@@ -249,7 +249,7 @@ pub(crate) async fn build_workspace(
     get,
     path = "/tasks/{task_id}",
     params(("task_id" = String, Path, description = "任务ID")),
-    responses((status = 200, body = HttpResult<BuildTaskSnapshot>, description = "任务状态快照（轮询通道，建议 2-3s 间隔）。关键字段：status（pending/running/completed/failed/cancelled——后三者为终态，到终态即可停止轮询）、currentService（正在编译的服务）、releaseId/sha256/sizeBytes/fileName/artifactPath（completed 时有值：产物摘要）、error（failed 时有值）、seq（事件游标，对齐 SSE 的 id）。终态快照保留 24h 供回查。")),
+    responses((status = 200, body = HttpResult<BuildTaskSnapshot>, description = "任务状态快照（轮询通道，建议 2-3s 间隔）。关键字段：status（pending/running/completed/failed/cancelled——后三者为终态，到终态即可停止轮询）、currentService（正在编译的服务）、releaseId/sha256/sizeBytes/fileName/artifactPath（completed 时有值：产物摘要）、error（failed 时有值）、seq（事件游标 = 已推送事件数，恰为下一条事件的 seq；从轮询切 SSE 续传时可直接作 fromSeq 传，但勿直接作 Last-Event-ID 头——头语义是最后收到事件的 id，比本值小 1，直接用会漏一条事件）。终态快照保留 24h 供回查。")),
     tag = "UserApp"
 )]
 pub(crate) async fn get_task(
@@ -327,7 +327,7 @@ pub(crate) async fn get_task_logs(
     responses(
         (
             status = 200,
-            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 1 递增。断线续传两种方式（二选一）：① 请求带 `Last-Event-ID: <最后收到的seq>` 头（SSE 规范标准方式，浏览器 EventSource 自动重连自动携带，服务端从该 seq 之后回放）；② query `?fromSeq=<最后seq+1>`（从该 seq 开始含本身回放；头存在时被忽略）。\n\n事件清单（event 名 → data 载荷）：\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始编译某服务）\n- `build_ok` → `{'event':'buildOk','service':'...'}`（服务编译成功；注意 data 内 tag 为 camelCase）\n- `build_fail` → `{'event':'buildFail','service':'...','error':'...'}`\n- `completed`（终态）→ `{'event':'completed','releaseId':'...','sha256':'...','sizeBytes':N,'fileName':'...','artifactPath':'builds/workspace-package-{releaseId}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端按上述任一方式带游标重连续传\n\n说明：构建日志经独立接口 `GET /tasks/{taskId}/logs` 分页查询，不走本流；`stage`/`log` 两种事件类型为协议预留，当前任务流不发送。终态事件（completed/failed/cancelled）后服务端关闭流；每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
+            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 0 递增（首条事件 id:0）。断线续传两种方式（二选一）：① 请求带 `Last-Event-ID: <最后收到的seq>` 头（SSE 规范标准方式，浏览器 EventSource 自动重连自动携带，服务端从该 seq 之后回放）；② query `?fromSeq=<最后seq+1>`（从该 seq 开始含本身回放；头存在时被忽略）。\n\n事件清单（event 名 → data 载荷）：\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始编译某服务）\n- `build_ok` → `{'event':'buildOk','service':'...'}`（服务编译成功；注意 data 内 tag 为 camelCase）\n- `build_fail` → `{'event':'buildFail','service':'...','error':'...'}`\n- `completed`（终态）→ `{'event':'completed','releaseId':'...','sha256':'...','sizeBytes':N,'fileName':'...','artifactPath':'builds/workspace-package-{releaseId}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端按上述任一方式带游标重连续传\n\n说明：构建日志经独立接口 `GET /tasks/{taskId}/logs` 分页查询，不走本流；`stage`/`log` 两种事件类型为协议预留，当前任务流不发送。终态事件（completed/failed/cancelled）后服务端关闭流；每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
             content_type = "text/event-stream",
         ),
         (status = 404, description = "Task not found（HttpResult JSON，非 SSE）"),

@@ -161,6 +161,7 @@ mod tests {
             "stream_lagged",
             "Last-Event-ID",
             "fromSeq",
+            "从 0 递增",
             "keep-alive",
             "artifactPath",
         ] {
@@ -177,16 +178,19 @@ mod tests {
             .map(|params| {
                 params
                     .iter()
-                    .map(|p| (p.name.as_str(), &p.parameter_in))
+                    .map(|p| (p.name.as_str(), &p.parameter_in, &p.required))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let last_event_id = sse_params
+            .iter()
+            .find(|(name, r#in, _)| {
+                *name == "Last-Event-ID" && matches!(r#in, utoipa::openapi::path::ParameterIn::Header)
+            })
+            .unwrap_or_else(|| panic!("SSE 接口参数缺 Last-Event-ID Header 声明（同事按 swagger 对接，头参数必须显式可见）"));
         assert!(
-            sse_params.iter().any(|(name, r#in)| {
-                *name == "Last-Event-ID"
-                    && matches!(r#in, utoipa::openapi::path::ParameterIn::Header)
-            }),
-            "SSE 接口参数缺 Last-Event-ID Header 声明（同事按 swagger 对接，头参数必须显式可见）"
+            matches!(last_event_id.2, utoipa::openapi::Required::False),
+            "Last-Event-ID 是可选续传头, swagger 标必填会阻断不带头的首次订阅"
         );
 
         let build = success_desc("/api/userapp/build");
@@ -197,8 +201,13 @@ mod tests {
 
         let task = success_desc("/api/userapp/tasks/{task_id}");
         assert!(
-            task.contains("completed") && task.contains("轮询"),
-            "task 快照描述缺终态/轮询语义"
+            task.contains("completed")
+                && task.contains("轮询")
+                // 快照 seq 语义指引必须保留: 已发事件数=下一条 seq, 可直接作 fromSeq、
+                // 勿作 Last-Event-ID(差 1, 直接用会漏事件)——同事按文档写续传逻辑
+                && task.contains("fromSeq")
+                && task.contains("勿直接作 Last-Event-ID"),
+            "task 快照描述缺终态/轮询/seq 游标语义"
         );
     }
 
