@@ -3,8 +3,8 @@
 //! 跨域公共入口：文件转发层（`userapp_forward`）、chat 开发对话、create-workspace、
 //! start/restart 部署链共用——注册表命中复用，miss 创建注册。
 //!
-//! 构建任务本体在 agent-runner 容器内 file-server（`/api/userapp/build` + tasks 查询），
-//! rcoder 不再做发布任务编排（旧 publish 任务体系已随 `/api/v1/apps/publish` 接口族删除）。
+//! 构建任务本体在 agent-runner 容器内 file-server（`/api/v1/userapp/build` + tasks 查询），
+//! rcoder 不再做发布任务编排（旧 publish 任务体系已随 `/api/v1/userapp/publish` 接口族删除）。
 
 mod dev_cleanup;
 

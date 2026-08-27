@@ -86,7 +86,7 @@ async fn redirect_doc_response(
 - **终端工作目录 = 开发卷 `{USERAPP_WORKSPACE_ROOT}/{app_id}`**（Pingora 注入
   `X-Ttyd-Service-Type: user-app-builder`，agent_runner 据此定位 cwd——与 chat
   开发对话、file-server 的 workspace 同根）。
-- 前置：`POST /api/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
+- 前置：`POST /api/v1/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（rcoder 容器 8088 / K8s NodePort 30435），须直连 Pingora 不走 rcoder 主端口。
 
 > 例：`GET /userapp/dev/ttyd/app-order-svc/`（终端页面）；WebSocket `/userapp/dev/ttyd/app-order-svc/ws`。
@@ -97,7 +97,7 @@ async fn redirect_doc_response(
     ),
     responses(
         (status = 307, description = "重定向到 Pingora 代理服务", body = String),
-        (status = 404, description = "该 app 的开发容器未创建（先调 POST /api/userapp/workspace）", body = String),
+        (status = 404, description = "该 app 的开发容器未创建（先调 POST /api/v1/userapp/workspace）", body = String),
         (status = 503, description = "代理服务未启用", body = ProxyErrorResponse)
     )
 )]
@@ -119,7 +119,7 @@ pub async fn proxy_to_userapp_ttyd(
 （Xvnc 5900 + noVNC 6080），与 computer 族 `/computer/vnc/{user_id}/...` 对称。
 
 - upstream = 容器内 noVNC（6080，HTTP 页面 + `websockify` WebSocket 同端口）。
-- 前置：`POST /api/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
+- 前置：`POST /api/v1/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（8088 / K8s NodePort 30435）。
 
 > 例：`GET /userapp/dev/vnc/app-order-svc/vnc.html`（桌面页面）；WebSocket `/userapp/dev/vnc/app-order-svc/websockify`。
@@ -154,7 +154,7 @@ pub async fn proxy_to_userapp_vnc(
 - `path` 为 `ws` 或 `ws/*` → WebSocket 语音流（6089）
 - 其余（含空路径）→ HTTP 静态资源/播放器页面（6090）
 
-- 前置：`POST /api/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
+- 前置：`POST /api/v1/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（8088 / K8s NodePort 30435）。
 
 > 例：`GET /userapp/dev/audio/app-order-svc/`（播放器页面）；WebSocket `/userapp/dev/audio/app-order-svc/ws`。
@@ -187,7 +187,7 @@ pub async fn proxy_to_userapp_audio(
 客户端本地输入法经 WebSocket 发送文本，容器内用 xdotool 输入到远程桌面——
 与 computer 族 `/computer/ime/{user_id}/...` 对称。
 
-- 前置：`POST /api/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
+- 前置：`POST /api/v1/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（8088 / K8s NodePort 30435）。
 
 > 例：`WebSocket /userapp/dev/ime/app-order-svc/connect`。
@@ -221,7 +221,7 @@ Web GUI（60+ 数据库，supervisor 恒起 4224）——开发阶段查库/改�
 （容器内 PG 已预置连接 + 首访浏览器设密码；也可连远端库）。
 
 - 与 pgweb（prod 域专用、只读排障向）互补：DBX 是两阶段全功能 GUI。
-- 前置：`POST /api/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
+- 前置：`POST /api/v1/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - 代理剥前缀直连 root 模式 dbx（前端运行时自推断 base path，API/WS 自动拼回本前缀）。
 - host = Pingora 入口（rcoder 容器 8088 / K8s NodePort 30435），须直连 Pingora 不走 rcoder 主端口。
 
@@ -233,7 +233,7 @@ Web GUI（60+ 数据库，supervisor 恒起 4224）——开发阶段查库/改�
     ),
     responses(
         (status = 307, description = "重定向到 Pingora 代理服务", body = String),
-        (status = 404, description = "该 app 的开发容器未创建（先调 POST /api/userapp/workspace）", body = String),
+        (status = 404, description = "该 app 的开发容器未创建（先调 POST /api/v1/userapp/workspace）", body = String),
         (status = 503, description = "代理服务未启用", body = ProxyErrorResponse)
     )
 )]

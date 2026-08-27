@@ -31,10 +31,10 @@ npm install @nuwax-ai/file-server-proxy
 
 | 策略 | 行为 | TS 进程 |
 |---|---|---|
-| `userapp_split`（默认） | `/api/userapp*` 或 `x-service-type: userapp` → 内嵌 Rust；其余 → TS | 需要 |
+| `userapp_split`（默认） | `/api/v1/userapp*` 或 `x-service-type: userapp` → 内嵌 Rust；其余 → TS | 需要 |
 | `all_rust` | 全部 → 内嵌 Rust file-server（路径白名单：`/api/*`、`/health`、`/`、`/api-docs*`） | 不需要 |
 | `all_ts` | 全部 → TS nuwax-file-server | 需要 |
-| `ts_first` | **仅** `/api/userapp*` → 内嵌 Rust；存量同名接口全走 TS——**含带 `x-service-type` 标记的请求**（header 判据失效，由 TS 以 `service_type` 入参内部处理 userApp 业务） | 需要 |
+| `ts_first` | **仅** `/api/v1/userapp*` → 内嵌 Rust；存量同名接口全走 TS——**含带 `x-service-type` 标记的请求**（header 判据失效，由 TS 以 `service_type` 入参内部处理 userApp 业务） | 需要 |
 
 > `ts_first` 的前提：TS 源工程（nuwax-file-server）已支持 `service_type` 入参处理
 > userApp 业务。TS 未就绪时切此模式 = 存量 userApp 业务按 TS 普通业务处理（正是

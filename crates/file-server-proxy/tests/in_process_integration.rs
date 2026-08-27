@@ -64,7 +64,7 @@ async fn in_process_router_serves_rust_domain_without_upstream_listener() {
     spawn_marker_upstream(TS_UPSTREAM_PORT, "upstream-ts").await;
     file_server_proxy::set_in_process_router(marker_router());
 
-    // TsFirst：仅 /api/userapp* → rust（直连）；存量路径 → TS
+    // TsFirst：仅 /api/v1/userapp* → rust（直连）；存量路径 → TS
     file_server_proxy::init(FileServerProxyConfig {
         listen_port: PROXY_PORT,
         rust_upstream_port: RUST_UPSTREAM_PORT,
@@ -75,10 +75,10 @@ async fn in_process_router_serves_rust_domain_without_upstream_listener() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // rust 域：上游端口无人听，仍由直连 router 服务（进程内 oneshot 铁证）
-    let userapp = http_get("/api/userapp/dev/start", &[]).await;
+    let userapp = http_get("/api/v1/userapp/dev/start", &[]).await;
     assert!(
         userapp.contains("in-process-router"),
-        "/api/userapp/* 应由直连 router 服务: {userapp}"
+        "/api/v1/userapp/* 应由直连 router 服务: {userapp}"
     );
 
     // ts_first 语义：存量路径（含 userApp 标记）→ TS
@@ -96,7 +96,7 @@ async fn in_process_router_serves_rust_domain_without_upstream_listener() {
 
     // 清除直连后回 loopback 转发路径：rust 域请求上游无人听 → 502（无直连兜底）
     file_server_proxy::clear_in_process_router();
-    let after_clear = http_get("/api/userapp/dev/start", &[]).await;
+    let after_clear = http_get("/api/v1/userapp/dev/start", &[]).await;
     assert!(
         after_clear.contains("502"),
         "清除直连后 rust 域应走上游转发（无人听=502）: {after_clear}"

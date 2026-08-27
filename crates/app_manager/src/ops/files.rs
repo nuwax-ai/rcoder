@@ -3,7 +3,7 @@
 //! 四接口（upload / upload-from-url / files / files-delete）不再直读写卷——
 //! rcoder 对生产 RBD 卷零挂载。改为：**唤醒**（闲置回收的 app 自动拉起）→
 //! 解析运行容器地址（pod IP）→ 转发容器内 file-server-proxy (:60000) 的
-//! `/api/userapp/app-files/*` 内部契约。file-server 侧同语义实现（魔数识别
+//! `/api/v1/userapp/app-files/*` 内部契约。file-server 侧同语义实现（魔数识别
 //! zip/tar.gz 解压 + flatten、app 根相对路径、防穿越），REST 契约（handbook）
 //! 对 Java 保持不变。
 
@@ -107,7 +107,7 @@ impl AppService {
             .text("flatten", flatten.to_string())
             .part("file", part);
         let resp = reqwest::Client::new()
-            .post(format!("{base}/api/userapp/app-files/upload"))
+            .post(format!("{base}/api/v1/userapp/app-files/upload"))
             .multipart(form)
             .send()
             .await
@@ -147,7 +147,7 @@ impl AppService {
             "flatten": flatten,
         });
         let resp = reqwest::Client::new()
-            .post(format!("{base}/api/userapp/app-files/upload-from-url"))
+            .post(format!("{base}/api/v1/userapp/app-files/upload-from-url"))
             .json(&body)
             .send()
             .await
@@ -184,7 +184,7 @@ impl AppService {
         validate_app_id(app_id)?;
         let base = self.app_files_base(app_id).await?;
         let mut url = format!(
-            "{base}/api/userapp/app-files/list?appId={}",
+            "{base}/api/v1/userapp/app-files/list?appId={}",
             urlencode(app_id)
         );
         if let Some(p) = subpath.map(str::trim).filter(|p| !p.is_empty()) {
@@ -224,7 +224,7 @@ impl AppService {
         let base = self.app_files_base(app_id).await?;
         let body = serde_json::json!({"appId": app_id, "path": file_path});
         let resp = reqwest::Client::new()
-            .post(format!("{base}/api/userapp/app-files/delete"))
+            .post(format!("{base}/api/v1/userapp/app-files/delete"))
             .json(&body)
             .send()
             .await

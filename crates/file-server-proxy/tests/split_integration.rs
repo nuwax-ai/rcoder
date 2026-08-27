@@ -108,11 +108,11 @@ async fn service_type_header_decides_upstream_and_lifecycle() {
         "非 userapp 业务声明应走 TS: {computer}"
     );
 
-    // path 判据（Java 未接 header 期的兜底）：/api/userapp/* 无 header 也走 Rust
-    let by_path = http_get("/api/userapp/dev/start", &[]).await;
+    // path 判据（Java 未接 header 期的兜底）：/api/v1/userapp/* 无 header 也走 Rust
+    let by_path = http_get("/api/v1/userapp/dev/start", &[]).await;
     assert!(
         by_path.contains("upstream-rust"),
-        "/api/userapp/* 前缀应走 Rust: {by_path}"
+        "/api/v1/userapp/* 前缀应走 Rust: {by_path}"
     );
 
     // 多值 header 透传（append 语义: 同名多值不丢——Cookie 链等场景）

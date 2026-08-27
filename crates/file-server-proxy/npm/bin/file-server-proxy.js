@@ -68,11 +68,11 @@ Usage:
   file-server-proxy --version | -V
 
 Policies:
-  userapp_split  /api/userapp* or x-service-type:userapp → embedded rust;
+  userapp_split  /api/v1/userapp* or x-service-type:userapp → embedded rust;
                   everything else → nuwax-file-server (default)
   all_rust       everything → embedded rust file-server (no TS process needed)
   all_ts         everything → nuwax-file-server
-  ts_first       only /api/userapp* → embedded rust; legacy paths → TS even
+  ts_first       only /api/v1/userapp* → embedded rust; legacy paths → TS even
                   with x-service-type header (TS handles service_type in-band)
 
 Environment:

@@ -1,4 +1,4 @@
-//! `/api/userapp` 路由与文档（自 file-server routes/mod.rs 迁出）。
+//! `/api/v1/userapp` 路由与文档（自 file-server routes/mod.rs 迁出）。
 
 use axum::routing::options;
 use utoipa::OpenApi;
@@ -10,7 +10,7 @@ use crate::handlers::{
     static_files, userapp, userapp_app_files, userapp_dev, userapp_dev_server, userapp_files,
 };
 
-/// `/api/userapp` 路由（workspace 多项目打包 + 文件操作镜像族 + 取整体包）。
+/// `/api/v1/userapp` 路由（workspace 多项目打包 + 文件操作镜像族 + 取整体包）。
 fn userapp_router() -> OpenApiRouter<UserAppState> {
     OpenApiRouter::new()
         .routes(routes!(userapp::build_workspace))
@@ -49,10 +49,10 @@ fn userapp_router() -> OpenApiRouter<UserAppState> {
         .route("/static/{app_id}", options(static_files::serve_userapp))
 }
 
-/// userApp 域顶层：nest `/api/userapp` 前缀（路径注解为相对路径，文档收集时
+/// userApp 域顶层：nest `/api/v1/userapp` 前缀（路径注解为相对路径，文档收集时
 /// 自动带前缀——与 file-server 侧原组织一致）。
 pub(crate) fn userapp_top_router() -> OpenApiRouter<UserAppState> {
-    OpenApiRouter::new().nest("/api/userapp", userapp_router())
+    OpenApiRouter::new().nest("/api/v1/userapp", userapp_router())
 }
 
 /// userApp 域独立 OpenAPI 文档（含 UserApp tag；rcoder 聚合与本地 swagger 用）。
@@ -63,7 +63,7 @@ pub(crate) fn userapp_top_router() -> OpenApiRouter<UserAppState> {
 )]
 struct ApiDoc;
 
-/// 组装好的域文档：ApiDoc 基础 + 路由收集（路径带 `/api/userapp` 前缀）。
+/// 组装好的域文档：ApiDoc 基础 + 路由收集（路径带 `/api/v1/userapp` 前缀）。
 pub fn document() -> utoipa::openapi::OpenApi {
     use utoipa::OpenApi as _;
     let mut doc = ApiDoc::openapi();
@@ -81,39 +81,39 @@ mod tests {
     fn document_contains_every_registered_operation() {
         let document = document();
         for path in [
-            "/api/userapp/build",
-            "/api/userapp/tasks/{task_id}",
-            "/api/userapp/tasks/{task_id}/logs",
-            "/api/userapp/tasks/{task_id}/logs/stream",
-            "/api/userapp/tasks/{task_id}/cancel",
-            "/api/userapp/projects/detect",
-            "/api/userapp/projects/confirm",
-            "/api/userapp/get-file-list",
-            "/api/userapp/resolve-file",
-            "/api/userapp/search-files",
-            "/api/userapp/files-update",
-            "/api/userapp/upload-file",
-            "/api/userapp/upload-files",
-            "/api/userapp/generate-file",
-            "/api/userapp/import-project",
-            "/api/userapp/app-files/upload",
-            "/api/userapp/app-files/upload-from-url",
-            "/api/userapp/app-files/list",
-            "/api/userapp/app-files/delete",
-            "/api/userapp/ensure-workspace",
-            "/api/userapp/execute-command",
-            "/api/userapp/get-logs",
-            "/api/userapp/install-project",
-            "/api/userapp/zip-workspace",
-            "/api/userapp/download-all-files",
-            "/api/userapp/init-project-template",
-            "/api/userapp/push-skills-to-workspace",
-            "/api/userapp/dev/start",
-            "/api/userapp/dev/stop",
-            "/api/userapp/dev/restart",
-            "/api/userapp/dev/list",
-            "/api/userapp/dev/logs",
-            "/api/userapp/static/{app_id}",
+            "/api/v1/userapp/build",
+            "/api/v1/userapp/tasks/{task_id}",
+            "/api/v1/userapp/tasks/{task_id}/logs",
+            "/api/v1/userapp/tasks/{task_id}/logs/stream",
+            "/api/v1/userapp/tasks/{task_id}/cancel",
+            "/api/v1/userapp/projects/detect",
+            "/api/v1/userapp/projects/confirm",
+            "/api/v1/userapp/get-file-list",
+            "/api/v1/userapp/resolve-file",
+            "/api/v1/userapp/search-files",
+            "/api/v1/userapp/files-update",
+            "/api/v1/userapp/upload-file",
+            "/api/v1/userapp/upload-files",
+            "/api/v1/userapp/generate-file",
+            "/api/v1/userapp/import-project",
+            "/api/v1/userapp/app-files/upload",
+            "/api/v1/userapp/app-files/upload-from-url",
+            "/api/v1/userapp/app-files/list",
+            "/api/v1/userapp/app-files/delete",
+            "/api/v1/userapp/ensure-workspace",
+            "/api/v1/userapp/execute-command",
+            "/api/v1/userapp/get-logs",
+            "/api/v1/userapp/install-project",
+            "/api/v1/userapp/zip-workspace",
+            "/api/v1/userapp/download-all-files",
+            "/api/v1/userapp/init-project-template",
+            "/api/v1/userapp/push-skills-to-workspace",
+            "/api/v1/userapp/dev/start",
+            "/api/v1/userapp/dev/stop",
+            "/api/v1/userapp/dev/restart",
+            "/api/v1/userapp/dev/list",
+            "/api/v1/userapp/dev/logs",
+            "/api/v1/userapp/static/{app_id}",
         ] {
             assert!(
                 document.paths.paths.contains_key(path),
@@ -213,7 +213,7 @@ mod tests {
             }
         };
 
-        let sse = success_desc("/api/userapp/tasks/{task_id}/logs/stream");
+        let sse = success_desc("/api/v1/userapp/tasks/{task_id}/logs/stream");
         for token in [
             "building",
             "build_ok",
@@ -234,7 +234,7 @@ mod tests {
         let sse_params = document
             .paths
             .paths
-            .get("/api/userapp/tasks/{task_id}/logs/stream")
+            .get("/api/v1/userapp/tasks/{task_id}/logs/stream")
             .and_then(|item| item.get.as_ref())
             .and_then(|op| op.parameters.as_ref())
             .map(|params| {
@@ -255,13 +255,13 @@ mod tests {
             "Last-Event-ID 是可选续传头, swagger 标必填会阻断不带头的首次订阅"
         );
 
-        let build = success_desc("/api/userapp/build");
+        let build = success_desc("/api/v1/userapp/build");
         assert!(
             build.contains("taskId") && build.contains("artifactPath") && build.contains("pending"),
             "build 受理描述缺关键语义"
         );
 
-        let task = success_desc("/api/userapp/tasks/{task_id}");
+        let task = success_desc("/api/v1/userapp/tasks/{task_id}");
         assert!(
             task.contains("completed")
                 && task.contains("轮询")
@@ -342,16 +342,19 @@ mod tests {
         let paths = value["paths"].as_object().expect("paths object");
         // 6 个 Rust 新契约接口（TS 无对应端点）：dev 生命周期 5 + ensure-workspace
         let expected_refs = [
-            ("/api/userapp/dev/start", "HttpResult_UserappDevTaskCreated"),
-            ("/api/userapp/dev/stop", "HttpResult_UserappDevStopped"),
             (
-                "/api/userapp/dev/restart",
+                "/api/v1/userapp/dev/start",
                 "HttpResult_UserappDevTaskCreated",
             ),
-            ("/api/userapp/dev/list", "HttpResult_UserappDevList"),
-            ("/api/userapp/dev/logs", "HttpResult_ReadDevLogResult"),
+            ("/api/v1/userapp/dev/stop", "HttpResult_UserappDevStopped"),
             (
-                "/api/userapp/ensure-workspace",
+                "/api/v1/userapp/dev/restart",
+                "HttpResult_UserappDevTaskCreated",
+            ),
+            ("/api/v1/userapp/dev/list", "HttpResult_UserappDevList"),
+            ("/api/v1/userapp/dev/logs", "HttpResult_ReadDevLogResult"),
+            (
+                "/api/v1/userapp/ensure-workspace",
                 "HttpResult_UserappEnsureWorkspaceData",
             ),
         ];

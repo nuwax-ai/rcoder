@@ -1,4 +1,4 @@
-//! UserApp workspace HTTP handlers（独立 `/api/userapp`，workspace 定位统一走 UserApp 开发卷）。
+//! UserApp workspace HTTP handlers（独立 `/api/v1/userapp`，workspace 定位统一走 UserApp 开发卷）。
 //!
 //! 响应格式：JSON 接口统一 `shared_types::HttpResult`（`{code, message, data, tid, success}`）；
 //! SSE（logs/stream）与静态文件（static）为特殊通道，不包 HttpResult。
@@ -97,7 +97,7 @@ pub(crate) struct BuildCreatedData {
     pub status: BuildTaskStatus,
     /// 预生成的产物相对路径（`builds/workspace-package-{releaseId}.zip`，release_id
     /// 创建时即生成）——信息字段：标识本次构建的产物位置；实际取包按 app 直下
-    /// `GET /api/userapp/static/{appId}`（服务端选最新产物，无需传路径）。
+    /// `GET /api/v1/userapp/static/{appId}`（服务端选最新产物，无需传路径）。
     pub artifact_path: String,
 }
 
@@ -127,7 +127,7 @@ pub(crate) struct ConfirmData {
     pub path: String,
 }
 
-/// `POST /api/userapp/build` 请求体。
+/// `POST /api/v1/userapp/build` 请求体。
 #[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]

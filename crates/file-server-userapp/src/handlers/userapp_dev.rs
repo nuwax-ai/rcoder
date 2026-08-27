@@ -1,4 +1,4 @@
-//! `/api/userapp` 开发执行镜像族: 执行/日志/依赖安装/打包下载/模板初始化/技能推送。
+//! `/api/v1/userapp` 开发执行镜像族: 执行/日志/依赖安装/打包下载/模板初始化/技能推送。
 //!
 //! 与 [`super::userapp_files`] 同约定: computer 域同参镜像 (`appId`/`userId`),
 //! 定位 `resolve_userapp_dev` = `{USERAPP_WORKSPACE_DIR}/{appId}`, 复用 computer impl。

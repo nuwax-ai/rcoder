@@ -13,7 +13,7 @@ use crate::models::{AppRuntimeInfo, RecyclePolicyRequest, StartAppRequest, Start
 /// 统一部署+启动入口（无 body = 传统启动；带 url = 轻量部署）
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/start",
+    path = "/api/v1/userapp/{app_id}/start",
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body(
         content = StartAppRequest,
@@ -48,7 +48,7 @@ pub async fn start_app(
 /// 停止应用（scale replicas = 0）
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/stop",
+    path = "/api/v1/userapp/{app_id}/stop",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),
@@ -73,7 +73,7 @@ pub async fn stop_app(
 /// rollout restart；可选参数与 start 同款——带 url 即部署新版本并重启。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/restart",
+    path = "/api/v1/userapp/{app_id}/restart",
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body(
         content = StartAppRequest,
@@ -110,7 +110,7 @@ pub async fn restart_app(
 /// 比 update 轻（无需 image）。三字段（recycle_enabled/idle_timeout_seconds/wake_on_traffic）皆 None → 400。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/recycle-policy",
+    path = "/api/v1/userapp/{app_id}/recycle-policy",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),

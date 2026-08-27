@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// `POST /api/v1/apps/{app_id}/start|restart` 请求体（全可选——无参数即传统启停语义）。
+/// `POST /api/v1/userapp/{app_id}/start|restart` 请求体（全可选——无参数即传统启停语义）。
 ///
 /// 带 `url` 即触发**轻量部署**（下载 zip → prepare → activate → 启动），
 /// 是 Java 直发制品包的统一入口（不经 build）；失败语义对齐发布链

@@ -1,4 +1,4 @@
-//! `POST /api/userapp/workspace`：创建项目显式入口。
+//! `POST /api/v1/userapp/workspace`：创建项目显式入口。
 //!
 //! ensure 开发容器（幂等）+ 容器内建 workspace 目录 + metadata 注册 owner，
 //! 对齐 computer 域 create-workspace 起手先例。
@@ -24,7 +24,7 @@ pub struct CreateWorkspaceBody {
     pub user_id: String,
 }
 
-/// `POST /api/userapp/workspace`：创建项目显式入口（幂等）。
+/// `POST /api/v1/userapp/workspace`：创建项目显式入口（幂等）。
 ///
 /// 1. metadata 注册 owner user_id（name 空 = 开发期；部署 create_app 后补全；
 ///    先于 ensure——builder 宿主树分区依赖 owner user_id）
@@ -34,7 +34,7 @@ pub struct CreateWorkspaceBody {
 ///    （execute-command 等接口要求目录已存在）
 #[utoipa::path(
     post,
-    path = "/api/userapp/workspace",
+    path = "/api/v1/userapp/workspace",
     request_body = CreateWorkspaceBody,
     responses(
         (status = 200, description = "创建成功（幂等，重复调用安全）", body = HttpResult<serde_json::Value>),

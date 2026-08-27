@@ -164,13 +164,13 @@ mod tests {
                 .paths
                 .contains_key("/api/page/static/{project_id}/{rest}")
         );
-        // userApp 域已拆出：本文档不得再出现 /api/userapp 路径（防回流）
+        // userApp 域已拆出：本文档不得再出现 /api/v1/userapp 路径（防回流）
         assert!(
             !document
                 .paths
                 .paths
                 .keys()
-                .any(|path| path.starts_with("/api/userapp"))
+                .any(|path| path.starts_with("/api/v1/userapp"))
         );
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
@@ -238,7 +238,7 @@ mod tests {
     }
 
     // userapp 字段文档/HttpResult 信封两测试已随域迁至 file-server-userapp crate
-    // （routes.rs 测试模块）——本文档不再含 /api/userapp 路径。
+    // （routes.rs 测试模块）——本文档不再含 /api/v1/userapp 路径。
 
     #[test]
     fn generated_document_round_trips_as_openapi() {

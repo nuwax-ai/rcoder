@@ -18,7 +18,7 @@ use crate::models::{FileInfo, UploadResult};
 /// 上传文件
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/upload",
+    path = "/api/v1/userapp/{app_id}/upload",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),
@@ -100,7 +100,7 @@ pub struct UploadFromUrlRequest {
 /// 从 URL 下载文件/压缩包并上传
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/upload-from-url",
+    path = "/api/v1/userapp/{app_id}/upload-from-url",
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body = UploadFromUrlRequest,
     responses(
@@ -135,7 +135,7 @@ pub struct ListFilesQuery {
 /// 列出文件
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/{app_id}/files",
+    path = "/api/v1/userapp/{app_id}/files",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
         ("path" = Option<String>, Query, description = "子目录（相对 app 根，如 code/data/logs；默认列 app 根）")
@@ -170,7 +170,7 @@ pub struct DeleteFileRequest {
 /// 删除文件
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/files/delete",
+    path = "/api/v1/userapp/{app_id}/files/delete",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),

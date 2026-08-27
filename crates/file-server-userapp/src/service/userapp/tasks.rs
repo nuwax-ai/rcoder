@@ -32,8 +32,8 @@ pub type BuildTaskId = String;
 /// 任务类型。Build = 发布打包（zip 制品）；DevStart/DevRestart = 开发闭环
 /// （manifest 同核编译成功后启动/重启 dev 服务——**启停前必先编译**，新代码
 /// 才生效；Completed 的制品四字段为占位空值，调用方按 status/error 消费，
-/// 端口经 `GET /api/userapp/dev/list` 查询）。纯开发编译不设接口——与
-/// Build 同核无增量，用 `/api/userapp/build`。
+/// 端口经 `GET /api/v1/userapp/dev/list` 查询）。纯开发编译不设接口——与
+/// Build 同核无增量，用 `/api/v1/userapp/build`。
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildTaskKind {

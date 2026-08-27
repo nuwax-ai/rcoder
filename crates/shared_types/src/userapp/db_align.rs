@@ -1,7 +1,7 @@
 //! UserApp PG 凭据对齐契约（跨 crate，按模块契约约定置于 shared_types）。
 //!
 //! 业务：开发环境（UserAppBuilder 开发容器）与部署环境（UserApp 运行容器）的
-//! 容器内 PG 账号密码保持一致——Java 调 `POST /api/userapp/db/{dev|prod}/align-credentials`
+//! 容器内 PG 账号密码保持一致——Java 调 `POST /api/v1/userapp/db/{dev|prod}/align-credentials`
 //! 传入目标凭据，rcoder 验证（TCP scram）→ 不一致则重置（本地 trust ALTER USER）。
 //!
 //! 流程单头在 [`align_pg_credentials`]，执行通道（容器 exec / 容器内 file-server
@@ -14,7 +14,7 @@ use crate::pg_utils::{
     pg_alter_password_cmd, pg_role_exists_cmd, pg_verify_credentials_cmd, validate_pg_identifier,
 };
 
-/// `POST /api/userapp/db/{env}/align-credentials` 请求体（dev/prod 两接口一致）。
+/// `POST /api/v1/userapp/db/{env}/align-credentials` 请求体（dev/prod 两接口一致）。
 #[derive(Debug, Deserialize, Serialize, Clone, utoipa::ToSchema)]
 pub struct AlignCredentialsRequest {
     /// 应用 ID（定位 dev=开发容器 / prod=运行容器）

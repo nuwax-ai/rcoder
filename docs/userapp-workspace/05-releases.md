@@ -2,15 +2,15 @@
 
 产物名为 `workspace-package-<release_id>.zip`（落 workspace 的 `builds/` 子目录——
 build 任务创建时即可从响应/快照的 `artifactPath` 字段拿到确定性相对路径，取包走
-`GET /api/userapp/static/{appId}/{artifactPath}`），根目录必须包含
+`GET /api/v1/userapp/static/{appId}/{artifactPath}`），根目录必须包含
 `workspace.manifest.toml` 和 `release.lock.toml`。
 
 ```text
-POST /api/v1/apps/{app_id}/releases/prepare
-POST /api/v1/apps/{app_id}/releases/{release_id}/activate
-POST /api/v1/apps/{app_id}/releases/{release_id}/confirm
-GET  /api/v1/apps/{app_id}/releases
-POST /api/v1/apps/{app_id}/releases/{release_id}/delete
+POST /api/v1/userapp/{app_id}/releases/prepare
+POST /api/v1/userapp/{app_id}/releases/{release_id}/activate
+POST /api/v1/userapp/{app_id}/releases/{release_id}/confirm
+GET  /api/v1/userapp/{app_id}/releases
+POST /api/v1/userapp/{app_id}/releases/{release_id}/delete
 ```
 
 prepare 下载到 `.incoming`，校验大小、SHA-256、zip 和 lock 中 release ID，再原子移动到

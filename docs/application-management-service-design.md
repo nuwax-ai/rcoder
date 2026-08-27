@@ -280,43 +280,43 @@ spec:
 
 | 方法 | 路径 | 描述 | 说明 |
 |------|------|------|------|
-| POST | `/api/v1/apps` | 创建应用 | Body: CreateAppRequest |
-| POST | `/api/v1/apps/query` | 查询应用列表 | Body: QueryAppsRequest |
-| GET | `/api/v1/apps/{app_id}` | 获取应用详情 | - |
-| POST | `/api/v1/apps/{app_id}/update` | 更新应用配置 | Body: UpdateAppRequest |
-| POST | `/api/v1/apps/{app_id}/delete` | 删除应用 | - |
+| POST | `/api/v1/userapp` | 创建应用 | Body: CreateAppRequest |
+| POST | `/api/v1/userapp/query` | 查询应用列表 | Body: QueryAppsRequest |
+| GET | `/api/v1/userapp/{app_id}` | 获取应用详情 | - |
+| POST | `/api/v1/userapp/{app_id}/update` | 更新应用配置 | Body: UpdateAppRequest |
+| POST | `/api/v1/userapp/{app_id}/delete` | 删除应用 | - |
 
 #### 应用操作
 
 | 方法 | 路径 | 描述 | 说明 |
 |------|------|------|------|
-| POST | `/api/v1/apps/{app_id}/start` | 启动应用 | - |
-| POST | `/api/v1/apps/{app_id}/stop` | 停止应用 | - |
-| POST | `/api/v1/apps/{app_id}/restart` | 重启应用 | - |
+| POST | `/api/v1/userapp/{app_id}/start` | 启动应用 | - |
+| POST | `/api/v1/userapp/{app_id}/stop` | 停止应用 | - |
+| POST | `/api/v1/userapp/{app_id}/restart` | 重启应用 | - |
 
 #### 查询接口
 
 | 方法 | 路径 | 描述 | 说明 |
 |------|------|------|------|
-| GET | `/api/v1/apps/{app_id}/logs` | 获取日志 | Query: tail, follow |
-| GET | `/api/v1/apps/{app_id}/health` | 获取健康状态 | - |
-| GET | `/api/v1/apps/{app_id}/events` | 获取事件 | - |
-| GET | `/api/v1/apps/{app_id}/stats` | 获取资源使用 | - |
+| GET | `/api/v1/userapp/{app_id}/logs` | 获取日志 | Query: tail, follow |
+| GET | `/api/v1/userapp/{app_id}/health` | 获取健康状态 | - |
+| GET | `/api/v1/userapp/{app_id}/events` | 获取事件 | - |
+| GET | `/api/v1/userapp/{app_id}/stats` | 获取资源使用 | - |
 
 #### 文件管理接口
 
 | 方法 | 路径 | 描述 | 说明 |
 |------|------|------|------|
-| POST | `/api/v1/apps/{app_id}/upload` | 上传文件 | multipart/form-data |
-| GET | `/api/v1/apps/{app_id}/files` | 列出文件 | - |
-| POST | `/api/v1/apps/{app_id}/files/delete` | 删除文件 | Body: DeleteFileRequest |
+| POST | `/api/v1/userapp/{app_id}/upload` | 上传文件 | multipart/form-data |
+| GET | `/api/v1/userapp/{app_id}/files` | 列出文件 | - |
+| POST | `/api/v1/userapp/{app_id}/files/delete` | 删除文件 | Body: DeleteFileRequest |
 
 ### 4.2 创建应用
 
 **请求：**
 
 ```json
-POST /api/v1/apps
+POST /api/v1/userapp
 
 {
   "name": "my-java-app",
@@ -412,7 +412,7 @@ POST /api/v1/apps
 **请求：**
 
 ```json
-PUT /api/v1/apps/app-123
+PUT /api/v1/userapp/app-123
 
 {
   "env": {
@@ -428,7 +428,7 @@ PUT /api/v1/apps/app-123
 **更新镜像（重启生效）：**
 
 ```json
-PUT /api/v1/apps/app-123
+PUT /api/v1/userapp/app-123
 
 {
   "image": "my-app:v2.0.0"
@@ -460,7 +460,7 @@ PUT /api/v1/apps/app-123
 **请求：**
 
 ```json
-GET /api/v1/apps/app-123
+GET /api/v1/userapp/app-123
 ```
 
 **响应：**
@@ -552,7 +552,7 @@ GET /api/v1/apps/app-123
 **请求：**
 
 ```json
-POST /api/v1/apps/query
+POST /api/v1/userapp/query
 
 {
   "page": 1,
@@ -627,7 +627,7 @@ K8s 通过 Liveness/Readiness Probe 自动执行健康检查，无需额外实�
 查询 K8s Pod 状态和 Probe 结果：
 
 ```json
-GET /api/v1/apps/app-123/health
+GET /api/v1/userapp/app-123/health
 ```
 
 **响应：**
@@ -689,7 +689,7 @@ GET /api/v1/apps/app-123/health
 **请求：**
 
 ```json
-GET /api/v1/apps/app-123/logs?tail=1000&follow=true
+GET /api/v1/userapp/app-123/logs?tail=1000&follow=true
 ```
 
 **请求参数：**
@@ -728,7 +728,7 @@ GET /api/v1/apps/app-123/logs?tail=1000&follow=true
 **实时日志流（WebSocket）：**
 
 ```
-WS /api/v1/apps/app-123/logs/stream?tail=1000
+WS /api/v1/userapp/app-123/logs/stream?tail=1000
 ```
 
 ### 4.8 获取资源使用
@@ -852,7 +852,7 @@ docker push your-registry/metrics-server:v0.7.1
 **请求：**
 
 ```json
-GET /api/v1/apps/app-123/stats
+GET /api/v1/userapp/app-123/stats
 ```
 
 **响应：**
@@ -1306,7 +1306,7 @@ volumes:
 **请求：**
 
 ```bash
-POST /api/v1/apps/app-123/upload
+POST /api/v1/userapp/app-123/upload
 Content-Type: multipart/form-data
 
 file: app.jar
@@ -1342,12 +1342,12 @@ target: code/  # 目标子目录（可选，默认 code/）
 │     → target/app.jar                                            │
 │                                                                 │
 │  2. 上传代码                                                     │
-│     $ curl -X POST /api/v1/apps/app-123/upload                  │
+│     $ curl -X POST /api/v1/userapp/app-123/upload                  │
 │         -F "file=@target/app.jar"                               │
 │     → 存储到 app-workspace/app-123/code/app.jar                 │
 │                                                                 │
 │  3. 创建应用                                                     │
-│     POST /api/v1/apps                                           │
+│     POST /api/v1/userapp                                           │
 │     {                                                           │
 │       "name": "my-java-app",                                    │
 │       "image": "eclipse-temurin:17",                            │
@@ -1366,9 +1366,9 @@ target: code/  # 目标子目录（可选，默认 code/）
 
 | 方法 | 路径 | 描述 |
 |------|------|------|
-| POST | `/api/v1/apps/{id}/upload` | 上传文件 |
-| GET | `/api/v1/apps/{id}/files` | 列出文件 |
-| DELETE | `/api/v1/apps/{id}/files/{path}` | 删除文件 |
+| POST | `/api/v1/userapp/{id}/upload` | 上传文件 |
+| GET | `/api/v1/userapp/{id}/files` | 列出文件 |
+| DELETE | `/api/v1/userapp/{id}/files/{path}` | 删除文件 |
 
 ---
 
@@ -1798,7 +1798,7 @@ struct AppInfo {
 
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/{app_id}",
+    path = "/api/v1/userapp/{app_id}",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),

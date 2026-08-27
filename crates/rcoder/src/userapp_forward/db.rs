@@ -1,6 +1,6 @@
-//! `POST /api/userapp/db/{dev|prod}/align-credentials`：PG 凭据对齐。
+//! `POST /api/v1/userapp/db/{dev|prod}/align-credentials`：PG 凭据对齐。
 //!
-//! 统一前缀 `/api/userapp/db/*`（路径段区分环境，可滤镜、可扩展）：
+//! 统一前缀 `/api/v1/userapp/db/*`（路径段区分环境，可滤镜、可扩展）：
 //! - `dev` → 该 app 的 UserAppBuilder 开发容器（经容器内 file-server
 //!   `execute-command` HTTP 通道执行 psql）
 //! - `prod` → UserApp 运行容器（app_manager runtime exec 通道）
@@ -61,7 +61,7 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
         // 30s 客户端超时: 容器内 execute-command 的服务端超时默认 1800s(为长构建
         // 设计), psql 秒级命令若 PG hang 会拖死对齐接口——传输层兜底
         let resp = crate::http_client::shared_client()
-            .post(format!("{}/api/userapp/execute-command", self.addr))
+            .post(format!("{}/api/v1/userapp/execute-command", self.addr))
             .timeout(std::time::Duration::from_secs(30))
             .json(&json!({"appId": self.app_id, "userId": self.user_id, "command": command}))
             .send()
@@ -87,10 +87,10 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
     }
 }
 
-/// `POST /api/userapp/db/{env}/align-credentials`
+/// `POST /api/v1/userapp/db/{env}/align-credentials`
 #[utoipa::path(
     post,
-    path = "/api/userapp/db/{env}/align-credentials",
+    path = "/api/v1/userapp/db/{env}/align-credentials",
     request_body = shared_types::AlignCredentialsRequest,
     params(
         ("env" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）内的 PG；`prod`=运行容器（UserApp）内的 PG")
@@ -266,10 +266,10 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
     }
 }
 
-/// `POST /api/userapp/db/{env}/reset-password`
+/// `POST /api/v1/userapp/db/{env}/reset-password`
 #[utoipa::path(
     post,
-    path = "/api/userapp/db/{env}/reset-password",
+    path = "/api/v1/userapp/db/{env}/reset-password",
     request_body = shared_types::UserappDbResetPasswordRequest,
     params(
         ("env" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）内的 PG；`prod`=运行容器（UserApp）内的 PG")
@@ -373,10 +373,10 @@ pub(crate) async fn reset_password(
     Ok(HttpResult::success(message))
 }
 
-/// `POST /api/userapp/db/{env}/create-database`
+/// `POST /api/v1/userapp/db/{env}/create-database`
 #[utoipa::path(
     post,
-    path = "/api/userapp/db/{env}/create-database",
+    path = "/api/v1/userapp/db/{env}/create-database",
     request_body = shared_types::UserappDbCreateDatabaseRequest,
     params(
         ("env" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）内的 PG；`prod`=运行容器（UserApp）内的 PG")

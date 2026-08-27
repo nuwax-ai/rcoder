@@ -33,7 +33,7 @@ cleanup_config:
 # 60000 file-server 分流代理（本地 dev 形态：默认 all_rust 全走本服务主端口 8090；
 # TS nuwax-file-server 已由 compose 的 nuwax-file-server 服务（共享网络栈）提供
 # 127.0.0.1:60001，可切 userapp_split/ts_first/all_ts 验证分流——
-# ts_first=仅 /api/userapp*→8090，存量同名接口（含 x-service-type 标记）全走 TS）
+# ts_first=仅 /api/v1/userapp*→8090，存量同名接口（含 x-service-type 标记）全走 TS）
 file_server_proxy:
   listen_port: 60000
   rust_upstream_port: 8090

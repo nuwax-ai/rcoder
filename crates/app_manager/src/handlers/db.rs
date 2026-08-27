@@ -18,7 +18,7 @@ use crate::models::{CreateDatabaseRequest, ResetDbPasswordRequest};
 /// exec 容器内 psql ALTER USER，本地 trust 认证绕过当前密码。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/db/reset-password",
+    path = "/api/v1/userapp/{app_id}/db/reset-password",
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body = ResetDbPasswordRequest,
     responses(
@@ -45,7 +45,7 @@ pub async fn reset_db_password(
 /// 新建 PG 库（exec 容器内 psql CREATE DATABASE）
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/db/create-database",
+    path = "/api/v1/userapp/{app_id}/db/create-database",
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body = CreateDatabaseRequest,
     responses(

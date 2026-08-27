@@ -1,4 +1,4 @@
-//! `/api/userapp/dev/*`: UserApp 开发阶段的服务生命周期 + 开发编译（新契约, appId 唯一 key）。
+//! `/api/v1/userapp/dev/*`: UserApp 开发阶段的服务生命周期 + 开发编译（新契约, appId 唯一 key）。
 //!
 //! 复用 file-server 的 DevServerManager（进程/端口池/探活/日志）与 build 流水线,
 //! 进程 key 用 `userapp:{appId}` 前缀与 web 项目的 projectId 空间隔离
@@ -120,9 +120,9 @@ pub(crate) struct UserappDevList {
 /// 编译可能数分钟。manifest 同核编译（与生产构建同核，dev 编译通过=可部署）
 /// 成功后启动 dev 服务（UserApp workspace = spawn app-cli 按 manifest
 /// run.command 编排全栈，pingap 9080 统一入口）；编译失败任务终态 Failed、
-/// 不启动。进度/结果：轮询 `GET /api/userapp/tasks/{taskId}`、SSE
-/// `/api/userapp/tasks/{taskId}/logs/stream`；终态后端口经
-/// `GET /api/userapp/dev/list` 查询（UserApp workspace 恒为 pingap 9080）。
+/// 不启动。进度/结果：轮询 `GET /api/v1/userapp/tasks/{taskId}`、SSE
+/// `/api/v1/userapp/tasks/{taskId}/logs/stream`；终态后端口经
+/// `GET /api/v1/userapp/dev/list` 查询（UserApp workspace 恒为 pingap 9080）。
 /// 入参 basePath 对 UserApp workspace（manifest/app-cli 引擎）**无效**
 /// ——pingap 路由前缀由各服务 project.manifest.toml `[proxy].path` 决定。
 #[utoipa::path(
@@ -248,7 +248,7 @@ pub(crate) async fn dev_restart(
 pub(crate) struct UserappDevTaskCreated {
     /// 应用 ID
     pub app_id: String,
-    /// 异步任务 ID（轮询 /api/userapp/tasks/{taskId}、SSE /api/userapp/tasks/{taskId}/logs/stream）
+    /// 异步任务 ID（轮询 /api/v1/userapp/tasks/{taskId}、SSE /api/v1/userapp/tasks/{taskId}/logs/stream）
     pub task_id: String,
     /// 受理时状态（恒为 pending——后台任务已创建；与 /tasks/{taskId} 轮询共用
     /// BuildTaskStatus 状态机，序列化值 "pending"）

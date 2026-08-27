@@ -289,7 +289,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GiB（upload 压缩包，覆盖全局 50MB）
         .with_state(app_manager_state);
 
-    // userApp 文件域转发层: /api/userapp/{*rest} 通配透传 + create-workspace 显式入口
+    // userApp 文件域转发层: /api/v1/userapp/{*rest} 通配透传 + create-workspace 显式入口
     // （build/tasks/static 等构建链接口均在 file-server 侧，经此转发直达 builder）
     let userapp_forward_routes = crate::userapp_forward::routes().with_state(state.clone());
 
@@ -355,7 +355,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         // 内部 API（供 rcoder-gateway 调用，绕过 API Key 鉴权）
         .merge(create_internal_routes(state.clone()))
         // file-server 基础路由（TS 移植版老路径：/api/project、/api/computer、/api/git、
-        // /api/build、/api/page；排除 /api/userapp——由 rcoder 转发层接管）。
+        // /api/build、/api/page；排除 /api/v1/userapp——由 rcoder 转发层接管）。
         // 与 TS 行为一致不设 API key → merge 在 api-key layer 之后（同 internal 先例）；
         // 构造失败不阻断主服务启动（warn 可见，缺路由面可诊断）。
         // computer 域拦截层：header X-Service-Type=userapp 的请求短路转发到该 app

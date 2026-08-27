@@ -1,8 +1,8 @@
 # 导入已有项目与排错
 
 ```text
-POST /api/userapp/projects/detect
-POST /api/userapp/projects/confirm
+POST /api/v1/userapp/projects/detect
+POST /api/v1/userapp/projects/confirm
 ```
 
 请求提供 `appId` 和 workspace 一级 `projectDir`。detect 只读取 package.json、pom.xml、

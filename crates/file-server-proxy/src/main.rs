@@ -60,10 +60,10 @@ fn usage() -> String {
          TS_UPSTREAM_PORT / ROUTE_POLICY / EMBED_FILE_SERVER). Default policy is\n\
          all_rust; embed is off by default (pure forward mode for containers).\n\n\
          Policies:\n  \
-         userapp_split  /api/userapp* or x-service-type:userapp -> rust; rest -> ts\n  \
+         userapp_split  /api/v1/userapp* or x-service-type:userapp -> rust; rest -> ts\n  \
          all_rust       everything -> rust upstream\n  \
          all_ts         everything -> ts upstream\n  \
-         ts_first       only /api/userapp* -> rust; legacy paths -> ts (even with\n\
+         ts_first       only /api/v1/userapp* -> rust; legacy paths -> ts (even with\n\
          x-service-type header - ts handles service_type in-band)",
         env!("CARGO_PKG_VERSION")
     )
@@ -334,7 +334,7 @@ fn prepare_embed() -> Result<
     let server = file_server::FileServer::builder(config)
         .build()
         .map_err(|e| format!("build embedded file-server: {e:#}"))?;
-    // 独立全量集（含 /、/health、swagger 与完整中间件栈 + /api/userapp 子树——
+    // 独立全量集（含 /、/health、swagger 与完整中间件栈 + /api/v1/userapp 子树——
     // userApp 域拆至 file-server-userapp crate，组装经其 full_router）——直连行为
     // 与原独立 file-server bin 完全同构
     let router = file_server_userapp::full_router(&server)

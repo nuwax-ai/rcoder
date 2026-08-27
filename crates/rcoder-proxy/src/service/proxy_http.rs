@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn other_routes_do_not_wake() {
         let router = test_router();
-        assert!(classify_wake_target(&router, "/api/userapp/build").is_none());
+        assert!(classify_wake_target(&router, "/api/v1/userapp/build").is_none());
         assert!(classify_wake_target(&router, "/web/ttyd/u1").is_none());
         // dev 工具族走 builder 注册表定位，不在 prod 唤醒范围
         assert!(classify_wake_target(&router, "/userapp/dev/ttyd/app-1").is_none());

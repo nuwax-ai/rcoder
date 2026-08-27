@@ -124,7 +124,7 @@ data: {"event":"<事件类型>", <事件字段...>}   // data 为事件对象全
 ```bash
 # 记住 last_seq，重连时传 from_seq
 LAST_SEQ=15
-curl -N "$RCODER/api/v1/apps/publish/tasks/$TASK_ID/stream?from_seq=$LAST_SEQ"
+curl -N "$RCODER/api/v1/userapp/publish/tasks/$TASK_ID/stream?from_seq=$LAST_SEQ"
 ```
 
 ---
@@ -167,7 +167,7 @@ LAST_SEQ=0
 
 while true; do
   # SSE 流式消费，每条事件带 id: <seq>
-  curl -sN "$RCODER/api/v1/apps/publish/tasks/$TASK_ID/stream?from_seq=$LAST_SEQ" | \
+  curl -sN "$RCODER/api/v1/userapp/publish/tasks/$TASK_ID/stream?from_seq=$LAST_SEQ" | \
   while IFS= read -r line; do
     case "$line" in
       id:*) LAST_SEQ="${line#id: }" ;;

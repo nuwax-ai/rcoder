@@ -22,7 +22,7 @@ use crate::models::{
 /// 实时查集群 + 过滤/分页；仅 status/app_ids 过滤生效。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/query",
+    path = "/api/v1/userapp/query",
     request_body = QueryAppsRequest,
     responses(
         (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<AppRuntimeInfo>>),
@@ -45,7 +45,7 @@ pub async fn query_apps(
 /// 供 Java 在 rcoder/自身重启后对账（rcoder 不持久化 app 元数据）。
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/runtime",
+    path = "/api/v1/userapp/runtime",
     responses(
         (status = 200, description = "对账成功", body = HttpResult<Vec<AppRuntimeInfo>>),
         (status = 500, description = "集群查询失败", body = HttpResult<String>)
@@ -64,7 +64,7 @@ pub async fn list_app_runtimes(
 /// 获取应用运行时详情（实时查集群）
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/{app_id}",
+    path = "/api/v1/userapp/{app_id}",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),
@@ -90,7 +90,7 @@ pub async fn get_app(
 /// Docker 重建容器；工作空间目录保留。详见设计文档 §5.2。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/update",
+    path = "/api/v1/userapp/{app_id}/update",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),
@@ -117,7 +117,7 @@ pub async fn update_app(
 /// 默认保留持久存储；body `{"purge": true}` 一键连数据面一起清空。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/delete",
+    path = "/api/v1/userapp/{app_id}/delete",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),

@@ -16,7 +16,7 @@ use crate::models::{DestroyStorageRequest, PaginatedResponse, QueryStorageReques
 /// 查询应用持久存储状态
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/{app_id}/storage",
+    path = "/api/v1/userapp/{app_id}/storage",
     params(("app_id" = String, Path, description = "应用 ID")),
     responses(
         (status = 200, description = "查询成功", body = HttpResult<StorageInfo>),
@@ -39,7 +39,7 @@ pub async fn get_app_storage(
 /// 留 PVC，可恢复；仅当 app 已 delete 时允许，否则 409 INVALID_STATE。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/storage/clear",
+    path = "/api/v1/userapp/{app_id}/storage/clear",
     params(("app_id" = String, Path, description = "应用 ID")),
     responses(
         (status = 200, description = "清空成功", body = HttpResult<String>),
@@ -63,7 +63,7 @@ pub async fn clear_app_storage(
 /// 高危·不可逆·释放配额；需 body `confirm=app_id`，仅 app 已 delete 后允许。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/storage/destroy",
+    path = "/api/v1/userapp/{app_id}/storage/destroy",
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body = DestroyStorageRequest,
     responses(
@@ -93,7 +93,7 @@ pub async fn destroy_app_storage(
 /// 分页查询持久存储（强制分页，无全量模式）
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/storage/query",
+    path = "/api/v1/userapp/storage/query",
     request_body = QueryStorageRequest,
     responses(
         (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<StorageInfo>>),

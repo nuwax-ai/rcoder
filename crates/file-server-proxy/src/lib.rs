@@ -2,11 +2,11 @@
 //!
 //! 架构位置：Java/外部 → `:60000` 本代理 → 按策略分流（词汇表
 //! `userapp_split | all_rust | all_ts | ts_first`，serde/CLI/env/helm 四层同源）：
-//! - `userapp_split`（默认）：`/api/userapp*` 前缀，**或** `x-service-type: userapp`
+//! - `userapp_split`（默认）：`/api/v1/userapp*` 前缀，**或** `x-service-type: userapp`
 //!   header → rust 上游；其余 → TS（存量域继续 TS nuwax-file-server）
 //! - `all_rust`：一律 rust 上游（60000 白名单：`/api/*`、`/health`、`/`、`/api-docs*`）
 //! - `all_ts`：一律 TS 上游（Rust 故障回退/AB 对照档）
-//! - `ts_first`：**仅** `/api/userapp*`（TS 无此路由）→ rust 上游；存量同名接口
+//! - `ts_first`：**仅** `/api/v1/userapp*`（TS 无此路由）→ rust 上游；存量同名接口
 //!   全走 TS——含带 userApp 标记的请求（header 判据失效，由 TS 以 service_type
 //!   入参内部处理 userApp 业务；过渡切流档）
 //!
@@ -17,7 +17,7 @@
 //!   请求直接 `router.oneshot` 进以 lib 集成的 file-server axum Router——无内部
 //!   监听端口、零 loopback 跳（npm/Electron 独立形态）
 //!
-//! 双判据的由来：`/api/userapp` 前缀是 userApp 新契约的专属路径（TS 无此路由，
+//! 双判据的由来：`/api/v1/userapp` 前缀是 userApp 新契约的专属路径（TS 无此路由，
 //! 按 path 分流零歧义）——Java 同事尚未接入 header 契约时的兜底判据；
 //! `x-service-type` 是存量路径（computer/project 等两实现同构）上的业务域显式
 //! 声明——Java 同事接入后的正名路径。两者任一命中即走 Rust 上游
@@ -25,7 +25,7 @@
 //!
 //! **header 契约**（待传达给 Java 同事）：
 //! - 走 60000 入口的 userApp 业务请求（含存量路径形态）带 `x-service-type: userapp`
-//! - 直连 8086 的 `/api/userapp/*` 请求带 `x-app-id: {app_id}`（转发定位容器；
+//! - 直连 8086 的 `/api/v1/userapp/*` 请求带 `x-app-id: {app_id}`（转发定位容器；
 //!   POST/multipart 的 app_id 不解析 body 拿不到，header 是唯一无损通道）
 //!
 //! 独立 crate 而不入 rcoder-proxy：rcoder-proxy 是端口参数化容器反代，本模块
@@ -56,7 +56,7 @@ use tracing::{error, info, warn};
 pub use shared_types::{SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP};
 
 /// userApp 业务路由前缀（header 未接入期的兜底判据）。
-pub const USERAPP_PATH_PREFIX: &str = "/api/userapp";
+pub const USERAPP_PATH_PREFIX: &str = "/api/v1/userapp";
 
 /// 60000（对外入口）与 60001（TS 内部端口）的单一事实源见 shared_types。
 pub use shared_types::{AGENT_FILE_SERVER_PORT, NUWAX_FILE_SERVER_INTERNAL_PORT};
@@ -113,9 +113,9 @@ pub enum RoutePolicy {
     AllRust,
     /// 全 TS 模式（npm 独立形态的回退/AB 对照档）：一律 ts 上游。
     /// 无路径白名单（TS 本就是全量老路由面，白名单语义不适用）；
-    /// TS 没有的 userApp 新接口（/api/userapp/*）在此模式下由 TS 返回 404。
+    /// TS 没有的 userApp 新接口（/api/v1/userapp/*）在此模式下由 TS 返回 404。
     AllTs,
-    /// TS 优先模式（过渡切流档）：**仅** Rust 独有接口（`/api/userapp*`，TS 无
+    /// TS 优先模式（过渡切流档）：**仅** Rust 独有接口（`/api/v1/userapp*`，TS 无
     /// 此路由）→ rust 上游；存量同名接口**全走 TS**（含带 `x-service-type`
     /// 标记的请求——header 判据在此模式下失效，由 TS 以 service_type 入参
     /// 内部消费 userApp 业务）。验证 TS 侧 userApp 能力就绪后的整体切流形态。
@@ -160,10 +160,10 @@ pub enum Upstream {
     Ts(u16),
 }
 
-/// userApp 路径前缀的段边界形式（`/api/userapplication` 不误命中）。
-const USERAPP_PATH_PREFIX_SLASH: &str = "/api/userapp/";
+/// userApp 路径前缀的段边界形式（`/api/v1/userapplication` 不误命中）。
+const USERAPP_PATH_PREFIX_SLASH: &str = "/api/v1/userapp/";
 
-/// userApp 业务判定的 path 判据：`/api/userapp` 精确或 `/api/userapp/*`。
+/// userApp 业务判定的 path 判据：`/api/v1/userapp` 精确或 `/api/v1/userapp/*`。
 /// TS 无此路由（走 TS 也 404），按前缀分流零歧义——Java 同事加
 /// `x-service-type` header 前的兜底判据，header 是未来的正名路径。
 fn is_userapp_path(path: &str) -> bool {
@@ -179,11 +179,11 @@ fn is_userapp_service_type(header_value: Option<&str>) -> bool {
 
 impl FileServerProxyConfig {
     /// 分流规则纯函数（按 [`RoutePolicy`] 分派）：
-    /// - [`RoutePolicy::UserappSplit`]：`/api/userapp*` 前缀或
+    /// - [`RoutePolicy::UserappSplit`]：`/api/v1/userapp*` 前缀或
     ///   `x-service-type: userapp` header（任一命中）→ Rust 上游，其余 → TS 上游
     /// - [`RoutePolicy::AllRust`]：一律 Rust 上游
     /// - [`RoutePolicy::AllTs`]：一律 TS 上游
-    /// - [`RoutePolicy::TsFirst`]：仅 `/api/userapp*` → Rust 上游（header 判据
+    /// - [`RoutePolicy::TsFirst`]：仅 `/api/v1/userapp*` → Rust 上游（header 判据
     ///   失效，存量同名接口含 userApp 标记一律 TS）
     pub fn upstream_port_for(&self, path: &str, service_type_header: Option<&str>) -> Upstream {
         let to_rust = match self.policy {
@@ -432,7 +432,7 @@ async fn serve(
     }
 }
 
-/// 单请求转发：按 `/api/userapp*` 前缀或 `x-service-type` header 选上游，
+/// 单请求转发：按 `/api/v1/userapp*` 前缀或 `x-service-type` header 选上游，
 /// 方法/路径/headers/body 原样透传。
 ///
 /// 上游不可达返回 502（不向客户端裸抛连接错误）。
@@ -635,11 +635,11 @@ mod tests {
         );
         // path 判据（userApp 新契约前缀；Java 未接 header 期的兜底）
         assert_eq!(
-            c.upstream_port_for("/api/userapp/dev/start", None),
+            c.upstream_port_for("/api/v1/userapp/dev/start", None),
             Upstream::Rust(8086)
         );
         assert_eq!(
-            c.upstream_port_for("/api/userapp", None),
+            c.upstream_port_for("/api/v1/userapp", None),
             Upstream::Rust(8086)
         );
         // 双判据都未命中 → TS
@@ -658,9 +658,9 @@ mod tests {
                 "{path}"
             );
         }
-        // 段边界: /api/userapplication 不是 userApp 域
+        // 段边界: /api/v1/userapplication 不是 userApp 域
         assert_eq!(
-            c.upstream_port_for("/api/userapplication", None),
+            c.upstream_port_for("/api/v1/userapplication", None),
             Upstream::Ts(60001)
         );
         // 非本业务域声明（computer 等）与空值一律 TS——契约违规 404 可见而非静默误路由
@@ -697,7 +697,7 @@ mod tests {
             ("/api/version", None),
             ("/api/computer/create-workspace", None),
             ("/api/computer/create-workspace", Some("computer")),
-            ("/api/userapp/dev/start", None),
+            ("/api/v1/userapp/dev/start", None),
             ("/", Some("")),
         ] {
             assert_eq!(
@@ -720,7 +720,7 @@ mod tests {
         };
         for (path, header) in [
             ("/health", None),
-            ("/api/userapp/dev/start", None),
+            ("/api/v1/userapp/dev/start", None),
             // userApp 显式 header 也走 TS——全 TS 语义优先于域判据
             ("/api/computer/get-file-list", Some("userapp")),
             ("/api/version", None),
@@ -773,7 +773,7 @@ mod tests {
 
     /// TS 优先模式（TsFirst）：存量同名接口全走 TS——**含 userApp 标记**
     /// （header 判据失效，由 TS 以 service_type 入参消费）；仅 Rust 独有的
-    /// `/api/userapp*` 走 rust。与 UserappSplit 的差异点就在 header 判据。
+    /// `/api/v1/userapp*` 走 rust。与 UserappSplit 的差异点就在 header 判据。
     #[test]
     fn ts_first_policy_routes_legacy_to_ts_even_with_userapp_header() {
         let c = FileServerProxyConfig {
@@ -784,9 +784,9 @@ mod tests {
         };
         // Rust 独有接口 → rust
         for path in [
-            "/api/userapp",
-            "/api/userapp/dev/start",
-            "/api/userapp/files",
+            "/api/v1/userapp",
+            "/api/v1/userapp/dev/start",
+            "/api/v1/userapp/files",
         ] {
             assert_eq!(
                 c.upstream_port_for(path, None),
@@ -801,7 +801,7 @@ mod tests {
             ("/api/project/content", Some("userapp")),
             ("/health", None),
             ("/api/version", None),
-            ("/api/userapplication", None),
+            ("/api/v1/userapplication", None),
         ] {
             assert_eq!(
                 c.upstream_port_for(path, header),
@@ -820,7 +820,7 @@ mod tests {
             policy: RoutePolicy::UserappSplit,
         };
         assert_eq!(
-            c.upstream_port_for("/api/userapp/dev/start", None),
+            c.upstream_port_for("/api/v1/userapp/dev/start", None),
             Upstream::Rust(18086)
         );
         assert_eq!(c.upstream_port_for("/health", None), Upstream::Ts(6001));
@@ -842,7 +842,7 @@ mod tests {
         for path in [
             "/api/version",
             "/api/computer/create-workspace",
-            "/api/userapp/dev/start",
+            "/api/v1/userapp/dev/start",
             "/health",
             "/",
             "/api-docs/openapi.json",

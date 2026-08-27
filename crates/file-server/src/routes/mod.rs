@@ -3,7 +3,7 @@
 //! 本模块只维护 method、URL 前缀与 handler 的映射。HTTP 提取、DTO、utoipa 注解
 //! 位于 [`crate::handlers`]，业务实现位于 [`crate::service`]。
 //!
-//! `/api/userapp` 域已拆出至 file-server-userapp crate（洋葱模型：依赖本 crate
+//! `/api/v1/userapp` 域已拆出至 file-server-userapp crate（洋葱模型：依赖本 crate
 //! 共享设施）；全量/container 形态的 userapp 子树由该 crate 的组装函数提供
 //! （`file_server_userapp::full_router` / `container_router`）。
 
@@ -31,7 +31,7 @@ pub fn api_router() -> OpenApiRouter<AppState> {
 ///
 /// 排除项与原因：
 /// - `/`、`/health`：与 rcoder 主 Router 的健康检查路由冲突（axum merge 同路径 panic）
-/// - `/api/userapp`：userApp 域由 rcoder 侧转发层接管（透传到 per-app 开发容器），
+/// - `/api/v1/userapp`：userApp 域由 rcoder 侧转发层接管（透传到 per-app 开发容器），
 ///   本地实现仅存在于开发容器内（file-server-userapp crate）
 /// - swagger UI（`/api-docs`）：rcoder 已在 `/api/docs` 聚合 file-server 全量文档
 ///
@@ -49,9 +49,9 @@ pub fn api_router_base() -> OpenApiRouter<AppState> {
 /// agent-runner 开发容器内嵌形态路由（全量 [`api_router`] 的子集）。
 ///
 /// 与 [`api_router_base`] 的差异：不含 swagger/fallback/`/`、`/health`（与宿主
-/// agent_runner 冲突）。`/api/userapp` 子树由调用方（agent_runner embed）经
+/// agent_runner 冲突）。`/api/v1/userapp` 子树由调用方（agent_runner embed）经
 /// `file_server_userapp::container_router` 追加——开发容器是 userApp 域本地
-/// 实现的宿主（曾因误用 base 集导致容器内 /api/userapp/* 全 404）。
+/// 实现的宿主（曾因误用 base 集导致容器内 /api/v1/userapp/* 全 404）。
 pub fn api_router_container() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(health::version))

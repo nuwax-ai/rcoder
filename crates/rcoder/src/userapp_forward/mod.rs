@@ -1,9 +1,9 @@
 //! userApp 文件域转发层（rcoder 侧编排，实际处理在 per-app 开发容器内 file-server）。
 //!
-//! - [`forward`]：`/api/userapp/{*rest}` 通配透传 + `/api/computer/*` 拦截层
+//! - [`forward`]：`/api/v1/userapp/{*rest}` 通配透传 + `/api/computer/*` 拦截层
 //!   （`X-Service-Type: userapp` 分流，反向代理转来的 TS 老路径原样透传）
-//! - [`workspace`]：`POST /api/userapp/workspace` 创建项目显式入口
-//! - [`db`]：`POST /api/userapp/db/{env}/align-credentials` PG 凭据对齐
+//! - [`workspace`]：`POST /api/v1/userapp/workspace` 创建项目显式入口
+//! - [`db`]：`POST /api/v1/userapp/db/{env}/align-credentials` PG 凭据对齐
 //! - 本模块：路由聚合 + 开发容器 ensure-workspace 公共调用
 //!
 //! 容器定位/创建复用 [`crate::userapp_builder::ensure_userapp_builder`]
@@ -26,24 +26,27 @@ use crate::router::AppState;
 pub(crate) use forward::computer_intercept;
 pub(crate) use forward::invalidate_probe_cache;
 
-/// userApp 域转发路由（挂 rcoder 主 Router；`/api/userapp` 族不再来自 file-server
+/// userApp 域转发路由（挂 rcoder 主 Router；`/api/v1/userapp` 族不再来自 file-server
 /// 本地路由——路由合并时已排除）。
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/userapp/workspace", post(workspace::create_workspace))
         .route(
-            "/api/userapp/db/{env}/align-credentials",
+            "/api/v1/userapp/workspace",
+            post(workspace::create_workspace),
+        )
+        .route(
+            "/api/v1/userapp/db/{env}/align-credentials",
             post(db::align_credentials),
         )
         .route(
-            "/api/userapp/db/{env}/reset-password",
+            "/api/v1/userapp/db/{env}/reset-password",
             post(db::reset_password),
         )
         .route(
-            "/api/userapp/db/{env}/create-database",
+            "/api/v1/userapp/db/{env}/create-database",
             post(db::create_database),
         )
-        .route("/api/userapp/{*rest}", any(forward::forward_userapp))
+        .route("/api/v1/userapp/{*rest}", any(forward::forward_userapp))
 }
 
 /// 容器内 file-server 幂等建 workspace 目录（execute-command 等接口的 cwd 前置；
@@ -87,7 +90,7 @@ pub(crate) async fn ensure_workspace_via_dev(
             tokio::time::sleep(sleep).await;
         }
         let resp = crate::http_client::shared_client()
-            .post(format!("{addr}/api/userapp/ensure-workspace"))
+            .post(format!("{addr}/api/v1/userapp/ensure-workspace"))
             .timeout(std::time::Duration::from_secs(30))
             .json(&serde_json::json!({"appId": app_id, "userId": user_id}))
             .send()

@@ -6,7 +6,7 @@
 /// workspace 到开发卷。HTTP header 名小写（HTTP/1.1 大小写不敏感）。
 pub const SERVICE_TYPE_HEADER: &str = "x-service-type";
 
-/// userApp 场景标记值（与 /api/userapp 前缀对齐；chat body 的 `service_type`
+/// userApp 场景标记值（与 /api/v1/userapp 前缀对齐；chat body 的 `service_type`
 /// 字段同词表）。匹配不区分大小写（[`is_userapp_service_type_value`] 归一后比较），
 /// 但推荐 wire 上一律传全小写 `userapp`。
 pub const SERVICE_TYPE_USERAPP: &str = "userapp";

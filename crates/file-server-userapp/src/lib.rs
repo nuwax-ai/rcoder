@@ -1,4 +1,4 @@
-//! file-server-userapp：UserApp 域（`/api/userapp/*`）独立 crate。
+//! file-server-userapp：UserApp 域（`/api/v1/userapp/*`）独立 crate。
 //!
 //! 自 file-server 拆出（洋葱模型：本 crate 依赖 file-server 共享设施，反向无依赖）：
 //! - 错误出口 [`error`]：`UserAppError` 直渲 HttpResult + 语义状态码，
@@ -24,20 +24,20 @@ pub use routes::document;
 pub use state::UserAppState;
 
 /// 独立全量形态：file-server 全量 router（TS 对齐 + swagger + fallback）+
-/// `/api/userapp` 子树（同款公共中间件栈）。file-server-proxy embed 消费。
+/// `/api/v1/userapp` 子树（同款公共中间件栈）。file-server-proxy embed 消费。
 pub fn full_router(server: &file_server::FileServer) -> Result<Router> {
     let base = server.router()?;
     Ok(base.merge(userapp_subrouter(server)?))
 }
 
-/// 开发容器形态：file-server container 路由集 + `/api/userapp` 子树。
+/// 开发容器形态：file-server container 路由集 + `/api/v1/userapp` 子树。
 /// agent_runner embed 消费（容器是 userApp 域本地实现的宿主）。
 pub fn container_router(server: &file_server::FileServer) -> Result<Router> {
     let base = server.router_container()?;
     Ok(base.merge(userapp_subrouter(server)?))
 }
 
-/// `/api/userapp` 子树（独立 state：UserAppState；公共中间件栈与 file-server
+/// `/api/v1/userapp` 子树（独立 state：UserAppState；公共中间件栈与 file-server
 /// 侧同源——`apply_common_layers` 单一事实源）。
 fn userapp_subrouter(server: &file_server::FileServer) -> Result<Router> {
     let body_limit = usize::try_from(server.state().config.request_body_max_bytes)

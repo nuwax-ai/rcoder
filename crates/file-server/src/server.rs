@@ -101,11 +101,11 @@ impl FileServer {
     /// 合并进 rcoder 主服务用的基础路由（[`crate::routes::api_router_base`]）。
     ///
     /// 与 [`Self::router`] 的差异：不含 swagger UI、不设 fallback（axum 不允许
-    /// 双 fallback merge 进主 Router）、不含 `/`、`/health`、`/api/userapp`
+    /// 双 fallback merge 进主 Router）、不含 `/`、`/health`、`/api/v1/userapp`
     /// （排除原因见 `routes::api_router_base` 文档）。中间件层（body limit/
     /// request_id/locale/请求日志/TraceLayer）随子路由生效于本子树。
     /// agent-runner 开发容器内嵌形态（[`crate::routes::api_router_container`]）：
-    /// 全量业务路由**含 `/api/userapp`**（容器是 userApp 域本地实现的宿主），
+    /// 全量业务路由**含 `/api/v1/userapp`**（容器是 userApp 域本地实现的宿主），
     /// 不含 swagger/fallback/`/`/`/health`（与宿主 agent_runner 冲突）。
     /// 中间件栈与 [`Self::router_base`] 一致（含 scope_userapp_flag——容器内
     /// X-Service-Type 切开发卷的主场景层）。

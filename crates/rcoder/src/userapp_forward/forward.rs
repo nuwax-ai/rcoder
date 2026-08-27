@@ -6,7 +6,7 @@
 //! - `prod`：UserApp 生产运行容器（存在性检查 + 唤醒 + 确定性命名定位）
 //!
 //! 两类入口共用 [`forward_to_dev`]/[`forward_to_prod`]：
-//! - `/api/userapp/{*rest}` 通配透传（Java 直调的新接口族）
+//! - `/api/v1/userapp/{*rest}` 通配透传（Java 直调的新接口族）
 //! - `/api/computer/*` 拦截层（反向代理转来的 TS 老路径 + `X-Service-Type: userapp`
 //!   header 分流，路径原样 body 零解析——multipart 在代理层不可解，复杂度内聚于此）
 //!
@@ -345,7 +345,7 @@ enum AppStage {
     Prod,
 }
 
-/// `/api/userapp/{*rest}` 通配透传 handler。
+/// `/api/v1/userapp/{*rest}` 通配透传 handler。
 pub(crate) async fn forward_userapp(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     req: Request,
@@ -380,7 +380,7 @@ pub(crate) async fn forward_userapp(
 /// `/api/computer/*` 拦截层：header `X-Service-Type: userapp` 即短路转发该 app
 /// 目标容器**同路径**（TS 路径原样、body 零解析，header 随请求透传供容器内
 /// computer handler 消费做 workspace 切换）；无该 header 落本地移植 handler。
-/// `X-App-Stage` 同样生效（缺省 dev，与 /api/userapp/* 分派一致）。
+/// `X-App-Stage` 同样生效（缺省 dev，与 /api/v1/userapp/* 分派一致）。
 pub(crate) async fn computer_intercept(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     req: Request,

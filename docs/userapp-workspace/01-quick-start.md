@@ -14,7 +14,7 @@ workspace/
 构建：
 
 ```http
-POST /api/userapp/build
+POST /api/v1/userapp/build
 Content-Type: application/json
 
 {"appId":"app-example"}

@@ -23,7 +23,7 @@ use super::AppManagerState;
 /// 应用声明的日志源与匹配到的日志文件（转发 app-cli /v1/logs/sources/query）。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/logs/sources/query",
+    path = "/api/v1/userapp/{app_id}/logs/sources/query",
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body = AppLogQueryRequest,
     responses(
@@ -48,7 +48,7 @@ pub async fn query_app_log_sources(
 /// 多服务日志快照，带 checkpoint 游标支持增量拉取（转发 app-cli /v1/logs/query）。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/logs/query",
+    path = "/api/v1/userapp/{app_id}/logs/query",
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body = AppLogQueryRequest,
     responses(
@@ -73,7 +73,7 @@ pub async fn query_app_logs(
 /// 转发 app-cli /v1/logs/stream，Content-Type: text/event-stream。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/logs/stream",
+    path = "/api/v1/userapp/{app_id}/logs/stream",
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body = AppLogQueryRequest,
     responses(

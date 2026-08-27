@@ -33,7 +33,7 @@ RCoder 对外提供一套 REST API，让你把一个多语言容器镜像（Java
 | **[09-操作与运维接口](./09-操作与运维接口.md)** | **新增** | 启停/重启/回收策略/URL上传/存储销毁/数据库管理 |
 | **[10-发布与版本管理](./10-发布与版本管理.md)** | **新增** | Java 六步发布编排（build→取包→中转→start+url 部署）+ 失败保留现场 + rollback + 状态机 |
 | **[11-任务与SSE事件](./11-任务与SSE事件.md)** | **新增** | 构建发布任务查询 + SSE 实时进度事件格式 + 断线重连 |
-| **[12-开发模式与文件接口](./12-开发模式与文件接口.md)** | **新增** | per-app 开发容器（RWO 块卷）+ `/api/userapp` 文件接口族 + AI 开发对话 + PG 凭据对齐 + 反代分流下的 Java 对接 |
+| **[12-开发模式与文件接口](./12-开发模式与文件接口.md)** | **新增** | per-app 开发容器（RWO 块卷）+ `/api/v1/userapp` 文件接口族 + AI 开发对话 + PG 凭据对齐 + 反代分流下的 Java 对接 |
 | **[13-反向代理对接指引](./13-反向代理对接指引.md)** | **新增** | 60000 反代分流规则 + X-Service-Type/X-App-Id header 约定 + TS↔userApp 路径对照表 + 开发域终端/桌面代理（/userapp/*）+ 端口表（给实现代理的同事） |
 
 > **建议顺序**：01 → 02（快速浏览）→ 05（跑一遍场景）→ 06（发布流程）→ 遇到错误查 03 → 发布细节查 10/11。
@@ -82,45 +82,45 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate 链路
 ## 接口总览（37 个）
 
 ```
-生命周期   POST   /api/v1/apps                                创建（异步）
-           POST   /api/v1/apps/query                          查询列表（body 过滤/分页）
-           GET    /api/v1/apps/runtime                        对账：列全部托管应用
-           GET    /api/v1/apps/{app_id}                       运行时详情（observed）
-           POST   /api/v1/apps/{app_id}/update                更新（全量替换）
-           POST   /api/v1/apps/{app_id}/delete                删除（默认保留数据）
+生命周期   POST   /api/v1/userapp                                创建（异步）
+           POST   /api/v1/userapp/query                          查询列表（body 过滤/分页）
+           GET    /api/v1/userapp/runtime                        对账：列全部托管应用
+           GET    /api/v1/userapp/{app_id}                       运行时详情（observed）
+           POST   /api/v1/userapp/{app_id}/update                更新（全量替换）
+           POST   /api/v1/userapp/{app_id}/delete                删除（默认保留数据）
 
-操作       POST   /api/v1/apps/{app_id}/start                 启动（scale=1）
-           POST   /api/v1/apps/{app_id}/stop                  停止（scale=0）
-           POST   /api/v1/apps/{app_id}/restart               重启（rollout）
-           POST   /api/v1/apps/{app_id}/recycle-policy        设置闲置回收策略（免重启）
+操作       POST   /api/v1/userapp/{app_id}/start                 启动（scale=1）
+           POST   /api/v1/userapp/{app_id}/stop                  停止（scale=0）
+           POST   /api/v1/userapp/{app_id}/restart               重启（rollout）
+           POST   /api/v1/userapp/{app_id}/recycle-policy        设置闲置回收策略（免重启）
 
-日志       POST   /api/v1/apps/{app_id}/logs/sources/query    查询声明的日志源
-           POST   /api/v1/apps/{app_id}/logs/query            多服务文件日志快照
-           POST   /api/v1/apps/{app_id}/logs/stream           SSE 实时流
-           GET    /api/v1/apps/{app_id}/health                健康状态
-           GET    /api/v1/apps/{app_id}/stats                 资源使用（best-effort）
-           GET    /api/v1/apps/{app_id}/events                应用事件
+日志       POST   /api/v1/userapp/{app_id}/logs/sources/query    查询声明的日志源
+           POST   /api/v1/userapp/{app_id}/logs/query            多服务文件日志快照
+           POST   /api/v1/userapp/{app_id}/logs/stream           SSE 实时流
+           GET    /api/v1/userapp/{app_id}/health                健康状态
+           GET    /api/v1/userapp/{app_id}/stats                 资源使用（best-effort）
+           GET    /api/v1/userapp/{app_id}/events                应用事件
 
-文件管理   POST   /api/v1/apps/{app_id}/upload                上传文件（multipart）
-           POST   /api/v1/apps/{app_id}/upload-from-url       从 URL 下载并上传
-           GET    /api/v1/apps/{app_id}/files                 列出文件
-           POST   /api/v1/apps/{app_id}/files/delete          删除文件
+文件管理   POST   /api/v1/userapp/{app_id}/upload                上传文件（multipart）
+           POST   /api/v1/userapp/{app_id}/upload-from-url       从 URL 下载并上传
+           GET    /api/v1/userapp/{app_id}/files                 列出文件
+           POST   /api/v1/userapp/{app_id}/files/delete          删除文件
 
-持久存储   GET    /api/v1/apps/{app_id}/storage               查询存储状态
-           POST   /api/v1/apps/{app_id}/storage/clear         清空内容（留 PVC）
-           POST   /api/v1/apps/{app_id}/storage/destroy      销毁 PVC（高危·不可逆）
-           POST   /api/v1/apps/storage/query                  分页查询存储
+持久存储   GET    /api/v1/userapp/{app_id}/storage               查询存储状态
+           POST   /api/v1/userapp/{app_id}/storage/clear         清空内容（留 PVC）
+           POST   /api/v1/userapp/{app_id}/storage/destroy      销毁 PVC（高危·不可逆）
+           POST   /api/v1/userapp/storage/query                  分页查询存储
 
-数据库     POST   /api/v1/apps/{app_id}/db/reset-password     重置 PG 密码
-           POST   /api/v1/apps/{app_id}/db/create-database    新建 PG 库
+数据库     POST   /api/v1/userapp/{app_id}/db/reset-password     重置 PG 密码
+           POST   /api/v1/userapp/{app_id}/db/create-database    新建 PG 库
 
 
-构建发布   POST   /api/v1/apps/{app_id}/build                        触发源码构建（自动建 Builder）
-           POST   /api/v1/apps/{app_id}/publish                      完整发布（一步）
-           POST   /api/v1/apps/publish/tasks/query                   任务列表分页查询
-           GET    /api/v1/apps/publish/tasks/{task_id}               任务状态快照
-           GET    /api/v1/apps/publish/tasks/{task_id}/stream        SSE 实时进度
-           POST   /api/v1/apps/publish/tasks/{task_id}/cancel        取消任务
+构建发布   POST   /api/v1/userapp/{app_id}/build                        触发源码构建（自动建 Builder）
+           POST   /api/v1/userapp/{app_id}/publish                      完整发布（一步）
+           POST   /api/v1/userapp/publish/tasks/query                   任务列表分页查询
+           GET    /api/v1/userapp/publish/tasks/{task_id}               任务状态快照
+           GET    /api/v1/userapp/publish/tasks/{task_id}/stream        SSE 实时进度
+           POST   /api/v1/userapp/publish/tasks/{task_id}/cancel        取消任务
 
 代理访问   GET    /proxy/userapp/prod/{user_id}/{app_id}/{path}                 访问部署的应用
 ```

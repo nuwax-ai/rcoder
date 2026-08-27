@@ -325,19 +325,19 @@ pub struct ApiDoc;
 /// 文档不暴露——Java 同事调 computer 域同名接口，带 `x-service-type: userapp`
 /// header 经 60000 分流代理内部路由到这些；直接暴露会让调用方绕过分流契约。
 const INTERNAL_USERAPP_PATHS: [&str; 13] = [
-    "/api/userapp/download-all-files",
-    "/api/userapp/files-update",
-    "/api/userapp/generate-file",
-    "/api/userapp/get-file-list",
-    "/api/userapp/import-project",
-    "/api/userapp/execute-command",
-    "/api/userapp/push-skills-to-workspace",
-    "/api/userapp/resolve-file",
-    "/api/userapp/search-files",
-    "/api/userapp/upload-file",
-    "/api/userapp/upload-files",
-    "/api/userapp/workspace",
-    "/api/userapp/zip-workspace",
+    "/api/v1/userapp/download-all-files",
+    "/api/v1/userapp/files-update",
+    "/api/v1/userapp/generate-file",
+    "/api/v1/userapp/get-file-list",
+    "/api/v1/userapp/import-project",
+    "/api/v1/userapp/execute-command",
+    "/api/v1/userapp/push-skills-to-workspace",
+    "/api/v1/userapp/resolve-file",
+    "/api/v1/userapp/search-files",
+    "/api/v1/userapp/upload-file",
+    "/api/v1/userapp/upload-files",
+    "/api/v1/userapp/workspace",
+    "/api/v1/userapp/zip-workspace",
 ];
 
 /// 从文档剔除内部路由 path（components 中失去引用的 schema 残留无害，不追引
@@ -350,11 +350,11 @@ fn strip_internal_userapp_paths(document: &mut utoipa::openapi::OpenApi) {
 }
 
 /// 聚合两份文档（UI 顶部下拉切换）：rcoder 主文档 + file-server 文档。
-/// file-server 全量文档（含 /api/userapp）始终聚合在此；实际路由宿主：
+/// file-server 全量文档（含 /api/v1/userapp）始终聚合在此；实际路由宿主：
 /// 老路径（project/computer/git/build）常驻 rcoder 主服务（`merged_router`），
 /// userapp 域由 rcoder 转发层接管、本地实现在 per-app 开发容器内 file-server（60000）。
 ///
-/// 主文档额外合入 userApp 业务域（file-server 的 `/api/userapp/*` 路径 +
+/// 主文档额外合入 userApp 业务域（file-server 的 `/api/v1/userapp/*` 路径 +
 /// schemas）——Swagger 默认打开主文档即见 userApp 全貌（dev 生命周期/编译/
 /// 文件/静态），无需切下拉；其余 file-server 域（project/computer/git 等）
 /// 仍只在 file-server.json，防主文档膨胀。两份文档均剔除
@@ -575,23 +575,23 @@ mod openapi_tests {
 
         let tag_of = |path: &str, method: &str| sole_tag("primary", &document, path, method);
         assert_eq!(
-            tag_of("/api/v1/apps/{app_id}/start", "post"),
+            tag_of("/api/v1/userapp/{app_id}/start", "post"),
             "UserApp · 生命周期"
         );
         assert_eq!(
-            tag_of("/api/v1/apps/{app_id}/logs/stream", "post"),
+            tag_of("/api/v1/userapp/{app_id}/logs/stream", "post"),
             "UserApp · 日志"
         );
         assert_eq!(
-            tag_of("/api/v1/apps/{app_id}/storage", "get"),
+            tag_of("/api/v1/userapp/{app_id}/storage", "get"),
             "UserApp · 文件与存储"
         );
         assert_eq!(
-            tag_of("/api/v1/apps/{app_id}/db/reset-password", "post"),
+            tag_of("/api/v1/userapp/{app_id}/db/reset-password", "post"),
             "UserApp · 数据库"
         );
         assert_eq!(
-            tag_of("/api/userapp/db/{env}/align-credentials", "post"),
+            tag_of("/api/v1/userapp/db/{env}/align-credentials", "post"),
             "UserApp · 数据库"
         );
         assert_eq!(
@@ -599,7 +599,10 @@ mod openapi_tests {
             "UserApp · 终端与代理"
         );
         assert_eq!(tag_of("/userapp/routes", "get"), "UserApp · 终端与代理");
-        assert_eq!(tag_of("/api/userapp/build", "post"), "UserApp · 开发与构建");
+        assert_eq!(
+            tag_of("/api/v1/userapp/build", "post"),
+            "UserApp · 开发与构建"
+        );
         assert_eq!(
             tag_of("/computer/db/{user_id}/reset-password", "post"),
             "computer"
@@ -614,7 +617,7 @@ mod openapi_tests {
         let item = document
             .paths
             .paths
-            .get("/api/v1/apps/{app_id}/logs/stream")
+            .get("/api/v1/userapp/{app_id}/logs/stream")
             .expect("logs/stream path documented");
         let op = item.post.as_ref().expect("POST operation");
         let resp = op
@@ -648,23 +651,23 @@ mod openapi_tests {
         let paths = document.paths.paths;
         for path in [
             // releases 五接口已随 RBD 卷形态删除（部署只走 start+url，见 handbook 10）
-            "/api/v1/apps/{app_id}/logs/query",
-            "/api/v1/apps/{app_id}/logs/stream",
-            "/api/v1/apps/{app_id}/start",
+            "/api/v1/userapp/{app_id}/logs/query",
+            "/api/v1/userapp/{app_id}/logs/stream",
+            "/api/v1/userapp/{app_id}/start",
         ] {
             assert!(paths.contains_key(path), "OpenAPI path missing: {path}");
         }
         // 删除面防复活：releases + rcoder 侧 publish 任务体系路径不得再出现
-        // （构建链收敛为 file-server /api/userapp/* 接口族，rcoder 不再做发布编排）
+        // （构建链收敛为 file-server /api/v1/userapp/* 接口族，rcoder 不再做发布编排）
         for gone in [
-            "/api/v1/apps/{app_id}/releases/prepare",
-            "/api/v1/apps/{app_id}/releases/rollback",
-            "/api/v1/apps/{app_id}/releases/{release_id}/activate",
-            "/api/v1/apps/{app_id}/build",
-            "/api/v1/apps/publish/tasks/query",
-            "/api/v1/apps/publish/tasks/{task_id}",
-            "/api/v1/apps/publish/tasks/{task_id}/stream",
-            "/api/v1/apps/publish/tasks/{task_id}/cancel",
+            "/api/v1/userapp/{app_id}/releases/prepare",
+            "/api/v1/userapp/{app_id}/releases/rollback",
+            "/api/v1/userapp/{app_id}/releases/{release_id}/activate",
+            "/api/v1/userapp/{app_id}/build",
+            "/api/v1/userapp/publish/tasks/query",
+            "/api/v1/userapp/publish/tasks/{task_id}",
+            "/api/v1/userapp/publish/tasks/{task_id}/stream",
+            "/api/v1/userapp/publish/tasks/{task_id}/cancel",
         ] {
             assert!(!paths.contains_key(gone), "deleted path reappeared: {gone}");
         }
@@ -681,8 +684,8 @@ mod openapi_tests {
         // 锚点: 项目创建入口 + UserApp 打包链 (跨域语义关键路径)
         for path in [
             "/api/project/create-project",
-            "/api/userapp/build",
-            "/api/userapp/projects/detect",
+            "/api/v1/userapp/build",
+            "/api/v1/userapp/projects/detect",
         ] {
             assert!(
                 paths.contains_key(path),
@@ -691,10 +694,10 @@ mod openapi_tests {
         }
         let userapp_count = paths
             .keys()
-            .filter(|p| p.starts_with("/api/userapp/"))
+            .filter(|p| p.starts_with("/api/v1/userapp/"))
             .count();
         // 全量 100 paths - 12 个内部镜像 path(file-server 侧; 第 13 条
-        // /api/userapp/workspace 仅存在于 rcoder 侧转发路由, 对 file-server 文档
+        // /api/v1/userapp/workspace 仅存在于 rcoder 侧转发路由, 对 file-server 文档
         // 是永不命中的防御条目) = 88
         assert!(paths.len() >= 85, "聚合文档路径总数异常: {}", paths.len());
         assert!(userapp_count >= 15, "userapp 路径数异常: {userapp_count}");
@@ -721,10 +724,10 @@ mod openapi_tests {
         }
         // 保留面锚点（不在内部清单的 userApp 公开接口）
         for anchor in [
-            "/api/userapp/build",
-            "/api/userapp/dev/start",
-            "/api/userapp/get-logs",
-            "/api/userapp/projects/detect",
+            "/api/v1/userapp/build",
+            "/api/v1/userapp/dev/start",
+            "/api/v1/userapp/get-logs",
+            "/api/v1/userapp/projects/detect",
         ] {
             assert!(
                 primary.paths.paths.contains_key(anchor),
@@ -743,9 +746,9 @@ mod openapi_tests {
 
         let app = Router::new().merge(create_swagger_ui());
         for (path, needle) in [
-            ("/api/docs/openapi.json", "/api/v1/apps"),
-            ("/api/docs/openapi.json", "/api/userapp/dev/start"),
-            ("/api/docs/file-server.json", "/api/userapp/build"),
+            ("/api/docs/openapi.json", "/api/v1/userapp"),
+            ("/api/docs/openapi.json", "/api/v1/userapp/dev/start"),
+            ("/api/docs/file-server.json", "/api/v1/userapp/build"),
         ] {
             let response = app
                 .clone()
@@ -775,10 +778,10 @@ mod openapi_tests {
         for (path, needle) in [
             // 主文档页：Scalar 引导脚本 + spec 锚点（应用管理 + userApp）
             ("/api/docs/scalar", "@scalar/api-reference"),
-            ("/api/docs/scalar", "/api/v1/apps"),
-            ("/api/docs/scalar", "/api/userapp/dev/start"),
+            ("/api/docs/scalar", "/api/v1/userapp"),
+            ("/api/docs/scalar", "/api/v1/userapp/dev/start"),
             // file-server 页：全量文档锚点
-            ("/api/docs/scalar/file-server", "/api/userapp/build"),
+            ("/api/docs/scalar/file-server", "/api/v1/userapp/build"),
         ] {
             let response = app
                 .clone()
@@ -803,12 +806,12 @@ mod openapi_tests {
         assert_eq!(response.status(), StatusCode::OK, "GET /api/docs/ 非 200");
     }
 
-    /// 主文档选择性合入的语义锁定：userApp 域（/api/userapp/*）在、其余
+    /// 主文档选择性合入的语义锁定：userApp 域（/api/v1/userapp/*）在、其余
     /// file-server 域（project 等）不在（防主文档膨胀）。
     #[test]
     fn primary_document_merges_userapp_domain_only() {
         let paths = &primary_document().paths.paths;
-        for anchor in ["/api/userapp/dev/start", "/api/userapp/build"] {
+        for anchor in ["/api/v1/userapp/dev/start", "/api/v1/userapp/build"] {
             assert!(
                 paths.contains_key(anchor),
                 "主文档缺 userApp 路径: {anchor}"
@@ -820,13 +823,13 @@ mod openapi_tests {
         );
     }
 
-    /// UserApp 全部对接端点（`/api/v1/apps` + `/userapp/` 代理文档接口）的文档质量
+    /// UserApp 全部对接端点（`/api/v1/userapp` + `/userapp/` 代理文档接口）的文档质量
     /// 防回归：
     /// 1. 每个操作必须有非空 summary 或 description（handler `///` doc 注释）；
     /// 2. 成功响应（2xx/3xx——/userapp/ 文档接口的成功码是 307）必须有非空 description；
     /// 3. 必须声明至少一个 4xx/5xx 错误响应（与 handler 实际错误分支对应）。
     ///
-    /// 新增 UserApp 端点未写注释会在此失败——样板见 app_manager/handlers（/api/v1/apps 族）。
+    /// 新增 UserApp 端点未写注释会在此失败——样板见 app_manager/handlers（/api/v1/userapp 族）。
     #[test]
     fn userapp_openapi_annotations_are_complete() {
         let document = ApiDoc::openapi();
@@ -836,7 +839,7 @@ mod openapi_tests {
             let is_userapp_proxy_doc = ["/userapp/dev/", "/userapp/prod/"]
                 .iter()
                 .any(|prefix| path.starts_with(prefix));
-            if !path.starts_with("/api/v1/apps") && !is_userapp_proxy_doc {
+            if !path.starts_with("/api/v1/userapp") && !is_userapp_proxy_doc {
                 continue;
             }
             for operation in [&item.get, &item.post].into_iter().flatten() {
@@ -884,7 +887,7 @@ mod openapi_tests {
             }
         }
         // 覆盖数下限：app_manager 25（create REST 面 + releases 五接口已删）+
-        // app_manager /api/v1/apps 族 + /userapp/ 代理文档 6（开发域 ttyd/vnc/audio/ime
+        // app_manager /api/v1/userapp 族 + /userapp/ 代理文档 6（开发域 ttyd/vnc/audio/ime
         // + 运行容器 ttyd/pgweb）+ dbx 两阶段代理文档 2（dev/prod）。
         assert!(
             checked >= 33,

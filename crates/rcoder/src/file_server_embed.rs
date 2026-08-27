@@ -1,7 +1,7 @@
 //! file-server 路由合并进 rcoder 主服务（同进程同端口，无独立 listener）。
 //!
 //! [`merged_router`] 构造 file-server 的基础路由（[`file_server::routes::api_router_base`]，
-//! 排除 `/`、`/health`、`/api/userapp` 与 swagger UI），由 `create_router` merge 进主
+//! 排除 `/`、`/health`、`/api/v1/userapp` 与 swagger UI），由 `create_router` merge 进主
 //! Router——老业务路径（/api/project、/api/computer、/api/git、/api/build）在主端口即可用；
 //! userApp 域由 rcoder 侧转发层接管（透传到 per-app 开发容器内的 file-server）。
 //!

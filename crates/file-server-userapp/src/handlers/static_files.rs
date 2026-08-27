@@ -1,4 +1,4 @@
-//! `GET|OPTIONS /api/userapp/static/{app_id}`——按 app 直下最新构建整体包。
+//! `GET|OPTIONS /api/v1/userapp/static/{app_id}`——按 app 直下最新构建整体包。
 
 use std::path::Path;
 

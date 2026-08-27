@@ -16,7 +16,7 @@ use crate::models::{HealthInfo, ResourceStats};
 /// 获取应用健康状态（由运行时状态派生）
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/{app_id}/health",
+    path = "/api/v1/userapp/{app_id}/health",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),
@@ -41,7 +41,7 @@ pub async fn get_app_health(
 /// best-effort：restart_count 来自运行时；CPU/内存需 metrics-server。
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/{app_id}/stats",
+    path = "/api/v1/userapp/{app_id}/stats",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),
@@ -66,7 +66,7 @@ pub async fn get_app_stats(
 /// best-effort：当前返回空，TODO 接 K8s events。
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/{app_id}/events",
+    path = "/api/v1/userapp/{app_id}/events",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),

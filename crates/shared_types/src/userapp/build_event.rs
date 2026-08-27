@@ -27,7 +27,7 @@ pub enum BuildProgressEvent {
     Log { service: String, line: String },
     /// 任务完成(build 产 release_id + 包摘要)。`artifact_path` 为相对 workspace
     /// 根的产物路径（`builds/workspace-package-{releaseId}.zip`）——信息字段，
-    /// 取包按 app 直下 `/api/userapp/static/{appId}`（服务端选最新产物）。
+    /// 取包按 app 直下 `/api/v1/userapp/static/{appId}`（服务端选最新产物）。
     #[serde(rename_all = "camelCase")]
     Completed {
         release_id: String,

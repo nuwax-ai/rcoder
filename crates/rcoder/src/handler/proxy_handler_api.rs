@@ -461,7 +461,7 @@ pub async fn proxy_to_port_with_path(
     tag = "UserApp · 终端与代理",
     summary = "Pingora 代理 - 访问部署的应用服务（免端口，按 app_id 路由，含路径）",
     description = r#"
-访问 `POST /api/v1/apps` 部署的应用。`access.external.http` 返回 `/proxy/userapp/prod/{user_id}/{app_id}`，即本接口。
+访问 `POST /api/v1/userapp` 部署的应用。`access.external.http` 返回 `/proxy/userapp/prod/{user_id}/{app_id}`，即本接口。
 **免端口**：代理内部固定拨 pingap 统一入口 `APP_ENTRY_PORT`(9080)——按 (app_id, 9080) 查
 `app_backends` 注册表路由到应用后端（K8s→`{app_id}-svc`，Docker→container_ip），**多 app 同端口不冲突**；
 未注册 9080 且该 app 恰只有一个已注册 HTTP 端口时回退用之。
@@ -538,7 +538,7 @@ pub async fn proxy_to_app_with_path(
 `/proxy/userapp/prod/{user_id}/{app_id}/{*path}` 同构——**开发切部署前端只改 `dev→prod` 一段**。
 
 - **免端口**：代理内部固定拨 pingap 统一入口 `APP_ENTRY_PORT`(9080)——开发容器
-  manifest 流程（`POST /api/userapp/dev/start`）恒起 app-cli+pingap，9080 即整应用入口。
+  manifest 流程（`POST /api/v1/userapp/dev/start`）恒起 app-cli+pingap，9080 即整应用入口。
 - upstream 动态解析到该 app 的开发容器（UserAppBuilder），**零注册零状态**：
   Java 用 `user_id` + `app_id` 直接拼 URL。
 - `user_id` 不参与解析（开发容器 per-app 定位），用于日志排障与未来归属鉴权。

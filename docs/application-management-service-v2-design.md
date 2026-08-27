@@ -194,10 +194,10 @@ workspace-package-<release_id>.zip
 file-server 接口：
 
 ```text
-POST /api/userapp/build
-POST /api/userapp/projects/detect
-POST /api/userapp/projects/confirm
-GET  /api/userapp/static/{app_id}/{path}
+POST /api/v1/userapp/build
+POST /api/v1/userapp/projects/detect
+POST /api/v1/userapp/projects/confirm
+GET  /api/v1/userapp/static/{app_id}/{path}
 ```
 
 构建响应包含 `releaseId`、`schemaVersion`、文件名、SHA-256 和字节数。
@@ -258,11 +258,11 @@ per-app PVC 对应 PV 的 `subvolumePath` 定位应用根目录。
 ### 5.1 API
 
 ```text
-POST /api/v1/apps/{app_id}/releases/prepare
-POST /api/v1/apps/{app_id}/releases/{release_id}/activate
-POST /api/v1/apps/{app_id}/releases/{release_id}/confirm
-GET  /api/v1/apps/{app_id}/releases
-POST /api/v1/apps/{app_id}/releases/{release_id}/delete
+POST /api/v1/userapp/{app_id}/releases/prepare
+POST /api/v1/userapp/{app_id}/releases/{release_id}/activate
+POST /api/v1/userapp/{app_id}/releases/{release_id}/confirm
+GET  /api/v1/userapp/{app_id}/releases
+POST /api/v1/userapp/{app_id}/releases/{release_id}/delete
 ```
 
 ### 5.2 状态
@@ -486,9 +486,9 @@ runtime.err.log
 外部：
 
 ```text
-POST /api/v1/apps/{app_id}/logs/sources/query
-POST /api/v1/apps/{app_id}/logs/query
-POST /api/v1/apps/{app_id}/logs/stream
+POST /api/v1/userapp/{app_id}/logs/sources/query
+POST /api/v1/userapp/{app_id}/logs/query
+POST /api/v1/userapp/{app_id}/logs/stream
 ```
 
 内部：
@@ -565,16 +565,16 @@ service/source/file/offset 对断线窗口内的日志做幂等去重。
 ### 9.1 计算资源生命周期
 
 ```text
-POST /api/v1/apps
-POST /api/v1/apps/query
-GET  /api/v1/apps/runtime
-GET  /api/v1/apps/{app_id}
-POST /api/v1/apps/{app_id}/update
-POST /api/v1/apps/{app_id}/delete
-POST /api/v1/apps/{app_id}/start
-POST /api/v1/apps/{app_id}/stop
-POST /api/v1/apps/{app_id}/restart
-POST /api/v1/apps/{app_id}/recycle-policy
+POST /api/v1/userapp
+POST /api/v1/userapp/query
+GET  /api/v1/userapp/runtime
+GET  /api/v1/userapp/{app_id}
+POST /api/v1/userapp/{app_id}/update
+POST /api/v1/userapp/{app_id}/delete
+POST /api/v1/userapp/{app_id}/start
+POST /api/v1/userapp/{app_id}/stop
+POST /api/v1/userapp/{app_id}/restart
+POST /api/v1/userapp/{app_id}/recycle-policy
 ```
 
 RCoder 不持久化 name/image/env 等业务元数据。后续 GET 返回 observed
@@ -593,9 +593,9 @@ K8s update 使用 `resourceVersion` 乐观锁和 SSA；Docker 模式当前为 la
 ### 9.2 查询与诊断
 
 ```text
-GET /api/v1/apps/{app_id}/health
-GET /api/v1/apps/{app_id}/stats
-GET /api/v1/apps/{app_id}/events
+GET /api/v1/userapp/{app_id}/health
+GET /api/v1/userapp/{app_id}/stats
+GET /api/v1/userapp/{app_id}/events
 ```
 
 `GET /apps/runtime` 是 RCoder/Java 重启后的运行时对账入口。
@@ -603,15 +603,15 @@ GET /api/v1/apps/{app_id}/events
 ### 9.3 文件和存储
 
 ```text
-POST /api/v1/apps/{app_id}/upload
-POST /api/v1/apps/{app_id}/upload-from-url
-GET  /api/v1/apps/{app_id}/files
-POST /api/v1/apps/{app_id}/files/delete
+POST /api/v1/userapp/{app_id}/upload
+POST /api/v1/userapp/{app_id}/upload-from-url
+GET  /api/v1/userapp/{app_id}/files
+POST /api/v1/userapp/{app_id}/files/delete
 
-GET  /api/v1/apps/{app_id}/storage
-POST /api/v1/apps/{app_id}/storage/clear
-POST /api/v1/apps/{app_id}/storage/destroy
-POST /api/v1/apps/storage/query
+GET  /api/v1/userapp/{app_id}/storage
+POST /api/v1/userapp/{app_id}/storage/clear
+POST /api/v1/userapp/{app_id}/storage/destroy
+POST /api/v1/userapp/storage/query
 ```
 
 文件路径一律是 app 根相对路径。禁止绝对路径、`..` 和符号链接逃逸。
@@ -622,8 +622,8 @@ upload 只保留给开发、导入和显式文件管理场景。
 ### 9.4 数据库
 
 ```text
-POST /api/v1/apps/{app_id}/db/reset-password
-POST /api/v1/apps/{app_id}/db/create-database
+POST /api/v1/userapp/{app_id}/db/reset-password
+POST /api/v1/userapp/{app_id}/db/create-database
 ```
 
 接口通过容器 exec 调用本地 psql，只适用于带 PostgreSQL 的 app-runtime。普通数据操作由
@@ -691,7 +691,7 @@ per-app 覆盖（Deployment 注解，由 `CreateAppRequest`/`UpdateAppRequest`/`
 #### 动态回收策略端点
 
 ```text
-POST /api/v1/apps/{app_id}/recycle-policy
+POST /api/v1/userapp/{app_id}/recycle-policy
 ```
 
 ```json

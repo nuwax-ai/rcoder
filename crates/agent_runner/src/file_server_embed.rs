@@ -34,9 +34,9 @@ use file_server_proxy::{AGENT_FILE_SERVER_PORT, NUWAX_FILE_SERVER_INTERNAL_PORT}
 /// 构造合并进 agent_runner 主 Router 的 file-server 路由（无独立 listener/端口）。
 ///
 /// 用 **container 路由集**（`file_server_userapp::container_router`：全量业务路由
-/// 含 `/api/userapp`——开发容器是 userApp 域本地实现的宿主，rcoder 转发层的上游；
+/// 含 `/api/v1/userapp`——开发容器是 userApp 域本地实现的宿主，rcoder 转发层的上游；
 /// userApp 域已拆至 file-server-userapp crate，组装经其完成。曾误用
-/// `router_base`（排除 userapp 的 rcoder 主进程集）导致容器内 /api/userapp/*
+/// `router_base`（排除 userapp 的 rcoder 主进程集）导致容器内 /api/v1/userapp/*
 /// 全 404）。返回 `Err` 时主服务照常启动（缺路由不致命，warn 可见）——
 /// 与 rcoder 主服务的降级语义同款。
 pub fn merged_router() -> Result<Router, String> {

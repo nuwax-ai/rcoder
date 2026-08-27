@@ -205,7 +205,7 @@ SSE 事件类型：`log`（单条记录）、`source_error` / `source_recovered`
 故障期间只报一次）、`cursor_reset`、`checkpoint`（cursor 变化时推送，客户端可持久化用于
 断线续传）、`heartbeat`（15s）。
 
-外部访问走 rcoder 转发：`POST /api/v1/apps/{app_id}/logs/{sources/query|query|stream}`
+外部访问走 rcoder 转发：`POST /api/v1/userapp/{app_id}/logs/{sources/query|query|stream}`
 （rcoder 透明代理——请求/响应体与状态码原样透传，信封直达调用方，详见
 [04-logs.md](04-logs.md)）。
 

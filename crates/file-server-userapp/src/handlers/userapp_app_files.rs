@@ -1,6 +1,6 @@
 //! app_manager 文件面转发目标的容器侧实现（生产运行容器 / 开发容器均可挂载）。
 //!
-//! rcoder 的 `/api/v1/apps/{id}/upload|upload-from-url|files|files/delete` 四接口在
+//! rcoder 的 `/api/v1/userapp/{id}/upload|upload-from-url|files|files/delete` 四接口在
 //! RBD 卷形态下不再直读写卷，改为**唤醒 + 转发到本容器 60000**；本模块按该四接口
 //! 的原语义（魔数识别 zip/tar.gz → 解压 + flatten、app 根相对路径、防穿越）在
 //! [`resolve_userapp_dev`] 根上原地实现——生产运行容器 = 单 app 模式（卷根即 app 根），
