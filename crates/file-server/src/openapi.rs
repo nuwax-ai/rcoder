@@ -250,6 +250,42 @@ mod tests {
         }
     }
 
+    /// build/dev 族 200 响应必须类型化（防回退到通用 SuccessResponse 占位——
+    /// 同事按 swagger 对接，业务字段不可见即盲区）。
+    #[test]
+    fn build_dev_endpoints_have_typed_success_bodies() {
+        let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");
+        let paths = value["paths"].as_object().expect("paths object");
+        // (路径, 方法, 期望 schema 名)——dev/logs/build 族均为 GET（对齐 nuwax 路由形态）
+        let expected = [
+            ("/api/build/start-dev", "get", "DevStarted"),
+            ("/api/build/stop-dev", "get", "DevStopped"),
+            ("/api/build/restart-dev", "get", "DevStarted"),
+            ("/api/build/list-dev", "get", "DevList"),
+            ("/api/build/keep-alive", "get", "KeepAlive"),
+            ("/api/build/port-pool-status", "get", "PortPool"),
+            ("/api/build/get-dev-log", "get", "DevLog"),
+            ("/api/build/get-log-cache-stats", "get", "LogCacheStats"),
+            ("/api/build/clear-all-log-cache", "get", "Simple"),
+            ("/api/build/parse-build-error", "post", "Simple"),
+            ("/api/build/build", "get", "BuildDone"),
+        ];
+        for (path, method, schema_name) in expected {
+            let operation = &paths[path][method];
+            assert!(
+                !operation.is_null(),
+                "{method} {path} must be registered in the document"
+            );
+            let reference =
+                &operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"];
+            assert_eq!(
+                reference,
+                &serde_json::json!(format!("#/components/schemas/{schema_name}")),
+                "{method} {path} 200 响应必须类型化为 {schema_name}（不得回退 SuccessResponse 占位）"
+            );
+        }
+    }
+
     #[test]
     fn flattened_git_log_query_is_exposed_as_individual_parameters() {
         let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");

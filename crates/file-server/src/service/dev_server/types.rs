@@ -1,14 +1,14 @@
-//! dev server 类型定义: 进程记录 / 响应 / 管理器本体。
+//! dev server 类型定义: 响应载体 / 管理器本体。
 //! 字段 `pub(super)`: 供 start.rs / stop.rs / mod.rs (同属 dev_server) 访问,
-//! 对 crate 其余部分保持私有。
+//! 对 crate 其余部分保持私有。进程记录 DevProcess 在 crate::models
+//! （list-dev wire 双面类型）。
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use super::port_pool::PortPool;
 use crate::Config;
-use crate::models::KilledPid;
+use crate::models::{DevProcess, KilledPid};
 
 /// 探活回调：(port, base_path, timeout_ms) → boxed future<bool>。
 /// 抽成类型别名既绕开 clippy::type_complexity，也方便测试注入 stub（绕开 reqwest 延迟）。
@@ -20,20 +20,6 @@ pub(super) type AliveProbe<'a> = &'a (
 ) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + 's>>
             + Sync
     );
-
-/// 运行中的 dev server 记录 (内存状态)。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DevProcess {
-    pub pid: u32,
-    pub port: u16,
-    pub project_id: String,
-    pub started_at: i64,
-    #[serde(skip)]
-    pub log_dir: PathBuf,
-    #[serde(skip)]
-    pub temp_log_name: String,
-}
 
 /// start-dev / restart-dev 响应。
 #[derive(Debug, Clone, serde::Serialize)]

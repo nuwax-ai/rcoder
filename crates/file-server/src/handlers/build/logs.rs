@@ -1,65 +1,13 @@
 //! 日志读取与缓存 handlers: get-dev-log / get-log-cache-stats / clear-all-log-cache。
 
 use axum::extract::State;
-use serde::Serialize;
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
-use crate::models::{DevLogQuery, LogLine};
+use crate::models::{DevLog, DevLogQuery, LogCacheStats, LogCacheStatsData, Simple};
 
-// ── 类型化响应 ────────────────────────────────────────────────────────────────
-
-/// get-dev-log
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DevLog {
-    pub success: bool,
-    pub message: String,
-    pub logs: Vec<LogLine>,
-    pub total_lines: usize,
-    pub start_index: usize,
-    pub log_file_name: String,
-    pub cache_hit: bool,
-    pub file_too_large: bool,
-}
-
-/// parse-build-error / clear-all-log-cache 共用 {success, message}
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Simple {
-    pub success: bool,
-    pub message: String,
-}
-
-/// get-log-cache-stats (stats 内含 SCREAMING_SNAKE 键 → 逐字段 rename)
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct LogCacheStats {
-    pub success: bool,
-    pub message: String,
-    pub stats: LogCacheStatsData,
-}
-
-#[derive(Serialize)]
-pub(crate) struct LogCacheStatsData {
-    pub enabled: bool,
-    #[serde(rename = "cacheSize")]
-    pub cache_size: u64,
-    #[serde(rename = "maxCacheEntries")]
-    pub max_cache_entries: u64,
-    #[serde(rename = "cacheDuration")]
-    pub cache_duration: u64,
-    #[serde(rename = "maxFileSizeMB")]
-    pub max_file_size_mb: String,
-    #[serde(rename = "totalCacheSizeMB")]
-    pub total_cache_size_mb: String,
-    #[serde(rename = "NODE_ENV")]
-    pub node_env: String,
-    #[serde(rename = "LOG_CACHE_ENABLED")]
-    pub log_cache_enabled: bool,
-}
-
+// 响应结构 DevLog/Simple/LogCacheStats(+Data) 在 crate::models（带 ToSchema）。
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 /// 读取开发日志
@@ -73,7 +21,7 @@ pub(crate) struct LogCacheStatsData {
 内容增长做增量拉取。
 "#,
     params(DevLogQuery),
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "开发日志分页（logs 含行号；cacheHit 标记缓存命中）", body = DevLog), crate::openapi::ErrorApiResponses),
     tag = "Build"
 )]
 pub(crate) async fn get_dev_log(
@@ -134,7 +82,7 @@ pub(crate) async fn get_dev_log(
 #[utoipa::path(
     get,
     path = "/get-log-cache-stats",
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "日志缓存配置与运行统计", body = LogCacheStats), crate::openapi::ErrorApiResponses),
     tag = "Build"
 )]
 pub(crate) async fn get_log_cache_stats(
@@ -166,7 +114,7 @@ pub(crate) async fn get_log_cache_stats(
 #[utoipa::path(
     get,
     path = "/clear-all-log-cache",
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "缓存已清空", body = Simple), crate::openapi::ErrorApiResponses),
     tag = "Build"
 )]
 pub(crate) async fn clear_all_log_cache(

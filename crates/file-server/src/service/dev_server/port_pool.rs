@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::error::{AppError, AppResult};
+use crate::models::PortAllocation;
 
 /// 端口池快照 (供 port-pool-status 路由)。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -17,13 +18,6 @@ pub struct PortPoolStatus {
     pub port_range: String,
     pub total_allocated: usize,
     pub allocations: Vec<PortAllocation>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PortAllocation {
-    pub project_id: String,
-    pub port: u16,
 }
 
 /// 单例端口池 (经 Arc 共享于 DevServerManager)。

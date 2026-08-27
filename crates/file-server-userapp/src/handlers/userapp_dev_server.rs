@@ -21,8 +21,9 @@ use crate::models::{
 };
 use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppQuery as Query};
+use file_server::models::DevProcess;
 use file_server::models::ReadDevLogResult;
-use file_server::service::dev_server::{DevProcess, StoppedDev};
+use file_server::service::dev_server::StoppedDev;
 use file_server::workspace::resolve_userapp_dev;
 
 /// 进程表 key（与 web projectId 空间隔离; log_dir 剥前缀）。

@@ -7,7 +7,7 @@ use crate::error::AppError;
 use crate::extract::AppJson as Json;
 use crate::models::ParseErrorBody;
 
-use super::build::logs::Simple;
+use crate::models::Simple;
 
 pub(super) fn normalize_build_base(base: Option<&str>) -> String {
     let base = base.map(str::trim).unwrap_or("/").to_string();
@@ -59,7 +59,7 @@ pub(super) fn copy_dir_all(
 /// 解析构建错误输出
 ///
 /// 识别常见编译/构建工具错误模式，返回结构化信息。
-#[utoipa::path(post, path = "/parse-build-error", request_body = ParseErrorBody, responses(crate::openapi::JsonApiResponses), tag = "Build")]
+#[utoipa::path(post, path = "/parse-build-error", request_body = ParseErrorBody, responses((status = 200, description = "解析出的结构化错误信息（message）", body = Simple), crate::openapi::ErrorApiResponses), tag = "Build")]
 pub(crate) async fn parse_build_error(
     State(_state): State<AppState>,
     Json(body): Json<ParseErrorBody>,

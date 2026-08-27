@@ -2,71 +2,17 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde::Serialize;
 
 use super::project_path;
 use crate::AppState;
 use crate::error::{AppError, AppResult};
 use crate::extract::{AppJson as Json, AppQuery as Query};
-use crate::models::{BuildQuery, KeepAliveQuery, KilledPid};
-use crate::service::dev_server::{DevProcess, PortAllocation};
+use crate::models::{
+    BuildQuery, DevList, DevStarted, DevStopped, KeepAlive, KeepAliveQuery, PortPool,
+};
 
-// ── 类型化响应 (camelCase 由 serde 统一保证) ──────────────────────────────────
-
-/// start-dev / restart-dev 共用 (对齐 nuwax: {success, message, projectId, pid, port})
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DevStarted {
-    pub success: bool,
-    pub message: String,
-    pub project_id: String,
-    pub pid: u32,
-    pub port: u16,
-}
-
-/// stop-dev (pid 恒 null: Option 不加 skip_serializing_if → 序列化为 null, 对齐现 json!)
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DevStopped {
-    pub success: bool,
-    pub message: String,
-    pub project_id: String,
-    pub pid: Option<u32>,
-    pub killed_pids: Vec<KilledPid>,
-}
-
-/// list-dev
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DevList {
-    pub success: bool,
-    pub list: Vec<DevProcess>,
-}
-
-/// keep-alive (action 仅重启分支有 → None 时省略, 匹配现 json! 条件追加行为)
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct KeepAlive {
-    pub success: bool,
-    pub project_id: String,
-    pub pid: u32,
-    pub port: u16,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
-}
-
-/// port-pool-status
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PortPool {
-    pub success: bool,
-    pub message: String,
-    pub port_range: String,
-    pub total_allocated: usize,
-    pub allocations: Vec<PortAllocation>,
-}
-
+// 响应结构 DevStarted/DevStopped/DevList/KeepAlive/PortPool 在 crate::models
+// （带 ToSchema，200 body 注解引用之）。
 async fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> AppResult<std::path::PathBuf> {
     if let Some(app_id) = q.app_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         return crate::workspace::resolve_userapp_dev(app_id, None, &state.config);
@@ -94,7 +40,7 @@ async fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> AppResult<st
     description = r#"
 启动项目开发服务器（按 package.json 等探测命令异步拉起，返回 pid/port）。端口经 PortPool 分配；重复调用幂等——已在跑则返回现有进程。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "dev server 已启动（pid/port 供 keep-alive 心跳回传）", body = DevStarted), crate::openapi::ErrorApiResponses),
     tag = "Build"
 )]
 pub(crate) async fn start_dev(
@@ -126,7 +72,7 @@ pub(crate) async fn start_dev(
     description = r#"
 停止项目的开发服务器进程组（按 projectId 定位，无需 pid）。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "已停止（killedPids 为被杀进程明细）", body = DevStopped), crate::openapi::ErrorApiResponses),
     tag = "Build"
 )]
 pub(crate) async fn stop_dev(
@@ -172,7 +118,7 @@ pub(crate) async fn stop_dev(
     description = r#"
 重启开发服务器：stop + start 组合，新 pid/port 在响应中返回。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "dev server 已启动（pid/port 供 keep-alive 心跳回传）", body = DevStarted), crate::openapi::ErrorApiResponses),
     tag = "Build"
 )]
 pub(crate) async fn restart_dev(
@@ -205,7 +151,7 @@ pub(crate) async fn restart_dev(
 列出当前在跑的开发服务器清单（projectId/pid/port/启动时间）——工作台面板与
 端口占用排障的数据源。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "在跑的 dev server 进程列表", body = DevList), crate::openapi::ErrorApiResponses),
     tag = "Build"
 )]
 pub(crate) async fn list_dev(State(state): State<AppState>) -> Result<Json<DevList>, AppError> {
@@ -226,7 +172,7 @@ pub(crate) async fn list_dev(State(state): State<AppState>) -> Result<Json<DevLi
     description = r#"
 开发服务器心跳保活：校验进程仍存活、目录仍在；**进程意外死亡时自动以原参数重启**（响应 action 字段区分 alive/started）。前端定时（如 30s）调用一次。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "心跳结果（action=restarted 表示探活失败已自动重启，存活时省略）", body = KeepAlive), crate::openapi::ErrorApiResponses),
     tag = "Build"
 )]
 pub(crate) async fn keep_alive(
@@ -278,7 +224,7 @@ pub(crate) async fn keep_alive(
 查开发服务器 PortPool 分配现状：可分配范围、已占用明细（哪个项目占了哪个
 端口）——端口冲突与泄漏排查用。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "端口池分配快照（projectId → port）", body = PortPool), crate::openapi::ErrorApiResponses),
     tag = "Build"
 )]
 pub(crate) async fn port_pool_status(

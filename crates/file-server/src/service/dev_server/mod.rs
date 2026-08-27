@@ -22,12 +22,12 @@ mod types;
 
 pub use error_classify::{STDERR_RING_CAP, StderrRing, ViteStartupError};
 pub use log::read_dev_log;
-pub use port_pool::{PortAllocation, PortPool, PortPoolStatus};
+pub use port_pool::{PortPool, PortPoolStatus};
 pub use process::{is_process_running, is_project_alive, kill_process_group, now_ms};
 pub use types::KeepAliveResult;
-pub use types::{DevProcess, DevServerManager, StartedDev, StoppedDev};
+pub use types::{DevServerManager, StartedDev, StoppedDev};
 
-use crate::models::ReadDevLogResult;
+use crate::models::{DevProcess, ReadDevLogResult};
 
 use std::path::Path;
 

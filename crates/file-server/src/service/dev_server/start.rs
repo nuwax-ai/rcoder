@@ -9,8 +9,9 @@ use super::log;
 use super::port_pool::PortPool;
 use super::process;
 use super::support::{early_exit_err, ldrtemp, lock, read_dev_script};
-use super::types::{AliveProbe, DevProcess, DevServerManager, StartedDev};
+use super::types::{AliveProbe, DevServerManager, StartedDev};
 use crate::error::{AppError, AppResult};
+use crate::models::DevProcess;
 use crate::service::pnpm::{self, InstallOptions, LogFiles};
 use std::path::Path;
 

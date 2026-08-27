@@ -1,7 +1,6 @@
 //! build 执行 handler: install + build + 拷贝 dist。
 
 use axum::extract::State;
-use serde::Serialize;
 use serde_json::Value;
 
 use super::super::build_support::{copy_dir_all, normalize_build_base};
@@ -9,16 +8,8 @@ use super::{BuildQuery, project_path};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
+use crate::models::BuildDone;
 use crate::service::pnpm::{self, InstallOptions, LogFiles};
-
-/// build 响应
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct BuildDone {
-    pub success: bool,
-    pub message: String,
-    pub project_id: String,
-}
 
 /// 构建项目
 ///
@@ -27,7 +18,7 @@ pub(crate) struct BuildDone {
     get,
     path = "/build",
     params(BuildQuery),
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "构建完成", body = BuildDone), crate::openapi::ErrorApiResponses),
     tag = "Build"
 )]
 pub(crate) async fn build_project(

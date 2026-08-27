@@ -91,3 +91,169 @@ pub struct ReadDevLogResult {
     /// 实际读取的日志文件名（按日期滚动的当前文件）
     pub log_file_name: String,
 }
+
+// ── build / dev server 生命周期（TS 对齐域：裸 {success, message, ...} 信封）──
+
+/// start-dev / restart-dev 响应 (对齐 nuwax: {success, message, projectId, pid, port})。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DevStarted {
+    pub success: bool,
+    pub message: String,
+    pub project_id: String,
+    /// dev server 主进程 PID（keep-alive 心跳回传它）
+    pub pid: u32,
+    /// dev server 监听端口
+    pub port: u16,
+}
+
+/// stop-dev 响应 (pid 恒 null: Option 不加 skip_serializing_if → 序列化为 null, 对齐现 json!)。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DevStopped {
+    pub success: bool,
+    pub message: String,
+    pub project_id: String,
+    /// 恒 null（按 app 定位进程组，无需 pid）
+    pub pid: Option<u32>,
+    /// 被杀进程 PID 明细（killed 标记是否杀灭成功）
+    pub killed_pids: Vec<KilledPid>,
+}
+
+/// list-dev 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DevList {
+    pub success: bool,
+    /// 在跑的 dev server 进程列表
+    pub list: Vec<DevProcess>,
+}
+
+/// keep-alive 响应 (action 仅重启分支有 → None 时省略, 匹配现 json! 条件追加行为)。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KeepAlive {
+    pub success: bool,
+    pub project_id: String,
+    pub pid: u32,
+    pub port: u16,
+    pub message: String,
+    /// 心跳结果动作（"restarted" = 探活失败已重启；存活时省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+/// port-pool-status 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PortPool {
+    pub success: bool,
+    pub message: String,
+    /// 端口池范围（如 "4000-55000"，保留区已剔除）
+    pub port_range: String,
+    /// 已分配端口数
+    pub total_allocated: usize,
+    /// projectId → port 分配明细
+    pub allocations: Vec<PortAllocation>,
+}
+
+/// get-dev-log 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DevLog {
+    pub success: bool,
+    pub message: String,
+    /// 日志行列表（含行号）
+    pub logs: Vec<LogLine>,
+    /// 该日志文件总行数（分页导航）
+    pub total_lines: usize,
+    /// 本批起始行号（1-based）
+    pub start_index: usize,
+    /// 实际读取的日志文件名（按日期滚动的当前文件）
+    pub log_file_name: String,
+    /// 是否命中服务端日志缓存（未命中才读盘）
+    pub cache_hit: bool,
+    /// 文件超过缓存上限时置 true（此时为直接读盘的部分内容）
+    pub file_too_large: bool,
+}
+
+/// parse-build-error / clear-all-log-cache 共用 {success, message} 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Simple {
+    pub success: bool,
+    pub message: String,
+}
+
+/// get-log-cache-stats 响应 (stats 内含 SCREAMING_SNAKE 键 → 逐字段 rename)。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LogCacheStats {
+    pub success: bool,
+    pub message: String,
+    /// 日志缓存配置与运行时统计
+    pub stats: LogCacheStatsData,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LogCacheStatsData {
+    /// 日志缓存功能是否启用
+    pub enabled: bool,
+    #[serde(rename = "cacheSize")]
+    /// 当前缓存占用字节数
+    pub cache_size: u64,
+    #[serde(rename = "maxCacheEntries")]
+    /// 最大缓存条目数
+    pub max_cache_entries: u64,
+    #[serde(rename = "cacheDuration")]
+    /// 缓存条目存活秒数
+    pub cache_duration: u64,
+    #[serde(rename = "maxFileSizeMB")]
+    /// 单文件缓存上限（MB，展示串）
+    pub max_file_size_mb: String,
+    #[serde(rename = "totalCacheSizeMB")]
+    /// 缓存总占用（MB，展示串）
+    pub total_cache_size_mb: String,
+    #[serde(rename = "NODE_ENV")]
+    /// 运行环境标识（对齐 nuwax 透传 NODE_ENV）
+    pub node_env: String,
+    #[serde(rename = "LOG_CACHE_ENABLED")]
+    /// 日志缓存开关（对齐 nuwax 配置键名）
+    pub log_cache_enabled: bool,
+}
+
+/// build 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildDone {
+    pub success: bool,
+    pub message: String,
+    pub project_id: String,
+}
+
+/// 运行中的 dev server 记录（内存状态 + list-dev wire 双面；log_dir/temp_log_name
+/// 不上 wire）。原 service/dev_server/types.rs 定义，DevServerManager 继续引用。
+#[derive(Debug, Clone, serde::Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DevProcess {
+    /// 主进程 PID
+    pub pid: u32,
+    /// 监听端口
+    pub port: u16,
+    /// 项目 ID（workspace 根目录名）
+    pub project_id: String,
+    /// 启动时间（Unix 毫秒）
+    pub started_at: i64,
+    #[serde(skip)]
+    pub log_dir: std::path::PathBuf,
+    #[serde(skip)]
+    pub temp_log_name: String,
+}
+
+/// 端口池分配明细（port-pool-status 内嵌；原 service/dev_server/port_pool.rs 定义）。
+#[derive(Debug, Clone, serde::Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PortAllocation {
+    pub project_id: String,
+    pub port: u16,
+}

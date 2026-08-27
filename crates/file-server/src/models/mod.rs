@@ -34,8 +34,9 @@ pub use request::{
     SearchFilesQuery, SpecifiedBody, TagCreateBody, TagNameBody, TargetBody, UserCidQuery, ZipBody,
 };
 pub use response::{
-    CreateWorkspaceResponse, HealthResponse, KilledPid, LogLine, MemoryUsage, ReadDevLogResult,
-    SkillFailure, VersionResponse,
+    BuildDone, CreateWorkspaceResponse, DevList, DevLog, DevProcess, DevStarted, DevStopped,
+    HealthResponse, KeepAlive, KilledPid, LogCacheStats, LogCacheStatsData, LogLine, MemoryUsage,
+    PortAllocation, PortPool, ReadDevLogResult, Simple, SkillFailure, VersionResponse,
 };
 
 #[cfg(test)]
