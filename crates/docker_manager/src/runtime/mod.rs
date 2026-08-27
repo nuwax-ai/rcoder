@@ -3,6 +3,7 @@
 //! This module provides container runtime abstraction to support both
 //! Docker and Kubernetes backends.
 
+pub(crate) mod docker_app_mounts;
 pub(crate) mod docker_app_runtime;
 pub mod docker_runtime;
 pub(crate) mod k8s_runtime_helpers;
@@ -18,7 +19,10 @@ pub(crate) mod k8s_agent_pod;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_agent_query;
 #[cfg(feature = "kubernetes")]
+#[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_app_create;
+#[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_app_expose;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_app_helpers;
 #[cfg(feature = "kubernetes")]

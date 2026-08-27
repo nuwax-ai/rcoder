@@ -144,8 +144,8 @@ pub async fn sync_dbx_after_password_change(
     password: &str,
 ) -> Result<(), String> {
     let cmd = match username {
-        Some(u) => crate::pg_utils::dbx_sync_cmd_for_user(u, password),
-        None => crate::pg_utils::dbx_sync_cmd_superuser(password),
+        Some(u) => crate::userapp::dbx_sync::dbx_sync_cmd_for_user(u, password),
+        None => crate::userapp::dbx_sync::dbx_sync_cmd_superuser(password),
     };
     let r = runner.run(&cmd).await?;
     if r.exit_code != 0 {

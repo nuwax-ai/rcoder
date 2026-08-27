@@ -168,7 +168,9 @@ pub async fn align_pg_credentials(
     //    local-pg 在用账号（$POSTGRES_USER）时无事可做 exit 0。
     //    失败不阻断：密码已生效，结果落字段供 Java 感知重试；错误不含密码。
     let (dbx_synced, dbx_error) = match runner
-        .run(&crate::pg_utils::dbx_sync_cmd_for_user(username, password))
+        .run(&crate::userapp::dbx_sync::dbx_sync_cmd_for_user(
+            username, password,
+        ))
         .await
     {
         Ok(r) if r.exit_code == 0 => (Some(true), None),
