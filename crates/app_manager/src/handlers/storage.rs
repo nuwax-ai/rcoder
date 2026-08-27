@@ -22,7 +22,7 @@ use crate::models::{DestroyStorageRequest, PaginatedResponse, QueryStorageReques
         (status = 200, description = "查询成功", body = HttpResult<StorageInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 文件与存储"
 )]
 #[instrument(skip(state))]
 pub async fn get_app_storage(
@@ -46,7 +46,7 @@ pub async fn get_app_storage(
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "应用仍存在，需先 delete", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 文件与存储"
 )]
 #[instrument(skip(state))]
 pub async fn clear_app_storage(
@@ -72,7 +72,7 @@ pub async fn clear_app_storage(
         (status = 409, description = "应用仍存在，需先 delete", body = HttpResult<String>),
         (status = 500, description = "PVC 卡 Terminating，需运维介入（pvc-protection finalizer 未移除）", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 文件与存储"
 )]
 #[instrument(skip(state, req))]
 pub async fn destroy_app_storage(
@@ -99,7 +99,7 @@ pub async fn destroy_app_storage(
         (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<StorageInfo>>),
         (status = 400, description = "分页参数错误", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 文件与存储"
 )]
 #[instrument(skip(state, request))]
 pub async fn query_storage(

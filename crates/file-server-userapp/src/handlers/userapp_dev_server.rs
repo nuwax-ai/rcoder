@@ -130,7 +130,7 @@ pub(crate) struct UserappDevList {
     path = "/dev/start",
     request_body = DevOpBody,
     responses((status = 200, body = HttpResult<UserappDevTaskCreated>, description = "启动任务已创建（taskId）")),
-    tag = "UserApp"
+    tag = "UserApp · 开发与构建"
 )]
 pub(crate) async fn dev_start(
     State(state): State<UserAppState>,
@@ -164,7 +164,7 @@ pub(crate) async fn dev_start(
     path = "/dev/stop",
     request_body = DevOpBody,
     responses((status = 200, body = HttpResult<UserappDevStopped>, description = "停止结果（含进程组杀灭明细）")),
-    tag = "UserApp"
+    tag = "UserApp · 开发与构建"
 )]
 pub(crate) async fn dev_stop(
     State(state): State<UserAppState>,
@@ -216,7 +216,7 @@ pub(crate) async fn dev_stop(
     path = "/dev/restart",
     request_body = DevOpBody,
     responses((status = 200, body = HttpResult<UserappDevTaskCreated>, description = "重启任务已创建（taskId）")),
-    tag = "UserApp"
+    tag = "UserApp · 开发与构建"
 )]
 pub(crate) async fn dev_restart(
     State(state): State<UserAppState>,
@@ -399,7 +399,7 @@ async fn spawn_dev_task(
     get,
     path = "/dev/list",
     responses((status = 200, body = HttpResult<UserappDevList>, description = "在跑的 UserApp 开发服务列表")),
-    tag = "UserApp"
+    tag = "UserApp · 开发与构建"
 )]
 pub(crate) async fn dev_list(State(state): State<UserAppState>) -> UserAppReply<UserappDevList> {
     let result = async {
@@ -426,7 +426,7 @@ pub(crate) async fn dev_list(State(state): State<UserAppState>) -> UserAppReply<
     path = "/dev/logs",
     params(DevLogsQuery),
     responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "开发服务日志分页")),
-    tag = "UserApp"
+    tag = "UserApp · 开发与构建"
 )]
 pub(crate) async fn dev_logs(
     State(state): State<UserAppState>,

@@ -59,7 +59,7 @@ pub(crate) fn userapp_top_router() -> OpenApiRouter<UserAppState> {
 #[derive(OpenApi)]
 #[openapi(
     info(title = "file-server-userapp", description = "UserApp domain APIs (build/tasks/dev-server/file mirror)"),
-    tags((name = "UserApp", description = "UserApp workspace 构建/任务/开发服务/文件镜像族"))
+    tags((name = "UserApp · 开发与构建", description = "开发工作区、构建任务与文件镜像（file-server 进程侧服务）"))
 )]
 struct ApiDoc;
 

@@ -24,7 +24,7 @@ use crate::models::{HealthInfo, ResourceStats};
         (status = 200, description = "查询成功", body = HttpResult<HealthInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 生命周期"
 )]
 #[instrument(skip(state))]
 pub async fn get_app_health(
@@ -49,7 +49,7 @@ pub async fn get_app_health(
         (status = 200, description = "查询成功", body = HttpResult<ResourceStats>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 生命周期"
 )]
 #[instrument(skip(state))]
 pub async fn get_app_stats(
@@ -74,7 +74,7 @@ pub async fn get_app_stats(
         (status = 200, description = "查询成功", body = HttpResult<Vec<container_runtime_api::AppEventInfo>>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 生命周期"
 )]
 #[instrument(skip(state))]
 pub async fn get_app_events(

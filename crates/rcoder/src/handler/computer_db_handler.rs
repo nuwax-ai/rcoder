@@ -38,7 +38,7 @@ use crate::router::AppState;
         (status = 404, description = "agent-runner 容器不存在"),
         (status = 500, description = "后端错误（psql 执行失败）")
     ),
-    tag = "Computer Agent"
+    tag = "computer"
 )]
 #[instrument(skip(state))]
 pub async fn computer_db_reset_password(
@@ -96,7 +96,7 @@ pub async fn computer_db_reset_password(
         (status = 409, description = "数据库已存在"),
         (status = 500, description = "后端错误（psql 执行失败）")
     ),
-    tag = "Computer Agent"
+    tag = "computer"
 )]
 #[instrument(skip(state))]
 pub async fn computer_db_create_database(

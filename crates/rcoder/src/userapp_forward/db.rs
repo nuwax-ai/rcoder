@@ -101,7 +101,7 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
         (status = 404, description = "prod 环境 app 不存在或未运行", body = HttpResult<String>),
         (status = 502, description = "开发容器不可达", body = HttpResult<String>)
     ),
-    tag = "UserApp",
+    tag = "UserApp · 数据库",
     operation_id = "align_userapp_db_credentials",
     summary = "PG 凭据对齐（检查 dev/prod 容器内 PG 密码，不一致则重置）"
 )]
@@ -280,7 +280,7 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
         (status = 404, description = "prod 环境 app 不存在", body = HttpResult<String>),
         (status = 500, description = "容器侧执行失败（PG 未就绪/SQL 失败）", body = HttpResult<String>)
     ),
-    tag = "UserApp",
+    tag = "UserApp · 数据库",
     operation_id = "userapp_db_reset_password",
     summary = "重置/创建 userApp 容器内 PG 账号密码（dev/prod）"
 )]
@@ -388,7 +388,7 @@ pub(crate) async fn reset_password(
         (status = 409, description = "数据库已存在（含并发创建竞态复检）", body = HttpResult<String>),
         (status = 500, description = "容器侧执行失败（PG 未就绪/SQL 失败）", body = HttpResult<String>)
     ),
-    tag = "UserApp",
+    tag = "UserApp · 数据库",
     operation_id = "userapp_db_create_database",
     summary = "在 userApp 容器内 PG 新建数据库（dev/prod）"
 )]

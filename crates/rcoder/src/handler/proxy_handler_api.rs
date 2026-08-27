@@ -458,7 +458,7 @@ pub async fn proxy_to_port_with_path(
 #[utoipa::path(
     get,
     path = "/proxy/userapp/prod/{user_id}/{app_id}/{*path}",
-    tag = "应用管理",
+    tag = "UserApp · 终端与代理",
     summary = "Pingora 代理 - 访问部署的应用服务（免端口，按 app_id 路由，含路径）",
     description = r#"
 访问 `POST /api/v1/apps` 部署的应用。`access.external.http` 返回 `/proxy/userapp/prod/{user_id}/{app_id}`，即本接口。
@@ -531,7 +531,7 @@ pub async fn proxy_to_app_with_path(
 #[utoipa::path(
     get,
     path = "/proxy/userapp/dev/{user_id}/{app_id}/{*path}",
-    tag = "应用管理",
+    tag = "UserApp · 终端与代理",
     summary = "Pingora 代理 - 开发阶段预览（app 开发容器 pingap 入口）",
     description = r#"
 访问开发阶段该 app 开发容器（UserAppBuilder，per-app）内的应用。与部署访问

@@ -239,15 +239,20 @@ use crate::handler;
         )
     ),
     tags(
-        (name = "system", description = "系统健康检查和状态监控接口"),
+        (name = "UserApp · 生命周期", description = "应用生产生命周期：查询/启停/更新/删除/健康/统计/事件/回收策略"),
+        (name = "UserApp · 日志", description = "应用日志：日志源、检索与 SSE 实时流"),
+        (name = "UserApp · 文件与存储", description = "应用文件上传/管理与存储卷查询/清理"),
+        (name = "UserApp · 数据库", description = "应用 PostgreSQL 账号与数据库管理（dev/prod）"),
+        (name = "UserApp · 终端与代理", description = "终端入口（ttyd/VNC/dbx/pgweb）与流量代理（/proxy/userapp）"),
+        (name = "UserApp · 开发与构建", description = "开发工作区、构建任务与文件镜像（file-server 进程侧服务）"),
+        (name = "computer", description = "Computer Agent 桌面、聊天与容器内 PG 管理接口"),
+        (name = "pod", description = "Pod 容器管理接口（监控/保活/重启；支持 service_type=userapp 分派 dev/prod 容器）"),
+        (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),
         (name = "chat", description = "AI 聊天对话接口，支持多媒体内容"),
         (name = "agent", description = "AI 代理会话管理和实时通知接口"),
-        (name = "computer", description = "Computer Agent 桌面与聊天接口"),
-        (name = "pod", description = "Pod 容器管理接口，支持容器监控、启动和保活"),
-        (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),
-        (name = "agent-mgmt", description = "Agent 二进制安装/卸载/检查接口(P0-4: rcoder 转发到 agent_runner 容器)"),
         (name = "devcomputer", description = "DevComputer 调试接口（与 /computer 共享容器，自动注入 auto_reload 配置）"),
-        (name = "应用管理", description = "应用容器管理接口，支持创建、启动、停止、删除应用"),
+        (name = "agent-mgmt", description = "Agent 二进制安装/卸载/检查接口(P0-4: rcoder 转发到 agent_runner 容器)"),
+        (name = "system", description = "系统健康检查和状态监控接口"),
     ),
     info(
         description = r#"
@@ -257,6 +262,7 @@ RCoder AI 服务 API
 
 ## 主要功能
 
+- **UserApp 应用引擎**: 无状态应用 Pod 的完整生命周期（开发构建 → 部署发布 → 终端/代理访问），按 `UserApp ·` 前缀六组分类
 - **智能对话**: 支持文本、图像、音频、文档等多媒体内容的 AI 交互
 - **实时通知**: 通过 SSE 协议提供 AI 代理执行进度的实时推送
 - **会话管理**: 完整的会话生命周期管理，支持任务取消
@@ -474,6 +480,130 @@ mod openapi_tests {
     fn operation_summaries_are_ui_concise() {
         assert_summaries_ui_concise("primary", &primary_document());
         assert_summaries_ui_concise("file-server", &file_server_document());
+    }
+
+    fn sole_tag(
+        doc_name: &str,
+        document: &utoipa::openapi::OpenApi,
+        path: &str,
+        method: &str,
+    ) -> String {
+        let item = document
+            .paths
+            .paths
+            .get(path)
+            .unwrap_or_else(|| panic!("{doc_name}: path {path} 不在文档中"));
+        let (_, op) = operations_of(item)
+            .into_iter()
+            .find(|(m, _)| *m == method)
+            .unwrap_or_else(|| panic!("{doc_name}: {path} 无 {method} operation"));
+        let mut tags = op.tags.clone().unwrap_or_default();
+        assert_eq!(
+            tags.len(),
+            1,
+            "{doc_name} {method} {path}: 期望单 tag，实际 {tags:?}"
+        );
+        tags.remove(0)
+    }
+
+    /// 主文档按业务域分组：UserApp 六个子类 tag 声明齐全且顺序最前（UI 分组
+    /// 顺序 = tags 声明顺序）、legacy tag（应用管理/应用日志/Computer Agent）
+    /// 全文清零、UserApp 系 operation 计数下限、分域锚点逐一断言。
+    #[test]
+    fn primary_document_groups_userapp_by_business_domain() {
+        let document = primary_document();
+        let tag_names: Vec<&str> = document
+            .tags
+            .iter()
+            .flatten()
+            .map(|t| t.name.as_str())
+            .collect();
+        let userapp_tags = [
+            "UserApp · 生命周期",
+            "UserApp · 日志",
+            "UserApp · 文件与存储",
+            "UserApp · 数据库",
+            "UserApp · 终端与代理",
+            "UserApp · 开发与构建",
+        ];
+        let mut prev: Option<usize> = None;
+        for tag in userapp_tags {
+            let pos = tag_names
+                .iter()
+                .position(|n| *n == tag)
+                .unwrap_or_else(|| panic!("tags 声明缺失: {tag}"));
+            if let Some(prev_pos) = prev {
+                assert!(
+                    pos > prev_pos,
+                    "tags 声明顺序异常: {tag}（pos={pos} prev={prev_pos}）"
+                );
+            }
+            prev = Some(pos);
+        }
+        assert!(
+            tag_names.first().is_some_and(|n| n.starts_with("UserApp")),
+            "UserApp 子类必须排在 tags 声明最前"
+        );
+        for legacy in ["应用管理", "应用日志", "Computer Agent"] {
+            assert!(
+                !tag_names.contains(&legacy),
+                "legacy tag 声明残留: {legacy}"
+            );
+        }
+
+        let mut userapp_ops = 0usize;
+        for (path, item) in &document.paths.paths {
+            for (method, op) in operations_of(item) {
+                for tag in op.tags.iter().flatten() {
+                    let tag = tag.as_str();
+                    assert!(
+                        tag != "应用管理" && tag != "应用日志" && tag != "Computer Agent",
+                        "{method} {path}: legacy tag 残留: {tag}"
+                    );
+                    if tag.starts_with("UserApp") {
+                        userapp_ops += 1;
+                    }
+                }
+            }
+        }
+        // 口径：生命周期12 + 日志3 + 文件存储8 + 数据库5 + 终端代理12 +
+        // 开发构建 20（userapp crate 33 条中 13 条内部路径已按 INTERNAL_USERAPP_PATHS 剔除）
+        assert!(
+            userapp_ops >= 60,
+            "UserApp 系 operation 计数下限（60）未达: {userapp_ops}"
+        );
+
+        let tag_of = |path: &str, method: &str| sole_tag("primary", &document, path, method);
+        assert_eq!(
+            tag_of("/api/v1/apps/{app_id}/start", "post"),
+            "UserApp · 生命周期"
+        );
+        assert_eq!(
+            tag_of("/api/v1/apps/{app_id}/logs/stream", "post"),
+            "UserApp · 日志"
+        );
+        assert_eq!(
+            tag_of("/api/v1/apps/{app_id}/storage", "get"),
+            "UserApp · 文件与存储"
+        );
+        assert_eq!(
+            tag_of("/api/v1/apps/{app_id}/db/reset-password", "post"),
+            "UserApp · 数据库"
+        );
+        assert_eq!(
+            tag_of("/api/userapp/db/{env}/align-credentials", "post"),
+            "UserApp · 数据库"
+        );
+        assert_eq!(
+            tag_of("/proxy/userapp/dev/{user_id}/{app_id}/{*path}", "get"),
+            "UserApp · 终端与代理"
+        );
+        assert_eq!(tag_of("/userapp/routes", "get"), "UserApp · 终端与代理");
+        assert_eq!(tag_of("/api/userapp/build", "post"), "UserApp · 开发与构建");
+        assert_eq!(
+            tag_of("/computer/db/{user_id}/reset-password", "post"),
+            "computer"
+        );
     }
 
     /// 运行日志 SSE 契约锚点：事件清单必须出现在 description 里（同事按 swagger

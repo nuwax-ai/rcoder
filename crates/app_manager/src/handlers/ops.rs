@@ -24,7 +24,7 @@ use crate::models::{AppRuntimeInfo, RecyclePolicyRequest, StartAppRequest, Start
         (status = 400, description = "创建空容器缺 user_id / deploy_mode 非法值", body = HttpResult<String>),
         (status = 409, description = "release 幂等冲突（同 id 不同内容）", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 生命周期"
 )]
 #[instrument(skip(state))]
 pub async fn start_app(
@@ -56,7 +56,7 @@ pub async fn start_app(
         (status = 200, description = "停止成功", body = HttpResult<AppRuntimeInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 生命周期"
 )]
 #[instrument(skip(state))]
 pub async fn stop_app(
@@ -83,7 +83,7 @@ pub async fn stop_app(
         (status = 200, description = "重启/部署成功", body = HttpResult<StartAppResult>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 生命周期"
 )]
 #[instrument(skip(state))]
 pub async fn restart_app(
@@ -120,7 +120,7 @@ pub async fn restart_app(
         (status = 400, description = "参数错误（三字段皆空）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 生命周期"
 )]
 #[instrument(skip(state, request))]
 pub async fn set_recycle_policy(

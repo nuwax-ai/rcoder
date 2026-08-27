@@ -29,7 +29,7 @@ use file_server::extract::AppPath as AxumPath;
         (status = 200, description = "Latest build artifact zip", body = file_server::openapi::BinaryFile, content_type = "application/zip"),
         (status = 404, description = "No completed build artifact for this app")
     ),
-    tag = "UserApp"
+    tag = "UserApp · 开发与构建"
 )]
 pub async fn serve_userapp(
     State(state): State<UserAppState>,

@@ -26,7 +26,7 @@ use crate::models::{CreateDatabaseRequest, ResetDbPasswordRequest};
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 400, description = "应用无 PG / 参数错误", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 数据库"
 )]
 #[instrument(skip(state, request))]
 pub async fn reset_db_password(
@@ -54,7 +54,7 @@ pub async fn reset_db_password(
         (status = 400, description = "应用无 PG / 参数错误", body = HttpResult<String>),
         (status = 409, description = "库已存在", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 数据库"
 )]
 #[instrument(skip(state, request))]
 pub async fn create_database(

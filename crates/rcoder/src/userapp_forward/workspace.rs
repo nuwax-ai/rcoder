@@ -41,7 +41,7 @@ pub struct CreateWorkspaceBody {
         (status = 400, description = "参数校验失败", body = HttpResult<String>),
         (status = 502, description = "开发容器不可达", body = HttpResult<String>)
     ),
-    tag = "UserApp",
+    tag = "UserApp · 终端与代理",
     operation_id = "create_userapp_workspace",
     summary = "创建 UserApp 项目工作区（ensure 开发容器 + 建目录 + 注册 owner）"
 )]

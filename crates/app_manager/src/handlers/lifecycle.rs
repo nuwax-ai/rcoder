@@ -28,7 +28,7 @@ use crate::models::{
         (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<AppRuntimeInfo>>),
         (status = 500, description = "集群查询失败", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 生命周期"
 )]
 #[instrument(skip(state, request))]
 pub async fn query_apps(
@@ -50,7 +50,7 @@ pub async fn query_apps(
         (status = 200, description = "对账成功", body = HttpResult<Vec<AppRuntimeInfo>>),
         (status = 500, description = "集群查询失败", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 生命周期"
 )]
 #[instrument(skip(state))]
 pub async fn list_app_runtimes(
@@ -72,7 +72,7 @@ pub async fn list_app_runtimes(
         (status = 200, description = "查询成功", body = HttpResult<AppRuntimeInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 生命周期"
 )]
 #[instrument(skip(state))]
 pub async fn get_app(
@@ -99,7 +99,7 @@ pub async fn get_app(
         (status = 200, description = "更新成功", body = HttpResult<AppRuntimeInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 生命周期"
 )]
 #[instrument(skip(state, request))]
 pub async fn update_app(
@@ -126,7 +126,7 @@ pub async fn update_app(
         (status = 200, description = "删除成功", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "应用管理"
+    tag = "UserApp · 生命周期"
 )]
 #[instrument(skip(state, body))]
 pub async fn delete_app(

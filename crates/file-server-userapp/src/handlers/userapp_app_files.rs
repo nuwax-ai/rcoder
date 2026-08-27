@@ -48,7 +48,7 @@ pub struct AppFilesUploadForm {
 }
 
 /// 单次上传（zip/tar.gz 自动解压；单文件直写）
-#[utoipa::path(post, path = "/app-files/upload", request_body(content = AppFilesUploadForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/app-files/upload", request_body(content = AppFilesUploadForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
 pub(crate) async fn upload(
     State(state): State<UserAppState>,
     mut multipart: Multipart,
@@ -191,7 +191,7 @@ pub struct AppFilesUploadFromUrlBody {
 }
 
 /// 容器内流式下载后走上传核心
-#[utoipa::path(post, path = "/app-files/upload-from-url", request_body = AppFilesUploadFromUrlBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/app-files/upload-from-url", request_body = AppFilesUploadFromUrlBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
 pub(crate) async fn upload_from_url(
     State(state): State<UserAppState>,
     Json(body): Json<AppFilesUploadFromUrlBody>,
@@ -244,7 +244,7 @@ pub struct AppFilesListParams {
     path = "/app-files/list",
     params(AppFilesListParams),
     responses(file_server::openapi::JsonApiResponses),
-    tag = "UserApp"
+    tag = "UserApp · 开发与构建"
 )]
 pub(crate) async fn list(
     State(state): State<UserAppState>,
@@ -319,7 +319,7 @@ pub struct AppFilesDeleteBody {
 }
 
 /// 删除文件或目录（防穿越）
-#[utoipa::path(post, path = "/app-files/delete", request_body = AppFilesDeleteBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/app-files/delete", request_body = AppFilesDeleteBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
 pub(crate) async fn delete(
     State(state): State<UserAppState>,
     Json(body): Json<AppFilesDeleteBody>,

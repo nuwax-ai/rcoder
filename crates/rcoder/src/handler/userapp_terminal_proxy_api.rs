@@ -75,7 +75,7 @@ async fn redirect_doc_response(
 #[utoipa::path(
     get,
     path = "/userapp/dev/ttyd/{app_id}/{*path}",
-    tag = "应用管理",
+    tag = "UserApp · 终端与代理",
     summary = "Pingora 代理 - userApp 开发域 Web 终端（ttyd）",
     description = r#"
 访问该 app 开发容器（UserAppBuilder）内的 **Web 终端**。与 computer 族
@@ -112,7 +112,7 @@ pub async fn proxy_to_userapp_ttyd(
 #[utoipa::path(
     get,
     path = "/userapp/dev/vnc/{app_id}/{*path}",
-    tag = "应用管理",
+    tag = "UserApp · 终端与代理",
     summary = "Pingora 代理 - userApp 开发域远程桌面（noVNC）",
     description = r#"
 访问该 app 开发容器（UserAppBuilder）内的 **远程桌面**（noVNC）。开发容器是完整桌面镜像
@@ -145,7 +145,7 @@ pub async fn proxy_to_userapp_vnc(
 #[utoipa::path(
     get,
     path = "/userapp/dev/audio/{app_id}/{*path}",
-    tag = "应用管理",
+    tag = "UserApp · 终端与代理",
     summary = "Pingora 代理 - userApp 开发域语音（audio，按 app_id 定位开发容器）",
     description = r#"
 访问该 app 开发容器（UserAppBuilder）内的 **语音服务**。分流规则与 computer 族
@@ -180,7 +180,7 @@ pub async fn proxy_to_userapp_audio(
 #[utoipa::path(
     get,
     path = "/userapp/dev/ime/{app_id}/{*path}",
-    tag = "应用管理",
+    tag = "UserApp · 终端与代理",
     summary = "Pingora 代理 - userApp 开发域输入法（IME，按 app_id 定位开发容器）",
     description = r#"
 访问该 app 开发容器（UserAppBuilder）内的 **IME 输入法透传服务**（6091，WebSocket）。
@@ -213,7 +213,7 @@ pub async fn proxy_to_userapp_ime(
 #[utoipa::path(
     get,
     path = "/userapp/dev/dbx/{app_id}/{*path}",
-    tag = "应用管理",
+    tag = "UserApp · 终端与代理",
     summary = "Pingora 代理 - DBX 数据库 Web GUI（开发阶段，按 app_id 定位开发容器）",
     description = r#"
 访问该 app **开发容器**（UserAppBuilder，agent-runner 镜像）内的 DBX 数据库
@@ -250,7 +250,7 @@ pub async fn proxy_to_dev_dbx(
 #[utoipa::path(
     get,
     path = "/userapp/prod/ttyd/{app_id}/{*path}",
-    tag = "应用管理",
+    tag = "UserApp · 终端与代理",
     summary = "Pingora 代理 - userApp 运行容器 Web 终端（部署后的生产环境，ttyd 直连）",
     description = r#"
 访问该 app **运行容器**（`ServiceType::UserApp`，app-runtime 镜像——部署后的生产环境）
@@ -286,7 +286,7 @@ pub async fn proxy_to_userapp_runtime_ttyd(
 #[utoipa::path(
     get,
     path = "/userapp/prod/pgweb/{app_id}/{*path}",
-    tag = "应用管理",
+    tag = "UserApp · 终端与代理",
     summary = "Pingora 代理 - userApp 运行容器数据库控制台（pgweb）",
     description = r#"
 访问该 app **运行容器**（app-runtime 镜像）内的 pgweb——容器内 PostgreSQL（5432）
@@ -319,7 +319,7 @@ pub async fn proxy_to_userapp_runtime_pgweb(
 #[utoipa::path(
     get,
     path = "/userapp/prod/dbx/{app_id}/{*path}",
-    tag = "应用管理",
+    tag = "UserApp · 终端与代理",
     summary = "Pingora 代理 - DBX 数据库 Web GUI（生产阶段，按 app_id 定位运行容器）",
     description = r#"
 访问该 app **运行容器**（`ServiceType::UserApp`，app-runtime 镜像——部署后的生产环境）
@@ -353,7 +353,7 @@ pub async fn proxy_to_prod_dbx(
 #[utoipa::path(
     get,
     path = "/userapp/routes",
-    tag = "应用管理",
+    tag = "UserApp · 终端与代理",
     summary = "userApp 代理路由一览（工具族/应用流量族，stage 段 dev/prod 统一）",
     description = "userApp 两族 Pingora 代理入口速查：工具族 /userapp/{dev,prod}/{tool}/{app_id}；应用流量族（免端口，pingap 统一入口 9080）/proxy/userapp/{dev,prod}/{user_id}/{app_id}。",
     responses(
