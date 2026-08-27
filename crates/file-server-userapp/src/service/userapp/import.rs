@@ -2,18 +2,8 @@
 
 use std::path::Path;
 
-use serde::Serialize;
-
+use crate::models::DetectionResult;
 use file_server::error::{AppError, AppResult};
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct DetectionResult {
-    pub project_dir: String,
-    pub detected_type: String,
-    pub draft_path: String,
-    pub manifest: String,
-    pub warnings: Vec<String>,
-}
 
 pub async fn detect_project(workspace: &Path, project_dir: &str) -> AppResult<DetectionResult> {
     validate_project_dir(project_dir)?;

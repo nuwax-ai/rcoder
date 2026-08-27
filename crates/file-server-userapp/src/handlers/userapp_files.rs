@@ -7,10 +7,14 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::UserAppState;
+use crate::models::{
+    UserappFileListQuery, UserappFilesUpdateBody, UserappGenerateFileBody,
+    UserappImportProjectForm, UserappResolveFileQuery, UserappSearchFilesQuery,
+    UserappUploadFileForm, UserappUploadFilesForm,
+};
 use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
 use file_server::handlers::computer::files::files_update_impl;
@@ -21,40 +25,10 @@ use file_server::handlers::computer::files_read::{
     FileListParams, SearchFilesParams, get_file_list_impl, resolve_file_impl, search_files_impl,
 };
 use file_server::handlers::multipart::{file_field, text_field, validate_zip_ext};
-use file_server::service::code as code_service;
 use file_server::service::temp_file::TemporaryFile;
 use file_server::workspace::resolve_userapp_dev;
 
 // ── get-file-list ───────────────────────────────────────────────────────────────
-
-/// userapp 版 get-file-list 查询参数 (computer FileListQuery 镜像, cId→appId)。
-#[derive(Deserialize, Validate, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UserappFileListQuery {
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    #[serde(default)]
-    #[garde(skip)]
-    /// 预览 URL 前缀（fileProxyUrl 的 base）；缺省则响应不含 fileProxyUrl
-    pub proxy_path: Option<String>,
-    #[serde(default)]
-    #[garde(skip)]
-    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
-    pub custom_target_dir: Option<String>,
-    #[serde(default)]
-    #[garde(skip)]
-    /// 相对 workspace 根的子目录（可多级）；缺省列根目录
-    pub relative_path: Option<String>,
-    #[serde(default)]
-    #[garde(skip)]
-    /// 是否递归展开子目录；缺省 true，显式 "false" 仅当前层
-    pub recursive: Option<String>,
-}
 
 /// 文件树列表（轻量元信息，不读内容）
 #[utoipa::path(
@@ -85,29 +59,6 @@ pub(crate) async fn get_file_list(
 
 // ── resolve-file ────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Validate, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UserappResolveFileQuery {
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    #[serde(default)]
-    #[garde(skip)]
-    /// 预览 URL 前缀（fileProxyUrl 的 base）；缺省则响应不含 fileProxyUrl
-    pub proxy_path: Option<String>,
-    #[serde(default)]
-    #[garde(skip)]
-    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
-    pub custom_target_dir: Option<String>,
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// workspace 内相对路径的文件（必填非空）
-    pub file_path: String,
-}
-
 /// 校验文件存在性，存在返回预览 URL
 #[utoipa::path(
     get,
@@ -132,42 +83,6 @@ pub(crate) async fn resolve_file(
 }
 
 // ── search-files ────────────────────────────────────────────────────────────────
-
-#[derive(Deserialize, Validate, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UserappSearchFilesQuery {
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    #[serde(default)]
-    #[garde(skip)]
-    /// 预览 URL 前缀（fileProxyUrl 的 base）；缺省则响应不含 fileProxyUrl
-    pub proxy_path: Option<String>,
-    #[serde(default)]
-    #[garde(skip)]
-    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
-    pub custom_target_dir: Option<String>,
-    #[serde(default)]
-    #[garde(skip)]
-    /// 相对 workspace 根的子目录（可多级）；缺省列根目录
-    pub relative_path: Option<String>,
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 搜索关键字（文件名/相对路径子串，大小写不敏感；必填非空）
-    pub kw: String,
-    #[garde(custom(file_server::validation_rules::positive_int))]
-    /// 命中条数上限（必填正整数）
-    pub limit: String,
-    #[garde(custom(file_server::validation_rules::positive_int))]
-    /// 访问条目数硬上限，含未命中（必填正整数）
-    pub max_visit: String,
-    #[garde(custom(file_server::validation_rules::positive_int))]
-    /// 超时毫秒数（必填正整数）
-    pub timeout_ms: String,
-}
 
 /// 无索引有界实时搜索
 #[utoipa::path(
@@ -201,22 +116,6 @@ pub(crate) async fn search_files(
 
 // ── files-update ────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UserappFilesUpdateBody {
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    /// 上传文件的二进制内容（重复字段，与 filePaths 一一对应）
-    pub files: Vec<code_service::FileOp>,
-    #[serde(default)]
-    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
-    pub custom_target_dir: Option<String>,
-}
-
 /// 批量文件增删改（modify 字节比较）
 #[utoipa::path(post, path = "/files-update", request_body = UserappFilesUpdateBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
 pub(crate) async fn files_update(
@@ -239,39 +138,6 @@ pub(crate) async fn files_update(
 }
 
 // ── upload-file / upload-files ──────────────────────────────────────────────────
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UserappUploadFileForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    /// workspace 内相对路径的文件（必填非空）
-    pub file_path: String,
-    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
-    pub custom_target_dir: Option<String>,
-    #[schema(format = Binary)]
-    /// 上传文件（zip 或单文件）
-    pub file: String,
-}
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UserappUploadFilesForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
-    pub custom_target_dir: Option<String>,
-    /// 每个文件的目标相对路径（与 files 一一对应，重复字段）
-    pub file_paths: Vec<String>,
-    /// 上传文件的二进制内容（重复字段，与 filePaths 一一对应）
-    pub files: Vec<file_server::openapi::BinaryFile>,
-}
 
 /// 单文件上传（multipart）
 #[utoipa::path(post, path = "/upload-file", request_body(content = UserappUploadFileForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
@@ -364,29 +230,6 @@ pub(crate) async fn upload_files(
 
 // ── generate-file ───────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UserappGenerateFileBody {
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 文件名，可含相对子路径（如 "src/foo.txt"；自动剥前导 `/`）
-    pub file_name: String,
-    #[serde(default)]
-    /// 文本内容；缺省视为空串
-    pub content: Option<String>,
-    #[serde(default)]
-    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
-    pub custom_target_dir: Option<String>,
-}
-
 /// JSON 文本生成文件
 #[utoipa::path(
     post,
@@ -409,21 +252,6 @@ pub(crate) async fn generate_file(
 }
 
 // ── import-project ──────────────────────────────────────────────────────────────
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UserappImportProjectForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
-    pub custom_target_dir: Option<String>,
-    #[schema(format = Binary)]
-    /// 上传文件（zip 或单文件）
-    pub file: String,
-}
 
 /// 上传项目 zip 解压合并到开发卷 workspace
 #[utoipa::path(post, path = "/import-project", request_body(content = UserappImportProjectForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
@@ -594,7 +422,7 @@ mod tests {
         // 3. detect_project (存量接口, 已切开发卷) 应在开发卷里找到项目
         let reply = super::super::userapp::detect_project(
             State(state),
-            AppJson(super::super::userapp::ImportProjectBody {
+            AppJson(crate::models::ImportProjectBody {
                 app_id: "app-1".into(),
                 user_id: "u1".into(),
                 project_dir: "demo-app".into(),
@@ -656,7 +484,7 @@ mod tests {
             Json(UserappFilesUpdateBody {
                 app_id: "app-3".into(),
                 user_id: "u".into(),
-                files: vec![code_service::FileOp {
+                files: vec![file_server::models::FileOp {
                     operation: "create".into(),
                     name: "pkg.json".into(),
                     is_dir: None,

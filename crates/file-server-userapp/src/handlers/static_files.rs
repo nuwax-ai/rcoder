@@ -3,30 +3,14 @@
 
 use std::path::Path;
 
+use crate::UserAppState;
+use crate::models::StaticQuery;
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
-use file_server::handlers::static_files::{COMPUTER_CORS, cors_404, serve_from_root};
-use file_server::workspace::resolve_userapp_dev;
-use serde::Deserialize;
-
-use crate::UserAppState;
 use file_server::extract::AppPath as AxumPath;
 use file_server::extract::AppQuery;
-
-/// static 取包 query（`GET /static/{appId}`）。
-///
-/// `parameter_in` 必须显式声明：utoipa-axum 从 handler 签名自动发现 Query struct
-/// 时按 Path extractor 推断 in（会把 query 字段误标 path——swagger 对接即错），
-/// 容器级显式声明优先于自动推断。
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct StaticQuery {
-    /// 可选：按 release_id 精确取包（定位 `builds/workspace-package-{release_id}.zip`）。
-    /// 缺省 = 最新产物。release_id 只允许字母数字与连字符（服务端生成的 UUID 形态），
-    /// 其余字符一律拒绝（防路径注入）；指定的版本不存在时 404。
-    #[serde(default)]
-    pub release_id: Option<String>,
-}
+use file_server::handlers::static_files::{COMPUTER_CORS, cors_404, serve_from_root};
+use file_server::workspace::resolve_userapp_dev;
 
 /// 下载构建整体包
 ///
@@ -47,7 +31,7 @@ pub struct StaticQuery {
         StaticQuery,
     ),
     responses(
-        (status = 200, description = "Build artifact zip（缺省最新产物；?release_id= 指定版本）", body = file_server::openapi::BinaryFile, content_type = "application/zip"),
+        (status = 200, description = "Build artifact zip（缺省最新产物；?release_id= 指定版本）", body = file_server::models::BinaryFile, content_type = "application/zip"),
         (status = 404, description = "无产物，或 ?release_id= 指定的版本不存在（含非法字符被拒）")
     ),
     tag = "UserApp · 开发与构建"

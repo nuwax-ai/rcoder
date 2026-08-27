@@ -31,7 +31,8 @@ use file_server::service::build_manager::BuildManager;
 use assemble::assemble_workspace_package;
 use manifest::{ReleaseMetadata, build_release_lock, read_workspace_manifest};
 
-use tasks::{BuildProgressEvent, BuildTask, BuildTaskId, BuildTaskKind, BuildTaskStore};
+use crate::models::{BuildTaskId, BuildTaskKind};
+use tasks::{BuildProgressEvent, BuildTask, BuildTaskStore};
 
 pub(crate) use tasks::BuildTask as UserappBuildTask;
 

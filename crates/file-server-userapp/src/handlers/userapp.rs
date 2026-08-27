@@ -26,16 +26,20 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use garde::Validate;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use shared_types::HttpResult;
 
 use crate::UserAppState;
+use crate::models::{
+    BuildCreatedData, BuildTaskSnapshot, BuildTaskStatus, BuildUserAppBody, CancelData,
+    ConfirmData, DetectData, ImportProjectBody, StreamQuery, TaskLogsQuery,
+};
 use crate::service::userapp;
-use crate::service::userapp::tasks::{BuildProgressEvent, BuildTaskSnapshot, BuildTaskStatus};
+use crate::service::userapp::tasks::BuildProgressEvent;
 use file_server::error::{AppError, AppResult};
-use file_server::extract::deserialize_id_string;
 use file_server::extract::{AppJson, AppPath, AppQuery};
-use file_server::service::dev_server::log::{ReadDevLogResult, read_dev_log};
+use file_server::models::ReadDevLogResult;
+use file_server::service::dev_server::log::read_dev_log;
 
 // ── HttpResult 转换层 ──────────────────────────────────────────────────────────
 
@@ -82,109 +86,6 @@ pub(crate) fn reply<T>(r: AppResult<T>) -> UserAppReply<T> {
         Ok(data) => UserAppReply::Ok(data),
         Err(e) => UserAppReply::Err(e),
     }
-}
-
-// ── data DTO（HttpResult.data 载荷）───────────────────────────────────────────
-
-/// build 响应 data（POST /build）。
-#[derive(Serialize, utoipa::ToSchema)]
-pub(crate) struct BuildCreatedData {
-    /// 构建任务 ID（轮询 /tasks/{task_id} 与 SSE 订阅用）
-    pub task_id: String,
-    /// 受理时状态（恒为 pending——异步任务已创建；与 /tasks/{task_id} 轮询共用
-    /// BuildTaskStatus 状态机，序列化值 "pending"）
-    pub status: BuildTaskStatus,
-    /// 预生成的产物相对路径（`builds/workspace-package-{release_id}.zip`，release_id
-    /// 创建时即生成）——信息字段：标识本次构建的产物位置；实际取包按 app 直下
-    /// `GET /api/v1/userapp/static/{app_id}`（缺省最新产物；带 `?release_id=` 精确
-    /// 取本版本，回滚/比对指定版本用）。
-    pub artifact_path: String,
-}
-
-/// cancel 响应 data。
-#[derive(Serialize, utoipa::ToSchema)]
-pub(crate) struct CancelData {
-    /// 被取消的任务 ID
-    pub task_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<BuildTaskStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub already_terminal: Option<bool>,
-}
-
-/// detect 响应 data。
-#[derive(Serialize, utoipa::ToSchema)]
-pub(crate) struct DetectData {
-    pub detection: userapp::import::DetectionResult,
-}
-
-/// confirm 响应 data。
-#[derive(Serialize, utoipa::ToSchema)]
-pub(crate) struct ConfirmData {
-    pub path: String,
-}
-
-/// `POST /api/v1/userapp/build` 请求体。
-#[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-pub(crate) struct BuildUserAppBody {
-    /// UserApp 标识（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）。
-    #[serde(deserialize_with = "deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    pub app_id: String,
-    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 时组装宿主树
-    /// `dev/{user_id}/{app_id}` 用；file-server 侧仅日志审计，不参与容器内定位）。
-    #[serde(deserialize_with = "deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    pub user_id: String,
-}
-
-#[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-pub(crate) struct ImportProjectBody {
-    #[serde(deserialize_with = "deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    pub app_id: String,
-    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
-    /// 侧仅日志审计，不参与容器内定位）。
-    #[serde(deserialize_with = "deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    pub user_id: String,
-    /// workspace 内的子项目目录名（模板 zip 的顶层目录；detect/confirm 的定位粒度）
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    pub project_dir: String,
-}
-
-/// 任务构建日志查询参数（`GET /tasks/{task_id}/logs`）。
-///
-/// `parameter_in` 必须显式声明：utoipa-axum 自动发现会按 Path extractor 把
-/// query 字段误标 path（swagger 对接即错），显式声明优先。
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-pub(crate) struct TaskLogsQuery {
-    /// 子项目目录名（= service_id）；留空读 workspace 根日志目录。
-    #[serde(default)]
-    pub service: Option<String>,
-    /// 起始行号（1-based，对齐 get-dev-log）。
-    #[serde(default = "default_start_index")]
-    pub start_index: usize,
-}
-
-fn default_start_index() -> usize {
-    1
-}
-
-/// SSE 订阅参数（`GET /tasks/{task_id}/logs/stream`）。
-///
-/// `parameter_in` 必须显式声明：utoipa-axum 自动发现会按 Path extractor 把
-/// query 字段误标 path（swagger 对接即错），显式声明优先。
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-pub(crate) struct StreamQuery {
-    /// 从哪个 seq 开始回放（含该 seq；0 = 从头）。仅作兜底——
-    /// 请求带 `Last-Event-ID` 头时以头为准（头值 + 1 = 本值语义），query 被忽略。
-    #[serde(default)]
-    pub from_seq: u64,
 }
 
 /// 解析 SSE 续传游标：`Last-Event-ID` 头优先，`?from_seq=` query 兜底。

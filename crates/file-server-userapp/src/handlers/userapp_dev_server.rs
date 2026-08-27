@@ -11,16 +11,18 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde::Deserialize;
-use serde::Serialize;
 use shared_types::HttpResult;
 
 use super::userapp::{UserAppReply, reply};
 use crate::UserAppState;
-use crate::service::userapp::tasks::BuildTaskStatus;
+use crate::models::{
+    BuildTaskStatus, DevLogsQuery, DevOpBody, UserappDevList, UserappDevProcess, UserappDevStopped,
+    UserappDevTaskCreated,
+};
 use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppQuery as Query};
-use file_server::service::dev_server::{DevProcess, KilledPid, ReadDevLogResult, StoppedDev};
+use file_server::models::ReadDevLogResult;
+use file_server::service::dev_server::{DevProcess, StoppedDev};
 use file_server::workspace::resolve_userapp_dev;
 
 /// 进程表 key（与 web projectId 空间隔离; log_dir 剥前缀）。
@@ -31,81 +33,6 @@ fn dev_key(app_id: &str) -> String {
 /// key → 对外 app_id（非本域 key 返回 None）。
 fn app_id_of_key(key: &str) -> Option<&str> {
     key.strip_prefix("userapp:")
-}
-
-// ── DTO ────────────────────────────────────────────────────────────────────────
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-pub(crate) struct DevOpBody {
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
-    pub app_id: String,
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树
-    /// `dev/{user_id}/{app_id}` 用；file-server 侧日志审计，不参与容器内定位）
-    pub user_id: String,
-    #[serde(default)]
-    #[garde(skip)]
-    /// dev server 的 base path（vite --base 等）；缺省 "/"。
-    /// **仅 web 域项目（vite dev server）生效**——UserApp workspace
-    /// （manifest/app-cli 引擎）不消费：pingap 路由前缀由各服务的
-    /// project.manifest.toml `[proxy].path` 决定，传了无效果。
-    pub base_path: Option<String>,
-}
-
-#[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-pub(crate) struct DevLogsQuery {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
-    pub app_id: String,
-    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；
-    /// file-server 侧不参与容器内定位）
-    pub user_id: String,
-    /// 日志起始行（分页, 默认 1）。
-    #[serde(default = "default_start_index")]
-    /// 日志起始行（分页）；默认 1
-    pub start_index: usize,
-    /// "main"（当日汇总）或 "temp"（最新一次, 默认）。
-    #[serde(default)]
-    /// 日志类型：main=当日汇总 / temp=最新一次（默认）
-    pub log_type: Option<String>,
-}
-fn default_start_index() -> usize {
-    1
-}
-
-/// dev/stop 响应 data（POST /dev/stop）。
-#[derive(Serialize, utoipa::ToSchema)]
-pub(crate) struct UserappDevStopped {
-    /// 停止结果消息（"Stopped" / "No running process found" / "Partially stopped but continue execution"）
-    pub message: String,
-    /// 应用 ID
-    pub app_id: String,
-    /// 被停进程 ID（按 app_id 定位进程组，无需 pid，恒为 null）
-    pub pid: Option<u32>,
-    /// 被杀进程 PID 明细（killed 标记是否杀灭成功）
-    pub killed_pids: Vec<KilledPid>,
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
-pub(crate) struct UserappDevProcess {
-    /// 应用 ID
-    pub app_id: String,
-    /// 主进程 PID
-    pub pid: u32,
-    /// 服务端口（UserApp workspace 恒为 pingap 9080 统一入口）
-    pub port: u16,
-    /// 启动时间（Unix 毫秒）
-    pub started_at: i64,
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
-pub(crate) struct UserappDevList {
-    /// 在跑的 UserApp 开发服务列表（不含 web/computer 项目进程）
-    pub list: Vec<UserappDevProcess>,
 }
 
 // ── handlers ───────────────────────────────────────────────────────────────────
@@ -237,19 +164,6 @@ pub(crate) async fn dev_restart(
     reply(result.await)
 }
 
-/// dev 异步任务受理响应 data（POST /dev/start、/dev/restart——编译+启停）。
-/// 字段 snake_case 对齐 BuildCreatedData（Java 同一消费面）。
-#[derive(Serialize, utoipa::ToSchema)]
-pub(crate) struct UserappDevTaskCreated {
-    /// 应用 ID
-    pub app_id: String,
-    /// 异步任务 ID（轮询 /api/v1/userapp/tasks/{task_id}、SSE /api/v1/userapp/tasks/{task_id}/logs/stream）
-    pub task_id: String,
-    /// 受理时状态（恒为 pending——后台任务已创建；与 /tasks/{task_id} 轮询共用
-    /// BuildTaskStatus 状态机，序列化值 "pending"）
-    pub status: BuildTaskStatus,
-}
-
 /// dev 任务的后置动作（编译成功后执行哪个生命周期操作）。
 pub(crate) enum DevTaskAction {
     Start,
@@ -266,8 +180,8 @@ async fn spawn_dev_task(
     action: DevTaskAction,
 ) -> Result<String, AppError> {
     let kind = match action {
-        DevTaskAction::Start => crate::service::userapp::tasks::BuildTaskKind::DevStart,
-        DevTaskAction::Restart => crate::service::userapp::tasks::BuildTaskKind::DevRestart,
+        DevTaskAction::Start => crate::models::BuildTaskKind::DevStart,
+        DevTaskAction::Restart => crate::models::BuildTaskKind::DevRestart,
     };
     let task = state
         .build_tasks

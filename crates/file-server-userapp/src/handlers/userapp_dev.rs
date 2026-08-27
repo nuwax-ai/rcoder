@@ -8,8 +8,6 @@
 use axum::extract::State;
 use axum::response::Response;
 use garde::Validate;
-use serde::Deserialize;
-use serde::Serialize;
 use serde_json::Value;
 use shared_types::HttpResult;
 
@@ -17,6 +15,11 @@ use super::userapp::UserAppReply;
 use super::userapp::reply;
 use super::userapp_files::require_app_field;
 use crate::UserAppState;
+use crate::models::{
+    UserappDownloadQuery, UserappEnsureWorkspaceBody, UserappEnsureWorkspaceData,
+    UserappExecCommandBody, UserappGetLogsQuery, UserappInitTemplateForm, UserappInstallBody,
+    UserappPushSkillsForm, UserappZipBody,
+};
 use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
 use file_server::handlers::computer::archive::{download_all_files_impl, zip_workspace_impl};
@@ -28,26 +31,6 @@ use file_server::handlers::multipart::{file_field, text_field};
 use file_server::workspace::resolve_userapp_dev;
 
 // ── ensure-workspace ────────────────────────────────────────────────────────────
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-pub(crate) struct UserappEnsureWorkspaceBody {
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-}
-
-/// ensure-workspace 响应 data。
-#[derive(Serialize, utoipa::ToSchema)]
-pub(crate) struct UserappEnsureWorkspaceData {
-    /// 建好的 workspace 绝对路径（容器内视角，`{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub workspace: String,
-}
 
 /// 幂等建 workspace 目录
 ///
@@ -73,23 +56,6 @@ pub(crate) async fn ensure_workspace(
 
 // ── execute-command ─────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UserappExecCommandBody {
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// shell 命令串（经 shell -c 执行，cwd=workspace）
-    pub command: String,
-}
-
 /// 终端命令执行（cwd=workspace）
 ///
 /// 经 shell -c 执行，带超时捕获。
@@ -104,27 +70,6 @@ pub(crate) async fn execute_command(
 }
 
 // ── get-logs ────────────────────────────────────────────────────────────────────
-
-#[derive(Deserialize, Validate, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-#[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UserappGetLogsQuery {
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    #[serde(default = "default_tail_lines")]
-    /// 返回日志末尾行数；默认 200
-    pub tail_lines: usize,
-}
-fn default_tail_lines() -> usize {
-    200
-}
 
 /// 读取最新应用日志
 ///
@@ -147,19 +92,6 @@ pub(crate) async fn get_logs(
 
 // ── install-project ─────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UserappInstallBody {
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    /// 语言：typescript/ts→pnpm install；python/py→pip install
-    pub programming_language: String,
-}
-
 /// 依赖安装
 ///
 /// typescript→pnpm install；python→pip install。
@@ -175,27 +107,13 @@ pub(crate) async fn install_project(
 
 // ── zip-workspace ───────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UserappZipBody {
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    #[serde(default)]
-    /// 额外排除目录（与内置排除表合并，按任意路径段匹配）
-    pub exclude_dirs: Option<Vec<String>>,
-}
-
 /// workspace 打包下载（二进制 zip）
 #[utoipa::path(
     post,
     path = "/zip-workspace",
     request_body = UserappZipBody,
     responses(
-        (status = 200, description = "Workspace ZIP archive", body = file_server::openapi::BinaryFile, content_type = "application/zip"),
+        (status = 200, description = "Workspace ZIP archive", body = file_server::models::BinaryFile, content_type = "application/zip"),
         file_server::openapi::ErrorApiResponses
     ),
     tag = "UserApp · 开发与构建"
@@ -217,22 +135,6 @@ pub(crate) async fn zip_workspace(
 
 // ── download-all-files ──────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Validate, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UserappDownloadQuery {
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    #[serde(default)]
-    #[garde(skip)]
-    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
-    pub custom_target_dir: Option<String>,
-}
-
 /// 全量文件下载
 ///
 /// 顶层前缀 + 空 zip 兜底 + 大小上限。
@@ -241,7 +143,7 @@ pub(crate) struct UserappDownloadQuery {
     path = "/download-all-files",
     params(UserappDownloadQuery),
     responses(
-        (status = 200, description = "Workspace ZIP archive", body = file_server::openapi::BinaryFile, content_type = "application/zip"),
+        (status = 200, description = "Workspace ZIP archive", body = file_server::models::BinaryFile, content_type = "application/zip"),
         file_server::openapi::ErrorApiResponses
     ),
     tag = "UserApp · 开发与构建"
@@ -258,21 +160,6 @@ pub(crate) async fn download_all_files(
 }
 
 // ── init-project-template ───────────────────────────────────────────────────────
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UserappInitTemplateForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    #[schema(format = Binary)]
-    /// 上传文件（zip 或单文件）
-    pub file: String,
-    /// 是否 git init（双开关：GIT_ENABLED 且为 true 才执行）
-    pub enable_git: Option<bool>,
-}
 
 /// 模板初始化开发卷
 ///
@@ -323,23 +210,6 @@ pub(crate) async fn init_project_template(
 }
 
 // ── push-skills-to-workspace ────────────────────────────────────────────────────
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UserappPushSkillsForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
-    /// 用户 ID（审计字段，不参与路径定位）
-    pub user_id: String,
-    #[schema(format = Binary)]
-    /// 上传文件（zip 或单文件）
-    pub file: Option<String>,
-    /// 技能 zip 的 URL 列表（JSON 数组或单值）
-    pub skill_urls: Option<Vec<String>>,
-    /// 智能体 ID (开发卷布局下不走 agent-store, 仅审计日志)
-    pub agent_id: Option<String>,
-}
 
 /// 技能推送（zip/skillUrls）
 ///

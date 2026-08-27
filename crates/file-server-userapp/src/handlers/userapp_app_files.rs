@@ -12,7 +12,6 @@
 
 use axum::Json;
 use axum::extract::{Multipart, Query, State};
-use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
 
@@ -28,24 +27,12 @@ use download_utils::{
 };
 use tokio_util::sync::CancellationToken;
 
-// ── 上传（multipart: app_id / target / flatten / file）──────────────────────────
+use crate::models::{
+    AppFilesClearBody, AppFilesDeleteBody, AppFilesListParams, AppFilesUploadForm,
+    AppFilesUploadFromUrlBody,
+};
 
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-pub struct AppFilesUploadForm {
-    /// UserApp 应用 ID（定位 = resolve_userapp_dev；单 app 模式须与归属一致）
-    pub app_id: String,
-    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
-    /// 侧仅日志审计，不参与容器内定位）
-    pub user_id: String,
-    /// app 根相对目标（压缩包=解压目录；单文件=文件路径）
-    pub target: String,
-    /// 压缩包解压后单层归一（默认 false）
-    pub flatten: Option<bool>,
-    #[schema(format = Binary)]
-    /// 上传内容（zip / tar.gz / 单文件，魔数自动识别）
-    pub file: String,
-}
+// ── 上传（multipart: app_id / target / flatten / file）──────────────────────────
 
 /// 上传文件
 ///
@@ -178,23 +165,6 @@ async fn upload_impl(
 
 // ── upload-from-url（json）───────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct AppFilesUploadFromUrlBody {
-    /// 制品/文件下载地址（HTTP(S)）
-    pub url: String,
-    /// app 根相对目标
-    pub target: String,
-    /// 压缩包解压后单层归一（默认 false）
-    #[serde(default)]
-    pub flatten: bool,
-    /// UserApp 应用 ID（定位）。
-    pub app_id: String,
-    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带；9252a29 曾改必填造成
-    /// rcoder 转发 422 断链，回退为可选审计字段）。
-    #[serde(default)]
-    pub user_id: Option<String>,
-}
-
 /// 容器内流式下载后走上传核心
 #[utoipa::path(
     post,
@@ -240,18 +210,6 @@ pub(crate) async fn upload_from_url(
 }
 
 // ── 列表（GET ?path=）───────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub struct AppFilesListParams {
-    /// UserApp 应用 ID（定位）。
-    pub app_id: String,
-    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带）。
-    #[serde(default)]
-    pub user_id: Option<String>,
-    /// app 根相对子目录（缺省列根）
-    #[serde(default)]
-    pub path: Option<String>,
-}
 
 /// 列目录（app 根相对 path 字段）
 #[utoipa::path(
@@ -326,17 +284,6 @@ pub(crate) async fn list(
 
 // ── 删除（json {path}）──────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct AppFilesDeleteBody {
-    /// UserApp 应用 ID（定位）。
-    pub app_id: String,
-    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带）。
-    #[serde(default)]
-    pub user_id: Option<String>,
-    /// app 根相对文件/目录
-    pub path: String,
-}
-
 /// 删除文件或目录（防穿越）
 #[utoipa::path(
     post,
@@ -386,15 +333,6 @@ pub(crate) async fn delete(
 }
 
 // ── 清空 workspace（json {app_id}）─────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct AppFilesClearBody {
-    /// UserApp 应用 ID（定位）。
-    pub app_id: String,
-    /// 用户 ID（仅审计日志，可选）。
-    #[serde(default)]
-    pub user_id: Option<String>,
-}
 
 /// 清空 workspace 内容（留容器留卷）
 ///
