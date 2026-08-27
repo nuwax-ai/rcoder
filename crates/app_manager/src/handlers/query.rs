@@ -36,7 +36,9 @@ pub async fn get_app_health(
     Ok(Json(HttpResult::success(runtime.health)))
 }
 
-/// 获取应用资源使用（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
+/// 获取应用资源使用
+///
+/// best-effort：restart_count 来自运行时；CPU/内存需 metrics-server。
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}/stats",
@@ -59,7 +61,9 @@ pub async fn get_app_stats(
     Ok(Json(HttpResult::success(stats)))
 }
 
-/// 获取应用事件（best-effort：当前返回空，TODO 接 K8s events）
+/// 获取应用事件
+///
+/// best-effort：当前返回空，TODO 接 K8s events。
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}/events",

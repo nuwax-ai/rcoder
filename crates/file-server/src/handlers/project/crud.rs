@@ -31,7 +31,7 @@ pub(crate) struct DeleteParams {
     pub isolation_type: Option<String>,
 }
 
-/// `GET /api/project/delete-project`
+/// 删除项目
 #[utoipa::path(
     get,
     path = "/delete-project",
@@ -105,7 +105,7 @@ pub(crate) struct CreateProjectBody {
     pub isolation_type: Option<String>,
 }
 
-/// `POST /api/project/create-project`
+/// 创建项目
 #[utoipa::path(post, path = "/create-project", request_body = CreateProjectBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn create_project(
     State(state): State<AppState>,
@@ -177,7 +177,9 @@ pub(crate) struct CopyProjectBody {
     pub target_isolation_type: Option<String>,
 }
 
-/// `POST /api/project/copy-project` (源/目标各自隔离上下文, 缺省回退公共字段)
+/// 复制项目
+///
+/// 源/目标各自隔离上下文, 缺省回退公共字段。
 #[utoipa::path(post, path = "/copy-project", request_body = CopyProjectBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn copy_project(
     State(state): State<AppState>,

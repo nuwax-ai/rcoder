@@ -18,7 +18,9 @@ use crate::models::{AppLogQueryRequest, AppOperationError};
 
 use super::AppManagerState;
 
-/// 查询应用声明的日志源与匹配到的日志文件（转发 app-cli /v1/logs/sources/query）
+/// 查询应用日志源
+///
+/// 应用声明的日志源与匹配到的日志文件（转发 app-cli /v1/logs/sources/query）。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/logs/sources/query",
@@ -41,7 +43,9 @@ pub async fn query_app_log_sources(
     forward_json(&state, &app_id, "/v1/logs/sources/query", request).await
 }
 
-/// 查询应用多服务日志快照（带 checkpoint 游标，支持增量拉取；转发 app-cli /v1/logs/query）
+/// 查询应用日志快照
+///
+/// 多服务日志快照，带 checkpoint 游标支持增量拉取（转发 app-cli /v1/logs/query）。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/logs/query",
@@ -64,7 +68,9 @@ pub async fn query_app_logs(
     forward_json(&state, &app_id, "/v1/logs/query", request).await
 }
 
-/// 实时日志 SSE 流（转发 app-cli /v1/logs/stream，Content-Type: text/event-stream）
+/// 实时日志 SSE 流
+///
+/// 转发 app-cli /v1/logs/stream，Content-Type: text/event-stream。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/logs/stream",

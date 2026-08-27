@@ -208,7 +208,7 @@ fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
     }
 }
 
-/// `POST /api/userapp/build` —— 异步发起 workspace 打包，立即返 taskId + 产物路径。
+/// 异步发起 workspace 打包（立即返 taskId）
 ///
 /// 编译在后台 spawn 执行（`start_build_task`）；进度经 task 流出（轮询 `/tasks/{id}` +
 /// SSE `/tasks/{id}/logs/stream`）。同 app_id 排队由 `BuildManager` per-project 互斥保证。
@@ -267,7 +267,7 @@ pub(crate) async fn get_task(
     reply(result.await)
 }
 
-/// `GET /api/userapp/tasks/{taskId}/logs` —— 构建日志分页（复用 `read_dev_log`）。
+/// 构建日志分页（复用 `read_dev_log`）
 #[utoipa::path(
     get,
     path = "/tasks/{task_id}/logs",
@@ -312,7 +312,7 @@ pub(crate) async fn get_task_logs(
     reply(result.await)
 }
 
-/// `GET /api/userapp/tasks/{taskId}/logs/stream` —— 任务进度 SSE（实时通道）。
+/// 任务进度 SSE（实时通道）
 ///
 /// 推送 `BuildProgressEvent`（event 名 = 事件类型，data = JSON 全量）；
 /// 先回放 ring 里 `seq >= from_seq` 的历史，再实时跟随 broadcast，终态事件后关闭流。
@@ -392,7 +392,7 @@ pub(crate) async fn stream_task_logs(
         .into_response()
 }
 
-/// `POST /api/userapp/tasks/{taskId}/cancel` —— 取消进行中的编译任务。
+/// 取消进行中的编译任务
 ///
 /// 双重取消：① 软取消（置 flag，build 循环服务间检查主动退出）；
 /// ② 硬取消（kill 当前 build 子进程组，即时中断）。build 循环/错误分支随后 emit `Cancelled`。
@@ -447,7 +447,9 @@ pub(crate) async fn cancel_build_task(task: &Arc<UserappBuildTask>) {
     task.emit(BuildProgressEvent::Cancelled).await;
 }
 
-/// 检测项目类型（分析文件结构推断 language/framework/build tool）
+/// 检测项目类型
+///
+/// 分析文件结构推断 language/framework/build tool。
 #[utoipa::path(
     post,
     path = "/projects/detect",

@@ -75,7 +75,9 @@ fn utf8_percent_encode(s: &str) -> String {
     out
 }
 
-/// `POST /api/computer/zip-workspace` (对齐 nuwax zipWorkspace):
+/// workspace 打包下载
+///
+/// 对齐 nuwax zipWorkspace:
 /// 无顶层前缀; 工作区不存在则报错; 文件名 `${userId}_${cId}.zip` + UTF-8 filename*。
 /// 过滤: ZIP_WORKSPACE_EXCLUDE (强制) + 调用方 excludeDirs (补充) 合并, 对任意路径段匹配
 /// (目录与文件同集合); 跳过符号链接; **无** dot-segment 过滤 (保留 .gitignore/.npmrc 等)。
@@ -130,7 +132,9 @@ pub async fn zip_workspace_impl(
     zip_response(&filename, tmp).await
 }
 
-/// `GET /api/computer/download-all-files` (对齐 nuwax downloadAllFiles):
+/// 下载工作区全部文件
+///
+/// 对齐 nuwax downloadAllFiles:
 /// 顶层前缀 `${userId}_${cId}/` + 空 zip 兜底 + 100MB 大小上限 + UTF-8 filename* + customTargetDir。
 #[utoipa::path(
     get,

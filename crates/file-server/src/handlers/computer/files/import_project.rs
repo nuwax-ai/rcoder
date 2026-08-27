@@ -56,7 +56,9 @@ impl ImportProjectFields {
     }
 }
 
-/// `POST /api/computer/import-project` (对齐 nuwax computer importProject):
+/// 导入项目 zip
+///
+/// 对齐 nuwax computer importProject:
 /// 上传 zip → 解压 + removeTopLevelDir + 白名单保留合并到工作区。
 #[utoipa::path(post, path = "/import-project", request_body(content = ImportProjectForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(crate) async fn import_project(

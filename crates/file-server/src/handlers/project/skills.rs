@@ -38,7 +38,7 @@ pub struct PushProjectSkillsForm {
     pub isolation_type: Option<String>,
 }
 
-/// `POST /api/project/push-skills-to-workspace`
+/// 技能推送到工作区
 #[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = PushProjectSkillsForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn push_skills_to_workspace(
     State(state): State<AppState>,

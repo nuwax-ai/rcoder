@@ -34,7 +34,9 @@ pub(crate) struct GenerateFileBody {
     custom_target_dir: Option<String>,
 }
 
-/// `POST /api/computer/generate-file` (对齐 nuwax computer generateFile, commit 9bea35e)。
+/// 生成文本文件
+///
+/// 对齐 nuwax computer generateFile, commit 9bea35e。
 ///
 /// 与 [`super::upload::upload_file`] 区别：本接口接收 **JSON 文本** (`fileName` + `content`) 而非 multipart 上传，
 /// 适用于 agent 直接由文本内容生成文件。复用 [`resolve_computer_target`] + [`path_safety::ensure_within`]

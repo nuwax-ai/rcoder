@@ -23,8 +23,10 @@ pub struct PushSkillsForm {
     pub agent_id: Option<String>,
 }
 
-/// `POST /api/computer/push-skills-to-workspace` (对齐 nuwax pushSkillsToWorkspace;
-/// 复用 skills_service::push_skills_at, 推到 .claude/skills + syncAgents)。
+/// 技能推送到工作区
+///
+/// 对齐 nuwax pushSkillsToWorkspace;
+/// 复用 skills_service::push_skills_at, 推到 .claude/skills + syncAgents。
 #[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = PushSkillsForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(crate) async fn push_skills_to_workspace(
     State(state): State<AppState>,

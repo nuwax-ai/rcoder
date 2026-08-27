@@ -31,7 +31,9 @@ pub(crate) struct DeleteWorkspaceBody {
 
 // ── delete-workspace ────────────────────────────────────────────────────────────
 
-/// `POST /api/computer/delete-workspace` (对齐 nuwax deleteWorkspace; 目录不存在也返回 deleted)。
+/// 删除工作区
+///
+/// 对齐 nuwax deleteWorkspace; 目录不存在也返回 deleted。
 #[utoipa::path(post, path = "/delete-workspace", request_body = DeleteWorkspaceBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(crate) async fn delete_workspace(
     State(state): State<AppState>,
@@ -61,7 +63,9 @@ pub(crate) struct FilesUpdateBody {
     pub(crate) custom_target_dir: Option<String>,
 }
 
-/// `POST /api/computer/files-update` (对齐 nuwax computer updateFiles; 增量 create/delete/rename/modify)。
+/// 工作区文件增量更新
+///
+/// 对齐 nuwax computer updateFiles; 增量 create/delete/rename/modify。
 #[utoipa::path(post, path = "/files-update", request_body = FilesUpdateBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(crate) async fn files_update(
     State(state): State<AppState>,

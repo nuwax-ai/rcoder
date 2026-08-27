@@ -28,7 +28,7 @@ pub struct FileServerStatus {
     address: Option<String>,
 }
 
-/// `GET /api/system/file-server/status` — 分流反向代理运行状态。
+/// 分流反向代理运行状态
 #[utoipa::path(
     get,
     path = "/api/system/file-server/status",
@@ -43,7 +43,7 @@ pub async fn status() -> Json<HttpResult<FileServerStatus>> {
     }))
 }
 
-/// `POST /api/system/file-server/stop` — 停止并释放 60000 端口 (幂等)。
+/// 停止并释放 60000 端口（幂等）
 #[utoipa::path(
     post,
     path = "/api/system/file-server/stop",
@@ -59,7 +59,7 @@ pub async fn stop() -> Json<HttpResult<serde_json::Value>> {
     }
 }
 
-/// `POST /api/system/file-server/start` — 启动分流代理 (幂等)。
+/// 启动分流代理（幂等）
 #[utoipa::path(
     post,
     path = "/api/system/file-server/start",
@@ -76,7 +76,7 @@ pub async fn start() -> Json<HttpResult<serde_json::Value>> {
     }
 }
 
-/// `POST /api/system/file-server/restart` — 停止后重新启动。
+/// 停止后重新启动分流代理
 #[utoipa::path(
     post,
     path = "/api/system/file-server/restart",

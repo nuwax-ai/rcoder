@@ -34,7 +34,9 @@ pub async fn get_app_storage(
     Ok(Json(HttpResult::success(info)))
 }
 
-/// 清空应用持久存储内容（留 PVC，可恢复；仅当 app 已 delete 时允许，否则 409 INVALID_STATE）
+/// 清空应用持久存储内容
+///
+/// 留 PVC，可恢复；仅当 app 已 delete 时允许，否则 409 INVALID_STATE。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/storage/clear",
@@ -56,7 +58,9 @@ pub async fn clear_app_storage(
     Ok(Json(HttpResult::success("存储已清空".to_string())))
 }
 
-/// 销毁应用持久存储 PVC（高危·不可逆·释放配额；需 body `confirm=app_id`，仅 app 已 delete 后允许）
+/// 销毁应用持久存储 PVC
+///
+/// 高危·不可逆·释放配额；需 body `confirm=app_id`，仅 app 已 delete 后允许。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/storage/destroy",

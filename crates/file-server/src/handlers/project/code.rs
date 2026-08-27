@@ -35,7 +35,9 @@ pub(crate) struct SpecifiedBody {
     pub isolation_type: Option<String>,
 }
 
-/// `POST /api/project/specified-files-update` (create/delete/rename/modify 增量)
+/// 项目文件增量更新
+///
+/// create/delete/rename/modify 增量。
 #[utoipa::path(post, path = "/specified-files-update", request_body = SpecifiedBody, responses(crate::openapi::JsonApiResponses), tag = "Code")]
 pub(crate) async fn specified_files_update(
     State(state): State<AppState>,
@@ -103,7 +105,9 @@ pub(crate) struct AllFilesBody {
     pub pid: Option<String>,
 }
 
-/// `POST /api/project/all-files-update` (全量覆盖 + 清理缺失)
+/// 项目文件全量更新
+///
+/// 全量覆盖 + 清理缺失。
 #[utoipa::path(post, path = "/all-files-update", request_body = AllFilesBody, responses(crate::openapi::JsonApiResponses), tag = "Code")]
 pub(crate) async fn all_files_update(
     State(state): State<AppState>,

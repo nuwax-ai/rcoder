@@ -110,7 +110,9 @@ async fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> AppResult<st
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-/// `GET /api/build/start-dev` (对齐 nuwax start-dev)。
+/// 启动开发服务器
+///
+/// 对齐 nuwax start-dev。
 #[utoipa::path(
     get,
     path = "/start-dev",
@@ -137,7 +139,9 @@ pub(crate) async fn start_dev(
     }))
 }
 
-/// `GET /api/build/stop-dev` (对齐 nuwax stop-dev)。
+/// 停止开发服务器
+///
+/// 对齐 nuwax stop-dev。
 #[utoipa::path(
     get,
     path = "/stop-dev",
@@ -178,7 +182,9 @@ pub(crate) async fn stop_dev(
     }))
 }
 
-/// `GET /api/build/restart-dev` (对齐 nuwax restart-dev)。
+/// 重启开发服务器
+///
+/// 对齐 nuwax restart-dev。
 #[utoipa::path(
     get,
     path = "/restart-dev",
@@ -205,7 +211,9 @@ pub(crate) async fn restart_dev(
     }))
 }
 
-/// `GET /api/build/list-dev` (对齐 nuwax list-dev)。
+/// 列出开发服务器
+///
+/// 对齐 nuwax list-dev。
 #[utoipa::path(
     get,
     path = "/list-dev",
@@ -220,7 +228,9 @@ pub(crate) async fn list_dev(State(state): State<AppState>) -> Result<Json<DevLi
     }))
 }
 
-/// `GET /api/build/keep-alive` (对齐 nuwax keep-alive)。
+/// 开发服务器保活
+///
+/// 对齐 nuwax keep-alive。
 #[utoipa::path(
     get,
     path = "/keep-alive",
@@ -268,7 +278,9 @@ pub(crate) async fn keep_alive(
     }))
 }
 
-/// `GET /api/build/port-pool-status` (对齐 nuwax port-pool-status)。
+/// 查询端口池状态
+///
+/// 对齐 nuwax port-pool-status。
 #[utoipa::path(
     get,
     path = "/port-pool-status",

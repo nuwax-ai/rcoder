@@ -14,7 +14,7 @@ use utoipa::ToSchema;
 
 use crate::AppState;
 
-/// `GET /`，兼容 nuwax 根路径探测。
+/// 根路径探测（兼容 nuwax）
 #[utoipa::path(
     get,
     path = "/",
@@ -48,7 +48,7 @@ pub struct MemoryUsage {
     pub external: f64,
 }
 
-/// `GET /health`
+/// 健康检查
 #[utoipa::path(
     get,
     path = "/health",
@@ -72,7 +72,9 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-/// `GET /api/version` — 版本协商 (对齐 TS v1.4.0 router.js)。
+/// 版本协商
+///
+/// 版本协商 (对齐 TS v1.4.0 router.js)。
 /// Java 网关据此决定走 v2 新 API (agent-store) 还是旧 API。
 #[utoipa::path(
     get,

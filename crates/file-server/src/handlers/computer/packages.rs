@@ -30,7 +30,9 @@ pub(crate) struct InstallBody {
     programming_language: String,
 }
 
-/// `POST /api/computer/install-project` (对齐 nuwax installProjectDependencies)。
+/// 安装项目依赖
+///
+/// 对齐 nuwax installProjectDependencies。
 /// typescript → 递归找 package.json 目录 pnpm install; python → 找 requirements/pyproject pip install。
 #[utoipa::path(post, path = "/install-project", request_body = InstallBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(crate) async fn install_project(
@@ -141,7 +143,9 @@ pub(crate) struct BuildAgentBody {
     version: String,
 }
 
-/// `POST /api/computer/build-agent-package` (对齐 nuwax buildAgentPackage)。
+/// 构建 agent 安装包
+///
+/// 对齐 nuwax buildAgentPackage。
 /// 递归找含 scripts/package-platforms.mjs 的目录 → pnpm install →
 /// `node scripts/package-platforms.mjs agent-{id} {ver} {dir}/dist-packages --print-artifacts`
 /// → 解析 stdout 中产物 (path 转 workspace 相对, platform 从文件名提取)。响应无 stdout。
@@ -206,7 +210,9 @@ pub(crate) struct CleanupBuildArtifactsBody {
     custom_target_dir: Option<String>,
 }
 
-/// `POST /api/computer/cleanup-build-artifacts` (对齐 nuwax cleanupBuildArtifacts; 删 dist-packages)。
+/// 清理构建产物
+///
+/// 对齐 nuwax cleanupBuildArtifacts; 删 dist-packages。
 /// 返回 {success, cleaned} (字段 cleaned, 非 removed; 无 message)。
 /// 递归找 scripts/package-platforms.mjs 所在 projectDir, 删其 dist-packages (对齐 nuwax)。
 #[utoipa::path(post, path = "/cleanup-build-artifacts", request_body = CleanupBuildArtifactsBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]

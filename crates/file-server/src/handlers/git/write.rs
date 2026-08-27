@@ -39,7 +39,7 @@ pub(crate) struct CommitBody {
     pub author_email: Option<String>,
 }
 
-/// `POST /api/git/init`
+/// 初始化仓库
 #[utoipa::path(post, path = "/init", request_body = GitWriteBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn init(
     State(state): State<AppState>,
@@ -57,7 +57,7 @@ pub(crate) async fn init(
     })))
 }
 
-/// `POST /api/git/add`
+/// 暂存文件
 #[utoipa::path(post, path = "/add", request_body = FilesBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn add(
     State(state): State<AppState>,
@@ -82,7 +82,7 @@ pub(crate) async fn add(
     })))
 }
 
-/// `POST /api/git/commit`
+/// 提交
 #[utoipa::path(post, path = "/commit", request_body = CommitBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn commit(
     State(state): State<AppState>,
@@ -131,7 +131,7 @@ pub(crate) async fn commit(
     }
 }
 
-/// `POST /api/git/unstage`
+/// 取消暂存
 #[utoipa::path(post, path = "/unstage", request_body = FilesBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn unstage(
     State(state): State<AppState>,
@@ -164,7 +164,7 @@ pub(crate) async fn unstage(
     })))
 }
 
-/// `POST /api/git/discard`
+/// 丢弃改动
 #[utoipa::path(post, path = "/discard", request_body = FilesBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn discard(
     State(state): State<AppState>,
@@ -208,7 +208,9 @@ pub(crate) struct DiffBody {
     pub paths: Option<Vec<String>>,
 }
 
-/// `POST /api/git/diff` (对齐 nuwax diff; source: worktree|staged|commit, 默认 worktree)。
+/// 查看差异
+///
+/// 对齐 nuwax diff; source: worktree|staged|commit, 默认 worktree。
 #[utoipa::path(post, path = "/diff", request_body = DiffBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn diff(
     State(state): State<AppState>,
@@ -290,7 +292,9 @@ pub(crate) struct RevertBody {
     pub author_email: Option<String>,
 }
 
-/// `POST /api/git/reset` (对齐 nuwax reset; mode: soft|mixed|hard, 默认 mixed)。
+/// 重置到目标提交
+///
+/// 对齐 nuwax reset; mode: soft|mixed|hard, 默认 mixed。
 #[utoipa::path(post, path = "/reset", request_body = ResetBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn reset(
     State(state): State<AppState>,
@@ -321,7 +325,9 @@ pub(crate) async fn reset(
     })))
 }
 
-/// `POST /api/git/checkout` (对齐 nuwax checkout; 恢复 target 整棵 tree, 不删多余文件, 不动 HEAD)。
+/// 检出目标文件树
+///
+/// 对齐 nuwax checkout; 恢复 target 整棵 tree, 不删多余文件, 不动 HEAD。
 #[utoipa::path(post, path = "/checkout", request_body = TargetBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn checkout(
     State(state): State<AppState>,
@@ -348,7 +354,9 @@ pub(crate) async fn checkout(
     })))
 }
 
-/// `POST /api/git/revert` (对齐 nuwax revert; 把 tree 重置到 target 但用新 commit 保留历史)。
+/// 回退到目标提交
+///
+/// 对齐 nuwax revert; 把 tree 重置到 target 但用新 commit 保留历史。
 #[utoipa::path(post, path = "/revert", request_body = RevertBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn revert(
     State(state): State<AppState>,

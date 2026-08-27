@@ -18,7 +18,9 @@ use super::{FileListQuery, ResolveFileQuery, SearchFilesQuery, resolve_computer_
 
 // ── get-file-list ───────────────────────────────────────────────────────────────
 
-/// `GET /api/computer/get-file-list` (对齐 nuwax getFileList, 含 commit ba08d0c 增强):
+/// 获取文件列表
+///
+/// 对齐 nuwax getFileList, 含 commit ba08d0c 增强:
 /// 轻量元信息遍历 (不读内容) + customTargetDir 覆盖 + relativePath 子目录 + recursive 单层开关;
 /// 目录不存在返回空数组。
 #[utoipa::path(
@@ -104,7 +106,9 @@ pub async fn get_file_list_impl(
 
 // ── resolve-file ────────────────────────────────────────────────────────────────
 
-/// `GET /api/computer/resolve-file` (对齐 nuwax resolveExistingFile, commit ba08d0c):
+/// 解析文件存在性
+///
+/// 对齐 nuwax resolveExistingFile, commit ba08d0c:
 /// 校验目标根目录下文件是否存在, 存在返回 `{exists:true, name, fileProxyUrl}`, 否则 `{exists:false}`。
 #[utoipa::path(
     get,
@@ -162,7 +166,9 @@ pub async fn resolve_file_impl(
 
 // ── search-files ────────────────────────────────────────────────────────────────
 
-/// `GET /api/computer/search-files` (对齐 nuwax searchFiles, commit ba08d0c):
+/// 搜索文件
+///
+/// 对齐 nuwax searchFiles, commit ba08d0c:
 /// 无索引有界实时搜索; `limit`/`maxVisit`/`timeoutMs` 为必填正整数 (由网关传入)。
 #[utoipa::path(
     get,

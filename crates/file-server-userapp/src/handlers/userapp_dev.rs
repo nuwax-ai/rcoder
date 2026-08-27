@@ -51,8 +51,10 @@ pub(crate) struct UserappEnsureWorkspaceData {
     pub workspace: String,
 }
 
-/// `POST /api/userapp/ensure-workspace`: 幂等建 workspace 目录（create-workspace 链路首建；
-/// execute-command 等接口要求 cwd 已存在，故目录创建须先于业务调用）。
+/// 幂等建 workspace 目录
+///
+/// create-workspace 链路首建；execute-command 等接口要求 cwd 已存在，
+/// 故目录创建须先于业务调用。
 #[utoipa::path(post, path = "/ensure-workspace", request_body = UserappEnsureWorkspaceBody, responses((status = 200, body = HttpResult<UserappEnsureWorkspaceData>, description = "workspace 目录已就绪（含绝对路径）")), tag = "UserApp")]
 pub(crate) async fn ensure_workspace(
     State(state): State<UserAppState>,
@@ -90,7 +92,9 @@ pub(crate) struct UserappExecCommandBody {
     pub command: String,
 }
 
-/// `POST /api/userapp/execute-command`: 终端命令执行 (cwd=workspace, shell -c + 超时捕获)。
+/// 终端命令执行（cwd=workspace）
+///
+/// 经 shell -c 执行，带超时捕获。
 #[utoipa::path(post, path = "/execute-command", request_body = UserappExecCommandBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn execute_command(
     State(state): State<UserAppState>,
@@ -124,7 +128,7 @@ fn default_tail_lines() -> usize {
     200
 }
 
-/// `GET /api/userapp/get-logs`: 读 `{ws}/.logs` 下 mtime 最新日志末尾 N 行。
+/// 读 `{ws}/.logs` 下 mtime 最新日志末尾 N 行
 #[utoipa::path(
     get,
     path = "/get-logs",
@@ -156,7 +160,9 @@ pub(crate) struct UserappInstallBody {
     pub programming_language: String,
 }
 
-/// `POST /api/userapp/install-project`: 依赖安装 (typescript→pnpm / python→pip)。
+/// 依赖安装
+///
+/// typescript→pnpm install；python→pip install。
 #[utoipa::path(post, path = "/install-project", request_body = UserappInstallBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn install_project(
     State(state): State<UserAppState>,
@@ -183,7 +189,7 @@ pub(crate) struct UserappZipBody {
     pub exclude_dirs: Option<Vec<String>>,
 }
 
-/// `POST /api/userapp/zip-workspace`: workspace 打包下载 (二进制 zip)。
+/// workspace 打包下载（二进制 zip）
 #[utoipa::path(
     post,
     path = "/zip-workspace",
@@ -227,7 +233,9 @@ pub(crate) struct UserappDownloadQuery {
     pub custom_target_dir: Option<String>,
 }
 
-/// `GET /api/userapp/download-all-files`: 全量文件下载 (顶层前缀 + 空 zip 兜底 + 大小上限)。
+/// 全量文件下载
+///
+/// 顶层前缀 + 空 zip 兜底 + 大小上限。
 #[utoipa::path(
     get,
     path = "/download-all-files",
@@ -266,8 +274,10 @@ pub struct UserappInitTemplateForm {
     pub enable_git: Option<bool>,
 }
 
-/// `POST /api/userapp/init-project-template`: 模板 zip 解压初始化开发卷 workspace
-/// (可选 git init, 双开关 GIT_ENABLED && enableGit)。UserApp 开发的起点接口。
+/// 模板 zip 解压初始化开发卷 workspace
+///
+/// 可选 git init（双开关：GIT_ENABLED 且 enableGit 为 true 才执行）。
+/// UserApp 开发的起点接口。
 #[utoipa::path(post, path = "/init-project-template", request_body(content = UserappInitTemplateForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn init_project_template(
     State(state): State<UserAppState>,
@@ -331,8 +341,9 @@ pub struct UserappPushSkillsForm {
     pub agent_id: Option<String>,
 }
 
-/// `POST /api/userapp/push-skills-to-workspace`: 技能推送 (zip/skillUrls)。
-/// 开发卷布局下技能一律推 `{ws}/.agents/skills` (legacy 路径)。
+/// 技能推送（zip/skillUrls）
+///
+/// 开发卷布局下技能一律推 `{ws}/.agents/skills`（legacy 路径）。
 #[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = UserappPushSkillsForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn push_skills_to_workspace(
     State(state): State<UserAppState>,

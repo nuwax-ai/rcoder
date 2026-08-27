@@ -28,7 +28,7 @@ pub(crate) struct GetContentParams {
     pub isolation_type: Option<String>,
 }
 
-/// `GET /api/project/get-project-content`
+/// 获取项目内容
 #[utoipa::path(
     get,
     path = "/get-project-content",
@@ -104,7 +104,7 @@ pub(crate) struct GetByVersionParams {
     pub isolation_type: Option<String>,
 }
 
-/// `GET /api/project/get-project-content-by-version`
+/// 按版本获取项目内容
 #[utoipa::path(
     get,
     path = "/get-project-content-by-version",

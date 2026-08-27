@@ -20,7 +20,9 @@ pub(crate) struct BuildDone {
     pub project_id: String,
 }
 
-/// `GET /api/build/build` (对齐 nuwax buildProject): install + build + 拷贝 dist。
+/// 构建项目
+///
+/// 对齐 nuwax buildProject: install + build + 拷贝 dist。
 #[utoipa::path(
     get,
     path = "/build",

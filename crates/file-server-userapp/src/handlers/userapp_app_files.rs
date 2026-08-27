@@ -47,7 +47,7 @@ pub struct AppFilesUploadForm {
     pub file: String,
 }
 
-/// `POST /api/userapp/app-files/upload`: 单次上传（zip/tar.gz 自动解压；单文件直写）。
+/// 单次上传（zip/tar.gz 自动解压；单文件直写）
 #[utoipa::path(post, path = "/app-files/upload", request_body(content = AppFilesUploadForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn upload(
     State(state): State<UserAppState>,
@@ -190,7 +190,7 @@ pub struct AppFilesUploadFromUrlBody {
     pub user_id: String,
 }
 
-/// `POST /api/userapp/app-files/upload-from-url`: 容器内流式下载后走上传核心。
+/// 容器内流式下载后走上传核心
 #[utoipa::path(post, path = "/app-files/upload-from-url", request_body = AppFilesUploadFromUrlBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn upload_from_url(
     State(state): State<UserAppState>,
@@ -238,7 +238,7 @@ pub struct AppFilesListParams {
     pub path: Option<String>,
 }
 
-/// `GET /api/userapp/app-files/list`: 列目录（app 根相对 path 字段）。
+/// 列目录（app 根相对 path 字段）
 #[utoipa::path(
     get,
     path = "/app-files/list",
@@ -318,7 +318,7 @@ pub struct AppFilesDeleteBody {
     pub path: String,
 }
 
-/// `POST /api/userapp/app-files/delete`: 删除文件或目录（防穿越）。
+/// 删除文件或目录（防穿越）
 #[utoipa::path(post, path = "/app-files/delete", request_body = AppFilesDeleteBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn delete(
     State(state): State<UserAppState>,

@@ -33,7 +33,9 @@ pub(crate) struct ExecCommandBody {
     command: String,
 }
 
-/// `POST /api/computer/execute-command` (对齐 nuwax executeCommand; shell 执行 + 超时 + 捕获输出)。
+/// 执行 shell 命令
+///
+/// 对齐 nuwax executeCommand; shell 执行 + 超时 + 捕获输出。
 /// command 是 agent 提供的 shell 命令串, 故经 shell -c (与 nuwax child_process.exec 一致)。
 /// shell 优先用 `BASH_PATH` (未配置则 sh); stdout/stderr 截断到 50MB (对齐 nuwax maxBuffer)。
 #[utoipa::path(post, path = "/execute-command", request_body = ExecCommandBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
@@ -97,7 +99,9 @@ fn default_tail_lines() -> usize {
     200
 }
 
-/// `GET /api/computer/get-logs` (对齐 nuwax getLatestLogs; 读 .logs/ 下 mtime 最新的文件末尾 N 行)。
+/// 读取最新日志
+///
+/// 对齐 nuwax getLatestLogs; 读 .logs/ 下 mtime 最新的文件末尾 N 行。
 /// 空场景区分 message, logFileName=null; 成功 message="Get log successfully"; 过滤空行。
 #[utoipa::path(
     get,

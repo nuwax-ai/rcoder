@@ -37,7 +37,7 @@ pub(crate) struct BackupVersionBody {
     pub isolation_type: Option<String>,
 }
 
-/// `POST /api/project/backup-current-version`
+/// 备份当前版本
 #[utoipa::path(post, path = "/backup-current-version", request_body = BackupVersionBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn backup_current_version(
     State(state): State<AppState>,
@@ -95,7 +95,7 @@ pub(crate) struct RollbackBody {
     pub isolation_type: Option<String>,
 }
 
-/// `POST /api/project/rollback-version`
+/// 回滚版本
 #[utoipa::path(post, path = "/rollback-version", request_body = RollbackBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn rollback_version(
     State(state): State<AppState>,
@@ -158,7 +158,9 @@ pub(crate) struct ExportBody {
     pub isolation_type: Option<String>,
 }
 
-/// `POST /api/project/export-project` (返回 application/zip 文件流)
+/// 导出项目
+///
+/// 返回 application/zip 文件流。
 #[utoipa::path(
     post,
     path = "/export-project",

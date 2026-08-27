@@ -17,7 +17,9 @@ use crate::models::{
 
 // create REST 面已删除（统一走 POST /{app_id}/start：不存在则由发布链/ url 部署自动创建）。
 
-/// 查询应用列表（实时查集群 + 过滤/分页；仅 status/app_ids 过滤生效）
+/// 查询应用列表
+///
+/// 实时查集群 + 过滤/分页；仅 status/app_ids 过滤生效。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/query",
@@ -110,7 +112,9 @@ pub async fn update_app(
     Ok(Json(HttpResult::success(runtime)))
 }
 
-/// 删除应用（默认保留持久存储；body `{"purge": true}` 一键连数据面一起清空）
+/// 删除应用
+///
+/// 默认保留持久存储；body `{"purge": true}` 一键连数据面一起清空。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/delete",

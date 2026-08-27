@@ -81,7 +81,9 @@ fn default_log_type() -> String {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-/// `GET /api/build/get-dev-log` (对齐 nuwax get-dev-log)。
+/// 读取开发日志
+///
+/// 对齐 nuwax get-dev-log。
 #[utoipa::path(
     get,
     path = "/get-dev-log",
@@ -141,7 +143,9 @@ pub(crate) async fn get_dev_log(
 
 // ── 日志缓存接口 (对齐 nuwax logCacheManager; Rust 无缓存层, 返回固定 stats) ────
 
-/// `GET /api/build/get-log-cache-stats` (对齐 nuwax logCacheManager.getStats)。
+/// 查询日志缓存统计
+///
+/// 对齐 nuwax logCacheManager.getStats。
 #[utoipa::path(
     get,
     path = "/get-log-cache-stats",
@@ -171,7 +175,9 @@ pub(crate) async fn get_log_cache_stats(
     }))
 }
 
-/// `GET /api/build/clear-all-log-cache` (对齐 nuwax logCacheManager.clear)。
+/// 清空全部日志缓存
+///
+/// 对齐 nuwax logCacheManager.clear。
 #[utoipa::path(
     get,
     path = "/clear-all-log-cache",

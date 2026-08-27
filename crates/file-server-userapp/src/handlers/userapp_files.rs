@@ -56,7 +56,7 @@ pub(crate) struct UserappFileListQuery {
     pub recursive: Option<String>,
 }
 
-/// `GET /api/userapp/get-file-list`: 文件树列表 (轻量元信息, 不读内容)。
+/// 文件树列表（轻量元信息，不读内容）
 #[utoipa::path(
     get,
     path = "/get-file-list",
@@ -108,7 +108,7 @@ pub(crate) struct UserappResolveFileQuery {
     pub file_path: String,
 }
 
-/// `GET /api/userapp/resolve-file`: 校验文件存在性, 存在返回预览 URL。
+/// 校验文件存在性，存在返回预览 URL
 #[utoipa::path(
     get,
     path = "/resolve-file",
@@ -169,7 +169,7 @@ pub(crate) struct UserappSearchFilesQuery {
     pub timeout_ms: String,
 }
 
-/// `GET /api/userapp/search-files`: 无索引有界实时搜索。
+/// 无索引有界实时搜索
 #[utoipa::path(
     get,
     path = "/search-files",
@@ -217,7 +217,7 @@ pub(crate) struct UserappFilesUpdateBody {
     pub custom_target_dir: Option<String>,
 }
 
-/// `POST /api/userapp/files-update`: 批量文件增删改 (modify 字节比较)。
+/// 批量文件增删改（modify 字节比较）
 #[utoipa::path(post, path = "/files-update", request_body = UserappFilesUpdateBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn files_update(
     State(state): State<UserAppState>,
@@ -273,7 +273,7 @@ pub struct UserappUploadFilesForm {
     pub files: Vec<file_server::openapi::BinaryFile>,
 }
 
-/// `POST /api/userapp/upload-file`: 单文件上传 (multipart)。
+/// 单文件上传（multipart）
 #[utoipa::path(post, path = "/upload-file", request_body(content = UserappUploadFileForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn upload_file(
     State(state): State<UserAppState>,
@@ -316,7 +316,7 @@ pub(crate) async fn upload_file(
     upload_file_impl(&ws, &file_path, data).await
 }
 
-/// `POST /api/userapp/upload-files`: 多文件上传 (单文件错误隔离)。
+/// 多文件上传（单文件错误隔离）
 #[utoipa::path(post, path = "/upload-files", request_body(content = UserappUploadFilesForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn upload_files(
     State(state): State<UserAppState>,
@@ -387,7 +387,7 @@ pub(crate) struct UserappGenerateFileBody {
     pub custom_target_dir: Option<String>,
 }
 
-/// `POST /api/userapp/generate-file`: JSON 文本生成文件。
+/// JSON 文本生成文件
 #[utoipa::path(
     post,
     path = "/generate-file",
@@ -425,7 +425,7 @@ pub struct UserappImportProjectForm {
     pub file: String,
 }
 
-/// `POST /api/userapp/import-project`: 上传项目 zip 解压合并到开发卷 workspace。
+/// 上传项目 zip 解压合并到开发卷 workspace
 #[utoipa::path(post, path = "/import-project", request_body(content = UserappImportProjectForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn import_project(
     State(state): State<UserAppState>,

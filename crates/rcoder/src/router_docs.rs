@@ -408,6 +408,74 @@ mod openapi_tests {
     use super::*;
     use axum::Router;
 
+    fn operations_of(
+        item: &utoipa::openapi::PathItem,
+    ) -> Vec<(&'static str, &utoipa::openapi::path::Operation)> {
+        fn push<'a>(
+            ops: &mut Vec<(&'static str, &'a utoipa::openapi::path::Operation)>,
+            method: &'static str,
+            op: &'a Option<utoipa::openapi::path::Operation>,
+        ) {
+            if let Some(op) = op {
+                ops.push((method, op));
+            }
+        }
+        let mut ops = Vec::new();
+        push(&mut ops, "get", &item.get);
+        push(&mut ops, "post", &item.post);
+        push(&mut ops, "put", &item.put);
+        push(&mut ops, "delete", &item.delete);
+        push(&mut ops, "options", &item.options);
+        push(&mut ops, "head", &item.head);
+        push(&mut ops, "patch", &item.patch);
+        push(&mut ops, "trace", &item.trace);
+        ops
+    }
+
+    fn assert_summaries_ui_concise(doc_name: &str, document: &utoipa::openapi::OpenApi) {
+        const METHODS: [&str; 8] = [
+            "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD", "TRACE",
+        ];
+        let mut checked = 0usize;
+        for (path, item) in &document.paths.paths {
+            for (method, op) in operations_of(item) {
+                let Some(summary) = op.summary.as_deref().filter(|s| !s.trim().is_empty()) else {
+                    panic!(
+                        "{doc_name} {method} {path}: summary 缺失（doc comment 首段或显式 summary= 必填）"
+                    );
+                };
+                assert!(
+                    !summary.contains('\n'),
+                    "{doc_name} {method} {path}: summary 须为单行（多行内容移到空行后的详细段）"
+                );
+                assert!(
+                    summary.chars().count() <= 50,
+                    "{doc_name} {method} {path}: summary 过长（>50 字符），详细内容移入 description: {summary}"
+                );
+                let method_prefixed =
+                    summary.starts_with('`') && METHODS.iter().any(|m| summary[1..].starts_with(m));
+                assert!(
+                    !method_prefixed,
+                    "{doc_name} {method} {path}: summary 不得带方法/路径前缀（UI 已单独显示）: {summary}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 60,
+            "{doc_name}: sanity 下限未达（至少遍历 60 个 operation，实际 {checked}）"
+        );
+    }
+
+    /// 两份对外文档的 operation summary 适配文档 UI（Scalar 左侧菜单与详情区
+    /// 标题显示它）：非空、单行、≤50 字符、无方法/路径前缀。utoipa 取 doc
+    /// comment 首段为 summary——首段写长文/带 `` `POST /api/...`` 前缀在此报红。
+    #[test]
+    fn operation_summaries_are_ui_concise() {
+        assert_summaries_ui_concise("primary", &primary_document());
+        assert_summaries_ui_concise("file-server", &file_server_document());
+    }
+
     /// 运行日志 SSE 契约锚点：事件清单必须出现在 description 里（同事按 swagger
     /// 直读对接，描述被精简回一句话在此报红——对齐 file-server-userapp 同款测试）。
     #[test]

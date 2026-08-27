@@ -111,7 +111,9 @@ impl UploadFilesFields {
     }
 }
 
-/// `POST /api/computer/upload-file` (对齐 nuwax computer uploadFile; multipart)。
+/// 上传单文件
+///
+/// 对齐 nuwax computer uploadFile; multipart。
 /// 返回 {success, message, fileSize} (不返回 filePath/originalname)。
 #[utoipa::path(post, path = "/upload-file", request_body(content = UploadFileForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(crate) async fn upload_file(
@@ -175,7 +177,9 @@ pub async fn upload_file_impl(
     })))
 }
 
-/// `POST /api/computer/upload-files` (对齐 nuwax computer uploadFiles; 多文件 multipart)。
+/// 批量上传文件
+///
+/// 对齐 nuwax computer uploadFiles; 多文件 multipart。
 /// 返回 {success, message, totalCount, successCount, failCount, results:[{success,filePath,originalname?,message?,fileSize?,error?}]}。
 #[utoipa::path(post, path = "/upload-files", request_body(content = UploadFilesForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(crate) async fn upload_files(

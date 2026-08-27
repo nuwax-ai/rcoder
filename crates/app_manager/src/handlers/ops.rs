@@ -68,7 +68,9 @@ pub async fn stop_app(
     Ok(Json(HttpResult::success(runtime)))
 }
 
-/// 重启应用（rollout restart；可选参数与 start 同款——带 url 即部署新版本并重启）
+/// 重启应用
+///
+/// rollout restart；可选参数与 start 同款——带 url 即部署新版本并重启。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/restart",

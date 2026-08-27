@@ -532,7 +532,7 @@ pub async fn proxy_to_app_with_path(
     get,
     path = "/proxy/userapp/dev/{user_id}/{app_id}/{*path}",
     tag = "应用管理",
-    summary = "Pingora 代理 - 开发阶段预览（免端口，app 开发容器 pingap 入口，零注册动态解析）",
+    summary = "Pingora 代理 - 开发阶段预览（app 开发容器 pingap 入口）",
     description = r#"
 访问开发阶段该 app 开发容器（UserAppBuilder，per-app）内的应用。与部署访问
 `/proxy/userapp/prod/{user_id}/{app_id}/{*path}` 同构——**开发切部署前端只改 `dev→prod` 一段**。

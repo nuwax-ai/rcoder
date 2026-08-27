@@ -74,7 +74,9 @@ pub struct CreateWorkspaceV2Form {
     pub update_skill_names: Option<Vec<String>>,
 }
 
-/// `POST /api/computer/create-workspace` (对齐 nuwax createWorkspace; v1):
+/// 创建 computer 工作区
+///
+/// 对齐 nuwax createWorkspace; v1:
 /// mkdir 工作区 + `.agents/{skills,agents}` 装配 + 可选 skill zip 合并 + syncAgents。
 /// v2 的 agent hook 配置 (claude/codex/opencode mcp/hooks/permissions) 见 create_workspace_v2。
 #[utoipa::path(post, path = "/create-workspace", request_body(content = CreateWorkspaceForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
@@ -125,7 +127,9 @@ pub(crate) async fn create_workspace(
     Ok(create_workspace_response(&state, res))
 }
 
-/// `POST /api/computer/create-workspace-v2` (对齐 nuwax create-workspace-v2):
+/// 创建工作区 v2
+///
+/// 对齐 nuwax create-workspace-v2:
 /// multipart: userId, cId, file, skillUrls, mcpServersConfig, hooksConfig,
 /// permissionsConfig, hookScripts。skillUrls/hookScripts 若为 JSON 字符串则解析。
 /// 有 agentId 时走实体存储 + 软链 (create_workspace_with_agent_store)。

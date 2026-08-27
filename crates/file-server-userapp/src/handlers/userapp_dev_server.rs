@@ -115,9 +115,10 @@ pub(crate) struct UserappDevList {
 
 // ── handlers ───────────────────────────────────────────────────────────────────
 
-/// `POST /api/userapp/dev/start`: 异步编译 + 启动（编译可能数分钟，立即返
-/// taskId）。manifest 同核编译（与生产构建同核，dev 编译通过=可部署）成功
-/// 后启动 dev 服务（UserApp workspace = spawn app-cli 按 manifest
+/// 异步编译并启动 dev 服务（立即返 taskId）
+///
+/// 编译可能数分钟。manifest 同核编译（与生产构建同核，dev 编译通过=可部署）
+/// 成功后启动 dev 服务（UserApp workspace = spawn app-cli 按 manifest
 /// run.command 编排全栈，pingap 9080 统一入口）；编译失败任务终态 Failed、
 /// 不启动。进度/结果：轮询 `GET /api/userapp/tasks/{taskId}`、SSE
 /// `/api/userapp/tasks/{taskId}/logs/stream`；终态后端口经
@@ -154,7 +155,10 @@ pub(crate) async fn dev_start(
     reply(result.await)
 }
 
-/// `POST /api/userapp/dev/stop`: 停止开发服务（按 appId 定位进程组, 无需 pid）。
+/// 停止开发服务（按 appId 定位进程组，无需 pid）
+///
+/// **联动取消该 app 在途的 start/restart 任务**——否则编译中的任务会在
+/// 编译完成后把刚停的服务重新拉起（停止意图被异步任务推翻）。
 #[utoipa::path(
     post,
     path = "/dev/stop",
@@ -162,9 +166,6 @@ pub(crate) async fn dev_start(
     responses((status = 200, body = HttpResult<UserappDevStopped>, description = "停止结果（含进程组杀灭明细）")),
     tag = "UserApp"
 )]
-/// `POST /api/userapp/dev/stop`: 停止开发服务（按 appId 定位进程组, 无需 pid）。
-/// **联动取消该 app 在途的 start/restart 任务**——否则编译中的任务会在
-/// 编译完成后把刚停的服务重新拉起（停止意图被异步任务推翻）。
 pub(crate) async fn dev_stop(
     State(state): State<UserAppState>,
     Json(body): Json<DevOpBody>,
@@ -203,9 +204,10 @@ pub(crate) async fn dev_stop(
     reply(result.await)
 }
 
-/// `POST /api/userapp/dev/restart`: 异步编译 + 重启（agent 改完代码后的
-/// 开发闭环——**重启前必须先编译**，新代码才生效；编译可能数分钟，立即返
-/// taskId）。manifest 同核编译成功后 stop + start（app-cli 重拉全栈）；
+/// 异步编译并重启 dev 服务（立即返 taskId）
+///
+/// agent 改完代码后的开发闭环——**重启前必须先编译**，新代码才生效；编译
+/// 可能数分钟。manifest 同核编译成功后 stop + start（app-cli 重拉全栈）；
 /// 编译失败任务终态 Failed、旧服务原样保留（可继续用旧版本测试，不因
 /// 中间态断流）。进度/结果查询同 start。入参 basePath 对 UserApp
 /// workspace 无效（同 start 的说明）。
@@ -390,7 +392,9 @@ async fn spawn_dev_task(
     Ok(task.id.clone())
 }
 
-/// `GET /api/userapp/dev/list`: 在跑的 UserApp 开发服务列表（不含 web/computer 项目）。
+/// 在跑的 UserApp 开发服务列表
+///
+/// 不含 web/computer 项目进程。
 #[utoipa::path(
     get,
     path = "/dev/list",
@@ -416,7 +420,7 @@ pub(crate) async fn dev_list(State(state): State<UserAppState>) -> UserAppReply<
     reply(result.await)
 }
 
-/// `GET /api/userapp/dev/logs`: 开发服务日志（main=当日汇总 / temp=最新一次）。
+/// 开发服务日志（main=当日汇总 / temp=最新一次）
 #[utoipa::path(
     get,
     path = "/dev/logs",

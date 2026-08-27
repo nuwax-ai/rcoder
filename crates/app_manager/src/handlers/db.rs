@@ -13,7 +13,9 @@ use shared_types::{AppError, HttpResult};
 use super::state::AppManagerState;
 use crate::models::{CreateDatabaseRequest, ResetDbPasswordRequest};
 
-/// 重置 app 容器内 PG 密码（exec 容器内 psql ALTER USER，本地 trust 认证绕过当前密码）
+/// 重置 app 容器内 PG 密码
+///
+/// exec 容器内 psql ALTER USER，本地 trust 认证绕过当前密码。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/db/reset-password",

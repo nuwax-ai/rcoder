@@ -57,7 +57,9 @@ pub struct InitProjectTemplateForm {
     pub enable_git: Option<bool>,
 }
 
-/// `POST /api/computer/init-project-template` (对齐 nuwax initProjectTemplate)。
+/// 初始化项目模板
+///
+/// 对齐 nuwax initProjectTemplate。
 /// multipart: userId, cId, file(模板 zip), enableGit。解压到工作区。
 /// git 触发双开关: GIT_ENABLED && enableGit → init + commit (对齐 nuwax)。
 #[utoipa::path(post, path = "/init-project-template", request_body(content = InitProjectTemplateForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]

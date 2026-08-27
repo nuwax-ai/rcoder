@@ -110,7 +110,7 @@ pub struct UploadProjectForm {
 
 // ── upload-single-file (multipart) ───────────────────────────────────────────────
 
-/// `POST /api/project/upload-single-file`
+/// 单文件上传
 #[utoipa::path(post, path = "/upload-single-file", request_body(content = UploadSingleFileForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Code")]
 pub(crate) async fn upload_single_file(
     State(state): State<AppState>,
@@ -190,7 +190,7 @@ pub(crate) async fn upload_single_file(
 
 // ── upload-batch-files (multipart) ───────────────────────────────────────────────
 
-/// `POST /api/project/upload-batch-files`
+/// 批量文件上传
 #[utoipa::path(post, path = "/upload-batch-files", request_body(content = UploadBatchFilesForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Code")]
 pub(crate) async fn upload_batch_files(
     State(state): State<AppState>,
@@ -269,7 +269,7 @@ pub(crate) async fn upload_batch_files(
 
 // ── upload-attachment-file (multipart) ───────────────────────────────────────────
 
-/// `POST /api/project/upload-attachment-file`
+/// 附件上传
 #[utoipa::path(post, path = "/upload-attachment-file", request_body(content = UploadAttachmentForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn upload_attachment_file(
     State(state): State<AppState>,
@@ -353,7 +353,9 @@ pub(crate) async fn upload_attachment_file(
 
 // ── upload-project (multipart zip) ──────────────────────────────────────────────
 
-/// `POST /api/project/upload-project` (上传 zip 覆盖项目)
+/// 上传项目 zip 覆盖
+///
+/// 上传 zip 覆盖项目。
 #[utoipa::path(post, path = "/upload-project", request_body(content = UploadProjectForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn upload_project(
     State(state): State<AppState>,

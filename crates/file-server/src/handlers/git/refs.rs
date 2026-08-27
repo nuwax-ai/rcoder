@@ -62,7 +62,7 @@ pub(crate) struct TagNameBody {
     pub tag_name: String,
 }
 
-/// `POST /api/git/branch-create`
+/// 创建分支
 #[utoipa::path(post, path = "/branch-create", request_body = BranchCreateBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn branch_create(
     State(state): State<AppState>,
@@ -88,7 +88,7 @@ pub(crate) async fn branch_create(
     })))
 }
 
-/// `POST /api/git/branch-delete`
+/// 删除分支
 #[utoipa::path(post, path = "/branch-delete", request_body = BranchNameBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn branch_delete(
     State(state): State<AppState>,
@@ -115,7 +115,7 @@ pub(crate) async fn branch_delete(
     })))
 }
 
-/// `POST /api/git/tag-create`
+/// 创建标签
 #[utoipa::path(post, path = "/tag-create", request_body = TagCreateBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn tag_create(
     State(state): State<AppState>,
@@ -142,7 +142,7 @@ pub(crate) async fn tag_create(
     })))
 }
 
-/// `POST /api/git/tag-delete`
+/// 删除标签
 #[utoipa::path(post, path = "/tag-delete", request_body = TagNameBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn tag_delete(
     State(state): State<AppState>,
@@ -165,7 +165,9 @@ pub(crate) async fn tag_delete(
     })))
 }
 
-/// `POST /api/git/branch-switch` (对齐 nuwax switchBranch; 切到已存在分支)。
+/// 切换分支
+///
+/// 对齐 nuwax switchBranch; 切到已存在分支。
 #[utoipa::path(post, path = "/branch-switch", request_body = BranchNameBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn branch_switch(
     State(state): State<AppState>,

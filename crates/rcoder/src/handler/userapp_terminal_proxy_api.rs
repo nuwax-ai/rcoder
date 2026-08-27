@@ -76,7 +76,7 @@ async fn redirect_doc_response(
     get,
     path = "/userapp/dev/ttyd/{app_id}/{*path}",
     tag = "应用管理",
-    summary = "Pingora 代理 - userApp 开发域 Web 终端（ttyd，按 app_id 定位开发容器）",
+    summary = "Pingora 代理 - userApp 开发域 Web 终端（ttyd）",
     description = r#"
 访问该 app 开发容器（UserAppBuilder）内的 **Web 终端**。与 computer 族
 （`/computer/ttyd/{user_id}/...` 按用户沙箱）对称的开发场景入口，按 **app_id** 定位。
@@ -113,7 +113,7 @@ pub async fn proxy_to_userapp_ttyd(
     get,
     path = "/userapp/dev/vnc/{app_id}/{*path}",
     tag = "应用管理",
-    summary = "Pingora 代理 - userApp 开发域远程桌面（noVNC，按 app_id 定位开发容器）",
+    summary = "Pingora 代理 - userApp 开发域远程桌面（noVNC）",
     description = r#"
 访问该 app 开发容器（UserAppBuilder）内的 **远程桌面**（noVNC）。开发容器是完整桌面镜像
 （Xvnc 5900 + noVNC 6080），与 computer 族 `/computer/vnc/{user_id}/...` 对称。
@@ -287,7 +287,7 @@ pub async fn proxy_to_userapp_runtime_ttyd(
     get,
     path = "/userapp/prod/pgweb/{app_id}/{*path}",
     tag = "应用管理",
-    summary = "Pingora 代理 - userApp 运行容器数据库 Web 控制台（pgweb，部署后的生产环境）",
+    summary = "Pingora 代理 - userApp 运行容器数据库控制台（pgweb）",
     description = r#"
 访问该 app **运行容器**（app-runtime 镜像）内的 pgweb——容器内 PostgreSQL（5432）
 的 Web 控制台（8081，普通 HTTP），供线上查库排障。

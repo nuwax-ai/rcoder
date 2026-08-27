@@ -175,6 +175,68 @@ mod tests {
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 
+    fn operations_of(
+        item: &utoipa::openapi::PathItem,
+    ) -> Vec<(&'static str, &utoipa::openapi::path::Operation)> {
+        fn push<'a>(
+            ops: &mut Vec<(&'static str, &'a utoipa::openapi::path::Operation)>,
+            method: &'static str,
+            op: &'a Option<utoipa::openapi::path::Operation>,
+        ) {
+            if let Some(op) = op {
+                ops.push((method, op));
+            }
+        }
+        let mut ops = Vec::new();
+        push(&mut ops, "get", &item.get);
+        push(&mut ops, "post", &item.post);
+        push(&mut ops, "put", &item.put);
+        push(&mut ops, "delete", &item.delete);
+        push(&mut ops, "options", &item.options);
+        push(&mut ops, "head", &item.head);
+        push(&mut ops, "patch", &item.patch);
+        push(&mut ops, "trace", &item.trace);
+        ops
+    }
+
+    /// operation summary 适配文档 UI（Scalar 左侧菜单与详情区标题显示它）：
+    /// 非空、单行、≤50 字符、不带 `` `GET ...`` 方法/路径前缀（UI 已单独显示
+    /// method+path）。utoipa 取 doc comment 首段为 summary——首段写长文在此报红。
+    #[test]
+    fn operation_summaries_are_ui_concise() {
+        let document = generated_document();
+        const METHODS: [&str; 8] = [
+            "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD", "TRACE",
+        ];
+        let mut checked = 0usize;
+        for (path, item) in &document.paths.paths {
+            for (method, op) in operations_of(item) {
+                let Some(summary) = op.summary.as_deref().filter(|s| !s.trim().is_empty()) else {
+                    panic!("{method} {path}: summary 缺失（doc comment 首段必填）");
+                };
+                assert!(
+                    !summary.contains('\n'),
+                    "{method} {path}: summary 须为单行（多行内容移到空行后的详细段）"
+                );
+                assert!(
+                    summary.chars().count() <= 50,
+                    "{method} {path}: summary 过长（>50 字符），详细内容移入 description: {summary}"
+                );
+                let method_prefixed =
+                    summary.starts_with('`') && METHODS.iter().any(|m| summary[1..].starts_with(m));
+                assert!(
+                    !method_prefixed,
+                    "{method} {path}: summary 不得带方法/路径前缀（UI 已单独显示）: {summary}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 60,
+            "sanity: 至少遍历 60 个 operation，实际 {checked}"
+        );
+    }
+
     // userapp 字段文档/HttpResult 信封两测试已随域迁至 file-server-userapp crate
     // （routes.rs 测试模块）——本文档不再含 /api/userapp 路径。
 

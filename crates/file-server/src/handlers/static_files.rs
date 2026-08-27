@@ -50,7 +50,7 @@ pub(crate) struct CustomTargetQuery {
 
 // ── page static ────────────────────────────────────────────────────────────────
 
-/// `GET|OPTIONS /api/page/static/{projectId}/{*rest}`
+/// 项目静态文件服务
 #[utoipa::path(
     get,
     path = "/static/{project_id}/{*rest}",
@@ -94,7 +94,7 @@ pub(crate) async fn serve_page(
 
 // ── computer static ────────────────────────────────────────────────────────────
 
-/// `GET|OPTIONS /api/computer/static/{userId}/{cId}/{*rest}?customTargetDir=`
+/// computer 工作区静态文件服务
 #[utoipa::path(
     get,
     path = "/static/{user_id}/{c_id}/{*rest}",

@@ -10,7 +10,7 @@ use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
 use crate::service::git;
 
-/// `GET /api/git/branches`
+/// 列出分支
 #[utoipa::path(
     get,
     path = "/branches",
@@ -49,7 +49,7 @@ pub(crate) async fn branches(
     })))
 }
 
-/// `GET /api/git/tags`
+/// 列出标签
 #[utoipa::path(
     get,
     path = "/tags",
@@ -92,7 +92,7 @@ pub(crate) struct GitLogQuery {
     pub file_path: Option<String>,
 }
 
-/// `GET /api/git/log`
+/// 提交历史
 #[utoipa::path(
     get,
     path = "/log",
@@ -148,7 +148,9 @@ pub(crate) struct FileContentBody {
     pub file_path: String,
 }
 
-/// `POST /api/git/file-content` (对齐 nuwax fileContent; 从 **body** 取 {ref, filePath})。
+/// 读取文件内容
+///
+/// 对齐 nuwax fileContent; 从 **body** 取 {ref, filePath}。
 /// ref ∈ {worktree, staged, ""} → 直接读 workdir 文件 (不查 git); 否则读 ref 处 blob。
 #[utoipa::path(post, path = "/file-content", request_body = FileContentBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn file_content(
@@ -197,7 +199,9 @@ pub(crate) async fn file_content(
     })))
 }
 
-/// `GET /api/git/status` (对齐 nuwax status 5-bucket + conflicted/ahead/behind/tracking 固定值)
+/// 查询工作区状态
+///
+/// 对齐 nuwax status 5-bucket + conflicted/ahead/behind/tracking 固定值。
 #[utoipa::path(
     get,
     path = "/status",
