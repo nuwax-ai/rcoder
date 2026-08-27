@@ -159,12 +159,35 @@ mod tests {
             "failed",
             "cancelled",
             "stream_lagged",
+            "Last-Event-ID",
             "fromSeq",
             "keep-alive",
             "artifactPath",
         ] {
             assert!(sse.contains(token), "SSE 描述缺事件/协议锚点 {token}");
         }
+
+        // 续传头必须在参数清单里显式声明（同事按 swagger 对接，仅藏在描述里不可见）
+        let sse_params = document
+            .paths
+            .paths
+            .get("/api/userapp/tasks/{task_id}/logs/stream")
+            .and_then(|item| item.get.as_ref())
+            .and_then(|op| op.parameters.as_ref())
+            .map(|params| {
+                params
+                    .iter()
+                    .map(|p| (p.name.as_str(), &p.parameter_in))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(
+            sse_params.iter().any(|(name, r#in)| {
+                *name == "Last-Event-ID"
+                    && matches!(r#in, utoipa::openapi::path::ParameterIn::Header)
+            }),
+            "SSE 接口参数缺 Last-Event-ID Header 声明（同事按 swagger 对接，头参数必须显式可见）"
+        );
 
         let build = success_desc("/api/userapp/build");
         assert!(

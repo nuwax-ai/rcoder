@@ -22,7 +22,7 @@ use async_stream::stream;
 use crate::service::userapp::UserappBuildTask;
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use garde::Validate;
@@ -180,9 +180,32 @@ fn default_start_index() -> usize {
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StreamQuery {
-    /// 从哪个 seq 开始回放（0 = 从头；断线重连带上次最后 seq+1）。
+    /// 从哪个 seq 开始回放（含该 seq；0 = 从头）。仅作兜底——
+    /// 请求带 `Last-Event-ID` 头时以头为准（头值 + 1 = 本值语义），query 被忽略。
     #[serde(default)]
     pub from_seq: u64,
+}
+
+/// 解析 SSE 续传游标：`Last-Event-ID` 头优先，`?fromSeq=` query 兜底。
+///
+/// SSE 规范（WHATWG）语义：断线重连时 `Last-Event-ID` 头的值是客户端最后收到
+/// 事件的 `id:`，服务端应回放该 id **之后**的事件；而 `fromSeq` 是"从哪个 seq
+/// 开始（含）"，故头值需 +1 换算。头存在但非数字时忽略头回退 query
+///（EventSource 不会发非数字 id，此分支只有手写客户端会触发，info 留痕）。
+fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
+    match last_event_id {
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(id) => id.saturating_add(1),
+            Err(_) => {
+                tracing::info!(
+                    raw,
+                    "Last-Event-ID header not numeric, fall back to fromSeq query"
+                );
+                query_from_seq
+            }
+        },
+        None => query_from_seq,
+    }
 }
 
 /// `POST /api/userapp/build` —— 异步发起 workspace 打包，立即返 taskId + 产物路径。
@@ -298,12 +321,13 @@ pub(crate) async fn get_task_logs(
     path = "/tasks/{task_id}/logs/stream",
     params(
         ("task_id" = String, Path, description = "任务ID"),
+        ("Last-Event-ID" = Option<String>, Header, description = "SSE 规范续传头（优先）：断线重连时填最后收到事件的 id（即上一条消息的 seq），服务端从该 id 之后回放。浏览器 EventSource 自动重连会自动携带，无需手动处理。与 fromSeq 同时存在时以本头为准。"),
         StreamQuery,
     ),
     responses(
         (
             status = 200,
-            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 1 递增，断线重连带 `?fromSeq=<最后seq+1>` 回放续传。\n\n事件清单（event 名 → data 载荷）：\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始编译某服务）\n- `build_ok` → `{'event':'buildOk','service':'...'}`（服务编译成功；注意 data 内 tag 为 camelCase）\n- `build_fail` → `{'event':'buildFail','service':'...','error':'...'}`\n- `completed`（终态）→ `{'event':'completed','releaseId':'...','sha256':'...','sizeBytes':N,'fileName':'...','artifactPath':'builds/workspace-package-{releaseId}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端用 fromSeq 重连续传\n\n说明：构建日志经独立接口 `GET /tasks/{taskId}/logs` 分页查询，不走本流；`stage`/`log` 两种事件类型为协议预留，当前任务流不发送。终态事件（completed/failed/cancelled）后服务端关闭流；每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
+            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 1 递增。断线续传两种方式（二选一）：① 请求带 `Last-Event-ID: <最后收到的seq>` 头（SSE 规范标准方式，浏览器 EventSource 自动重连自动携带，服务端从该 seq 之后回放）；② query `?fromSeq=<最后seq+1>`（从该 seq 开始含本身回放；头存在时被忽略）。\n\n事件清单（event 名 → data 载荷）：\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始编译某服务）\n- `build_ok` → `{'event':'buildOk','service':'...'}`（服务编译成功；注意 data 内 tag 为 camelCase）\n- `build_fail` → `{'event':'buildFail','service':'...','error':'...'}`\n- `completed`（终态）→ `{'event':'completed','releaseId':'...','sha256':'...','sizeBytes':N,'fileName':'...','artifactPath':'builds/workspace-package-{releaseId}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端按上述任一方式带游标重连续传\n\n说明：构建日志经独立接口 `GET /tasks/{taskId}/logs` 分页查询，不走本流；`stage`/`log` 两种事件类型为协议预留，当前任务流不发送。终态事件（completed/failed/cancelled）后服务端关闭流；每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
             content_type = "text/event-stream",
         ),
         (status = 404, description = "Task not found（HttpResult JSON，非 SSE）"),
@@ -314,6 +338,7 @@ pub(crate) async fn stream_task_logs(
     State(state): State<UserAppState>,
     AppPath(task_id): AppPath<String>,
     AppQuery(q): AppQuery<StreamQuery>,
+    headers: HeaderMap,
 ) -> Response {
     // 错误路径 (task 不存在) 也走 HttpResult shape, 与同组 JSON 接口一致
     // (成功路径是 SSE 流, 豁免 HttpResult)
@@ -323,7 +348,11 @@ pub(crate) async fn stream_task_logs(
         )))
         .into_response();
     };
-    let (replay, mut rx) = task.subscribe(q.from_seq).await;
+    let from_seq = resolve_from_seq(
+        headers.get("last-event-id").and_then(|v| v.to_str().ok()),
+        q.from_seq,
+    );
+    let (replay, mut rx) = task.subscribe(from_seq).await;
 
     let progress = stream! {
         // 回放历史事件（seq >= from_seq）
@@ -500,4 +529,27 @@ fn is_terminal_event(ev: &BuildProgressEvent) -> bool {
             | BuildProgressEvent::Failed { .. }
             | BuildProgressEvent::Cancelled
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_from_seq;
+
+    #[test]
+    fn resolve_from_seq_prefers_last_event_id_header_with_plus_one() {
+        // SSE 规范：头值是最后收到的 id，回放其后 → +1
+        assert_eq!(resolve_from_seq(Some("7"), 0), 8);
+        assert_eq!(resolve_from_seq(Some(" 7 "), 3), 8); // 容忍空白
+        assert_eq!(resolve_from_seq(Some("0"), 0), 1);
+        assert_eq!(resolve_from_seq(Some(&u64::MAX.to_string()), 0), u64::MAX);
+    }
+
+    #[test]
+    fn resolve_from_seq_falls_back_to_query_when_header_absent_or_invalid() {
+        assert_eq!(resolve_from_seq(None, 5), 5);
+        assert_eq!(resolve_from_seq(None, 0), 0);
+        // 非数字头（EventSource 不会发，仅手写客户端触发）→ 忽略头用 query
+        assert_eq!(resolve_from_seq(Some("abc"), 5), 5);
+        assert_eq!(resolve_from_seq(Some(""), 9), 9);
+    }
 }
