@@ -6,7 +6,6 @@
 use std::path::PathBuf;
 
 use axum::extract::State;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::process_capture::run_capture;
@@ -14,21 +13,12 @@ use super::{resolve_computer_target, ws_path};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
+use crate::models::{BuildAgentBody, CleanupBuildArtifactsBody, InstallBody};
 use crate::service::package_build;
 use crate::service::pnpm::{self, InstallOptions};
 use crate::service::pnpm_config;
 
 // ── install-project ─────────────────────────────────────────────────────────────
-
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct InstallBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    user_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    c_id: String,
-    programming_language: String,
-}
 
 /// 安装项目依赖
 ///
@@ -130,19 +120,6 @@ pub async fn install_project_impl(
 
 // ── build-agent-package ─────────────────────────────────────────────────────────
 
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct BuildAgentBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    user_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    c_id: String,
-    // agentId 同 user_id/c_id: TS 原版 buildAgentPackage 标注 {string|number},Java 后端传 DB bigint(整数)。
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    agent_id: String,
-    version: String,
-}
-
 /// 构建 agent 安装包
 ///
 /// 对齐 nuwax buildAgentPackage。
@@ -198,17 +175,6 @@ pub(crate) async fn build_agent_package(
 }
 
 // ── cleanup-build-artifacts ─────────────────────────────────────────────────────
-
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CleanupBuildArtifactsBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    user_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    c_id: String,
-    #[serde(default)]
-    custom_target_dir: Option<String>,
-}
 
 /// 清理构建产物
 ///

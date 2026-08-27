@@ -1,12 +1,12 @@
 //! 日志读取与缓存 handlers: get-dev-log / get-log-cache-stats / clear-all-log-cache。
 
 use axum::extract::State;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
-use crate::service::dev_server::log::LogLine;
+use crate::models::{DevLogQuery, LogLine};
 
 // ── 类型化响应 ────────────────────────────────────────────────────────────────
 
@@ -58,28 +58,6 @@ pub(crate) struct LogCacheStatsData {
     pub node_env: String,
     #[serde(rename = "LOG_CACHE_ENABLED")]
     pub log_cache_enabled: bool,
-}
-
-// ── Query ─────────────────────────────────────────────────────────────────────
-
-#[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DevLogQuery {
-    /// 项目 ID
-    pub(crate) project_id: String,
-    /// 日志起始行号 (1 起; 缺省 1 即从头读取)
-    #[serde(default = "default_start_index")]
-    start_index: usize,
-    /// 日志类型: `temp`(运行日志,默认) / `app`(应用自定义日志)
-    #[serde(default = "default_log_type")]
-    log_type: String,
-}
-fn default_start_index() -> usize {
-    1
-}
-fn default_log_type() -> String {
-    "temp".to_string()
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────

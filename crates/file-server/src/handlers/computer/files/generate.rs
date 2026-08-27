@@ -4,35 +4,14 @@ use std::path::PathBuf;
 
 use axum::extract::State;
 use garde::Validate;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::super::resolve_computer_target;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
+use crate::models::GenerateFileBody;
 use crate::path_safety;
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct GenerateFileBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
-    user_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
-    c_id: String,
-    /// 文件名，可含相对子路径 (如 "src/foo.txt")；对齐 nuwax normalizeFilePath 会剥离前导 `/`。
-    #[garde(custom(crate::validation_rules::not_blank))]
-    file_name: String,
-    /// 文本内容，缺省视为空串。
-    #[serde(default)]
-    content: Option<String>,
-    /// 绝对目录覆盖；非空则用之，否则回退默认工作区 (与 upload-file 同语义)。
-    #[serde(default)]
-    custom_target_dir: Option<String>,
-}
 
 /// 生成文本文件
 ///

@@ -7,31 +7,17 @@ use std::path::{Path, PathBuf};
 
 use axum::extract::State;
 use garde::Validate;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::error::{AppError, AppResult};
 use crate::extract::{AppJson as Json, AppQuery as Query};
+use crate::models::{ExecCommandBody, GetLogsQuery};
 
 use super::process_capture::capture_command;
 use super::{resolve_computer_target, ws_path};
 
 // ── execute-command ─────────────────────────────────────────────────────────────
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ExecCommandBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
-    user_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
-    c_id: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
-    command: String,
-}
 
 /// 执行 shell 命令
 ///
@@ -80,27 +66,6 @@ pub async fn execute_command_impl(
 }
 
 // ── get-logs ────────────────────────────────────────────────────────────────────
-
-#[derive(Deserialize, Validate, utoipa::IntoParams)]
-#[garde(allow_unvalidated)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct GetLogsQuery {
-    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
-    user_id: String,
-    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
-    c_id: String,
-    /// 读取末尾行数（缺省取最近若干行）
-    #[serde(default = "default_tail_lines")]
-    tail_lines: usize,
-}
-fn default_tail_lines() -> usize {
-    200
-}
 
 /// 读取最新日志
 ///

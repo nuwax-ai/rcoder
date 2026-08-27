@@ -7,21 +7,7 @@ use super::require_workspace_fields;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
-
-/// create-workspace 响应 (对齐 nuwax createWorkspace 响应字段)。
-/// workspaceRoot = COMPUTER_WORKSPACE_DIR; updatedSkills/failedSkills 空时不输出。
-#[derive(serde::Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CreateWorkspaceResponse {
-    pub success: bool,
-    pub message: String,
-    pub workspace_root: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub updated_skills: Vec<String>,
-    /// best-effort 透传: 推送失败的 skill URL 明细 (空则不输出)。
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub failed_skills: Vec<crate::service::computer_ws::SkillFailure>,
-}
+use crate::models::{CreateWorkspaceForm, CreateWorkspaceResponse, CreateWorkspaceV2Form};
 
 fn create_workspace_response(
     state: &AppState,
@@ -39,39 +25,6 @@ fn create_workspace_response(
         updated_skills: result.updated_skills,
         failed_skills: result.failed_skills,
     })
-}
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateWorkspaceForm {
-    pub user_id: String,
-    pub c_id: String,
-    #[schema(format = Binary)]
-    pub file: Option<String>,
-}
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateWorkspaceV2Form {
-    pub user_id: String,
-    pub c_id: String,
-    #[schema(format = Binary)]
-    pub file: Option<String>,
-    pub skill_urls: Option<Vec<String>>,
-    pub mcp_servers_config: Option<String>,
-    pub hooks_config: Option<String>,
-    pub permissions_config: Option<String>,
-    pub hook_scripts: Option<String>,
-    /// 智能体 ID (非空时走实体存储 + 软链)
-    pub agent_id: Option<String>,
-    /// 技能名 → URL 映射 (JSON; 下载前可跳过已存在的)
-    pub skill_url_map: Option<String>,
-    /// 配置技能名全集 (JSON; 用于差集删除)
-    pub skill_names: Option<Vec<String>>,
-    /// 强制更新的技能名 (JSON; 传入时按需安装)
-    pub update_skill_names: Option<Vec<String>>,
 }
 
 /// 创建 computer 工作区

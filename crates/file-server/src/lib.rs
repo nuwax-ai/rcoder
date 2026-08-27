@@ -5,6 +5,7 @@ pub mod error;
 pub mod extract;
 pub mod handlers;
 pub mod logging;
+pub mod models;
 pub mod openapi;
 pub mod path_safety;
 pub mod response;

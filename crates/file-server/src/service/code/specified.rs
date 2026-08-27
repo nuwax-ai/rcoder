@@ -13,7 +13,7 @@ use crate::path_safety::safe_within_or_skip;
 use crate::service::version;
 use crate::workspace::{ProjectContext, WorkspaceResolver};
 
-use super::types::{FileOp, FileOperation};
+use crate::models::{FileOp, FileOperation};
 
 /// modify 策略 (project 与 computer 路由口径不同):
 /// - `Diff`: 行级 diff 合并 (project specifiedFilesUpdate; 换行符继承 existing)。

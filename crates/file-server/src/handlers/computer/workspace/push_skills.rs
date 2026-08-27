@@ -8,20 +8,8 @@ use super::require_workspace_fields;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
+use crate::models::PushSkillsForm;
 use crate::service::skills as skills_service;
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PushSkillsForm {
-    pub user_id: String,
-    pub c_id: String,
-    #[schema(format = Binary)]
-    pub file: Option<String>,
-    pub skill_urls: Option<Vec<String>>,
-    /// 智能体 ID (有则可能走实体存储; 须同时满足会话已是软链)
-    pub agent_id: Option<String>,
-}
 
 /// 技能推送到工作区
 ///

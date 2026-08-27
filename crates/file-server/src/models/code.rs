@@ -1,4 +1,8 @@
-//! code 文件操作的请求结构 (对齐 nuwax codeService 入参)。
+//! code 文件操作契约（原 service/code/types.rs）：跨 project / computer /
+//! userapp(file-server-userapp) 三域共享的文件写操作请求组件。
+//!
+//! `FileOperation` 的解析/展示逻辑随类型迁移——它是 wire 枚举（schema 断言
+//! 锁定 `FileOp→FileOperation` 的 $ref 结构），service 侧继续引用。
 
 use std::fmt;
 use std::str::FromStr;

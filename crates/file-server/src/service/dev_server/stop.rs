@@ -5,8 +5,9 @@ use std::collections::HashSet;
 use super::log;
 use super::process;
 use super::support::lock;
-use super::types::{DevServerManager, KilledPid, StoppedDev};
+use super::types::{DevServerManager, StoppedDev};
 use crate::error::AppResult;
+use crate::models::KilledPid;
 
 impl DevServerManager {
     /// stop-dev (对齐 nuwax stopDevServerByProjectId; 系统级 pid 扫描 + 杀整组 +

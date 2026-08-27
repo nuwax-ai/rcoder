@@ -10,31 +10,9 @@ use super::super::{file_field, resolve_computer_target, text_field};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
+use crate::models::{UploadFileForm, UploadFilesForm};
 use crate::path_safety;
 use crate::service::temp_file::TemporaryFile;
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UploadFileForm {
-    pub user_id: String,
-    pub c_id: String,
-    pub file_path: String,
-    pub custom_target_dir: Option<String>,
-    #[schema(format = Binary)]
-    pub file: String,
-}
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UploadFilesForm {
-    pub user_id: String,
-    pub c_id: String,
-    pub custom_target_dir: Option<String>,
-    pub file_paths: Vec<String>,
-    pub files: Vec<crate::openapi::BinaryFile>,
-}
 
 /// upload-file 必填字段 (multipart 提取后构造 + garde 校验; 文件字段用内置 required)。
 #[derive(garde::Validate)]

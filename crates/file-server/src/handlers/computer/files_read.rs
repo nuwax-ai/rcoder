@@ -12,9 +12,10 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
+use crate::models::{FileListQuery, ResolveFileQuery, SearchFilesQuery};
 use crate::service::{code as code_service, tree};
 
-use super::{FileListQuery, ResolveFileQuery, SearchFilesQuery, resolve_computer_target};
+use super::resolve_computer_target;
 
 // ── get-file-list ───────────────────────────────────────────────────────────────
 

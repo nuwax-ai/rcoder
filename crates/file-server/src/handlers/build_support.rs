@@ -1,11 +1,11 @@
 //! Build handler 的文件系统与错误解析职责。
 
 use axum::extract::State;
-use serde::Deserialize;
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
+use crate::models::ParseErrorBody;
 
 use super::build::logs::Simple;
 
@@ -54,15 +54,6 @@ pub(super) fn copy_dir_all(
         }
     }
     Ok(())
-}
-
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ParseErrorBody {
-    #[allow(dead_code)]
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    project_id: String,
-    error_message: String,
 }
 
 /// 解析构建错误输出

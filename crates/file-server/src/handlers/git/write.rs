@@ -2,42 +2,16 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{GitWriteBody, resolve_body};
+use super::resolve_body;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
+use crate::models::{
+    CommitBody, DiffBody, FilesBody, GitWriteBody, ResetBody, RevertBody, TargetBody,
+};
 use crate::service::git;
-
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FilesBody {
-    #[serde(flatten)]
-    pub base: GitWriteBody,
-    #[serde(default)]
-    pub files: Option<Vec<String>>,
-}
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CommitBody {
-    #[serde(flatten)]
-    #[garde(skip)]
-    pub base: GitWriteBody,
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub message: String,
-    #[serde(default)]
-    #[garde(skip)]
-    pub files: Option<Vec<String>>,
-    #[serde(default)]
-    #[garde(skip)]
-    pub author_name: Option<String>,
-    #[serde(default)]
-    #[garde(skip)]
-    pub author_email: Option<String>,
-}
 
 /// 初始化仓库
 #[utoipa::path(post, path = "/init", request_body = GitWriteBody, description = r#"
@@ -208,21 +182,6 @@ pub(crate) async fn discard(
     })))
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DiffBody {
-    #[serde(flatten)]
-    pub base: GitWriteBody,
-    #[serde(default)]
-    pub source: String,
-    #[serde(default)]
-    pub from: Option<String>,
-    #[serde(default)]
-    pub to: Option<String>,
-    #[serde(default)]
-    pub paths: Option<Vec<String>>,
-}
-
 /// 查看差异
 ///
 /// 对齐 nuwax diff; source: worktree|staged|commit, 默认 worktree。
@@ -263,48 +222,6 @@ pub(crate) async fn diff(
             "deletions": result.deletions,
         },
     })))
-}
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct TargetBody {
-    #[serde(flatten)]
-    #[garde(skip)]
-    pub base: GitWriteBody,
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub target: String,
-}
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ResetBody {
-    #[serde(flatten)]
-    #[garde(skip)]
-    pub base: GitWriteBody,
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub target: String,
-    #[serde(default)]
-    #[garde(skip)]
-    pub mode: String,
-}
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RevertBody {
-    #[serde(flatten)]
-    #[garde(skip)]
-    pub base: GitWriteBody,
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub target: String,
-    #[serde(default)]
-    #[garde(skip)]
-    pub message: Option<String>,
-    #[serde(default)]
-    #[garde(skip)]
-    pub author_name: Option<String>,
-    #[serde(default)]
-    #[garde(skip)]
-    pub author_email: Option<String>,
 }
 
 /// 重置到目标提交
@@ -419,6 +336,7 @@ pub(crate) async fn revert(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
 
     /// 关键回归: git 写接口 (add/commit/discard/...) 经 `#[serde(flatten)]` 复用 GitWriteBody。
     /// serde flatten 会把字段收集到 Map 再二次反序列化, 是 deserialize_with 失效的已知坑区。

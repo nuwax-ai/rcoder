@@ -4,26 +4,15 @@ use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use garde::Validate;
-use serde::Deserialize;
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
+use crate::models::{UserCidQuery, ZipBody};
 use crate::service::temp_file::{TemporaryFile, TemporaryFileWriter};
 use crate::service::zip;
 
-use super::{UserCidQuery, resolve_computer_target, ws_path};
-
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ZipBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    user_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    c_id: String,
-    #[serde(default)]
-    exclude_dirs: Option<Vec<String>>,
-}
+use super::{resolve_computer_target, ws_path};
 
 async fn computer_tmp_zip(state: &AppState) -> Result<TemporaryFile, AppError> {
     TemporaryFileWriter::create(
@@ -86,7 +75,7 @@ fn utf8_percent_encode(s: &str) -> String {
     path = "/zip-workspace",
     request_body = ZipBody,
     responses(
-        (status = 200, description = "Workspace ZIP archive", body = crate::openapi::BinaryFile, content_type = "application/zip"),
+        (status = 200, description = "Workspace ZIP archive", body = crate::models::BinaryFile, content_type = "application/zip"),
         crate::openapi::ErrorApiResponses
     ),
     tag = "Computer"
@@ -141,7 +130,7 @@ pub async fn zip_workspace_impl(
     path = "/download-all-files",
     params(UserCidQuery),
     responses(
-        (status = 200, description = "Workspace ZIP archive", body = crate::openapi::BinaryFile, content_type = "application/zip"),
+        (status = 200, description = "Workspace ZIP archive", body = crate::models::BinaryFile, content_type = "application/zip"),
         crate::openapi::ErrorApiResponses
     ),
     tag = "Computer"

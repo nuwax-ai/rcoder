@@ -4,38 +4,15 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use garde::Validate;
-use serde::Deserialize;
 use serde_json::json;
 
 use super::ctx_from;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
+use crate::models::{BackupVersionBody, ExportBody, RollbackBody};
 use crate::response;
 use crate::service::{project as project_service, version as version_service};
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct BackupVersionBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub project_id: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub code_version: String,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub space_id: Option<String>,
-    #[serde(default)]
-    pub isolation_type: Option<String>,
-}
 
 /// 备份当前版本
 #[utoipa::path(post, path = "/backup-current-version", request_body = BackupVersionBody, description = r#"
@@ -71,31 +48,6 @@ pub(crate) async fn backup_current_version(
         "projectId": result.project_id,
         "zipPath": result.zip_path,
     })))
-}
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RollbackBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub project_id: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub code_version: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub rollback_to: String,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub space_id: Option<String>,
-    #[serde(default)]
-    pub isolation_type: Option<String>,
 }
 
 /// 回滚版本
@@ -136,34 +88,6 @@ pub(crate) async fn rollback_version(
     })))
 }
 
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ExportBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub project_id: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub code_version: String,
-    #[serde(default)]
-    pub export_type: Option<String>,
-    #[serde(default)]
-    #[schema(value_type = Object)]
-    pub config: Option<serde_json::Value>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub space_id: Option<String>,
-    #[serde(default)]
-    pub isolation_type: Option<String>,
-}
-
 /// 导出项目
 ///
 /// 返回 application/zip 文件流。
@@ -172,7 +96,7 @@ pub(crate) struct ExportBody {
     path = "/export-project",
     request_body = ExportBody,
     responses(
-        (status = 200, description = "Project ZIP archive", body = crate::openapi::BinaryFile, content_type = "application/zip"),
+        (status = 200, description = "Project ZIP archive", body = crate::models::BinaryFile, content_type = "application/zip"),
         crate::openapi::ErrorApiResponses
     ),
     tag = "Project"

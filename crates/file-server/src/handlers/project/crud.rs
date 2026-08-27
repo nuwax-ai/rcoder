@@ -5,36 +5,17 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde::Deserialize;
 use serde_json::json;
 
 use super::ctx_from;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
+use crate::models::{CopyProjectBody, CreateProjectBody, DeleteParams};
 use crate::service::project as project_service;
 use crate::workspace::ProjectContext;
 
 // ── delete-project ───────────────────────────────────────────────────────────────
-
-#[derive(Deserialize, Validate, utoipa::IntoParams)]
-#[garde(allow_unvalidated)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DeleteParams {
-    /// 项目 ID
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub project_id: String,
-    /// 关联 dev server 进程 PID（可选；用于删除前停止开发服务器）
-    #[serde(default)]
-    pub pid: Option<String>,
-    /// 租户 ID（多租户隔离；本地部署可缺省）
-    pub tenant_id: Option<String>,
-    /// 空间 ID（多租户隔离；本地部署可缺省）
-    pub space_id: Option<String>,
-    /// 隔离类型（多租户隔离；本地部署可缺省）
-    pub isolation_type: Option<String>,
-}
 
 /// 删除项目
 #[utoipa::path(
@@ -91,28 +72,6 @@ pub(crate) async fn delete_project(
 
 // ── create-project ───────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CreateProjectBody {
-    #[serde(default, deserialize_with = "crate::extract::deserialize_id_string")]
-    #[schema(required = true)]
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub project_id: String,
-    pub template_type: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
-}
-
 /// 创建项目
 #[utoipa::path(post, path = "/create-project", request_body = CreateProjectBody, description = r#"
 创建项目骨架：在工作区建立 `{projectId}` 目录结构（app 根相对）。**注意是 GET 形态**——沿用 TS 契约，projectId 走 query。成功后即可用文件族接口写入内容或 upload-project 整包导入。
@@ -142,51 +101,6 @@ pub(crate) async fn create_project(
 }
 
 // ── copy-project ─────────────────────────────────────────────────────────────────
-
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CopyProjectBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    pub source_project_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    pub target_project_id: String,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub space_id: Option<String>,
-    #[serde(default)]
-    pub isolation_type: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub source_tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub source_space_id: Option<String>,
-    #[serde(default)]
-    pub source_isolation_type: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub target_tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub target_space_id: Option<String>,
-    #[serde(default)]
-    pub target_isolation_type: Option<String>,
-}
 
 /// 复制项目
 ///

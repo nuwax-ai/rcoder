@@ -2,43 +2,12 @@
 //!
 //! 路径、参数和请求体由各 Axum handler 的 `#[utoipa::path]` 提供；
 //! `utoipa_axum::OpenApiRouter` 在注册 handler 时同步收集文档，避免维护第二套路由表。
+//! wire 契约类型（信封/Body/Query/响应载荷）集中在 [`crate::models`]。
 
-use serde::Serialize;
-use serde_json::Value;
-use utoipa::{IntoResponses, OpenApi, ToSchema};
+use utoipa::{IntoResponses, OpenApi};
 use utoipa_swagger_ui::{Config, SwaggerUi};
 
-/// OpenAPI multipart binary item，支持单文件和文件数组。
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(ToSchema)]
-#[schema(value_type = String, format = Binary)]
-pub struct BinaryFile(String);
-
-/// JSON 成功响应的公共字段。具体接口会附加各自业务字段。
-#[derive(Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SuccessResponse {
-    pub success: bool,
-    pub message: Option<String>,
-}
-
-#[derive(Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ErrorDetail {
-    pub r#type: String,
-    pub message: String,
-    pub timestamp: String,
-    pub request_id: String,
-    #[schema(value_type = Object)]
-    pub details: Option<Value>,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct ErrorResponse {
-    pub success: bool,
-    pub code: String,
-    pub error: ErrorDetail,
-}
+use crate::models::{ErrorResponse, SuccessResponse};
 
 /// JSON 接口的公共 HTTP 响应集合。
 #[derive(IntoResponses)]
@@ -119,6 +88,7 @@ pub fn swagger_ui(routes: utoipa::openapi::OpenApi) -> SwaggerUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn generated_document() -> utoipa::openapi::OpenApi {
         document(crate::routes::api_router().into_openapi())

@@ -8,18 +8,8 @@ use super::super::{file_field, resolve_computer_target, text_field, validate_zip
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
+use crate::models::ImportProjectForm;
 use crate::service::temp_file::TemporaryFile;
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ImportProjectForm {
-    pub user_id: String,
-    pub c_id: String,
-    pub custom_target_dir: Option<String>,
-    #[schema(format = Binary)]
-    pub file: String,
-}
 
 /// import-project 必填字段 (userId/cId 必填非空 + zip 文件必填)。
 #[derive(garde::Validate)]

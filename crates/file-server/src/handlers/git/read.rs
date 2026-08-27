@@ -1,13 +1,13 @@
 //! git 读 handlers: branches / tags / log / file-content / status。
 
 use axum::extract::State;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{GitQuery, GitWriteBody, resolve, resolve_body};
+use super::{resolve, resolve_body};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
+use crate::models::{FileContentBody, GitLogQuery, GitQuery};
 use crate::service::git;
 
 /// 列出分支
@@ -84,20 +84,6 @@ pub(crate) async fn tags(
     ))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct GitLogQuery {
-    #[serde(flatten)]
-    pub base: GitQuery,
-    pub max_count: Option<usize>,
-    pub skip: Option<usize>,
-    /// 指定分支 (对齐 nuwax git.log ref); 默认 HEAD。
-    #[serde(default)]
-    pub branch: Option<String>,
-    #[serde(default)]
-    pub file_path: Option<String>,
-}
-
 /// 提交历史
 #[utoipa::path(
     get,
@@ -144,17 +130,6 @@ pub(crate) async fn log_history(
     Ok(Json(
         json!({ "success": true, "logId": log_id, "commits": commits, "total": total }),
     ))
-}
-
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FileContentBody {
-    #[serde(flatten)]
-    pub base: GitWriteBody,
-    /// nuwax 字段名 `ref` (Rust 关键字, 用 ref_ + serde rename)
-    #[serde(rename = "ref", default)]
-    pub ref_: Option<String>,
-    pub file_path: String,
 }
 
 /// 读取文件内容

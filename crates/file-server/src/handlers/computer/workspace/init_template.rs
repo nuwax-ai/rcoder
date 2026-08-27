@@ -8,6 +8,7 @@ use super::super::{file_field, text_field, ws_path};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
+use crate::models::InitProjectTemplateForm;
 use crate::service::temp_file::TemporaryFile;
 use crate::service::zip;
 
@@ -44,17 +45,6 @@ impl InitTemplateFields {
                 .ok_or_else(|| AppError::system("template zip missing after garde validation"))?,
         })
     }
-}
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct InitProjectTemplateForm {
-    pub user_id: String,
-    pub c_id: String,
-    #[schema(format = Binary)]
-    pub file: String,
-    pub enable_git: Option<bool>,
 }
 
 /// 初始化项目模板

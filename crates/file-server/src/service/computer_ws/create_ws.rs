@@ -6,16 +6,10 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use crate::error::AppResult;
+use crate::models::SkillFailure;
 
 use super::DYNAMIC_ADD_LOCK;
 use super::helpers::{find_dir, move_dir};
-
-/// 单个 skill URL 推送失败 (best-effort 语义下收集, 透传给调用方)。
-#[derive(serde::Serialize, utoipa::ToSchema)]
-pub struct SkillFailure {
-    pub url: String,
-    pub error: String,
-}
 
 pub struct CreateWorkspaceResult {
     pub message: String,

@@ -9,6 +9,9 @@ use super::{ctx_from, file_field, text_field, validate_zip_ext};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
+use crate::models::{
+    UploadAttachmentForm, UploadBatchFilesForm, UploadProjectForm, UploadSingleFileForm,
+};
 use crate::service::temp_file::TemporaryFile;
 use crate::service::{project as project_service, upload as upload_service};
 
@@ -50,62 +53,6 @@ struct UploadProjectFields {
     code_version: Option<String>,
     #[garde(required)]
     data: Option<TemporaryFile>,
-}
-
-// ── OpenAPI multipart schema (仅文档用) ──────────────────────────────────────────
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UploadSingleFileForm {
-    pub project_id: String,
-    pub code_version: String,
-    pub file_path: String,
-    #[schema(format = Binary)]
-    pub file: String,
-    pub tenant_id: Option<String>,
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
-}
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UploadBatchFilesForm {
-    pub project_id: String,
-    pub code_version: String,
-    pub file_paths: Vec<String>,
-    pub files: Vec<crate::openapi::BinaryFile>,
-    pub tenant_id: Option<String>,
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
-}
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UploadAttachmentForm {
-    pub project_id: String,
-    pub file_name: Option<String>,
-    #[schema(format = Binary)]
-    pub file: String,
-    pub tenant_id: Option<String>,
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
-}
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UploadProjectForm {
-    pub project_id: String,
-    pub code_version: String,
-    #[schema(format = Binary)]
-    pub file: String,
-    pub pid: Option<String>,
-    pub tenant_id: Option<String>,
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
 }
 
 // ── upload-single-file (multipart) ───────────────────────────────────────────────

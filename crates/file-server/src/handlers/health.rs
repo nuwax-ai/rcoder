@@ -9,10 +9,9 @@
 use axum::Json;
 use axum::extract::State;
 use axum::response::Html;
-use serde::Serialize;
-use utoipa::ToSchema;
 
 use crate::AppState;
+use crate::models::{HealthResponse, MemoryUsage, VersionResponse};
 
 /// 根路径探测（兼容 nuwax）
 #[utoipa::path(
@@ -23,29 +22,6 @@ use crate::AppState;
 )]
 pub async fn root() -> Html<&'static str> {
     Html("Hello")
-}
-
-#[derive(Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct HealthResponse {
-    pub status: String,
-    pub timestamp: i64,
-    pub uptime: u64,
-    pub version: String,
-    pub platform: String,
-    pub node_version: String,
-    pub pid: u32,
-    pub memory: MemoryUsage,
-    pub env: String,
-}
-
-#[derive(Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct MemoryUsage {
-    pub rss: f64,
-    pub heap_used: f64,
-    pub heap_total: f64,
-    pub external: f64,
 }
 
 /// 健康检查
@@ -87,13 +63,6 @@ pub async fn version() -> Json<VersionResponse> {
         success: true,
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
-}
-
-/// `/api/version` 响应 (对齐 TS `{ success: true, version }`)。
-#[derive(serde::Serialize, utoipa::ToSchema)]
-pub struct VersionResponse {
-    pub success: bool,
-    pub version: String,
 }
 
 /// 当前 epoch 毫秒 (对齐 nuwax Date.now())。

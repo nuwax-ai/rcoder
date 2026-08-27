@@ -8,6 +8,7 @@ use super::{ctx_from, file_field, text_field};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
+use crate::models::PushProjectSkillsForm;
 use crate::service::skills as skills_service;
 
 /// project_id 必填 (multipart 提取后构造 + garde 校验)。
@@ -23,19 +24,6 @@ fn require_project_id(project_id: Option<String>) -> Result<String, AppError> {
     f.validate().map_err(crate::error::from_garde)?;
     f.project_id
         .ok_or_else(|| AppError::system("project_id missing after garde validation"))
-}
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PushProjectSkillsForm {
-    pub project_id: String,
-    #[schema(format = Binary)]
-    pub file: Option<String>,
-    pub skill_urls: Option<Vec<String>>,
-    pub tenant_id: Option<String>,
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
 }
 
 /// 技能推送到工作区

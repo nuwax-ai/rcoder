@@ -12,7 +12,7 @@ mod helpers;
 mod import_ws;
 
 pub use agent_store_ws::{CreateAgentStoreParams, create_workspace_with_agent_store};
-pub use create_ws::{CreateWorkspaceResult, SkillFailure, create_workspace};
+pub use create_ws::{CreateWorkspaceResult, create_workspace};
 pub use helpers::remove_top_level_dir;
 pub use import_ws::{ImportResult, import_project};
 

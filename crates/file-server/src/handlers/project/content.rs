@@ -4,35 +4,15 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use garde::Validate;
-use serde::Deserialize;
 use serde_json::json;
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
+use crate::models::{GetByVersionParams, GetContentParams};
 use crate::response;
 use crate::service::{tree, version as version_service};
 use crate::workspace::ProjectContext;
-
-#[derive(Deserialize, Validate, utoipa::IntoParams)]
-#[garde(allow_unvalidated)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct GetContentParams {
-    /// 项目 ID
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub project_id: String,
-    /// 框架探测命令 (可选；前端框架识别失败时兜底执行的自定义命令)
-    pub command: Option<String>,
-    /// 代理子路径 (可选；透传给框架探测的环境信息)
-    pub proxy_path: Option<String>,
-    /// 租户 ID（多租户隔离；本地部署可缺省）
-    pub tenant_id: Option<String>,
-    /// 空间 ID（多租户隔离；本地部署可缺省）
-    pub space_id: Option<String>,
-    /// 隔离类型（多租户隔离；本地部署可缺省）
-    pub isolation_type: Option<String>,
-}
 
 /// 获取项目内容
 #[utoipa::path(
@@ -91,33 +71,6 @@ pub(crate) async fn get_project_content(
         )
             .into_response(),
     }
-}
-
-#[derive(Deserialize, Validate, utoipa::IntoParams)]
-#[garde(allow_unvalidated)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct GetByVersionParams {
-    /// 项目 ID
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub project_id: String,
-    /// 代码版本号（code_version 仓库的版本标签）
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub code_version: String,
-    /// 代理子路径 (可选；透传给框架探测的环境信息)
-    pub proxy_path: Option<String>,
-    /// 框架探测命令 (可选；前端框架识别失败时兜底执行的自定义命令)
-    #[serde(default)]
-    pub command: Option<String>,
-    /// 租户 ID（多租户隔离；本地部署可缺省）
-    #[serde(default)]
-    pub tenant_id: Option<String>,
-    /// 空间 ID（多租户隔离；本地部署可缺省）
-    #[serde(default)]
-    pub space_id: Option<String>,
-    /// 隔离类型（多租户隔离；本地部署可缺省）
-    #[serde(default)]
-    pub isolation_type: Option<String>,
 }
 
 /// 按版本获取项目内容

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use super::port_pool::PortPool;
 use crate::Config;
+use crate::models::KilledPid;
 
 /// 探活回调：(port, base_path, timeout_ms) → boxed future<bool>。
 /// 抽成类型别名既绕开 clippy::type_complexity，也方便测试注入 stub（绕开 reqwest 延迟）。
@@ -45,14 +46,6 @@ pub struct StartedDev {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StoppedDev {
     pub killed_pids: Vec<KilledPid>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
-pub struct KilledPid {
-    /// 被杀进程 PID
-    pub pid: u32,
-    /// 是否杀灭成功
-    pub killed: bool,
 }
 
 /// keep-alive 结果。

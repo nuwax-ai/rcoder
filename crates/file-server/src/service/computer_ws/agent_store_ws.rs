@@ -7,8 +7,9 @@ use tokio::fs;
 
 use crate::error::AppResult;
 
-use super::create_ws::{CreateWorkspaceResult, SkillFailure};
+use super::create_ws::CreateWorkspaceResult;
 use super::helpers::find_dir;
+use crate::models::SkillFailure;
 
 /// create_workspace_with_agent_store 参数 (避免 too_many_arguments)。
 pub struct CreateAgentStoreParams<'a> {

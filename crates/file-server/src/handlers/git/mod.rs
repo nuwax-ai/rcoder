@@ -3,45 +3,22 @@
 //! 拆分: [`read`] (branches / tags / log / file-content / status) / [`write`]
 //! (init / add / commit / unstage / discard / diff / reset / checkout / revert) /
 //! [`refs`] (branch-create / branch-delete / branch-switch / tag-create / tag-delete)。
-//! 本 mod.rs 提供共享 base 结构 (GitQuery / GitWriteBody) + 路径解析 helper。
+//! 本 mod.rs 提供共享路径解析 helper；共享 base 结构 (GitQuery / GitWriteBody)
+//! 定义在 [`crate::models`]。
 
 use std::path::PathBuf;
 
 use crate::AppState;
 use crate::error::AppError;
+use crate::models::{GitQuery, GitWriteBody};
 use crate::service::git;
 use crate::workspace::{ComputerContext, ProjectContext};
-use serde::Deserialize;
 
 pub(crate) mod read;
 pub(crate) mod refs;
 pub(crate) mod write;
 
 // ── 共享 base 结构 + 路径解析 (子模块经 super:: 访问) ─────────────────────────────
-
-/// GET 路由公共查询 (workspaceType + project/computer 标识 + 多租户)。
-#[derive(Deserialize, utoipa::IntoParams, utoipa::ToSchema)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct GitQuery {
-    /// 工作区类型: `project`(项目工作区) / `computer`(Electron 容器根) 二选一
-    pub workspace_type: Option<String>,
-    /// 项目 ID（workspaceType=project 时必填）
-    pub project_id: Option<String>,
-    /// 用户 ID（workspaceType=computer 时必填）
-    pub user_id: Option<String>,
-    /// 容器/实例 ID（workspaceType=computer 时必填）
-    pub c_id: Option<String>,
-    /// 租户 ID（多租户隔离；本地部署可缺省）
-    #[serde(default)]
-    pub tenant_id: Option<String>,
-    /// 空间 ID（多租户隔离；本地部署可缺省）
-    #[serde(default)]
-    pub space_id: Option<String>,
-    /// 隔离类型（多租户隔离；本地部署可缺省）
-    #[serde(default)]
-    pub isolation_type: Option<String>,
-}
 
 fn project_ctx(q: &GitQuery) -> Option<ProjectContext> {
     Some(ProjectContext {
@@ -69,40 +46,6 @@ pub(super) async fn resolve(q: &GitQuery, state: &AppState) -> Result<(PathBuf, 
     )
     .await?;
     Ok((target.path().to_path_buf(), target.log_id()))
-}
-
-/// POST 路由公共 body (写操作基类, 被 FilesBody / CommitBody 等经 serde flatten 复用)。
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct GitWriteBody {
-    pub workspace_type: String,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub project_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub user_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub c_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub space_id: Option<String>,
-    #[serde(default)]
-    pub isolation_type: Option<String>,
 }
 
 /// POST 路由解析: GitWriteBody → (workspace path, logId)。

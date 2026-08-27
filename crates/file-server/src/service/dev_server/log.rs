@@ -10,6 +10,7 @@ use chrono::Local;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::error::{AppError, AppResult};
+use crate::models::{LogLine, ReadDevLogResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogFileSnapshot {
@@ -132,13 +133,6 @@ where
     })
 }
 
-/// 一行日志 (对齐 nuwax getDevLog 响应)。
-#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
-pub struct LogLine {
-    pub line: usize,
-    pub content: String,
-}
-
 /// 读 dev 日志 (对齐 nuwax getDevLog)。
 /// - log_type="main": 当日 `dev-YYYY-MM-DD.log`
 /// - log_type="temp" (默认): 最新 `dev-temp-*.log` (按文件名时间戳降序)
@@ -209,18 +203,6 @@ pub async fn snapshot_dev_log(dir: &Path, log_type: &str) -> AppResult<Option<Lo
         size_bytes: metadata.len(),
         modified,
     }))
-}
-
-#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
-pub struct ReadDevLogResult {
-    /// 日志行列表（含行号，snake_case wire）
-    pub logs: Vec<LogLine>,
-    /// 该日志文件总行数（分页导航：start_index 超过它表示读完）
-    pub total_lines: usize,
-    /// 本批起始行号（1-based）
-    pub start_index: usize,
-    /// 实际读取的日志文件名（按日期滚动的当前文件）
-    pub log_file_name: String,
 }
 
 pub fn slice_log_result(full: &ReadDevLogResult, start_index: usize) -> ReadDevLogResult {

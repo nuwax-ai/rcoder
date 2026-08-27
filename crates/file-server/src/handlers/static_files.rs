@@ -64,7 +64,7 @@ pub(crate) struct CustomTargetQuery {
 直连 60000 场景）；`index.html` 目录补全由 rest 显式给出。
 "#,
     responses(
-        (status = 200, description = "Static file", body = crate::openapi::BinaryFile, content_type = "application/octet-stream"),
+        (status = 200, description = "Static file", body = crate::models::BinaryFile, content_type = "application/octet-stream"),
         (status = 404, description = "File not found")
     ),
     tag = "Static"
@@ -115,7 +115,7 @@ pub(crate) async fn serve_page(
 static 一致：二进制原样 + CORS，404 = 路径不存在或越界。
 "#,
     responses(
-        (status = 200, description = "Static file", body = crate::openapi::BinaryFile, content_type = "application/octet-stream"),
+        (status = 200, description = "Static file", body = crate::models::BinaryFile, content_type = "application/octet-stream"),
         (status = 404, description = "File not found")
     ),
     tag = "Static"

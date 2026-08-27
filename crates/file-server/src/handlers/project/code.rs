@@ -2,38 +2,14 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde::Deserialize;
 use serde_json::json;
 
 use super::ctx_from;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
+use crate::models::{AllFilesBody, SpecifiedBody};
 use crate::service::code as code_service;
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SpecifiedBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub project_id: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub code_version: String,
-    pub files: Vec<code_service::FileOp>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub space_id: Option<String>,
-    #[serde(default)]
-    pub isolation_type: Option<String>,
-}
 
 /// 项目文件增量更新
 ///
@@ -73,36 +49,6 @@ pub(crate) async fn specified_files_update(
         "projectId": result.project_id,
         "filesCount": result.files_count,
     })))
-}
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AllFilesBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub project_id: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
-    pub code_version: String,
-    pub files: Vec<code_service::FileEntry>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub space_id: Option<String>,
-    #[serde(default)]
-    pub isolation_type: Option<String>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub base_path: Option<String>, // nuwax 接收但未使用
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub pid: Option<String>,
 }
 
 /// 项目文件全量更新

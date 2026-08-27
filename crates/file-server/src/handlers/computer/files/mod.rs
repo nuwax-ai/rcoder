@@ -11,23 +11,14 @@ pub mod upload;
 use std::path::Path;
 
 use axum::extract::State;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{resolve_computer_target, ws_path};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
+use crate::models::{DeleteWorkspaceBody, FileOp, FilesUpdateBody};
 use crate::service::code as code_service;
-
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DeleteWorkspaceBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    user_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    c_id: String,
-}
 
 // ── delete-workspace ────────────────────────────────────────────────────────────
 
@@ -50,18 +41,6 @@ pub(crate) async fn delete_workspace(
 }
 
 // ── files-update ────────────────────────────────────────────────────────────────
-
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FilesUpdateBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    pub(crate) user_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    pub(crate) c_id: String,
-    pub(crate) files: Vec<code_service::FileOp>,
-    #[serde(default)]
-    pub(crate) custom_target_dir: Option<String>,
-}
 
 /// 工作区文件增量更新
 ///
@@ -89,10 +68,7 @@ pub(crate) async fn files_update(
 }
 
 /// files-update 的 workspace 无关实现：返回写入的文件数（展示/回显归各域壳层）。
-pub async fn files_update_impl(
-    ws: &Path,
-    mut files: Vec<code_service::FileOp>,
-) -> Result<usize, AppError> {
+pub async fn files_update_impl(ws: &Path, mut files: Vec<FileOp>) -> Result<usize, AppError> {
     // 工作区不存在 → 创建 (对齐 nuwax computerFileUtils.updateFiles: !existsSync → mkdirSync recursive)。
     // 首次向全新 user/cId 工作区写入不应失败。
     tokio::fs::create_dir_all(ws).await?;
