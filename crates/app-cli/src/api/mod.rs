@@ -535,7 +535,7 @@ mod tests {
         assert_eq!(body["success"], true);
     }
 
-    /// proxy/status idle 信封：data.mode=idle、releaseId=null。
+    /// proxy/status idle 信封：data.mode=idle、release_id=null。
     #[tokio::test]
     async fn proxy_status_idle_envelope() {
         let state = test_state();
@@ -543,7 +543,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["code"], "0000");
         assert_eq!(body["data"]["mode"], "idle");
-        assert_eq!(body["data"]["releaseId"], serde_json::Value::Null);
+        assert_eq!(body["data"]["release_id"], serde_json::Value::Null);
     }
 
     /// proxy/validate idle 错误信封：PINGAP_CONFIG_INVALID + data=null。

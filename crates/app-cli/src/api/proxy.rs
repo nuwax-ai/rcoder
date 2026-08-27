@@ -16,11 +16,10 @@ use super::AppState;
 use super::envelope;
 use super::envelope::HttpResult;
 
-// ── 响应 data DTO（信封载荷；camelCase 与既有调用面保持） ─────────────────────
+// ── 响应 data DTO（信封载荷；字段 snake_case，与主仓 userApp Java 契约统一）────
 
 /// `POST /v1/proxy/validate` 响应 data。
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(super) struct ProxyValidateData {
     /// 配置校验结果（恒 true——无效走错误信封）
     pub valid: bool,
@@ -30,7 +29,6 @@ pub(super) struct ProxyValidateData {
 
 /// `POST /v1/proxy/reload` 响应 data。
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(super) struct ProxyReloadData {
     /// 是否已写入生效配置
     pub reloaded: bool,
@@ -46,7 +44,6 @@ pub(super) struct ProxyReloadData {
 
 /// `GET /v1/proxy/status` 响应 data。
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(super) struct ProxyStatusData {
     /// 当前 release ID（idle 态为 null）
     pub release_id: Option<String>,
@@ -64,7 +61,6 @@ pub(super) struct ProxyStatusData {
 
 /// upstream 条目（`GET /v1/proxy/upstreams` data）。
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(super) struct ProxyUpstream {
     /// 服务 ID
     pub service_id: String,
@@ -76,7 +72,6 @@ pub(super) struct ProxyUpstream {
 
 /// `GET /v1/proxy/upstreams` 响应 data。
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(super) struct ProxyUpstreamsData {
     /// workspace 服务 → 回环 upstream 映射
     pub upstreams: Vec<ProxyUpstream>,
@@ -225,7 +220,7 @@ pub(super) async fn effective_config(
     let path = effective_path(&state);
     tokio::fs::read_to_string(&path)
         .await
-        .map(|content| Json(json!({"releaseId": state.server.boot_id(), "toml": content})))
+        .map(|content| Json(json!({"release_id": state.server.boot_id(), "toml": content})))
         .map_err(|error| {
             (
                 StatusCode::BAD_REQUEST,
