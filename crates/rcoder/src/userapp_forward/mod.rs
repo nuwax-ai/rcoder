@@ -198,13 +198,7 @@ pub(crate) async fn ensure_workspace_via_dev(
         let resp = crate::http_client::shared_client()
             .post(format!("{addr}/api/v1/userapp/ensure-workspace"))
             .timeout(std::time::Duration::from_secs(30))
-            // 双键过渡：新容器读 snake，存量容器（digest 烙印不换镜像）读 camel；
-            // 两侧 DTO 均无 deny_unknown_fields，多出的键被忽略——存量容器全量
-            // 代号后删 camel 键。
-            .json(&serde_json::json!({
-                "app_id": app_id, "appId": app_id,
-                "user_id": user_id, "userId": user_id,
-            }))
+            .json(&serde_json::json!({"app_id": app_id, "user_id": user_id}))
             .send()
             .await;
         match resp {

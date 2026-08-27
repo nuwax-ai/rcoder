@@ -7,9 +7,8 @@
 //! 开发容器 = `{ws}/{app_id}`（对称可用，虽然 app_manager 只对生产容器转发）。
 //!
 //! 与 userapp_files.rs（Java 15 镜像族）的区别：本族是 rcoder↔file-server 的内部
-//! 契约（字段直传、响应形状对齐 app_manager DTO），不经 Java。请求键 snake_case；
-//! appId/userId 双键兼容（serde alias + multipart 双臂）是过渡措施——存量容器
-//! digest 烙印不换镜像，rcoder 双写两键直到存量换代后清理。
+//! 契约（字段直传、响应形状对齐 app_manager DTO），不经 Java。请求键 snake_case
+//! 单键——本族为 userApp 专属新契约，未上线不做旧 camel 键兼容。
 
 use axum::Json;
 use axum::extract::{Multipart, Query, State};
@@ -29,7 +28,7 @@ use download_utils::{
 };
 use tokio_util::sync::CancellationToken;
 
-// ── 上传（multipart: app_id / target / flatten / file；appId/userId 双键过渡）─────
+// ── 上传（multipart: app_id / target / flatten / file）──────────────────────────
 
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(utoipa::ToSchema)]
@@ -67,9 +66,8 @@ pub(crate) async fn upload(
         .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
     {
         match field.name().unwrap_or("") {
-            // 双键过渡：新 rcoder 发 snake，旧容器/新容器互通期间 camel 别名保留
-            "app_id" | "appId" => app_id = Some(text_field(field).await?),
-            "user_id" | "userId" => user_id = Some(text_field(field).await?),
+            "app_id" => app_id = Some(text_field(field).await?),
+            "user_id" => user_id = Some(text_field(field).await?),
             "target" => target = Some(text_field(field).await?),
             "flatten" => flatten = matches!(text_field(field).await?.trim(), "true" | "1" | "yes"),
             "file" => {
@@ -189,12 +187,11 @@ pub struct AppFilesUploadFromUrlBody {
     /// 压缩包解压后单层归一（默认 false）
     #[serde(default)]
     pub flatten: bool,
-    /// UserApp 应用 ID（定位）。camel 别名为旧 rcoder 过渡兼容，存量容器换代后清理。
-    #[serde(alias = "appId")]
+    /// UserApp 应用 ID（定位）。
     pub app_id: String,
     /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带；9252a29 曾改必填造成
-    /// rcoder 转发 422 断链，回退为可选审计字段）。camel 别名同上。
-    #[serde(default, alias = "userId")]
+    /// rcoder 转发 422 断链，回退为可选审计字段）。
+    #[serde(default)]
     pub user_id: Option<String>,
 }
 
@@ -246,11 +243,10 @@ pub(crate) async fn upload_from_url(
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct AppFilesListParams {
-    /// UserApp 应用 ID（定位）。camel 别名为旧 rcoder 过渡兼容，存量容器换代后清理。
-    #[serde(alias = "appId")]
+    /// UserApp 应用 ID（定位）。
     pub app_id: String,
-    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带）。camel 别名同上。
-    #[serde(default, alias = "userId")]
+    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带）。
+    #[serde(default)]
     pub user_id: Option<String>,
     /// app 根相对子目录（缺省列根）
     #[serde(default)]
@@ -332,11 +328,10 @@ pub(crate) async fn list(
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct AppFilesDeleteBody {
-    /// UserApp 应用 ID（定位）。camel 别名为旧 rcoder 过渡兼容，存量容器换代后清理。
-    #[serde(alias = "appId")]
+    /// UserApp 应用 ID（定位）。
     pub app_id: String,
-    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带）。camel 别名同上。
-    #[serde(default, alias = "userId")]
+    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带）。
+    #[serde(default)]
     pub user_id: Option<String>,
     /// app 根相对文件/目录
     pub path: String,
@@ -394,11 +389,10 @@ pub(crate) async fn delete(
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct AppFilesClearBody {
-    /// UserApp 应用 ID（定位）。camel 别名为旧 rcoder 过渡兼容。
-    #[serde(alias = "appId")]
+    /// UserApp 应用 ID（定位）。
     pub app_id: String,
-    /// 用户 ID（仅审计日志，可选）。camel 别名同上。
-    #[serde(default, alias = "userId")]
+    /// 用户 ID（仅审计日志，可选）。
+    #[serde(default)]
     pub user_id: Option<String>,
 }
 
