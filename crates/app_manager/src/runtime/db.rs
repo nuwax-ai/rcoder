@@ -65,6 +65,19 @@ impl AppService {
             &format!("[APP] reset_db_password failed app_id={app_id}"),
         )
         .await?;
+        // dbx 预置连接同步（best-effort）：重置目标即 local-pg 在用账号（超户），
+        // 恒同步；失败仅 warn——密码已生效，不阻断响应（与 userapp_forward 版同款）。
+        let runner = RuntimeExecRunner {
+            service: self,
+            app_id,
+        };
+        if let Err(e) =
+            shared_types::sync_dbx_after_password_change(&runner, None, &req.new_password).await
+        {
+            tracing::warn!(
+                "[APP] dbx connection sync failed (password already applied): app_id={app_id}: {e}"
+            );
+        }
         info!("[APP] PG password reset: {}", app_id);
         Ok(())
     }
@@ -215,20 +228,33 @@ impl AppService {
         Ok(r.stdout.trim() == "1")
     }
 
-    /// 校验 app 处于 Running 阶段（exec psql 的前置条件）。
+    /// 确保 app 处于运行状态（exec 类容器内操作的前置）。
     ///
-    /// Stopped/Starting 等给 InvalidState 友好错误而非让 exec 失败（exec 在 Stopped 时
-    /// 报容器不存在的 Backend 错误，对用户不友好）。reset_db_password / create_database 共用。
+    /// Stopped/ScaledDown 时**自动唤醒**（activity registry 的 single-flight
+    /// scale-up，hold-and-wait ≤ wake_timeout 默认 60s；与文件接口
+    /// `ops::files` 同款模式）——"有请求即唤醒"平台语义。Timeout（app 仍在
+    /// 后台启动，stopped 态保留下次可重试）/Failed(e) → InvalidState；随后
+    /// `get_app` 兜 404（ensure_running 对不存在的 app 恒 AlreadyRunning 幻报，
+    /// stopped 集合未命中不 scale）。
+    ///
+    /// reset_db_password / create_database / align_db_credentials 共用。
+    /// validate_app_id 由调用方先做（Fail Fast：参数校验在 runtime 调用前）。
     async fn ensure_app_running(&self, app_id: &str) -> AppResult<()> {
-        // validate_app_id 由调用方（reset_db_password/create_database）先做（Fail Fast：参数校验
-        // 在 K8s API 调用前，非法 app_id 不浪费 RTT）。此方法仅做 phase 检查（单一职责）。
-        let status = self.fetch_runtime_status_or_err(app_id).await?;
-        if status.phase != "Running" {
-            return Err(AppOperationError::InvalidState(format!(
-                "app {app_id} not running (phase={}), exec psql requires a live container",
-                status.phase
-            )));
+        use shared_types::AppWakeControl;
+        match self.activity.ensure_running(app_id).await {
+            shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
+            shared_types::WakeOutcome::Timeout => {
+                return Err(AppOperationError::InvalidState(format!(
+                    "app {app_id} wake timeout (still starting in background), retry later"
+                )));
+            }
+            shared_types::WakeOutcome::Failed(e) => {
+                return Err(AppOperationError::InvalidState(format!(
+                    "app {app_id} wake failed: {e}"
+                )));
+            }
         }
+        self.get_app(app_id).await?;
         Ok(())
     }
 
@@ -343,5 +369,117 @@ mod tests {
         assert!(!is_shell_safe_path_component(""));
         assert!(!is_shell_safe_path_component("."));
         assert!(!is_shell_safe_path_component(".."));
+    }
+
+    use crate::models::ResetDbPasswordRequest;
+    use crate::test_support::{MockRuntime, test_service};
+    use std::sync::Arc;
+
+    /// 预置 Running 并经平台 stop 路径停掉（scale0 + registry mark_stopped——
+    /// ensure_running 只感知"平台标记的 stopped"，外部直接改 deployment phase
+    /// 它不认）。
+    async fn stopped_via_platform(service: &AppService, runtime: &MockRuntime, app_id: &str) {
+        runtime.deployments.insert(
+            app_id.to_string(),
+            container_runtime_api::DeploymentStatus {
+                app_id: app_id.to_string(),
+                replicas: 1,
+                ready_replicas: 1,
+                phase: "Running".to_string(),
+                ..Default::default()
+            },
+        );
+        service.stop_app(app_id).await.expect("platform stop");
+        assert_eq!(runtime.deployments.get(app_id).unwrap().phase, "Stopped");
+    }
+
+    #[tokio::test]
+    async fn reset_db_password_wakes_stopped_app_and_syncs_dbx() {
+        let runtime = Arc::new(MockRuntime::default());
+        let service = test_service(
+            std::path::Path::new("/tmp/app-manager-test-ws"),
+            runtime.clone(),
+        );
+        service.activity.set_runtime(runtime.clone());
+        stopped_via_platform(&service, &runtime, "app-w1").await;
+
+        service
+            .reset_db_password(
+                "app-w1",
+                ResetDbPasswordRequest {
+                    new_password: "pw-new".to_string(),
+                },
+            )
+            .await
+            .expect("stopped app 应被自动唤醒后改密成功");
+
+        // 唤醒生效：scale(1) 后 phase=Running
+        assert_eq!(runtime.deployments.get("app-w1").unwrap().phase, "Running");
+
+        // exec 序列：先 ALTER USER（trust 改密），后 dbx 同步（重写 connections.json
+        // + supervisorctl restart dbx）
+        let calls = runtime.exec_calls.get("app-w1").unwrap().clone();
+        assert!(calls.len() >= 2, "expect alter + dbx sync, got: {calls:?}");
+        assert!(
+            calls[0].contains("ALTER USER CURRENT_USER"),
+            "got: {:?}",
+            calls[0]
+        );
+        assert!(
+            calls[1].contains("connections.json") && calls[1].contains("supervisorctl"),
+            "dbx 同步命令应紧随改密, got: {:?}",
+            calls[1]
+        );
+        // 密码不落 exec 记录之外的日志不可断言,但命令本身含密码属预期(容器内执行)
+    }
+
+    #[tokio::test]
+    async fn reset_db_password_wake_failed_reports_invalid_state() {
+        let runtime = Arc::new(MockRuntime::default());
+        let service = test_service(
+            std::path::Path::new("/tmp/app-manager-test-ws"),
+            runtime.clone(),
+        );
+        service.activity.set_runtime(runtime.clone());
+        stopped_via_platform(&service, &runtime, "app-w2").await;
+        runtime
+            .crash_on_start
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = service
+            .reset_db_password(
+                "app-w2",
+                ResetDbPasswordRequest {
+                    new_password: "pw".to_string(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppOperationError::InvalidState(ref m) if m.contains("wake failed")),
+            "唤醒失败(启动即 Error)应报 InvalidState, got: {err}"
+        );
+        // 改密与 dbx 同步均未执行
+        assert!(runtime.exec_calls.get("app-w2").is_none());
+    }
+
+    #[tokio::test]
+    async fn reset_db_password_missing_app_reports_not_found() {
+        let runtime = Arc::new(MockRuntime::default());
+        let service = test_service(std::path::Path::new("/tmp/app-manager-test-ws"), runtime);
+        // 不预置 deployment：ensure_running 幻报 AlreadyRunning 后由 get_app 兜 404
+        let err = service
+            .reset_db_password(
+                "app-missing",
+                ResetDbPasswordRequest {
+                    new_password: "pw".to_string(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppOperationError::NotFound(_)),
+            "不存在的 app 应 404 语义, got: {err}"
+        );
     }
 }

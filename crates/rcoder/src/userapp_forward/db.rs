@@ -20,7 +20,7 @@ use tracing::info;
 use shared_types::PgCommandRunner as _;
 
 use crate::router::AppState;
-use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder};
+use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder_probed};
 use crate::{AppError, HttpResult};
 
 /// 目标环境路径段。
@@ -117,8 +117,9 @@ pub(crate) async fn align_credentials(
 
     let outcome = match env {
         DbEnv::Dev => {
-            // 开发容器：ensure（幂等）+ ensure-workspace（execute-command 的 cwd 前置）
-            let info = ensure_userapp_builder(&state, &body.app_id)
+            // 开发容器：ensure（幂等 + 探活自愈，stopped/exited builder 自动重建）
+            // + ensure-workspace（execute-command 的 cwd 前置）
+            let (info, _recreated) = ensure_userapp_builder_probed(&state, &body.app_id)
                 .await
                 .map_err(|e| {
                     tracing::error!(
@@ -220,10 +221,12 @@ impl shared_types::PgCommandRunner for ExecRunner<'_> {
     }
 }
 
-/// 解析 exec 目标并做存在性/就绪校验：
-/// - dev：`ensure_userapp_builder`（幂等，与 align 同款——容器不在则创建）
-/// - prod：`get_app` 存在性校验（**不自动唤醒**——stopped 的 app 由 exec 失败
-///   显式报错，Java 需先 ensure；与 pod ensure prod 的 get_app 前置同款语义）
+/// 解析 exec 目标并做存在性/就绪校验（"有请求即唤醒"平台语义）：
+/// - dev：`ensure_userapp_builder_probed`（幂等 + 探活自愈——注册缓存指向
+///   stopped/exited 的 Docker builder 时自动重建；pod ensure dev 同款）
+/// - prod：`get_app` 前置（防 ensure_running 对不存在 app 的 AlreadyRunning
+///   幻报）→ `activity.ensure_running` 自动唤醒（single-flight scale-up，
+///   hold-and-wait ≤ wake_timeout 默认 60s；与文件透传/pod ensure prod 同款）
 async fn resolve_exec_target(
     state: &AppState,
     env: DbEnv,
@@ -231,7 +234,7 @@ async fn resolve_exec_target(
 ) -> Result<String, AppError> {
     match env {
         DbEnv::Dev => {
-            let info = ensure_userapp_builder(state, app_id)
+            let (info, _recreated) = ensure_userapp_builder_probed(state, app_id)
                 .await
                 .map_err(|e| {
                     tracing::error!(
@@ -250,6 +253,17 @@ async fn resolve_exec_target(
                 return Err(AppError::not_found(&format!(
                     "userapp prod app not found: {e:#}"
                 )));
+            }
+            use shared_types::AppWakeControl;
+            match state.activity.ensure_running(app_id).await {
+                shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
+                shared_types::WakeOutcome::Timeout | shared_types::WakeOutcome::Failed(_) => {
+                    tracing::error!("[USERAPP_DB_ADMIN] prod app wake failed: app_id={app_id}");
+                    return Err(AppError::with_message(
+                        shared_types::error_codes::ERR_CONTAINER_ERROR,
+                        "userapp prod app wake failed or timeout (still starting), retry later",
+                    ));
+                }
             }
             Ok(app_id.to_string())
         }
