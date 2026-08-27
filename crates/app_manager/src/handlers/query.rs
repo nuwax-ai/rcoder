@@ -21,6 +21,14 @@ use crate::models::{HealthInfo, ResourceStats};
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),
+    description = r#"
+轻量探活面：返回运行时状态派生的健康快照（`AppRuntimeInfo.health` 同构——
+phase、就绪探针结果、实例 IP 等），适合轮询面板 / 网关前置检查。
+
+- 不深入容器内探活；容器内服务的深检查由 app-cli :3010 `/health` 承担
+  （经日志/代理面访问）；
+- 应用不存在 → 404。
+"#,
     responses(
         (status = 200, description = "查询成功", body = HttpResult<HealthInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)

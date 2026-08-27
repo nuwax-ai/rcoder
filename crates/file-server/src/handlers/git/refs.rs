@@ -63,7 +63,10 @@ pub(crate) struct TagNameBody {
 }
 
 /// 创建分支
-#[utoipa::path(post, path = "/branch-create", request_body = BranchCreateBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+#[utoipa::path(post, path = "/branch-create", request_body = BranchCreateBody, description = r#"
+从当前 HEAD 创建新分支。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn branch_create(
     State(state): State<AppState>,
     Json(body): Json<BranchCreateBody>,
@@ -89,7 +92,10 @@ pub(crate) async fn branch_create(
 }
 
 /// 删除分支
-#[utoipa::path(post, path = "/branch-delete", request_body = BranchNameBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+#[utoipa::path(post, path = "/branch-delete", request_body = BranchNameBody, description = r#"
+删除指定分支（当前检出分支拒绝删除）。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn branch_delete(
     State(state): State<AppState>,
     Json(body): Json<BranchNameBody>,
@@ -116,7 +122,10 @@ pub(crate) async fn branch_delete(
 }
 
 /// 创建标签
-#[utoipa::path(post, path = "/tag-create", request_body = TagCreateBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+#[utoipa::path(post, path = "/tag-create", request_body = TagCreateBody, description = r#"
+在指定/当前 commit 上打标签（轻量版本标记）。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn tag_create(
     State(state): State<AppState>,
     Json(body): Json<TagCreateBody>,
@@ -143,7 +152,10 @@ pub(crate) async fn tag_create(
 }
 
 /// 删除标签
-#[utoipa::path(post, path = "/tag-delete", request_body = TagNameBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+#[utoipa::path(post, path = "/tag-delete", request_body = TagNameBody, description = r#"
+删除指定标签。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn tag_delete(
     State(state): State<AppState>,
     Json(body): Json<TagNameBody>,
@@ -168,7 +180,10 @@ pub(crate) async fn tag_delete(
 /// 切换分支
 ///
 /// 对齐 nuwax switchBranch; 切到已存在分支。
-#[utoipa::path(post, path = "/branch-switch", request_body = BranchNameBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+#[utoipa::path(post, path = "/branch-switch", request_body = BranchNameBody, description = r#"
+切换当前检出到指定分支（工作区未提交改动可能阻止切换）。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn branch_switch(
     State(state): State<AppState>,
     Json(body): Json<BranchNameBody>,

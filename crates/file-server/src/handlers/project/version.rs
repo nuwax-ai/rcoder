@@ -38,7 +38,10 @@ pub(crate) struct BackupVersionBody {
 }
 
 /// 备份当前版本
-#[utoipa::path(post, path = "/backup-current-version", request_body = BackupVersionBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
+#[utoipa::path(post, path = "/backup-current-version", request_body = BackupVersionBody, description = r#"
+将当前项目状态备份为一个版本快照（记录 logId/时间戳），供 rollback-version 回退目标。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn backup_current_version(
     State(state): State<AppState>,
     Json(body): Json<BackupVersionBody>,
@@ -96,7 +99,10 @@ pub(crate) struct RollbackBody {
 }
 
 /// 回滚版本
-#[utoipa::path(post, path = "/rollback-version", request_body = RollbackBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
+#[utoipa::path(post, path = "/rollback-version", request_body = RollbackBody, description = r#"
+回滚项目到指定版本快照（覆盖当前内容；当前态建议先 backup 再回滚）。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn rollback_version(
     State(state): State<AppState>,
     Json(body): Json<RollbackBody>,

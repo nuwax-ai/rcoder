@@ -108,7 +108,10 @@ pub(crate) struct AllFilesBody {
 /// 项目文件全量更新
 ///
 /// 全量覆盖 + 清理缺失。
-#[utoipa::path(post, path = "/all-files-update", request_body = AllFilesBody, responses(crate::openapi::JsonApiResponses), tag = "Code")]
+#[utoipa::path(post, path = "/all-files-update", request_body = AllFilesBody, description = r#"
+**全量覆盖**语义：以上传的文件集替换项目对应范围，并清理未被覆盖的缺失文件——保证远端与本地一致（区别于 specified-files-update 的定点更新）。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Code")]
 pub(crate) async fn all_files_update(
     State(state): State<AppState>,
     Json(mut body): Json<AllFilesBody>,

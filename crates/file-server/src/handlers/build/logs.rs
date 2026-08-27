@@ -86,10 +86,14 @@ fn default_log_type() -> String {
 
 /// 读取开发日志
 ///
-/// 对齐 nuwax get-dev-log。
 #[utoipa::path(
     get,
     path = "/get-dev-log",
+    description = r#"
+分页读取开发服务器输出日志：`startIndex` 翻页（1 起）；`logType` 区分
+`temp`（运行输出，默认）/ `app`（应用自定义日志）。配合 keep-alive 心跳后的
+内容增长做增量拉取。
+"#,
     params(DevLogQuery),
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"

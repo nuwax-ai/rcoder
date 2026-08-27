@@ -58,6 +58,11 @@ pub(crate) struct CustomTargetQuery {
         ("project_id" = String, Path, description = "Project identifier"),
         ("rest" = String, Path, description = "Project-relative file path")
     ),
+    description = r#"
+以 HTTP 直读项目工作区内任意文件（构建产物预览、前端页面直挂场景）：
+按 `project_id` 定位项目根，`rest` 为根相对路径。带 CORS 头（浏览器跨源
+直连 60000 场景）；`index.html` 目录补全由 rest 显式给出。
+"#,
     responses(
         (status = 200, description = "Static file", body = crate::openapi::BinaryFile, content_type = "application/octet-stream"),
         (status = 404, description = "File not found")
@@ -104,6 +109,11 @@ pub(crate) async fn serve_page(
         ("rest" = String, Path, description = "Workspace-relative file path"),
         ("customTargetDir" = Option<String>, Query, description = "Override workspace root")
     ),
+    description = r#"
+以 HTTP 直读 computer 树（两级 `{root}/{user_id}/{cId}` Electron 全局根语义）
+内任意文件。`customTargetDir` 可覆盖根目录（默认 user/cid 推导）。同 page
+static 一致：二进制原样 + CORS，404 = 路径不存在或越界。
+"#,
     responses(
         (status = 200, description = "Static file", body = crate::openapi::BinaryFile, content_type = "application/octet-stream"),
         (status = 404, description = "File not found")

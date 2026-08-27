@@ -111,7 +111,10 @@ pub struct UploadProjectForm {
 // ── upload-single-file (multipart) ───────────────────────────────────────────────
 
 /// 单文件上传
-#[utoipa::path(post, path = "/upload-single-file", request_body(content = UploadSingleFileForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Code")]
+#[utoipa::path(post, path = "/upload-single-file", request_body(content = UploadSingleFileForm, content_type = "multipart/form-data"), description = r#"
+上传单个文件到项目内指定路径（multipart：file + 目标路径字段）。适合配置/小文件即时修改。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Code")]
 pub(crate) async fn upload_single_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -191,7 +194,10 @@ pub(crate) async fn upload_single_file(
 // ── upload-batch-files (multipart) ───────────────────────────────────────────────
 
 /// 批量文件上传
-#[utoipa::path(post, path = "/upload-batch-files", request_body(content = UploadBatchFilesForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Code")]
+#[utoipa::path(post, path = "/upload-batch-files", request_body(content = UploadBatchFilesForm, content_type = "multipart/form-data"), description = r#"
+批量上传多个文件（multipart 多 file 字段 + 各自相对路径），一次请求落盘多文件。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Code")]
 pub(crate) async fn upload_batch_files(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -270,7 +276,10 @@ pub(crate) async fn upload_batch_files(
 // ── upload-attachment-file (multipart) ───────────────────────────────────────────
 
 /// 附件上传
-#[utoipa::path(post, path = "/upload-attachment-file", request_body(content = UploadAttachmentForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Project")]
+#[utoipa::path(post, path = "/upload-attachment-file", request_body(content = UploadAttachmentForm, content_type = "multipart/form-data"), description = r#"
+上传附件类文件（对话附件/资源文件场景）；路径归属与校验规则见 Schema 字段说明。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn upload_attachment_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -356,7 +365,10 @@ pub(crate) async fn upload_attachment_file(
 /// 上传项目 zip 覆盖
 ///
 /// 上传 zip 覆盖项目。
-#[utoipa::path(post, path = "/upload-project", request_body(content = UploadProjectForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Project")]
+#[utoipa::path(post, path = "/upload-project", request_body(content = UploadProjectForm, content_type = "multipart/form-data"), description = r#"
+上传 zip 整包**覆盖**项目目录（自动解压；含 wrapper 目录剥除参数）。用于整版本替换导入——增量修改请走 single/batch 或 files-update。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn upload_project(
     State(state): State<AppState>,
     mut multipart: Multipart,

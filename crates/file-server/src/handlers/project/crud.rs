@@ -41,6 +41,9 @@ pub(crate) struct DeleteParams {
     get,
     path = "/delete-project",
     params(DeleteParams),
+    description = r#"
+删除整个项目目录（含停止其 dev server 前置动作）。**不可逆**：code/data/logs 一并移除；只删单文件用 files-update/delete 面。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Project"
 )]
@@ -111,7 +114,10 @@ pub(crate) struct CreateProjectBody {
 }
 
 /// 创建项目
-#[utoipa::path(post, path = "/create-project", request_body = CreateProjectBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
+#[utoipa::path(post, path = "/create-project", request_body = CreateProjectBody, description = r#"
+创建项目骨架：在工作区建立 `{projectId}` 目录结构（app 根相对）。**注意是 GET 形态**——沿用 TS 契约，projectId 走 query。成功后即可用文件族接口写入内容或 upload-project 整包导入。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn create_project(
     State(state): State<AppState>,
     Json(body): Json<CreateProjectBody>,
@@ -185,7 +191,10 @@ pub(crate) struct CopyProjectBody {
 /// 复制项目
 ///
 /// 源/目标各自隔离上下文, 缺省回退公共字段。
-#[utoipa::path(post, path = "/copy-project", request_body = CopyProjectBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
+#[utoipa::path(post, path = "/copy-project", request_body = CopyProjectBody, description = r#"
+复制项目到新 projectId：源/目标各自取租户隔离上下文，字段缺省时逐级回退公共值。用于模板化克隆场景。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(crate) async fn copy_project(
     State(state): State<AppState>,
     Json(body): Json<CopyProjectBody>,

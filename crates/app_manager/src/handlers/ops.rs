@@ -54,6 +54,15 @@ pub async fn start_app(
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),
+    description = r#"
+把运行容器缩到 0 副本停止应用：**数据卷 / 元数据全部保留**，随时可 `start` 重启
+（区别于 delete 后的 storage 面）。
+
+- 停止后进入 stopped 集合；生产面流量与文件操作会按"有请求即唤醒"语义自动
+  scale 回 1（single-flight，唤醒窗口内返回 503+Retry-After）；
+- 与闲置回收协同：`recycle-policy` 到期也会触发同一 stop 路径；
+- 需要"彻底销毁"走 delete → （可选）storage/clear | destroy。
+"#,
     responses(
         (status = 200, description = "停止成功", body = HttpResult<AppRuntimeInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)

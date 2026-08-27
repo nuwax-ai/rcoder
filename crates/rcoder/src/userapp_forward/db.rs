@@ -23,29 +23,8 @@ use crate::router::AppState;
 use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder_probed};
 use crate::{AppError, HttpResult};
 
-/// 目标环境路径段。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DbEnv {
-    Dev,
-    Prod,
-}
-
-impl DbEnv {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "dev" => Some(Self::Dev),
-            "prod" => Some(Self::Prod),
-            _ => None,
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Dev => "dev",
-            Self::Prod => "prod",
-        }
-    }
-}
+/// 目标环境路径段（`shared_types::UserappEnv`——与文件/存储八接口的 `{env}` 共用词表与解析）。
+use shared_types::UserappEnv as DbEnv;
 
 /// 开发容器执行通道：容器内 file-server `execute-command`（cwd=workspace 须已存在，
 /// 故本 handler 前置幂等 ensure-workspace）。
@@ -103,7 +82,20 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
     ),
     tag = "UserApp · 数据库",
     operation_id = "align_userapp_db_credentials",
-    summary = "PG 凭据对齐"
+    summary = "PG 凭据对齐",
+    description = r#"
+校验目标容器内 PG 的账号密码与传入值是否一致（TCP scram 探测），不一致则用
+本地 trust 认证改密对齐并复验——**部署链 pg 凭据自动对齐的独立入口**。
+
+- 定位：body `app_id` + path `{env}`（dev=开发容器 / prod=运行容器）；
+- `username` 指定目标账号（缺省 superuser）；`password` 为期望值；
+- dev 环境：容器不存在时幂等 ensure 开发容器（builder）；
+- prod 环境：app 不存在 → 404；stopped 自动唤醒并等待 PG 就绪
+  （唤醒窗口约 60s，超时报 InvalidState 可重试）；
+- 幂等：密码已一致时零改动作直接成功。
+
+**密码不落日志**；结果 message 区分"已一致/已重置"。
+"#,
 )]
 pub(crate) async fn align_credentials(
     State(state): State<Arc<AppState>>,
@@ -342,7 +334,21 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
     ),
     tag = "UserApp · 数据库",
     operation_id = "userapp_db_reset_password",
-    summary = "重置/创建 PG 账号密码"
+    summary = "重置/创建 PG 账号密码",
+    description = r#"
+设置目标容器内 PG 的账号密码，两种语义：
+
+- **不带 username**：重置 superuser（SQL CURRENT_USER 语义，绕过"需要当前密码"
+  死锁——用户忘记 pgweb 密码时的正解）；
+- **带 username**：账号 upsert——角色存在则 ALTER USER 改密，不存在则 CREATE ROLE
+  建号后再设密。
+
+两者均 best-effort 同步 dbx 预置连接（重写 connections.json 并 restart dbx；
+指定业务账号且非 local-pg 在用账号时自动跳过），同步失败不阻断响应（密码已生效）。
+prod 环境目标容器 stopped 会自动唤醒并等待 PG 就绪。
+
+**密码只出现在 exec 命令内，日志零落盘**（仅记 app_id/env/username/结果）。
+"#,
 )]
 pub(crate) async fn reset_password(
     State(state): State<Arc<AppState>>,
@@ -450,7 +456,18 @@ pub(crate) async fn reset_password(
     ),
     tag = "UserApp · 数据库",
     operation_id = "userapp_db_create_database",
-    summary = "新建 PG 数据库"
+    summary = "新建 PG 数据库",
+    description = r#"
+在目标容器的 PG 里建库（API 化建库，Java/CI 自动化场景免手工 psql）：
+
+- 先查 `pg_database` 再 CREATE（check-then-act；409 已存在含并发竞态复检，
+  不靠 stderr 文本判定）；
+- `owner` 可选：库属主账号（须已存在）；缺省 = 执行者 superuser；
+- 标识符白名单校验 `[A-Za-z0-9_]`（app_id/database/owner 全过，防注入）；
+- prod 环境 stopped 自动唤醒并等待 PG 就绪。
+
+普通数据操作建议走 pgweb / 业务迁移脚本，本接口面向"建库"这一步编排。
+"#,
 )]
 pub(crate) async fn create_database(
     State(state): State<Arc<AppState>>,

@@ -15,6 +15,9 @@ use crate::service::git;
     get,
     path = "/branches",
     params(GitQuery),
+    description = r#"
+列 git 仓库全部分支及当前检出分支（`current=true` 标记）。用于分支切换器渲染与提交前校验。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Git"
 )]
@@ -54,6 +57,9 @@ pub(crate) async fn branches(
     get,
     path = "/tags",
     params(GitQuery),
+    description = r#"
+列仓库全部标签（轻量引用读取）。常用于版本选择下拉。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Git"
 )]
@@ -103,6 +109,9 @@ pub(crate) struct GitLogQuery {
         ("branch" = Option<String>, Query, description = "Branch or ref, defaults to HEAD"),
         ("filePath" = Option<String>, Query, description = "Filter history by file")
     ),
+    description = r#"
+查提交历史（hash、作者、时间、message 列表，倒序）。配合 diff/file-content 做追溯。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Git"
 )]
@@ -206,6 +215,9 @@ pub(crate) async fn file_content(
     get,
     path = "/status",
     params(GitQuery),
+    description = r#"
+查工作区状态：已修改/已暂存/未跟踪文件清单与当前分支——编辑器脏标记与提交面板的数据源。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Git"
 )]

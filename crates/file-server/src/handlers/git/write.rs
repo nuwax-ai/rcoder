@@ -40,7 +40,10 @@ pub(crate) struct CommitBody {
 }
 
 /// 初始化仓库
-#[utoipa::path(post, path = "/init", request_body = GitWriteBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+#[utoipa::path(post, path = "/init", request_body = GitWriteBody, description = r#"
+初始化 git 仓库（`git init` + 写入基础 .gitignore）。幂等：已是仓库则成功返回。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn init(
     State(state): State<AppState>,
     Json(body): Json<GitWriteBody>,
@@ -58,7 +61,10 @@ pub(crate) async fn init(
 }
 
 /// 暂存文件
-#[utoipa::path(post, path = "/add", request_body = FilesBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+#[utoipa::path(post, path = "/add", request_body = FilesBody, description = r#"
+暂存文件变更（加入 index）。body `files` 省略时等价 `git add -A`。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn add(
     State(state): State<AppState>,
     Json(body): Json<FilesBody>,
@@ -83,7 +89,10 @@ pub(crate) async fn add(
 }
 
 /// 提交
-#[utoipa::path(post, path = "/commit", request_body = CommitBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+#[utoipa::path(post, path = "/commit", request_body = CommitBody, description = r#"
+提交暂存区变更：`message` 必填；可选限定 `files` 集合与 `authorName/authorEmail` 覆盖。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn commit(
     State(state): State<AppState>,
     Json(body): Json<CommitBody>,
@@ -132,7 +141,10 @@ pub(crate) async fn commit(
 }
 
 /// 取消暂存
-#[utoipa::path(post, path = "/unstage", request_body = FilesBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+#[utoipa::path(post, path = "/unstage", request_body = FilesBody, description = r#"
+取消暂存（index → 工作区回退），保留文件内容改动。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn unstage(
     State(state): State<AppState>,
     Json(body): Json<FilesBody>,
@@ -165,7 +177,10 @@ pub(crate) async fn unstage(
 }
 
 /// 丢弃改动
-#[utoipa::path(post, path = "/discard", request_body = FilesBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+#[utoipa::path(post, path = "/discard", request_body = FilesBody, description = r#"
+**丢弃**指定文件的工作区改动（不可恢复——未提交内容将丢失），慎用。
+"#,
+    responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(crate) async fn discard(
     State(state): State<AppState>,
     Json(body): Json<FilesBody>,

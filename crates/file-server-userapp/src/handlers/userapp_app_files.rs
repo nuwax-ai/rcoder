@@ -199,7 +199,18 @@ pub struct AppFilesUploadFromUrlBody {
 }
 
 /// 容器内流式下载后走上传核心
-#[utoipa::path(post, path = "/app-files/upload-from-url", request_body = AppFilesUploadFromUrlBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
+#[utoipa::path(
+    post,
+    path = "/app-files/upload-from-url",
+    request_body = AppFilesUploadFromUrlBody,
+    description = r#"
+服务端代下载后落盘（制品库/对象存储直连发布场景，免本地中转）：HTTP(S) 下载
+→ 压缩包按魔数自动解压（zip/tar.gz）、单文件直写。语义同 `upload`：
+`target` 为 app 根相对落盘位置、`flatten` 控制剥单层 wrapper 目录。
+"#,
+    responses(file_server::openapi::JsonApiResponses),
+    tag = "UserApp · 开发与构建",
+)]
 pub(crate) async fn upload_from_url(
     State(state): State<UserAppState>,
     Json(body): Json<AppFilesUploadFromUrlBody>,
@@ -251,6 +262,11 @@ pub struct AppFilesListParams {
     get,
     path = "/app-files/list",
     params(AppFilesListParams),
+    description = r#"
+列应用卷内指定目录的文件清单（名称/大小/mtime 元信息）。响应形状对齐
+rcoder app_manager DTO（本族为 rcoder↔file-server 内部契约，字段直传不经
+Java）；生产运行容器 = 单 app 模式（卷根即 app 根）。
+"#,
     responses(file_server::openapi::JsonApiResponses),
     tag = "UserApp · 开发与构建"
 )]
@@ -327,7 +343,17 @@ pub struct AppFilesDeleteBody {
 }
 
 /// 删除文件或目录（防穿越）
-#[utoipa::path(post, path = "/app-files/delete", request_body = AppFilesDeleteBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
+#[utoipa::path(
+    post,
+    path = "/app-files/delete",
+    request_body = AppFilesDeleteBody,
+    description = r#"
+按路径删除文件或目录（app 根相对；路径解析经防穿越校验，拒绝越出卷根的
+`..` 与绝对路径注入）。危险的全量清理不走此接口——由存储面 storage/clear 承担。
+"#,
+    responses(file_server::openapi::JsonApiResponses),
+    tag = "UserApp · 开发与构建",
+)]
 pub(crate) async fn delete(
     State(state): State<UserAppState>,
     Json(body): Json<AppFilesDeleteBody>,
@@ -361,6 +387,71 @@ pub(crate) async fn delete(
             .map_err(|e| AppError::system(format!("remove file: {e}")))?;
     }
     info!(app_id = %body.app_id, path = %body.path, "app-files deleted");
+    Ok(Json(json!({"success": true})))
+}
+
+// ── 清空 workspace（json {app_id}）─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct AppFilesClearBody {
+    /// UserApp 应用 ID（定位）。camel 别名为旧 rcoder 过渡兼容。
+    #[serde(alias = "appId")]
+    pub app_id: String,
+    /// 用户 ID（仅审计日志，可选）。camel 别名同上。
+    #[serde(default, alias = "userId")]
+    pub user_id: Option<String>,
+}
+
+/// 清空 workspace 内容（留容器留卷）
+///
+/// rcoder `POST /api/v1/userapp/{app_id}/dev/storage/clear` 的容器侧实现：
+/// "重置开发工作区"语义——逐子项删除 `resolve_userapp_dev` 根下全部内容、保留
+/// 根目录本身；幂等（workspace 不存在视为已空）。
+#[utoipa::path(
+    post,
+    path = "/app-files/clear",
+    request_body = AppFilesClearBody,
+    description = r#"
+清空 workspace 内容、**留容器留卷**（"重置开发工作区"）：逐子项删除根下全部
+内容、保留根目录本身。幂等：workspace 不存在视为已空直接成功。与 prod 的
+storage/clear（K8s 删 PVC 重建空卷）语义不同——开发容器常驻，卷重建要求先
+销毁容器，得不偿失。
+"#,
+    responses(file_server::openapi::JsonApiResponses),
+    tag = "UserApp · 开发与构建"
+)]
+pub(crate) async fn clear(
+    State(state): State<UserAppState>,
+    Json(body): Json<AppFilesClearBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    info!(
+        app_id = %body.app_id,
+        user_id = body.user_id.as_deref().unwrap_or(""),
+        "app-files clear (workspace reset)"
+    );
+    let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
+    if !root.exists() {
+        return Ok(Json(json!({"success": true})));
+    }
+    let mut entries = tokio::fs::read_dir(&root)
+        .await
+        .map_err(|e| AppError::system(format!("read workspace {}: {e}", root.display())))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| AppError::system(format!("traverse workspace: {e}")))?
+    {
+        let path = entry.path();
+        let remove = if path.is_dir() {
+            tokio::fs::remove_dir_all(&path).await
+        } else {
+            tokio::fs::remove_file(&path).await
+        };
+        remove.map_err(|e| {
+            AppError::system(format!("clear workspace entry {}: {e}", path.display()))
+        })?;
+    }
+    info!(app_id = %body.app_id, "app-files clear done (root retained)");
     Ok(Json(json!({"success": true})))
 }
 

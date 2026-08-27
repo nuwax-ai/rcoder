@@ -39,6 +39,9 @@ pub(crate) struct GetContentParams {
     get,
     path = "/get-project-content",
     params(GetContentParams),
+    description = r#"
+拉取项目内容树 + 前端框架探测结果：返回 `files` 树、`frontendFramework`/`devFramework`（探测失败时可传 `command` 兜底执行自定义命令）——打开工作台的第一数据源。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Project"
 )]
@@ -122,6 +125,9 @@ pub(crate) struct GetByVersionParams {
     get,
     path = "/get-project-content-by-version",
     params(GetByVersionParams),
+    description = r#"
+同 [`get-project-content`](#) 但以 `codeVersion` 指定历史版本读取内容树（版本对比/回滚预览场景）。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Project"
 )]

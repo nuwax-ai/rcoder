@@ -124,6 +124,9 @@ async fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> AppResult<st
     get,
     path = "/start-dev",
     params(BuildQuery),
+    description = r#"
+启动项目开发服务器（按 package.json 等探测命令异步拉起，返回 pid/port）。端口经 PortPool 分配；重复调用幂等——已在跑则返回现有进程。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
@@ -153,6 +156,9 @@ pub(crate) async fn start_dev(
     get,
     path = "/stop-dev",
     params(BuildQuery),
+    description = r#"
+停止项目的开发服务器进程组（按 projectId 定位，无需 pid）。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
@@ -196,6 +202,9 @@ pub(crate) async fn stop_dev(
     get,
     path = "/restart-dev",
     params(BuildQuery),
+    description = r#"
+重启开发服务器：stop + start 组合，新 pid/port 在响应中返回。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
@@ -220,10 +229,15 @@ pub(crate) async fn restart_dev(
 
 /// 列出开发服务器
 ///
-/// 对齐 nuwax list-dev。
+/// 列出在跑的开发服务器
+///
 #[utoipa::path(
     get,
     path = "/list-dev",
+    description = r#"
+列出当前在跑的开发服务器清单（projectId/pid/port/启动时间）——工作台面板与
+端口占用排障的数据源。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
@@ -242,6 +256,9 @@ pub(crate) async fn list_dev(State(state): State<AppState>) -> Result<Json<DevLi
     get,
     path = "/keep-alive",
     params(KeepAliveQuery),
+    description = r#"
+开发服务器心跳保活：校验进程仍存活、目录仍在；**进程意外死亡时自动以原参数重启**（响应 action 字段区分 alive/started）。前端定时（如 30s）调用一次。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
@@ -287,10 +304,13 @@ pub(crate) async fn keep_alive(
 
 /// 查询端口池状态
 ///
-/// 对齐 nuwax port-pool-status。
 #[utoipa::path(
     get,
     path = "/port-pool-status",
+    description = r#"
+查开发服务器 PortPool 分配现状：可分配范围、已占用明细（哪个项目占了哪个
+端口）——端口冲突与泄漏排查用。
+"#,
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]

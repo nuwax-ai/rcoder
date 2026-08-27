@@ -247,11 +247,26 @@ pub(crate) async fn build_workspace(
 
 /// 获取构建任务状态快照
 ///
-/// 含进度日志摘要。
+/// 构建进度的**轮询通道**（与 SSE 订阅二选一或互补）：受理 build 后拿 taskId
+/// 周期拉取（建议 2-3s 间隔），快照含当前编译到哪个服务、进度日志摘要与产物
+/// 信息——200 响应 schema 内有逐字段说明。
 #[utoipa::path(
     get,
     path = "/tasks/{task_id}",
     params(("task_id" = String, Path, description = "任务ID")),
+    description = r#"
+返回构建任务的完整状态机快照。典型用法：
+
+1. `POST /build` 受理 → 得 `task_id`；
+2. 轮询本接口（2-3s）观察 `status`：`pending → running → completed|failed|cancelled`
+   （后三个为终态，到达即停）；`current_service` 指示正在编译的子服务；
+3. `completed` 后从 `release_id / artifact_path / size_bytes / file_name` 取产物摘要，
+   直接接 `GET /static/{app_id}`（按 releaseId 回源取包）；
+4. 需要实时滚动日志时改订阅 `GET /tasks/{task_id}/logs/stream`（SSE），
+   `seq` 字段用于轮询→SSE 无缝续传（详见响应内说明）。
+
+终态快照保留 24h 供回查；不存在/已清理 → 404。
+"#,
     responses((status = 200, body = HttpResult<BuildTaskSnapshot>, description = "任务状态快照（轮询通道，建议 2-3s 间隔）。关键字段：status（pending/running/completed/failed/cancelled——后三者为终态，到终态即可停止轮询）、current_service（正在编译的服务）、release_id/sha256/size_bytes/file_name/artifact_path（completed 时有值：产物摘要）、error（failed 时有值）、seq（事件游标 = 已推送事件数，恰为下一条事件的 seq；从轮询切 SSE 续传时可直接作 from_seq 传，但勿直接作 Last-Event-ID 头——头语义是最后收到事件的 id，比本值小 1，直接用会漏一条事件）。终态快照保留 24h 供回查。")),
     tag = "UserApp · 开发与构建"
 )]
@@ -272,7 +287,10 @@ pub(crate) async fn get_task(
 
 /// 构建日志分页
 ///
-/// 复用 `read_dev_log`。
+/// 构建过程输出的**分页拉取**（非 SSE）：复用 dev 日志读取内核 `read_dev_log`，
+/// 按 `service`（子项目目录，留空=workspace 根）+ `startIndex` 翻页——上批响应
+/// 的 `totalLines` 即下一页起点。适合事后回看完整构建输出；实时滚动请用
+/// `/tasks/{task_id}/logs/stream`。
 #[utoipa::path(
     get,
     path = "/tasks/{task_id}/logs",
