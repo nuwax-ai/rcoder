@@ -73,22 +73,29 @@ pub(crate) struct PortPool {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct KeepAliveQuery {
+    /// 项目 ID（workspace 根目录名）
     #[garde(custom(crate::validation_rules::not_blank))]
     project_id: String,
     /// UserApp 开发卷定位 (可选, 与 projectId 二选一; 见 BuildQuery::app_id)。
     #[serde(default)]
     app_id: Option<String>,
+    /// 开发服务器进程 PID（start-dev 响应回传的值）
     #[serde(default)]
     #[garde(required)]
     pid: Option<u32>,
+    /// 开发服务器监听端口
     port: u16,
+    /// 项目内子路径 (可选；心跳时校验目录仍存在)
     #[serde(default)]
     #[garde(custom(crate::validation_rules::required_not_blank))]
     base_path: Option<String>,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     #[serde(default)]
     tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     #[serde(default)]
     space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     #[serde(default)]
     isolation_type: Option<String>,
 }

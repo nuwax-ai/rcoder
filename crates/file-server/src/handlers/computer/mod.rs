@@ -82,10 +82,13 @@ async fn resolve_computer_target(
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserCidQuery {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub c_id: String,
+    /// 自定义目标目录 (可选；缺省用 user/cid 推导的默认根)
     #[serde(default)]
     #[garde(skip)]
     pub custom_target_dir: Option<String>,
@@ -97,13 +100,17 @@ pub(crate) struct UserCidQuery {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FileListQuery {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub c_id: String,
+    /// 代理子路径 (可选；网关转发场景透传)
     #[serde(default)]
     #[garde(skip)]
     pub proxy_path: Option<String>,
+    /// 自定义目标目录 (可选；缺省用 user/cid 推导的默认根)
     #[serde(default)]
     #[garde(skip)]
     pub custom_target_dir: Option<String>,
@@ -123,16 +130,21 @@ pub(crate) struct FileListQuery {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResolveFileQuery {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub c_id: String,
+    /// 代理子路径 (可选；网关转发场景透传)
     #[serde(default)]
     #[garde(skip)]
     pub proxy_path: Option<String>,
+    /// 自定义目标目录 (可选；缺省用 user/cid 推导的默认根)
     #[serde(default)]
     #[garde(skip)]
     pub custom_target_dir: Option<String>,
+    /// 待解析的文件相对路径 (不补扩展名，逐候选目录查找)
     #[garde(custom(crate::validation_rules::not_blank))]
     pub file_path: String,
 }
@@ -144,25 +156,34 @@ pub(crate) struct ResolveFileQuery {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SearchFilesQuery {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub c_id: String,
+    /// 代理子路径 (可选；网关转发场景透传)
     #[serde(default)]
     #[garde(skip)]
     pub proxy_path: Option<String>,
+    /// 自定义目标目录 (可选；缺省用 user/cid 推导的默认根)
     #[serde(default)]
     #[garde(skip)]
     pub custom_target_dir: Option<String>,
+    /// 搜索起始子目录 (可多级)，空 → 从工作区根搜起
     #[serde(default)]
     #[garde(skip)]
     pub relative_path: Option<String>,
+    /// 关键词（对文件名做大小写敏感包含匹配）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub kw: String,
+    /// 返回结果条数上限（正整数，如 "50"）
     #[garde(custom(crate::validation_rules::positive_int))]
     pub limit: String,
+    /// 最多访问的目录/文件节点数上限（正整数，防大目录全量遍历）
     #[garde(custom(crate::validation_rules::positive_int))]
     pub max_visit: String,
+    /// 搜索超时毫秒数（正整数，超时返回已收集结果）
     #[garde(custom(crate::validation_rules::positive_int))]
     pub timeout_ms: String,
 }

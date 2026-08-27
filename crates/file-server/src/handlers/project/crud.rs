@@ -22,12 +22,17 @@ use crate::workspace::ProjectContext;
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DeleteParams {
+    /// 项目 ID
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    /// 关联 dev server 进程 PID（可选；用于删除前停止开发服务器）
     #[serde(default)]
     pub pid: Option<String>,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     pub isolation_type: Option<String>,
 }
 

@@ -20,20 +20,25 @@ use crate::workspace::ProjectContext;
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BuildQuery {
+    /// 项目 ID（workspace 根目录名）
     pub(crate) project_id: String,
     /// UserApp 开发卷定位 (可选): 传 appId 时 workspace 走 UserApp 开发卷
     /// (`{USERAPP_WORKSPACE_DIR}/{appId}`), 与 projectId 定位二选一。
     #[serde(default)]
     pub(crate) app_id: Option<String>,
+    /// 关联进程 PID（可选；build 启动后回传，keep-alive 场景使用）
     #[serde(default)]
     pub(crate) pid: Option<String>,
+    /// 项目内子路径 (可选；限定文件操作的基准目录)
     #[serde(default)]
     pub(crate) base_path: Option<String>,
-    // 多租户隔离参数 (透传给 ProjectContext)
+    /// 租户 ID（多租户隔离，透传给 ProjectContext；本地部署可缺省）
     #[serde(default)]
     pub(crate) tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离，透传给 ProjectContext；本地部署可缺省）
     #[serde(default)]
     pub(crate) space_id: Option<String>,
+    /// 隔离类型（多租户隔离，透传给 ProjectContext；本地部署可缺省）
     #[serde(default)]
     pub(crate) isolation_type: Option<String>,
 }

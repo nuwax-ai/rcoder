@@ -19,12 +19,18 @@ use crate::workspace::ProjectContext;
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GetContentParams {
+    /// 项目 ID
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    /// 框架探测命令 (可选；前端框架识别失败时兜底执行的自定义命令)
     pub command: Option<String>,
+    /// 代理子路径 (可选；透传给框架探测的环境信息)
     pub proxy_path: Option<String>,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     pub isolation_type: Option<String>,
 }
 
@@ -89,17 +95,24 @@ pub(crate) async fn get_project_content(
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GetByVersionParams {
+    /// 项目 ID
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    /// 代码版本号（code_version 仓库的版本标签）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub code_version: String,
+    /// 代理子路径 (可选；透传给框架探测的环境信息)
     pub proxy_path: Option<String>,
+    /// 框架探测命令 (可选；前端框架识别失败时兜底执行的自定义命令)
     #[serde(default)]
     pub command: Option<String>,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub isolation_type: Option<String>,
 }

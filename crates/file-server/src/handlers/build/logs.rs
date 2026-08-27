@@ -66,9 +66,12 @@ pub(crate) struct LogCacheStatsData {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DevLogQuery {
+    /// 项目 ID
     pub(crate) project_id: String,
+    /// 日志起始行号 (1 起; 缺省 1 即从头读取)
     #[serde(default = "default_start_index")]
     start_index: usize,
+    /// 日志类型: `temp`(运行日志,默认) / `app`(应用自定义日志)
     #[serde(default = "default_log_type")]
     log_type: String,
 }

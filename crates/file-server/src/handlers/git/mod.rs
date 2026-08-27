@@ -24,14 +24,21 @@ pub(crate) mod write;
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GitQuery {
+    /// 工作区类型: `project`(项目工作区) / `computer`(Electron 容器根) 二选一
     pub workspace_type: Option<String>,
+    /// 项目 ID（workspaceType=project 时必填）
     pub project_id: Option<String>,
+    /// 用户 ID（workspaceType=computer 时必填）
     pub user_id: Option<String>,
+    /// 容器/实例 ID（workspaceType=computer 时必填）
     pub c_id: Option<String>,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub isolation_type: Option<String>,
 }
