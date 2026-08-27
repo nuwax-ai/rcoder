@@ -13,6 +13,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use shared_types::error_codes;
+use shared_types::{AppError, HttpResult};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -28,34 +30,24 @@ use std::sync::atomic::Ordering;
     summary = "获取 Pingora 代理服务状态",
     description = "返回当前 Pingora 代理服务的运行状态和配置信息",
     responses(
-        (status = 200, description = "成功获取代理状态", body = ProxyStatus),
-        (status = 503, description = "代理服务未启用", body = ProxyErrorResponse)
+        (status = 200, description = "成功获取代理状态", body = HttpResult<ProxyStatus>),
+        (status = 503, description = "代理服务未启用", body = HttpResult<String>)
     )
 )]
 pub async fn proxy_status(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ProxyStatus>, (StatusCode, Json<ProxyErrorResponse>)> {
+) -> Result<Json<HttpResult<ProxyStatus>>, AppError> {
     if state.config.proxy_config.is_none() || state.pingora_service.is_none() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ProxyErrorResponse {
-                error: "PROXY_DISABLED".to_string(),
-                message: "Pingora proxy service is not enabled or unavailable".to_string(),
-                target_port: 0,
-                timestamp: Utc::now().to_rfc3339(),
-            }),
+        return Err(AppError::with_message(
+            error_codes::ERR_PROXY_DISABLED,
+            "Pingora proxy service is not enabled or unavailable",
         ));
     }
 
     let svc = state.pingora_service.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ProxyErrorResponse {
-                error: "PROXY_SERVICE_UNAVAILABLE".to_string(),
-                message: "Pingora proxy service instance is unavailable".to_string(),
-                target_port: 0,
-                timestamp: Utc::now().to_rfc3339(),
-            }),
+        AppError::with_message(
+            error_codes::ERR_PROXY_SERVICE_UNAVAILABLE,
+            "Pingora proxy service instance is unavailable",
         )
     })?;
     let conf = svc.config().clone();
@@ -114,7 +106,7 @@ pub async fn proxy_status(
         status.listen_port, status.default_backend_host, status.default_backend_port, backend_count
     );
 
-    Ok(Json(status))
+    Ok(Json(HttpResult::success(status)))
 }
 
 /// Pingora 代理统计信息
@@ -125,35 +117,25 @@ pub async fn proxy_status(
     summary = "获取 Pingora 代理统计信息",
     description = "返回代理服务的请求统计和性能指标",
     responses(
-        (status = 200, description = "成功获取统计信息", body = ProxyStats),
-        (status = 503, description = "代理服务未启用", body = ProxyErrorResponse)
+        (status = 200, description = "成功获取统计信息", body = HttpResult<ProxyStats>),
+        (status = 503, description = "代理服务未启用", body = HttpResult<String>)
     )
 )]
 pub async fn proxy_stats(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ProxyStats>, (StatusCode, Json<ProxyErrorResponse>)> {
+) -> Result<Json<HttpResult<ProxyStats>>, AppError> {
     // 需要代理配置启用且服务可用
     if state.config.proxy_config.is_none() || state.pingora_service.is_none() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ProxyErrorResponse {
-                error: "PROXY_DISABLED".to_string(),
-                message: "Pingora proxy service is not enabled or unavailable".to_string(),
-                target_port: 0,
-                timestamp: Utc::now().to_rfc3339(),
-            }),
+        return Err(AppError::with_message(
+            error_codes::ERR_PROXY_DISABLED,
+            "Pingora proxy service is not enabled or unavailable",
         ));
     }
 
     let svc = state.pingora_service.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ProxyErrorResponse {
-                error: "PROXY_SERVICE_UNAVAILABLE".to_string(),
-                message: "Pingora proxy service instance is unavailable".to_string(),
-                target_port: 0,
-                timestamp: Utc::now().to_rfc3339(),
-            }),
+        AppError::with_message(
+            error_codes::ERR_PROXY_SERVICE_UNAVAILABLE,
+            "Pingora proxy service instance is unavailable",
         )
     })?;
     let m = &svc.metrics;
@@ -205,7 +187,7 @@ pub async fn proxy_stats(
         stats.avg_response_time_ms
     );
 
-    Ok(Json(stats))
+    Ok(Json(HttpResult::success(stats)))
 }
 
 /// Pingora 代理配置查询
@@ -216,34 +198,24 @@ pub async fn proxy_stats(
     summary = "获取 Pingora 代理配置",
     description = "返回当前代理服务的配置信息",
     responses(
-        (status = 200, description = "成功获取配置信息", body = ProxyConfig),
-        (status = 503, description = "代理服务未启用", body = ProxyErrorResponse)
+        (status = 200, description = "成功获取配置信息", body = HttpResult<ProxyConfig>),
+        (status = 503, description = "代理服务未启用", body = HttpResult<String>)
     )
 )]
 pub async fn proxy_config(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ProxyConfig>, (StatusCode, Json<ProxyErrorResponse>)> {
+) -> Result<Json<HttpResult<ProxyConfig>>, AppError> {
     if state.config.proxy_config.is_none() || state.pingora_service.is_none() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ProxyErrorResponse {
-                error: "PROXY_DISABLED".to_string(),
-                message: "Pingora proxy service is not enabled or unavailable".to_string(),
-                target_port: 0,
-                timestamp: Utc::now().to_rfc3339(),
-            }),
+        return Err(AppError::with_message(
+            error_codes::ERR_PROXY_DISABLED,
+            "Pingora proxy service is not enabled or unavailable",
         ));
     }
 
     let svc = state.pingora_service.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ProxyErrorResponse {
-                error: "PROXY_SERVICE_UNAVAILABLE".to_string(),
-                message: "Pingora proxy service instance is unavailable".to_string(),
-                target_port: 0,
-                timestamp: Utc::now().to_rfc3339(),
-            }),
+        AppError::with_message(
+            error_codes::ERR_PROXY_SERVICE_UNAVAILABLE,
+            "Pingora proxy service instance is unavailable",
         )
     })?;
     let conf = svc.config();
@@ -252,14 +224,9 @@ pub async fn proxy_config(
         .proxy_config
         .as_ref()
         .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ProxyErrorResponse {
-                    error: "PROXY_CONFIG_UNAVAILABLE".to_string(),
-                    message: "Pingora proxy config unavailable".to_string(),
-                    target_port: 0,
-                    timestamp: Utc::now().to_rfc3339(),
-                }),
+            AppError::with_message(
+                error_codes::ERR_PROXY_SERVICE_UNAVAILABLE,
+                "Pingora proxy config unavailable",
             )
         })?
         .health_check;
@@ -290,7 +257,7 @@ pub async fn proxy_config(
         config.load_balancing_algorithm
     );
 
-    Ok(Json(config))
+    Ok(Json(HttpResult::success(config)))
 }
 
 /// 代理到指定端口（重定向到 Pingora）

@@ -163,6 +163,8 @@ fn status_from_code(code: &str) -> axum::http::StatusCode {
         ec::ERR_SERVICE_UNAVAILABLE
         | ec::ERR_AGENT_RUNNER_UNAVAILABLE
         | ec::ERR_AGENT_CONTAINER_UNAVAILABLE
+        | ec::ERR_PROXY_DISABLED
+        | ec::ERR_PROXY_SERVICE_UNAVAILABLE
         | ec::ERR_RESOURCE_EXHAUSTED => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         ec::ERR_BACKEND_ERROR => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -195,5 +197,18 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// Pingora 观测接口错误码须映射 503（/proxy/status 等依赖此语义）。
+    #[test]
+    fn proxy_error_codes_map_to_service_unavailable() {
+        assert_eq!(
+            super::status_from_code(crate::error_codes::ERR_PROXY_DISABLED),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            super::status_from_code(crate::error_codes::ERR_PROXY_SERVICE_UNAVAILABLE),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }
