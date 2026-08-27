@@ -42,7 +42,9 @@ pub async fn reset_db_password(
     Ok(Json(HttpResult::success("密码已重置".to_string())))
 }
 
-/// 新建 PG 库（exec 容器内 psql CREATE DATABASE）
+/// 新建 PG 数据库
+///
+/// exec 容器内 psql CREATE DATABASE。
 #[utoipa::path(
     post,
     path = "/api/v1/userapp/{app_id}/db/create-database",

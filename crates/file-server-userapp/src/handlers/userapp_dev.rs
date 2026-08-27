@@ -128,7 +128,9 @@ fn default_tail_lines() -> usize {
     200
 }
 
-/// 读 `{ws}/.logs` 下 mtime 最新日志末尾 N 行
+/// 读取最新应用日志
+///
+/// 取 `{ws}/.logs` 下 mtime 最新日志末尾 N 行。
 #[utoipa::path(
     get,
     path = "/get-logs",
@@ -274,9 +276,9 @@ pub struct UserappInitTemplateForm {
     pub enable_git: Option<bool>,
 }
 
-/// 模板 zip 解压初始化开发卷 workspace
+/// 模板初始化开发卷
 ///
-/// 可选 git init（双开关：GIT_ENABLED 且 enableGit 为 true 才执行）。
+/// 模板 zip 解压到 workspace；可选 git init（双开关：GIT_ENABLED 且 enableGit 为 true 才执行）。
 /// UserApp 开发的起点接口。
 #[utoipa::path(post, path = "/init-project-template", request_body(content = UserappInitTemplateForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
 pub(crate) async fn init_project_template(

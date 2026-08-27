@@ -561,7 +561,7 @@ pub async fn agent_session_cancel(
     ),
     tag = "computer",
     operation_id = "computer_agent_session_cancel",
-    summary = "转发 Computer Agent 任务取消请求（支持 user_id）",
+    summary = "取消 Computer Agent 任务",
     description = "将 Computer Agent 取消请求通过 gRPC 转发到容器内的 agent_runner 服务，支持通过 user_id 或 pod_id 定位用户容器"
 )]
 #[instrument(skip(state), fields(user_id = ?request.user_id.as_deref(), project_id = %request.project_id, pod_id = ?request.pod_id.as_deref()))]

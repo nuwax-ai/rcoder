@@ -35,7 +35,9 @@ pub(crate) async fn push_skills_to_workspace(
     push_skills_to_workspace_impl(state, multipart).await
 }
 
-/// 推送 skills 到工作区 v2（多文件上传，软链优先 + copy 回退）
+/// 推送 skills 到工作区
+///
+/// v2：多文件上传，软链优先 + copy 回退。
 #[utoipa::path(post, path = "/push-skills-to-workspace-v2", request_body(content = PushSkillsForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(crate) async fn push_skills_to_workspace_v2(
     State(state): State<AppState>,

@@ -69,7 +69,7 @@ use crate::{AppError, HttpResult, router::AppState};
     ),
     tag = "devcomputer",
     operation_id = "handle_devcomputer_chat",
-    summary = "发送聊天消息到 DevComputer Agent",
+    summary = "发送 DevComputer 聊天消息",
     description = "与 /computer/chat 功能相同，自动注入 auto_reload 默认配置（默认启用热重载），适用于开发调试场景"
 )]
 #[instrument(skip(state, request), fields(user_id = %request.user_id, project_id = ?request.project_id))]
@@ -311,7 +311,7 @@ pub async fn devcomputer_notify_resolved(
     ),
     tag = "devcomputer",
     operation_id = "devcomputer_agent_progress_notification",
-    summary = "DevComputer Agent 进度 SSE 通知流",
+    summary = "DevComputer 进度 SSE 流",
     description = "与 /computer/progress/{session_id} 功能相同，建立 SSE 连接实时接收执行进度和状态更新"
 )]
 pub async fn devcomputer_agent_progress_notification(

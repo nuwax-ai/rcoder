@@ -29,8 +29,9 @@ pub struct StaticQuery {
     pub release_id: Option<String>,
 }
 
-/// 下载该 app 的**构建整体包**（缺省最新，`?releaseId=` 指定版本）。
+/// 下载构建整体包
 ///
+/// 缺省最新，`?releaseId=` 指定版本。
 /// 调用方只按 app 定位（产物就是每次构建出的一个整体 zip，无需传文件路径）：
 /// - 不带 `releaseId`：服务端在 `{ws}/builds/` 下选 `workspace-package-*.zip`
 ///   文件名字典序最大者——文件名含 UUIDv7（时间有序），字典序最大即最新构建产物；

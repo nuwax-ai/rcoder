@@ -303,7 +303,7 @@ pub async fn agent_session_notification(
     ),
     tag = "computer",
     operation_id = "computer_agent_progress_notification",
-    summary = "Computer Agent 专用会话 SSE 通知流",
+    summary = "Computer Agent 会话进度 SSE 流",
     description = r#"为 Computer Agent 专用的进度流接口，建立 SSE 连接实时接收执行进度和状态更新。
 
 此接口与 `/computer/progress/{session_id}` 功能相同，提供更明确的路径结构。

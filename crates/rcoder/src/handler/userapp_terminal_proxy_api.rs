@@ -76,7 +76,7 @@ async fn redirect_doc_response(
     get,
     path = "/userapp/dev/ttyd/{app_id}/{*path}",
     tag = "UserApp · 终端与代理",
-    summary = "Pingora 代理 - userApp 开发域 Web 终端（ttyd）",
+    summary = "开发容器 Web 终端（ttyd）",
     description = r#"
 访问该 app 开发容器（UserAppBuilder）内的 **Web 终端**。与 computer 族
 （`/computer/ttyd/{user_id}/...` 按用户沙箱）对称的开发场景入口，按 **app_id** 定位。
@@ -113,7 +113,7 @@ pub async fn proxy_to_userapp_ttyd(
     get,
     path = "/userapp/dev/vnc/{app_id}/{*path}",
     tag = "UserApp · 终端与代理",
-    summary = "Pingora 代理 - userApp 开发域远程桌面（noVNC）",
+    summary = "开发容器远程桌面（noVNC）",
     description = r#"
 访问该 app 开发容器（UserAppBuilder）内的 **远程桌面**（noVNC）。开发容器是完整桌面镜像
 （Xvnc 5900 + noVNC 6080），与 computer 族 `/computer/vnc/{user_id}/...` 对称。
@@ -146,7 +146,7 @@ pub async fn proxy_to_userapp_vnc(
     get,
     path = "/userapp/dev/audio/{app_id}/{*path}",
     tag = "UserApp · 终端与代理",
-    summary = "Pingora 代理 - userApp 开发域语音（audio，按 app_id 定位开发容器）",
+    summary = "开发容器语音代理（audio）",
     description = r#"
 访问该 app 开发容器（UserAppBuilder）内的 **语音服务**。分流规则与 computer 族
 `/computer/audio/{user_id}/...` 一致：
@@ -181,7 +181,7 @@ pub async fn proxy_to_userapp_audio(
     get,
     path = "/userapp/dev/ime/{app_id}/{*path}",
     tag = "UserApp · 终端与代理",
-    summary = "Pingora 代理 - userApp 开发域输入法（IME，按 app_id 定位开发容器）",
+    summary = "开发容器输入法代理（IME）",
     description = r#"
 访问该 app 开发容器（UserAppBuilder）内的 **IME 输入法透传服务**（6091，WebSocket）。
 客户端本地输入法经 WebSocket 发送文本，容器内用 xdotool 输入到远程桌面——
@@ -214,7 +214,7 @@ pub async fn proxy_to_userapp_ime(
     get,
     path = "/userapp/dev/dbx/{app_id}/{*path}",
     tag = "UserApp · 终端与代理",
-    summary = "Pingora 代理 - DBX 数据库 Web GUI（开发阶段，按 app_id 定位开发容器）",
+    summary = "开发容器数据库控制台（DBX）",
     description = r#"
 访问该 app **开发容器**（UserAppBuilder，agent-runner 镜像）内的 DBX 数据库
 Web GUI（60+ 数据库，supervisor 恒起 4224）——开发阶段查库/改数据的全功能控制台
@@ -251,7 +251,7 @@ pub async fn proxy_to_dev_dbx(
     get,
     path = "/userapp/prod/ttyd/{app_id}/{*path}",
     tag = "UserApp · 终端与代理",
-    summary = "Pingora 代理 - userApp 运行容器 Web 终端（部署后的生产环境，ttyd 直连）",
+    summary = "生产容器 Web 终端（ttyd）",
     description = r#"
 访问该 app **运行容器**（`ServiceType::UserApp`，app-runtime 镜像——部署后的生产环境）
 内的 Web 终端，供线上排障。与开发域 `/userapp/dev/ttyd/{app_id}`（UserAppBuilder 开发容器、
@@ -287,7 +287,7 @@ pub async fn proxy_to_userapp_runtime_ttyd(
     get,
     path = "/userapp/prod/pgweb/{app_id}/{*path}",
     tag = "UserApp · 终端与代理",
-    summary = "Pingora 代理 - userApp 运行容器数据库控制台（pgweb）",
+    summary = "生产容器数据库控制台（pgweb）",
     description = r#"
 访问该 app **运行容器**（app-runtime 镜像）内的 pgweb——容器内 PostgreSQL（5432）
 的 Web 控制台（8081，普通 HTTP），供线上查库排障。
@@ -320,7 +320,7 @@ pub async fn proxy_to_userapp_runtime_pgweb(
     get,
     path = "/userapp/prod/dbx/{app_id}/{*path}",
     tag = "UserApp · 终端与代理",
-    summary = "Pingora 代理 - DBX 数据库 Web GUI（生产阶段，按 app_id 定位运行容器）",
+    summary = "生产容器数据库控制台（DBX）",
     description = r#"
 访问该 app **运行容器**（`ServiceType::UserApp`，app-runtime 镜像——部署后的生产环境）
 内的 DBX 数据库 Web GUI（supervisor 恒起 4224），供线上查库排障。
@@ -354,7 +354,7 @@ pub async fn proxy_to_prod_dbx(
     get,
     path = "/userapp/routes",
     tag = "UserApp · 终端与代理",
-    summary = "userApp 代理路由一览（工具族/应用流量族，stage 段 dev/prod 统一）",
+    summary = "userApp 代理路由一览",
     description = "userApp 两族 Pingora 代理入口速查：工具族 /userapp/{dev,prod}/{tool}/{app_id}；应用流量族（免端口，pingap 统一入口 9080）/proxy/userapp/{dev,prod}/{user_id}/{app_id}。",
     responses(
         (status = 200, description = "路由清单", body = Value)

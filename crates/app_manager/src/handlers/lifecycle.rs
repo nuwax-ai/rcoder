@@ -40,9 +40,9 @@ pub async fn query_apps(
     Ok(Json(HttpResult::success(response)))
 }
 
-/// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态
+/// 列出应用运行时状态
 ///
-/// 供 Java 在 rcoder/自身重启后对账（rcoder 不持久化 app 元数据）。
+/// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态，供 Java 在 rcoder/自身重启后对账（rcoder 不持久化 app 元数据）。
 #[utoipa::path(
     get,
     path = "/api/v1/userapp/runtime",

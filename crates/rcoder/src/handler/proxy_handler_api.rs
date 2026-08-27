@@ -265,7 +265,7 @@ pub async fn proxy_config(
     get,
     path = "/proxy/{port}",
     tag = "proxy",
-    summary = "Pingora 代理 - 访问部署的应用服务（无路径，重定向）",
+    summary = "按端口访问部署的应用服务",
     description = r#"
 重定向请求到 Pingora 代理服务，无额外路径。
 
@@ -354,7 +354,7 @@ pub async fn proxy_to_port(
     get,
     path = "/proxy/{port}/{*path}",
     tag = "proxy",
-    summary = "Pingora 代理 - 通用本机端口代理（含路径）",
+    summary = "本机端口代理（含路径）",
     description = r#"
 重定向请求到 Pingora 代理服务，包含完整路径信息。
 
@@ -459,7 +459,7 @@ pub async fn proxy_to_port_with_path(
     get,
     path = "/proxy/userapp/prod/{user_id}/{app_id}/{*path}",
     tag = "UserApp · 终端与代理",
-    summary = "Pingora 代理 - 访问部署的应用服务（免端口，按 app_id 路由，含路径）",
+    summary = "按 app_id 访问部署的应用服务",
     description = r#"
 访问 `POST /api/v1/userapp` 部署的应用。`access.external.http` 返回 `/proxy/userapp/prod/{user_id}/{app_id}`，即本接口。
 **免端口**：代理内部固定拨 pingap 统一入口 `APP_ENTRY_PORT`(9080)——按 (app_id, 9080) 查
@@ -532,7 +532,7 @@ pub async fn proxy_to_app_with_path(
     get,
     path = "/proxy/userapp/dev/{user_id}/{app_id}/{*path}",
     tag = "UserApp · 终端与代理",
-    summary = "Pingora 代理 - 开发阶段预览（app 开发容器 pingap 入口）",
+    summary = "开发容器预览入口",
     description = r#"
 访问开发阶段该 app 开发容器（UserAppBuilder，per-app）内的应用。与部署访问
 `/proxy/userapp/prod/{user_id}/{app_id}/{*path}` 同构——**开发切部署前端只改 `dev→prod` 一段**。

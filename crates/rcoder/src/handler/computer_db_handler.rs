@@ -23,8 +23,9 @@ use app_manager::models::{CreateDatabaseRequest, ResetDbPasswordRequest};
 
 use crate::router::AppState;
 
-/// 重置 computer agent-runner 容器内 PG 的用户密码。
+/// 重置容器内 PG 用户密码
 ///
+/// computer agent-runner 容器一用户一容器。用途: 用户忘记 pgweb 密码时重置 —— psql 走容器内本地 trust 认证免密连上,
 /// 用途: 用户忘记 pgweb 密码时重置 —— psql 走容器内本地 trust 认证免密连上,
 /// 直接 ALTER USER 改密, 绕过"需要当前密码"的死锁。
 #[utoipa::path(
@@ -83,7 +84,9 @@ pub async fn computer_db_reset_password(
     Ok(Json(HttpResult::success("密码已重置".to_string())))
 }
 
-/// 在 computer agent-runner 容器的 PG 里新建数据库。
+/// 新建容器内 PG 数据库
+///
+/// 在 computer agent-runner 容器（一用户一容器）的 PG 里新建数据库。
 #[utoipa::path(
     post,
     path = "/computer/db/{user_id}/create-database",

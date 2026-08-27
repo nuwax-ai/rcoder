@@ -217,9 +217,9 @@ fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
     }
 }
 
-/// 异步发起 workspace 打包（立即返 taskId）
+/// 发起 workspace 打包
 ///
-/// 编译在后台 spawn 执行（`start_build_task`）；进度经 task 流出（轮询 `/tasks/{id}` +
+/// 异步任务：编译在后台 spawn 执行（`start_build_task`），受理即返 taskId；进度经 task 流出（轮询 `/tasks/{id}` +
 /// SSE `/tasks/{id}/logs/stream`）。同 app_id 排队由 `BuildManager` per-project 互斥保证。
 #[utoipa::path(
     post,
@@ -253,7 +253,9 @@ pub(crate) async fn build_workspace(
     reply(result.await)
 }
 
-/// 获取 UserApp 构建任务状态快照（含进度日志摘要）
+/// 获取构建任务状态快照
+///
+/// 含进度日志摘要。
 #[utoipa::path(
     get,
     path = "/tasks/{task_id}",
@@ -276,7 +278,9 @@ pub(crate) async fn get_task(
     reply(result.await)
 }
 
-/// 构建日志分页（复用 `read_dev_log`）
+/// 构建日志分页
+///
+/// 复用 `read_dev_log`。
 #[utoipa::path(
     get,
     path = "/tasks/{task_id}/logs",
@@ -480,7 +484,9 @@ pub(crate) async fn detect_project(
     reply(result.await)
 }
 
-/// 确认项目检测结果（用户选择/修正 detect 推断的项目类型后提交）
+/// 确认项目检测结果
+///
+/// 用户选择/修正 detect 推断的项目类型后提交。
 #[utoipa::path(
     post,
     path = "/projects/confirm",

@@ -47,7 +47,9 @@ pub struct AppFilesUploadForm {
     pub file: String,
 }
 
-/// 单次上传（zip/tar.gz 自动解压；单文件直写）
+/// 上传文件
+///
+/// zip/tar.gz 自动解压；单文件直写。
 #[utoipa::path(post, path = "/app-files/upload", request_body(content = AppFilesUploadForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
 pub(crate) async fn upload(
     State(state): State<UserAppState>,

@@ -65,7 +65,9 @@ pub(crate) struct ParseErrorBody {
     error_message: String,
 }
 
-/// 解析构建错误输出（识别常见编译/构建工具错误模式，返回结构化信息）
+/// 解析构建错误输出
+///
+/// 识别常见编译/构建工具错误模式，返回结构化信息。
 #[utoipa::path(post, path = "/parse-build-error", request_body = ParseErrorBody, responses(crate::openapi::JsonApiResponses), tag = "Build")]
 pub(crate) async fn parse_build_error(
     State(_state): State<AppState>,

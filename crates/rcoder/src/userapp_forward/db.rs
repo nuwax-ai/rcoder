@@ -103,7 +103,7 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
     ),
     tag = "UserApp · 数据库",
     operation_id = "align_userapp_db_credentials",
-    summary = "PG 凭据对齐（检查 dev/prod 容器内 PG 密码，不一致则重置）"
+    summary = "PG 凭据对齐"
 )]
 pub(crate) async fn align_credentials(
     State(state): State<Arc<AppState>>,
@@ -342,7 +342,7 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
     ),
     tag = "UserApp · 数据库",
     operation_id = "userapp_db_reset_password",
-    summary = "重置/创建 userApp 容器内 PG 账号密码（dev/prod）"
+    summary = "重置/创建 PG 账号密码"
 )]
 pub(crate) async fn reset_password(
     State(state): State<Arc<AppState>>,
@@ -450,7 +450,7 @@ pub(crate) async fn reset_password(
     ),
     tag = "UserApp · 数据库",
     operation_id = "userapp_db_create_database",
-    summary = "在 userApp 容器内 PG 新建数据库（dev/prod）"
+    summary = "新建 PG 数据库"
 )]
 pub(crate) async fn create_database(
     State(state): State<Arc<AppState>>,

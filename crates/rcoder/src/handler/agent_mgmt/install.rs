@@ -321,7 +321,7 @@ pub async fn install_agent(
     post,
     path = "/agent-mgmt/agents/install-from-url",
     operation_id = "install_from_url",
-    summary = "从 URL 下载并安装 agent(多平台+版本管理)",
+    summary = "从 URL 安装 agent",
     description = "支持 platforms 多平台 URL + version 版本号,agent-runner 自动判断是否需要下载安装(幂等)。",
     request_body = shared_types::InstallFromUrlRequest,
     responses(
