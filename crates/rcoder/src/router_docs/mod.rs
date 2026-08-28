@@ -1,7 +1,7 @@
 //! OpenAPI 文档聚合与文档 UI（从 router.rs 拆出；路由组装仍在 router.rs）。
 //!
 //! [`ApiDoc`] 是 rcoder 主文档的 utoipa 声明（paths/components 全量，
-//! 声明体在 [`api_doc`]）；[`create_swagger_ui`] 聚合两份文档（主文档 +
+//! 声明体在 `api_doc`）；[`create_swagger_ui`] 聚合两份文档（主文档 +
 //! file-server 全量文档，UI 顶部下拉切换），[`create_scalar_docs`] 以
 //! Scalar 界面提供同样两份文档（每份独立页面，供对比选用）。
 

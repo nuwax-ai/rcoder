@@ -2,7 +2,7 @@
 //!
 //! 集中管理 Pingora 代理服务的路由注册：基础路由（端口代理 / 健康检查 /
 //! API 密钥代理）在本文件，computer 域（VNC / 音频 / IME / ttyd）与
-//! userApp 域（流量族 / 工具族 / dbx）分属 [`computer`] / [`userapp`]。
+//! userApp 域（流量族 / 工具族 / dbx）分属 `computer` / `userapp`。
 //!
 //! ## 路由语法
 //!
