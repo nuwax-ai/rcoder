@@ -223,3 +223,55 @@ pub enum RouteType {
     /// - `/web/ttyd/user_123/proj_456/ws/token` → 127.0.0.1:7681/ws/token
     WebTtydProxy,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_route_type_equality() {
+        assert_eq!(RouteType::VncProxy, RouteType::VncProxy);
+        assert_eq!(RouteType::PortProxy, RouteType::PortProxy);
+        assert_eq!(RouteType::ApiProxy, RouteType::ApiProxy);
+        assert_eq!(RouteType::HealthCheck, RouteType::HealthCheck);
+        assert_eq!(RouteType::AudioProxy, RouteType::AudioProxy);
+        assert_eq!(RouteType::ImeProxy, RouteType::ImeProxy);
+        assert_eq!(RouteType::TtydProxy, RouteType::TtydProxy);
+        assert_eq!(RouteType::WebTtydProxy, RouteType::WebTtydProxy);
+        assert_ne!(RouteType::VncProxy, RouteType::PortProxy);
+        assert_ne!(RouteType::ApiProxy, RouteType::PortProxy);
+        assert_ne!(RouteType::AudioProxy, RouteType::ImeProxy);
+        assert_ne!(RouteType::TtydProxy, RouteType::VncProxy);
+        assert_ne!(RouteType::WebTtydProxy, RouteType::TtydProxy);
+    }
+
+    #[test]
+    fn test_route_type_debug() {
+        let vnc = RouteType::VncProxy;
+        let port = RouteType::PortProxy;
+        let api = RouteType::ApiProxy;
+        let health = RouteType::HealthCheck;
+        let audio = RouteType::AudioProxy;
+        let ime = RouteType::ImeProxy;
+        let ttyd = RouteType::TtydProxy;
+        let web_ttyd = RouteType::WebTtydProxy;
+
+        let vnc_str = format!("{:?}", vnc);
+        let port_str = format!("{:?}", port);
+        let api_str = format!("{:?}", api);
+        let health_str = format!("{:?}", health);
+        let audio_str = format!("{:?}", audio);
+        let ime_str = format!("{:?}", ime);
+        let ttyd_str = format!("{:?}", ttyd);
+        let web_ttyd_str = format!("{:?}", web_ttyd);
+
+        assert!(vnc_str.contains("VncProxy"));
+        assert!(port_str.contains("PortProxy"));
+        assert!(api_str.contains("ApiProxy"));
+        assert!(health_str.contains("HealthCheck"));
+        assert!(audio_str.contains("AudioProxy"));
+        assert!(ime_str.contains("ImeProxy"));
+        assert!(ttyd_str.contains("TtydProxy"));
+        assert!(web_ttyd_str.contains("WebTtydProxy"));
+    }
+}
