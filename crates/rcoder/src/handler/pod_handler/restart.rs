@@ -108,150 +108,28 @@ pub async fn pod_restart(
     )
     .await?;
     let was_existing = existing_container.is_some();
-
-    // 🆕 优先原地重启（exec SIGTERM PID 1 → kubelet restartPolicy 原地重启容器，卷不 unstage → ~秒级）。
-    // 仅容器已存在时尝试；K8s agent-runner 支持。失败（runtime 不支持 / 超时 / agent 卡死）自动
-    // 回落下方 destroy+recreate（慢但可靠）。原地重启 pod 名/IP/svc 不变 → VNC backend / 存储
-    // 记录 / grpc 池均复用，无需重注或清理。
-    if was_existing {
-        let runtime = state.runtime().clone();
-        match runtime
-            .restart_container_inplace(&container_identifier, &service_type)
-            .await
-        {
-            Ok(()) => {
-                info!(
-                    "[POD_RESTART] Agent 原地重启完成（fast，volume 未 unstage）: container_identifier={}",
-                    container_identifier
-                );
-                // 原地重启不换 pod（同 UID）→ 复用 existing_container 的 container_id；
-                // status=Running（in-place 的 poll 已确认 ready）。不再 re-fetch —— 避免 fetch 失败
-                // 时回落 destroy 把刚原地重启好的 pod 毁掉重建（违背原地重启初衷）。
-                let response = RestartPodResponse {
-                    was_existing: true,
-                    restarted: true,
-                    container_info: existing_container
-                        .as_ref()
-                        .map(|c| PodContainerInfo {
-                            container_id: c.container_id.clone(),
-                            status: "Running".to_string(),
-                        })
-                        .unwrap_or_else(|| PodContainerInfo {
-                            container_id: container_identifier.clone(),
-                            status: "Running".to_string(),
-                        }),
-                    message: "Container restarted in-place (fast), can access virtual desktop via VNC (Agent service not started)".to_string(),
-                };
-                info!(
-                    "[POD_RESTART] Completed (in-place): container_id={}",
-                    response.container_info.container_id
-                );
-                return Ok(HttpResult::success(response));
-            }
-            Err(e) => {
-                warn!(
-                    "[POD_RESTART] 原地重启失败，回落 destroy+recreate: container_identifier={}, err={:?}",
-                    container_identifier, e
-                );
-                // 落入下方 destroy+recreate 兜底
-            }
-        }
+    // 🆕 优先原地重启（快路径，容器已存在时尝试；失败回落 destroy+recreate）
+    if was_existing
+        && let Some(response) = try_restart_inplace(
+            &state,
+            &container_identifier,
+            &service_type,
+            existing_container.as_ref(),
+        )
+        .await
+    {
+        return Ok(response);
     }
 
-    // 3. 如果容器存在，先销毁
+    // 3. 容器存在时先销毁（存储记录 + 物理容器 + SSE/gRPC 连接 + 确认移除）
     if let Some(container_info) = existing_container {
-        info!(
-            "[POD_RESTART] Destroying existing container: container_id={}",
-            container_info.container_id
-        );
-
-        // 从存储中彻底移除旧容器及其所有关联记录
-        // 使用 container_id 删除,确保清理该容器关联的所有 project_id
-        let (container_deleted, deleted_projects) = state
-            .delete_container_with_projects_durable(&container_info.container_id)
-            .await;
-        info!(
-            "[POD_RESTART] Cleaned up old container records: container_id={}, container_deleted={}, deleted_projects={}",
-            container_info.container_id, container_deleted, deleted_projects
-        );
-
-        let runtime = state.runtime().clone();
-
-        // 使用 pod_id 优先的标识符停止容器（与创建时一致）
-        if let Err(e) = runtime
-            .stop_container_by_identifier(&container_identifier, &service_type)
-            .await
-        {
-            // 记录错误但继续尝试创建新容器
-            error!(
-                "[POD_RESTART] Failed to stop container (will continue creating new container): container_id={}, error={}",
-                container_info.container_id, e
-            );
-        } else {
-            info!(
-                "[POD_RESTART] Container destroyed: container_id={}",
-                container_info.container_id
-            );
-        }
-
-        // 物理销毁后，关闭旧容器的 SSE 共享流 + 清理 gRPC 连接（post-destroy；按 addr 关闭幂等，
-        // 不依赖 project/session 记录，故可在 delete_container_with_projects 之后）。
-        // 地址走 build_grpc_addr（K8s Service FQDN / Docker 容器 IP，与连接建立同源）。
-        if shared_types::is_kubernetes_runtime() || !container_info.container_ip.is_empty() {
-            let old_grpc_addr = shared_types::build_grpc_addr(
-                &container_info.container_name,
-                &container_info.container_ip,
-                &state.config.app_manager.namespace,
-                &state.cluster_domain,
-            );
-            state.shutdown_sse_streams_by_addr(&old_grpc_addr);
-            state.grpc_pool.remove(&old_grpc_addr).await;
-        }
-
-        // 验证容器是否真正移除
-        let mut deletion_confirmed = false;
-
-        for i in 0..10 {
-            // 最多等待 5 秒 (10 * 500ms)
-            match runtime
-                .find_container(&container_identifier, &service_type)
-                .await
-            {
-                Ok(Some(_)) => {
-                    if i == 0 {
-                        info!(
-                            "[POD_RESTART] Container still exists, waiting for cleanup: container_identifier={}",
-                            container_identifier
-                        );
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                }
-                Ok(None) => {
-                    info!(
-                        "[POD_RESTART] Confirmed container removed: container_identifier={}",
-                        container_identifier
-                    );
-                    deletion_confirmed = true;
-                    break;
-                }
-                Err(e) => {
-                    warn!(
-                        "[POD_RESTART] check container removed status: {}, container already removed",
-                        e
-                    );
-                    // 如果是其他错误，也可能意味着Container status abnormal，尝试继续
-                    deletion_confirmed = true;
-                    break;
-                }
-            }
-        }
-
-        if !deletion_confirmed {
-            warn!(
-                "[POD_RESTART] Wait for container removal timeout, subsequent creation may fail: container_identifier={}",
-                container_identifier
-            );
-        }
+        destroy_for_recreate(
+            &state,
+            &container_info,
+            &container_identifier,
+            &service_type,
+        )
+        .await;
     }
 
     // 4. 定义资源限制（API 入参优先，缺失字段回退 configmap 默认值）
@@ -462,4 +340,162 @@ async fn restart_userapp_prod(
         },
         message: "UserApp 生产实例已滚动重启".to_string(),
     }))
+}
+
+// ============================================================================
+// 主流程阶段实现（从 pod_restart 拆出，控制流/日志逐条保持）
+// ============================================================================
+
+/// 原地重启快路径：exec SIGTERM PID 1 → kubelet restartPolicy 原地重启容器，
+/// 卷不 unstage → ~秒级。仅容器已存在时尝试；K8s agent-runner 支持。失败
+/// （runtime 不支持 / 超时 / agent 卡死）返回 None 自动回落 destroy+recreate
+/// （慢但可靠）。原地重启 pod 名/IP/svc 不变 → VNC backend / 存储记录 /
+/// grpc 池均复用，无需重注或清理。
+async fn try_restart_inplace(
+    state: &Arc<AppState>,
+    container_identifier: &str,
+    service_type: &ServiceType,
+    existing_container: Option<&ContainerBasicInfo>,
+) -> Option<HttpResult<RestartPodResponse>> {
+    let runtime = state.runtime().clone();
+    match runtime
+        .restart_container_inplace(container_identifier, service_type)
+        .await
+    {
+        Ok(()) => {
+            info!(
+                "[POD_RESTART] Agent 原地重启完成（fast，volume 未 unstage）: container_identifier={}",
+                container_identifier
+            );
+            // 原地重启不换 pod（同 UID）→ 复用 existing_container 的 container_id；
+            // status=Running（in-place 的 poll 已确认 ready）。不再 re-fetch —— 避免 fetch 失败
+            // 时回落 destroy 把刚原地重启好的 pod 毁掉重建（违背原地重启初衷）。
+            let response = RestartPodResponse {
+                was_existing: true,
+                restarted: true,
+                container_info: existing_container
+                    .map(|c| PodContainerInfo {
+                        container_id: c.container_id.clone(),
+                        status: "Running".to_string(),
+                    })
+                    .unwrap_or_else(|| PodContainerInfo {
+                        container_id: container_identifier.to_string(),
+                        status: "Running".to_string(),
+                    }),
+                message: "Container restarted in-place (fast), can access virtual desktop via VNC (Agent service not started)".to_string(),
+            };
+            info!(
+                "[POD_RESTART] Completed (in-place): container_id={}",
+                response.container_info.container_id
+            );
+            Some(HttpResult::success(response))
+        }
+        Err(e) => {
+            warn!(
+                "[POD_RESTART] 原地重启失败，回落 destroy+recreate: container_identifier={}, err={:?}",
+                container_identifier, e
+            );
+            // 落入 destroy+recreate 兜底
+            None
+        }
+    }
+}
+
+/// 销毁既有容器为重建铺路：存储级删除（含关联 project 记录）→ 物理停止 →
+/// SSE/gRPC 连接清理 → 轮询确认移除（最多 5s）。
+///
+/// 停止失败不阻断（记日志继续创建新容器——良性竞态由后续 recreate 报错兜底）。
+async fn destroy_for_recreate(
+    state: &Arc<AppState>,
+    container_info: &ContainerBasicInfo,
+    container_identifier: &str,
+    service_type: &ServiceType,
+) {
+    info!(
+        "[POD_RESTART] Destroying existing container: container_id={}",
+        container_info.container_id
+    );
+
+    // 从存储中彻底移除旧容器及其所有关联记录
+    // 使用 container_id 删除,确保清理该容器关联的所有 project_id
+    let (container_deleted, deleted_projects) = state
+        .delete_container_with_projects_durable(&container_info.container_id)
+        .await;
+    info!(
+        "[POD_RESTART] Cleaned up old container records: container_id={}, container_deleted={}, deleted_projects={}",
+        container_info.container_id, container_deleted, deleted_projects
+    );
+
+    let runtime = state.runtime().clone();
+
+    // 使用 pod_id 优先的标识符停止容器（与创建时一致）
+    if let Err(e) = runtime
+        .stop_container_by_identifier(container_identifier, service_type)
+        .await
+    {
+        // 记录错误但继续尝试创建新容器
+        error!(
+            "[POD_RESTART] Failed to stop container (will continue creating new container): container_id={}, error={}",
+            container_info.container_id, e
+        );
+    } else {
+        info!(
+            "[POD_RESTART] Container destroyed: container_id={}",
+            container_info.container_id
+        );
+    }
+
+    // 物理销毁后，关闭旧容器的 SSE 共享流 + 清理 gRPC 连接（post-destroy；
+    // delete_container_with_projects 之后的既有顺序）
+    state
+        .teardown_container_connections(
+            &container_info.container_name,
+            &container_info.container_ip,
+        )
+        .await;
+
+    // 验证容器是否真正移除
+    let mut deletion_confirmed = false;
+
+    for i in 0..10 {
+        // 最多等待 5 秒 (10 * 500ms)
+        match runtime
+            .find_container(container_identifier, service_type)
+            .await
+        {
+            Ok(Some(_)) => {
+                if i == 0 {
+                    info!(
+                        "[POD_RESTART] Container still exists, waiting for cleanup: container_identifier={}",
+                        container_identifier
+                    );
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+            Ok(None) => {
+                info!(
+                    "[POD_RESTART] Confirmed container removed: container_identifier={}",
+                    container_identifier
+                );
+                deletion_confirmed = true;
+                break;
+            }
+            Err(e) => {
+                warn!(
+                    "[POD_RESTART] check container removed status: {}, container already removed",
+                    e
+                );
+                // 如果是其他错误，也可能意味着Container status abnormal，尝试继续
+                deletion_confirmed = true;
+                break;
+            }
+        }
+    }
+
+    if !deletion_confirmed {
+        warn!(
+            "[POD_RESTART] Wait for container removal timeout, subsequent creation may fail: container_identifier={}",
+            container_identifier
+        );
+    }
 }

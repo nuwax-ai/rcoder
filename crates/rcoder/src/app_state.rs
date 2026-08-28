@@ -314,6 +314,23 @@ impl AppState {
         }
     }
 
+    /// 物理销毁容器后关闭其 SSE 共享流并清理 gRPC 连接（post-destroy；按 addr
+    /// 关闭幂等，不依赖 project/session 记录）。地址走 `build_grpc_addr`
+    /// （K8s Service FQDN / Docker 容器 IP，与连接建立同源）。K8s 恒清；
+    /// Docker 仅在有 IP 时清。
+    pub async fn teardown_container_connections(&self, container_name: &str, container_ip: &str) {
+        if shared_types::is_kubernetes_runtime() || !container_ip.is_empty() {
+            let addr = shared_types::build_grpc_addr(
+                container_name,
+                container_ip,
+                &self.config.app_manager.namespace,
+                &self.cluster_domain,
+            );
+            self.shutdown_sse_streams_by_addr(&addr);
+            self.grpc_pool.remove(&addr).await;
+        }
+    }
+
     /// 按 grpc_addr 关闭关联的所有 SSE 共享流。
     ///
     /// 适用于记录可能已被清空的销毁路径（reaper/restart/ensure/destroyer）：这些路径中

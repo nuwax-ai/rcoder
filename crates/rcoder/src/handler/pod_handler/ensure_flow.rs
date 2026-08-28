@@ -170,18 +170,10 @@ pub(super) async fn resolve_need_create(
             );
 
             // 物理销毁成功后，关闭旧容器的 SSE 共享流 + 清理 gRPC 连接（post-destroy：
-            // stop 用 ? 返回，失败时此处不执行，避免误断可能仍存活的容器连接）。
-            // 地址走 build_grpc_addr（K8s Service FQDN / Docker 容器 IP，与连接建立同源）。
-            if shared_types::is_kubernetes_runtime() || !result.container_ip.is_empty() {
-                let old_grpc_addr = shared_types::build_grpc_addr(
-                    &result.container_name,
-                    &result.container_ip,
-                    &state.config.app_manager.namespace,
-                    &state.cluster_domain,
-                );
-                state.shutdown_sse_streams_by_addr(&old_grpc_addr);
-                state.grpc_pool.remove(&old_grpc_addr).await;
-            }
+            // stop 用 ? 返回，失败时此处不执行，避免误断可能仍存活的容器连接）
+            state
+                .teardown_container_connections(&result.container_name, &result.container_ip)
+                .await;
 
             // ⏱️ 等待 Docker 完全释放容器资源（避免竞态条件）
             // Docker 删除是异步操作，立即创建同名容器可能导致资源冲突
