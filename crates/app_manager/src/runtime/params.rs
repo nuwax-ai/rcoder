@@ -33,8 +33,8 @@ struct AppParamsInput {
     space_id: Option<String>,
     recycle_enabled: Option<bool>,
     idle_timeout_seconds: Option<u64>,
-    /// app owner 用户 ID（create 路径来自 CreateAppRequest.user_id；update 路径 None
-    /// → inner 从元数据查）。Docker 模式数据卷 bind 源（prod/{user_id}/data/{app_id}）
+    /// app owner 用户 ID（create/update 路径均来自请求必填字段；None 仅剩内部
+    /// 兼容路径 → inner 从元数据查）。Docker 模式数据卷 bind 源（prod/{user_id}/data/{app_id}）
     /// 与宿主树分区依赖它；K8s 不消费（env/挂载只用 app_id）。
     user_id: Option<String>,
 }
@@ -141,8 +141,7 @@ impl AppService {
                 idle_timeout_seconds: request
                     .idle_timeout_seconds
                     .or(current.idle_timeout_seconds),
-                // update 请求不携带 user_id（身份不变）→ inner 从元数据查
-                user_id: None,
+                user_id: Some(request.user_id.clone()),
             },
         )
         .await
