@@ -63,7 +63,7 @@ async fn test_build_identifier_validation(env: &Env, report: &JsonlReporter) {
     let t0 = Instant::now();
     let resp = env
         .http
-        .post(format!("{}/api/userapp/build", env.rcoder))
+        .post(format!("{}/api/v1/userapp/build", env.rcoder))
         .timeout(Duration::from_secs(30))
         .json(&json!({"app_id": "app-e2e-noheader", "user_id": "e2e-user"}))
         .send()
@@ -93,7 +93,7 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
     // fail fast "workspace not found"）
     let (ws_status, ws_body) = post_json(
         env,
-        "/api/userapp/workspace",
+        "/api/v1/userapp/workspace",
         json!({"app_id": ident, "user_id": "e2e-user"}),
     )
     .await;
@@ -105,7 +105,7 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
 
     let resp = env
         .http
-        .post(format!("{}/api/userapp/build", env.rcoder))
+        .post(format!("{}/api/v1/userapp/build", env.rcoder))
         .timeout(Duration::from_secs(60))
         .header("X-App-Id", &ident)
         .json(&json!({"app_id": ident, "user_id": "e2e-user"}))
@@ -145,9 +145,11 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
     while t0.elapsed() < Duration::from_secs(180) {
         let resp = env
             .http
-            .get(format!("{}/api/userapp/tasks/{task_id}", env.rcoder))
+            .get(format!(
+                "{}/api/v1/userapp/tasks/{task_id}?app_id={guard_app}",
+                env.rcoder
+            ))
             .timeout(Duration::from_secs(10))
-            .header("X-App-Id", &guard_app)
             .send()
             .await;
         if let Ok(r) = resp
@@ -187,7 +189,10 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
     // completed → 200。本场景 workspace 无真实项目，预期 failed + 404
     let static_resp = env
         .http
-        .get(format!("{}/api/userapp/static/{guard_app}", env.rcoder))
+        .get(format!(
+            "{}/api/v1/userapp/static/{guard_app}?user_id=e2e-user",
+            env.rcoder
+        ))
         .timeout(Duration::from_secs(15))
         .header("X-App-Id", &guard_app)
         .send()
@@ -220,7 +225,7 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
     // ① 不存在 + 缺 user_id → 400（数据卷分区依赖）
     let (s1, b1) = post_json(
         env,
-        &format!("/api/v1/apps/app-e2e-nokey-{suffix}/start"),
+        &format!("/api/v1/userapp/app-e2e-nokey-{suffix}/start"),
         json!({}),
     )
     .await;
@@ -234,7 +239,7 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
     let app_id = format!("app-e2e-empty-{suffix}");
     let (s2, b2) = post_json(
         env,
-        &format!("/api/v1/apps/{app_id}/start"),
+        &format!("/api/v1/userapp/{app_id}/start"),
         json!({"user_id": "e2e-user"}),
     )
     .await;
@@ -255,8 +260,8 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
         drop(
             post_json(
                 env,
-                &format!("/api/v1/apps/{app_id}/delete"),
-                json!({"purge": true}),
+                &format!("/api/v1/userapp/{app_id}/prod/delete"),
+                json!({"user_id": "e2e-user", "purge": true}),
             )
             .await,
         );
@@ -265,7 +270,7 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
     // ③ restart 无 url 对不存在 app → 404（重启语义不创建）
     let (s3, _) = post_json(
         env,
-        &format!("/api/v1/apps/app-e2e-norestart-{suffix}/restart"),
+        &format!("/api/v1/userapp/app-e2e-norestart-{suffix}/restart"),
         json!({}),
     )
     .await;
@@ -290,7 +295,7 @@ async fn test_env_scoped_files_and_storage(env: &Env, report: &JsonlReporter) {
     // 前置：建 workspace（ensure 开发容器 + 幂等建目录——upload/dev 链路的载体）
     let (ws_s, ws_b) = post_json(
         env,
-        "/api/userapp/workspace",
+        "/api/v1/userapp/workspace",
         json!({"app_id": ident, "user_id": "e2e-user"}),
     )
     .await;
@@ -308,6 +313,7 @@ async fn test_env_scoped_files_and_storage(env: &Env, report: &JsonlReporter) {
     // upload(dev)：multipart 单文件直传（target 相对开发容器 workspace 根）
     let part = reqwest::multipart::Part::bytes(b"e2e-dev-upload").file_name("hello.txt");
     let form = reqwest::multipart::Form::new()
+        .text("user_id", "e2e-user")
         .text("target", "hello.txt")
         .part("file", part);
     let resp = env
@@ -333,7 +339,10 @@ async fn test_env_scoped_files_and_storage(env: &Env, report: &JsonlReporter) {
     // files(dev)：workspace 根列表含上传文件
     let resp = env
         .http
-        .get(format!("{}/api/v1/userapp/{ident}/dev/files", env.rcoder))
+        .get(format!(
+            "{}/api/v1/userapp/{ident}/dev/files?user_id=e2e-user",
+            env.rcoder
+        ))
         .timeout(Duration::from_secs(60))
         .send()
         .await
@@ -388,7 +397,7 @@ async fn test_env_scoped_files_and_storage(env: &Env, report: &JsonlReporter) {
     let (d_s, d_b) = post_json(
         env,
         &format!("/api/v1/userapp/{ident}/dev/storage/destroy"),
-        json!({"confirm": ident}),
+        json!({"user_id": "e2e-user", "confirm": ident}),
     )
     .await;
     report.assert_hard(

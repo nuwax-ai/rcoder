@@ -52,10 +52,17 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
 
 /// 场景内唯一 app_id（run_tag+pid 防跨进程撞名；≤63 字符约束内）。
 fn scoped_app(env: &Env, tag: &str) -> String {
-    format!("e2e-ud-{}-{}", &env.run_tag.replace('_', "")[..10], tag,)
-        .chars()
-        .take(48)
-        .collect()
+    // run_tag 前 10 位=日期+小时：同小时内重跑（同 tag）会撞容器名（Docker 409，
+    // 上轮 cleanup 未达时残留即冲突）——加 pid 段对齐主套件 ident 模式
+    format!(
+        "e2e-ud-{}-p{}-{}",
+        &env.run_tag.replace('_', "")[..10],
+        std::process::id() % 1000,
+        tag
+    )
+    .chars()
+    .take(48)
+    .collect()
 }
 
 /// 显式清理开发容器（Docker: docker rm；K8s 模式由 rcoder 闲置回收兜底，
@@ -72,7 +79,7 @@ fn cleanup_builder(app_id: &str) {
 async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user: &str) -> bool {
     let (status, body) = post_json(
         env,
-        "/api/userapp/workspace",
+        "/api/v1/userapp/workspace",
         json!({"app_id": app_id, "user_id": user}),
     )
     .await;
@@ -118,7 +125,7 @@ async fn userapp_dev_files_two_entry_points() {
     // 入口 A：userApp 新接口直连（X-App-Id 定位开发容器——post_json 不带 header，直接构造）
     let resp_a = env
         .http
-        .post(format!("{}/api/userapp/generate-file", env.rcoder))
+        .post(format!("{}/api/v1/userapp/generate-file", env.rcoder))
         .timeout(Duration::from_secs(30))
         .header("X-App-Id", &app)
         .json(&json!({"appId": app, "userId": user, "fileName": "direct.txt", "content": "via direct"}))
@@ -158,7 +165,7 @@ async fn userapp_dev_files_two_entry_points() {
     let resp_l = env
         .http
         .get(format!(
-            "{}/api/userapp/get-file-list?appId={app}&userId={user}",
+            "{}/api/v1/userapp/get-file-list?appId={app}&userId={user}",
             env.rcoder
         ))
         .timeout(Duration::from_secs(30))
@@ -183,7 +190,7 @@ async fn userapp_dev_files_two_entry_points() {
     // 缺 X-App-Id 的 userApp 转发 → 400（明确提示）
     let resp = env
         .http
-        .post(format!("{}/api/userapp/generate-file", env.rcoder))
+        .post(format!("{}/api/v1/userapp/generate-file", env.rcoder))
         .timeout(Duration::from_secs(15))
         .json(&json!({"appId": app, "userId": user, "fileName": "x.txt", "content": "x"}))
         .send()
@@ -228,8 +235,8 @@ async fn userapp_dev_pg_align_idempotent() {
     while t0.elapsed() < deadline {
         let (s, b) = post_json(
             &env,
-            "/api/userapp/db/dev/align-credentials",
-            json!({"app_id": app, "username": "dev", "password": pw}),
+            "/api/v1/userapp/db/dev/align-credentials",
+            json!({"app_id": app, "user_id": user, "username": "dev", "password": pw}),
         )
         .await;
         if s.is_success() && http_ok(&b) {
@@ -260,8 +267,8 @@ async fn userapp_dev_pg_align_idempotent() {
     // 同密码复调：一致 → reset_performed=false（幂等语义）
     let (_, b2) = post_json(
         &env,
-        "/api/userapp/db/dev/align-credentials",
-        json!({"app_id": app, "username": "dev", "password": pw}),
+        "/api/v1/userapp/db/dev/align-credentials",
+        json!({"app_id": app, "user_id": user, "username": "dev", "password": pw}),
     )
     .await;
     let ok_second = http_ok(&b2) && b2["data"]["reset_performed"].as_bool() == Some(false);
