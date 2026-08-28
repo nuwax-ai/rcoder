@@ -114,7 +114,8 @@ pub enum SortOrder {
 /// （env `RCODER_RUNTIME_IMAGE_DIGEST`）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct UpdateAppRequest {
-    /// 归属用户 ID（必填；标识符白名单校验——审计留痕 + 归属校验锚点）
+    /// 宿主机数据卷分区归属目录名（必填；Docker compose 挂载路径组成段，
+    /// 容器未启动时按此自动唤醒后挂载）
     #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
     /// 应用名称（仅元数据，不影响 K8s 资源命名；rcoder 忽略）
@@ -161,8 +162,9 @@ pub struct UpdateAppRequest {
 /// 比 `UpdateAppRequest` 轻——无需 image、不走全量 SSA。至少需传一个字段（皆 None → ERR_VALIDATION）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct RecyclePolicyRequest {
-    /// 归属用户 ID（必填，白名单校验；审计留痕 + 归属校验锚点——计费 tier 变更
-    /// 是高危操作，调用方身份留痕）
+    /// 宿主机数据卷分区归属目录名（Docker compose 形态挂载路径
+    /// `prod/{user_id}/data/{app_id}` 的组成段）：容器未启动时按
+    /// user_id+app_id+app_stage 自动唤醒后挂载，策略落点才有效
     #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
     /// 是否参与闲置回收。None=不改；Some(true)=可回收（免费默认）；Some(false)=永不回收（付费/常驻）。
@@ -189,8 +191,9 @@ pub struct DeleteAppRequest {
     #[garde(skip)]
     #[serde(default)]
     pub purge: Option<bool>,
-    /// 归属用户 ID（必填；标识符白名单校验）——purge 时 `prod/{user_id}/data/{app_id}`
-    /// 分区精确定位 + 审计留痕；缺省回退 userapp_metadata.owner 的兜底路径退役。
+    /// 宿主机数据卷分区归属目录名（必填；标识符白名单校验）——purge 时按
+    /// `prod/{user_id}/data/{app_id}` 精确定位宿主目录；缺省回退
+    /// userapp_metadata.owner 的兜底路径退役。
     #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
     /// 乐观锁：传入 `GET /apps/{id}` 返回的 `resource_version`；不匹配 → 409 ERR_CONFLICT。

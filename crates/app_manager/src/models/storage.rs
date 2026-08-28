@@ -16,7 +16,7 @@ pub struct ClearStorageRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct DestroyStorageRequest {
     /// 归属用户 ID（必填，白名单校验；Docker compose 部署下销毁宿主树
-    /// `prod/{user_id}/` 该 app 四目录的定位与审计依据——K8s 走 PVC 对象、
+    /// `prod/{user_id}/` 该 app 四目录的分区定位——K8s 走 PVC 对象、
     /// Docker 走 prod/*/ 通配扫描兜底，显式值用于对账与未来精确直删）
     #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
@@ -28,7 +28,7 @@ pub struct DestroyStorageRequest {
 /// 存储查询请求（**强制分页，无全量模式**——扫存储后端代价高）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueryStorageRequest {
-    /// 归属用户 ID（必填；审计留痕——存储清单按 owner 归属审计）
+    /// 宿主机数据卷分区归属目录名（必填；存储清单按分区归属枚举）
     pub user_id: String,
     /// 页码（必填，从 1 开始）
     pub page: u32,

@@ -20,7 +20,7 @@ use crate::models::{FileInfo, UploadResult};
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct AppUploadForm {
-    /// 归属用户 ID（必填，白名单校验；dev 容器懒创建宿主树分区依据 + 审计）
+    /// 宿主机数据卷分区归属目录名（必填，白名单校验；dev 容器懒创建的宿主树分区档）
     pub user_id: String,
     /// 目标路径（app 根相对；单文件=文件路径如 code/app.jar，压缩包=解压目录如 code/；缺省 code/{文件名}）
     pub target: Option<String>,
@@ -215,7 +215,7 @@ pub struct ListFilesQuery {
     params(
         ("app_id" = String, Path, description = "应用 ID"),
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（根=workspace）/ `prod`=生产运行容器（根=/app）"),
-        ("user_id" = String, Query, description = "归属用户 ID（必填，白名单校验；dev 容器懒创建宿主树分区依据 + 审计）"),
+        ("user_id" = String, Query, description = "宿主机数据卷分区归属目录名（必填，白名单校验；dev 容器懒创建的宿主树分区档）"),
         ("path" = Option<String>, Query, description = "子目录（相对环境根，如 code/data/logs；默认列根）")
     ),
     responses(

@@ -22,7 +22,7 @@ impl AppService {
     const DEPLOY_LIST_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// 对账接口：列出该 owner 归属的应用运行时状态（metadata owner 匹配；
-    /// 无归属记录的应用不返回——归属审计口径，日志留痕）。
+    /// 无归属记录的应用不返回——分区归属口径）。
     #[instrument(skip(self))]
     pub async fn list_app_runtimes(&self, user_id: &str) -> AppResult<Vec<AppRuntimeInfo>> {
         let statuses = self.list_deployments_cached().await?;

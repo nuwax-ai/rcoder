@@ -254,7 +254,7 @@ impl crate::service::AppService {
         // 独立 storage/destroy 接口：与 PVC 同生命周期，元数据行同步删除
         // （三档删除语义的第三档）。
         self.metadata.record_deleted(app_id).await;
-        // user_id 审计留痕：Docker 下宿主目录定位由 destroy_app_pvc 的
+        // user_id 卷分区定位：Docker 下宿主目录定位由 destroy_app_pvc 的
         // prod/*/ 通配扫描兜底（正确性不依赖 metadata），显式值用于对账与
         // 未来精确直删。
         info!("[APP] app PVC destroyed: {} (user_id={})", app_id, user_id);

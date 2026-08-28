@@ -61,13 +61,13 @@ pub async fn get_app_health(
 
 /// stats 查询参数
 ///
-/// `user_id` 必填：Docker compose 部署下按 owner 关联宿主机数据卷目录
-/// （`prod/{user_id}/data/{app_id}` 分区）与调用侧映射关系维护；服务端
-/// 当前用于审计留痕与 owner 一致性校验。
+/// `user_id` 必填：宿主机数据卷分区归属目录名（Docker compose 挂载路径
+/// `prod/{user_id}/data/{app_id}` 组成段）——容器未启动时按此自动唤醒后挂载。
 #[derive(Debug, Deserialize, utoipa::IntoParams, garde::Validate)]
 #[into_params(parameter_in = Query)]
 pub struct StatsParams {
-    /// 所属用户 ID（必填；标识符白名单校验）
+    /// 宿主机数据卷分区归属目录名（必填；Docker compose 挂载路径组成段——
+    /// 容器未启动时按此自动唤醒后挂载）
     #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
 }
@@ -98,7 +98,7 @@ pub async fn get_app_stats(
     Query(params): Query<StatsParams>,
 ) -> Result<Json<HttpResult<ResourceStats>>, AppError> {
     let app_stage = super::parse_app_stage_param(&app_stage)?;
-    // 标识符白名单校验（user_id 进宿主机卷路径分区与审计留痕，含 `/` 即逃逸）
+    // 标识符白名单校验（user_id 为宿主机卷路径分区组成段，含 `/` 即逃逸）
     params
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;

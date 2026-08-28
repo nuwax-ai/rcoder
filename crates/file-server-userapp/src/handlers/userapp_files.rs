@@ -1,7 +1,7 @@
 //! `/api/v1/userapp` 文件操作镜像族（读+写）: computer 域同参镜像, workspace 走 UserApp 开发卷。
 //!
 //! 参数对齐 computer 域语义但自有命名: `appId`（≡app_id, 原 cId 改名）、`userId`
-//! （保留, 不参与路径, 仅审计日志）。定位统一 `resolve_userapp_dev` =
+//! （保留, 不参与路径, 为挂载分区组成段）。定位统一 `resolve_userapp_dev` =
 //! `{USERAPP_WORKSPACE_DIR}/{appId}`; 核心逻辑复用 computer 域 impl（bac9663 抽取）,
 //! 两域不复制实现防漂移。
 

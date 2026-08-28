@@ -2,7 +2,7 @@
 //! handler 壳在 handlers/userapp_app_files.rs）。
 //!
 //! 字段为 `pub`（models 是 crate 内公共层）；app_id 定位、user_id 必填
-//! （审计 + dev 容器懒创建显式 owner 档）。
+//! （宿主卷分区定位 + dev 容器懒创建显式 owner 档）。
 
 use serde::Deserialize;
 
@@ -12,7 +12,7 @@ pub struct AppFilesUploadForm {
     /// UserApp 应用 ID（定位 = resolve_userapp_dev；单 app 模式须与归属一致）
     pub app_id: String,
     /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
-    /// 侧仅日志审计，不参与容器内定位）
+    /// 侧为挂载分区组成段）
     pub user_id: String,
     /// app 根相对目标（压缩包=解压目录；单文件=文件路径）
     pub target: String,
@@ -35,7 +35,7 @@ pub struct AppFilesUploadFromUrlBody {
     /// UserApp 应用 ID（定位）。
     pub app_id: String,
     /// 归属用户 ID（必填；rcoder 转发链现已携带——dev 容器懒创建显式 owner
-    /// 档与审计日志双消费）。
+    /// 档与分区定位双消费）。
     pub user_id: String,
 }
 
@@ -43,7 +43,7 @@ pub struct AppFilesUploadFromUrlBody {
 pub struct AppFilesListParams {
     /// UserApp 应用 ID（定位）。
     pub app_id: String,
-    /// 归属用户 ID（必填；rcoder 转发链现已携带，审计留痕）。
+    /// 宿主机数据卷分区归属目录名（必填；rcoder 转发链现已携带——懒唤醒挂载定位）。
     pub user_id: String,
     /// app 根相对子目录（缺省列根）
     #[serde(default)]
@@ -54,7 +54,7 @@ pub struct AppFilesListParams {
 pub struct AppFilesDeleteBody {
     /// UserApp 应用 ID（定位）。
     pub app_id: String,
-    /// 归属用户 ID（必填；rcoder 转发链现已携带，审计留痕）。
+    /// 宿主机数据卷分区归属目录名（必填；rcoder 转发链现已携带——懒唤醒挂载定位）。
     pub user_id: String,
     /// app 根相对文件/目录
     pub path: String,
@@ -64,6 +64,6 @@ pub struct AppFilesDeleteBody {
 pub struct AppFilesClearBody {
     /// UserApp 应用 ID（定位）。
     pub app_id: String,
-    /// 归属用户 ID（必填；审计留痕）。
+    /// 宿主机数据卷分区归属目录名（必填；懒唤醒挂载定位）。
     pub user_id: String,
 }

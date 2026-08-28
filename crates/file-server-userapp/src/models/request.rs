@@ -20,7 +20,7 @@ pub struct BuildUserAppBody {
     #[garde(custom(file_server::validation_rules::not_blank))]
     pub app_id: String,
     /// 用户 ID（挂载压平契约字段：rcoder ensure builder 时组装宿主树
-    /// `dev/{user_id}/{app_id}` 用；file-server 侧仅日志审计，不参与容器内定位）。
+    /// `dev/{user_id}/{app_id}` 用；file-server 侧为挂载分区组成段）。
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
     pub user_id: String,
@@ -47,7 +47,7 @@ pub struct ImportProjectBody {
     #[garde(custom(file_server::validation_rules::not_blank))]
     pub app_id: String,
     /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
-    /// 侧仅日志审计，不参与容器内定位）。
+    /// 侧为挂载分区组成段）。
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
     pub user_id: String,
@@ -64,9 +64,10 @@ pub struct ImportProjectBody {
 #[into_params(parameter_in = Query)]
 pub struct TaskLogsQuery {
     /// 构建链定位 app_id（rcoder 转发层消费：目标开发容器定位与容器不在时的
-    /// 短路判定；容器侧校验白名单并记审计日志）
+    /// 短路判定；容器侧校验白名单）
     pub app_id: String,
-    /// 归属用户 ID（审计留痕；rcoder 转发层用于 dev 容器懒创建显式 owner 档）
+    /// 宿主机数据卷分区归属目录名（dev 卷 `dev/{user_id}/...` 组成段；
+    /// rcoder 转发层懒创建开发容器时的宿主树显式档）
     pub user_id: String,
     /// 子项目目录名（= service_id）；留空读 workspace 根日志目录。
     #[serde(default)]
@@ -88,9 +89,10 @@ fn default_start_index() -> usize {
 #[into_params(parameter_in = Query)]
 pub struct StreamQuery {
     /// 构建链定位 app_id（rcoder 转发层消费：目标开发容器定位与容器不在时的
-    /// 短路判定；容器侧校验白名单并记审计日志）
+    /// 短路判定；容器侧校验白名单）
     pub app_id: String,
-    /// 归属用户 ID（审计留痕；rcoder 转发层用于 dev 容器懒创建显式 owner 档）
+    /// 宿主机数据卷分区归属目录名（dev 卷 `dev/{user_id}/...` 组成段；
+    /// rcoder 转发层懒创建开发容器时的宿主树显式档）
     pub user_id: String,
     /// 从哪个 seq 开始回放（含该 seq；0 = 从头）。仅作兜底——
     /// 请求带 `Last-Event-ID` 头时以头为准（头值 + 1 = 本值语义），query 被忽略。
@@ -101,14 +103,15 @@ pub struct StreamQuery {
 /// 任务作用域定位参数（`GET /tasks/{task_id}` 与 `POST /tasks/{task_id}/cancel`）。
 ///
 /// `parameter_in` 必须显式声明（同上）。app_id 曾是 rcoder 转发层单方消费的
-/// 隐式必填项，本批下沉为容器侧显式校验；user_id 为新增审计字段。
+/// 隐式必填项，本批下沉为容器侧显式校验；user_id 为挂载分区组成段。
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct UserappTaskScopeQuery {
     /// 构建链定位 app_id（rcoder 转发层消费：目标开发容器定位与容器不在时的
-    /// 短路判定；容器侧校验白名单并记审计日志）
+    /// 短路判定；容器侧校验白名单）
     pub app_id: String,
-    /// 归属用户 ID（审计留痕；rcoder 转发层用于 dev 容器懒创建显式 owner 档）
+    /// 宿主机数据卷分区归属目录名（dev 卷 `dev/{user_id}/...` 组成段；
+    /// rcoder 转发层懒创建开发容器时的宿主树显式档）
     pub user_id: String,
 }
 
@@ -118,7 +121,7 @@ pub struct UserappTaskScopeQuery {
 pub struct UserappDevListQuery {
     /// 应用 ID（进程表按 `userapp:{app_id}` key 过滤，只返回该 app 的 dev 进程）
     pub app_id: String,
-    /// 归属用户 ID（审计留痕）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段；容器未启动时按此懒创建挂载）
     pub user_id: String,
 }
 
@@ -152,7 +155,7 @@ pub struct UserappEnsureWorkspaceBody {
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
 }
 
@@ -166,7 +169,7 @@ pub struct UserappExecCommandBody {
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
     /// shell 命令串（经 shell -c 执行，cwd=workspace）
@@ -184,7 +187,7 @@ pub struct UserappGetLogsQuery {
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     #[serde(default = "default_tail_lines")]
     /// 返回日志末尾行数；默认 200
@@ -197,7 +200,7 @@ fn default_tail_lines() -> usize {
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct UserappInstallBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     /// 语言：typescript/ts→pnpm install；python/py→pip install
     pub programming_language: String,
@@ -210,7 +213,7 @@ pub struct UserappZipBody {
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     #[serde(default)]
     /// 额外排除目录（与内置排除表合并，按任意路径段匹配）
@@ -225,7 +228,7 @@ pub struct UserappDownloadQuery {
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     #[serde(default)]
     #[garde(skip)]
@@ -239,7 +242,7 @@ pub struct UserappDownloadQuery {
 pub struct UserappInitTemplateForm {
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     #[schema(format = Binary)]
     /// 上传文件（zip 或单文件）
@@ -254,7 +257,7 @@ pub struct UserappInitTemplateForm {
 pub struct UserappPushSkillsForm {
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     #[schema(format = Binary)]
     /// 上传文件（zip 或单文件）
@@ -276,7 +279,7 @@ pub struct UserappFileListQuery {
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     #[serde(default)]
     #[garde(skip)]
@@ -304,7 +307,7 @@ pub struct UserappResolveFileQuery {
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     #[serde(default)]
     #[garde(skip)]
@@ -327,7 +330,7 @@ pub struct UserappSearchFilesQuery {
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     #[serde(default)]
     #[garde(skip)]
@@ -362,7 +365,7 @@ pub struct UserappFilesUpdateBody {
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     /// 上传文件的二进制内容（重复字段，与 filePaths 一一对应）
     pub files: Vec<FileOp>,
@@ -377,7 +380,7 @@ pub struct UserappFilesUpdateBody {
 pub struct UserappUploadFileForm {
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     /// workspace 内相对路径的文件（必填非空）
     pub file_path: String,
@@ -394,7 +397,7 @@ pub struct UserappUploadFileForm {
 pub struct UserappUploadFilesForm {
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
@@ -414,7 +417,7 @@ pub struct UserappGenerateFileBody {
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
     /// 文件名，可含相对子路径（如 "src/foo.txt"；自动剥前导 `/`）
@@ -433,7 +436,7 @@ pub struct UserappGenerateFileBody {
 pub struct UserappImportProjectForm {
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
     /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
@@ -454,7 +457,7 @@ pub struct DevOpBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
     /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树
-    /// `dev/{user_id}/{app_id}` 用；file-server 侧日志审计，不参与容器内定位）
+    /// `dev/{user_id}/{app_id}` 用；file-server 侧为挂载分区组成段）
     pub user_id: String,
     #[serde(default)]
     #[garde(skip)]

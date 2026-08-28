@@ -2,7 +2,7 @@
 //!
 //! - **开发域工具族**：`/userapp/dev/{ttyd,vnc,audio,ime,dbx}/{user_id}/{app_id}`——
 //!   定位 UserAppBuilder 开发容器；user_id 是懒创建显式 owner 档（dev/{user_id}/{app_id}
-//!   宿主树分区）+ 审计锚点（与 computer 族按 user_id 定位沙箱对称）。
+//!   宿主树分区）+ 卷分区定位（与 computer 族按 user_id 定位沙箱对称）。
 //! - **生产域工具族**：`/userapp/prod/{ttyd,pgweb,dbx}/{user_id}/{app_id}`——定位
 //!   `ServiceType::UserApp` 运行容器；user_id 为归属校验锚点（容器不在时配合唤醒）。
 //! - **应用流量族**（免端口）：`/proxy/userapp/{dev,prod}/{user_id}/{app_id}`——
@@ -95,7 +95,7 @@ async fn redirect_doc_response(
 > 例：`GET /userapp/dev/ttyd/u1/app-order-svc/`（终端页面）；WebSocket `/userapp/dev/ttyd/u1/app-order-svc/ws`。
 "#,
     params(
-        ("user_id" = String, Path, description = "归属用户 ID（dev 懒创建显式 owner 档 + 审计锚点；prod 归属校验锚点）"),
+        ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
         ("app_id" = String, Path, description = "应用 ID（定位其 per-app 开发容器；workspace 须已创建）"),
         ("path" = String, Path, description = "ttyd 内路径（`/` 终端页面；`ws` WebSocket）")
     ),
@@ -129,7 +129,7 @@ pub async fn proxy_to_userapp_ttyd(
 > 例：`GET /userapp/dev/vnc/u1/app-order-svc/vnc.html`（桌面页面）；WebSocket `/userapp/dev/vnc/u1/app-order-svc/websockify`。
 "#,
     params(
-        ("user_id" = String, Path, description = "归属用户 ID（dev 懒创建显式 owner 档 + 审计锚点；prod 归属校验锚点）"),
+        ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
         ("app_id" = String, Path, description = "应用 ID（定位其 per-app 开发容器）"),
         ("path" = String, Path, description = "noVNC 内路径（`vnc.html` 页面；`websockify` WebSocket）")
     ),
@@ -165,7 +165,7 @@ pub async fn proxy_to_userapp_vnc(
 > 例：`GET /userapp/dev/audio/u1/app-order-svc/`（播放器页面）；WebSocket `/userapp/dev/audio/u1/app-order-svc/ws`。
 "#,
     params(
-        ("user_id" = String, Path, description = "归属用户 ID（dev 懒创建显式 owner 档 + 审计锚点；prod 归属校验锚点）"),
+        ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
         ("app_id" = String, Path, description = "应用 ID（定位其 per-app 开发容器）"),
         ("path" = String, Path, description = "`ws`/`ws/*` 走 6089 流；其余走 6090 静态")
     ),
@@ -199,7 +199,7 @@ pub async fn proxy_to_userapp_audio(
 > 例：`WebSocket /userapp/dev/ime/u1/app-order-svc/connect`。
 "#,
     params(
-        ("user_id" = String, Path, description = "归属用户 ID（dev 懒创建显式 owner 档 + 审计锚点；prod 归属校验锚点）"),
+        ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
         ("app_id" = String, Path, description = "应用 ID（定位其 per-app 开发容器）"),
         ("path" = String, Path, description = "`connect` 为 WebSocket 连接端点")
     ),
@@ -235,7 +235,7 @@ Web GUI（60+ 数据库，supervisor 恒起 4224）——开发阶段查库/改�
 > 例：`GET /userapp/dev/dbx/u1/app-order-svc/`（DBX 控制台页面）。
 "#,
     params(
-        ("user_id" = String, Path, description = "归属用户 ID（dev 懒创建显式 owner 档 + 审计锚点；prod 归属校验锚点）"),
+        ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
         ("app_id" = String, Path, description = "应用 ID（定位其 per-app 开发容器；workspace 须已创建）"),
         ("path" = String, Path, description = "dbx 内路径（`/` 控制台页面；`api/*` REST；WebSocket 透传）")
     ),
@@ -274,7 +274,7 @@ pub async fn proxy_to_dev_dbx(
 > 例：`GET /userapp/prod/ttyd/u1/app-order-svc/`；WebSocket `/userapp/prod/ttyd/u1/app-order-svc/ws`。
 "#,
     params(
-        ("user_id" = String, Path, description = "归属用户 ID（dev 懒创建显式 owner 档 + 审计锚点；prod 归属校验锚点）"),
+        ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
         ("app_id" = String, Path, description = "应用 ID（定位其运行容器）"),
         ("path" = String, Path, description = "ttyd 内路径（`/` 终端页面；`ws` WebSocket）")
     ),
@@ -308,7 +308,7 @@ pub async fn proxy_to_userapp_runtime_ttyd(
 > 例：`GET /userapp/prod/pgweb/u1/app-order-svc/`（控制台页面）。
 "#,
     params(
-        ("user_id" = String, Path, description = "归属用户 ID（dev 懒创建显式 owner 档 + 审计锚点；prod 归属校验锚点）"),
+        ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
         ("app_id" = String, Path, description = "应用 ID（定位其运行容器）"),
         ("path" = String, Path, description = "pgweb 内路径（`/` 控制台页面）")
     ),
@@ -343,7 +343,7 @@ pub async fn proxy_to_userapp_runtime_pgweb(
 > 例：`GET /userapp/prod/dbx/u1/app-order-svc/`（DBX 控制台页面）。
 "#,
     params(
-        ("user_id" = String, Path, description = "归属用户 ID（dev 懒创建显式 owner 档 + 审计锚点；prod 归属校验锚点）"),
+        ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
         ("app_id" = String, Path, description = "应用 ID（定位其运行容器）"),
         ("path" = String, Path, description = "dbx 内路径（`/` 控制台页面）")
     ),

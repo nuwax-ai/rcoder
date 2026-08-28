@@ -367,7 +367,7 @@ impl AppService {
                 app_id,
                 RecyclePolicyRequest {
                     // start 内部链构造：user_id 取请求显式档（StartAppRequest
-                    // .user_id 已是必填 String——owner 审计值直传）
+                    // .user_id 已是必填 String——分区归属值直传）
                     user_id: request.user_id.clone(),
                     recycle_enabled: Some(idle > 0),
                     idle_timeout_seconds: Some(idle),

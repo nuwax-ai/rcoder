@@ -95,7 +95,7 @@ pub(crate) fn reply<T>(r: AppResult<T>) -> UserAppReply<T> {
 /// 开始（含）"，故头值需 +1 换算。头存在但非数字时忽略头回退 query
 ///（EventSource 不会发非数字 id，此分支只有手写客户端会触发，info 留痕）。
 /// tasks 族作用域校验：app_id/user_id 必填白名单（app_id 原是 rcoder 转发层
-/// 单方消费的隐式必填，本批下沉容器侧；user_id 审计留痕）。
+/// 单方消费的隐式必填，本批下沉容器侧；user_id 为挂载分区组成段）。
 fn validate_task_scope(scope: &UserappTaskScopeQuery, task_id: &str) -> Result<(), AppError> {
     shared_types::validate_identifier(&scope.app_id, "app_id")
         .map_err(|e| AppError::validation(e.to_string()))?;

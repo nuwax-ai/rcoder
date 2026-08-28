@@ -29,7 +29,7 @@ pub trait AppServiceTrait: Send + Sync {
     /// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态
     ///
     /// 供 Java 在 rcoder/自身重启后对账（rcoder 不持久化 app 元数据）。
-    /// 按 metadata owner 过滤（无归属记录的应用不返回——归属审计口径）。
+    /// 按 metadata owner 过滤（无归属记录的应用不返回——分区归属口径）。
     async fn list_app_runtimes(&self, user_id: &str) -> AppResult<Vec<AppRuntimeInfo>>;
 
     /// 无过滤全量版（系统内部扫描面：闲置回收器覆盖所有 app，与归属无关）。
