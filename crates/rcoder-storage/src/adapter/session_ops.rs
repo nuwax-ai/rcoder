@@ -154,58 +154,6 @@ impl ProjectAdapter {
         Ok(())
     }
 
-    /// 单值更新 session（已废弃，新代码请用 `insert_with_session` 或新 `add_session` 路径）
-    ///
-    /// 历史问题：本方法非原子（write_session_index + entry 两步），并发调用会产生 session 互踩。
-    /// 多 session 模型下，请改用 `insert_with_session` 走 add-only 路径。
-    #[deprecated(
-        since = "0.0.0",
-        note = "非原子且语义已变更，请用 `insert_with_session` 走多 session 路径"
-    )]
-    pub fn update_session(&self, project_id: &str, session_id: &str) {
-        // 走 add_session 语义，不再覆盖（兼容旧调用点 + 多 session）
-        if let Entry::Occupied(mut e) = self.projects.entry(project_id.to_string()) {
-            let info = Arc::make_mut(e.get_mut());
-            info.add_session(session_id);
-        }
-
-        // 维护 session_index（追加，不清旧）
-        let ck = self
-            .project_to_container
-            .view(project_id, |_, v| v.clone())
-            .unwrap_or_default();
-        self.session_index
-            .insert(session_id.to_string(), (ck, project_id.to_string()));
-
-        // 更新容器活跃时间
-        if let Some(ck) = self.project_to_container.view(project_id, |_, v| v.clone()) {
-            self.containers.view(&ck, |_, ce| ce.update_activity());
-        }
-    }
-
-    /// 原子更新 session（已废弃，CAS 语义在多 session 模型下不再适用）
-    #[deprecated(since = "0.0.0", note = "CAS 语义在多 session 模型下不再适用")]
-    #[allow(dead_code)]
-    pub fn update_session_atomic(
-        &self,
-        project_id: &str,
-        new_session_id: &str,
-        _expected_current_session_id: Option<&str>,
-    ) -> bool {
-        // 简化：直接走 add_session（不再做 CAS 检查）
-        if let Entry::Occupied(mut e) = self.projects.entry(project_id.to_string()) {
-            let info = Arc::make_mut(e.get_mut());
-            info.add_session(new_session_id);
-        }
-        let ck = self
-            .project_to_container
-            .view(project_id, |_, v| v.clone())
-            .unwrap_or_default();
-        self.session_index
-            .insert(new_session_id.to_string(), (ck, project_id.to_string()));
-        true
-    }
-
     /// 清空该 project 的所有 session（agent stop 场景）
     ///
     /// 语义：当用户主动 stop agent 时，所有 session 失效。

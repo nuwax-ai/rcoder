@@ -412,19 +412,6 @@ impl AppState {
             .await
     }
 
-    /// 更新会话信息（已废弃，请用 `add_session_to_project` 或 `insert_project_with_session`）
-    ///
-    /// 存储契约（ProjectStore）只保留多 session 语义；本委托直接转发
-    /// `add_session_to_project`（adapter 侧废弃同名方法也是该语义）。
-    #[inline]
-    #[deprecated(
-        since = "0.0.0",
-        note = "非原子，请用 `add_session_to_project` 走多 session 路径"
-    )]
-    pub fn update_session(&self, project_id: &str, session_id: &str) {
-        let _ = self.projects.add_session_to_project(project_id, session_id);
-    }
-
     /// 清除会话信息（清所有 session，agent stop 场景）——durable 变体：
     /// stop 路径调用（与插入类 durable 同事务语义，消队列倒挂窗口）。
     pub async fn clear_session_durable(&self, project_id: &str) {
