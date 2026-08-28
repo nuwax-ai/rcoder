@@ -1,58 +1,26 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::{BufRead, Read, Seek};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::DateTime;
 use globset::Glob;
-use workspace_manifest::{LockedService, LogFormat, LogSource, ReleaseLock};
+use workspace_manifest::{LockedService, LogFormat, ReleaseLock};
 
+use super::filter::compare_timestamps;
 use super::model::{
     CursorState, FileCursor, LogQueryRequest, LogQueryResponse, LogRecord, LogSourceInfo,
     MAX_CURSOR_BYTES, MAX_KEYWORD_BYTES, MAX_SERVICES, MAX_SOURCES, MAX_TAIL_PER_SOURCE,
     SourceCursor, SourceError,
 };
+use super::read::read_file;
+pub use super::sources::LogLayout;
+use super::sources::{MatchedLogFile, SelectedSource, file_identity, inject_runtime_log_sources};
 
 const MAX_FILES_PER_SOURCE: usize = 128;
-const MAX_LINE_BYTES: usize = 1024 * 1024;
-
-/// runtime 日志源为平台注入：supervisor 会为每个服务落盘 runtime.out.log /
-/// runtime.err.log（轮转命名 runtime.out.N.log），即使 manifest 未声明也应可查。
-/// 纯内存变换，不写回 release.lock；用户已声明同 id source 时以用户声明为准，不覆盖。
-fn inject_runtime_log_sources(release: &mut ReleaseLock, layout: LogLayout) {
-    for service in &mut release.services {
-        if service.logs.iter().any(|source| source.id == "runtime") {
-            continue;
-        }
-        let glob = match layout {
-            LogLayout::Builtin => "runtime.*.log".to_string(),
-            // supervisord 单目录合流文件：{svc}.log（glob 相对 services/ 目录）
-            LogLayout::Supervisord => format!("{}.log", service.service_id),
-        };
-        service.logs.push(LogSource {
-            id: "runtime".into(),
-            glob,
-            format: LogFormat::Text,
-            multiline_start_pattern: None,
-        });
-    }
-}
-
-/// runtime 日志源（服务 stdout/stderr 落盘）的目录布局。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LogLayout {
-    /// builtin 引擎：app-cli 亲自 pipe 服务 stdout → `{log_root}/{svc}/runtime.*.log`。
-    #[default]
-    Builtin,
-    /// supervisord 引擎：program stdout 由 supervisord 落盘
-    /// `{log_root}/services/{svc}.log`（redirect_stderr 合流，轮转由 supervisord 管）。
-    /// 用户声明源（应用自写文件，APP_LOG_DIR={log_root}/{svc}）两布局目录一致。
-    Supervisord,
-}
-
 #[derive(Clone)]
 pub struct LogService {
     /// enabled 服务集（已注入 runtime 日志源）。server 动态形态下每次查询按当前
@@ -61,19 +29,6 @@ pub struct LogService {
     log_root: PathBuf,
     boot_id: String,
     layout: LogLayout,
-}
-
-#[derive(Clone)]
-struct SelectedSource {
-    service_id: String,
-    source: LogSource,
-}
-
-struct MatchedLogFile {
-    path: PathBuf,
-    identity: String,
-    len: u64,
-    modified: std::time::SystemTime,
 }
 
 impl LogService {
@@ -502,227 +457,11 @@ impl LogService {
     }
 }
 
-struct ReadOutcome {
-    records: Vec<LogRecord>,
-    offset: u64,
-    complete: bool,
-}
-
-fn read_file(
-    path: &Path,
-    start: u64,
-    selected: &SelectedSource,
-    request: &LogQueryRequest,
-    tail_limit: Option<usize>,
-    record_limit: Option<usize>,
-    cancelled: &AtomicBool,
-) -> Result<ReadOutcome> {
-    let mut file = std::fs::File::open(path)?;
-    let length = file.metadata()?.len();
-    let safe_start = if start > length { 0 } else { start };
-    file.seek(std::io::SeekFrom::Start(safe_start))?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut offset = safe_start;
-    let mut records = VecDeque::new();
-    let multiline_start = if selected.source.format == LogFormat::Text {
-        selected
-            .source
-            .multiline_start_pattern
-            .as_deref()
-            .map(regex::Regex::new)
-            .transpose()
-            .context("compile multiline_start_pattern")?
-    } else {
-        None
-    };
-    let mut pending_multiline: Option<LogRecord> = None;
-    let mut complete = true;
-    loop {
-        if cancelled.load(Ordering::Relaxed) {
-            anyhow::bail!("log query cancelled");
-        }
-        let mut line = Vec::new();
-        let read = reader
-            .by_ref()
-            .take((MAX_LINE_BYTES + 1) as u64)
-            .read_until(b'\n', &mut line)?;
-        if read == 0 {
-            break;
-        }
-        if line.len() > MAX_LINE_BYTES {
-            anyhow::bail!("log line exceeds {MAX_LINE_BYTES} bytes");
-        }
-        let current_offset = offset;
-        offset += u64::try_from(read).context("line size conversion")?;
-        let message = String::from_utf8_lossy(&line)
-            .trim_end_matches(['\r', '\n'])
-            .to_string();
-        let (timestamp, level, rendered) = parse_line(&message, &selected.source.format);
-        let record = LogRecord {
-            service_id: selected.service_id.clone(),
-            source_id: selected.source.id.clone(),
-            file: path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            offset: current_offset,
-            timestamp,
-            level,
-            message: rendered,
-        };
-        if let Some(start) = &multiline_start {
-            if start.is_match(&record.message) || pending_multiline.is_none() {
-                if let Some(previous) = pending_multiline.take()
-                    && push_record(&mut records, previous, request, tail_limit, record_limit)
-                {
-                    // 当前行已读出但属于下一条逻辑记录；cursor 回到该行开头，
-                    // 下一页重新读取，避免达到分页上限时丢日志。
-                    offset = current_offset;
-                    complete = false;
-                    break;
-                }
-                pending_multiline = Some(record);
-            } else if let Some(previous) = pending_multiline.as_mut() {
-                previous.message.push('\n');
-                previous.message.push_str(&record.message);
-            }
-        } else if push_record(&mut records, record, request, tail_limit, record_limit) {
-            complete = false;
-            break;
-        }
-    }
-    if complete && let Some(record) = pending_multiline {
-        let _ = push_record(&mut records, record, request, tail_limit, record_limit);
-    }
-    Ok(ReadOutcome {
-        records: records.into(),
-        offset,
-        complete,
-    })
-}
-
-fn push_record(
-    records: &mut VecDeque<LogRecord>,
-    record: LogRecord,
-    request: &LogQueryRequest,
-    tail_limit: Option<usize>,
-    record_limit: Option<usize>,
-) -> bool {
-    if !matches_filters(
-        request,
-        record.timestamp.as_deref(),
-        record.level.as_deref(),
-        &record.message,
-    ) {
-        return false;
-    }
-    records.push_back(record);
-    if let Some(limit) = tail_limit {
-        if records.len() > limit {
-            records.pop_front();
-        }
-        false
-    } else {
-        records.len() >= record_limit.unwrap_or(MAX_TAIL_PER_SOURCE)
-    }
-}
-
-fn parse_line(line: &str, format: &LogFormat) -> (Option<String>, Option<String>, String) {
-    if format == &LogFormat::Jsonl
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
-    {
-        let timestamp = value
-            .get("timestamp")
-            .or_else(|| value.get("time"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let level = value
-            .get("level")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let message = value
-            .get("message")
-            .or_else(|| value.get("msg"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(line)
-            .to_owned();
-        return (timestamp, level, message);
-    }
-    (None, None, line.to_owned())
-}
-
-fn matches_filters(
-    request: &LogQueryRequest,
-    timestamp: Option<&str>,
-    level: Option<&str>,
-    message: &str,
-) -> bool {
-    if let Some(keyword) = &request.keyword
-        && !message.contains(keyword)
-    {
-        return false;
-    }
-    if !request.levels.is_empty()
-        && !level.is_some_and(|value| {
-            request
-                .levels
-                .iter()
-                .any(|expected| expected.eq_ignore_ascii_case(value))
-        })
-    {
-        return false;
-    }
-    if request.since.is_some() || request.until.is_some() {
-        let Some(timestamp) = timestamp.and_then(parse_timestamp) else {
-            return false;
-        };
-        if let Some(since) = request.since.as_deref().and_then(parse_timestamp)
-            && timestamp < since
-        {
-            return false;
-        }
-        if let Some(until) = request.until.as_deref().and_then(parse_timestamp)
-            && timestamp > until
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::<FixedOffset>::parse_from_rfc3339(value)
-        .ok()
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-}
-
-fn compare_timestamps(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {
-    match (
-        left.and_then(parse_timestamp),
-        right.and_then(parse_timestamp),
-    ) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => left.cmp(&right),
-    }
-}
-
-#[cfg(unix)]
-fn file_identity(_path: &Path, metadata: &std::fs::Metadata) -> String {
-    use std::os::unix::fs::MetadataExt;
-    format!("{}:{}", metadata.dev(), metadata.ino())
-}
-
-#[cfg(not(unix))]
-fn file_identity(path: &Path, _metadata: &std::fs::Metadata) -> String {
-    // Rust 标准库在所有非 Unix 平台上没有统一稳定的 file-id API。日志目录和
-    // 文件名已经过边界校验，以路径作为稳定 identity 可避免每次 append 都重置 cursor。
-    path.to_string_lossy().into_owned()
-}
-
 #[cfg(test)]
 mod tests {
+    use workspace_manifest::LogSource;
+
+    use super::super::read::MAX_LINE_BYTES;
     use super::*;
 
     fn release_lock() -> ReleaseLock {
@@ -762,80 +501,6 @@ format = "jsonl"
 "#,
         )
         .expect("valid release lock")
-    }
-
-    #[test]
-    fn multiline_text_combines_stack_trace_lines() {
-        let root = tempfile::tempdir().expect("log root");
-        let path = root.path().join("application.log");
-        std::fs::write(
-            &path,
-            "2026-07-29 ERROR failed\n  at example::main\n2026-07-29 INFO recovered\n",
-        )
-        .expect("write multiline log");
-        let selected = SelectedSource {
-            service_id: "api".into(),
-            source: LogSource {
-                id: "application".into(),
-                glob: "application*.log".into(),
-                format: LogFormat::Text,
-                multiline_start_pattern: Some(r"^\d{4}-\d{2}-\d{2}".into()),
-            },
-        };
-        let outcome = read_file(
-            &path,
-            0,
-            &selected,
-            &LogQueryRequest::default(),
-            Some(2),
-            None,
-            &AtomicBool::new(false),
-        )
-        .expect("read multiline log");
-        assert_eq!(outcome.records.len(), 2);
-        assert!(outcome.records[0].message.contains("at example::main"));
-        assert_eq!(outcome.records[1].message, "2026-07-29 INFO recovered");
-
-        let tail = read_file(
-            &path,
-            0,
-            &selected,
-            &LogQueryRequest::default(),
-            Some(1),
-            None,
-            &AtomicBool::new(false),
-        )
-        .expect("tail multiline log");
-        assert_eq!(tail.records.len(), 1);
-        assert_eq!(tail.records[0].message, "2026-07-29 INFO recovered");
-    }
-
-    #[test]
-    fn invalid_multiline_pattern_fails_fast() {
-        let root = tempfile::tempdir().expect("log root");
-        let path = root.path().join("application.log");
-        std::fs::write(&path, "line\n").expect("write log");
-        let selected = SelectedSource {
-            service_id: "api".into(),
-            source: LogSource {
-                id: "application".into(),
-                glob: "application*.log".into(),
-                format: LogFormat::Text,
-                multiline_start_pattern: Some("[".into()),
-            },
-        };
-        assert!(
-            read_file(
-                &path,
-                0,
-                &selected,
-                &LogQueryRequest::default(),
-                Some(100),
-                None,
-                &AtomicBool::new(false),
-            )
-            .is_err()
-        );
     }
 
     #[tokio::test]
