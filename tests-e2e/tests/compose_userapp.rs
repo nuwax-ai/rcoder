@@ -146,7 +146,7 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
         let resp = env
             .http
             .get(format!(
-                "{}/api/v1/userapp/tasks/{task_id}?app_id={guard_app}",
+                "{}/api/v1/userapp/tasks/{task_id}?app_id={guard_app}&user_id=e2e-user",
                 env.rcoder
             ))
             .timeout(Duration::from_secs(10))

@@ -39,7 +39,7 @@ UserApp 全量业务接口已验证通过。长期运行的 UserApp 占用 K8s �
 
 - **R1 自动回收**：闲置超过阈值的 Running UserApp → scale replicas 0。仅回收 `managed-by=rcoder-app-manager` 的 Deployment；跳过 `protection_seconds` 内新建的 app。
 - **R2 配置开关**：全局 `enabled`(默认 true，可由部署侧关闭) + `idle_timeout_seconds`(默认 432000=5天) + `scan_interval_seconds`(默认 3600) + `wake_timeout_seconds`(默认 60) + `protection_seconds`(默认 300)。
-- **R3 流量唤醒**：仅由空闲回收产生的 stopped UserApp 收到 `/proxy/userapp/prod/{user_id}/{id}/...` 请求时，自动 scale 1 → 轮询 Ready（上限 `wake_timeout`）→ Ready 后正常代理；超时返回 503+`Retry-After: 15`。用户手动停止和发布切换期间禁止流量唤醒。
+- **R3 流量唤醒**：仅由空闲回收产生的 stopped UserApp 收到 `/proxy/userapp/prod/{user_id}/{id}/...`（应用流量族，touch）或 `/userapp/prod/{tool}/{user_id}/{id}/...`（工具族，wake-without-touch）请求时，自动 scale 1 → 轮询 Ready（上限 `wake_timeout`）→ Ready 后正常代理；超时返回 503+`Retry-After: 15`。用户手动停止和发布切换期间禁止流量唤醒。
 - **R4 per-app 回收策略（付费/免费分层）**：默认所有 UserApp **可回收**（= 免费用户语义）。允许对**单独 app** 设为不回收——通过 `CreateAppRequest`/`UpdateAppRequest` 的 `recycle_enabled: Option<bool>` 字段（rcoder 持久化为 Deployment 注解 `rcoder.io/recycle-enabled`），`false` = **永不回收**（付费 / 需常驻的 app）。另支持 `idle_timeout_seconds: Option<u64>` 字段（注解 `rcoder.io/idle-timeout-seconds`）覆盖全局阈值。**rcoder 不感知"付费/免费"业务概念**，只看布尔；tier→bool 映射由 Java 调用方决定（付费 → `recycle_enabled=false`）。
 
 ### 1.3 非目标
