@@ -101,7 +101,6 @@ pub struct RegistryStats {
 
 use tracing::info;
 
-
 impl AgentSessionRegistry {
     /// 设置项目为 Pending 状态（用于预占位，防止并发请求）
     ///

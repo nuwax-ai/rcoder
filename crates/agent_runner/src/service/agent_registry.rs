@@ -290,7 +290,6 @@ impl AgentSessionRegistry {
         }
     }
 
-
     // ========== 查询操作 ==========
 
     /// 通过 session_id 获取 project_id（O(1) 复杂度）
@@ -389,7 +388,6 @@ impl AgentSessionRegistry {
     }
 
     // ========== 清理操作 ==========
-
 
     // ========== 遍历操作 ==========
 

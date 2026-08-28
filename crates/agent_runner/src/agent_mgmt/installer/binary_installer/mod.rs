@@ -10,7 +10,9 @@ mod stream;
 
 pub use bytes::{IncomingStream, InstallFileParams, install_from_bytes};
 pub use file::install_from_file;
-pub use stream::{InstallBytesParams, StreamMetadata, install_from_prepared_stream, install_from_stream};
+pub use stream::{
+    InstallBytesParams, StreamMetadata, install_from_prepared_stream, install_from_stream,
+};
 
 #[cfg(test)]
 mod tests {
@@ -19,8 +21,8 @@ mod tests {
     use shared_types_grpc::InstallAgentRequest;
 
     use super::staging::detect_file_type;
-    use crate::agent_mgmt::error::AgentMgmtError;
     use super::*;
+    use crate::agent_mgmt::error::AgentMgmtError;
     use crate::agent_mgmt::path_manager::PathManager;
     use crate::agent_mgmt::registry::AgentRegistry;
     use tempfile::tempdir;

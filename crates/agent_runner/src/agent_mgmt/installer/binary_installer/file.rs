@@ -24,7 +24,7 @@ use shared_types_grpc::{InstallAgentRequest, InstallAgentResponse};
 use tracing::{debug, info, warn};
 
 use super::bytes::InstallFileParams;
-use super::staging::{StagingInstallParams, _install_from_staging, detect_file_type};
+use super::staging::{_install_from_staging, StagingInstallParams, detect_file_type};
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
 use crate::agent_mgmt::path_manager::PathManager;
 use crate::agent_mgmt::registry::AgentRegistry;
@@ -32,7 +32,6 @@ use crate::agent_mgmt::registry::AgentRegistry;
 /// Server-side stream type (matches `tonic::Streaming<InstallAgentRequest>`).
 pub type IncomingStream =
     Pin<Box<dyn Stream<Item = Result<InstallAgentRequest, tonic::Status>> + Send>>;
-
 
 /// 文件路径安装入口（避免全量读入内存）。
 ///
@@ -166,4 +165,3 @@ pub async fn install_from_file(
     )
     .await
 }
-

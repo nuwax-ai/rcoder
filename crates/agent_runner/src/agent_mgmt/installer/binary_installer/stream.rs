@@ -33,7 +33,6 @@ use crate::agent_mgmt::registry::AgentRegistry;
 pub type IncomingStream =
     Pin<Box<dyn Stream<Item = Result<InstallAgentRequest, tonic::Status>> + Send>>;
 
-
 /// 预解析的 stream metadata（由 gRPC 层解析后传入，避免重复解析）
 pub struct StreamMetadata {
     pub agent_id: String,
@@ -216,4 +215,3 @@ pub async fn install_from_prepared_stream(
     )
     .await
 }
-

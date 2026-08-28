@@ -25,15 +25,14 @@ use shared_types::InstallType;
 use shared_types_grpc::{InstallAgentRequest, InstallAgentResponse};
 use tracing::{debug, info, warn};
 
-use crate::agent_mgmt::installer::archive_installer;
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
 use crate::agent_mgmt::installer::AgentManifest;
+use crate::agent_mgmt::installer::archive_installer;
 use crate::agent_mgmt::registry::AgentRegistry;
 
 /// Server-side stream type (matches `tonic::Streaming<InstallAgentRequest>`).
 pub type IncomingStream =
     Pin<Box<dyn Stream<Item = Result<InstallAgentRequest, tonic::Status>> + Send>>;
-
 
 /// staging 安装参数
 pub(super) struct StagingInstallParams<'a> {
@@ -214,7 +213,6 @@ pub(super) async fn _install_from_staging(
     })
 }
 
-
 /// Detect file type by magic bytes.
 /// Returns one of: "elf" | "pe" | "script" | "tar.gz" | "zip" | "executable"
 ///
@@ -265,4 +263,3 @@ pub(super) fn make_executable_sync(path: &Path) -> AgentMgmtResult<()> {
     }
     Ok(())
 }
-
