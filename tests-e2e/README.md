@@ -93,6 +93,13 @@ grep '"kind":"subscribe_end"' tests-e2e/reports/<run>/<scenario>.jsonl | jq .
 **compose_userapp**：tasks/query 分页、publish 标识校验快速失败、publish 有限时间达终态
 （activate 死锁修复行为面）、无 release lock 创建拦截。
 
+**compose_userapp_deploy**（userApp 部署主流程全链，~15-25 分钟）：template-cli 全量模板
+初始化（7 服务）→ build 到 completed（release_id/sha256 快照）→ static 取包 sha256 校验 →
+start(url) 部署 → pingora 七路流量（`/`、`/react`、`/vue`、四后端 readiness）→ prod
+delete purge。镜像前置不满足时 verdict=skip（dev-app-runtime:latest 存在 +
+dev-rcoder-agent-runner:latest 含 template-cli——`make docker-build-app-runtime` /
+`make docker-build-agent-runner` 重建）。构建依赖外网（npm/maven/pypi/goproxy/crates）。
+
 **k8s_lb**（lb_test.py 完整移植）：入口轮换 4 轮、跨入口游标续传、新会话跨入口
 （durable+回源 1s 验收窗口）。清理走 ssh kubectl（ns 硬限定 + user 前缀严格匹配）。
 
@@ -106,6 +113,6 @@ grep '"kind":"subscribe_end"' tests-e2e/reports/<run>/<scenario>.jsonl | jq .
 ```
 src/common/        # lib 目标（多测试目标共享编译一次）：env/gate/chat、SSE 客户端、
                    #   JSONL 报告器、场景编排件（collect_reported/spawn_chat）
-tests/compose_sse.rs / compose_userapp.rs / k8s_lb.rs   # 三个测试目标
+tests/compose_sse.rs / compose_userapp*.rs / k8s_lb.rs   # 测试目标
 reports/           # .gitignore；JSONL 报告与 summary.json
 ```
