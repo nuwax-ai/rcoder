@@ -549,15 +549,29 @@ pub(crate) async fn forward_userapp(
 
     // static/{app_id}：构建链 dev-only（制品 zip 在 dev workspace，prod 容器必
     // 404——忽略 X-App-Stage，与 tasks 族同语义），query user_id 必填（🟢 ensure
-    // 显式档）。校验先于 header 定位：必填契约不因 stage 取值被绕过。
+    // 显式档）。app_id 取 path 段（签名自描述）：制品下载方是 app-cli（容器内
+    // 部署下载，URL 由 start{url} 编排注入）——机器调用不设 X-App-Id header，
+    // 必填 header 契约会把部署下载拒成 400（模板全链验证实测），path 段已
+    // 承载定位。
     if path.starts_with("/api/v1/userapp/static/") {
         let user_id = match require_static_user_id(query.as_deref()) {
             Ok(v) => v,
             Err(e) => return e.into_response(),
         };
-        let Some(app_id) = require_app_id(&req) else {
-            return missing_app_id_response();
+        let raw_app_id = path
+            .strip_prefix("/api/v1/userapp/static/")
+            .and_then(|rest| rest.split('/').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let Some(app_id) = raw_app_id.map(str::to_owned) else {
+            return HttpResultError::bad_request(
+                "missing path segment `app_id` for static artifact download",
+            )
+            .into_response();
         };
+        if let Err(e) = shared_types::validate_identifier(&app_id, "app_id") {
+            return HttpResultError::bad_request(e).into_response();
+        }
         info!(
             "[USERAPP_FORWARD] {} {} -> dev container (static, app_id={app_id})",
             req.method(),

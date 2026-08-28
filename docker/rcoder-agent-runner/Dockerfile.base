@@ -1003,3 +1003,15 @@ ENV AGENT_RUNNER_PORT=8086
 
 # 设置默认工作目录
 WORKDIR /home/user
+
+# ── Go 工具链（UserApp 多语言模板构建；rust:bookworm 基底不含 go）─────────────
+# 模板 backend-go 要求 go 1.26（apt bookworm 的 golang-go 1.19 不满足），用官方
+# tarball 装最新稳定版；GOPROXY 走国内镜像（与 pip/npm 同策略）。
+ARG GO_VERSION=1.26.0
+RUN ARCH=$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/') && \
+    curl -fsSL https://golang.google.cn/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz -o /tmp/go.tgz && \
+    tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz && \
+    ln -sf /usr/local/go/bin/go /usr/local/bin/go && \
+    ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt && \
+    go version
+ENV GOPROXY=https://goproxy.cn,direct
