@@ -140,7 +140,7 @@ pub async fn restart_app(
 
 /// 设置闲置回收策略
 ///
-/// 动态、免重启（免费↔付费 tier 变更）：strategic-merge Deployment 注解,不碰 pod template → 不触发 rollout,下个扫描 tick 生效。
+/// 动态、免重启（策略即时调整，无需重新部署）：strategic-merge Deployment 注解,不碰 pod template → 不触发 rollout,下个扫描 tick 生效。
 /// 比 update 轻（无需 image）。三字段（recycle_enabled/idle_timeout_seconds/wake_on_traffic）皆 None → 400。
 /// **仅 prod**：策略作用于运行容器 Deployment 注解，dev 开发环境无回收语义。
 #[utoipa::path(

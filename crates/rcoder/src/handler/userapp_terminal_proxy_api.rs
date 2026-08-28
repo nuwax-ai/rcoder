@@ -4,7 +4,8 @@
 //!   定位 UserAppBuilder 开发容器；user_id 是懒创建显式 owner 档（dev/{user_id}/{app_id}
 //!   宿主树分区）+ 卷分区定位（与 computer 族按 user_id 定位沙箱对称）。
 //! - **生产域工具族**：`/userapp/prod/{ttyd,pgweb,dbx}/{user_id}/{app_id}`——定位
-//!   `ServiceType::UserApp` 运行容器；user_id 为归属校验锚点（容器不在时配合唤醒）。
+//!   `ServiceType::UserApp` 运行容器；user_id 为宿主机数据卷分区组成段（容器
+//!   未启动时配合唤醒定位）。
 //! - **应用流量族**（免端口）：`/proxy/userapp/{dev,prod}/{user_id}/{app_id}`——
 //!   见 `proxy_handler_api` 的 `proxy_to_app/devapp_with_path`。
 //!

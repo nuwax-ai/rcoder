@@ -138,8 +138,8 @@ pub(super) fn require_query_app_id(query: Option<&str>) -> Result<String, HttpRe
         .map_err(HttpResultError::bad_request)
 }
 
-/// tasks 族 query `user_id` 必填（审计 + dev 容器懒创建显式 owner 档——
-/// 宿主树 `dev/{user_id}/{app_id}` 分区直取，不依赖 metadata 注册兜底）。
+/// tasks 族 query `user_id` 必填（宿主机数据卷分区定位 + dev 容器懒创建显式
+/// owner 档——宿主树 `dev/{user_id}/{app_id}` 分区直取，不依赖 metadata 注册兜底）。
 pub(super) fn require_query_user_id(query: Option<&str>) -> Result<String, HttpResultError> {
     let raw = query_param(query, "user_id")
         .map(str::trim)
@@ -155,9 +155,8 @@ pub(super) fn require_query_user_id(query: Option<&str>) -> Result<String, HttpR
 }
 
 /// static/{app_id} 的 query `user_id` 必填（🟢 ensure 显式档：懒创建容器
-/// 宿主树分区直取，不依赖 metadata 注册）。非 static 路径返回 None（不要求）。
-/// static/{app_id} 的 query `user_id` 必填（🟢 ensure 显式档：懒创建容器
-/// 宿主树分区直取，不依赖 metadata 注册）。调用方已按 static 前缀分派。
+/// 宿主树分区直取，不依赖 metadata 注册）。非 static 路径返回 None（不要求）；
+/// 调用方已按 static 前缀分派。
 pub(super) fn require_static_user_id(query: Option<&str>) -> Result<String, HttpResultError> {
     let raw = query_param(query, "user_id")
         .map(str::trim)

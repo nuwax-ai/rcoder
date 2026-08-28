@@ -304,7 +304,9 @@ async fn spawn_dev_task(
 
 /// 在跑的 UserApp 开发服务列表
 ///
-/// 不含 web/computer 项目进程；按 `app_id` 过滤单 app 视角（必填）。
+/// 列出该 `app_id`（query 必填）在跑的 dev server 进程（pid/port/started_at）。
+/// 不含 web/computer 项目进程——进程键按 app 维度前缀隔离，仅 UserApp 开发
+/// 服务视角；`user_id` 为挂载压平契约字段（必填校验，不参与过滤）。
 #[utoipa::path(
     get,
     path = "/dev/list",
@@ -343,7 +345,8 @@ pub(crate) async fn dev_list(
 
 /// 开发服务日志
 ///
-/// main = 当日汇总 / temp = 最新一次。
+/// 读取该 `app_id` 的 dev server 进程日志并分页返回：`log_type=main` 当日
+/// 汇总 / `temp` 最新一次运行（默认）；`start_index` 起始行分页（默认 1）。
 #[utoipa::path(
     get,
     path = "/dev/logs",

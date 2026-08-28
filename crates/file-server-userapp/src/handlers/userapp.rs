@@ -413,7 +413,9 @@ pub(crate) async fn cancel_build_task(task: &Arc<UserappBuildTask>) {
 
 /// 检测项目类型
 ///
-/// 分析文件结构推断 language/framework/build tool。
+/// 分析 workspace 内 `project_dir` 的文件结构（manifest/配置文件特征），
+/// 推断 language/framework/build tool，作为 confirm 的输入。`app_id` 由
+/// path 承载定位 workspace，body 仅需 `user_id` 与 `project_dir`。
 #[utoipa::path(
     post,
     path = "/{app_id}/{app_stage}/projects/detect",
@@ -442,7 +444,9 @@ pub(crate) async fn detect_project(
 
 /// 确认项目检测结果
 ///
-/// 用户选择/修正 detect 推断的项目类型后提交。
+/// 用户选择/修正 detect 推断的项目类型后提交（幂等）。附带 workspace 级
+/// git init 双开关：`git_enabled` 开启时初始化本地仓库（失败仅告警不阻断
+/// 确认），为 publish 快照 commit 的前提。
 #[utoipa::path(
     post,
     path = "/{app_id}/{app_stage}/projects/confirm",

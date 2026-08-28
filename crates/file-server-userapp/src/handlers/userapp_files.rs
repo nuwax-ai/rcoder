@@ -31,6 +31,12 @@ use file_server::workspace::resolve_userapp_dev;
 // ── get-file-list ───────────────────────────────────────────────────────────────
 
 /// 文件树列表（轻量元信息，不读内容）
+///
+/// 列开发卷 workspace 内指定目录的文件清单（名称/大小/mtime 等元信息，不读
+/// 内容）。`relative_path` 相对 workspace 根（缺省列根一层）；`recursive`
+/// 缺省 true 递归展开整棵子树，显式 "false" 仅当前层。响应
+/// `{ success, files[], recursive }`；传 `proxy_path` 时条目附 `proxy_url`
+/// 预览地址（`custom_target_dir` 非空时自动追加同名 query 参数）。
 #[utoipa::path(
     get,
     path = "/get-file-list",
@@ -62,6 +68,12 @@ pub(crate) async fn get_file_list(
 // ── resolve-file ────────────────────────────────────────────────────────────────
 
 /// 校验文件存在性，存在返回预览 URL
+///
+/// 探测 `file_path`（workspace 内相对路径，必填非空）指向的文件：不存在返回
+/// `{ success, exists: false }`；存在返回 `{ success, exists: true, name,
+/// file_proxy_url }`——`proxy_path` 为预览 URL 前缀（缺省则响应不含
+/// file_proxy_url）；`custom_target_dir` 非空时自动追加
+/// `?custom_target_dir=`（语义同 computer 域 customTargetDir 后缀）。
 #[utoipa::path(
     get,
     path = "/resolve-file",
@@ -98,6 +110,12 @@ pub(crate) async fn resolve_file(
 // ── search-files ────────────────────────────────────────────────────────────────
 
 /// 无索引有界实时搜索
+///
+/// 按 `kw`（文件名/相对路径子串，大小写不敏感）遍历 workspace 实时匹配，
+/// 三重上限防大目录失控：`limit` 命中条数上限、`max_visit` 访问条目硬上限
+/// （含未命中）、`timeout_ms` 超时毫秒。响应 `{ success, files[], truncated,
+/// visited }`——`truncated=true` 表示因上限/超时提前结束、结果不完整，
+/// 调用方应提示而非当作全量。
 #[utoipa::path(
     get,
     path = "/search-files",
@@ -138,6 +156,12 @@ pub(crate) async fn search_files(
 // ── files-update ────────────────────────────────────────────────────────────────
 
 /// 批量文件增删改（modify 字节比较）
+///
+/// 对 `files` 数组逐项执行 create / delete / rename / modify（`operation`
+/// 字段区分；rename 须带 `rename_from`，create/modify 携 `contents` 文本、
+/// 服务端做 URL 解码）。modify 以字节比较判变更，内容相同跳过写入。
+/// 响应 `{ success, message, user_id, app_id, files_count }`（files_count
+/// = 实际执行动作数）。注意 delete 按路径直删无回收站，调用方自行确认。
 #[utoipa::path(post, path = "/files-update", request_body = UserappFilesUpdateBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 双态 · 文件镜像")]
 pub(crate) async fn files_update(
     State(state): State<UserAppState>,
@@ -162,6 +186,10 @@ pub(crate) async fn files_update(
 // ── upload-file / upload-files ──────────────────────────────────────────────────
 
 /// 单文件上传（multipart）
+///
+/// 上传单个文件/压缩包到开发卷：`file_path` 指定 workspace 内相对路径，
+/// zip/tar.gz 按魔数自动解压（单文件直写）。`custom_target_dir` 可覆盖
+/// workspace 根（Java 侧负责合法性）。
 #[utoipa::path(post, path = "/upload-file", request_body(content = UserappUploadFileForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 双态 · 文件镜像")]
 pub(crate) async fn upload_file(
     State(state): State<UserAppState>,
@@ -210,6 +238,9 @@ pub(crate) async fn upload_file(
 }
 
 /// 多文件上传（单文件错误隔离）
+///
+/// multipart 重复字段批量上传：`file_paths` 与 `files` 一一对应落盘；
+/// 单个文件失败不影响其余（错误隔离，逐项返回结果）。
 #[utoipa::path(post, path = "/upload-files", request_body(content = UserappUploadFilesForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 双态 · 文件镜像")]
 pub(crate) async fn upload_files(
     State(state): State<UserAppState>,
@@ -293,6 +324,10 @@ pub(crate) async fn upload_files(
 // ── generate-file ───────────────────────────────────────────────────────────────
 
 /// JSON 文本生成文件
+///
+/// 以 `file_name`（可含相对子路径，自动剥前导 `/`）在 workspace 内写入
+/// `content` 文本（缺省空串）；父目录自动创建。适合生成配置/代码骨架等
+/// 纯文本产物。
 #[utoipa::path(
     post,
     path = "/generate-file",
@@ -321,7 +356,10 @@ pub(crate) async fn generate_file(
 
 // ── import-project ──────────────────────────────────────────────────────────────
 
-/// 上传项目 zip 解压合并到开发卷 workspace
+/// 项目 zip 导入开发卷（解压合并）
+///
+/// 上传项目 zip 解压合并到开发卷 workspace（`file` 必填；zip 按魔数识别
+/// 解压，单文件直写）；`custom_target_dir` 可覆盖 workspace 根。
 #[utoipa::path(post, path = "/import-project", request_body(content = UserappImportProjectForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 双态 · 文件镜像")]
 pub(crate) async fn import_project(
     State(state): State<UserAppState>,

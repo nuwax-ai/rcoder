@@ -116,10 +116,13 @@ pub async fn get_app(
     Ok(Json(HttpResult::success(runtime)))
 }
 
-/// 更新应用（全量替换 desired state）
+/// 更新应用（部分更新，`None` 字段沿用 live 值）
 ///
-/// rcoder 无状态：调用方需发送完整新状态（`image` 必填）。K8s SSA re-apply 幂等，
-/// Docker 重建容器；工作空间目录保留。详见设计文档 §5.2。
+/// `user_id` 必填（宿主机数据卷分区定位——compose 挂载路径组成段）；其余字段
+/// 可选：`env`/`secrets` 显式传 = 整段替换，`image` 缺省 = 平台默认运行时镜像，
+/// 回收字段缺省沿用既有值。K8s SSA re-apply 幂等，Docker 重建容器；工作空间
+/// 目录保留。携带 `expected_resource_version` 启用乐观锁（不匹配 → 409；
+/// Docker 模式 resource_version 为 None，忽略校验）。
 #[utoipa::path(
     post,
     path = "/api/v1/userapp/{app_id}/update",
@@ -129,7 +132,9 @@ pub async fn get_app(
     request_body = UpdateAppRequest,
     responses(
         (status = 200, description = "更新成功", body = HttpResult<AppRuntimeInfo>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>)
+        (status = 400, description = "user_id 非法等参数校验失败", body = HttpResult<String>),
+        (status = 404, description = "应用不存在", body = HttpResult<String>),
+        (status = 409, description = "乐观锁冲突（expected_resource_version 与当前不符；Docker 模式忽略校验）", body = HttpResult<String>)
     ),
     tag = "UserApp · prod · 部署与启停"
 )]

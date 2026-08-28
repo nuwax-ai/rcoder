@@ -140,7 +140,7 @@ async fn forward_permission_resolution(
     }
 }
 
-/// Resolve permission for an RCoder project container.
+/// 处理 RCoder project 容器的权限审批结果。
 #[utoipa::path(
     post,
     path = "/agent/notify-resolved",
@@ -229,7 +229,7 @@ pub async fn agent_notify_resolved(
     forward_permission_resolution(&state, container, dto, locale).await
 }
 
-/// Resolve permission for a ComputerAgentRunner container.
+/// 处理 ComputerAgentRunner 容器的权限审批结果。
 #[utoipa::path(
     post,
     path = "/computer/notify-resolved",

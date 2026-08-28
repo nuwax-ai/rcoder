@@ -129,7 +129,9 @@ pub(crate) async fn get_logs(
 
 /// 依赖安装
 ///
-/// typescript→pnpm install；python→pip install。
+/// 按语言执行依赖安装：typescript → pnpm install；python → pip install。
+/// 前置：projects/detect + confirm 已完成（workspace 内已有项目 manifest）。
+/// 响应 `{ success, message, project_dir, programming_language }`。
 #[utoipa::path(
     post,
     path = "/{app_id}/{app_stage}/install-project",
@@ -160,6 +162,9 @@ pub(crate) async fn install_project(
 // ── zip-workspace ───────────────────────────────────────────────────────────────
 
 /// workspace 打包下载（二进制 zip）
+///
+/// 将开发卷 workspace 整体打包为 zip 返回（`application/zip` 二进制体），
+/// 文件名 `{user_id}_{app_id}.zip`；body `exclude_dirs` 可选排除目录清单。
 #[utoipa::path(
     post,
     path = "/zip-workspace",
@@ -189,7 +194,8 @@ pub(crate) async fn zip_workspace(
 
 /// 全量文件下载
 ///
-/// 顶层前缀 + 空 zip 兜底 + 大小上限。
+/// 打包下载 workspace 全部文件（zip 内顶层加 `{user_id}_{app_id}/` 前缀，
+/// 防解压时覆盖本地目录）；空 workspace 返回空 zip 兜底；超大小上限报错。
 #[utoipa::path(
     get,
     path = "/download-all-files",

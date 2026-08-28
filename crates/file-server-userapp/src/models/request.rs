@@ -493,12 +493,10 @@ pub struct DevLogsQuery {
     /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；
     /// file-server 侧不参与容器内定位）
     pub user_id: String,
-    /// 日志起始行（分页, 默认 1）。
+    /// 日志起始行（分页，默认 1）
     #[serde(default = "default_start_index")]
-    /// 日志起始行（分页）；默认 1
     pub start_index: usize,
-    /// "main"（当日汇总）或 "temp"（最新一次, 默认）。
-    #[serde(default)]
     /// 日志类型：main=当日汇总 / temp=最新一次（默认）
+    #[serde(default)]
     pub log_type: Option<String>,
 }

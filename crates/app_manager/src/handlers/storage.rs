@@ -154,7 +154,7 @@ pub async fn destroy_app_storage(
     )))
 }
 
-/// 分页查询持久存储（强制分页，无全量模式；prod=运行卷清单，dev=开发卷清单）
+/// 分页查询持久存储清单
 #[utoipa::path(
     post,
     path = "/api/v1/userapp/storage/{app_stage}/query",

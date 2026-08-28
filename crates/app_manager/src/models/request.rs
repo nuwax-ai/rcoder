@@ -158,7 +158,7 @@ pub struct UpdateAppRequest {
 
 /// 设置闲置回收策略（动态、免重启：只 patch Deployment 注解，不碰 pod template → 不触发 rollout）。
 ///
-/// 供计费侧免费↔付费 tier 变更调用：`recycle_enabled=false`（付费→不回收）/`true`（降级免费→恢复回收）。
+/// 典型调用场景为策略即时调整：`recycle_enabled=false` 关闭自动回收 / `true` 恢复回收。
 /// 比 `UpdateAppRequest` 轻——无需 image、不走全量 SSA。至少需传一个字段（皆 None → ERR_VALIDATION）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct RecyclePolicyRequest {

@@ -10,7 +10,8 @@
 //!   [`super::semantics`]）
 //! - [`computer_intercept`]：`/api/computer/*` 拦截层（`X-Service-Type: userapp`
 //!   分流时 TS 老路径原样转发，body 零解析——multipart 在代理层不可解）
-//! - 门面折叠：剥 `{app_id}/{app_stage}` 段还原容器平铺契约（构建链 dev-only）
+//! - 构建链三门面：`{app_id}/{app_stage}/...` 同构直转容器内同形态路由
+//!   （path 即身份、URI/body 零改写，dev-only）
 //!
 //! 定位与转发内核在 [`super::upstream`]。
 
@@ -245,18 +246,18 @@ async fn fold_env_forward(
     ),
     request_body(
         content = file_server_userapp::models::ProjectChainBody,
-        description = "仅需 `user_id` 与 `project_dir`——`app_id` 由 path 提供并自动注入转发 body（调用方不传）"
+        description = "仅需 `user_id` 与 `project_dir`——`app_id` 由 path 段承载（body 不含此字段，调用方不传）"
     ),
     description = r#"
 分析开发容器 workspace 的文件结构，推断项目类型（Node/Python/Java…）与推荐配置，
 作为 confirm 的输入。**仅 dev**——构建链是开发阶段能力，传 prod 返回 400。
 
-定位沿用透传面契约：header `X-App-Id` 指定目标开发容器（须与 path 一致）；
-URI 折叠为容器内平铺路径 `/api/v1/userapp/projects/detect` 后流式转发。
+path 即身份：path `app_id` 定位目标开发容器（幂等 ensure + 探活自愈），无
+`X-App-Id` header 要求；URI 原样转发至容器内同形态路由（零改写流式透传）。
 "#,
     responses(
         (status = 200, description = "探测结果（HttpResult 信封，data 含类型推断与文件清单）", body = HttpResult<serde_json::Value>),
-        (status = 400, description = "app_stage 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
+        (status = 400, description = "app_stage 非 dev / app_id 非法 / 容器侧参数校验失败", body = HttpResult<String>)
     ),
     tag = "UserApp · dev · 工作区与工具链",
 )]
@@ -278,15 +279,15 @@ pub(crate) async fn flat_dev_projects_detect(
     ),
     request_body(
         content = file_server_userapp::models::ProjectChainBody,
-        description = "detect 结果的用户修正确认 + 项目基础信息。仅需 `user_id` 与 `project_dir`——`app_id` 由 path 提供并自动注入转发 body（调用方不传）"
+        description = "detect 结果的用户修正确认 + 项目基础信息。仅需 `user_id` 与 `project_dir`——`app_id` 由 path 段承载（body 不含此字段，调用方不传）"
     ),
     description = r#"
 用户在 detect 推断基础上选择/修正项目类型后提交确认（幂等附带 git init 双开关）。
-**仅 dev**；定位与折叠语义同 [`flat_dev_projects_detect`]。
+**仅 dev**；定位与转发语义同 [`flat_dev_projects_detect`]。
 "#,
     responses(
         (status = 200, description = "确认结果（HttpResult 信封）", body = HttpResult<serde_json::Value>),
-        (status = 400, description = "app_stage 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
+        (status = 400, description = "app_stage 非 dev / app_id 非法 / 容器侧参数校验失败", body = HttpResult<String>)
     ),
     tag = "UserApp · dev · 工作区与工具链",
 )]
@@ -308,15 +309,15 @@ pub(crate) async fn flat_dev_projects_confirm(
     ),
     request_body(
         content = file_server_userapp::models::UserappInstallBody,
-        description = "仅需 `user_id` 与 `programming_language`——`app_id` 由 path 提供并自动注入转发 body（调用方不传）"
+        description = "仅需 `user_id` 与 `programming_language`——`app_id` 由 path 段承载（body 不含此字段，调用方不传）"
     ),
     description = r#"
 将项目安装进开发容器工作区（依赖安装等初始化动作的统一入口）。**仅 dev**；
-定位与折叠语义同 [`flat_dev_projects_detect`]。
+定位与转发语义同 [`flat_dev_projects_detect`]。
 "#,
     responses(
         (status = 200, description = "安装结果（HttpResult 信封）", body = HttpResult<serde_json::Value>),
-        (status = 400, description = "app_stage 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
+        (status = 400, description = "app_stage 非 dev / app_id 非法 / 容器侧参数校验失败", body = HttpResult<String>)
     ),
     tag = "UserApp · dev · 工作区与工具链",
 )]

@@ -134,7 +134,7 @@ impl AppService {
     }
 
     /// 设置闲置回收策略（动态、免重启：strategic-merge Deployment 注解，不碰 pod template）。
-    /// 供计费侧免费↔付费 tier 变更调用。Fail Fast：两字段皆 None → ERR_VALIDATION。
+    /// 供管理/运营面策略调整调用。Fail Fast：两字段皆 None → ERR_VALIDATION。
     #[instrument(skip(self))]
     pub async fn set_recycle_policy(
         &self,
