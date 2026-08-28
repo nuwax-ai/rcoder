@@ -12,6 +12,8 @@
 
 pub(crate) mod db;
 pub(crate) mod forward;
+pub(crate) mod semantics;
+pub(crate) mod upstream;
 pub(crate) mod workspace;
 
 use std::sync::Arc;
@@ -24,7 +26,7 @@ use crate::router::AppState;
 // file-server 共用单一事实源）；本模块转发 computer_intercept 拦截层给主 Router
 // 装配。chat body 的 service_type 词表由 shared_types::ChatServiceScope 枚举承载。
 pub(crate) use forward::computer_intercept;
-pub(crate) use forward::invalidate_probe_cache;
+pub(crate) use upstream::invalidate_probe_cache;
 
 /// 容器 file-server 对外接口的**显式透传清单**（全路径；handler 统一复用
 /// [`forward::forward_userapp`]，method/path/query/body 原样流式转发，容器侧
