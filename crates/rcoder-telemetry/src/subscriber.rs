@@ -1,7 +1,7 @@
 //! tracing subscriber 组装：EnvFilter + 终端/文件日志 + OTLP + 外部注入层。
 //!
 //! boxed layer（[`BoxedLayer`]）只能直接挂 Registry 顶层——外部注入层
-//! （file-server 嵌入、tokio-console 观测）经 [`stack_boxed_layers`] 叠加。
+//! （file-server 嵌入、tokio-console 观测）经 `stack_boxed_layers` 叠加。
 
 use anyhow::Result;
 use opentelemetry_sdk::trace::SdkTracerProvider;

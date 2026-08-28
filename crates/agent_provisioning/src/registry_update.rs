@@ -35,7 +35,7 @@ pub struct AgentManifest {
 /// 更新安装目录下的 registry.json
 ///
 /// 将新安装的 agent 信息写入 registry，支持多版本。
-/// 写入的格式与 agent_runner 的 Vec<AgentManifest> 兼容。
+/// 写入的格式与 agent_runner 的 `Vec<AgentManifest>` 兼容。
 ///
 /// # 并发安全
 ///

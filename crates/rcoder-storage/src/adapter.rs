@@ -86,7 +86,7 @@ pub struct ProjectAdapter {
     pub(super) pod_id_to_project_id: DashMap<String, String>,
     /// per-project 串行锁：序列化同一 project_id 的 insert/remove，
     /// 消除跨 DashMap（projects ↔ containers）的 TOCTOU 竞态。
-    /// Arc<LockMap> 保证 clone 后共享同一锁实例。
+    /// `Arc<LockMap>` 保证 clone 后共享同一锁实例。
     project_locks: Arc<LockMap<String, ()>>,
 }
 

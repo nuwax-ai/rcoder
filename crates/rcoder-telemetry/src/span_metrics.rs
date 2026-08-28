@@ -2,7 +2,7 @@
 //!
 //! 设计动机：`#[instrument]` 的 span 本身就在计时（创建→关闭 = 墙钟耗时），
 //! 手动 `Instant::now()` + 出口记录是重复劳动且侵入业务代码。本 layer 与
-//! [`crate::subscriber::TraceIdExtractor`] 同架构——通过 span extensions
+//! `crate::subscriber::TraceIdExtractor` 同架构——通过 span extensions
 //! 存开始时间，`on_close` 时按规则表记录直方图，调用点零计时代码。
 //!
 //! 规则表由 [`crate::config::TelemetryConfig::with_span_metric_rules`] 注入

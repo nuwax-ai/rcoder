@@ -2,8 +2,8 @@
 //!
 //! [`AppActivityRegistry`] 是「闲置自动回收 + 流量唤醒」特性的共享状态中心(in-memory,
 //! rcoder 单实例):
-//! - [`AppAccessTracker`](shared_types::AppAccessTracker):Pingora 热路径 `touch` 记录最近访问(5s 节流);
-//! - [`AppWakeControl`](shared_types::AppWakeControl):stopped app 收到请求时 hold-and-wait 拉起,
+//! - [`AppAccessTracker`]:Pingora 热路径 `touch` 记录最近访问(5s 节流);
+//! - [`AppWakeControl`]:stopped app 收到请求时 hold-and-wait 拉起,
 //!   并发请求经 `tokio::sync::watch` 合流为一次 scale-up。
 //!
 //! 构造顺序:rcoder 启动早期(init_proxy 之前)独立构造为 `Arc`,注入 Pingora(访问/唤醒);

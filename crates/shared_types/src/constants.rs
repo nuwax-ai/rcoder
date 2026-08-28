@@ -42,7 +42,7 @@ impl FeatureFlags {
         );
     }
 
-    /// 取单例; 未 [`init`] 时 lazy 读 env (测试 / 忘记 init 兜底, 保证永远可用)。
+    /// 取单例; 未 [`Self::init`] 时 lazy 读 env (测试 / 忘记 init 兜底, 保证永远可用)。
     pub fn get() -> &'static FeatureFlags {
         FEATURE_FLAGS.get_or_init(Self::from_env)
     }

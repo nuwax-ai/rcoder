@@ -60,7 +60,7 @@ impl PingoraServerManager {
     ///
     /// # 参数
     ///
-    /// * `config` - 共享的 Arc<ArcSwap<ApiKeyAuthConfig>>
+    /// * `config` - 共享的 `Arc<ArcSwap<ApiKeyAuthConfig>>`
     pub fn with_api_key_config(
         mut self,
         config: Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>,

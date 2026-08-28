@@ -14,7 +14,7 @@
 //! | 子模块 | 职责 | 关键类型 |
 //! |--------|------|---------|
 //! | [`lifecycle`] | Agent 生命周期守卫（RAII 资源管理）| `AgentLifecycleGuard` |
-//! | [`claude_code_sacp`] | SACP 版本的 Claude Code Agent 启动器 | `SacpClaudeCodeLauncher` |
+//! | `claude_code_sacp` | SACP 版本的 Claude Code Agent 启动器 | `SacpClaudeCodeLauncher` |
 //!
 //! ## Agent 启动流程 (SACP)
 //!

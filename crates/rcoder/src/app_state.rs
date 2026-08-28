@@ -296,7 +296,7 @@ impl AppState {
 
     /// 关闭某 project 关联的所有 SSE 共享流（容器销毁/项目删除前调用）。
     ///
-    /// 必须在 [`remove_project`] 之前调用——remove_project 会清空 project 的 sessions 集合，
+    /// 必须在 [`Self::remove_project`] 之前调用——remove_project 会清空 project 的 sessions 集合，
     /// 之后无法再据此枚举。销毁语义：让后台 gRPC task 尽快退出，避免对已失效地址重试。
     pub fn shutdown_sse_streams_for_project(&self, project_id: &str) {
         let sids: Vec<String> = self
@@ -317,7 +317,7 @@ impl AppState {
     /// 按 grpc_addr 关闭关联的所有 SSE 共享流。
     ///
     /// 适用于记录可能已被清空的销毁路径（reaper/restart/ensure/destroyer）：这些路径中
-    /// project/session 记录可能在关闭前已被移除，无法再走 [`shutdown_sse_streams_for_project`]，
+    /// project/session 记录可能在关闭前已被移除，无法再走 [`Self::shutdown_sse_streams_for_project`]，
     /// 但它们都能构造出 grpc_addr（与 `grpc_pool.remove` 同源）。幂等：重复调用安全。
     pub fn shutdown_sse_streams_by_addr(&self, grpc_addr: &str) {
         let closed = self

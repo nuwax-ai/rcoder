@@ -7,8 +7,8 @@
 //! - [`types`] - 类型定义（PerPortMetrics, ProxyMetrics, TrackingCtx 等）
 //! - [`utils`] - 工具函数（normalize_path, rewrite_uri, set_common_headers 等）
 //! - [`handlers`] - 请求处理函数（VNC, ttyd, audio, IME, API proxy, port proxy）
-//! - [`proxy_http`] - `ProxyHttp for PortProxy` 实现（请求生命周期 filter/peer/response）
-//! - [`backends`] - `PingoraProxyService` 后端映射管理（port/app/vnc/project + health check）
+//! - `proxy_http` - `ProxyHttp for PortProxy` 实现（请求生命周期 filter/peer/response）
+//! - `backends` - `PingoraProxyService` 后端映射管理（port/app/vnc/project + health check）
 //!
 //! 本模块（mod.rs）仅保留 struct 定义 + 构造（new/builders/create_pingora_proxy）+ Clone。
 

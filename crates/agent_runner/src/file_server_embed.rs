@@ -12,7 +12,7 @@
 //! 与独立 listener 方案（内嵌 file-server 单独绑 60002）相比：少一个 listener 与
 //! 端口配置；与 rcoder 主 pod（8086 merge + 60000 分流代理）架构完全对称。
 //! 复用接口族（push-skills-to-workspace 等）最终走 Rust 还是 TS nuwax-file-server
-//! 尚未拍板，60000 proxy 是未来的路由策略切换控制点（[`RoutePolicy`] 加值即可）。
+//! 尚未拍板，60000 proxy 是未来的路由策略切换控制点（`RoutePolicy` 加值即可）。
 //!
 //! agent_runner 是 per-agent 容器,workspace 在本地 (`/home/user`),直接用
 //! file-server 默认的 `LocalWorkspaceResolver`,不需要 Subvolume / cephfs 聚合解析。

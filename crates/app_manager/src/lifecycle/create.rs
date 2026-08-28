@@ -15,7 +15,7 @@ impl AppService {
     ///
     /// ⚠️ 调用方不得已持 `acquire_process_release_lock(app_id)` —— tokio Mutex
     /// 不可重入，已持锁调用会永久挂起（activate 的 ensure_app_runtime 走
-    /// [`create_app_locked`] 内核避免此问题）。
+    /// `create_app_locked` 内核避免此问题）。
     #[instrument(skip(self, request))]
     pub async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo> {
         // ⚠️ 调用方不得已持 `acquire_process_release_lock(app_id)` —— tokio Mutex

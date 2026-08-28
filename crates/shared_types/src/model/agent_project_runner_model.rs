@@ -192,7 +192,7 @@ pub struct ProjectExtendedFields {
 pub struct ProjectExtendedState {
     /// 模型提供商配置
     pub model_provider: Option<ModelProviderConfig>,
-    /// container 容器信息（Arc 共享：与 ProjectAdapter.containers[name] 同一实例），
+    /// container 容器信息（Arc 共享：与 `ProjectAdapter.containers[name]` 同一实例），
     /// 一个 project_id 只能对应最多1个容器。
     pub container: Option<Arc<ContainerEntry>>,
     /// 当前活跃的请求ID，用于标识用户请求
@@ -518,7 +518,7 @@ impl ProjectAndContainerInfo {
         self.state.extended.model_provider.as_ref()
     }
 
-    /// 获取共享的容器条目引用（与 ProjectAdapter.containers[name] 同一 Arc 实例）。
+    /// 获取共享的容器条目引用（与 `ProjectAdapter.containers[name]` 同一 Arc 实例）。
     /// 需要容器字段值时优先用 `container_info()`（owned clone）。
     pub fn container(&self) -> Option<&Arc<ContainerEntry>> {
         self.state.extended.container.as_ref()
@@ -605,8 +605,8 @@ impl ProjectAndContainerInfo {
         });
     }
 
-    /// 设置容器信息（接收裸 ContainerBasicInfo，内部包成 Arc<ContainerEntry>）。
-    /// Arc 在 insert 时与 ProjectAdapter.containers[name] 共享同一实例。
+    /// 设置容器信息（接收裸 ContainerBasicInfo，内部包成 `Arc<ContainerEntry>`）。
+    /// Arc 在 insert 时与 `ProjectAdapter.containers[name]` 共享同一实例。
     pub fn set_container(&mut self, container: Option<ContainerBasicInfo>) {
         let entry = container.map(|c| {
             let st = self.service_type().unwrap_or(ServiceType::WebAgentRunner);
@@ -618,7 +618,7 @@ impl ProjectAndContainerInfo {
         });
     }
 
-    /// 直接设置共享的 Arc<ContainerEntry>（insert 在 Occupied/重建场景回写权威 Arc 用）。
+    /// 直接设置共享的 `Arc<ContainerEntry>`（insert 在 Occupied/重建场景回写权威 Arc 用）。
     pub fn set_container_arc(&mut self, entry: Option<Arc<ContainerEntry>>) {
         self.state.update_extended(|extended| {
             extended.container = entry;

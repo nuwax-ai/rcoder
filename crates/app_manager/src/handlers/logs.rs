@@ -5,7 +5,7 @@
 //!
 //! JSON 转发（sources/query、query）是**透明代理**：透传 app-cli 的状态码 +
 //! 三条接口均支持 `{app_stage}` 显式环境分派（prod=运行容器实例 IP / dev=开发容器
-//! host 重拼 :3010，见 [`AppService::log_api_base`]）——
+//! host 重拼 :3010，见 `AppService::log_api_base`）——
 //! 响应体——app-cli 侧统一 `HttpResult` 信封（`{code,message,data,tid,success}`），
 //! 成功失败都以信封直达调用方，code/message 保真不二次包装；仅连接/读取失败
 //! 由 rcoder 生成自己的 HttpResult 错误（AppError 路径）。SSE（stream）豁免信封。

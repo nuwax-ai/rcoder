@@ -48,7 +48,7 @@ impl AgentLifecycleGuard {
     ///
     /// **注意**：此构造函数不携带 `diagnostics_listener`、`process_command` 等诊断信息，
     /// reaper 退出时不会触发 `on_process_error` / `on_process_exited` 回调。
-    /// 如需完整诊断能力，请使用 [`new_claude_full`]。
+    /// 如需完整诊断能力，请使用 `new_claude_full`。
     ///
     /// # 参数
     ///

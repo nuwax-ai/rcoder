@@ -2,7 +2,7 @@
 //!
 //! 自 M1 起 project/session/container 的存储实现（内存 + 后续 PG）整体迁至
 //! `rcoder-storage` crate，本模块只保留 rcoder 运行时侧组件：
-//! - [resource_reaper]: ResourceReaper（消费存储层 CleanupRequest，物理销毁容器
+//! - `resource_reaper`: ResourceReaper（消费存储层 CleanupRequest，物理销毁容器
 //!   + 清理 gRPC 池/SSE 流/Pingora backend；依赖 grpc/pingora/docker_manager，属运行时编排）
 //! - 转发 re-export：调用方（router/cleanup_task/lib）路径不变，零改动兼容。
 //!

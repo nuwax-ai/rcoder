@@ -136,7 +136,7 @@ impl AppService {
     /// 目录内按文件名升序。逐文件 exec 容器内 `psql -f`（容器内路径
     /// `{app_code_root(app_id)}/{rel}`，`ON_ERROR_STOP=on` 单文件原子性），单文件失败
     /// 收集进 report 继续下一文件。find 输出逐段过
-    /// [`is_shell_safe_path_component`] 白名单（防恶意文件名注入 `sh -c` 命令行）。
+    /// `is_shell_safe_path_component` 白名单（防恶意文件名注入 `sh -c` 命令行）。
     pub async fn execute_database_sql(&self, app_id: &str) -> AppResult<DatabaseSqlReport> {
         validate_app_id(app_id)?;
         // 容器内代码根（workspace 压平挂载 /home/user/{app_id} 之下）

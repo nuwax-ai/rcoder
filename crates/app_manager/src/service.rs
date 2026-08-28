@@ -1,7 +1,7 @@
 //! 应用管理服务层（统一 Docker / K8s 后端，无状态）
 //!
 //! rcoder 是无状态的应用 pod 引擎：
-//! - 写操作（create/start/stop/restart/delete）转调 [`ContainerRuntime`] 的 Deployment 能力；
+//! - 写操作（create/start/stop/restart/delete）转调 [`container_runtime_api::ContainerRuntime`] 的 Deployment 能力；
 //! - 读操作（get/query/list）实时查集群，返回 [`AppRuntimeInfo`]；
 //! - 业务元数据（name/image/command/app_stage 等）由调用方（Java）持久化，rcoder 不存。
 //!

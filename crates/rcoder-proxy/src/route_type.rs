@@ -89,7 +89,7 @@ pub enum RouteType {
     /// **pgweb**: `/userapp/prod/pgweb/{app_id}/{*path}` → 直连 pgweb(8081, HTTP)
     ///
     /// 定位走 find_app_runtime_addr（确定性命名构造——运行容器不进注册表，
-    /// project_to_container[app_id] 单值键被 builder 占用）；K8s=Service FQDN
+    /// `project_to_container[app_id]` 单值键被 builder 占用）；K8s=Service FQDN
     /// （Pod 重建 DNS 自愈）。app 未部署/停止 → 上游连接失败 502。
     RuntimeTtydProxy,
     RuntimePgwebProxy,

@@ -1,13 +1,13 @@
 //! userApp 文件域转发层（rcoder 侧编排，实际处理在 per-app 开发容器内 file-server）。
 //!
-//! - [`forward`]：`/api/v1/userapp` 显式透传清单（见
-//!   [`CONTAINER_PASS_THROUGH_PATHS`]），并承接 `/api/computer/*` 拦截层
+//! - `forward`：`/api/v1/userapp` 显式透传清单（见
+//!   `CONTAINER_PASS_THROUGH_PATHS`），并承接 `/api/computer/*` 拦截层
 //!   （`X-Service-Type: userapp` 分流时反向代理转来的 TS 老路径原样透传）
-//! - [`workspace`]：`POST /api/v1/userapp/workspace` 创建项目显式入口
-//! - [`db`]：`POST /api/v1/userapp/db/{app_stage}/align-credentials` PG 凭据对齐
+//! - `workspace`：`POST /api/v1/userapp/workspace` 创建项目显式入口
+//! - `db`：`POST /api/v1/userapp/db/{app_stage}/align-credentials` PG 凭据对齐
 //! - 本模块：路由聚合 + 开发容器 ensure-workspace 公共调用
 //!
-//! 容器定位/创建复用 [`crate::userapp_builder::ensure_userapp_builder`]
+//! 容器定位/创建复用 `crate::userapp_builder::ensure_userapp_builder`
 //! （幂等；注册 state.projects 防孤立清理）。
 
 pub(crate) mod db;

@@ -1,4 +1,4 @@
-//! 应用管理处理器共享状态（注入到所有 handler 的 Arc<AppManagerState>）
+//! 应用管理处理器共享状态（注入到所有 handler 的 `Arc<AppManagerState>`）
 
 use std::sync::Arc;
 

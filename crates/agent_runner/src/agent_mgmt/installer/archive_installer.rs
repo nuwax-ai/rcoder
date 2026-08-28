@@ -6,7 +6,7 @@
 //! - **Zip bomb**: cumulative uncompressed size exceeding [`shared_types::MAX_EXTRACTED_SIZE`]
 //!
 //! Only tar.gz and zip archives are accepted; non-archive files are rejected
-//! upstream in [`binary_installer`] with `UnsupportedType`.
+//! upstream in `binary_installer` with `UnsupportedType`.
 
 use std::fs::File;
 use std::io::{Read, Write};

@@ -58,7 +58,7 @@ pub struct ServiceImageConfig {
     #[serde(default)]
     pub workspace_resolution_path: Option<String>,
     /// 容器安全配置（可选）。仅 Docker 部署模式透传到 bollard HostConfig；
-    /// 未配置（None）时走代码默认（privileged=false + cap_drop=[NET_RAW,NET_ADMIN]）。
+    /// 未配置（None）时走代码默认（privileged=false + `cap_drop=[NET_RAW, NET_ADMIN]`）。
     #[serde(default)]
     pub security: Option<ServiceSecurityConfig>,
 }

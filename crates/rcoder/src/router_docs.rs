@@ -385,7 +385,7 @@ fn strip_internal_userapp_paths(document: &mut utoipa::openapi::OpenApi) {
 /// schemas）——Swagger 默认打开主文档即见 userApp 全貌（dev 生命周期/编译/
 /// 文件/静态），无需切下拉；其余 file-server 域（project/computer/git 等）
 /// 仍只在 file-server.json，防主文档膨胀。两份文档均剔除
-/// [`INTERNAL_USERAPP_PATHS`]（分流代理的内部路由面）。
+/// `INTERNAL_USERAPP_PATHS`（分流代理的内部路由面）。
 pub fn create_swagger_ui() -> SwaggerUi {
     SwaggerUi::new("/api/docs")
         .url("/api/docs/openapi.json", primary_document())

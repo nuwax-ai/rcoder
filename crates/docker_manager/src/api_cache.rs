@@ -14,7 +14,7 @@ use crate::ContainerQueryResultArc;
 /// 使用 Moka 缓存库实现高性能缓存，减少 Docker API 调用次数
 /// 使用结构体包装，提高代码可读性和减少 clone 开销
 pub struct DockerApiCache {
-    /// 容器状态缓存 (identifier -> Option<ContainerQueryResultArc>)
+    /// 容器状态缓存 (identifier -> `Option<ContainerQueryResultArc>`)
     /// 支持 None 值缓存，用于缓存 404 响应
     status_cache: Cache<String, Option<ContainerQueryResultArc>>,
 

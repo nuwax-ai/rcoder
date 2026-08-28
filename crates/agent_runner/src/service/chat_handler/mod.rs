@@ -5,12 +5,12 @@
 //! ## 结构
 //!
 //! `handle_chat_core` 仅负责编排，具体流程拆为子模块：
-//! 1. [`probe`] —— 模型探活
-//! 2. [`prepare`] —— 会话准备
-//! 3. [`dispatch`] —— 任务下发
-//! 4. [`finalize`] —— 结果组装
+//! 1. `probe` —— 模型探活
+//! 2. `prepare` —— 会话准备
+//! 3. `dispatch` —— 任务下发
+//! 4. `finalize` —— 结果组装
 //!
-//! 类型定义见 [`types`]，取消逻辑见同目录 `../cancel.rs`。
+//! 类型定义见 `types`，取消逻辑见同目录 `../cancel.rs`。
 
 mod dispatch;
 mod finalize;
