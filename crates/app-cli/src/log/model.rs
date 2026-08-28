@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub use shared_types::{
-    LogQueryRequest, LogQueryResponse, LogRecord, LogSelector, LogSourceInfo, SourceError,
-    MAX_CURSOR_BYTES, MAX_KEYWORD_BYTES, MAX_SERVICES, MAX_SOURCES, MAX_TAIL_PER_SOURCE,
+    LogQueryRequest, LogQueryResponse, LogRecord, LogSelector, LogSourceInfo, MAX_CURSOR_BYTES,
+    MAX_KEYWORD_BYTES, MAX_SERVICES, MAX_SOURCES, MAX_TAIL_PER_SOURCE, SourceError,
 };
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

@@ -1882,17 +1882,13 @@ function prepare_pg() {
     export PGWEB_PORT="${PGWEB_PORT:-8081}"
 
     # dbx-web(DBX 数据库 Web GUI):默认配置导出,supervisor conf.d/dbx.conf 进程继承。
-    # 密码不设默认 → 首访浏览器自设(存 $DBX_DATA_DIR/dbx.db);需固定密码时注入 DBX_PASSWORD env。
+    # 面板免登(DBX_DISABLE_PASSWORD=1,conf.d/dbx.conf 注入)+ local-pg 预置连接
+    # 由 fork dbx 启动时自管(local_pg.rs:unix socket 免密直连,凭据不落盘)——
+    # 本脚本不再播种 connections.json。
     export DBX_PORT="${DBX_PORT:-4224}"
     export DBX_DATA_DIR="${DBX_DATA_DIR:-/home/user/.dbx}"
     export DBX_STATIC_DIR="${DBX_STATIC_DIR:-/usr/local/share/dbx/static}"
-    # 首次播种本地 PG 连接:dbx-web 启动时每次免认证导入 $DBX_DATA_DIR/connections.json
-    # (导入后改名 .bak + INSERT OR IGNORE,幂等;字段 snake_case 见 dbx-core ConnectionConfigData)
-    if [ ! -e "$DBX_DATA_DIR/dbx.db" ] && [ ! -e "$DBX_DATA_DIR/connections.json" ]; then
-        mkdir -p "$DBX_DATA_DIR"
-        printf '[{"id":"local-pg","name":"Local PostgreSQL","db_type":"postgres","host":"127.0.0.1","port":5432,"username":"%s","password":"%s","database":"%s"}]\n' \
-            "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB" > "$DBX_DATA_DIR/connections.json"
-    fi
+    mkdir -p "$DBX_DATA_DIR"
 
     mkdir -p /app/logs
     # 仅备好 PGDATA 目录归属（瞬时: 无 fsync、无递归 chown）。
@@ -1906,7 +1902,7 @@ function prepare_pg() {
 PostgreSQL 开发数据库:
   容器内: host=localhost port=5432 user=$POSTGRES_USER password=$POSTGRES_PASSWORD database=$POSTGRES_DB sslmode=disable
 pgweb: http://localhost:$PGWEB_PORT  (Add Connection 填上述信息)
-dbx:   http://localhost:$DBX_PORT  (已预置上述连接, 双击桌面 DBX 图标即用; 首访设密码)
+dbx:   http://localhost:$DBX_PORT  (免登录; local-pg 预置连接开箱即用, 双击桌面 DBX 图标)
 EOF
     log "PG prepared (PGDATA=$PGDATA); initdb/postgres 由 supervisor 异步拉起"
 }
