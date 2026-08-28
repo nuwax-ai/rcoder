@@ -32,32 +32,14 @@ async fn main() -> anyhow::Result<()> {
     // 首次部署无 code 时 api 起不来，:3010 由部署段的 liveness 托管应答探针
     // （防大制品下载窗口 kubelet 误杀）。失败退出非零 → supervisord 重试
     // （code/ 现场不破坏，readiness 超时由 rcoder wait_app_ready 上报）。
-    if app_cli::deploy::deploy_requested() {
-        // 占位失败（端口被占等）不阻断部署本身：warn 后裸跑（最坏 liveness 抖动）
-        let hold = match app_cli::deploy::LivenessHold::start(&args.admin_addr) {
-            Ok(hold) => Some(hold),
-            Err(e) => {
-                tracing::warn!(
-                    "liveness hold bind {} failed, deploy continues without hold: {e:#}",
-                    args.admin_addr
-                );
-                None
-            }
-        };
-        let deploy_result = app_cli::deploy::run_from_env(&args.workspace).await;
-        if let Some(hold) = hold {
-            hold.release().await;
-        }
-        if let Err(e) = deploy_result {
-            tracing::error!("❌ deploy stage failed: {e:#}");
-            anyhow::bail!("deploy stage failed");
-        }
-    }
-
-    // 形态分派：serve = 常驻 server（容器形态）；无子命令 = legacy 直跑
-    //（file-server dev 链的兼容入口，行为与 serve 演化前一致）。
+    //
+    // **仅 serve / legacy 直跑形态执行**：run-service 是已编排服务的 exec 载体，
+    // 而容器 env 恒带 APP_DEPLOY_URL 三元组（serve 的部署种子，换 Pod 模式每次
+    // 更新）——run-service 若也执行部署段会二次部署（move code 到 .previous 跨
+    // 卷 link 失败 exit 1 → supervisord SPAWN_ERROR，全部 app-svc-* 拉不起来）。
     match &args.command {
         Some(app_cli::config::Command::Serve) => {
+            deploy_stage(&args).await?;
             return app_cli::server::serve(&args).await;
         }
         Some(app_cli::config::Command::RunService {
@@ -70,7 +52,9 @@ async fn main() -> anyhow::Result<()> {
             }
             unreachable!("exec replaced process image");
         }
-        None => {}
+        None => {
+            deploy_stage(&args).await?;
+        }
     }
 
     // idle 判定：未部署（无 release.lock——start 无 url 创建的空容器）→ 最小形态
@@ -140,4 +124,32 @@ fn init_tracing(log_dir: &std::path::Path) -> Arc<tracing_appender::non_blocking
         .init();
 
     guard
+}
+
+/// 部署段（serve / legacy 直跑形态公用）：env 有 `APP_DEPLOY_URL` 才执行；
+/// liveness 托管占位 3010 防下载窗口 kubelet 误杀，失败上抛（supervisord 重试）。
+async fn deploy_stage(args: &app_cli::CliArgs) -> anyhow::Result<()> {
+    if !app_cli::deploy::deploy_requested() {
+        return Ok(());
+    }
+    // 占位失败（端口被占等）不阻断部署本身：warn 后裸跑（最坏 liveness 抖动）
+    let hold = match app_cli::deploy::LivenessHold::start(&args.admin_addr) {
+        Ok(hold) => Some(hold),
+        Err(e) => {
+            tracing::warn!(
+                "liveness hold bind {} failed, deploy continues without hold: {e:#}",
+                args.admin_addr
+            );
+            None
+        }
+    };
+    let deploy_result = app_cli::deploy::run_from_env(&args.workspace).await;
+    if let Some(hold) = hold {
+        hold.release().await;
+    }
+    if let Err(e) = deploy_result {
+        tracing::error!("❌ deploy stage failed: {e:#}");
+        anyhow::bail!("deploy stage failed");
+    }
+    Ok(())
 }
