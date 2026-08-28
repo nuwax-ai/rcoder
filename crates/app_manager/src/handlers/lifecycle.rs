@@ -6,6 +6,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
+use garde::Validate as _;
 use tracing::{info, instrument};
 
 use shared_types::{AppError, HttpResult};
@@ -36,8 +37,9 @@ pub async fn query_apps(
     State(state): State<Arc<AppManagerState>>,
     Json(request): Json<QueryAppsRequest>,
 ) -> Result<Json<HttpResult<PaginatedResponse<AppRuntimeInfo>>>, AppError> {
-    shared_types::validate_identifier(request.user_id.trim(), "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    request
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!("[APP] querying apps (user_id={})", request.user_id);
     let response = state.app_service.query_apps(request).await?;
     Ok(Json(HttpResult::success(response)))
@@ -61,8 +63,9 @@ pub async fn list_app_runtimes(
     State(state): State<Arc<AppManagerState>>,
     Query(owner): Query<OwnerParams>,
 ) -> Result<Json<HttpResult<Vec<AppRuntimeInfo>>>, AppError> {
-    shared_types::validate_identifier(owner.user_id.trim(), "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    owner
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!(
         "[APP] reconcile: listing app runtimes (user_id={})",
         owner.user_id
@@ -102,8 +105,9 @@ pub async fn get_app(
     Path(app_id): Path<String>,
     Query(owner): Query<OwnerParams>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    shared_types::validate_identifier(owner.user_id.trim(), "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    owner
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!(
         "[APP] getting app runtime: {} (user_id={})",
         app_id, owner.user_id
@@ -135,8 +139,9 @@ pub async fn update_app(
     Path(app_id): Path<String>,
     Json(request): Json<UpdateAppRequest>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    shared_types::validate_identifier(request.user_id.trim(), "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    request
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!("[APP] updating app: {}", app_id);
     let runtime = state.app_service.update_app(&app_id, request).await?;
     Ok(Json(HttpResult::success(runtime)))
@@ -191,16 +196,16 @@ pub async fn delete_app(
         ));
     };
     let purge = body.purge.unwrap_or(false);
-    let user_id = body.user_id.trim();
-    let expected_rv = body.expected_resource_version;
+    let user_id = body.user_id.trim().to_string();
+    let expected_rv = body.expected_resource_version.clone();
     // user_id 白名单校验后补录 owner 元数据（start 同款 best-effort——失败仅
     // 告警：后续 purge 的目录解析回退 metadata owner / 通配兜底）
     {
-        shared_types::validate_identifier(user_id, "user_id")
-            .map_err(|e| AppError::validation_error(&e))?;
+        body.validate()
+            .map_err(shared_types::garde_err_to_app_error)?;
         if let Err(e) = state
             .app_service
-            .record_dev_registration(&app_id, user_id)
+            .record_dev_registration(&app_id, &user_id)
             .await
         {
             tracing::warn!(

@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use garde::Validate as _;
 use tracing::{instrument, warn};
 
 use crate::models::*;
@@ -96,8 +97,14 @@ impl AppService {
         &self,
         request: QueryAppsRequest,
     ) -> AppResult<PaginatedResponse<AppRuntimeInfo>> {
-        shared_types::validate_identifier(request.user_id.trim(), "user_id")
-            .map_err(|e| AppOperationError::Validation(format!("invalid user_id: {e}")))?;
+        request.validate().map_err(|e| {
+            let msg = e
+                .iter()
+                .map(|(p, err)| format!("{p}: {}", err.message()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            AppOperationError::Validation(msg)
+        })?;
         let mut items = self.list_app_runtimes(request.user_id.trim()).await?;
 
         // 过滤：status/app_ids 为运行时字段直接生效；name/created_at 需业务元数据

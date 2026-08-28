@@ -6,6 +6,7 @@ use axum::{
     Json,
     extract::{Multipart, Path, Query, State},
 };
+use garde::Validate as _;
 use serde::Deserialize;
 use tracing::{info, instrument};
 use utoipa::ToSchema;
@@ -99,8 +100,7 @@ pub async fn upload_file(
     let name = file_name.unwrap_or_else(|| "uploaded_file".to_string());
     let target = target_path.unwrap_or_else(|| format!("code/{}", name));
     let user_id = user_id.ok_or_else(|| AppError::bad_request("missing user_id field"))?;
-    shared_types::validate_identifier(&user_id, "user_id")
-        .map_err(|e| AppError::bad_request(&e))?;
+    shared_types::identifier(&user_id, &()).map_err(|e| AppError::bad_request(&e.to_string()))?;
 
     let result = state
         .app_service
@@ -111,16 +111,20 @@ pub async fn upload_file(
 }
 
 /// 从 URL 下载文件请求
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, ToSchema, garde::Validate)]
 pub struct UploadFromUrlRequest {
     /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
     /// `dev/{user_id}/{app_id}` 分区依据）
+    #[garde(custom(shared_types::identifier))]
     pub user_id: String,
     /// 下载 URL（HTTP/HTTPS；允许内网 IP、localhost、集群域名和普通公网域名）
+    #[garde(skip)]
     pub url: String,
     /// 目标路径（app 根相对；单文件=文件路径，压缩包=解压目录如 "code/"；默认 "code/"）
+    #[garde(skip)]
     pub target: Option<String>,
     /// 压缩包是否剥单层 wrapper 目录（默认 false）
+    #[garde(skip)]
     pub flatten: Option<bool>,
 }
 
@@ -158,10 +162,10 @@ pub async fn upload_from_url(
         app_stage.as_str(),
         req.url
     );
-    let target = req.target.unwrap_or_else(|| "code/".to_string());
+    req.validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
+    let target = req.target.clone().unwrap_or_else(|| "code/".to_string());
     let flatten = req.flatten.unwrap_or(false);
-    shared_types::validate_identifier(&req.user_id, "user_id")
-        .map_err(|e| AppError::bad_request(&e))?;
     let result = state
         .app_service
         .upload_from_url(app_stage, &app_id, &req.user_id, &req.url, &target, flatten)
@@ -170,12 +174,14 @@ pub async fn upload_from_url(
 }
 
 /// 列出文件查询参数
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, ToSchema, garde::Validate)]
 pub struct ListFilesQuery {
     /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
     /// `dev/{user_id}/{app_id}` 分区依据）
+    #[garde(custom(shared_types::identifier))]
     pub user_id: String,
     /// 子目录（相对 app 根，如 "code"/"data"/"logs"；默认列 app 根）
+    #[garde(skip)]
     pub path: Option<String>,
 }
 
@@ -207,8 +213,7 @@ pub async fn list_files(
     Query(q): Query<ListFilesQuery>,
 ) -> Result<Json<HttpResult<Vec<FileInfo>>>, AppError> {
     let app_stage = super::parse_app_stage_param(&app_stage)?;
-    shared_types::validate_identifier(&q.user_id, "user_id")
-        .map_err(|e| AppError::bad_request(&e))?;
+    q.validate().map_err(shared_types::garde_err_to_app_error)?;
     info!(
         "[APP] listing files: {} (app_stage={}, user_id={}, subpath={:?})",
         app_id,
@@ -224,12 +229,14 @@ pub async fn list_files(
 }
 
 /// 删除文件请求
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, ToSchema, garde::Validate)]
 pub struct DeleteFileRequest {
     /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
     /// `dev/{user_id}/{app_id}` 分区依据）
+    #[garde(custom(shared_types::identifier))]
     pub user_id: String,
     /// 文件路径（app 根相对，如 "code/app.jar"，可指向 code/data/logs 下任意文件）
+    #[garde(skip)]
     pub path: String,
 }
 
@@ -259,8 +266,9 @@ pub async fn delete_file(
     Json(request): Json<DeleteFileRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
     let app_stage = super::parse_app_stage_param(&app_stage)?;
-    shared_types::validate_identifier(&request.user_id, "user_id")
-        .map_err(|e| AppError::bad_request(&e))?;
+    request
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!(
         "[APP] deleting file: {}/{} (app_stage={}, user_id={})",
         app_id,

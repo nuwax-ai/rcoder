@@ -47,9 +47,48 @@ pub fn validate_identifier(value: &str, field_name: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// garde custom rule 形态的标识符白名单校验（DTO 字段 `#[garde(custom(identifier))]`）。
+///
+/// 语义与 [`validate_identifier`] 一致（字母数字下划线连字符、1-64 字符、防路径
+/// 穿越/注入）；字段名由 garde Report 的 path 自动携带，消息内不再重复。
+/// 调用侧统一入口：`dto.validate().map_err(garde_err_to_app_error)?`。
+pub fn identifier(value: &str, _: &()) -> garde::Result {
+    if value.is_empty() {
+        return Err(garde::Error::new("不能为空"));
+    }
+    if value.len() > 64 {
+        return Err(garde::Error::new(format!(
+            "长度超过 64 字符: {}",
+            value.len()
+        )));
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(garde::Error::new(
+            "仅允许字母、数字、下划线和连字符（防路径穿越/注入）",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn garde_identifier_rule_matches_validate_identifier() {
+        // 同语义：合法集
+        for ok in ["user123", "my-project_01", "A-B_C"] {
+            assert!(identifier(ok, &()).is_ok(), "{ok}");
+            assert!(validate_identifier(ok, "f").is_ok());
+        }
+        // 拒绝集：穿越/注入/超长
+        for bad in ["../etc", "foo/bar", "", "x".repeat(65).as_str()] {
+            assert!(identifier(bad, &()).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn test_validate_identifier_accepts_valid() {

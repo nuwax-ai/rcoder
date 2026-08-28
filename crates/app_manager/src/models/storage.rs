@@ -4,21 +4,24 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// 清空应用持久存储请求
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct ClearStorageRequest {
     /// 归属用户 ID（必填，白名单校验；dev 分支经容器清 workspace 时开发容器
     /// 懒创建的宿主树 `dev/{user_id}/{app_id}` 分区依据）
+    #[garde(custom(shared_types::identifier))]
     pub user_id: String,
 }
 
 /// 销毁 PVC 请求（高危·不可逆；强制 `confirm == app_id` 二次确认）
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct DestroyStorageRequest {
     /// 归属用户 ID（必填，白名单校验；Docker compose 部署下销毁宿主树
     /// `prod/{user_id}/` 该 app 四目录的定位与审计依据——K8s 走 PVC 对象、
     /// Docker 走 prod/*/ 通配扫描兜底，显式值用于对账与未来精确直删）
+    #[garde(custom(shared_types::identifier))]
     pub user_id: String,
     /// 必须等于 path 的 `app_id`（防误调 / 防脚本批量误删 / 防重放）
+    #[garde(skip)]
     pub confirm: String,
 }
 

@@ -6,6 +6,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
+use garde::Validate as _;
 use serde::Deserialize;
 use tracing::{info, instrument};
 
@@ -45,8 +46,9 @@ pub async fn get_app_health(
     Path((app_id, app_stage)): Path<(String, String)>,
     Query(owner): Query<OwnerParams>,
 ) -> Result<Json<HttpResult<HealthInfo>>, AppError> {
-    shared_types::validate_identifier(owner.user_id.trim(), "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    owner
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     let app_stage = super::parse_app_stage_param(&app_stage)?;
     info!(
         "[APP] getting app health: {} app_stage={}",
@@ -62,10 +64,11 @@ pub async fn get_app_health(
 /// `user_id` 必填：Docker compose 部署下按 owner 关联宿主机数据卷目录
 /// （`prod/{user_id}/data/{app_id}` 分区）与调用侧映射关系维护；服务端
 /// 当前用于审计留痕与 owner 一致性校验。
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[derive(Debug, Deserialize, utoipa::IntoParams, garde::Validate)]
 #[into_params(parameter_in = Query)]
 pub struct StatsParams {
     /// 所属用户 ID（必填；标识符白名单校验）
+    #[garde(custom(shared_types::identifier))]
     pub user_id: String,
 }
 
@@ -96,8 +99,9 @@ pub async fn get_app_stats(
 ) -> Result<Json<HttpResult<ResourceStats>>, AppError> {
     let app_stage = super::parse_app_stage_param(&app_stage)?;
     // 标识符白名单校验（user_id 进宿主机卷路径分区与审计留痕，含 `/` 即逃逸）
-    shared_types::validate_identifier(&params.user_id, "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    params
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!(
         "[APP] getting app stats: {} (user_id={})",
         app_id, params.user_id
@@ -142,8 +146,9 @@ pub async fn get_app_events(
             "`events` is a prod-runtime capability: pass app_stage=prod (dev environment has no k8s events)",
         ));
     }
-    shared_types::validate_identifier(owner.user_id.trim(), "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    owner
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!(
         "[APP] getting app events: {} (user_id={})",
         app_id, owner.user_id

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Json, Path, Query, State};
+use garde::Validate as _;
 use tracing::{info, instrument};
 
 use shared_types::{AppError, HttpResult};
@@ -41,8 +42,9 @@ pub async fn start_app(
             "request body with required `user_id` is required for start",
         ));
     };
-    shared_types::validate_identifier(request.user_id.trim(), "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    request
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!(
         "[APP] starting app: {} (deploy={}, user_id={})",
         app_id,
@@ -85,8 +87,9 @@ pub async fn stop_app(
     Path(app_id): Path<String>,
     Query(owner): Query<OwnerParams>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    shared_types::validate_identifier(owner.user_id.trim(), "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    owner
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!("[APP] stopping app: {} (user_id={})", app_id, owner.user_id);
     let runtime = state.app_service.stop_app(&app_id).await?;
     Ok(Json(HttpResult::success(runtime)))
@@ -120,8 +123,9 @@ pub async fn restart_app(
             "request body with required `user_id` is required for restart",
         ));
     };
-    shared_types::validate_identifier(request.user_id.trim(), "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    request
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!(
         "[APP] restarting app: {} (deploy={})",
         app_id,
@@ -175,6 +179,13 @@ pub async fn set_recycle_policy(
             "`recycle-policy` is a prod-runtime capability: pass app_stage=prod (dev environment has no recycle semantics)",
         ));
     }
+    request
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
+    info!(
+        "[APP] setting recycle policy: {} (user_id={})",
+        app_id, request.user_id
+    );
     let runtime = state
         .app_service
         .set_recycle_policy(&app_id, request)

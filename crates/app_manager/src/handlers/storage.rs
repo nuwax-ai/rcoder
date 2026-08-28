@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
 };
+use garde::Validate as _;
 use tracing::{info, instrument};
 
 use shared_types::{AppError, HttpResult};
@@ -44,12 +45,17 @@ use crate::models::{
 pub async fn get_app_storage(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, app_stage)): Path<(String, String)>,
+    Query(owner): Query<crate::models::OwnerParams>,
 ) -> Result<Json<HttpResult<StorageInfo>>, AppError> {
     let app_stage = super::parse_app_stage_param(&app_stage)?;
+    owner
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!(
-        "[APP] getting app storage: {} (app_stage={})",
+        "[APP] getting app storage: {} (app_stage={}, user_id={})",
         app_id,
-        app_stage.as_str()
+        app_stage.as_str(),
+        owner.user_id
     );
     let info = state
         .app_service
@@ -86,8 +92,8 @@ pub async fn clear_app_storage(
     Json(req): Json<ClearStorageRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
     let app_stage = super::parse_app_stage_param(&app_stage)?;
-    shared_types::validate_identifier(&req.user_id, "user_id")
-        .map_err(|e| AppError::bad_request(&e))?;
+    req.validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!(
         "[APP] clearing app storage: {} (app_stage={}, user_id={})",
         app_id,
@@ -129,8 +135,8 @@ pub async fn destroy_app_storage(
     Json(req): Json<DestroyStorageRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
     let app_stage = super::parse_app_stage_param(&app_stage)?;
-    shared_types::validate_identifier(&req.user_id, "user_id")
-        .map_err(|e| AppError::bad_request(&e))?;
+    req.validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     info!(
         "[APP] destroying app storage: {} (app_stage={}, user_id={})",
         app_id,

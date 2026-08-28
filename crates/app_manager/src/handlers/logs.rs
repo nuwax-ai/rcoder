@@ -13,6 +13,7 @@
 //! wire DTO 与 app-cli 同源（`shared_types::app_cli_logs`），文档响应 schema
 //! 因此可见具体字段定义。
 
+use garde::Validate as _;
 use std::sync::Arc;
 
 use axum::Json;
@@ -31,11 +32,12 @@ use super::AppManagerState;
 ///
 /// `parameter_in` 必须显式声明：utoipa-axum 自动发现会按 Path extractor 把
 /// query 字段误标 path（项目既有约定），容器级显式声明优先。
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[derive(Debug, Deserialize, utoipa::IntoParams, garde::Validate)]
 #[into_params(parameter_in = Query)]
 pub struct LogsAccessParams {
     /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
     /// `dev/{user_id}/{app_id}` 分区依据）
+    #[garde(custom(shared_types::identifier))]
     pub user_id: String,
 }
 
@@ -73,8 +75,9 @@ pub async fn query_app_log_sources(
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
     let app_stage = super::parse_app_stage_param(&app_stage)?;
-    shared_types::validate_identifier(&params.user_id, "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    params
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     let base = state
         .app_service
         .log_api_base(app_stage, &app_id, &params.user_id)
@@ -116,8 +119,9 @@ pub async fn query_app_logs(
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
     let app_stage = super::parse_app_stage_param(&app_stage)?;
-    shared_types::validate_identifier(&params.user_id, "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    params
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     let base = state
         .app_service
         .log_api_base(app_stage, &app_id, &params.user_id)
@@ -159,8 +163,9 @@ pub async fn stream_app_logs_v1(
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
     let app_stage = super::parse_app_stage_param(&app_stage)?;
-    shared_types::validate_identifier(&params.user_id, "user_id")
-        .map_err(|e| AppError::validation_error(&e))?;
+    params
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     let base = state
         .app_service
         .log_api_base(app_stage, &app_id, &params.user_id)

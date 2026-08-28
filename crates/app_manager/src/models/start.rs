@@ -14,42 +14,51 @@ use utoipa::ToSchema;
 /// start 无 `url` 且 app 不存在时**创建空容器**（基础设施形态：PG/ttyd/dbx
 /// 常驻 + app-cli idle 等部署，此形态 `user_id` 必填）；restart 无 `url` 对
 /// 不存在的 app 仍 404（重启语义不创建）。
-#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema, garde::Validate)]
 pub struct StartAppRequest {
     /// 制品包下载 URL（workspace 整体包 zip）。给出即触发轻量部署链。
+    #[garde(skip)]
     pub url: Option<String>,
     /// owner 用户 ID（必填；标识符白名单校验）。start/restart 显式传值直接落
     /// 容器 create params——Docker compose 数据卷 bind 源
     /// `prod/{user_id}/data/{app_id}` 分区依据；同批注册 `userapp_metadata`，
     /// 供 `/proxy/userapp/prod/{user_id}/...` URL 拼接与"我的应用"归属过滤。
     /// （metadata 回退→runtime 兜底 app_id 的孤儿目录路径已随必填化退役。）
+    #[garde(custom(shared_types::identifier))]
     pub user_id: String,
     /// 发布版本标记（幂等键）。缺省自动生成（`rel-{时间戳}-{随机}`）并在响应返回；
     /// 显式传入时同 id+同内容重复部署幂等命中。
+    #[garde(skip)]
     pub release_id: Option<String>,
     /// 制品 sha256（64 位十六进制小写）。可选——给出则下载后校验一致性，
     /// 缺省跳过校验（信任内网源）。
+    #[garde(skip)]
     pub sha256: Option<String>,
     /// 应用环境变量（整段替换语义，与 update 一致）。容器内 app-cli 读取。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
     pub env: Option<HashMap<String, String>>,
     /// 闲置回收超时（秒）。0 = 不回收（常驻）。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
     pub idle_timeout_seconds: Option<u64>,
     /// PG 凭据对齐：给出则部署完成后自动连接测试（scram），不一致自动重置为该值
     /// （对齐失败不阻断部署，结果见响应 `pg_aligned` 字段，可重试）。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
     pub pg: Option<StartPgCredential>,
     /// 是否在部署 activate 后自动执行包内 database 目录 SQL（根 database/ 先 +
     /// 各子项目 database/，文件名升序；单文件失败仅收集进 `sql_report` 不阻断）。
     /// 缺省 true；false 跳过。仅 url 部署时生效。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
     pub auto_execute_sql: Option<bool>,
     /// 部署模式（仅带 url 时生效）：`pod`（缺省）= env 注入 → Recreate 换 Pod 部署；
     /// `hot` = 调容器内 app-cli `/v1/deploy` 原地换应用——不换 Pod、PG/ttyd/dbx
     /// 不断连。hot 的一切前置不满足（app 不存在/不在跑/容器为旧镜像）自动回退
     /// pod 模式。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
     pub deploy_mode: Option<DeployMode>,
 }
 

@@ -4,6 +4,7 @@
 //! 轻量部署（下载 zip → prepare → activate → 启动），失败语义对齐发布链
 //! （activate 就绪失败保留旧版本现场 + Failed）。可选 env/idle/pg 顺带生效。
 
+use garde::Validate as _;
 use tracing::{info, warn};
 
 use crate::models::*;
@@ -29,8 +30,14 @@ impl AppService {
     ) -> AppResult<StartAppResult> {
         // user_id 必填（白名单；空串/非法字符 400）——owner 分区与 metadata 注册的
         // 唯一来源，DTO 层缺字段已由反序列化 422 拦截，此处覆盖空串/格式。
-        shared_types::validate_identifier(request.user_id.trim(), "user_id")
-            .map_err(|e| AppOperationError::Validation(format!("invalid user_id: {e}")))?;
+        request.validate().map_err(|e| {
+            let msg = e
+                .iter()
+                .map(|(p, err)| format!("{p}: {}", err.message()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            AppOperationError::Validation(msg)
+        })?;
         validate_app_id(app_id)?;
 
         let (release_id, sql_report) = if let Some(url) = request
@@ -359,6 +366,9 @@ impl AppService {
             self.set_recycle_policy(
                 app_id,
                 RecyclePolicyRequest {
+                    // start 内部链构造：user_id 取请求显式档（StartAppRequest
+                    // .user_id 已是必填 String——owner 审计值直传）
+                    user_id: request.user_id.clone(),
                     recycle_enabled: Some(idle > 0),
                     idle_timeout_seconds: Some(idle),
                     wake_on_traffic: None,
