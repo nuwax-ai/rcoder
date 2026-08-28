@@ -362,7 +362,7 @@ pub async fn proxy_to_port(
 `/proxy/{port}` 按端口号代理到 **rcoder 容器本机** 的 `127.0.0.1:{port}`（本机服务调试入口）。
 **不是** userApp 应用的访问入口——应用访问走免端口专用路由
 `/proxy/userapp/prod/{user_id}/{app_id}/{*path}`（见 `proxy_to_app_with_path`），
-容器内控制台（ttyd/pgweb/dbx）走 `/userapp/{dev,prod}/{tool}/{app_id}`。
+容器内控制台（ttyd/pgweb/dbx）走 `/userapp/{dev,prod}/{tool}/{user_id}/{app_id}`。
 
 ## 工作原理
 此接口会返回 307 重定向，将请求转发到 Pingora 代理服务的实际端口和路径。

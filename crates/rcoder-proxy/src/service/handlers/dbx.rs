@@ -1,4 +1,4 @@
-//! DBX 数据库 Web GUI 两阶段代理（`/userapp/{dev,prod}/dbx/{app_id}` 工具族）。
+//! DBX 数据库 Web GUI 两阶段代理（`/userapp/{dev,prod}/dbx/{user_id}/{app_id}` 工具族）。
 //!
 //! dbx-web（60+ 数据库 GUI，supervisor 恒起 `DBX_PORT`=4224）的开发/生产双入口：
 //! - **dev**：UserAppBuilder 开发容器（agent-runner 镜像）——注册表
@@ -21,7 +21,7 @@ use pingora_http::RequestHeader;
 use tracing::debug;
 
 use crate::service::handlers::dev_terminal::{
-    find_dev_container, find_runtime_addr, require_app_id, runtime_target_path_of,
+    find_dev_container, find_runtime_addr, require_app_id, require_user_id, runtime_target_path_of,
 };
 use crate::service::types::{ProxyMetrics, TrackingCtx};
 use crate::service::utils;
@@ -61,7 +61,7 @@ fn dbx_peer(container_addr: &str) -> Box<HttpPeer> {
     Box::new(peer)
 }
 
-/// `/userapp/dev/dbx/{app_id}/{*path}` 请求重写（定位在 upstream 阶段完成，同族先例）。
+/// `/userapp/dev/dbx/{user_id}/{app_id}/{*path}` 请求重写（定位在 upstream 阶段完成）。
 pub async fn handle_dev_dbx_request(
     upstream_request: &mut RequestHeader,
     original_uri: &http::Uri,
@@ -80,21 +80,24 @@ pub async fn handle_dev_dbx_upstream(
     dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
-    let container_addr = find_dev_container(container_lookup, dev_ensure, &app_id).await?;
+    let user_id = require_user_id(&params)?;
+    let container_addr =
+        find_dev_container(container_lookup, dev_ensure, &app_id, &user_id).await?;
 
     metrics.record_request();
     metrics.inc_active();
     ctx.vnc_target_ip = Some(container_addr.clone());
     debug!(
-        "[DEV_DBX] app_id={} -> {}:{}",
+        "[DEV_DBX] app_id={}, user_id={} -> {}:{}",
         app_id,
+        user_id,
         container_addr,
         shared_types::DBX_PORT
     );
     Ok(dbx_peer(&container_addr))
 }
 
-/// `/userapp/prod/dbx/{app_id}/{*path}` 请求重写。
+/// `/userapp/prod/dbx/{user_id}/{app_id}/{*path}` 请求重写。
 pub async fn handle_prod_dbx_request(
     upstream_request: &mut RequestHeader,
     original_uri: &http::Uri,
@@ -113,14 +116,16 @@ pub async fn handle_prod_dbx_upstream(
     ip_slot: &arc_swap::ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
+    let user_id = require_user_id(&params)?;
     let container_addr = find_runtime_addr(ip_slot, container_lookup, &app_id).await?;
 
     metrics.record_request();
     metrics.inc_active();
     ctx.vnc_target_ip = Some(container_addr.clone());
     debug!(
-        "[PROD_DBX] app_id={} -> {}:{}",
+        "[PROD_DBX] app_id={}, user_id={} -> {}:{}",
         app_id,
+        user_id,
         container_addr,
         shared_types::DBX_PORT
     );

@@ -39,7 +39,7 @@ const AGENT_NOVNC_PORT: u32 = NOVNC_PORT as u32;
 /// Agent Runner WS 终端中间层端口（agent_runner tokio-tungstenite 监听；Pingora TtydProxy 路由到此）
 const AGENT_WS_TERMINAL_PORT: u32 = WS_TERMINAL_PORT as u32;
 
-/// DBX 数据库 Web GUI 端口（agent-runner 镜像 supervisor 恒起；Pingora /userapp/dev/dbx 路由到此）
+/// DBX 数据库 Web GUI 端口（agent-runner 镜像 supervisor 恒起；Pingora /userapp/dev/dbx/{user_id}/{app_id} 路由到此）
 const AGENT_DBX_PORT: u32 = DBX_PORT as u32;
 
 /// K8s 标准标签前缀

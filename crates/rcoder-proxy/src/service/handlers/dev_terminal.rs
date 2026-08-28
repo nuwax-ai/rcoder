@@ -36,9 +36,16 @@ pub(crate) async fn find_dev_container(
     container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
     dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
     app_id: &str,
+    user_id: &str,
 ) -> Result<String, Box<pingora_core::Error>> {
     if let Err(e) = shared_types::validate_identifier(app_id, "app_id") {
         warn!("[DEV_TERMINAL] invalid app_id: {}", e);
+        return Err(pingora_core::Error::new(
+            pingora_core::ErrorType::HTTPStatus(400),
+        ));
+    }
+    if let Err(e) = shared_types::validate_identifier(user_id, "user_id") {
+        warn!("[DEV_TERMINAL] invalid user_id: {}", e);
         return Err(pingora_core::Error::new(
             pingora_core::ErrorType::HTTPStatus(400),
         ));
@@ -52,13 +59,14 @@ pub(crate) async fn find_dev_container(
     {
         return Ok(ip);
     }
-    // miss → 懒启动（metadata owner 链；显式 user_id 恒 None——URL 无携带位）。
+    // miss → 懒启动（显式 owner 档：URL user_id 段直取，宿主树
+    // `dev/{user_id}/{app_id}` 分区正确，不依赖 metadata 兜底）。
     // 槽未回填（AppState 就绪前）视为未注入，维持 404 指引。
     let Some(ensurer) = dev_ensure.load_full() else {
         info!("[DEV_TERMINAL] dev container not found: app_id={app_id} (create workspace first)");
         return Err(not_found_error(app_id));
     };
-    match ensurer.ensure_dev_container(app_id, None).await {
+    match ensurer.ensure_dev_container(app_id, Some(user_id)).await {
         Ok(info) if !info.container_ip.is_empty() => {
             info!("[DEV_TERMINAL] dev container ensured on demand: app_id={app_id}");
             Ok(info.container_ip)
@@ -83,6 +91,15 @@ fn not_found_error(app_id: &str) -> Box<pingora_core::Error> {
 }
 
 /// 提取并校验 app_id 路径参数。
+/// 路由参数 user_id 提取（工具族新形态 `{user_id}/{app_id}` 双段）。
+pub(crate) fn require_user_id(params: &Params<'_, '_>) -> Result<String, Box<pingora_core::Error>> {
+    let user_id = params.get("user_id").ok_or_else(|| {
+        error!("[DEV_TERMINAL] route missing user_id param");
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+    })?;
+    Ok(user_id.to_owned())
+}
+
 pub(crate) fn require_app_id(params: &Params<'_, '_>) -> Result<String, Box<pingora_core::Error>> {
     let app_id = params.get("app_id").ok_or_else(|| {
         error!("[DEV_TERMINAL] route missing app_id param");
@@ -136,7 +153,8 @@ pub async fn handle_dev_ttyd_upstream(
     dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
-    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id).await?;
+    let user_id = require_user_id(&params)?;
+    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id, &user_id).await?;
 
     metrics.record_request();
     metrics.inc_active();
@@ -194,7 +212,8 @@ pub async fn handle_dev_vnc_upstream(
     dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
-    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id).await?;
+    let user_id = require_user_id(&params)?;
+    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id, &user_id).await?;
 
     metrics.record_request();
     metrics.inc_active();
@@ -246,7 +265,8 @@ pub async fn handle_dev_audio_request(
         format!("/{remaining}")
     };
 
-    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id).await?;
+    let user_id = require_user_id(&params)?;
+    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id, &user_id).await?;
     metrics.record_request();
     metrics.record_request_port(target_port);
     ctx.target_port = Some(target_port);
@@ -302,9 +322,10 @@ pub async fn handle_dev_ime_request(
     dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
 ) -> PingoraResult<()> {
     let app_id = require_app_id(&params)?;
+    let user_id = require_user_id(&params)?;
     let target_path = target_path_of(&params);
 
-    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id).await?;
+    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id, &user_id).await?;
     metrics.record_request();
     metrics.record_request_port(crate::service::types::IME_PORT);
     ctx.target_port = Some(crate::service::types::IME_PORT);

@@ -70,7 +70,7 @@ pub fn resolve_project_cwd(
         Some(ServiceType::UserAppBuilder) => {
             // userApp 开发容器的终端：workspace = 开发卷 {USERAPP_WORKSPACE_ROOT}/{app_id}
             // （与 chat 的 work_dir、file-server 的 resolve_userapp_dev 同根——
-            // /userapp/dev/ttyd/{app_id} 经 Pingora 注入本 service_type 到达此处）
+            // /userapp/dev/ttyd/{user_id}/{app_id} 经 Pingora 注入本 service_type 到达此处）
             resolve_in_candidates(project_id, &[USERAPP_PREFIX])
         }
         Some(ServiceType::WebAgentRunner) | Some(ServiceType::UserApp) => {

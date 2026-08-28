@@ -178,23 +178,42 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
     // 示例:
     // - /health → {"status":"ok","service":"pingora-proxy","timestamp":1234567890}
     //
-    // userApp 开发域终端/桌面代理族（与 computer 族对称，app_id 定位 UserAppBuilder 开发容器）。
-    // 兜底路由（无尾随 path）与通配成对注册——matchit 的 {*path} 至少 1 字符。
+    // userApp 开发域终端/桌面代理族（与 computer 族对称；{user_id}/{app_id} 双段——
+    // user_id 是懒创建显式 owner 档）。兜底路由（无尾随 path）与通配成对注册。
+    // matchit 的 {*path} 至少 1 字符。
     for (prefix, route) in [
         (
-            "/userapp/dev/ttyd/{app_id}/{*path}",
+            "/userapp/dev/ttyd/{user_id}/{app_id}/{*path}",
             RouteType::DevTtydProxy,
         ),
-        ("/userapp/dev/ttyd/{app_id}", RouteType::DevTtydProxy),
-        ("/userapp/dev/vnc/{app_id}/{*path}", RouteType::DevVncProxy),
-        ("/userapp/dev/vnc/{app_id}", RouteType::DevVncProxy),
         (
-            "/userapp/dev/audio/{app_id}/{*path}",
+            "/userapp/dev/ttyd/{user_id}/{app_id}",
+            RouteType::DevTtydProxy,
+        ),
+        (
+            "/userapp/dev/vnc/{user_id}/{app_id}/{*path}",
+            RouteType::DevVncProxy,
+        ),
+        (
+            "/userapp/dev/vnc/{user_id}/{app_id}",
+            RouteType::DevVncProxy,
+        ),
+        (
+            "/userapp/dev/audio/{user_id}/{app_id}/{*path}",
             RouteType::DevAudioProxy,
         ),
-        ("/userapp/dev/audio/{app_id}", RouteType::DevAudioProxy),
-        ("/userapp/dev/ime/{app_id}/{*path}", RouteType::DevImeProxy),
-        ("/userapp/dev/ime/{app_id}", RouteType::DevImeProxy),
+        (
+            "/userapp/dev/audio/{user_id}/{app_id}",
+            RouteType::DevAudioProxy,
+        ),
+        (
+            "/userapp/dev/ime/{user_id}/{app_id}/{*path}",
+            RouteType::DevImeProxy,
+        ),
+        (
+            "/userapp/dev/ime/{user_id}/{app_id}",
+            RouteType::DevImeProxy,
+        ),
     ] {
         router.insert(prefix, route).map_err(|e| {
             tracing::error!("[ROUTER] userapp dev terminal route {prefix} config failed: {e}");
@@ -205,18 +224,25 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
     }
 
     // userApp 生产域工具族（运行容器，部署后的生产环境）。
-    // stage 段 prod 与开发域工具族对称（原 `/runtime` 静态段随路径风格统一退役）。
+    // stage 段 prod 与开发域工具族对称（{user_id}/{app_id} 双段同构；
+    // 原 `/runtime` 静态段随路径风格统一退役）。
     for (prefix, route) in [
         (
-            "/userapp/prod/ttyd/{app_id}/{*path}",
+            "/userapp/prod/ttyd/{user_id}/{app_id}/{*path}",
             RouteType::RuntimeTtydProxy,
         ),
-        ("/userapp/prod/ttyd/{app_id}", RouteType::RuntimeTtydProxy),
         (
-            "/userapp/prod/pgweb/{app_id}/{*path}",
+            "/userapp/prod/ttyd/{user_id}/{app_id}",
+            RouteType::RuntimeTtydProxy,
+        ),
+        (
+            "/userapp/prod/pgweb/{user_id}/{app_id}/{*path}",
             RouteType::RuntimePgwebProxy,
         ),
-        ("/userapp/prod/pgweb/{app_id}", RouteType::RuntimePgwebProxy),
+        (
+            "/userapp/prod/pgweb/{user_id}/{app_id}",
+            RouteType::RuntimePgwebProxy,
+        ),
     ] {
         router.insert(prefix, route).map_err(|e| {
             tracing::error!("[ROUTER] userapp prod terminal route {prefix} config failed: {e}");
@@ -227,15 +253,24 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
     }
 
     // DBX 数据库 Web GUI 两阶段（dev=开发容器 / prod=运行容器，均直连 :4224）——
-    // 归入工具族 stage 前缀风格（与 ttyd/vnc/audio/ime/pgweb 同一形态）。
+    // 归入工具族 stage 前缀风格（{user_id}/{app_id} 双段与 ttyd/vnc/audio/ime/pgweb 同一形态）。
     for (prefix, route) in [
-        ("/userapp/dev/dbx/{app_id}/{*path}", RouteType::DevDbxProxy),
-        ("/userapp/dev/dbx/{app_id}", RouteType::DevDbxProxy),
         (
-            "/userapp/prod/dbx/{app_id}/{*path}",
+            "/userapp/dev/dbx/{user_id}/{app_id}/{*path}",
+            RouteType::DevDbxProxy,
+        ),
+        (
+            "/userapp/dev/dbx/{user_id}/{app_id}",
+            RouteType::DevDbxProxy,
+        ),
+        (
+            "/userapp/prod/dbx/{user_id}/{app_id}/{*path}",
             RouteType::ProdDbxProxy,
         ),
-        ("/userapp/prod/dbx/{app_id}", RouteType::ProdDbxProxy),
+        (
+            "/userapp/prod/dbx/{user_id}/{app_id}",
+            RouteType::ProdDbxProxy,
+        ),
     ] {
         router.insert(prefix, route).map_err(|e| {
             tracing::error!("[ROUTER] dbx proxy route {prefix} config failed: {e}");
@@ -577,14 +612,14 @@ mod tests {
 
         // 开发域工具族（stage 段 dev）通配 + 兜底（无尾随 path）成对
         for (path, expected) in [
-            ("/userapp/dev/ttyd/app-1/ws", RouteType::DevTtydProxy),
-            ("/userapp/dev/ttyd/app-1", RouteType::DevTtydProxy),
-            ("/userapp/dev/vnc/app-1/vnc.html", RouteType::DevVncProxy),
-            ("/userapp/dev/vnc/app-1", RouteType::DevVncProxy),
-            ("/userapp/dev/audio/app-1/ws", RouteType::DevAudioProxy),
-            ("/userapp/dev/audio/app-1", RouteType::DevAudioProxy),
-            ("/userapp/dev/ime/app-1/connect", RouteType::DevImeProxy),
-            ("/userapp/dev/ime/app-1", RouteType::DevImeProxy),
+            ("/userapp/dev/ttyd/u1/app-1/ws", RouteType::DevTtydProxy),
+            ("/userapp/dev/ttyd/u1/app-1", RouteType::DevTtydProxy),
+            ("/userapp/dev/vnc/u1/app-1/vnc.html", RouteType::DevVncProxy),
+            ("/userapp/dev/vnc/u1/app-1", RouteType::DevVncProxy),
+            ("/userapp/dev/audio/u1/app-1/ws", RouteType::DevAudioProxy),
+            ("/userapp/dev/audio/u1/app-1", RouteType::DevAudioProxy),
+            ("/userapp/dev/ime/u1/app-1/connect", RouteType::DevImeProxy),
+            ("/userapp/dev/ime/u1/app-1", RouteType::DevImeProxy),
         ] {
             let matched = router.at(path).expect(path);
             assert_eq!(*matched.value, expected, "path={path}");
@@ -593,28 +628,28 @@ mod tests {
         // 生产域工具族（stage 段 prod，原 /runtime 段退役）：与开发域 stage 段区分
         for (path, expected, expected_app) in [
             (
-                "/userapp/prod/ttyd/app-1/ws/token",
+                "/userapp/prod/ttyd/u1/app-1/ws/token",
                 RouteType::RuntimeTtydProxy,
                 "app-1",
             ),
             (
-                "/userapp/prod/ttyd/app-1",
+                "/userapp/prod/ttyd/u1/app-1",
                 RouteType::RuntimeTtydProxy,
                 "app-1",
             ),
             (
-                "/userapp/prod/pgweb/app-1/static/favicon.ico",
+                "/userapp/prod/pgweb/u1/app-1/static/favicon.ico",
                 RouteType::RuntimePgwebProxy,
                 "app-1",
             ),
             (
-                "/userapp/prod/pgweb/app-1",
+                "/userapp/prod/pgweb/u1/app-1",
                 RouteType::RuntimePgwebProxy,
                 "app-1",
             ),
             // 开发域路由不被 prod 段劫持
             (
-                "/userapp/dev/ttyd/app-1/ws",
+                "/userapp/dev/ttyd/u1/app-1/ws",
                 RouteType::DevTtydProxy,
                 "app-1",
             ),
@@ -628,41 +663,51 @@ mod tests {
             );
         }
 
-        // dbx 两阶段（工具族形态）：app_id + 剩余 path 剥前缀语义与族内一致
-        for (path, expected, expected_app, expected_rest) in [
+        // 工具族新形态（{user_id}/{app_id} 双段）：app_id + 剩余 path 剥前缀语义不变
+        for (path, expected, expected_user, expected_app, expected_rest) in [
             (
-                "/userapp/dev/dbx/app-1",
+                "/userapp/dev/dbx/u1/app-1",
                 RouteType::DevDbxProxy,
+                "u1",
                 "app-1",
                 None,
             ),
             (
-                "/userapp/dev/dbx/app-1/api/auth/check",
+                "/userapp/dev/dbx/u1/app-1/api/auth/check",
                 RouteType::DevDbxProxy,
+                "u1",
                 "app-1",
                 Some("api/auth/check"),
             ),
             (
-                "/userapp/dev/dbx/app-1/assets/index.js",
-                RouteType::DevDbxProxy,
+                "/userapp/dev/ttyd/u1/app-1/ws",
+                RouteType::DevTtydProxy,
+                "u1",
                 "app-1",
-                Some("assets/index.js"),
+                Some("ws"),
             ),
             (
-                "/userapp/prod/dbx/app-1",
+                "/userapp/prod/dbx/u1/app-1",
                 RouteType::ProdDbxProxy,
+                "u1",
                 "app-1",
                 None,
             ),
             (
-                "/userapp/prod/dbx/app-1/api/connection/list",
-                RouteType::ProdDbxProxy,
+                "/userapp/prod/pgweb/u1/app-1/console",
+                RouteType::RuntimePgwebProxy,
+                "u1",
                 "app-1",
-                Some("api/connection/list"),
+                Some("console"),
             ),
         ] {
             let matched = router.at(path).expect(path);
             assert_eq!(*matched.value, expected, "path={path}");
+            assert_eq!(
+                matched.params.get("user_id"),
+                Some(expected_user),
+                "user_id param path={path}"
+            );
             assert_eq!(
                 matched.params.get("app_id"),
                 Some(expected_app),
@@ -672,6 +717,31 @@ mod tests {
                 matched.params.get("path"),
                 expected_rest,
                 "rest path param path={path}"
+            );
+        }
+
+        // 单段 app_id 旧形态（无 user_id）已退役：根形态（无尾随 path）不得命中。
+        // 注：深层旧 URL（如 /userapp/dev/dbx/app-1/api/...）会把 app-1 误解析进
+        // user_id 槽 → 定位失败 404——Breaking 换代由 Java 同批改 URL 保证。
+        for old_path in ["/userapp/prod/dbx/app-1", "/userapp/dev/ttyd/app-1"] {
+            let path = crate::service::utils::normalize_path(old_path);
+            let hits = router
+                .at(path)
+                .ok()
+                .map(|m| {
+                    matches!(
+                        *m.value,
+                        RouteType::DevDbxProxy
+                            | RouteType::ProdDbxProxy
+                            | RouteType::DevTtydProxy
+                            | RouteType::RuntimeTtydProxy
+                            | RouteType::RuntimePgwebProxy
+                    )
+                })
+                .unwrap_or(false);
+            assert!(
+                !hits,
+                "single-segment legacy path must be retired: {old_path}"
             );
         }
 

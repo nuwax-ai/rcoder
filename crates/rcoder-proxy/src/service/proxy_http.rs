@@ -342,10 +342,10 @@ mod tests {
         let router = test_router();
         // classify 接收 request_filter 规范化后的路径（尾部斜杠已剥）
         for path in [
-            "/userapp/prod/ttyd/app-1",
-            "/userapp/prod/ttyd/app-1/token.js",
-            "/userapp/prod/pgweb/app-1",
-            "/userapp/prod/dbx/app-1",
+            "/userapp/prod/ttyd/u1/app-1",
+            "/userapp/prod/ttyd/u1/app-1/token.js",
+            "/userapp/prod/pgweb/u1/app-1",
+            "/userapp/prod/dbx/u1/app-1",
         ] {
             let (app_id, touch) =
                 classify_wake_target(&router, path).unwrap_or_else(|| panic!("{path} unmatched"));
@@ -371,6 +371,6 @@ mod tests {
         assert!(classify_wake_target(&router, "/api/v1/userapp/build").is_none());
         assert!(classify_wake_target(&router, "/web/ttyd/u1").is_none());
         // dev 工具族走 builder 注册表定位，不在 prod 唤醒范围
-        assert!(classify_wake_target(&router, "/userapp/dev/ttyd/app-1").is_none());
+        assert!(classify_wake_target(&router, "/userapp/dev/ttyd/u1/app-1").is_none());
     }
 }

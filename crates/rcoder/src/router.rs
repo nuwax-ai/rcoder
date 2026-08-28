@@ -137,68 +137,68 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         // 此处提供 Swagger 文档 + 可直接调用的重定向语义，对齐 devapp 先例）
         // 开发域（UserAppBuilder 开发容器）：ttyd/vnc/audio/ime/dbx
         .route(
-            "/userapp/dev/ttyd/{app_id}/{*path}",
+            "/userapp/dev/ttyd/{user_id}/{app_id}/{*path}",
             get(handler::proxy_to_userapp_ttyd),
         )
         .route(
-            "/userapp/dev/ttyd/{app_id}",
+            "/userapp/dev/ttyd/{user_id}/{app_id}",
             get(handler::proxy_to_userapp_ttyd_redirect_root),
         )
         .route(
-            "/userapp/dev/vnc/{app_id}/{*path}",
+            "/userapp/dev/vnc/{user_id}/{app_id}/{*path}",
             get(handler::proxy_to_userapp_vnc),
         )
         .route(
-            "/userapp/dev/vnc/{app_id}",
+            "/userapp/dev/vnc/{user_id}/{app_id}",
             get(handler::proxy_to_userapp_vnc_redirect_root),
         )
         .route(
-            "/userapp/dev/audio/{app_id}/{*path}",
+            "/userapp/dev/audio/{user_id}/{app_id}/{*path}",
             get(handler::proxy_to_userapp_audio),
         )
         .route(
-            "/userapp/dev/audio/{app_id}",
+            "/userapp/dev/audio/{user_id}/{app_id}",
             get(handler::proxy_to_userapp_audio_redirect_root),
         )
         .route(
-            "/userapp/dev/ime/{app_id}/{*path}",
+            "/userapp/dev/ime/{user_id}/{app_id}/{*path}",
             get(handler::proxy_to_userapp_ime),
         )
         .route(
-            "/userapp/dev/ime/{app_id}",
+            "/userapp/dev/ime/{user_id}/{app_id}",
             get(handler::proxy_to_userapp_ime_redirect_root),
         )
         .route(
-            "/userapp/dev/dbx/{app_id}/{*path}",
+            "/userapp/dev/dbx/{user_id}/{app_id}/{*path}",
             get(handler::proxy_to_dev_dbx),
         )
         .route(
-            "/userapp/dev/dbx/{app_id}",
+            "/userapp/dev/dbx/{user_id}/{app_id}",
             get(handler::proxy_to_dev_dbx_redirect_root),
         )
         // 生产域（运行容器，部署后的生产环境）：ttyd/pgweb/dbx
         .route(
-            "/userapp/prod/ttyd/{app_id}/{*path}",
+            "/userapp/prod/ttyd/{user_id}/{app_id}/{*path}",
             get(handler::proxy_to_userapp_runtime_ttyd),
         )
         .route(
-            "/userapp/prod/ttyd/{app_id}",
+            "/userapp/prod/ttyd/{user_id}/{app_id}",
             get(handler::proxy_to_userapp_runtime_ttyd_redirect_root),
         )
         .route(
-            "/userapp/prod/pgweb/{app_id}/{*path}",
+            "/userapp/prod/pgweb/{user_id}/{app_id}/{*path}",
             get(handler::proxy_to_userapp_runtime_pgweb),
         )
         .route(
-            "/userapp/prod/pgweb/{app_id}",
+            "/userapp/prod/pgweb/{user_id}/{app_id}",
             get(handler::proxy_to_userapp_runtime_pgweb_redirect_root),
         )
         .route(
-            "/userapp/prod/dbx/{app_id}/{*path}",
+            "/userapp/prod/dbx/{user_id}/{app_id}/{*path}",
             get(handler::proxy_to_prod_dbx),
         )
         .route(
-            "/userapp/prod/dbx/{app_id}",
+            "/userapp/prod/dbx/{user_id}/{app_id}",
             get(handler::proxy_to_prod_dbx_redirect_root),
         )
         .route("/userapp/routes", get(handler::userapp_proxy_routes_doc))

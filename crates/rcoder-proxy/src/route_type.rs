@@ -94,19 +94,20 @@ pub enum RouteType {
     RuntimeTtydProxy,
     RuntimePgwebProxy,
 
-    /// DBX 数据库 Web GUI 两阶段代理族: `/userapp/{dev,prod}/dbx/{app_id}/{*path}`
+    /// DBX 数据库 Web GUI 两阶段代理族: `/userapp/{dev,prod}/dbx/{user_id}/{app_id}/{*path}`
     ///
     /// dbx-web（60+ 数据库 GUI，两镜像 supervisor 恒起 :4224）按 **app_id** 定位，
-    /// stage 段区分定位方式（归入工具族 stage 语义）：
-    /// **dev**: `/userapp/dev/dbx/{app_id}/{*path}` → UserAppBuilder 开发容器
+    /// **user_id** 是 dev 懒创建显式 owner 档（`dev/{user_id}/{app_id}` 宿主树分区）
+    /// 与 prod 归属校验锚点；stage 段区分定位方式（归入工具族 stage 语义）：
+    /// **dev**: `/userapp/dev/dbx/{user_id}/{app_id}/{*path}` → UserAppBuilder 开发容器
     ///   （agent-runner 镜像）；注册表 find_by_project_id(app_id, UserAppBuilder)，
     ///   未建 workspace → 404（同 dev 工具族）
-    /// **prod**: `/userapp/prod/dbx/{app_id}/{*path}` → UserApp 运行容器
+    /// **prod**: `/userapp/prod/dbx/{user_id}/{app_id}/{*path}` → UserApp 运行容器
     ///   （app-runtime 镜像）；find_app_runtime_addr 确定性命名构造，
-    ///   未部署/停止 → 上游连接失败 502（同 prod 工具族）
+    ///   未部署/停止 → 唤醒（wake-without-touch）或上游失败 502（同 prod 工具族）
     ///
     /// 代理剥前缀直连 root 模式 dbx（同 pgweb）：前端 webPath.ts 从
-    /// location.pathname 运行时推断 base，API/WS 自动拼回 `/userapp/{stage}/dbx/{app_id}`。
+    /// location.pathname 运行时推断 base，API/WS 自动拼回 `/userapp/{stage}/dbx/{user_id}/{app_id}`。
     DevDbxProxy,
     ProdDbxProxy,
 
