@@ -219,16 +219,13 @@ fn classify_dev_absent(path: &str) -> DevAbsentAction {
 
 /// 短路语义的容器在否判定（peek）：只读探测，不 ensure、不写探活缓存、
 /// 不触发自愈——短路路径必须零副作用。
-async fn dev_container_absent(state: &AppState, app_id: &str) -> bool {
-    let Some(info) = registered_builder(state, app_id) else {
-        return true;
-    };
-    let cache = PROBE_OK.get_or_init(dashmap::DashMap::new);
-    if cache.get(app_id).is_some_and(|t| t.elapsed() < PROBE_TTL) {
-        return false;
-    }
-    let addr = dev_file_server_addr(state, &info);
-    !probe_dev_container(&addr).await
+/// 短路语义的容器在否判定（peek）：**仅以注册表 miss 为 absent 信号**，
+/// 不做探活——3s 探测在容器内重量构建（多服务 build/依赖安装）下会假阴性，
+/// 把进行中的 tasks 进度轮询误杀（轮询恰是该接口的核心场景）。注册命中即
+/// 视为在：慢/死 IP 由转发路径兜底（send 失败 502 + 下请求探活自愈）。
+/// 零副作用承诺不变：只读注册表，不 ensure 不自愈不清缓存。
+fn dev_container_absent(state: &AppState, app_id: &str) -> bool {
+    registered_builder(state, app_id).is_none()
 }
 
 /// 全站 HttpResult 信封短路响应（HTTP 恒 200，调用方按信封 code 判断：
@@ -526,7 +523,7 @@ pub(crate) async fn forward_userapp(
             Ok(app_id) => app_id,
             Err(e) => return e.into_response(),
         };
-        if dev_container_absent(&state, &app_id).await {
+        if dev_container_absent(&state, &app_id) {
             return match classify_dev_absent(&path) {
                 DevAbsentAction::SkipSuccess(SkipKind::CancelTask(task_id)) => {
                     info!(
@@ -580,8 +577,8 @@ pub(crate) async fn forward_userapp(
         UserappStage::Dev => {
             // 停止/查询短路：仅容器不在时生效（容器在则照常转发）
             let action = classify_dev_absent(&path);
-            let short_circuit = !matches!(action, DevAbsentAction::Ensure)
-                && dev_container_absent(&state, &app_id).await;
+            let short_circuit =
+                !matches!(action, DevAbsentAction::Ensure) && dev_container_absent(&state, &app_id);
             if short_circuit {
                 return match action {
                     DevAbsentAction::SkipSuccess(SkipKind::DevStop) => {
