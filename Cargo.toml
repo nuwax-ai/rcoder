@@ -103,7 +103,7 @@ schemars = { version = "1.2", features = ["derive"] }
 config = "0.15"
 
 # Validation
-garde = { version = "0.23.0", features = ["derive"] }
+garde = { version = "0.23.0", features = ["derive", "regex"] }
 
 # Error handling
 anyhow = "1.0"

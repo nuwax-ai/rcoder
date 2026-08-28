@@ -136,6 +136,6 @@ pub struct InternalPort {
 #[into_params(parameter_in = Query)]
 pub struct OwnerParams {
     /// 归属用户 ID（必填；标识符白名单校验。审计留痕；后续归属鉴权的数据锚点）
-    #[garde(custom(shared_types::identifier))]
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
 }

@@ -109,9 +109,12 @@ impl AppService {
         // user_id：归属用户（部署访问 URL 段 + metadata 数据源），identifier 规范。
         // 空串放行——内部发布链 ensure 构造无 user 上下文（回填已存值或空，
         // record 侧空转 None）；外部 REST 路径的必填由 handler 层校验兜底。
-        if !request.user_id.trim().is_empty() {
-            shared_types::identifier(request.user_id.trim(), &())
-                .map_err(|e| AppOperationError::Validation(e.to_string()))?;
+        if !request.user_id.trim().is_empty()
+            && !shared_types::IDENTIFIER_RE.is_match(request.user_id.trim())
+        {
+            return Err(AppOperationError::Validation(
+                "user_id 仅允许字母、数字、下划线和连字符（1-64 字符）".to_string(),
+            ));
         }
         // app_id：外部指定（app- + DNS-1123，校验 + 唯一性）or 自动生成
         let app_id = match &request.app_id {

@@ -68,7 +68,7 @@ pub async fn get_app_health(
 #[into_params(parameter_in = Query)]
 pub struct StatsParams {
     /// 所属用户 ID（必填；标识符白名单校验）
-    #[garde(custom(shared_types::identifier))]
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
 }
 

@@ -24,7 +24,7 @@ pub struct StartAppRequest {
     /// `prod/{user_id}/data/{app_id}` 分区依据；同批注册 `userapp_metadata`，
     /// 供 `/proxy/userapp/prod/{user_id}/...` URL 拼接与"我的应用"归属过滤。
     /// （metadata 回退→runtime 兜底 app_id 的孤儿目录路径已随必填化退役。）
-    #[garde(custom(shared_types::identifier))]
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
     /// 发布版本标记（幂等键）。缺省自动生成（`rel-{时间戳}-{随机}`）并在响应返回；
     /// 显式传入时同 id+同内容重复部署幂等命中。

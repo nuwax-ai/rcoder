@@ -37,7 +37,7 @@ use super::AppManagerState;
 pub struct LogsAccessParams {
     /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
     /// `dev/{user_id}/{app_id}` 分区依据）
-    #[garde(custom(shared_types::identifier))]
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
 }
 

@@ -115,7 +115,11 @@ pub async fn upload_file(
     let name = file_name.unwrap_or_else(|| "uploaded_file".to_string());
     let target = target_path.unwrap_or_else(|| format!("code/{}", name));
     let user_id = user_id.ok_or_else(|| AppError::bad_request("missing user_id field"))?;
-    shared_types::identifier(&user_id, &()).map_err(|e| AppError::bad_request(&e.to_string()))?;
+    if !shared_types::IDENTIFIER_RE.is_match(&user_id) {
+        return Err(AppError::bad_request(
+            "user_id 仅允许字母、数字、下划线和连字符（1-64 字符）",
+        ));
+    }
 
     let result = state
         .app_service
@@ -130,7 +134,7 @@ pub async fn upload_file(
 pub struct UploadFromUrlRequest {
     /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
     /// `dev/{user_id}/{app_id}` 分区依据）
-    #[garde(custom(shared_types::identifier))]
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
     /// 下载 URL（HTTP/HTTPS；允许内网 IP、localhost、集群域名和普通公网域名）
     #[garde(skip)]
@@ -193,7 +197,7 @@ pub async fn upload_from_url(
 pub struct ListFilesQuery {
     /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
     /// `dev/{user_id}/{app_id}` 分区依据）
-    #[garde(custom(shared_types::identifier))]
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
     /// 子目录（相对 app 根，如 "code"/"data"/"logs"；默认列 app 根）
     #[garde(skip)]
@@ -249,7 +253,7 @@ pub async fn list_files(
 pub struct DeleteFileRequest {
     /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
     /// `dev/{user_id}/{app_id}` 分区依据）
-    #[garde(custom(shared_types::identifier))]
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
     /// 文件路径（app 根相对，如 "code/app.jar"，可指向 code/data/logs 下任意文件）
     #[garde(skip)]

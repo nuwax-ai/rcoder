@@ -55,7 +55,7 @@ pub struct CreateAppRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct QueryAppsRequest {
     /// 归属用户 ID（必填——按 metadata owner 过滤"我的应用"；无归属记录的应用不返回）
-    #[garde(custom(shared_types::identifier))]
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
     /// 页码
     #[garde(skip)]
@@ -115,7 +115,7 @@ pub enum SortOrder {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct UpdateAppRequest {
     /// 归属用户 ID（必填；标识符白名单校验——审计留痕 + 归属校验锚点）
-    #[garde(custom(shared_types::identifier))]
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
     /// 应用名称（仅元数据，不影响 K8s 资源命名；rcoder 忽略）
     #[garde(skip)]
@@ -163,7 +163,7 @@ pub struct UpdateAppRequest {
 pub struct RecyclePolicyRequest {
     /// 归属用户 ID（必填，白名单校验；审计留痕 + 归属校验锚点——计费 tier 变更
     /// 是高危操作，调用方身份留痕）
-    #[garde(custom(shared_types::identifier))]
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
     /// 是否参与闲置回收。None=不改；Some(true)=可回收（免费默认）；Some(false)=永不回收（付费/常驻）。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,7 +191,7 @@ pub struct DeleteAppRequest {
     pub purge: Option<bool>,
     /// 归属用户 ID（必填；标识符白名单校验）——purge 时 `prod/{user_id}/data/{app_id}`
     /// 分区精确定位 + 审计留痕；缺省回退 userapp_metadata.owner 的兜底路径退役。
-    #[garde(custom(shared_types::identifier))]
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
     /// 乐观锁：传入 `GET /apps/{id}` 返回的 `resource_version`；不匹配 → 409 ERR_CONFLICT。
     /// 不传 = 不校验（向后兼容）。Docker 模式忽略。
