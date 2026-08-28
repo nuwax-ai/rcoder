@@ -45,6 +45,7 @@ pub(crate) mod k8s_service;
 pub(crate) mod k8s_statefulset;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_translate;
+pub(crate) mod k8s_userapp_impl;
 
 pub use docker_runtime::DockerRuntime;
 #[cfg(feature = "kubernetes")]
