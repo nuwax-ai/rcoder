@@ -13,13 +13,14 @@ use crate::service::skills as skills_service;
 use crate::service::temp_file::TemporaryFile;
 use crate::service::zip;
 
-/// init-project-template 的 workspace 无关实现。
-pub async fn init_project_template_impl(
+/// init-project-template 的 workspace 无关核心（返回 workspace 根；
+/// 响应拼装归各域壳层）。
+pub async fn init_project_template_core(
     state: &AppState,
     ws: std::path::PathBuf,
     data: TemporaryFile,
     enable_git: bool,
-) -> Result<Json<Value>, AppError> {
+) -> Result<std::path::PathBuf, AppError> {
     tokio::fs::create_dir_all(&ws).await?;
     zip::extract_to(data.path().to_path_buf(), ws.clone()).await?;
     // git 双开关: GIT_ENABLED && enableGit → init + initial commit (对齐 nuwax)
@@ -31,6 +32,17 @@ pub async fn init_project_template_impl(
             tracing::warn!(error = %e, "git init_repo after template init failed (skipping)");
         }
     }
+    Ok(ws)
+}
+
+/// init-project-template 的 workspace 无关实现（computer 域 TS 响应拼装）。
+pub async fn init_project_template_impl(
+    state: &AppState,
+    ws: std::path::PathBuf,
+    data: TemporaryFile,
+    enable_git: bool,
+) -> Result<Json<Value>, AppError> {
+    let ws = init_project_template_core(state, ws, data, enable_git).await?;
     Ok(Json(json!({
         "success": true,
         "message": "Project template initialized successfully",
@@ -38,12 +50,17 @@ pub async fn init_project_template_impl(
     })))
 }
 
-/// push-skills 的 workspace 无关实现。
+/// push-skills 结果（updated 为已推送的技能目录名列表）。
+pub struct PushedSkills {
+    pub updated: Vec<String>,
+}
+
+/// push-skills 的 workspace 无关核心。
 ///
 /// `allow_agent_store`: 是否允许 agent-store 软链分支 (computer 布局 `{root}/{user}/{cid}`
 /// 下 `ws.parent()` 即用户根, 语义成立; userapp 开发卷布局下 parent 是共享卷根,
 /// 该分支不适用, 传 false 一律走 legacy `push_skills_at` 写 `{ws}/.agents/skills`)。
-pub async fn push_skills_impl(
+pub async fn push_skills_core(
     state: &AppState,
     ws: &Path,
     cid: &str,
@@ -51,7 +68,7 @@ pub async fn push_skills_impl(
     skill_urls: Vec<String>,
     agent_id: Option<&str>,
     allow_agent_store: bool,
-) -> Result<Json<Value>, AppError> {
+) -> Result<PushedSkills, AppError> {
     if !crate::service::fs_util::path_exists(ws).await? {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -100,17 +117,40 @@ pub async fn push_skills_impl(
         )
         .await?
     };
+    Ok(PushedSkills { updated })
+}
+
+/// push-skills 的 workspace 无关实现（computer 域 TS 响应拼装）。
+pub async fn push_skills_impl(
+    state: &AppState,
+    ws: &Path,
+    cid: &str,
+    zip_data: Option<&TemporaryFile>,
+    skill_urls: Vec<String>,
+    agent_id: Option<&str>,
+    allow_agent_store: bool,
+) -> Result<Json<Value>, AppError> {
+    let r = push_skills_core(
+        state,
+        ws,
+        cid,
+        zip_data,
+        skill_urls,
+        agent_id,
+        allow_agent_store,
+    )
+    .await?;
     // message 对齐 nuwax pushSkillsToWorkspace: 有 skills → "Pushed N skills: a, b";
     // 无 → "No valid skill directories found in file or skillUrls"
-    let message = if updated.is_empty() {
+    let message = if r.updated.is_empty() {
         "No valid skill directories found in file or skillUrls".to_string()
     } else {
-        format!("Pushed {} skills: {}", updated.len(), updated.join(", "))
+        format!("Pushed {} skills: {}", r.updated.len(), r.updated.join(", "))
     };
     Ok(Json(json!({
         "success": true,
         "message": message,
         "workspaceRoot": ws.display().to_string(),
-        "updatedSkills": updated,
+        "updatedSkills": r.updated,
     })))
 }

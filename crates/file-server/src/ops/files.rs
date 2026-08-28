@@ -32,42 +32,78 @@ pub async fn files_update_impl(ws: &Path, mut files: Vec<FileOp>) -> Result<usiz
     Ok(count)
 }
 
-/// upload-file 的 workspace 无关实现。
+/// upload-file 业务核心（类型化返回；各域响应拼装在本文件 `upload_file_impl`
+/// 与 file-server-userapp 壳层——键风格分歧点在拼装层，编排逻辑单点在此）。
+pub struct UploadedFile {
+    pub file_size: u64,
+}
+
+/// upload-file 的 workspace 无关核心。
+pub async fn upload_file_core(
+    ws: &Path,
+    file_path: &str,
+    data: TemporaryFile,
+) -> Result<UploadedFile, AppError> {
+    let target = path_safety::ensure_within(ws, file_path)?;
+    // copy_file 内部已 create_dir_all(parent), 无需重复
+    let file_size = data.size();
+    crate::service::temp_file::copy_file(data.path(), &target).await?;
+    Ok(UploadedFile { file_size })
+}
+
+/// upload-file 的 workspace 无关实现（computer 域 TS 响应拼装）。
 pub async fn upload_file_impl(
     ws: &Path,
     file_path: &str,
     data: TemporaryFile,
 ) -> Result<Json<Value>, AppError> {
-    let target = path_safety::ensure_within(ws, file_path)?;
-    // copy_file 内部已 create_dir_all(parent), 无需重复
-    let file_size = data.size();
-    crate::service::temp_file::copy_file(data.path(), &target).await?;
+    let r = upload_file_core(ws, file_path, data).await?;
     Ok(Json(json!({
         "success": true,
         "message": "File uploaded successfully",
-        "fileSize": file_size,
+        "fileSize": r.file_size,
     })))
 }
 
-/// upload-files 的 workspace 无关实现 (单文件错误隔离: 单个失败不影响其余)。
-pub async fn upload_files_impl(
+/// upload-files 单文件结果（成功/失败两态；失败含 error 文案）。
+pub enum BatchUploadItem {
+    Ok {
+        file_path: String,
+        original: Option<String>,
+        file_size: u64,
+    },
+    Err {
+        file_path: String,
+        original: Option<String>,
+        error: String,
+    },
+}
+
+/// upload-files 批量结果。
+pub struct BatchUploadOutcome {
+    pub total: usize,
+    pub success_count: usize,
+    pub results: Vec<BatchUploadItem>,
+}
+
+/// upload-files 的 workspace 无关核心 (单文件错误隔离: 单个失败不影响其余)。
+pub async fn upload_files_core(
     ws: &Path,
     file_paths: &[String],
     files_vec: &[(Option<String>, TemporaryFile)],
-) -> Result<Json<Value>, AppError> {
+) -> Result<BatchUploadOutcome, AppError> {
     let total = file_paths.len();
     let mut success_count = 0usize;
-    let mut results: Vec<Value> = Vec::new();
+    let mut results: Vec<BatchUploadItem> = Vec::new();
     for (fp, (original, data)) in file_paths.iter().zip(files_vec) {
         let target = match path_safety::ensure_within(ws, fp) {
             Ok(t) => t,
             Err(_) => {
-                results.push(json!({
-                    "success": false,
-                    "filePath": fp,
-                    "originalname": original,
-                    "error": "Invalid file path",
-                }));
+                results.push(BatchUploadItem::Err {
+                    file_path: fp.clone(),
+                    original: original.clone(),
+                    error: "Invalid file path".to_string(),
+                });
                 continue;
             }
         };
@@ -75,31 +111,68 @@ pub async fn upload_files_impl(
         match write_file_create_parent(&target, data.path()).await {
             Ok(()) => {
                 success_count += 1;
-                results.push(json!({
-                    "success": true,
-                    "filePath": fp,
-                    "originalname": original,
-                    "message": "File uploaded successfully",
-                    "fileSize": file_size,
-                }));
+                results.push(BatchUploadItem::Ok {
+                    file_path: fp.clone(),
+                    original: original.clone(),
+                    file_size,
+                });
             }
             Err(e) => {
-                results.push(json!({
-                    "success": false,
-                    "filePath": fp,
-                    "originalname": original,
-                    "error": e.to_string(),
-                }));
+                results.push(BatchUploadItem::Err {
+                    file_path: fp.clone(),
+                    original: original.clone(),
+                    error: e.to_string(),
+                });
             }
         }
     }
-    let fail_count = total - success_count;
+    Ok(BatchUploadOutcome {
+        total,
+        success_count,
+        results,
+    })
+}
+
+/// upload-files 的 workspace 无关实现（computer 域 TS 响应拼装）。
+pub async fn upload_files_impl(
+    ws: &Path,
+    file_paths: &[String],
+    files_vec: &[(Option<String>, TemporaryFile)],
+) -> Result<Json<Value>, AppError> {
+    let r = upload_files_core(ws, file_paths, files_vec).await?;
+    let results: Vec<Value> = r
+        .results
+        .into_iter()
+        .map(|item| match item {
+            BatchUploadItem::Ok {
+                file_path,
+                original,
+                file_size,
+            } => json!({
+                "success": true,
+                "filePath": file_path,
+                "originalname": original,
+                "message": "File uploaded successfully",
+                "fileSize": file_size,
+            }),
+            BatchUploadItem::Err {
+                file_path,
+                original,
+                error,
+            } => json!({
+                "success": false,
+                "filePath": file_path,
+                "originalname": original,
+                "error": error,
+            }),
+        })
+        .collect();
     Ok(Json(json!({
         "success": true,
         "message": "Batch upload completed",
-        "totalCount": total,
-        "successCount": success_count,
-        "failCount": fail_count,
+        "totalCount": r.total,
+        "successCount": r.success_count,
+        "failCount": r.total - r.success_count,
         "results": results,
     })))
 }
@@ -111,12 +184,18 @@ async fn write_file_create_parent(target: &Path, source: &Path) -> Result<(), Ap
         .map(|_| ())
 }
 
-/// generate-file 的 workspace 无关实现 (`file_name` 已 trim; 内容缺省空串)。
-pub async fn generate_file_impl(
+/// generate-file 业务核心的返回（file_name 为入参原样回显）。
+pub struct GeneratedFile {
+    pub file_name: String,
+    pub file_size: usize,
+}
+
+/// generate-file 的 workspace 无关核心 (`file_name` 已 trim; 内容缺省空串)。
+pub async fn generate_file_core(
     ws: std::path::PathBuf,
     file_name: &str,
     content: String,
-) -> Result<Json<Value>, AppError> {
+) -> Result<GeneratedFile, AppError> {
     // 对齐 TS uploadFile.normalizeFilePath: 路径拼接时剥离前导 `/`
     // (允许 "src/foo.txt" 这类相对子路径;绝对路径会被 ensure_within 拒)。
     let target = path_safety::ensure_within(&ws, file_name.trim_start_matches('/'))?;
@@ -128,11 +207,24 @@ pub async fn generate_file_impl(
     tokio::fs::write(&target, bytes)
         .await
         .map_err(|e| AppError::system(format!("write generated file failed: {e}")))?;
+    Ok(GeneratedFile {
+        file_name: file_name.to_string(),
+        file_size,
+    })
+}
+
+/// generate-file 的 workspace 无关实现（computer 域 TS 响应拼装）。
+pub async fn generate_file_impl(
+    ws: std::path::PathBuf,
+    file_name: &str,
+    content: String,
+) -> Result<Json<Value>, AppError> {
+    let r = generate_file_core(ws, file_name, content).await?;
     Ok(Json(json!({
         "success": true,
         "message": "File generated successfully",
-        "fileName": file_name,
-        "fileSize": file_size,
+        "fileName": r.file_name,
+        "fileSize": r.file_size,
     })))
 }
 
