@@ -5,7 +5,7 @@
 //! 例外: `ensure-workspace` 为 Rust 独有新契约（TS 无对应端点）, 响应用
 //! `HttpResult` 信封（同 build/dev-server 域）。
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::response::Response;
 use garde::Validate;
 use serde_json::Value;
@@ -94,13 +94,24 @@ pub(crate) async fn get_logs(
 /// 依赖安装
 ///
 /// typescript→pnpm install；python→pip install。
-#[utoipa::path(post, path = "/install-project", request_body = UserappInstallBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · dev · 工作区与工具链")]
+#[utoipa::path(
+    post,
+    path = "/{app_id}/{app_stage}/install-project",
+    params(
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）")
+    ),
+    request_body = UserappInstallBody,
+    responses(file_server::openapi::JsonApiResponses),
+    tag = "UserApp · dev · 工作区与工具链"
+)]
 pub(crate) async fn install_project(
     State(state): State<UserAppState>,
+    Path((app_id, _app_stage)): Path<(String, String)>,
     Json(body): Json<UserappInstallBody>,
 ) -> Result<Json<Value>, AppError> {
-    tracing::debug!(app_id = %body.app_id, user_id = %body.user_id, "userapp install-project");
-    let ws = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
+    tracing::debug!(app_id = %app_id, user_id = %body.user_id, "userapp install-project");
+    let ws = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
     install_project_impl(&state.fs, ws, &body.programming_language).await
 }
 

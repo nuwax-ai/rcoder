@@ -312,6 +312,7 @@ pub(crate) fn require_app_field(value: Option<String>, field: &str) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::Path;
     use std::sync::Arc;
 
     use crate::UserAppState;
@@ -416,11 +417,11 @@ mod tests {
             .collect();
         assert!(names.contains(&"demo-app"), "names={names:?}");
 
-        // 3. detect_project (存量接口, 已切开发卷) 应在开发卷里找到项目
+        // 3. detect_project ({app_id}/{app_stage} 新形态) 应在开发卷里找到项目
         let reply = super::super::userapp::detect_project(
             State(state),
-            AppJson(crate::models::ImportProjectBody {
-                app_id: "app-1".into(),
+            Path(("app-1".into(), "dev".into())),
+            AppJson(crate::models::ProjectChainBody {
                 user_id: "u1".into(),
                 project_dir: "demo-app".into(),
             }),

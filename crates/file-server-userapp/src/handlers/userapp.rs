@@ -21,7 +21,7 @@ use async_stream::stream;
 
 use crate::service::userapp::UserappBuildTask;
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -32,7 +32,7 @@ use shared_types::HttpResult;
 use crate::UserAppState;
 use crate::models::{
     BuildCreatedData, BuildTaskSnapshot, BuildTaskStatus, BuildUserAppBody, CancelData,
-    ConfirmData, DetectData, ImportProjectBody, StreamQuery, TaskLogsQuery, UserappTaskScopeQuery,
+    ConfirmData, DetectData, ProjectChainBody, StreamQuery, TaskLogsQuery, UserappTaskScopeQuery,
 };
 use crate::service::userapp;
 use crate::service::userapp::tasks::BuildProgressEvent;
@@ -416,19 +416,24 @@ pub(crate) async fn cancel_build_task(task: &Arc<UserappBuildTask>) {
 /// 分析文件结构推断 language/framework/build tool。
 #[utoipa::path(
     post,
-    path = "/projects/detect",
-    request_body = ImportProjectBody,
+    path = "/{app_id}/{app_stage}/projects/detect",
+    params(
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）")
+    ),
+    request_body = ProjectChainBody,
     responses((status = 200, body = HttpResult<DetectData>, description = "项目探测结果")),
     tag = "UserApp · dev · 工作区与工具链"
 )]
 pub(crate) async fn detect_project(
     State(state): State<UserAppState>,
-    AppJson(body): AppJson<ImportProjectBody>,
+    Path((app_id, _app_stage)): Path<(String, String)>,
+    AppJson(body): AppJson<ProjectChainBody>,
 ) -> UserAppReply<DetectData> {
     let result = async {
         body.validate().map_err(file_server::error::from_garde)?;
         let workspace =
-            file_server::workspace::resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
+            file_server::workspace::resolve_userapp_dev(&app_id, None, &state.fs.config)?;
         let detection = userapp::import::detect_project(&workspace, &body.project_dir).await?;
         Ok(DetectData { detection })
     };
@@ -440,20 +445,24 @@ pub(crate) async fn detect_project(
 /// 用户选择/修正 detect 推断的项目类型后提交。
 #[utoipa::path(
     post,
-    path = "/projects/confirm",
-    request_body = ImportProjectBody,
+    path = "/{app_id}/{app_stage}/projects/confirm",
+    params(
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）")
+    ),
+    request_body = ProjectChainBody,
     responses((status = 200, body = HttpResult<ConfirmData>, description = "项目确认结果")),
     tag = "UserApp · dev · 工作区与工具链"
 )]
 pub(crate) async fn confirm_project(
     State(state): State<UserAppState>,
-    AppJson(body): AppJson<ImportProjectBody>,
+    Path((app_id, _app_stage)): Path<(String, String)>,
+    AppJson(body): AppJson<ProjectChainBody>,
 ) -> UserAppReply<ConfirmData> {
     let result = async {
         body.validate().map_err(file_server::error::from_garde)?;
-        let app_id = body.app_id.clone();
         let workspace =
-            file_server::workspace::resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
+            file_server::workspace::resolve_userapp_dev(&app_id, None, &state.fs.config)?;
         let path = userapp::import::confirm_project(&workspace, &body.project_dir).await?;
         // workspace 级 git init（幂等）：本地版本管理 + publish snapshot commit 的前提。
         // 放 handler 层（持有 config.git_enabled / author）；失败仅告警，不阻断 manifest 确认。

@@ -26,6 +26,20 @@ pub struct BuildUserAppBody {
     pub user_id: String,
 }
 
+/// detect/confirm 门面同构 body（`{app_id}/{app_stage}` 新形态）：**不含
+/// `app_id`**——由路径段提供（handler `Path` 提取）；与 import-project 镜像
+/// 接口的 [`ImportProjectBody`]（body 携 app_id 旧契约）并存。
+#[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
+#[garde(allow_unvalidated)]
+pub struct ProjectChainBody {
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
+    #[garde(custom(file_server::validation_rules::not_blank))]
+    pub user_id: String,
+    /// workspace 内的子项目目录名（模板 zip 的顶层目录；detect/confirm 的定位粒度）
+    #[garde(custom(file_server::validation_rules::not_blank))]
+    pub project_dir: String,
+}
+
 #[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
 #[garde(allow_unvalidated)]
 pub struct ImportProjectBody {
@@ -182,9 +196,6 @@ fn default_tail_lines() -> usize {
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct UserappInstallBody {
-    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
-    pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,

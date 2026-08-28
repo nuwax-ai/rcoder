@@ -16,9 +16,7 @@
 
 use std::sync::Arc;
 
-use axum::body::Body;
 use axum::extract::Request;
-use axum::http::Uri;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use tracing::info;
@@ -196,132 +194,45 @@ pub(crate) async fn forward_userapp(
         }
     }
 }
-
-/// `/api/v1/userapp/{app_id}/{app_stage}` 门面折叠转发（dev-only 构建链公用内核）：
+/// `/api/v1/userapp/{app_id}/{app_stage}` 门面（dev-only 构建链公用内核）：
+///
+/// 两侧契约**同构直转**——容器侧（file-server-userapp）已同形态注册
+/// `/{app_id}/{app_stage}/...`，app_id 由路径段承载、body 不含（容器侧
+/// body 结构已瘦身），转发零改写（URI/body 原样流式）。
 ///
 /// 1. `{app_stage}` 仅认 `dev`——构建链是开发阶段能力，传 prod 返回 400 明示；
-/// 2. 容器定位沿用透传面契约：`X-App-Id` header（require_app_id 白名单校验），
-///    body 自带的 app_id 字段由容器侧 `resolve_userapp_dev` 消费；
-/// 3. **URI 折叠**：剥掉门面段 `/api/v1/userapp/{app_id}/{app_stage}` 还原容器平铺
-///    契约路径（file-server-userapp 端点零改动），query 原样保留。
+/// 2. 容器定位以 path `app_id` 为准（幂等 ensure builder+探活自愈），无
+///    `X-App-Id` header 要求——path 即身份。
 async fn fold_env_forward(
     state: Arc<AppState>,
     path: axum::extract::Path<(String, String)>,
     req: Request,
-    target_path: &'static str,
+    target: &'static str,
 ) -> Response {
     use shared_types::UserappStage;
-    let (path_app_id, app_stage) = path.0;
+    let (app_id, app_stage) = path.0;
     let Some(app_stage) = UserappStage::parse(&app_stage) else {
         return HttpResultError::bad_request("path segment `app_stage` must be `dev` or `prod`")
             .into_response();
     };
     if app_stage != UserappStage::Dev {
         return HttpResultError::bad_request(format!(
-            "`{target_path}` is a dev (build-chain) capability: pass app_stage=dev"
+            "`{target}` is a dev (build-chain) capability: pass app_stage=dev"
         ))
         .into_response();
     }
-    let Some(app_id) = require_app_id(&req) else {
-        return missing_app_id_response();
-    };
-    // 门面段一致性：path 与 X-App-Id 不一致直接拒（防错把请求打进别的开发容器）
-    if path_app_id != app_id {
-        return HttpResultError::bad_request(format!(
-            "path app_id '{path_app_id}' != header `X-App-Id` '{app_id}'"
-        ))
-        .into_response();
+    if let Err(e) = shared_types::validate_identifier(&app_id, "app_id") {
+        return HttpResultError::bad_request(e).into_response();
     }
-
-    let mut req = req;
-    let rebuilt = match rebuild_uri_with(req.uri(), target_path) {
-        Ok(uri) => uri,
-        Err(e) => return HttpResultError::system(e).into_response(),
-    };
-    *req.uri_mut() = rebuilt;
-
-    // 门面注入：body 的 app_id 由 path 强制对齐——调用方无需在 body 重复传
-    // app_id，且根治 body 与 path 不一致时容器按 body 操作错对象的隐患。
-    // 三个门面目标均为小体积 JSON 契约（<1MB），缓冲语义在此让位于正确性。
-    let (mut parts, body) = req.into_parts();
-    let bytes = match axum::body::to_bytes(body, JSON_BODY_LIMIT).await {
-        Ok(b) => b,
-        Err(e) => {
-            return HttpResultError::bad_request(format!("read request body: {e}")).into_response();
-        }
-    };
-    let injected = match inject_path_app_id(&bytes, &app_id) {
-        Ok(b) => b,
-        Err(e) => return HttpResultError::bad_request(e).into_response(),
-    };
-    if let Ok(v) = axum::http::HeaderValue::from_str(&injected.len().to_string()) {
-        parts.headers.insert(axum::http::header::CONTENT_LENGTH, v);
-    }
-    let req = Request::from_parts(parts, Body::from(injected));
 
     info!(
         "[USERAPP_FORWARD] {} {} -> dev container (folded app_stage, app_id={app_id})",
         req.method(),
         req.uri().path()
     );
-    // 门面 body 携 user_id 但流式不解析（multipart 族不可解）——owner 走
-    // metadata 链（create-workspace 前置注册）
+    // 门面 body 携 user_id 但流式不解析——owner 走 metadata 链（create-workspace
+    // 前置注册）
     forward_to_dev(&state, &app_id, req, None).await
-}
-
-/// 门面 JSON 体积上限（detect/confirm/install 均为小表单）
-const JSON_BODY_LIMIT: usize = 1024 * 1024;
-
-/// body `app_id` 由门面 path 注入（userApp 全域统一 snake_case 字段风格，
-/// 单键 `app_id`；调用方无需重复传递，path 与 body 不一致的歧义从根上消除）。
-/// 非 JSON body 拒绝。
-fn inject_path_app_id(body: &[u8], app_id: &str) -> Result<Vec<u8>, String> {
-    let mut v: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|e| format!("request body must be a JSON object: {e}"))?;
-    let obj = v
-        .as_object_mut()
-        .ok_or_else(|| "request body must be a JSON object".to_string())?;
-    obj.insert(
-        "app_id".to_string(),
-        serde_json::Value::String(app_id.to_string()),
-    );
-    serde_json::to_vec(&v).map_err(|e| format!("re-serialize body: {e}"))
-}
-
-#[cfg(test)]
-mod inject_tests {
-    use super::inject_path_app_id;
-
-    #[test]
-    fn injects_when_absent() {
-        let out = inject_path_app_id(br#"{"user_id":"u1"}"#, "app-a").unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["app_id"], "app-a");
-        assert_eq!(v["user_id"], "u1");
-    }
-
-    #[test]
-    fn overrides_mismatched_body_value() {
-        // body 带了不同的 app_id（历史遗留形态）→ 一律以 path 为准
-        let out = inject_path_app_id(br#"{"app_id":"app-evil"}"#, "app-a").unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["app_id"], "app-a");
-    }
-
-    #[test]
-    fn non_json_body_rejected() {
-        assert!(inject_path_app_id(b"not json", "app-a").is_err());
-        assert!(inject_path_app_id(b"[1,2]", "app-a").is_err());
-    }
-}
-
-/// 以 `target_path` 替换原 URI 的 path 部分、拼接原 query，重建 [`Uri`]。
-fn rebuild_uri_with(uri: &Uri, target_path: &'static str) -> Result<Uri, String> {
-    let pq = match uri.query() {
-        Some(q) => format!("{target_path}?{q}"),
-        None => target_path.to_string(),
-    };
-    Uri::try_from(pq).map_err(|e| format!("rebuild forwarded uri: {e:?}"))
 }
 
 /// 探测开发容器内的项目类型
@@ -333,8 +244,8 @@ fn rebuild_uri_with(uri: &Uri, target_path: &'static str) -> Result<Uri, String>
         ("app_stage" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
     ),
     request_body(
-        content = file_server_userapp::models::ImportProjectBody,
-        description = "同容器平铺契约（snake_case：user_id / project_dir；**`app_id` 无需传**：门面以 path 中的 app_id 强制注入对齐（传了也以 path 为准）。）"
+        content = file_server_userapp::models::ProjectChainBody,
+        description = "仅需 `user_id` 与 `project_dir`——`app_id` 由 path 提供并自动注入转发 body（调用方不传）"
     ),
     description = r#"
 分析开发容器 workspace 的文件结构，推断项目类型（Node/Python/Java…）与推荐配置，
@@ -366,8 +277,8 @@ pub(crate) async fn flat_dev_projects_detect(
         ("app_stage" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
     ),
     request_body(
-        content = file_server_userapp::models::ImportProjectBody,
-        description = "detect 结果的用户修正确认 + 项目基础信息（snake_case 同容器平铺契约；**`app_id` 无需传**：门面以 path 中的 app_id 强制注入对齐（传了也以 path 为准）。）"
+        content = file_server_userapp::models::ProjectChainBody,
+        description = "detect 结果的用户修正确认 + 项目基础信息。仅需 `user_id` 与 `project_dir`——`app_id` 由 path 提供并自动注入转发 body（调用方不传）"
     ),
     description = r#"
 用户在 detect 推断基础上选择/修正项目类型后提交确认（幂等附带 git init 双开关）。
@@ -397,7 +308,7 @@ pub(crate) async fn flat_dev_projects_confirm(
     ),
     request_body(
         content = file_server_userapp::models::UserappInstallBody,
-        description = "安装参数（snake_case：user_id / programming_language；**`app_id` 无需传**：门面以 path 中的 app_id 强制注入对齐（传了也以 path 为准）。）"
+        description = "仅需 `user_id` 与 `programming_language`——`app_id` 由 path 提供并自动注入转发 body（调用方不传）"
     ),
     description = r#"
 将项目安装进开发容器工作区（依赖安装等初始化动作的统一入口）。**仅 dev**；
