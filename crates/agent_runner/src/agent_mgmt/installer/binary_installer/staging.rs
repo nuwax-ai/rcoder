@@ -239,20 +239,3 @@ pub fn detect_file_type(bytes: &[u8]) -> String {
     }
     "executable".into()
 }
-
-#[allow(dead_code)]
-pub(super) fn make_executable_sync(path: &Path) -> AgentMgmtResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(path)?;
-        let mut perms = metadata.permissions();
-        perms.set_mode(perms.mode() | 0o755);
-        std::fs::set_permissions(path, perms)?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
-}

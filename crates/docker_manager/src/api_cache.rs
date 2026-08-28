@@ -48,12 +48,6 @@ impl DockerApiCache {
         }
     }
 
-    /// 使用默认配置创建缓存实例
-    #[allow(dead_code)]
-    pub fn with_defaults() -> Self {
-        Self::new(10, 15, 10000)
-    }
-
     /// 获取状态缓存
     pub async fn get_status(&self, identifier: &str) -> Option<Option<ContainerQueryResultArc>> {
         self.status_cache.get(identifier).await

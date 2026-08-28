@@ -298,21 +298,6 @@ pub fn start_file_watcher() {
     info!("[FILE_WATCH] File watcher started");
 }
 
-/// 停止文件系统监听器
-#[allow(dead_code)]
-pub fn stop_file_watcher() {
-    if !WATCHER_STARTED.swap(false, Ordering::SeqCst) {
-        return;
-    }
-
-    let watcher_holder = FILE_WATCHER.get_or_init(|| Mutex::new(None));
-    if let Ok(mut guard) = watcher_holder.lock() {
-        *guard = None;
-    }
-
-    info!("[filelisten] File watcher already stopped");
-}
-
 /// 通过文件扫描检查 session 是否存在（带缓存）
 pub async fn check_session_file_exists(session_id: &str, project_path: &str) -> bool {
     // 确保监听器已启动
