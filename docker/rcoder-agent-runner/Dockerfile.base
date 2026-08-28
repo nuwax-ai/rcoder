@@ -625,18 +625,28 @@ RUN echo '[Service]\n\
 
 RUN systemctl enable chrony
 
-# Java 配置 (完整 JDK 工具集)
+# Java 配置 (完整 JDK 工具集) —— Adoptium Temurin 25 LTS
+# bookworm 官方仓库只有 openjdk-17；升级到 25 经 Adoptium apt repo（Temurin 25 LTS）。
+# 与 app-runtime 运行时镜像（openjdk-25）对齐，使 builder 能编译 target=25 的项目（否则 mvn 报
+# "release version 25 not supported"）。VERSION_CODENAME 在 bookworm 上解析为 bookworm，Adoptium 支持。
 RUN apt-get update && \
-    apt-get install -y openjdk-17-jdk && \
+    apt-get install -y wget apt-transport-https gpg ca-certificates && \
+    wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \
+        | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(awk -F= '/VERSION_CODENAME/{print $2}' /etc/os-release) main" \
+        > /etc/apt/sources.list.d/adoptium.list && \
+    apt-get update && \
+    apt-get install -y temurin-25-jdk && \
+    # 双架构统一 JAVA_HOME：建 -current 软链（与 app-runtime 写法一致）
+    ARCH=$(dpkg --print-architecture) && \
+    ln -sf /usr/lib/jvm/temurin-25-jdk-${ARCH} /usr/lib/jvm/temurin-25-jdk-current && \
     # 验证安装
     java -version && \
     javac -version && \
-    echo "✅ OpenJDK 17 installed with full toolset" && \
-    # 确认 javac 存在
-    which javac && \
-    ls -la /usr/lib/jvm/java-17-openjdk-*/bin/javac && \
-    # 清理缓存（但不 autoremove，避免删除 JDK 依赖）
+    echo "✅ Temurin 25 installed with full toolset" && \
     rm -rf /var/lib/apt/lists/*
+ENV JAVA_HOME=/usr/lib/jvm/temurin-25-jdk-current
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 # ============================================================================
 # 📦 Maven 配置（使用阿里云镜像加速）
