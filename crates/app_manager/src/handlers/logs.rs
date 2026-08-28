@@ -48,7 +48,8 @@ pub struct LogsAccessParams {
     post,
     path = "/api/v1/userapp/{app_id}/{app_stage}/logs/sources/query",
     params(("app_id" = String, Path, description = "应用 ID"),
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）"),
+        LogsAccessParams
     ),
     description = r#"
 查询应用声明的日志源及匹配到的日志文件清单（选日志面板"源选择器"用）。
@@ -92,7 +93,8 @@ pub async fn query_app_log_sources(
     post,
     path = "/api/v1/userapp/{app_id}/{app_stage}/logs/query",
     params(("app_id" = String, Path, description = "应用 ID"),
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）"),
+        LogsAccessParams
     ),
     description = r#"
 多服务日志快照（分页拉取，非 SSE）：携带上次响应的 `cursor` 即可断点续拉；
@@ -136,7 +138,8 @@ pub async fn query_app_logs(
     post,
     path = "/api/v1/userapp/{app_id}/{app_stage}/logs/stream",
     params(("app_id" = String, Path, description = "应用 ID"),
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）"),
+        LogsAccessParams
     ),
     description = r#"
 SSE 实时日志流（500ms 轮询内核）：事件清单与断线续传协议见 200 响应说明。

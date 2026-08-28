@@ -267,8 +267,8 @@ fn rebuild_uri_with(uri: &Uri, target_path: &'static str) -> Result<Uri, String>
         ("app_stage" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
     ),
     request_body(
-        content = serde_json::Value,
-        description = "同容器平铺契约 `{appId/app_id, userId/user_id}`；结构详见 file-server 文档同路径"
+        content = file_server_userapp::models::ImportProjectBody,
+        description = "同容器平铺契约（snake_case：app_id / user_id / project_dir）"
     ),
     description = r#"
 分析开发容器 workspace 的文件结构，推断项目类型（Node/Python/Java…）与推荐配置，
@@ -300,8 +300,8 @@ pub(crate) async fn flat_dev_projects_detect(
         ("app_stage" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
     ),
     request_body(
-        content = serde_json::Value,
-        description = "detect 结果的用户修正确认 + 项目基础信息；字段同容器平铺契约"
+        content = file_server_userapp::models::ImportProjectBody,
+        description = "detect 结果的用户修正确认 + 项目基础信息（snake_case 同容器平铺契约）"
     ),
     description = r#"
 用户在 detect 推断基础上选择/修正项目类型后提交确认（幂等附带 git init 双开关）。
@@ -330,8 +330,8 @@ pub(crate) async fn flat_dev_projects_confirm(
         ("app_stage" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
     ),
     request_body(
-        content = serde_json::Value,
-        description = "安装参数（同容器平铺契约 install 表单；详见 file-server 文档同路径）"
+        content = file_server_userapp::models::UserappInstallBody,
+        description = "安装参数（**camelCase**：`appId` / `userId` / `programmingLanguage`——15 族镜像接口的永久 TS 契约，与 detect/confirm 的 snake_case 并存是既有事实）"
     ),
     description = r#"
 将项目安装进开发容器工作区（依赖安装等初始化动作的统一入口）。**仅 dev**；

@@ -13,6 +13,7 @@ kubernetes = []
 workspace = true
 
 [dependencies]
+garde = { workspace = true }
 # Internal crates
 container-runtime-api = { workspace = true }
 docker_manager = { workspace = true }

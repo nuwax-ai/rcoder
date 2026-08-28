@@ -117,10 +117,9 @@ pub struct UserappDevListQuery {
 #[into_params(parameter_in = Query)]
 pub struct StaticQuery {
     /// 归属用户 ID（**rcoder 转发层消费**：dev 容器懒创建时宿主树
-    /// `dev/{user_id}/{app_id}` 分区依据；经 rcoder 访问必填、白名单校验，
-    /// 容器侧不读取）。
-    #[serde(default)]
-    pub user_id: Option<String>,
+    /// `dev/{user_id}/{app_id}` 分区依据；必填（缺失 400）、白名单校验，
+    /// 容器侧不读取仅提取）。
+    pub user_id: String,
     /// 可选：按 release_id 精确取包（定位 `builds/workspace-package-{release_id}.zip`）。
     /// 缺省 = 最新产物。release_id 只允许字母数字与连字符（服务端生成的 UUID 形态），
     /// 其余字符一律拒绝（防路径注入）；指定的版本不存在时 404。

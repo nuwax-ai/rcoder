@@ -16,6 +16,21 @@ use shared_types::{AppError, HttpResult};
 use super::state::AppManagerState;
 use crate::models::{FileInfo, UploadResult};
 
+/// multipart 上传表单 schema（OpenAPI-only——handler 手解析字段，结构此单源声明）。
+#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct AppUploadForm {
+    /// 归属用户 ID（必填，白名单校验；dev 容器懒创建宿主树分区依据 + 审计）
+    pub user_id: String,
+    /// 目标路径（app 根相对；单文件=文件路径如 code/app.jar，压缩包=解压目录如 code/；缺省 code/{文件名}）
+    pub target: Option<String>,
+    /// 压缩包是否剥单层 wrapper 目录（"true"/"1" 生效；默认 false 保留结构）
+    pub flatten: Option<String>,
+    #[schema(format = Binary)]
+    /// 上传文件（zip/tar.gz 自动解压；必填）
+    pub file: String,
+}
+
 /// 上传文件
 ///
 /// multipart 直传到目标环境数据卷（prod=运行容器 /app 根；dev=开发容器 workspace
@@ -30,10 +45,10 @@ use crate::models::{FileInfo, UploadResult};
         ("app_id" = String, Path, description = "应用 ID"),
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder，target 相对 workspace 根）/ `prod`=生产运行容器（target 相对 /app 根）")
     ),
-    request_body(content_type = "multipart/form-data", description = "上传文件"),
+    request_body(content = AppUploadForm, content_type = "multipart/form-data", description = "上传文件（multipart：user_id 必填）"),
     responses(
         (status = 200, description = "上传成功", body = HttpResult<UploadResult>),
-        (status = 400, description = "multipart 解析失败 / 缺 file 字段 / app_stage 非法", body = HttpResult<String>),
+        (status = 400, description = "multipart 解析失败 / 缺 file 或 user_id 字段 / app_stage 非法", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
     ),
@@ -196,6 +211,7 @@ pub struct ListFilesQuery {
     params(
         ("app_id" = String, Path, description = "应用 ID"),
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（根=workspace）/ `prod`=生产运行容器（根=/app）"),
+        ("user_id" = String, Query, description = "归属用户 ID（必填，白名单校验；dev 容器懒创建宿主树分区依据 + 审计）"),
         ("path" = Option<String>, Query, description = "子目录（相对环境根，如 code/data/logs；默认列根）")
     ),
     responses(

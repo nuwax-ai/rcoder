@@ -703,6 +703,89 @@ mod openapi_tests {
         );
     }
 
+    /// userApp 全接口 app_id + user_id 文档可见性防回归（用户铁律：
+    /// 所有 userApp 业务接口都要有 app_id 和 user_id 入参，方便获取使用）。
+    ///
+    /// 遍历主文档全部 /api/v1/userapp op，断言两字段在 path 模板 / query 参数 /
+    /// request body schema 属性任一处可见。豁免清单显式枚举（列表跨 app 查询
+    /// 天然无单 app 归属——user_id 仍必须）：
+    /// - `query` / `runtime` / `storage/{app_stage}/query` 三条的 app_id
+    #[test]
+    fn userapp_params_app_and_owner_visible() {
+        let document = primary_document();
+        let schemas = &document.components.as_ref().map(|c| c.schemas.clone());
+        /// 豁免：列表跨 app 查询类（无单 app 归属，user_id 仍必须）
+        const APP_ID_EXEMPT: [&str; 3] = [
+            "/api/v1/userapp/query",
+            "/api/v1/userapp/runtime",
+            "/api/v1/userapp/storage/{app_stage}/query",
+        ];
+        let mut checked = 0usize;
+        for (path, item) in &document.paths.paths {
+            if !path.starts_with("/api/v1/userapp") {
+                continue;
+            }
+            for (method, op) in operations_of(item) {
+                let params = op.parameters.iter().flatten();
+                let mut has_app_id =
+                    APP_ID_EXEMPT.contains(&path.as_str()) || path.contains("{app_id}");
+                let mut has_user_id = false;
+                for p in params {
+                    // 15 族镜像接口的 camelCase（appId/userId）是永久 TS 契约——
+                    // 参数名双词表兼容（容器侧 IntoParams serde rename_all camelCase）
+                    if p.name == "app_id" || p.name == "appId" {
+                        has_app_id = true;
+                    }
+                    if p.name == "user_id" || p.name == "userId" {
+                        has_user_id = true;
+                    }
+                }
+                // request body schema 属性兜底（$ref 解引用）
+                if !has_app_id || !has_user_id {
+                    let body_ref = op
+                        .request_body
+                        .as_ref()
+                        .and_then(|rb| rb.content.values().next())
+                        .and_then(|c| c.schema.as_ref())
+                        .and_then(|s| match s {
+                            utoipa::openapi::RefOr::Ref(r) => Some(r.clone()),
+                            _ => None,
+                        });
+                    if let Some(r) = body_ref
+                        && let Some(schemas) = schemas
+                        && let Some(utoipa::openapi::RefOr::T(
+                            utoipa::openapi::schema::Schema::Object(obj),
+                        )) = schemas.get(&r.ref_location.replace("#/components/schemas/", ""))
+                    {
+                        for k in obj.properties.keys() {
+                            if k == "app_id" || k == "appId" {
+                                has_app_id = true;
+                            }
+                            if k == "user_id" || k == "userId" {
+                                has_user_id = true;
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    has_app_id,
+                    "{method} {path}: 缺 app_id 入参（path/query/body 任一位置）——用户铁律：userApp 接口必须携带"
+                );
+                assert!(
+                    has_user_id,
+                    "{method} {path}: 缺 user_id 入参（query/body 任一位置）——用户铁律：userApp 接口必须携带"
+                );
+                checked += 1;
+            }
+        }
+        // 本守卫口径 = 主文档 /api/v1/userapp 前缀 op（tag 口径 54 含部分内部面差异，
+        // 此处用本面实测全量 43 作下限——接口只增不减）
+        assert!(
+            checked >= 43,
+            "UserApp 系 operation 计数下限（43）未达: {checked}"
+        );
+    }
+
     /// 环境维度防回归：UserApp 系 operation 的 tag 必须带环境段（dev/prod/双态
     /// 三选一）或属于「访问入口」——今后新增接口随手写无环境维度的 tag 即红，
     /// 保证 Scalar 分组永远可按 dev 专属 / prod 专属 / 双态辨识。

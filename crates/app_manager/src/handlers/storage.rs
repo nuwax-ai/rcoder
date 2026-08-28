@@ -13,7 +13,8 @@ use shared_types::{AppError, HttpResult};
 
 use super::state::AppManagerState;
 use crate::models::{
-    ClearStorageRequest, DestroyStorageRequest, PaginatedResponse, QueryStorageRequest, StorageInfo,
+    ClearStorageRequest, DestroyStorageRequest, OwnerParams, PaginatedResponse,
+    QueryStorageRequest, StorageInfo,
 };
 
 /// 查询应用持久存储状态
@@ -22,7 +23,8 @@ use crate::models::{
     path = "/api/v1/userapp/{app_id}/{app_stage}/storage",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器开发卷（is_orphan=卷在而 builder 容器不在）/ `prod`=生产运行卷")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器开发卷（is_orphan=卷在而 builder 容器不在）/ `prod`=生产运行卷"),
+        OwnerParams
     ),
     description = r#"
 查询单个应用持久存储（per-app PVC / Docker bind 卷）的状态与用量：容量、已用、
@@ -45,7 +47,7 @@ use crate::models::{
 pub async fn get_app_storage(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, app_stage)): Path<(String, String)>,
-    Query(owner): Query<crate::models::OwnerParams>,
+    Query(owner): Query<OwnerParams>,
 ) -> Result<Json<HttpResult<StorageInfo>>, AppError> {
     let app_stage = super::parse_app_stage_param(&app_stage)?;
     owner
