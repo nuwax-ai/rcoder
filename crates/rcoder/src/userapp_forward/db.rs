@@ -40,7 +40,7 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
         let resp = crate::http_client::shared_client()
             .post(format!("{}/api/v1/userapp/execute-command", self.addr))
             .timeout(std::time::Duration::from_secs(30))
-            .json(&json!({"appId": self.app_id, "userId": self.user_id, "command": command}))
+            .json(&json!({"app_id": self.app_id, "user_id": self.user_id, "command": command}))
             .send()
             .await
             .map_err(|e| format!("dev container execute-command failed: {e}"))?;
@@ -51,13 +51,14 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
                 "dev container execute-command returned {status}: {text}"
             ));
         }
-        // 响应 {success, stdout, stderr, exitCode}（TS 外层恒 success=true，结果由 exitCode 表达）
+        // 响应 {success, stdout, stderr, exit_code}（userapp 域 snake wire；
+        // 外层恒 success=true，结果由 exit_code 表达）
         let body: serde_json::Value = resp
             .json()
             .await
             .map_err(|e| format!("decode execute-command response: {e}"))?;
         Ok(shared_types::CommandOutcome {
-            exit_code: body["exitCode"].as_i64().unwrap_or(-1),
+            exit_code: body["exit_code"].as_i64().unwrap_or(-1),
             stdout: body["stdout"].as_str().unwrap_or_default().to_string(),
             stderr: body["stderr"].as_str().unwrap_or_default().to_string(),
         })

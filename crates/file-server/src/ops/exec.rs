@@ -89,7 +89,7 @@ pub async fn get_logs_core(
         None => {
             return Ok(LogsOutcome::Empty {
                 reason: "No log file found",
-            })
+            });
         }
     };
     let name = latest

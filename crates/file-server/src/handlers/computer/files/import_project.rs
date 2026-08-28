@@ -4,7 +4,7 @@ use axum::extract::State;
 use garde::Validate;
 use serde_json::{Value, json};
 
-use crate::ops::files::import_project_impl;
+use crate::ops::files::import_project_core;
 use crate::ops::multipart::{file_field, text_field, validate_zip_ext};
 
 use super::super::resolve_computer_target;
@@ -91,7 +91,7 @@ pub(crate) async fn import_project(
     validate_zip_ext(file_name.as_deref())?;
     let target_dir =
         resolve_computer_target(&state, &v.user_id, &v.cid, custom_target_dir.as_deref()).await?;
-    let target = import_project_impl(target_dir, v.data).await?;
+    let target = import_project_core(target_dir, v.data).await?;
     Ok(Json(json!({
         "success": true,
         "message": "Project imported successfully",

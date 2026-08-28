@@ -16,12 +16,18 @@ use crate::service::pnpm_config;
 
 use super::process_capture::run_capture;
 
-/// install-project 的 workspace 无关实现 (typescript→pnpm / python→pip, 按语言找 manifest)。
-pub async fn install_project_impl(
+/// install-project 结果（类型化返回；响应拼装归各域壳层）。
+pub struct InstalledProject {
+    pub project_dir: PathBuf,
+    pub programming_language: String,
+}
+
+/// install-project 的 workspace 无关核心 (typescript→pnpm / python→pip, 按语言找 manifest)。
+pub async fn install_project_core(
     state: &AppState,
     ws: PathBuf,
     programming_language: &str,
-) -> Result<Json<Value>, AppError> {
+) -> Result<InstalledProject, AppError> {
     if !ws.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -93,10 +99,23 @@ pub async fn install_project_impl(
             )));
         }
     }
+    Ok(InstalledProject {
+        project_dir,
+        programming_language: lang,
+    })
+}
+
+/// install-project 的 workspace 无关实现（computer 域 TS 响应拼装）。
+pub async fn install_project_impl(
+    state: &AppState,
+    ws: PathBuf,
+    programming_language: &str,
+) -> Result<Json<Value>, AppError> {
+    let r = install_project_core(state, ws, programming_language).await?;
     Ok(Json(json!({
         "success": true,
         "message": "Project dependencies installed successfully",
-        "projectDir": project_dir.display().to_string(),
-        "programmingLanguage": lang,
+        "projectDir": r.project_dir.display().to_string(),
+        "programmingLanguage": r.programming_language,
     })))
 }

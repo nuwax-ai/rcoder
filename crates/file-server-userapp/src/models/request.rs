@@ -7,7 +7,7 @@
 use garde::Validate;
 use serde::Deserialize;
 
-use file_server::models::{BinaryFile, FileOp};
+use file_server::models::BinaryFile;
 
 // ── 构建任务域（userapp.rs）─────────────────────────────────────────────────────
 
@@ -15,7 +15,7 @@ use file_server::models::{BinaryFile, FileOp};
 #[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
 #[garde(allow_unvalidated)]
 pub struct BuildUserAppBody {
-    /// UserApp 标识（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）。
+    /// UserApp 标识（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）。
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
     pub app_id: String,
@@ -151,7 +151,7 @@ pub struct StaticQuery {
 pub struct UserappEnsureWorkspaceBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
@@ -161,11 +161,10 @@ pub struct UserappEnsureWorkspaceBody {
 
 #[derive(Deserialize, Validate, utoipa::ToSchema)]
 #[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappExecCommandBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
@@ -179,11 +178,10 @@ pub struct UserappExecCommandBody {
 #[derive(Deserialize, Validate, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 #[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappGetLogsQuery {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
@@ -207,10 +205,9 @@ pub struct UserappInstallBody {
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappZipBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
@@ -222,10 +219,9 @@ pub struct UserappZipBody {
 
 #[derive(Deserialize, Validate, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappDownloadQuery {
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
@@ -238,9 +234,8 @@ pub struct UserappDownloadQuery {
 
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappInitTemplateForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
@@ -253,9 +248,8 @@ pub struct UserappInitTemplateForm {
 
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappPushSkillsForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
@@ -273,10 +267,9 @@ pub struct UserappPushSkillsForm {
 /// userapp 版 get-file-list 查询参数 (computer FileListQuery 镜像, cId→appId)。
 #[derive(Deserialize, Validate, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappFileListQuery {
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
@@ -301,10 +294,9 @@ pub struct UserappFileListQuery {
 
 #[derive(Deserialize, Validate, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappResolveFileQuery {
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
@@ -324,10 +316,9 @@ pub struct UserappResolveFileQuery {
 
 #[derive(Deserialize, Validate, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappSearchFilesQuery {
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
@@ -359,26 +350,55 @@ pub struct UserappSearchFilesQuery {
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappFilesUpdateBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
-    /// 上传文件的二进制内容（重复字段，与 filePaths 一一对应）
-    pub files: Vec<FileOp>,
+    /// 增量文件操作列表（与共享 FileOp 同语义，wire 键 snake）
+    pub files: Vec<UserappFileOp>,
     #[serde(default)]
     /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
 }
 
+/// files-update 的单条操作（userapp 域 snake wire；computer 域 FileOp 的
+/// camelCase 是 TS 契约不复用——语义同构，经 [`From`] 转入共享核心）。
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct UserappFileOp {
+    /// 操作类型：create / delete / rename / modify
+    pub operation: String,
+    /// 目标文件相对路径（rename 时为新路径）
+    pub name: String,
+    /// 是否目录（缺省 false）
+    #[serde(default)]
+    pub is_dir: Option<bool>,
+    /// 文本内容（create/modify 时写入；服务端做 URL 解码）
+    #[serde(default)]
+    pub contents: Option<String>,
+    /// rename 的源路径（操作为 rename 时必填）
+    #[serde(default)]
+    pub rename_from: Option<String>,
+}
+
+impl From<UserappFileOp> for file_server::models::FileOp {
+    fn from(op: UserappFileOp) -> Self {
+        Self {
+            operation: op.operation,
+            name: op.name,
+            is_dir: op.is_dir,
+            contents: op.contents,
+            rename_from: op.rename_from,
+        }
+    }
+}
+
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappUploadFileForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
@@ -393,9 +413,8 @@ pub struct UserappUploadFileForm {
 
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappUploadFilesForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
@@ -403,17 +422,16 @@ pub struct UserappUploadFilesForm {
     pub custom_target_dir: Option<String>,
     /// 每个文件的目标相对路径（与 files 一一对应，重复字段）
     pub file_paths: Vec<String>,
-    /// 上传文件的二进制内容（重复字段，与 filePaths 一一对应）
+    /// 上传文件的二进制内容（重复字段，与 file_paths 一一对应）
     pub files: Vec<BinaryFile>,
 }
 
 #[derive(Deserialize, Validate, utoipa::ToSchema)]
 #[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappGenerateFileBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
@@ -432,9 +450,8 @@ pub struct UserappGenerateFileBody {
 
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappImportProjectForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,

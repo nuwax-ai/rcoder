@@ -1,14 +1,15 @@
 //! `/api/v1/userapp` 开发执行镜像族: 执行/日志/依赖安装/打包下载/模板初始化/技能推送。
 //!
-//! 与 [`super::userapp_files`] 同约定: computer 域同参镜像 (`appId`/`userId`),
-//! 定位 `resolve_userapp_dev` = `{USERAPP_WORKSPACE_DIR}/{appId}`, 复用 computer impl。
-//! 例外: `ensure-workspace` 为 Rust 独有新契约（TS 无对应端点）, 响应用
-//! `HttpResult` 信封（同 build/dev-server 域）。
+//! 与 [`super::userapp_files`] 同约定: computer 域同参镜像（`app_id`/`user_id`）,
+//! 定位 `resolve_userapp_dev` = `{USERAPP_WORKSPACE_DIR}/{app_id}`; 编排复用
+//! file-server `*_core`，**响应在本壳层自拼 snake JSON**（computer 域 TS 驼峰
+//! 契约不经本域）。例外: `ensure-workspace` 为 Rust 独有新契约（TS 无对应端点）,
+//! 响应用 `HttpResult` 信封（同 build/dev-server 域）。
 
 use axum::extract::{Path, State};
 use axum::response::Response;
 use garde::Validate;
-use serde_json::Value;
+use serde_json::{Value, json};
 use shared_types::HttpResult;
 
 use super::userapp::UserAppReply;
@@ -23,10 +24,10 @@ use crate::models::{
 use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
 use file_server::ops::archive::{download_all_files_impl, zip_workspace_impl};
-use file_server::ops::exec::{execute_command_impl, get_logs_impl};
+use file_server::ops::exec::{LogsOutcome, execute_command_core, get_logs_core};
 use file_server::ops::multipart::{file_field, text_field};
-use file_server::ops::packages::install_project_impl;
-use file_server::ops::workspace::{init_project_template_impl, push_skills_impl};
+use file_server::ops::packages::install_project_core;
+use file_server::ops::workspace::{init_project_template_core, push_skills_core};
 use file_server::workspace::resolve_userapp_dev;
 
 // ── ensure-workspace ────────────────────────────────────────────────────────────
@@ -65,7 +66,14 @@ pub(crate) async fn execute_command(
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(file_server::error::from_garde)?;
     let cwd = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
-    execute_command_impl(&state.fs, cwd, &body.command).await
+    let r = execute_command_core(&state.fs, cwd, &body.command).await?;
+    // 外层恒 success=true，命令结果由 exit_code 表达（语义同 computer 域 TS 契约）
+    Ok(Json(json!({
+        "success": true,
+        "stdout": r.stdout,
+        "stderr": r.stderr,
+        "exit_code": r.exit_code,
+    })))
 }
 
 // ── get-logs ────────────────────────────────────────────────────────────────────
@@ -86,7 +94,35 @@ pub(crate) async fn get_logs(
 ) -> Result<Json<Value>, AppError> {
     q.validate().map_err(file_server::error::from_garde)?;
     let log_dir = resolve_userapp_dev(&q.app_id, None, &state.fs.config)?.join(".logs");
-    get_logs_impl(&state.fs, log_dir, q.tail_lines).await
+    match get_logs_core(&state.fs, log_dir, q.tail_lines).await? {
+        LogsOutcome::Empty { reason } => Ok(Json(json!({
+            "success": true,
+            "message": reason,
+            "logs": [],
+            "total_lines": 0,
+            "start_index": 1,
+            "log_file_name": None::<String>,
+        }))),
+        LogsOutcome::Tail {
+            logs,
+            total_lines,
+            start_index,
+            log_file_name,
+        } => {
+            let logs: Vec<Value> = logs
+                .into_iter()
+                .map(|l| json!({ "line": l.line, "content": l.content }))
+                .collect();
+            Ok(Json(json!({
+                "success": true,
+                "message": "Get log successfully",
+                "logs": logs,
+                "total_lines": total_lines,
+                "start_index": start_index,
+                "log_file_name": log_file_name,
+            })))
+        }
+    }
 }
 
 // ── install-project ─────────────────────────────────────────────────────────────
@@ -112,7 +148,13 @@ pub(crate) async fn install_project(
 ) -> Result<Json<Value>, AppError> {
     tracing::debug!(app_id = %app_id, user_id = %body.user_id, "userapp install-project");
     let ws = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
-    install_project_impl(&state.fs, ws, &body.programming_language).await
+    let r = install_project_core(&state.fs, ws, &body.programming_language).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Project dependencies installed successfully",
+        "project_dir": r.project_dir.display().to_string(),
+        "programming_language": r.programming_language,
+    })))
 }
 
 // ── zip-workspace ───────────────────────────────────────────────────────────────
@@ -190,8 +232,8 @@ pub(crate) async fn init_project_template(
         .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
     {
         match field.name().unwrap_or("") {
-            "appId" => app_id = Some(text_field(field).await?),
-            "userId" => user_id = Some(text_field(field).await?),
+            "app_id" => app_id = Some(text_field(field).await?),
+            "user_id" => user_id = Some(text_field(field).await?),
             "file" => {
                 data = Some(
                     file_field(
@@ -202,7 +244,7 @@ pub(crate) async fn init_project_template(
                     .await?,
                 )
             }
-            "enableGit" => {
+            "enable_git" => {
                 enable_git = matches!(
                     text_field(field).await?.trim().to_lowercase().as_str(),
                     "true" | "1" | "yes"
@@ -211,12 +253,17 @@ pub(crate) async fn init_project_template(
             _ => {}
         }
     }
-    let app_id = require_app_field(app_id, "appId")?;
-    let user_id = require_app_field(user_id, "userId")?;
+    let app_id = require_app_field(app_id, "app_id")?;
+    let user_id = require_app_field(user_id, "user_id")?;
     tracing::debug!(app_id = %app_id, user_id, "userapp init-project-template");
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     let ws = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
-    init_project_template_impl(&state.fs, ws, data, enable_git).await
+    let ws = init_project_template_core(&state.fs, ws, data, enable_git).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Project template initialized successfully",
+        "workspace_root": ws.display().to_string(),
+    })))
 }
 
 // ── push-skills-to-workspace ────────────────────────────────────────────────────
@@ -240,8 +287,8 @@ pub(crate) async fn push_skills_to_workspace(
         .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
     {
         match field.name().unwrap_or("") {
-            "appId" => app_id = Some(text_field(field).await?),
-            "userId" => user_id = Some(text_field(field).await?),
+            "app_id" => app_id = Some(text_field(field).await?),
+            "user_id" => user_id = Some(text_field(field).await?),
             "file" => {
                 zip_data = Some(
                     file_field(
@@ -252,7 +299,7 @@ pub(crate) async fn push_skills_to_workspace(
                     .await?,
                 )
             }
-            "skillUrls" => {
+            "skill_urls" => {
                 let t = text_field(field).await?;
                 if let Ok(urls) = serde_json::from_str::<Vec<String>>(&t) {
                     skill_urls.extend(urls);
@@ -260,15 +307,15 @@ pub(crate) async fn push_skills_to_workspace(
                     skill_urls.push(t);
                 }
             }
-            "agentId" => agent_id = Some(text_field(field).await?),
+            "agent_id" => agent_id = Some(text_field(field).await?),
             _ => {}
         }
     }
-    let app_id = require_app_field(app_id, "appId")?;
-    let user_id = require_app_field(user_id, "userId")?;
+    let app_id = require_app_field(app_id, "app_id")?;
+    let user_id = require_app_field(user_id, "user_id")?;
     tracing::debug!(app_id = %app_id, user_id, "userapp push-skills");
     let ws = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
-    push_skills_impl(
+    let r = push_skills_core(
         &state.fs,
         &ws,
         &app_id,
@@ -277,5 +324,53 @@ pub(crate) async fn push_skills_to_workspace(
         agent_id.as_deref(),
         false,
     )
-    .await
+    .await?;
+    let message = if r.updated.is_empty() {
+        "No valid skill directories found in file or skillUrls".to_string()
+    } else {
+        format!(
+            "Pushed {} skills: {}",
+            r.updated.len(),
+            r.updated.join(", ")
+        )
+    };
+    Ok(Json(json!({
+        "success": true,
+        "message": message,
+        "workspace_root": ws.display().to_string(),
+        "updated_skills": r.updated,
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handlers::userapp_files::tests_support::make_state;
+    use file_server::extract::AppJson;
+
+    /// execute-command 响应键 snake（exit_code）+ 命令真实执行语义。
+    #[tokio::test]
+    async fn execute_command_snake_response() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        tokio::fs::create_dir_all(tmp.path().join("app-exec"))
+            .await
+            .unwrap();
+        let res = execute_command(
+            State(state),
+            AppJson(UserappExecCommandBody {
+                app_id: "app-exec".into(),
+                user_id: "u".into(),
+                command: "printf out-xyz".into(),
+            }),
+        )
+        .await
+        .expect("exec ok");
+        assert_eq!(res.0["success"], serde_json::json!(true));
+        assert_eq!(res.0["exit_code"], serde_json::json!(0));
+        assert_eq!(res.0["stdout"].as_str().unwrap(), "out-xyz");
+        // 旧 camel 键不再出现（concat 拼装避免键风格守卫自命中）
+        let legacy_key = ["exit", "Code"].concat();
+        assert!(res.0.get(&legacy_key).is_none());
+    }
 }

@@ -255,6 +255,56 @@ mod tests {
         let v = serde_json::to_value(&info).expect("serialize storage info");
         assert_eq!(v["is_orphan"], false);
         assert_eq!(v["modified_at"], "2026-08-20T00:00:00Z");
+
         assert_no_camel(&v, "StorageInfo");
+    }
+
+    /// 源码级守卫：crate 内 `rename_all = "camelCase"` 零容忍——userApp 业务
+    /// 契约全 snake（定案见 file-server-userapp models/mod.rs 同名守卫；
+    /// camelCase 仅属 computer 域 TS 契约，不在本 crate）。
+    #[test]
+    fn no_camel_case_rename_in_crate() {
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let marker = ["rename_all = ", "\"camelCase\""].concat();
+        let mut offenders = Vec::new();
+        let mut visited = 0usize;
+        fn visit(
+            dir: &std::path::Path,
+            marker: &str,
+            offenders: &mut Vec<String>,
+            visited: &mut usize,
+        ) {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(&path, marker, offenders, visited);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    *visited += 1;
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        for line in content.lines() {
+                            let trimmed = line.trim_start();
+                            if trimmed.starts_with("//") || trimmed.starts_with("//!") {
+                                continue;
+                            }
+                            if line.contains(marker) {
+                                offenders.push(format!("{}: {}", path.display(), line.trim()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        visit(&src, &marker, &mut offenders, &mut visited);
+        assert!(
+            offenders.is_empty(),
+            "app_manager 内 userApp 契约一律 snake（{} 不得出现）：\n{}",
+            marker,
+            offenders.join("\n")
+        );
+        assert!(visited > 20, "sanity: 至少扫描 20 个源文件, 实际 {visited}");
     }
 }

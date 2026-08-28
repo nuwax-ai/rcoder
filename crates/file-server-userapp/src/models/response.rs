@@ -56,8 +56,48 @@ pub struct DetectionResult {
 /// ensure-workspace 响应 data。
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct UserappEnsureWorkspaceData {
-    /// 建好的 workspace 绝对路径（容器内视角，`{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// 建好的 workspace 绝对路径（容器内视角，`{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub workspace: String,
+}
+
+/// 文件列表/搜索条目（userapp 域 snake wire；共享 `tree::FileEntry` 的
+/// camelCase serde 是 computer 域 TS 契约，经 [`From`] 转换，缺省字段的
+/// skip 语义保持一致）。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappFileEntry {
+    /// 文件/目录名
+    pub name: String,
+    /// 是否目录
+    pub is_dir: bool,
+    /// 是否二进制（文本预读时的判定；缺省省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary: Option<bool>,
+    /// 内容超限未读（缺省省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_exceeded: Option<bool>,
+    /// 文本内容（预读窗口内；缺省省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contents: Option<String>,
+    /// 预览 URL（proxy_path 提供时；缺省省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_proxy_url: Option<String>,
+    /// 是否软链（缺省省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_link: Option<bool>,
+}
+
+impl From<file_server::service::tree::FileEntry> for UserappFileEntry {
+    fn from(e: file_server::service::tree::FileEntry) -> Self {
+        Self {
+            name: e.name,
+            is_dir: e.is_dir,
+            binary: e.binary,
+            size_exceeded: e.size_exceeded,
+            contents: e.contents,
+            file_proxy_url: e.file_proxy_url,
+            is_link: e.is_link,
+        }
+    }
 }
 
 /// dev/stop 响应 data（POST /dev/stop）。

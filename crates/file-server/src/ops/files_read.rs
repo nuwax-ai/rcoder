@@ -41,8 +41,8 @@ pub async fn get_file_list_core(
         return Ok((Vec::new(), is_recursive));
     }
     // list_files_meta 内部解析 relativePath (越界 / 非目录抛 ValidationError → 400)。
-    let files = tree::list_files_meta(path, &state.config, proxy_path, relative_path, is_recursive)
-        .await?;
+    let files =
+        tree::list_files_meta(path, &state.config, proxy_path, relative_path, is_recursive).await?;
     Ok((files, is_recursive))
 }
 
@@ -52,14 +52,8 @@ pub async fn get_file_list_impl(
     path: &Path,
     p: FileListParams<'_>,
 ) -> Result<Json<Value>, AppError> {
-    let (mut files, is_recursive) = get_file_list_core(
-        state,
-        path,
-        p.proxy_path,
-        p.relative_path,
-        p.recursive,
-    )
-    .await?;
+    let (mut files, is_recursive) =
+        get_file_list_core(state, path, p.proxy_path, p.relative_path, p.recursive).await?;
     let ct = trimmed_non_empty(p.custom_target_dir);
     // fileProxyUrl 追加 ?customTargetDir (对齐 nuwax; 值需 encodeURIComponent)。
     // 单层/递归模式统一在此补齐后缀。
@@ -130,6 +124,7 @@ pub async fn resolve_file_impl(
 }
 
 /// search-files 的 workspace 无关实现。
+#[derive(Clone, Copy)]
 pub struct SearchFilesParams<'a> {
     pub proxy_path: Option<&'a str>,
     pub relative_path: Option<&'a str>,
@@ -147,21 +142,17 @@ pub struct SearchOutcome {
     pub visited: usize,
 }
 
-/// search-files 的 workspace 无关核心。
+/// search-files 的 workspace 无关核心（`custom_target_dir` 不消费——URL 后缀
+/// 归各域拼装层）。
 pub async fn search_files_core(
     state: &AppState,
     path: PathBuf,
-    proxy_path: Option<&str>,
-    relative_path: Option<&str>,
-    kw: &str,
-    limit: &str,
-    max_visit: &str,
-    timeout_ms: &str,
+    p: SearchFilesParams<'_>,
 ) -> Result<SearchOutcome, AppError> {
     // garde positive_int 已保证正整数; 此处仅取数 (parse 失败逻辑不可达, 防御性处理)
-    let limit = parse_positive_int(limit, "limit")?;
-    let max_visit = parse_positive_int(max_visit, "maxVisit")?;
-    let timeout_ms = parse_positive_int(timeout_ms, "timeoutMs")?;
+    let limit = parse_positive_int(p.limit, "limit")?;
+    let max_visit = parse_positive_int(p.max_visit, "maxVisit")?;
+    let timeout_ms = parse_positive_int(p.timeout_ms, "timeoutMs")?;
     // 目标根目录不存在 → 空 (对齐 TS)
     if !crate::service::fs_util::path_exists(&path).await? {
         return Ok(SearchOutcome {
@@ -173,9 +164,9 @@ pub async fn search_files_core(
     let result = tree::search_files(tree::SearchParams {
         root: &path,
         config: &state.config,
-        proxy_path,
-        kw,
-        relative_path,
+        proxy_path: p.proxy_path,
+        kw: p.kw,
+        relative_path: p.relative_path,
         limit,
         max_visit,
         timeout_ms: timeout_ms as u64,
@@ -194,17 +185,7 @@ pub async fn search_files_impl(
     path: PathBuf,
     p: SearchFilesParams<'_>,
 ) -> Result<Json<Value>, AppError> {
-    let mut r = search_files_core(
-        state,
-        path,
-        p.proxy_path,
-        p.relative_path,
-        p.kw,
-        p.limit,
-        p.max_visit,
-        p.timeout_ms,
-    )
-    .await?;
+    let mut r = search_files_core(state, path, p).await?;
     let ct = trimmed_non_empty(p.custom_target_dir);
     // customTargetDir 后缀统一在此追加 (对齐 nuwax)
     if let Some(ct) = ct {

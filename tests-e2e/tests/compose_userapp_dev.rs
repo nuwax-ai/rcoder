@@ -128,7 +128,7 @@ async fn userapp_dev_files_two_entry_points() {
         .post(format!("{}/api/v1/userapp/generate-file", env.rcoder))
         .timeout(Duration::from_secs(30))
         .header("X-App-Id", &app)
-        .json(&json!({"appId": app, "userId": user, "fileName": "direct.txt", "content": "via direct"}))
+        .json(&json!({"app_id": app, "user_id": user, "file_name": "direct.txt", "content": "via direct"}))
         .send()
         .await
         .expect("direct post");
@@ -165,7 +165,7 @@ async fn userapp_dev_files_two_entry_points() {
     let resp_l = env
         .http
         .get(format!(
-            "{}/api/v1/userapp/get-file-list?appId={app}&userId={user}",
+            "{}/api/v1/userapp/get-file-list?app_id={app}&user_id={user}",
             env.rcoder
         ))
         .timeout(Duration::from_secs(30))
@@ -192,7 +192,7 @@ async fn userapp_dev_files_two_entry_points() {
         .http
         .post(format!("{}/api/v1/userapp/generate-file", env.rcoder))
         .timeout(Duration::from_secs(15))
-        .json(&json!({"appId": app, "userId": user, "fileName": "x.txt", "content": "x"}))
+        .json(&json!({"app_id": app, "user_id": user, "file_name": "x.txt", "content": "x"}))
         .send()
         .await
         .expect("missing header post");

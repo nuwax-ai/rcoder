@@ -16,7 +16,7 @@ use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
 use crate::models::{DeleteWorkspaceBody, FilesUpdateBody};
-use crate::ops::files::files_update_impl;
+use crate::ops::files::files_update_core;
 
 // ── delete-workspace ────────────────────────────────────────────────────────────
 
@@ -55,7 +55,7 @@ pub(crate) async fn files_update(
         body.custom_target_dir.as_deref(),
     )
     .await?;
-    let count = files_update_impl(&path, body.files).await?;
+    let count = files_update_core(&path, body.files).await?;
     Ok(Json(json!({
         "success": true,
         "message": "User files updated successfully",

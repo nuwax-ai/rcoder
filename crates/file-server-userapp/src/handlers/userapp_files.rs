@@ -1,9 +1,10 @@
 //! `/api/v1/userapp` 文件操作镜像族（读+写）: computer 域同参镜像, workspace 走 UserApp 开发卷。
 //!
-//! 参数对齐 computer 域语义但自有命名: `appId`（≡app_id, 原 cId 改名）、`userId`
+//! 参数对齐 computer 域语义但自有命名: `app_id`（原 cId 改名）、`user_id`
 //! （保留, 不参与路径, 为挂载分区组成段）。定位统一 `resolve_userapp_dev` =
-//! `{USERAPP_WORKSPACE_DIR}/{appId}`; 核心逻辑复用 computer 域 impl（bac9663 抽取）,
-//! 两域不复制实现防漂移。
+//! `{USERAPP_WORKSPACE_DIR}/{app_id}`; 编排复用 file-server `*_core`（类型化
+//! 业务核心），**响应在本壳层自拼 snake JSON**——computer 域 TS 驼峰契约
+//! 不经本域（键风格分歧归各域拼装层，两域不复制编排防漂移）。
 
 use axum::extract::State;
 use garde::Validate;
@@ -11,19 +12,19 @@ use serde_json::{Value, json};
 
 use crate::UserAppState;
 use crate::models::{
-    UserappFileListQuery, UserappFilesUpdateBody, UserappGenerateFileBody,
+    UserappFileEntry, UserappFileListQuery, UserappFilesUpdateBody, UserappGenerateFileBody,
     UserappImportProjectForm, UserappResolveFileQuery, UserappSearchFilesQuery,
     UserappUploadFileForm, UserappUploadFilesForm,
 };
 use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
+use file_server::ops::files::files_update_core;
 use file_server::ops::files::{
-    files_update_impl, generate_file_impl, import_project_impl, upload_file_impl, upload_files_impl,
+    BatchUploadItem, generate_file_core, import_project_core, upload_file_core, upload_files_core,
 };
-use file_server::ops::files_read::{
-    FileListParams, SearchFilesParams, get_file_list_impl, resolve_file_impl, search_files_impl,
-};
+use file_server::ops::files_read::{get_file_list_core, resolve_file_core, search_files_core};
 use file_server::ops::multipart::{file_field, text_field, validate_zip_ext};
+use file_server::service::code as code_service;
 use file_server::service::temp_file::TemporaryFile;
 use file_server::workspace::resolve_userapp_dev;
 
@@ -43,17 +44,19 @@ pub(crate) async fn get_file_list(
 ) -> Result<Json<Value>, AppError> {
     q.validate().map_err(file_server::error::from_garde)?;
     let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
-    get_file_list_impl(
+    let (entries, is_recursive) = get_file_list_core(
         &state.fs,
         &path,
-        FileListParams {
-            proxy_path: q.proxy_path.as_deref(),
-            relative_path: q.relative_path.as_deref(),
-            recursive: q.recursive.as_deref(),
-            custom_target_dir: q.custom_target_dir.as_deref(),
-        },
+        q.proxy_path.as_deref(),
+        q.relative_path.as_deref(),
+        q.recursive.as_deref(),
     )
-    .await
+    .await?;
+    let mut files: Vec<UserappFileEntry> = entries.into_iter().map(Into::into).collect();
+    append_proxy_url_suffix(&mut files, q.custom_target_dir.as_deref());
+    Ok(Json(
+        json!({ "success": true, "files": files, "recursive": is_recursive }),
+    ))
 }
 
 // ── resolve-file ────────────────────────────────────────────────────────────────
@@ -72,13 +75,24 @@ pub(crate) async fn resolve_file(
 ) -> Result<Json<Value>, AppError> {
     q.validate().map_err(file_server::error::from_garde)?;
     let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
-    resolve_file_impl(
-        path,
-        q.file_path.trim(),
-        q.proxy_path.as_deref(),
-        q.custom_target_dir.as_deref(),
-    )
-    .await
+    let mut r = match resolve_file_core(path, q.file_path.trim(), q.proxy_path.as_deref()).await? {
+        Some(r) => r,
+        None => return Ok(Json(json!({ "success": true, "exists": false }))),
+    };
+    // file_proxy_url 追加 ?custom_target_dir=（语义同 computer 域 customTargetDir 后缀）
+    if let (Some(ct), Some(url)) = (
+        trimmed_non_empty(q.custom_target_dir.as_deref()),
+        r.file_proxy_url.as_mut(),
+    ) {
+        url.push_str("?custom_target_dir=");
+        url.push_str(&code_service::encode_uri_component(ct));
+    }
+    Ok(Json(json!({
+        "success": true,
+        "exists": true,
+        "name": r.name,
+        "file_proxy_url": r.file_proxy_url,
+    })))
 }
 
 // ── search-files ────────────────────────────────────────────────────────────────
@@ -97,10 +111,10 @@ pub(crate) async fn search_files(
 ) -> Result<Json<Value>, AppError> {
     q.validate().map_err(file_server::error::from_garde)?;
     let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
-    search_files_impl(
+    let r = search_files_core(
         &state.fs,
         path,
-        SearchFilesParams {
+        file_server::ops::files_read::SearchFilesParams {
             proxy_path: q.proxy_path.as_deref(),
             relative_path: q.relative_path.as_deref(),
             kw: q.kw.trim(),
@@ -110,7 +124,15 @@ pub(crate) async fn search_files(
             custom_target_dir: q.custom_target_dir.as_deref(),
         },
     )
-    .await
+    .await?;
+    let mut files: Vec<UserappFileEntry> = r.files.into_iter().map(Into::into).collect();
+    append_proxy_url_suffix(&mut files, q.custom_target_dir.as_deref());
+    Ok(Json(json!({
+        "success": true,
+        "files": files,
+        "truncated": r.truncated,
+        "visited": r.visited,
+    })))
 }
 
 // ── files-update ────────────────────────────────────────────────────────────────
@@ -126,13 +148,14 @@ pub(crate) async fn files_update(
         body.custom_target_dir.as_deref(),
         &state.fs.config,
     )?;
-    let count = files_update_impl(&path, body.files).await?;
+    let files: Vec<_> = body.files.into_iter().map(Into::into).collect();
+    let count = files_update_core(&path, files).await?;
     Ok(Json(json!({
         "success": true,
         "message": "User files updated successfully",
-        "userId": body.user_id,
-        "appId": body.app_id,
-        "filesCount": count,
+        "user_id": body.user_id,
+        "app_id": body.app_id,
+        "files_count": count,
     })))
 }
 
@@ -155,10 +178,10 @@ pub(crate) async fn upload_file(
         .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
     {
         match field.name().unwrap_or("") {
-            "appId" => app_id = Some(text_field(field).await?),
-            "userId" => user_id = Some(text_field(field).await?),
-            "filePath" => file_path = Some(text_field(field).await?),
-            "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
+            "app_id" => app_id = Some(text_field(field).await?),
+            "user_id" => user_id = Some(text_field(field).await?),
+            "file_path" => file_path = Some(text_field(field).await?),
+            "custom_target_dir" => custom_target_dir = Some(text_field(field).await?),
             "file" => {
                 data = Some(
                     file_field(
@@ -172,13 +195,18 @@ pub(crate) async fn upload_file(
             _ => {}
         }
     }
-    let app_id = require_app_field(app_id, "appId")?;
-    let user_id = require_app_field(user_id, "userId")?;
-    let file_path = require_app_field(file_path, "filePath")?;
+    let app_id = require_app_field(app_id, "app_id")?;
+    let user_id = require_app_field(user_id, "user_id")?;
+    let file_path = require_app_field(file_path, "file_path")?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     tracing::debug!(app_id = %app_id, user_id = %user_id, "userapp upload-file");
     let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.fs.config)?;
-    upload_file_impl(&ws, &file_path, data).await
+    let r = upload_file_core(&ws, &file_path, data).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "File uploaded successfully",
+        "file_size": r.file_size,
+    })))
 }
 
 /// 多文件上传（单文件错误隔离）
@@ -198,10 +226,10 @@ pub(crate) async fn upload_files(
         .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
     {
         match field.name().unwrap_or("") {
-            "appId" => app_id = Some(text_field(field).await?),
-            "userId" => user_id = Some(text_field(field).await?),
-            "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
-            "filePaths" => file_paths.push(text_field(field).await?),
+            "app_id" => app_id = Some(text_field(field).await?),
+            "user_id" => user_id = Some(text_field(field).await?),
+            "custom_target_dir" => custom_target_dir = Some(text_field(field).await?),
+            "file_paths" => file_paths.push(text_field(field).await?),
             "files" => {
                 let original = field.file_name().map(|s| s.to_string());
                 files_vec.push((
@@ -217,14 +245,49 @@ pub(crate) async fn upload_files(
             _ => {}
         }
     }
-    let app_id = require_app_field(app_id, "appId")?;
-    let user_id = require_app_field(user_id, "userId")?;
+    let app_id = require_app_field(app_id, "app_id")?;
+    let user_id = require_app_field(user_id, "user_id")?;
     tracing::debug!(app_id = %app_id, user_id, "userapp upload-files");
     if file_paths.len() != files_vec.len() {
-        return Err(AppError::validation("filePaths and files count mismatch"));
+        return Err(AppError::validation("file_paths and files count mismatch"));
     }
     let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.fs.config)?;
-    upload_files_impl(&ws, &file_paths, &files_vec).await
+    let r = upload_files_core(&ws, &file_paths, &files_vec).await?;
+    let results: Vec<Value> = r
+        .results
+        .into_iter()
+        .map(|item| match item {
+            BatchUploadItem::Ok {
+                file_path,
+                original,
+                file_size,
+            } => json!({
+                "success": true,
+                "file_path": file_path,
+                "originalname": original,
+                "message": "File uploaded successfully",
+                "file_size": file_size,
+            }),
+            BatchUploadItem::Err {
+                file_path,
+                original,
+                error,
+            } => json!({
+                "success": false,
+                "file_path": file_path,
+                "originalname": original,
+                "error": error,
+            }),
+        })
+        .collect();
+    Ok(Json(json!({
+        "success": true,
+        "message": "Batch upload completed",
+        "total_count": r.total,
+        "success_count": r.success_count,
+        "fail_count": r.total - r.success_count,
+        "results": results,
+    })))
 }
 
 // ── generate-file ───────────────────────────────────────────────────────────────
@@ -247,7 +310,13 @@ pub(crate) async fn generate_file(
         body.custom_target_dir.as_deref(),
         &state.fs.config,
     )?;
-    generate_file_impl(ws, body.file_name.trim(), body.content.unwrap_or_default()).await
+    let r = generate_file_core(ws, body.file_name.trim(), body.content.unwrap_or_default()).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "File generated successfully",
+        "file_name": r.file_name,
+        "file_size": r.file_size,
+    })))
 }
 
 // ── import-project ──────────────────────────────────────────────────────────────
@@ -269,9 +338,9 @@ pub(crate) async fn import_project(
         .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
     {
         match field.name().unwrap_or("") {
-            "appId" => app_id = Some(text_field(field).await?),
-            "userId" => user_id = Some(text_field(field).await?),
-            "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
+            "app_id" => app_id = Some(text_field(field).await?),
+            "user_id" => user_id = Some(text_field(field).await?),
+            "custom_target_dir" => custom_target_dir = Some(text_field(field).await?),
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
                 data = Some(
@@ -286,19 +355,40 @@ pub(crate) async fn import_project(
             _ => {}
         }
     }
-    let app_id = require_app_field(app_id, "appId")?;
-    let user_id = require_app_field(user_id, "userId")?;
+    let app_id = require_app_field(app_id, "app_id")?;
+    let user_id = require_app_field(user_id, "user_id")?;
     let data: TemporaryFile = data.ok_or_else(|| AppError::validation("file is required"))?;
     validate_zip_ext(file_name.as_deref())?;
     let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.fs.config)?;
-    let target = import_project_impl(ws, data).await?;
+    let target = import_project_core(ws, data).await?;
     Ok(Json(json!({
         "success": true,
         "message": "Project imported successfully",
-        "userId": user_id,
-        "appId": app_id,
-        "targetDir": target,
+        "user_id": user_id,
+        "app_id": app_id,
+        "target_dir": target,
     })))
+}
+
+/// 预览 URL 追加 custom_target_dir 后缀（list/search 条目统一处理）。
+fn append_proxy_url_suffix(files: &mut [UserappFileEntry], custom_target_dir: Option<&str>) {
+    let Some(ct) = trimmed_non_empty(custom_target_dir) else {
+        return;
+    };
+    let suffix = format!(
+        "?custom_target_dir={}",
+        code_service::encode_uri_component(ct)
+    );
+    for f in files.iter_mut() {
+        if let Some(u) = f.file_proxy_url.as_mut() {
+            u.push_str(&suffix);
+        }
+    }
+}
+
+/// trim 后非空才返回（custom_target_dir 的 URL 后缀语义）。
+fn trimmed_non_empty(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// multipart 提取后必填字段校验 (空/缺失 → 400, 错误消息带字段名便于定位)。
@@ -309,22 +399,20 @@ pub(crate) fn require_app_field(value: Option<String>, field: &str) -> Result<St
         .ok_or_else(|| AppError::validation(format!("{field} is required (missing or blank)")))
 }
 
+/// 测试夹具（handlers 域共享）：userapp AppState 构造。
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::extract::Path;
+pub(crate) mod tests_support {
     use std::sync::Arc;
 
     use crate::UserAppState;
     use crate::service::userapp::tasks::BuildTaskStore;
-    use file_server::extract::AppJson;
     use file_server::{
         BuildManager, Config, DevServerManager, LocalWorkspaceResolver, LogCacheManager,
         SkillDownloader, WorkspaceResolver,
     };
 
     /// userapp 版 make_state: `userapp_workspace_dir` 指向 tempdir (resolve_userapp_dev 的根)。
-    fn make_state(userapp_root: std::path::PathBuf) -> UserAppState {
+    pub(crate) fn make_state(userapp_root: std::path::PathBuf) -> UserAppState {
         let config = Arc::new(Config {
             userapp_workspace_dir: userapp_root,
             ..Config::default()
@@ -349,6 +437,16 @@ mod tests {
             build_tasks: Arc::new(BuildTaskStore::new()),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::Path;
+
+    use file_server::extract::AppJson;
+
+    use super::tests_support::make_state;
 
     /// 经公共 Writer API 构造 TemporaryFile (与 multipart file_field 同路径), 内容为单层 zip。
     async fn make_temp_zip(entries: &[(&str, &str)], parent: &std::path::Path) -> TemporaryFile {
@@ -393,7 +491,7 @@ mod tests {
         )
         .await;
         let ws = resolve_userapp_dev("app-1", None, &state.fs.config).unwrap();
-        file_server::ops::workspace::init_project_template_impl(&state.fs, ws, data, false)
+        file_server::ops::workspace::init_project_template_core(&state.fs, ws, data, false)
             .await
             .expect("init template");
 
@@ -469,7 +567,7 @@ mod tests {
         .await
         .expect("resolve ok");
         assert_eq!(res.0["exists"], serde_json::json!(true));
-        assert_eq!(res.0["fileProxyUrl"], "/proxy/src/a.txt");
+        assert_eq!(res.0["file_proxy_url"], "/proxy/src/a.txt");
     }
 
     /// files-update (Json 壳) 写入开发卷 + 响应回显 appId。
@@ -482,7 +580,7 @@ mod tests {
             Json(UserappFilesUpdateBody {
                 app_id: "app-3".into(),
                 user_id: "u".into(),
-                files: vec![file_server::models::FileOp {
+                files: vec![crate::models::UserappFileOp {
                     operation: "create".into(),
                     name: "pkg.json".into(),
                     is_dir: None,
@@ -495,7 +593,7 @@ mod tests {
         .await
         .expect("update ok");
         assert_eq!(res.0["success"], serde_json::json!(true));
-        assert_eq!(res.0["appId"], "app-3");
+        assert_eq!(res.0["app_id"], "app-3");
         assert_eq!(
             std::fs::read(tmp.path().join("app-3").join("pkg.json")).unwrap(),
             b"{}"
@@ -505,9 +603,9 @@ mod tests {
     /// resolve_userapp_dev: customTargetDir 信任覆盖 + identifier 路径穿越拒绝。
     #[test]
     fn resolve_userapp_dev_semantics() {
-        let config = Config {
+        let config = file_server::Config {
             userapp_workspace_dir: std::path::PathBuf::from("/data/userapp"),
-            ..Config::default()
+            ..file_server::Config::default()
         };
         // 常规: {root}/{appId}
         assert_eq!(

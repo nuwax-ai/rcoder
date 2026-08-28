@@ -13,8 +13,8 @@ use crate::path_safety;
 use crate::service::code as code_service;
 use crate::service::temp_file::TemporaryFile;
 
-/// files-update 的 workspace 无关实现：返回写入的文件数（展示/回显归各域壳层）。
-pub async fn files_update_impl(ws: &Path, mut files: Vec<FileOp>) -> Result<usize, AppError> {
+/// files-update 的 workspace 无关核心：返回写入的文件数（类型化返回，展示/回显归各域壳层）。
+pub async fn files_update_core(ws: &Path, mut files: Vec<FileOp>) -> Result<usize, AppError> {
     // 工作区不存在 → 创建 (对齐 nuwax computerFileUtils.updateFiles: !existsSync → mkdirSync recursive)。
     // 首次向全新 user/cId 工作区写入不应失败。
     tokio::fs::create_dir_all(ws).await?;
@@ -228,8 +228,8 @@ pub async fn generate_file_impl(
     })))
 }
 
-/// import-project 的 workspace 无关实现：解压合并并返回目标目录（展示/回显归各域壳层）。
-pub async fn import_project_impl(
+/// import-project 的 workspace 无关核心：解压合并并返回目标目录（类型化返回，展示/回显归各域壳层）。
+pub async fn import_project_core(
     target_dir: std::path::PathBuf,
     data: TemporaryFile,
 ) -> Result<String, AppError> {

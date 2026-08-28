@@ -145,7 +145,11 @@ pub async fn push_skills_impl(
     let message = if r.updated.is_empty() {
         "No valid skill directories found in file or skillUrls".to_string()
     } else {
-        format!("Pushed {} skills: {}", r.updated.len(), r.updated.join(", "))
+        format!(
+            "Pushed {} skills: {}",
+            r.updated.len(),
+            r.updated.join(", ")
+        )
     };
     Ok(Json(json!({
         "success": true,
