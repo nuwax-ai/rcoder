@@ -185,8 +185,12 @@ impl super::AppServiceTrait for AppService {
         self.query_apps(request).await
     }
 
-    async fn list_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
-        self.list_app_runtimes().await
+    async fn list_app_runtimes(&self, user_id: &str) -> AppResult<Vec<AppRuntimeInfo>> {
+        self.list_app_runtimes(user_id).await
+    }
+
+    async fn list_all_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
+        self.list_all_app_runtimes().await
     }
 
     async fn get_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
@@ -510,6 +514,7 @@ mod tests {
         );
 
         let update_no_name = UpdateAppRequest {
+            user_id: "u1".into(),
             name: None,
             image: Some("registry.example/app-runtime:v2".into()),
             env: None,
@@ -553,6 +558,7 @@ mod tests {
         let _publish_lock = service.acquire_process_release_lock("app-busy").await;
 
         let request = UpdateAppRequest {
+            user_id: "u1".into(),
             name: None,
             image: Some("registry.example/app-runtime:v2".into()),
             env: None,
@@ -601,6 +607,7 @@ mod tests {
 
     fn update_request_with_storage(storage: Option<&str>) -> UpdateAppRequest {
         UpdateAppRequest {
+            user_id: "u1".into(),
             name: None,
             image: Some("registry.example/app-runtime:v2".into()),
             env: None,
@@ -826,8 +833,16 @@ mod tests {
             );
         }
         let service = test_service(root.path(), runtime.clone());
+        // owner 过滤前置：两 app 注册 owner=u1（内存 metadata）
+        for app_id in ["app-alpha", "app-beta"] {
+            service
+                .metadata
+                .record(app_id, None, Some("u1".into()), None, None)
+                .await;
+        }
 
         let by_name = |name: &str| QueryAppsRequest {
+            user_id: "u1".into(),
             page: None,
             page_size: None,
             filters: Some(AppFilters {
@@ -849,7 +864,7 @@ mod tests {
             AppMetadataRecord {
                 app_id: "app-alpha".into(),
                 name: Some("alpha".into()),
-                user_id: None,
+                user_id: Some("u1".into()),
                 tenant_id: None,
                 space_id: None,
                 created_at: chrono::Utc::now() - chrono::Duration::hours(2),
@@ -857,7 +872,7 @@ mod tests {
             AppMetadataRecord {
                 app_id: "app-beta".into(),
                 name: Some("beta".into()),
-                user_id: None,
+                user_id: Some("u1".into()),
                 tenant_id: None,
                 space_id: None,
                 created_at: chrono::Utc::now(),
@@ -874,6 +889,7 @@ mod tests {
         let now = chrono::Utc::now();
         let response = service
             .query_apps(QueryAppsRequest {
+                user_id: "u1".into(),
                 page: None,
                 page_size: None,
                 filters: Some(AppFilters {

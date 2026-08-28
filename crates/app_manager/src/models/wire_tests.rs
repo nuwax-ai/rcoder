@@ -9,9 +9,11 @@
 mod tests {
     use crate::models::commons::{ExposeType, HealthCheckType};
     use crate::models::request::{
-        AppFilters, CreateAppRequest, QueryAppsRequest, SortOrder, UpdateAppRequest,
+        AppFilters, CreateAppRequest, DeleteAppRequest, QueryAppsRequest, SortOrder,
+        UpdateAppRequest,
     };
     use crate::models::response::{AppRuntimeInfo, PaginatedResponse, Pagination};
+    use crate::models::start::StartAppRequest;
     use crate::models::storage::{QueryStorageRequest, StorageFilters, StorageInfo};
 
     fn assert_no_camel(json: &serde_json::Value, ctx: &str) {
@@ -76,6 +78,7 @@ mod tests {
     #[test]
     fn update_app_request_accepts_snake_wire() {
         let req: UpdateAppRequest = serde_json::from_value(serde_json::json!({
+            "user_id": "u6",
             "image": "registry.example/app-runtime:2",
             "expected_resource_version": "rv-1"
         }))
@@ -84,6 +87,7 @@ mod tests {
         assert!(req.env.is_none() && req.secrets.is_none() && req.resources.is_none());
 
         let full: UpdateAppRequest = serde_json::from_value(serde_json::json!({
+            "user_id": "u6",
             "image": "i",
             "env": {"A": "1"},
             "recycle_enabled": false
@@ -98,6 +102,7 @@ mod tests {
         // v2 四要素内定后 command/ports/health_check 已从请求面删除——旧调用方
         // 仍传这些键时必须静默忽略（无 deny_unknown_fields），而非 422 反序列化失败。
         let legacy: Result<UpdateAppRequest, _> = serde_json::from_value(serde_json::json!({
+            "user_id": "u6",
             "image": "i",
             "command": ["java", "-jar", "app.jar"],
             "ports": [{"name": "http", "port": 8080, "expose_type": "http"}],
@@ -107,10 +112,36 @@ mod tests {
         assert_eq!(legacy.image.as_deref(), Some("i"));
     }
 
+    /// 必填契约：缺 user_id 的请求体直接反序列化拒绝（422）。
+    #[test]
+    fn requests_missing_user_id_are_rejected() {
+        let update: Result<UpdateAppRequest, _> =
+            serde_json::from_value(serde_json::json!({"image": "i"}));
+        assert!(update.is_err(), "update 缺 user_id 应拒");
+
+        let query: Result<QueryAppsRequest, _> = serde_json::from_value(serde_json::json!({
+            "page": 1
+        }));
+        assert!(query.is_err(), "query 缺 user_id 应拒");
+
+        let storage: Result<QueryStorageRequest, _> =
+            serde_json::from_value(serde_json::json!({"page": 1}));
+        assert!(storage.is_err(), "storage query 缺 user_id 应拒");
+
+        let start: Result<StartAppRequest, _> = serde_json::from_value(serde_json::json!({
+            "url": "http://x"
+        }));
+        assert!(start.is_err(), "start 缺 user_id 应拒");
+
+        let delete: Result<DeleteAppRequest, _> = serde_json::from_value(serde_json::json!({}));
+        assert!(delete.is_err(), "delete 缺 user_id 应拒");
+    }
+
     /// query 请求：filters/sort 键与 SortOrder 小写值。
     #[test]
     fn query_apps_request_accepts_snake_wire() {
         let req: QueryAppsRequest = serde_json::from_value(serde_json::json!({
+            "user_id": "u6",
             "page": 1,
             "page_size": 20,
             "filters": {
@@ -200,6 +231,7 @@ mod tests {
     #[test]
     fn storage_dto_snake_wire() {
         let req: QueryStorageRequest = serde_json::from_value(serde_json::json!({
+            "user_id": "u6",
             "page": 1,
             "page_size": 20,
             "filters": {"orphan_only": true, "app_ids": ["app-1"]}

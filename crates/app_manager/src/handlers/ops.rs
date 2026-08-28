@@ -2,13 +2,15 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Json, Path, State};
+use axum::extract::{Json, Path, Query, State};
 use tracing::{info, instrument};
 
 use shared_types::{AppError, HttpResult};
 
 use super::state::AppManagerState;
-use crate::models::{AppRuntimeInfo, RecyclePolicyRequest, StartAppRequest, StartAppResult};
+use crate::models::{
+    AppRuntimeInfo, OwnerParams, RecyclePolicyRequest, StartAppRequest, StartAppResult,
+};
 
 /// 启动应用或轻量部署
 ///
@@ -34,11 +36,18 @@ pub async fn start_app(
     Path(app_id): Path<String>,
     body: Option<Json<StartAppRequest>>,
 ) -> Result<Json<HttpResult<StartAppResult>>, AppError> {
-    let request = body.map(|Json(b)| b).unwrap_or_default();
+    let Some(Json(request)) = body else {
+        return Err(AppError::validation_error(
+            "request body with required `user_id` is required for start",
+        ));
+    };
+    shared_types::validate_identifier(request.user_id.trim(), "user_id")
+        .map_err(|e| AppError::validation_error(&e))?;
     info!(
-        "[APP] starting app: {} (deploy={})",
+        "[APP] starting app: {} (deploy={}, user_id={})",
         app_id,
-        request.url.is_some()
+        request.url.is_some(),
+        request.user_id
     );
     let result = state
         .app_service
@@ -52,7 +61,8 @@ pub async fn start_app(
     post,
     path = "/api/v1/userapp/{app_id}/stop",
     params(
-        ("app_id" = String, Path, description = "应用 ID")
+        ("app_id" = String, Path, description = "应用 ID"),
+        OwnerParams,
     ),
     description = r#"
 把运行容器缩到 0 副本停止应用：**数据卷 / 元数据全部保留**，随时可 `start` 重启
@@ -73,8 +83,11 @@ pub async fn start_app(
 pub async fn stop_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
+    Query(owner): Query<OwnerParams>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    info!("[APP] stopping app: {}", app_id);
+    shared_types::validate_identifier(owner.user_id.trim(), "user_id")
+        .map_err(|e| AppError::validation_error(&e))?;
+    info!("[APP] stopping app: {} (user_id={})", app_id, owner.user_id);
     let runtime = state.app_service.stop_app(&app_id).await?;
     Ok(Json(HttpResult::success(runtime)))
 }
@@ -88,7 +101,7 @@ pub async fn stop_app(
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body(
         content = StartAppRequest,
-        description = "全可选——无 body = 传统 rollout restart。带 url = 部署新版本（activate 自带切流）；其余字段语义同 start"
+        description = "user_id 必填；其余可选——空对象 = 传统 rollout restart。带 url = 部署新版本（activate 自带切流）；其余字段语义同 start"
     ),
     responses(
         (status = 200, description = "重启/部署成功", body = HttpResult<StartAppResult>),
@@ -102,7 +115,13 @@ pub async fn restart_app(
     Path(app_id): Path<String>,
     body: Option<Json<StartAppRequest>>,
 ) -> Result<Json<HttpResult<StartAppResult>>, AppError> {
-    let request = body.map(|Json(b)| b).unwrap_or_default();
+    let Some(Json(request)) = body else {
+        return Err(AppError::validation_error(
+            "request body with required `user_id` is required for restart",
+        ));
+    };
+    shared_types::validate_identifier(request.user_id.trim(), "user_id")
+        .map_err(|e| AppError::validation_error(&e))?;
     info!(
         "[APP] restarting app: {} (deploy={})",
         app_id,

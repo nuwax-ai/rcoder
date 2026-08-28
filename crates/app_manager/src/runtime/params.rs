@@ -372,6 +372,7 @@ mod tests {
 
     fn empty_update_request(image: &str) -> UpdateAppRequest {
         UpdateAppRequest {
+            user_id: "u1".into(),
             name: None,
             image: Some(image.to_owned()),
             env: None,

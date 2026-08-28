@@ -54,6 +54,8 @@ pub struct CreateAppRequest {
 /// 查询应用请求
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct QueryAppsRequest {
+    /// 归属用户 ID（必填——按 metadata owner 过滤"我的应用"；无归属记录的应用不返回）
+    pub user_id: String,
     /// 页码
     pub page: Option<u32>,
     /// 每页数量
@@ -106,6 +108,8 @@ pub enum SortOrder {
 /// （env `RCODER_RUNTIME_IMAGE_DIGEST`）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateAppRequest {
+    /// 归属用户 ID（必填；标识符白名单校验——审计留痕 + 归属校验锚点）
+    pub user_id: String,
     /// 应用名称（仅元数据，不影响 K8s 资源命名；rcoder 忽略）
     pub name: Option<String>,
     /// 容器镜像（可选；缺失 = 平台默认运行时镜像 env `RCODER_RUNTIME_IMAGE_DIGEST`，
@@ -160,11 +164,9 @@ pub struct DeleteAppRequest {
     /// 是否同时清空持久存储（默认 `false`：只删计算面，保留数据面）
     #[serde(default)]
     pub purge: Option<bool>,
-    /// 归属用户 ID（可选；标识符白名单校验）——Docker compose 部署下容器挂载
-    /// 目录映射宿主机 `prod/{user_id}/data/{app_id}` 分区，purge 清理时以此
-    /// 精确定位；缺省回退 userapp_metadata.owner，再兜底通配扫描。建议始终携带。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
+    /// 归属用户 ID（必填；标识符白名单校验）——purge 时 `prod/{user_id}/data/{app_id}`
+    /// 分区精确定位 + 审计留痕；缺省回退 userapp_metadata.owner 的兜底路径退役。
+    pub user_id: String,
     /// 乐观锁：传入 `GET /apps/{id}` 返回的 `resource_version`；不匹配 → 409 ERR_CONFLICT。
     /// 不传 = 不校验（向后兼容）。Docker 模式忽略。
     #[serde(default)]

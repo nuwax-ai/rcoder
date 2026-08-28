@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
 };
 use tracing::{info, instrument};
 
@@ -12,7 +12,8 @@ use shared_types::{AppError, HttpResult};
 
 use super::state::AppManagerState;
 use crate::models::{
-    AppRuntimeInfo, DeleteAppRequest, PaginatedResponse, QueryAppsRequest, UpdateAppRequest,
+    AppRuntimeInfo, DeleteAppRequest, OwnerParams, PaginatedResponse, QueryAppsRequest,
+    UpdateAppRequest,
 };
 
 // create REST 面已删除（统一走 POST /{app_id}/start：不存在则由发布链/ url 部署自动创建）。
@@ -35,7 +36,9 @@ pub async fn query_apps(
     State(state): State<Arc<AppManagerState>>,
     Json(request): Json<QueryAppsRequest>,
 ) -> Result<Json<HttpResult<PaginatedResponse<AppRuntimeInfo>>>, AppError> {
-    info!("[APP] querying apps");
+    shared_types::validate_identifier(request.user_id.trim(), "user_id")
+        .map_err(|e| AppError::validation_error(&e))?;
+    info!("[APP] querying apps (user_id={})", request.user_id);
     let response = state.app_service.query_apps(request).await?;
     Ok(Json(HttpResult::success(response)))
 }
@@ -46,8 +49,9 @@ pub async fn query_apps(
 #[utoipa::path(
     get,
     path = "/api/v1/userapp/runtime",
+    params(OwnerParams),
     responses(
-        (status = 200, description = "对账成功", body = HttpResult<Vec<AppRuntimeInfo>>),
+        (status = 200, description = "对账成功（仅该 user_id 归属的应用）", body = HttpResult<Vec<AppRuntimeInfo>>),
         (status = 500, description = "集群查询失败", body = HttpResult<String>)
     ),
     tag = "UserApp · prod · 应用查询"
@@ -55,9 +59,18 @@ pub async fn query_apps(
 #[instrument(skip(state))]
 pub async fn list_app_runtimes(
     State(state): State<Arc<AppManagerState>>,
+    Query(owner): Query<OwnerParams>,
 ) -> Result<Json<HttpResult<Vec<AppRuntimeInfo>>>, AppError> {
-    info!("[APP] reconcile: listing all app runtimes");
-    let runtimes = state.app_service.list_app_runtimes().await?;
+    shared_types::validate_identifier(owner.user_id.trim(), "user_id")
+        .map_err(|e| AppError::validation_error(&e))?;
+    info!(
+        "[APP] reconcile: listing app runtimes (user_id={})",
+        owner.user_id
+    );
+    let runtimes = state
+        .app_service
+        .list_app_runtimes(owner.user_id.trim())
+        .await?;
     Ok(Json(HttpResult::success(runtimes)))
 }
 
@@ -66,7 +79,8 @@ pub async fn list_app_runtimes(
     get,
     path = "/api/v1/userapp/{app_id}",
     params(
-        ("app_id" = String, Path, description = "应用 ID")
+        ("app_id" = String, Path, description = "应用 ID"),
+        OwnerParams,
     ),
     description = r#"
 实时查询单个应用的运行时全量快照：phase / replicas / 健康状态（含实例 IP）、
@@ -86,8 +100,14 @@ pub async fn list_app_runtimes(
 pub async fn get_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
+    Query(owner): Query<OwnerParams>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    info!("[APP] getting app runtime: {}", app_id);
+    shared_types::validate_identifier(owner.user_id.trim(), "user_id")
+        .map_err(|e| AppError::validation_error(&e))?;
+    info!(
+        "[APP] getting app runtime: {} (user_id={})",
+        app_id, owner.user_id
+    );
     let runtime = state.app_service.get_app(&app_id).await?;
     Ok(Json(HttpResult::success(runtime)))
 }
@@ -115,6 +135,8 @@ pub async fn update_app(
     Path(app_id): Path<String>,
     Json(request): Json<UpdateAppRequest>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
+    shared_types::validate_identifier(request.user_id.trim(), "user_id")
+        .map_err(|e| AppError::validation_error(&e))?;
     info!("[APP] updating app: {}", app_id);
     let runtime = state.app_service.update_app(&app_id, request).await?;
     Ok(Json(HttpResult::success(runtime)))
@@ -163,23 +185,22 @@ pub async fn delete_app(
             "`delete` is a prod-runtime capability: pass app_stage=prod (to tear down a dev environment use the storage destroy endpoint with app_stage=dev)",
         ));
     }
-    let (purge, user_id, expected_rv) = body
-        .map(|Json(r)| {
-            (
-                r.purge.unwrap_or(false),
-                r.user_id,
-                r.expected_resource_version,
-            )
-        })
-        .unwrap_or((false, None, None));
-    // 显式 user_id 白名单校验后补录 owner 元数据（start 同款 best-effort——
-    // 失败仅告警：后续 purge 的目录解析回退 metadata owner / 通配兜底）
-    if let Some(uid) = user_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        shared_types::validate_identifier(uid, "user_id")
+    let Some(Json(body)) = body else {
+        return Err(AppError::validation_error(
+            "request body with required `user_id` is required for delete",
+        ));
+    };
+    let purge = body.purge.unwrap_or(false);
+    let user_id = body.user_id.trim();
+    let expected_rv = body.expected_resource_version;
+    // user_id 白名单校验后补录 owner 元数据（start 同款 best-effort——失败仅
+    // 告警：后续 purge 的目录解析回退 metadata owner / 通配兜底）
+    {
+        shared_types::validate_identifier(user_id, "user_id")
             .map_err(|e| AppError::validation_error(&e))?;
         if let Err(e) = state
             .app_service
-            .record_dev_registration(&app_id, uid)
+            .record_dev_registration(&app_id, user_id)
             .await
         {
             tracing::warn!(
@@ -188,10 +209,8 @@ pub async fn delete_app(
         }
         info!(
             "[APP] deleting app: {} (purge={}, user_id={})",
-            app_id, purge, uid
+            app_id, purge, user_id
         );
-    } else {
-        info!("[APP] deleting app: {} (purge={})", app_id, purge);
     }
     state
         .app_service

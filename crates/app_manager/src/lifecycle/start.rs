@@ -27,6 +27,10 @@ impl AppService {
         app_id: &str,
         request: StartAppRequest,
     ) -> AppResult<StartAppResult> {
+        // user_id 必填（白名单；空串/非法字符 400）——owner 分区与 metadata 注册的
+        // 唯一来源，DTO 层缺字段已由反序列化 422 拦截，此处覆盖空串/格式。
+        shared_types::validate_identifier(request.user_id.trim(), "user_id")
+            .map_err(|e| AppOperationError::Validation(format!("invalid user_id: {e}")))?;
         validate_app_id(app_id)?;
 
         let (release_id, sql_report) = if let Some(url) = request
@@ -58,7 +62,7 @@ impl AppService {
         // PG 对齐（部署完成后 app Running，exec 通道可用）
         let (pg_aligned, pg_error) = match &request.pg {
             Some(cred) => match self
-                .align_start_pg(app_id, request.user_id.as_deref(), cred)
+                .align_start_pg(app_id, request.user_id.trim(), cred)
                 .await
             {
                 Ok(()) => (Some(true), None),
@@ -103,14 +107,11 @@ impl AppService {
         app_id: &str,
         request: StartAppRequest,
     ) -> AppResult<StartAppResult> {
-        // owner 兜底注册（与 build 同款补记语义：显式传优先；workspace 接口是主注册
-        // 来源）。失败仅告警——owner 缺失不影响部署本身（URL 拼接归属是消费侧问题）。
-        if let Some(user_id) = request
-            .user_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            && let Err(e) = self.record_dev_registration(app_id, user_id).await
+        // owner 注册（显式必填；workspace 接口是主注册来源，此处兜底补记）。
+        // 失败仅告警——owner 注册失败不影响部署本身（URL 拼接归属是消费侧问题）。
+        if let Err(e) = self
+            .record_dev_registration(app_id, request.user_id.trim())
+            .await
         {
             warn!("[APP] start owner registration failed (ignored): app_id={app_id}: {e}");
         }
@@ -129,7 +130,7 @@ impl AppService {
         }
         let (pg_aligned, pg_error) = match &request.pg {
             Some(cred) => match self
-                .align_start_pg(app_id, request.user_id.as_deref(), cred)
+                .align_start_pg(app_id, request.user_id.trim(), cred)
                 .await
             {
                 Ok(()) => (Some(true), None),
@@ -230,16 +231,11 @@ impl AppService {
 
         // 3. ensure/re-apply 运行容器：env 变更 → config-hash → Recreate rollout
         //    → 新 Pod 启动时 app-cli 部署段生效
-        // 显式 user_id 直接落 create params（Docker 数据卷 bind 源 prod/{user_id}/data/{app_id}
-        // 分区依据）——不依赖 finish 段先行的 owner 补记注册（fire-and-forget，失败仅告警，
-        // 曾致首次部署回退查空 → runtime 兜底 app_id 出孤儿目录 prod/{app_id}/）；缺失仍走
-        // metadata 回退（build 后二次部署等场景请求侧无 user_id）。
-        let explicit_user_id = request
-            .user_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        // user_id 直接落 create params（Docker 数据卷 bind 源 prod/{user_id}/data/{app_id}
+        // 分区依据）——不依赖 finish 段的 owner 补记注册（fire-and-forget，失败仅告警，
+        // 曾致首次部署回退查空 → runtime 兜底 app_id 出孤儿目录 prod/{app_id}/）。
+        // 必填化后 metadata 回退路径退役。
+        let explicit_user_id = request.user_id.trim().to_string();
         match self.get_app(app_id).await {
             Ok(_) => {
                 // 已存在 → update 通道（env 显式整段替换，其余字段 live 回退）。
@@ -247,6 +243,7 @@ impl AppService {
                 // 顺带收敛运行时镜像到最新配置（对齐"大升级全量更新"运维语义）。
                 // 乐观锁跳过：部署是权威写，last-write-wins。
                 let update = UpdateAppRequest {
+                    user_id: request.user_id.clone(),
                     name: None,
                     image: None,
                     env: Some(env),
@@ -263,7 +260,7 @@ impl AppService {
             Err(AppOperationError::NotFound(_)) => {
                 // 首次部署 → ensure 创建（镜像/端口/探针平台内定，env 携带部署三元组）
                 let lock = self.acquire_process_release_lock(app_id).await;
-                self.ensure_app_runtime(app_id, app_id, Some(env), explicit_user_id, lock)
+                self.ensure_app_runtime(app_id, app_id, Some(env), Some(explicit_user_id), lock)
                     .await?;
             }
             Err(e) => return Err(e),
@@ -309,20 +306,8 @@ impl AppService {
     /// 秒级应答，get_app 很快转 Running。
     async fn ensure_empty_runtime(&self, app_id: &str, request: &StartAppRequest) -> AppResult<()> {
         // Docker 模式数据卷 bind 源 prod/{user_id}/data/{app_id} 依赖真实 user_id
-        //（K8s 不消费，但统一要求——owner 分区语义单值）
-        let user_id = request
-            .user_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                AppOperationError::Validation(
-                    "user_id is required when starting a non-existent app \
-                     (empty app provisioning; existing apps start without it)"
-                        .to_string(),
-                )
-            })?
-            .to_string();
+        //（K8s 不消费，但统一要求——owner 分区语义单值；请求侧已必填）
+        let user_id = request.user_id.trim().to_string();
 
         info!(
             "[APP] provisioning empty app (infrastructure only, no deployment): \
@@ -355,6 +340,7 @@ impl AppService {
         if request.env.is_some() {
             let current = self.get_app(app_id).await?;
             let update = UpdateAppRequest {
+                user_id: request.user_id.clone(),
                 name: None,
                 image: None,
                 env: request.env.clone(),
@@ -388,14 +374,14 @@ impl AppService {
     async fn align_start_pg(
         &self,
         app_id: &str,
-        user_id: Option<&str>,
+        user_id: &str,
         cred: &StartPgCredential,
     ) -> AppResult<()> {
         self.align_db_credentials(
             app_id,
             shared_types::AlignCredentialsRequest {
                 app_id: app_id.to_string(),
-                user_id: user_id.unwrap_or_default().to_string(),
+                user_id: user_id.to_string(),
                 username: cred.username.clone(),
                 password: cred.password.clone(),
             },
@@ -490,7 +476,7 @@ mod tests {
         let svc = test_service(tmp.path(), runtime.clone());
 
         let request = StartAppRequest {
-            user_id: Some("u-empty".into()),
+            user_id: "u-empty".into(),
             env: Some([("APP_FOO".to_string(), "1".to_string())].into()),
             ..Default::default()
         };
@@ -548,7 +534,7 @@ mod tests {
         let err = svc
             .start_app_enhanced("app-empty-2", StartAppRequest::default())
             .await
-            .expect_err("missing user_id must be rejected");
+            .expect_err("empty user_id must be rejected");
         assert!(
             matches!(err, crate::error::AppOperationError::Validation(_)),
             "got {err:?}"
@@ -578,7 +564,7 @@ mod tests {
             .start_app_enhanced(
                 "app-exist-1",
                 StartAppRequest {
-                    user_id: None,
+                    user_id: "u1".into(),
                     ..Default::default()
                 },
             )

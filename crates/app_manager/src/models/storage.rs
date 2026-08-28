@@ -25,6 +25,8 @@ pub struct DestroyStorageRequest {
 /// 存储查询请求（**强制分页，无全量模式**——扫存储后端代价高）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueryStorageRequest {
+    /// 归属用户 ID（必填；审计留痕——存储清单按 owner 归属审计）
+    pub user_id: String,
     /// 页码（必填，从 1 开始）
     pub page: u32,
     /// 每页数量（必填，上限 100）

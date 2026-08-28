@@ -20,9 +20,32 @@ impl AppService {
     /// 而不是把 HTTP 请求挂死到连接超时（Docker daemon 高负载实战）。
     const DEPLOY_LIST_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态
+    /// 对账接口：列出该 owner 归属的应用运行时状态（metadata owner 匹配；
+    /// 无归属记录的应用不返回——归属审计口径，日志留痕）。
     #[instrument(skip(self))]
-    pub async fn list_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
+    pub async fn list_app_runtimes(&self, user_id: &str) -> AppResult<Vec<AppRuntimeInfo>> {
+        let statuses = self.list_deployments_cached().await?;
+        let (owned, unowned): (Vec<_>, Vec<_>) = statuses.into_iter().partition(|s| {
+            self.metadata
+                .lookup(&s.app_id)
+                .is_some_and(|m| m.user_id.as_deref() == Some(user_id))
+        });
+        if !unowned.is_empty() {
+            tracing::debug!(
+                owner = user_id,
+                skipped = unowned.len(),
+                "list_app_runtimes skipped apps without matching owner metadata"
+            );
+        }
+        Ok(owned
+            .into_iter()
+            .map(|s| self.build_runtime_info(s))
+            .collect())
+    }
+
+    /// 无过滤全量版（系统内部扫描面：闲置回收器须覆盖所有 app，与归属无关）。
+    #[instrument(skip(self))]
+    pub async fn list_all_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
         let statuses = self.list_deployments_cached().await?;
         Ok(statuses
             .into_iter()
@@ -73,7 +96,9 @@ impl AppService {
         &self,
         request: QueryAppsRequest,
     ) -> AppResult<PaginatedResponse<AppRuntimeInfo>> {
-        let mut items = self.list_app_runtimes().await?;
+        shared_types::validate_identifier(request.user_id.trim(), "user_id")
+            .map_err(|e| AppOperationError::Validation(format!("invalid user_id: {e}")))?;
+        let mut items = self.list_app_runtimes(request.user_id.trim()).await?;
 
         // 过滤：status/app_ids 为运行时字段直接生效；name/created_at 需业务元数据
         // （集群不持有），仅 PG 模式（metadata 持久化已注入）经内存 join 生效，
@@ -239,6 +264,15 @@ mod tests {
         );
     }
 
+    /// 测试辅助：为 app 注册 owner 后按该 owner 查询（owner 过滤是
+    /// list_app_runtimes 的前置语义，缓存断言不受影响）。返回查询条数。
+    async fn owned_list(svc: &AppService, app_id: &str, user_id: &str) -> usize {
+        svc.metadata
+            .record(app_id, None, Some(user_id.to_string()), None, None)
+            .await;
+        svc.list_app_runtimes(user_id).await.unwrap().len()
+    }
+
     /// TTL 内命中缓存：多次查询只穿透一次到 runtime。
     #[tokio::test]
     async fn deploy_list_cache_hits_within_ttl() {
@@ -247,10 +281,10 @@ mod tests {
         deployed(&runtime, "app-a");
         let svc = test_service(tmp.path(), runtime.clone());
 
-        let r1 = svc.list_app_runtimes().await.unwrap();
-        let r2 = svc.list_app_runtimes().await.unwrap();
-        assert_eq!(r1.len(), 1);
-        assert_eq!(r2.len(), 1);
+        let r1 = owned_list(&svc, "app-a", "u1").await;
+        let r2 = owned_list(&svc, "app-a", "u1").await;
+        assert_eq!(r1, 1);
+        assert_eq!(r2, 1);
         assert_eq!(
             runtime.list_calls.load(Ordering::Relaxed),
             1,
@@ -266,10 +300,14 @@ mod tests {
         deployed(&runtime, "app-a");
         let svc = test_service(tmp.path(), runtime.clone());
 
-        drop(svc.list_app_runtimes().await.unwrap());
+        owned_list(&svc, "app-a", "u1").await;
         deployed(&runtime, "app-b"); // 模拟并发新建（绕过 service 写路径）
         svc.invalidate_deploy_cache().await;
-        let r = svc.list_app_runtimes().await.unwrap();
+        // 两个 app 都注册给同一 owner 后对账
+        svc.metadata
+            .record("app-b", None, Some("u1".to_string()), None, None)
+            .await;
+        let r = svc.list_app_runtimes("u1").await.unwrap();
         assert_eq!(r.len(), 2, "invalidated cache must refetch");
         assert_eq!(runtime.list_calls.load(Ordering::Relaxed), 2);
     }
@@ -282,7 +320,7 @@ mod tests {
         deployed(&runtime, "app-a");
         let svc = test_service(tmp.path(), runtime.clone());
 
-        drop(svc.list_app_runtimes().await.unwrap());
+        owned_list(&svc, "app-a", "u1").await;
         // 把缓存时间戳拨回 TTL 之前，模拟过期
         {
             let mut guard = svc.deploy_list_cache.lock().await;
@@ -291,7 +329,7 @@ mod tests {
                     - (AppService::DEPLOY_LIST_TTL + Duration::from_secs(1));
             }
         }
-        drop(svc.list_app_runtimes().await.unwrap());
+        owned_list(&svc, "app-a", "u1").await;
         assert_eq!(
             runtime.list_calls.load(Ordering::Relaxed),
             2,

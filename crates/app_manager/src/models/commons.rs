@@ -130,3 +130,11 @@ pub struct InternalPort {
     /// 端口号
     pub port: u16,
 }
+
+/// 单 app 运维/查询接口的归属用户 query 参数（必填——审计留痕 + 归属校验锚点）。
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct OwnerParams {
+    /// 归属用户 ID（必填；标识符白名单校验。审计留痕；后续归属鉴权的数据锚点）
+    pub user_id: String,
+}

@@ -277,11 +277,12 @@ mod tests {
     #[test]
     fn deploy_mode_wire_default_and_hot() {
         let req: StartAppRequest =
-            serde_json::from_str(r#"{"url":"http://x/p.zip"}"#).expect("parse");
+            serde_json::from_str(r#"{"user_id":"u1","url":"http://x/p.zip"}"#).expect("parse");
         assert!(req.deploy_mode.is_none(), "default must be absent (= pod)");
 
         let req: StartAppRequest =
-            serde_json::from_str(r#"{"url":"http://x/p.zip","deploy_mode":"hot"}"#).expect("parse");
+            serde_json::from_str(r#"{"user_id":"u1","url":"http://x/p.zip","deploy_mode":"hot"}"#)
+                .expect("parse");
         assert_eq!(req.deploy_mode, Some(crate::models::DeployMode::Hot));
 
         // 非法值拒绝（枚举校验）

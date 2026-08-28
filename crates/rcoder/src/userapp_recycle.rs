@@ -65,9 +65,9 @@ impl UserAppRecycleScanner {
         let apps = self
             .state
             .app_service
-            .list_app_runtimes()
+            .list_all_app_runtimes()
             .await
-            .map_err(|e| anyhow::anyhow!("list_app_runtimes: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("list_all_app_runtimes: {e}"))?;
         // 闲置时长按 wall-clock 计算（last_accessed 为 DateTime，可跨重启持久化）；
         // 负值（时钟回拨）按 0 处理
         let now = chrono::Utc::now();

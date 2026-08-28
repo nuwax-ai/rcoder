@@ -605,6 +605,7 @@ mod tests {
             .query_storage(
                 UserappStage::Dev,
                 QueryStorageRequest {
+                    user_id: "u1".into(),
                     page: 1,
                     page_size: 10,
                     filters: None,
@@ -626,6 +627,7 @@ mod tests {
             .query_storage(
                 UserappStage::Prod,
                 QueryStorageRequest {
+                    user_id: "u1".into(),
                     page: 1,
                     page_size: 10,
                     filters: None,

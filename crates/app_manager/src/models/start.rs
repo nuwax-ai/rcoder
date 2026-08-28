@@ -18,15 +18,12 @@ use utoipa::ToSchema;
 pub struct StartAppRequest {
     /// 制品包下载 URL（workspace 整体包 zip）。给出即触发轻量部署链。
     pub url: Option<String>,
-    /// owner 用户 ID。start 无 url 创建空容器时**必填**（数据卷分区依赖）；
-    /// start/restart 带 url 首次部署时显式传值直接落容器 create params——
-    /// Docker compose 数据卷 bind 源 `prod/{user_id}/data/{app_id}` 分区依据
-    /// （缺失走 `userapp_metadata` 回退，回退查空时 runtime 兜底 app_id 出孤儿目录，
-    /// 建议始终携带）；已存在 app 可选补记 owner——与 build 同款语义：显式传优先，
-    /// 注册 `userapp_metadata`，供 `/proxy/userapp/prod/{user_id}/...` URL
-    /// 拼接与"我的应用"归属过滤；None=不改动已有记录。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
+    /// owner 用户 ID（必填；标识符白名单校验）。start/restart 显式传值直接落
+    /// 容器 create params——Docker compose 数据卷 bind 源
+    /// `prod/{user_id}/data/{app_id}` 分区依据；同批注册 `userapp_metadata`，
+    /// 供 `/proxy/userapp/prod/{user_id}/...` URL 拼接与"我的应用"归属过滤。
+    /// （metadata 回退→runtime 兜底 app_id 的孤儿目录路径已随必填化退役。）
+    pub user_id: String,
     /// 发布版本标记（幂等键）。缺省自动生成（`rel-{时间戳}-{随机}`）并在响应返回；
     /// 显式传入时同 id+同内容重复部署幂等命中。
     pub release_id: Option<String>,
