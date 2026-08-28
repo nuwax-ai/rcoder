@@ -268,7 +268,54 @@ pub async fn run_command_to_log(
     // 等日志管道 drain(超时放弃,不阻塞返回;尾部日志可能截断但会告警)。
     drain_log_pipes(stdout_handle, stderr_handle).await;
 
-    outcome
+    // 失败时把本次运行输出尾部嵌入错误信息——只报退出码的笼统错误
+    // （"command exited non-zero: exit status: 1"）无法定位是哪条命令、
+    // 因何而败；temp_log 仅含本次运行输出（stdout+stderr 双写），读尾部
+    // 即真实报错现场（有界读取防大日志）。
+    match outcome {
+        Err(e) => Err(append_run_log_tail(e, temp_log).await),
+        outcome => outcome,
+    }
+}
+
+/// 失败错误附加本次运行日志尾部（尾部 16KB 内取最后 30 行；读失败静默返回
+/// 原错误——诊断增强不改变错误本体）。
+async fn append_run_log_tail(err: AppError, temp_log: &Path) -> AppError {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    const TAIL_BYTES: u64 = 16 * 1024;
+    const TAIL_LINES: usize = 30;
+
+    let Ok(meta) = tokio::fs::metadata(temp_log).await else {
+        return err;
+    };
+    let start = meta.len().saturating_sub(TAIL_BYTES);
+    let Ok(mut file) = tokio::fs::File::open(temp_log).await else {
+        return err;
+    };
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return err;
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).await.is_err() {
+        return err;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    let take = lines.len().saturating_sub(TAIL_LINES);
+    lines.drain(..take);
+    if lines.is_empty() {
+        return err;
+    }
+    let name = temp_log
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("temp.log");
+    AppError::system(format!(
+        "{err}\n--- output tail ({name}, last {} lines) ---\n{}",
+        lines.len(),
+        lines.join("\n")
+    ))
 }
 
 /// 等待 stdout/stderr 日志管道 task 结束,确保 child 退出后尾部日志写完(#17)。
@@ -392,7 +439,7 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::contains_project_path_segment;
+    use super::{contains_project_path_segment, run_command_to_log};
 
     #[test]
     fn project_process_match_requires_a_path_segment_boundary() {
@@ -408,5 +455,56 @@ mod tests {
             "123 node /workspace/abc2/node_modules/vite/bin/vite.js",
             "abc"
         ));
+    }
+
+    /// 失败错误必须携带真实报错现场：退出码 + 本次运行输出尾部（stdout/stderr
+    /// 均管道写入 temp_log）——"command exited non-zero" 笼统错误无法排障。
+    #[tokio::test]
+    async fn run_command_to_log_error_carries_output_tail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_log = tmp.path().join("dev-test.log");
+        let temp_log = tmp.path().join("temp-1.log");
+        let err = run_command_to_log(
+            "sh",
+            &[
+                "-c",
+                "echo boom-marker-stderr >&2; echo plain-out-line; exit 7",
+            ],
+            tmp.path(),
+            &main_log,
+            &temp_log,
+            30,
+            None,
+        )
+        .await
+        .expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("exit status: 7"), "退出码缺失: {msg}");
+        assert!(msg.contains("boom-marker-stderr"), "stderr 尾部缺失: {msg}");
+        assert!(msg.contains("plain-out-line"), "stdout 尾部缺失: {msg}");
+        assert!(msg.contains("output tail"), "尾部标注缺失: {msg}");
+    }
+
+    /// 成功路径不受尾部增强影响（错误才附加）。
+    #[tokio::test]
+    async fn run_command_to_log_success_writes_logs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_log = tmp.path().join("dev-test.log");
+        let temp_log = tmp.path().join("temp-2.log");
+        run_command_to_log(
+            "sh",
+            &["-c", "echo ok-line"],
+            tmp.path(),
+            &main_log,
+            &temp_log,
+            30,
+            None,
+        )
+        .await
+        .expect("must succeed");
+        let temp = tokio::fs::read_to_string(&temp_log)
+            .await
+            .expect("read temp");
+        assert!(temp.contains("ok-line"));
     }
 }

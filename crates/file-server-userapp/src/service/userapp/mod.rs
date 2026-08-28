@@ -173,6 +173,9 @@ pub async fn build_workspace_package(
         let artifact = match build_result {
             Ok(a) => a,
             Err(e) => {
+                // 服务名前缀：多服务 workspace 串行构建，快照 error 必须自明是
+                // 哪个服务挂的（源错误已嵌该服务构建输出的尾部日志）。
+                let wrapped = AppError::system(format!("{} build failed: {e}", proj.name()));
                 // cancel(kill 进程组)导致的失败不 emit（终态 Cancelled 由 cancel handler 置）；
                 // 否则 emit 服务级 BuildFail（任务级 Failed 由顶层 start_*_task 统一 emit）。
                 if let Some(p) = progress
@@ -180,11 +183,11 @@ pub async fn build_workspace_package(
                 {
                     p.emit(BuildProgressEvent::BuildFail {
                         service: proj.name().to_string(),
-                        error: e.to_string(),
+                        error: wrapped.to_string(),
                     })
                     .await;
                 }
-                return Err(e);
+                return Err(wrapped);
             }
         };
         if let Some(p) = progress {

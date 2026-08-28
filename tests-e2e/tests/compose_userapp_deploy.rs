@@ -460,13 +460,22 @@ async fn build_to_completion(
         ),
     );
     if !done {
-        // 失败留痕：任务日志尾部进报告（排查线索，不额外判死）
+        // 失败留痕：失败服务（快照 current_service）的分服务日志尾部进报告
+        //（tasks logs 端点 ?service= 定位；快照 error 本身已嵌输出尾部——
+        // 此处再拉完整日志行号分页视角，排查线索，不额外判死）
+        let svc = data["current_service"].as_str().unwrap_or_default();
         let (_, logs) = get_json(
             env,
-            &format!("/api/v1/userapp/tasks/{task_id}/logs?app_id={app}&user_id={user}"),
+            &format!(
+                "/api/v1/userapp/tasks/{task_id}/logs?app_id={app}&user_id={user}&service={svc}&start_index=1"
+            ),
         )
         .await;
-        report.diagnostic("build 失败日志尾部", &trunc(&logs, 2000), "tasks logs");
+        report.diagnostic(
+            &format!("build 失败服务 [{svc}] 日志尾部"),
+            &trunc(&logs, 3000),
+            "tasks logs?service=current_service",
+        );
         return None;
     }
     let release_id = data["release_id"].as_str().unwrap_or_default().to_owned();
