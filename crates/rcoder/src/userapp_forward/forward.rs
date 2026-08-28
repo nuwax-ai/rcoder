@@ -30,8 +30,8 @@ use crate::router::AppState;
 
 use super::semantics::{
     DevAbsentAction, HttpResultError, SkipKind, cancel_skip_response, classify_dev_absent,
-    dev_container_absent, dev_stop_skip_response, require_query_app_id, require_static_user_id,
-    unavailable_response,
+    dev_container_absent, dev_stop_skip_response, require_query_app_id, require_query_user_id,
+    require_static_user_id, unavailable_response,
 };
 use super::upstream::{
     STATIC_PATH_PREFIX, TASKS_PATH_PREFIX, forward_to_dev, forward_to_prod,
@@ -75,10 +75,15 @@ pub(crate) async fn forward_userapp(
     let query = req.uri().query().map(str::to_string);
 
     // tasks 族：构建链 dev-only（忽略 X-App-Stage——构建任务只存在于 dev
-    // builder），query app_id 定位；容器不在时短路
+    // builder），query app_id+user_id 定位（user_id 同时是懒创建显式 owner 档）；
+    // 容器不在时短路
     if path.starts_with(TASKS_PATH_PREFIX) {
         let app_id = match require_query_app_id(query.as_deref()) {
             Ok(app_id) => app_id,
+            Err(e) => return e.into_response(),
+        };
+        let user_id = match require_query_user_id(query.as_deref()) {
+            Ok(v) => v,
             Err(e) => return e.into_response(),
         };
         if dev_container_absent(&state, &app_id) {
@@ -98,11 +103,11 @@ pub(crate) async fn forward_userapp(
             };
         }
         info!(
-            "[USERAPP_FORWARD] {} {} -> dev container (app_id={app_id}, query-located)",
+            "[USERAPP_FORWARD] {} {} -> dev container (app_id={app_id}, user_id={user_id}, query-located)",
             req.method(),
             req.uri().path()
         );
-        return forward_to_dev(&state, &app_id, req, None).await;
+        return forward_to_dev(&state, &app_id, req, Some(&user_id)).await;
     }
 
     // static/{app_id}：构建链 dev-only（制品 zip 在 dev workspace，prod 容器必

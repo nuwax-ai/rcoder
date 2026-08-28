@@ -49,6 +49,11 @@ pub struct ImportProjectBody {
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct TaskLogsQuery {
+    /// 构建链定位 app_id（rcoder 转发层消费：目标开发容器定位与容器不在时的
+    /// 短路判定；容器侧校验白名单并记审计日志）
+    pub app_id: String,
+    /// 归属用户 ID（审计留痕；rcoder 转发层用于 dev 容器懒创建显式 owner 档）
+    pub user_id: String,
     /// 子项目目录名（= service_id）；留空读 workspace 根日志目录。
     #[serde(default)]
     pub service: Option<String>,
@@ -68,10 +73,39 @@ fn default_start_index() -> usize {
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct StreamQuery {
+    /// 构建链定位 app_id（rcoder 转发层消费：目标开发容器定位与容器不在时的
+    /// 短路判定；容器侧校验白名单并记审计日志）
+    pub app_id: String,
+    /// 归属用户 ID（审计留痕；rcoder 转发层用于 dev 容器懒创建显式 owner 档）
+    pub user_id: String,
     /// 从哪个 seq 开始回放（含该 seq；0 = 从头）。仅作兜底——
     /// 请求带 `Last-Event-ID` 头时以头为准（头值 + 1 = 本值语义），query 被忽略。
     #[serde(default)]
     pub from_seq: u64,
+}
+
+/// 任务作用域定位参数（`GET /tasks/{task_id}` 与 `POST /tasks/{task_id}/cancel`）。
+///
+/// `parameter_in` 必须显式声明（同上）。app_id 曾是 rcoder 转发层单方消费的
+/// 隐式必填项，本批下沉为容器侧显式校验；user_id 为新增审计字段。
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct UserappTaskScopeQuery {
+    /// 构建链定位 app_id（rcoder 转发层消费：目标开发容器定位与容器不在时的
+    /// 短路判定；容器侧校验白名单并记审计日志）
+    pub app_id: String,
+    /// 归属用户 ID（审计留痕；rcoder 转发层用于 dev 容器懒创建显式 owner 档）
+    pub user_id: String,
+}
+
+/// dev 进程列表查询参数（`GET /dev/list`）——按 app_id 过滤单 app 视角。
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct UserappDevListQuery {
+    /// 应用 ID（进程表按 `userapp:{app_id}` key 过滤，只返回该 app 的 dev 进程）
+    pub app_id: String,
+    /// 归属用户 ID（审计留痕）
+    pub user_id: String,
 }
 
 /// static 取包 query（`GET /static/{appId}`）。

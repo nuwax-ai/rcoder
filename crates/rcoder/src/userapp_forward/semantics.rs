@@ -138,6 +138,22 @@ pub(super) fn require_query_app_id(query: Option<&str>) -> Result<String, HttpRe
         .map_err(HttpResultError::bad_request)
 }
 
+/// tasks 族 query `user_id` 必填（审计 + dev 容器懒创建显式 owner 档——
+/// 宿主树 `dev/{user_id}/{app_id}` 分区直取，不依赖 metadata 注册兜底）。
+pub(super) fn require_query_user_id(query: Option<&str>) -> Result<String, HttpResultError> {
+    let raw = query_param(query, "user_id")
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(raw) = raw else {
+        return Err(HttpResultError::bad_request(
+            "missing required query parameter `user_id` for tasks endpoints",
+        ));
+    };
+    shared_types::validate_identifier(raw, "user_id")
+        .map(|_| raw.to_string())
+        .map_err(HttpResultError::bad_request)
+}
+
 /// static/{app_id} 的 query `user_id` 必填（🟢 ensure 显式档：懒创建容器
 /// 宿主树分区直取，不依赖 metadata 注册）。非 static 路径返回 None（不要求）。
 /// static/{app_id} 的 query `user_id` 必填（🟢 ensure 显式档：懒创建容器

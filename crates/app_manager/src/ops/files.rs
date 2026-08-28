@@ -140,6 +140,7 @@ impl AppService {
         let part = reqwest::multipart::Part::bytes(file_data).file_name(file_name);
         let form = reqwest::multipart::Form::new()
             .text("app_id", app_id.to_string())
+            .text("user_id", user_id.to_string())
             .text("target", target.to_string())
             .text("flatten", flatten.to_string())
             .part("file", part);
@@ -183,6 +184,7 @@ impl AppService {
             .await?;
         let body = serde_json::json!({
             "app_id": app_id,
+            "user_id": user_id,
             "url": url,
             "target": target,
             "flatten": flatten,
@@ -229,8 +231,9 @@ impl AppService {
             .app_files_base(app_stage, app_id, Some(user_id))
             .await?;
         let mut url = format!(
-            "{base}/api/v1/userapp/app-files/list?app_id={}",
-            urlencode(app_id)
+            "{base}/api/v1/userapp/app-files/list?app_id={}&user_id={}",
+            urlencode(app_id),
+            urlencode(user_id)
         );
         if let Some(p) = subpath.map(str::trim).filter(|p| !p.is_empty()) {
             url.push_str("&path=");
@@ -275,7 +278,7 @@ impl AppService {
         let base = self
             .app_files_base(app_stage, app_id, Some(user_id))
             .await?;
-        let body = serde_json::json!({"app_id": app_id, "path": file_path});
+        let body = serde_json::json!({"app_id": app_id, "user_id": user_id, "path": file_path});
         let resp = reqwest::Client::new()
             .post(format!("{base}/api/v1/userapp/app-files/delete"))
             .json(&body)

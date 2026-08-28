@@ -360,7 +360,12 @@ mod tests {
             .expect("components present")
             .schemas
         {
-            if !name.starts_with("Userapp") && name != "DevOpBody" && name != "DevLogsQuery" {
+            if !name.starts_with("Userapp")
+                && !matches!(
+                    name.as_str(),
+                    "DevOpBody" | "DevLogsQuery" | "TaskLogsQuery" | "StreamQuery"
+                )
+            {
                 continue;
             }
             let utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(obj)) = schema

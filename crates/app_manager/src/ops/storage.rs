@@ -163,7 +163,7 @@ impl crate::service::AppService {
             let resp = reqwest::Client::new()
                 .post(format!("{base}/api/v1/userapp/app-files/clear"))
                 .timeout(std::time::Duration::from_secs(60))
-                .json(&serde_json::json!({"app_id": app_id}))
+                .json(&serde_json::json!({"app_id": app_id, "user_id": user_id}))
                 .send()
                 .await
                 .map_err(|e| {

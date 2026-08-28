@@ -1,8 +1,8 @@
 //! app-files 域请求结构（rcoder `app_files` 转发链的容器侧内部契约，
 //! handler 壳在 handlers/userapp_app_files.rs）。
 //!
-//! 字段为 `pub`（models 是 crate 内公共层）；user_id 均为可选审计字段
-//! （rcoder 转发链不携带）。
+//! 字段为 `pub`（models 是 crate 内公共层）；app_id 定位、user_id 必填
+//! （审计 + dev 容器懒创建显式 owner 档）。
 
 use serde::Deserialize;
 
@@ -34,19 +34,17 @@ pub struct AppFilesUploadFromUrlBody {
     pub flatten: bool,
     /// UserApp 应用 ID（定位）。
     pub app_id: String,
-    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带；9252a29 曾改必填造成
-    /// rcoder 转发 422 断链，回退为可选审计字段）。
-    #[serde(default)]
-    pub user_id: Option<String>,
+    /// 归属用户 ID（必填；rcoder 转发链现已携带——dev 容器懒创建显式 owner
+    /// 档与审计日志双消费）。
+    pub user_id: String,
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct AppFilesListParams {
     /// UserApp 应用 ID（定位）。
     pub app_id: String,
-    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带）。
-    #[serde(default)]
-    pub user_id: Option<String>,
+    /// 归属用户 ID（必填；rcoder 转发链现已携带，审计留痕）。
+    pub user_id: String,
     /// app 根相对子目录（缺省列根）
     #[serde(default)]
     pub path: Option<String>,
@@ -56,9 +54,8 @@ pub struct AppFilesListParams {
 pub struct AppFilesDeleteBody {
     /// UserApp 应用 ID（定位）。
     pub app_id: String,
-    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带）。
-    #[serde(default)]
-    pub user_id: Option<String>,
+    /// 归属用户 ID（必填；rcoder 转发链现已携带，审计留痕）。
+    pub user_id: String,
     /// app 根相对文件/目录
     pub path: String,
 }
@@ -67,7 +64,6 @@ pub struct AppFilesDeleteBody {
 pub struct AppFilesClearBody {
     /// UserApp 应用 ID（定位）。
     pub app_id: String,
-    /// 用户 ID（仅审计日志，可选）。
-    #[serde(default)]
-    pub user_id: Option<String>,
+    /// 归属用户 ID（必填；审计留痕）。
+    pub user_id: String,
 }

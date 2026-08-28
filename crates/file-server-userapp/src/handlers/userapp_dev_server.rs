@@ -16,8 +16,8 @@ use shared_types::HttpResult;
 use super::userapp::{UserAppReply, reply};
 use crate::UserAppState;
 use crate::models::{
-    BuildTaskStatus, DevLogsQuery, DevOpBody, UserappDevList, UserappDevProcess, UserappDevStopped,
-    UserappDevTaskCreated,
+    BuildTaskStatus, DevLogsQuery, DevOpBody, UserappDevList, UserappDevListQuery,
+    UserappDevProcess, UserappDevStopped, UserappDevTaskCreated,
 };
 use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppQuery as Query};
@@ -304,18 +304,29 @@ async fn spawn_dev_task(
 
 /// 在跑的 UserApp 开发服务列表
 ///
-/// 不含 web/computer 项目进程。
+/// 不含 web/computer 项目进程；按 `app_id` 过滤单 app 视角（必填）。
 #[utoipa::path(
     get,
     path = "/dev/list",
-    responses((status = 200, body = HttpResult<UserappDevList>, description = "在跑的 UserApp 开发服务列表")),
+    params(UserappDevListQuery),
+    responses((status = 200, body = HttpResult<UserappDevList>, description = "该 app 在跑的 UserApp 开发服务列表（不含 web/computer 项目进程）")),
     tag = "UserApp · dev · 进程管理"
 )]
-pub(crate) async fn dev_list(State(state): State<UserAppState>) -> UserAppReply<UserappDevList> {
+pub(crate) async fn dev_list(
+    State(state): State<UserAppState>,
+    Query(q): Query<UserappDevListQuery>,
+) -> UserAppReply<UserappDevList> {
     let result = async {
+        shared_types::validate_identifier(&q.app_id, "app_id")
+            .map_err(|e| AppError::validation(e.to_string()))?;
+        shared_types::validate_identifier(&q.user_id, "user_id")
+            .map_err(|e| AppError::validation(e.to_string()))?;
+        tracing::debug!(app_id = %q.app_id, user_id = %q.user_id, "dev list");
+        let wanted = dev_key(&q.app_id);
         let processes: Vec<DevProcess> = state.fs.dev_server.list_dev()?;
         let list = processes
             .into_iter()
+            .filter(|p| p.project_id == wanted)
             .filter_map(|p| {
                 app_id_of_key(&p.project_id).map(|app_id| UserappDevProcess {
                     app_id: app_id.to_string(),

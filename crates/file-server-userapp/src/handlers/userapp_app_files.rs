@@ -71,15 +71,12 @@ pub(crate) async fn upload(
         }
     }
     let app_id = require_app_field(app_id, "app_id")?;
-    // user_id 仅审计（调用方 rcoder 转发链不携带——内部契约不要求），带到则日志留痕
-    let user_id = user_id
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let user_id = require_app_field(user_id, "user_id")?;
     let target = require_app_field(target, "target")?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     let root = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
     let result = upload_impl(&root, &target, flatten, data.path(), data.size()).await?;
-    info!(app_id = %app_id, user_id = user_id.as_deref().unwrap_or(""), target = %target, "app-files upload done");
+    info!(app_id = %app_id, user_id = %user_id, target = %target, "app-files upload done");
     Ok(Json(json!({
         "success": true,
         "file_path": result.file_path,
@@ -199,7 +196,7 @@ pub(crate) async fn upload_from_url(
         .map(|m| m.len())
         .map_err(|e| AppError::system(format!("stat downloaded file: {e}")))?;
     let result = upload_impl(&root, &body.target, body.flatten, tmp.path(), size).await?;
-    info!(app_id = %body.app_id, user_id = body.user_id.as_deref().unwrap_or(""), url = %body.url, "app-files upload-from-url done");
+    info!(app_id = %body.app_id, user_id = %body.user_id, url = %body.url, "app-files upload-from-url done");
     Ok(Json(json!({
         "success": true,
         "file_path": result.file_path,
@@ -228,7 +225,7 @@ pub(crate) async fn list(
     State(state): State<UserAppState>,
     Query(params): Query<AppFilesListParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    tracing::debug!(app_id = %params.app_id, user_id = params.user_id.as_deref().unwrap_or(""), "app-files list");
+    tracing::debug!(app_id = %params.app_id, user_id = %params.user_id, "app-files list");
     let root = resolve_userapp_dev(&params.app_id, None, &state.fs.config)?;
     if !root.exists() {
         return Ok(Json(json!({"success": true, "files": []})));
@@ -300,7 +297,7 @@ pub(crate) async fn delete(
     State(state): State<UserAppState>,
     Json(body): Json<AppFilesDeleteBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    info!(app_id = %body.app_id, user_id = body.user_id.as_deref().unwrap_or(""), path = %body.path, "app-files delete");
+    info!(app_id = %body.app_id, user_id = %body.user_id, path = %body.path, "app-files delete");
     let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
     if !root.exists() {
         return Err(AppError::resource(format!(
@@ -358,7 +355,7 @@ pub(crate) async fn clear(
 ) -> Result<Json<serde_json::Value>, AppError> {
     info!(
         app_id = %body.app_id,
-        user_id = body.user_id.as_deref().unwrap_or(""),
+        user_id = %body.user_id,
         "app-files clear (workspace reset)"
     );
     let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;

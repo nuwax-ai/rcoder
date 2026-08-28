@@ -32,7 +32,7 @@ use shared_types::HttpResult;
 use crate::UserAppState;
 use crate::models::{
     BuildCreatedData, BuildTaskSnapshot, BuildTaskStatus, BuildUserAppBody, CancelData,
-    ConfirmData, DetectData, ImportProjectBody, StreamQuery, TaskLogsQuery,
+    ConfirmData, DetectData, ImportProjectBody, StreamQuery, TaskLogsQuery, UserappTaskScopeQuery,
 };
 use crate::service::userapp;
 use crate::service::userapp::tasks::BuildProgressEvent;
@@ -94,6 +94,17 @@ pub(crate) fn reply<T>(r: AppResult<T>) -> UserAppReply<T> {
 /// 事件的 `id:`，服务端应回放该 id **之后**的事件；而 `from_seq` 是"从哪个 seq
 /// 开始（含）"，故头值需 +1 换算。头存在但非数字时忽略头回退 query
 ///（EventSource 不会发非数字 id，此分支只有手写客户端会触发，info 留痕）。
+/// tasks 族作用域校验：app_id/user_id 必填白名单（app_id 原是 rcoder 转发层
+/// 单方消费的隐式必填，本批下沉容器侧；user_id 审计留痕）。
+fn validate_task_scope(scope: &UserappTaskScopeQuery, task_id: &str) -> Result<(), AppError> {
+    shared_types::validate_identifier(&scope.app_id, "app_id")
+        .map_err(|e| AppError::validation(e.to_string()))?;
+    shared_types::validate_identifier(&scope.user_id, "user_id")
+        .map_err(|e| AppError::validation(e.to_string()))?;
+    tracing::debug!(app_id = %scope.app_id, user_id = %scope.user_id, %task_id, "task scope access");
+    Ok(())
+}
+
 fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
     match last_event_id {
         Some(raw) => match raw.trim().parse::<u64>() {
@@ -155,7 +166,7 @@ pub(crate) async fn build_workspace(
     get,
     path = "/tasks/{task_id}",
     params(
-        ("app_id" = String, Query, description = "构建链定位 app_id（**rcoder 转发层消费**：目标开发容器定位与容器不在时的短路判定；经 rcoder 访问必填、白名单校验，容器侧不读取）"),
+        UserappTaskScopeQuery,
         ("task_id" = String, Path, description = "任务ID"),
     ),
     description = r#"
@@ -177,8 +188,10 @@ pub(crate) async fn build_workspace(
 pub(crate) async fn get_task(
     State(state): State<UserAppState>,
     AppPath(task_id): AppPath<String>,
+    AppQuery(scope): AppQuery<UserappTaskScopeQuery>,
 ) -> UserAppReply<BuildTaskSnapshot> {
     let result = async {
+        validate_task_scope(&scope, &task_id)?;
         let task = state
             .build_tasks
             .get(&task_id)
@@ -199,7 +212,6 @@ pub(crate) async fn get_task(
     get,
     path = "/tasks/{task_id}/logs",
     params(
-        ("app_id" = String, Query, description = "构建链定位 app_id（**rcoder 转发层消费**：目标开发容器定位与容器不在时的短路判定；经 rcoder 访问必填、白名单校验，容器侧不读取）"),
         ("task_id" = String, Path, description = "任务ID"),
         TaskLogsQuery,
     ),
@@ -212,6 +224,13 @@ pub(crate) async fn get_task_logs(
     AppQuery(q): AppQuery<TaskLogsQuery>,
 ) -> UserAppReply<ReadDevLogResult> {
     let result = async {
+        validate_task_scope(
+            &UserappTaskScopeQuery {
+                app_id: q.app_id.clone(),
+                user_id: q.user_id.clone(),
+            },
+            &task_id,
+        )?;
         let task = state
             .build_tasks
             .get(&task_id)
@@ -251,7 +270,6 @@ pub(crate) async fn get_task_logs(
     get,
     path = "/tasks/{task_id}/logs/stream",
     params(
-        ("app_id" = String, Query, description = "构建链定位 app_id（**rcoder 转发层消费**：目标开发容器定位与容器不在时的短路判定；经 rcoder 访问必填、白名单校验，容器侧不读取）"),
         ("task_id" = String, Path, description = "任务ID"),
         ("Last-Event-ID" = Option<String>, Header, description = "SSE 规范续传头（优先）：断线重连时填最后收到事件的 id（即上一条消息的 seq），服务端从该 id 之后回放。浏览器 EventSource 自动重连会自动携带，无需手动处理。与 from_seq 同时存在时以本头为准。"),
         StreamQuery,
@@ -272,8 +290,17 @@ pub(crate) async fn stream_task_logs(
     AppQuery(q): AppQuery<StreamQuery>,
     headers: HeaderMap,
 ) -> Response {
-    // 错误路径 (task 不存在) 也走 HttpResult shape, 与同组 JSON 接口一致
+    // 错误路径 (校验失败/task 不存在) 也走 HttpResult shape, 与同组 JSON 接口一致
     // (成功路径是 SSE 流, 豁免 HttpResult)
+    if let Err(e) = validate_task_scope(
+        &UserappTaskScopeQuery {
+            app_id: q.app_id.clone(),
+            user_id: q.user_id.clone(),
+        },
+        &task_id,
+    ) {
+        return UserAppReply::<()>::Err(e).into_response();
+    }
     let Some(task) = state.build_tasks.get(&task_id).await else {
         return UserAppReply::<()>::Err(AppError::resource(format!(
             "build task not found: {task_id}"
@@ -332,7 +359,7 @@ pub(crate) async fn stream_task_logs(
     post,
     path = "/tasks/{task_id}/cancel",
     params(
-        ("app_id" = String, Query, description = "构建链定位 app_id（**rcoder 转发层消费**：目标开发容器定位与容器不在时的短路判定；经 rcoder 访问必填、白名单校验，容器侧不读取）"),
+        UserappTaskScopeQuery,
         ("task_id" = String, Path, description = "任务ID"),
     ),
     responses((status = 200, body = HttpResult<CancelData>, description = "取消结果。双重取消：软取消（置 flag）+ kill 编译进程组；已到终态的任务返回 already_terminal=true 幂等成功。取消成功后任务流发 cancelled 终态事件（SSE）")),
@@ -341,8 +368,10 @@ pub(crate) async fn stream_task_logs(
 pub(crate) async fn cancel_task(
     State(state): State<UserAppState>,
     AppPath(task_id): AppPath<String>,
+    AppQuery(scope): AppQuery<UserappTaskScopeQuery>,
 ) -> UserAppReply<CancelData> {
     let result = async {
+        validate_task_scope(&scope, &task_id)?;
         let task = state
             .build_tasks
             .get(&task_id)
