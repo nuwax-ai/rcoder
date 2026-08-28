@@ -54,6 +54,9 @@ RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 # 安装 codex-acp（Codex ACP 代理）
 RUN echo "Cache bust: ${CACHEBUST}" && npm install -g @zed-industries/codex-acp
 
+# 安装 template-cli（userApp workspace 模板脚手架；生产 build_config 同源）
+RUN echo "Cache bust: ${CACHEBUST}" && npm i -g @nuwax-ai/template-cli@latest --registry https://registry.npmjs.org
+
 # 根据codex-acp改造的codex cli,使用cli是: nuwax-codex-acp
 # 使用官方 npm 源，国内镜像可能未同步
 RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest --registry=https://registry.npmjs.org/
