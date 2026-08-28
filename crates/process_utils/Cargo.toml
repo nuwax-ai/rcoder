@@ -12,4 +12,3 @@ workspace = true
 nix = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
-libc = { workspace = true }

@@ -66,8 +66,15 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 # unix 信号已通过 process_utils 封装（仅 unix 启用，不污染 windows 构建）
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 tempfile = "3"
 # idle/api 路由行为测试：axum Router oneshot（axum 不 re-export ServiceExt）
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+[workspace.lints]
+# 与主 workspace 同款红线：生产代码禁 unsafe；cfg(test) 的 env 变异豁免见各测试模块
+rust.unsafe_code = "deny"

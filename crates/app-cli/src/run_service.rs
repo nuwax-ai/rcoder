@@ -57,6 +57,7 @@ fn exec_spec(spec: &ServiceSpecFile, log_dir: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;

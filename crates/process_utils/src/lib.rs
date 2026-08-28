@@ -83,20 +83,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// spawn 一个 sleep 子进程作为进程组组长, 返回其 pid。
-    /// pre_exec 里 setpgid(0,0) 是 std `Command::process_group(0)` 的等价实现
-    /// (后者在当前工具链不可用); FFI 调用是这里使用 unsafe 的明确理由。
     fn spawn_sleeper() -> std::process::Child {
         use std::os::unix::process::CommandExt;
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        // setpgid(0,0) 的 std 等价（Rust 1.64 stable）：子进程自成进程组
+        cmd.process_group(0);
         cmd.spawn().expect("spawn sleep")
     }
 

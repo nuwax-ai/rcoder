@@ -23,6 +23,10 @@ default-members = [
 rustdoc.unescaped_backticks = "warn"
 rustdoc.redundant_explicit_links = "warn"
 rust.unused_lifetimes = "warn"
+# 项目红线「禁止 unsafe」编译器化：生产代码新增 unsafe 直接报错。deny 而非
+# forbid 是为给 cfg(test) 的 edition-2024 env 变异（set_var/remove_var 在测试
+# 内是 unsafe）留 #[allow(unsafe_code)] 豁免通道；豁免仅限测试模块。
+rust.unsafe_code = "deny"
 # 防回归: 多余路径限定 (如 `crate::foo::Bar` 而 `Bar` 已在作用域内) 降低可读性。
 # 存量已清零, 升级 deny 拦截新增; prost 生成代码在 shared_types_grpc 内局部 allow。
 rust.unused_qualifications = "deny"

@@ -115,6 +115,7 @@ impl ServiceSpecFile {
 pub(crate) static SPEC_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     // APP_CLI_SPEC_DIR 经 std::env::set_var 注入——多个文件系统测试并行会互抢，

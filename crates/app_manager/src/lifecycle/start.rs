@@ -465,9 +465,9 @@ mod tests {
         assert!(validate_release_id_fs_safe("rel-abc_1.2").is_ok());
     }
 
+    // 豁免仅限测试 helper：edition-2024 env 变异是 unsafe；同值重复 set 对并行测试无害
+    #[allow(unsafe_code)]
     fn with_runtime_image_env() {
-        // ensure_app_runtime 读 env 决定默认镜像；同值重复 set 对并行测试无害
-        //（edition 2024 set_var 为 unsafe：测试进程单线程 env 写入，无并发读取者）
         unsafe {
             std::env::set_var(
                 "RCODER_RUNTIME_IMAGE_DIGEST",
