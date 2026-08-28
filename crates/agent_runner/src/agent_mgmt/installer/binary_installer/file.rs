@@ -16,11 +16,7 @@
 //! - Path traversal and zip bomb protections live in `archive_installer`
 //! - Non-archive files (ELF / PE / script) are rejected with `UnsupportedType`
 
-use std::pin::Pin;
-
-use futures_util::Stream;
-use sha2::Digest;
-use shared_types_grpc::{InstallAgentRequest, InstallAgentResponse};
+use shared_types_grpc::InstallAgentResponse;
 use tracing::{debug, info, warn};
 
 use super::bytes::InstallFileParams;
@@ -28,10 +24,6 @@ use super::staging::{_install_from_staging, StagingInstallParams, detect_file_ty
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
 use crate::agent_mgmt::path_manager::PathManager;
 use crate::agent_mgmt::registry::AgentRegistry;
-
-/// Server-side stream type (matches `tonic::Streaming<InstallAgentRequest>`).
-pub type IncomingStream =
-    Pin<Box<dyn Stream<Item = Result<InstallAgentRequest, tonic::Status>> + Send>>;
 
 /// 文件路径安装入口（避免全量读入内存）。
 ///

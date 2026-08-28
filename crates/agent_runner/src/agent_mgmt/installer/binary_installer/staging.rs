@@ -17,22 +17,15 @@
 //! - Non-archive files (ELF / PE / script) are rejected with `UnsupportedType`
 
 use std::path::Path;
-use std::pin::Pin;
 
-use futures_util::Stream;
-use sha2::Digest;
 use shared_types::InstallType;
-use shared_types_grpc::{InstallAgentRequest, InstallAgentResponse};
+use shared_types_grpc::InstallAgentResponse;
 use tracing::{debug, info, warn};
 
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
 use crate::agent_mgmt::installer::AgentManifest;
 use crate::agent_mgmt::installer::archive_installer;
 use crate::agent_mgmt::registry::AgentRegistry;
-
-/// Server-side stream type (matches `tonic::Streaming<InstallAgentRequest>`).
-pub type IncomingStream =
-    Pin<Box<dyn Stream<Item = Result<InstallAgentRequest, tonic::Status>> + Send>>;
 
 /// staging 安装参数
 pub(super) struct StagingInstallParams<'a> {

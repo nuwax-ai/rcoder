@@ -16,10 +16,7 @@ pub use topology::{collect_topology_issues, validate_topology};
 #[cfg(test)]
 mod tests {
     use super::project::is_dns1123_label;
-    use crate::{
-        DiscoveredProject, LogFormat, ManifestError, ProjectKind, ProjectManifest, SCHEMA_VERSION,
-        WorkspaceManifest,
-    };
+    use crate::{DiscoveredProject, ManifestError, ProjectKind, ProjectManifest};
 
     use std::collections::BTreeMap;
 

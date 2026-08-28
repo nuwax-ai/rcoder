@@ -20,7 +20,6 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 use futures_util::Stream;
-use sha2::Digest;
 use shared_types::InstallType;
 use shared_types_grpc::{InstallAgentRequest, InstallAgentResponse};
 

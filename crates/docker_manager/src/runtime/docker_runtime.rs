@@ -322,10 +322,6 @@ impl AgentContainerRuntime for DockerRuntime {
     }
 }
 
-/// Docker 不实现 WorkspaceRuntime 的 `resolve_*` / `ensure_workspace`
-/// (file-server 经 trait upcast 拿到 DockerRuntime 时这些方法命中 trait 默认 Ok(None)/Ok(()),
-/// 走 LocalWorkspaceResolver 降级 —— 符合 Docker 模式设计)。
-
 // UserAppDeploymentRuntime 完整实现拆至 docker_app_runtime.rs（与 K8s 侧
 // k8s_app_*.rs 文件群对称——Docker 语义映射的 app 域自成一档）。
 impl DockerRuntime {
