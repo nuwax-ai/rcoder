@@ -181,7 +181,6 @@ fn default_tail_lines() -> usize {
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct UserappInstallBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）

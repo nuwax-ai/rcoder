@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::Request;
 use axum::http::Uri;
 use axum::middleware::Next;
@@ -239,6 +240,25 @@ async fn fold_env_forward(
     };
     *req.uri_mut() = rebuilt;
 
+    // 门面注入：body 的 app_id 由 path 强制对齐——调用方无需在 body 重复传
+    // app_id，且根治 body 与 path 不一致时容器按 body 操作错对象的隐患。
+    // 三个门面目标均为小体积 JSON 契约（<1MB），缓冲语义在此让位于正确性。
+    let (mut parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, JSON_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(e) => {
+            return HttpResultError::bad_request(format!("read request body: {e}")).into_response();
+        }
+    };
+    let injected = match inject_path_app_id(&bytes, &app_id) {
+        Ok(b) => b,
+        Err(e) => return HttpResultError::bad_request(e).into_response(),
+    };
+    if let Ok(v) = axum::http::HeaderValue::from_str(&injected.len().to_string()) {
+        parts.headers.insert(axum::http::header::CONTENT_LENGTH, v);
+    }
+    let req = Request::from_parts(parts, Body::from(injected));
+
     info!(
         "[USERAPP_FORWARD] {} {} -> dev container (folded app_stage, app_id={app_id})",
         req.method(),
@@ -247,6 +267,52 @@ async fn fold_env_forward(
     // 门面 body 携 user_id 但流式不解析（multipart 族不可解）——owner 走
     // metadata 链（create-workspace 前置注册）
     forward_to_dev(&state, &app_id, req, None).await
+}
+
+/// 门面 JSON 体积上限（detect/confirm/install 均为小表单）
+const JSON_BODY_LIMIT: usize = 1024 * 1024;
+
+/// body `app_id` 由门面 path 注入（userApp 全域统一 snake_case 字段风格，
+/// 单键 `app_id`；调用方无需重复传递，path 与 body 不一致的歧义从根上消除）。
+/// 非 JSON body 拒绝。
+fn inject_path_app_id(body: &[u8], app_id: &str) -> Result<Vec<u8>, String> {
+    let mut v: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| format!("request body must be a JSON object: {e}"))?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| "request body must be a JSON object".to_string())?;
+    obj.insert(
+        "app_id".to_string(),
+        serde_json::Value::String(app_id.to_string()),
+    );
+    serde_json::to_vec(&v).map_err(|e| format!("re-serialize body: {e}"))
+}
+
+#[cfg(test)]
+mod inject_tests {
+    use super::inject_path_app_id;
+
+    #[test]
+    fn injects_when_absent() {
+        let out = inject_path_app_id(br#"{"user_id":"u1"}"#, "app-a").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["app_id"], "app-a");
+        assert_eq!(v["user_id"], "u1");
+    }
+
+    #[test]
+    fn overrides_mismatched_body_value() {
+        // body 带了不同的 app_id（历史遗留形态）→ 一律以 path 为准
+        let out = inject_path_app_id(br#"{"app_id":"app-evil"}"#, "app-a").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["app_id"], "app-a");
+    }
+
+    #[test]
+    fn non_json_body_rejected() {
+        assert!(inject_path_app_id(b"not json", "app-a").is_err());
+        assert!(inject_path_app_id(b"[1,2]", "app-a").is_err());
+    }
 }
 
 /// 以 `target_path` 替换原 URI 的 path 部分、拼接原 query，重建 [`Uri`]。
@@ -268,7 +334,7 @@ fn rebuild_uri_with(uri: &Uri, target_path: &'static str) -> Result<Uri, String>
     ),
     request_body(
         content = file_server_userapp::models::ImportProjectBody,
-        description = "同容器平铺契约（snake_case：app_id / user_id / project_dir）"
+        description = "同容器平铺契约（snake_case：user_id / project_dir；**`app_id` 无需传**：门面以 path 中的 app_id 强制注入对齐（传了也以 path 为准）。）"
     ),
     description = r#"
 分析开发容器 workspace 的文件结构，推断项目类型（Node/Python/Java…）与推荐配置，
@@ -301,7 +367,7 @@ pub(crate) async fn flat_dev_projects_detect(
     ),
     request_body(
         content = file_server_userapp::models::ImportProjectBody,
-        description = "detect 结果的用户修正确认 + 项目基础信息（snake_case 同容器平铺契约）"
+        description = "detect 结果的用户修正确认 + 项目基础信息（snake_case 同容器平铺契约；**`app_id` 无需传**：门面以 path 中的 app_id 强制注入对齐（传了也以 path 为准）。）"
     ),
     description = r#"
 用户在 detect 推断基础上选择/修正项目类型后提交确认（幂等附带 git init 双开关）。
@@ -331,7 +397,7 @@ pub(crate) async fn flat_dev_projects_confirm(
     ),
     request_body(
         content = file_server_userapp::models::UserappInstallBody,
-        description = "安装参数（**camelCase**：`appId` / `userId` / `programmingLanguage`——15 族镜像接口的永久 TS 契约，与 detect/confirm 的 snake_case 并存是既有事实）"
+        description = "安装参数（snake_case：user_id / programming_language；**`app_id` 无需传**：门面以 path 中的 app_id 强制注入对齐（传了也以 path 为准）。）"
     ),
     description = r#"
 将项目安装进开发容器工作区（依赖安装等初始化动作的统一入口）。**仅 dev**；
