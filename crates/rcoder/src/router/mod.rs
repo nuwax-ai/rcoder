@@ -1,12 +1,12 @@
 //! Axum 主路由装配（目录化拆分）。
 //!
 //! [`create_router`] 只做「构建各域 → merge → 挂中间件」的装配骨架：
-//! - 域路由分属 [`api`]（chat/agent 会话）、[`computer`]（Computer Agent Runner
-//!   与 pod 管理）、[`userapp_proxy`]（Pingora 状态 + userApp 工具族文档接口）、
-//!   [`devcomputer`]（调试委托）、[`agent_mgmt`]（agent 安装管理）
+//! - 域路由分属 `api`（chat/agent 会话）、`computer`（Computer Agent Runner
+//!   与 pod 管理）、`userapp_proxy`（Pingora 状态 + userApp 工具族文档接口）、
+//!   `devcomputer`（调试委托）、`agent_mgmt`（agent 安装管理）
 //! - app_manager / userapp_forward / file-server-admin 为外部 crate 或
 //!   crate 级模块的路由，装配在本文件
-//! - 全局中间件与安全头在 [`layers`]（层序敏感）；/metrics 在 [`metrics`]
+//! - 全局中间件与安全头在 `layers`（层序敏感）；/metrics 在 `metrics`
 //!
 //! // AppState/SessionInfo 拆至 app_state.rs（状态+会话注册表自成一档）；
 //! // re-export 保持 crate::router::AppState 既有引用稳定。
