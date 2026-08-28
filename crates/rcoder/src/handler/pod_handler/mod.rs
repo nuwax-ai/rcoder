@@ -27,6 +27,7 @@ use shared_types::{
 
 // pod_handler 目录化：类型/辅助/各 handler 按职责拆分（函数体原样搬迁，未做分解）
 mod ensure;
+mod ensure_flow;
 mod helpers;
 mod keepalive;
 mod queries;

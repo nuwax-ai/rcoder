@@ -349,3 +349,63 @@ pub(super) fn parse_app_target(
 pub(super) fn invalid_app_target_response<T>(locale: &str, e: &str) -> HttpResult<T> {
     HttpResult::error_with_message(shared_types::error_codes::ERR_VALIDATION, locale, e)
 }
+
+/// 注册 VNC backend + 更新存储记录 + 构建成功响应。
+///
+/// pod_ensure 的并发等待命中分支与主流程尾部共用（两处逐字同构提取）：
+/// 容器就绪后无论新建、复用还是由并发请求代建，注册/记录/响应三步一致。
+pub(super) fn persist_and_respond(
+    state: &AppState,
+    request: &EnsurePodRequest,
+    service_type: &ServiceType,
+    info: &ContainerBasicInfo,
+    created: bool,
+    message: String,
+) -> Result<HttpResult<EnsurePodResponse>, AppError> {
+    // 容器已就绪(无论新建还是复用)，注册 VNC backend 到 pingora
+    register_vnc_backend(state, &request.user_id, info, service_type);
+
+    // 更新存储中的容器信息（用于后续保活）；无论容器是新建还是已存在，
+    // 都要确保记录是最新的
+    let project_info = if let Some(existing) = state.get_project(&request.project_id) {
+        // 如果已存在记录，更新容器信息
+        let mut pinfo = (*existing).clone();
+        pinfo.set_container(Some(info.clone()));
+        pinfo
+    } else {
+        // 如果不存在记录，创建新记录
+        let mut pinfo = ProjectAndContainerInfo::new(request.project_id.clone());
+        // 入口尽可能记录完整信息（user_id 对两类业务都记录）；
+        // 是否参与 user_id 查找由 service_type 在使用方区分（见 adapter 索引门控与 find_projects_by_user_id）。
+        pinfo.set_user_id(Some(request.user_id.clone()));
+        pinfo.set_pod_id(request.pod_id.clone());
+        pinfo.set_service_type(Some(service_type.clone()));
+        pinfo.set_scope(
+            request.tenant_id.clone(),
+            request.space_id.clone(),
+            request.isolation_type.clone(),
+        );
+        pinfo.set_container(Some(info.clone()));
+        pinfo
+    };
+
+    state
+        .insert_project(request.project_id.clone(), Arc::new(project_info))
+        .map_err(|e| {
+            tracing::error!("[STORAGE] insert_project failed: {}", e);
+            e
+        })?;
+    debug!(
+        "[POD_ENSURE] project record updated: project_id={}, user_id={}, container_id={}",
+        request.project_id, request.user_id, info.container_id
+    );
+
+    Ok(HttpResult::success(EnsurePodResponse {
+        created,
+        container_info: PodContainerInfo {
+            container_id: info.container_id.clone(),
+            status: info.status.clone(),
+        },
+        message,
+    }))
+}
