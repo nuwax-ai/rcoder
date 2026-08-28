@@ -302,6 +302,10 @@ async fn append_run_log_tail(err: AppError, temp_log: &Path) -> AppError {
     }
     let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<&str> = text.lines().collect();
+    // 非零偏移=窗口起点可能落在行中间，首行是残行——丢弃防半行误导排查
+    if start > 0 && lines.len() > 1 {
+        lines.remove(0);
+    }
     let take = lines.len().saturating_sub(TAIL_LINES);
     lines.drain(..take);
     if lines.is_empty() {
