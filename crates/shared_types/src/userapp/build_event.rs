@@ -15,13 +15,13 @@ use serde::{Deserialize, Serialize};
 pub enum BuildProgressEvent {
     /// 进入新阶段
     Stage { stage: String },
-    /// 开始编译某服务
+    /// 开始编译某服务（`service` 为 service_id 稳定身份，非 `[project].name` 显示名）
     Building { service: String },
-    /// 某服务编译成功
+    /// 某服务编译成功（`service` 为 service_id）
     BuildOk { service: String },
-    /// 某服务编译失败
+    /// 某服务编译失败（`service` 为 service_id；`error` 含服务名前缀与输出尾部）
     BuildFail { service: String, error: String },
-    /// 一行日志(实时 tail)
+    /// 一行日志(实时 tail；`service` 为 service_id)
     Log { service: String, line: String },
     /// 任务完成(build 产 release_id + 包摘要)。`artifact_path` 为相对 workspace
     /// 根的产物路径（`builds/workspace-package-{release_id}.zip`）——信息字段，

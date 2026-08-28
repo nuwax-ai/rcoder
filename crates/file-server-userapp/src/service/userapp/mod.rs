@@ -130,23 +130,25 @@ pub async fn build_workspace_package(
                 return Err(AppError::business("build cancelled by user"));
             }
             p.emit(BuildProgressEvent::Building {
-                service: proj.name().to_string(),
+                service: proj.service_id().to_string(),
             })
             .await;
         }
-        let log_dir = ws.join("logs").join(&proj.dir);
+        // 构建日志按 service_id 归档（稳定身份：改目录名日志归档连续，且与
+        // 运行时 /app/logs/<service_id> 及 tasks logs ?service= 端点同轴）
+        let log_dir = ws.join("logs").join(proj.service_id());
         // path 安全校验 + 拼接（防 `../` 穿越 workspace）
         let proj_dir = file_server::path_safety::ensure_within(&ws, &proj.dir).map_err(|_| {
             AppError::validation(format!(
-                "project path escapes workspace: {} (=\"{}\")",
+                "project path escapes workspace: {} (service_id={})",
                 proj.dir,
-                proj.name()
+                proj.service_id()
             ))
         })?;
         if !proj_dir.is_dir() {
             return Err(AppError::resource(format!(
-                "project dir not found: {} (path={})",
-                proj.name(),
+                "project dir not found: service_id={} (path={})",
+                proj.service_id(),
                 proj.dir
             )));
         }
@@ -173,16 +175,16 @@ pub async fn build_workspace_package(
         let artifact = match build_result {
             Ok(a) => a,
             Err(e) => {
-                // 服务名前缀：多服务 workspace 串行构建，快照 error 必须自明是
+                // service_id 前缀：多服务 workspace 串行构建，快照 error 必须自明是
                 // 哪个服务挂的（源错误已嵌该服务构建输出的尾部日志）。
-                let wrapped = AppError::system(format!("{} build failed: {e}", proj.name()));
+                let wrapped = AppError::system(format!("{} build failed: {e}", proj.service_id()));
                 // cancel(kill 进程组)导致的失败不 emit（终态 Cancelled 由 cancel handler 置）；
                 // 否则 emit 服务级 BuildFail（任务级 Failed 由顶层 start_*_task 统一 emit）。
                 if let Some(p) = progress
                     && !p.is_cancelled()
                 {
                     p.emit(BuildProgressEvent::BuildFail {
-                        service: proj.name().to_string(),
+                        service: proj.service_id().to_string(),
                         error: wrapped.to_string(),
                     })
                     .await;
@@ -192,7 +194,7 @@ pub async fn build_workspace_package(
         };
         if let Some(p) = progress {
             p.emit(BuildProgressEvent::BuildOk {
-                service: proj.name().to_string(),
+                service: proj.service_id().to_string(),
             })
             .await;
         }

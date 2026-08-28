@@ -215,7 +215,7 @@ pub(crate) async fn get_task(
         ("task_id" = String, Path, description = "任务ID"),
         TaskLogsQuery,
     ),
-    responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "构建日志分页（历史日志文件读取，非 SSE）。query：service=子项目目录名（留空=workspace 根日志）；start_index=起始行号（1-based，用上批响应的 total_lines 翻页）。响应 data：logs[{line,content}]（行号+内容）、total_lines（总行数）、start_index、log_file_name。日志按天滚动（dev-YYYY-MM-DD.log），只读当前文件。")),
+    responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "构建日志分页（历史日志文件读取，非 SSE）。query：service=子项目 service_id（构建日志按 service_id 归档，常规场景与目录名同名；留空=workspace 根日志）；start_index=起始行号（1-based，用上批响应的 total_lines 翻页）。响应 data：logs[{line,content}]（行号+内容）、total_lines（总行数）、start_index、log_file_name。日志按天滚动（dev-YYYY-MM-DD.log），只读当前文件。")),
     tag = "UserApp · dev · 构建任务"
 )]
 pub(crate) async fn get_task_logs(

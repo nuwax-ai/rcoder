@@ -40,6 +40,8 @@ pub struct BuildTaskSnapshot {
     pub kind: BuildTaskKind,
     pub status: BuildTaskStatus,
     pub stage: Option<String>,
+    /// 当前/失败中断的子项目 service_id（构建日志按 service_id 归档，
+    /// 失败排查用 `tasks/{id}/logs?service=` 同键取日志）
     pub current_service: Option<String>,
     pub release_id: Option<String>,
     pub sha256: Option<String>,

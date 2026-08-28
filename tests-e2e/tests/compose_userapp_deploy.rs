@@ -612,7 +612,7 @@ async fn deploy_and_verify_traffic(
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
-    for (name, path) in probes {
+    for (name, _) in probes {
         let seen = first_seen.iter().find(|(n, _)| n == name);
         report.assert_hard(
             &format!("流量七路[{name}]就绪"),
@@ -625,7 +625,6 @@ async fn deploy_and_verify_traffic(
                 ),
             },
         );
-        let _ = path;
     }
 }
 
@@ -710,13 +709,10 @@ async fn userapp_deploy_full_chain() {
     }
 
     // ② 模板初始化 + 落盘断言 + java manifest 规范化
-    let mut template_ok = false;
     if init_full_template(&env, &report, &app, user).await {
         normalize_java_multiline_pattern(&env, &report, &app, user).await;
         assert_template_files(&env, &report, &app, user).await;
-        template_ok = true;
     }
-    let _ = template_ok;
 
     // ③ 构建 + ④ 取包校验
     if let Some((release_id, sha256)) = build_to_completion(&env, &report, &app, user).await
