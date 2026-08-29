@@ -222,7 +222,8 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
         std::process::id() % 1000
     );
 
-    // ① 不存在 + 缺 user_id → 400（数据卷分区依赖）
+    // ① 不存在 + 缺 user_id → 422（serde 提取层拒缺必填字段——user_id 必填化
+    //    后 Json 反序列化先于 garde 校验，axum 裸 422；带提示 missing field）
     let (s1, b1) = post_json(
         env,
         &format!("/api/v1/userapp/app-e2e-nokey-{suffix}/start"),
@@ -230,8 +231,8 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
     )
     .await;
     report.assert_hard(
-        "start 无 url 创建空容器缺 user_id → 400",
-        s1.as_u16() == 400,
+        "start 无 url 缺 user_id → 422（必填字段提取层拒绝）",
+        s1.as_u16() == 422,
         format!("HTTP {s1}, {}", trunc(&b1, 100)),
     );
 
@@ -267,11 +268,11 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
         );
     }
 
-    // ③ restart 无 url 对不存在 app → 404（重启语义不创建）
+    // ③ restart 无 url 对不存在 app → 404（重启语义不创建；user_id 必填带到业务层）
     let (s3, _) = post_json(
         env,
         &format!("/api/v1/userapp/app-e2e-norestart-{suffix}/restart"),
-        json!({}),
+        json!({"user_id": "e2e-user"}),
     )
     .await;
     report.assert_hard(
@@ -361,7 +362,11 @@ async fn test_env_scoped_files_and_storage(env: &Env, report: &JsonlReporter) {
     );
 
     // storage(dev)：workspace 已建 → exists=true
-    let (st_s, st_b) = get_json(env, &format!("/api/v1/userapp/{ident}/dev/storage")).await;
+    let (st_s, st_b) = get_json(
+        env,
+        &format!("/api/v1/userapp/{ident}/dev/storage?user_id=e2e-user"),
+    )
+    .await;
     report.assert_hard(
         "storage(dev) exists=true（workspace 就绪）",
         st_s.is_success() && http_ok(&st_b) && st_b["data"]["exists"] == true,
@@ -372,7 +377,7 @@ async fn test_env_scoped_files_and_storage(env: &Env, report: &JsonlReporter) {
     let (q_s, q_b) = post_json(
         env,
         "/api/v1/userapp/storage/dev/query",
-        json!({"page": 1, "page_size": 50, "filters": {"app_ids": [ident]}}),
+        json!({"user_id": "e2e-user", "page": 1, "page_size": 50, "filters": {"app_ids": [ident]}}),
     )
     .await;
     report.assert_hard(
@@ -407,7 +412,11 @@ async fn test_env_scoped_files_and_storage(env: &Env, report: &JsonlReporter) {
     );
 
     // 回收后复查：exists=false
-    let (re_s, re_b) = get_json(env, &format!("/api/v1/userapp/{ident}/dev/storage")).await;
+    let (re_s, re_b) = get_json(
+        env,
+        &format!("/api/v1/userapp/{ident}/dev/storage?user_id=e2e-user"),
+    )
+    .await;
     report.assert_hard(
         "destroy 后 storage(dev) exists=false",
         re_s.is_success() && http_ok(&re_b) && re_b["data"]["exists"] == false,

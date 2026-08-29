@@ -228,9 +228,9 @@ docker_config:
           RCODER_PINGAP_COMMIT: "local-development"
           RCODER_RUNTIME_IMAGE_DIGEST: "sha256:local-development"
         resource_limits:
-          memory_limit: 2147483648 # 2GB
+          memory_limit: 8589934592 # 8GB（rust/maven 全量冷编内存峰值超 2G 会 swap 颠簸卡死——e2e 全链实测）
           cpu_limit: 2.0
-          swap_limit: 4294963648 # 4GB
+          swap_limit: 17179869184 # 16GB（docker 约束 memoryswap 必须 ≥ memory）
         work_dir: "/app"
         network_mode: "bridge"
         mounts: []
