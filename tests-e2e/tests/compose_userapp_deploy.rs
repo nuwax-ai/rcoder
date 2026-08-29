@@ -211,114 +211,6 @@ async fn init_full_template(env: &Env, report: &JsonlReporter, app: &str, user: 
     ok
 }
 
-/// npm @nuwax-ai/template-cli@latest 已知渲染 bug 的临时规范化（两处根因
-/// 均已在模板仓修复，待 npm 发版后本函数可删）：① multiline_start_pattern
-/// 正则以 TOML basic string 裸输出（\d 非法转义，构建解析即失败；
-/// backend-java 与 backend-python 两处，cli/src/manifest.ts 已修）；② next
-/// 模板 lockfile 只录 darwin 平台 optional 二进制 + 构建脚本静态 import
-/// 依赖（lockfile 已重新生成全平台、scripts/build-standalone.mjs 已改动态
-/// import）。
-async fn normalize_java_multiline_pattern(
-    env: &Env,
-    report: &JsonlReporter,
-    app: &str,
-    user: &str,
-) -> bool {
-    // ① multiline 正则 TOML 转义修复（backend-java/backend-python）
-    let command = r#"find . -maxdepth 2 -name project.manifest.toml -exec sed -i 's/^multiline_start_pattern = .*/multiline_start_pattern = "^\\\\d{4}-\\\\d{2}-\\\\d{2}"/' {} +"#;
-    let sed_ok = exec_and_report(env, report, app, user, command, 60, "multiline 转义规范化").await;
-    // ② npm @latest 包内 next 模板在 linux 容器内构建必挂，三个因素叠加：
-    //    a) lockfile 只录 darwin 平台 optional 二进制（lightningcss），npm ci 严格
-    //       按 lockfile 且先清空 node_modules → 平台二进制缺席
-    //    b) 构建脚本静态 import esbuild/archiver，解析先于脚本内安装
-    //    c) 执行链注入 NODE_ENV=development，Turbopack prerender 崩（useContext
-    //       null——NODE_ENV=production 实验证实可建）
-    //    根因均已在模板仓修复（全平台 lockfile 重生成 / 动态 import / build 调用
-    //    钉 NODE_ENV=production），待 npm 发版；本地兜底（一次 execute-command）：
-    //    干净树 npm install（官方源避 npmmirror 平台 tarball 静默跳过，同时解决
-    //    静态 import）+ 脚本内 npm ci 改 npm install（不清空）+ base64 补丁给
-    //    npm run build 钉 production（node 脚本补丁走 base64 避三层引号转义）。
-    let command = "cd userapp-next \
-        && printf 'registry=https://registry.npmjs.org\\n' > .npmrc \
-        && rm -rf node_modules package-lock.json \
-        && npm install --no-audit --no-fund \
-        && sed -i \"s/execSync('npm ci'/execSync('npm install --no-audit --no-fund'/\" scripts/build-standalone.mjs \
-        && echo Y29uc3QgZnMgPSByZXF1aXJlKCdmcycpOwpjb25zdCBwID0gJ3NjcmlwdHMvYnVpbGQtc3RhbmRhbG9uZS5tanMnOwpsZXQgcyA9IGZzLnJlYWRGaWxlU3luYyhwLCAndXRmOCcpOwpjb25zdCBmcm9tID0gImV4ZWNTeW5jKCducG0gcnVuIGJ1aWxkJywgeyBzdGRpbzogJ2luaGVyaXQnLCBjd2Q6IFJPT1QgfSk7IjsKY29uc3QgdG8gPSAiZXhlY1N5bmMoJ25wbSBydW4gYnVpbGQnLCB7IHN0ZGlvOiAnaW5oZXJpdCcsIGN3ZDogUk9PVCwgZW52OiB7IC4uLnByb2Nlc3MuZW52LCBOT0RFX0VOVjogJ3Byb2R1Y3Rpb24nIH0gfSk7IjsKaWYgKCFzLmluY2x1ZGVzKGZyb20pKSB7IGNvbnNvbGUuZXJyb3IoJ3BhdGNoIGFuY2hvciBub3QgZm91bmQnKTsgcHJvY2Vzcy5leGl0KDEpOyB9CmZzLndyaXRlRmlsZVN5bmMocCwgcy5yZXBsYWNlKGZyb20sIHRvKSk7CmNvbnNvbGUubG9nKCdwYXRjaGVkJyk7Cg== | base64 -d > /tmp/patch-nodenv.cjs && node /tmp/patch-nodenv.cjs";
-    let npm_ok = exec_and_report(
-        env,
-        report,
-        app,
-        user,
-        command,
-        600,
-        "next 依赖重装+构建脚本修正",
-    )
-    .await;
-    // ③ python 模板 deps 与运行时 ABI 失配：builder python 3.11 pip 默认装
-    //    cpython-311 轮子，app-runtime 容器 python 3.13 加载报 ModuleNotFoundError:
-    //    pydantic_core._pydantic_core，服务 spawn 失败致整 workspace 编排中止。
-    //    根因已在模板仓钉 --python-version 3.13（对齐 java 模板钉 JDK25 的先例），
-    //    待 npm 发版；本地兜底 = 对渲染脚本打同款 sed。
-    let command = "sed -i 's|pip3 install -t deps/ |pip3 install -t deps/ --python-version 3.13 --only-binary=:all: |' backend-python/scripts/build-standalone.sh";
-    let py_ok = exec_and_report(
-        env,
-        report,
-        app,
-        user,
-        command,
-        60,
-        "python 运行时 ABI 修正",
-    )
-    .await;
-    sed_ok && npm_ok && py_ok
-}
-
-/// execute-command 执行并记 diagnostic（临时规范化步骤共用）。
-async fn exec_and_report(
-    env: &Env,
-    report: &JsonlReporter,
-    app: &str,
-    user: &str,
-    command: &str,
-    timeout_secs: u64,
-    label: &str,
-) -> bool {
-    let resp = env
-        .http
-        .post(format!("{}/api/v1/userapp/execute-command", env.rcoder))
-        .timeout(Duration::from_secs(timeout_secs))
-        .header("X-App-Id", app)
-        .json(&json!({"app_id": app, "user_id": user, "command": command}))
-        .send()
-        .await
-        .expect("exec post");
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or(Value::Null);
-    let ok = status.is_success()
-        && body["success"].as_bool() == Some(true)
-        && body["exit_code"].as_i64() == Some(0);
-    report.diagnostic(
-        &format!("{label}（template-cli@latest 渲染 bug 临时修复）"),
-        if ok { "ok" } else { "failed" },
-        &format!("HTTP {status}, stderr 尾部: {}", stderr_tail(&body)),
-    );
-    ok
-}
-
-/// execute-command 响应 stderr 的末尾片段（排查用）。
-fn stderr_tail(body: &Value) -> String {
-    body["stderr"]
-        .as_str()
-        .unwrap_or("")
-        .chars()
-        .rev()
-        .take(200)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect()
-}
-
 /// 模板落盘断言：根层 workspace.manifest.toml + 7 个子项目目录；逐子目录
 /// spot-check project.manifest.toml（get-file-list 镜像族，snake query）。
 async fn assert_template_files(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
@@ -708,9 +600,10 @@ async fn userapp_deploy_full_chain() {
         return;
     }
 
-    // ② 模板初始化 + 落盘断言 + java manifest 规范化
+    // ② 模板初始化 + 落盘断言（template-cli ≥0.1.1 已含全部模板修复，
+    //    历史兜底 normalize 三步随之退役——曾覆盖：multiline TOML 转义、
+    //    next lockfile 平台二进制/静态 import/NODE_ENV、python ABI 3.13）
     if init_full_template(&env, &report, &app, user).await {
-        normalize_java_multiline_pattern(&env, &report, &app, user).await;
         assert_template_files(&env, &report, &app, user).await;
     }
 
