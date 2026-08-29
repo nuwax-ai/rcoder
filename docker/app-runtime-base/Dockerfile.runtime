@@ -20,8 +20,10 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && npm install -g pm2 typescript ts-node pnpm@10 \
     && rm -rf /var/lib/apt/lists/*
 
-# Deno（JS/TS 运行时，最新版；DENO_INSTALL=/usr/local → /usr/local/bin/deno，在默认 PATH）
-RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+# Deno（JS/TS 运行时；deno.land 安装脚本在部分构建网络不可达 exit 35——改
+# registry 镜像拉取固定版本，与 rcoder-agent-runner base 的 Deno 同源同版）
+COPY --from=denoland/deno:bin-2.5.6 /deno /usr/local/bin/deno
+RUN chmod +x /usr/local/bin/deno && rm -rf /root/.cache/deno
 
 # ── Python（Debian bookworm 自带 3.11）+ uv ───────────────────────────────────
 # uv（Astral 极速 Python 包管理器，最新版）经 pip 装到 /usr/local/bin，在默认 PATH。

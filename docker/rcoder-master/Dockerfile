@@ -59,8 +59,7 @@ COPY . .
 # 🔧 支持 CARGO_FLAGS 参数，允许外部传递 feature flags
 ARG CARGO_FLAGS=""
 RUN echo "🔧 Cargo flags: ${CARGO_FLAGS}" && \
-    cargo build --release --bin rcoder --bin agent_runner ${CARGO_FLAGS} && \
-    cargo build --release -p file-server --bin file-server
+    cargo build --release --bin rcoder --bin agent_runner ${CARGO_FLAGS}
 
 # ============================================================================
 # 第二阶段：运行阶段（基于基础镜像）
@@ -134,8 +133,6 @@ RUN chmod +x /app/agent-runner-start.sh
 RUN mkdir -p /app/bin
 COPY --from=rust-builder /build/target/release/rcoder /app/bin/rcoder
 COPY --from=rust-builder /build/target/release/agent_runner /app/bin/agent_runner
-# Rust file-server (替代 node nuwax-file-server; node 版仍经 npm i -g 保留作回滚)
-COPY --from=rust-builder /build/target/release/file-server /app/bin/file-server
 
 # 只有在二进制文件存在时才复制（避免feature构建时的错误）
 RUN if [ -f /build/target/release/codex-acp-agent ]; then \
@@ -143,7 +140,7 @@ RUN if [ -f /build/target/release/codex-acp-agent ]; then \
     fi
 
 # 设置执行权限
-RUN chmod +x /app/bin/rcoder /app/bin/agent_runner /app/bin/file-server
+RUN chmod +x /app/bin/rcoder /app/bin/agent_runner
 
 # 暴露端口
 EXPOSE 8086
