@@ -445,6 +445,124 @@ fn trunc(v: &Value, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// dev 日志尾读 + 应用列表双接口（观测面此前 e2e 零覆盖）：
+/// files-update 写 `.logs/` 探针文件 → get-logs 尾读断言回显；
+/// query（owner 过滤）/runtime（运行时列表）双列表接口。
+async fn test_dev_logs_and_listing(env: &Env, report: &JsonlReporter) {
+    let ident = format!(
+        "app-e2e-log-{}{}",
+        &env.run_tag.replace('_', "")[..10],
+        std::process::id() % 1000
+    );
+    let marker = format!("e2e-log-marker-{ident}");
+    let user = "e2e-user";
+
+    // 前置：workspace（dev 卷载体）
+    let (ws_s, ws_b) = post_json(
+        env,
+        "/api/v1/userapp/workspace",
+        json!({"app_id": ident, "user_id": user}),
+    )
+    .await;
+    let ws_ok = ws_s.is_success() && http_ok(&ws_b);
+    report.assert_hard(
+        "log 场景前置：create-workspace",
+        ws_ok,
+        format!("HTTP {ws_s}, body 截断: {}", trunc(&ws_b, 120)),
+    );
+    if !ws_ok {
+        cleanup_builder(&ident);
+        return;
+    }
+
+    // files-update 写 .logs 探针（get-logs 读 {ws}/.logs 下 mtime 最新文件尾行；
+    // 镜像族须 X-App-Id 定位开发容器，post_json 不带 header 故直构请求）
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/files-update", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &ident)
+        .json(&json!({
+            "app_id": ident, "user_id": user,
+            "files": [{"operation": "create", "name": ".logs/probe.log", "contents": marker}]
+        }))
+        .send()
+        .await
+        .expect("files-update post");
+    let fu_s = resp.status();
+    let fu_b: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "files-update 写 .logs/probe.log 探针",
+        fu_s.is_success() && fu_b["success"].as_bool() == Some(true),
+        format!("HTTP {fu_s}, body 截断: {}", trunc(&fu_b, 120)),
+    );
+
+    // get-logs 尾读（镜像族：X-App-Id 定位容器 + snake query）
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/get-logs?app_id={ident}&user_id={user}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &ident)
+        .send()
+        .await
+        .expect("get-logs");
+    let gl_s = resp.status();
+    let gl_b: Value = resp.json().await.unwrap_or(Value::Null);
+    let marker_seen = gl_s.is_success()
+        && gl_b["success"].as_bool() == Some(true)
+        && gl_b["total_lines"].as_u64().unwrap_or(0) >= 1
+        && gl_b["logs"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|r| r["content"].as_str().is_some_and(|c| c.contains(&marker)))
+        });
+    report.assert_hard(
+        "get-logs 尾读回显探针行",
+        marker_seen,
+        format!("HTTP {gl_s}, body 截断: {}", trunc(&gl_b, 180)),
+    );
+
+    // query：运行时对账（实时查集群 Deployment 集）——workspace-only app 无
+    // prod 运行时，过滤 app_ids 应得空列表（语义锚：query 是运行态而非元数据面）
+    let (q_s, q_b) = post_json(
+        env,
+        "/api/v1/userapp/query",
+        json!({"user_id": user, "page": 1, "page_size": 50, "filters": {"app_ids": [ident]}}),
+    )
+    .await;
+    let listed = q_s.is_success()
+        && http_ok(&q_b)
+        && q_b["data"]["items"]
+            .as_array()
+            .is_some_and(|items| !items.iter().any(|i| i["app_id"] == ident));
+    report.assert_hard(
+        "query 运行时对账：未部署 app 不在运行时列表",
+        listed,
+        format!("HTTP {q_s}, body 截断: {}", trunc(&q_b, 150)),
+    );
+
+    // runtime：运行时列表（无 prod 容器时为空数组——断言接口形态非内容）
+    let (rt_s, rt_b) = get_json(env, &format!("/api/v1/userapp/runtime?user_id={user}")).await;
+    report.assert_hard(
+        "runtime 运行时列表（200 + 0000）",
+        rt_s.is_success() && http_ok(&rt_b),
+        format!("HTTP {rt_s}, body 截断: {}", trunc(&rt_b, 120)),
+    );
+
+    // 回收 dev 环境
+    drop(
+        post_json(
+            env,
+            &format!("/api/v1/userapp/{ident}/dev/storage/destroy"),
+            json!({"user_id": user, "confirm": ident}),
+        )
+        .await,
+    );
+    cleanup_builder(&ident);
+}
+
 #[tokio::test]
 async fn userapp_compose_regression() {
     rcoder_e2e::common::cross_bin_lock::acquire();
@@ -457,6 +575,7 @@ async fn userapp_compose_regression() {
     test_build_reaches_terminal(&env, &report).await;
     test_start_without_app_semantics(&env, &report).await;
     test_env_scoped_files_and_storage(&env, &report).await;
+    test_dev_logs_and_listing(&env, &report).await;
 
     let path = report.path.display().to_string();
     assert!(report.finish(), "场景失败：断言明细见 {path}");

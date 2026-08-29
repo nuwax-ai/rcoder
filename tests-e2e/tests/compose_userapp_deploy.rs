@@ -385,6 +385,29 @@ async fn build_to_completion(
     if release_id.is_empty() || sha256.len() != 64 {
         return None;
     }
+    // 构建日志分页（成功路径）：按 service_id 取分服务归档（logs/{service_id}），
+    // 断言行内容与翻页游标字段——此前仅失败分支间接覆盖过本端点
+    let (ls, lb) = get_json(
+        env,
+        &format!(
+            "/api/v1/userapp/tasks/{task_id}/logs?app_id={app}&user_id={user}&service=backend-go"
+        ),
+    )
+    .await;
+    let logs_ok = ls.is_success()
+        && http_ok(&lb)
+        && lb["data"]["total_lines"].as_u64().unwrap_or(0) > 0
+        && lb["data"]["log_file_name"]
+            .as_str()
+            .is_some_and(|n| n.starts_with("dev-"))
+        && lb["data"]["logs"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty());
+    report.assert_hard(
+        "构建日志分页（?service=backend-go 行内容 + 翻页游标）",
+        logs_ok,
+        format!("HTTP {ls}, body 截断: {}", trunc(&lb, 180)),
+    );
     Some((release_id, sha256))
 }
 
@@ -520,6 +543,111 @@ async fn deploy_and_verify_traffic(
     }
 }
 
+/// 部署后 prod 观测族验收（health / logs 三接口 / stats / events）——运行态
+/// 主链此前 e2e 零覆盖（logs 三接口转发 app-cli :3010 曾有断链史，audit 批修复）。
+async fn verify_prod_observability(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
+    // health：GET 双态健康（prod=运行容器就绪探针）
+    let (h_s, h_b) = get_json(
+        env,
+        &format!("/api/v1/userapp/{app}/prod/health?user_id={user}"),
+    )
+    .await;
+    report.assert_hard(
+        "prod health 就绪（200 + 0000）",
+        h_s.is_success() && http_ok(&h_b),
+        format!("HTTP {h_s}, body 截断: {}", trunc(&h_b, 150)),
+    );
+
+    // logs/sources/query：声明日志源清单（POST 转发 app-cli）
+    let (ss, sb) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/prod/logs/sources/query?user_id={user}"),
+        json!({}),
+    )
+    .await;
+    let sources_ok =
+        ss.is_success() && http_ok(&sb) && sb["data"].as_array().is_some_and(|arr| !arr.is_empty());
+    report.assert_hard(
+        "prod logs/sources/query 声明源非空",
+        sources_ok,
+        format!("HTTP {ss}, body 截断: {}", trunc(&sb, 200)),
+    );
+
+    // logs/query：多服务日志快照（tail 限行 + cursor 游标面）
+    let (qs, qb) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/prod/logs/query?user_id={user}"),
+        json!({"tail": 20}),
+    )
+    .await;
+    report.assert_hard(
+        "prod logs/query 快照（200 + 0000）",
+        qs.is_success() && http_ok(&qb),
+        format!("HTTP {qs}, body 截断: {}", trunc(&qb, 200)),
+    );
+
+    // logs/stream：SSE 实时流（连接建立 + content-type；应用静默期无事件属正常）
+    // POST-SSE 设计（body=LogQueryRequest 支持断线 cursor 续传），非 GET
+    let stream_ok = env
+        .http
+        .post(format!(
+            "{}/api/v1/userapp/{app}/prod/logs/stream?user_id={user}",
+            env.rcoder
+        ))
+        .header("Accept", "text/event-stream")
+        .json(&json!({}))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    let stream_detail;
+    let stream_ok = match stream_ok {
+        Ok(resp) => {
+            let ct = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let status = resp.status();
+            // 连接保持打开：丢弃响应体（应用静默期无事件属正常，头即证明通道）
+            drop(resp);
+            stream_detail = format!("HTTP {status}, content-type={ct}");
+            status.is_success() && ct.contains("text/event-stream")
+        }
+        Err(e) => {
+            stream_detail = format!("err: {e}");
+            false
+        }
+    };
+    report.assert_hard(
+        "prod logs/stream SSE 通道（200 + text/event-stream）",
+        stream_ok,
+        stream_detail,
+    );
+
+    // stats / events：运行观测双查询
+    let (st_s, st_b) = get_json(
+        env,
+        &format!("/api/v1/userapp/{app}/prod/stats?user_id={user}"),
+    )
+    .await;
+    report.assert_hard(
+        "prod stats（200 + 0000）",
+        st_s.is_success() && http_ok(&st_b),
+        format!("HTTP {st_s}, body 截断: {}", trunc(&st_b, 150)),
+    );
+    let (ev_s, ev_b) = get_json(
+        env,
+        &format!("/api/v1/userapp/{app}/prod/events?user_id={user}"),
+    )
+    .await;
+    report.assert_hard(
+        "prod events（200 + 0000）",
+        ev_s.is_success() && http_ok(&ev_b),
+        format!("HTTP {ev_s}, body 截断: {}", trunc(&ev_b, 150)),
+    );
+}
+
 /// 回收：prod delete purge → 流量转 502。
 async fn cleanup_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
     let (s, b) = post_json(
@@ -612,7 +740,7 @@ async fn userapp_deploy_full_chain() {
         && let Some(artifact_path) =
             fetch_and_verify_artifact(&env, &report, &app, user, &release_id, &sha256).await
     {
-        // ⑤ 部署 + 七路流量 ⑥ 回收
+        // ⑤ 部署 + 七路流量 ⑤b prod 观测族 ⑥ 回收
         deploy_and_verify_traffic(
             &env,
             &report,
@@ -623,6 +751,7 @@ async fn userapp_deploy_full_chain() {
             &artifact_path,
         )
         .await;
+        verify_prod_observability(&env, &report, &app, user).await;
         cleanup_prod(&env, &report, &app, user).await;
     } else {
         cleanup_prod(&env, &report, &app, user).await;

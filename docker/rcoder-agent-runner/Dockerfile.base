@@ -662,11 +662,15 @@ RUN apt-get update && apt-get install -y maven && \
     echo "✅ Maven installed: $(mvn --version | head -1)"
 
 # 创建 Maven 配置目录（系统级和用户级）
-RUN mkdir -p /home/user/.m2 && \
+RUN mkdir -p /home/user/.m2 /root/.m2 && \
     mkdir -p /etc/maven
 
 # 复制 Maven 配置文件（阿里云镜像已配置）
+# /root/.m2 必须有：构建进程（agent_runner/构建链）以 root 运行，maven/mvnw 读
+# user.home 的 settings——缺它则全程直连 repo.maven.apache.org（国内 TLS 握手
+# 瞬断 = 全链 e2e 多次 flaky 的统一根因）
 COPY settings.xml /home/user/.m2/settings.xml
+COPY settings.xml /root/.m2/settings.xml
 COPY settings.xml /etc/maven/settings.xml
 
 # 设置权限
