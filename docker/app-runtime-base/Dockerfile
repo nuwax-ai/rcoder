@@ -1,12 +1,12 @@
 # 应用运行时基础镜像（app-runtime-base）
-# 基础设施层：Rust 工具链（来自 rust:trixie）+ 排查工具 + ttyd + PostgreSQL + pgweb + supervisor。
-# rust:trixie 基于 Debian trixie（buildpack-deps），Rust/cargo 白赚，不再单独 rustup 装；Rust 版本随 tag 自动跟进最新 stable。
+# 基础设施层：Rust 工具链（来自 rust:bookworm）+ 排查工具 + ttyd + PostgreSQL + pgweb + supervisor。
+# rust:bookworm 基于 Debian bookworm（buildpack-deps），Rust/cargo 白赚，不再单独 rustup 装；Rust 版本随 tag 自动跟进最新 stable。
 # 语言运行时见 Dockerfile.runtime（FROM 本镜像 + Node/Python/Java/Go）。
 
 ARG DOCKER_MIRROR
 
 # === app-cli builder（从 vendored rcoder 源编译 app-cli 编排器；app-cli 独立于 rcoder workspace）===
-FROM ${DOCKER_MIRROR}rust:trixie AS app-cli-builder
+FROM ${DOCKER_MIRROR}rust:bookworm AS app-cli-builder
 WORKDIR /build
 # builder 阶段先换国内 apt 源(默认 deb.debian.org 从国内拉易 stall),与 stage-2 的 LinuxMirrors 换源对齐
 RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
@@ -14,7 +14,7 @@ RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
         --install-epel false --backup false --upgrade-software false --clean-cache true --ignore-backup-tips && \
     apt-get update && apt-get install -y --no-install-recommends cmake libclang-dev protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY --from=rcoder / .
-# 删 rust-toolchain.toml:rcoder 锁 1.96.0,但 base image rust:trixie 自带更新版(向下兼容)。
+# 删 rust-toolchain.toml:rcoder 锁 1.96.0,但 base image rust:bookworm 自带更新版(向下兼容)。
 # 不删会触发 rustup 下载 1.96.0 工具链(~200MB,走 static.rust-lang.org 官方,国内极慢)。
 RUN rm -f rust-toolchain.toml
 # 配置 cargo 源(国内 rsproxy 加速)。文件在 .cargo/config.toml,查阅/修改方便。
@@ -28,7 +28,7 @@ RUN cargo build --release -p file-server-proxy
 
 # === 主 stage（app-runtime-base 基础设施层）===
 ARG DOCKER_MIRROR
-FROM ${DOCKER_MIRROR}rust:trixie
+FROM ${DOCKER_MIRROR}rust:bookworm
 
 # 设置环境变量
 ENV DEBIAN_FRONTEND=noninteractive
@@ -47,7 +47,7 @@ ENV RCODER_PINGAP_VERSION=${PINGAP_VERSION} \
 WORKDIR /app
 
 
-# 使用 LinuxMirrors 一键配置阿里云镜像源（rust:trixie 基于 Debian trixie，已预装 curl）
+# 使用 LinuxMirrors 一键配置阿里云镜像源（rust:bookworm 基于 Debian bookworm，已预装 curl）
 RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --source mirrors.aliyun.com \
     --protocol https \
@@ -105,12 +105,12 @@ RUN chmod +x /usr/local/bin/ttyd && mkdir -p /usr/local/share/ttyd
 COPY start-ttyd.sh /usr/local/bin/start-ttyd.sh
 RUN chmod +x /usr/local/bin/start-ttyd.sh
 
-# 安装 PostgreSQL 16（rust:trixie 基于 Debian trixie，PG apt 仓库用 trixie-pgdg）
+# 安装 PostgreSQL 16（rust:bookworm 基于 Debian bookworm，PG apt 仓库用 bookworm-pgdg）
 RUN install -d /usr/share/postgresql-keyring && \
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
         | gpg --dearmor -o /usr/share/postgresql-keyring/pgdg.gpg && \
     chmod 644 /usr/share/postgresql-keyring/pgdg.gpg && \
-    echo "deb [signed-by=/usr/share/postgresql-keyring/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt trixie-pgdg main" \
+    echo "deb [signed-by=/usr/share/postgresql-keyring/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
         > /etc/apt/sources.list.d/pgdg.list && \
     apt-get update && apt-get install -y postgresql-16 && rm -rf /var/lib/apt/lists/*
 
@@ -121,7 +121,7 @@ RUN chmod +x /usr/local/bin/pgweb
 # 安装 dbx-web(DBX 数据库 Web GUI,60+ 数据库;supervisor 托管 :4224,见 app-runtime.supervisor.conf [program:dbx])
 # 由 make download-dbx-cache (16) 从官方镜像 docker.cnb.cool/dbxio.com/dbx 抽取分发到 downloads/
 # (与 agent-runner 镜像同源分发)。dbx-core 的 font-kit 枚举系统字体 → 需 fontconfig/libfreetype6
-# + 至少一套字体(官方镜像同款依赖,rust:trixie 不保证自带)。
+# + 至少一套字体(官方镜像同款依赖,rust:bookworm 不保证自带)。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         fontconfig \
         fonts-dejavu-core \
