@@ -12,6 +12,9 @@ cp .env.local.example .env.local
 # compose 环境（本地 docker compose，前置 make dev-up + .env.local 的 LLM 配置）
 make test-e2e-compose
 
+# compose userApp 部署全链（7 服务模板→构建→部署→七路流量；~8-15 分钟，独立 target 不拖慢常规回归）
+make test-e2e-compose-deploy
+
 # K8s 专项（个人测试机 20 / 229 单节点；19 机有生产环境禁用）
 # 负载均衡场景默认 ignore（此前已验证通过），确认后 RUN_LB=1 显式开启
 make test-e2e-k8s

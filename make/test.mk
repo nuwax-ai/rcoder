@@ -45,6 +45,20 @@ test-e2e-compose:
 	fi; \
 	exit $$status
 
+# compose userApp 部署全链（template-cli 7 服务模板→构建→部署→七路流量；~8-15 分钟，
+# 构建依赖外网 npm/maven/pypi/goproxy/crates。镜像前置不满足时场景 verdict=skip）
+test-e2e-compose-deploy:
+	@echo "🧪 Rust e2e（compose userApp 部署全链；串行；报告在 tests-e2e/reports/）..."
+	@status=0; \
+	cargo test -p rcoder-e2e --test compose_userapp_deploy -- --test-threads=1 || status=$$?; \
+	latest=$$(ls -t tests-e2e/reports/ 2>/dev/null | head -1); \
+	echo ""; \
+	if [ -n "$$latest" ]; then \
+		echo "📋 报告目录: tests-e2e/reports/$$latest"; \
+		python3 -c "import json; s=json.load(open('tests-e2e/reports/$$latest/summary.json')); [print(f\"  {e['verdict']:>7}  {e['scenario']}__{e['backend']}\") for e in s['scenarios']]" 2>/dev/null || true; \
+	fi; \
+	exit $$status
+
 # K8s 专项（目标: 个人开发测试 K8s——20/229 单节点；19 机有生产环境禁用）。
 # 配置在 .env.local（参照 .env.local.example）或环境变量：TEST_K8S_SSH、
 # LB_ENTRY_HOSTS（单节点一个 IP 即可，场景退化同入口）。
