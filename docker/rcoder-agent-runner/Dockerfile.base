@@ -547,6 +547,26 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     apt-get autoclean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
+# Python 统一 3.13：与 app-runtime（rust:trixie 原生 3.13）对齐——builder 装的
+# wheel ABI 必须与运行容器一致（3.11 装的 cpython-311 .so 在 3.13 下加载失败，
+# 服务 SPAWN_ERROR 致整 workspace 编排中止；曾靠模板钉 --python-version 3.13
+# 兜底，统一后用户自带项目无需感知）。bookworm apt 只有 3.11，用
+# python-build-standalone（uv 同源）预编译包叠到 /usr/local——PATH 优先于
+# /usr/bin/python3（apt 版保留，供系统工具的 /usr/bin shebang 使用）。
+RUN ARCH=$(uname -m) && \
+    curl -fsSL "https://github.com/astral-sh/python-build-standalone/releases/download/20260825/cpython-3.13.15+20260825-${ARCH}-unknown-linux-gnu-install_only.tar.gz" \
+      -o /tmp/py313.tar.gz && \
+    tar -xzf /tmp/py313.tar.gz -C /tmp && \
+    cp -a /tmp/python/. /usr/local/ && \
+    rm -rf /tmp/py313.tar.gz /tmp/python && \
+    python3 --version && pip3 --version && \
+    python3 -c "import sys; assert sys.version_info[:2] == (3, 13), 'unified python must be 3.13'" && \
+    # python 与 python3 同指 3.13（上游 apt 层曾把 /usr/bin/python 软链到 apt 3.11，
+    # 会造成 python≠python3 的 ABI 分裂——用 python 的构建脚本同样要拿到统一版本）
+    ln -sf /usr/local/bin/python3 /usr/bin/python && \
+    python --version && \
+    echo "✅ Python 3.13 unified with app-runtime (builder pip wheels → runtime ABI)"
+
 # 安装 Node.js 22.x (现在支持，因为不再依赖 ijavascript)
 RUN apt-get update && \
     apt-get install -y curl gnupg ca-certificates && \
