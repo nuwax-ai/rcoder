@@ -109,9 +109,11 @@ impl AppService {
         match resp {
             Ok(r) if r.status().as_u16() == 202 => {}
             Ok(r) if r.status().as_u16() == 409 => {
-                return Err(AppOperationError::Conflict(
-                    "hot deploy already in progress on container".to_string(),
-                ));
+                // 透传容器侧错误体（含 "deploy in progress (phase=...)" 真实相位）
+                let detail = r.text().await.unwrap_or_default();
+                return Err(AppOperationError::Conflict(format!(
+                    "hot deploy rejected by container: {detail}"
+                )));
             }
             Ok(r) => {
                 warn!(

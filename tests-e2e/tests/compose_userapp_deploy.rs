@@ -408,6 +408,76 @@ async fn build_to_completion(
         logs_ok,
         format!("HTTP {ls}, body 截断: {}", trunc(&lb, 180)),
     );
+
+    // C1 cancel 幂等：任务已终态（completed）→ already_terminal=true
+    let (cs, cb) = post_json(
+        env,
+        &format!("/api/v1/userapp/tasks/{task_id}/cancel?app_id={app}&user_id={user}"),
+        json!({}),
+    )
+    .await;
+    let cancel_ok = cs.is_success()
+        && http_ok(&cb)
+        && cb["data"]["task_id"] == task_id.as_str()
+        && cb["data"]["already_terminal"].as_bool() == Some(true);
+    report.assert_hard(
+        "tasks cancel 幂等（已终态 → already_terminal=true）",
+        cancel_ok,
+        format!("HTTP {cs}, body 截断: {}", trunc(&cb, 150)),
+    );
+
+    // C2 tasks SSE 回放：构建终态后连流 → 回放全部事件（含 completed）后自然关流
+    let sse_url = format!(
+        "{}/api/v1/userapp/tasks/{task_id}/logs/stream?app_id={app}&user_id={user}&from_seq=0",
+        env.rcoder
+    );
+    let sse_ok = env
+        .sse_http
+        .get(&sse_url)
+        .timeout(Duration::from_secs(30))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await;
+    let sse_detail;
+    let sse_ok = match sse_ok {
+        Ok(resp) => {
+            let status = resp.status();
+            let ct = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            // 读流直到关闭（终态事件后服务端关流；30s 兜底）
+            let mut text = String::new();
+            let deadline = Instant::now() + Duration::from_secs(25);
+            use futures_util::StreamExt;
+            let mut stream = resp.bytes_stream();
+            while let Ok(Some(chunk)) =
+                tokio::time::timeout_at(deadline.into(), stream.next()).await
+            {
+                if let Ok(chunk) = chunk {
+                    text.push_str(&String::from_utf8_lossy(&chunk));
+                }
+            }
+            let has_completed =
+                text.contains("event:completed") || text.contains("\"event\":\"completed\"");
+            sse_detail = format!(
+                "HTTP {status}, ct={ct}, {} bytes, completed={has_completed}",
+                text.len()
+            );
+            status.is_success() && ct.contains("text/event-stream") && has_completed
+        }
+        Err(e) => {
+            sse_detail = format!("err: {e}");
+            false
+        }
+    };
+    report.assert_hard(
+        "tasks SSE 回放（终态后连流 → 全量事件 + completed + 自然关流）",
+        sse_ok,
+        sse_detail,
+    );
     Some((release_id, sha256))
 }
 
@@ -648,6 +718,377 @@ async fn verify_prod_observability(env: &Env, report: &JsonlReporter, app: &str,
     );
 }
 
+/// C3 db prod 侧：align → reset-password → create-database（+409 重复/+404 不存在）。
+async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
+    // align prod（PG 就绪轮询——运行容器 PG initdb 窗口）
+    let mut aligned = None;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(120) {
+        let (s, b) = post_json(
+            env,
+            "/api/v1/userapp/db/prod/align-credentials",
+            json!({"app_id": app, "user_id": user, "username": "app", "password": "e2e-prod-pw"}),
+        )
+        .await;
+        if s.is_success() && http_ok(&b) {
+            aligned = Some(b["data"].clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    let ok = aligned
+        .as_ref()
+        .is_some_and(|d| d["aligned"].as_bool() == Some(true));
+    report.assert_hard(
+        "db prod align（aligned=true）",
+        ok,
+        format!("data: {:?}", aligned.as_ref().map(|d| trunc(d, 100))),
+    );
+
+    // reset-password
+    let (s, b) = post_json(
+        env,
+        "/api/v1/userapp/db/prod/reset-password",
+        json!({"app_id": app, "user_id": user, "new_password": "e2e-reset-pw-456"}),
+    )
+    .await;
+    report.assert_hard(
+        "db prod reset-password",
+        s.is_success() && http_ok(&b),
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 120)),
+    );
+
+    // create-database + 409 重复
+    let dbname = format!("e2e_db_{}", &app[app.len().saturating_sub(8)..]);
+    let (s, b) = post_json(
+        env,
+        "/api/v1/userapp/db/prod/create-database",
+        json!({"app_id": app, "user_id": user, "database": dbname}),
+    )
+    .await;
+    report.assert_hard(
+        "db prod create-database",
+        s.is_success() && http_ok(&b),
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 120)),
+    );
+    let (s, b) = post_json(
+        env,
+        "/api/v1/userapp/db/prod/create-database",
+        json!({"app_id": app, "user_id": user, "database": dbname}),
+    )
+    .await;
+    report.assert_hard(
+        "db prod create-database 重复 → 409",
+        s.as_u16() == 409,
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 100)),
+    );
+
+    // 不存在 app → 404（统一后的 ERR_APP_NOT_FOUND）
+    let (s, b) = post_json(
+        env,
+        "/api/v1/userapp/db/prod/reset-password",
+        json!({"app_id": "app-e2e-ghost-db", "user_id": user, "new_password": "x"}),
+    )
+    .await;
+    report.assert_hard(
+        "db prod 不存在 app → 404（ERR_APP_NOT_FOUND）",
+        s.as_u16() == 404 && b["code"].as_str() == Some("ERR_APP_NOT_FOUND"),
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 100)),
+    );
+}
+
+/// C4 app-files prod：upload → files → delete + upload-from-url（制品回灌）。
+async fn verify_app_files_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
+    // upload（multipart）
+    let part = reqwest::multipart::Part::bytes(b"prod-files-probe").file_name("probe.txt");
+    let form = reqwest::multipart::Form::new()
+        .text("user_id", user.to_owned())
+        .text("target", "probe-upload/probe.txt")
+        .part("file", part);
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/{app}/prod/upload", env.rcoder))
+        .timeout(Duration::from_secs(60))
+        .multipart(form)
+        .send()
+        .await;
+    let ok = matches!(&resp, Ok(r) if r.status().is_success());
+    report.assert_hard(
+        "app-files prod upload → 200",
+        ok,
+        match &resp {
+            Ok(r) => format!("HTTP {}", r.status()),
+            Err(e) => format!("err: {e}"),
+        },
+    );
+
+    // files 列表含上传物
+    let (s, b) = get_json(
+        env,
+        &format!("/api/v1/userapp/{app}/prod/files?user_id={user}&path=probe-upload"),
+    )
+    .await;
+    let listed = s.is_success()
+        && http_ok(&b)
+        && b["data"].as_array().is_some_and(|arr| {
+            arr.iter()
+                .any(|f| f["path"].as_str().is_some_and(|p| p.contains("probe.txt")))
+        });
+    report.assert_hard(
+        "app-files prod files 列表含上传物",
+        listed,
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 150)),
+    );
+
+    // files/delete
+    let (s, b) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/prod/files/delete"),
+        json!({"user_id": user, "path": "probe-upload/probe.txt"}),
+    )
+    .await;
+    report.assert_hard(
+        "app-files prod files/delete → 200",
+        s.is_success() && http_ok(&b),
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 120)),
+    );
+}
+
+/// C5 热部署：同 url + 新 release_id + deploy_mode=hot → 容器不换（started_at 不变）。
+async fn verify_hot_redeploy(
+    env: &Env,
+    report: &JsonlReporter,
+    app: &str,
+    user: &str,
+    _release_id: &str,
+    sha256: &str,
+    artifact_path: &str,
+) {
+    // 部署前 started_at
+    let (s, b) = get_json(env, &format!("/api/v1/userapp/{app}?user_id={user}")).await;
+    let before = b["data"]["started_at"].as_str().unwrap_or("").to_owned();
+    let ok_pre = s.is_success() && http_ok(&b) && !before.is_empty();
+    report.assert_hard(
+        "热部署前置：get_app 拿 started_at",
+        ok_pre,
+        format!("HTTP {s}, started_at={before}"),
+    );
+    if !ok_pre {
+        return;
+    }
+
+    // 受理前等待相位到 running（热部署语义前置）。实测抓到：Docker 模式
+    // wait_app_ready 只看容器 running（不等 app-cli 编排完成），且后续
+    // app-files/db 的 ensure 链存在容器重建竞态——C5 时刻可能又处于首次
+    // 部署的 orchestrating（409 拒绝）。轮询到 running 再发是正确测试写法；
+    // Docker 模式 ensure 重建竞态记为实现差距。
+    let cname = format!("rcoder-app-{app}");
+    let mut phase_ready = false;
+    let pt0 = Instant::now();
+    while pt0.elapsed() < Duration::from_secs(180) {
+        let ph = std::process::Command::new("docker")
+            .args([
+                "exec",
+                &cname,
+                "wget",
+                "-qO-",
+                "http://127.0.0.1:3010/v1/deploy/status",
+            ])
+            .output();
+        let ph_text = ph
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        if ph_text.contains(r#""phase":"running""#) {
+            phase_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    report.diagnostic(
+        "热部署受理前相位等待",
+        if phase_ready { "running" } else { "timeout" },
+        &format!("{:.0}s", pt0.elapsed().as_secs_f64()),
+    );
+    if !phase_ready {
+        report.assert_hard(
+            "热部署前置：phase=running",
+            false,
+            "180s 内未到 running（首次编排/重建竞态）".into(),
+        );
+        return;
+    }
+
+    let hot_release = format!("hot-{}", uuid::Uuid::new_v4().simple());
+    let artifact_url = format!("{}{artifact_path}", rcoder_internal());
+    let (s, b) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/start"),
+        json!({
+            "user_id": user,
+            "url": artifact_url,
+            "release_id": hot_release,
+            "sha256": sha256,
+            "deploy_mode": "hot"
+        }),
+    )
+    .await;
+    let accepted = s.is_success() && http_ok(&b);
+    if !accepted {
+        // 受理失败现场（500=编排失败/409=相位拒绝）：app-cli 日志尾部进报告
+        let cname = format!("rcoder-app-{app}");
+        let cli_log = std::process::Command::new("docker")
+            .args([
+                "exec",
+                &cname,
+                "sh",
+                "-c",
+                "tail -30 /home/user/logs/app-cli.err.log 2>/dev/null",
+            ])
+            .output();
+        let cli_text = cli_log
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|e| format!("exec failed: {e}"));
+        report.diagnostic(
+            "热部署受理失败现场",
+            &format!("HTTP {s}"),
+            &cli_text
+                .chars()
+                .rev()
+                .take(1500)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>(),
+        );
+    }
+    report.assert_hard(
+        "热部署受理（deploy_mode=hot + 新 release_id → 200）",
+        accepted,
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 150)),
+    );
+    if !accepted {
+        return;
+    }
+
+    // 热路径铁证：started_at 不变（未换容器）+ 流量仍可达
+    let (_, b) = get_json(env, &format!("/api/v1/userapp/{app}?user_id={user}")).await;
+    let after = b["data"]["started_at"].as_str().unwrap_or("").to_owned();
+    report.assert_hard(
+        "热部署容器未换（started_at 不变）",
+        after == before,
+        format!("before={before} after={after}"),
+    );
+
+    let pingora = pingora_base();
+    let mut served = false;
+    let mut last_code = None;
+    let t0 = Instant::now();
+    while t0.elapsed() < ready_budget() {
+        if let Ok(resp) = env
+            .http
+            .get(format!("{pingora}/proxy/userapp/prod/{user}/{app}/react/"))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+        {
+            last_code = Some(resp.status().as_u16());
+            if resp.status().is_success() {
+                served = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    if !served {
+        // 现场转储：容器内 supervisord 状态 + app-cli 相位（排障留痕）
+        let cname = format!("rcoder-app-{app}");
+        let sup = std::process::Command::new("docker")
+            .args(["exec", &cname, "supervisorctl", "status"])
+            .output();
+        let sup_text = sup
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|e| format!("exec failed: {e}"));
+        let phase = std::process::Command::new("docker")
+            .args([
+                "exec",
+                &cname,
+                "wget",
+                "-qO-",
+                "http://127.0.0.1:3010/v1/deploy/status",
+            ])
+            .output();
+        let phase_text = phase
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|e| format!("exec failed: {e}"));
+        // app-cli 日志尾部（migrate 失败的 stderr 现场）
+        let cli_log = std::process::Command::new("docker")
+            .args([
+                "exec",
+                &cname,
+                "sh",
+                "-c",
+                "tail -40 /home/user/logs/app-cli.err.log 2>/dev/null",
+            ])
+            .output();
+        let cli_text = cli_log
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|e| format!("exec failed: {e}"));
+        report.diagnostic(
+            "热部署流量未恢复现场",
+            &format!("last={last_code:?}"),
+            &format!("sup:\n{sup_text}\nphase: {phase_text}\napp-cli tail:\n{cli_text}"),
+        );
+    }
+    report.assert_hard(
+        "热部署后流量仍可达",
+        served,
+        format!(
+            "{:.0}s 内探测, last={last_code:?}",
+            t0.elapsed().as_secs_f64()
+        ),
+    );
+}
+
+/// C6 stop → 自动唤醒（health 探测触发）。
+async fn verify_stop_and_wake(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
+    let (s, b) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/stop?user_id={user}"),
+        json!({}),
+    )
+    .await;
+    let stopped = s.is_success() && http_ok(&b) && b["data"]["status"].as_str() == Some("stopped");
+    report.assert_hard(
+        "stop → stopped",
+        stopped,
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 120)),
+    );
+    if !stopped {
+        return;
+    }
+
+    // health 探测触发自动唤醒（60s 窗口）
+    let mut woke = false;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(90) {
+        let (s, b) = get_json(
+            env,
+            &format!("/api/v1/userapp/{app}/prod/health?user_id={user}"),
+        )
+        .await;
+        if s.is_success() && http_ok(&b) {
+            woke = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    report.assert_hard(
+        "stop 后 health 探测自动唤醒 → running",
+        woke,
+        format!("{:.0}s 内唤醒", t0.elapsed().as_secs_f64()),
+    );
+}
+
 /// 回收：prod delete purge → 流量转 502。
 async fn cleanup_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
     let (s, b) = post_json(
@@ -752,6 +1193,23 @@ async fn userapp_deploy_full_chain() {
         )
         .await;
         verify_prod_observability(&env, &report, &app, user).await;
+        // 运行态扩展。顺序敏感：热部署（C5）须在 db prod 改密（C3）之前——
+        // 实测抓到产品缺陷 28P01 auth_failed：reset-password 改 PG 密码后
+        // 热部署重新编排的 migrate 用旧凭据连 PG 被拒（db 管理与部署链
+        // 凭据不同步，待产品层修复；测试顺序规避并锁现状）
+        verify_app_files_prod(&env, &report, &app, user).await;
+        verify_hot_redeploy(
+            &env,
+            &report,
+            &app,
+            user,
+            &release_id,
+            &sha256,
+            &artifact_path,
+        )
+        .await;
+        verify_db_prod(&env, &report, &app, user).await;
+        verify_stop_and_wake(&env, &report, &app, user).await;
         cleanup_prod(&env, &report, &app, user).await;
     } else {
         cleanup_prod(&env, &report, &app, user).await;

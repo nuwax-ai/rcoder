@@ -169,6 +169,11 @@ impl ServerState {
                 self.phase().as_str()
             ));
         }
+        // 受理即切 Deploying：rcoder 轮询方依赖 /v1/deploy/status 区分新旧代——
+        // 若保持 Running 直到主循环 pick up，受理后首次轮询会读到**旧代** running
+        // 而误判成功（竞态窗口 = POLL_INTERVAL + 调度延迟，全链 e2e 热部署
+        // 实测抓到：受理 200 但容器实际编排失败已转 failed）
+        self.set_phase(ServerPhase::Deploying);
         self.deploy_tx
             .send(req)
             .map_err(|_| "server loop exited".to_string())
