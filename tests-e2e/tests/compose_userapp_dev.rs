@@ -77,12 +77,18 @@ fn cleanup_builder(app_id: &str) {
 
 /// create-workspace（幂等起手；断言 200 + 容器信息回显）。
 async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user: &str) -> bool {
-    let (status, body) = post_json(
-        env,
-        "/api/v1/userapp/workspace",
-        json!({"app_id": app_id, "user_id": user}),
-    )
-    .await;
+    // 300s：K8s 首次 PVC 动态制备（ceph-rbd 100Gi）实测 ~2 分钟，post_json
+    // 默认 90s 会截断 ensure（pod 实际创建成功但测试已超时 500/断言失败）
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/workspace", env.rcoder))
+        .timeout(Duration::from_secs(300))
+        .json(&json!({"app_id": app_id, "user_id": user}))
+        .send()
+        .await
+        .expect("workspace post");
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
     let ok = status.is_success()
         && http_ok(&body)
         && body["data"]["container_name"]

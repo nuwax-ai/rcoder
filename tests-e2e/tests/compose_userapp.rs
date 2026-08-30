@@ -251,11 +251,31 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
         format!("HTTP {s2}, body 截断: {}", trunc(&b2, 150)),
     );
     if created {
-        let status = b2["data"]["status"].as_str().unwrap_or("");
+        // 轮询到 running：Docker 立即就绪；K8s 异步（Pod 探针等 app-cli
+        // /health，start 响应时可能仍 starting——双环境统一轮询写法）
+        let mut st = b2["data"]["status"].as_str().unwrap_or("").to_string();
+        let t0 = Instant::now();
+        while st != "running" && t0.elapsed() < Duration::from_secs(120) {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let resp = env
+                .http
+                .get(format!(
+                    "{}/api/v1/userapp/{app_id}?user_id=e2e-user",
+                    env.rcoder
+                ))
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+            if let Ok(r) = resp
+                && let Ok(v) = r.json::<Value>().await
+            {
+                st = v["data"]["status"].as_str().unwrap_or("").to_string();
+            }
+        }
         report.assert_hard(
-            "空容器状态 Running（基础设施形态就绪）",
-            status == "running",
-            format!("status={status}"),
+            "空容器状态 Running（基础设施形态就绪；120s 轮询兼容 K8s 异步）",
+            st == "running",
+            format!("status={st}"),
         );
         // cleanup：删除 app（purge 连数据卷一起清，防 compose 环境残留）
         drop(
@@ -727,17 +747,39 @@ async fn test_update_stop_restart(env: &Env, report: &JsonlReporter) {
         format!("HTTP {s}, body 截断: {}", trunc(&b, 150)),
     );
 
-    // 唤醒：start（无 url 传统启动=唤醒通道）
+    // 唤醒：start（无 url 传统启动=唤醒通道）；K8s 异步就绪轮询到 running
     let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/{app_id}/start"),
         json!({"user_id": user}),
     )
     .await;
+    let accepted = s.is_success() && http_ok(&b);
+    let mut st = b["data"]["status"].as_str().unwrap_or("").to_string();
+    if accepted {
+        let t0 = Instant::now();
+        while st != "running" && t0.elapsed() < Duration::from_secs(120) {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let resp = env
+                .http
+                .get(format!(
+                    "{}/api/v1/userapp/{app_id}?user_id={user}",
+                    env.rcoder
+                ))
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+            if let Ok(r) = resp
+                && let Ok(v) = r.json::<Value>().await
+            {
+                st = v["data"]["status"].as_str().unwrap_or("").to_string();
+            }
+        }
+    }
     report.assert_hard(
-        "stop 后 start 唤醒 → running",
-        s.is_success() && http_ok(&b) && b["data"]["status"].as_str() == Some("running"),
-        format!("HTTP {s}, body 截断: {}", trunc(&b, 120)),
+        "stop 后 start 唤醒 → running（120s 轮询兼容 K8s 异步）",
+        accepted && st == "running",
+        format!("HTTP {s}, status={st}"),
     );
 
     drop(
