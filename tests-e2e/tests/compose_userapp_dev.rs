@@ -520,3 +520,414 @@ async fn userapp_dev_two_turn_isolation_anthropic() {
     let _gate = scenario_gate().await;
     scenario_userapp_two_turn_isolation(Backend::Anthropic).await;
 }
+
+// ============================================================
+// B1 归档下载族：zip-workspace / download-all-files（PK 魔数 + 兜底差异）
+// ============================================================
+#[tokio::test]
+async fn userapp_dev_archive_downloads() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_archive";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "zip");
+    let user = "e2e-ud-user";
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 造内容
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/generate-file", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &app)
+        .json(&json!({"app_id": app, "user_id": user, "file_name": "zip-probe.txt", "content": "zip-probe-content"}))
+        .send()
+        .await
+        .expect("generate");
+    report.assert_hard(
+        "归档前置：generate-file 造内容",
+        resp.status().is_success(),
+        format!("HTTP {}", resp.status()),
+    );
+
+    // zip-workspace：application/zip + PK 魔数 + Content-Disposition
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/zip-workspace", env.rcoder))
+        .timeout(Duration::from_secs(60))
+        .header("X-App-Id", &app)
+        .json(&json!({"app_id": app, "user_id": user}))
+        .send()
+        .await
+        .expect("zip post");
+    let status = resp.status();
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let cd = resp
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let bytes = resp.bytes().await.unwrap_or_default();
+    let zip_ok = status.is_success()
+        && ct.contains("application/zip")
+        && cd.contains(&format!("{user}_{app}"))
+        && bytes.len() > 4
+        && bytes[..2] == *b"PK";
+    report.assert_hard(
+        "zip-workspace → zip 流（PK 魔数 + Content-Disposition 文件名）",
+        zip_ok,
+        format!("HTTP {status}, ct={ct}, cd={cd}, {} bytes", bytes.len()),
+    );
+
+    // download-all-files：顶层前缀 + 同魔数
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/download-all-files?app_id={app}&user_id={user}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(60))
+        .header("X-App-Id", &app)
+        .send()
+        .await
+        .expect("download get");
+    let status = resp.status();
+    let bytes = resp.bytes().await.unwrap_or_default();
+    report.assert_hard(
+        "download-all-files → zip 流（PK 魔数）",
+        status.is_success() && bytes.len() > 4 && bytes[..2] == *b"PK",
+        format!("HTTP {status}, {} bytes", bytes.len()),
+    );
+
+    // 兜底差异：workspace 不存在——zip-workspace 404 / download-all-files 空 zip 200。
+    // 用"容器在 + destroy dev storage（目录已删）"构造：ghost app 透传 ensure 新建
+    // 容器后 file-server 有启动窗口，无就绪退避会 502（实现差距已记录在案）
+    drop(
+        post_json(
+            &env,
+            &format!("/api/v1/userapp/{app}/dev/storage/destroy"),
+            json!({"user_id": user, "confirm": app}),
+        )
+        .await,
+    );
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/zip-workspace", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &app)
+        .json(&json!({"app_id": app, "user_id": user}))
+        .send()
+        .await
+        .expect("destroyed zip");
+    // 实测发现：zip-workspace 的 404 分支不可达——resolve_userapp_dev 有
+    // create_dir_all 副作用，透传到达前 workspace 根已被幂等重建（恒 200 空 zip）
+    report.assert_hard(
+        "zip-workspace workspace 已 destroy → 200（resolve 幂等重建，404 不可达）",
+        resp.status().is_success(),
+        format!("HTTP {}", resp.status()),
+    );
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/download-all-files?app_id={app}&user_id={user}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &app)
+        .send()
+        .await
+        .expect("destroyed download");
+    let dl_status = resp.status();
+    let dl_bytes = resp.bytes().await.unwrap_or_default();
+    report.assert_hard(
+        "download-all-files 目录不存在 → 空 zip 兜底（200 + PK）",
+        dl_status.is_success() && dl_bytes.len() > 4 && dl_bytes[..2] == *b"PK",
+        format!("HTTP {dl_status}, {} bytes", dl_bytes.len()),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
+// ============================================================
+// B2 push-skills：multipart skill zip → updated_skills + 落盘
+// ============================================================
+#[tokio::test]
+async fn userapp_dev_skills_push() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_skills";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "skl");
+    let user = "e2e-ud-user";
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 构造 skill zip（e2e-skill-probe/SKILL.md）
+    let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    zw.start_file("skills/e2e-skill-probe/SKILL.md", opts)
+        .unwrap();
+    std::io::Write::write_all(&mut zw, b"---\nname: e2e-skill-probe\n---\nprobe\n").unwrap();
+    let zip_bytes = zw.finish().unwrap().into_inner();
+
+    let part = reqwest::multipart::Part::bytes(zip_bytes).file_name("skills.zip");
+    let form = reqwest::multipart::Form::new()
+        .text("app_id", app.clone())
+        .text("user_id", user.to_owned())
+        .part("file", part);
+    let resp = env
+        .http
+        .post(format!(
+            "{}/api/v1/userapp/push-skills-to-workspace",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(60))
+        .header("X-App-Id", &app)
+        .multipart(form)
+        .send()
+        .await
+        .expect("skills post");
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let pushed = status.is_success()
+        && body["success"].as_bool() == Some(true)
+        && body["updated_skills"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|s| s == "e2e-skill-probe"));
+    report.assert_hard(
+        "push-skills → updated_skills 含探针 skill",
+        pushed,
+        format!("HTTP {status}, body 截断: {}", trunc(&body, 150)),
+    );
+
+    // 落盘复核：get-file-list 看 .agents/skills
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/get-file-list?app_id={app}&user_id={user}&recursive=false&relative_path=.agents/skills",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &app)
+        .send()
+        .await
+        .expect("list skills");
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let landed = body["files"].as_array().is_some_and(|files| {
+        files.iter().any(|f| {
+            f["name"]
+                .as_str()
+                .is_some_and(|n| n.contains("e2e-skill-probe"))
+        })
+    });
+    report.assert_hard(
+        "push-skills 落盘 .agents/skills/<name>",
+        landed,
+        format!("body 截断: {}", trunc(&body, 150)),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
+// ============================================================
+// B3 模板 zip 上传 + projects detect/confirm 门面
+// ============================================================
+#[tokio::test]
+async fn userapp_dev_template_zip_and_projects() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_tpl_zip";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "tpl");
+    let user = "e2e-ud-user";
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 最小模板 zip：workspace.manifest.toml + backend-go go 特征。
+    // 不放正式 project.manifest.toml——detect 对已 confirm 的项目 400
+    // "already has a confirmed manifest"；只放特征让 detect 生成 draft
+    let ws_manifest = "schema_version = 1\n\n[workspace]\nname = \"e2e-tpl\"\n";
+    let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    zw.start_file("workspace.manifest.toml", opts).unwrap();
+    std::io::Write::write_all(&mut zw, ws_manifest.as_bytes()).unwrap();
+    zw.start_file("backend-go/go.mod", opts).unwrap();
+    std::io::Write::write_all(&mut zw, b"module e2e/tpl\n\ngo 1.26\n").unwrap();
+    zw.start_file("backend-go/main.go", opts).unwrap();
+    std::io::Write::write_all(&mut zw, b"package main\n\nfunc main() {}\n").unwrap();
+    let zip_bytes = zw.finish().unwrap().into_inner();
+
+    let part = reqwest::multipart::Part::bytes(zip_bytes).file_name("template.zip");
+    let form = reqwest::multipart::Form::new()
+        .text("app_id", app.clone())
+        .text("user_id", user.to_owned())
+        .text("enable_git", "false")
+        .part("file", part);
+    let resp = env
+        .http
+        .post(format!(
+            "{}/api/v1/userapp/init-project-template",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(60))
+        .header("X-App-Id", &app)
+        .multipart(form)
+        .send()
+        .await
+        .expect("init zip");
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let init_ok = status.is_success()
+        && body["success"].as_bool() == Some(true)
+        && body["workspace_root"]
+            .as_str()
+            .is_some_and(|w| !w.is_empty());
+    report.assert_hard(
+        "init-project-template（zip 上传形态）→ workspace_root",
+        init_ok,
+        format!("HTTP {status}, body 截断: {}", trunc(&body, 150)),
+    );
+    if !init_ok {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // projects/detect
+    let (ds, db) = post_json(
+        &env,
+        &format!("/api/v1/userapp/{app}/dev/projects/detect"),
+        json!({"user_id": user, "project_dir": "backend-go"}),
+    )
+    .await;
+    let detect_ok = ds.is_success()
+        && http_ok(&db)
+        && db["data"]["detection"]["detected_type"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty());
+    report.assert_hard(
+        "projects/detect → detected_type 非空",
+        detect_ok,
+        format!("HTTP {ds}, body 截断: {}", trunc(&db, 180)),
+    );
+
+    // projects/confirm + 幂等
+    let (c1s, c1b) = post_json(
+        &env,
+        &format!("/api/v1/userapp/{app}/dev/projects/confirm"),
+        json!({"user_id": user, "project_dir": "backend-go"}),
+    )
+    .await;
+    let confirm_ok = c1s.is_success()
+        && http_ok(&c1b)
+        && c1b["data"]["path"].as_str().is_some_and(|p| !p.is_empty());
+    report.assert_hard(
+        "projects/confirm → data.path 非空",
+        confirm_ok,
+        format!("HTTP {c1s}, body 截断: {}", trunc(&c1b, 150)),
+    );
+    if confirm_ok {
+        // confirm 是一次性状态迁移（draft rename 为正式 manifest）——二次
+        // 必然拒绝（draft 已不存在），与 detect 的 already-confirmed 语义自洽
+        let (c2s, c2b) = post_json(
+            &env,
+            &format!("/api/v1/userapp/{app}/dev/projects/confirm"),
+            json!({"user_id": user, "project_dir": "backend-go"}),
+        )
+        .await;
+        let second_rejected = !http_ok(&c2b) || c2b["data"]["path"].as_str().is_none();
+        report.assert_hard(
+            "projects/confirm 二次 → 拒绝（一次性状态迁移）",
+            second_rejected,
+            format!("HTTP {c2s}, body 截断: {}", trunc(&c2b, 120)),
+        );
+    }
+
+    // prod stage → 400（dev-only 能力）
+    let (ps, _) = post_json(
+        &env,
+        &format!("/api/v1/userapp/{app}/prod/projects/detect"),
+        json!({"user_id": user, "project_dir": "backend-go"}),
+    )
+    .await;
+    report.assert_hard(
+        "projects/detect stage=prod → 400（dev-only）",
+        ps.as_u16() == 400,
+        format!("HTTP {ps}"),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
+// ============================================================
+// B4 dev/dbx 代理（Pingora 8089 真实代理面）
+// ============================================================
+#[tokio::test]
+async fn userapp_dev_dbx_proxy() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_dbx";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "dbx");
+    let user = "e2e-ud-user";
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // Pingora dev/dbx → builder 容器 dbx-web 4224 GUI 页
+    let pingora = std::env::var("E2E_PINGORA_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8089".to_owned());
+    let resp = env
+        .http
+        .get(format!("{pingora}/userapp/dev/dbx/{user}/{app}/"))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await;
+    let ok = matches!(&resp, Ok(r) if r.status().is_success());
+    report.assert_hard(
+        "Pingora dev/dbx → 200（builder dbx-web GUI）",
+        ok,
+        match &resp {
+            Ok(r) => format!("HTTP {}", r.status()),
+            Err(e) => format!("err: {e}"),
+        },
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}

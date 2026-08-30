@@ -6815,6 +6815,7 @@ dependencies = [
  "shared_types",
  "tokio",
  "uuid",
+ "zip 8.6.0",
 ]
 
 [[package]]
