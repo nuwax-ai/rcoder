@@ -159,6 +159,7 @@ docker-build-agent-runner:
 	@mkdir -p docker/rcoder-agent-runner/bin
 	@docker create --name build-container dev-rcoder-agent-runner-build
 	@docker cp build-container:/build/target/release/agent_runner docker/rcoder-agent-runner/bin/
+	@docker cp build-container:/build/crates/app-cli/target/release/app-cli docker/rcoder-agent-runner/bin/
 	@docker rm build-container
 	@docker rmi dev-rcoder-agent-runner-build
 	@echo "📦 步骤3: 构建最终的 agent-runner 镜像（基于基础镜像，快速）..."

@@ -165,6 +165,18 @@ RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
 
 # 复制预构建的 agent_runner 二进制文件
 COPY bin/agent_runner /usr/local/bin/agent_runner
+# app-cli（dev/start manifest 引擎前置；与生产 L324-329 同源——从 Dockerfile.build
+# 的 crates/app-cli/target 复制，bin/ 目录由 make 步骤同步）
+COPY bin/app-cli /usr/local/bin/app-cli
+
+# 安装 dbx-web（DBX 数据库 Web GUI，supervisor conf.d/dbx.conf 托管 :4224；
+# 对齐生产 L358-365——二进制从 build_config downloads/ 分发，本地直接 COPY）
+ARG TARGETARCH
+COPY downloads/dbx-web-${TARGETARCH} /usr/local/bin/dbx-web
+COPY downloads/dbx-static/ /usr/local/share/dbx/static
+RUN chmod +x /usr/local/bin/dbx-web
+# supervisor conf.d/dbx.conf（:4224 恒起；与生产 supervisor/conf.d 同源）
+COPY supervisor/conf.d/dbx.conf /etc/supervisor/conf.d/dbx.conf
 RUN chmod +x /usr/local/bin/agent_runner
 
 # 复制启动脚本

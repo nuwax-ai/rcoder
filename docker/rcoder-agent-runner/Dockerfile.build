@@ -61,3 +61,9 @@ ARG RUSTFLAGS=""
 ENV RUSTFLAGS="${RUSTFLAGS}"
 RUN echo "🔧 Cargo flags: ${CARGO_FLAGS}" && \
     cargo build --release --bin agent_runner ${CARGO_FLAGS}
+
+# 构建 app-cli（UserApp 容器编排器；对齐生产 build_config L70-77）：
+# app-cli 被 workspace exclude（独立 Cargo.lock），不能从根 --bin 构建，
+# 必须 cd 进 crate 目录单独编；输出在 crate 自己的 target 下。
+# dev/start（manifest 引擎 spawn app-cli）的前置。
+RUN cd crates/app-cli && cargo build --release

@@ -144,3 +144,21 @@ docker-build-agent-base: docker-pre-download-libreoffice
 		echo "⏭️  跳过基础镜像推送（PUSH_IMAGE != true）。如需推送：make ... PUSH_IMAGE=true"; \
 	fi
 	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"
+
+# ============================================================================
+# dbx-web 预抽取（对齐生产 build-agent-docker 16-app-runtime.mk 的
+# download-dbx-cache：官方二进制唯一来源是官方 Docker 镜像；本地直接从
+# build_config downloads/ 复用（单一来源），不可达时才走抽取）
+# ============================================================================
+.PHONY: download-dbx-cache
+download-dbx-cache:
+	@BUILD_CONFIG_DIR=~/Documents/git-workspace/build-agent-docker/build_config/rcoder-agent-runner; \
+	if [ -f "$$BUILD_CONFIG_DIR/downloads/dbx-web-$$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/')" ]; then \
+		echo "📦 复用 build_config downloads/dbx-web（单一来源）"; \
+		mkdir -p docker/rcoder-agent-runner/downloads; \
+		cp -p $$BUILD_CONFIG_DIR/downloads/dbx-web-arm64 $$BUILD_CONFIG_DIR/downloads/dbx-web-amd64 docker/rcoder-agent-runner/downloads/ 2>/dev/null; \
+		cp -R $$BUILD_CONFIG_DIR/downloads/dbx-static docker/rcoder-agent-runner/downloads/; \
+	else \
+		echo "❌ build_config downloads 无 dbx-web，请先在生产仓跑 make download-dbx-cache"; exit 1; \
+	fi
+	@echo "  ✓ dbx-web 就绪: docker/rcoder-agent-runner/downloads/"

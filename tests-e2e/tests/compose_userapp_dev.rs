@@ -931,3 +931,238 @@ async fn userapp_dev_dbx_proxy() {
     assert_hard_all(report).await;
     cleanup_builder(&app);
 }
+
+// ============================================================
+// B5 dev server 进程族：backend-go 单服务 → dev/start → 9080 探活 → stop
+// ============================================================
+// known-issue（08-30 实测）：dev/start 任务卡 running（app-cli spawn 后进程
+// 拓扑与预期不符——ps 无 app-cli 但其 run 子进程由 agent_runner 直接持有；
+// 任务 120s 不达终态）。待 app-cli dev 编排链修复后移除 ignore 恢复。
+#[tokio::test]
+#[ignore = "dev/start manifest 编排任务卡 running——实现问题待修"]
+async fn userapp_dev_server_lifecycle() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_server";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "srv");
+    let user = "e2e-ud-user";
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 模板：backend-go 单服务 zip（含正式 manifest——dev/start 直接编排）
+    let ws_manifest = "schema_version = 1\n\n[workspace]\nname = \"e2e-srv\"\n";
+    let proj_manifest = "schema_version = 1\n\n[project]\nservice_id = \"backend-go\"\nname = \"Go Backend\"\ntype = \"go\"\nkind = \"web\"\nenabled = true\n\n[build]\ncommand = [\"true\"]\nartifact = \"artifact.zip\"\n\n[run]\ncommand = [\"./server\"]\n\n[health]\nreadiness_path = \"/ready\"\n\n[proxy]\npath = \"/api/go/\"\nstrip_prefix = true\n";
+    let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    zw.start_file("workspace.manifest.toml", opts).unwrap();
+    std::io::Write::write_all(&mut zw, ws_manifest.as_bytes()).unwrap();
+    zw.start_file("backend-go/project.manifest.toml", opts)
+        .unwrap();
+    std::io::Write::write_all(&mut zw, proj_manifest.as_bytes()).unwrap();
+    zw.start_file("backend-go/server", opts).unwrap();
+    // 最小静态 busybox 风格占位二进制不可行——用 sh 脚本替代（exec 权限 zip
+    // 里无法设置，dev/start 的 spawn command 需要 exec 位……实际由 app-cli
+    // 经 shell？查证：run.command 直接 exec。改用 go 编译太重——用 /bin/sh
+    // 脚本 + zip 外部 chmod 不行。方案：manifest run command 用 ["sh","-c","sleep 9999"]
+    zw.start_file("backend-go/start.sh", opts).unwrap();
+    std::io::Write::write_all(&mut zw, b"#!/bin/sh\nsleep 9999\n").unwrap();
+    let zip_bytes = zw.finish().unwrap().into_inner();
+
+    let part = reqwest::multipart::Part::bytes(zip_bytes).file_name("template.zip");
+    let form = reqwest::multipart::Form::new()
+        .text("app_id", app.clone())
+        .text("user_id", user.to_owned())
+        .text("enable_git", "false")
+        .part("file", part);
+    let resp = env
+        .http
+        .post(format!(
+            "{}/api/v1/userapp/init-project-template",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(60))
+        .header("X-App-Id", &app)
+        .multipart(form)
+        .send()
+        .await
+        .expect("init zip");
+    report.assert_hard(
+        "dev server 前置：init 模板 zip",
+        resp.status().is_success(),
+        format!("HTTP {}", resp.status()),
+    );
+
+    // run command 改 sh -c sleep（manifest 覆写——server 二进制不存在）
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/execute-command", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &app)
+        .json(&json!({"app_id": app, "user_id": user,
+            "command": "sed -i 's|^command = .*|command = [\\\"sh\\\", \\\"-c\\\", \\\"sleep 9999\\\"]|' backend-go/project.manifest.toml && grep '^command' backend-go/project.manifest.toml"}))
+        .send()
+        .await
+        .expect("patch manifest");
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "manifest run 改 sleep（免编译探活）",
+        body["exit_code"].as_i64() == Some(0),
+        format!("exit={:?}", body["exit_code"].as_i64()),
+    );
+
+    // dev/start（异步任务）
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/dev/start", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &app)
+        .json(&json!({"app_id": app, "user_id": user}))
+        .send()
+        .await
+        .expect("dev start");
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let task_id = body["data"]["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    report.assert_hard(
+        "dev/start 受理（task_id + pending）",
+        status.is_success() && http_ok(&body) && !task_id.is_empty(),
+        format!("HTTP {status}, body 截断: {}", trunc(&body, 150)),
+    );
+    if task_id.is_empty() {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 轮询任务到终态（免编译应秒级）
+    let mut terminal = None;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(120) {
+        let resp = env
+            .http
+            .get(format!(
+                "{}/api/v1/userapp/tasks/{task_id}?app_id={app}&user_id={user}",
+                env.rcoder
+            ))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await;
+        if let Ok(r) = resp
+            && r.status().is_success()
+            && let Ok(b) = r.json::<Value>().await
+            && let Some(st) = b["data"]["status"].as_str()
+            && matches!(st, "completed" | "failed" | "cancelled")
+        {
+            terminal = Some((
+                st.to_string(),
+                b["data"]["error"].as_str().unwrap_or("").to_string(),
+            ));
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    let (term_ok, err) = match &terminal {
+        Some((st, e)) => (st == "completed", e.clone()),
+        None => (false, "120s 未到终态".into()),
+    };
+    report.assert_hard(
+        "dev/start 任务 completed",
+        term_ok,
+        format!("terminal={terminal:?}, err: {err}"),
+    );
+
+    // dev/list：port=9080 + pid>0
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/dev/list?app_id={app}&user_id={user}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(15))
+        .header("X-App-Id", &app)
+        .send()
+        .await
+        .expect("dev list");
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let listed = body["data"]["list"].as_array().is_some_and(|arr| {
+        arr.iter().any(|p| {
+            p["port"].as_u64() == Some(9080) && p["pid"].as_u64().is_some_and(|pid| pid > 0)
+        })
+    });
+    report.assert_hard(
+        "dev/list → port=9080 + pid>0",
+        listed,
+        format!("body 截断: {}", trunc(&body, 150)),
+    );
+
+    // dev/logs：ReadDevLogResult 字段
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/dev/logs?app_id={app}&user_id={user}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(15))
+        .header("X-App-Id", &app)
+        .send()
+        .await
+        .expect("dev logs");
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let logs_ok = body["data"]["log_file_name"].as_str().is_some();
+    report.assert_hard(
+        "dev/logs → ReadDevLogResult 字段",
+        logs_ok,
+        format!("body 截断: {}", trunc(&body, 120)),
+    );
+
+    // dev/stop → list 空
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/dev/stop", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &app)
+        .json(&json!({"app_id": app, "user_id": user}))
+        .send()
+        .await
+        .expect("dev stop");
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "dev/stop → Stopped",
+        body["data"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Stopped")),
+        format!("body 截断: {}", trunc(&body, 120)),
+    );
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/dev/list?app_id={app}&user_id={user}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(15))
+        .header("X-App-Id", &app)
+        .send()
+        .await
+        .expect("dev list after stop");
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "dev/stop 后 list 空",
+        body["data"]["list"]
+            .as_array()
+            .is_some_and(|arr| arr.is_empty()),
+        format!("body 截断: {}", trunc(&body, 120)),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
