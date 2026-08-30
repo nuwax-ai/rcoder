@@ -77,7 +77,7 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
         (status = 200, description = "对齐完成（aligned=true；reset_performed 表示是否执行了重置）", body = HttpResult<shared_types::AlignCredentialsOutcome>),
         (status = 400, description = "参数校验失败（app_stage/username/password）", body = HttpResult<String>),
         (status = 404, description = "prod 环境 app 不存在或未运行", body = HttpResult<String>),
-        (status = 502, description = "开发容器不可达", body = HttpResult<String>)
+        (status = 500, description = "开发容器不可达（ERR_CONTAINER_ERROR 映射 500，非 502）", body = HttpResult<String>)
     ),
     tag = "UserApp · 双态 · 数据库",
     operation_id = "align_userapp_db_credentials",
@@ -261,9 +261,12 @@ async fn resolve_exec_target(
         UserappStage::Prod => {
             if let Err(e) = state.app_service.get_app(app_id).await {
                 tracing::error!("[USERAPP_DB_ADMIN] prod app not found: app_id={app_id}: {e:#}");
-                return Err(AppError::not_found(&format!(
-                    "userapp prod app not found: {e:#}"
-                )));
+                // 与 align prod 侧同码（ERR_APP_NOT_FOUND）——同一"应用不存在"语义
+                // 双码（ERR_NOT_FOUND）曾是历史不一致，未上线期统一
+                return Err(AppError::with_message(
+                    shared_types::error_codes::ERR_APP_NOT_FOUND,
+                    format!("userapp prod app not found: {e:#}"),
+                ));
             }
             use shared_types::AppWakeControl;
             match state.activity.ensure_running(app_id).await {

@@ -576,7 +576,492 @@ async fn userapp_compose_regression() {
     test_start_without_app_semantics(&env, &report).await;
     test_env_scoped_files_and_storage(&env, &report).await;
     test_dev_logs_and_listing(&env, &report).await;
+    test_query_pagination_validation(&env, &report).await;
+    test_update_stop_restart(&env, &report).await;
+    test_storage_guards(&env, &report).await;
+    test_recycle_policy(&env, &report).await;
+    test_observation_error_shapes(&env, &report).await;
+    test_terminal_proxy_redirects(&env, &report).await;
+    test_ensure_workspace_idempotent(&env, &report).await;
 
     let path = report.path.display().to_string();
     assert!(report.finish(), "场景失败：断言明细见 {path}");
+}
+
+/// A1 query 排序/分页校验（400 三态 + 合法形态）。
+async fn test_query_pagination_validation(env: &Env, report: &JsonlReporter) {
+    let user = "e2e-user";
+    // 400：page < 1
+    let (s, _) = post_json(
+        env,
+        "/api/v1/userapp/query",
+        json!({"user_id": user, "page": 0}),
+    )
+    .await;
+    report.assert_hard("query page=0 → 400", s.as_u16() == 400, format!("HTTP {s}"));
+    // 400：page_size 超界（>100）
+    let (s, _) = post_json(
+        env,
+        "/api/v1/userapp/query",
+        json!({"user_id": user, "page_size": 101}),
+    )
+    .await;
+    report.assert_hard(
+        "query page_size=101 → 400（1..=100）",
+        s.as_u16() == 400,
+        format!("HTTP {s}"),
+    );
+    // 400：非法 sort_by
+    let (s, _) = post_json(
+        env,
+        "/api/v1/userapp/query",
+        json!({"user_id": user, "sort_by": "bogus_field"}),
+    )
+    .await;
+    report.assert_hard(
+        "query sort_by=bogus → 400（仅 app_id/name/created_at）",
+        s.as_u16() == 400,
+        format!("HTTP {s}"),
+    );
+    // 合法：sort_by=app_id + 分页结构
+    let (s, b) = post_json(
+        env,
+        "/api/v1/userapp/query",
+        json!({"user_id": user, "sort_by": "app_id", "page": 1, "page_size": 5}),
+    )
+    .await;
+    let ok = s.is_success()
+        && http_ok(&b)
+        && b["data"]["pagination"]["page"].as_u64() == Some(1)
+        && b["data"]["pagination"]["page_size"].as_u64() == Some(5)
+        && b["data"]["items"].as_array().is_some();
+    report.assert_hard(
+        "query 合法形态（sort_by=app_id + 分页结构）",
+        ok,
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 120)),
+    );
+}
+
+/// A2 update/stop/restart 语义闭环。
+async fn test_update_stop_restart(env: &Env, report: &JsonlReporter) {
+    let suffix = format!(
+        "{}{}",
+        &env.run_tag.replace('_', "")[..10],
+        std::process::id() % 1000
+    );
+    let user = "e2e-user";
+
+    // 404：update / stop 不存在 app
+    let (s, _) = post_json(
+        env,
+        &format!("/api/v1/userapp/app-e2e-noup-{suffix}/update"),
+        json!({"user_id": user}),
+    )
+    .await;
+    report.assert_hard(
+        "update 不存在 app → 404",
+        s.as_u16() == 404,
+        format!("HTTP {s}"),
+    );
+    let (s, _) = post_json(
+        env,
+        &format!("/api/v1/userapp/app-e2e-nostop-{suffix}/stop?user_id={user}"),
+        json!({}),
+    )
+    .await;
+    report.assert_hard(
+        "stop 不存在 app → 404",
+        s.as_u16() == 404,
+        format!("HTTP {s}"),
+    );
+    // 400：stop 缺 user_id query
+    let (s, _) = post_json(env, "/api/v1/userapp/app-e2e-any/stop", json!({})).await;
+    report.assert_hard(
+        "stop 缺 user_id query → 400",
+        s.as_u16() == 400,
+        format!("HTTP {s}"),
+    );
+
+    // 闭环：空容器 → update{name} → stop → 唤醒
+    let app_id = format!("app-e2e-usr-{suffix}");
+    let (s, b) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app_id}/start"),
+        json!({"user_id": user}),
+    )
+    .await;
+    let created = s.is_success() && http_ok(&b);
+    report.assert_hard(
+        "update/stop 前置：start 空容器",
+        created,
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 120)),
+    );
+    if !created {
+        return;
+    }
+    let (s, b) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app_id}/update"),
+        json!({"user_id": user, "name": "e2e-renamed"}),
+    )
+    .await;
+    report.assert_hard(
+        "update{name} → 200（live 回退其余字段）",
+        s.is_success() && http_ok(&b),
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 120)),
+    );
+
+    let (s, b) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app_id}/stop?user_id={user}"),
+        json!({}),
+    )
+    .await;
+    let stopped = s.is_success()
+        && http_ok(&b)
+        && b["data"]["status"].as_str() == Some("stopped")
+        && b["data"]["replicas"].as_u64() == Some(0);
+    report.assert_hard(
+        "stop → stopped / replicas=0",
+        stopped,
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 150)),
+    );
+
+    // 唤醒：start（无 url 传统启动=唤醒通道）
+    let (s, b) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app_id}/start"),
+        json!({"user_id": user}),
+    )
+    .await;
+    report.assert_hard(
+        "stop 后 start 唤醒 → running",
+        s.is_success() && http_ok(&b) && b["data"]["status"].as_str() == Some("running"),
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 120)),
+    );
+
+    drop(
+        post_json(
+            env,
+            &format!("/api/v1/userapp/{app_id}/prod/delete"),
+            json!({"user_id": user, "purge": true}),
+        )
+        .await,
+    );
+}
+
+/// A3 storage 守卫（GET 幂等 + clear/destroy 前置）。
+async fn test_storage_guards(env: &Env, report: &JsonlReporter) {
+    let user = "e2e-user";
+    // GET 随机 app：200 + exists=false（不校验 app 存在性）
+    let (s, b) = get_json(
+        env,
+        &format!("/api/v1/userapp/app-e2e-ghost-{user}/prod/storage?user_id={user}"),
+    )
+    .await;
+    report.assert_hard(
+        "storage GET 不存在 app → 200 + exists=false",
+        s.is_success() && http_ok(&b) && b["data"]["exists"] == false,
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 120)),
+    );
+    // clear 未 delete → 409（前置：app 有计算资源——Docker 模式下 ghost app 的
+    // deployment 查询返回 None → 守卫通过 → 幂等成功；须真实容器验证守卫分支）
+    let guard_app = format!(
+        "app-e2e-clr-{}{}",
+        &env.run_tag.replace('_', "")[..10],
+        std::process::id() % 1000
+    );
+    let (cs, _) = post_json(
+        env,
+        &format!("/api/v1/userapp/{guard_app}/start"),
+        json!({"user_id": user}),
+    )
+    .await;
+    if cs.is_success() {
+        let (s, b) = post_json(
+            env,
+            &format!("/api/v1/userapp/{guard_app}/prod/storage/clear"),
+            json!({"user_id": user}),
+        )
+        .await;
+        report.assert_hard(
+            "storage/clear 对未 delete 的 app → 409",
+            s.as_u16() == 409,
+            format!("HTTP {s}, body 截断: {}", trunc(&b, 100)),
+        );
+        drop(
+            post_json(
+                env,
+                &format!("/api/v1/userapp/{guard_app}/prod/delete"),
+                json!({"user_id": user, "purge": true}),
+            )
+            .await,
+        );
+    } else {
+        report.assert_hard(
+            "storage/clear 前置：start 空容器",
+            false,
+            format!("HTTP {cs}"),
+        );
+    }
+    // destroy confirm 不匹配 → 400
+    let (s, b) = post_json(
+        env,
+        &format!("/api/v1/userapp/app-e2e-ghost-{user}/prod/storage/destroy"),
+        json!({"user_id": user, "confirm": "wrong-confirm"}),
+    )
+    .await;
+    report.assert_hard(
+        "storage/destroy confirm≠app_id → 400",
+        s.as_u16() == 400,
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 100)),
+    );
+}
+
+/// A4 recycle-policy 守卫与成功。
+async fn test_recycle_policy(env: &Env, report: &JsonlReporter) {
+    let user = "e2e-user";
+    let suffix = format!(
+        "{}{}",
+        &env.run_tag.replace('_', "")[..10],
+        std::process::id() % 1000
+    );
+    // 400：stage=dev
+    let (s, _) = post_json(
+        env,
+        &format!("/api/v1/userapp/app-e2e-rc-{suffix}/dev/recycle-policy"),
+        json!({"user_id": user, "recycle_enabled": true}),
+    )
+    .await;
+    report.assert_hard(
+        "recycle-policy stage=dev → 400（仅 prod）",
+        s.as_u16() == 400,
+        format!("HTTP {s}"),
+    );
+    // 400：三可选字段全缺
+    let (s, _) = post_json(
+        env,
+        &format!("/api/v1/userapp/app-e2e-rc-{suffix}/prod/recycle-policy"),
+        json!({"user_id": user}),
+    )
+    .await;
+    report.assert_hard(
+        "recycle-policy 三字段全缺 → 400",
+        s.as_u16() == 400,
+        format!("HTTP {s}"),
+    );
+    // 400：非法 user_id
+    let (s, _) = post_json(
+        env,
+        &format!("/api/v1/userapp/app-e2e-rc-{suffix}/prod/recycle-policy"),
+        json!({"user_id": "bad user!", "recycle_enabled": true}),
+    )
+    .await;
+    report.assert_hard(
+        "recycle-policy 非法 user_id → 400",
+        s.as_u16() == 400,
+        format!("HTTP {s}"),
+    );
+
+    // 成功：空容器上设置
+    let app_id = format!("app-e2e-rc-{suffix}");
+    let (cs, cb) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app_id}/start"),
+        json!({"user_id": user}),
+    )
+    .await;
+    if !(cs.is_success() && http_ok(&cb)) {
+        report.assert_hard(
+            "recycle-policy 前置：start 空容器",
+            false,
+            format!("HTTP {cs}"),
+        );
+        return;
+    }
+    let (s, b) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app_id}/prod/recycle-policy"),
+        json!({"user_id": user, "recycle_enabled": false, "idle_timeout_seconds": 3600}),
+    )
+    .await;
+    report.assert_hard(
+        "recycle-policy prod 成功（200 + runtime 回显）",
+        s.is_success() && http_ok(&b) && b["data"]["app_id"] == app_id,
+        format!("HTTP {s}, body 截断: {}", trunc(&b, 150)),
+    );
+    drop(
+        post_json(
+            env,
+            &format!("/api/v1/userapp/{app_id}/prod/delete"),
+            json!({"user_id": user, "purge": true}),
+        )
+        .await,
+    );
+}
+
+/// A5 观测接口错误形态（404/400）。
+async fn test_observation_error_shapes(env: &Env, report: &JsonlReporter) {
+    let user = "e2e-user";
+    let ghost = "app-e2e-ghost-obs";
+    // health 不存在 app → 404
+    let (s, _) = get_json(
+        env,
+        &format!("/api/v1/userapp/{ghost}/prod/health?user_id={user}"),
+    )
+    .await;
+    report.assert_hard(
+        "health 不存在 app → 404",
+        s.as_u16() == 404,
+        format!("HTTP {s}"),
+    );
+    // logs sources/query 不存在 app → 404
+    let (s, _) = post_json(
+        env,
+        &format!("/api/v1/userapp/{ghost}/prod/logs/sources/query?user_id={user}"),
+        json!({}),
+    )
+    .await;
+    report.assert_hard(
+        "logs/sources/query 不存在 app → 404",
+        s.as_u16() == 404,
+        format!("HTTP {s}"),
+    );
+    // logs/query 不存在 app → 404
+    let (s, _) = post_json(
+        env,
+        &format!("/api/v1/userapp/{ghost}/prod/logs/query?user_id={user}"),
+        json!({"tail": 10}),
+    )
+    .await;
+    report.assert_hard(
+        "logs/query 不存在 app → 404",
+        s.as_u16() == 404,
+        format!("HTTP {s}"),
+    );
+    // 非法 stage → 400
+    let (s, _) = get_json(
+        env,
+        &format!("/api/v1/userapp/{ghost}/staging/health?user_id={user}"),
+    )
+    .await;
+    report.assert_hard(
+        "health 非法 stage → 400",
+        s.as_u16() == 400,
+        format!("HTTP {s}"),
+    );
+}
+
+/// 禁跟随重定向的 client（307 断言用——共享 client 自动 follow 会打到
+/// Pingora 宿主端口而 compose 映射是 8089≠8088）。
+fn no_redirect_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build no-redirect client")
+    })
+}
+
+/// A6 终端代理主端口 307 文档重定向（零依赖，恒可断言）。
+async fn test_terminal_proxy_redirects(env: &Env, report: &JsonlReporter) {
+    let user = "e2e-user";
+    // 三个工具族变体：307 + Location 是绝对 URL 指向 Pingora 入口
+    // （{*path} 需非空段——尾斜杠空段不匹配会 404，root 用无尾变体/带子路径）
+    for (tool, path) in [
+        ("ttyd", "dev/ttyd/{user}/{app}"),
+        ("dbx", "prod/dbx/{user}/{app}/ws"),
+        ("vnc", "dev/vnc/{user}/{app}/x"),
+    ] {
+        let app = format!("app-e2e-{tool}");
+        let url = format!(
+            "/userapp/{}",
+            path.replace("{user}", user).replace("{app}", &app)
+        );
+        let resp = no_redirect_client()
+            .get(format!("{}{url}", env.rcoder))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .expect("redirect get");
+        let status = resp.status().as_u16();
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let ok = status == 307 && location.contains("://") && location.contains("/userapp/");
+        report.assert_hard(
+            &format!("终端代理[{tool}] 主端口 → 307 + Location 重定向"),
+            ok,
+            format!("HTTP {status}, Location: {location}"),
+        );
+    }
+    // 文档速查表
+    let resp = env
+        .http
+        .get(format!("{}/userapp/routes", env.rcoder))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .expect("routes get");
+    report.assert_hard(
+        "/userapp/routes 速查表 → 200",
+        resp.status().is_success(),
+        format!("HTTP {}", resp.status()),
+    );
+}
+
+/// A7 ensure-workspace 幂等。
+async fn test_ensure_workspace_idempotent(env: &Env, report: &JsonlReporter) {
+    let ident = format!(
+        "app-e2e-ew-{}{}",
+        &env.run_tag.replace('_', "")[..10],
+        std::process::id() % 1000
+    );
+    let user = "e2e-user";
+    let call = || async {
+        let resp = env
+            .http
+            .post(format!("{}/api/v1/userapp/ensure-workspace", env.rcoder))
+            .timeout(Duration::from_secs(120))
+            .header("X-App-Id", &ident)
+            .json(&json!({"app_id": ident, "user_id": user}))
+            .send()
+            .await
+            .expect("ensure post");
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        (status, body)
+    };
+    let (s1, b1) = call().await;
+    let first_ok = s1.is_success()
+        && http_ok(&b1)
+        && b1["data"]["workspace"]
+            .as_str()
+            .is_some_and(|w| !w.is_empty());
+    report.assert_hard(
+        "ensure-workspace 首调（懒建容器）",
+        first_ok,
+        format!("HTTP {s1}, body 截断: {}", trunc(&b1, 120)),
+    );
+    if !first_ok {
+        cleanup_builder(&ident);
+        return;
+    }
+    let (s2, b2) = call().await;
+    let idem =
+        s2.is_success() && http_ok(&b2) && b1["data"]["workspace"] == b2["data"]["workspace"];
+    report.assert_hard(
+        "ensure-workspace 幂等（两次 workspace 路径一致）",
+        idem,
+        format!(
+            "1st={:?} 2nd={:?}",
+            b1["data"]["workspace"].as_str(),
+            b2["data"]["workspace"].as_str()
+        ),
+    );
+    cleanup_builder(&ident);
 }

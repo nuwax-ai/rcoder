@@ -152,6 +152,13 @@ pub(crate) async fn forward_userapp(
     };
     match stage {
         UserappStage::Dev => {
+            // ensure-workspace 特判：body 小 JSON（app_id+user_id），完整读取提取
+            // user_id 作懒创建显式 owner 档——透传族流式不解析 body，新 app 无
+            // metadata owner 时 ensure 必 502 "cannot resolve owner user_id"
+            // （body 的 user_id 被透传忽略）。提取后带原 body 重组转发。
+            if path == "/api/v1/userapp/ensure-workspace" {
+                return forward_ensure_workspace(&state, &app_id, req).await;
+            }
             // 停止/查询短路：仅容器不在时生效（容器在则照常转发）
             let action = classify_dev_absent(&path);
             let short_circuit =
@@ -369,4 +376,27 @@ pub(crate) async fn computer_intercept(
             forward_to_prod(&state, &app_id, req).await
         }
     }
+}
+
+/// ensure-workspace 专用转发：读取小 JSON body 提取 user_id 作懒创建显式
+/// owner 档（透传族流式不解析 body 的例外——此接口 body 天然小且语义就是
+/// "幂等建目录"，新 app 无 metadata owner 时必须靠 body 显式档），提取后
+/// 带原 body 重组转发到开发容器。
+async fn forward_ensure_workspace(state: &AppState, app_id: &str, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    // ensure-workspace body 小 JSON，上限 1MB 兜底防滥用
+    let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return HttpResultError::bad_request(format!("read ensure-workspace body: {e}"))
+                .into_response();
+        }
+    };
+    let user_id = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| v.get("user_id").and_then(|u| u.as_str()).map(str::to_owned))
+        .filter(|u| !u.trim().is_empty());
+    // 重组原请求（method/uri/headers 原样）带原 body 转发
+    let rebuilt = Request::from_parts(parts, axum::body::Body::from(bytes));
+    forward_to_dev(state, app_id, rebuilt, user_id.as_deref()).await
 }
