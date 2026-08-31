@@ -425,7 +425,7 @@ async fn scenario_userapp_two_turn_isolation(backend: Backend) {
     let mk_req = |prompt: &str, tag: &str| {
         let mut r = env.base_payload(backend, prompt, &format!("{}-{tag}", env.run_tag), user);
         r.service_type = Some(shared_types::ChatServiceScope::Userapp);
-        r.project_id = Some(app.clone());
+        r.app_id = Some(app.clone());
         r
     };
 

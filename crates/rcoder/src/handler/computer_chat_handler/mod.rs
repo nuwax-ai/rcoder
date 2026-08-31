@@ -135,6 +135,24 @@ async fn run_computer_chat_flow(
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
 
+    // wire 契约防护：app_id 是 userApp 分派定位键，仅在 service_type=userapp
+    // 下合法——只传 app_id 不传 service_type 会静默走 computer 路径（project_id
+    // 自动生成 UUID、app_id 被丢弃跑错沙箱），fail-open 显式拒绝
+    // （agent 族/pod 族以 app_id 存在即分派无此风险；chat 以枚举分派为主判据）
+    let has_app_id = request
+        .app_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    if has_app_id && request.service_type != Some(shared_types::ChatServiceScope::Userapp) {
+        return Err(ChatFlowExit::response(
+            super::pod_handler::invalid_app_target_response(
+                locale,
+                "app_id is only valid with service_type=userapp (computer 路径不消费 app_id)",
+            ),
+        ));
+    }
+
     // userApp 开发对话分支：service_type=Userapp → 该 app 的 UserappBuilder 开发容器
     // （ACP agent 直接在开发卷 workspace 工作，代码生成直接落卷）。
     // 枚举穷尽：未来加业务域变体时此处编译期提醒补分支。
