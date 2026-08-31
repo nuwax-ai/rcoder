@@ -124,40 +124,44 @@ pub async fn install_agent(
 /// 注意：不能用 `AgentDownloadManager::is_cached`——它只判下载缓存
 /// `cache_dir/{agent_id}/{version}`（全局），与具体 install_dir（per-user）无关，
 /// 会导致"首个 user 装上、其余 user 被跳过"的 bug。
-pub fn is_agent_installed(install_dir: &Path, agent_id: &str, version: &str) -> bool {
+///
+/// 只有 async 版：install_dir 在共享网络卷（CephFS）上，同步 read_dir 会
+/// 阻塞 Tokio worker（对齐 manager.rs `is_cached_async` 的既有理由）。
+pub async fn is_agent_installed(install_dir: &Path, agent_id: &str, version: &str) -> bool {
     let target = install_dir.join(agent_id).join(version);
-    std::fs::read_dir(&target)
-        .map(|mut it| it.next().is_some())
-        .unwrap_or(false)
+    match tokio::fs::read_dir(&target).await {
+        Ok(mut it) => it.next_entry().await.map(|e| e.is_some()).unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn is_agent_installed_detects_state() {
+    #[tokio::test]
+    async fn is_agent_installed_detects_state() {
         let tmp = tempfile::tempdir().unwrap();
         let install_dir = tmp.path();
 
         // 不存在 → 未安装
-        assert!(!is_agent_installed(install_dir, "agentA", "1.0.0"));
+        assert!(!is_agent_installed(install_dir, "agentA", "1.0.0").await);
 
         // 版本目录存在且有文件 → 已安装
         let ver_dir = install_dir.join("agentA").join("1.0.0");
         std::fs::create_dir_all(&ver_dir).unwrap();
         std::fs::write(ver_dir.join("bundle.mjs"), "x").unwrap();
-        assert!(is_agent_installed(install_dir, "agentA", "1.0.0"));
+        assert!(is_agent_installed(install_dir, "agentA", "1.0.0").await);
 
         // 版本目录存在但为空（不完整安装）→ 未安装
         let empty_ver = install_dir.join("agentB").join("2.0.0");
         std::fs::create_dir_all(&empty_ver).unwrap();
-        assert!(!is_agent_installed(install_dir, "agentB", "2.0.0"));
+        assert!(!is_agent_installed(install_dir, "agentB", "2.0.0").await);
     }
 
     /// 回归测试：per-user/per-target 安装状态独立判定（不能被全局缓存短路）。
-    #[test]
-    fn per_target_install_state_independent() {
+    #[tokio::test]
+    async fn per_target_install_state_independent() {
         let user1 = tempfile::tempdir().unwrap();
         let user2 = tempfile::tempdir().unwrap();
         let agent_id = "33290548";
@@ -169,7 +173,7 @@ mod tests {
         std::fs::write(u1_ver.join("bundle.mjs"), "x").unwrap();
 
         // user-1 已装、user-2 未装 —— 两者独立判定
-        assert!(is_agent_installed(user1.path(), agent_id, version));
-        assert!(!is_agent_installed(user2.path(), agent_id, version));
+        assert!(is_agent_installed(user1.path(), agent_id, version).await);
+        assert!(!is_agent_installed(user2.path(), agent_id, version).await);
     }
 }

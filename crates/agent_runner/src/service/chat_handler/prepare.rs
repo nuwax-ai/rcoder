@@ -81,9 +81,12 @@ pub(super) async fn prepare_session(
                 let version = server.version.as_deref().unwrap_or("");
 
                 // 有 agent_id + version 才能定位安装目录、判定是否缺失
+                // async 判定：install_root 在共享网络卷上，不阻塞 Tokio worker
+                // （此处帧内无同步锁，await 安全）
                 if !agent_id.is_empty()
                     && !version.is_empty()
                     && !agent_provisioning::is_agent_installed(&install_root, agent_id, version)
+                        .await
                 {
                     let has_platforms = server.platforms.as_ref().is_some_and(|p| !p.is_empty());
                     if has_platforms {
