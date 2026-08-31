@@ -55,8 +55,22 @@ pub async fn import_project(target_dir: &Path, zip_path: &Path) -> AppResult<Imp
         if let Err(e) = clear_except_preserved(target_dir).await {
             tracing::warn!(error = %e, "rollback clear_except_preserved failed (skipping)");
         }
-        if let Err(e) = restore_from_backup(&backup_dir, target_dir).await {
-            tracing::warn!(error = %e, "rollback restore_from_backup failed (skipping)");
+        if let Err(rollback_err) = restore_from_backup(&backup_dir, target_dir).await {
+            // 备份是用户数据的唯一副本（move 语义），守卫 drop 会把它连同数据一起删掉。
+            // 回滚失败的瞬间不能让守卫执行清理：放弃所有权把备份留在原地，路径写进
+            // 错误消息供手动找回（端到端双 IO 故障无法在单测模拟，此处是唯一兜底）。
+            let backup_path = backup_guard.keep().join("content");
+            tracing::error!(
+                error = %rollback_err,
+                backup = %backup_path.display(),
+                target = %target_dir.display(),
+                "import rollback failed, user data preserved in backup dir"
+            );
+            return Err(AppError::system(format!(
+                "import merge failed: {merge_err}; rollback also failed: {rollback_err}; \
+                 original workspace data preserved at {}",
+                backup_path.display()
+            )));
         }
         return Err(merge_err);
     }
@@ -193,5 +207,29 @@ mod tests {
         drop(fs::remove_dir_all(&tmp).await);
         drop(fs::remove_dir_all(&zip_root).await);
         drop(fs::remove_file(&zip_path).await);
+    }
+
+    // 回滚失败链路的可触发性证明：backup 与 target 存在同名非空目录时，
+    // move_dir 的 rename 因 ENOTEMPTY 失败 → import_project 走"保留备份"分支。
+    #[tokio::test]
+    async fn restore_from_backup_fails_on_nonempty_collision() {
+        let base = std::env::temp_dir().join(format!(
+            "fs_restore_{}",
+            crate::service::computer_ws::helpers::now_nanos()
+        ));
+        let backup = base.join("backup");
+        let target = base.join("target");
+        // 两侧各建同名非空目录 proj/（rename 到已存在非空目录 → ENOTEMPTY）
+        for d in [&backup, &target] {
+            fs::create_dir_all(d.join("proj").join("inner"))
+                .await
+                .unwrap();
+            fs::write(d.join("proj").join("inner").join("f.txt"), "x")
+                .await
+                .unwrap();
+        }
+        let res = restore_from_backup(&backup, &target).await;
+        assert!(res.is_err(), "同名非空目录应使 restore 失败");
+        drop(fs::remove_dir_all(&base).await);
     }
 }
