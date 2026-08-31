@@ -45,6 +45,23 @@ pub const WORKSPACE_PACKAGE_PREFIX: &str = "workspace-package-";
 /// workspace 内的构建产物目录（整体包落 `{ws}/builds/`；模板 .gitignore 忽略）。
 pub const WORKSPACE_BUILDS_DIR: &str = "builds";
 
+/// SSE `log` 事件单行字节上限（事件流展示副本的截断线，文件落盘不受影响）。
+const MAX_LOG_EVENT_LINE_BYTES: usize = 16 * 1024;
+
+/// 按 UTF-8 字符边界截断（超限截到 `max` 内最大合法前缀，带省略号标记）。
+fn truncate_at_char(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push('…');
+    out
+}
+
 /// 拼 workspace 相对产物路径（`builds/workspace-package-{release_id}.zip`）——
 /// build 创建响应/任务快照/Completed 事件的 `artifact_path` 同源。
 pub fn workspace_artifact_rel_path(release_id: &str) -> String {
@@ -158,8 +175,12 @@ pub async fn build_workspace_package(
             })
         };
         let line_cb: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |line: &str| {
+            // 超长行截断（UTF-8 边界安全）：minified 产物输出单行可达数 MB，
+            // 无界行 × 回放环 4000 条会吃掉数百 MB 内存。只截事件流展示副本，
+            // 文件落盘保持完整（深度排障看日志文件）。
+            let line = truncate_at_char(line, MAX_LOG_EVENT_LINE_BYTES);
             // 接收端关闭（理论不达）时静默丢弃该行
-            drop(line_tx.send(line.to_string()));
+            drop(line_tx.send(line));
         });
         // 构建日志按 service_id 归档（稳定身份：改目录名日志归档连续，且与
         // 运行时 /app/logs/<service_id> 同轴）

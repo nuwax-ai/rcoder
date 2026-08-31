@@ -79,11 +79,6 @@ pub async fn prepare_run_dir(ws: &Path, release_id: &str) -> AppResult<PathBuf> 
     Ok(run)
 }
 
-/// 运行目录定位（启动用；不存在时 None——未部署过）。
-pub fn run_dir_of(ws: &Path) -> PathBuf {
-    ws.join(RUN_DIR)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

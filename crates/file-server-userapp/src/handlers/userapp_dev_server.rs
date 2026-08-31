@@ -228,9 +228,10 @@ async fn spawn_dev_task(
         )
         .await;
         let outcome = async {
-            // Start 快速路径：服务已在跑 → 跳过编译直接完成（恢复旧同步
-            // start 的廉价幂等——否则白编译数分钟且已运行进程不加载新代码；
-            // 要上新代码用 restart）
+            // Start 快速路径：服务已在跑 → 跳过启停直接完成（廉价幂等）。
+            // 注意：此处编译已在上方 await 完（build_workspace_package 产出
+            // 新 zip 但不部署不重启——已运行进程不加载新代码，要上新代码
+            // 用 restart）；快速路径仅省去解压换入与启停。
             if matches!(action, DevTaskAction::Start)
                 && state
                     .fs.dev_server
@@ -238,7 +239,7 @@ async fn spawn_dev_task(
                     .iter()
                     .any(|p| p.project_id == key)
             {
-                tracing::info!(%app_id, "dev already running; start task completes without rebuild");
+                tracing::info!(%app_id, "dev already running; start task completes without deploy/restart");
                 return Ok::<(), AppError>(());
             }
             result?;
@@ -279,8 +280,8 @@ async fn spawn_dev_task(
                     .emit(shared_types::BuildProgressEvent::Completed {
                         // dev 任务消费方按 status/端口（dev/list）取结果；制品字段
                         // 仍带真实值（同核编译产出制品 zip，artifact_path 可用于
-                        // 手动取包校验）。快速路径（跳过编译）时制品不存在，
-                        // 该路径仅是预期值。
+                        // 手动取包校验）。快速路径（跳过部署）时制品为本次
+                        // 编译产出，存在但未部署。
                         release_id: release_id.clone(),
                         sha256: String::new(),
                         size_bytes: 0,

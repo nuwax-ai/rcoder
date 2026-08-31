@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use chrono::{DateTime, Local, NaiveDate};
+use chrono::{Local, NaiveDate};
 
 use super::run_dir::STAGING_DIR;
 use super::{WORKSPACE_BUILDS_DIR, WORKSPACE_PACKAGE_PREFIX};
@@ -66,9 +66,13 @@ pub async fn sweep_workspace(
             stats.main_logs_removed += sweep_stale_main_logs(&dir, retention_days).await;
         }
     }
-    // dev server 进程日志目录
+    // dev server 进程日志目录 + app-cli 编排器日志子目录（app-cli.log.{date}，
+    // tracing daily 轮转——日期为文件名尾段，同样按天数清）
     stats.temp_logs_removed += sweep_temp_logs(dev_log_dir, retain_count).await;
     stats.main_logs_removed += sweep_stale_main_logs(dev_log_dir, retention_days).await;
+    let orchestrator_dir = dev_log_dir.join("app-cli");
+    stats.main_logs_removed +=
+        sweep_dated_files(&orchestrator_dir, "app-cli.log.", retention_days).await;
     // .staging 残留（run_dir 换入失败遗留）
     stats.staging_dirs_removed = sweep_staging(&ws.join(STAGING_DIR)).await;
     stats
@@ -122,6 +126,12 @@ async fn remove_all_but_latest(dir: &Path, mut names: Vec<String>, retain_count:
 
 /// `dev-{YYYY-MM-DD}.log` 按文件名日期删除 `retention_days` 天前的。
 async fn sweep_stale_main_logs(dir: &Path, retention_days: usize) -> usize {
+    sweep_dated_files(dir, "dev-", retention_days).await
+}
+
+/// `{prefix}{YYYY-MM-DD}`（日期为文件名尾段，可选 .log 后缀）按日期删除
+/// `retention_days` 天前的；非该形态跳过（保守不删）。
+async fn sweep_dated_files(dir: &Path, prefix: &str, retention_days: usize) -> usize {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return 0;
     };
@@ -132,7 +142,7 @@ async fn sweep_stale_main_logs(dir: &Path, retention_days: usize) -> usize {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(date) = parse_main_log_date(&name) else {
+        let Some(date) = parse_dated_name(&name, prefix) else {
             continue;
         };
         if date >= cutoff {
@@ -148,10 +158,12 @@ async fn sweep_stale_main_logs(dir: &Path, retention_days: usize) -> usize {
     removed
 }
 
-/// `dev-YYYY-MM-DD.log` → 解析日期；非该形态（含 dev-temp-）返回 None。
-fn parse_main_log_date(name: &str) -> Option<NaiveDate> {
-    let rest = name.strip_prefix("dev-")?;
-    let date_str = rest.strip_suffix(".log")?;
+/// `{prefix}{YYYY-MM-DD}`（可选 .log 后缀）→ 解析日期；非该形态返回 None。
+/// 兼容两形态：`dev-2026-08-31.log`（构建/dev server main）与
+/// `app-cli.log.2026-08-31`（app-cli tracing daily 轮转）。
+fn parse_dated_name(name: &str, prefix: &str) -> Option<NaiveDate> {
+    let rest = name.strip_prefix(prefix)?;
+    let date_str = rest.strip_suffix(".log").unwrap_or(rest);
     NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
         .ok()
         .or_else(|| {
@@ -178,12 +190,6 @@ async fn sweep_staging(staging_root: &Path) -> usize {
         }
     }
     removed
-}
-
-/// 把 UTC/本地时间标准化（供测试注入固定"今天"）。
-#[allow(dead_code)]
-fn _date_time_cast(dt: DateTime<Local>) -> NaiveDate {
-    dt.date_naive()
 }
 
 #[cfg(test)]
@@ -267,6 +273,26 @@ mod tests {
         assert!(dir.path().join(format!("dev-{recent}.log")).is_file());
         assert!(dir.path().join(format!("dev-{today}.log")).is_file());
         assert!(dir.path().join("dev-weird-name.log").is_file());
+    }
+
+    #[tokio::test]
+    async fn orchestrator_daily_logs_removed_by_date() {
+        let dev_dir = tempfile::tempdir().expect("dev dir");
+        let orch = dev_dir.path().join("app-cli");
+        std::fs::create_dir_all(&orch).expect("orch dir");
+        let old = (Local::now().date_naive() - chrono::Duration::days(10))
+            .format("%Y-%m-%d")
+            .to_string();
+        let recent = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        std::fs::write(orch.join(format!("app-cli.log.{old}")), "{}").expect("old");
+        std::fs::write(orch.join(format!("app-cli.log.{recent}")), "{}").expect("recent");
+        std::fs::write(orch.join("app-cli.out.log"), "x").expect("out");
+        let removed = sweep_dated_files(&orch, "app-cli.log.", 7).await;
+        assert_eq!(removed, 1);
+        assert!(!orch.join(format!("app-cli.log.{old}")).exists());
+        assert!(orch.join(format!("app-cli.log.{recent}")).is_file());
+        // 非 dated 形态（out/err 合流）不受影响
+        assert!(orch.join("app-cli.out.log").is_file());
     }
 
     #[tokio::test]
