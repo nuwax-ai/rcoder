@@ -1,11 +1,11 @@
 //! userApp 开发域工具代理（`/userapp/dev/{ttyd,vnc,audio,ime}/{app_id}` 族；prod 工具族与本族同形态）。
 //!
 //! 与 computer 族（`/computer/*`，按 user_id 定位沙箱）对称的开发场景入口：
-//! 按 **app_id** 定位该 app 的 UserAppBuilder 开发容器（镜像同款——内含
+//! 按 **app_id** 定位该 app 的 UserappBuilder 开发容器（镜像同款——内含
 //! ttyd 7681 / noVNC 6080 / 音频 6089+6090 / IME 6091，以及 agent_runner
 //! ws_terminal 中间层 17681）。
 //!
-//! 定位统一走 `find_by_project_id(app_id, UserAppBuilder)`（state.projects
+//! 定位统一走 `find_by_project_id(app_id, UserappBuilder)`（state.projects
 //! 注册表，create-workspace/chat/publish 均注册）——**不走 vnc_backends 注册**
 //! （其键空间是 user_id，混用 app_id 存在撞键路由错容器风险）；miss 即 404
 //! （提示先创建 workspace）。
@@ -26,7 +26,7 @@ use tracing::{debug, error, info, warn};
 use crate::service::types::{ProxyMetrics, TrackingCtx};
 use crate::service::utils;
 
-/// 按 app_id 解析 UserAppBuilder 开发容器 IP（app_id 先过 identifier 白名单，
+/// 按 app_id 解析 UserappBuilder 开发容器 IP（app_id 先过 identifier 白名单，
 /// 防 header 注入与路径拼接逃逸）。
 ///
 /// 懒启动：注册表 miss 时经 `UserappDevEnsure` 回调自动 ensure 创建（开终端是
@@ -53,7 +53,7 @@ pub(crate) async fn find_dev_container(
     if let Some(ip) = container_lookup
         .as_ref()
         .and_then(|lookup| {
-            lookup.find_by_project_id(app_id, &shared_types::ServiceType::UserAppBuilder)
+            lookup.find_by_project_id(app_id, &shared_types::ServiceType::UserappBuilder)
         })
         .filter(|ip| !ip.is_empty())
     {
@@ -135,11 +135,11 @@ pub async fn handle_dev_ttyd_request(
     upstream_request.set_uri(new_uri);
     utils::set_common_headers(upstream_request)?;
     upstream_request.insert_header("X-Ttyd-Proxy", "pingora-dev")?;
-    // ws_terminal 的 cwd 解析三元组：service_type=UserAppBuilder → 开发卷 {根}/{project_id}
+    // ws_terminal 的 cwd 解析三元组：service_type=UserappBuilder → 开发卷 {根}/{project_id}
     upstream_request.insert_header("X-Ttyd-Project-Id", &app_id)?;
     upstream_request.insert_header(
         "X-Ttyd-Service-Type",
-        shared_types::ServiceType::UserAppBuilder.to_string(),
+        shared_types::ServiceType::UserappBuilder.to_string(),
     )?;
     Ok(())
 }
@@ -377,7 +377,7 @@ pub async fn handle_dev_ime_upstream(
 // ── 运行容器（部署后的生产环境）───────────────────────────────────────────────
 //
 // `/userapp/prod/{ttyd,pgweb}/{app_id}/{*path}`：与上面的开发域工具族对称，
-// 但目标是 `ServiceType::UserApp` 运行容器（app-runtime 镜像）。两处关键差异：
+// 但目标是 `ServiceType::Userapp` 运行容器（app-runtime 镜像）。两处关键差异：
 // 1. 定位走 `find_app_runtime_addr`（确定性命名构造）——运行容器不进 projects
 //    注册表（project_to_container[app_id] 单值键被 builder 占用）；
 // 2. **不经 ws_terminal（17681）**——运行容器没有 agent_runner，ttyd 直连本体

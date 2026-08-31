@@ -28,10 +28,10 @@ use super::utils::*;
 /// 应用管理服务（Docker / K8s 统一）
 pub struct AppService {
     pub(crate) config: AppManagerConfig,
-    /// ISP 收紧 (阶段3): app_manager 只需 workspace (B) + UserApp Deployment (C) 能力,
+    /// ISP 收紧 (阶段3): app_manager 只需 workspace (B) + Userapp Deployment (C) 能力,
     /// 不依赖 agent 容器生命周期 (A) —— 类型声明即编译期约束 (调用 agent 方法会编译错).
     pub(crate) runtime: Arc<dyn UserAppRuntime>,
-    /// UserApp 活动状态注册表(闲置回收/流量唤醒的共享状态:last_accessed/stopped/waking)
+    /// Userapp 活动状态注册表(闲置回收/流量唤醒的共享状态:last_accessed/stopped/waking)
     pub(crate) activity: Arc<AppActivityRegistry>,
     /// Pingora 代理（Docker 模式用于注册 HTTP backend；K8s 模式通常为 None）
     pub(crate) pingora: Option<Arc<PingoraProxyService>>,
@@ -47,11 +47,11 @@ pub struct AppService {
     /// 应用业务元数据（name/租户/业务创建时间;集群不持有）。PG 模式 query 的
     /// name/created_at 过滤数据源；纯内存模式恒空（过滤忽略+warn）。
     pub(crate) metadata: AppMetadataStore,
-    /// UserApp 开发资源回收回调（宿主注入；purge 时回收 UserAppBuilder 开发容器
+    /// Userapp 开发资源回收回调（宿主注入；purge 时回收 UserappBuilder 开发容器
     /// 与 per-app PVC——app_manager 的 runtime 视图无 agent 能力，经契约委托宿主）。
     pub(crate) dev_cleanup: std::sync::RwLock<Option<Arc<dyn shared_types::UserappDevCleanup>>>,
-    /// UserApp 开发容器定位回调（宿主注入；文件/存储接口 `app_stage=dev` 分支经此
-    /// ensure/定位 UserAppBuilder 的 file-server——同 dev_cleanup 的委托根因）。
+    /// Userapp 开发容器定位回调（宿主注入；文件/存储接口 `app_stage=dev` 分支经此
+    /// ensure/定位 UserappBuilder 的 file-server——同 dev_cleanup 的委托根因）。
     pub(crate) dev_locator: std::sync::RwLock<Option<Arc<dyn shared_types::UserappDevLocator>>>,
     /// Deployment 列表查询缓存（TTL + 写路径失效 + single-flight）。防查询面
     /// 轮询频繁穿透到 Docker daemon/K8s apiserver——Docker daemon 高负载下

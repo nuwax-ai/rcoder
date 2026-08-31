@@ -15,7 +15,7 @@ use file_server::models::BinaryFile;
 #[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
 #[garde(allow_unvalidated)]
 pub struct BuildUserAppBody {
-    /// UserApp 标识（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）。
+    /// Userapp 标识（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）。
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
     pub app_id: String,
@@ -126,7 +126,7 @@ pub struct StaticQuery {
 pub struct UserappEnsureWorkspaceBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
@@ -139,7 +139,7 @@ pub struct UserappEnsureWorkspaceBody {
 pub struct UserappExecCommandBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
@@ -156,7 +156,7 @@ pub struct UserappExecCommandBody {
 pub struct UserappGetLogsQuery {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
@@ -182,7 +182,7 @@ pub struct UserappInstallBody {
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct UserappZipBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
@@ -196,7 +196,7 @@ pub struct UserappZipBody {
 #[into_params(parameter_in = Query)]
 pub struct UserappDownloadQuery {
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
@@ -210,7 +210,7 @@ pub struct UserappDownloadQuery {
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(utoipa::ToSchema)]
 pub struct UserappInitTemplateForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
@@ -224,7 +224,7 @@ pub struct UserappInitTemplateForm {
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(utoipa::ToSchema)]
 pub struct UserappPushSkillsForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
@@ -244,7 +244,7 @@ pub struct UserappPushSkillsForm {
 #[into_params(parameter_in = Query)]
 pub struct UserappFileListQuery {
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
@@ -271,7 +271,7 @@ pub struct UserappFileListQuery {
 #[into_params(parameter_in = Query)]
 pub struct UserappResolveFileQuery {
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
@@ -293,7 +293,7 @@ pub struct UserappResolveFileQuery {
 #[into_params(parameter_in = Query)]
 pub struct UserappSearchFilesQuery {
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[garde(custom(file_server::validation_rules::not_blank))]
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
@@ -327,7 +327,7 @@ pub struct UserappSearchFilesQuery {
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct UserappFilesUpdateBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
@@ -373,7 +373,7 @@ impl From<UserappFileOp> for file_server::models::FileOp {
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(utoipa::ToSchema)]
 pub struct UserappUploadFileForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
@@ -389,7 +389,7 @@ pub struct UserappUploadFileForm {
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(utoipa::ToSchema)]
 pub struct UserappUploadFilesForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
@@ -406,7 +406,7 @@ pub struct UserappUploadFilesForm {
 pub struct UserappGenerateFileBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
@@ -426,7 +426,7 @@ pub struct UserappGenerateFileBody {
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(utoipa::ToSchema)]
 pub struct UserappImportProjectForm {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     /// 宿主机数据卷分区归属目录名（dev 卷组成段）
     pub user_id: String,
@@ -444,7 +444,7 @@ pub struct UserappImportProjectForm {
 pub struct DevOpBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
@@ -454,7 +454,7 @@ pub struct DevOpBody {
     #[serde(default)]
     #[garde(skip)]
     /// dev server 的 base path（vite --base 等）；缺省 "/"。
-    /// **仅 web 域项目（vite dev server）生效**——UserApp workspace
+    /// **仅 web 域项目（vite dev server）生效**——Userapp workspace
     /// （manifest/app-cli 引擎）不消费：pingap 路由前缀由各服务的
     /// project.manifest.toml `[proxy].path` 决定，传了无效果。
     pub base_path: Option<String>,

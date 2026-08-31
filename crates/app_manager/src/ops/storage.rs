@@ -20,8 +20,8 @@ use crate::utils::*;
 /// app_stage → 卷形态的 ServiceType（K8s PVC label / Docker 目录树都按它分形）。
 fn service_type_of(app_stage: UserappStage) -> ServiceType {
     match app_stage {
-        UserappStage::Dev => ServiceType::UserAppBuilder,
-        UserappStage::Prod => ServiceType::UserApp,
+        UserappStage::Dev => ServiceType::UserappBuilder,
+        UserappStage::Prod => ServiceType::Userapp,
     }
 }
 
@@ -288,7 +288,7 @@ impl crate::service::AppService {
             .destroy_app_pvc(app_id)
             .await
             .map_err(|e| map_runtime_error("destroy_app_pvc failed", e))?;
-        // UserApp 开发资源回收（UserAppBuilder 开发容器 + per-app 开发 PVC）：
+        // Userapp 开发资源回收（UserappBuilder 开发容器 + per-app 开发 PVC）：
         // 经 UserappDevCleanup 契约回调宿主（app_manager 的 runtime 视图无 agent
         // 能力，ISP 分层）；best-effort——失败仅 warn 不阻断 purge，下次幂等收敛。
         let dev_cleanup = self.dev_cleanup.read().expect("dev_cleanup lock").clone();
@@ -304,7 +304,7 @@ impl crate::service::AppService {
             }
             None => {
                 warn!(
-                    "[APP] dev cleanup not injected, skip UserAppBuilder resources recycle: app_id={app_id}"
+                    "[APP] dev cleanup not injected, skip UserappBuilder resources recycle: app_id={app_id}"
                 );
             }
         }
@@ -547,7 +547,7 @@ mod tests {
     use crate::test_support::{MockRuntime, test_service};
 
     /// storage 的 app_stage 分派落点：workspace_volume_name / list_workspace_identifiers
-    /// 必须按 app_stage 换 ServiceType（dev→UserAppBuilder / prod→UserApp）——K8s 卷
+    /// 必须按 app_stage 换 ServiceType（dev→UserappBuilder / prod→Userapp）——K8s 卷
     /// label 与 Docker 目录树都按它分形，分派错即查错卷。
     #[tokio::test]
     async fn storage_env_dispatches_service_type() {
@@ -566,13 +566,13 @@ mod tests {
         let calls = runtime.volume_name_calls.get("app-1").expect("calls");
         assert_eq!(
             *calls,
-            vec!["UserApp".to_string(), "UserAppBuilder".to_string()],
+            vec!["Userapp".to_string(), "UserappBuilder".to_string()],
             "prod 先查运行卷、dev 查开发卷（ServiceType 分派）"
         );
     }
 
-    /// query 的 app_stage 分派：dev 清单枚举 UserAppBuilder 卷（不并入 Deployment 集），
-    /// prod 枚举 UserApp 卷（并入运行中 app 兜底）。
+    /// query 的 app_stage 分派：dev 清单枚举 UserappBuilder 卷（不并入 Deployment 集），
+    /// prod 枚举 Userapp 卷（并入运行中 app 兜底）。
     #[tokio::test]
     async fn query_storage_env_selects_volume_family() {
         /// dev query 依赖 locator 做 builder 在跑探测——stub 恒"在"（非 orphan）
@@ -594,10 +594,10 @@ mod tests {
         let runtime = Arc::new(MockRuntime::default());
         runtime
             .workspace_ids
-            .insert("UserAppBuilder".to_string(), vec!["app-dev".to_string()]);
+            .insert("UserappBuilder".to_string(), vec!["app-dev".to_string()]);
         runtime
             .workspace_ids
-            .insert("UserApp".to_string(), vec!["app-prod".to_string()]);
+            .insert("Userapp".to_string(), vec!["app-prod".to_string()]);
         let service = test_service(std::path::Path::new("/tmp/ws"), runtime.clone());
         *service.dev_locator.write().expect("dev_locator lock") = Some(Arc::new(StubDevLocator));
 

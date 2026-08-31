@@ -16,7 +16,7 @@ use tracing::{info, warn};
 const ENV_ENABLED: &str = "RCODER_SKILL_SYNC_RECONCILE_ON_STARTUP";
 
 /// 递归找 `.agents` 的最大深度。
-/// 覆盖: computer `user/cid` (2 层) + web 多租户 `tenant/space/project` (3 层) + UserApp `apps/app_id` (2 层)。
+/// 覆盖: computer `user/cid` (2 层) + web 多租户 `tenant/space/project` (3 层) + Userapp `apps/app_id` (2 层)。
 const MAX_SCAN_DEPTH: u32 = 4;
 
 /// 启动 skill sync reconciler 后台 task (不阻塞 rcoder 主流程)。

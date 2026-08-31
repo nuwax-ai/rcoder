@@ -1,4 +1,4 @@
-//! UserApp 异步编译/发布任务:BuildTaskStore(`Mutex<HashMap>`)+ 状态机 + 进度事件。
+//! Userapp 异步编译/发布任务:BuildTaskStore(`Mutex<HashMap>`)+ 状态机 + 进度事件。
 //!
 //! 设计参考 app_manager `ReleaseStatus`(Prepared/PendingStart/Active/Failed)状态机;
 //! 进度事件用 `broadcast`(实时 SSE 推送)+ `VecDeque` ring(seq replay,断线重连)。

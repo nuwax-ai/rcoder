@@ -1,4 +1,4 @@
-//! compose 环境 UserApp **部署主流程全链**：template-cli 全量模板初始化 →
+//! compose 环境 Userapp **部署主流程全链**：template-cli 全量模板初始化 →
 //! 构建到 completed → static 取包校验 → start(url) 部署 → pingora 七路流量
 //! → prod delete purge 回收。
 //!

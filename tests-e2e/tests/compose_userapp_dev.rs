@@ -1,4 +1,4 @@
-//! compose 环境 UserApp **开发域**场景：per-app 开发容器上的文件转发/拦截分流、
+//! compose 环境 Userapp **开发域**场景：per-app 开发容器上的文件转发/拦截分流、
 //! PG 凭据对齐、`/computer/chat + service_type=userapp` 开发对话 + SSE 消息流。
 //!
 //! 运行: `cargo test -p rcoder-e2e --test compose_userapp_dev -- --test-threads=1`

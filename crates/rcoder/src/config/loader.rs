@@ -87,7 +87,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         info!(" RCODER_API_KEY configured");
     }
 
-    // 应用 UserApp 自动回收配置的环境变量覆盖
+    // 应用 Userapp 自动回收配置的环境变量覆盖
     env_override_bool(
         "RCODER_USERAPP_RECYCLE_ENABLED",
         &mut config.userapp_recycle.enabled,

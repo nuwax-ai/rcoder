@@ -15,7 +15,7 @@ use crate::router::AppState;
 #[utoipa::path(
     get,
     path = "/proxy/userapp/prod/{user_id}/{app_id}/{*path}",
-    tag = "UserApp · 访问入口",
+    tag = "Userapp · 访问入口",
     summary = "按 app_id 访问部署的应用服务",
     description = r#"
 访问 `POST /api/v1/userapp` 部署的应用。`access.external.http` 返回 `/proxy/userapp/prod/{user_id}/{app_id}`，即本接口。
@@ -88,15 +88,15 @@ pub async fn proxy_to_app_with_path(
 #[utoipa::path(
     get,
     path = "/proxy/userapp/dev/{user_id}/{app_id}/{*path}",
-    tag = "UserApp · 访问入口",
+    tag = "Userapp · 访问入口",
     summary = "开发容器预览入口",
     description = r#"
-访问开发阶段该 app 开发容器（UserAppBuilder，per-app）内的应用。与部署访问
+访问开发阶段该 app 开发容器（UserappBuilder，per-app）内的应用。与部署访问
 `/proxy/userapp/prod/{user_id}/{app_id}/{*path}` 同构——**开发切部署前端只改 `dev→prod` 一段**。
 
 - **免端口**：代理内部固定拨 pingap 统一入口 `APP_ENTRY_PORT`(9080)——开发容器
   manifest 流程（`POST /api/v1/userapp/dev/start`）恒起 app-cli+pingap，9080 即整应用入口。
-- upstream 动态解析到该 app 的开发容器（UserAppBuilder），**零注册零状态**：
+- upstream 动态解析到该 app 的开发容器（UserappBuilder），**零注册零状态**：
   Java 用 `user_id` + `app_id` 直接拼 URL。
 - `user_id` 不参与解析（开发容器 per-app 定位），用于日志排障与未来归属鉴权。
 - 多 app 并行：每 app 独立开发容器，URL 各拼各的 app_id。

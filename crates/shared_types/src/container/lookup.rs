@@ -37,7 +37,7 @@ pub struct ProjectScope {
 /// app-runtime 的 ttyd 只监听 IPv4（libwebsockets）→ 7681 ConnectRefused
 /// （pgweb 是 Go dual-stack 不受影响）。本 trait 由持有 `ContainerRuntime`
 /// 句柄的进程（rcoder main）实现：经 `get_container_info_by_identifier(app_id,
-/// UserApp)` 实时取容器 IPv4。K8s 模式不需要（Service FQDN 走 A 记录）。
+/// Userapp)` 实时取容器 IPv4。K8s 模式不需要（Service FQDN 走 A 记录）。
 #[async_trait::async_trait]
 pub trait AppRuntimeIpResolver: Send + Sync {
     async fn resolve_runtime_container_ip(&self, app_id: &str) -> Option<String>;
@@ -56,8 +56,8 @@ pub trait ContainerLookup: Send + Sync {
 
     /// userApp 运行容器地址（`/userapp/{ttyd,pgweb}/{app_id}/runtime` 代理上游）。
     ///
-    /// 运行容器（`ServiceType::UserApp` Deployment/容器）**不进 projects 注册表**——
-    /// `project_to_container[app_id]` 单值索引已被 UserAppBuilder 开发容器占用，
+    /// 运行容器（`ServiceType::Userapp` Deployment/容器）**不进 projects 注册表**——
+    /// `project_to_container[app_id]` 单值索引已被 UserappBuilder 开发容器占用，
     /// 同 app 双容器无法共存一个键。因此本方法不走注册表，按确定性命名构造地址：
     /// K8s = Service FQDN（Pod 重建 DNS 自愈）；Docker = 容器名（同网络 Docker DNS 解析；
     /// dual-stack 网络下调用方应优先经 [`AppRuntimeIpResolver`] 取 IPv4，本方法为回退）。
@@ -122,9 +122,9 @@ pub trait ContainerLookup: Send + Sync {
                     None
                 }
             }
-            // UserApp / UserAppBuilder 的 identifier 是 app_id(兼任 project_id),
+            // Userapp / UserappBuilder 的 identifier 是 app_id(兼任 project_id),
             // 复用 project_id 查找路径(通常不注册到 agent lookup,命中预期为 None)
-            ServiceType::WebAgentRunner | ServiceType::UserApp | ServiceType::UserAppBuilder => {
+            ServiceType::WebAgentRunner | ServiceType::Userapp | ServiceType::UserappBuilder => {
                 if let Some(pid) = project_id {
                     let result = self.find_by_project_id(pid, service_type);
                     if result.is_some() {

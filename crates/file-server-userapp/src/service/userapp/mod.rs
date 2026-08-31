@@ -1,6 +1,6 @@
-//! UserApp workspace 多项目打包：两级 manifest → 遍历子项目 build_generic → 组装整体包。
+//! Userapp workspace 多项目打包：两级 manifest → 遍历子项目 build_generic → 组装整体包。
 //!
-//! - workspace 定位统一 [`file_server::workspace::resolve_userapp_dev`]（UserApp 开发卷, 容器无关）。
+//! - workspace 定位统一 [`file_server::workspace::resolve_userapp_dev`]（Userapp 开发卷, 容器无关）。
 //!   workspace 根下有多个子项目（前端/后端/...）。
 //! - file-server 严格读取 Manifest v1，并自动发现一级子项目。
 //! - 组装成版本化整体包 `builds/workspace-package-<release_id>.zip`，内含 release lock。
@@ -91,7 +91,7 @@ struct BuiltProject {
 
 /// workspace 多项目打包主流程。
 ///
-/// 1. `resolve_userapp_dev(app_id)` → workspace 根（UserApp 开发卷）
+/// 1. `resolve_userapp_dev(app_id)` → workspace 根（Userapp 开发卷）
 /// 2. 读 `workspace.manifest.toml` → 子项目列表
 /// 3. 遍历子项目：读 `project.manifest.toml` → `build_generic(cmd, artifact, cwd={ws}/{path})`
 /// 4. `assemble::assemble_workspace_package` 组装整体包（含 pingap 配置 + `.service-ports`）
@@ -107,11 +107,11 @@ pub async fn build_workspace_package(
     timeout_secs: u64,
     progress: Option<Arc<BuildTask>>,
 ) -> AppResult<WorkspaceBuildArtifact> {
-    // 1. workspace 根（UserApp 开发卷, 容器无关）
+    // 1. workspace 根（Userapp 开发卷, 容器无关）
     let ws = file_server::workspace::resolve_userapp_dev(app_id, None, config)?;
     if !ws.is_dir() {
         return Err(AppError::resource(format!(
-            "UserApp workspace not found: {} (app_id={app_id})",
+            "Userapp workspace not found: {} (app_id={app_id})",
             ws.display()
         )));
     }

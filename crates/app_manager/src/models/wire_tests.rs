@@ -1,4 +1,4 @@
-//! UserApp API DTO 的 wire 契约锁定测试（snake_case 字段 + 小写枚举值）。
+//! Userapp API DTO 的 wire 契约锁定测试（snake_case 字段 + 小写枚举值）。
 //!
 //! 动机：DTO 曾经历 camelCase↔snake_case 两次方向切换，且 `AppPortStatus` 曾漏撤
 //! camelCase（d3ba55e）——models 层此前没有任何 JSON 序列化测试，wire 形态漂移

@@ -1,4 +1,4 @@
-//! UserApp 日志域契约（rcoder ↔ app-cli 单一事实源）。
+//! Userapp 日志域契约（rcoder ↔ app-cli 单一事实源）。
 //!
 //! `/api/v1/userapp/{app_id}/logs/*` 由 rcoder **透明转发**到容器内 app-cli
 //! :3010 的 `/v1/logs/*`；此前请求体两端各写一份（AppLogQueryRequest vs

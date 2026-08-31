@@ -1,4 +1,4 @@
-//! compose 环境 UserApp 面回归（rcoder publish 任务体系删除面 + file-server 构建链终态）。
+//! compose 环境 Userapp 面回归（rcoder publish 任务体系删除面 + file-server 构建链终态）。
 //!
 //! 运行: `make test-e2e-compose` 或
 //! `cargo test -p rcoder-e2e --test compose_userapp -- --test-threads=1`

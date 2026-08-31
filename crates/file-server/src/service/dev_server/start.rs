@@ -80,7 +80,7 @@ impl DevServerManager {
         project_path: &Path,
         base_path: Option<&str>,
     ) -> AppResult<StartedDev> {
-        // UserApp workspace 分流：workspace.manifest.toml 存在 → app-cli 引擎。
+        // Userapp workspace 分流：workspace.manifest.toml 存在 → app-cli 引擎。
         // manifest 多服务（Java/Go 等）的正确运行态 = app-cli 按 run.command
         // 编排全栈 + pingap 9080 统一入口（[proxy] 路由）；开发容器 per-app，
         // 9080 无冲突。原 package.json/vite 引擎是 web 域（单 vite dev server）
@@ -219,7 +219,7 @@ impl DevServerManager {
         Ok(StartedDev { pid, port })
     }
 
-    /// UserApp workspace 的 dev 启动（app-cli 引擎）：spawn 常驻 `app-cli
+    /// Userapp workspace 的 dev 启动（app-cli 引擎）：spawn 常驻 `app-cli
     /// --workspace <ws>` ——按 manifest run.command 拉起全部服务 + pingap
     /// 9080 统一入口（多服务编排/健康检查/失败清理都由 app-cli 负责）。
     ///

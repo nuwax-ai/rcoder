@@ -1,4 +1,4 @@
-//! UserApp workspace PVC 就绪（从 service.rs 拆出，extension-impl）。
+//! Userapp workspace PVC 就绪（从 service.rs 拆出，extension-impl）。
 //!
 //! RBD 卷形态（rcoder 零挂载）：本模块只剩 PVC ensure——rcoder 不再解析卷路径、
 //! 不再建目录（prod 四目录由 runtime 在 create_deployment 前经 userapp-workspace
@@ -10,7 +10,7 @@ use crate::models::*;
 use crate::service::AppService;
 
 impl AppService {
-    /// ensure UserApp per-app 工作空间就绪 (K8s): ensure PVC 带 requests.storage 用户配额。
+    /// ensure Userapp per-app 工作空间就绪 (K8s): ensure PVC 带 requests.storage 用户配额。
     ///
     /// RBD 卷无 `subvolumePath`（CephFS CSI 专有字段），故**不等待 resolve**——PVC
     /// 绑定由首个 Pod 调度触发（WaitForFirstConsumer），rcoder 无需卷路径视角。
@@ -25,10 +25,10 @@ impl AppService {
             return Ok(()); // Docker 无 per-app PVC
         }
         self.runtime
-            .ensure_workspace(app_id, &ServiceType::UserApp, storage_size)
+            .ensure_workspace(app_id, &ServiceType::Userapp, storage_size)
             .await
             .map_err(|e| {
-                AppOperationError::Backend(format!("ensure UserApp PVC (app_id={app_id}): {e}"))
+                AppOperationError::Backend(format!("ensure Userapp PVC (app_id={app_id}): {e}"))
             })
     }
 }

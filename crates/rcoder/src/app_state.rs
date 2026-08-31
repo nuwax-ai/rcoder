@@ -76,7 +76,7 @@ pub struct AppState {
     pub agent_download_manager: Arc<AgentDownloadManager>,
     /// 应用管理服务
     pub app_service: Arc<dyn app_manager::AppServiceTrait>,
-    /// UserApp 活动状态注册表（闲置回收/流量唤醒共享状态；扫描器读 last_accessed/waking）
+    /// Userapp 活动状态注册表（闲置回收/流量唤醒共享状态；扫描器读 last_accessed/waking）
     pub activity: Arc<app_manager::AppActivityRegistry>,
     /// K8s 集群域名（用于构建 K8s Service FQDN）
     pub cluster_domain: String,
@@ -124,7 +124,7 @@ impl AppState {
             .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?,
         );
 
-        // UserApp 开发资源回收回调（app purge 时回收 UserAppBuilder 开发容器 +
+        // Userapp 开发资源回收回调（app purge 时回收 UserappBuilder 开发容器 +
         // per-app PVC；app_manager 的 runtime 视图无 agent 能力，经契约委托本进程）
         app_service_arc.set_dev_cleanup(Arc::new(
             crate::userapp_builder::UserappDevResourcesCleanup::new(

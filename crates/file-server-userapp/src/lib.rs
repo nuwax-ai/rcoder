@@ -1,4 +1,4 @@
-//! file-server-userapp：UserApp 域（`/api/v1/userapp/*`）独立 crate。
+//! file-server-userapp：Userapp 域（`/api/v1/userapp/*`）独立 crate。
 //!
 //! 自 file-server 拆出（洋葱模型：本 crate 依赖 file-server 共享设施，反向无依赖）：
 //! - 错误出口 [`error`]：`UserAppError` 直渲 HttpResult + 语义状态码，

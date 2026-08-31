@@ -63,9 +63,9 @@ pub struct PingoraProxyService {
     pub api_key_config: Option<Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>>,
     /// 容器查找服务（统一数据源）
     container_lookup: Option<Arc<dyn shared_types::ContainerLookup>>,
-    /// UserApp 访问追踪（Pingora 热路径 touch 记录最近访问，供闲置回收判断）
+    /// Userapp 访问追踪（Pingora 热路径 touch 记录最近访问，供闲置回收判断）
     access_tracker: Option<Arc<dyn shared_types::AppAccessTracker>>,
-    /// UserApp 流量唤醒（stopped app 收到请求时 hold-and-wait 拉起）
+    /// Userapp 流量唤醒（stopped app 收到请求时 hold-and-wait 拉起）
     wake_control: Option<Arc<dyn shared_types::AppWakeControl>>,
     /// 开发容器懒启动回调（dev 终端族 miss 时自动 ensure，而非 404）。
     /// ArcSwap 槽——AppState 就绪晚于 Pingora 启动，main 侧经
@@ -104,7 +104,7 @@ pub struct PortProxy {
     api_key_config: Option<Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>>,
     /// 容器查找服务（统一数据源）
     container_lookup: Option<Arc<dyn shared_types::ContainerLookup>>,
-    /// UserApp 访问追踪 + 流量唤醒（/proxy/userapp/prod/* 路由用）
+    /// Userapp 访问追踪 + 流量唤醒（/proxy/userapp/prod/* 路由用）
     access_tracker: Option<Arc<dyn shared_types::AppAccessTracker>>,
     wake_control: Option<Arc<dyn shared_types::AppWakeControl>>,
     /// 开发容器懒启动回调槽（与 PingoraProxyService 共享同一 Arc）
@@ -157,13 +157,13 @@ impl PingoraProxyService {
         self
     }
 
-    /// 设置 UserApp 访问追踪（闲置回收的 HTTP 访问信号源）
+    /// 设置 Userapp 访问追踪（闲置回收的 HTTP 访问信号源）
     pub fn with_access_tracker(mut self, tracker: Arc<dyn shared_types::AppAccessTracker>) -> Self {
         self.access_tracker = Some(tracker);
         self
     }
 
-    /// 设置 UserApp 流量唤醒控制
+    /// 设置 Userapp 流量唤醒控制
     pub fn with_wake_control(mut self, wc: Arc<dyn shared_types::AppWakeControl>) -> Self {
         self.wake_control = Some(wc);
         self

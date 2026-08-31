@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 pub struct FeatureFlags {
     /// 主线 Web/Computer per-agent PVC (per-agent subvolume + 配额 + lazy mv + batch migrate)
     pub per_agent_pvc: bool,
-    /// UserApp per-app PVC (新功能, 独立于主线; 依赖 cephfs-root 派生挂载 + SC Immediate)
+    /// Userapp per-app PVC (新功能, 独立于主线; 依赖 cephfs-root 派生挂载 + SC Immediate)
     pub userapp_per_app_pvc: bool,
     /// rcoder 嵌入 Rust file-server (替代 nuwax-file-server 独立进程)
     pub embed_file_server: bool,
@@ -60,7 +60,7 @@ pub fn per_agent_pvc_enabled() -> bool {
     FeatureFlags::get().per_agent_pvc
 }
 
-// UserApp K8s 永远 per-app (代码不读开关, 无分裂);
+// Userapp K8s 永远 per-app (代码不读开关, 无分裂);
 // FeatureFlags.userapp_per_app_pvc 字段保留供启动日志 + chart cephfs-root 派生标记。
 
 // === 端口配置 ===
@@ -111,14 +111,14 @@ pub const PGWEB_PORT: u16 = 8081;
 /// dbx-web 端口（agent-runner 与 app-runtime 容器恒为 4224）
 ///
 /// DBX 数据库 Web GUI（60+ 数据库），两镜像 supervisor 均恒起（无 CLI 参数，全 env 配置）。
-/// 经 Pingora `/userapp/dev/dbx/{user_id}/{app_id}`（UserAppBuilder 开发容器）与
-/// `/userapp/prod/dbx/{user_id}/{app_id}`（UserApp 运行容器）两阶段代理暴露；
+/// 经 Pingora `/userapp/dev/dbx/{user_id}/{app_id}`（UserappBuilder 开发容器）与
+/// `/userapp/prod/dbx/{user_id}/{app_id}`（Userapp 运行容器）两阶段代理暴露；
 /// dbx 前端运行时自推断 base path（webPath.ts），代理剥前缀直连 root 模式即可。
 pub const DBX_PORT: u16 = 4224;
 
 /// userApp 应用统一入口端口（pingap 监听，恒为 9080）
 ///
-/// 容器内 app-cli 编排的 pingap 统一入口：dev 容器（UserAppBuilder，manifest 流程
+/// 容器内 app-cli 编排的 pingap 统一入口：dev 容器（UserappBuilder，manifest 流程
 /// `start_dev_manifest` 恒起 pingap）与 prod 运行容器（release 流程 pin 唯一 HTTP 端口）
 /// 同值。Pingora 应用流量族 `/proxy/userapp/{dev,prod}/{user_id}/{app_id}` 免端口——
 /// 内部固定拨此端口，调用方无需传端口。
@@ -128,7 +128,7 @@ pub const APP_ENTRY_PORT: u16 = 9080;
 
 /// agent-runner 内嵌 file-server 端口
 ///
-/// agent-runner 内嵌的 file-server 监听端口（UserApp workspace build / package 下载；
+/// agent-runner 内嵌的 file-server 监听端口（Userapp workspace build / package 下载；
 /// rcoder 的 prepare 与 agent-runner build 都走它）。四方共用此单一来源,避免各处硬编码
 /// `60_000` 漂移:
 /// - file-server 自身默认监听端口（可被 `FILE_SERVER_PORT`/`PORT` env 覆盖）

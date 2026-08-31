@@ -1,9 +1,9 @@
 //! `POST /api/v1/userapp/db/{dev|prod}/align-credentials`：PG 凭据对齐。
 //!
 //! 统一前缀 `/api/v1/userapp/db/*`（路径段区分环境，可滤镜、可扩展）：
-//! - `dev` → 该 app 的 UserAppBuilder 开发容器（经容器内 file-server
+//! - `dev` → 该 app 的 UserappBuilder 开发容器（经容器内 file-server
 //!   `execute-command` HTTP 通道执行 psql）
-//! - `prod` → UserApp 运行容器（app_manager runtime exec 通道）
+//! - `prod` → Userapp 运行容器（app_manager runtime exec 通道）
 //!
 //! 流程单头 [`shared_types::align_pg_credentials`]（验证 scram → 角色存在 →
 //! trust 重置 → 复验）；密码不落日志。
@@ -71,7 +71,7 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
     path = "/api/v1/userapp/db/{app_stage}/align-credentials",
     request_body = shared_types::AlignCredentialsRequest,
     params(
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）内的 PG；`prod`=运行容器（UserApp）内的 PG")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）内的 PG；`prod`=运行容器（Userapp）内的 PG")
     ),
     responses(
         (status = 200, description = "对齐完成（aligned=true；reset_performed 表示是否执行了重置）", body = HttpResult<shared_types::AlignCredentialsOutcome>),
@@ -79,7 +79,7 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
         (status = 404, description = "prod 环境 app 不存在或未运行", body = HttpResult<String>),
         (status = 500, description = "开发容器不可达（ERR_CONTAINER_ERROR 映射 500，非 502）", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 数据库",
+    tag = "Userapp · 双态 · 数据库",
     operation_id = "align_userapp_db_credentials",
     summary = "PG 凭据对齐",
     description = r#"
@@ -182,7 +182,7 @@ fn align_error_code(err: &shared_types::AlignError) -> &'static str {
 // ── 账号/库管理（reset-password / create-database；与 align 同域扩展） ──────────
 
 /// rcoder 侧 PG 命令执行通道：`ContainerRuntime::exec`（容器内 `sh -c`）。
-/// dev 目标 = UserAppBuilder 容器名；prod 目标 = app_id（pod 解析在 runtime
+/// dev 目标 = UserappBuilder 容器名；prod 目标 = app_id（pod 解析在 runtime
 /// 内部，与 app_manager 的 RuntimeExecRunner 同款）。
 struct ExecRunner<'a> {
     runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
@@ -323,7 +323,7 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
     path = "/api/v1/userapp/db/{app_stage}/reset-password",
     request_body = shared_types::UserappDbResetPasswordRequest,
     params(
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）内的 PG；`prod`=运行容器（UserApp）内的 PG")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）内的 PG；`prod`=运行容器（Userapp）内的 PG")
     ),
     responses(
         (status = 200, description = "密码已设置（message 区分\"账号已创建并设置密码\"/\"密码已重置\"）", body = HttpResult<String>),
@@ -331,7 +331,7 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
         (status = 404, description = "prod 环境 app 不存在", body = HttpResult<String>),
         (status = 500, description = "容器侧执行失败（PG 未就绪/SQL 失败）", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 数据库",
+    tag = "Userapp · 双态 · 数据库",
     operation_id = "userapp_db_reset_password",
     summary = "重置/创建 PG 账号密码",
     description = r#"
@@ -419,7 +419,7 @@ pub(crate) async fn reset_password(
     path = "/api/v1/userapp/db/{app_stage}/create-database",
     request_body = shared_types::UserappDbCreateDatabaseRequest,
     params(
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）内的 PG；`prod`=运行容器（UserApp）内的 PG")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）内的 PG；`prod`=运行容器（Userapp）内的 PG")
     ),
     responses(
         (status = 200, description = "数据库已创建", body = HttpResult<String>),
@@ -428,7 +428,7 @@ pub(crate) async fn reset_password(
         (status = 409, description = "数据库已存在（含并发创建竞态复检）", body = HttpResult<String>),
         (status = 500, description = "容器侧执行失败（PG 未就绪/SQL 失败）", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 数据库",
+    tag = "Userapp · 双态 · 数据库",
     operation_id = "userapp_db_create_database",
     summary = "新建 PG 数据库",
     description = r#"

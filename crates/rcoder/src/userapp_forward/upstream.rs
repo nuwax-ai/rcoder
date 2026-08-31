@@ -298,10 +298,10 @@ async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box
         use shared_types::ContainerLookup;
         state.projects.find_app_runtime_addr(app_id)
     } else {
-        // Docker：直查容器 IPv4（同 pod restart 的 UserApp 定位模式）
+        // Docker：直查容器 IPv4（同 pod restart 的 Userapp 定位模式）
         state
             .runtime()
-            .get_container_info_by_identifier(app_id, &shared_types::ServiceType::UserApp)
+            .get_container_info_by_identifier(app_id, &shared_types::ServiceType::Userapp)
             .await
             .ok()
             .flatten()

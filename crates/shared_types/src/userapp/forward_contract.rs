@@ -14,7 +14,7 @@ pub const SERVICE_TYPE_USERAPP: &str = "userapp";
 /// 判断 `x-service-type` header 值是否标记 userApp 场景。
 ///
 /// 值经 trim + ASCII 小写归一后与 [`SERVICE_TYPE_USERAPP`] 比较——`userapp` /
-/// `UserApp` / `USERAPP` 等大小写变体均命中（Java 侧约定不区分大小写）。
+/// `Userapp` / `USERAPP` 等大小写变体均命中（Java 侧约定不区分大小写）。
 /// 三个消费点（rcoder computer_intercept、file-server-proxy 60000 分流、
 /// 容器内 file-server scope 注入）统一走本函数，禁止各自重写比较逻辑。
 pub fn is_userapp_service_type_value(value: &str) -> bool {
@@ -30,10 +30,10 @@ pub const APP_ID_HEADER: &str = "x-app-id";
 /// 字段同词表——同一 app_id 可同时存在 builder 与生产 Deployment，必须显式区分。
 pub const APP_STAGE_HEADER: &str = "x-app-stage";
 
-/// [`APP_STAGE_HEADER`] 的值：开发阶段（UserAppBuilder 开发容器）。
+/// [`APP_STAGE_HEADER`] 的值：开发阶段（UserappBuilder 开发容器）。
 pub const APP_STAGE_DEV: &str = "dev";
 
-/// [`APP_STAGE_HEADER`] 的值：生产阶段（UserApp 运行容器）。
+/// [`APP_STAGE_HEADER`] 的值：生产阶段（Userapp 运行容器）。
 pub const APP_STAGE_PROD: &str = "prod";
 
 #[cfg(test)]
@@ -63,7 +63,7 @@ mod tests {
     #[test]
     fn service_type_value_matching_is_case_insensitive() {
         assert!(is_userapp_service_type_value("userapp"));
-        assert!(is_userapp_service_type_value("UserApp"));
+        assert!(is_userapp_service_type_value("Userapp"));
         assert!(is_userapp_service_type_value("USERAPP"));
         assert!(is_userapp_service_type_value("  userapp  "));
         assert!(!is_userapp_service_type_value("user-app"));

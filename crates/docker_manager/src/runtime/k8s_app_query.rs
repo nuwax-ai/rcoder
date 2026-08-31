@@ -1,4 +1,4 @@
-//! UserApp Deployment 查询/状态(从 k8s_deployment.rs 拆出)。
+//! Userapp Deployment 查询/状态(从 k8s_deployment.rs 拆出)。
 //!
 //! get_app_status/read_app_container_spec/list_app_status + deployment_to_status +
 //! container_error_message。
@@ -46,9 +46,9 @@ impl KubernetesRuntime {
 
     /// 读 app 当前容器的 desired 快照（update 部分更新回退用）。
     ///
-    /// - **command**：UserApp 存于 `container.args`（用镜像 ENTRYPOINT + 用户命令作 args），
+    /// - **command**：Userapp 存于 `container.args`（用镜像 ENTRYPOINT + 用户命令作 args），
     ///   兼顾 `container.command`（其他路径内联）→ `command.or(args)`。
-    /// - **env**：UserApp env 走 ConfigMap（envFrom 引用 `{app}-config`），读 `.data` 还原字面值。
+    /// - **env**：Userapp env 走 ConfigMap（envFrom 引用 `{app}-config`），读 `.data` 还原字面值。
     /// - **secrets**：Secret `{app}-secret`（写入用 string_data，API 返回在 `.data` 并 base64）。
     /// - **resources**：pod template `resources.limits` 原样还原 Quantity 字符串
     ///   （写入与读出同格式，无换算损耗；storage 是 per-app PVC 配额不在容器层，不读）。

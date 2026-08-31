@@ -54,18 +54,18 @@ pub(crate) fn userapp_top_router() -> OpenApiRouter<UserAppState> {
     OpenApiRouter::new().nest("/api/v1/userapp", userapp_router())
 }
 
-/// userApp 域独立 OpenAPI 文档（含 UserApp tag；rcoder 聚合与本地 swagger 用）。
+/// userApp 域独立 OpenAPI 文档（含 Userapp tag；rcoder 聚合与本地 swagger 用）。
 ///
 /// tag 体系与 rcoder 主文档同源（环境维度分组）；声明顺序即 UI 分组顺序。
 #[derive(OpenApi)]
 #[openapi(
-    info(title = "file-server-userapp", description = "UserApp 域接口（构建任务 / dev server 进程 / 文件镜像 / 工作区与工具链）——容器内 file-server 服务，由 rcoder 门面与透传面转发"),
+    info(title = "file-server-userapp", description = "Userapp 域接口（构建任务 / dev server 进程 / 文件镜像 / 工作区与工具链）——容器内 file-server 服务，由 rcoder 门面与透传面转发"),
     tags(
-        (name = "UserApp · dev · 构建任务", description = "dev 专属（目标容器恒为 UserAppBuilder 开发容器）：构建触发、任务查询/取消与进度 SSE、制品包下载"),
-        (name = "UserApp · dev · 工作区与工具链", description = "dev 专属（目标容器 UserAppBuilder 开发容器）：workspace 创建、命令执行、打包下载、模板与技能安装、项目类型探测确认"),
-        (name = "UserApp · dev · 进程管理", description = "dev 专属（目标容器 UserAppBuilder 开发容器，路径自带 dev）：dev server 进程启停/列表/日志"),
-        (name = "UserApp · 双态 · 文件镜像", description = "dev/prod 双态（X-App-Stage header 分派，缺省 dev）：TS 老接口族文件操作（wire 键已随 userApp 域 snake 统一）"),
-        (name = "UserApp · 双态 · 文件与存储", description = "dev/prod 双态（路径 {app_id}/{app_stage} 段分派）：文件上传/管理与存储卷查询/清理/销毁")
+        (name = "Userapp · dev · 构建任务", description = "dev 专属（目标容器恒为 UserappBuilder 开发容器）：构建触发、任务查询/取消与进度 SSE、制品包下载"),
+        (name = "Userapp · dev · 工作区与工具链", description = "dev 专属（目标容器 UserappBuilder 开发容器）：workspace 创建、命令执行、打包下载、模板与技能安装、项目类型探测确认"),
+        (name = "Userapp · dev · 进程管理", description = "dev 专属（目标容器 UserappBuilder 开发容器，路径自带 dev）：dev server 进程启停/列表/日志"),
+        (name = "Userapp · 双态 · 文件镜像", description = "dev/prod 双态（X-App-Stage header 分派，缺省 dev）：TS 老接口族文件操作（wire 键已随 userApp 域 snake 统一）"),
+        (name = "Userapp · 双态 · 文件与存储", description = "dev/prod 双态（路径 {app_id}/{app_stage} 段分派）：文件上传/管理与存储卷查询/清理/销毁")
     )
 )]
 struct ApiDoc;

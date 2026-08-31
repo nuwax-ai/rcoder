@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
     let projects_for_lookup = Arc::clone(&projects);
     let container_lookup: Arc<dyn shared_types::ContainerLookup> = projects_for_lookup;
 
-    // UserApp 活动状态注册表（闲置回收 + 流量唤醒的共享状态）。
+    // Userapp 活动状态注册表（闲置回收 + 流量唤醒的共享状态）。
     // 独立 Arc 在 Pingora 之前构造（注入代理层）；runtime 延迟到下方 RuntimeManager::get 后
     // 经 set_runtime 填充（OnceLock）——wake 只在 is_stopped 真时触发，而 stopped 表要到
     // AppService::new 才填充，此时 OnceLock 早已 set。

@@ -45,7 +45,7 @@ pub struct DockerRuntime {
     pub(super) inner: Arc<DockerManager>,
     /// TTL cache for list_containers result (15 seconds)
     list_cache: Cache<(), Vec<RuntimeContainerInfo>>,
-    /// UserApp 闲置回收策略（Docker 无 K8s 注解，改用内存态；dev 模式可接受重启丢失，
+    /// Userapp 闲置回收策略（Docker 无 K8s 注解，改用内存态；dev 模式可接受重启丢失，
     /// 与 pingora_ports 同架构）。app_id → RecyclePolicy，merge 语义。
     pub(super) recycle_policy: DashMap<String, RecyclePolicy>,
 }
@@ -112,8 +112,8 @@ impl AgentContainerRuntime for DockerRuntime {
             // 使用 find_container 实时查询 Docker API 获取 IP，
             // 避免 get_user_container_info → get_agent_info → get_container_info 只查缓存
             // 导致服务重启后缓存丢失返回 None。
-            // UserAppBuilder 复用 agent-runner 镜像(有 gRPC),同样走实时查询。
-            ServiceType::ComputerAgentRunner | ServiceType::UserAppBuilder => {
+            // UserappBuilder 复用 agent-runner 镜像(有 gRPC),同样走实时查询。
+            ServiceType::ComputerAgentRunner | ServiceType::UserappBuilder => {
                 let result = self.find_container(identifier, service_type).await?;
                 Ok(result.map(|pod| ContainerBasicInfo {
                     container_id: pod.container_id,
@@ -131,9 +131,9 @@ impl AgentContainerRuntime for DockerRuntime {
                     ),
                 }))
             }
-            // UserApp 兜底：UserApp 通常走 create_deployment/get_deployment_status，
+            // Userapp 兜底：Userapp 通常走 create_deployment/get_deployment_status，
             // 此处仅为 trait 穷尽性，端口不固定故 internal_port=0
-            ServiceType::UserApp => {
+            ServiceType::Userapp => {
                 let result = self.find_container(identifier, service_type).await?;
                 Ok(result.map(|pod| ContainerBasicInfo {
                     container_id: pod.container_id,
@@ -243,8 +243,8 @@ impl AgentContainerRuntime for DockerRuntime {
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
         match service_type {
-            // UserApp/UserAppBuilder 的 identifier=app_id/project_id，复用 WebAgentRunner 的 stop_container 路径
-            ServiceType::WebAgentRunner | ServiceType::UserApp | ServiceType::UserAppBuilder => {
+            // Userapp/UserappBuilder 的 identifier=app_id/project_id，复用 WebAgentRunner 的 stop_container 路径
+            ServiceType::WebAgentRunner | ServiceType::Userapp | ServiceType::UserappBuilder => {
                 self.inner
                     .stop_container(identifier)
                     .await
@@ -360,11 +360,11 @@ impl DockerRuntime {
     }
 }
 
-/// UserApp 容器/Deployment 命名（单一来源，与 K8s 侧 `KubernetesRuntime::app_deployment_name` 对称）。
+/// Userapp 容器/Deployment 命名（单一来源，与 K8s 侧 `KubernetesRuntime::app_deployment_name` 对称）。
 ///
-/// 前缀取自 `ServiceType::UserApp::container_prefix()`，避免散落硬编码；改前缀只需改一处。
+/// 前缀取自 `ServiceType::Userapp::container_prefix()`，避免散落硬编码；改前缀只需改一处。
 pub(super) fn app_deployment_name(app_id: &str) -> String {
-    format!("{}-{app_id}", ServiceType::UserApp.container_prefix())
+    format!("{}-{app_id}", ServiceType::Userapp.container_prefix())
 }
 
 /// 容器 ports 元数据 label（update live 回退数据源；编码 "8080:http,5432:tcp"，

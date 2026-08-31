@@ -1,10 +1,10 @@
 //! userApp 工具族代理的文档接口。
 //!
 //! - **开发域工具族**：`/userapp/dev/{ttyd,vnc,audio,ime,dbx}/{user_id}/{app_id}`——
-//!   定位 UserAppBuilder 开发容器；user_id 是懒创建显式 owner 档（dev/{user_id}/{app_id}
+//!   定位 UserappBuilder 开发容器；user_id 是懒创建显式 owner 档（dev/{user_id}/{app_id}
 //!   宿主树分区）+ 卷分区定位（与 computer 族按 user_id 定位沙箱对称）。
 //! - **生产域工具族**：`/userapp/prod/{ttyd,pgweb,dbx}/{user_id}/{app_id}`——定位
-//!   `ServiceType::UserApp` 运行容器；user_id 为宿主机数据卷分区组成段（容器
+//!   `ServiceType::Userapp` 运行容器；user_id 为宿主机数据卷分区组成段（容器
 //!   未启动时配合唤醒定位）。
 //! - **应用流量族**（免端口）：`/proxy/userapp/{dev,prod}/{user_id}/{app_id}`——
 //!   见 `proxy_handler_api` 的 `proxy_to_app/devapp_with_path`。
@@ -79,10 +79,10 @@ async fn redirect_doc_response(
 #[utoipa::path(
     get,
     path = "/userapp/dev/ttyd/{user_id}/{app_id}/{*path}",
-    tag = "UserApp · dev · 终端工具",
+    tag = "Userapp · dev · 终端工具",
     summary = "开发容器 Web 终端（ttyd）",
     description = r#"
-访问该 app 开发容器（UserAppBuilder）内的 **Web 终端**。与 computer 族
+访问该 app 开发容器（UserappBuilder）内的 **Web 终端**。与 computer 族
 （`/computer/ttyd/{user_id}/...` 按用户沙箱）对称的开发场景入口，按 **app_id** 定位。
 
 - upstream 经容器内 agent_runner 的 ws_terminal 中间层（17681）连接 ttyd 本体（7681）；
@@ -117,10 +117,10 @@ pub async fn proxy_to_userapp_ttyd(
 #[utoipa::path(
     get,
     path = "/userapp/dev/vnc/{user_id}/{app_id}/{*path}",
-    tag = "UserApp · dev · 终端工具",
+    tag = "Userapp · dev · 终端工具",
     summary = "开发容器远程桌面（noVNC）",
     description = r#"
-访问该 app 开发容器（UserAppBuilder）内的 **远程桌面**（noVNC）。开发容器是完整桌面镜像
+访问该 app 开发容器（UserappBuilder）内的 **远程桌面**（noVNC）。开发容器是完整桌面镜像
 （Xvnc 5900 + noVNC 6080），与 computer 族 `/computer/vnc/{user_id}/...` 对称。
 
 - upstream = 容器内 noVNC（6080，HTTP 页面 + `websockify` WebSocket 同端口）。
@@ -151,10 +151,10 @@ pub async fn proxy_to_userapp_vnc(
 #[utoipa::path(
     get,
     path = "/userapp/dev/audio/{user_id}/{app_id}/{*path}",
-    tag = "UserApp · dev · 终端工具",
+    tag = "Userapp · dev · 终端工具",
     summary = "开发容器语音代理（audio）",
     description = r#"
-访问该 app 开发容器（UserAppBuilder）内的 **语音服务**。分流规则与 computer 族
+访问该 app 开发容器（UserappBuilder）内的 **语音服务**。分流规则与 computer 族
 `/computer/audio/{user_id}/...` 一致：
 
 - `path` 为 `ws` 或 `ws/*` → WebSocket 语音流（6089）
@@ -187,10 +187,10 @@ pub async fn proxy_to_userapp_audio(
 #[utoipa::path(
     get,
     path = "/userapp/dev/ime/{user_id}/{app_id}/{*path}",
-    tag = "UserApp · dev · 终端工具",
+    tag = "Userapp · dev · 终端工具",
     summary = "开发容器输入法代理（IME）",
     description = r#"
-访问该 app 开发容器（UserAppBuilder）内的 **IME 输入法透传服务**（6091，WebSocket）。
+访问该 app 开发容器（UserappBuilder）内的 **IME 输入法透传服务**（6091，WebSocket）。
 客户端本地输入法经 WebSocket 发送文本，容器内用 xdotool 输入到远程桌面——
 与 computer 族 `/computer/ime/{user_id}/...` 对称。
 
@@ -217,14 +217,14 @@ pub async fn proxy_to_userapp_ime(
     redirect_doc_response(&state, "dev", "ime", user_id, app_id, path).await
 }
 
-/// Pingora 代理 - DBX 数据库 Web GUI（开发阶段，UserAppBuilder 开发容器）
+/// Pingora 代理 - DBX 数据库 Web GUI（开发阶段，UserappBuilder 开发容器）
 #[utoipa::path(
     get,
     path = "/userapp/dev/dbx/{user_id}/{app_id}/{*path}",
-    tag = "UserApp · dev · 终端工具",
+    tag = "Userapp · dev · 终端工具",
     summary = "开发容器数据库控制台（DBX）",
     description = r#"
-访问该 app **开发容器**（UserAppBuilder，agent-runner 镜像）内的 DBX 数据库
+访问该 app **开发容器**（UserappBuilder，agent-runner 镜像）内的 DBX 数据库
 Web GUI（60+ 数据库，supervisor 恒起 4224）——开发阶段查库/改数据的全功能控制台
 （容器内 PG 已预置连接 + 首访浏览器设密码；也可连远端库）。
 
@@ -259,11 +259,11 @@ pub async fn proxy_to_dev_dbx(
 #[utoipa::path(
     get,
     path = "/userapp/prod/ttyd/{user_id}/{app_id}/{*path}",
-    tag = "UserApp · prod · 终端工具",
+    tag = "Userapp · prod · 终端工具",
     summary = "生产容器 Web 终端（ttyd）",
     description = r#"
-访问该 app **运行容器**（`ServiceType::UserApp`，app-runtime 镜像——部署后的生产环境）
-内的 Web 终端，供线上排障。与开发域 `/userapp/dev/ttyd/{app_id}`（UserAppBuilder 开发容器、
+访问该 app **运行容器**（`ServiceType::Userapp`，app-runtime 镜像——部署后的生产环境）
+内的 Web 终端，供线上排障。与开发域 `/userapp/dev/ttyd/{app_id}`（UserappBuilder 开发容器、
 经 ws_terminal 中间层定位到开发卷 cwd）的关键差异：
 
 - upstream **直连 ttyd 本体**（7681，WebSocket）——运行容器没有 agent_runner，
@@ -296,7 +296,7 @@ pub async fn proxy_to_userapp_runtime_ttyd(
 #[utoipa::path(
     get,
     path = "/userapp/prod/pgweb/{user_id}/{app_id}/{*path}",
-    tag = "UserApp · prod · 终端工具",
+    tag = "Userapp · prod · 终端工具",
     summary = "生产容器数据库控制台（pgweb）",
     description = r#"
 访问该 app **运行容器**（app-runtime 镜像）内的 pgweb——容器内 PostgreSQL（5432）
@@ -326,14 +326,14 @@ pub async fn proxy_to_userapp_runtime_pgweb(
     redirect_doc_response(&state, "prod", "pgweb", user_id, app_id, path).await
 }
 
-/// Pingora 代理 - DBX 数据库 Web GUI（生产阶段，UserApp 运行容器）
+/// Pingora 代理 - DBX 数据库 Web GUI（生产阶段，Userapp 运行容器）
 #[utoipa::path(
     get,
     path = "/userapp/prod/dbx/{user_id}/{app_id}/{*path}",
-    tag = "UserApp · prod · 终端工具",
+    tag = "Userapp · prod · 终端工具",
     summary = "生产容器数据库控制台（DBX）",
     description = r#"
-访问该 app **运行容器**（`ServiceType::UserApp`，app-runtime 镜像——部署后的生产环境）
+访问该 app **运行容器**（`ServiceType::Userapp`，app-runtime 镜像——部署后的生产环境）
 内的 DBX 数据库 Web GUI（supervisor 恒起 4224），供线上查库排障。
 
 - 容器内 PG 由 supervisor 恒起（`/app/data/pg` 持久于 app 的 RWX PVC）；
@@ -365,7 +365,7 @@ pub async fn proxy_to_prod_dbx(
 #[utoipa::path(
     get,
     path = "/userapp/routes",
-    tag = "UserApp · 访问入口",
+    tag = "Userapp · 访问入口",
     summary = "userApp 代理路由一览",
     description = "userApp 两族 Pingora 代理入口速查：工具族 /userapp/{dev,prod}/{tool}/{user_id}/{app_id}；应用流量族（免端口，pingap 统一入口 9080）/proxy/userapp/{dev,prod}/{user_id}/{app_id}。",
     responses(
@@ -375,7 +375,7 @@ pub async fn proxy_to_prod_dbx(
 pub async fn userapp_proxy_routes_doc() -> Json<Value> {
     Json(json!({
         "tools": {
-            "说明": "容器内固定控制台（supervisor 恒起）；user_id=归属（dev 懒创建显式 owner 档 / prod 归属锚点）；stage 段 dev=开发容器(UserAppBuilder，未建 workspace → 404) / prod=运行容器(未部署 → 502)",
+            "说明": "容器内固定控制台（supervisor 恒起）；user_id=归属（dev 懒创建显式 owner 档 / prod 归属锚点）；stage 段 dev=开发容器(UserappBuilder，未建 workspace → 404) / prod=运行容器(未部署 → 502)",
             "dev": {
                 "ttyd（Web 终端，cwd=开发卷/{app_id}，ws 子协议 tty）": "/userapp/dev/ttyd/{user_id}/{app_id}/{path}",
                 "vnc（noVNC 远程桌面）": "/userapp/dev/vnc/{user_id}/{app_id}/{path}",

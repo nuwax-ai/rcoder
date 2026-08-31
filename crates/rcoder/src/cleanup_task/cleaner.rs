@@ -237,9 +237,9 @@ impl AgentCleaner {
         let strategy: &dyn super::strategies::CleanupStrategy = match service_type {
             ServiceType::WebAgentRunner => &self.rcoder_strategy,
             ServiceType::ComputerAgentRunner => &self.computer_runner_strategy,
-            // UserApp 不注册到 projects 表,cleanup_task 不会处理;UserAppBuilder 复用 agent-runner,
+            // Userapp 不注册到 projects 表,cleanup_task 不会处理;UserappBuilder 复用 agent-runner,
             // 闲置清理用 rcoder 策略(检查自身 idle + timeout)。兜底用 rcoder 策略。
-            ServiceType::UserApp | ServiceType::UserAppBuilder => &self.rcoder_strategy,
+            ServiceType::Userapp | ServiceType::UserappBuilder => &self.rcoder_strategy,
         };
 
         // 3. 检查是否需要销毁容器，并获取销毁原因
@@ -392,7 +392,7 @@ impl AgentCleaner {
             return false; // 无容器记录：无换代对象
         }
         // identifier 单一事实源（与**创建路径**一致：pod_id 优先 →
-        // Computer 用 user_id → Web/UserApp 用 project_id），防止此处的 STS 定位
+        // Computer 用 user_id → Web/Userapp 用 project_id），防止此处的 STS 定位
         // 与创建路径分叉
         let identifier = match service_type.container_identifier(
             info.pod_id(),

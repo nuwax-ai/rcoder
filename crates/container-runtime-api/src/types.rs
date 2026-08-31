@@ -1,4 +1,4 @@
-//! Container runtime 类型定义（错误、状态、UserApp 相关 DTO）
+//! Container runtime 类型定义（错误、状态、Userapp 相关 DTO）
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ pub enum ContainerRuntimeError {
 /// Result type for container operations
 pub type ContainerRuntimeResult<T> = Result<T, ContainerRuntimeError>;
 
-/// exec 命令执行结果(UserApp 容器内跑命令的输出)
+/// exec 命令执行结果(Userapp 容器内跑命令的输出)
 #[derive(Debug, Clone)]
 pub struct ExecResult {
     /// 标准输出
@@ -271,7 +271,7 @@ impl From<ContainerRuntimeStatus> for String {
 }
 
 // ============================================================================
-// 应用（UserApp）相关类型
+// 应用（Userapp）相关类型
 // ============================================================================
 
 /// 应用端口暴露类型（只描述协议；对外暴露机制由 [`HttpExpose`] 决定）
@@ -425,7 +425,7 @@ pub struct DeploymentStatus {
 /// `valueFrom`（secret/configmap 引用）无字面值，读不回，需调用方 update 时重发 `secrets`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerSpecSnapshot {
-    /// 启动命令（K8s UserApp 存于 `container.args`，Docker 存于 `Config.cmd`）
+    /// 启动命令（K8s Userapp 存于 `container.args`，Docker 存于 `Config.cmd`）
     pub command: Option<Vec<String>>,
     /// 字面值环境变量
     pub env: Option<HashMap<String, String>>,

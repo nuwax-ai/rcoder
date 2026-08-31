@@ -15,7 +15,7 @@ pub(super) fn proxy_api_routes(state: Arc<AppState>) -> Router {
         .route("/proxy/config", get(handler::proxy_config))
         // userApp 工具族 307 文档接口（实际流量走 Pingora 8088；stage 段 dev/prod 统一：
         // 此处提供 Swagger 文档 + 可直接调用的重定向语义，对齐 devapp 先例）
-        // 开发域（UserAppBuilder 开发容器）：ttyd/vnc/audio/ime/dbx
+        // 开发域（UserappBuilder 开发容器）：ttyd/vnc/audio/ime/dbx
         .route(
             "/userapp/dev/ttyd/{user_id}/{app_id}/{*path}",
             get(handler::proxy_to_userapp_ttyd),

@@ -84,7 +84,7 @@ const GRPC_REQUEST_TIMEOUT_SECS: u64 = 5;
     tag = "computer",
     operation_id = "computer_agent_status",
     summary = "查询 Computer Agent 状态",
-    description = "查询指定 user_id + project_id 对应的 Computer Agent 是否已启动。通过主动调用子容器的 gRPC GetStatus 接口确认 Agent 真实状态。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserAppBuilder 开发容器，agent 会话仅 dev 阶段。"
+    description = "查询指定 user_id + project_id 对应的 Computer Agent 是否已启动。通过主动调用子容器的 gRPC GetStatus 接口确认 Agent 真实状态。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_agent_status(
@@ -96,7 +96,7 @@ pub async fn computer_agent_status(
     let locale = get_locale_from_headers(&headers);
 
     // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；agent 会话
-    //    仅存在于 dev 的 UserAppBuilder 开发容器）
+    //    仅存在于 dev 的 UserappBuilder 开发容器）
     match super::pod_handler::parse_agent_userapp_dispatch(
         request.service_type.as_deref(),
         request.project_id.as_deref(),
@@ -154,7 +154,7 @@ pub async fn computer_agent_status(
         identifier_display, project_id
     );
 
-    // 2. 查询容器信息：project 映射优先（userApp 开发对话的 UserAppBuilder 开发
+    // 2. 查询容器信息：project 映射优先（userApp 开发对话的 UserappBuilder 开发
     //    容器仅存在于映射；computer 老场景也必注册映射）；miss 再按 user_id/pod_id
     //    走 ComputerAgentRunner 查找
     let mapped_container = state
@@ -516,10 +516,10 @@ async fn call_grpc_get_status_with_retry(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error")))
 }
 
-/// userApp dev 分派：查询 UserAppBuilder 开发容器内 app 会话的 agent 状态。
+/// userApp dev 分派：查询 UserappBuilder 开发容器内 app 会话的 agent 状态。
 ///
 /// 定位 = project 映射优先（builder 容器注册于 `state.projects[app_id]`）；
-/// 映射 miss 时按 UserAppBuilder 只读实时查（与 pod 族 status_userapp_dev
+/// 映射 miss 时按 UserappBuilder 只读实时查（与 pod 族 status_userapp_dev
 /// 同为只读不自愈）。无容器/not running/gRPC 失败均报 `not_alive`（幂等），
 /// 不做 computer 路径的 self-healing——builder 注册由 ensure 链维护。
 async fn status_userapp_dev(
@@ -536,7 +536,7 @@ async fn status_userapp_dev(
                 .runtime()
                 .get_container_info_by_identifier(
                     app_id,
-                    &shared_types::ServiceType::UserAppBuilder,
+                    &shared_types::ServiceType::UserappBuilder,
                 )
                 .await
             {

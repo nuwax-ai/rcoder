@@ -119,7 +119,7 @@ pub struct UserappDevProcess {
     pub app_id: String,
     /// 主进程 PID
     pub pid: u32,
-    /// 服务端口（UserApp workspace 恒为 pingap 9080 统一入口）
+    /// 服务端口（Userapp workspace 恒为 pingap 9080 统一入口）
     pub port: u16,
     /// 启动时间（Unix 毫秒）
     pub started_at: i64,
@@ -127,7 +127,7 @@ pub struct UserappDevProcess {
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct UserappDevList {
-    /// 在跑的 UserApp 开发服务列表（不含 web/computer 项目进程）
+    /// 在跑的 Userapp 开发服务列表（不含 web/computer 项目进程）
     pub list: Vec<UserappDevProcess>,
 }
 

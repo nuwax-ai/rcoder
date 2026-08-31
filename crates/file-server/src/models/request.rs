@@ -28,7 +28,7 @@ pub struct ParseErrorBody {
 pub struct BuildQuery {
     /// 项目 ID（workspace 根目录名）
     pub project_id: String,
-    /// UserApp 开发卷定位 (可选): 传 appId 时 workspace 走 UserApp 开发卷
+    /// Userapp 开发卷定位 (可选): 传 appId 时 workspace 走 Userapp 开发卷
     /// (`{USERAPP_WORKSPACE_DIR}/{appId}`), 与 projectId 定位二选一。
     #[serde(default)]
     pub app_id: Option<String>,
@@ -77,7 +77,7 @@ pub struct KeepAliveQuery {
     /// 项目 ID（workspace 根目录名）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
-    /// UserApp 开发卷定位 (可选, 与 projectId 二选一; 见 BuildQuery::app_id)。
+    /// Userapp 开发卷定位 (可选, 与 projectId 二选一; 见 BuildQuery::app_id)。
     #[serde(default)]
     pub app_id: Option<String>,
     /// 开发服务器进程 PID（start-dev 响应回传的值）

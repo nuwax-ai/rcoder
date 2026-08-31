@@ -20,7 +20,7 @@ use super::*;
     tag = "pod",
     operation_id = "pod_stop",
     summary = "停止并销毁容器（保留数据卷）",
-    description = "根据 user_id / project_id / service_type 定位容器并销毁：K8s 删 STS + Service（PVC 保留，数据不丢，下次 ensure 重建挂回），Docker 删容器。携带 app_id 时进入 userApp 分派：dev=销毁 UserAppBuilder 开发容器（per-app PVC 保留）；prod=scale-to-0 停止生产实例（阻断流量唤醒，ensure 可显式唤醒）。容器不存在时幂等返回成功。注意：对话状态在 agent 内存中，停止即断会话。"
+    description = "根据 user_id / project_id / service_type 定位容器并销毁：K8s 删 STS + Service（PVC 保留，数据不丢，下次 ensure 重建挂回），Docker 删容器。携带 app_id 时进入 userApp 分派：dev=销毁 UserappBuilder 开发容器（per-app PVC 保留）；prod=scale-to-0 停止生产实例（阻断流量唤醒，ensure 可显式唤醒）。容器不存在时幂等返回成功。注意：对话状态在 agent 内存中，停止即断会话。"
 )]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_stop(
@@ -222,7 +222,7 @@ pub async fn pod_stop(
 // userApp 分派实现（app_id/app_stage）
 // ============================================================================
 
-/// stop 的 userApp dev 分支：销毁 UserAppBuilder 开发容器（per-app PVC 保留，
+/// stop 的 userApp dev 分支：销毁 UserappBuilder 开发容器（per-app PVC 保留，
 /// 数据不丢）。清注册 container 字段而非 remove_project——保 PG 侧 project 行
 /// 与会话映射；探活缓存一并失效，防下次 ensure 命中死 IP。
 async fn stop_userapp_dev(
@@ -232,7 +232,7 @@ async fn stop_userapp_dev(
     // 区分查询错误与真不存在（K8s API 瞬断不应误报幂等成功）
     let existed = state
         .runtime()
-        .get_container_info_by_identifier(&app_id, &ServiceType::UserAppBuilder)
+        .get_container_info_by_identifier(&app_id, &ServiceType::UserappBuilder)
         .await
         .map_err(|e| {
             error!("[POD_STOP] userapp dev container lookup failed: app_id={app_id}: {e:#}");
@@ -247,14 +247,14 @@ async fn stop_userapp_dev(
         );
         return Ok(HttpResult::success(StopPodResponse {
             was_existing: false,
-            message: "UserApp dev 容器不存在（幂等空操作）".to_string(),
+            message: "Userapp dev 容器不存在（幂等空操作）".to_string(),
         }));
     }
 
     // 物理销毁（K8s：STS+svc，per-app PVC 保留；Docker：删容器+卷映射，宿主目录保留）
     state
         .runtime()
-        .stop_container_by_identifier(&app_id, &ServiceType::UserAppBuilder)
+        .stop_container_by_identifier(&app_id, &ServiceType::UserappBuilder)
         .await
         .map_err(|e| {
             error!("[POD_STOP] userapp dev stop failed: app_id={app_id}: {e:#}");
@@ -278,7 +278,7 @@ async fn stop_userapp_dev(
     info!("[POD_STOP] userapp dev stop completed: app_id={app_id}");
     Ok(HttpResult::success(StopPodResponse {
         was_existing: true,
-        message: "UserApp dev 容器已停止（开发卷保留，数据不丢）".to_string(),
+        message: "Userapp dev 容器已停止（开发卷保留，数据不丢）".to_string(),
     }))
 }
 
@@ -307,6 +307,6 @@ async fn stop_userapp_prod(
     info!("[POD_STOP] userapp prod 已停止（scale 0）: app_id={app_id}");
     Ok(HttpResult::success(StopPodResponse {
         was_existing: true,
-        message: "UserApp 生产实例已停止（流量唤醒已阻断，ensure 可显式唤醒）".to_string(),
+        message: "Userapp 生产实例已停止（流量唤醒已阻断，ensure 可显式唤醒）".to_string(),
     }))
 }

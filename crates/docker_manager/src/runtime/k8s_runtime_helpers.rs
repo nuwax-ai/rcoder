@@ -113,16 +113,16 @@ impl KubernetesRuntime {
                     return env_image;
                 }
             }
-            // UserAppBuilder 复用 agent-runner 镜像(含 file-server embed + build 工具链),与
+            // UserappBuilder 复用 agent-runner 镜像(含 file-server embed + build 工具链),与
             // ComputerAgentRunner 同源。只读 RCODER_DOCKER_IMAGE_COMPUTER(= agent-runner 镜像),
             // 绝不能读 RCODER_DOCKER_IMAGE(= rcoder 主镜像)——后者默认 CMD 是 node REPL,不是 agent_runner,
             // 会导致 builder pod 落入 node 交互式 shell 而非跑 agent_runner + 内嵌 file-server。
-            ServiceType::UserAppBuilder => {
+            ServiceType::UserappBuilder => {
                 if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE_COMPUTER")
                     && !env_image.is_empty()
                 {
                     info!(
-                        "[K8S] UserAppBuilder using agent-runner image from RCODER_DOCKER_IMAGE_COMPUTER env: {}",
+                        "[K8S] UserappBuilder using agent-runner image from RCODER_DOCKER_IMAGE_COMPUTER env: {}",
                         env_image
                     );
                     return env_image;
@@ -200,11 +200,11 @@ impl KubernetesRuntime {
         // 4. 硬编码兜底(env 与 config 都没给)
         warn!("[K8S] No image config found, using hardcoded fallback");
         match service_type {
-            // UserApp 实际走 create_deployment（image_override），不走 create_container/select_image
+            // Userapp 实际走 create_deployment（image_override），不走 create_container/select_image
             // 此处兜底与 WebAgentRunner 共用，仅为 match 穷尽
-            ServiceType::WebAgentRunner | ServiceType::UserApp => "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest".to_string(),
-            // UserAppBuilder 复用 dev-rcoder-agent-runner 镜像(与 ComputerAgentRunner 同镜像)
-            ServiceType::ComputerAgentRunner | ServiceType::UserAppBuilder => {
+            ServiceType::WebAgentRunner | ServiceType::Userapp => "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest".to_string(),
+            // UserappBuilder 复用 dev-rcoder-agent-runner 镜像(与 ComputerAgentRunner 同镜像)
+            ServiceType::ComputerAgentRunner | ServiceType::UserappBuilder => {
                 "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest".to_string()
             }
         }
@@ -212,7 +212,7 @@ impl KubernetesRuntime {
 
     /// Build resource requirements for K8s container from ServiceResourceLimits。
     ///
-    /// 委派给共享 `build_decoupled_resources`（与 UserApp 侧 `build_app_resource_requirements`
+    /// 委派给共享 `build_decoupled_resources`（与 Userapp 侧 `build_app_resource_requirements`
     /// 共用 requests/limits 解耦策略，值一致）。仅在此做入参转换：ServiceResourceLimits 的
     /// memory(bytes f64）/cpu（核数 f64）归一化为 K8s Quantity 字符串。
     pub(super) fn build_resource_requirements(

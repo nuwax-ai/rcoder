@@ -21,7 +21,7 @@ use crate::models::{HealthInfo, OwnerParams, ResourceStats};
     path = "/api/v1/userapp/{app_id}/{app_stage}/health",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）"),
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）；`prod`=运行容器（Userapp）"),
         OwnerParams,
     ),
     description = r#"
@@ -38,7 +38,7 @@ use crate::models::{HealthInfo, OwnerParams, ResourceStats};
         (status = 400, description = "app_stage 非法（仅 dev|prod）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 生命周期"
+    tag = "Userapp · 双态 · 生命周期"
 )]
 #[instrument(skip(state))]
 pub async fn get_app_health(
@@ -81,7 +81,7 @@ pub struct StatsParams {
     path = "/api/v1/userapp/{app_id}/{app_stage}/stats",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）"),
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）；`prod`=运行容器（Userapp）"),
         StatsParams
     ),
     responses(
@@ -89,7 +89,7 @@ pub struct StatsParams {
         (status = 400, description = "参数错误（user_id 缺失/非法）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 生命周期"
+    tag = "Userapp · 双态 · 生命周期"
 )]
 #[instrument(skip(state, params))]
 pub async fn get_app_stats(
@@ -133,7 +133,7 @@ pub async fn get_app_stats(
         (status = 400, description = "app_stage 非法或 dev 不支持（本接口仅 prod）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 生命周期"
+    tag = "Userapp · 双态 · 生命周期"
 )]
 #[instrument(skip(state))]
 pub async fn get_app_events(

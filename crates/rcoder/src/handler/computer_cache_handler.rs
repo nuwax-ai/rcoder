@@ -65,9 +65,11 @@ pub struct CacheCleanRequest {
     #[schema(example = "tenant")]
     pub isolation_type: Option<String>,
 
-    /// 服务类型（可选，默认 `computer-agent-runner`；userApp 分派传 `userapp`
-    /// 与 project_id 搭配——**project_id 兼任 app_id**（对齐 /computer/chat
-    /// 契约），清 userApp 开发工作区内的 .cache）
+    /// 服务类型。可选值：`computer-agent-runner`（默认——清 computer workspace
+    /// 的 .cache）、`userapp`（同义变体 `user-app` / `application` / `app`，大小
+    /// 写不敏感——与 project_id 搭配，**project_id 兼任 app_id**，清 userApp
+    /// 开发工作区内的 .cache）。userApp 容器类型由 app_stage 推导，勿传
+    /// `user-app-builder`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,

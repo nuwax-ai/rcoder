@@ -16,7 +16,7 @@ pub use container::{
 pub mod project_store;
 pub use project_store::ProjectStore;
 
-// UserApp 域（高内聚收拢于 userapp/ 模块）—— 活动追踪/唤醒 + 业务元数据 + build 进度事件 + 开发资源回收契约
+// Userapp 域（高内聚收拢于 userapp/ 模块）—— 活动追踪/唤醒 + 业务元数据 + build 进度事件 + 开发资源回收契约
 pub use userapp::activity::{
     ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, WakeOutcome,
 };
@@ -102,7 +102,7 @@ pub use validation::{
     IDENTIFIER_RE, USERAPP_APP_ID_MAX_LEN, garde_err_to_app_error, validate_identifier,
 };
 
-// UserApp 日志域契约（rcoder ↔ app-cli 单一事实源；OpenAPI schema 同源派生）
+// Userapp 日志域契约（rcoder ↔ app-cli 单一事实源；OpenAPI schema 同源派生）
 pub mod app_cli_logs;
 pub use app_cli_logs::{
     LogQueryRequest, LogQueryResponse, LogRecord, LogSelector, LogSourceInfo, MAX_CURSOR_BYTES,
@@ -202,7 +202,7 @@ pub use agent::http_service::AgentHttpService;
 pub use agent::rcoder_types::*;
 pub use agent::types::*;
 
-// UserApp workspace manifest 类型（极轻量独立 crate，file-server build + app-cli runtime 共用）
+// Userapp workspace manifest 类型（极轻量独立 crate，file-server build + app-cli runtime 共用）
 pub use agent::mgmt_types::{
     AGENT_CACHE_DIR, AgentDetailInfo, AgentIdentity, AgentInfo, AgentInstallStatus,
     CheckAgentRequest, CheckAgentResponse, DEFAULT_ACP_AGENT_INSTALL_DIR, GetAgentRequest,

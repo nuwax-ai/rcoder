@@ -21,20 +21,20 @@ use file_server::workspace::resolve_userapp_dev;
 ///   zip 写入经 part+rename 原子落盘（见 assemble），目录内不存在半截文件。
 /// - 带 `release_id`：精确定位该版本的产物文件（回滚/比对指定版本用）。
 ///
-/// `app_id` 定位走 UserApp 开发卷（`resolve_userapp_dev`，与 build/detect/confirm 同根）。
+/// `app_id` 定位走 Userapp 开发卷（`resolve_userapp_dev`，与 build/detect/confirm 同根）。
 /// 用 COMPUTER_CORS（暴露 Range/Content-Range，支持大产物断点续传）。
 #[utoipa::path(
     get,
     path = "/static/{app_id}",
     params(
-        ("app_id" = String, Path, description = "UserApp identifier (= workspace app_id)"),
+        ("app_id" = String, Path, description = "Userapp identifier (= workspace app_id)"),
         StaticQuery,
     ),
     responses(
         (status = 200, description = "Build artifact zip（缺省最新产物；?release_id= 指定版本）", body = file_server::models::BinaryFile, content_type = "application/zip"),
         (status = 404, description = "无产物，或 ?release_id= 指定的版本不存在（含非法字符被拒）")
     ),
-    tag = "UserApp · dev · 构建任务"
+    tag = "Userapp · dev · 构建任务"
 )]
 pub async fn serve_userapp(
     State(state): State<UserAppState>,

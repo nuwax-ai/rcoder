@@ -1,4 +1,4 @@
-//! UserApp 生命周期 + 观测操作（从 service.rs 拆出，extension-impl）。
+//! Userapp 生命周期 + 观测操作（从 service.rs 拆出，extension-impl）。
 //!
 //! start/stop/restart/recycle + stats/events 观测委托（转调 ContainerRuntime）。
 
@@ -218,12 +218,12 @@ impl AppService {
         Ok(Self::resource_stats_from(usage, restart_count))
     }
 
-    /// 开发容器资源统计：`get_app_resource_usage_for(UserAppBuilder)` 双键定位。
+    /// 开发容器资源统计：`get_app_resource_usage_for(UserappBuilder)` 双键定位。
     /// 用量降级语义与 prod 相同；dev builder 常驻自愈，restart 视图不存在 → 0。
     async fn get_dev_stats(&self, app_id: &str) -> AppResult<ResourceStats> {
         let usage = match self
             .runtime
-            .get_app_resource_usage_for(app_id, &shared_types::ServiceType::UserAppBuilder)
+            .get_app_resource_usage_for(app_id, &shared_types::ServiceType::UserappBuilder)
             .await
         {
             Ok(u) => u,

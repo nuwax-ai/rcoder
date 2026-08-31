@@ -38,7 +38,7 @@ pub(crate) async fn build_project(
 /// 走 pnpm install 与 vite build，产物 dist 拷贝）——本函数就是
 /// package.json 引擎本体，仅服务 vite 前端项目（`GET /api/build/build`）。
 ///
-/// UserApp 域（Java/Go 多服务）**不走本函数**：其编译入口是 manifest 驱动
+/// Userapp 域（Java/Go 多服务）**不走本函数**：其编译入口是 manifest 驱动
 /// 的 `service::userapp::build_workspace_package`（project.manifest.toml 的
 /// [build].command，/api/v1/userapp/build 与 /api/v1/userapp/dev/start|restart 共用）。
 pub(crate) async fn build_project_impl(

@@ -1,4 +1,4 @@
-//! UserApp 活动状态注册表 + 访问追踪/流量唤醒实现
+//! Userapp 活动状态注册表 + 访问追踪/流量唤醒实现
 //!
 //! [`AppActivityRegistry`] 是「闲置自动回收 + 流量唤醒」特性的共享状态中心(in-memory,
 //! rcoder 单实例):
@@ -84,7 +84,7 @@ impl Drop for WakeGuard {
     }
 }
 
-/// UserApp 活动状态注册表(in-memory,rcoder 单实例共享)
+/// Userapp 活动状态注册表(in-memory,rcoder 单实例共享)
 ///
 /// M5 起支持影子持久化：注入 [`shared_types::ActivityPersistence`] 后，
 /// 状态变更标脏，由 rcoder 侧 flusher 周期批量落 PG；启动时 `apply_loaded`

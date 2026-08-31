@@ -1,4 +1,4 @@
-//! UserApp ContainerCreateParams 构建（从 service.rs 拆出，extension-impl）。
+//! Userapp ContainerCreateParams 构建（从 service.rs 拆出，extension-impl）。
 //!
 //! build_container_params / _from_update / build_params_inner（create/update 共用）。
 
@@ -40,7 +40,7 @@ struct AppParamsInput {
 }
 
 impl AppService {
-    /// 构建 ContainerCreateParams（UserApp，create 路径）
+    /// 构建 ContainerCreateParams（Userapp，create 路径）
     pub(crate) async fn build_container_params(
         &self,
         app_id: &str,
@@ -225,7 +225,7 @@ impl AppService {
 
         let mut builder = ContainerCreateParams::builder()
             .project_id(app_id.to_string())
-            .service_type(ServiceType::UserApp)
+            .service_type(ServiceType::Userapp)
             .image_override(image)
             .env(env)
             .secrets(secrets.unwrap_or_default())

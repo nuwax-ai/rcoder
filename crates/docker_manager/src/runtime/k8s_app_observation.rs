@@ -1,7 +1,7 @@
-//! UserApp 观测/操作（从 k8s_deployment.rs 拆出）：日志/事件/资源用量/exec。
+//! Userapp 观测/操作（从 k8s_deployment.rs 拆出）：日志/事件/资源用量/exec。
 //!
 //! 这组方法只读 Pod（pods_api）+ Events/Metrics API，不触碰 Deployment，
-//! 与 k8s_deployment.rs 的 UserApp Deployment 生命周期正交，故独立成模块。
+//! 与 k8s_deployment.rs 的 Userapp Deployment 生命周期正交，故独立成模块。
 
 use container_runtime_api::{ContainerLogEntry, ContainerRuntimeError, ContainerRuntimeResult};
 use kube::api::{Api, ListParams};
@@ -296,7 +296,7 @@ impl KubernetesRuntime {
     }
 
     /// 按双键标准标签定位任意 rcoder 托管容器的资源用量——开发容器
-    /// （UserAppBuilder STS）stats 的 dev 环境入口：builder 由
+    /// （UserappBuilder STS）stats 的 dev 环境入口：builder 由
     /// `build_standard_labels` 打标，同 app_id 下与 prod Deployment 以
     /// service-type 维度区分，零创建链改动即可被 metrics API 命中。
     pub async fn app_resource_usage_for(
@@ -323,7 +323,7 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<container_runtime_api::ResourceUsage> {
         use container_runtime_api::ResourceUsage;
 
-        // 1. 关联 Pod（UserApp 单副本；取第一个）
+        // 1. 关联 Pod（Userapp 单副本；取第一个）
         let lp = ListParams::default().labels(&label_selector);
         let pod = self
             .pods_api()

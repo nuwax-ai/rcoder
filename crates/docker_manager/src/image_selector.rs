@@ -60,9 +60,9 @@ impl ImageSelector {
                 // ComputerAgentRunner 没有老名称
                 None
             }
-            ServiceType::UserApp | ServiceType::UserAppBuilder => {
-                // UserApp / UserAppBuilder 镜像由调用方/chart 提供,不走多镜像选择。
-                // (UserAppBuilder 在 select_image 特判为 dev-rcoder-agent-runner,见路B)
+            ServiceType::Userapp | ServiceType::UserappBuilder => {
+                // Userapp / UserappBuilder 镜像由调用方/chart 提供,不走多镜像选择。
+                // (UserappBuilder 在 select_image 特判为 dev-rcoder-agent-runner,见路B)
                 None
             }
         }

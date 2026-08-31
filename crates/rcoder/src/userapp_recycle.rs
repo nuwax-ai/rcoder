@@ -1,6 +1,6 @@
-//! UserApp 闲置自动回收扫描器（后台定时任务）。
+//! Userapp 闲置自动回收扫描器（后台定时任务）。
 //!
-//! 周期枚举所有 Running UserApp,比对 `last_accessed_at` 与阈值,闲置超阈值 → `stop_app`(scale0,
+//! 周期枚举所有 Running Userapp,比对 `last_accessed_at` 与阈值,闲置超阈值 → `stop_app`(scale0,
 //! 不删 PVC/Service/路由)。付费 app(`recycle_enabled=false` 注解)opt-out 跳过;进行中的唤醒跳过;
 //! 龄期 < protection 跳过;从未访问(None)跳过 grace。
 //!

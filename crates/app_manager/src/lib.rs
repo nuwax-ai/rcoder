@@ -1,6 +1,6 @@
-//! app_manager —— UserApp 应用生命周期管理（独立 crate）
+//! app_manager —— Userapp 应用生命周期管理（独立 crate）
 //!
-//! 提供 REST API 管理 UserApp：create/update/delete/start/stop/restart +
+//! 提供 REST API 管理 Userapp：create/update/delete/start/stop/restart +
 //! 文件管理 + 持久存储 + DB 管理（reset-password/create-database）。
 //! Docker / K8s 双后端统一走 ContainerRuntime 抽象。
 //! rcoder 无状态：业务元数据由调用方持久化。

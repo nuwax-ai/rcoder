@@ -1,4 +1,4 @@
-//! `app-cli`：UserApp 容器运行时编排器。
+//! `app-cli`：Userapp 容器运行时编排器。
 //!
 //! 装在 app-runtime 镜像，替代 workspace `start.sh`：自动发现子项目 → 编排（启服务 + pingap）
 //! → 日志（轮转 + API + SSE）→ 管理 API。

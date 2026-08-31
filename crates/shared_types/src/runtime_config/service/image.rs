@@ -276,11 +276,11 @@ impl ServiceImageConfig {
                 ServiceType::ComputerAgentRunner => {
                     crate::paths::COMPUTER_WORKSPACE_ROOT.to_string()
                 }
-                // UserApp 复用 rcoder-workspace PVC 的 apps subPath（部署侧挂到 /app/app-workspace）
-                ServiceType::UserApp => "/app/app-workspace".to_string(),
-                // UserAppBuilder 完整开发容器: per-app RWO PVC 整卷挂载（与镜像
+                // Userapp 复用 rcoder-workspace PVC 的 apps subPath（部署侧挂到 /app/app-workspace）
+                ServiceType::Userapp => "/app/app-workspace".to_string(),
+                // UserappBuilder 完整开发容器: per-app RWO PVC 整卷挂载（与镜像
                 // start-up.sh 导出的 USERAPP_WORKSPACE_DIR 一致）
-                ServiceType::UserAppBuilder => crate::paths::USERAPP_WORKSPACE_ROOT.to_string(),
+                ServiceType::UserappBuilder => crate::paths::USERAPP_WORKSPACE_ROOT.to_string(),
             })
     }
 

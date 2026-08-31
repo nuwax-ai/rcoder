@@ -238,7 +238,7 @@ fn app_target_accepts_userapp_service_type_alongside_app_id() {
         Ok(AppTarget::Prod(id)) if id == "app-1"
     ));
     // 大小写不敏感 + 既有 ServiceType 变体同义
-    for variant in ["USERAPP", "UserApp", "user-app"] {
+    for variant in ["USERAPP", "Userapp", "user-app"] {
         assert!(
             matches!(
                 parse_app_target(Some("app-1"), None, Some(variant)),
@@ -247,7 +247,7 @@ fn app_target_accepts_userapp_service_type_alongside_app_id() {
             "service_type={variant:?} 应视为 userapp 变体放行"
         );
     }
-    // userapp 标记缺 app_id → 报错（不走 agent 路径空查 UserApp 容器）
+    // userapp 标记缺 app_id → 报错（不走 agent 路径空查 Userapp 容器）
     assert!(parse_app_target(None, None, Some("userapp")).is_err());
 }
 
@@ -257,7 +257,7 @@ fn app_target_accepts_userapp_service_type_alongside_app_id() {
 #[test]
 fn agent_userapp_dispatch_resolves_project_id_as_app_id() {
     // userapp + project_id → Some(app_id)（内部以 app_id 语义消费 project_id 值）
-    for variant in ["userapp", "USERAPP", "UserApp", "user-app"] {
+    for variant in ["userapp", "USERAPP", "Userapp", "user-app"] {
         assert_eq!(
             parse_agent_userapp_dispatch(Some(variant), Some("app-1"), None),
             Ok(Some("app-1".to_string())),
@@ -280,6 +280,26 @@ fn agent_userapp_dispatch_resolves_project_id_as_app_id() {
     );
     assert!(parse_agent_userapp_dispatch(Some("userapp"), Some("app-1"), Some("prod")).is_err());
     assert!(parse_agent_userapp_dispatch(Some("userapp"), Some("app-1"), Some("staging")).is_err());
+}
+
+/// 入参语义防误用：user-app-builder（UserappBuilder 变体）不是有效入参——
+/// userApp 容器类型由 app_stage 推导，传 builder 显式报错引导正确形态
+/// （静默直通会把 project_id 兼任的 app_id 当普通项目 ID 查出误导错误）。
+#[test]
+fn agent_userapp_dispatch_rejects_builder_variant() {
+    for variant in ["user-app-builder", "USER-APP-BUILDER"] {
+        let err = parse_agent_userapp_dispatch(Some(variant), Some("app-1"), None)
+            .expect_err("user-app-builder 应显式拒绝");
+        assert!(
+            err.contains("app_stage 推导"),
+            "报错应引导 app_stage 推导语义: {err}"
+        );
+    }
+    // 未知值仍宽松直通 computer 路径（cache 场景需 computer-agent-runner 直通）
+    assert_eq!(
+        parse_agent_userapp_dispatch(Some("computer-agent-runner"), Some("p1"), None),
+        Ok(None)
+    );
 }
 
 /// agent 族分派的校验面：userapp 缺 project_id 报错、project_id 走 identifier

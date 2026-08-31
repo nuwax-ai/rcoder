@@ -1,4 +1,4 @@
-//! UserApp 应用业务元数据缓存 + 影子持久化（extension-impl）。
+//! Userapp 应用业务元数据缓存 + 影子持久化（extension-impl）。
 //!
 //! PG 模式下 `POST /apps/query` 的 name/created_at 过滤数据源：集群不持有这两个字段
 //! （rcoder 无状态），由 PG `userapp_metadata` 表补充。内存 cache 全量镜像（启动
@@ -106,14 +106,14 @@ impl crate::service::AppService {
         tracing::info!("[APP_METADATA] userapp_metadata loaded: {count} rows");
     }
 
-    /// 注入开发资源回收回调（宿主 rcoder 装配时调用；purge 回收 UserAppBuilder
+    /// 注入开发资源回收回调（宿主 rcoder 装配时调用；purge 回收 UserappBuilder
     /// 开发容器与 per-app PVC，app_manager 自身 runtime 视图无 agent 能力）。
     pub fn set_dev_cleanup(&self, cleanup: Arc<dyn shared_types::UserappDevCleanup>) {
         *self.dev_cleanup.write().expect("dev_cleanup lock") = Some(cleanup);
     }
 
     /// 注入开发容器定位回调（宿主 rcoder 装配时调用；文件/存储接口 `env=dev`
-    /// 分支经此幂等 ensure UserAppBuilder 并解析其 file-server 地址）。
+    /// 分支经此幂等 ensure UserappBuilder 并解析其 file-server 地址）。
     pub fn set_dev_locator(&self, locator: Arc<dyn shared_types::UserappDevLocator>) {
         *self.dev_locator.write().expect("dev_locator lock") = Some(locator);
     }

@@ -1,8 +1,8 @@
-//! `/api/v1/userapp/dev/*`: UserApp 开发阶段的服务生命周期 + 开发编译（新契约, app_id 唯一 key）。
+//! `/api/v1/userapp/dev/*`: Userapp 开发阶段的服务生命周期 + 开发编译（新契约, app_id 唯一 key）。
 //!
 //! 复用 file-server 的 DevServerManager（进程/端口池/探活/日志）与 build 流水线,
 //! 进程 key 用 `userapp:{app_id}` 前缀与 web 项目的 projectId 空间隔离
-//! （app_id≡project_id 同值时, web 项目 workspace 在 project 树 / UserApp 在开发卷,
+//! （app_id≡project_id 同值时, web 项目 workspace 在 project 树 / Userapp 在开发卷,
 //! 同 key 会互踩路径）; 对外响应一律剥前缀回 app_id。
 //!
 //! 响应格式：JSON 接口统一 `shared_types::HttpResult` 信封
@@ -40,19 +40,19 @@ fn app_id_of_key(key: &str) -> Option<&str> {
 /// 编译并启动 dev 服务
 ///
 /// 异步任务：编译可能数分钟，受理即返 task_id。manifest 同核编译（与生产构建同核，dev 编译通过=可部署）
-/// 成功后启动 dev 服务（UserApp workspace = spawn app-cli 按 manifest
+/// 成功后启动 dev 服务（Userapp workspace = spawn app-cli 按 manifest
 /// run.command 编排全栈，pingap 9080 统一入口）；编译失败任务终态 Failed、
 /// 不启动。进度/结果：轮询 `GET /api/v1/userapp/tasks/{task_id}`、SSE
 /// `/api/v1/userapp/tasks/{task_id}/logs/stream`；终态后端口经
-/// `GET /api/v1/userapp/dev/list` 查询（UserApp workspace 恒为 pingap 9080）。
-/// 入参 basePath 对 UserApp workspace（manifest/app-cli 引擎）**无效**
+/// `GET /api/v1/userapp/dev/list` 查询（Userapp workspace 恒为 pingap 9080）。
+/// 入参 basePath 对 Userapp workspace（manifest/app-cli 引擎）**无效**
 /// ——pingap 路由前缀由各服务 project.manifest.toml `[proxy].path` 决定。
 #[utoipa::path(
     post,
     path = "/dev/start",
     request_body = DevOpBody,
     responses((status = 200, body = HttpResult<UserappDevTaskCreated>, description = "启动任务已创建（task_id）")),
-    tag = "UserApp · dev · 进程管理"
+    tag = "Userapp · dev · 进程管理"
 )]
 pub(crate) async fn dev_start(
     State(state): State<UserAppState>,
@@ -87,7 +87,7 @@ pub(crate) async fn dev_start(
     path = "/dev/stop",
     request_body = DevOpBody,
     responses((status = 200, body = HttpResult<UserappDevStopped>, description = "停止结果（含进程组杀灭明细）")),
-    tag = "UserApp · dev · 进程管理"
+    tag = "Userapp · dev · 进程管理"
 )]
 pub(crate) async fn dev_stop(
     State(state): State<UserAppState>,
@@ -132,14 +132,14 @@ pub(crate) async fn dev_stop(
 /// agent 改完代码后的开发闭环——**重启前必须先编译**，新代码才生效；异步任务立即返 task_id，编译
 /// 可能数分钟。manifest 同核编译成功后 stop + start（app-cli 重拉全栈）；
 /// 编译失败任务终态 Failed、旧服务原样保留（可继续用旧版本测试，不因
-/// 中间态断流）。进度/结果查询同 start。入参 basePath 对 UserApp
+/// 中间态断流）。进度/结果查询同 start。入参 basePath 对 Userapp
 /// workspace 无效（同 start 的说明）。
 #[utoipa::path(
     post,
     path = "/dev/restart",
     request_body = DevOpBody,
     responses((status = 200, body = HttpResult<UserappDevTaskCreated>, description = "重启任务已创建（task_id）")),
-    tag = "UserApp · dev · 进程管理"
+    tag = "Userapp · dev · 进程管理"
 )]
 pub(crate) async fn dev_restart(
     State(state): State<UserAppState>,
@@ -216,7 +216,7 @@ async fn spawn_dev_task(
         // 执行 project.manifest.toml 的 [build].command——与发布打包
         // build_workspace_package 完全同核（顺带产出制品 zip，dev 编译通过
         // = 可部署）。此前误用 web 域的 package.json/pnpm 引擎（vite 项目
-        // 专用），对 UserApp 模板项目（Java/Go 多服务）不适用。
+        // 专用），对 Userapp 模板项目（Java/Go 多服务）不适用。
         let progress = task_clone.clone();
         let result = crate::service::userapp::build_workspace_package(
             &state.fs.config,
@@ -307,17 +307,17 @@ async fn spawn_dev_task(
     Ok(task.id.clone())
 }
 
-/// 在跑的 UserApp 开发服务列表
+/// 在跑的 Userapp 开发服务列表
 ///
 /// 列出该 `app_id`（query 必填）在跑的 dev server 进程（pid/port/started_at）。
-/// 不含 web/computer 项目进程——进程键按 app 维度前缀隔离，仅 UserApp 开发
+/// 不含 web/computer 项目进程——进程键按 app 维度前缀隔离，仅 Userapp 开发
 /// 服务视角；`user_id` 为挂载压平契约字段（必填校验，不参与过滤）。
 #[utoipa::path(
     get,
     path = "/dev/list",
     params(UserappDevListQuery),
-    responses((status = 200, body = HttpResult<UserappDevList>, description = "该 app 在跑的 UserApp 开发服务列表（不含 web/computer 项目进程）")),
-    tag = "UserApp · dev · 进程管理"
+    responses((status = 200, body = HttpResult<UserappDevList>, description = "该 app 在跑的 Userapp 开发服务列表（不含 web/computer 项目进程）")),
+    tag = "Userapp · dev · 进程管理"
 )]
 pub(crate) async fn dev_list(
     State(state): State<UserAppState>,
@@ -370,7 +370,7 @@ mod tests {
         assert!(dir.ends_with("my-app"), "dir={}", dir.display());
     }
 
-    /// dev_list 只返回 UserApp 域进程并剥前缀（构造带混合 key 的 manager 快照不易,
+    /// dev_list 只返回 Userapp 域进程并剥前缀（构造带混合 key 的 manager 快照不易,
     /// 此处锁定 app_id_of_key 过滤语义——与 dev_list 的 filter_map 同谓词）。
     #[test]
     fn list_filter_semantics() {

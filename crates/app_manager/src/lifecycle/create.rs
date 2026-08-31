@@ -1,4 +1,4 @@
-//! UserApp 创建链（从 service.rs 拆出，extension-impl）。
+//! Userapp 创建链（从 service.rs 拆出，extension-impl）。
 //!
 //! create_app + validate/provision/runtime/assemble 创建流水。
 
@@ -219,7 +219,7 @@ impl AppService {
 
     /// 创建运行时资源：build params → create_deployment → 注册 Pingora backend。
     ///
-    /// 注: UserApp 是新开发逻辑 (application-management-service-v2-design.md), /app 路径
+    /// 注: Userapp 是新开发逻辑 (application-management-service-v2-design.md), /app 路径
     /// 不涉及历史数据迁移 → 不调 lazy_migrate (新应用无旧数据)。Web/Computer 有历史数据才调。
     async fn create_app_runtime(&self, app_id: &str, request: &CreateAppRequest) -> AppResult<()> {
         let params = self.build_container_params(app_id, request).await?;

@@ -173,9 +173,9 @@ pub fn create_strategy(service_type: &ServiceType) -> Option<Box<dyn AgentInstal
     match service_type {
         ServiceType::ComputerAgentRunner => Some(Box::new(ComputerAgentRunnerStrategy)),
         ServiceType::WebAgentRunner => Some(Box::new(RcoderStrategy)),
-        // UserApp / UserAppBuilder 不是 agent(无 ACP chat),无 agent install strategy。
-        // UserAppBuilder 仅跑 file-server build(本地编译),不需要安装 agent bundle。
-        ServiceType::UserApp | ServiceType::UserAppBuilder => None,
+        // Userapp / UserappBuilder 不是 agent(无 ACP chat),无 agent install strategy。
+        // UserappBuilder 仅跑 file-server build(本地编译),不需要安装 agent bundle。
+        ServiceType::Userapp | ServiceType::UserappBuilder => None,
     }
 }
 

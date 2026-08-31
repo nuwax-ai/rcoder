@@ -5,7 +5,7 @@
 //! - 容器级 OOM 仍由 restartPolicy=Always 原地重启（pod 模板继承）；
 //! - stop/destroy = 删 STS + ClusterIP/headless svc（保留 PVC；下次 ensure 重建 STS 挂回同 PVC）。
 //!
-//! 仅 ComputerAgentRunner / WebAgentRunner 走此路径；UserApp 仍用 Deployment（create_deployment）。
+//! 仅 ComputerAgentRunner / WebAgentRunner 走此路径；Userapp 仍用 Deployment（create_deployment）。
 
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{PodSpec, PodTemplateSpec, Service, ServicePort, ServiceSpec};

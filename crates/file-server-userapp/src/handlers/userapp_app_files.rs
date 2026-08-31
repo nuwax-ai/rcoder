@@ -37,7 +37,7 @@ use crate::models::{
 /// 上传文件
 ///
 /// zip/tar.gz 自动解压；单文件直写。
-#[utoipa::path(post, path = "/app-files/upload", request_body(content = AppFilesUploadForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 双态 · 文件与存储")]
+#[utoipa::path(post, path = "/app-files/upload", request_body(content = AppFilesUploadForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "Userapp · 双态 · 文件与存储")]
 pub(crate) async fn upload(
     State(state): State<UserAppState>,
     mut multipart: Multipart,
@@ -173,7 +173,7 @@ async fn upload_impl(
 `target` 为 app 根相对落盘位置、`flatten` 控制剥单层 wrapper 目录。
 "#,
     responses(file_server::openapi::JsonApiResponses),
-    tag = "UserApp · 双态 · 文件与存储",
+    tag = "Userapp · 双态 · 文件与存储",
 )]
 pub(crate) async fn upload_from_url(
     State(state): State<UserAppState>,
@@ -219,7 +219,7 @@ rcoder app_manager DTO（本族为 rcoder↔file-server 内部契约，字段直
 Java）；生产运行容器 = 单 app 模式（卷根即 app 根）。
 "#,
     responses(file_server::openapi::JsonApiResponses),
-    tag = "UserApp · 双态 · 文件与存储"
+    tag = "Userapp · 双态 · 文件与存储"
 )]
 pub(crate) async fn list(
     State(state): State<UserAppState>,
@@ -291,7 +291,7 @@ pub(crate) async fn list(
 `..` 与绝对路径注入）。危险的全量清理不走此接口——由存储面 storage/clear 承担。
 "#,
     responses(file_server::openapi::JsonApiResponses),
-    tag = "UserApp · 双态 · 文件与存储",
+    tag = "Userapp · 双态 · 文件与存储",
 )]
 pub(crate) async fn delete(
     State(state): State<UserAppState>,
@@ -347,7 +347,7 @@ storage/clear（K8s 删 PVC 重建空卷）语义不同——开发容器常驻�
 销毁容器，得不偿失。
 "#,
     responses(file_server::openapi::JsonApiResponses),
-    tag = "UserApp · 双态 · 文件与存储"
+    tag = "Userapp · 双态 · 文件与存储"
 )]
 pub(crate) async fn clear(
     State(state): State<UserAppState>,

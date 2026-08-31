@@ -1,7 +1,7 @@
-//! UserApp PG 账号/库管理契约（跨 crate，按模块契约约定置于 shared_types）。
+//! Userapp PG 账号/库管理契约（跨 crate，按模块契约约定置于 shared_types）。
 //!
 //! 业务：Java 调 `POST /api/v1/userapp/db/{app_stage}/reset-password|create-database` 管理
-//! userApp dev（UserAppBuilder 开发容器）/ prod（运行容器）的容器内 PG——
+//! userApp dev（UserappBuilder 开发容器）/ prod（运行容器）的容器内 PG——
 //! 账号 upsert（存在改密 / 不存在建号，补齐 [`super::db_align`] 只重置不建号的
 //! 缺口）与 API 化建库。
 //!

@@ -141,14 +141,14 @@ pub(super) async fn apply_auto_mounts(
                             std::path::PathBuf::from(&workspace_container),
                         )
                     }
-                    // UserAppBuilder 完整开发容器（per-app）——挂载压平:
+                    // UserappBuilder 完整开发容器（per-app）——挂载压平:
                     // 宿主 {根}/dev/{user_id}/{app_id} → 容器 /home/user/{app_id}
                     // （env/user 层只在宿主树, 容器内不体现）; data/logs/agent-store 三个
                     // 兄弟挂载在主挂载之后追加。user_id 缺失兜底 app_id（防御旧调用方,
                     // create_builder_and_register 已传真实值）。
                     // resolution path 由 config user-app-builder 段配置为
                     // /app/userapp-workspace, 经 rcoder compose bind 反解宿主根。
-                    ServiceType::UserAppBuilder => {
+                    ServiceType::UserappBuilder => {
                         let pid = project_id.unwrap_or("default");
                         let uid = user_id.unwrap_or(pid);
                         // 宿主子路径 = 挂载压平四目录之一（布局单一事实源 paths::userapp_dev_subpaths）
@@ -158,9 +158,9 @@ pub(super) async fn apply_auto_mounts(
                                 .join(pid),
                         )
                     }
-                    // RCoder/UserApp: 一个 project_id 对应一个容器
+                    // RCoder/Userapp: 一个 project_id 对应一个容器
                     // 挂载: 宿主机 /project_workspace/{project_id} → 容器 /project_workspace/{project_id}
-                    ServiceType::WebAgentRunner | ServiceType::UserApp => {
+                    ServiceType::WebAgentRunner | ServiceType::Userapp => {
                         let pid = project_id.unwrap_or("default");
                         (
                             pid.to_string(),
@@ -208,7 +208,7 @@ pub(super) async fn apply_auto_mounts(
                 );
             }
 
-            // UserAppBuilder 追加三个数据挂载（压平模型四挂载的后三个）:
+            // UserappBuilder 追加三个数据挂载（压平模型四挂载的后三个）:
             // 宿主 {根}/dev/{user_id}/data/{app_id} → 容器 /home/user/data（PG/dbx
             // 持久数据, env 注入见 start()）、{根}/dev/{user_id}/logs/{app_id} →
             // /home/user/logs（容器级持久日志, USERAPP_LOG_DIR 约定）、
@@ -218,7 +218,7 @@ pub(super) async fn apply_auto_mounts(
             // 与 K8s 四 subPath 挂载（同一块 PVC 卷内）容器内路径完全同构。
             // 注: 宿主树 symlink 从宿主视角断链（多 app 分层 vs 容器内拍平的固有
             // 差异）——宿主侧只删不解析（purge），无影响。
-            if pod_id.is_none() && matches!(service_type, ServiceType::UserAppBuilder) {
+            if pod_id.is_none() && matches!(service_type, ServiceType::UserappBuilder) {
                 let pid = project_id.unwrap_or("default");
                 let uid = user_id.unwrap_or(pid);
                 // data/logs/agent-store = 布局四目录的后三段（单一事实源），与
@@ -259,12 +259,12 @@ pub(super) async fn apply_auto_mounts(
             }
         }
         Err(e) => {
-            if matches!(service_type, ServiceType::UserAppBuilder) {
+            if matches!(service_type, ServiceType::UserappBuilder) {
                 // builder 的 workspace 是"数据即产品"卷（开发源码+制品）：
                 // 解析失败若继续，容器健康照常但所有开发数据落 overlay 临时层、
                 // 回收即丢——fail fast 优于静默降级（computer/web 容器可降级）
                 return Err(DockerError::ContainerCreationError(format!(
-                    "UserAppBuilder workspace host path resolve failed                          (rcoder 容器需挂载 userapp-workspace 锚点): {e}"
+                    "UserappBuilder workspace host path resolve failed                          (rcoder 容器需挂载 userapp-workspace 锚点): {e}"
                 )));
             }
             warn!(

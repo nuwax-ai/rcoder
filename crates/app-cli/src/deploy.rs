@@ -1,4 +1,4 @@
-//! URL 制品部署段（生产 UserApp 运行容器，RBD 卷形态）。
+//! URL 制品部署段（生产 Userapp 运行容器，RBD 卷形态）。
 //!
 //! rcoder `start {url}` 经 Deployment env 注入三元组：`APP_DEPLOY_URL`（制品 zip 地址）、
 //! `APP_RELEASE_ID`（部署身份标识）、`APP_DEPLOY_SHA256`（可选校验，空 = 信任内网源）。

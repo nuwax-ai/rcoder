@@ -94,11 +94,11 @@ impl DockerManager {
         }
 
         // 2. 实时查询 Docker API (构造名称)
-        // UserApp/UserAppBuilder 短路多镜像配置查询：这两类从不配置 service image
+        // Userapp/UserappBuilder 短路多镜像配置查询：这两类从不配置 service image
         // （get_service_config 必 Err 且每次深克隆 MultiImageConfig + warn 日志），
         // 前缀直接取 ServiceType 常量——runtime 终端代理每请求走此路径。
         let prefix = match service_type {
-            shared_types::ServiceType::UserApp | shared_types::ServiceType::UserAppBuilder => {
+            shared_types::ServiceType::Userapp | shared_types::ServiceType::UserappBuilder => {
                 service_type.container_prefix().to_string()
             }
             _ => match self.get_service_config(service_type).await {
@@ -276,11 +276,11 @@ impl DockerManager {
         }
 
         // 2. 实时查询 Docker API (构造名称)
-        // UserApp/UserAppBuilder 短路多镜像配置查询：这两类从不配置 service image
+        // Userapp/UserappBuilder 短路多镜像配置查询：这两类从不配置 service image
         // （get_service_config 必 Err 且每次深克隆 MultiImageConfig + warn 日志），
         // 前缀直接取 ServiceType 常量——runtime 终端代理每请求走此路径。
         let prefix = match service_type {
-            shared_types::ServiceType::UserApp | shared_types::ServiceType::UserAppBuilder => {
+            shared_types::ServiceType::Userapp | shared_types::ServiceType::UserappBuilder => {
                 service_type.container_prefix().to_string()
             }
             _ => match self.get_service_config(service_type).await {

@@ -1,7 +1,7 @@
 //! userApp 开发应用流量代理（免端口）
 //!
 //! 处理 `/proxy/userapp/dev/{user_id}/{app_id}/{*path}` 路径的反向代理：
-//! upstream 动态解析到**该 app 的开发容器**（UserAppBuilder，per-app）的
+//! upstream 动态解析到**该 app 的开发容器**（UserappBuilder，per-app）的
 //! pingap 统一入口 `APP_ENTRY_PORT`(9080)——与部署后 `/proxy/userapp/prod/*`
 //! （app_backends 注册表 → app 运行容器）对称的开发预览入口，切环境只改
 //! `dev→prod` 一段，调用方无需传端口。
@@ -63,8 +63,8 @@ pub async fn handle_dev_app_request(
 
 /// 处理开发应用流量代理的上游连接选择
 ///
-/// `find_by_project_id(app_id, UserAppBuilder)` 动态解析该 app 开发容器 IP
-/// （trait 校验 service_type 防串用——与 UserApp 运行容器隔离），固定拨
+/// `find_by_project_id(app_id, UserappBuilder)` 动态解析该 app 开发容器 IP
+/// （trait 校验 service_type 防串用——与 Userapp 运行容器隔离），固定拨
 /// `APP_ENTRY_PORT`(9080)；无容器 → 502（日志带 user_id/app_id 便于排障）。
 pub async fn handle_dev_app_upstream(
     ctx: &mut TrackingCtx,
@@ -88,7 +88,7 @@ pub async fn handle_dev_app_upstream(
     let dev_container_ip = container_lookup
         .as_ref()
         .and_then(|lookup| {
-            lookup.find_by_project_id(app_id, &shared_types::ServiceType::UserAppBuilder)
+            lookup.find_by_project_id(app_id, &shared_types::ServiceType::UserappBuilder)
         })
         .ok_or_else(|| {
             error!(

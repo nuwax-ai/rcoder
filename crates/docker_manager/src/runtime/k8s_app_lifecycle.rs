@@ -1,4 +1,4 @@
-//! UserApp Deployment 生命周期(从 k8s_deployment.rs 拆出)。
+//! Userapp Deployment 生命周期(从 k8s_deployment.rs 拆出)。
 //!
 //! scale/restart + delete_app_resources + cleanup_labeled_orphans/cleanup_orphan_port_resources +
 //! wait_for_app_pod_stopped/ignore_404。
@@ -108,7 +108,7 @@ impl KubernetesRuntime {
         Ok(())
     }
 
-    /// 删除 UserApp 的全部 K8s 计算资源（Deployment/Service/NodePort/HTTPRoute/ConfigMap/Secret）。
+    /// 删除 Userapp 的全部 K8s 计算资源（Deployment/Service/NodePort/HTTPRoute/ConfigMap/Secret）。
     /// **不删 per-app PVC**（数据安全：默认保留，可恢复；销毁走独立 `storage/destroy` 接口
     /// → `destroy_app_pvc`，见 docs/application-management-service-v2-design.md §5.4）。
     ///

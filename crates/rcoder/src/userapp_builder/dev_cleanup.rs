@@ -1,6 +1,6 @@
-//! UserApp 开发资源回收（[`shared_types::UserappDevCleanup`] 契约实现）。
+//! Userapp 开发资源回收（[`shared_types::UserappDevCleanup`] 契约实现）。
 //!
-//! app 删除（purge）时回收 UserAppBuilder 开发资源——per-app 开发容器 +
+//! app 删除（purge）时回收 UserappBuilder 开发资源——per-app 开发容器 +
 //! per-app RWO PVC +（Docker 模式）开发卷宿主目录（挂载压平四目录 + 旧布局遗留）。
 //! 经契约注入 app_manager（其 runtime 视图无 agent 能力）；幂等，失败 best-effort
 //! 由调用方决定（purge 路径 warn 不阻断，下次收敛）。
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use shared_types::ServiceType;
 use tracing::info;
 
-/// [`shared_types::UserappDevCleanup`] 实现：app 删除（purge）时回收 UserAppBuilder
+/// [`shared_types::UserappDevCleanup`] 实现：app 删除（purge）时回收 UserappBuilder
 /// 开发资源——per-app 开发容器 + per-app RWO PVC +（Docker 模式）宿主 bind 目录。
 ///
 /// 经契约注入 app_manager（其 runtime 视图无 agent 能力）；幂等，失败 best-effort
@@ -37,7 +37,7 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
         //    pvc-protection 会挂住删除——容器先删是 PVC 能删的前提）
         if let Err(e) = self
             .runtime
-            .stop_container_by_identifier(app_id, &ServiceType::UserAppBuilder)
+            .stop_container_by_identifier(app_id, &ServiceType::UserappBuilder)
             .await
         {
             tracing::warn!(
@@ -49,7 +49,7 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
 
         // 2. per-app 开发 PVC 回收（幂等；Docker 模式 trait no-op）
         self.runtime
-            .destroy_workspace_pvc(app_id, &ServiceType::UserAppBuilder)
+            .destroy_workspace_pvc(app_id, &ServiceType::UserappBuilder)
             .await
             .map_err(|e| format!("destroy dev PVC failed: {e}"))?;
 

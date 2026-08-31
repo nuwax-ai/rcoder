@@ -29,7 +29,7 @@ impl KubernetesRuntime {
     ///
     /// 编排顺序：identifier 解析 → per-agent PVC ensure（副作用）→ cache-hit 早返回 →
     /// `build_agent_pod_spec` 纯构造 → headless svc + STS(replicas=1) → 等 Ready →
-    /// ClusterIP svc → 取 info。UserApp 不走此路径（用 create_deployment）。
+    /// ClusterIP svc → 取 info。Userapp 不走此路径（用 create_deployment）。
     pub(crate) async fn create_agent_container(
         &self,
         params: ContainerCreateParams,
@@ -52,10 +52,10 @@ impl KubernetesRuntime {
         // 阶段2 per-agent PVC (CephFS subvolume, ceph-csi 服务端配额, 绕开 client setfattr):
         // 仅隔离容器 (pod_id=None, project/user 级) 且 per_agent_pvc_enabled=true 走 per-agent PVC。
         // 共享容器 (pod_id=Some) 或回滚开关 false → 共享 PVC (选项A 行为)。
-        // UserAppBuilder 天然 per-app PVC(不受灰度开关限制),总是 ensure。
+        // UserappBuilder 天然 per-app PVC(不受灰度开关限制),总是 ensure。
         if pod_id.is_none()
             && (shared_types::per_agent_pvc_enabled()
-                || matches!(service_type, ServiceType::UserAppBuilder))
+                || matches!(service_type, ServiceType::UserappBuilder))
         {
             self.ensure_workspace_pvc(identifier, &service_type, params.storage_size.as_deref())
                 .await?;
@@ -177,15 +177,15 @@ impl KubernetesRuntime {
             .get_service_config(service_type);
 
         // workspace 挂载路径(K8s 模式 computer→/home/user, web→/app/project_workspace)。
-        // UserAppBuilder 不走 docker fallback：docker 段的 workspace_resolution_path 是
+        // UserappBuilder 不走 docker fallback：docker 段的 workspace_resolution_path 是
         // rcoder 容器视角的宿主反解锚点（/app/userapp-workspace），K8s 下误用会把
         // PVC 挂到 overlay 路径造成数据面分裂——k8s 配置缺失时直接用镜像契约默认。
-        // （UserAppBuilder 的实际挂载不走此单挂载点——见下方 volume_mounts 的
+        // （UserappBuilder 的实际挂载不走此单挂载点——见下方 volume_mounts 的
         //  四 subPath 压平分支，此值对 builder 不生效。）
         let workspace_mount_path = k8s_service
             .map(|sc| sc.workspace_container_path())
             .or_else(|| {
-                if matches!(service_type, ServiceType::UserAppBuilder) {
+                if matches!(service_type, ServiceType::UserappBuilder) {
                     None
                 } else {
                     docker_service.map(|sc| sc.workspace_container_path())
@@ -193,9 +193,9 @@ impl KubernetesRuntime {
             })
             .unwrap_or_else(|| match service_type {
                 ServiceType::ComputerAgentRunner => "/home/user".to_string(),
-                // UserAppBuilder 开发容器: 挂载压平（四 subPath 分支在 volume_mounts
+                // UserappBuilder 开发容器: 挂载压平（四 subPath 分支在 volume_mounts
                 // 构造处短路），此兜底值不生效，仅为 match 完备性保留
-                ServiceType::UserAppBuilder => {
+                ServiceType::UserappBuilder => {
                     shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string()
                 }
                 _ => "/app/project_workspace".to_string(),
@@ -218,8 +218,8 @@ impl KubernetesRuntime {
 
         // 构建 volume_mounts: workspace 挂载 + 翻译 kubernetes_config 额外挂载(挂到 agent 容器)
         let mut volume_mounts_vec: Vec<VolumeMount> =
-            if matches!(service_type, ServiceType::UserAppBuilder) {
-                // UserAppBuilder 开发容器: 同一块 per-app RWO PVC 的四个 subPath 视图
+            if matches!(service_type, ServiceType::UserappBuilder) {
+                // UserappBuilder 开发容器: 同一块 per-app RWO PVC 的四个 subPath 视图
                 // （挂载压平）。卷内布局 {app_id}/ + data/ + logs/ + agent-store/
                 // （一卷一 app 拍平, env/user 层只存在于宿主/卷内, 容器内不体现）;
                 // 容器内路径是平台契约（file-server USERAPP_WORKSPACE_DIR / PGDATA /
@@ -302,10 +302,10 @@ impl KubernetesRuntime {
         let topology_spread_constraints = match service_type {
             ServiceType::ComputerAgentRunner
             | ServiceType::WebAgentRunner
-            | ServiceType::UserAppBuilder => Some(vec![build_hostname_spread_constraint(
+            | ServiceType::UserappBuilder => Some(vec![build_hostname_spread_constraint(
                 &service_type.to_string(),
             )]),
-            // UserApp 实际走 create_deployment（k8s_app_create），不经此路径（防御性兜底）；
+            // Userapp 实际走 create_deployment（k8s_app_create），不经此路径（防御性兜底）；
             // 其均衡在 build_app_deployment 用共享 label user-app 注入。
             _ => None,
         };
@@ -364,15 +364,15 @@ impl KubernetesRuntime {
                                 .unwrap_or_else(|| vec!["/app/bin/agent_runner".to_string()]);
                             Some(cmd)
                         }
-                        // ComputerAgentRunner / UserApp 用镜像自带 ENTRYPOINT/CMD
-                        // (UserApp 实际走 create_deployment,不经此路径;
+                        // ComputerAgentRunner / Userapp 用镜像自带 ENTRYPOINT/CMD
+                        // (Userapp 实际走 create_deployment,不经此路径;
                         //  ComputerAgentRunner 走 start-up.sh 启 ttyd/VNC + agent_runner)
-                        ServiceType::ComputerAgentRunner | ServiceType::UserApp => None,
-                        // UserAppBuilder 完整开发容器: 默认镜像 ENTRYPOINT/start-up.sh
+                        ServiceType::ComputerAgentRunner | ServiceType::Userapp => None,
+                        // UserappBuilder 完整开发容器: 默认镜像 ENTRYPOINT/start-up.sh
                         // 起 agent_runner + 内嵌 file-server(60000) + PG 全套——userApp 的
                         // 文件/exec/dev-server/构建/chat 开发对话都在此容器内执行;
                         // kubernetes_config.user-app-builder.command 仍可显式覆盖。
-                        ServiceType::UserAppBuilder => k8s_service.and_then(|sc| {
+                        ServiceType::UserappBuilder => k8s_service.and_then(|sc| {
                             if sc.command.is_empty() {
                                 None
                             } else {
@@ -401,7 +401,7 @@ impl KubernetesRuntime {
                             name: Some("http".to_string()),
                             ..Default::default()
                         },
-                        // file-server port (embedded, UserApp workspace build / package download)
+                        // file-server port (embedded, Userapp workspace build / package download)
                         ContainerPort {
                             container_port: shared_types::AGENT_FILE_SERVER_PORT as i32,
                             name: Some("file-server".to_string()),

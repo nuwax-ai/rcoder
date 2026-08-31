@@ -1,4 +1,4 @@
-//! UserApp 应用业务元数据（trait）
+//! Userapp 应用业务元数据（trait）
 //!
 //! 支撑 `POST /apps/query` 的 name/created_at 过滤（PG 模式）：这两个字段是业务元数据，
 //! **集群不持有**（rcoder 无状态读路径拿不到），故由本契约持久化到 PG `userapp_metadata` 表。
@@ -6,13 +6,13 @@
 //! 设计边界（与现有 5 张 PG 表的哲学一致）：
 //! - 只存集群确实没有的字段；desired 运行字段（image/env/resources/recycle 注解等）
 //!   以 K8s/Docker 集群为事实源，本契约**不镜像**，避免三事实源漂移。
-//! - 删除对齐 UserApp 三档语义：`delete`（默认）/`purge:true` **保留**行（误删找回后元数据仍在），
+//! - 删除对齐 Userapp 三档语义：`delete`（默认）/`purge:true` **保留**行（误删找回后元数据仍在），
 //!   仅 `storage/destroy`（PVC 不可逆销毁）时删行。
 
-/// UserApp 业务元数据行（app_manager 产出/消费 ↔ 存储后端的数据载体）
+/// Userapp 业务元数据行（app_manager 产出/消费 ↔ 存储后端的数据载体）
 #[derive(Debug, Clone)]
 pub struct AppMetadataRecord {
-    /// UserApp 应用 ID（app- 前缀，与集群资源名一致）
+    /// Userapp 应用 ID（app- 前缀，与集群资源名一致）
     pub app_id: String,
     /// 业务名称（仅元数据，集群不持有）
     pub name: Option<String>,

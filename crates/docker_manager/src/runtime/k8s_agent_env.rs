@@ -2,7 +2,7 @@
 //!
 //! 纯函数无 K8s API 副作用: 基础标识（PROJECT_ID/USER_ID/SERVICE_TYPE/DEPLOY_MODE）、
 //! 多租户、service environment 合并（RESERVED 去重, docker 兜底→k8s 覆盖）、
-//! UserAppBuilder 挂载压平契约 env 注入（摘除 config 同名防覆盖）、release lock
+//! UserappBuilder 挂载压平契约 env 注入（摘除 config 同名防覆盖）、release lock
 //! 三元组透传、build timeout。
 
 #[cfg(feature = "kubernetes")]
@@ -89,11 +89,11 @@ pub(crate) fn build_agent_env_vars(
             merged_env.insert(k.clone(), v.clone());
         }
     }
-    // UserAppBuilder 挂载压平契约 env 是平台注入的固定值（与四
+    // UserappBuilder 挂载压平契约 env 是平台注入的固定值（与四
     // subPath 挂载点绑定）——先从 merged_env 摘除, 防 config
     // environment 覆盖造成数据面分裂（PGDATA 落 overlay = builder
     // 重建丢库）。
-    if matches!(service_type, ServiceType::UserAppBuilder) {
+    if matches!(service_type, ServiceType::UserappBuilder) {
         for var in [
             "USERAPP_WORKSPACE_DIR",
             "USERAPP_LOG_DIR",
@@ -113,11 +113,11 @@ pub(crate) fn build_agent_env_vars(
             ..Default::default()
         });
     }
-    // UserAppBuilder 挂载压平契约 env（与上方四 subPath 挂载点绑定,
+    // UserappBuilder 挂载压平契约 env（与上方四 subPath 挂载点绑定,
     // 值为 shared_types::paths 单一事实源）。PGDATA/DBX_DATA_DIR
     // 使 dev PG/dbx 数据落卷持久（镜像脚本均为 ${VAR:-...} 覆盖模式,
     // 无 env 时落 overlay, builder 重建即丢）。
-    if matches!(service_type, ServiceType::UserAppBuilder) {
+    if matches!(service_type, ServiceType::UserappBuilder) {
         for (name, value) in [
             (
                 "USERAPP_WORKSPACE_DIR",
@@ -134,7 +134,7 @@ pub(crate) fn build_agent_env_vars(
             });
         }
     }
-    // 透传 UserApp build 必需 env 给 agent-runner（build 在 agent-runner 执行）:
+    // 透传 Userapp build 必需 env 给 agent-runner（build 在 agent-runner 执行）:
     // release lock 三元组（rcoder 自身 env 已有，来自 helm runtime identity 注入）。
     // 缺这些 agent-runner 无法生成 release.lock.toml。
     for var in [

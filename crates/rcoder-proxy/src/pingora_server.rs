@@ -85,14 +85,14 @@ impl PingoraServerManager {
         self
     }
 
-    /// 设置 UserApp 访问追踪（闲置回收的 HTTP 访问信号源，/proxy/userapp/prod/* 路由用）
+    /// 设置 Userapp 访问追踪（闲置回收的 HTTP 访问信号源，/proxy/userapp/prod/* 路由用）
     pub fn with_access_tracker(mut self, tracker: Arc<dyn shared_types::AppAccessTracker>) -> Self {
         let new_service = (*self.service).clone().with_access_tracker(tracker);
         self.service = Arc::new(new_service);
         self
     }
 
-    /// 设置 UserApp 流量唤醒控制（stopped app 收到请求时 hold-and-wait 拉起）
+    /// 设置 Userapp 流量唤醒控制（stopped app 收到请求时 hold-and-wait 拉起）
     pub fn with_wake_control(mut self, wc: Arc<dyn shared_types::AppWakeControl>) -> Self {
         let new_service = (*self.service).clone().with_wake_control(wc);
         self.service = Arc::new(new_service);

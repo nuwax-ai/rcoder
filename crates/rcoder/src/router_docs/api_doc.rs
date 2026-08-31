@@ -247,18 +247,18 @@ use crate::handler;
         )
     ),
     tags(
-        (name = "UserApp · dev · 构建任务", description = "dev 专属（目标容器恒为 UserAppBuilder 开发容器）：构建触发、任务查询/取消与进度 SSE、制品包下载"),
-        (name = "UserApp · dev · 工作区与工具链", description = "dev 专属（目标容器 UserAppBuilder 开发容器）：workspace 创建、命令执行、打包下载、模板与技能安装、项目类型探测确认"),
-        (name = "UserApp · dev · 进程管理", description = "dev 专属（目标容器 UserAppBuilder 开发容器，路径自带 dev）：dev server 进程启停/列表/日志"),
-        (name = "UserApp · dev · 终端工具", description = "dev 专属（目标容器 UserAppBuilder 开发容器）：ttyd/VNC/audio/ime/dbx 开发终端入口"),
-        (name = "UserApp · prod · 部署与启停", description = "prod 专属（目标为 UserApp 生产运行容器/Deployment）：部署启动、停止、重启与配置更新"),
-        (name = "UserApp · prod · 应用查询", description = "prod 专属：应用详情、分页查询与运行时清单"),
-        (name = "UserApp · prod · 终端工具", description = "prod 专属（目标容器 UserApp 生产运行容器）：ttyd/pgweb/dbx 生产终端入口"),
-        (name = "UserApp · 双态 · 文件与存储", description = "dev/prod 双态（路径 {app_id}/{app_stage} 段分派）：文件上传/管理与存储卷查询/清理/销毁"),
-        (name = "UserApp · 双态 · 日志", description = "dev/prod 双态（路径 {app_stage} 段分派）：日志源、检索与 SSE 实时流，转发容器内 app-cli"),
-        (name = "UserApp · 双态 · 数据库", description = "dev/prod 双态（路径 {app_stage} 段分派）：应用 PostgreSQL 凭据对齐/改密/建库"),
-        (name = "UserApp · 双态 · 生命周期", description = "dev/prod 双态（路径 {app_stage} 段分派）：健康/统计/事件、回收策略与删除"),
-        (name = "UserApp · 访问入口", description = "流量代理（/proxy/userapp/{dev,prod}，前端切换只改 dev→prod 一段）与终端代理路由速查表"),
+        (name = "Userapp · dev · 构建任务", description = "dev 专属（目标容器恒为 UserappBuilder 开发容器）：构建触发、任务查询/取消与进度 SSE、制品包下载"),
+        (name = "Userapp · dev · 工作区与工具链", description = "dev 专属（目标容器 UserappBuilder 开发容器）：workspace 创建、命令执行、打包下载、模板与技能安装、项目类型探测确认"),
+        (name = "Userapp · dev · 进程管理", description = "dev 专属（目标容器 UserappBuilder 开发容器，路径自带 dev）：dev server 进程启停/列表/日志"),
+        (name = "Userapp · dev · 终端工具", description = "dev 专属（目标容器 UserappBuilder 开发容器）：ttyd/VNC/audio/ime/dbx 开发终端入口"),
+        (name = "Userapp · prod · 部署与启停", description = "prod 专属（目标为 Userapp 生产运行容器/Deployment）：部署启动、停止、重启与配置更新"),
+        (name = "Userapp · prod · 应用查询", description = "prod 专属：应用详情、分页查询与运行时清单"),
+        (name = "Userapp · prod · 终端工具", description = "prod 专属（目标容器 Userapp 生产运行容器）：ttyd/pgweb/dbx 生产终端入口"),
+        (name = "Userapp · 双态 · 文件与存储", description = "dev/prod 双态（路径 {app_id}/{app_stage} 段分派）：文件上传/管理与存储卷查询/清理/销毁"),
+        (name = "Userapp · 双态 · 日志", description = "dev/prod 双态（路径 {app_stage} 段分派）：日志源、检索与 SSE 实时流，转发容器内 app-cli"),
+        (name = "Userapp · 双态 · 数据库", description = "dev/prod 双态（路径 {app_stage} 段分派）：应用 PostgreSQL 凭据对齐/改密/建库"),
+        (name = "Userapp · 双态 · 生命周期", description = "dev/prod 双态（路径 {app_stage} 段分派）：健康/统计/事件、回收策略与删除"),
+        (name = "Userapp · 访问入口", description = "流量代理（/proxy/userapp/{dev,prod}，前端切换只改 dev→prod 一段）与终端代理路由速查表"),
         (name = "computer", description = "Computer Agent 桌面、聊天与容器内 PG 管理接口；agent 族（status/stop/cancel/notify-resolved/cache/clean）支持 service_type=userapp 分派（project_id 兼任 app_id，仅 dev 阶段）"),
         (name = "pod", description = "Pod 容器管理接口（监控/保活/重启；支持 service_type=userapp 分派 dev/prod 容器）"),
         (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),
@@ -276,7 +276,7 @@ RCoder AI 服务 API
 
 ## 主要功能
 
-- **UserApp 应用引擎**: 无状态应用 Pod 的完整生命周期（开发构建 → 部署发布 → 终端/代理访问），按 `UserApp ·` 前缀环境维度分组（dev / prod / 双态 / 访问入口）
+- **Userapp 应用引擎**: 无状态应用 Pod 的完整生命周期（开发构建 → 部署发布 → 终端/代理访问），按 `Userapp ·` 前缀环境维度分组（dev / prod / 双态 / 访问入口）
 - **智能对话**: 支持文本、图像、音频、文档等多媒体内容的 AI 交互
 - **实时通知**: 通过 SSE 协议提供 AI 代理执行进度的实时推送
 - **会话管理**: 完整的会话生命周期管理，支持任务取消

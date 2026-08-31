@@ -1,5 +1,5 @@
 //! 主服务域的数据访问层（repo）：containers/projects/sessions 三表纯 SQL
-//! （UserApp 业务表的 SQL 在 `crate::pg::userapp::repo/`,两域互不触碰）。
+//! （Userapp 业务表的 SQL 在 `crate::pg::userapp::repo/`,两域互不触碰）。
 //!
 //! 分层约定（参考 sqlx 官方 axum-social-with-tests / transaction 示例）：
 //! - **本层**：纯 SQL 语句 + 行类型（FromRow），无业务逻辑、无状态；

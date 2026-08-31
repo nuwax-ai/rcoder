@@ -1,4 +1,4 @@
-//! Docker 侧 UserApp 部署**变更组**实现（create/patch/scale/recycle/restart/delete）。
+//! Docker 侧 Userapp 部署**变更组**实现（create/patch/scale/recycle/restart/delete）。
 //!
 //! 方法体为 `DockerRuntime` 自有 impl（trait 壳在 docker_app_runtime.rs 一行委托——
 //! 同一 trait 的 impl 块不可分割，k8s 侧 k8s_app_create.rs 同款模式）。
@@ -72,7 +72,7 @@ impl DockerRuntime {
         let mut labels: HashMap<String, String> = HashMap::new();
         labels.insert("managed-by".to_string(), "rcoder-app-manager".to_string());
         labels.insert("app-id".to_string(), app_id.clone());
-        labels.insert("service-type".to_string(), ServiceType::UserApp.to_string());
+        labels.insert("service-type".to_string(), ServiceType::Userapp.to_string());
         if let Some(t) = &params.tenant_id {
             labels.insert("tenant".to_string(), t.clone());
         }
@@ -242,7 +242,7 @@ impl DockerRuntime {
         })
     }
 
-    /// 更新 UserApp 容器：Docker 不支持 in-place 改 image/env/command，必须重建。
+    /// 更新 Userapp 容器：Docker 不支持 in-place 改 image/env/command，必须重建。
     /// force-remove 旧容器（best-effort，不存在则忽略）后用新 params 走 create_deployment。
     /// 工作空间目录不在 runtime 层（由 service 层管理），重建不丢数据。
     pub(crate) async fn patch_deployment_impl(

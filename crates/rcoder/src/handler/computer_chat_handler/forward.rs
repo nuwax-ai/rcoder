@@ -25,10 +25,10 @@ pub(super) struct ComputerForwardParams<'a> {
     /// 容器运行时(连接失败时诊断 pod 真实根因)
     pub(super) runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
     /// 目标容器类型（决定 agent_runner 侧 work_dir 定位与诊断通道）：
-    /// 普通对话 = ComputerAgentRunner；userApp 开发对话 = UserAppBuilder
+    /// 普通对话 = ComputerAgentRunner；userApp 开发对话 = UserappBuilder
     pub(super) service_type: shared_types::ServiceType,
     /// 诊断通道的容器 identifier（container_identifier 语义：
-    /// ComputerAgentRunner=user_id；UserAppBuilder=app_id）
+    /// ComputerAgentRunner=user_id；UserappBuilder=app_id）
     pub(super) diagnostic_identifier: String,
 }
 

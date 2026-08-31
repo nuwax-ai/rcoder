@@ -1,4 +1,4 @@
-//! Docker 侧 UserApp Deployment 运行时（从 docker_runtime.rs 拆出）。
+//! Docker 侧 Userapp Deployment 运行时（从 docker_runtime.rs 拆出）。
 //!
 //! `UserAppDeploymentRuntime` 的 trait 壳：**变更组**（create/patch/scale/
 //! recycle/restart/delete）一行委托 docker_app_create.rs 的自有 impl；

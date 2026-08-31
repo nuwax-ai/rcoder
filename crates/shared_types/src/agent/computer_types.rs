@@ -16,7 +16,7 @@ use crate::{Attachment, ChatAgentConfig, ModelProviderConfig};
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ChatServiceScope {
-    /// userApp 开发对话：路由到该 app 的 UserAppBuilder 开发容器
+    /// userApp 开发对话：路由到该 app 的 UserappBuilder 开发容器
     Userapp,
 }
 
@@ -34,22 +34,22 @@ pub struct ComputerChatRequest {
     /// 项目 ID (可选) - 一个容器内可以有多个项目
     /// 若未提供，系统自动生成 UUID
     /// userApp 开发对话场景（service_type=userapp）下必填且等于 app_id
-    /// （路由到该 app 的 UserAppBuilder 开发容器）
+    /// （路由到该 app 的 UserappBuilder 开发容器）
     #[schema(example = "proj_456")]
     pub project_id: Option<String>,
 
-    /// userApp 开发对话标记（可选，默认 None = 普通 computer 沙箱对话）。
-    ///
-    /// `Userapp`：本请求路由到该 app（project_id）的 UserAppBuilder 开发容器，
-    /// ACP agent 直接在开发卷 workspace（`{USERAPP_WORKSPACE_DIR}/{app_id}`）上
-    /// 工作，生成的代码直接落卷。仅开发阶段传；部署后无对话。
-    /// wire 词表 snake_case（`"userapp"`）；未知值反序列化即拒（fail-fast，
-    /// 不静默回落 computer——路由错容器比 400 更难排查）。
+    /// 业务域路由标记（枚举）。可选值：**仅 `userapp`**（wire 词表
+    /// snake_case）——本请求路由到该 app（project_id 兼任 app_id）的
+    /// UserappBuilder 开发容器，ACP agent 直接在开发卷 workspace
+    /// （`{USERAPP_WORKSPACE_DIR}/{app_id}`）上工作，生成的代码直接落卷。
+    /// 仅开发阶段传；部署后无对话。缺省（不传）= 普通 computer 沙箱对话；
+    /// 未知值反序列化即拒（fail-fast，不静默回落 computer——路由错容器
+    /// 比 400 更难排查）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_type: Option<ChatServiceScope>,
 
     /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
-    /// userApp 开发对话仅支持 dev：agent 会话只存在于 UserAppBuilder 开发
+    /// userApp 开发对话仅支持 dev：agent 会话只存在于 UserappBuilder 开发
     /// 容器，prod 运行容器无 agent 会话（形态对齐 agent 族五接口）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "dev")]
@@ -180,17 +180,19 @@ pub struct ComputerAgentStatusRequest {
     #[schema(example = "project")]
     pub isolation_type: Option<String>,
 
-    /// userApp 分派标记（值 `userapp`，大小写不敏感）——与 project_id 搭配
-    /// 表示按 userApp 应用定位：**project_id 兼任 app_id**（对齐 /computer/chat
-    /// 契约，不设独立 app_id 字段），定位 UserAppBuilder 开发容器；agent 会话
-    /// 仅存在于 dev 阶段。不传时走既有 computer 路径
+    /// userApp 分派标记。可选值：`userapp`（推荐）、`user-app` / `application` /
+    /// `app`（同义变体，均大小写不敏感）——与 project_id 搭配（**project_id
+    /// 兼任 app_id**，对齐 /computer/chat 契约，不设独立 app_id 字段）定位
+    /// UserappBuilder 开发容器，agent 会话仅存在于 dev 阶段。userApp 容器类型由 app_stage 推导
+    /// （dev=UserappBuilder / prod=Userapp），**勿传 `user-app-builder`**。
+    /// 不传时走既有 computer 路径
     #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "userapp")]
     pub service_type: Option<String>,
 
     /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
-    /// 本接口 userApp 分派仅支持 dev：agent 会话只存在于 UserAppBuilder
+    /// 本接口 userApp 分派仅支持 dev：agent 会话只存在于 UserappBuilder
     /// 开发容器，prod 运行容器无 agent 会话
     #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -301,17 +303,19 @@ pub struct ComputerAgentStopRequest {
     #[schema(example = "project")]
     pub isolation_type: Option<String>,
 
-    /// userApp 分派标记（值 `userapp`，大小写不敏感）——与 project_id 搭配
-    /// 表示按 userApp 应用定位：**project_id 兼任 app_id**（对齐 /computer/chat
-    /// 契约，不设独立 app_id 字段），定位 UserAppBuilder 开发容器；agent 会话
-    /// 仅存在于 dev 阶段。不传时走既有 computer 路径
+    /// userApp 分派标记。可选值：`userapp`（推荐）、`user-app` / `application` /
+    /// `app`（同义变体，均大小写不敏感）——与 project_id 搭配（**project_id
+    /// 兼任 app_id**，对齐 /computer/chat 契约，不设独立 app_id 字段）定位
+    /// UserappBuilder 开发容器，agent 会话仅存在于 dev 阶段。userApp 容器类型由 app_stage 推导
+    /// （dev=UserappBuilder / prod=Userapp），**勿传 `user-app-builder`**。
+    /// 不传时走既有 computer 路径
     #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "userapp")]
     pub service_type: Option<String>,
 
     /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
-    /// 本接口 userApp 分派仅支持 dev：agent 会话只存在于 UserAppBuilder
+    /// 本接口 userApp 分派仅支持 dev：agent 会话只存在于 UserappBuilder
     /// 开发容器，prod 运行容器无 agent 会话
     #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,7 +358,7 @@ pub struct ComputerAgentCancelRequest {
     pub user_id: Option<String>,
 
     /// 项目 ID（computer 路径与 userApp 分派均必填——userApp 场景下兼任
-    /// app_id，即 UserAppBuilder 开发容器标识）
+    /// app_id，即 UserappBuilder 开发容器标识）
     #[param(example = "project_456")]
     #[schema(example = "project_456")]
     pub project_id: String,
@@ -397,17 +401,19 @@ pub struct ComputerAgentCancelRequest {
     #[schema(example = "project")]
     pub isolation_type: Option<String>,
 
-    /// userApp 分派标记（值 `userapp`，大小写不敏感）——与 project_id 搭配
-    /// 表示按 userApp 应用定位：**project_id 兼任 app_id**（对齐 /computer/chat
-    /// 契约，不设独立 app_id 字段），定位 UserAppBuilder 开发容器；agent 会话
-    /// 仅存在于 dev 阶段。不传时走既有 computer 路径
+    /// userApp 分派标记。可选值：`userapp`（推荐）、`user-app` / `application` /
+    /// `app`（同义变体，均大小写不敏感）——与 project_id 搭配（**project_id
+    /// 兼任 app_id**，对齐 /computer/chat 契约，不设独立 app_id 字段）定位
+    /// UserappBuilder 开发容器，agent 会话仅存在于 dev 阶段。userApp 容器类型由 app_stage 推导
+    /// （dev=UserappBuilder / prod=Userapp），**勿传 `user-app-builder`**。
+    /// 不传时走既有 computer 路径
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[param(example = "userapp")]
     #[schema(example = "userapp")]
     pub service_type: Option<String>,
 
     /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
-    /// 本接口 userApp 分派仅支持 dev：agent 会话只存在于 UserAppBuilder
+    /// 本接口 userApp 分派仅支持 dev：agent 会话只存在于 UserappBuilder
     /// 开发容器，prod 运行容器无 agent 会话
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[param(example = "dev")]

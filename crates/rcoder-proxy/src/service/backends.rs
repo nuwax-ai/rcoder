@@ -347,10 +347,10 @@ impl PingoraProxyService {
                     None
                 }
             }
-            // UserApp / UserAppBuilder 不走 VNC/project backend 查找:
-            // UserApp 经 /proxy/{port} 的 backends map 路由;
-            // UserAppBuilder 经 agent lookup(project_id)由上层解析,此处返 None
-            shared_types::ServiceType::UserApp | shared_types::ServiceType::UserAppBuilder => None,
+            // Userapp / UserappBuilder 不走 VNC/project backend 查找:
+            // Userapp 经 /proxy/{port} 的 backends map 路由;
+            // UserappBuilder 经 agent lookup(project_id)由上层解析,此处返 None
+            shared_types::ServiceType::Userapp | shared_types::ServiceType::UserappBuilder => None,
         }
     }
 

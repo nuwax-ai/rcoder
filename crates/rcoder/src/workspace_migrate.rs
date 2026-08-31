@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 /// resolve per-agent dst 聚合路径, 等 PVC Bound (重试)。
 ///
-/// UserApp `create_deployment` 不等 Pod Ready, PVC 刚 ensure 可能未 Bound
+/// Userapp `create_deployment` 不等 Pod Ready, PVC 刚 ensure 可能未 Bound
 /// (WaitForFirstConsumer 需 Pod 调度)。重试等 ceph-csi provision 完成 (典型秒级,
 /// 慢调度可达 30s+)。Web/Computer `create_container` 等 Pod Ready, 首次即 Bound, 不实际重试。
 async fn resolve_dst_with_retry(
@@ -58,7 +58,7 @@ async fn resolve_dst_with_retry(
 /// 经挂根把共享 PVC 子目录数据 mv 到 per-agent subvolume (首次懒迁移, 瞬间无重复)。
 ///
 /// - `shared_pvc_env`: 共享 PVC 名的 env var (`RCODER_WORKSPACE_PVC_NAME` / `RCODER_COMPUTER_WORKSPACE_PVC_NAME`)。
-/// - `shared_subpath`: 共享 subvol 下的子路径段 (web=`["workspace"]`, computer=`[]`, UserApp=`["workspace","apps"]`)。
+/// - `shared_subpath`: 共享 subvol 下的子路径段 (web=`["workspace"]`, computer=`[]`, Userapp=`["workspace","apps"]`)。
 /// - `identifier`/`service_type`: per-agent PVC (resolve_workspace_path)。
 /// - `leaf`: 共享 subpath 下的源目录名 (= project_id / user_id / app_id)。
 /// - `dst_at_root`: true=dst 用 per-agent subvol 根 (computer, 吸收 user_id); false=dst=base/leaf。
@@ -69,11 +69,11 @@ async fn resolve_dst_with_retry(
 /// **dst_at_root=true (Computer)**: **逐子项 rename** (遍历 src `{user_id}` 子项, 逐个 rename 到
 /// per-user PVC 根, skip 已存在)。原因: Computer agent 启动会装 `acp-agent` 到 PVC 根 (`/home/user`),
 /// rename 整个 `{user_id} → PVC 根` 会 ENOTEMPTY; 逐子项迁项目 `{cid}` (不存在 → 成功), agent 装的
-/// acp-agent 已存在自动 skip。Web/UserApp 不受影响 (单 leaf rename, dst 不存在, 不碰 agent 写)。
+/// acp-agent 已存在自动 skip。Web/Userapp 不受影响 (单 leaf rename, dst 不存在, 不碰 agent 写)。
 ///
 /// # 类型 (ISP 阶段3)
 /// 取 `Arc<dyn WorkspaceRuntime>` (按值): lazy_migrate 只用 workspace 方法 (resolve),
-/// 不需 agent/UserApp 能力。调用方传 `Arc<dyn ContainerRuntime>` 时, Rust trait upcasting
+/// 不需 agent/Userapp 能力。调用方传 `Arc<dyn ContainerRuntime>` 时, Rust trait upcasting
 /// (1.86+) 自动把 `Arc<dyn ContainerRuntime>` → `Arc<dyn WorkspaceRuntime>` (super-trait coercion).
 /// 按值而非 `&Arc` 是为绕过 `&Arc<dyn Sub>` → `&Arc<dyn Super>` 不自动 coercible 的限制
 /// (借用背后的临时值生命周期有歧义). Arc::clone 是原子计数, 廉价.
@@ -104,7 +104,7 @@ pub async fn lazy_migrate(
         src = src.join(s);
     }
     src = src.join(leaf);
-    // src 不存在 → 新项目/无旧数据 (UserApp 新应用常态, 见 application-management-service-v2-design.md;
+    // src 不存在 → 新项目/无旧数据 (Userapp 新应用常态, 见 application-management-service-v2-design.md;
     // 新 project/user 同理), 早退。提前检查避免新项目白等 dst resolve (per-agent PVC 等 Bound
     // 重试最长 60s), 性能关键 —— 新应用 create_app 不该被迁移逻辑阻塞。
     if tokio::fs::metadata(&src).await.is_err() {
@@ -122,7 +122,7 @@ pub async fn lazy_migrate(
         return;
     }
 
-    // Web/UserApp: 单 leaf 迁移 (src → dst={subvol}/{leaf})
+    // Web/Userapp: 单 leaf 迁移 (src → dst={subvol}/{leaf})
     let dst = dst_base.join(leaf);
     // 幂等: dst/.migrated 存在 → 已迁移, 跳过 (防 copy 中途失败后半 copy 误判)
     let marker = dst.join(".migrated");

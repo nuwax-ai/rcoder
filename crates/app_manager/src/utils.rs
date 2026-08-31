@@ -200,7 +200,7 @@ pub(super) fn health_from_status(status: &DeploymentStatus) -> HealthInfo {
         instance: Some(InstanceInfo {
             name: format!(
                 "{}-{}",
-                ServiceType::UserApp.container_prefix(),
+                ServiceType::Userapp.container_prefix(),
                 status.app_id
             ),
             phase: status.phase.clone(),

@@ -39,10 +39,12 @@ pub struct ResolvePermissionHttpRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub isolation_type: Option<String>,
-    /// userApp 分派标记（值 `userapp`，大小写不敏感）——与 project_id 搭配
-    /// 表示按 userApp 应用定位：**project_id 兼任 app_id**（对齐 /computer/chat
-    /// 契约，不设独立 app_id 字段），定位 UserAppBuilder 开发容器；agent 会话
-    /// 仅存在于 dev 阶段。不传时走既有 computer 路径
+    /// userApp 分派标记。可选值：`userapp`（推荐）、`user-app` / `application` /
+    /// `app`（同义变体，均大小写不敏感）——与 project_id 搭配（**project_id
+    /// 兼任 app_id**，对齐 /computer/chat 契约，不设独立 app_id 字段）定位
+    /// UserappBuilder 开发容器，agent 会话仅存在于 dev 阶段。userApp 容器类型由 app_stage 推导
+    /// （dev=UserappBuilder / prod=Userapp），**勿传 `user-app-builder`**。
+    /// 不传时走既有 computer 路径
     #[serde(
         default,
         alias = "serviceType",
@@ -51,7 +53,7 @@ pub struct ResolvePermissionHttpRequest {
     pub service_type: Option<String>,
 
     /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
-    /// userApp 分派仅支持 dev：agent 会话只存在于 UserAppBuilder 开发容器，
+    /// userApp 分派仅支持 dev：agent 会话只存在于 UserappBuilder 开发容器，
     /// prod 运行容器无 agent 会话
     #[serde(default, alias = "appStage", skip_serializing_if = "Option::is_none")]
     pub app_stage: Option<String>,

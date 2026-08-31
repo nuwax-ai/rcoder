@@ -43,7 +43,7 @@ pub struct AppUploadForm {
     path = "/api/v1/userapp/{app_id}/{app_stage}/upload",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder，target 相对 workspace 根）/ `prod`=生产运行容器（target 相对 /app 根）")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder，target 相对 workspace 根）/ `prod`=生产运行容器（target 相对 /app 根）")
     ),
     request_body(content = AppUploadForm, content_type = "multipart/form-data", description = "上传文件（multipart：user_id 必填）"),
     responses(
@@ -52,7 +52,7 @@ pub struct AppUploadForm {
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 文件与存储"
+    tag = "Userapp · 双态 · 文件与存储"
 )]
 #[instrument(skip(state, multipart))]
 pub async fn upload_file(
@@ -166,7 +166,7 @@ pub struct UploadFromUrlRequest {
         (status = 400, description = "URL 非法或不是 HTTP(S) / app_stage 非法", body = HttpResult<String>),
         (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 文件与存储"
+    tag = "Userapp · 双态 · 文件与存储"
 )]
 #[instrument(skip(state))]
 pub async fn upload_from_url(
@@ -224,7 +224,7 @@ pub struct ListFilesQuery {
         (status = 404, description = "应用/路径不存在", body = HttpResult<String>),
         (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 文件与存储"
+    tag = "Userapp · 双态 · 文件与存储"
 )]
 #[instrument(skip(state))]
 pub async fn list_files(
@@ -278,7 +278,7 @@ pub struct DeleteFileRequest {
         (status = 404, description = "文件/应用不存在", body = HttpResult<String>),
         (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 文件与存储"
+    tag = "Userapp · 双态 · 文件与存储"
 )]
 pub async fn delete_file(
     State(state): State<Arc<AppManagerState>>,

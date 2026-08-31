@@ -1,4 +1,4 @@
-//! UserApp Deployment 纯辅助函数(从 k8s_deployment.rs 拆出)。
+//! Userapp Deployment 纯辅助函数(从 k8s_deployment.rs 拆出)。
 //!
 //! port-expose 注解编解码 + config_hash 注解 + probe 构建。create/query 共用。
 
@@ -175,10 +175,10 @@ pub(crate) fn build_probe(
     }
 }
 
-/// 构建 **requests/limits 解耦** 的 ResourceRequirements（agent 与 UserApp 两端共享策略）。
+/// 构建 **requests/limits 解耦** 的 ResourceRequirements（agent 与 Userapp 两端共享策略）。
 ///
 /// ⚙️ 策略：requests 设超小固定值（仅作 scheduler 调度保障量），limits 保留配置上限。
-///   背景：常态空闲的 pod（agent-runner / UserApp）若 requests=limits（大值），scheduler
+///   背景：常态空闲的 pod（agent-runner / Userapp）若 requests=limits（大值），scheduler
 ///   严格按 requests 预订 → 节点迅速占满 → Pod Pending。requests 小 → 支持超卖调度；
 ///   limits 大 → 单 Pod 突发不受限（最多 throttle / evict，不崩）。如需调整改下方固定值。
 ///
@@ -232,7 +232,7 @@ pub(crate) fn build_decoupled_resources(
 }
 
 /// 构建"按节点(hostname)均衡"的 topologySpreadConstraint（软约束），agent-runner 与
-/// UserApp 动态创建路径共用（统一均衡策略，改参数只改这一处）。
+/// Userapp 动态创建路径共用（统一均衡策略，改参数只改这一处）。
 ///
 /// - `topologyKey=hostname`：每个 Node 一个 domain，pod 往节点间摊。
 /// - `labelSelector=app.kubernetes.io/name=<label_value>`：分组统计 key——只统计同 label
@@ -264,9 +264,9 @@ pub(crate) fn build_hostname_spread_constraint(label_value: &str) -> TopologySpr
     }
 }
 
-/// UserApp 资源需求 → ResourceRequirements（包一层共享 `build_decoupled_resources`）。
+/// Userapp 资源需求 → ResourceRequirements（包一层共享 `build_decoupled_resources`）。
 ///
-/// UserApp 的 `ephemeral_storage` 未指定时回退 `storage`（与 agent 侧
+/// Userapp 的 `ephemeral_storage` 未指定时回退 `storage`（与 agent 侧
 /// `ephemeral_storage_limit.or(storage_size)` 对称），二者同义（overlay 可写层配额）。
 #[cfg(feature = "kubernetes")]
 pub(crate) fn build_app_resource_requirements(
@@ -288,7 +288,7 @@ mod tests {
     fn params_with_ports(ports: Vec<AppPortSpec>) -> ContainerCreateParams {
         ContainerCreateParams::builder()
             .project_id("test")
-            .service_type(ServiceType::UserApp)
+            .service_type(ServiceType::Userapp)
             .image_override("img")
             .ports(ports)
             .build()
@@ -297,7 +297,7 @@ mod tests {
     fn params_with_env(env: std::collections::HashMap<String, String>) -> ContainerCreateParams {
         ContainerCreateParams::builder()
             .project_id("test")
-            .service_type(ServiceType::UserApp)
+            .service_type(ServiceType::Userapp)
             .image_override("img")
             .env(env)
             .build()

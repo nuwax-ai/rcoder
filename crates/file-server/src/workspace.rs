@@ -110,7 +110,7 @@ fn validated_identifier<'a>(value: &'a str, field: &str) -> AppResult<&'a str> {
     Ok(value)
 }
 
-/// UserApp 开发卷定位: `{config.userapp_workspace_dir}/{app_id}`。
+/// Userapp 开发卷定位: `{config.userapp_workspace_dir}/{app_id}`。
 ///
 /// 不走 [`WorkspaceResolver`] trait——开发卷是容器挂载事实 (env `USERAPP_WORKSPACE_DIR`
 /// 指向各自视角的挂载点), 沙箱与 builder 共享同一块卷同构目录, 与拓扑无关。

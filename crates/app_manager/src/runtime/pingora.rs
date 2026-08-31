@@ -1,4 +1,4 @@
-//! UserApp Pingora backend 注册管理（从 service.rs 拆出，extension-impl）。
+//! Userapp Pingora backend 注册管理（从 service.rs 拆出，extension-impl）。
 //!
 //! register / unregister / rebuild_pingora_backends（Docker 模式为主）。
 
@@ -45,7 +45,7 @@ impl AppService {
                 let cluster_domain = shared_types::get_k8s_cluster_domain();
                 format!(
                     "{}-{}-svc.{}.svc.{}",
-                    ServiceType::UserApp.container_prefix(),
+                    ServiceType::Userapp.container_prefix(),
                     app_id,
                     self.config.namespace,
                     cluster_domain

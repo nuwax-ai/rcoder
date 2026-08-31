@@ -30,7 +30,7 @@ impl shared_types::AppRuntimeIpResolver for DockerRuntimeIpResolver {
             return None;
         }
         self.runtime
-            .get_container_info_by_identifier(app_id, &shared_types::ServiceType::UserApp)
+            .get_container_info_by_identifier(app_id, &shared_types::ServiceType::Userapp)
             .await
             .ok()
             .flatten()

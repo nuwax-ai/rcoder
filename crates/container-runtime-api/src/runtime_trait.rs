@@ -3,7 +3,7 @@
 //! 阶段3 ISP 拆分: 原 `ContainerRuntime` 32 方法拆为 3 个聚焦子 trait + 1 个聚合 super-trait:
 //! - [`AgentContainerRuntime`] (Group A, 13): agent 容器生命周期 (create/stop/find/list/health).
 //! - [`WorkspaceRuntime`]    (Group B, 8):  workspace/file-server PVC 解析 (resolve/ensure/resize/destroy).
-//! - [`UserAppDeploymentRuntime`] (Group C, 14): UserApp Deployment CRUD (create/patch/scale/logs/exec).
+//! - [`UserAppDeploymentRuntime`] (Group C, 14): Userapp Deployment CRUD (create/patch/scale/logs/exec).
 //! - [`ContainerRuntime`]:    聚合 super-trait = A + B + C; 旧调用点零改 (`Arc<dyn ContainerRuntime>`).
 //! - [`UserAppRuntime`]:      B + C 视图; 供 app_manager 收紧 (不需 agent 能力).
 //!
@@ -32,7 +32,7 @@ pub use tokio::sync::mpsc;
 /// Agent 容器生命周期运行时 (Group A)。
 ///
 /// 用于 rcoder 主服务对 agent pod/container (WebAgentRunner / ComputerAgentRunner) 的管理。
-/// 不含 UserApp Deployment 或 workspace PVC 解析能力。
+/// 不含 Userapp Deployment 或 workspace PVC 解析能力。
 #[async_trait]
 pub trait AgentContainerRuntime: Send + Sync {
     /// Create and start a container
@@ -268,7 +268,7 @@ pub trait WorkspaceRuntime: Send + Sync {
         ))
     }
 
-    /// 销毁 per-app PVC(UserApp 专用;Docker 默认 no-op)。
+    /// 销毁 per-app PVC(Userapp 专用;Docker 默认 no-op)。
     ///
     /// K8s: 删 PVC 对象 → ceph-csi 回收 subvolume(释放配额)。调用方须保证 app 已 delete
     /// (PVC 无 Pod 引用 → pvc-protection finalizer 正常移除,不会卡)。幂等:PVC 不存在返 Ok。
@@ -277,7 +277,7 @@ pub trait WorkspaceRuntime: Send + Sync {
         Ok(()) // default no-op (Docker / 未实现)
     }
 
-    /// 调整 per-app PVC 容量（UserApp 专用；K8s PVC **只扩不能缩**）。
+    /// 调整 per-app PVC 容量（Userapp 专用；K8s PVC **只扩不能缩**）。
     ///
     /// K8s: 读 PVC 当前 `requests.storage` → 等量 no-op / 更大 patch 扩容
     /// （external-resizer 异步生效，不重建 Pod）/ 更小 [`StorageResizeOutcome::ShrinkRejected`]
@@ -293,8 +293,8 @@ pub trait WorkspaceRuntime: Send + Sync {
 
     /// 按 service_type 销毁 workspace PVC（幂等；Docker 默认 no-op）。
     ///
-    /// 现有调用方：UserAppBuilder 开发 PVC 回收（app purge 经 `UserappDevCleanup`
-    /// 契约）。UserApp 运行 PVC 走语义化包装 [`Self::destroy_app_pvc`]。
+    /// 现有调用方：UserappBuilder 开发 PVC 回收（app purge 经 `UserappDevCleanup`
+    /// 契约）。Userapp 运行 PVC 走语义化包装 [`Self::destroy_app_pvc`]。
     /// 调用方须保证该 service_type 的容器已停（PVC 无 Pod 引用才可删）。
     async fn destroy_workspace_pvc(
         &self,
@@ -307,11 +307,11 @@ pub trait WorkspaceRuntime: Send + Sync {
 
 // ============================================================================
 // Group C — UserAppDeploymentRuntime (14 方法)
-// UserApp Deployment CRUD: create/patch/scale/restart/delete + status/logs/events/exec.
+// Userapp Deployment CRUD: create/patch/scale/restart/delete + status/logs/events/exec.
 // 默认实现: 核心操作返 ConfigurationError; 容器快照/events/resource/prerequisites Ok(default).
 // ============================================================================
 
-/// UserApp Deployment 运行时 (Group C)。
+/// Userapp Deployment 运行时 (Group C)。
 ///
 /// K8s 由 `KubernetesRuntime` 实现真实 Deployment 操作；
 /// Docker 由 `DockerRuntime` 做等价语义映射（容器 create/stop/start）。
@@ -429,7 +429,7 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         Ok(ContainerSpecSnapshot::default())
     }
 
-    /// 列出当前 runtime 托管的所有 UserApp Deployment（供对账接口）
+    /// 列出当前 runtime 托管的所有 Userapp Deployment（供对账接口）
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
         Err(ContainerRuntimeError::ConfigurationError(
             "list_deployments not supported by this runtime".to_string(),
@@ -470,7 +470,7 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
-    /// 在 UserApp 容器内执行命令（exec）。
+    /// 在 Userapp 容器内执行命令（exec）。
     ///
     /// 用于数据库管理等场景（reset-password / create-database：在 app 容器内跑 psql，
     /// 利用本地 trust 认证绕过当前密码）。默认不支持（返回 ConfigurationError），
@@ -504,7 +504,7 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
 
     /// 按[`ServiceType`]维度查询容器资源用量——env 显式化路由用：
     /// prod 运行容器走 [`Self::get_app_resource_usage`]；开发容器
-    /// （UserAppBuilder）经此方法以双键 label selector
+    /// （UserappBuilder）经此方法以双键 label selector
     /// （`app.kubernetes.io/instance` + `rcoder.io/service-type`）定位 Pod。
     /// 默认返回空（Docker/compose 形态 metrics 本就缺失，语义为降级 0 不报错）。
     async fn get_app_resource_usage_for(
@@ -530,7 +530,7 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
 // 聚合 super-trait — ContainerRuntime (A + B + C) / UserAppRuntime (B + C 视图)
 // ============================================================================
 
-/// UserApp 视图: 同时具备 workspace (B) + UserApp Deployment (C) 能力, **不含 agent (A)**.
+/// Userapp 视图: 同时具备 workspace (B) + Userapp Deployment (C) 能力, **不含 agent (A)**.
 ///
 /// 供 app_manager 类型收紧 (file_server_embed 同理用 [`WorkspaceRuntime`] 单独收紧):
 /// 任何调用点声明 `Arc<dyn UserAppRuntime>` 即可在编译期阻止使用 agent 方法 (Group A),
@@ -542,7 +542,7 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
 pub trait UserAppRuntime: WorkspaceRuntime + UserAppDeploymentRuntime {}
 impl<T> UserAppRuntime for T where T: WorkspaceRuntime + UserAppDeploymentRuntime {}
 
-/// 聚合 super-trait: 同时具备 agent / workspace / UserApp 三类能力。
+/// 聚合 super-trait: 同时具备 agent / workspace / Userapp 三类能力。
 ///
 /// 旧调用点 (`Arc<dyn ContainerRuntime>`) 零改 —— 任何 impl A+B+C 的具体类型
 /// (KubernetesRuntime / DockerRuntime) 自动 impl ContainerRuntime:

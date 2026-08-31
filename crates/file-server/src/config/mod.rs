@@ -105,7 +105,7 @@ pub struct Config {
     pub port: u16,
     pub project_source_dir: PathBuf,
     pub computer_workspace_dir: PathBuf,
-    /// UserApp 开发卷根 (env `USERAPP_WORKSPACE_DIR`; 沙箱挂载点, 见 paths::USERAPP_WORKSPACE_ROOT)。
+    /// Userapp 开发卷根 (env `USERAPP_WORKSPACE_DIR`; 沙箱挂载点, 见 paths::USERAPP_WORKSPACE_ROOT)。
     pub userapp_workspace_dir: PathBuf,
     /// 单 app 模式归属 (env `USERAPP_SINGLE_APP_ID`)。
     ///

@@ -240,7 +240,7 @@ async fn restart_userapp_dev(
     // 区分查询错误与真不存在（K8s API 瞬断不应误报 404 语义）
     let existed = state
         .runtime()
-        .get_container_info_by_identifier(&app_id, &ServiceType::UserAppBuilder)
+        .get_container_info_by_identifier(&app_id, &ServiceType::UserappBuilder)
         .await
         .map_err(|e| {
             error!("[POD_RESTART] userapp dev container lookup failed: app_id={app_id}: {e:#}");
@@ -258,14 +258,14 @@ async fn restart_userapp_dev(
     };
     let inplace = state
         .runtime()
-        .restart_container_inplace(&app_id, &ServiceType::UserAppBuilder)
+        .restart_container_inplace(&app_id, &ServiceType::UserappBuilder)
         .await;
     let (info, message) = match inplace {
         Ok(()) => {
             info!("[POD_RESTART] userapp dev 容器原地重启完成: app_id={app_id}");
             (
                 existing,
-                "UserApp dev 容器已原地重启（地址不变）".to_string(),
+                "Userapp dev 容器已原地重启（地址不变）".to_string(),
             )
         }
         Err(e) => {
@@ -276,7 +276,7 @@ async fn restart_userapp_dev(
             // 映射缺失等良性竞态不阻断；真 API 故障由后续 recreate 的报错兜底）
             if let Err(e) = state
                 .runtime()
-                .stop_container_by_identifier(&app_id, &ServiceType::UserAppBuilder)
+                .stop_container_by_identifier(&app_id, &ServiceType::UserappBuilder)
                 .await
             {
                 warn!("[POD_RESTART] userapp dev stop 失败（继续重建）: app_id={app_id}: {e:#}");
@@ -302,7 +302,7 @@ async fn restart_userapp_dev(
                     })?;
             (
                 recreated,
-                "UserApp dev 容器已重建（卷保留，数据不丢）".to_string(),
+                "Userapp dev 容器已重建（卷保留，数据不丢）".to_string(),
             )
         }
     };
@@ -338,7 +338,7 @@ async fn restart_userapp_prod(
             container_id: app_id.clone(),
             status: "Running".to_string(),
         },
-        message: "UserApp 生产实例已滚动重启".to_string(),
+        message: "Userapp 生产实例已滚动重启".to_string(),
     }))
 }
 

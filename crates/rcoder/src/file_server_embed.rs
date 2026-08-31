@@ -30,7 +30,7 @@ use tracing::{info, warn};
 /// 包 `Arc<dyn WorkspaceRuntime>` 实现 file-server 的 [`WorkspacePathResolver`] 窄 trait。
 ///
 /// ISP 收紧 (阶段3): file-server 仅需 workspace 能力 (resolve/ensure), 不依赖 agent 容器
-/// 生命周期或 UserApp Deployment —— 类型声明即编译期约束。
+/// 生命周期或 Userapp Deployment —— 类型声明即编译期约束。
 ///
 /// `resolve_workspace_path` 失败 (K8s API 抖动 / PVC 未 Bound / Docker 模式) → 返回 `None`
 /// → [`SubvolumeWorkspaceResolver`] 降级到 LocalWorkspaceResolver (fail-open, 不阻断服务)。
@@ -144,7 +144,7 @@ async fn run_lazy_migrate(
     let (pvc_env, subpath, dst_at_root) = match service_type {
         ServiceType::WebAgentRunner => ("RCODER_WORKSPACE_PVC_NAME", vec!["workspace"], false),
         ServiceType::ComputerAgentRunner => ("RCODER_COMPUTER_WORKSPACE_PVC_NAME", vec![], true),
-        _ => return, // UserApp 不经 file-server (app_manager 直管)
+        _ => return, // Userapp 不经 file-server (app_manager 直管)
     };
     // lazy_migrate 取 Arc by-value (trait upcast 需按值), clone 廉价 (原子计数).
     crate::workspace_migrate::lazy_migrate(

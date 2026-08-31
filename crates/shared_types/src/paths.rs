@@ -37,7 +37,7 @@ pub const WORKSPACE_ROOT: &str = "/app/project_workspace";
 /// ```
 pub const COMPUTER_WORKSPACE_ROOT: &str = "/app/computer-project-workspace";
 
-/// UserApp 开发卷根目录 (**沙箱容器视角**)。
+/// Userapp 开发卷根目录 (**沙箱容器视角**)。
 ///
 /// 独立共享卷: 沙箱 (ComputerAgentRunner) 挂载点为 `/home/user/userapp-workspace`
 /// (K8s=共享 PVC `{ns}-rcoder-userapp-workspace`, Docker=bind `./userapp-workspace`);
@@ -51,13 +51,13 @@ pub const COMPUTER_WORKSPACE_ROOT: &str = "/app/computer-project-workspace";
 /// ```
 pub const USERAPP_WORKSPACE_ROOT: &str = "/home/user/userapp-workspace";
 
-/// UserApp 开发卷根目录 (**rcoder 主容器视角**)。
+/// Userapp 开发卷根目录 (**rcoder 主容器视角**)。
 ///
 /// rcoder 挂共享卷到此固定路径（helm deployment / docker-compose 均按此挂载），
 /// 供 app_manager purge/destroy 时清理 `{root}/{app_id}/`（开发源码 + 构建制品 zip）。
 pub const RCODER_USERAPP_WORKSPACE_ROOT: &str = "/app/userapp-workspace";
 
-// ── UserApp 容器（dev builder / prod 运行容器）挂载压平契约 ────────────────────
+// ── Userapp 容器（dev builder / prod 运行容器）挂载压平契约 ────────────────────
 //
 // dev 与 prod 容器内布局完全同构（workspace/data/logs/agent-store 四目录压平在
 // /home/user 下）；宿主机/K8s 卷内是完整树，挂载把 env/user 层吸收：
@@ -67,26 +67,26 @@ pub const RCODER_USERAPP_WORKSPACE_ROOT: &str = "/app/userapp-workspace";
 //   卷内四目录平级（四 subPath 挂载）。
 // 以下容器内路径常量为 dev/prod 两形态共用（值一致）。
 
-/// UserApp 容器内 workspace 父目录（`USERAPP_WORKSPACE_DIR` env 值；
+/// Userapp 容器内 workspace 父目录（`USERAPP_WORKSPACE_DIR` env 值；
 /// workspace = `{USERAPP_DEV_HOME}/{app_id}`，file-server 定位不变仍按 app_id）。
 pub const USERAPP_DEV_HOME: &str = "/home/user";
 
-/// UserApp 容器内持久数据目录（PG/dbx；`PGDATA`/`DBX_DATA_DIR` env 值的父目录）。
+/// Userapp 容器内持久数据目录（PG/dbx；`PGDATA`/`DBX_DATA_DIR` env 值的父目录）。
 pub const USERAPP_DEV_DATA: &str = "/home/user/data";
 
-/// UserApp 容器内持久日志目录（`USERAPP_LOG_DIR` env 值，TS file-server 同名约定）。
+/// Userapp 容器内持久日志目录（`USERAPP_LOG_DIR` env 值，TS file-server 同名约定）。
 pub const USERAPP_DEV_LOGS: &str = "/home/user/logs";
 
-/// UserApp 容器内 agent-store 实体存储目录（file-server `agent_store.rs` 契约
+/// Userapp 容器内 agent-store 实体存储目录（file-server `agent_store.rs` 契约
 /// `user_root/.agent-store`——userapp 场景 user_root=/home/user；skills 经
 /// 相对软链进 workspace `{app_id}/` 使用，挂载点布局与同一棵树路径一致——
 /// workspace 与本目录同父（/home/user）是软链可解析的前提）。
 pub const USERAPP_DEV_AGENT_STORE: &str = "/home/user/.agent-store";
 
-/// UserApp 容器内 PG 数据目录（`PGDATA` env 注入值）。
+/// Userapp 容器内 PG 数据目录（`PGDATA` env 注入值）。
 pub const USERAPP_DEV_PGDATA: &str = "/home/user/data/pg";
 
-/// UserApp 容器内 dbx 数据目录（`DBX_DATA_DIR` env 注入值）。
+/// Userapp 容器内 dbx 数据目录（`DBX_DATA_DIR` env 注入值）。
 pub const USERAPP_DEV_DBX_DATA: &str = "/home/user/data/dbx";
 
 // ── 挂载压平布局子路径（宿主树定位的单一事实源）──────────────────────────────
@@ -94,7 +94,7 @@ pub const USERAPP_DEV_DBX_DATA: &str = "/home/user/data/dbx";
 // dev cleanup（purge 通配清理）、docker_app_runtime/k8s_app_create/app_manager
 // （prod 挂载与清理定位）共用——改布局只动这里。
 
-/// UserApp 宿主树 `{dev|prod}/{user_id}/` 下四目录的 app 侧后缀段
+/// Userapp 宿主树 `{dev|prod}/{user_id}/` 下四目录的 app 侧后缀段
 /// （`{app_id}` / `data/{app_id}` / `logs/{app_id}` / `agent-store/{app_id}`）——
 /// dev 与 prod 布局同构，共用此 suffix。
 pub fn userapp_dev_app_suffixes(app_id: &str) -> [String; 4] {
@@ -106,25 +106,25 @@ pub fn userapp_dev_app_suffixes(app_id: &str) -> [String; 4] {
     ]
 }
 
-/// UserApp 开发卷宿主树四目录的完整子路径（`dev/{user_id}/…`，锚点相对）。
+/// Userapp 开发卷宿主树四目录的完整子路径（`dev/{user_id}/…`，锚点相对）。
 pub fn userapp_dev_subpaths(user_id: &str, app_id: &str) -> [String; 4] {
     userapp_dev_app_suffixes(app_id).map(|s| format!("dev/{user_id}/{s}"))
 }
 
-/// UserApp prod 宿主树四目录的完整子路径（`prod/{user_id}/…`，锚点相对）——
+/// Userapp prod 宿主树四目录的完整子路径（`prod/{user_id}/…`，锚点相对）——
 /// 运行容器四 bind/四 subPath 挂载源与 clear/destroy 清理定位共用，
 /// 与 [`userapp_dev_subpaths`] 布局同构（仅 dev→prod 一层之差）。
 pub fn userapp_prod_subpaths(user_id: &str, app_id: &str) -> [String; 4] {
     userapp_dev_app_suffixes(app_id).map(|s| format!("prod/{user_id}/{s}"))
 }
 
-/// UserApp prod 数据目录子路径（`prod/{user_id}/data/{app_id}`，锚点相对）——
+/// Userapp prod 数据目录子路径（`prod/{user_id}/data/{app_id}`，锚点相对）——
 /// [`userapp_prod_subpaths`] 第二段的兼容视图（存量调用方零改动）。
 pub fn userapp_prod_data_subpath(user_id: &str, app_id: &str) -> String {
     userapp_prod_subpaths(user_id, app_id)[1].clone()
 }
 
-/// UserApp 运行容器内的应用代码根（**部署契约**：activate 后整体包落此目录，
+/// Userapp 运行容器内的应用代码根（**部署契约**：activate 后整体包落此目录，
 /// workspace 压平挂载点 `/home/user/{app_id}` 之下；database 目录 SQL 执行等
 /// 容器内路径拼接收口于此）。
 /// ```text

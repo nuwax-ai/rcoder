@@ -38,7 +38,7 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
         // 与 pod ensure/keepalive 同款；热路径转发层不走这里（自有 30s 探活缓存）。
         let (info, created) = ensure_userapp_builder_probed(&state, app_id, user_id)
             .await
-            .map_err(|e| format!("ensure UserAppBuilder (app {app_id}): {e:#}"))?;
+            .map_err(|e| format!("ensure UserappBuilder (app {app_id}): {e:#}"))?;
         if created {
             tracing::info!("[USERAPP_DEV_LOCATOR] builder ensured on demand: app_id={app_id}");
         }
@@ -49,10 +49,10 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
         let state = self.state()?;
         state
             .runtime()
-            .find_container(app_id, &ServiceType::UserAppBuilder)
+            .find_container(app_id, &ServiceType::UserappBuilder)
             .await
             .map(|found| found.is_some())
-            .map_err(|e| format!("find UserAppBuilder (app {app_id}): {e}"))
+            .map_err(|e| format!("find UserappBuilder (app {app_id}): {e}"))
     }
 }
 
@@ -68,7 +68,7 @@ impl shared_types::UserappDevEnsure for UserappDevLocator {
         let state = self.state()?;
         let (info, created) = ensure_userapp_builder_probed(&state, app_id, user_id)
             .await
-            .map_err(|e| format!("ensure UserAppBuilder (app {app_id}): {e:#}"))?;
+            .map_err(|e| format!("ensure UserappBuilder (app {app_id}): {e:#}"))?;
         if created {
             tracing::info!("[USERAPP_DEV_LOCATOR] builder ensured on demand: app_id={app_id}");
         }

@@ -6,7 +6,7 @@
 //! file-server 侧同语义实现（魔数识别 zip/tar.gz 解压 + flatten、防穿越），
 //! REST 契约（handbook）对 Java 保持不变。
 //! - `app_stage=prod`：唤醒（闲置回收的 app 自动拉起）→ 运行容器；target 相对 /app 根
-//! - `app_stage=dev`：幂等 ensure 开发容器（UserAppBuilder）；target 相对 workspace 根
+//! - `app_stage=dev`：幂等 ensure 开发容器（UserappBuilder）；target 相对 workspace 根
 
 use tracing::{info, instrument, warn};
 
@@ -51,7 +51,7 @@ impl AppService {
     /// - `app_stage=prod`：`ensure_running` 唤醒（闲置回收的 app 自动拉起）→ `get_app`
     ///   拿运行容器 IP。幻报拦截：`ensure_running` 对不存在的 app 返回
     ///   AlreadyRunning（stopped-set 语义），后续 `get_app` NotFound 兜底 404。
-    /// - `app_stage=dev`：经 `UserappDevLocator` 契约幂等 ensure UserAppBuilder（探活
+    /// - `app_stage=dev`：经 `UserappDevLocator` 契约幂等 ensure UserappBuilder（探活
     ///   自愈，开发容器常驻无唤醒语义——app_manager 的 runtime 视图无 agent
     ///   能力，委托宿主 rcoder）。
     ///

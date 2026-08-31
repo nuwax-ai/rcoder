@@ -1,4 +1,4 @@
-//! UserApp 查询面（从 service.rs 拆出，extension-impl）。
+//! Userapp 查询面（从 service.rs 拆出，extension-impl）。
 //!
 //! list_app_runtimes（对账）/ query_apps（分页过滤）/ get_app（详情）——
 //! 列表类查询经 TTL 缓存（防轮询穿透到 Docker daemon/K8s apiserver，

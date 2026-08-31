@@ -18,7 +18,7 @@ pub fn garde_err_to_app_error(report: Report) -> AppError {
     AppError::validation_error(&message)
 }
 
-/// UserApp `app_id` 长度上限（Fail Fast 校验用）。
+/// Userapp `app_id` 长度上限（Fail Fast 校验用）。
 ///
 /// 推导链（K8s 部署形态）：StatefulSet controller 自动给每个 pod 打
 /// `apps.kubernetes.io/controller-revision-hash` label，其值 = ControllerRevision

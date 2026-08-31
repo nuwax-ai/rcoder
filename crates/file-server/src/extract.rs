@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(to_bytes(resp.into_body(), 1024).await.unwrap(), "true");
 
         // 大小写不敏感变体（单一事实源 shared_types::is_userapp_service_type_value）
-        for variant in ["UserApp", "USERAPP"] {
+        for variant in ["Userapp", "USERAPP"] {
             let resp = app
                 .clone()
                 .oneshot(

@@ -75,7 +75,7 @@ impl shared_types::ContainerLookup for ProjectAdapter {
             return None;
         }
         // 确定性命名构造（trait 文档：运行容器不进 projects 注册表，键被 builder 占用）
-        let container_name = format!("{}-{app_id}", ServiceType::UserApp.container_prefix());
+        let container_name = format!("{}-{app_id}", ServiceType::Userapp.container_prefix());
         if shared_types::is_kubernetes_runtime() {
             Some(shared_types::build_k8s_service_fqdn(
                 &container_name,

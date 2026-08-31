@@ -13,12 +13,12 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-/// UserApp 容器运行时编排器。
+/// Userapp 容器运行时编排器。
 #[derive(Parser, Debug, Clone, Default)]
 #[command(
     name = "app-cli",
     version,
-    about = "UserApp 容器运行时编排器（替代 start.sh）"
+    about = "Userapp 容器运行时编排器（替代 start.sh）"
 )]
 pub struct CliArgs {
     /// workspace 根（含 workspace.manifest.toml + 各子项目；解压后的 /app/code）。

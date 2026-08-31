@@ -2,7 +2,7 @@
 //!
 //! 复用 workspace-manifest 的纯函数（发现 → 校验 → 锁定）+ app-cli proxy 的纯编译，
 //! 在本地秒级生成 `release.lock.toml` 并预览 Pingap 生效配置 —— 无需 pingap 二进制 / PG / 镜像。
-//! 供 UserApp 模板与 manifest 设计的快速迭代验证："改 toml → 重跑 → 立刻看端口/拓扑/路由/Pingap 配置"。
+//! 供 Userapp 模板与 manifest 设计的快速迭代验证："改 toml → 重跑 → 立刻看端口/拓扑/路由/Pingap 配置"。
 
 use std::path::Path;
 

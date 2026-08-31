@@ -289,7 +289,7 @@ pub(super) fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
 pub(super) enum AppTarget {
     /// 无 app_id——走既有 agent/computer 路径
     NotApp,
-    /// 开发容器（UserAppBuilder：虚拟终端/文件服务/PG 全套开发栈）
+    /// 开发容器（UserappBuilder：虚拟终端/文件服务/PG 全套开发栈）
     Dev(String),
     /// 生产 Deployment（AppService 托管）
     Prod(String),
@@ -298,12 +298,12 @@ pub(super) enum AppTarget {
 /// 解析 userApp 分派目标。
 ///
 /// 校验规则：
-/// - `service_type` 为 UserApp 变体（大小写不敏感，复用 `ServiceType::FromStr`
+/// - `service_type` 为 Userapp 变体（大小写不敏感，复用 `ServiceType::FromStr`
 ///   词表：`userapp`/`user-app`/`application`/`app`）时与 `app_id` 搭配**放行**——
 ///   userApp 场景统一三字段形态（Java 侧 `service_type=userapp` + `app_id` +
 ///   `app_stage`）；其余 service_type 值与 `app_id` 仍互斥（userApp 容器类型由
 ///   `app_stage` 推导，防双头语义）
-/// - `service_type` 为 UserApp 变体但缺 `app_id` → 报错（防误走 agent 路径空查）
+/// - `service_type` 为 Userapp 变体但缺 `app_id` → 报错（防误走 agent 路径空查）
 /// - `app_stage` 依附于 `app_id`（单独出现视为无效）
 /// - `app_id` 过 identifier 白名单（进入容器名/bind 路径拼接，防注入）
 pub(super) fn parse_app_target(
@@ -314,7 +314,7 @@ pub(super) fn parse_app_target(
     let service_type = service_type.map(str::trim).filter(|s| !s.is_empty());
     let service_type_is_userapp = service_type
         .map(|s| s.to_ascii_lowercase())
-        .is_some_and(|s| matches!(s.parse::<ServiceType>(), Ok(ServiceType::UserApp)));
+        .is_some_and(|s| matches!(s.parse::<ServiceType>(), Ok(ServiceType::Userapp)));
     let Some(app_id) = app_id.map(str::trim).filter(|s| !s.is_empty()) else {
         if service_type_is_userapp {
             return Err("service_type 'userapp' requires app_id".to_string());
@@ -357,7 +357,7 @@ pub(crate) fn invalid_app_target_response<T>(locale: &str, e: &str) -> HttpResul
 ///
 /// 与 pod 族 `parse_app_target` 的差异：pod 操作容器本体（dev/prod 双态，
 /// 独立 app_id 字段）；agent 族操作 agent 会话与构建缓存——只存在于 dev
-/// 阶段的 UserAppBuilder 开发容器，`app_stage=prod` 直接校验失败。
+/// 阶段的 UserappBuilder 开发容器，`app_stage=prod` 直接校验失败。
 ///
 /// - `Ok(Some(app_id))`：userApp 分派（app_id = project_id 的值）
 /// - `Ok(None)`：computer 既有路径（service_type 非 userapp 或未传——
@@ -370,10 +370,21 @@ pub(crate) fn parse_agent_userapp_dispatch(
     app_stage: Option<&str>,
 ) -> Result<Option<String>, String> {
     let service_type = service_type.map(str::trim).filter(|s| !s.is_empty());
-    let service_type_is_userapp = service_type
-        .map(|s| s.to_ascii_lowercase())
-        .is_some_and(|s| matches!(s.parse::<ServiceType>(), Ok(ServiceType::UserApp)));
+    let lowered = service_type.map(|s| s.to_ascii_lowercase());
+    let parsed = lowered.as_deref().and_then(|s| s.parse::<ServiceType>().ok());
+    let service_type_is_userapp = matches!(parsed, Some(ServiceType::Userapp));
     if !service_type_is_userapp {
+        // UserappBuilder 变体（user-app-builder）显式拦截：userApp 容器类型由
+        // app_stage 推导（dev=UserappBuilder / prod=Userapp），入参传 builder 是
+        // 误用——静默直通 computer 路径会把 project_id（app_id）当普通项目 ID
+        // 查，报误导性错误（pod 族 parse_app_target 对此同样显式拒绝）
+        if matches!(parsed, Some(ServiceType::UserappBuilder)) {
+            return Err(
+                "service_type 'user-app-builder' is not a valid input: userApp 容器类型 \
+                 由 app_stage 推导（dev=UserappBuilder / prod=Userapp），请传 service_type=userapp"
+                    .to_string(),
+            );
+        }
         return Ok(None);
     }
     let Some(app_id) = project_id.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -387,7 +398,7 @@ pub(crate) fn parse_agent_userapp_dispatch(
 }
 
 /// agent 族五接口与 `/computer/chat` 共用的 dev-only stage 校验：缺省 dev；
-/// prod / 非法值报错——agent 会话仅存在于 UserAppBuilder 开发容器（prod
+/// prod / 非法值报错——agent 会话仅存在于 UserappBuilder 开发容器（prod
 /// 运行容器无 agent 会话）。
 pub(crate) fn validate_agent_dev_stage(app_stage: Option<&str>) -> Result<(), String> {
     let stage_raw = app_stage
@@ -398,7 +409,7 @@ pub(crate) fn validate_agent_dev_stage(app_stage: Option<&str>) -> Result<(), St
         Some(shared_types::UserappStage::Dev) => Ok(()),
         Some(shared_types::UserappStage::Prod) => Err(
             "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 \
-             (UserAppBuilder 开发容器)"
+             (UserappBuilder 开发容器)"
                 .to_string(),
         ),
         None => Err(format!(

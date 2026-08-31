@@ -1,4 +1,4 @@
-//! UserApp K8s 资源 **共享 helper**(命名/label/API accessor/const)。
+//! Userapp K8s 资源 **共享 helper**(命名/label/API accessor/const)。
 //! 从原 k8s_deployment.rs(1415行)拆分后,本文件仅保留跨 create/lifecycle/query 共用的:
 //! - 模块级 const:`APP_MANAGED_BY`/`APP_LABEL_PREFIX`/`RCODER_LABEL_PREFIX`/`APP_CONTAINER_NAME`
 //! - 命名:`app_deployment_name`/`app_config_name`/.../`app_workspace_pvc_name`
@@ -8,7 +8,7 @@
 //!
 //! 实际生命周期方法见 `k8s_app_create`(创建)/`k8s_app_lifecycle`(stop/restart/cleanup)/
 //! `k8s_app_query`(状态查询)/`k8s_app_helpers`(编解码/probe)。
-//! UserApp 存储走 per-app CephFS subvolume PVC(`ensure_workspace_pvc(app_id, UserApp, ...)`)。
+//! Userapp 存储走 per-app CephFS subvolume PVC(`ensure_workspace_pvc(app_id, Userapp, ...)`)。
 
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::ContainerRuntimeResult;
@@ -34,24 +34,24 @@ pub(crate) const APP_MANAGED_BY: &str = "rcoder-app-manager";
 pub(crate) const APP_LABEL_PREFIX: &str = "app.kubernetes.io";
 #[cfg(feature = "kubernetes")]
 pub(crate) const RCODER_LABEL_PREFIX: &str = "rcoder.io";
-/// UserApp Pod 主容器名：build_app_deployment 创建、deployment_to_status 按此名定位状态
+/// Userapp Pod 主容器名：build_app_deployment 创建、deployment_to_status 按此名定位状态
 #[cfg(feature = "kubernetes")]
 pub(crate) const APP_CONTAINER_NAME: &str = "app";
-/// 所有 UserApp 共享的 app.kubernetes.io/name label 值：build_app_labels 写入，
+/// 所有 Userapp 共享的 app.kubernetes.io/name label 值：build_app_labels 写入，
 /// build_app_deployment 的 topologySpreadConstraints 也按它分组（跨 Deployment 统计）
 #[cfg(feature = "kubernetes")]
 pub(crate) const APP_NAME_LABEL_VALUE: &str = "user-app";
 
-/// UserApp K8s 资源命名 + 创建/伸缩/重启/删除/查询（pub(crate)，由 ContainerRuntime
+/// Userapp K8s 资源命名 + 创建/伸缩/重启/删除/查询（pub(crate)，由 ContainerRuntime
 /// trait 的 Deployment 方法转调，rcoder 通过 trait 调用）。
 #[cfg(feature = "kubernetes")]
 impl KubernetesRuntime {
     /// app_id → Deployment 名（其余 app 资源名基于此）
     ///
-    /// 前缀取自 `ServiceType::UserApp::container_prefix()`（单一来源），与 Docker 侧
+    /// 前缀取自 `ServiceType::Userapp::container_prefix()`（单一来源），与 Docker 侧
     /// `docker_runtime::app_deployment_name` 对称，避免硬编码散落；改前缀只需改一处。
     pub fn app_deployment_name(&self, app_id: &str) -> String {
-        format!("{}-{app_id}", ServiceType::UserApp.container_prefix())
+        format!("{}-{app_id}", ServiceType::Userapp.container_prefix())
     }
 
     pub(crate) fn app_config_name(&self, app_id: &str) -> String {
@@ -78,7 +78,7 @@ impl KubernetesRuntime {
     /// app workspace PVC 名（阶段2 per-app PVC, 复用 K8sPvcOps::workspace_pvc_name 单一事实源,
     /// 与 agent 路径 create_container + resolve_subvolume_path 同名, 根除漂移）
     pub(crate) fn app_workspace_pvc_name(&self, app_id: &str) -> ContainerRuntimeResult<String> {
-        self.workspace_pvc_name(app_id, &ServiceType::UserApp)
+        self.workspace_pvc_name(app_id, &ServiceType::Userapp)
     }
 
     /// 构建 app 专用 label（与 agent 物理隔离）。

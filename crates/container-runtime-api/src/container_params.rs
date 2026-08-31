@@ -31,10 +31,10 @@ pub struct ContainerCreateParams {
     /// Only effective in K8s mode, Docker mode ignores this parameter
     pub storage_size: Option<String>,
 
-    // ===== UserApp 专用字段（agent 路径不传，全 Option 向后兼容）=====
-    /// 镜像覆盖（UserApp 必填，优先于 ServiceType 驱动的 select_image）
+    // ===== Userapp 专用字段（agent 路径不传，全 Option 向后兼容）=====
+    /// 镜像覆盖（Userapp 必填，优先于 ServiceType 驱动的 select_image）
     pub image_override: Option<String>,
-    /// 启动命令（UserApp 用，agent 路径由 ServiceType 决定）
+    /// 启动命令（Userapp 用，agent 路径由 ServiceType 决定）
     pub command: Option<Vec<String>>,
     /// 启动参数
     pub args: Option<Vec<String>>,
@@ -42,15 +42,15 @@ pub struct ContainerCreateParams {
     pub env: Option<HashMap<String, String>>,
     /// 敏感环境变量（K8s 模式进 Secret，Docker 模式合并进 env）
     pub secrets: Option<HashMap<String, String>>,
-    /// 端口配置（UserApp 用）
+    /// 端口配置（Userapp 用）
     pub ports: Option<Vec<AppPortSpec>>,
-    /// 健康检查配置（UserApp 用）
+    /// 健康检查配置（Userapp 用）
     pub health_check: Option<AppHealthCheck>,
-    /// 应用资源需求（字符串格式；与 resource_limits 二选一，UserApp 专用）
+    /// 应用资源需求（字符串格式；与 resource_limits 二选一，Userapp 专用）
     pub app_resources: Option<AppResourceRequirements>,
-    /// 是否参与闲置自动回收（UserApp 用；None/Some(true)=可回收=免费用户默认，Some(false)=永不回收=付费/常驻）
+    /// 是否参与闲置自动回收（Userapp 用；None/Some(true)=可回收=免费用户默认，Some(false)=永不回收=付费/常驻）
     pub recycle_enabled: Option<bool>,
-    /// 闲置回收阈值秒数（UserApp 用；None=用全局默认，Some=per-app 覆盖）
+    /// 闲置回收阈值秒数（Userapp 用；None=用全局默认，Some=per-app 覆盖）
     pub idle_timeout_seconds: Option<u64>,
 }
 

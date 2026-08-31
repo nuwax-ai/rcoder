@@ -13,7 +13,7 @@
 
 // 两业务域目录化(开闭原则:改一个域不碰另一个域的文件):
 // - project_store/  主服务域(ProjectStore 契约的 PG 后端实现全部)
-// - userapp/        UserApp 业务域(activity/metadata)
+// - userapp/        Userapp 业务域(activity/metadata)
 mod project_store;
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! Docker UserApp 运行容器的 prod 挂载组装（从 docker_app_runtime.rs 拆出）。
+//! Docker Userapp 运行容器的 prod 挂载组装（从 docker_app_runtime.rs 拆出）。
 //!
 //! prod 四目录压平挂载（与 dev builder 完全同构）：宿主
 //! `{userapp 根}/prod/{user_id}/` 下四目录（`{app_id}`、`data/{app_id}`、
@@ -28,7 +28,7 @@ pub(super) async fn build_prod_flat_mounts(
     .await
     .map_err(|e| {
         ContainerRuntimeError::DockerError(format!(
-            "UserApp prod volume host path resolve failed (rcoder 容器需挂载 userapp-workspace 锚点): {e}"
+            "Userapp prod volume host path resolve failed (rcoder 容器需挂载 userapp-workspace 锚点): {e}"
         ))
     })?;
     let subs = shared_types::paths::userapp_prod_subpaths(uid, app_id);

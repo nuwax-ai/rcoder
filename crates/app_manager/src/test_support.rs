@@ -50,7 +50,7 @@ pub(crate) struct MockRuntime {
     /// 注入 resize_app_storage 返回 outcome（None → 默认模拟 K8s Grow 成功）。
     pub resize_outcome: std::sync::Mutex<Option<StorageResizeOutcome>>,
     /// workspace_volume_name 收到的 (app_id, service_type debug) 历史——storage
-    /// env 分派断言用（dev→UserAppBuilder / prod→UserApp）。
+    /// env 分派断言用（dev→UserappBuilder / prod→Userapp）。
     pub volume_name_calls: DashMap<String, Vec<String>>,
     /// list_workspace_identifiers 按 service_type 的返回预置 + 调用计数
     /// （storage get/query 的 env 分派断言用）。

@@ -1,19 +1,19 @@
-//! UserApp 阶段维度（dev/prod）——路径段 `{app_stage}` 的统一解析契约。
+//! Userapp 阶段维度（dev/prod）——路径段 `{app_stage}` 的统一解析契约。
 //!
 //! db 三接口（`/api/v1/userapp/db/{app_stage}/...`）与文件/存储八接口
 //! （`/api/v1/userapp/{app_id}/{app_stage}/...`）共用同一词表与解析，
 //! 与转发层 `X-App-Stage` header 同一词汇（app_stage）：
-//! - `dev`：开发容器（UserAppBuilder）——workspace 开发卷，幂等 ensure 常驻
-//! - `prod`：生产运行容器（UserApp）——per-app 运行卷，stopped 语义 + 唤醒
+//! - `dev`：开发容器（UserappBuilder）——workspace 开发卷，幂等 ensure 常驻
+//! - `prod`：生产运行容器（Userapp）——per-app 运行卷，stopped 语义 + 唤醒
 //!
 //! app_stage 必填（无缺省值）：平台同时存在两环境容器，隐式缺省必歧义。
 
-/// UserApp 目标阶段（路径段 `{app_stage}` 的类型化形态）。
+/// Userapp 目标阶段（路径段 `{app_stage}` 的类型化形态）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserappStage {
-    /// 开发容器（UserAppBuilder）：开发卷 workspace，幂等 ensure 常驻
+    /// 开发容器（UserappBuilder）：开发卷 workspace，幂等 ensure 常驻
     Dev,
-    /// 生产运行容器（UserApp）：per-app 运行卷，stopped 语义 + 唤醒
+    /// 生产运行容器（Userapp）：per-app 运行卷，stopped 语义 + 唤醒
     Prod,
 }
 

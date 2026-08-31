@@ -1,6 +1,6 @@
-//! UserApp PG 凭据对齐契约（跨 crate，按模块契约约定置于 shared_types）。
+//! Userapp PG 凭据对齐契约（跨 crate，按模块契约约定置于 shared_types）。
 //!
-//! 业务：开发环境（UserAppBuilder 开发容器）与部署环境（UserApp 运行容器）的
+//! 业务：开发环境（UserappBuilder 开发容器）与部署环境（Userapp 运行容器）的
 //! 容器内 PG 账号密码保持一致——Java 调 `POST /api/v1/userapp/db/{dev|prod}/align-credentials`
 //! 传入目标凭据，rcoder 验证（TCP scram）→ 不一致则重置（本地 trust ALTER USER）。
 //!
@@ -46,7 +46,7 @@ pub struct CommandOutcome {
 }
 
 /// 容器内 shell 命令执行通道（宿主注入）：
-/// - prod：app_manager 经 runtime exec（UserApp 运行容器）
+/// - prod：app_manager 经 runtime exec（Userapp 运行容器）
 /// - dev：rcoder 经开发容器内 file-server `execute-command`（HTTP）
 #[async_trait]
 pub trait PgCommandRunner: Send + Sync {

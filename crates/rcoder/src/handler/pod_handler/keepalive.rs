@@ -297,7 +297,7 @@ async fn keepalive_userapp_dev(
         current_activity_time_str: timestamp_to_utc8_string(current),
         time_until_cleanup: idle_timeout_seconds,
         message: format!(
-            "UserApp dev 容器已保活, {} minutes until auto cleanup",
+            "Userapp dev 容器已保活, {} minutes until auto cleanup",
             idle_timeout_seconds / 60
         ),
     }))
@@ -330,6 +330,6 @@ async fn keepalive_userapp_prod(
         current_activity_time_str: timestamp_to_utc8_string(current),
         // 生产回收阈值由 userapp_recycle 的 per-app 注解决定（非 cleanup_config）
         time_until_cleanup: 0,
-        message: "UserApp 生产实例活跃信号已刷新（闲置回收计时重置）".to_string(),
+        message: "Userapp 生产实例活跃信号已刷新（闲置回收计时重置）".to_string(),
     }))
 }

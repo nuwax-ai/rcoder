@@ -1,4 +1,4 @@
-//! UserApp 容器内 PostgreSQL 管理（从 service.rs 拆出，extension-impl）。
+//! Userapp 容器内 PostgreSQL 管理（从 service.rs 拆出，extension-impl）。
 //!
 //! 职责：`align_db_credentials`（凭据对齐，流程单头
 //! `shared_types::align_pg_credentials`）与 exec 前置 `ensure_app_running`。
@@ -13,7 +13,7 @@ use crate::models::*;
 use crate::service::AppService;
 use crate::utils::*;
 
-/// UserApp 运行容器 exec 通道（runtime exec → PgCommandRunner）。
+/// Userapp 运行容器 exec 通道（runtime exec → PgCommandRunner）。
 struct RuntimeExecRunner<'a> {
     service: &'a AppService,
     app_id: &'a str,
@@ -40,7 +40,7 @@ impl shared_types::PgCommandRunner for RuntimeExecRunner<'_> {
 }
 
 impl AppService {
-    /// PG 凭据对齐（UserApp 运行容器内，prod 环境）：验证传入密码与账号当前密码
+    /// PG 凭据对齐（Userapp 运行容器内，prod 环境）：验证传入密码与账号当前密码
     /// 是否一致（TCP scram），不一致则本地 trust ALTER USER 重置并复验。
     /// 流程单头 [`shared_types::align_pg_credentials`]；密码不落日志。
     pub async fn align_db_credentials(

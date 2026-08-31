@@ -264,9 +264,9 @@ pub(super) async fn update_session_mappings_after_response(
 
     // 从 Runtime API 获取最新容器信息，避免使用过期 IP。
     // 查找 identifier：ComputerAgentRunner=user_id（per-user 容器）；
-    // UserAppBuilder=project_id（userApp 开发对话的 per-app 开发容器）
+    // UserappBuilder=project_id（userApp 开发对话的 per-app 开发容器）
     let lookup_identifier = match container_service_type {
-        shared_types::ServiceType::UserAppBuilder => project_id,
+        shared_types::ServiceType::UserappBuilder => project_id,
         _ => user_id,
     };
     let container_info = match state

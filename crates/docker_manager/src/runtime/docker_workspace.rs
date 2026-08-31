@@ -6,7 +6,7 @@ use shared_types::ServiceType;
 
 use super::docker_runtime::DockerRuntime;
 
-/// `list_workspace_identifiers` 仅实现 dev（UserAppBuilder）形态（目录树扫描），
+/// `list_workspace_identifiers` 仅实现 dev（UserappBuilder）形态（目录树扫描），
 /// prod 维持 trait 默认空（孤儿检测依赖 list_deployments 兜底——存量缺口）。
 /// **`destroy_app_pvc` 重写** (Docker 模式 destroy = 删 app workspace 目录, 对应 K8s 删 PVC+subvolume).
 #[async_trait]
@@ -19,13 +19,13 @@ impl WorkspaceRuntime for DockerRuntime {
         // Docker 持久卷 = userapp-workspace 树四目录（uid 维度经通配定位，
         // 无单一物理路径）——返回展示标识串（与 K8s 返回 PVC 名对称：标识而非
         // 可 stat 路径；存在性判定由调用方 storage 层用元数据 uid 精确定位）。
-        // dev（UserAppBuilder）与 prod（UserApp）仅树前缀一层之差。
+        // dev（UserappBuilder）与 prod（Userapp）仅树前缀一层之差。
         if app_id.is_empty() || app_id.contains('/') || app_id.contains('\\') {
             return Err(ContainerRuntimeError::DockerError(format!(
                 "workspace_volume_name: invalid app_id {app_id:?}"
             )));
         }
-        let stage = if *service_type == ServiceType::UserAppBuilder {
+        let stage = if *service_type == ServiceType::UserappBuilder {
             "dev"
         } else {
             "prod"
@@ -37,7 +37,7 @@ impl WorkspaceRuntime for DockerRuntime {
         ))
     }
 
-    /// Docker 无 PVC label 集——dev（UserAppBuilder）形态按 dev 树目录扫描反解
+    /// Docker 无 PVC label 集——dev（UserappBuilder）形态按 dev 树目录扫描反解
     /// identifier：`dev/{uid}/` 一层 × 其下 app 目录（跳过同层的 data/logs/
     /// agent-store 三个兄弟目录，它们按 app_id 键不是 uid）。prod 形态维持
     /// 空（Docker 孤儿检测非关键，见 trait 注释）。
@@ -45,7 +45,7 @@ impl WorkspaceRuntime for DockerRuntime {
         &self,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Vec<String>> {
-        if *service_type != ServiceType::UserAppBuilder {
+        if *service_type != ServiceType::UserappBuilder {
             return Ok(vec![]);
         }
         let dev_root =
@@ -121,7 +121,7 @@ impl WorkspaceRuntime for DockerRuntime {
     }
 }
 
-/// dev 树 identifier 扫描（`list_workspace_identifiers(UserAppBuilder)` 的实现体，
+/// dev 树 identifier 扫描（`list_workspace_identifiers(UserappBuilder)` 的实现体，
 /// 提为自由函数便于单测）：`dev/{uid}/` 一层 × 其下 app 目录；跳过同层按 app_id
 /// 键的 data/logs/agent-store 兄弟目录；dev 树不存在 = 空（幂等）。
 pub(super) async fn scan_dev_workspace_identifiers(

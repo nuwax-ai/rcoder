@@ -674,7 +674,7 @@ mod tests {
         );
         // 大小写不敏感：userapp 的任意大小写变体（含前后空白）均命中 Rust 上游
         // （单一事实源 shared_types::is_userapp_service_type_value）
-        for variant in ["UserApp", "USERAPP", " userapp "] {
+        for variant in ["Userapp", "USERAPP", " userapp "] {
             assert_eq!(
                 c.upstream_port_for("/api/computer/x", Some(variant)),
                 Upstream::Rust(8086),

@@ -17,7 +17,7 @@ use crate::{AppError, HttpResult};
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateWorkspaceBody {
-    /// UserApp 应用 ID（同时是开发容器与 workspace 目录的标识）
+    /// Userapp 应用 ID（同时是开发容器与 workspace 目录的标识）
     pub app_id: String,
     /// 用户 ID（owner，落 userapp_metadata；发布编排与 apps 代理 URL 拼接使用）
     pub user_id: String,
@@ -27,7 +27,7 @@ pub struct CreateWorkspaceBody {
 ///
 /// 1. metadata 注册 owner user_id（name 空 = 开发期；部署 create_app 后补全；
 ///    先于 ensure——builder 宿主树分区依赖 owner user_id）
-/// 2. ensure 该 app 的开发容器（UserAppBuilder，per-app RWO 卷；K8s 走 STS+PVC
+/// 2. ensure 该 app 的开发容器（UserappBuilder，per-app RWO 卷；K8s 走 STS+PVC
 ///    ensure，Docker 走 per-app bind）
 /// 3. 容器内 file-server 幂等建 workspace 目录 `{USERAPP_WORKSPACE_DIR}/{app_id}`
 ///    （execute-command 等接口要求目录已存在）
@@ -40,9 +40,9 @@ pub struct CreateWorkspaceBody {
         (status = 400, description = "参数校验失败", body = HttpResult<String>),
         (status = 502, description = "开发容器不可达", body = HttpResult<String>)
     ),
-    tag = "UserApp · dev · 工作区与工具链",
+    tag = "Userapp · dev · 工作区与工具链",
     operation_id = "create_userapp_workspace",
-    summary = "创建 UserApp 项目工作区（ensure 开发容器 + 建目录 + 注册 owner）"
+    summary = "创建 Userapp 项目工作区（ensure 开发容器 + 建目录 + 注册 owner）"
 )]
 pub(crate) async fn create_workspace(
     State(state): State<Arc<AppState>>,

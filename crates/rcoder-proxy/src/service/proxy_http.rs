@@ -27,7 +27,7 @@ impl ProxyHttp for PortProxy {
         TrackingCtx::new()
     }
 
-    /// 请求过滤阶段：UserApp 访问追踪 + 流量唤醒。
+    /// 请求过滤阶段：Userapp 访问追踪 + 流量唤醒。
     ///
     /// 两类 prod 路由触发唤醒（stopped app → `ensure_running` hold-and-wait ≤60s
     /// 拉起；超时/失败 → 503+Retry-After）：

@@ -23,7 +23,7 @@ use super::kubernetes_runtime::{KubernetesRuntime, read_app_expose_env};
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 impl UserAppDeploymentRuntime for KubernetesRuntime {
-    // ===== Deployment 生命周期（UserApp 专用，转调 k8s_deployment.rs 的 inherent 方法）=====
+    // ===== Deployment 生命周期（Userapp 专用，转调 k8s_deployment.rs 的 inherent 方法）=====
 
     /// 热部署收敛：仅更新 ConfigMap data，**保留原 labels/metadata、不触碰
     /// Deployment**（config-hash 注解不动 → 无 Recreate → 热部署效果保持）。
@@ -82,7 +82,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             project_id: app_id.clone(),
             status: "Starting".to_string(),
             created_at: Utc::now(),
-            // UserApp service_url: 传 app_deployment_name(不含 -svc),由 build_k8s_service_fqdn
+            // Userapp service_url: 传 app_deployment_name(不含 -svc),由 build_k8s_service_fqdn
             // 追加单层 -svc。【不要】传 app_service_name(已含 -svc) → -svc-svc 双后缀。
             service_url: format!(
                 "http://{}",
@@ -126,7 +126,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             project_id: app_id.clone(),
             status: "Starting".to_string(),
             created_at: Utc::now(),
-            // UserApp service_url: 传 app_deployment_name(不含 -svc),由 build_k8s_service_fqdn
+            // Userapp service_url: 传 app_deployment_name(不含 -svc),由 build_k8s_service_fqdn
             // 追加单层 -svc。【不要】传 app_service_name(已含 -svc) → -svc-svc 双后缀。
             service_url: format!(
                 "http://{}",
@@ -184,7 +184,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         &self,
         app_id: &str,
     ) -> ContainerRuntimeResult<ContainerSpecSnapshot> {
-        // 委派到 k8s_deployment 的 inherent 实现（UserApp trait 方法统一走「委派→inherent」模式，
+        // 委派到 k8s_deployment 的 inherent 实现（Userapp trait 方法统一走「委派→inherent」模式，
         // 与 get_deployment_status→get_app_status 一致）。不委派则会命中 trait 默认实现（空快照）→
         // update 回退失效 → command/env 仍被清空。
         self.read_app_container_spec(app_id).await

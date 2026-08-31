@@ -412,13 +412,13 @@ impl UnifiedContainerInfo {
             idle_duration > ChronoDuration::from_std(idle_timeout).unwrap_or(ChronoDuration::MAX);
 
         match self.service_type {
-            ServiceType::UserApp => {
-                // UserApp 由 app_manager/Java 管理生命周期，不参与 agent 闲置清理
+            ServiceType::Userapp => {
+                // Userapp 由 app_manager/Java 管理生命周期，不参与 agent 闲置清理
                 false
             }
-            ServiceType::WebAgentRunner | ServiceType::UserAppBuilder => {
-                // RCoder / UserAppBuilder 模式：检查自身状态。
-                // UserAppBuilder 是 build/dev agent-runner(复用 dev-rcoder-agent-runner 镜像),
+            ServiceType::WebAgentRunner | ServiceType::UserappBuilder => {
+                // RCoder / UserappBuilder 模式：检查自身状态。
+                // UserappBuilder 是 build/dev agent-runner(复用 dev-rcoder-agent-runner 镜像),
                 // 长期闲置应回收(省资源),下次 ensure 重建复用 per-app PVC 数据。
                 let is_idle_status = matches!(self.status, Some(AgentStatus::Idle) | None);
                 is_idle_status && is_timeout

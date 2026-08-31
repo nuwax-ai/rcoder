@@ -1,6 +1,6 @@
 //! PVC ensure/destroy 核心。ensure 核心（workspace 卷）：存在检查/terminating
 //! 等待/SC 漂移可见/创建重试；destroy 核心：幂等删除 + 60s Terminating 等待 →
-//! 强删 grace=0（另被 UserApp data 卷存量兜底回收复用）。
+//! 强删 grace=0（另被 Userapp data 卷存量兜底回收复用）。
 
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
@@ -174,7 +174,7 @@ impl KubernetesRuntime {
             },
             spec: Some(PersistentVolumeClaimSpec {
                 // access_mode/storage_class_name 由调用方按卷型决定:
-                // UserApp 域（运行卷/开发卷/data 卷）RWO RBD 单容器独占,
+                // Userapp 域（运行卷/开发卷/data 卷）RWO RBD 单容器独占,
                 // 其余用全局配置。
                 access_modes: Some(vec![access_mode]),
                 storage_class_name,
@@ -231,7 +231,7 @@ impl KubernetesRuntime {
         }
     }
 
-    /// PVC destroy 核心（workspace 卷与 UserApp data 卷共用）：幂等删除 +
+    /// PVC destroy 核心（workspace 卷与 Userapp data 卷共用）：幂等删除 +
     /// 60s Terminating 等待 → 强删 grace=0。
     pub(super) async fn destroy_pvc_core(&self, pvc_name: &str) -> ContainerRuntimeResult<()> {
         // 幂等: PVC 不存在直接返回成功 (Java 重试 / 对账安全)

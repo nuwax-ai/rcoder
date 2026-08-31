@@ -90,7 +90,7 @@ pub struct AppConfig {
     /// 容器清理配置
     #[serde(default)]
     pub cleanup_config: CleanupConfigSettings,
-    /// UserApp 闲置自动回收 + 流量唤醒配置
+    /// Userapp 闲置自动回收 + 流量唤醒配置
     #[serde(default)]
     pub userapp_recycle: UserAppRecycleConfig,
     /// 存储后端配置（rcoder-pg：memory=纯内存单节点，postgres=PG 持久化）

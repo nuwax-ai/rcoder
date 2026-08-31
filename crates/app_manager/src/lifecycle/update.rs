@@ -1,4 +1,4 @@
-//! UserApp desired-state 变更面（从 service.rs 拆出，extension-impl）。
+//! Userapp desired-state 变更面（从 service.rs 拆出，extension-impl）。
 //!
 //! update_app（SSA 全量替换+live 回退）/ delete_app（默认保留数据面，purge 清空）。
 

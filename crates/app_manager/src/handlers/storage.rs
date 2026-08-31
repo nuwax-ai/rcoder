@@ -41,7 +41,7 @@ use crate::models::{
         (status = 400, description = "app_stage 非法", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 文件与存储"
+    tag = "Userapp · 双态 · 文件与存储"
 )]
 #[instrument(skip(state))]
 pub async fn get_app_storage(
@@ -85,7 +85,7 @@ pub async fn get_app_storage(
         (status = 409, description = "prod 下应用仍存在，需先 delete", body = HttpResult<String>),
         (status = 502, description = "dev 下开发容器不可达（或容器内无 clear 端点——旧镜像需换代）", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 文件与存储"
+    tag = "Userapp · 双态 · 文件与存储"
 )]
 #[instrument(skip(state))]
 pub async fn clear_app_storage(
@@ -128,7 +128,7 @@ pub async fn clear_app_storage(
         (status = 409, description = "prod 下应用仍存在，需先 delete", body = HttpResult<String>),
         (status = 500, description = "PVC 卡 Terminating，需运维介入（pvc-protection finalizer 未移除）", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 文件与存储"
+    tag = "Userapp · 双态 · 文件与存储"
 )]
 #[instrument(skip(state, req))]
 pub async fn destroy_app_storage(
@@ -174,7 +174,7 @@ pub async fn destroy_app_storage(
         (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<StorageInfo>>),
         (status = 400, description = "分页参数错误 / app_stage 非法", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 文件与存储"
+    tag = "Userapp · 双态 · 文件与存储"
 )]
 #[instrument(skip(state, request))]
 pub async fn query_storage(

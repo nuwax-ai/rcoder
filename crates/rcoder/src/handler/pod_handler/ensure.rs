@@ -177,7 +177,7 @@ async fn ensure_userapp_dev(
             container_id: info.container_id.clone(),
             status: info.status.clone(),
         },
-        message: "UserApp dev 容器已就绪（虚拟终端/文件服务经反向代理访问）".to_string(),
+        message: "Userapp dev 容器已就绪（虚拟终端/文件服务经反向代理访问）".to_string(),
     }))
 }
 
@@ -207,7 +207,7 @@ async fn ensure_userapp_prod(
                 container_id: app_id.clone(),
                 status: "Running".to_string(),
             },
-            message: "UserApp 生产实例已唤醒（wake_on_traffic 已启用）".to_string(),
+            message: "Userapp 生产实例已唤醒（wake_on_traffic 已启用）".to_string(),
         })),
         shared_types::WakeOutcome::AlreadyRunning => Ok(HttpResult::success(EnsurePodResponse {
             created: false,
@@ -215,7 +215,7 @@ async fn ensure_userapp_prod(
                 container_id: app_id.clone(),
                 status: "Running".to_string(),
             },
-            message: "UserApp 生产实例已在运行".to_string(),
+            message: "Userapp 生产实例已在运行".to_string(),
         })),
         shared_types::WakeOutcome::Timeout => {
             error!("[POD_ENSURE] userapp prod wake timeout: app_id={app_id}");

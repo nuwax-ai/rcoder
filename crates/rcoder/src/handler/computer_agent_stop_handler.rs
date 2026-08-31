@@ -68,7 +68,7 @@ use super::utils::{I18nJsonOrQuery, extract_grpc_addr, get_locale_from_headers};
     tag = "computer",
     operation_id = "computer_agent_stop",
     summary = "停止 Computer Agent",
-    description = "停止特定 project_id 的 Agent，不销毁容器。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserAppBuilder 开发容器，agent 会话仅 dev 阶段。"
+    description = "停止特定 project_id 的 Agent，不销毁容器。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_agent_stop(
@@ -80,7 +80,7 @@ pub async fn computer_agent_stop(
     let locale = get_locale_from_headers(&headers);
 
     // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；agent 会话
-    //    仅存在于 dev 的 UserAppBuilder 开发容器）
+    //    仅存在于 dev 的 UserappBuilder 开发容器）
     match super::pod_handler::parse_agent_userapp_dispatch(
         request.service_type.as_deref(),
         request.project_id.as_deref(),
@@ -130,7 +130,7 @@ pub async fn computer_agent_stop(
     );
 
     // 2. 查找容器：project 映射优先（computer 与 userApp 开发对话都注册映射，
-    //    UserAppBuilder 开发容器仅存在于映射——user_id/pod_id 的 computer 查找
+    //    UserappBuilder 开发容器仅存在于映射——user_id/pod_id 的 computer 查找
     //    覆盖不了它）；映射 miss 再按 user_id/pod_id 走 computer 容器查找
     let container_info = if let Some(mapped) = state
         .get_project(project_id)
@@ -287,10 +287,10 @@ pub async fn computer_agent_stop(
     }
 }
 
-/// userApp dev 分派：停止 UserAppBuilder 开发容器内 app 会话的 agent。
+/// userApp dev 分派：停止 UserappBuilder 开发容器内 app 会话的 agent。
 ///
 /// 定位 = project 映射优先（builder 容器注册于 `state.projects[app_id]`）；
-/// 映射 miss 时按 UserAppBuilder 只读实时查（操作型接口不 ensure 不自愈）。
+/// 映射 miss 时按 UserappBuilder 只读实时查（操作型接口不 ensure 不自愈）。
 /// 成功/already_stopped 与 computer 路径同构清 `clear_session_durable`。
 async fn stop_userapp_dev(
     state: &AppState,
@@ -306,7 +306,7 @@ async fn stop_userapp_dev(
                 .runtime()
                 .get_container_info_by_identifier(
                     app_id,
-                    &shared_types::ServiceType::UserAppBuilder,
+                    &shared_types::ServiceType::UserappBuilder,
                 )
                 .await
             {

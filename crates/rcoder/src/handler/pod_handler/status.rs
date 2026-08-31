@@ -242,7 +242,7 @@ pub async fn pod_status(
 // userApp 分派实现（app_id/app_stage/service_type=userapp）
 // ============================================================================
 
-/// status 的 userApp dev 分支：查询 UserAppBuilder 开发容器实时状态（只读，
+/// status 的 userApp dev 分支：查询 UserappBuilder 开发容器实时状态（只读，
 /// 不触发探活自愈——那是 ensure/keepalive 的职责）。
 async fn status_userapp_dev(
     state: &Arc<AppState>,
@@ -251,7 +251,7 @@ async fn status_userapp_dev(
     let timestamp = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let existing = state
         .runtime()
-        .get_container_info_by_identifier(&app_id, &ServiceType::UserAppBuilder)
+        .get_container_info_by_identifier(&app_id, &ServiceType::UserappBuilder)
         .await
         .map_err(|e| {
             error!("[POD_STATUS] userapp dev container lookup failed: app_id={app_id}: {e:#}");
@@ -265,7 +265,7 @@ async fn status_userapp_dev(
             container_id: None,
             container_name: None,
             timestamp,
-            message: format!("UserApp dev container not found (app_id={app_id})"),
+            message: format!("Userapp dev container not found (app_id={app_id})"),
         }));
     };
     // ContainerBasicInfo.status 是运行时自由字符串（"Running"/"Starting"/pod phase），
@@ -282,10 +282,10 @@ async fn status_userapp_dev(
         container_name: Some(info.container_name),
         timestamp,
         message: if is_running {
-            "UserApp dev container is running".to_string()
+            "Userapp dev container is running".to_string()
         } else {
             format!(
-                "UserApp dev container exists but status is: {:?}",
+                "Userapp dev container exists but status is: {:?}",
                 info.status
             )
         },
@@ -311,7 +311,7 @@ async fn status_userapp_prod(
                 container_id: None,
                 container_name: None,
                 timestamp,
-                message: format!("UserApp prod app not found (app_id={app_id})"),
+                message: format!("Userapp prod app not found (app_id={app_id})"),
             }));
         }
         Err(e) => {
@@ -573,7 +573,7 @@ pub async fn pod_vnc_status(
     }
 }
 
-/// vnc-status 的 userApp dev 分支：开发容器（UserAppBuilder）复用 agent-runner
+/// vnc-status 的 userApp dev 分支：开发容器（UserappBuilder）复用 agent-runner
 /// 镜像，VNC 栈（Xvnc 5900 + noVNC 6080）实际在跑（桌面入口
 /// `/userapp/dev/vnc/{app_id}`）——走既有 gRPC 链路真查容器内探针。
 /// 不注册 `vnc_backends`：那是 computer 域 user_id 键空间，userApp VNC 走独立
@@ -585,7 +585,7 @@ async fn vnc_status_userapp_dev(
 ) -> Result<HttpResult<VncStatusResponse>, AppError> {
     let existing = state
         .runtime()
-        .get_container_info_by_identifier(&app_id, &ServiceType::UserAppBuilder)
+        .get_container_info_by_identifier(&app_id, &ServiceType::UserappBuilder)
         .await
         .map_err(|e| {
             error!("[POD_VNC_STATUS] userapp dev container lookup failed: app_id={app_id}: {e:#}");

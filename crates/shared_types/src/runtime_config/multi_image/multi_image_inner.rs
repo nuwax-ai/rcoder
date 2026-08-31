@@ -22,8 +22,8 @@ fn is_compatible_service_key(service_key: &str, service_type: &ServiceType) -> b
             // ComputerAgentRunner 没有旧名称
             false
         }
-        ServiceType::UserApp | ServiceType::UserAppBuilder => {
-            // UserApp / UserAppBuilder 镜像由调用方/image_selector 提供,
+        ServiceType::Userapp | ServiceType::UserappBuilder => {
+            // Userapp / UserappBuilder 镜像由调用方/image_selector 提供,
             // 不走多镜像配置选择,无旧名称兼容
             false
         }
@@ -216,8 +216,8 @@ impl MultiImageConfig {
                 // ComputerAgentRunner 没有旧名称
                 None
             }
-            ServiceType::UserApp | ServiceType::UserAppBuilder => {
-                // UserApp / UserAppBuilder 镜像由调用方/image_selector 提供,不走多镜像配置选择
+            ServiceType::Userapp | ServiceType::UserappBuilder => {
+                // Userapp / UserappBuilder 镜像由调用方/image_selector 提供,不走多镜像配置选择
                 None
             }
         }
@@ -765,11 +765,11 @@ mod tests {
 
         // 验证 user-app-builder 配置(路 B)
         let builder_config = multi_config
-            .get_service_config(&ServiceType::UserAppBuilder)
+            .get_service_config(&ServiceType::UserappBuilder)
             .expect("user-app-builder config not found");
         assert!(builder_config.image.is_some());
         assert!(builder_config.enabled);
-        assert_eq!(builder_config.service_type, ServiceType::UserAppBuilder);
+        assert_eq!(builder_config.service_type, ServiceType::UserappBuilder);
 
         // 验证配置有效
         assert!(multi_config.validate().is_ok());

@@ -1,4 +1,4 @@
-//! UserApp 容器 env 的平台保留变量治理。
+//! Userapp 容器 env 的平台保留变量治理。
 //!
 //! RBD 卷形态下 rcoder 不再读卷上 release.lock.toml 注入运行身份变量
 //! （`RCODER_PINGAP_VERSION/COMMIT/RUNTIME_IMAGE_DIGEST`——锁就在容器内

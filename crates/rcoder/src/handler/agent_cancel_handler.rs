@@ -562,7 +562,7 @@ pub async fn agent_session_cancel(
     tag = "computer",
     operation_id = "computer_agent_session_cancel",
     summary = "取消 Computer Agent 任务",
-    description = "将 Computer Agent 取消请求通过 gRPC 转发到容器内的 agent_runner 服务，支持通过 user_id 或 pod_id 定位用户容器。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserAppBuilder 开发容器，agent 会话仅 dev 阶段。"
+    description = "将 Computer Agent 取消请求通过 gRPC 转发到容器内的 agent_runner 服务，支持通过 user_id 或 pod_id 定位用户容器。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
 )]
 #[instrument(skip(state), fields(user_id = ?request.user_id.as_deref(), project_id = %request.project_id, pod_id = ?request.pod_id.as_deref()))]
 pub async fn computer_agent_session_cancel(
@@ -573,7 +573,7 @@ pub async fn computer_agent_session_cancel(
     let locale = get_locale_from_headers(&headers);
 
     // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；agent 会话
-    //    仅存在于 dev 的 UserAppBuilder）。CancelIdentifier::Project 的定位 =
+    //    仅存在于 dev 的 UserappBuilder）。CancelIdentifier::Project 的定位 =
     //    project 映射优先——正是 builder 容器的注册位置，容器 miss 走幂等成功
     match super::pod_handler::parse_agent_userapp_dispatch(
         request.service_type.as_deref(),

@@ -2,8 +2,8 @@
 //!
 //! **dev/prod 两阶段分派**（`X-App-Stage` header，缺省 dev——同一 app_id 可同时
 //! 存在开发容器与生产 Deployment，必须显式区分）：
-//! - `dev`：UserAppBuilder 开发容器（注册表定位 + 探活自愈，miss 幂等 ensure）
-//! - `prod`：UserApp 生产运行容器（存在性检查 + 唤醒 + 确定性命名定位）
+//! - `dev`：UserappBuilder 开发容器（注册表定位 + 探活自愈，miss 幂等 ensure）
+//! - `prod`：Userapp 生产运行容器（存在性检查 + 唤醒 + 确定性命名定位）
 //!
 //! 三类入口：
 //! - [`forward_userapp`]：`/api/v1/userapp/*` 显式透传（容器懒启动语义分派见
@@ -266,7 +266,7 @@ path 即身份：path `app_id` 定位目标开发容器（幂等 ensure + 探活
         (status = 200, description = "探测结果（HttpResult 信封，data 含类型推断与文件清单）", body = HttpResult<serde_json::Value>),
         (status = 400, description = "app_stage 非 dev / app_id 非法 / 容器侧参数校验失败", body = HttpResult<String>)
     ),
-    tag = "UserApp · dev · 工作区与工具链",
+    tag = "Userapp · dev · 工作区与工具链",
 )]
 pub(crate) async fn flat_dev_projects_detect(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -296,7 +296,7 @@ pub(crate) async fn flat_dev_projects_detect(
         (status = 200, description = "确认结果（HttpResult 信封）", body = HttpResult<serde_json::Value>),
         (status = 400, description = "app_stage 非 dev / app_id 非法 / 容器侧参数校验失败", body = HttpResult<String>)
     ),
-    tag = "UserApp · dev · 工作区与工具链",
+    tag = "Userapp · dev · 工作区与工具链",
 )]
 pub(crate) async fn flat_dev_projects_confirm(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -326,7 +326,7 @@ pub(crate) async fn flat_dev_projects_confirm(
         (status = 200, description = "安装结果（HttpResult 信封）", body = HttpResult<serde_json::Value>),
         (status = 400, description = "app_stage 非 dev / app_id 非法 / 容器侧参数校验失败", body = HttpResult<String>)
     ),
-    tag = "UserApp · dev · 工作区与工具链",
+    tag = "Userapp · dev · 工作区与工具链",
 )]
 pub(crate) async fn flat_dev_install_project(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,

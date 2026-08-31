@@ -1,4 +1,4 @@
-//! UserApp workspace HTTP handlers（独立 `/api/v1/userapp`，workspace 定位统一走 UserApp 开发卷）。
+//! Userapp workspace HTTP handlers（独立 `/api/v1/userapp`，workspace 定位统一走 Userapp 开发卷）。
 //!
 //! 响应格式：JSON 接口统一 `shared_types::HttpResult`（`{code, message, data, tid, success}`）；
 //! SSE（logs/stream）与静态文件（static）为特殊通道，不包 HttpResult。
@@ -40,10 +40,10 @@ use file_server::extract::{AppJson, AppPath, AppQuery};
 
 // ── HttpResult 转换层 ──────────────────────────────────────────────────────────
 
-/// UserApp JSON 接口的统一响应：成功/失败都是 HttpResult shape + 语义 HTTP 状态码。
+/// Userapp JSON 接口的统一响应：成功/失败都是 HttpResult shape + 语义 HTTP 状态码。
 ///
 /// file-server 全局 AppError shape（`{success, code:"UNKNOWN_ERROR", error:{...}}`）服务于
-/// TS 对齐路由不能全局改；UserApp 是 Rust 独有新业务（TS 无此路由），此处将 AppError
+/// TS 对齐路由不能全局改；Userapp 是 Rust 独有新业务（TS 无此路由），此处将 AppError
 /// 映射为 HttpResult 错误（code/message + 4xx/5xx 状态码）。
 pub(crate) enum UserAppReply<T> {
     Ok(T),
@@ -127,7 +127,7 @@ fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
     path = "/build",
     request_body = BuildUserAppBody,
     responses((status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 task_id（轮询/SSE 用）与 artifact_path（受理时即确定：builds/workspace-package-{release_id}.zip，release_id 预生成）+ status=pending。同 app_id 已有活跃任务时在队列排队（per-app 互斥）；全局任务容量满时 4xx 拒绝。后续状态：轮询 GET /tasks/{task_id} 或订阅 GET /tasks/{task_id}/logs/stream（SSE，构建日志行以 log 事件实时推送）。")),
-    tag = "UserApp · dev · 构建任务"
+    tag = "Userapp · dev · 构建任务"
 )]
 pub(crate) async fn build_workspace(
     State(state): State<UserAppState>,
@@ -180,7 +180,7 @@ pub(crate) async fn build_workspace(
 终态快照保留 24h 供回查；不存在/已清理 → 404。
 "#,
     responses((status = 200, body = HttpResult<BuildTaskSnapshot>, description = "任务状态快照（轮询通道，建议 2-3s 间隔）。关键字段：status（pending/running/completed/failed/cancelled——后三者为终态，到终态即可停止轮询）、current_service（正在编译的服务）、release_id/sha256/size_bytes/file_name/artifact_path（completed 时有值：产物摘要）、error（failed 时有值）、seq（事件游标 = 已推送事件数，恰为下一条事件的 seq；从轮询切 SSE 续传时可直接作 from_seq 传，但勿直接作 Last-Event-ID 头——头语义是最后收到事件的 id，比本值小 1，直接用会漏一条事件）。终态快照保留 24h 供回查。")),
-    tag = "UserApp · dev · 构建任务"
+    tag = "Userapp · dev · 构建任务"
 )]
 pub(crate) async fn get_task(
     State(state): State<UserAppState>,
@@ -219,7 +219,7 @@ pub(crate) async fn get_task(
         ),
         (status = 404, description = "Task not found（HttpResult JSON，非 SSE）"),
     ),
-    tag = "UserApp · dev · 构建任务"
+    tag = "Userapp · dev · 构建任务"
 )]
 pub(crate) async fn stream_task_logs(
     State(state): State<UserAppState>,
@@ -300,7 +300,7 @@ pub(crate) async fn stream_task_logs(
         ("task_id" = String, Path, description = "任务ID"),
     ),
     responses((status = 200, body = HttpResult<CancelData>, description = "取消结果。双重取消：软取消（置 flag）+ kill 编译进程组；已到终态的任务返回 already_terminal=true 幂等成功。取消成功后任务流发 cancelled 终态事件（SSE）")),
-    tag = "UserApp · dev · 构建任务"
+    tag = "Userapp · dev · 构建任务"
 )]
 pub(crate) async fn cancel_task(
     State(state): State<UserAppState>,
@@ -358,11 +358,11 @@ pub(crate) async fn cancel_build_task(task: &Arc<UserappBuildTask>) {
     path = "/{app_id}/{app_stage}/projects/detect",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）")
     ),
     request_body = ProjectChainBody,
     responses((status = 200, body = HttpResult<DetectData>, description = "项目探测结果")),
-    tag = "UserApp · dev · 工作区与工具链"
+    tag = "Userapp · dev · 工作区与工具链"
 )]
 pub(crate) async fn detect_project(
     State(state): State<UserAppState>,
@@ -389,11 +389,11 @@ pub(crate) async fn detect_project(
     path = "/{app_id}/{app_stage}/projects/confirm",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）")
     ),
     request_body = ProjectChainBody,
     responses((status = 200, body = HttpResult<ConfirmData>, description = "项目确认结果")),
-    tag = "UserApp · dev · 工作区与工具链"
+    tag = "Userapp · dev · 工作区与工具链"
 )]
 pub(crate) async fn confirm_project(
     State(state): State<UserAppState>,

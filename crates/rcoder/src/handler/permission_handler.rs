@@ -304,7 +304,7 @@ pub async fn agent_notify_resolved(
     tag = "computer",
     operation_id = "computer_notify_resolved",
     summary = "处理 Computer Agent 权限审批结果",
-    description = "将用户权限审批结果转发到 Computer Agent 容器内的 agent_runner 服务。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserAppBuilder 开发容器，agent 会话仅 dev 阶段。"
+    description = "将用户权限审批结果转发到 Computer Agent 容器内的 agent_runner 服务。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
 )]
 pub async fn computer_notify_resolved(
     State(state): State<Arc<AppState>>,
@@ -316,7 +316,7 @@ pub async fn computer_notify_resolved(
     validate_common(&dto)?;
 
     // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；agent 会话
-    //    仅存在于 dev 的 UserAppBuilder）。rcoder_container 的定位 = project 映射
+    //    仅存在于 dev 的 UserappBuilder）。rcoder_container 的定位 = project 映射
     //    优先——与 builder 容器注册同源；此形态下 user_id/pod_id 不再必填
     match super::pod_handler::parse_agent_userapp_dispatch(
         input.service_type.as_deref(),

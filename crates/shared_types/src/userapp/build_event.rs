@@ -1,4 +1,4 @@
-//! UserApp build 进度事件 —— file-server(发送)与 rcoder(接收)共享的类型化 DTO。
+//! Userapp build 进度事件 —— file-server(发送)与 rcoder(接收)共享的类型化 DTO。
 //!
 //! 历史:file-server 定义、rcoder 以字符串键(`event`/`release_id`/`error`)重复解析,
 //! 字段重命名会静默断链。统一到此模块,两端共用同一类型,消除漂移。

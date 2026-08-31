@@ -190,7 +190,7 @@ impl Default for CleanupConfigSettings {
     }
 }
 
-/// UserApp 闲置自动回收 + 流量唤醒配置（配置文件格式，秒为单位）
+/// Userapp 闲置自动回收 + 流量唤醒配置（配置文件格式，秒为单位）
 ///
 /// 默认 `enabled=true`：免费用户 app 闲置超阈值自动 scale0 回收；付费 app 经
 /// `CreateAppRequest.recycle_enabled=false`（注解 `rcoder.io/recycle-enabled=false`）opt-out 永不回收。

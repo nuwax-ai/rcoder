@@ -91,11 +91,11 @@ pub async fn chat(
         }
         // userApp 开发对话: workspace = {USERAPP_WORKSPACE_ROOT}/{app_id}（rcoder 转发
         // chat 时 project_id=app_id, ACP agent 直接在开发卷 workspace 上工作）
-        shared_types::ServiceType::UserAppBuilder => {
+        shared_types::ServiceType::UserappBuilder => {
             std::path::PathBuf::from(shared_types::paths::USERAPP_WORKSPACE_ROOT).join(&work_dir_id)
         }
-        // UserApp 不由 agent_runner 托管；WebAgentRunner 走 project_workspace 路径
-        shared_types::ServiceType::WebAgentRunner | shared_types::ServiceType::UserApp => {
+        // Userapp 不由 agent_runner 托管；WebAgentRunner 走 project_workspace 路径
+        shared_types::ServiceType::WebAgentRunner | shared_types::ServiceType::Userapp => {
             let tenant_id = std::env::var("TENANT_ID").ok();
             let space_id = std::env::var("SPACE_ID").ok();
             match (tenant_id, space_id) {

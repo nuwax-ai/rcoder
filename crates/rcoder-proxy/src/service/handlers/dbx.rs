@@ -1,9 +1,9 @@
 //! DBX 数据库 Web GUI 两阶段代理（`/userapp/{dev,prod}/dbx/{user_id}/{app_id}` 工具族）。
 //!
 //! dbx-web（60+ 数据库 GUI，supervisor 恒起 `DBX_PORT`=4224）的开发/生产双入口：
-//! - **dev**：UserAppBuilder 开发容器（agent-runner 镜像）——注册表
-//!   `find_by_project_id(app_id, UserAppBuilder)`，未建 workspace → 404（同 dev 终端族）；
-//! - **prod**：UserApp 运行容器（app-runtime 镜像）——`find_app_runtime_addr`
+//! - **dev**：UserappBuilder 开发容器（agent-runner 镜像）——注册表
+//!   `find_by_project_id(app_id, UserappBuilder)`，未建 workspace → 404（同 dev 终端族）；
+//! - **prod**：Userapp 运行容器（app-runtime 镜像）——`find_app_runtime_addr`
 //!   确定性命名构造，未部署/停止 → 连接失败 502（同 runtime 终端族）。
 //!
 //! 代理剥前缀直连 root 模式 dbx（同 pgweb）：dbx 前端 `webPath.ts` 从
@@ -71,7 +71,7 @@ pub async fn handle_dev_dbx_request(
     dbx_rewrite_request("DEV_DBX", upstream_request, original_uri, params, ctx).await
 }
 
-/// dev dbx 上游：注册表定位 UserAppBuilder 开发容器 + 直连 DBX_PORT=4224。
+/// dev dbx 上游：注册表定位 UserappBuilder 开发容器 + 直连 DBX_PORT=4224。
 pub async fn handle_dev_dbx_upstream(
     ctx: &mut TrackingCtx,
     params: Params<'_, '_>,
@@ -107,7 +107,7 @@ pub async fn handle_prod_dbx_request(
     dbx_rewrite_request("PROD_DBX", upstream_request, original_uri, params, ctx).await
 }
 
-/// prod dbx 上游：确定性命名定位 UserApp 运行容器 + 直连 DBX_PORT=4224。
+/// prod dbx 上游：确定性命名定位 Userapp 运行容器 + 直连 DBX_PORT=4224。
 pub async fn handle_prod_dbx_upstream(
     ctx: &mut TrackingCtx,
     params: Params<'_, '_>,

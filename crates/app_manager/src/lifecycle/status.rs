@@ -1,4 +1,4 @@
-//! UserApp 运行时状态 + 访问地址构建（从 service.rs 拆出，extension-impl）。
+//! Userapp 运行时状态 + 访问地址构建（从 service.rs 拆出，extension-impl）。
 //!
 //! fetch_runtime_status* / ensure_app_exists / build_runtime_info / build_access_info。
 
@@ -191,18 +191,18 @@ impl AppService {
                 // 容器名统一走 DockerUtils::generate_container_name（与创建路径一致）；
                 // app_id 已在 API 层校验，理论上不会走到降级分支
                 let name = docker_manager::utils::DockerUtils::generate_container_name(
-                    ServiceType::UserApp.container_prefix(),
+                    ServiceType::Userapp.container_prefix(),
                     app_id,
                 )
                 .unwrap_or_else(|e| {
                     tracing::warn!("[APP] invalid app_id for container name, fallback: {}", e);
-                    format!("{}-{}", ServiceType::UserApp.container_prefix(), app_id)
+                    format!("{}-{}", ServiceType::Userapp.container_prefix(), app_id)
                 });
                 (name.clone(), name)
             }
             AppAccessMode::Kubernetes => {
                 let cluster_domain = shared_types::get_k8s_cluster_domain();
-                let svc = format!("{}-{}-svc", ServiceType::UserApp.container_prefix(), app_id);
+                let svc = format!("{}-{}-svc", ServiceType::Userapp.container_prefix(), app_id);
                 (
                     format!("{}.{}.svc.{}", svc, self.config.namespace, cluster_domain),
                     format!("{}.{}", svc, self.config.namespace),

@@ -98,7 +98,7 @@ impl AppService {
             }),
             tenant_id: None,
             space_id: None,
-            // 发布编排创建的 UserApp 默认参与闲置回收（= 免费用户语义）；如需付费常驻由调用方另行 update。
+            // 发布编排创建的 Userapp 默认参与闲置回收（= 免费用户语义）；如需付费常驻由调用方另行 update。
             recycle_enabled: None,
             idle_timeout_seconds: None,
         };

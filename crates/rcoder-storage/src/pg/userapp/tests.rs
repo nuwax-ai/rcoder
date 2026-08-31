@@ -1,4 +1,4 @@
-//! UserApp PG 集成测试(userapp_metadata / activity 影子)。
+//! Userapp PG 集成测试(userapp_metadata / activity 影子)。
 //!
 //! 运行条件与主测试套一致:`RCODER_PG_TEST_DSN` 指向可破坏的测试库,
 //! 未设置时静默跳过。公共 helper(test_dsn/wait_for/uuid_suffix)复用

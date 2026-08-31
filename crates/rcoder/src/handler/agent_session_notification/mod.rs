@@ -332,7 +332,7 @@ pub async fn computer_agent_progress_notification(
         "[SSE_PROXY] Received Computer Agent SSE connection request: session_id={:?}",
         params.session_id
     );
-    // 路由定制：computer 入口默认 ComputerAgentRunner 语义；但 UserAppBuilder
+    // 路由定制：computer 入口默认 ComputerAgentRunner 语义；但 UserappBuilder
     // 项目（userapp dev chat 的 SSE 经 /devcomputer 委托本入口）按 project 实际
     // service_type 分发——容器定位 identifier 取 project_id（app_id），否则断流
     // 诊断会查 user 的 computer 容器而非 app 开发容器（与通用入口对齐）

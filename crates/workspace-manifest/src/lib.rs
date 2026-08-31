@@ -1,4 +1,4 @@
-//! UserApp Manifest v1 shared contract.
+//! Userapp Manifest v1 shared contract.
 //!
 //! Build-time (`file-server`) and runtime (`app-cli`) both consume this crate。
 //!

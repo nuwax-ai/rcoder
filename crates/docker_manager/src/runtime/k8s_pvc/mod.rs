@@ -16,11 +16,11 @@ mod lifecycle;
 /// （真实上限是 CephFS 池容量）——此 50Gi 仅是 PVC 对象 spec 必填的惯性
 /// 兜底值，作为「接口入参 resource_limits.storage_size」与「config.yml
 /// resource_limits.storage_size」均未指定时的最终兜底。磁盘空间限制语义
-/// 仅存在于 UserApp 域独立 RBD 卷（见 [`DEFAULT_USERAPP_PVC_STORAGE_SIZE`]）。
+/// 仅存在于 Userapp 域独立 RBD 卷（见 [`DEFAULT_USERAPP_PVC_STORAGE_SIZE`]）。
 #[cfg(feature = "kubernetes")]
 const DEFAULT_PVC_STORAGE_SIZE: &str = "50Gi";
 
-/// UserApp 域（生产运行卷 + builder 开发卷）的默认容量兜底——per-app RBD
+/// Userapp 域（生产运行卷 + builder 开发卷）的默认容量兜底——per-app RBD
 /// 块设备独占，是唯一有真实磁盘空间限制语义的卷型（RBD image size 即硬
 /// 上限）；仅当 create 请求未带 `resources.storage` / builder ensure 未
 /// 显式传 size 时生效（已存在 PVC 复用旧值，不自动扩容）。
@@ -46,9 +46,9 @@ use super::kubernetes_runtime::KubernetesRuntime;
 /// - PVC 创建 (`ensure_workspace_pvc`)
 /// - PVC 绑定等待 (`wait_for_pvc_bound`)
 /// - subvolume 路径解析 (`resolve_subvolume_path`, 阶段2 rcoder 挂根聚合)
-/// - UserApp PVC 容量调整 (`resize_app_pvc`, 只扩不缩)
+/// - Userapp PVC 容量调整 (`resize_app_pvc`, 只扩不缩)
 ///
-/// - PVC 销毁 (`destroy_workspace_pvc`, 仅 UserApp 经 REST `storage/destroy` 显式调用)
+/// - PVC 销毁 (`destroy_workspace_pvc`, 仅 Userapp 经 REST `storage/destroy` 显式调用)
 ///
 /// PVC 销毁策略: 默认保留 (clear 清内容留 PVC, 可恢复); 仅 `destroy_workspace_pvc`
 /// 显式删 PVC + subvolume (释放配额, 不可逆)。agent PVC 仍永不删。
@@ -78,14 +78,14 @@ pub(crate) trait K8sPvcOps {
         storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()>;
 
-    /// UserApp 生产运行容器历史第二块数据卷（`-data` 后缀）的卷名。
+    /// Userapp 生产运行容器历史第二块数据卷（`-data` 后缀）的卷名。
     ///
     /// 格式：`{container_prefix}-{sanitized_id}-data`。**已随单卷四 subPath 化退役**
     /// （prod 卷内 `{app_id}/ data/ logs/ agent-store/` 四目录平级，挂载在
     /// workspace 卷上）——仅 destroy_app_pvc 兜底回收存量旧 PVC 时使用。
     fn app_data_pvc_name(&self, app_id: &str) -> ContainerRuntimeResult<String>;
 
-    /// 销毁 UserApp per-app 数据卷（app purge 时随 `-workspace` 卷一并回收）。
+    /// 销毁 Userapp per-app 数据卷（app purge 时随 `-workspace` 卷一并回收）。
     /// 幂等：PVC 不存在返回 Ok。
     async fn destroy_app_data_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()>;
 
@@ -118,7 +118,7 @@ pub(crate) trait K8sPvcOps {
         pvc_name: &str,
     ) -> ContainerRuntimeResult<String>;
 
-    /// 调整 UserApp per-app 运行卷容量（`WorkspaceRuntime::resize_app_storage` 的 K8s 内核）。
+    /// 调整 Userapp per-app 运行卷容量（`WorkspaceRuntime::resize_app_storage` 的 K8s 内核）。
     ///
     /// 读 PVC 当前 `requests.storage` → quantity 归一比较：等量 no-op；更大 merge
     /// patch 扩容（external-resizer 异步生效，在线扩文件系统不重建 Pod）；更小
@@ -132,7 +132,7 @@ pub(crate) trait K8sPvcOps {
 
     /// 销毁 workspace PVC + CephFS subvolume (释放配额, 不可逆)。
     ///
-    /// 仅 UserApp 经 REST `POST /apps/{id}/storage/destroy` 显式调用 (agent PVC 永不删)。
+    /// 仅 Userapp 经 REST `POST /apps/{id}/storage/destroy` 显式调用 (agent PVC 永不删)。
     /// 调用方须保证 app 已 delete (PVC 无 Pod 引用 → pvc-protection finalizer 正常移除,
     /// 不会卡 Terminating)。幂等: PVC 不存在返回 Ok。
     /// 白名单: pvc_name 由 `workspace_pvc_name` 生成, 只删 `{prefix}-{id}-workspace`,
@@ -144,11 +144,11 @@ pub(crate) trait K8sPvcOps {
     ) -> ContainerRuntimeResult<()>;
 }
 
-/// UserApp 域（生产运行卷 + builder 开发卷）的 storage class（env
+/// Userapp 域（生产运行卷 + builder 开发卷）的 storage class（env
 /// `RCODER_USERAPP_STORAGE_CLASS` 显式覆盖，兼容回退旧名
 /// `RCODER_USERAPP_BUILDER_STORAGE_CLASS`；缺省 None = PVC 不指定
 /// storageClassName → 集群 default StorageClass，如 229/19 的 `ceph-rbd`
-/// ——Ceph RBD 块存储）。UserApp 两类卷均 RWO 单容器独占：rcoder 不挂卷
+/// ——Ceph RBD 块存储）。Userapp 两类卷均 RWO 单容器独占：rcoder 不挂卷
 /// （零挂载访问，文件操作经容器内 file-server），编译构建/运行数据走块设备，
 /// 不经 CephFS 元数据面。
 #[cfg(feature = "kubernetes")]
@@ -190,11 +190,11 @@ impl K8sPvcOps for KubernetesRuntime {
         storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
-        // UserApp 域（生产运行卷 + builder 开发卷）: RWO + RBD（env 可覆盖）,
+        // Userapp 域（生产运行卷 + builder 开发卷）: RWO + RBD（env 可覆盖）,
         // 兜底容量 100Gi; 其余 service_type 用全局 access_mode/storage_class
         // 与 50Gi 兜底。
         let (access_mode, storage_class_name, default_size) = match service_type {
-            ServiceType::UserApp | ServiceType::UserAppBuilder => (
+            ServiceType::Userapp | ServiceType::UserappBuilder => (
                 "ReadWriteOnce".to_string(),
                 userapp_storage_class(),
                 DEFAULT_USERAPP_PVC_STORAGE_SIZE,
@@ -217,7 +217,7 @@ impl K8sPvcOps for KubernetesRuntime {
 
     fn app_data_pvc_name(&self, app_id: &str) -> ContainerRuntimeResult<String> {
         let prefix = KubernetesRuntime::sanitize_k8s_name_part(
-            &self.service_container_prefix(&ServiceType::UserApp)?,
+            &self.service_container_prefix(&ServiceType::Userapp)?,
         );
         let sanitized = app_id.replace('_', "-");
         Ok(format!("{}-{}-data", prefix, sanitized))
@@ -324,7 +324,7 @@ impl K8sPvcOps for KubernetesRuntime {
         app_id: &str,
         new_size: &str,
     ) -> ContainerRuntimeResult<StorageResizeOutcome> {
-        let pvc_name = self.workspace_pvc_name(app_id, &ServiceType::UserApp)?;
+        let pvc_name = self.workspace_pvc_name(app_id, &ServiceType::Userapp)?;
         let pvc = self.pvcs().get(&pvc_name).await.map_err(|e| match e {
             kube::Error::Api(ae) if ae.code == 404 => ContainerRuntimeError::ContainerNotFound(
                 format!("PVC '{pvc_name}' for app {app_id} not found"),
@@ -404,8 +404,8 @@ impl K8sPvcOps for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
-        // UserAppBuilder 现为 per-app RWO PVC（app 删除 purge 时随容器一并回收,
-        // 调用方为 UserApp 域 REST 流程, 符合"agent PVC 永不删"约束的例外面）。
+        // UserappBuilder 现为 per-app RWO PVC（app 删除 purge 时随容器一并回收,
+        // 调用方为 Userapp 域 REST 流程, 符合"agent PVC 永不删"约束的例外面）。
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
         self.destroy_pvc_core(&pvc_name).await
     }

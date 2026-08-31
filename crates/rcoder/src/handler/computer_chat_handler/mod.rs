@@ -135,7 +135,7 @@ async fn run_computer_chat_flow(
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
 
-    // userApp 开发对话分支：service_type=Userapp → 该 app 的 UserAppBuilder 开发容器
+    // userApp 开发对话分支：service_type=Userapp → 该 app 的 UserappBuilder 开发容器
     // （ACP agent 直接在开发卷 workspace 工作，代码生成直接落卷）。
     // 枚举穷尽：未来加业务域变体时此处编译期提醒补分支。
     if request.service_type == Some(shared_types::ChatServiceScope::Userapp) {
@@ -213,15 +213,15 @@ async fn run_computer_chat_flow(
     Ok(result)
 }
 
-/// userApp 开发对话流程：project_id 必填=app_id，容器=该 app 的 UserAppBuilder
+/// userApp 开发对话流程：project_id 必填=app_id，容器=该 app 的 UserappBuilder
 /// 开发容器（per-app），workspace={USERAPP_WORKSPACE_DIR}/{app_id}（容器内）。
 ///
 /// 与普通 computer 链路的差异：
 /// - 容器 ensure 走 `ensure_userapp_builder`（幂等，注册 state.projects 防孤立清理）
 /// - workspace 目录由容器内 file-server `ensure-workspace` 幂等创建（rcoder 无共享卷）
 /// - 跳过 VNC 注册（开发容器无桌面代理需求；工具族/流量族 stage 入口已覆盖）
-/// - 跳过 agent 自动安装（UserAppBuilder 安装策略 None）
-/// - gRPC service_type=UserAppBuilder → agent_runner work_dir 命中开发卷分支
+/// - 跳过 agent 自动安装（UserappBuilder 安装策略 None）
+/// - gRPC service_type=UserappBuilder → agent_runner work_dir 命中开发卷分支
 async fn run_userapp_dev_chat_flow(
     state: Arc<AppState>,
     locale: &'static str,
@@ -302,7 +302,7 @@ async fn run_userapp_dev_chat_flow(
     session::probe_agent_status(&state, &container_info, &project_id, locale).await;
     let request_for_forward = session::resolve_forward_request(&state, &request, &project_id);
 
-    // 5. gRPC 转发（service_type=UserAppBuilder → agent_runner 开发卷 work_dir）
+    // 5. gRPC 转发（service_type=UserappBuilder → agent_runner 开发卷 work_dir）
     let forward_params = forward::ComputerForwardParams {
         request: &request_for_forward,
         project_id: &project_id,
@@ -314,12 +314,12 @@ async fn run_userapp_dev_chat_flow(
         namespace: &state.config.app_manager.namespace,
         cluster_domain: &state.cluster_domain,
         runtime: state.runtime(),
-        service_type: shared_types::ServiceType::UserAppBuilder,
+        service_type: shared_types::ServiceType::UserappBuilder,
         diagnostic_identifier: project_id.clone(),
     };
     let result = forward::forward_computer_request_to_container(forward_params).await;
 
-    // 6. 会话映射更新（service_type=UserAppBuilder；session→project 映射供 SSE/会话族接口路由）
+    // 6. 会话映射更新（service_type=UserappBuilder；session→project 映射供 SSE/会话族接口路由）
     session::update_session_mappings_after_response(
         &state,
         &result,
@@ -327,7 +327,7 @@ async fn run_userapp_dev_chat_flow(
         &project_id,
         &container_info,
         &request,
-        &shared_types::ServiceType::UserAppBuilder,
+        &shared_types::ServiceType::UserappBuilder,
     )
     .await;
 

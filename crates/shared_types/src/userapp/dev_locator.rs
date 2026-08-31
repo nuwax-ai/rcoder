@@ -1,8 +1,8 @@
-//! UserApp 开发容器定位契约（跨 crate，与 [`super::dev_cleanup`] 同居）。
+//! Userapp 开发容器定位契约（跨 crate，与 [`super::dev_cleanup`] 同居）。
 
 use async_trait::async_trait;
 
-/// UserAppBuilder 开发容器定位（幂等 ensure + 地址解析 + 存在性探测）。
+/// UserappBuilder 开发容器定位（幂等 ensure + 地址解析 + 存在性探测）。
 ///
 /// app_manager 的 runtime 视图（`UserAppRuntime`）经 ISP 分层不含 agent 容器
 /// 能力，但文件/存储接口的 `env=dev` 分支需要定位开发容器（转发其 file-server
@@ -30,7 +30,7 @@ pub trait UserappDevLocator: Send + Sync {
     async fn dev_container_alive(&self, app_id: &str) -> Result<bool, String>;
 }
 
-/// UserAppBuilder 开发容器懒启动回调（rcoder-proxy 终端代理消费）。
+/// UserappBuilder 开发容器懒启动回调（rcoder-proxy 终端代理消费）。
 ///
 /// 终端代理（ttyd/vnc/audio/ime/dbx 的 dev 族）是使用语义：开发容器不在时
 /// 自动 ensure 创建（owner 走 metadata 链——浏览器终端 URL 无入参携带

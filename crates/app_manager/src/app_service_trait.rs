@@ -80,7 +80,7 @@ pub trait AppServiceTrait: Send + Sync {
         confirm: &str,
     ) -> AppResult<()>;
 
-    /// PG 凭据对齐（UserApp 运行容器内）：验证传入密码，不一致则重置
+    /// PG 凭据对齐（Userapp 运行容器内）：验证传入密码，不一致则重置
     /// （流程单头 `shared_types::align_pg_credentials`，exec 通道实现）
     async fn align_db_credentials(
         &self,

@@ -1,6 +1,6 @@
 //! 主服务域 PG 集成测试（ProjectStore write-behind / 加载 / 跨副本同步 / 选主 / durable）。
 //!
-//! 共享 helper 见 `crate::pg::test_support`；UserApp 域测试在 `crate::pg::userapp::tests`。
+//! 共享 helper 见 `crate::pg::test_support`；Userapp 域测试在 `crate::pg::userapp::tests`。
 
 #![cfg(all(test, feature = "pg"))]
 

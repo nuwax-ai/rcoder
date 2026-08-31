@@ -363,11 +363,11 @@ impl ContainerStatusChecker {
                     false
                 }
             }
-            // UserAppBuilder 是 agent-runner(复用 dev-rcoder-agent-runner,有 gRPC),
+            // UserappBuilder 是 agent-runner(复用 dev-rcoder-agent-runner,有 gRPC),
             // 复用 WebAgentRunner 的 project_id 查找路径
             shared_types::ServiceType::WebAgentRunner
-            | shared_types::ServiceType::UserAppBuilder => {
-                // RCoder / UserAppBuilder 模式：使用 project_id(app_id)查找容器
+            | shared_types::ServiceType::UserappBuilder => {
+                // RCoder / UserappBuilder 模式：使用 project_id(app_id)查找容器
                 match runtime
                     .find_container(container_info.project_id(), &service_type)
                     .await
@@ -380,8 +380,8 @@ impl ContainerStatusChecker {
                     }
                 }
             }
-            // UserApp 不参与 agent 健康检查（由 app_manager 独立管理），视为不存在
-            shared_types::ServiceType::UserApp => false,
+            // Userapp 不参与 agent 健康检查（由 app_manager 独立管理），视为不存在
+            shared_types::ServiceType::Userapp => false,
         };
 
         if exists {

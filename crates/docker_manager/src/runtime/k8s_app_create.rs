@@ -1,4 +1,4 @@
-//! UserApp Deployment 创建路径(从 k8s_deployment.rs 拆出)。
+//! Userapp Deployment 创建路径(从 k8s_deployment.rs 拆出)。
 //!
 //! apply_app_configmap/secret/service/httproute/nodeport/deployment + build_app_deployment +
 //! create_app_resources 编排。
@@ -108,7 +108,7 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<Deployment> {
         let image = params.image_override.clone().ok_or_else(|| {
             ContainerRuntimeError::ConfigurationError(
-                "UserApp create_deployment requires image_override".to_string(),
+                "Userapp create_deployment requires image_override".to_string(),
             )
         })?;
 
@@ -195,7 +195,7 @@ impl KubernetesRuntime {
             },
         ]);
 
-        // ── UserApp prod 单卷四 subPath 压平挂载（与 dev builder 完全同构）──────
+        // ── Userapp prod 单卷四 subPath 压平挂载（与 dev builder 完全同构）──────
         // per-app RWO RBD PVC 一块（卷内 `{app_id}/ + data/ + logs/ + agent-store/`
         // 四目录平级，subPath 目录由 kubelet 挂载时自动创建），四 subPath 挂到
         // 容器内 /home/user/{app_id}（workspace=发布代码根）、/home/user/data、
@@ -203,7 +203,7 @@ impl KubernetesRuntime {
         // [`shared_types::paths::userapp_prod_subpaths`] 一一配对。
         // rcoder **不挂载**该卷（RBD 无 subvolumePath，挂根聚合天然不可达）——
         // 部署经 env 注入 APP_DEPLOY_URL 由 app-cli 启动段下载解压，文件操作经
-        // 容器内 file-server-proxy (:60000)。UserApp 代码路径独立于主线
+        // 容器内 file-server-proxy (:60000)。Userapp 代码路径独立于主线
         // (Web/Computer 走 create_container 共享 PVC)。RWO 单 pod 独占
         // (Deployment replicas=1)；pod 重建需等 volume detach→attach（秒级，
         // K8s 自动处理）。
@@ -253,7 +253,7 @@ impl KubernetesRuntime {
             volumes,
             containers: vec![container],
             restart_policy: Some("Always".to_string()),
-            // topologySpreadConstraints：所有 UserApp 共享 label app.kubernetes.io/name=user-app
+            // topologySpreadConstraints：所有 Userapp 共享 label app.kubernetes.io/name=user-app
             // （build_app_labels 写入），按它分组可把【N 个不同 app 的 Deployment】跨节点摊开
             // （约束按 label 统计，跨 Deployment 生效）。单 Deployment replicas=1，组内无均衡
             // 意义，价值全在跨 app。ScheduleAnyway 绝不阻断用户 app 创建；存量 Deployment
@@ -327,7 +327,7 @@ impl KubernetesRuntime {
         Ok(())
     }
 
-    /// 创建 UserApp 的全部 K8s 资源（SSA apply，幂等 create-or-update）：
+    /// 创建 Userapp 的全部 K8s 资源（SSA apply，幂等 create-or-update）：
     /// ConfigMap/Secret/Service/Deployment/HTTPRoute/NodePort。
     pub async fn create_app_resources(
         &self,
@@ -339,14 +339,14 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<Vec<AppPortStatus>> {
         let tenant_id = params.tenant_id.as_deref();
         let space_id = params.space_id.as_deref();
-        // 0. workspace PVC: UserApp (K8s 永远 per-app) per-app RWO RBD 单卷——
+        // 0. workspace PVC: Userapp (K8s 永远 per-app) per-app RWO RBD 单卷——
         //    卷内四目录（{app_id}/ data/ logs/ agent-store/）经 subPath 挂载，
         //    subPath 目录由 kubelet 自动创建，故只 ensure 单块 PVC
         //    （历史第二块 `-data` PVC 已随单卷化退役；destroy 侧兜底回收存量）。
         //    销毁走 destroy_app_pvc。
         self.ensure_workspace_pvc(
             app_id,
-            &ServiceType::UserApp,
+            &ServiceType::Userapp,
             params.storage_size.as_deref(),
         )
         .await?;
@@ -418,7 +418,7 @@ impl KubernetesRuntime {
 
 /// prod 单卷四 subPath 压平挂载映射（卷内子目录 → 容器内路径），段序与
 /// [`shared_types::paths::userapp_prod_subpaths`] 一一配对——与 dev builder
-/// （k8s_agent_create UserAppBuilder 分支）完全同构；subPath 目录由 kubelet
+/// （k8s_agent_create UserappBuilder 分支）完全同构；subPath 目录由 kubelet
 /// 挂载时自动创建。
 pub(crate) fn app_flat_volume_mounts(app_id: &str) -> [(String, String); 4] {
     [

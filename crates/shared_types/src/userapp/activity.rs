@@ -1,7 +1,7 @@
-//! UserApp 活动追踪与流量唤醒接口（trait）
+//! Userapp 活动追踪与流量唤醒接口（trait）
 //!
 //! 支撑「闲置自动回收 + 流量唤醒」特性：
-//! - [`AppAccessTracker`]（同步）由 Pingora 代理热路径调用，记录每个 UserApp 的最近 HTTP 访问时间，
+//! - [`AppAccessTracker`]（同步）由 Pingora 代理热路径调用，记录每个 Userapp 的最近 HTTP 访问时间，
 //!   作为闲置回收的唯一信号源。镜像 [`crate::ContainerLookup`] 的同步 trait 风格（DashMap 读写，无 runtime 依赖）。
 //! - [`AppWakeControl`]（异步）由 Pingora 在请求过滤阶段调用：当目标 app 处于 stopped（scale0）时，
 //!   hold-and-wait 拉起（scale→1）并轮询 Ready，超时返回 [`WakeOutcome::Timeout`]。
@@ -10,7 +10,7 @@
 //! 其余同 crate 调用者（AppService / 回收扫描器）持具体 `AppActivityRegistry` 类型，直接用其 pub 方法
 //! （`last_accessed_at` / `mark_running` / `mark_stopped` / `is_waking` / `seed_accessed`）。
 
-/// UserApp HTTP 访问追踪（同步，无 runtime 依赖）
+/// Userapp HTTP 访问追踪（同步，无 runtime 依赖）
 ///
 /// 由 Pingora `request_filter` 对 `/proxy/userapp/prod/{user_id}/{app_id}/...` 路由调用。
 /// `touch` 内部应做节流（实现自行决定粒度），避免高 QPS 下的 DashMap 锁竞争。
@@ -32,7 +32,7 @@ pub enum WakeOutcome {
     Failed(String),
 }
 
-/// UserApp 流量唤醒控制（异步）
+/// Userapp 流量唤醒控制（异步）
 ///
 /// 由 Pingora `request_filter` 在检测到目标 app stopped 时调用 [`AppWakeControl::ensure_running`]，
 /// hold-and-wait 拉起容器（上限由实现配置，默认 60s）。并发请求由实现内部合流为一次 scale-up。
@@ -49,10 +49,10 @@ pub trait AppWakeControl: Send + Sync {
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome;
 }
 
-/// UserApp 活动状态的持久化行（AppActivityRegistry ↔ 存储后端的数据载体）
+/// Userapp 活动状态的持久化行（AppActivityRegistry ↔ 存储后端的数据载体）
 #[derive(Debug, Clone)]
 pub struct ActivityRow {
-    /// UserApp 应用 ID
+    /// Userapp 应用 ID
     pub app_id: String,
     /// 最近真实 HTTP 访问时间（wall-clock；None=从未访问）
     pub last_accessed: Option<chrono::DateTime<chrono::Utc>>,

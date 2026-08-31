@@ -46,7 +46,7 @@ pub struct LogsAccessParams {
     post,
     path = "/api/v1/userapp/{app_id}/{app_stage}/logs/sources/query",
     params(("app_id" = String, Path, description = "应用 ID"),
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）"),
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）；`prod`=运行容器（Userapp）"),
         LogsAccessParams
     ),
     description = r#"
@@ -72,7 +72,7 @@ pub struct LogsAccessParams {
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
         (status = 500, description = "连接 app-cli / 响应读取失败", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 日志"
+    tag = "Userapp · 双态 · 日志"
 )]
 pub async fn query_app_log_sources(
     State(state): State<Arc<AppManagerState>>,
@@ -98,7 +98,7 @@ pub async fn query_app_log_sources(
     post,
     path = "/api/v1/userapp/{app_id}/{app_stage}/logs/query",
     params(("app_id" = String, Path, description = "应用 ID"),
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）"),
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）；`prod`=运行容器（Userapp）"),
         LogsAccessParams
     ),
     description = r#"
@@ -123,7 +123,7 @@ sources/query。
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
         (status = 500, description = "连接 app-cli / 响应读取失败", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 日志"
+    tag = "Userapp · 双态 · 日志"
 )]
 pub async fn query_app_logs(
     State(state): State<Arc<AppManagerState>>,
@@ -149,7 +149,7 @@ pub async fn query_app_logs(
     post,
     path = "/api/v1/userapp/{app_id}/{app_stage}/logs/stream",
     params(("app_id" = String, Path, description = "应用 ID"),
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）"),
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）；`prod`=运行容器（Userapp）"),
         LogsAccessParams
     ),
     description = r#"
@@ -174,7 +174,7 @@ SSE 实时日志流（500ms 轮询内核）：事件清单与断线续传协议�
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
         (status = 500, description = "连接 app-cli / 建流失败", body = HttpResult<String>)
     ),
-    tag = "UserApp · 双态 · 日志"
+    tag = "Userapp · 双态 · 日志"
 )]
 pub async fn stream_app_logs_v1(
     State(state): State<Arc<AppManagerState>>,
