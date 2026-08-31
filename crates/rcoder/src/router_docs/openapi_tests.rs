@@ -790,6 +790,7 @@ fn agent_endpoints_userapp_dispatch_fields_are_documented() {
                 | "ComputerAgentStopRequest"
                 | "ComputerAgentCancelRequest"
                 | "CacheCleanRequest"
+                | "ComputerChatRequest"
         ) {
             continue;
         }
@@ -797,6 +798,11 @@ fn agent_endpoints_userapp_dispatch_fields_are_documented() {
             continue;
         };
         for field in ["service_type", "app_stage"] {
+            // ComputerChatRequest 的 service_type 为 ChatServiceScope 枚举
+            // （doc 讲路由语义），仅校验其 app_stage
+            if name == "ComputerChatRequest" && field == "service_type" {
+                continue;
+            }
             let Some(value) = obj.properties.get(field) else {
                 panic!("schema {name} 缺少 userApp 分派字段 {field}");
             };
@@ -819,5 +825,5 @@ fn agent_endpoints_userapp_dispatch_fields_are_documented() {
     }
     // 四 schema × 两字段 = 8（CacheCleanRequest 的分派载体是 project_id 字段，
     // 其描述同样被上面断言覆盖到的 service_type/app_stage 钉住语义）
-    assert!(checked >= 8, "分派字段覆盖数异常偏少: {checked}");
+    assert!(checked >= 9, "分派字段覆盖数异常偏少: {checked}");
 }

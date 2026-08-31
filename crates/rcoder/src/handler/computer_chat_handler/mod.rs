@@ -228,6 +228,14 @@ async fn run_userapp_dev_chat_flow(
     request: ComputerChatRequest,
     is_devcomputer: bool,
 ) -> Result<HttpResult<ChatResponse>, ChatFlowExit> {
+    // 0. app_stage 校验（缺省 dev；prod 拒绝——形态对齐 agent 族五接口，
+    //    共用 validate_agent_dev_stage 单一事实源）
+    if let Err(e) = super::pod_handler::validate_agent_dev_stage(request.app_stage.as_deref()) {
+        return Err(ChatFlowExit::response(
+            super::pod_handler::invalid_app_target_response(locale, &e),
+        ));
+    }
+
     // 1. 校验：user_id 必填 + project_id 必填（=app_id，不自动生成——app 语义明确）
     if request.user_id.trim().is_empty() {
         return Err(ChatFlowExit::response(HttpResult::error_with_locale(

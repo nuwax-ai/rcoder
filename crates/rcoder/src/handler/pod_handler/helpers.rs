@@ -382,12 +382,20 @@ pub(crate) fn parse_agent_userapp_dispatch(
         );
     };
     shared_types::validate_identifier(app_id, "app_id").map_err(|e| e.to_string())?;
+    validate_agent_dev_stage(app_stage)?;
+    Ok(Some(app_id.to_owned()))
+}
+
+/// agent 族五接口与 `/computer/chat` 共用的 dev-only stage 校验：缺省 dev；
+/// prod / 非法值报错——agent 会话仅存在于 UserAppBuilder 开发容器（prod
+/// 运行容器无 agent 会话）。
+pub(crate) fn validate_agent_dev_stage(app_stage: Option<&str>) -> Result<(), String> {
     let stage_raw = app_stage
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("dev");
     match shared_types::UserappStage::parse(stage_raw) {
-        Some(shared_types::UserappStage::Dev) => Ok(Some(app_id.to_owned())),
+        Some(shared_types::UserappStage::Dev) => Ok(()),
         Some(shared_types::UserappStage::Prod) => Err(
             "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 \
              (UserAppBuilder 开发容器)"

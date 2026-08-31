@@ -48,6 +48,13 @@ pub struct ComputerChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_type: Option<ChatServiceScope>,
 
+    /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
+    /// userApp 开发对话仅支持 dev：agent 会话只存在于 UserAppBuilder 开发
+    /// 容器，prod 运行容器无 agent 会话（形态对齐 agent 族五接口）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
+
     /// 用户输入的 prompt
     #[schema(example = "帮我打开浏览器访问 https://example.com")]
     pub prompt: String,
@@ -447,6 +454,31 @@ mod userapp_dispatch_tests {
             .unwrap_or_else(|e| panic!("cancel {cancel_raw} 应可反序列化: {e}"));
         assert_eq!(cancel.project_id, "app-1");
         assert!(cancel.app_stage.is_none());
+    }
+
+    /// 契约钉住：/computer/chat 的 userApp wire 形态（service_type 枚举 +
+    /// project_id 兼任 app_id + app_stage 可缺省）——app_stage 与 agent 族
+    /// 五接口同语义（缺省 dev，prod 服务端 400）。
+    #[test]
+    fn chat_request_deserializes_userapp_wire_form_with_app_stage() {
+        for raw in [
+            r#"{"service_type":"userapp","project_id":"app-1","prompt":"hi","user_id":"u1"}"#,
+            r#"{"service_type":"userapp","project_id":"app-1","app_stage":"dev","prompt":"hi","user_id":"u1"}"#,
+        ] {
+            let chat: ComputerChatRequest = serde_json::from_str(raw)
+                .unwrap_or_else(|e| panic!("chat userApp 形态 {raw} 应可反序列化: {e}"));
+            assert_eq!(chat.project_id.as_deref(), Some("app-1"));
+            assert!(
+                chat.app_stage.as_deref().is_none_or(|s| s == "dev"),
+                "app_stage 应可缺省或为 dev"
+            );
+        }
+        // 非法 stage 是服务端校验（String 承接，非 serde 枚举）——反序列化应通过
+        let chat: ComputerChatRequest = serde_json::from_str(
+            r#"{"service_type":"userapp","project_id":"app-1","app_stage":"prod","prompt":"hi","user_id":"u1"}"#,
+        )
+        .unwrap();
+        assert_eq!(chat.app_stage.as_deref(), Some("prod"));
     }
 
     /// 既有 computer 形态回归：不传三字段反序列化不受影响（全部缺省）。
