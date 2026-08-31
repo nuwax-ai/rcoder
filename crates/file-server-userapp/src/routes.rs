@@ -224,6 +224,7 @@ mod tests {
         let sse = success_desc("/api/v1/userapp/tasks/{task_id}/logs/stream");
         for token in [
             "building",
+            "log",
             "build_ok",
             "completed",
             "failed",
