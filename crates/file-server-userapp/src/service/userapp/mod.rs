@@ -11,8 +11,10 @@
 //! - `pingap`：pingap 反代配置（`pingap.toml`）+ `.service-ports` 生成（独立可扩展）
 
 mod assemble;
+pub mod hygiene;
 pub mod import;
 mod manifest;
+pub mod run_dir;
 pub mod tasks;
 
 // 重导出 manifest 类型：保持 userapp 模块公开面。
@@ -257,6 +259,24 @@ pub async fn build_workspace_package(
     let rel_path = workspace_artifact_rel_path(release_id);
     let path = assemble_workspace_package(&ws, &built, &lock, &rel_path).await?;
     let (sha256, size_bytes) = hash_file(&path).await?;
+    // 磁盘卫生（构建完成后顺带）：制品/temp 保留最近 N 个、main 日志按天数、
+    // .staging 残留。fail-safe——清理失败不影响构建结果，仅 warn 留痕。
+    let dev_log_dir = config.log_base_dir.join(app_id);
+    let stats = hygiene::sweep_workspace(
+        &ws,
+        &dev_log_dir,
+        config.build_artifact_retain_count,
+        config.build_log_retention_days,
+    )
+    .await;
+    tracing::info!(
+        app_id,
+        artifacts_removed = stats.artifacts_removed,
+        temp_logs_removed = stats.temp_logs_removed,
+        main_logs_removed = stats.main_logs_removed,
+        staging_dirs_removed = stats.staging_dirs_removed,
+        "[HYGIENE] workspace sweep done"
+    );
     Ok(WorkspaceBuildArtifact {
         release_id: release_id.to_string(),
         path,

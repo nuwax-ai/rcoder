@@ -94,6 +94,14 @@ impl Config {
         self.userapp_single_app_id = env_opt_string("USERAPP_SINGLE_APP_ID")?;
         path!(service_log_dir, "FILE_SERVER_LOG_DIR");
         parse!(service_log_retention_days, "FILE_SERVER_LOG_RETENTION_DAYS");
+        parse!(
+            build_artifact_retain_count,
+            "FILE_SERVER_BUILD_ARTIFACT_RETAIN_COUNT"
+        );
+        parse!(
+            build_log_retention_days,
+            "FILE_SERVER_BUILD_LOG_RETENTION_DAYS"
+        );
         path!(init_project_dir, "INIT_PROJECT_DIR");
         path!(upload_project_dir, "UPLOAD_PROJECT_DIR");
         path!(dist_target_dir, "DIST_TARGET_DIR");
@@ -187,6 +195,8 @@ impl Config {
                 "/app/logs/file-server",
             )?),
             service_log_retention_days: env_parse("FILE_SERVER_LOG_RETENTION_DAYS", 7)?,
+            build_artifact_retain_count: env_parse("FILE_SERVER_BUILD_ARTIFACT_RETAIN_COUNT", 10)?,
+            build_log_retention_days: env_parse("FILE_SERVER_BUILD_LOG_RETENTION_DAYS", 7)?,
             init_project_dir: PathBuf::from(env_str("INIT_PROJECT_DIR", "/app/project_init")?),
             upload_project_dir: PathBuf::from(env_str("UPLOAD_PROJECT_DIR", "/app/project_zips")?),
             dist_target_dir: PathBuf::from(env_str("DIST_TARGET_DIR", "/app/project_nginx")?),
@@ -319,6 +329,16 @@ impl Config {
         if self.listen_host.trim().is_empty() {
             return Err(anyhow!("listen_host must not be empty"));
         }
+        if self.build_artifact_retain_count == 0 {
+            return Err(anyhow!(
+                "BUILD_ARTIFACT_RETAIN_COUNT must be greater than zero"
+            ));
+        }
+        if self.build_log_retention_days == 0 {
+            return Err(anyhow!(
+                "BUILD_LOG_RETENTION_DAYS must be greater than zero"
+            ));
+        }
         if self.service_log_retention_days == 0 {
             return Err(anyhow!(
                 "FILE_SERVER_LOG_RETENTION_DAYS must be greater than zero"
@@ -404,6 +424,8 @@ mod tests {
         assert!(config.git_enabled);
         assert_eq!(config.request_body_max_bytes, MAX_UPLOAD_FILE_SIZE_BYTES);
         assert_eq!(config.service_log_retention_days, 7);
+        assert_eq!(config.build_artifact_retain_count, 10);
+        assert_eq!(config.build_log_retention_days, 7);
     }
 
     #[test]

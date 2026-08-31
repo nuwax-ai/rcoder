@@ -92,8 +92,9 @@ pub(crate) const DEFAULT_CONTENT_TRAVERSE_EXCLUDE_FILES: &str =
 /// 内联图片扩展名。
 pub(crate) const DEFAULT_INLINE_IMAGE_EXTENSIONS: &str =
     ".png,.jpg,.jpeg,.gif,.bmp,.svg,.ico,.webp,.avif";
-/// zip-workspace 排除列表。
-pub(crate) const DEFAULT_ZIP_WORKSPACE_EXCLUDE: &str = ".git,.tmp,.claude,.agents,.codex,.opencode,.grok,.pi,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json";
+/// zip-workspace 排除列表（含 dev 部署运行目录 .run/.previous/.staging——平台
+/// 生成的解压产物与轮换现场，不进下载包）。
+pub(crate) const DEFAULT_ZIP_WORKSPACE_EXCLUDE: &str = ".git,.tmp,.claude,.agents,.codex,.opencode,.grok,.pi,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json,.run,.previous,.staging";
 
 /// 全局配置 (启动时构造一次, 经 AppState 共享)。
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -114,6 +115,11 @@ pub struct Config {
     pub userapp_single_app_id: Option<String>,
     pub service_log_dir: PathBuf,
     pub service_log_retention_days: usize,
+    /// workspace 构建产物（`builds/workspace-package-*.zip`）与构建 temp 日志
+    /// （`dev-temp-*.log`）保留的最近构建数（按文件名字典序=uuid v7 时间序）。
+    pub build_artifact_retain_count: usize,
+    /// workspace 构建与 dev server 的 main 日志（`dev-YYYY-MM-DD.log`）保留天数。
+    pub build_log_retention_days: usize,
 
     // —— 业务目录 ——
     pub init_project_dir: PathBuf,
@@ -209,6 +215,8 @@ impl Default for Config {
             userapp_single_app_id: None,
             service_log_dir: PathBuf::from("/app/logs/file-server"),
             service_log_retention_days: 7,
+            build_artifact_retain_count: 10,
+            build_log_retention_days: 7,
             init_project_dir: PathBuf::from("/app/project_init"),
             upload_project_dir: PathBuf::from("/app/project_zips"),
             dist_target_dir: PathBuf::from("/app/project_nginx"),

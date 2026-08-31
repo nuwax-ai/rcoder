@@ -249,19 +249,24 @@ async fn spawn_dev_task(
                 tracing::info!(%app_id, "dev task cancelled after build; skipping start/restart");
                 return Ok(());
             }
-            // 编译成功：按 action 启动/重启（app-cli 全栈新代码生效；失败整体
-            // Failed——restart 场景旧服务已被 stop，语义上本轮失败，下次重试）
+            // zip 部署（与生产部署物一致）：解压制品包到 {ws}/.run 并原子换入
+            // ——dev 运行的是编译产物而非源码目录。解压/校验失败时旧 .run
+            // 原样保留（运行中服务不受影响），任务 Failed。
+            let run =
+                crate::service::userapp::run_dir::prepare_run_dir(&ws, &release_id).await?;
+            // 启动/重启（app-cli --workspace 指向 .run；失败整体 Failed——
+            // restart 场景旧服务已被 stop，语义上本轮失败，下次重试）
             match action {
                 DevTaskAction::Start => {
                     state
                         .fs.dev_server
-                        .start_dev(&key, &ws, base_path.as_deref())
+                        .start_dev(&key, &run, base_path.as_deref())
                         .await?;
                 }
                 DevTaskAction::Restart => {
                     state
                         .fs.dev_server
-                        .restart_dev(&key, &ws, base_path.as_deref())
+                        .restart_dev(&key, &run, base_path.as_deref())
                         .await?;
                 }
             }

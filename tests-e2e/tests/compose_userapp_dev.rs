@@ -1121,6 +1121,26 @@ async fn userapp_dev_server_lifecycle() {
         format!("body 截断: {}", trunc(&body, 150)),
     );
 
+    // zip 部署落盘断言：dev 运行源=制品解压目录 .run（与生产部署物一致）——
+    // resolve-file 探测 .run 内 workspace 清单存在即证解压换入成功
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/resolve-file?app_id={app}&user_id={user}&file_path=.run/workspace.manifest.toml",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .expect("resolve run dir");
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let run_ok = body["success"].as_bool() == Some(true) && body["exists"].as_bool() == Some(true);
+    report.assert_hard(
+        "dev zip 部署 → .run/workspace.manifest.toml 存在",
+        run_ok,
+        format!("body 截断: {}", trunc(&body, 150)),
+    );
+
     // 编排日志内置源：logs/query 按 service_id=app-cli 过滤（dev/logs 已下线，
     // app-cli 自身编排日志由日志族接口内置源统一提供）
     let resp = env
