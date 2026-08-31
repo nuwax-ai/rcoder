@@ -66,9 +66,10 @@ jq 'select(.trace_id == "abcdef1234567890abcdef1234567890")' logs/rcoder.$(date 
 ## tokio-console
 
 ```bash
-# 启用（compose 环境）
-DEV_CONSOLE=1 make dev-hot
+# 启用（compose 环境，运行期开关默认关——详见 docs/console.md）
+make console-on
 tokio-console http://localhost:6669     # 注意 http:// 前缀
+make console-off                        # 用完关闭（console 无背压记账，开着 RSS 持续涨）
 
 # 本地 cargo run
 make run-console

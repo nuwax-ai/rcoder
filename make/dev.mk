@@ -53,12 +53,12 @@ dev-restart: dev-build
 # 前提：docker-compose.yml 已挂载源码到 /app/src（首次需 make dev-restart 应用）。
 # 流程：容器内 cargo build --release --bin rcoder（增量）→ 替换 /app/bin/rcoder
 #       → docker restart 拉起新 binary。
-# tokio-console 观测模式（本地 cargo run）：feature+RUSTFLAGS+独立 target 三件套
+# tokio-console 观测模式（本地 cargo run）：feature+RUSTFLAGS+独立 target+DEV_CONSOLE 四件套
 # 连接: cargo install tokio-console && tokio-console localhost:6669
 run-console:
 	@echo "🖥️  本地运行 rcoder（tokio-console 观测模式，端口 6669）..."
 	@RUSTFLAGS="--cfg tokio_unstable" CARGO_TARGET_DIR=target-console \
-	cargo run -p rcoder --features console
+	DEV_CONSOLE=1 cargo run -p rcoder --features console
 
 dev-hot:
 	@echo "🔥 容器内热编译 rcoder..."

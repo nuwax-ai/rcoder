@@ -17,26 +17,36 @@ tokio-console 是 tokio 官方的异步运行时观测工具：任务级耗时�
 
 ## 启用方式
 
+console feature **恒编入** dev-hot 产物（免编译期切换），启停是**运行期开关**：
+rcoder 主进程默认关（常驻进程 + console-subscriber 无背压记账，rcoder 后台
+事件量下 RSS 数十 MB/s 爬升直至 OOM——用时开、用完关，切换秒级零重编）。
+
 ### rcoder（docker compose 本地）
 
 ```bash
-DEV_CONSOLE=1 make dev-hot     # 首次全量编译约 10 分钟（独立 target volume；此后增量秒级）
+make console-on               # 启用（重建容器注入 DEV_CONSOLE=1；binary 复用编译产物）
 tokio-console http://localhost:6669   # 注意 http:// 前缀（TUI 0.1.x 要求显式 scheme）
+make console-off              # 用完关闭（内存即刻回落常态 ~50MB）
 ```
 
-切回普通模式：`make dev-hot`（不带 DEV_CONSOLE，各自缓存独立零重编）。
+开关状态跟容器走：`make dev-hot`（重编 + restart）不改变开关；判断当前状态
+看启动日志 `[BOOTSTRAP] tokio-console enabled/disabled` 行。`TOKIO_CONSOLE_RETENTION`
+（compose 默认 300s）控制已完成任务保留窗口，调小省内存。**开启期间 RSS 仍会
+较快上涨（观测期内置成本），短窗口（10 分钟内）用完即关。**
 
 ### rcoder（本地 cargo run）
 
 ```bash
-make run-console              # = RUSTFLAGS + target-console + --features console
+make run-console              # = RUSTFLAGS + target-console + --features console + DEV_CONSOLE=1
 tokio-console http://localhost:6669
 ```
 
 ### agent_runner（动态 agent 容器）
 
-构建带 console 的 agent 镜像后，动态容器即有观测（bind 0.0.0.0，宿主机
-经容器 IP 直连——OrbStack 特性）：
+agent_runner 侧默认开（feature 经 AGENT_CONSOLE 构建显式选择 = 想观测；
+动态容器生命周期短无常驻风险；`DEV_CONSOLE=0` 可显式关）。构建带 console
+的 agent 镜像后，动态容器即有观测（bind 0.0.0.0，宿主机经容器 IP 直连——
+OrbStack 特性）：
 
 ```bash
 AGENT_CONSOLE=1 make docker-build-agent-runner
