@@ -5,7 +5,7 @@ services:
     ports:
       - "${RCODER_PORT:-8090}:${RCODER_PORT:-8090}"
       - "8089:8088" # Pingora 反向代理端口（VNC 代理、健康检查等）
-      - "6669:6669" # tokio-console 观测（DEV_CONSOLE=1 make dev-hot 构建时启用）
+      - "6669:6669" # tokio-console 观测（make console-on 运行期启用）
       - "8199:80"
       - "60000:60000" # file-server 分流代理入口（all_rust → 主端口; K8s 形态同构缩小版）
       - "7681:7681" # ttyd Web 终端端口
@@ -13,6 +13,14 @@ services:
       - TZ=Asia/Shanghai
       - RCODER_PORT=${RCODER_PORT:-8090}
       - RUST_LOG=debug,bollard=info,h2=info,hyper=info,tonic=info # debug 基线 + 收敛三方库噪声（bollard 全量 inspect JSON dump / h2 帧日志）
+      # tokio-console 运行期开关（console feature 恒编入 binary；仅 DEV_CONSOLE=1 时
+      # 注入 ConsoleLayer + EnvFilter 放行 tokio/runtime trace）。默认关：console-
+      # subscriber 对 tokio 微观事件无背压记账，rcoder 后台事件量下 RSS 数十 MB/s
+      # 爬升直至 OOM——用时 `make console-on`，用完 `make console-off`
+      - DEV_CONSOLE=${DEV_CONSOLE:-0}
+      # console 开启时的已完成任务保留窗口（Aggregator 表内存 = 最近 N 分钟记录量；
+      # 库默认 1h 在本进程事件速率下必然 OOM，5 分钟是观测价值与内存的平衡点）
+      - TOKIO_CONSOLE_RETENTION=${TOKIO_CONSOLE_RETENTION:-300}
       # console layer 是 per-layer filter，但静态 level hint 需要全局放行
       # app_manager（UserApp）Docker 模式工作空间根（app-workspace 挂在 /app/app-workspace）；
       # 不设则默认 /app/project_workspace/apps，与挂载点不符，文件管理/storage 会路径错

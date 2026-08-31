@@ -32,9 +32,14 @@ fi
 
 # 启动 rcoder 服务
 # 优先用 dev-hot 编译产物 (target volume 持久, docker compose up 后不丢); 回退镜像 binary
+# target-console 是 dev-hot 恒定编译目录（tokio-console 恒编入）；两目录互斥
+# （dev-hot-build.sh 每次清另一侧产物防陈旧），取存在的那个即可。
 RCODER_BIN="/app/bin/rcoder"
 if [ -x "/app/src/target/release/rcoder" ]; then
     RCODER_BIN="/app/src/target/release/rcoder"
+    echo "📡 使用 dev-hot 编译产物: $RCODER_BIN"
+elif [ -x "/app/src/target-console/release/rcoder" ]; then
+    RCODER_BIN="/app/src/target-console/release/rcoder"
     echo "📡 使用 dev-hot 编译产物: $RCODER_BIN"
 else
     echo "📡 使用镜像 binary: $RCODER_BIN"

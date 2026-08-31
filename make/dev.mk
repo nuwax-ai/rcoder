@@ -66,11 +66,24 @@ dev-hot:
 	if [ -z "$$DEV_CID" ]; then \
 		echo "❌ rcoder 容器未运行，请先 make dev-up"; exit 1; \
 	fi; \
-	docker exec -e DEV_CONSOLE="$${DEV_CONSOLE:-1}" $$DEV_CID bash /app/src/docker/dev-hot-build.sh && \
+	docker exec $$DEV_CID bash /app/src/docker/dev-hot-build.sh && \
 	echo "🔄 重启 rcoder 进程（拉起新 binary）..." && \
 	docker restart $$DEV_CID >/dev/null && \
 	echo "✅ 热编译完成（日志: docker logs -f $$DEV_CID）" && \
-	echo "🖥️  tokio-console 已随服务启用（独立 target 缓存无重编代价）：make console 连接面板；DEV_CONSOLE=0 make dev-hot 关闭"
+	echo "🖥️  tokio-console 恒编入（运行期默认关）：make console-on 启用 / make console-off 关闭 / make console 连接面板"
+
+## 启用 tokio-console（重建 rcoder 容器注入 DEV_CONSOLE=1；binary 复用
+## target-console volume 编译产物，不触发重编。console-subscriber 无背压
+## 记账，rcoder 后台事件量下 RSS 会持续爬升——观测完记得 console-off）
+console-on:
+	@DEV_CONSOLE=1 docker-compose -f docker/docker-compose.yml up -d rcoder && \
+	echo "🖥️  tokio-console 已启用：make console 连接面板（localhost:6669）"
+
+## 关闭 tokio-console（重建容器 DEV_CONSOLE=0；EnvFilter 拦截 tokio/runtime
+## trace 事件不进 Registry，内存回到常态水位）
+console-off:
+	@DEV_CONSOLE=0 docker-compose -f docker/docker-compose.yml up -d rcoder && \
+	echo "✅ tokio-console 已关闭（内存回落常态水位）"
 
 ## 连接本地 dev 容器的 tokio-console TUI 面板（6669 已随 compose 映射宿主）
 console:

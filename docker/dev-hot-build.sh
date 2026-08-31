@@ -40,23 +40,18 @@ fi
 
 # 3. 增量编译 rcoder binary（release；cargo target volume 持久化 → 增量）
 cd "$SRC_DIR"
-# DEV_CONSOLE=1：tokio-console 观测模式（独立 target-console 目录——RUSTFLAGS
-# 变化会使普通缓存指纹失效，隔离避免交替全量重编；宿主机连 localhost:6669）
-if [ "${DEV_CONSOLE:-0}" = "1" ]; then
-    echo "🔨 cargo build --release --bin rcoder --features console（tokio-console；独立 target）..."
-    export RUSTFLAGS="--cfg tokio_unstable"
-    export CARGO_TARGET_DIR="$SRC_DIR/target-console"
-    cargo build --release --bin rcoder --features console
-    BIN_SRC="$CARGO_TARGET_DIR/release/rcoder"
-    # start-rcoder.sh 优先用 /app/src/target/release/rcoder——必须清掉另一模式的
-    # 旧产物，否则新二进制（/app/bin/rcoder）被跳过（8/19 陈旧产物事故同款坑）
-    rm -f "$SRC_DIR/target/release/rcoder"
-else
-    echo "🔨 cargo build --release --bin rcoder（增量）..."
-    cargo build --release --bin rcoder
-    BIN_SRC="$SRC_DIR/target/release/rcoder"
-    rm -f "$SRC_DIR/target-console/release/rcoder"
-fi
+# tokio-console 恒编入（独立 target-console 目录——RUSTFLAGS 与普通缓存指纹
+# 不同，隔离避免交替全量重编；恒定后不再切换，无重编代价）。启用与否是
+# 运行期 DEV_CONSOLE env（默认关），经 `make console-on/off` 重建容器切换，
+# 功能切换不再触发重编。宿主机连 localhost:6669。
+echo "🔨 cargo build --release --bin rcoder --features console（tokio-console 恒编入；独立 target）..."
+export RUSTFLAGS="--cfg tokio_unstable"
+export CARGO_TARGET_DIR="$SRC_DIR/target-console"
+cargo build --release --bin rcoder --features console
+BIN_SRC="$CARGO_TARGET_DIR/release/rcoder"
+# start-rcoder.sh 优先用 /app/src/target/release/rcoder——必须清掉另一模式的
+# 旧产物，否则新二进制（/app/bin/rcoder）被跳过（8/19 陈旧产物事故同款坑）
+rm -f "$SRC_DIR/target/release/rcoder"
 
 # 4. 替换运行 binary
 if [ ! -f "$BIN_SRC" ]; then

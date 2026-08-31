@@ -18,6 +18,7 @@
 	test-ebpf-install test-ebpf-no-install test-ebpf-debug test-pyroscope-offcpu \
 	pyroscope-up pyroscope-down pyroscope-logs \
 	agent-runner-up agent-runner-down agent-runner-logs agent-runner-restart agent-runner-status \
+	console-on console-off \
 	k8s-offline-bundle k8s-offline-import k8s-offline-images-list k8s-offline-clean
 
 # 包含子 Makefile
