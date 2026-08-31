@@ -45,7 +45,7 @@ pub struct LogQueryRequest {
     /// 结束时间过滤（可选，RFC3339）
     #[serde(default)]
     pub until: Option<String>,
-    /// 每源尾部行数限制（可选；单源上限 10000）
+    /// 每源尾部行数限制（可选；单源上限 10000；stream 首轮默认 100 行）
     #[serde(default)]
     pub tail: Option<usize>,
     /// 增量拉取游标（可选；上次 query 响应返回的 cursor，支持断点续拉）

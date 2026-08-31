@@ -50,6 +50,10 @@ pub struct LogsAccessParams {
         LogsAccessParams
     ),
     description = r#"
+【日志三接口分工】`sources/query` 发现源清单（对接第一步）→ `query` 快照分页 /
+事后回看（cursor 增量续拉）→ `stream` SSE 实时跟随；三者请求体同构
+（LogQueryRequest：selectors / levels / keyword / since / until / tail / cursor）。
+
 查询应用声明的日志源及匹配到的日志文件清单（选日志面板"源选择器"用）。
 `app_stage` 决定目标容器：dev=开发容器的实时源 / prod=运行容器的应用日志源；
 请求体 selectors 支持 per-service 过滤（空 = 全量声明面）。
@@ -98,6 +102,9 @@ pub async fn query_app_log_sources(
         LogsAccessParams
     ),
     description = r#"
+【日志三接口分工】`sources/query` 发现源清单（对接第一步）→ 本接口快照分页 /
+事后回看 → `stream` SSE 实时跟随；三者请求体同构（LogQueryRequest）。
+
 多服务日志快照（分页拉取，非 SSE）：携带上次响应的 `cursor` 即可断点续拉；
 `cursor_reset=true` 表示跨部署代需从 tail 重读。`app_stage` 选择目标容器同
 sources/query。
@@ -146,6 +153,9 @@ pub async fn query_app_logs(
         LogsAccessParams
     ),
     description = r#"
+【日志三接口分工】`sources/query` 发现源清单（对接第一步）→ `query` 快照分页 /
+事后回看 → 本接口 SSE 实时跟随；三者请求体同构（LogQueryRequest）。
+
 SSE 实时日志流（500ms 轮询内核）：事件清单与断线续传协议见 200 响应说明。
 `app_stage` 选择目标容器同 sources/query；断线后以最近 checkpoint 回填 cursor 重连，
 部署代切换收 `cursor_reset` 后重置游标。
