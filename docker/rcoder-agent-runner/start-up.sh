@@ -486,12 +486,15 @@ function initialize_user_home() {
         log_success "  xfce4-desktop.xml pre-configured from system (fixes wallpaper scaling)"
     fi
 
-    # ========== 无条件补齐桌面系统图标 (每次启动确保预设图标存在) ==========
+    # ========== 无条件补齐/对齐桌面系统图标 (每次启动确保预设图标存在且与镜像一致) ==========
     # 与下方 launcher 补齐同理, 属于"系统预设, 每次启动确保存在"。
-    # 语义: 只补缺失的, 不删除用户自定义图标, 不覆盖用户改过的同名图标:
+    # 语义: 只管理骨架集合内的平台预置启动器, 骨架外的用户自定义图标一律不动:
     #   - 用户删了图标 (链接不存在)              → 补
     #   - 链接损坏 (目标无效, -e 跟踪失败)        → 补
-    #   - 用户保留或改过 (存在且有效)             → 不动
+    #   - 内容与骨架漂移 (镜像升级改了 Icon 等)   → 覆盖为骨架版
+    #     (平台启动器须跟随镜像版本; /home/user 是持久化 PVC, 镜像升级不触碰
+    #      卷内旧文件——不覆盖则存量沙箱永远停在旧内容, 如 0.1.245 dbx 官方图标)
+    #   - 骨架集合外的用户自定义 .desktop         → 不动
     # 背景: /home/user 是持久化 PVC (rcoder-computer-workspace/{user_id}),
     #       用户删图标会被 PVC 保留; 而上方 need_restore 只在"目录不存在"时触发,
     #       删图标后 Desktop 目录还在 → 不触发 → 桌面图标必须靠这里无条件补齐才能恢复。
@@ -507,12 +510,17 @@ function initialize_user_home() {
                 chmod +x "$user_icon" 2>/dev/null || true
                 chown user:user "$user_icon" 2>/dev/null || true
                 log_success "  Desktop icon ensured (was missing): $icon_name"
+            elif ! cmp -s "$user_icon" "$skel_icon"; then   # 平台预置启动器内容漂移 → 以骨架版对齐
+                cp -aL "$skel_icon" "$user_icon"
+                chmod 755 "$user_icon" 2>/dev/null || true
+                chown user:user "$user_icon" 2>/dev/null || true
+                log_success "  Desktop icon refreshed (drifted from skeleton): $icon_name"
             fi
         done
     fi
 
-    # 无条件确保桌面图标可执行 + 属主 (X 启动前; 补齐段只补缺失/断链,
-    # rsync 同步带过来的旧图标 (644) 会跳过补齐 → xfdesktop 读到 644 弹 mark executable。
+    # 无条件确保桌面图标可执行 + 属主 (X 启动前; 补齐/对齐段只覆盖缺失/断链/漂移,
+    # rsync 同步带过来且内容恰好一致的旧图标 (644) 会跳过上方分支 → xfdesktop 读到 644 弹 mark executable。
     # 这里无条件 chmod 兜底, 保证 xfdesktop 启动时桌面图标一定 755)
     if [ -d "$USER_HOME/Desktop" ]; then
         chmod 755 "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
