@@ -99,7 +99,15 @@ impl ContainerStateActor {
         debug!("[ACTOR] ContainerStateActor started");
 
         while let Some(cmd) = self.receiver.recv().await {
-            self.handle_command(cmd);
+            // panic 隔离（对齐 sse_stream / agent_abstraction 的 catch_unwind 先例）：
+            // actor 是无人监督的常驻任务，panic 静默消亡会让 DockerManager 的内存
+            // 容器表永久读空（所有 handle 调用降级为空值且无自愈）。单命令 panic
+            // 只跳过该命令继续服务 —— 单条 HashMap 操作不存在跨命令半完成状态
+            if let Err(_panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.handle_command(cmd);
+            })) {
+                error!("[ACTOR] handle_command panicked, command skipped (actor keeps running)");
+            }
         }
 
         debug!("[ACTOR] ContainerStateActor stopped (all senders dropped)");

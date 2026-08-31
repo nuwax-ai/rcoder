@@ -45,6 +45,51 @@ pub(super) fn validate_resource_limits(limits: &ServiceResourceLimits) -> Result
     Ok(())
 }
 
+/// 轮询确认容器真正移除（10×500ms 最多 5s）。
+///
+/// stop / restart 的销毁后半程共用（原两处逐行同构收敛于此）：物理销毁已
+/// 返回成功，此处确认不到只影响调用方的收尾日志，不翻案。返回 true =
+/// 已确认移除（含"探测报错按已移除处理"）；false = 5s 内仍存在。
+pub(super) async fn confirm_container_removed(
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
+    container_identifier: &str,
+    service_type: &ServiceType,
+    log_tag: &str,
+) -> bool {
+    for i in 0..10 {
+        match runtime
+            .find_container(container_identifier, service_type)
+            .await
+        {
+            Ok(Some(_)) => {
+                if i == 0 {
+                    info!(
+                        "[{}] Container still exists, waiting for cleanup: container_identifier={}",
+                        log_tag, container_identifier
+                    );
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+            Ok(None) => {
+                info!(
+                    "[{}] Confirmed container removed: container_identifier={}",
+                    log_tag, container_identifier
+                );
+                return true;
+            }
+            Err(e) => {
+                // 瞬断/权限类报错按已移除处理（物理销毁已成功返回）
+                warn!(
+                    "[{}] check container removed status: {}, container already removed",
+                    log_tag, e
+                );
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// 容器创建/复用成功后注册 VNC backend 到 pingora 的 `vnc_backends`(显式注册)。
 ///
 /// 背景:pingora `handle_vnc_upstream` 优先走 ContainerLookupService 动态查项目存储

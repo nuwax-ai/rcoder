@@ -283,13 +283,7 @@ async fn restart_userapp_dev(
             }
             // 清注册表 container 字段（防 ensure 命中死注册不重建——同探活自愈
             // 的就地清模式，不 remove_project 以保 PG 侧 project 行与会话映射）
-            state.shutdown_sse_streams_for_project(&app_id);
-            if let Some(mut info) = state.get_project(&app_id).map(|p| (*p).clone()) {
-                info.set_container(None);
-                if let Err(e) = state.insert_project(app_id.clone(), Arc::new(info)) {
-                    warn!("[POD_RESTART] clear stale container field failed: app_id={app_id}: {e}");
-                }
-            }
+            state.clear_project_container_field(&app_id);
             let recreated =
                 crate::userapp_builder::ensure_userapp_builder(state, &app_id, Some(user_id))
                     .await
@@ -454,44 +448,10 @@ async fn destroy_for_recreate(
         )
         .await;
 
-    // 验证容器是否真正移除
-    let mut deletion_confirmed = false;
-
-    for i in 0..10 {
-        // 最多等待 5 秒 (10 * 500ms)
-        match runtime
-            .find_container(container_identifier, service_type)
-            .await
-        {
-            Ok(Some(_)) => {
-                if i == 0 {
-                    info!(
-                        "[POD_RESTART] Container still exists, waiting for cleanup: container_identifier={}",
-                        container_identifier
-                    );
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            }
-            Ok(None) => {
-                info!(
-                    "[POD_RESTART] Confirmed container removed: container_identifier={}",
-                    container_identifier
-                );
-                deletion_confirmed = true;
-                break;
-            }
-            Err(e) => {
-                warn!(
-                    "[POD_RESTART] check container removed status: {}, container already removed",
-                    e
-                );
-                // 如果是其他错误，也可能意味着Container status abnormal，尝试继续
-                deletion_confirmed = true;
-                break;
-            }
-        }
-    }
-
+    // 验证容器是否真正移除（最多等待 5 秒）
+    let deletion_confirmed =
+        confirm_container_removed(&runtime, container_identifier, service_type, "POD_RESTART")
+            .await;
     if !deletion_confirmed {
         warn!(
             "[POD_RESTART] Wait for container removal timeout, subsequent creation may fail: container_identifier={}",

@@ -166,40 +166,13 @@ pub async fn pod_stop(
     }
 
     // 7. 轮询确认容器真正移除（最多 5s；不确认只 warn 不翻案——物理销毁已返回成功）
-    let mut deletion_confirmed = false;
-    for i in 0..10 {
-        match state
-            .runtime()
-            .find_container(&container_identifier, &service_type)
-            .await
-        {
-            Ok(Some(_)) => {
-                if i == 0 {
-                    info!(
-                        "[POD_STOP] Container still exists, waiting for cleanup: container_identifier={}",
-                        container_identifier
-                    );
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            }
-            Ok(None) => {
-                info!(
-                    "[POD_STOP] Confirmed container removed: container_identifier={}",
-                    container_identifier
-                );
-                deletion_confirmed = true;
-                break;
-            }
-            Err(e) => {
-                warn!(
-                    "[POD_STOP] check container removed status: {}, container already removed",
-                    e
-                );
-                deletion_confirmed = true;
-                break;
-            }
-        }
-    }
+    let deletion_confirmed = confirm_container_removed(
+        state.runtime(),
+        &container_identifier,
+        &service_type,
+        "POD_STOP",
+    )
+    .await;
     if !deletion_confirmed {
         warn!(
             "[POD_STOP] Wait for container removal timeout (physical destroy already succeeded): container_identifier={}",
@@ -266,13 +239,7 @@ async fn stop_userapp_dev(
     info!("[POD_STOP] userapp dev 容器已销毁: app_id={app_id}");
 
     // 清 SSE 流 + 注册表 container 字段（保 PG project 行与会话映射）
-    state.shutdown_sse_streams_for_project(&app_id);
-    if let Some(mut info) = state.get_project(&app_id).map(|p| (*p).clone()) {
-        info.set_container(None);
-        if let Err(e) = state.insert_project(app_id.clone(), Arc::new(info)) {
-            warn!("[POD_STOP] clear stale container field failed: app_id={app_id}: {e}");
-        }
-    }
+    state.clear_project_container_field(&app_id);
     crate::userapp_forward::invalidate_probe_cache(&app_id);
 
     info!("[POD_STOP] userapp dev stop completed: app_id={app_id}");

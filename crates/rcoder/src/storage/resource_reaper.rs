@@ -105,16 +105,23 @@ impl ResourceReaper {
         info!("[REAPER] shutdown");
     }
 
-    /// 带 120s 超时保护地处理单个清理请求
+    /// 带 120s 超时保护地处理单个清理请求（含 panic 隔离）
     async fn process_with_timeout(&mut self, req: CleanupRequest) {
         let identifier = req.identifier.clone();
-        match tokio::time::timeout(
-            Duration::from_secs(CLEANUP_TIMEOUT_SECS),
+        // 按请求粒度包 catch_unwind（对齐 sse_stream.rs 先例）：reaper 是无人监督的
+        // 常驻任务，单个坏请求 panic 若杀死整个循环，cleanup_tx 后续全部 send 失败，
+        // 所有 RAII 容器销毁请求将泄漏 —— 只跳过当前请求继续服务
+        let fut = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
             self.process_cleanup(req),
-        )
-        .await
-        {
-            Ok(()) => {}
+        ));
+        match tokio::time::timeout(Duration::from_secs(CLEANUP_TIMEOUT_SECS), fut).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_panic)) => {
+                error!(
+                    "[REAPER] cleanup panicked, skipping request: {}",
+                    identifier
+                );
+            }
             Err(_) => {
                 warn!(
                     "[REAPER] cleanup timed out after {}s, skipping: {}",

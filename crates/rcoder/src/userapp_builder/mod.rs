@@ -22,7 +22,7 @@ use shared_types::{
     AGENT_FILE_SERVER_PORT, ContainerBasicInfo, ProjectAndContainerInfo, ServiceType,
     build_backend_addr,
 };
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::router::AppState;
 
@@ -82,13 +82,7 @@ pub(crate) async fn ensure_userapp_builder_probed(
             "[USERAPP_ENSURE] dev container probe failed (stale registry?), recreating: app_id={app_id}, addr={addr}"
         );
         // 就地清 container 字段而非 remove_project（保 PG project 行与会话映射）
-        state.shutdown_sse_streams_for_project(app_id);
-        if let Some(mut stale) = state.get_project(app_id).map(|p| (*p).clone()) {
-            stale.set_container(None);
-            if let Err(e) = state.insert_project(app_id.to_string(), Arc::new(stale)) {
-                warn!("[USERAPP_ENSURE] clear stale container field failed: app_id={app_id}: {e}");
-            }
-        }
+        state.clear_project_container_field(app_id);
         let info = create_builder_and_register(state, app_id, explicit_user_id).await?;
         return Ok((info, true));
     }

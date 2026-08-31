@@ -100,8 +100,10 @@ impl PermissionManager {
             .filter(|key| key.0 == session_id)
             .cloned()
             .collect();
-        let count = Self::remove_and_respond(&mut guard, &keys);
+        let responders = Self::take_pending(&mut guard, &keys);
         drop(guard);
+        let count = responders.len();
+        Self::respond_cancelled(responders);
         // 一并清理该 session 的最近审批记录（防内存泄漏）
         self.recent_resolutions
             .retain(|(sid, _), _| sid != session_id);
@@ -177,8 +179,10 @@ impl PermissionManager {
             .filter(|(_, pending)| pending.context.project_id == project_id)
             .map(|(key, _)| key.clone())
             .collect();
-        let count = Self::remove_and_respond(&mut guard, &keys);
+        let responders = Self::take_pending(&mut guard, &keys);
         drop(guard);
+        let count = responders.len();
+        Self::respond_cancelled(responders);
         info!(
             "[Permission] Cancelled {} pending permissions for project: {}",
             count, project_id
@@ -186,20 +190,29 @@ impl PermissionManager {
         count
     }
 
-    fn remove_and_respond(
+    /// 锁内只做 remove + 收集 responder（对齐 resolve.rs 的锁纪律：
+    /// 持 pending 锁完成状态变更，释放锁后再对外通信，防止锁内 respond
+    /// 的模式扩散到可能阻塞的场景）
+    fn take_pending(
         guard: &mut MutexGuard<'_, HashMap<PendingKey, PendingPermission>>,
         keys: &[PendingKey],
-    ) -> usize {
-        let mut count = 0;
+    ) -> Vec<Responder<RequestPermissionResponse>> {
+        let mut responders = Vec::new();
         for key in keys {
             if let Some(pending) = guard.remove(key) {
-                if let Err(err) = pending.responder.respond(cancelled_response()) {
-                    warn!("[Permission] failed to cancel pending permission: {err}");
-                }
-                count += 1;
+                responders.push(pending.responder);
             }
         }
-        count
+        responders
+    }
+
+    /// 锁外统一回应取消
+    fn respond_cancelled(responders: Vec<Responder<RequestPermissionResponse>>) {
+        for responder in responders {
+            if let Err(err) = responder.respond(cancelled_response()) {
+                warn!("[Permission] failed to cancel pending permission: {err}");
+            }
+        }
     }
 
     /// 将权限请求推送到前端 SSE，等待用户审批

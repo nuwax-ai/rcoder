@@ -197,6 +197,25 @@ impl AppState {
 
     // ========== 向后兼容的便捷方法 ==========
 
+    /// 清注册表 container 字段并关闭该 project 的 SSE 流（"就地清"模式：
+    /// 不 remove_project，保 PG 侧 project 行与会话映射）。
+    ///
+    /// pod stop / pod restart / userapp_builder 探活自愈三处共用（原三处
+    /// 逐行同构收敛于此）。读-改-写非原子（get 与 insert 之间存在并发
+    /// insert_project 的小竞态窗口）——消费方均为低频管理面路径，且
+    /// `set_container(None)` 是幂等收敛操作，竞态最坏后果是重复清一次。
+    pub fn clear_project_container_field(&self, project_id: &str) {
+        self.shutdown_sse_streams_for_project(project_id);
+        if let Some(mut info) = self.get_project(project_id).map(|p| (*p).clone()) {
+            info.set_container(None);
+            if let Err(e) = self.insert_project(project_id.to_string(), Arc::new(info)) {
+                tracing::warn!(
+                    "[CLEAR_CONTAINER_FIELD] clear stale container field failed: project_id={project_id}: {e}"
+                );
+            }
+        }
+    }
+
     /// 获取项目信息（替代 project_and_agent_map.get）
     #[inline]
     pub fn get_project(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
