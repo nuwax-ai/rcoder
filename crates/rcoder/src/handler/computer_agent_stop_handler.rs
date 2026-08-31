@@ -79,6 +79,24 @@ pub async fn computer_agent_stop(
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
 
+    // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；agent 会话
+    //    仅存在于 dev 的 UserAppBuilder 开发容器）
+    match super::pod_handler::parse_agent_userapp_dispatch(
+        request.service_type.as_deref(),
+        request.project_id.as_deref(),
+        request.app_stage.as_deref(),
+    ) {
+        Ok(Some(app_id)) => {
+            info!(
+                "🛑 [COMPUTER_STOP] userApp dev dispatch: app_id={}, session_id={:?}",
+                app_id, request.session_id
+            );
+            return stop_userapp_dev(&state, locale, &app_id, &request).await;
+        }
+        Ok(None) => {}
+        Err(e) => return Ok(super::pod_handler::invalid_app_target_response(locale, &e)),
+    }
+
     // 使用 garde 进行字段校验
     let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
     let project_id = request
@@ -265,6 +283,144 @@ pub async fn computer_agent_stop(
                 shared_types::error_codes::ERR_GRPC_ERROR,
                 locale,
             ));
+        }
+    }
+}
+
+/// userApp dev 分派：停止 UserAppBuilder 开发容器内 app 会话的 agent。
+///
+/// 定位 = project 映射优先（builder 容器注册于 `state.projects[app_id]`）；
+/// 映射 miss 时按 UserAppBuilder 只读实时查（操作型接口不 ensure 不自愈）。
+/// 成功/already_stopped 与 computer 路径同构清 `clear_session_durable`。
+async fn stop_userapp_dev(
+    state: &AppState,
+    locale: &'static str,
+    app_id: &str,
+    request: &ComputerAgentStopRequest,
+) -> Result<HttpResult<ComputerAgentStopResponse>, AppError> {
+    let container_info = state.get_project(app_id).and_then(|p| p.container_info());
+    let container_info = match container_info {
+        Some(info) => info,
+        None => {
+            match state
+                .runtime()
+                .get_container_info_by_identifier(
+                    app_id,
+                    &shared_types::ServiceType::UserAppBuilder,
+                )
+                .await
+            {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    warn!(
+                        "[COMPUTER_STOP][USERAPP] dev builder container not found: app_id={app_id}"
+                    );
+                    return Ok(HttpResult::error_with_locale(
+                        shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+                        locale,
+                    ));
+                }
+                Err(e) => {
+                    error!(
+                        "[COMPUTER_STOP][USERAPP] failed to query dev builder container: app_id={app_id}, error={e}"
+                    );
+                    return Err(AppError::internal_server_error(&format!(
+                        "Failed to query container info: {e}"
+                    )));
+                }
+            }
+        }
+    };
+
+    info!(
+        "📦 [COMPUTER_STOP][USERAPP] dev builder container found: container_id={}, ip={}",
+        container_info.container_id, container_info.container_ip
+    );
+
+    let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
+    match crate::grpc::grpc_stop_agent_with_pool(
+        &state.grpc_pool,
+        &grpc_addr,
+        app_id.to_string(),
+        request
+            .session_id
+            .clone()
+            .or_else(|| Some("User requested stop".to_string())),
+        false, // force=false，优雅停止
+        None,
+    )
+    .await
+    {
+        Ok(response) => {
+            info!(
+                "📥 [COMPUTER_STOP][USERAPP] Received StopAgent response: result={}, success={}",
+                response.result, response.success
+            );
+            if response.success {
+                state.clear_session_durable(app_id).await;
+                let message = format!(
+                    "Agent {app_id} stopped successfully, container {} continues running",
+                    container_info.container_id
+                );
+                return Ok(HttpResult::success(ComputerAgentStopResponse {
+                    success: true,
+                    message,
+                    user_id: request.user_id.clone(),
+                    pod_id: None,
+                    project_id: app_id.to_string(),
+                }));
+            }
+            match response.result.as_str() {
+                "not_found" => {
+                    warn!("[COMPUTER_STOP][USERAPP] agent not found: app_id={app_id}");
+                    Ok(HttpResult::error_with_locale(
+                        shared_types::error_codes::ERR_AGENT_NOT_FOUND,
+                        locale,
+                    ))
+                }
+                "already_stopped" => {
+                    info!("[COMPUTER_STOP][USERAPP] agent already stopped: app_id={app_id}");
+                    state.clear_session_durable(app_id).await;
+                    let message =
+                        shared_types::get_i18n_message("success.agent_already_stopped", locale);
+                    Ok(HttpResult::success(ComputerAgentStopResponse {
+                        success: true,
+                        message,
+                        user_id: request.user_id.clone(),
+                        pod_id: None,
+                        project_id: app_id.to_string(),
+                    }))
+                }
+                "error" => {
+                    let err_msg = response
+                        .message
+                        .unwrap_or_else(|| "Unknown error".to_string());
+                    error!("[COMPUTER_STOP][USERAPP] agent stop failed: {err_msg}");
+                    Ok(HttpResult::error_with_locale(
+                        shared_types::error_codes::ERR_STOP_FAILED,
+                        locale,
+                    ))
+                }
+                _ => {
+                    warn!(
+                        "[COMPUTER_STOP][USERAPP] unexpected result: {}",
+                        response.result
+                    );
+                    Ok(HttpResult::error_with_locale(
+                        shared_types::error_codes::ERR_UNKNOWN,
+                        locale,
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            error!(
+                "❌ [COMPUTER_STOP][USERAPP] StopAgent RPC call failed: app_id={app_id}, error={e}"
+            );
+            Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_GRPC_ERROR,
+                locale,
+            ))
         }
     }
 }

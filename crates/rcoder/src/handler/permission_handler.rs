@@ -314,6 +314,32 @@ pub async fn computer_notify_resolved(
     let locale = get_locale_from_headers(&headers);
     let dto = input.to_dto();
     validate_common(&dto)?;
+
+    // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；agent 会话
+    //    仅存在于 dev 的 UserAppBuilder）。rcoder_container 的定位 = project 映射
+    //    优先——与 builder 容器注册同源；此形态下 user_id/pod_id 不再必填
+    match super::pod_handler::parse_agent_userapp_dispatch(
+        input.service_type.as_deref(),
+        input.project_id.as_deref(),
+        input.app_stage.as_deref(),
+    ) {
+        Ok(Some(_app_id)) => {
+            info!(
+                "[PERMISSION] userApp dev dispatch: app_id(=project_id)={}, session_id={}",
+                dto.project_id.as_deref().unwrap_or(""),
+                dto.session_id
+            );
+            let container = rcoder_container(&state, &dto)?;
+            return forward_permission_resolution(&state, container, dto, locale).await;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Ok(Json(super::pod_handler::invalid_app_target_response(
+                locale, &e,
+            )));
+        }
+    }
+
     if input.project_id.as_deref().unwrap_or("").trim().is_empty() {
         return Err(AppError::with_message(
             shared_types::error_codes::ERR_VALIDATION,

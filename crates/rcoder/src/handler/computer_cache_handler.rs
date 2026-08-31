@@ -31,9 +31,11 @@ use super::utils::{I18nJsonOrQuery, user_dir};
 /// workspace 固定为 `/app/computer-project-workspace/{user_id}`。
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct CacheCleanRequest {
-    /// 用户唯一标识符（必填，定位 `.cache` 所在 workspace）
+    /// 用户唯一标识符（computer 路径必填，定位 `.cache` 所在 workspace；
+    /// userApp 分派形态下可省略——owner 从 app 元数据解析）
+    #[serde(default)]
     #[schema(example = "1754545591")]
-    pub user_id: String,
+    pub user_id: Option<String>,
 
     /// 容器唯一标识（可选，对齐接口惯例；不改变 `.cache` 路径解析）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,10 +65,24 @@ pub struct CacheCleanRequest {
     #[schema(example = "tenant")]
     pub isolation_type: Option<String>,
 
-    /// 服务类型（可选，默认 `computer-agent-runner`；传其他值返回校验错误）
+    /// 服务类型（可选，默认 `computer-agent-runner`；userApp 分派传 `userapp`
+    /// 与 project_id 搭配——清 userApp 开发工作区内的 .cache）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
+
+    /// userApp 分派形态下兼任 app_id（对齐 /computer/chat 契约，不设独立
+    /// app_id 字段）——清 dev 工作区 `dev/{owner}/{app_id}/.cache`（app 项目
+    /// 自身的构建缓存如 vite/webpack 输出）；computer 路径不消费本字段
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "app_001")]
+    pub project_id: Option<String>,
+
+    /// userApp 应用阶段 dev/prod（缺省 dev）——userApp 分派仅支持 dev：
+    /// 构建缓存只存在于开发工作区，prod 运行容器无构建缓存语义
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
 }
 
 /// 清理 user `.cache` 缓存响应
@@ -109,23 +125,43 @@ pub struct CacheCleanResponse {
                    回收空间。只清 .cache，不动其他目录。computer-agent 的 workspace 固定按 user_id，\
                    pod_id/tenant_id/space_id 等可选字段对齐接口惯例但不改变路径解析。"
 )]
-#[instrument(skip_all, fields(user_id = %request.user_id))]
+#[instrument(skip_all, fields(user_id = ?request.user_id.as_deref()))]
 pub async fn computer_cache_clean(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     I18nJsonOrQuery(request): I18nJsonOrQuery<CacheCleanRequest>,
 ) -> Result<HttpResult<CacheCleanResponse>, AppError> {
     let locale = current_request_locale();
 
-    // 1. 校验 user_id
-    let user_id = request.user_id.trim();
-    if user_id.is_empty() {
+    // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；构建缓存
+    //    只存在于 dev 开发工作区）。user_id 此形态下可省略——owner 从 app
+    //    元数据解析（显式传 > metadata > fail-fast，与 ensure_userapp_builder 同源）
+    match super::pod_handler::parse_agent_userapp_dispatch(
+        request.service_type.as_deref(),
+        request.project_id.as_deref(),
+        request.app_stage.as_deref(),
+    ) {
+        Ok(Some(app_id)) => {
+            info!("[CACHE_CLEAN] userApp dev dispatch: app_id={app_id}");
+            return cache_clean_userapp_dev(state.as_ref(), &app_id, &request).await;
+        }
+        Ok(None) => {}
+        Err(e) => return Ok(super::pod_handler::invalid_app_target_response(locale, &e)),
+    }
+
+    // 1. 校验 user_id（computer 路径必填）
+    let user_id = request
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(user_id) = user_id else {
         warn!("[CACHE_CLEAN] rejected: empty user_id");
         return Ok(HttpResult::error_with_message(
             ERR_VALIDATION,
             locale,
             "user_id is required and cannot be empty",
         ));
-    }
+    };
 
     // 2. 校验 service_type（仅支持 computer-agent-runner）
     if let Some(ref st) = request.service_type
@@ -197,6 +233,55 @@ async fn clean_cache_dir(cache_dir: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(deleted)
+}
+
+/// userApp dev 分派：清 app 开发工作区的 `.cache`（app 项目自身的构建缓存，
+/// 如 vite/webpack 输出）。
+///
+/// 目标路径 = `{USERAPP_WORKSPACE_ROOT}/dev/{owner}/{app_id}/.cache`（dev 四
+/// 目录中工作区段的隐藏缓存目录）。owner 三档解析与 ensure_userapp_builder
+/// 同源（显式 user_id > app 元数据 > fail-fast，绝不兜底 app_id——防宿主树
+/// 挂错位置不可回收）；owner 过 identifier 白名单（防路径穿越）。
+async fn cache_clean_userapp_dev(
+    state: &AppState,
+    app_id: &str,
+    request: &CacheCleanRequest,
+) -> Result<HttpResult<CacheCleanResponse>, AppError> {
+    // owner 解析：显式 user_id > metadata（get_app_owner）> fail-fast
+    let metadata_owner = state.app_service.get_app_owner(app_id).await;
+    let owner = crate::userapp_builder::resolve_owner(
+        request.user_id.as_deref(),
+        metadata_owner.as_deref(),
+    )
+    .map_err(|e| {
+        warn!("[CACHE_CLEAN][USERAPP] cannot resolve owner: app_id={app_id}: {e}");
+        AppError::with_message(
+            ERR_VALIDATION,
+            "cannot resolve owner user_id for app; pass user_id explicitly",
+        )
+    })?;
+    shared_types::validate_identifier(&owner, "user_id").map_err(|e| {
+        warn!("[CACHE_CLEAN][USERAPP] rejected: invalid owner={owner}: {e}");
+        AppError::with_message(ERR_VALIDATION, e.to_string())
+    })?;
+
+    let cache_dir = Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+        .join("dev")
+        .join(&owner)
+        .join(app_id)
+        .join(".cache");
+
+    // 复用 computer 路径的清理实现（幂等、不跟随符号链接、保留 .cache 本身）
+    let deleted = clean_cache_dir(&cache_dir).await?;
+
+    info!(
+        "[CACHE_CLEAN][USERAPP] cleaned app dev workspace cache: app_id={app_id}, owner={owner}, deleted_entries={deleted}",
+    );
+
+    Ok(HttpResult::success(CacheCleanResponse {
+        user_id: owner,
+        deleted_entries: deleted,
+    }))
 }
 
 #[cfg(test)]
@@ -282,5 +367,25 @@ mod tests {
             fs::read(outside.join("keep").join("data")).await.unwrap(),
             b"precious"
         );
+    }
+
+    /// 契约钉住：userApp 分派 wire 形态 = service_type=userapp +
+    /// project_id 兼任 app_id + app_stage 可缺省（user_id 可省略——owner
+    /// 从 app 元数据解析）；既有 computer 形态（user_id 必传）不受影响。
+    #[test]
+    fn cache_clean_request_deserializes_userapp_wire_form() {
+        let raw = r#"{"service_type":"userapp","project_id":"app-1"}"#;
+        let req: CacheCleanRequest = serde_json::from_str(raw)
+            .unwrap_or_else(|e| panic!("userApp 形态 {raw} 应可反序列化: {e}"));
+        assert_eq!(req.service_type.as_deref(), Some("userapp"));
+        assert_eq!(req.project_id.as_deref(), Some("app-1"));
+        assert!(req.app_stage.is_none());
+        assert!(req.user_id.is_none());
+
+        let legacy = r#"{"user_id":"1754545591"}"#;
+        let req: CacheCleanRequest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(req.user_id.as_deref(), Some("1754545591"));
+        assert!(req.service_type.is_none());
+        assert!(req.project_id.is_none());
     }
 }

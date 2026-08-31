@@ -332,22 +332,71 @@ pub(super) fn parse_app_target(
         );
     }
     shared_types::validate_identifier(app_id, "app_id").map_err(|e| e.to_string())?;
-    match app_stage
+    let stage_raw = app_stage
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("dev")
-    {
-        "dev" => Ok(AppTarget::Dev(app_id.to_owned())),
-        "prod" => Ok(AppTarget::Prod(app_id.to_owned())),
-        other => Err(format!(
-            "invalid app_stage {other:?}: expected \"dev\" or \"prod\""
+        .unwrap_or("dev");
+    match shared_types::UserappStage::parse(stage_raw) {
+        Some(shared_types::UserappStage::Dev) => Ok(AppTarget::Dev(app_id.to_owned())),
+        Some(shared_types::UserappStage::Prod) => Ok(AppTarget::Prod(app_id.to_owned())),
+        None => Err(format!(
+            "invalid app_stage {stage_raw:?}: expected \"dev\" or \"prod\""
         )),
     }
 }
 
-/// userApp 分派参数校验失败的统一响应（ensure/keepalive/restart 三 handler 复用）。
-pub(super) fn invalid_app_target_response<T>(locale: &str, e: &str) -> HttpResult<T> {
+/// userApp 分派参数校验失败的统一响应（pod 五 handler 与 computer/agent 族共用）。
+pub(crate) fn invalid_app_target_response<T>(locale: &str, e: &str) -> HttpResult<T> {
     HttpResult::error_with_message(shared_types::error_codes::ERR_VALIDATION, locale, e)
+}
+
+/// agent 族接口（status/stop/cancel/notify-resolved/cache-clean）的 userApp
+/// 分派解析——wire 形态对齐 `/computer/chat`：`service_type=userapp` +
+/// **project_id 兼任 app_id**（对外不设独立 app_id 字段，内部以 app_id
+/// 语义消费该值）+ `app_stage`（缺省 dev）。
+///
+/// 与 pod 族 `parse_app_target` 的差异：pod 操作容器本体（dev/prod 双态，
+/// 独立 app_id 字段）；agent 族操作 agent 会话与构建缓存——只存在于 dev
+/// 阶段的 UserAppBuilder 开发容器，`app_stage=prod` 直接校验失败。
+///
+/// - `Ok(Some(app_id))`：userApp 分派（app_id = project_id 的值）
+/// - `Ok(None)`：computer 既有路径（service_type 非 userapp 或未传——
+///   其余 service_type 值交由 computer 路径自身的校验处理）
+/// - `Err`：service_type=userapp 但 project_id 缺失 / project_id 非法
+///   标识符（进入容器名与路径拼接）/ app_stage 非 dev|prod 或为 prod
+pub(crate) fn parse_agent_userapp_dispatch(
+    service_type: Option<&str>,
+    project_id: Option<&str>,
+    app_stage: Option<&str>,
+) -> Result<Option<String>, String> {
+    let service_type = service_type.map(str::trim).filter(|s| !s.is_empty());
+    let service_type_is_userapp = service_type
+        .map(|s| s.to_ascii_lowercase())
+        .is_some_and(|s| matches!(s.parse::<ServiceType>(), Ok(ServiceType::UserApp)));
+    if !service_type_is_userapp {
+        return Ok(None);
+    }
+    let Some(app_id) = project_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err(
+            "service_type 'userapp' requires project_id (project_id 兼任 app_id)".to_string(),
+        );
+    };
+    shared_types::validate_identifier(app_id, "app_id").map_err(|e| e.to_string())?;
+    let stage_raw = app_stage
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("dev");
+    match shared_types::UserappStage::parse(stage_raw) {
+        Some(shared_types::UserappStage::Dev) => Ok(Some(app_id.to_owned())),
+        Some(shared_types::UserappStage::Prod) => Err(
+            "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 \
+             (UserAppBuilder 开发容器)"
+                .to_string(),
+        ),
+        None => Err(format!(
+            "invalid app_stage {stage_raw:?}: expected \"dev\" or \"prod\""
+        )),
+    }
 }
 
 /// 注册 VNC backend + 更新存储记录 + 构建成功响应。

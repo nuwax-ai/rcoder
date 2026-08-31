@@ -172,6 +172,23 @@ pub struct ComputerAgentStatusRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "project")]
     pub isolation_type: Option<String>,
+
+    /// userApp 分派标记（值 `userapp`，大小写不敏感）——与 project_id 搭配
+    /// 表示按 userApp 应用定位：**project_id 兼任 app_id**（对齐 /computer/chat
+    /// 契约，不设独立 app_id 字段），定位 UserAppBuilder 开发容器；agent 会话
+    /// 仅存在于 dev 阶段。不传时走既有 computer 路径
+    #[garde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "userapp")]
+    pub service_type: Option<String>,
+
+    /// userApp 应用阶段 dev/prod（缺省 dev）——本接口 userApp 分派仅支持
+    /// dev：agent 会话只存在于 UserAppBuilder 开发容器，prod 运行容器
+    /// 无 agent 会话
+    #[garde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
 }
 
 /// Computer Agent 状态查询响应
@@ -276,6 +293,23 @@ pub struct ComputerAgentStopRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "project")]
     pub isolation_type: Option<String>,
+
+    /// userApp 分派标记（值 `userapp`，大小写不敏感）——与 project_id 搭配
+    /// 表示按 userApp 应用定位：**project_id 兼任 app_id**（对齐 /computer/chat
+    /// 契约，不设独立 app_id 字段），定位 UserAppBuilder 开发容器；agent 会话
+    /// 仅存在于 dev 阶段。不传时走既有 computer 路径
+    #[garde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "userapp")]
+    pub service_type: Option<String>,
+
+    /// userApp 应用阶段 dev/prod（缺省 dev）——本接口 userApp 分派仅支持
+    /// dev：agent 会话只存在于 UserAppBuilder 开发容器，prod 运行容器
+    /// 无 agent 会话
+    #[garde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
 }
 
 /// Computer Agent 停止响应
@@ -312,7 +346,8 @@ pub struct ComputerAgentCancelRequest {
     #[schema(example = "user_123")]
     pub user_id: Option<String>,
 
-    /// 项目 ID（必填）
+    /// 项目 ID（computer 路径与 userApp 分派均必填——userApp 场景下兼任
+    /// app_id，即 UserAppBuilder 开发容器标识）
     #[param(example = "project_456")]
     #[schema(example = "project_456")]
     pub project_id: String,
@@ -354,6 +389,23 @@ pub struct ComputerAgentCancelRequest {
     #[param(example = "project")]
     #[schema(example = "project")]
     pub isolation_type: Option<String>,
+
+    /// userApp 分派标记（值 `userapp`，大小写不敏感）——与 project_id 搭配
+    /// 表示按 userApp 应用定位：**project_id 兼任 app_id**（对齐 /computer/chat
+    /// 契约，不设独立 app_id 字段），定位 UserAppBuilder 开发容器；agent 会话
+    /// 仅存在于 dev 阶段。不传时走既有 computer 路径
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[param(example = "userapp")]
+    #[schema(example = "userapp")]
+    pub service_type: Option<String>,
+
+    /// userApp 应用阶段 dev/prod（缺省 dev）——本接口 userApp 分派仅支持
+    /// dev：agent 会话只存在于 UserAppBuilder 开发容器，prod 运行容器
+    /// 无 agent 会话
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[param(example = "dev")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
 }
 
 /// Computer Agent 取消响应
@@ -366,4 +418,45 @@ pub struct ComputerAgentCancelResponse {
     /// 会话 ID
     #[schema(example = "session_789")]
     pub session_id: String,
+}
+
+#[cfg(test)]
+mod userapp_dispatch_tests {
+    use super::*;
+
+    /// 契约钉住：agent 族接口（status/stop/cancel）的 userApp wire 形态 =
+    /// service_type=userapp + **project_id 兼任 app_id** + app_stage（可缺省），
+    /// 对齐 /computer/chat 契约——不设独立 app_id 字段，Java 侧统一传
+    /// project_id。缺 service_type 时 app_stage 缺省字段也不影响既有形态。
+    #[test]
+    fn agent_requests_deserialize_userapp_wire_form() {
+        let raw = r#"{"service_type":"userapp","project_id":"app-1","app_stage":"dev"}"#;
+        let status: ComputerAgentStatusRequest =
+            serde_json::from_str(raw).unwrap_or_else(|e| panic!("status {raw} 应可反序列化: {e}"));
+        assert_eq!(status.service_type.as_deref(), Some("userapp"));
+        assert_eq!(status.project_id.as_deref(), Some("app-1"));
+        assert_eq!(status.app_stage.as_deref(), Some("dev"));
+
+        let stop: ComputerAgentStopRequest =
+            serde_json::from_str(raw).unwrap_or_else(|e| panic!("stop {raw} 应可反序列化: {e}"));
+        assert_eq!(stop.service_type.as_deref(), Some("userapp"));
+
+        // cancel 的 project_id 为 String 必填（userApp 形态必传——兼任 app_id）
+        let cancel_raw = r#"{"service_type":"userapp","project_id":"app-1"}"#;
+        let cancel: ComputerAgentCancelRequest = serde_json::from_str(cancel_raw)
+            .unwrap_or_else(|e| panic!("cancel {cancel_raw} 应可反序列化: {e}"));
+        assert_eq!(cancel.project_id, "app-1");
+        assert!(cancel.app_stage.is_none());
+    }
+
+    /// 既有 computer 形态回归：不传三字段反序列化不受影响（全部缺省）。
+    #[test]
+    fn agent_requests_deserialize_legacy_computer_form() {
+        let raw = r#"{"user_id":"user_123","project_id":"project_456"}"#;
+        let status: ComputerAgentStatusRequest = serde_json::from_str(raw).unwrap();
+        assert!(status.service_type.is_none());
+        assert!(status.app_stage.is_none());
+        let stop: ComputerAgentStopRequest = serde_json::from_str(raw).unwrap();
+        assert!(stop.service_type.is_none());
+    }
 }

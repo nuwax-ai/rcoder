@@ -572,6 +572,32 @@ pub async fn computer_agent_session_cancel(
 ) -> Result<HttpResult<AgentCancelResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
 
+    // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；agent 会话
+    //    仅存在于 dev 的 UserAppBuilder）。CancelIdentifier::Project 的定位 =
+    //    project 映射优先——正是 builder 容器的注册位置，容器 miss 走幂等成功
+    match super::pod_handler::parse_agent_userapp_dispatch(
+        request.service_type.as_deref(),
+        Some(request.project_id.as_str()),
+        request.app_stage.as_deref(),
+    ) {
+        Ok(Some(app_id)) => {
+            info!(
+                "🛑 [COMPUTER_CANCEL] userApp dev dispatch: app_id={app_id}, session_id={:?}",
+                request.session_id
+            );
+            return handle_session_cancel_internal_v2(
+                &state,
+                CancelIdentifier::Project(app_id.clone()),
+                app_id,
+                request.session_id,
+                locale,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(e) => return Ok(super::pod_handler::invalid_app_target_response(locale, &e)),
+    }
+
     let identifier = match (&request.user_id, &request.pod_id) {
         (Some(user_id), _) if !user_id.trim().is_empty() => CancelIdentifier::User(user_id.clone()),
         (_, Some(pod_id)) if !pod_id.trim().is_empty() => CancelIdentifier::Pod(pod_id.clone()),

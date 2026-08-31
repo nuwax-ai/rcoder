@@ -7,6 +7,7 @@
 //! - `GET /computer/pod/list` - 获取所有容器信息（支持分页）
 //! - `POST /computer/pod/ensure` - 启动/确保容器存在（幂等）
 //! - `POST /computer/pod/keepalive` - 容器保活（刷新活动时间）
+//! - `POST /computer/pod/stop` - 停止并销毁容器（保留数据卷）
 
 use axum::extract::State;
 use std::sync::Arc;
@@ -33,14 +34,20 @@ mod keepalive;
 mod queries;
 mod restart;
 mod status;
+mod stop;
 #[cfg(test)]
 mod tests;
 mod types;
 
 pub use ensure::*;
 pub(crate) use helpers::resolve_resource_limits_from_config;
+/// agent 族接口（status/stop/cancel/notify-resolved/cache-clean）的 userApp
+/// 分派共用件——wire 形态 service_type=userapp + project_id 兼任 app_id +
+/// app_stage（仅 dev），校验规则与词表见函数 doc（单一事实源）
+pub(crate) use helpers::{invalid_app_target_response, parse_agent_userapp_dispatch};
 pub use keepalive::*;
 pub use queries::*;
 pub use restart::*;
 pub use status::*;
+pub use stop::*;
 pub use types::*;

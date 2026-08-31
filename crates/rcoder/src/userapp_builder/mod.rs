@@ -184,7 +184,8 @@ async fn create_builder_and_register(
 /// dev 宿主树 owner 解析（纯函数）：显式传 > metadata 注册值 > 报错。
 ///
 /// 空白字符串视为未传（pod 分派层 body 字段可能携空串）。
-fn resolve_owner(explicit: Option<&str>, metadata: Option<&str>) -> Result<String> {
+/// cache/clean 的 userApp 分派共用（owner 三档同源）。
+pub(crate) fn resolve_owner(explicit: Option<&str>, metadata: Option<&str>) -> Result<String> {
     if let Some(uid) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(uid.to_string());
     }
