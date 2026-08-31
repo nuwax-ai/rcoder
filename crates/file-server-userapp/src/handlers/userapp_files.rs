@@ -187,9 +187,9 @@ pub(crate) async fn files_update(
 
 /// 单文件上传（multipart）
 ///
-/// 上传单个文件/压缩包到开发卷：`file_path` 指定 workspace 内相对路径，
-/// zip/tar.gz 按魔数自动解压（单文件直写）。`custom_target_dir` 可覆盖
-/// workspace 根（Java 侧负责合法性）。
+/// 上传单个文件到开发卷：`file_path` 指定 workspace 内相对路径，按原字节
+/// 直写落盘（不解析压缩包——zip/tar.gz 保存为文件本体）。`custom_target_dir`
+/// 可覆盖 workspace 根（Java 侧负责合法性）。
 #[utoipa::path(post, path = "/upload-file", request_body(content = UserappUploadFileForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 双态 · 文件镜像")]
 pub(crate) async fn upload_file(
     State(state): State<UserAppState>,
