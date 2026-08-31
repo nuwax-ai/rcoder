@@ -120,7 +120,18 @@ fn init_tracing(log_dir: &std::path::Path) -> Arc<tracing_appender::non_blocking
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
+        // 文件层 JSON 行格式（flatten_event 平铺 message，去掉 span 结构）：
+        // 输出 {"timestamp","level","message"} 顶层三键，与 /v1/logs 的 orchestrator
+        // 内置源解析（log::read parse_line Jsonl 分支）直接匹配——编排日志因此
+        // 支持 levels/since/until 过滤。人类阅读走 stderr / supervisord out 文本。
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_writer(non_blocking),
+        )
         .init();
 
     guard

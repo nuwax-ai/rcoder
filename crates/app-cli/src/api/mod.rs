@@ -479,6 +479,31 @@ mod tests {
         assert_eq!(body["data"].as_object().unwrap().len(), 4);
     }
 
+    /// sources/query 端点信封：idle 态编排器内置源（app-cli/orchestrator）可见
+    /// ——空容器排障正是该源的核心场景。
+    #[tokio::test]
+    async fn logs_sources_query_envelope_with_orchestrator_source() {
+        let state = test_state();
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/v1/logs/sources/query",
+            r#"{"selectors": []}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "0000");
+        assert_eq!(body["success"], true);
+        let sources = body["data"].as_array().expect("sources array");
+        assert!(
+            sources
+                .iter()
+                .any(|source| source["service_id"] == "app-cli"
+                    && source["source_id"] == "orchestrator"),
+            "{sources:?}"
+        );
+    }
+
     /// 业务错误信封：INVALID_LOG_QUERY + data 恒 null（未知 service selector）。
     #[tokio::test]
     async fn logs_query_invalid_selector_error_envelope() {

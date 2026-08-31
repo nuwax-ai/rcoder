@@ -18,7 +18,10 @@ use super::model::{
 };
 use super::read::read_file;
 pub use super::sources::LogLayout;
-use super::sources::{MatchedLogFile, SelectedSource, file_identity, inject_runtime_log_sources};
+use super::sources::{
+    MatchedLogFile, ORCHESTRATOR_SERVICE_ID, SelectedSource, file_identity,
+    inject_orchestrator_log_source, inject_runtime_log_sources, orchestrator_service,
+};
 
 const MAX_FILES_PER_SOURCE: usize = 128;
 #[derive(Clone)]
@@ -38,6 +41,7 @@ impl LogService {
 
     pub fn with_layout(mut release: ReleaseLock, log_root: PathBuf, layout: LogLayout) -> Self {
         inject_runtime_log_sources(&mut release, layout);
+        inject_orchestrator_log_source(&mut release);
         Self {
             services: release
                 .services
@@ -51,9 +55,10 @@ impl LogService {
     }
 
     /// 未部署（idle）形态：空服务集，boot_id 固定 "idle"（无代际可言）。
+    /// 编排器源仍注入——空容器/部署失败恰是最需要 app-cli 自身日志的场景。
     pub fn idle(log_root: PathBuf) -> Self {
         Self {
-            services: Vec::new(),
+            services: vec![orchestrator_service()],
             log_root,
             boot_id: "idle".to_string(),
             layout: LogLayout::Builtin,
@@ -69,6 +74,7 @@ impl LogService {
         layout: LogLayout,
     ) -> Self {
         inject_runtime_log_sources(&mut release, layout);
+        inject_orchestrator_log_source(&mut release);
         Self {
             services: release
                 .services
@@ -272,8 +278,12 @@ impl LogService {
     }
 
     fn match_files(&self, selected: &SelectedSource) -> Result<Vec<MatchedLogFile>> {
-        let directory = if self.layout == LogLayout::Supervisord && selected.source.id == "runtime"
+        let directory = if selected.service_id == ORCHESTRATOR_SERVICE_ID
+            && selected.source.id == "orchestrator"
         {
+            // 编排器源：app-cli 自身日志直接落在 log_root 根目录（非 {svc}/ 子目录）
+            self.log_root.clone()
+        } else if self.layout == LogLayout::Supervisord && selected.source.id == "runtime" {
             self.log_root.join("services")
         } else {
             // 用户声明源（应用自写文件）两布局同目录：{log_root}/{svc}/
@@ -461,6 +471,7 @@ impl LogService {
 mod tests {
     use workspace_manifest::LogSource;
 
+    use super::super::model::LogSelector;
     use super::super::read::MAX_LINE_BYTES;
     use super::*;
 
@@ -512,8 +523,10 @@ format = "jsonl"
         let second = directory.join("application-2.log");
         std::fs::write(&first, "").expect("first log");
         std::fs::write(&second, "").expect("second log");
-        // 平台注入的 runtime 源也需有匹配文件，避免其 source error 干扰断言。
+        // 平台注入的 runtime 源与内置 orchestrator 源也需有匹配文件，
+        // 避免其 source error 干扰断言。
         std::fs::write(directory.join("runtime.out.log"), "").expect("runtime log");
+        std::fs::write(root.path().join("app-cli.log.2026-01-01"), "").expect("orchestrator log");
         let service = LogService::new(release_lock(), root.path().to_path_buf());
 
         let initial = service
@@ -554,6 +567,7 @@ format = "jsonl"
         let root = tempfile::tempdir().expect("log root");
         std::fs::create_dir_all(root.path().join("api")).expect("service log directory");
         std::fs::write(root.path().join("api/application.log"), "").expect("log file");
+        std::fs::write(root.path().join("app-cli.log.2026-01-01"), "").expect("orchestrator log");
         let first = LogService::new(release_lock(), root.path().to_path_buf());
         let cursor = first
             .query(LogQueryRequest::default())
@@ -580,7 +594,8 @@ format = "jsonl"
             .sources(LogQueryRequest::default())
             .await
             .expect("sources query");
-        assert_eq!(sources.len(), 1);
+        // api/runtime + 内置 app-cli/orchestrator（空 selectors 全遍历）。
+        assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].service_id, "api");
         assert_eq!(sources[0].source_id, "runtime");
         assert_eq!(sources[0].format, "text");
@@ -600,20 +615,22 @@ format = "jsonl"
             .sources(LogQueryRequest::default())
             .await
             .expect("sources query");
-        assert_eq!(sources.len(), 1);
+        // api/runtime（用户声明）+ 内置 app-cli/orchestrator。
+        assert_eq!(sources.len(), 2);
         // 用户已声明同 id source：不重复注入，且保留用户声明（jsonl 而非平台合成 text）。
         assert_eq!(sources[0].format, "jsonl");
     }
 
     #[tokio::test]
     async fn injected_runtime_source_coexists_with_user_declared_sources() {
-        // release_lock() 已声明 application 源；runtime 源应共存不覆盖。
+        // release_lock() 已声明 application 源；runtime 源应共存不覆盖，
+        // 内置 app-cli/orchestrator 源并存。
         let service = LogService::new(release_lock(), PathBuf::from("/nonexistent-log-root"));
         let sources = service
             .sources(LogQueryRequest::default())
             .await
             .expect("sources query");
-        assert_eq!(sources.len(), 2);
+        assert_eq!(sources.len(), 3);
         let ids: Vec<&str> = sources
             .iter()
             .map(|source| source.source_id.as_str())
@@ -631,6 +648,8 @@ format = "jsonl"
         let outside = tempfile::tempdir().expect("outside directory");
         std::fs::write(outside.path().join("application.log"), "secret\n").expect("outside log");
         symlink(outside.path(), root.path().join("api")).expect("service directory symlink");
+        // 内置 orchestrator 源匹配 log_root 根目录，须有真实文件避免其 error 混入断言。
+        std::fs::write(root.path().join("app-cli.log.2026-01-01"), "").expect("orchestrator log");
         let service = LogService::new(release_lock(), root.path().to_path_buf());
 
         let response = service
@@ -646,5 +665,86 @@ format = "jsonl"
                 .iter()
                 .all(|error| error.message.contains("must be a real directory"))
         );
+    }
+
+    /// 内置编排器源：空 selectors 可见，文件匹配走 log_root 根目录特判，
+    /// JSON 行（文件层 JSON 化产物）解析出 timestamp/level/message。
+    #[tokio::test]
+    async fn orchestrator_source_matches_root_directory_glob() {
+        let root = tempfile::tempdir().expect("log root");
+        std::fs::write(
+            root.path().join("app-cli.log.2026-08-31"),
+            "{\"timestamp\":\"2026-08-31T00:00:00Z\",\"level\":\"INFO\",\"message\":\"🚀 start web\"}\n",
+        )
+        .expect("orchestrator log");
+        let service = LogService::new(release_lock(), root.path().to_path_buf());
+
+        let sources = service
+            .sources(LogQueryRequest::default())
+            .await
+            .expect("sources query");
+        let orchestrator = sources
+            .iter()
+            .find(|source| source.service_id == "app-cli")
+            .expect("orchestrator source present");
+        assert_eq!(orchestrator.source_id, "orchestrator");
+        assert_eq!(orchestrator.format, "jsonl");
+        assert!(
+            orchestrator
+                .matched_files
+                .contains(&"app-cli.log.2026-08-31".to_string())
+        );
+
+        let response = service
+            .query(LogQueryRequest {
+                selectors: vec![LogSelector {
+                    service_id: "app-cli".into(),
+                    source_ids: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await
+            .expect("orchestrator query");
+        let record = response
+            .logs
+            .iter()
+            .find(|log| log.service_id == "app-cli")
+            .expect("orchestrator record");
+        assert_eq!(record.level.as_deref(), Some("INFO"));
+        assert!(record.message.contains("🚀 start web"), "{record:?}");
+    }
+
+    /// 用户 manifest 占用 "app-cli" 服务名时不注入（用户声明优先），且其
+    /// 日志目录解析不受编排器根目录特判影响。
+    #[tokio::test]
+    async fn orchestrator_source_skipped_when_service_id_taken() {
+        let mut release = release_lock();
+        release.services[0].service_id = "app-cli".into();
+        let service = LogService::new(release, PathBuf::from("/nonexistent-log-root"));
+        let sources = service
+            .sources(LogQueryRequest::default())
+            .await
+            .expect("sources query");
+        assert!(
+            !sources
+                .iter()
+                .any(|source| source.source_id == "orchestrator"),
+            "{sources:?}"
+        );
+    }
+
+    /// idle 形态（空容器/未部署）仍注入编排器源——部署失败排障恰需此源。
+    #[tokio::test]
+    async fn idle_service_still_exposes_orchestrator_source() {
+        let root = tempfile::tempdir().expect("log root");
+        std::fs::write(root.path().join("app-cli.log.2026-08-31"), "{}\n").expect("log");
+        let service = LogService::idle(root.path().to_path_buf());
+        let sources = service
+            .sources(LogQueryRequest::default())
+            .await
+            .expect("sources query");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].service_id, "app-cli");
+        assert_eq!(sources[0].source_id, "orchestrator");
     }
 }
