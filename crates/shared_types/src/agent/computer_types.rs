@@ -488,7 +488,6 @@ mod userapp_dispatch_tests {
         assert_eq!(cancel.app_id.as_deref(), Some("app-1"));
         assert!(cancel.project_id.is_none());
         assert!(cancel.app_stage.is_none());
-
     }
 
     /// 契约钉住：/computer/chat 的 userApp wire 形态（service_type 枚举 +
