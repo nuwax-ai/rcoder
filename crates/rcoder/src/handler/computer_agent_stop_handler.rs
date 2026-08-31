@@ -68,7 +68,7 @@ use super::utils::{I18nJsonOrQuery, extract_grpc_addr, get_locale_from_headers};
     tag = "computer",
     operation_id = "computer_agent_stop",
     summary = "停止 Computer Agent",
-    description = "停止特定 project_id 的 Agent，不销毁容器"
+    description = "停止特定 project_id 的 Agent，不销毁容器。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserAppBuilder 开发容器，agent 会话仅 dev 阶段。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_agent_stop(

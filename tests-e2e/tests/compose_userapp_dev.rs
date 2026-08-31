@@ -1206,3 +1206,147 @@ async fn userapp_dev_server_lifecycle() {
     assert_hard_all(report).await;
     cleanup_builder(&app);
 }
+
+// ============================================================
+// 场景 5：agent 族接口 userApp 分派（service_type=userapp +
+// project_id 兼任 app_id + app_stage 缺省 dev）
+// ============================================================
+/// 分派正向链：dev chat 建会话 → status 分派（is_alive + session 回显）→
+/// cancel 分派（幂等 success）→ stop 分派 → cache-clean 分派（owner 显式）
+/// → computer 旧形态回归（不带 service_type 不炸）。
+async fn scenario_userapp_agent_dispatch(backend: Backend) {
+    let scenario = "userapp_agent_dispatch";
+    let Some((env, report)) = Env::compose_or_skip(scenario, backend.as_str()).await else {
+        return;
+    };
+    let app = scoped_app(&env, &format!("ad-{}", backend.as_str()));
+    let user = "e2e-ud-user";
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // dev chat 建会话（分派的目标会话；短 prompt 控制时长）
+    let mut req = env.base_payload(backend, "只回复 ok", &format!("{}-adp", env.run_tag), user);
+    req.service_type = Some(shared_types::ChatServiceScope::Userapp);
+    req.project_id = Some(app.clone());
+    let sid = match chat_reported(&env, &report, "dispatch_chat", &env.rcoder, &req).await {
+        Ok(d) if !d.session_id.is_empty() => d.session_id,
+        _ => {
+            report.assert_hard("chat 建会话", false, "chat 失败".into());
+            assert_hard_all(report).await;
+            cleanup_builder(&app);
+            return;
+        }
+    };
+    report.assert_hard("chat 建会话", true, sid.clone());
+    // 等 turn 收尾（会话映射在响应后写入；status 读取依赖其落库）
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    // 通用 POST（信封解析；五接口全部 HTTP 200 + code/success 判定）
+    async fn post(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, Value) {
+        let resp = env
+            .http
+            .post(format!("{}/{path}", env.rcoder))
+            .timeout(Duration::from_secs(120))
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{path} post: {e}"));
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    // ① status 分派：is_alive=true + 会话回显（映射+GetStatus 双确认）
+    let (st, body) = post(
+        &env,
+        "computer/agent/status",
+        json!({"service_type": "userapp", "project_id": app}),
+    )
+    .await;
+    let ok = st.is_success()
+        && http_ok(&body)
+        && body["data"]["is_alive"].as_bool() == Some(true)
+        && body["data"]["session_id"].as_str() == Some(sid.as_str());
+    report.assert_hard(
+        "status 分派 alive+session 回显",
+        ok,
+        format!("HTTP {st}, {}", trunc(&body, 160)),
+    );
+
+    // ② cancel 分派：幂等 success（会话已结束或仍活跃均成功）
+    let (st, body) = post(
+        &env,
+        "computer/agent/session/cancel",
+        json!({"service_type": "userapp", "project_id": app, "session_id": sid}),
+    )
+    .await;
+    let ok = st.is_success() && http_ok(&body) && body["data"]["success"].as_bool() == Some(true);
+    report.assert_hard(
+        "cancel 分派 success",
+        ok,
+        format!("HTTP {st}, {}", trunc(&body, 160)),
+    );
+
+    // ③ stop 分派：停掉 app 会话的 agent（builder 容器继续运行）
+    let (st, body) = post(
+        &env,
+        "computer/agent/stop",
+        json!({"service_type": "userapp", "project_id": app}),
+    )
+    .await;
+    let ok = st.is_success() && http_ok(&body) && body["data"]["success"].as_bool() == Some(true);
+    report.assert_hard(
+        "stop 分派 success",
+        ok,
+        format!("HTTP {st}, {}", trunc(&body, 160)),
+    );
+
+    // ④ cache-clean 分派：owner 显式传（清 dev 工作区 .cache，幂等）
+    let (st, body) = post(
+        &env,
+        "computer/cache/clean",
+        json!({"service_type": "userapp", "project_id": app, "user_id": user}),
+    )
+    .await;
+    let ok = st.is_success() && http_ok(&body);
+    report.assert_hard(
+        "cache-clean 分派 success",
+        ok,
+        format!("HTTP {st}, {}", trunc(&body, 160)),
+    );
+
+    // ⑤ computer 旧形态回归：不带 service_type 走原路径（信封完整不炸）
+    let (st, body) = post(
+        &env,
+        "computer/agent/status",
+        json!({"user_id": user, "project_id": app}),
+    )
+    .await;
+    let ok = st.is_success() && body["success"].is_boolean();
+    report.assert_hard(
+        "computer 旧形态回归（无 service_type）",
+        ok,
+        format!("HTTP {st}, {}", trunc(&body, 160)),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
+#[tokio::test]
+async fn userapp_agent_dispatch_openai() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    scenario_userapp_agent_dispatch(Backend::Openai).await;
+}
+
+#[tokio::test]
+async fn userapp_agent_dispatch_anthropic() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    scenario_userapp_agent_dispatch(Backend::Anthropic).await;
+}

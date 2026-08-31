@@ -304,7 +304,7 @@ pub async fn agent_notify_resolved(
     tag = "computer",
     operation_id = "computer_notify_resolved",
     summary = "处理 Computer Agent 权限审批结果",
-    description = "将用户权限审批结果转发到 Computer Agent 容器内的 agent_runner 服务"
+    description = "将用户权限审批结果转发到 Computer Agent 容器内的 agent_runner 服务。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserAppBuilder 开发容器，agent 会话仅 dev 阶段。"
 )]
 pub async fn computer_notify_resolved(
     State(state): State<Arc<AppState>>,

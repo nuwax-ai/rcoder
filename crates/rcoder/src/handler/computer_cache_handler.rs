@@ -125,7 +125,7 @@ pub struct CacheCleanResponse {
     summary = "清理 user 的 .cache 缓存",
     description = "清空 /app/computer-project-workspace/{user_id}/.cache 下所有内容（可再生缓存），\
                    回收空间。只清 .cache，不动其他目录。computer-agent 的 workspace 固定按 user_id，\
-                   pod_id/tenant_id/space_id 等可选字段对齐接口惯例但不改变路径解析。"
+                   pod_id/tenant_id/space_id 等可选字段对齐接口惯例但不改变路径解析。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id）清开发工作区 dev/{owner}/{app_id}/.cache（app 项目构建缓存，仅 dev 阶段）。"
 )]
 #[instrument(skip_all, fields(user_id = ?request.user_id.as_deref()))]
 pub async fn computer_cache_clean(
