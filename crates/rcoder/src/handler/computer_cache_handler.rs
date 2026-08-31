@@ -66,7 +66,8 @@ pub struct CacheCleanRequest {
     pub isolation_type: Option<String>,
 
     /// 服务类型（可选，默认 `computer-agent-runner`；userApp 分派传 `userapp`
-    /// 与 project_id 搭配——清 userApp 开发工作区内的 .cache）
+    /// 与 project_id 搭配——**project_id 兼任 app_id**（对齐 /computer/chat
+    /// 契约），清 userApp 开发工作区内的 .cache）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
@@ -78,8 +79,9 @@ pub struct CacheCleanRequest {
     #[schema(example = "app_001")]
     pub project_id: Option<String>,
 
-    /// userApp 应用阶段 dev/prod（缺省 dev）——userApp 分派仅支持 dev：
-    /// 构建缓存只存在于开发工作区，prod 运行容器无构建缓存语义
+    /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
+    /// userApp 分派仅支持 dev：构建缓存只存在于开发工作区，prod 运行
+    /// 容器无构建缓存语义
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "dev")]
     pub app_stage: Option<String>,

@@ -182,9 +182,9 @@ pub struct ComputerAgentStatusRequest {
     #[schema(example = "userapp")]
     pub service_type: Option<String>,
 
-    /// userApp 应用阶段 dev/prod（缺省 dev）——本接口 userApp 分派仅支持
-    /// dev：agent 会话只存在于 UserAppBuilder 开发容器，prod 运行容器
-    /// 无 agent 会话
+    /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
+    /// 本接口 userApp 分派仅支持 dev：agent 会话只存在于 UserAppBuilder
+    /// 开发容器，prod 运行容器无 agent 会话
     #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "dev")]
@@ -303,9 +303,9 @@ pub struct ComputerAgentStopRequest {
     #[schema(example = "userapp")]
     pub service_type: Option<String>,
 
-    /// userApp 应用阶段 dev/prod（缺省 dev）——本接口 userApp 分派仅支持
-    /// dev：agent 会话只存在于 UserAppBuilder 开发容器，prod 运行容器
-    /// 无 agent 会话
+    /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
+    /// 本接口 userApp 分派仅支持 dev：agent 会话只存在于 UserAppBuilder
+    /// 开发容器，prod 运行容器无 agent 会话
     #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "dev")]
@@ -399,9 +399,9 @@ pub struct ComputerAgentCancelRequest {
     #[schema(example = "userapp")]
     pub service_type: Option<String>,
 
-    /// userApp 应用阶段 dev/prod（缺省 dev）——本接口 userApp 分派仅支持
-    /// dev：agent 会话只存在于 UserAppBuilder 开发容器，prod 运行容器
-    /// 无 agent 会话
+    /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
+    /// 本接口 userApp 分派仅支持 dev：agent 会话只存在于 UserAppBuilder
+    /// 开发容器，prod 运行容器无 agent 会话
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[param(example = "dev")]
     #[schema(example = "dev")]

@@ -50,8 +50,9 @@ pub struct ResolvePermissionHttpRequest {
     )]
     pub service_type: Option<String>,
 
-    /// userApp 应用阶段 dev/prod（缺省 dev）——userApp 分派仅支持 dev：
-    /// agent 会话只存在于 UserAppBuilder 开发容器，prod 运行容器无 agent 会话
+    /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
+    /// userApp 分派仅支持 dev：agent 会话只存在于 UserAppBuilder 开发容器，
+    /// prod 运行容器无 agent 会话
     #[serde(default, alias = "appStage", skip_serializing_if = "Option::is_none")]
     pub app_stage: Option<String>,
 }
