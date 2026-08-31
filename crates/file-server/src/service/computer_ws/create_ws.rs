@@ -91,29 +91,55 @@ pub async fn create_workspace(
             crate::service::zip::extract_to(source.to_path_buf(), extract_root.clone()).await;
         match extract_res {
             Ok(()) => {
-                // skills/: 逐子目录移动覆盖
+                // skills/: 逐子目录移动覆盖 (读目录/遍历失败要留痕, 不能静默吞掉整包 skill)
                 if let Some(src_skills) = find_dir(&extract_root, "skills").await {
-                    if let Ok(mut rd) = fs::read_dir(&src_skills).await {
-                        while let Ok(Some(entry)) = rd.next_entry().await {
-                            let ft = match entry.file_type().await {
-                                Ok(t) => t,
-                                Err(_) => continue,
-                            };
-                            if !ft.is_dir() {
-                                continue;
+                    match fs::read_dir(&src_skills).await {
+                        Ok(mut rd) => {
+                            loop {
+                                let entry = match rd.next_entry().await {
+                                    Ok(Some(e)) => e,
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "list skills/ entries interrupted, partial skills installed"
+                                        );
+                                        break;
+                                    }
+                                };
+                                let ft = match entry.file_type().await {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            entry = %entry.file_name().to_string_lossy(),
+                                            "skill entry file_type failed (skipped)"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                if !ft.is_dir() {
+                                    continue;
+                                }
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                let dst = skills_dir.join(&name);
+                                if let Err(e) = fs::remove_dir_all(&dst).await
+                                    && e.kind() != std::io::ErrorKind::NotFound
+                                {
+                                    tracing::warn!(error = %e, "clear existing skill dir before move failed");
+                                }
+                                move_dir(&entry.path(), &dst).await?;
+                                updated_skills.push(name);
                             }
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            let dst = skills_dir.join(&name);
-                            if let Err(e) = fs::remove_dir_all(&dst).await
-                                && e.kind() != std::io::ErrorKind::NotFound
-                            {
-                                tracing::warn!(error = %e, "clear existing skill dir before move failed");
-                            }
-                            move_dir(&entry.path(), &dst).await?;
-                            updated_skills.push(name);
+                            updated_dirs.push("skills");
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "read skills/ dir from uploaded zip failed (skipping)"
+                            );
                         }
                     }
-                    updated_dirs.push("skills");
                 }
                 // agents/: 整目录替换
                 if let Some(src_agents) = find_dir(&extract_root, "agents").await {
@@ -219,15 +245,23 @@ async fn process_skill_url(
         extract_root.clone()
     };
     let mut candidates: Vec<(String, PathBuf)> = Vec::new();
-    if let Ok(mut rd) = fs::read_dir(&base).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
+    // 读目录失败上抛 → 调用方落入 failed_skills 明细; 权限错误不再伪装成"无 skill"
+    let mut rd = fs::read_dir(&base).await?;
+    loop {
+        let entry = match rd.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(error = %e, "list extracted skill entries interrupted, partial candidates");
+                break;
             }
-            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
-                candidates.push((name, entry.path()));
-            }
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            candidates.push((name, entry.path()));
         }
     }
     fs::create_dir_all(skills_dir).await?;

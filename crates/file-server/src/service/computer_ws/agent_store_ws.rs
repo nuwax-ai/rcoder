@@ -101,26 +101,35 @@ pub async fn create_workspace_with_agent_store(
         // skills/: 逐子目录 install (按需跳过)
         if let Some(src_skills) = find_dir(&extract_root, "skills").await {
             match fs::read_dir(&src_skills).await {
-                Ok(mut rd) => {
-                    while let Ok(Some(entry)) = rd.next_entry().await {
-                        if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
-                            continue;
+                Ok(mut rd) => loop {
+                    let entry = match rd.next_entry().await {
+                        Ok(Some(e)) => e,
+                        Ok(None) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "list skills/ entries interrupted, partial skills installed"
+                            );
+                            break;
                         }
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if !install_ctx.should_install(&name) {
-                            skipped_skills.push(name);
-                            continue;
-                        }
-                        crate::service::agent_store::install_skill_dir(
-                            &entry.path(),
-                            &agent_skills_dir,
-                            &name,
-                            false,
-                        )
-                        .await?;
-                        updated_skills.push(name);
+                    };
+                    if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
                     }
-                }
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if !install_ctx.should_install(&name) {
+                        skipped_skills.push(name);
+                        continue;
+                    }
+                    crate::service::agent_store::install_skill_dir(
+                        &entry.path(),
+                        &agent_skills_dir,
+                        &name,
+                        false,
+                    )
+                    .await?;
+                    updated_skills.push(name);
+                },
                 Err(e) => {
                     tracing::warn!(error = %e, "read skills/ dir from uploaded zip failed (skipping)");
                 }

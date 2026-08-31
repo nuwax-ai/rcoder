@@ -119,7 +119,20 @@ async fn migrate_shared_pvc(
     };
 
     let mut migrated = 0u32;
-    while let Ok(Some(entry)) = rd.next_entry().await {
+    loop {
+        let entry = match rd.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                // 遍历中断要留痕: 静默退出会让后续 identifier 看似"无老数据"
+                warn!(
+                    "[BATCH_MIGRATE] list {} entries interrupted: {} (未遍历项下次运行重试)",
+                    shared_root.display(),
+                    e
+                );
+                break;
+            }
+        };
         let name = match entry.file_name().to_str() {
             Some(s) => s.to_string(),
             None => continue,

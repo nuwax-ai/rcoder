@@ -177,9 +177,16 @@ pub(crate) async fn create_workspace_v2(
         },
         None => None,
     };
-    // updateSkillNames: 显式传入 (含空数组) 时按需安装; 未传则全量 (None)
-    let update_skill_names =
-        update_skill_names_raw.map(|s| serde_json::from_str::<Vec<String>>(&s).unwrap_or_default());
+    // updateSkillNames: 显式传入 (含空数组) 时按需安装; 未传则全量 (None)。
+    // 解析失败同样回退 None (全量) —— 若回退 Some(空集), selective 模式会把目标
+    // skill 全部静默 skip, 与"客户端显式传空数组"不可区分 (对齐 skillNames 的降级处理)
+    let update_skill_names = update_skill_names_raw.and_then(|s| {
+        serde_json::from_str::<Vec<String>>(&s)
+            .map_err(|e| {
+                tracing::warn!(error = %e, "parse updateSkillNames failed, falling back to full install");
+            })
+            .ok()
+    });
 
     let ws = ws_path(&state, &user_id, &cid).await?;
     tokio::fs::create_dir_all(&ws).await?;

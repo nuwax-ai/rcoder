@@ -22,7 +22,9 @@ impl FromStr for ModelApiProtocol {
         match s.to_lowercase().as_str() {
             "anthropic" => Ok(ModelApiProtocol::Anthropic),
             "openai" => Ok(ModelApiProtocol::OpenAI),
-            _ => Ok(ModelApiProtocol::Anthropic), // 未知协议默认为 Anthropic
+            // 未知值报错而非静默回退 —— 错误配置(如 "openai-compatible")按错误协议
+            // 发请求只会到上游 400, 排障时无从分辨; 由消费方决定回退策略并留痕
+            _ => Err(()),
         }
     }
 }
@@ -30,8 +32,8 @@ impl FromStr for ModelApiProtocol {
 impl fmt::Display for ModelApiProtocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ModelApiProtocol::Anthropic => f.write_str("Anthropic"),
-            ModelApiProtocol::OpenAI => f.write_str("Openai"),
+            ModelApiProtocol::Anthropic => f.write_str("anthropic"),
+            ModelApiProtocol::OpenAI => f.write_str("openai"),
         }
     }
 }
@@ -57,7 +59,7 @@ pub struct ModelProviderConfig {
     /// 默认模型名称
     #[schema(example = "gpt-4")]
     pub default_model: String,
-    /// 模型接口协议类型 (anthropic/openai)，默认为 openai
+    /// 模型接口协议类型 (anthropic/openai)，未指定或未知值时按 anthropic 处理（未知值会打 warn 日志）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "openai")]
     pub api_protocol: Option<String>,
@@ -69,11 +71,18 @@ pub struct ModelProviderConfig {
 }
 
 impl ModelProviderConfig {
-    /// 获取模型接口协议，如果未指定则默认为 OpenAI
+    /// 获取模型接口协议：未指定 → 默认 anthropic；未知值 → warn 留痕后回退 anthropic
+    /// （保持既有行为兼容，但配置错误可观测，不再静默按错误协议发请求）
     pub fn get_api_protocol(&self) -> ModelApiProtocol {
         self.api_protocol
             .as_ref()
-            .map(|s| ModelApiProtocol::from_str(s).unwrap_or_default())
+            .and_then(|s| match ModelApiProtocol::from_str(s) {
+                Ok(p) => Some(p),
+                Err(()) => {
+                    tracing::warn!(protocol = %s, "unknown api_protocol, falling back to anthropic");
+                    None
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -159,4 +168,58 @@ pub struct ModelProviderSafeInfo {
     /// 默认模型名称
     #[schema(example = "gpt-4")]
     pub default_model: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(protocol: Option<&str>) -> ModelProviderConfig {
+        ModelProviderConfig {
+            id: "p".into(),
+            name: "n".into(),
+            base_url: "https://example.com".into(),
+            api_key: "k".into(),
+            requires_openai_auth: false,
+            default_model: "m".into(),
+            api_protocol: protocol.map(Into::into),
+            wire_api: None,
+        }
+    }
+
+    #[test]
+    fn from_str_rejects_unknown_protocol() {
+        assert!("openai-compatible".parse::<ModelApiProtocol>().is_err());
+        assert!("bogus".parse::<ModelApiProtocol>().is_err());
+        assert_eq!(
+            "openai".parse::<ModelApiProtocol>().unwrap(),
+            ModelApiProtocol::OpenAI
+        );
+        // 大小写不敏感
+        assert_eq!(
+            "Anthropic".parse::<ModelApiProtocol>().unwrap(),
+            ModelApiProtocol::Anthropic
+        );
+    }
+
+    #[test]
+    fn get_api_protocol_falls_back_with_observation() {
+        // 未指定 → 默认 anthropic
+        assert_eq!(config(None).get_api_protocol(), ModelApiProtocol::Anthropic);
+        // 未知值 → 同样回退 anthropic（行为兼容），区别只在 warn 留痕
+        assert_eq!(
+            config(Some("openai-compatible")).get_api_protocol(),
+            ModelApiProtocol::Anthropic
+        );
+        assert_eq!(
+            config(Some("openai")).get_api_protocol(),
+            ModelApiProtocol::OpenAI
+        );
+    }
+
+    #[test]
+    fn display_matches_serde_lowercase() {
+        assert_eq!(ModelApiProtocol::OpenAI.to_string(), "openai");
+        assert_eq!(ModelApiProtocol::Anthropic.to_string(), "anthropic");
+    }
 }

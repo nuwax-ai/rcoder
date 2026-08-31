@@ -201,11 +201,36 @@ async fn migrate_children(src: &std::path::Path, dst: &std::path::Path, identifi
     }
     let mut rd = match tokio::fs::read_dir(src).await {
         Ok(rd) => rd,
-        Err(_) => return, // src 不存在 → 新 user (无旧数据), 跳过
+        // src 不存在 → 新 user (无旧数据), 跳过
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            // 其他读失败 (网络盘抖动等): 不写 marker 直接返回, 下次 ensure 重试
+            warn!(
+                "[MIGRATE] read src {} failed: {} (下次 ensure 重试)",
+                src.display(),
+                e
+            );
+            return;
+        }
     };
     let mut migrated = 0u32;
     let mut skipped = 0u32;
-    while let Ok(Some(entry)) = rd.next_entry().await {
+    let mut failed = 0u32;
+    loop {
+        let entry = match rd.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                // 遍历中断: 记 failed 防 marker 写入 (否则中断后的子项永久漏迁)
+                warn!(
+                    "[MIGRATE] list {} entries interrupted: {} (已完成部分保留, 未遍历子项下次重试)",
+                    src.display(),
+                    e
+                );
+                failed += 1;
+                break;
+            }
+        };
         let src_item = entry.path();
         let dst_item = dst.join(entry.file_name());
         if tokio::fs::try_exists(&dst_item).await.unwrap_or(false) {
@@ -227,23 +252,32 @@ async fn migrate_children(src: &std::path::Path, dst: &std::path::Path, identifi
                         }
                         migrated += 1;
                     }
-                    Err(e) => warn!(
-                        "[MIGRATE] copy {} -> {} failed: {} (skip, 继续其他子项)",
-                        src_item.display(),
-                        dst_item.display(),
-                        e
-                    ),
+                    Err(e) => {
+                        warn!(
+                            "[MIGRATE] copy {} -> {} failed: {} (skip, 继续其他子项)",
+                            src_item.display(),
+                            dst_item.display(),
+                            e
+                        );
+                        failed += 1;
+                    }
                 }
             }
-            Err(e) => warn!(
-                "[MIGRATE] rename {} -> {} failed: {} (skip, 继续其他子项)",
-                src_item.display(),
-                dst_item.display(),
-                e
-            ),
+            Err(e) => {
+                warn!(
+                    "[MIGRATE] rename {} -> {} failed: {} (skip, 继续其他子项)",
+                    src_item.display(),
+                    dst_item.display(),
+                    e
+                );
+                failed += 1;
+            }
         }
     }
-    if migrated > 0 || skipped > 0 {
+    // 有子项失败/遍历中断时不写 marker —— marker 是"迁移完成"的永久短路标记,
+    // 写了之后 lazy_migrate 不再重入, 失败子项将永久漏迁; 不写则下次 ensure
+    // 重新进入, 已迁移项由上面的 skip-if-exists 天然幂等跳过 (= 免费续传)
+    if failed == 0 && (migrated > 0 || skipped > 0) {
         if let Err(e) = tokio::fs::write(&marker, b"1").await {
             warn!(
                 "[MIGRATE] 逐子项迁移后写 marker {} 失败: {} (下次 ensure 会重判)",
