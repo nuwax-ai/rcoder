@@ -27,6 +27,10 @@ pub struct GenericBuildRequest<'a> {
     pub timeout_secs: u64,
     /// spawn 后回调 child pid（供外部 cancel kill 进程组）；None 则不回调。
     pub on_pid: Option<&'a (dyn Fn(u32) + Send + Sync)>,
+    /// 每行输出回调（原始行，时间戳前缀之前；供上层实时推送 SSE `log` 事件）；
+    /// None 则不回调。与文件写入同源（vite 噪音行同样被过滤）。
+    /// Arc 所有权式（区别于 on_pid 的借用式）：回调需跨入日志管道的 spawn task（'static）。
+    pub on_line: Option<crate::service::dev_server::process::OnLineCallback>,
 }
 
 /// 通用 build：在给定工作目录执行 `argv`，产 `artifact_rel`。
@@ -66,7 +70,10 @@ pub async fn build_generic(
         &main_log,
         &temp_log,
         req.timeout_secs,
-        req.on_pid,
+        crate::service::dev_server::process::CommandObservers {
+            on_pid: req.on_pid,
+            on_line: req.on_line.clone(),
+        },
     )
     .await?;
 

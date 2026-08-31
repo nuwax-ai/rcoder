@@ -224,7 +224,7 @@ async fn spawn_dev_task(
             &app_id,
             &release_id,
             state.fs.config.dev_command_timeout_secs,
-            Some(&progress),
+            Some(progress),
         )
         .await;
         let outcome = async {

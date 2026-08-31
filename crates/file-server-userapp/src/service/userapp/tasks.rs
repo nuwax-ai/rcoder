@@ -19,10 +19,12 @@ use uuid::Uuid;
 // 进度事件类型复用 shared_types(file-server 发送 ↔ rcoder 接收,统一 wire)。
 pub use shared_types::BuildProgressEvent;
 
-/// 历史事件 ring 容量(断线重连 seq replay)。
-const RING_CAP: usize = 1000;
-/// broadcast 通道容量(实时 SSE fan-out)。
-const BROADCAST_CAP: usize = 256;
+/// 历史事件 ring 容量(断线重连 seq replay)。log 事件（构建输出逐行）纳入后
+/// 事件总量可达数千，容量按"典型构建全程 + 早期进度不滚掉"取值。
+const RING_CAP: usize = 4000;
+/// broadcast 通道容量(实时 SSE fan-out)。高频 log 行下给慢消费者留裕量，
+/// 降低 Lagged 关流概率。
+const BROADCAST_CAP: usize = 2048;
 const TERMINAL_TASK_TTL_SECS: i64 = 24 * 60 * 60;
 const MAX_RETAINED_TASKS: usize = 1_000;
 
@@ -401,6 +403,48 @@ mod tests {
         let (seq, event) = receiver.recv().await.expect("live event");
         assert_eq!(seq, 0);
         assert!(matches!(event, BuildProgressEvent::Stage { .. }));
+    }
+
+    /// log 事件（构建日志行）实时入流、非终态，且不污染任务快照状态。
+    #[tokio::test]
+    async fn log_events_flow_through_subscription_without_touching_snapshot_status() {
+        let task = BuildTask::new("app-a".into(), BuildTaskKind::Build);
+        let (replay, mut receiver) = task.subscribe(0).await;
+        assert!(replay.is_empty());
+
+        task.emit(BuildProgressEvent::Building {
+            service: "java".into(),
+        })
+        .await;
+        task.emit(BuildProgressEvent::Log {
+            service: "java".into(),
+            line: "[INFO] build...".into(),
+        })
+        .await;
+        task.emit(BuildProgressEvent::BuildOk {
+            service: "java".into(),
+        })
+        .await;
+
+        let (seq, event) = receiver.recv().await.expect("building");
+        assert_eq!(seq, 0);
+        assert!(matches!(event, BuildProgressEvent::Building { .. }));
+        let (seq, event) = receiver.recv().await.expect("log");
+        assert_eq!(seq, 1);
+        assert!(
+            matches!(
+                &event,
+                BuildProgressEvent::Log { service, line }
+                    if service == "java" && line == "[INFO] build..."
+            ),
+            "{event:?}"
+        );
+        // 回放环含全部三条（from_seq=0 重连可完整回放）
+        let (replay, _) = task.subscribe(0).await;
+        assert_eq!(replay.len(), 3);
+        // 快照状态不被 log 事件污染（apply_event 对 Log no-op；Building 已置 Running）
+        let snapshot = task.snapshot().await;
+        assert!(matches!(snapshot.status, BuildTaskStatus::Running));
     }
 
     #[tokio::test]

@@ -71,8 +71,12 @@ fn brace_delta(line: &str) -> i32 {
     delta
 }
 
-pub(super) async fn pipe_stream<R>(reader: R, main: PathBuf, temp: PathBuf)
-where
+pub(super) async fn pipe_stream<R>(
+    reader: R,
+    main: PathBuf,
+    temp: PathBuf,
+    on_line: Option<super::OnLineCallback>,
+) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -81,6 +85,11 @@ where
     while let Ok(Some(line)) = lines.next_line().await {
         if noise.should_skip(&line) {
             continue;
+        }
+        // 行回调（原始行、时间戳前缀之前）：与文件写入同源（噪音行同样被过滤），
+        // 供上层实时推送 SSE `log` 事件。
+        if let Some(cb) = &on_line {
+            cb(&line);
         }
         let prefixed = format!("[{}] {}", Local::now().format("%Y/%m/%d %H:%M:%S"), line);
         // 日志写失败告警(#17):磁盘满/权限错误时可见,不再静默吞掉。

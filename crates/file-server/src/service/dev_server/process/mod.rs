@@ -173,10 +173,26 @@ pub fn spawn_dev(
     Ok((child, stdout, stderr))
 }
 
+/// 构建输出行回调（原始行、时间戳前缀之前）。Arc 所有权式：需跨入日志管道
+/// spawn task（'static）。供上层实时推送 SSE `log` 事件。
+pub type OnLineCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// 运行一次性非 pnpm-install 命令 (build/preprocess), arg 数组 + stdout/stderr 管道到日志, 阻塞等待。
 /// 用 current_dir 替代 `cd ... &&`, arg 数组替代 shell 拼接; 错误为类型化 io::Error/退出码。
 ///
-/// `on_pid`: spawn 后回调 child pid (供外部 cancel 时 kill 进程组); 传 None 则不回调。
+/// 一次性命令的过程回调集合（pid 回写供 cancel；行回调供 SSE 实时日志）。
+#[derive(Default)]
+pub struct CommandObservers<'a> {
+    /// spawn 后回调 child pid（供外部 cancel kill 进程组）；None 不回调。
+    pub on_pid: Option<&'a (dyn Fn(u32) + Send + Sync)>,
+    /// 每行输出回调（见 [`OnLineCallback`]）；None 不回调。
+    pub on_line: Option<OnLineCallback>,
+}
+
+/// 运行一次性非 pnpm-install 命令 (build/preprocess), arg 数组 + stdout/stderr 管道到日志, 阻塞等待。
+/// 用 current_dir 替代 `cd ... &&`, arg 数组替代 shell 拼接; 错误为类型化 io::Error/退出码。
+///
+/// `observers`: 过程回调集合（pid / 行回调，均可 None）。
 pub async fn run_command_to_log(
     program: &str,
     args: &[&str],
@@ -184,7 +200,7 @@ pub async fn run_command_to_log(
     main_log: &Path,
     temp_log: &Path,
     timeout_secs: u64,
-    on_pid: Option<&(dyn Fn(u32) + Send + Sync)>,
+    observers: CommandObservers<'_>,
 ) -> AppResult<()> {
     let mut cmd = Command::new(program);
     cmd.args(args);
@@ -211,7 +227,7 @@ pub async fn run_command_to_log(
         ))
     })?;
     // 回调 pid 供外部 cancel (kill_process_group); child drop 前 pid 恒有效。
-    if let Some(cb) = on_pid
+    if let Some(cb) = observers.on_pid
         && let Some(pid) = child.id()
     {
         cb(pid);
@@ -224,12 +240,14 @@ pub async fn run_command_to_log(
     let stdout_handle = stdout.map(|out| {
         let main = main.clone();
         let temp = temp.clone();
-        tokio::spawn(async move { pipe_stream(out, main, temp).await })
+        let on_line = observers.on_line.clone();
+        tokio::spawn(async move { pipe_stream(out, main, temp, on_line).await })
     });
     let stderr_handle = stderr.map(|err| {
         let main = main.clone();
         let temp = temp.clone();
-        tokio::spawn(async move { pipe_stream(err, main, temp).await })
+        let on_line = observers.on_line.clone();
+        tokio::spawn(async move { pipe_stream(err, main, temp, on_line).await })
     });
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
     let outcome = match result {
@@ -443,7 +461,7 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_project_path_segment, run_command_to_log};
+    use super::{CommandObservers, contains_project_path_segment, run_command_to_log};
 
     #[test]
     fn project_process_match_requires_a_path_segment_boundary() {
@@ -478,7 +496,7 @@ mod tests {
             &main_log,
             &temp_log,
             30,
-            None,
+            CommandObservers::default(),
         )
         .await
         .expect_err("must fail");
@@ -490,6 +508,39 @@ mod tests {
     }
 
     /// 成功路径不受尾部增强影响（错误才附加）。
+    /// on_line 行回调：逐行收到原始输出（无时间戳前缀），与文件写入同源同序。
+    #[tokio::test]
+    async fn run_command_to_log_invokes_line_callback_per_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_log = tmp.path().join("dev-test.log");
+        let temp_log = tmp.path().join("temp-3.log");
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lines_cb = lines.clone();
+        run_command_to_log(
+            "sh",
+            &["-c", "echo first-line; echo second-line"],
+            tmp.path(),
+            &main_log,
+            &temp_log,
+            30,
+            CommandObservers {
+                on_line: Some(std::sync::Arc::new(move |line: &str| {
+                    lines_cb.lock().expect("lock").push(line.to_string());
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("command ok");
+        assert_eq!(
+            lines.lock().expect("lock").clone(),
+            vec!["first-line".to_string(), "second-line".to_string()]
+        );
+        // 文件行仍带时间戳前缀（回调行是原文）
+        let file = std::fs::read_to_string(&main_log).expect("main log");
+        assert!(file.contains("first-line") && file.contains("["), "{file}");
+    }
+
     #[tokio::test]
     async fn run_command_to_log_success_writes_logs() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -502,7 +553,7 @@ mod tests {
             &main_log,
             &temp_log,
             30,
-            None,
+            CommandObservers::default(),
         )
         .await
         .expect("must succeed");

@@ -100,7 +100,7 @@ pub(crate) async fn build_project_impl(
         &main_log,
         &temp_log,
         timeout,
-        None,
+        Default::default(),
     )
     .await;
     if let Err(build_error) = build_result {

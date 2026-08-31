@@ -86,7 +86,7 @@ pub async fn build_workspace_package(
     app_id: &str,
     release_id: &str,
     timeout_secs: u64,
-    progress: Option<&BuildTask>,
+    progress: Option<Arc<BuildTask>>,
 ) -> AppResult<WorkspaceBuildArtifact> {
     // 1. workspace 根（UserApp 开发卷, 容器无关）
     let ws = file_server::workspace::resolve_userapp_dev(app_id, None, config)?;
@@ -125,7 +125,7 @@ pub async fn build_workspace_package(
     for proj in enabled {
         // 软取消：服务间检查（硬 cancel 靠外部 kill 进程组，见 cancel handler）。
         // 不在此 emit 终态（Cancelled 由 cancel handler / 顶层 task 统一 emit）。
-        if let Some(p) = progress {
+        if let Some(p) = &progress {
             if p.is_cancelled() {
                 return Err(AppError::business("build cancelled by user"));
             }
@@ -134,8 +134,33 @@ pub async fn build_workspace_package(
             })
             .await;
         }
+        // 构建输出逐行转 Log 事件：unbounded 通道 + 独立消费 task（emit 为 async，
+        // 管道回调同步 send 行）。run_command_to_log 返回前已 drain 管道——返回后
+        // drop 闭包关通道 → 消费 task 排空 join → 才 emit BuildOk/BuildFail，
+        // 顺序严格为 building → log* → build_ok/build_fail。
+        let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let line_task = {
+            let task = progress.clone();
+            let service = proj.service_id().to_string();
+            tokio::spawn(async move {
+                let mut rx = line_rx;
+                while let Some(line) = rx.recv().await {
+                    if let Some(task) = &task {
+                        task.emit(BuildProgressEvent::Log {
+                            service: service.clone(),
+                            line,
+                        })
+                        .await;
+                    }
+                }
+            })
+        };
+        let line_cb: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |line: &str| {
+            // 接收端关闭（理论不达）时静默丢弃该行
+            drop(line_tx.send(line.to_string()));
+        });
         // 构建日志按 service_id 归档（稳定身份：改目录名日志归档连续，且与
-        // 运行时 /app/logs/<service_id> 及 tasks logs ?service= 端点同轴）
+        // 运行时 /app/logs/<service_id> 同轴）
         let log_dir = ws.join("logs").join(proj.service_id());
         // path 安全校验 + 拼接（防 `../` 穿越 workspace）
         let proj_dir = file_server::path_safety::ensure_within(&ws, &proj.dir).map_err(|_| {
@@ -148,12 +173,12 @@ pub async fn build_workspace_package(
         if !proj_dir.is_dir() {
             return Err(AppError::resource(format!(
                 "project dir not found: service_id={} (path={})",
-                proj.service_id(),
-                proj.dir
+                proj.dir,
+                proj.service_id()
             )));
         }
         // on_pid 回调: spawn build 子进程后回写 pid 到 task, 供 cancel kill 进程组。
-        let pid_cb = progress.map(|p| move |pid: u32| p.set_pid(pid));
+        let pid_cb = progress.as_ref().map(|p| move |pid: u32| p.set_pid(pid));
         let pid_ref: Option<&(dyn Fn(u32) + Send + Sync)> =
             pid_cb.as_ref().map(|c| c as &(dyn Fn(u32) + Send + Sync));
         let build_result = build_generic(
@@ -164,13 +189,20 @@ pub async fn build_workspace_package(
                 log_dir: &log_dir,
                 timeout_secs,
                 on_pid: pid_ref,
+                on_line: Some(line_cb.clone()),
             },
             &_ws_guard,
         )
         .await;
         // 子进程已退出(或超时被 kill),pid 即将失效,清零缩短 stale-pid 窗口(#2)。
-        if let Some(p) = progress {
+        if let Some(p) = &progress {
             p.clear_pid();
+        }
+        // 关通道（管道已 drain，行全部入队）→ 消费 task 排空 join：
+        // 保证日志行全部先于本服务的 build_ok/build_fail 终态序。
+        drop(line_cb);
+        if let Err(e) = line_task.await {
+            tracing::warn!(error = %e, "log line consumer task join failed");
         }
         let artifact = match build_result {
             Ok(a) => a,
@@ -180,7 +212,7 @@ pub async fn build_workspace_package(
                 let wrapped = AppError::system(format!("{} build failed: {e}", proj.service_id()));
                 // cancel(kill 进程组)导致的失败不 emit（终态 Cancelled 由 cancel handler 置）；
                 // 否则 emit 服务级 BuildFail（任务级 Failed 由顶层 start_*_task 统一 emit）。
-                if let Some(p) = progress
+                if let Some(p) = &progress
                     && !p.is_cancelled()
                 {
                     p.emit(BuildProgressEvent::BuildFail {
@@ -192,7 +224,7 @@ pub async fn build_workspace_package(
                 return Err(wrapped);
             }
         };
-        if let Some(p) = progress {
+        if let Some(p) = &progress {
             p.emit(BuildProgressEvent::BuildOk {
                 service: proj.service_id().to_string(),
             })
@@ -285,7 +317,7 @@ pub async fn start_build_task(
             &app_id,
             &release_id,
             timeout_secs,
-            Some(&task_spawn),
+            Some(task_spawn.clone()),
         )
         .await;
         // 终态统一由此 emit：build_workspace_package 只发非终态进度（Building/BuildOk/BuildFail）。

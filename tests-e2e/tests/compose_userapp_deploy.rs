@@ -432,11 +432,13 @@ async fn build_to_completion(
             }
             let has_completed =
                 text.contains("event:completed") || text.contains("\"event\":\"completed\"");
+            // log 事件（构建日志行实时流）至少出现一条
+            let has_log = text.contains("event:log") || text.contains("\"event\":\"log\"");
             sse_detail = format!(
-                "HTTP {status}, ct={ct}, {} bytes, completed={has_completed}",
+                "HTTP {status}, ct={ct}, {} bytes, completed={has_completed}, log={has_log}",
                 text.len()
             );
-            status.is_success() && ct.contains("text/event-stream") && has_completed
+            status.is_success() && ct.contains("text/event-stream") && has_completed && has_log
         }
         Err(e) => {
             sse_detail = format!("err: {e}");

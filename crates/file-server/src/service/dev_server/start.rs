@@ -131,7 +131,7 @@ impl DevServerManager {
             &main_log,
             &temp_log,
             self.config.dev_command_timeout_secs,
-            None,
+            Default::default(),
         )
         .await
         {
