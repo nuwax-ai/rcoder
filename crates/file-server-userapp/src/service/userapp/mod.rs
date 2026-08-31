@@ -429,3 +429,24 @@ async fn hash_file(path: &std::path::Path) -> AppResult<(String, u64)> {
     }
     Ok((hex::encode(hasher.finalize()), size))
 }
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::*;
+
+    /// UTF-8 边界安全截断：多字节字符中间回退到合法边界并以省略号标记；
+    /// 未超限原样返回。
+    #[test]
+    fn truncate_respects_char_boundary() {
+        assert_eq!(truncate_at_char("abc", 16), "abc");
+        let long = "行".repeat(6000); // 18000 字节 > 16KB 上限
+        let out = truncate_at_char(&long, MAX_LOG_EVENT_LINE_BYTES);
+        assert!(out.len() <= MAX_LOG_EVENT_LINE_BYTES + 3);
+        assert!(out.ends_with('…'));
+        // 边界回退：max 落在多字节字符中间（'中' 占字节 1-3，max=2 回退到 1）
+        let mixed = "a中b";
+        assert_eq!(truncate_at_char(mixed, 2), "a…");
+        // max 恰在合法边界（'中' 结束于字节 4）：不回退、不丢字符
+        assert_eq!(truncate_at_char(mixed, 4), "a中…");
+    }
+}
