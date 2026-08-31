@@ -63,7 +63,7 @@ pub async fn uninstall(
     }
 
     // 从注册表移除（所有版本）
-    let removed = registry.remove(agent_id)?;
+    let removed = registry.remove(agent_id).await?;
     info!(
         "[agent_mgmt] Uninstalled all versions: agent_id={}, count={}",
         agent_id,
@@ -110,7 +110,7 @@ pub async fn uninstall_version(
     }
 
     // 从注册表移除指定版本
-    let removed = registry.remove_version(agent_id, version)?;
+    let removed = registry.remove_version(agent_id, version).await?;
 
     // 如果 agent 没有剩余版本，清理空的父目录
     if !registry.contains(agent_id) {
@@ -228,6 +228,7 @@ mod tests {
         let r = AgentRegistry::empty(temp_pm());
         let install_dir = r.install_dir().to_path_buf();
         r.insert(sample("builtin-1", InstallType::Builtin, &install_dir))
+            .await
             .unwrap();
         let err = uninstall(&r, "builtin-1").await.unwrap_err();
         assert!(matches!(err, AgentMgmtError::BuiltinProtected));
@@ -239,6 +240,7 @@ mod tests {
         let r = AgentRegistry::empty(temp_pm());
         let install_dir = r.install_dir().to_path_buf();
         r.insert(sample("user-1", InstallType::Binary, &install_dir))
+            .await
             .unwrap();
         let removed = uninstall(&r, "user-1").await.unwrap();
         assert_eq!(removed.len(), 1);
@@ -255,7 +257,7 @@ mod tests {
             &std::path::PathBuf::from("/tmp"),
         );
         m.binary_path = "/etc/passwd".to_string();
-        r.insert(m).unwrap();
+        r.insert(m).await.unwrap();
         let err = uninstall(&r, "evil").await.unwrap_err();
         assert!(matches!(err, AgentMgmtError::InvalidManifest(_)));
     }
@@ -288,6 +290,7 @@ mod tests {
             InstallType::Binary,
             &install_dir,
         ))
+        .await
         .unwrap();
         r.insert(sample_with_version(
             "test-agent",
@@ -295,6 +298,7 @@ mod tests {
             InstallType::Binary,
             &install_dir,
         ))
+        .await
         .unwrap();
 
         // 卸载 1.0.0
@@ -327,6 +331,7 @@ mod tests {
             InstallType::Binary,
             &install_dir,
         ))
+        .await
         .unwrap();
 
         let removed = uninstall_version(&r, "solo-agent", "1.0.0").await.unwrap();
@@ -348,6 +353,7 @@ mod tests {
             InstallType::Binary,
             &install_dir,
         ))
+        .await
         .unwrap();
 
         let err = uninstall_version(&r, "test-agent", "9.9.9")
@@ -366,6 +372,7 @@ mod tests {
             InstallType::Builtin,
             &install_dir,
         ))
+        .await
         .unwrap();
 
         let err = uninstall_version(&r, "builtin-1", "1.0.0")
@@ -384,7 +391,7 @@ mod tests {
             &std::path::PathBuf::from("/tmp"),
         );
         m.binary_path = "/etc/passwd".to_string();
-        r.insert(m).unwrap();
+        r.insert(m).await.unwrap();
 
         let err = uninstall_version(&r, "evil", "1.0.0").await.unwrap_err();
         assert!(matches!(err, AgentMgmtError::InvalidManifest(_)));
@@ -406,6 +413,7 @@ mod tests {
             InstallType::Binary,
             &install_dir,
         ))
+        .await
         .unwrap();
         r.insert(sample_with_version(
             "multi-agent",
@@ -413,6 +421,7 @@ mod tests {
             InstallType::Binary,
             &install_dir,
         ))
+        .await
         .unwrap();
 
         // version = None → 卸载全部

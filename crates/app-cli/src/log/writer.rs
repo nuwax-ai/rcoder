@@ -87,17 +87,24 @@ impl RotatingWriter {
             return;
         };
         let data = format!("{line}\n");
-        if file.write_all(data.as_bytes()).await.is_ok() {
+        if let Err(e) = file.write_all(data.as_bytes()).await {
+            eprintln!("[log-writer] write failed (line dropped): {e}");
+        } else {
             self.size += data.len() as u64;
         }
     }
 
     /// 刷盘：tokio::fs::File 的写入经 spawn_blocking，需显式 `flush` + `sync_all`
     /// 才能保证数据持久化（drop 不保证末尾写入落盘 → 会丢最后几行）。
+    /// 失败必须留痕——否则"调了 sync"与"没调"一样丢末尾且无从发现。
     async fn flush(&mut self) {
         if let Some(f) = self.file.as_mut() {
-            let _ = f.flush().await;
-            let _ = f.sync_all().await;
+            if let Err(e) = f.flush().await {
+                eprintln!("[log-writer] flush failed: {e}");
+            }
+            if let Err(e) = f.sync_all().await {
+                eprintln!("[log-writer] sync_all failed (tail lines may be lost): {e}");
+            }
         }
     }
 

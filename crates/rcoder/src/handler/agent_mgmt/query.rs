@@ -80,7 +80,7 @@ pub async fn list_agents(
         if let Ok(install_ctx) = strategy.resolve_install_context(&project, &body.routing) {
             let registry_path = install_ctx.install_dir.join("registry.json");
             if registry_path.exists() {
-                match read_registry_from_file(&registry_path) {
+                match read_registry_from_file(&registry_path).await {
                     Ok(resp) => return Ok(Json(HttpResult::success(resp))),
                     Err(e) => {
                         warn!("[agent_mgmt] Failed to read registry from file: {}", e);
@@ -98,24 +98,41 @@ pub async fn list_agents(
     Ok(Json(HttpResult::success(resp)))
 }
 
-/// 从文件直接读取注册表
-fn read_registry_from_file(
+/// 从文件直接读取注册表（读 + 解析经 spawn_blocking 移出 worker——
+/// registry.json 在共享网络卷上）
+async fn read_registry_from_file(
     registry_path: &std::path::Path,
 ) -> Result<shared_types::ListAgentsResponse, AppError> {
-    let data = std::fs::read_to_string(registry_path).map_err(|e| {
-        AppError::with_message(
-            ec::ERR_INTERNAL_SERVER_ERROR,
-            format!("read registry file: {}", e),
-        )
-    })?;
-
+    let registry_path = registry_path.to_path_buf();
+    // install_dir 在 move 前预计算（闭包消耗 registry_path）
+    let install_dir = registry_path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
     let manifests: Vec<agent_provisioning::AgentManifest> =
-        serde_json::from_str(&data).map_err(|e| {
+        tokio::task::spawn_blocking(move || -> Result<_, AppError> {
+            let data = std::fs::read_to_string(&registry_path).map_err(|e| {
+                AppError::with_message(
+                    ec::ERR_INTERNAL_SERVER_ERROR,
+                    format!("read registry file: {}", e),
+                )
+            })?;
+            let manifests: Vec<agent_provisioning::AgentManifest> = serde_json::from_str(&data)
+                .map_err(|e| {
+                    AppError::with_message(
+                        ec::ERR_INTERNAL_SERVER_ERROR,
+                        format!("parse registry JSON: {}", e),
+                    )
+                })?;
+            Ok(manifests)
+        })
+        .await
+        .map_err(|e| {
             AppError::with_message(
                 ec::ERR_INTERNAL_SERVER_ERROR,
-                format!("parse registry JSON: {}", e),
+                format!("read registry task join: {e}"),
             )
-        })?;
+        })??;
 
     let agents: Vec<shared_types::AgentInfo> = manifests
         .into_iter()
@@ -134,10 +151,6 @@ fn read_registry_from_file(
         .collect();
 
     let total = agents.len();
-    let install_dir = registry_path
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
 
     Ok(shared_types::ListAgentsResponse {
         system_info: shared_types::SystemInfo::current(),

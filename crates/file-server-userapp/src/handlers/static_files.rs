@@ -91,7 +91,20 @@ fn latest_build_artifact(ws_root: &Path) -> Option<String> {
     use crate::service::userapp::{WORKSPACE_BUILDS_DIR, WORKSPACE_PACKAGE_PREFIX};
 
     let builds_dir = ws_root.join(WORKSPACE_BUILDS_DIR);
-    let entries = std::fs::read_dir(&builds_dir).ok()?;
+    // NotFound = 尚无产物（合法 None）；其他错误（权限/IO）不能伪装成"无产物"，
+    // 至少留 warn 供排障，避免下载 404 与盘故障混淆
+    let entries = match std::fs::read_dir(&builds_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(
+                dir = %builds_dir.display(),
+                error = %e,
+                "read builds dir failed, treating as no artifact"
+            );
+            return None;
+        }
+    };
     let mut latest: Option<String> = None;
     for entry in entries.flatten() {
         // 只认普通文件（防同名目录混入候选）

@@ -54,10 +54,12 @@ fn temp_pm() -> PathManager {
 }
 
 /// 构造一个测试用的 AgentMgmtHttpState
-fn build_state() -> (AgentMgmtHttpState, tempfile_helpers::TempDir) {
+async fn build_state() -> (AgentMgmtHttpState, tempfile_helpers::TempDir) {
     let pm = temp_pm();
     let dir_path = pm.install_dir().to_path_buf();
-    let registry = AgentRegistry::load(pm.clone()).expect("load registry");
+    let registry = AgentRegistry::load(pm.clone())
+        .await
+        .expect("load registry");
     let state = AgentMgmtHttpState::new(Arc::new(registry), pm);
     (state, tempfile_helpers::TempDir(dir_path))
 }
@@ -99,7 +101,7 @@ async fn send(
 
 #[tokio::test]
 async fn list_agents_empty_registry() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     let router = create_agent_mgmt_router(state);
 
     let body = serde_json::json!({});
@@ -121,7 +123,7 @@ async fn list_agents_empty_registry() {
 
 #[tokio::test]
 async fn list_agents_with_registered_agent() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     // 手动注册一个 agent
     state
         .registry
@@ -134,6 +136,7 @@ async fn list_agents_with_registered_agent() {
             1024,
             "executable".into(),
         ))
+        .await
         .unwrap();
 
     let router = create_agent_mgmt_router(state);
@@ -158,7 +161,7 @@ async fn list_agents_with_registered_agent() {
 
 #[tokio::test]
 async fn install_binary_succeeds() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     let router = create_agent_mgmt_router(state);
 
     // 构造 tar.gz 压缩包(内含 shell 脚本)
@@ -190,7 +193,7 @@ async fn install_binary_succeeds() {
 
 #[tokio::test]
 async fn install_binary_rejects_missing_metadata() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     let router = create_agent_mgmt_router(state);
 
     let req = Request::builder()
@@ -206,7 +209,7 @@ async fn install_binary_rejects_missing_metadata() {
 
 #[tokio::test]
 async fn install_binary_rejects_oversize() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     let router = create_agent_mgmt_router(state);
 
     // 构造 > MAX_BINARY_SIZE 的请求(为了测试快,临时构造大 buffer)
@@ -248,7 +251,7 @@ async fn install_binary_rejects_oversize() {
 
 #[tokio::test]
 async fn install_from_url_rejects_non_http_scheme() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     let router = create_agent_mgmt_router(state);
 
     let body = serde_json::json!({
@@ -269,7 +272,7 @@ async fn install_from_url_rejects_non_http_scheme() {
 
 #[tokio::test]
 async fn install_from_url_rejects_empty_command() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     let router = create_agent_mgmt_router(state);
 
     let body = serde_json::json!({
@@ -296,7 +299,7 @@ async fn install_from_url_rejects_empty_command() {
 async fn install_from_npm_rejects_when_npm_unavailable() {
     // 该测试在没有 npm 的环境下运行,期待非 200 的响应(INSTALL_FAILED 等)
     // 我们只验证请求被正确处理,不强制期待 200
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     let router = create_agent_mgmt_router(state);
 
     let body = serde_json::json!({
@@ -319,7 +322,7 @@ async fn install_from_npm_rejects_when_npm_unavailable() {
 
 #[tokio::test]
 async fn uninstall_unknown_returns_404() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     let router = create_agent_mgmt_router(state);
 
     let body = serde_json::json!({"agent_id": "nonexistent"});
@@ -336,7 +339,7 @@ async fn uninstall_unknown_returns_404() {
 
 #[tokio::test]
 async fn uninstall_builtin_protected() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     // 手动注册一个 builtin agent
     state
         .registry
@@ -349,6 +352,7 @@ async fn uninstall_builtin_protected() {
             0,
             "executable".into(),
         ))
+        .await
         .unwrap();
 
     let router = create_agent_mgmt_router(state);
@@ -375,7 +379,7 @@ async fn uninstall_builtin_protected() {
 
 #[tokio::test]
 async fn check_returns_detail_with_broken_status_for_missing_binary() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     state
         .registry
         .insert(AgentManifest::new(
@@ -387,6 +391,7 @@ async fn check_returns_detail_with_broken_status_for_missing_binary() {
             0,
             "executable".into(),
         ))
+        .await
         .unwrap();
 
     let router = create_agent_mgmt_router(state);
@@ -410,7 +415,7 @@ async fn check_returns_detail_with_broken_status_for_missing_binary() {
 
 #[tokio::test]
 async fn check_returns_not_found_for_unknown() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     let router = create_agent_mgmt_router(state);
 
     let body = serde_json::json!({"agent_id": "unknown-agent-xyz"});
@@ -433,7 +438,7 @@ async fn check_returns_not_found_for_unknown() {
 
 #[tokio::test]
 async fn get_agent_returns_none_for_unknown() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     let router = create_agent_mgmt_router(state);
 
     let body = serde_json::json!({"agent_id": "unknown-xyz-12345"});
@@ -452,7 +457,7 @@ async fn get_agent_returns_none_for_unknown() {
 
 #[tokio::test]
 async fn get_agent_returns_detail_for_known() {
-    let (state, _tmp) = build_state();
+    let (state, _tmp) = build_state().await;
     state
         .registry
         .insert(AgentManifest::new(
@@ -464,6 +469,7 @@ async fn get_agent_returns_detail_for_known() {
             100,
             "executable".into(),
         ))
+        .await
         .unwrap();
 
     let router = create_agent_mgmt_router(state);

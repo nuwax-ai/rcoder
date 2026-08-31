@@ -183,7 +183,7 @@ pub(super) async fn _install_from_staging(
         installed_at: chrono::Utc::now().timestamp(),
     };
     manifest.validate()?;
-    registry.upsert(manifest)?;
+    registry.upsert(manifest).await?;
 
     info!(
         "[agent_mgmt] Installed: agent_id={}, command={}, binary_path={}, file_type={}, size={}",

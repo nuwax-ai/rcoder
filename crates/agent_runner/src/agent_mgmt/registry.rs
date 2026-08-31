@@ -35,7 +35,7 @@ impl AgentRegistry {
     ///
     /// 加载后自动清理残留条目：如果非 builtin agent 的安装目录已不存在，
     /// 说明卸载过程中进程被 kill 导致注册表未更新，此时自动移除该条目。
-    pub fn load(path_manager: PathManager) -> AgentMgmtResult<Self> {
+    pub async fn load(path_manager: PathManager) -> AgentMgmtResult<Self> {
         let mut map = Self::read_from_disk(&path_manager.registry_path())?;
         let healed = Self::heal_orphaned_entries(&mut map);
         let registry = Self {
@@ -44,7 +44,7 @@ impl AgentRegistry {
         };
         // 自愈后立即落盘，保持文件与内存一致
         if healed > 0 {
-            registry.save_to_disk()?;
+            registry.save_to_disk().await?;
         }
         Ok(registry)
     }
@@ -181,61 +181,74 @@ impl AgentRegistry {
 
     /// 插入条目(立即落盘)，拒绝重复的精确版本
     #[allow(dead_code)] // used in tests
-    pub fn insert(&self, manifest: AgentManifest) -> AgentMgmtResult<()> {
+    pub async fn insert(&self, manifest: AgentManifest) -> AgentMgmtResult<()> {
         manifest.validate()?;
-        let mut guard = self.inner.lock();
-        let vkey = version_util::normalize_version(manifest.version.as_deref().unwrap_or("0.0.0"))?;
-        let versions = guard.entry(manifest.agent_id.clone()).or_default();
-        if versions.contains_key(&vkey) {
-            return Err(AgentMgmtError::VersionAlreadyInstalled {
-                agent_id: manifest.agent_id.clone(),
-                version: manifest.version.as_deref().unwrap_or("none").to_string(),
-            });
+        // 锁内完成变更；块作用域释放 guard（Send 分析对显式 drop 在
+        // #[instrument] 变换下不认账，块边界是唯一可靠收窄方式）
+        {
+            let mut guard = self.inner.lock();
+            let vkey =
+                version_util::normalize_version(manifest.version.as_deref().unwrap_or("0.0.0"))?;
+            let versions = guard.entry(manifest.agent_id.clone()).or_default();
+            if versions.contains_key(&vkey) {
+                return Err(AgentMgmtError::VersionAlreadyInstalled {
+                    agent_id: manifest.agent_id.clone(),
+                    version: manifest.version.as_deref().unwrap_or("none").to_string(),
+                });
+            }
+            versions.insert(vkey, manifest);
         }
-        versions.insert(vkey, manifest);
-        drop(guard);
-        self.save_to_disk()
+        self.save_to_disk().await
     }
 
     /// 覆盖式更新(用于 reinstall 场景)
-    pub fn upsert(&self, manifest: AgentManifest) -> AgentMgmtResult<()> {
+    pub async fn upsert(&self, manifest: AgentManifest) -> AgentMgmtResult<()> {
         manifest.validate()?;
-        let mut guard = self.inner.lock();
-        let vkey = version_util::normalize_version(manifest.version.as_deref().unwrap_or("0.0.0"))?;
-        let versions = guard.entry(manifest.agent_id.clone()).or_default();
-        versions.insert(vkey, manifest);
-        drop(guard);
-        self.save_to_disk()
+        {
+            let mut guard = self.inner.lock();
+            let vkey =
+                version_util::normalize_version(manifest.version.as_deref().unwrap_or("0.0.0"))?;
+            let versions = guard.entry(manifest.agent_id.clone()).or_default();
+            versions.insert(vkey, manifest);
+        }
+        self.save_to_disk().await
     }
 
     /// 删除 agent 的所有版本(立即落盘)
-    pub fn remove(&self, agent_id: &str) -> AgentMgmtResult<Vec<AgentManifest>> {
-        let mut guard = self.inner.lock();
-        let removed = guard
-            .remove(agent_id)
-            .ok_or_else(|| AgentMgmtError::NotFound(agent_id.to_string()))?;
-        let removed_vec: Vec<AgentManifest> = removed.into_values().collect();
-        drop(guard);
-        self.save_to_disk()?;
+    pub async fn remove(&self, agent_id: &str) -> AgentMgmtResult<Vec<AgentManifest>> {
+        let removed_vec: Vec<AgentManifest> = {
+            let mut guard = self.inner.lock();
+            let removed = guard
+                .remove(agent_id)
+                .ok_or_else(|| AgentMgmtError::NotFound(agent_id.to_string()))?;
+            removed.into_values().collect()
+        };
+        self.save_to_disk().await?;
         Ok(removed_vec)
     }
 
     /// 删除指定版本(立即落盘)
-    pub fn remove_version(&self, agent_id: &str, version: &str) -> AgentMgmtResult<AgentManifest> {
-        let mut guard = self.inner.lock();
-        let vkey = version_util::normalize_version(version)?;
-        let versions = guard
-            .get_mut(agent_id)
-            .ok_or_else(|| AgentMgmtError::NotFound(agent_id.to_string()))?;
-        let removed = versions
-            .remove(&vkey)
-            .ok_or_else(|| AgentMgmtError::NotFound(format!("{}@{}", agent_id, version)))?;
-        // 如果 agent 没有任何版本了，清理空条目
-        if versions.is_empty() {
-            guard.remove(agent_id);
-        }
-        drop(guard);
-        self.save_to_disk()?;
+    pub async fn remove_version(
+        &self,
+        agent_id: &str,
+        version: &str,
+    ) -> AgentMgmtResult<AgentManifest> {
+        let removed: AgentManifest = {
+            let mut guard = self.inner.lock();
+            let vkey = version_util::normalize_version(version)?;
+            let versions = guard
+                .get_mut(agent_id)
+                .ok_or_else(|| AgentMgmtError::NotFound(agent_id.to_string()))?;
+            let removed = versions
+                .remove(&vkey)
+                .ok_or_else(|| AgentMgmtError::NotFound(format!("{}@{}", agent_id, version)))?;
+            // 如果 agent 没有任何版本了，清理空条目
+            if versions.is_empty() {
+                guard.remove(agent_id);
+            }
+            removed
+        };
+        self.save_to_disk().await?;
         Ok(removed)
     }
 
@@ -258,7 +271,11 @@ impl AgentRegistry {
         self.path_manager.registry_path()
     }
 
-    fn save_to_disk(&self) -> AgentMgmtResult<()> {
+    /// 持久化注册表（锁结构铁律：锁内只做内存 snapshot，guard 块边界释放后才
+    /// 进入磁盘 IO；IO 经 spawn_blocking 移出 Tokio worker —— registry.json 在
+    /// 共享网络卷上，阻塞池排队发生在锁外，不影响锁持有时长。不得把 lock 挪进
+    /// 闭包或闭包内重锁再跨 await）
+    async fn save_to_disk(&self) -> AgentMgmtResult<()> {
         let snapshot: Vec<AgentManifest> = {
             let guard = self.inner.lock();
             let mut v: Vec<AgentManifest> = guard
@@ -278,28 +295,37 @@ impl AgentRegistry {
         };
         let json = serde_json::to_string_pretty(&snapshot)?;
         let path = self.registry_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // 原子写:tmp → rename
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json.as_bytes())?;
-        if std::fs::rename(&tmp, &path).is_err() {
-            std::fs::copy(&tmp, &path)?;
-            if let Err(e) = std::fs::remove_file(&tmp) {
-                warn!(
-                    "[agent_mgmt] failed to remove registry tmp file after copy fallback: path={}, error={}",
-                    tmp.display(),
-                    e
-                );
+        let count = snapshot.len();
+        tokio::task::spawn_blocking(move || -> AgentMgmtResult<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
-        }
-        info!(
-            "[agent_mgmt] Registry persisted: path={}, count={}",
-            path.display(),
-            snapshot.len()
-        );
-        Ok(())
+            // 原子写:tmp → rename
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, json.as_bytes())?;
+            if std::fs::rename(&tmp, &path).is_err() {
+                std::fs::copy(&tmp, &path)?;
+                if let Err(e) = std::fs::remove_file(&tmp) {
+                    warn!(
+                        "[agent_mgmt] failed to remove registry tmp file after copy fallback: path={}, error={}",
+                        tmp.display(),
+                        e
+                    );
+                }
+            }
+            info!(
+                "[agent_mgmt] Registry persisted: path={}, count={}",
+                path.display(),
+                count
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            AgentMgmtError::Io(std::io::Error::other(format!(
+                "registry persist task panicked: {e}"
+            )))
+        })?
     }
 
     /// 从磁盘读取，按 (agent_id, version) 分组
@@ -420,14 +446,14 @@ mod tests {
         m
     }
 
-    #[test]
-    fn insert_list_get_remove() {
+    #[tokio::test]
+    async fn insert_list_get_remove() {
         let pm = temp_pm();
         let r = AgentRegistry::empty(pm);
         assert_eq!(r.total(), 0);
 
-        r.insert(sample_manifest("codex-acp")).unwrap();
-        r.insert(sample_manifest("kimi-cli")).unwrap();
+        r.insert(sample_manifest("codex-acp")).await.unwrap();
+        r.insert(sample_manifest("kimi-cli")).await.unwrap();
         assert_eq!(r.total(), 2);
 
         let got = r.get("codex-acp").expect("should exist");
@@ -436,19 +462,21 @@ mod tests {
         assert!(r.contains("kimi-cli"));
         assert!(!r.contains("ghost"));
 
-        let removed = r.remove("kimi-cli").unwrap();
+        let removed = r.remove("kimi-cli").await.unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].agent_id, "kimi-cli");
         assert_eq!(r.total(), 1);
     }
 
-    #[test]
-    fn insert_rejects_duplicate_exact_version() {
+    #[tokio::test]
+    async fn insert_rejects_duplicate_exact_version() {
         let r = AgentRegistry::empty(temp_pm());
         r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .await
             .unwrap();
         let err = r
             .insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .await
             .unwrap_err();
         assert!(matches!(
             err,
@@ -456,37 +484,44 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn insert_allows_different_versions() {
+    #[tokio::test]
+    async fn insert_allows_different_versions() {
         let r = AgentRegistry::empty(temp_pm());
         r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .await
             .unwrap();
         r.insert(sample_manifest_with_version("codex-acp", "2.0.0"))
+            .await
             .unwrap();
         assert_eq!(r.total(), 1); // 同一个 agent_id
         assert_eq!(r.get_all_versions("codex-acp").len(), 2);
     }
 
-    #[test]
-    fn get_returns_latest_version() {
+    #[tokio::test]
+    async fn get_returns_latest_version() {
         let r = AgentRegistry::empty(temp_pm());
         r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .await
             .unwrap();
         r.insert(sample_manifest_with_version("codex-acp", "2.0.0"))
+            .await
             .unwrap();
         r.insert(sample_manifest_with_version("codex-acp", "1.5.0"))
+            .await
             .unwrap();
 
         let latest = r.get("codex-acp").unwrap();
         assert_eq!(latest.version.as_deref(), Some("2.0.0"));
     }
 
-    #[test]
-    fn get_version_returns_specific() {
+    #[tokio::test]
+    async fn get_version_returns_specific() {
         let r = AgentRegistry::empty(temp_pm());
         r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .await
             .unwrap();
         r.insert(sample_manifest_with_version("codex-acp", "2.0.0"))
+            .await
             .unwrap();
 
         let v1 = r.get_version("codex-acp", "1.0.0").unwrap();
@@ -498,10 +533,11 @@ mod tests {
         assert!(r.get_version("codex-acp", "3.0.0").is_none());
     }
 
-    #[test]
-    fn contains_version_checks_specific() {
+    #[tokio::test]
+    async fn contains_version_checks_specific() {
         let r = AgentRegistry::empty(temp_pm());
         r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .await
             .unwrap();
 
         assert!(r.contains("codex-acp"));
@@ -510,63 +546,69 @@ mod tests {
         assert!(!r.contains("ghost"));
     }
 
-    #[test]
-    fn remove_version_removes_specific() {
+    #[tokio::test]
+    async fn remove_version_removes_specific() {
         let r = AgentRegistry::empty(temp_pm());
         r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .await
             .unwrap();
         r.insert(sample_manifest_with_version("codex-acp", "2.0.0"))
+            .await
             .unwrap();
 
-        let removed = r.remove_version("codex-acp", "1.0.0").unwrap();
+        let removed = r.remove_version("codex-acp", "1.0.0").await.unwrap();
         assert_eq!(removed.version.as_deref(), Some("1.0.0"));
         assert_eq!(r.total(), 1);
         assert!(r.contains_version("codex-acp", "2.0.0"));
         assert!(!r.contains_version("codex-acp", "1.0.0"));
     }
 
-    #[test]
-    fn remove_removes_all_versions() {
+    #[tokio::test]
+    async fn remove_removes_all_versions() {
         let r = AgentRegistry::empty(temp_pm());
         r.insert(sample_manifest_with_version("codex-acp", "1.0.0"))
+            .await
             .unwrap();
         r.insert(sample_manifest_with_version("codex-acp", "2.0.0"))
+            .await
             .unwrap();
 
-        let removed = r.remove("codex-acp").unwrap();
+        let removed = r.remove("codex-acp").await.unwrap();
         assert_eq!(removed.len(), 2);
         assert_eq!(r.total(), 0);
         assert!(!r.contains("codex-acp"));
     }
 
-    #[test]
-    fn remove_unknown_returns_not_found() {
+    #[tokio::test]
+    async fn remove_unknown_returns_not_found() {
         let r = AgentRegistry::empty(temp_pm());
-        let err = r.remove("ghost").unwrap_err();
+        let err = r.remove("ghost").await.unwrap_err();
         assert!(matches!(err, AgentMgmtError::NotFound(_)));
     }
 
-    #[test]
-    fn upsert_overwrites() {
+    #[tokio::test]
+    async fn upsert_overwrites() {
         let r = AgentRegistry::empty(temp_pm());
         r.upsert(sample_manifest_with_version("a", "1.0.0"))
+            .await
             .unwrap();
         r.upsert(sample_manifest_with_version("a", "1.0.0"))
+            .await
             .unwrap();
         assert_eq!(r.total(), 1);
     }
 
-    #[test]
-    fn insert_rejects_invalid_manifest() {
+    #[tokio::test]
+    async fn insert_rejects_invalid_manifest() {
         let r = AgentRegistry::empty(temp_pm());
         let mut m = sample_manifest("../bad");
         m.installed_at = 0;
-        let err = r.insert(m).unwrap_err();
+        let err = r.insert(m).await.unwrap_err();
         assert!(matches!(err, AgentMgmtError::InvalidManifest(_)));
     }
 
-    #[test]
-    fn load_persists_and_reloads() {
+    #[tokio::test]
+    async fn load_persists_and_reloads() {
         let pm = temp_pm();
         let install_dir = pm.install_dir().to_path_buf();
         let r1 = AgentRegistry::empty(pm.clone());
@@ -583,45 +625,49 @@ mod tests {
             "1.0.0",
             &install_dir,
         ))
+        .await
         .unwrap();
         r1.insert(sample_manifest_with_version_in(
             "alpha",
             "2.0.0",
             &install_dir,
         ))
+        .await
         .unwrap();
         r1.insert(sample_manifest_with_version_in(
             "beta",
             "1.0.0",
             &install_dir,
         ))
+        .await
         .unwrap();
 
         // 重新加载
-        let r2 = AgentRegistry::load(pm).unwrap();
+        let r2 = AgentRegistry::load(pm).await.unwrap();
         assert_eq!(r2.total(), 2);
         assert!(r2.contains("alpha"));
         assert!(r2.contains("beta"));
         assert_eq!(r2.get_all_versions("alpha").len(), 2);
     }
 
-    #[test]
-    fn list_filters_builtin() {
+    #[tokio::test]
+    async fn list_filters_builtin() {
         let pm = temp_pm();
         let r = AgentRegistry::empty(pm);
         r.insert(sample_manifest_with_version("user-1", "1.0.0"))
+            .await
             .unwrap();
         let mut builtin = sample_manifest_with_version("builtin-1", "1.0.0");
         builtin.install_type = InstallType::Builtin;
-        r.insert(builtin).unwrap();
+        r.insert(builtin).await.unwrap();
 
         let user_only = r.list();
         assert_eq!(user_only.len(), 1);
         assert_eq!(user_only[0].agent_id, "user-1");
     }
 
-    #[test]
-    fn compare_versions_basic() {
+    #[tokio::test]
+    async fn compare_versions_basic() {
         use std::cmp::Ordering;
         let cv = version_util::compare_versions;
         assert_eq!(cv("1.0.0", "1.0.0").unwrap(), Ordering::Equal);
@@ -631,21 +677,21 @@ mod tests {
         assert_eq!(cv("1.2.3", "1.2.4").unwrap(), Ordering::Less);
     }
 
-    #[test]
-    fn compare_versions_with_v_prefix() {
+    #[tokio::test]
+    async fn compare_versions_with_v_prefix() {
         use std::cmp::Ordering;
         let cv = version_util::compare_versions;
         assert_eq!(cv("v1.0.0", "1.0.0").unwrap(), Ordering::Equal);
         assert_eq!(cv("V2.0.0", "1.9.9").unwrap(), Ordering::Greater);
     }
 
-    #[test]
-    fn compare_versions_returns_err_on_invalid() {
+    #[tokio::test]
+    async fn compare_versions_returns_err_on_invalid() {
         assert!(version_util::compare_versions("invalid", "0.0.0").is_err());
     }
 
-    #[test]
-    fn version_key_normalizes() {
+    #[tokio::test]
+    async fn version_key_normalizes() {
         let nk = version_util::normalize_version;
         // v 前缀归一化
         assert_eq!(nk("v1.0.0").unwrap(), "1.0.0");
@@ -663,14 +709,14 @@ mod tests {
         assert!(nk("latest").is_err());
     }
 
-    #[test]
-    fn normalize_platform_key_amd64() {
+    #[tokio::test]
+    async fn normalize_platform_key_amd64() {
         assert_eq!(normalize_platform_key("linux", "amd64"), "linux-x86_64");
         assert_eq!(normalize_platform_key("linux", "x86_64"), "linux-x86_64");
     }
 
-    #[test]
-    fn normalize_platform_key_arm64() {
+    #[tokio::test]
+    async fn normalize_platform_key_arm64() {
         assert_eq!(normalize_platform_key("linux", "arm64"), "linux-arm64");
         assert_eq!(normalize_platform_key("linux", "aarch64"), "linux-arm64");
         assert_eq!(normalize_platform_key("darwin", "arm64"), "darwin-arm64");

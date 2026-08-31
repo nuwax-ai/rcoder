@@ -138,15 +138,44 @@ pub(super) async fn scan_dev_workspace_identifiers(
         }
     };
     let mut ids = std::collections::BTreeSet::new();
-    while let Ok(Some(uid_dir)) = uid_entries.next_entry().await {
+    loop {
+        // 错误上抛（对齐顶层 read_dir 的处理）：静默截断会让漏扫用户的
+        // workspace 逃过对账 —— orphan 误判/清毁前置校验误放行都源于此
+        let uid_dir = match uid_entries.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                return Err(ContainerRuntimeError::DockerError(format!(
+                    "list dev workspace identifiers: iterate {}: {e}",
+                    dev_root.display()
+                )));
+            }
+        };
         let uid_path = uid_dir.path();
         if !uid_path.is_dir() {
             continue;
         }
-        let Ok(mut app_entries) = tokio::fs::read_dir(&uid_path).await else {
-            continue;
+        let mut app_entries = match tokio::fs::read_dir(&uid_path).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(ContainerRuntimeError::DockerError(format!(
+                    "list dev workspace identifiers: read {}: {e}",
+                    uid_path.display()
+                )));
+            }
         };
-        while let Ok(Some(app_dir)) = app_entries.next_entry().await {
+        loop {
+            let app_dir = match app_entries.next_entry().await {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(ContainerRuntimeError::DockerError(format!(
+                        "list dev workspace identifiers: iterate {}: {e}",
+                        uid_path.display()
+                    )));
+                }
+            };
             let name = app_dir.file_name().to_string_lossy().to_string();
             if matches!(name.as_str(), "data" | "logs" | "agent-store") {
                 continue;

@@ -92,7 +92,17 @@ where
 {
     tokio::spawn(async move {
         let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        loop {
+            // 读侧失败必须留痕: 子进程输出含非 UTF-8 字节时 lines() 返回
+            // InvalidData, 静默退出会让该流后续日志全部丢失且无迹可循
+            let line = match lines.next_line().await {
+                Ok(Some(l)) => l,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "log pipe read failed, stream logging stopped");
+                    break;
+                }
+            };
             let prefixed = format!("{}{}", timestamp_prefix(), line);
             // 主+临时都写; 单流失败不阻塞另一流
             if let Err(e) = append_line(&main_path, &prefixed).await {
@@ -118,7 +128,15 @@ where
 {
     tokio::spawn(async move {
         let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        loop {
+            let line = match lines.next_line().await {
+                Ok(Some(l)) => l,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "log pipe read failed, stream logging stopped");
+                    break;
+                }
+            };
             // 原始行入环形缓冲 (供错误分类)
             super::error_classify::ring_push(&ring, &line);
             // 带时间戳写日志

@@ -153,7 +153,7 @@ pub async fn install_from_npm(
         installed_at: chrono::Utc::now().timestamp(),
     };
     manifest.validate()?;
-    registry.upsert(manifest)?;
+    registry.upsert(manifest).await?;
 
     info!(
         "[agent_mgmt] npm install done: agent_id={}, entrypoint={}",

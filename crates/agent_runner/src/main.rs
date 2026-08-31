@@ -208,25 +208,26 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
     // 🆕 P0-1: 创建 Agent 管理注册表(从磁盘加载,失败则用空注册表 + 警告)
     let agent_mgmt_path_manager = agent_runner::agent_mgmt::PathManager::new();
-    let agent_mgmt_registry =
-        match agent_runner::agent_mgmt::AgentRegistry::load(agent_mgmt_path_manager.clone()) {
-            Ok(r) => {
-                info!(
-                    "[MAIN] Agent management registry loaded: total={}, builtin={}",
-                    r.total(),
-                    r.builtin_count()
-                );
-                Arc::new(r)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[MAIN] Failed to load agent management registry, starting empty: {e}"
-                );
-                Arc::new(agent_runner::agent_mgmt::AgentRegistry::empty(
-                    agent_mgmt_path_manager.clone(),
-                ))
-            }
-        };
+    let agent_mgmt_registry = match agent_runner::agent_mgmt::AgentRegistry::load(
+        agent_mgmt_path_manager.clone(),
+    )
+    .await
+    {
+        Ok(r) => {
+            info!(
+                "[MAIN] Agent management registry loaded: total={}, builtin={}",
+                r.total(),
+                r.builtin_count()
+            );
+            Arc::new(r)
+        }
+        Err(e) => {
+            tracing::warn!("[MAIN] Failed to load agent management registry, starting empty: {e}");
+            Arc::new(agent_runner::agent_mgmt::AgentRegistry::empty(
+                agent_mgmt_path_manager.clone(),
+            ))
+        }
+    };
 
     // 🔥 http-server 模式：启动 HTTP + (可选 gRPC) + Pingora
     #[cfg(feature = "http-server")]
