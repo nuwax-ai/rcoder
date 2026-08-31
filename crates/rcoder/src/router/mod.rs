@@ -116,7 +116,11 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .merge(crate::userapp_forward::routes().with_state(state.clone()))
         // file-server 分流代理运行时启停 (无 state, 受全局 API key 中间件保护;
         // `rcoder file-server {start,stop,restart,status}` CLI 的服务端)
-        .merge(crate::file_server_admin::admin_routes());
+        .merge(crate::file_server_admin::admin_routes())
+        // OpenAPI 文档 UI 两面（Swagger + Scalar）。在此 merge = 受下方 API key
+        // 中间件保护（与拆分前 router.rs 的挂载语义一致）
+        .merge(crate::router_docs::create_swagger_ui())
+        .merge(crate::router_docs::create_scalar_docs());
 
     // 仅在启用 debug feature 时添加调试路由
     #[cfg(feature = "debug")]
@@ -140,4 +144,35 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             .merge(create_internal_routes(state.clone()))
             .merge(file_server_routes_with_intercept(&state)),
     )
+}
+
+#[cfg(test)]
+mod assembly_guard {
+    /// 主装配防丢件守卫：create_router 的 merge 链必须覆盖全部对外路由面。
+    ///
+    /// 背景：ac99d63 目录化拆分曾漏挂 router_docs 两面（/api/docs 全 404）——
+    /// router_docs 自身的 HTTP 守卫直接构造子 Router 测试、不经过 create_router
+    /// 装配层，装配遗漏是测试盲区。以源码快照断言兜底（同 userapp_forward
+    /// guard_tables 快照闭包模式）：新增对外路由面须同步本清单。
+    #[test]
+    fn create_router_merges_all_public_route_families() {
+        let src = include_str!("mod.rs");
+        for family in [
+            "router_docs::create_swagger_ui()",
+            "router_docs::create_scalar_docs()",
+            "userapp_forward::routes()",
+            "file_server_admin::admin_routes()",
+            "app_manager::routes::app_manager_routes()",
+            "internal_pod_ensure",
+            "api::api_routes",
+            "computer::computer_routes",
+            "userapp_proxy::proxy_api_routes",
+            "agent_mgmt::agent_mgmt_routes",
+        ] {
+            assert!(
+                src.contains(family),
+                "create_router 装配缺路由面: {family}（对照拆分前 router.rs merge 链）"
+            );
+        }
+    }
 }
