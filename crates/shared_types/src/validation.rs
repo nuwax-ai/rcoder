@@ -18,6 +18,23 @@ pub fn garde_err_to_app_error(report: Report) -> AppError {
     AppError::validation_error(&message)
 }
 
+/// UserApp `app_id` 长度上限（Fail Fast 校验用）。
+///
+/// 推导链（K8s 部署形态）：StatefulSet controller 自动给每个 pod 打
+/// `apps.kubernetes.io/controller-revision-hash` label，其值 = ControllerRevision
+/// 名 = `{sts 名}-{10 位 hash}`。K8s label 值上限 63 字节：
+///
+/// ```text
+/// rcoder-app-builder-(19) + app_id + -hash(11) ≤ 63  →  app_id ≤ 33
+/// ```
+///
+/// identifier 白名单（`IDENTIFIER_RE`）允许 64 字符，但超 33 的 app_id 在
+/// K8s 下创建 builder STS 必然 `FailedCreate: invalid metadata.labels`，
+/// 表象是含糊的 ensure 500/连接超时（真因只在 kubectl events）——入口
+/// Fail Fast 把它变成明确的 400。Docker 模式理论上限更宽，统一 33 取最紧
+/// 约束（与 user_id ≤23 的既有限制同类：K8s 资源名约束传导到业务标识）。
+pub const USERAPP_APP_ID_MAX_LEN: usize = 33;
+
 /// 校验路径标识符（project_id, agent_work_dir 等）
 ///
 /// # 规则

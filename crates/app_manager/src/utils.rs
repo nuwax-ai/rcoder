@@ -72,6 +72,10 @@ pub(super) fn validate_upload_target(target: &str) -> AppResult<()> {
 /// app_id 直接来自 HTTP 路径参数，会流入文件系统路径拼接（delete/upload/logs/list）。
 /// 此校验是路径穿越的纵深防御（Fail Fast）：拒绝 `..`、绝对路径、非法格式，
 /// 避免恶意 app_id 触达工作空间目录之外。
+///
+/// 长度上限 33（`USERAPP_APP_ID_MAX_LEN`）：K8s 下 builder STS pod 的
+/// controller-revision-hash label = `rcoder-app-builder-{app_id}-{10位hash}`
+/// 受 K8s 63 字节限，超长 app_id 创建必然失败且表象含糊——入口拒绝。
 pub(super) fn validate_app_id(app_id: &str) -> AppResult<()> {
     // 必须 app- 前缀（统一，和自动生成一致）
     let rest = app_id.strip_prefix("app-").ok_or_else(|| {
@@ -82,11 +86,18 @@ pub(super) fn validate_app_id(app_id: &str) -> AppResult<()> {
             "invalid app_id: empty after 'app-'".to_string(),
         ));
     }
-    // DNS-1123 label 合规（[a-z0-9]([-a-z0-9]*[a-z0-9])?，≤63；支持 app-order-svc 等业务名）
-    if rest.len() > 63
-        || !rest
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    if app_id.len() > shared_types::USERAPP_APP_ID_MAX_LEN {
+        return Err(AppOperationError::Validation(format!(
+            "invalid app_id: length {} exceeds {} (K8s StatefulSet label 63-byte limit, \
+             see USERAPP_APP_ID_MAX_LEN)",
+            app_id.len(),
+            shared_types::USERAPP_APP_ID_MAX_LEN
+        )));
+    }
+    // DNS-1123 label 合规（[a-z0-9]([-a-z0-9]*[a-z0-9])?；支持 app-order-svc 等业务名）
+    if !rest
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         return Err(AppOperationError::Validation(format!(
             "invalid app_id: must be DNS-1123 label (lowercase alphanumeric or '-', got '{rest}')"
@@ -240,6 +251,23 @@ mod tests {
         assert!(validate_app_id("app-order-svc").is_ok());
         assert!(validate_app_id("app-1a2b3c4d").is_ok());
         assert!(validate_app_id("app-a").is_ok()); // 最短合法
+        // 上限边界：恰好 33 字符
+        let edge = format!("app-{}", "x".repeat(29));
+        assert_eq!(edge.len(), shared_types::USERAPP_APP_ID_MAX_LEN);
+        assert!(validate_app_id(&edge).is_ok());
+    }
+
+    #[test]
+    fn validate_app_id_err_too_long() {
+        // 超 33：K8s builder STS revision-hash label 超 63 字节必炸，
+        // 入口 Fail Fast（而非 apiserver FailedCreate 含糊表象）
+        let too_long = format!("app-{}", "x".repeat(30));
+        let err = validate_app_id(&too_long).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("USERAPP_APP_ID_MAX_LEN") || msg.contains("33"),
+            "报错应带上限指引: {msg}"
+        );
     }
 
     #[test]
@@ -264,13 +292,6 @@ mod tests {
     fn validate_app_id_err_path_traversal() {
         // 含 ../ 等穿越字符
         assert!(validate_app_id("app-../../../etc").is_err());
-    }
-
-    #[test]
-    fn validate_app_id_err_too_long() {
-        // rest > 63 字符
-        let too_long = format!("app-{}", "a".repeat(64));
-        assert!(validate_app_id(&too_long).is_err());
     }
 
     #[test]

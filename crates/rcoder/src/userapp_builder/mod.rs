@@ -38,6 +38,21 @@ pub(crate) async fn ensure_userapp_builder(
     app_id: &str,
     explicit_user_id: Option<&str>,
 ) -> Result<ContainerBasicInfo> {
+    // 长度 Fail Fast（仅新建路径需要——注册命中说明历史上已建成，不受限）：
+    // K8s 下 STS pod 的 controller-revision-hash label =
+    // `rcoder-app-builder-{app_id}-{10位hash}` 受 63 字节限，超长必然
+    // FailedCreate 且表象含糊（ensure 500/连接超时，真因只在 kubectl
+    // events）。入口明确拒绝（229 全链 e2e 实测抓出）。
+    if app_id.len() > shared_types::USERAPP_APP_ID_MAX_LEN
+        && registered_builder(state, app_id).is_none()
+    {
+        return Err(anyhow!(
+            "app_id length {} exceeds {} (K8s StatefulSet label 63-byte limit; \
+             see USERAPP_APP_ID_MAX_LEN)",
+            app_id.len(),
+            shared_types::USERAPP_APP_ID_MAX_LEN
+        ));
+    }
     match registered_builder(state, app_id) {
         Some(info) => Ok(info),
         None => create_builder_and_register(state, app_id, explicit_user_id).await,

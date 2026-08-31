@@ -98,7 +98,9 @@ pub use shared_types_i18n::{
 
 // Validation 模块
 pub mod validation;
-pub use validation::{IDENTIFIER_RE, garde_err_to_app_error, validate_identifier};
+pub use validation::{
+    IDENTIFIER_RE, USERAPP_APP_ID_MAX_LEN, garde_err_to_app_error, validate_identifier,
+};
 
 // UserApp 日志域契约（rcoder ↔ app-cli 单一事实源；OpenAPI schema 同源派生）
 pub mod app_cli_logs;
