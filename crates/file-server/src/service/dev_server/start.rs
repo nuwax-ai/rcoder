@@ -226,7 +226,8 @@ impl DevServerManager {
     /// 端口恒 9080（pingap 主入口，per-app 开发容器无冲突），不走 PortPool；
     /// 探活沿用 poll_alive（app-cli 早退=manifest 校验失败被拦截；HTTP 未
     /// 就绪但进程存活=宽松通过，与 vite 路径同语义）。app-cli 自身文件日志
-    /// 指 `<log_dir>/app-cli/`，stdout/stderr 管道照走 main_log（dev/logs 可读）。
+    /// 指 `<log_dir>/app-cli/`，stdout/stderr 管道照走 main_log；编排日志的
+    /// 对外查询口=logs/query 内置源（service_id=app-cli / source_id=orchestrator）。
     async fn start_dev_manifest(
         &self,
         project_id: &str,

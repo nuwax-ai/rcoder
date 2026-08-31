@@ -299,7 +299,6 @@ mod tests {
             "/api/v1/userapp/build",
             "/api/v1/userapp/dev/start",
             "/api/v1/userapp/dev/restart",
-            "/api/v1/userapp/dev/logs",
             "/api/v1/userapp/ensure-workspace",
             "/api/v1/userapp/static/app-1",
             "/api/v1/userapp/get-file-list",

@@ -3,9 +3,7 @@
 //! 三条接口支持 `{app_stage}` 显式环境分派（prod=运行容器实例 IP / dev=开发容器
 //! host 重拼 :3010，见 `AppService::log_api_base`）。
 //!
-//! JSON 转发（sources/query、query）是**透明代理**：透传 app-cli 的状态码 +
-//! 三条接口均支持 `{app_stage}` 显式环境分派（prod=运行容器实例 IP / dev=开发容器
-//! host 重拼 :3010，见 `AppService::log_api_base`）——
+//! JSON 转发（sources/query、query）是**透明代理**：
 //! 响应体——app-cli 侧统一 `HttpResult` 信封（`{code,message,data,tid,success}`），
 //! 成功失败都以信封直达调用方，code/message 保真不二次包装；仅连接/读取失败
 //! 由 rcoder 生成自己的 HttpResult 错误（AppError 路径）。SSE（stream）豁免信封。
@@ -55,6 +53,9 @@ pub struct LogsAccessParams {
 查询应用声明的日志源及匹配到的日志文件清单（选日志面板"源选择器"用）。
 `app_stage` 决定目标容器：dev=开发容器的实时源 / prod=运行容器的应用日志源；
 请求体 selectors 支持 per-service 过滤（空 = 全量声明面）。
+
+内置源：编排器（app-cli 自身）日志以 `service_id=app-cli` / `source_id=orchestrator`
+常驻提供（JSON 行格式，含启停横幅与部署过程输出，空容器未部署时也可查）。
 "#,
     responses(
         (
@@ -100,6 +101,9 @@ pub async fn query_app_log_sources(
 多服务日志快照（分页拉取，非 SSE）：携带上次响应的 `cursor` 即可断点续拉；
 `cursor_reset=true` 表示跨部署代需从 tail 重读。`app_stage` 选择目标容器同
 sources/query。
+
+编排器（app-cli 自身）日志以内置源 `service_id=app-cli` / `source_id=orchestrator`
+提供——看应用部署启动过程即按此过滤（`selectors=[{"service_id":"app-cli"}]`）。
 "#,
     responses(
         (
@@ -145,6 +149,9 @@ pub async fn query_app_logs(
 SSE 实时日志流（500ms 轮询内核）：事件清单与断线续传协议见 200 响应说明。
 `app_stage` 选择目标容器同 sources/query；断线后以最近 checkpoint 回填 cursor 重连，
 部署代切换收 `cursor_reset` 后重置游标。
+
+编排器（app-cli 自身）日志以内置源 `service_id=app-cli` / `source_id=orchestrator`
+常驻提供，`selectors` 可按此过滤实时跟踪部署启动过程。
 "#,
     responses(
         (

@@ -484,19 +484,3 @@ pub struct DevOpBody {
     /// project.manifest.toml `[proxy].path` 决定，传了无效果。
     pub base_path: Option<String>,
 }
-
-#[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct DevLogsQuery {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
-    pub app_id: String,
-    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；
-    /// file-server 侧不参与容器内定位）
-    pub user_id: String,
-    /// 日志起始行（分页，默认 1）
-    #[serde(default = "default_start_index")]
-    pub start_index: usize,
-    /// 日志类型：main=当日汇总 / temp=最新一次（默认）
-    #[serde(default)]
-    pub log_type: Option<String>,
-}

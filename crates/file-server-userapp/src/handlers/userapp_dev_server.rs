@@ -16,13 +16,12 @@ use shared_types::HttpResult;
 use super::userapp::{UserAppReply, reply};
 use crate::UserAppState;
 use crate::models::{
-    BuildTaskStatus, DevLogsQuery, DevOpBody, UserappDevList, UserappDevListQuery,
-    UserappDevProcess, UserappDevStopped, UserappDevTaskCreated,
+    BuildTaskStatus, DevOpBody, UserappDevList, UserappDevListQuery, UserappDevProcess,
+    UserappDevStopped, UserappDevTaskCreated,
 };
 use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppQuery as Query};
 use file_server::models::DevProcess;
-use file_server::models::ReadDevLogResult;
 use file_server::service::dev_server::StoppedDev;
 use file_server::workspace::resolve_userapp_dev;
 
@@ -341,34 +340,6 @@ pub(crate) async fn dev_list(
         Ok(UserappDevList { list })
     };
     reply(result.await)
-}
-
-/// 开发服务日志
-///
-/// 读取该 `app_id` 的 dev server 进程日志并分页返回：`log_type=main` 当日
-/// 汇总 / `temp` 最新一次运行（默认）；`start_index` 起始行分页（默认 1）。
-#[utoipa::path(
-    get,
-    path = "/dev/logs",
-    params(DevLogsQuery),
-    responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "开发服务日志分页")),
-    tag = "UserApp · dev · 进程管理"
-)]
-pub(crate) async fn dev_logs(
-    State(state): State<UserAppState>,
-    Query(q): Query<DevLogsQuery>,
-) -> UserAppReply<ReadDevLogResult> {
-    tracing::debug!(app_id = %q.app_id, user_id = %q.user_id, "userapp dev logs");
-    let result = state
-        .fs
-        .dev_server
-        .read_dev_log(
-            &dev_key(&q.app_id),
-            q.start_index,
-            q.log_type.as_deref().unwrap_or("temp"),
-        )
-        .await;
-    reply(result)
 }
 
 #[cfg(test)]

@@ -45,7 +45,6 @@ fn userapp_router() -> OpenApiRouter<UserAppState> {
         .routes(routes!(userapp_dev_server::dev_stop))
         .routes(routes!(userapp_dev_server::dev_restart))
         .routes(routes!(userapp_dev_server::dev_list))
-        .routes(routes!(userapp_dev_server::dev_logs))
         .routes(routes!(static_files::serve_userapp))
         .route("/static/{app_id}", options(static_files::serve_userapp))
 }
@@ -122,7 +121,6 @@ mod tests {
             "/api/v1/userapp/dev/stop",
             "/api/v1/userapp/dev/restart",
             "/api/v1/userapp/dev/list",
-            "/api/v1/userapp/dev/logs",
             "/api/v1/userapp/static/{app_id}",
         ] {
             assert!(
@@ -130,7 +128,7 @@ mod tests {
                 "userapp path missing: {path}"
             );
         }
-        assert_eq!(document.paths.paths.len(), 34);
+        assert_eq!(document.paths.paths.len(), 33);
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 
@@ -361,10 +359,7 @@ mod tests {
             .schemas
         {
             if !name.starts_with("Userapp")
-                && !matches!(
-                    name.as_str(),
-                    "DevOpBody" | "DevLogsQuery" | "TaskLogsQuery" | "StreamQuery"
-                )
+                && !matches!(name.as_str(), "DevOpBody" | "TaskLogsQuery" | "StreamQuery")
             {
                 continue;
             }
@@ -415,7 +410,6 @@ mod tests {
                 "HttpResult_UserappDevTaskCreated",
             ),
             ("/api/v1/userapp/dev/list", "HttpResult_UserappDevList"),
-            ("/api/v1/userapp/dev/logs", "HttpResult_ReadDevLogResult"),
             (
                 "/api/v1/userapp/ensure-workspace",
                 "HttpResult_UserappEnsureWorkspaceData",
