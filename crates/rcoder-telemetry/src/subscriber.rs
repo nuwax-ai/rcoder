@@ -270,15 +270,6 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
         }
     }
     let deny_tokio = tokio_console_layer.is_some();
-    let make_deny_filter = |deny_tokio: bool| {
-        move |meta: &tracing::Metadata<'_>| {
-            let deny = meta.target().starts_with("file_server")
-                || (deny_tokio
-                    && (meta.target().starts_with("tokio")
-                        || meta.target().starts_with("runtime")));
-            !deny
-        }
-    };
 
     // 控制台日志层（deny file_server + console 开启时额外 deny tokio/runtime）
     let console_layer = fmt::layer()
@@ -327,7 +318,11 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
     };
 
     // OTLP layer：有 exporter 用真实 provider；无 exporter 用全局 no-op
-    // （no-op 仍安装 OpenTelemetryLayer——提供 span context 存储基础设施）
+    // （no-op 仍安装 OpenTelemetryLayer——提供 span context 存储基础设施）。
+    // EnvFilter 为 console 放行的 tokio/runtime trace 级 span（每秒上万）必须
+    // 在此 deny：OTel 层漏拦会把 BatchSpanProcessor 队列持续打满强制导出，
+    // 导出 gRPC 本身又 spawn 任务生成新的 runtime span，正反馈下 RSS 以
+    // ~30MB/s 爬升（compose 实测 10 分钟涨至 25GB）
     let otel_layer = {
         static NOOP_PROVIDER: std::sync::OnceLock<SdkTracerProvider> = std::sync::OnceLock::new();
         let tracer = match tracer_provider {
@@ -337,7 +332,9 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
                 provider.tracer(service_name.to_string())
             }
         };
-        Some(tracing_opentelemetry::layer().with_tracer(tracer))
+        tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(filter_fn(make_deny_filter(deny_tokio)))
     };
 
     // 组装 subscriber 链
@@ -358,6 +355,21 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
     }
 
     Ok(())
+}
+
+/// per-layer deny 过滤器工厂：deny `file_server` target（独立日志域），
+/// `deny_tokio`（console 开启）时额外 deny `tokio`/`runtime` target——
+/// EnvFilter 为 console 放行的这两类 trace 级 span 每秒上万，fmt/文件/OTel
+/// 三个消费层都必须各自拦截（`filter_fn` 要求 `'static`，闭包经参数化工厂生成）。
+fn make_deny_filter(
+    deny_tokio: bool,
+) -> impl Fn(&tracing::Metadata<'_>) -> bool + Send + Sync + 'static {
+    move |meta: &tracing::Metadata<'_>| {
+        let deny = meta.target().starts_with("file_server")
+            || (deny_tokio
+                && (meta.target().starts_with("tokio") || meta.target().starts_with("runtime")));
+        !deny
+    }
 }
 
 /// 两个 boxed layer（Option 包装，None 为 no-op）叠加为单层。
@@ -405,6 +417,53 @@ impl tracing::field::Visit for JsonFieldVisitor<'_> {
         self.0.insert(
             field.name().to_string(),
             serde_json::json!(value.to_string()),
+        );
+    }
+}
+
+#[cfg(test)]
+mod otel_deny_tests {
+    use super::*;
+
+    /// 复现生产装配的 OTel 层 deny 行为：EnvFilter 为 tokio-console 放行
+    /// `runtime=trace, tokio=trace` 后，这两类 target 的 span（console 场景
+    /// 每秒上万）不得进入 OTel 导出——漏拦会把 BatchSpanProcessor 队列持续
+    /// 打满强制导出，导出 gRPC 又 spawn 新任务生成 runtime span，正反馈下
+    /// RSS 以 ~30MB/s 爬升（compose 实测 10 分钟涨至 25GB）。
+    #[test]
+    fn otel_layer_excludes_tokio_runtime_spans_under_console_env_filter() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::testing::trace::new_test_exporter;
+
+        let (exporter, mut rx_export, _rx_shutdown) = new_test_exporter();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .build();
+
+        // 与 init_tracing_subscriber 同构：console 开启 → EnvFilter 放行
+        // trace 级 tokio/runtime，otel 层挂 make_deny_filter(true)
+        let env_filter = EnvFilter::new("debug,runtime=trace,tokio=trace");
+        let otel = tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("otel-deny-test"))
+            .with_filter(filter_fn(make_deny_filter(true)));
+
+        let subscriber = tracing_subscriber::registry().with(env_filter).with(otel);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _s1 = tracing::trace_span!(target: "runtime::tokio", "runtime.spawn").entered();
+            let _s2 = tracing::trace_span!(target: "tokio::task", "task.spawn").entered();
+            let _s3 = tracing::info_span!(target: "rcoder::handler", "http_request").entered();
+        });
+        drop(provider.force_flush());
+
+        let mut names = Vec::new();
+        while let Ok(span) = rx_export.try_recv() {
+            names.push(span.name);
+        }
+        assert_eq!(
+            names,
+            ["http_request"],
+            "runtime/tokio target 的 span 漏进了 OTel 导出: {names:?}"
         );
     }
 }

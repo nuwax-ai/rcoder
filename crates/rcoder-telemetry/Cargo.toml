@@ -51,3 +51,4 @@ full = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
