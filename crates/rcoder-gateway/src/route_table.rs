@@ -127,6 +127,7 @@ pub fn build_route_table() -> Result<Router<RouteType>, matchit::InsertError> {
     // ── 控制面路由（不注册，由默认匹配处理）──
     // POST /computer/pod/ensure → ControlPlane (default)
     // POST /computer/pod/restart → ControlPlane (default)
+    // POST /computer/pod/stop → ControlPlane (default)
     // POST /computer/pod/keepalive → ControlPlane (default)
     // GET  /computer/pod/count → ControlPlane (default)
     // GET  /health → ControlPlane (default)

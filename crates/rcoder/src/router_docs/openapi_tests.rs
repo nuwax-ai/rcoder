@@ -724,7 +724,7 @@ fn pod_endpoints_fields_are_documented() {
             }
         }
     }
-    // 请求体 DTO（POST 三兄弟）的 schema 字段（$ref 字段如 resource_limits 跳过）
+    // 请求体 DTO（POST 四兄弟）的 schema 字段（$ref 字段如 resource_limits 跳过）
     for (name, schema) in &document
         .components
         .as_ref()
@@ -733,7 +733,7 @@ fn pod_endpoints_fields_are_documented() {
     {
         if !matches!(
             name.as_str(),
-            "EnsurePodRequest" | "KeepalivePodRequest" | "RestartPodRequest"
+            "EnsurePodRequest" | "KeepalivePodRequest" | "RestartPodRequest" | "StopPodRequest"
         ) {
             continue;
         }
@@ -757,7 +757,7 @@ fn pod_endpoints_fields_are_documented() {
         }
     }
     // 动态下限防空转：GET status/vnc-status 各 9 参数（含新增 app_id/app_stage）；
-    // 三个 POST DTO 各 9 个内联字段（resource_limits 为 $ref 不计）。
+    // 四个 POST DTO 各 6-9 个内联字段（resource_limits 为 $ref 不计）。
     assert!(
         checked_params >= 16,
         "pod 接口参数覆盖数异常偏少: {checked_params}"
@@ -805,12 +805,11 @@ fn agent_endpoints_userapp_dispatch_fields_are_documented() {
             else {
                 continue;
             };
-            let desc = field_obj
-                .description
-                .as_deref()
-                .unwrap_or_default()
-                .trim();
-            assert!(!desc.is_empty(), "schema {name} 字段 {field} 缺少 description");
+            let desc = field_obj.description.as_deref().unwrap_or_default().trim();
+            assert!(
+                !desc.is_empty(),
+                "schema {name} 字段 {field} 缺少 description"
+            );
             assert!(
                 desc.contains("project_id 兼任 app_id"),
                 "schema {name} 字段 {field} 描述未写明「project_id 兼任 app_id」wire 契约: {desc}"

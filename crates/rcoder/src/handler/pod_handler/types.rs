@@ -381,6 +381,60 @@ pub struct RestartPodResponse {
     pub message: String,
 }
 
+// ============================================================================
+// 接口五：停止容器
+// ============================================================================
+
+/// 停止容器请求
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct StopPodRequest {
+    /// 用户唯一标识符 (必填)
+    #[schema(example = "user_123")]
+    #[serde(default)]
+    pub user_id: String,
+
+    /// 项目唯一标识符 (必填)
+    #[schema(example = "proj_456")]
+    #[serde(default)]
+    pub project_id: String,
+
+    /// 容器唯一标识，若传值则使用此 ID 标识容器（与创建/重启时保持一致）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "pod_tenant_123")]
+    pub pod_id: Option<String>,
+
+    /// 服务类型，决定销毁哪种类型的容器
+    /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
+    /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
+    /// - "userapp" (userApp 场景，大小写不敏感): 与 app_id 搭配传入，
+    ///   容器类型由 app_stage 推导；其余值与 app_id 互斥
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "computer-agent-runner")]
+    pub service_type: Option<String>,
+
+    /// UserApp 容器标识（可选；存在即进入 userApp 分派——停止 userApp 容器；
+    /// 与 service_type=userapp 搭配）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "app_789")]
+    pub app_id: Option<String>,
+
+    /// UserApp 容器阶段（可选，缺省 "dev"；dev=开发容器 UserAppBuilder / prod=生产 Deployment）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
+}
+
+/// 停止容器响应
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct StopPodResponse {
+    /// 容器是否曾经存在 (之前不存在时为 false，此时为幂等空操作)
+    pub was_existing: bool,
+
+    /// 提示消息
+    #[schema(example = "容器已停止并销毁（数据卷保留）")]
+    pub message: String,
+}
+
 /// 查询容器状态请求
 #[derive(Debug, Clone, Deserialize, IntoParams, ToSchema)]
 pub struct PodStatusQuery {

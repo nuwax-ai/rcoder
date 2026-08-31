@@ -48,6 +48,7 @@ pub(super) fn computer_routes(state: Arc<AppState>) -> Router {
         .route("/computer/pod/ensure", post(handler::pod_ensure))
         .route("/computer/pod/keepalive", post(handler::pod_keepalive))
         .route("/computer/pod/restart", post(handler::pod_restart))
+        .route("/computer/pod/stop", post(handler::pod_stop))
         .route("/computer/pod/status", get(handler::pod_status))
         .route("/computer/pod/vnc-status", get(handler::pod_vnc_status))
         // 🆕 音频代理路由（用于 OpenAPI 文档）
