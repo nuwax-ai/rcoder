@@ -237,7 +237,15 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
                 .await
             }
             _ => {
-                // BINARY / Builtin:走 streaming 安装（metadata 已解析，直接传入）
+                // BINARY / Builtin:走 streaming 安装（metadata 已解析，直接传入）。
+                // 注意 conversion 对非法 i32 产出 Unknown —— 不能让它混进本分支
+                // 静默按二进制流解析（调用方按 URL/NPM 语义发的请求会报误导性
+                // 压缩包错误），先显式拒绝
+                if matches!(install_type, shared_types::InstallType::Unknown) {
+                    return Err(Self::to_status(AgentMgmtError::InvalidChunk(format!(
+                        "unknown install_type: {install_type_i32} (proto enum out of range)"
+                    ))));
+                }
                 let first_data = Bytes::from(first_chunk.data);
                 let prepared = binary_installer::StreamMetadata {
                     agent_id,

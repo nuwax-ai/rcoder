@@ -311,15 +311,26 @@ async fn download_and_install_skill(
         extract_root.clone()
     };
     let mut candidates: Vec<(String, PathBuf)> = Vec::new();
-    if let Ok(mut rd) = fs::read_dir(&base).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
+    // 读目录失败上抛 → 调用方落入 failed_skills 明细（权限错误不伪装成"无 skill"）
+    let mut rd = fs::read_dir(&base).await?;
+    loop {
+        let entry = match rd.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "list extracted skill entries interrupted, partial candidates"
+                );
+                break;
             }
-            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
-                candidates.push((name, entry.path()));
-            }
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            candidates.push((name, entry.path()));
         }
     }
 
