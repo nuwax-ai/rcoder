@@ -597,7 +597,10 @@ pub async fn computer_agent_session_cancel(
             .await;
         }
         Ok(super::pod_handler::AppTarget::Prod(_)) => {
-            return Ok(super::pod_handler::invalid_app_target_response(locale, "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 (UserappBuilder 开发容器)"));
+            return Ok(super::pod_handler::invalid_app_target_response(
+                locale,
+                "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 (UserappBuilder 开发容器)",
+            ));
         }
         Err(e) => return Ok(super::pod_handler::invalid_app_target_response(locale, &e)),
     }
@@ -615,10 +618,7 @@ pub async fn computer_agent_session_cancel(
     };
 
     // 验证 project_id 不为空（computer 路径必填）
-    let Some(project_id) = request
-        .project_id
-        .filter(|s| !s.trim().is_empty())
-    else {
+    let Some(project_id) = request.project_id.filter(|s| !s.trim().is_empty()) else {
         error!("[COMPUTER_CANCEL] project_id is required");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,

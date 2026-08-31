@@ -75,7 +75,8 @@ fn rcoder_container_for_app(
 fn computer_container(
     state: &AppState,
     input: &ResolvePermissionRequestDto,
-) -> Result<ContainerBasicInfo, AppError> {    if let Some(user_id) = input.user_id.as_deref().filter(|s| !s.trim().is_empty())
+) -> Result<ContainerBasicInfo, AppError> {
+    if let Some(user_id) = input.user_id.as_deref().filter(|s| !s.trim().is_empty())
         && let Some(container) = state
             .projects
             .get_container_by_user_id(user_id, &shared_types::ServiceType::ComputerAgentRunner)
@@ -344,8 +345,7 @@ pub async fn computer_notify_resolved(
         Ok(super::pod_handler::AppTarget::Dev(app_id)) => {
             info!(
                 "[PERMISSION] userApp dev dispatch: app_id={}, session_id={}",
-                app_id,
-                dto.session_id
+                app_id, dto.session_id
             );
             let container = rcoder_container_for_app(&state, &app_id)?;
             return forward_permission_resolution(&state, container, dto, locale).await;
