@@ -1121,22 +1121,26 @@ async fn userapp_dev_server_lifecycle() {
         format!("body 截断: {}", trunc(&body, 150)),
     );
 
-    // dev/logs：ReadDevLogResult 字段
+    // 编排日志内置源：logs/query 按 service_id=app-cli 过滤（dev/logs 已下线，
+    // app-cli 自身编排日志由日志族接口内置源统一提供）
     let resp = env
         .http
-        .get(format!(
-            "{}/api/v1/userapp/dev/logs?app_id={app}&user_id={user}",
+        .post(format!(
+            "{}/api/v1/userapp/{app}/dev/logs/query?user_id={user}",
             env.rcoder
         ))
         .timeout(Duration::from_secs(15))
-        .header("X-App-Id", &app)
+        .json(&json!({"selectors": [{"service_id": "app-cli"}]}))
         .send()
         .await
-        .expect("dev logs");
+        .expect("orchestrator logs query");
     let body: Value = resp.json().await.unwrap_or(Value::Null);
-    let logs_ok = body["data"]["log_file_name"].as_str().is_some();
+    let logs_ok = body["data"]["logs"].as_array().is_some_and(|arr| {
+        arr.iter()
+            .any(|log| log["service_id"] == "app-cli" && log["source_id"] == "orchestrator")
+    });
     report.assert_hard(
-        "dev/logs → ReadDevLogResult 字段",
+        "logs/query orchestrator 源 → app-cli 编排日志可见",
         logs_ok,
         format!("body 截断: {}", trunc(&body, 120)),
     );
