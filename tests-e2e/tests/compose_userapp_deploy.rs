@@ -352,21 +352,13 @@ async fn build_to_completion(
         ),
     );
     if !done {
-        // 失败留痕：失败服务（快照 current_service）的分服务日志尾部进报告
-        //（tasks logs 端点 ?service= 定位；快照 error 本身已嵌输出尾部——
-        // 此处再拉完整日志行号分页视角，排查线索，不额外判死）
+        // 失败留痕：快照 error 本身已嵌失败服务的输出尾部（构建日志行实时走
+        // tasks SSE `log` 事件；tasks/{id}/logs 分页端点已下线，无额外日志拉取）
         let svc = data["current_service"].as_str().unwrap_or_default();
-        let (_, logs) = get_json(
-            env,
-            &format!(
-                "/api/v1/userapp/tasks/{task_id}/logs?app_id={app}&user_id={user}&service={svc}&start_index=1"
-            ),
-        )
-        .await;
         report.diagnostic(
-            &format!("build 失败服务 [{svc}] 日志尾部"),
-            &trunc(&logs, 3000),
-            "tasks logs?service=current_service",
+            &format!("build 失败服务 [{svc}]（完整输出见快照 error 尾部）"),
+            data["error"].as_str().unwrap_or(""),
+            "task snapshot error",
         );
         return None;
     }
@@ -385,29 +377,7 @@ async fn build_to_completion(
     if release_id.is_empty() || sha256.len() != 64 {
         return None;
     }
-    // 构建日志分页（成功路径）：按 service_id 取分服务归档（logs/{service_id}），
-    // 断言行内容与翻页游标字段——此前仅失败分支间接覆盖过本端点
-    let (ls, lb) = get_json(
-        env,
-        &format!(
-            "/api/v1/userapp/tasks/{task_id}/logs?app_id={app}&user_id={user}&service=backend-go"
-        ),
-    )
-    .await;
-    let logs_ok = ls.is_success()
-        && http_ok(&lb)
-        && lb["data"]["total_lines"].as_u64().unwrap_or(0) > 0
-        && lb["data"]["log_file_name"]
-            .as_str()
-            .is_some_and(|n| n.starts_with("dev-"))
-        && lb["data"]["logs"]
-            .as_array()
-            .is_some_and(|rows| !rows.is_empty());
-    report.assert_hard(
-        "构建日志分页（?service=backend-go 行内容 + 翻页游标）",
-        logs_ok,
-        format!("HTTP {ls}, body 截断: {}", trunc(&lb, 180)),
-    );
+    // （构建日志分页端点已下线：日志行实时走 tasks SSE `log` 事件，C2 覆盖回放）
 
     // C1 cancel 幂等：任务已终态（completed）→ already_terminal=true
     let (cs, cb) = post_json(

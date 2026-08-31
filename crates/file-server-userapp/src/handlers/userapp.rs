@@ -6,8 +6,7 @@
 //! 异步编译/发布（task 10-12）：
 //! - `POST /build`：workspace 多项目打包（异步：返 task_id，进度经 task 流出）。
 //! - `GET  /tasks/{task_id}`：查任务状态快照（轮询通道）。
-//! - `GET  /tasks/{task_id}/logs`：查构建日志（分页，复用 `read_dev_log`）。
-//! - `GET  /tasks/{task_id}/logs/stream`：任务进度 SSE（实时通道，进度事件推送）。
+//! - `GET  /tasks/{task_id}/logs/stream`：任务进度 SSE（实时通道：进度事件 + 构建日志行 `log` 事件）。
 //! - `POST /tasks/{task_id}/cancel`：取消进行中的编译任务（软取消 + kill 进程组）。
 //! - `GET  /static/{app_id}`：按 app 直下构建整体包（缺省最新；`?release_id=` 指定版本）。
 //!
@@ -32,14 +31,12 @@ use shared_types::HttpResult;
 use crate::UserAppState;
 use crate::models::{
     BuildCreatedData, BuildTaskSnapshot, BuildTaskStatus, BuildUserAppBody, CancelData,
-    ConfirmData, DetectData, ProjectChainBody, StreamQuery, TaskLogsQuery, UserappTaskScopeQuery,
+    ConfirmData, DetectData, ProjectChainBody, StreamQuery, UserappTaskScopeQuery,
 };
 use crate::service::userapp;
 use crate::service::userapp::tasks::BuildProgressEvent;
 use file_server::error::{AppError, AppResult};
 use file_server::extract::{AppJson, AppPath, AppQuery};
-use file_server::models::ReadDevLogResult;
-use file_server::service::dev_server::log::read_dev_log;
 
 // ── HttpResult 转换层 ──────────────────────────────────────────────────────────
 
@@ -202,66 +199,6 @@ pub(crate) async fn get_task(
     reply(result.await)
 }
 
-/// 构建日志分页
-///
-/// 构建过程输出的**分页拉取**（非 SSE）：复用 dev 日志读取内核 `read_dev_log`，
-/// 按 `service`（子项目目录，留空=workspace 根）+ `startIndex` 翻页——上批响应
-/// 的 `totalLines` 即下一页起点。适合事后回看完整构建输出；实时滚动请用
-/// `/tasks/{task_id}/logs/stream`。
-#[utoipa::path(
-    get,
-    path = "/tasks/{task_id}/logs",
-    params(
-        ("task_id" = String, Path, description = "任务ID"),
-        TaskLogsQuery,
-    ),
-    responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "构建日志分页（历史日志文件读取，非 SSE）。query：service=子项目 service_id（构建日志按 service_id 归档，常规场景与目录名同名；留空=workspace 根日志）；start_index=起始行号（1-based，用上批响应的 total_lines 翻页）。响应 data：logs[{line,content}]（行号+内容）、total_lines（总行数）、start_index、log_file_name。日志按天滚动（dev-YYYY-MM-DD.log），只读当前文件。")),
-    tag = "UserApp · dev · 构建任务"
-)]
-pub(crate) async fn get_task_logs(
-    State(state): State<UserAppState>,
-    AppPath(task_id): AppPath<String>,
-    AppQuery(q): AppQuery<TaskLogsQuery>,
-) -> UserAppReply<ReadDevLogResult> {
-    let result = async {
-        validate_task_scope(
-            &UserappTaskScopeQuery {
-                app_id: q.app_id.clone(),
-                user_id: q.user_id.clone(),
-            },
-            &task_id,
-        )?;
-        let task = state
-            .build_tasks
-            .get(&task_id)
-            .await
-            .ok_or_else(|| AppError::resource(format!("build task not found: {task_id}")))?;
-        let ws_root = task
-            .workspace_root()
-            .await
-            .ok_or_else(|| AppError::resource("build task workspace not resolved yet"))?;
-        let dir = match q.service.as_deref() {
-            Some(service) if !service.is_empty() => {
-                shared_types::validate_service_id(service).map_err(|error| {
-                    AppError::validation(format!("invalid log service selector: {error}"))
-                })?;
-                file_server::path_safety::ensure_within(&ws_root.join("logs"), service).map_err(
-                    |_| AppError::validation("log service selector escapes workspace logs"),
-                )?
-            }
-            _ => ws_root.join("logs"),
-        };
-        read_dev_log(
-            &dir,
-            q.start_index,
-            "main",
-            state.fs.config.log_read_max_bytes,
-        )
-        .await
-    };
-    reply(result.await)
-}
-
 /// 任务进度 SSE（实时通道）
 ///
 /// 推送 `BuildProgressEvent`（event 名 = 事件类型，data = JSON 全量）；
@@ -277,7 +214,7 @@ pub(crate) async fn get_task_logs(
     responses(
         (
             status = 200,
-            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 0 递增（首条事件 id:0）。断线续传两种方式（二选一）：① 请求带 `Last-Event-ID: <最后收到的seq>` 头（SSE 规范标准方式，浏览器 EventSource 自动重连自动携带，服务端从该 seq 之后回放）；② query `?from_seq=<最后seq+1>`（从该 seq 开始含本身回放；头存在时被忽略）。\n\n事件清单（event 名 → data 载荷）：\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始构建某服务）\n- `log` → `{'event':'log','service':'<服务ID>','line':'一行构建输出'}`（构建日志行，实时逐行推送；`line` 为行内容原文、非行号——与分页接口 `logs[].line`（行号）/`content`（内容）字段名不同义；出现在该服务的 building 与 build_ok/build_fail 之间，行序即进程输出顺序）\n- `build_ok` → `{'event':'build_ok','service':'...'}`（服务构建成功）\n- `build_fail` → `{'event':'build_fail','service':'...','error':'...'}`\n- `completed`（终态）→ `{'event':'completed','release_id':'...','sha256':'...','size_bytes':N,'file_name':'...','artifact_path':'builds/workspace-package-{release_id}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端按上述任一方式带游标重连续传\n\n说明：构建日志以本流 `log` 事件实时推送（前端单流订阅即可）；完整历史文件回看走独立接口 `GET /tasks/{task_id}/logs` 分页查询。构建串行执行（按 service_id 字母序逐服务构建），日志行按服务分段有序、不交错。`stage` 事件类型为协议预留，当前任务流不发送。终态事件（completed/failed/cancelled）后服务端关闭流；每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
+            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 0 递增（首条事件 id:0）。断线续传两种方式（二选一）：① 请求带 `Last-Event-ID: <最后收到的seq>` 头（SSE 规范标准方式，浏览器 EventSource 自动重连自动携带，服务端从该 seq 之后回放）；② query `?from_seq=<最后seq+1>`（从该 seq 开始含本身回放；头存在时被忽略）。\n\n事件清单（event 名 → data 载荷）：\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始构建某服务）\n- `log` → `{'event':'log','service':'<服务ID>','line':'一行构建输出'}`（构建日志行，实时逐行推送；出现在该服务的 building 与 build_ok/build_fail 之间，行序即进程输出顺序）\n- `build_ok` → `{'event':'build_ok','service':'...'}`（服务构建成功）\n- `build_fail` → `{'event':'build_fail','service':'...','error':'...'}`\n- `completed`（终态）→ `{'event':'completed','release_id':'...','sha256':'...','size_bytes':N,'file_name':'...','artifact_path':'builds/workspace-package-{release_id}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端按上述任一方式带游标重连续传\n\n说明：构建日志以本流 `log` 事件实时推送（前端单流订阅即可）；断线按上述续传协议补齐——回放环有界（超环容量的早期行不可回补），长任务/超大输出建议任务创建后尽早订阅。构建串行执行（按 service_id 字母序逐服务构建），日志行按服务分段有序、不交错。`stage` 事件类型为协议预留，当前任务流不发送。终态事件（completed/failed/cancelled）后服务端关闭流；每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
             content_type = "text/event-stream",
         ),
         (status = 404, description = "Task not found（HttpResult JSON，非 SSE）"),

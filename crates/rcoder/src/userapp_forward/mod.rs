@@ -47,7 +47,6 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
     // 构建链（builder 编排：构建/任务流转/项目探测确认）
     "/api/v1/userapp/build",
     "/api/v1/userapp/tasks/{task_id}",
-    "/api/v1/userapp/tasks/{task_id}/logs",
     "/api/v1/userapp/tasks/{task_id}/logs/stream",
     "/api/v1/userapp/tasks/{task_id}/cancel",
     // projects/detect|confirm、install-project 已上收 `{app_id}/{app_stage}` 门面路由

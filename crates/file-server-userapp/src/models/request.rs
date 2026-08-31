@@ -56,31 +56,6 @@ pub struct ImportProjectBody {
     pub project_dir: String,
 }
 
-/// 任务构建日志查询参数（`GET /tasks/{task_id}/logs`）。
-///
-/// `parameter_in` 必须显式声明：utoipa-axum 自动发现会按 Path extractor 把
-/// query 字段误标 path（swagger 对接即错），显式声明优先。
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct TaskLogsQuery {
-    /// 构建链定位 app_id（rcoder 转发层消费：目标开发容器定位与容器不在时的
-    /// 短路判定；容器侧校验白名单）
-    pub app_id: String,
-    /// 宿主机数据卷分区归属目录名（dev 卷 `dev/{user_id}/...` 组成段；
-    /// rcoder 转发层懒创建开发容器时的宿主树显式档）
-    pub user_id: String,
-    /// 子项目目录名（= service_id）；留空读 workspace 根日志目录。
-    #[serde(default)]
-    pub service: Option<String>,
-    /// 起始行号（1-based，对齐 get-dev-log）。
-    #[serde(default = "default_start_index")]
-    pub start_index: usize,
-}
-
-fn default_start_index() -> usize {
-    1
-}
-
 /// SSE 订阅参数（`GET /tasks/{task_id}/logs/stream`）。
 ///
 /// `parameter_in` 必须显式声明：utoipa-axum 自动发现会按 Path extractor 把

@@ -402,7 +402,6 @@ mod tests {
             let kind = classify_kind(&sample);
             let expected = match *pattern {
                 "/api/v1/userapp/tasks/{task_id}" => "unavailable",
-                "/api/v1/userapp/tasks/{task_id}/logs" => "unavailable",
                 "/api/v1/userapp/tasks/{task_id}/logs/stream" => "unavailable",
                 "/api/v1/userapp/tasks/{task_id}/cancel" => "cancel-ok",
                 "/api/v1/userapp/dev/stop" => "dev-stop-ok",

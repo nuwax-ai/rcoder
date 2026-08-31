@@ -15,7 +15,6 @@ fn userapp_router() -> OpenApiRouter<UserAppState> {
     OpenApiRouter::new()
         .routes(routes!(userapp::build_workspace))
         .routes(routes!(userapp::get_task))
-        .routes(routes!(userapp::get_task_logs))
         .routes(routes!(userapp::stream_task_logs))
         .routes(routes!(userapp::cancel_task))
         .routes(routes!(userapp::detect_project))
@@ -91,7 +90,6 @@ mod tests {
         for path in [
             "/api/v1/userapp/build",
             "/api/v1/userapp/tasks/{task_id}",
-            "/api/v1/userapp/tasks/{task_id}/logs",
             "/api/v1/userapp/tasks/{task_id}/logs/stream",
             "/api/v1/userapp/tasks/{task_id}/cancel",
             "/api/v1/userapp/{app_id}/{app_stage}/projects/detect",
@@ -128,7 +126,7 @@ mod tests {
                 "userapp path missing: {path}"
             );
         }
-        assert_eq!(document.paths.paths.len(), 33);
+        assert_eq!(document.paths.paths.len(), 32);
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 
@@ -359,8 +357,7 @@ mod tests {
             .expect("components present")
             .schemas
         {
-            if !name.starts_with("Userapp")
-                && !matches!(name.as_str(), "DevOpBody" | "TaskLogsQuery" | "StreamQuery")
+            if !name.starts_with("Userapp") && !matches!(name.as_str(), "DevOpBody" | "StreamQuery")
             {
                 continue;
             }
