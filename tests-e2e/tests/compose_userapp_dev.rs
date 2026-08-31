@@ -52,16 +52,24 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
 
 /// 场景内唯一 app_id（run_tag+pid 防跨进程撞名；≤63 字符约束内）。
 fn scoped_app(env: &Env, tag: &str) -> String {
-    // run_tag 前 10 位=日期+小时：同小时内重跑（同 tag）会撞容器名（Docker 409，
-    // 上轮 cleanup 未达时残留即冲突）——加 pid 段对齐主套件 ident 模式
+    // run_tag 前 6 位=日期：同日重跑（同 tag）会撞容器名（Docker 409，
+    // 上轮 cleanup 未达时残留即冲突）——加 pid 段对齐主套件 ident 模式。
+    // K8s 边界（229 实测产品 bug）：builder STS pod label 值 =
+    // 前缀(19)+app_id+controller-hash(11) 限 63 字节 → app_id 实际上限
+    // ~33 字符（远小于 identifier 白名单 64）——tag 压缩到单字母+缩写，
+    // 总长 ~26 字符双环境安全
+    let short_tag: String = tag
+        .split('-')
+        .filter_map(|part| part.chars().next())
+        .collect();
     format!(
         "e2e-ud-{}-p{}-{}",
-        &env.run_tag.replace('_', "")[..10],
+        &env.run_tag.replace('_', "")[..6],
         std::process::id() % 1000,
-        tag
+        short_tag
     )
     .chars()
-    .take(48)
+    .take(33)
     .collect()
 }
 
@@ -77,12 +85,14 @@ fn cleanup_builder(app_id: &str) {
 
 /// create-workspace（幂等起手；断言 200 + 容器信息回显）。
 async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user: &str) -> bool {
-    // 300s：K8s 首次 PVC 动态制备（ceph-rbd 100Gi）实测 ~2 分钟，post_json
-    // 默认 90s 会截断 ensure（pod 实际创建成功但测试已超时 500/断言失败）
+    // 600s：K8s 首次 PVC 动态制备（ceph-rbd 100Gi）常态 ~2 分钟，但删除
+    // 风暴后 ceph 恢复期实测可超 300s（229 三轮实测：前轮 PVC Bound 117-
+    // 219s，恢复期超时）。post_json 默认 90s 会截断 ensure（pod 实际创建
+    // 成功但测试已超时）
     let resp = env
         .http
         .post(format!("{}/api/v1/userapp/workspace", env.rcoder))
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_secs(600))
         .json(&json!({"app_id": app_id, "user_id": user}))
         .send()
         .await
