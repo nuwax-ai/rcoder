@@ -46,6 +46,7 @@ pub struct ComputerChatRequest {
     /// 未知值反序列化即拒（fail-fast，不静默回落 computer——路由错容器
     /// 比 400 更难排查）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(inline)] // 枚举描述直读字段列表（否则 $ref 藏进组件库不直观）
     pub service_type: Option<ChatServiceScope>,
 
     /// userApp 应用 ID——userApp 开发对话场景（service_type=userapp）必填，
