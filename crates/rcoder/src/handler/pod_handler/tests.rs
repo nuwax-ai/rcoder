@@ -251,69 +251,6 @@ fn app_target_accepts_userapp_service_type_alongside_app_id() {
     assert!(parse_app_target(None, None, Some("userapp")).is_err());
 }
 
-/// agent 族分派（status/stop/cancel/notify-resolved/cache-clean 共用）：
-/// wire 形态 = service_type=userapp + **project_id 兼任 app_id** + app_stage
-/// （缺省 dev，prod 拒绝——agent 会话仅存在于 dev 阶段）。
-#[test]
-fn agent_userapp_dispatch_resolves_project_id_as_app_id() {
-    // userapp + project_id → Some(app_id)（内部以 app_id 语义消费 project_id 值）
-    for variant in ["userapp", "USERAPP", "Userapp", "user-app"] {
-        assert_eq!(
-            parse_agent_userapp_dispatch(Some(variant), Some("app-1"), None),
-            Ok(Some("app-1".to_string())),
-            "service_type={variant:?} 应视为 userapp 变体分派"
-        );
-    }
-    // 非 userapp / 未传 service_type → None 直通 computer 既有路径
-    assert_eq!(
-        parse_agent_userapp_dispatch(None, Some("p1"), None),
-        Ok(None)
-    );
-    assert_eq!(
-        parse_agent_userapp_dispatch(Some("computer-agent-runner"), Some("p1"), None),
-        Ok(None)
-    );
-    // app_stage 缺省 dev；prod / 非法值拒绝
-    assert_eq!(
-        parse_agent_userapp_dispatch(Some("userapp"), Some("app-1"), Some("dev")),
-        Ok(Some("app-1".to_string()))
-    );
-    assert!(parse_agent_userapp_dispatch(Some("userapp"), Some("app-1"), Some("prod")).is_err());
-    assert!(parse_agent_userapp_dispatch(Some("userapp"), Some("app-1"), Some("staging")).is_err());
-}
-
-/// 入参语义防误用：user-app-builder（UserappBuilder 变体）不是有效入参——
-/// userApp 容器类型由 app_stage 推导，传 builder 显式报错引导正确形态
-/// （静默直通会把 project_id 兼任的 app_id 当普通项目 ID 查出误导错误）。
-#[test]
-fn agent_userapp_dispatch_rejects_builder_variant() {
-    for variant in ["user-app-builder", "USER-APP-BUILDER"] {
-        let err = parse_agent_userapp_dispatch(Some(variant), Some("app-1"), None)
-            .expect_err("user-app-builder 应显式拒绝");
-        assert!(
-            err.contains("app_stage 推导"),
-            "报错应引导 app_stage 推导语义: {err}"
-        );
-    }
-    // 未知值仍宽松直通 computer 路径（cache 场景需 computer-agent-runner 直通）
-    assert_eq!(
-        parse_agent_userapp_dispatch(Some("computer-agent-runner"), Some("p1"), None),
-        Ok(None)
-    );
-}
-
-/// agent 族分派的校验面：userapp 缺 project_id 报错、project_id 走 identifier
-/// 白名单（防容器名/路径拼接注入）、空白串视为未传。
-#[test]
-fn agent_userapp_dispatch_validates_inputs() {
-    // userapp 标记缺 project_id（兼任 app_id）→ 报错
-    assert!(parse_agent_userapp_dispatch(Some("userapp"), None, None).is_err());
-    assert!(parse_agent_userapp_dispatch(Some("userapp"), Some("  "), None).is_err());
-    // identifier 白名单
-    assert!(parse_agent_userapp_dispatch(Some("userapp"), Some("../escape"), None).is_err());
-    assert!(parse_agent_userapp_dispatch(Some("userapp"), Some("app/1"), None).is_err());
-}
-
 /// 契约钉住：userApp 请求只传 app_id/app_stage 即可反序列化（user_id/project_id
 /// 有 serde default 兜底，agent 路径空值校验在后）——Java 最小请求形态。
 #[test]

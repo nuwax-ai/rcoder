@@ -40,21 +40,23 @@ pub struct ResolvePermissionHttpRequest {
     )]
     pub isolation_type: Option<String>,
     /// userApp 分派标记。可选值：`userapp`（推荐）、`user-app` / `application` /
-    /// `app`（同义变体，均大小写不敏感）——与 project_id 搭配（**project_id
-    /// 兼任 app_id**，对齐 /computer/chat 契约，不设独立 app_id 字段）定位
-    /// UserappBuilder 开发容器，agent 会话仅存在于 dev 阶段。userApp 容器类型由 app_stage 推导
-    /// （dev=UserappBuilder / prod=Userapp），**勿传 `user-app-builder`**。
-    /// 不传时走既有 computer 路径
+    /// `app`（同义变体，均大小写不敏感）——与 app_id 搭配启用分派，定位
+    /// UserappBuilder 开发容器，agent 会话仅存在于 dev 阶段。userApp 容器
+    /// 类型由 app_stage 推导（dev=UserappBuilder / prod=Userapp），**勿传
+    /// `user-app-builder`**。不传时走既有 computer 路径
     #[serde(
         default,
         alias = "serviceType",
         skip_serializing_if = "Option::is_none"
     )]
     pub service_type: Option<String>,
+    /// userApp 应用 ID——存在即进入 userApp 分派（定位 UserappBuilder
+    /// 开发容器，其标识 = app_id）；分派仅支持 dev 阶段
+    #[serde(default, alias = "appId", skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
 
-    /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
-    /// userApp 分派仅支持 dev：agent 会话只存在于 UserappBuilder 开发容器，
-    /// prod 运行容器无 agent 会话
+    /// userApp 应用阶段 dev/prod（缺省 dev）——userApp 分派仅支持 dev：
+    /// agent 会话只存在于 UserappBuilder 开发容器，prod 运行容器无 agent 会话
     #[serde(default, alias = "appStage", skip_serializing_if = "Option::is_none")]
     pub app_stage: Option<String>,
 }
@@ -197,18 +199,18 @@ mod tests {
     }
 
     /// 契约钉住：userApp 分派 wire 形态（service_type=userapp + project_id
-    /// 兼任 app_id + app_stage 可缺省），snake_case 与 camelCase 双形态均可
+    /// app_id 定位 + app_stage 可缺省），snake_case 与 camelCase 双形态均可
     /// （对齐本 DTO 既有 alias 风格）。
     #[test]
     fn notify_resolved_deserializes_userapp_wire_form() {
         for raw in [
-            r#"{"permission_resolve_request":{"session_id":"s1","tool_call_id":"t1","request_permission_response":{"outcome":{"outcome":"cancelled"}}},"service_type":"userapp","project_id":"app-1"}"#,
-            r#"{"permissionResolveRequest":{"sessionId":"s1","toolCallId":"t1","requestPermissionResponse":{"outcome":{"outcome":"cancelled"}}},"serviceType":"userapp","projectId":"app-1","appStage":"dev"}"#,
+            r#"{"permission_resolve_request":{"session_id":"s1","tool_call_id":"t1","request_permission_response":{"outcome":{"outcome":"cancelled"}}},"service_type":"userapp","app_id":"app-1"}"#,
+            r#"{"permissionResolveRequest":{"sessionId":"s1","toolCallId":"t1","requestPermissionResponse":{"outcome":{"outcome":"cancelled"}}},"serviceType":"userapp","appId":"app-1","appStage":"dev"}"#,
         ] {
             let body: ResolvePermissionHttpRequest = serde_json::from_str(raw)
                 .unwrap_or_else(|e| panic!("userApp 形态 {raw} 应可反序列化: {e}"));
             assert_eq!(body.service_type.as_deref(), Some("userapp"));
-            assert_eq!(body.project_id.as_deref(), Some("app-1"));
+            assert_eq!(body.app_id.as_deref(), Some("app-1"));
             assert!(
                 body.app_stage.as_deref().is_none_or(|s| s == "dev"),
                 "app_stage 应可缺省或为 dev"

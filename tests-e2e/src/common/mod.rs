@@ -284,6 +284,7 @@ impl Env {
             user_id: user.to_owned(),
             project_id: None,
             service_type: None,
+            app_id: None,
             app_stage: None,
             prompt: prompt.to_owned(),
             session_id: None,

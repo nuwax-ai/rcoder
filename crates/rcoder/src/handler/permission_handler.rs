@@ -54,11 +54,28 @@ fn rcoder_container(
         })
 }
 
+/// userApp dev 分派的容器定位：app_id 即 project 映射键（UserappBuilder
+/// 容器注册于 `state.projects[app_id]`），与 `rcoder_container` 的映射定位
+/// 同源、但键直接取分派解析出的 app_id（不依赖 body 的 project_id 字段）。
+fn rcoder_container_for_app(
+    state: &AppState,
+    app_id: &str,
+) -> Result<ContainerBasicInfo, AppError> {
+    state
+        .get_project(app_id)
+        .and_then(|info| info.container_info())
+        .ok_or_else(|| {
+            AppError::with_message(
+                shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+                "container not found for app_id",
+            )
+        })
+}
+
 fn computer_container(
     state: &AppState,
     input: &ResolvePermissionRequestDto,
-) -> Result<ContainerBasicInfo, AppError> {
-    if let Some(user_id) = input.user_id.as_deref().filter(|s| !s.trim().is_empty())
+) -> Result<ContainerBasicInfo, AppError> {    if let Some(user_id) = input.user_id.as_deref().filter(|s| !s.trim().is_empty())
         && let Some(container) = state
             .projects
             .get_container_by_user_id(user_id, &shared_types::ServiceType::ComputerAgentRunner)
@@ -304,7 +321,7 @@ pub async fn agent_notify_resolved(
     tag = "computer",
     operation_id = "computer_notify_resolved",
     summary = "处理 Computer Agent 权限审批结果",
-    description = "将用户权限审批结果转发到 Computer Agent 容器内的 agent_runner 服务。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
+    description = "将用户权限审批结果转发到 Computer Agent 容器内的 agent_runner 服务。支持 userApp 分派：service_type=userapp + app_id 定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
 )]
 pub async fn computer_notify_resolved(
     State(state): State<Arc<AppState>>,
@@ -315,24 +332,30 @@ pub async fn computer_notify_resolved(
     let dto = input.to_dto();
     validate_common(&dto)?;
 
-    // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；agent 会话
-    //    仅存在于 dev 的 UserappBuilder）。rcoder_container 的定位 = project 映射
-    //    优先——与 builder 容器注册同源；此形态下 user_id/pod_id 不再必填
-    match super::pod_handler::parse_agent_userapp_dispatch(
-        input.service_type.as_deref(),
-        input.project_id.as_deref(),
+    // 0. userApp 分派（service_type=userapp + app_id；agent 会话仅存在于
+    //    dev 的 UserappBuilder）。定位 = project 映射优先（app_id 即映射键，
+    //    与 builder 容器注册同源）；此形态下 user_id/pod_id/project_id 不再必填
+    match super::pod_handler::parse_app_target(
+        input.app_id.as_deref(),
         input.app_stage.as_deref(),
+        input.service_type.as_deref(),
     ) {
-        Ok(Some(_app_id)) => {
+        Ok(super::pod_handler::AppTarget::NotApp) => {}
+        Ok(super::pod_handler::AppTarget::Dev(app_id)) => {
             info!(
-                "[PERMISSION] userApp dev dispatch: app_id(=project_id)={}, session_id={}",
-                dto.project_id.as_deref().unwrap_or(""),
+                "[PERMISSION] userApp dev dispatch: app_id={}, session_id={}",
+                app_id,
                 dto.session_id
             );
-            let container = rcoder_container(&state, &dto)?;
+            let container = rcoder_container_for_app(&state, &app_id)?;
             return forward_permission_resolution(&state, container, dto, locale).await;
         }
-        Ok(None) => {}
+        Ok(super::pod_handler::AppTarget::Prod(_)) => {
+            return Ok(Json(super::pod_handler::invalid_app_target_response(
+                locale,
+                "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 (UserappBuilder 开发容器)",
+            )));
+        }
         Err(e) => {
             return Ok(Json(super::pod_handler::invalid_app_target_response(
                 locale, &e,

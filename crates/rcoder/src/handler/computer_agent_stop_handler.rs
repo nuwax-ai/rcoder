@@ -68,7 +68,7 @@ use super::utils::{I18nJsonOrQuery, extract_grpc_addr, get_locale_from_headers};
     tag = "computer",
     operation_id = "computer_agent_stop",
     summary = "停止 Computer Agent",
-    description = "停止特定 project_id 的 Agent，不销毁容器。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
+    description = "停止特定 project_id 的 Agent，不销毁容器。支持 userApp 分派：service_type=userapp + app_id 定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_agent_stop(
@@ -79,21 +79,24 @@ pub async fn computer_agent_stop(
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
 
-    // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；agent 会话
+    // 0. userApp 分派（service_type=userapp + app_id；agent 会话
     //    仅存在于 dev 的 UserappBuilder 开发容器）
-    match super::pod_handler::parse_agent_userapp_dispatch(
-        request.service_type.as_deref(),
-        request.project_id.as_deref(),
+    match super::pod_handler::parse_app_target(
+        request.app_id.as_deref(),
         request.app_stage.as_deref(),
+        request.service_type.as_deref(),
     ) {
-        Ok(Some(app_id)) => {
+        Ok(super::pod_handler::AppTarget::NotApp) => {}
+        Ok(super::pod_handler::AppTarget::Dev(app_id)) => {
             info!(
                 "🛑 [COMPUTER_STOP] userApp dev dispatch: app_id={}, session_id={:?}",
                 app_id, request.session_id
             );
             return stop_userapp_dev(&state, locale, &app_id, &request).await;
         }
-        Ok(None) => {}
+        Ok(super::pod_handler::AppTarget::Prod(_)) => {
+            return Ok(super::pod_handler::invalid_app_target_response(locale, "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 (UserappBuilder 开发容器)"));
+        }
         Err(e) => return Ok(super::pod_handler::invalid_app_target_response(locale, &e)),
     }
 

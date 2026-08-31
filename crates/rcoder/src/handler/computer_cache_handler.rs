@@ -67,22 +67,21 @@ pub struct CacheCleanRequest {
 
     /// 服务类型。可选值：`computer-agent-runner`（默认——清 computer workspace
     /// 的 .cache）、`userapp`（同义变体 `user-app` / `application` / `app`，大小
-    /// 写不敏感——与 project_id 搭配，**project_id 兼任 app_id**，清 userApp
-    /// 开发工作区内的 .cache）。userApp 容器类型由 app_stage 推导，勿传
-    /// `user-app-builder`
+    /// 写不敏感——与 app_id 搭配，清 userApp 开发工作区内的 .cache）。
+    /// userApp 容器类型由 app_stage 推导，勿传 `user-app-builder`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
 
-    /// userApp 分派形态下兼任 app_id（对齐 /computer/chat 契约，不设独立
-    /// app_id 字段）——清 dev 工作区 `dev/{owner}/{app_id}/.cache`（app 项目
-    /// 自身的构建缓存如 vite/webpack 输出）；computer 路径不消费本字段
+    /// userApp 应用 ID——存在即进入 userApp 分派，清 dev 工作区
+    /// `dev/{owner}/{app_id}/.cache`（app 项目自身的构建缓存如 vite/webpack
+    /// 输出）；computer 路径不消费本字段
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "app_001")]
-    pub project_id: Option<String>,
+    pub app_id: Option<String>,
 
-    /// userApp 应用阶段 dev/prod（缺省 dev）——**project_id 兼任 app_id**；
-    /// userApp 分派仅支持 dev：构建缓存只存在于开发工作区，prod 运行
+    /// userApp 应用阶段 dev/prod（缺省 dev）——userApp 分派仅
+    /// 支持 dev：构建缓存只存在于开发工作区，prod 运行
     /// 容器无构建缓存语义
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "dev")]
@@ -127,7 +126,7 @@ pub struct CacheCleanResponse {
     summary = "清理 user 的 .cache 缓存",
     description = "清空 /app/computer-project-workspace/{user_id}/.cache 下所有内容（可再生缓存），\
                    回收空间。只清 .cache，不动其他目录。computer-agent 的 workspace 固定按 user_id，\
-                   pod_id/tenant_id/space_id 等可选字段对齐接口惯例但不改变路径解析。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id）清开发工作区 dev/{owner}/{app_id}/.cache（app 项目构建缓存，仅 dev 阶段）。"
+                   pod_id/tenant_id/space_id 等可选字段对齐接口惯例但不改变路径解析。支持 userApp 分派：service_type=userapp + app_id 清开发工作区 dev/{owner}/{app_id}/.cache（app 项目构建缓存，仅 dev 阶段）。"
 )]
 #[instrument(skip_all, fields(user_id = ?request.user_id.as_deref()))]
 pub async fn computer_cache_clean(
@@ -136,19 +135,22 @@ pub async fn computer_cache_clean(
 ) -> Result<HttpResult<CacheCleanResponse>, AppError> {
     let locale = current_request_locale();
 
-    // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；构建缓存
+    // 0. userApp 分派（service_type=userapp + app_id；构建缓存
     //    只存在于 dev 开发工作区）。user_id 此形态下可省略——owner 从 app
     //    元数据解析（显式传 > metadata > fail-fast，与 ensure_userapp_builder 同源）
-    match super::pod_handler::parse_agent_userapp_dispatch(
-        request.service_type.as_deref(),
-        request.project_id.as_deref(),
+    match super::pod_handler::parse_app_target(
+        request.app_id.as_deref(),
         request.app_stage.as_deref(),
+        request.service_type.as_deref(),
     ) {
-        Ok(Some(app_id)) => {
+        Ok(super::pod_handler::AppTarget::NotApp) => {}
+        Ok(super::pod_handler::AppTarget::Dev(app_id)) => {
             info!("[CACHE_CLEAN] userApp dev dispatch: app_id={app_id}");
             return cache_clean_userapp_dev(state.as_ref(), &app_id, &request).await;
         }
-        Ok(None) => {}
+        Ok(super::pod_handler::AppTarget::Prod(_)) => {
+            return Ok(super::pod_handler::invalid_app_target_response(locale, "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 (UserappBuilder 开发容器)"));
+        }
         Err(e) => return Ok(super::pod_handler::invalid_app_target_response(locale, &e)),
     }
 
@@ -374,15 +376,15 @@ mod tests {
     }
 
     /// 契约钉住：userApp 分派 wire 形态 = service_type=userapp +
-    /// project_id 兼任 app_id + app_stage 可缺省（user_id 可省略——owner
+    /// app_id 定位 + app_stage 可缺省（user_id 可省略——owner
     /// 从 app 元数据解析）；既有 computer 形态（user_id 必传）不受影响。
     #[test]
     fn cache_clean_request_deserializes_userapp_wire_form() {
-        let raw = r#"{"service_type":"userapp","project_id":"app-1"}"#;
+        let raw = r#"{"service_type":"userapp","app_id":"app-1"}"#;
         let req: CacheCleanRequest = serde_json::from_str(raw)
             .unwrap_or_else(|e| panic!("userApp 形态 {raw} 应可反序列化: {e}"));
         assert_eq!(req.service_type.as_deref(), Some("userapp"));
-        assert_eq!(req.project_id.as_deref(), Some("app-1"));
+        assert_eq!(req.app_id.as_deref(), Some("app-1"));
         assert!(req.app_stage.is_none());
         assert!(req.user_id.is_none());
 
@@ -390,6 +392,6 @@ mod tests {
         let req: CacheCleanRequest = serde_json::from_str(legacy).unwrap();
         assert_eq!(req.user_id.as_deref(), Some("1754545591"));
         assert!(req.service_type.is_none());
-        assert!(req.project_id.is_none());
+        assert!(req.app_id.is_none());
     }
 }

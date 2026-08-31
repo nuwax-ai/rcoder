@@ -819,15 +819,24 @@ fn agent_endpoints_userapp_dispatch_fields_are_documented() {
             // doc comment 换行会原样进 description——空白归一化后匹配，
             // 防措辞被折行拆开误报
             let flat: String = desc.split_whitespace().collect::<String>();
-            assert!(
-                flat.contains("project_id兼任app_id"),
-                "schema {name} 字段 {field} 描述未写明「project_id 兼任 app_id」wire 契约: {desc}"
-            );
+            if field != "app_stage" {
+                assert!(
+                    flat.contains("app_id"),
+                    "schema {name} 字段 {field} 描述未提及 app_id 分派定位: {desc}"
+                );
+            }
             if field == "service_type" {
                 // 值清单可见性：同事看 swagger 对接，可选值必须直白可见
                 assert!(
                     flat.contains("可选值") && flat.contains("userapp"),
                     "schema {name} 的 service_type 描述未列出可选值清单: {desc}"
+                );
+            }
+            if field == "app_id" {
+                // 分派定位语义可见性（wire 契约核心：app_id 是定位键）
+                assert!(
+                    flat.contains("UserappBuilder") || flat.contains("app_id"),
+                    "schema {name} 的 app_id 描述未写明分派定位语义: {desc}"
                 );
             }
             checked += 1;

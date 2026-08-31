@@ -562,9 +562,9 @@ pub async fn agent_session_cancel(
     tag = "computer",
     operation_id = "computer_agent_session_cancel",
     summary = "取消 Computer Agent 任务",
-    description = "将 Computer Agent 取消请求通过 gRPC 转发到容器内的 agent_runner 服务，支持通过 user_id 或 pod_id 定位用户容器。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
+    description = "将 Computer Agent 取消请求通过 gRPC 转发到容器内的 agent_runner 服务，支持通过 user_id 或 pod_id 定位用户容器。支持 userApp 分派：service_type=userapp + app_id 定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
 )]
-#[instrument(skip(state), fields(user_id = ?request.user_id.as_deref(), project_id = %request.project_id, pod_id = ?request.pod_id.as_deref()))]
+#[instrument(skip(state), fields(user_id = ?request.user_id.as_deref(), project_id = ?request.project_id.as_deref(), pod_id = ?request.pod_id.as_deref()))]
 pub async fn computer_agent_session_cancel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -572,15 +572,17 @@ pub async fn computer_agent_session_cancel(
 ) -> Result<HttpResult<AgentCancelResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
 
-    // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；agent 会话
-    //    仅存在于 dev 的 UserappBuilder）。CancelIdentifier::Project 的定位 =
-    //    project 映射优先——正是 builder 容器的注册位置，容器 miss 走幂等成功
-    match super::pod_handler::parse_agent_userapp_dispatch(
-        request.service_type.as_deref(),
-        Some(request.project_id.as_str()),
+    // 0. userApp 分派（service_type=userapp + app_id；agent 会话仅存在于
+    //    dev 的 UserappBuilder）。CancelIdentifier::Project 的定位 = project
+    //    映射优先——正是 builder 容器的注册位置（app_id 即映射键），容器
+    //    miss 走幂等成功
+    match super::pod_handler::parse_app_target(
+        request.app_id.as_deref(),
         request.app_stage.as_deref(),
+        request.service_type.as_deref(),
     ) {
-        Ok(Some(app_id)) => {
+        Ok(super::pod_handler::AppTarget::NotApp) => {}
+        Ok(super::pod_handler::AppTarget::Dev(app_id)) => {
             info!(
                 "🛑 [COMPUTER_CANCEL] userApp dev dispatch: app_id={app_id}, session_id={:?}",
                 request.session_id
@@ -594,7 +596,9 @@ pub async fn computer_agent_session_cancel(
             )
             .await;
         }
-        Ok(None) => {}
+        Ok(super::pod_handler::AppTarget::Prod(_)) => {
+            return Ok(super::pod_handler::invalid_app_target_response(locale, "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 (UserappBuilder 开发容器)"));
+        }
         Err(e) => return Ok(super::pod_handler::invalid_app_target_response(locale, &e)),
     }
 
@@ -610,24 +614,27 @@ pub async fn computer_agent_session_cancel(
         }
     };
 
-    // 验证 project_id 不为空
-    if request.project_id.trim().is_empty() {
+    // 验证 project_id 不为空（computer 路径必填）
+    let Some(project_id) = request
+        .project_id
+        .filter(|s| !s.trim().is_empty())
+    else {
         error!("[COMPUTER_CANCEL] project_id is required");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
         ));
-    }
+    };
 
     info!(
         "🚀 [COMPUTER_CANCEL] Starting to process cancel request: user_id={:?}, pod_id={:?}, project_id={}, session_id={:?}",
-        request.user_id, request.pod_id, request.project_id, request.session_id
+        request.user_id, request.pod_id, project_id, request.session_id
     );
 
     handle_session_cancel_internal_v2(
         &state,
         identifier,
-        request.project_id, // 必填的 project_id
+        project_id, // computer 路径必填的 project_id
         request.session_id,
         locale,
     )

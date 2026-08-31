@@ -286,7 +286,7 @@ pub(super) fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
 // ============================================================================
 
 /// pod 接口族的 userApp 分派目标。
-pub(super) enum AppTarget {
+pub(crate) enum AppTarget {
     /// 无 app_id——走既有 agent/computer 路径
     NotApp,
     /// 开发容器（UserappBuilder：虚拟终端/文件服务/PG 全套开发栈）
@@ -306,7 +306,7 @@ pub(super) enum AppTarget {
 /// - `service_type` 为 Userapp 变体但缺 `app_id` → 报错（防误走 agent 路径空查）
 /// - `app_stage` 依附于 `app_id`（单独出现视为无效）
 /// - `app_id` 过 identifier 白名单（进入容器名/bind 路径拼接，防注入）
-pub(super) fn parse_app_target(
+pub(crate) fn parse_app_target(
     app_id: Option<&str>,
     app_stage: Option<&str>,
     service_type: Option<&str>,
@@ -348,53 +348,6 @@ pub(super) fn parse_app_target(
 /// userApp 分派参数校验失败的统一响应（pod 五 handler 与 computer/agent 族共用）。
 pub(crate) fn invalid_app_target_response<T>(locale: &str, e: &str) -> HttpResult<T> {
     HttpResult::error_with_message(shared_types::error_codes::ERR_VALIDATION, locale, e)
-}
-
-/// agent 族接口（status/stop/cancel/notify-resolved/cache-clean）的 userApp
-/// 分派解析——wire 形态对齐 `/computer/chat`：`service_type=userapp` +
-/// **project_id 兼任 app_id**（对外不设独立 app_id 字段，内部以 app_id
-/// 语义消费该值）+ `app_stage`（缺省 dev）。
-///
-/// 与 pod 族 `parse_app_target` 的差异：pod 操作容器本体（dev/prod 双态，
-/// 独立 app_id 字段）；agent 族操作 agent 会话与构建缓存——只存在于 dev
-/// 阶段的 UserappBuilder 开发容器，`app_stage=prod` 直接校验失败。
-///
-/// - `Ok(Some(app_id))`：userApp 分派（app_id = project_id 的值）
-/// - `Ok(None)`：computer 既有路径（service_type 非 userapp 或未传——
-///   其余 service_type 值交由 computer 路径自身的校验处理）
-/// - `Err`：service_type=userapp 但 project_id 缺失 / project_id 非法
-///   标识符（进入容器名与路径拼接）/ app_stage 非 dev|prod 或为 prod
-pub(crate) fn parse_agent_userapp_dispatch(
-    service_type: Option<&str>,
-    project_id: Option<&str>,
-    app_stage: Option<&str>,
-) -> Result<Option<String>, String> {
-    let service_type = service_type.map(str::trim).filter(|s| !s.is_empty());
-    let lowered = service_type.map(|s| s.to_ascii_lowercase());
-    let parsed = lowered.as_deref().and_then(|s| s.parse::<ServiceType>().ok());
-    let service_type_is_userapp = matches!(parsed, Some(ServiceType::Userapp));
-    if !service_type_is_userapp {
-        // UserappBuilder 变体（user-app-builder）显式拦截：userApp 容器类型由
-        // app_stage 推导（dev=UserappBuilder / prod=Userapp），入参传 builder 是
-        // 误用——静默直通 computer 路径会把 project_id（app_id）当普通项目 ID
-        // 查，报误导性错误（pod 族 parse_app_target 对此同样显式拒绝）
-        if matches!(parsed, Some(ServiceType::UserappBuilder)) {
-            return Err(
-                "service_type 'user-app-builder' is not a valid input: userApp 容器类型 \
-                 由 app_stage 推导（dev=UserappBuilder / prod=Userapp），请传 service_type=userapp"
-                    .to_string(),
-            );
-        }
-        return Ok(None);
-    }
-    let Some(app_id) = project_id.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Err(
-            "service_type 'userapp' requires project_id (project_id 兼任 app_id)".to_string(),
-        );
-    };
-    shared_types::validate_identifier(app_id, "app_id").map_err(|e| e.to_string())?;
-    validate_agent_dev_stage(app_stage)?;
-    Ok(Some(app_id.to_owned()))
 }
 
 /// agent 族五接口与 `/computer/chat` 共用的 dev-only stage 校验：缺省 dev；

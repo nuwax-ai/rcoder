@@ -236,20 +236,21 @@ async fn run_userapp_dev_chat_flow(
         ));
     }
 
-    // 1. 校验：user_id 必填 + project_id 必填（=app_id，不自动生成——app 语义明确）
+    // 1. 校验：user_id 必填 + app_id 必填（userApp 定位键，不自动生成——
+    //    app 语义明确；内部以 app_id 兼任 project_id 作存储/会话映射键）
     if request.user_id.trim().is_empty() {
         return Err(ChatFlowExit::response(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
         )));
     }
-    let project_id = match request.project_id.as_deref() {
+    let project_id = match request.app_id.as_deref() {
         Some(id) if !id.trim().is_empty() => id.trim().to_string(),
         _ => {
             return Err(ChatFlowExit::response(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
-                "project_id (= app_id) is required for userApp dev chat",
+                "app_id is required for userApp dev chat",
             )));
         }
     };

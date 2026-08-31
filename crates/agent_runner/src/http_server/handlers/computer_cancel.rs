@@ -47,7 +47,7 @@ pub async fn handle_computer_cancel(
 ) -> Result<Json<HttpResult<ComputerAgentCancelResponse>>, AppError> {
     let locale = locale_from_headers(&headers);
     info!(
-        "🚫 [HTTP] Computer Agent 取消请求: user_id={:?}, project_id={}, session_id={:?}",
+        "🚫 [HTTP] Computer Agent 取消请求: user_id={:?}, project_id={:?}, session_id={:?}",
         request.user_id, request.project_id, request.session_id
     );
 
@@ -58,24 +58,28 @@ pub async fn handle_computer_cancel(
         ));
     }
 
-    if request.project_id.is_empty() {
+    // project_id 在共享 DTO 上为 Option（rcoder 侧 userApp 分派形态可不传）；
+    // agent_runner 本地 HTTP 入口按 computer 语义必填校验
+    let Some(project_id) = request
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
         return Err(AppError::with_i18n_key(
             ERR_VALIDATION,
             &get_i18n_message("error.project_id_required", locale),
         ));
-    }
+    };
 
     // 查找 session_id (如果未提供,从 AGENT_REGISTRY 获取)
     let session_id = if let Some(sid) = request.session_id {
         sid
     } else {
-        match AGENT_REGISTRY.get_agent_info(&request.project_id) {
+        match AGENT_REGISTRY.get_agent_info(project_id) {
             Some(info) => info.session_id.to_string(),
             None => {
-                info!(
-                    "ℹ️  [HTTP] Agent 不存在,幂等返回成功: project_id={}",
-                    request.project_id
-                );
+                info!("ℹ️  [HTTP] Agent 不存在,幂等返回成功: project_id={project_id}");
                 let response = ComputerAgentCancelResponse {
                     success: true,
                     session_id: String::new(),
@@ -86,7 +90,7 @@ pub async fn handle_computer_cancel(
     };
 
     // 从 AGENT_REGISTRY 获取 Agent 信息并发送取消信号
-    if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(&request.project_id) {
+    if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(project_id) {
         let cancel_tx = agent_info.cancel_tx.clone();
         drop(agent_info);
 

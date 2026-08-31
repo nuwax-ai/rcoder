@@ -84,7 +84,7 @@ const GRPC_REQUEST_TIMEOUT_SECS: u64 = 5;
     tag = "computer",
     operation_id = "computer_agent_status",
     summary = "查询 Computer Agent 状态",
-    description = "查询指定 user_id + project_id 对应的 Computer Agent 是否已启动。通过主动调用子容器的 gRPC GetStatus 接口确认 Agent 真实状态。支持 userApp 分派：service_type=userapp + project_id（兼任 app_id，对齐 /computer/chat 契约）定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
+    description = "查询指定 user_id + project_id 对应的 Computer Agent 是否已启动。通过主动调用子容器的 gRPC GetStatus 接口确认 Agent 真实状态。支持 userApp 分派：service_type=userapp + app_id 定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_agent_status(
@@ -95,18 +95,21 @@ pub async fn computer_agent_status(
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
 
-    // 0. userApp 分派（service_type=userapp + project_id 兼任 app_id；agent 会话
+    // 0. userApp 分派（service_type=userapp + app_id；agent 会话
     //    仅存在于 dev 的 UserappBuilder 开发容器）
-    match super::pod_handler::parse_agent_userapp_dispatch(
-        request.service_type.as_deref(),
-        request.project_id.as_deref(),
+    match super::pod_handler::parse_app_target(
+        request.app_id.as_deref(),
         request.app_stage.as_deref(),
+        request.service_type.as_deref(),
     ) {
-        Ok(Some(app_id)) => {
+        Ok(super::pod_handler::AppTarget::NotApp) => {}
+        Ok(super::pod_handler::AppTarget::Dev(app_id)) => {
             info!("[COMPUTER_AGENT_STATUS] userApp dev dispatch: app_id={app_id}");
             return status_userapp_dev(&state, locale, &app_id, &request).await;
         }
-        Ok(None) => {}
+        Ok(super::pod_handler::AppTarget::Prod(_)) => {
+            return Ok(super::pod_handler::invalid_app_target_response(locale, "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 (UserappBuilder 开发容器)"));
+        }
         Err(e) => return Ok(super::pod_handler::invalid_app_target_response(locale, &e)),
     }
 

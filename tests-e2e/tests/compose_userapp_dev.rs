@@ -325,7 +325,7 @@ async fn scenario_userapp_chat_full_turn(backend: Backend) {
         user,
     );
     req.service_type = Some(shared_types::ChatServiceScope::Userapp);
-    req.project_id = Some(app.clone());
+    req.app_id = Some(app.clone());
 
     let Ok(data) = chat_reported(&env, &report, "turn1", &env.rcoder, &req).await else {
         report.assert_hard("chat 成功", false, "chat 失败（见 chat_request 行）".into());
@@ -1231,7 +1231,7 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
     // dev chat 建会话（分派的目标会话；短 prompt 控制时长）
     let mut req = env.base_payload(backend, "只回复 ok", &format!("{}-adp", env.run_tag), user);
     req.service_type = Some(shared_types::ChatServiceScope::Userapp);
-    req.project_id = Some(app.clone());
+    req.app_id = Some(app.clone());
     let sid = match chat_reported(&env, &report, "dispatch_chat", &env.rcoder, &req).await {
         Ok(d) if !d.session_id.is_empty() => d.session_id,
         _ => {
@@ -1264,7 +1264,7 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
     let (st, body) = post(
         &env,
         "computer/agent/status",
-        json!({"service_type": "userapp", "project_id": app}),
+        json!({"service_type": "userapp", "app_id": app}),
     )
     .await;
     let ok = st.is_success()
@@ -1281,7 +1281,7 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
     let (st, body) = post(
         &env,
         "computer/agent/session/cancel",
-        json!({"service_type": "userapp", "project_id": app, "session_id": sid}),
+        json!({"service_type": "userapp", "app_id": app, "session_id": sid}),
     )
     .await;
     let ok = st.is_success() && http_ok(&body) && body["data"]["success"].as_bool() == Some(true);
@@ -1295,7 +1295,7 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
     let (st, body) = post(
         &env,
         "computer/agent/stop",
-        json!({"service_type": "userapp", "project_id": app}),
+        json!({"service_type": "userapp", "app_id": app}),
     )
     .await;
     let ok = st.is_success() && http_ok(&body) && body["data"]["success"].as_bool() == Some(true);
@@ -1309,7 +1309,7 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
     let (st, body) = post(
         &env,
         "computer/cache/clean",
-        json!({"service_type": "userapp", "project_id": app, "user_id": user}),
+        json!({"service_type": "userapp", "app_id": app, "user_id": user}),
     )
     .await;
     let ok = st.is_success() && http_ok(&body);
