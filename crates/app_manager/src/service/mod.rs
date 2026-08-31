@@ -387,6 +387,5 @@ impl super::AppServiceTrait for AppService {
     }
 }
 
-
 #[cfg(test)]
 mod tests;

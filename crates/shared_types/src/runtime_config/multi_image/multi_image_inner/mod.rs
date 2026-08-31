@@ -402,6 +402,5 @@ pub fn create_legacy_multi_image_config(
     }
 }
 
-
 #[cfg(test)]
 mod tests;
