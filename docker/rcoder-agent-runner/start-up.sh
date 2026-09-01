@@ -766,12 +766,15 @@ function start_vnc_services() {
 }
 
 # ========== 桌面图标信任化 ==========
-# xfdesktop 4.18 对桌面 launcher 的信任只看文件属性: 实体文件 + 属主 user + 可执行 755。
-# 不要写 gio metadata (metadata::trusted / xfce-exe-checksum) —— 实测反而有害:
-#   xfce-exe-checksum 校验时我们只能写 sha256(整个文件), 而 xfdesktop 期望 sha256(Exec 行),
-#   两者不等 → xfdesktop 判定 "launcher 被篡改" → 双击概率性弹 untrusted (还叠加写 metadata 与
-#   xfdesktop 读取的时序竞态)。清空 metadata、只靠文件属性后, 确定性不弹。
-# 故这里只保证文件属性 (骨架恢复 cp -aL 已给实体, 本函数兜底 chown/chmod), 不碰 gio、不重启 xfdesktop。
+# xfdesktop 4.18 桌面 launcher 免弹 "untrusted" 需五件套齐 (ef0bcdc 实测):
+#   实体文件 + 属主 user(uid) + 可执行 755 + DBUS_SESSION 连上 gvfsd-metadata
+#   + gio metadata (metadata::trusted=true + metadata::xfce-exe-checksum)。
+# 历史两轮误判, 机制结论:
+#   - 7a39a79 只靠文件属性删 gio → 新图标/新 PVC 必弹 (旧图标靠 PVC 残留旧 metadata 幸免);
+#   - checksum 须为 sha256(Exec 行字符串)——误写 sha256(整个文件) 时校验不等 →
+#     xfdesktop 判 "launcher 被篡改" → 概率性弹 untrusted。
+# metadata 持久化在 PVC (~/.local/share/gvfs-metadata), 正常启动每次重写自愈
+# (内容漂移对齐后 checksum 同批刷新); 热修改文件后需重跑本函数或重启容器。
 function trust_desktop_icons() {
     local f
     # 1) 实体 + 属主 user(uid 1000) + 可执行 755  (XFCE 4.18 五件套 条件 1+2)
@@ -799,11 +802,14 @@ function trust_desktop_icons() {
     if [ "$_gvfs_ready" = "1" ]; then
         for f in /home/user/Desktop/*.desktop; do
             [ -f "$f" ] || continue
-            local cksum=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+            # xfce-exe-checksum 期望 sha256(Exec 行字符串)——曾误写 sha256(整个文件),
+            # 校验不等 → xfdesktop 判定 "launcher 被篡改" → 双击概率性弹 untrusted。
+            local _exec_line="$(grep -m1 '^Exec=' "$f" | cut -d= -f2-)"
+            local cksum="$(printf '%s' "$_exec_line" | sha256sum | cut -d' ' -f1)"
             [ -n "$cksum" ] && gio set "$f" metadata::xfce-exe-checksum "$cksum" 2>/dev/null || true
             gio set "$f" metadata::trusted true 2>/dev/null || true
         done
-        log_success "Desktop icons trusted (XFCE 4.18 五件套: uid+755+DBUS+checksum+trusted)"
+        log_success "Desktop icons trusted (XFCE 4.18 五件套: uid+755+DBUS+checksum(Exec行)+trusted)"
         # 3) 刷新 xfdesktop 缓存: gio set 写在 xfdesktop 启动之后, 它已缓存旧信任状态;
         #    用 session env 重启 xfdesktop 让它重读 metadata (aaf10f4 的 refresh, 7a39a79 误删)。
         if pgrep -x xfdesktop >/dev/null 2>&1; then
