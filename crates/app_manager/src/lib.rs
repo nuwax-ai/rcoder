@@ -5,7 +5,6 @@
 //! Docker / K8s 双后端统一走 ContainerRuntime 抽象。
 //! rcoder 无状态：业务元数据由调用方持久化。
 
-mod activity_persistence_ops;
 pub mod activity_registry;
 pub mod app_service_trait;
 pub mod config;

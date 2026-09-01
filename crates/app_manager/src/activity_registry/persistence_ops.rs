@@ -1,7 +1,7 @@
-//! 影子持久化操作（从 activity_registry.rs 拆出，extension-impl）
+//! 影子持久化操作（activity_registry 目录子模块，extension-impl）
 //!
 //! PG 模式下的数据面：持久化注入、启动恢复加载（apply_loaded）、
-//! 脏行/删除收集（flusher 周期消费）。wake/回收协调机制仍在本体文件。
+//! 脏行/删除收集（flusher 周期消费）。wake/回收协调机制见同目录 wake.rs 与 mod.rs。
 
 use std::sync::Arc;
 
