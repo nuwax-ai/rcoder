@@ -35,7 +35,7 @@ npm/*/rcoder-cli
 npm/*/rcoder-cli.exe
 
 docker/app-workspace/*
-docker/rcoder-agent-runner/bin/app-cli
+docker/rcoder-agent-runner/bin/*
 
 # Ignore DevSpace cache and log folder
 .devspace/
