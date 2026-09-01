@@ -6,12 +6,20 @@
         "--userDataDir=/home/user/.config/chromium",
         "--executablePath=/usr/local/bin/chromium-for-mcp",
         "--no-usage-statistics",
+        "--ignore-default-chrome-arg=--enable-automation",
+        "--chrome-arg=--disable-blink-features=AutomationControlled",
         "--chrome-arg=--no-sandbox",
         "--chrome-arg=--no-zygote",
         "--chrome-arg=--disable-dev-shm-usage",
         "--chrome-arg=--disable-gpu",
         "--chrome-arg=--remote-debugging-port=9222"
       ]
+    },
+    "dbx": {
+      "command": "dbx-mcp-server",
+      "env": {
+        "DBX_WEB_URL": "http://localhost:4224"
+      }
     }
   }
 }
