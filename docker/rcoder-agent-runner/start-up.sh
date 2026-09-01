@@ -486,12 +486,6 @@ function initialize_user_home() {
         log_success "  xfce4-desktop.xml pre-configured from system (fixes wallpaper scaling)"
     fi
 
-    # ========== 退役清理: pgweb 桌面图标 (存量 PVC 残留) ==========
-    # pgweb 已退役(dbx 替代); 补齐循环只管骨架集合(不删文件), 持久化 PVC 里
-    # 旧镜像时代写入的 pgweb.desktop 须在此显式清除——否则图标残留且点击 502
-    # (容器内 8081 已无监听)。幂等: 不存在时 rm -f 静默。
-    rm -f "$USER_HOME/Desktop/pgweb.desktop" 2>/dev/null || true
-
     # ========== 无条件补齐/对齐桌面系统图标 (每次启动确保预设图标存在且与镜像一致) ==========
     # 与下方 launcher 补齐同理, 属于"系统预设, 每次启动确保存在"。
     # 语义: 只管理骨架集合内的平台预置启动器, 骨架外的用户自定义图标一律不动:
@@ -524,6 +518,14 @@ function initialize_user_home() {
             fi
         done
     fi
+
+    # ========== 退役清理: pgweb 桌面图标 (存量残留, 须在补齐循环之后) ==========
+    # pgweb 已退役(dbx 替代)。清理在补齐循环**之后**执行——顺序即防御:
+    # 若 base 层未重建(骨架仍含旧 pgweb.desktop, 曾见于 0.1.250 混搭),
+    # 先清后补会被循环从骨架补回; 放在循环后则无论骨架新旧都能清掉。
+    # 幂等: 不存在时 rm -f 静默。骨架侧残留一并清理(防 need_restore 大恢复
+    # 分支从骨架整体复制时再次带回)。
+    rm -f "$USER_HOME/Desktop/pgweb.desktop" "$SKEL_DIR/Desktop/pgweb.desktop" 2>/dev/null || true
 
     # 无条件确保桌面图标可执行 + 属主 (X 启动前; 补齐/对齐段只覆盖缺失/断链/漂移,
     # rsync 同步带过来且内容恰好一致的旧图标 (644) 会跳过上方分支 → xfdesktop 读到 644 弹 mark executable。
