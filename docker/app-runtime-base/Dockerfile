@@ -1,5 +1,5 @@
 # 应用运行时基础镜像（app-runtime-base）
-# 基础设施层：Rust 工具链（来自 rust:bookworm）+ 排查工具 + ttyd + PostgreSQL + pgweb + supervisor。
+# 基础设施层：Rust 工具链（来自 rust:bookworm）+ 排查工具 + ttyd + PostgreSQL + supervisor。
 # rust:bookworm 基于 Debian bookworm（buildpack-deps），Rust/cargo 白赚，不再单独 rustup 装；Rust 版本随 tag 自动跟进最新 stable。
 # 语言运行时见 Dockerfile.runtime（FROM 本镜像 + Node/Python/Java/Go）。
 
@@ -114,9 +114,7 @@ RUN install -d /usr/share/postgresql-keyring && \
         > /etc/apt/sources.list.d/pgdg.list && \
     apt-get update && apt-get install -y postgresql-16 && rm -rf /var/lib/apt/lists/*
 
-# 安装 pgweb(Go 单二进制) — 由 make download-pgweb (09) 预下载分发到 downloads/, COPY 进容器
-COPY downloads/pgweb-${TARGETARCH} /usr/local/bin/pgweb
-RUN chmod +x /usr/local/bin/pgweb
+# （pgweb 已退役删除——数据库 Web 控制台由 dbx 承担）
 
 # 安装 dbx-web(DBX 数据库 Web GUI,60+ 数据库;supervisor 托管 :4224,见 app-runtime.supervisor.conf [program:dbx])
 # 由 make download-dbx-cache (16) 从官方镜像 docker.cnb.cool/dbxio.com/dbx 抽取分发到 downloads/
@@ -190,7 +188,7 @@ COPY .npmrc /root/.npmrc
 # /home/user/{data,logs} 由挂载卷提供，此处 mkdir 仅直跑场景兜底）
 RUN mkdir -p /app/code /app/config /home/user/data /home/user/logs /run/app-cli/pingap
 
-# PG / pgweb / dbx-web / workspace 默认配置(可被 UserApp env 覆盖——rcoder 创建
+# PG / dbx-web / workspace 默认配置(可被 UserApp env 覆盖——rcoder 创建
 # 容器时注入 USERAPP_WORKSPACE_DIR=/home/user/{app_id} 等；此层默认=本地直跑语义)
 # POSTGRES_PASSWORD 不设默认(敏感),由 UserApp env 提供;start-app.sh 兜底 "app"
 # DBX_PASSWORD 同理不设默认:首访浏览器自设(存 DBX_DATA_DIR/dbx.db),需固定密码时注入 env。
@@ -198,18 +196,17 @@ RUN mkdir -p /app/code /app/config /home/user/data /home/user/logs /run/app-cli/
 ENV PGDATA=/home/user/data/pg \
     POSTGRES_USER=app \
     POSTGRES_DB=app \
-    PGWEB_PORT=8081 \
     DBX_PORT=4224 \
     DBX_STATIC_DIR=/usr/local/share/dbx/static \
     DBX_DATA_DIR=/home/user/data/dbx \
     USERAPP_WORKSPACE_DIR=/app \
     APP_ID=
 
-# 暴露端口:9080/3010 应用+pingap / 7681 ttyd / 8081 pgweb / 4224 dbx-web / 5432 PostgreSQL(仅容器内)
+# 暴露端口:9080/3010 应用+pingap / 7681 ttyd / 4224 dbx-web / 5432 PostgreSQL(仅容器内)
 # / 8086 file-server / 60000 file-server-proxy（rcoder 转发层 prod 上游）
-EXPOSE 9080 3010 7681 8081 4224 5432 60000
+EXPOSE 9080 3010 7681 4224 5432 60000
 
-# ENTRYPOINT:start-app.sh 起 PG+pgweb+ttyd(supervisor)+ app-cli。
+# ENTRYPOINT:start-app.sh 起 PG+dbx+ttyd(supervisor)+ app-cli。
 # CMD 仅保留为镜像元数据；Manifest v1 的用户服务命令来自 release.lock.toml。
 ENTRYPOINT ["/usr/local/bin/start-app.sh"]
 CMD ["sleep", "infinity"]

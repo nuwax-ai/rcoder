@@ -353,8 +353,8 @@ function initialize_user_home() {
         # ========== 清除残留的 sudo-supervisord autostart ==========
         # 老镜像 Dockerfile.old 曾写入 $USER_HOME/.config/autostart/supervisord.desktop
         # (Exec=sudo supervisord); 当前镜像不再生成, 但 /home/user 是持久化 PVC, 旧文件残留。
-        # XFCE 启动会 autostart 它 → sudo 净化环境 → 那把 supervisord 解析 pgweb.conf
-        # %(ENV_PGWEB_PORT)s 失败(error.log 噪音) + 第二把 supervisord 隐患(socket 冲突)。
+        # XFCE 启动会 autostart 它 → sudo 净化环境 → 那把 supervisord 起第二把
+        # supervisord 隐患(socket 冲突)。(pgweb.conf 已随 pgweb 退役删除,此处仅历史背景)
         # 必须在 start_display_and_desktop(XFCE 起来)前删掉。定向清理, 不动其它 autostart。
         rm -f "$USER_HOME/.config/autostart/supervisord.desktop" /usr/local/bin/start-supervisord.sh 2>/dev/null || true
 
@@ -485,6 +485,12 @@ function initialize_user_home() {
         cp -f "$XFCE_DESKTOP_SYSTEM" "$XFCE_DESKTOP_XML"
         log_success "  xfce4-desktop.xml pre-configured from system (fixes wallpaper scaling)"
     fi
+
+    # ========== 退役清理: pgweb 桌面图标 (存量 PVC 残留) ==========
+    # pgweb 已退役(dbx 替代); 补齐循环只管骨架集合(不删文件), 持久化 PVC 里
+    # 旧镜像时代写入的 pgweb.desktop 须在此显式清除——否则图标残留且点击 502
+    # (容器内 8081 已无监听)。幂等: 不存在时 rm -f 静默。
+    rm -f "$USER_HOME/Desktop/pgweb.desktop" 2>/dev/null || true
 
     # ========== 无条件补齐/对齐桌面系统图标 (每次启动确保预设图标存在且与镜像一致) ==========
     # 与下方 launcher 补齐同理, 属于"系统预设, 每次启动确保存在"。
@@ -1873,9 +1879,9 @@ function start_ime_services() {
 }
 
 # ============================================================================
-# 🐘 PostgreSQL + pgweb（开发环境本地数据库 + Web UI）
+# 🐘 PostgreSQL（开发环境本地数据库）
 # 用户在 agent-runner 容器开发时用本地 PG 测试；开发完打包发布到 UserApp。
-# PG 数据落 /home/user/.pgdata（持久化，容器重启保留）；pgweb Web UI 操作数据库。
+# PG 数据落 /home/user/.pgdata（持久化，容器重启保留）；数据库操作走 dbx（Web GUI + AI MCP）。
 #
 # ⚠️ 启动模型: 此处只做"非阻塞"准备（备 PGDATA 归属 + 写连接信息）；首次 initdb
 # 与 postgres 进程均由 supervisor 托管的 pg-supervisor-entry.sh 异步拉起。
@@ -1887,7 +1893,6 @@ function prepare_pg() {
     export POSTGRES_USER="${POSTGRES_USER:-dev}"
     export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-dev}"
     export POSTGRES_DB="${POSTGRES_DB:-dev}"
-    export PGWEB_PORT="${PGWEB_PORT:-8081}"
 
     # dbx-web(DBX 数据库 Web GUI):默认配置导出,supervisor conf.d/dbx.conf 进程继承。
     # 面板免登(DBX_DISABLE_PASSWORD=1,conf.d/dbx.conf 注入)+ local-pg 预置连接
@@ -1905,11 +1910,11 @@ function prepare_pg() {
     # 项目文件属主错改成 postgres。
     install -d -o postgres -g postgres "$PGDATA"
 
-    # 连接信息（供用户参考；postgres/pgweb/dbx-web 进程由 supervisor 管）
+    # 连接信息（供用户参考；postgres/dbx-web 进程由 supervisor 管）
+    # （pgweb 已退役——数据库 Web 控制台由 dbx 承担）
     cat > /home/user/pg-connection.txt <<EOF
 PostgreSQL 开发数据库:
   容器内: host=localhost port=5432 user=$POSTGRES_USER password=$POSTGRES_PASSWORD database=$POSTGRES_DB sslmode=disable
-pgweb: http://localhost:$PGWEB_PORT  (Add Connection 填上述信息)
 dbx:   http://localhost:$DBX_PORT  (免登录; local-pg 预置连接开箱即用, 双击桌面 DBX 图标)
 EOF
     log "PG prepared (PGDATA=$PGDATA); initdb/postgres 由 supervisor 异步拉起"
@@ -1927,12 +1932,12 @@ export VNC_AUTO_START=true
 # 从骨架目录恢复配置（解决挂载空目录导致的花屏和图标消失）
 initialize_user_home
 
-# ========== supervisor 管 ttyd/PG/pgweb（不依赖 X11，初始化后启动）==========
-# 阶段1：ttyd/PG/pgweb 迁 supervisor（autorestart 崩溃自动拉起）
+# ========== supervisor 管 ttyd/PG/dbx（不依赖 X11，初始化后启动）==========
+# 阶段1：ttyd/PG/dbx 迁 supervisor（autorestart 崩溃自动拉起）
 # VNC/XFCE/MCP/audio/IME 仍由下方 start-up.sh 管（保留自定义）
 prepare_pg                                       # PG 非阻塞准备（initdb 已异步进 supervisor）
-supervisord -c /etc/supervisor/supervisord.conf  # daemon，autostart postgres/pgweb/ttyd
-log "supervisord started (manages: postgresql, pgweb, dbx, ttyd — autorestart on crash)"
+supervisord -c /etc/supervisor/supervisord.conf  # daemon，autostart postgres/dbx/ttyd
+log "supervisord started (manages: postgresql, dbx, ttyd — autorestart on crash)"
 
 # ========== MCP Proxy 服务在 X11 就绪后启动 ==========
 # 注意：chrome-devtools-mcp 需要 X11 来启动 Chromium 浏览器
@@ -2003,7 +2008,7 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
     ) &
     ime_pid=$!
 
-    # 4.5 ttyd + PostgreSQL + pgweb —— 由 supervisor 管（autorestart），不在此启动
+    # 4.5 ttyd + PostgreSQL + dbx —— 由 supervisor 管（autorestart），不在此启动
     # （见上方 supervisord 启动；阶段1 迁 supervisor）
 
     # 5. 应用 XFCE 壁纸（后台）

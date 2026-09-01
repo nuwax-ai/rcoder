@@ -210,7 +210,7 @@ docker-build-agent-production:
 # 产物: dev-app-runtime-base:latest（基础设施+Rust app-cli）+ dev-app-runtime:latest（多语言运行时）
 APP_RUNTIME_DIR := docker/app-runtime-base
 
-# 构建 dev-app-runtime-base（基础设施层: PG/pgweb/ttyd/supervisor + Rust app-cli）
+# 构建 dev-app-runtime-base（基础设施层: PG/dbx/ttyd/supervisor + Rust app-cli）
 docker-build-app-runtime-base:
 	@echo "🐳 构建 dev-app-runtime-base:latest ..."
 	@docker build --build-context rcoder=$(PWD) \

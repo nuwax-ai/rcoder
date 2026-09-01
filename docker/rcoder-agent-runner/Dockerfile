@@ -214,7 +214,7 @@ COPY ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
 COPY pg-supervisor-entry.sh /usr/local/bin/pg-supervisor-entry.sh
 RUN chmod +x /usr/local/bin/pg-supervisor-entry.sh
 
-# 复制 supervisor 配置（管 ttyd/PG/pgweb，autorestart 自动拉起；见 start-up.sh 的 supervisord 启动）
+# 复制 supervisor 配置（管 ttyd/PG/dbx，autorestart 自动拉起；见 start-up.sh 的 supervisord 启动）
 COPY supervisor/supervisord.conf /etc/supervisor/supervisord.conf
 COPY supervisor/conf.d/ /etc/supervisor/conf.d/
 COPY ttyd/ttyd-index.html /usr/local/share/ttyd/index.html

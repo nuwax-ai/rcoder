@@ -83,7 +83,7 @@ flowchart LR
 - **app_manager**：管理计算资源、应用 PVC、版本包、激活、确认、回滚和清理。
 - **app-cli**：只读取 release lock，编排当前 release 的服务、健康检查、Pingap 和日志。
 - **Pingap**：UserApp 容器统一应用入口，固定监听 `0.0.0.0:9080`，同时支持公网和内网访问。
-- **PostgreSQL/pgweb**：由 app-runtime 提供；数据库数据位于应用持久卷。
+- **PostgreSQL/dbx**：由 app-runtime 提供；数据库数据位于应用持久卷。
 
 Java 仍是业务 desired state 的权威。workspace TOML 是 workspace 拓扑、服务和 Pingap
 配置的唯一权威。`release.lock.toml` 是某个 release 的不可变运行时权威。
@@ -631,7 +631,7 @@ POST /api/v1/userapp/db/{env}/create-database
 
 接口以 body `app_id` + path `{env}`（dev=开发容器 / prod=运行容器）定位，容器 exec 本地
 psql 完成（改密支持 username 可选账号 upsert）；只适用于带
-PostgreSQL 的 app-runtime。普通数据操作由 pgweb 或业务迁移完成。
+PostgreSQL 的 app-runtime。普通数据操作由 dbx 或业务迁移完成。
 > 原 `POST /api/v1/userapp/{app_id}/db/*` 两路为上述接口的子集，已下线。
 
 ### 9.5 闲置自动回收与流量唤醒
@@ -783,7 +783,7 @@ migrate 在 service 启动前执行。任意 migration 失败会使整组启动�
 - Secret 不进入 workspace Manifest；
 - workspace TOML 中的明文会进入源码和最近保留的 release 包；
 - app-cli 不主动打印完整 Pingap TOML；
-- app-cli 管理端口、PG 和 pgweb 不通过用户自定义 Pingap 应用路由暴露；
+- app-cli 管理端口、PG 和 dbx 不通过用户自定义 Pingap 应用路由暴露；
 - 发布包、上传文件和 Agent 下载 URL 允许 HTTP、内网 IP、localhost、集群域名及公网域名；
 - release URL、摘要、大小和 ID全部校验；
 - 日志查询不能读取未在 release lock 声明的路径；
@@ -823,7 +823,7 @@ migrate 在 service 启动前执行。任意 migration 失败会使整组启动�
 
 ### 12.2 尚需补齐或验证
 
-1. **真实 K8s E2E**：验证 cephfs-root、per-app PVC、app-runtime、PG、pgweb、app-cli、
+1. **真实 K8s E2E**：验证 cephfs-root、per-app PVC、app-runtime、PG、dbx、app-cli、
    Pingap 9080、日志和回滚完整链路。
 2. **发布编排归属**：统一 activate 后 120 秒 readiness 和 confirm 的责任组件。
 3. **激活前深度校验**：app_manager 当前只做 release 文件存在和 ID 基础校验；完整

@@ -15,7 +15,7 @@
 ```text
 supervisord (start-app.sh)
 ├── [program:postgresql]   priority=10
-├── [program:pgweb]        priority=20
+├── [program:dbx]          priority=25
 ├── [program:ttyd]         priority=30
 └── [program:app]          priority=40  ← app-cli（UserApp command 动态注册）
     ├── 管理 API            0.0.0.0:3010（--admin-addr）

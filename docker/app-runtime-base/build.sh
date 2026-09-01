@@ -3,7 +3,7 @@
 # 应用运行时镜像构建脚本（base + 统一多语言 runtime）
 # ============================================================================
 # 产物两个镜像：
-#   1. app-runtime-base:${TAG}   —— 基础设施层（PG/pgweb/ttyd/supervisor/排查工具），Dockerfile
+#   1. app-runtime-base:${TAG}   —— 基础设施层（PG/dbx/ttyd/supervisor/排查工具），Dockerfile
 #   2. app-runtime:${TAG}        —— 统一多语言运行时（Node+Python+Java+Go+Rust），Dockerfile.runtime
 # 用户部署 UserApp 只用 app-runtime:${TAG}（任意语言 / workspace 多语言同容器）。
 # 原 Dockerfile.{node,python,java,go,rust} 已合并进 Dockerfile.runtime，不再按语言拆镜像。

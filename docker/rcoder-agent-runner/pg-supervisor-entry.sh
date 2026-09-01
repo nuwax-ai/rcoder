@@ -51,6 +51,6 @@ fi
 
 # 前台运行 postgres, 供 supervisor 直接托管 (PID 即 postgres 本体)
 # chmod 700: postgres 要求 PGDATA u=rwx(0700)或 u=rwx,g=rx(0750); start-up.sh 的 install -d 默认建 755
-# → postgres FATAL "data directory has invalid permissions" → pgweb 登录连不上 PG. 幂等兜底 (supervisor 每次重启都校正, 也防 fsGroup/PVC 改权限).
+# → postgres FATAL "data directory has invalid permissions" → 数据库客户端连不上 PG. 幂等兜底 (supervisor 每次重启都校正, 也防 fsGroup/PVC 改权限).
 chmod 700 "$PGDATA" 2>/dev/null || true
 exec "$PG_BIN/postgres" -D "$PGDATA"

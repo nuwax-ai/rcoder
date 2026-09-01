@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# app-runtime ENTRYPOINT —— supervisor 管 PG + pgweb + ttyd + app-cli
+# app-runtime ENTRYPOINT —— supervisor 管 PG + dbx + ttyd + app-cli
 # app-cli 从 $WS/code/release.lock.toml 编排 workspace 内的全部用户服务与 Pingap。
 # supervisor 作 PID 1:docker stop SIGTERM → 优雅停 PG(INT 信号)不丢数据
 #
@@ -17,7 +17,6 @@ export PGDATA="${PGDATA:-/home/user/data/pg}"
 export POSTGRES_USER="${POSTGRES_USER:-app}"
 export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-app}"
 export POSTGRES_DB="${POSTGRES_DB:-app}"
-export PGWEB_PORT="${PGWEB_PORT:-8081}"
 
 # dbx-web(DBX 数据库 Web GUI):默认配置导出,supervisor [program:dbx] 继承。
 # 面板免登(DBX_DISABLE_PASSWORD=1,supervisor conf 注入)+ local-pg 预置连接
@@ -42,7 +41,7 @@ install -d -o postgres -g postgres "$PGDATA"
 #    PGDATA 在 /home/user/data(挂载卷), 重启不丢数据。
 # ============================================================================
 
-# 连接信息供用户参考(pgweb UI 手填 / 应用连接)
+# 连接信息供用户参考(dbx 控制台开箱即用 / 应用连接)
 cat > "$WS/config/pg-connection.txt" <<EOF
 PostgreSQL 连接信息:
   容器内:host=localhost port=5432 user=$POSTGRES_USER password=$POSTGRES_PASSWORD dbname=$POSTGRES_DB sslmode=disable
