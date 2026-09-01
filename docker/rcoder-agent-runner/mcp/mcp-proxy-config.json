@@ -14,12 +14,6 @@
         "--chrome-arg=--disable-gpu",
         "--chrome-arg=--remote-debugging-port=9222"
       ]
-    },
-    "dbx": {
-      "command": "dbx-mcp-server",
-      "env": {
-        "DBX_WEB_URL": "http://localhost:4224"
-      }
     }
   }
 }
