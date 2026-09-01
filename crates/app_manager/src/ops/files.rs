@@ -17,7 +17,7 @@ use crate::models::*;
 use crate::service::AppService;
 use crate::utils::*;
 
-/// 运行容器 file-server-proxy 端口（与 ttyd 7681 / pgweb 8081 同为固定端口）。
+/// 运行容器 file-server-proxy 端口（与 ttyd 7681 / dbx 4224 同为固定端口）。
 const APP_FILE_SERVER_PORT: u16 = shared_types::AGENT_FILE_SERVER_PORT;
 
 /// file-server app-files 族响应 DTO（形状对齐 app_manager DTO，snake 键；

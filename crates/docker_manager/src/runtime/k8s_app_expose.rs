@@ -39,23 +39,24 @@ impl KubernetesRuntime {
             .unwrap_or_default();
         let mut ports = ports;
         // 运行容器固定端口随 Service 一并暴露——
-        // `/userapp/prod/{ttyd,pgweb,dbx}/{app_id}` 代理上游为 Service FQDN，
-        // 若 7681/8081/4224 不在 Service ports 内，
-        // 代理连接将超时（app-runtime 镜像 supervisor 恒起 ttyd/pgweb/dbx-web，
+        // `/userapp/prod/{ttyd,dbx}/{app_id}` 代理上游为 Service FQDN，
+        // 若 7681/4224 不在 Service ports 内，
+        // 代理连接将超时（app-runtime 镜像 supervisor 恒起 ttyd/dbx-web，
         // targetPort 恒可达）。
         // 60000 = 容器内 file-server-proxy（rcoder 转发层 prod 文件操作的上游，
         // AllRust → 8086 Rust file-server；单 app 模式）。
         // 用户 ports 为空时同样需要本 Service（仅含固定端口也建）——
         // 平台内定四要素下 ports 恒非空，此分支防御直接 REST create 的调用方。
+        // （原 pgweb(8081) 成员已随 pgweb 退役删除；Service 全量构造+声明式 apply，
+        // 存量 Service 的 8081 端口随下次 reconcile 自动消失。）
         for (name, port) in [
             ("ttyd", shared_types::TTYD_PORT),
-            ("pgweb", shared_types::PGWEB_PORT),
             ("dbx", shared_types::DBX_PORT),
             ("file-server", shared_types::AGENT_FILE_SERVER_PORT),
         ] {
             // 撞名即跳过（不论端口值）：再 push 同名端口会撞 K8s 校验
             // "port names must be unique"，整个 Service 被拒绝。用户占用保留名
-            // 属自担行为（7681/8081 未暴露，对应 runtime 代理将不可达）。
+            // 属自担行为（7681/4224 未暴露，对应 runtime 代理将不可达）。
             if let Some(conflict) = ports.iter().find(|p| p.name.as_deref() == Some(name)) {
                 warn!(
                     "[K8S] app {} Service port name '{}' occupied by user port {}, skipping builtin exposure",

@@ -338,7 +338,7 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
 设置目标容器内 PG 的账号密码，两种语义：
 
 - **不带 username**：重置 superuser（SQL CURRENT_USER 语义，绕过"需要当前密码"
-  死锁——用户忘记 pgweb 密码时的正解）；
+  死锁——用户忘记数据库密码时的正解）；
 - **带 username**：账号 upsert——角色存在则 ALTER USER 改密，不存在则 CREATE ROLE
   建号后再设密。
 
@@ -440,7 +440,7 @@ pub(crate) async fn reset_password(
 - 标识符白名单校验 `[A-Za-z0-9_]`（app_id/database/owner 全过，防注入）；
 - prod 环境 stopped 自动唤醒并等待 PG 就绪。
 
-普通数据操作建议走 pgweb / 业务迁移脚本，本接口面向"建库"这一步编排。
+普通数据操作建议走 dbx 控制台 / 业务迁移脚本，本接口面向"建库"这一步编排。
 "#,
 )]
 pub(crate) async fn create_database(

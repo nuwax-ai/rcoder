@@ -107,16 +107,6 @@ fn test_userapp_dev_terminal_routes() {
             RouteType::RuntimeTtydProxy,
             "app-1",
         ),
-        (
-            "/userapp/prod/pgweb/u1/app-1/static/favicon.ico",
-            RouteType::RuntimePgwebProxy,
-            "app-1",
-        ),
-        (
-            "/userapp/prod/pgweb/u1/app-1",
-            RouteType::RuntimePgwebProxy,
-            "app-1",
-        ),
         // 开发域路由不被 prod 段劫持
         (
             "/userapp/dev/ttyd/u1/app-1/ws",
@@ -163,13 +153,6 @@ fn test_userapp_dev_terminal_routes() {
             "app-1",
             None,
         ),
-        (
-            "/userapp/prod/pgweb/u1/app-1/console",
-            RouteType::RuntimePgwebProxy,
-            "u1",
-            "app-1",
-            Some("console"),
-        ),
     ] {
         let matched = router.at(path).expect(path);
         assert_eq!(*matched.value, expected, "path={path}");
@@ -205,7 +188,6 @@ fn test_userapp_dev_terminal_routes() {
                         | RouteType::ProdDbxProxy
                         | RouteType::DevTtydProxy
                         | RouteType::RuntimeTtydProxy
-                        | RouteType::RuntimePgwebProxy
                 )
             })
             .unwrap_or(false);
@@ -239,7 +221,6 @@ fn test_userapp_dev_terminal_routes() {
                         | RouteType::DevDbxProxy
                         | RouteType::ProdDbxProxy
                         | RouteType::RuntimeTtydProxy
-                        | RouteType::RuntimePgwebProxy
                         | RouteType::ProdAppProxy
                         | RouteType::DevAppProxy
                 )

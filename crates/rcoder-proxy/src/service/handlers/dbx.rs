@@ -6,7 +6,7 @@
 //! - **prod**：Userapp 运行容器（app-runtime 镜像）——`find_app_runtime_addr`
 //!   确定性命名构造，未部署/停止 → 连接失败 502（同 runtime 终端族）。
 //!
-//! 代理剥前缀直连 root 模式 dbx（同 pgweb）：dbx 前端 `webPath.ts` 从
+//! 代理剥前缀直连 root 模式 dbx：dbx 前端 `webPath.ts` 从
 //! location.pathname 运行时推断 base，index.html 全相对引用，API/WS 调用
 //! 自动拼回 `/userapp/{stage}/dbx/{app_id}` 前缀——无需容器侧配置
 //! `DBX_PUBLIC_BASE_PATH`。WebSocket（redis pubsub 等）由 Pingora 透传。

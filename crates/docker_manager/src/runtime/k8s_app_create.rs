@@ -233,7 +233,7 @@ impl KubernetesRuntime {
             image: Some(image),
             image_pull_policy: Some("IfNotPresent".to_string()),
             // K8s:command 不设 → 用镜像 ENTRYPOINT(app-runtime 镜像 = start-app.sh,
-            // 负责起 PG/pgweb/ttyd 后 exec 用户 command)。
+            // 负责起 PG/dbx/ttyd 后 exec 用户 command)。
             // args = 用户 command(等同 docker CMD 语义:有 ENTRYPOINT 时作其参数,
             // 无 ENTRYPOINT 时(如 node:20-alpine)docker 自动作命令运行)。
             // 这样 app-runtime 镜像的 ENTRYPOINT 生效跑内置服务,普通镜像用户 command 直接运行。

@@ -33,7 +33,7 @@ impl ProxyHttp for PortProxy {
     /// 拉起；超时/失败 → 503+Retry-After）：
     /// - `/proxy/userapp/prod/{user_id}/{app_id}/...` 应用业务流量：**touch + wake**
     ///   （touch 记录最近访问，是闲置回收的信号源）；
-    /// - `/userapp/prod/{ttyd,pgweb,dbx}/{app_id}` 工具族：**只 wake 不 touch**
+    /// - `/userapp/prod/{ttyd,dbx}/{app_id}` 工具族：**只 wake 不 touch**
     ///   （终端/DB 客户端连接不算业务活跃——挂终端不阻止闲置回收，回收后下次
     ///   连接自动唤醒再转发，ttyd 前端自动重连兜底首连窗口）。
     /// 其余路由直接放行（Ok(false) → 继续 upstream_peer）。
@@ -307,7 +307,7 @@ impl PortProxy {
 /// 唤醒目标分类：路径 → `(app_id, touch)`。
 ///
 /// - `/proxy/userapp/prod/...` 应用业务流量 → touch=true（闲置回收信号源）；
-/// - `/userapp/prod/{ttyd,pgweb,dbx}/{app_id}` 工具族 → touch=false（终端/DB
+/// - `/userapp/prod/{ttyd,dbx}/{app_id}` 工具族 → touch=false（终端/DB
 ///   连接不算业务活跃，不刷新闲置计时——挂终端不阻止回收，回收后下次连接再唤醒）；
 /// - 其余路由 → None（不触发唤醒）。
 fn classify_wake_target(router: &matchit::Router<RouteType>, path: &str) -> Option<(String, bool)> {
@@ -319,9 +319,9 @@ fn classify_wake_target(router: &matchit::Router<RouteType>, path: &str) -> Opti
     match router.at(path) {
         Ok(m) => match m.value {
             RouteType::ProdAppProxy => m.params.get("app_id").map(|s| (s.to_string(), true)),
-            RouteType::RuntimeTtydProxy
-            | RouteType::RuntimePgwebProxy
-            | RouteType::ProdDbxProxy => m.params.get("app_id").map(|s| (s.to_string(), false)),
+            RouteType::RuntimeTtydProxy | RouteType::ProdDbxProxy => {
+                m.params.get("app_id").map(|s| (s.to_string(), false))
+            }
             _ => None,
         },
         Err(_) => None,
@@ -346,7 +346,6 @@ mod tests {
         for path in [
             "/userapp/prod/ttyd/u1/app-1",
             "/userapp/prod/ttyd/u1/app-1/token.js",
-            "/userapp/prod/pgweb/u1/app-1",
             "/userapp/prod/dbx/u1/app-1",
         ] {
             let (app_id, touch) =

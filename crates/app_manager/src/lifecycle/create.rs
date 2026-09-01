@@ -157,7 +157,7 @@ impl AppService {
             }
         }
 
-        // 端口校验：HTTP 端口数上限放开（app-runtime 镜像单容器带 pgweb 8081 + ttyd 7681 + 用户应用端口）
+        // 端口校验：HTTP 端口数上限放开（app-runtime 镜像单容器带 ttyd 7681 + dbx 4224 + 用户应用端口）
         // Pingora 免端口路由 /proxy/userapp/prod 按 (app_id, APP_ENTRY_PORT) 优先（多 HTTP 端口仍全量注册）
         // gateway 模式（HTTPRoute）仍只支持单 HTTP，在 k8s_deployment 侧单独拦截（这里不拦，让 Pingora 模式可用）
         let http_port_count = request
@@ -186,11 +186,11 @@ impl AppService {
                         p.port
                     )));
                 }
-                // Service 端口保留名：ttyd/pgweb 由平台恒补（运行容器终端/PG
-                // 控制台的代理上游），用户占用会挤掉恒补暴露（K8s 端口名唯一）
-                if p.name == "ttyd" || p.name == "pgweb" {
+                // Service 端口保留名：ttyd 由平台恒补（运行容器终端的代理上游），
+                // 用户占用会挤掉恒补暴露（K8s 端口名唯一）
+                if p.name == "ttyd" {
                     return Err(AppOperationError::Validation(format!(
-                        "port name '{}' is reserved for platform builtin services (ttyd=7681, pgweb=8081)",
+                        "port name '{}' is reserved for platform builtin services (ttyd=7681)",
                         p.name
                     )));
                 }

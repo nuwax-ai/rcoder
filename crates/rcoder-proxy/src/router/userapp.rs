@@ -88,20 +88,12 @@ pub(super) fn insert_userapp_routes(
             "/userapp/prod/ttyd/{user_id}/{app_id}",
             RouteType::RuntimeTtydProxy,
         ),
-        (
-            "/userapp/prod/pgweb/{user_id}/{app_id}/{*path}",
-            RouteType::RuntimePgwebProxy,
-        ),
-        (
-            "/userapp/prod/pgweb/{user_id}/{app_id}",
-            RouteType::RuntimePgwebProxy,
-        ),
     ] {
         insert_route(router, prefix, route)?;
     }
 
     // DBX 数据库 Web GUI 两阶段（dev=开发容器 / prod=运行容器，均直连 :4224）——
-    // 归入工具族 stage 前缀风格（{user_id}/{app_id} 双段与 ttyd/vnc/audio/ime/pgweb 同一形态）。
+    // 归入工具族 stage 前缀风格（{user_id}/{app_id} 双段与 ttyd/vnc/audio/ime 同一形态）。
     for (prefix, route) in [
         (
             "/userapp/dev/dbx/{user_id}/{app_id}/{*path}",

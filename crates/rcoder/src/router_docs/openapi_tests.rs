@@ -176,10 +176,11 @@ fn primary_document_groups_userapp_by_business_domain() {
         }
     }
     // 口径（环境维度 tag 重组后同前）：内部剔除 21 条后实测 Userapp 系 op
-    // 总数=52（dev/logs、tasks/{id}/logs 先后下线各 -1），下限防漂移不设满额
+    // 总数=51（dev/logs、tasks/{id}/logs 先后下线各 -1；pgweb 代理文档随 pgweb 退役 -1），
+    // 下限防漂移不设满额
     assert!(
-        userapp_ops >= 52,
-        "Userapp 系 operation 计数下限（52）未达: {userapp_ops}"
+        userapp_ops >= 51,
+        "Userapp 系 operation 计数下限（51）未达: {userapp_ops}"
     );
 
     let tag_of = |path: &str, method: &str| sole_tag("primary", &document, path, method);
@@ -346,8 +347,8 @@ fn userapp_tags_carry_environment_dimension() {
         }
     }
     assert!(
-        userapp_ops >= 52,
-        "Userapp 系 operation 计数下限（52）未达: {userapp_ops}"
+        userapp_ops >= 51,
+        "Userapp 系 operation 计数下限（51）未达: {userapp_ops}"
     );
     // 三个环境组都必须非空：分组退化（全塞一组/环境段丢失）当场报红
     for prefix in ["Userapp · dev · ", "Userapp · prod · ", "Userapp · 双态 · "] {
@@ -690,10 +691,10 @@ fn userapp_openapi_annotations_are_complete() {
         }
     }
     // 覆盖数下限：app_manager 25（create REST 面 + releases 五接口已删）+
-    // app_manager /api/v1/userapp 族 + /userapp/ 代理文档 6（开发域 ttyd/vnc/audio/ime
-    // + 运行容器 ttyd/pgweb）+ dbx 两阶段代理文档 2（dev/prod）。
+    // app_manager /api/v1/userapp 族 + /userapp/ 代理文档 5（开发域 ttyd/vnc/audio/ime
+    // + 运行容器 ttyd）+ dbx 两阶段代理文档 2（dev/prod）。（原 pgweb 1 端点已随 pgweb 退役删除）
     assert!(
-        checked >= 33,
+        checked >= 32,
         "Userapp OpenAPI 端点覆盖数异常偏少: {checked}"
     );
 }

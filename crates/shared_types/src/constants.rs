@@ -102,12 +102,6 @@ pub const TTYD_PORT: u16 = 7681;
 /// 仅 agent_runner 内部连接，不对外暴露（K8s Service 暴露此 17681 而非 ttyd 7681）。
 pub const WS_TERMINAL_PORT: u16 = 17681;
 
-/// pgweb 端口（app-runtime 容器恒为 8081）
-///
-/// app-runtime 镜像 supervisor 恒起 pgweb（`--listen=8081`），供 userApp 运行容器的
-/// 数据库 Web 控制台；经 Pingora `/userapp/prod/pgweb/{user_id}/{app_id}` 代理暴露。
-pub const PGWEB_PORT: u16 = 8081;
-
 /// dbx-web 端口（agent-runner 与 app-runtime 容器恒为 4224）
 ///
 /// DBX 数据库 Web GUI（60+ 数据库），两镜像 supervisor 均恒起（无 CLI 参数，全 env 配置）。

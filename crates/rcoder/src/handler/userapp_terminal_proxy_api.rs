@@ -3,7 +3,7 @@
 //! - **开发域工具族**：`/userapp/dev/{ttyd,vnc,audio,ime,dbx}/{user_id}/{app_id}`——
 //!   定位 UserappBuilder 开发容器；user_id 是懒创建显式 owner 档（dev/{user_id}/{app_id}
 //!   宿主树分区）+ 卷分区定位（与 computer 族按 user_id 定位沙箱对称）。
-//! - **生产域工具族**：`/userapp/prod/{ttyd,pgweb,dbx}/{user_id}/{app_id}`——定位
+//! - **生产域工具族**：`/userapp/prod/{ttyd,dbx}/{user_id}/{app_id}`——定位
 //!   `ServiceType::Userapp` 运行容器；user_id 为宿主机数据卷分区组成段（容器
 //!   未启动时配合唤醒定位）。
 //! - **应用流量族**（免端口）：`/proxy/userapp/{dev,prod}/{user_id}/{app_id}`——
@@ -228,7 +228,7 @@ pub async fn proxy_to_userapp_ime(
 Web GUI（60+ 数据库，supervisor 恒起 4224）——开发阶段查库/改数据的全功能控制台
 （容器内 PG 已预置连接 + 首访浏览器设密码；也可连远端库）。
 
-- 与 pgweb（prod 域专用、只读排障向）互补：DBX 是两阶段全功能 GUI。
+- 数据库控制台（dev/prod 两阶段全功能 GUI，已取代退役的 pgweb）。
 - 前置：`POST /api/v1/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - 代理剥前缀直连 root 模式 dbx（前端运行时自推断 base path，API/WS 自动拼回本前缀）。
 - host = Pingora 入口（rcoder 容器 8088 / K8s NodePort 30435），须直连 Pingora 不走 rcoder 主端口。
@@ -253,7 +253,7 @@ pub async fn proxy_to_dev_dbx(
     redirect_doc_response(&state, "dev", "dbx", user_id, app_id, path).await
 }
 
-// ── 生产域工具族（运行容器，部署后的生产环境）：/userapp/prod/{ttyd,pgweb,dbx}/{app_id}/{*path} ──
+// ── 生产域工具族（运行容器，部署后的生产环境）：/userapp/prod/{ttyd,dbx}/{app_id}/{*path} ──
 
 /// Pingora 代理 - userApp 运行容器 Web 终端（ttyd）
 #[utoipa::path(
@@ -290,40 +290,6 @@ pub async fn proxy_to_userapp_runtime_ttyd(
     Path((user_id, app_id, path)): Path<(String, String, String)>,
 ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
     redirect_doc_response(&state, "prod", "ttyd", user_id, app_id, path).await
-}
-
-/// Pingora 代理 - userApp 运行容器数据库控制台（pgweb）
-#[utoipa::path(
-    get,
-    path = "/userapp/prod/pgweb/{user_id}/{app_id}/{*path}",
-    tag = "Userapp · prod · 终端工具",
-    summary = "生产容器数据库控制台（pgweb）",
-    description = r#"
-访问该 app **运行容器**（app-runtime 镜像）内的 pgweb——容器内 PostgreSQL（5432）
-的 Web 控制台（8081，普通 HTTP），供线上查库排障。
-
-- 容器内 PG 由 supervisor 恒起（`/app/data/pg` 持久于 app 的 RWX PVC）；
-  pgweb 会话直连容器内本实例。
-- **app 未部署/已停止 → 上游连接失败 502**。
-
-> 例：`GET /userapp/prod/pgweb/u1/app-order-svc/`（控制台页面）。
-"#,
-    params(
-        ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
-        ("app_id" = String, Path, description = "应用 ID（定位其运行容器）"),
-        ("path" = String, Path, description = "pgweb 内路径（`/` 控制台页面）")
-    ),
-    responses(
-        (status = 307, description = "重定向到 Pingora 代理服务", body = String),
-        (status = 502, description = "app 未部署或已停止（运行容器不可达）", body = String),
-        (status = 503, description = "代理服务未启用", body = ProxyErrorResponse)
-    )
-)]
-pub async fn proxy_to_userapp_runtime_pgweb(
-    State(state): State<Arc<AppState>>,
-    Path((user_id, app_id, path)): Path<(String, String, String)>,
-) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
-    redirect_doc_response(&state, "prod", "pgweb", user_id, app_id, path).await
 }
 
 /// Pingora 代理 - DBX 数据库 Web GUI（生产阶段，Userapp 运行容器）
@@ -385,7 +351,6 @@ pub async fn userapp_proxy_routes_doc() -> Json<Value> {
             },
             "prod": {
                 "ttyd（Web 终端，cwd=/app，直连 ttyd 本体不经 ws_terminal）": "/userapp/prod/ttyd/{user_id}/{app_id}/{path}",
-                "pgweb（容器内 PG 的 Web 控制台）": "/userapp/prod/pgweb/{user_id}/{app_id}/{path}",
                 "dbx（数据库 Web GUI，已预置本地 PG 连接，首访设密码）": "/userapp/prod/dbx/{user_id}/{app_id}/{path}"
             }
         },
@@ -417,9 +382,4 @@ stage_tool_redirect!(proxy_to_userapp_audio_redirect_root, "dev", "audio");
 stage_tool_redirect!(proxy_to_userapp_ime_redirect_root, "dev", "ime");
 stage_tool_redirect!(proxy_to_dev_dbx_redirect_root, "dev", "dbx");
 stage_tool_redirect!(proxy_to_userapp_runtime_ttyd_redirect_root, "prod", "ttyd");
-stage_tool_redirect!(
-    proxy_to_userapp_runtime_pgweb_redirect_root,
-    "prod",
-    "pgweb"
-);
 stage_tool_redirect!(proxy_to_prod_dbx_redirect_root, "prod", "dbx");

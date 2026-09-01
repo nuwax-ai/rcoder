@@ -376,7 +376,7 @@ pub async fn handle_dev_ime_upstream(
 
 // ── 运行容器（部署后的生产环境）───────────────────────────────────────────────
 //
-// `/userapp/prod/{ttyd,pgweb}/{app_id}/{*path}`：与上面的开发域工具族对称，
+// `/userapp/prod/{ttyd,...}/{app_id}/{*path}`：与上面的开发域工具族对称，
 // 但目标是 `ServiceType::Userapp` 运行容器（app-runtime 镜像）。两处关键差异：
 // 1. 定位走 `find_app_runtime_addr`（确定性命名构造）——运行容器不进 projects
 //    注册表（project_to_container[app_id] 单值键被 builder 占用）；
@@ -481,64 +481,6 @@ pub async fn handle_runtime_ttyd_upstream(
     peer.options.write_timeout = None;
     peer.options.total_connection_timeout = Some(Duration::from_secs(15));
     // 终端会话可长开；与开发域 ttyd 同档
-    peer.options.idle_timeout = Some(Duration::from_secs(3600));
-    Ok(Box::new(peer))
-}
-
-/// `/userapp/prod/pgweb/{app_id}/{*path}` 请求重写（HTTP 直连 PGWEB_PORT）。
-///
-/// 定位在 upstream 阶段完成（同 runtime ttyd 的生命周期说明）。
-pub async fn handle_runtime_pgweb_request(
-    upstream_request: &mut RequestHeader,
-    original_uri: &http::Uri,
-    params: Params<'_, '_>,
-    ctx: &TrackingCtx,
-) -> PingoraResult<()> {
-    let app_id = require_app_id(&params)?;
-    let target_path = runtime_target_path_of(&params);
-    debug!(
-        "[RUNTIME_PGWEB] app_id={}, target_path={}",
-        app_id, target_path
-    );
-
-    let host = ctx.vnc_target_ip.as_deref().unwrap_or("127.0.0.1");
-    upstream_request.insert_header("Host", host)?;
-    let new_uri = utils::rewrite_uri(original_uri, target_path)?;
-    upstream_request.set_uri(new_uri);
-    utils::set_common_headers(upstream_request)?;
-    Ok(())
-}
-
-/// 运行态 pgweb 上游：定位运行容器 + 直连 PGWEB_PORT=8081（普通 HTTP）。
-pub async fn handle_runtime_pgweb_upstream(
-    ctx: &mut TrackingCtx,
-    params: Params<'_, '_>,
-    metrics: &Arc<ProxyMetrics>,
-    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
-    ip_slot: &arc_swap::ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>,
-) -> PingoraResult<Box<HttpPeer>> {
-    let app_id = require_app_id(&params)?;
-    let container_addr = find_runtime_addr(ip_slot, container_lookup, &app_id).await?;
-
-    metrics.record_request();
-    metrics.inc_active();
-    ctx.vnc_target_ip = Some(container_addr.clone());
-    debug!(
-        "[RUNTIME_PGWEB] app_id={} -> {}:{}",
-        app_id,
-        container_addr,
-        shared_types::PGWEB_PORT
-    );
-
-    let mut peer = HttpPeer::new(
-        (container_addr.as_str(), shared_types::PGWEB_PORT),
-        false,
-        "".to_string(),
-    );
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None;
-    peer.options.write_timeout = None;
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
     peer.options.idle_timeout = Some(Duration::from_secs(3600));
     Ok(Box::new(peer))
 }

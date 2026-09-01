@@ -35,7 +35,7 @@ pub struct ProjectScope {
 ///
 /// Docker 网络启用 IPv6 时容器名 DNS 会返回 AAAA，pingora 解析选中 v6 而
 /// app-runtime 的 ttyd 只监听 IPv4（libwebsockets）→ 7681 ConnectRefused
-/// （pgweb 是 Go dual-stack 不受影响）。本 trait 由持有 `ContainerRuntime`
+/// （dbx-web 是 dual-stack 不受影响）。本 trait 由持有 `ContainerRuntime`
 /// 句柄的进程（rcoder main）实现：经 `get_container_info_by_identifier(app_id,
 /// Userapp)` 实时取容器 IPv4。K8s 模式不需要（Service FQDN 走 A 记录）。
 #[async_trait::async_trait]
@@ -54,7 +54,7 @@ pub trait ContainerLookup: Send + Sync {
     /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None。
     fn find_by_project_id(&self, project_id: &str, service_type: &ServiceType) -> Option<String>;
 
-    /// userApp 运行容器地址（`/userapp/{ttyd,pgweb}/{app_id}/runtime` 代理上游）。
+    /// userApp 运行容器地址（`/userapp/{ttyd,dbx}/{app_id}` 代理上游）。
     ///
     /// 运行容器（`ServiceType::Userapp` Deployment/容器）**不进 projects 注册表**——
     /// `project_to_container[app_id]` 单值索引已被 UserappBuilder 开发容器占用，

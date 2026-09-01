@@ -167,15 +167,6 @@ impl PortProxy {
                 )
                 .await?;
             }
-            RouteType::RuntimePgwebProxy => {
-                handlers::dev_terminal::handle_runtime_pgweb_request(
-                    upstream_request,
-                    original_uri,
-                    params,
-                    ctx,
-                )
-                .await?;
-            }
             RouteType::DevDbxProxy => {
                 handlers::dbx::handle_dev_dbx_request(upstream_request, original_uri, params, ctx)
                     .await?;
@@ -324,16 +315,6 @@ impl PortProxy {
             }
             RouteType::RuntimeTtydProxy => {
                 handlers::dev_terminal::handle_runtime_ttyd_upstream(
-                    ctx,
-                    params,
-                    &self.metrics,
-                    &self.container_lookup,
-                    &self.app_runtime_ip_slot,
-                )
-                .await
-            }
-            RouteType::RuntimePgwebProxy => {
-                handlers::dev_terminal::handle_runtime_pgweb_upstream(
                     ctx,
                     params,
                     &self.metrics,

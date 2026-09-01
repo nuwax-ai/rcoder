@@ -25,7 +25,7 @@ use crate::router::AppState;
 
 /// 重置容器内 PG 用户密码
 ///
-/// computer agent-runner 容器一用户一容器。用途: 用户忘记 pgweb 密码时重置
+/// computer agent-runner 容器一用户一容器。用途: 用户忘记数据库密码（DBX/PG）时重置
 /// —— psql 走容器内本地 trust 认证免密连上, 直接 ALTER USER 改密,
 /// 绕过"需要当前密码"的死锁。
 #[utoipa::path(

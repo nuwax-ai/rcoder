@@ -56,7 +56,7 @@ pub(super) fn proxy_api_routes(state: Arc<AppState>) -> Router {
             "/userapp/dev/dbx/{user_id}/{app_id}",
             get(handler::proxy_to_dev_dbx_redirect_root),
         )
-        // 生产域（运行容器，部署后的生产环境）：ttyd/pgweb/dbx
+        // 生产域（运行容器，部署后的生产环境）：ttyd/dbx
         .route(
             "/userapp/prod/ttyd/{user_id}/{app_id}/{*path}",
             get(handler::proxy_to_userapp_runtime_ttyd),
@@ -64,14 +64,6 @@ pub(super) fn proxy_api_routes(state: Arc<AppState>) -> Router {
         .route(
             "/userapp/prod/ttyd/{user_id}/{app_id}",
             get(handler::proxy_to_userapp_runtime_ttyd_redirect_root),
-        )
-        .route(
-            "/userapp/prod/pgweb/{user_id}/{app_id}/{*path}",
-            get(handler::proxy_to_userapp_runtime_pgweb),
-        )
-        .route(
-            "/userapp/prod/pgweb/{user_id}/{app_id}",
-            get(handler::proxy_to_userapp_runtime_pgweb_redirect_root),
         )
         .route(
             "/userapp/prod/dbx/{user_id}/{app_id}/{*path}",

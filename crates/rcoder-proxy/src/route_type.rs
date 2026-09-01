@@ -80,19 +80,18 @@ pub enum RouteType {
     DevImeProxy,
 
     /// userApp 生产域工具代理族（运行容器，部署后的生产环境）:
-    /// `/userapp/prod/{ttyd,pgweb,dbx}/{app_id}/{*path}`
+    /// `/userapp/prod/{ttyd,dbx}/{app_id}/{*path}`
     ///
     /// 按 **app_id** 定位 `ServiceType::Userapp` 运行容器（app-runtime 镜像），
     /// 与开发域工具族对称的生产场景入口（stage 段 `prod`，原 `/runtime` 静态段退役）：
     /// **ttyd**: `/userapp/prod/ttyd/{app_id}/{*path}` → 直连 ttyd 本体(7681, WS)；
     ///   运行容器无 agent_runner → 不经 ws_terminal(17681) 中间层
-    /// **pgweb**: `/userapp/prod/pgweb/{app_id}/{*path}` → 直连 pgweb(8081, HTTP)
     ///
     /// 定位走 find_app_runtime_addr（确定性命名构造——运行容器不进注册表，
     /// `project_to_container[app_id]` 单值键被 builder 占用）；K8s=Service FQDN
     /// （Pod 重建 DNS 自愈）。app 未部署/停止 → 上游连接失败 502。
+    /// （原 pgweb(8081) 成员已随 pgweb 退役删除，数据库控制台由 dbx 承担。）
     RuntimeTtydProxy,
-    RuntimePgwebProxy,
 
     /// DBX 数据库 Web GUI 两阶段代理族: `/userapp/{dev,prod}/dbx/{user_id}/{app_id}/{*path}`
     ///
@@ -106,7 +105,7 @@ pub enum RouteType {
     ///   （app-runtime 镜像）；find_app_runtime_addr 确定性命名构造，
     ///   未部署/停止 → 唤醒（wake-without-touch）或上游失败 502（同 prod 工具族）
     ///
-    /// 代理剥前缀直连 root 模式 dbx（同 pgweb）：前端 webPath.ts 从
+    /// 代理剥前缀直连 root 模式 dbx：前端 webPath.ts 从
     /// location.pathname 运行时推断 base，API/WS 自动拼回 `/userapp/{stage}/dbx/{user_id}/{app_id}`。
     DevDbxProxy,
     ProdDbxProxy,
