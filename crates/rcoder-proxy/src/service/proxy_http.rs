@@ -51,9 +51,11 @@ impl ProxyHttp for PortProxy {
                 tracker.touch(&app_id);
             }
             // ② 流量唤醒（stopped app 才触发；手动 stop 与闲置回收统一——
-            //    有请求即唤醒，见 AppWakeControl::ensure_running 语义）
+            //    有请求即唤醒，见 AppWakeControl::ensure_running 语义）。
+            //    is_stopped 为内存视图：多副本下其他副本 stop 后本副本不知情，
+            //    remote_stopped 兜底查集群真实 replicas（TTL 缓存节流）。
             if let Some(ref wc) = self.wake_control
-                && wc.is_stopped(&app_id)
+                && (wc.is_stopped(&app_id) || wc.remote_stopped(&app_id).await)
             {
                 tracing::info!(
                     "[WAKE] {} traffic wakes stopped app: {}",

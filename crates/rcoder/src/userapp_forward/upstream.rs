@@ -266,9 +266,10 @@ async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box
             .into_response(),
         ));
     }
-    // 唤醒（仅 stopped 真时触发——Running 高频文件操作零开销）
+    // 唤醒（仅 stopped 真时触发——Running 高频文件操作零开销）。is_stopped
+    // 为内存视图，remote_stopped 兜底多副本/重启后状态漂移（TTL 缓存节流）。
     use shared_types::AppWakeControl;
-    if state.activity.is_stopped(app_id) {
+    if state.activity.is_stopped(app_id) || state.activity.remote_stopped(app_id).await {
         match state.activity.ensure_running(app_id).await {
             shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
             shared_types::WakeOutcome::Timeout => {

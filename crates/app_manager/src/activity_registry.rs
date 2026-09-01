@@ -30,6 +30,32 @@ const WAKE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WAKE_FOLLOWER_GRACE: Duration = Duration::from_secs(10);
 /// leader 异常退出(panic)时广播给 follower 的失败原因
 const WAKE_LEADER_ABORTED: &str = "wake leader aborted";
+/// 集群真实状态兜底缓存 TTL（`remote_stopped` 查询节流，过期自动重查）
+const REMOTE_STATE_TTL: Duration = Duration::from_secs(30);
+/// 兜底缓存容量上限（防 app 海量时内存膨胀）
+const REMOTE_STATE_MAX_ENTRIES: u64 = 10_000;
+
+/// `get_deployment_status` 的兜底判定快照（多副本 stopped 事实源 = 集群 replicas）。
+#[derive(Debug, Clone, Copy, Default)]
+struct RemoteState {
+    stopped: bool,
+    /// K8s `wake_on_traffic==Some(false)` 注解：手动停档（回填 `wake_blocked` 而非 `stopped`，
+    /// 对齐 rebuild_stopped_apps 档位区分；Docker 形态恒 false）
+    manual_stop: bool,
+}
+
+impl RemoteState {
+    /// 已停、可被流量唤醒（闲置回收/软停档）
+    const WAKEABLE_STOPPED: Self = Self {
+        stopped: true,
+        manual_stop: false,
+    };
+    /// 手动停止档（K8s wake-on-traffic 注解为 false）
+    const MANUAL_STOPPED: Self = Self {
+        stopped: true,
+        manual_stop: true,
+    };
+}
 
 /// 进行中的唤醒句柄(leader 持有 `tx`,follower `subscribe` 后等结果)
 struct WakeHandle {
@@ -112,6 +138,10 @@ pub struct AppActivityRegistry {
     recycling: Arc<DashMap<String, Arc<Notify>>>,
     /// runtime 延迟注入(wake 需要 scale + 查 status;启动早期拿不到,故 OnceLock)
     runtime: OnceLock<Arc<dyn UserAppRuntime>>,
+    /// 集群真实状态兜底缓存(app_id → 快照;TTL 过期自动失效)。
+    /// 多副本下本进程内存表可能不知情其他副本的 stop,集群 replicas 是权威事实源。
+    /// sync 版 Cache:get/insert 均同步——mark_* 状态写点(同步方法)可直接刷新。
+    remote_state: moka::sync::Cache<String, RemoteState>,
     /// 唤醒 hold-and-wait 上限
     wake_timeout: Duration,
     /// touch 节流(可配,便于测试)
@@ -136,6 +166,10 @@ impl AppActivityRegistry {
             waking: Arc::new(DashMap::new()),
             recycling: Arc::new(DashMap::new()),
             runtime: OnceLock::new(),
+            remote_state: moka::sync::Cache::builder()
+                .time_to_live(REMOTE_STATE_TTL)
+                .max_capacity(REMOTE_STATE_MAX_ENTRIES)
+                .build(),
             wake_timeout,
             throttle,
         }
@@ -153,6 +187,8 @@ impl AppActivityRegistry {
         self.wake_blocked.remove(app_id);
         self.stopped.insert(app_id.to_string());
         self.note_dirty(app_id);
+        self.remote_state
+            .insert(app_id.to_string(), RemoteState::WAKEABLE_STOPPED);
     }
 
     /// 主动停止/发布切换：记录 scale0，但禁止流量自动拉起。
@@ -160,6 +196,8 @@ impl AppActivityRegistry {
         self.stopped.remove(app_id);
         self.wake_blocked.insert(app_id.to_string());
         self.note_dirty(app_id);
+        self.remote_state
+            .insert(app_id.to_string(), RemoteState::MANUAL_STOPPED);
     }
 
     /// 闲置回收完成后把停止状态转换为可由流量唤醒。
@@ -167,6 +205,8 @@ impl AppActivityRegistry {
         self.wake_blocked.remove(app_id);
         self.stopped.insert(app_id.to_string());
         self.note_dirty(app_id);
+        self.remote_state
+            .insert(app_id.to_string(), RemoteState::WAKEABLE_STOPPED);
     }
 
     /// 是否有进行中的唤醒(回收扫描器据此跳过,避免与 in-flight wake 竞态)
@@ -186,6 +226,7 @@ impl AppActivityRegistry {
         self.dirty.remove(app_id);
         self.deleted.insert(app_id.to_string());
         self.wake_blocked.remove(app_id);
+        self.remote_state.invalidate(app_id);
         if let dashmap::mapref::entry::Entry::Occupied(entry) =
             self.waking.entry(app_id.to_string())
         {
@@ -263,12 +304,31 @@ impl AppActivityRegistry {
         self.last_accessed.get(app_id).map(|r| *r)
     }
 
+    /// 合并跨副本访问时间（多副本回收判定用）：仅当 `t` 比本进程内存新才覆盖，
+    /// 返回合并后的有效值。不标脏（值来自 PG 影子行，无需回写）。
+    /// 覆盖内存是必须的：`try_begin_recycle` 按"内存值 == 判定时观测值"做
+    /// epoch 复核——不回写则 PG 较新时复核恒失败，app 永远无法回收。
+    pub fn merge_accessed(&self, app_id: &str, t: DateTime<Utc>) -> DateTime<Utc> {
+        // guard 物化到独立语句（scrutinee 临时值存活到 match 结束——match 内
+        // insert 会与持存的 read guard 抢同 shard 写锁，自死锁）
+        let cur = self.last_accessed.get(app_id).map(|r| *r);
+        match cur {
+            Some(c) if c >= t => c,
+            _ => {
+                self.last_accessed.insert(app_id.to_string(), t);
+                t
+            }
+        }
+    }
+
     /// 标记 app 为 Running(唤醒成功 / start_app / 外部 start 后调用,清 stopped 态 + 刷新访问时间)。
     pub fn mark_running(&self, app_id: &str) {
         self.stopped.remove(app_id);
         self.wake_blocked.remove(app_id);
         self.last_accessed.insert(app_id.to_string(), Utc::now());
         self.note_dirty(app_id);
+        self.remote_state
+            .insert(app_id.to_string(), RemoteState::default());
     }
 
     /// 仅供流量唤醒成功路径使用。
@@ -284,6 +344,30 @@ impl AppActivityRegistry {
         self.wake_blocked.remove(app_id);
         self.last_accessed.insert(app_id.to_string(), Utc::now());
         self.note_dirty(app_id);
+        self.remote_state
+            .insert(app_id.to_string(), RemoteState::default());
+        true
+    }
+
+    /// 集群快照为 stopped 时回填内存标记（幂等；manual_stop 档区分，对齐
+    /// rebuild_stopped_apps 语义）。不 note_dirty：多副本 PG 行本就存在
+    /// flush 互覆盖窗口，事实源已转集群；启动恢复由 rebuild_stopped_apps
+    /// 从集群注解重建，无需依赖本回填落库。
+    fn backfill_remote_state(&self, app_id: &str, state: RemoteState) -> bool {
+        if !state.stopped {
+            return false;
+        }
+        if state.manual_stop {
+            self.stopped.remove(app_id);
+            self.wake_blocked.insert(app_id.to_string());
+        } else {
+            self.wake_blocked.remove(app_id);
+            self.stopped.insert(app_id.to_string());
+        }
+        debug!(
+            "[ACTIVITY] remote stopped backfilled: app_id={app_id}, manual_stop={}",
+            state.manual_stop
+        );
         true
     }
 
@@ -413,6 +497,37 @@ impl AppWakeControl for AppActivityRegistry {
             || self.recycling.contains_key(app_id)
     }
 
+    /// 兜底判定：TTL 缓存命中零 IO；miss 查一次 `get_deployment_status`。
+    /// 查到 stopped 回填内存标记（manual_stop 档对齐 rebuild_stopped_apps），
+    /// 让本副本后续请求走内存快路，并使 `ensure_running` 的兜底分支自然
+    /// 衔接到 wake_leader。查询失败（API 瞬断）不缓存，行为退化同旧（仅
+    /// 内存视图）。
+    async fn remote_stopped(&self, app_id: &str) -> bool {
+        if let Some(state) = self.remote_state.get(app_id) {
+            return self.backfill_remote_state(app_id, state);
+        }
+        let Some(rt) = self.runtime.get().cloned() else {
+            return false;
+        };
+        let state = match rt.get_deployment_status(app_id).await {
+            // replicas==0 即停（K8s derive_phase 恒 Stopped；Docker stop 后同为 Stopped）
+            Ok(Some(s)) => RemoteState {
+                stopped: s.replicas <= 0,
+                manual_stop: s.wake_on_traffic == Some(false),
+            },
+            // app 不存在：非 stopped 负缓存（防幻报 app 每请求白查）
+            Ok(None) => RemoteState::default(),
+            Err(e) => {
+                warn!(
+                    "[ACTIVITY] remote state probe failed (fallback to memory view): app_id={app_id}: {e}"
+                );
+                return false;
+            }
+        };
+        self.remote_state.insert(app_id.to_string(), state);
+        self.backfill_remote_state(app_id, state)
+    }
+
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome {
         // 回收过渡期的请求必须等 scale0 完成，再由唤醒 single-flight scale1。
         self.wait_for_recycle_transition(app_id).await;
@@ -420,7 +535,12 @@ impl AppWakeControl for AppActivityRegistry {
         // 请求本身就是把 app 拉起来的授权；唤醒过程中新到的 stop 由
         // wake_leader 的竞争保护尊重（时间后到者赢）。
         if !self.stopped.contains(app_id) && !self.wake_blocked.contains(app_id) {
-            return WakeOutcome::AlreadyRunning;
+            // 多副本兜底：内存无记录不代表集群在跑（其他副本 stop 后本副本
+            // 不知情；本副本重启后未覆盖）。查集群真实 replicas（TTL 缓存
+            // 节流），查到 stopped 会回填内存标记，继续走下方唤醒流程。
+            if !self.remote_stopped(app_id).await {
+                return WakeOutcome::AlreadyRunning;
+            }
         }
         // 只在同步作用域内持有 DashMap entry guard，禁止 shard 锁跨越 await。
         let role = match self.waking.entry(app_id.to_string()) {
@@ -449,10 +569,11 @@ mod tests {
     use super::*;
     use Arc;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use container_runtime_api::{
-        ContainerRuntimeResult, DeploymentStatus, UserAppDeploymentRuntime, WorkspaceRuntime,
+        ContainerRuntimeError, ContainerRuntimeResult, DeploymentStatus, UserAppDeploymentRuntime,
+        WorkspaceRuntime,
     };
 
     /// 构造一个 DeploymentStatus(仅填测试关心字段)
@@ -475,6 +596,12 @@ mod tests {
         panic_on_nth: AtomicU32,
         // 互斥保护相位切换
         phase: StdMutex<String>,
+        // get_deployment_status 调用计数(remote_stopped TTL 缓存断言用)
+        status_calls: AtomicU32,
+        // 返回的 wake_on_traffic 注解值(manual_stop 档断言用)
+        wake_on_traffic: StdMutex<Option<bool>>,
+        // true 时 get_deployment_status 返回 Err(瞬断注入,验证 Err 不缓存)
+        fail_status: AtomicBool,
     }
 
     impl MockRuntime {
@@ -484,6 +611,9 @@ mod tests {
                 running_after_scale,
                 panic_on_nth: AtomicU32::new(0),
                 phase: StdMutex::new("Starting".to_string()),
+                status_calls: AtomicU32::new(0),
+                wake_on_traffic: StdMutex::new(None),
+                fail_status: AtomicBool::new(false),
             }
         }
     }
@@ -511,8 +641,20 @@ mod tests {
             &self,
             app_id: &str,
         ) -> ContainerRuntimeResult<Option<DeploymentStatus>> {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_status.load(Ordering::SeqCst) {
+                return Err(ContainerRuntimeError::ConnectionError(format!(
+                    "injected transient failure for {app_id}"
+                )));
+            }
             let phase = self.phase.lock().unwrap().clone();
-            Ok(Some(mk_status(app_id, &phase)))
+            let mut status = mk_status(app_id, &phase);
+            // 对齐集群语义:replicas==0 即 Stopped(remote_stopped 按 replicas 判定)
+            if phase == "Stopped" {
+                status.replicas = 0;
+            }
+            status.wake_on_traffic = *self.wake_on_traffic.lock().unwrap();
+            Ok(Some(status))
         }
     }
 
@@ -687,6 +829,117 @@ mod tests {
             outcome
         );
         assert!(!reg.is_stopped("app-p"));
+    }
+
+    // ── remote_stopped 多副本兜底（集群 replicas 为 stopped 事实源）──
+
+    /// 内存无任何标记（模拟其他副本 stop 后本副本不知情）+ 集群 replicas=0：
+    /// ensure_running 经兜底回填后正常唤醒。
+    #[tokio::test]
+    async fn remote_stopped_backfills_and_wakes_when_cluster_says_stopped() {
+        let rt = Arc::new(MockRuntime::new(true)); // scale 后转 Running
+        *rt.phase.lock().unwrap() = "Stopped".to_string();
+        let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
+        reg.set_runtime(rt.clone());
+        assert!(!reg.is_stopped("app-x"), "前置：内存视图无记录");
+
+        let outcome = reg.ensure_running("app-x").await;
+        assert!(matches!(outcome, WakeOutcome::Ready), "got {outcome:?}");
+        assert_eq!(rt.scale_calls.load(Ordering::SeqCst), 1);
+        assert!(!reg.is_stopped("app-x"), "唤醒成功后内存标记清除");
+    }
+
+    /// Running app 的兜底查询负缓存：TTL 内重复判定零额外集群查询。
+    #[tokio::test]
+    async fn remote_stopped_negative_cache_avoids_extra_queries() {
+        let rt = Arc::new(MockRuntime::new(true)); // phase Starting → replicas 1
+        let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
+        reg.set_runtime(rt.clone());
+
+        assert!(!reg.remote_stopped("app-run").await);
+        assert!(!reg.remote_stopped("app-run").await);
+        assert_eq!(
+            rt.status_calls.load(Ordering::SeqCst),
+            1,
+            "TTL 内第二次零额外查询"
+        );
+
+        // 内存也无记录 → ensure_running 走兜底（缓存命中 false，无 IO）
+        assert_eq!(
+            reg.ensure_running("app-run").await,
+            WakeOutcome::AlreadyRunning
+        );
+        assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 查询瞬断（Err）不缓存：下次调用重查，恢复后返回真实值。
+    #[tokio::test]
+    async fn remote_stopped_err_not_cached_retries_next_call() {
+        let rt = Arc::new(MockRuntime::new(true));
+        rt.fail_status.store(true, Ordering::SeqCst);
+        let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
+        reg.set_runtime(rt.clone());
+
+        assert!(!reg.remote_stopped("app-e").await, "瞬断退化为 false");
+        assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1);
+
+        rt.fail_status.store(false, Ordering::SeqCst);
+        assert!(
+            !reg.remote_stopped("app-e").await,
+            "恢复后重查（Err 未缓存）"
+        );
+        assert_eq!(rt.status_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// K8s wake_on_traffic==Some(false) 注解：回填 wake_blocked 档（非 stopped 档）。
+    #[tokio::test]
+    async fn remote_stopped_manual_stop_backfills_wake_blocked_tier() {
+        let rt = Arc::new(MockRuntime::new(true));
+        *rt.phase.lock().unwrap() = "Stopped".to_string();
+        *rt.wake_on_traffic.lock().unwrap() = Some(false);
+        let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
+        reg.set_runtime(rt);
+
+        assert!(reg.remote_stopped("app-m").await);
+        assert!(
+            reg.is_wake_blocked("app-m"),
+            "manual_stop 档回填 wake_blocked"
+        );
+    }
+
+    /// 本副本状态写点即时刷新兜底缓存（防 TTL 窗口旧值）。
+    #[tokio::test]
+    async fn mark_writes_refresh_remote_cache_immediately() {
+        let rt = Arc::new(MockRuntime::new(true));
+        let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
+        reg.set_runtime(rt.clone());
+        assert!(!reg.remote_stopped("app-c").await); // 查一次（Running）缓存 false
+        assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1);
+
+        reg.mark_wake_blocked("app-c"); // 本副本 stop → 缓存即时刷新
+        assert!(
+            reg.remote_stopped("app-c").await,
+            "mark 后缓存立即为 stopped"
+        );
+        assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1, "零额外集群查询");
+    }
+
+    /// 跨副本访问时间合并：PG 较新覆盖内存（并回写，保 epoch 复核），较旧保内存值。
+    #[test]
+    fn merge_accessed_takes_max_and_backfills_memory() {
+        let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(1));
+        let old_t = Utc::now() - chrono::Duration::hours(10);
+        let new_t = Utc::now() - chrono::Duration::minutes(1);
+        reg.last_accessed.insert("app-g".to_string(), old_t);
+
+        // PG 较新 → 覆盖内存并返回新值
+        assert_eq!(reg.merge_accessed("app-g", new_t), new_t);
+        assert_eq!(reg.last_accessed_at("app-g"), Some(new_t), "新值已回写内存");
+
+        // PG 较旧 → 保内存新值（返回值仍为较新者）
+        let stale_t = old_t - chrono::Duration::hours(1);
+        assert_eq!(reg.merge_accessed("app-g", stale_t), new_t);
+        assert_eq!(reg.last_accessed_at("app-g"), Some(new_t), "旧值不覆盖");
     }
 
     /// 验证 Fix3:leader 中途 panic(result 未写入)时,`WakeGuard` drop 必须广播 `Failed`,

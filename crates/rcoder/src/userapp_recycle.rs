@@ -1,18 +1,20 @@
-//! Userapp 闲置自动回收扫描器（后台定时任务）。
+//! Userapp 闲置自动回收扫描器（后台定时任务，leader 副本运行）。
 //!
 //! 周期枚举所有 Running Userapp,比对 `last_accessed_at` 与阈值,闲置超阈值 → `stop_app`(scale0,
 //! 不删 PVC/Service/路由)。付费 app(`recycle_enabled=false` 注解)opt-out 跳过;进行中的唤醒跳过;
 //! 龄期 < protection 跳过;从未访问(None)跳过 grace。
 //!
 //! 闲置信号来自 pingora 热路径 `AppAccessTracker::touch`(经 [`AppActivityRegistry`] 维护)。
-//! 回收 = scale-to-zero,数据零风险;唤醒由 pingora `request_filter` 的 wake-on-traffic 负责。
+//! 多副本下 touch 分摊在各副本内存，leader 每轮扫描从 PG 影子行合并最新值（`merge_accessed`），
+//! 防活跃流量全落其他副本时误回收。回收 = scale-to-zero,数据零风险;唤醒由 pingora
+//! `request_filter` 的 wake-on-traffic 负责。
 //!
 //! 回收判定逻辑抽成纯函数 [`decide_recycle`](见模块底),不依赖 AppState/K8s,便于单测覆盖所有分支。
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
 use crate::router::AppState;
@@ -68,14 +70,41 @@ impl UserAppRecycleScanner {
             .list_all_app_runtimes()
             .await
             .map_err(|e| anyhow::anyhow!("list_all_app_runtimes: {e}"))?;
+        // 多副本：touch 分摊在各副本内存（leader 眼里只有落在本副本的流量），
+        // 跨副本合并经 PG 影子行——各副本 5s flusher 落库，leader 每轮扫描
+        // 读一次最新值取 max（防活跃流量全落其他副本时误回收）。非 PG 模式
+        // 退化为纯内存判定（单副本部署，无跨副本问题）。
+        let pg_accessed: std::collections::HashMap<String, DateTime<Utc>> = match self
+            .state
+            .activity
+            .persistence()
+        {
+            Some(p) => match p.load_all().await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter_map(|r| r.last_accessed.map(|t| (r.app_id, t)))
+                    .collect(),
+                Err(e) => {
+                    warn!(
+                        "[USERAPP_RECYCLE] load activity rows failed, fallback to memory-only view: {e}"
+                    );
+                    Default::default()
+                }
+            },
+            None => Default::default(),
+        };
         // 闲置时长按 wall-clock 计算（last_accessed 为 DateTime，可跨重启持久化）；
         // 负值（时钟回拨）按 0 处理
-        let now = chrono::Utc::now();
+        let now = Utc::now();
         let mut recycled = 0usize;
 
         for app in apps {
             let age = app.created_at.as_deref().and_then(age_of);
-            let last_accessed = self.state.activity.last_accessed_at(&app.app_id);
+            // PG 较新时 merge_accessed 会回写内存（保 try_begin_recycle 的 epoch 复核）
+            let last_accessed = match pg_accessed.get(&app.app_id) {
+                Some(pg_t) => Some(self.state.activity.merge_accessed(&app.app_id, *pg_t)),
+                None => self.state.activity.last_accessed_at(&app.app_id),
+            };
             let idle =
                 last_accessed.map(|t| now.signed_duration_since(t).to_std().unwrap_or_default());
             let decision = decide_recycle(
@@ -128,7 +157,7 @@ impl UserAppRecycleScanner {
 /// RFC3339 创建时间 → 至今的龄期(future/解析失败 → None)
 fn age_of(created_at: &str) -> Option<Duration> {
     let t = DateTime::parse_from_rfc3339(created_at).ok()?;
-    let diff = chrono::Utc::now().signed_duration_since(t);
+    let diff = Utc::now().signed_duration_since(t);
     diff.to_std().ok()
 }
 
@@ -397,7 +426,7 @@ mod tests {
 
     #[test]
     fn age_of_parses_rfc3339_past() {
-        let t = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let t = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         let age = age_of(&t).expect("past date parses");
         // ~3600s,留容差
         assert!(age >= Duration::from_secs(3500) && age <= Duration::from_secs(3700));
@@ -406,7 +435,7 @@ mod tests {
     #[test]
     fn age_of_future_returns_none() {
         // future → signed_duration_since 为负 → to_std 失败 → None
-        let t = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let t = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
         assert!(age_of(&t).is_none());
     }
 
