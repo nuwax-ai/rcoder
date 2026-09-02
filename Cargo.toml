@@ -296,9 +296,10 @@ encoding_rs = "0.8"
 mime_guess = "2"
 
 # Git (file-server, 纯 Rust; gitoxide 0.85 源码可参考)
-# ⚠️ 不能升 0.87.1：上游已移除 tree-editor feature（write.rs 的 edit_tree 依赖它），
-# 升级需重写树编辑逻辑；bisync yanked 随之搁置（非漏洞），等上游迁移路径明朗
-gix = { version = "0.86", features = ["tree-editor"] }
+# 0.87 起 tree-editor feature 名被上游移除（API 本体无条件可用——MSRV 超过 1.75 后
+# 不再需要 gate，见 gitoxide 3a4350cd），声明里不得再带该 feature；
+# 升级同时带走 gix-protocol 0.65.1（其依赖已无 bisync yanked）
+gix = "0.87.1"
 
 # i18n (国际化)
 rust-i18n = "4"
