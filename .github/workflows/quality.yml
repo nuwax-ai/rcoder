@@ -1,0 +1,49 @@
+# 质量门禁 CI：格式 / Lint / 依赖安全 / 许可证合规
+# 口径分两档:
+#   拦截档（失败即红）: fmt / clippy -D warnings / vulnerability / 违禁许可证 / 未知来源
+#   观察档（只警告）: unmaintained 依赖、重复版本（bans.multiple-versions=warn）
+# 存量清理完后可将 audit 加 --deny-warnings、deny 的 bans 拉严。
+# 注意: 当前存在已知存量漏洞（h2/protobuf，见体检报告）——修复前本 CI 的
+# audit/deny 步骤会是红的；若需临时放行，给对应步骤加 continue-on-error: true。
+name: quality
+
+on:
+  push:
+    branches: [main, "feature-*"]
+  pull_request:
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  quality:
+    name: fmt + clippy + audit + deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Install cargo-audit / cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo audit (vulnerabilities fail, unmaintained warn)
+        run: cargo audit
+
+      - name: cargo deny (licenses/sources/advisories)
+        run: cargo deny check

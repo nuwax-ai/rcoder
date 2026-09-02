@@ -16,6 +16,7 @@
 	update-image-tag \
 	test test-unit test-integration test-all test-blocking \
 	test-ebpf-install test-ebpf-no-install test-ebpf-debug test-pyroscope-offcpu \
+	audit deny geiger quality coverage fuzz \
 	pyroscope-up pyroscope-down pyroscope-logs \
 	agent-runner-up agent-runner-down agent-runner-logs agent-runner-restart agent-runner-status \
 	console-on console-off \
@@ -29,6 +30,7 @@ include make/devspace.mk
 include make/k8s.mk
 include make/k8s-offline.mk
 include make/test.mk
+include make/quality.mk
 include make/pyroscope.mk
 include make/agent-runner.mk
 
@@ -142,6 +144,14 @@ help:
 	@echo "  make test-integration - 运行集成测试"
 	@echo "  make test-blocking  - 运行极端场景测试（包含阻塞）"
 	@echo "  make test-all       - 运行完整测试套件（所有 features）"
+	@echo ""
+	@echo "🔍 质量检查："
+	@echo "  make audit     - 依赖安全公告扫描（RustSec）"
+	@echo "  make deny      - 许可证/重复版本/来源检查（deny.toml）"
+	@echo "  make geiger    - 依赖 unsafe 审计（首次编译较慢）"
+	@echo "  make quality   - audit + deny + geiger 一键三连"
+	@echo "  make coverage  - 测试覆盖率 HTML 报告（llvm-cov，排除 e2e）"
+	@echo "  make fuzz      - 模糊测试冒烟（默认每目标 60s；FUZZ_SECONDS/FUZZ_TARGET 可调）"
 	@echo ""
 	@echo "开发模式工作流程（推荐使用 DevSpace）："
 	@echo "  DevSpace 模式（增量编译、自动同步）："

@@ -1,0 +1,38 @@
+[package]
+name = "rcoder-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.shared_types]
+path = "../crates/shared_types"
+
+# 独立 workspace：隔离于主 workspace（主 members 为 crates/* + tests-e2e，不含 fuzz）
+[workspace]
+
+[[bin]]
+name = "fuzz_quantity"
+path = "fuzz_targets/fuzz_quantity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_semver"
+path = "fuzz_targets/fuzz_semver.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_chat_config"
+path = "fuzz_targets/fuzz_chat_config.rs"
+test = false
+doc = false
+bench = false

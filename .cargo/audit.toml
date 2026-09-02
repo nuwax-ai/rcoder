@@ -1,0 +1,8 @@
+# cargo-audit 项目级配置（cargo audit 自动读取；与 deny.toml 的同类豁免保持同步）
+[advisories]
+ignore = [
+    # protobuf 2.28.0（RUSTSEC-2024-0437 递归崩溃）锁死于 prometheus 0.13.4 → pingora 0.8.1
+    # 传递链，pingora 上游最新即 0.8.1 无可升级路径（2026-09 拍板搁置）；
+    # prometheus 仅在指标 encode 方向使用 protobuf、攻击面窄。pingora 升级后移除本条。
+    "RUSTSEC-2024-0437",
+]
