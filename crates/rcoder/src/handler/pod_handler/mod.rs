@@ -38,6 +38,7 @@ mod stop;
 #[cfg(test)]
 mod tests;
 mod types;
+mod vnc_status;
 
 pub use ensure::*;
 pub(crate) use helpers::resolve_resource_limits_from_config;
@@ -55,3 +56,4 @@ pub use restart::*;
 pub use status::*;
 pub use stop::*;
 pub use types::*;
+pub use vnc_status::*;
