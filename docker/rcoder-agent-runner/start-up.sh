@@ -771,8 +771,9 @@ function start_vnc_services() {
 #   + gio metadata (metadata::trusted=true + metadata::xfce-exe-checksum)。
 # 历史两轮误判, 机制结论:
 #   - 7a39a79 只靠文件属性删 gio → 新图标/新 PVC 必弹 (旧图标靠 PVC 残留旧 metadata 幸免);
-#   - checksum 须为 sha256(Exec 行字符串)——误写 sha256(整个文件) 时校验不等 →
-#     xfdesktop 判 "launcher 被篡改" → 概率性弹 untrusted。
+#   - checksum 形态=sha256(整个文件字节流)(libxfce4util xfce_g_file_create_checksum
+#     源码实锤; 02228da 曾误判为 Exec 行 sha256 致 0.1.251 全量弹, 已回滚);
+#     is_trusted=FALSE 时 thunar 拒按 launcher 渲染(图标空白文档样式)且双击弹窗。
 # metadata 持久化在 PVC (~/.local/share/gvfs-metadata), 正常启动每次重写自愈
 # (内容漂移对齐后 checksum 同批刷新); 热修改文件后需重跑本函数或重启容器。
 function trust_desktop_icons() {
@@ -802,14 +803,15 @@ function trust_desktop_icons() {
     if [ "$_gvfs_ready" = "1" ]; then
         for f in /home/user/Desktop/*.desktop; do
             [ -f "$f" ] || continue
-            # xfce-exe-checksum 期望 sha256(Exec 行字符串)——曾误写 sha256(整个文件),
-            # 校验不等 → xfdesktop 判定 "launcher 被篡改" → 双击概率性弹 untrusted。
-            local _exec_line="$(grep -m1 '^Exec=' "$f" | cut -d= -f2-)"
-            local cksum="$(printf '%s' "$_exec_line" | sha256sum | cut -d' ' -f1)"
+            # checksum 形态=sha256(整个文件字节流)——libxfce4util 源码实锤
+            # (xfce_g_file_create_checksum 逐字节读文件做 SHA-256; is_trusted 只比对
+            # xfce-exe-checksum, metadata::trusted 不参与判定仅仪式值; 无 checksum 属性
+            # =必弹。02228da 曾误改为 sha256(Exec 行) → 0.1.251 全量弹 untrusted, 此处回滚)。
+            local cksum="$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)"
             [ -n "$cksum" ] && gio set "$f" metadata::xfce-exe-checksum "$cksum" 2>/dev/null || true
             gio set "$f" metadata::trusted true 2>/dev/null || true
         done
-        log_success "Desktop icons trusted (XFCE 4.18 五件套: uid+755+DBUS+checksum(Exec行)+trusted)"
+        log_success "Desktop icons trusted (XFCE 4.18: uid+755+DBUS+checksum(整文件)+trusted)"
         # 3) 刷新 xfdesktop 缓存: gio set 写在 xfdesktop 启动之后, 它已缓存旧信任状态;
         #    用 session env 重启 xfdesktop 让它重读 metadata (aaf10f4 的 refresh, 7a39a79 误删)。
         if pgrep -x xfdesktop >/dev/null 2>&1; then
