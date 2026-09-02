@@ -33,7 +33,7 @@ pub enum RouteType {
     /// - `/proxy/3000/`
     PortProxy,
 
-    /// userApp 生产应用流量代理（免端口）: `/proxy/userapp/prod/{user_id}/{app_id}/{*path}`
+    /// userApp 生产应用流量代理（免端口）: `/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}/{*path}`
     ///
     /// - `user_id`: 用户 ID（不参与解析；日志排障/归属鉴权锚点）
     /// - `app_id`: 应用 ID（`app_backends` 注册表定位 Userapp 运行容器）
@@ -44,10 +44,10 @@ pub enum RouteType {
     /// 一个已注册 HTTP 端口时回退用之（防御直接 REST create 自定义端口），否则 502。
     /// request_filter 对本路由做访问追踪 + 停止唤醒。
     ///
-    /// **示例**: `/proxy/userapp/prod/6/app-1a2b3c4d/api/users`
+    /// **示例**: `/api/v1/userapp/proxy/app/prod/6/app-1a2b3c4d/api/users`
     ProdAppProxy,
 
-    /// userApp 开发应用流量代理（免端口）: `/proxy/userapp/dev/{user_id}/{app_id}/{*path}`
+    /// userApp 开发应用流量代理（免端口）: `/api/v1/userapp/proxy/app/dev/{user_id}/{app_id}/{*path}`
     ///
     /// - `user_id`: 用户 ID（不参与解析；日志排障/归属鉴权锚点）
     /// - `app_id`: 应用 ID（动态解析该 app 的开发容器（UserappBuilder，per-app））
@@ -57,20 +57,20 @@ pub enum RouteType {
     /// manifest 流程恒定 9080，调用方无需传端口；与 ProdAppProxy（运行容器）
     /// 对称的开发预览入口，切环境只改 `dev→prod` 一段。
     ///
-    /// **示例**: `/proxy/userapp/dev/6/app-1a2b3c4d/api/users`
+    /// **示例**: `/api/v1/userapp/proxy/app/dev/6/app-1a2b3c4d/api/users`
     DevAppProxy,
 
-    /// userApp 开发域工具代理族: `/userapp/dev/{ttyd,vnc,audio,ime,dbx}/{app_id}/{*path}`
+    /// userApp 开发域工具代理族: `/api/v1/userapp/proxy/{ttyd,vnc,audio,ime,dbx}/dev/{user_id}/{app_id}/{*path}`
     ///
     /// 按 **app_id** 定位该 app 的 UserappBuilder 开发容器（镜像同款：ttyd/noVNC/
     /// 音频/IME/DBX 全套），与 computer 族（user_id 定位沙箱）对称的开发场景入口；
-    /// stage 段 `dev` 与 prod 工具族/流量族 `/proxy/userapp/{dev,prod}` 语义统一。
+    /// stage 段 `dev` 与 prod 工具族/流量族语义统一（切环境只改一段）。
     ///
-    /// **ttyd**: `/userapp/dev/ttyd/{app_id}/{*path}` → 容器 ws_terminal(17681) → ttyd 本体；
+    /// **ttyd**: `.../proxy/ttyd/dev/{user_id}/{app_id}/{*path}` → 容器 ws_terminal(17681) → ttyd 本体；
     ///   终端 cwd = 开发卷 `{USERAPP_WORKSPACE_ROOT}/{app_id}`（X-Ttyd-Service-Type 注入）
-    /// **vnc**: `/userapp/dev/vnc/{app_id}/{*path}` → 容器 noVNC(6080, HTTP+WS)
-    /// **audio**: `/userapp/dev/audio/{app_id}/{*path}` → ws* 6089 流 / 其余 6090 静态
-    /// **ime**: `/userapp/dev/ime/{app_id}/{*path}` → 容器 IME(6091, WebSocket)
+    /// **vnc**: `.../proxy/vnc/dev/{user_id}/{app_id}/{*path}` → 容器 noVNC(6080, HTTP+WS)
+    /// **audio**: `.../proxy/audio/dev/{user_id}/{app_id}/{*path}` → ws* 6089 流 / 其余 6090 静态
+    /// **ime**: `.../proxy/ime/dev/{user_id}/{app_id}/{*path}` → 容器 IME(6091, WebSocket)
     ///
     /// 定位走 find_by_project_id(app_id, UserappBuilder)（注册表），miss → 404
     /// （提示先创建 workspace）；不走 vnc_backends（user_id 键空间，防撞键）。
@@ -80,11 +80,11 @@ pub enum RouteType {
     DevImeProxy,
 
     /// userApp 生产域工具代理族（运行容器，部署后的生产环境）:
-    /// `/userapp/prod/{ttyd,dbx}/{app_id}/{*path}`
+    /// `/api/v1/userapp/proxy/{ttyd,dbx}/prod/{user_id}/{app_id}/{*path}`
     ///
     /// 按 **app_id** 定位 `ServiceType::Userapp` 运行容器（app-runtime 镜像），
     /// 与开发域工具族对称的生产场景入口（stage 段 `prod`，原 `/runtime` 静态段退役）：
-    /// **ttyd**: `/userapp/prod/ttyd/{app_id}/{*path}` → 直连 ttyd 本体(7681, WS)；
+    /// **ttyd**: `.../proxy/ttyd/prod/{user_id}/{app_id}/{*path}` → 直连 ttyd 本体(7681, WS)；
     ///   运行容器无 agent_runner → 不经 ws_terminal(17681) 中间层
     ///
     /// 定位走 find_app_runtime_addr（确定性命名构造——运行容器不进注册表，
@@ -93,20 +93,20 @@ pub enum RouteType {
     /// （原 pgweb(8081) 成员已随 pgweb 退役删除，数据库控制台由 dbx 承担。）
     RuntimeTtydProxy,
 
-    /// DBX 数据库 Web GUI 两阶段代理族: `/userapp/{dev,prod}/dbx/{user_id}/{app_id}/{*path}`
+    /// DBX 数据库 Web GUI 两阶段代理族: `/api/v1/userapp/proxy/dbx/{dev,prod}/{user_id}/{app_id}/{*path}`
     ///
     /// dbx-web（60+ 数据库 GUI，两镜像 supervisor 恒起 :4224）按 **app_id** 定位，
     /// **user_id** 是 dev 懒创建显式 owner 档（`dev/{user_id}/{app_id}` 宿主树分区）
     /// 与 prod 归属校验锚点；stage 段区分定位方式（归入工具族 stage 语义）：
-    /// **dev**: `/userapp/dev/dbx/{user_id}/{app_id}/{*path}` → UserappBuilder 开发容器
+    /// **dev**: `.../proxy/dbx/dev/{user_id}/{app_id}/{*path}` → UserappBuilder 开发容器
     ///   （agent-runner 镜像）；注册表 find_by_project_id(app_id, UserappBuilder)，
     ///   未建 workspace → 404（同 dev 工具族）
-    /// **prod**: `/userapp/prod/dbx/{user_id}/{app_id}/{*path}` → Userapp 运行容器
+    /// **prod**: `.../proxy/dbx/prod/{user_id}/{app_id}/{*path}` → Userapp 运行容器
     ///   （app-runtime 镜像）；find_app_runtime_addr 确定性命名构造，
     ///   未部署/停止 → 唤醒（wake-without-touch）或上游失败 502（同 prod 工具族）
     ///
     /// 代理剥前缀直连 root 模式 dbx：前端 webPath.ts 从
-    /// location.pathname 运行时推断 base，API/WS 自动拼回 `/userapp/{stage}/dbx/{user_id}/{app_id}`。
+    /// location.pathname 运行时推断 base，API/WS 自动拼回完整代理前缀。
     DevDbxProxy,
     ProdDbxProxy,
 

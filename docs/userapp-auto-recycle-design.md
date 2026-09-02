@@ -39,7 +39,7 @@ UserApp 全量业务接口已验证通过。长期运行的 UserApp 占用 K8s �
 
 - **R1 自动回收**：闲置超过阈值的 Running UserApp → scale replicas 0。仅回收 `managed-by=rcoder-app-manager` 的 Deployment；跳过 `protection_seconds` 内新建的 app。
 - **R2 配置开关**：全局 `enabled`(默认 true，可由部署侧关闭) + `idle_timeout_seconds`(默认 432000=5天) + `scan_interval_seconds`(默认 3600) + `wake_timeout_seconds`(默认 60) + `protection_seconds`(默认 300)。
-- **R3 流量唤醒**：仅由空闲回收产生的 stopped UserApp 收到 `/proxy/userapp/prod/{user_id}/{id}/...`（应用流量族，touch）或 `/userapp/prod/{tool}/{user_id}/{id}/...`（工具族，wake-without-touch）请求时，自动 scale 1 → 轮询 Ready（上限 `wake_timeout`）→ Ready 后正常代理；超时返回 503+`Retry-After: 15`。用户手动停止和发布切换期间禁止流量唤醒。
+- **R3 流量唤醒**：仅由空闲回收产生的 stopped UserApp 收到 `/api/v1/userapp/proxy/app/prod/{user_id}/{id}/...`（应用流量族，touch）或 `/api/v1/userapp/proxy/{tool}/prod/{user_id}/{id}/...`（工具族，wake-without-touch）请求时，自动 scale 1 → 轮询 Ready（上限 `wake_timeout`）→ Ready 后正常代理；超时返回 503+`Retry-After: 15`。用户手动停止和发布切换期间禁止流量唤醒。
 - **R4 per-app 回收策略（付费/免费分层）**：默认所有 UserApp **可回收**（= 免费用户语义）。允许对**单独 app** 设为不回收——通过 `CreateAppRequest`/`UpdateAppRequest` 的 `recycle_enabled: Option<bool>` 字段（rcoder 持久化为 Deployment 注解 `rcoder.io/recycle-enabled`），`false` = **永不回收**（付费 / 需常驻的 app）。另支持 `idle_timeout_seconds: Option<u64>` 字段（注解 `rcoder.io/idle-timeout-seconds`）覆盖全局阈值。**rcoder 不感知"付费/免费"业务概念**，只看布尔；tier→bool 映射由 Java 调用方决定（付费 → `recycle_enabled=false`）。
 
 ### 1.3 非目标
@@ -116,7 +116,7 @@ pub struct AppActivityRegistry {
 
 **目的**：记录每个 app 的最近访问时间，作为闲置判断的唯一信号源。
 
-- pingora `request_filter`（[mod.rs:113](../../crates/rcoder-proxy/src/service/mod.rs)）解析路径，对 `/proxy/userapp/prod/{user_id}/{app_id}/...` 路由调 `tracker.touch(app_id)`。
+- pingora `request_filter`（[mod.rs:113](../../crates/rcoder-proxy/src/service/mod.rs)）解析路径，对 `/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}/...` 路由调 `tracker.touch(app_id)`。
 - **节流**：`touch` 内部仅当 `now - last > 5s` 才写 DashMap，避免高 QPS 下的锁竞争（entry API）。
 - 非	app 路由（VNC/project/api 等）不 touch。
 - DI：照 `container_lookup` 模式（[mod.rs:72/102](../../crates/rcoder-proxy/src/service/mod.rs)），`PingoraProxyService` + `PortProxy` 各加一个 `access_tracker: Option<Arc<dyn AppAccessTracker>>` 字段，经 `PingoraProxyService::new` 注入。
@@ -179,7 +179,7 @@ request_filter(session):
 ```rust
 #[async_trait]
 pub trait AppAccessTracker: Send + Sync {
-    /// 更新最近访问（内部节流）；仅 /proxy/userapp/prod/* 路由调用
+    /// 更新最近访问（内部节流）；仅 /api/v1/userapp/proxy/app/prod/* 路由调用
     fn touch(&self, app_id: &str);
 }
 
@@ -295,7 +295,7 @@ pub struct UserAppRecycleConfig {
 1. **静态**：`cargo fmt --check` + `cargo clippy --default-features --features kubernetes`（零 warning）+ `cargo test`（全绿，含新增 activity_registry 单测）。
 2. **229 E2E**（Pingora 模式，NodePort 30435）：
    - **回收**：`enabled=true`，`idle_timeout_seconds=120`（测试用短阈值），发布一个 app → 停止访问 > 2min → 扫描器 scale0 → `kubectl get deploy` replicas=0，PVC/Service 仍在 → `stopped_apps` 含该 id。
-   - **唤醒**：空闲回收 scale0 后 `curl http://192.168.32.229:30435/proxy/userapp/prod/{user_id}/{id}/...` → hold-and-wait ≤60s → 200，Deployment replicas 回 1。
+   - **唤醒**：空闲回收 scale0 后 `curl http://192.168.32.229:30435/api/v1/userapp/proxy/app/prod/{user_id}/{id}/...` → hold-and-wait ≤60s → 200，Deployment replicas 回 1。
    - **手动停止隔离**：调用 stop API 后访问代理路径 → 返回 503，Deployment 持续 replicas=0；显式 start 后恢复。
    - **超时**：人为让 app 启动失败（坏 command）→ wake 60s 超时 → 客户端收 503+Retry-After。
    - **并发合流**：stopped app 并发 5 请求 → 仅 1 次 scale-up（日志/事件验证）。

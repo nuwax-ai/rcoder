@@ -1,4 +1,4 @@
-//! userApp 开发域工具代理（`/userapp/dev/{ttyd,vnc,audio,ime}/{app_id}` 族；prod 工具族与本族同形态）。
+//! userApp 开发域工具代理（`/api/v1/userapp/proxy/{ttyd,vnc,audio,ime}/dev/{user_id}/{app_id}` 族；prod 工具族与本族同形态）。
 //!
 //! 与 computer 族（`/computer/*`，按 user_id 定位沙箱）对称的开发场景入口：
 //! 按 **app_id** 定位该 app 的 UserappBuilder 开发容器（镜像同款——内含
@@ -376,7 +376,7 @@ pub async fn handle_dev_ime_upstream(
 
 // ── 运行容器（部署后的生产环境）───────────────────────────────────────────────
 //
-// `/userapp/prod/{ttyd,...}/{app_id}/{*path}`：与上面的开发域工具族对称，
+// `/api/v1/userapp/proxy/{ttyd,...}/prod/{user_id}/{app_id}/{*path}`：与上面的开发域工具族对称，
 // 但目标是 `ServiceType::Userapp` 运行容器（app-runtime 镜像）。两处关键差异：
 // 1. 定位走 `find_app_runtime_addr`（确定性命名构造）——运行容器不进 projects
 //    注册表（project_to_container[app_id] 单值键被 builder 占用）；
@@ -423,7 +423,7 @@ pub(crate) async fn find_runtime_addr(
     })
 }
 
-/// `/userapp/prod/ttyd/{app_id}/{*path}` 请求重写（直连 ttyd 本体 7681）。
+/// `/api/v1/userapp/proxy/ttyd/prod/{app_id}/{*path}` 请求重写（直连 ttyd 本体 7681）。
 ///
 /// 定位在 upstream 阶段完成（pingora 生命周期 `upstream_peer` 先于
 /// `upstream_request_filter`——与开发域 ttyd/vnc 同构），此处只重写 URI/Host。

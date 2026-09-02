@@ -88,7 +88,7 @@ pub async fn list_app_runtimes(
     description = r#"
 实时查询单个应用的运行时全量快照：phase / replicas / 健康状态（含实例 IP）、
 端口与访问地址（`access.external.http` 等，Pingora 模式返回
-`/proxy/userapp/prod/{user_id}/{app_id}` 形态）、release 与制品摘要。
+`/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}` 形态）、release 与制品摘要。
 
 - 与 `GET /runtime` 的区别：本接口是**单条实时**查询，对账列表是集群全量；
 - 不存在 → 404；查询失败（集群不可达）→ 500。

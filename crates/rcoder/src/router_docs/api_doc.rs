@@ -257,7 +257,7 @@ use crate::handler;
         (name = "Userapp · 双态 · 日志", description = "dev/prod 双态（路径 {app_stage} 段分派）：日志源、检索与 SSE 实时流，转发容器内 app-cli"),
         (name = "Userapp · 双态 · 数据库", description = "dev/prod 双态（路径 {app_stage} 段分派）：应用 PostgreSQL 凭据对齐/改密/建库"),
         (name = "Userapp · 双态 · 生命周期", description = "dev/prod 双态（路径 {app_stage} 段分派）：健康/统计/事件、回收策略与删除"),
-        (name = "Userapp · 访问入口", description = "流量代理（/proxy/userapp/{dev,prod}，前端切换只改 dev→prod 一段）与终端代理路由速查表"),
+        (name = "Userapp · 访问入口", description = "流量代理（/api/v1/userapp/proxy/app/{dev,prod}，前端切换只改 dev→prod 一段）与终端代理路由速查表"),
         (name = "computer", description = "Computer Agent 桌面、聊天与容器内 PG 管理接口；chat 与 agent 族（status/stop/cancel/notify-resolved/cache/clean）支持 service_type=userapp + app_id 分派（仅 dev 阶段）"),
         (name = "pod", description = "Pod 容器管理接口（监控/保活/重启；支持 service_type=userapp 分派 dev/prod 容器）"),
         (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),

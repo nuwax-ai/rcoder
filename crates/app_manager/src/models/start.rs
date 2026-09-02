@@ -22,7 +22,7 @@ pub struct StartAppRequest {
     /// owner 用户 ID（必填；标识符白名单校验）。start/restart 显式传值直接落
     /// 容器 create params——Docker compose 数据卷 bind 源
     /// `prod/{user_id}/data/{app_id}` 分区依据；同批注册 `userapp_metadata`，
-    /// 供 `/proxy/userapp/prod/{user_id}/...` URL 拼接与"我的应用"归属过滤。
+    /// 供 `/api/v1/userapp/proxy/app/prod/{user_id}/...` URL 拼接与"我的应用"归属过滤。
     /// （metadata 回退→runtime 兜底 app_id 的孤儿目录路径已随必填化退役。）
     #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,

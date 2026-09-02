@@ -61,7 +61,7 @@ fn dbx_peer(container_addr: &str) -> Box<HttpPeer> {
     Box::new(peer)
 }
 
-/// `/userapp/dev/dbx/{user_id}/{app_id}/{*path}` 请求重写（定位在 upstream 阶段完成）。
+/// `/api/v1/userapp/proxy/dbx/dev/{user_id}/{app_id}/{*path}` 请求重写（定位在 upstream 阶段完成）。
 pub async fn handle_dev_dbx_request(
     upstream_request: &mut RequestHeader,
     original_uri: &http::Uri,
@@ -97,7 +97,7 @@ pub async fn handle_dev_dbx_upstream(
     Ok(dbx_peer(&container_addr))
 }
 
-/// `/userapp/prod/dbx/{user_id}/{app_id}/{*path}` 请求重写。
+/// `/api/v1/userapp/proxy/dbx/prod/{user_id}/{app_id}/{*path}` 请求重写。
 pub async fn handle_prod_dbx_request(
     upstream_request: &mut RequestHeader,
     original_uri: &http::Uri,

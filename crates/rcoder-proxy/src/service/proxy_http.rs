@@ -31,11 +31,11 @@ impl ProxyHttp for PortProxy {
     ///
     /// 两类 prod 路由触发唤醒（stopped app → `ensure_running` hold-and-wait ≤60s
     /// 拉起；超时/失败 → 503+Retry-After）：
-    /// - `/proxy/userapp/prod/{user_id}/{app_id}/...` 应用业务流量：**touch + wake**
-    ///   （touch 记录最近访问，是闲置回收的信号源）；
-    /// - `/userapp/prod/{ttyd,dbx}/{app_id}` 工具族：**只 wake 不 touch**
-    ///   （终端/DB 客户端连接不算业务活跃——挂终端不阻止闲置回收，回收后下次
-    ///   连接自动唤醒再转发，ttyd 前端自动重连兜底首连窗口）。
+    /// - `/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}/...` 应用业务流量：
+    ///   **touch + wake**（touch 记录最近访问，是闲置回收的信号源）；
+    /// - `/api/v1/userapp/proxy/{ttyd,dbx}/prod/{user_id}/{app_id}` 工具族：
+    ///   **只 wake 不 touch**（终端/DB 客户端连接不算业务活跃——挂终端不阻止
+    ///   闲置回收，回收后下次连接自动唤醒再转发，ttyd 前端自动重连兜底首连窗口）。
     /// 其余路由直接放行（Ok(false) → 继续 upstream_peer）。
     async fn request_filter(
         &self,
@@ -306,14 +306,12 @@ impl PortProxy {
 
 /// 唤醒目标分类：路径 → `(app_id, touch)`。
 ///
-/// - `/proxy/userapp/prod/...` 应用业务流量 → touch=true（闲置回收信号源）；
-/// - `/userapp/prod/{ttyd,dbx}/{app_id}` 工具族 → touch=false（终端/DB
+/// - `/api/v1/userapp/proxy/app/prod/...` 应用业务流量 → touch=true（闲置回收信号源）；
+/// - `/api/v1/userapp/proxy/{ttyd,dbx}/prod/{app_id}` 工具族 → touch=false（终端/DB
 ///   连接不算业务活跃，不刷新闲置计时——挂终端不阻止回收，回收后下次连接再唤醒）；
 /// - 其余路由 → None（不触发唤醒）。
 fn classify_wake_target(router: &matchit::Router<RouteType>, path: &str) -> Option<(String, bool)> {
-    let is_app_traffic = path.starts_with("/proxy/userapp/prod/");
-    let is_tool_traffic = path.starts_with("/userapp/prod/");
-    if !is_app_traffic && !is_tool_traffic {
+    if !path.starts_with("/api/v1/userapp/proxy/") {
         return None;
     }
     match router.at(path) {
@@ -344,9 +342,9 @@ mod tests {
         let router = test_router();
         // classify 接收 request_filter 规范化后的路径（尾部斜杠已剥）
         for path in [
-            "/userapp/prod/ttyd/u1/app-1",
-            "/userapp/prod/ttyd/u1/app-1/token.js",
-            "/userapp/prod/dbx/u1/app-1",
+            "/api/v1/userapp/proxy/ttyd/prod/u1/app-1",
+            "/api/v1/userapp/proxy/ttyd/prod/u1/app-1/token.js",
+            "/api/v1/userapp/proxy/dbx/prod/u1/app-1",
         ] {
             let (app_id, touch) =
                 classify_wake_target(&router, path).unwrap_or_else(|| panic!("{path} unmatched"));
@@ -359,8 +357,9 @@ mod tests {
     #[test]
     fn app_traffic_wakes_with_touch() {
         let router = test_router();
-        let (app_id, touch) = classify_wake_target(&router, "/proxy/userapp/prod/u1/app-1/x")
-            .expect("app proxy route must match");
+        let (app_id, touch) =
+            classify_wake_target(&router, "/api/v1/userapp/proxy/app/prod/u1/app-1/x")
+                .expect("app proxy route must match");
         assert_eq!(app_id, "app-1");
         assert!(touch);
     }
@@ -372,6 +371,9 @@ mod tests {
         assert!(classify_wake_target(&router, "/api/v1/userapp/build").is_none());
         assert!(classify_wake_target(&router, "/web/ttyd/u1").is_none());
         // dev 工具族走 builder 注册表定位，不在 prod 唤醒范围
-        assert!(classify_wake_target(&router, "/userapp/dev/ttyd/u1/app-1").is_none());
+        assert!(classify_wake_target(&router, "/api/v1/userapp/proxy/ttyd/dev/u1/app-1").is_none());
+        // 旧路径形态（前缀统一前）不再命中任何 userApp 路由
+        assert!(classify_wake_target(&router, "/userapp/prod/ttyd/u1/app-1").is_none());
+        assert!(classify_wake_target(&router, "/proxy/userapp/prod/u1/app-1/x").is_none());
     }
 }

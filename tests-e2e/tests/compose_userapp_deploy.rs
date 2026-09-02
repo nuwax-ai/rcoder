@@ -541,7 +541,7 @@ async fn deploy_and_verify_traffic(
         ("rust /api/rust/ready", "/api/rust/ready"),
     ];
     let pingora = pingora_base();
-    let base = format!("{pingora}/proxy/userapp/prod/{user}/{app}");
+    let base = format!("{pingora}/api/v1/userapp/proxy/app/prod/{user}/{app}");
     let t0 = Instant::now();
     let mut pending: Vec<(&str, &str)> = probes.to_vec();
     let mut first_seen: Vec<(String, u128)> = Vec::new();
@@ -958,7 +958,9 @@ async fn verify_hot_redeploy(
     while t0.elapsed() < ready_budget() {
         if let Ok(resp) = env
             .http
-            .get(format!("{pingora}/proxy/userapp/prod/{user}/{app}/react/"))
+            .get(format!(
+                "{pingora}/api/v1/userapp/proxy/app/prod/{user}/{app}/react/"
+            ))
             .timeout(Duration::from_secs(15))
             .send()
             .await
@@ -1080,7 +1082,7 @@ async fn cleanup_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) 
         if let Ok(resp) = env
             .http
             .get(format!(
-                "{}/proxy/userapp/prod/{user}/{app}/react/",
+                "{}/api/v1/userapp/proxy/app/prod/{user}/{app}/react/",
                 pingora_base()
             ))
             .timeout(Duration::from_secs(10))

@@ -15,7 +15,7 @@ pub struct CreateAppRequest {
     pub app_id: Option<String>,
     /// 应用名称
     pub name: String,
-    /// 归属用户 ID（部署访问 URL `/proxy/userapp/prod/{user_id}/{app_id}` 的组成段；
+    /// 归属用户 ID（部署访问 URL `/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}` 的组成段；
     /// 存 userapp_metadata.user_id，"我的应用"过滤/归属校验数据源）
     pub user_id: String,
     /// 容器镜像（可选；完整地址含 registry + 命名空间）。

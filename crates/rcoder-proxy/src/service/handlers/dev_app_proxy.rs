@@ -1,8 +1,8 @@
 //! userApp 开发应用流量代理（免端口）
 //!
-//! 处理 `/proxy/userapp/dev/{user_id}/{app_id}/{*path}` 路径的反向代理：
+//! 处理 `/api/v1/userapp/proxy/app/dev/{user_id}/{app_id}/{*path}` 路径的反向代理：
 //! upstream 动态解析到**该 app 的开发容器**（UserappBuilder，per-app）的
-//! pingap 统一入口 `APP_ENTRY_PORT`(9080)——与部署后 `/proxy/userapp/prod/*`
+//! pingap 统一入口 `APP_ENTRY_PORT`(9080)——与部署后 `/api/v1/userapp/proxy/app/prod/*`
 //! （app_backends 注册表 → app 运行容器）对称的开发预览入口，切环境只改
 //! `dev→prod` 一段，调用方无需传端口。
 //!
@@ -23,7 +23,7 @@ use crate::service::utils;
 
 /// 处理开发应用流量代理请求
 ///
-/// 路径格式: `/proxy/userapp/dev/{user_id}/{app_id}/{*path}` —— 提取参数，
+/// 路径格式: `/api/v1/userapp/proxy/app/dev/{user_id}/{app_id}/{*path}` —— 提取参数，
 /// 重写 URI 去掉前缀（免端口：固定 APP_ENTRY_PORT），设置代理标识头。
 pub async fn handle_dev_app_request(
     upstream_request: &mut RequestHeader,
@@ -39,9 +39,9 @@ pub async fn handle_dev_app_request(
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
     })?;
 
-    // strip /proxy/userapp/dev/{user_id}/{app_id}，保留尾斜杠
+    // strip /api/v1/userapp/proxy/app/dev/{user_id}/{app_id}，保留尾斜杠
     let original_path = original_uri.path();
-    let prefix = format!("/proxy/userapp/dev/{user_id}/{app_id}");
+    let prefix = format!("/api/v1/userapp/proxy/app/dev/{user_id}/{app_id}");
     let target_path = if original_path.len() <= prefix.len() {
         "/".to_string()
     } else {

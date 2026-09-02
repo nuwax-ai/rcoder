@@ -117,7 +117,7 @@ impl AppService {
             Ok(info) => info,
             Err(e) => {
                 // patch 失败：Deployment 原样仍在运行，恢复 pingora 路由（对齐 delete_app
-                // 的失败恢复分支）——否则应用还在跑但 /proxy/userapp/prod/{id} 502，直到
+                // 的失败恢复分支）——否则应用还在跑但 /api/v1/userapp/proxy/app/prod/{id} 502，直到
                 // 下次成功 update 或进程重启。
                 let previous_host = current.pod_ip.clone().unwrap_or_default();
                 self.register_pingora_backends(app_id, &http_ports, &previous_host)
@@ -129,7 +129,7 @@ impl AppService {
             }
         };
         // 重新注册 Pingora backend（与上面 unregister 对称——否则部分更新会丢
-        // Pingora 路由，app 经 /proxy/userapp/prod/{id} 变 502）。
+        // Pingora 路由，app 经 /api/v1/userapp/proxy/app/prod/{id} 变 502）。
         // 注：register 在 K8s 模式并非 no-op，会把 backend 指到 Service FQDN（与 create 一致）。
         self.register_pingora_backends(app_id, &http_ports, &info.container_ip)
             .await;

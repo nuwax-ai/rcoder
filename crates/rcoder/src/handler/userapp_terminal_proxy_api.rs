@@ -1,13 +1,14 @@
-//! userApp 工具族代理的文档接口。
+//! userApp 代理族的文档接口（路径与 Pingora 真实路由同形态）。
 //!
-//! - **开发域工具族**：`/userapp/dev/{ttyd,vnc,audio,ime,dbx}/{user_id}/{app_id}`——
-//!   定位 UserappBuilder 开发容器；user_id 是懒创建显式 owner 档（dev/{user_id}/{app_id}
-//!   宿主树分区）+ 卷分区定位（与 computer 族按 user_id 定位沙箱对称）。
-//! - **生产域工具族**：`/userapp/prod/{ttyd,dbx}/{user_id}/{app_id}`——定位
-//!   `ServiceType::Userapp` 运行容器；user_id 为宿主机数据卷分区组成段（容器
-//!   未启动时配合唤醒定位）。
-//! - **应用流量族**（免端口）：`/proxy/userapp/{dev,prod}/{user_id}/{app_id}`——
-//!   见 `proxy_handler_api` 的 `proxy_to_app/devapp_with_path`。
+//! 全族统一 `/api/v1/userapp/proxy/{tool}/{stage}/{user_id}/{app_id}`（tool→stage
+//! 段序，与 REST 面 `/api/v1/userapp/...` 同根）：
+//! - **开发域工具族**：`ttyd/vnc/audio/ime/dbx` × `dev`——定位 UserappBuilder
+//!   开发容器；user_id 是懒创建显式 owner 档（dev/{user_id}/{app_id} 宿主树
+//!   分区）+ 卷分区定位（与 computer 族按 user_id 定位沙箱对称）。
+//! - **生产域工具族**：`ttyd/dbx` × `prod`——定位 `ServiceType::Userapp` 运行
+//!   容器；user_id 为宿主机数据卷分区组成段（容器未启动时配合唤醒定位）。
+//! - **应用流量族**（tool=app，免端口）：见 `proxy_handler_api` 的
+//!   `proxy_to_app/devapp_with_path`。
 //!
 //! stage 段 dev/prod 全族统一（前端切环境只改一段）；实际流量由 Pingora 代理服务
 //! 处理（容器 8088，K8s NodePort 30435），不经过 rcoder 主服务。本组接口让 Java
@@ -27,7 +28,8 @@ use chrono::Utc;
 
 /// 公共：构造 307 重定向到 Pingora 的文档化响应（或 503 说明）。
 ///
-/// Pingora 侧路由前缀 = `/userapp/{stage}/{tool}`（stage 段 dev/prod 区分定位方式）。
+/// Pingora 侧路由前缀 = `/api/v1/userapp/proxy/{tool}/{stage}`（stage 段
+/// dev/prod 区分定位方式）。
 async fn redirect_doc_response(
     state: &AppState,
     stage: &str,
@@ -54,7 +56,7 @@ async fn redirect_doc_response(
         format!("/{}", path)
     };
     let location = format!(
-        "http://127.0.0.1:{listen_port}/userapp/{stage}/{tool}/{user_id}/{app_id}{target_path}"
+        "http://127.0.0.1:{listen_port}/api/v1/userapp/proxy/{tool}/{stage}/{user_id}/{app_id}{target_path}"
     );
     axum::http::Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
@@ -73,12 +75,12 @@ async fn redirect_doc_response(
         })
 }
 
-// ── 开发域工具族：/userapp/dev/{ttyd,vnc,audio,ime,dbx}/{app_id}/{*path} ──
+// ── 开发域工具族：/api/v1/userapp/proxy/{ttyd,vnc,audio,ime,dbx}/dev/{user_id}/{app_id}/{*path} ──
 
 /// Pingora 代理 - userApp 开发域 ttyd 终端
 #[utoipa::path(
     get,
-    path = "/userapp/dev/ttyd/{user_id}/{app_id}/{*path}",
+    path = "/api/v1/userapp/proxy/ttyd/dev/{user_id}/{app_id}/{*path}",
     tag = "Userapp · dev · 终端工具",
     summary = "开发容器 Web 终端（ttyd）",
     description = r#"
@@ -93,7 +95,7 @@ async fn redirect_doc_response(
 - 前置：`POST /api/v1/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（rcoder 容器 8088 / K8s NodePort 30435），须直连 Pingora 不走 rcoder 主端口。
 
-> 例：`GET /userapp/dev/ttyd/u1/app-order-svc/`（终端页面）；WebSocket `/userapp/dev/ttyd/u1/app-order-svc/ws`。
+> 例：`GET /api/v1/userapp/proxy/ttyd/dev/u1/app-order-svc/`（终端页面）；WebSocket `/api/v1/userapp/proxy/ttyd/dev/u1/app-order-svc/ws`。
 "#,
     params(
         ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
@@ -116,7 +118,7 @@ pub async fn proxy_to_userapp_ttyd(
 /// Pingora 代理 - userApp 开发域远程桌面（noVNC）
 #[utoipa::path(
     get,
-    path = "/userapp/dev/vnc/{user_id}/{app_id}/{*path}",
+    path = "/api/v1/userapp/proxy/vnc/dev/{user_id}/{app_id}/{*path}",
     tag = "Userapp · dev · 终端工具",
     summary = "开发容器远程桌面（noVNC）",
     description = r#"
@@ -127,7 +129,7 @@ pub async fn proxy_to_userapp_ttyd(
 - 前置：`POST /api/v1/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（8088 / K8s NodePort 30435）。
 
-> 例：`GET /userapp/dev/vnc/u1/app-order-svc/vnc.html`（桌面页面）；WebSocket `/userapp/dev/vnc/u1/app-order-svc/websockify`。
+> 例：`GET /api/v1/userapp/proxy/vnc/dev/u1/app-order-svc/vnc.html`（桌面页面）；WebSocket `/api/v1/userapp/proxy/vnc/dev/u1/app-order-svc/websockify`。
 "#,
     params(
         ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
@@ -150,7 +152,7 @@ pub async fn proxy_to_userapp_vnc(
 /// Pingora 代理 - userApp 开发域语音（audio）
 #[utoipa::path(
     get,
-    path = "/userapp/dev/audio/{user_id}/{app_id}/{*path}",
+    path = "/api/v1/userapp/proxy/audio/dev/{user_id}/{app_id}/{*path}",
     tag = "Userapp · dev · 终端工具",
     summary = "开发容器语音代理（audio）",
     description = r#"
@@ -163,7 +165,7 @@ pub async fn proxy_to_userapp_vnc(
 - 前置：`POST /api/v1/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（8088 / K8s NodePort 30435）。
 
-> 例：`GET /userapp/dev/audio/u1/app-order-svc/`（播放器页面）；WebSocket `/userapp/dev/audio/u1/app-order-svc/ws`。
+> 例：`GET /api/v1/userapp/proxy/audio/dev/u1/app-order-svc/`（播放器页面）；WebSocket `/api/v1/userapp/proxy/audio/dev/u1/app-order-svc/ws`。
 "#,
     params(
         ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
@@ -186,7 +188,7 @@ pub async fn proxy_to_userapp_audio(
 /// Pingora 代理 - userApp 开发域输入法（IME）
 #[utoipa::path(
     get,
-    path = "/userapp/dev/ime/{user_id}/{app_id}/{*path}",
+    path = "/api/v1/userapp/proxy/ime/dev/{user_id}/{app_id}/{*path}",
     tag = "Userapp · dev · 终端工具",
     summary = "开发容器输入法代理（IME）",
     description = r#"
@@ -197,7 +199,7 @@ pub async fn proxy_to_userapp_audio(
 - 前置：`POST /api/v1/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（8088 / K8s NodePort 30435）。
 
-> 例：`WebSocket /userapp/dev/ime/u1/app-order-svc/connect`。
+> 例：`WebSocket /api/v1/userapp/proxy/ime/dev/u1/app-order-svc/connect`。
 "#,
     params(
         ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
@@ -220,7 +222,7 @@ pub async fn proxy_to_userapp_ime(
 /// Pingora 代理 - DBX 数据库 Web GUI（开发阶段，UserappBuilder 开发容器）
 #[utoipa::path(
     get,
-    path = "/userapp/dev/dbx/{user_id}/{app_id}/{*path}",
+    path = "/api/v1/userapp/proxy/dbx/dev/{user_id}/{app_id}/{*path}",
     tag = "Userapp · dev · 终端工具",
     summary = "开发容器数据库控制台（DBX）",
     description = r#"
@@ -233,7 +235,7 @@ Web GUI（60+ 数据库，supervisor 恒起 4224）——开发阶段查库/改�
 - 代理剥前缀直连 root 模式 dbx（前端运行时自推断 base path，API/WS 自动拼回本前缀）。
 - host = Pingora 入口（rcoder 容器 8088 / K8s NodePort 30435），须直连 Pingora 不走 rcoder 主端口。
 
-> 例：`GET /userapp/dev/dbx/u1/app-order-svc/`（DBX 控制台页面）。
+> 例：`GET /api/v1/userapp/proxy/dbx/dev/u1/app-order-svc/`（DBX 控制台页面）。
 "#,
     params(
         ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
@@ -253,17 +255,17 @@ pub async fn proxy_to_dev_dbx(
     redirect_doc_response(&state, "dev", "dbx", user_id, app_id, path).await
 }
 
-// ── 生产域工具族（运行容器，部署后的生产环境）：/userapp/prod/{ttyd,dbx}/{app_id}/{*path} ──
+// ── 生产域工具族（运行容器，部署后的生产环境）：/api/v1/userapp/proxy/{ttyd,dbx}/prod/{user_id}/{app_id}/{*path} ──
 
 /// Pingora 代理 - userApp 运行容器 Web 终端（ttyd）
 #[utoipa::path(
     get,
-    path = "/userapp/prod/ttyd/{user_id}/{app_id}/{*path}",
+    path = "/api/v1/userapp/proxy/ttyd/prod/{user_id}/{app_id}/{*path}",
     tag = "Userapp · prod · 终端工具",
     summary = "生产容器 Web 终端（ttyd）",
     description = r#"
 访问该 app **运行容器**（`ServiceType::Userapp`，app-runtime 镜像——部署后的生产环境）
-内的 Web 终端，供线上排障。与开发域 `/userapp/dev/ttyd/{app_id}`（UserappBuilder 开发容器、
+内的 Web 终端，供线上排障。与开发域 `/api/v1/userapp/proxy/ttyd/dev/{app_id}`（UserappBuilder 开发容器、
 经 ws_terminal 中间层定位到开发卷 cwd）的关键差异：
 
 - upstream **直连 ttyd 本体**（7681，WebSocket）——运行容器没有 agent_runner，
@@ -272,7 +274,7 @@ pub async fn proxy_to_dev_dbx(
 - 定位按确定性 Service 名（K8s Pod 重建 DNS 自愈）；**app 未部署/已停止 → 上游
   连接失败 502**（区别于开发域未注册 404）。
 
-> 例：`GET /userapp/prod/ttyd/u1/app-order-svc/`；WebSocket `/userapp/prod/ttyd/u1/app-order-svc/ws`。
+> 例：`GET /api/v1/userapp/proxy/ttyd/prod/u1/app-order-svc/`；WebSocket `/api/v1/userapp/proxy/ttyd/prod/u1/app-order-svc/ws`。
 "#,
     params(
         ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
@@ -295,7 +297,7 @@ pub async fn proxy_to_userapp_runtime_ttyd(
 /// Pingora 代理 - DBX 数据库 Web GUI（生产阶段，Userapp 运行容器）
 #[utoipa::path(
     get,
-    path = "/userapp/prod/dbx/{user_id}/{app_id}/{*path}",
+    path = "/api/v1/userapp/proxy/dbx/prod/{user_id}/{app_id}/{*path}",
     tag = "Userapp · prod · 终端工具",
     summary = "生产容器数据库控制台（DBX）",
     description = r#"
@@ -307,7 +309,7 @@ pub async fn proxy_to_userapp_runtime_ttyd(
 - **app 未部署/已停止 → 上游连接失败 502**（区别于 dev 阶段未注册 404）。
 - host = Pingora 入口（rcoder 容器 8088 / K8s NodePort 30435）。
 
-> 例：`GET /userapp/prod/dbx/u1/app-order-svc/`（DBX 控制台页面）。
+> 例：`GET /api/v1/userapp/proxy/dbx/prod/u1/app-order-svc/`（DBX 控制台页面）。
 "#,
     params(
         ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
@@ -333,7 +335,7 @@ pub async fn proxy_to_prod_dbx(
     path = "/userapp/routes",
     tag = "Userapp · 访问入口",
     summary = "userApp 代理路由一览",
-    description = "userApp 两族 Pingora 代理入口速查：工具族 /userapp/{dev,prod}/{tool}/{user_id}/{app_id}；应用流量族（免端口，pingap 统一入口 9080）/proxy/userapp/{dev,prod}/{user_id}/{app_id}。",
+    description = "userApp 两族 Pingora 代理入口速查（统一形态 /api/v1/userapp/proxy/{tool}/{stage}/{user_id}/{app_id}）：工具族 ttyd/vnc/audio/ime/dbx；应用流量族 tool=app（免端口，pingap 统一入口 9080）。",
     responses(
         (status = 200, description = "路由清单", body = Value)
     )
@@ -343,27 +345,27 @@ pub async fn userapp_proxy_routes_doc() -> Json<Value> {
         "tools": {
             "说明": "容器内固定控制台（supervisor 恒起）；user_id=归属（dev 懒创建显式 owner 档 / prod 归属锚点）；stage 段 dev=开发容器(UserappBuilder，未建 workspace → 404) / prod=运行容器(未部署 → 502)",
             "dev": {
-                "ttyd（Web 终端，cwd=开发卷/{app_id}，ws 子协议 tty）": "/userapp/dev/ttyd/{user_id}/{app_id}/{path}",
-                "vnc（noVNC 远程桌面）": "/userapp/dev/vnc/{user_id}/{app_id}/{path}",
-                "audio（ws*→6089 流；其余→6090 静态）": "/userapp/dev/audio/{user_id}/{app_id}/{path}",
-                "ime（输入法，WebSocket connect）": "/userapp/dev/ime/{user_id}/{app_id}/{path}",
-                "dbx（数据库 Web GUI，已预置本地 PG 连接，首访设密码）": "/userapp/dev/dbx/{user_id}/{app_id}/{path}"
+                "ttyd（Web 终端，cwd=开发卷/{app_id}，ws 子协议 tty）": "/api/v1/userapp/proxy/ttyd/dev/{user_id}/{app_id}/{path}",
+                "vnc（noVNC 远程桌面）": "/api/v1/userapp/proxy/vnc/dev/{user_id}/{app_id}/{path}",
+                "audio（ws*→6089 流；其余→6090 静态）": "/api/v1/userapp/proxy/audio/dev/{user_id}/{app_id}/{path}",
+                "ime（输入法，WebSocket connect）": "/api/v1/userapp/proxy/ime/dev/{user_id}/{app_id}/{path}",
+                "dbx（数据库 Web GUI，已预置本地 PG 连接，首访设密码）": "/api/v1/userapp/proxy/dbx/dev/{user_id}/{app_id}/{path}"
             },
             "prod": {
-                "ttyd（Web 终端，cwd=/app，直连 ttyd 本体不经 ws_terminal）": "/userapp/prod/ttyd/{user_id}/{app_id}/{path}",
-                "dbx（数据库 Web GUI，已预置本地 PG 连接，首访设密码）": "/userapp/prod/dbx/{user_id}/{app_id}/{path}"
+                "ttyd（Web 终端，cwd=/app，直连 ttyd 本体不经 ws_terminal）": "/api/v1/userapp/proxy/ttyd/prod/{user_id}/{app_id}/{path}",
+                "dbx（数据库 Web GUI，已预置本地 PG 连接，首访设密码）": "/api/v1/userapp/proxy/dbx/prod/{user_id}/{app_id}/{path}"
             }
         },
         "app_traffic": {
-            "说明": "应用流量（免端口——代理内部固定拨 pingap 统一入口 APP_ENTRY_PORT=9080）；切环境只改 dev→prod 一段；dev 无开发容器 → 502，prod 未部署 → 502",
-            "dev（开发预览，manifest 流程恒起 pingap）": "/proxy/userapp/dev/{user_id}/{app_id}/{path}",
-            "prod（部署访问，access.external.http 即此格式）": "/proxy/userapp/prod/{user_id}/{app_id}/{path}"
+            "说明": "应用流量（tool=app，免端口——代理内部固定拨 pingap 统一入口 APP_ENTRY_PORT=9080）；切环境只改 dev→prod 一段；dev 无开发容器 → 502，prod 未部署 → 502",
+            "dev（开发预览，manifest 流程恒起 pingap）": "/api/v1/userapp/proxy/app/dev/{user_id}/{app_id}/{path}",
+            "prod（部署访问，access.external.http 即此格式）": "/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}/{path}"
         },
         "entry": "Pingora 入口 = rcoder 容器 8088 / K8s NodePort 30435（不经 rcoder 主端口）"
     }))
 }
 
-// ── 根路径（无尾随 path）变体：/userapp/{stage}/{tool}/{app_id} → 同款 307（path 置空） ──
+// ── 根路径（无尾随 path）变体：.../proxy/{tool}/{stage}/{user_id}/{app_id} → 同款 307（path 置空） ──
 
 macro_rules! stage_tool_redirect {
     ($fn_name:ident, $stage:expr, $tool:expr) => {

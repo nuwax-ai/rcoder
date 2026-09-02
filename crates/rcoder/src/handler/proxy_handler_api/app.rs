@@ -1,4 +1,4 @@
-//! 应用流量代理文档接口（/proxy/userapp 族）。
+//! 应用流量代理文档接口（/api/v1/userapp/proxy/app 族）。
 
 use axum::{
     extract::{Path, State},
@@ -14,18 +14,18 @@ use crate::router::AppState;
 /// Pingora 代理 - 访问部署的应用服务（免端口，按 app_id 路由，含路径）
 #[utoipa::path(
     get,
-    path = "/proxy/userapp/prod/{user_id}/{app_id}/{*path}",
+    path = "/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}/{*path}",
     tag = "Userapp · 访问入口",
     summary = "按 app_id 访问部署的应用服务",
     description = r#"
-访问 `POST /api/v1/userapp` 部署的应用。`access.external.http` 返回 `/proxy/userapp/prod/{user_id}/{app_id}`，即本接口。
+访问 `POST /api/v1/userapp` 部署的应用。`access.external.http` 返回 `/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}`，即本接口。
 **免端口**：代理内部固定拨 pingap 统一入口 `APP_ENTRY_PORT`(9080)——按 (app_id, 9080) 查
 `app_backends` 注册表路由到应用后端（K8s→`{app_id}-svc`，Docker→container_ip），**多 app 同端口不冲突**；
 未注册 9080 且该 app 恰只有一个已注册 HTTP 端口时回退用之。
 
-> 例（归属 u6）：`GET /apps/{id}` 返回 `access.external.http = "/proxy/userapp/prod/u6/{app_id}"`，
-> 访问该应用：`GET /proxy/userapp/prod/u6/{app_id}/api/users` → Pingora 代理到应用 `:9080/api/users`。
-> user_id 不参与后端解析，仅与开发预览 `/proxy/userapp/dev/{user_id}/...` 同构——切环境只改 `dev→prod` 一段。
+> 例（归属 u6）：`GET /apps/{id}` 返回 `access.external.http = "/api/v1/userapp/proxy/app/prod/u6/{app_id}"`，
+> 访问该应用：`GET /api/v1/userapp/proxy/app/prod/u6/{app_id}/api/users` → Pingora 代理到应用 `:9080/api/users`。
+> user_id 不参与后端解析，仅与开发预览 `/api/v1/userapp/proxy/app/dev/{user_id}/...` 同构——切环境只改 `dev→prod` 一段。
 > host（Pingora 入口）由调用方持有，详见应用管理手册 §1.7。
 
 （此 axum 接口返回 307 重定向到 Pingora 端口；生产建议直接访问 Pingora 的同路径）
@@ -63,7 +63,7 @@ pub async fn proxy_to_app_with_path(
     };
     // 重定向到 Pingora 的 app 流量路径（免端口; user_id 不参与解析, 同构锚点）
     let location = format!(
-        "http://127.0.0.1:{}/proxy/userapp/prod/{}/{}/{}",
+        "http://127.0.0.1:{}/api/v1/userapp/proxy/app/prod/{}/{}/{}",
         listen_port, _user_id, app_id, target_path
     );
     let resp = axum::http::Response::builder()
@@ -87,12 +87,12 @@ pub async fn proxy_to_app_with_path(
 /// Pingora 代理 - 开发阶段预览（app 开发容器 dev server，按 app_id 动态解析）
 #[utoipa::path(
     get,
-    path = "/proxy/userapp/dev/{user_id}/{app_id}/{*path}",
+    path = "/api/v1/userapp/proxy/app/dev/{user_id}/{app_id}/{*path}",
     tag = "Userapp · 访问入口",
     summary = "开发容器预览入口",
     description = r#"
 访问开发阶段该 app 开发容器（UserappBuilder，per-app）内的应用。与部署访问
-`/proxy/userapp/prod/{user_id}/{app_id}/{*path}` 同构——**开发切部署前端只改 `dev→prod` 一段**。
+`/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}/{*path}` 同构——**开发切部署前端只改 `dev→prod` 一段**。
 
 - **免端口**：代理内部固定拨 pingap 统一入口 `APP_ENTRY_PORT`(9080)——开发容器
   manifest 流程（`POST /api/v1/userapp/dev/start`）恒起 app-cli+pingap，9080 即整应用入口。
@@ -102,7 +102,7 @@ pub async fn proxy_to_app_with_path(
 - 多 app 并行：每 app 独立开发容器，URL 各拼各的 app_id。
 - 长连接支持（HMR/WebSocket）；无该 app 开发容器 → 502；容器重建后有短窗口旧 IP（下次 ensure 修正）。
 
-> 例：`GET /proxy/userapp/dev/u6/app-order-svc/api/users` → 开发容器 `:9080/api/users`。
+> 例：`GET /api/v1/userapp/proxy/app/dev/u6/app-order-svc/api/users` → 开发容器 `:9080/api/users`。
 > host（Pingora 入口）由调用方持有，详见应用管理手册 §12。
 "#,
     params(
@@ -137,7 +137,7 @@ pub async fn proxy_to_devapp_with_path(
         format!("/{}", path)
     };
     let location = format!(
-        "http://127.0.0.1:{}/proxy/userapp/dev/{}/{}/{}",
+        "http://127.0.0.1:{}/api/v1/userapp/proxy/app/dev/{}/{}/{}",
         listen_port, user_id, app_id, target_path
     );
     let resp = axum::http::Response::builder()

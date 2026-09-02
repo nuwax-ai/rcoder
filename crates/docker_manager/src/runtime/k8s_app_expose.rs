@@ -39,7 +39,7 @@ impl KubernetesRuntime {
             .unwrap_or_default();
         let mut ports = ports;
         // 运行容器固定端口随 Service 一并暴露——
-        // `/userapp/prod/{ttyd,dbx}/{app_id}` 代理上游为 Service FQDN，
+        // `/api/v1/userapp/proxy/{ttyd,dbx}/prod/{app_id}` 代理上游为 Service FQDN，
         // 若 7681/4224 不在 Service ports 内，
         // 代理连接将超时（app-runtime 镜像 supervisor 恒起 ttyd/dbx-web，
         // targetPort 恒可达）。

@@ -226,8 +226,18 @@ fn primary_document_groups_userapp_by_business_domain() {
         "Userapp · 双态 · 生命周期"
     );
     assert_eq!(
-        tag_of("/proxy/userapp/dev/{user_id}/{app_id}/{*path}", "get"),
+        tag_of(
+            "/api/v1/userapp/proxy/app/dev/{user_id}/{app_id}/{*path}",
+            "get"
+        ),
         "Userapp · 访问入口"
+    );
+    assert_eq!(
+        tag_of(
+            "/api/v1/userapp/proxy/ttyd/dev/{user_id}/{app_id}/{*path}",
+            "get"
+        ),
+        "Userapp · dev · 终端工具"
     );
     assert_eq!(tag_of("/userapp/routes", "get"), "Userapp · 访问入口");
     assert_eq!(
@@ -639,11 +649,9 @@ fn userapp_openapi_annotations_are_complete() {
     let document = ApiDoc::openapi();
     let mut checked = 0usize;
     for (path, item) in &document.paths.paths {
-        // /userapp/routes 速查表是纯静态文档接口（无错误分支），不在质量检查内
-        let is_userapp_proxy_doc = ["/userapp/dev/", "/userapp/prod/"]
-            .iter()
-            .any(|prefix| path.starts_with(prefix));
-        if !path.starts_with("/api/v1/userapp") && !is_userapp_proxy_doc {
+        // /userapp/routes 速查表是纯静态文档接口（无错误分支），不在质量检查内；
+        // 307 代理文档族已并入 /api/v1/userapp/proxy/... 前缀，被 starts_with 天然覆盖
+        if !path.starts_with("/api/v1/userapp") {
             continue;
         }
         for operation in [&item.get, &item.post].into_iter().flatten() {

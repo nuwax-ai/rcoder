@@ -17,9 +17,9 @@ fn test_create_router() {
     assert_eq!(matched.params.get("project_id"), Some("proj_456"));
     assert_eq!(matched.params.get("path"), Some("vnc.html"));
 
-    // 测试 userApp 生产应用流量代理（免端口，user_id 不参与解析）
+    // 测试 userApp 生产应用流量代理（免端口，user_id 不参与解析；tool=app → pingap 9080）
     let matched = router
-        .at("/proxy/userapp/prod/u6/app-abc/api/users")
+        .at("/api/v1/userapp/proxy/app/prod/u6/app-abc/api/users")
         .unwrap();
     assert_eq!(*matched.value, RouteType::ProdAppProxy);
     assert_eq!(matched.params.get("user_id"), Some("u6"));
@@ -34,13 +34,15 @@ fn test_create_router() {
 
     // userApp 开发应用流量代理（带 path）+ 无尾随 path 兜底
     let matched = router
-        .at("/proxy/userapp/dev/u6/app-abc123/api/users")
+        .at("/api/v1/userapp/proxy/app/dev/u6/app-abc123/api/users")
         .unwrap();
     assert_eq!(*matched.value, RouteType::DevAppProxy);
     assert_eq!(matched.params.get("user_id"), Some("u6"));
     assert_eq!(matched.params.get("app_id"), Some("app-abc123"));
     assert_eq!(matched.params.get("path"), Some("api/users"));
-    let matched = router.at("/proxy/userapp/dev/u6/app-abc123").unwrap();
+    let matched = router
+        .at("/api/v1/userapp/proxy/app/dev/u6/app-abc123")
+        .unwrap();
     assert_eq!(*matched.value, RouteType::DevAppProxy);
 }
 
@@ -80,36 +82,60 @@ fn test_port_proxy_route_variations() {
 fn test_userapp_dev_terminal_routes() {
     let router = create_router().expect("router");
 
-    // 开发域工具族（stage 段 dev）通配 + 兜底（无尾随 path）成对
+    // 开发域工具族（tool→stage 段序）通配 + 兜底（无尾随 path）成对
     for (path, expected) in [
-        ("/userapp/dev/ttyd/u1/app-1/ws", RouteType::DevTtydProxy),
-        ("/userapp/dev/ttyd/u1/app-1", RouteType::DevTtydProxy),
-        ("/userapp/dev/vnc/u1/app-1/vnc.html", RouteType::DevVncProxy),
-        ("/userapp/dev/vnc/u1/app-1", RouteType::DevVncProxy),
-        ("/userapp/dev/audio/u1/app-1/ws", RouteType::DevAudioProxy),
-        ("/userapp/dev/audio/u1/app-1", RouteType::DevAudioProxy),
-        ("/userapp/dev/ime/u1/app-1/connect", RouteType::DevImeProxy),
-        ("/userapp/dev/ime/u1/app-1", RouteType::DevImeProxy),
+        (
+            "/api/v1/userapp/proxy/ttyd/dev/u1/app-1/ws",
+            RouteType::DevTtydProxy,
+        ),
+        (
+            "/api/v1/userapp/proxy/ttyd/dev/u1/app-1",
+            RouteType::DevTtydProxy,
+        ),
+        (
+            "/api/v1/userapp/proxy/vnc/dev/u1/app-1/vnc.html",
+            RouteType::DevVncProxy,
+        ),
+        (
+            "/api/v1/userapp/proxy/vnc/dev/u1/app-1",
+            RouteType::DevVncProxy,
+        ),
+        (
+            "/api/v1/userapp/proxy/audio/dev/u1/app-1/ws",
+            RouteType::DevAudioProxy,
+        ),
+        (
+            "/api/v1/userapp/proxy/audio/dev/u1/app-1",
+            RouteType::DevAudioProxy,
+        ),
+        (
+            "/api/v1/userapp/proxy/ime/dev/u1/app-1/connect",
+            RouteType::DevImeProxy,
+        ),
+        (
+            "/api/v1/userapp/proxy/ime/dev/u1/app-1",
+            RouteType::DevImeProxy,
+        ),
     ] {
         let matched = router.at(path).expect(path);
         assert_eq!(*matched.value, expected, "path={path}");
     }
 
-    // 生产域工具族（stage 段 prod，原 /runtime 段退役）：与开发域 stage 段区分
+    // 生产域工具族（stage 段 prod）：与开发域 stage 段区分
     for (path, expected, expected_app) in [
         (
-            "/userapp/prod/ttyd/u1/app-1/ws/token",
+            "/api/v1/userapp/proxy/ttyd/prod/u1/app-1/ws/token",
             RouteType::RuntimeTtydProxy,
             "app-1",
         ),
         (
-            "/userapp/prod/ttyd/u1/app-1",
+            "/api/v1/userapp/proxy/ttyd/prod/u1/app-1",
             RouteType::RuntimeTtydProxy,
             "app-1",
         ),
         // 开发域路由不被 prod 段劫持
         (
-            "/userapp/dev/ttyd/u1/app-1/ws",
+            "/api/v1/userapp/proxy/ttyd/dev/u1/app-1/ws",
             RouteType::DevTtydProxy,
             "app-1",
         ),
@@ -123,31 +149,31 @@ fn test_userapp_dev_terminal_routes() {
         );
     }
 
-    // 工具族新形态（{user_id}/{app_id} 双段）：app_id + 剩余 path 剥前缀语义不变
+    // dbx 两阶段（{user_id}/{app_id} 双段）：app_id + 剩余 path 剥前缀语义不变
     for (path, expected, expected_user, expected_app, expected_rest) in [
         (
-            "/userapp/dev/dbx/u1/app-1",
+            "/api/v1/userapp/proxy/dbx/dev/u1/app-1",
             RouteType::DevDbxProxy,
             "u1",
             "app-1",
             None,
         ),
         (
-            "/userapp/dev/dbx/u1/app-1/api/auth/check",
+            "/api/v1/userapp/proxy/dbx/dev/u1/app-1/api/auth/check",
             RouteType::DevDbxProxy,
             "u1",
             "app-1",
             Some("api/auth/check"),
         ),
         (
-            "/userapp/dev/ttyd/u1/app-1/ws",
+            "/api/v1/userapp/proxy/ttyd/dev/u1/app-1/ws",
             RouteType::DevTtydProxy,
             "u1",
             "app-1",
             Some("ws"),
         ),
         (
-            "/userapp/prod/dbx/u1/app-1",
+            "/api/v1/userapp/proxy/dbx/prod/u1/app-1",
             RouteType::ProdDbxProxy,
             "u1",
             "app-1",
@@ -173,36 +199,20 @@ fn test_userapp_dev_terminal_routes() {
         );
     }
 
-    // 单段 app_id 旧形态（无 user_id）已退役：根形态（无尾随 path）不得命中。
-    // 注：深层旧 URL（如 /userapp/dev/dbx/app-1/api/...）会把 app-1 误解析进
-    // user_id 槽 → 定位失败 404——Breaking 换代由 Java 同批改 URL 保证。
-    for old_path in ["/userapp/prod/dbx/app-1", "/userapp/dev/ttyd/app-1"] {
-        let path = crate::service::utils::normalize_path(old_path);
-        let hits = router
-            .at(path)
-            .ok()
-            .map(|m| {
-                matches!(
-                    *m.value,
-                    RouteType::DevDbxProxy
-                        | RouteType::ProdDbxProxy
-                        | RouteType::DevTtydProxy
-                        | RouteType::RuntimeTtydProxy
-                )
-            })
-            .unwrap_or(false);
-        assert!(
-            !hits,
-            "single-segment legacy path must be retired: {old_path}"
-        );
-    }
-
-    // 旧路径风格已退役（clean break）：不得命中 userapp 家族任何变体。
+    // 旧路径风格已退役（clean break，前缀统一 /api/v1/userapp/proxy 前两代形态）：
+    // 不得命中 userapp 家族任何变体。
     // 注：/proxy/apps/...、/proxy/dev/... 旧前缀会落进 /proxy/{port} 泛化路由
     //（port 段非数字 → handler 400），属预期行为，不算命中。
     for old_path in [
+        // 第一代：单段 app_id
         "/userapp/ttyd/app-1/ws",
         "/userapp/pgweb/app-1/runtime",
+        "/userapp/prod/dbx/app-1",
+        // 第二代：stage 在前 tool 在后 + /proxy/userapp 应用流量族
+        "/userapp/dev/ttyd/u1/app-1/ws",
+        "/userapp/prod/dbx/u1/app-1",
+        "/proxy/userapp/prod/u1/app-1/api/users",
+        "/proxy/userapp/dev/u1/app-1/api/users",
         "/proxy/apps/u1/app-1/4000/x",
         "/proxy/devapps/u1/app-1/4000/x",
         "/proxy/dev/dbx/app-1/api/auth/check",
@@ -270,6 +280,19 @@ fn test_api_proxy_route() {
     assert_eq!(*matched.value, RouteType::ApiProxy);
     assert_eq!(matched.params.get("service_name"), Some("custom"));
     assert_eq!(matched.params.get("path"), Some("v2/org/project/messages"));
+
+    // /api/v1 静态段（userApp 代理前缀）与 ApiProxy 参数段共存验证：
+    // userApp 路径命中静态族；非 userapp 的 /api/v1/xxx 不被静态族吞掉
+    // （matchit 静态优先、不匹配回退参数路由——service_name=v1 的 ApiProxy
+    // 行为与改造前一致，由 ApiProxy 自身拒绝无效服务名）。
+    let userapp_hit = router
+        .at("/api/v1/userapp/proxy/app/prod/u1/app-1/x")
+        .unwrap();
+    assert_eq!(*userapp_hit.value, RouteType::ProdAppProxy);
+    let api_fallback = router.at("/api/v1/other-thing/x").unwrap();
+    assert_eq!(*api_fallback.value, RouteType::ApiProxy);
+    assert_eq!(api_fallback.params.get("service_name"), Some("v1"));
+    assert_eq!(api_fallback.params.get("path"), Some("other-thing/x"));
 }
 
 #[test]

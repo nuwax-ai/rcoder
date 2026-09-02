@@ -65,7 +65,7 @@ impl AppService {
         // Gateway 模式：K8s status.ports 已含 HTTP（HTTPRoute backendRef），无需补。
         // ⚠️ 重启风险（pingora_ports 内存态丢失，已知限制）：
         //   - Docker：HTTP 端口补不出 → access.external.http = null（Java 可感知降级）
-        //   - K8s Pingora：status.ports（containerPort）仍含 HTTP → access 返有效 /proxy/userapp/prod/{user_id}/{app_id}，
+        //   - K8s Pingora：status.ports（containerPort）仍含 HTTP → access 返有效 /api/v1/userapp/proxy/app/prod/{user_id}/{app_id}，
         //     但 Pingora backend 未重注册 → 访问 404（静默坏路径）。根治：启动从 containerPorts 重建 backends（TODO）
         let ports = if self.config.http_expose == HttpExpose::Pingora {
             let mut merged = status.ports.clone();
@@ -159,9 +159,9 @@ impl AppService {
         let http_port = ports.iter().find(|p| p.expose_type == RtExposeType::Http);
 
         // 一律只返 path，host 由 Java 拼（Java 必然已知 RCoder / gateway 入口，否则访问不了）：
-        // - Pingora 模式（默认，两后端统一）：/proxy/userapp/prod/{user_id}/{app_id}
+        // - Pingora 模式（默认，两后端统一）：/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}
         //   （免端口——代理内部固定拨 pingap 统一入口 APP_ENTRY_PORT=9080；
-        //   与开发预览 /proxy/userapp/dev/{user_id}/{app_id} 同构，切环境只改 dev→prod；
+        //   与开发预览 /api/v1/userapp/proxy/app/dev/{user_id}/{app_id} 同构，切环境只改 dev→prod；
         //   user_id 来自 userapp_metadata，缺值（存量行/内部 ensure 无上下文）无法锚定
         //   归属 → 返 None 由调用方降级处理）
         // - Gateway 模式（K8s 可选）：/apps/{app_id}
@@ -172,7 +172,9 @@ impl AppService {
                     None
                 } else {
                     match self.owner_user_id(app_id) {
-                        Some(user_id) => Some(format!("/proxy/userapp/prod/{user_id}/{app_id}")),
+                        Some(user_id) => {
+                            Some(format!("/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}"))
+                        }
                         None => {
                             warn!(
                                 "[APP] metadata user_id missing, cannot build access URL: {app_id}"

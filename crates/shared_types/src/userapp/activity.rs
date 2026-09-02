@@ -12,7 +12,7 @@
 
 /// Userapp HTTP 访问追踪（同步，无 runtime 依赖）
 ///
-/// 由 Pingora `request_filter` 对 `/proxy/userapp/prod/{user_id}/{app_id}/...` 路由调用。
+/// 由 Pingora `request_filter` 对 `/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}/...` 路由调用。
 /// `touch` 内部应做节流（实现自行决定粒度），避免高 QPS 下的 DashMap 锁竞争。
 pub trait AppAccessTracker: Send + Sync {
     /// 记录 app 的最近一次真实 HTTP 访问（实现内部节流）。

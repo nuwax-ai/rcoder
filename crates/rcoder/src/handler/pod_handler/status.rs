@@ -575,7 +575,7 @@ pub async fn pod_vnc_status(
 
 /// vnc-status 的 userApp dev 分支：开发容器（UserappBuilder）复用 agent-runner
 /// 镜像，VNC 栈（Xvnc 5900 + noVNC 6080）实际在跑（桌面入口
-/// `/userapp/dev/vnc/{app_id}`）——走既有 gRPC 链路真查容器内探针。
+/// `/api/v1/userapp/proxy/vnc/dev/{app_id}`）——走既有 gRPC 链路真查容器内探针。
 /// 不注册 `vnc_backends`：那是 computer 域 user_id 键空间，userApp VNC 走独立
 /// app_id 路由（ContainerLookup 动态解析）。
 async fn vnc_status_userapp_dev(

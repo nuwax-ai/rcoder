@@ -930,7 +930,9 @@ async fn userapp_dev_dbx_proxy() {
         .unwrap_or_else(|| "http://127.0.0.1:8089".to_owned());
     let resp = env
         .http
-        .get(format!("{pingora}/userapp/dev/dbx/{user}/{app}/"))
+        .get(format!(
+            "{pingora}/api/v1/userapp/proxy/dbx/dev/{user}/{app}/"
+        ))
         .timeout(Duration::from_secs(15))
         .send()
         .await;

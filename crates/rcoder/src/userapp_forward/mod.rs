@@ -85,7 +85,7 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
 pub(crate) mod guard_tables {
     /// rcoder 本地实现的 userapp 路径快照（`routes()` 显式入口部分；
     /// 守卫闭包比对用——改动路由须同步）。
-    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 7] = [
+    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 16] = [
         "/api/v1/userapp/workspace",
         "/api/v1/userapp/db/{app_stage}/align-credentials",
         "/api/v1/userapp/db/{app_stage}/reset-password",
@@ -94,6 +94,16 @@ pub(crate) mod guard_tables {
         "/api/v1/userapp/{app_id}/{app_stage}/projects/detect",
         "/api/v1/userapp/{app_id}/{app_stage}/projects/confirm",
         "/api/v1/userapp/{app_id}/{app_stage}/install-project",
+        // 307 代理文档族（userapp_proxy.rs 挂载；路径与 Pingora 真实路由同形态）
+        "/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}/{*path}",
+        "/api/v1/userapp/proxy/app/dev/{user_id}/{app_id}/{*path}",
+        "/api/v1/userapp/proxy/ttyd/dev/{user_id}/{app_id}/{*path}",
+        "/api/v1/userapp/proxy/vnc/dev/{user_id}/{app_id}/{*path}",
+        "/api/v1/userapp/proxy/audio/dev/{user_id}/{app_id}/{*path}",
+        "/api/v1/userapp/proxy/ime/dev/{user_id}/{app_id}/{*path}",
+        "/api/v1/userapp/proxy/dbx/dev/{user_id}/{app_id}/{*path}",
+        "/api/v1/userapp/proxy/ttyd/prod/{user_id}/{app_id}/{*path}",
+        "/api/v1/userapp/proxy/dbx/prod/{user_id}/{app_id}/{*path}",
     ];
 
     /// app_manager 具体路由路径快照（crates/app_manager/src/routes.rs；同样供

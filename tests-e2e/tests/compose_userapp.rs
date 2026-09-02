@@ -1012,13 +1012,13 @@ async fn test_terminal_proxy_redirects(env: &Env, report: &JsonlReporter) {
     // 三个工具族变体：307 + Location 是绝对 URL 指向 Pingora 入口
     // （{*path} 需非空段——尾斜杠空段不匹配会 404，root 用无尾变体/带子路径）
     for (tool, path) in [
-        ("ttyd", "dev/ttyd/{user}/{app}"),
-        ("dbx", "prod/dbx/{user}/{app}/ws"),
-        ("vnc", "dev/vnc/{user}/{app}/x"),
+        ("ttyd", "ttyd/dev/{user}/{app}"),
+        ("dbx", "dbx/prod/{user}/{app}/ws"),
+        ("vnc", "vnc/dev/{user}/{app}/x"),
     ] {
         let app = format!("app-e2e-{tool}");
         let url = format!(
-            "/userapp/{}",
+            "/api/v1/userapp/proxy/{}",
             path.replace("{user}", user).replace("{app}", &app)
         );
         let resp = no_redirect_client()
@@ -1034,7 +1034,9 @@ async fn test_terminal_proxy_redirects(env: &Env, report: &JsonlReporter) {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_owned();
-        let ok = status == 307 && location.contains("://") && location.contains("/userapp/");
+        let ok = status == 307
+            && location.contains("://")
+            && location.contains("/api/v1/userapp/proxy/");
         report.assert_hard(
             &format!("终端代理[{tool}] 主端口 → 307 + Location 重定向"),
             ok,
