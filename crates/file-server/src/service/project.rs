@@ -449,3 +449,284 @@ pub async fn export_project(
     }
     Ok(zip_path)
 }
+
+#[cfg(test)]
+mod tests {
+    //! project 域核心路径回归网（此前 0 测试、e2e 零命中）。
+    //! 锁住的偏移敏感点：
+    //! - delete 的 resolve 校验先于旁路目录 join（顺序颠倒 = 穿越防护静默失效）
+    //! - create 的错误变体分派（Validation vs Business——前端按 error.type 分流）
+    //! - copy 的源/目标双检
+    //! - remove_node_modules 的 symlink 分支（误递归 = 删掉链接目标的内容）
+
+    use super::*;
+    use crate::workspace::{LocalWorkspaceResolver, ProjectContext};
+    use std::path::PathBuf;
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        resolver: LocalWorkspaceResolver,
+        config: Config,
+    }
+
+    fn fixture() -> Fixture {
+        let root = tempfile::tempdir().expect("tempdir");
+        let resolver =
+            LocalWorkspaceResolver::new(root.path().join("ws"), root.path().join("computer"));
+        let mut config = Config::default();
+        config.upload_project_dir = root.path().join("uploads");
+        config.dist_target_dir = root.path().join("dist");
+        config.log_base_dir = root.path().join("logs");
+        config.init_project_dir = root.path().join("init");
+        config.git_enabled = false;
+        Fixture {
+            _root: root,
+            resolver,
+            config,
+        }
+    }
+
+    fn ctx(id: &str) -> ProjectContext {
+        ProjectContext {
+            project_id: id.to_string(),
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_traversal_id_before_touching_bypass_dirs() {
+        let f = fixture();
+        // 三个旁路目录（delete 直接按 project_id join，不经 resolver）预置哨兵
+        let bypass_dirs = [
+            f.config.upload_project_dir.clone(),
+            f.config.dist_target_dir.clone(),
+            f.config.log_base_dir.clone(),
+        ];
+        for dir in &bypass_dirs {
+            fs::create_dir_all(dir).await.expect("建旁路目录");
+            fs::write(dir.join("sentinel.txt"), b"x")
+                .await
+                .expect("写哨兵");
+        }
+
+        let result = delete_project(&f.resolver, &f.config, &ctx("../evil")).await;
+
+        assert!(
+            result.is_err(),
+            "非法 project_id 必须在 resolve 阶段被拒（validation）"
+        );
+        for dir in &bypass_dirs {
+            assert!(
+                dir.join("sentinel.txt").exists(),
+                "旁路目录 {} 的哨兵必须原封不动——resolve 拒绝是 join 的前提",
+                dir.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_non_whitelisted_template_with_validation_error() {
+        let f = fixture();
+        let err = create_project(&f.resolver, &f.config, &ctx("p1"), "angular")
+            .await
+            .map(|_: CreateResult| ())
+            .expect_err("模板白名单外必须拒绝");
+        assert!(
+            matches!(err, AppError::Validation(..)),
+            "模板白名单拒绝必须是 Validation 变体（前端按 error.type 分流）"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_duplicate_project_is_business_error() {
+        let f = fixture();
+        let ws = f._root.path().join("ws");
+        fs::create_dir_all(ws.join("dup"))
+            .await
+            .expect("预置已存在目录");
+
+        let err = create_project(&f.resolver, &f.config, &ctx("dup"), "react")
+            .await
+            .map(|_: CreateResult| ())
+            .expect_err("重名必须拒绝");
+        assert!(
+            matches!(err, AppError::Business(msg) if msg.contains("already exists")),
+            "重名必须是 Business 变体（与 Validation 的 400 同码不同 type）"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_requires_existing_source_and_missing_target() {
+        let f = fixture();
+        let ws = f._root.path().join("ws");
+
+        // 源不存在 → Business
+        let err = copy_project(&f.resolver, &f.config, &ctx("nope"), &ctx("t1"))
+            .await
+            .map(|_: CopyResult| ())
+            .expect_err("源不存在必须拒绝");
+        assert!(
+            matches!(err, AppError::Business(msg) if msg.contains("Source project does not exist")),
+            "源不存在必须是 Business 变体"
+        );
+
+        // 源在 + 目标在 → Business
+        fs::create_dir_all(ws.join("src")).await.expect("建源目录");
+        fs::create_dir_all(ws.join("tgt"))
+            .await
+            .expect("建目标目录");
+        let err = copy_project(&f.resolver, &f.config, &ctx("src"), &ctx("tgt"))
+            .await
+            .map(|_: CopyResult| ())
+            .expect_err("目标已存在必须拒绝");
+        assert!(
+            matches!(err, AppError::Business(msg) if msg.contains("already exists")),
+            "目标已存在必须是 Business 变体"
+        );
+    }
+
+    /// 上传 zip 夹具：tempdir 内一个源目录 + pack 成 zip
+    async fn make_zip(root: &Path, name: &str) -> PathBuf {
+        let src = root.join(format!("{name}-src"));
+        fs::create_dir_all(&src).await.expect("建 zip 源目录");
+        fs::write(src.join("index.txt"), format!("content of {name}"))
+            .await
+            .expect("写 zip 源文件");
+        let zip = root.join(format!("{name}.zip"));
+        crate::service::zip::pack_dir(src, zip.clone(), vec![], vec![])
+            .await
+            .expect("打包 zip");
+        zip
+    }
+
+    #[tokio::test]
+    async fn upload_v0_skips_backup_and_v2_backs_up_previous_version_zip() {
+        let f = fixture();
+        let ws = f._root.path().join("ws");
+        let proj = ws.join("app");
+        fs::create_dir_all(&proj).await.expect("建项目目录");
+        fs::write(proj.join("existing.txt"), "old")
+            .await
+            .expect("预置非空项目");
+
+        // v0 上传：version >= 1 不满足 → 无备份 zip
+        let zip0 = make_zip(f._root.path(), "up0").await;
+        upload_project(&f.resolver, &f.config, &ctx("app"), "0", &zip0)
+            .await
+            .expect("v0 上传应成功");
+        let backup_dir = f.config.upload_project_dir.join("app");
+        assert!(
+            !backup_dir.join("app-v0.zip").exists(),
+            "v0 上传不得产生任何版本备份 zip"
+        );
+
+        // 重建非空项目后 v2 上传：备份的是 v1（off-by-one 语义——备份前一号而非当前号）
+        fs::write(proj.join("regen.txt"), "old2")
+            .await
+            .expect("项目被 v0 换入后重置非空");
+        let zip2 = make_zip(f._root.path(), "up2").await;
+        upload_project(&f.resolver, &f.config, &ctx("app"), "2", &zip2)
+            .await
+            .expect("v2 上传应成功");
+        assert!(
+            backup_dir.join("app-v1.zip").exists(),
+            "v2 上传必须生成 v1 备份（备份前一号而非当前号）"
+        );
+        assert!(
+            !backup_dir.join("app-v2.zip").exists(),
+            "上传 zip 本体不得存为版本 zip"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_with_git_enabled_skips_zip_backup() {
+        let f = fixture();
+        let mut config = {
+            // 独立 config：git_enabled=true（zip 备份由 git 历史替代）
+            let mut c = f.config.clone();
+            c.git_enabled = true;
+            c
+        };
+        config.upload_project_dir = f._root.path().join("uploads-git");
+        let proj = f._root.path().join("ws").join("app");
+        fs::create_dir_all(&proj).await.expect("建项目目录");
+        fs::write(proj.join("existing.txt"), "old")
+            .await
+            .expect("预置非空项目");
+
+        let zip = make_zip(f._root.path(), "upg").await;
+        upload_project(&f.resolver, &config, &ctx("app"), "3", &zip)
+            .await
+            .expect("git 模式上传应成功");
+
+        assert!(
+            !config
+                .upload_project_dir
+                .join("app")
+                .join("app-v2.zip")
+                .exists(),
+            "git_enabled 模式不得产生 zip 备份（git 历史替代）"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_keeps_existing_prev_zip_untouched() {
+        let f = fixture();
+        let proj = f._root.path().join("ws").join("app");
+        fs::create_dir_all(&proj).await.expect("建项目目录");
+        fs::write(proj.join("existing.txt"), "old")
+            .await
+            .expect("预置非空项目");
+
+        // 预置哨兵 v1 zip（内容可鉴别）
+        let backup_dir = f.config.upload_project_dir.join("app");
+        fs::create_dir_all(&backup_dir).await.expect("建备份目录");
+        fs::write(backup_dir.join("app-v1.zip"), b"sentinel-bytes")
+            .await
+            .expect("预置哨兵备份");
+
+        let zip = make_zip(f._root.path(), "upx").await;
+        upload_project(&f.resolver, &f.config, &ctx("app"), "2", &zip)
+            .await
+            .expect("已存在备份时上传应成功");
+
+        let content = fs::read(backup_dir.join("app-v1.zip"))
+            .await
+            .expect("哨兵 zip 应仍存在");
+        assert_eq!(
+            content, b"sentinel-bytes",
+            "prev zip 已存在时必须跳过重打（幂等）"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_node_modules_unlinks_symlink_without_recursing_into_target() {
+        let f = fixture();
+        let external = f._root.path().join("external_store");
+        fs::create_dir_all(&external).await.expect("建外部目录");
+        fs::write(external.join("keep.txt"), b"payload")
+            .await
+            .expect("写外部内容");
+
+        let project = f._root.path().join("proj");
+        fs::create_dir_all(&project).await.expect("建项目目录");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&external, project.join("node_modules"))
+                .expect("造 node_modules symlink");
+        }
+
+        remove_node_modules(&project).await;
+
+        assert!(
+            !project.join("node_modules").exists(),
+            "symlink 本体应被移除"
+        );
+        assert!(
+            external.join("keep.txt").exists(),
+            "symlink 指向的外部内容绝不能被递归删除"
+        );
+    }
+}

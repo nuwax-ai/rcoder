@@ -307,3 +307,135 @@ fn is_no_commit_error(e: &impl std::fmt::Display) -> bool {
         || msg.contains("could not find")
         || msg.contains("not found")
 }
+
+#[cfg(test)]
+mod tests {
+    //! git 读服务回归网（read.rs 此前 0 测试）。
+    //! 锁住的偏移敏感点：
+    //! - file_content_at_ref 的 blob 缺失 = Ok(None)（handler 依赖此语义映射空串）
+    //! - 超限 blob = Validation（防整库读爆内存）
+    //! - get_status 的 5-bucket 分派（客户端按 bucket 渲染状态列表）
+    //! - log_history 尊重 max_count（handler 层 clamp 后传值）
+
+    use super::*;
+    use crate::service::git::write::{commit_indexed, init_repo, stage_path};
+    use gix::open;
+
+    struct TestRepo(std::path::PathBuf);
+
+    impl TestRepo {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "file-server-git-read-test-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create test repo");
+            init_repo(&path, "Test", "test@example.com").expect("init test repo");
+            Self(path)
+        }
+
+        fn open(&self) -> Repository {
+            open(&self.0).expect("open test repo")
+        }
+    }
+
+    impl Drop for TestRepo {
+        fn drop(&mut self) {
+            drop(std::fs::remove_dir_all(&self.0));
+        }
+    }
+
+    fn commit_file(test: &TestRepo, path: &str, data: &str, message: &str) -> String {
+        std::fs::write(test.0.join(path), data).expect("write fixture");
+        let repo = test.open();
+        stage_path(&repo, path).expect("stage fixture");
+        commit_indexed(&repo, message, "Test", "test@example.com").expect("commit fixture")
+    }
+
+    #[test]
+    fn file_content_at_ref_reads_blob_and_missing_path_yields_none() {
+        let t = TestRepo::new();
+        std::fs::create_dir_all(t.0.join("src")).expect("建父目录");
+        commit_file(&t, "src/app.txt", "hello", "c1");
+        let repo = t.open();
+
+        let content =
+            file_content_at_ref(&repo, "HEAD", "src/app.txt", 1024).expect("读 blob 不应失败");
+        assert_eq!(content.as_deref(), Some("hello"));
+
+        // blob 缺失 = Ok(None) 而非 Err——handler 据此映射为空串（静默契约）
+        let missing =
+            file_content_at_ref(&repo, "HEAD", "no/such/file.txt", 1024).expect("缺失路径不应报错");
+        assert_eq!(
+            missing, None,
+            "blob 缺失必须 Ok(None)（handler 空串语义的前提）"
+        );
+    }
+
+    #[test]
+    fn file_content_at_ref_rejects_blob_over_limit() {
+        let t = TestRepo::new();
+        commit_file(&t, "big.txt", "0123456789", "c1");
+        let repo = t.open();
+
+        let err = file_content_at_ref(&repo, "HEAD", "big.txt", 5).expect_err("超限 blob 必须拒绝");
+        assert!(
+            matches!(err, AppError::Validation(..)),
+            "超限必须是 Validation（而非把大文件读进内存后再失败）"
+        );
+    }
+
+    #[test]
+    fn get_status_buckets_staged_modified_and_untracked() {
+        let t = TestRepo::new();
+        commit_file(&t, "tracked.txt", "v1", "c1");
+        let repo = t.open();
+
+        // staged：新增并 stage
+        std::fs::write(t.0.join("staged_new.txt"), "x").expect("写文件");
+        stage_path(&repo, "staged_new.txt").expect("stage");
+
+        // modified：已跟踪文件改动（不 stage）
+        std::fs::write(t.0.join("tracked.txt"), "v2-dirty").expect("改文件");
+
+        // untracked：新文件不 stage
+        std::fs::write(t.0.join("fresh.txt"), "y").expect("写未跟踪");
+
+        let s = get_status(&repo).expect("status 不应失败");
+        assert_eq!(s.current.as_deref(), Some("main"));
+        assert!(
+            s.staged.iter().any(|p| p == "staged_new.txt"),
+            "stage 的新文件必须进 staged bucket: {:?}",
+            s.staged
+        );
+        assert!(
+            s.modified.iter().any(|p| p == "tracked.txt"),
+            "工作区改动必须进 modified bucket: {:?}",
+            s.modified
+        );
+        assert!(
+            s.untracked.iter().any(|p| p == "fresh.txt"),
+            "未跟踪文件必须进 untracked bucket: {:?}",
+            s.untracked
+        );
+    }
+
+    #[test]
+    fn log_history_respects_max_count() {
+        let t = TestRepo::new();
+        commit_file(&t, "a.txt", "1", "c1");
+        commit_file(&t, "a.txt", "2", "c2");
+        commit_file(&t, "a.txt", "3", "c3");
+        let repo = t.open();
+
+        let all = log_history(&repo, 50, 0, None, None).expect("全量 log");
+        assert_eq!(all.len(), 4, "init_repo 的 initial commit + 3 次提交");
+
+        let limited = log_history(&repo, 2, 0, None, None).expect("受限 log");
+        assert_eq!(limited.len(), 2, "service 必须尊重传入的 max_count 上限");
+    }
+}
