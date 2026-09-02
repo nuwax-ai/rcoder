@@ -19,7 +19,6 @@ workspace = true
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-structopt = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }

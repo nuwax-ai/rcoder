@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use im::HashSet as ImHashSet;
+use imbl::HashSet as ImHashSet;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

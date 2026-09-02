@@ -144,7 +144,6 @@ chrono = { version = "0.4", features = ["serde"] }
 notify = "8.2"
 
 # File system utilities
-tokio-fs = "0.1"
 path-clean = "1.0"
 
 # Utilities
@@ -171,7 +170,8 @@ parking_lot = "0.12"
 lockmap = "0.2.3"
 convert_case = "0.11"
 # Persistent data structures for CoW-friendly multi-session tracking (C2/M3 fix)
-im = { version = "15.1", features = ["serde"] }
+# imbl = im 的活跃维护 fork（im 15.1 已 unmaintained，RUSTSEC-2026-0248）
+imbl = { version = "7.0", features = ["serde"] }
 handlebars = { version = "6.4", features = ["rust-embed"] }
 rust-embed = "8.12"
 zstd = "0.13"
@@ -279,7 +279,6 @@ pingora-http = "0.8"
 pingora-proxy = { version = "0.8", features = ["rustls"] }
 pingora-load-balancing = { version = "0.8", features = ["rustls"] }
 matchit = "0.8"
-structopt = "0.3"
 
 bollard = { version = "0.21" }
 
@@ -297,6 +296,8 @@ encoding_rs = "0.8"
 mime_guess = "2"
 
 # Git (file-server, 纯 Rust; gitoxide 0.85 源码可参考)
+# ⚠️ 不能升 0.87.1：上游已移除 tree-editor feature（write.rs 的 edit_tree 依赖它），
+# 升级需重写树编辑逻辑；bisync yanked 随之搁置（非漏洞），等上游迁移路径明朗
 gix = { version = "0.86", features = ["tree-editor"] }
 
 # i18n (国际化)
