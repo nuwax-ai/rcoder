@@ -27,7 +27,7 @@ pub struct PortConfig {
     pub name: String,
     /// 容器端口
     pub port: u16,
-    /// 暴露类型
+    /// 暴露类型（枚举：`http` HTTP 访问 / `tcp` TCP 直连）
     pub expose_type: ExposeType,
     /// [HTTP 端口] 是否 strip `/apps/{app_id}` 前缀（EG URLRewrite）。
     /// - `None`/`true`（默认）：EG strip 前缀，后端收到 `/api`（与 Docker Pingora 一致）

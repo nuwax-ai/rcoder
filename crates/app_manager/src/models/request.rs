@@ -69,7 +69,7 @@ pub struct QueryAppsRequest {
     /// 排序字段
     #[garde(skip)]
     pub sort_by: Option<String>,
-    /// 排序方式
+    /// 排序方式（枚举：`asc` 升序 / `desc` 降序）
     #[garde(skip)]
     pub sort_order: Option<SortOrder>,
 }

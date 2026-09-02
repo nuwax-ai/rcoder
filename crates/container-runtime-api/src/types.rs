@@ -369,8 +369,11 @@ pub enum StorageResizeOutcome {
 /// 应用端口运行时状态（含实际分配的对外端口）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AppPortStatus {
+    /// 端口名
     pub name: String,
+    /// 容器端口
     pub port: u16,
+    /// 暴露类型（枚举：`http` HTTP 访问 / `tcp` TCP 直连）
     pub expose_type: ExposeType,
     /// K8s: NodePort；Docker: host_port；未暴露则为 None
     pub external_port: Option<u16>,

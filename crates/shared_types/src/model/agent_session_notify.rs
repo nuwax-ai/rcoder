@@ -21,7 +21,7 @@ pub enum SessionMessageType {
 pub struct UnifiedSessionMessage {
     /// 会话ID
     pub session_id: String,
-    /// 消息主类型
+    /// 消息主类型（枚举：`sessionPromptStart` / `sessionPromptEnd` / `agentSessionUpdate` / `acpRequestPermission` / `heartbeat`）
     pub message_type: SessionMessageType,
     /// 消息子类型
     pub sub_type: String,

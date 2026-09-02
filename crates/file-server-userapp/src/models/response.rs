@@ -10,8 +10,8 @@ use file_server::models::KilledPid;
 pub struct BuildCreatedData {
     /// 构建任务 ID（轮询 /tasks/{task_id} 与 SSE 订阅用）
     pub task_id: String,
-    /// 受理时状态（恒为 pending——异步任务已创建；与 /tasks/{task_id} 轮询共用
-    /// BuildTaskStatus 状态机，序列化值 "pending"）
+    /// 受理时状态（恒为 `pending`——异步任务已创建；与 /tasks/{task_id} 轮询共用
+    /// BuildTaskStatus 状态机：`pending` / `running` / `completed` / `failed` / `cancelled`）
     pub status: BuildTaskStatus,
     /// 预生成的产物相对路径（`builds/workspace-package-{release_id}.zip`，release_id
     /// 创建时即生成）——信息字段：标识本次构建的产物位置；实际取包按 app 直下
@@ -25,6 +25,7 @@ pub struct BuildCreatedData {
 pub struct CancelData {
     /// 被取消的任务 ID
     pub task_id: String,
+    /// 取消后任务状态（枚举：`pending` / `running` / `completed` / `failed` / `cancelled`）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<BuildTaskStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,7 +140,7 @@ pub struct UserappDevTaskCreated {
     pub app_id: String,
     /// 异步任务 ID（轮询 /api/v1/userapp/tasks/{task_id}、SSE /api/v1/userapp/tasks/{task_id}/logs/stream）
     pub task_id: String,
-    /// 受理时状态（恒为 pending——后台任务已创建；与 /tasks/{task_id} 轮询共用
-    /// BuildTaskStatus 状态机，序列化值 "pending"）
+    /// 受理时状态（恒为 `pending`——后台任务已创建；与 /tasks/{task_id} 轮询共用
+    /// BuildTaskStatus 状态机：`pending` / `running` / `completed` / `failed` / `cancelled`）
     pub status: BuildTaskStatus,
 }

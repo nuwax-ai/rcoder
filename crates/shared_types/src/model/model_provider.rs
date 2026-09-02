@@ -162,7 +162,7 @@ pub struct ModelProviderSafeInfo {
     /// 提供商名称
     #[schema(example = "openai")]
     pub name: String,
-    /// 模型接口协议类型
+    /// 模型接口协议类型（枚举：`anthropic` / `openai`）
     #[schema(example = "openai")]
     pub api_protocol: ModelApiProtocol,
     /// 默认模型名称

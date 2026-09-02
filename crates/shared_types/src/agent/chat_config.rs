@@ -255,7 +255,7 @@ pub const VALID_TOOL_KINDS: &[&str] = &[
 pub struct ModelEnvBinding {
     /// Agent 子进程环境变量名
     pub env_key: String,
-    /// 绑定来源
+    /// 绑定来源（枚举：`api_key` / `base_url` / `default_model` / `provider_name`）
     pub source: ModelEnvBindingSource,
 }
 

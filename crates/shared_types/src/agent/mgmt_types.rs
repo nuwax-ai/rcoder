@@ -145,9 +145,9 @@ pub enum AgentInstallStatus {
 pub struct AgentInfo {
     /// Agent ID
     pub agent_id: String,
-    /// 安装类型
+    /// 安装类型（枚举：`builtin` 内置 / `binary` 二进制 / `npm` / `url` / `unknown` 未知）
     pub install_type: InstallType,
-    /// 状态
+    /// 状态（枚举：`available` 可用 / `broken` 损坏 / `not_installed` 未安装 / `unknown` 未知）
     pub status: AgentInstallStatus,
     /// 版本(可选,部分 agent 无版本概念)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,11 +196,11 @@ pub struct StaticCheckResult {
 pub struct AgentDetailInfo {
     /// Agent ID
     pub agent_id: String,
-    /// 安装类型
+    /// 安装类型（枚举：`builtin` 内置 / `binary` 二进制 / `npm` / `url` / `unknown` 未知）
     pub install_type: InstallType,
     /// 是否已安装
     pub installed: bool,
-    /// 状态
+    /// 状态（枚举：`available` 可用 / `broken` 损坏 / `not_installed` 未安装 / `unknown` 未知）
     pub status: AgentInstallStatus,
     /// 版本(可选)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -441,7 +441,7 @@ pub struct InstallFromPackageManagerRequest {
 pub struct InstallAgentResponse {
     /// Agent ID
     pub agent_id: String,
-    /// 安装状态
+    /// 安装状态（枚举：`available` 可用 / `broken` 损坏 / `not_installed` 未安装 / `unknown` 未知）
     pub status: AgentInstallStatus,
     /// 二进制路径
     pub binary_path: String,
@@ -459,7 +459,7 @@ pub struct InstallAgentResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
     // === 多平台版本管理字段 ===
-    /// 本次操作类型
+    /// 本次操作类型（枚举：`installed` 新安装 / `updated` 更新 / `skipped` 跳过——版本已满足）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<InstallAction>,
     /// 本次是否实际执行了下载安装
@@ -571,7 +571,7 @@ pub struct UninstallAgentRequest {
 pub struct UninstallAgentResponse {
     /// 是否已卸载
     pub uninstalled: bool,
-    /// 被卸载的安装类型
+    /// 被卸载的安装类型（枚举：`builtin` / `binary` / `npm` / `url` / `unknown`）
     pub install_type: InstallType,
     /// 被卸载的 agent_id
     pub agent_id: String,

@@ -280,7 +280,7 @@ pub struct AgentStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "session123")]
     pub session_id: Option<String>,
-    /// Agent 服务状态（仅当 is_alive 为 true 时存在）
+    /// Agent 服务状态（仅当 is_alive 为 true 时存在；枚举：`Pending` 等待中 / `Active` 活跃 / `Idle` 空闲 / `Terminating` 终止中）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<AgentStatus>,
     /// 最后活动时间（仅当 is_alive 为 true 时存在）

@@ -850,3 +850,93 @@ fn agent_endpoints_userapp_dispatch_fields_are_documented() {
     // 其描述同样被上面断言覆盖到的 service_type/app_stage 钉住语义）
     assert!(checked >= 14, "分派字段覆盖数异常偏少: {checked}");
 }
+
+/// 枚举字段文档守卫：引用枚举 schema（utoipa 由 Rust enum 生成了 `enum` 值
+/// 数组）的字段，其 description（字段级 + oneOf/allOf/anyOf 子项合并）必须
+/// 列出**全部**枚举序列化值——同事按 swagger description 对接，Scalar 折叠
+/// $ref 时字段行看不到枚举值。2026-09 枚举值缺失 16 处批量补齐后立此守卫，
+/// 防空转回退；新增枚举 schema 自动纳入覆盖（清单动态发现，不硬编码）。
+#[test]
+fn enum_fields_document_all_serialized_values() {
+    let document = primary_document();
+    let json = serde_json::to_value(&document).expect("openapi to json");
+    let schemas = json
+        .pointer("/components/schemas")
+        .and_then(|v| v.as_object())
+        .expect("components.schemas");
+
+    // 动态发现枚举 schema（顶层带 enum 数组）
+    let enum_values: std::collections::HashMap<&str, Vec<&str>> = schemas
+        .iter()
+        .filter_map(|(name, sch)| {
+            sch.get("enum").and_then(|e| e.as_array()).map(|vals| {
+                (
+                    name.as_str(),
+                    vals.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
+                )
+            })
+        })
+        .collect();
+    assert!(
+        enum_values.len() >= 10,
+        "枚举 schema 动态发现异常偏少: {}",
+        enum_values.len()
+    );
+
+    let ref_name = |sub: &serde_json::Value| -> Option<String> {
+        sub.get("$ref")?
+            .as_str()?
+            .rsplit('/')
+            .next()
+            .map(str::to_owned)
+    };
+    let mut checked = 0usize;
+    for (name, sch) in schemas {
+        let Some(props) = sch.get("properties").and_then(|p| p.as_object()) else {
+            continue;
+        };
+        for (field, prop) in props {
+            // 引用枚举的字段：字段级 $ref 或组合子项 $ref
+            let referenced = prop
+                .get("$ref")
+                .and_then(|r| r.as_str())
+                .map(|r| r.rsplit('/').next().unwrap_or(r).to_owned())
+                .or_else(|| {
+                    ["oneOf", "allOf", "anyOf"].iter().find_map(|comb| {
+                        prop.get(comb)
+                            .and_then(|c| c.as_array())
+                            .and_then(|subs| subs.iter().find_map(|sub| ref_name(sub)))
+                    })
+                })
+                .and_then(|r| enum_values.get(r.as_str()));
+            let Some(values) = referenced else { continue };
+            // 合并字段级 + 组合子项 description（Option 枚举的 desc 落在
+            // oneOf 的 $ref 子项上——utoipa 生成形态）
+            let mut flat = String::new();
+            if let Some(d) = prop.get("description").and_then(|d| d.as_str()) {
+                flat.push_str(d);
+            }
+            for comb in ["oneOf", "allOf", "anyOf"] {
+                if let Some(subs) = prop.get(comb).and_then(|c| c.as_array()) {
+                    for sub in subs {
+                        if let Some(d) = sub.get("description").and_then(|d| d.as_str()) {
+                            flat.push(' ');
+                            flat.push_str(d);
+                        }
+                    }
+                }
+            }
+            let missing: Vec<&str> = values
+                .iter()
+                .filter(|v| !flat.contains(**v))
+                .copied()
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{name}.{field} 引用枚举但描述未列出全部值（缺 {missing:?}）: {flat}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 15, "枚举引用字段覆盖数异常偏少: {checked}");
+}

@@ -37,7 +37,9 @@ pub enum BuildTaskStatus {
 pub struct BuildTaskSnapshot {
     pub id: BuildTaskId,
     pub app_id: String,
+    /// 任务类型（枚举：`build` 发布构建 / `dev_start` 开发启动 / `dev_restart` 开发重启）
     pub kind: BuildTaskKind,
+    /// 任务状态（枚举：`pending` / `running` / `completed` / `failed` / `cancelled`）
     pub status: BuildTaskStatus,
     pub stage: Option<String>,
     /// 当前/失败中断的子项目 service_id（构建日志按 service_id 归档，
