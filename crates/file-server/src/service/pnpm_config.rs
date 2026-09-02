@@ -343,6 +343,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn package_json_round_trip_preserves_insertion_order() {
+        // serde_json preserve_order 特性的行为锁：sanitize_pnpm_built_deps 对
+        // package.json 是读-改-写回（from_str → remove 键 → to_string_pretty），
+        // 键序必须保持插入序——feature 丢失时 serde_json 静默退化为 BTreeMap
+        // 字母序，用户 version control 里的 package.json 会产生全量无关 diff。
+        // 刻意用非字母序键序：无此特性时本测试立即失败。
+        let raw = r#"{
+  "zzz": 1,
+  "name": "app",
+  "aaa": { "y": 1, "x": 2 },
+  "version": "0.1.0"
+}"#;
+        let parsed: Value = serde_json::from_str(raw).expect("合法 JSON");
+        let keys: Vec<&String> = parsed.as_object().expect("object").keys().collect();
+        assert_eq!(
+            keys,
+            ["zzz", "name", "aaa", "version"],
+            "解析必须保持插入序（preserve_order）"
+        );
+
+        let round_tripped: Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        let keys_after: Vec<&String> = round_tripped.as_object().unwrap().keys().collect();
+        assert_eq!(keys_after, keys, "序列化 round-trip 后键序必须不变");
+
+        let nested: Vec<&String> = round_tripped["aaa"].as_object().unwrap().keys().collect();
+        assert_eq!(nested, ["y", "x"], "嵌套对象同样保序");
+    }
+
+    #[test]
     fn npmrc_optimal_detects_copy_and_store() {
         assert!(npmrc_optimal("package-import-method=copy\n", None));
         assert!(!npmrc_optimal("package-import-method=hardlink\n", None));
