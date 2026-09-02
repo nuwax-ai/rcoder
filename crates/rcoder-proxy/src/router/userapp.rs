@@ -7,6 +7,7 @@
 //!   + 单端口回退，dev 走注册表定位开发容器）；user_id 不参与解析，未来归属鉴权锚点；
 //! - `ttyd`/`dbx`/`vnc`/`audio`/`ime` = 容器内工具服务（定位语义见 route_type.rs；
 //!   vnc/audio/ime 仅 dev——prod 无对应服务）。
+//!
 //! stage 段 dev/prod 全族统一（切环境只改一段）。
 
 use matchit::Router;

@@ -905,7 +905,7 @@ fn enum_fields_document_all_serialized_values() {
                     ["oneOf", "allOf", "anyOf"].iter().find_map(|comb| {
                         prop.get(comb)
                             .and_then(|c| c.as_array())
-                            .and_then(|subs| subs.iter().find_map(|sub| ref_name(sub)))
+                            .and_then(|subs| subs.iter().find_map(ref_name))
                     })
                 })
                 .and_then(|r| enum_values.get(r.as_str()));

@@ -186,8 +186,11 @@ fn auto_cleanup_invalid_env_falls_back_to_true() {
     let sb = Sandbox::new(vec!["RCODER_AUTO_CLEANUP"]);
     // 方法级直测（不经 load 全链——链路里 validate_multi_image_config 对
     // 缺镜像的默认骨架 fail-fast，与本测试目的无关）
-    let mut docker = rcoder::config::DockerConfig::default();
-    docker.auto_cleanup = Some(false); // 预置非默认原值，验证 unwrap_or(true) 会覆盖它
+    // 预置非默认原值 false，验证 unwrap_or(true) 会覆盖它
+    let mut docker = rcoder::config::DockerConfig {
+        auto_cleanup: Some(false),
+        ..Default::default()
+    };
     sb.set_env("RCODER_AUTO_CLEANUP", "not-a-bool");
 
     docker

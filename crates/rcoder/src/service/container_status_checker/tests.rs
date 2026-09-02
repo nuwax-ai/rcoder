@@ -5,15 +5,17 @@
 //! - check_container_exists 按 service_type 的查找键分派（分派轴改错 = 清理错容器）
 //! - 健康状态的清理双轴（不在存储 / 超期）
 
-use super::*;
+use super::checker::ContainerStatusChecker;
+use super::state::{ContainerHealthState, ContainerStatusCheckerConfig};
 use crate::config::AppConfig;
-use crate::grpc::SessionStreamRegistry;
+use crate::grpc::{GrpcChannelPool, SessionStreamRegistry};
 use crate::router::AppState;
 use crate::storage::{ProjectAdapter, ProjectStoreBackend};
 use agent_provisioning::AgentDownloadManager;
 use app_manager::config::{AppAccessMode, AppManagerConfig};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use chrono::Utc;
 use container_runtime_api::{
     AgentContainerRuntime, ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult,
     ContainerRuntimeStatus, RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
@@ -23,7 +25,9 @@ use shared_types::{
     ApiKeyAuthConfig, ContainerBasicInfo, ProjectAndContainerInfo, ProjectExtendedFields,
     ServiceType,
 };
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 /// find_container 的可重复响应行为（多次查询返回一致结果）
@@ -255,9 +259,11 @@ async fn record_success_resets_failure_state_completely() {
 #[tokio::test]
 async fn should_skip_requires_threshold_and_unexpired_window() {
     let state = test_state(Arc::new(ProbeRuntime::new(FindBehavior::Missing))).await;
-    let mut config = ContainerStatusCheckerConfig::default();
-    config.failure_threshold = 3;
-    config.skip_duration = Duration::from_secs(300);
+    let config = ContainerStatusCheckerConfig {
+        failure_threshold: 3,
+        skip_duration: Duration::from_secs(300),
+        ..Default::default()
+    };
     let c = checker(config, state);
 
     // 未达阈值：不跳过
@@ -368,25 +374,31 @@ async fn check_container_exists_treats_error_and_missing_user_id_as_absent() {
 async fn cleanup_stale_health_states_removes_unknown_or_expired_only() {
     let probe = Arc::new(ProbeRuntime::new(FindBehavior::Missing));
     let state = test_state(probe).await;
-    let mut config = ContainerStatusCheckerConfig::default();
-    config.health_reset_interval = Duration::from_secs(1800);
+    let config = ContainerStatusCheckerConfig {
+        health_reset_interval: Duration::from_secs(1800),
+        ..Default::default()
+    };
     let c = checker(config, state.clone());
 
     // 条目 A：不在 projects 存储 → 移除
     c.health_states
         .insert("unknown".to_string(), ContainerHealthState::new());
     // 条目 B：在存储且新近检查 → 保留
-    state.insert_project(
-        "known".to_string(),
-        container_info("known", Some("u"), ServiceType::WebAgentRunner),
-    );
+    state
+        .insert_project(
+            "known".to_string(),
+            container_info("known", Some("u"), ServiceType::WebAgentRunner),
+        )
+        .expect("插入 known");
     c.health_states
         .insert("known".to_string(), ContainerHealthState::new());
     // 条目 C：在存储但 last_check 超 reset 周期 → 移除
-    state.insert_project(
-        "stale".to_string(),
-        container_info("stale", Some("u"), ServiceType::WebAgentRunner),
-    );
+    state
+        .insert_project(
+            "stale".to_string(),
+            container_info("stale", Some("u"), ServiceType::WebAgentRunner),
+        )
+        .expect("插入 stale");
     c.health_states.insert(
         "stale".to_string(),
         ContainerHealthState {
