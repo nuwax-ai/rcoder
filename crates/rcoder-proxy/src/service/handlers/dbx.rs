@@ -1,4 +1,4 @@
-//! DBX 数据库 Web GUI 两阶段代理（`/userapp/{dev,prod}/dbx/{user_id}/{app_id}` 工具族）。
+//! DBX 数据库 Web GUI 两阶段代理（`/api/v1/userapp/proxy/dbx/{dev,prod}/{user_id}/{app_id}` 工具族）。
 //!
 //! dbx-web（60+ 数据库 GUI，supervisor 恒起 `DBX_PORT`=4224）的开发/生产双入口：
 //! - **dev**：UserappBuilder 开发容器（agent-runner 镜像）——注册表
@@ -8,7 +8,7 @@
 //!
 //! 代理剥前缀直连 root 模式 dbx：dbx 前端 `webPath.ts` 从
 //! location.pathname 运行时推断 base，index.html 全相对引用，API/WS 调用
-//! 自动拼回 `/userapp/{stage}/dbx/{app_id}` 前缀——无需容器侧配置
+//! 自动拼回完整代理前缀——无需容器侧配置
 //! `DBX_PUBLIC_BASE_PATH`。WebSocket（redis pubsub 等）由 Pingora 透传。
 
 use std::sync::Arc;

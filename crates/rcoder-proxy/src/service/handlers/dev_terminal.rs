@@ -485,7 +485,7 @@ pub async fn handle_runtime_ttyd_upstream(
     Ok(Box::new(peer))
 }
 
-/// 剩余路径 → 目标路径（空归一 "/"）。工具族路由 `/userapp/{stage}/{tool}/{app_id}/{*path}`
+/// 剩余路径 → 目标路径（空归一 "/"）。工具族路由 `/api/v1/userapp/proxy/{tool}/{stage}/{user_id}/{app_id}/{*path}`
 /// 中 tool 为静态段，剩余 path 可为空；与开发域 `target_path_of` 语义一致。
 pub(crate) fn runtime_target_path_of(params: &Params<'_, '_>) -> String {
     match params.get("path") {
