@@ -43,9 +43,18 @@ quality:
 # 测试覆盖率 HTML 报告（llvm-cov；排除 rcoder-e2e——环境门控型测试不可达即 skip）
 # ⚠️ 首次需插桩编译全 workspace，较慢
 # 例: make coverage / make coverage COV_PKGS="-p shared_types -p app_manager"
+# 分支覆盖开关: make coverage COV_BRANCH=1（默认关）
+# ⚠️ --branch 依赖 rustc `-Z coverage-options=branch`，仅 nightly 可用（stable 报
+#    "the option `Z` is only accepted on the nightly compiler"，已实测）；两种模式
+#    插桩产物共写 target/llvm-cov-target，切换开关即触发全量重插桩编译
 coverage:
 	@echo "🔍 测试覆盖率（llvm-cov；排除 rcoder-e2e）..."
-	@cargo llvm-cov --workspace --exclude rcoder-e2e --html --output-dir target/llvm-cov/html $(COV_PKGS)
+	@if [ "$(COV_BRANCH)" = "1" ]; then \
+		echo "🌿 分支覆盖启用（+nightly --branch）..."; \
+		cargo +nightly llvm-cov --branch --workspace --exclude rcoder-e2e --html --output-dir target/llvm-cov/html $(COV_PKGS); \
+	else \
+		cargo llvm-cov --workspace --exclude rcoder-e2e --html --output-dir target/llvm-cov/html $(COV_PKGS); \
+	fi
 	@echo "✅ 覆盖率报告: target/llvm-cov/html/html/index.html"
 
 # ============================================================================
