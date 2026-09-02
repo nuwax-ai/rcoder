@@ -51,3 +51,4 @@ tests/userapp_e2e_local/
 tests-e2e/reports/
 target-console/debug/build/ahash-8c244d12b1e0d55d/invoked.timestamp
 target-console/
+target-splitcheck/
