@@ -923,19 +923,32 @@ async fn userapp_dev_dbx_proxy() {
         return;
     }
 
-    // Pingora dev/dbx → builder 容器 dbx-web 4224 GUI 页
+    // Pingora dev/dbx → builder 容器 dbx-web 4224 GUI 页。
+    // 就绪轮询而非单发：ensure 刚建的开发容器里 dbx-web 恒起需 ~10s（产品行为
+    // =首访 502 秒级拉回、二访 200），单发断言在冷环境（dev-hot restart 后）必
+    // 撞 502 时序竞态；轮询只放宽就绪窗口，200 断言口径不变
     let pingora = std::env::var("E2E_PINGORA_URL")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:8089".to_owned());
-    let resp = env
-        .http
-        .get(format!(
-            "{pingora}/api/v1/userapp/proxy/dbx/dev/{user}/{app}/"
-        ))
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await;
+    let dbx_url = format!("{pingora}/api/v1/userapp/proxy/dbx/dev/{user}/{app}/");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut resp = None;
+    loop {
+        let r = env
+            .http
+            .get(&dbx_url)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await;
+        let ok = matches!(&r, Ok(r) if r.status().is_success());
+        if ok || Instant::now() >= deadline {
+            resp = Some(r);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let resp = resp.expect("至少一次请求");
     let ok = matches!(&resp, Ok(r) if r.status().is_success());
     report.assert_hard(
         "Pingora dev/dbx → 200（builder dbx-web GUI）",
