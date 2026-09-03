@@ -216,7 +216,6 @@ mod tests {
                 proxy: None,
                 logs: LogsSection::default(),
                 env: BTreeMap::new(),
-                static_content_dir: None,
             },
         }
     }

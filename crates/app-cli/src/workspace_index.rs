@@ -268,6 +268,7 @@ mod tests {
                 shutdown_timeout_seconds: 30,
             },
             devrun: None,
+            static_content_dir: None,
             health: Default::default(),
             proxy: Some(ProxySection {
                 path: if catchall { "/".into() } else { "/app".into() },
