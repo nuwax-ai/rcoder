@@ -157,6 +157,9 @@ pub struct DevrunSection {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunSection {
+    /// 段内缺省容忍（校验层统一把关：进程态空 command 报错/static 配置报错，
+    /// 比 serde missing field 的裸错更可操作）。
+    #[serde(default)]
     pub command: Vec<String>,
     #[serde(default)]
     pub migrate: Vec<String>,
