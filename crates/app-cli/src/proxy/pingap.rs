@@ -172,12 +172,17 @@ mod tests {
             with_index.contains("[locations.workspaceIndexLocation]"),
             "{with_index}"
         );
-        // 兜底 location 不写 path（pingap 默认权重 0）
-        let location_block = with_index
+        // 兜底 location 自身不写 path（pingap 默认权重 0）。块内容以段头截断——
+        // PingapConfig 的 locations 是 HashMap，toml 输出序不定，块后可能紧跟
+        // 其他 location（其 path 不得误伤本断言）。
+        let location_body = with_index
             .split("[locations.workspaceIndexLocation]")
             .nth(1)
-            .expect("location block");
-        assert!(!location_block.contains("path ="), "{with_index}");
+            .expect("location block")
+            .split('[')
+            .next()
+            .unwrap_or("");
+        assert!(!location_body.contains("path ="), "{with_index}");
 
         let without_index = build_pingap_config(&entries, None)
             .expect("serialize")
