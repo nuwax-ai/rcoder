@@ -98,11 +98,7 @@ fn router(workspace: PathBuf) -> Router {
 
 /// 根路径 → index.html；其余仅根一级文件（子目录 404，路径穿越 404）。
 /// HEAD 与 GET 同判定，但按协议剥 body 只留头。
-async fn serve(
-    State(workspace): State<PathBuf>,
-    method: axum::http::Method,
-    uri: Uri,
-) -> Response {
+async fn serve(State(workspace): State<PathBuf>, method: axum::http::Method, uri: Uri) -> Response {
     let path = uri.path();
     if path.contains("..") {
         return (StatusCode::NOT_FOUND, "not found").into_response();
