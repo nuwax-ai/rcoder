@@ -55,6 +55,9 @@ pub(super) async fn assemble_workspace_package(
 
             // 3. workspace.manifest.toml + 各 project.manifest.toml（app-cli 运行时读，编排子项目 + pingap）
             add_file_if_exists(&mut zw, &ws_for_task, "workspace.manifest.toml")?;
+            // workspace 首页（可选）：.run 解压后由 app-cli 内置静态服务 serve +
+            // pingap 兜底路由展示
+            add_file_if_exists(&mut zw, &ws_for_task, "index.html")?;
             zw.start_file("release.lock.toml", deflate_opts())
                 .map_err(|e| AppError::file(format!("start_file release.lock.toml: {e}")))?;
             use std::io::Write;
@@ -250,6 +253,8 @@ mod tests {
             "schema_version=1\n[workspace]\nname=\"x\"\n[pingap]\nmode=\"managed\"\n",
         )
         .unwrap();
+        // workspace 首页（app-cli 静态服务 serve；存在才进包）
+        std::fs::write(ws_path.join("index.html"), "<html>home</html>\n").unwrap();
         // database 目录（workspace 根 + 子项目；发布后平台自动执行其中的 .sql）
         std::fs::create_dir_all(ws_path.join("database")).unwrap();
         std::fs::write(
@@ -340,6 +345,11 @@ mod tests {
         assert!(root.join("scripts/lib/helpers.sh").is_file());
         // manifest 进包（app-cli 运行时读）
         assert!(root.join("workspace.manifest.toml").is_file());
+        // workspace 首页进包（.run 解压后 app-cli 静态服务 serve）
+        assert_eq!(
+            std::fs::read_to_string(root.join("index.html")).unwrap(),
+            "<html>home</html>\n"
+        );
         assert!(root.join("release.lock.toml").is_file());
         assert!(
             root.join("userapp-frontend/project.manifest.toml")
