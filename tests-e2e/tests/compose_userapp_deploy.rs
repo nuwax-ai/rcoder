@@ -721,7 +721,7 @@ async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str
     let (s, b) = post_json(
         env,
         "/api/v1/userapp/db/prod/reset-password",
-        json!({"app_id": app, "user_id": user, "new_password": "e2e-reset-pw-456"}),
+        json!({"app_id": app, "user_id": user, "password": "e2e-reset-pw-456"}),
     )
     .await;
     report.assert_hard(
@@ -759,7 +759,7 @@ async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str
     let (s, b) = post_json(
         env,
         "/api/v1/userapp/db/prod/reset-password",
-        json!({"app_id": "app-e2e-ghost-db", "user_id": user, "new_password": "x"}),
+        json!({"app_id": "app-e2e-ghost-db", "user_id": user, "password": "x"}),
     )
     .await;
     report.assert_hard(

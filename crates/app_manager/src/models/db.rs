@@ -7,7 +7,7 @@ use utoipa::ToSchema;
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResetDbPasswordRequest {
     /// 新密码（PG 密码，非空）
-    pub new_password: String,
+    pub password: String,
 }
 
 /// 新建 PG 库请求

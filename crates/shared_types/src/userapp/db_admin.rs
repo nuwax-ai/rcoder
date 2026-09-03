@@ -24,7 +24,7 @@ pub struct UserappDbResetPasswordRequest {
     /// 必填，白名单校验）
     pub user_id: String,
     /// 新密码（非空；允许任意字符含特殊符号）
-    pub new_password: String,
+    pub password: String,
     /// 目标账号名（可选，须过 PG 标识符白名单）：
     /// - 缺省：重置 superuser（`$POSTGRES_USER`，SQL CURRENT_USER 语义）
     /// - 指定：账号 upsert——角色已存在则 ALTER USER 改密，不存在则 CREATE ROLE 建号
@@ -205,13 +205,13 @@ mod tests {
     #[test]
     fn db_admin_requests_require_user_id() {
         let reset: UserappDbResetPasswordRequest = serde_json::from_value(serde_json::json!({
-            "app_id": "app-1", "user_id": "u1", "new_password": "p",
+            "app_id": "app-1", "user_id": "u1", "password": "p",
         }))
         .expect("full reset body");
         assert_eq!(reset.user_id, "u1");
         assert!(
             serde_json::from_value::<UserappDbResetPasswordRequest>(serde_json::json!({
-                "app_id": "app-1", "new_password": "p",
+                "app_id": "app-1", "password": "p",
             }))
             .is_err()
         );
