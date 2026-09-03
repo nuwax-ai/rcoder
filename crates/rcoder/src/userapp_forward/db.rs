@@ -1,19 +1,21 @@
-//! `POST /api/v1/userapp/db/{dev|prod}/align-credentials`：PG 凭据对齐。
+//! `POST /api/v1/userapp/db/{dev|prod}/reset-password|create-database`：
+//! Userapp PG 账号/库管理。
 //!
 //! 统一前缀 `/api/v1/userapp/db/*`（路径段区分环境，可滤镜、可扩展）：
-//! - `dev` → 该 app 的 UserappBuilder 开发容器（经容器内 file-server
-//!   `execute-command` HTTP 通道执行 psql）
-//! - `prod` → Userapp 运行容器（app_manager runtime exec 通道）
+//! - `dev` → 该 app 的 UserappBuilder 开发容器（exec 直达 builder 容器，
+//!   含 PG 就绪等待）
+//! - `prod` → Userapp 运行容器（app_manager runtime exec 通道，stopped 自动唤醒）
 //!
-//! 流程单头 [`shared_types::align_pg_credentials`]（验证 scram → 角色存在 →
-//! trust 重置 → 复验）；密码不落日志。
+//! 流程单头 [`shared_types::upsert_pg_user`]/[`create_pg_database`]；密码不落日志。
+//! （PG 凭据对齐不在此面——start 部署链内嵌（请求 `pg.username`/`pg.password`
+//! → 响应 `pg_aligned`），流程单头 `shared_types::align_pg_credentials`
+//! 供 app_manager 函数级消费，独立 HTTP 入口已下线。）
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::Json;
 use axum::extract::{Path, State};
-use serde_json::json;
 use tracing::info;
 
 // ExecRunner 方法语法调用所需（trait 本体经 shared_types 全路径引用）
@@ -21,190 +23,86 @@ use shared_types::PgCommandRunner as _;
 use shared_types::UserappStage;
 
 use crate::router::AppState;
-use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder_probed};
+use crate::userapp_builder::ensure_userapp_builder_probed;
 use crate::{AppError, HttpResult};
 
-/// 开发容器执行通道：容器内 file-server `execute-command`（cwd=workspace 须已存在，
-/// 故本 handler 前置幂等 ensure-workspace）。
-struct DevHttpRunner<'a> {
-    addr: &'a str,
-    app_id: &'a str,
-    user_id: &'a str,
-}
-
-#[async_trait]
-impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
-    async fn run(&self, command: &str) -> Result<shared_types::CommandOutcome, String> {
-        // 30s 客户端超时: 容器内 execute-command 的服务端超时默认 1800s(为长构建
-        // 设计), psql 秒级命令若 PG hang 会拖死对齐接口——传输层兜底
-        let resp = crate::http_client::shared_client()
-            .post(format!("{}/api/v1/userapp/execute-command", self.addr))
-            .timeout(std::time::Duration::from_secs(30))
-            .json(&json!({"app_id": self.app_id, "user_id": self.user_id, "command": command}))
-            .send()
-            .await
-            .map_err(|e| format!("dev container execute-command failed: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "dev container execute-command returned {status}: {text}"
-            ));
-        }
-        // 响应 {success, stdout, stderr, exit_code}（userapp 域 snake wire；
-        // 外层恒 success=true，结果由 exit_code 表达）
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("decode execute-command response: {e}"))?;
-        Ok(shared_types::CommandOutcome {
-            exit_code: body["exit_code"].as_i64().unwrap_or(-1),
-            stdout: body["stdout"].as_str().unwrap_or_default().to_string(),
-            stderr: body["stderr"].as_str().unwrap_or_default().to_string(),
-        })
-    }
-}
-
-/// `POST /api/v1/userapp/db/{app_stage}/align-credentials`
-#[utoipa::path(
-    post,
-    path = "/api/v1/userapp/db/{app_stage}/align-credentials",
-    request_body = shared_types::AlignCredentialsRequest,
-    params(
-        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）内的 PG；`prod`=运行容器（Userapp）内的 PG")
-    ),
-    responses(
-        (status = 200, description = "对齐完成（aligned=true；reset_performed 表示是否执行了重置）", body = HttpResult<shared_types::AlignCredentialsOutcome>),
-        (status = 400, description = "参数校验失败（app_stage/username/password）", body = HttpResult<String>),
-        (status = 404, description = "prod 环境 app 不存在或未运行", body = HttpResult<String>),
-        (status = 500, description = "开发容器不可达（ERR_CONTAINER_ERROR 映射 500，非 502）", body = HttpResult<String>)
-    ),
-    tag = "Userapp · 双态 · 数据库",
-    operation_id = "align_userapp_db_credentials",
-    summary = "PG 凭据对齐",
-    description = r#"
-校验目标容器内 PG 的账号密码与传入值是否一致（TCP scram 探测），不一致则用
-本地 trust 认证改密对齐并复验——**部署链 pg 凭据自动对齐的独立入口**。
-
-- 定位：body `app_id` + path `{app_stage}`（dev=开发容器 / prod=运行容器）；
-- `username` 指定目标账号（缺省 superuser）；`password` 为期望值；
-- dev 环境：容器不存在时幂等 ensure 开发容器（builder）；
-- prod 环境：app 不存在 → 404；stopped 自动唤醒并等待 PG 就绪
-  （唤醒窗口约 60s，超时报 InvalidState 可重试）；
-- 幂等：密码已一致时零改动作直接成功。
-
-**密码不落日志**；结果 message 区分"已一致/已重置"。
-"#,
-)]
-pub(crate) async fn align_credentials(
-    State(state): State<Arc<AppState>>,
-    Path(app_stage): Path<String>,
-    Json(body): Json<shared_types::AlignCredentialsRequest>,
-) -> Result<HttpResult<shared_types::AlignCredentialsOutcome>, AppError> {
-    let app_stage = UserappStage::parse(&app_stage)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
-    shared_types::validate_identifier(&body.app_id, "app_id")
-        .map_err(|e| AppError::bad_request(&e))?;
-    shared_types::validate_identifier(&body.user_id, "user_id")
-        .map_err(|e| AppError::bad_request(&e))?;
-
-    let outcome = match app_stage {
-        UserappStage::Dev => {
-            // 开发容器：ensure（幂等 + 探活自愈，stopped/exited builder 自动重建；
-            // owner 显式档=body user_id）+ ensure-workspace（execute-command 的 cwd 前置）
-            let (info, _recreated) =
-                ensure_userapp_builder_probed(&state, &body.app_id, Some(&body.user_id))
-                    .await
-                    .map_err(|e| {
-                        tracing::error!(
-                            "[USERAPP_DB_ALIGN] ensure dev container failed: app_id={}: {e:#}",
-                            body.app_id
-                        );
-                        AppError::with_message(
-                            shared_types::error_codes::ERR_CONTAINER_ERROR,
-                            format!("ensure dev container failed: {e:#}"),
-                        )
-                    })?;
-            let addr = dev_file_server_addr(&state, &info);
-            super::ensure_workspace_via_dev(&addr, &body.app_id, &body.user_id)
-                .await
-                .map_err(|e| {
-                    AppError::with_message(shared_types::error_codes::ERR_CONTAINER_ERROR, e)
-                })?;
-            let runner = DevHttpRunner {
-                addr: &addr,
-                app_id: &body.app_id,
-                user_id: &body.user_id,
-            };
-            shared_types::align_pg_credentials(&runner, &body.username, &body.password)
-                .await
-                .map_err(|e| AppError::with_message(align_error_code(&e), e.to_string()))?
-        }
-        UserappStage::Prod => state
-            .app_service
-            .align_db_credentials(&body.app_id, body.clone())
-            .await
-            .map_err(|e| {
-                // 与 dev 分支同一错误码语义：Validation（输入问题）→ ERR_VALIDATION；
-                // 其余（容器侧执行失败）→ ERR_CONTAINER_ERROR
-                let code = match &e {
-                    app_manager::AppOperationError::Validation(_) => {
-                        shared_types::error_codes::ERR_VALIDATION
-                    }
-                    _ => shared_types::error_codes::ERR_CONTAINER_ERROR,
-                };
-                AppError::with_message(code, format!("prod align failed: {e}"))
-            })?,
-    };
-
-    info!(
-        "[USERAPP_DB_ALIGN] aligned: app_stage={}, app_id={}, username={}, reset_performed={}",
-        app_stage.as_str(),
-        body.app_id,
-        body.username,
-        outcome.reset_performed
-    );
-    Ok(HttpResult::success(outcome))
-}
-
-/// 对齐流程错误的错误码映射（类型化 variant 匹配）：
-/// [`shared_types::AlignError::InvalidInput`] / [`RoleMissing`] 为调用方输入问题
-/// （400 语义）；[`Command`] 为容器侧执行失败（ERR_CONTAINER_ERROR）。
-fn align_error_code(err: &shared_types::AlignError) -> &'static str {
-    match err {
-        shared_types::AlignError::InvalidInput(_) | shared_types::AlignError::RoleMissing(_) => {
-            shared_types::error_codes::ERR_VALIDATION
-        }
-        shared_types::AlignError::Command { .. } => shared_types::error_codes::ERR_CONTAINER_ERROR,
-    }
-}
-
-// ── 账号/库管理（reset-password / create-database；与 align 同域扩展） ──────────
-
 /// rcoder 侧 PG 命令执行通道：`ContainerRuntime::exec`（容器内 `sh -c`）。
-/// dev 目标 = UserappBuilder 容器名；prod 目标 = app_id（pod 解析在 runtime
-/// 内部，与 app_manager 的 RuntimeExecRunner 同款）。
-struct ExecRunner<'a> {
-    runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
-    target: &'a str,
+/// rcoder 侧 PG 命令执行通道（对齐 shared_types::db_align 模块契约注释）：
+/// - dev：开发容器内 file-server `execute-command`（HTTP，容器内 `sh -c`
+///   同语义）——`ContainerRuntime::exec` 是 **Userapp 运行容器**的 app_id
+///   语义（目标拼 `rcoder-app-{id}`），传 builder 完整容器名会被再拼一层
+///   前缀致 404，不能用于 dev
+/// - prod：`ContainerRuntime::exec`（app_id → Userapp 运行容器，与
+///   app_manager 的 RuntimeExecRunner 同款）
+enum ExecChannel<'a> {
+    DevHttp {
+        /// dev 容器 file-server 基址（`dev_file_server_addr` 产出）
+        base: String,
+        app_id: String,
+        user_id: String,
+    },
+    ProdRuntime {
+        runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
+        app_id: String,
+    },
 }
 
 #[async_trait]
-impl shared_types::PgCommandRunner for ExecRunner<'_> {
+impl shared_types::PgCommandRunner for ExecChannel<'_> {
     async fn run(&self, command: &str) -> Result<shared_types::CommandOutcome, String> {
-        let r = self
-            .runtime
-            .exec(
-                self.target,
-                vec!["sh".to_string(), "-c".to_string(), command.to_string()],
-            )
-            .await
-            .map_err(|e| format!("exec failed: {e}"))?;
-        Ok(shared_types::CommandOutcome {
-            exit_code: r.exit_code,
-            stdout: r.stdout,
-            stderr: r.stderr,
-        })
+        match self {
+            Self::DevHttp {
+                base,
+                app_id,
+                user_id,
+            } => {
+                let resp = crate::http_client::shared_client()
+                    .post(format!("{base}/api/v1/userapp/execute-command"))
+                    .json(&serde_json::json!({
+                        "app_id": app_id,
+                        "user_id": user_id,
+                        "command": command,
+                    }))
+                    .timeout(std::time::Duration::from_secs(90))
+                    .send()
+                    .await
+                    .map_err(|e| format!("exec http failed: {e}"))?;
+                let status = resp.status();
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("exec http body: {e}"))?;
+                // execute-command 契约：外层恒 success=true（命令结果由
+                // exit_code 表示）；非 2xx / success=false 是通道层问题
+                if !status.is_success() || body["success"].as_bool() != Some(true) {
+                    return Err(format!(
+                        "execute-command rejected: HTTP {status}: {}",
+                        serde_json::to_string(&body).unwrap_or_else(|_| "<unserializable>".into())
+                    ));
+                }
+                // userapp 域 execute-command 响应键为 snake（exit_code——契约
+                // 测试 userapp_dev.rs:357 锁定）；-1 兜底 = 响应缺字段视为执行失败
+                Ok(shared_types::CommandOutcome {
+                    exit_code: body["exit_code"].as_i64().unwrap_or(-1),
+                    stdout: body["stdout"].as_str().unwrap_or_default().to_string(),
+                    stderr: body["stderr"].as_str().unwrap_or_default().to_string(),
+                })
+            }
+            Self::ProdRuntime { runtime, app_id } => {
+                let r = runtime
+                    .exec(
+                        app_id,
+                        vec!["sh".to_string(), "-c".to_string(), command.to_string()],
+                    )
+                    .await
+                    .map_err(|e| format!("exec failed: {e}"))?;
+                Ok(shared_types::CommandOutcome {
+                    exit_code: r.exit_code,
+                    stdout: r.stdout,
+                    stderr: r.stderr,
+                })
+            }
+        }
     }
 }
 
@@ -214,12 +112,12 @@ impl shared_types::PgCommandRunner for ExecRunner<'_> {
 /// - prod：`get_app` 前置（防 ensure_running 对不存在 app 的 AlreadyRunning
 ///   幻报）→ `activity.ensure_running` 自动唤醒（single-flight scale-up，
 ///   hold-and-wait ≤ wake_timeout 默认 60s；与文件透传/pod ensure prod 同款）
-async fn resolve_exec_target(
-    state: &AppState,
+async fn resolve_exec_target<'a>(
+    state: &'a AppState,
     app_stage: UserappStage,
     app_id: &str,
     user_id: &str,
-) -> Result<String, AppError> {
+) -> Result<ExecChannel<'a>, AppError> {
     match app_stage {
         UserappStage::Dev => {
             let (info, _recreated) = ensure_userapp_builder_probed(state, app_id, Some(user_id))
@@ -233,12 +131,14 @@ async fn resolve_exec_target(
                         format!("ensure dev container failed: {e:#}"),
                     )
                 })?;
-            // builder 内 PG 可能刚 initdb（新容器/重建后），等就绪再执行改密命令
-            let runner = ExecRunner {
-                runtime: &state.runtime().clone(),
-                target: &info.container_name,
+            // dev 通道：dev 容器 file-server execute-command（契约见 ExecChannel）
+            let channel = ExecChannel::DevHttp {
+                base: crate::userapp_builder::dev_file_server_addr(state, &info),
+                app_id: app_id.to_string(),
+                user_id: user_id.to_string(),
             };
-            let wait = runner
+            // builder 内 PG 可能刚 initdb（新容器/重建后），等就绪再执行改密命令
+            let wait = channel
                 .run(&shared_types::pg_utils::pg_wait_ready_cmd(60))
                 .await
                 .map_err(|e| {
@@ -256,7 +156,7 @@ async fn resolve_exec_target(
                     "dev builder postgres not ready after ensure",
                 ));
             }
-            Ok(info.container_name)
+            Ok(channel)
         }
         UserappStage::Prod => {
             if let Err(e) = state.app_service.get_app(app_id).await {
@@ -279,12 +179,12 @@ async fn resolve_exec_target(
                     ));
                 }
             }
-            // 唤醒后容器内 PG 启动窗口：等就绪再交还 exec 目标
-            let runner = ExecRunner {
-                runtime: &state.runtime().clone(),
-                target: app_id,
+            // 唤醒后容器内 PG 启动窗口：等就绪再交还 exec 通道
+            let channel = ExecChannel::ProdRuntime {
+                runtime: state.runtime(),
+                app_id: app_id.to_string(),
             };
-            let wait = runner
+            let wait = channel
                 .run(&shared_types::pg_utils::pg_wait_ready_cmd(60))
                 .await
                 .map_err(|e| {
@@ -302,12 +202,16 @@ async fn resolve_exec_target(
                     "userapp prod postgres not ready after wake",
                 ));
             }
-            Ok(app_id.to_string())
+            Ok(ExecChannel::ProdRuntime {
+                runtime: state.runtime(),
+                app_id: app_id.to_string(),
+            })
         }
     }
 }
 
-/// 账号/库管理流程错误的错误码映射（与 `align_error_code` 同构）。
+/// 账号/库管理流程错误的错误码映射（类型化 variant 匹配，与 db_align 的
+/// 对齐错误映射同构）。
 fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
     use shared_types::DbAdminError as E;
     match err {
@@ -363,12 +267,7 @@ pub(crate) async fn reset_password(
         return Err(AppError::bad_request("password must not be empty"));
     }
 
-    let target = resolve_exec_target(&state, app_stage, &body.app_id, &body.user_id).await?;
-    let runtime = state.runtime().clone();
-    let runner = ExecRunner {
-        runtime: &runtime,
-        target: &target,
-    };
+    let runner = resolve_exec_target(&state, app_stage, &body.app_id, &body.user_id).await?;
 
     // username 缺省 → 重置 superuser（CURRENT_USER 语义，与 computer 版/app_manager
     // 版同源）；指定 → 账号 upsert（存在 ALTER / 不存在 CREATE ROLE 建号）
@@ -453,12 +352,7 @@ pub(crate) async fn create_database(
     shared_types::validate_identifier(&body.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
 
-    let target = resolve_exec_target(&state, app_stage, &body.app_id, &body.user_id).await?;
-    let runtime = state.runtime().clone();
-    let runner = ExecRunner {
-        runtime: &runtime,
-        target: &target,
-    };
+    let runner = resolve_exec_target(&state, app_stage, &body.app_id, &body.user_id).await?;
     shared_types::create_pg_database(&runner, &body.database, body.owner.as_deref())
         .await
         .map_err(|e| AppError::with_message(db_admin_error_code(&e), e.to_string()))?;

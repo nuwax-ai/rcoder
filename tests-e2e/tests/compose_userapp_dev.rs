@@ -223,14 +223,15 @@ async fn userapp_dev_files_two_entry_points() {
 }
 
 // ============================================================
-// 场景 2：PG 凭据对齐 dev（全新容器 PG initdb 有就绪窗口，轮询收敛）
-//          首调 aligned=true；同密码复调 reset_performed=false（无 LLM 依赖）
+// 场景 2：PG 改密 dev（reset-password；全新容器 PG initdb 有就绪窗口，轮询收敛）
+//          首调成功（username upsert 建号）；同密码复调仍成功（upsert 幂等执行）
+//          （align-credentials HTTP 入口已下线——start 部署链内嵌对齐）
 // ============================================================
 #[tokio::test]
-async fn userapp_dev_pg_align_idempotent() {
+async fn userapp_dev_pg_reset_password() {
     rcoder_e2e::common::cross_bin_lock::acquire();
     let _gate = scenario_gate().await;
-    let scenario = "userapp_dev_pg_align";
+    let scenario = "userapp_dev_pg_reset_password";
     let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
         return;
     };
@@ -251,7 +252,7 @@ async fn userapp_dev_pg_align_idempotent() {
     while t0.elapsed() < deadline {
         let (s, b) = post_json(
             &env,
-            "/api/v1/userapp/db/dev/align-credentials",
+            "/api/v1/userapp/db/dev/reset-password",
             json!({"app_id": app, "user_id": user, "username": "dev", "password": pw}),
         )
         .await;
@@ -260,17 +261,15 @@ async fn userapp_dev_pg_align_idempotent() {
             break;
         }
         report.diagnostic(
-            "pg align retry（PG initdb 就绪窗口）",
+            "pg reset retry（PG initdb 就绪窗口）",
             &s.to_string(),
             &trunc(&b, 120),
         );
         tokio::time::sleep(Duration::from_secs(10)).await;
     }
-    let ok_first = first
-        .as_ref()
-        .is_some_and(|d| d["aligned"].as_bool() == Some(true));
+    let ok_first = first.is_some();
     report.assert_hard(
-        "首次对齐成功（scram 验证/trust 重置/复验）",
+        "首次改密成功（username upsert 建号/改密）",
         ok_first,
         format!("data: {:?}", first.as_ref().map(|d| trunc(d, 80))),
     );
@@ -280,16 +279,16 @@ async fn userapp_dev_pg_align_idempotent() {
         return;
     }
 
-    // 同密码复调：一致 → reset_performed=false（幂等语义）
+    // 同密码复调：upsert 幂等执行（ALTER 同密码再次成功，无状态翻转）
     let (_, b2) = post_json(
         &env,
-        "/api/v1/userapp/db/dev/align-credentials",
+        "/api/v1/userapp/db/dev/reset-password",
         json!({"app_id": app, "user_id": user, "username": "dev", "password": pw}),
     )
     .await;
-    let ok_second = http_ok(&b2) && b2["data"]["reset_performed"].as_bool() == Some(false);
+    let ok_second = http_ok(&b2);
     report.assert_hard(
-        "同密码复调 reset_performed=false（幂等）",
+        "同密码复调仍成功（upsert 幂等执行）",
         ok_second,
         trunc(&b2, 120),
     );
