@@ -39,12 +39,14 @@ fn app_id_of_key(key: &str) -> Option<&str> {
 
 /// 编译并启动 dev 服务
 ///
-/// 异步任务：编译可能数分钟，受理即返 task_id。manifest 同核编译（与生产构建同核，dev 编译通过=可部署）
-/// 成功后启动 dev 服务（Userapp workspace = spawn app-cli 按 manifest
-/// run.command 编排全栈，pingap 9080 统一入口）；编译失败任务终态 Failed、
-/// 不启动。进度/结果：轮询 `GET /api/v1/userapp/tasks/{task_id}`、SSE
-/// `/api/v1/userapp/tasks/{task_id}/logs/stream`；终态后端口经
-/// `GET /api/v1/userapp/dev/list` 查询（Userapp workspace 恒为 pingap 9080）。
+/// 异步任务：编译可能耗时，受理即返 task_id。任一服务配了 `[devrun]` 时走**源码态**：
+/// 编译执行 `[devbuild].command`（缺省回落 `[build].command`，刷新源码目录产物、不打
+/// zip），随后 app-cli 直接编排源码 workspace 并以 `[devrun].command`（缺省回落
+/// `[run].command`）启动——热加载命令（vite/nodemon 等）改码即生效。未配 `[devrun]`
+/// 的 app 走产物态（现状）：manifest 同核编译打 zip → 部署 `.run` → `[run].command`
+/// （dev 编译通过=可部署）。编译失败任务终态 Failed、不启动。进度/结果：轮询
+/// `GET /api/v1/userapp/tasks/{task_id}`、SSE `/api/v1/userapp/tasks/{task_id}/logs/stream`；
+/// 终态后端口经 `GET /api/v1/userapp/dev/list` 查询（Userapp workspace 恒为 pingap 9080）。
 /// 入参 basePath 对 Userapp workspace（manifest/app-cli 引擎）**无效**
 /// ——pingap 路由前缀由各服务 project.manifest.toml `[proxy].path` 决定。
 #[utoipa::path(
@@ -129,10 +131,12 @@ pub(crate) async fn dev_stop(
 
 /// 编译并重启 dev 服务
 ///
-/// agent 改完代码后的开发闭环——**重启前必须先编译**，新代码才生效；异步任务立即返 task_id，编译
-/// 可能数分钟。manifest 同核编译成功后 stop + start（app-cli 重拉全栈）；
-/// 编译失败任务终态 Failed、旧服务原样保留（可继续用旧版本测试，不因
-/// 中间态断流）。进度/结果查询同 start。入参 basePath 对 Userapp
+/// agent 改完代码后的开发闭环——**重启前必须先编译**；异步任务立即返 task_id。
+/// 任一服务配了 `[devrun]` 时走**源码态**：编译执行 `[devbuild].command`（缺省回落
+/// `[build].command`），源码目录 release.lock 按 manifest 新旧自动重锁后 app-cli
+/// 重编源码 workspace（`[devrun]` 优先）；未配则产物态（现状：同核编译打 zip →
+/// `.run` 换入）。编译失败任务终态 Failed、旧服务原样保留（可继续用旧版本测试，
+/// 不因中间态断流）。进度/结果查询同 start。入参 basePath 对 Userapp
 /// workspace 无效（同 start 的说明）。
 #[utoipa::path(
     post,
@@ -194,8 +198,22 @@ async fn spawn_dev_task(
     let artifact_rel_path = crate::service::userapp::workspace_artifact_rel_path(&release_id);
     task.set_artifact_path(release_id.clone(), artifact_rel_path.clone())
         .await;
-    match resolve_userapp_dev(app_id, None, &state.fs.config) {
-        Ok(ws) => task.set_workspace_root(ws.clone()).await,
+    // 源码态判定（[devrun] 触发，单一事实源）：决定 dev 编译/启动链路形态。
+    // 判定失败（manifest 坏等）与 resolve 失败同款 fail-fast——受理即终态 Failed。
+    let dev_source_mode = match resolve_userapp_dev(app_id, None, &state.fs.config) {
+        Ok(ws) => {
+            task.set_workspace_root(ws.clone()).await;
+            match crate::service::userapp::dev_mode::dev_mode_enabled(&ws) {
+                Ok(mode) => mode,
+                Err(e) => {
+                    task.emit(shared_types::BuildProgressEvent::Failed {
+                        error: format!("dev mode detection: {e}"),
+                    })
+                    .await;
+                    return Ok(task.id.clone());
+                }
+            }
+        }
         Err(e) => {
             task.emit(shared_types::BuildProgressEvent::Failed {
                 error: format!("resolve workspace: {e}"),
@@ -203,7 +221,7 @@ async fn spawn_dev_task(
             .await;
             return Ok(task.id.clone());
         }
-    }
+    };
     let app_id = app_id.to_string();
     let task_clone = task.clone();
     tokio::spawn(async move {
@@ -212,29 +230,45 @@ async fn spawn_dev_task(
             // set_workspace_root 已成功才走到 spawn；防御分支
             std::path::PathBuf::from(".")
         });
-        // manifest 同核编译（单一编译事实源）：discover_projects → 逐子项目
-        // 执行 project.manifest.toml 的 [build].command——与发布打包
-        // build_workspace_package 完全同核（顺带产出制品 zip，dev 编译通过
-        // = 可部署）。此前误用 web 域的 package.json/pnpm 引擎（vite 项目
-        // 专用），对 Userapp 模板项目（Java/Go 多服务）不适用。
+        // 编译（形态分派）：
+        // - 产物态（现状）：manifest 同核编译（单一编译事实源）——discover →
+        //   逐子项目 [build].command → 组 workspace zip（dev 编译通过 = 可部署）。
+        // - 源码态（[devrun] 触发）：逐服务 [devbuild].command（缺省回落
+        //   [build].command）刷新源码目录产物——不打 zip（热加载命令跑源码，
+        //   制品无消费者；可部署性检查走 /api/v1/userapp/build）。
         let progress = task_clone.clone();
-        let result = crate::service::userapp::build_workspace_package(
-            &state.fs.config,
-            &state.fs.build_manager,
-            &app_id,
-            &release_id,
-            state.fs.config.dev_command_timeout_secs,
-            Some(progress),
-        )
-        .await;
+        let result = if dev_source_mode {
+            crate::service::userapp::dev_mode::run_dev_builds(
+                &state.fs.build_manager,
+                &app_id,
+                &ws,
+                state.fs.config.dev_command_timeout_secs,
+                Some(progress),
+            )
+            .await
+            .map(|()| None)
+        } else {
+            crate::service::userapp::build_workspace_package(
+                &state.fs.config,
+                &state.fs.build_manager,
+                &app_id,
+                &release_id,
+                state.fs.config.dev_command_timeout_secs,
+                Some(progress),
+            )
+            .await
+            .map(Some)
+        };
         let outcome = async {
             // Start 快速路径：服务已在跑 → 跳过启停直接完成（廉价幂等）。
-            // 注意：此处编译已在上方 await 完（build_workspace_package 产出
-            // 新 zip 但不部署不重启——已运行进程不加载新代码，要上新代码
-            // 用 restart）；快速路径仅省去解压换入与启停。
+            // 注意：此处编译已在上方 await 完（产物态产出新 zip 但不部署不重启
+            // ——已运行进程不加载新代码，要上新代码用 restart；源码态同理——
+            // dev 编译刷新源码目录产物，热加载服务自身决定是否热更）。
+            // 快速路径仅省去解压换入/锁 ensure 与启停。
             if matches!(action, DevTaskAction::Start)
                 && state
-                    .fs.dev_server
+                    .fs
+                    .dev_server
                     .list_dev()?
                     .iter()
                     .any(|p| p.project_id == key)
@@ -250,24 +284,29 @@ async fn spawn_dev_task(
                 tracing::info!(%app_id, "dev task cancelled after build; skipping start/restart");
                 return Ok(());
             }
-            // zip 部署（与生产部署物一致）：解压制品包到 {ws}/.run 并原子换入
-            // ——dev 运行的是编译产物而非源码目录。解压/校验失败时旧 .run
-            // 原样保留（运行中服务不受影响），任务 Failed。
-            let run =
-                crate::service::userapp::run_dir::prepare_run_dir(&ws, &release_id).await?;
-            // 启动/重启（app-cli --workspace 指向 .run；失败整体 Failed——
-            // restart 场景旧服务已被 stop，语义上本轮失败，下次重试）
+            // 启动 workspace 根（形态分派）：
+            // - 产物态：zip 部署到 {ws}/.run 原子换入（dev 运行编译产物）。
+            // - 源码态：ensure 源码目录 release.lock（mtime 检测自动重锁），
+            //   app-cli 直接编排源码 workspace（devrun 优先、run 兜底）。
+            // 两种形态失败语义一致：旧运行态原样保留，任务 Failed。
+            let run_root = if dev_source_mode {
+                crate::service::userapp::dev_mode::ensure_dev_lock(&ws).await?
+            } else {
+                crate::service::userapp::run_dir::prepare_run_dir(&ws, &release_id).await?
+            };
+            // 启动/重启（失败整体 Failed——restart 场景旧服务已被 stop，
+            // 语义上本轮失败，下次重试）
             match action {
                 DevTaskAction::Start => {
                     state
                         .fs.dev_server
-                        .start_dev(&key, &run, base_path.as_deref())
+                        .start_dev(&key, &run_root, base_path.as_deref())
                         .await?;
                 }
                 DevTaskAction::Restart => {
                     state
                         .fs.dev_server
-                        .restart_dev(&key, &run, base_path.as_deref())
+                        .restart_dev(&key, &run_root, base_path.as_deref())
                         .await?;
                 }
             }

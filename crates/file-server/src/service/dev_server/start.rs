@@ -251,7 +251,10 @@ impl DevServerManager {
         let main_log = ldir.join(log::main_log_name());
         let temp_log = ldrtemp(&ldir, now);
 
-        // 管理 API 绑随机端口（dev 场景无人消费，避免多实例撞 3010）
+        // 管理 API 绑随机端口（dev 场景无人消费，避免多实例撞 3010）。
+        // env 注入 APP_CLI_RUN_PROFILE=dev：源码态 dev 链路信号——app-cli 编排
+        // 时 [devrun].command 优先、[run].command 兜底（产物态/生产不注入恒走
+        // [run]，见 app-cli supervisor::effective_run_argv）。
         let (child, stdout, stderr) = process::spawn_dev(
             "app-cli",
             &[
@@ -263,7 +266,7 @@ impl DevServerManager {
                 "127.0.0.1:0".to_string(),
             ],
             project_path,
-            &[],
+            &[("APP_CLI_RUN_PROFILE".to_string(), "dev".to_string())],
         )?;
         let pid = child
             .id()

@@ -11,6 +11,7 @@
 //! - `pingap`：pingap 反代配置（`pingap.toml`）+ `.service-ports` 生成（独立可扩展）
 
 mod assemble;
+pub mod dev_mode;
 pub mod hygiene;
 pub mod import;
 mod manifest;
@@ -153,35 +154,8 @@ pub async fn build_workspace_package(
             })
             .await;
         }
-        // 构建输出逐行转 Log 事件：unbounded 通道 + 独立消费 task（emit 为 async，
-        // 管道回调同步 send 行）。run_command_to_log 返回前已 drain 管道——返回后
-        // drop 闭包关通道 → 消费 task 排空 join → 才 emit BuildOk/BuildFail，
-        // 顺序严格为 building → log* → build_ok/build_fail。
-        let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let line_task = {
-            let task = progress.clone();
-            let service = proj.service_id().to_string();
-            tokio::spawn(async move {
-                let mut rx = line_rx;
-                while let Some(line) = rx.recv().await {
-                    if let Some(task) = &task {
-                        task.emit(BuildProgressEvent::Log {
-                            service: service.clone(),
-                            line,
-                        })
-                        .await;
-                    }
-                }
-            })
-        };
-        let line_cb: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |line: &str| {
-            // 超长行截断（UTF-8 边界安全）：minified 产物输出单行可达数 MB，
-            // 无界行 × 回放环 4000 条会吃掉数百 MB 内存。只截事件流展示副本，
-            // 文件落盘保持完整（深度排障看日志文件）。
-            let line = truncate_at_char(line, MAX_LOG_EVENT_LINE_BYTES);
-            // 接收端关闭（理论不达）时静默丢弃该行
-            drop(line_tx.send(line));
-        });
+        // 构建输出逐行转 Log 事件（共用管道，保序约定见 fn 文档）
+        let (line_cb, line_task) = spawn_build_log_pipe(&progress, proj.service_id());
         // 构建日志按 service_id 归档（稳定身份：改目录名日志归档连续，且与
         // 运行时 /app/logs/<service_id> 同轴）
         let log_dir = ws.join("logs").join(proj.service_id());
@@ -387,6 +361,47 @@ pub async fn start_build_task(
         }
     });
     Ok((task.id.clone(), artifact_path))
+}
+
+/// 构建输出行回调（同步 send 进管道通道；Arc 式跨入 spawn task）。
+pub(super) type BuildLineCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// 构建输出逐行转 Log 事件的管道：unbounded 通道 + 独立消费 task（emit 为
+/// async，管道回调同步 send 行）。返回 (行回调, 消费 task join 句柄)。
+///
+/// 调用方保序约定（building → log\* → build_ok/build_fail 严格有序）：
+/// run_command_to_log 返回前已 drain 管道——返回后 drop 行回调关通道 →
+/// await join 排空 → 才 emit 本服务的 BuildOk/BuildFail。
+pub(super) fn spawn_build_log_pipe(
+    progress: &Option<Arc<BuildTask>>,
+    service_id: &str,
+) -> (BuildLineCallback, tokio::task::JoinHandle<()>) {
+    let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let line_task = {
+        let task = progress.clone();
+        let service = service_id.to_string();
+        tokio::spawn(async move {
+            let mut rx = line_rx;
+            while let Some(line) = rx.recv().await {
+                if let Some(task) = &task {
+                    task.emit(BuildProgressEvent::Log {
+                        service: service.clone(),
+                        line,
+                    })
+                    .await;
+                }
+            }
+        })
+    };
+    let line_cb: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |line: &str| {
+        // 超长行截断（UTF-8 边界安全）：minified 产物输出单行可达数 MB，
+        // 无界行 × 回放环 4000 条会吃掉数百 MB 内存。只截事件流展示副本，
+        // 文件落盘保持完整（深度排障看日志文件）。
+        let line = truncate_at_char(line, MAX_LOG_EVENT_LINE_BYTES);
+        // 接收端关闭（理论不达）时静默丢弃该行
+        drop(line_tx.send(line));
+    });
+    (line_cb, line_task)
 }
 
 fn required_release_metadata(name: &str) -> AppResult<String> {
