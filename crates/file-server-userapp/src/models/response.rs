@@ -132,6 +132,63 @@ pub struct UserappDevList {
     pub list: Vec<UserappDevProcess>,
 }
 
+// ── workspace 框架识别（GET /dev/framework-info）─────────────────────────────
+
+/// 单维度框架识别结果（build 与 ui 两维度同构）。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappFrameworkDetection {
+    /// 稳定标识：build 维度 `nextjs`/`nuxt`/`remix`/`astro`/`sveltekit`/
+    /// `solid-start`/`gatsby`/`docusaurus`/`angular`/`create-react-app`/
+    /// `vue-cli`/`rsbuild`/`vite`/`webpack`；ui 维度 `react`/`vue3`/`vue2`/
+    /// `vue`/`svelte`/`solid`/`preact`/`angular`；无法识别 `other`
+    pub name: String,
+    /// 人类可读名（如 "Next.js"/"Vite"/"React"）
+    pub display_name: String,
+    /// package.json 依赖声明原样（如 "^5.4.21"；未声明为空串）
+    pub declared_range: String,
+    /// 框架版本（best effort，三级口径精确度递减；提取不到为 null）
+    pub version: Option<String>,
+    /// 版本来源：`installed`（node_modules 实际安装版本，最准）/
+    /// `declared_pinned`（声明为精确版本如 "16.2.12"）/ `declared_range`
+    ///（从 "^x.y.z" 提取，仅最低位可信）/ `none`
+    pub version_source: String,
+}
+
+/// 单服务的识别结果（manifest 声明面 + 探测面）。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappServiceFrameworkInfo {
+    /// 服务稳定身份（manifest [project].service_id）
+    pub service_id: String,
+    /// 人类可读服务名（manifest [project].name）
+    pub name: String,
+    /// 服务语言/形态（manifest [project].type 权威声明：
+    /// node/java/python/go/rust/static）
+    pub r#type: String,
+    /// 服务类别（manifest [project].kind：web/worker）
+    pub kind: String,
+    /// workspace 内一级子目录名
+    pub dir: String,
+    /// 是否参与构建/启动（manifest [project].enabled）
+    pub enabled: bool,
+    /// 包管理器（`pnpm`/`npm`/`yarn`/`bun`：packageManager 字段 > lockfile
+    /// 存在性判定；无 package.json 的非 Node 服务为 null）
+    pub package_manager: Option<String>,
+    /// 项目使用 TypeScript（typescript 依赖或 tsconfig.json 存在）
+    pub typescript: bool,
+    /// 构建/meta 框架识别（vite/nextjs/nuxt 等；与 ui 维度正交可同真——
+    /// next 项目 build=nextjs 且 ui=react）
+    pub build_framework: UserappFrameworkDetection,
+    /// UI 框架识别（react/vue3/vue2/svelte 等；vue 细分仅凭 vue 本体主版本）
+    pub ui_framework: UserappFrameworkDetection,
+}
+
+/// workspace 框架识别响应 data（`GET /dev/framework-info`）。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappFrameworkInfo {
+    /// 全部服务（含 disabled，enabled 字段自明）的识别结果清单
+    pub services: Vec<UserappServiceFrameworkInfo>,
+}
+
 /// dev 异步任务受理响应 data（POST /dev/start、/dev/restart——编译+启停）。
 /// 字段 snake_case 对齐 BuildCreatedData（Java 同一消费面）。
 #[derive(Serialize, utoipa::ToSchema)]

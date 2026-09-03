@@ -17,7 +17,8 @@ use super::userapp::{UserAppReply, reply};
 use crate::UserAppState;
 use crate::models::{
     BuildTaskStatus, DevOpBody, UserappDevList, UserappDevListQuery, UserappDevProcess,
-    UserappDevStopped, UserappDevTaskCreated,
+    UserappDevStopped, UserappDevTaskCreated, UserappFrameworkDetection, UserappFrameworkInfo,
+    UserappFrameworkInfoQuery, UserappServiceFrameworkInfo,
 };
 use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppQuery as Query};
@@ -536,6 +537,75 @@ pub(crate) async fn dev_list(
     reply(result.await)
 }
 
+/// workspace 框架识别
+///
+/// 识别该 app workspace 下**全部服务**（含 disabled，`enabled` 字段自明）的技术栈：
+/// - **manifest 声明面**（权威）：service_id/type（node/java/python/go/rust/static）/
+///   kind/dir/enabled
+/// - **探测面**（package.json + 文件系统，纯只读毫秒级）：`build_framework`
+///（构建/meta 框架：vite/nextjs/nuxt/astro/sveltekit 等 14 种）、`ui_framework`
+///（react/vue3/vue2/svelte 等，与 build 维度**正交可同真**——next 项目
+/// build=nextjs 且 ui=react）、每维度框架版本（三级口径：node_modules 实测 >
+/// 精确声明 > range 提取，`version_source` 自明）、`package_manager`、`typescript`
+///
+/// 无法识别为 `name: "other"`（恒有值免判空）。design 设计模式支持判定建议：
+/// `build_framework.name == "vite"`（设计模式注入插件为 vite 插件）。
+#[utoipa::path(
+    get,
+    path = "/dev/framework-info",
+    params(UserappFrameworkInfoQuery),
+    responses((status = 200, body = HttpResult<UserappFrameworkInfo>, description = "全部服务的技术栈识别结果（manifest 声明面 + 框架探测面）")),
+    tag = "Userapp · dev · 进程管理"
+)]
+pub(crate) async fn framework_info(
+    State(state): State<UserAppState>,
+    Query(q): Query<UserappFrameworkInfoQuery>,
+) -> UserAppReply<UserappFrameworkInfo> {
+    let result = async {
+        shared_types::validate_identifier(&q.app_id, "app_id")
+            .map_err(|e| AppError::validation(e.to_string()))?;
+        shared_types::validate_identifier(&q.user_id, "user_id")
+            .map_err(|e| AppError::validation(e.to_string()))?;
+        let ws = resolve_userapp_dev(&q.app_id, None, &state.fs.config)?;
+        // discover 严格模式：manifest 损坏即 400（识别接口必须给出可信清单，
+        // 静默跳过坏服务会让调用方误判 workspace 结构）
+        let discovered = shared_types::discover_projects(&ws)
+            .map_err(|e| AppError::business(format!("discover workspace services: {e}")))?;
+        let services = discovered
+            .iter()
+            .map(|project| {
+                let dir = ws.join(&project.dir);
+                let detected = frontend_detector::detect_project(&dir);
+                UserappServiceFrameworkInfo {
+                    service_id: project.service_id().to_string(),
+                    name: project.manifest.project.name.clone(),
+                    r#type: format!("{:?}", project.manifest.project.r#type).to_lowercase(),
+                    kind: format!("{:?}", project.manifest.project.kind).to_lowercase(),
+                    dir: project.dir.clone(),
+                    enabled: project.manifest.project.enabled,
+                    package_manager: detected.package_manager,
+                    typescript: detected.typescript,
+                    build_framework: to_detection(detected.build),
+                    ui_framework: to_detection(detected.ui),
+                }
+            })
+            .collect();
+        Ok(UserappFrameworkInfo { services })
+    };
+    reply(result.await)
+}
+
+/// detector 领域结构 → wire DTO（分层：探测归 frontend-detector，展示归壳层）。
+fn to_detection(hit: frontend_detector::FrameworkHit) -> UserappFrameworkDetection {
+    UserappFrameworkDetection {
+        name: hit.name.to_string(),
+        display_name: hit.display_name.to_string(),
+        declared_range: hit.declared_range,
+        version: hit.version,
+        version_source: hit.source.as_str().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,5 +680,22 @@ mod tests {
         // 未知事件/坏 JSON → None（丢弃不 panic）
         assert!(map_app_cli_evt(r#"{"event":"something_else"}"#).is_none());
         assert!(map_app_cli_evt("not json").is_none());
+    }
+    /// DTO 转换：detector 领域结构字段全量透传（name/display/range/version/source）。
+    #[test]
+    fn to_detection_maps_all_fields() {
+        let hit = frontend_detector::FrameworkHit {
+            name: "vite",
+            display_name: "Vite",
+            declared_range: "^5.4.21".into(),
+            version: Some("5.4.21".into()),
+            source: frontend_detector::VersionSource::Installed,
+        };
+        let dto = to_detection(hit);
+        assert_eq!(dto.name, "vite");
+        assert_eq!(dto.display_name, "Vite");
+        assert_eq!(dto.declared_range, "^5.4.21");
+        assert_eq!(dto.version.as_deref(), Some("5.4.21"));
+        assert_eq!(dto.version_source, "installed");
     }
 }

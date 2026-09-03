@@ -44,6 +44,7 @@ fn userapp_router() -> OpenApiRouter<UserAppState> {
         .routes(routes!(userapp_dev_server::dev_stop))
         .routes(routes!(userapp_dev_server::dev_restart))
         .routes(routes!(userapp_dev_server::dev_list))
+        .routes(routes!(userapp_dev_server::framework_info))
         .routes(routes!(static_files::serve_userapp))
         .route("/static/{app_id}", options(static_files::serve_userapp))
 }
@@ -119,6 +120,7 @@ mod tests {
             "/api/v1/userapp/dev/stop",
             "/api/v1/userapp/dev/restart",
             "/api/v1/userapp/dev/list",
+            "/api/v1/userapp/dev/framework-info",
             "/api/v1/userapp/static/{app_id}",
         ] {
             assert!(
@@ -126,7 +128,7 @@ mod tests {
                 "userapp path missing: {path}"
             );
         }
-        assert_eq!(document.paths.paths.len(), 32);
+        assert_eq!(document.paths.paths.len(), 33);
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 
@@ -408,6 +410,10 @@ mod tests {
                 "HttpResult_UserappDevTaskCreated",
             ),
             ("/api/v1/userapp/dev/list", "HttpResult_UserappDevList"),
+            (
+                "/api/v1/userapp/dev/framework-info",
+                "HttpResult_UserappFrameworkInfo",
+            ),
             (
                 "/api/v1/userapp/ensure-workspace",
                 "HttpResult_UserappEnsureWorkspaceData",

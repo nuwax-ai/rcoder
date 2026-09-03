@@ -100,6 +100,16 @@ pub struct UserappDevListQuery {
     pub user_id: String,
 }
 
+/// workspace 框架识别查询参数（`GET /dev/framework-info`）。
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct UserappFrameworkInfoQuery {
+    /// 应用 ID（workspace 按 `userapp:{app_id}` 定位，识别其全部服务）
+    pub app_id: String,
+    /// 宿主机数据卷分区归属目录名（dev 卷 `dev/{user_id}/...` 组成段）
+    pub user_id: String,
+}
+
 /// static 取包 query（`GET /static/{appId}`）。
 ///
 /// `parameter_in` 必须显式声明：utoipa-axum 从 handler 签名自动发现 Query struct
