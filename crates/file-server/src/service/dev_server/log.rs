@@ -115,7 +115,7 @@ where
     })
 }
 
-/// 同 [`spawn_log_pipe`], 额外把**原始行**(不含时间戳)tee 到 stderr 环形缓冲,
+/// 同 [`spawn_log_pipe_with_ring`], 额外把**原始行**(不含时间戳)tee 到 stderr 环形缓冲,
 /// 供启动失败时分类 (借鉴 vite-rs: stderr/stdout 分流, vite 错误走 stderr)。
 pub fn spawn_log_pipe_with_ring<R>(
     reader: R,
@@ -140,6 +140,47 @@ where
             // 原始行入环形缓冲 (供错误分类)
             super::error_classify::ring_push(&ring, &line);
             // 带时间戳写日志
+            let prefixed = format!("{}{}", timestamp_prefix(), line);
+            if let Err(e) = append_line(&main_path, &prefixed).await {
+                tracing::warn!(error = %e, "append_line (main log) failed");
+            }
+            if let Err(e) = append_line(&temp_path, &prefixed).await {
+                tracing::warn!(error = %e, "append_line (temp log) failed");
+            }
+        }
+    })
+}
+
+/// app-cli 编排事件行前缀（跨进程 stdout 行协议；与 app-cli
+/// `orchestration_events::EVT_PREFIX` 同字符串——两端契约测试锁同一字面量）。
+pub const APP_CLI_EVT_PREFIX: &str = "APP-CLI-EVT ";
+
+/// 同 [`spawn_log_pipe`], 额外识别 app-cli 编排事件行：行首
+/// [`APP_CLI_EVT_PREFIX`] 匹配 → 去前缀的 JSON 部分回调 `on_event`（dev 链路
+/// 转发任务 SSE）；EVT 行照常写日志（排障可见），非 EVT 行只写日志不回调。
+pub fn spawn_log_pipe_with_events<R>(
+    reader: R,
+    main_path: PathBuf,
+    temp_path: PathBuf,
+    on_event: super::process::OnLineCallback,
+) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            let line = match lines.next_line().await {
+                Ok(Some(l)) => l,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "log pipe read failed, stream logging stopped");
+                    break;
+                }
+            };
+            if let Some(json) = line.strip_prefix(APP_CLI_EVT_PREFIX) {
+                on_event(json);
+            }
             let prefixed = format!("{}{}", timestamp_prefix(), line);
             if let Err(e) = append_line(&main_path, &prefixed).await {
                 tracing::warn!(error = %e, "append_line (main log) failed");
@@ -291,5 +332,58 @@ pub async fn cleanup_temp_logs(dir: &Path) {
         {
             tracing::warn!(error = %e, "remove temp log file failed (skipping)");
         }
+    }
+}
+
+#[cfg(test)]
+mod evt_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// EVT 行（行首前缀匹配）→ 去前缀 JSON 回调；普通行不回调；两类行都落日志。
+    #[tokio::test]
+    async fn evt_lines_callback_and_plain_lines_do_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("main.log");
+        let temp = dir.path().join("temp.log");
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = hits.clone();
+        let callback: crate::service::dev_server::process::OnLineCallback =
+            Arc::new(move |json: &str| {
+                sink.lock().expect("lock").push(json.to_string());
+            });
+        let _handle = spawn_log_pipe_with_events(reader, main.clone(), temp.clone(), callback);
+        use tokio::io::AsyncWriteExt as _;
+        writer
+            .write_all(
+                b"APP-CLI-EVT {\"event\":\"service_start_ok\",\"service\":\"frontend\"}\nplain log line\n",
+            )
+            .await
+            .expect("write");
+        // 管道消费是异步的：轮询等回调命中（有界）
+        for _ in 0..50 {
+            if hits.lock().expect("lock").len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let hits = hits.lock().expect("lock");
+        assert_eq!(
+            hits.as_slice(),
+            [r#"{"event":"service_start_ok","service":"frontend"}"#.to_string()],
+            "only the EVT line's JSON payload (prefix stripped) is forwarded"
+        );
+        // 两类行都写日志（EVT 行排障可见）
+        let logged = tokio::fs::read_to_string(&main).await.expect("main log");
+        assert!(logged.contains("APP-CLI-EVT"), "{logged}");
+        assert!(logged.contains("plain log line"), "{logged}");
+    }
+
+    /// 前缀常量与 app-cli orchestration_events::EVT_PREFIX 锁同一字面量
+    /// （跨进程行协议契约；app-cli 侧测试锁另一端）。
+    #[test]
+    fn evt_prefix_matches_app_cli_contract() {
+        assert_eq!(APP_CLI_EVT_PREFIX, "APP-CLI-EVT ");
     }
 }

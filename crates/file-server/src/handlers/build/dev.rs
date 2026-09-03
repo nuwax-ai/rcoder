@@ -51,7 +51,7 @@ pub(crate) async fn start_dev(
     let base = q.base_path.as_deref();
     let started = state
         .dev_server
-        .start_dev(&q.project_id, &path, base)
+        .start_dev(&q.project_id, &path, base, None)
         .await?;
     Ok(Json(DevStarted {
         success: true,
@@ -129,7 +129,7 @@ pub(crate) async fn restart_dev(
     let base = q.base_path.as_deref();
     let started = state
         .dev_server
-        .restart_dev(&q.project_id, &path, base)
+        .restart_dev(&q.project_id, &path, base, None)
         .await?;
     Ok(Json(DevStarted {
         success: true,

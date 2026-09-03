@@ -35,15 +35,17 @@ use crate::error::AppResult;
 use support::lock;
 
 impl DevServerManager {
-    /// restart-dev = stop + start。
+    /// restart-dev = stop + start（`on_event` 语义同 [`Self::start_dev`]）。
     pub async fn restart_dev(
         &self,
         project_id: &str,
         project_path: &Path,
         base_path: Option<&str>,
+        on_event: Option<process::OnLineCallback>,
     ) -> AppResult<StartedDev> {
         self.stop_dev(project_id).await?;
-        self.start_dev(project_id, project_path, base_path).await
+        self.start_dev(project_id, project_path, base_path, on_event)
+            .await
     }
 
     /// keep-alive (对齐 nuwax: 探活, 不存活则重启)。
@@ -66,7 +68,9 @@ impl DevServerManager {
         }
         // 不存活 → 重启, 返回新 pid/port (对齐 nuwax 透传 startDevServer 返回值)
         self.stop_dev(project_id).await?;
-        let started = self.start_dev(project_id, project_path, base_path).await?;
+        let started = self
+            .start_dev(project_id, project_path, base_path, None)
+            .await?;
         Ok(KeepAliveResult {
             alive: true,
             action: Some("start".into()),

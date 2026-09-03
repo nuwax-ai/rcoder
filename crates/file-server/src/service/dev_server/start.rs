@@ -50,11 +50,15 @@ impl Drop for AllocGuard<'_> {
 
 impl DevServerManager {
     /// start-dev (对齐 nuwax startDevServer)。
+    ///
+    /// `on_event`：app-cli 编排事件行回调（仅 manifest 引擎消费——Userapp dev
+    /// 链路转发任务 SSE；web 域 vite 路径传 None）。
     pub async fn start_dev(
         &self,
         project_id: &str,
         project_path: &Path,
         base_path: Option<&str>,
+        on_event: Option<process::OnLineCallback>,
     ) -> AppResult<StartedDev> {
         // 启动锁
         {
@@ -70,7 +74,7 @@ impl DevServerManager {
             starting: &self.starting,
             project_id: project_id.to_string(),
         };
-        self.start_dev_inner(project_id, project_path, base_path)
+        self.start_dev_inner(project_id, project_path, base_path, on_event)
             .await
     }
 
@@ -79,6 +83,7 @@ impl DevServerManager {
         project_id: &str,
         project_path: &Path,
         base_path: Option<&str>,
+        on_event: Option<process::OnLineCallback>,
     ) -> AppResult<StartedDev> {
         // Userapp workspace 分流：workspace.manifest.toml 存在 → app-cli 引擎。
         // manifest 多服务（Java/Go 等）的正确运行态 = app-cli 按 run.command
@@ -87,7 +92,9 @@ impl DevServerManager {
         // 移植，对多服务模板不适用——web/computer 项目（无 workspace manifest）
         // 继续走原路径。
         if project_path.join("workspace.manifest.toml").exists() {
-            return self.start_dev_manifest(project_id, project_path).await;
+            return self
+                .start_dev_manifest(project_id, project_path, on_event)
+                .await;
         }
         // 幂等: 已运行则返回现有 pid/port
         if let Some(p) = lock(&self.processes)?.get(project_id).cloned() {
@@ -232,6 +239,7 @@ impl DevServerManager {
         &self,
         project_id: &str,
         project_path: &Path,
+        on_event: Option<process::OnLineCallback>,
     ) -> AppResult<StartedDev> {
         // 单一来源 shared_types::APP_ENTRY_PORT（release 流程、Pingora 免端口代理同值）
         const PINGAP_ENTRY_PORT: u16 = shared_types::APP_ENTRY_PORT;
@@ -275,7 +283,11 @@ impl DevServerManager {
             std::collections::VecDeque::with_capacity(STDERR_RING_CAP),
         ));
         if let Some(out) = stdout {
-            log::spawn_log_pipe(out, main_log.clone(), temp_log.clone());
+            // EVT 识别（on_event Some 时回调编排事件行；None 退化为普通管道——
+            // 回调为 no-op 的闭包，日志行为不变）
+            let sink =
+                on_event.unwrap_or_else(|| Arc::new(|_json: &str| {}) as process::OnLineCallback);
+            log::spawn_log_pipe_with_events(out, main_log.clone(), temp_log.clone(), sink);
         }
         if let Some(err) = stderr {
             log::spawn_log_pipe_with_ring(
