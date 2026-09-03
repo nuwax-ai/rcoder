@@ -32,11 +32,23 @@ enabled = true
 command = ["sh", "scripts/build-standalone.sh"]
 artifact = "artifact.zip"
 
+# 可选：dev 阶段编译命令，缺省回落 [build].command。仅配了 [devrun] 的源码态
+# dev 链路生效；不要求产出 artifact（纯检查命令如 type-check 可用）。
+[devbuild]
+command = ["pnpm", "run", "type-check"]
+
 [run]
 command = ["./server"]
 migrate = []
 depends_on = []
 shutdown_timeout_seconds = 30
+
+# 可选：dev 阶段热加载启动命令，缺省回落 [run].command。任一 enabled 服务配置
+# 即把该 app 的 dev 链路切为源码态：dev/start·restart 编译（[devbuild] 优先）
+# 后 app-cli 直接编排源码 workspace（跑源码，改码即生效），不再部署 .run 产物。
+# 须监听 0.0.0.0:$PORT（注入同 [run]）；生产部署不读本段。
+[devrun]
+command = ["pnpm", "exec", "vite"]
 
 [health]
 startup_path = "/health"
