@@ -8,6 +8,10 @@ use workspace_manifest::ProxySection;
 /// pingap 监听端口（不用 3000，前端框架默认端口；9080 无冲突）。
 pub const PINGAP_PORT: u16 = 9080;
 
+/// workspace 首页静态服务的 pingap upstream / location 名（注入兜底路由用）。
+pub const WORKSPACE_INDEX_UPSTREAM: &str = "workspaceIndex";
+pub const WORKSPACE_INDEX_LOCATION: &str = "workspaceIndexLocation";
+
 /// 一个需要代理的子项目（从 ServiceSpec 提取，pingap_config 不依赖 manifest 模块）。
 pub struct ProxyEntry {
     pub name: String,
@@ -23,7 +27,13 @@ pub struct ProxyEntry {
 /// - pingap 监听 :9080；各子项目 upstream = `127.0.0.1:<port>`。
 /// - `proxy.path == "/"` 兜底（location 不写 path）；其余前缀匹配；`strip_prefix` 去前缀。
 /// - 每个 location 默认带 `pingap:requestId` + `pingap:compressionUpstream`（零配置内置插件）。
-pub fn build_pingap_config(entries: &[ProxyEntry]) -> anyhow::Result<Option<String>> {
+/// - `index_port = Some` 时追加 workspace 首页静态服务（`app-cli workspace_index`）的
+///   兜底路由：无 path location（权重 0，服务前缀路由权重 512+ 恒优先）。调用方须
+///   保证仅在无服务占 `/` 时传 Some（两个无 path location 并存同权重有匹配歧义）。
+pub fn build_pingap_config(
+    entries: &[ProxyEntry],
+    index_port: Option<u16>,
+) -> anyhow::Result<Option<String>> {
     if entries.is_empty() {
         return Ok(None);
     }
@@ -31,10 +41,13 @@ pub fn build_pingap_config(entries: &[ProxyEntry]) -> anyhow::Result<Option<Stri
     let mut cfg = PingapConfig::default();
 
     // [servers.app]
-    let location_names: Vec<String> = entries
+    let mut location_names: Vec<String> = entries
         .iter()
         .map(|e| format!("{}Location", e.name))
         .collect();
+    if index_port.is_some() {
+        location_names.push(WORKSPACE_INDEX_LOCATION.into());
+    }
     cfg.servers.insert(
         "app".into(),
         ServerConf {
@@ -43,6 +56,27 @@ pub fn build_pingap_config(entries: &[ProxyEntry]) -> anyhow::Result<Option<Stri
             ..Default::default()
         },
     );
+
+    // workspace 首页静态服务（index.html）：兜底 upstream + 无 path location。
+    if let Some(port) = index_port {
+        cfg.upstreams.insert(
+            WORKSPACE_INDEX_UPSTREAM.into(),
+            UpstreamConf {
+                addrs: vec![format!("127.0.0.1:{port}")],
+                health_check: Some(format!("http://{WORKSPACE_INDEX_UPSTREAM}/")),
+                ..Default::default()
+            },
+        );
+        cfg.locations.insert(
+            WORKSPACE_INDEX_LOCATION.into(),
+            LocationConf {
+                upstream: Some(WORKSPACE_INDEX_UPSTREAM.into()),
+                plugins: Some(vec!["pingap:requestId".into()]),
+                // 不写 path：pingap 默认权重 0 = 兜底（前缀路由恒优先）
+                ..Default::default()
+            },
+        );
+    }
 
     // 每个 proxied 项目：[upstreams.<name>] + [locations.<name>Location]
     for e in entries {
@@ -114,7 +148,41 @@ mod tests {
 
     #[test]
     fn empty_entries_returns_none() {
-        assert!(build_pingap_config(&[]).expect("serialize").is_none());
+        assert!(build_pingap_config(&[], None).expect("serialize").is_none());
+    }
+
+    /// index_port=Some 时注入 workspaceIndex 兜底：upstream + 无 path location +
+    /// server locations 挂载；None 时不出现。
+    #[test]
+    fn index_upstream_injected_only_when_port_given() {
+        let entries = vec![entry("frontend", 4000, "/react", true)];
+
+        let with_index = build_pingap_config(&entries, Some(9081))
+            .expect("serialize")
+            .expect("non-empty config");
+        assert!(
+            with_index.contains("[upstreams.workspaceIndex]"),
+            "{with_index}"
+        );
+        assert!(
+            with_index.contains("addrs = [\"127.0.0.1:9081\"]"),
+            "{with_index}"
+        );
+        assert!(
+            with_index.contains("[locations.workspaceIndexLocation]"),
+            "{with_index}"
+        );
+        // 兜底 location 不写 path（pingap 默认权重 0）
+        let location_block = with_index
+            .split("[locations.workspaceIndexLocation]")
+            .nth(1)
+            .expect("location block");
+        assert!(!location_block.contains("path ="), "{with_index}");
+
+        let without_index = build_pingap_config(&entries, None)
+            .expect("serialize")
+            .expect("non-empty config");
+        assert!(!without_index.contains("workspaceIndex"), "{without_index}");
     }
 
     #[test]
@@ -123,7 +191,7 @@ mod tests {
             entry("frontend", 4000, "/", false),
             entry("backend", 4001, "/api/", true),
         ];
-        let toml_text = build_pingap_config(&entries)
+        let toml_text = build_pingap_config(&entries, None)
             .expect("serialize")
             .expect("non-empty config");
         assert!(toml_text.contains("addr = \"0.0.0.0:9080\""), "{toml_text}");
@@ -158,7 +226,7 @@ mod tests {
     #[test]
     fn rewrite_escapes_regex_metacharacters_in_path() {
         let entries = vec![entry("backend", 4001, "/api/v(1)/", true)];
-        let toml_text = build_pingap_config(&entries)
+        let toml_text = build_pingap_config(&entries, None)
             .expect("serialize")
             .expect("non-empty config");
         let parsed: toml::Value = toml::from_str(&toml_text).expect("reparse generated config");

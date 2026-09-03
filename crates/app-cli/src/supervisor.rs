@@ -90,13 +90,32 @@ async fn run_inner(
             // start（dev 形态下 [devrun].command 优先、[run].command 兜底）
             let argv = effective_run_argv(spec, dev_profile);
             if argv.is_empty() {
-                warn!("⚠️  {} 无启动 command（[run]/[devrun]），跳过", spec.service_id);
+                warn!(
+                    "⚠️  {} 无启动 command（[run]/[devrun]），跳过",
+                    spec.service_id
+                );
                 continue;
             }
-            let child = start_service(spec, argv, &args.workspace, &args.log_dir, &release.release_id)
-                .with_context(|| format!("start {}", spec.service_id))?;
+            let child = start_service(
+                spec,
+                argv,
+                &args.workspace,
+                &args.log_dir,
+                &release.release_id,
+            )
+            .with_context(|| format!("start {}", spec.service_id))?;
             children.push((spec.service_id.clone(), child));
             started_user_services += 1;
+        }
+        // workspace 首页静态服务（index.html 存在且无 catch-all 时；判定与 pingap
+        // 兜底路由注入同源 workspace_index::index_port_if_eligible）。进程退出即
+        // 随 runtime 消亡，无需显式停。
+        if crate::workspace_index::index_port_if_eligible(&args.workspace, &specs).is_some() {
+            crate::workspace_index::spawn(args.workspace.clone())?;
+            info!(
+                "📄 workspace index (index.html) serving on :{}",
+                crate::workspace_index::INDEX_PORT
+            );
         }
         // 编译、完整验证并启动 Pingap；代理失败时 workspace 不得进入 ready。
         start_pingap(&args.workspace, &args.pingap_bin, &release, &mut children).await
@@ -130,6 +149,12 @@ async fn run_inner(
         info!(
             "🔌   {} port={} {state} {route}",
             spec.service_id, spec.port
+        );
+    }
+    if crate::workspace_index::index_port_if_eligible(&args.workspace, &specs).is_some() {
+        info!(
+            "🔌   workspace-index port={} running route=/ (兜底 index.html)",
+            crate::workspace_index::INDEX_PORT
         );
     }
 
@@ -316,9 +341,7 @@ fn dev_run_profile() -> bool {
 /// 跑源码），否则 [run].command。（[devbuild] 的回落在平台侧 dev 链路执行，
 /// app-cli 不消费该字段。）
 fn effective_run_argv(spec: &ServiceSpec, dev_profile: bool) -> &[String] {
-    if dev_profile
-        && let Some(devrun) = &spec.devrun
-    {
+    if dev_profile && let Some(devrun) = &spec.devrun {
         return &devrun.command;
     }
     &spec.run.command

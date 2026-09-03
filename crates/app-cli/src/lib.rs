@@ -25,6 +25,7 @@ pub mod server;
 pub mod supervisor;
 pub mod supervisord_host;
 pub mod svc_spec;
+pub mod workspace_index;
 pub mod xmlrpc;
 
 pub use config::CliArgs;

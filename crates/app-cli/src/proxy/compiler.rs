@@ -79,7 +79,7 @@ pub async fn compile_effective_config(
     release: &ReleaseLock,
 ) -> Result<(String, String)> {
     let mut config = match release.pingap.mode {
-        PingapMode::Managed => managed_config(release)?,
+        PingapMode::Managed => managed_config(workspace, release)?,
         PingapMode::Extend => compile_extend(workspace, release).await?,
         PingapMode::Custom => load_user_config(workspace, release).await?,
     };
@@ -98,7 +98,7 @@ pub async fn compile_effective_config(
     Ok((content, expected_hash))
 }
 
-fn managed_config(release: &ReleaseLock) -> Result<PingapConfig> {
+fn managed_config(workspace: &Path, release: &ReleaseLock) -> Result<PingapConfig> {
     let entries: Vec<_> = release
         .services
         .iter()
@@ -114,7 +114,11 @@ fn managed_config(release: &ReleaseLock) -> Result<PingapConfig> {
             })
         })
         .collect();
-    let content = build_pingap_config(&entries)?.ok_or_else(|| {
+    // workspace 首页兜底路由（index.html 存在且无 catch-all 服务时注入；
+    // 判定单一事实源 workspace_index::index_port_if_eligible——运行时与
+    // gen-lock 预览同一结论）
+    let index_port = crate::workspace_index::index_port_if_eligible(workspace, &release.services);
+    let content = build_pingap_config(&entries, index_port)?.ok_or_else(|| {
         anyhow::anyhow!(
             "workspace has no proxied web service: none of the enabled services declares a [proxy] section\n     fix:   pick the service that serves HTTP and add, in its project.manifest.toml:\n            [proxy]\n            path = \"/api/<service_id>/\"\n            strip_prefix = true"
         )
@@ -123,7 +127,7 @@ fn managed_config(release: &ReleaseLock) -> Result<PingapConfig> {
 }
 
 async fn compile_extend(workspace: &Path, release: &ReleaseLock) -> Result<PingapConfig> {
-    let mut managed = managed_config(release)?;
+    let mut managed = managed_config(workspace, release)?;
     let extension = load_user_config(workspace, release).await?;
     if !extension.servers.is_empty()
         || !extension.locations.is_empty()
@@ -381,6 +385,11 @@ mod tests {
     use super::{managed_config, validate_plugin_paths, validate_upstream_destination};
     use workspace_manifest::ReleaseLock;
 
+    /// 无 index.html 的临时 workspace（兜底路由不注入的基线形态）。
+    fn no_index_workspace() -> std::path::PathBuf {
+        tempfile::tempdir().expect("tempdir").keep()
+    }
+
     fn release_lock_with_disabled_proxy() -> ReleaseLock {
         toml::from_str(
             r#"
@@ -449,8 +458,8 @@ format = "text"
 
     #[test]
     fn disabled_services_are_excluded_from_managed_config() {
-        let config =
-            managed_config(&release_lock_with_disabled_proxy()).expect("managed config compiles");
+        let config = managed_config(&no_index_workspace(), &release_lock_with_disabled_proxy())
+            .expect("managed config compiles");
         assert!(config.upstreams.contains_key("api"));
         assert!(
             !config.upstreams.contains_key("worker"),
@@ -466,7 +475,7 @@ format = "text"
             .services
             .retain(|service| service.service_id == "worker");
         // 唯一的 proxied 服务被禁用 → 无拓扑可编译，报错而非生成空配置。
-        assert!(managed_config(&release).is_err());
+        assert!(managed_config(&no_index_workspace(), &release).is_err());
     }
 
     #[test]
