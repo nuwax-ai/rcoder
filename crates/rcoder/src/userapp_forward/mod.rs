@@ -4,7 +4,8 @@
 //!   `CONTAINER_PASS_THROUGH_PATHS`），并承接 `/api/computer/*` 拦截层
 //!   （`X-Service-Type: userapp` 分流时反向代理转来的 TS 老路径原样透传）
 //! - `workspace`：`POST /api/v1/userapp/workspace` 创建项目显式入口
-//! - `db`：`POST /api/v1/userapp/db/{app_stage}/align-credentials` PG 凭据对齐
+//! - `db`：`POST /api/v1/userapp/db/{app_stage}/reset-password|create-database`
+//!   PG 账号/库管理（凭据对齐已内嵌 start 部署链，独立接口下线）
 //! - 本模块：路由聚合 + 开发容器 ensure-workspace 公共调用
 //!
 //! 容器定位/创建复用 `crate::userapp_builder::ensure_userapp_builder`
@@ -75,6 +76,7 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
     "/api/v1/userapp/dev/stop",
     "/api/v1/userapp/dev/restart",
     "/api/v1/userapp/dev/list",
+    "/api/v1/userapp/dev/framework-info",
     // 静态资源（按 releaseId 取包；注解侧另挂 OPTIONS，any 已覆盖）
     "/api/v1/userapp/static/{app_id}",
 ];
@@ -85,9 +87,8 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
 pub(crate) mod guard_tables {
     /// rcoder 本地实现的 userapp 路径快照（`routes()` 显式入口部分；
     /// 守卫闭包比对用——改动路由须同步）。
-    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 16] = [
+    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 15] = [
         "/api/v1/userapp/workspace",
-        "/api/v1/userapp/db/{app_stage}/align-credentials",
         "/api/v1/userapp/db/{app_stage}/reset-password",
         "/api/v1/userapp/db/{app_stage}/create-database",
         // `{app_stage}` 门面折叠路由（dev-only 构建链；URI 还原容器平铺契约转发）
@@ -160,10 +161,6 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/v1/userapp/workspace",
             post(workspace::create_workspace),
-        )
-        .route(
-            "/api/v1/userapp/db/{app_stage}/align-credentials",
-            post(db::align_credentials),
         )
         .route(
             "/api/v1/userapp/db/{app_stage}/reset-password",

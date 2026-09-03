@@ -90,27 +90,31 @@ pub fn detect_ui(dir: &std::path::Path, pkg: &PackageJsonMinimal) -> FrameworkHi
             let resolved = version::resolve(dir, package, pkg.dependency(package));
             FrameworkHit::from_rule(rule.name, rule.display_name, resolved)
         });
-        // vue 细分：**仅 vue 本体**的可解析 major 决定 vue2/vue3。fallback 依赖
-        //（vue-router / @vue/cli-service）只提供版本展示、不做细分——它们的
+        // vue 细分：**仅 vue 本体**的可解析 major（2/3）决定 vue2/vue3。fallback
+        // 依赖（vue-router / @vue/cli-service）只提供版本展示、不做细分——它们的
         // major 与 vue 主版本无可靠映射（nuwax 原逻辑拿 router major 判细分会
-        // 产出 "vue4" 这类荒谬值，此处修正）。
+        // 产出 "vue4" 这类荒谬值，此处修正）。细分命中时 version 一并换成
+        // vue 本体的解析结果（防 name=vue3 而 version 取自 router 的展示矛盾）。
         if rule.name == "vue"
             && let Some(declared) = pkg.dependency("vue")
-            && let Some(major) = version::resolve(dir, "vue", Some(declared))
+        {
+            let self_version = version::resolve(dir, "vue", Some(declared));
+            let subdivision = self_version
                 .version
                 .as_deref()
                 .and_then(version::major_of)
-        {
-            match major {
-                2 => {
-                    hit.name = "vue2";
-                    hit.display_name = "Vue 2";
-                }
-                3 => {
-                    hit.name = "vue3";
-                    hit.display_name = "Vue 3";
-                }
-                _ => {}
+                .filter(|major| *major == 2 || *major == 3);
+            if let Some(major) = subdivision {
+                let (name, display) = if major == 2 {
+                    ("vue2", "Vue 2")
+                } else {
+                    ("vue3", "Vue 3")
+                };
+                hit.name = name;
+                hit.display_name = display;
+                hit.declared_range = self_version.declared_range;
+                hit.version = self_version.version;
+                hit.source = self_version.source;
             }
         }
         return hit;
@@ -283,6 +287,22 @@ mod tests {
             &pkg_with(&[("vue", "latest")]),
         );
         assert_eq!(hit.name, "vue");
+    }
+
+    /// vue 细分与版本同源：vue 本体可解析时 name=vue3 且 version 也取 vue 本体
+    ///（不得出现 name=vue3 + version=4.6.0（router 的）这类展示矛盾）。
+    #[test]
+    fn vue_subdivision_keeps_version_consistent_with_vue_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // vue 本体 ^3.3.11 + router ^4.6.0：若无 node_modules，两者都 range 提取——
+        // 循环首选可解析的 vue 本体（^3.3.11 → 3.3.11），细分与版本天然同源
+        let hit = detect_ui(
+            dir.path(),
+            &pkg_with(&[("vue", "^3.3.11"), ("vue-router", "^4.6.0")]),
+        );
+        assert_eq!(hit.name, "vue3");
+        assert_eq!(hit.version.as_deref(), Some("3.3.11"));
+        assert_eq!(hit.declared_range, "^3.3.11");
     }
 
     #[test]

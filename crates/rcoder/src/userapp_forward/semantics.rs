@@ -50,7 +50,7 @@ pub(super) fn classify_dev_absent(path: &str) -> DevAbsentAction {
     }
     match rest {
         "/dev/stop" => DevAbsentAction::SkipSuccess(SkipKind::DevStop),
-        "/dev/list" => DevAbsentAction::Unavailable,
+        "/dev/list" | "/dev/framework-info" => DevAbsentAction::Unavailable,
         _ => DevAbsentAction::Ensure,
     }
 }
@@ -294,6 +294,10 @@ mod tests {
         );
         assert_eq!(classify_kind("/api/v1/userapp/dev/stop"), "dev-stop-ok");
         assert_eq!(classify_kind("/api/v1/userapp/dev/list"), "unavailable");
+        assert_eq!(
+            classify_kind("/api/v1/userapp/dev/framework-info"),
+            "unavailable"
+        );
         // 使用语义默认 ensure（起容器）
         for path in [
             "/api/v1/userapp/build",
@@ -405,7 +409,7 @@ mod tests {
                 "/api/v1/userapp/tasks/{task_id}/logs/stream" => "unavailable",
                 "/api/v1/userapp/tasks/{task_id}/cancel" => "cancel-ok",
                 "/api/v1/userapp/dev/stop" => "dev-stop-ok",
-                "/api/v1/userapp/dev/list" => "unavailable",
+                "/api/v1/userapp/dev/list" | "/api/v1/userapp/dev/framework-info" => "unavailable",
                 _ => "ensure",
             };
             assert_eq!(kind, expected, "{pattern} 语义分类漂移");
