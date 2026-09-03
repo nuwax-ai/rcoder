@@ -4,6 +4,7 @@
 
 use crate::grpc::{GrpcChannelPool, GrpcError};
 use shared_types::ChatAgentConfig;
+use shared_types::grpc::agent_service_client::AgentServiceClient;
 use shared_types::grpc::{
     CancelRequest, CancelResponse, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, ResolvePermissionRequest as GrpcResolvePermissionRequest,
@@ -11,6 +12,7 @@ use shared_types::grpc::{
 };
 use std::sync::Arc;
 use tonic::Status;
+use tonic::transport::Channel;
 use tracing::{debug, error, info};
 
 /// gRPC Chat 请求参数
@@ -54,6 +56,31 @@ pub struct GrpcChatParams {
 ///
 /// 返回 `Result<GrpcChatResponse, GrpcError>`，其中 `GrpcError` 包含
 /// 分类后的错误信息，便于调用方判断是否应该重试。
+/// 连接池获取客户端 + 连接层错误映射（4 个 *_with_pool 的逐字样板收敛）
+async fn pooled_client(
+    pool: &Arc<GrpcChannelPool>,
+    grpc_addr: &str,
+    log_tag: &str,
+) -> Result<AgentServiceClient<Channel>, GrpcError> {
+    pool.get_client(grpc_addr).await.map_err(|e| {
+        error!("[{log_tag}] Failed to get client: {e}");
+        // 连接池错误通常是连接层问题，使用 Status::unavailable 表示
+        GrpcError::Status(Status::unavailable(format!("Connection failed: {}", e)))
+    })
+}
+
+/// 构建带 locale 的 tonic Request 并按需设超时（None = 不设，保持 tonic 默认）
+fn locale_request_opt_timeout<T>(
+    grpc_request: T,
+    timeout: Option<std::time::Duration>,
+) -> tonic::Request<T> {
+    let mut request = super::new_request_with_locale(grpc_request, super::current_grpc_locale());
+    if let Some(t) = timeout {
+        request.set_timeout(t);
+    }
+    request
+}
+
 pub async fn grpc_chat_with_pool(
     pool: &Arc<GrpcChannelPool>,
     grpc_addr: &str,
@@ -65,11 +92,7 @@ pub async fn grpc_chat_with_pool(
     );
 
     // 使用连接池获取客户端
-    let mut client = pool.get_client(grpc_addr).await.map_err(|e| {
-        error!("[gRPC_CHAT] Failed to get client: {}", e);
-        // 连接池错误通常是连接层问题，使用 Status::unavailable 表示
-        GrpcError::Status(Status::unavailable(format!("Connection failed: {}", e)))
-    })?;
+    let mut client = pooled_client(pool, grpc_addr, "gRPC_CHAT").await?;
 
     // 构建 gRPC 请求
     let grpc_request = GrpcChatRequest {
@@ -100,15 +123,8 @@ pub async fn grpc_chat_with_pool(
 
     debug!("[gRPC_CHAT] sendrequest: {:?}", grpc_request);
 
-    // 构建 tonic Request 并设置请求级别超时
-    let locale = super::current_grpc_locale();
-    let mut request = super::new_request_with_locale(grpc_request, locale);
-
-    // ✅ 使用 Tonic 原生 API 设置请求超时
-    if let Some(timeout) = params.request_timeout {
-        request.set_timeout(timeout);
-        debug!("[gRPC_CHAT] request timeout: {:?}", timeout);
-    }
+    // 构建 tonic Request（locale + 可选请求级超时）
+    let request = locale_request_opt_timeout(grpc_request, params.request_timeout);
 
     // 发送请求，使用 GrpcError 包装错误
     let response = client.chat(request).await.map_err(|e| {
@@ -155,10 +171,7 @@ pub async fn grpc_cancel_session_with_pool(
     );
 
     // 使用连接池获取客户端
-    let mut client = pool.get_client(grpc_addr).await.map_err(|e| {
-        error!("[gRPC_CANCEL] Failed to get client: {}", e);
-        GrpcError::Status(Status::unavailable(format!("Connection failed: {}", e)))
-    })?;
+    let mut client = pooled_client(pool, grpc_addr, "gRPC_CANCEL").await?;
 
     // 构建 gRPC 请求
     let grpc_request = CancelRequest {
@@ -170,14 +183,12 @@ pub async fn grpc_cancel_session_with_pool(
     debug!("[gRPC_CANCEL] sendrequest: {:?}", grpc_request);
 
     // 构建 tonic Request 并设置请求级别超时
-    let locale = super::current_grpc_locale();
-    let mut request = super::new_request_with_locale(grpc_request, locale);
-
-    let timeout = request_timeout.unwrap_or_else(|| {
-        std::time::Duration::from_secs(shared_types::GRPC_CANCEL_SESSION_TIMEOUT_SECS)
-    });
-    request.set_timeout(timeout);
-    debug!("[gRPC_CANCEL] request timeout: {:?}", timeout);
+    let request = locale_request_opt_timeout(
+        grpc_request,
+        Some(request_timeout.unwrap_or_else(|| {
+            std::time::Duration::from_secs(shared_types::GRPC_CANCEL_SESSION_TIMEOUT_SECS)
+        })),
+    );
 
     let response = client.cancel_session(request).await.map_err(|e| {
         error!("[gRPC_CANCEL] CancelSession RPC call failed: {}", e);
@@ -218,10 +229,7 @@ pub async fn grpc_resolve_permission_with_pool(
         grpc_addr, input.session_id, input.tool_call_id
     );
 
-    let mut client = pool.get_client(grpc_addr).await.map_err(|e| {
-        error!("[gRPC_PERMISSION] Failed to get client: {}", e);
-        GrpcError::Status(Status::unavailable(format!("Connection failed: {}", e)))
-    })?;
+    let mut client = pooled_client(pool, grpc_addr, "gRPC_PERMISSION").await?;
 
     let grpc_request = GrpcResolvePermissionRequest {
         session_id: input.session_id,
@@ -237,14 +245,12 @@ pub async fn grpc_resolve_permission_with_pool(
         isolation_type: input.isolation_type,
     };
 
-    let locale = super::current_grpc_locale();
-    let mut request = super::new_request_with_locale(grpc_request, locale);
-
-    let timeout = request_timeout.unwrap_or_else(|| {
-        std::time::Duration::from_secs(shared_types::GRPC_RESOLVE_PERMISSION_TIMEOUT_SECS)
-    });
-    request.set_timeout(timeout);
-    debug!("[gRPC_PERMISSION] request timeout: {:?}", timeout);
+    let request = locale_request_opt_timeout(
+        grpc_request,
+        Some(request_timeout.unwrap_or_else(|| {
+            std::time::Duration::from_secs(shared_types::GRPC_RESOLVE_PERMISSION_TIMEOUT_SECS)
+        })),
+    );
 
     let response = client.resolve_permission(request).await.map_err(|e| {
         error!("[gRPC_PERMISSION] ResolvePermission RPC call failed: {}", e);
@@ -269,10 +275,7 @@ pub async fn grpc_stop_agent_with_pool(
     );
 
     // 使用连接池获取客户端
-    let mut client = pool.get_client(grpc_addr).await.map_err(|e| {
-        error!("[gRPC_STOP_AGENT] Failed to get client: {}", e);
-        GrpcError::Status(Status::unavailable(format!("Connection failed: {}", e)))
-    })?;
+    let mut client = pooled_client(pool, grpc_addr, "gRPC_STOP_AGENT").await?;
 
     // 构建 gRPC 请求
     let grpc_request = shared_types::grpc::StopAgentRequest {
@@ -284,14 +287,12 @@ pub async fn grpc_stop_agent_with_pool(
     debug!("[gRPC_STOP_AGENT] sendrequest: {:?}", grpc_request);
 
     // 构建 tonic Request 并设置请求级别超时
-    let locale = super::current_grpc_locale();
-    let mut request = super::new_request_with_locale(grpc_request, locale);
-
-    let timeout = request_timeout.unwrap_or_else(|| {
-        std::time::Duration::from_secs(shared_types::GRPC_STOP_AGENT_TIMEOUT_SECS)
-    });
-    request.set_timeout(timeout);
-    debug!("[gRPC_STOP_AGENT] request timeout: {:?}", timeout);
+    let request = locale_request_opt_timeout(
+        grpc_request,
+        Some(request_timeout.unwrap_or_else(|| {
+            std::time::Duration::from_secs(shared_types::GRPC_STOP_AGENT_TIMEOUT_SECS)
+        })),
+    );
 
     let response = client.stop_agent(request).await.map_err(|e| {
         error!("[gRPC_STOP_AGENT] StopAgent RPC call failed: {}", e);

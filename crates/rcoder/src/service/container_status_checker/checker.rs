@@ -6,10 +6,8 @@ use std::sync::Arc;
 use tokio::time;
 use tracing::{Instrument, debug, info, warn};
 
-use crate::grpc::GrpcChannelPool;
 use crate::router::AppState;
 use shared_types::ProjectStore as _;
-use shared_types::grpc::GetContainerStatusRequest;
 
 use super::state::{ContainerHealthState, ContainerStatusCheckerConfig};
 
@@ -172,17 +170,26 @@ impl ContainerStatusChecker {
         let project_id = container_info.project_id().to_string();
 
         // 查询容器状态
-        match query_container_status(
+        match crate::grpc::status_query::query_container_status(
+            &self.state.grpc_pool,
             &grpc_addr,
             &user_id,
             &project_id,
-            &self.state.grpc_pool,
-            &self.config,
-            last_activity_str,
-            relative_time_str,
+            self.config.query_timeout,
         )
         .await
-        {
+        .map(|status| {
+            debug!(
+                "[STATUS_CHECKER] Container status: user_id={}, is_active={}, active_tasks={}, status={}, last_activity={} ({})",
+                user_id,
+                status.is_active,
+                status.active_tasks,
+                status.status,
+                last_activity_str,
+                relative_time_str
+            );
+            crate::grpc::status_query::is_agent_active(&status)
+        }) {
             Ok(is_active) => {
                 // ✅ 成功：重置失败计数器
                 self.record_success(lookup_key);
@@ -372,47 +379,6 @@ pub fn start_container_status_checker(
             }
         }
     })
-}
-
-/// 查询容器状态
-///
-/// 返回容器是否活跃（有活跃任务）
-async fn query_container_status(
-    grpc_addr: &str,
-    user_id: &str,
-    project_id: &str,
-    grpc_pool: &Arc<GrpcChannelPool>,
-    config: &ContainerStatusCheckerConfig,
-    last_activity_str: String,
-    relative_time_str: String,
-) -> anyhow::Result<bool> {
-    // 获取 gRPC 客户端
-    let mut client = grpc_pool.get_client(grpc_addr).await?;
-
-    // 构建请求
-    let request = tonic::Request::new(GetContainerStatusRequest {
-        user_id: user_id.to_string(),
-        project_id: project_id.to_string(),
-    });
-
-    // 发送请求（带超时）
-    let response =
-        time::timeout(config.query_timeout, client.get_container_status(request)).await??;
-
-    let status_response = response.into_inner();
-
-    debug!(
-        "[STATUS_CHECKER] Container status: user_id={}, is_active={}, active_tasks={}, status={}, last_activity={} ({})",
-        user_id,
-        status_response.is_active,
-        status_response.active_tasks,
-        status_response.status,
-        last_activity_str,
-        relative_time_str
-    );
-
-    // 如果容器有活跃任务，则认为容器活跃
-    Ok(status_response.is_active || status_response.active_tasks > 0)
 }
 
 /// 更新项目活动时间（并同步更新关联容器的活动时间）

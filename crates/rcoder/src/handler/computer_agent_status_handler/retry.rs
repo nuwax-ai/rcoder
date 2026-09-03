@@ -1,10 +1,6 @@
 //! gRPC GetStatus 重试基建（自 computer_agent_status_handler 拆出；原样搬迁）。
 
 use std::sync::Arc;
-use tracing::warn;
-
-use super::*;
-
 /// gRPC GetStatus 最大重试次数
 pub(super) const GRPC_MAX_RETRIES: u32 = 3;
 
@@ -60,9 +56,8 @@ pub(super) struct GetStatusParams<'a> {
 pub(super) async fn call_grpc_get_status_with_retry(
     params: GetStatusParams<'_>,
 ) -> anyhow::Result<shared_types::grpc::GetStatusResponse> {
-    let mut last_error = None;
-
-    // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
+    // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）；
+    // FQDN 稳定不重解析，重试轮间复用同一地址
     let grpc_addr = shared_types::build_grpc_addr(
         params.container_name,
         params.container_ip,
@@ -70,97 +65,24 @@ pub(super) async fn call_grpc_get_status_with_retry(
         params.cluster_domain,
     );
 
-    for attempt in 1..=params.max_retries {
-        // K8s Service FQDN 是稳定的，不需要重新解析
-        // 直接使用原来的 FQDN 进行重试
-        if attempt > 1 {
-            debug!(
-                "🔄 [GRPC_GET_STATUS] Retrying with same K8s Service FQDN: {}",
-                grpc_addr
-            );
-        }
-
-        match params.pool.get_client(&grpc_addr).await {
-            Ok(mut client) => {
-                let request = shared_types::grpc::GetStatusRequest {
-                    project_id: params.project_id.to_string(),
-                    session_id: String::new(), // 查询项目级别状态
-                };
-
-                // 设置超时
-                let mut tonic_request =
-                    crate::grpc::new_request_with_locale(request, params.locale);
-                tonic_request
-                    .set_timeout(std::time::Duration::from_secs(GRPC_REQUEST_TIMEOUT_SECS));
-
-                match client.get_status(tonic_request).await {
-                    Ok(response) => {
-                        let grpc_response = response.into_inner();
-                        debug!(
-                            "✅ [GRPC_GET_STATUS] Attempt {} succeeded: project_id={}, status={}, is_found={}",
-                            attempt,
-                            params.project_id,
-                            grpc_response.status,
-                            grpc_response.is_found
-                        );
-                        return Ok(grpc_response);
-                    }
-                    Err(e) => {
-                        // 直接判断原始 tonic::Status，避免信息丢失
-                        let should_retry = matches!(
-                            e.code(),
-                            tonic::Code::Unavailable
-                                | tonic::Code::DeadlineExceeded
-                                | tonic::Code::Unknown
-                                | tonic::Code::Internal
-                        );
-
-                        if should_retry && attempt < params.max_retries {
-                            warn!(
-                                "⚠️ [GRPC_GET_STATUS] Attempt {} failed (retryable): project_id={}, code={:?}, error={}",
-                                attempt,
-                                params.project_id,
-                                e.code(),
-                                e
-                            );
-                            // 从连接池移除失败的连接
-                            params.pool.remove(&grpc_addr).await;
-                            last_error = Some(anyhow::anyhow!("gRPC call failed: {}", e));
-
-                            // 指数退避: 100ms, 200ms, 400ms
-                            let delay_ms = 100 * (1 << (attempt - 1));
-                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                            continue;
-                        } else {
-                            error!(
-                                "❌ [GRPC_GET_STATUS] Attempt {} failed (non-retryable or max retries reached): project_id={}, code={:?}, error={}",
-                                attempt,
-                                params.project_id,
-                                e.code(),
-                                e
-                            );
-                            return Err(anyhow::anyhow!("gRPC call failed: {}", e));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "⚠️ [GRPC_GET_STATUS] Attempt {} to get gRPC client failed: error={}",
-                    attempt, e
-                );
-                // 从连接池移除可能失效的连接
-                params.pool.remove(&grpc_addr).await;
-                last_error = Some(e);
-                if attempt < params.max_retries {
-                    // 指数退避: 100ms, 200ms, 400ms
-                    let delay_ms = 100 * (1 << (attempt - 1));
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                    continue;
-                }
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error")))
+    crate::grpc::retry::call_grpc_with_retry(
+        params.pool,
+        &grpc_addr,
+        crate::grpc::retry::GrpcRetryPolicy {
+            attempts: params.max_retries,
+            backoff: crate::grpc::retry::exponential_backoff,
+            retry_on: crate::grpc::retry::retry_on_transport_errors,
+            log_tag: "GRPC_GET_STATUS",
+        },
+        |mut client| async move {
+            let request = shared_types::grpc::GetStatusRequest {
+                project_id: params.project_id.to_string(),
+                session_id: String::new(), // 查询项目级别状态
+            };
+            let mut tonic_request = crate::grpc::new_request_with_locale(request, params.locale);
+            tonic_request.set_timeout(std::time::Duration::from_secs(GRPC_REQUEST_TIMEOUT_SECS));
+            client.get_status(tonic_request).await
+        },
+    )
+    .await
 }

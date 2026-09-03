@@ -8,8 +8,10 @@ pub mod converters;
 pub mod error;
 pub mod locale_metadata;
 pub mod port_ready;
+pub mod retry;
 pub mod session_stream_registry;
 pub mod sse_stream;
+pub mod status_query;
 
 pub use channel_pool::GrpcChannelPool;
 pub use chat_client::*;

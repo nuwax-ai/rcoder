@@ -327,7 +327,7 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
     ),
     responses(
         (status = 200, description = "密码已设置（message 区分\"账号已创建并设置密码\"/\"密码已重置\"）", body = HttpResult<String>),
-        (status = 400, description = "参数校验失败（app_stage/app_id/new_password/username 非法）", body = HttpResult<String>),
+        (status = 400, description = "参数校验失败（app_stage/app_id/password/username 非法）", body = HttpResult<String>),
         (status = 404, description = "prod 环境 app 不存在", body = HttpResult<String>),
         (status = 500, description = "容器侧执行失败（PG 未就绪/SQL 失败）", body = HttpResult<String>)
     ),
@@ -360,8 +360,8 @@ pub(crate) async fn reset_password(
         .map_err(|e| AppError::bad_request(&e))?;
     shared_types::validate_identifier(&body.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
-    if body.new_password.is_empty() {
-        return Err(AppError::bad_request("new_password must not be empty"));
+    if body.password.is_empty() {
+        return Err(AppError::bad_request("password must not be empty"));
     }
 
     let target = resolve_exec_target(&state, app_stage, &body.app_id, &body.user_id).await?;
@@ -375,8 +375,7 @@ pub(crate) async fn reset_password(
     // 版同源）；指定 → 账号 upsert（存在 ALTER / 不存在 CREATE ROLE 建号）
     let message = match body.username.as_deref() {
         None => {
-            let cmd =
-                shared_types::pg_utils::pg_alter_current_user_password_cmd(&body.new_password);
+            let cmd = shared_types::pg_utils::pg_alter_current_user_password_cmd(&body.password);
             let r = runner.run(&cmd).await.map_err(|e| {
                 AppError::with_message(shared_types::error_codes::ERR_CONTAINER_ERROR, e)
             })?;
@@ -393,7 +392,7 @@ pub(crate) async fn reset_password(
             "密码已重置".to_string()
         }
         Some(username) => {
-            let outcome = shared_types::upsert_pg_user(&runner, username, &body.new_password)
+            let outcome = shared_types::upsert_pg_user(&runner, username, &body.password)
                 .await
                 .map_err(|e| AppError::with_message(db_admin_error_code(&e), e.to_string()))?;
             match outcome {
