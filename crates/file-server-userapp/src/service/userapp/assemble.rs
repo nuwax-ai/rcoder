@@ -45,9 +45,14 @@ pub(super) async fn assemble_workspace_package(
                 .map_err(|e| AppError::file(format!("create workspace package: {e}")))?;
             let mut zw = ZipWriterFile::new(out_file);
 
-            // 1. 各子项目 zip：raw copy（保留原始压缩字节，不二次压缩），加 {path}/ 前缀
+            // 1. 各子项目产物：zip（raw copy 保留原始压缩字节）或 static 目录
+            //（type=static 的 artifact 为静态内容目录——递归打入 {path}/ 前缀）
             for proj in &built_for_task {
-                merge_artifact_with_prefix(&mut zw, &proj.artifact, &proj.path)?;
+                if proj.artifact.is_dir() {
+                    add_dir_entries(&mut zw, &proj.artifact, &proj.path)?;
+                } else {
+                    merge_artifact_with_prefix(&mut zw, &proj.artifact, &proj.path)?;
+                }
             }
 
             // 2. workspace 根入口文件（start.sh + scripts/）：小文件，直接写入
@@ -418,6 +423,44 @@ mod tests {
         assert!(
             !out.exists(),
             "partial workspace package should be cleaned up on failure"
+        );
+    }
+    /// static 目录产物：artifact 为目录时递归打入 {path}/ 前缀（zip 产物走
+    /// raw copy 的既有分支不变）。
+    #[tokio::test]
+    async fn assemble_packs_static_directory_artifacts() {
+        let ws = tempfile::tempdir().expect("ws tempdir");
+        let ws_path = ws.path().to_path_buf();
+        std::fs::write(
+            ws_path.join("workspace.manifest.toml"),
+            "schema_version=1\n[workspace]\nname=\"x\"\n[pingap]\nmode=\"managed\"\n",
+        )
+        .unwrap();
+        // static 服务产物：目录（dist 含嵌套 assets）
+        let dist = ws_path.join("frontend/dist");
+        std::fs::create_dir_all(dist.join("assets")).expect("dist");
+        std::fs::write(dist.join("index.html"), "<html>static</html>").expect("index");
+        std::fs::write(dist.join("assets/app.js"), "js").expect("asset");
+
+        let built = vec![BuiltProject {
+            path: "frontend".into(),
+            artifact: dist,
+        }];
+        let out = assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE_REL)
+            .await
+            .expect("assemble");
+        let extract_dst = tempfile::tempdir().expect("extract");
+        zip::extract_to(out, extract_dst.path().to_path_buf())
+            .await
+            .expect("extract");
+        let root = extract_dst.path();
+        assert_eq!(
+            std::fs::read_to_string(root.join("frontend/index.html")).unwrap(),
+            "<html>static</html>"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("frontend/assets/app.js")).unwrap(),
+            "js"
         );
     }
 }
