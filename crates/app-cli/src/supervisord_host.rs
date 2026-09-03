@@ -125,6 +125,18 @@ impl SupervisordHost {
         let pingap_outcome = compile_pingap(args, release).await?;
         let endpoint = admin_probe::ensure_admin_endpoint();
 
+        // 2.5 workspace 首页静态服务（幂等；判定与 pingap 编译的兜底路由注入
+        // 同源 index_port_if_eligible——路由注入了就必须有服务承接，否则根路径
+        // 502。常驻 app-cli 进程：热部署重 orchestrate 不二次 bind，实时读文件
+        // 自动切新 code 内容）。
+        if crate::workspace_index::index_port_if_eligible(&args.workspace, &specs).is_some() {
+            crate::workspace_index::ensure_spawned(&args.workspace)?;
+            info!(
+                "📄 workspace index (index.html) serving on :{}",
+                crate::workspace_index::INDEX_PORT
+            );
+        }
+
         // 3. 写 per-service specs（run-service 启动契约；pingap 同机制承载凭证）
         let mut started: Vec<String> = Vec::new();
         for spec in &specs {

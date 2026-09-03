@@ -65,6 +65,10 @@ async fn run_inner(
     if dev_profile {
         info!("🧪 dev run profile: services with [devrun] start via their dev command");
     }
+    // workspace 首页静态服务判定（一次判定贯穿启动与拓扑汇总；与 pingap 兜底
+    // 路由注入同源 workspace_index::index_port_if_eligible）。
+    let workspace_index_port =
+        crate::workspace_index::index_port_if_eligible(&args.workspace, &specs);
 
     // 2. wait PG（PG 由 supervisor [program:postgresql] 托管，秒级就绪；失败不阻断）
     wait_for_pg().await?;
@@ -107,11 +111,10 @@ async fn run_inner(
             children.push((spec.service_id.clone(), child));
             started_user_services += 1;
         }
-        // workspace 首页静态服务（index.html 存在且无 catch-all 时；判定与 pingap
-        // 兜底路由注入同源 workspace_index::index_port_if_eligible）。进程退出即
-        // 随 runtime 消亡，无需显式停。
-        if crate::workspace_index::index_port_if_eligible(&args.workspace, &specs).is_some() {
-            crate::workspace_index::spawn(args.workspace.clone())?;
+        // workspace 首页静态服务（幂等：热部署重编排不二次 bind；常驻 app-cli
+        // 进程生命周期，实时读文件无需随 code 换入重启）。
+        if workspace_index_port.is_some() {
+            crate::workspace_index::ensure_spawned(&args.workspace)?;
             info!(
                 "📄 workspace index (index.html) serving on :{}",
                 crate::workspace_index::INDEX_PORT
@@ -151,7 +154,7 @@ async fn run_inner(
             spec.service_id, spec.port
         );
     }
-    if crate::workspace_index::index_port_if_eligible(&args.workspace, &specs).is_some() {
+    if workspace_index_port.is_some() {
         info!(
             "🔌   workspace-index port={} running route=/ (兜底 index.html)",
             crate::workspace_index::INDEX_PORT

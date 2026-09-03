@@ -51,32 +51,58 @@ pub fn index_port_if_eligible(
     Some(INDEX_PORT)
 }
 
-/// 启动静态首页服务（后台 task；app-cli 进程退出即随 runtime 消亡）。
-pub fn spawn(workspace: PathBuf) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let router = router(workspace);
-    let listener = std::net::TcpListener::bind(("0.0.0.0", INDEX_PORT))
-        .map_err(|e| anyhow::anyhow!("bind workspace index server 0.0.0.0:{INDEX_PORT}: {e}"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| anyhow::anyhow!("workspace index listener nonblocking: {e}"))?;
-    let listener = tokio::net::TcpListener::from_std(listener)
-        .map_err(|e| anyhow::anyhow!("workspace index listener async: {e}"))?;
-    Ok(tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, router).await {
-            tracing::error!("workspace index server exited: {e}");
-        }
-    }))
+/// 静态首页服务是否已在本进程内启动（幂等标记：builtin 热部署重编排 /
+/// supervisord 引擎重复 orchestrate 不得二次 bind 同端口）。
+static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 启动静态首页服务（幂等）：已在跑则直接 Ok；bind 失败回滚标记并上抛
+/// （端口被外部占用 = 编排应 fail-fast，静默跳过会让兜底路由 502）。
+///
+/// 后台 task 常驻 app-cli 进程生命周期（热部署换 code 后实时读文件自然
+/// 切到新内容，无需重启）；workspace 路径热部署间恒定（变的是目录内容）。
+pub fn ensure_spawned(workspace: &Path) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    if SPAWNED.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let spawn_result = (|| -> anyhow::Result<()> {
+        let listener = std::net::TcpListener::bind(("0.0.0.0", INDEX_PORT)).map_err(|e| {
+            anyhow::anyhow!("bind workspace index server 0.0.0.0:{INDEX_PORT}: {e}")
+        })?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| anyhow::anyhow!("workspace index listener nonblocking: {e}"))?;
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .map_err(|e| anyhow::anyhow!("workspace index listener async: {e}"))?;
+        let router = router(workspace.to_path_buf());
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router).await {
+                tracing::error!("workspace index server exited: {e}");
+            }
+        });
+        Ok(())
+    })();
+    if spawn_result.is_err() {
+        SPAWNED.store(false, Ordering::SeqCst);
+    }
+    spawn_result
 }
 
 fn router(workspace: PathBuf) -> Router {
     Router::new()
-        .route("/{*file}", get(serve))
-        .route("/", get(serve))
+        // get 仅匹配 GET，HEAD 需显式挂同 handler（curl -I / 探活工具用 HEAD）
+        .route("/{*file}", get(serve).head(serve))
+        .route("/", get(serve).head(serve))
         .with_state(workspace)
 }
 
 /// 根路径 → index.html；其余仅根一级文件（子目录 404，路径穿越 404）。
-async fn serve(State(workspace): State<PathBuf>, uri: Uri) -> Response {
+/// HEAD 与 GET 同判定，但按协议剥 body 只留头。
+async fn serve(
+    State(workspace): State<PathBuf>,
+    method: axum::http::Method,
+    uri: Uri,
+) -> Response {
     let path = uri.path();
     if path.contains("..") {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -123,6 +149,14 @@ async fn serve(State(workspace): State<PathBuf>, uri: Uri) -> Response {
                         "application/octet-stream".parse().expect("static mime")
                     }),
                 );
+            }
+            if method == axum::http::Method::HEAD {
+                // HEAD：只回头部（Content-Length 保持文件大小语义），body 为空
+                headers.insert(
+                    header::CONTENT_LENGTH,
+                    bytes.len().to_string().parse().expect("decimal length"),
+                );
+                return (StatusCode::OK, headers, axum::body::Body::empty()).into_response();
             }
             (StatusCode::OK, headers, bytes).into_response()
         }
@@ -270,6 +304,38 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type, "image/svg+xml");
         assert_eq!(body, "<svg/>");
+    }
+
+    /// HEAD 只回头部（Content-Length = 文件大小），body 为空。
+    #[tokio::test]
+    async fn head_returns_headers_without_body() {
+        let ws = temp_ws_with_index();
+        let router = router(ws);
+        let response = router
+            .oneshot(
+                axum::http::Request::head("/")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let length = response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .expect("content-length");
+        assert_eq!(
+            length,
+            "<html><body>workspace home</body></html>".len().to_string()
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect")
+            .to_bytes();
+        assert!(body.is_empty(), "HEAD must not carry a body");
     }
 
     /// 子目录与穿越路径 404（源码在一级子目录，不暴露）。
