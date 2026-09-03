@@ -368,12 +368,14 @@ mod evt_tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let hits = hits.lock().expect("lock");
-        assert_eq!(
-            hits.as_slice(),
-            [r#"{"event":"service_start_ok","service":"frontend"}"#.to_string()],
-            "only the EVT line's JSON payload (prefix stripped) is forwarded"
-        );
+        {
+            let hits = hits.lock().expect("lock");
+            assert_eq!(
+                hits.as_slice(),
+                [r#"{"event":"service_start_ok","service":"frontend"}"#.to_string()],
+                "only the EVT line's JSON payload (prefix stripped) is forwarded"
+            );
+        }
         // 两类行都写日志（EVT 行排障可见）
         let logged = tokio::fs::read_to_string(&main).await.expect("main log");
         assert!(logged.contains("APP-CLI-EVT"), "{logged}");
