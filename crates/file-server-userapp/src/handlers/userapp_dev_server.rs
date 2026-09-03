@@ -35,6 +35,72 @@ fn app_id_of_key(key: &str) -> Option<&str> {
     key.strip_prefix("userapp:")
 }
 
+/// app-cli 终局事件的有界等待上限（秒）——正常路径 done 先于 start_dev
+/// 返回（9080 listen 即全部判定完成），此窗口仅防御管道异步竞态。
+const START_DONE_WAIT_MAX_SECS: u64 = 2;
+
+/// 任务级日志行（快速路径说明等）的事件 service 标识——对齐编排日志源
+/// `service_id=app-cli` 的既有命名。
+const ORCHESTRATOR_LOG_SERVICE: &str = "app-cli";
+
+/// 启动判定状态（EVT 回调同步写 / spawn 主流程 await 完后读）。
+#[derive(Default)]
+struct StartEventsState {
+    /// app-cli 终局事件（orchestration_done）已到。
+    done: bool,
+    /// 启动失败清单（service, error）——done 的清单为权威值（覆盖累积）。
+    failed: Vec<(String, String)>,
+}
+
+/// app-cli EVT 行（JSON 字符串，前缀已被 file-server 管道剥离）的映射结果。
+#[derive(Debug)]
+enum EvtOutcome {
+    /// 可直接转发的进度事件。
+    Event(shared_types::BuildProgressEvent),
+    /// 终局事件：权威失败清单。
+    Done { failed: Vec<(String, String)> },
+}
+
+/// app-cli EVT JSON → 进度事件/终局（跨进程 wire 契约；与 app-cli
+/// `orchestration_events` 的 serde 形态一致——两端测试锁同一组字符串）。
+/// 解析失败/未知事件返回 None（调用方 warn 丢弃，不影响编排）。
+fn map_app_cli_evt(json: &str) -> Option<EvtOutcome> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let event = value.get("event")?.as_str()?;
+    match event {
+        "service_starting" => Some(EvtOutcome::Event(
+            shared_types::BuildProgressEvent::ServiceStarting {
+                service: value.get("service")?.as_str()?.to_string(),
+            },
+        )),
+        "service_start_ok" => Some(EvtOutcome::Event(
+            shared_types::BuildProgressEvent::ServiceStartOk {
+                service: value.get("service")?.as_str()?.to_string(),
+            },
+        )),
+        "service_start_fail" => Some(EvtOutcome::Event(
+            shared_types::BuildProgressEvent::ServiceStartFail {
+                service: value.get("service")?.as_str()?.to_string(),
+                error: value.get("error")?.as_str()?.to_string(),
+            },
+        )),
+        "orchestration_done" => {
+            let failed = value
+                .get("failed")?
+                .as_array()?
+                .iter()
+                .map(|item| {
+                    let service = item.get("service")?.as_str()?.to_string();
+                    let error = item.get("error")?.as_str()?.to_string();
+                    Some((service, error))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(EvtOutcome::Done { failed })
+        }
+        _ => None,
+    }
+}
+
 // ── handlers ───────────────────────────────────────────────────────────────────
 
 /// 编译并启动 dev 服务
@@ -259,6 +325,42 @@ async fn spawn_dev_task(
             .await
             .map(Some)
         };
+        // 启动事件通道：app-cli stdout EVT 行（同步管道回调）→ unbounded 通道 →
+        // 独立消费 task 异步 emit（emit 为 async；对齐构建日志管道先例）。
+        // 消费 task 常驻到管道 EOF（app-cli 退出），fire-and-forget。
+        let (evt_tx, mut evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<shared_types::BuildProgressEvent>();
+        let emit_task = {
+            let task = task_clone.clone();
+            tokio::spawn(async move {
+                while let Some(event) = evt_rx.recv().await {
+                    task.emit(event).await;
+                }
+            })
+        };
+        // 启动判定状态（回调同步写 / 主流程 await 完后读）：
+        // - failed：启动失败清单（service, error）——orchestration_done 的清单为
+        //   权威值（覆盖逐事件累积）
+        // - done：app-cli 终局事件已到（9080 listen 即全部判定完成，通常先于
+        //   start_dev 返回；bounded 等待为防御）
+        let start_state = std::sync::Arc::new(std::sync::Mutex::new(StartEventsState::default()));
+        let on_event = {
+            let tx = evt_tx.clone();
+            let start_state = start_state.clone();
+            std::sync::Arc::new(move |json: &str| match map_app_cli_evt(json) {
+                Some(EvtOutcome::Event(event)) => {
+                    drop(tx.send(event));
+                }
+                Some(EvtOutcome::Done { failed }) => {
+                    let mut state = start_state.lock().expect("start state lock");
+                    state.done = true;
+                    state.failed = failed;
+                }
+                None => {
+                    tracing::warn!(json, "[DEV_START] unparsed app-cli EVT line dropped");
+                }
+            }) as file_server::service::dev_server::process::OnLineCallback
+        };
         let outcome = async {
             // Start 快速路径：服务已在跑 → 跳过启停直接完成（廉价幂等）。
             // 注意：此处编译已在上方 await 完（产物态产出新 zip 但不部署不重启
@@ -274,6 +376,12 @@ async fn spawn_dev_task(
                     .any(|p| p.project_id == key)
             {
                 tracing::info!(%app_id, "dev already running; start task completes without deploy/restart");
+                task_clone
+                    .emit(shared_types::BuildProgressEvent::Log {
+                        service: ORCHESTRATOR_LOG_SERVICE.into(),
+                        line: "dev already running; start task completes without deploy/restart".into(),
+                    })
+                    .await;
                 return Ok::<(), AppError>(());
             }
             result?;
@@ -294,25 +402,64 @@ async fn spawn_dev_task(
             } else {
                 crate::service::userapp::run_dir::prepare_run_dir(&ws, &release_id).await?
             };
-            // 启动/重启（失败整体 Failed——restart 场景旧服务已被 stop，
-            // 语义上本轮失败，下次重试）
+            // 启动/重启（start_dev 内 poll_alive 宽松就绪——app-cli 进程存活
+            // 即成功；单服务启动成败经 EVT 事件流逐服务呈现，见下方终态判定）
             match action {
                 DevTaskAction::Start => {
                     state
                         .fs.dev_server
-                        .start_dev(&key, &run_root, base_path.as_deref())
+                        .start_dev(&key, &run_root, base_path.as_deref(), Some(on_event.clone()))
                         .await?;
                 }
                 DevTaskAction::Restart => {
                     state
                         .fs.dev_server
-                        .restart_dev(&key, &run_root, base_path.as_deref())
+                        .restart_dev(&key, &run_root, base_path.as_deref(), Some(on_event.clone()))
                         .await?;
                 }
+            }
+            // bounded 等 app-cli 终局事件（9080 listen 即全部启动判定完成，通常
+            // 已先于 start_dev 返回；2s 防御窗口后按当前累积清单兜底——事件流
+            // 仍是真相源，终态误判窗口毫秒级）。
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(START_DONE_WAIT_MAX_SECS);
+            loop {
+                {
+                    let snapshot = start_state.lock().expect("start state lock");
+                    if snapshot.done || tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let failed = start_state
+                .lock()
+                .expect("start state lock")
+                .failed
+                .clone();
+            // 排空窗口：done 行到达时通道内 service 事件已全部 send（stdout 行序
+            // 保证），但消费 task 的 emit 是异步的——短暂等待让 service_* 事件
+            // 先于终态入环（SSE 消费方按序看到逐服务结果再收终态）。
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if !failed.is_empty() {
+                // 部分服务启动失败：任务终态 Failed（逐服务汇总；调用方经 SSE
+                // 事件流自明各服务成败）——**已启动服务保留运行**（不 stop；
+                // dev/list 可查部分存活），与"失败不阻塞"语义一致。
+                let summary = failed
+                    .iter()
+                    .map(|(service, error)| format!("{service}: {error}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(AppError::business(format!(
+                    "服务启动失败（其余服务已启动）: {summary}"
+                )));
             }
             Ok::<(), AppError>(())
         }
         .await;
+        // 注：事件转发 task（emit_task）不 join——它由 stdout 管道 EOF
+        // （app-cli 退出）自然收尾；终态 emit 在主流程（上方排空窗口后）。
+        let _ = emit_task;
         match outcome {
             Ok(()) => {
                 task_clone
@@ -416,5 +563,50 @@ mod tests {
         let keys = ["userapp:app-1", "web-proj", "computer:u:c"];
         let userapp: Vec<&str> = keys.iter().filter_map(|k| app_id_of_key(k)).collect();
         assert_eq!(userapp, vec!["app-1"]);
+    }
+    /// EVT JSON 映射契约：与 app-cli orchestration_events 的 wire 字符串一致
+    /// （跨进程行协议，两端测试锁同一组字面量；此处锁 file-server-userapp 侧）。
+    #[test]
+    fn maps_app_cli_evt_wire_to_progress_events() {
+        match map_app_cli_evt(r#"{"event":"service_starting","service":"frontend"}"#) {
+            Some(EvtOutcome::Event(shared_types::BuildProgressEvent::ServiceStarting {
+                service,
+            })) => assert_eq!(service, "frontend"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match map_app_cli_evt(r#"{"event":"service_start_ok","service":"backend-go"}"#) {
+            Some(EvtOutcome::Event(shared_types::BuildProgressEvent::ServiceStartOk {
+                service,
+            })) => assert_eq!(service, "backend-go"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match map_app_cli_evt(
+            r#"{"event":"service_start_fail","service":"backend-java","error":"probe timeout"}"#,
+        ) {
+            Some(EvtOutcome::Event(shared_types::BuildProgressEvent::ServiceStartFail {
+                service,
+                error,
+            })) => {
+                assert_eq!(service, "backend-java");
+                assert_eq!(error, "probe timeout");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match map_app_cli_evt(
+            r#"{"event":"orchestration_done","failed":[{"service":"s1","error":"e1"}]}"#,
+        ) {
+            Some(EvtOutcome::Done { failed }) => {
+                assert_eq!(failed, vec![("s1".to_string(), "e1".to_string())]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // 空 failed = 全部成功
+        match map_app_cli_evt(r#"{"event":"orchestration_done","failed":[]}"#) {
+            Some(EvtOutcome::Done { failed }) => assert!(failed.is_empty()),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // 未知事件/坏 JSON → None（丢弃不 panic）
+        assert!(map_app_cli_evt(r#"{"event":"something_else"}"#).is_none());
+        assert!(map_app_cli_evt("not json").is_none());
     }
 }

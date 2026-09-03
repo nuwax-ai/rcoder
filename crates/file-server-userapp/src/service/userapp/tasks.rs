@@ -279,6 +279,17 @@ fn apply_event(state: &mut TaskState, event: &BuildProgressEvent) {
             state.error = Some(error.clone());
         }
         BuildProgressEvent::Log { .. } => {}
+        // dev 启动阶段事件：更新 current_service（消费方轮询快照可见进行中的
+        // 服务）；失败记录 error（快照侧可读，终态仍由汇总 Failed 决定）。
+        BuildProgressEvent::ServiceStarting { service }
+        | BuildProgressEvent::ServiceStartOk { service } => {
+            state.current_service = Some(service.clone());
+            state.status = BuildTaskStatus::Running;
+        }
+        BuildProgressEvent::ServiceStartFail { service, error } => {
+            state.current_service = Some(service.clone());
+            state.error = Some(error.clone());
+        }
         BuildProgressEvent::Completed {
             release_id,
             sha256,
