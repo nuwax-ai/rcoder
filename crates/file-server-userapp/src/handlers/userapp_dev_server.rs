@@ -202,7 +202,9 @@ pub(crate) async fn dev_stop(
 /// `[build].command`），源码目录 release.lock 按 manifest 新旧自动重锁后 app-cli
 /// 重编源码 workspace（`[devrun]` 优先）；未配则产物态（现状：同核编译打 zip →
 /// `.run` 换入）。编译失败任务终态 Failed、旧服务原样保留（可继续用旧版本测试，
-/// 不因中间态断流）。进度/结果查询同 start。入参 basePath 对 Userapp
+/// 不因中间态断流）。启动阶段逐服务 SSE 事件（service_starting/start_ok/
+/// start_fail，单服务失败不阻塞其余）同 start 的说明。进度/结果查询同 start。
+/// 入参 basePath 对 Userapp
 /// workspace 无效（同 start 的说明）。
 #[utoipa::path(
     post,
@@ -457,9 +459,9 @@ async fn spawn_dev_task(
             Ok::<(), AppError>(())
         }
         .await;
-        // 注：事件转发 task（emit_task）不 join——它由 stdout 管道 EOF
+        // 事件转发 task 显式 detach（drop JoinHandle）：由 stdout 管道 EOF
         // （app-cli 退出）自然收尾；终态 emit 在主流程（上方排空窗口后）。
-        let _ = emit_task;
+        drop(emit_task);
         match outcome {
             Ok(()) => {
                 task_clone
