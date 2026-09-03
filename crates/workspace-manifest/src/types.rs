@@ -70,6 +70,9 @@ pub struct ProjectManifest {
     /// dev 阶段编译命令（可选，缺省回落 [`Self::build`]；仅源码态 dev 链路生效）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devbuild: Option<DevbuildSection>,
+    /// 运行段：进程态服务必填（`command` 非空由校验保证）；`type = "static"`
+    /// 的服务省略本段（serde default 空段；校验层拒绝 static 配置启动命令）。
+    #[serde(default)]
     pub run: RunSection,
     /// dev 阶段启动命令（可选，缺省回落 [`Self::run`]；配置即触发源码态 dev 链路）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,7 +152,9 @@ pub struct DevrunSection {
     pub command: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// 运行段。进程态服务 `command` 必填非空（校验保证）；`type = "static"` 服务
+/// 省略整段（[`Default`]：空 command——由 app-cli 内置静态托管承载，无进程）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunSection {
     pub command: Vec<String>,

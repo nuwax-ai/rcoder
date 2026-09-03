@@ -75,6 +75,64 @@ mod tests {
         .join("\n")
     }
 
+    /// static 形态契约：省略 [run] 合法（serde default 空段）；配启动/迁移命令
+    /// 校验拒绝（无进程——内置静态托管承载）；非 static 省 [run] 仍被
+    /// run.command 空数组校验拦截（既有把关）。
+    #[test]
+    fn static_service_form_contract() {
+        // 合法：static 无 [run]，artifact=目录
+        let static_min = [
+            "schema_version = 1",
+            "[project]",
+            "service_id = 'frontend'",
+            "name = 'Frontend'",
+            "type = 'static'",
+            "[build]",
+            "command = ['sh', 'build.sh']",
+            "artifact = 'dist'",
+        ]
+        .join("\n");
+        let manifest = parse_project(&static_min).expect("static without [run] parses");
+        assert!(manifest.run.command.is_empty(), "run defaults to empty");
+
+        // 非法：static + [run].command
+        let with_run = format!("{static_min}\n[run]\ncommand = ['node', 'server.js']\n");
+        let err = parse_project(&with_run)
+            .expect_err("static with run.command must fail")
+            .to_string();
+        assert!(
+            err.contains("static service must not declare [run].command"),
+            "{err}"
+        );
+
+        // 非法：static + [run].migrate
+        let with_migrate = format!("{static_min}\n[run]\nmigrate = ['true']\n");
+        let err = parse_project(&with_migrate)
+            .expect_err("static with migrate must fail")
+            .to_string();
+        assert!(
+            err.contains("static service must not declare [run].migrate"),
+            "{err}"
+        );
+
+        // 非 static 省 [run]：空 command 被既有校验拦截
+        let no_run_node = [
+            "schema_version = 1",
+            "[project]",
+            "service_id = 'frontend'",
+            "name = 'Frontend'",
+            "type = 'node'",
+            "[build]",
+            "command = ['sh', 'build.sh']",
+            "artifact = 'artifact.zip'",
+        ]
+        .join("\n");
+        let err = parse_project(&no_run_node)
+            .expect_err("non-static without run must fail")
+            .to_string();
+        assert!(err.contains("run.command"), "{err}");
+    }
+
     #[test]
     fn dev_sections_parse_and_default_to_none() {
         let base = minimal_project_toml();

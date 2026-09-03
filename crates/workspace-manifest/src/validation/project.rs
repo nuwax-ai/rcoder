@@ -3,7 +3,8 @@
 use std::path::Path;
 
 use crate::{
-    ManifestError, PingapMode, ProjectKind, ProjectManifest, SCHEMA_VERSION, WorkspaceManifest,
+    ManifestError, PingapMode, ProjectKind, ProjectManifest, ProjectType, SCHEMA_VERSION,
+    WorkspaceManifest,
 };
 
 use super::issue::{ValidationIssue, manifest_file_of};
@@ -71,12 +72,43 @@ pub fn validate_project_at(manifest: &ProjectManifest, dir: &str) -> Vec<Validat
             ),
         );
     }
-    if let Some(issue) = validate_argv_issue(&manifest.run.command, "run.command") {
+    // run.command 非空仅约束进程态服务；static 的形态约束见下方专项检查
+    if project.r#type != ProjectType::Static
+        && let Some(issue) = validate_argv_issue(&manifest.run.command, "run.command")
+    {
         issues.push(
             locate(issue).at_field("run.command").with_hint(
                 "the service must listen on 0.0.0.0:$PORT ($PORT is injected per service)",
             ),
         );
+    }
+    // type = static 的形态契约：无进程——app-cli 内置静态托管 serve
+    // [build].artifact（静态内容目录），启动恒成功。配了启动/迁移命令即矛盾。
+    if project.r#type == ProjectType::Static {
+        if !manifest.run.command.is_empty() {
+            issues.push(
+                locate(
+                    ValidationIssue::new(
+                        "static service must not declare [run].command \
+                         (no process: content is served by the built-in static host)",
+                    )
+                    .at_field("run.command"),
+                )
+                .with_hint(
+                    "remove the [run] section, or set type = \"node\" etc. \
+                     if the service runs a process",
+                ),
+            );
+        }
+        if !manifest.run.migrate.is_empty() {
+            issues.push(
+                locate(
+                    ValidationIssue::new("static service must not declare [run].migrate")
+                        .at_field("run.migrate"),
+                )
+                .with_hint("remove [run].migrate (static services have no process or database side effects at start)"),
+            );
+        }
     }
     if let Some(devrun) = &manifest.devrun
         && let Some(issue) = validate_argv_issue(&devrun.command, "devrun.command")
