@@ -351,10 +351,7 @@ pub async fn computer_notify_resolved(
             return forward_permission_resolution(&state, container, dto, locale).await;
         }
         Ok(super::pod_handler::AppTarget::Prod(_)) => {
-            return Ok(Json(super::pod_handler::invalid_app_target_response(
-                locale,
-                "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 (UserappBuilder 开发容器)",
-            )));
+            return Ok(Json(super::pod_handler::agent_prod_unsupported(locale)));
         }
         Err(e) => {
             return Ok(Json(super::pod_handler::invalid_app_target_response(

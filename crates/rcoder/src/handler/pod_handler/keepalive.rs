@@ -9,7 +9,7 @@ use super::*;
     request_body(content = KeepalivePodRequest, description = "容器保活请求"),
     responses(
         (status = 200, description = "成功刷新活动时间", body = HttpResult<KeepalivePodResponse>),
-        (status = 400, description = "请求参数无效", body = HttpResult<String>),
+        (status = 200, description = "参数无效错误信封（code=ERR_VALIDATION；异常统一 200 信封风格）", body = HttpResult<String>),
         (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
@@ -43,19 +43,13 @@ pub async fn pod_keepalive(
     }
 
     // 1. 验证参数
-    if request.user_id.trim().is_empty() {
-        error!("[POD_KEEPALIVE] user_id is required");
-        return Err(AppError::with_message(
-            shared_types::error_codes::ERR_VALIDATION,
-            "user_id is required and cannot be empty",
-        ));
-    }
-    if request.project_id.trim().is_empty() {
-        error!("[POD_KEEPALIVE] project_id is required");
-        return Err(AppError::with_message(
-            shared_types::error_codes::ERR_VALIDATION,
-            "project_id is required and cannot be empty",
-        ));
+    if let Some(resp) = validate_pod_ids(
+        &request.user_id,
+        &request.project_id,
+        locale,
+        "POD_KEEPALIVE",
+    ) {
+        return Ok(resp);
     }
 
     // 1.1 解析 service_type
@@ -63,9 +57,10 @@ pub async fn pod_keepalive(
         Ok(st) => st,
         Err(e) => {
             error!("[POD_KEEPALIVE] invalid service_type: {}", e);
-            return Err(AppError::with_message(
+            return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
-                e.to_string(),
+                locale,
+                &e.to_string(),
             ));
         }
     };
@@ -79,8 +74,9 @@ pub async fn pod_keepalive(
             error!(
                 "[POD_KEEPALIVE] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided"
             );
-            return Err(AppError::with_message(
+            return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
+                locale,
                 "isolation_type, tenant_id, space_id are all required when pod_id is provided",
             ));
         }

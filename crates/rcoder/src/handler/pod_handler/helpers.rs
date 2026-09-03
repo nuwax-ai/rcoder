@@ -520,3 +520,41 @@ pub(crate) async fn resolve_userapp_dev_container(
         }
     }
 }
+
+/// agent 族 "app_stage prod 不支持" 的统一响应（文案与
+/// [`validate_agent_dev_stage`] 的 Prod 分支逐字同源——此前 5 处逐字拷贝，
+/// 改文案时极易漂移）。泛型 T 由调用方响应类型推断。
+pub(crate) fn agent_prod_unsupported<T>(locale: &'static str) -> HttpResult<T> {
+    invalid_app_target_response(
+        locale,
+        "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 (UserappBuilder 开发容器)",
+    )
+}
+
+/// pod 族 POST 请求的 user_id/project_id 必填校验（ensure/stop/keepalive/
+/// restart 四处原为 15 行×4 逐字重复，仅日志 tag 不同）。
+/// 返回 Some(错误信封) 时调用方直接 `return Ok(resp)`；T 由响应类型推断。
+pub(crate) fn validate_pod_ids<T>(
+    user_id: &str,
+    project_id: &str,
+    locale: &'static str,
+    log_tag: &str,
+) -> Option<HttpResult<T>> {
+    if user_id.trim().is_empty() {
+        error!("[{log_tag}] user_id is required");
+        return Some(HttpResult::error_with_message(
+            shared_types::error_codes::ERR_VALIDATION,
+            locale,
+            "user_id is required and cannot be empty",
+        ));
+    }
+    if project_id.trim().is_empty() {
+        error!("[{log_tag}] project_id is required");
+        return Some(HttpResult::error_with_message(
+            shared_types::error_codes::ERR_VALIDATION,
+            locale,
+            "project_id is required and cannot be empty",
+        ));
+    }
+    None
+}

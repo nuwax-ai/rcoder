@@ -232,10 +232,7 @@ pub async fn computer_agent_session_cancel(
             .await;
         }
         Ok(super::pod_handler::AppTarget::Prod(_)) => {
-            return Ok(super::pod_handler::invalid_app_target_response(
-                locale,
-                "app_stage 'prod' is not supported: agent 会话仅存在于 dev 阶段 (UserappBuilder 开发容器)",
-            ));
+            return Ok(super::pod_handler::agent_prod_unsupported(locale));
         }
         Err(e) => return Ok(super::pod_handler::invalid_app_target_response(locale, &e)),
     }

@@ -47,21 +47,9 @@ pub async fn pod_stop(
     }
 
     // 1. 验证参数
-    if request.user_id.trim().is_empty() {
-        error!("[POD_STOP] user_id is required");
-        return Ok(HttpResult::error_with_message(
-            shared_types::error_codes::ERR_VALIDATION,
-            locale,
-            "user_id is required and cannot be empty",
-        ));
-    }
-    if request.project_id.trim().is_empty() {
-        error!("[POD_STOP] project_id is required");
-        return Ok(HttpResult::error_with_message(
-            shared_types::error_codes::ERR_VALIDATION,
-            locale,
-            "project_id is required and cannot be empty",
-        ));
+    if let Some(resp) = validate_pod_ids(&request.user_id, &request.project_id, locale, "POD_STOP")
+    {
+        return Ok(resp);
     }
 
     // 1.1 解析 service_type

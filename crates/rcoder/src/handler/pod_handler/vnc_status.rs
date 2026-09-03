@@ -13,7 +13,7 @@ use shared_types::ProjectStore as _; // 存储契约 trait：state.projects（Pr
     params(VncStatusQuery),
     responses(
         (status = 200, description = "成功获取 VNC 状态", body = HttpResult<VncStatusResponse>),
-        (status = 400, description = "参数无效", body = HttpResult<String>),
+        (status = 200, description = "参数无效错误信封（code=ERR_VALIDATION；异常统一 200 信封风格）", body = HttpResult<String>),
         (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 404, description = "容器不存在", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
@@ -52,9 +52,10 @@ pub async fn pod_vnc_status(
         }
         Err(e) => {
             error!("[POD_VNC_STATUS] invalid app target: {}", e);
-            return Err(AppError::with_message(
+            return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
-                e,
+                locale,
+                &e,
             ));
         }
     }
@@ -72,9 +73,10 @@ pub async fn pod_vnc_status(
         Ok(st) => st,
         Err(e) => {
             error!("[POD_VNC_STATUS] invalid service_type: {}", e);
-            return Err(AppError::with_message(
+            return Ok(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
-                e.to_string(),
+                locale,
+                &e.to_string(),
             ));
         }
     };
@@ -88,16 +90,18 @@ pub async fn pod_vnc_status(
         error!(
             "[POD_VNC_STATUS] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided"
         );
-        return Err(AppError::with_message(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
+            locale,
             "isolation_type, tenant_id, space_id are all required when pod_id is provided",
         ));
     }
 
     if pod_id.is_none() && user_id.is_none() && project_id.is_none() {
         warn!("[POD_VNC_STATUS] pod_id, user_id and project_id are all empty");
-        return Err(AppError::with_message(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
+            locale,
             "at least one of pod_id, user_id or project_id is required",
         ));
     }

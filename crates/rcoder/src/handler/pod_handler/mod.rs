@@ -48,8 +48,8 @@ pub(crate) use helpers::resolve_resource_limits_from_config;
 /// userApp 三字段（service_type/app_id/app_stage）分派共用件——pod 族与
 /// agent 族（status/stop/cancel/notify-resolved/cache-clean）单一事实源
 pub(crate) use helpers::{
-    AppTarget, invalid_app_target_response, is_container_running, parse_app_target,
-    resolve_userapp_dev_container, validate_agent_dev_stage,
+    AppTarget, agent_prod_unsupported, invalid_app_target_response, is_container_running,
+    parse_app_target, resolve_userapp_dev_container, validate_agent_dev_stage,
 };
 pub use keepalive::*;
 pub use queries::*;
