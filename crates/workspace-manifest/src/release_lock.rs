@@ -47,7 +47,9 @@ pub fn build_release_lock(
                 kind: manifest.project.kind.clone(),
                 enabled: manifest.project.enabled,
                 port,
+                devbuild: manifest.devbuild.clone(),
                 run: manifest.run.clone(),
+                devrun: manifest.devrun.clone(),
                 health: manifest.health.clone(),
                 proxy: manifest.proxy.clone(),
                 logs: manifest.logs.sources.clone(),
@@ -199,12 +201,14 @@ mod tests {
                     command: vec!["true".into()],
                     artifact: "artifact.zip".into(),
                 },
+                devbuild: None,
                 run: RunSection {
                     command: vec!["./server".into()],
                     migrate: Vec::new(),
                     depends_on: Vec::new(),
                     shutdown_timeout_seconds: 30,
                 },
+                devrun: None,
                 health: HealthSection::default(),
                 proxy: None,
                 logs: LogsSection::default(),
@@ -232,6 +236,88 @@ mod tests {
             ports
                 .values()
                 .all(|port| !RESERVED_RUNTIME_PORTS.contains(port))
+        );
+    }
+
+    /// devbuild/devrun 透传进 lock，且 None 服务序列化后 lock 无新键
+    /// （未配置 dev 段的服务，旧版 app-cli 读新链路产出的 lock 完全兼容）。
+    #[test]
+    fn dev_sections_pass_through_and_omit_when_absent() {
+        use crate::{DevbuildSection, DevrunSection};
+        let mut with_dev = discovered("frontend");
+        with_dev.manifest.devbuild = Some(DevbuildSection {
+            command: vec!["pnpm".into(), "run".into(), "type-check".into()],
+        });
+        with_dev.manifest.devrun = Some(DevrunSection {
+            command: vec!["pnpm".into(), "exec".into(), "vite".into()],
+        });
+        let plain = discovered("backend");
+
+        let workspace = WorkspaceManifest {
+            schema_version: 1,
+            workspace: crate::WorkspaceMeta {
+                name: "ws".into(),
+                description: None,
+            },
+            pingap: Default::default(),
+            health: Default::default(),
+        };
+        let lock = build_release_lock(
+            &workspace,
+            &[with_dev, plain],
+            ReleaseMetadata {
+                release_id: "rel",
+                pingap_version: "0",
+                pingap_commit: "0",
+                minimum_app_cli_version: "0",
+                runtime_image_digest: "local-dev",
+            },
+        )
+        .expect("lock");
+
+        let frontend = lock
+            .services
+            .iter()
+            .find(|service| service.service_id == "frontend")
+            .expect("frontend");
+        assert_eq!(
+            frontend.devbuild.as_ref().expect("devbuild").command,
+            vec!["pnpm", "run", "type-check"]
+        );
+        assert_eq!(
+            frontend.devrun.as_ref().expect("devrun").command,
+            vec!["pnpm", "exec", "vite"]
+        );
+        let backend = lock
+            .services
+            .iter()
+            .find(|service| service.service_id == "backend")
+            .expect("backend");
+        assert!(backend.devbuild.is_none() && backend.devrun.is_none());
+
+        // 序列化兼容性：lock 文本中 dev 段键仅在配置处出现；未配置服务不产生
+        // devbuild/devrun 键（serde skip None），旧 app-cli（deny_unknown_fields）
+        // 读该 lock 不报 unknown field。
+        let text = toml::to_string_pretty(&lock).expect("serialize");
+        assert!(text.contains("[services.devbuild]"));
+        assert!(text.contains("[services.devrun]"));
+        assert_eq!(
+            text.matches("devbuild").count(),
+            1,
+            "devbuild key must appear exactly once (frontend only)"
+        );
+        assert_eq!(
+            text.matches("devrun").count(),
+            1,
+            "devrun key must appear exactly once (frontend only)"
+        );
+        // roundtrip：带 dev 段的 lock 可被 load_release_lock 读回（当前版本路径）
+        let reloaded = load_release_lock(&text).expect("reload lock with dev sections");
+        assert!(
+            reloaded
+                .services
+                .iter()
+                .any(|service| service.devrun.is_some())
         );
     }
 }

@@ -67,7 +67,13 @@ pub struct ProjectManifest {
     pub schema_version: u32,
     pub project: ProjectMeta,
     pub build: BuildSection,
+    /// dev 阶段编译命令（可选，缺省回落 [`Self::build`]；仅源码态 dev 链路生效）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devbuild: Option<DevbuildSection>,
     pub run: RunSection,
+    /// dev 阶段启动命令（可选，缺省回落 [`Self::run`]；配置即触发源码态 dev 链路）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devrun: Option<DevrunSection>,
     #[serde(default)]
     pub health: HealthSection,
     #[serde(default)]
@@ -114,6 +120,33 @@ pub enum ProjectKind {
 pub struct BuildSection {
     pub command: Vec<String>,
     pub artifact: String,
+}
+
+/// dev 阶段编译/检查命令（可选）。
+///
+/// 仅在源码态 dev 链路（任一服务配了 `[devrun]`）生效：`/dev/start`·`/dev/restart`
+/// 逐服务执行本命令而非 `[build].command`——典型用法是轻量检查（如
+/// `pnpm run type-check`）避免全量构建；缺省回落 `[build].command`（刷新源码
+/// 目录产物，未配 `[devrun]` 的服务 run.command 依赖它）。产物态链路
+/// （未配 `[devrun]` 的 app）编译恒用 `[build].command`（发布同核，zip 是
+/// 部署物必需品，轻量命令不产 zip 不能替换）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevbuildSection {
+    pub command: Vec<String>,
+}
+
+/// dev 阶段热加载启动命令（可选）。
+///
+/// 任一 enabled 服务配置本段即把该 app 的 dev 形态切为**源码态**：dev/start
+/// ·restart 不再部署 `.run` 产物，app-cli 直接编排源码 workspace 并用本命令
+/// 启动（典型：`vite`/`nodemon`/`spring-boot:run` 等热加载命令，跑源码改码即
+/// 生效）；缺省回落 `[run].command`。端口注入（PORT env）、pingap 路由、健康
+/// 检查、拓扑编排与产物态完全一致；生产（serve 形态）不读本段。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevrunSection {
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -237,7 +270,15 @@ pub struct LockedService {
     pub kind: ProjectKind,
     pub enabled: bool,
     pub port: u16,
+    /// dev 阶段编译命令（manifest 透传；编译执行在平台侧，app-cli 不消费，
+    /// 携带以保持 lock 对 manifest 的完整投影与 gen-lock 预览可见）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devbuild: Option<DevbuildSection>,
     pub run: RunSection,
+    /// dev 阶段启动命令（manifest 透传；app-cli 仅在 `APP_CLI_RUN_PROFILE=dev`
+    /// 的源码态编排下消费，生产 serve 形态不读）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devrun: Option<DevrunSection>,
     pub health: HealthSection,
     pub proxy: Option<ProxySection>,
     pub logs: Vec<LogSource>,

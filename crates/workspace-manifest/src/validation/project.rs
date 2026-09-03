@@ -62,12 +62,29 @@ pub fn validate_project_at(manifest: &ProjectManifest, dir: &str) -> Vec<Validat
             "argv array, e.g. [\"sh\", \"scripts/build.sh\"]; needs a shell? use [\"sh\", \"-c\", \"...\"]",
         ));
     }
+    if let Some(devbuild) = &manifest.devbuild
+        && let Some(issue) = validate_argv_issue(&devbuild.command, "devbuild.command")
+    {
+        issues.push(
+            locate(issue).at_field("devbuild.command").with_hint(
+                "dev 阶段编译/检查命令（仅源码态 dev 链路生效，缺省回落 [build].command）",
+            ),
+        );
+    }
     if let Some(issue) = validate_argv_issue(&manifest.run.command, "run.command") {
         issues.push(
             locate(issue).at_field("run.command").with_hint(
                 "the service must listen on 0.0.0.0:$PORT ($PORT is injected per service)",
             ),
         );
+    }
+    if let Some(devrun) = &manifest.devrun
+        && let Some(issue) = validate_argv_issue(&devrun.command, "devrun.command")
+    {
+        issues.push(locate(issue).at_field("devrun.command").with_hint(
+            "dev 阶段热加载启动命令（配置即切源码态，缺省回落 [run].command）；\
+             需监听 0.0.0.0:$PORT（与 run.command 同款注入）",
+        ));
     }
     if !manifest.run.migrate.is_empty()
         && let Some(issue) = validate_argv_issue(&manifest.run.migrate, "run.migrate")

@@ -212,10 +212,10 @@ pub use agent::mgmt_types::{
     UPLOAD_CHUNK_SIZE, URL_DOWNLOAD_TIMEOUT_SECS, UninstallAgentRequest, UninstallAgentResponse,
 };
 pub use workspace_manifest::{
-    BuildSection, DiscoverError, DiscoveredProject, HealthSection, LockedPingap, LockedService,
-    LogFormat, LogSource, LogsSection, ManifestError, PingapMode, PingapSection, ProjectKind,
-    ProjectManifest, ProjectMeta, ProjectType, ProxySection, ReleaseLock, ReleaseMetadata,
-    RunSection, WorkspaceManifest, WorkspaceMeta, build_release_lock, discover_projects,
-    parse_project, parse_workspace, validate_project, validate_service_id, validate_topology,
-    validate_workspace,
+    BuildSection, DevbuildSection, DevrunSection, DiscoverError, DiscoveredProject, HealthSection,
+    LockedPingap, LockedService, LogFormat, LogSource, LogsSection, ManifestError, PingapMode,
+    PingapSection, ProjectKind, ProjectManifest, ProjectMeta, ProjectType, ProxySection,
+    ReleaseLock, ReleaseMetadata, RunSection, WorkspaceManifest, WorkspaceMeta, build_release_lock,
+    discover_projects, parse_project, parse_workspace, validate_project, validate_service_id,
+    validate_topology, validate_workspace,
 };

@@ -37,12 +37,14 @@ mod tests {
                 command: vec!["sh".into(), "build.sh".into()],
                 artifact: "artifact.zip".into(),
             },
+            devbuild: None,
             run: RunSection {
                 command: vec!["./server".into()],
                 migrate: Vec::new(),
                 depends_on: depends_on.iter().map(|value| (*value).into()).collect(),
                 shutdown_timeout_seconds: 30,
             },
+            devrun: None,
             health: HealthSection::default(),
             proxy: None,
             logs: Default::default(),
@@ -54,6 +56,66 @@ mod tests {
     fn rejects_unknown_and_legacy_fields() {
         assert!(parse_workspace("[workspace]\nname='old'\n").is_err());
         assert!(parse_workspace("schema_version=1\n[workspace]\nname='x'\nother=true\n").is_err());
+    }
+
+    /// 最小合法 project manifest（dev 段缺省），供 dev 段测试拼装。
+    fn minimal_project_toml() -> String {
+        [
+            "schema_version = 1",
+            "[project]",
+            "service_id = 'frontend'",
+            "name = 'Frontend'",
+            "type = 'node'",
+            "[build]",
+            "command = ['sh', 'build.sh']",
+            "artifact = 'artifact.zip'",
+            "[run]",
+            "command = ['node', 'server.js']",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn dev_sections_parse_and_default_to_none() {
+        let base = minimal_project_toml();
+        // 缺省：两段均为 None（可选项，deny_unknown_fields 下不写即无）
+        let plain = parse_project(&base).expect("parse without dev sections");
+        assert!(plain.devbuild.is_none());
+        assert!(plain.devrun.is_none());
+
+        // 带段：command 原样解析
+        let with_dev = format!(
+            "{base}\n[devbuild]\ncommand = ['pnpm', 'run', 'type-check']\n\
+             [devrun]\ncommand = ['pnpm', 'exec', 'vite']\n"
+        );
+        let dev = parse_project(&with_dev).expect("parse with dev sections");
+        assert_eq!(
+            dev.devbuild.expect("devbuild").command,
+            vec![
+                "pnpm".to_string(),
+                "run".to_string(),
+                "type-check".to_string()
+            ]
+        );
+        assert_eq!(
+            dev.devrun.expect("devrun").command,
+            vec!["pnpm".to_string(), "exec".to_string(), "vite".to_string()]
+        );
+    }
+
+    #[test]
+    fn dev_sections_empty_command_flagged() {
+        for field in ["devbuild.command", "devrun.command"] {
+            let section = field.split('.').next().expect("section name");
+            let toml = format!(
+                "{base}\n[{section}]\ncommand = []\n",
+                base = minimal_project_toml()
+            );
+            let err = parse_project(&toml)
+                .expect_err("empty command must fail validation")
+                .to_string();
+            assert!(err.contains(field), "error should locate {field}: {err}");
+        }
     }
 
     #[test]

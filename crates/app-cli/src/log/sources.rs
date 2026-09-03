@@ -65,12 +65,14 @@ pub(super) fn orchestrator_service() -> LockedService {
         kind: ProjectKind::Worker,
         enabled: true,
         port: 0,
+        devbuild: None,
         run: RunSection {
             command: Vec::new(),
             migrate: Vec::new(),
             depends_on: Vec::new(),
             shutdown_timeout_seconds: 30,
         },
+        devrun: None,
         health: HealthSection::default(),
         proxy: None,
         logs: vec![LogSource {
