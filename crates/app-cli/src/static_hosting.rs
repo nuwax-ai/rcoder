@@ -66,6 +66,15 @@ fn spawn_listener(spec: &ServiceSpec, workspace: &Path) -> anyhow::Result<()> {
         )
     };
     let root = workspace.join(&spec.dir).join(content_dir);
+    // 产物缺失可见性：root 不存在（如源码态未跑过构建）不阻断 bind（后续构建
+    // 出目录即自动生效——每请求实时读），但必须 warn 留痕（否则 404 无迹可循）
+    if !root.is_dir() {
+        tracing::warn!(
+            "static host '{}' content dir missing (serving 404 until it appears): {}",
+            spec.service_id,
+            root.display()
+        );
+    }
     let listener = std::net::TcpListener::bind(("127.0.0.1", spec.port))
         .map_err(|e| anyhow::anyhow!("bind static host 127.0.0.1:{}: {e}", spec.port))?;
     listener

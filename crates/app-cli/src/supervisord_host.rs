@@ -202,7 +202,16 @@ impl SupervisordHost {
         // 6. 依赖序启动（lock services 顺序即拓扑序；startProcessWait 等 startsecs）
         for spec in &specs {
             if spec.run.command.is_empty() {
-                warn!("⚠️  {} 无 [run].command，跳过", spec.service_id);
+                // static 服务无进程（步骤 2.6 已内置托管）——不是配置问题，
+                // 与进程态服务的"未配命令"区分文案
+                if crate::static_hosting::hosts_statically(spec, false) {
+                    info!(
+                        "📄 {} static host（无进程，步骤 2.6 已托管）",
+                        spec.service_id
+                    );
+                } else {
+                    warn!("⚠️  {} 无 [run].command，跳过", spec.service_id);
+                }
                 continue;
             }
             let name = format!("{SVC_PROGRAM_PREFIX}{}", spec.service_id);
@@ -317,6 +326,10 @@ pub(crate) fn render_programs_conf(
     let rid = &release.release_id;
     let mut out = String::new();
     for spec in specs {
+        // static 服务无进程（内置托管承载）——不生成 run-service program
+        if crate::static_hosting::hosts_statically(spec, false) {
+            continue;
+        }
         let id = safe_program_token(&spec.service_id);
         let name = format!("{SVC_PROGRAM_PREFIX}{id}");
         let service_log = log_dir.join("services").join(format!("{id}.log"));

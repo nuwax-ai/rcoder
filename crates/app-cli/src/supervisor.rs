@@ -191,10 +191,14 @@ async fn run_inner(
             );
         }
         // ── 并行 readiness 探测：spawn 成功的服务在各自 [health].
-        //    startup_timeout_seconds 窗口内轮询 readiness_path（K8s readinessProbe
-        //    语义，1s 请求超时/500ms 间隔）。探测超时的服务**保留运行**（部分
-        //    运行态：可能仅慢启动或探针路径配错，杀掉武断；supervise 循环继续
-        //    管理其退出重启）。结果逐服务 emit（dev 链路 SSE 可见）。
+        //    startup_timeout_seconds 窗口内探测（500ms 间隔）：
+        //    - 进程态（[run]）：HTTP readiness_path 轮询（K8s readinessProbe 语义）
+        //    - devrun 启动的热加载服务：**TCP 连通**即可——vite/nodemon 等 dev
+        //      server 的 HTTP 路径语义不可知（多数不实现 readiness_path，按 HTTP
+        //      探会误判超时）；"端口在听"是热加载命令的保守正确判定
+        //    探测超时的服务**保留运行**（部分运行态：可能仅慢启动或探针路径配错，
+        //    杀掉武断；supervise 循环继续管理其退出重启）。结果逐服务 emit（dev
+        //    链路 SSE 可见）。
         let mut probe_tasks = Vec::new();
         for (service_id, _) in &children {
             let Some(spec) = specs.iter().find(|s| &s.service_id == service_id) else {
@@ -202,8 +206,11 @@ async fn run_inner(
             };
             let spec = spec.clone();
             probe_tasks.push(tokio::spawn(async move {
-                let outcome =
-                    wait_for_service_ready_within(&spec, spec.health.startup_timeout_seconds).await;
+                let outcome = if dev_profile && spec.devrun.is_some() {
+                    wait_for_port_open(&spec, spec.health.startup_timeout_seconds).await
+                } else {
+                    wait_for_service_ready_within(&spec, spec.health.startup_timeout_seconds).await
+                };
                 (spec.service_id.clone(), outcome.err())
             }));
         }
@@ -264,12 +271,21 @@ async fn run_inner(
             .as_ref()
             .map(|proxy| format!("route={} (strip_prefix={})", proxy.path, proxy.strip_prefix))
             .unwrap_or_else(|| "internal (无 [proxy])".into());
-        let state = if started_ids.contains(spec.service_id.as_str()) {
+        let failed_ids: std::collections::BTreeSet<&str> = startup_failures
+            .iter()
+            .map(|failure| failure.service.as_str())
+            .collect();
+        let state = if failed_ids.contains(spec.service_id.as_str()) {
+            "failed (启动失败，详见事件流/日志)"
+        } else if started_ids.contains(spec.service_id.as_str()) {
             if dev_profile && spec.devrun.is_some() {
                 "running (devrun)"
             } else {
                 "running"
             }
+        } else if crate::static_hosting::hosts_statically(spec, dev_profile) {
+            // static 服务无进程（不在 children）——内置托管承载
+            "running (static host)"
         } else {
             "skipped (无启动 command)"
         };
@@ -425,6 +441,27 @@ pub(crate) async fn wait_for_pg() -> Result<()> {
 /// 默认(不配 bridge)不调本函数 —— app-cli 自给 /ready,不强依赖任何后端。
 pub(crate) async fn wait_for_service_ready(spec: &ServiceSpec) -> Result<()> {
     wait_for_service_ready_within(spec, 120).await
+}
+
+/// 在窗口（秒）内轮询端口 TCP 连通（devrun 热加载命令的就绪判定——HTTP 路径
+/// 语义对 dev server 不可知，端口在听即就绪）。
+pub(crate) async fn wait_for_port_open(spec: &ServiceSpec, timeout_secs: u64) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match tokio::net::TcpStream::connect(("127.0.0.1", spec.port)).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "port {} not open within {} seconds (last connect: {e})",
+                        spec.port,
+                        timeout_secs
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// 在给定窗口（秒）内轮询 readiness_path 至 2xx；超时返回 Err（含路径信息）。
