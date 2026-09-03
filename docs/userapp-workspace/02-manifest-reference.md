@@ -54,6 +54,8 @@ command = ["pnpm", "exec", "vite"]
 startup_path = "/health"
 readiness_path = "/health"
 liveness_path = "/health"
+# dev 启动判定用 readiness_path（窗口内 2xx = service_start_ok 事件）；
+# startup_timeout_seconds 可选（默认 25s，慢启动服务如 Spring Boot 按需调大）
 
 [proxy]
 path = "/api/go/"

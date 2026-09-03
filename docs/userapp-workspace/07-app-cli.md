@@ -153,6 +153,26 @@ app-cli 自带两个探针，K8s 的 liveness/readiness 直接指向管理 API�
 即：**默认 app-cli 自给自足，不强依赖任何后端**；只有显式声明了 bridge_service 才做
 深检查，且失败只摘流、不杀容器。
 
+## 编排事件行（EVT，stdout 协议）
+
+builtin 引擎（dev 链路）启动过程在 **stdout** 输出机器可读事件行，平台 dev server
+的 stdout 管道识别后转发任务 SSE（`/api/v1/userapp/tasks/{id}/logs/stream`）：
+
+```
+APP-CLI-EVT {"event":"service_starting","service":"frontend"}
+APP-CLI-EVT {"event":"service_start_ok","service":"backend-go"}
+APP-CLI-EVT {"event":"service_start_fail","service":"backend-java","error":"readiness probe: ..."}
+APP-CLI-EVT {"event":"orchestration_done","failed":[{"service":"...","error":"..."}]}
+```
+
+- 判定：`service_start_ok` = readiness 探测通过（`[health].readiness_path` 在
+  `[health].startup_timeout_seconds` 窗口内 2xx，多服务并行探测）；单服务失败
+  **不阻塞**其余服务，进程仍保留运行（部分运行态）
+- `orchestration_done` 在 pingap 就绪确认后输出（9080 listen 即全部判定完成）——
+  平台侧终态判定无竞态
+- stdout 无 tracing 噪声（日志只配 stderr + 文件层）；生产 supervisord 引擎不输出
+  EVT（无 stdout 消费者，启动判定语义另有约定）
+
 ## 管理 API（默认 :3010）
 
 **响应形态**：JSON 端点统一 `HttpResult` 信封 `{code, message, data, tid, success}`
