@@ -4,6 +4,12 @@
 
 平台根据每个 web 服务的 `[proxy]` 自动生成 server、location 和 upstream。
 
+**入口默认页（index.html 兜底）**：workspace 根放 `index.html` 且无服务声明
+`[proxy].path = "/"` 时，额外注入 `workspaceIndex` upstream（app-cli 内置静态服务
+:9081，serve workspace 根一级文件）与无 path 兜底 location——根路径与未匹配路径
+展示该页面，用户改完刷新即生效（每次请求实时读文件）。服务路由恒优先；catch-all
+服务独占 `/` 时不注入。`template-cli init` 会按所选服务自动生成导航页。
+
 ## extend
 
 `[pingap].config` 指向单文件或目录。只允许定义 `plugins` 和 `storages`，项目通过
