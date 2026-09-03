@@ -170,6 +170,11 @@ pub struct HealthSection {
     pub readiness_path: String,
     #[serde(default = "default_health_path")]
     pub liveness_path: String,
+    /// 启动就绪探测窗口（秒，dev/start·restart 逐服务并行探测 readiness_path
+    /// 的上限；超时记 service_start_fail 不阻塞其余服务）。默认 25；慢启动
+    /// 服务（如 Spring Boot 冷启动）按需调大。
+    #[serde(default = "default_startup_timeout")]
+    pub startup_timeout_seconds: u64,
 }
 
 impl Default for HealthSection {
@@ -178,6 +183,7 @@ impl Default for HealthSection {
             startup_path: default_health_path(),
             readiness_path: default_health_path(),
             liveness_path: default_health_path(),
+            startup_timeout_seconds: default_startup_timeout(),
         }
     }
 }
@@ -295,4 +301,8 @@ fn default_shutdown_timeout() -> u64 {
 
 fn default_health_path() -> String {
     "/health".into()
+}
+
+fn default_startup_timeout() -> u64 {
+    25
 }

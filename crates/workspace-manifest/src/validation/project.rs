@@ -107,6 +107,18 @@ pub fn validate_project_at(manifest: &ProjectManifest, dir: &str) -> Vec<Validat
             .with_hint("remove the key to use the default 30, or set a positive value"),
         );
     }
+    if manifest.health.startup_timeout_seconds == 0 {
+        issues.push(
+            locate(
+                ValidationIssue::new("health.startup_timeout_seconds must be greater than zero")
+                    .at_field("health.startup_timeout_seconds"),
+            )
+            .with_hint(
+                "remove the key to use the default 25 (dev startup probe window), \
+                 or set a positive value",
+            ),
+        );
+    }
     if project.kind == ProjectKind::Worker && manifest.proxy.is_some() {
         issues.push(
             locate(

@@ -23,6 +23,16 @@ pub enum BuildProgressEvent {
     BuildFail { service: String, error: String },
     /// 一行日志(实时 tail；`service` 为 service_id)
     Log { service: String, line: String },
+    /// dev 启动阶段：开始启动某服务（spawn 前；`service` 为 service_id）。
+    /// 仅 dev/start·restart 链路（app-cli builtin 引擎经 stdout EVT 行转发）。
+    ServiceStarting { service: String },
+    /// dev 启动阶段：某服务启动成功（= readiness 探测通过，`[health].
+    /// readiness_path` 窗口内 2xx；`service` 为 service_id）。
+    ServiceStartOk { service: String },
+    /// dev 启动阶段：某服务启动失败（spawn io 错误 / migrate 失败 / 探测超时；
+    /// `error` 含具体原因，`service` 为 service_id）。**不阻塞其余服务**——
+    /// 调用方按事件自明各服务成败，任务终态 Failed 的 error 为逐服务汇总。
+    ServiceStartFail { service: String, error: String },
     /// 任务完成(build 产 release_id + 包摘要)。`artifact_path` 为相对 workspace
     /// 根的产物路径（`builds/workspace-package-{release_id}.zip`）——信息字段，
     /// 取包按 app 直下 `/api/v1/userapp/static/{app_id}`（服务端选最新产物）。
@@ -42,6 +52,43 @@ pub enum BuildProgressEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 服务启动事件 wire：tag service_starting/service_start_ok/service_start_fail
+    /// （与 app-cli stdout EVT 行协议字符串一致——两端契约由各自测试锁同一组字符串）。
+    #[test]
+    fn service_start_events_serialize_snake_case() {
+        let cases: Vec<(BuildProgressEvent, &str, &str)> = vec![
+            (
+                BuildProgressEvent::ServiceStarting {
+                    service: "frontend".into(),
+                },
+                r#""event":"service_starting""#,
+                r#""service":"frontend""#,
+            ),
+            (
+                BuildProgressEvent::ServiceStartOk {
+                    service: "backend-go".into(),
+                },
+                r#""event":"service_start_ok""#,
+                r#""service":"backend-go""#,
+            ),
+            (
+                BuildProgressEvent::ServiceStartFail {
+                    service: "backend-java".into(),
+                    error: "probe timeout".into(),
+                },
+                r#""event":"service_start_fail""#,
+                r#""error":"probe timeout""#,
+            ),
+        ];
+        for (event, tag, field) in cases {
+            let json = serde_json::to_string(&event).unwrap();
+            assert!(json.contains(tag), "tag: {json}");
+            assert!(json.contains(field), "field: {json}");
+            let back: BuildProgressEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, event);
+        }
+    }
 
     /// wire 全 snake_case:tag 值(build_ok/build_fail)+ 字段(release_id/size_bytes/file_name/artifact_path)。
     /// tag 与 SSE `event:` 名一致——消费端只记一套事件名。
