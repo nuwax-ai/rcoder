@@ -3,11 +3,9 @@
 
 use chrono::{DateTime, Utc};
 use imbl::HashSet as ImHashSet;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::super::{AgentStatus, ModelProviderConfig};
-use super::container_info::ContainerBasicInfo;
 use crate::{ContainerEntry, ServiceType};
 
 /// 项目核心状态 - 包含频繁变更的小字段

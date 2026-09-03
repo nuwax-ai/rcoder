@@ -2,7 +2,6 @@
 
 use super::helpers::*;
 use super::*;
-use shared_types::ProjectStore as _; // 存储契约 trait：state.projects（ProjectStoreBackend）方法经此解析
 
 /// 查询容器状态（是否存活）
 ///
@@ -137,28 +136,12 @@ pub async fn pod_status(
     // 4. 通过 runtime 查询容器状态
     match query_result {
         Ok(Some(result)) => {
-            let is_running =
-                result.status == container_runtime_api::ContainerRuntimeStatus::Running;
-            let status_str = if is_running { "running" } else { "stopped" };
-            let message = if is_running {
-                "container is running".to_string()
-            } else {
-                format!("container exists but status is: {:?}", result.status)
-            };
-
+            let response = PodStatusResponse::from_runtime(&result, timestamp);
             info!(
                 "[POD_STATUS] Container status: alive={}, status={}, container_id={}",
-                is_running, status_str, result.container_id
+                response.alive, response.status, result.container_id
             );
-
-            return Ok(HttpResult::success(PodStatusResponse {
-                alive: is_running,
-                status: status_str.to_string(),
-                container_id: Some(result.container_id),
-                container_name: Some(result.container_name),
-                timestamp,
-                message,
-            }));
+            return Ok(HttpResult::success(response));
         }
         Ok(None) => {
             // 容器不存在，继续尝试 project_id
@@ -181,28 +164,12 @@ pub async fn pod_status(
             .await
         {
             Ok(Some(result)) => {
-                let is_running =
-                    result.status == container_runtime_api::ContainerRuntimeStatus::Running;
-                let status_str = if is_running { "running" } else { "stopped" };
-                let message = if is_running {
-                    "container is running".to_string()
-                } else {
-                    format!("container exists but status is: {:?}", result.status)
-                };
-
+                let response = PodStatusResponse::from_runtime(&result, timestamp);
                 info!(
                     "[POD_STATUS] Found container by project_id: alive={}, container_id={}",
-                    is_running, result.container_id
+                    response.alive, result.container_id
                 );
-
-                return Ok(HttpResult::success(PodStatusResponse {
-                    alive: is_running,
-                    status: status_str.to_string(),
-                    container_id: Some(result.container_id),
-                    container_name: Some(result.container_name),
-                    timestamp,
-                    message,
-                }));
+                return Ok(HttpResult::success(response));
             }
             Ok(None) => {
                 // 容器不存在
@@ -225,17 +192,46 @@ pub async fn pod_status(
         params.user_id, params.project_id
     );
 
-    Ok(HttpResult::success(PodStatusResponse {
-        alive: false,
-        status: "not_found".to_string(),
-        container_id: None,
-        container_name: None,
+    Ok(HttpResult::success(PodStatusResponse::not_found(
         timestamp,
-        message: format!(
+        format!(
             "Container not found (user_id={:?}, project_id={:?})",
             params.user_id, params.project_id
         ),
-    }))
+    )))
+}
+
+impl PodStatusResponse {
+    /// runtime 命中组装（user_id 主路 / project_id 回退路共享）：
+    /// 枚举 status 推导 alive/status/message 三元组
+    fn from_runtime(result: &container_runtime_api::RuntimeContainerInfo, timestamp: u64) -> Self {
+        let is_running = result.status == container_runtime_api::ContainerRuntimeStatus::Running;
+        Self {
+            alive: is_running,
+            status: if is_running { "running" } else { "stopped" }.to_string(),
+            container_id: Some(result.container_id.clone()),
+            container_name: Some(result.container_name.clone()),
+            timestamp,
+            message: if is_running {
+                "container is running".to_string()
+            } else {
+                format!("container exists but status is: {:?}", result.status)
+            },
+        }
+    }
+
+    /// not_found 组装（agent 主路径 / userapp dev / userapp prod 三路共享，
+    /// message 由调用方携带上下文）
+    fn not_found(timestamp: u64, message: String) -> Self {
+        Self {
+            alive: false,
+            status: "not_found".to_string(),
+            container_id: None,
+            container_name: None,
+            timestamp,
+            message,
+        }
+    }
 }
 
 // ============================================================================
@@ -259,14 +255,10 @@ async fn status_userapp_dev(
         })?;
     let Some(info) = existing else {
         info!("[POD_STATUS] userapp dev container not found: app_id={app_id}");
-        return Ok(HttpResult::success(PodStatusResponse {
-            alive: false,
-            status: "not_found".to_string(),
-            container_id: None,
-            container_name: None,
+        return Ok(HttpResult::success(PodStatusResponse::not_found(
             timestamp,
-            message: format!("Userapp dev container not found (app_id={app_id})"),
-        }));
+            format!("Userapp dev container not found (app_id={app_id})"),
+        )));
     };
     // ContainerBasicInfo.status 是运行时自由字符串（"Running"/"Starting"/pod phase），
     // 大小写容忍比较（K8s Pod phase 为 "Running"）。
@@ -305,14 +297,10 @@ async fn status_userapp_prod(
         Ok(info) => info,
         Err(app_manager::AppOperationError::NotFound(_)) => {
             info!("[POD_STATUS] userapp prod app not found: app_id={app_id}");
-            return Ok(HttpResult::success(PodStatusResponse {
-                alive: false,
-                status: "not_found".to_string(),
-                container_id: None,
-                container_name: None,
+            return Ok(HttpResult::success(PodStatusResponse::not_found(
                 timestamp,
-                message: format!("Userapp prod app not found (app_id={app_id})"),
-            }));
+                format!("Userapp prod app not found (app_id={app_id})"),
+            )));
         }
         Err(e) => {
             error!("[POD_STATUS] userapp prod app query failed: app_id={app_id}: {e:#}");

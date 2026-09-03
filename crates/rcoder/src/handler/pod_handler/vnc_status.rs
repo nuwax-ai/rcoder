@@ -159,13 +159,7 @@ pub async fn pod_vnc_status(
             "[POD_VNC_STATUS] Container not running: container_id={}",
             result.container_id
         );
-        return Ok(HttpResult::success(VncStatusResponse {
-            vnc_ready: false,
-            novnc_ready: false,
-            message: "Container not running".to_string(),
-            uptime_seconds: Some(0),
-            container_id: Some(result.container_id),
-        }));
+        return Ok(HttpResult::success(vnc_not_running(result.container_id)));
     }
 
     // 5.1 🎯 确保 VNC 代理路由已注册
@@ -181,11 +175,46 @@ pub async fn pod_vnc_status(
         );
     }
 
-    // 6. 构建 gRPC 地址
+    // 6. gRPC 真查 VNC 探针（与 userapp dev 路径共享链路）
+    probe_vnc_via_grpc(
+        &state,
+        locale,
+        VncProbeTarget {
+            name: &result.container_name,
+            ip: &result.container_ip,
+            container_id: result.container_id,
+        },
+        user_id,
+        project_id,
+        "agent",
+    )
+    .await
+}
+
+/// VNC 状态 gRPC 探测共享段（agent 与 userapp dev 两路径原为 ~37 行逐字重复）：
+/// build_grpc_addr → get_client → get_vnc_status → 组装/错误分支。
+/// 运行判定与容器定位留在调用点（两路径的 status 类型/定位链不同），
+/// 日志上下文经 `log_ctx` 区分（下游按 tag 检索）。
+/// 探测目标三元组（agent 路径 RuntimeContainerInfo 与 userapp dev 路径
+/// ContainerBasicInfo 类型不同，取共享字段打包）
+struct VncProbeTarget<'a> {
+    name: &'a str,
+    ip: &'a str,
+    container_id: String,
+}
+
+async fn probe_vnc_via_grpc(
+    state: &AppState,
+    locale: &'static str,
+    target: VncProbeTarget<'_>,
+    user_id: Option<&str>,
+    project_id: Option<&str>,
+    log_ctx: &str,
+) -> Result<HttpResult<VncStatusResponse>, AppError> {
     // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
     let grpc_addr = shared_types::build_grpc_addr(
-        &result.container_name,
-        &result.container_ip,
+        target.name,
+        target.ip,
         &state.config.app_manager.namespace,
         &state.cluster_domain,
     );
@@ -204,7 +233,7 @@ pub async fn pod_vnc_status(
                 Ok(response) => {
                     let resp = response.into_inner();
                     info!(
-                        "[POD_VNC_STATUS] gRPC call successful: vnc_ready={}, novnc_ready={}",
+                        "[POD_VNC_STATUS] {log_ctx} gRPC ok: vnc_ready={}, novnc_ready={}",
                         resp.vnc_ready, resp.novnc_ready
                     );
 
@@ -213,11 +242,11 @@ pub async fn pod_vnc_status(
                         novnc_ready: resp.novnc_ready,
                         message: resp.message,
                         uptime_seconds: Some(resp.uptime_seconds),
-                        container_id: Some(result.container_id),
+                        container_id: Some(target.container_id),
                     }))
                 }
                 Err(e) => {
-                    error!("[POD_VNC_STATUS] gRPC call failed: {}", e);
+                    error!("[POD_VNC_STATUS] {log_ctx} gRPC call failed: {e}");
                     Ok(HttpResult::error_with_locale(
                         shared_types::error_codes::ERR_GRPC_ERROR,
                         locale,
@@ -226,12 +255,23 @@ pub async fn pod_vnc_status(
             }
         }
         Err(e) => {
-            error!("[POD_VNC_STATUS] gRPC connection failed: {}", e);
+            error!("[POD_VNC_STATUS] {log_ctx} gRPC connection failed: {e}");
             Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_GRPC_ERROR,
                 locale,
             ))
         }
+    }
+}
+
+/// 容器未运行时的 VNC 状态响应（agent 与 userapp dev 两路径逐字同构）
+fn vnc_not_running(container_id: String) -> VncStatusResponse {
+    VncStatusResponse {
+        vnc_ready: false,
+        novnc_ready: false,
+        message: "Container not running".to_string(),
+        uptime_seconds: Some(0),
+        container_id: Some(container_id),
     }
 }
 
@@ -269,64 +309,21 @@ async fn vnc_status_userapp_dev(
             "[POD_VNC_STATUS] userapp dev container not running: container_id={}",
             result.container_id
         );
-        return Ok(HttpResult::success(VncStatusResponse {
-            vnc_ready: false,
-            novnc_ready: false,
-            message: "Container not running".to_string(),
-            uptime_seconds: Some(0),
-            container_id: Some(result.container_id),
-        }));
+        return Ok(HttpResult::success(vnc_not_running(result.container_id)));
     }
 
     // gRPC 真查（与 agent 路径同链路：K8s 用 Service FQDN，Docker 用容器 IP）
-    let grpc_addr = shared_types::build_grpc_addr(
-        &result.container_name,
-        &result.container_ip,
-        &state.config.app_manager.namespace,
-        &state.cluster_domain,
-    );
-
-    match state.grpc_pool.get_client(&grpc_addr).await {
-        Ok(mut client) => {
-            let grpc_request = crate::grpc::new_request_with_locale(
-                shared_types::grpc::GetVncStatusRequest {
-                    user_id: None,
-                    project_id: Some(app_id.clone()),
-                },
-                locale,
-            );
-
-            match client.get_vnc_status(grpc_request).await {
-                Ok(response) => {
-                    let resp = response.into_inner();
-                    info!(
-                        "[POD_VNC_STATUS] userapp dev gRPC ok: app_id={app_id}, vnc_ready={}, novnc_ready={}",
-                        resp.vnc_ready, resp.novnc_ready
-                    );
-
-                    Ok(HttpResult::success(VncStatusResponse {
-                        vnc_ready: resp.vnc_ready,
-                        novnc_ready: resp.novnc_ready,
-                        message: resp.message,
-                        uptime_seconds: Some(resp.uptime_seconds),
-                        container_id: Some(result.container_id),
-                    }))
-                }
-                Err(e) => {
-                    error!("[POD_VNC_STATUS] userapp dev gRPC call failed: app_id={app_id}: {e}");
-                    Ok(HttpResult::error_with_locale(
-                        shared_types::error_codes::ERR_GRPC_ERROR,
-                        locale,
-                    ))
-                }
-            }
-        }
-        Err(e) => {
-            error!("[POD_VNC_STATUS] userapp dev gRPC connection failed: app_id={app_id}: {e}");
-            Ok(HttpResult::error_with_locale(
-                shared_types::error_codes::ERR_GRPC_ERROR,
-                locale,
-            ))
-        }
-    }
+    probe_vnc_via_grpc(
+        state,
+        locale,
+        VncProbeTarget {
+            name: &result.container_name,
+            ip: &result.container_ip,
+            container_id: result.container_id,
+        },
+        None,
+        Some(&app_id),
+        "userapp dev",
+    )
+    .await
 }
