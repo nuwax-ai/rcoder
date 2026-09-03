@@ -18,6 +18,7 @@ pub mod devtool;
 pub mod idle;
 pub mod log;
 pub mod manifest;
+pub mod orchestration_events;
 pub mod proxy;
 pub mod run_service;
 pub mod runtime_status;

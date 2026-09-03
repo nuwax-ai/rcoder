@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::config::CliArgs;
 use crate::manifest::{self, ServiceSpec};
+use crate::orchestration_events::{FailedService, OrchestrationEvent, emit as emit_event};
 use crate::proxy::admin_probe;
 use crate::proxy::compiler::compile_and_validate;
 use crate::proxy::pingap::PINGAP_PORT;
@@ -81,15 +82,31 @@ async fn run_inner(
     // 路径已自行清理, 此处对已 take 空的集合再调 shutdown_all 幂等无害。
     let mut children: Vec<(String, Child)> = Vec::new();
     let mut started_user_services = 0usize;
+    // 启动失败清单（容错语义：单服务 migrate/spawn/探测失败不阻塞其余服务；
+    // pingap 失败仍整体 Err 全组清理——入口必需）
+    let mut startup_failures: Vec<FailedService> = Vec::new();
     let startup = async {
+        // ── 启动循环（容错）：单服务失败记 EVT 后 continue ──
         for spec in &specs {
-            // migrate（如有）—— 失败 error 上报 + Fail Fast; stdout/stderr 已落 app-cli 日志。
-            // migrate 恒用 [run].migrate（迁移是数据语义，与 dev/prod 启动形态无关）。
+            // migrate（如有）—— per-service：失败=该服务跳过（不再全局 fail-fast；
+            // 迁移错误即启动失败原因，EVT 带原始错误链）。
             if !spec.run.migrate.is_empty() {
                 info!("🛠️  migrate {}", spec.service_id);
-                run_transient(&spec.run.migrate, &args.workspace.join(&spec.dir))
-                    .await
-                    .with_context(|| format!("migrate {}", spec.service_id))?;
+                if let Err(e) =
+                    run_transient(&spec.run.migrate, &args.workspace.join(&spec.dir)).await
+                {
+                    let error = format!("migrate {}: {e:#}", spec.service_id);
+                    warn!("⚠️  {error} — 跳过该服务，继续启动其余服务");
+                    emit_event(&OrchestrationEvent::ServiceStartFail {
+                        service: spec.service_id.clone(),
+                        error: error.clone(),
+                    });
+                    startup_failures.push(FailedService {
+                        service: spec.service_id.clone(),
+                        error,
+                    });
+                    continue;
+                }
             }
             // start（dev 形态下 [devrun].command 优先、[run].command 兜底）
             let argv = effective_run_argv(spec, dev_profile);
@@ -100,16 +117,36 @@ async fn run_inner(
                 );
                 continue;
             }
-            let child = start_service(
+            crate::orchestration_events::emit(
+                &crate::orchestration_events::OrchestrationEvent::ServiceStarting {
+                    service: spec.service_id.clone(),
+                },
+            );
+            match start_service(
                 spec,
                 argv,
                 &args.workspace,
                 &args.log_dir,
                 &release.release_id,
-            )
-            .with_context(|| format!("start {}", spec.service_id))?;
-            children.push((spec.service_id.clone(), child));
-            started_user_services += 1;
+            ) {
+                Ok(child) => {
+                    children.push((spec.service_id.clone(), child));
+                    started_user_services += 1;
+                }
+                Err(e) => {
+                    let error = format!("spawn {}: {e:#}", spec.service_id);
+                    warn!("⚠️  {error} — 跳过该服务，继续启动其余服务");
+                    emit_event(&OrchestrationEvent::ServiceStartFail {
+                        service: spec.service_id.clone(),
+                        error: error.clone(),
+                    });
+                    startup_failures.push(FailedService {
+                        service: spec.service_id.clone(),
+                        error,
+                    });
+                    continue;
+                }
+            }
         }
         // workspace 首页静态服务（幂等：热部署重编排不二次 bind；常驻 app-cli
         // 进程生命周期，实时读文件无需随 code 换入重启）。
@@ -120,8 +157,62 @@ async fn run_inner(
                 crate::workspace_index::INDEX_PORT
             );
         }
+        // ── 并行 readiness 探测：spawn 成功的服务在各自 [health].
+        //    startup_timeout_seconds 窗口内轮询 readiness_path（K8s readinessProbe
+        //    语义，1s 请求超时/500ms 间隔）。探测超时的服务**保留运行**（部分
+        //    运行态：可能仅慢启动或探针路径配错，杀掉武断；supervise 循环继续
+        //    管理其退出重启）。结果逐服务 emit（dev 链路 SSE 可见）。
+        let mut probe_tasks = Vec::new();
+        for (service_id, _) in &children {
+            let Some(spec) = specs.iter().find(|s| &s.service_id == service_id) else {
+                continue;
+            };
+            let spec = spec.clone();
+            probe_tasks.push(tokio::spawn(async move {
+                let outcome =
+                    wait_for_service_ready_within(&spec, spec.health.startup_timeout_seconds).await;
+                (spec.service_id.clone(), outcome.err())
+            }));
+        }
+        for task in probe_tasks {
+            let Ok((service_id, failure)) = task.await else {
+                continue;
+            };
+            match failure {
+                None => {
+                    info!("✅ {service_id} ready (readiness probe passed)");
+                    emit_event(&OrchestrationEvent::ServiceStartOk {
+                        service: service_id,
+                    });
+                }
+                Some(e) => {
+                    let error = format!("readiness probe: {e:#}");
+                    warn!("⏳ {service_id} {error} — 服务保留运行（启动判定失败）");
+                    emit_event(&OrchestrationEvent::ServiceStartFail {
+                        service: service_id.clone(),
+                        error: error.clone(),
+                    });
+                    startup_failures.push(FailedService {
+                        service: service_id,
+                        error,
+                    });
+                }
+            }
+        }
         // 编译、完整验证并启动 Pingap；代理失败时 workspace 不得进入 ready。
-        start_pingap(&args.workspace, &args.pingap_bin, &release, &mut children).await
+        start_pingap(&args.workspace, &args.pingap_bin, &release, &mut children).await?;
+        // 启动编排终局（pingap 确认后输出——9080 listen 即全部启动判定完成，
+        // 下游终态判定无竞态）：failed 空 = 全部成功。
+        emit_event(&OrchestrationEvent::OrchestrationDone {
+            failed: startup_failures.clone(),
+        });
+        if !startup_failures.is_empty() {
+            warn!(
+                "⚠️  启动编排完成（部分失败 {} 项，其余服务正常运行）",
+                startup_failures.len()
+            );
+        }
+        Ok(())
     };
     if let Err(e) = startup.await {
         error!("❌ startup failed, shutting down already-started children: {e:#}");
@@ -300,6 +391,16 @@ pub(crate) async fn wait_for_pg() -> Result<()> {
 /// 仅在 workspace.manifest `[health].bridge_service` 显式配置时调用(只等那一个后端)。
 /// 默认(不配 bridge)不调本函数 —— app-cli 自给 /ready,不强依赖任何后端。
 pub(crate) async fn wait_for_service_ready(spec: &ServiceSpec) -> Result<()> {
+    wait_for_service_ready_within(spec, 120).await
+}
+
+/// 在给定窗口（秒）内轮询 readiness_path 至 2xx；超时返回 Err（含路径信息）。
+/// bridge_service 等待（固定 120s）与启动逐服务探测（`[health].
+/// startup_timeout_seconds`）共用同一探测核心。
+pub(crate) async fn wait_for_service_ready_within(
+    spec: &ServiceSpec,
+    timeout_secs: u64,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
@@ -308,7 +409,7 @@ pub(crate) async fn wait_for_service_ready(spec: &ServiceSpec) -> Result<()> {
         "http://127.0.0.1:{}{}",
         spec.port, spec.health.readiness_path
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         let ready = client
             .get(&url)
@@ -320,9 +421,10 @@ pub(crate) async fn wait_for_service_ready(spec: &ServiceSpec) -> Result<()> {
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "service '{}' readiness timed out after 120 seconds (path {})",
-                spec.service_id,
-                spec.health.readiness_path
+                "readiness '{}' not ready within {} seconds (last probe: {})",
+                url,
+                timeout_secs,
+                "no 2xx",
             );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -743,5 +845,30 @@ mod tests {
         let spec = spec_with(Some(vec!["pnpm", "exec", "vite"]));
         let argv = effective_run_argv(&spec, false);
         assert_eq!(argv, &["node", "server.js"]);
+    }
+
+    /// 窗口内探测超时：无人监听的端口在 1s 窗口内轮询后 Err（含 URL 与窗口信息）。
+    /// （成功分支与 bridge 等待共用同一探测核心，由集成/冒烟覆盖。）
+    #[tokio::test]
+    async fn readiness_probe_times_out_within_window() {
+        // 找一个确定空闲的端口：bind 后立即释放（TIME_WAIT 由 connect 端触发，服务端无）
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let spec = spec_with(None);
+        let spec = crate::manifest::ServiceSpec {
+            port,
+            health: workspace_manifest::HealthSection {
+                readiness_path: "/ready".into(),
+                ..Default::default()
+            },
+            ..spec
+        };
+        let err = wait_for_service_ready_within(&spec, 1)
+            .await
+            .expect_err("must time out");
+        let message = format!("{err:#}");
+        assert!(message.contains("not ready within 1 seconds"), "{message}");
+        assert!(message.contains("/ready"), "{message}");
     }
 }
