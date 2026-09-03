@@ -304,38 +304,15 @@ async fn stop_userapp_dev(
     app_id: &str,
     request: &ComputerAgentStopRequest,
 ) -> Result<HttpResult<ComputerAgentStopResponse>, AppError> {
-    let container_info = state.get_project(app_id).and_then(|p| p.container_info());
-    let container_info = match container_info {
-        Some(info) => info,
-        None => {
-            match state
-                .runtime()
-                .get_container_info_by_identifier(
-                    app_id,
-                    &shared_types::ServiceType::UserappBuilder,
-                )
-                .await
-            {
-                Ok(Some(info)) => info,
-                Ok(None) => {
-                    warn!(
-                        "[COMPUTER_STOP][USERAPP] dev builder container not found: app_id={app_id}"
-                    );
-                    return Ok(HttpResult::error_with_locale(
-                        shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
-                        locale,
-                    ));
-                }
-                Err(e) => {
-                    error!(
-                        "[COMPUTER_STOP][USERAPP] failed to query dev builder container: app_id={app_id}, error={e}"
-                    );
-                    return Err(AppError::internal_server_error(&format!(
-                        "Failed to query container info: {e}"
-                    )));
-                }
-            }
-        }
+    let Some(container_info) =
+        super::pod_handler::resolve_userapp_dev_container(state, app_id, "COMPUTER_STOP][USERAPP")
+            .await?
+    else {
+        warn!("[COMPUTER_STOP][USERAPP] dev builder container not found: app_id={app_id}");
+        return Ok(HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+            locale,
+        ));
     };
 
     info!(

@@ -15,41 +15,20 @@ pub(super) async fn status_userapp_dev(
     app_id: &str,
     request: &ComputerAgentStatusRequest,
 ) -> Result<HttpResult<ComputerAgentStatusResponse>, AppError> {
-    let container_info = state.get_project(app_id).and_then(|p| p.container_info());
-    let container_info = match container_info {
-        Some(info) => info,
-        None => {
-            match state
-                .runtime()
-                .get_container_info_by_identifier(
-                    app_id,
-                    &shared_types::ServiceType::UserappBuilder,
-                )
-                .await
-            {
-                Ok(Some(info)) => info,
-                Ok(None) => {
-                    info!(
-                        "📭 [COMPUTER_AGENT_STATUS][USERAPP] dev builder container not found: app_id={app_id}"
-                    );
-                    return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
-                        request.user_id.clone(),
-                        app_id.to_string(),
-                    )));
-                }
-                Err(e) => {
-                    error!(
-                        "❌ [COMPUTER_AGENT_STATUS][USERAPP] failed to query container info: app_id={app_id}, error={e}"
-                    );
-                    return Err(AppError::internal_server_error(&format!(
-                        "Failed to query container info: {e}"
-                    )));
-                }
-            }
-        }
+    let Some(container_info) = crate::handler::pod_handler::resolve_userapp_dev_container(
+        state,
+        app_id,
+        "COMPUTER_AGENT_STATUS][USERAPP",
+    )
+    .await?
+    else {
+        return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
+            request.user_id.clone(),
+            app_id.to_string(),
+        )));
     };
 
-    if container_info.status != "running" {
+    if !crate::handler::pod_handler::is_container_running(&container_info.status) {
         info!(
             "⚠️ [COMPUTER_AGENT_STATUS][USERAPP] dev builder container not running: app_id={app_id}, status={}",
             container_info.status

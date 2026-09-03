@@ -304,7 +304,7 @@ async fn vnc_status_userapp_dev(
             ));
         }
     };
-    if !result.status.eq_ignore_ascii_case("Running") {
+    if !is_container_running(&result.status) {
         info!(
             "[POD_VNC_STATUS] userapp dev container not running: container_id={}",
             result.container_id

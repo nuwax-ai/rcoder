@@ -1,10 +1,9 @@
 //! Computer Agent 状态查询 handler（目录化拆分；函数体原样搬迁）。
+//! 查询 Computer Agent 的运行状态（通过 gRPC GetStatus 主动确认）。
+//!
+//! 子模块：
 //! - retry: gRPC GetStatus 重试基建（常量/参数包/指数退避重试）
 //! - userapp: userApp dev 分派变体（只读不自愈）
-
-//! Computer Agent Status Handler
-//!
-//! 查询 Computer Agent 的运行状态（通过 gRPC GetStatus 主动确认）
 
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -212,7 +211,7 @@ pub async fn computer_agent_status(
         }
     };
     // 3. 检查容器是否运行中
-    if container_info.status != "running" {
+    if !crate::handler::pod_handler::is_container_running(&container_info.status) {
         info!(
             "⚠️ [COMPUTER_AGENT_STATUS] Container not running: identifier={}, status={}",
             identifier_display, container_info.status

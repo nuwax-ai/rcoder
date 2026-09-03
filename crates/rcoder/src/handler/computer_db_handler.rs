@@ -35,7 +35,7 @@ use crate::router::AppState;
     request_body = ResetDbPasswordRequest,
     responses(
         (status = 200, description = "密码已重置", body = HttpResult<String>),
-        (status = 400, description = "参数错误（new_password 为空）"),
+        (status = 400, description = "参数错误（password 为空）"),
         (status = 404, description = "agent-runner 容器不存在"),
         (status = 500, description = "后端错误（psql 执行失败）")
     ),
@@ -47,8 +47,8 @@ pub async fn computer_db_reset_password(
     Path(user_id): Path<String>,
     Json(req): Json<ResetDbPasswordRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    if req.new_password.is_empty() {
-        return Err(AppError::validation_error("new_password must not be empty"));
+    if req.password.is_empty() {
+        return Err(AppError::validation_error("password must not be empty"));
     }
     let container_name = resolve_computer_container(&state, &user_id).await?;
 
@@ -56,7 +56,7 @@ pub async fn computer_db_reset_password(
     // 容器内 sh 展开 $POSTGRES_USER(镜像 ENV); psql 本地 trust 免密;
     // safe_pw 经 pg_escape_literal (SQL 标准 ' → '' 转义) 防注入到 SQL 字符串字面量;
     // 密码本身不做标识符白名单校验(允许任意字符含特殊符号)。
-    let safe_pw = pg_escape_literal(&req.new_password);
+    let safe_pw = pg_escape_literal(&req.password);
     let cmd = vec![
         "sh".to_string(),
         "-c".to_string(),

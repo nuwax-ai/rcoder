@@ -475,3 +475,48 @@ pub(super) fn persist_and_respond(
         message,
     }))
 }
+
+/// 容器运行判定单一事实源（agent 族与 pod 族共享）。
+///
+/// `ContainerBasicInfo.status` 是运行时自由字符串：docker 侧小写 "running"、
+/// K8s Pod phase 大写 "Running"，必须大小写容忍比较。历史上四处判定口径
+/// 分裂（两处 eq_ignore_ascii_case / 两处小写精确匹配），K8s 大写 phase 会被
+/// 小写匹配误判 not running → 误报 not_alive。
+pub(crate) fn is_container_running(status: &str) -> bool {
+    status.eq_ignore_ascii_case("Running")
+}
+
+/// userApp dev 开发容器定位（agent 族 status/stop 共享前言）：
+/// project 映射优先，miss 走 UserappBuilder 实时查（只读，不触发探活自愈）。
+///
+/// - `Ok(Some)`：定位成功
+/// - `Ok(None)`：容器不存在（调用方决定 not_alive / ERR_CONTAINER_NOT_FOUND）
+/// - `Err`：runtime 故障（500 透传——不吞错误伪装"不存在"，防客户端误判
+///   容器已销毁触发 ensure 重建风暴）
+pub(crate) async fn resolve_userapp_dev_container(
+    state: &AppState,
+    app_id: &str,
+    log_tag: &str,
+) -> Result<Option<ContainerBasicInfo>, AppError> {
+    if let Some(info) = state.get_project(app_id).and_then(|p| p.container_info()) {
+        return Ok(Some(info));
+    }
+    match state
+        .runtime()
+        .get_container_info_by_identifier(app_id, &ServiceType::UserappBuilder)
+        .await
+    {
+        Ok(info) => {
+            if info.is_none() {
+                info!("📭 [{log_tag}] dev builder container not found: app_id={app_id}");
+            }
+            Ok(info)
+        }
+        Err(e) => {
+            error!("❌ [{log_tag}] failed to query container info: app_id={app_id}, error={e}");
+            Err(AppError::internal_server_error(&format!(
+                "Failed to query container info: {e}"
+            )))
+        }
+    }
+}

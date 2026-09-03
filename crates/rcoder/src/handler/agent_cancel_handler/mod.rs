@@ -12,10 +12,8 @@
 
 use axum::extract::State;
 use axum::http::HeaderMap;
-use serde::Deserialize;
 use std::sync::Arc;
-use tracing::{debug, error, info, instrument, warn};
-use utoipa::ToSchema;
+use tracing::{error, info, instrument};
 
 use crate::router::AppState;
 use docker_manager::ContainerBasicInfo;

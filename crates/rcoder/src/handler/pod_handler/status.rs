@@ -262,7 +262,7 @@ async fn status_userapp_dev(
     };
     // ContainerBasicInfo.status 是运行时自由字符串（"Running"/"Starting"/pod phase），
     // 大小写容忍比较（K8s Pod phase 为 "Running"）。
-    let is_running = info.status.eq_ignore_ascii_case("Running");
+    let is_running = is_container_running(&info.status);
     info!(
         "[POD_STATUS] userapp dev container status: app_id={app_id}, alive={}, container_id={}",
         is_running, info.container_id
