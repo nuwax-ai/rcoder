@@ -24,7 +24,8 @@ schema_version = 1
 [project]
 service_id = "backend-go"
 name = "Go Backend"
-type = "go"       # node/java/python/go/rust/static
+type = "go"       # node/java/python/go/rust/static（static=无进程：[run] 禁止、
+                  # artifact=静态内容目录如 dist——内置托管 serve、启动恒成功）
 kind = "web"      # web/worker
 enabled = true
 
