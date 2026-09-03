@@ -154,7 +154,7 @@ pub struct DevrunSection {
 
 /// 运行段。进程态服务 `command` 必填非空（校验保证）；`type = "static"` 服务
 /// 省略整段（[`Default`]：空 command——由 app-cli 内置静态托管承载，无进程）。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunSection {
     pub command: Vec<String>,
@@ -164,6 +164,20 @@ pub struct RunSection {
     pub depends_on: Vec<String>,
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_seconds: u64,
+}
+
+impl Default for RunSection {
+    /// 手写而非 derive：`shutdown_timeout_seconds` 的 serde default 属性不参与
+    /// `Default` trait（derive 会给 u64 零值，触发 >0 校验）——与反序列化缺省
+    /// 值（30）保持一致。
+    fn default() -> Self {
+        Self {
+            command: Vec::new(),
+            migrate: Vec::new(),
+            depends_on: Vec::new(),
+            shutdown_timeout_seconds: default_shutdown_timeout(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
