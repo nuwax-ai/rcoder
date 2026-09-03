@@ -1,9 +1,9 @@
 //! Computer Agent-runner 容器的 PG 管理接口（重置密码 / 新建库）。
 //!
-//! 与 app_manager 给 Userapp 提供的 `POST /api/v1/userapp/{app_id}/db/*` 同源、同语义，
-//! 区别仅在此处针对 computer agent-runner 容器（按 user_id 解析，一用户一容器）。
-//! PG 逻辑（psql 命令、SQL 转义、退出码判定）镜像 `app_manager::service::reset_db_password`
-//! 与 `create_database`（crates/app_manager/src/service.rs:461-546）。
+//! 与 Userapp 域 `POST /api/v1/userapp/db/{app_stage}/*` 同源、同语义（重置恒指
+//! superuser——本接口无 username upsert 分支），区别仅在此处针对 computer
+//! agent-runner 容器（按 user_id 解析，一用户一容器）。PG 命令构造与 SQL 转义
+//! 复用 `shared_types::pg_utils`。
 //!
 //! 为什么 rcoder 侧 exec 而非 agent_runner 加接口: rcoder 目前没有把 `/computer/*`
 //! HTTP 反代到 agent-runner pod:8086 的通道（每条 `/computer/*` 都是 rcoder 自己的 handler），

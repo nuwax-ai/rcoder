@@ -342,8 +342,7 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
 - **带 username**：账号 upsert——角色存在则 ALTER USER 改密，不存在则 CREATE ROLE
   建号后再设密。
 
-两者均 best-effort 同步 dbx 预置连接（重写 connections.json 并 restart dbx；
-指定业务账号且非 local-pg 在用账号时自动跳过），同步失败不阻断响应（密码已生效）。
+dbx 预置连接为容器内 local-pg socket 免密（与改密链解耦——改密不影响 dbx 访问）。
 prod 环境目标容器 stopped 会自动唤醒并等待 PG 就绪。
 
 **密码只出现在 exec 命令内，日志零落盘**（仅记 app_id/app_stage/username/结果）。
