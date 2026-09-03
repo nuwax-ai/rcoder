@@ -23,6 +23,7 @@ pub mod proxy;
 pub mod run_service;
 pub mod runtime_status;
 pub mod server;
+pub mod static_hosting;
 pub mod supervisor;
 pub mod supervisord_host;
 pub mod svc_spec;

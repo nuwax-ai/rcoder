@@ -137,9 +137,25 @@ impl SupervisordHost {
             );
         }
 
+        // 2.6 static 服务托管（无进程——内置静态承载于 lock 端口；幂等，热部署
+        // 重 orchestrate 不二次 bind。run-service spec/conf 不为 static 生成
+        //（下方循环跳过 command 为空的服务）。
+        for spec in &specs {
+            if crate::static_hosting::hosts_statically(spec, false) {
+                crate::static_hosting::ensure_spawned(spec, &args.workspace)?;
+                info!(
+                    "📄 static host '{}' serving on :{}",
+                    spec.service_id, spec.port
+                );
+            }
+        }
+
         // 3. 写 per-service specs（run-service 启动契约；pingap 同机制承载凭证）
         let mut started: Vec<String> = Vec::new();
         for spec in &specs {
+            if crate::static_hosting::hosts_statically(spec, false) {
+                continue; // static：无进程，不经 run-service
+            }
             let svc_spec = ServiceSpecFile {
                 release_id: release.release_id.clone(),
                 service_id: spec.service_id.clone(),

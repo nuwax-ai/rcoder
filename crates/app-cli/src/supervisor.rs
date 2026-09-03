@@ -88,6 +88,39 @@ async fn run_inner(
     let startup = async {
         // ── 启动循环（容错）：单服务失败记 EVT 后 continue ──
         for spec in &specs {
+            // static 服务：内置静态托管承载（无进程，bind 即成恒成功；dev 源码态
+            // 且配了 [devrun] 时端口让给 dev server——fallthrough 到正常 spawn）
+            if crate::static_hosting::hosts_statically(spec, dev_profile) {
+                emit_event(&OrchestrationEvent::ServiceStarting {
+                    service: spec.service_id.clone(),
+                });
+                match crate::static_hosting::ensure_spawned(spec, &args.workspace) {
+                    Ok(()) => {
+                        info!(
+                            "📄 static host '{}' serving on :{} (content dir {})",
+                            spec.service_id,
+                            spec.port,
+                            spec.static_content_dir.as_deref().unwrap_or("?")
+                        );
+                        emit_event(&OrchestrationEvent::ServiceStartOk {
+                            service: spec.service_id.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        let error = format!("static host: {e:#}");
+                        warn!("⚠️  {error} — 跳过该服务，继续启动其余服务");
+                        emit_event(&OrchestrationEvent::ServiceStartFail {
+                            service: spec.service_id.clone(),
+                            error: error.clone(),
+                        });
+                        startup_failures.push(FailedService {
+                            service: spec.service_id.clone(),
+                            error,
+                        });
+                    }
+                }
+                continue;
+            }
             // migrate（如有）—— per-service：失败=该服务跳过（不再全局 fail-fast；
             // 迁移错误即启动失败原因，EVT 带原始错误链）。
             if !spec.run.migrate.is_empty() {
@@ -816,6 +849,7 @@ mod tests {
             devrun: devrun.map(|command| DevrunSection {
                 command: command.into_iter().map(String::from).collect(),
             }),
+            static_content_dir: None,
             health: Default::default(),
             proxy: None,
             logs: Vec::new(),

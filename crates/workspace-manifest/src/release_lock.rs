@@ -54,6 +54,9 @@ pub fn build_release_lock(
                 proxy: manifest.proxy.clone(),
                 logs: manifest.logs.sources.clone(),
                 env: manifest.env.clone(),
+                // static 服务：托管内容目录（= [build].artifact 目录语义）
+                static_content_dir: (manifest.project.r#type == crate::ProjectType::Static)
+                    .then(|| manifest.build.artifact.clone()),
             })
         })
         .collect::<Result<Vec<_>, ManifestError>>()?;
@@ -213,6 +216,7 @@ mod tests {
                 proxy: None,
                 logs: LogsSection::default(),
                 env: BTreeMap::new(),
+                static_content_dir: None,
             },
         }
     }

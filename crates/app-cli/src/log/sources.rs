@@ -82,6 +82,7 @@ pub(super) fn orchestrator_service() -> LockedService {
             multiline_start_pattern: None,
         }],
         env: BTreeMap::new(),
+        static_content_dir: None,
     }
 }
 

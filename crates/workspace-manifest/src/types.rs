@@ -311,6 +311,11 @@ pub struct LockedService {
     pub proxy: Option<ProxySection>,
     pub logs: Vec<LogSource>,
     pub env: BTreeMap<String, String>,
+    /// `type = static` 服务的托管内容目录（相对 `dir`，= manifest
+    /// `[build].artifact` 目录语义）——app-cli 内置静态托管 serve
+    /// `{dir}/{该目录}`。非 static 服务 None（不序列化，旧 lock 兼容）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_content_dir: Option<String>,
 }
 
 fn default_true() -> bool {
