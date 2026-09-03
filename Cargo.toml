@@ -319,6 +319,7 @@ sqlx = { version = "0.9", default-features = false, features = [
 
 # Internal crates
 rcoder-telemetry = { path = "crates/rcoder-telemetry" }
+frontend-detector = { path = "crates/frontend-detector" }
 shared_types = { path = "crates/shared_types" }
 shared_types_grpc = { path = "crates/shared_types_grpc" }
 shared_types_i18n = { path = "crates/shared_types_i18n" }

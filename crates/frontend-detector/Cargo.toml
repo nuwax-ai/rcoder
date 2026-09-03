@@ -1,0 +1,16 @@
+[package]
+name = "frontend-detector"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "前端项目框架探测（build 框架/UI 框架/版本/包管理器/typescript），纯函数无副作用"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

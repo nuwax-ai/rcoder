@@ -2173,6 +2173,7 @@ dependencies = [
  "chrono",
  "download_utils",
  "file-server",
+ "frontend-detector",
  "futures-util",
  "garde",
  "hex",
@@ -2312,6 +2313,15 @@ dependencies = [
  "gimli 0.33.0",
  "macho-unwind-info",
  "pe-unwind-info",
+]
+
+[[package]]
+name = "frontend-detector"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
