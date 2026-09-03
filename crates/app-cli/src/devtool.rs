@@ -63,8 +63,22 @@ pub async fn gen_lock(workspace: &Path) -> Result<()> {
 
     println!("📋 发现 {} 个 enabled 服务:", projects.len());
     for project in &projects {
+        // dev 段标注：dev 阶段命令与生产不同时可见（排障：dev 链路为何走了不同命令）
+        let dev_tags = [
+            project.manifest.devbuild.is_some().then_some("devbuild"),
+            project.manifest.devrun.is_some().then_some("devrun"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(",");
+        let dev_note = if dev_tags.is_empty() {
+            String::new()
+        } else {
+            format!(" dev=[{dev_tags}]")
+        };
         println!(
-            "   • {:<24} dir={:<22} type={:?} kind={:?}",
+            "   • {:<24} dir={:<22} type={:?} kind={:?}{dev_note}",
             project.service_id(),
             project.dir,
             project.manifest.project.r#type,

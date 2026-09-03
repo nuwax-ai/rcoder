@@ -60,6 +60,11 @@ async fn run_inner(
         .filter(|service| service.enabled)
         .cloned()
         .collect();
+    // dev 形态编排信号：[devrun].command 优先、[run].command 兜底（源码态 dev 链路）。
+    let dev_profile = dev_run_profile();
+    if dev_profile {
+        info!("🧪 dev run profile: services with [devrun] start via their dev command");
+    }
 
     // 2. wait PG（PG 由 supervisor [program:postgresql] 托管，秒级就绪；失败不阻断）
     wait_for_pg().await?;
@@ -75,18 +80,20 @@ async fn run_inner(
     let startup = async {
         for spec in &specs {
             // migrate（如有）—— 失败 error 上报 + Fail Fast; stdout/stderr 已落 app-cli 日志。
+            // migrate 恒用 [run].migrate（迁移是数据语义，与 dev/prod 启动形态无关）。
             if !spec.run.migrate.is_empty() {
                 info!("🛠️  migrate {}", spec.service_id);
                 run_transient(&spec.run.migrate, &args.workspace.join(&spec.dir))
                     .await
                     .with_context(|| format!("migrate {}", spec.service_id))?;
             }
-            // start
-            if spec.run.command.is_empty() {
-                warn!("⚠️  {} 无 [run].command，跳过", spec.service_id);
+            // start（dev 形态下 [devrun].command 优先、[run].command 兜底）
+            let argv = effective_run_argv(spec, dev_profile);
+            if argv.is_empty() {
+                warn!("⚠️  {} 无启动 command（[run]/[devrun]），跳过", spec.service_id);
                 continue;
             }
-            let child = start_service(spec, &args.workspace, &args.log_dir, &release.release_id)
+            let child = start_service(spec, argv, &args.workspace, &args.log_dir, &release.release_id)
                 .with_context(|| format!("start {}", spec.service_id))?;
             children.push((spec.service_id.clone(), child));
             started_user_services += 1;
@@ -112,9 +119,13 @@ async fn run_inner(
             .map(|proxy| format!("route={} (strip_prefix={})", proxy.path, proxy.strip_prefix))
             .unwrap_or_else(|| "internal (无 [proxy])".into());
         let state = if started_ids.contains(spec.service_id.as_str()) {
-            "running"
+            if dev_profile && spec.devrun.is_some() {
+                "running (devrun)"
+            } else {
+                "running"
+            }
         } else {
-            "skipped (无 [run].command)"
+            "skipped (无启动 command)"
         };
         info!(
             "🔌   {} port={} {state} {route}",
@@ -293,8 +304,29 @@ pub(crate) async fn wait_for_service_ready(spec: &ServiceSpec) -> Result<()> {
 // ── 子项目启动 ─────────────────────────────────────────────────────────────────
 
 /// 启动一个子项目（[run].command + PORT/HOSTNAME env + stdout/stderr → 轮转日志）。
+/// dev 形态编排信号（源码态 dev 链路）：平台 dev server spawn 本进程时注入
+/// `APP_CLI_RUN_PROFILE=dev`。仅影响启动命令选择（[devrun] 优先、[run] 兜底），
+/// 端口注入/pingap/健康检查/拓扑与生产编排完全一致；未注入（生产 serve、
+/// 本地直跑）恒走 [run]——与既有行为逐字节一致。
+fn dev_run_profile() -> bool {
+    std::env::var("APP_CLI_RUN_PROFILE").as_deref() == Ok("dev")
+}
+
+/// 服务的生效启动命令：dev 形态且配置了 [devrun] 时用 devrun.command（热加载，
+/// 跑源码），否则 [run].command。（[devbuild] 的回落在平台侧 dev 链路执行，
+/// app-cli 不消费该字段。）
+fn effective_run_argv(spec: &ServiceSpec, dev_profile: bool) -> &[String] {
+    if dev_profile
+        && let Some(devrun) = &spec.devrun
+    {
+        return &devrun.command;
+    }
+    &spec.run.command
+}
+
 fn start_service(
     spec: &ServiceSpec,
+    argv: &[String],
     ws_root: &Path,
     log_dir: &Path,
     release_id: &str,
@@ -306,8 +338,8 @@ fn start_service(
     let out_path = service_log_dir.join("runtime.out.log");
     let err_path = service_log_dir.join("runtime.err.log");
 
-    let mut cmd = process_group_command(&spec.run.command[0]);
-    cmd.args(&spec.run.command[1..])
+    let mut cmd = process_group_command(&argv[0]);
+    cmd.args(&argv[1..])
         .current_dir(&cwd)
         .envs(&spec.env)
         // Runtime-owned variables are applied last so even a hand-crafted
@@ -322,7 +354,7 @@ fn start_service(
 
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawn {}: {}", spec.service_id, spec.run.command.join(" ")))?;
+        .with_context(|| format!("spawn {}: {}", spec.service_id, argv.join(" ")))?;
 
     // pipe → 带轮转的日志文件（append 模式，不 truncate；超 10MB rotate，保留 3 份）
     if let Some(stdout) = child.stdout.take() {
@@ -629,4 +661,61 @@ fn process_group_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 #[cfg(not(unix))]
 fn process_group_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     Command::new(program)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use workspace_manifest::{DevrunSection, RunSection};
+
+    /// 最小 ServiceSpec（LockedService）：只填启动命令相关字段。
+    fn spec_with(devrun: Option<Vec<&str>>) -> ServiceSpec {
+        ServiceSpec {
+            service_id: "frontend".into(),
+            name: "Frontend".into(),
+            dir: "frontend".into(),
+            r#type: workspace_manifest::ProjectType::Node,
+            kind: workspace_manifest::ProjectKind::Web,
+            enabled: true,
+            port: 4578,
+            devbuild: None,
+            run: RunSection {
+                command: vec!["node".into(), "server.js".into()],
+                migrate: Vec::new(),
+                depends_on: Vec::new(),
+                shutdown_timeout_seconds: 30,
+            },
+            devrun: devrun.map(|command| DevrunSection {
+                command: command.into_iter().map(String::from).collect(),
+            }),
+            health: Default::default(),
+            proxy: None,
+            logs: Vec::new(),
+            env: Default::default(),
+        }
+    }
+
+    /// dev 形态 + 有 [devrun] → devrun.command（热加载命令生效）。
+    #[test]
+    fn dev_profile_prefers_devrun_command() {
+        let spec = spec_with(Some(vec!["pnpm", "exec", "vite"]));
+        let argv = effective_run_argv(&spec, true);
+        assert_eq!(argv, &["pnpm", "exec", "vite"]);
+    }
+
+    /// dev 形态但未配 [devrun] → 回落 [run].command（未配置服务的兜底语义）。
+    #[test]
+    fn dev_profile_falls_back_to_run_without_devrun() {
+        let spec = spec_with(None);
+        let argv = effective_run_argv(&spec, true);
+        assert_eq!(argv, &["node", "server.js"]);
+    }
+
+    /// 非 dev 形态（生产/本地直跑）恒走 [run]——即便配置了 [devrun] 也不生效。
+    #[test]
+    fn prod_profile_always_uses_run_command() {
+        let spec = spec_with(Some(vec!["pnpm", "exec", "vite"]));
+        let argv = effective_run_argv(&spec, false);
+        assert_eq!(argv, &["node", "server.js"]);
+    }
 }
