@@ -13,15 +13,21 @@
 //!
 //! 探测是尽力而为的观察通道：package.json 缺失或损坏、node_modules 部分安装
 //! 均优雅降级（other / declared 口径），不报错不 panic。
+//!
+//! 除探测外，另提供**产物路由一致性检查**（[`check_static_proxy_alignment`]）：
+//! 编译期推演 pingap 对静态产物（`dist/`）的翻译链路，发现
+//! base/[proxy].path/strip_prefix/产物布局 的联动错配（部署白屏的前移拦截）。
 
 mod engine;
 mod package_json;
+mod proxy_consistency;
 mod rules;
 mod version;
 
 pub use engine::{
     FrameworkHit, detect_build, detect_package_manager, detect_typescript, detect_ui,
 };
+pub use proxy_consistency::check_static_proxy_alignment;
 pub use version::VersionSource;
 
 /// 单个项目的完整探测结果（领域结构；wire 序列化归消费方壳层）。
