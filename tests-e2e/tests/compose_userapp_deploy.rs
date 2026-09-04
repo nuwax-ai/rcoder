@@ -461,7 +461,7 @@ async fn fetch_and_verify_artifact(
     user: &str,
     release_id: &str,
     sha256_expect: &str,
-) -> Option<String> {
+) -> Option<()> {
     let url = format!("/api/v1/userapp/static/{app}?release_id={release_id}&user_id={user}");
     let resp = env
         .http
@@ -498,7 +498,7 @@ async fn fetch_and_verify_artifact(
             sha256_actual == sha256_expect
         ),
     );
-    ok.then_some(url)
+    ok.then_some(())
 }
 
 /// start(url) 部署 → 轮询七路流量（compose 语义：容器 running 即 ready，
@@ -510,10 +510,13 @@ async fn deploy_and_verify_traffic(
     user: &str,
     release_id: &str,
     sha256: &str,
-    artifact_path: &str,
 ) {
-    // 制品 URL 用容器可达形态（app 容器并入 compose 主网络，按服务名回拉 rcoder）
-    let artifact_url = format!("{}{artifact_path}", rcoder_internal());
+    // 制品 URL 用容器可达形态（app 容器并入 compose 主网络，按服务名回拉 rcoder）；
+    // static 端点按 release_id 精确定位制品——勿直拼 build 响应的 artifact_path
+    let artifact_url = format!(
+        "{}/api/v1/userapp/static/{app}?release_id={release_id}&user_id={user}",
+        rcoder_internal()
+    );
     let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/{app}/start"),
@@ -808,9 +811,8 @@ async fn verify_hot_redeploy(
     report: &JsonlReporter,
     app: &str,
     user: &str,
-    _release_id: &str,
+    release_id: &str,
     sha256: &str,
-    artifact_path: &str,
 ) {
     // 部署前 started_at
     let (s, b) = get_json(env, &format!("/api/v1/userapp/{app}?user_id={user}")).await;
@@ -867,7 +869,12 @@ async fn verify_hot_redeploy(
     }
 
     let hot_release = format!("hot-{}", uuid::Uuid::new_v4().simple());
-    let artifact_url = format!("{}{artifact_path}", rcoder_internal());
+    // URL 嵌原 release_id（static 按 release_id 定位制品，hot_release 无产物会 404）；
+    // 请求体的 release_id 才是热部署新标签
+    let artifact_url = format!(
+        "{}/api/v1/userapp/static/{app}?release_id={release_id}&user_id={user}",
+        rcoder_internal()
+    );
     let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/{app}/start"),
@@ -1128,7 +1135,7 @@ async fn userapp_deploy_full_chain() {
 
     // ③ 构建 + ④ 取包校验
     if let Some((release_id, sha256)) = build_to_completion(&env, &report, &app, user).await
-        && let Some(artifact_path) =
+        && let Some(()) =
             fetch_and_verify_artifact(&env, &report, &app, user, &release_id, &sha256).await
     {
         // ⑤ 部署 + 七路流量 ⑤b prod 观测族 ⑥ 回收
@@ -1139,7 +1146,6 @@ async fn userapp_deploy_full_chain() {
             user,
             &release_id,
             &sha256,
-            &artifact_path,
         )
         .await;
         verify_prod_observability(&env, &report, &app, user).await;
@@ -1155,7 +1161,6 @@ async fn userapp_deploy_full_chain() {
             user,
             &release_id,
             &sha256,
-            &artifact_path,
         )
         .await;
         verify_db_prod(&env, &report, &app, user).await;
