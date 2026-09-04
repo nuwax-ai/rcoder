@@ -36,9 +36,13 @@ fn app_id_of_key(key: &str) -> Option<&str> {
     key.strip_prefix("userapp:")
 }
 
-/// app-cli 终局事件的有界等待上限（秒）——正常路径 done 先于 start_dev
-/// 返回（9080 listen 即全部判定完成），此窗口仅防御管道异步竞态。
-const START_DONE_WAIT_MAX_SECS: u64 = 2;
+/// app-cli 终局事件的有界等待上限（秒）。**必须覆盖最慢启动路径**：done 在
+/// 逐服务 readiness 探测（各自 `[health].startup_timeout_seconds`，模板 java
+/// 60s）+ pingap 就绪确认后才输出，而 start_dev 在 9080 listen 即返回——
+/// 探测窗口内两者时间差可达数十秒。done 到达即 break（快路径零等待）；
+/// 超时兜底按当前累积清单判终态（事件流仍是真相源）。曾为 2s：java 60s
+/// 探测场景下 done 必然迟到、终态后事件被丢，部分失败误判 Completed。
+const START_DONE_WAIT_MAX_SECS: u64 = 120;
 
 /// 任务级日志行（快速路径说明等）的事件 service 标识——对齐编排日志源
 /// `service_id=app-cli` 的既有命名。
@@ -421,9 +425,10 @@ async fn spawn_dev_task(
                         .await?;
                 }
             }
-            // bounded 等 app-cli 终局事件（9080 listen 即全部启动判定完成，通常
-            // 已先于 start_dev 返回；2s 防御窗口后按当前累积清单兜底——事件流
-            // 仍是真相源，终态误判窗口毫秒级）。
+            // bounded 等 app-cli 终局事件：start_dev 在 9080（pingap）listen 即
+            // 返回，但逐服务 readiness 探测可能仍在进行（java 60s 窗口）——done
+            // 最晚在探测+pingap 确认后输出。等待期 poll_alive 的宽松语义不变，
+            // 调用方此时段经 SSE 已可看到 service_starting（受理即订阅）。
             let deadline = tokio::time::Instant::now()
                 + std::time::Duration::from_secs(START_DONE_WAIT_MAX_SECS);
             loop {

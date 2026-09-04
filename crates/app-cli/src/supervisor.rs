@@ -356,7 +356,11 @@ async fn run_inner(
         .map(|service| service.run.shutdown_timeout_seconds)
         .max()
         .unwrap_or(30);
-    supervise(children, shutdown_timeout, cancel).await;
+    let known_failed = startup_failures
+        .iter()
+        .map(|failure| failure.service.clone())
+        .collect::<Vec<_>>();
+    supervise(children, shutdown_timeout, cancel, known_failed).await;
     runtime_status.set_ready(false);
     Ok(())
 }
@@ -719,6 +723,7 @@ async fn supervise(
     mut children: Vec<(String, Child)>,
     shutdown_timeout_seconds: u64,
     cancel: Option<tokio_util::sync::CancellationToken>,
+    known_failed: Vec<String>,
 ) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
@@ -736,7 +741,7 @@ async fn supervise(
         } => {
             info!("📡 orchestration cancelled (hot deploy / shutdown), stopping services");
         }
-        exited = poll_any_exit(&mut children) => {
+        exited = poll_any_exit(&mut children, &known_failed) => {
             if let Some(name) = exited {
                 error!("❌ {name} exited — shutting down (supervisor will restart)");
             }
@@ -813,14 +818,40 @@ fn send_kill(child: &mut Child) {
 }
 
 /// 轮询所有子进程，第一个退出的返回其名字（500ms 间隔）。
-async fn poll_any_exit(children: &mut [(String, Child)]) -> Option<String> {
+/// 监测任一子进程退出。`known_failed`：启动判定已失败的服务（readiness
+/// 探测超时等，启动编排按"部分运行态"保留了它们）——其退出**不触发整组停**
+///（与启动容错语义一致：失败的旧进程退出是预期路径，杀掉其余正常服务是
+/// 矛盾行为）；已退出的失败服务从监测集中移除（不再重复判定）。
+/// 成功启动的服务退出仍整组停（防端口残留 crash-loop 的既有语义）。
+async fn poll_any_exit(
+    children: &mut Vec<(String, Child)>,
+    known_failed: &[String],
+) -> Option<String> {
     loop {
-        for (name, child) in children.iter_mut() {
-            match child.try_wait() {
-                Ok(Some(_)) => return Some(name.clone()),
-                Ok(None) => {}
-                Err(_) => return Some(name.clone()),
+        // 第一个退出的**正常服务**（触发整组停）；已知失败服务的退出静默移出
+        // 监测集（部分运行态语义：失败者退出是预期路径）
+        let mut normal_exit: Option<String> = None;
+        children.retain_mut(|(name, child)| {
+            let exited = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
+            if !exited {
+                return true;
             }
+            if known_failed.iter().any(|failed| failed == name) {
+                warn!("⚠️  {name}（启动判定失败，已标记）退出 — 不触发整组停");
+                return false; // 移出监测集
+            }
+            if normal_exit.is_none() {
+                normal_exit = Some(name.clone());
+            }
+            false
+        });
+        if let Some(name) = normal_exit {
+            return Some(name);
+        }
+        // 全部退出且均为 known_failed（被移除）：children 空——不再有崩溃可
+        // 监测，阻塞挂起让信号/取消分支主导（外层 supervisor 重启策略收尾）
+        if children.is_empty() {
+            std::future::pending::<()>().await;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
