@@ -12,6 +12,7 @@
 //! - [`proxy`]：pingap 配置生成
 
 pub mod api;
+pub mod build;
 pub mod config;
 pub mod deploy;
 pub mod devtool;

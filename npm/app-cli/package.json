@@ -1,0 +1,38 @@
+{
+  "name": "@nuwax-ai/app-cli",
+  "version": "0.0.0",
+  "description": "UserApp workspace runtime orchestrator (service orchestration + pingap routing + admin API; local build tool)",
+  "main": "./bin/cli.js",
+  "bin": {
+    "app-cli": "./bin/cli.js"
+  },
+  "optionalDependencies": {
+    "@nuwax-ai/app-cli-linux-x64": "0.0.0",
+    "@nuwax-ai/app-cli-linux-arm64": "0.0.0",
+    "@nuwax-ai/app-cli-darwin-x64": "0.0.0",
+    "@nuwax-ai/app-cli-darwin-arm64": "0.0.0"
+  },
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/nuwax-ai/rcoder",
+  "keywords": [
+    "userapp",
+    "orchestrator",
+    "pingap",
+    "workspace"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuwax-ai/rcoder.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

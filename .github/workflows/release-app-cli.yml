@@ -1,0 +1,230 @@
+name: release-app-cli
+
+# 发布 app-cli（UserApp 容器运行时编排器 + 本地编译工具）到公开 npmjs.org：
+# 主包 @nuwax-ai/app-cli（wrapper）+ 四个平台子包（二进制直打 tarball，
+# optionalDependencies 按平台装）。供模板仓库 Dockerfile `npm i -g` 自包含取用。
+# 触发：推 tag `app-cli-v*`（稳定 / 预发布）或手动 workflow_dispatch。
+# 与 release.yml（`v*`）/ release-file-server-proxy.yml 靠 tag 前缀隔离。
+#
+# 版本纪律：单一事实源 = crates/app-cli/Cargo.toml 的 version。发版流程 =
+# 改 Cargo.toml 版本 → 在该 commit 打同版本 tag `app-cli-v<VERSION>`；meta job
+# 强校验一致，不一致 fail-fast。仓库内 npm 包 version 恒为占位 0.0.0（CI 注入）。
+#
+# 需在仓库 Secrets 配置（复用现有）：NPM_TOKEN —— 发布 @nuwax-ai/* 到公开 npmjs.org。
+#
+# 构建策略（对齐 release-file-server-proxy.yml 的验证路径）：
+# - linux gnu 双架构走 cargo-zigbuild（zig 通用 C 工具链，给 aws-lc-sys 提供交叉
+#   CC），glibc 钉 2.17 —— 低于 rust:bookworm(2.36) 与 debian:12 基线，产物
+#   在所有支持的目标运行时直接可用；勿改为 ubuntu runner 裸编（glibc 2.39 产物
+#   在 bookworm 上不可运行）。
+# - darwin 双架构：macos-latest native（x64 加 target 交叉）。
+
+on:
+  push:
+    tags:
+      - "app-cli-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag，如 app-cli-v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ "${GITHUB_REF}" = "${TAG}" ]; then
+            # 非 tag 触发（workflow_dispatch），用输入
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          VERSION="${TAG#app-cli-v}"
+          # 版本一致性守卫：tag 必须与 crates/app-cli/Cargo.toml 的 version 一致
+          grep -q "^version = \"${VERSION}\"" crates/app-cli/Cargo.toml || {
+            echo "✗ tag(${TAG}) 与 crates/app-cli/Cargo.toml version 不一致："
+            grep '^version' crates/app-cli/Cargo.toml
+            exit 1
+          }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin,     runner: macos-latest,  zig: false }
+          - { target: x86_64-apple-darwin,       runner: macos-latest,  zig: false }
+          - { target: x86_64-unknown-linux-gnu,  runner: ubuntu-latest, zig: true }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-latest, zig: true }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 读 rust-toolchain.toml 安装工具链，并加 matrix 目标（app-cli 虽被 workspace
+      # exclude，子目录构建时 rustup 仍会沿目录树命中仓库 toolchain 文件）。
+      - name: Install Rust toolchain + target
+        shell: bash
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+
+      # protoc：pingap-config → etcd-client → tonic-prost → prost-build 构建期调用；
+      # aws-lc-sys 需要 cmake（macos 镜像自带；ubuntu 加装）。
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      # linux 双架构走 cargo-zigbuild（glibc 钉 2.17，见文件头注释）。
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        run: pip3 install ziglang cargo-zigbuild
+
+      - name: Build app-cli
+        working-directory: crates/app-cli
+        env:
+          TARGET: ${{ matrix.target }}
+          USE_ZIG: ${{ matrix.zig }}
+        run: |
+          if [ "$USE_ZIG" = "true" ]; then
+            cargo zigbuild --release --target "${TARGET}.2.17"
+          else
+            cargo build --release --target "$TARGET"
+          fi
+
+      - name: Smoke test binary --version
+        working-directory: crates/app-cli
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          TARGET_ARCH="ARM64"
+          case "$TARGET" in x86_64-*) TARGET_ARCH="X64" ;; esac
+          if [ "$TARGET_ARCH" = "${{ runner.arch }}" ]; then
+            ./target/${TARGET}/release/app-cli --version
+          else
+            echo "交叉产物（宿主架构不匹配），跳过冒烟"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-cli-${{ matrix.target }}
+          path: crates/app-cli/target/${{ matrix.target }}/release/app-cli
+          retention-days: 7
+
+  publish-npm:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Stamp versions + place binaries
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 版本注入：5 个 package.json + 主包 optionalDependencies（scoped key）
+          for dir in npm/app-cli npm/app-cli-linux-x64 npm/app-cli-linux-arm64 npm/app-cli-darwin-x64 npm/app-cli-darwin-arm64; do
+            jq --arg v "$VERSION" '.version = $v' "$dir/package.json" > "$dir/package.json.tmp" && mv "$dir/package.json.tmp" "$dir/package.json"
+          done
+          jq --arg v "$VERSION" '
+            .optionalDependencies["@nuwax-ai/app-cli-linux-x64"] = $v |
+            .optionalDependencies["@nuwax-ai/app-cli-linux-arm64"] = $v |
+            .optionalDependencies["@nuwax-ai/app-cli-darwin-x64"] = $v |
+            .optionalDependencies["@nuwax-ai/app-cli-darwin-arm64"] = $v
+          ' npm/app-cli/package.json > npm/app-cli/package.json.tmp && mv npm/app-cli/package.json.tmp npm/app-cli/package.json
+
+          # 二进制就位（target triple → 平台包目录）
+          cp dist/app-cli-x86_64-unknown-linux-gnu  npm/app-cli-linux-x64/app-cli
+          cp dist/app-cli-aarch64-unknown-linux-gnu npm/app-cli-linux-arm64/app-cli
+          cp dist/app-cli-x86_64-apple-darwin       npm/app-cli-darwin-x64/app-cli
+          cp dist/app-cli-aarch64-apple-darwin      npm/app-cli-darwin-arm64/app-cli
+          chmod +x npm/app-cli-*/app-cli
+
+          # 冒烟：runner(x64 linux, glibc ≥ 2.17) 直接跑二进制验证可执行
+          ./npm/app-cli-linux-x64/app-cli --version
+
+      # 发布顺序：先平台包后主包（主包 optionalDependencies 指向平台包版本，
+      # 反序会在安装窗口出现解析失败）。prerelease 发 beta dist-tag。
+      - name: Publish platform packages
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          TAG_ARGS=""
+          if [ "$PRERELEASE" = "true" ]; then TAG_ARGS="--tag beta"; fi
+          failures=0
+          for dir in app-cli-linux-x64 app-cli-linux-arm64 app-cli-darwin-x64 app-cli-darwin-arm64; do
+            (cd "$dir" && npm publish --access public $TAG_ARGS --registry https://registry.npmjs.org) || failures=$((failures+1))
+          done
+          [ "$failures" -eq 0 ] || { echo "✗ $failures 个平台包发布失败"; exit 1; }
+
+      - name: Publish main package
+        working-directory: npm/app-cli
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          if [ "$PRERELEASE" = "true" ]; then
+            npm publish --access public --tag beta --registry https://registry.npmjs.org
+          else
+            npm publish --access public --registry https://registry.npmjs.org
+          fi
+
+  release:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: app-cli-v${{ needs.meta.outputs.version }}
+          name: app-cli ${{ needs.meta.outputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ needs.meta.outputs.prerelease }}
+          files: |
+            dist/app-cli-aarch64-apple-darwin
+            dist/app-cli-x86_64-apple-darwin
+            dist/app-cli-x86_64-unknown-linux-gnu
+            dist/app-cli-aarch64-unknown-linux-gnu

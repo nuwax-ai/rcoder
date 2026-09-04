@@ -266,6 +266,26 @@ pub struct DiscoveredProject {
     pub manifest: ProjectManifest,
 }
 
+impl ProjectManifest {
+    /// dev 编译命令三分派（按产物消费方判定；平台 dev 链路与 app-cli 本地 `build`
+    /// 共用的单一事实源）：
+    /// - 配了 `[devbuild]` → 用之（显式检查/准备意图：type-check、依赖安装等，
+    ///   不要求产出 artifact）；
+    /// - 未配 `[devbuild]` 但配了 `[devrun]` → `None`（**跳过编译**：devrun 命令
+    ///   自足跑源码，构建产物零消费者；dev 命令确实要消费产物的非常规用法，
+    ///   显式配 `[devbuild]` 强制构建）；
+    /// - 都未配 → 回落 `[build].command`（run.command 在源码目录消费产物，需刷新）。
+    pub fn devbuild_argv(&self) -> Option<&[String]> {
+        if let Some(devbuild) = &self.devbuild {
+            return Some(devbuild.command.as_slice());
+        }
+        if self.devrun.is_some() {
+            return None;
+        }
+        Some(self.build.command.as_slice())
+    }
+}
+
 impl DiscoveredProject {
     pub fn name(&self) -> &str {
         &self.manifest.project.name
@@ -352,4 +372,63 @@ fn default_startup_timeout() -> u64 {
 /// app-cli 二进制；见 [`HealthSection::startup_timeout_seconds`] 文档）。
 fn is_default_startup_timeout(seconds: &u64) -> bool {
     *seconds == default_startup_timeout()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 最小合法 manifest（dev 段由各用例追加）。
+    fn manifest(extra: &str) -> ProjectManifest {
+        let toml_text = format!(
+            "schema_version = 1\n\
+             [project]\nservice_id = 'svc'\nname = 'svc'\ntype = 'node'\n\
+             [build]\ncommand = ['cargo', 'build']\nartifact = 'artifact.zip'\n\
+             [run]\ncommand = ['./server']\n{extra}"
+        );
+        toml::from_str(&toml_text).expect("parse manifest")
+    }
+
+    /// 三态之一：devrun + devbuild → 执行 devbuild（显式检查/准备意图优先）。
+    #[test]
+    fn devbuild_argv_prefers_explicit_devbuild() {
+        let m = manifest(
+            "[devbuild]\ncommand = ['pnpm', 'type-check']\n[devrun]\ncommand = ['vite']",
+        );
+        assert_eq!(
+            m.devbuild_argv().map(Vec::from),
+            Some(vec!["pnpm".to_string(), "type-check".to_string()])
+        );
+    }
+
+    /// 三态之二：devrun 自足（未配 devbuild）→ 跳过编译。
+    #[test]
+    fn devrun_without_devbuild_skips_compile() {
+        let m = manifest("[devrun]\ncommand = ['vite']");
+        assert_eq!(
+            m.devbuild_argv(),
+            None,
+            "devrun-only service must skip compile (devrun self-sufficient)"
+        );
+    }
+
+    /// 三态之三：未配 devrun → 回落 [build].command（run.command 消费源码目录产物）。
+    #[test]
+    fn no_devrun_falls_back_to_build() {
+        let m = manifest("");
+        assert_eq!(
+            m.devbuild_argv().map(Vec::from),
+            Some(vec!["cargo".to_string(), "build".to_string()])
+        );
+    }
+
+    /// 仅配 [devbuild] 未配 [devrun]（少见但合法）：显式准备意图仍生效。
+    #[test]
+    fn devbuild_without_devrun_still_wins() {
+        let m = manifest("[devbuild]\ncommand = ['pnpm', 'install']");
+        assert_eq!(
+            m.devbuild_argv().map(Vec::from),
+            Some(vec!["pnpm".to_string(), "install".to_string()])
+        );
+    }
 }

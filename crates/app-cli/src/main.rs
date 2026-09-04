@@ -14,6 +14,19 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // 本地编译工具：与 --gen-lock 同类的本地分派。必须先于 init_tracing——
+    // 宿主机裸跑没有 /app/logs（默认 log_dir），tracing-appender 建目录会失败；
+    // build 自身只 println 输出，不依赖 tracing/日志目录。
+    if let Some(app_cli::config::Command::Build {
+        dev,
+        deploy_dir,
+        only,
+    }) = &args.command
+    {
+        app_cli::build::run(&args.workspace, *dev, deploy_dir.as_deref(), only.as_deref())?;
+        return Ok(());
+    }
+
     let runtime_status = app_cli::runtime_status::RuntimeStatusService::default();
 
     // init tracing：stderr + 文件（daily 轮转 + non-blocking，_guard 保活到 main 退出）
@@ -37,7 +50,13 @@ async fn main() -> anyhow::Result<()> {
     // 而容器 env 恒带 APP_DEPLOY_URL 三元组（serve 的部署种子，换 Pod 模式每次
     // 更新）——run-service 若也执行部署段会二次部署（move code 到 .previous 跨
     // 卷 link 失败 exit 1 → supervisord SPAWN_ERROR，全部 app-svc-* 拉不起来）。
+    // build 是本地编译工具，无运行时副作用，不进部署段（已在前置本地分派返回）。
     match &args.command {
+        // 结构性不可达（Build 在 init_tracing 前已分派）；与 run-service 的
+        // unreachable 同款：守住 match 穷尽性，防止后续重构把分派挪走后静默走错路径。
+        Some(app_cli::config::Command::Build { .. }) => {
+            unreachable!("build dispatched before tracing init")
+        }
         Some(app_cli::config::Command::Serve) => {
             deploy_stage(&args).await?;
             return app_cli::server::serve(&args).await;
