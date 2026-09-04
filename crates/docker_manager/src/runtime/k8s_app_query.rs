@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
-    AppPortSpec, AppPortStatus, ContainerRuntimeError, ContainerRuntimeResult,
-    ContainerSpecSnapshot, DeploymentStatus, ExposeType,
+    AppPortSpec, ContainerRuntimeError, ContainerRuntimeResult, ContainerSpecSnapshot,
+    DeploymentStatus, ExposeType,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::apps::v1::Deployment;

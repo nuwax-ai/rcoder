@@ -7,7 +7,6 @@ use std::collections::HashMap;
 
 use container_runtime_api::{AppPortStatus, ExposeType};
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use super::k8s_app_helpers::{PORT_EXPOSE_ANNOTATION, parse_port_expose};
 

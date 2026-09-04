@@ -948,8 +948,7 @@ async fn userapp_dev_dbx_proxy() {
         .unwrap_or_else(|| "http://127.0.0.1:8089".to_owned());
     let dbx_url = format!("{pingora}/api/v1/userapp/proxy/dbx/dev/{user}/{app}/");
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut resp = None;
-    loop {
+    let resp = loop {
         let r = env
             .http
             .get(&dbx_url)
@@ -958,12 +957,10 @@ async fn userapp_dev_dbx_proxy() {
             .await;
         let ok = matches!(&r, Ok(r) if r.status().is_success());
         if ok || Instant::now() >= deadline {
-            resp = Some(r);
-            break;
+            break r;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-    let resp = resp.expect("至少一次请求");
+    };
     let ok = matches!(&resp, Ok(r) if r.status().is_success());
     report.assert_hard(
         "Pingora dev/dbx → 200（builder dbx-web GUI）",

@@ -473,12 +473,14 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let resolver =
             LocalWorkspaceResolver::new(root.path().join("ws"), root.path().join("computer"));
-        let mut config = Config::default();
-        config.upload_project_dir = root.path().join("uploads");
-        config.dist_target_dir = root.path().join("dist");
-        config.log_base_dir = root.path().join("logs");
-        config.init_project_dir = root.path().join("init");
-        config.git_enabled = false;
+        let config = Config {
+            upload_project_dir: root.path().join("uploads"),
+            dist_target_dir: root.path().join("dist"),
+            log_base_dir: root.path().join("logs"),
+            init_project_dir: root.path().join("init"),
+            git_enabled: false,
+            ..Config::default()
+        };
         Fixture {
             _root: root,
             resolver,
