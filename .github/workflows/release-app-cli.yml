@@ -127,11 +127,17 @@ jobs:
             echo "交叉产物（宿主架构不匹配），跳过冒烟"
           fi
 
+      # 二进制重命名为 app-cli-<target>：download-artifact merge-multiple 合并后
+      # 各平台文件名不冲突（原名同为 app-cli 会互相覆盖）。
+      - name: Rename binary for artifact
+        working-directory: crates/app-cli
+        run: cp "target/${{ matrix.target }}/release/app-cli" "app-cli-${{ matrix.target }}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-cli-${{ matrix.target }}
-          path: crates/app-cli/target/${{ matrix.target }}/release/app-cli
+          path: crates/app-cli/app-cli-${{ matrix.target }}
           retention-days: 7
 
   publish-npm:
