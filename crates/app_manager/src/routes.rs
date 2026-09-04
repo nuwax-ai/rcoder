@@ -26,6 +26,10 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
             "/api/v1/userapp/{app_id}/{app_stage}/delete",
             post(handlers::delete_app),
         )
+        .route(
+            "/api/v1/userapp/{app_id}/delete/app",
+            post(handlers::purge_app),
+        )
         // 应用操作
         .route("/api/v1/userapp/{app_id}/start", post(handlers::start_app))
         .route("/api/v1/userapp/{app_id}/stop", post(handlers::stop_app))

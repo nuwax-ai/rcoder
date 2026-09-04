@@ -56,6 +56,10 @@ pub(crate) struct MockRuntime {
     /// （storage get/query 的 env 分派断言用）。
     pub workspace_ids: DashMap<String, Vec<String>>,
     pub list_workspace_calls: AtomicUsize,
+    /// destroy_app_pvc 调用计数（purge_app 断言用；trait 默认 no-op 故须覆写）
+    pub destroy_pvc_calls: AtomicUsize,
+    /// 注入 destroy_app_pvc 失败（true → ConnectionError）
+    pub destroy_pvc_fails: AtomicBool,
 }
 
 #[async_trait]
@@ -86,6 +90,16 @@ impl WorkspaceRuntime for MockRuntime {
             .get(&format!("{service_type:?}"))
             .map(|v| v.clone())
             .unwrap_or_default())
+    }
+
+    async fn destroy_app_pvc(&self, _app_id: &str) -> ContainerRuntimeResult<()> {
+        self.destroy_pvc_calls.fetch_add(1, Ordering::Relaxed);
+        if self.destroy_pvc_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConnectionError(
+                "mock destroy_app_pvc failure".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn resize_app_storage(
@@ -300,6 +314,27 @@ upstream_includes = []
 
 [services.env]
 "#
+}
+
+/// 可控假 [`shared_types::UserappDevCleanup`]：记录 cleanup 调用，可注入失败
+/// （purge_app 的 dev 回收链路断言用；注入方式同 dev_locator——测试直写
+/// `service.dev_cleanup` 的 RwLock）。
+#[derive(Default)]
+pub(crate) struct StubDevCleanup {
+    pub calls: AtomicUsize,
+    pub fails: AtomicBool,
+}
+
+#[async_trait]
+impl shared_types::UserappDevCleanup for StubDevCleanup {
+    async fn cleanup(&self, _app_id: &str) -> Result<(), String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fails.load(Ordering::SeqCst) {
+            Err("mock dev cleanup failure".into())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// 内存版 [`shared_types::AppMetadataPersistence`]（query 过滤测试注入用；

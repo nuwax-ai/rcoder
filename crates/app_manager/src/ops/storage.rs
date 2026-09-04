@@ -312,6 +312,71 @@ impl crate::service::AppService {
         Ok(())
     }
 
+    /// 彻底删除应用（永久删除·不可逆·幂等）：只给 app_id，一步收敛
+    /// ① prod 计算面 + ② prod PVC/目录 + ③ dev 开发环境 + ④ 元数据行。
+    ///
+    /// 与三档删除语义的关系：等效 `{app_id}/prod/delete`(purge=true) →
+    /// `{app_id}/prod/storage/destroy`（删行）→ `{app_id}/dev/storage/destroy`
+    /// 的串接，供调用方（Java）"部分 app 需彻底删除"一步调用；无 confirm
+    /// （与用户的确认由调用方负责）。幂等：app 不存在 = 其余步骤照做并成功
+    /// （重入收敛）；状态查询失败透传（不当作"不存在"——对齐
+    /// fetch_runtime_status_or_err 的两态分类）。dev 回收确定性执行（未注入
+    /// 硬错、失败透传），区别于 delete_app purge 分支的 best-effort——本接口
+    /// 契约是"彻底删除"，静默跳过 dev 会让成功响应与实际状态不一致。
+    pub async fn purge_app(&self, app_id: &str) -> AppResult<()> {
+        validate_app_id(app_id)?;
+        // 与发布链（prepare/activate/confirm/delete-release）及 create/update/delete
+        // 串行：purge 全程删计算+存储，不能与写版本包/切 code 并发。
+        let release_lock = self.acquire_process_release_lock(app_id).await;
+        // 1. prod 计算面：存在才拆（防护序列 + 失败对称恢复见 tear_down_compute_plane）
+        match self.runtime.get_deployment_status(app_id).await {
+            Ok(Some(previous)) => self.tear_down_compute_plane(app_id, &previous).await?,
+            Ok(None) => info!(
+                "[APP] purge: compute plane already absent (idempotent skip): {}",
+                app_id
+            ),
+            Err(e) => {
+                warn!(
+                    "[APP] purge: query app status failed app_id={}: {}",
+                    app_id, e
+                );
+                return Err(AppOperationError::Backend(format!(
+                    "failed to query app status: {e}"
+                )));
+            }
+        }
+        // 2. prod 持久存储（K8s: 删 PVC + Ceph subvolume + 存量 -data 兜底；Docker:
+        //    通配 prod/*/ 删该 app 四目录 + 旧布局兜底——双形态在 destroy_app_pvc
+        //    收口，幂等）
+        self.runtime.destroy_app_pvc(app_id).await.map_err(|e| {
+            map_runtime_error(&format!("[APP] destroy_app_pvc failed app_id={app_id}"), e)
+        })?;
+        // 3. dev 开发环境（builder 容器 + dev PVC + Docker dev 目录 + 注册/探活
+        //    摘除，UserappDevCleanup 四步）：确定性执行——未注入硬错，失败透传
+        let cleanup = self
+            .dev_cleanup
+            .read()
+            .expect("dev_cleanup lock")
+            .clone()
+            .ok_or_else(|| {
+                AppOperationError::Backend("userapp dev cleanup not injected".to_string())
+            })?;
+        cleanup.cleanup(app_id).await.map_err(|e| {
+            AppOperationError::Backend(format!("destroy userapp dev resources (app {app_id}): {e}"))
+        })?;
+        // 4. 元数据行删除（永久删除语义；record_deleted 内部 PG 失败仅 warn
+        //    不阻断——行残留只影响 name/owner 对账，不影响资源已删的事实）
+        self.metadata.record_deleted(app_id).await;
+        drop(release_lock);
+        self.remove_unused_process_release_lock(app_id);
+        self.invalidate_deploy_cache().await;
+        info!(
+            "[APP] app purged everywhere (compute + prod storage + dev env + metadata): {}",
+            app_id
+        );
+        Ok(())
+    }
+
     /// 清空目录内容 (逐子项 remove), 保留目录本身（Docker 模式专用）。
     pub(super) async fn purge_dir_contents(dir: &std::path::Path) -> std::io::Result<()> {
         let mut rd = tokio::fs::read_dir(dir).await?;

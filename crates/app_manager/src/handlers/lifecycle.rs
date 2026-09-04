@@ -13,8 +13,8 @@ use shared_types::{AppError, HttpResult};
 
 use super::state::AppManagerState;
 use crate::models::{
-    AppRuntimeInfo, DeleteAppRequest, OwnerParams, PaginatedResponse, QueryAppsRequest,
-    UpdateAppRequest,
+    AppRuntimeInfo, DeleteAppRequest, OwnerParams, PaginatedResponse, PurgeAppRequest,
+    QueryAppsRequest, UpdateAppRequest,
 };
 
 // create REST 面已删除（统一走 POST /{app_id}/start：不存在则由发布链/ url 部署自动创建）。
@@ -227,4 +227,56 @@ pub async fn delete_app(
         .delete_app(&app_id, purge, expected_rv.as_deref())
         .await?;
     Ok(Json(HttpResult::success("删除成功".to_string())))
+}
+
+/// 彻底删除应用（永久删除，幂等）
+///
+/// 只给 app_id，一步删除：prod 容器/Deployment → prod PVC 与目录数据 →
+/// dev 开发环境（builder 容器+dev 卷+目录）→ 元数据行。**不可恢复**。
+#[utoipa::path(
+    post,
+    path = "/api/v1/userapp/{app_id}/delete/app",
+    params(
+        ("app_id" = String, Path, description = "应用 ID")
+    ),
+    request_body = PurgeAppRequest,
+    description = r#"
+彻底删除应用（永久删除·不可逆·幂等）：只给 app_id，自动删除该应用
+dev + prod 两个阶段的容器、对应的 PVC/目录数据与元数据行。
+
+- **幂等**：app 不存在（从未创建/已删除）= 任务成功；重复调用 = 成功
+  （每步底层幂等：K8s 删除 404 视为成功、Docker 目录不存在跳过）；
+- **body 可选**：不发 body（或发空 body）也成功；`user_id` 仅为日志与
+  对账，资源定位不依赖它；
+- **失败语义（Fail Fast）**：删除链任一步真实失败（状态查询/计算面删除/
+  PVC 销毁/dev 环境回收）立即透传 500；已执行步骤保留现场，调用方重试
+  同一接口即可收敛，不会死锁（内部锁为 RAII + 进程内存态）；
+- 与 `{app_stage}/delete` + `storage/destroy` 的关系：等效
+  `prod/delete`(purge=true) → `prod/storage/destroy` → `dev/storage/destroy`
+  三步串接。**无 confirm**——与终端用户的确认由调用方负责。
+"#,
+    responses(
+        (status = 200, description = "已彻底删除（app 不存在也成功——幂等）", body = HttpResult<String>),
+        (status = 400, description = "app_id/user_id 非法", body = HttpResult<String>),
+        (status = 500, description = "删除链任一步真实失败，幂等重试收敛", body = HttpResult<String>)
+    ),
+    tag = "Userapp · 双态 · 生命周期"
+)]
+#[instrument(skip(state, body))]
+pub async fn purge_app(
+    State(state): State<Arc<AppManagerState>>,
+    Path(app_id): Path<String>,
+    body: Option<Json<PurgeAppRequest>>,
+) -> Result<Json<HttpResult<String>>, AppError> {
+    if let Some(Json(req)) = &body {
+        req.validate()
+            .map_err(shared_types::garde_err_to_app_error)?;
+    }
+    let user_id = body.as_ref().and_then(|Json(r)| r.user_id.clone());
+    info!(
+        "[APP] purging app (permanent): {} (user_id={:?})",
+        app_id, user_id
+    );
+    state.app_service.purge_app(&app_id).await?;
+    Ok(Json(HttpResult::success("已彻底删除".to_string())))
 }

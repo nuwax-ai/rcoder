@@ -215,6 +215,10 @@ impl super::AppServiceTrait for AppService {
             .await
     }
 
+    async fn purge_app(&self, app_id: &str) -> AppResult<()> {
+        self.purge_app(app_id).await
+    }
+
     async fn get_app_storage(
         &self,
         app_stage: shared_types::UserappStage,

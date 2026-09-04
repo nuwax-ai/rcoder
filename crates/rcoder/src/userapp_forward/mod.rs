@@ -111,12 +111,13 @@ pub(crate) mod guard_tables {
     /// 守卫闭包比对——该清单增删须同步。原 `{app_id}/db/*` 两路已下线，数据库
     /// 管理统一走转发层 `/api/v1/userapp/db/{app_stage}/*`；文件/存储八接口已加
     /// `{app_stage}` 段显式分派 dev/prod）。
-    pub(crate) const APP_MANAGER_PATHS: [&str; 23] = [
+    pub(crate) const APP_MANAGER_PATHS: [&str; 24] = [
         "/api/v1/userapp/query",
         "/api/v1/userapp/runtime",
         "/api/v1/userapp/{app_id}",
         "/api/v1/userapp/{app_id}/update",
         "/api/v1/userapp/{app_id}/{app_stage}/delete",
+        "/api/v1/userapp/{app_id}/delete/app",
         "/api/v1/userapp/{app_id}/start",
         "/api/v1/userapp/{app_id}/stop",
         "/api/v1/userapp/{app_id}/restart",

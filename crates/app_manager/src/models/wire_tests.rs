@@ -9,8 +9,8 @@
 mod tests {
     use crate::models::commons::{ExposeType, HealthCheckType};
     use crate::models::request::{
-        AppFilters, CreateAppRequest, DeleteAppRequest, QueryAppsRequest, SortOrder,
-        UpdateAppRequest,
+        AppFilters, CreateAppRequest, DeleteAppRequest, PurgeAppRequest, QueryAppsRequest,
+        SortOrder, UpdateAppRequest,
     };
     use crate::models::response::{AppRuntimeInfo, PaginatedResponse, Pagination};
     use crate::models::start::StartAppRequest;
@@ -135,6 +135,21 @@ mod tests {
 
         let delete: Result<DeleteAppRequest, _> = serde_json::from_value(serde_json::json!({}));
         assert!(delete.is_err(), "delete 缺 user_id 应拒");
+    }
+
+    /// purge 请求：user_id 可选（body 整体可选——资源定位走 app_id 通配，
+    /// user_id 仅为日志/对账），空对象与携带均可反序列化。
+    #[test]
+    fn purge_app_request_user_id_is_optional() {
+        let empty: PurgeAppRequest =
+            serde_json::from_value(serde_json::json!({})).expect("empty body must parse");
+        assert_eq!(empty.user_id, None);
+
+        let with_user: PurgeAppRequest = serde_json::from_value(serde_json::json!({
+            "user_id": "u-purge"
+        }))
+        .expect("user_id body must parse");
+        assert_eq!(with_user.user_id.as_deref(), Some("u-purge"));
     }
 
     /// query 请求：filters/sort 键与 SortOrder 小写值。

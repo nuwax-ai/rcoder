@@ -202,3 +202,16 @@ pub struct DeleteAppRequest {
     #[serde(default)]
     pub expected_resource_version: Option<String>,
 }
+
+/// 彻底删除应用请求（永久删除：dev+prod 容器与 PVC/目录、元数据行全删）
+///
+/// body 整体可选——不发也成功（`Option<Json>` 提取器语义：缺 body/空 body
+/// 折为 None）；`user_id` 仅为日志与对账，资源定位不依赖它（目录删除走
+/// `prod/*/`、`dev/*/` 通配扫描按 app_id 匹配）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, garde::Validate)]
+pub struct PurgeAppRequest {
+    /// 归属用户 ID（可选；携带时做标识符白名单校验）
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
+    #[serde(default)]
+    pub user_id: Option<String>,
+}

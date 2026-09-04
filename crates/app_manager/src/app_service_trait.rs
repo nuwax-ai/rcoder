@@ -54,6 +54,11 @@ pub trait AppServiceTrait: Send + Sync {
         expected_resource_version: Option<&str>,
     ) -> AppResult<()>;
 
+    /// 彻底删除应用（永久删除·幂等·无 confirm）：只给 app_id——prod 计算面 +
+    /// prod PVC + dev 开发环境 + 元数据行全删。app 不存在 = 其余步骤照做并
+    /// 成功（重入收敛）；状态查询失败透传（不当作"不存在"）
+    async fn purge_app(&self, app_id: &str) -> AppResult<()>;
+
     /// 查询单个应用持久存储状态（prod=运行卷 / dev=开发卷；O(1) stat，不含 size_bytes）
     async fn get_app_storage(
         &self,

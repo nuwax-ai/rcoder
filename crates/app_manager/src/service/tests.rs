@@ -2,7 +2,7 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 use crate::models::ResourceLimits;
-use crate::test_support::{MockRuntime, release_lock, test_service};
+use crate::test_support::{MockRuntime, StubDevCleanup, release_lock, test_service};
 use container_runtime_api::StorageResizeOutcome;
 
 pub(crate) fn create_request(app_id: &str) -> CreateAppRequest {
@@ -517,4 +517,186 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
         .expect("query by range");
     assert_eq!(response.items.len(), 1);
     assert_eq!(response.items[0].app_id, "app-alpha");
+}
+
+// ===== purge_app（彻底删除：dev+prod 容器/PVC + 元数据行，幂等）=====
+
+/// purge_app 测试基座：直构造 service + 注入 dev cleanup + 预置元数据行。
+/// 返回 (service, runtime, dev_stub, persistence)。
+async fn purge_test_service(
+    root: &std::path::Path,
+    runtime: Arc<MockRuntime>,
+) -> (
+    AppService,
+    Arc<MockRuntime>,
+    Arc<StubDevCleanup>,
+    Arc<crate::test_support::InMemoryMetadataPersistence>,
+) {
+    use crate::test_support::InMemoryMetadataPersistence;
+
+    let persistence = InMemoryMetadataPersistence::new(vec![]);
+    let service = test_service(root, runtime.clone());
+    service.set_metadata_persistence(persistence.clone());
+    let dev = Arc::new(StubDevCleanup::default());
+    *service.dev_cleanup.write().expect("dev_cleanup lock") =
+        Some(dev.clone() as Arc<dyn shared_types::UserappDevCleanup>);
+    (service, runtime, dev, persistence)
+}
+
+/// 预置"app 存在"（deployments 直插——purge_app 不走 build_container_params，
+/// 无需 create_app 全链路）+ 元数据行。
+async fn seed_running_app(service: &AppService, runtime: &MockRuntime, app_id: &str) {
+    runtime.deployments.insert(
+        app_id.to_string(),
+        DeploymentStatus {
+            app_id: app_id.to_string(),
+            replicas: 1,
+            ready_replicas: 1,
+            phase: "Running".into(),
+            ..Default::default()
+        },
+    );
+    service
+        .metadata
+        .record(
+            app_id,
+            Some("purge-me".into()),
+            Some("u-purge".into()),
+            None,
+            None,
+        )
+        .await;
+}
+
+/// happy path：计算面 + prod PVC + dev 环境 + 元数据行全删。
+#[tokio::test]
+pub(crate) async fn purge_app_deletes_everything_and_metadata_row() {
+    use shared_types::AppMetadataPersistence as _;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime = Arc::new(MockRuntime::default());
+    let (service, runtime, dev, persistence) =
+        purge_test_service(root.path(), runtime.clone()).await;
+    seed_running_app(&service, &runtime, "app-p1").await;
+
+    service.purge_app("app-p1").await.expect("purge app");
+
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
+    assert!(runtime.deployments.get("app-p1").is_none());
+    assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(dev.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        service.metadata.lookup("app-p1").is_none(),
+        "purge_app must delete metadata row (permanent delete)"
+    );
+    assert!(
+        !persistence
+            .load_all()
+            .await
+            .expect("persisted")
+            .iter()
+            .any(|r| r.app_id == "app-p1"),
+        "PG row deleted by purge_app"
+    );
+}
+
+/// 幂等：app 不存在 = 任务成功，其余清理步骤照做（重入收敛）。
+#[tokio::test]
+pub(crate) async fn purge_app_on_absent_app_is_idempotent_and_still_cleans_rest() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime = Arc::new(MockRuntime::default());
+    let (service, runtime, dev, _persistence) =
+        purge_test_service(root.path(), runtime.clone()).await;
+    // 不预置 deployment（计算面缺席），仅预置元数据行使断言非空洞
+    service
+        .metadata
+        .record("app-p2", None, Some("u-purge".into()), None, None)
+        .await;
+
+    service.purge_app("app-p2").await.expect("idempotent purge");
+
+    assert_eq!(
+        runtime.delete_calls.load(Ordering::SeqCst),
+        0,
+        "compute plane absent → skip delete_deployment"
+    );
+    assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(dev.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        service.metadata.lookup("app-p2").is_none(),
+        "metadata row still deleted on absent compute plane"
+    );
+}
+
+/// dev 回收失败透传（确定性，区别于 delete_app purge 分支的 best-effort），
+/// 元数据行保留（幂等重试收敛）。
+#[tokio::test]
+pub(crate) async fn purge_app_dev_cleanup_failure_propagates_and_keeps_metadata() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime = Arc::new(MockRuntime::default());
+    let (service, runtime, dev, _persistence) =
+        purge_test_service(root.path(), runtime.clone()).await;
+    seed_running_app(&service, &runtime, "app-p3").await;
+    dev.fails.store(true, Ordering::SeqCst);
+
+    let error = service.purge_app("app-p3").await.expect_err("must fail");
+
+    assert!(matches!(error, AppOperationError::Backend(_)));
+    assert!(
+        error.to_string().contains("destroy userapp dev resources"),
+        "dev cleanup failure message, got: {error}"
+    );
+    // 前置步骤已执行（重试时幂等跳过/重做）
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(dev.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        service.metadata.lookup("app-p3").is_some(),
+        "metadata row kept for retry convergence"
+    );
+}
+
+/// 状态查询失败不得当成"不存在"（对齐 fetch_runtime_status_or_err 两态分类）：
+/// 透传 Backend，且未执行任何删除步骤。
+#[tokio::test]
+pub(crate) async fn purge_app_query_failure_propagates_not_treated_as_absent() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime = Arc::new(MockRuntime::default());
+    let (service, runtime, dev, _persistence) =
+        purge_test_service(root.path(), runtime.clone()).await;
+    seed_running_app(&service, &runtime, "app-p4").await;
+    runtime.status_fails.store(1, Ordering::SeqCst);
+
+    let error = service.purge_app("app-p4").await.expect_err("must fail");
+
+    assert!(matches!(error, AppOperationError::Backend(_)));
+    assert!(
+        error.to_string().contains("failed to query app status"),
+        "query failure message, got: {error}"
+    );
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(dev.calls.load(Ordering::SeqCst), 0);
+    assert!(service.metadata.lookup("app-p4").is_some());
+}
+
+/// dev_cleanup 未注入 → 硬错（确定性语义；对齐独立 dev destroy），元数据行保留。
+#[tokio::test]
+pub(crate) async fn purge_app_without_dev_cleanup_injected_is_hard_error() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime = Arc::new(MockRuntime::default());
+    // 不注入 dev_cleanup（test_service 默认 None）
+    let service = test_service(root.path(), runtime.clone());
+    seed_running_app(&service, &runtime, "app-p5").await;
+
+    let error = service.purge_app("app-p5").await.expect_err("must fail");
+
+    assert!(matches!(error, AppOperationError::Backend(_)));
+    assert!(
+        error.to_string().contains("dev cleanup not injected"),
+        "not-injected message, got: {error}"
+    );
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 1);
+    assert!(service.metadata.lookup("app-p5").is_some());
 }

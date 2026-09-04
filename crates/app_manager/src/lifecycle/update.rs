@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, instrument};
 
-use container_runtime_api::{ExposeType as RtExposeType, StorageResizeOutcome};
+use container_runtime_api::{DeploymentStatus, ExposeType as RtExposeType, StorageResizeOutcome};
 
 use crate::models::*;
 use crate::service::AppService;
@@ -172,9 +172,6 @@ impl AppService {
     ) -> AppResult<()> {
         validate_app_id(app_id)?;
         let previous = self.fetch_runtime_status_or_err(app_id).await?;
-        let previous_wake_on_traffic = previous
-            .wake_on_traffic
-            .unwrap_or_else(|| !self.activity.is_wake_blocked(app_id));
         // 乐观锁（同 update_app）：expected 不匹配 → 409 Conflict
         if let Some(expected) = expected_resource_version
             && let Some(actual) = &previous.resource_version
@@ -189,32 +186,10 @@ impl AppService {
         let release_lock = self.acquire_process_release_lock(app_id).await;
         info!("[APP] deleting app: {} (purge={})", app_id, purge);
 
-        // 1. Docker 模式：清理 Pingora backend（恢复依据先取出——unregister 会移除
-        //    注册表条目；用注册表而非 previous.ports 反推，Docker 后端的状态 ports
-        //    只含 TCP、反推恒空）
-        let registered_http_ports = self.registered_http_ports(app_id);
-        self.unregister_pingora_backends(app_id).await;
+        // 1. 删除计算面（防护序列与失败对称恢复见 tear_down_compute_plane）
+        self.tear_down_compute_plane(app_id, &previous).await?;
 
-        // 2. 删除计算资源（K8s: Deployment/Service/HTTPRoute/NodePort/ConfigMap/Secret
-        //    + label orphan 扫描兜底；Docker: 容器）。持久存储默认保留。
-        // 先阻止并发流量唤醒；删除失败时恢复原活动状态。
-        self.activity.mark_wake_blocked(app_id);
-        if let Err(error) = self.runtime.delete_deployment(app_id).await {
-            self.restore_activity_state(app_id, &previous, previous_wake_on_traffic);
-            self.register_pingora_backends(
-                app_id,
-                &registered_http_ports,
-                previous.pod_ip.as_deref().unwrap_or_default(),
-            )
-            .await;
-            return Err(map_runtime_error(
-                &format!("[APP] delete_deployment failed app_id={app_id}"),
-                error,
-            ));
-        }
-        self.activity.forget_app(app_id);
-
-        // 3. purge=true 必须销毁持久存储（K8s: PVC + Ceph subvolume；Docker:
+        // 2. purge=true 必须销毁持久存储（K8s: PVC + Ceph subvolume；Docker:
         //    workspace 目录），与 API 的“全部删除”语义一致。仅清空目录却保留 PVC
         //    会继续占用配额，并让成功响应与实际状态不一致。
         //    元数据行**保留**（三档语义：delete/purge 保留行支持误删找回，仅独立
@@ -233,6 +208,49 @@ impl AppService {
         drop(release_lock);
         self.remove_unused_process_release_lock(app_id);
         self.invalidate_deploy_cache().await;
+        Ok(())
+    }
+
+    /// 删除 prod 计算面防护序列（delete_app 与 purge_app 共用）：
+    /// 取注册端口 → 注销 Pingora backend → 阻断流量唤醒 → delete_deployment
+    /// （失败：恢复原活动状态 + 按原 pod_ip 重注册 backend 后透传）→ forget_app。
+    ///
+    /// 持锁约定：调用方须已持有 per-app 发布锁——本方法及其调用链**不重入**
+    /// acquire_process_release_lock（重试无死锁保证）。`previous` 由调用方
+    /// 持有（delete_app 乐观锁需要；purge_app 幂等分派需要）。
+    pub(crate) async fn tear_down_compute_plane(
+        &self,
+        app_id: &str,
+        previous: &DeploymentStatus,
+    ) -> AppResult<()> {
+        // 失败恢复依据先取出（unregister 会移除注册表条目）：pingora_ports 里的是
+        // 当前实际生效的 Http 端口——比 previous.ports 反推可靠（Docker 后端的状态
+        // ports 只含 TCP，反推恒空会让恢复分支注册了个寂寞）。
+        let previous_wake_on_traffic = previous
+            .wake_on_traffic
+            .unwrap_or_else(|| !self.activity.is_wake_blocked(app_id));
+        let registered_http_ports = self.registered_http_ports(app_id);
+        // 先注销 Pingora backend（K8s/Docker 都执行：Docker 旧 container_ip 失效；
+        // K8s 侧 backend 指向 Service FQDN，删除后集群资源整体消失）。
+        self.unregister_pingora_backends(app_id).await;
+        // 删除计算资源（K8s: Deployment/Service/HTTPRoute/NodePort/ConfigMap/Secret
+        // + label orphan 扫描兜底；Docker: 容器）。持久存储默认保留。
+        // 先阻止并发流量唤醒；删除失败时恢复原活动状态。
+        self.activity.mark_wake_blocked(app_id);
+        if let Err(error) = self.runtime.delete_deployment(app_id).await {
+            self.restore_activity_state(app_id, previous, previous_wake_on_traffic);
+            self.register_pingora_backends(
+                app_id,
+                &registered_http_ports,
+                previous.pod_ip.as_deref().unwrap_or_default(),
+            )
+            .await;
+            return Err(map_runtime_error(
+                &format!("[APP] delete_deployment failed app_id={app_id}"),
+                error,
+            ));
+        }
+        self.activity.forget_app(app_id);
         Ok(())
     }
 }
