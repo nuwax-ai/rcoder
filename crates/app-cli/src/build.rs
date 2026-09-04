@@ -12,7 +12,7 @@
 //! 任一失败则退出非零且不组装部署布局。
 
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -215,7 +215,8 @@ fn assemble_deploy_dir(workspace: &Path, tasks: &[BuildTask], deploy_dir: &Path)
 }
 
 /// 解压 zip 到目录根。zip-slip 防护：条目路径经 `enclosed_name` 归一，逃逸即拒；
-/// 保留 unix 可执行位（`./server` 类产物需要）。
+/// 保留 unix 可执行位与**符号链接条目**（standalone 类产物用 symlink 指向
+/// 依赖目录——写成普通文件会破坏模块解析）。
 fn extract_zip(zip_path: &Path, dst: &Path) -> Result<()> {
     let file = fs::File::open(zip_path)
         .with_context(|| format!("open {}", zip_path.display()))?;
@@ -228,6 +229,27 @@ fn extract_zip(zip_path: &Path, dst: &Path) -> Result<()> {
             bail!("zip 条目路径逃逸（拒绝解压）: {}", entry.name());
         };
         let out_path = dst.join(relative);
+        #[cfg(unix)]
+        if entry.is_symlink() {
+            // 符号链接条目：内容即目标路径（相对/绝对均按原样创建）。
+            // standalone 类产物用 symlink 指向依赖目录——写成普通文件会破坏
+            // 模块解析（如 next 的 .next/node_modules/pg-<hash>）。
+            let mut target = String::new();
+            entry
+                .read_to_string(&mut target)
+                .with_context(|| format!("read symlink target {}", entry.name()))?;
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if out_path.exists() || out_path.is_symlink() {
+                fs::remove_file(&out_path)
+                    .with_context(|| format!("remove {}", out_path.display()))?;
+            }
+            std::os::unix::fs::symlink(&target, &out_path).with_context(|| {
+                format!("symlink {} -> {}", out_path.display(), target)
+            })?;
+            continue;
+        }
         if entry.is_dir() {
             fs::create_dir_all(&out_path)?;
         } else {
@@ -289,6 +311,15 @@ mod tests {
             let plain: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
             writer.start_file("conf/app.toml", plain).expect("add conf");
             writer.write_all(b"key = 1\n").expect("write conf");
+            // 符号链接条目：add_symlink 是 zip 写侧正规 API，读侧用 is_symlink 识别
+            let plain_options: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
+            writer
+                .add_symlink(
+                    ".next/node_modules/pg-test",
+                    "../../node_modules/pg",
+                    plain_options,
+                )
+                .expect("add symlink");
             writer.finish().expect("finish zip");
         }
 
@@ -330,6 +361,11 @@ mod tests {
             "# lock"
         );
         assert!(deploy.join("index.html").is_file(), "workspace 入口页未拷贝");
+        // 符号链接条目解压为 symlink（内容 = 目标路径），不是普通文件
+        assert!(
+            deploy.join("backend/.next/node_modules/pg-test").is_symlink(),
+            "zip 符号链接条目未按 symlink 创建"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

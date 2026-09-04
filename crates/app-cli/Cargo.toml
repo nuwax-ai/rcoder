@@ -1,6 +1,6 @@
 [package]
 name = "app-cli"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "UserApp 容器运行时编排器（替代 start.sh，管 pingap + 子项目编排 + 管理 API）"
