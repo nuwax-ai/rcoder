@@ -3,6 +3,8 @@
 //! - workspace 定位统一 [`file_server::workspace::resolve_userapp_dev`]（Userapp 开发卷, 容器无关）。
 //!   workspace 根下有多个子项目（前端/后端/...）。
 //! - file-server 严格读取 Manifest v1，并自动发现一级子项目。
+//! - static 服务的产物在构建后做**路由一致性检查**（base/[proxy].path/strip_prefix/
+//!   产物布局联动错配 → 构建失败并给修复指引，白屏前移到编译期拦截）。
 //! - 组装成版本化整体包 `builds/workspace-package-<release_id>.zip`，内含 release lock。
 //!
 //! 子模块：
@@ -30,6 +32,7 @@ use std::sync::Arc;
 use file_server::error::{AppError, AppResult};
 use file_server::service::build_generic::{GenericBuildRequest, build_generic};
 use file_server::service::build_manager::BuildManager;
+use shared_types::ProjectType;
 
 use assemble::assemble_workspace_package;
 use manifest::{ReleaseMetadata, build_release_lock, read_workspace_manifest};
@@ -221,6 +224,30 @@ pub async fn build_workspace_package(
                 return Err(wrapped);
             }
         };
+        // static+proxy 产物路由一致性检查（zip 产物不查）：错配即构建失败，
+        // 走与构建失败完全相同的失败链（BuildFail 事件 + 任务终态 Failed、不启动）。
+        // 生产 /api/v1/userapp/build 与 dev/start 产物态共用本函数——一处接线两链都拦。
+        if proj.manifest.project.r#type == ProjectType::Static
+            && let Some(proxy) = &proj.manifest.proxy
+            && artifact.is_dir()
+            && let Err(msg) = frontend_detector::check_static_proxy_alignment(
+                &artifact,
+                &proxy.path,
+                proxy.strip_prefix,
+            )
+        {
+            let wrapped = AppError::business(format!("{}: {msg}", proj.service_id()));
+            if let Some(p) = &progress
+                && !p.is_cancelled()
+            {
+                p.emit(BuildProgressEvent::BuildFail {
+                    service: proj.service_id().to_string(),
+                    error: wrapped.to_string(),
+                })
+                .await;
+            }
+            return Err(wrapped);
+        }
         if let Some(p) = &progress {
             p.emit(BuildProgressEvent::BuildOk {
                 service: proj.service_id().to_string(),
