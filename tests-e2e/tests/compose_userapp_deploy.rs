@@ -690,34 +690,10 @@ async fn verify_prod_observability(env: &Env, report: &JsonlReporter, app: &str,
     );
 }
 
-/// C3 db prod 侧：align → reset-password → create-database（+409 重复/+404 不存在）。
+/// C3 db prod 侧：reset-password → create-database（+409 重复/+404 不存在）。
 async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
-    // align prod（PG 就绪轮询——运行容器 PG initdb 窗口）
-    let mut aligned = None;
-    let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(120) {
-        let (s, b) = post_json(
-            env,
-            "/api/v1/userapp/db/prod/align-credentials",
-            json!({"app_id": app, "user_id": user, "username": "app", "password": "e2e-prod-pw"}),
-        )
-        .await;
-        if s.is_success() && http_ok(&b) {
-            aligned = Some(b["data"].clone());
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(10)).await;
-    }
-    let ok = aligned
-        .as_ref()
-        .is_some_and(|d| d["aligned"].as_bool() == Some(true));
-    report.assert_hard(
-        "db prod align（aligned=true）",
-        ok,
-        format!("data: {:?}", aligned.as_ref().map(|d| trunc(d, 100))),
-    );
-
-    // reset-password
+    // reset-password（prod 唤醒链内嵌容器内 PG 就绪等待——pg_wait_ready；
+    // 独立 align-credentials 接口已下线，对齐能力内嵌 start 部署链）
     let (s, b) = post_json(
         env,
         "/api/v1/userapp/db/prod/reset-password",

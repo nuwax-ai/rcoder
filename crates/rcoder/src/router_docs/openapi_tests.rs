@@ -176,11 +176,12 @@ fn primary_document_groups_userapp_by_business_domain() {
         }
     }
     // 口径（环境维度 tag 重组后同前）：内部剔除 21 条后实测 Userapp 系 op
-    // 总数=51（dev/logs、tasks/{id}/logs 先后下线各 -1；pgweb 代理文档随 pgweb 退役 -1），
+    // 总数=50（dev/logs、tasks/{id}/logs 先后下线各 -1；pgweb 代理文档随 pgweb 退役 -1；
+    // align-credentials 独立接口下线再 -1——对齐能力内嵌 start 部署链），
     // 下限防漂移不设满额
     assert!(
-        userapp_ops >= 51,
-        "Userapp 系 operation 计数下限（51）未达: {userapp_ops}"
+        userapp_ops >= 50,
+        "Userapp 系 operation 计数下限（50）未达: {userapp_ops}"
     );
 
     let tag_of = |path: &str, method: &str| sole_tag("primary", &document, path, method);
@@ -215,10 +216,6 @@ fn primary_document_groups_userapp_by_business_domain() {
     );
     assert_eq!(
         tag_of("/api/v1/userapp/db/{app_stage}/reset-password", "post"),
-        "Userapp · 双态 · 数据库"
-    );
-    assert_eq!(
-        tag_of("/api/v1/userapp/db/{app_stage}/align-credentials", "post"),
         "Userapp · 双态 · 数据库"
     );
     assert_eq!(
@@ -321,11 +318,12 @@ fn userapp_params_app_and_owner_visible() {
             checked += 1;
         }
     }
-    // 本守卫口径 = 主文档 /api/v1/userapp 前缀 op（tag 口径 52 含部分内部面差异，
-    // 此处用本面实测全量 41 作下限——接口只增不减；dev/logs、tasks/{id}/logs 先后下线）
+    // 本守卫口径 = 主文档 /api/v1/userapp 前缀 op（tag 口径 51 含部分内部面差异，
+    // 此处用本面实测全量 40 作下限——接口只增不减；dev/logs、tasks/{id}/logs 先后下线，
+    // align-credentials 独立接口下线——对齐能力内嵌 start 部署链）
     assert!(
-        checked >= 41,
-        "Userapp 系 operation 计数下限（41）未达: {checked}"
+        checked >= 40,
+        "Userapp 系 operation 计数下限（40）未达: {checked}"
     );
 }
 
@@ -357,8 +355,8 @@ fn userapp_tags_carry_environment_dimension() {
         }
     }
     assert!(
-        userapp_ops >= 51,
-        "Userapp 系 operation 计数下限（51）未达: {userapp_ops}"
+        userapp_ops >= 50,
+        "Userapp 系 operation 计数下限（50）未达: {userapp_ops}"
     );
     // 三个环境组都必须非空：分组退化（全塞一组/环境段丢失）当场报红
     for prefix in ["Userapp · dev · ", "Userapp · prod · ", "Userapp · 双态 · "] {

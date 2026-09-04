@@ -99,15 +99,12 @@ use crate::handler;
         crate::userapp_forward::forward::flat_dev_projects_detect,
         crate::userapp_forward::forward::flat_dev_projects_confirm,
         crate::userapp_forward::forward::flat_dev_install_project,
-        crate::userapp_forward::db::align_credentials,
         crate::userapp_forward::db::reset_password,
         crate::userapp_forward::db::create_database,
     ),
     components(
         schemas(
-            // userApp 转发层（PG 凭据对齐/账号库管理；create-workspace 为内部接口不入文档）
-            shared_types::AlignCredentialsRequest,
-            shared_types::AlignCredentialsOutcome,
+            // userApp 转发层（PG 账号/库管理；create-workspace 为内部接口不入文档）
             shared_types::UserappDbResetPasswordRequest,
             shared_types::UserappDbCreateDatabaseRequest,
             // 日志域 wire DTO（与容器内 app-cli 同源；logs/sources/query + logs/query 响应面）
@@ -255,7 +252,7 @@ use crate::handler;
         (name = "Userapp · prod · 终端工具", description = "prod 专属（目标容器 Userapp 生产运行容器）：ttyd/dbx 生产终端入口"),
         (name = "Userapp · 双态 · 文件与存储", description = "dev/prod 双态（路径 {app_id}/{app_stage} 段分派）：文件上传/管理与存储卷查询/清理/销毁"),
         (name = "Userapp · 双态 · 日志", description = "dev/prod 双态（路径 {app_stage} 段分派）：日志源、检索与 SSE 实时流，转发容器内 app-cli"),
-        (name = "Userapp · 双态 · 数据库", description = "dev/prod 双态（路径 {app_stage} 段分派）：应用 PostgreSQL 凭据对齐/改密/建库"),
+        (name = "Userapp · 双态 · 数据库", description = "dev/prod 双态（路径 {app_stage} 段分派）：应用 PostgreSQL 改密/建库（凭据对齐内嵌 start 部署链）"),
         (name = "Userapp · 双态 · 生命周期", description = "dev/prod 双态（路径 {app_stage} 段分派）：健康/统计/事件、回收策略与删除"),
         (name = "Userapp · 访问入口", description = "流量代理（/api/v1/userapp/proxy/app/{dev,prod}，前端切换只改 dev→prod 一段）与终端代理路由速查表"),
         (name = "computer", description = "Computer Agent 桌面、聊天与容器内 PG 管理接口；chat 与 agent 族（status/stop/cancel/notify-resolved/cache/clean）支持 service_type=userapp + app_id 分派（仅 dev 阶段）"),
