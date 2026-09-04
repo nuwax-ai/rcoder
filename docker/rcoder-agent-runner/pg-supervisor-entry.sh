@@ -41,13 +41,27 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
     fi
     rm -f "$PWFILE"
 
-    # 临时起停, 仅 unix socket 建业务库 (不占 TCP, 不影响后续 exec 的 postgres)
-    "$PG_BIN/pg_ctl" -D "$PGDATA" \
-        -o '-c listen_addresses= -c unix_socket_directories=/tmp' -w start || true
-    "$PG_BIN/createdb" -h /tmp -U "$POSTGRES_USER" "$POSTGRES_DB" 2>/dev/null || true
-    "$PG_BIN/pg_ctl" -D "$PGDATA" -m fast -w stop || true
+    # 业务库兜底改后台幂等建库（postgres 正式起来后补建）：原"临时起停 +
+    # createdb"在慢盘下 -w 超时被 || true 静默吞错 → 业务库永久缺失
+    # （pg_isready 通但业务库 FATAL not exist 的中间态）。挪到 exec postgres
+    # 之后由后台循环等 socket 就绪再幂等 createdb（已存在自动跳过）。
     echo "[pg] initdb done (user=$POSTGRES_USER db=$POSTGRES_DB)"
 fi
+
+# 后台幂等建库（无论是否首次 init 都兜底——覆盖历史半成品/临时起停失败遗留）
+(
+    for _i in $(seq 1 300); do
+        "$PG_BIN/psql" -h /var/run/postgresql -U "$POSTGRES_USER" \
+            -d postgres -tAc "select 1" >/dev/null 2>&1 && break
+        sleep 1
+    done
+    if ! "$PG_BIN/createdb" -h /var/run/postgresql -U "$POSTGRES_USER" \
+            "$POSTGRES_DB" 2>/dev/null; then
+        echo "[pg] createdb $POSTGRES_DB failed or already exists (idempotent skip)"
+    else
+        echo "[pg] business database $POSTGRES_DB created"
+    fi
+) &
 
 # 前台运行 postgres, 供 supervisor 直接托管 (PID 即 postgres 本体)
 # chmod 700: postgres 要求 PGDATA u=rwx(0700)或 u=rwx,g=rx(0750); start-up.sh 的 install -d 默认建 755

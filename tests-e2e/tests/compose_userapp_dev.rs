@@ -89,16 +89,32 @@ async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user:
     // 风暴后 ceph 恢复期实测可超 300s（229 三轮实测：前轮 PVC Bound 117-
     // 219s，恢复期超时）。post_json 默认 90s 会截断 ensure（pod 实际创建
     // 成功但测试已超时）
-    let resp = env
-        .http
-        .post(format!("{}/api/v1/userapp/workspace", env.rcoder))
-        .timeout(Duration::from_secs(600))
-        .json(&json!({"app_id": app_id, "user_id": user}))
-        .send()
-        .await
-        .expect("workspace post");
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    // 冷启动容忍：dev 容器刚建时内嵌 file-server（60000→8086）有 ~10s 启动
+    // 窗口，首个 ensure 可能连接层失败（ERR_CONTAINER_ERROR: error sending
+    // request）——容器可能已建成功，重试即通（幂等）
+    let mut status = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
+    let mut body = Value::Null;
+    for attempt in 0..3 {
+        let resp = env
+            .http
+            .post(format!("{}/api/v1/userapp/workspace", env.rcoder))
+            .timeout(Duration::from_secs(600))
+            .json(&json!({"app_id": app_id, "user_id": user}))
+            .send()
+            .await;
+        let Ok(resp) = resp else { continue };
+        status = resp.status();
+        body = resp.json().await.unwrap_or(Value::Null);
+        if status.is_success() && http_ok(&body) {
+            break;
+        }
+        report.diagnostic(
+            "ensure 冷启动重试（file-server 启动窗口）",
+            &format!("attempt {attempt}"),
+            &trunc(&body, 100),
+        );
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
     let ok = status.is_success()
         && http_ok(&body)
         && body["data"]["container_name"]
@@ -965,11 +981,7 @@ async fn userapp_dev_dbx_proxy() {
 // ============================================================
 // B5 dev server 进程族：backend-go 单服务 → dev/start → 9080 探活 → stop
 // ============================================================
-// known-issue（08-30 实测）：dev/start 任务卡 running（app-cli spawn 后进程
-// 拓扑与预期不符——ps 无 app-cli 但其 run 子进程由 agent_runner 直接持有；
-// 任务 120s 不达终态）。待 app-cli dev 编排链修复后移除 ignore 恢复。
 #[tokio::test]
-#[ignore = "dev/start manifest 编排任务卡 running——实现问题待修"]
 async fn userapp_dev_server_lifecycle() {
     rcoder_e2e::common::cross_bin_lock::acquire();
     let _gate = scenario_gate().await;
@@ -977,7 +989,9 @@ async fn userapp_dev_server_lifecycle() {
     let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
         return;
     };
-    let app = scoped_app(&env, "srv");
+    // logs/query 等接口要求 app_id 整体以 "app-" 开头（scoped_app 产物
+    // 以 run_tag 开头不满足）——本场景自拼合规名（app- + tag 压缩段）
+    let app = format!("app-{}", scoped_app(&env, "srv"));
     let user = "e2e-ud-user";
 
     if !create_workspace(&env, &report, &app, user).await {
@@ -987,8 +1001,11 @@ async fn userapp_dev_server_lifecycle() {
     }
 
     // 模板：backend-go 单服务 zip（含正式 manifest——dev/start 直接编排）
+    // build = zip 打包 start.sh（秒过且产物是合法 zip——touch 空文件过得了
+    // 存在性校验但挂产物 parse）；run = http.server serve 服务目录（touch ready
+    // 文件使 GET /ready 命中 200 → readiness 探测通过 → 任务正向 Completed）
     let ws_manifest = "schema_version = 1\n\n[workspace]\nname = \"e2e-srv\"\n";
-    let proj_manifest = "schema_version = 1\n\n[project]\nservice_id = \"backend-go\"\nname = \"Go Backend\"\ntype = \"go\"\nkind = \"web\"\nenabled = true\n\n[build]\ncommand = [\"true\"]\nartifact = \"artifact.zip\"\n\n[run]\ncommand = [\"./server\"]\n\n[health]\nreadiness_path = \"/ready\"\n\n[proxy]\npath = \"/api/go/\"\nstrip_prefix = true\n";
+    let proj_manifest = "schema_version = 1\n\n[project]\nservice_id = \"backend-go\"\nname = \"Go Backend\"\ntype = \"go\"\nkind = \"web\"\nenabled = true\n\n[build]\ncommand = [\"sh\", \"-c\", \"zip -q artifact.zip start.sh\"]\nartifact = \"artifact.zip\"\n\n[run]\ncommand = [\"sh\", \"-c\", \"touch ready && exec python3 -m http.server $PORT --bind 0.0.0.0\"]\n\n[health]\nreadiness_path = \"/ready\"\n\n[proxy]\npath = \"/api/go/\"\nstrip_prefix = true\n";
     let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
     zw.start_file("workspace.manifest.toml", opts).unwrap();
@@ -1027,24 +1044,6 @@ async fn userapp_dev_server_lifecycle() {
         "dev server 前置：init 模板 zip",
         resp.status().is_success(),
         format!("HTTP {}", resp.status()),
-    );
-
-    // run command 改 sh -c sleep（manifest 覆写——server 二进制不存在）
-    let resp = env
-        .http
-        .post(format!("{}/api/v1/userapp/execute-command", env.rcoder))
-        .timeout(Duration::from_secs(30))
-        .header("X-App-Id", &app)
-        .json(&json!({"app_id": app, "user_id": user,
-            "command": "sed -i 's|^command = .*|command = [\\\"sh\\\", \\\"-c\\\", \\\"sleep 9999\\\"]|' backend-go/project.manifest.toml && grep '^command' backend-go/project.manifest.toml"}))
-        .send()
-        .await
-        .expect("patch manifest");
-    let body: Value = resp.json().await.unwrap_or(Value::Null);
-    report.assert_hard(
-        "manifest run 改 sleep（免编译探活）",
-        body["exit_code"].as_i64() == Some(0),
-        format!("exit={:?}", body["exit_code"].as_i64()),
     );
 
     // dev/start（异步任务）
@@ -1144,6 +1143,7 @@ async fn userapp_dev_server_lifecycle() {
             env.rcoder
         ))
         .timeout(Duration::from_secs(15))
+        .header("X-App-Id", &app)
         .send()
         .await
         .expect("resolve run dir");

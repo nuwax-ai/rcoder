@@ -115,6 +115,8 @@ docker-build-master-base:
 CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug
 
 # 构建 agent-runner 镜像（基于基础镜像，快速构建）
+# pingap 版本说明（构建注入，单一来源 = app-cli devtool.rs DEFAULT_PINGAP_VERSION/COMMIT，
+# 与生产 build_config 16-app-runtime.mk 同值；三处同步改）
 docker-build-agent-runner:
 	@echo "🐳 构建 rcoder-agent-runner 镜像（本地开发用 dev-computer-agent-runner）..."
 	@echo "📍 镜像名称: dev-computer-agent-runner:latest"
@@ -171,10 +173,13 @@ docker-build-agent-runner:
 		INSTALL_EBPF="false"; \
 		echo "🔒 跳过 eBPF 工具安装（生产模式）"; \
 	fi; \
+	PINGAP_VERSION=0.13.9 PINGAP_COMMIT=f7f9eddb029a5b07438bead2e0fd3df763086567; \
 	cd docker/rcoder-agent-runner && \
 		if [ -n "$(BUILDX_BUILDER)" ]; then \
 			docker buildx build --builder $(BUILDX_BUILDER) --platform linux/$(DOCKER_HOST_ARCH) --load \
 				--build-arg BASE_IMAGE=dev-rcoder-agent-base:latest \
+				--build-arg PINGAP_VERSION=$$PINGAP_VERSION \
+				--build-arg PINGAP_COMMIT=$$PINGAP_COMMIT \
 				--build-arg CACHEBUST=$$(date +%s) \
 				--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
 				--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
@@ -183,6 +188,8 @@ docker-build-agent-runner:
 		else \
 			docker build \
 				--build-arg BASE_IMAGE=dev-rcoder-agent-base:latest \
+				--build-arg PINGAP_VERSION=$$PINGAP_VERSION \
+				--build-arg PINGAP_COMMIT=$$PINGAP_COMMIT \
 				--build-arg CACHEBUST=$$(date +%s) \
 				--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
 				--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \

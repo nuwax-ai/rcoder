@@ -47,13 +47,20 @@ pub fn pg_quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// PG 就绪等待命令（容器内 `pg_isready` 轮询，`timeout_secs` 预算）——
+/// PG 就绪等待命令（容器内轮询，`timeout_secs` 预算）——
 /// 唤醒/刚建的容器 phase=Running 不等于容器内 PG 已可连（initdb/启动窗口），
 /// 改密类 exec 前置执行可避免竞态。exit 0=就绪；超时 exit 1（stderr 有原因）。
+///
+/// 就绪口径 = **业务库可连**（`psql -d "$POSTGRES_DB"` 2xx）而非仅 socket 在听：
+/// PG init 中间态（initdb 完成 socket 已监听、业务库 createdb 尚未跑完/曾静默
+/// 失败）下 `pg_isready` 会误判就绪，随后业务查询 FATAL "database does not
+/// exist"。容器 ENV（POSTGRES_USER/POSTGRES_DB）经 sh -c 展开在。
 pub fn pg_wait_ready_cmd(timeout_secs: usize) -> String {
     format!(
-        "for i in $(seq 1 {timeout_secs}); do pg_isready -q >/dev/null 2>&1 && exit 0; sleep 1; done; \
-echo 'postgres not ready' >&2; exit 1"
+        "for i in $(seq 1 {timeout_secs}); do \
+psql -h /var/run/postgresql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -tAc 'select 1' >/dev/null 2>&1 && exit 0; \
+sleep 1; done; \
+echo \"postgres or business db $POSTGRES_DB not ready\" >&2; exit 1"
     )
 }
 

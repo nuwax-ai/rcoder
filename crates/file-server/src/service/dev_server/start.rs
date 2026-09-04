@@ -259,7 +259,10 @@ impl DevServerManager {
         let main_log = ldir.join(log::main_log_name());
         let temp_log = ldrtemp(&ldir, now);
 
-        // 管理 API 绑随机端口（dev 场景无人消费，避免多实例撞 3010）。
+        // 管理 API 绑 0.0.0.0:3010——logs/query 的 orchestrator 内置源
+        //（app_manager log_api_base dev 分支）按 {容器 IP}:3010 连 app-cli
+        // 日志 API，随机端口/loopback 都会断链（旧"避免多实例撞 3010"顾虑
+        // 基于多 app 同沙箱的已废弃架构；per-app 容器单实例无冲突）。
         // env 注入 APP_CLI_RUN_PROFILE=dev：源码态 dev 链路信号——app-cli 编排
         // 时 [devrun].command 优先、[run].command 兜底（产物态/生产不注入恒走
         // [run]，见 app-cli supervisor::effective_run_argv）。
@@ -271,7 +274,7 @@ impl DevServerManager {
                 "--log-dir".to_string(),
                 ldir.join("app-cli").display().to_string(),
                 "--admin-addr".to_string(),
-                "127.0.0.1:0".to_string(),
+                "0.0.0.0:3010".to_string(),
             ],
             project_path,
             &[("APP_CLI_RUN_PROFILE".to_string(), "dev".to_string())],

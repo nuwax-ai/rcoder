@@ -169,6 +169,28 @@ COPY bin/agent_runner /usr/local/bin/agent_runner
 # 的 crates/app-cli/target 复制，bin/ 目录由 make 步骤同步）
 COPY bin/app-cli /usr/local/bin/app-cli
 
+# 安装 pingap（app-cli 编排的反向代理；dev/start 的 manifest 引擎必需——缺失时
+# start_pingap fail-fast 整组退出。与生产 build_config Dockerfile L386-405 同源：
+# tarball 从 build_config downloads/ 同版本分发；版本单一来源 = app-cli
+# devtool.rs DEFAULT_PINGAP_VERSION/COMMIT（make/docker.mk 注入，两处同步改）。
+ARG PINGAP_VERSION
+ARG PINGAP_COMMIT
+ENV RCODER_PINGAP_VERSION=${PINGAP_VERSION} \
+    RCODER_PINGAP_COMMIT=${PINGAP_COMMIT}
+COPY downloads/pingap-v*-linux-gnu-*-full.tar.gz /tmp/pingap/
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) PINGAP_ARCH=x86 ;; \
+        arm64) PINGAP_ARCH=aarch64 ;; \
+        *) echo "Unsupported arch: $(dpkg --print-architecture)" && exit 1 ;; \
+    esac && \
+    TARBALL="/tmp/pingap/pingap-v${PINGAP_VERSION}-linux-gnu-${PINGAP_ARCH}-full.tar.gz" && \
+    test -f "$TARBALL" && \
+    tar -C /usr/local/bin -xzf "$TARBALL" && \
+    mv "/usr/local/bin/pingap-linux-gnu-${PINGAP_ARCH}-full" /usr/local/bin/pingap && \
+    chmod +x /usr/local/bin/pingap && \
+    rm -rf /tmp/pingap && \
+    /usr/local/bin/pingap --version
+
 # 安装 dbx-web（DBX 数据库 Web GUI，supervisor conf.d/dbx.conf 托管 :4224；
 # 对齐生产 L358-365——二进制从 build_config downloads/ 分发，本地直接 COPY）
 ARG TARGETARCH
