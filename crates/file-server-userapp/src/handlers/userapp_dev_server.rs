@@ -111,8 +111,9 @@ fn map_app_cli_evt(json: &str) -> Option<EvtOutcome> {
 /// 编译并启动 dev 服务
 ///
 /// 异步任务：编译可能耗时，受理即返 task_id。任一服务配了 `[devrun]` 时走**源码态**：
-/// 编译执行 `[devbuild].command`（缺省回落 `[build].command`，刷新源码目录产物、不打
-/// zip），随后 app-cli 直接编排源码 workspace 并以 `[devrun].command`（缺省回落
+/// 编译三分派（`[devbuild]` 显式配置则执行；只配 `[devrun]` 的服务跳过——devrun
+/// 自足不消费产物；未配 `[devrun]` 的服务回落 `[build].command` 刷新源码目录产物、
+/// 不打 zip），随后 app-cli 直接编排源码 workspace 并以 `[devrun].command`（缺省回落
 /// `[run].command`）启动——热加载命令（vite/nodemon 等）改码即生效。未配 `[devrun]`
 /// 的 app 走产物态（现状）：manifest 同核编译打 zip → 部署 `.run` → `[run].command`
 /// （dev 编译通过=可部署）。编译失败任务终态 Failed、不启动。进度/结果：轮询
@@ -203,8 +204,9 @@ pub(crate) async fn dev_stop(
 /// 编译并重启 dev 服务
 ///
 /// agent 改完代码后的开发闭环——**重启前必须先编译**；异步任务立即返 task_id。
-/// 任一服务配了 `[devrun]` 时走**源码态**：编译执行 `[devbuild].command`（缺省回落
-/// `[build].command`），源码目录 release.lock 按 manifest 新旧自动重锁后 app-cli
+/// 任一服务配了 `[devrun]` 时走**源码态**：编译三分派（`[devbuild]` 显式配置则
+/// 执行；只配 `[devrun]` 的服务跳过——devrun 自足；其余回落 `[build].command`），
+/// 源码目录 release.lock 按 manifest 新旧自动重锁后 app-cli
 /// 重编源码 workspace（`[devrun]` 优先）；未配则产物态（现状：同核编译打 zip →
 /// `.run` 换入）。编译失败任务终态 Failed、旧服务原样保留（可继续用旧版本测试，
 /// 不因中间态断流）。启动阶段逐服务 SSE 事件（service_starting/start_ok/
@@ -306,8 +308,9 @@ async fn spawn_dev_task(
         // 编译（形态分派）：
         // - 产物态（现状）：manifest 同核编译（单一编译事实源）——discover →
         //   逐子项目 [build].command → 组 workspace zip（dev 编译通过 = 可部署）。
-        // - 源码态（[devrun] 触发）：逐服务 [devbuild].command（缺省回落
-        //   [build].command）刷新源码目录产物——不打 zip（热加载命令跑源码，
+        // - 源码态（[devrun] 触发）：逐服务三分派（[devbuild] 显式配置则执行；
+        //   只配 [devrun] 的服务跳过——devrun 自足；其余回落 [build].command
+        //   刷新源码目录产物）——不打 zip（热加载命令跑源码，
         //   制品无消费者；可部署性检查走 /api/v1/userapp/build）。
         let progress = task_clone.clone();
         let result = if dev_source_mode {

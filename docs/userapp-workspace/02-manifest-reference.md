@@ -33,8 +33,11 @@ enabled = true
 command = ["sh", "scripts/build-standalone.sh"]
 artifact = "artifact.zip"
 
-# 可选：dev 阶段编译命令，缺省回落 [build].command。仅配了 [devrun] 的源码态
-# dev 链路生效；不要求产出 artifact（纯检查命令如 type-check 可用）。
+# 可选：dev 阶段编译/准备命令，不要求产出 artifact（type-check、依赖安装等
+# 均可）。仅配了 [devrun] 的源码态 dev 链路生效；缺省三分派：只配 [devrun]
+# 的服务跳过编译（devrun 自足不消费产物——依赖安装等前置准备应放本段，否则
+# 首次 dev 启动会因依赖缺失失败）；未配 [devrun] 的服务回落 [build].command
+# 刷新源码目录产物。
 [devbuild]
 command = ["pnpm", "run", "type-check"]
 
@@ -45,8 +48,9 @@ depends_on = []
 shutdown_timeout_seconds = 30
 
 # 可选：dev 阶段热加载启动命令，缺省回落 [run].command。任一 enabled 服务配置
-# 即把该 app 的 dev 链路切为源码态：dev/start·restart 编译（[devbuild] 优先）
-# 后 app-cli 直接编排源码 workspace（跑源码，改码即生效），不再部署 .run 产物。
+# 即把该 app 的 dev 链路切为源码态：dev/start·restart 编译（[devbuild] 显式
+# 配置则执行，未配则本服务跳过——devrun 即声明 dev 态自足）后 app-cli 直接
+# 编排源码 workspace（跑源码，改码即生效），不再部署 .run 产物。
 # 须监听 0.0.0.0:$PORT（注入同 [run]）；生产部署不读本段。
 [devrun]
 command = ["pnpm", "exec", "vite"]
@@ -63,6 +67,9 @@ path = "/api/go/"
 strip_prefix = true
 plugins = []
 upstream_includes = []
+# static 服务的产物在编译期自动校验 base/path/strip_prefix/产物布局联动
+# （烧进 dist/index.html 的资源引用按本段规则推演翻译链路），错配构建失败
+# 并给修复指引（构建工具 base/publicPath 应与 path 一致等）。
 
 [[logs.sources]]
 id = "application"

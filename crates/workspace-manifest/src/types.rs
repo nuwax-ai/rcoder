@@ -67,7 +67,9 @@ pub struct ProjectManifest {
     pub schema_version: u32,
     pub project: ProjectMeta,
     pub build: BuildSection,
-    /// dev 阶段编译命令（可选，缺省回落 [`Self::build`]；仅源码态 dev 链路生效）。
+    /// dev 阶段编译/准备命令（可选；仅源码态 dev 链路生效）。缺省三分派：未配
+    /// `[devrun]` 的服务回落 [`Self::build`]（run.command 消费源码目录产物）；
+    /// 配了 `[devrun]` 未配本段则跳过编译（devrun 自足，见 [`DevrunSection`]）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devbuild: Option<DevbuildSection>,
     /// 运行段：进程态服务必填（`command` 非空由校验保证）；`type = "static"`
@@ -125,12 +127,15 @@ pub struct BuildSection {
     pub artifact: String,
 }
 
-/// dev 阶段编译/检查命令（可选）。
+/// dev 阶段编译/准备命令（可选）。
 ///
 /// 仅在源码态 dev 链路（任一服务配了 `[devrun]`）生效：`/dev/start`·`/dev/restart`
-/// 逐服务执行本命令而非 `[build].command`——典型用法是轻量检查（如
-/// `pnpm run type-check`）避免全量构建；缺省回落 `[build].command`（刷新源码
-/// 目录产物，未配 `[devrun]` 的服务 run.command 依赖它）。产物态链路
+/// 对配置本段的服务执行本命令而非 `[build].command`——典型用法是轻量检查
+/// （如 `pnpm run type-check`）或依赖准备（如 `npm install`），**不要求产出
+/// artifact**。未配本段的缺省三分派：配了 `[devrun]` 的服务**跳过编译**
+/// （devrun 命令自足跑源码，产物零消费者——依赖安装等前置准备即应放本段，
+/// 否则首次 dev 启动会因依赖缺失失败）；未配 `[devrun]` 的服务回落
+/// `[build].command`（刷新源码目录产物，run.command 依赖它）。产物态链路
 /// （未配 `[devrun]` 的 app）编译恒用 `[build].command`（发布同核，zip 是
 /// 部署物必需品，轻量命令不产 zip 不能替换）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -145,7 +150,9 @@ pub struct DevbuildSection {
 /// ·restart 不再部署 `.run` 产物，app-cli 直接编排源码 workspace 并用本命令
 /// 启动（典型：`vite`/`nodemon`/`spring-boot:run` 等热加载命令，跑源码改码即
 /// 生效）；缺省回落 `[run].command`。端口注入（PORT env）、pingap 路由、健康
-/// 检查、拓扑编排与产物态完全一致；生产（serve 形态）不读本段。
+/// 检查、拓扑编排与产物态完全一致；生产（serve 形态）不读本段。**本段即声明
+/// dev 态自足**：未配 `[devbuild]` 时该服务的 dev 编译被跳过（本命令不消费
+/// 构建产物）；需要 type-check、依赖安装等前置，显式配 `[devbuild]`。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevrunSection {

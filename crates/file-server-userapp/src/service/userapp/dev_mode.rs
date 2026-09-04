@@ -1,10 +1,12 @@
 //! dev 源码态链路（`[devrun]` 触发）：形态判定 / 源码目录 lock ensure / dev 编译。
 //!
 //! 任一 enabled 服务配了 `[devrun]` → 该 app 的 dev 形态 = 源码态：dev/start·
-//! restart 不再部署 `.run` 产物，而是「dev 编译（devbuild ?? build，刷新源码
-//! 目录产物）→ ensure 源码目录 release.lock → app-cli 直接编排源码 workspace
-//! （`APP_CLI_RUN_PROFILE=dev`，devrun 优先、run 兜底）」。未配置的 app 走
-//! 产物态链路（编译 → zip → `.run`）不受影响。
+//! restart 不再部署 `.run` 产物，而是「dev 编译（三分派：`[devbuild]` 显式配置
+//! 则执行；只配 `[devrun]` 的服务跳过——devrun 命令自足不消费产物；未配
+//! `[devrun]` 的服务回落 `[build]` 刷新源码目录产物）→ ensure 源码目录
+//! release.lock → app-cli 直接编排源码 workspace（`APP_CLI_RUN_PROFILE=dev`，
+//! devrun 优先、run 兜底）」。未配置的 app 走产物态链路（编译 → zip →
+//! `.run`）不受影响。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,7 +38,9 @@ pub fn dev_mode_enabled(ws: &Path) -> AppResult<bool> {
         .any(|project| project.manifest.project.enabled && project.manifest.devrun.is_some()))
 }
 
-/// dev 编译：逐服务执行 `devbuild.command ?? build.command`。
+/// dev 编译（三分派，见 [`devbuild_argv`]）：配了 `[devbuild]` 的服务执行之；
+/// 只配 `[devrun]` 的服务跳过（devrun 自足，emit Log 说明）；其余回落
+/// `[build].command` 刷新源码目录产物。
 ///
 /// 与发布编译（[`super::build_workspace_package`]）共用执行框架（BuildGuard 互斥、
 /// SSE 事件序 building → log\* → build_ok/build_fail、pid 回写供 cancel kill、
@@ -65,6 +69,22 @@ pub async fn run_dev_builds(
         {
             return Err(AppError::business("build cancelled by user"));
         }
+        // devrun 自足跳过：不 emit Building/BuildOk（跳过的服务不进入编译事件
+        // 序），仅 emit Log 让 SSE 可见。
+        let Some(argv) = devbuild_argv(proj) else {
+            tracing::info!(
+                service = proj.service_id(),
+                "[DEV_BUILD] devrun 自足，跳过编译"
+            );
+            if let Some(p) = &progress {
+                p.emit(BuildProgressEvent::Log {
+                    service: proj.service_id().to_string(),
+                    line: "devrun 自足（不消费构建产物），跳过编译".to_string(),
+                })
+                .await;
+            }
+            continue;
+        };
         if let Some(p) = &progress {
             p.emit(BuildProgressEvent::Building {
                 service: proj.service_id().to_string(),
@@ -93,7 +113,6 @@ pub async fn run_dev_builds(
         let pid_ref: Option<&(dyn Fn(u32) + Send + Sync)> =
             pid_cb.as_ref().map(|c| c as &(dyn Fn(u32) + Send + Sync));
 
-        let argv = devbuild_argv(proj);
         let (program, args) = argv.split_first().ok_or_else(|| {
             AppError::validation("dev build command must have at least one argv item")
         })?;
@@ -155,14 +174,21 @@ pub async fn run_dev_builds(
     Ok(())
 }
 
-/// 服务的 dev 编译命令：`[devbuild].command` 优先、`[build].command` 兜底。
-fn devbuild_argv(project: &DiscoveredProject) -> &[String] {
-    project
-        .manifest
-        .devbuild
-        .as_ref()
-        .map(|devbuild| devbuild.command.as_slice())
-        .unwrap_or(&project.manifest.build.command)
+/// 服务的 dev 编译命令三分派（按产物消费方判定）：
+/// - 配了 `[devbuild]` → 用之（显式检查/准备意图：type-check、依赖安装等，
+///   不要求产出 artifact）；
+/// - 未配 `[devbuild]` 但配了 `[devrun]` → `None`（**跳过编译**：devrun 命令
+///   自足跑源码，构建产物零消费者；dev 命令确实要消费产物的非常规用法，
+///   显式配 `[devbuild]` 强制构建）；
+/// - 都未配 → 回落 `[build].command`（run.command 在源码目录消费产物，需刷新）。
+fn devbuild_argv(project: &DiscoveredProject) -> Option<&[String]> {
+    if let Some(devbuild) = &project.manifest.devbuild {
+        return Some(devbuild.command.as_slice());
+    }
+    if project.manifest.devrun.is_some() {
+        return None;
+    }
+    Some(project.manifest.build.command.as_slice())
 }
 
 /// ensure 源码目录 `release.lock.toml`：无 lock、或任一 manifest 比 lock 新
@@ -318,14 +344,14 @@ mod tests {
         );
     }
 
-    /// devbuild 回落：有 [devbuild] 用之，无则 [build].command。
+    /// 三态之一：devrun + devbuild → 执行 devbuild（显式检查/准备意图优先）。
     #[test]
-    fn devbuild_argv_falls_back_to_build() {
+    fn devbuild_argv_prefers_explicit_devbuild() {
         let ws = temp_ws();
         write_manifest(
             &ws.join("frontend"),
             "frontend",
-            "[devbuild]\ncommand = ['pnpm', 'type-check']",
+            "[devbuild]\ncommand = ['pnpm', 'type-check']\n[devrun]\ncommand = ['vite']",
         );
         write_manifest(&ws.join("backend"), "backend", "");
         let discovered = discover_ws_projects(&ws).expect("discover");
@@ -333,12 +359,47 @@ mod tests {
             .iter()
             .find(|p| p.service_id() == "frontend")
             .expect("frontend");
+        assert_eq!(
+            devbuild_argv(frontend).map(Vec::from),
+            Some(vec!["pnpm".to_string(), "type-check".to_string()])
+        );
+    }
+
+    /// 三态之二：devrun 自足（未配 devbuild）→ 跳过编译。
+    #[test]
+    fn devrun_without_devbuild_skips_compile() {
+        let ws = temp_ws();
+        write_manifest(
+            &ws.join("frontend"),
+            "frontend",
+            "[devrun]\ncommand = ['vite']",
+        );
+        let discovered = discover_ws_projects(&ws).expect("discover");
+        let frontend = discovered
+            .iter()
+            .find(|p| p.service_id() == "frontend")
+            .expect("frontend");
+        assert_eq!(
+            devbuild_argv(frontend),
+            None,
+            "devrun-only service must skip compile (devrun self-sufficient)"
+        );
+    }
+
+    /// 三态之三：未配 devrun → 回落 [build].command（run.command 消费源码目录产物）。
+    #[test]
+    fn no_devrun_falls_back_to_build() {
+        let ws = temp_ws();
+        write_manifest(&ws.join("backend"), "backend", "");
+        let discovered = discover_ws_projects(&ws).expect("discover");
         let backend = discovered
             .iter()
             .find(|p| p.service_id() == "backend")
             .expect("backend");
-        assert_eq!(devbuild_argv(frontend), &["pnpm", "type-check"]);
-        assert_eq!(devbuild_argv(backend), &["true"]);
+        assert_eq!(
+            devbuild_argv(backend).map(Vec::from),
+            Some(vec!["true".to_string()])
+        );
     }
 
     fn set_mtime(path: &Path, mtime: SystemTime) {
