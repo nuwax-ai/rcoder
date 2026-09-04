@@ -33,3 +33,16 @@ RCODER_APP_RELEASE_RETENTION_MAX=100
 
 成功 confirm 后才清理；当前版本始终保护。长期只保存 zip，不保留 15 份解压目录。
 数据库不执行 down migration，迁移必须幂等并采用 expand/contract。
+
+## release.lock 兼容性纪律（改 schema 必读）
+
+release.lock 由 rcoder 侧序列化、**镜像内 app-cli 二进制**（`deny_unknown_fields`）解析——
+二进制内嵌的是其编译时点的 schema。修改 lock 相关字段（LockedService/HealthSection 等新增
+或变更）时必须三步同步，否则已部署镜像的 app-cli 解析报 unknown field、deploy 阶段无限
+重启（502、9080/3010 不监听）：
+
+1. bump `crates/app-cli` 版本 + `workspace_manifest::MINIMUM_APP_CLI_VERSION` 常量；
+2. lock 侧序列化对新增**可选**字段加 `default + skip_serializing_if`（默认值不写入，
+   旧二进制可解析；前车之鉴：startup_timeout_seconds）；
+3. **重建 app-runtime 镜像**（本地 `make docker-build-app-runtime`；生产走 build-agent-docker
+   的 0.1.25x 构建线）——显式配置了非默认新字段值的部署，序列化兜底救不了，必须新镜像。

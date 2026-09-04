@@ -46,5 +46,12 @@ pub use validation::{
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
+/// release.lock 声明的最低 app-cli 版本（`validate_runtime_compatibility`
+/// 消费）。**版本线纪律**：修改 release.lock 相关 schema（新增/变更
+/// LockedService/HealthSection 等序列化字段）时，必须同步 bump app-cli 的
+/// Cargo 版本与本常量，并重建 app-runtime 镜像——已发布的旧二进制内嵌
+/// 编译时点的 schema（deny_unknown_fields），序列化新增字段会让其部署死循环
+/// （前车之鉴：startup_timeout_seconds，序列化侧须 skip 默认值兜底）。
+pub const MINIMUM_APP_CLI_VERSION: &str = "0.1.3";
 pub const INTERNAL_PORT_MIN: u16 = 4000;
 pub const INTERNAL_PORT_MAX: u16 = 7999;

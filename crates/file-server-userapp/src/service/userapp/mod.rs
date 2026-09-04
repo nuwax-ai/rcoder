@@ -270,7 +270,7 @@ pub async fn build_workspace_package(
             release_id,
             pingap_version: &pingap_version,
             pingap_commit: &pingap_commit,
-            minimum_app_cli_version: env!("CARGO_PKG_VERSION"),
+            minimum_app_cli_version: shared_types::MINIMUM_APP_CLI_VERSION,
             runtime_image_digest: &runtime_image_digest,
         },
     )

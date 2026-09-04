@@ -195,8 +195,9 @@ fn devbuild_argv(project: &DiscoveredProject) -> Option<&[String]> {
 /// （mtime）→ 重新生成；新鲜则 no-op。返回编排 workspace 根（= 源码 ws 本身，
 /// app-cli `--workspace` 指向这里）。
 ///
-/// metadata 与发布链同源（env 必备——发布编译同进程已依赖）；`minimum_app_cli_version`
-/// 同发布链取本 crate 版本（隐含与 app-cli 同批发版的既有约定）。幂等，重复调用安全。
+/// metadata 与发布链同源（env 必备——发布编译同进程已依赖）；
+/// `minimum_app_cli_version` 取共享常量（app-cli 版本线，见其 doc 的纪律）。
+/// 幂等，重复调用安全。
 pub async fn ensure_dev_lock(ws: &Path) -> AppResult<PathBuf> {
     let lock_path = ws.join(LOCK_FILE);
     if fresh_lock(ws, &lock_path).await {
@@ -222,7 +223,7 @@ pub async fn ensure_dev_lock(ws: &Path) -> AppResult<PathBuf> {
             release_id: &release_id,
             pingap_version: &pingap_version,
             pingap_commit: &pingap_commit,
-            minimum_app_cli_version: env!("CARGO_PKG_VERSION"),
+            minimum_app_cli_version: shared_types::MINIMUM_APP_CLI_VERSION,
             runtime_image_digest: &runtime_image_digest,
         },
     )

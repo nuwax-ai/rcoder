@@ -213,9 +213,9 @@ pub use agent::mgmt_types::{
 };
 pub use workspace_manifest::{
     BuildSection, DevbuildSection, DevrunSection, DiscoverError, DiscoveredProject, HealthSection,
-    LockedPingap, LockedService, LogFormat, LogSource, LogsSection, ManifestError, PingapMode,
-    PingapSection, ProjectKind, ProjectManifest, ProjectMeta, ProjectType, ProxySection,
-    ReleaseLock, ReleaseMetadata, RunSection, WorkspaceManifest, WorkspaceMeta, build_release_lock,
-    discover_projects, parse_project, parse_workspace, validate_project, validate_service_id,
-    validate_topology, validate_workspace,
+    LockedPingap, LockedService, LogFormat, LogSource, LogsSection, MINIMUM_APP_CLI_VERSION,
+    ManifestError, PingapMode, PingapSection, ProjectKind, ProjectManifest, ProjectMeta,
+    ProjectType, ProxySection, ReleaseLock, ReleaseMetadata, RunSection, WorkspaceManifest,
+    WorkspaceMeta, build_release_lock, discover_projects, parse_project, parse_workspace,
+    validate_project, validate_service_id, validate_topology, validate_workspace,
 };
