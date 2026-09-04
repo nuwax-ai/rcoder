@@ -323,4 +323,60 @@ mod tests {
                 .any(|service| service.devrun.is_some())
         );
     }
+
+    /// startup_timeout_seconds 序列化前向兼容（d576ee5 补完）：默认值（25）不写入
+    /// lock——已发布旧 app-cli 二进制（deny_unknown_fields，无此字段）可解析；
+    /// 显式非默认值仍写入；读侧 default 补 25。回归背景：8/30 构建的生产镜像
+    /// 读 9/3 后生成的 lock 报 unknown field → app-cli deploy 阶段无限重启。
+    #[test]
+    fn startup_timeout_omitted_at_default_and_written_when_custom() {
+        let mut plain = discovered("backend");
+        let mut slow_boot = discovered("spring");
+        slow_boot.manifest.health.startup_timeout_seconds = 60;
+        plain.manifest.health.startup_timeout_seconds = 25;
+
+        let workspace = WorkspaceManifest {
+            schema_version: 1,
+            workspace: crate::WorkspaceMeta {
+                name: "ws".into(),
+                description: None,
+            },
+            pingap: Default::default(),
+            health: Default::default(),
+        };
+        let lock = build_release_lock(
+            &workspace,
+            &[plain, slow_boot],
+            ReleaseMetadata {
+                release_id: "rel",
+                pingap_version: "0",
+                pingap_commit: "0",
+                minimum_app_cli_version: "0",
+                runtime_image_digest: "local-dev",
+            },
+        )
+        .expect("lock");
+
+        let text = toml::to_string_pretty(&lock).expect("serialize");
+        assert_eq!(
+            text.matches("startup_timeout_seconds").count(),
+            1,
+            "键仅出现一次（显式 60 的服务；默认值服务必须省略）"
+        );
+        assert!(text.contains("startup_timeout_seconds = 60"));
+
+        // 读侧：省略处 default 补 25，显式处保持 60
+        let reloaded = load_release_lock(&text).expect("reload");
+        let get = |id: &str| {
+            reloaded
+                .services
+                .iter()
+                .find(|service| service.service_id == id)
+                .expect(id)
+                .health
+                .startup_timeout_seconds
+        };
+        assert_eq!(get("backend"), 25, "省略键读回默认 25");
+        assert_eq!(get("spring"), 60);
+    }
 }

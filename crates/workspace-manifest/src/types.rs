@@ -202,7 +202,14 @@ pub struct HealthSection {
     /// 启动就绪探测窗口（秒，dev/start·restart 逐服务并行探测 readiness_path
     /// 的上限；超时记 service_start_fail 不阻塞其余服务）。默认 25；慢启动
     /// 服务（如 Spring Boot 冷启动）按需调大。
-    #[serde(default = "default_startup_timeout")]
+    ///
+    /// 序列化省略默认值（读侧 default 恢复）：release.lock 会被镜像内的
+    /// app-cli `deny_unknown_fields` 解析——已发布的旧二进制不认识新字段，
+    /// 默认值不写入才能保持前向兼容（显式非默认值仍写入，那些部署需新镜像）。
+    #[serde(
+        default = "default_startup_timeout",
+        skip_serializing_if = "is_default_startup_timeout"
+    )]
     pub startup_timeout_seconds: u64,
 }
 
@@ -339,4 +346,10 @@ fn default_health_path() -> String {
 
 fn default_startup_timeout() -> u64 {
     25
+}
+
+/// `startup_timeout_seconds` 序列化省略判定（= 默认值不写入，前向兼容旧
+/// app-cli 二进制；见 [`HealthSection::startup_timeout_seconds`] 文档）。
+fn is_default_startup_timeout(seconds: &u64) -> bool {
+    *seconds == default_startup_timeout()
 }
