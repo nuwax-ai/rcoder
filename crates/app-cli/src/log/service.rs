@@ -156,7 +156,9 @@ impl LogService {
                     service_id: source.service_id,
                     source_id: source.source.id,
                     code: "source_read_failed".into(),
-                    message: error.to_string(),
+                    // {:#} 保留 anyhow 完整错误链——to_string() 只有最外层
+                    // context，根因（如非法正则/IO 错误）会被吞掉，无法排障。
+                    message: format!("{error:#}"),
                 }),
             }
         }
@@ -357,7 +359,11 @@ impl LogService {
     ) -> Result<Vec<LogRecord>> {
         let files = self.match_files(selected)?;
         if files.is_empty() {
-            anyhow::bail!("no files match declared glob {}", selected.source.glob);
+            // 零匹配是正常状态（文件尚未写出/已被轮转清理），不是读失败：
+            // 报错会让全局查询在首启窗口与 static 服务上恒定带
+            // source_read_failed 噪音。匹配可见性由 sources/query 的
+            // matched_files=[] 承担。
+            return Ok(Vec::new());
         }
         let key = format!("{}/{}", selected.service_id, selected.source.id);
         let prior = cursor.sources.get(&key).cloned().unwrap_or(SourceCursor {
@@ -441,14 +447,17 @@ impl LogService {
         let Some(encoded) = encoded else {
             return Ok((self.empty_cursor(), false));
         };
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        // 损坏游标（base64/JSON 解不开：截断、手改）自愈为全量重读而非 400
+        // ——与 cursor_reset 契约一致（客户端丢弃本地 cursor 从 tail 重读，
+        // 最坏重复消费，不丢日志）。
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(encoded)
-            .context("decode cursor")?;
-        let cursor: CursorState = serde_json::from_slice(&bytes).context("parse cursor")?;
-        if cursor.boot_id != self.boot_id {
-            return Ok((self.empty_cursor(), true));
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<CursorState>(&bytes).ok());
+        match decoded {
+            Some(cursor) if cursor.boot_id == self.boot_id => Ok((cursor, false)),
+            _ => Ok((self.empty_cursor(), true)),
         }
-        Ok((cursor, false))
     }
 
     fn empty_cursor(&self) -> CursorState {
@@ -516,50 +525,250 @@ format = "jsonl"
 
     #[tokio::test]
     async fn source_error_does_not_commit_partial_cursor_progress() {
+        // 触发器说明：超长行已改为截断续读（见 oversized_line 测试），这里用
+        // 非法 multiline 正则构造确定性的源读失败，验证坏源不产出日志、
+        // 好源进度正常提交（增量续拉只返回好源新行）。
         let root = tempfile::tempdir().expect("log root");
-        let directory = root.path().join("api");
-        std::fs::create_dir_all(&directory).expect("service log directory");
-        let first = directory.join("application-1.log");
-        let second = directory.join("application-2.log");
-        std::fs::write(&first, "").expect("first log");
-        std::fs::write(&second, "").expect("second log");
-        // 平台注入的 runtime 源与内置 orchestrator 源也需有匹配文件，
-        // 避免其 source error 干扰断言。
-        std::fs::write(directory.join("runtime.out.log"), "").expect("runtime log");
-        std::fs::write(root.path().join("app-cli.log.2026-01-01"), "").expect("orchestrator log");
-        let service = LogService::new(release_lock(), root.path().to_path_buf());
+        let api_dir = root.path().join("api");
+        std::fs::create_dir_all(&api_dir).expect("api log directory");
+        std::fs::create_dir_all(root.path().join("broken")).expect("broken log directory");
+        let api_log = api_dir.join("application-1.log");
+        std::fs::write(
+            &api_log,
+            "{\"timestamp\":\"2026-08-03T00:00:00Z\",\"message\":\"first\"}\n",
+        )
+        .expect("api log");
+        std::fs::write(root.path().join("broken/application.log"), "line\n").expect("broken log");
+        let mut release = release_lock();
+        let mut broken = release.services[0].clone();
+        broken.service_id = "broken".into();
+        broken.name = "broken".into();
+        broken.logs[0].format = workspace_manifest::LogFormat::Text;
+        broken.logs[0].multiline_start_pattern = Some("[".into()); // 非法正则：读文件时编译失败
+        release.services.push(broken);
+        let service = LogService::new(release, root.path().to_path_buf());
 
         let initial = service
             .query(LogQueryRequest::default())
             .await
-            .expect("initial cursor");
+            .expect("initial query");
+        assert_eq!(initial.logs.len(), 1);
+        assert_eq!(initial.logs[0].message, "first");
+        assert_eq!(initial.source_errors.len(), 1);
+        assert_eq!(initial.source_errors[0].service_id, "broken");
+
+        // 好源进度已提交：追加一行后增量续拉只返回新行（坏源仍报错、不产日志）。
         std::fs::write(
-            &first,
+            &api_log,
+            "{\"timestamp\":\"2026-08-03T00:00:00Z\",\"message\":\"first\"}\n{\"timestamp\":\"2026-08-03T00:00:02Z\",\"message\":\"new\"}\n",
+        )
+        .expect("append api log");
+        let incremental = service
+            .query(LogQueryRequest {
+                cursor: Some(initial.cursor),
+                ..Default::default()
+            })
+            .await
+            .expect("incremental query");
+        assert_eq!(incremental.logs.len(), 1);
+        assert_eq!(incremental.logs[0].message, "new");
+    }
+
+    /// 超长行截断续读：旧行为 bail! 会毒化整源（cursor 不前进、每次重读撞
+    /// 同一行直到轮转走）；新行为产一条截断记录并越过该行。
+    #[tokio::test]
+    async fn oversized_line_is_truncated_instead_of_poisoning_the_source() {
+        let root = tempfile::tempdir().expect("log root");
+        let directory = root.path().join("api");
+        std::fs::create_dir_all(&directory).expect("service log directory");
+        let oversized = "x".repeat(MAX_LINE_BYTES + 10);
+        let line_bytes = oversized.len() + 1; // 计入换行
+        let mut contents = format!(
+            "{{\"timestamp\":\"2026-08-03T00:00:00Z\",\"message\":\"before\"}}\n{oversized}\n\
+             {{\"timestamp\":\"2026-08-03T00:00:01Z\",\"message\":\"after\"}}\n"
+        );
+        std::fs::write(directory.join("application-1.log"), &contents).expect("log file");
+        std::fs::write(root.path().join("app-cli.log.2026-01-01"), "").expect("orchestrator log");
+        let service = LogService::new(release_lock(), root.path().to_path_buf());
+
+        let snapshot = service
+            .query(LogQueryRequest::default())
+            .await
+            .expect("snapshot query");
+        assert!(
+            snapshot.source_errors.is_empty(),
+            "{:?}",
+            snapshot.source_errors
+        );
+        assert_eq!(snapshot.logs.len(), 3);
+        assert_eq!(snapshot.logs[0].message, "before");
+        assert_eq!(snapshot.logs[1].message, "after");
+        // 无时间戳的截断记录排最后（compare_timestamps 里 ts 为 None 恒排后）。
+        let truncated = &snapshot.logs[2];
+        assert!(
+            truncated.message.starts_with("xxxx"),
+            "{}",
+            truncated.message
+        );
+        assert!(truncated.message.contains(&format!(
+            "[app-cli truncated: original line was {line_bytes} bytes]"
+        )));
+        assert_eq!(truncated.timestamp, None);
+
+        // cursor 已越过超长行：追加后增量续拉只返回新行。
+        contents.push_str("{\"timestamp\":\"2026-08-03T00:00:02Z\",\"message\":\"new\"}\n");
+        std::fs::write(directory.join("application-1.log"), &contents).expect("append log");
+        let incremental = service
+            .query(LogQueryRequest {
+                cursor: Some(snapshot.cursor),
+                ..Default::default()
+            })
+            .await
+            .expect("incremental query");
+        assert_eq!(incremental.logs.len(), 1);
+        assert_eq!(incremental.logs[0].message, "new");
+    }
+
+    /// 行长恰为 MAX_LINE_BYTES+1 且以 \n 结尾：截断判定触发但行已完整读入，
+    /// 不得把下一行误吞进截断记录。
+    #[tokio::test]
+    async fn boundary_oversized_line_does_not_swallow_the_next_line() {
+        let root = tempfile::tempdir().expect("log root");
+        let directory = root.path().join("api");
+        std::fs::create_dir_all(&directory).expect("service log directory");
+        // 恰好 MAX+1 字节（含换行）的单行 + 前后各一条正常行。
+        let boundary = format!("{}\n", "y".repeat(MAX_LINE_BYTES));
+        assert_eq!(boundary.len(), MAX_LINE_BYTES + 1);
+        std::fs::write(
+            directory.join("application-1.log"),
+            format!(
+                "{{\"timestamp\":\"2026-08-03T00:00:00Z\",\"message\":\"before\"}}\n{boundary}\
+                 {{\"timestamp\":\"2026-08-03T00:00:01Z\",\"message\":\"after\"}}\n"
+            ),
+        )
+        .expect("log file");
+        std::fs::write(root.path().join("app-cli.log.2026-01-01"), "").expect("orchestrator log");
+        let service = LogService::new(release_lock(), root.path().to_path_buf());
+
+        let response = service
+            .query(LogQueryRequest::default())
+            .await
+            .expect("query");
+        assert!(
+            response.source_errors.is_empty(),
+            "{:?}",
+            response.source_errors
+        );
+        assert_eq!(response.logs.len(), 3);
+        assert_eq!(response.logs[0].message, "before");
+        assert_eq!(response.logs[1].message, "after");
+        assert!(response.logs[2].message.contains(&format!(
+            "[app-cli truncated: original line was {} bytes]",
+            MAX_LINE_BYTES + 1
+        )));
+    }
+
+    /// 损坏 cursor（base64/JSON 解不开）自愈为全量重读，与 cursor_reset 契约一致。
+    #[tokio::test]
+    async fn undecodable_cursor_self_heals_as_reset() {
+        use base64::Engine;
+        let root = tempfile::tempdir().expect("log root");
+        std::fs::create_dir_all(root.path().join("api")).expect("service log directory");
+        std::fs::write(
+            root.path().join("api/application-1.log"),
             "{\"timestamp\":\"2026-08-03T00:00:00Z\",\"message\":\"first\"}\n",
         )
-        .expect("append first");
-        std::fs::write(&second, vec![b'x'; MAX_LINE_BYTES + 1]).expect("oversized second");
-        let request = LogQueryRequest {
-            cursor: Some(initial.cursor.clone()),
-            ..Default::default()
-        };
-        let failed = service
-            .query(request.clone())
-            .await
-            .expect("source error response");
-        assert!(failed.logs.is_empty());
-        assert_eq!(failed.source_errors.len(), 1);
-        assert_eq!(failed.cursor, initial.cursor);
+        .expect("log file");
+        std::fs::write(root.path().join("app-cli.log.2026-01-01"), "").expect("orchestrator log");
+        let service = LogService::new(release_lock(), root.path().to_path_buf());
+        let not_base64 = "@@@not-base64@@@".to_string();
+        let not_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("not json")
+            .to_string();
+        for garbage in [not_base64, not_json] {
+            let response = service
+                .query(LogQueryRequest {
+                    cursor: Some(garbage),
+                    ..Default::default()
+                })
+                .await
+                .expect("self-heal instead of 400");
+            assert!(response.cursor_reset);
+            assert_eq!(response.logs.len(), 1);
+            assert_eq!(response.logs[0].message, "first");
+        }
+    }
 
-        std::fs::write(
-            &second,
-            "{\"timestamp\":\"2026-08-03T00:00:01Z\",\"message\":\"second\"}\n",
-        )
-        .expect("repair second");
-        let recovered = service.query(request).await.expect("recovered source");
-        assert_eq!(recovered.logs.len(), 2);
-        assert_eq!(recovered.logs[0].message, "first");
-        assert_eq!(recovered.logs[1].message, "second");
+    /// static 服务无进程，runtime.{out,err}.log 永不存在——不注入，避免
+    /// 全局查询/流恒定带 no-match 噪音。
+    #[tokio::test]
+    async fn static_service_is_not_injected_runtime_source() {
+        let mut release = release_lock();
+        release.services[0].r#type = workspace_manifest::ProjectType::Static;
+        release.services[0].logs.clear();
+        let service = LogService::new(release, PathBuf::from("/nonexistent-log-root"));
+        let sources = service
+            .sources(LogQueryRequest::default())
+            .await
+            .expect("sources query");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].service_id, "app-cli");
+    }
+
+    /// 零匹配（文件尚未写出/已被轮转清理）是正常状态，不是读失败——
+    /// 匹配可见性由 sources/query 的 matched_files=[] 承担。
+    #[tokio::test]
+    async fn zero_matched_files_is_not_a_source_error() {
+        let root = tempfile::tempdir().expect("log root");
+        std::fs::create_dir_all(root.path().join("api")).expect("service log directory");
+        std::fs::write(root.path().join("app-cli.log.2026-01-01"), "").expect("orchestrator log");
+        let service = LogService::new(release_lock(), root.path().to_path_buf());
+        let response = service
+            .query(LogQueryRequest::default())
+            .await
+            .expect("query");
+        assert!(response.logs.is_empty());
+        assert!(
+            response.source_errors.is_empty(),
+            "{:?}",
+            response.source_errors
+        );
+        let sources = service
+            .sources(LogQueryRequest::default())
+            .await
+            .expect("sources query");
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.service_id == "api" && source.matched_files.is_empty())
+        );
+    }
+
+    /// source_error 文案保留 anyhow 完整错误链（{:#}）——to_string() 只剩
+    /// 最外层 context，根因（非法正则等）会被吞掉，无法排障。
+    #[tokio::test]
+    async fn source_error_message_keeps_root_cause_chain() {
+        let root = tempfile::tempdir().expect("log root");
+        let directory = root.path().join("api");
+        std::fs::create_dir_all(&directory).expect("service log directory");
+        std::fs::write(directory.join("application-1.log"), "line\n").expect("log file");
+        std::fs::write(root.path().join("app-cli.log.2026-01-01"), "").expect("orchestrator log");
+        let mut release = release_lock();
+        release.services[0].logs[0].format = workspace_manifest::LogFormat::Text;
+        release.services[0].logs[0].multiline_start_pattern = Some("[".into());
+        let service = LogService::new(release, root.path().to_path_buf());
+        let response = service
+            .query(LogQueryRequest::default())
+            .await
+            .expect("query");
+        assert_eq!(response.source_errors.len(), 1);
+        let message = &response.source_errors[0].message;
+        assert!(message.contains("read source api/application"), "{message}");
+        assert!(
+            message.contains("compile multiline_start_pattern"),
+            "{message}"
+        );
+        assert!(message.contains("regex parse error"), "{message}");
     }
 
     #[tokio::test]

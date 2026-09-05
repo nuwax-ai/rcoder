@@ -25,6 +25,11 @@ pub(super) fn inject_runtime_log_sources(release: &mut ReleaseLock, layout: LogL
         if service.logs.iter().any(|source| source.id == "runtime") {
             continue;
         }
+        // static 服务无进程——runtime.{out,err}.log 永不存在，注入只会让每次
+        // 全局查询/流恒定带 no-match 噪音，跳过。
+        if service.r#type == ProjectType::Static {
+            continue;
+        }
         let glob = match layout {
             LogLayout::Builtin => "runtime.*.log".to_string(),
             // supervisord 单目录合流文件：{svc}.log（glob 相对 services/ 目录）

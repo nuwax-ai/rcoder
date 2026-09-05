@@ -14,6 +14,9 @@ use super::sources::SelectedSource;
 
 pub(super) const MAX_LINE_BYTES: usize = 1024 * 1024;
 
+/// 超长行截断后保留进记录的前缀字节数（时间戳/级别/消息开头足以定位）。
+const TRUNCATED_PREFIX_BYTES: usize = 4096;
+
 pub(super) struct ReadOutcome {
     pub(super) records: Vec<LogRecord>,
     pub(super) offset: u64,
@@ -61,14 +64,40 @@ pub(super) fn read_file(
         if read == 0 {
             break;
         }
-        if line.len() > MAX_LINE_BYTES {
-            anyhow::bail!("log line exceeds {MAX_LINE_BYTES} bytes");
-        }
         let current_offset = offset;
-        offset += u64::try_from(read).context("line size conversion")?;
-        let message = String::from_utf8_lossy(&line)
-            .trim_end_matches(['\r', '\n'])
-            .to_string();
+        let mut consumed = u64::try_from(read).context("line size conversion")?;
+        let message = if line.len() > MAX_LINE_BYTES {
+            // 超长行（大堆栈/大 JSON dump）不毒化整个源：吞掉本行剩余字节、
+            // 产出一条截断记录并推进 offset。旧行为是 bail!——该源 cursor
+            // 不前进，每次查询都重读撞上同一行，恒定报错直到该行被轮转走。
+            // 注：行长恰为 MAX+1 且以 \n 结尾时行已完整读入，无需再 drain
+            // （否则会把下一行误吞进截断记录）。
+            if !line.ends_with(b"\n") {
+                loop {
+                    let mut chunk = Vec::new();
+                    let n = reader
+                        .by_ref()
+                        .take((MAX_LINE_BYTES + 1) as u64)
+                        .read_until(b'\n', &mut chunk)?;
+                    if n == 0 {
+                        break;
+                    }
+                    consumed += u64::try_from(n).context("line size conversion")?;
+                    if chunk.ends_with(b"\n") {
+                        break;
+                    }
+                }
+            }
+            let prefix = &line[..TRUNCATED_PREFIX_BYTES.min(line.len())];
+            let prefix = String::from_utf8_lossy(prefix);
+            let prefix = prefix.trim_end_matches(['\r', '\n']);
+            format!("{prefix}… [app-cli truncated: original line was {consumed} bytes]")
+        } else {
+            String::from_utf8_lossy(&line)
+                .trim_end_matches(['\r', '\n'])
+                .to_string()
+        };
+        offset += consumed;
         let (timestamp, level, rendered) = parse_line(&message, &selected.source.format);
         let record = LogRecord {
             service_id: selected.service_id.clone(),
