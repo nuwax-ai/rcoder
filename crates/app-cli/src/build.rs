@@ -38,9 +38,16 @@ struct BuildTask {
 ///   直接编排源码 workspace）。
 /// - `deploy_dir`：产物态部署布局组装（与 `dev` 互斥——两态产物落点不同）。
 /// - `only`：逗号分隔 service_id 过滤。
-pub fn run(workspace: &Path, dev: bool, deploy_dir: Option<&Path>, only: Option<&str>) -> Result<()> {
+pub fn run(
+    workspace: &Path,
+    dev: bool,
+    deploy_dir: Option<&Path>,
+    only: Option<&str>,
+) -> Result<()> {
     if dev && deploy_dir.is_some() {
-        bail!("--dev 与 --deploy-dir 互斥：dev 产物落源码目录（serve 直接编排），产物态才组装部署布局");
+        bail!(
+            "--dev 与 --deploy-dir 互斥：dev 产物落源码目录（serve 直接编排），产物态才组装部署布局"
+        );
     }
 
     // 发现 + 校验：宽松发现，全量问题一次呈现（与 --gen-lock 同款体验）。
@@ -64,7 +71,11 @@ pub fn run(workspace: &Path, dev: bool, deploy_dir: Option<&Path>, only: Option<
     println!(
         "📦 app-cli build: workspace={} mode={} 服务数={}",
         workspace.display(),
-        if dev { "dev(三分派)" } else { "产物态(全量)" },
+        if dev {
+            "dev(三分派)"
+        } else {
+            "产物态(全量)"
+        },
         projects.len(),
     );
 
@@ -133,7 +144,10 @@ pub fn run(workspace: &Path, dev: bool, deploy_dir: Option<&Path>, only: Option<
             );
             failed += 1;
         } else {
-            println!("✅ [{}] artifact={}（{:.1}s）", task.service_id, task.artifact, elapsed);
+            println!(
+                "✅ [{}] artifact={}（{:.1}s）",
+                task.service_id, task.artifact, elapsed
+            );
         }
     }
 
@@ -166,7 +180,9 @@ fn artifact_present(path: &Path, is_static: bool) -> bool {
                 .unwrap_or(false)
     } else {
         path.is_file()
-            && fs::metadata(path).map(|meta| meta.len() > 0).unwrap_or(false)
+            && fs::metadata(path)
+                .map(|meta| meta.len() > 0)
+                .unwrap_or(false)
     }
 }
 
@@ -218,8 +234,7 @@ fn assemble_deploy_dir(workspace: &Path, tasks: &[BuildTask], deploy_dir: &Path)
 /// 保留 unix 可执行位与**符号链接条目**（standalone 类产物用 symlink 指向
 /// 依赖目录——写成普通文件会破坏模块解析）。
 fn extract_zip(zip_path: &Path, dst: &Path) -> Result<()> {
-    let file = fs::File::open(zip_path)
-        .with_context(|| format!("open {}", zip_path.display()))?;
+    let file = fs::File::open(zip_path).with_context(|| format!("open {}", zip_path.display()))?;
     let mut archive = zip::ZipArchive::new(file).context("open zip archive")?;
     for index in 0..archive.len() {
         let mut entry = archive
@@ -245,9 +260,8 @@ fn extract_zip(zip_path: &Path, dst: &Path) -> Result<()> {
                 fs::remove_file(&out_path)
                     .with_context(|| format!("remove {}", out_path.display()))?;
             }
-            std::os::unix::fs::symlink(&target, &out_path).with_context(|| {
-                format!("symlink {} -> {}", out_path.display(), target)
-            })?;
+            std::os::unix::fs::symlink(&target, &out_path)
+                .with_context(|| format!("symlink {} -> {}", out_path.display(), target))?;
             continue;
         }
         if entry.is_dir() {
@@ -272,9 +286,7 @@ fn extract_zip(zip_path: &Path, dst: &Path) -> Result<()> {
 /// 递归拷贝目录（静态内容目录用；不追符号链接，产物目录为普通树）。
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)
-        .with_context(|| format!("read {}", src.display()))?
-    {
+    for entry in fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             copy_dir(&entry.path(), &dst.join(entry.file_name()))?;
@@ -354,16 +366,27 @@ mod tests {
         assemble_deploy_dir(ws, &tasks, &deploy).expect("assemble");
 
         assert!(deploy.join("backend/server").is_file(), "zip 根文件未解压");
-        assert!(deploy.join("backend/conf/app.toml").is_file(), "zip 子目录未解压");
-        assert!(deploy.join("frontend/dist/index.html").is_file(), "static 内容目录未拷贝");
+        assert!(
+            deploy.join("backend/conf/app.toml").is_file(),
+            "zip 子目录未解压"
+        );
+        assert!(
+            deploy.join("frontend/dist/index.html").is_file(),
+            "static 内容目录未拷贝"
+        );
         assert_eq!(
             fs::read_to_string(deploy.join("release.lock.toml")).expect("lock"),
             "# lock"
         );
-        assert!(deploy.join("index.html").is_file(), "workspace 入口页未拷贝");
+        assert!(
+            deploy.join("index.html").is_file(),
+            "workspace 入口页未拷贝"
+        );
         // 符号链接条目解压为 symlink（内容 = 目标路径），不是普通文件
         assert!(
-            deploy.join("backend/.next/node_modules/pg-test").is_symlink(),
+            deploy
+                .join("backend/.next/node_modules/pg-test")
+                .is_symlink(),
             "zip 符号链接条目未按 symlink 创建"
         );
         #[cfg(unix)]
@@ -386,8 +409,8 @@ mod tests {
     fn assemble_deploy_dir_requires_lock() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws = tmp.path();
-        let err = assemble_deploy_dir(ws, &[], &ws.join("deploy"))
-            .expect_err("missing lock must fail");
+        let err =
+            assemble_deploy_dir(ws, &[], &ws.join("deploy")).expect_err("missing lock must fail");
         assert!(
             err.to_string().contains("gen-lock"),
             "错误应指引先跑 --gen-lock：{err}"

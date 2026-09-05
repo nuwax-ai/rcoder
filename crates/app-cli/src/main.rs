@@ -23,7 +23,12 @@ async fn main() -> anyhow::Result<()> {
         only,
     }) = &args.command
     {
-        app_cli::build::run(&args.workspace, *dev, deploy_dir.as_deref(), only.as_deref())?;
+        app_cli::build::run(
+            &args.workspace,
+            *dev,
+            deploy_dir.as_deref(),
+            only.as_deref(),
+        )?;
         return Ok(());
     }
 
