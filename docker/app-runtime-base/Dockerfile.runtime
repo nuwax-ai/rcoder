@@ -20,6 +20,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && npm install -g pm2 typescript ts-node pnpm@10 \
     && rm -rf /var/lib/apt/lists/*
 
+# ── dbx MCP server（dbx 官方 MCP；与 build-agent-docker 正式镜像同款，防本地/生产工具面漂移）──
+# DBX_WEB_URL 指容器内 dbx-web :4224（WebBackend → PG socket 免密），spawn 即零配置。
+# 官方源：平台二进制 optionalDependencies（@dbx-app/mcp-linux-*）npmmirror 同步延迟
+# 404 静默跳过致二进制缺失；--verify-platform 构建期自检。
+RUN npm i -g @dbx-app/mcp-server@latest --registry https://registry.npmjs.org && \
+    dbx-mcp-server --verify-platform
+ENV DBX_WEB_URL=http://localhost:4224
+
 # Deno（JS/TS 运行时；deno.land 安装脚本在部分构建网络不可达 exit 35——改
 # registry 镜像拉取固定版本，与 rcoder-agent-runner base 的 Deno 同源同版）
 COPY --from=denoland/deno:bin-2.5.6 /deno /usr/local/bin/deno
