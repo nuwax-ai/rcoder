@@ -9,12 +9,12 @@
 ARG DOCKER_MIRROR
 # GitHub 镜像加速配置（默认启用）
 ARG USE_GITHUB_MIRROR=true
-# 基础镜像: rust:bookworm (= buildpack-deps:bookworm 完整版 + Rust 工具链)
-# - 基于 debian:12 (bookworm), GLIBC 2.36, 与 debian:12 100% 兼容
+# 基础镜像: rust:trixie (= buildpack-deps:trixie 完整版 + Rust 工具链)
+# - 基于 debian:13 (trixie), GLIBC 2.41, 与 debian:13 100% 兼容
 # - 预装 Rust 工具链 (cargo/rustc, 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo), 免 rustup 安装
 # - 预装 build-essential 构成 + libssl-dev/pkg-config + curl/wget/git 等 (buildpack-deps 完整版)
 # - 镜像内可直接编译 Rust 项目 (UserApp runtime build 需要 cargo)
-FROM ${DOCKER_MIRROR}rust:bookworm
+FROM ${DOCKER_MIRROR}rust:trixie
 
 # GitHub 镜像加速环境变量（必须在 FROM 之后设置）
 ENV GITHUB_MIRROR_URL=https://gh-proxy.org/https://github.com/
@@ -35,7 +35,7 @@ ENV \
 
 # 使用 LinuxMirrors 一键配置阿里云镜像源
 # 参考: https://github.com/SuperManito/LinuxMirrors
-# rust:bookworm (基于 buildpack-deps) 已预装 curl，可直接执行脚本配置镜像源
+# rust:trixie (基于 buildpack-deps) 已预装 curl，可直接执行脚本配置镜像源
 RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --source mirrors.aliyun.com \
     --protocol https \
@@ -83,9 +83,9 @@ RUN apt-get update && \
     apt-transport-https ca-certificates gnupg \
     socat supervisor \
     xclip \
-    wget software-properties-common \
-    # Suna dependencies:
-    poppler-utils wkhtmltopdf antiword unrtf catdoc gawk file jq csvkit xmlstarlet zip unzip tmux vim tree rsync \
+    wget \
+    # Suna dependencies: (wkhtmltopdf 已从 Debian 13 移除; HTML→PDF 由 chromium --headless --print-to-pdf / soffice 承担)
+    poppler-utils antiword unrtf catdoc gawk file jq csvkit xmlstarlet zip unzip tmux vim tree rsync \
     gvfs libglib2.0-bin \
     # pm-utils: 提供 pm-is-supported, 消除 xfce4-session 启动告警(容器无电源管理, 仅满足探测)
     pm-utils && \
@@ -189,8 +189,10 @@ RUN mkdir -p /etc/pip && \
 COPY requirements.txt /tmp/requirements.txt
 
 # 升级基础工具并安装依赖
-RUN pip3 install --break-system-packages --upgrade pip setuptools wheel && \
-    pip3 install --break-system-packages -r /tmp/requirements.txt && \
+# --ignore-installed: trixie 的 Debian 自带 python3-wheel/setuptools 无 pip RECORD 文件,
+# 直接 --upgrade 会报 uninstall-no-record-file; 新装到 /usr/local 遮蔽 dist-packages 副本
+RUN pip3 install --break-system-packages --ignore-installed --upgrade pip setuptools wheel && \
+    pip3 install --break-system-packages --ignore-installed -r /tmp/requirements.txt && \
     echo "✅ Python 数据科学库安装完成" && \
     echo "已安装的包:" && \
     pip3 list | grep -E '(numpy|pandas|scipy|matplotlib|openpyxl|python-docx|PyMuPDF|xlrd|xlwt|seaborn|requests|BeautifulSoup|lxml|scikit-learn)'
@@ -296,7 +298,7 @@ RUN mkdir -p /etc/chromium/policies/managed/ && \
 
 # Create user and configure Chrome (merged for smaller image size)
 RUN apt-get update && \
-    apt-get install -y gnome-keyring policykit-1-gnome policykit-1 && \
+    apt-get install -y gnome-keyring polkitd lxpolkit && \
     # Create default user
     useradd -ms /bin/bash user && \
     usermod -aG sudo user && \
@@ -313,18 +315,18 @@ RUN apt-get update && \
     echo 'Default_keyring' > /home/user/.local/share/keyrings/default && \
     chmod 600 /home/user/.local/share/keyrings/Default_keyring.keyring && \
     chmod 600 /home/user/.local/share/keyrings/default && \
-    # Configure PolicyKit to auto-allow Chromium operations
-    mkdir -p /etc/polkit-1/localauthority/50-local.d && \
-    # Create comprehensive policy for user
-    printf '[Allow all for user]\nIdentity=unix-user:user\nAction=*\nResultAny=yes\nResultInactive=yes\nResultActive=yes\n\n[Allow all for user - specific patterns]\nIdentity=unix-user:user\nAction=org.freedesktop.policykit.*\nResultAny=yes\nResultInactive=yes\nResultActive=yes\n\n[Allow Chromium specific]\nIdentity=unix-user:user\nAction=org.chromium.*\nResultAny=yes\nResultInactive=yes\nResultActive=yes' > /etc/polkit-1/localauthority/50-local.d/comprehensive-allow.pkla && \
+    # Configure PolicyKit to auto-allow user/Chromium operations
+    # (trixie: polkit 移除 pkla localauthority 后端，改用 JS rules；原 .pkla 的全量放行语义等价迁移)
+    mkdir -p /etc/polkit-1/rules.d && \
+    printf 'polkit.addRule(function(action, subject) {\n    if (subject.user === "user") {\n        return polkit.Result.YES;\n    }\n});\n' > /etc/polkit-1/rules.d/49-allow-all-user.rules && \
     # ========== 系统级自启动配置 (不受用户目录挂载影响) ==========
     mkdir -p /etc/xdg/autostart && \
     # PolicyKit authentication agent autostart
-    printf "[Desktop Entry]\nType=Application\nName=PolicyKit Auth\nExec=/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true\nStartupNotify=false" > /etc/xdg/autostart/polkit-gnome-auth.desktop && \
+    printf "[Desktop Entry]\nType=Application\nName=PolicyKit Auth\nExec=/usr/bin/lxpolkit\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true\nStartupNotify=false" > /etc/xdg/autostart/polkit-gnome-auth.desktop && \
     # D-Bus session autostart
     printf "[Desktop Entry]\nType=Application\nName=D-Bus Session\nExec=/usr/bin/dbus-launch --sh-syntax\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true" > /etc/xdg/autostart/dbus-session.desktop && \
     # PolicyKit daemon autostart
-    printf "[Desktop Entry]\nType=Application\nName=PolicyKit Daemon\nExec=/usr/lib/policykit-1/polkitd --no-debug\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true" > /etc/xdg/autostart/polkitd.desktop && \
+    printf "[Desktop Entry]\nType=Application\nName=PolicyKit Daemon\nExec=/usr/lib/polkit-1/polkitd --no-debug\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true" > /etc/xdg/autostart/polkitd.desktop && \
     # Fcitx5 autostart
     printf '[Desktop Entry]\nType=Application\nName=Fcitx 5\nComment=Input Method Framework\nExec=fcitx5 -d --replace\nIcon=fcitx5\nStartupNotify=false\nTerminal=false\nCategories=System;Utility;\nX-GNOME-Autostart-enabled=true\nX-XFCE-Autostart-enabled=true' > /etc/xdg/autostart/fcitx5.desktop && \
     # 创建用户运行时目录
@@ -534,9 +536,9 @@ COPY firefox.cfg /usr/lib/firefox-esr/firefox.cfg
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential curl git util-linux jq sudo fonts-noto-cjk fonts-noto-color-emoji \
-    systemd ca-certificates chrony r-base software-properties-common \
+    systemd ca-certificates chrony r-base \
     libzmq3-dev libzmq5 pkg-config && \
-    # 使用 Debian 12 默认的 Python 3.11 (更稳定)
+    # 使用 Debian 13 (trixie) 默认的 Python 3.13
     apt-get install -y python3 python3-dev python3-venv python3-pip && \
     ln -sf /usr/bin/python3 /usr/bin/python && \
     # Python/Jupyter services and kernels removed, but Python3 environment kept
@@ -545,10 +547,10 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     apt-get autoclean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Python 版本契约：本镜像与 app-runtime 统一 rust:bookworm 基底（原生 python 3.11
-# 双侧同 ABI）——builder pip 装的 wheel 在运行容器原生可载。曾用
-# python-build-standalone 3.13 叠层对齐 trixie 运行时，随 app-runtime 回迁
-# bookworm 一并撤销（wheel ABI 跨次版本互不兼容，双侧同版本是唯一稳定契约）。
+# Python 版本契约：本镜像与 app-runtime 统一 rust:trixie 基底（原生 python 3.13
+# 双侧同 ABI，cp313 ↔ cp313）——builder pip 装的 wheel 在运行容器原生可载。
+# 沿革：bookworm 原生 3.11（6101bc0 统一）→ 2026-09 整批升 trixie 原生 3.13。
+# （wheel ABI 跨次版本互不兼容，双侧同发行版同原生版本是唯一稳定契约。）
 
 # 安装 Node.js 22.x (现在支持，因为不再依赖 ijavascript)
 RUN apt-get update && \
@@ -628,27 +630,20 @@ RUN echo '[Service]\n\
 
 RUN systemctl enable chrony
 
-# Java 配置 (完整 JDK 工具集) —— Adoptium Temurin 25 LTS
-# bookworm 官方仓库只有 openjdk-17；升级到 25 经 Adoptium apt repo（Temurin 25 LTS）。
-# 与 app-runtime 运行时镜像（openjdk-25）对齐，使 builder 能编译 target=25 的项目（否则 mvn 报
-# "release version 25 not supported"）。VERSION_CODENAME 在 bookworm 上解析为 bookworm，Adoptium 支持。
+# Java 配置 (完整 JDK 工具集) —— openjdk-25（trixie 官方仓库原生提供）
+# （bookworm 时代 openjdk-25 缺位，曾走 Adoptium Temurin apt 源；trixie 起回归一行安装，
+#   与 app-runtime 运行时同源同版，builder 可编译 target=25 的项目。）
 RUN apt-get update && \
-    apt-get install -y wget apt-transport-https gpg ca-certificates && \
-    wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \
-        | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(awk -F= '/VERSION_CODENAME/{print $2}' /etc/os-release) main" \
-        > /etc/apt/sources.list.d/adoptium.list && \
-    apt-get update && \
-    apt-get install -y temurin-25-jdk && \
+    apt-get install -y openjdk-25-jdk && \
     # 双架构统一 JAVA_HOME：建 -current 软链（与 app-runtime 写法一致）
     ARCH=$(dpkg --print-architecture) && \
-    ln -sf /usr/lib/jvm/temurin-25-jdk-${ARCH} /usr/lib/jvm/temurin-25-jdk-current && \
+    ln -sf /usr/lib/jvm/java-25-openjdk-${ARCH} /usr/lib/jvm/java-25-openjdk-current && \
     # 验证安装
     java -version && \
     javac -version && \
-    echo "✅ Temurin 25 installed with full toolset" && \
+    echo "✅ openjdk-25 installed with full toolset" && \
     rm -rf /var/lib/apt/lists/*
-ENV JAVA_HOME=/usr/lib/jvm/temurin-25-jdk-current
+ENV JAVA_HOME=/usr/lib/jvm/java-25-openjdk-current
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 # ============================================================================
@@ -703,8 +698,8 @@ RUN mkdir -p /etc/dbus-1/session.d && \
     printf '<!-- Allow root to access user session bus for fcitx5 input method -->\n<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">\n<busconfig>\n  <policy user="root">\n    <allow own="*"/>\n    <allow own_prefix="*"/>\n    <allow send_destination="*"/>\n    <allow receive_sender="*"/>\n    <allow eavesdrop="true"/>\n  </policy>\n</busconfig>' > /etc/dbus-1/session.d/allow-root.conf && \
     # Set proper permissions
     chown -R root:root /etc/polkit-1 /etc/dbus-1 && \
-    chmod 755 /etc/polkit-1/localauthority/50-local.d /etc/dbus-1/session.d && \
-    chmod 644 /etc/polkit-1/localauthority/50-local.d/*.pkla /etc/dbus-1/session.d/*.conf
+    chmod 755 /etc/polkit-1/rules.d /etc/dbus-1/session.d && \
+    chmod 644 /etc/polkit-1/rules.d/*.rules /etc/dbus-1/session.d/*.conf
 
 # 安装 agent_runner 运行时依赖（与 rcoder/Dockerfile-runner 保持一致）
 RUN apt-get update && apt-get install -y \
@@ -779,8 +774,8 @@ RUN npm install -g @zed-industries/claude-code-acp@latest && \
 #     echo "✅ Playwright Chromium installed"
 
 # 安装 OpenSSL 开发包和构建依赖（mcp-stdio-proxy 需要）
-# Rust 工具链已由 rust:bookworm 镜像提供 (cargo 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo, 已在 PATH)。
-# libssl-dev / pkg-config / build-essential 构成 已由 rust:bookworm (buildpack-deps) 预装, 不再单独 apt 装
+# Rust 工具链已由 rust:trixie 镜像提供 (cargo 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo, 已在 PATH)。
+# libssl-dev / pkg-config / build-essential 构成 已由 rust:trixie (buildpack-deps) 预装, 不再单独 apt 装
 # (原此处 apt 装 libssl-dev/pkg-config/build-essential + rustup 安装, 均已冗余, 删除)。
 # cargo 镜像配置 (rsproxy-sparse) 写到 /usr/local/cargo/config.toml; runtime UserApp build 走加速源。
 # heredoc 内联生成, 仓库不携带 .cargo/config.toml（项目级 cargo 源配置会与全局配置撞 URL 导致 Docker 构建失败）
@@ -838,7 +833,7 @@ RUN pip3 install --break-system-packages --no-cache-dir -i https://mirrors.aliyu
 # - /root/.local/bin: root 用户使用 uv tool install 时的可执行文件位置
 # - /home/user/.local/bin: user 用户使用 uv tool install 时的可执行文件位置
 # - /usr/local/bin: 系统级工具（bun, uv, pnpm 等）
-# 注: Rust cargo 在 /usr/local/cargo/bin, 由 rust:bookworm 的 ${PATH} 继承, 不在此显式列出
+# 注: Rust cargo 在 /usr/local/cargo/bin, 由 rust:trixie 的 ${PATH} 继承, 不在此显式列出
 ENV PNPM_HOME="/home/user/.local/share/pnpm" \
     PATH="/root/.local/bin:/home/user/.local/bin:/usr/local/bin:${PATH}"
 
@@ -962,7 +957,7 @@ RUN mkdir -p /usr/local/share/ttyd
 RUN install -d /etc/apt/keyrings && \
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
         -o /etc/apt/keyrings/postgresql.asc && \
-    echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+    echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] http://apt.postgresql.org/pub/repos/apt trixie-pgdg main" \
         > /etc/apt/sources.list.d/pgdg.list && \
     apt-get update && \
     apt-get install -y postgresql-16 && \
@@ -993,7 +988,7 @@ ENV AGENT_RUNNER_PORT=8086
 # 设置默认工作目录
 WORKDIR /home/user
 
-# ── Go 工具链（UserApp 多语言模板构建；rust:bookworm 基底不含 go）─────────────
+# ── Go 工具链（UserApp 多语言模板构建；rust:trixie 基底不含 go）─────────────
 # 模板 backend-go 要求 go 1.26（apt bookworm 的 golang-go 1.19 不满足），用官方
 # tarball 装最新稳定版；GOPROXY 走国内镜像（与 pip/npm 同策略）。
 ARG GO_VERSION=1.26.4

@@ -6,14 +6,14 @@
 # 平时不需要重新构建，只有在修改系统依赖时才需要重新构建
 # ============================================================================
 
-FROM rust:bookworm
+FROM rust:trixie
 
 # 设置环境变量
 ENV TZ=Asia/Shanghai
 
 # 使用 LinuxMirrors 一键配置阿里云镜像源
 # 参考: https://github.com/SuperManito/LinuxMirrors
-# rust:bookworm (基于 buildpack-deps) 已预装 curl，可直接执行脚本配置镜像源
+# rust:trixie (基于 buildpack-deps) 已预装 curl，可直接执行脚本配置镜像源
 RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --source mirrors.aliyun.com \
     --protocol https \
@@ -25,7 +25,7 @@ RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --ignore-backup-tips
 
 # 安装必要的运行时依赖（apt 包管理器）
-# ca-certificates / curl / wget / gnupg / unzip 已由 rust:bookworm (buildpack-deps) 预装, 不重装
+# ca-certificates / curl / wget / gnupg / unzip 已由 rust:trixie (buildpack-deps) 预装, 不重装
 RUN apt-get update && apt-get install -y \
     zip \
     tzdata \
@@ -44,7 +44,7 @@ RUN apt-get update && apt-get install -y \
     && echo $TZ > /etc/timezone
 
 # ============================================================================
-# 安装 Node.js 22.x + npm (rust:bookworm 不带 Node, 手动装; NodeSource 套路, 与 agent-runner 统一)
+# 安装 Node.js 22.x + npm (rust:trixie 不带 Node, 手动装; NodeSource 套路, 与 agent-runner 统一)
 # npm install -g yarn: node:22 原捆绑 yarn, NodeSource 的 Node 不带, 单独装回 (yarn config 需要)
 # ============================================================================
 RUN apt-get update && \
@@ -56,7 +56,7 @@ RUN apt-get update && \
     update-ca-certificates && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Rust cargo 国内镜像配置 (rsproxy-sparse); rust:bookworm CARGO_HOME=/usr/local/cargo, dev 容器 cargo run/build 走加速源
+# Rust cargo 国内镜像配置 (rsproxy-sparse); rust:trixie CARGO_HOME=/usr/local/cargo, dev 容器 cargo run/build 走加速源
 # heredoc 内联生成, 仓库不携带 .cargo/config.toml（项目级 cargo 源配置会与全局配置撞 URL 导致 Docker 构建失败）
 COPY <<'EOF' /usr/local/cargo/config.toml
 [source.crates-io]
@@ -140,7 +140,7 @@ RUN echo '[install]' > /root/.bunfig.toml && \
     # 运行时 bunx @upstash/context7-mcp 会命中 ~/.bun/install/global 全局缓存，无需再下载
     echo '"@upstash" = "https://registry.npmmirror.com"' >> /root/.bunfig.toml
 
-# 安装 python3-pip（rust:bookworm 基础镜像默认不带 Python，用 pip 装 uv 需要先安装）
+# 安装 python3-pip（rust:trixie 基础镜像默认不带 Python，用 pip 装 uv 需要先安装；trixie 原生为 3.13）
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 

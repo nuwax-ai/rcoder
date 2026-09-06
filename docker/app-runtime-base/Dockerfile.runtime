@@ -4,11 +4,11 @@
 # 合并原 Dockerfile.{node,python,java,go,rust} 为单镜像 —— 用户部署任意语言应用，
 # workspace 多语言项目（前端+后端不同语言）可同容器运行，不再按语言拆镜像。
 #
-# 基础设施 + Rust（rust:bookworm）继承自 app-runtime-base（Dockerfile）。本层补 Node/Python/Java/Go。
+# 基础设施 + Rust（rust:trixie，随 tag 浮动）继承自 app-runtime-base（Dockerfile）。本层补 Node/Python/Java/Go。
 # ENTRYPOINT=start-app.sh（base 继承），UserApp command 覆盖 CMD 作 args 传入。
 #
-# ⚠️ Python 版本契约：与 agent-runner builder 镜像统一 rust:bookworm（原生 3.11
-# 双侧同 ABI）——builder pip 装的 wheel 在本运行时原生可载（cp311 ↔ cp311）。
+# ⚠️ Python 版本契约：与 agent-runner builder 镜像统一 rust:trixie（原生 3.13
+# 双侧同 ABI）——builder pip 装的 wheel 在本运行时原生可载（cp313 ↔ cp313）。
 # ⚠️ 镜像体积：Rust(~1.5G,来自 base)+Go+JDK+Python+Node，约 4-5GB —— 全语言自由的代价。
 ARG BASE_IMAGE=app-runtime-base:latest
 FROM ${BASE_IMAGE}
@@ -33,7 +33,7 @@ ENV DBX_WEB_URL=http://localhost:4224
 COPY --from=denoland/deno:bin-2.5.6 /deno /usr/local/bin/deno
 RUN chmod +x /usr/local/bin/deno && rm -rf /root/.cache/deno
 
-# ── Python（Debian bookworm 自带 3.11）+ uv ───────────────────────────────────
+# ── Python（Debian trixie 自带 3.13）+ uv ────────────────────────────────────
 # uv（Astral 极速 Python 包管理器，最新版）经 pip 装到 /usr/local/bin，在默认 PATH。
 RUN apt-get update && apt-get install -y \
        python3 \
@@ -42,28 +42,21 @@ RUN apt-get update && apt-get install -y \
        python3-dev \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/bin/python \
-    && pip3 install --no-cache-dir --break-system-packages pip setuptools wheel virtualenv uv
+    && pip3 install --no-cache-dir --break-system-packages --ignore-installed pip setuptools wheel virtualenv uv
 
-# ── Java (Temurin 25 LTS + Maven + Gradle + Arthas) ─────────────────────────
-# bookworm 官方仓库无 openjdk-25（trixie 才有）——经 Adoptium apt repo 装
-# Temurin 25（与 agent-runner builder 的 JDK 段同源同版，builder 编 target=25
-# 与运行时 25 对齐；块照搬自 rcoder-agent-runner/Dockerfile.base 已验证实现）。
+# ── Java (openjdk-25 + Maven + Gradle + Arthas) ─────────────────────────────
+# trixie 官方仓库原生提供 openjdk-25（bookworm 时代缺位曾走 Adoptium Temurin 源；
+# 与 agent-runner builder 的 JDK 段同源同版，builder 编 target=25 与运行时 25 对齐）。
 RUN apt-get update && \
-    apt-get install -y wget apt-transport-https gpg ca-certificates maven gradle && \
-    wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \
-        | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(awk -F= '/VERSION_CODENAME/{print $2}' /etc/os-release) main" \
-        > /etc/apt/sources.list.d/adoptium.list && \
-    apt-get update && \
-    apt-get install -y temurin-25-jdk && \
+    apt-get install -y maven gradle openjdk-25-jdk && \
     ARCH=$(dpkg --print-architecture) && \
-    ln -sf /usr/lib/jvm/temurin-25-jdk-${ARCH} /usr/lib/jvm/temurin-25-jdk-current && \
+    ln -sf /usr/lib/jvm/java-25-openjdk-${ARCH} /usr/lib/jvm/java-25-openjdk-current && \
     java -version && javac -version && \
     rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://arthas.aliyun.com/arthas-boot.jar -o /usr/local/bin/arthas-boot.jar \
     && printf '#!/bin/bash\njava -jar /usr/local/bin/arthas-boot.jar "$@"\n' > /usr/local/bin/arthas \
     && chmod +x /usr/local/bin/arthas
-ENV JAVA_HOME=/usr/lib/jvm/temurin-25-jdk-current
+ENV JAVA_HOME=/usr/lib/jvm/java-25-openjdk-current
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 # ── Go ────────────────────────────────────────────────────────────────────────
@@ -74,7 +67,7 @@ RUN ARCH=$(dpkg --print-architecture) \
     && rm /tmp/go.tar.gz
 ENV GOPATH=/root/go
 
-# Rust 已在 app-runtime-base（rust:bookworm）层提供，cargo 在 PATH（base ENV 透传）。
+# Rust 已在 app-runtime-base（rust:trixie）层提供，cargo 在 PATH（base ENV 透传）。
 # 聚合 PATH：Go + Go bin（node 在 /usr/bin、python/java 在默认 PATH，无需追加）
 ENV PATH="/usr/local/go/bin:${GOPATH}/bin:${PATH}"
 

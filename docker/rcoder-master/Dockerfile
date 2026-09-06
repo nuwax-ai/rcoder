@@ -2,7 +2,7 @@
 # 最终镜像 Dockerfile - master-rcoder
 # ============================================================================
 # 此 Dockerfile 使用多阶段构建：
-# 1. 第一阶段：在 rust:bookworm 中构建 Rust 项目
+# 1. 第一阶段：在 rust:trixie 中构建 Rust 项目
 # 2. 第二阶段：基于 master-rcoder-base 基础镜像运行
 # ============================================================================
 
@@ -12,7 +12,7 @@ ARG BASE_IMAGE=dev-master-rcoder-base:latest
 # ============================================================================
 # 第一阶段：构建 Rust 项目
 # ============================================================================
-FROM rust:bookworm AS rust-builder
+FROM rust:trixie AS rust-builder
 
 # 设置环境变量避免交互式提示
 ENV DEBIAN_FRONTEND=noninteractive
@@ -37,7 +37,7 @@ RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --ignore-backup-tips
 
 # 安装 Rust 构建所需的额外系统依赖
-# rust:bookworm (= buildpack-deps:bookworm 完整版) 已预装 build-essential / libssl-dev / git / curl 等,
+# rust:trixie (= buildpack-deps:trixie 完整版) 已预装 build-essential / libssl-dev / git / curl 等,
 # 这里补镜像里没有的: cmake + protobuf (rcoder/agent_runner/file-server gRPC 依赖); pkg-config 保留兜底
 RUN apt-get update && apt-get install -y \
     cmake \
@@ -46,7 +46,7 @@ RUN apt-get update && apt-get install -y \
     libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust 工具链已由 rust:bookworm 镜像提供 (cargo 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo, 已在 PATH)。
+# Rust 工具链已由 rust:trixie 镜像提供 (cargo 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo, 已在 PATH)。
 # builder 阶段 cargo 镜像 (rsproxy-sparse) 写到 /usr/local/cargo/config.toml 生效
 # (仓库根 .cargo/config.toml 为空, 故用 printf 内联生成, 不污染宿主)
 RUN mkdir -p /usr/local/cargo && \
@@ -88,7 +88,7 @@ RUN apt-get update && apt-get install -y \
 # 复制 .npmrc 文件
 COPY docker/rcoder-master/.npmrc /root/.npmrc
 
-# Rust 工具链 + cargo rsproxy 配置 已由 base (rust:bookworm) 提供:
+# Rust 工具链 + cargo rsproxy 配置 已由 base (rust:trixie) 提供:
 # cargo 在 /usr/local/cargo/bin, config 在 /usr/local/cargo/config.toml (base COPY)。
 # dev 容器 cargo run/build 直接可用, 不再单独 rustup 安装。
 

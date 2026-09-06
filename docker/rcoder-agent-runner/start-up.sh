@@ -965,7 +965,7 @@ function start_display_and_desktop() {
 		fi
 
 		log "Starting PolicyKit daemon..."
-		/usr/lib/policykit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
+		/usr/lib/polkit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
 
 		if wait_for_process "polkitd" 5; then
 			log_success "PolicyKit daemon started"
@@ -1045,7 +1045,7 @@ function start_display_and_desktop() {
 	gnome-keyring-daemon --start --components=secrets,ssh,pkcs11 >/dev/null 2>&1 &
 
 	# 启动 PolicyKit 认证代理
-	/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1 >/var/log/polkit-agent.log 2>&1 &
+	/usr/bin/lxpolkit >/var/log/polkit-agent.log 2>&1 &
 
 	# 等待 gnome-keyring-daemon 启动（智能等待，最长 2 秒）
 	wait_for_process_pattern "gnome-keyring-daemon" 2 || true
