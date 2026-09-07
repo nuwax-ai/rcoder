@@ -19,9 +19,8 @@ use shared_types::grpc::{
     CheckAgentResponse as ProtoCheckAgentResponse, GetAgentRequest, GetAgentResponse,
     InstallAgentRequest, InstallAgentResponse as ProtoInstallAgentResponse,
     InstallType as ProtoInstallType, ListAgentsRequest as ProtoListAgentsRequest,
-    ListAgentsResponse as ProtoListAgentsResponse, StaticCheckResult,
-    SystemInfo as ProtoSystemInfo, UninstallAgentRequest,
-    UninstallAgentResponse as ProtoUninstallResponse,
+    ListAgentsResponse as ProtoListAgentsResponse, SystemInfo as ProtoSystemInfo,
+    UninstallAgentRequest, UninstallAgentResponse as ProtoUninstallResponse,
     install_agent_request::Metadata as InstallMetadata,
 };
 use shared_types::{
@@ -457,9 +456,6 @@ fn agent_install_status_from_proto_i32(v: i32) -> AgentInstallStatus {
         _ => AgentInstallStatus::NotInstalled,
     }
 }
-
-#[allow(dead_code)]
-fn _ensure_used(_: &StaticCheckResult, _: &ProtoInstallType, _: &ProtoAgentInstallStatus) {}
 
 #[cfg(test)]
 mod tests {

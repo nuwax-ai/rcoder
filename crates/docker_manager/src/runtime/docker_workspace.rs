@@ -69,24 +69,49 @@ impl WorkspaceRuntime for DockerRuntime {
         }
         let prod_root =
             std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join("prod");
-        if prod_root.is_dir() {
-            let uid_entries = std::fs::read_dir(&prod_root)
-                .map_err(|e| {
-                    ContainerRuntimeError::DockerError(format!(
-                        "destroy_app_pvc: read_dir {}: {e}",
-                        prod_root.display()
-                    ))
-                })?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect::<Vec<_>>();
+        // 全段走 tokio::fs：本函数是 async fn 且下方删除已是 remove_dir_all().await，
+        // 混用阻塞 std::fs 会占住 tokio worker 线程。错误处理对齐同文件
+        // scan_dev_workspace_identifiers —— 上抛而非静默跳过：漏扫某个 uid 目录会让
+        // 该 app 的 prod 目录悄悄逃过销毁，而本函数的语义是"删干净"。
+        if tokio::fs::metadata(&prod_root)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            let mut rd = tokio::fs::read_dir(&prod_root).await.map_err(|e| {
+                ContainerRuntimeError::DockerError(format!(
+                    "destroy_app_pvc: read_dir {}: {e}",
+                    prod_root.display()
+                ))
+            })?;
+            let mut uid_entries = Vec::new();
+            loop {
+                let entry = match rd.next_entry().await {
+                    Ok(Some(e)) => e,
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err(ContainerRuntimeError::DockerError(format!(
+                            "destroy_app_pvc: iterate {}: {e}",
+                            prod_root.display()
+                        )));
+                    }
+                };
+                // file_type() 走 readdir 的 d_type，不额外 stat
+                if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                    uid_entries.push(entry.file_name().to_string_lossy().to_string());
+                }
+            }
             for uid in uid_entries {
                 for sub in shared_types::paths::userapp_prod_subpaths(&uid, app_id) {
                     let dir =
                         std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
                             .join(&sub);
-                    if dir.exists() {
+                    if tokio::fs::try_exists(&dir).await.map_err(|e| {
+                        ContainerRuntimeError::DockerError(format!(
+                            "destroy_app_pvc: stat {}: {e}",
+                            dir.display()
+                        ))
+                    })? {
                         tokio::fs::remove_dir_all(&dir).await.map_err(|e| {
                             ContainerRuntimeError::DockerError(format!(
                                 "destroy_app_pvc: remove {}: {}",
@@ -104,7 +129,12 @@ impl WorkspaceRuntime for DockerRuntime {
         let ws_root = std::env::var("RCODER_WORKSPACE_ROOT")
             .unwrap_or_else(|_| "/app/project_workspace/apps".to_string());
         let legacy_dir = std::path::Path::new(&ws_root).join(app_id);
-        if legacy_dir.exists() {
+        if tokio::fs::try_exists(&legacy_dir).await.map_err(|e| {
+            ContainerRuntimeError::DockerError(format!(
+                "destroy_app_pvc: stat legacy {}: {e}",
+                legacy_dir.display()
+            ))
+        })? {
             tokio::fs::remove_dir_all(&legacy_dir).await.map_err(|e| {
                 ContainerRuntimeError::DockerError(format!(
                     "destroy_app_pvc: remove legacy {}: {}",

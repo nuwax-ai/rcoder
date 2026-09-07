@@ -5,4 +5,18 @@ ignore = [
     # 传递链，pingora 上游最新即 0.8.1 无可升级路径（2026-09 拍板搁置）；
     # prometheus 仅在指标 encode 方向使用 protobuf、攻击面窄。pingora 升级后移除本条。
     "RUSTSEC-2024-0437",
+    # bitmaps 3.2.1（RUSTSEC-2025-0167 unsound: Bitmap::try_from(&[u8]) 可构造非法值）
+    # 经 imbl 7.0.1 → shared_types 传入；imbl 上游最新即 7.0.1 无可升级路径。
+    # 攻击面: 漏洞 API 在整条链上零调用——imbl 与其 imbl-sized-chunks 只使用
+    # Bitmap<GROUP_WIDTH> 常量泛型及 Bits/BitsImpl trait（hamt.rs:13,27），bitmap
+    # 位由内部 hash 位派生，从不接收外部字节切片。imbl 升级后移除本条。
+    # 注: bitmaps 另有一条 unmaintained 通告 RUSTSEC-2026-0247，属观察档、不豁免。
+    "RUSTSEC-2025-0167",
+    # lru 0.16.4（RUSTSEC-2026-0253 unsound: LruCache::pop() 缺 panic safety 致 UAF）
+    # 经 pingora-cache/pingora-pool 0.8.1 → pingora 0.8.1 锁死，与 protobuf 同根因、
+    # 上游最新无可升级路径。注意 lru 0.18.2 另由 ratatui 引入，那个版本不受影响。
+    # 攻击面: 漏洞 API 在整条链上零调用——pingora-cache/pool/core/proxy 对 LruCache
+    # 只用 unbounded()/iter_mut()/get/put（hashtable.rs、lru.rs:113），从不调 pop()。
+    # pingora 升级后移除本条。
+    "RUSTSEC-2026-0253",
 ]

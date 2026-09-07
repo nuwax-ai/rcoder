@@ -77,6 +77,17 @@ ignore = [
     # 传递链，pingora 上游最新即 0.8.1 无可升级路径（2026-09 拍板搁置）；
     # prometheus 仅在指标 encode 方向使用 protobuf、攻击面窄。pingora 升级后移除本条。
     { id = "RUSTSEC-2024-0437", reason = "protobuf 2.28 locked by prometheus 0.13.4 via pingora 0.8.1 (latest upstream); prometheus only encodes metrics with it - narrow attack surface. Remove when pingora ships an upgrade." },
+    # bitmaps 3.2.1（RUSTSEC-2025-0167 unsound: Bitmap::try_from(&[u8]) 可构造非法值）
+    # 经 imbl 7.0.1 → shared_types 传入，imbl 上游最新即 7.0.1 无升级路径；
+    # 漏洞 API 在整条链上零调用（imbl/imbl-sized-chunks 只用 Bitmap<GROUP_WIDTH>
+    # 常量泛型与 Bits/BitsImpl trait，位由内部 hash 派生，不接收外部字节）。
+    # 注: bitmaps 另有 unmaintained 通告 RUSTSEC-2026-0247，属观察档、不豁免。
+    { id = "RUSTSEC-2025-0167", reason = "bitmaps 3.2.1 via imbl 7.0.1 (latest upstream) <- shared_types; vulnerable Bitmap::try_from(&[u8]) is never called - imbl only uses const-generic Bitmap<GROUP_WIDTH> + Bits traits with internally derived hash bits. Remove when imbl ships an upgrade." },
+    # lru 0.16.4（RUSTSEC-2026-0253 unsound: LruCache::pop() 缺 panic safety 致 UAF）
+    # 经 pingora-cache/pingora-pool 0.8.1 → pingora 0.8.1 锁死，与 protobuf 同根因；
+    # 漏洞 API 在整条链上零调用（pingora 系只用 unbounded()/iter_mut()/get/put）。
+    # 注意 lru 0.18.2 另由 ratatui 引入，该版本不受影响。
+    { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 locked by pingora-cache/pingora-pool 0.8.1 (latest upstream); vulnerable LruCache::pop() is never called - pingora only uses unbounded()/iter_mut()/get/put. lru 0.18.2 from ratatui is unaffected. Remove when pingora ships an upgrade." },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

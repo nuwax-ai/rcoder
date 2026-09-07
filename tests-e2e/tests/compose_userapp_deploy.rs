@@ -1139,30 +1139,14 @@ async fn userapp_deploy_full_chain() {
             fetch_and_verify_artifact(&env, &report, &app, user, &release_id, &sha256).await
     {
         // ⑤ 部署 + 七路流量 ⑤b prod 观测族 ⑥ 回收
-        deploy_and_verify_traffic(
-            &env,
-            &report,
-            &app,
-            user,
-            &release_id,
-            &sha256,
-        )
-        .await;
+        deploy_and_verify_traffic(&env, &report, &app, user, &release_id, &sha256).await;
         verify_prod_observability(&env, &report, &app, user).await;
         // 运行态扩展。顺序敏感：热部署（C5）须在 db prod 改密（C3）之前——
         // 实测抓到产品缺陷 28P01 auth_failed：reset-password 改 PG 密码后
         // 热部署重新编排的 migrate 用旧凭据连 PG 被拒（db 管理与部署链
         // 凭据不同步，待产品层修复；测试顺序规避并锁现状）
         verify_app_files_prod(&env, &report, &app, user).await;
-        verify_hot_redeploy(
-            &env,
-            &report,
-            &app,
-            user,
-            &release_id,
-            &sha256,
-        )
-        .await;
+        verify_hot_redeploy(&env, &report, &app, user, &release_id, &sha256).await;
         verify_db_prod(&env, &report, &app, user).await;
         verify_stop_and_wake(&env, &report, &app, user).await;
         cleanup_prod(&env, &report, &app, user).await;

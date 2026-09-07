@@ -19,8 +19,9 @@ use crate::userapp_recycle;
 
 #[allow(dead_code)]
 pub struct BackgroundTaskHandles {
+    /// 以下四个单实例语义句柄：memory 模式为本层直接拉起的任务；
+    /// PG 模式恒为 None，实际句柄由 leader 监督任务按 leadership 代际持有（见 pg_leader_handle）。
     pub cleanup_handle: TaskHandle,
-    /// PG 模式下由 leader 监督任务持有（此处为占位 pending task）
     pub status_checker_handle: TaskHandle,
     pub container_sync_handle: TaskHandle,
     pub userapp_recycle_handle: TaskHandle,
@@ -163,14 +164,9 @@ pub async fn start_all_background_tasks(
                 let leader_handle = tokio::spawn(async move {
                     run_leader_supervisor(election, config, state, shutdown_tx).await;
                 });
-                // 监督任务异步拉起子任务，直接句柄由 supervisor 持有
-                (
-                    None,
-                    Some(tokio::spawn(std::future::pending())),
-                    Some(tokio::spawn(std::future::pending())),
-                    None,
-                    Some(leader_handle),
-                )
+                // 监督任务异步拉起子任务，直接句柄由 supervisor 持有；
+                // 本层对应槽位置 None（不是占位 pending task，避免误导与白占 executor 槽）
+                (None, None, None, None, Some(leader_handle))
             }
             #[cfg(not(feature = "rcoder-pg"))]
             {

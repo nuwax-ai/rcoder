@@ -26,7 +26,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
             CONFIG_FILE
         );
         let default_config = AppConfig::default();
-        create_default_config_file(&default_config)?;
+        create_default_config_file()?;
         default_config
     };
 
@@ -232,7 +232,7 @@ pub fn load_api_key_config_from_file(
 }
 
 /// 创建默认配置文件
-fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
+fn create_default_config_file() -> anyhow::Result<()> {
     // 检查配置文件是否已存在
     if std::path::Path::new(CONFIG_FILE).exists() {
         return Ok(());
@@ -255,7 +255,10 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to write default config file: {}", e))?;
 
     info!("Created default config file: {}", CONFIG_FILE);
-    info!(" Loaded API Key (not set)");
+    info!(
+        "Generated a random API key into {} (not echoed to logs)",
+        CONFIG_FILE
+    );
     Ok(())
 }
 

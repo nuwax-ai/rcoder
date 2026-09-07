@@ -3,8 +3,8 @@
 #   拦截档（失败即红）: fmt / clippy -D warnings / vulnerability / 违禁许可证 / 未知来源
 #   观察档（只警告）: unmaintained 依赖、重复版本（bans.multiple-versions=warn）
 # 存量清理完后可将 audit 加 --deny-warnings、deny 的 bans 拉严。
-# 注意: 当前存在已知存量漏洞（h2/protobuf，见体检报告）——修复前本 CI 的
-# audit/deny 步骤会是红的；若需临时放行，给对应步骤加 continue-on-error: true。
+# audit/deny 当前均为绿灯；剩余的是观察档 warning（unmaintained / unsound 传递依赖），
+# 已拍板搁置的逐条登记在 .cargo/audit.toml 与 deny.toml 的 ignore（两处保持同步）。
 name: quality
 
 on:

@@ -127,6 +127,9 @@ pub async fn run_cli_command(action: &str, port: u16, api_key: Option<&str>) -> 
         Some(key) => request.header("x-api-key", key),
         None => request,
     };
+    // 共享 client 有意不设总超时(为 SSE 长连接让路)，短请求须由调用方自补；
+    // 否则 file-server 接受连接却不响应时本命令会永久挂起。
+    let request = request.timeout(std::time::Duration::from_secs(30));
 
     let resp = request.send().await.map_err(|e| {
         anyhow::anyhow!(

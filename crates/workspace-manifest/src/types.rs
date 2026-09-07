@@ -392,9 +392,8 @@ mod tests {
     /// 三态之一：devrun + devbuild → 执行 devbuild（显式检查/准备意图优先）。
     #[test]
     fn devbuild_argv_prefers_explicit_devbuild() {
-        let m = manifest(
-            "[devbuild]\ncommand = ['pnpm', 'type-check']\n[devrun]\ncommand = ['vite']",
-        );
+        let m =
+            manifest("[devbuild]\ncommand = ['pnpm', 'type-check']\n[devrun]\ncommand = ['vite']");
         assert_eq!(
             m.devbuild_argv().map(Vec::from),
             Some(vec!["pnpm".to_string(), "type-check".to_string()])
