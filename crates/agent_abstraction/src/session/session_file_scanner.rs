@@ -93,7 +93,7 @@ async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
 
     let mut session_ids = HashSet::new();
 
-    if !projects_dir.exists() {
+    if !tokio::fs::try_exists(&projects_dir).await.unwrap_or(false) {
         debug!(
             "[FILE_SCAN] Projects directory does not exist: {}",
             projects_dir.display()
@@ -169,6 +169,12 @@ async fn invalidate_project_cache(project_dir_name: &str) {
 /// 启动文件系统监听器
 ///
 /// 监听 ~/.claude/projects/ 目录的变化，当 .jsonl 文件创建/删除时刷新缓存
+///
+/// **刻意保持同步**（唯一调用方 `check_session_file_exists` 是 async fn）：
+/// `WATCHER_STARTED` 原子量守住「每进程只真正执行一次」，后续调用即 swap 快路径
+/// 直接返回；而首次执行的主要开销是 notify 的 OS watcher 注册与 `watch()`，二者
+/// 没有异步 API。改成 `async fn` 只能把两个 stat/mkdir 挪走、真正阻塞的部分仍在，
+/// 签名反而误导。故此处不按「async 内不得阻塞 IO」改造。
 pub fn start_file_watcher() {
     // 确保只启动一次
     if WATCHER_STARTED.swap(true, Ordering::SeqCst) {

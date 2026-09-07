@@ -28,7 +28,7 @@ pub async fn install_project_core(
     ws: PathBuf,
     programming_language: &str,
 ) -> Result<InstalledProject, AppError> {
-    if !ws.exists() {
+    if !tokio::fs::try_exists(&ws).await.unwrap_or(false) {
         return Err(AppError::resource("workspace does not exist"));
     }
     let lang = programming_language.to_ascii_lowercase();

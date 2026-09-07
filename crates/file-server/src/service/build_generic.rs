@@ -79,7 +79,7 @@ pub async fn build_generic(
 
     // 校验产物
     let artifact = req.cwd.join(req.artifact_rel);
-    if !artifact.exists() {
+    if !tokio::fs::try_exists(&artifact).await.unwrap_or(false) {
         return Err(AppError::business(format!(
             "build produced no artifact: {} (cwd={})",
             req.artifact_rel,

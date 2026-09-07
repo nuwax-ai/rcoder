@@ -161,7 +161,9 @@ async fn run_inner(
                 &args.workspace,
                 &args.log_dir,
                 &release.release_id,
-            ) {
+            )
+            .await
+            {
                 Ok(child) => {
                     children.push((spec.service_id.clone(), child));
                     started_user_services += 1;
@@ -526,7 +528,7 @@ fn effective_run_argv(spec: &ServiceSpec, dev_profile: bool) -> &[String] {
     &spec.run.command
 }
 
-fn start_service(
+async fn start_service(
     spec: &ServiceSpec,
     argv: &[String],
     ws_root: &Path,
@@ -535,7 +537,8 @@ fn start_service(
 ) -> Result<Child> {
     let cwd = ws_root.join(&spec.dir);
     let service_log_dir = log_dir.join(&spec.service_id);
-    std::fs::create_dir_all(&service_log_dir)
+    tokio::fs::create_dir_all(&service_log_dir)
+        .await
         .with_context(|| format!("create service log dir {}", service_log_dir.display()))?;
     let out_path = service_log_dir.join("runtime.out.log");
     let err_path = service_log_dir.join("runtime.err.log");

@@ -118,7 +118,7 @@ pub async fn install_from_bytes(
     };
 
     // 只删除特定版本目录，不影响其他版本
-    if version_dir.exists()
+    if tokio::fs::try_exists(&version_dir).await.unwrap_or(false)
         && let Err(e) = tokio::fs::remove_dir_all(&version_dir).await
     {
         warn!(

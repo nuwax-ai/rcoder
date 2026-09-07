@@ -20,7 +20,7 @@ pub async fn execute_command_core(
     cwd: PathBuf,
     command: &str,
 ) -> Result<CaptureResult, AppError> {
-    if !cwd.exists() {
+    if !tokio::fs::try_exists(&cwd).await.unwrap_or(false) {
         return Err(AppError::resource("workspace does not exist"));
     }
     let timeout_secs = state.config.dev_command_timeout_secs;
@@ -79,7 +79,7 @@ pub async fn get_logs_core(
     log_dir: PathBuf,
     tail_lines: usize,
 ) -> Result<LogsOutcome, AppError> {
-    if !log_dir.exists() {
+    if !tokio::fs::try_exists(&log_dir).await.unwrap_or(false) {
         return Ok(LogsOutcome::Empty {
             reason: "Log directory does not exist",
         });

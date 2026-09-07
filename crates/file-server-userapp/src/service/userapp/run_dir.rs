@@ -25,8 +25,15 @@ pub const STAGING_DIR: &str = ".staging";
 /// 返回 `.run` 绝对路径。任何一步失败：`.run` 不动（旧版照常可跑），
 /// staging 残留留给 hygiene 清理。
 pub async fn prepare_run_dir(ws: &Path, release_id: &str) -> AppResult<PathBuf> {
+    // 全段走 tokio::fs（含存在性判断）：阻塞的 Path::is_file()/exists() 会占住 tokio
+    // worker，而本函数是每次 dev 部署都走的路径。unwrap_or(false) 对齐 Path 方法遇错
+    // 返回 false 的语义，各分支成败判定不变。
     let zip_path = ws.join(workspace_artifact_rel_path(release_id));
-    if !zip_path.is_file() {
+    if !tokio::fs::metadata(&zip_path)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
         return Err(AppError::resource(format!(
             "deploy package missing: {} (release_id={release_id})",
             zip_path.display()
@@ -34,7 +41,7 @@ pub async fn prepare_run_dir(ws: &Path, release_id: &str) -> AppResult<PathBuf> 
     }
     // 幂等：同 release_id 重复部署先清旧 staging
     let staging = ws.join(STAGING_DIR).join(release_id);
-    if staging.exists() {
+    if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
         tokio::fs::remove_dir_all(&staging).await.map_err(|e| {
             AppError::system(format!("clean stale staging {}: {e}", staging.display()))
         })?;
@@ -43,7 +50,12 @@ pub async fn prepare_run_dir(ws: &Path, release_id: &str) -> AppResult<PathBuf> 
 
     // 校验解压物：workspace 与 release lock 双要件（app-cli 硬依赖）。
     for required in ["workspace.manifest.toml", "release.lock.toml"] {
-        if !staging.join(required).is_file() {
+        let required_path = staging.join(required);
+        if !tokio::fs::metadata(&required_path)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
             return Err(AppError::business(format!(
                 "deploy package missing {required} at zip root (release_id={release_id})"
             )));
@@ -53,8 +65,8 @@ pub async fn prepare_run_dir(ws: &Path, release_id: &str) -> AppResult<PathBuf> 
     // 原子换入：旧 .run → .previous（覆盖删旧），staging → .run。
     let run = ws.join(RUN_DIR);
     let previous = ws.join(PREVIOUS_DIR);
-    if run.exists() {
-        if previous.exists() {
+    if tokio::fs::try_exists(&run).await.unwrap_or(false) {
+        if tokio::fs::try_exists(&previous).await.unwrap_or(false) {
             tokio::fs::remove_dir_all(&previous)
                 .await
                 .map_err(|e| AppError::system(format!("remove old {}: {e}", previous.display())))?;

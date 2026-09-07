@@ -127,7 +127,9 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
     info!("Projects directory: {:?}", config.projects_dir);
 
     let config_file_path = std::path::PathBuf::from(crate::config::CONFIG_FILE);
-    let config_watcher_enabled = config_file_path.exists();
+    let config_watcher_enabled = tokio::fs::try_exists(&config_file_path)
+        .await
+        .unwrap_or(false);
 
     Ok(BootstrapResult {
         config,

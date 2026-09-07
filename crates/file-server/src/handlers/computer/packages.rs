@@ -46,7 +46,7 @@ pub(crate) async fn build_agent_package(
     Json(body): Json<BuildAgentBody>,
 ) -> Result<Json<Value>, AppError> {
     let ws = ws_path(&state, &body.user_id, &body.c_id).await?;
-    if !ws.exists() {
+    if !tokio::fs::try_exists(&ws).await.unwrap_or(false) {
         return Err(AppError::resource("workspace does not exist"));
     }
     // 递归找 scripts/package-platforms.mjs 所在目录 (对齐 nuwax findPackageScript;
@@ -107,7 +107,7 @@ pub(crate) async fn cleanup_build_artifacts(
         body.custom_target_dir.as_deref(),
     )
     .await?;
-    if !ws.exists() {
+    if !tokio::fs::try_exists(&ws).await.unwrap_or(false) {
         return Ok(Json(json!({ "success": true, "cleaned": false })));
     }
     let skip = package_build::package_search_skip_dirs(&state.config.zip_workspace_exclude);
@@ -116,7 +116,7 @@ pub(crate) async fn cleanup_build_artifacts(
         None => return Ok(Json(json!({ "success": true, "cleaned": false }))),
     };
     let dist = project_dir.join("dist-packages");
-    let cleaned = if dist.exists() {
+    let cleaned = if tokio::fs::try_exists(&dist).await.unwrap_or(false) {
         match tokio::fs::remove_dir_all(&dist).await {
             Ok(()) => true,
             Err(e) => {

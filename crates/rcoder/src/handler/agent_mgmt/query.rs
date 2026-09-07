@@ -79,7 +79,7 @@ pub async fn list_agents(
 
         if let Ok(install_ctx) = strategy.resolve_install_context(&project, &body.routing) {
             let registry_path = install_ctx.install_dir.join("registry.json");
-            if registry_path.exists() {
+            if tokio::fs::try_exists(&registry_path).await.unwrap_or(false) {
                 match read_registry_from_file(&registry_path).await {
                     Ok(resp) => return Ok(Json(HttpResult::success(resp))),
                     Err(e) => {

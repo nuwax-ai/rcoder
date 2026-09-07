@@ -196,7 +196,7 @@ impl crate::service::AppService {
         // "清空持久存储"语义的主体；owner 查元数据（元数据行在 clear 场景恒保留），
         // 缺失兜底 app_id（与 bind 源组装的兜底一致）。
         for dir in self.app_prod_dirs(app_id) {
-            if dir.exists()
+            if tokio::fs::try_exists(&dir).await.unwrap_or(false)
                 && let Err(e) = Self::purge_dir_contents(&dir).await
             {
                 return Err(map_io_error("failed to clear app storage", e, false));
@@ -382,7 +382,14 @@ impl crate::service::AppService {
         let mut rd = tokio::fs::read_dir(dir).await?;
         while let Some(entry) = rd.next_entry().await? {
             let p = entry.path();
-            if p.is_dir() {
+            // metadata 而非 entry.file_type()：前者跟随符号链接，与 Path::is_dir 语义
+            // 一致（链接指向目录时仍走 remove_dir_all 分支）；后者用 d_type 不跟随，
+            // 会把这类条目误判成文件。
+            if tokio::fs::metadata(&p)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
                 tokio::fs::remove_dir_all(&p).await?;
             } else {
                 tokio::fs::remove_file(&p).await?;

@@ -239,7 +239,10 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
                 state.set_phase(ServerPhase::Failed(format!("deploy env: {e:#}")));
             }
         }
-    } else if args.workspace.join("release.lock.toml").exists() {
+    } else if tokio::fs::try_exists(args.workspace.join("release.lock.toml"))
+        .await
+        .unwrap_or(false)
+    {
         tracing::info!(
             "server: release.lock exists without deploy env — orchestrating existing release"
         );

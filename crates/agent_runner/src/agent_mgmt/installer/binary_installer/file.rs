@@ -64,9 +64,13 @@ pub async fn install_from_file(
     // 2. 读取前 4 字节 magic bytes 检测文件类型
     let mut header = [0u8; 4];
     {
-        use std::io::Read;
-        let mut f = std::fs::File::open(download_path).map_err(AgentMgmtError::Io)?;
-        f.read_exact(&mut header).map_err(AgentMgmtError::Io)?;
+        use tokio::io::AsyncReadExt;
+        let mut f = tokio::fs::File::open(download_path)
+            .await
+            .map_err(AgentMgmtError::Io)?;
+        f.read_exact(&mut header)
+            .await
+            .map_err(AgentMgmtError::Io)?;
     }
     let file_type = detect_file_type(&header);
     if file_type != "tar.gz" && file_type != "zip" {
@@ -96,7 +100,7 @@ pub async fn install_from_file(
     };
 
     // 只删除特定版本目录，不影响其他版本
-    if version_dir.exists() {
+    if tokio::fs::try_exists(&version_dir).await.unwrap_or(false) {
         debug!("[agent_mgmt] install_from_file: removing existing version_dir");
         if let Err(e) = tokio::fs::remove_dir_all(&version_dir).await {
             warn!(

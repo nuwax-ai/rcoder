@@ -112,7 +112,7 @@ async fn upload_impl(
             tokio::fs::create_dir_all(&dest)
                 .await
                 .map_err(|e| AppError::system(format!("create extraction dir: {e}")))?;
-            ensure_within_root(&dest, root)?;
+            ensure_within_root(&dest, root).await?;
             let count = tokio::task::spawn_blocking({
                 let dest = dest.clone();
                 let archive = archive_path.to_path_buf();
@@ -147,7 +147,7 @@ async fn upload_impl(
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|e| AppError::system(format!("create parent dir: {e}")))?;
-                ensure_within_root(parent, root)?;
+                ensure_within_root(parent, root).await?;
             }
             tokio::fs::copy(archive_path, &file_path)
                 .await
@@ -229,11 +229,11 @@ pub(crate) async fn list(
 ) -> Result<Json<serde_json::Value>, AppError> {
     tracing::debug!(app_id = %params.app_id, user_id = %params.user_id, "app-files list");
     let root = resolve_userapp_dev(&params.app_id, None, &state.fs.config)?;
-    if !root.exists() {
+    if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
         return Ok(Json(json!({"success": true, "files": []})));
     }
-    let canonical_root = root
-        .canonicalize()
+    let canonical_root = tokio::fs::canonicalize(&root)
+        .await
         .map_err(|e| AppError::system(format!("resolve app root: {e}")))?;
     let sub = params
         .path
@@ -243,10 +243,10 @@ pub(crate) async fn list(
     let target_dir = match sub {
         Some(p) => {
             let full = root.join(p);
-            if !full.exists() {
+            if !tokio::fs::try_exists(&full).await.unwrap_or(false) {
                 return Ok(Json(json!({"success": true, "files": []})));
             }
-            ensure_within_root(&full, &canonical_root)?
+            ensure_within_root(&full, &canonical_root).await?
         }
         None => canonical_root,
     };
@@ -301,24 +301,28 @@ pub(crate) async fn delete(
 ) -> Result<Json<serde_json::Value>, AppError> {
     info!(app_id = %body.app_id, user_id = %body.user_id, path = %body.path, "app-files delete");
     let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
-    if !root.exists() {
+    if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
         return Err(AppError::resource(format!(
             "app root does not exist: {}",
             root.display()
         )));
     }
     let full = root.join(&body.path);
-    if !full.exists() {
+    if !tokio::fs::try_exists(&full).await.unwrap_or(false) {
         return Err(AppError::resource(format!(
             "file does not exist: {}",
             body.path
         )));
     }
-    let canonical_root = root
-        .canonicalize()
+    let canonical_root = tokio::fs::canonicalize(&root)
+        .await
         .map_err(|e| AppError::system(format!("resolve app root: {e}")))?;
-    let canonical = ensure_within_root(&full, &canonical_root)?;
-    if canonical.is_dir() {
+    let canonical = ensure_within_root(&full, &canonical_root).await?;
+    if tokio::fs::metadata(&canonical)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
         tokio::fs::remove_dir_all(&canonical)
             .await
             .map_err(|e| AppError::system(format!("remove dir: {e}")))?;
@@ -361,7 +365,7 @@ pub(crate) async fn clear(
         "app-files clear (workspace reset)"
     );
     let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
-    if !root.exists() {
+    if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
         return Ok(Json(json!({"success": true})));
     }
     let mut entries = tokio::fs::read_dir(&root)
@@ -373,7 +377,12 @@ pub(crate) async fn clear(
         .map_err(|e| AppError::system(format!("traverse workspace: {e}")))?
     {
         let path = entry.path();
-        let remove = if path.is_dir() {
+        // metadata 而非 entry.file_type()：前者跟随符号链接，与 Path::is_dir 语义一致
+        let remove = if tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             tokio::fs::remove_dir_all(&path).await
         } else {
             tokio::fs::remove_file(&path).await
@@ -407,12 +416,12 @@ fn validate_target(target: &str) -> AppResult<()> {
 }
 
 /// canonicalize 后必须仍在 root 内（防符号链接穿越）。
-fn ensure_within_root(
+async fn ensure_within_root(
     path: &std::path::Path,
     canonical_root: &std::path::Path,
 ) -> AppResult<std::path::PathBuf> {
-    let canonical = path
-        .canonicalize()
+    let canonical = tokio::fs::canonicalize(path)
+        .await
         .map_err(|e| AppError::system(format!("resolve {}: {e}", path.display())))?;
     if !canonical.starts_with(canonical_root) {
         return Err(AppError::validation(format!(

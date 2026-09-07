@@ -96,7 +96,7 @@ pub async fn resolve_target(
                 ));
             }
             let path = resolver.resolve_computer(ctx).await?;
-            if !path.exists() {
+            if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
                 return Err(AppError::resource("Computer workspace does not exist"));
             }
             Ok(GitTarget::TaskAgent {
@@ -112,7 +112,7 @@ pub async fn resolve_target(
                 return Err(AppError::validation("pageApp mode requires projectId"));
             }
             let path = resolver.resolve_project(ctx).await?;
-            if !path.exists() {
+            if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
                 return Err(AppError::resource("Project does not exist"));
             }
             Ok(GitTarget::PageApp {

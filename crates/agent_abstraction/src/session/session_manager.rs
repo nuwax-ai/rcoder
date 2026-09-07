@@ -210,7 +210,7 @@ where
 
     /// 确保项目目录存在
     pub async fn ensure_project_dir(path: &PathBuf) -> Result<()> {
-        if !path.exists() {
+        if !tokio::fs::try_exists(path).await.unwrap_or(false) {
             info!("Project path does not exist, creating: {:?}", path);
             tokio::fs::create_dir_all(path).await?;
         }

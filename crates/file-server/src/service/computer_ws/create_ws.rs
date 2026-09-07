@@ -239,7 +239,12 @@ async fn process_skill_url(
     extract_res?;
     // 候选 skill 目录: 优先 skills/ 子目录, 否则顶层非隐藏目录 (对齐 nuwax)
     let skills_sub = extract_root.join("skills");
-    let base = if skills_sub.is_dir() {
+    // 必须用 metadata (跟随软链) 而非 file_type/symlink_metadata, 才等价 Path::is_dir()
+    let base = if fs::metadata(&skills_sub)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
         skills_sub
     } else {
         extract_root.clone()

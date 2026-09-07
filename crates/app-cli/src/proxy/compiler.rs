@@ -174,16 +174,20 @@ async fn load_user_config(workspace: &Path, release: &ReleaseLock) -> Result<Pin
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("Pingap config path is missing from release lock"))?;
     let path = workspace.join(relative);
-    let canonical_workspace = workspace
-        .canonicalize()
+    let canonical_workspace = tokio::fs::canonicalize(workspace)
+        .await
         .with_context(|| format!("canonicalize workspace {}", workspace.display()))?;
-    let canonical = path
-        .canonicalize()
+    let canonical = tokio::fs::canonicalize(&path)
+        .await
         .with_context(|| format!("canonicalize Pingap config {}", path.display()))?;
     if !canonical.starts_with(&canonical_workspace) {
         anyhow::bail!("Pingap config path escapes workspace");
     }
-    let bytes = if canonical.is_dir() {
+    let bytes = if tokio::fs::metadata(&canonical)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
         pingap_config::read_all_config_files(&canonical.to_string_lossy())
             .await
             .context("read multi-file Pingap config")?

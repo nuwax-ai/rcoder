@@ -111,23 +111,30 @@ pub async fn install_from_npm(
     let npm_root_path = PathBuf::from(&npm_root);
 
     // 3. 定位入口二进制(.bin/command 是 npm 标准的入口目录)
-    let entrypoint = find_npm_entrypoint(&npm_root_path, package, command)?;
-    let entrypoint_canon = entrypoint.canonicalize().map_err(AgentMgmtError::Io)?;
+    let entrypoint = find_npm_entrypoint(&npm_root_path, package, command).await?;
+    let entrypoint_canon = tokio::fs::canonicalize(&entrypoint)
+        .await
+        .map_err(AgentMgmtError::Io)?;
 
     // 4. 在 bin_dir 中创建 symlink
     let link_path = path_manager.bin_dir().join(command);
-    if link_path.exists() || link_path.symlink_metadata().is_ok() {
-        std::fs::remove_file(&link_path).ok();
+    // try_exists 跟随符号链接，悬空 symlink 会得到 false，故再用 symlink_metadata 兜住这种情况
+    if tokio::fs::try_exists(&link_path).await.unwrap_or(false)
+        || tokio::fs::symlink_metadata(&link_path).await.is_ok()
+    {
+        tokio::fs::remove_file(&link_path).await.ok();
     }
 
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&entrypoint_canon, &link_path).map_err(|e| {
-        AgentMgmtError::InstallFailed(format!(
-            "symlink {} -> {}: {e}",
-            link_path.display(),
-            entrypoint_canon.display()
-        ))
-    })?;
+    tokio::fs::symlink(&entrypoint_canon, &link_path)
+        .await
+        .map_err(|e| {
+            AgentMgmtError::InstallFailed(format!(
+                "symlink {} -> {}: {e}",
+                link_path.display(),
+                entrypoint_canon.display()
+            ))
+        })?;
 
     #[cfg(not(unix))]
     {
@@ -178,21 +185,25 @@ pub async fn install_from_npm(
 }
 
 /// Find the entrypoint binary for an npm package.
-fn find_npm_entrypoint(npm_root: &Path, package: &str, command: &str) -> AgentMgmtResult<PathBuf> {
+async fn find_npm_entrypoint(
+    npm_root: &Path,
+    package: &str,
+    command: &str,
+) -> AgentMgmtResult<PathBuf> {
     // 1. 优先:.bin/command(nodejs 规范)
     let bin_link = npm_root.join(package).join(".bin").join(command);
-    if bin_link.exists() {
+    if tokio::fs::try_exists(&bin_link).await.unwrap_or(false) {
         return Ok(bin_link);
     }
     // 2. 退而求其次:bin/command
     let bin_path = npm_root.join(package).join("bin").join(command);
-    if bin_path.exists() {
+    if tokio::fs::try_exists(&bin_path).await.unwrap_or(false) {
         return Ok(bin_path);
     }
     // 3. 启发式:.bin 下任何可执行文件
     let bin_dir = npm_root.join(package).join(".bin");
-    if let Ok(entries) = std::fs::read_dir(&bin_dir) {
-        for e in entries.flatten() {
+    if let Ok(mut entries) = tokio::fs::read_dir(&bin_dir).await {
+        while let Ok(Some(e)) = entries.next_entry().await {
             if e.file_name() == command {
                 return Ok(e.path());
             }

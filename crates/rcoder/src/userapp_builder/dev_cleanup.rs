@@ -67,7 +67,14 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
             let sub_paths = shared_types::paths::userapp_dev_app_suffixes(app_id);
             let dev_root = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
                 .join("dev");
-            if dev_root.is_dir() {
+            // 全段走 tokio::fs：本函数在 async 上下文里跑，Path 的同步谓词会阻塞
+            // worker 线程。metadata/try_exists 均跟随符号链接，与 Path::is_dir/exists
+            // 语义一致（删除路径上宁可跟随，让异常链接暴露成 remove 错误而非漏删）。
+            if tokio::fs::metadata(&dev_root)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
                 let mut rd = tokio::fs::read_dir(&dev_root)
                     .await
                     .map_err(|e| format!("read dev root {}: {e}", dev_root.display()))?;
@@ -78,7 +85,7 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
                 {
                     for sub in &sub_paths {
                         let target = user_dir.path().join(sub);
-                        if target.exists() {
+                        if tokio::fs::try_exists(&target).await.unwrap_or(false) {
                             tokio::fs::remove_dir_all(&target).await.map_err(|e| {
                                 format!("remove dev bind dir {}: {e}", target.display())
                             })?;
@@ -94,7 +101,7 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
             let legacy_dir =
                 std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
                     .join(app_id);
-            if legacy_dir.exists() {
+            if tokio::fs::try_exists(&legacy_dir).await.unwrap_or(false) {
                 tokio::fs::remove_dir_all(&legacy_dir)
                     .await
                     .map_err(|e| format!("remove legacy dev dir {}: {e}", legacy_dir.display()))?;

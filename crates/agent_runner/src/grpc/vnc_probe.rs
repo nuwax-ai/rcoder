@@ -17,7 +17,6 @@
 //! - 3.7：server 发类型列表，client 选 None，无 SecurityResult
 //! - 3.8：server 发类型列表，client 选 None，后跟 4 字节 SecurityResult
 
-use std::path::Path;
 use std::time::Duration;
 
 use shared_types::{NOVNC_PORT, XVNC_RFB_PORT};
@@ -232,7 +231,9 @@ pub struct VncProbeResult {
 /// 封装「文件标记 + 6080 TCP + 6080 WebSocket + 5900 RFB」四层探测与 message 分支。
 /// 调用方（gRPC / HTTP）只需补充各自上下文特有的 `uptime_seconds` / `container_id`。
 pub async fn probe_vnc_readiness(timeout_millis: u64, locale: &str) -> VncProbeResult {
-    let file_exists = Path::new("/tmp/vnc_ready").exists();
+    let file_exists = tokio::fs::try_exists("/tmp/vnc_ready")
+        .await
+        .unwrap_or(false);
 
     let novnc_port_ready = check_port_available(NOVNC_PORT, timeout_millis).await;
     // ⚠️ 不做 WebSocket 升级探测：websockify 是 WS↔TCP proxy，WS 升级会触发它连后端 5900，

@@ -45,7 +45,14 @@ pub async fn serve_from_root(root: &Path, rest: &str, cors: &CorsConfig, req: Re
     if req.method() == axum::http::Method::OPTIONS {
         return cors_empty(&req, cors);
     }
-    if !full.is_file() {
+    // tokio::fs::metadata 而非阻塞的 Path::is_file()：本函数每次静态请求都会走到，
+    // 阻塞调用会占住 tokio worker。metadata 同样跟随符号链接，出错按"不是文件"处理，
+    // 与 Path::is_file() 遇错返回 false 语义一致。
+    if !tokio::fs::metadata(&full)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
         return cors_404(&req, cors);
     }
     // ServeFile 处理 Range / ETag / Last-Modified / conditional GET

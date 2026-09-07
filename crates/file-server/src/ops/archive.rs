@@ -68,7 +68,7 @@ pub async fn zip_workspace_impl(
     extra_exclude_dirs: Vec<String>,
     filename: String,
 ) -> Result<Response, AppError> {
-    if !src.exists() {
+    if !tokio::fs::try_exists(&src).await.unwrap_or(false) {
         return Err(AppError::resource("workspace does not exist"));
     }
     let tmp = computer_tmp_zip(state).await?;
@@ -104,7 +104,7 @@ pub async fn download_all_files_impl(
     let tmp = computer_tmp_zip(state).await?;
 
     // 工作区不存在 → 空 zip 兜底 (仅含顶层目录条目, 对齐 nuwax)
-    if !src.exists() {
+    if !tokio::fs::try_exists(&src).await.unwrap_or(false) {
         zip::write_empty_zip(tmp.path().to_path_buf(), prefix.clone()).await?;
         return zip_response(&filename, tmp).await;
     }

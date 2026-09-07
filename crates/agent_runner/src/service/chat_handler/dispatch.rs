@@ -29,7 +29,7 @@ pub(super) async fn dispatch_task(
     );
 
     // 确保目录存在
-    if !project_dir.exists()
+    if !tokio::fs::try_exists(&project_dir).await.unwrap_or(false)
         && let Err(e) = tokio::fs::create_dir_all(&project_dir).await
     {
         error!("[ChatHandler] Failed to create project directory: {}", e);

@@ -57,8 +57,13 @@ pub async fn sweep_workspace(
     if let Ok(mut entries) = tokio::fs::read_dir(ws.join("logs")).await {
         let mut subdirs = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.path().is_dir() {
-                subdirs.push(entry.path());
+            let path = entry.path();
+            let is_dir = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if is_dir {
+                subdirs.push(path);
             }
         }
         for dir in subdirs {
@@ -181,7 +186,15 @@ async fn sweep_staging(staging_root: &Path) -> usize {
     };
     let mut removed = 0;
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if !entry.path().is_dir() {
+        // metadata 而非阻塞的 Path::is_dir()，且刻意不用 entry.file_type()：metadata
+        // 同样跟随符号链接，保持原语义——.staging/{release_id} 本该是真目录，若出现
+        // 符号链接这种异常，判为目录后 remove_dir_all 会失败并 warn 出来（暴露异常），
+        // 而 file_type() 会静默跳过。
+        if !tokio::fs::metadata(entry.path())
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             continue;
         }
         match tokio::fs::remove_dir_all(entry.path()).await {

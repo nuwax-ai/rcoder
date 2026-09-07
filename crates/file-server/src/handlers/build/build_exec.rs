@@ -47,7 +47,8 @@ pub(crate) async fn build_project_impl(
     project_id: &str,
     base_path: Option<&str>,
 ) -> Result<(), AppError> {
-    if !path.exists() {
+    // unwrap_or(false): 对齐 Path::exists() 遇任何错误(含权限拒绝)都返回 false 的语义
+    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
         return Err(AppError::resource("project does not exist"));
     }
     let log_dir = crate::service::dev_server::log::log_dir(&state.config, project_id);
@@ -120,7 +121,7 @@ pub(crate) async fn build_project_impl(
     // 错误为类型化 io::Error, 路径经 PathBuf::join 无注入)
     let dst = state.config.dist_target_dir.join(project_id).join("dist");
     let src = path.join("dist");
-    if !src.exists() {
+    if !tokio::fs::try_exists(&src).await.unwrap_or(false) {
         // 无产物视为成功收尾 (对齐旧壳行为), 响应构造归壳层
         tracing::warn!(project_id, path = %src.display(), "build produced no dist directory");
         return Ok(());

@@ -19,7 +19,7 @@ use file_server::service::dev_server::process::{CommandObservers, now_ms, run_co
 use shared_types::{BuildProgressEvent, DiscoveredProject};
 
 use super::manifest::{
-    ReleaseMetadata, build_release_lock, discover_projects, read_workspace_manifest,
+    ReleaseMetadata, build_release_lock, discover_projects_async, read_workspace_manifest,
 };
 use super::tasks::BuildTask;
 use super::{required_release_metadata, spawn_build_log_pipe};
@@ -31,8 +31,8 @@ const LOCK_FILE: &str = "release.lock.toml";
 ///
 /// 单一事实源（dev/start 与 dev/restart 共用）；disabled 服务的 devrun 不触发
 /// （与 lock 生成时 enabled 过滤一致，防「disabled 段把 app 拖进源码态」）。
-pub fn dev_mode_enabled(ws: &Path) -> AppResult<bool> {
-    let discovered = discover_ws_projects(ws)?;
+pub async fn dev_mode_enabled(ws: &Path) -> AppResult<bool> {
+    let discovered = discover_ws_projects(ws).await?;
     Ok(discovered
         .iter()
         .any(|project| project.manifest.project.enabled && project.manifest.devrun.is_some()))
@@ -55,7 +55,8 @@ pub async fn run_dev_builds(
     timeout_secs: u64,
     progress: Option<Arc<BuildTask>>,
 ) -> AppResult<()> {
-    let enabled: Vec<DiscoveredProject> = discover_ws_projects(ws)?
+    let enabled: Vec<DiscoveredProject> = discover_ws_projects(ws)
+        .await?
         .into_iter()
         .filter(|project| project.manifest.project.enabled)
         .collect();
@@ -102,7 +103,11 @@ pub async fn run_dev_builds(
                 proj.service_id()
             ))
         })?;
-        if !proj_dir.is_dir() {
+        if !tokio::fs::metadata(&proj_dir)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             return Err(AppError::resource(format!(
                 "project dir not found: service_id={} (path={})",
                 proj.dir,
@@ -189,7 +194,7 @@ pub async fn ensure_dev_lock(ws: &Path) -> AppResult<PathBuf> {
     }
 
     let manifest = read_workspace_manifest(ws).await?;
-    let discovered = discover_ws_projects(ws)?;
+    let discovered = discover_ws_projects(ws).await?;
     if discovered.is_empty() {
         return Err(AppError::business(format!(
             "no sub-projects found under workspace={}",
@@ -260,8 +265,9 @@ async fn mtime_of(path: &Path) -> Option<SystemTime> {
         .and_then(|meta| meta.modified().ok())
 }
 
-fn discover_ws_projects(ws: &Path) -> AppResult<Vec<DiscoveredProject>> {
-    discover_projects(ws)
+async fn discover_ws_projects(ws: &Path) -> AppResult<Vec<DiscoveredProject>> {
+    discover_projects_async(ws)
+        .await
         .map_err(|e| AppError::system(format!("discover projects in {}: {e}", ws.display())))
 }
 
@@ -290,8 +296,8 @@ mod tests {
     }
 
     /// 有 enabled 服务配 [devrun] → 源码态。
-    #[test]
-    fn devrun_on_any_enabled_service_enables_source_mode() {
+    #[tokio::test]
+    async fn devrun_on_any_enabled_service_enables_source_mode() {
         let ws = temp_ws();
         write_manifest(
             &ws.join("frontend"),
@@ -299,23 +305,23 @@ mod tests {
             "[devrun]\ncommand = ['vite']",
         );
         write_manifest(&ws.join("backend"), "backend", "");
-        assert!(dev_mode_enabled(&ws).expect("dev mode"));
+        assert!(dev_mode_enabled(&ws).await.expect("dev mode"));
     }
 
     /// 全部未配 → 产物态（现状链路）。
-    #[test]
-    fn no_devrun_keeps_artifact_mode() {
+    #[tokio::test]
+    async fn no_devrun_keeps_artifact_mode() {
         let ws = temp_ws();
         write_manifest(&ws.join("frontend"), "frontend", "");
         write_manifest(&ws.join("backend"), "backend", "");
-        assert!(!dev_mode_enabled(&ws).expect("dev mode"));
+        assert!(!dev_mode_enabled(&ws).await.expect("dev mode"));
     }
 
     /// disabled 服务的 devrun 不触发（与 lock enabled 过滤一致）。严格 discover
     /// 对全 disabled workspace 本身报错（与产物态同语义），故用「disabled+devrun
     /// 与 enabled 无 devrun 并存」的合法形态验证。
-    #[test]
-    fn disabled_service_devrun_does_not_enable_source_mode() {
+    #[tokio::test]
+    async fn disabled_service_devrun_does_not_enable_source_mode() {
         let ws = temp_ws();
         write_manifest(
             &ws.join("frontend"),
@@ -324,7 +330,7 @@ mod tests {
         );
         write_manifest(&ws.join("backend"), "backend", "");
         assert!(
-            !dev_mode_enabled(&ws).expect("dev mode"),
+            !dev_mode_enabled(&ws).await.expect("dev mode"),
             "disabled devrun must not flip the workspace to source mode"
         );
     }

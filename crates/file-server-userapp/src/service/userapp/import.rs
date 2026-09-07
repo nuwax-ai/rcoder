@@ -9,19 +9,29 @@ pub async fn detect_project(workspace: &Path, project_dir: &str) -> AppResult<De
     validate_project_dir(project_dir)?;
     let project = file_server::path_safety::ensure_within(workspace, project_dir)
         .map_err(|_| AppError::validation("project_dir escapes workspace"))?;
-    if !project.is_dir() {
+    // 全段走 tokio::fs：本函数每次导入请求要 stat 九次（自身 2 + detect_type 6 +
+    // suggestion 1），阻塞的 Path 方法会占住 tokio worker。metadata 跟随符号链接、
+    // 遇错按 false，与 Path::is_dir()/is_file() 语义一致。
+    if !tokio::fs::metadata(&project)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
         return Err(AppError::resource(format!(
             "import project directory not found: {project_dir}"
         )));
     }
-    if project.join("project.manifest.toml").exists() {
+    if tokio::fs::try_exists(project.join("project.manifest.toml"))
+        .await
+        .unwrap_or(false)
+    {
         return Err(AppError::business(format!(
             "project already has a confirmed manifest: {project_dir}"
         )));
     }
     let service_id = normalize_service_id(project_dir)?;
-    let detected = detect_type(&project)?;
-    let (build, run, health, log_format, warnings) = suggestion(&project, detected);
+    let detected = detect_type(&project).await?;
+    let (build, run, health, log_format, warnings) = suggestion(&project, detected).await;
     let manifest = format!(
         r#"schema_version = 1
 
@@ -78,7 +88,8 @@ pub async fn confirm_project(workspace: &Path, project_dir: &str) -> AppResult<S
         AppError::validation(format!("invalid project manifest draft: {error}"))
     })?;
     let confirmed = project.join("project.manifest.toml");
-    if confirmed.exists() {
+    // try_exists 而非阻塞的 Path::exists()；这条检查不能省，它挡住覆盖已确认的 manifest
+    if tokio::fs::try_exists(&confirmed).await.unwrap_or(false) {
         return Err(AppError::business(format!(
             "confirmed project manifest already exists: {project_dir}"
         )));
@@ -89,7 +100,7 @@ pub async fn confirm_project(workspace: &Path, project_dir: &str) -> AppResult<S
     Ok(format!("{project_dir}/project.manifest.toml"))
 }
 
-fn detect_type(project: &Path) -> AppResult<&'static str> {
+async fn detect_type(project: &Path) -> AppResult<&'static str> {
     let candidates = [
         ("package.json", "node"),
         ("pom.xml", "java"),
@@ -98,10 +109,18 @@ fn detect_type(project: &Path) -> AppResult<&'static str> {
         ("requirements.txt", "python"),
         ("Cargo.toml", "rust"),
     ];
-    let detected: Vec<_> = candidates
-        .into_iter()
-        .filter(|(file, _)| project.join(file).is_file())
-        .collect();
+    // 用 for 循环而非 iterator filter：filter 闭包是同步的、内部无法 await。
+    // 保持 candidates 原序 —— 下面 ambiguous 分支要按该顺序列出命中的 marker。
+    let mut detected: Vec<(&str, &str)> = Vec::new();
+    for (file, project_type) in candidates {
+        if tokio::fs::metadata(project.join(file))
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            detected.push((file, project_type));
+        }
+    }
     if detected.is_empty() {
         return Err(AppError::business(
             "unable to detect project type from supported dependency files",
@@ -127,11 +146,14 @@ fn detect_type(project: &Path) -> AppResult<&'static str> {
         .ok_or_else(|| AppError::business("detected project type disappeared"))
 }
 
-fn suggestion(
+async fn suggestion(
     project: &Path,
     project_type: &str,
 ) -> (String, String, &'static str, &'static str, Vec<String>) {
-    let script_exists = project.join("scripts/build-standalone.sh").is_file();
+    let script_exists = tokio::fs::metadata(project.join("scripts/build-standalone.sh"))
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false);
     let build = r#"["sh", "scripts/build-standalone.sh"]"#.into();
     let (run, health, format) = match project_type {
         "java" => (r#"["java", "-jar", "app.jar"]"#, "/actuator/health", "text"),

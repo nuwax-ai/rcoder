@@ -42,8 +42,9 @@ fn pingap_identity() -> (String, String) {
 /// 确保紧接着能用本二进制 `run` 起来。
 pub async fn gen_lock(workspace: &Path) -> Result<()> {
     let ws_path = workspace.join("workspace.manifest.toml");
-    let ws_content =
-        std::fs::read_to_string(&ws_path).with_context(|| format!("read {}", ws_path.display()))?;
+    let ws_content = tokio::fs::read_to_string(&ws_path)
+        .await
+        .with_context(|| format!("read {}", ws_path.display()))?;
     let ws_manifest = parse_workspace(&ws_content).context("parse workspace.manifest.toml")?;
 
     // 宽松发现：单模块 TOML/校验错误不中断扫描，全部问题一次呈现——
@@ -125,7 +126,8 @@ pub async fn gen_lock(workspace: &Path) -> Result<()> {
 
     let lock_path = workspace.join("release.lock.toml");
     let lock_toml = toml::to_string_pretty(&lock).context("serialize release lock")?;
-    std::fs::write(&lock_path, &lock_toml)
+    tokio::fs::write(&lock_path, &lock_toml)
+        .await
         .with_context(|| format!("write {}", lock_path.display()))?;
     println!("\n✅ release.lock.toml 已写入: {}", lock_path.display());
     println!(

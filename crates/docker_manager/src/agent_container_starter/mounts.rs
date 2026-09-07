@@ -178,7 +178,7 @@ pub(super) async fn apply_auto_mounts(
             // 拼接后在容器内创建目录，通过 docker-compose volume 自动同步到宿主机
             let host_dir_to_create =
                 std::path::PathBuf::from(&workspace_resolution).join(&host_sub);
-            if let Err(e) = std::fs::create_dir_all(&host_dir_to_create) {
+            if let Err(e) = tokio::fs::create_dir_all(&host_dir_to_create).await {
                 warn!(
                     "[DOCKER_MGR] Failed to create workspace directory {}: {}",
                     host_dir_to_create.display(),
@@ -235,7 +235,7 @@ pub(super) async fn apply_auto_mounts(
                     let hm = workspace_host_path.join(&sub);
                     // 宿主目录预创建（rcoder 容器内经 bind 同步宿主; bind 源必须存在）
                     let hdc = std::path::PathBuf::from(workspace_resolution).join(&sub);
-                    if let Err(e) = std::fs::create_dir_all(&hdc) {
+                    if let Err(e) = tokio::fs::create_dir_all(&hdc).await {
                         warn!(
                             "[DOCKER_MGR] Failed to create dev data directory {}: {}",
                             hdc.display(),
@@ -431,7 +431,7 @@ pub(super) async fn apply_auto_mounts(
                     create_path, resolve_from_path, relative_part
                 );
 
-                if let Err(e) = std::fs::create_dir_all(&create_path) {
+                if let Err(e) = tokio::fs::create_dir_all(&create_path).await {
                     warn!(
                         "[DOCKER_MGR] createdmountdirectoryfailed: {} - {}",
                         create_path, e

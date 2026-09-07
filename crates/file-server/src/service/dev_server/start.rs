@@ -91,7 +91,8 @@ impl DevServerManager {
         // 9080 无冲突。原 package.json/vite 引擎是 web 域（单 vite dev server）
         // 移植，对多服务模板不适用——web/computer 项目（无 workspace manifest）
         // 继续走原路径。
-        if project_path.join("workspace.manifest.toml").exists() {
+        let manifest = project_path.join("workspace.manifest.toml");
+        if tokio::fs::try_exists(&manifest).await.unwrap_or(false) {
             return self
                 .start_dev_manifest(project_id, project_path, on_event)
                 .await;

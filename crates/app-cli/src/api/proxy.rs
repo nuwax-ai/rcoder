@@ -187,14 +187,20 @@ pub(super) async fn reload(State(state): State<AppState>) -> Response {
 pub(super) async fn status(State(state): State<AppState>) -> Response {
     let path = effective_path(&state);
     let data = match state.server.release() {
-        Some(release) => ProxyStatusData {
-            release_id: Some(release.release_id),
-            mode: format!("{:?}", release.pingap.mode).to_ascii_lowercase(),
-            configured: path.is_file(),
-            effective_config_path: path.to_string_lossy().to_string(),
-            pingap_version: Some(release.pingap.version),
-            pingap_commit: Some(release.pingap.commit),
-        },
+        Some(release) => {
+            let configured = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false);
+            ProxyStatusData {
+                release_id: Some(release.release_id),
+                mode: format!("{:?}", release.pingap.mode).to_ascii_lowercase(),
+                configured,
+                effective_config_path: path.to_string_lossy().to_string(),
+                pingap_version: Some(release.pingap.version),
+                pingap_commit: Some(release.pingap.commit),
+            }
+        }
         None => ProxyStatusData {
             release_id: None,
             mode: "idle".to_string(),

@@ -33,7 +33,10 @@ impl LogCleaner {
         let log_path = Path::new(&self.log_dir);
 
         // 检查目录是否存在
-        if !log_path.exists() {
+        // 两处判断刻意不合并成单次 metadata：两个分支的日志级别与文案不同（不存在走
+        // debug、存在但非目录走 warn），而旧 exists() 对权限错误等也返回 false 从而走
+        // debug 分支，合并后无法复刻。多一次 syscall 在周期清理任务里可忽略。
+        if !fs::try_exists(log_path).await.unwrap_or(false) {
             debug!(
                 "[log_cleaner] Log directory does not exist, skipping cleanup: {}",
                 self.log_dir
@@ -42,7 +45,11 @@ impl LogCleaner {
         }
 
         // 检查是否是目录
-        if !log_path.is_dir() {
+        if !fs::metadata(log_path)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             warn!(
                 "[log_cleaner] Path is not a directory, skip cleanup: {}",
                 self.log_dir

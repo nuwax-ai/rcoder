@@ -25,6 +25,8 @@ pub use manifest::{
     BuildSection, ProjectManifest, ProjectMeta, ProxySection, RunSection, WorkspaceManifest,
     WorkspaceMeta,
 };
+// handlers 域同样要走阻塞池版扫描（manifest 是本模块私有子模块，够不到其内部项）
+pub(crate) use manifest::discover_projects_async;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -113,7 +115,11 @@ pub async fn build_workspace_package(
 ) -> AppResult<WorkspaceBuildArtifact> {
     // 1. workspace 根（Userapp 开发卷, 容器无关）
     let ws = file_server::workspace::resolve_userapp_dev(app_id, None, config)?;
-    if !ws.is_dir() {
+    if !tokio::fs::metadata(&ws)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
         return Err(AppError::resource(format!(
             "Userapp workspace not found: {} (app_id={app_id})",
             ws.display()
@@ -124,7 +130,8 @@ pub async fn build_workspace_package(
     let manifest = read_workspace_manifest(&ws).await?;
 
     // 3. 自动发现子项目（扫描含 project.manifest.toml 的一级子目录）
-    let discovered = manifest::discover_projects(&ws)
+    let discovered = discover_projects_async(&ws)
+        .await
         .map_err(|e| AppError::system(format!("discover projects in {}: {e}", ws.display())))?;
     if discovered.is_empty() {
         return Err(AppError::business(format!(
@@ -170,7 +177,11 @@ pub async fn build_workspace_package(
                 proj.service_id()
             ))
         })?;
-        if !proj_dir.is_dir() {
+        if !tokio::fs::metadata(&proj_dir)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             return Err(AppError::resource(format!(
                 "project dir not found: service_id={} (path={})",
                 proj.dir,
@@ -229,24 +240,34 @@ pub async fn build_workspace_package(
         // 生产 /api/v1/userapp/build 与 dev/start 产物态共用本函数——一处接线两链都拦。
         if proj.manifest.project.r#type == ProjectType::Static
             && let Some(proxy) = &proj.manifest.proxy
-            && artifact.is_dir()
-            && let Err(msg) = frontend_detector::check_static_proxy_alignment(
-                &artifact,
-                &proxy.path,
-                proxy.strip_prefix,
-            )
+            && tokio::fs::metadata(&artifact)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
         {
-            let wrapped = AppError::business(format!("{}: {msg}", proj.service_id()));
-            if let Some(p) = &progress
-                && !p.is_cancelled()
-            {
-                p.emit(BuildProgressEvent::BuildFail {
-                    service: proj.service_id().to_string(),
-                    error: wrapped.to_string(),
-                })
-                .await;
+            // frontend-detector 是纯同步 crate（内部同步读 index.html + 逐引用 stat），
+            // 移进阻塞池执行，不占 tokio worker
+            let dist = artifact.clone();
+            let proxy_path = proxy.path.clone();
+            let strip_prefix = proxy.strip_prefix;
+            let aligned = tokio::task::spawn_blocking(move || {
+                frontend_detector::check_static_proxy_alignment(&dist, &proxy_path, strip_prefix)
+            })
+            .await
+            .map_err(|e| AppError::system(format!("proxy alignment task: {e}")))?;
+            if let Err(msg) = aligned {
+                let wrapped = AppError::business(format!("{}: {msg}", proj.service_id()));
+                if let Some(p) = &progress
+                    && !p.is_cancelled()
+                {
+                    p.emit(BuildProgressEvent::BuildFail {
+                        service: proj.service_id().to_string(),
+                        error: wrapped.to_string(),
+                    })
+                    .await;
+                }
+                return Err(wrapped);
             }
-            return Err(wrapped);
         }
         if let Some(p) = &progress {
             p.emit(BuildProgressEvent::BuildOk {

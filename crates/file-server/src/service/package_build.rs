@@ -12,7 +12,12 @@ pub async fn find_first(root: &Path, manifest: &str) -> Option<PathBuf> {
     let mut q = VecDeque::new();
     q.push_back(root.to_path_buf());
     while let Some(dir) = q.pop_front() {
-        if dir.join(manifest).exists() {
+        // try_exists 而非阻塞的 Path::exists()：BFS 每访问一个目录就要判一次，
+        // 在构建请求里是高频阻塞点。unwrap_or(false) 对齐 exists() 遇错返回 false。
+        if tokio::fs::try_exists(dir.join(manifest))
+            .await
+            .unwrap_or(false)
+        {
             return Some(dir);
         }
         let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
@@ -48,7 +53,11 @@ pub fn package_search_skip_dirs(zip_workspace_exclude: &[String]) -> Vec<String>
 /// 递归查找含 `scripts/package-platforms.mjs` 的目录 (对齐 nuwax findPackageScript)。
 /// 深度优先, 跳过 skip_dirs 命中的目录名。
 pub async fn find_package_script(root: &Path, skip_dirs: &[String]) -> Option<PathBuf> {
-    if root.join("scripts").join("package-platforms.mjs").exists() {
+    // 同 find_first：DFS 每层递归判一次，改异步以免阻塞 tokio worker
+    if tokio::fs::try_exists(root.join("scripts").join("package-platforms.mjs"))
+        .await
+        .unwrap_or(false)
+    {
         return Some(root.to_path_buf());
     }
     let Ok(mut rd) = tokio::fs::read_dir(root).await else {

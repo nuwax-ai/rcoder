@@ -177,10 +177,12 @@ impl SupervisordHost {
         ServiceSpecFile::prune_other_generations(&release.release_id);
 
         // 4. 生成并重载 program conf（supervisord 不建日志目录——服务日志目录预建）
-        std::fs::create_dir_all(args.log_dir.join("services"))
-            .with_context(|| format!("create {}", args.log_dir.join("services").display()))?;
+        let services_log_dir = args.log_dir.join("services");
+        tokio::fs::create_dir_all(&services_log_dir)
+            .await
+            .with_context(|| format!("create {}", services_log_dir.display()))?;
         let conf = render_programs_conf(release, &specs, &args.log_dir, &args.workspace);
-        write_conf(&self.conf_path, &conf)?;
+        write_conf(&self.conf_path, &conf).await?;
         if let Err(e) = self.client.reload_config().await {
             bail!("supervisord reloadConfig: {e:#}");
         }
@@ -303,13 +305,19 @@ fn pingap_service_spec(
 }
 
 /// 写 conf 分片（原子：tmp + rename；supervisord reloadConfig 前落盘）。
-fn write_conf(path: &Path, content: &str) -> Result<()> {
+async fn write_conf(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create {}", parent.display()))?;
     }
     let tmp = path.with_extension("conf.tmp");
-    std::fs::write(&tmp, content).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+    tokio::fs::write(&tmp, content)
+        .await
+        .with_context(|| format!("write {}", tmp.display()))?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .with_context(|| format!("rename to {}", path.display()))?;
     Ok(())
 }
 

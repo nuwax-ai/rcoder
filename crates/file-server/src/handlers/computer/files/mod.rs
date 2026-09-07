@@ -30,7 +30,7 @@ pub(crate) async fn delete_workspace(
 ) -> Result<Json<Value>, AppError> {
     let path = ws_path(&state, &body.user_id, &body.c_id).await?;
     // 不存在视为已删除 (对齐 nuwax, 只 warn)
-    if path.exists() {
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
         tokio::fs::remove_dir_all(&path)
             .await
             .map_err(|e| AppError::system(format!("delete workspace failed: {e}")))?;

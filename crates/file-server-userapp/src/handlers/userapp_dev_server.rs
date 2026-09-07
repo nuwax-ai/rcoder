@@ -278,7 +278,7 @@ async fn spawn_dev_task(
     let dev_source_mode = match resolve_userapp_dev(app_id, None, &state.fs.config) {
         Ok(ws) => {
             task.set_workspace_root(ws.clone()).await;
-            match crate::service::userapp::dev_mode::dev_mode_enabled(&ws) {
+            match crate::service::userapp::dev_mode::dev_mode_enabled(&ws).await {
                 Ok(mode) => mode,
                 Err(e) => {
                     task.emit(shared_types::BuildProgressEvent::Failed {
@@ -577,25 +577,33 @@ pub(crate) async fn framework_info(
         let ws = resolve_userapp_dev(&q.app_id, None, &state.fs.config)?;
         // discover 严格模式：manifest 损坏即 400（识别接口必须给出可信清单，
         // 静默跳过坏服务会让调用方误判 workspace 结构）
-        let discovered = shared_types::discover_projects(&ws)
+        let discovered = crate::service::userapp::discover_projects_async(&ws)
+            .await
             .map_err(|e| AppError::business(format!("discover workspace services: {e}")))?;
+        // frontend-detector 是纯同步 crate（逐服务读 package.json + 探测锁文件），
+        // 整批移进阻塞池，避免每个服务各阻塞一次 worker
+        let dirs: Vec<_> = discovered.iter().map(|p| ws.join(&p.dir)).collect();
+        let detections = tokio::task::spawn_blocking(move || {
+            dirs.iter()
+                .map(|dir| frontend_detector::detect_project(dir))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| AppError::system(format!("framework detect task: {e}")))?;
         let services = discovered
             .iter()
-            .map(|project| {
-                let dir = ws.join(&project.dir);
-                let detected = frontend_detector::detect_project(&dir);
-                UserappServiceFrameworkInfo {
-                    service_id: project.service_id().to_string(),
-                    name: project.manifest.project.name.clone(),
-                    r#type: format!("{:?}", project.manifest.project.r#type).to_lowercase(),
-                    kind: format!("{:?}", project.manifest.project.kind).to_lowercase(),
-                    dir: project.dir.clone(),
-                    enabled: project.manifest.project.enabled,
-                    package_manager: detected.package_manager,
-                    typescript: detected.typescript,
-                    build_framework: to_detection(detected.build),
-                    ui_framework: to_detection(detected.ui),
-                }
+            .zip(detections)
+            .map(|(project, detected)| UserappServiceFrameworkInfo {
+                service_id: project.service_id().to_string(),
+                name: project.manifest.project.name.clone(),
+                r#type: format!("{:?}", project.manifest.project.r#type).to_lowercase(),
+                kind: format!("{:?}", project.manifest.project.kind).to_lowercase(),
+                dir: project.dir.clone(),
+                enabled: project.manifest.project.enabled,
+                package_manager: detected.package_manager,
+                typescript: detected.typescript,
+                build_framework: to_detection(detected.build),
+                ui_framework: to_detection(detected.ui),
             })
             .collect();
         Ok(UserappFrameworkInfo { services })

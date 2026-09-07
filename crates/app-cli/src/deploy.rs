@@ -161,7 +161,9 @@ pub(crate) async fn deploy(
     // 1. marker 幂等：同 release_id 且 code 在位 → 跳过
     if let Some(state) = read_state(volume_root).await
         && state.release_id == release_id
-        && workspace.join("release.lock.toml").exists()
+        && tokio::fs::try_exists(workspace.join("release.lock.toml"))
+            .await
+            .unwrap_or(false)
     {
         info!("📦 deploy stage skipped (marker hit): release_id={release_id}");
         return Ok(());
@@ -193,7 +195,7 @@ pub(crate) async fn deploy(
 
     // 3. 解压 staging + 包完整性校验
     let staging = volume_root.join(STAGING_DIR).join(release_id);
-    if staging.exists() {
+    if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
         tokio::fs::remove_dir_all(&staging)
             .await
             .with_context(|| format!("clean stale staging {}", staging.display()))?;
@@ -206,12 +208,12 @@ pub(crate) async fn deploy(
 
     // 4. 换 code/（同 fs rename，原子；旧代保留一代）
     let previous = volume_root.join(PREVIOUS_DIR);
-    if previous.exists() {
+    if tokio::fs::try_exists(&previous).await.unwrap_or(false) {
         tokio::fs::remove_dir_all(&previous)
             .await
             .with_context(|| format!("clean old {}", previous.display()))?;
     }
-    if workspace.exists() {
+    if tokio::fs::try_exists(workspace).await.unwrap_or(false) {
         tokio::fs::rename(workspace, &previous)
             .await
             .with_context(|| format!("move current code to {}", previous.display()))?;

@@ -85,7 +85,10 @@ async fn main() -> anyhow::Result<()> {
     // 常驻应答探针（防 kubelet liveness 杀容器），等 start{url} 部署换 Pod 替换本
     // 进程。lock 存在但损坏不进 idle——走下方正常链 fail-fast（supervisord 重试
     // 后 FATAL，损坏 lock 是需人工介入的异常态，静默 idle 会掩盖问题）。
-    if !args.workspace.join("release.lock.toml").exists() {
+    if !tokio::fs::try_exists(args.workspace.join("release.lock.toml"))
+        .await
+        .unwrap_or(false)
+    {
         app_cli::idle::serve_forever(&args.admin_addr).await;
         return Ok(()); // 仅 SIGTERM（容器终止/被替换）到达
     }

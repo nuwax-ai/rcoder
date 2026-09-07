@@ -50,8 +50,10 @@ pub async fn ensure_agent_store_dirs(
 }
 
 /// 检查 skill 目录是否有 `.dynamic_add.lock`。
-fn has_dynamic_add_lock(skill_path: &Path) -> bool {
-    skill_path.join(DYNAMIC_ADD_LOCK).exists()
+async fn has_dynamic_add_lock(skill_path: &Path) -> bool {
+    fs::try_exists(skill_path.join(DYNAMIC_ADD_LOCK))
+        .await
+        .unwrap_or(false)
 }
 
 /// 写入 `.dynamic_add.lock` (标记动态添加的技能)。
@@ -79,7 +81,7 @@ pub async fn prune_agent_skills(
         .filter(|s| !s.is_empty())
         .collect();
 
-    if !skills_dir.exists() {
+    if !fs::try_exists(skills_dir).await.unwrap_or(false) {
         return Ok((Vec::new(), Vec::new()));
     }
 
@@ -92,7 +94,7 @@ pub async fn prune_agent_skills(
             continue;
         }
         let skill_path = entry.path();
-        if has_dynamic_add_lock(&skill_path) {
+        if has_dynamic_add_lock(&skill_path).await {
             kept_dynamic.push(name);
         } else {
             // 对齐 TS fs.rm(force): 文件和目录都能删 (skills/ 下正常是目录,
@@ -151,8 +153,11 @@ pub async fn install_skill_dir(
 /// 同名子目录并发覆盖最终一致。目标目录始终存在, 无"目录空"窗口。
 pub async fn update_agents_dir(src: Option<&Path>, dest: &Path) -> AppResult<()> {
     fs::create_dir_all(dest).await?;
+    // try_exists 而非阻塞的 Path::exists()（本函数在 async 上下文）。这个存在性检查
+    // 不能省：否则下面 read_dir 的 ? 会把"src 不存在"从可容忍情况变成返回 Err。
+    // unwrap_or(false) 对齐 Path::exists() 遇任何错误都返回 false 的语义。
     if let Some(src) = src
-        && src.exists()
+        && fs::try_exists(src).await.unwrap_or(false)
     {
         let mut entries = fs::read_dir(src).await?;
         let mut tasks = Vec::new();
@@ -330,11 +335,11 @@ async fn materialize_agent_store_by_copy(
     fs::create_dir_all(&primary_skills).await?;
     fs::create_dir_all(&primary_agents).await?;
 
-    if agent_skills_dir.exists() {
+    if fs::try_exists(agent_skills_dir).await.unwrap_or(false) {
         crate::service::fs_util::copy_dir_filtered(agent_skills_dir, &primary_skills, &[], &[])
             .await?;
     }
-    if agent_agents_dir.exists() {
+    if fs::try_exists(agent_agents_dir).await.unwrap_or(false) {
         crate::service::fs_util::copy_dir_filtered(agent_agents_dir, &primary_agents, &[], &[])
             .await?;
     }
