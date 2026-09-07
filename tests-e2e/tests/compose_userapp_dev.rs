@@ -7,7 +7,9 @@
 //! 覆盖点（对应 rcoder userapp_forward / computer_chat_handler userApp 分支）：
 //! - create-workspace 起手（ensure 开发容器 + 建目录 + owner 注册）
 //! - X-App-Id 直连转发 + X-Service-Type 拦截分流（两路落同一 workspace）
-//! - `/api/userapp/db/dev/align-credentials`（scram 验证 → trust 重置 → 复验）
+//! - x-user-id owner 显式档懒创建（无注册前置的拦截分流；502 故障钉住 +
+//!   白名单 400——生产 192.168.1.19 cannot resolve owner user_id 回归）
+//! - `/api/userapp/db/dev/reset-password`（PG 改密；凭据对齐已内嵌 start 链）
 //! - userApp 开发对话全轮：session 创建（project_id=app_id 回显）+ SSE 事件流
 //!   （/computer/progress/{sid} 经 session→project 映射路由到开发容器）
 
@@ -1360,4 +1362,127 @@ async fn userapp_agent_dispatch_anthropic() {
     rcoder_e2e::common::cross_bin_lock::acquire();
     let _gate = scenario_gate().await;
     scenario_userapp_agent_dispatch(Backend::Anthropic).await;
+}
+
+// ============================================================
+// 场景 6：x-user-id owner 显式档懒创建（生产故障回归）
+//   192.168.1.19 实测断链：Java computer 文件族 + X-Service-Type/X-App-Id
+//   分流、无注册前置也无 x-user-id 时，透传层 owner 三档两档皆空 →
+//   502 "cannot resolve owner user_id"（fail-fast 防宿主树孤儿目录）。
+//   修复（d9e208b）：拦截层从 x-user-id header 提取 owner 显式档。
+// ============================================================
+#[tokio::test]
+async fn userapp_dev_owner_header_lazy_ensure() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_owner";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "o1");
+    let user = "e2e-ud-ohuser";
+
+    // A｜复现生产故障：全新 app（无注册、无 x-user-id）→ 502 cannot resolve
+    //    （不走 create-workspace——正是生产 Java 的接入形态）
+    let resp = env
+        .http
+        .post(format!("{}/api/computer/generate-file", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-Service-Type", "userapp")
+        .header("X-App-Id", &app)
+        .json(&json!({"userId": user, "cId": app, "fileName": "a.txt", "content": "x"}))
+        .send()
+        .await
+        .expect("no-owner post");
+    let status_a = resp.status();
+    let body_a: Value = resp.json().await.unwrap_or(Value::Null);
+    let ok_a = status_a.as_u16() == 502
+        && body_a["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("cannot resolve owner user_id for app"));
+    report.assert_hard(
+        "A：无 owner 懒创建拒（502 cannot resolve——fail-fast 防孤儿目录，生产行为钉住）",
+        ok_a,
+        format!("HTTP {status_a}, {}", trunc(&body_a, 160)),
+    );
+
+    // B｜x-user-id 显式档：同请求补 header → 懒创建 + 透传成功。
+    //    重试幂等（首次含容器拉起 + 容器内 file-server ~10s 启动窗口）
+    let mut ok_b = false;
+    let (mut status_b, mut body_b) = (status_a, body_a.clone());
+    for attempt in 0..3 {
+        let resp = env
+            .http
+            .post(format!("{}/api/computer/generate-file", env.rcoder))
+            .timeout(Duration::from_secs(120))
+            .header("X-Service-Type", "userapp")
+            .header("X-App-Id", &app)
+            .header("X-User-Id", user)
+            .json(&json!({"userId": user, "cId": app, "fileName": "b.txt", "content": "via x-user-id"}))
+            .send()
+            .await
+            .expect("owner post");
+        status_b = resp.status();
+        body_b = resp.json().await.unwrap_or(Value::Null);
+        if status_b.is_success() && body_b["success"].as_bool() == Some(true) {
+            ok_b = true;
+            break;
+        }
+        report.diagnostic(
+            "x-user-id 懒创建冷启动重试（file-server 启动窗口）",
+            &format!("attempt {attempt}"),
+            &trunc(&body_b, 100),
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    report.assert_hard(
+        "B：x-user-id 显式档懒创建成功（拦截分流透传 200）",
+        ok_b,
+        format!("HTTP {status_b}, {}", trunc(&body_b, 120)),
+    );
+
+    // B'｜懒创建后注册表命中：无 header 再调同 app → 200（owner 只在创建路径需要）
+    let resp = env
+        .http
+        .post(format!("{}/api/computer/generate-file", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-Service-Type", "userapp")
+        .header("X-App-Id", &app)
+        .json(&json!({"userId": user, "cId": app, "fileName": "b2.txt", "content": "reuse"}))
+        .send()
+        .await
+        .expect("registry hit post");
+    let status_r = resp.status();
+    let body_r: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "B'：懒创建后注册表命中（无 header 复用 200——owner 仅创建路径需要）",
+        status_r.is_success() && body_r["success"].as_bool() == Some(true),
+        format!("HTTP {status_r}, {}", trunc(&body_r, 120)),
+    );
+
+    // C｜白名单：非法 x-user-id（路径逃逸形态）→ 400（防宿主树拼接逃逸）
+    let resp = env
+        .http
+        .post(format!("{}/api/computer/generate-file", env.rcoder))
+        .timeout(Duration::from_secs(15))
+        .header("X-Service-Type", "userapp")
+        .header("X-App-Id", &app)
+        .header("X-User-Id", "../escape")
+        .json(&json!({"fileName": "c.txt", "content": "x"}))
+        .send()
+        .await
+        .expect("bad uid post");
+    let status_c = resp.status();
+    let body_c: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "C：非法 x-user-id → 400（identifier 白名单防逃逸）",
+        status_c.as_u16() == 400
+            && body_c["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("user_id")),
+        format!("HTTP {status_c}, {}", trunc(&body_c, 120)),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
 }
