@@ -5,6 +5,18 @@
 **作者**: Claude (基于用户需求分析)
 **项目**: rcoder - AI 驱动开发平台
 
+> **⚠️ 部分设计已废弃（2026-09 代码质量审计）**: 本文档 §4.1.1「统一容器标识符
+> （ContainerKey）」与 §4.1.2「统一容器信息结构（UnifiedContainerInfo）」这套数据模型
+> **已废弃并从代码中删除**。它曾按本稿落地在
+> `crates/shared_types/src/model/computer_agent_model.rs`（674 行），但从未被任何代码
+> 消费——`ContainerKey`/`UnifiedContainerInfo`/`ProjectInfo`/`SessionInfo` 四个类型在
+> crate 外完全不可达（`shared_types/src/lib.rs` 的 `pub use model::{...}` 白名单从未
+> 包含它们），全仓 `.rs` 零引用，仅靠文件内自身单测维持"存活"。
+>
+> **Computer Agent Runner 功能本体仍在正常使用**（`/computer/*` HTTP 接口、
+> `ServiceType::ComputerAgentRunner`、VNC 桌面、`computer_chat_handler` 等），只是走了
+> 与本稿不同的数据模型路径。废弃的仅是这套"统一容器注册表"设计，**请勿照本稿重建**。
+
 ---
 
 ## 一、项目背景

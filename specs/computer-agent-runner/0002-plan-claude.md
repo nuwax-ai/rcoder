@@ -6,6 +6,16 @@
 **项目**: rcoder - AI 驱动开发平台
 **基准文档**: `specs/computer-agent-runner/0001-spec-claude.md`
 
+> **⚠️ 本计划中 computer_agent_model 相关步骤已永久作废（2026-09 代码质量审计）**:
+> 凡是涉及 `crates/shared_types/src/model/computer_agent_model.rs` 的步骤——包括
+> 「添加 `mod computer_agent_model;`」「添加 `pub use computer_agent_model::*;`」以及
+> `ContainerKey` / `UnifiedContainerInfo` / `ProjectInfo` / `SessionInfo` 的定义与
+> 导出——**都不要再做**。该文件曾按本计划落地（674 行），但从未被任何代码消费
+> （四个类型在 crate 外不可达、全仓 `.rs` 零引用），已整体删除。
+>
+> 这些步骤在本文档里仍是未勾选的 `- [ ]`，容易被误当成待办补做，故在此显式作废。
+> 背景与依据见 `0001-spec-claude.md` 头部的同批标注。
+
 ---
 
 ## 一、项目概述与目标

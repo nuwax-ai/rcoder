@@ -418,9 +418,11 @@ impl AgentDownloadManager {
             let archive_clone = archive_path.clone();
             let file_type_str = file_type.to_string();
 
+            // 配额传 None: 本路径此前即无解压配额，收敛重复实现不顺带改行为
+            // （容器/PVC 配额作主边界，见 download_utils::archive 模块文档）
             tokio::task::spawn_blocking(move || match file_type_str.as_str() {
-                "tar.gz" => archive::extract_tar_gz(&archive_clone, &target_clone),
-                "zip" => archive::extract_zip(&archive_clone, &target_clone),
+                "tar.gz" => archive::extract_tar_gz(&archive_clone, &target_clone, None),
+                "zip" => archive::extract_zip(&archive_clone, &target_clone, None),
                 _ => Err(ArchiveError::InvalidArchive(format!(
                     "unsupported archive type: {}",
                     file_type_str

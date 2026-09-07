@@ -127,7 +127,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .with_state(state.clone());
 
     // DevComputer 调试路由 — 共享 /computer/* 容器和处理逻辑
-    // chat 需要注入 auto_reload（devcomputer_chat.rs），progress 需要返回类型适配（devcomputer_handlers.rs）
+    // chat 需要注入 auto_reload（devcomputer_chat.rs）；progress 需要独立的 #[utoipa::path]
+    // 属性才能保住自己的 OpenAPI 条目（devcomputer_handlers.rs），流式逻辑仍无副本
     // 其余路由直接复用 computer_* handler
     let devcomputer_routes = Router::new()
         .route(
@@ -282,6 +283,7 @@ fn create_swagger_ui() -> SwaggerUi {
         devcomputer_chat::__path_handle_devcomputer_chat,
         devcomputer_handlers::__path_devcomputer_progress,
         pod_count::__path_handle_pod_count,
+        rcoder_progress::__path_handle_rcoder_progress,
     };
 
     #[derive(OpenApi)]
@@ -296,6 +298,8 @@ fn create_swagger_ui() -> SwaggerUi {
             // DevComputer Agent 端点
             handle_devcomputer_chat,
             devcomputer_progress,
+            // RCoder Agent 端点
+            handle_rcoder_progress,
             // Pod 管理端点
             handle_pod_count,
             // 健康检查

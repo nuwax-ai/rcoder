@@ -116,9 +116,11 @@ async fn upload_impl(
             let count = tokio::task::spawn_blocking({
                 let dest = dest.clone();
                 let archive = archive_path.to_path_buf();
+                // 配额传 None: 保持既有行为（容器/PVC 配额作主边界，
+                // 见 download_utils::archive 模块文档）
                 move || match file_type {
-                    "zip" => extract_zip(&archive, &dest),
-                    _ => extract_tar_gz(&archive, &dest),
+                    "zip" => extract_zip(&archive, &dest, None),
+                    _ => extract_tar_gz(&archive, &dest, None),
                 }
             })
             .await

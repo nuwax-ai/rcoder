@@ -3,9 +3,15 @@
 //! Provides safe extraction for tar.gz and zip archives with:
 //! - Path traversal protection
 //! - Directory normalization (strip single wrapper directory)
+//! - Optional total-uncompressed-size quota (zip bomb guard)
 //!
-//! 资源限制(总解压字节/entry 数/单文件大小)有意不加:解压发生在用户隔离的容器内,由容器/PVC
-//! 配额作主边界;用户自己的内容用爆了,重启容器即可恢复。仅保留 path-traversal 安全边界
+//! 资源限制(总解压字节)由调用方按需传入 `max_total_size`:
+//! - `None` = 不限。解压发生在用户隔离的容器内,由容器/PVC 配额作主边界;用户自己的内容
+//!   用爆了,重启容器即可恢复。
+//! - `Some(max)` = 累计解压字节超上限即中止。agent 安装包来自外部 URL,须防 zip bomb
+//!   (见 agent_runner 侧传 `shared_types::MAX_EXTRACTED_SIZE`)。
+//!
+//! entry 数与单文件大小上限有意不加,理由同上。path-traversal 安全边界始终生效
 //! (防 entry 越出 dest_dir 写到别处)。
 
 use std::fs::File;
@@ -23,6 +29,8 @@ pub enum ArchiveError {
     PathTraversal(String),
     /// Invalid archive format
     InvalidArchive(String),
+    /// Cumulative uncompressed size exceeded the caller-supplied quota
+    TooLarge { size: u64, max: u64 },
 }
 
 impl std::fmt::Display for ArchiveError {
@@ -31,6 +39,11 @@ impl std::fmt::Display for ArchiveError {
             ArchiveError::Io(e) => write!(f, "IO error: {}", e),
             ArchiveError::PathTraversal(msg) => write!(f, "Path traversal: {}", msg),
             ArchiveError::InvalidArchive(msg) => write!(f, "Invalid archive: {}", msg),
+            ArchiveError::TooLarge { size, max } => write!(
+                f,
+                "Archive bomb: uncompressed size {} exceeds limit {}",
+                size, max
+            ),
         }
     }
 }
@@ -45,13 +58,20 @@ impl From<std::io::Error> for ArchiveError {
 
 /// Extract a `.tar.gz` archive into `dest_dir`.
 ///
+/// `max_total_size`: 累计解压字节上限（zip bomb 防护）。`None` = 不限。
+///
 /// Returns the number of file entries extracted.
-pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<usize, ArchiveError> {
+pub fn extract_tar_gz(
+    archive_path: &Path,
+    dest_dir: &Path,
+    max_total_size: Option<u64>,
+) -> Result<usize, ArchiveError> {
     let file = File::open(archive_path)?;
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
 
     let mut file_count: usize = 0;
+    let mut total_uncompressed: u64 = 0;
     let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for entry in archive.entries()? {
@@ -83,6 +103,17 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<usize, Arc
         }
 
         let entry_type = entry.header().entry_type();
+
+        // 用 header 声明的大小累计, 在写盘前即可拦下 —— 否则 bomb 会先把磁盘写爆
+        if let Some(max) = max_total_size {
+            total_uncompressed = total_uncompressed.saturating_add(entry.header().size()?);
+            if total_uncompressed > max {
+                return Err(ArchiveError::TooLarge {
+                    size: total_uncompressed,
+                    max,
+                });
+            }
+        }
 
         if entry_type.is_dir() {
             if !created_dirs.contains(&dest_path) {
@@ -124,13 +155,20 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<usize, Arc
 
 /// Extract a `.zip` archive into `dest_dir`.
 ///
+/// `max_total_size`: 累计解压字节上限（zip bomb 防护）。`None` = 不限。
+///
 /// Returns the number of file entries extracted.
-pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<usize, ArchiveError> {
+pub fn extract_zip(
+    archive_path: &Path,
+    dest_dir: &Path,
+    max_total_size: Option<u64>,
+) -> Result<usize, ArchiveError> {
     let file = File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| ArchiveError::InvalidArchive(format!("open zip: {e}")))?;
 
     let mut file_count: usize = 0;
+    let mut total_uncompressed: u64 = 0;
     let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for i in 0..archive.len() {
@@ -160,6 +198,17 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<usize, Archiv
                 return Err(e);
             }
             created_dirs.insert(parent.to_path_buf());
+        }
+
+        // 用 central directory 声明的未压缩大小累计, 写盘前拦截
+        if let Some(max) = max_total_size {
+            total_uncompressed = total_uncompressed.saturating_add(entry.size());
+            if total_uncompressed > max {
+                return Err(ArchiveError::TooLarge {
+                    size: total_uncompressed,
+                    max,
+                });
+            }
         }
 
         if entry.is_dir() {
@@ -476,6 +525,11 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_rejects_nul() {
+        assert!(sanitize_entry_path(Path::new("foo\0bar")).is_err());
+    }
+
+    #[test]
     fn test_extract_tar_gz_round_trip() {
         let tmp = tempdir().unwrap();
         let archive = tmp.path().join("src.tar.gz");
@@ -498,7 +552,7 @@ mod tests {
             tar.into_inner().unwrap().finish().unwrap();
         }
 
-        let count = extract_tar_gz(&archive, &extract_to).unwrap();
+        let count = extract_tar_gz(&archive, &extract_to, None).unwrap();
         assert_eq!(count, 1);
 
         let hello = extract_to.join("bin/hello");
@@ -528,7 +582,7 @@ mod tests {
             tar.into_inner().unwrap().finish().unwrap();
         }
 
-        assert_eq!(extract_tar_gz(&archive, &extract_to).unwrap(), 1);
+        assert_eq!(extract_tar_gz(&archive, &extract_to, None).unwrap(), 1);
 
         #[cfg(unix)]
         {
@@ -621,7 +675,7 @@ mod tests {
         // 4. 解压
         let extract_dir = tmp.path().join("extracted");
         std::fs::create_dir_all(&extract_dir).unwrap();
-        let count = extract_tar_gz(&archive_path, &extract_dir).unwrap();
+        let count = extract_tar_gz(&archive_path, &extract_dir, None).unwrap();
         assert!(count > 0);
 
         // 5. 规范化目录（去掉 wrapper）
@@ -631,5 +685,152 @@ mod tests {
         // 6. 检查内容直接位于解压根目录
         assert!(extract_dir.join("package.json").exists());
         assert!(extract_dir.join("index.js").exists());
+    }
+
+    /// 手写一个 tar 归档字节流(单 file entry,GNU long path 不启用)
+    ///
+    /// tar crate 的 `set_path` 自身会拒绝 `..` 路径，故手写 tar 头绕过 Builder
+    /// 校验，才能验证**我们的** extract 逻辑确实拦得下。
+    fn build_tar_with_path(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        let name_bytes = name.as_bytes();
+        let copy_len = name_bytes.len().min(100);
+        header[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
+        header[100..108].copy_from_slice(b"0000644\0"); // mode
+        header[108..116].copy_from_slice(b"0000000\0"); // uid
+        header[116..124].copy_from_slice(b"0000000\0"); // gid
+        let size_str = format!("{:011o}\0", data.len());
+        header[124..136].copy_from_slice(size_str.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0"); // mtime
+        header[156] = b'0'; // typeflag: regular file
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+
+        // checksum 字段本身按 spaces 参与计算
+        let mut chs = [b' '; 8];
+        header[148..156].copy_from_slice(&chs);
+        let sum: u32 = header.iter().map(|&b| b as u32).sum();
+        let cksum = format!("{:06o}\0 ", sum);
+        chs.copy_from_slice(cksum.as_bytes());
+        header[148..156].copy_from_slice(&chs);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&header);
+        out.extend_from_slice(data);
+        let pad = (512 - (data.len() % 512)) % 512;
+        out.extend(std::iter::repeat_n(0u8, pad));
+        out.extend(std::iter::repeat_n(0u8, 1024)); // 2 个零块作 EOF
+        out
+    }
+
+    fn write_tar_gz(path: &Path, raw_tar: &[u8]) {
+        let mut gz =
+            flate2::write::GzEncoder::new(File::create(path).unwrap(), flate2::Compression::fast());
+        Write::write_all(&mut gz, raw_tar).unwrap();
+        gz.finish().unwrap();
+    }
+
+    #[test]
+    fn extract_tar_gz_rejects_path_traversal() {
+        let tmp = tempdir().unwrap();
+        let archive = tmp.path().join("evil.tar.gz");
+        let extract_to = tmp.path().join("out");
+        std::fs::create_dir_all(&extract_to).unwrap();
+
+        write_tar_gz(
+            &archive,
+            &build_tar_with_path("../../../etc/evil", b"pwned"),
+        );
+
+        let err = extract_tar_gz(&archive, &extract_to, None).unwrap_err();
+        assert!(matches!(err, ArchiveError::PathTraversal(_)));
+        // 越界文件绝不能落盘
+        assert!(!Path::new("/etc/evil").exists());
+        assert!(!extract_to.join("evil").exists());
+    }
+
+    #[test]
+    fn extract_zip_rejects_path_traversal() {
+        let tmp = tempdir().unwrap();
+        let archive = tmp.path().join("evil.zip");
+        let extract_to = tmp.path().join("out");
+        std::fs::create_dir_all(&extract_to).unwrap();
+
+        {
+            let file = File::create(&archive).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            zip.start_file("../../../etc/evil", opts).unwrap();
+            zip.write_all(b"pwned").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let err = extract_zip(&archive, &extract_to, None).unwrap_err();
+        assert!(matches!(err, ArchiveError::PathTraversal(_)));
+        assert!(!extract_to.join("evil").exists());
+    }
+
+    /// 配额检查此前两侧实现都无测试覆盖。用"小配额 + 正常条目"确定性触发，
+    /// 比伪造超大 tar header 可靠（后者会先撞上 header 与实际数据不符的解析错）。
+    #[test]
+    fn extract_tar_gz_enforces_quota_when_some() {
+        let tmp = tempdir().unwrap();
+        let archive = tmp.path().join("src.tar.gz");
+        let extract_to = tmp.path().join("out");
+        std::fs::create_dir_all(&extract_to).unwrap();
+
+        let payload = vec![b'x'; 4096];
+        write_tar_gz(&archive, &build_tar_with_path("big.bin", &payload));
+
+        // 配额远小于条目声明大小 → 必须在写盘前拦下
+        let err = extract_tar_gz(&archive, &extract_to, Some(16)).unwrap_err();
+        match err {
+            ArchiveError::TooLarge { size, max } => {
+                assert_eq!(max, 16);
+                assert!(size >= 4096, "size={size}");
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_zip_enforces_quota_when_some() {
+        let tmp = tempdir().unwrap();
+        let archive = tmp.path().join("src.zip");
+        let extract_to = tmp.path().join("out");
+        std::fs::create_dir_all(&extract_to).unwrap();
+
+        {
+            let file = File::create(&archive).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            zip.start_file("big.bin", opts).unwrap();
+            zip.write_all(&vec![b'y'; 4096]).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let err = extract_zip(&archive, &extract_to, Some(16)).unwrap_err();
+        assert!(matches!(err, ArchiveError::TooLarge { max: 16, .. }));
+    }
+
+    /// 同一个归档在 `None`（不限额）下必须正常解压——证明配额是可选的、
+    /// 不会改变既有调用方（agent_provisioning / file-server-userapp）的行为。
+    #[test]
+    fn quota_none_does_not_limit() {
+        let tmp = tempdir().unwrap();
+        let archive = tmp.path().join("src.tar.gz");
+        let extract_to = tmp.path().join("out");
+        std::fs::create_dir_all(&extract_to).unwrap();
+
+        let payload = vec![b'x'; 4096];
+        write_tar_gz(&archive, &build_tar_with_path("big.bin", &payload));
+
+        let count = extract_tar_gz(&archive, &extract_to, None).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            std::fs::metadata(extract_to.join("big.bin")).unwrap().len(),
+            4096
+        );
     }
 }
