@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
     pub enabled: bool,
     pub interval_seconds: u64,
@@ -15,7 +15,7 @@ pub struct HealthCheckConfig {
 }
 
 /// 代理配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyConfig {
     /// 代理监听端口
     pub listen_port: u16,
@@ -30,7 +30,7 @@ pub struct ProxyConfig {
 }
 
 /// Agent cleanup configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCleanupConfig {
     /// Idle timeout (seconds), default 300 (5 minutes)
     #[serde(default = "default_idle_timeout")]
@@ -41,7 +41,7 @@ pub struct AgentCleanupConfig {
 }
 
 /// Deprecated no-op. Agent process count is no longer limited by agent_runner.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentConcurrencyConfig {
     /// Deprecated no-op.
     #[serde(default = "default_concurrency_limit")]
@@ -77,7 +77,7 @@ impl Default for AgentConcurrencyConfig {
 }
 
 /// gRPC timeout configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrpcTimeoutConfig {
     /// Cancel session timeout (seconds), default 30
     #[serde(default = "default_cancel_timeout")]
@@ -381,7 +381,8 @@ mod tests {
             enable_proxy: true,
             proxy_port: Some(8089),
             default_backend_port: None,
-        });
+        })
+        .expect("load config");
 
         let proxy_config = config.proxy_config.expect("proxy config");
         assert_eq!(config.port, 8286);
@@ -397,7 +398,8 @@ mod tests {
             enable_proxy: true,
             proxy_port: Some(8089),
             default_backend_port: Some(9000),
-        });
+        })
+        .expect("load config");
 
         let proxy_config = config.proxy_config.expect("proxy config");
         assert_eq!(config.port, 8286);

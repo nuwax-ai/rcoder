@@ -2,6 +2,7 @@
 
 use std::env;
 use std::fs;
+use std::path::Path;
 
 use tracing::{error, info, warn};
 
@@ -13,29 +14,27 @@ pub(super) const CONFIG_FILE: &str = "config.yml";
 /// 代理默认监听端口（CLI --port 未指定时的回退值）
 pub(super) const DEFAULT_PROXY_LISTEN_PORT: u16 = 8080;
 
-pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
+pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     // 1. 首先加载默认配置
     let mut config = AppConfig::default();
 
-    // 2. 尝试从当前目录读取配置文件
-    match load_config_from_file() {
-        Ok(file_config) => {
-            config = file_config;
-            info!("Loaded config from {}", CONFIG_FILE);
-        }
-        Err(e) => {
-            warn!(
-                "Failed to read config file {}: {}, using defaults",
-                CONFIG_FILE, e
-            );
-
-            // 创建默认配置文件
-            if let Err(create_err) = create_default_config_file(&config) {
-                error!("Failed to create default config file: {}", create_err);
-            } else {
-                info!("Created default config file: {}", CONFIG_FILE);
-            }
-        }
+    // 2. 读取配置文件。"不存在"与"存在但解析失败"语义完全不同，必须分开处理
+    //    （旧实现两者共用一条降级路径，与 rcoder/src/config/loader.rs 已修掉的模式同款）：
+    //    - 不存在：容器镜像不带 config.yml（Dockerfile 只 COPY 二进制，k8s 的 config.yml
+    //      configmap 只挂给 rcoder 主服务，动态创建 agent 容器时只注入 env），首启自建
+    //      是刚需 → create-then-continue。写盘失败仅记日志：只读根文件系统等场景下
+    //      内存里的默认值仍足够跑起来，不该把容器打进 CrashLoop。
+    //    - 存在但解析失败：fail-fast 上抛。静默降级默认值会让报错与真因隔好几层
+    //      （rcoder 侧 0.1.233 事故：configmap 缩进坏 → docker_config 无镜像 → CrashLoop
+    //      排障一小时），而 serde_yaml 的错误自带行号列号，直接暴露才是最短路径。
+    //      更关键的是旧降级路径会顺手覆盖掉那份坏文件，把唯一的排障证据销毁。
+    if Path::new(CONFIG_FILE).exists() {
+        config = load_config_from_file()?;
+        info!("Loaded config from {}", CONFIG_FILE);
+    } else if let Err(create_err) = create_default_config_file() {
+        error!("Failed to create default config file: {}", create_err);
+    } else {
+        info!("Created default config file: {}", CONFIG_FILE);
     }
 
     // 3. 环境变量覆盖配置
@@ -317,7 +316,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
         config.grpc_timeouts = Some(GrpcTimeoutConfig::default());
     }
 
-    config
+    Ok(config)
 }
 
 /// 从文件加载配置
@@ -331,116 +330,119 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
     Ok(config)
 }
 
-/// 创建默认配置文件
-fn create_default_config_file(config: &AppConfig) -> anyhow::Result<()> {
-    // 获取 proxy_config，如果不存在则使用默认值
-    let proxy_config = config.proxy_config.as_ref().cloned().unwrap_or_default();
+/// 创建默认配置文件（仅当 `config.yml` 不存在时）。
+fn create_default_config_file() -> anyhow::Result<()> {
+    write_default_config_file(Path::new(CONFIG_FILE))
+}
 
-    // 获取 agent_cleanup 配置，如果不存在则使用默认值
-    let agent_cleanup = config.agent_cleanup.as_ref().cloned().unwrap_or_default();
+/// 写出默认配置文件到指定路径。
+///
+/// **任何情况下都不覆盖已存在的文件**：旧实现直接 `fs::write`，而它唯一的调用点在
+/// "读取失败"降级分支里 —— 配置被改坏时会把那份坏文件冲掉，销毁唯一的排障证据。
+/// 现在解析失败已 fail-fast，这道守卫是防止将来再有人把它接回降级路径。
+fn write_default_config_file(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
 
-    // 获取 grpc_timeouts 配置，如果不存在则使用默认值
-    let grpc_timeouts = config.grpc_timeouts.as_ref().cloned().unwrap_or_default();
-
-    // 手动构建带注释的 YAML 内容
-    let content_with_comments = format!(
-        r#"# rcoder 配置文件
-# 该文件在首次启动时自动生成
-
-# 默认使用的 Agent ID
-default_agent_id: {}
-
-# 项目工作目录
-projects_dir: {}
-
-# 主服务端口
-port: {}
-
-# Pingora 反向代理配置
-proxy_config:
-  # 代理服务监听端口 (用于接收外部请求)
-  listen_port: {}
-  # 默认后端服务端口 (当请求未指定端口时使用)
-  default_backend_port: {}
-  # 后端服务主机地址
-  backend_host: "{}"
-  # URL 中端口参数的名称 (用于从路径中提取端口号)
-  port_param: "{}"
-  # 健康检查配置
-  health_check:
-    enabled: {}
-    interval_seconds: {}
-    timeout_seconds: {}
-    healthy_threshold: {}
-    unhealthy_threshold: {}
-
-# Agent 清理配置
-# 如果省略此配置块，将使用以下默认值：
-#   - idle_timeout_secs: 300 (5分钟)
-#   - cleanup_interval_secs: 30 (30秒)
-agent_cleanup:
-  # Agent 闲置超时时间（秒）
-  # Agent 在闲置超过此时间后会被自动清理以释放资源
-  # 有效范围: 10 - 86400 秒（10秒 - 24小时）
-  # 可通过环境变量 RCODER_AGENT_IDLE_TIMEOUT_SECS 覆盖
-  idle_timeout_secs: {}
-  # 清理检查间隔（秒）
-  # 系统每隔此时间检查一次是否有闲置的 Agent 需要清理
-  # 有效范围: 5 - 3600 秒（5秒 - 1小时）
-  # 可通过环境变量 RCODER_AGENT_CLEANUP_INTERVAL_SECS 覆盖
-  cleanup_interval_secs: {}
-
-# gRPC 超时配置
-# 如果省略此配置块，将使用以下默认值：
-#   - cancel_session_timeout_secs: 30 (30秒)
-#   - acp_session_create_timeout_secs: 100 (100秒)
-#   - agent_cancel_timeout_secs: 10 (10秒)
-#   - port_check_timeout_millis: 500 (500毫秒)
-grpc_timeouts:
-  # 取消会话超时（秒）
-  # gRPC 取消会话请求的最大等待时间
-  # 有效范围: 5 - 300 秒
-  # 可通过环境变量 RCODER_CANCEL_SESSION_TIMEOUT_SECS 覆盖
-  cancel_session_timeout_secs: {}
-  # ACP 会话创建超时（秒）
-  # Agent 创建新会话的最大等待时间（MCP 工具较多时可能需要更长时间）
-  # 有效范围: 10 - 300 秒
-  # 可通过环境变量 RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS 覆盖
-  acp_session_create_timeout_secs: {}
-  # Agent 取消调用超时（秒）
-  # Agent 内部取消操作的最大等待时间
-  # 有效范围: 5 - 60 秒
-  # 可通过环境变量 RCODER_AGENT_CANCEL_TIMEOUT_SECS 覆盖
-  agent_cancel_timeout_secs: {}
-  # 端口检查超时（毫秒）
-  # 检查端口可用性的最大等待时间
-  # 有效范围: 100 - 10000 毫秒
-  # 可通过环境变量 RCODER_PORT_CHECK_TIMEOUT_MILLIS 覆盖
-  port_check_timeout_millis: {}
-
-"#,
-        config.default_agent_id,
-        config.projects_dir.display(),
-        config.port,
-        proxy_config.listen_port,
-        proxy_config.default_backend_port,
-        proxy_config.backend_host,
-        proxy_config.port_param,
-        proxy_config.health_check.enabled,
-        proxy_config.health_check.interval_seconds,
-        proxy_config.health_check.timeout_seconds,
-        proxy_config.health_check.healthy_threshold,
-        proxy_config.health_check.unhealthy_threshold,
-        agent_cleanup.idle_timeout_secs,
-        agent_cleanup.cleanup_interval_secs,
-        grpc_timeouts.cancel_session_timeout_secs,
-        grpc_timeouts.acp_session_create_timeout_secs,
-        grpc_timeouts.agent_cancel_timeout_secs,
-        grpc_timeouts.port_check_timeout_millis
-    );
-
-    fs::write(CONFIG_FILE, content_with_comments)
-        .map_err(|e| anyhow::anyhow!("Failed to write config file: {}", e))?;
-
+    let content = render_default_config_yaml()?;
+    fs::write(path, content)
+        .map_err(|e| anyhow::anyhow!("Failed to write config file {}: {}", path.display(), e))?;
     Ok(())
+}
+
+/// 生成默认配置文件内容：静态注释头 + serde 序列化的 [`AppConfig::default`]。
+///
+/// 注释里刻意不复述任何具体数值。旧实现是 75 行手写 `format!` 模板（18 处插值），
+/// 注释与插值各自维护，已经漂移过：注释写 `idle_timeout_secs: 300 (5分钟)`，而插进去
+/// 的值来自 `AgentCleanupConfig::default()`，在 `http-server` feature 下是 86400 ——
+/// 生成出来的文件自己和自己矛盾。数值交给 serde，注释只描述字段与覆盖它的环境变量，
+/// 范围指向 sections.rs 的 MIN_/MAX_ 常量，无重复即无漂移。
+fn render_default_config_yaml() -> anyhow::Result<String> {
+    let header = "\
+# rcoder agent_runner 配置文件
+# 该文件在首次启动时自动生成，下方数值即当前生效的默认值。
+#
+# 字段说明（此处刻意不复述数值，避免注释与实际默认值漂移）：
+#   default_agent_id   默认使用的 Agent ID
+#   projects_dir       项目工作目录
+#   port               主服务端口
+#   proxy_config       Pingora 反向代理：listen_port / default_backend_port /
+#                      backend_host / port_param / health_check。
+#                      仅在 --enable-proxy 时生效，且由 CLI 参数整体重建
+#   agent_cleanup      Agent 闲置清理：
+#                        idle_timeout_secs     <- RCODER_AGENT_IDLE_TIMEOUT_SECS
+#                        cleanup_interval_secs <- RCODER_AGENT_CLEANUP_INTERVAL_SECS
+#   grpc_timeouts      gRPC 各环节超时：
+#                        cancel_session_timeout_secs     <- RCODER_CANCEL_SESSION_TIMEOUT_SECS
+#                        acp_session_create_timeout_secs <- RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS
+#                        agent_cancel_timeout_secs       <- RCODER_AGENT_CANCEL_TIMEOUT_SECS
+#                        port_check_timeout_millis       <- RCODER_PORT_CHECK_TIMEOUT_MILLIS
+#   mcp_proxy_log_dir  mcp-proxy 诊断日志目录（省略即不启用）
+#
+# 优先级：CLI 参数 > 环境变量 > 本文件 > 内置默认值。
+# 各数值的有效范围见 crates/agent_runner/src/config/sections.rs 的 MIN_/MAX_ 常量。
+
+";
+
+    let body = serde_yaml::to_string(&AppConfig::default())
+        .map_err(|e| anyhow::anyhow!("Failed to serialize default config: {}", e))?;
+
+    Ok(format!("{header}{body}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 防漂移的根本手段：生成的 YAML 必须能被原样读回，且等于 AppConfig::default()。
+    /// 手写模板时代没有任何测试覆盖这条链路，漂移因此能长期存在。
+    #[test]
+    fn rendered_default_config_roundtrips_to_default() {
+        let yaml = render_default_config_yaml().expect("render default config");
+        let parsed: AppConfig = serde_yaml::from_str(&yaml).expect("生成的 YAML 必须能被读回");
+        assert_eq!(parsed, AppConfig::default());
+    }
+
+    /// 注释头不得再复述具体数值 —— 数值只能来自 serde，否则又会漂移。
+    /// 判定口径：注释行里 ASCII 冒号后紧跟数字即算硬编码，这样能同时抓住
+    /// "idle_timeout_secs: 300 (5分钟)" 与 "有效范围: 10 - 86400" 两种漂移形态。
+    #[test]
+    fn rendered_header_carries_no_hardcoded_values() {
+        let yaml = render_default_config_yaml().expect("render default config");
+        for line in yaml.lines().take_while(|l| l.starts_with('#')) {
+            let hardcoded = line
+                .split_once(": ")
+                .is_some_and(|(_, rest)| rest.starts_with(|c: char| c.is_ascii_digit()));
+            assert!(
+                !hardcoded,
+                "注释头出现硬编码数值，会与 serde 输出漂移: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn never_overwrites_existing_config_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.yml");
+        // 模拟用户改坏的文件：既是排障证据，也绝不能被默认配置冲掉
+        let corrupt = "port: not-a-number\n  bad_indent: [\n";
+        fs::write(&path, corrupt).expect("write corrupt config");
+
+        write_default_config_file(&path).expect("已存在应是 no-op 而非错误");
+
+        assert_eq!(fs::read_to_string(&path).expect("read back"), corrupt);
+    }
+
+    #[test]
+    fn writes_default_config_when_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.yml");
+
+        write_default_config_file(&path).expect("write default config");
+
+        let content = fs::read_to_string(&path).expect("read back");
+        let parsed: AppConfig = serde_yaml::from_str(&content).expect("parse generated file");
+        assert_eq!(parsed, AppConfig::default());
+    }
 }

@@ -31,7 +31,7 @@ pub struct CliArgs {
 }
 
 /// 应用配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     /// 默认使用的 Agent ID
     #[serde(default = "default_agent_id")]
@@ -49,7 +49,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub grpc_timeouts: Option<GrpcTimeoutConfig>,
     /// Deprecated no-op. Kept only so old config files still deserialize.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_concurrency: Option<AgentConcurrencyConfig>,
     /// mcp-proxy 日志目录（可选）
     /// 当设置此值且日志级别为 debug 时，mcp-proxy convert 命令会自动追加

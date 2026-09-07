@@ -139,7 +139,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
     let cli_args = CliArgs::parse();
 
     // 加载配置（包含命令行参数）
-    let config = load_config_with_args(cli_args);
+    let config = load_config_with_args(cli_args)?;
 
     // 注:容器以 tini 做 PID 1(见镜像 ENTRYPOINT / chart command 前置 tini),由 tini 负责回收
     // 孤儿进程 + 转发信号。agent_runner 不再自带 in-process reaper(旧 process_reaper 模块已删:
