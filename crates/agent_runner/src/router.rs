@@ -1,6 +1,5 @@
 // 顶层 router 仅 AppState 被 grpc/main 使用；create_router/ApiDoc 等已迁至
-// http_server::router，保留这里的实现以兼容现有引用。抑制 dead_code 警告。
-#![allow(dead_code)]
+// http_server::router，保留这里的实现以兼容现有引用。
 
 use std::sync::Arc;
 

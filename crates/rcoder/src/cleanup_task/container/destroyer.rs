@@ -5,8 +5,6 @@
 //! 运行时无关: 物理销毁走 `ContainerRuntime` trait 的 `stop_container_by_identifier`,
 //! Docker / K8s 各自实现正确语义 (Docker 整删; K8s 删 Pod+Service 并保留 PVC)。
 
-#![allow(dead_code)]
-
 use anyhow::Result;
 use container_runtime_api::ContainerRuntime;
 use shared_types::ServiceType;

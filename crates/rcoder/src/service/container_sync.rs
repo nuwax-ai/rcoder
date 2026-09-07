@@ -5,8 +5,6 @@
 //!
 //! 注意：本模块由 binary (main.rs) 使用，lib 内部不直接调用。
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{Instrument, debug, info, warn};

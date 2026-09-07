@@ -12,8 +12,7 @@
 //! // re-export 保持 crate::router::AppState 既有引用稳定。
 
 // router 整体由 binary (main.rs) 使用，lib 内不直接调用 create_router / ApiDoc 等。
-// 抑制 dead_code 以避免 lib 维度误报。
-#![allow(dead_code)]
+// （--all-targets 口径下 bin 本身即调用点，实测零 dead_code，无需 blanket allow。）
 
 mod agent_mgmt;
 mod api;

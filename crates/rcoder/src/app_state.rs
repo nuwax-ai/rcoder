@@ -3,8 +3,7 @@
 //! [`AppState`]：全局共享状态（配置/容器查找/项目注册表/SSE 流管理/活动注册表），
 //! 含项目增删与 session 归属/活跃度维护方法；路由组装仍在 [`crate::router`]。
 //!
-//! lib+bin 双树：部分方法仅单树消费，与 router.rs 同款抑制 lib 维度 dead_code 误报。
-#![allow(dead_code)]
+//! lib+bin 双树：部分方法仅单树消费（--all-targets 口径下实测零 dead_code 误报）。
 
 use std::sync::Arc;
 

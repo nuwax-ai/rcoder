@@ -13,8 +13,6 @@
 //! | 挂载配置 | 硬编码 | config.yml mounts (配置化) |
 //! | Agent 实例 | 1 个 | 多个（按 project_id 区分） |
 
-#![allow(dead_code)]
-
 use crate::AppError;
 use crate::handler::utils::{COMPUTER_WORKSPACE_ROOT, user_dir};
 use container_runtime_api::{ContainerCreateParams, ContainerRuntime};
@@ -337,17 +335,6 @@ impl ComputerContainerManager {
         Ok(container_info)
     }
 
-    /// 获取用户工作区路径
-    ///
-    /// 路径格式: `/app/computer-project-workspace/{user_id}`
-    ///
-    /// 注意：project_id 作为子目录由容器内的 agent 自己管理
-    pub async fn get_user_workspace(user_id: &str) -> Result<PathBuf, AppError> {
-        Ok(PathBuf::from(
-            user_dir(user_id).map_err(|e| AppError::validation_error(&e.to_string()))?,
-        ))
-    }
-
     /// 创建用户工作区目录
     ///
     /// 创建 `/app/computer-project-workspace/{user_id}` 目录
@@ -427,44 +414,5 @@ impl ComputerContainerManager {
     ) -> Result<Option<ContainerBasicInfo>, AppError> {
         Self::get_container_info_with_type(user_id, runtime, &ServiceType::ComputerAgentRunner)
             .await
-    }
-}
-
-// ============================================================================
-// 单元测试
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_get_user_workspace_path() {
-        // 测试路径格式
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let path = ComputerContainerManager::get_user_workspace("user_123")
-                .await
-                .unwrap();
-            assert_eq!(
-                path,
-                PathBuf::from("/app/computer-project-workspace/user_123")
-            );
-        });
-    }
-
-    #[test]
-    fn test_workspace_path_with_special_chars() {
-        // 测试带特殊字符的 user_id
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let path = ComputerContainerManager::get_user_workspace("user-with-dash_123")
-                .await
-                .unwrap();
-            assert_eq!(
-                path,
-                PathBuf::from("/app/computer-project-workspace/user-with-dash_123")
-            );
-        });
     }
 }

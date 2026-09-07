@@ -8,8 +8,6 @@
 //!
 //! 只有当所有启用的服务都就绪时，才返回 "healthy" 状态。
 
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;

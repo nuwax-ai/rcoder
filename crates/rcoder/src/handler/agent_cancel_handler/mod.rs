@@ -8,8 +8,6 @@
 //!
 //! 转发取消请求到容器内的 agent_runner 服务
 
-#![allow(dead_code)]
-
 use axum::extract::State;
 use axum::http::HeaderMap;
 use std::sync::Arc;
