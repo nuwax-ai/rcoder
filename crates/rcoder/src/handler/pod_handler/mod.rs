@@ -42,9 +42,6 @@ mod vnc_status;
 
 pub use ensure::*;
 pub(crate) use helpers::resolve_resource_limits_from_config;
-/// agent 族接口（status/stop/cancel/notify-resolved/cache-clean）的 userApp
-/// 分派共用件——wire 形态 service_type=userapp + project_id 兼任 app_id +
-/// app_stage（仅 dev），校验规则与词表见函数 doc（单一事实源）
 /// userApp 三字段（service_type/app_id/app_stage）分派共用件——pod 族与
 /// agent 族（status/stop/cancel/notify-resolved/cache-clean）单一事实源
 pub(crate) use helpers::{

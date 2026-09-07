@@ -31,7 +31,7 @@ pub enum ServiceType {
     /// K8s 模式下对应 Deployment（而非 agent 的裸 Pod）。
     Userapp,
     /// Userapp 构建/开发 agent-runner（路B：独立 per-app PVC + 复用 dev-rcoder-agent-runner 镜像）。
-    /// 容器标识为 app_id（project_id 兼任）；走 create_container（STS）；与 ComputerAgentRunner 容器隔离。
+    /// 容器标识为 app_id（值经 project_id 槽位进容器基建）；走 create_container（STS）；与 ComputerAgentRunner 容器隔离。
     UserappBuilder,
 }
 
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn userapp_builder_uses_project_id() {
-        // UserappBuilder identifier = project_id(app_id 兼任)
+        // UserappBuilder identifier = app_id（值经 project_id 槽位传入）
         assert_eq!(
             ServiceType::UserappBuilder.container_identifier(None, None, Some("app-9")),
             Ok("app-9")

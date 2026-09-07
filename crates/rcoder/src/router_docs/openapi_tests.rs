@@ -776,9 +776,9 @@ fn pod_endpoints_fields_are_documented() {
 }
 
 /// 文档质量防回归：computer/agent 族五接口（status/stop/cancel/notify-resolved/
-/// cache/clean）的 userApp 分派字段（service_type/app_stage）必须存在且有
-/// 非空 description，且描述写明「project_id 兼任 app_id」——wire 契约核心
-/// 语义（对齐 /computer/chat，不设独立 app_id 字段）靠此守卫钉住。
+/// cache/clean）的 userApp 分派三字段（service_type/app_id/app_stage）必须存在
+/// 且有非空 description，且描述写明 app_id 分派定位语义——wire 契约核心
+/// （独立 app_id 字段，project_id 回归 computer 语义，见 0db3789）靠此守卫钉住。
 /// notify-resolved 的请求体为描述性 content（无 schema 引用），其文档由
 /// handler 注解描述承载，不在此遍历范围。
 #[test]
@@ -844,8 +844,7 @@ fn agent_endpoints_userapp_dispatch_fields_are_documented() {
             checked += 1;
         }
     }
-    // 四 schema × 两字段 = 8（CacheCleanRequest 的分派载体是 project_id 字段，
-    // 其描述同样被上面断言覆盖到的 service_type/app_stage 钉住语义）
+    // 五 schema × 三字段 = 15（notify-resolved 无 schema 引用不在遍历内）
     assert!(checked >= 14, "分派字段覆盖数异常偏少: {checked}");
 }
 

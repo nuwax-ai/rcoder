@@ -114,11 +114,8 @@ pub(crate) fn dev_file_server_addr(state: &AppState, info: &ContainerBasicInfo) 
 
 /// 纯解析:只查 state.projects,无副作用（短路语义 peek 复用——只读判定
 /// 容器注册在否，不 ensure 不自愈）。
-pub(crate) fn registered_builder(state: &AppState, project_id: &str) -> Option<ContainerBasicInfo> {
-    state
-        .projects
-        .get(project_id)
-        .and_then(|p| p.container_info())
+pub(crate) fn registered_builder(state: &AppState, app_id: &str) -> Option<ContainerBasicInfo> {
+    state.projects.get(app_id).and_then(|p| p.container_info())
 }
 
 /// 创建 UserappBuilder(幂等)并注册进 state.projects,返回容器信息。
@@ -127,21 +124,22 @@ pub(crate) fn registered_builder(state: &AppState, project_id: &str) -> Option<C
 /// **不走 ComputerContainerManager**(避免 ComputerAgentRunner 专属的 lazy_migrate)。
 async fn create_builder_and_register(
     state: &AppState,
-    project_id: &str,
+    app_id: &str,
     explicit_user_id: Option<&str>,
 ) -> Result<ContainerBasicInfo> {
     // owner 解析三档：显式传（请求入参）> userapp_metadata.owner（create-workspace/
     // start 注册落库）> fail-fast 报错。绝不兜底 app_id 兼任——旧兜底会把宿主树
     // 挂成 dev/{app_id}/{app_id} 孤儿目录（数据落错树不可回收，且对调用方不可见）。
-    let metadata_owner = state.app_service.get_app_owner(project_id).await;
+    let metadata_owner = state.app_service.get_app_owner(app_id).await;
     let owner_user_id =
         resolve_owner(explicit_user_id, metadata_owner.as_deref()).with_context(|| {
-            format!("cannot resolve owner user_id for app {project_id}; pass user_id explicitly")
+            format!("cannot resolve owner user_id for app {app_id}; pass user_id explicitly")
         })?;
-    // UserappBuilder identifier = project_id(app_id 兼任);挂载由 mounts/k8s_agent_create
-    // auto-inject 统一组装（dev 四目录压平）。
+    // UserappBuilder identifier = app_id（值经 project_id 槽位进容器基建——
+    // state.projects/ContainerCreateParams 共用 project 键空间）；挂载由
+    // mounts/k8s_agent_create auto-inject 统一组装（dev 四目录压平）。
     let params = ContainerCreateParams::builder()
-        .project_id(project_id.to_string())
+        .project_id(app_id.to_string())
         .user_id(owner_user_id)
         .service_type(ServiceType::UserappBuilder)
         .storage_size(DEFAULT_BUILDER_STORAGE_SIZE)
@@ -153,24 +151,24 @@ async fn create_builder_and_register(
         .await
         .context("ensure UserappBuilder failed")?;
 
-    // 注册到 state.projects(后续转发/部署据 project_id 查 container_name/ip)。
-    let project_info = if let Some(existing) = state.get_project(project_id) {
+    // 注册到 state.projects(后续转发/部署据 app_id 查 container_name/ip)。
+    let project_info = if let Some(existing) = state.get_project(app_id) {
         let mut info = (*existing).clone();
         info.set_container(Some(container_info.clone()));
         info
     } else {
-        let mut info = ProjectAndContainerInfo::new(project_id.to_string());
+        let mut info = ProjectAndContainerInfo::new(app_id.to_string());
         info.set_service_type(Some(ServiceType::UserappBuilder));
         info.set_container(Some(container_info.clone()));
         info
     };
     state
-        .insert_project(project_id.to_string(), Arc::new(project_info))
+        .insert_project(app_id.to_string(), Arc::new(project_info))
         .context("register UserappBuilder to projects failed")?;
 
     info!(
         "[USERAPP_BUILDER] UserappBuilder ensured: app_id={}, container={}, ip={}",
-        project_id, container_info.container_name, container_info.container_ip
+        app_id, container_info.container_name, container_info.container_ip
     );
     Ok(container_info)
 }
