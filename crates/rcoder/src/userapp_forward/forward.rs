@@ -13,6 +13,11 @@
 //! - 构建链三门面：`{app_id}/{app_stage}/...` 同构直转容器内同形态路由
 //!   （path 即身份、URI/body 零改写，dev-only）
 //!
+//! owner 显式档：dev 懒创建开发容器需要 owner user_id（三档解析的显式档），
+//! 透传族 body 流式不解析——来源 = query 可见接口（tasks/static）与
+//! [`shared_types::USER_ID_HEADER`] header（Java userApp 出站统一携带），缺失降级
+//! userapp_metadata.owner（create-workspace/start 前置注册）。
+//!
 //! 定位与转发内核在 [`super::upstream`]。
 
 use std::sync::Arc;
@@ -34,8 +39,8 @@ use super::semantics::{
     require_static_user_id, unavailable_response,
 };
 use super::upstream::{
-    STATIC_PATH_PREFIX, TASKS_PATH_PREFIX, forward_to_dev, forward_to_prod,
-    missing_app_id_response, require_app_id,
+    STATIC_PATH_PREFIX, TASKS_PATH_PREFIX, explicit_user_id_from_headers, forward_to_dev,
+    forward_to_prod, missing_app_id_response, require_app_id,
 };
 
 /// dev/prod 阶段分派解析：缺省 dev（向后兼容既有无 header 调用）；
@@ -189,8 +194,13 @@ pub(crate) async fn forward_userapp(
                 req.method(),
                 req.uri().path()
             );
-            // 透传族 body 内 user_id 流式不解析——显式档仅 static（已前移）传值
-            forward_to_dev(&state, &app_id, req, None).await
+            // 透传族 body 内 user_id 流式不解析——显式档来源：static 前移的
+            // query（已处理）与 `x-user-id` header（Java userApp 出站统一携带）
+            let explicit_user_id = match explicit_user_id_from_headers(req.headers()) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            forward_to_dev(&state, &app_id, req, explicit_user_id.as_deref()).await
         }
         UserappStage::Prod => {
             info!(
@@ -238,9 +248,13 @@ async fn fold_env_forward(
         req.method(),
         req.uri().path()
     );
-    // 门面 body 携 user_id 但流式不解析——owner 走 metadata 链（create-workspace
-    // 前置注册）
-    forward_to_dev(&state, &app_id, req, None).await
+    // 门面 body 携 user_id 但流式不解析——显式档走 `x-user-id` header，
+    // 缺失时降级 metadata 链（create-workspace/start 前置注册）
+    let explicit_user_id = match explicit_user_id_from_headers(req.headers()) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    forward_to_dev(&state, &app_id, req, explicit_user_id.as_deref()).await
 }
 
 /// 探测开发容器内的项目类型
@@ -361,12 +375,17 @@ pub(crate) async fn computer_intercept(
     };
     match stage {
         UserappStage::Dev => {
+            // `x-user-id` header 是 owner 显式档（Java userApp 出站统一携带，
+            // 拦截层零 body 解析）；缺失降级 metadata 链，非法值 400 fail-fast
+            let explicit_user_id = match explicit_user_id_from_headers(req.headers()) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
             info!(
                 "[USERAPP_FORWARD] intercepted computer request {} -> dev container (app_id={app_id})",
                 req.uri().path()
             );
-            // TS 老族 body 携 user_id（camelCase 契约）但流式不解析——metadata 链
-            forward_to_dev(&state, &app_id, req, None).await
+            forward_to_dev(&state, &app_id, req, explicit_user_id.as_deref()).await
         }
         UserappStage::Prod => {
             info!(
@@ -380,10 +399,15 @@ pub(crate) async fn computer_intercept(
 
 /// ensure-workspace 专用转发：读取小 JSON body 提取 user_id 作懒创建显式
 /// owner 档（透传族流式不解析 body 的例外——此接口 body 天然小且语义就是
-/// "幂等建目录"，新 app 无 metadata owner 时必须靠 body 显式档），提取后
-/// 带原 body 重组转发到开发容器。
+/// "幂等建目录"），body 无 user_id 时降级 [`shared_types::USER_ID_HEADER`]
+/// 提取，提取后带原 body 重组转发到开发容器。
 async fn forward_ensure_workspace(state: &AppState, app_id: &str, req: Request) -> Response {
     let (parts, body) = req.into_parts();
+    // header 档先于 body 解析校验（非法值 400 短路，不做无谓 body 读取）
+    let header_user_id = match explicit_user_id_from_headers(&parts.headers) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
     // ensure-workspace body 小 JSON，上限 1MB 兜底防滥用
     let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(bytes) => bytes,
@@ -395,7 +419,8 @@ async fn forward_ensure_workspace(state: &AppState, app_id: &str, req: Request) 
     let user_id = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|v| v.get("user_id").and_then(|u| u.as_str()).map(str::to_owned))
-        .filter(|u| !u.trim().is_empty());
+        .filter(|u| !u.trim().is_empty())
+        .or(header_user_id);
     // 重组原请求（method/uri/headers 原样）带原 body 转发
     let rebuilt = Request::from_parts(parts, axum::body::Body::from(bytes));
     forward_to_dev(state, app_id, rebuilt, user_id.as_deref()).await

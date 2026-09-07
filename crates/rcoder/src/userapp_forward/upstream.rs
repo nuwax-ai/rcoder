@@ -15,7 +15,7 @@ use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
 
-use shared_types::APP_ID_HEADER;
+use shared_types::{APP_ID_HEADER, USER_ID_HEADER};
 
 use crate::router::AppState;
 use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder};
@@ -88,6 +88,29 @@ pub(super) fn missing_app_id_response() -> Response {
         "missing required header `{APP_ID_HEADER}` for userApp forwarding"
     ))
     .into_response()
+}
+
+/// 从 [`USER_ID_HEADER`] 提取 owner 显式档（`Ok(None)` = 缺失/空白，降级
+/// metadata 兜底；透传族 body 流式不解析，header 是零成本显式档来源）。
+///
+/// identifier 白名单必做：user_id 进宿主树路径 `dev/{user_id}/{app_id}` 拼接，
+/// 含 `/` 即逃逸开发卷根——非法值 400 fail-fast（与 `require_app_id` 同源，
+/// 不静默降级防配置错误被吞）。
+pub(super) fn explicit_user_id_from_headers(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<String>, Box<Response>> {
+    let Some(raw) = headers
+        .get(USER_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    match shared_types::validate_identifier(raw, "user_id") {
+        Ok(()) => Ok(Some(raw.to_owned())),
+        Err(e) => Err(HttpResultError::bad_request(e).into_boxed_response()),
+    }
 }
 
 /// 定位（miss 幂等 ensure）开发容器 file-server addr。

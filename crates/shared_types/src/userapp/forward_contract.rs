@@ -30,6 +30,12 @@ pub const APP_ID_HEADER: &str = "x-app-id";
 /// 字段同词表——同一 app_id 可同时存在 builder 与生产 Deployment，必须显式区分。
 pub const APP_STAGE_HEADER: &str = "x-app-stage";
 
+/// userApp owner 显式档 header（Java 出站统一携带）：rcoder 拦截/透传层零 body
+/// 解析即可拿到懒创建开发容器的 owner user_id（owner 三档解析的显式档）。
+/// 缺失/空白 = 未传（降级 metadata 兜底）；值须过 identifier 白名单
+/// （进宿主树路径 `dev/{user_id}/{app_id}` 拼接，防逃逸——与 app_id 同源）。
+pub const USER_ID_HEADER: &str = "x-user-id";
+
 /// [`APP_STAGE_HEADER`] 的值：开发阶段（UserappBuilder 开发容器）。
 pub const APP_STAGE_DEV: &str = "dev";
 
@@ -69,5 +75,15 @@ mod tests {
         assert!(!is_userapp_service_type_value("user-app"));
         assert!(!is_userapp_service_type_value("computer-agent-runner"));
         assert!(!is_userapp_service_type_value(""));
+    }
+
+    /// userApp 分派 header 名族统一小写 `x-` 前缀（HTTP/1.1 大小写不敏感，
+    /// HeaderMap 归一小写比较——一处改名另一处漂移即在此报红）。
+    #[test]
+    fn userapp_dispatch_headers_share_x_prefix() {
+        assert_eq!(SERVICE_TYPE_HEADER, "x-service-type");
+        assert_eq!(APP_ID_HEADER, "x-app-id");
+        assert_eq!(APP_STAGE_HEADER, "x-app-stage");
+        assert_eq!(USER_ID_HEADER, "x-user-id");
     }
 }
