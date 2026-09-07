@@ -96,7 +96,16 @@ impl WorkspaceRuntime for DockerRuntime {
                         )));
                     }
                 };
-                // file_type() 走 readdir 的 d_type，不额外 stat
+                // file_type() 走 readdir 的 d_type，不额外 stat。
+                //
+                // 注意这里与旧实现有一处**有意的语义差异**：旧代码是
+                // `.filter(|e| e.path().is_dir())`，`Path::is_dir()` 跟随符号链接；
+                // `DirEntry::file_type()` 不跟随（d_type / symlink_metadata）。
+                // 对这条删除路径而言不跟随更安全：若 `prod/{uid}` 是指向别处的符号链接，
+                // 跟随它会拿链接名拼出 userapp_prod_subpaths 再 remove_dir_all，
+                // 等于删到 prod 树之外。宁可漏扫一个符号链接 uid，也不越界删除。
+                // （同文件 scan_dev_workspace_identifiers 是**列举**语义，漏项会导致
+                // orphan 误判，那边刻意保留跟随符号链接——两者风险方向相反。）
                 if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
                     uid_entries.push(entry.file_name().to_string_lossy().to_string());
                 }
@@ -182,7 +191,16 @@ pub(super) async fn scan_dev_workspace_identifiers(
             }
         };
         let uid_path = uid_dir.path();
-        if !uid_path.is_dir() {
+        // tokio::fs::metadata 而非阻塞的 Path::is_dir()（本函数是 async fn，跑在 tokio
+        // worker 上）。刻意不用 DirEntry::file_type()：它不跟随符号链接，而本函数是
+        // **列举**语义，漏掉一个 uid 会让该用户的 workspace 逃过对账（与本函数上方
+        // "错误上抛而非静默截断"同理）。metadata() 与 Path::is_dir() 同样跟随符号链接，
+        // 语义不变；出错按"不是目录"跳过，对齐 Path::is_dir() 遇错返回 false。
+        if !tokio::fs::metadata(&uid_path)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             continue;
         }
         let mut app_entries = match tokio::fs::read_dir(&uid_path).await {
@@ -210,7 +228,12 @@ pub(super) async fn scan_dev_workspace_identifiers(
             if matches!(name.as_str(), "data" | "logs" | "agent-store") {
                 continue;
             }
-            if app_dir.path().is_dir() {
+            // 同上：tokio::fs::metadata 替代阻塞的 Path::is_dir()，跟随符号链接语义不变
+            if tokio::fs::metadata(app_dir.path())
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
                 ids.insert(name);
             }
         }

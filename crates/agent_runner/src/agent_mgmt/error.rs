@@ -81,9 +81,12 @@ impl From<shared_types::version_util::VersionParseError> for AgentMgmtError {
 /// - `TooLarge` → `ArchiveBomb` → `ERR_AGENT_MGMT_ARCHIVE_BOMB`（配额语义靠它承载）
 /// - `InvalidArchive` → `Archive`（两侧连错误消息文本都一致）
 ///
-/// 注意 `normalize_extracted_dir` 不走本通用映射——它的失败原先是 `InstallFailed`
-/// （→ `ERR_AGENT_MGMT_INSTALL_FAILED`），若经 `Io` 会漂成 `ERR_INTERNAL_SERVER_ERROR`，
-/// 属 wire 可见契约变更，由 `archive_installer::normalize_extracted_dir` 显式保留。
+/// 注意 `normalize_extracted_dir` 不走本通用映射，而是由
+/// `archive_installer::normalize_extracted_dir` 把 `Io` 显式改判为 `InstallFailed`。
+/// 那是本次重构**唯一一处 wire 可见的错误码变更**（原实现 rename 失败本就是
+/// `InstallFailed`，只有 `read_dir` 失败经 `?` 走 `Io`/`ERR_INTERNAL_SERVER_ERROR`；
+/// `download_utils` 已把两者收敛成同一个 `ArchiveError::Io`，封装层无从区分），
+/// 取舍与影响面见该函数文档。
 impl From<download_utils::ArchiveError> for AgentMgmtError {
     fn from(e: download_utils::ArchiveError) -> Self {
         match e {

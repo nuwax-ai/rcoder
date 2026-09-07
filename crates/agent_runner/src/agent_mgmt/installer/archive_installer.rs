@@ -56,10 +56,17 @@ pub fn find_entrypoint(extract_dir: &Path, command: &str) -> Option<PathBuf> {
 
 /// Strip a single wrapper directory (e.g. `deepagents-dev-templates-0.2.9/`).
 ///
-/// 错误码刻意保留为 `InstallFailed`（→ `ERR_AGENT_MGMT_INSTALL_FAILED`）：
-/// `download_utils` 侧把 normalize 失败归为 `ArchiveError::Io`，若走通用 `From`
-/// 映射会变成 `ERR_INTERNAL_SERVER_ERROR`——那是 wire 可见的契约变更，不该由一次
-/// 去重重构顺带引入。其余变体仍走通用映射。
+/// **本函数是这次去重里唯一一处 wire 可见的错误码变更，特此明写。**
+/// 原实现的 normalize 失败分两种码：rename 失败 → `InstallFailed`
+/// （`ERR_AGENT_MGMT_INSTALL_FAILED`），而 `read_dir` 失败经 `?` → `Io`
+/// （`ERR_INTERNAL_SERVER_ERROR`）。`download_utils` 把两者都收敛成
+/// `ArchiveError::Io`，封装层已无从区分，故统一映射为 `InstallFailed`：
+/// - rename 路径（较常见：跨设备/权限/目标已存在）错误码**不变**
+/// - `read_dir` 路径（罕见边界：解压刚成功后目录即不可读）由
+///   `ERR_INTERNAL_SERVER_ERROR` 变为 `ERR_AGENT_MGMT_INSTALL_FAILED`
+///
+/// 不为复刻这点差异给 `ArchiveError` 加变体：同一个"安装中剥壳步骤失败"原本返回两个
+/// 码本身就是不一致，`INSTALL_FAILED` 对调用方也更有信息量（安装确实失败了）。
 pub fn normalize_extracted_dir(agent_dir: &Path) -> AgentMgmtResult<bool> {
     archive::normalize_extracted_dir(agent_dir).map_err(|e| match e {
         ArchiveError::Io(io) => AgentMgmtError::InstallFailed(format!(
@@ -216,10 +223,13 @@ mod tests {
         }
     }
 
-    /// normalize 失败的错误码必须仍是 `ERR_AGENT_MGMT_INSTALL_FAILED`，
-    /// 不能被通用 From 映射漂成 `ERR_INTERNAL_SERVER_ERROR`（wire 可见契约）。
+    /// normalize 失败统一判为 `ERR_AGENT_MGMT_INSTALL_FAILED`。
+    ///
+    /// 这里用不存在的目录触发的是 `read_dir` 失败路径——**该路径原先返回的是
+    /// `Io`/`ERR_INTERNAL_SERVER_ERROR`**，统一后变了（见函数文档，是本次重构
+    /// 唯一一处 wire 可见错误码变更）。本测试把这个新契约钉住，避免将来无意漂移。
     #[test]
-    fn normalize_failure_keeps_install_failed_error_code() {
+    fn normalize_failure_maps_to_install_failed() {
         let tmp = tempdir().unwrap();
         // 不存在的路径 → normalize 内部 IO 失败
         let missing = tmp.path().join("does-not-exist");
