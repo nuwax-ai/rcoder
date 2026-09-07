@@ -33,6 +33,20 @@ mkdir -p "$WS/code" "$WS/config" /home/user/data /home/user/logs
 chown postgres:postgres /home/user/data 2>/dev/null || true
 install -d -o postgres -g postgres "$PGDATA"
 
+# 存量数据属主兜底（与 agent-runner start-up.sh 同款）：镜像换代可能漂移 postgres
+# 系统用户 uid（现已在镜像里钉死 111:121），UserApp workspace PVC 上旧 PGDATA 文件
+# 属主对不上时 postgres 读 600 的 postgresql.conf 直接 FATAL Permission denied。
+# 此处以 root 在 supervisord 拉起 PG 之前整目录收敛（一次性，命中过即跳过）；
+# 不能放进 pg-supervisor-entry.sh —— 它以 user=postgres 运行，无权 chown 他人文件。
+# ⚠️ 本脚本 set -e：chown 必须 || 兜底，失败不得中断整个 UserApp 启动链。
+if [ -s "$PGDATA/PG_VERSION" ]; then
+    _pg_ver_owner="$(stat -c '%u' "$PGDATA/PG_VERSION" 2>/dev/null || true)"
+    if [ -n "$_pg_ver_owner" ] && [ "$_pg_ver_owner" != "$(id -u postgres)" ]; then
+        echo "[pg] PGDATA 属主漂移: PG_VERSION owner=$_pg_ver_owner != postgres(uid=$(id -u postgres)) → 递归 chown 收敛"
+        chown -R postgres:postgres "$PGDATA" || echo "[pg] WARN: 递归 chown 失败, postgres 大概率仍将 FATAL（查 dmesg/存储）"
+    fi
+fi
+
 # ============================================================================
 # 1. PostgreSQL 首次 initdb 已异步化 —— 由 supervisor 托管的
 #    /usr/local/bin/pg-supervisor-entry.sh 在 [program:postgresql] 里幂等执行

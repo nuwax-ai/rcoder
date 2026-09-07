@@ -321,8 +321,14 @@ RUN apt-get update && \
     printf 'polkit.addRule(function(action, subject) {\n    if (subject.user === "user") {\n        return polkit.Result.YES;\n    }\n});\n' > /etc/polkit-1/rules.d/49-allow-all-user.rules && \
     # ========== 系统级自启动配置 (不受用户目录挂载影响) ==========
     mkdir -p /etc/xdg/autostart && \
-    # PolicyKit authentication agent autostart
-    printf "[Desktop Entry]\nType=Application\nName=PolicyKit Auth\nExec=/usr/bin/lxpolkit\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true\nStartupNotify=false" > /etc/xdg/autostart/polkit-gnome-auth.desktop && \
+    # 不启动任何 polkit GUI 认证代理：容器无 systemd-logind，代理注册时查不到登录会话
+    # 必失败（lxpolkit 会把失败弹成桌面 "No session for pid" Error 对话框；bookworm 时代
+    # polkit-gnome 同样失败只是静默）。删掉自建条目 + 包自带的 lxpolkit/mate-polkit
+    # autostart，防 XFCE 会话再拉起；polkitd 本体保留（下方 polkitd.desktop）。
+    # lxpolkit/mate-polkit 包不卸载：避免包集变化再扰动系统用户 uid 分配（postgres uid 曾因此漂移）。
+    rm -f /etc/xdg/autostart/polkit-gnome-auth.desktop \
+          /etc/xdg/autostart/lxpolkit.desktop \
+          /etc/xdg/autostart/polkit-mate-authentication-agent-1.desktop && \
     # D-Bus session autostart
     printf "[Desktop Entry]\nType=Application\nName=D-Bus Session\nExec=/usr/bin/dbus-launch --sh-syntax\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true" > /etc/xdg/autostart/dbus-session.desktop && \
     # PolicyKit daemon autostart
@@ -953,12 +959,18 @@ RUN mkdir -p /usr/local/share/ttyd
 # 开发完打包发布到 UserApp（app-runtime 镜像自带 PG）。
 # （pgweb 已退役删除——数据库 Web 控制台由 dbx 承担，AI 侧走 dbx MCP。）
 # ============================================================================
-# PostgreSQL 16（PGDG repo for bookworm）
+# PostgreSQL 16（PGDG repo for trixie）
 RUN install -d /etc/apt/keyrings && \
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
         -o /etc/apt/keyrings/postgresql.asc && \
     echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] http://apt.postgresql.org/pub/repos/apt trixie-pgdg main" \
         > /etc/apt/sources.list.d/pgdg.list && \
+    # 钉死 postgres uid/gid=111:121（=bookworm 时代值）：Debian 系统用户 uid 按包安装顺序
+    # 动态分配，包集变化即漂移（trixie 0.1.253 中 postgres 漂成 110:116），持久卷上旧
+    # PGDATA 文件属主对不上 → postgres FATAL "Permission denied"。预创建后 postgresql-common
+    # 检测到用户已存在会直接复用，不再重新分配；后续动态 uid 顺延一位，均镜像内部用户无持久数据。
+    groupadd -g 121 postgres && \
+    useradd -r -u 111 -g 121 -d /var/lib/postgresql -s /bin/bash postgres && \
     apt-get update && \
     apt-get install -y postgresql-16 && \
     rm -rf /var/lib/apt/lists/*

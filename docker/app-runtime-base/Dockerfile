@@ -112,6 +112,13 @@ RUN install -d /usr/share/postgresql-keyring && \
     chmod 644 /usr/share/postgresql-keyring/pgdg.gpg && \
     echo "deb [signed-by=/usr/share/postgresql-keyring/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt trixie-pgdg main" \
         > /etc/apt/sources.list.d/pgdg.list && \
+    # 钉死 postgres uid/gid=111:121（与 agent-runner 镜像舰队统一）：Debian 系统用户 uid
+    # 动态分配随包集漂移（本镜像 trixie 现值实测 102:105，bookworm 时代值已不可考），
+    # 持久卷 /home/user/data/pg（UserApp workspace PVC）旧数据属主对不上 → postgres
+    # FATAL "Permission denied"。预创建后 postgresql-common 复用既有用户；历史遗留 uid
+    # 由 start-app.sh 的属主检测 chown 一次性收敛。
+    groupadd -g 121 postgres && \
+    useradd -r -u 111 -g 121 -d /var/lib/postgresql -s /bin/bash postgres && \
     apt-get update && apt-get install -y postgresql-16 && rm -rf /var/lib/apt/lists/*
 
 # （pgweb 已退役删除——数据库 Web 控制台由 dbx 承担）

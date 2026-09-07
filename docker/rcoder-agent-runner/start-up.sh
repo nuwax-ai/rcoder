@@ -1044,8 +1044,8 @@ function start_display_and_desktop() {
 	# 启动 gnome-keyring-daemon
 	gnome-keyring-daemon --start --components=secrets,ssh,pkcs11 >/dev/null 2>&1 &
 
-	# 启动 PolicyKit 认证代理
-	/usr/bin/lxpolkit >/var/log/polkit-agent.log 2>&1 &
+	# 不启动 polkit GUI 认证代理：容器无 systemd-logind，任何进程都没有登录会话，
+	# 代理注册必失败且 lxpolkit 会把失败弹成桌面 Error 对话框（镜像 autostart 已一并移除）。
 
 	# 等待 gnome-keyring-daemon 启动（智能等待，最长 2 秒）
 	wait_for_process_pattern "gnome-keyring-daemon" 2 || true
@@ -1914,11 +1914,25 @@ function prepare_pg() {
     mkdir -p "$DBX_DATA_DIR"
 
     mkdir -p /app/logs
-    # 仅备好 PGDATA 目录归属（瞬时: 无 fsync、无递归 chown）。
+    # 仅备好 PGDATA 目录归属（瞬时: 无 fsync；递归 chown 仅在下方检测到属主漂移时触发）。
     # 只 chown .pgdata 本身，不碰 /home/user —— 旧版 `chown -R $(dirname $PGDATA)`
     # 会递归 chown 整个用户主目录（= /home/user），既慢（CephFS 递归）又会把用户
     # 项目文件属主错改成 postgres。
     install -d -o postgres -g postgres "$PGDATA"
+
+    # 存量数据属主兜底：镜像换代可能漂移 postgres 系统用户 uid（bookworm=111:121，
+    # trixie 0.1.253 包集变化曾漂成 110:116，现已在镜像里钉死），旧 PVC 上 PGDATA 内
+    # 文件属主对不上时 postgres 读 600 的 postgresql.conf 直接 FATAL Permission denied。
+    # 此处以 root 在 supervisord 拉起 PG 之前整目录收敛（一次性，命中过即跳过）；
+    # 不能放进 pg-supervisor-entry.sh —— 它以 user=postgres 运行，无权 chown 他人文件。
+    # 递归只落在 .pgdata 内（dev 库几百 MB，CephFS 秒级），不碰 /home/user 其余文件。
+    if [ -s "$PGDATA/PG_VERSION" ]; then
+        _pg_ver_owner="$(stat -c '%u' "$PGDATA/PG_VERSION" 2>/dev/null || true)"
+        if [ -n "$_pg_ver_owner" ] && [ "$_pg_ver_owner" != "$(id -u postgres)" ]; then
+            log "PGDATA 属主漂移: PG_VERSION owner=$_pg_ver_owner != postgres(uid=$(id -u postgres)) → 递归 chown 收敛"
+            chown -R postgres:postgres "$PGDATA" || log "WARN: 递归 chown 失败，postgres 大概率仍将 FATAL（查 dmesg/存储）"
+        fi
+    fi
 
     # 连接信息（供用户参考；postgres/dbx-web 进程由 supervisor 管）
     # （pgweb 已退役——数据库 Web 控制台由 dbx 承担）
