@@ -16,7 +16,8 @@
 //! owner 显式档：dev 懒创建开发容器需要 owner user_id（三档解析的显式档），
 //! 透传族 body 流式不解析——来源 = query 可见接口（tasks/static）与
 //! [`shared_types::USER_ID_HEADER`] header（Java userApp 出站统一携带），缺失降级
-//! userapp_metadata.owner（create-workspace/start 前置注册）。
+//! userapp_metadata.owner（create-workspace/start 前置注册）。例外：新 userApp
+//! 接口族（`NEW_ENDPOINT_*_PATHS`）body/query 自定位，同时提供 owner 显式档。
 //!
 //! 定位与转发内核在 [`super::upstream`]。
 
@@ -35,8 +36,8 @@ use crate::router::AppState;
 
 use super::semantics::{
     DevAbsentAction, HttpResultError, SkipKind, cancel_skip_response, classify_dev_absent,
-    dev_container_absent, dev_stop_skip_response, require_query_app_id, require_query_user_id,
-    require_static_user_id, unavailable_response,
+    dev_container_absent, dev_stop_skip_response, optional_query_id, require_query_app_id,
+    require_query_user_id, require_static_user_id, unavailable_response,
 };
 use super::upstream::{
     STATIC_PATH_PREFIX, TASKS_PATH_PREFIX, explicit_user_id_from_headers, forward_to_dev,
@@ -69,9 +70,15 @@ fn parse_app_stage(req: &Request) -> Result<UserappStage, Box<Response>> {
 
 /// `/api/v1/userapp/{*rest}` 通配透传 handler。
 ///
-/// 容器懒启动语义分派：tasks 族 query app_id 自描述定位（不消费 X-App-Id），
+/// 容器懒启动语义分派（四级，前者短路）：
+/// 1. tasks 族：query app_id+user_id 自描述定位（不消费 X-App-Id）；
+/// 2. static 族：path app_id 段 + query user_id；
+/// 3. 新 userApp 接口族（dev server 生命周期/build/ensure-workspace）：POST
+///    body / GET query 自定位——header 优先兼容，Java 直连可零 header；
+/// 4. 其余（TS 同名老族，file-server-proxy 反代形态）：X-App-Id header 必填。
+///
 /// 容器不在时按 [`classify_dev_absent`] 短路（cancel/dev-stop 成功、查询类
-/// CONTAINER_NOT_FOUND）或 ensure 创建；static 族 query user_id 必填（显式档）。
+/// CONTAINER_NOT_FOUND）或 ensure 创建。
 pub(crate) async fn forward_userapp(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     req: Request,
@@ -148,6 +155,13 @@ pub(crate) async fn forward_userapp(
         return forward_to_dev(&state, &app_id, req, Some(&user_id)).await;
     }
 
+    // 新 userApp 接口族：body/query 自定位（无 header 依赖——老族 header 契约
+    // 保留给 file-server-proxy 反代 file-server 模块使用）。dev-only（忽略
+    // X-App-Stage，与 tasks/static 同语义）。
+    if let Some(locate) = new_endpoint_locator(&path) {
+        return forward_new_endpoint(&state, locate, query.as_deref(), req).await;
+    }
+
     let Some(app_id) = require_app_id(&req) else {
         return missing_app_id_response();
     };
@@ -157,37 +171,9 @@ pub(crate) async fn forward_userapp(
     };
     match stage {
         UserappStage::Dev => {
-            // ensure-workspace 特判：body 小 JSON（app_id+user_id），完整读取提取
-            // user_id 作懒创建显式 owner 档——透传族流式不解析 body，新 app 无
-            // metadata owner 时 ensure 必 502 "cannot resolve owner user_id"
-            // （body 的 user_id 被透传忽略）。提取后带原 body 重组转发。
-            if path == "/api/v1/userapp/ensure-workspace" {
-                return forward_ensure_workspace(&state, &app_id, req).await;
-            }
             // 停止/查询短路：仅容器不在时生效（容器在则照常转发）
-            let action = classify_dev_absent(&path);
-            let short_circuit =
-                !matches!(action, DevAbsentAction::Ensure) && dev_container_absent(&state, &app_id);
-            if short_circuit {
-                return match action {
-                    DevAbsentAction::SkipSuccess(SkipKind::DevStop) => {
-                        info!(
-                            "[USERAPP_FORWARD] dev container absent, dev/stop short-circuit ok: app_id={app_id}"
-                        );
-                        dev_stop_skip_response(&app_id)
-                    }
-                    // cancel 已在 tasks 分支按 query app_id 处理；此处兜底不可达
-                    DevAbsentAction::SkipSuccess(SkipKind::CancelTask(task_id)) => {
-                        cancel_skip_response(&task_id)
-                    }
-                    DevAbsentAction::Unavailable => {
-                        info!(
-                            "[USERAPP_FORWARD] dev container absent, dev/list rejected: app_id={app_id}"
-                        );
-                        unavailable_response(&app_id)
-                    }
-                    DevAbsentAction::Ensure => unreachable!("Ensure 已被 short_circuit 条件排除"),
-                };
+            if let Some(resp) = dev_absent_short_circuit(&state, &app_id, &path) {
+                return resp;
             }
             info!(
                 "[USERAPP_FORWARD] {} {} -> dev container (app_id={app_id})",
@@ -397,31 +383,216 @@ pub(crate) async fn computer_intercept(
     }
 }
 
-/// ensure-workspace 专用转发：读取小 JSON body 提取 user_id 作懒创建显式
-/// owner 档（透传族流式不解析 body 的例外——此接口 body 天然小且语义就是
-/// "幂等建目录"），body 无 user_id 时降级 [`shared_types::USER_ID_HEADER`]
-/// 提取，提取后带原 body 重组转发到开发容器。
-async fn forward_ensure_workspace(state: &AppState, app_id: &str, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    // header 档先于 body 解析校验（非法值 400 短路，不做无谓 body 读取）
-    let header_user_id = match explicit_user_id_from_headers(&parts.headers) {
+// ── 新 userApp 接口族：body/query 自定位（无 header 依赖） ──────────────────
+// （ensure-workspace 曾有的 body 特判已被本族通用路径吸收）
+
+/// 新 userApp 接口族定位形态（分界：老族 header 契约保留给 file-server-proxy
+/// 反代 file-server 模块使用；新族 Java 直连，定位参数就在接口签名本体）。
+#[derive(Clone, Copy)]
+enum NewEndpointLocate {
+    /// POST 小 JSON body `{app_id, user_id}`（容器侧 DevOpBody/
+    /// BuildUserAppBody/UserappEnsureWorkspaceBody 均必填 snake_case）。
+    Body,
+    /// GET query `app_id`+`user_id`（容器侧 UserappDevListQuery/
+    /// UserappFrameworkInfoQuery 均必填）。
+    Query,
+}
+
+/// 新族 POST body 定位路径清单（精确匹配）。**容器侧加新 dev 接口须同步登记**
+/// （守卫测试锁清单与容器侧路由对照，防漏登记退回 header 必填）。
+pub(super) const NEW_ENDPOINT_BODY_PATHS: [&str; 5] = [
+    "/api/v1/userapp/dev/start",
+    "/api/v1/userapp/dev/stop",
+    "/api/v1/userapp/dev/restart",
+    "/api/v1/userapp/build",
+    "/api/v1/userapp/ensure-workspace",
+];
+/// 新族 GET query 定位路径清单。
+pub(super) const NEW_ENDPOINT_QUERY_PATHS: [&str; 2] = [
+    "/api/v1/userapp/dev/list",
+    "/api/v1/userapp/dev/framework-info",
+];
+
+fn new_endpoint_locator(path: &str) -> Option<NewEndpointLocate> {
+    if NEW_ENDPOINT_BODY_PATHS.contains(&path) {
+        Some(NewEndpointLocate::Body)
+    } else if NEW_ENDPOINT_QUERY_PATHS.contains(&path) {
+        Some(NewEndpointLocate::Query)
+    } else {
+        None
+    }
+}
+
+/// POST body 小 JSON 的 `app_id`/`user_id` 提取（snake_case 容器契约本体，
+/// 不认 camelCase——避免 Java DTO 形态漏进 rcoder 契约；非 JSON/缺字段/
+/// 空白均视为未携带，由 header 档兜底）。
+fn extract_body_ids(bytes: &[u8]) -> (Option<String>, Option<String>) {
+    fn id_field(v: &serde_json::Value, key: &str) -> Option<String> {
+        v.get(key)?
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+    let v = match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    (id_field(&v, "app_id"), id_field(&v, "user_id"))
+}
+
+/// 新族转发：app_id/user_id 解析顺位均为 **header > body/query**（存量调用方
+/// 与 file-server-proxy 反代形态优先，Java 直连可零 header）；owner 显式档
+/// 之后的 metadata 兜底由 ensure 链自答。dev-only（忽略 X-App-Stage——契约恒
+/// UserappBuilder，与 tasks/static 同语义）。
+async fn forward_new_endpoint(
+    state: &AppState,
+    locate: NewEndpointLocate,
+    query: Option<&str>,
+    req: Request,
+) -> Response {
+    let path = req.uri().path().to_string();
+    // header 档先提取（body 读取前——x-user-id 非法值 400 短路不做无谓读取）
+    let header_app = require_app_id(&req);
+    let header_user = match explicit_user_id_from_headers(req.headers()) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    // ensure-workspace body 小 JSON，上限 1MB 兜底防滥用
-    let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return HttpResultError::bad_request(format!("read ensure-workspace body: {e}"))
+    match locate {
+        NewEndpointLocate::Body => {
+            let (parts, body) = req.into_parts();
+            // 新族 body 为小 JSON（构建/生命周期契约恒小），上限 1MB 兜底防滥用
+            let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return HttpResultError::bad_request(format!("read request body: {e}"))
+                        .into_response();
+                }
+            };
+            let (body_app, body_user) = extract_body_ids(&bytes);
+            let Some(app_id) = header_app.or(body_app) else {
+                return HttpResultError::bad_request(
+                    "missing app_id: pass `X-App-Id` header or body `app_id` field",
+                )
                 .into_response();
+            };
+            // header 档已在提取处过白名单；body 档在此校验（统一再验幂等）
+            if let Err(e) = shared_types::validate_identifier(&app_id, "app_id") {
+                return HttpResultError::bad_request(e).into_response();
+            }
+            let explicit_user_id = header_user.or(body_user);
+            if let Some(resp) = dev_absent_short_circuit(state, &app_id, &path) {
+                return resp;
+            }
+            info!(
+                "[USERAPP_FORWARD] {} {path} -> dev container (app_id={app_id}, body-located)",
+                parts.method
+            );
+            // 重组原请求（method/uri/headers 原样）带原 body 转发
+            let rebuilt = Request::from_parts(parts, axum::body::Body::from(bytes));
+            forward_to_dev(state, &app_id, rebuilt, explicit_user_id.as_deref()).await
         }
-    };
-    let user_id = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|v| v.get("user_id").and_then(|u| u.as_str()).map(str::to_owned))
-        .filter(|u| !u.trim().is_empty())
-        .or(header_user_id);
-    // 重组原请求（method/uri/headers 原样）带原 body 转发
-    let rebuilt = Request::from_parts(parts, axum::body::Body::from(bytes));
-    forward_to_dev(state, app_id, rebuilt, user_id.as_deref()).await
+        NewEndpointLocate::Query => {
+            let query_app = match optional_query_id(query, "app_id", "app_id") {
+                Ok(v) => v,
+                Err(e) => return e.into_response(),
+            };
+            let query_user = match optional_query_id(query, "user_id", "user_id") {
+                Ok(v) => v,
+                Err(e) => return e.into_response(),
+            };
+            let Some(app_id) = header_app.or(query_app) else {
+                return HttpResultError::bad_request(
+                    "missing app_id: pass `X-App-Id` header or query parameter `app_id`",
+                )
+                .into_response();
+            };
+            let explicit_user_id = header_user.or(query_user);
+            if let Some(resp) = dev_absent_short_circuit(state, &app_id, &path) {
+                return resp;
+            }
+            info!(
+                "[USERAPP_FORWARD] {} {path} -> dev container (app_id={app_id}, query-located)",
+                req.method()
+            );
+            forward_to_dev(state, &app_id, req, explicit_user_id.as_deref()).await
+        }
+    }
+}
+
+/// 容器不在时的短路分派（查询类 unavailable / dev-stop skip-success）；
+/// cancel 兜底不可达——tasks 分支已按 query app_id 处理。容器在（或该路径
+/// 无短路语义）返回 `None` 照常转发。
+fn dev_absent_short_circuit(state: &AppState, app_id: &str, path: &str) -> Option<Response> {
+    let action = classify_dev_absent(path);
+    if matches!(action, DevAbsentAction::Ensure) || !dev_container_absent(state, app_id) {
+        return None;
+    }
+    Some(match action {
+        DevAbsentAction::SkipSuccess(SkipKind::DevStop) => {
+            info!(
+                "[USERAPP_FORWARD] dev container absent, dev/stop short-circuit ok: app_id={app_id}"
+            );
+            dev_stop_skip_response(app_id)
+        }
+        // cancel 已在 tasks 分支按 query app_id 处理；此处兜底不可达
+        DevAbsentAction::SkipSuccess(SkipKind::CancelTask(task_id)) => {
+            cancel_skip_response(&task_id)
+        }
+        DevAbsentAction::Unavailable => {
+            info!("[USERAPP_FORWARD] dev container absent, query rejected: app_id={app_id}");
+            unavailable_response(app_id)
+        }
+        DevAbsentAction::Ensure => unreachable!("Ensure 已提前返回 None"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// locator 形态判别：7 条新族路径精确命中，近邻老族/未知路径不误命中。
+    #[test]
+    fn new_endpoint_locator_matches_exact_paths_only() {
+        assert!(matches!(
+            new_endpoint_locator("/api/v1/userapp/dev/start"),
+            Some(NewEndpointLocate::Body)
+        ));
+        assert!(matches!(
+            new_endpoint_locator("/api/v1/userapp/dev/restart"),
+            Some(NewEndpointLocate::Body)
+        ));
+        assert!(matches!(
+            new_endpoint_locator("/api/v1/userapp/ensure-workspace"),
+            Some(NewEndpointLocate::Body)
+        ));
+        assert!(matches!(
+            new_endpoint_locator("/api/v1/userapp/dev/list"),
+            Some(NewEndpointLocate::Query)
+        ));
+        assert!(matches!(
+            new_endpoint_locator("/api/v1/userapp/dev/framework-info"),
+            Some(NewEndpointLocate::Query)
+        ));
+        // 老族（header 契约）与前缀相近的未知路径不命中
+        assert!(new_endpoint_locator("/api/v1/userapp/get-file-list").is_none());
+        assert!(new_endpoint_locator("/api/v1/userapp/dev/unknown").is_none());
+        assert!(new_endpoint_locator("/api/v1/userapp/dev/start/extra").is_none());
+    }
+
+    /// body id 提取：snake_case 有效；camelCase 不认（契约不沾染 Java DTO）；
+    /// 非 JSON/缺字段/空白 = 未携带（header 档兜底）。
+    #[test]
+    fn extract_body_ids_only_takes_snake_case() {
+        let ok = br#"{"app_id":"a1","user_id":"u1"}"#;
+        assert_eq!(extract_body_ids(ok), (Some("a1".into()), Some("u1".into())));
+        // camelCase 视为未携带
+        let camel = br#"{"appId":5}"#;
+        assert_eq!(extract_body_ids(camel), (None, None));
+        // 空白/缺失字段视为未携带
+        let blank = br#"{"app_id":"  ","user_id":"u1"}"#;
+        assert_eq!(extract_body_ids(blank), (None, Some("u1".into())));
+        assert_eq!(extract_body_ids(br#"not json"#), (None, None));
+        assert_eq!(extract_body_ids(b"{}"), (None, None));
+    }
 }

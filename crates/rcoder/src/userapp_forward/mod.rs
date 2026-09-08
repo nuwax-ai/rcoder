@@ -298,4 +298,35 @@ mod tests {
             );
         }
     }
+
+    /// 新接口族（body/query 自定位）防死链：清单路径必须存在于容器侧对外文档。
+    #[test]
+    fn new_endpoint_paths_exist_in_container_doc() {
+        let document = file_server_userapp::document();
+        for path in forward::NEW_ENDPOINT_BODY_PATHS
+            .iter()
+            .chain(forward::NEW_ENDPOINT_QUERY_PATHS.iter())
+        {
+            assert!(
+                document.paths.paths.contains_key(*path),
+                "new-endpoint path missing in container doc: {path}"
+            );
+        }
+    }
+
+    /// 新接口族路由可达性：locator 清单必须是透传清单子集——不在
+    /// CONTAINER_PASS_THROUGH_PATHS 里登记的路径根本进不了 forward_userapp，
+    /// locator 匹配形同虚设（新族接口漏登记即在此报红，而非退回 header 必填）。
+    #[test]
+    fn new_endpoint_paths_are_pass_through_subset() {
+        for path in forward::NEW_ENDPOINT_BODY_PATHS
+            .iter()
+            .chain(forward::NEW_ENDPOINT_QUERY_PATHS.iter())
+        {
+            assert!(
+                CONTAINER_PASS_THROUGH_PATHS.contains(path),
+                "new-endpoint path not in pass-through table (unroutable): {path}"
+            );
+        }
+    }
 }

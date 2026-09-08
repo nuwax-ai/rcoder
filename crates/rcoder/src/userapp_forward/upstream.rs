@@ -73,8 +73,12 @@ fn connection_listed_tokens(headers: &axum::http::HeaderMap) -> Vec<String> {
 /// （与 TS 一致性设计），app_id 原样进入容器标识与 Docker bind 宿主路径拼接
 /// （`host_root.join(app_id)`），含 `/` 即逃逸开发卷根把宿主任意目录挂进容器。
 pub(super) fn require_app_id(req: &Request) -> Option<String> {
-    let raw = req
-        .headers()
+    app_id_from_headers(req.headers())
+}
+
+/// [`require_app_id`] 的 HeaderMap 版本（body 读取重组后 parts.headers 复用）。
+pub(super) fn app_id_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
         .get(APP_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)

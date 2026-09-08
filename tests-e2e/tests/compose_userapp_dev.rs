@@ -1486,3 +1486,128 @@ async fn userapp_dev_owner_header_lazy_ensure() {
     assert_hard_all(report).await;
     cleanup_builder(&app);
 }
+
+// ============================================================
+// 场景 7：新接口族 body/query 自定位（无 header 依赖）
+//   生产对接断链（testagent 400 missing x-app-id）：Java 直连新 userApp
+//   接口（dev server 生命周期/build/ensure-workspace）定位参数自携带，
+//   header 契约保留给 TS 老族（file-server-proxy 反代形态）。
+// ============================================================
+#[tokio::test]
+async fn userapp_dev_new_endpoint_body_query_locate() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_nep";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "n1");
+    let user = "e2e-ud-nepuser";
+
+    // A｜body-only POST dev/restart：无任何 X- header，body snake_case 自定位
+    //    （含懒创建——body user_id 即 owner 显式档）。重试幂等（容器冷启动窗口）
+    let mut ok_a = false;
+    let (mut status_a, mut body_a) = (reqwest::StatusCode::BAD_REQUEST, Value::Null);
+    for attempt in 0..3 {
+        let resp = env
+            .http
+            .post(format!("{}/api/v1/userapp/dev/restart", env.rcoder))
+            .timeout(Duration::from_secs(120))
+            .json(&json!({"app_id": app, "user_id": user}))
+            .send()
+            .await
+            .expect("body-located post");
+        status_a = resp.status();
+        body_a = resp.json().await.unwrap_or(Value::Null);
+        if status_a.is_success() && http_ok(&body_a) && body_a["data"]["task_id"].is_string() {
+            ok_a = true;
+            break;
+        }
+        report.diagnostic(
+            "body 定位懒创建冷启动重试",
+            &format!("attempt {attempt}"),
+            &trunc(&body_a, 100),
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    report.assert_hard(
+        "A：body-only dev/restart 自定位（零 header，懒创建+任务受理）",
+        ok_a,
+        format!("HTTP {status_a}, {}", trunc(&body_a, 140)),
+    );
+
+    // B｜query-only GET dev/list：无 header，query app_id+user_id 自定位
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/dev/list?app_id={app}&user_id={user}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .expect("query-located get");
+    let status_b = resp.status();
+    let body_b: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "B：query-only dev/list 自定位（零 header，list 信封可达）",
+        status_b.is_success() && http_ok(&body_b) && body_b["data"]["list"].is_array(),
+        format!("HTTP {status_b}, {}", trunc(&body_b, 120)),
+    );
+
+    // C｜camelCase body 不被识别（契约不沾染 Java DTO）→ 400 双来源指引
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/dev/restart", env.rcoder))
+        .timeout(Duration::from_secs(15))
+        .json(&json!({"appId": app, "userId": user}))
+        .send()
+        .await
+        .expect("camelCase post");
+    let status_c = resp.status();
+    let body_c: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "C：camelCase body 不识别 → 400（指引 X-App-Id header 或 body app_id 字段）",
+        status_c.as_u16() == 400
+            && body_c["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("missing app_id")),
+        format!("HTTP {status_c}, {}", trunc(&body_c, 120)),
+    );
+
+    // D｜老族 header 契约不变：TS 老路径无 X-App-Id 仍拒（file-server-proxy 形态保留）
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/get-file-list", env.rcoder))
+        .timeout(Duration::from_secs(15))
+        .header("X-App-Id", &app)
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("legacy header post");
+    // 带 header 的老族调用可达（容器侧自答参数校验）——不带则 400 missing header
+    let resp2 = env
+        .http
+        .post(format!("{}/api/v1/userapp/get-file-list", env.rcoder))
+        .timeout(Duration::from_secs(15))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("legacy no-header post");
+    let status_d = resp2.status();
+    let body_d: Value = resp2.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "D：TS 老族 header 必填不变（无 X-App-Id 仍 400——反代契约保留）",
+        status_d.as_u16() == 400
+            && body_d["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("x-app-id")),
+        format!(
+            "HTTP {status_d}（带 header 对照 HTTP {}）",
+            resp.status()
+        ),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}

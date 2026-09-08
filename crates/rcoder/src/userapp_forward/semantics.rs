@@ -171,6 +171,25 @@ pub(super) fn require_static_user_id(query: Option<&str>) -> Result<String, Http
         .map_err(HttpResultError::bad_request)
 }
 
+/// 可选档 query id 提取（新 userApp 接口族 query 自定位）：缺失/空白返回
+/// `Ok(None)`（调用方按「header > query」合并），存在则过 identifier 白名单
+/// （非法 400 fail-fast，不静默降级——防配置错误被吞）。
+pub(super) fn optional_query_id(
+    query: Option<&str>,
+    key: &str,
+    label: &str,
+) -> Result<Option<String>, HttpResultError> {
+    let Some(raw) = query_param(query, key)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    shared_types::validate_identifier(raw, label)
+        .map(|_| Some(raw.to_string()))
+        .map_err(HttpResultError::bad_request)
+}
+
 // ── HttpResult 错误响应（透传层自身错误；上游业务响应原样透传不重包装） ──────────
 
 /// 轻量错误值（Result 大 Err 侧禁用 Response 本体；测试 unwrap 需 Debug）。
