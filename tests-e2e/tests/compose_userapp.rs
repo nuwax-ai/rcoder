@@ -56,10 +56,11 @@ async fn test_publish_endpoints_removed(env: &Env, report: &JsonlReporter) {
     );
 }
 
-/// file-server build 入口校验：缺转发 header `X-App-Id` → 400 快速失败（不挂起、
-/// 无容器副作用）。body 内 app_id 格式的严格校验是 TS 对齐语义（file-server 侧
-/// 仅 not_blank），随 nuwax-file-server 改造对齐，不在本测试范围。
+/// file-server build 入口定位校验（30f86a1 body 自定位语义）：定位参数自携带，
+/// 解析顺位 header > body——缺 header 时 body `app_id` 自定位受理；header 与
+/// body 双缺 → 400 快速失败（双来源指引 message，不挂起）。
 async fn test_build_identifier_validation(env: &Env, report: &JsonlReporter) {
+    // ① 缺 header + body 自定位 → 受理（200 + task_id）
     let t0 = Instant::now();
     let resp = env
         .http
@@ -70,11 +71,39 @@ async fn test_build_identifier_validation(env: &Env, report: &JsonlReporter) {
         .await
         .expect("http post");
     let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
     let elapsed = t0.elapsed();
     report.assert_hard(
-        "build 缺 X-App-Id 返回 400 且不挂起",
-        status.as_u16() == 400 && elapsed < Duration::from_secs(5),
-        format!("HTTP {status}, {:.1}s", elapsed.as_secs_f64()),
+        "build 缺 header 时 body app_id 自定位受理且不挂起",
+        status.as_u16() == 200 && body.contains("task_id") && elapsed < Duration::from_secs(10),
+        format!(
+            "HTTP {status}, {:.1}s, body 截断: {}",
+            elapsed.as_secs_f64(),
+            &body[..body.len().min(80)]
+        ),
+    );
+
+    // ② 双缺（header 与 body 均无 app_id）→ 400 双来源指引
+    let t1 = Instant::now();
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/build", env.rcoder))
+        .timeout(Duration::from_secs(15))
+        .json(&json!({"user_id": "e2e-user"}))
+        .send()
+        .await
+        .expect("http post");
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let elapsed = t1.elapsed();
+    report.assert_hard(
+        "build 双缺 app_id → 400 双来源指引且不挂起",
+        status.as_u16() == 400 && body.contains("X-App-Id") && elapsed < Duration::from_secs(5),
+        format!(
+            "HTTP {status}, {:.1}s, body 截断: {}",
+            elapsed.as_secs_f64(),
+            &body[..body.len().min(80)]
+        ),
     );
 }
 
