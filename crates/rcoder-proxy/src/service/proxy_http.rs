@@ -42,6 +42,18 @@ impl ProxyHttp for PortProxy {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> PingoraResult<bool> {
+        // dbx 入口尾斜杠规范化（先于唤醒判定——重定向后的二次请求才进入 wake，
+        // stopped app 不在无子路径请求上空等一轮）。
+        let raw_uri = session.req_header().uri.clone();
+        if let Some(location) =
+            dbx_root_redirect_location(&self.router, raw_uri.path(), raw_uri.query())
+        {
+            let mut resp = ResponseHeader::build(307, None)?;
+            resp.insert_header("Location", location)?;
+            session.write_response_header(Box::new(resp), true).await?;
+            return Ok(true); // 已直接响应，跳过 upstream
+        }
+
         // 前缀快滤，避免每请求都走 matchit 树匹配（其余路由 /proxy/{port}、
         // /web/ttyd、/computer/vnc、/api/* 等直接放行；dev 流量无闲置回收语义，不触发）
         let path = Self::normalize_path(session.req_header().uri.path());
@@ -326,6 +338,37 @@ fn classify_wake_target(router: &matchit::Router<RouteType>, path: &str) -> Opti
     }
 }
 
+/// dbx 入口无尾斜杠 → 307 目标（原路径 + `/`，query 原样保留；相对 Location，
+/// 不拼 origin——代理可被挂任意 host/端口下）。
+///
+/// dbx-web 是相对路径 SPA（index.html `./assets/...`），浏览器以 URL 目录段为
+/// 基准解析相对引用——无尾斜杠时 `{app_id}` 被当文件名、基准向上错位一级
+/// （`./assets` 落到 `/{user_id}/assets` → 静态资源 404 白屏）。判定=路由命中
+/// dbx 族且逻辑上无子路径（`{*path}` 缺失或为空——两种 matchit 命中形态等价，
+/// 不依赖 matchit 在精确/通配间的择优）；带尾斜杠/带子路径请求不受影响，
+/// `!path.ends_with('/')` 兼作 matchit 尾斜杠行为变化时的死循环双保险。
+fn dbx_root_redirect_location(
+    router: &matchit::Router<RouteType>,
+    path: &str,
+    query: Option<&str>,
+) -> Option<String> {
+    if !path.starts_with("/api/v1/userapp/proxy/dbx/") || path.ends_with('/') {
+        return None;
+    }
+    let matched = router.at(path).ok()?;
+    match matched.value {
+        RouteType::DevDbxProxy | RouteType::ProdDbxProxy
+            if matched.params.get("path").is_none_or(|p| p.is_empty()) =>
+        {
+            Some(match query {
+                Some(q) => format!("{path}/?{q}"),
+                None => format!("{path}/"),
+            })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,7 +416,57 @@ mod tests {
         // dev 工具族走 builder 注册表定位，不在 prod 唤醒范围
         assert!(classify_wake_target(&router, "/api/v1/userapp/proxy/ttyd/dev/u1/app-1").is_none());
         // 旧路径形态（前缀统一前）不再命中任何 userApp 路由
-        assert!(classify_wake_target(&router, "/userapp/prod/ttyd/u1/app-1").is_none());
-        assert!(classify_wake_target(&router, "/proxy/userapp/prod/u1/app-1/x").is_none());
+        assert!(classify_wake_target(&router, "/userapp/proxy/ttyd/u1/app-1").is_none());
+        assert!(classify_wake_target(&router, "/proxy/userapp/proxy/1/app-1/x").is_none());
+    }
+
+    /// dbx 入口无尾斜杠：307 到同路径 + `/`（query 原样保留），dev/prod 双阶段。
+    #[test]
+    fn dbx_root_without_trailing_slash_redirects() {
+        let router = test_router();
+        assert_eq!(
+            dbx_root_redirect_location(&router, "/api/v1/userapp/proxy/dbx/dev/4/5", None),
+            Some("/api/v1/userapp/proxy/dbx/dev/4/5/".to_string())
+        );
+        assert_eq!(
+            dbx_root_redirect_location(
+                &router,
+                "/api/v1/userapp/proxy/dbx/prod/4/app-5",
+                Some("a=1")
+            ),
+            Some("/api/v1/userapp/proxy/dbx/prod/4/app-5/?a=1".to_string())
+        );
+    }
+
+    /// 带尾斜杠/带子路径已是正确基准不重定向；其他工具族与无关路由不误伤。
+    #[test]
+    fn dbx_paths_with_content_do_not_redirect() {
+        let router = test_router();
+        let base = "/api/v1/userapp/proxy/dbx/dev/4/5";
+        assert_eq!(
+            dbx_root_redirect_location(&router, &format!("{base}/"), None),
+            None
+        );
+        assert_eq!(
+            dbx_root_redirect_location(&router, &format!("{base}/assets/index.js"), None),
+            None
+        );
+        assert_eq!(
+            dbx_root_redirect_location(&router, &format!("{base}/api/auth/check"), None),
+            None
+        );
+        // ttyd/vnc 非 dbx 族不受影响（ttyd 为 WS 直连形态，无相对路径基准问题）
+        assert_eq!(
+            dbx_root_redirect_location(&router, "/api/v1/userapp/proxy/ttyd/dev/4/5", None),
+            None
+        );
+        assert_eq!(
+            dbx_root_redirect_location(&router, "/api/v1/userapp/proxy/ttyd/prod/4/5", None),
+            None
+        );
+        assert_eq!(
+            dbx_root_redirect_location(&router, "/web/ttyd/u1", None),
+            None
+        );
     }
 }

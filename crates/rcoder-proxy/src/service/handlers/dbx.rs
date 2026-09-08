@@ -10,6 +10,8 @@
 //! location.pathname 运行时推断 base，index.html 全相对引用，API/WS 调用
 //! 自动拼回完整代理前缀——无需容器侧配置
 //! `DBX_PUBLIC_BASE_PATH`。WebSocket（redis pubsub 等）由 Pingora 透传。
+//! 入口 URL 须以 `/` 结尾（相对路径的解析基准）：无尾斜杠访问由
+//! `request_filter` 的 `dbx_root_redirect_location` 307 规范化加斜杠。
 
 use std::sync::Arc;
 use std::time::Duration;
