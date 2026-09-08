@@ -940,14 +940,70 @@ async fn userapp_dev_dbx_proxy() {
         return;
     }
 
-    // Pingora dev/dbx → builder 容器 dbx-web 4224 GUI 页。
-    // 就绪轮询而非单发：ensure 刚建的开发容器里 dbx-web 恒起需 ~10s（产品行为
-    // =首访 502 秒级拉回、二访 200），单发断言在冷环境（dev-hot restart 后）必
-    // 撞 502 时序竞态；轮询只放宽就绪窗口，200 断言口径不变
     let pingora = std::env::var("E2E_PINGORA_URL")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:8089".to_owned());
+
+    // B4b 无尾斜杠规范化：dbx-web 是相对路径 SPA（index.html ./assets/...），浏览器
+    // 基准目录由 URL 尾斜杠决定——无尾斜杠时 {app_id} 被当文件名、./assets 向上
+    // 错位一级 → 静态资源 404 白屏；request_filter 对"恰好停在 {app_id} 的 dbx
+    // 入口"307 到同路径 + /（query 保留）。307 短路是纯路由判定，不依赖容器
+    // 就绪，先于就绪轮询断言。
+    let no_redirect = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("no-redirect client");
+    let root_url = format!("{pingora}/api/v1/userapp/proxy/dbx/dev/{user}/{app}");
+    let resp307 = no_redirect
+        .get(&root_url)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await;
+    let location = resp307.as_ref().ok().and_then(|r| {
+        r.headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    });
+    report.assert_hard(
+        "Pingora dev/dbx 无尾斜杠 → 307 + 相对 Location 带斜杠",
+        matches!(&resp307, Ok(r) if r.status() == reqwest::StatusCode::TEMPORARY_REDIRECT)
+            && location.as_deref()
+                == Some(format!("/api/v1/userapp/proxy/dbx/dev/{user}/{app}/").as_str()),
+        match &resp307 {
+            Ok(r) => format!("HTTP {} Location={location:?}", r.status()),
+            Err(e) => format!("err: {e}"),
+        },
+    );
+
+    // query 原样保留（SPA 侧状态参数随重定向不丢）
+    let resp_q = no_redirect
+        .get(format!("{root_url}?tab=1"))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await;
+    let loc_q = resp_q.as_ref().ok().and_then(|r| {
+        r.headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    });
+    report.assert_hard(
+        "Pingora dev/dbx 307 query 保留",
+        matches!(&resp_q, Ok(r) if r.status() == reqwest::StatusCode::TEMPORARY_REDIRECT)
+            && loc_q.as_deref()
+                == Some(format!("/api/v1/userapp/proxy/dbx/dev/{user}/{app}/?tab=1").as_str()),
+        match &resp_q {
+            Ok(r) => format!("HTTP {} Location={loc_q:?}", r.status()),
+            Err(e) => format!("err: {e}"),
+        },
+    );
+
+    // Pingora dev/dbx → builder 容器 dbx-web 4224 GUI 页。
+    // 就绪轮询而非单发：ensure 刚建的开发容器里 dbx-web 恒起需 ~10s（产品行为
+    // =首访 502 秒级拉回、二访 200），单发断言在冷环境（dev-hot restart 后）必
+    // 撞 502 时序竞态；轮询只放宽就绪窗口，200 断言口径不变
     let dbx_url = format!("{pingora}/api/v1/userapp/proxy/dbx/dev/{user}/{app}/");
     let deadline = Instant::now() + Duration::from_secs(30);
     let resp = loop {
@@ -969,6 +1025,23 @@ async fn userapp_dev_dbx_proxy() {
         ok,
         match &resp {
             Ok(r) => format!("HTTP {}", r.status()),
+            Err(e) => format!("err: {e}"),
+        },
+    );
+
+    // B4c 浏览器行为模拟：默认跟随重定向的 client 访问无尾斜杠 → 一次 307 后
+    // 最终 200 且 URL 收敛到带斜杠形态（相对路径基准正确，白屏场景根治）
+    let follow = env
+        .http
+        .get(&root_url)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await;
+    report.assert_hard(
+        "Pingora dev/dbx 无尾斜杠跟随重定向 → 200 + URL 收敛带斜杠",
+        matches!(&follow, Ok(r) if r.status().is_success() && r.url().path().ends_with('/')),
+        match &follow {
+            Ok(r) => format!("HTTP {} final={}", r.status(), r.url()),
             Err(e) => format!("err: {e}"),
         },
     );
@@ -1602,10 +1675,7 @@ async fn userapp_dev_new_endpoint_body_query_locate() {
             && body_d["message"]
                 .as_str()
                 .is_some_and(|m| m.contains("x-app-id")),
-        format!(
-            "HTTP {status_d}（带 header 对照 HTTP {}）",
-            resp.status()
-        ),
+        format!("HTTP {status_d}（带 header 对照 HTTP {}）", resp.status()),
     );
 
     assert_hard_all(report).await;
