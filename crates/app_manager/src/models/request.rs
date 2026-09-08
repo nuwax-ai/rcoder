@@ -10,7 +10,9 @@ use super::commons::{AppStatus, HealthCheckConfig, PortConfig, ResourceLimits};
 /// 创建应用请求
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAppRequest {
-    /// 应用 ID（可选，外部指定；格式 `app-` + DNS-1123，如 `app-order-svc`；None=自动生成）
+    /// 应用 ID（可选，外部指定；DNS-1123 label：小写字母/数字/连字符，1-33 字符且不以
+    /// '-' 开头或结尾，如 `app-order-svc` 或数值 project_id `1234567890123456789`；
+    /// None=自动生成 `app-{8hex}`）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
     /// 应用名称

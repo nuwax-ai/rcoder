@@ -67,23 +67,24 @@ pub(super) fn validate_upload_target(target: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// 校验 app_id 格式（create_app 生成 `app-` + 8 个十六进制字符）
+/// 校验 app_id 格式（DNS-1123 label，≤ USERAPP_APP_ID_MAX_LEN）
 ///
 /// app_id 直接来自 HTTP 路径参数，会流入文件系统路径拼接（delete/upload/logs/list）。
-/// 此校验是路径穿越的纵深防御（Fail Fast）：拒绝 `..`、绝对路径、非法格式，
-/// 避免恶意 app_id 触达工作空间目录之外。
+/// 此校验是路径穿越的纵深防御（Fail Fast）：白名单字符集 `[a-z0-9-]` 天然排除
+/// `..`、`/`、绝对路径，避免恶意 app_id 触达工作空间目录之外。
+///
+/// 不强制 `app-` 前缀：create_app 缺省自动生成 `app-{8hex}`，外部也可指定自有
+/// 体系 ID（如 Java 侧数值 project_id，≤20 位）。两者命名空间不冲突——下游无
+/// `strip_prefix("app-")` 归一化，`app-123` 与 `123` 是两个独立 app；create 侧
+/// 另有唯一性检查兜底。
 ///
 /// 长度上限 33（`USERAPP_APP_ID_MAX_LEN`）：K8s 下 builder STS pod 的
 /// controller-revision-hash label = `rcoder-app-builder-{app_id}-{10位hash}`
 /// 受 K8s 63 字节限，超长 app_id 创建必然失败且表象含糊——入口拒绝。
 pub(super) fn validate_app_id(app_id: &str) -> AppResult<()> {
-    // 必须 app- 前缀（统一，和自动生成一致）
-    let rest = app_id.strip_prefix("app-").ok_or_else(|| {
-        AppOperationError::Validation("invalid app_id: must start with 'app-'".to_string())
-    })?;
-    if rest.is_empty() {
+    if app_id.is_empty() {
         return Err(AppOperationError::Validation(
-            "invalid app_id: empty after 'app-'".to_string(),
+            "invalid app_id: must not be empty".to_string(),
         ));
     }
     if app_id.len() > shared_types::USERAPP_APP_ID_MAX_LEN {
@@ -94,16 +95,17 @@ pub(super) fn validate_app_id(app_id: &str) -> AppResult<()> {
             shared_types::USERAPP_APP_ID_MAX_LEN
         )));
     }
-    // DNS-1123 label 合规（[a-z0-9]([-a-z0-9]*[a-z0-9])?；支持 app-order-svc 等业务名）
-    if !rest
+    // DNS-1123 label 合规（[a-z0-9]([-a-z0-9]*[a-z0-9])?；支持 app-order-svc、
+    // 纯数值 project_id 等，首尾约束见下）
+    if !app_id
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         return Err(AppOperationError::Validation(format!(
-            "invalid app_id: must be DNS-1123 label (lowercase alphanumeric or '-', got '{rest}')"
+            "invalid app_id: must be DNS-1123 label (lowercase alphanumeric or '-', got '{app_id}')"
         )));
     }
-    if rest.starts_with('-') || rest.ends_with('-') {
+    if app_id.starts_with('-') || app_id.ends_with('-') {
         return Err(AppOperationError::Validation(
             "invalid app_id: must not start/end with '-'".to_string(),
         ));
@@ -251,6 +253,9 @@ mod tests {
         assert!(validate_app_id("app-order-svc").is_ok());
         assert!(validate_app_id("app-1a2b3c4d").is_ok());
         assert!(validate_app_id("app-a").is_ok()); // 最短合法
+        // 外部自有体系 ID：纯数值（Java 侧 project_id，≤20 位）
+        assert!(validate_app_id("1234567890123456789").is_ok());
+        assert!(validate_app_id("123").is_ok());
         // 上限边界：恰好 33 字符
         let edge = format!("app-{}", "x".repeat(29));
         assert_eq!(edge.len(), shared_types::USERAPP_APP_ID_MAX_LEN);
@@ -271,14 +276,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_app_id_err_no_prefix() {
-        // 无 app- 前缀
-        assert!(validate_app_id("order-svc").is_err());
+    fn validate_app_id_err_empty() {
+        // 空串非法
+        assert!(validate_app_id("").is_err());
     }
 
     #[test]
-    fn validate_app_id_err_empty_after_prefix() {
-        // prefix 后为空
+    fn validate_app_id_err_bare_prefix() {
+        // 裸 "app-"（尾部 '-'）非法
         assert!(validate_app_id("app-").is_err());
     }
 

@@ -116,7 +116,8 @@ impl AppService {
                 "user_id 仅允许字母、数字、下划线和连字符（1-64 字符）".to_string(),
             ));
         }
-        // app_id：外部指定（app- + DNS-1123，校验 + 唯一性）or 自动生成
+        // app_id：外部指定（DNS-1123 label ≤33，如 app-order-svc 或数值 project_id；
+        // 校验 + 唯一性）or 自动生成（app-{8hex}）
         let app_id = match &request.app_id {
             Some(id) => {
                 validate_app_id(id)?;
