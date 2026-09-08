@@ -264,7 +264,10 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 utoipa = { version = "5.5", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-axum = "0.2"
-utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+# vendored：swagger-ui 资源随 utoipa-swagger-ui-vendored crate 内嵌（include_bytes），
+# 构建期零 GitHub 依赖——build.rs 默认会用 curl 从 github.com 下载 swagger-ui zip，
+# Docker 构建/离线环境概率性失败；四个 workspace 成员经 workspace = true 统一继承
+utoipa-swagger-ui = { version = "9.0", features = ["axum", "vendored"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 
