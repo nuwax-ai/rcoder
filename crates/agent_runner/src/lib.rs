@@ -24,6 +24,9 @@ pub mod service; // 🔥 设为 public，供测试使用
 pub mod shutdown;
 pub mod utils;
 
+// Userapp builder 容器内运行时路径解析（env 驱动，与 file-server 同源）
+pub(crate) mod userapp_env;
+
 // 条件性编译：HTTP 服务器模块
 #[cfg(feature = "http-server")]
 pub mod http_server;

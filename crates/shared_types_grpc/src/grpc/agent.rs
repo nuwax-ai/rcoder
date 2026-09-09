@@ -43,6 +43,11 @@ pub struct ChatRequest {
     /// 🆕 自定义工作目录标识符（可选，用于替代 project_id 参与工作目录拼接）
     #[prost(string, optional, tag = "14")]
     pub agent_work_dir: ::core::option::Option<::prost::alloc::string::String>,
+    /// 🆕 UserApp 开发对话定位键（UserappBuilder 场景必填，缺失即拒绝；语义独立于
+    /// project_id——userapp 流程中 project_id 亦承载 app_id 值作会话映射键，本字段使
+    /// 工作目录定位键显式化。其他 service_type 不填）
+    #[prost(string, optional, tag = "15")]
+    pub app_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChatResponse {

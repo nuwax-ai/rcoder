@@ -73,40 +73,49 @@ pub async fn chat(
         })
         .unwrap_or(shared_types::ServiceType::WebAgentRunner);
 
-    // 确定用于拼接工作目录的标识符
-    // HTTP 入口已保证：未传 agent_work_dir 时，用 project_id 赋值
-    let work_dir_id = req
-        .agent_work_dir
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| project_id.clone());
+    let app_id = req.app_id.clone().filter(|s| !s.is_empty());
 
-    // 纵深防御：即使 HTTP 入口已校验，gRPC 入口也应校验
-    if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
+    // Fail Fast：app_id 是 UserappBuilder 场景的定位键（与 project_id 语义独立，
+    // 不做回落——缺失即调用方契约错误，显式拒绝）
+    validate_userapp_app_id(&service_type, app_id.as_deref())?;
+
+    // UserappBuilder 不消费 agent_work_dir（computer 场景专用概念）。网关已消毒，
+    // 这里对绕过网关直连/漏改的调用留痕，不静默（值等于 app_id 时视为无害冗余）
+    if matches!(service_type, shared_types::ServiceType::UserappBuilder)
+        && let Some(raw) = req.agent_work_dir.as_deref()
+        && !raw.is_empty()
+        && Some(raw) != app_id.as_deref()
+    {
+        warn!(
+            "[gRPC] UserappBuilder ignores agent_work_dir (computer-only concept): got={raw}, app_id={}",
+            app_id.as_deref().unwrap_or_default()
+        );
+    }
+
+    // 实际用于工作目录拼接的标识符（UserappBuilder=app_id；其余=work_dir_id，
+    // 即 agent_work_dir 优先 project_id 的原语义）。纵深防御：即使 HTTP/网关
+    // 入口已校验，gRPC 入口也应校验
+    let (dir_key, dir_key_name) = match service_type {
+        shared_types::ServiceType::UserappBuilder => (app_id.clone().unwrap_or_default(), "app_id"),
+        _ => (
+            req.agent_work_dir
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| project_id.clone()),
+            "agent_work_dir",
+        ),
+    };
+    if let Err(e) = shared_types::validate_identifier(&dir_key, dir_key_name) {
         return Err(Status::invalid_argument(e));
     }
 
-    let project_dir = match service_type {
-        shared_types::ServiceType::ComputerAgentRunner => {
-            std::path::PathBuf::from("/home/user").join(&work_dir_id)
-        }
-        // userApp 开发对话: workspace = {USERAPP_WORKSPACE_ROOT}/{app_id}（rcoder 转发
-        // chat 时 project_id=app_id, ACP agent 直接在开发卷 workspace 上工作）
-        shared_types::ServiceType::UserappBuilder => {
-            std::path::PathBuf::from(shared_types::paths::USERAPP_WORKSPACE_ROOT).join(&work_dir_id)
-        }
-        // Userapp 不由 agent_runner 托管；WebAgentRunner 走 project_workspace 路径
-        shared_types::ServiceType::WebAgentRunner | shared_types::ServiceType::Userapp => {
-            let tenant_id = std::env::var("TENANT_ID").ok();
-            let space_id = std::env::var("SPACE_ID").ok();
-            match (tenant_id, space_id) {
-                (Some(tid), Some(sid)) => std::path::PathBuf::from("./project_workspace")
-                    .join(&tid)
-                    .join(&sid)
-                    .join(&work_dir_id),
-                _ => std::path::PathBuf::from("./project_workspace").join(&work_dir_id),
-            }
-        }
-    };
+    let project_dir = resolve_project_dir(
+        &service_type,
+        &project_id,
+        app_id.as_deref(),
+        req.agent_work_dir.as_deref(),
+        &crate::userapp_env::userapp_workspace_dir(),
+    );
 
     let agent_config_override = req.agent_config.map(convert_agent_config).transpose()?;
 
@@ -152,4 +161,148 @@ pub async fn chat(
     info!("[gRPC] Chat completed: success={}", grpc_response.success);
 
     Ok(Response::new(grpc_response))
+}
+
+/// UserappBuilder 场景 app_id 必填校验（Fail Fast：app_id 与 project_id 是语义
+/// 独立的字段——定位键缺失即调用方契约错误，不做 project_id 回落）。
+fn validate_userapp_app_id(
+    service_type: &shared_types::ServiceType,
+    app_id: Option<&str>,
+) -> Result<(), Status> {
+    if matches!(service_type, shared_types::ServiceType::UserappBuilder) && app_id.is_none() {
+        return Err(Status::invalid_argument(
+            "app_id is required for UserappBuilder chat",
+        ));
+    }
+    Ok(())
+}
+
+/// 按 service_type 解析 chat 工作目录（纯函数，env 读取参数化便于测试）。
+///
+/// - UserappBuilder：键 = app_id（入口已校验必填）。不消费 agent_work_dir
+///   （computer 场景专用概念，Java 曾借它渗入会话 ID 导致 agent 落错目录）；
+///   根 = userapp_root（env USERAPP_WORKSPACE_DIR 缺省 /home/user，见
+///   userapp_env.rs——挂载压平契约，勿用沙箱视角的 USERAPP_WORKSPACE_ROOT）
+/// - ComputerAgentRunner：/home/user + work_dir_id（agent_work_dir 优先，原语义）
+/// - WebAgentRunner/Userapp：./project_workspace + tenant/space 分支（原语义）
+fn resolve_project_dir(
+    service_type: &shared_types::ServiceType,
+    project_id: &str,
+    app_id: Option<&str>,
+    agent_work_dir: Option<&str>,
+    userapp_root: &str,
+) -> std::path::PathBuf {
+    // computer/web 场景：work_dir_id 优先 agent_work_dir（proto 语义：自定义
+    // 目录名单段标识符，替代 project_id 参与拼接）
+    let work_dir_id = agent_work_dir
+        .filter(|s| !s.is_empty())
+        .unwrap_or(project_id);
+    match service_type {
+        shared_types::ServiceType::ComputerAgentRunner => {
+            std::path::PathBuf::from("/home/user").join(work_dir_id)
+        }
+        shared_types::ServiceType::UserappBuilder => {
+            std::path::PathBuf::from(userapp_root).join(app_id.unwrap_or_default())
+        }
+        // Userapp 不由 agent_runner 托管；WebAgentRunner 走 project_workspace 路径
+        shared_types::ServiceType::WebAgentRunner | shared_types::ServiceType::Userapp => {
+            let tenant_id = std::env::var("TENANT_ID").ok();
+            let space_id = std::env::var("SPACE_ID").ok();
+            match (tenant_id, space_id) {
+                (Some(tid), Some(sid)) => std::path::PathBuf::from("./project_workspace")
+                    .join(tid)
+                    .join(sid)
+                    .join(work_dir_id),
+                _ => std::path::PathBuf::from("./project_workspace").join(work_dir_id),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_types::ServiceType;
+
+    #[test]
+    fn userapp_builder_uses_app_id_field() {
+        // 新契约主路径：定位键=app_id，agent_work_dir（Java 会话 ID 形态）被忽略，
+        // 根=注入的 userapp_root（builder 容器内即 /home/user，PVC 挂载点父目录）
+        let dir = resolve_project_dir(
+            &ServiceType::UserappBuilder,
+            "13",
+            Some("13"),
+            Some("1561845"),
+            "/tmp/ws",
+        );
+        assert_eq!(dir, std::path::PathBuf::from("/tmp/ws/13"));
+    }
+
+    #[test]
+    fn userapp_builder_without_agent_work_dir() {
+        let dir = resolve_project_dir(
+            &ServiceType::UserappBuilder,
+            "13",
+            Some("13"),
+            None,
+            "/tmp/ws",
+        );
+        assert_eq!(dir, std::path::PathBuf::from("/tmp/ws/13"));
+    }
+
+    #[test]
+    fn userapp_builder_missing_app_id_rejected() {
+        // Fail Fast：app_id 与 project_id 语义独立，缺失即拒绝，无回落
+        let err = validate_userapp_app_id(&ServiceType::UserappBuilder, None).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("app_id is required"));
+    }
+
+    #[test]
+    fn other_service_types_do_not_require_app_id() {
+        assert!(validate_userapp_app_id(&ServiceType::ComputerAgentRunner, None).is_ok());
+        assert!(validate_userapp_app_id(&ServiceType::WebAgentRunner, None).is_ok());
+    }
+
+    #[test]
+    fn computer_agent_runner_keeps_agent_work_dir_priority() {
+        // computer 语义不变：agent_work_dir 优先于 project_id，app_id 不参与
+        let dir = resolve_project_dir(
+            &ServiceType::ComputerAgentRunner,
+            "13",
+            Some("13"),
+            Some("1561845"),
+            "/tmp/ws",
+        );
+        assert_eq!(dir, std::path::PathBuf::from("/home/user/1561845"));
+    }
+
+    #[test]
+    fn computer_agent_runner_falls_back_to_project_id() {
+        let dir = resolve_project_dir(
+            &ServiceType::ComputerAgentRunner,
+            "13",
+            None,
+            None,
+            "/tmp/ws",
+        );
+        assert_eq!(dir, std::path::PathBuf::from("/home/user/13"));
+    }
+
+    #[test]
+    fn web_agent_runner_semantics_unchanged() {
+        // 单级：./project_workspace/{work_dir_id}（测试环境无 TENANT_ID/SPACE_ID，
+        // 有则跳过避免 flaky；app_id 不参与 web 路径）
+        if std::env::var("TENANT_ID").is_ok() || std::env::var("SPACE_ID").is_ok() {
+            return;
+        }
+        let dir = resolve_project_dir(
+            &ServiceType::WebAgentRunner,
+            "p1",
+            Some("ignored"),
+            None,
+            "/tmp/ws",
+        );
+        assert_eq!(dir, std::path::PathBuf::from("./project_workspace/p1"));
+    }
 }

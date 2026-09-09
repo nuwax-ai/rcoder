@@ -86,6 +86,28 @@ pub(super) async fn forward_computer_request_to_container(
     // gRPC 调用（带重试机制；统一转发器见 chat_forward.rs）
     let request = params.request;
     let project_id = params.project_id;
+    // userapp 开发对话：定位键显式化为 app_id（proto 独立字段，与 project_id 语义
+    // 解耦）；agent_work_dir 是 computer 场景的自定义目录概念——Java 侧已约定
+    // userapp 传 app_id 值，此 override 是过渡期防御（Java 未及时改/漏传会话 ID 时
+    // 兜底），正常路径零噪音。computer 路径两者均原样。
+    let (app_id, agent_work_dir) = match params.service_type {
+        shared_types::ServiceType::UserappBuilder => {
+            if let Some(raw) = request.agent_work_dir.as_deref()
+                && !raw.is_empty()
+                && raw != params.work_dir_id
+            {
+                info!(
+                    "[USERAPP_FORWARD] override agent_work_dir={raw} -> {} (userapp 定位键恒为 app_id)",
+                    params.work_dir_id
+                );
+            }
+            (
+                Some(params.work_dir_id.to_string()),
+                Some(params.work_dir_id.to_string()),
+            )
+        }
+        _ => (None, request.agent_work_dir.clone()),
+    };
     let grpc_pool = params.grpc_pool;
     crate::handler::chat_forward::forward_chat(
         grpc_pool,
@@ -107,7 +129,8 @@ pub(super) async fn forward_computer_request_to_container(
             service_type: Some(params.service_type.clone()),
             user_id: Some(request.user_id.clone()),
             is_devcomputer: params.is_devcomputer,
-            agent_work_dir: request.agent_work_dir.clone(),
+            agent_work_dir: agent_work_dir.clone(),
+            app_id: app_id.clone(),
         },
         params.locale,
         crate::handler::chat_forward::ForwardChatOpts {

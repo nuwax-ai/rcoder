@@ -50,6 +50,8 @@ pub struct GrpcChatParams {
     pub is_devcomputer: bool,
     /// 自定义工作目录标识符
     pub agent_work_dir: Option<String>,
+    /// UserApp 开发对话定位键（仅 UserappBuilder 场景填充；语义独立于 project_id）
+    pub app_id: Option<String>,
 }
 
 /// 通过 gRPC 发送 Chat 请求到 agent_runner (使用连接池)
@@ -119,6 +121,7 @@ pub async fn grpc_chat_with_pool(
         user_id: params.user_id,               // 传递 user_id
         is_devcomputer: params.is_devcomputer, // 🆕 传递 is_devcomputer
         agent_work_dir: params.agent_work_dir, // 🆕 传递 agent_work_dir
+        app_id: params.app_id,                 // 🆕 UserappBuilder 定位键
     };
 
     debug!("[gRPC_CHAT] sendrequest: {:?}", grpc_request);

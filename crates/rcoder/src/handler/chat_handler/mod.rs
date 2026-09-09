@@ -305,6 +305,7 @@ async fn forward_request_to_container_service(
             user_id: None,
             is_devcomputer: false,
             agent_work_dir: request.agent_work_dir.clone(),
+            app_id: None,
         },
         ctx.locale,
         handler::chat_forward::ForwardChatOpts {

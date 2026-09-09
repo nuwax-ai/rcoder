@@ -211,6 +211,9 @@ fn normalize_path(path: &str) -> String {
 /// 解析 `{PREFIX_WORKSPACE_DIR}` 占位符
 ///
 /// 根据不同场景解析为不同的路径：
+/// - **UserappBuilder（userapp 开发容器）**：`LOG_DIR` / `OPENCODE_LOG_DIR` 解析为
+///   env `USERAPP_LOG_DIR`（builder 平台注入 /home/user/logs，PVC 持久；缺省回落
+///   shared_types 压平契约常量）——`container-logs` 是 emptyDir，pod 重建即丢
 /// - **环境变量场景**：
 ///   - `LOG_DIR` / `OPENCODE_LOG_DIR`：解析为 `/app/container-logs`（日志专用目录）
 ///   - `/devcomputer/chat` 接口的 `LOG_DIR`：解析为 `/home/user`（开发调试方便查看）
@@ -220,10 +223,12 @@ fn normalize_path(path: &str) -> String {
 /// * `value` - 需要解析的字符串
 /// * `env_key` - 环境变量名（用于判断是否是日志相关的变量），command/args 时传 None
 /// * `is_devcomputer` - 是否是 devcomputer 接口（影响日志路径解析）
+/// * `service_type` - 服务类型（UserappBuilder 场景日志目录走 PVC 持久卷）
 pub(crate) fn render_prefix_workspace_dir(
     value: &mut String,
     env_key: Option<&str>,
     is_devcomputer: bool,
+    service_type: &shared_types::ServiceType,
 ) {
     if !value.contains("{PREFIX_WORKSPACE_DIR}") {
         return;
@@ -234,31 +239,42 @@ pub(crate) fn render_prefix_workspace_dir(
             // 环境变量场景
             let upper_key = key.to_uppercase();
             if upper_key == "LOG_DIR" || upper_key == "OPENCODE_LOG_DIR" {
-                if is_devcomputer {
+                if matches!(service_type, shared_types::ServiceType::UserappBuilder) {
+                    userapp_log_dir()
+                } else if is_devcomputer {
                     // devcomputer 接口：日志放在项目目录下，方便开发调试
                     // 最终路径: /home/user/{project_id}/.logs
-                    WORKSPACE_DIR_HOME_PATH
+                    WORKSPACE_DIR_HOME_PATH.to_string()
                 } else {
                     // computer 接口：日志放在专用日志目录
-                    WORKSPACE_DIR_LOG_PATH
+                    WORKSPACE_DIR_LOG_PATH.to_string()
                 }
             } else {
                 // 其他环境变量：使用 home 路径
-                WORKSPACE_DIR_HOME_PATH
+                WORKSPACE_DIR_HOME_PATH.to_string()
             }
         }
         None => {
             // command / args 场景：使用 home 路径
-            WORKSPACE_DIR_HOME_PATH
+            WORKSPACE_DIR_HOME_PATH.to_string()
         }
     };
 
-    let replaced = value.replace("{PREFIX_WORKSPACE_DIR}", replacement);
+    let replaced = value.replace("{PREFIX_WORKSPACE_DIR}", &replacement);
     *value = normalize_path(&replaced);
     debug!(
-        "[SACP] Resolved {{PREFIX_WORKSPACE_DIR}} => '{}' (env_key={:?}, is_devcomputer={})",
-        replacement, env_key, is_devcomputer
+        "[SACP] Resolved {{PREFIX_WORKSPACE_DIR}} => '{}' (env_key={:?}, is_devcomputer={}, service_type={:?})",
+        replacement, env_key, is_devcomputer, service_type
     );
+}
+
+/// userapp 开发容器的持久日志目录（env `USERAPP_LOG_DIR`，builder 由平台注入，
+/// 与四 subPath 挂载点绑定；缺省回落 shared_types 压平契约常量 /home/user/logs）。
+fn userapp_log_dir() -> String {
+    std::env::var("USERAPP_LOG_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| shared_types::paths::USERAPP_DEV_LOGS.to_string())
 }
 
 fn resolved_model_binding_value(
@@ -335,6 +351,7 @@ pub(crate) fn apply_sensitive_model_env_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared_types::ServiceType;
 
     #[test]
     fn test_normalize_path() {
@@ -356,67 +373,138 @@ mod tests {
     #[test]
     fn test_render_prefix_workspace_dir_no_placeholder() {
         let mut value = "/some/path".to_string();
-        render_prefix_workspace_dir(&mut value, None, false);
+        render_prefix_workspace_dir(&mut value, None, false, &ServiceType::ComputerAgentRunner);
         assert_eq!(value, "/some/path");
     }
 
     #[test]
     fn test_render_prefix_workspace_dir_command() {
         let mut value = "{PREFIX_WORKSPACE_DIR}/project/node_modules/.bin/tsx".to_string();
-        render_prefix_workspace_dir(&mut value, None, false);
+        render_prefix_workspace_dir(&mut value, None, false, &ServiceType::ComputerAgentRunner);
         assert_eq!(value, "/home/user/project/node_modules/.bin/tsx");
     }
 
     #[test]
     fn test_render_prefix_workspace_dir_args() {
         let mut value = "{PREFIX_WORKSPACE_DIR}/project/src/index.ts".to_string();
-        render_prefix_workspace_dir(&mut value, None, true);
+        render_prefix_workspace_dir(&mut value, None, true, &ServiceType::ComputerAgentRunner);
         assert_eq!(value, "/home/user/project/src/index.ts");
     }
 
     #[test]
     fn test_render_prefix_workspace_dir_log_dir_computer() {
         let mut value = "{PREFIX_WORKSPACE_DIR}/{conversationId}/logs".to_string();
-        render_prefix_workspace_dir(&mut value, Some("LOG_DIR"), false);
+        render_prefix_workspace_dir(
+            &mut value,
+            Some("LOG_DIR"),
+            false,
+            &ServiceType::ComputerAgentRunner,
+        );
         assert_eq!(value, "/app/container-logs/{conversationId}/logs");
     }
 
     #[test]
     fn test_render_prefix_workspace_dir_log_dir_devcomputer() {
         let mut value = "{PREFIX_WORKSPACE_DIR}/{conversationId}/.logs".to_string();
-        render_prefix_workspace_dir(&mut value, Some("LOG_DIR"), true);
+        render_prefix_workspace_dir(
+            &mut value,
+            Some("LOG_DIR"),
+            true,
+            &ServiceType::ComputerAgentRunner,
+        );
         assert_eq!(value, "/home/user/{conversationId}/.logs");
     }
 
     #[test]
     fn test_render_prefix_workspace_dir_opencode_log_dir_computer() {
         let mut value = "{PREFIX_WORKSPACE_DIR}/{conversationId}/logs".to_string();
-        render_prefix_workspace_dir(&mut value, Some("OPENCODE_LOG_DIR"), false);
+        render_prefix_workspace_dir(
+            &mut value,
+            Some("OPENCODE_LOG_DIR"),
+            false,
+            &ServiceType::ComputerAgentRunner,
+        );
         assert_eq!(value, "/app/container-logs/{conversationId}/logs");
     }
 
     #[test]
     fn test_render_prefix_workspace_dir_opencode_log_dir_devcomputer() {
         let mut value = "{PREFIX_WORKSPACE_DIR}/{conversationId}/.logs".to_string();
-        render_prefix_workspace_dir(&mut value, Some("OPENCODE_LOG_DIR"), true);
+        render_prefix_workspace_dir(
+            &mut value,
+            Some("OPENCODE_LOG_DIR"),
+            true,
+            &ServiceType::ComputerAgentRunner,
+        );
         assert_eq!(value, "/home/user/{conversationId}/.logs");
+    }
+
+    #[test]
+    fn test_render_prefix_workspace_dir_log_dir_userapp_builder() {
+        // userapp 开发容器：日志目录走 PVC 持久卷（is_devcomputer 不影响——
+        // service_type 是更强的场景判据）。测试环境未设 USERAPP_LOG_DIR 时
+        // 断言回落值；本地意外设置则跳过避免 flaky
+        if std::env::var("USERAPP_LOG_DIR").is_ok() {
+            return;
+        }
+        let mut value = "{PREFIX_WORKSPACE_DIR}/{conversationId}/logs".to_string();
+        render_prefix_workspace_dir(
+            &mut value,
+            Some("OPENCODE_LOG_DIR"),
+            false,
+            &ServiceType::UserappBuilder,
+        );
+        assert_eq!(
+            value,
+            format!(
+                "{}/{{conversationId}}/logs",
+                shared_types::paths::USERAPP_DEV_LOGS
+            )
+        );
+
+        let mut value = "{PREFIX_WORKSPACE_DIR}/logs".to_string();
+        render_prefix_workspace_dir(
+            &mut value,
+            Some("LOG_DIR"),
+            true,
+            &ServiceType::UserappBuilder,
+        );
+        assert_eq!(
+            value,
+            format!("{}/logs", shared_types::paths::USERAPP_DEV_LOGS)
+        );
     }
 
     #[test]
     fn test_render_prefix_workspace_dir_other_env_var() {
         let mut value = "{PREFIX_WORKSPACE_DIR}/other".to_string();
-        render_prefix_workspace_dir(&mut value, Some("OTHER_VAR"), false);
+        render_prefix_workspace_dir(
+            &mut value,
+            Some("OTHER_VAR"),
+            false,
+            &ServiceType::ComputerAgentRunner,
+        );
         assert_eq!(value, "/home/user/other");
     }
 
     #[test]
     fn test_render_prefix_workspace_dir_case_insensitive() {
         let mut value = "{PREFIX_WORKSPACE_DIR}/logs".to_string();
-        render_prefix_workspace_dir(&mut value, Some("log_dir"), false);
+        render_prefix_workspace_dir(
+            &mut value,
+            Some("log_dir"),
+            false,
+            &ServiceType::ComputerAgentRunner,
+        );
         assert_eq!(value, "/app/container-logs/logs");
 
         let mut value = "{PREFIX_WORKSPACE_DIR}/logs".to_string();
-        render_prefix_workspace_dir(&mut value, Some("Log_Dir"), true);
+        render_prefix_workspace_dir(
+            &mut value,
+            Some("Log_Dir"),
+            true,
+            &ServiceType::ComputerAgentRunner,
+        );
         assert_eq!(value, "/home/user/logs");
     }
 }

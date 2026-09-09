@@ -23,8 +23,6 @@ use shared_types::paths::WORKSPACE_ROOT;
 
 /// ComputerAgentRunner 容器内项目目录前缀（per-user 容器，不受隔离模式影响）
 const HOME_PREFIX: &str = "/home/user";
-/// userApp 开发卷根（UserappBuilder 终端 cwd 前缀）。
-const USERAPP_PREFIX: &str = shared_types::paths::USERAPP_WORKSPACE_ROOT;
 
 // WebAgentRunner 工作区根用 shared_types::paths::WORKSPACE_ROOT (单一事实源, 不再本地定义)
 
@@ -68,10 +66,17 @@ pub fn resolve_project_cwd(
             resolve_in_candidates(project_id, &[HOME_PREFIX])
         }
         Some(ServiceType::UserappBuilder) => {
-            // userApp 开发容器的终端：workspace = 开发卷 {USERAPP_WORKSPACE_ROOT}/{app_id}
-            // （与 chat 的 work_dir、file-server 的 resolve_userapp_dev 同根——
-            // /api/v1/userapp/proxy/ttyd/dev/{user_id}/{app_id} 经 Pingora 注入本 service_type 到达此处）
-            resolve_in_candidates(project_id, &[USERAPP_PREFIX])
+            // userApp 开发容器的终端：workspace = {USERAPP_WORKSPACE_DIR}/{app_id}
+            // （与 chat 的 work_dir、file-server 的 resolve_userapp_dev 三方同根：
+            // env 驱动、缺省回落 shared_types 压平契约常量 /home/user，见
+            // userapp_env.rs。/api/v1/userapp/proxy/ttyd/dev/{user_id}/{app_id} 经
+            // Pingora 注入本 service_type 到达此处）
+            //
+            // 沙箱安全性：UserappBuilder 分支仅在 builder 容器命中（X-Ttyd-Service-Type
+            // 由 Pingora 按容器类型注入），沙箱/computer 容器不进此分支，env 回落值
+            // 与沙箱的 /home/user/{project_id} 布局无冲突。
+            let prefix = crate::userapp_env::userapp_workspace_dir();
+            resolve_in_candidates(project_id, &[prefix.as_str()])
         }
         Some(ServiceType::WebAgentRunner) | Some(ServiceType::Userapp) => {
             // 共享容器三级优先，单项目隔离单级兜底
