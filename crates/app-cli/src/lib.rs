@@ -28,6 +28,7 @@ pub mod static_hosting;
 pub mod supervisor;
 pub mod supervisord_host;
 pub mod svc_spec;
+pub mod win_cmd;
 pub mod workspace_index;
 pub mod xmlrpc;
 

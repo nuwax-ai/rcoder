@@ -254,6 +254,53 @@ reload 的 fail-safe 语义：basic/storages/server addr 类变更在 `--autorel
 │   └── application*.log          # 应用框架自写的文件日志（[logs] 声明，app-cli 只读）
 ```
 
+## Windows（Git Bash）支持
+
+Windows 上通过 npm 安装（win32-x64 平台子包附带自建 **pingap.exe**——上游 pingap
+官方无 Windows 产物，由 release-app-cli CI 从 app-cli `Cargo.toml` pin 的同一 git rev
+用 `tls-rustls` 特性构建，版本严格同源）：
+
+```bash
+npm i -g @nuwax-ai/app-cli
+```
+
+三步闭环（Git Bash，与 Linux 本地闭环同构）：
+
+```bash
+# ① 生成 release.lock + 预览 pingap 配置（无需 pingap/PG）
+app-cli --gen-lock ./my-workspace
+
+# ② 本地构建（dev 形态产物组装）
+app-cli build --dev --workspace ./my-workspace --deploy-dir ./deploy-out
+
+# ③ 启动服务（builtin 引擎：supervisord 探测在 Windows 恒失败，自动直连编排）
+APP_CLI_WORKSPACE=./deploy-out \
+APP_CLI_LOG_DIR=./logs \
+APP_CLI_SPEC_DIR="$PWD/specs" \
+APP_CLI_PINGAP_RUNTIME_DIR="$PWD/run" \
+APP_CLI_SKIP_PG_WAIT=1 \
+app-cli serve
+# 入口 = pingap 反代 :9080；管理 API :3010；浏览器打开 http://127.0.0.1:9080
+```
+
+Windows 必知差异：
+
+- **`APP_CLI_PINGAP_BIN` 由 npm launcher 自动注入**（指向包内 pingap.exe），显式设置
+  env 或 `--pingap-bin` 可覆盖。
+- **`APP_CLI_SPEC_DIR` / `APP_CLI_PINGAP_RUNTIME_DIR` 必须显式指到用户可写目录**——
+  默认值 `/run/app-cli` 在 Windows 解析为盘根 `C:\run\...`（通常无权限）。
+- **`APP_CLI_SKIP_PG_WAIT=1`**：Windows 本机通常没有 `pg_isready`，不设会在
+  PG 等待上空耗 60s 后失败。
+- `npm` / `pnpm` / `yarn` 等 `.cmd` shim：spawn 前自动按 PATH 探测补全，manifest
+  里照常写裸名 `npm` 即可。
+- 停止用 Ctrl+C：Windows 无进程组信号，孙进程（如 `npm run dev` 派生的 node）
+  可能残留占用端口——用任务管理器或 `taskkill /F /T /PID <pid>` 清理。
+- 首次启动 Windows 防火墙会弹放行询问（监听 9080/3010），允许即可。
+- 自建 pingap.exe 是 rustls 变体：admin **Web 控制台为占位页**（dist/ 占位编译，
+  app-cli 只消费 admin JSON API，不受影响）；不支持 imageoptim 类 full 特性插件。
+- zip 制品内的符号链接条目在 Windows 解压时降级为普通文件并告警——
+  Next standalone 类制品的模块解析可能受影响，此类制品建议在容器内构建。
+
 ## 相关文档
 
 - [01-quick-start.md](01-quick-start.md) — 目录约定与运行时固定目录

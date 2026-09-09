@@ -21,7 +21,8 @@ pub fn run(release_id: &str, service_id: &str, args: &CliArgs) -> Result<()> {
 
 /// 组装并 exec（独立函数便于单测 env 组装逻辑）。
 fn exec_spec(spec: &ServiceSpecFile, log_dir: &std::path::Path) -> Result<()> {
-    let mut command = std::process::Command::new(&spec.argv[0]);
+    let mut command =
+        std::process::Command::new(crate::win_cmd::resolve_spawn_program(&spec.argv[0]));
     command
         .args(&spec.argv[1..])
         .current_dir(&spec.cwd)

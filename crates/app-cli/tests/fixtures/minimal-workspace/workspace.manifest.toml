@@ -1,0 +1,7 @@
+# 成对一致性 gate 的最小 fixture workspace（release-app-cli.yml 的
+# pair-gate job 用：app-cli --gen-lock 生成的 pingap 配置必须能被同版本
+# pingap.exe -t 校验通过——绑定分发的 app-cli/pingap 二进制对 schema 兼容）。
+schema_version = 1
+
+[workspace]
+name = "pair-gate-fixture"

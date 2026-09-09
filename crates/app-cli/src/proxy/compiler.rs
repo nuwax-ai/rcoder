@@ -342,16 +342,26 @@ fn validate_plugin_paths(name: &str, plugin: &impl serde::Serialize) -> Result<(
 }
 
 fn validate_runtime_path(field: &str, value: &str) -> Result<()> {
-    let allowed = ["/app/code", "/app/data", "/app/logs", "/run/app-cli"];
-    if !allowed
-        .iter()
-        .any(|root| value == *root || value.starts_with(&format!("{root}/")))
+    // Windows 本地 dev 没有容器内运行时布局（/app/code 等不存在，路径是 C:\...），
+    // 越界防护防的是容器内 config 逃逸，对非 unix 不适用——直接放行。
+    #[cfg(not(unix))]
     {
-        anyhow::bail!(
-            "{field} path is outside the allowed runtime roots (/app/code, /app/data, /app/logs, /run/app-cli): {value}"
-        );
+        let _ = (field, value);
+        return Ok(());
     }
-    Ok(())
+    #[cfg(unix)]
+    {
+        let allowed = ["/app/code", "/app/data", "/app/logs", "/run/app-cli"];
+        if !allowed
+            .iter()
+            .any(|root| value == *root || value.starts_with(&format!("{root}/")))
+        {
+            anyhow::bail!(
+                "{field} path is outside the allowed runtime roots (/app/code, /app/data, /app/logs, /run/app-cli): {value}"
+            );
+        }
+        Ok(())
+    }
 }
 
 fn merge_unique<K, V>(

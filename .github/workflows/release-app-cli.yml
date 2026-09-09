@@ -1,8 +1,10 @@
 name: release-app-cli
 
 # 发布 app-cli（UserApp 容器运行时编排器 + 本地编译工具）到公开 npmjs.org：
-# 主包 @nuwax-ai/app-cli（wrapper）+ 四个平台子包（二进制直打 tarball，
-# optionalDependencies 按平台装）。供模板仓库 Dockerfile `npm i -g` 自包含取用。
+# 主包 @nuwax-ai/app-cli（wrapper）+ 五个平台子包（二进制直打 tarball，
+# optionalDependencies 按平台装）。供模板仓库 Dockerfile `npm i -g` 自包含取用；
+# win32-x64 子包额外附带自建 rustls 版 pingap.exe（上游 pingap 官方无 Windows
+# 产物，serve 的反代依赖由本 workflow 从 pin 的同一 git rev 构建）。
 # 触发：推 tag `app-cli-v*`（稳定 / 预发布）或手动 workflow_dispatch。
 # 与 release.yml（`v*`）/ release-file-server-proxy.yml 靠 tag 前缀隔离。
 #
@@ -18,6 +20,14 @@ name: release-app-cli
 #   在所有支持的目标运行时直接可用；勿改为 ubuntu runner 裸编（glibc 2.39 产物
 #   在 bookworm 上不可运行）。
 # - darwin 双架构：macos-latest native（x64 加 target 交叉）。
+# - windows x64：windows-latest native。app-cli.exe 的 aws-lc-sys（reqwest rustls）
+#   需要 protoc+nasm+cmake（cmake 预装）。
+# - pingap.exe：独立 job，从 crates/app-cli/Cargo.toml grep 出 pin 的官方 rev
+#   （单一事实源，构造性同步防漂移）→ checkout vicanso/pingap@rev →
+#   `--no-default-features --features tls-rustls`（ring provider，无需 nasm/cmake；
+#   dist/ 占位已提交无需 build-web）。与 app-cli 的 pingap-config 库严格同 rev。
+# - pair-gate：windows 下用 fixture workspace 跑 `app-cli.exe --gen-lock`，
+#   生成配置喂 `pingap.exe -t` —— 分发的二进制对 schema 兼容性 gate。
 
 on:
   push:
@@ -74,6 +84,7 @@ jobs:
           - { target: x86_64-apple-darwin,       runner: macos-latest,  zig: false }
           - { target: x86_64-unknown-linux-gnu,  runner: ubuntu-latest, zig: true }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-latest, zig: true }
+          - { target: x86_64-pc-windows-msvc,    runner: windows-latest, zig: false }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +98,8 @@ jobs:
           rustup target add ${{ matrix.target }}
 
       # protoc：pingap-config → etcd-client → tonic-prost → prost-build 构建期调用；
-      # aws-lc-sys 需要 cmake（macos 镜像自带；ubuntu 加装）。
+      # aws-lc-sys 需要 cmake（macos 镜像自带；ubuntu/windows 加装）+ nasm（windows，
+      # aws-lc 汇编；与 release-file-server-proxy.yml 同款路径）。
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
@@ -95,6 +107,12 @@ jobs:
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
+
+      - name: Install protoc + nasm (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install protoc nasm -y --no-progress
+          echo "C:\Program Files\NASM" >> "$GITHUB_PATH"
 
       # linux 双架构走 cargo-zigbuild（glibc 钉 2.17，见文件头注释）。
       - name: Install cargo-zigbuild
@@ -121,27 +139,130 @@ jobs:
           set -euo pipefail
           TARGET_ARCH="ARM64"
           case "$TARGET" in x86_64-*) TARGET_ARCH="X64" ;; esac
+          BIN=app-cli
+          if [ "${{ runner.os }}" = "Windows" ]; then BIN=app-cli.exe; fi
           if [ "$TARGET_ARCH" = "${{ runner.arch }}" ]; then
-            ./target/${TARGET}/release/app-cli --version
+            ./target/${TARGET}/release/${BIN} --version
           else
             echo "交叉产物（宿主架构不匹配），跳过冒烟"
           fi
 
-      # 二进制重命名为 app-cli-<target>：download-artifact merge-multiple 合并后
+      # 二进制重命名为 app-cli-<target>[.exe]：download-artifact merge-multiple 合并后
       # 各平台文件名不冲突（原名同为 app-cli 会互相覆盖）。
       - name: Rename binary for artifact
         working-directory: crates/app-cli
-        run: cp "target/${{ matrix.target }}/release/app-cli" "app-cli-${{ matrix.target }}"
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          BIN=app-cli
+          if [ "${{ runner.os }}" = "Windows" ]; then BIN=app-cli.exe; fi
+          cp "target/${TARGET}/release/${BIN}" "app-cli-${TARGET}$( [ "${{ runner.os }}" = "Windows" ] && echo ".exe" )"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-cli-${{ matrix.target }}
-          path: crates/app-cli/app-cli-${{ matrix.target }}
+          path: crates/app-cli/app-cli-${{ matrix.target }}*
           retention-days: 7
 
+  # ── pingap.exe（Windows 专用，随 win32-x64 平台包分发）─────────────────────
+  # 上游 pingap 官方无 Windows 产物。构建源 = app-cli Cargo.toml pin 的同一
+  # git rev（构造性同步：同一 commit 里 grep，漂移即 fail-fast）。
+  # rustls 变体走 ring（非 aws-lc-sys）→ 只需 protoc + MSVC；dist/ 在 tag 里
+  # 有 README 占位（rust-embed 可编译），无需 node build-web；代价是 admin
+  # web UI 为占位页（app-cli 只消费 admin JSON API，不受影响）。
+  build-pingap-windows:
+    needs: meta
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout rcoder (for pin rev)
+        uses: actions/checkout@v4
+
+      - name: Resolve pingap rev from Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          REV=$(grep -o 'rev = "[0-9a-f]\{40\}"' crates/app-cli/Cargo.toml | head -1 | cut -d'"' -f2)
+          [ -n "$REV" ] || { echo "✗ 未在 crates/app-cli/Cargo.toml 找到 pingap-config rev"; exit 1; }
+          VER=$(grep -o 'DEFAULT_PINGAP_VERSION: &str = "[0-9.]*"' crates/app-cli/src/devtool.rs | head -1 | cut -d'"' -f2)
+          [ -n "$VER" ] || { echo "✗ 未在 devtool.rs 找到 DEFAULT_PINGAP_VERSION"; exit 1; }
+          echo "PINGAP_REV=$REV" >> "$GITHUB_ENV"
+          echo "PINGAP_VERSION_EXPECTED=$VER" >> "$GITHUB_ENV"
+          echo "pingap rev = $REV, expect version = $VER"
+
+      - name: Disable CRLF conversion
+        run: git config --global core.autocrlf false
+
+      - name: Checkout pingap at pinned rev
+        uses: actions/checkout@v4
+        with:
+          repository: vicanso/pingap
+          ref: ${{ env.PINGAP_REV }}
+
+      - name: Install protoc
+        run: choco install protoc -y --no-progress
+
+      - name: Show Rust toolchain
+        shell: bash
+        run: rustup show
+
+      # 不加 full：官方 full 只多 tracing/imageoptim，app-cli 生成的配置用不到，
+      # 省约一半编译时间。上游 profile lto=true + codegen-units=1，构建慢属预期。
+      - name: Build pingap (tls-rustls)
+        shell: bash
+        run: cargo build --release --no-default-features --features tls-rustls
+
+      - name: Smoke test pingap -V
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=$(./target/release/pingap.exe -V)
+          echo "$OUT"
+          # 版本断言：二进制版本必须与 devtool 常量（= pingap-config pin 的 tag）一致
+          echo "$OUT" | grep -F "$PINGAP_VERSION_EXPECTED" || {
+            echo "✗ pingap.exe 版本与 pin 的 $PINGAP_VERSION_EXPECTED 不符"; exit 1; }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pingap-x86_64-pc-windows-msvc
+          path: target/release/pingap.exe
+          retention-days: 7
+
+  # ── 成对一致性 gate：分发的 app-cli.exe ↔ pingap.exe schema 兼容 ──────────
+  # fixture workspace 跑 gen-lock（纯函数生成配置）→ 提取 pingap.toml →
+  # pingap.exe -t 校验。本地（darwin）已验证过该链路，CI 在目标平台复验。
+  pair-gate-windows:
+    needs: [meta, build, build-pingap-windows]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Gen lock with fixture and validate via pingap -t
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=dist/app-cli-x86_64-pc-windows-msvc.exe
+          PINGAP=dist/pingap.exe
+          ls -lh "$APP" "$PINGAP"
+          WS=$(mktemp -d)/ws
+          cp -r crates/app-cli/tests/fixtures/minimal-workspace "$WS"
+          "$APP" --gen-lock "$WS" 2>/dev/null \
+            | sed -n '/──── pingap.toml ────/,/──── end ────/p' | sed '1d;$d' \
+            > pingap.toml
+          head -5 pingap.toml
+          "$PINGAP" -c pingap.toml -t
+          echo "✓ pair gate passed: app-cli 生成的配置被同 rev pingap.exe 接受"
+
   publish-npm:
-    needs: [meta, build]
+    needs: [meta, pair-gate-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -162,23 +283,33 @@ jobs:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
           set -euo pipefail
-          # 版本注入：5 个 package.json + 主包 optionalDependencies（scoped key）
-          for dir in npm/app-cli npm/app-cli-linux-x64 npm/app-cli-linux-arm64 npm/app-cli-darwin-x64 npm/app-cli-darwin-arm64; do
+          # 版本注入：6 个 package.json + 主包 optionalDependencies（scoped key）
+          for dir in npm/app-cli npm/app-cli-linux-x64 npm/app-cli-linux-arm64 npm/app-cli-darwin-x64 npm/app-cli-darwin-arm64 npm/app-cli-windows-x64; do
             jq --arg v "$VERSION" '.version = $v' "$dir/package.json" > "$dir/package.json.tmp" && mv "$dir/package.json.tmp" "$dir/package.json"
           done
           jq --arg v "$VERSION" '
             .optionalDependencies["@nuwax-ai/app-cli-linux-x64"] = $v |
             .optionalDependencies["@nuwax-ai/app-cli-linux-arm64"] = $v |
             .optionalDependencies["@nuwax-ai/app-cli-darwin-x64"] = $v |
-            .optionalDependencies["@nuwax-ai/app-cli-darwin-arm64"] = $v
+            .optionalDependencies["@nuwax-ai/app-cli-darwin-arm64"] = $v |
+            .optionalDependencies["@nuwax-ai/app-cli-windows-x64"] = $v
           ' npm/app-cli/package.json > npm/app-cli/package.json.tmp && mv npm/app-cli/package.json.tmp npm/app-cli/package.json
+
+          # 守卫：主包 optionalDependencies 的 key 集 == 平台子包目录集（防加平台漏改）
+          DEP_KEYS=$(jq -r '.optionalDependencies | keys[]' npm/app-cli/package.json | sed 's/@nuwax-ai\///' | sort)
+          DIR_KEYS=$(ls -d npm/app-cli-* | sed 's|npm/||' | sort)
+          [ "$DEP_KEYS" = "$DIR_KEYS" ] || {
+            echo "✗ 平台包目录与 optionalDependencies 不一致:"; echo "$DEP_KEYS"; echo "---"; echo "$DIR_KEYS"; exit 1; }
 
           # 二进制就位（target triple → 平台包目录）
           cp dist/app-cli-x86_64-unknown-linux-gnu  npm/app-cli-linux-x64/app-cli
           cp dist/app-cli-aarch64-unknown-linux-gnu npm/app-cli-linux-arm64/app-cli
           cp dist/app-cli-x86_64-apple-darwin       npm/app-cli-darwin-x64/app-cli
           cp dist/app-cli-aarch64-apple-darwin      npm/app-cli-darwin-arm64/app-cli
-          chmod +x npm/app-cli-*/app-cli
+          # win32 包双件套：app-cli.exe + 自建 pingap.exe（serve 反代依赖）
+          cp dist/app-cli-x86_64-pc-windows-msvc.exe npm/app-cli-windows-x64/app-cli.exe
+          cp dist/pingap.exe                          npm/app-cli-windows-x64/pingap.exe
+          chmod +x npm/app-cli-*/app-cli npm/app-cli-windows-x64/*.exe || true
 
           # 冒烟：runner(x64 linux, glibc ≥ 2.17) 直接跑二进制验证可执行
           ./npm/app-cli-linux-x64/app-cli --version
@@ -195,7 +326,7 @@ jobs:
           TAG_ARGS=""
           if [ "$PRERELEASE" = "true" ]; then TAG_ARGS="--tag beta"; fi
           failures=0
-          for dir in app-cli-linux-x64 app-cli-linux-arm64 app-cli-darwin-x64 app-cli-darwin-arm64; do
+          for dir in app-cli-linux-x64 app-cli-linux-arm64 app-cli-darwin-x64 app-cli-darwin-arm64 app-cli-windows-x64; do
             (cd "$dir" && npm publish --access public $TAG_ARGS --registry https://registry.npmjs.org) || failures=$((failures+1))
           done
           [ "$failures" -eq 0 ] || { echo "✗ $failures 个平台包发布失败"; exit 1; }
@@ -213,7 +344,7 @@ jobs:
           fi
 
   release:
-    needs: [meta, build]
+    needs: [meta, pair-gate-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -234,3 +365,5 @@ jobs:
             dist/app-cli-x86_64-apple-darwin
             dist/app-cli-x86_64-unknown-linux-gnu
             dist/app-cli-aarch64-unknown-linux-gnu
+            dist/app-cli-x86_64-pc-windows-msvc.exe
+            dist/pingap.exe

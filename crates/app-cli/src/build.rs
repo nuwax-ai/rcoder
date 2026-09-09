@@ -119,7 +119,7 @@ pub fn run(
             task.project_path.display()
         );
         let started = Instant::now();
-        let status = Command::new(&task.argv[0])
+        let status = Command::new(crate::win_cmd::resolve_spawn_program(&task.argv[0]))
             .args(&task.argv[1..])
             .current_dir(&task.project_path)
             .status()
@@ -263,6 +263,16 @@ fn extract_zip(zip_path: &Path, dst: &Path) -> Result<()> {
             std::os::unix::fs::symlink(&target, &out_path)
                 .with_context(|| format!("symlink {} -> {}", out_path.display(), target))?;
             continue;
+        }
+        #[cfg(not(unix))]
+        if entry.is_symlink() {
+            // Windows 创建符号链接需开发者模式/管理员权限——降级为普通文件
+            // （内容为目标路径字符串）。standalone 类制品的模块解析会因此破坏，
+            // 明确告警暴露而非静默降级（Fail Fast）。
+            println!(
+                "⚠️  zip 符号链接条目 {} 在 Windows 降级为普通文件——standalone 产物可能无法运行",
+                entry.name()
+            );
         }
         if entry.is_dir() {
             fs::create_dir_all(&out_path)?;

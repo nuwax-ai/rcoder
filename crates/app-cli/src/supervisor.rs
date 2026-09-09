@@ -543,7 +543,7 @@ async fn start_service(
     let out_path = service_log_dir.join("runtime.out.log");
     let err_path = service_log_dir.join("runtime.err.log");
 
-    let mut cmd = process_group_command(&argv[0]);
+    let mut cmd = process_group_command(crate::win_cmd::resolve_spawn_program(&argv[0]));
     cmd.args(&argv[1..])
         .current_dir(&cwd)
         .envs(&spec.env)
@@ -590,7 +590,7 @@ async fn start_service(
 /// 捕获 stdout/stderr（不 `Stdio::null()` 丢弃）：成功走 `info!`，失败带 stderr 返回错误，
 /// 便于排障（Fail Fast：暴露而非吞掉）。
 pub(crate) async fn run_transient(argv: &[String], cwd: &Path) -> Result<()> {
-    let mut child = Command::new(&argv[0])
+    let mut child = Command::new(crate::win_cmd::resolve_spawn_program(&argv[0]))
         .args(&argv[1..])
         .current_dir(cwd)
         .stdout(Stdio::piped())

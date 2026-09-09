@@ -1,0 +1,23 @@
+{
+  "name": "@nuwax-ai/app-cli-windows-x64",
+  "version": "0.0.0",
+  "description": "app-cli binary for win32-x64 (bundled with self-built rustls pingap.exe — upstream pingap ships no Windows builds)",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "app-cli.exe",
+    "pingap.exe"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuwax-ai/rcoder.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

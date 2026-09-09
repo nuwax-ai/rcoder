@@ -10,11 +10,13 @@
     "@nuwax-ai/app-cli-linux-x64": "0.0.0",
     "@nuwax-ai/app-cli-linux-arm64": "0.0.0",
     "@nuwax-ai/app-cli-darwin-x64": "0.0.0",
-    "@nuwax-ai/app-cli-darwin-arm64": "0.0.0"
+    "@nuwax-ai/app-cli-darwin-arm64": "0.0.0",
+    "@nuwax-ai/app-cli-windows-x64": "0.0.0"
   },
   "os": [
     "linux",
-    "darwin"
+    "darwin",
+    "win32"
   ],
   "cpu": [
     "x64",
