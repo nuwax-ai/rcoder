@@ -125,21 +125,36 @@ fn map_app_cli_evt(json: &str) -> Option<EvtOutcome> {
     post,
     path = "/dev/start",
     request_body = DevOpBody,
-    responses((status = 200, body = HttpResult<UserappDevTaskCreated>, description = "启动任务已创建（task_id）")),
+    responses(
+        (status = 200, body = HttpResult<UserappDevTaskCreated>, description = "启动任务已创建（task_id）"),
+        (status = 400, description = "受理前置校验拒绝（HttpResult 信封，非任务）：code=ERR_WORKSPACE_EMPTY——workspace 为空（尚未创建/导入项目）；code=ERR_WORKSPACE_NO_SERVICES——manifest 缺失/损坏或无 enabled 服务（message 含 fix 指引）。此时不创建任务、无 task_id"),
+    ),
     tag = "Userapp · dev · 进程管理"
 )]
 pub(crate) async fn dev_start(
     State(state): State<UserAppState>,
     Json(body): Json<DevOpBody>,
 ) -> UserAppReply<UserappDevTaskCreated> {
+    // 参数校验最先：非法入参不触发 workspace IO（precheck 含目录扫描/discover）
+    if let Err(e) = body.validate() {
+        return reply(Err(file_server::error::from_garde(e)));
+    }
+    // 受理前置校验：空 workspace / manifest 无可用服务同步 4xx 拒绝
+    // （专用错误码），不再创建"受理成功 → 秒级 failed"的任务。
+    let precheck =
+        match crate::service::userapp::precheck_dev_workspace(&body.app_id, &state.fs.config).await
+        {
+            Ok(p) => p,
+            Err(e) => return super::userapp::dev_precheck_reply(e),
+        };
     let result = async {
-        body.validate().map_err(file_server::error::from_garde)?;
         tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev start");
         let task_id = spawn_dev_task(
             state,
             &body.app_id,
             body.base_path.map(|s| s.to_string()),
             DevTaskAction::Start,
+            precheck,
         )
         .await?;
         Ok(UserappDevTaskCreated {
@@ -217,21 +232,35 @@ pub(crate) async fn dev_stop(
     post,
     path = "/dev/restart",
     request_body = DevOpBody,
-    responses((status = 200, body = HttpResult<UserappDevTaskCreated>, description = "重启任务已创建（task_id）")),
+    responses(
+        (status = 200, body = HttpResult<UserappDevTaskCreated>, description = "重启任务已创建（task_id）"),
+        (status = 400, description = "受理前置校验拒绝（同 dev/start）：ERR_WORKSPACE_EMPTY / ERR_WORKSPACE_NO_SERVICES，不创建任务"),
+    ),
     tag = "Userapp · dev · 进程管理"
 )]
 pub(crate) async fn dev_restart(
     State(state): State<UserAppState>,
     Json(body): Json<DevOpBody>,
 ) -> UserAppReply<UserappDevTaskCreated> {
+    // 参数校验最先（同 dev/start），再受理前置校验：空 workspace / 无可用
+    // 服务同步拒绝。
+    if let Err(e) = body.validate() {
+        return reply(Err(file_server::error::from_garde(e)));
+    }
+    let precheck =
+        match crate::service::userapp::precheck_dev_workspace(&body.app_id, &state.fs.config).await
+        {
+            Ok(p) => p,
+            Err(e) => return super::userapp::dev_precheck_reply(e),
+        };
     let result = async {
-        body.validate().map_err(file_server::error::from_garde)?;
         tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev restart");
         let task_id = spawn_dev_task(
             state,
             &body.app_id,
             body.base_path.map(|s| s.to_string()),
             DevTaskAction::Restart,
+            precheck,
         )
         .await?;
         Ok(UserappDevTaskCreated {
@@ -249,14 +278,19 @@ pub(crate) enum DevTaskAction {
     Restart,
 }
 
-/// dev 任务骨架：create task + resolve workspace + spawn 后台执行
+/// dev 任务骨架：create task + spawn 后台执行
 /// （manifest 同核编译 → 成功后按 action 启动/重启 dev 服务）。
 /// 终态：Completed（制品四字段占位空）/ Failed（友好错误）。
+///
+/// workspace 就绪性（resolve + 源码态判定）由调用方受理前置校验
+/// （`precheck_dev_workspace`）完成并以 `precheck` 传入——空目录 /
+/// manifest 无可用服务在受理期即同步 4xx 拒绝，不再进入本函数。
 async fn spawn_dev_task(
     state: UserAppState,
     app_id: &str,
     base_path: Option<String>,
     action: DevTaskAction,
+    precheck: crate::service::userapp::DevWorkspacePrecheck,
 ) -> Result<String, AppError> {
     let kind = match action {
         DevTaskAction::Start => crate::models::BuildTaskKind::DevStart,
@@ -273,30 +307,10 @@ async fn spawn_dev_task(
     let artifact_rel_path = crate::service::userapp::workspace_artifact_rel_path(&release_id);
     task.set_artifact_path(release_id.clone(), artifact_rel_path.clone())
         .await;
-    // 源码态判定（[devrun] 触发，单一事实源）：决定 dev 编译/启动链路形态。
-    // 判定失败（manifest 坏等）与 resolve 失败同款 fail-fast——受理即终态 Failed。
-    let dev_source_mode = match resolve_userapp_dev(app_id, None, &state.fs.config) {
-        Ok(ws) => {
-            task.set_workspace_root(ws.clone()).await;
-            match crate::service::userapp::dev_mode::dev_mode_enabled(&ws).await {
-                Ok(mode) => mode,
-                Err(e) => {
-                    task.emit(shared_types::BuildProgressEvent::Failed {
-                        error: format!("dev mode detection: {e}"),
-                    })
-                    .await;
-                    return Ok(task.id.clone());
-                }
-            }
-        }
-        Err(e) => {
-            task.emit(shared_types::BuildProgressEvent::Failed {
-                error: format!("resolve workspace: {e}"),
-            })
-            .await;
-            return Ok(task.id.clone());
-        }
-    };
+    // 源码态判定（[devrun] 触发，单一事实源）由 precheck 带入：决定 dev
+    // 编译/启动链路形态；workspace 根同步入任务快照供日志/SSE 解析。
+    let dev_source_mode = precheck.dev_source_mode;
+    task.set_workspace_root(precheck.ws).await;
     let app_id = app_id.to_string();
     let task_clone = task.clone();
     tokio::spawn(async move {
@@ -713,5 +727,53 @@ mod tests {
         assert_eq!(dto.declared_range, "^5.4.21");
         assert_eq!(dto.version.as_deref(), Some("5.4.21"));
         assert_eq!(dto.version_source, "installed");
+    }
+}
+
+#[cfg(test)]
+mod precheck_reply_tests {
+    use super::*;
+    use crate::models::DevOpBody;
+    use axum::response::IntoResponse;
+
+    use super::super::userapp_files::tests_support::make_state;
+
+    /// 受理全链（handler 层）：空 workspace → HTTP 400 + 信封 code=ERR_WORKSPACE_EMPTY，
+    /// 且不创建任务（build_tasks 空）——不再走"200 受理 → 秒级 failed 任务"。
+    #[tokio::test]
+    async fn dev_start_rejects_empty_workspace_with_dedicated_code() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+
+        let reply = dev_start(
+            State(state.clone()),
+            Json(DevOpBody {
+                app_id: "app-7".into(),
+                user_id: "u".into(),
+                base_path: None,
+            }),
+        )
+        .await;
+        let resp = reply.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let (parts, body) = resp.into_parts();
+        drop(parts);
+        let bytes = axum::body::to_bytes(body, 16 * 1024)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("ERR_WORKSPACE_EMPTY"),
+            "code expected in envelope: {text}"
+        );
+        // 未创建任务：被拒受理不在任务表产生残留
+        assert!(
+            state
+                .build_tasks
+                .active_tasks_for_app("app-7")
+                .await
+                .is_empty(),
+            "no task should be created"
+        );
     }
 }

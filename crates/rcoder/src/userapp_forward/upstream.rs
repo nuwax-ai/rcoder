@@ -120,8 +120,10 @@ pub(super) fn explicit_user_id_from_headers(
 /// 定位（miss 幂等 ensure）开发容器 file-server addr。
 ///
 /// 注册表脏值自愈：容器被外部删除（docker rm / 回收）后 state.projects 残留死 IP，
-/// 且 ensure 被注册表命中挡住不会重建——转发前轻量探活（GET /api/version，3s 超时），
-/// 失败则清注册重新 ensure（新容器新 IP），下一次请求即恢复。
+/// 且 ensure 被注册表命中挡住不会重建——转发前轻量探活（GET /api/version，3s 超时）。
+/// 探活失败**不直接判死**：先经 `crate::userapp_builder::remediate_stale_registry`
+/// 以容器运行时真实状态裁决——Running 保容器（高负载超时/启动窗口抖动），
+/// 真死才清注册重建。
 async fn resolve_dev_addr(
     state: &AppState,
     app_id: &str,
@@ -139,33 +141,56 @@ async fn resolve_dev_addr(
     // RTT; 成功后窗口内免探。失败路径(自愈重建)不受缓存影响; 窗口内死容器漏检
     // 可接受——send 失败仍会 502, 下一请求自愈。
     let cache = PROBE_OK.get_or_init(dashmap::DashMap::new);
-    let probe_fresh = cache.get(app_id).is_some_and(|t| t.elapsed() < PROBE_TTL);
+    // view 回调式读取：不产生 Ref guard（锁仅在闭包内持有），结构性杜绝
+    // guard 跨 await 的自死锁可能——不依赖"临时值即时 drop"的写法纪律
+    let probe_fresh = cache
+        .view(app_id, |_, t| t.elapsed() < PROBE_TTL)
+        .unwrap_or(false);
     if !probe_fresh && !probe_dev_container(&addr).await {
         warn!(
-            "[USERAPP_FORWARD] dev container probe failed (stale registry entry?), recreating: app_id={app_id}, addr={addr}"
+            "[USERAPP_FORWARD] dev container probe failed (stale registry entry?), verifying container state: app_id={app_id}, addr={addr}"
         );
-        // 就地清 container 字段而非 remove_project：remove 在 PG 模式会持久化删除
-        // project 行及其 sessions（刚 durable 写入的会话映射全丢、跨副本路由失效），
-        // 且需先关 SSE 流避免后台 gRPC 对死地址空转——探活仅 3s 超时单次判定，
-        // 高负载抖动即触发，破坏性过大。清 container 让 ensure 走重建路径即可。
-        state.shutdown_sse_streams_for_project(app_id);
-        if let Some(mut info) = state.get_project(app_id).map(|p| (*p).clone()) {
-            info.set_container(None);
-            if let Err(e) = state.insert_project(app_id.to_string(), Arc::new(info)) {
-                warn!("[USERAPP_FORWARD] clear stale container field failed: app_id={app_id}: {e}");
+        // 先验容器真实状态再决定处置：Running 则保容器（探活失败是超时/未就绪
+        // 抖动，编译高负载/新容器启动窗口常见），只有真死才清注册重建——
+        // 防误杀正在跑任务的容器
+        match crate::userapp_builder::remediate_stale_registry(state, app_id).await {
+            crate::userapp_builder::RegistryRemediation::Alive(info) => {
+                info!(
+                    "[USERAPP_FORWARD] dev container alive on inspect, keep without rebuild: app_id={app_id}"
+                );
+                // 写正缓存：容器经 inspect 确认在跑（探活失败只是负载抖动），30s
+                // 窗口内不再重复付 3s 探活超时——否则编译高峰期每个请求都要
+                // probe 超时+inspect 一次。窗口内容器真死漏检与既有语义一致
+                // （send 失败 502，下一请求自愈）。
+                cache.insert(app_id.to_string(), std::time::Instant::now());
+                return Ok(dev_file_server_addr(state, &info));
+            }
+            crate::userapp_builder::RegistryRemediation::Gone => {
+                // 就地清 container 字段而非 remove_project：remove 在 PG 模式会持久化删除
+                // project 行及其 sessions（刚 durable 写入的会话映射全丢、跨副本路由失效），
+                // 且需先关 SSE 流避免后台 gRPC 对死地址空转——清 container 让 ensure 走重建路径即可。
+                state.shutdown_sse_streams_for_project(app_id);
+                if let Some(mut info) = state.get_project(app_id).map(|p| (*p).clone()) {
+                    info.set_container(None);
+                    if let Err(e) = state.insert_project(app_id.to_string(), Arc::new(info)) {
+                        warn!(
+                            "[USERAPP_FORWARD] clear stale container field failed: app_id={app_id}: {e}"
+                        );
+                    }
+                }
+                info = ensure_userapp_builder(state, app_id, explicit_user_id)
+                    .await
+                    .map_err(|e| {
+                        warn!("[USERAPP_FORWARD] re-ensure dev container failed: app_id={app_id}: {e:#}");
+                        HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}"))
+                            .into_boxed_response()
+                    })?;
+                addr = dev_file_server_addr(state, &info);
+                // 重建的新容器可能仍在启动(agent_runner+file-server+PG 全套)——不写探活
+                // 缓存, 由本次 send 定成败; 下一请求重新探活
+                return Ok(addr);
             }
         }
-        info = ensure_userapp_builder(state, app_id, explicit_user_id)
-            .await
-            .map_err(|e| {
-                warn!("[USERAPP_FORWARD] re-ensure dev container failed: app_id={app_id}: {e:#}");
-                HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}"))
-                    .into_boxed_response()
-            })?;
-        addr = dev_file_server_addr(state, &info);
-        // 重建的新容器可能仍在启动(agent_runner+file-server+PG 全套)——不写探活
-        // 缓存, 由本次 send 定成败; 下一请求重新探活
-        return Ok(addr);
     }
     if !probe_fresh {
         cache.insert(app_id.to_string(), std::time::Instant::now());

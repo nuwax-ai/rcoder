@@ -224,7 +224,7 @@ docker_config:
           RCODER_EMBED_FILE_SERVER: "true"
           # release lock 构建身份三元组（build 产 workspace-package 的 release.lock.toml 需要；
           # 与 K8s 模式 env 透传、rcoder compose env 同源——值由部署环境注入）
-          RCODER_PINGAP_VERSION: "0.13.8"
+          RCODER_PINGAP_VERSION: "0.13.9"
           RCODER_PINGAP_COMMIT: "local-development"
           RCODER_RUNTIME_IMAGE_DIGEST: "sha256:local-development"
         resource_limits:

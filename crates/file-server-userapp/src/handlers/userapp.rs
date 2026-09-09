@@ -48,6 +48,10 @@ use file_server::extract::{AppJson, AppPath, AppQuery};
 pub(crate) enum UserAppReply<T> {
     Ok(T),
     Err(AppError),
+    /// 专用错误码错误：code 显式指定（如 `ERR_WORKSPACE_EMPTY`），HTTP 400。
+    /// 用于调用方（Java/前端）需要程序化区分的受理拒绝，AppError 类型映射
+    /// 覆盖不到的细分语义。
+    ErrCode(&'static str, String),
 }
 
 impl<T: Serialize> IntoResponse for UserAppReply<T> {
@@ -55,6 +59,11 @@ impl<T: Serialize> IntoResponse for UserAppReply<T> {
         use shared_types::error_codes as ec;
         match self {
             UserAppReply::Ok(data) => Json(HttpResult::success(data)).into_response(),
+            UserAppReply::ErrCode(code, message) => (
+                StatusCode::BAD_REQUEST,
+                Json(HttpResult::<T>::error(code, &message)),
+            )
+                .into_response(),
             UserAppReply::Err(e) => {
                 let (code, status) = match &e {
                     AppError::Validation(..)
@@ -126,19 +135,32 @@ fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
     post,
     path = "/build",
     request_body = BuildUserAppBody,
-    responses((status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 task_id（轮询/SSE 用）与 artifact_path（受理时即确定：builds/workspace-package-{release_id}.zip，release_id 预生成）+ status=pending。同 app_id 已有活跃任务时在队列排队（per-app 互斥）；全局任务容量满时 4xx 拒绝。后续状态：轮询 GET /tasks/{task_id} 或订阅 GET /tasks/{task_id}/logs/stream（SSE，构建日志行以 log 事件实时推送）。")),
+    responses(
+        (status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 task_id（轮询/SSE 用）与 artifact_path（受理时即确定：builds/workspace-package-{release_id}.zip，release_id 预生成）+ status=pending。同 app_id 已有活跃任务时在队列排队（per-app 互斥）；全局任务容量满时 4xx 拒绝。后续状态：轮询 GET /tasks/{task_id} 或订阅 GET /tasks/{task_id}/logs/stream（SSE，构建日志行以 log 事件实时推送）。"),
+        (status = 400, description = "受理前置校验拒绝（HttpResult 信封，非任务）：code=ERR_WORKSPACE_EMPTY——workspace 为空（尚未创建/导入项目）；code=ERR_WORKSPACE_NO_SERVICES——manifest 缺失/损坏或无 enabled 服务（message 含 fix 指引）。此时不创建任务、无 task_id"),
+    ),
     tag = "Userapp · dev · 构建任务"
 )]
 pub(crate) async fn build_workspace(
     State(state): State<UserAppState>,
     AppJson(body): AppJson<BuildUserAppBody>,
 ) -> UserAppReply<BuildCreatedData> {
+    // 参数校验最先：非法入参不触发 workspace IO（precheck 含目录扫描/discover）。
+    if let Err(e) = body.validate() {
+        return reply(Err(file_server::error::from_garde(e)));
+    }
+    // 受理前置校验：空 workspace / manifest 无可用服务同步 4xx 拒绝
+    // （专用错误码），不再创建"受理成功 → 秒级 failed"的任务。
+    let precheck = match userapp::precheck_dev_workspace(&body.app_id, &state.fs.config).await {
+        Ok(p) => p,
+        Err(e) => return dev_precheck_reply(e),
+    };
     let result = async {
-        body.validate().map_err(file_server::error::from_garde)?;
         let (task_id, artifact_path) = userapp::start_build_task(
             &state.build_tasks,
             &state.fs.config,
             state.fs.build_manager.clone(),
+            precheck.ws.clone(),
             body.app_id.clone(),
             state.fs.config.dev_command_timeout_secs,
         )
@@ -152,6 +174,20 @@ pub(crate) async fn build_workspace(
         })
     };
     reply(result.await)
+}
+
+/// 受理前置校验失败 → 专用错误码 4xx 响应（dev/start、dev/restart、build 三链共用）。
+pub(crate) fn dev_precheck_reply<T: Serialize>(e: userapp::DevPrecheckError) -> UserAppReply<T> {
+    use shared_types::error_codes as ec;
+    match e {
+        userapp::DevPrecheckError::Resolve(e) => UserAppReply::Err(e),
+        userapp::DevPrecheckError::WorkspaceEmpty(msg) => {
+            UserAppReply::ErrCode(ec::ERR_WORKSPACE_EMPTY, msg)
+        }
+        userapp::DevPrecheckError::NoServices(msg) => {
+            UserAppReply::ErrCode(ec::ERR_WORKSPACE_NO_SERVICES, msg)
+        }
+    }
 }
 
 /// 获取构建任务状态快照
@@ -214,7 +250,7 @@ pub(crate) async fn get_task(
     responses(
         (
             status = 200,
-            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 0 递增（首条事件 id:0）。断线续传两种方式（二选一）：① 请求带 `Last-Event-ID: <最后收到的seq>` 头（SSE 规范标准方式，浏览器 EventSource 自动重连自动携带，服务端从该 seq 之后回放）；② query `?from_seq=<最后seq+1>`（从该 seq 开始含本身回放；头存在时被忽略）。\n\n事件清单（event 名 → data 载荷）：\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始构建某服务）\n- `log` → `{'event':'log','service':'<服务ID>','line':'一行构建输出'}`（构建日志行，实时逐行推送；出现在该服务的 building 与 build_ok/build_fail 之间，行序即进程输出顺序）\n- `build_ok` → `{'event':'build_ok','service':'...'}`（服务构建成功）\n- `build_fail` → `{'event':'build_fail','service':'...','error':'...'}`\n- `completed`（终态）→ `{'event':'completed','release_id':'...','sha256':'...','size_bytes':N,'file_name':'...','artifact_path':'builds/workspace-package-{release_id}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端按上述任一方式带游标重连续传\n\n说明：构建日志以本流 `log` 事件实时推送（前端单流订阅即可）；断线按上述续传协议补齐——回放环有界（超环容量的早期行不可回补），长任务/超大输出建议任务创建后尽早订阅。构建串行执行（按 service_id 字母序逐服务构建），日志行按服务分段有序、不交错。`stage` 事件类型为协议预留，当前任务流不发送。终态事件（completed/failed/cancelled）后服务端关闭流；每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
+            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 0 递增（首条事件 id:0）。断线续传两种方式（二选一）：① 请求带 `Last-Event-ID: <最后收到的seq>` 头（SSE 规范标准方式，浏览器 EventSource 自动重连自动携带，服务端从该 seq 之后回放）；② query `?from_seq=<最后seq+1>`（从该 seq 开始含本身回放；头存在时被忽略）。\n\n事件清单（event 名 → data 载荷）：\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始构建某服务）\n- `log` → `{'event':'log','service':'<服务ID>','line':'一行构建输出'}`（构建日志行，实时逐行推送；出现在该服务的 building 与 build_ok/build_fail 之间，行序即进程输出顺序）\n- `build_ok` → `{'event':'build_ok','service':'...'}`（服务构建成功）\n- `build_fail` → `{'event':'build_fail','service':'...','error':'...'}`\n- `completed`（终态）→ `{'event':'completed','release_id':'...','sha256':'...','size_bytes':N,'file_name':'...','artifact_path':'builds/workspace-package-{release_id}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端按上述任一方式带游标重连续传\n\n说明：构建日志以本流 `log` 事件实时推送（前端单流订阅即可）；断线按上述续传协议补齐——回放环有界（超环容量的早期行不可回补），长任务/超大输出建议任务创建后尽早订阅。构建串行执行（按 service_id 字母序逐服务构建），日志行按服务分段有序、不交错。`stage` 事件类型为协议预留，当前任务流不发送。终态事件（completed/failed/cancelled）后服务端关闭流；续传游标已越过终态事件（客户端早已收到终态）时订阅即刻关闭、不再等待。每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
             content_type = "text/event-stream",
         ),
         (status = 404, description = "Task not found（HttpResult JSON，非 SSE）"),
@@ -258,6 +294,12 @@ pub(crate) async fn stream_task_logs(
             if terminal {
                 return;
             }
+        }
+        // 回放耗尽未遇终态，但任务此刻已是终态：说明续传游标已越过终态事件
+        // （客户端早已收到终态）——不会再有新事件，直接关流。否则 broadcast
+        // 存活期内 recv 永远 pending，流只剩 keep-alive 悬挂不关闭。
+        if task.is_terminal().await {
+            return;
         }
         // 实时跟随 broadcast
         loop {
@@ -472,5 +514,97 @@ mod tests {
         // 非数字头（EventSource 不会发，仅手写客户端触发）→ 忽略头用 query
         assert_eq!(resolve_from_seq(Some("abc"), 5), 5);
         assert_eq!(resolve_from_seq(Some(""), 9), 9);
+    }
+}
+
+#[cfg(test)]
+mod stream_close_tests {
+    use super::*;
+    use crate::models::BuildTaskKind;
+    use file_server::extract::{AppPath, AppQuery};
+
+    use super::super::userapp_files::tests_support::make_state;
+
+    /// 终态任务 + 续传游标越过终态事件 → 流即刻关闭。
+    /// 回归锁：修复前此场景 replay 为空、broadcast 存活期内 recv 永远 pending，
+    /// 流只剩 15s keep-alive 悬挂不关闭（客户端 EventSource 无限重连）。
+    #[tokio::test]
+    async fn stream_closes_when_cursor_past_terminal_event() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        let task = state
+            .build_tasks
+            .create("app-1".into(), BuildTaskKind::DevStart)
+            .await
+            .expect("create task");
+        task.emit(BuildProgressEvent::Failed {
+            error: "boom".into(),
+        })
+        .await;
+
+        // from_seq=999 越过终态事件（seq=0）：replay 为空 + 任务已终态 → 直接关流
+        let resp = stream_task_logs(
+            State(state),
+            AppPath(task.id.clone()),
+            AppQuery(StreamQuery {
+                app_id: "app-1".into(),
+                user_id: "u".into(),
+                from_seq: 999,
+            }),
+            HeaderMap::new(),
+        )
+        .await;
+        let body = resp.into_body();
+        // 若回归（悬挂），to_bytes 永不完成——超时兜底让测试失败而非挂死
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(3),
+            axum::body::to_bytes(body, 64 * 1024),
+        )
+        .await
+        .expect("stream must terminate (regression: keep-alive-only hang)")
+        .expect("read body");
+        assert!(
+            bytes.is_empty(),
+            "no events expected past terminal, got: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    /// 对照：正常游标（from_seq=0）回放终态事件后关流（既有行为锁定）。
+    #[tokio::test]
+    async fn stream_replays_terminal_event_then_closes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        let task = state
+            .build_tasks
+            .create("app-1".into(), BuildTaskKind::DevStart)
+            .await
+            .expect("create task");
+        task.emit(BuildProgressEvent::Failed {
+            error: "boom".into(),
+        })
+        .await;
+
+        let resp = stream_task_logs(
+            State(state),
+            AppPath(task.id.clone()),
+            AppQuery(StreamQuery {
+                app_id: "app-1".into(),
+                user_id: "u".into(),
+                from_seq: 0,
+            }),
+            HeaderMap::new(),
+        )
+        .await;
+        let body = resp.into_body();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(3),
+            axum::body::to_bytes(body, 64 * 1024),
+        )
+        .await
+        .expect("stream must terminate after terminal event")
+        .expect("read body");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("event: failed"), "body={text}");
     }
 }

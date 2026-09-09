@@ -67,7 +67,7 @@ pub struct LogsAccessParams {
             description = "查询成功（HttpResult 信封 data=声明日志源与匹配文件列表）",
             body = HttpResult<Vec<LogSourceInfo>>
         ),
-        (status = 400, description = "app-cli 拒绝请求（参数错误，信封透传）", body = HttpResult<String>),
+        (status = 400, description = "dev 会话未运行（ERR_DEV_NOT_RUNNING，rcoder 受理前置检查秒回）或 app-cli 拒绝请求（参数错误，信封透传）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
         (status = 500, description = "连接 app-cli / 响应读取失败", body = HttpResult<String>)
@@ -118,7 +118,7 @@ sources/query。
             description = "查询成功（HttpResult 信封 data=多服务日志快照；cursor 回填下次请求可断点续拉）",
             body = HttpResult<LogQueryResponse>
         ),
-        (status = 400, description = "app-cli 拒绝请求（参数错误，信封透传）", body = HttpResult<String>),
+        (status = 400, description = "dev 会话未运行（ERR_DEV_NOT_RUNNING，rcoder 受理前置检查秒回）或 app-cli 拒绝请求（参数错误，信封透传）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
         (status = 500, description = "连接 app-cli / 响应读取失败", body = HttpResult<String>)
@@ -169,7 +169,7 @@ SSE 实时日志流（500ms 轮询内核）：事件清单与断线续传协议�
             description = "SSE 实时日志流（转发容器内 app-cli，轮询周期 500ms；首轮带 tail 默认 100 行，后续增量）。每条消息 `event:<事件名>` + `data:<JSON>`，字段 snake_case。\n\n事件清单：\n- `log` → 日志行：`{'service_id':'web','source_id':'runtime','file':'web.log','offset':123,'timestamp':'...','level':'INFO','message':'一行日志'}`（timestamp/level 可空，文本格式日志无时间戳解析）\n- `source_error` → 某日志源读取失败：`{'service_id':'...','source_id':'...','code':'...','message':'...'}`（去重：同源只报一次）\n- `source_recovered` → 失败源恢复：`{'service_id':'...','source_id':'...'}`\n- `cursor_reset` → 游标失效（跨部署代/游标损坏）：`{'message':'...'}`，客户端应丢弃本地 cursor 从 tail 重新开始\n- `checkpoint` → data 为新游标字符串（base64，可直接回填请求体 cursor 断线续传）\n- `heartbeat` → 保活（每 15s），data='{}'\n\n断线续传：把最近一次 checkpoint 的值作为请求体 cursor 重发即可从断点继续；重新部署后游标代际变化会收到 cursor_reset。",
             content_type = "text/event-stream",
         ),
-        (status = 400, description = "app-cli 拒绝请求（参数错误）", body = HttpResult<String>),
+        (status = 400, description = "dev 会话未运行（ERR_DEV_NOT_RUNNING，rcoder 受理前置检查秒回）或 app-cli 拒绝请求（参数错误）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
         (status = 500, description = "连接 app-cli / 建流失败", body = HttpResult<String>)

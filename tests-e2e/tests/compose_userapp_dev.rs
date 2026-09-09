@@ -423,6 +423,117 @@ async fn userapp_dev_chat_full_turn_anthropic() {
 }
 
 // ============================================================
+// 场景 3b：userApp 开发对话 agent_work_dir 渗透防御（回归锚点：
+//          Java 曾借 agent_work_dir 传会话 ID → agent 落错容器可写层，
+//          平台侧按 app_id 找不到代码。修复后定位键恒为 app_id）
+// ============================================================
+async fn scenario_userapp_chat_workdir_agent_work_dir(backend: Backend) {
+    let scenario = "userapp_dev_chat_workdir";
+    let Some((env, report)) = Env::compose_or_skip(scenario, backend.as_str()).await else {
+        return;
+    };
+    let app = scoped_app(&env, &format!("w-{}", backend.as_str()));
+    let user = "e2e-ud-user";
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 模拟 Java 历史行为：agent_work_dir 携带会话 ID（非 app_id）。修复后
+    // 网关消毒 + agent_runner 忽略——工作目录恒为 {USERAPP_WORKSPACE_DIR}/{app_id}
+    let mut req = env.base_payload(
+        backend,
+        "创建文件 workdir-landed.txt，内容为 ok。除此之外不要做任何事。",
+        &format!("{}-udw", env.run_tag),
+        user,
+    );
+    req.service_type = Some(shared_types::ChatServiceScope::Userapp);
+    req.app_id = Some(app.clone());
+    req.agent_work_dir = Some("1561845".to_string());
+
+    let Ok(data) = chat_reported(&env, &report, "turn1", &env.rcoder, &req).await else {
+        report.assert_hard("chat 成功", false, "chat 失败（见 chat_request 行）".into());
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    };
+    let sid = data.session_id.clone();
+    report.assert_hard("session_id 非空", !sid.is_empty(), sid.clone());
+    report.assert_hard(
+        "project_id 回显 = app_id",
+        data.project_id == app,
+        format!("回显 {:?}，期望 {app:?}", data.project_id),
+    );
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let (events, _) = collect_reported(
+        &env,
+        &report,
+        CollectSpec {
+            phase: "collect_turn1",
+            entry: &env.rcoder,
+            sid: &sid,
+            duration_s: 60.0,
+            last_event_id: None,
+            idle_stop: true,
+        },
+    )
+    .await;
+    report.assert_hard(
+        "含 end_turn（完整轮）",
+        count_event(&events, "end_turn") >= 1,
+        format!("事件分布 {}", sse::type_counts(&events)),
+    );
+
+    // 核心断言：产物落在平台可见的 workspace——file-server 按
+    // {USERAPP_WORKSPACE_DIR}/{app_id} 定位，能列出即证明 agent 落在
+    // PVC 挂载点，而非 agent_work_dir 指向的容器可写层目录
+    let resp_l = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/get-file-list?app_id={app}&user_id={user}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &app)
+        .send()
+        .await
+        .expect("list get");
+    let sl = resp_l.status();
+    let bl: Value = resp_l.json().await.unwrap_or(Value::Null);
+    let files = bl["files"].as_array().cloned().unwrap_or_default();
+    let names: Vec<String> = files
+        .iter()
+        .filter_map(|f| f["name"].as_str().map(str::to_owned))
+        .collect();
+    let landed = names.iter().any(|n| n == "workdir-landed.txt");
+    report.assert_hard(
+        "agent 产物落 workspace（agent_work_dir=会话ID 不再劫持定位）",
+        landed,
+        format!("HTTP {sl}, files: {names:?}"),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
+#[tokio::test]
+async fn userapp_dev_chat_workdir_agent_work_dir_openai() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    scenario_userapp_chat_workdir_agent_work_dir(Backend::Openai).await;
+}
+
+#[tokio::test]
+async fn userapp_dev_chat_workdir_agent_work_dir_anthropic() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    scenario_userapp_chat_workdir_agent_work_dir(Backend::Anthropic).await;
+}
+
+// ============================================================
 // 场景 4：userApp 开发对话两轮 seq 隔离（同 session 第二轮不含第一轮内容）
 // ============================================================
 async fn scenario_userapp_two_turn_isolation(backend: Backend) {
@@ -1287,6 +1398,27 @@ async fn userapp_dev_server_lifecycle() {
             .as_array()
             .is_some_and(|arr| arr.is_empty()),
         format!("body 截断: {}", trunc(&body, 120)),
+    );
+
+    // dev 停止后查 dev 日志 → 受理前置检查快速失败（400 ERR_DEV_NOT_RUNNING），
+    // 不再是挂满连接超时后的 500 ERR_BACKEND_ERROR（app-cli :3010 随会话退出）
+    let resp = env
+        .http
+        .post(format!(
+            "{}/api/v1/userapp/{app}/dev/logs/sources/query?user_id={user}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(10))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("logs sources query after dev stop");
+    let stopped_status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "dev/stop 后 logs/sources/query → 快速 400 ERR_DEV_NOT_RUNNING",
+        stopped_status.as_u16() == 400 && body["code"].as_str() == Some("ERR_DEV_NOT_RUNNING"),
+        format!("status={stopped_status}, body 截断: {}", trunc(&body, 120)),
     );
 
     assert_hard_all(report).await;

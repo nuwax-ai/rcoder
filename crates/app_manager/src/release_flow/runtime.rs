@@ -16,7 +16,7 @@ use crate::service::AppService;
 /// 单一来源 shared_types::APP_ENTRY_PORT（dev 容器 manifest 流程、Pingora 免端口代理同值）。
 const APP_HTTP_PORT: u16 = shared_types::APP_ENTRY_PORT;
 /// app-cli 管理 API 端口（K8s 探针打这里：app-cli 自身提供 /health+/ready，不强依赖后端 app）。
-const APP_CLI_ADMIN_PORT: u16 = 3010;
+const APP_CLI_ADMIN_PORT: u16 = shared_types::APP_CLI_ADMIN_PORT;
 /// app-cli 提供的探针路径（liveness=进程活，readiness=初始化完成/可选桥接后端）。
 const APP_LIVENESS_PATH: &str = "/health";
 const APP_READINESS_PATH: &str = "/ready";

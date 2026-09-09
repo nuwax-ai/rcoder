@@ -211,6 +211,21 @@ pub const ERR_IMAGE_PULL_FAILED: &str = "ERR_IMAGE_PULL_FAILED";
 /// 集群资源不足（调度失败）。可重试 → 503
 pub const ERR_RESOURCE_EXHAUSTED: &str = "ERR_RESOURCE_EXHAUSTED";
 
+// ========== UserApp workspace 就绪性错误码 ==========
+//
+// dev/start、dev/restart、build 受理期前置校验专用：失败即刻同步拒绝（HTTP 400），
+// 不再走"受理成功 → 任务异步 failed"的旧链路。终态（放好项目前重试无用）。
+
+/// UserApp workspace 为空（目录不存在或没有任何文件）——尚未创建/导入项目。终态 → 400
+pub const ERR_WORKSPACE_EMPTY: &str = "ERR_WORKSPACE_EMPTY";
+
+/// UserApp workspace 无可用服务（manifest 缺失/损坏，或所有项目 disabled）。终态 → 400
+pub const ERR_WORKSPACE_NO_SERVICES: &str = "ERR_WORKSPACE_NO_SERVICES";
+
+/// UserApp dev 会话未运行——dev 日志仅在开发服务运行期间可用（app-cli 管理
+/// API :3010 随 dev 会话拉起/退出）。日志受理期快速失败 → 400；启动 dev 后即可查询。
+pub const ERR_DEV_NOT_RUNNING: &str = "ERR_DEV_NOT_RUNNING";
+
 /// 判断错误码是否可重试（Java 据此决定是否指数退避重发）。
 ///
 /// 注意：`retryable` 是错误码的固有属性，不在响应体重复（HttpResult 不变）。
@@ -290,6 +305,9 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_BACKEND_ERROR => "error.backend_error",
         ERR_IMAGE_PULL_FAILED => "error.image_pull_failed",
         ERR_RESOURCE_EXHAUSTED => "error.resource_exhausted",
+        ERR_WORKSPACE_EMPTY => "error.workspace_empty",
+        ERR_WORKSPACE_NO_SERVICES => "error.workspace_no_services",
+        ERR_DEV_NOT_RUNNING => "error.dev_not_running",
         ERR_UNKNOWN => "error.unknown",
         _ => "error.undefined",
     }
@@ -393,6 +411,13 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_BACKEND_ERROR => "Backend API call failed",
         ERR_IMAGE_PULL_FAILED => "Image pull failed",
         ERR_RESOURCE_EXHAUSTED => "Cluster resources exhausted",
+        ERR_WORKSPACE_EMPTY => "UserApp workspace is empty (no project created or imported yet)",
+        ERR_WORKSPACE_NO_SERVICES => {
+            "UserApp workspace has no enabled services (invalid or missing manifest)"
+        }
+        ERR_DEV_NOT_RUNNING => {
+            "UserApp dev server is not running (dev logs are only available while it runs)"
+        }
         ERR_UNKNOWN => "Unknown error",
         _ => "Undefined error code",
     }
@@ -455,6 +480,9 @@ mod tests {
             ERR_AGENT_RUNNER_UNAVAILABLE,
             ERR_AGENT_CONTAINER_UNAVAILABLE,
             ERR_MODEL_UNAVAILABLE,
+            ERR_WORKSPACE_EMPTY,
+            ERR_WORKSPACE_NO_SERVICES,
+            ERR_DEV_NOT_RUNNING,
         ];
 
         for code in codes {
@@ -470,6 +498,30 @@ mod tests {
                 !get_error_message(code, "zh-TW").is_empty(),
                 "missing zh-TW: {code}"
             );
+        }
+    }
+
+    /// 新增 workspace 就绪性码的三语 yml 真命中：t() 未命中时返回 key 本身，
+    /// 仅断言非空拦不住 yml 加载失败/键名写错。
+    #[test]
+    fn workspace_readiness_codes_translate_in_all_locales() {
+        for (code, key, zh) in [
+            (ERR_WORKSPACE_EMPTY, "error.workspace_empty", "工作区为空"),
+            (
+                ERR_WORKSPACE_NO_SERVICES,
+                "error.workspace_no_services",
+                "无可用服务",
+            ),
+        ] {
+            assert_eq!(get_error_i18n_key(code), key);
+            for locale in ["zh-CN", "zh-TW", "en-US"] {
+                let msg = get_error_message(code, locale);
+                assert_ne!(msg, key, "locale={locale} fell back to raw key");
+                assert!(!msg.is_empty());
+            }
+            // zh-CN 译文内容抽检（防键值错位配到别的条目）
+            let zh_msg = get_error_message(code, "zh-CN");
+            assert!(zh_msg.contains(zh), "zh-CN={zh_msg}");
         }
     }
 }

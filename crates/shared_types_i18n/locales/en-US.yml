@@ -135,6 +135,13 @@ error.system_busy: "System is busy: concurrent Agent sessions reached limit ({})
 error.project_not_found: "Project not found or stopped"
 error.agent_runner_unavailable: "Agent Runner container is unavailable"
 
+# UserApp workspace readiness (dev/start & build acceptance precheck)
+error.workspace_empty: "UserApp workspace is empty: no project created or imported yet"
+error.workspace_no_services: "UserApp workspace has no enabled services: manifest missing, invalid, or all projects disabled"
+
+# UserApp dev session (dev logs precheck)
+error.dev_not_running: "Dev server is not running: dev logs are only available while the dev server is running; start it first"
+
 # === gRPC service messages ===
 
 # Common (shared across cancel/stop)

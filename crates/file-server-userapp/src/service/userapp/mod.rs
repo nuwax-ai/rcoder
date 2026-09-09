@@ -330,6 +330,64 @@ pub async fn build_workspace_package(
     })
 }
 
+/// dev/build 受理前置校验结果：workspace 绝对路径 + 源码态判定。
+#[derive(Debug)]
+pub struct DevWorkspacePrecheck {
+    /// workspace 根（受理期已 resolve，任务快照与编译链共用）。
+    pub ws: PathBuf,
+    /// 是否源码态（任一 enabled 服务配 `[devrun]`；dev 编译形态分派用，
+    /// `/build` 产物态打包不消费此值）。
+    pub dev_source_mode: bool,
+}
+
+/// 受理前置校验失败——同步 4xx 拒绝（不创建任务），由壳层映射专用错误码。
+#[derive(Debug)]
+pub enum DevPrecheckError {
+    /// workspace 路径解析失败（appId 非法等）——沿用通用校验错误。
+    Resolve(AppError),
+    /// workspace 不存在或没有任何文件——`ERR_WORKSPACE_EMPTY`。
+    WorkspaceEmpty(String),
+    /// discover 失败（manifest 缺失/损坏、无 enabled 服务）——
+    /// `ERR_WORKSPACE_NO_SERVICES`（message 保留 discover 的 fix 指引文案）。
+    NoServices(String),
+}
+
+/// dev/build 任务受理前置校验：workspace 就绪性快速失败。
+///
+/// 空目录 / manifest 无可用服务直接拒绝受理，不再创建"受理成功 → 秒级
+/// failed"的任务——失败对调用方即刻可见（HTTP 4xx + 专用错误码），也免去
+/// 任务注册与上游轮询开销。`/build`（产物态打包）、`/dev/start`、
+/// `/dev/restart` 三链共用：discover 失败对三条链路同样致命。
+pub async fn precheck_dev_workspace(
+    app_id: &str,
+    config: &Arc<file_server::Config>,
+) -> Result<DevWorkspacePrecheck, DevPrecheckError> {
+    let ws = file_server::workspace::resolve_userapp_dev(app_id, None, config)
+        .map_err(DevPrecheckError::Resolve)?;
+    // 廉价空检查：目录不存在或无任何条目 = 尚未创建/导入项目。空目录走
+    // discover 只会报 "no enabled services"，与 manifest 损坏无法区分——
+    // 提前分流才能给出 ERR_WORKSPACE_EMPTY 的精确指引。
+    let has_entries = match tokio::fs::read_dir(&ws).await {
+        Ok(mut entries) => matches!(entries.next_entry().await, Ok(Some(_))),
+        Err(_) => false,
+    };
+    if !has_entries {
+        return Err(DevPrecheckError::WorkspaceEmpty(format!(
+            "应用工作区为空，请先创建或导入项目: {}",
+            ws.display()
+        )));
+    }
+    let dev_source_mode = dev_mode::dev_mode_enabled(&ws).await.map_err(|e| {
+        // e 内部已含 "discover projects in {ws}: " 前缀（dev_mode.rs 包装），
+        // 此处只加链路标识——再拼路径会双前缀重复
+        DevPrecheckError::NoServices(format!("dev mode detection: {e}"))
+    })?;
+    Ok(DevWorkspacePrecheck {
+        ws,
+        dev_source_mode,
+    })
+}
+
 /// 异步发起 build 任务（不阻塞，立即返 task_id + 预生成的产物相对路径）。进度事件
 /// 经 task 流出（SSE/轮询）。
 ///
@@ -344,6 +402,7 @@ pub async fn start_build_task(
     store: &BuildTaskStore,
     config: &Arc<file_server::Config>,
     build_manager: Arc<BuildManager>,
+    ws: PathBuf,
     app_id: String,
     timeout_secs: u64,
 ) -> Result<(BuildTaskId, String), AppError> {
@@ -359,18 +418,9 @@ pub async fn start_build_task(
     let artifact_path = workspace_artifact_rel_path(&release_id);
     task.set_artifact_path(release_id.clone(), artifact_path.clone())
         .await;
-    // 预 resolve workspace 根并存入 task,供 logs/SSE handler 解析日志目录
-    // ({workspace}/logs/{service}/)。resolve 失败则 emit Failed 终态,不 spawn。
-    match file_server::workspace::resolve_userapp_dev(&app_id, None, config) {
-        Ok(ws) => task.set_workspace_root(ws).await,
-        Err(e) => {
-            task.emit(BuildProgressEvent::Failed {
-                error: format!("resolve workspace: {e}"),
-            })
-            .await;
-            return Ok((task.id.clone(), artifact_path));
-        }
-    }
+    // workspace 根由受理前置校验（precheck_dev_workspace）resolve 后传入：
+    // 空目录/manifest 无可用服务已在受理期同步拒绝，此处不再有 resolve 失败分支。
+    task.set_workspace_root(ws).await;
     let task_spawn = task.clone();
     let config = Arc::clone(config);
     tokio::spawn(async move {
@@ -511,5 +561,130 @@ mod truncate_tests {
         assert_eq!(truncate_at_char(mixed, 2), "a…");
         // max 恰在合法边界（'中' 结束于字节 4）：不回退、不丢字符
         assert_eq!(truncate_at_char(mixed, 4), "a中…");
+    }
+}
+
+#[cfg(test)]
+mod precheck_tests {
+    use super::*;
+
+    fn config_with_root(root: &std::path::Path) -> Arc<file_server::Config> {
+        Arc::new(file_server::Config {
+            userapp_workspace_dir: root.to_path_buf(),
+            ..Default::default()
+        })
+    }
+
+    /// 与 dev_mode 测试同款 manifest fixture（enabled 服务，无 [devrun]）。
+    fn write_manifest(dir: &std::path::Path, service_id: &str) {
+        let content = format!(
+            "schema_version = 1\n\
+             [project]\nservice_id = '{service_id}'\nname = '{service_id}'\ntype = 'node'\n\
+             [build]\ncommand = ['true']\nartifact = 'artifact.zip'\n\
+             [run]\ncommand = ['true']\n"
+        );
+        std::fs::write(dir.join("project.manifest.toml"), content).expect("write manifest");
+    }
+
+    /// workspace 不存在 / 存在但空 → WorkspaceEmpty（message 带路径指引）。
+    /// 这两个场景不再走任务链报笼统的 "no enabled services"。
+    #[tokio::test]
+    async fn precheck_rejects_missing_or_empty_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = config_with_root(tmp.path());
+
+        // 目录不存在
+        match precheck_dev_workspace("app-7", &cfg).await {
+            Err(DevPrecheckError::WorkspaceEmpty(msg)) => {
+                assert!(msg.contains("app-7"), "message should mention path: {msg}");
+            }
+            other => panic!("expected WorkspaceEmpty, got {other:?}"),
+        }
+
+        // 目录存在但没有任何条目
+        tokio::fs::create_dir_all(tmp.path().join("app-7"))
+            .await
+            .expect("mkdir");
+        assert!(matches!(
+            precheck_dev_workspace("app-7", &cfg).await,
+            Err(DevPrecheckError::WorkspaceEmpty(_))
+        ));
+    }
+
+    /// 非空但没有任何 project.manifest.toml → NoServices（保留 discover 的
+    /// fix 指引文案，与旧任务 error 文本同源）。
+    #[tokio::test]
+    async fn precheck_rejects_workspace_without_services() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = config_with_root(tmp.path());
+        let ws = tmp.path().join("app-7");
+        tokio::fs::create_dir_all(ws.join("some-dir"))
+            .await
+            .expect("mkdir");
+
+        match precheck_dev_workspace("app-7", &cfg).await {
+            Err(DevPrecheckError::NoServices(msg)) => {
+                assert!(msg.contains("no enabled services"), "msg={msg}");
+                assert!(msg.contains("fix"), "fix hint expected: {msg}");
+                // 防双前缀回归：e 内部已含 "discover projects in {ws}: "，链路
+                // 标识只加一次——路径/动词各出现一次
+                assert_eq!(
+                    msg.matches("discover projects").count(),
+                    1,
+                    "prefix must not duplicate: {msg}"
+                );
+                assert_eq!(
+                    msg.matches("app-7").count(),
+                    1,
+                    "workspace path must not duplicate: {msg}"
+                );
+            }
+            _ => panic!("expected NoServices"),
+        }
+    }
+
+    /// 正常 workspace（enabled 服务）→ 放行；无 [devrun] 时产物态（false），
+    /// 配 [devrun] 时源码态（true）——判定与 dev_mode 单一事实源一致。
+    #[tokio::test]
+    async fn precheck_passes_valid_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = config_with_root(tmp.path());
+        let ws = tmp.path().join("app-7");
+        let frontend = ws.join("frontend");
+        tokio::fs::create_dir_all(&frontend).await.expect("mkdir");
+        write_manifest(&frontend, "frontend");
+
+        let precheck = precheck_dev_workspace("app-7", &cfg)
+            .await
+            .expect("valid workspace passes");
+        assert!(!precheck.dev_source_mode, "artifact mode without [devrun]");
+        assert!(precheck.ws.ends_with("app-7"));
+
+        // 追加 [devrun] → 源码态（build/run 段为 manifest 必填，dev_mode 测试同款）
+        let devrun = "schema_version = 1\n\
+             [project]\nservice_id = 'hot'\nname = 'hot'\ntype = 'node'\n\
+             [devrun]\ncommand = ['true']\n\
+             [build]\ncommand = ['true']\nartifact = 'artifact.zip'\n\
+             [run]\ncommand = ['true']\n";
+        let hot = ws.join("hot");
+        tokio::fs::create_dir_all(&hot).await.expect("mkdir");
+        tokio::fs::write(hot.join("project.manifest.toml"), devrun)
+            .await
+            .expect("write devrun manifest");
+        let precheck = precheck_dev_workspace("app-7", &cfg)
+            .await
+            .expect("devrun workspace passes");
+        assert!(precheck.dev_source_mode, "source mode with [devrun]");
+    }
+
+    /// appId 非法 → Resolve（沿用通用校验错误，非专用码）。
+    #[tokio::test]
+    async fn precheck_maps_illegal_app_id_to_resolve_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = config_with_root(tmp.path());
+        assert!(matches!(
+            precheck_dev_workspace("../evil", &cfg).await,
+            Err(DevPrecheckError::Resolve(_))
+        ));
     }
 }

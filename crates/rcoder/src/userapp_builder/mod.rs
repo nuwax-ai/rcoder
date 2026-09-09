@@ -29,6 +29,84 @@ use crate::router::AppState;
 /// UserappBuilder per-app PVC 默认大小(后续可提到 config.yml 的 user-app-builder.service 段)。
 const DEFAULT_BUILDER_STORAGE_SIZE: &str = "100Gi";
 
+/// 探活失败后的注册表自愈裁决：以容器运行时**真实状态**（实时 inspect）为准，
+/// 不再凭单次探活失败即判死——编译高负载探活超时、新容器启动窗口未就绪等
+/// 抖动场景下，容器实际 Running，杀重建会把正在跑的任务连同容器一起蒸发。
+pub(crate) enum RegistryRemediation {
+    /// 容器真实 Running：探活失败是超时/未就绪抖动。注册已按 inspect 真实值
+    /// 刷新（治"注册表死 IP"本源），调用方继续使用返回的 info，**不杀不重建**
+    /// （透传由本次请求定成败）。
+    Alive(ContainerBasicInfo),
+    /// 容器 Stopped/不存在（或 runtime 查询失败）：走既有清注册重建路径。
+    Gone,
+}
+
+/// 探活失败自愈裁决（[`RegistryRemediation`] 的判定体）。
+///
+/// `find_container` 的 Docker 实现为实时 inspect（404 不缓存）、K8s 为 pod
+/// get/label list——两后端 Running 语义一致，天然覆盖。
+pub(crate) async fn remediate_stale_registry(
+    state: &AppState,
+    app_id: &str,
+) -> RegistryRemediation {
+    let Ok(Some(rc)) = state
+        .runtime()
+        .find_container(app_id, &ServiceType::UserappBuilder)
+        .await
+    else {
+        // 查询失败与不存在同判 Gone：重建路径的同名清理已实时化（只删真实
+        // 存在的容器），双层防护下 runtime 瞬时故障不会误删活容器
+        return RegistryRemediation::Gone;
+    };
+    if rc.status != container_runtime_api::ContainerRuntimeStatus::Running {
+        return RegistryRemediation::Gone;
+    }
+    // Running：以 inspect 真实值刷新注册。注册缺失走重建（防御——调用方
+    // 语义上只在"注册命中但探活失败"时进入本函数）。
+    let Some(mut project) = state.get_project(app_id).map(|p| (*p).clone()) else {
+        return RegistryRemediation::Gone;
+    };
+    let Some(existing) = project.container_info() else {
+        return RegistryRemediation::Gone;
+    };
+    if let Some(updated) = refreshed_registration(&existing, &rc) {
+        project.set_container(Some(updated.clone()));
+        if let Err(e) = state.insert_project(app_id.to_string(), Arc::new(project)) {
+            tracing::warn!(
+                "[USERAPP_BUILDER] refresh registry from inspect failed: app_id={app_id}: {e:#}"
+            );
+        } else {
+            info!(
+                "[USERAPP_BUILDER] registry refreshed from inspect (container alive, probe failure was transient): app_id={app_id}, ip={}",
+                updated.container_ip
+            );
+        }
+        RegistryRemediation::Alive(updated)
+    } else {
+        // 与注册一致（探活失败是纯抖动，注册本来就没脏）：零写直接复用
+        RegistryRemediation::Alive(existing.clone())
+    }
+}
+
+/// 注册刷新构造（纯函数）：以 inspect 真实值覆盖注册的标识/地址/状态字段
+/// （service_url 随 IP 同步重算），端口等其余字段沿用注册旧值；与注册完全
+/// 一致时返回 None（零写）。
+fn refreshed_registration(
+    existing: &ContainerBasicInfo,
+    rc: &container_runtime_api::RuntimeContainerInfo,
+) -> Option<ContainerBasicInfo> {
+    let updated = ContainerBasicInfo {
+        container_id: rc.container_id.clone(),
+        container_name: rc.container_name.clone(),
+        container_ip: rc.container_ip.clone(),
+        status: String::from(rc.status.clone()),
+        created_at: rc.created_at,
+        service_url: format!("http://{}:{}", rc.container_ip, existing.internal_port),
+        ..existing.clone()
+    };
+    (&updated != existing).then_some(updated)
+}
+
 /// 确保 UserappBuilder 开发容器存在（幂等）并返回容器信息。
 ///
 /// `explicit_user_id`：请求入参显式携带的 owner（优先档；`None`/空白视为未传，
@@ -60,14 +138,15 @@ pub(crate) async fn ensure_userapp_builder(
 }
 
 /// 探活自愈版 [`ensure_userapp_builder`]：注册命中后连容器 file-server 探活
-/// （3s 超时），失败视为注册脏值（容器被外部删除）→ 清注册重建。
+/// （3s 超时）。探活失败**不直接判死**——先经 [`remediate_stale_registry`]
+/// 以容器真实状态裁决：Running 保容器（负载抖动/启动窗口），真死才清注册重建。
 ///
 /// 供低频管理面调用（pod ensure/keepalive）：**先探活再返回**，防"注册表命中
 /// 死容器"幻报就绪；热路径（转发/chat）不适用——它们有自己的节流
 /// 探活（forward 30s 正缓存）或按需自愈语义。
 ///
-/// 返回 `(info, created)`——created 由本函数判定（探活失败重建/miss 创建=true，
-/// 复用=false），调用方无需再读注册表推断。
+/// 返回 `(info, created)`——created 由本函数判定（真死重建/miss 创建=true，
+/// 探活通过或经裁决保容器=false），调用方无需再读注册表推断。
 pub(crate) async fn ensure_userapp_builder_probed(
     state: &AppState,
     app_id: &str,
@@ -79,12 +158,24 @@ pub(crate) async fn ensure_userapp_builder_probed(
             return Ok((info, false));
         }
         tracing::warn!(
-            "[USERAPP_ENSURE] dev container probe failed (stale registry?), recreating: app_id={app_id}, addr={addr}"
+            "[USERAPP_ENSURE] dev container probe failed (stale registry?), verifying container state: app_id={app_id}, addr={addr}"
         );
-        // 就地清 container 字段而非 remove_project（保 PG project 行与会话映射）
-        state.clear_project_container_field(app_id);
-        let info = create_builder_and_register(state, app_id, explicit_user_id).await?;
-        return Ok((info, true));
+        // 先验容器真实状态再决定处置：Running 则保容器（探活失败是超时/未就绪
+        // 抖动），只有真死才清注册重建——防误杀正在跑任务的容器
+        match remediate_stale_registry(state, app_id).await {
+            RegistryRemediation::Alive(info) => {
+                tracing::info!(
+                    "[USERAPP_ENSURE] dev container alive on inspect, keep without rebuild: app_id={app_id}"
+                );
+                return Ok((info, false));
+            }
+            RegistryRemediation::Gone => {
+                // 就地清 container 字段而非 remove_project（保 PG project 行与会话映射）
+                state.clear_project_container_field(app_id);
+                let info = create_builder_and_register(state, app_id, explicit_user_id).await?;
+                return Ok((info, true));
+            }
+        }
     }
     let info = create_builder_and_register(state, app_id, explicit_user_id).await?;
     Ok((info, true))
@@ -213,5 +304,75 @@ mod tests {
         assert!(resolve_owner(None, Some(" ")).is_err());
         // 双缺 → fail-fast（绝不兜底 app_id 建孤儿目录树）
         assert!(resolve_owner(None, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod remediation_tests {
+    use super::*;
+    use chrono::Utc;
+    use container_runtime_api::{ContainerRuntimeStatus, RuntimeContainerInfo};
+    use shared_types::ContainerBasicInfo;
+
+    fn registered(ip: &str, id: &str) -> ContainerBasicInfo {
+        ContainerBasicInfo {
+            container_id: id.to_string(),
+            container_name: "rcoder-app-builder-app-1".to_string(),
+            container_ip: ip.to_string(),
+            internal_port: 60000,
+            external_port: 0,
+            project_id: "app-1".to_string(),
+            status: "Running".to_string(),
+            created_at: Utc::now(),
+            service_url: format!("http://{ip}:60000"),
+        }
+    }
+
+    fn inspected(ip: &str, id: &str) -> RuntimeContainerInfo {
+        RuntimeContainerInfo {
+            container_id: id.to_string(),
+            container_name: "rcoder-app-builder-app-1".to_string(),
+            container_ip: ip.to_string(),
+            status: ContainerRuntimeStatus::Running,
+            created_at: Utc::now(),
+            env_vars: None,
+        }
+    }
+
+    /// IP 漂移（重建后注册残留死 IP 的本源场景）：刷新为新值，service_url
+    /// 同步重算，端口等其余字段沿用注册旧值。
+    #[test]
+    fn refreshed_registration_updates_ip_and_service_url() {
+        let existing = registered("192.168.97.10", "id-old");
+        let out = refreshed_registration(&existing, &inspected("192.168.97.8", "id-new"))
+            .expect("ip drift must refresh");
+        assert_eq!(out.container_ip, "192.168.97.8");
+        assert_eq!(out.service_url, "http://192.168.97.8:60000");
+        assert_eq!(out.container_id, "id-new");
+        assert_eq!(out.internal_port, 60000, "port fields preserved");
+    }
+
+    /// 注册与 inspect 完全一致（探活失败是纯抖动）：零写（None）。
+    #[test]
+    fn refreshed_registration_no_write_when_identical() {
+        let existing = registered("192.168.97.8", "id-x");
+        let rc = inspected("192.168.97.8", "id-x");
+        // created_at 取 rc 的值——对齐构造语义重造一份与输出一致的输入
+        let existing = ContainerBasicInfo {
+            created_at: rc.created_at,
+            status: String::from(rc.status.clone()),
+            ..existing
+        };
+        assert!(
+            refreshed_registration(&existing, &rc).is_none(),
+            "identical registration must be zero-write"
+        );
+    }
+
+    /// 仅容器 id 变化（同名重建新实例）：也要刷新（id 是 rm/inspect 的键）。
+    #[test]
+    fn refreshed_registration_updates_on_id_change() {
+        let existing = registered("192.168.97.8", "id-old");
+        assert!(refreshed_registration(&existing, &inspected("192.168.97.8", "id-new")).is_some());
     }
 }

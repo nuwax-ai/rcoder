@@ -131,7 +131,9 @@ impl axum::response::IntoResponse for AppError {
 fn status_from_code(code: &str) -> axum::http::StatusCode {
     use crate::error_codes as ec;
     match code {
-        ec::ERR_VALIDATION | ec::ERR_INVALID_PARAMS => axum::http::StatusCode::BAD_REQUEST,
+        ec::ERR_VALIDATION | ec::ERR_INVALID_PARAMS | ec::ERR_DEV_NOT_RUNNING => {
+            axum::http::StatusCode::BAD_REQUEST
+        }
         ec::ERR_API_KEY_AUTH_FAILED => axum::http::StatusCode::UNAUTHORIZED,
         ec::ERR_TOO_MANY_REQUESTS => axum::http::StatusCode::TOO_MANY_REQUESTS,
         ec::ERR_NOT_FOUND

@@ -135,6 +135,13 @@ error.system_busy: "系统繁忙：并发 Agent 会话数已达上限 ({} 个)�
 error.project_not_found: "项目不存在或已停止"
 error.agent_runner_unavailable: "Agent Runner 容器不可用"
 
+# UserApp workspace 就绪性（dev/start、build 受理前置校验）
+error.workspace_empty: "应用工作区为空：尚未创建或导入项目"
+error.workspace_no_services: "应用工作区无可用服务：manifest 缺失、损坏或所有项目已停用"
+
+# UserApp dev 会话（dev 日志受理前置检查）
+error.dev_not_running: "开发服务未运行：dev 日志仅在开发服务运行期间可用，请先启动开发服务"
+
 # === gRPC 服务消息 ===
 
 # 通用（cancel/stop 共享）

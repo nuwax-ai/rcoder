@@ -20,7 +20,7 @@ use crate::models::AppRuntimeInfo;
 use crate::service::AppService;
 
 /// 热部署受理/轮询端口（app-cli 管理 API 常量对齐）。
-const APP_CLI_ADMIN_PORT: u16 = 3010;
+const APP_CLI_ADMIN_PORT: u16 = shared_types::APP_CLI_ADMIN_PORT;
 /// 轮询间隔/预算（对齐 wait_app_ready 语义）。
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const HOT_DEPLOY_BUDGET: Duration = Duration::from_secs(300);

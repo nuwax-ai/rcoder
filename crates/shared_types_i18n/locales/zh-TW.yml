@@ -170,3 +170,10 @@ grpc.status.vnc_port_unreachable: "VNC 標記存在，但 noVNC 埠 6080 無法�
 grpc.status.vnc_not_ready: "VNC 服務尚未就緒（啟動中或啟動失敗）"
 grpc.status.vnc_backend_not_ready: "noVNC 代理就緒，但 Xvnc 後端（5900）無回應 — 後端可能卡死或已崩潰"
 
+
+# UserApp workspace 就緒性（dev/start、build 受理前置校驗）
+error.workspace_empty: "應用工作區為空：尚未建立或匯入專案"
+error.workspace_no_services: "應用工作區無可用服務：manifest 缺失、損壞或所有專案已停用"
+
+# UserApp dev 會話（dev 日誌受理前置檢查）
+error.dev_not_running: "開發服務未運行：dev 日誌僅在開發服務運行期間可用，請先啟動開發服務"

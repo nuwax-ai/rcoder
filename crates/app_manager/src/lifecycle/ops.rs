@@ -2,7 +2,7 @@
 //!
 //! start/stop/restart/recycle + stats/events 观测委托（转调 ContainerRuntime）。
 
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use container_runtime_api::DeploymentStatus;
 
@@ -338,18 +338,79 @@ impl AppService {
                         "app {app_id} has no ready runtime IP for log access"
                     ))
                 })?;
-            return Ok(format!("http://{ip}:3010"));
+            return Ok(format!("http://{ip}:{}", shared_types::APP_CLI_ADMIN_PORT));
         }
         let file_server = self
             .app_files_base(app_stage, app_id, Some(user_id))
             .await?;
-        // http://{host}:60000 → http://{host}:3010（host 段原样保留，仅换管理端口）
+        // dev 日志受理前置检查：app-cli 管理 API（:3010）随 dev 会话拉起/退出，
+        // 会话不在时该端口为死端口——直连只会挂满连接超时（15s）后 500。
+        // 未运行即刻 4xx 快速失败（ERR_DEV_NOT_RUNNING）。
+        self.ensure_dev_logs_running(&file_server, app_id, user_id)
+            .await?;
+        // http://{host}:60000 → http://{host}:{APP_CLI_ADMIN_PORT}（host 段原样保留，仅换管理端口）
         let host = file_server
             .trim_start_matches("http://")
             .split(':')
             .next()
             .unwrap_or_default();
-        Ok(format!("http://{host}:3010"))
+        Ok(format!(
+            "http://{host}:{}",
+            shared_types::APP_CLI_ADMIN_PORT
+        ))
+    }
+
+    /// dev 日志可达性前置检查（`log_api_base` dev 分支调用）。
+    ///
+    /// 经容器内 file-server `/api/v1/userapp/dev/list` 判定——app-cli 即 dev
+    /// 进程，在跑列表空 ⇔ :3010 死端口。仅"HTTP 200 且列表空"短路为
+    /// `DevNotRunning`；预检自身 transport 失败/非 200/解码失败一律
+    /// fail-open：预检不构成新故障面，照旧由后续 :3010 连接兜底
+    /// （拿不准放行，对齐 model_probe 惯例）。
+    async fn ensure_dev_logs_running(
+        &self,
+        file_server_base: &str,
+        app_id: &str,
+        user_id: &str,
+    ) -> AppResult<()> {
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{file_server_base}/api/v1/userapp/dev/list?app_id={app_id}&user_id={user_id}"
+            ))
+            .timeout(DEV_LOGS_PRECHECK_TIMEOUT)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                debug!(app_id, %error, "dev logs precheck transport error, fail-open");
+                return Ok(());
+            }
+        };
+        if !response.status().is_success() {
+            debug!(
+                app_id,
+                status = %response.status(),
+                "dev logs precheck non-success, fail-open"
+            );
+            return Ok(());
+        }
+        match response.json::<DevListEnvelope>().await {
+            // 仅"200 且 data.list 为空"短路；data 缺失（信封形态漂移）与
+            // 解码失败同判 fail-open，不构成误报 DevNotRunning 的新故障面
+            Ok(envelope) => match envelope.data {
+                Some(data) if data.list.is_empty() => {
+                    Err(AppOperationError::DevNotRunning(format!(
+                        "app {app_id} dev 会话未运行，请先启动开发服务（dev 日志仅在开发服务运行期间可用）"
+                    )))
+                }
+                _ => Ok(()),
+            },
+            Err(error) => {
+                debug!(app_id, %error, "dev logs precheck decode error, fail-open");
+                Ok(())
+            }
+        }
     }
 
     /// 获取应用事件（K8s Events API：调度/拉取/启动/崩溃）
@@ -379,6 +440,23 @@ fn validate_recycle_policy_fields(
         ));
     }
     Ok(())
+}
+
+/// dev 日志前置检查（/dev/list）单请求超时——预检只许快，不得叠加等待
+const DEV_LOGS_PRECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `/dev/list` 响应最小解析（HttpResult 信封的 `data.list`，仅判空——完整
+/// 字段契约归 file-server-userapp `UserappDevList`，此处不重复建模）
+#[derive(serde::Deserialize)]
+struct DevListEnvelope {
+    #[serde(default)]
+    data: Option<DevListData>,
+}
+
+#[derive(serde::Deserialize)]
+struct DevListData {
+    #[serde(default)]
+    list: Vec<serde_json::Value>,
 }
 
 #[cfg(test)]

@@ -15,6 +15,11 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// app-cli 管理/日志 API 端口（容器内恒绑 `0.0.0.0:3010`）。
+/// 消费方：app_manager `log_api_base`（拼管理面基址）、k8s_service（builder
+/// Service 暴露——ClusterIP 未声明的端口无转发规则，logs/query 会连接超时）。
+pub const APP_CLI_ADMIN_PORT: u16 = 3010;
+
 /// 单 manifest 服务数上限（app-cli 侧校验口径）
 pub const MAX_SERVICES: usize = 64;
 /// 单服务日志源数上限

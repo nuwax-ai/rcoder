@@ -11,11 +11,11 @@ use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 #[cfg(feature = "kubernetes")]
-use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
+use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PostParams};
 #[cfg(feature = "kubernetes")]
 use shared_types::{
-    AGENT_FILE_SERVER_PORT, DBX_PORT, GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, NOVNC_PORT,
-    ServiceType, WS_TERMINAL_PORT,
+    AGENT_FILE_SERVER_PORT, APP_CLI_ADMIN_PORT, DBX_PORT, GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT,
+    NOVNC_PORT, ServiceType, WS_TERMINAL_PORT,
 };
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
@@ -41,6 +41,72 @@ const AGENT_WS_TERMINAL_PORT: u32 = WS_TERMINAL_PORT as u32;
 
 /// DBX 数据库 Web GUI 端口（agent-runner 镜像 supervisor 恒起；Pingora /api/v1/userapp/proxy/dbx/dev/{user_id}/{app_id} 路由到此）
 const AGENT_DBX_PORT: u32 = DBX_PORT as u32;
+
+/// agent per-pod Service 的 TCP 端口条目
+fn tcp_service_port(name: &str, port: u16) -> ServicePort {
+    ServicePort {
+        name: Some(name.to_string()),
+        port: port as i32,
+        target_port: Some(
+            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(port as i32),
+        ),
+        protocol: Some("TCP".to_string()),
+        ..Default::default()
+    }
+}
+
+/// agent per-pod Service 端口清单（创建与存量收敛共用同一期望）。
+///
+/// 基础六端口恒暴露；UserappBuilder 追加 app-cli 管理/日志端口——
+/// app_manager `log_api_base` dev 分支按 `{svc}:{APP_CLI_ADMIN_PORT}` 连容器内
+/// app-cli，ClusterIP 未声明的端口无 kube-proxy/Cilium 转发规则（SYN 被丢弃
+/// → 连接超时）。其他 agent 类型容器内不跑 app-cli，不暴露。
+fn agent_service_ports(service_type: &ServiceType) -> Vec<ServicePort> {
+    let mut ports = vec![
+        tcp_service_port("http", AGENT_HTTP_PORT as u16),
+        tcp_service_port("grpc", AGENT_GRPC_PORT as u16),
+        tcp_service_port("novnc", AGENT_NOVNC_PORT as u16),
+        tcp_service_port("ws-terminal", AGENT_WS_TERMINAL_PORT as u16),
+        tcp_service_port("file-server", AGENT_FILE_SERVER_PORT),
+        tcp_service_port("dbx", AGENT_DBX_PORT as u16),
+    ];
+    if matches!(service_type, ServiceType::UserappBuilder) {
+        ports.push(tcp_service_port("app-cli-admin", APP_CLI_ADMIN_PORT));
+    }
+    ports
+}
+
+/// 组装 agent per-pod Service 的期望全量 spec（缺失创建与存量 SSA 收敛同源）
+fn agent_service_object(
+    namespace: &str,
+    svc_name: &str,
+    identifier: &str,
+    service_type: &ServiceType,
+) -> Service {
+    Service {
+        metadata: ObjectMeta {
+            name: Some(svc_name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(build_standard_labels(identifier, service_type)),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            type_: Some("ClusterIP".to_string()),
+            selector: Some(build_selector_labels(identifier, service_type)),
+            ports: Some(agent_service_ports(service_type)),
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
+/// Service 是否已声明某端口（端口值口径；ClusterIP 只路由已声明的端口）
+fn service_exposes_port(svc: &Service, port: u16) -> bool {
+    svc.spec
+        .as_ref()
+        .and_then(|spec| spec.ports.as_ref())
+        .is_some_and(|ports| ports.iter().any(|p| p.port == port as i32))
+}
 
 /// K8s 标准标签前缀
 const LABEL_PREFIX: &str = "app.kubernetes.io";
@@ -133,14 +199,16 @@ pub(crate) trait K8sServiceOps {
 
     /// 创建 K8s ClusterIP Service，selector 匹配 agent_runner Pod
     ///
-    /// Service 暴露以下端口：
-    /// - HTTP 8086：健康检查、状态查询
+    /// Service 暴露以下端口（`agent_service_ports` 单一事实源）：
+    /// - HTTP 8086：健康检查、状态查询（Pingora 统一入口）
     /// - gRPC 50051：rcoder 与 agent-runner 通信
-    /// - noVNC 6080：Web VNC 访问
-    /// - ttyd 7681：Web 终端访问
+    /// - noVNC 6080 / ws-terminal 17681
+    /// - file-server 60000 / dbx 4224
+    /// - app-cli-admin 3010：仅 UserappBuilder（app-cli 管理/日志 API）
     ///
     /// selector 使用与 Pod 相同的 labels（`app.kubernetes.io/managed-by=rcoder-runtime` + identifier label）。
-    /// 创建前先检查是否已存在，已存在则跳过。
+    /// 已存在则跳过——例外：builder Service 缺 app-cli-admin 端口时 SSA patch
+    /// 定向收敛（见函数内注释）。
     async fn create_agent_service(
         &self,
         identifier: &str,
@@ -179,7 +247,35 @@ impl K8sServiceOps for KubernetesRuntime {
 
         // 检查是否已存在
         match services.get(&svc_name).await {
-            Ok(_) => {
+            Ok(existing) => {
+                // 定向收敛：早期版本创建的 builder Service 缺 app-cli-admin
+                // （APP_CLI_ADMIN_PORT）端口，dev 日志链路按 `{svc}:3010` 连接
+                // 必超时——SSA patch 写入全量期望 spec 补齐（存量端口随
+                // reconcile 收敛，范式对齐 apply_app_service）。仅 UserappBuilder
+                // 触发：读路径自愈（get_container_info 每次经过这里）不对其他
+                // agent 类型写放大。
+                if matches!(service_type, ServiceType::UserappBuilder)
+                    && !service_exposes_port(&existing, APP_CLI_ADMIN_PORT)
+                {
+                    let desired =
+                        agent_service_object(&self.namespace, &svc_name, identifier, service_type);
+                    let body = serde_json::to_value(&desired).map_err(|e| {
+                        ContainerRuntimeError::K8sError(format!("serialize service: {e}"))
+                    })?;
+                    services
+                        .patch(&svc_name, &Self::ssa_patch_params(), &Patch::Apply(body))
+                        .await
+                        .map_err(|e| {
+                            ContainerRuntimeError::K8sError(format!(
+                                "patch agent service '{svc_name}': {e}"
+                            ))
+                        })?;
+                    info!(
+                        "[K8S] Service {} patched to expose app-cli-admin {}",
+                        svc_name, APP_CLI_ADMIN_PORT
+                    );
+                    return Ok(());
+                }
                 debug!("[K8S] Service {} already exists", svc_name);
                 return Ok(());
             }
@@ -192,91 +288,7 @@ impl K8sServiceOps for KubernetesRuntime {
             }
         }
 
-        // 构建 selector labels（与 Pod labels 一致）
-        let selector = build_selector_labels(identifier, service_type);
-
-        let service = Service {
-            metadata: ObjectMeta {
-                name: Some(svc_name.clone()),
-                namespace: Some(self.namespace.clone()),
-                labels: Some(build_standard_labels(identifier, service_type)),
-                ..Default::default()
-            },
-            spec: Some(ServiceSpec {
-                type_: Some("ClusterIP".to_string()),
-                selector: Some(selector),
-                ports: Some(vec![
-                    ServicePort {
-                        name: Some("http".to_string()),
-                        port: AGENT_HTTP_PORT as i32,
-                        target_port: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                                AGENT_HTTP_PORT as i32,
-                            ),
-                        ),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    ServicePort {
-                        name: Some("grpc".to_string()),
-                        port: AGENT_GRPC_PORT as i32,
-                        target_port: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                                AGENT_GRPC_PORT as i32,
-                            ),
-                        ),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    ServicePort {
-                        name: Some("novnc".to_string()),
-                        port: AGENT_NOVNC_PORT as i32,
-                        target_port: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                                AGENT_NOVNC_PORT as i32,
-                            ),
-                        ),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    ServicePort {
-                        name: Some("ws-terminal".to_string()),
-                        port: AGENT_WS_TERMINAL_PORT as i32,
-                        target_port: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                                AGENT_WS_TERMINAL_PORT as i32,
-                            ),
-                        ),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    ServicePort {
-                        name: Some("file-server".to_string()),
-                        port: AGENT_FILE_SERVER_PORT as i32,
-                        target_port: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                                AGENT_FILE_SERVER_PORT as i32,
-                            ),
-                        ),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    ServicePort {
-                        name: Some("dbx".to_string()),
-                        port: AGENT_DBX_PORT as i32,
-                        target_port: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                                AGENT_DBX_PORT as i32,
-                            ),
-                        ),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                ]),
-                ..Default::default()
-            }),
-            status: None,
-        };
+        let service = agent_service_object(&self.namespace, &svc_name, identifier, service_type);
 
         services
             .create(&PostParams::default(), &service)
@@ -315,5 +327,85 @@ impl K8sServiceOps for KubernetesRuntime {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_service_ports_expose_app_cli_admin() {
+        let ports = agent_service_ports(&ServiceType::UserappBuilder);
+        let admin = ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some("app-cli-admin"))
+            .expect("builder Service 必须暴露 app-cli-admin");
+        assert_eq!(admin.port, APP_CLI_ADMIN_PORT as i32);
+        assert_eq!(
+            admin.target_port,
+            Some(
+                k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                    APP_CLI_ADMIN_PORT as i32
+                )
+            )
+        );
+        // 端口名必须唯一（K8s 校验 "port names must be unique"）
+        let mut names: Vec<_> = ports.iter().filter_map(|p| p.name.clone()).collect();
+        names.sort();
+        let total = names.len();
+        names.dedup();
+        assert_eq!(names.len(), total, "端口名重复: {names:?}");
+        // 基础六端口仍在
+        for expected in [
+            AGENT_HTTP_PORT,
+            AGENT_GRPC_PORT,
+            AGENT_NOVNC_PORT,
+            AGENT_WS_TERMINAL_PORT,
+            AGENT_FILE_SERVER_PORT as u32,
+            AGENT_DBX_PORT,
+        ] {
+            assert!(
+                ports.iter().any(|p| p.port == expected as i32),
+                "基础端口 {expected} 缺失"
+            );
+        }
+    }
+
+    #[test]
+    fn other_agent_types_do_not_expose_app_cli_admin() {
+        for service_type in [
+            ServiceType::ComputerAgentRunner,
+            ServiceType::WebAgentRunner,
+        ] {
+            let ports = agent_service_ports(&service_type);
+            assert!(
+                !ports.iter().any(|p| p.port == APP_CLI_ADMIN_PORT as i32),
+                "{service_type} 容器内不跑 app-cli，不应暴露 3010"
+            );
+            // 基础六端口恒在
+            assert_eq!(ports.len(), 6, "{service_type} 端口数应为基础六端口");
+        }
+    }
+
+    #[test]
+    fn service_exposes_port_matches_declared_only() {
+        let svc = agent_service_object(
+            "ns",
+            "rcoder-app-builder-1-svc",
+            "1",
+            &ServiceType::UserappBuilder,
+        );
+        assert!(service_exposes_port(&svc, APP_CLI_ADMIN_PORT));
+        assert!(!service_exposes_port(&svc, 9999));
+        let legacy = Service {
+            metadata: ObjectMeta::default(),
+            spec: Some(ServiceSpec {
+                ports: Some(agent_service_ports(&ServiceType::ComputerAgentRunner)),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        assert!(!service_exposes_port(&legacy, APP_CLI_ADMIN_PORT));
     }
 }

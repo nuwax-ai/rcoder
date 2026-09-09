@@ -8,8 +8,8 @@
 use std::fmt;
 
 use shared_types::error_codes::{
-    ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_CONFLICT, ERR_FILE_NOT_FOUND,
-    ERR_INVALID_STATE, ERR_VALIDATION,
+    ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_CONFLICT,
+    ERR_DEV_NOT_RUNNING, ERR_FILE_NOT_FOUND, ERR_INVALID_STATE, ERR_VALIDATION,
 };
 
 /// app 操作级错误（携带业务错误码，供 handler 精确映射 HTTP）。
@@ -30,6 +30,9 @@ pub enum AppOperationError {
     FileNotFound(String),
     /// 请求参数校验失败（400 ERR_VALIDATION）
     Validation(String),
+    /// dev 会话未运行（400 ERR_DEV_NOT_RUNNING）——dev 日志受理前置检查快速
+    /// 失败；启动 dev 会话后即可查询
+    DevNotRunning(String),
     /// 后端运行时错误（500 ERR_BACKEND_ERROR，兜底）
     Backend(String),
     /// 乐观锁冲突（409 ERR_CONFLICT）—— expected_resource_version 不匹配
@@ -45,6 +48,7 @@ impl AppOperationError {
             Self::InvalidState(_) => ERR_INVALID_STATE,
             Self::FileNotFound(_) => ERR_FILE_NOT_FOUND,
             Self::Validation(_) => ERR_VALIDATION,
+            Self::DevNotRunning(_) => ERR_DEV_NOT_RUNNING,
             Self::Backend(_) => ERR_BACKEND_ERROR,
             Self::Conflict(_) => ERR_CONFLICT,
         }
@@ -58,6 +62,7 @@ impl AppOperationError {
             | Self::InvalidState(m)
             | Self::FileNotFound(m)
             | Self::Validation(m)
+            | Self::DevNotRunning(m)
             | Self::Backend(m)
             | Self::Conflict(m) => m,
         }

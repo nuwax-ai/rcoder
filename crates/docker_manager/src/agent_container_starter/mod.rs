@@ -61,11 +61,38 @@ impl<'a> AgentContainerStarter<'a> {
         if let Some(ref id) = project_id
             && let Some(existing) = self.manager.get_container_info(id).await
         {
-            warn!(
-                "Stopping container {}, already stopped...",
-                existing.container_name
-            );
-            self.manager.stop_container(id).await?;
+            // 实时确认再删：内存缓存命中 ≠ 容器存在（脏值误调 rm）；容器真实
+            // 存在才删（running=重建替换、stopped=尸体清理），查询失败保守跳过
+            // ——创建链的 try_reuse_existing_container 会按实时状态兜底
+            // （复用/删除），清理动作永远建立在确证之上。
+            match self
+                .manager
+                .find_container_realtime(&existing.container_name)
+                .await
+            {
+                Ok(Some(rc)) => {
+                    warn!(
+                        "Removing existing container {} (state={}) for rebuild...",
+                        existing.container_name,
+                        if rc.is_running { "running" } else { "stopped" }
+                    );
+                    self.manager.stop_container(id).await?;
+                }
+                Ok(None) => {
+                    // 容器已不存在：仅清缓存记录（stop 幂等——rm 对 404 跳过）
+                    debug!(
+                        "Existing container {} no longer exists (stale cache), clearing entry",
+                        existing.container_name
+                    );
+                    self.manager.stop_container(id).await?;
+                }
+                Err(e) => {
+                    warn!(
+                        "Verify existing container {} failed, skip cleanup (create path will reconcile): {e}",
+                        existing.container_name
+                    );
+                }
+            }
         }
 
         // 2. 获取配置和镜像
