@@ -15,8 +15,8 @@ use crate::proxy::compiler::compile_effective_config;
 
 /// 本地无环境变量时的 pingap 身份回退值（升级 pingap 时与 Cargo.toml 的
 /// pingap-config git rev、build-agent-docker 16-app-runtime.mk 的 PINGAP_COMMIT 一起改）。
-const DEFAULT_PINGAP_VERSION: &str = "0.13.9";
-const DEFAULT_PINGAP_COMMIT: &str = "f7f9eddb029a5b07438bead2e0fd3df763086567";
+const DEFAULT_PINGAP_VERSION: &str = "0.14.1";
+const DEFAULT_PINGAP_COMMIT: &str = "c74e4eaa44e64958cffa18c33e8bbf5995b6844f";
 
 /// pingap 身份优先读 `RCODER_PINGAP_VERSION`/`RCODER_PINGAP_COMMIT`（与 file-server
 /// 真实发布链路同名；容器内由镜像 ENV 注入，见 16-app-runtime.mk 单一版本源），
@@ -135,4 +135,32 @@ pub async fn gen_lock(workspace: &Path) -> Result<()> {
         workspace.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 防漂移守卫：Cargo.toml 的 pingap-config git rev 必须与
+    /// DEFAULT_PINGAP_COMMIT 常量一致——升级 pingap 时两处（连同
+    /// build-agent-docker 16-app-runtime.mk）必须一起改，CI 在此绑定。
+    #[test]
+    fn pingap_commit_constant_matches_cargo_toml_pin() {
+        let cargo_toml = include_str!("../Cargo.toml");
+        let pin_line = cargo_toml
+            .lines()
+            .find(|l| l.trim_start().starts_with("pingap-config"))
+            .expect("Cargo.toml 应有 pingap-config 依赖行");
+        let rev = pin_line
+            .split("rev = \"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("pingap-config 行应含 rev = \"...\"");
+        assert_eq!(
+            rev,
+            DEFAULT_PINGAP_COMMIT,
+            "Cargo.toml 的 pingap-config rev 与 devtool DEFAULT_PINGAP_COMMIT 漂移——\
+             升级 pingap 时两处必须同步修改（另见 build-agent-docker 16-app-runtime.mk）"
+        );
+    }
 }

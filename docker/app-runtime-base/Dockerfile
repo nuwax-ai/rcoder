@@ -14,8 +14,9 @@ RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
         --install-epel false --backup false --upgrade-software false --clean-cache true --ignore-backup-tips && \
     apt-get update && apt-get install -y --no-install-recommends cmake libclang-dev protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY --from=rcoder / .
-# 删 rust-toolchain.toml:rcoder 锁 1.96.0,但 base image rust:trixie 自带更新版(向下兼容)。
-# 不删会触发 rustup 下载 1.96.0 工具链(~200MB,走 static.rust-lang.org 官方,国内极慢)。
+# 删 rust-toolchain.toml（若存在）：仓库当前未 pin toolchain，但防御性移除可避免
+# 未来重新引入 pin 时触发 rustup 下载指定版本（~200MB,走 static.rust-lang.org 官方,国内极慢），
+# base image rust:trixie 自带的最新 stable 向下兼容。
 RUN rm -f rust-toolchain.toml
 # 配置 cargo 源(国内 rsproxy 加速)。文件在 .cargo/config.toml,查阅/修改方便。
 COPY .cargo/config.toml /usr/local/cargo/config.toml

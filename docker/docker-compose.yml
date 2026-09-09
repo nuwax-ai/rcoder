@@ -28,8 +28,8 @@ services:
       # file-server 路由已常驻合并进主服务（主端口可达，无独立 60000 listener）；
       # RCODER_EMBED_FILE_SERVER 仅 agent_runner 进程消费，rcoder 进程不再读取
       # UserApp release.lock 构建元数据；测试正式镜像时建议由 shell 覆盖 digest。
-      - RCODER_PINGAP_VERSION=${RCODER_PINGAP_VERSION:-0.13.9}
-      - RCODER_PINGAP_COMMIT=${RCODER_PINGAP_COMMIT:-f7f9eddb029a5b07438bead2e0fd3df763086567}
+      - RCODER_PINGAP_VERSION=${RCODER_PINGAP_VERSION:-0.14.1}
+      - RCODER_PINGAP_COMMIT=${RCODER_PINGAP_COMMIT:-c74e4eaa44e64958cffa18c33e8bbf5995b6844f}
       - RCODER_RUNTIME_IMAGE_DIGEST=${RCODER_RUNTIME_IMAGE_DIGEST:-nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/app-runtime:0.1.186-arm64}
       # 🎯 关键：获取docker sock,用于检测宿主机路径
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}

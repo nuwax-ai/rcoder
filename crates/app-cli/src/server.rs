@@ -532,7 +532,7 @@ mod tests {
             pingap: workspace_manifest::LockedPingap {
                 mode: workspace_manifest::PingapMode::Managed,
                 config: None,
-                version: "0.13.9".into(),
+                version: "0.14.1".into(),
                 commit: "abc".into(),
             },
             minimum_app_cli_version: "0.0.0".into(),

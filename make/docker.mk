@@ -173,7 +173,7 @@ docker-build-agent-runner:
 		INSTALL_EBPF="false"; \
 		echo "🔒 跳过 eBPF 工具安装（生产模式）"; \
 	fi; \
-	PINGAP_VERSION=0.13.9 PINGAP_COMMIT=f7f9eddb029a5b07438bead2e0fd3df763086567; \
+	PINGAP_VERSION=0.14.1 PINGAP_COMMIT=c74e4eaa44e64958cffa18c33e8bbf5995b6844f; \
 	cd docker/rcoder-agent-runner && \
 		if [ -n "$(BUILDX_BUILDER)" ]; then \
 			docker buildx build --builder $(BUILDX_BUILDER) --platform linux/$(DOCKER_HOST_ARCH) --load \
@@ -221,8 +221,8 @@ APP_RUNTIME_DIR := docker/app-runtime-base
 docker-build-app-runtime-base:
 	@echo "🐳 构建 dev-app-runtime-base:latest ..."
 	@docker build --build-context rcoder=$(PWD) \
-		--build-arg PINGAP_VERSION=0.13.7 \
-		--build-arg PINGAP_COMMIT=f7f9eddb029a5b07438bead2e0fd3df763086567 \
+		--build-arg PINGAP_VERSION=0.14.1 \
+		--build-arg PINGAP_COMMIT=c74e4eaa44e64958cffa18c33e8bbf5995b6844f \
 		-t dev-app-runtime-base:latest -f $(APP_RUNTIME_DIR)/Dockerfile $(APP_RUNTIME_DIR)
 	@echo "✅ dev-app-runtime-base:latest 构建完成"
 

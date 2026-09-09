@@ -373,7 +373,7 @@ runtime_image_digest = "registry.example/app-runtime:0.1.140"
 
 [pingap]
 mode = "managed"
-version = "0.13.9"
+version = "0.14.1"
 commit = "abc123"
 
 [[services]]
