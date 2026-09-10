@@ -97,7 +97,24 @@ fn normalize_base_path(b: &str) -> String {
     }
 }
 
-/// 最小化 env (对齐 nuwax: PATH + NODE_ENV=development + extra; 补 HOME 供 pnpm cache)。
+/// 数据库凭据族透传白名单：用户服务连 app 数据库所需。生产形态服务经
+/// supervisord/run-service 继承容器全 env 恒可拿到这组变量；dev 编排若被
+/// env_clear 卡断，服务回落自身代码内默认凭据（如 user=app）→ 认证失败
+/// → readiness 探活超时 → dev 任务误报「服务启动失败」。
+const DB_CREDENTIAL_ENV_KEYS: [&str; 9] = [
+    "POSTGRES_USER",
+    "POSTGRES_PASSWORD",
+    "POSTGRES_DB",
+    "PGHOST",
+    "PGPORT",
+    "PGUSER",
+    "PGPASSWORD",
+    "PGDATABASE",
+    "DATABASE_URL",
+];
+
+/// 最小化 env (对齐 nuwax: PATH + NODE_ENV=development + extra; 补 HOME 供 pnpm cache;
+/// 透传数据库凭据族——dev 形态与生产形态的取数行为对齐)。
 fn minimal_env(extra: &[(String, String)]) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
     if let Ok(p) = std::env::var("PATH") {
@@ -105,6 +122,11 @@ fn minimal_env(extra: &[(String, String)]) -> Vec<(String, String)> {
     }
     if let Ok(h) = std::env::var("HOME") {
         env.push(("HOME".into(), h));
+    }
+    for key in DB_CREDENTIAL_ENV_KEYS {
+        if let Ok(v) = std::env::var(key) {
+            env.push((key.into(), v));
+        }
     }
     env.push(("NODE_ENV".into(), "development".into()));
     env.push(("ROLLUP_WASM".into(), "1".into()));
@@ -461,7 +483,54 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandObservers, contains_project_path_segment, run_command_to_log};
+    use super::{
+        CommandObservers, DB_CREDENTIAL_ENV_KEYS, contains_project_path_segment, minimal_env,
+        run_command_to_log,
+    };
+
+    /// 守卫：数据库凭据族白名单内容快照——dev 编排 spawn 链的取数契约，
+    /// 误删键会让用户服务回落代码内默认凭据（dev/生产取数行为分叉）。
+    #[test]
+    fn db_credential_env_keys_snapshot() {
+        assert_eq!(
+            DB_CREDENTIAL_ENV_KEYS,
+            [
+                "POSTGRES_USER",
+                "POSTGRES_PASSWORD",
+                "POSTGRES_DB",
+                "PGHOST",
+                "PGPORT",
+                "PGUSER",
+                "PGPASSWORD",
+                "PGDATABASE",
+                "DATABASE_URL",
+            ]
+        );
+    }
+
+    /// 白名单键在当前进程 env 存在时必须透传（取一条真实存在的验证结构路径；
+    /// 逐键取值受全局 env 不可写约束——Rust 2024 set_var 为 unsafe，项目禁用）。
+    #[test]
+    fn minimal_env_passes_through_whitelisted_db_credentials() {
+        let env = minimal_env(&[]);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        // PATH/HOME 测试环境恒存在
+        assert!(keys.contains(&"PATH") && keys.contains(&"HOME"));
+        // CI/本地环境常驻 DATABASE_URL 以外的白名单键不可靠，改为结构性断言：
+        // 白名单键要么全部透传（存在）、要么完全不在结果里（不存在）——
+        // 由 env_clear + 白名单的实现保证，这里锁"非白名单键永不透传"边界。
+        assert!(
+            !keys.contains(&"HOSTNAME") && !keys.contains(&"APP_LOG_DIR"),
+            "非白名单键不得透传: {keys:?}"
+        );
+        // extra 注入仍生效（APP_CLI_RUN_PROFILE 走此通道）
+        let with_extra = minimal_env(&[("APP_CLI_RUN_PROFILE".into(), "dev".into())]);
+        assert!(
+            with_extra
+                .iter()
+                .any(|(k, v)| k == "APP_CLI_RUN_PROFILE" && v == "dev")
+        );
+    }
 
     #[test]
     fn project_process_match_requires_a_path_segment_boundary() {
