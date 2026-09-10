@@ -94,7 +94,8 @@ pub async fn chat(
 
     // 实际用于工作目录拼接的标识符（UserappBuilder=app_id；其余=work_dir_id，
     // 即 agent_work_dir 优先 project_id 的原语义）。纵深防御：即使 HTTP/网关
-    // 入口已校验，gRPC 入口也应校验
+    // 入口已校验，gRPC 入口也应校验。校验按 service_type 分派：Computer 放行
+    // 绝对路径形态（常规项目场景），Web 等其余显式拒绝（fail-fast）
     let (dir_key, dir_key_name) = match service_type {
         shared_types::ServiceType::UserappBuilder => (app_id.clone().unwrap_or_default(), "app_id"),
         _ => (
@@ -105,7 +106,13 @@ pub async fn chat(
             "agent_work_dir",
         ),
     };
-    if let Err(e) = shared_types::validate_identifier(&dir_key, dir_key_name) {
+    let dir_key_validation = match service_type {
+        shared_types::ServiceType::UserappBuilder => {
+            shared_types::validate_identifier(&dir_key, dir_key_name)
+        }
+        _ => shared_types::validate_agent_work_dir_for_service(&service_type, &dir_key),
+    };
+    if let Err(e) = dir_key_validation {
         return Err(Status::invalid_argument(e));
     }
 
@@ -183,8 +190,13 @@ fn validate_userapp_app_id(
 ///   （computer 场景专用概念，Java 曾借它渗入会话 ID 导致 agent 落错目录）；
 ///   根 = userapp_root（env USERAPP_WORKSPACE_DIR 缺省 /home/user，见
 ///   userapp_env.rs——挂载压平契约，勿用沙箱视角的 USERAPP_WORKSPACE_ROOT）
-/// - ComputerAgentRunner：/home/user + work_dir_id（agent_work_dir 优先，原语义）
-/// - WebAgentRunner/Userapp：./project_workspace + tenant/space 分支（原语义）
+/// - ComputerAgentRunner：work_dir_id（agent_work_dir 优先，原语义）两形态——
+///   单段目录名 → `/home/user + work_dir_id`；绝对路径（常规项目场景，Java 传
+///   子容器内 `/home/user/{projectType}/{projectId}`）→ 原样作为工作目录。
+///   绝对形态仅 Computer 支持（入口 `validate_agent_work_dir_for_service`
+///   已挡其余 service_type）
+/// - WebAgentRunner/Userapp：./project_workspace + tenant/space 分支（原语义，
+///   仅单段 work_dir_id）
 fn resolve_project_dir(
     service_type: &shared_types::ServiceType,
     project_id: &str,
@@ -193,13 +205,19 @@ fn resolve_project_dir(
     userapp_root: &str,
 ) -> std::path::PathBuf {
     // computer/web 场景：work_dir_id 优先 agent_work_dir（proto 语义：自定义
-    // 目录名单段标识符，替代 project_id 参与拼接）
+    // 目录名或绝对路径，替代 project_id 参与拼接）
     let work_dir_id = agent_work_dir
         .filter(|s| !s.is_empty())
         .unwrap_or(project_id);
     match service_type {
         shared_types::ServiceType::ComputerAgentRunner => {
-            std::path::PathBuf::from("/home/user").join(work_dir_id)
+            // 绝对路径形态：显式分派为原样使用，而非依赖 join 对绝对参数的
+            // 隐式前缀替换语义（跨平台字符串判定见 is_absolute_path_like）
+            if shared_types::is_absolute_path_like(work_dir_id) {
+                std::path::PathBuf::from(work_dir_id)
+            } else {
+                std::path::PathBuf::from("/home/user").join(work_dir_id)
+            }
         }
         shared_types::ServiceType::UserappBuilder => {
             std::path::PathBuf::from(userapp_root).join(app_id.unwrap_or_default())
@@ -287,6 +305,34 @@ mod tests {
             "/tmp/ws",
         );
         assert_eq!(dir, std::path::PathBuf::from("/home/user/13"));
+    }
+
+    #[test]
+    fn computer_agent_runner_absolute_path_verbatim() {
+        // 常规项目场景：Java 传子容器内绝对路径 /home/user/{projectType}/{projectId}，
+        // 原样作为工作目录。显式分派语义——join 对绝对参数本就隐式替换前缀，
+        // 改造前后行为相同，此用例固化「显式化」而非行为变化
+        let dir = resolve_project_dir(
+            &ServiceType::ComputerAgentRunner,
+            "13",
+            None,
+            Some("/home/user/web/proj_1"),
+            "/tmp/ws",
+        );
+        assert_eq!(dir, std::path::PathBuf::from("/home/user/web/proj_1"));
+    }
+
+    #[test]
+    fn computer_agent_runner_windows_drive_path_verbatim() {
+        // 多平台：Windows 盘符形态（未来本机 agent_runner 场景）同样原样使用
+        let dir = resolve_project_dir(
+            &ServiceType::ComputerAgentRunner,
+            "13",
+            None,
+            Some("C:/Users/dev/proj"),
+            "/tmp/ws",
+        );
+        assert_eq!(dir, std::path::PathBuf::from("C:/Users/dev/proj"));
     }
 
     #[test]

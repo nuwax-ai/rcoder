@@ -155,16 +155,10 @@ pub fn resolve_userapp_dev(
 
 // ── 项目绑定目录 (workspaceDir, 对齐 TS nuwax-file-server f979df7) ───────────────
 
-/// 绑定目录长度上限（对齐 TS `normalizeWorkspaceDir` 的 512）。
-const WORKSPACE_DIR_MAX_LEN: usize = 512;
-
-/// 校验并归一化项目绑定目录（对齐 TS `normalizeWorkspaceDir` + `canonicalizeDir`，
-/// nuwax-file-server f979df7）：
-///
-/// - trim 后长度 ≤ 512；无控制字符（`\x00`-`\x1f`、`\x7f`）
-/// - 分隔符归一：`\`→`/`、连续 `/` 折叠、UNC 前导 `//` 保留、盘符首字母大写
-/// - 必须绝对路径（`/` 开头或 `X:/` 盘符形态）
-/// - 不得含 `.` / `..` 段（fail-fast 拒绝，不静默归一）
+/// 校验并归一化项目绑定目录：薄封装 [`shared_types::normalize_absolute_dir`]
+/// （规则自本文件提取至 shared_types 单一事实源，行为与 TS
+/// `normalizeWorkspaceDir` + `canonicalizeDir` 同构不变），错误类型转换为
+/// 带 `field: workspaceDir` 的 `AppError`。
 ///
 /// 绝对路径判断是**跨平台字符串规则**（任意宿主平台上 POSIX 与 Windows 两种
 /// 形态都接受，对齐 TS 平台无关校验）；只做格式校验，不限制目录范围
@@ -177,78 +171,13 @@ const WORKSPACE_DIR_MAX_LEN: usize = 512;
 /// （非绝对路径，会误拒）、`//server/share` 的 UNC 前导被折叠丢失；且它把
 /// `.` 段**静默规范化掉**（std 文档明示 CurDir 被 normalize away），与"含点段
 /// 须拒绝"的 fail-fast 语义冲突。灰度切流期间同一请求须在 TS/Rust 两上游
-/// 行为同构（TS 校验刻意平台无关），故此处为纯字符串实现。宿主语义的
-/// `Path::is_absolute()` 仅用于 `/fs/children`（TS 该处用的正是宿主语义
-/// `path.isAbsolute`，两侧恰好同构）。
+/// 行为同构（TS 校验刻意平台无关），故 shared_types 侧为纯字符串实现。宿主
+/// 语义的 `Path::is_absolute()` 仅用于 `/fs/children`（TS 该处用的正是宿主
+/// 语义 `path.isAbsolute`，两侧恰好同构）。
 pub fn normalize_workspace_dir(raw: &str) -> AppResult<String> {
     let field = || serde_json::json!({ "field": "workspaceDir" });
-    let dir = raw.trim();
-    // JS `.length` 计 UTF-16 单元，此处取 Unicode 标量数——补充字符边缘有差异
-    // （emoji JS 计 2、此处计 1），不影响 ASCII 路径。
-    if dir.chars().count() > WORKSPACE_DIR_MAX_LEN {
-        return Err(AppError::validation_with(
-            "workspaceDir length exceeds 512",
-            field(),
-        ));
-    }
-    if dir.chars().any(|c| {
-        let code = c as u32;
-        code <= 0x1f || code == 0x7f
-    }) {
-        return Err(AppError::validation_with(
-            "workspaceDir contains illegal characters",
-            field(),
-        ));
-    }
-    let dir = canonicalize_dir(dir);
-    if !(dir.starts_with('/') || is_drive_form(&dir)) {
-        return Err(AppError::validation_with(
-            "workspaceDir must be an absolute path (POSIX /a/b, Windows C:/a/b or UNC //server/share/a/b)",
-            field(),
-        ));
-    }
-    if dir.split('/').any(|seg| seg == "." || seg == "..") {
-        return Err(AppError::validation_with(
-            "workspaceDir must not contain dot segments",
-            field(),
-        ));
-    }
-    Ok(dir)
-}
-
-/// 盘符形态：`X:/`（首字符 ASCII 字母 + `:` + `/`），对齐 TS 正则 `^[A-Za-z]:\/.*`。
-fn is_drive_form(dir: &str) -> bool {
-    let bytes = dir.as_bytes();
-    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
-}
-
-/// 分隔符统一为 `/` 并折叠连续分隔符（保留 UNC 的前导 `//`）；Windows 盘符统一
-/// 大写（大小写不敏感），不做宿主机语义解析——镜像 TS `canonicalizeDir`。
-fn canonicalize_dir(dir: &str) -> String {
-    let unc = dir.starts_with("//") || dir.starts_with("\\\\");
-    let mut collapsed = String::with_capacity(dir.len());
-    let mut in_sep = false;
-    for ch in dir.chars() {
-        let normalized = if ch == '\\' { '/' } else { ch };
-        if normalized == '/' {
-            if !in_sep {
-                collapsed.push('/');
-            }
-            in_sep = true;
-        } else {
-            collapsed.push(normalized);
-            in_sep = false;
-        }
-    }
-    if unc {
-        collapsed.insert(0, '/');
-    }
-    // 盘符首字母大写（^[a-z]:/ → ^[A-Z]:/；首字节已验证 ASCII，切片边界安全）
-    let bytes = collapsed.as_bytes();
-    if bytes.len() >= 3 && bytes[0].is_ascii_lowercase() && bytes[1] == b':' && bytes[2] == b'/' {
-        collapsed[0..1].make_ascii_uppercase();
-    }
-    collapsed
+    shared_types::normalize_absolute_dir(raw, "workspaceDir")
+        .map_err(|message| AppError::validation_with(&message, field()))
 }
 
 #[async_trait]

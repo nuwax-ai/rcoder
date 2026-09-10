@@ -40,7 +40,12 @@ pub struct ChatRequest {
     /// 🆕 是否是 DevComputer 接口请求（用于 {PREFIX_WORKSPACE_DIR} 变量解析）
     #[prost(bool, tag = "13")]
     pub is_devcomputer: bool,
-    /// 🆕 自定义工作目录标识符（可选，用于替代 project_id 参与工作目录拼接）
+    /// 🆕 自定义工作目录（可选，替代 project_id 参与工作目录拼接）。两形态：
+    ///
+    /// 1. 单段目录名（原语义）；
+    /// 1. 绝对路径（跨平台字符串规则：POSIX /a/b、Windows X:/a/b、UNC //s/a），
+    ///    常规项目场景 Java 传子容器内 /home/user/{projectType}/{projectId}。
+    ///    绝对路径形态仅 service_type=ComputerAgentRunner 支持，其余显式拒绝
     #[prost(string, optional, tag = "14")]
     pub agent_work_dir: ::core::option::Option<::prost::alloc::string::String>,
     /// 🆕 UserApp 开发对话定位键（UserappBuilder 场景必填，缺失即拒绝；语义独立于

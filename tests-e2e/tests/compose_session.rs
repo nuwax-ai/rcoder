@@ -4,7 +4,8 @@
 //! `cargo test -p rcoder-e2e --test compose_session -- --test-threads=1`
 //!
 //! 覆盖：游标/无游标重连（双后端）、project→session 映射复用（前端标准
-//! 续话姿势）、跨轮重连零残留、三连切模型 + 逐字重放检测、并发订阅。
+//! 续话姿势）、跨轮重连零残留、三连切模型 + 逐字重放检测、并发订阅、
+//! agent_work_dir 绝对路径形态（常规项目场景）。
 
 use std::time::Duration;
 
@@ -640,6 +641,68 @@ async fn scenario_concurrent_subscribers(backend: Backend) {
 }
 
 // ============================================================
+// 场景：agent_work_dir 绝对路径形态（常规项目 /home/user/{type}/{id}）——
+//      校验放行 + agent 以该路径为会话 cwd（pwd 输出回显验证，双后端）
+// ============================================================
+async fn scenario_absolute_work_dir(backend: Backend) {
+    let scenario = "absolute_agent_work_dir";
+    let Some((env, report)) = Env::compose_or_skip(scenario, backend.as_str()).await else {
+        return;
+    };
+    let user = env.scoped_user(&format!("wd-{}", backend.as_str()));
+    let _guard = TestUserGuard::new(&env, &user);
+
+    // 常规项目形态：子容器内用户维度绝对路径（模拟 Java 传入）
+    const WORK_DIR: &str = "/home/user/e2e/abs-workdir-1";
+    let mut req = env.base_payload(
+        backend,
+        "先执行命令 pwd，把命令输出原样打印；随后创建文件 abs-workdir-landed.txt（内容 ok）。除此之外不要做任何事。",
+        &format!("{}-wd", env.run_tag),
+        &user,
+    );
+    req.agent_work_dir = Some(WORK_DIR.to_string());
+
+    let Ok(data) = chat_reported(&env, &report, "turn1", &env.rcoder, &req).await else {
+        report.assert_hard("chat 成功", false, "chat 失败（见 chat_request 行）".into());
+        assert_hard_all(report).await;
+        return;
+    };
+    let sid = data.session_id.clone();
+    report.assert_hard("session_id 非空", !sid.is_empty(), sid.clone());
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let (events, _) = collect_reported(
+        &env,
+        &report,
+        CollectSpec {
+            phase: "collect_turn1",
+            entry: &env.rcoder,
+            sid: &sid,
+            duration_s: 120.0,
+            last_event_id: None,
+            idle_stop: true,
+        },
+    )
+    .await;
+    report.assert_hard(
+        "含 end_turn（完整轮）",
+        count_event(&events, "end_turn") >= 1,
+        format!("事件分布 {}", sse::type_counts(&events)),
+    );
+
+    // 核心：事件流（工具输出/消息文本）中出现目标绝对路径——证明 agent 的
+    // 实际 cwd 是绝对路径形态，而非默认 /home/user/{project_id}
+    let cwd_hit = events.iter().any(|e| e.data.to_string().contains(WORK_DIR));
+    report.assert_hard(
+        "agent cwd = 绝对路径（pwd 输出回显）",
+        cwd_hit,
+        format!("事件分布 {}", sse::type_counts(&events)),
+    );
+
+    assert_hard_all(report).await;
+}
+
+// ============================================================
 // 测试入口
 // ============================================================
 
@@ -701,4 +764,14 @@ async fn concurrent_subscribers_openai() {
 #[tokio::test]
 async fn concurrent_subscribers_anthropic() {
     scenario_concurrent_subscribers(Backend::Anthropic).await;
+}
+
+#[tokio::test]
+async fn absolute_agent_work_dir_openai() {
+    scenario_absolute_work_dir(Backend::Openai).await;
+}
+
+#[tokio::test]
+async fn absolute_agent_work_dir_anthropic() {
+    scenario_absolute_work_dir(Backend::Anthropic).await;
 }

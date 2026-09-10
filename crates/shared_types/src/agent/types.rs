@@ -86,9 +86,10 @@ pub struct AgentChatRequest {
     #[schema(example = "project")]
     pub isolation_type: Option<String>,
 
-    /// Agent 工作目录标识符（可选）
-    /// 用于替代 project_id 参与工作目录路径拼接
-    /// 未提供时使用 project_id
+    /// Agent 工作目录（可选）
+    /// 用于替代 project_id 参与工作目录路径拼接；仅支持单段目录名——
+    /// 绝对路径形态仅 ComputerAgentRunner（/computer/chat）支持，
+    /// Web 链路（本请求）传绝对路径会被拒绝
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "custom_workspace_123")]
     pub agent_work_dir: Option<String>,

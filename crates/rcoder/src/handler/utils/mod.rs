@@ -29,8 +29,8 @@ pub use grpc_addr::{container_identity_from_name, extract_grpc_addr, extract_grp
 pub use i18n_extractors::{I18nJsonOrQuery, I18nPath, I18nQuery};
 pub use locale::get_locale_from_headers;
 pub use paths::{
-    COMPUTER_WORKSPACE_ROOT, build_computer_workspace_path, build_workspace_path, project_dir,
-    user_dir,
+    COMPUTER_WORKSPACE_ROOT, build_computer_workspace_path, build_workspace_path,
+    map_container_work_dir_to_host, project_dir, user_dir,
 };
 
 // 内部使用：路径验证（通过路径函数自动调用，无需外部直接使用）

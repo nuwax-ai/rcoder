@@ -89,8 +89,13 @@ impl AgentHttpService for LocalAgentHttpService {
 
         // 校验 agent_work_dir（如果提供了）
         // 注意：这里使用 project_id 作为 fallback，所以 work_dir_id 不会为空
-        // 但如果 agent_work_dir 有值且不合法，需要返回错误
-        if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
+        // 但如果 agent_work_dir 有值且不合法，需要返回错误。
+        // 本服务是 WebAgentRunner 形态（HTTP Server 直跑模式）：绝对路径形态
+        // 不支持（work_dir 会流入容器挂载配置语义），for_service 显式拒绝
+        if let Err(e) = shared_types::validate_agent_work_dir_for_service(
+            &ServiceType::WebAgentRunner,
+            &work_dir_id,
+        ) {
             return HttpResult::error(shared_types::error_codes::ERR_VALIDATION, &e);
         }
 
@@ -101,7 +106,8 @@ impl AgentHttpService for LocalAgentHttpService {
                 .map(|info| info.session_id.to_string())
         });
 
-        // 3. 创建项目工作目录
+        // 3. 创建项目工作目录（work_dir_id 已由上方校验保证为单段，
+        // join 不会被绝对路径替换前缀）
         let project_dir = self.projects_dir.join(&work_dir_id);
         if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
             let error_msg = format!("Failed to create project dir: {}", e);

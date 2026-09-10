@@ -217,6 +217,42 @@ pub fn build_computer_workspace_path(
     }
 }
 
+/// 子容器工作目录 → 主容器挂载卷路径的视角映射（`/computer/chat` 绝对路径
+/// `agent_work_dir` 场景，常规项目 `/home/user/{projectType}/{projectId}`）。
+///
+/// 挂载关系（Docker 默认模式与 K8s 共享 PVC subPath=user_id 拓扑一致）：
+/// 主容器 `{COMPUTER_WORKSPACE_ROOT}/{user_id}` ⇔ 子容器 `/home/user`
+/// （见 shared_types::paths 文档与 docker_manager 挂载构造）。
+///
+/// - `Ok(Some(path))`：`/home/user` 前缀（含裸 `/home/user`=用户根）→ 映射出
+///   主容器侧路径，调用方 `create_dir_all` 预创建（chat 发起时目录即存在）
+/// - `Ok(None)`：非 `/home/user` 前缀（容器本地路径 / Windows 盘符形态）——
+///   主容器无从映射，跳过预创建，由 agent_runner 容器内 create_dir_all 兜底
+/// - `Err`：user_id 非法
+///
+/// work_dir_id 须已通过 `validate_agent_work_dir`（无 `.`/`..` 段），此处不
+/// 重复校验路径段；per-agent PVC 模式下主容器不挂 agent PVC，由调用方先行
+/// 短路（本函数不感知部署拓扑）。
+pub fn map_container_work_dir_to_host(
+    work_dir_id: &str,
+    user_id: &str,
+) -> Result<Option<PathBuf>, PathValidationError> {
+    let suffix = if work_dir_id == "/home/user" {
+        ""
+    } else {
+        // 精确到 `/` 边界：`/home/userX` 不视为用户根内路径（容器内是另一目录）
+        let Some(rest) = work_dir_id.strip_prefix("/home/user/") else {
+            return Ok(None);
+        };
+        rest
+    };
+    let user_root = PathBuf::from(user_dir(user_id)?);
+    if suffix.is_empty() {
+        return Ok(Some(user_root));
+    }
+    Ok(Some(user_root.join(suffix)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +425,50 @@ mod tests {
     fn test_build_computer_workspace_path_rejects_traversal() {
         assert!(build_computer_workspace_path(None, None, None, "../../etc", "proj").is_err());
         assert!(build_computer_workspace_path(None, None, None, "user", "../../etc").is_err());
+    }
+
+    // ── map_container_work_dir_to_host（绝对路径 agent_work_dir 视角映射）──
+
+    #[test]
+    fn test_map_container_work_dir_maps_home_user_prefix() {
+        // 常规项目主场景：/home/user/{projectType}/{projectId}
+        assert_eq!(
+            map_container_work_dir_to_host("/home/user/web/proj_1", "user_123").unwrap(),
+            Some(PathBuf::from(
+                "/app/computer-project-workspace/user_123/web/proj_1"
+            ))
+        );
+        // 裸 /home/user = 用户根
+        assert_eq!(
+            map_container_work_dir_to_host("/home/user", "user_123").unwrap(),
+            Some(PathBuf::from("/app/computer-project-workspace/user_123"))
+        );
+        assert!(map_container_work_dir_to_host("/home/user/web/p1", "../../etc").is_err());
+    }
+
+    #[test]
+    fn test_map_container_work_dir_returns_none_for_other_prefixes() {
+        // 非 /home/user 前缀（容器本地 / Windows 盘符 / UNC）→ 主容器不预创建
+        assert_eq!(
+            map_container_work_dir_to_host("/srv/data/p1", "user_123").unwrap(),
+            None
+        );
+        assert_eq!(
+            map_container_work_dir_to_host("C:/Users/dev/proj", "user_123").unwrap(),
+            None
+        );
+        assert_eq!(
+            map_container_work_dir_to_host("//srv/share/p1", "user_123").unwrap(),
+            None
+        );
+        // 前缀边界：/home/userX 不是用户根内路径
+        assert_eq!(
+            map_container_work_dir_to_host("/home/userX", "user_123").unwrap(),
+            None
+        );
+        assert_eq!(
+            map_container_work_dir_to_host("/home/userspace/p1", "user_123").unwrap(),
+            None
+        );
     }
 }

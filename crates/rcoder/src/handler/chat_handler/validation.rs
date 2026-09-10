@@ -46,8 +46,14 @@ pub(super) fn validate_and_route_chat_request(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| project_id.clone());
 
-    // 校验 work_dir_id（无论来源，用于路径拼接的标识符都应校验）
-    if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
+    // 校验 work_dir_id（无论来源，用于路径拼接的标识符都应校验）。
+    // Web 链路（/chat → WebAgentRunner）：work_dir_id 会流入 build_workspace_path
+    // → ContainerCreateOptions.container_work_path 容器挂载配置，绝对路径形态
+    // 不支持——for_service 显式拒绝（fail-fast），错误信息直指原因
+    if let Err(e) = shared_types::validate_agent_work_dir_for_service(
+        &shared_types::ServiceType::WebAgentRunner,
+        &work_dir_id,
+    ) {
         return Err(ChatFlowExit::response(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,

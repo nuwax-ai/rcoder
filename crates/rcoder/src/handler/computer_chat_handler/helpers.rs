@@ -1,18 +1,22 @@
 use super::*;
 
-/// 确保 project_id 对应的工作目录存在
+/// 确保 work_dir_id 对应的工作目录存在
 ///
-/// Computer Agent Runner 的目录结构：
-/// /app/computer-project-workspace/{user_id}/{project_id}/
+/// Computer Agent Runner 的目录结构（单段 work_dir_id）：
+/// /app/computer-project-workspace/{user_id}/{work_dir_id}/
+///
+/// 绝对路径 work_dir_id（常规项目场景，子容器视角 /home/user/{projectType}/{projectId}）：
+/// /home/user 前缀映射回主容器挂载卷路径创建；其余前缀跳过预创建（agent_runner
+/// 容器内 create_dir_all 兜底）；per-agent PVC 模式主容器不挂 agent PVC，同样跳过。
 ///
 /// 注意：这个目录已经在 docker-compose.yml 中挂载，可以直接在 rcoder 容器内创建
 ///
 /// # 参数
-/// - `isolation_type`: 隔离类型（可选）
+/// - `isolation_type`: 隔离类型（可选；绝对路径形态仅默认用户维度，入口已校验）
 /// - `tenant_id`: 租户 ID（可选）
 /// - `space_id`: 空间 ID（可选）
 /// - `user_id`: 用户 ID（当 isolation_type 为 project 时使用）
-/// - `work_dir_id`: 工作目录标识符（可能是 project_id 或 agent_work_dir）
+/// - `work_dir_id`: 工作目录标识符（单段目录名，或绝对路径形态）
 #[instrument(skip_all, fields(user_id = %user_id, work_dir_id = %work_dir_id))]
 pub(super) async fn ensure_project_workspace_exists(
     isolation_type: Option<&str>,
@@ -21,11 +25,38 @@ pub(super) async fn ensure_project_workspace_exists(
     user_id: &str,
     work_dir_id: &str,
 ) -> Result<(), AppError> {
-    // 根据隔离类型构建工作空间路径
-    let project_workspace_path = std::path::PathBuf::from(
-        build_computer_workspace_path(isolation_type, tenant_id, space_id, user_id, work_dir_id)
+    // 解析主容器侧应创建的路径（None = 跳过预创建）
+    let project_workspace_path = if shared_types::is_absolute_path_like(work_dir_id) {
+        // per-agent PVC 模式：主容器不挂 per-agent PVC，预创建只会产生主视角
+        // 孤儿目录；容器内 agent_runner dispatch 有 create_dir_all 兜底
+        if shared_types::per_agent_pvc_enabled() {
+            debug!(
+                "📁 [COMPUTER_CHAT] per-agent PVC mode, skip host-side pre-create (agent_runner will create): work_dir_id={work_dir_id}"
+            );
+            return Ok(());
+        }
+        match map_container_work_dir_to_host(work_dir_id, user_id) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                debug!(
+                    "📁 [COMPUTER_CHAT] non-/home/user absolute work_dir, skip host-side pre-create (agent_runner will create): work_dir_id={work_dir_id}"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(AppError::validation_error(&e.to_string())),
+        }
+    } else {
+        std::path::PathBuf::from(
+            build_computer_workspace_path(
+                isolation_type,
+                tenant_id,
+                space_id,
+                user_id,
+                work_dir_id,
+            )
             .map_err(|e| AppError::validation_error(&e.to_string()))?,
-    );
+        )
+    };
 
     debug!(
         "📁 [COMPUTER_CHAT] Ensuring project workspace directory exists: {:?}",

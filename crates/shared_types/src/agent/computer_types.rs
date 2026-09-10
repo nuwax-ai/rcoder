@@ -132,11 +132,22 @@ pub struct ComputerChatRequest {
     #[schema(example = "tenant")]
     pub isolation_type: Option<String>,
 
-    /// Agent 工作目录标识符（可选）
-    /// 用于替代 project_id 参与工作目录路径拼接
-    /// 未提供时使用 project_id
+    /// Agent 工作目录（可选，替代 project_id 参与工作目录路径拼接）。两形态：
+    ///
+    /// 1. **单段目录名**（原语义）：容器内工作目录为 `/home/user/{agent_work_dir}`，
+    ///    未提供时使用 project_id
+    /// 2. **绝对路径**（常规项目场景，跨平台字符串规则：POSIX `/a/b`、Windows
+    ///    `X:/a/b`、UNC `//s/a`；拒 `.`/`..` 段）：Java 传子容器内用户维度路径
+    ///    `/home/user/{projectType}/{projectId}`，agent 以此为会话 cwd。
+    ///    仅默认（用户维度）隔离支持——pod_id/tenant/space 与之组合会被拒绝；
+    ///    `/home/user` 前缀会在主容器挂载卷预创建对应目录，其余前缀由容器内创建
+    ///
+    /// 📋 Java 配套契约：chat 传绝对 agent_work_dir 后，后续 `/api/computer/*`
+    /// 文件族接口（get-logs、execute-command 等）须以 `workspaceDir`
+    /// （body/query 或 `x-workspace-dir` header）传同一绝对路径，`cid` 保持单段
+    /// （cid 通道拒 `/`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "custom_workspace_123")]
+    #[schema(example = "/home/user/web/proj_001")]
     pub agent_work_dir: Option<String>,
 }
 

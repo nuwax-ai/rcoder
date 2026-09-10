@@ -66,15 +66,21 @@ pub(super) async fn forward_computer_request_to_container(
     );
 
     // Computer Agent Runner 的工作目录路径
-    // 在容器内：/app/computer-project-workspace/{user_id}/{work_dir_id}
-    let project_workspace = match project_dir(&params.request.user_id, params.work_dir_id) {
-        Ok(path) => format!("{}/", path),
-        Err(e) => {
-            return HttpResult::error_with_message(
-                shared_types::error_codes::ERR_VALIDATION,
-                params.locale,
-                &e.to_string(),
-            );
+    // 单段 work_dir_id：在容器内 /app/computer-project-workspace/{user_id}/{work_dir_id}
+    // 绝对路径 work_dir_id（常规项目场景）：入口已按多平台规则校验，project_dir()
+    // 的单段校验不适用——原样记录（子容器视角，agent_runner 侧原样作为 cwd）
+    let project_workspace = if shared_types::is_absolute_path_like(params.work_dir_id) {
+        format!("{}/", params.work_dir_id)
+    } else {
+        match project_dir(&params.request.user_id, params.work_dir_id) {
+            Ok(path) => format!("{}/", path),
+            Err(e) => {
+                return HttpResult::error_with_message(
+                    shared_types::error_codes::ERR_VALIDATION,
+                    params.locale,
+                    &e.to_string(),
+                );
+            }
         }
     };
 

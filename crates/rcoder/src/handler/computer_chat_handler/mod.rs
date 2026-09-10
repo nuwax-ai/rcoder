@@ -41,7 +41,8 @@ use docker_manager::ContainerBasicInfo;
 
 use super::chat_forward::ChatFlowExit;
 use super::utils::{
-    I18nJsonOrQuery, build_computer_workspace_path, get_locale_from_headers, project_dir,
+    I18nJsonOrQuery, build_computer_workspace_path, get_locale_from_headers,
+    map_container_work_dir_to_host, project_dir,
 };
 
 /// 处理 Computer Agent 聊天请求
