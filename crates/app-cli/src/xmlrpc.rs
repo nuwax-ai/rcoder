@@ -106,14 +106,7 @@ impl SupervisorClient {
             body.len()
         ) + &body;
 
-        let mut stream = tokio::net::UnixStream::connect(&self.socket)
-            .await
-            .with_context(|| format!("connect supervisord socket {}", self.socket.display()))?;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        stream.write_all(request.as_bytes()).await?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await?;
-
+        let response = self.transport(&request).await?;
         let text = String::from_utf8_lossy(&response);
         let xml = split_body(&text).ok_or_else(|| {
             anyhow!(
@@ -122,6 +115,26 @@ impl SupervisorClient {
             )
         })?;
         parse_response(xml)
+    }
+
+    /// unix socket 传输。tokio 的 UnixStream 仅 unix 存在——Windows 编译不过，
+    /// 平台分叉：非 unix 防御性报错（正常路径到不了这里：`socket_exists()`
+    /// 恒 false → `SupervisordHost::detect()` 返回 None → builtin 引擎接管）。
+    #[cfg(unix)]
+    async fn transport(&self, request: &str) -> Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(&self.socket)
+            .await
+            .with_context(|| format!("connect supervisord socket {}", self.socket.display()))?;
+        stream.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok(response)
+    }
+
+    #[cfg(not(unix))]
+    async fn transport(&self, _request: &str) -> Result<Vec<u8>> {
+        anyhow::bail!("supervisord unix-socket transport is unavailable on this platform")
     }
 }
 
