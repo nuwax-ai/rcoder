@@ -105,6 +105,9 @@ async fn run_inner(
                         emit_event(&OrchestrationEvent::ServiceStartOk {
                             service: spec.service_id.clone(),
                         });
+                        // 内置托管也是"用户服务已启动"——纯 static workspace 不触发
+                        // 下方 no-service-started 守卫（bind 即成，恒成功）
+                        started_user_services += 1;
                     }
                     Err(e) => {
                         let error = format!("static host: {e:#}");
