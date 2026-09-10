@@ -1813,3 +1813,372 @@ async fn userapp_dev_new_endpoint_body_query_locate() {
     assert_hard_all(report).await;
     cleanup_builder(&app);
 }
+
+// ============================================================
+// 场景：workspace 就绪性前置校验负路径——dev/start 受理期 4xx 快速失败
+//       （不创建任务）+ ERR_DEV_NOT_RUNNING 未启动互补路径。无 LLM 依赖。
+//       锚定 file-server-userapp precheck_dev_workspace（94329c5）：
+//       空 workspace → ERR_WORKSPACE_EMPTY；有文件无 manifest →
+//       ERR_WORKSPACE_NO_SERVICES；logs 族未启动 → ERR_DEV_NOT_RUNNING。
+// ============================================================
+#[tokio::test]
+async fn userapp_dev_precheck_rejects_empty_and_no_services() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_precheck";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    // logs 族接口沿用 app- 前缀形态（lifecycle 场景同款自拼，最稳）
+    let app = format!("app-{}", scoped_app(&env, "prechk"));
+    let user = "e2e-ud-user";
+
+    // create-workspace 只建空目录（file-server ensure_workspace 仅 create_dir_all）
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 1. 空 workspace → dev/start 受理期拒绝（400 + 无 task_id = 不创建任务）
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/dev/start", env.rcoder))
+        .timeout(Duration::from_secs(90))
+        .header("X-App-Id", &app)
+        .json(&json!({"app_id": app, "user_id": user}))
+        .send()
+        .await
+        .expect("dev start on empty workspace");
+    let s1 = resp.status();
+    let b1: Value = resp.json().await.unwrap_or(Value::Null);
+    let no_task = b1["data"]["task_id"].as_str().is_none_or(str::is_empty);
+    report.assert_hard(
+        "空 workspace → dev/start 400 ERR_WORKSPACE_EMPTY（不创建任务）",
+        s1.as_u16() == 400 && b1["code"].as_str() == Some("ERR_WORKSPACE_EMPTY") && no_task,
+        format!("HTTP {s1}, {}", trunc(&b1, 120)),
+    );
+
+    // 2. 写一个普通文件（非 manifest）→ 非空但 discover 无 enabled 服务
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/generate-file", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &app)
+        .json(&json!({"app_id": app, "user_id": user, "file_name": "probe.txt", "content": "no manifest"}))
+        .send()
+        .await
+        .expect("generate probe file");
+    let s2 = resp.status();
+    let b2: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "构造前提：generate-file 写入 probe.txt 成功",
+        s2.is_success() && b2["success"].as_bool() == Some(true),
+        format!("HTTP {s2}, {}", trunc(&b2, 100)),
+    );
+
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/dev/start", env.rcoder))
+        .timeout(Duration::from_secs(90))
+        .header("X-App-Id", &app)
+        .json(&json!({"app_id": app, "user_id": user}))
+        .send()
+        .await
+        .expect("dev start without manifest");
+    let s3 = resp.status();
+    let b3: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "无 manifest workspace → dev/start 400 ERR_WORKSPACE_NO_SERVICES",
+        s3.as_u16() == 400 && b3["code"].as_str() == Some("ERR_WORKSPACE_NO_SERVICES"),
+        format!("HTTP {s3}, {}", trunc(&b3, 120)),
+    );
+
+    // 3. 从未 dev/start 的 workspace 查 dev 日志 → 未启动互补路径（与 lifecycle
+    //    场景的 stop 后断言互补：判定只看 dev/list 空，不区分从未启动/已停止）
+    let resp = env
+        .http
+        .post(format!(
+            "{}/api/v1/userapp/{app}/dev/logs/sources/query?user_id={user}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(10))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("logs query never started");
+    let s4 = resp.status();
+    let b4: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "从未 dev/start → logs/sources/query 400 ERR_DEV_NOT_RUNNING",
+        s4.as_u16() == 400 && b4["code"].as_str() == Some("ERR_DEV_NOT_RUNNING"),
+        format!("HTTP {s4}, {}", trunc(&b4, 120)),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
+/// docker inspect 读容器 Id（cleanup_builder 同款 std::process::Command 先例）。
+fn docker_inspect_id(app_id: &str) -> Option<String> {
+    let name = format!("rcoder-app-builder-{app_id}");
+    let out = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{.Id}}", &name])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+// ============================================================
+// 场景：builder 注册表自愈——docker restart 使 IP 变化（注册表脏 IP），
+//       转发链探活失败 → remediate 以容器真实状态裁决 → Running 保容器
+//       刷新注册（container_id 不变），而非杀重建。锚定 94329c5 的
+//       remediate_stale_registry / refreshed_registration。
+//       Docker 模式专属（K8s STS 重建语义不同构，由部署验证覆盖）。
+// ============================================================
+#[tokio::test]
+async fn userapp_dev_registry_self_heal_after_restart() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_heal";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    if !env.k8s_ssh.is_empty() {
+        eprintln!("[{scenario}] K8s 模式跳过（Docker 注册表自愈专属场景）");
+        return;
+    }
+    let app = format!("app-{}", scoped_app(&env, "heal"));
+    let user = "e2e-ud-user";
+
+    // create-workspace 后不再调 get-file-list——避免探活正缓存（PROBE_OK 30s）
+    // 在 restart 后跳过探活直打旧 IP；注册表脏 IP 正是本场景要构造的输入
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    let Some(id_before) = docker_inspect_id(&app) else {
+        report.assert_hard(
+            "restart 前容器 inspect 可得 Id（基线）",
+            false,
+            "docker inspect 失败（容器未建或 CLI 异常）".to_string(),
+        );
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    };
+
+    // docker restart CLI 返回时容器已 Running——无"restart 进行中触发请求走
+    // Gone 重建分支"的竞态窗口
+    let name = format!("rcoder-app-builder-{app}");
+    let restart_ok = std::process::Command::new("docker")
+        .args(["restart", &name])
+        .output()
+        .is_ok_and(|o| o.status.success());
+
+    // 轮询 get-file-list（/api/v1/userapp/* 透传走 resolve_dev_addr 自愈链）：
+    // - 探活失败 → remediate → inspect Running → 刷新注册（新 IP）→ 本次转发
+    // - 首几次 502 可接受：PROBE_OK 30s 缓存直打旧 IP / file-server ~10s 启动窗
+    let mut healed = false;
+    let mut last = String::new();
+    if restart_ok {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while Instant::now() < deadline {
+            match env
+                .http
+                .get(format!(
+                    "{}/api/v1/userapp/get-file-list?app_id={app}&user_id={user}",
+                    env.rcoder
+                ))
+                .timeout(Duration::from_secs(30))
+                .header("X-App-Id", &app)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body: Value = resp.json().await.unwrap_or(Value::Null);
+                    // get-file-list 是 file-server 直转发的原始形态（success 字段，
+                    // 无 HttpResult code 信封——判定对齐场景 1 的两路断言）
+                    if status.is_success() && body["success"].as_bool() == Some(true) {
+                        healed = true;
+                        break;
+                    }
+                    last = format!("HTTP {status}, {}", trunc(&body, 80));
+                }
+                Err(e) => last = format!("transport: {e}"),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+    report.assert_hard(
+        "restart 后 get-file-list 经自愈恢复 200（探活失败→刷新注册→转发成功）",
+        healed,
+        format!("restart_ok={restart_ok}, 末次: {last}"),
+    );
+
+    // 核心不变量：container_id 不变 = Alive 分支保容器（重建必换 Id）。
+    // IP 是否变化不断言——自定 bridge 网络同址复用是合法退化。
+    let id_after = docker_inspect_id(&app);
+    report.assert_hard(
+        "容器 Id 不变（remediate Alive 保容器，非杀重建）",
+        matches!(&id_after, Some(a) if *a == id_before),
+        format!(
+            "before={}…, after={:?}",
+            &id_before[..12.min(id_before.len())],
+            id_after
+        ),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
+/// 剥 ANSI 转义序列（ttyd OUTPUT 帧是原始字节含转义，非 base64；
+/// 简化 CSI 处理——断言只做 contains，OSC 等罕见形态残留无害）。
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// ============================================================
+// 场景：userapp 终端 cwd——ws 经 pingora(:8089) → ws_terminal(17681) →
+//       ttyd(7681)，wrapper 按注入 cwd 参数起 shell；发 pwd 读回显断言
+//       cwd = /home/user/{app}（workspace 压平挂载点）。锚定 f8ccaa8 的
+//       cwd.rs UserappBuilder 前缀 env 化修复（终端三方同根）。
+//       Docker 模式专属；ttyd 路由脏 IP 不自愈，须用新建容器（不与
+//       restart 场景叠加）。
+// ============================================================
+#[tokio::test]
+async fn userapp_dev_terminal_cwd_via_ttyd_ws() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_ttyd";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    if !env.k8s_ssh.is_empty() {
+        eprintln!("[{scenario}] K8s 模式跳过（终端 ws 链路 compose 专属场景）");
+        return;
+    }
+    let app = format!("app-{}", scoped_app(&env, "ttyd"));
+    let user = "e2e-ud-user";
+
+    // workspace 目录存在即满足 cwd 解析前提（resolve_in_candidates 要求目录在）
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+    let pingora = std::env::var("E2E_PINGORA_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8089".to_owned());
+    let ws_url = format!("{pingora}/api/v1/userapp/proxy/ttyd/dev/{user}/{app}/ws")
+        .replacen("http://", "ws://", 1);
+
+    // 握手重试 30s 窗（ws_terminal 启动等 ttyd 7681 就绪最多 ~15s；子协议 tty
+    // 是 ttyd 硬性要求——缺省路由到 http-only 空壳、消息全丢）
+    let mut ws = None;
+    let handshake_deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < handshake_deadline {
+        let Ok(mut req) = ws_url.clone().into_client_request() else {
+            break;
+        };
+        req.headers_mut()
+            .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("tty"));
+        match connect_async(req).await {
+            Ok((stream, _)) => {
+                ws = Some(stream);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+        }
+    }
+    let Some(mut ws) = ws else {
+        report.assert_hard(
+            "终端 ws 握手（pingora → ws_terminal 子协议 tty）",
+            false,
+            format!("30s 窗口耗尽，url={ws_url}"),
+        );
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    };
+    report.assert_hard(
+        "终端 ws 握手（pingora → ws_terminal 子协议 tty）",
+        true,
+        format!("url={ws_url}"),
+    );
+
+    // 首帧 JSON_DATA（ttyd 收到才 fork shell），等 shell 就绪后发 INPUT pwd。
+    // 发送失败（连接早断）不阻断——收帧循环自然收不到，由断言统一裁决
+    ws.send(Message::Text(r#"{"columns":80,"rows":24}"#.into()))
+        .await
+        .ok();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    ws.send(Message::Binary(b"0pwd\n".to_vec().into()))
+        .await
+        .ok();
+
+    // 30s 窗收 OUTPUT 帧找 cwd：首字节 0x30 的 Binary 帧，payload 剥 ANSI；
+    // 单字节 keepalive(0x90) 帧跳过
+    let expected = format!("/home/user/{app}");
+    let read_deadline = Instant::now() + Duration::from_secs(30);
+    let mut found = false;
+    let mut sample = String::new();
+    while Instant::now() < read_deadline {
+        let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+        else {
+            continue;
+        };
+        let Message::Binary(data) = msg else {
+            continue;
+        };
+        if data.first() != Some(&b'0') {
+            continue;
+        }
+        let text = strip_ansi(&String::from_utf8_lossy(&data[1..]));
+        if text.contains(&expected) {
+            found = true;
+            break;
+        }
+        if sample.is_empty() {
+            sample = text.chars().take(80).collect();
+        }
+    }
+    report.assert_hard(
+        "终端 cwd 落 workspace 压平挂载点（pwd 回显含 /home/user/{app}）",
+        found,
+        format!("期望含 {expected}, OUTPUT 首帧样本: {sample}"),
+    );
+
+    ws.close(None).await.ok();
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
