@@ -77,17 +77,15 @@ pub async fn handle_dev_dbx_request(
 pub async fn handle_dev_dbx_upstream(
     ctx: &mut TrackingCtx,
     params: Params<'_, '_>,
-    metrics: &Arc<ProxyMetrics>,
-    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
-    dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
+    deps: &super::dev_terminal::DevProxyDeps<'_>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
     let user_id = require_user_id(&params)?;
     let container_addr =
-        find_dev_container(container_lookup, dev_ensure, &app_id, &user_id).await?;
+        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, &user_id).await?;
 
-    metrics.record_request();
-    metrics.inc_active();
+    deps.metrics.record_request();
+    deps.metrics.inc_active();
     ctx.vnc_target_ip = Some(container_addr.clone());
     debug!(
         "[DEV_DBX] app_id={}, user_id={} -> {}:{}",

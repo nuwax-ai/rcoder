@@ -29,6 +29,17 @@ use crate::service::utils;
 /// 按 app_id 解析 UserappBuilder 开发容器 IP（app_id 先过 identifier 白名单，
 /// 防 header 注入与路径拼接逃逸）。
 ///
+/// dev 工具族代理共享依赖（ttyd/vnc/audio/ime/dbx/app 六族一致）。
+///
+/// dispatch 构造一次、各 handler 以单引用收拢传参——替代
+/// `metrics + container_lookup + dev_ensure` 三件逐参传递的散弹式签名
+///（新依赖入此结构，不再逐函数改签名）。
+pub struct DevProxyDeps<'a> {
+    pub metrics: &'a Arc<ProxyMetrics>,
+    pub container_lookup: &'a Option<Arc<dyn shared_types::ContainerLookup>>,
+    pub dev_ensure: &'a arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
+}
+
 /// 懒启动：注册表 miss 时经 `UserappDevEnsure` 回调自动 ensure 创建（开终端是
 /// 使用语义；owner 走 metadata 链——浏览器终端 URL 无入参携带能力），
 /// ensure 失败或回调未注入才 404（指引先建工作区）。
@@ -148,16 +159,15 @@ pub async fn handle_dev_ttyd_request(
 pub async fn handle_dev_ttyd_upstream(
     ctx: &mut TrackingCtx,
     params: Params<'_, '_>,
-    metrics: &Arc<ProxyMetrics>,
-    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
-    dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
+    deps: &DevProxyDeps<'_>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
     let user_id = require_user_id(&params)?;
-    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id, &user_id).await?;
+    let container_ip =
+        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, &user_id).await?;
 
-    metrics.record_request();
-    metrics.inc_active();
+    deps.metrics.record_request();
+    deps.metrics.inc_active();
     ctx.vnc_target_ip = Some(container_ip.clone());
     debug!(
         "[DEV_TTYD] app_id={} -> {}:{}",
@@ -207,16 +217,15 @@ pub async fn handle_dev_vnc_request(
 pub async fn handle_dev_vnc_upstream(
     ctx: &mut TrackingCtx,
     params: Params<'_, '_>,
-    metrics: &Arc<ProxyMetrics>,
-    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
-    dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
+    deps: &DevProxyDeps<'_>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
     let user_id = require_user_id(&params)?;
-    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id, &user_id).await?;
+    let container_ip =
+        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, &user_id).await?;
 
-    metrics.record_request();
-    metrics.inc_active();
+    deps.metrics.record_request();
+    deps.metrics.inc_active();
     ctx.vnc_target_ip = Some(container_ip.clone());
     debug!(
         "[DEV_VNC] app_id={} -> {}:{}",
@@ -247,9 +256,7 @@ pub async fn handle_dev_audio_request(
     original_uri: &http::Uri,
     params: Params<'_, '_>,
     ctx: &mut TrackingCtx,
-    metrics: &Arc<ProxyMetrics>,
-    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
-    dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
+    deps: &DevProxyDeps<'_>,
 ) -> PingoraResult<()> {
     let app_id = require_app_id(&params)?;
     let remaining = params.get("path").unwrap_or("");
@@ -266,9 +273,10 @@ pub async fn handle_dev_audio_request(
     };
 
     let user_id = require_user_id(&params)?;
-    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id, &user_id).await?;
-    metrics.record_request();
-    metrics.record_request_port(target_port);
+    let container_ip =
+        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, &user_id).await?;
+    deps.metrics.record_request();
+    deps.metrics.record_request_port(target_port);
     ctx.target_port = Some(target_port);
     ctx.upstream_host = Some(format!("{}:{}", container_ip, target_port));
     info!(
@@ -317,28 +325,23 @@ pub async fn handle_dev_ime_request(
     original_uri: &http::Uri,
     params: Params<'_, '_>,
     ctx: &mut TrackingCtx,
-    metrics: &Arc<ProxyMetrics>,
-    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
-    dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
+    deps: &DevProxyDeps<'_>,
 ) -> PingoraResult<()> {
     let app_id = require_app_id(&params)?;
     let user_id = require_user_id(&params)?;
     let target_path = target_path_of(&params);
 
-    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id, &user_id).await?;
-    metrics.record_request();
-    metrics.record_request_port(crate::service::types::IME_PORT);
-    ctx.target_port = Some(crate::service::types::IME_PORT);
-    ctx.upstream_host = Some(format!(
-        "{}:{}",
-        container_ip,
-        crate::service::types::IME_PORT
-    ));
+    let container_ip =
+        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, &user_id).await?;
+    deps.metrics.record_request();
+    deps.metrics.record_request_port(shared_types::IME_PORT);
+    ctx.target_port = Some(shared_types::IME_PORT);
+    ctx.upstream_host = Some(format!("{}:{}", container_ip, shared_types::IME_PORT));
     debug!(
         "[DEV_IME] app_id={} -> {}:{}",
         app_id,
         container_ip,
-        crate::service::types::IME_PORT
+        shared_types::IME_PORT
     );
 
     upstream_request.insert_header("Host", &container_ip)?;

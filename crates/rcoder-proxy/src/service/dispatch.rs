@@ -16,18 +16,40 @@ use crate::service::types::TrackingCtx;
 
 type ProxyResult<T> = pingora_core::Result<T>;
 
+/// request 分发上下文：`dispatch_upstream_request` 所需的每请求数据收拢——
+/// 路由解析产物（route/params/path）+ 原始 URI + Pingora 请求头与追踪态。
+///
+/// 调用方（Pingora 回调）组装一次；dispatch 签名随路由数据演进不再逐参
+/// 膨胀（对齐 handler 侧 `DevProxyDeps` 的收拢思路）。
+pub(crate) struct DispatchRequest<'a> {
+    pub route: RouteType,
+    pub params: Params<'a, 'a>,
+    pub original_uri: &'a http::Uri,
+    pub path: &'a str,
+    pub upstream_request: &'a mut RequestHeader,
+    pub ctx: &'a mut TrackingCtx,
+}
+
 impl PortProxy {
     /// upstream_request_filter 阶段：按 RouteType 重写发往上游的请求。
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn dispatch_upstream_request(
         &self,
-        route: RouteType,
-        params: Params<'_, '_>,
-        upstream_request: &mut RequestHeader,
-        original_uri: &http::Uri,
-        ctx: &mut TrackingCtx,
-        path: &str,
+        req: DispatchRequest<'_>,
     ) -> ProxyResult<()> {
+        // 解构取散参形态（match 各臂直接用，与历史签名同名零迁移）
+        let DispatchRequest {
+            route,
+            params,
+            original_uri,
+            path,
+            upstream_request,
+            ctx,
+        } = req;
+        let dev_deps = handlers::dev_terminal::DevProxyDeps {
+            metrics: &self.metrics,
+            container_lookup: &self.container_lookup,
+            dev_ensure: &self.dev_ensure_slot,
+        };
         match route {
             RouteType::VncProxy => {
                 handlers::vnc::handle_vnc_request(upstream_request, original_uri, params, ctx)
@@ -140,9 +162,7 @@ impl PortProxy {
                     original_uri,
                     params,
                     ctx,
-                    &self.metrics,
-                    &self.container_lookup,
-                    &self.dev_ensure_slot,
+                    &dev_deps,
                 )
                 .await?;
             }
@@ -152,9 +172,7 @@ impl PortProxy {
                     original_uri,
                     params,
                     ctx,
-                    &self.metrics,
-                    &self.container_lookup,
-                    &self.dev_ensure_slot,
+                    &dev_deps,
                 )
                 .await?;
             }
@@ -187,6 +205,11 @@ impl PortProxy {
         params: Params<'_, '_>,
         ctx: &mut TrackingCtx,
     ) -> ProxyResult<Box<HttpPeer>> {
+        let dev_deps = handlers::dev_terminal::DevProxyDeps {
+            metrics: &self.metrics,
+            container_lookup: &self.container_lookup,
+            dev_ensure: &self.dev_ensure_slot,
+        };
         match route {
             RouteType::VncProxy => {
                 handlers::vnc::handle_vnc_upstream(
@@ -218,13 +241,7 @@ impl PortProxy {
                 .await
             }
             RouteType::DevAppProxy => {
-                handlers::dev_app_proxy::handle_dev_app_upstream(
-                    ctx,
-                    params,
-                    &self.metrics,
-                    &self.container_lookup,
-                )
-                .await
+                handlers::dev_app_proxy::handle_dev_app_upstream(ctx, params, &dev_deps).await
             }
             RouteType::HealthCheck => {
                 // 健康检查已在 upstream_request_filter 中设置 target_port
@@ -288,24 +305,10 @@ impl PortProxy {
                 .await
             }
             RouteType::DevTtydProxy => {
-                handlers::dev_terminal::handle_dev_ttyd_upstream(
-                    ctx,
-                    params,
-                    &self.metrics,
-                    &self.container_lookup,
-                    &self.dev_ensure_slot,
-                )
-                .await
+                handlers::dev_terminal::handle_dev_ttyd_upstream(ctx, params, &dev_deps).await
             }
             RouteType::DevVncProxy => {
-                handlers::dev_terminal::handle_dev_vnc_upstream(
-                    ctx,
-                    params,
-                    &self.metrics,
-                    &self.container_lookup,
-                    &self.dev_ensure_slot,
-                )
-                .await
+                handlers::dev_terminal::handle_dev_vnc_upstream(ctx, params, &dev_deps).await
             }
             RouteType::DevAudioProxy => {
                 handlers::dev_terminal::handle_dev_audio_upstream(ctx, &self.metrics).await
@@ -324,14 +327,7 @@ impl PortProxy {
                 .await
             }
             RouteType::DevDbxProxy => {
-                handlers::dbx::handle_dev_dbx_upstream(
-                    ctx,
-                    params,
-                    &self.metrics,
-                    &self.container_lookup,
-                    &self.dev_ensure_slot,
-                )
-                .await
+                handlers::dbx::handle_dev_dbx_upstream(ctx, params, &dev_deps).await
             }
             RouteType::ProdDbxProxy => {
                 handlers::dbx::handle_prod_dbx_upstream(

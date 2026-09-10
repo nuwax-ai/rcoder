@@ -3,6 +3,7 @@
 //! 从 `service/mod.rs` 拆出，使 mod.rs 聚焦 struct 定义 + 构造（new/builders/create_pingora_proxy）。
 //! 子模块可直接访问 `PortProxy` 的私有字段（隐私规则：子模块可见祖先模块的私有项）。
 
+use crate::service::dispatch::DispatchRequest;
 use async_trait::async_trait;
 use pingora_core::Result as PingoraResult;
 use pingora_core::protocols::Digest;
@@ -154,14 +155,14 @@ impl ProxyHttp for PortProxy {
 
         let original_uri = upstream_request.uri.clone();
 
-        self.dispatch_upstream_request(
-            *matched.value,
-            matched.params,
+        self.dispatch_upstream_request(DispatchRequest {
+            route: *matched.value,
+            params: matched.params,
+            original_uri: &original_uri,
+            path: &path,
             upstream_request,
-            &original_uri,
             ctx,
-            &path,
-        )
+        })
         .await?;
 
         Ok(())
