@@ -52,8 +52,9 @@ async fn ws_path(
 ///    本 app 卷，与 customTargetDir 在该模式的收紧先例一致（workspace.rs
 ///    `resolve_userapp_dev`）；TS 无 single-app 概念，此为有意偏离。
 /// 2. userApp 分流（X-Service-Type=userapp，经反向代理/rcoder 拦截层透传）：
-///    workspace 从 computer 定位 `{COMPUTER_WORKSPACE_ROOT}/{userId}/{cId}` 切到
-///    开发卷 `{USERAPP_WORKSPACE_DIR}/{cId}`（cId=app_id；本容器即该 app 的开发容器）。
+///    workspace 切到开发卷 `{USERAPP_WORKSPACE_DIR}/{app_id}`。**app_id 是独立
+///    字段**（header `x-app-id` > query `appId`，见 [`crate::extract::userapp_app_id`]），
+///    cId 是会话字段**不参与** userapp 定位（勿兼任）；缺失 fail-fast。
 /// 3. 默认 resolver（Local `{root}/{userId}/{cId}` / Subvolume per-agent PVC）。
 pub(crate) async fn computer_root_for_request(
     state: &AppState,
@@ -78,7 +79,12 @@ pub(crate) async fn computer_root_for_request(
         return Ok(PathBuf::from(dir));
     }
     if crate::extract::is_userapp_request() {
-        return crate::workspace::resolve_userapp_dev(cid, None, &state.config);
+        let app_id = crate::extract::userapp_app_id().ok_or_else(|| {
+            AppError::validation(
+                "userapp request missing app_id: pass `X-App-Id` header or query `appId`",
+            )
+        })?;
+        return crate::workspace::resolve_userapp_dev(&app_id, None, &state.config);
     }
     state
         .resolver
@@ -141,6 +147,7 @@ pub(crate) fn agent_store_user_root(
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -230,16 +237,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn userapp_flag_without_binding_keeps_dev_volume() {
+    async fn userapp_flag_resolves_by_independent_app_id() {
         let (state, _resolver) = make_state();
-        let path = crate::extract::USERAPP_FLAG
+        // app_id 是独立字段（task-local 两级提取的结果）；cId 传任意会话值
+        // 证明不参与 userapp 定位（勿让会话字段兼任 app_id）
+        let path = scope_userapp(Some("app-9"), async {
+            computer_root_for_request(&state, "u1", "1561913", None).await
+        })
+        .await
+        .expect("userapp dev volume");
+        assert_eq!(path, state.config.userapp_workspace_dir.join("app-9"));
+    }
+
+    #[tokio::test]
+    async fn userapp_flag_without_app_id_fails_fast() {
+        let (state, resolver) = make_state();
+        let err = crate::extract::USERAPP_FLAG
             .scope(true, async {
                 computer_root_for_request(&state, "u1", "app-9", None).await
             })
             .await
-            .expect("userapp dev volume");
-        // 现状回归: 无绑定时 userapp 分流 → {USERAPP_WORKSPACE_DIR}/{cId}
-        assert_eq!(path, state.config.userapp_workspace_dir.join("app-9"));
+            .expect_err("missing app_id must fail fast");
+        assert!(
+            matches!(err, AppError::Validation(..)),
+            "缺 app_id 应 4xx 校验错: {err:?}"
+        );
+        assert!(err.to_string().contains("missing app_id"));
+        // 不触达 resolver（userapp 域与 computer 默认定位互不相干）
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn userapp_app_id_blank_treated_as_missing() {
+        let (state, _resolver) = make_state();
+        // 空白串视为未携带（与 header trim 语义一致）→ 同样 fail-fast
+        let err = scope_userapp(Some("  "), async {
+            computer_root_for_request(&state, "u1", "c1", None).await
+        })
+        .await
+        .expect_err("blank app_id must fail fast");
+        assert!(err.to_string().contains("missing app_id"));
+    }
+
+    /// 测试助手：同时 scope userapp 标记与独立 app_id（模拟中间件两级提取）。
+    async fn scope_userapp<F, T>(app_id: Option<&str>, f: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        let app_id = app_id.map(str::to_string);
+        crate::extract::USERAPP_FLAG
+            .scope(true, async move {
+                crate::extract::USERAPP_APP_ID.scope(app_id, f).await
+            })
+            .await
     }
 
     #[tokio::test]

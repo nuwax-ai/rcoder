@@ -19,7 +19,7 @@
 //! | 路由策略 | `--policy P` | `ROUTE_POLICY` | `all_rust` |
 //! | 内嵌直连装配 | `--embed` / `--no-embed` | `EMBED_FILE_SERVER=1/0` | 不装配（纯转发，容器安全缺省） |
 //!
-//! 策略词汇（serde/CLI/env/helm 同源）：`userapp_split | all_rust | all_ts | ts_first`
+//! 策略词汇（serde/CLI/env/helm 同源）：`ts_first | all_rust | all_ts`
 //! （语义见 `RoutePolicy` 文档）。容器内切换模式：改 supervisord conf 的
 //! command/env 后 `supervisorctl reread && supervisorctl update`，重启生效。
 //!
@@ -53,18 +53,16 @@ fn usage() -> String {
     format!(
         "file-server-proxy {}\n\n\
          Usage:\n  \
-         file-server-proxy [--policy <userapp_split|all_rust|all_ts|ts_first>] \\\n \
+         file-server-proxy [--policy <ts_first|all_rust|all_ts>] \\\n \
          [--port <60000>] [--rust-port <8086>] [--ts-port <60001>] \\\n \
          [--embed|--no-embed] [--version]\n\n\
          CLI args take precedence over env (FILE_SERVER_PORT / RUST_UPSTREAM_PORT /\n\
          TS_UPSTREAM_PORT / ROUTE_POLICY / EMBED_FILE_SERVER). Default policy is\n\
          all_rust; embed is off by default (pure forward mode for containers).\n\n\
          Policies:\n  \
-         userapp_split  /api/v1/userapp* or x-service-type:userapp -> rust; rest -> ts\n  \
+         ts_first       /api/v1/userapp* or x-service-type:userapp -> rust; rest -> ts\n  \
          all_rust       everything -> rust upstream\n  \
-         all_ts         everything -> ts upstream\n  \
-         ts_first       only /api/v1/userapp* -> rust; legacy paths -> ts (even with\n\
-         x-service-type header - ts handles service_type in-band)",
+         all_ts         everything -> ts upstream",
         env!("CARGO_PKG_VERSION")
     )
 }

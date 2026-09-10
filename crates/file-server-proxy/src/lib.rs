@@ -1,14 +1,13 @@
 //! nuwax-file-server 前置分流反向代理（60000 端口，阶段三终态）。
 //!
 //! 架构位置：Java/外部 → `:60000` 本代理 → 按策略分流（词汇表
-//! `userapp_split | all_rust | all_ts | ts_first`，serde/CLI/env/helm 四层同源）：
-//! - `userapp_split`（默认）：`/api/v1/userapp*` 前缀，**或** `x-service-type: userapp`
-//!   header → rust 上游；其余 → TS（存量域继续 TS nuwax-file-server）
+//! `ts_first | all_rust | all_ts`，serde/CLI/env/helm 四层同源）：
+//! - `ts_first`（默认）：`/api/v1/userapp*` 前缀，**或** `x-service-type: userapp`
+//!   header → rust 上游（rcoder 拦截层转发 per-app 容器——per-app RBD 架构下
+//!   只有容器读得到 app 工作区）；其余（无 userApp 标记的存量流量）→ TS
+//!   nuwax-file-server（存量域继续 TS 承载）
 //! - `all_rust`：一律 rust 上游（60000 白名单：`/api/*`、`/health`、`/`、`/api-docs*`）
 //! - `all_ts`：一律 TS 上游（Rust 故障回退/AB 对照档）
-//! - `ts_first`：**仅** `/api/v1/userapp*`（TS 无此路由）→ rust 上游；存量同名接口
-//!   全走 TS——含带 userApp 标记的请求（header 判据失效，由 TS 以 service_type
-//!   入参内部处理 userApp 业务；过渡切流档）
 //!
 //! rust 上游两种承载（编译期 feature + 运行时开关）：
 //! - **纯转发**（容器/rcoder 嵌入形态）：loopback 转发 `rust_upstream_port`

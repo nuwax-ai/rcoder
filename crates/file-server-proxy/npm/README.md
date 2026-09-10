@@ -27,31 +27,32 @@ npm install @nuwax-ai/file-server-proxy
                  └─ TS nuwax-file-server（唯一额外进程，随机端口，由 CLI 拉起托管）
 ```
 
-四档路由策略（`--policy`；同一词汇表贯穿 helm/config.yml/CLI/env 三层）：
+三档路由策略（`--policy`；同一词汇表贯穿 helm/config.yml/CLI/env 三层）：
 
 | 策略 | 行为 | TS 进程 |
 |---|---|---|
-| `userapp_split`（默认） | `/api/v1/userapp*` 或 `x-service-type: userapp` → 内嵌 Rust；其余 → TS | 需要 |
+| `ts_first` | `/api/v1/userapp*` 或 `x-service-type: userapp` → 内嵌 Rust；其余 → TS | 需要 |
 | `all_rust` | 全部 → 内嵌 Rust file-server（路径白名单：`/api/*`、`/health`、`/`、`/api-docs*`） | 不需要 |
 | `all_ts` | 全部 → TS nuwax-file-server | 需要 |
-| `ts_first` | **仅** `/api/v1/userapp*` → 内嵌 Rust；存量同名接口全走 TS——**含带 `x-service-type` 标记的请求**（header 判据失效，由 TS 以 `service_type` 入参内部处理 userApp 业务） | 需要 |
 
-> `ts_first` 的前提：TS 源工程（nuwax-file-server）已支持 `service_type` 入参处理
-> userApp 业务。TS 未就绪时切此模式 = 存量 userApp 业务按 TS 普通业务处理（正是
-> 验证 TS 兼容性的切换目的）。
+> 默认值分形态：npm CLI 未传 `--policy` 时默认 `all_rust`（独立形态惯例）；
+> config.yml 段缺失 policy 时 serde 默认 `ts_first`（集群形态惯例）。
+> `userapp_split` 档已删除（语义并入 `ts_first`）——原「TS 以 service_type 入参
+> 自载 userApp 业务」的前提在 per-app RBD 架构下失效（TS 读不到 app 卷），
+> userApp 标记流量必须经 Rust 拦截层转发 per-app 容器。
 
 ### 三层控制链路（过渡期切流同一词汇表）
 
 | 层 | 控制入口 | 生效方式 |
 |---|---|---|
-| K8s/helm | `rcoder.fileServerProxyPolicy`（values，四值直配） | configmap → config.yml，pod 重启生效 |
-| 容器/bin | `file-server-proxy --policy <四值>` 或 `ROUTE_POLICY` env（参数优先） | 改 supervisord conf → `supervisorctl reread && update` |
-| npm CLI | `file-server-proxy start --policy <四值>` | start/restart 生效 |
+| K8s/helm | `rcoder.fileServerProxyPolicy`（values，三值直配） | configmap → config.yml，pod 重启生效 |
+| 容器/bin | `file-server-proxy --policy <三值>` 或 `ROUTE_POLICY` env（参数优先） | 改 supervisord conf → `supervisorctl reread && update` |
+| npm CLI | `file-server-proxy start --policy <三值>` | start/restart 生效 |
 
 ## 命令
 
 ```bash
-file-server-proxy start [--policy <userapp_split|all_rust|all_ts>]
+file-server-proxy start [--policy <ts_first|all_rust|all_ts>]
                         [--port <60000>] [--rust-port <8086>]
                         [--ts-port <N>] [--detached]
 file-server-proxy stop [--all]

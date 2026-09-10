@@ -64,7 +64,7 @@ async fn in_process_router_serves_rust_domain_without_upstream_listener() {
     spawn_marker_upstream(TS_UPSTREAM_PORT, "upstream-ts").await;
     file_server_proxy::set_in_process_router(marker_router());
 
-    // TsFirst：仅 /api/v1/userapp* → rust（直连）；存量路径 → TS
+    // TsFirst：userApp 判据（路径前缀或 header）→ rust（直连）；其余 → TS
     file_server_proxy::init(FileServerProxyConfig {
         listen_port: PROXY_PORT,
         rust_upstream_port: RUST_UPSTREAM_PORT,
@@ -81,17 +81,18 @@ async fn in_process_router_serves_rust_domain_without_upstream_listener() {
         "/api/v1/userapp/* 应由直连 router 服务: {userapp}"
     );
 
-    // ts_first 语义：存量路径（含 userApp 标记）→ TS
+    // ts_first 语义：无 userApp 标记的存量路径 → TS
     let legacy = http_get("/api/computer/get-file-list", &[]).await;
     assert!(legacy.contains("upstream-ts"), "存量路径应走 TS: {legacy}");
+    // userApp 标记的存量路径 → rust 直连（per-app RBD 架构下 TS 读不到 app 卷）
     let legacy_marked = http_get(
         "/api/computer/get-file-list",
         &[(SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP)],
     )
     .await;
     assert!(
-        legacy_marked.contains("upstream-ts"),
-        "ts_first 下 userApp 标记的存量路径也应走 TS: {legacy_marked}"
+        legacy_marked.contains("in-process-router"),
+        "userApp 标记的存量路径应由直连 router 服务: {legacy_marked}"
     );
 
     // 清除直连后回 loopback 转发路径：rust 域请求上游无人听 → 502（无直连兜底）

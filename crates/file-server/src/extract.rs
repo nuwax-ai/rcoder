@@ -19,11 +19,17 @@ use axum::response::{IntoResponse, Response};
 use crate::error::AppError;
 
 // 分流契约常量与 rcoder 转发层共用 shared_types 单一事实源。
-pub use shared_types::{SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP, WORKSPACE_DIR_HEADER};
+pub use shared_types::{
+    APP_ID_HEADER, SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP, WORKSPACE_DIR_HEADER,
+};
 
 // ── 请求级 userApp 分流标记 (task_local, 由请求中间件 scope 注入) ────────────────
 tokio::task_local! {
     pub(crate) static USERAPP_FLAG: bool;
+    /// userApp 定位的独立 app_id（header `x-app-id` 优先，缺省 query `appId`
+    /// 兜底；原始值存储，合法性由定位收口 `resolve_userapp_dev` 校验——与
+    /// WORKSPACE_DIR 同款「中间件存原始值、收口 fail-fast」模式）。
+    pub(crate) static USERAPP_APP_ID: Option<String>;
 }
 
 /// 当前请求是否为 userApp 场景（`X-Service-Type: userapp`；task_local 未设置时 false）。
@@ -31,14 +37,52 @@ pub fn is_userapp_request() -> bool {
     USERAPP_FLAG.try_with(|f| *f).unwrap_or(false)
 }
 
-/// 中间件：读 `X-Service-Type` header → task-local scope 注入（全部 handler 可读）。
+/// 当前请求的独立 app_id（对齐 TS `resolveServiceContext` 的两级提取：
+/// header `x-app-id` > query `appId`）。非 userApp 请求或两处皆缺 → None。
+///
+/// cId（会话字段）**不参与** userapp 定位——app_id 是独立字段，缺失由
+/// computer 域收口 fail-fast（勿让 cId 兼任，语义违例先例）。
+pub fn userapp_app_id() -> Option<String> {
+    USERAPP_APP_ID
+        .try_with(|v| v.clone())
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// 中间件：读 `X-Service-Type` header → task-local scope 注入 userApp 标记，
+/// 同时提取定位用 app_id（header `x-app-id` 优先，缺省 query `appId` 兜底——
+/// Java 静态文件族 query 恒带 `appId`）。query 值不做 percent-decode：
+/// app_id 是 identifier 字符集，含转义序列会在定位收口校验 fail-fast。
 pub async fn scope_userapp_flag(req: Request, next: axum::middleware::Next) -> Response {
     let is_userapp = req
         .headers()
         .get(SERVICE_TYPE_HEADER)
         .and_then(|v| v.to_str().ok())
         .is_some_and(shared_types::is_userapp_service_type_value);
-    USERAPP_FLAG.scope(is_userapp, next.run(req)).await
+    let app_id = req
+        .headers()
+        .get(APP_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .or_else(|| query_param_raw(req.uri().query(), "appId"));
+    let fut = next.run(req);
+    async {
+        USERAPP_APP_ID
+            .scope(app_id, async { USERAPP_FLAG.scope(is_userapp, fut).await })
+            .await
+    }
+    .await
+}
+
+/// 从原始 query 串取单值参数（`appId=19&x=y` → `Some("19")`；多值取首个）。
+fn query_param_raw(query: Option<&str>, key: &str) -> Option<String> {
+    query?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key && !v.is_empty()).then(|| v.to_string())
+    })
 }
 
 // ── 请求级绑定目录 (task_local, 存原始 header 值; 对齐 TS f979df7) ───────────────
@@ -266,6 +310,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(to_bytes(resp.into_body(), 1024).await.unwrap(), "false");
+    }
+
+    /// userapp app_id 两级提取（对齐 TS resolveServiceContext）：
+    /// header `x-app-id` 优先 > query `appId` 兜底 > None（缺失由定位收口 fail-fast）。
+    #[tokio::test]
+    async fn userapp_app_id_extracted_header_first_then_query() {
+        let app = Router::new()
+            .route(
+                "/probe",
+                post(|| async { format!("{:?}", super::userapp_app_id()) }),
+            )
+            .layer(axum::middleware::from_fn(super::scope_userapp_flag));
+
+        // 仅 header
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe")
+                    .header(super::SERVICE_TYPE_HEADER, super::SERVICE_TYPE_USERAPP)
+                    .header(super::APP_ID_HEADER, "app-19")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"Some("app-19")"#
+        );
+
+        // header 优先于 query（两处都有 → header 胜出）
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe?appId=from-query")
+                    .header(super::SERVICE_TYPE_HEADER, super::SERVICE_TYPE_USERAPP)
+                    .header(super::APP_ID_HEADER, "from-header")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"Some("from-header")"#
+        );
+
+        // 仅 query 兜底（Java 静态文件族形态：query 恒带 appId）
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe?appId=19&other=1")
+                    .header(super::SERVICE_TYPE_HEADER, super::SERVICE_TYPE_USERAPP)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"Some("19")"#
+        );
+
+        // 两处皆缺 → None；空白 header 值视为未携带（回落 query）
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe")
+                    .header(super::SERVICE_TYPE_HEADER, super::SERVICE_TYPE_USERAPP)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(to_bytes(resp.into_body(), 1024).await.unwrap(), "None");
+        let resp = app
+            .oneshot(
+                Request::post("/probe?appId=q1")
+                    .header(super::SERVICE_TYPE_HEADER, super::SERVICE_TYPE_USERAPP)
+                    .header(super::APP_ID_HEADER, "   ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"Some("q1")"#
+        );
     }
 
     /// 绑定目录 task-local：中间件 scope 注入原始 header 值（可读、未校验），

@@ -237,7 +237,7 @@ const HOP_BY_HOP: [&str; 7] = [
 ];
 
 /// AllRust 模式的 60000 入口白名单：file-server 语义路径（`/api/*`、`/health`、`/`、
-/// swagger `/api-docs*`）。UserappSplit 的 rust 分支无需白名单——其判据本身已窄面。
+/// swagger `/api-docs*`）。TsFirst 的 rust 分支无需白名单——其判据本身已窄面。
 pub(crate) fn all_rust_path_allowed(path: &str) -> bool {
     path == "/health" || path == "/" || path.starts_with("/api/") || path.starts_with("/api-docs")
 }

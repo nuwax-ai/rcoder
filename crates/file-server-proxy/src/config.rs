@@ -39,12 +39,16 @@ impl Default for FileServerProxyConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutePolicy {
-    /// 分流模式（现状兼容，生产在跑）：userApp 判据（path 前缀或
-    /// `x-service-type` header）→ rust 上游，其余 → ts 上游
-    /// （存量域继续 TS nuwax-file-server；TS 尚未支持 service_type 入参时
-    /// 存量路径上的 userApp 业务必须由 Rust 承载）
+    /// TS 优先模式（存量切流档，测试/生产在跑）：userApp 判据（`/api/v1/userapp*`
+    /// 路径前缀 **或** `x-service-type: userapp` header）→ rust 上游（rcoder
+    /// 拦截层转发 per-app 容器——per-app RBD 架构下只有容器读得到 app 工作区）；
+    /// 其余（无 userApp 标记的存量流量）→ TS nuwax-file-server。
+    ///
+    /// 历史：曾为「仅路径判据、header 失效」的过渡档（假设 TS 以 service_type
+    /// 入参自载 userApp 业务）——共享卷时代 TS 可达 app 卷，per-app RBD 后 TS
+    /// 物理不可达，该假设失效，已并入 header 判据（原 userapp_split 档删除）。
     #[default]
-    UserappSplit,
+    TsFirst,
     /// 全 Rust 模式（切流终态）：一律 rust 上游，全部流量由 Rust 重写的
     /// file-server 承载（TS 热备于 [`NUWAX_FILE_SERVER_INTERNAL_PORT`]，不接流量）
     AllRust,
@@ -52,38 +56,30 @@ pub enum RoutePolicy {
     /// 无路径白名单（TS 本就是全量老路由面，白名单语义不适用）；
     /// TS 没有的 userApp 新接口（/api/v1/userapp/*）在此模式下由 TS 返回 404。
     AllTs,
-    /// TS 优先模式（过渡切流档）：**仅** Rust 独有接口（`/api/v1/userapp*`，TS 无
-    /// 此路由）→ rust 上游；存量同名接口**全走 TS**（含带 `x-service-type`
-    /// 标记的请求——header 判据在此模式下失效，由 TS 以 service_type 入参
-    /// 内部消费 userApp 业务）。验证 TS 侧 userApp 能力就绪后的整体切流形态。
-    TsFirst,
 }
 
 impl RoutePolicy {
     /// 策略的 wire 值（serde/CLI/env/helm 共用词汇表）。
     pub const fn as_str(self) -> &'static str {
         match self {
-            RoutePolicy::UserappSplit => "userapp_split",
+            RoutePolicy::TsFirst => "ts_first",
             RoutePolicy::AllRust => "all_rust",
             RoutePolicy::AllTs => "all_ts",
-            RoutePolicy::TsFirst => "ts_first",
         }
     }
 }
 
 /// 解析策略值（env/CLI 入口共用；serde 之外的运行时入口）。
 ///
-/// 受认可值与 serde wire 契约一致：`userapp_split|all_rust|all_ts|ts_first`。
+/// 受认可值与 serde wire 契约一致：`ts_first|all_rust|all_ts`。
 /// 非法值返回 Err（带受认可值清单，调用方 exit 前可直接展示）。
 pub fn parse_route_policy(value: &str) -> Result<RoutePolicy, String> {
     match value.trim() {
-        "userapp_split" => Ok(RoutePolicy::UserappSplit),
+        "ts_first" => Ok(RoutePolicy::TsFirst),
         "all_rust" => Ok(RoutePolicy::AllRust),
         "all_ts" => Ok(RoutePolicy::AllTs),
-        "ts_first" => Ok(RoutePolicy::TsFirst),
         other => Err(format!(
-            "invalid route policy {other:?}: expected one of \
-             userapp_split | all_rust | all_ts | ts_first"
+            "invalid route policy {other:?}: expected one of ts_first | all_rust | all_ts"
         )),
     }
 }
@@ -116,20 +112,17 @@ fn is_userapp_service_type(header_value: Option<&str>) -> bool {
 
 impl FileServerProxyConfig {
     /// 分流规则纯函数（按 [`RoutePolicy`] 分派）：
-    /// - [`RoutePolicy::UserappSplit`]：`/api/v1/userapp*` 前缀或
+    /// - [`RoutePolicy::TsFirst`]：`/api/v1/userapp*` 前缀或
     ///   `x-service-type: userapp` header（任一命中）→ Rust 上游，其余 → TS 上游
     /// - [`RoutePolicy::AllRust`]：一律 Rust 上游
     /// - [`RoutePolicy::AllTs`]：一律 TS 上游
-    /// - [`RoutePolicy::TsFirst`]：仅 `/api/v1/userapp*` → Rust 上游（header 判据
-    ///   失效，存量同名接口含 userApp 标记一律 TS）
     pub fn upstream_port_for(&self, path: &str, service_type_header: Option<&str>) -> Upstream {
         let to_rust = match self.policy {
-            RoutePolicy::UserappSplit => {
+            RoutePolicy::TsFirst => {
                 is_userapp_path(path) || is_userapp_service_type(service_type_header)
             }
             RoutePolicy::AllRust => true,
             RoutePolicy::AllTs => false,
-            RoutePolicy::TsFirst => is_userapp_path(path),
         };
         if to_rust {
             Upstream::Rust(self.rust_upstream_port)

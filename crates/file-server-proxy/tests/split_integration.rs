@@ -72,7 +72,7 @@ async fn service_type_header_decides_upstream_and_lifecycle() {
         listen_port: PROXY_PORT,
         rust_upstream_port: RUST_UPSTREAM_PORT,
         ts_upstream_port: TS_UPSTREAM_PORT,
-        policy: file_server_proxy::RoutePolicy::UserappSplit,
+        policy: file_server_proxy::RoutePolicy::TsFirst,
     });
 
     // ── 生命周期: start → status ──

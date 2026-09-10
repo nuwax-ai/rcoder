@@ -221,6 +221,55 @@ async fn userapp_dev_files_two_entry_points() {
         format!("HTTP {sl}, files: {names:?}"),
     );
 
+    // 入口 B'：TS 老路径 GET 列表 + 双 header，cId 传会话风格值（≠app_id）——
+    // app_id 是独立字段（header 提取），cId（会话字段）不参与 userapp 定位
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/computer/get-file-list?userId={user}&cId=conv-12345&recursive=false",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(30))
+        .header("X-Service-Type", "userapp")
+        .header("X-App-Id", &app)
+        .send()
+        .await
+        .expect("intercepted list");
+    let sl_c = resp.status();
+    let bl_c: Value = resp.json().await.unwrap_or(Value::Null);
+    let names_c: Vec<String> = bl_c["files"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|f| f["name"].as_str().map(str::to_owned))
+        .collect();
+    let both_c =
+        names_c.iter().any(|n| n == "direct.txt") && names_c.iter().any(|n| n == "proxy.txt");
+    report.assert_hard(
+        "入口 B'：computer 老路径列表，cId 传会话值不参与定位（app_id 独立提取）",
+        sl_c.is_success() && both_c,
+        format!("HTTP {sl_c}, files: {names_c:?}"),
+    );
+
+    // TS 老路径缺 X-App-Id（有 userapp 标记无定位字段）→ 400 fail-fast
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/computer/get-file-list?userId={user}&cId=conv-12345",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(15))
+        .header("X-Service-Type", "userapp")
+        .send()
+        .await
+        .expect("missing app id list");
+    report.assert_hard(
+        "computer 老路径缺 X-App-Id → 400",
+        resp.status().as_u16() == 400,
+        format!("HTTP {}", resp.status()),
+    );
+
     // 缺 X-App-Id 的 userApp 转发 → 400（明确提示）
     let resp = env
         .http

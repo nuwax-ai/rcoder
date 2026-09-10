@@ -6,13 +6,12 @@ fn cfg() -> FileServerProxyConfig {
 }
 
 /// config.yml wire 契约：策略值为 snake_case（helm 模板渲染依赖此形态）。
+/// `userapp_split` 为已删除档（语义并入 ts_first）——wire 值不再受认可。
 #[test]
 fn policy_serializes_snake_case() {
     assert_eq!(
-        serde_yaml::to_string(&RoutePolicy::UserappSplit)
-            .unwrap()
-            .trim(),
-        "userapp_split"
+        serde_yaml::to_string(&RoutePolicy::TsFirst).unwrap().trim(),
+        "ts_first"
     );
     assert_eq!(
         serde_yaml::to_string(&RoutePolicy::AllRust).unwrap().trim(),
@@ -22,29 +21,27 @@ fn policy_serializes_snake_case() {
         serde_yaml::to_string(&RoutePolicy::AllTs).unwrap().trim(),
         "all_ts"
     );
-    assert_eq!(
-        serde_yaml::to_string(&RoutePolicy::TsFirst).unwrap().trim(),
-        "ts_first"
-    );
-    let parsed: RoutePolicy = serde_yaml::from_str("all_rust").unwrap();
-    assert_eq!(parsed, RoutePolicy::AllRust);
-    let parsed: RoutePolicy = serde_yaml::from_str("all_ts").unwrap();
-    assert_eq!(parsed, RoutePolicy::AllTs);
-    let parsed: RoutePolicy = serde_yaml::from_str("ts_first").unwrap();
-    assert_eq!(parsed, RoutePolicy::TsFirst);
-    // 段缺 policy 字段 → 默认 UserappSplit（存量 config 兼容）
+    for wire in ["ts_first", "all_rust", "all_ts"] {
+        let parsed: RoutePolicy = serde_yaml::from_str(wire).unwrap();
+        assert_eq!(parsed.as_str(), wire);
+    }
+    // 已删除档拒绝（values 已迁移；残留配置 fail-fast 而非静默错档）
+    assert!(serde_yaml::from_str::<RoutePolicy>("userapp_split").is_err());
+    // 段缺 policy 字段 → 默认 TsFirst（存量 config 兼容）
     let parsed: FileServerProxyConfig = serde_yaml::from_str(
         "listen_port: 60000\nrust_upstream_port: 8086\nts_upstream_port: 60001\n",
     )
     .unwrap();
-    assert_eq!(parsed.policy, RoutePolicy::UserappSplit);
+    assert_eq!(parsed.policy, RoutePolicy::TsFirst);
 }
 
-/// 主 pod 形态（UserappSplit 默认策略）：header 与 path 双判据。
+/// 主 pod 形态（TsFirst 默认策略）：header 与 path 双判据。
+/// userApp 标记流量走 Rust（rcoder 拦截层转发 per-app 容器——per-app RBD
+/// 架构下 TS 物理读不到 app 工作区，历史「TS 自载 userApp」假设已失效）。
 #[test]
-fn userapp_split_policy_routes_by_header_and_path() {
+fn ts_first_policy_routes_by_header_and_path() {
     let c = cfg();
-    assert_eq!(c.policy, RoutePolicy::UserappSplit, "默认策略为主 pod 形态");
+    assert_eq!(c.policy, RoutePolicy::TsFirst, "默认策略为主 pod 形态");
     // header 判据（存量路径形态 + 业务声明）
     assert_eq!(
         c.upstream_port_for("/api/computer/get-file-list", Some("userapp")),
@@ -155,75 +152,38 @@ fn all_ts_policy_routes_everything_to_ts() {
 #[test]
 fn parse_route_policy_accepts_wire_vocabulary() {
     assert_eq!(
-        parse_route_policy("userapp_split").unwrap(),
-        RoutePolicy::UserappSplit
+        parse_route_policy("ts_first").unwrap(),
+        RoutePolicy::TsFirst
     );
     assert_eq!(
         parse_route_policy("all_rust").unwrap(),
         RoutePolicy::AllRust
     );
     assert_eq!(parse_route_policy("all_ts").unwrap(), RoutePolicy::AllTs);
-    assert_eq!(
-        parse_route_policy("ts_first").unwrap(),
-        RoutePolicy::TsFirst
-    );
     // trim 容差（env 值尾随空白是常见脏数据）
     assert_eq!(parse_route_policy(" all_ts\n").unwrap(), RoutePolicy::AllTs);
     // as_str 与 parse 互逆
     for policy in [
-        RoutePolicy::UserappSplit,
+        RoutePolicy::TsFirst,
         RoutePolicy::AllRust,
         RoutePolicy::AllTs,
-        RoutePolicy::TsFirst,
     ] {
         assert_eq!(parse_route_policy(policy.as_str()).unwrap(), policy);
     }
-    // 非法值：报错文案带受认可值清单（调用方直接展示给用户）
-    for bad in ["", "split", "ALL_RUST", "userapp", "ts-first"] {
+    // 非法值：报错文案带受认可值清单（调用方直接展示给用户）；
+    // userapp_split（已删除档）也在此列
+    for bad in [
+        "",
+        "split",
+        "ALL_RUST",
+        "userapp",
+        "ts-first",
+        "userapp_split",
+    ] {
         let err = parse_route_policy(bad).unwrap_err();
         assert!(
-            err.contains("userapp_split | all_rust | all_ts | ts_first"),
+            err.contains("ts_first | all_rust | all_ts"),
             "{bad:?} 报错应含受认可值清单: {err}"
-        );
-    }
-}
-
-/// TS 优先模式（TsFirst）：存量同名接口全走 TS——**含 userApp 标记**
-/// （header 判据失效，由 TS 以 service_type 入参消费）；仅 Rust 独有的
-/// `/api/v1/userapp*` 走 rust。与 UserappSplit 的差异点就在 header 判据。
-#[test]
-fn ts_first_policy_routes_legacy_to_ts_even_with_userapp_header() {
-    let c = FileServerProxyConfig {
-        listen_port: 60000,
-        rust_upstream_port: 8086,
-        ts_upstream_port: 60001,
-        policy: RoutePolicy::TsFirst,
-    };
-    // Rust 独有接口 → rust
-    for path in [
-        "/api/v1/userapp",
-        "/api/v1/userapp/dev/start",
-        "/api/v1/userapp/files",
-    ] {
-        assert_eq!(
-            c.upstream_port_for(path, None),
-            Upstream::Rust(8086),
-            "{path}"
-        );
-    }
-    // 存量同名接口 → TS；带 userApp 标记也走 TS（差异点/语义铁证）
-    for (path, header) in [
-        ("/api/computer/get-file-list", None),
-        ("/api/computer/get-file-list", Some("userapp")),
-        ("/api/project/content", Some("userapp")),
-        ("/health", None),
-        ("/api/version", None),
-        ("/api/v1/userapplication", None),
-    ] {
-        assert_eq!(
-            c.upstream_port_for(path, header),
-            Upstream::Ts(60001),
-            "{path} {header:?} 应走 TS"
         );
     }
 }
@@ -234,7 +194,7 @@ fn custom_ports_respected() {
         listen_port: 61000,
         rust_upstream_port: 18086,
         ts_upstream_port: 6001,
-        policy: RoutePolicy::UserappSplit,
+        policy: RoutePolicy::TsFirst,
     };
     assert_eq!(
         c.upstream_port_for("/api/v1/userapp/dev/start", None),
