@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::service::types::{IME_PORT, ProxyMetrics, TrackingCtx};
+use crate::service::types::{ProxyMetrics, TrackingCtx};
 use crate::service::utils;
+use shared_types::IME_PORT;
 
 /// 处理 IME 输入法代理请求
 ///

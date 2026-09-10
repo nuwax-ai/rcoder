@@ -110,6 +110,13 @@ pub const WS_TERMINAL_PORT: u16 = 17681;
 /// dbx 前端运行时自推断 base path（webPath.ts），代理剥前缀直连 root 模式即可。
 pub const DBX_PORT: u16 = 4224;
 
+/// 输入法服务端口（agent-runner 容器内 fcitx/ime 桥接服务，恒为 6091）
+///
+/// agent_runner 镜像 supervisor 恒起；Pingora 的 ImeProxy（computer `/computer/ime/*`
+/// 与 userapp `/userapp/ime/{app_id}/*` 两族）按 `{host}:6091` 拨上游——K8s 下
+/// host 为 per-app Service FQDN，Service 端口清单须声明（未声明无转发规则）。
+pub const IME_PORT: u16 = 6091;
+
 /// userApp 应用统一入口端口（pingap 监听，恒为 9080）
 ///
 /// 容器内 app-cli 编排的 pingap 统一入口：dev 容器（UserappBuilder，manifest 流程

@@ -254,12 +254,11 @@ impl TrackingCtx {
 // 端口常量
 // ============================================================================
 
-/// 音频服务端口（rcoder-proxy 专用，shared_types 未定义）
+/// 音频服务端口（rcoder-proxy 专用，shared_types 未定义——builder 容器内无
+/// 音频服务，不进 K8s Service 端口清单）
 pub const AUDIO_HTTP_PORT: u16 = 6090; // 音频静态文件服务
 pub const AUDIO_WS_PORT: u16 = 6089; // 音频 WebSocket 流
 
-/// IME 输入法服务端口（rcoder-proxy 专用，shared_types 未定义）
-pub const IME_PORT: u16 = 6091;
-
-// 注：跨 crate 共享的端口常量（NOVNC_PORT、WS_TERMINAL_PORT、TTYD_PORT 等）统一定义在
-// `shared_types::constants`，本 crate 直接引用，不在本地重复定义。
+// 注：跨 crate 共享的端口常量（NOVNC_PORT、WS_TERMINAL_PORT、TTYD_PORT、IME_PORT 等）
+// 统一定义在 `shared_types::constants`，本 crate 直接引用，不在本地重复定义。
+// （IME_PORT 已提升 shared_types——K8s Service 端口清单消费同值。）

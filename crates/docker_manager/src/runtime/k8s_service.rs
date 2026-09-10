@@ -14,8 +14,8 @@ use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PostParams};
 #[cfg(feature = "kubernetes")]
 use shared_types::{
-    AGENT_FILE_SERVER_PORT, APP_CLI_ADMIN_PORT, DBX_PORT, GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT,
-    NOVNC_PORT, ServiceType, WS_TERMINAL_PORT,
+    AGENT_FILE_SERVER_PORT, APP_CLI_ADMIN_PORT, APP_ENTRY_PORT, DBX_PORT, GRPC_DEFAULT_PORT,
+    HTTP_DEFAULT_PORT, IME_PORT, NOVNC_PORT, ServiceType, WS_TERMINAL_PORT,
 };
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
@@ -57,10 +57,19 @@ fn tcp_service_port(name: &str, port: u16) -> ServicePort {
 
 /// agent per-pod Service 端口清单（创建与存量收敛共用同一期望）。
 ///
-/// 基础六端口恒暴露；UserappBuilder 追加 app-cli 管理/日志端口——
-/// app_manager `log_api_base` dev 分支按 `{svc}:{APP_CLI_ADMIN_PORT}` 连容器内
-/// app-cli，ClusterIP 未声明的端口无 kube-proxy/Cilium 转发规则（SYN 被丢弃
-/// → 连接超时）。其他 agent 类型容器内不跑 app-cli，不暴露。
+/// 基础六端口恒暴露；UserappBuilder 追加三个专属端口：
+/// - app-cli 管理/日志 3010：app_manager `log_api_base` dev 分支按
+///   `{svc}:{APP_CLI_ADMIN_PORT}` 连容器内 app-cli；
+/// - 应用流量入口 9080（pingap）：dev 应用代理（rcoder-proxy dev_app_proxy）
+///   按 `{svc}:{APP_ENTRY_PORT}` 拨上游；
+/// - 输入法 6091：ImeProxy（computer/userapp 两族）按 `{svc}:{IME_PORT}`
+///   拨上游（agent-runner 镜像 supervisor 恒起）。
+///
+/// 音频 6089/6090 不在此列：builder 容器内无音频服务（userapp 开发容器
+/// 无桌面音频），声明了也无对应监听。
+///
+/// ClusterIP 未声明的端口无 kube-proxy/Cilium 转发规则（SYN 被丢弃
+/// → 连接超时）。其他 agent 类型容器内不跑 app-cli/pingap/ime 桥接，不暴露。
 fn agent_service_ports(service_type: &ServiceType) -> Vec<ServicePort> {
     let mut ports = vec![
         tcp_service_port("http", AGENT_HTTP_PORT as u16),
@@ -72,6 +81,8 @@ fn agent_service_ports(service_type: &ServiceType) -> Vec<ServicePort> {
     ];
     if matches!(service_type, ServiceType::UserappBuilder) {
         ports.push(tcp_service_port("app-cli-admin", APP_CLI_ADMIN_PORT));
+        ports.push(tcp_service_port("app-entry", APP_ENTRY_PORT));
+        ports.push(tcp_service_port("ime", IME_PORT));
     }
     ports
 }
@@ -106,6 +117,15 @@ fn service_exposes_port(svc: &Service, port: u16) -> bool {
         .as_ref()
         .and_then(|spec| spec.ports.as_ref())
         .is_some_and(|ports| ports.iter().any(|p| p.port == port as i32))
+}
+
+/// 存量 Service 是否缺任一期望端口（按 [`agent_service_ports`] 清单逐端口
+/// 比对）——SSA 收敛的触发判定：点名单端口的条件在清单再扩时必然漏检
+/// （3010 → 9080 两次同款教训），按期望清单比对后加端口即自动覆盖存量。
+fn has_missing_expected_ports(svc: &Service, service_type: &ServiceType) -> bool {
+    agent_service_ports(service_type)
+        .iter()
+        .any(|p| !service_exposes_port(svc, p.port as u16))
 }
 
 /// K8s 标准标签前缀
@@ -248,14 +268,15 @@ impl K8sServiceOps for KubernetesRuntime {
         // 检查是否已存在
         match services.get(&svc_name).await {
             Ok(existing) => {
-                // 定向收敛：早期版本创建的 builder Service 缺 app-cli-admin
-                // （APP_CLI_ADMIN_PORT）端口，dev 日志链路按 `{svc}:3010` 连接
-                // 必超时——SSA patch 写入全量期望 spec 补齐（存量端口随
-                // reconcile 收敛，范式对齐 apply_app_service）。仅 UserappBuilder
-                // 触发：读路径自愈（get_container_info 每次经过这里）不对其他
-                // agent 类型写放大。
+                // 定向收敛：存量 builder Service 缺任一期望端口（历史上两次
+                // 犯同款——3010 日志链路、9080 dev 应用流量代理，均按
+                // `{svc}:{port}` 拨上游必超时）——SSA patch 写入全量期望 spec
+                // 补齐（范式对齐 apply_app_service）。条件按期望清单逐端口
+                // 比对而非点名端口：后续清单再加端口，存量 svc 访问即自愈。
+                // 仅 UserappBuilder 触发：读路径自愈（get_container_info 每次
+                // 经过这里）不对其他 agent 类型写放大。
                 if matches!(service_type, ServiceType::UserappBuilder)
-                    && !service_exposes_port(&existing, APP_CLI_ADMIN_PORT)
+                    && has_missing_expected_ports(&existing, service_type)
                 {
                     let desired =
                         agent_service_object(&self.namespace, &svc_name, identifier, service_type);
@@ -271,8 +292,8 @@ impl K8sServiceOps for KubernetesRuntime {
                             ))
                         })?;
                     info!(
-                        "[K8S] Service {} patched to expose app-cli-admin {}",
-                        svc_name, APP_CLI_ADMIN_PORT
+                        "[K8S] Service {} patched to converge expected ports (was missing some)",
+                        svc_name
                     );
                     return Ok(());
                 }
@@ -373,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn other_agent_types_do_not_expose_app_cli_admin() {
+    fn other_agent_types_do_not_expose_builder_only_ports() {
         for service_type in [
             ServiceType::ComputerAgentRunner,
             ServiceType::WebAgentRunner,
@@ -383,9 +404,83 @@ mod tests {
                 !ports.iter().any(|p| p.port == APP_CLI_ADMIN_PORT as i32),
                 "{service_type} 容器内不跑 app-cli，不应暴露 3010"
             );
+            assert!(
+                !ports.iter().any(|p| p.port == APP_ENTRY_PORT as i32),
+                "{service_type} 容器内不跑 pingap，不应暴露 9080"
+            );
+            assert!(
+                !ports.iter().any(|p| p.port == IME_PORT as i32),
+                "{service_type} ime 直连 pod IP 不经 svc，不应暴露 6091"
+            );
             // 基础六端口恒在
             assert_eq!(ports.len(), 6, "{service_type} 端口数应为基础六端口");
         }
+    }
+
+    /// dev 应用流量代理按 `{svc}:{APP_ENTRY_PORT}` 拨上游（pingap）——
+    /// 未声明则 kube-proxy 无转发规则、必 502（app 19 事故回归锁）。
+    #[test]
+    fn builder_service_ports_expose_app_entry() {
+        let ports = agent_service_ports(&ServiceType::UserappBuilder);
+        let entry = ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some("app-entry"))
+            .expect("builder Service 必须暴露 app-entry");
+        assert_eq!(entry.port, APP_ENTRY_PORT as i32);
+        assert_eq!(
+            entry.target_port,
+            Some(
+                k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                    APP_ENTRY_PORT as i32
+                )
+            )
+        );
+        // builder 总端口数 = 基础六 + 3010 + 9080 + 6091
+        assert_eq!(ports.len(), 9, "ports={ports:?}");
+        // ime：ImeProxy 按 {svc}:{IME_PORT} 拨上游（userapp 族）
+        let ime = ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some("ime"))
+            .expect("builder Service 必须暴露 ime");
+        assert_eq!(ime.port, IME_PORT as i32);
+    }
+
+    /// SSA 收敛触发判定：缺任一期望端口即收敛（点名 3010 的旧条件在 9080
+    /// 加入后必然漏检——泛化后的回归锁）。
+    #[test]
+    fn convergence_triggers_on_any_missing_expected_port() {
+        // 全量期望 svc：不触发
+        let full = agent_service_object("ns", "s", "1", &ServiceType::UserappBuilder);
+        assert!(!has_missing_expected_ports(
+            &full,
+            &ServiceType::UserappBuilder
+        ));
+
+        // legacy：有 3010（3010 修复期存量）但缺 9080 → 触发
+        let legacy = Service {
+            metadata: ObjectMeta::default(),
+            spec: Some(ServiceSpec {
+                ports: Some(
+                    agent_service_ports(&ServiceType::UserappBuilder)
+                        .into_iter()
+                        .filter(|p| p.port != APP_ENTRY_PORT as i32)
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        assert!(has_missing_expected_ports(
+            &legacy,
+            &ServiceType::UserappBuilder
+        ));
+
+        // 非 builder 类型期望即六基础端口：基础 svc 不触发
+        let base = agent_service_object("ns", "s", "1", &ServiceType::ComputerAgentRunner);
+        assert!(!has_missing_expected_ports(
+            &base,
+            &ServiceType::ComputerAgentRunner
+        ));
     }
 
     #[test]
