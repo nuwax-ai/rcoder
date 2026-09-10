@@ -12,7 +12,11 @@
 //! 任一失败则退出非零且不组装部署布局。
 
 use std::fs;
-use std::io::{self, Read as _};
+use std::io;
+// Read 仅供 cfg(unix) 的 zip 符号链接条目读取（read_to_string 需要 trait 在
+// 作用域）；非 unix 编译该路径被门控，导入一并门控避免 unused 警告
+#[cfg(unix)]
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;

@@ -52,6 +52,9 @@ fn exec_spec(spec: &ServiceSpecFile, log_dir: &std::path::Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
+        // exec 的 Windows 退化：spawn + 等待 + 透传 exit code（语义等价：
+        // supervisord 引擎在 Windows 不可达，本分支仅防御性存在）。
+        use anyhow::Context as _;
         let status = command.status().context("spawn service")?;
         std::process::exit(status.code().unwrap_or(1));
     }
