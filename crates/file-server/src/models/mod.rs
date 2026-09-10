@@ -67,6 +67,36 @@ mod tests {
         assert!(visited > 80, "sanity: 至少扫描 80 个源文件, 实际 {visited}");
     }
 
+    /// computer 契约携带绑定目录守卫（对齐 TS f979df7：全部 computer 路由接受
+    /// workspaceDir）：`models/computer.rs` 与 `models/forms.rs` 中凡含 `pub user_id`
+    /// 字段的结构体必须同时含 `pub workspace_dir` 字段——未来新增 computer 契约
+    /// 漏带绑定目录在此报红（按 struct 分块的源码文本扫描，同上守卫范式）。
+    #[test]
+    fn computer_contracts_carry_workspace_dir() {
+        for file in ["computer.rs", "forms.rs"] {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src/models")
+                .join(file);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            // 按 struct 定义分块（`pub struct X {` 到下一个 `pub struct`/文件尾）
+            let mut chunks: Vec<&str> = content.split("pub struct ").skip(1).collect();
+            assert!(
+                !chunks.is_empty(),
+                "{file}: 未扫到任何 struct，守卫自身失效"
+            );
+            for chunk in &mut chunks {
+                let head = chunk.split('{').next().unwrap_or_default().trim();
+                let body = chunk.split_once('{').map(|(_, rest)| rest).unwrap_or("");
+                assert!(
+                    !body.contains("pub user_id") || body.contains("pub workspace_dir"),
+                    "{file}: struct {head} 含 user_id 但缺 workspace_dir 字段 \
+                     （TS f979df7 全部 computer 契约须接受绑定目录）"
+                );
+            }
+        }
+    }
+
     fn visit(dir: &Path, f: &mut dyn FnMut(&Path, &str), visited: &mut usize) {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,

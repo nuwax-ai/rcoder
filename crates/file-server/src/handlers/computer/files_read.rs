@@ -37,8 +37,14 @@ pub(crate) async fn get_file_list(
     Query(q): Query<FileListQuery>,
 ) -> Result<Json<Value>, AppError> {
     q.validate().map_err(crate::error::from_garde)?;
-    let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())
-        .await?;
+    let path = resolve_computer_target(
+        &state,
+        &q.user_id,
+        &q.c_id,
+        q.custom_target_dir.as_deref(),
+        q.workspace_dir.as_deref(),
+    )
+    .await?;
     get_file_list_impl(
         &state,
         &path,
@@ -70,8 +76,14 @@ pub(crate) async fn resolve_file(
     Query(q): Query<ResolveFileQuery>,
 ) -> Result<Json<Value>, AppError> {
     q.validate().map_err(crate::error::from_garde)?;
-    let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())
-        .await?;
+    let path = resolve_computer_target(
+        &state,
+        &q.user_id,
+        &q.c_id,
+        q.custom_target_dir.as_deref(),
+        q.workspace_dir.as_deref(),
+    )
+    .await?;
     resolve_file_impl(
         path,
         q.file_path.trim(),
@@ -99,8 +111,14 @@ pub(crate) async fn search_files(
     Query(q): Query<SearchFilesQuery>,
 ) -> Result<Json<Value>, AppError> {
     q.validate().map_err(crate::error::from_garde)?;
-    let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())
-        .await?;
+    let path = resolve_computer_target(
+        &state,
+        &q.user_id,
+        &q.c_id,
+        q.custom_target_dir.as_deref(),
+        q.workspace_dir.as_deref(),
+    )
+    .await?;
     search_files_impl(
         &state,
         path,
@@ -173,6 +191,7 @@ mod tests {
             c_id: "c".into(),
             proxy_path: None,
             custom_target_dir: None,
+            workspace_dir: None,
             relative_path: None,
             recursive: None, // 缺省 = 递归
         });
@@ -202,6 +221,7 @@ mod tests {
             c_id: "c".into(),
             proxy_path: None,
             custom_target_dir: None,
+            workspace_dir: None,
             relative_path: None,
             recursive: Some("false".into()),
         });
@@ -230,6 +250,7 @@ mod tests {
             c_id: "c".into(),
             proxy_path: None,
             custom_target_dir: None,
+            workspace_dir: None,
             relative_path: None,
             recursive: None,
         });
@@ -253,6 +274,7 @@ mod tests {
             c_id: "c".into(),
             proxy_path: Some("/proxy".into()),
             custom_target_dir: Some(custom.to_string_lossy().into_owned()),
+            workspace_dir: None,
             relative_path: None,
             recursive: Some("false".into()),
         });
@@ -282,6 +304,7 @@ mod tests {
             c_id: "c".into(),
             proxy_path: Some("/proxy".into()),
             custom_target_dir: None,
+            workspace_dir: None,
             relative_path: None,
             recursive: Some("false".into()),
         });
@@ -304,6 +327,7 @@ mod tests {
             c_id: "c".into(),
             proxy_path: Some("/proxy".into()),
             custom_target_dir: None,
+            workspace_dir: None,
             file_path: "sub/c.txt".into(),
         });
         let res = resolve_file(State(state), q).await.expect("resolve ok");
@@ -325,6 +349,7 @@ mod tests {
             c_id: "c".into(),
             proxy_path: None,
             custom_target_dir: None,
+            workspace_dir: None,
             file_path: "nope.txt".into(),
         });
         let res = resolve_file(State(state), q).await.expect("resolve ok");
@@ -345,6 +370,7 @@ mod tests {
             c_id: "c".into(),
             proxy_path: None,
             custom_target_dir: None,
+            workspace_dir: None,
             file_path: "".into(),
         });
         let err = resolve_file(State(state), q)
@@ -366,6 +392,7 @@ mod tests {
             c_id: "c".into(),
             proxy_path: Some("/proxy".into()),
             custom_target_dir: Some(custom.to_string_lossy().into_owned()),
+            workspace_dir: None,
             file_path: "f.txt".into(),
         });
         let res = resolve_file(State(state), q).await.expect("resolve ok");
@@ -391,6 +418,7 @@ mod tests {
             c_id: "c".into(),
             proxy_path: Some("/proxy".into()),
             custom_target_dir: None,
+            workspace_dir: None,
             relative_path: None,
             kw: ".txt".into(),
             limit: "100".into(),
@@ -421,6 +449,7 @@ mod tests {
             c_id: "c".into(),
             proxy_path: None,
             custom_target_dir: None,
+            workspace_dir: None,
             relative_path: None,
             kw: "x".into(),
             limit: "0".into(), // 非正
@@ -444,6 +473,7 @@ mod tests {
             c_id: "c".into(),
             proxy_path: None,
             custom_target_dir: None,
+            workspace_dir: None,
             relative_path: None,
             kw: "".into(),
             limit: "100".into(),
@@ -455,5 +485,66 @@ mod tests {
             .err()
             .expect("should reject");
         assert!(err.to_string().contains("kw"));
+    }
+
+    // ── 项目绑定目录通道 (对齐 TS f979df7) ─────────────────────────────────────────
+
+    /// query 显式 workspaceDir → 工作区切到绑定目录 (不经 user/cid 默认定位)。
+    #[tokio::test]
+    async fn get_file_lists_bound_dir_when_workspace_dir_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let computer_root = tmp.path().join("c");
+        let state = make_state(computer_root.clone());
+        seed_workspace(&computer_root).await;
+        // 绑定目录: 独立于 computer_root 的另一棵树
+        let bound = tmp.path().join("bound-ws");
+        tokio::fs::create_dir_all(&bound).await.unwrap();
+        tokio::fs::write(bound.join("only-in-bound.txt"), "x")
+            .await
+            .unwrap();
+
+        let q = Query(FileListQuery {
+            user_id: "u".into(),
+            c_id: "c".into(),
+            proxy_path: None,
+            custom_target_dir: None,
+            workspace_dir: Some(bound.to_string_lossy().into_owned()),
+            relative_path: None,
+            recursive: None,
+        });
+        let res = get_file_list(State(state), q).await.expect("list ok");
+        let names: Vec<&str> = res.0["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        // 列的是绑定目录内容, 不是默认工作区
+        assert_eq!(names, vec!["only-in-bound.txt"]);
+    }
+
+    /// 非法绑定 (相对路径) → fail-fast 400, 不落盘不遍历。
+    #[tokio::test]
+    async fn get_file_rejects_relative_workspace_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().join("c"));
+        let q = Query(FileListQuery {
+            user_id: "u".into(),
+            c_id: "c".into(),
+            proxy_path: None,
+            custom_target_dir: None,
+            workspace_dir: Some("relative/nope".into()),
+            relative_path: None,
+            recursive: None,
+        });
+        let err = match get_file_list(State(state), q).await {
+            Err(e) => e,
+            Ok(_) => panic!("relative workspaceDir must be rejected"),
+        };
+        use axum::response::IntoResponse;
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
     }
 }

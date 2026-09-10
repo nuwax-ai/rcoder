@@ -28,7 +28,14 @@ pub(crate) async fn delete_workspace(
     State(state): State<AppState>,
     Json(body): Json<DeleteWorkspaceBody>,
 ) -> Result<Json<Value>, AppError> {
-    let path = ws_path(&state, &body.user_id, &body.c_id).await?;
+    // 绑定目录直接定位删除 (不先建后删, 对齐 TS f979df7 deleteWorkspace)
+    let path = ws_path(
+        &state,
+        &body.user_id,
+        &body.c_id,
+        body.workspace_dir.as_deref(),
+    )
+    .await?;
     // 不存在视为已删除 (对齐 nuwax, 只 warn)
     if tokio::fs::try_exists(&path).await.unwrap_or(false) {
         tokio::fs::remove_dir_all(&path)
@@ -53,6 +60,7 @@ pub(crate) async fn files_update(
         &body.user_id,
         &body.c_id,
         body.custom_target_dir.as_deref(),
+        body.workspace_dir.as_deref(),
     )
     .await?;
     let count = files_update_core(&path, body.files).await?;

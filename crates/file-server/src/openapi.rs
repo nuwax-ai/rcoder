@@ -172,10 +172,11 @@ mod tests {
     #[test]
     fn document_contains_every_registered_operation() {
         let document = generated_document();
-        // 71 = TS 对齐域全量（镜像族+build+dev）。userApp 域 33 条已拆至
+        // 73 = TS 对齐域全量（镜像族+build+dev）+ /fs/roots + /fs/children
+        // （对齐 TS f979df7 目录浏览）。userApp 域 33 条已拆至
         // file-server-userapp crate（其 routes.rs 测试守卫）。路由增删须同步本计数
         // （防"注册了但没进文档"回归）。
-        assert_eq!(document.paths.paths.len(), 71);
+        assert_eq!(document.paths.paths.len(), 73);
         assert!(document.paths.paths.contains_key("/"));
         assert!(document.paths.paths.contains_key("/api/build/start-dev"));
         assert!(document.paths.paths.contains_key("/api/git/commit"));
@@ -218,6 +219,88 @@ mod tests {
                 .any(|path| path.starts_with("/api/v1/userapp"))
         );
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
+    }
+
+    /// computer 域全端点 workspaceDir 契约守卫（对齐 TS f979df7：TS 全部存量
+    /// computer 路由 + 静态路由都接受项目绑定目录）。遍历文档中 `/api/computer`
+    /// 前缀全部 operation：GET 参数面须含 `workspaceDir`、POST requestBody
+    /// schema（JSON / multipart form）须含 `workspaceDir` 属性；`/fs/*` 目录
+    /// 浏览端点例外（TS 侧不带会话上下文）。新增端点漏带字段在此报红——
+    /// 文档驱动 = 与路由注册面同源，接线遗漏的最强检测。
+    #[test]
+    fn computer_endpoints_accept_workspace_dir() {
+        let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");
+        let schemas = value["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        let paths = value["paths"].as_object().expect("paths");
+        let mut offenders = Vec::new();
+        let mut checked = 0usize;
+
+        for (path, item) in paths {
+            if !path.starts_with("/api/computer") {
+                continue;
+            }
+            // 目录浏览端点不带会话上下文（TS 同款例外）
+            if path.starts_with("/api/computer/fs/") {
+                continue;
+            }
+            let Some(ops) = item.as_object() else {
+                continue;
+            };
+            for (method, op) in ops {
+                if !matches!(method.as_str(), "get" | "post") {
+                    continue;
+                }
+                let Some(op) = op.as_object() else {
+                    continue;
+                };
+                let has_workspace_dir = if method == "get" {
+                    op.get("parameters")
+                        .and_then(Value::as_array)
+                        .is_some_and(|params| {
+                            params.iter().any(|p| {
+                                p.get("name").and_then(Value::as_str) == Some("workspaceDir")
+                            })
+                        })
+                } else {
+                    op.get("requestBody")
+                        .and_then(|rb| rb.get("content"))
+                        .and_then(Value::as_object)
+                        .and_then(|content| {
+                            content.values().find_map(|media| {
+                                let target = media
+                                    .get("schema")
+                                    .and_then(|s| s.get("$ref"))
+                                    .and_then(Value::as_str)
+                                    .and_then(|r| r.strip_prefix("#/components/schemas/"))
+                                    .and_then(|key| schemas.get(key))
+                                    .or_else(|| media.get("schema"))?;
+                                target
+                                    .get("properties")
+                                    .and_then(Value::as_object)
+                                    .map(|props| props.contains_key("workspaceDir"))
+                            })
+                        })
+                        .unwrap_or(false)
+                };
+                if !has_workspace_dir {
+                    offenders.push(format!(
+                        "{method} {path}: 契约面缺 workspaceDir (GET 查参数 / POST 查 body schema)"
+                    ));
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "computer 端点缺 workspaceDir 契约（对齐 TS f979df7 全路由接受绑定目录）：\n{}",
+            offenders.join("\n")
+        );
+        assert!(
+            checked >= 20,
+            "sanity: 至少覆盖 20 个 computer operation, 实际 {checked}"
+        );
     }
 
     fn operations_of(

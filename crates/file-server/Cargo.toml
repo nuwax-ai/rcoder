@@ -43,6 +43,9 @@ utoipa-swagger-ui = { workspace = true }
 # 异步运行时
 tokio = { workspace = true, features = ["full"] }
 
+# 文件系统工具 (fs_browser 的 home 目录探测; workspace 根依赖, agent_abstraction 同款先例)
+dirs = { workspace = true }
+
 # 日志
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

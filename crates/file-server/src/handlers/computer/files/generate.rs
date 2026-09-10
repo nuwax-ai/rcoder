@@ -36,6 +36,7 @@ pub(crate) async fn generate_file(
         &body.user_id,
         &body.c_id,
         body.custom_target_dir.as_deref(),
+        body.workspace_dir.as_deref(),
     )
     .await?;
     generate_file_impl(ws, body.file_name.trim(), body.content.unwrap_or_default()).await
@@ -83,6 +84,7 @@ mod tests {
             file_name: "src/a.txt".into(),
             content: Some("hi".into()),
             custom_target_dir: None,
+            workspace_dir: None,
         };
         let res = generate_file(State(state), Json(body))
             .await
@@ -108,6 +110,7 @@ mod tests {
             file_name: "top.txt".into(),
             content: Some("x".into()),
             custom_target_dir: Some(custom.to_string_lossy().into_owned()),
+            workspace_dir: None,
         };
         generate_file(State(state), Json(body))
             .await
@@ -128,6 +131,7 @@ mod tests {
             file_name: "../escape.txt".into(),
             content: Some("pwned".into()),
             custom_target_dir: None,
+            workspace_dir: None,
         };
         let err = generate_file(State(state), Json(body))
             .await
@@ -153,6 +157,7 @@ mod tests {
             file_name: "   ".into(),
             content: None,
             custom_target_dir: None,
+            workspace_dir: None,
         };
         let err = generate_file(State(state), Json(body))
             .await
@@ -177,6 +182,7 @@ mod tests {
             file_name: "/src/a.txt".into(),
             content: Some("hi".into()),
             custom_target_dir: None,
+            workspace_dir: None,
         };
         let res = generate_file(State(state), Json(body))
             .await
@@ -188,5 +194,72 @@ mod tests {
         let written = std::fs::read(computer_root.join("u").join("c").join("src").join("a.txt"))
             .expect("file written under src/");
         assert_eq!(written, b"hi");
+    }
+
+    // ── 项目绑定目录通道 (对齐 TS f979df7): body 字段 + x-workspace-dir header ─────
+
+    /// body 的 workspaceDir 字段 → 文件落绑定目录。
+    #[tokio::test]
+    async fn generate_file_writes_into_body_workspace_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().join("c"));
+        let bound = tmp.path().join("bound-ws");
+
+        let body = GenerateFileBody {
+            user_id: "u".into(),
+            c_id: "c".into(),
+            file_name: "bound.txt".into(),
+            content: Some("x".into()),
+            custom_target_dir: None,
+            workspace_dir: Some(bound.to_string_lossy().into_owned()),
+        };
+        generate_file(State(state), Json(body))
+            .await
+            .expect("generate ok");
+        // 文件落在绑定目录 (generate_file_impl 内部创建父目录)
+        let content = tokio::fs::read_to_string(bound.join("bound.txt"))
+            .await
+            .expect("file in bound dir");
+        assert_eq!(content, "x");
+    }
+
+    /// x-workspace-dir header 通道端到端: 中间件 scope → task-local → 收口合并。
+    /// 验证 header 优先级与 wire 契约 (Java 服务间调用走 header)。
+    #[tokio::test]
+    async fn generate_file_honors_workspace_dir_header() {
+        use crate::extract::scope_workspace_dir;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().join("c"));
+        let bound = tmp.path().join("header-bound-ws");
+
+        let app = axum::Router::new()
+            .route("/generate-file", axum::routing::post(generate_file))
+            .layer(axum::middleware::from_fn(scope_workspace_dir))
+            .with_state(state);
+
+        use tower::ServiceExt;
+        let body = serde_json::json!({
+            "userId": "u",
+            "cId": "c",
+            "fileName": "from-header.txt",
+            "content": "h",
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::post("/generate-file")
+                    .header("content-type", "application/json")
+                    .header("x-workspace-dir", bound.to_string_lossy().as_ref())
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let content = tokio::fs::read_to_string(bound.join("from-header.txt"))
+            .await
+            .expect("file in header-bound dir");
+        assert_eq!(content, "h");
     }
 }

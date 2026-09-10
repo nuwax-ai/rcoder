@@ -28,7 +28,13 @@ pub(crate) async fn install_project(
     State(state): State<AppState>,
     Json(body): Json<InstallBody>,
 ) -> Result<Json<Value>, AppError> {
-    let ws = ws_path(&state, &body.user_id, &body.c_id).await?;
+    let ws = ws_path(
+        &state,
+        &body.user_id,
+        &body.c_id,
+        body.workspace_dir.as_deref(),
+    )
+    .await?;
     install_project_impl(&state, ws, &body.programming_language).await
 }
 
@@ -45,7 +51,13 @@ pub(crate) async fn build_agent_package(
     State(state): State<AppState>,
     Json(body): Json<BuildAgentBody>,
 ) -> Result<Json<Value>, AppError> {
-    let ws = ws_path(&state, &body.user_id, &body.c_id).await?;
+    let ws = ws_path(
+        &state,
+        &body.user_id,
+        &body.c_id,
+        body.workspace_dir.as_deref(),
+    )
+    .await?;
     if !tokio::fs::try_exists(&ws).await.unwrap_or(false) {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -105,6 +117,7 @@ pub(crate) async fn cleanup_build_artifacts(
         &body.user_id,
         &body.c_id,
         body.custom_target_dir.as_deref(),
+        body.workspace_dir.as_deref(),
     )
     .await?;
     if !tokio::fs::try_exists(&ws).await.unwrap_or(false) {

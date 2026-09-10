@@ -36,6 +36,15 @@ pub const APP_STAGE_HEADER: &str = "x-app-stage";
 /// （进宿主树路径 `dev/{user_id}/{app_id}` 拼接，防逃逸——与 app_id 同源）。
 pub const USER_ID_HEADER: &str = "x-user-id";
 
+/// 项目绑定目录 header（对齐 TS nuwax-file-server f979df7 `resolveServiceContext`）：
+/// Java/前端注入，值为一跨平台绝对路径（POSIX `/a/b`、Windows 盘符 `C:/a/b`、UNC
+/// `//server/share/a/b`）。computer 域工作区定位收口（file-server
+/// `computer_root_for_request`）据此把工作区切到该目录——优先级高于
+/// `X-Service-Type` 分流与默认规则；合法性（绝对/无点段/长度/控制字符）由
+/// 收口处 [`normalize_workspace_dir`]（file-server 侧）fail-fast 校验，header
+/// 本身不做归一。与 body/query 的 `workspaceDir` 字段同语义（header 优先）。
+pub const WORKSPACE_DIR_HEADER: &str = "x-workspace-dir";
+
 /// [`APP_STAGE_HEADER`] 的值：开发阶段（UserappBuilder 开发容器）。
 pub const APP_STAGE_DEV: &str = "dev";
 
@@ -85,5 +94,12 @@ mod tests {
         assert_eq!(APP_ID_HEADER, "x-app-id");
         assert_eq!(APP_STAGE_HEADER, "x-app-stage");
         assert_eq!(USER_ID_HEADER, "x-user-id");
+    }
+
+    /// 绑定目录 header 名与 TS `resolveServiceContext` 读取的 header 名逐字一致
+    /// （对齐 nuwax-file-server f979df7）——一侧改名另一侧漂移即在此报红。
+    #[test]
+    fn workspace_dir_header_matches_ts_contract() {
+        assert_eq!(WORKSPACE_DIR_HEADER, "x-workspace-dir");
     }
 }

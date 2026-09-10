@@ -299,3 +299,55 @@ pub struct PortAllocation {
     /// 分配到的端口
     pub port: u16,
 }
+
+// ── 文件系统目录浏览 (/fs/roots, /fs/children, 对齐 TS f979df7) ───────────────────
+
+/// 目录浏览条目（目录与文件；是否可选由前端按 `isDir` 判断）。
+#[derive(Debug, Clone, serde::Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsEntry {
+    /// 条目名（不含路径）
+    pub name: String,
+    /// 归一化显示路径（分隔符统一 `/`，UNC 前导保留）
+    pub path: String,
+    /// 是否目录（符号链接按目标类型判定）
+    pub is_dir: bool,
+    /// 是否符号链接（前端标注用；悬空链接按文件展示）
+    pub is_symlink: bool,
+}
+
+/// 文件系统根条目（win32 盘符 / 其余平台 `/`）。
+#[derive(Debug, Clone, serde::Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsRootEntry {
+    /// 显示名（如 `C:/` 或 `/`）
+    pub name: String,
+    /// 根路径
+    pub path: String,
+    /// 恒为 true（根必为目录）
+    pub is_dir: bool,
+}
+
+/// `GET /fs/roots` 响应：浏览起点（根列表 + home 快捷入口）。
+#[derive(Debug, serde::Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsRootsResponse {
+    /// 恒 true
+    pub success: bool,
+    /// 可进入的根目录列表
+    pub roots: Vec<FsRootEntry>,
+    /// 用户 home（前端快捷入口；理论上缺省为 null）
+    pub home: Option<String>,
+}
+
+/// `GET /fs/children` 响应：某绝对目录下一层子项。
+#[derive(Debug, serde::Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsChildrenResponse {
+    /// 恒 true
+    pub success: bool,
+    /// 归一化后的请求目录路径
+    pub path: String,
+    /// 一层子项（目录在前、名称自然排序）
+    pub entries: Vec<FsEntry>,
+}

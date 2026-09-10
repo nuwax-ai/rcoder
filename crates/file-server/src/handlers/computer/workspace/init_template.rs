@@ -61,6 +61,7 @@ pub(crate) async fn init_project_template(
 ) -> Result<Json<Value>, AppError> {
     let mut user_id = None;
     let mut cid = None;
+    let mut workspace_dir = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
     let mut data = None;
     let mut enable_git = false;
     while let Some(field) = multipart
@@ -71,6 +72,7 @@ pub(crate) async fn init_project_template(
         match field.name().unwrap_or("") {
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
+            "workspaceDir" => workspace_dir = Some(text_field(field).await?),
             "file" => {
                 data = Some(
                     file_field(
@@ -92,6 +94,6 @@ pub(crate) async fn init_project_template(
     }
     let fields = InitTemplateFields { user_id, cid, data };
     let v = fields.into_validated()?;
-    let ws = ws_path(&state, &v.user_id, &v.cid).await?;
+    let ws = ws_path(&state, &v.user_id, &v.cid, workspace_dir.as_deref()).await?;
     init_project_template_impl(&state, ws, v.data, enable_git).await
 }

@@ -131,14 +131,14 @@ impl FileServer {
     // file-server-proxy 的全量组装形态，见 file_server_userapp::full_router）。
 }
 
-/// 公共中间件栈（body limit → request_id → locale → userApp 分流标记 → 请求日志
-/// → TraceLayer；后添加的层在最外层）。
+/// 公共中间件栈（body limit → request_id → locale → userApp 分流标记 → 绑定目录
+/// → 请求日志 → TraceLayer；后添加的层在最外层）。
 ///
 /// `router()`/`router_container()`/`router_base()` 三形态与 file-server-userapp
 /// 组装的 userapp 子树共用本函数——**单一事实源**，中间件演进只改这里。
 /// 泛型于 state 类型（from_fn 中间件不依赖 state），调用方各自 `with_state`。
-/// `scope_userapp_flag` 对 userapp 子树是 no-op（其 handler 不读该 flag），包含
-/// 无行为差异。
+/// `scope_userapp_flag` / `scope_workspace_dir` 对 userapp 子树是 no-op
+/// （其 handler 不读这两个 task-local），包含无行为差异。
 pub fn apply_common_layers<S: Clone + Send + Sync + 'static>(
     router: Router<S>,
     request_body_limit: usize,
@@ -148,6 +148,7 @@ pub fn apply_common_layers<S: Clone + Send + Sync + 'static>(
         .layer(from_fn(request_id_layer))
         .layer(from_fn(locale_layer))
         .layer(from_fn(crate::extract::scope_userapp_flag))
+        .layer(from_fn(crate::extract::scope_workspace_dir))
         .layer(from_fn(request_log_layer))
         .layer(
             TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {

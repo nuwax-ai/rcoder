@@ -55,11 +55,26 @@ pub struct PushedSkills {
     pub updated: Vec<String>,
 }
 
-/// push-skills 的 workspace 无关核心。
-///
-/// `allow_agent_store`: 是否允许 agent-store 软链分支 (computer 布局 `{root}/{user}/{cid}`
-/// 下 `ws.parent()` 即用户根, 语义成立; userapp 开发卷布局下 parent 是共享卷根,
-/// 该分支不适用, 传 false 一律走 legacy `push_skills_at` 写 `{ws}/.agents/skills`)。
+/// push-skills 参数集 (结构化入参, 避免 too_many_arguments; 同
+/// `PushToStoreParams` / `CreateAgentStoreParams` 惯例)。
+pub struct PushSkillsParams<'a> {
+    /// 会话工作区
+    pub ws: &'a Path,
+    pub cid: &'a str,
+    pub zip_data: Option<&'a TemporaryFile>,
+    pub skill_urls: Vec<String>,
+    pub agent_id: Option<&'a str>,
+    /// 是否允许 agent-store 软链分支 (computer 布局下成立; userapp 开发卷
+    /// 布局 parent 是共享卷根, 传 false 一律走 legacy)
+    pub allow_agent_store: bool,
+    /// agent-store 根锚定 (项目绑定目录场景, 对齐 TS f979df7 `getAgentStorePath`
+    /// ——store 锚定配置根不随绑定漂移); `None` 保持 `ws.parent()` 派生
+    /// (默认布局, 与历史行为逐字节一致)。
+    pub agent_store_root: Option<&'a Path>,
+}
+
+/// push-skills 的 workspace 无关核心（扁平签名, **file-server-userapp 跨 crate
+/// 调用方依赖**; agent-store 根固定 `ws.parent()` 派生）。
 pub async fn push_skills_core(
     state: &AppState,
     ws: &Path,
@@ -69,6 +84,35 @@ pub async fn push_skills_core(
     agent_id: Option<&str>,
     allow_agent_store: bool,
 ) -> Result<PushedSkills, AppError> {
+    push_skills_core_with_store(
+        state,
+        PushSkillsParams {
+            ws,
+            cid,
+            zip_data,
+            skill_urls,
+            agent_id,
+            allow_agent_store,
+            agent_store_root: None,
+        },
+    )
+    .await
+}
+
+/// [`push_skills_core`] 的参数结构变体（computer 侧注入 agent-store 根锚定）。
+pub async fn push_skills_core_with_store(
+    state: &AppState,
+    params: PushSkillsParams<'_>,
+) -> Result<PushedSkills, AppError> {
+    let PushSkillsParams {
+        ws,
+        cid,
+        zip_data,
+        skill_urls,
+        agent_id,
+        allow_agent_store,
+        agent_store_root,
+    } = params;
     if !crate::service::fs_util::path_exists(ws).await? {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -78,7 +122,10 @@ pub async fn push_skills_core(
     let updated = if allow_agent_store && let Some(agent_id) = agent_id {
         let skills_path = ws.join(".agents").join("skills");
         if crate::service::agent_store::is_dir_link(&skills_path) {
-            let user_root = ws.parent().unwrap_or(ws).to_path_buf();
+            let user_root = match agent_store_root {
+                Some(root) => root.to_path_buf(),
+                None => ws.parent().unwrap_or(ws).to_path_buf(),
+            };
             skills_service::push_skills_to_agent_store(skills_service::PushToStoreParams {
                 user_root: &user_root,
                 cid,
@@ -123,23 +170,10 @@ pub async fn push_skills_core(
 /// push-skills 的 workspace 无关实现（computer 域 TS 响应拼装）。
 pub async fn push_skills_impl(
     state: &AppState,
-    ws: &Path,
-    cid: &str,
-    zip_data: Option<&TemporaryFile>,
-    skill_urls: Vec<String>,
-    agent_id: Option<&str>,
-    allow_agent_store: bool,
+    params: PushSkillsParams<'_>,
 ) -> Result<Json<Value>, AppError> {
-    let r = push_skills_core(
-        state,
-        ws,
-        cid,
-        zip_data,
-        skill_urls,
-        agent_id,
-        allow_agent_store,
-    )
-    .await?;
+    let ws_display = params.ws.display().to_string();
+    let r = push_skills_core_with_store(state, params).await?;
     // message 对齐 nuwax pushSkillsToWorkspace: 有 skills → "Pushed N skills: a, b";
     // 无 → "No valid skill directories found in file or skillUrls"
     let message = if r.updated.is_empty() {
@@ -154,7 +188,7 @@ pub async fn push_skills_impl(
     Ok(Json(json!({
         "success": true,
         "message": message,
-        "workspaceRoot": ws.display().to_string(),
+        "workspaceRoot": ws_display,
         "updatedSkills": r.updated,
     })))
 }

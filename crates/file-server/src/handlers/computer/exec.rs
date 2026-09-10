@@ -29,7 +29,13 @@ pub(crate) async fn execute_command(
     Json(body): Json<ExecCommandBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
-    let cwd = ws_path(&state, &body.user_id, &body.c_id).await?;
+    let cwd = ws_path(
+        &state,
+        &body.user_id,
+        &body.c_id,
+        body.workspace_dir.as_deref(),
+    )
+    .await?;
     execute_command_impl(&state, cwd, &body.command).await
 }
 
@@ -51,8 +57,15 @@ pub(crate) async fn get_logs(
     Query(q): Query<GetLogsQuery>,
 ) -> Result<Json<Value>, AppError> {
     q.validate().map_err(crate::error::from_garde)?;
-    let log_dir = resolve_computer_target(&state, &q.user_id, &q.c_id, None)
-        .await?
-        .join(".logs");
+    // 绑定目录优先于 userapp/默认 (收口内); 日志目录跟随工作区: {ws}/.logs (对齐 TS f979df7)
+    let log_dir = resolve_computer_target(
+        &state,
+        &q.user_id,
+        &q.c_id,
+        None,
+        q.workspace_dir.as_deref(),
+    )
+    .await?
+    .join(".logs");
     get_logs_impl(&state, log_dir, q.tail_lines).await
 }

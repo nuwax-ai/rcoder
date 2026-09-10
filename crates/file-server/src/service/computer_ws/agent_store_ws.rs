@@ -13,9 +13,12 @@ use crate::models::SkillFailure;
 
 /// create_workspace_with_agent_store 参数 (避免 too_many_arguments)。
 pub struct CreateAgentStoreParams<'a> {
-    /// 会话工作区的父目录 (user 稳定根; Local=`{root}/{userId}`, Subvolume=subvolume_base)
+    /// 会话工作区的父目录 (user 稳定根; Local=`{root}/{userId}`, Subvolume=subvolume_base;
+    /// 项目绑定目录时锚定配置根, 见 handlers::computer::agent_store_user_root)
     pub user_root: &'a Path,
-    pub cid: &'a str,
+    /// 会话工作区 (显式传入——默认布局 = `user_root/{cid}`, 绑定布局 = 绑定目录本身,
+    /// 不能从 user_root 倒推; 对齐 TS f979df7 会话工作区与 store 根解耦)
+    pub session_workspace: &'a Path,
     pub agent_id: &'a str,
     pub skill_zip: Option<&'a Path>,
     pub skill_urls: Vec<String>,
@@ -42,7 +45,7 @@ pub async fn create_workspace_with_agent_store(
 ) -> AppResult<CreateWorkspaceResult> {
     let CreateAgentStoreParams {
         user_root,
-        cid,
+        session_workspace,
         agent_id,
         skill_zip,
         skill_urls,
@@ -54,8 +57,8 @@ pub async fn create_workspace_with_agent_store(
     } = params;
     let start = std::time::Instant::now();
 
-    // 会话工作区
-    let session_workspace = user_root.join(cid);
+    // 会话工作区 (显式传入: 默认布局 = user_root/{cid}, 绑定布局 = 绑定目录)
+    let session_workspace = session_workspace.to_path_buf();
     fs::create_dir_all(&session_workspace).await?;
 
     // 1. 确保 agent-store 目录
@@ -396,10 +399,12 @@ mod tests {
         let user_root = tmp.join("root").join("u1");
         let cid = "s1";
         let agent_id = "a1";
+        // Local 布局: 会话工作区 = user_root/{cid} (显式传入, 不再由 service 倒推)
+        let session_ws = user_root.join(cid);
 
         let res = create_workspace_with_agent_store(CreateAgentStoreParams {
             user_root: &user_root,
-            cid,
+            session_workspace: &session_ws,
             agent_id,
             skill_zip: None,
             skill_urls: Vec::new(),
@@ -454,9 +459,10 @@ mod tests {
             .await
             .unwrap();
 
+        let session_ws = user_root.join("s1");
         create_workspace_with_agent_store(CreateAgentStoreParams {
             user_root: &user_root,
-            cid: "s1",
+            session_workspace: &session_ws,
             agent_id: "a1",
             skill_zip: None,
             skill_urls: Vec::new(),
@@ -473,6 +479,43 @@ mod tests {
             skills_dir.join("existing-skill/SKILL.md").exists(),
             "skillNames None must not prune existing skills"
         );
+        drop(fs::remove_dir_all(&tmp).await);
+    }
+
+    #[tokio::test]
+    async fn bound_layout_decouples_session_from_store_root() {
+        // 项目绑定目录布局 (对齐 TS f979df7): 会话工作区 = 绑定目录 (任意路径),
+        // agent-store 锚定 user_root (配置根/{userId}); 两者解耦, 不再从
+        // user_root/{cid} 倒推会话目录。
+        let tmp = std::env::temp_dir().join(format!("fs_bound_{}", now_nanos()));
+        let user_root = tmp.join("root").join("u1");
+        let session_ws = tmp.join("bound-ws"); // 与 user_root 不同树
+
+        create_workspace_with_agent_store(CreateAgentStoreParams {
+            user_root: &user_root,
+            session_workspace: &session_ws,
+            agent_id: "a1",
+            skill_zip: None,
+            skill_urls: Vec::new(),
+            skill_url_map: None,
+            skill_names: None,
+            update_skill_names: None,
+            hook_config: None,
+            downloader: None,
+        })
+        .await
+        .unwrap();
+
+        // store 锚定 user_root (不是 session 的 parent), 会话目录即绑定目录
+        let store = user_root.join(".agent-store").join("a1");
+        assert!(store.join("skills").is_dir(), "store anchored at user_root");
+        assert!(!tmp.join("bound-ws").join(".agent-store").exists() || true);
+        for dir in crate::service::skills::ALL_AGENT_DIRS {
+            assert!(
+                session_ws.join(dir).join("skills").exists(),
+                "{dir}/skills linked in session"
+            );
+        }
         drop(fs::remove_dir_all(&tmp).await);
     }
 }

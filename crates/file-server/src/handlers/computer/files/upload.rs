@@ -102,6 +102,7 @@ pub(crate) async fn upload_file(
     let mut cid = None;
     let mut file_path = None;
     let mut custom_target_dir = None;
+    let mut workspace_dir = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
     let mut data = None;
     while let Some(field) = multipart
         .next_field()
@@ -113,6 +114,7 @@ pub(crate) async fn upload_file(
             "cId" => cid = Some(text_field(field).await?),
             "filePath" => file_path = Some(text_field(field).await?),
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
+            "workspaceDir" => workspace_dir = Some(text_field(field).await?),
             "file" => {
                 data = Some(
                     file_field(
@@ -133,8 +135,14 @@ pub(crate) async fn upload_file(
         data,
     };
     let v = fields.into_validated()?;
-    let ws =
-        resolve_computer_target(&state, &v.user_id, &v.cid, custom_target_dir.as_deref()).await?;
+    let ws = resolve_computer_target(
+        &state,
+        &v.user_id,
+        &v.cid,
+        custom_target_dir.as_deref(),
+        workspace_dir.as_deref(),
+    )
+    .await?;
     upload_file_impl(&ws, &v.file_path, v.data).await
 }
 
@@ -150,6 +158,7 @@ pub(crate) async fn upload_files(
     let mut user_id = None;
     let mut cid = None;
     let mut custom_target_dir = None;
+    let mut workspace_dir = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
     let mut file_paths: Vec<String> = Vec::new();
     let mut files_vec = Vec::new();
     while let Some(field) = multipart
@@ -161,6 +170,7 @@ pub(crate) async fn upload_files(
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
+            "workspaceDir" => workspace_dir = Some(text_field(field).await?),
             "filePaths" => file_paths.push(text_field(field).await?),
             "files" => {
                 let original = field.file_name().map(|s| s.to_string());
@@ -183,7 +193,124 @@ pub(crate) async fn upload_files(
     if file_paths.len() != files_vec.len() {
         return Err(AppError::validation("filePaths and files count mismatch"));
     }
-    let ws =
-        resolve_computer_target(&state, &v.user_id, &v.cid, custom_target_dir.as_deref()).await?;
+    let ws = resolve_computer_target(
+        &state,
+        &v.user_id,
+        &v.cid,
+        custom_target_dir.as_deref(),
+        workspace_dir.as_deref(),
+    )
+    .await?;
     upload_files_impl(&ws, &file_paths, &files_vec).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::{
+        AppState, BuildManager, Config, DevServerManager, LocalWorkspaceResolver, LogCacheManager,
+        SkillDownloader, WorkspaceResolver,
+    };
+
+    fn make_state(tmp: &std::path::Path) -> AppState {
+        // 上传临时目录指到测试 tmp (默认 /app/... 在 macOS 不存在)
+        let config = Arc::new(Config {
+            upload_project_dir: tmp.join("upload-tmp"),
+            ..Config::default()
+        });
+        let resolver: Arc<dyn WorkspaceResolver> = Arc::new(LocalWorkspaceResolver::new(
+            config.project_source_dir.clone(),
+            tmp.join("c"),
+        ));
+        AppState {
+            resolver,
+            dev_server: Arc::new(DevServerManager::new(config.clone())),
+            build_manager: Arc::new(BuildManager::new(config.max_build_concurrency)),
+            log_cache: Arc::new(LogCacheManager::new(&config)),
+            skill_downloader: Arc::new(
+                SkillDownloader::new(&config).expect("construct skill downloader"),
+            ),
+            config,
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    /// 手拼 multipart/form-data body (无第三方依赖; 文本字段 + 单文件)。
+    fn multipart_body(
+        boundary: &str,
+        fields: &[(&str, &str)],
+        file_name: &str,
+        file_bytes: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(value.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(file_bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    /// multipart 文本字段 "workspaceDir" 通道: 上传文件落绑定目录 (对齐 TS f979df7,
+    /// 字段名与 TS multer 同名——拼错大小写在此测试报红)。
+    #[tokio::test]
+    async fn upload_file_accepts_workspace_dir_multipart_field() {
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        tokio::fs::create_dir_all(tmp.path().join("upload-tmp"))
+            .await
+            .unwrap();
+        let bound = tmp.path().join("multipart-bound");
+        let state = make_state(tmp.path());
+
+        let app = axum::Router::new()
+            .route("/upload-file", axum::routing::post(upload_file))
+            .with_state(state);
+
+        let boundary = "test-boundary-12345";
+        let body = multipart_body(
+            boundary,
+            &[
+                ("userId", "u"),
+                ("cId", "c"),
+                ("filePath", "nested/uploaded.txt"),
+                ("workspaceDir", &bound.to_string_lossy()),
+            ],
+            "uploaded.txt",
+            b"payload",
+        );
+        let resp = app
+            .oneshot(
+                axum::http::Request::post("/upload-file")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(axum::body::Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let content = tokio::fs::read(bound.join("nested").join("uploaded.txt"))
+            .await
+            .expect("file lands in bound dir");
+        assert_eq!(content, b"payload");
+    }
 }

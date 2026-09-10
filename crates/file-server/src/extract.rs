@@ -1,9 +1,14 @@
 //! HTTP 提取器适配层：把 Axum 原生 rejection 统一映射为 file-server `AppError`。
 //!
-//! 另含 userApp 分流标记（`USERAPP_FLAG`）：`X-Service-Type: userapp` 请求经
-//! 反向代理/rcoder 拦截层透传到容器内，由 [`scope_userapp_flag`] 中间件读 header
-//! 注入 task-local，computer 域 workspace 定位（`ws_path` 等）据此切换到
-//! userApp 开发卷——HTTP 层标记，与 ServiceType 枚举（容器编排层）互不相干。
+//! 另含两个请求级 task-local 标记（中间件 scope 注入）：
+//! - userApp 分流标记（`USERAPP_FLAG`）：`X-Service-Type: userapp` 请求经
+//!   反向代理/rcoder 拦截层透传到容器内，由 [`scope_userapp_flag`] 读 header
+//!   注入，computer 域 workspace 定位（`ws_path` 等）据此切换到 userApp 开发卷
+//!   ——HTTP 层标记，与 ServiceType 枚举（容器编排层）互不相干。
+//! - 项目绑定目录（`WORKSPACE_DIR`，对齐 TS f979df7）：`x-workspace-dir`
+//!   header 的原始值，由 [`scope_workspace_dir`] 注入；与 body/query 的
+//!   `workspaceDir` 字段经 [`merged_workspace_dir`] 合并（header 优先）后由
+//!   computer 域收口 fail-fast 校验。
 
 use axum::extract::multipart::MultipartRejection;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
@@ -14,11 +19,11 @@ use axum::response::{IntoResponse, Response};
 use crate::error::AppError;
 
 // 分流契约常量与 rcoder 转发层共用 shared_types 单一事实源。
-pub use shared_types::{SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP};
+pub use shared_types::{SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP, WORKSPACE_DIR_HEADER};
 
 // ── 请求级 userApp 分流标记 (task_local, 由请求中间件 scope 注入) ────────────────
 tokio::task_local! {
-    static USERAPP_FLAG: bool;
+    pub(crate) static USERAPP_FLAG: bool;
 }
 
 /// 当前请求是否为 userApp 场景（`X-Service-Type: userapp`；task_local 未设置时 false）。
@@ -34,6 +39,48 @@ pub async fn scope_userapp_flag(req: Request, next: axum::middleware::Next) -> R
         .and_then(|v| v.to_str().ok())
         .is_some_and(shared_types::is_userapp_service_type_value);
     USERAPP_FLAG.scope(is_userapp, next.run(req)).await
+}
+
+// ── 请求级绑定目录 (task_local, 存原始 header 值; 对齐 TS f979df7) ───────────────
+tokio::task_local! {
+    pub(crate) static WORKSPACE_DIR: Option<String>;
+}
+
+/// 当前请求 `x-workspace-dir` header 的**原始值**（未校验；中间件外恒 None）。
+///
+/// 校验/归一不在此处做——由收口 [`crate::handlers::computer`]
+/// `computer_root_for_request` 经 [`merged_workspace_dir`] 合并后 fail-fast
+/// （对齐 TS：`resolveServiceContext` 在路由入口校验，非 userapp 域路由不受影响）。
+pub fn workspace_dir_header_raw() -> Option<String> {
+    WORKSPACE_DIR.try_with(|v| v.clone()).ok().flatten()
+}
+
+/// 中间件：读 `x-workspace-dir` header → task-local scope 注入原始值
+/// （header 缺失也 scope `None`，与 `scope_userapp_flag` 恒 scope 形态一致；
+/// 对不消费绑定目录的路由是 no-op）。
+pub async fn scope_workspace_dir(req: Request, next: axum::middleware::Next) -> Response {
+    let raw = req
+        .headers()
+        .get(WORKSPACE_DIR_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    WORKSPACE_DIR.scope(raw, next.run(req)).await
+}
+
+/// 合并绑定目录来源（对齐 TS `resolveServiceContext` 的取值顺序）：
+/// header（trim 非空）> 调用方显式值（body/query 的 `workspaceDir` 字段，trim 非空）。
+///
+/// header 为空白串时落回显式值；两者皆空/缺失 → `None`（未绑定，走默认定位）。
+/// 只做 trim/非空过滤，合法性校验（绝对路径/点段/长度/控制字符）由收口处
+/// [`crate::workspace::normalize_workspace_dir`] fail-fast。
+pub fn merged_workspace_dir(explicit: Option<&str>) -> Option<String> {
+    if let Some(header) = workspace_dir_header_raw().filter(|s| !s.trim().is_empty()) {
+        return Some(header);
+    }
+    explicit
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 pub struct AppJson<T>(pub T);
@@ -181,7 +228,6 @@ mod tests {
             post(|| async { format!("{}", is_userapp_request()) }),
         );
         let app = app.layer(axum::middleware::from_fn(super::scope_userapp_flag));
-
         // 带 X-Service-Type: userapp → handler 内 true
         let resp = app
             .clone()
@@ -220,6 +266,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(to_bytes(resp.into_body(), 1024).await.unwrap(), "false");
+    }
+
+    /// 绑定目录 task-local：中间件 scope 注入原始 header 值（可读、未校验），
+    /// header 缺失时 scope None（handler 内 None）；中间件外恒 None。
+    #[tokio::test]
+    async fn workspace_dir_task_local_scoped_by_middleware() {
+        use super::{merged_workspace_dir, scope_workspace_dir, workspace_dir_header_raw};
+
+        let app = Router::new().route(
+            "/probe",
+            post(|| async {
+                format!(
+                    "{:?}|{:?}",
+                    workspace_dir_header_raw(),
+                    merged_workspace_dir(Some("/from-query"))
+                )
+            }),
+        );
+        let app = app.layer(axum::middleware::from_fn(scope_workspace_dir));
+
+        // 带 x-workspace-dir → 原始值可读 + merge 时压过显式值
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe")
+                    .header(super::WORKSPACE_DIR_HEADER, "/bound/dir")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"Some("/bound/dir")|Some("/bound/dir")"#
+        );
+
+        // header 为空白串 → scope Some(空白) 但 merge 落回显式值（对齐 TS）
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe")
+                    .header(super::WORKSPACE_DIR_HEADER, "   ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"Some("   ")|Some("/from-query")"#
+        );
+
+        // 无 header → scope None + merge 取显式值
+        let resp = app
+            .oneshot(Request::post("/probe").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"None|Some("/from-query")"#
+        );
+    }
+
+    /// merge 优先级（对齐 TS resolveServiceContext：header > body/query > 无）。
+    /// 显式值同样 trim 过滤：空白显式值视为未传。
+    #[test]
+    fn merged_workspace_dir_filters_empty_explicit() {
+        use super::merged_workspace_dir;
+        assert_eq!(merged_workspace_dir(Some("   ")), None);
+        assert_eq!(
+            merged_workspace_dir(Some("  /bound  ")),
+            Some("/bound".to_string())
+        );
+        // 中间件外（无 task_local）显式为空 → None（不 panic）
+        assert_eq!(merged_workspace_dir(None), None);
     }
 
     #[derive(Deserialize)]

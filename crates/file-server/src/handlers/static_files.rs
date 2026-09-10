@@ -83,7 +83,8 @@ pub(crate) async fn serve_page(
         ("user_id" = String, Path, description = "User identifier"),
         ("c_id" = String, Path, description = "Computer workspace identifier"),
         ("rest" = String, Path, description = "Workspace-relative file path"),
-        ("customTargetDir" = Option<String>, Query, description = "Override workspace root")
+        ("customTargetDir" = Option<String>, Query, description = "Override workspace root"),
+        ("workspaceDir" = Option<String>, Query, description = "Bound workspace dir (TS f979df7), takes precedence over default root; customTargetDir wins over it")
     ),
     description = r#"
 以 HTTP 直读 computer 树（两级 `{root}/{user_id}/{cId}` Electron 全局根语义）
@@ -106,11 +107,17 @@ pub(crate) async fn serve_computer(
         return cors_404(&req, &COMPUTER_CORS);
     }
     // userApp 分流与 computer 定位经公共收口（与 ws_path 单头，防两处漂移）
-    let default_root =
-        match super::computer::computer_root_for_request(&state, &user_id, &c_id).await {
-            Ok(root) => root,
-            Err(error) => return error.into_response(),
-        };
+    let default_root = match super::computer::computer_root_for_request(
+        &state,
+        &user_id,
+        &c_id,
+        q.workspace_dir.as_deref(),
+    )
+    .await
+    {
+        Ok(root) => root,
+        Err(error) => return error.into_response(),
+    };
     // customTargetDir 非空 → 完全覆盖根 (对齐 nuwax, 不拼 user/cId);
     // 注: 不做根目录白名单限制 —— 容器内内网部署, 且用户客户端复用本模块逻辑,
     // 每个用户电脑上的路径各不相同, 限制根路径会误伤正常业务。
