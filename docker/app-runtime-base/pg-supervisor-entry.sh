@@ -11,9 +11,9 @@ set -u
 
 PG_BIN=/usr/lib/postgresql/16/bin
 : "${PGDATA:=/home/user/data/pg}"
-: "${POSTGRES_USER:=app}"
-: "${POSTGRES_PASSWORD:=app}"
-: "${POSTGRES_DB:=app}"
+: "${POSTGRES_USER:=dev}"
+: "${POSTGRES_PASSWORD:=dev}"
+: "${POSTGRES_DB:=dev}"
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
     echo "[pg] first-time initdb at $PGDATA"

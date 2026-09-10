@@ -419,8 +419,8 @@ pub(crate) async fn wait_for_pg() -> Result<()> {
     }
     let host = std::env::var("PGHOST").unwrap_or_else(|_| "localhost".into());
     let port = std::env::var("PGPORT").unwrap_or_else(|_| "5432".into());
-    let user = std::env::var("POSTGRES_USER").unwrap_or_else(|_| "app".into());
-    let pwd = std::env::var("POSTGRES_PASSWORD").unwrap_or_else(|_| "app".into());
+    let user = std::env::var("POSTGRES_USER").unwrap_or_else(|_| "dev".into());
+    let pwd = std::env::var("POSTGRES_PASSWORD").unwrap_or_else(|_| "dev".into());
 
     for i in 1..=30u8 {
         let result = Command::new("pg_isready")

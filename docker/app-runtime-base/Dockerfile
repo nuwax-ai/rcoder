@@ -198,12 +198,13 @@ RUN mkdir -p /app/code /app/config /home/user/data /home/user/logs /run/app-cli/
 
 # PG / dbx-web / workspace 默认配置(可被 UserApp env 覆盖——rcoder 创建
 # 容器时注入 USERAPP_WORKSPACE_DIR=/home/user/{app_id} 等；此层默认=本地直跑语义)
-# POSTGRES_PASSWORD 不设默认(敏感),由 UserApp env 提供;start-app.sh 兜底 "app"
+# PG 默认凭证 dev/dev/dev(与 agent-runner 对齐;仅首次 initdb 生效,存量 PGDATA 不受影响)
 # DBX_PASSWORD 同理不设默认:首访浏览器自设(存 DBX_DATA_DIR/dbx.db),需固定密码时注入 env。
 # USERAPP_WORKSPACE_DIR 默认 /app 兼作 supervisor conf %(ENV_…)s 展开的必存锚。
 ENV PGDATA=/home/user/data/pg \
-    POSTGRES_USER=app \
-    POSTGRES_DB=app \
+    POSTGRES_USER=dev \
+    POSTGRES_PASSWORD=dev \
+    POSTGRES_DB=dev \
     DBX_PORT=4224 \
     DBX_STATIC_DIR=/usr/local/share/dbx/static \
     DBX_DATA_DIR=/home/user/data/dbx \

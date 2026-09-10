@@ -14,9 +14,9 @@ set -e
 WS="${USERAPP_WORKSPACE_DIR:-/app}"
 
 export PGDATA="${PGDATA:-/home/user/data/pg}"
-export POSTGRES_USER="${POSTGRES_USER:-app}"
-export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-app}"
-export POSTGRES_DB="${POSTGRES_DB:-app}"
+export POSTGRES_USER="${POSTGRES_USER:-dev}"
+export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-dev}"
+export POSTGRES_DB="${POSTGRES_DB:-dev}"
 
 # dbx-web(DBX 数据库 Web GUI):默认配置导出,supervisor [program:dbx] 继承。
 # 面板免登(DBX_DISABLE_PASSWORD=1,supervisor conf 注入)+ local-pg 预置连接
