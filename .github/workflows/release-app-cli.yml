@@ -110,6 +110,7 @@ jobs:
 
       - name: Install protoc + nasm (Windows)
         if: runner.os == 'Windows'
+        shell: bash
         run: |
           choco install protoc nasm -y --no-progress
           echo "C:\Program Files\NASM" >> "$GITHUB_PATH"
@@ -119,8 +120,11 @@ jobs:
         if: matrix.zig
         run: pip3 install ziglang cargo-zigbuild
 
+      # shell: bash 必须显式——Windows 默认 PowerShell 解析不了 bash 语法
+      #（Linux/macOS 默认 bash 不受影响）
       - name: Build app-cli
         working-directory: crates/app-cli
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
           USE_ZIG: ${{ matrix.zig }}
@@ -133,6 +137,7 @@ jobs:
 
       - name: Smoke test binary --version
         working-directory: crates/app-cli
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -151,6 +156,7 @@ jobs:
       # 各平台文件名不冲突（原名同为 app-cli 会互相覆盖）。
       - name: Rename binary for artifact
         working-directory: crates/app-cli
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: |
