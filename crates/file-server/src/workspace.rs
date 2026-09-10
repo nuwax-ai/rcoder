@@ -530,6 +530,23 @@ mod tests {
     }
 
     #[test]
+    fn normalize_workspace_dir_de_verbatims_windows_extended_length() {
+        // Windows verbatim（\\?\ 扩展长度路径）de-verbatim：剥前缀产出可用路径
+        // （Electron 客户端长路径场景）；消费方拿到的归一化值在 Windows fs 可用
+        assert_eq!(
+            normalize_workspace_dir(r"\\?\C:\Users\dev\proj").expect("verbatim drive"),
+            "C:/Users/dev/proj"
+        );
+        assert_eq!(
+            normalize_workspace_dir(r"\\?\UNC\server\share\p").expect("verbatim unc"),
+            "//server/share/p"
+        );
+        // 非法 verbatim / 设备命名空间显式拒绝
+        assert!(normalize_workspace_dir(r"\\?\foo\bar").is_err());
+        assert!(normalize_workspace_dir(r"\\.\PhysicalDrive0").is_err());
+    }
+
+    #[test]
     fn normalize_workspace_dir_rejects_invalid() {
         // 相对路径 / 裸盘符（无斜杠）
         assert!(normalize_workspace_dir("a/b").is_err());

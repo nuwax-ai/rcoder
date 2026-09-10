@@ -336,6 +336,22 @@ mod tests {
     }
 
     #[test]
+    fn computer_agent_runner_windows_verbatim_prefix_verbatim() {
+        // Windows verbatim 扩展长度路径（\\?\ 前缀，Electron/Win32 API 长路径产物）：
+        // 校验层 de-verbatim 判定合法后，raw 值原样作为工作目录——
+        // PathBuf::from 在 Windows std 本就是合法 verbatim 绝对路径
+        let raw = r"\\?\C:\Users\dev\proj";
+        let dir = resolve_project_dir(
+            &ServiceType::ComputerAgentRunner,
+            "13",
+            None,
+            Some(raw),
+            "/tmp/ws",
+        );
+        assert_eq!(dir, std::path::PathBuf::from(raw));
+    }
+
+    #[test]
     fn web_agent_runner_semantics_unchanged() {
         // 单级：./project_workspace/{work_dir_id}（测试环境无 TENANT_ID/SPACE_ID，
         // 有则跳过避免 flaky；app_id 不参与 web 路径）

@@ -137,10 +137,12 @@ pub struct ComputerChatRequest {
     /// 1. **单段目录名**（原语义）：容器内工作目录为 `/home/user/{agent_work_dir}`，
     ///    未提供时使用 project_id
     /// 2. **绝对路径**（常规项目场景，跨平台字符串规则：POSIX `/a/b`、Windows
-    ///    `X:/a/b`、UNC `//s/a`；拒 `.`/`..` 段）：Java 传子容器内用户维度路径
-    ///    `/home/user/{projectType}/{projectId}`，agent 以此为会话 cwd。
-    ///    仅默认（用户维度）隔离支持——pod_id/tenant/space 与之组合会被拒绝；
-    ///    `/home/user` 前缀会在主容器挂载卷预创建对应目录，其余前缀由容器内创建
+    ///    盘符 `X:/a/b`、UNC `//s/a`，识别并原样透传 Windows verbatim
+    ///    `\\?\C:\a\b` / `\\?\UNC\s\a` 扩展长度路径；均拒 `.`/`..` 段）：Java 传
+    ///    子容器内用户维度路径 `/home/user/{projectType}/{projectId}`，agent 以此
+    ///    为会话 cwd。仅默认（用户维度）隔离支持——pod_id/tenant/space 与之组合
+    ///    会被拒绝；`/home/user` 前缀会在主容器挂载卷预创建对应目录，其余前缀
+    ///    由容器内创建
     ///
     /// 📋 Java 配套契约：chat 传绝对 agent_work_dir 后，后续 `/api/computer/*`
     /// 文件族接口（get-logs、execute-command 等）须以 `workspaceDir`

@@ -43,7 +43,8 @@ pub struct ChatRequest {
     /// 🆕 自定义工作目录（可选，替代 project_id 参与工作目录拼接）。两形态：
     ///
     /// 1. 单段目录名（原语义）；
-    /// 1. 绝对路径（跨平台字符串规则：POSIX /a/b、Windows X:/a/b、UNC //s/a），
+    /// 1. 绝对路径（跨平台字符串规则：POSIX /a/b、Windows X:/a/b、UNC //s/a，
+    ///    识别并原样透传 Windows verbatim \\?\C:\a\b / \\?\UNC\s\a 扩展长度路径），
     ///    常规项目场景 Java 传子容器内 /home/user/{projectType}/{projectId}。
     ///    绝对路径形态仅 service_type=ComputerAgentRunner 支持，其余显式拒绝
     #[prost(string, optional, tag = "14")]

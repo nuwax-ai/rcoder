@@ -79,6 +79,12 @@ pub static IDENTIFIER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLoc
 // 首个消费方为 file-server 的项目绑定目录 workspaceDir（TS nuwax-file-server
 // 同构契约）与 agent_work_dir 绝对路径形态（/computer/chat 常规项目场景）；
 // app-cli / file-server-proxy 等多平台 crate 后续可复用。
+//
+// ⚠️ TS 待同步锚点：verbatim（\\?\）de-verbatim 处理是 Rust 侧先行修复——
+// TS nuwax-file-server src/utils/computer/workspaceContext.js 的 canonicalizeDir
+// （~:113）同款盲区（\\?\ 被折叠成 //?/ 产出 Windows 非法路径形态），需按
+// strip_verbatim 同规则补齐（\\?\C:\x → C:\x、\\?\UNC\s\a → \\s\a、非法
+// verbatim / \\.\ 设备路径显式拒绝），保持两上游灰度切流行为同构。
 
 /// 绑定目录/工作目录绝对路径长度上限（对齐 TS `normalizeWorkspaceDir` 的 512）。
 pub const ABSOLUTE_DIR_MAX_LEN: usize = 512;
@@ -89,13 +95,22 @@ pub const ABSOLUTE_DIR_MAX_LEN: usize = 512;
 pub const AGENT_WORK_DIR_MAX_SEGMENTS: usize = 8;
 
 /// 判断字符串是否为绝对路径形态（跨平台字符串规则，非宿主语义）：
-/// POSIX `/a/b`、Windows 盘符 `X:/a/b`（含反斜杠 `X:\a\b` 原始形态）或
-/// UNC `//server/share`。
+/// POSIX `/a/b`、Windows 盘符 `X:/a/b`（含反斜杠 `X:\a\b` 原始形态）、
+/// UNC `//server/share`，以及 Windows verbatim 扩展长度路径
+/// `\\?\C:\a\b` / `\\?\UNC\server\share`。
 ///
-/// 判定前做与 [`normalize_absolute_dir`] 同款的 trim + 分隔符归一，保证
-/// `is_absolute_path_like(x)` 与 normalize 的绝对判定一致。
+/// 判定前做与 [`normalize_absolute_dir`] 同款的 trim + verbatim 剥离 +
+/// 分隔符归一，保证 `is_absolute_path_like(x)` 与 normalize 的绝对判定一致。
+/// 非法 verbatim（`\\?\foo` 无盘符非 UNC）与设备命名空间（`\\.\`）返回
+/// false——不是合法绝对路径形态。
 pub fn is_absolute_path_like(value: &str) -> bool {
-    let collapsed = canonicalize_dir(value.trim());
+    let trimmed = value.trim();
+    let effective = match strip_verbatim(trimmed) {
+        Ok(Some(inner)) => inner,
+        Ok(None) => std::borrow::Cow::Borrowed(trimmed),
+        Err(_) => return false,
+    };
+    let collapsed = canonicalize_dir(&effective);
     collapsed.starts_with('/') || is_drive_form(&collapsed)
 }
 
@@ -103,6 +118,10 @@ pub fn is_absolute_path_like(value: &str) -> bool {
 /// nuwax-file-server f979df7；规则自 file-server workspace.rs 原样提取）：
 ///
 /// - trim 后长度 ≤ 512；无控制字符（`\x00`-`\x1f`、`\x7f`）
+/// - Windows verbatim 扩展长度路径 de-verbatim：`\\?\C:\x` → `C:/x`、
+///   `\\?\UNC\s\a` → `//s/a`（产出可用路径——verbatim 形态只认反斜杠且按
+///   字面处理，归一化输出若保留 `//?/` 前缀在 Windows 上是非法路径）；
+///   非法 verbatim（内层无盘符非 UNC）与设备命名空间 `\\.\` 显式拒绝
 /// - 分隔符归一：`\`→`/`、连续 `/` 折叠、UNC 前导 `//` 保留、盘符首字母大写
 /// - 必须绝对路径（`/` 开头或 `X:/` 盘符形态）
 /// - 不得含 `.` / `..` 段（fail-fast 拒绝，不静默归一）
@@ -118,11 +137,15 @@ pub fn is_absolute_path_like(value: &str) -> bool {
 /// 须拒绝"的 fail-fast 语义冲突。TS/Rust 两侧行为须同构（TS 校验刻意平台
 /// 无关），故此处为纯字符串实现。
 ///
+/// 已知非目标：正斜杠 `//?/C:/x` 不识别为 verbatim（非合法 Win32 verbatim
+/// 形态、现实调用方不产生），与非 verbatim 输入同路径处理。
+///
 /// 返回规范化后的路径（调用方以返回值为准，勿继续用原始输入）。
 pub fn normalize_absolute_dir(raw: &str, field_name: &str) -> Result<String, String> {
     let dir = raw.trim();
     // JS `.length` 计 UTF-16 单元，此处取 Unicode 标量数——补充字符边缘有差异
-    // （emoji JS 计 2、此处计 1），不影响 ASCII 路径。
+    // （emoji JS 计 2、此处计 1），不影响 ASCII 路径。长度按剥 verbatim 前缀前
+    // 的原文计（与 TS 入口先查长度一致）。
     if dir.chars().count() > ABSOLUTE_DIR_MAX_LEN {
         return Err(format!("{field_name} length exceeds 512"));
     }
@@ -132,7 +155,14 @@ pub fn normalize_absolute_dir(raw: &str, field_name: &str) -> Result<String, Str
     }) {
         return Err(format!("{field_name} contains illegal characters"));
     }
-    let dir = canonicalize_dir(dir);
+    // verbatim 剥离在 canonicalize 之前——先剥 `\\?\` 再归一分隔符，
+    // 否则 `\\?\` 被折叠成 `//?/` 产出 Windows 非法形态
+    let effective = match strip_verbatim(dir) {
+        Ok(Some(inner)) => inner,
+        Ok(None) => std::borrow::Cow::Borrowed(dir),
+        Err(e) => return Err(format!("{field_name} {e}")),
+    };
+    let dir = canonicalize_dir(&effective);
     if !(dir.starts_with('/') || is_drive_form(&dir)) {
         return Err(format!(
             "{field_name} must be an absolute path (POSIX /a/b, Windows C:/a/b or UNC //server/share/a/b)"
@@ -177,6 +207,52 @@ fn canonicalize_dir(dir: &str) -> String {
         collapsed[0..1].make_ascii_uppercase();
     }
     collapsed
+}
+
+/// 识别并剥离 Windows verbatim 扩展长度路径前缀（`\\?\`），作用于 **trim 后、
+/// canonicalize 前**的字符串——顺序不可换：先归一分隔符会把 `\\?\` 折叠成
+/// `//?/`，产出 Windows 上非法的路径形态（verbatim 只认反斜杠且按字面处理）。
+///
+/// 返回：
+/// - `Ok(None)`：非 verbatim 输入，调用方走原路径
+/// - `Ok(Some(inner))`：合法 verbatim，inner 为剥前缀后的内层（UNC 形态已补回
+///   双反斜杠）——盘符分支借用输入零拷贝，UNC 分支重建字符串
+/// - `Err(msg)`：以 `\\?\` 开头但内层无盘符非 UNC（含裸前缀、双重前缀），或
+///   设备命名空间 `\\.\`（现状靠点段检查碰巧拒绝，此处显式化）
+///
+/// 前缀只认反斜杠形态；正斜杠 `//?/` 非合法 Win32 verbatim（现实调用方不
+/// 产生），不识别。`\\?\UNC` 匹配含尾分隔符的 9 字符且 `UNC` 大小写不敏感
+/// （防 `\\?\UNCserver\share` 误判为 UNC）。
+fn strip_verbatim(trimmed: &str) -> Result<Option<std::borrow::Cow<'_, str>>, String> {
+    if let Some(rest) = trimmed.strip_prefix(r"\\?\") {
+        // \\?\UNC\server\share → \\server\share：
+        // strip_prefix 已剥 \\?\（4 字符），此处再剥 UNC\（4 字符）、前补 \\，
+        // 等价于剥 9 字符 \\?\UNC\——无三反斜杠中间态，后续 canonicalize_dir
+        // 对 \\ 前缀走 UNC 保留分支。
+        // UNC 匹配用**字节切片**比较：str 切片 rest[..3] 在多字节 UTF-8 序列上
+        // 会 panic（char boundary violation，如 \\?\é中），畸形输入不得炸校验层
+        let rest_bytes = rest.as_bytes();
+        if rest_bytes.len() >= 4
+            && rest_bytes[..3].eq_ignore_ascii_case(b"UNC")
+            && rest_bytes[3] == b'\\'
+        {
+            // 前三字节已证为 ASCII（UNC），&rest[4..] 字符边界安全
+            let after_unc = &rest[4..];
+            return Ok(Some(std::borrow::Cow::Owned(format!(r"\\{after_unc}"))));
+        }
+        // 盘符内层：X:\... 或 x:/...（字母 + :，大小写不限；有无根由后续
+        // 绝对形态判定兜底——如 \\?\C: 剥后 C: 非 X:/ 形态被拒）
+        if rest_bytes.len() >= 2 && rest_bytes[0].is_ascii_alphabetic() && rest_bytes[1] == b':' {
+            return Ok(Some(std::borrow::Cow::Borrowed(rest)));
+        }
+        return Err(
+            "verbatim prefix \\\\?\\ must be followed by a drive letter or UNC".to_string(),
+        );
+    }
+    if trimmed.starts_with(r"\\.\") {
+        return Err("device namespace paths (\\\\.\\) are not supported".to_string());
+    }
+    Ok(None)
 }
 
 /// 校验 `agent_work_dir`（/computer/chat 等对话接口的工作目录入参），两种形态：
@@ -353,6 +429,111 @@ mod tests {
         for bad in ["a/b", "abc", "web/p1", "C:", "a\\b", "", "  "] {
             assert!(!is_absolute_path_like(bad), "{bad:?}");
         }
+    }
+
+    // ── Windows verbatim（\\?\）de-verbatim ──────────────────────────────
+
+    #[test]
+    fn normalize_absolute_dir_de_verbatims_drive_form() {
+        assert_eq!(
+            normalize_absolute_dir(r"\\?\C:\Users\dev\proj", "f").expect("verbatim drive"),
+            "C:/Users/dev/proj"
+        );
+        assert_eq!(
+            normalize_absolute_dir(r"\\?\c:/x", "f").expect("lowercase drive"),
+            "C:/x"
+        );
+        // 盘根 / 尾随分隔（与非 verbatim 输入同款行为）
+        assert_eq!(
+            normalize_absolute_dir(r"\\?\C:\", "f").expect("drive root"),
+            "C:/"
+        );
+        assert_eq!(
+            normalize_absolute_dir(r"\\?\C:\x\", "f").expect("trailing sep"),
+            "C:/x/"
+        );
+    }
+
+    #[test]
+    fn normalize_absolute_dir_de_verbatims_unc_form() {
+        assert_eq!(
+            normalize_absolute_dir(r"\\?\UNC\server\share\p", "f").expect("verbatim unc"),
+            "//server/share/p"
+        );
+        // 混合分隔 + 小写 unc 关键字（大小写不敏感）
+        assert_eq!(
+            normalize_absolute_dir(r"\\?\unc\server/share\p", "f").expect("mixed sep unc"),
+            "//server/share/p"
+        );
+        // 缺 share 不收紧（与非 verbatim 输入 //server 的既有放行一致，TS 同款）
+        assert_eq!(
+            normalize_absolute_dir(r"\\?\UNC\server", "f").expect("unc no share"),
+            "//server"
+        );
+    }
+
+    #[test]
+    fn normalize_absolute_dir_rejects_invalid_verbatim() {
+        // 内层无盘符非 UNC / 双重前缀 / 裸前缀 / 设备命名空间 / 点段
+        assert!(normalize_absolute_dir(r"\\?\foo\bar", "f").is_err());
+        assert!(normalize_absolute_dir(r"\\?\\?\C:\x", "f").is_err());
+        assert!(normalize_absolute_dir(r"\\?\", "f").is_err());
+        assert!(normalize_absolute_dir(r"\\?\UNCserver\share", "f").is_err()); // UNC 后无分隔符
+        assert!(normalize_absolute_dir(r"\\.\PhysicalDrive0", "f").is_err());
+        assert!(normalize_absolute_dir(r"\\?\C:\a\..\b", "f").is_err());
+        // \\?\C:（无根）剥后非 X:/ 形态，由绝对判定拒绝
+        assert!(normalize_absolute_dir(r"\\?\C:", "f").is_err());
+    }
+
+    /// panic 回归锚：`\\?\` 后跟多字节 UTF-8 序列时，UNC 匹配的字节切片比较
+    /// 不得触发 char boundary panic（str 切片 rest[..3] 在 é中/🦀 等序列上会炸）
+    #[test]
+    fn verbatim_with_multibyte_inner_does_not_panic() {
+        // é(2字节)+中(3字节)：字节 3 边界落在「中」的中间
+        assert!(normalize_absolute_dir(r"\\?\é中", "f").is_err());
+        assert!(!is_absolute_path_like(r"\\?\é中"));
+        assert!(validate_agent_work_dir(r"\\?\é中").is_err());
+        // 🦀(4字节) 开头：字节 3 边界落在 emoji 中间；UNC 假阳性形态同测
+        assert!(normalize_absolute_dir(r"\\?\🦀UNC\x", "f").is_err());
+        assert!(normalize_absolute_dir(r"\\?\🦀", "f").is_err());
+        // 中文目录段（非 ASCII 但合法路径成分）不 panic——首字节非盘符即 Err
+        assert!(normalize_absolute_dir(r"\\?\中文\目录", "f").is_err());
+    }
+
+    #[test]
+    fn normalize_absolute_dir_verbatim_unc_empty_tail() {
+        // \\?\UNC\（空剩余）→ Ok("//")：与非 verbatim 输入 // 的既有放行一致
+        assert_eq!(
+            normalize_absolute_dir(r"\\?\UNC\", "f").expect("verbatim unc empty"),
+            "//"
+        );
+    }
+
+    #[test]
+    fn is_absolute_path_like_handles_verbatim() {
+        // 合法 verbatim（盘符/UNC）→ true
+        assert!(is_absolute_path_like(r"\\?\C:\Users\dev\proj"));
+        assert!(is_absolute_path_like(r"\\?\UNC\server\share\p"));
+        // 非法 verbatim / 设备命名空间 → false（不是合法绝对路径形态）
+        assert!(!is_absolute_path_like(r"\\?\foo\bar"));
+        assert!(!is_absolute_path_like(r"\\.\PhysicalDrive0"));
+        // 非 verbatim 的 UNC 不受影响
+        assert!(is_absolute_path_like(r"\\srv\share\a"));
+    }
+
+    #[test]
+    fn validate_agent_work_dir_verbatim_segments_count_inner() {
+        // 段数按剥前缀后的内层计（? 幽灵段消失）：C:,a..g = 8 段 Ok
+        let ok = r"\\?\C:\a\b\c\d\e\f\g";
+        assert!(validate_agent_work_dir(ok).is_ok(), "{ok}");
+        // 9 段超上限
+        let too_deep = r"\\?\C:\a\b\c\d\e\f\g\h";
+        assert!(validate_agent_work_dir(too_deep).is_err());
+        // 合法 verbatim 整体过校验（调用方以 raw 值透传，Windows 下作 cwd）
+        assert!(validate_agent_work_dir(r"\\?\C:\Users\dev\proj").is_ok());
+        assert!(validate_agent_work_dir(r"\\?\UNC\server\share\p").is_ok());
+        // 非法 verbatim 拒绝
+        assert!(validate_agent_work_dir(r"\\?\foo\bar").is_err());
     }
 
     // ── validate_agent_work_dir：两形态分派 ──────────────────────────────

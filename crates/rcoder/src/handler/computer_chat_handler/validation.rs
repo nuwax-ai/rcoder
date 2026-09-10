@@ -257,6 +257,20 @@ mod tests {
         }
     }
 
+    /// Windows verbatim（合法形态）同样按绝对路径参与隔离拒绝门——
+    /// is_absolute_path_like 对 verbatim 返回 true 的回归锚
+    #[test]
+    fn verbatim_work_dir_rejected_with_tenant_isolation() {
+        let mut req = request_with_work_dir(Some(r"\\?\C:\Users\dev\proj"));
+        req.isolation_type = Some("tenant".to_string());
+        req.tenant_id = Some("t1".to_string());
+        req.space_id = Some("s1".to_string());
+        assert!(matches!(
+            validate_and_prepare_request(&mut req, "zh-CN"),
+            Err(ChatFlowExit::Response(_))
+        ));
+    }
+
     /// 绝对路径 + pod_id 共享容器 → 拒绝（pod_id 挂载层级 {tid}/{sid}/{pod_id}，
     /// 同样非用户维度）
     #[test]
