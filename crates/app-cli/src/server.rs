@@ -20,6 +20,7 @@
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
+use shared_types::AppCliDeployPhase;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::CliArgs;
@@ -60,13 +61,8 @@ pub enum ServerPhase {
 
 impl ServerPhase {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            ServerPhase::Idle => "idle",
-            ServerPhase::Deploying => "deploying",
-            ServerPhase::Orchestrating => "orchestrating",
-            ServerPhase::Running => "running",
-            ServerPhase::Failed(_) => "failed",
-        }
+        // wire 值单一事实源在 shared_types（消费方 app_manager 同枚举判据）
+        AppCliDeployPhase::from(self).as_str()
     }
 
     /// /ready 判定（Idle=基础设施就绪；Running=bridge readiness；其余摘流）。
@@ -92,14 +88,29 @@ pub struct DeployRequest {
     pub sha256: Option<String>,
 }
 
-/// 部署进度快照（/v1/deploy/status 响应体）。
+/// 部署进度快照（/v1/deploy/status 响应体）。`phase` 为共享 wire 枚举
+/// （rcoder 侧同枚举穷尽 match，新增相位编译期强制同步决策）。
 #[derive(Debug, Clone, Default, serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct DeployStatus {
-    pub phase: String,
+    pub phase: AppCliDeployPhase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// 内部状态机 → wire 相位（穷尽：新增 `ServerPhase` 变体时编译错，
+/// 强制同步 wire 契约；`Failed` 的 error 负载走 `DeployStatus.error`）。
+impl From<&ServerPhase> for AppCliDeployPhase {
+    fn from(phase: &ServerPhase) -> Self {
+        match phase {
+            ServerPhase::Idle => AppCliDeployPhase::Idle,
+            ServerPhase::Deploying => AppCliDeployPhase::Deploying,
+            ServerPhase::Orchestrating => AppCliDeployPhase::Orchestrating,
+            ServerPhase::Running => AppCliDeployPhase::Running,
+            ServerPhase::Failed(_) => AppCliDeployPhase::Failed,
+        }
+    }
 }
 
 impl ServerState {
@@ -110,7 +121,7 @@ impl ServerState {
             release: RwLock::new(None),
             ready,
             deploy_status: RwLock::new(DeployStatus {
-                phase: ServerPhase::Idle.as_str().to_string(),
+                phase: AppCliDeployPhase::Idle,
                 ..Default::default()
             }),
             deploy_tx,
@@ -129,7 +140,7 @@ impl ServerState {
         *guard = phase.clone();
         drop(guard);
         let mut status = self.deploy_status.write().expect("deploy status lock");
-        status.phase = phase.as_str().to_string();
+        status.phase = AppCliDeployPhase::from(&phase);
         if let ServerPhase::Failed(err) = &phase {
             status.error = Some(err.clone());
         }
@@ -226,8 +237,10 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
         }
     });
 
-    // 启动部署判定（换 Pod 模式）：env 三元组在位且 code 缺失 → 首次部署；
-    // lock 已在（卷上既有部署——Pod 重建/marker 幂等命中）→ 直接编排恢复。
+    // 启动部署判定（换 Pod 模式的部署种子）：env 三元组在位 → Deploying 相位
+    // 执行完整部署段（下载/校验/解压/换 code；卷上已有同代 code 时 marker
+    // 幂等命中秒过——Pod 重建场景）；lock 已在但 env 不在（deploy_stage 时代
+    // 的既有部署）→ 直接编排恢复，跳过 Deploying。
     let mut first_request: Option<InitialAction> = None;
     if crate::deploy::deploy_requested() {
         match crate::deploy::request_from_env() {
@@ -469,6 +482,45 @@ mod tests {
 
     fn state() -> ServerState {
         ServerState::new(RuntimeStatusService::default())
+    }
+
+    /// 内部状态机 → wire 相位转换矩阵：as_str 委托共享枚举，Failed 负载
+    /// 丢弃（error 走 DeployStatus.error 独立字段）。新增 ServerPhase 变体
+    /// 时 From 实现编译错强制同步本矩阵。
+    #[test]
+    fn server_phase_to_wire_phase_matrix() {
+        let cases = [
+            (ServerPhase::Idle, AppCliDeployPhase::Idle),
+            (ServerPhase::Deploying, AppCliDeployPhase::Deploying),
+            (ServerPhase::Orchestrating, AppCliDeployPhase::Orchestrating),
+            (ServerPhase::Running, AppCliDeployPhase::Running),
+            (
+                ServerPhase::Failed("boom".to_string()),
+                AppCliDeployPhase::Failed,
+            ),
+        ];
+        for (phase, wire) in cases {
+            assert_eq!(AppCliDeployPhase::from(&phase), wire);
+            assert_eq!(phase.as_str(), wire.as_str());
+        }
+    }
+
+    /// set_phase 同步 deploy_status：phase 即时反映 + Failed 附 error 快照。
+    #[test]
+    fn set_phase_updates_deploy_status_snapshot() {
+        let st = state();
+        st.set_phase(ServerPhase::Deploying);
+        {
+            let status = st.deploy_status.read().expect("deploy status lock");
+            assert_eq!(status.phase, AppCliDeployPhase::Deploying);
+            assert_eq!(status.error, None);
+        }
+        st.set_phase(ServerPhase::Failed("download 404".to_string()));
+        {
+            let status = st.deploy_status.read().expect("deploy status lock");
+            assert_eq!(status.phase, AppCliDeployPhase::Failed);
+            assert_eq!(status.error.as_deref(), Some("download 404"));
+        }
     }
 
     #[test]

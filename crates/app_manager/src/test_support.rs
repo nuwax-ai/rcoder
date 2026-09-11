@@ -25,7 +25,8 @@ use crate::service::AppService;
 /// get_container_app_dir 因此落到 `workspace_root/{app_id}`，测试用 tempdir 承接）。
 /// `specs` 预置 app 的 live desired 快照（get_app_container_spec 回退测试用；缺省空快照）。
 /// `deployments` 预置 app 运行时状态（query_apps/list 过滤测试用；缺省空列表）。
-/// `status_fails` 注入 get_deployment_status 的瞬时后端错误（wait_app_ready 容错测试）。
+/// `status_fails` 注入 get_deployment_status 的瞬时后端错误（查询链容错测试；
+/// 历史用途 wait_app_ready 已退役，现有消费者见 purge 链不缺席测试）。
 #[derive(Default)]
 pub(crate) struct MockRuntime {
     pub delete_calls: AtomicUsize,
@@ -35,7 +36,8 @@ pub(crate) struct MockRuntime {
     pub create_calls: AtomicUsize,
     pub create_fails: AtomicBool,
     pub status_fails: AtomicUsize,
-    /// start_app（scale>0）后 phase 停在 Error：模拟新版本启动即崩（就绪失败测试）。
+    /// start_app（scale>0）后 phase 停在 Error：模拟新版本启动即崩（部署段
+    /// 等待器的 Error 态快速失败测试用）。
     pub crash_on_start: AtomicBool,
     pub specs: DashMap<String, ContainerSpecSnapshot>,
     pub deployments: DashMap<String, DeploymentStatus>,
@@ -178,8 +180,8 @@ impl UserAppDeploymentRuntime for MockRuntime {
             status.phase = if replicas == 0 {
                 "Stopped"
             } else if self.crash_on_start.load(Ordering::SeqCst) {
-                // 注入"启动即崩"：start_app 后 phase=Error，activate 的 wait_app_ready
-                // 首个轮询即失败（无竞态地构造就绪失败场景）。
+                // 注入"启动即崩"：start_app 后 phase=Error，部署段等待器
+                //（wait_deploy_stage）首个轮询即失败（无竞态地构造失败场景）。
                 "Error"
             } else {
                 "Running"

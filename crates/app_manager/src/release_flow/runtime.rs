@@ -1,14 +1,13 @@
 //! 发布激活的运行时编排（自 rcoder/userapp_publish/app_lifecycle 下沉）：
-//! ensure_app_runtime（幂等建/取运行单元）+ wait_app_ready（轮询就绪）。
+//! ensure_app_runtime（幂等建/取运行单元）。
 //!
-//! activate_release 单接口语义（切流→ensure 容器→等就绪→提交/失败）的组成部分；
-//! 仅被 releases.rs 消费，不放 AppServiceTrait（内部实现细节）。
-
-use std::time::Duration;
+//! 历史的 wait_app_ready（轮询 readiness 转-ready，300s）已退役：部署链的
+//! 同步等待点前移到部署段完成（[`crate::lifecycle`] 的 wait_deploy_stage，
+//! 轮询容器内 app-cli `/v1/deploy/status`）；readiness 探针仅负责 K8s 摘流。
 
 use tracing::info;
 
-use crate::models::commons::{AppStatus, ExposeType, HealthCheckType};
+use crate::models::commons::{ExposeType, HealthCheckType};
 use crate::models::{AppOperationError, CreateAppRequest, HealthCheckConfig, PortConfig};
 use crate::service::AppService;
 
@@ -20,10 +19,6 @@ const APP_CLI_ADMIN_PORT: u16 = shared_types::APP_CLI_ADMIN_PORT;
 /// app-cli 提供的探针路径（liveness=进程活，readiness=初始化完成/可选桥接后端）。
 const APP_LIVENESS_PATH: &str = "/health";
 const APP_READINESS_PATH: &str = "/ready";
-/// 就绪轮询间隔。
-const READY_POLL_INTERVAL_SECS: u64 = 3;
-/// 就绪等待默认超时秒数（activate 请求体 readinessTimeoutSeconds 可覆盖，范围 5..=1800）。
-pub(crate) const DEFAULT_READY_TIMEOUT_SECS: u64 = 300;
 
 impl AppService {
     /// 确保 app 计算单元存在：不存在则 create_app（幂等；image/ports 首次设定后恒定）。
@@ -105,67 +100,5 @@ impl AppService {
         self.create_app_locked(rcoder_app_id, request, process_lock)
             .await
             .map(|_| ())
-    }
-
-    /// 轮询 app 到 status=Running 且 health 非 Unhealthy；超时或进入 Error 则失败
-    /// （activate 就绪窗口）。超时秒数由调用方传入（activate 请求体，已校验范围）。
-    ///
-    /// 容错：后端瞬时错误（API 抖动/网络瞬断）在就绪预算内记日志继续轮询——单次
-    /// 抖动不耗尽整个预算；但**连续** [`MAX_CONSECUTIVE_POLL_ERRORS`] 次失败判死
-    /// （持续性故障如网络分区/RBAC 配错不该拖满整个预算才失败，最长 1800s）。
-    /// `NotFound` 是"发布期间应用被用户删除"——等就绪阶段确实不持进程锁
-    /// （activate_release 的 guard 被 ensure_app_runtime 按值消费、其返回即释放；
-    /// 删除是更高优先级的用户意图），与普通就绪失败区分报错便于排查。
-    pub(crate) async fn wait_app_ready(
-        &self,
-        rcoder_app_id: &str,
-        timeout_secs: u64,
-    ) -> Result<(), AppOperationError> {
-        const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 5;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-        let mut consecutive_errors = 0u32;
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(AppOperationError::Backend(format!(
-                    "app readiness poll timed out after {timeout_secs}s"
-                )));
-            }
-            match self.get_app(rcoder_app_id).await {
-                Ok(info) => {
-                    consecutive_errors = 0;
-                    if info.status == AppStatus::Error {
-                        return Err(AppOperationError::Backend(format!(
-                            "app entered Error state (health={})",
-                            info.health.status
-                        )));
-                    }
-                    if info.status == AppStatus::Running && info.health.status != "Unhealthy" {
-                        return Ok(());
-                    }
-                }
-                Err(AppOperationError::NotFound(_)) => {
-                    return Err(AppOperationError::Backend(format!(
-                        "app {rcoder_app_id} was deleted while waiting for readiness"
-                    )));
-                }
-                Err(error) => {
-                    consecutive_errors += 1;
-                    if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS {
-                        return Err(AppOperationError::Backend(format!(
-                            "app readiness poll failed {consecutive_errors} consecutive \
-                             times: {error}"
-                        )));
-                    }
-                    tracing::warn!(
-                        app_id = %rcoder_app_id,
-                        attempt = consecutive_errors,
-                        max = MAX_CONSECUTIVE_POLL_ERRORS,
-                        %error,
-                        "readiness poll transient error, retrying within budget"
-                    );
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(READY_POLL_INTERVAL_SECS)).await;
-        }
     }
 }

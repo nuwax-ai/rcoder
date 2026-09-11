@@ -112,6 +112,10 @@ pub use app_cli_logs::{
     SourceError,
 };
 
+// app-cli 部署相位契约（rcoder ↔ app-cli 单一事实源；deploy/status wire 枚举）
+pub mod app_cli_deploy;
+pub use app_cli_deploy::AppCliDeployPhase;
+
 // gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）
 pub use shared_types_grpc::grpc;
 

@@ -1,14 +1,15 @@
 //! start/restart 的统一部署+启动编排（从 app_ops 拆出）。
 //!
 //! [`start_app_enhanced`] 是 Java 的统一入口：无参数 = 传统启停；带 `url` 触发
-//! 轻量部署（下载 zip → prepare → activate → 启动），失败语义对齐发布链
-//! （activate 就绪失败保留旧版本现场 + Failed）。可选 env/idle/pg 顺带生效。
+//! 轻量部署（容器内下载/校验/解压 → 换 code → 编排启动），同步等待边界 =
+//! 部署段完成（[`Self::wait_deploy_stage`]；服务启动结果异步可见）。失败 =
+//! 部署段失败/等待超时，code/ 现场不破坏（旧制品 URL 重发即回滚）。
+//! 可选 env/idle/pg 顺带生效。
 
 use garde::Validate as _;
 use tracing::{info, warn};
 
 use crate::models::*;
-use crate::release_flow::runtime::DEFAULT_READY_TIMEOUT_SECS;
 use crate::service::AppService;
 use crate::utils::*;
 // record_dev_registration 是 AppServiceTrait 方法（trait impl 在 service.rs）
@@ -162,12 +163,14 @@ impl AppService {
     }
 
     /// 轻量部署链（RBD 卷形态·容器中心化）：env 注入部署三元组 → ensure/re-apply
-    /// 运行容器（config-hash 变更 → Recreate 换 Pod）→ 等就绪 → 包内 SQL 执行。
+    /// 运行容器（config-hash 变更 → Recreate 换 Pod）→ 等部署段完成 → 包内 SQL 执行。
     ///
     /// 下载/解压/换 code 由容器内 app-cli 部署段完成（sha256 校验、marker 幂等
-    /// 重启不重下载、上一代保留 `/app/.previous`）；失败 = supervisord 重试耗尽 →
-    /// readiness 超时由 `wait_app_ready` 上报，code/ 现场不破坏（发布链失败语义
-    /// 保持）。回滚 = 用旧制品 URL 重新 start。
+    /// 重启不重下载、上一代保留 `/app/.previous`）。同步等待边界 = 部署段完成
+    /// （编排已启动，[`Self::wait_deploy_stage`]）——服务启动结果异步可见
+    /// （readiness 探针照常摘流/恢复流量）。失败 = 部署段失败（容器侧 Failed
+    /// 相位，error 透传）或等待超时，code/ 现场不破坏（发布链失败语义保持）。
+    /// 回滚 = 用旧制品 URL 重新 start。
     #[allow(clippy::type_complexity)]
     async fn deploy_from_url(
         &self,
@@ -273,9 +276,11 @@ impl AppService {
             Err(e) => return Err(e),
         }
 
-        // 4. 等就绪（下载/解压/起服务全在 readiness 窗口内，默认预算 300s）
-        self.wait_app_ready(app_id, DEFAULT_READY_TIMEOUT_SECS)
-            .await?;
+        // 4. 同步等待边界 = 部署段完成（app-cli 状态机离开 Deploying，编排已
+        //    启动）——不等用户服务启动/bridge 探活（服务起不起是用户代码域，
+        //    readiness 探针照常摘流；返回成功 ≠ 立即接流量）。容器侧部署失败
+        //    （下载 404/sha256 不匹配/解压损坏）在此同步上报并透传 error 文本。
+        self.wait_deploy_stage(app_id, &release_id).await?;
 
         // 5. 包内 database SQL 自动执行（缺省开；单文件失败仅收集进 report 不阻断）
         let mut sql_report: Option<DatabaseSqlReport> = None;
@@ -309,7 +314,7 @@ impl AppService {
     /// 走 update 通道注入部署三元组 → Recreate 换 Pod 完成部署，双 PVC
     /// 数据面（含空容器阶段建的表）无缝承接。
     ///
-    /// 不调 wait_app_ready：空容器无应用就绪概念，readiness 由 idle app-cli
+    /// 不同步等待部署段：空容器无应用就绪概念，readiness 由 idle app-cli
     /// 秒级应答，get_app 很快转 Running。
     async fn ensure_empty_runtime(&self, app_id: &str, request: &StartAppRequest) -> AppResult<()> {
         // Docker 模式数据卷 bind 源 prod/{user_id}/data/{app_id} 依赖真实 user_id

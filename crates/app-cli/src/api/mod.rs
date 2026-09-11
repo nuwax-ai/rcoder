@@ -560,6 +560,32 @@ mod tests {
         assert_eq!(body["success"], true);
     }
 
+    /// deploy/status 相位 wire 矩阵：Deploying 可查（rcoder 部署段等待点的
+    /// 观察依赖——下载期 API 常驻应答）；Failed 携带 error。wire 值锁死
+    /// snake_case（rcoder 侧 AppCliDeployPhase 同枚举解析）。
+    #[tokio::test]
+    async fn deploy_status_phase_wire_matrix() {
+        let state = test_state();
+        state
+            .server
+            .set_phase(crate::server::ServerPhase::Deploying);
+        let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["phase"], "deploying");
+        assert_eq!(body["data"].get("error"), None);
+
+        state.server.set_phase(crate::server::ServerPhase::Failed(
+            "artifact sha256 mismatch".into(),
+        ));
+        let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["phase"], "failed");
+        assert_eq!(
+            body["data"]["error"].as_str(),
+            Some("artifact sha256 mismatch")
+        );
+    }
+
     /// proxy/status idle 信封：data.mode=idle、release_id=null。
     #[tokio::test]
     async fn proxy_status_idle_envelope() {

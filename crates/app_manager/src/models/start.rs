@@ -7,9 +7,11 @@ use utoipa::ToSchema;
 
 /// `POST /api/v1/userapp/{app_id}/start|restart` 请求体（全可选——无参数即传统启停语义）。
 ///
-/// 带 `url` 即触发**轻量部署**（下载 zip → prepare → activate → 启动），
-/// 是 Java 直发制品包的统一入口（不经 build）；失败语义对齐发布链
-/// （activate 就绪失败保留旧版本现场 + Failed 状态）。
+/// 带 `url` 即触发**轻量部署**（容器内下载/校验/解压 → 换 code → 编排启动），
+/// 是 Java 直发制品包的统一入口（不经 build）。同步等待边界 = **部署段完成**
+/// （制品正确落地 + database SQL 执行；服务启动结果异步可见，readiness 探针
+/// 照常摘流）；失败 = 部署段失败（容器侧 error 透传）或等待超时，code/ 现场
+/// 不破坏（旧制品 URL 重发即回滚）。
 ///
 /// start 无 `url` 且 app 不存在时**创建空容器**（基础设施形态：PG/ttyd/dbx
 /// 常驻 + app-cli idle 等部署，此形态 `user_id` 必填）；restart 无 `url` 对

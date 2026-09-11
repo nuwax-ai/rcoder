@@ -828,7 +828,7 @@ async fn verify_hot_redeploy(
     }
 
     // 受理前等待相位到 running（热部署语义前置）。实测抓到：Docker 模式
-    // wait_app_ready 只看容器 running（不等 app-cli 编排完成），且后续
+    // start 同步等待止于部署段完成（不等 app-cli 编排到 running），且后续
     // app-files/db 的 ensure 链存在容器重建竞态——C5 时刻可能又处于首次
     // 部署的 orchestrating（409 拒绝）。轮询到 running 再发是正确测试写法；
     // Docker 模式 ensure 重建竞态记为实现差距。

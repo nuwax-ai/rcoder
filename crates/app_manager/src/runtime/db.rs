@@ -139,6 +139,30 @@ impl AppService {
     /// `is_shell_safe_path_component` 白名单（防恶意文件名注入 `sh -c` 命令行）。
     pub async fn execute_database_sql(&self, app_id: &str) -> AppResult<DatabaseSqlReport> {
         validate_app_id(app_id)?;
+        // PG 就绪前置：部署链的同步等待点已前移到部署段完成（编排刚启动），
+        // 此时容器内 PG 可能仍在启动窗口——显式等待（与容器内编排并行，多数
+        // 首轮即过）。超时按"失败不阻断"契约收集进 report 提前返回（PG 不可连
+        // 时 psql 必然全失败，继续只会产出噪音）。
+        let runner = RuntimeExecRunner {
+            service: self,
+            app_id,
+        };
+        use shared_types::PgCommandRunner as _;
+        let pg_wait = runner
+            .run(&shared_types::pg_utils::pg_wait_ready_cmd(60))
+            .await;
+        let not_ready = match &pg_wait {
+            Err(e) => Some(format!("exec failed: {e}")),
+            Ok(outcome) if outcome.exit_code != 0 => Some(outcome.stderr.trim().to_string()),
+            Ok(_) => None,
+        };
+        if let Some(reason) = not_ready {
+            tracing::warn!("[APP] database sql skipped, postgres not ready: {reason}");
+            return Ok(DatabaseSqlReport {
+                executed: Vec::new(),
+                failed: vec![format!("postgres not ready: {reason}")],
+            });
+        }
         // 容器内代码根（workspace 压平挂载 /home/user/{app_id} 之下）
         let code_root = shared_types::paths::app_code_root(app_id);
         // 根 database 先、子项目后（-mindepth 3 排除根目录自身）

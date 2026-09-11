@@ -45,16 +45,18 @@ async fn main() -> anyhow::Result<()> {
         args.pingap_bin.display()
     );
 
-    // 部署段（生产 RBD 卷形态）：APP_DEPLOY_URL 注入时下载制品包并切换 code/。
-    // 必须先于 api / 编排读 release.lock（api::serve 与 supervisor 都读 lock）；
-    // 首次部署无 code 时 api 起不来，:3010 由部署段的 liveness 托管应答探针
-    // （防大制品下载窗口 kubelet 误杀）。失败退出非零 → supervisord 重试
-    // （code/ 现场不破坏，readiness 超时由 rcoder wait_app_ready 上报）。
+    // 部署段归属：**serve 形态（生产容器）由 server 状态机内执行**——api 先 bind
+    // （Idle 态常驻，/health 恒 200 天然覆盖 kubelet liveness，取代 LivenessHold
+    // 端口托管），随后 InitialAction::Deploy 在 Deploying 相位内下载/校验/解压/换
+    // code：下载期 /v1/deploy/status 可查（rcoder 等待点），失败进 Failed 相位
+    // 常驻可查（进程不退出，supervisord 不重启循环、kubelet 不杀容器，现场保留）。
     //
-    // **仅 serve / legacy 直跑形态执行**：run-service 是已编排服务的 exec 载体，
-    // 而容器 env 恒带 APP_DEPLOY_URL 三元组（serve 的部署种子，换 Pod 模式每次
-    // 更新）——run-service 若也执行部署段会二次部署（move code 到 .previous 跨
-    // 卷 link 失败 exit 1 → supervisord SPAWN_ERROR，全部 app-svc-* 拉不起来）。
+    // **仅 legacy 直跑形态（None 分支）仍前置 deploy_stage**：无 server 状态机，
+    // 失败语义维持进程退出非零 → supervisord 重试。
+    // run-service 是已编排服务的 exec 载体，恒不执行部署段（容器 env 恒带
+    // APP_DEPLOY_URL 三元组——serve 的部署种子，换 Pod 模式每次更新；run-service
+    // 若也执行部署段会二次部署（move code 到 .previous 跨卷 link 失败 exit 1
+    // → supervisord SPAWN_ERROR，全部 app-svc-* 拉不起来）。
     // build 是本地编译工具，无运行时副作用，不进部署段（已在前置本地分派返回）。
     match &args.command {
         // 结构性不可达（Build 在 init_tracing 前已分派）；与 run-service 的
@@ -63,7 +65,6 @@ async fn main() -> anyhow::Result<()> {
             unreachable!("build dispatched before tracing init")
         }
         Some(app_cli::config::Command::Serve) => {
-            deploy_stage(&args).await?;
             return app_cli::server::serve(&args).await;
         }
         Some(app_cli::config::Command::RunService {
@@ -164,8 +165,10 @@ fn init_tracing(log_dir: &std::path::Path) -> Arc<tracing_appender::non_blocking
     guard
 }
 
-/// 部署段（serve / legacy 直跑形态公用）：env 有 `APP_DEPLOY_URL` 才执行；
+/// 部署段（**仅 legacy 直跑形态**）：env 有 `APP_DEPLOY_URL` 才执行；
 /// liveness 托管占位 3010 防下载窗口 kubelet 误杀，失败上抛（supervisord 重试）。
+/// serve 形态不走本函数——部署段在 server 状态机 Deploying 相位内执行
+/// （见上方 match 注释）。
 async fn deploy_stage(args: &app_cli::CliArgs) -> anyhow::Result<()> {
     if !app_cli::deploy::deploy_requested() {
         return Ok(());

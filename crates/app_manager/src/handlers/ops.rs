@@ -22,10 +22,10 @@ use crate::models::{
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body(
         content = StartAppRequest,
-        description = "user_id 必填（owner 分区与 metadata 注册）；其余可选——空对象 = 传统启动（app 不存在即创建空容器：基础设施形态，PG/ttyd/dbx 可用）。带 url 触发部署：deploy_mode 缺省 pod（app_stage 注入 → Recreate 换 Pod），hot = 容器内原地换应用（不换 Pod、PG/终端不断连；前置不满足自动回退 pod）；release_id 缺省自动生成并在响应返回；sha256 可选校验；app_stage/idle_timeout_seconds 覆盖；pg 凭据自动对齐（不一致重置，失败不阻断部署）"
+        description = "user_id 必填（owner 分区与 metadata 注册）；其余可选——空对象 = 传统启动（app 不存在即创建空容器：基础设施形态，PG/ttyd/dbx 可用）。带 url 触发部署：deploy_mode 缺省 pod（app_stage 注入 → Recreate 换 Pod），hot = 容器内原地换应用（不换 Pod、PG/终端不断连；前置不满足自动回退 pod，等编排+bridge 就绪才返回）；release_id 缺省自动生成并在响应返回；sha256 可选校验；app_stage/idle_timeout_seconds 覆盖；pg 凭据自动对齐（不一致重置，失败不阻断部署）。同步等待边界 = 部署段完成（下载/sha256/解压成功、编排已启动）+ 包内 database SQL 执行——服务启动结果异步可见（GET /apps/{app_id} 或访问探活确认）；成功返回 ≠ 立即接流量（readiness 摘流窗口，配置 bridge_service 的应用摘流到后端就绪）。建议客户端读超时 ≥ 120s；超时 ≠ 失败（服务端继续收敛，先查状态再决定是否重试）"
     ),
     responses(
-        (status = 200, description = "启动/部署成功", body = HttpResult<StartAppResult>),
+        (status = 200, description = "启动/部署成功（部署 = 制品已部署 + SQL 已执行，服务启动中）", body = HttpResult<StartAppResult>),
         (status = 400, description = "创建空容器缺 user_id / deploy_mode 非法值", body = HttpResult<String>),
         (status = 409, description = "release 幂等冲突（同 id 不同内容）", body = HttpResult<String>)
     ),
@@ -104,10 +104,10 @@ pub async fn stop_app(
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body(
         content = StartAppRequest,
-        description = "user_id 必填；其余可选——空对象 = 传统 rollout restart。带 url = 部署新版本（activate 自带切流）；其余字段语义同 start"
+        description = "user_id 必填；其余可选——空对象 = 传统 rollout restart。带 url = 部署新版本（等待边界同 start：部署段完成 + SQL 执行，服务启动异步可见，成功 ≠ 立即接流量）；其余字段语义同 start"
     ),
     responses(
-        (status = 200, description = "重启/部署成功", body = HttpResult<StartAppResult>),
+        (status = 200, description = "重启/部署成功（部署 = 制品已部署 + SQL 已执行，服务启动中）", body = HttpResult<StartAppResult>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
     tag = "Userapp · prod · 部署与启停"

@@ -6,14 +6,20 @@
 //! 受理后失败（部署失败/超时）保留现场报错（旧制品 URL 重发即回滚，对齐
 //! activate 失败语义）。
 //!
+//! 等待边界与冷部署链（[`crate::lifecycle`] wait_deploy_stage，部署段完成即
+//! 返回）不同：热部署**等 `Running`**——热切换的价值就是旧服务不断流，须等
+//! 新版编排完成 + bridge readiness 过了才算成功（旧服务期间一直在线）。
+//!
 //! 成功后把部署三元组经 `update_env_configmap` 收敛进 ConfigMap（K8s-only，
 //! 不触碰 Deployment → 无 Recreate）：Pod 重建时 server 按 env 恢复最新版本，
 //! 热部署的换代效果不因重建丢失。
 
 use std::time::Duration;
 
+use shared_types::AppCliDeployPhase;
 use tracing::{info, warn};
 
+use super::deploy_wait::parse_deploy_status;
 use crate::error::AppOperationError;
 use crate::error::AppResult;
 use crate::models::AppRuntimeInfo;
@@ -21,21 +27,9 @@ use crate::service::AppService;
 
 /// 热部署受理/轮询端口（app-cli 管理 API 常量对齐）。
 const APP_CLI_ADMIN_PORT: u16 = shared_types::APP_CLI_ADMIN_PORT;
-/// 轮询间隔/预算（对齐 wait_app_ready 语义）。
+/// 轮询间隔/预算（对齐冷部署链部署段等待的量级）。
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const HOT_DEPLOY_BUDGET: Duration = Duration::from_secs(300);
-
-/// 解析 `/v1/deploy/status` 的 phase：新形态信封 `data.phase`，旧形态顶层
-/// `phase`（双兼容——app-cli 与 rcoder 任一侧先发版都不破坏热部署轮询；
-/// 两处都缺失返回 None = 继续轮询）。
-fn deploy_status_phase(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("data")
-        .and_then(|data| data.get("phase"))
-        .or_else(|| value.get("phase"))
-        .and_then(|phase| phase.as_str())
-        .map(str::to_string)
-}
 
 impl AppService {
     /// 尝试热部署。`Ok(Some(()))` = 完成（调用方跳过换 Pod 链，直接进 SQL 执行
@@ -147,24 +141,31 @@ impl AppService {
                 .header("X-Deploy-Token", &token)
                 .send()
                 .await;
-            let phase = match resp {
+            let probe = match resp {
                 Ok(r) if r.status().is_success() => r
                     .json::<serde_json::Value>()
                     .await
                     .ok()
-                    .and_then(|v| deploy_status_phase(&v)),
+                    .map(|v| parse_deploy_status(&v)),
                 _ => None,
             };
-            match phase.as_deref() {
-                Some("running") => break,
-                Some("failed") => {
+            // 穷尽 match：新增 AppCliDeployPhase 变体时编译错，强制同步本判据
+            match probe.as_ref().and_then(|p| p.phase) {
+                Some(AppCliDeployPhase::Running) => break,
+                Some(AppCliDeployPhase::Failed) => {
                     let error = "hot deploy failed on container (see app-cli logs; \
                                  redeploy old artifact URL to roll back)"
                         .to_string();
                     return Err(AppOperationError::Backend(error));
                 }
-                // deploying/orchestrating/idle（受理竞态窗口）→ 继续等
-                _ => {}
+                // deploying/orchestrating（换应用进行中）、idle（受理竞态窗口）、
+                // None（不可达/未知相位——旧镜像）→ 继续等
+                Some(
+                    AppCliDeployPhase::Idle
+                    | AppCliDeployPhase::Deploying
+                    | AppCliDeployPhase::Orchestrating,
+                )
+                | None => {}
             }
         }
 
@@ -210,7 +211,6 @@ impl AppService {
 
 #[cfg(test)]
 mod tests {
-    use super::deploy_status_phase;
     use crate::models::StartAppRequest;
     use crate::test_support::{MockRuntime, test_service};
     use std::sync::Arc;
@@ -256,24 +256,8 @@ mod tests {
         );
     }
 
-    /// /v1/deploy/status phase 解析双兼容：新信封形态 data.phase + 旧裸形态
-    /// 顶层 phase（任一发版顺序都不挂）；两处都缺 → None（继续轮询）。
-    #[test]
-    fn deploy_status_phase_reads_envelope_and_legacy_shapes() {
-        let envelope = serde_json::json!({
-            "code": "0000", "message": "success", "tid": null, "success": true,
-            "data": { "phase": "deploying", "release_id": "rel-1" }
-        });
-        assert_eq!(deploy_status_phase(&envelope).as_deref(), Some("deploying"));
-
-        let legacy = serde_json::json!({ "phase": "running", "release_id": "rel-1" });
-        assert_eq!(deploy_status_phase(&legacy).as_deref(), Some("running"));
-
-        assert_eq!(
-            deploy_status_phase(&serde_json::json!({ "code": "0000", "data": null })),
-            None
-        );
-    }
+    // /v1/deploy/status phase 解析（信封/裸顶层双兼容 + 未知相位容错）的
+    // 用例已随 `parse_deploy_status` 迁至 deploy_wait.rs（`parse_deploy_status_shapes`）。
 
     /// deploy_mode wire：默认缺省（pod）+ hot 受理。
     #[test]
