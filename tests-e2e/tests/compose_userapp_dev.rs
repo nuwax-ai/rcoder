@@ -2231,3 +2231,456 @@ async fn userapp_dev_terminal_cwd_via_ttyd_ws() {
     assert_hard_all(report).await;
     cleanup_builder(&app);
 }
+
+// ============================================================
+// P0 三场景：应用代理懒启动 / 受理后高频轮询不误杀 / SSE 游标过头关流
+//（锚定 8bb25bd 懒启动、94329c5+Alive 路径探活自愈、SSE 游标关流修复）
+// ============================================================
+
+/// P0 场景共享：内存 zip → init-project-template（entries: (zip 内路径, 内容)）。
+async fn upload_ws_zip(env: &Env, app: &str, user: &str, entries: &[(&str, &str)]) -> bool {
+    let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    for (path, content) in entries {
+        zw.start_file(*path, opts).unwrap();
+        std::io::Write::write_all(&mut zw, content.as_bytes()).unwrap();
+    }
+    let zip_bytes = zw.finish().unwrap().into_inner();
+    let part = reqwest::multipart::Part::bytes(zip_bytes).file_name("template.zip");
+    let form = reqwest::multipart::Form::new()
+        .text("app_id", app.to_owned())
+        .text("user_id", user.to_owned())
+        .text("enable_git", "false")
+        .part("file", part);
+    env.http
+        .post(format!(
+            "{}/api/v1/userapp/init-project-template",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(60))
+        .header("X-App-Id", app)
+        .multipart(form)
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success())
+}
+
+/// P0 场景共享：dev/start 受理 → task_id（非成功受理返回 None）。
+async fn dev_start_task(env: &Env, app: &str, user: &str) -> Option<String> {
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/dev/start", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", app)
+        .json(&json!({"app_id": app, "user_id": user}))
+        .send()
+        .await
+        .ok()?;
+    let body: Value = resp.json().await.ok()?;
+    if !http_ok(&body) {
+        return None;
+    }
+    body["data"]["task_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// P0 场景共享：轮询任务到终态，返回 (status, error)；budget 内未到终态返回 None。
+async fn poll_task_terminal(
+    env: &Env,
+    app: &str,
+    user: &str,
+    task_id: &str,
+    budget: Duration,
+    interval: Duration,
+) -> Option<(String, String)> {
+    let t0 = Instant::now();
+    while t0.elapsed() < budget {
+        if let Ok(r) = env
+            .http
+            .get(format!(
+                "{}/api/v1/userapp/tasks/{task_id}?app_id={app}&user_id={user}",
+                env.rcoder
+            ))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            && r.status().is_success()
+            && let Ok(b) = r.json::<Value>().await
+            && let Some(st) = b["data"]["status"].as_str()
+            && matches!(st, "completed" | "failed" | "cancelled")
+        {
+            return Some((
+                st.to_string(),
+                b["data"]["error"].as_str().unwrap_or("").to_string(),
+            ));
+        }
+        tokio::time::sleep(interval).await;
+    }
+    None
+}
+
+/// 单服务 workspace 条目（build/run 可定制——P0 三场景共用形态：
+/// run = http.server serve 服务目录，readiness 文件 `ready` 使 /ready 200）。
+/// 注意：`build_cmd` 内联进 TOML 双引号字符串，不得含双引号/反斜杠
+/// （会破坏 manifest 语法——复杂命令改用单引号 TOML 字符串形态）。
+fn single_service_entries(build_cmd: &str) -> Vec<(&'static str, String)> {
+    let proj_manifest = format!(
+        "schema_version = 1\n\n[project]\nservice_id = \"backend-go\"\nname = \"Go Backend\"\ntype = \"go\"\nkind = \"web\"\nenabled = true\n\n[build]\ncommand = [\"sh\", \"-c\", \"{build_cmd}\"]\nartifact = \"artifact.zip\"\n\n[run]\ncommand = [\"sh\", \"-c\", \"touch ready && exec python3 -m http.server $PORT --bind 0.0.0.0\"]\n\n[health]\nreadiness_path = \"/ready\"\n\n[proxy]\npath = \"/api/go/\"\nstrip_prefix = true\n"
+    );
+    vec![
+        (
+            "workspace.manifest.toml",
+            "schema_version = 1\n\n[workspace]\nname = \"e2e-p0\"\n".to_string(),
+        ),
+        ("backend-go/project.manifest.toml", proj_manifest),
+        ("backend-go/start.sh", "#!/bin/sh\nsleep 9999\n".to_string()),
+    ]
+}
+
+/// 条目转 `&str` 形态（upload_ws_zip 入参适配）。
+fn entries_ref<'a>(entries: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)> {
+    entries.iter().map(|(p, c)| (*p, c.as_str())).collect()
+}
+
+/// 场景：dev 应用代理懒启动——服务跑起后删 builder 容器，应用流量访问
+/// 应自动拉起容器（锚定 8bb25bd：app 族代理接 find_dev_container 懒启动，
+/// 修复前无容器即 502 永不自愈）。
+#[tokio::test]
+async fn userapp_dev_app_proxy_lazy_start() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_app_proxy_lazy";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    if !env.k8s_ssh.is_empty() {
+        eprintln!("[{scenario}] K8s 模式跳过（docker rm/inspect 专属场景）");
+        return;
+    }
+    let app = format!("app-{}", scoped_app(&env, "lzy"));
+    let user = "e2e-ud-user";
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    let pingora = std::env::var("E2E_PINGORA_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8089".to_owned());
+    let svc_url = format!("{pingora}/api/v1/userapp/proxy/app/dev/{user}/{app}/api/go/ready");
+
+    // 1. 起服务（zip build 秒过 + http.server readiness）→ completed
+    let entries = single_service_entries("zip -q artifact.zip start.sh");
+    report.assert_hard(
+        "懒启动前置：init 模板 zip",
+        upload_ws_zip(&env, &app, user, &entries_ref(&entries)).await,
+        "init-project-template 失败".into(),
+    );
+    let Some(task_id) = dev_start_task(&env, &app, user).await else {
+        report.assert_hard("懒启动前置：dev/start 受理", false, "未拿到 task_id".into());
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    };
+    let terminal = poll_task_terminal(
+        &env,
+        &app,
+        user,
+        &task_id,
+        Duration::from_secs(120),
+        Duration::from_secs(3),
+    )
+    .await;
+    report.assert_hard(
+        "懒启动前置：任务 completed（服务在跑）",
+        terminal
+            .as_ref()
+            .map(|(st, _)| st == "completed")
+            .unwrap_or(false),
+        format!("terminal={terminal:?}"),
+    );
+
+    // 2. 服务路由经代理可达（200）
+    let resp = env
+        .http
+        .get(&svc_url)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await;
+    let svc_status = resp.as_ref().map(|r| r.status().as_u16()).ok();
+    report.assert_hard(
+        "懒启动前置：代理访问服务路由 200",
+        svc_status == Some(200),
+        format!("GET {svc_url} -> status={svc_status:?}"),
+    );
+
+    // 3. 删容器 → 应用流量访问 → 容器应自动重建（Id 必变）
+    let id_before = docker_inspect_id(&app);
+    report.assert_hard(
+        "懒启动前置：容器 Id 记录",
+        id_before.is_some(),
+        "docker inspect 未取到容器".into(),
+    );
+    let Some(id_before) = id_before else {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    };
+    cleanup_builder(&app);
+
+    let resp = env
+        .http
+        .get(&svc_url)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await;
+    report.diagnostic(
+        "懒启动：删容器后首访状态（新容器服务未编排，5xx 属预期）",
+        &format!("{resp:?}"),
+        "语义断言在容器重建而非本访状态码",
+    );
+
+    // 4. 容器被自动拉回（30s 窗口内出现新 Id 且 ≠ 旧 Id）
+    let mut id_after = None;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(30) {
+        if let Some(id) = docker_inspect_id(&app) {
+            id_after = Some(id);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    report.assert_hard(
+        "懒启动：容器被应用流量自动重建（新 Id ≠ 旧 Id）",
+        matches!(&id_after, Some(id) if *id != id_before),
+        format!("before={id_before:.12}, after={id_after:?}"),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
+/// 场景：受理后高频轮询不误杀容器——dev/start 受理后零等待进入 0.5s 间隔
+/// 轮询（精确撞容器启动窗口 + 编译期探活超时窗），容器 Id 应全程唯一、
+/// 任务正常达终态（锚定线上 id=80 事故：修复前该节奏触发探活自愈杀容器、
+/// 任务蒸发查询 404）。
+#[tokio::test]
+async fn userapp_dev_poll_storm_keeps_container() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_poll_storm";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    if !env.k8s_ssh.is_empty() {
+        eprintln!("[{scenario}] K8s 模式跳过（docker inspect 专属场景）");
+        return;
+    }
+    let app = format!("app-{}", scoped_app(&env, "storm"));
+    let user = "e2e-ud-user";
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 慢 build（~12s 编译窗口）制造探活超时窗
+    let entries = single_service_entries("sleep 12 && zip -q artifact.zip start.sh");
+    report.assert_hard(
+        "轮询风暴前置：init 模板 zip",
+        upload_ws_zip(&env, &app, user, &entries_ref(&entries)).await,
+        "init-project-template 失败".into(),
+    );
+    let Some(task_id) = dev_start_task(&env, &app, user).await else {
+        report.assert_hard(
+            "轮询风暴前置：dev/start 受理",
+            false,
+            "未拿到 task_id".into(),
+        );
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    };
+
+    // 零等待高频轮询（0.5s）：启动窗口 + 编译期全程打 tasks 查询
+    let mut seen_ids = std::collections::BTreeSet::new();
+    let mut query_ok_count = 0u32;
+    let mut terminal = None;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(90) {
+        if let Some(id) = docker_inspect_id(&app) {
+            seen_ids.insert(id);
+        }
+        if let Ok(r) = env
+            .http
+            .get(format!(
+                "{}/api/v1/userapp/tasks/{task_id}?app_id={app}&user_id={user}",
+                env.rcoder
+            ))
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+            && r.status().is_success()
+        {
+            query_ok_count += 1;
+            if let Ok(b) = r.json::<Value>().await
+                && let Some(st) = b["data"]["status"].as_str()
+                && matches!(st, "completed" | "failed" | "cancelled")
+            {
+                terminal = Some(st.to_string());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if let Some(id) = docker_inspect_id(&app) {
+        seen_ids.insert(id);
+    }
+    report.diagnostic(
+        "轮询风暴：查询成功次数",
+        &query_ok_count.to_string(),
+        "高频轮询全程打 tasks 查询",
+    );
+    report.assert_hard(
+        "轮询风暴：任务正常达终态（未蒸发）",
+        matches!(terminal.as_deref(), Some("completed") | Some("failed")),
+        format!("terminal={terminal:?}（90s 未到终态=任务蒸发或卡死）"),
+    );
+    report.assert_hard(
+        "轮询风暴：容器 Id 全程唯一（启动窗口+编译期无重建/误杀）",
+        seen_ids.len() == 1,
+        format!("seen_ids={seen_ids:?}（>1 即容器曾被杀重建）"),
+    );
+    report.assert_hard(
+        "轮询风暴：容器仍存在",
+        docker_inspect_id(&app).is_some(),
+        "终态后容器应存活".into(),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
+/// 场景：SSE 游标过头即刻关流——终态任务带越界 from_seq 订阅 logs/stream，
+/// 流应数秒内服务端主动关闭且零事件（修复前：replay 空后 broadcast pending，
+/// 流只剩 15s keep-alive 永久悬挂、EventSource 无限重连）。
+#[tokio::test]
+async fn userapp_dev_task_sse_cursor_past_terminal() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_dev_sse_cursor";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = format!("app-{}", scoped_app(&env, "cur"));
+    let user = "e2e-ud-user";
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 快速失败任务（build exit 1 → 秒级 failed 终态）
+    let entries = single_service_entries("exit 1");
+    report.assert_hard(
+        "游标关流前置：init 模板 zip",
+        upload_ws_zip(&env, &app, user, &entries_ref(&entries)).await,
+        "init-project-template 失败".into(),
+    );
+    let Some(task_id) = dev_start_task(&env, &app, user).await else {
+        report.assert_hard(
+            "游标关流前置：dev/start 受理",
+            false,
+            "未拿到 task_id".into(),
+        );
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    };
+    let terminal = poll_task_terminal(
+        &env,
+        &app,
+        user,
+        &task_id,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    )
+    .await;
+    report.assert_hard(
+        "游标关流前置：任务达终态",
+        terminal.is_some(),
+        format!("terminal={terminal:?}"),
+    );
+
+    // 带 from_seq=99999（越过终态事件）订阅：10s deadline 内应服务端关流 + 零事件
+    let sse_url = format!(
+        "{}/api/v1/userapp/tasks/{task_id}/logs/stream?app_id={app}&user_id={user}&from_seq=99999",
+        env.rcoder
+    );
+    let resp = env
+        .sse_http
+        .get(&sse_url)
+        .header("Accept", "text/event-stream")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    use futures_util::StreamExt;
+    let (status, ct, mut stream) = match resp {
+        Ok(r) => {
+            let status = r.status();
+            let ct = r
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            (status, ct, r.bytes_stream())
+        }
+        Err(e) => {
+            report.assert_hard("游标关流：SSE 连接建立", false, format!("{e}"));
+            assert_hard_all(report).await;
+            cleanup_builder(&app);
+            return;
+        }
+    };
+    let mut text = String::new();
+    let mut ended_by_close = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                text.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            Ok(None) => {
+                ended_by_close = true; // 服务端主动关流
+                break;
+            }
+            Ok(Some(Err(_))) | Err(_) => break, // 网络错误 / deadline 兜底
+        }
+    }
+    report.assert_hard(
+        "游标关流：SSE 200 + event-stream",
+        status.is_success() && ct.contains("text/event-stream"),
+        format!("HTTP {status}, content-type={ct}"),
+    );
+    report.assert_hard(
+        "游标关流：deadline 内服务端主动关流（非悬挂）",
+        ended_by_close,
+        format!(
+            "ended_by_close={ended_by_close}, body: {}",
+            trunc(&Value::String(text.clone()), 120)
+        ),
+    );
+    report.assert_hard(
+        "游标关流：越界游标零事件下发",
+        !text.contains("event:"),
+        format!("body 应为空，实得: {}", trunc(&Value::String(text), 120)),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
