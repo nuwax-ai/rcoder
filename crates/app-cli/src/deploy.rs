@@ -6,11 +6,12 @@
 //!
 //! 1. marker：`{卷根}/.deploy-state.toml` 的 release_id 一致且 code/ 在位 → 跳过
 //!    （幂等重启，pod 重启不重下载）；
-//! 2. 流式下载到 `{卷根}/.incoming/{release_id}.zip.part`（sha256 增量计算）；
-//! 3. 解压到 `{卷根}/.staging/{release_id}`（zip-slip 防护）并校验包内
-//!    release.lock.toml 可解析（包完整性闸门）；
+//! 2. 清 `.incoming/` 残片 + 流式下载到 `{卷根}/.incoming/{release_id}.zip.part`
+//!    （sha256 增量计算）；
+//! 3. zip 魔数校验（拦 HTTP 200 + 错误信封 body）→ 解压到 `{卷根}/.staging/{release_id}`
+//!    （zip-slip 防护）并校验包内 release.lock.toml 可解析（包完整性闸门）；
 //! 4. 换 code/：旧 code → `.previous`（保留一代，紧急人工恢复用）→ staging → code；
-//! 5. 写 `.deploy-state.toml`。
+//! 5. 写 `.deploy-state.toml`。下载后的任一步失败统一清 `.part` 残片。
 //!
 //! 失败由 main 退出非零 → supervisord 重试；code/ 现场不破坏（换卷只做同 fs rename）。
 
@@ -20,7 +21,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 /// 部署状态 marker 文件名（卷根下，跨 code 换代存续）。
@@ -174,7 +175,10 @@ pub(crate) async fn deploy(
         expected_sha.unwrap_or("(skip verify)")
     );
 
-    // 2. 流式下载（sha256 增量）
+    // 2. 清跨重启残留的下载中转残片（上次失败路径遗留；成功路径本就自清）
+    sweep_incoming_parts(&incoming_dir(volume_root)).await;
+
+    // 3. 流式下载（sha256 增量）
     let incoming = volume_root.join(INCOMING_DIR);
     tokio::fs::create_dir_all(&incoming)
         .await
@@ -193,34 +197,49 @@ pub(crate) async fn deploy(
         );
     }
 
-    // 3. 解压 staging + 包完整性校验
-    let staging = volume_root.join(STAGING_DIR).join(release_id);
-    if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
-        tokio::fs::remove_dir_all(&staging)
+    // 4. 魔数校验 → 解压 → 包完整性闸门 → 原子换入：任一步失败统一清 .part
+    //    （对齐 sha mismatch 的清理语义，消除解压/lock/promote 失败的残片残留路径）。
+    let staged: Result<()> = async {
+        verify_zip_magic(&part).await?;
+        let staging = volume_root.join(STAGING_DIR).join(release_id);
+        if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
+            tokio::fs::remove_dir_all(&staging)
+                .await
+                .with_context(|| format!("clean stale staging {}", staging.display()))?;
+        }
+        extract_zip(&part, &staging)
             .await
-            .with_context(|| format!("clean stale staging {}", staging.display()))?;
-    }
-    extract_zip(&part, &staging)
-        .await
-        .with_context(|| format!("extract package to {}", staging.display()))?;
-    crate::manifest::read_release_lock(&staging)
-        .context("staged package has no parsable release.lock.toml — not a platform artifact?")?;
+            .with_context(|| format!("extract package to {}", staging.display()))?;
+        crate::manifest::read_release_lock(&staging).context(
+            "staged package has no parsable release.lock.toml — not a platform artifact?",
+        )?;
 
-    // 4. 换 code/（同 fs rename，原子；旧代保留一代）
-    let previous = volume_root.join(PREVIOUS_DIR);
-    if tokio::fs::try_exists(&previous).await.unwrap_or(false) {
-        tokio::fs::remove_dir_all(&previous)
+        let previous = volume_root.join(PREVIOUS_DIR);
+        if tokio::fs::try_exists(&previous).await.unwrap_or(false) {
+            tokio::fs::remove_dir_all(&previous)
+                .await
+                .with_context(|| format!("clean old {}", previous.display()))?;
+        }
+        if tokio::fs::try_exists(workspace).await.unwrap_or(false) {
+            tokio::fs::rename(workspace, &previous)
+                .await
+                .with_context(|| format!("move current code to {}", previous.display()))?;
+        }
+        tokio::fs::rename(&staging, workspace)
             .await
-            .with_context(|| format!("clean old {}", previous.display()))?;
+            .with_context(|| format!("promote staging to {}", workspace.display()))?;
+        Ok(())
     }
-    if tokio::fs::try_exists(workspace).await.unwrap_or(false) {
-        tokio::fs::rename(workspace, &previous)
-            .await
-            .with_context(|| format!("move current code to {}", previous.display()))?;
+    .await;
+    if let Err(e) = staged {
+        if let Err(remove_err) = tokio::fs::remove_file(&part).await {
+            warn!(
+                "remove failed part {} after deploy error: {remove_err}",
+                part.display()
+            );
+        }
+        return Err(e);
     }
-    tokio::fs::rename(&staging, workspace)
-        .await
-        .with_context(|| format!("promote staging to {}", workspace.display()))?;
 
     // 5. 写 marker + 清 .part
     let state = DeployState {
@@ -237,6 +256,64 @@ pub(crate) async fn deploy(
         warn!("remove part {} failed: {e}", part.display());
     }
     info!("✅ deploy stage complete: release_id={release_id} sha256={actual_hex}");
+    Ok(())
+}
+
+/// 下载中转目录路径（卷根下）。
+fn incoming_dir(volume_root: &Path) -> std::path::PathBuf {
+    volume_root.join(INCOMING_DIR)
+}
+
+/// 清 `.incoming/` 下全部 `*.part` 残片（deploy stage 入口调用）。
+///
+/// 跨重启遗留：成功路径自清、sha mismatch 清、其余失败路径由 staged 块兜底清，
+/// 但历史版本残片 / 进程被 SIGKILL 的窗口仍可能留档——下载前统一扫掉，
+/// 对齐 file-server 侧 hygiene sweep 的模型。失败仅 warn（清理是卫生动作，
+/// 不阻断部署主流程）。
+async fn sweep_incoming_parts(dir: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return; // 目录不存在 = 无残片
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "part")
+            && let Err(e) = tokio::fs::remove_file(&path).await
+        {
+            warn!("sweep stale part {} failed: {e}", path.display());
+        }
+    }
+}
+
+/// 制品 zip 魔数校验（下载完整落盘后读文件头，非流式截取）。
+///
+/// 拦截形态：下载 URL 返回 **HTTP 200 + 错误信封 body**（如网关把 401/404 包成
+/// 200 + JSON code 信封返回）——下载器在 HTTP 层无感知，错误 body 被当 zip 落盘，
+/// 直到解压层才报深层 "Could not find EOCD"（线上事故形态）。此处前置拦截并给
+/// 出带首字节线索的可诊断错误。
+///
+/// 判据：ZIP 规范中含 ≥1 条目的 zip 偏移 0 必是第一个条目的 Local File Header
+/// （PK\x03\x04），与生成工具无关；`infer::archive::is_zip` 还额外放行空 zip /
+/// 跨卷等边缘形态（平台制品必含 release.lock.toml，空包由 lock 闸门拒绝，跨卷
+/// zip crate 本就不支持——宽松方向只会放行"真 zip"，无误伤）。body 不足 4 字节
+/// （0 字导体/极短错误页）is_zip 恒 false，天然归入同一错误。
+async fn verify_zip_magic(part: &Path) -> Result<()> {
+    let mut file = tokio::fs::File::open(part)
+        .await
+        .with_context(|| format!("open downloaded part {}", part.display()))?;
+    let mut head = [0u8; 4];
+    let n = file
+        .read(&mut head)
+        .await
+        .with_context(|| format!("read head of {}", part.display()))?;
+    let head = &head[..n];
+    if !infer::archive::is_zip(head) {
+        bail!(
+            "downloaded artifact is not a zip archive (first bytes: {}) — \
+             the url likely returned an error envelope with HTTP 200; \
+             verify the deploy url and its auth (release_id in path)",
+            head.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+    }
     Ok(())
 }
 
@@ -270,14 +347,27 @@ async fn download_to_file(url: &str, dest: &Path) -> Result<[u8; 32]> {
 }
 
 /// 解压 zip（zip-slip 防护：enclosed_name 拒绝越界条目；unix 权限保留）。
+///
+/// 错误 context 附文件首 4 字节 hex——解压层失败（EOCD/InvalidArchive）时自诊断：
+/// 看到非 PK 头（如 7b22636f = `{"co`）即知 body 是错误信封而非 zip。
 async fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
     let zip_path = zip_path.to_path_buf();
     let dest = dest.to_path_buf();
     tokio::task::spawn_blocking(move || {
+        let mut head = [0u8; 4];
+        let head_hex = std::fs::File::open(&zip_path)
+            .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+            .ok()
+            .map(|_| head.iter().map(|b| format!("{b:02x}")).collect::<String>())
+            .unwrap_or_else(|| "<unreadable>".to_string());
         let file = std::fs::File::open(&zip_path)
             .with_context(|| format!("open {}", zip_path.display()))?;
-        let mut archive = zip::ZipArchive::new(file)
-            .with_context(|| format!("open zip {}", zip_path.display()))?;
+        let mut archive = zip::ZipArchive::new(file).with_context(|| {
+            format!(
+                "open zip {} (first 4 bytes: 0x{head_hex})",
+                zip_path.display()
+            )
+        })?;
         for index in 0..archive.len() {
             let mut entry = archive
                 .by_index(index)
@@ -551,6 +641,82 @@ format = "jsonl"
             .await
             .expect_err("package without lock must fail");
         assert!(err.to_string().contains("release.lock.toml"));
+        // lock 闸门失败也清 .part（staged 块统一清理，不留残片）
+        assert!(
+            !volume_root_of(&workspace)
+                .join(INCOMING_DIR)
+                .join("rel-001.zip.part")
+                .exists()
+        );
+    }
+
+    /// 线上事故形态锁：URL 返回 HTTP 200 + JSON 错误信封（网关把 401 包成 200），
+    /// 下载器无感知落盘——必须在魔数校验层拦截并给出可诊断错误，而非深层的
+    /// "Could not find EOCD"。
+    #[tokio::test]
+    async fn deploy_rejects_non_zip_body() {
+        let (_dir, workspace) = make_volume();
+        std::fs::write(workspace.join("sentinel.txt"), "old").expect("sentinel");
+        let envelope = br#"{"code":"4010","message":"not logged in","success":false}"#;
+        let url = serve_once(envelope.to_vec()).await;
+        let err = deploy(&workspace, &url, "rel-001", None)
+            .await
+            .expect_err("error envelope must be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("not a zip archive"),
+            "unexpected error: {chain}"
+        );
+        // 首字节线索：7b22636f = `{"co`（JSON 信封指纹）
+        assert!(chain.contains("7b22636f"), "missing head hex: {chain}");
+        // .part 已清 + 现场 code 未破坏
+        assert!(
+            !volume_root_of(&workspace)
+                .join(INCOMING_DIR)
+                .join("rel-001.zip.part")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("sentinel.txt")).unwrap(),
+            "old"
+        );
+    }
+
+    /// 0 字节 body（某些网关错误页）：读不满 4 字节同样归入 not-a-zip 拒绝。
+    #[tokio::test]
+    async fn deploy_rejects_empty_body() {
+        let (_dir, workspace) = make_volume();
+        let url = serve_once(Vec::new()).await;
+        let err = deploy(&workspace, &url, "rel-001", None)
+            .await
+            .expect_err("empty body must be rejected");
+        assert!(
+            format!("{err:#}").contains("not a zip archive"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !volume_root_of(&workspace)
+                .join(INCOMING_DIR)
+                .join("rel-001.zip.part")
+                .exists()
+        );
+    }
+
+    /// 启动 sweep：跨重启遗留的 *.part 残片在下一次 deploy 入口被清掉，
+    /// 非 .part 文件（.staging 中转等）不受影响。
+    #[tokio::test]
+    async fn sweep_clears_stale_parts_only() {
+        let (_dir, workspace) = make_volume();
+        let volume_root = volume_root_of(&workspace);
+        let incoming = volume_root.join(INCOMING_DIR);
+        std::fs::create_dir_all(&incoming).expect("mkdir incoming");
+        std::fs::write(incoming.join("old-release.zip.part"), b"stale").expect("stale part");
+        std::fs::write(incoming.join("keep.txt"), b"not a part").expect("keep file");
+
+        sweep_incoming_parts(&incoming).await;
+
+        assert!(!incoming.join("old-release.zip.part").exists());
+        assert!(incoming.join("keep.txt").exists());
     }
 
     #[tokio::test]

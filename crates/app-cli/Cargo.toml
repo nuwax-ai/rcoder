@@ -63,6 +63,9 @@ roxmltree = "0.20"
 sha2 = "0.10"
 # 部署段解压制品包（与 rcoder workspace zip 同版本；deflate 足够覆盖平台制品）
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# 部署段制品 zip 魔数校验（拦 HTTP 200 + 错误信封 body 被当 zip 落盘）；
+# 关 default 裁掉 cfb 传递依赖——只用 archive::is_zip 纯函数
+infer = { version = "0.22", default-features = false }
 
 # unix 信号已通过 process_utils 封装（仅 unix 启用，不污染 windows 构建）
 

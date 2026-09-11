@@ -157,8 +157,7 @@ mod tests {
             .and_then(|s| s.split('"').next())
             .expect("pingap-config 行应含 rev = \"...\"");
         assert_eq!(
-            rev,
-            DEFAULT_PINGAP_COMMIT,
+            rev, DEFAULT_PINGAP_COMMIT,
             "Cargo.toml 的 pingap-config rev 与 devtool DEFAULT_PINGAP_COMMIT 漂移——\
              升级 pingap 时两处必须同步修改（另见 build-agent-docker 16-app-runtime.mk）"
         );
