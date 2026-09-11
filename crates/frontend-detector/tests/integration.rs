@@ -50,7 +50,9 @@ fn vue3_template_detected() {
     assert!(result.typescript);
 }
 
-/// next 模板：build=nextjs + ui=react 正交同真 + npm（package-lock）。
+/// next 模板：build=nextjs + ui=react 正交同真 + pnpm（pnpm-workspace.yaml
+/// 优先于残留 package-lock.json——模板 24e412e 起安装链切 pnpm 11，
+/// allowBuilds 白名单文件是更特异的锁信号）。
 #[test]
 fn next_template_detected() {
     if !template_available("userapp-next-template") {
@@ -64,7 +66,7 @@ fn next_template_detected() {
     );
     assert_eq!(result.build.name, "nextjs", "build: {:?}", result.build);
     assert_eq!(result.ui.name, "react", "ui: {:?}", result.ui);
-    assert_eq!(result.package_manager.as_deref(), Some("npm"));
+    assert_eq!(result.package_manager.as_deref(), Some("pnpm"));
     assert!(result.typescript);
 }
 
