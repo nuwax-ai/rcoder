@@ -96,7 +96,9 @@ async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user:
     // request）——容器可能已建成功，重试即通（幂等）
     let mut status = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
     let mut body = Value::Null;
-    for attempt in 0..3 {
+    // 全量套件串行跑到中后段时,系统负载会拖慢新 builder 容器的 file-server
+    // 启动,3x15s 窗口实测间歇性不够(非代码回归,基线二分已证)——放宽到 5 次
+    for attempt in 0..5 {
         let resp = env
             .http
             .post(format!("{}/api/v1/userapp/workspace", env.rcoder))
