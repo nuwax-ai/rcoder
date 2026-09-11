@@ -192,18 +192,18 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {
         let mut removed = Vec::new();
 
-        // 获取缓存快照 (identifier, RuntimeContainerInfo)
-        let cache_snapshot: Vec<(String, RuntimeContainerInfo)> = self
+        // 获取缓存快照 (identifier, RuntimeContainerInfo, service_type)
+        let cache_snapshot: Vec<(String, RuntimeContainerInfo, ServiceType)> = self
             .pod_cache
             .read()
             .await
             .iter()
-            .map(|(k, v)| (k.clone(), v.info.clone()))
+            .map(|(k, v)| (k.clone(), v.info.clone(), v.service_type.clone()))
             .collect();
 
         let checked_count = cache_snapshot.len() as u32;
 
-        for (identifier, container_info) in cache_snapshot {
+        for (identifier, container_info, service_type) in cache_snapshot {
             // container_name 已是 sts_name（get_container_info 源头剥过 -0）。判"真没了"看 STS
             // 是否存在，不看 pod 404（STS replicas>0 时 pod 被 evict/重建会瞬时空缺，误判清缓存
             // 会中断重建）。
@@ -216,8 +216,7 @@ impl KubernetesRuntime {
                         container_name: container_info.container_name.clone(),
                         container_ip: container_info.container_ip.clone(),
                         identifier: identifier.clone(),
-                        // FIXME: RuntimeContainerInfo 不带 service_type；消费方未用，暂占位。
-                        service_type: ServiceType::WebAgentRunner,
+                        service_type,
                     });
                     info!(
                         "[K8S_SYNC] StatefulSet gone, removed from cache: {} (identifier={})",

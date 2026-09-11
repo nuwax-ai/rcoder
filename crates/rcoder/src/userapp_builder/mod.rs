@@ -155,6 +155,11 @@ pub(crate) async fn ensure_userapp_builder_probed(
     if let Some(info) = registered_builder(state, app_id) {
         let addr = dev_file_server_addr(state, &info);
         if probe_file_server(&addr).await {
+            // 探活过 ≠ 归属正确：跨族污染形态下生产容器的 file-server 同样在
+            // 60000 应答（探活恒过、remediation 永不触发）——追加归属交叉校验
+            if let Some(updated) = cross_verify_registration(state, app_id, &info).await {
+                return Ok((updated, false));
+            }
             return Ok((info, false));
         }
         tracing::warn!(
@@ -179,6 +184,53 @@ pub(crate) async fn ensure_userapp_builder_probed(
     }
     let info = create_builder_and_register(state, app_id, explicit_user_id).await?;
     Ok((info, true))
+}
+
+/// 探活通过后的**跨族污染交叉校验**（补"探活失败才自愈"的触发缺口）。
+///
+/// 背景：生产 UserApp 容器与 builder 一样在 60000 跑 file-server——注册表被
+/// 跨族污染时（如生产 pod 被写入 builder 注册项），探活恒过、remediation
+/// 永不触发，dev 流量持续打向生产容器（vnc/ttyd 6080/7681 拒绝显形为 502，
+/// 文件族 60000 则是"错容器成功"更隐蔽）。此处以带类型分流的
+/// `find_container` 真实值与注册值比对：不一致即以 inspect 值刷新注册
+/// （复用 [`refreshed_registration`]），把自愈触发从"探活失败"扩展到
+/// "归属不符"。find 失败/非 Running 时不推翻注册（探活已过的条目维持现状）。
+///
+/// 成本：一次 pods().get（K8s 单 get，毫秒级）。调用方为低频管理面
+/// （ensure_probed）与热路径的 30s 探活缓存 miss 分支，频率受控。
+pub(crate) async fn cross_verify_registration(
+    state: &AppState,
+    app_id: &str,
+    registered: &ContainerBasicInfo,
+) -> Option<ContainerBasicInfo> {
+    let Ok(Some(rc)) = state
+        .runtime()
+        .find_container(app_id, &ServiceType::UserappBuilder)
+        .await
+    else {
+        return None;
+    };
+    if rc.status != container_runtime_api::ContainerRuntimeStatus::Running {
+        return None;
+    }
+    let updated = refreshed_registration(registered, &rc)?;
+    if let Some(mut project) = state.get_project(app_id).map(|p| (*p).clone()) {
+        project.set_container(Some(updated.clone()));
+        if let Err(e) = state.insert_project(app_id.to_string(), Arc::new(project)) {
+            tracing::warn!(
+                "[USERAPP_BUILDER] refresh contaminated registry failed: app_id={app_id}: {e}"
+            );
+            // 写回失败也返回新值——本次请求路由正确比注册表持久一致更紧要，
+            // 下一次校验会再试写
+            return Some(updated);
+        }
+    }
+    tracing::warn!(
+        "[USERAPP_BUILDER] cross-family registry contamination self-healed: app_id={app_id}, registered={} -> actual={}",
+        registered.container_name,
+        updated.container_name
+    );
+    Some(updated)
 }
 
 /// 开发容器 file-server 轻量探活（连接失败/非 2xx 均不可用）。

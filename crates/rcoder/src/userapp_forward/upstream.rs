@@ -193,6 +193,15 @@ async fn resolve_dev_addr(
         }
     }
     if !probe_fresh {
+        // 探活过 ≠ 归属正确：跨族污染（生产 pod 被写入注册表）时生产容器的
+        // file-server 同样在 60000 应答——借 30s 探活缓存 miss 窗口做归属交叉
+        // 校验（成本：每 app 每 30s 一次 K8s get），污染即自愈刷回 builder 值
+        if let Some(updated) =
+            crate::userapp_builder::cross_verify_registration(state, app_id, &info).await
+        {
+            cache.insert(app_id.to_string(), std::time::Instant::now());
+            return Ok(dev_file_server_addr(state, &updated));
+        }
         cache.insert(app_id.to_string(), std::time::Instant::now());
     }
     Ok(addr)
