@@ -46,10 +46,23 @@ pub(super) async fn assemble_workspace_package(
             let mut zw = ZipWriterFile::new(out_file);
 
             // 1. 各子项目产物：zip（raw copy 保留原始压缩字节）或 static 目录
-            //（type=static 的 artifact 为静态内容目录——递归打入 {path}/ 前缀）
+            //（type=static 的 artifact 为静态内容目录——**保留 artifact 目录层**
+            // 打入 `{path}/{artifact}/...`：app-cli 静态托管内容根 =
+            // `{workspace}/{dir}/{[build].artifact 目录}`（release lock 透传，
+            // static_hosting.rs），平铺进 `{path}/` 会让 content dir 永远缺失、
+            // 流量恒 404 等待）
             for proj in &built_for_task {
                 if proj.artifact.is_dir() {
-                    add_dir_entries(&mut zw, &proj.artifact, &proj.path)?;
+                    let artifact_name = proj
+                        .artifact
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    add_dir_entries(
+                        &mut zw,
+                        &proj.artifact,
+                        &format!("{}/{}", proj.path, artifact_name),
+                    )?;
                 } else {
                     merge_artifact_with_prefix(&mut zw, &proj.artifact, &proj.path)?;
                 }
@@ -425,8 +438,11 @@ mod tests {
             "partial workspace package should be cleaned up on failure"
         );
     }
-    /// static 目录产物：artifact 为目录时递归打入 {path}/ 前缀（zip 产物走
-    /// raw copy 的既有分支不变）。
+    /// static 目录产物：artifact 为目录时**保留 artifact 目录层**打入
+    /// `{path}/{artifact}/...`——app-cli 静态托管内容根按 release lock 的
+    /// [build].artifact 目录定位（`{workspace}/{dir}/{artifact}`），平铺会让
+    /// content dir 永远缺失（流量恒 404 等待）。zip 产物走 raw copy 的既有
+    /// 分支不变。
     #[tokio::test]
     async fn assemble_packs_static_directory_artifacts() {
         let ws = tempfile::tempdir().expect("ws tempdir");
@@ -454,12 +470,13 @@ mod tests {
             .await
             .expect("extract");
         let root = extract_dst.path();
+        // 契约：dist 目录层保留（app-cli 按 {dir}/{artifact} 定位内容根）
         assert_eq!(
-            std::fs::read_to_string(root.join("frontend/index.html")).unwrap(),
+            std::fs::read_to_string(root.join("frontend/dist/index.html")).unwrap(),
             "<html>static</html>"
         );
         assert_eq!(
-            std::fs::read_to_string(root.join("frontend/assets/app.js")).unwrap(),
+            std::fs::read_to_string(root.join("frontend/dist/assets/app.js")).unwrap(),
             "js"
         );
     }
