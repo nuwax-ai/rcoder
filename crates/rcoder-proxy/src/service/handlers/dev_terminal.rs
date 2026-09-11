@@ -43,11 +43,17 @@ pub struct DevProxyDeps<'a> {
 /// 懒启动：注册表 miss 时经 `UserappDevEnsure` 回调自动 ensure 创建（开终端是
 /// 使用语义；owner 走 metadata 链——浏览器终端 URL 无入参携带能力），
 /// ensure 失败或回调未注入才 404（指引先建工作区）。
+///
+/// `probe_port`：注册表命中后的死值探测——内存 lookup 表（rcoder-storage）
+/// 不随容器物理删除失效（hit 恒返旧 IP），TCP connect 该端口失败即视为
+/// 死值，落入 ensure 懒启动自愈（ensure 幂等：容器真在则复用，探测误判
+/// 只是多一次幂等调用）。
 pub(crate) async fn find_dev_container(
     container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
     dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
     app_id: &str,
     user_id: &str,
+    probe_port: u16,
 ) -> Result<String, Box<pingora_core::Error>> {
     if let Err(e) = shared_types::validate_identifier(app_id, "app_id") {
         warn!("[DEV_TERMINAL] invalid app_id: {}", e);
@@ -67,10 +73,12 @@ pub(crate) async fn find_dev_container(
             lookup.find_by_project_id(app_id, &shared_types::ServiceType::UserappBuilder)
         })
         .filter(|ip| !ip.is_empty())
+        && utils::tcp_port_reachable(&ip, probe_port).await
     {
         return Ok(ip);
     }
-    // miss → 懒启动（显式 owner 档：URL user_id 段直取，宿主树
+    // miss（或命中死值——容器被外部删除后内存表残留旧 IP，探测失败）
+    // → 懒启动（显式 owner 档：URL user_id 段直取，宿主树
     // `dev/{user_id}/{app_id}` 分区正确，不依赖 metadata 兜底）。
     // 槽未回填（AppState 就绪前）视为未注入，维持 404 指引。
     let Some(ensurer) = dev_ensure.load_full() else {
@@ -163,8 +171,14 @@ pub async fn handle_dev_ttyd_upstream(
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
     let user_id = require_user_id(&params)?;
-    let container_ip =
-        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, &user_id).await?;
+    let container_ip = find_dev_container(
+        deps.container_lookup,
+        deps.dev_ensure,
+        &app_id,
+        &user_id,
+        shared_types::WS_TERMINAL_PORT,
+    )
+    .await?;
 
     deps.metrics.record_request();
     deps.metrics.inc_active();
@@ -221,8 +235,14 @@ pub async fn handle_dev_vnc_upstream(
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
     let user_id = require_user_id(&params)?;
-    let container_ip =
-        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, &user_id).await?;
+    let container_ip = find_dev_container(
+        deps.container_lookup,
+        deps.dev_ensure,
+        &app_id,
+        &user_id,
+        shared_types::NOVNC_PORT,
+    )
+    .await?;
 
     deps.metrics.record_request();
     deps.metrics.inc_active();
@@ -273,8 +293,10 @@ pub async fn handle_dev_audio_request(
     };
 
     let user_id = require_user_id(&params)?;
+    // audio 传 0 跳过命中探测：builder 容器无音频服务（svc 亦不声明
+    // 6089/6090），探测恒超时只增每请求延迟
     let container_ip =
-        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, &user_id).await?;
+        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, &user_id, 0).await?;
     deps.metrics.record_request();
     deps.metrics.record_request_port(target_port);
     ctx.target_port = Some(target_port);
@@ -331,8 +353,14 @@ pub async fn handle_dev_ime_request(
     let user_id = require_user_id(&params)?;
     let target_path = target_path_of(&params);
 
-    let container_ip =
-        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, &user_id).await?;
+    let container_ip = find_dev_container(
+        deps.container_lookup,
+        deps.dev_ensure,
+        &app_id,
+        &user_id,
+        shared_types::IME_PORT,
+    )
+    .await?;
     deps.metrics.record_request();
     deps.metrics.record_request_port(shared_types::IME_PORT);
     ctx.target_port = Some(shared_types::IME_PORT);

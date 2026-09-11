@@ -129,6 +129,25 @@ pub fn mask_domain(domain: &str) -> String {
     format!("{}***{}", prefix, suffix)
 }
 
+/// TCP 端口可达探测（2s 上限——成功路径毫秒级返回；只判 connect 成败，
+/// 不做协议交互）。两类消费：注册表/命名命中值的死值甄别（容器被外部删除
+/// 后残留引用），以及解析结果防假（OrbStack 等环境的 DNS 对不存在名字返回
+/// fake-ip（198.18.0.0/15）而非 NXDOMAIN——解析"成功"但连接黑洞，探测让
+/// 其快速失败回落。`probe_port == 0` 跳过探测（目标端口无对应服务的场景）。
+pub(crate) async fn tcp_port_reachable(ip: &str, probe_port: u16) -> bool {
+    if probe_port == 0 {
+        return true;
+    }
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(2000),
+            tokio::net::TcpStream::connect((ip, probe_port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
