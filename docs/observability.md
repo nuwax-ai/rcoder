@@ -7,7 +7,8 @@
 | 工具 | 用途 | 启用方式 | 排查场景 |
 |------|------|----------|----------|
 | **OTLP → Tempo** | 分布式追踪（跨服务全链路 trace） | compose 常开 | 全链路瀑布/火焰图、生产事故排查 |
-| **trace_id 日志注入** | 日志 JSON 顶层 trace_id 字段 | 自动（有 traceparent 时） | 跨服务全链路日志过滤 |
+| **trace_id 日志注入** | 日志 JSON 顶层 trace_id 字段 | 自动（有 traceparent 继承；无则合成） | 跨服务全链路日志过滤 |
+| **Loki + fluent-bit** | 结构化日志采集检索（生产同链路） | compose 常开（`make logs-*`） | 关键字/trace_id 查日志、Log context |
 | **tokio-console** | 异步任务/锁/waker 运行时观测 | `console` feature | 死锁、锁等待、任务泄漏 |
 | **Pyroscope** | CPU 火焰图持续剖析 | 已部署（compose） | CPU 热点 |
 | **/metrics** | HTTP 请求量/延迟 | 默认开启 | 性能回归 |
@@ -61,7 +62,33 @@ curl -H "traceparent: 00-abcdef1234567890abcdef1234567890-0123456789abcdef-01" .
 jq 'select(.trace_id == "abcdef1234567890abcdef1234567890")' logs/rcoder.$(date +%Y-%m-%d)
 ```
 
-**无需配置**——span field 方案直接工作（不依赖 OTLP exporter）。无 traceparent 时日志行为不变。
+**无需配置**——span field 方案直接工作（不依赖 OTLP exporter）。无 traceparent 时请求 span
+**合成新 trace_id**（`remote_context_or_synthesized` 装成 remote parent），日志 field、OTel span、
+注入出去的 traceparent、Tempo 四处同一 id——每个请求的日志都可按 trace_id 检索与串联。
+
+## Loki + fluent-bit 日志链路（生产同构）
+
+```
+/app/logs/*.log（stdout 重定向产物） ──> fluent-bit:3.2.10 ──> Loki:3.7.7 ──> Grafana
+```
+
+本地复刻生产采集链路（同版本、OUTPUT 逐字复制、`Line_Format` 随 stage 演进）；配置在
+`docker/fluent-bit/`、`docker/loki/`。生产无 kube-apiserver 的两处替身见文件头注释
+（Lua `synthesize_k8s_meta` 构造同构 kubernetes map + Merge_Log/Keep_Log 仿真）。
+
+```bash
+make logs-up          # 启动 Loki + fluent-bit（Grafana 重启装载合并数据源）
+make logs-query Q='{job="fluent-bit"} |= "关键字"'
+make logs-fidelity    # fluent-bit health/storage + Loki ready 自检
+```
+
+**控制台 JSON 开关**：`TELEMETRY_CONSOLE_JSON=1` 时 stdout 输出与文件层同款的单行 JSON
+（root trace_id），stdout 重定向进 `rcoder.log`（生产 `start-services.sh` 即此形态）后
+采集器直接拿到结构化日志；默认 0=ANSI 文本（线上零影响）。JSON 模式额外拦掉两种
+OTel 导出噪声拼写（`opentelemetry-otlp` / `opentelemetry_sdk`，B0 基线占 20.3%）。
+
+Grafana（http://localhost:3000）→ Explore → Loki：日志行内 trace_id 生成可点击
+**TraceID** 字段跳 Tempo；Tempo trace 视图反向 tracesToLogsV2 跳回日志行。
 
 ## tokio-console
 
@@ -109,11 +136,11 @@ metrics 直方图 p50=3.1s / p99=10s，folded 里 max 仅 67ms（差 150 倍）�
 ## 完整排查链路
 
 ```
-e2e 注入 traceparent
+请求（有 traceparent 继承；无则合成——本指南）
   ↓
-rcoder 日志 JSON 顶层 trace_id（本指南）
+rcoder 日志 JSON 顶层 trace_id（jq / Loki `| json | log_processed_trace_id=`）
   ↓                          ↓
-jq 过滤全链路          tokio-console 看锁/任务
-                             ↓
-                    tracing-flame 看 span 耗时火焰图
+Loki 关键字/字段检索        tokio-console 看锁/任务
+  ↓ TraceID 字段
+Tempo trace 瀑布/Flame graph（tracesToLogsV2 回跳 Loki）
 ```

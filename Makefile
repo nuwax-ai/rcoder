@@ -20,7 +20,8 @@
 	pyroscope-up pyroscope-down pyroscope-logs \
 	agent-runner-up agent-runner-down agent-runner-logs agent-runner-restart agent-runner-status \
 	console-on console-off \
-	k8s-offline-bundle k8s-offline-import k8s-offline-images-list k8s-offline-clean
+	k8s-offline-bundle k8s-offline-import k8s-offline-images-list k8s-offline-clean \
+	logs-help logs-up logs-down logs-query logs-fidelity
 
 # 包含子 Makefile
 include make/docker.mk
@@ -33,6 +34,7 @@ include make/test.mk
 include make/quality.mk
 include make/pyroscope.mk
 include make/agent-runner.mk
+include make/observability.mk
 
 # 本地编译（仅编译，不构建镜像）
 build:

@@ -238,6 +238,8 @@ pub(crate) struct SubscriberParams<'a> {
     pub tokio_console_layer: Option<BoxedLayer>,
     /// span 耗时→直方图规则（SpanMetricsLayer）
     pub span_metrics: Vec<crate::span_metrics::SpanMetricRule>,
+    /// 控制台（stdout）日志 JSON 化（`TELEMETRY_CONSOLE_JSON`；默认 false=ANSI 文本）
+    pub console_json: bool,
 }
 
 pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()> {
@@ -250,6 +252,7 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
         extra_layer,
         tokio_console_layer,
         span_metrics,
+        console_json,
     } = params;
 
     // 创建 EnvFilter（支持 RUST_LOG 环境变量）
@@ -271,14 +274,9 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
     }
     let deny_tokio = tokio_console_layer.is_some();
 
-    // 控制台日志层（deny file_server + console 开启时额外 deny tokio/runtime）
-    let console_layer = fmt::layer()
-        .with_target(true)
-        .with_ansi(true)
-        .with_thread_ids(false)
-        .with_file(false)
-        .with_line_number(false)
-        .with_filter(filter_fn(make_deny_filter(deny_tokio)));
+    // 控制台日志层（JSON 模式复用文件层同款 formatter + OTel 噪声过滤，
+    // 文本模式保持原行为；见 build_console_layer）
+    let console_layer = build_console_layer(console_json, deny_tokio, std::io::stdout);
 
     // 文件日志层
     let file_layer = if let Some(file_config) = file_log_config {
@@ -355,6 +353,69 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
     }
 
     Ok(())
+}
+
+/// 控制台日志层构建器（`TELEMETRY_CONSOLE_JSON` 开关的两分支）。
+///
+/// - `console_json=true`：与文件 JSON 层同款 [`TraceIdJsonFormat`]（单行 JSON +
+///   root `trace_id`）+ `with_ansi(false)`（ANSI 转义序列会污染结构化流）+
+///   [`make_json_console_filter`]（额外拦两种 OTel 噪声拼写）。面向 stdout 被
+///   重定向进 `rcoder.log`、由日志采集器消费的场景。
+/// - `console_json=false`：原文本行为逐字段不变（ANSI + target，无 thread/file）。
+///
+/// S 泛型 + 返回 `Box<dyn Layer<S>>`：boxed 对象只能挂在类型精确匹配的
+/// subscriber 链位置（S 由调用点的 `.with()` 位置推断，与文件层同一模式）。
+/// writer 参数化仅为测试注入（生产传 `std::io::stdout`）。
+fn build_console_layer<S, W>(
+    console_json: bool,
+    deny_tokio: bool,
+    writer: W,
+) -> Box<dyn Layer<S> + Send + Sync + 'static>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'a> fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    if console_json {
+        fmt::layer()
+            .json()
+            .event_format(TraceIdJsonFormat)
+            .with_ansi(false)
+            .with_writer(writer)
+            .with_filter(filter_fn(make_json_console_filter(deny_tokio)))
+            .boxed()
+    } else {
+        fmt::layer()
+            .with_target(true)
+            .with_ansi(true)
+            .with_thread_ids(false)
+            .with_file(false)
+            .with_line_number(false)
+            .with_writer(writer)
+            .with_filter(filter_fn(make_deny_filter(deny_tokio)))
+            .boxed()
+    }
+}
+
+/// JSON 控制台模式专用 deny 过滤器：[`make_deny_filter`] 的全量语义（file_server /
+/// tokio-console 时的 tokio+runtime）+ 额外拦截 OTel 导出噪声的**两种拼写**
+/// （`opentelemetry-otlp` 连字符 / `opentelemetry_sdk` 下划线——B0 基线两者并存，
+/// 仅拦一种漏 56%，合计占当日日志 20.3%）。
+///
+/// 仅 JSON 模式启用：JSON 面向采集器的结构化流，噪声行污染 Loki 检索；文本模式
+/// （本地开发）保持原行为，便于排查 OTLP 本身的问题。
+/// 不并入 [`make_deny_filter`]：该函数被 OTel/文件层共用，是 OOM 敏感路径，
+/// 语义任何变化都可能改变生产导出行为。
+fn make_json_console_filter(
+    deny_tokio: bool,
+) -> impl Fn(&tracing::Metadata<'_>) -> bool + Send + Sync + 'static {
+    move |meta: &tracing::Metadata<'_>| {
+        let target = meta.target();
+        let deny = target.starts_with("file_server")
+            || target.starts_with("opentelemetry-otlp")
+            || target.starts_with("opentelemetry_sdk")
+            || (deny_tokio && (target.starts_with("tokio") || target.starts_with("runtime")));
+        !deny
+    }
 }
 
 /// per-layer deny 过滤器工厂：deny `file_server` target（独立日志域），
@@ -517,6 +578,282 @@ mod extra_layer_tests {
         assert!(
             written.contains("hello from file server"),
             "file_server 事件未写入 extra_layer 文件, 实际内容: {written:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod trace_id_json_format_tests {
+    use super::*;
+    use tracing_appender::rolling::{Builder, Rotation};
+
+    const VALID_TRACE_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rcoder-b1-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 与生产文件层同构的最小装配：TraceIdExtractor（extensions 截获）+
+    /// EnvFilter + JSON formatter（TraceIdJsonFormat）写盘。
+    fn write_one_event(dir: &std::path::Path, record_trace_id: bool) -> String {
+        let appender = Builder::new()
+            .rotation(Rotation::NEVER)
+            .filename_prefix("json-test.log")
+            .build(dir)
+            .unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(TraceIdExtractor)
+            .with(EnvFilter::new("debug"))
+            .with(
+                fmt::layer()
+                    .json()
+                    .event_format(TraceIdJsonFormat)
+                    .with_writer(appender)
+                    .with_ansi(false),
+            );
+        tracing::subscriber::with_default(subscriber, || {
+            // 与 make_span_with_trace_parent 同款声明：field::Empty 先占位再 record
+            let span = tracing::info_span!(
+                "http_request",
+                method = "GET",
+                uri = "/health",
+                trace_id = tracing::field::Empty
+            );
+            let _guard = span.enter();
+            if record_trace_id {
+                span.record("trace_id", tracing::field::display(VALID_TRACE_ID));
+            }
+            tracing::info!(target: "rcoder::b1", user = "tester", "Server starting on port 8086");
+        });
+        std::fs::read_to_string(dir.join("json-test.log")).unwrap()
+    }
+
+    /// span.record(trace_id) 后：root 级 trace_id 存在且值等于记录值
+    /// （B4 console JSON 分支复用同一 formatter，此契约即两条通道的共同保证）。
+    #[test]
+    fn root_trace_id_present_when_recorded() {
+        let dir = temp_dir("present");
+        let written = write_one_event(&dir, true);
+        let obj: Value = serde_json::from_str(written.trim_end()).unwrap();
+        assert_eq!(obj["trace_id"], json!(VALID_TRACE_ID));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 未 record 时 root 级 trace_id 缺席（被动继承模型的现状行为）。
+    #[test]
+    fn root_trace_id_absent_without_record() {
+        let dir = temp_dir("absent");
+        let written = write_one_event(&dir, false);
+        let obj: Value = serde_json::from_str(written.trim_end()).unwrap();
+        assert!(obj.get("trace_id").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// span{}/spans[] 形态：current span 对象含 name 与已格式化字段。
+    #[test]
+    fn span_and_spans_shape() {
+        let dir = temp_dir("spans");
+        let written = write_one_event(&dir, true);
+        let obj: Value = serde_json::from_str(written.trim_end()).unwrap();
+        let span = &obj["span"];
+        assert_eq!(span["name"], json!("http_request"));
+        assert_eq!(span["method"], json!("GET"));
+        assert_eq!(span["uri"], json!("/health"));
+        let spans = obj["spans"].as_array().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["name"], json!("http_request"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 标准 JSON 字段齐全（与标准 Format<Json> 逐字段对齐的契约）。
+    #[test]
+    fn standard_fields_present() {
+        let dir = temp_dir("fields");
+        let written = write_one_event(&dir, false);
+        let obj: Value = serde_json::from_str(written.trim_end()).unwrap();
+        let ts = obj["timestamp"].as_str().unwrap();
+        assert!(
+            ts.contains('T') && ts.len() >= 20,
+            "timestamp 非 rfc3339: {ts}"
+        );
+        assert_eq!(obj["level"], json!("INFO"));
+        assert_eq!(obj["target"], json!("rcoder::b1"));
+        assert_eq!(obj["fields"]["user"], json!("tester"));
+        assert!(obj["filename"].as_str().unwrap().ends_with("subscriber.rs"));
+        assert!(obj["line_number"].as_u64().unwrap() > 0);
+        assert!(obj["threadId"].as_str().is_some());
+        assert!(obj["threadName"].as_str().is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 单行输出且整体可被 serde_json 解析（Loki `| json` 的前提）。
+    #[test]
+    fn single_line_parseable_json() {
+        let dir = temp_dir("single");
+        let written = write_one_event(&dir, true);
+        let trimmed = written.trim_end_matches('\n');
+        assert!(!trimmed.contains('\n'), "输出不是单行: {trimmed:?}");
+        assert_eq!(trimmed.lines().count(), 1);
+        assert!(serde_json::from_str::<Value>(trimmed).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// grep 契约（start-services.sh:77 依赖）：message 子串在 JSON 转义后逐字保留。
+    /// serde_json 只转义 `"`/`\`/控制字符，普通子串不受影响——锁定此性质。
+    #[test]
+    fn message_substring_survives_json_escaping() {
+        let dir = temp_dir("grep");
+        let written = write_one_event(&dir, true);
+        assert!(
+            written.contains("Server starting on port 8086"),
+            "message 子串被转义破坏: {written}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// is_valid_hex 边界：32 位 hex 通过；31/33 位与非 hex 拒绝。
+    #[test]
+    fn is_valid_hex_rejects_malformed() {
+        assert!(TraceIdVisitor::is_valid_hex(VALID_TRACE_ID));
+        assert!(
+            !TraceIdVisitor::is_valid_hex(&VALID_TRACE_ID[1..]),
+            "31 hex 应拒绝"
+        );
+        assert!(
+            !TraceIdVisitor::is_valid_hex(&format!("{VALID_TRACE_ID}f")),
+            "33 hex 应拒绝"
+        );
+        assert!(
+            !TraceIdVisitor::is_valid_hex("zzzz456789abcdef0123456789abcdef"),
+            "非 hex 应拒绝"
+        );
+        assert!(!TraceIdVisitor::is_valid_hex(""), "空串应拒绝");
+    }
+}
+
+#[cfg(test)]
+mod console_layer_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    const VALID_TRACE_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    /// 测试用 writer：捕获 fmt layer 输出（生产传 std::io::stdout，
+    /// 经 build_console_layer 的 writer 参数注入）。
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured_string(writer: &CaptureWriter) -> String {
+        String::from_utf8(writer.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// 用 build_console_layer 的指定分支装配 registry 并发出事件（含 trace_id）。
+    fn emit_events(console_json: bool, writer: &CaptureWriter) {
+        let layer = build_console_layer(console_json, false, writer.clone());
+        let subscriber = tracing_subscriber::registry()
+            .with(TraceIdExtractor)
+            .with(EnvFilter::new("trace"))
+            .with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "http_request",
+                method = "GET",
+                uri = "/health",
+                trace_id = tracing::field::Empty
+            );
+            let _guard = span.enter();
+            span.record("trace_id", tracing::field::display(VALID_TRACE_ID));
+            tracing::info!(target: "rcoder::console", "Server starting on port 8086");
+            // B0 基线的两种 OTel 噪声拼写
+            tracing::debug!(target: "opentelemetry-otlp::exporter", retry = 3, "noise hyphen");
+            tracing::debug!(target: "opentelemetry_sdk::trace", "noise underscore");
+            // file_server 独立日志域（两模式都必须 deny）
+            tracing::debug!(target: "file_server::router", "noise file_server");
+        });
+    }
+
+    /// JSON 分支：输出单行 JSON、root trace_id 存在、grep 契约保留。
+    #[test]
+    fn json_branch_writes_single_line_json_with_root_trace_id() {
+        let writer = CaptureWriter::default();
+        emit_events(true, &writer);
+        let out = captured_string(&writer);
+        let line = out.trim_end();
+        assert_eq!(line.lines().count(), 1, "应为单行 JSON: {out:?}");
+        let obj: Value = serde_json::from_str(line).expect("JSON 分支输出应为合法 JSON");
+        assert_eq!(obj["trace_id"], json!(VALID_TRACE_ID));
+        assert!(
+            line.contains("Server starting on port 8086"),
+            "grep 契约破坏: {line}"
+        );
+    }
+
+    /// JSON 分支：两种 OTel 噪声拼写 + file_server 全部被 deny，
+    /// 业务 target（rcoder::console）正常通过。
+    #[test]
+    fn json_branch_denies_otel_noise_both_spellings_and_file_server() {
+        let writer = CaptureWriter::default();
+        emit_events(true, &writer);
+        let out = captured_string(&writer);
+        assert!(
+            !out.contains("noise hyphen"),
+            "opentelemetry-otlp 漏拦: {out:?}"
+        );
+        assert!(
+            !out.contains("noise underscore"),
+            "opentelemetry_sdk 漏拦: {out:?}"
+        );
+        assert!(
+            !out.contains("noise file_server"),
+            "file_server 漏拦: {out:?}"
+        );
+        assert!(
+            out.contains("rcoder::console"),
+            "业务 target 不应被拦: {out:?}"
+        );
+    }
+
+    /// 文本分支：行为不变——非 JSON、无 root trace_id、OTel 噪声不拦（便于本地排查）。
+    #[test]
+    fn text_branch_keeps_original_shape_and_allows_otel_noise() {
+        let writer = CaptureWriter::default();
+        emit_events(false, &writer);
+        let out = captured_string(&writer);
+        assert!(
+            !out.trim_start().starts_with('{'),
+            "文本分支不应输出 JSON: {out:?}"
+        );
+        assert!(out.contains("Server starting on port 8086"));
+        assert!(
+            out.contains("noise hyphen"),
+            "文本模式不应拦 opentelemetry-otlp: {out:?}"
+        );
+        assert!(
+            out.contains("noise underscore"),
+            "文本模式不应拦 opentelemetry_sdk: {out:?}"
+        );
+        assert!(
+            !out.contains("noise file_server"),
+            "file_server 两模式都必须拦: {out:?}"
         );
     }
 }

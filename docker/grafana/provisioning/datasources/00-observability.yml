@@ -1,0 +1,64 @@
+apiVersion: 1
+
+# 三个数据源合并单文件（陷阱 3：Loki derivedFields → tempo 与 Tempo tracesToLogsV2 → loki
+# 互相以 uid 引用；拆成多文件时 provisioning 按文件序校验，交叉引用会启动失败——
+# 原 tempo.yml 注释记录的 tracesToMetrics 失败即同一根因）。
+# 文件内顺序: Prometheus → Loki → Tempo（tracesToLogsV2 显式 datasourceUid 引用
+# 已存在的 Loki 行；Loki derivedFields 的 datasourceUid 是惰性解析，不受序影响）。
+# 取代原 default.yml（仅 Prometheus）与 tempo.yml（仅 Tempo）。
+
+datasources:
+  # Prometheus 数据源（容器内部网络）
+  # 不指定 uid：grafana-data 卷里已有旧 default.yml 建的无 uid 行，provisioning
+  # 按名字匹配沿用旧 uid；本文件没有任何按 uid 引用 Prometheus 的地方
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: "15s"
+
+  # Loki 日志数据源（fluent-bit → Loki，生产同链路）
+  # derivedFields：日志行内 trace_id 生成可点击 TraceID 字段 → 跳 Tempo 查轨迹。
+  # matcherRegex 兼容两种行形态：stage B（json）的 "trace_id":"hex" 与
+  # stage A（key_value）Go map 渲染的 trace_id:hex
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: false
+    editable: true
+    jsonData:
+      derivedFields:
+        - name: TraceID
+          matcherRegex: 'trace_id"?\s*[:=]\s*"?([0-9a-f]{32})'
+          datasourceUid: tempo
+          url: '$${__value.raw}'
+
+  # Tempo 分布式追踪数据源（App → otel-collector → Tempo）
+  # Explore → Tempo：按 service.name / trace_id 检索，自带 Flame graph 与瀑布视图
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: false
+    editable: true
+    jsonData:
+      httpMethod: GET
+      # Tempo → Loki 回跳：查 trace 时一键跳回日志行（trace↔logs 双向联动的回程）
+      # customQuery 固定走 job=fluent-bit + ns=nuwax-k8s-test 选择器（本地合成 ns），
+      # 避免 Grafana 自动按 span tag 生成 ns 匹配器（rcoder span 无该 tag → 空选择器）。
+      # datasourceUid 必须显式给出：缺省会隐式查"默认日志数据源"，冷启动 DB 为空
+      # → Grafana 13 provisioning 报 "data source not found" 启动失败
+      tracesToLogsV2:
+        datasourceUid: loki
+        customQuery: true
+        query: '{job="fluent-bit", ns="nuwax-k8s-test"} |= "$${__trace.traceId}"'
+
+# 注意: Pyroscope 有独立的 Web UI (http://localhost:4040)
+# Grafana 原生不支持 Pyroscope 作为 datasource
+# 请直接访问 Pyroscope Web UI 查看性能剖析数据

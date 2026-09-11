@@ -22,6 +22,13 @@ services:
       # 库默认 1h 在本进程事件速率下必然 OOM，5 分钟是观测价值与内存的平衡点）
       - TOKIO_CONSOLE_RETENTION=${TOKIO_CONSOLE_RETENTION:-300}
       # console layer 是 per-layer filter，但静态 level hint 需要全局放行
+      # 控制台日志 JSON 化（B4）：1=stdout 单行 JSON（root trace_id，复用文件层
+      # formatter）+ 拦两种 OTel 噪声拼写；0=ANSI 文本（默认，线上零影响）。
+      # B5 起 stdout 重定向进 /app/logs/rcoder.log 时，fluent-bit 即采到结构化日志
+      - TELEMETRY_CONSOLE_JSON=${TELEMETRY_CONSOLE_JSON:-0}
+      # stdout/stderr 重定向进 /app/logs/rcoder.log（B5；生产 start-services.sh 同形态，
+      # 配合 TELEMETRY_CONSOLE_JSON=1 产出被 fluent-bit 采集的结构化日志）
+      - RCODER_LOG_TO_FILE=${RCODER_LOG_TO_FILE:-0}
       # app_manager（UserApp）Docker 模式工作空间根（app-workspace 挂在 /app/app-workspace）；
       # 不设则默认 /app/project_workspace/apps，与挂载点不符，文件管理/storage 会路径错
       - RCODER_WORKSPACE_ROOT=/app/app-workspace
@@ -172,6 +179,42 @@ services:
       - TZ=Asia/Shanghai
     restart: unless-stopped
 
+  # Loki - 日志后端（3.7.7 = 生产同版本，runbook upgrade-step3-3.7 同代）
+  # 阶段一 B3：fluent-bit → Loki → Grafana 复刻生产采集链路；配置见 docker/loki/loki.yml
+  # （tsdb/v13 + 三条生产 limits 逐字复制：allow_structured_metadata false /
+  #   max_label_names_per_series 40 / max_line_size 2MB）
+  loki:
+    image: grafana/loki:3.7.7
+    container_name: rcoder-loki
+    command: ["-config.file=/etc/loki/loki.yml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+
+  # fluent-bit - 日志采集（3.2.10 = 生产硬下限版本，CRI 纳秒时间戳兼容）
+  # tail /app/logs/*.log = sidecar _log-shipper.tpl:37 所 tail 的同一 glob；
+  # 仅 rcoder.log（stdout 重定向产物）会被采集，按天滚动的 rcoder.<date> 不匹配——
+  # 与生产断点①行为一致，属预期保真
+  fluent-bit:
+    image: fluent/fluent-bit:3.2.10
+    container_name: rcoder-fluent-bit
+    ports:
+      - "2020:2020" # health / storage / metrics API
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - ./fluent-bit/helpers.lua:/fluent-bit/etc/helpers.lua:ro
+      - ./logs:/app/logs:ro
+      - fluent-bit-storage:/var/lib/fluent-bit
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+
   # Grafana - 可视化平台
   grafana:
     image: grafana/grafana:latest
@@ -189,6 +232,7 @@ services:
     depends_on:
       - prometheus
       - tempo
+      - loki
     restart: unless-stopped
 
 volumes:
@@ -196,6 +240,10 @@ volumes:
   tempo-data:
   prometheus-data:
   grafana-data:
+  # Loki 本地数据（tsdb index + filesystem chunks）
+  loki-data:
+  # fluent-bit 缓冲落盘（Storage.Path + tail DB + rewrite_tag emitter）
+  fluent-bit-storage:
   # 容器内热编译缓存（本地开发测试用）
   rcoder-cargo-registry:
   rcoder-cargo-git:

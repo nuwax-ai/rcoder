@@ -29,6 +29,13 @@ pub struct TelemetryConfig {
     pub console_layer: Option<BoxedLayer>,
     /// span 耗时→直方图指标规则（SpanMetricsLayer；空=不桥接）
     pub span_metrics: Vec<crate::span_metrics::SpanMetricRule>,
+    /// 控制台（stdout）日志 JSON 化开关（`TELEMETRY_CONSOLE_JSON`，默认 false）。
+    ///
+    /// true 时控制台层输出与文件层同款的单行 JSON（含 root `trace_id`，
+    /// 复用 [`crate::subscriber::TraceIdJsonFormat`] 契约）——服务管理脚本把
+    /// stdout 重定向进 `rcoder.log`（命中日志采集器的 `*.log` glob）时，
+    /// 采集器拿到的是结构化日志。false 保持人类可读的 ANSI 文本（线上零影响）。
+    pub console_json: bool,
 }
 
 /// OTLP 导出器配置
@@ -75,6 +82,7 @@ impl std::fmt::Debug for TelemetryConfig {
             .field("extra_layer", &self.extra_layer.is_some())
             .field("extra_layer_guard", &self.extra_layer_guard.is_some())
             .field("console_layer", &self.console_layer.is_some())
+            .field("console_json", &self.console_json)
             .finish()
     }
 }
@@ -90,6 +98,7 @@ impl Default for TelemetryConfig {
             extra_layer_guard: None,
             console_layer: None,
             span_metrics: Vec::new(),
+            console_json: false,
         }
     }
 }
@@ -144,6 +153,18 @@ impl FileLogConfig {
     }
 }
 
+/// `TELEMETRY_CONSOLE_JSON` 取值解析（纯函数，便于测试）：
+/// `1`/`true`/`on`（不区分大小写，容忍空白）开启，缺省与其余值均为 false。
+fn parse_console_json_flag(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => {
+            let v = v.trim().to_lowercase();
+            v == "1" || v == "true" || v == "on"
+        }
+        None => false,
+    }
+}
+
 impl TelemetryConfig {
     /// 创建新的配置
     pub fn new(service_name: impl Into<String>) -> Self {
@@ -161,6 +182,7 @@ impl TelemetryConfig {
     /// - `OTEL_TRACES_SAMPLER_ARG` - 采样率
     /// - `OTEL_EXPORTER_OTLP_PROTOCOL` - 协议（grpc/http）
     /// - `TELEMETRY_PROMETHEUS_ENABLED` - 是否启用 Prometheus（true/false）
+    /// - `TELEMETRY_CONSOLE_JSON` - 控制台日志 JSON 化（1/true/on，默认关）
     pub fn from_env(default_service_name: impl Into<String>) -> Self {
         let service_name =
             env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| default_service_name.into());
@@ -195,6 +217,10 @@ impl TelemetryConfig {
             None
         };
 
+        // 控制台 JSON 开关：默认 false（线上零影响）
+        let console_json =
+            parse_console_json_flag(env::var("TELEMETRY_CONSOLE_JSON").ok().as_deref());
+
         Self {
             service_name,
             otlp,
@@ -204,6 +230,7 @@ impl TelemetryConfig {
             extra_layer_guard: None,
             console_layer: None,
             span_metrics: Vec::new(),
+            console_json,
         }
     }
 
@@ -333,5 +360,28 @@ mod tests {
         let file_log = config.file_log.unwrap();
         assert_eq!(file_log.filename_prefix, "my-service");
         assert_eq!(file_log.directory, PathBuf::from("logs"));
+    }
+
+    /// TELEMETRY_CONSOLE_JSON 取值解析：1/true/on 开启；缺省与其余值 false。
+    #[test]
+    fn test_console_json_flag_parsing() {
+        let cases = [
+            (None, false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("TRUE"), true),
+            (Some("on"), true),
+            (Some(" 1 "), true),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some(""), false),
+        ];
+        for (value, expect) in cases {
+            assert_eq!(
+                parse_console_json_flag(value),
+                expect,
+                "TELEMETRY_CONSOLE_JSON={value:?}"
+            );
+        }
     }
 }

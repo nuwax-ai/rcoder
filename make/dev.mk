@@ -88,3 +88,8 @@ console-off:
 ## 连接本地 dev 容器的 tokio-console TUI 面板（6669 已随 compose 映射宿主）
 console:
 	@tokio-console localhost:6669
+
+## 查看开发模式容器日志（rcoder + 全部关联服务，跟随输出）
+dev-logs:
+	@echo "📋 开发模式容器日志（Ctrl+C 退出）:"
+	@docker-compose -f docker/docker-compose.yml logs -f

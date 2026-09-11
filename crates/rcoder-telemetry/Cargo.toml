@@ -43,6 +43,7 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
 pin-project-lite = { workspace = true }
+rand.workspace = true
 
 [features]
 default = []

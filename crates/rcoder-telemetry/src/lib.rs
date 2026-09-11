@@ -35,6 +35,7 @@
 //! | `OTEL_TRACES_SAMPLER_ARG` | 采样率 | `1.0` |
 //! | `OTEL_EXPORTER_OTLP_PROTOCOL` | 协议 (grpc/http) | `grpc` |
 //! | `TELEMETRY_PROMETHEUS_ENABLED` | 启用 Prometheus | `true` |
+//! | `TELEMETRY_CONSOLE_JSON` | 控制台（stdout）日志 JSON 化 | `false` |
 //! | `RUST_LOG` | 日志级别过滤 | `info` |
 
 pub mod config;
@@ -59,7 +60,7 @@ pub use prometheus::{
 };
 pub use propagation::{
     extract_context, extract_context_http, inject_context, inject_context_http,
-    make_span_with_trace_parent, set_global_propagator,
+    make_span_with_trace_parent, remote_context_or_synthesized, set_global_propagator,
 };
 pub use span_metrics::SpanMetricRule;
 pub use subscriber::BoxedLayer;

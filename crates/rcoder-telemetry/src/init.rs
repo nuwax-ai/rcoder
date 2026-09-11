@@ -76,6 +76,7 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
         extra_layer,
         tokio_console_layer,
         span_metrics,
+        console_json: config.console_json,
     })?;
 
     info!(
@@ -83,12 +84,13 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
         config.service_name
     );
     info!(
-        "✅ [Telemetry] Telemetry system initialization completed: OTLP={}, Prometheus={}, FileLog={}, ExtraLayer={}, TokioConsole={}",
+        "✅ [Telemetry] Telemetry system initialization completed: OTLP={}, Prometheus={}, FileLog={}, ExtraLayer={}, TokioConsole={}, ConsoleJSON={}",
         tracer_provider.is_some(),
         prometheus_handle.is_some(),
         config.file_log.is_some(),
         has_extra_layer,
-        has_tokio_console
+        has_tokio_console,
+        config.console_json
     );
 
     Ok(TelemetryGuard {

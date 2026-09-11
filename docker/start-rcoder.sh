@@ -45,4 +45,14 @@ else
     echo "📡 使用镜像 binary: $RCODER_BIN"
 fi
 echo "📡 启动 rcoder 服务 (端口: $RCODER_PORT)..."
-exec "$RCODER_BIN" --port "$RCODER_PORT"
+
+# RCODER_LOG_TO_FILE=1：stdout/stderr 合流重定向进 /app/logs/rcoder.log——生产
+# start-services.sh 的同形态（该文件命中日志采集器 fluent-bit/sidecar 的 *.log glob，
+# 配合 TELEMETRY_CONSOLE_JSON=1 即产出结构化日志）。用 >> 而非生产脚本的 >：
+# 本地容器反复重启不清史，也避免截断丢启动期日志（陷阱 4，生产侧已知问题）。
+if [ "${RCODER_LOG_TO_FILE:-0}" = "1" ]; then
+    echo "📄 RCODER_LOG_TO_FILE=1：stdout/stderr -> /app/logs/rcoder.log"
+    exec "$RCODER_BIN" --port "$RCODER_PORT" >> /app/logs/rcoder.log 2>&1
+else
+    exec "$RCODER_BIN" --port "$RCODER_PORT"
+fi
