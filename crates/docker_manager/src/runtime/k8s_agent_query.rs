@@ -26,11 +26,14 @@ impl KubernetesRuntime {
     pub(crate) async fn get_container_info_inner(
         &self,
         identifier: &str,
+        service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
         // Try cache first
         // .cloned() 让 cached 成为 owned,读守卫在条件求值结束即释放 —— 否则守卫跨下面
         // build_container_basic_info().await 持续占读锁,卡住写者(stop/cleanup)。
         // 读守卫物化到独立块（guard 跨 await 地雷同 k8s_agent_create.rs 修正注释）。
+        // 类型校验：同 identifier 下 STS 族与生产 UserApp 可并存（如 builder 与
+        // 生产 Deployment 同 app_id），异族条目视为 miss，防止互串。
         let entry = {
             let guard = self.pod_cache.read().await;
             guard.get(identifier).cloned()
@@ -38,6 +41,7 @@ impl KubernetesRuntime {
         if let Some(entry) = entry
             && entry.cached_at.elapsed() < POD_CACHE_TTL
             && entry.info.status == ContainerRuntimeStatus::Running
+            && entry.service_type == *service_type
         {
             return Ok(Some(
                 self.build_container_basic_info(identifier, &entry.info)
@@ -45,13 +49,8 @@ impl KubernetesRuntime {
             ));
         }
 
-        // Query K8s API - 使用标准 K8s 标签查询（与 build_standard_labels 一致）
-        let search_queries = vec![
-            format!("app.kubernetes.io/instance={}", identifier),
-            format!("rcoder.io/identifier={}", identifier),
-        ];
-
-        for query in search_queries {
+        // Query K8s API — 按类型分流的 selector（单一事实源，与 find_container_inner 共用）
+        for query in pod_label_selectors(identifier, service_type) {
             let lp = ListParams::default().labels(&query);
             if let Ok(pods) = self.pods().list(&lp).await
                 && let Some(pod) = pods.items.into_iter().next()
@@ -96,6 +95,7 @@ impl KubernetesRuntime {
                         identifier.to_string(),
                         CachedPod {
                             info: pod_info.clone(),
+                            service_type: service_type.clone(),
                             cached_at: std::time::Instant::now(),
                         },
                     );
@@ -116,7 +116,9 @@ impl KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
-        let info = self.get_container_info_inner(identifier).await?;
+        let info = self
+            .get_container_info_inner(identifier, service_type)
+            .await?;
         if info.is_some() {
             // Self-heal：异常创建（如 OrbStack sandbox 超时）可能留下"pod 在、svc 丢"
             // 的不一致状态——pod 重试后起来了，但 create_agent_service 那步没跑完。
@@ -140,23 +142,29 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
         // Check cache first（TTL 未过期才命中，避免外部删除后返旧）。
         // 读守卫物化（同上——guard 不跨下方 pods().get() 的网络 await）。
+        // 类型校验：同 identifier 下 STS 族与生产 UserApp 可并存，异族条目视为 miss。
         let cached = {
             let guard = self.pod_cache.read().await;
             guard
                 .get(identifier)
-                .filter(|entry| entry.cached_at.elapsed() < POD_CACHE_TTL)
+                .filter(|entry| {
+                    entry.cached_at.elapsed() < POD_CACHE_TTL && entry.service_type == *service_type
+                })
                 .map(|entry| entry.info.clone())
         };
         if let Some(info) = cached {
             return Ok(Some(info));
         }
 
-        // 1) Query by concrete pod name
-        let pod_name = self.pod_name(identifier, service_type)?;
+        // 1) Query by concrete pod name —— STS 实际 pod 名（`{sts_name}-0`）。
+        // pod_name() 产出的是 STS 名（建 STS/拼 svc FQDN 的寻址基名，不带序号），
+        // 直接 get 恒 404；Userapp 是 Deployment（hash 名），`-0` 后缀同样 404 落兜底。
+        let pod_name = self.agent_pod_name(identifier, service_type)?;
         match self.pods().get(&pod_name).await {
             Ok(pod) => {
                 let info = Self::runtime_info_from_pod(&pod);
-                self.maybe_cache_running_pod(identifier, &info).await;
+                self.maybe_cache_running_pod(identifier, service_type, &info)
+                    .await;
                 return Ok(Some(info));
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {}
@@ -168,26 +176,30 @@ impl KubernetesRuntime {
             }
         }
 
-        // 2) Query by labels (使用新的标准标签)
-        let selector = format!("app.kubernetes.io/instance={}", identifier);
-        let pods = self
-            .pods()
-            .list(&ListParams::default().labels(&selector).limit(1))
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::K8sError(format!(
-                    "Failed to list pods with selector '{}': {}",
-                    selector, e
-                ))
-            })?;
+        // 2) Query by labels —— 按类型分流的 selector（单一事实源）。
+        // 仅 `instance={id}` 单键时，生产 UserApp Deployment（instance 同值、字典序
+        // 排前）会被 limit(1) 稳定捞走，污染 builder 注册表——app 23 事故形态。
+        for selector in pod_label_selectors(identifier, service_type) {
+            let pods = self
+                .pods()
+                .list(&ListParams::default().labels(&selector).limit(1))
+                .await
+                .map_err(|e| {
+                    ContainerRuntimeError::K8sError(format!(
+                        "Failed to list pods with selector '{}': {}",
+                        selector, e
+                    ))
+                })?;
 
-        if let Some(pod) = pods.items.into_iter().next() {
-            let info = Self::runtime_info_from_pod(&pod);
-            self.maybe_cache_running_pod(identifier, &info).await;
-            return Ok(Some(info));
+            if let Some(pod) = pods.items.into_iter().next() {
+                let info = Self::runtime_info_from_pod(&pod);
+                self.maybe_cache_running_pod(identifier, service_type, &info)
+                    .await;
+                return Ok(Some(info));
+            }
         }
 
-        // 3) 兼容旧标签查询（平滑迁移）
+        // 3) 兼容旧标签查询（平滑迁移；生产 UserApp Deployment 无这些标签，无撞车面）
         for old_selector in [
             format!("pod_id={}", identifier),
             format!("user_id={}", identifier),
@@ -206,7 +218,8 @@ impl KubernetesRuntime {
 
             if let Some(pod) = pods.items.into_iter().next() {
                 let info = Self::runtime_info_from_pod(&pod);
-                self.maybe_cache_running_pod(identifier, &info).await;
+                self.maybe_cache_running_pod(identifier, service_type, &info)
+                    .await;
                 return Ok(Some(info));
             }
         }
@@ -217,12 +230,18 @@ impl KubernetesRuntime {
     /// find_container_inner 查询成功且 Running 时回填缓存。
     /// 避免 TTL 过期后每次 find_container 都打 K8s API（status checker 等
     /// 高频调用方）；与 get_container_info_inner 的写入语义一致（仅缓存 Running）。
-    async fn maybe_cache_running_pod(&self, identifier: &str, info: &RuntimeContainerInfo) {
+    async fn maybe_cache_running_pod(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        info: &RuntimeContainerInfo,
+    ) {
         if info.status == ContainerRuntimeStatus::Running {
             self.pod_cache.write().await.insert(
                 identifier.to_string(),
                 CachedPod {
                     info: info.clone(),
+                    service_type: service_type.clone(),
                     cached_at: std::time::Instant::now(),
                 },
             );
@@ -348,5 +367,88 @@ impl KubernetesRuntime {
             waiting_reason,
             detail: super::k8s_app_query::container_error_message(cs),
         })
+    }
+}
+
+/// pod 定位 label selector 候选（单一事实源：find_container_inner step2 与
+/// get_container_info_inner 的 label 查询共用）。
+///
+/// 生产 UserApp Deployment 与 agent/builder STS 族的标签体系不同——两族共享
+/// `app.kubernetes.io/instance={id}` 键（builder 与生产同 app_id 时同值），仅凭
+/// 它无法分流；单键 + limit(1) 时生产 pod（字典序排前）会被稳定捞走，以 inspect
+/// 真实值污染 builder 注册表（app 23 事故）。故按 service_type 拼双键：
+/// - Userapp（生产 Deployment，标签由 app_manager `build_app_labels` 写入）：
+///   instance + managed-by=rcoder-app-manager
+/// - 其余（STS 族，标签由 `build_standard_labels` 写入，恒带
+///   rcoder.io/service-type）：instance + rcoder.io/service-type
+///
+/// 第二候选取各族的 rcoder.io 专属键（identifier vs app-id），同样带类型维度。
+fn pod_label_selectors(identifier: &str, service_type: &ServiceType) -> Vec<String> {
+    match service_type {
+        ServiceType::Userapp => vec![
+            format!(
+                "app.kubernetes.io/instance={identifier},app.kubernetes.io/managed-by={}",
+                super::k8s_deployment::APP_MANAGED_BY
+            ),
+            format!(
+                "rcoder.io/app-id={identifier},app.kubernetes.io/managed-by={}",
+                super::k8s_deployment::APP_MANAGED_BY
+            ),
+        ],
+        _ => vec![
+            format!(
+                "app.kubernetes.io/instance={identifier},rcoder.io/service-type={service_type}"
+            ),
+            format!("rcoder.io/identifier={identifier},rcoder.io/service-type={service_type}"),
+        ],
+    }
+}
+
+#[cfg(test)]
+mod label_selector_tests {
+    use super::pod_label_selectors;
+    use shared_types::ServiceType;
+
+    /// Userapp 走 managed-by 维度（生产 Deployment 无 rcoder.io/service-type 标签），
+    /// 且两个候选都必须含 managed-by=rcoder-app-manager——这是把生产 pod 从
+    /// builder 查询里分流出去的决定性维度。
+    #[test]
+    fn userapp_selectors_use_app_manager_dimension() {
+        let selectors = pod_label_selectors("23", &ServiceType::Userapp);
+        assert_eq!(selectors.len(), 2);
+        assert!(
+            selectors
+                .iter()
+                .all(|s| !s.contains("rcoder.io/service-type"))
+        );
+        assert!(
+            selectors
+                .iter()
+                .all(|s| s.contains("managed-by=rcoder-app-manager"))
+        );
+        assert!(selectors[0].contains("app.kubernetes.io/instance=23"));
+        assert!(selectors[1].contains("rcoder.io/app-id=23"));
+    }
+
+    /// STS 族（含 UserappBuilder）带 rcoder.io/service-type 维度——builder 与生产
+    /// Deployment 同 app_id 共享 instance 键，service-type 是唯一分键。
+    #[test]
+    fn sts_family_selectors_carry_service_type_dimension() {
+        for st in [
+            ServiceType::UserappBuilder,
+            ServiceType::WebAgentRunner,
+            ServiceType::ComputerAgentRunner,
+        ] {
+            let selectors = pod_label_selectors("42", &st);
+            assert_eq!(selectors.len(), 2, "{st}");
+            assert!(
+                selectors
+                    .iter()
+                    .all(|s| s.contains(&format!("rcoder.io/service-type={st}"))),
+                "{st}"
+            );
+            assert!(selectors[0].contains("app.kubernetes.io/instance=42"));
+            assert!(selectors[1].contains("rcoder.io/identifier=42"));
+        }
     }
 }

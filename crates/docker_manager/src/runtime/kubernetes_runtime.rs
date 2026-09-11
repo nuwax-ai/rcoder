@@ -40,10 +40,15 @@ pub(crate) const RUNTIME_MANAGED_LABEL: &str = "app.kubernetes.io/managed-by=rco
 
 /// pod_cache 条目的新鲜度包装：记录写入时刻，TTL 过期则视为 miss 走 K8s API，
 /// 修复外部 `kubectl delete pod` / STS 重建窗口期内仍返回旧 Running 的问题。
+///
+/// 携带 service_type：同 identifier 下 STS 族与生产 UserApp 可并存（builder 与
+/// 生产 Deployment 同 app_id），读点校验类型、异族条目视为 miss——对齐 Docker
+/// 实现 container_query/lookup.rs 的条目类型校验模式。
 #[cfg(feature = "kubernetes")]
 #[derive(Clone)]
 pub(crate) struct CachedPod {
     pub(crate) info: RuntimeContainerInfo,
+    pub(crate) service_type: ServiceType,
     pub(crate) cached_at: std::time::Instant,
 }
 
@@ -202,7 +207,11 @@ impl AgentContainerRuntime for KubernetesRuntime {
         &self,
         identifier: &str,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
-        self.get_container_info_inner(identifier).await
+        // trait 契约本就是 agent 族管理面（WebAgentRunner 语义，见
+        // AgentContainerRuntime 文档注释）；显式类型化后 label 查询带 service-type
+        // 维度，不再以 instance 单键捞到生产 UserApp pod。
+        self.get_container_info_inner(identifier, &ServiceType::WebAgentRunner)
+            .await
     }
 
     async fn get_container_info_by_identifier(

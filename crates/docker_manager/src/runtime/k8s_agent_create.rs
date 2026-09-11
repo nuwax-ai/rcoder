@@ -65,10 +65,12 @@ impl KubernetesRuntime {
         // 读守卫物化到独立块内结束（scrutinee 临时值在 Rust 里存活到整个 if 语句
         // 结束——即便 .cloned() 只解决 entry 的数据借用，guard 仍会跨下方 await；
         // 若 body 内再入 pod_cache 写锁即自死锁，tokio RwLock 不可升级）。
+        // 类型校验：同 identifier 异族条目（如生产 UserApp）视为不存在。
         let cached_running = {
             let entry = self.pod_cache.read().await.get(identifier).cloned();
             entry.is_some_and(|entry| {
                 entry.cached_at.elapsed() < POD_CACHE_TTL
+                    && entry.service_type == service_type
                     && entry.info.status == ContainerRuntimeStatus::Running
             })
         };
