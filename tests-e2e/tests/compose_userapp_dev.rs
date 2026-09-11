@@ -1758,6 +1758,45 @@ async fn userapp_dev_new_endpoint_body_query_locate() {
     let app = scoped_app(&env, "n1");
     let user = "e2e-ud-nepuser";
 
+    // A0｜空 workspace 快速失败（fc9cd2e 语义锁）：无项目内容的 app 直接
+    //     dev/restart 应 400 ERR_WORKSPACE_EMPTY（受理前 precheck 拒绝），
+    //     而非旧语义的受理后深层 build 失败
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/dev/restart", env.rcoder))
+        .timeout(Duration::from_secs(120))
+        .json(&json!({"app_id": app, "user_id": user}))
+        .send()
+        .await
+        .expect("empty-workspace restart");
+    let status_e = resp.status();
+    let body_e: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "A0：空 workspace dev/restart 快速失败 ERR_WORKSPACE_EMPTY",
+        status_e.as_u16() == 400 && body_e["code"].as_str() == Some("ERR_WORKSPACE_EMPTY"),
+        format!("HTTP {status_e}, {}", trunc(&body_e, 140)),
+    );
+
+    // 前置最小模板（workspace 非空后 restart 才可受理——A 步保留 body-only
+    // 定位意图，适配上快速失败语义）
+    if !upload_ws_zip(
+        &env,
+        &app,
+        user,
+        &entries_ref(&single_service_entries("zip -q artifact.zip start.sh")),
+    )
+    .await
+    {
+        report.assert_hard(
+            "前置：upload 最小模板（workspace 非空化）",
+            false,
+            "init-project-template 上传失败".to_string(),
+        );
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
     // A｜body-only POST dev/restart：无任何 X- header，body snake_case 自定位
     //    （含懒创建——body user_id 即 owner 显式档）。重试幂等（容器冷启动窗口）
     let mut ok_a = false;
@@ -2679,6 +2718,96 @@ async fn userapp_dev_task_sse_cursor_past_terminal() {
         "游标关流：越界游标零事件下发",
         !text.contains("event:"),
         format!("body 应为空，实得: {}", trunc(&Value::String(text), 120)),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
+// ============================================================
+// 场景：容器身份结构化消费端锁（382c957）——无 LLM 依赖
+// - /computer/pod/list 的 builder 容器 serviceType 来自结构化字段直读
+//   （旧版反解缺 userapp 族，Docker 下显示 "Unknown"）
+// - /computer/agent/status userapp 分支走 resolve_userapp_dev_container +
+//   cross_verify 归属交叉校验（H5 第三入口），注册表命中不破坏状态上报
+// ============================================================
+#[tokio::test]
+async fn userapp_dev_pod_identity_list_and_status() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_pod_identity";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "pid");
+    let user = "e2e-ud-user";
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 1) pod/list：builder 容器的 serviceType 必须是结构化字段值
+    //    "user-app-builder"（缓存直读），而非反解缺失导致的 "Unknown"
+    let resp = env
+        .http
+        .get(format!("{}/computer/pod/list?limit=200", env.rcoder))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .expect("pod list");
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let builder_name = format!("rcoder-app-builder-{app}");
+    let found = body["data"]["containers"]
+        .as_array()
+        .and_then(|list| {
+            list.iter()
+                .find(|c| c["container_name"].as_str() == Some(builder_name.as_str()))
+        })
+        .cloned();
+    let ok_list = status.is_success()
+        && body["success"].as_bool() == Some(true)
+        && found
+            .as_ref()
+            .is_some_and(|c| c["service_type"].as_str() == Some("user-app-builder"));
+    report.assert_hard(
+        "pod/list builder serviceType 字段直读（user-app-builder，非 Unknown）",
+        ok_list,
+        format!(
+            "HTTP {status}, builder 条目: {}",
+            found
+                .as_ref()
+                .map(|c| trunc(c, 160))
+                .unwrap_or_else(|| "<not found>".into())
+        ),
+    );
+
+    // 2) /computer/agent/status userapp 分支：resolve（含 cross_verify 归属
+    //    交叉校验）→ gRPC；builder 刚 ensure 无会话 → not_alive 属预期幂等
+    //    形态，锁的是链路通（HTTP 200 信封、不 500、不误报容器不存在异常）
+    let resp = env
+        .http
+        .post(format!("{}/computer/agent/status", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .json(&json!({
+            "app_id": app,
+            "user_id": user,
+            "service_type": "userapp",
+        }))
+        .send()
+        .await
+        .expect("agent status");
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let ok_status = status.is_success()
+        && body["success"].as_bool() == Some(true)
+        && body["data"]["is_alive"].is_boolean();
+    report.assert_hard(
+        "agent/status userapp 分支经 cross_verify 链返回幂等信封",
+        ok_status,
+        format!("HTTP {status}, body: {}", trunc(&body, 160)),
     );
 
     assert_hard_all(report).await;
