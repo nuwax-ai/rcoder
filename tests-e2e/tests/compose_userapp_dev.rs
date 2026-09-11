@@ -66,7 +66,7 @@ fn scoped_app(env: &Env, tag: &str) -> String {
         .collect();
     format!(
         "e2e-ud-{}-p{}-{}",
-        &env.run_tag.replace('_', "")[..6],
+        &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000,
         short_tag
     )
@@ -78,11 +78,11 @@ fn scoped_app(env: &Env, tag: &str) -> String {
 /// 显式清理开发容器（Docker: docker rm；K8s 模式由 rcoder 闲置回收兜底，
 /// 测试内不等待——场景各自创建唯一 app_id 不复用）。
 fn cleanup_builder(app_id: &str) {
-    let name = format!("rcoder-app-builder-{app_id}");
-    std::process::Command::new("docker")
-        .args(["rm", "-f", &name])
-        .output()
-        .ok();
+    if let Err(error) =
+        rcoder_e2e::common::resources::cleanup_container(&format!("rcoder-app-builder-{app_id}"))
+    {
+        eprintln!("owned builder cleanup failed: {error}");
+    }
 }
 
 /// create-workspace（幂等起手；断言 200 + 容器信息回显）。
@@ -110,6 +110,9 @@ async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user:
         status = resp.status();
         body = resp.json().await.unwrap_or(Value::Null);
         if status.is_success() && http_ok(&body) {
+            break;
+        }
+        if !rcoder_e2e::common::retry::ensure_transient(status, &body) {
             break;
         }
         report.diagnostic(
@@ -1066,7 +1069,7 @@ async fn userapp_dev_template_zip_and_projects() {
     }
 
     // prod stage → 400（dev-only 能力）
-    let (ps, _) = post_json(
+    let (ps, pb) = post_json(
         &env,
         &format!("/api/v1/userapp/{app}/prod/projects/detect"),
         json!({"user_id": user, "project_dir": "backend-go"}),
@@ -1074,7 +1077,7 @@ async fn userapp_dev_template_zip_and_projects() {
     .await;
     report.assert_hard(
         "projects/detect stage=prod → 400（dev-only）",
-        ps.as_u16() == 400,
+        ps.as_u16() == 200 && pb["code"] == "ERR_VALIDATION",
         format!("HTTP {ps}"),
     );
 
@@ -1468,7 +1471,7 @@ async fn userapp_dev_server_lifecycle() {
     let body: Value = resp.json().await.unwrap_or(Value::Null);
     report.assert_hard(
         "dev/stop 后 logs/sources/query → 快速 400 ERR_DEV_NOT_RUNNING",
-        stopped_status.as_u16() == 400 && body["code"].as_str() == Some("ERR_DEV_NOT_RUNNING"),
+        stopped_status.as_u16() == 200 && body["code"].as_str() == Some("ERR_DEV_NOT_RUNNING"),
         format!("status={stopped_status}, body 截断: {}", trunc(&body, 120)),
     );
 
@@ -1775,7 +1778,7 @@ async fn userapp_dev_new_endpoint_body_query_locate() {
     let body_e: Value = resp.json().await.unwrap_or(Value::Null);
     report.assert_hard(
         "A0：空 workspace dev/restart 快速失败 ERR_WORKSPACE_EMPTY",
-        status_e.as_u16() == 400 && body_e["code"].as_str() == Some("ERR_WORKSPACE_EMPTY"),
+        status_e.as_u16() == 200 && body_e["code"].as_str() == Some("ERR_WORKSPACE_EMPTY"),
         format!("HTTP {status_e}, {}", trunc(&body_e, 140)),
     );
 
@@ -1863,10 +1866,11 @@ async fn userapp_dev_new_endpoint_body_query_locate() {
     let body_c: Value = resp.json().await.unwrap_or(Value::Null);
     report.assert_hard(
         "C：camelCase body 不识别 → 400（指引 X-App-Id header 或 body app_id 字段）",
-        status_c.as_u16() == 400
+        status_c.as_u16() == 200
+            && body_c["code"] == "ERR_VALIDATION"
             && body_c["message"]
                 .as_str()
-                .is_some_and(|m| m.contains("missing app_id")),
+                .is_some_and(|m| m.is_ascii() && m.contains("missing app_id")),
         format!("HTTP {status_c}, {}", trunc(&body_c, 120)),
     );
 
@@ -1945,7 +1949,7 @@ async fn userapp_dev_precheck_rejects_empty_and_no_services() {
     let no_task = b1["data"]["task_id"].as_str().is_none_or(str::is_empty);
     report.assert_hard(
         "空 workspace → dev/start 400 ERR_WORKSPACE_EMPTY（不创建任务）",
-        s1.as_u16() == 400 && b1["code"].as_str() == Some("ERR_WORKSPACE_EMPTY") && no_task,
+        s1.as_u16() == 200 && b1["code"].as_str() == Some("ERR_WORKSPACE_EMPTY") && no_task,
         format!("HTTP {s1}, {}", trunc(&b1, 120)),
     );
 
@@ -1980,7 +1984,7 @@ async fn userapp_dev_precheck_rejects_empty_and_no_services() {
     let b3: Value = resp.json().await.unwrap_or(Value::Null);
     report.assert_hard(
         "无 manifest workspace → dev/start 400 ERR_WORKSPACE_NO_SERVICES",
-        s3.as_u16() == 400 && b3["code"].as_str() == Some("ERR_WORKSPACE_NO_SERVICES"),
+        s3.as_u16() == 200 && b3["code"].as_str() == Some("ERR_WORKSPACE_NO_SERVICES"),
         format!("HTTP {s3}, {}", trunc(&b3, 120)),
     );
 
@@ -2001,7 +2005,7 @@ async fn userapp_dev_precheck_rejects_empty_and_no_services() {
     let b4: Value = resp.json().await.unwrap_or(Value::Null);
     report.assert_hard(
         "从未 dev/start → logs/sources/query 400 ERR_DEV_NOT_RUNNING",
-        s4.as_u16() == 400 && b4["code"].as_str() == Some("ERR_DEV_NOT_RUNNING"),
+        s4.as_u16() == 200 && b4["code"].as_str() == Some("ERR_DEV_NOT_RUNNING"),
         format!("HTTP {s4}, {}", trunc(&b4, 120)),
     );
 

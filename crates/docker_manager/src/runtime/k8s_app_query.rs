@@ -95,12 +95,23 @@ impl KubernetesRuntime {
             .filter(|r| r.cpu.is_some() || r.memory.is_some() || r.ephemeral_storage.is_some());
         let health_check = container.and_then(probe_to_health_check);
 
+        let env_sources = container.and_then(|c| c.env_from.as_ref());
+        let config_name = env_sources
+            .and_then(|sources| {
+                sources
+                    .iter()
+                    .find_map(|source| source.config_map_ref.as_ref().map(|r| r.name.clone()))
+            })
+            .unwrap_or_else(|| self.app_config_name(app_id));
+        let secret_name = env_sources
+            .and_then(|sources| {
+                sources
+                    .iter()
+                    .find_map(|source| source.secret_ref.as_ref().map(|r| r.name.clone()))
+            })
+            .unwrap_or_else(|| self.app_secret_name(app_id));
         // env：ConfigMap `{app}-config`.data（apply_app_configmap 写入 = params.env 原样）
-        let env = match self
-            .configmaps_api()
-            .get(&self.app_config_name(app_id))
-            .await
-        {
+        let env = match self.configmaps_api().get(&config_name).await {
             Ok(cm) => cm
                 .data
                 .filter(|m| !m.is_empty())
@@ -115,7 +126,7 @@ impl KubernetesRuntime {
 
         // secrets：Secret `.data` base64 解码还原（写入走 string_data，API 侧自动转 data；
         // 值类型是 ByteString，直接取内部字节，无需再按文本 base64 解码字符串）
-        let secrets = match self.secrets_api().get(&self.app_secret_name(app_id)).await {
+        let secrets = match self.secrets_api().get(&secret_name).await {
             Ok(secret) => secret.data.and_then(|data| {
                 data.into_iter()
                     .map(|(key, value)| {

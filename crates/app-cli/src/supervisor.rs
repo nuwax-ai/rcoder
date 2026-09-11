@@ -22,7 +22,7 @@ use crate::runtime_status::RuntimeStatusService;
 
 /// 编排主入口（legacy 直跑形态：一次性编排，无外部取消源）。
 pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result<()> {
-    run_inner(args, runtime_status, None, None).await
+    run_inner(args, runtime_status, None, None, true).await
 }
 
 /// 编排主入口（server 形态：`cancel` 触发 = 优雅停全部子服务后 Ok 返回，
@@ -33,8 +33,16 @@ pub async fn run_with_cancel(
     runtime_status: RuntimeStatusService,
     cancel: tokio_util::sync::CancellationToken,
     on_running: Option<tokio::sync::oneshot::Sender<()>>,
+    run_migrations: bool,
 ) -> Result<()> {
-    run_inner(&args, runtime_status, Some(cancel), on_running).await
+    run_inner(
+        &args,
+        runtime_status,
+        Some(cancel),
+        on_running,
+        run_migrations,
+    )
+    .await
 }
 
 /// 等 SIGTERM 的可复用 future（server 主循环 select 消费；Unix handler 安装
@@ -48,6 +56,7 @@ async fn run_inner(
     runtime_status: RuntimeStatusService,
     cancel: Option<tokio_util::sync::CancellationToken>,
     on_running: Option<tokio::sync::oneshot::Sender<()>>,
+    run_migrations: bool,
 ) -> Result<()> {
     runtime_status.set_ready(false);
     // 1. 自动发现子项目 + 组装服务清单
@@ -126,7 +135,7 @@ async fn run_inner(
             }
             // migrate（如有）—— per-service：失败=该服务跳过（不再全局 fail-fast；
             // 迁移错误即启动失败原因，EVT 带原始错误链）。
-            if !spec.run.migrate.is_empty() {
+            if run_migrations && !spec.run.migrate.is_empty() {
                 info!("🛠️  migrate {}", spec.service_id);
                 if let Err(e) =
                     run_transient(&spec.run.migrate, &args.workspace.join(&spec.dir)).await
@@ -251,6 +260,12 @@ async fn run_inner(
         emit_event(&OrchestrationEvent::OrchestrationDone {
             failed: startup_failures.clone(),
         });
+        if on_running.is_some() && !startup_failures.is_empty() {
+            anyhow::bail!(
+                "deployment startup failed for {} service(s)",
+                startup_failures.len()
+            );
+        }
         if !startup_failures.is_empty() {
             warn!(
                 "⚠️  启动编排完成（部分失败 {} 项，其余服务正常运行）",

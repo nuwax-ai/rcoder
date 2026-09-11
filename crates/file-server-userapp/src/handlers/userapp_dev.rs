@@ -140,23 +140,23 @@ pub(crate) async fn get_logs(
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）")
     ),
     request_body = UserappInstallBody,
-    responses(file_server::openapi::JsonApiResponses),
+    responses((status = 200, body = HttpResult<Value>, description = "Dependency installation result or business error")),
     tag = "Userapp · dev · 工作区与工具链"
 )]
 pub(crate) async fn install_project(
     State(state): State<UserAppState>,
     Path((app_id, _app_stage)): Path<(String, String)>,
     Json(body): Json<UserappInstallBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<axum::Json<HttpResult<Value>>, crate::UserAppError> {
     tracing::debug!(app_id = %app_id, user_id = %body.user_id, "userapp install-project");
     let ws = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
     let r = install_project_core(&state.fs, ws, &body.programming_language).await?;
-    Ok(Json(json!({
+    Ok(axum::Json(HttpResult::success(json!({
         "success": true,
         "message": "Project dependencies installed successfully",
         "project_dir": r.project_dir.display().to_string(),
         "programming_language": r.programming_language,
-    })))
+    }))))
 }
 
 // ── zip-workspace ───────────────────────────────────────────────────────────────

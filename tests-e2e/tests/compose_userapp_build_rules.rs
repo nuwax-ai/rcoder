@@ -54,7 +54,7 @@ fn scoped_app(env: &Env, tag: &str) -> String {
         .collect();
     format!(
         "app-e2e-br-{}-p{}-{}",
-        &env.run_tag.replace('_', "")[..6],
+        &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000,
         short_tag
     )
@@ -64,11 +64,11 @@ fn scoped_app(env: &Env, tag: &str) -> String {
 }
 
 fn cleanup_builder(app_id: &str) {
-    let name = format!("rcoder-app-builder-{app_id}");
-    std::process::Command::new("docker")
-        .args(["rm", "-f", &name])
-        .output()
-        .ok();
+    if let Err(error) =
+        rcoder_e2e::common::resources::cleanup_container(&format!("rcoder-app-builder-{app_id}"))
+    {
+        eprintln!("owned builder cleanup failed: {error}");
+    }
 }
 
 /// create-workspace（幂等起手；冷启动重试窗口与 compose_userapp_dev 同款）。
@@ -87,6 +87,9 @@ async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user:
         status = resp.status();
         body = resp.json().await.unwrap_or(Value::Null);
         if status.is_success() && http_ok(&body) {
+            break;
+        }
+        if !rcoder_e2e::common::retry::ensure_transient(status, &body) {
             break;
         }
         report.diagnostic(

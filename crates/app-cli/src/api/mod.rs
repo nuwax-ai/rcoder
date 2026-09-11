@@ -173,6 +173,8 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
 /// `POST /v1/deploy` 请求体（热部署）。
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub(super) struct DeployBody {
+    #[serde(default)]
+    pub operation_id: Option<String>,
     /// 制品包下载 URL（workspace 整体包 zip）。
     pub url: String,
     /// 发布版本标记（幂等键）。
@@ -185,6 +187,7 @@ pub(super) struct DeployBody {
 /// `POST /v1/deploy` 受理成功响应 data。
 #[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct DeployAcceptedData {
+    pub operation_id: String,
     /// 受理状态（"accepted"）
     pub status: String,
     /// 轮询部署进度的端点路径
@@ -226,14 +229,33 @@ async fn submit_deploy(
             "sha256 must be 64 hex characters",
         );
     }
-    match state.server.try_accept_deploy(DeployRequest {
-        url: body.url,
-        release_id: body.release_id,
-        sha256: body.sha256,
-    }) {
+    let operation_id = body
+        .operation_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    if operation_id.is_empty()
+        || operation_id.len() > 128
+        || !operation_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return envelope::error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_OPERATION_ID",
+            "invalid operation_id",
+        );
+    }
+    match state.server.try_accept_deploy_with_id(
+        DeployRequest {
+            url: body.url,
+            release_id: body.release_id,
+            sha256: body.sha256,
+        },
+        operation_id.clone(),
+    ) {
         Ok(()) => envelope::ok(
             StatusCode::ACCEPTED,
             DeployAcceptedData {
+                operation_id,
                 status: "accepted".to_string(),
                 poll: "/v1/deploy/status".to_string(),
             },

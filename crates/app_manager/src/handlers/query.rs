@@ -34,9 +34,7 @@ use crate::models::{HealthInfo, OwnerParams, ResourceStats};
 - 应用不存在（prod）→ 404；`app_stage` 非法 → 400。
 "#,
     responses(
-        (status = 200, description = "查询成功", body = HttpResult<HealthInfo>),
-        (status = 400, description = "app_stage 非法（仅 dev|prod）", body = HttpResult<String>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>)
+        (status = 200, description = "查询成功", body = HttpResult<HealthInfo>)
     ),
     tag = "Userapp · 双态 · 生命周期"
 )]
@@ -85,9 +83,7 @@ pub struct StatsParams {
         StatsParams
     ),
     responses(
-        (status = 200, description = "查询成功", body = HttpResult<ResourceStats>),
-        (status = 400, description = "参数错误（user_id 缺失/非法）", body = HttpResult<String>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>)
+        (status = 200, description = "查询成功", body = HttpResult<ResourceStats>)
     ),
     tag = "Userapp · 双态 · 生命周期"
 )]
@@ -129,9 +125,7 @@ pub async fn get_app_stats(
 > **仅 prod**：传 `app_stage=dev` 返回 400（开发环境无 Events 能力面）。
 "#,
     responses(
-        (status = 200, description = "查询成功", body = HttpResult<Vec<container_runtime_api::AppEventInfo>>),
-        (status = 400, description = "app_stage 非法或 dev 不支持（本接口仅 prod）", body = HttpResult<String>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>)
+        (status = 200, description = "查询成功", body = HttpResult<Vec<container_runtime_api::AppEventInfo>>)
     ),
     tag = "Userapp · 双态 · 生命周期"
 )]

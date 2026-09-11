@@ -53,6 +53,10 @@ async fn k8s_or_skip(scenario: &str) -> Option<(Env, JsonlReporter, Vec<String>)
             "entries": entries, "trace_id": env.trace_id,
         }),
     );
+    if env.k8s_ns == "nuwax-k8s-prod" {
+        report.skip("production cluster is outside E2E scope");
+        return None;
+    }
     if env.k8s_ssh.is_empty() {
         report.skip("K8s gate: TEST_K8S_SSH 未设置");
         return None;

@@ -36,9 +36,7 @@ pub struct CreateWorkspaceBody {
     path = "/api/v1/userapp/workspace",
     request_body = CreateWorkspaceBody,
     responses(
-        (status = 200, description = "创建成功（幂等，重复调用安全）", body = HttpResult<serde_json::Value>),
-        (status = 400, description = "参数校验失败", body = HttpResult<String>),
-        (status = 502, description = "开发容器不可达", body = HttpResult<String>)
+        (status = 200, description = "创建成功（幂等，重复调用安全）", body = HttpResult<serde_json::Value>)
     ),
     tag = "Userapp · dev · 工作区与工具链",
     operation_id = "create_userapp_workspace",

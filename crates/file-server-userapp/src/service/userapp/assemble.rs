@@ -135,7 +135,7 @@ fn merge_artifact_with_prefix(
     let mut archive = ::zip::ZipArchive::new(file)
         .map_err(|e| AppError::file(format!("parse artifact {}: {e}", artifact.display())))?;
     for i in 0..archive.len() {
-        let entry = archive
+        let mut entry = archive
             .by_index(i)
             .map_err(|e| AppError::file(format!("read entry {i}: {e}")))?;
         if entry.is_dir() {
@@ -148,6 +148,20 @@ fn merge_artifact_with_prefix(
             continue;
         }
         let new_name = format!("{prefix}/{orig_name}");
+        if entry.is_symlink() {
+            use std::io::Read;
+            let mut target = String::new();
+            (&mut entry)
+                .take((shared_types::archive_links::MAX_ARCHIVE_LINK_BYTES + 1) as u64)
+                .read_to_string(&mut target)?;
+            let mut validation = shared_types::archive_links::ArchiveSymlinks::default();
+            validation
+                .record(Path::new(&new_name), &target)
+                .map_err(|e| AppError::validation(format!("artifact symbolic link: {e}")))?;
+            zw.add_symlink(&new_name, target, deflate_opts())
+                .map_err(|e| AppError::file(format!("copy artifact symbolic link: {e}")))?;
+            continue;
+        }
         zw.raw_copy_file_rename(entry, &new_name)
             .map_err(|e| AppError::file(format!("raw_copy {orig_name}: {e}")))?;
     }
@@ -478,6 +492,32 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join("frontend/dist/assets/app.js")).unwrap(),
             "js"
+        );
+    }
+    #[test]
+    fn aggregate_preserves_dependency_symlink_metadata() {
+        let root = tempfile::tempdir().expect("root");
+        let source = root.path().join("source.zip");
+        let mut zip = ::zip::ZipWriter::new(std::fs::File::create(&source).expect("source"));
+        zip.add_symlink(
+            "node_modules/next",
+            ".pnpm/next/node_modules/next",
+            ::zip::write::SimpleFileOptions::default(),
+        )
+        .expect("link");
+        zip.finish().expect("finish");
+        let destination = root.path().join("merged.zip");
+        let mut writer =
+            ::zip::ZipWriter::new(std::fs::File::create(&destination).expect("destination"));
+        merge_artifact_with_prefix(&mut writer, &source, "frontend").expect("merge");
+        writer.finish().expect("finish");
+        let mut merged =
+            ::zip::ZipArchive::new(std::fs::File::open(destination).expect("open")).expect("zip");
+        assert!(
+            merged
+                .by_name("frontend/node_modules/next")
+                .expect("entry")
+                .is_symlink()
         );
     }
 }

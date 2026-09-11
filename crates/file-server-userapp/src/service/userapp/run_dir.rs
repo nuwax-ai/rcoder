@@ -1,94 +1,118 @@
-//! dev 部署运行目录（`{ws}/.run`）：制品 zip 解压 → 校验 → 原子换入。
-//!
-//! 与生产部署物完全一致（对齐 app-cli `deploy.rs` 的 `.staging → code` 模型）：
-//! 构建产物 zip 的顶层即 workspace 根（`workspace.manifest.toml` +
-//! `release.lock.toml` + 各子项目产物），解压后直接作 `app-cli --workspace`。
-//! 换目录用 rename（旧 `.run` → `.previous`，staging → `.run`）——运行中进程
-//! 持旧 inode 不受影响；解压/校验失败时旧 `.run` 原样保留（对齐"失败保留现场"）。
-
-use std::path::{Path, PathBuf};
-
-use file_server::error::{AppError, AppResult};
-use file_server::service::zip;
+//! Prepare dev artifacts without changing the serving directory. Activation belongs
+//! inside the application's generation/commit guard.
 
 use super::workspace_artifact_rel_path;
+use file_server::error::{AppError, AppResult};
+use file_server::service::zip;
+use std::path::{Path, PathBuf};
 
-/// dev 运行目录名（解压产物，`app-cli --workspace` 指向这里）。
 pub const RUN_DIR: &str = ".run";
-/// 上一版现场（swap 时旧 `.run` rename 到此；保留一份供排障/回退参考，下次覆盖）。
 pub const PREVIOUS_DIR: &str = ".previous";
-/// 解压过渡目录（`{ws}/.staging/{release_id}`；swap 后为空，残留由 hygiene 清）。
 pub const STAGING_DIR: &str = ".staging";
 
-/// 把 `builds/workspace-package-{release_id}.zip` 解压换入 `{ws}/.run`。
-///
-/// 返回 `.run` 绝对路径。任何一步失败：`.run` 不动（旧版照常可跑），
-/// staging 残留留给 hygiene 清理。
-pub async fn prepare_run_dir(ws: &Path, release_id: &str) -> AppResult<PathBuf> {
-    // 全段走 tokio::fs（含存在性判断）：阻塞的 Path::is_file()/exists() 会占住 tokio
-    // worker，而本函数是每次 dev 部署都走的路径。unwrap_or(false) 对齐 Path 方法遇错
-    // 返回 false 的语义，各分支成败判定不变。
-    let zip_path = ws.join(workspace_artifact_rel_path(release_id));
-    if !tokio::fs::metadata(&zip_path)
-        .await
-        .map(|m| m.is_file())
-        .unwrap_or(false)
-    {
-        return Err(AppError::resource(format!(
-            "deploy package missing: {} (release_id={release_id})",
-            zip_path.display()
-        )));
-    }
-    // 幂等：同 release_id 重复部署先清旧 staging
-    let staging = ws.join(STAGING_DIR).join(release_id);
-    if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
-        tokio::fs::remove_dir_all(&staging).await.map_err(|e| {
-            AppError::system(format!("clean stale staging {}: {e}", staging.display()))
-        })?;
-    }
-    zip::extract_to(zip_path, staging.clone()).await?;
+/// Shared with hygiene: a live worker keeps this lease even if its async caller
+/// is cancelled. Never unlink the lock file (that would split the lock domain).
+pub(super) fn staging_lease(ws: &Path) -> AppResult<std::fs::File> {
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(ws.join(".dev-prepare.lock"))?;
+    lease
+        .try_lock()
+        .map_err(|e| AppError::business(format!("dev preparation is busy: {e}")))?;
+    Ok(lease)
+}
 
-    // 校验解压物：workspace 与 release lock 双要件（app-cli 硬依赖）。
-    for required in ["workspace.manifest.toml", "release.lock.toml"] {
-        let required_path = staging.join(required);
-        if !tokio::fs::metadata(&required_path)
-            .await
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
-            return Err(AppError::business(format!(
-                "deploy package missing {required} at zip root (release_id={release_id})"
+#[derive(Debug)]
+pub struct PreparedRun {
+    // Field order releases the directory before the lease.
+    staging: tempfile::TempDir,
+    _lease: std::fs::File,
+    workspace: PathBuf,
+}
+
+impl PreparedRun {
+    /// Must run inside the generation commit guard. No suspension between the
+    /// two renames: cancellation cannot leave a half-promoted directory.
+    pub fn activate(self) -> AppResult<PathBuf> {
+        let run = self.workspace.join(RUN_DIR);
+        let previous = self.workspace.join(PREVIOUS_DIR);
+        let had_run = run.try_exists()?;
+        if had_run {
+            if previous.try_exists()? {
+                std::fs::remove_dir_all(&previous)?;
+            }
+            std::fs::rename(&run, &previous)?;
+        }
+        if let Err(error) = std::fs::rename(self.staging.path(), &run) {
+            if had_run && let Err(restore) = std::fs::rename(&previous, &run) {
+                return Err(AppError::system(format!(
+                    "activate dev directory: {error}; restore failed: {restore}"
+                )));
+            }
+            return Err(AppError::system(format!(
+                "activate dev directory: {error}; previous directory preserved"
             )));
         }
+        Ok(run)
     }
+}
 
-    // 原子换入：旧 .run → .previous（覆盖删旧），staging → .run。
-    let run = ws.join(RUN_DIR);
-    let previous = ws.join(PREVIOUS_DIR);
-    if tokio::fs::try_exists(&run).await.unwrap_or(false) {
-        if tokio::fs::try_exists(&previous).await.unwrap_or(false) {
-            tokio::fs::remove_dir_all(&previous)
-                .await
-                .map_err(|e| AppError::system(format!("remove old {}: {e}", previous.display())))?;
+/// Only extract and validate. The blocking worker owns both staging and its
+/// lease, so cancellation cannot race extraction against temporary cleanup.
+pub async fn prepare_run_dir(ws: &Path, release_id: &str) -> AppResult<PreparedRun> {
+    let workspace = ws.to_path_buf();
+    let release_id = release_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let lease = staging_lease(&workspace)?;
+        let zip_path = workspace.join(workspace_artifact_rel_path(&release_id));
+        match std::fs::metadata(&zip_path) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return Err(AppError::resource("deploy package is not a file")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AppError::resource(format!(
+                    "deploy package missing: {}",
+                    zip_path.display()
+                )));
+            }
+            Err(e) => return Err(AppError::system(format!("inspect deploy package: {e}"))),
         }
-        tokio::fs::rename(&run, &previous).await.map_err(|e| {
-            AppError::system(format!(
-                "swap {} → {}: {e}",
-                run.display(),
-                previous.display()
-            ))
-        })?;
-    }
-    tokio::fs::rename(&staging, &run)
-        .await
-        .map_err(|e| AppError::system(format!("promote staging → {}: {e}", run.display())))?;
-    tracing::info!(
-        release_id,
-        run = %run.display(),
-        previous = %previous.display(),
-        "[RUN_DIR] dev deploy swapped"
-    );
-    Ok(run)
+        let staging_root = workspace.join(STAGING_DIR);
+        std::fs::create_dir_all(&staging_root)?;
+        let staging = tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(staging_root)?;
+        zip::extract_blocking(&zip_path, staging.path())?;
+        for required in ["workspace.manifest.toml", "release.lock.toml"] {
+            match std::fs::metadata(staging.path().join(required)) {
+                Ok(m) if m.is_file() => {}
+                Ok(_) => {
+                    return Err(AppError::business(format!(
+                        "deploy package {required} is not a file"
+                    )));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(AppError::business(format!(
+                        "deploy package missing {required} at zip root (release_id={release_id})"
+                    )));
+                }
+                Err(e) => {
+                    return Err(AppError::system(format!(
+                        "inspect deploy package {required}: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(PreparedRun {
+            staging,
+            _lease: lease,
+            workspace,
+        })
+    })
+    .await
+    .map_err(|e| AppError::system(format!("dev preparation task failed: {e}")))?
 }
 
 #[cfg(test)]
@@ -128,7 +152,11 @@ mod tests {
     async fn first_deploy_extracts_and_promotes_run_dir() {
         let ws = tempfile::tempdir().expect("ws");
         make_package(ws.path(), "rel-1");
-        let run = prepare_run_dir(ws.path(), "rel-1").await.expect("prepare");
+        let run = prepare_run_dir(ws.path(), "rel-1")
+            .await
+            .expect("prepare")
+            .activate()
+            .expect("activate");
         assert!(run.ends_with(RUN_DIR));
         assert!(run.join("workspace.manifest.toml").is_file());
         assert!(run.join("release.lock.toml").is_file());
@@ -142,10 +170,18 @@ mod tests {
         let ws = tempfile::tempdir().expect("ws");
         make_package(ws.path(), "rel-1");
         make_package(ws.path(), "rel-2");
-        prepare_run_dir(ws.path(), "rel-1").await.expect("first");
+        prepare_run_dir(ws.path(), "rel-1")
+            .await
+            .expect("first")
+            .activate()
+            .expect("activate");
         // 在 rel-1 的 .run 里放标记文件
         std::fs::write(ws.path().join(RUN_DIR).join("marker-rel-1"), "1").expect("marker");
-        let run = prepare_run_dir(ws.path(), "rel-2").await.expect("second");
+        let run = prepare_run_dir(ws.path(), "rel-2")
+            .await
+            .expect("second")
+            .activate()
+            .expect("activate");
         // 新 .run 来自 rel-2（无 marker），旧内容轮换进 .previous
         assert!(!run.join("marker-rel-1").exists());
         assert!(ws.path().join(PREVIOUS_DIR).join("marker-rel-1").is_file());
@@ -155,7 +191,11 @@ mod tests {
     async fn missing_package_keeps_existing_run_dir_untouched() {
         let ws = tempfile::tempdir().expect("ws");
         make_package(ws.path(), "rel-1");
-        prepare_run_dir(ws.path(), "rel-1").await.expect("first");
+        prepare_run_dir(ws.path(), "rel-1")
+            .await
+            .expect("first")
+            .activate()
+            .expect("activate");
         let err = prepare_run_dir(ws.path(), "rel-missing")
             .await
             .expect_err("must fail");
@@ -163,5 +203,114 @@ mod tests {
         // 旧 .run 原样
         assert!(ws.path().join(RUN_DIR).join("start.sh").is_file());
         assert!(!ws.path().join(PREVIOUS_DIR).exists());
+    }
+    #[tokio::test]
+    async fn invalid_package_cleans_its_staging() {
+        let ws = tempfile::tempdir().expect("ws");
+        let path = make_package(ws.path(), "invalid");
+        let file = std::fs::File::create(path).expect("zip");
+        let mut zip = ::zip::ZipWriter::new(file);
+        zip.start_file(
+            "workspace.manifest.toml",
+            ::zip::write::SimpleFileOptions::default(),
+        )
+        .expect("entry");
+        zip.write_all(b"schema_version = 1").expect("write");
+        zip.finish().expect("finish");
+        assert!(prepare_run_dir(ws.path(), "invalid").await.is_err());
+        assert_eq!(
+            std::fs::read_dir(ws.path().join(STAGING_DIR))
+                .expect("staging")
+                .count(),
+            0
+        );
+    }
+    #[tokio::test]
+    async fn stale_preparation_neither_promotes_nor_leaks() {
+        use crate::models::BuildTaskKind;
+        use crate::service::userapp::tasks::BuildTaskStore;
+        let ws = tempfile::tempdir().expect("ws");
+        make_package(ws.path(), "old");
+        prepare_run_dir(ws.path(), "old")
+            .await
+            .expect("prepare")
+            .activate()
+            .expect("activate");
+        std::fs::write(ws.path().join(RUN_DIR).join("marker"), "old").expect("marker");
+        make_package(ws.path(), "new");
+        let store = BuildTaskStore::new();
+        let task = store
+            .create("app".into(), BuildTaskKind::DevStart)
+            .await
+            .expect("task");
+        let lifecycle = store.dev_lifecycle("app").await;
+        let generation = *lifecycle.lock().await;
+        let prepared = prepare_run_dir(ws.path(), "new").await.expect("prepare");
+        assert!(ws.path().join(RUN_DIR).join("marker").exists());
+        // A sweep while preparation is active must leave its directory intact.
+        super::super::hygiene::sweep_workspace(ws.path(), &ws.path().join("logs"), 5, 7).await;
+        assert!(prepared.staging.path().join("release.lock.toml").exists());
+        *lifecycle.lock().await += 1;
+        let committed = task
+            .commit_start(&lifecycle, generation, async move {
+                prepared.activate()?;
+                Ok::<(), AppError>(())
+            })
+            .await
+            .expect("check");
+        assert!(!committed);
+        assert!(ws.path().join(RUN_DIR).join("marker").exists());
+        assert_eq!(
+            std::fs::read_dir(ws.path().join(STAGING_DIR))
+                .expect("staging")
+                .count(),
+            0
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dev_artifact_preserves_links_and_executable_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = tempfile::tempdir().expect("ws");
+        let path = make_package(ws.path(), "links");
+        let mut zip = ::zip::ZipWriter::new(std::fs::File::create(path).expect("zip"));
+        for (name, content) in [
+            ("workspace.manifest.toml", "schema_version=1"),
+            ("release.lock.toml", "release_id='links'"),
+            ("lib/index.js", "module.exports=42"),
+            ("start.sh", "#!/bin/sh"),
+        ] {
+            zip.start_file(
+                name,
+                ::zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+            )
+            .expect("entry");
+            zip.write_all(content.as_bytes()).expect("content");
+        }
+        zip.add_symlink(
+            "node_modules/next",
+            "../lib",
+            ::zip::write::SimpleFileOptions::default(),
+        )
+        .expect("link");
+        zip.finish().expect("zip");
+        let run = prepare_run_dir(ws.path(), "links")
+            .await
+            .expect("prepare")
+            .activate()
+            .expect("activate");
+        assert!(run.join("node_modules/next").is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(run.join("node_modules/next/index.js")).expect("module"),
+            "module.exports=42"
+        );
+        assert_ne!(
+            std::fs::metadata(run.join("start.sh"))
+                .expect("mode")
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
     }
 }

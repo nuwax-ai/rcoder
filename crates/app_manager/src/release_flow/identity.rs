@@ -39,6 +39,42 @@ pub(crate) fn ensure_no_reserved_env(env: &HashMap<String, String>) -> AppResult
     Ok(())
 }
 
+/// Platform-managed values survive replacement of the business environment.
+pub(crate) const PLATFORM_ENV_KEYS: &[&str] = &[
+    "APP_DEPLOY_URL",
+    "APP_RELEASE_ID",
+    "APP_DEPLOY_SHA256",
+    "APP_CLI_DEPLOY_TOKEN",
+    "APP_ID",
+    "PGDATA",
+    "DBX_DATA_DIR",
+    "USERAPP_WORKSPACE_DIR",
+];
+
+pub(crate) fn replace_business_env(
+    mut business: HashMap<String, String>,
+    live: Option<HashMap<String, String>>,
+) -> HashMap<String, String> {
+    if let Some(live) = live {
+        for key in PLATFORM_ENV_KEYS {
+            if let Some(value) = live.get(*key) {
+                business
+                    .entry((*key).to_owned())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+    }
+    business
+}
+
+pub(crate) fn business_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
+    strip_release_identity(&mut env);
+    for key in PLATFORM_ENV_KEYS {
+        env.remove(*key);
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

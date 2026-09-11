@@ -69,6 +69,42 @@ impl std::str::FromStr for AppCliDeployPhase {
     }
 }
 
+/// Identity and result of one deployment attempt, independent of serving health.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct AppDeploymentOperation {
+    pub operation_id: String,
+    pub request_release_id: String,
+    pub artifact_release_id: Option<String>,
+    #[serde(default)]
+    pub recovery: Option<AppDeploymentRecovery>,
+    pub phase: AppCliDeployPhase,
+    pub error: Option<String>,
+}
+
+/// Recovery reports code/process restoration only, never database rollback.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct AppDeploymentRecovery {
+    pub status: String,
+    pub error: Option<String>,
+    pub database_migrations_reversed: bool,
+}
+
+/// Snapshot used for a conditional configuration write after hot deployment.
+#[derive(Debug, Clone, Default)]
+pub struct AppEnvSnapshot {
+    pub env: std::collections::HashMap<String, String>,
+    pub deployment_uid: Option<String>,
+    pub deployment_version: Option<String>,
+    pub resource_name: Option<String>,
+    pub resource_version: Option<String>,
+}
+
+/// Actual runtime write precondition. None is supported only by Docker.
+#[derive(Debug, Clone, Default)]
+pub struct AppMutationPrecondition {
+    pub resource_version: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -230,10 +230,7 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）内的 PG；`prod`=运行容器（Userapp）内的 PG")
     ),
     responses(
-        (status = 200, description = "密码已设置（message 区分\"账号已创建并设置密码\"/\"密码已重置\"）", body = HttpResult<String>),
-        (status = 400, description = "参数校验失败（app_stage/app_id/password/username 非法）", body = HttpResult<String>),
-        (status = 404, description = "prod 环境 app 不存在", body = HttpResult<String>),
-        (status = 500, description = "容器侧执行失败（PG 未就绪/SQL 失败）", body = HttpResult<String>)
+        (status = 200, description = "密码已设置（message 区分\"账号已创建并设置密码\"/\"密码已重置\"）", body = HttpResult<String>)
     ),
     tag = "Userapp · 双态 · 数据库",
     operation_id = "userapp_db_reset_password",
@@ -319,11 +316,7 @@ pub(crate) async fn reset_password(
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）内的 PG；`prod`=运行容器（Userapp）内的 PG")
     ),
     responses(
-        (status = 200, description = "数据库已创建", body = HttpResult<String>),
-        (status = 400, description = "参数校验失败（app_stage/app_id/database/owner 非标识符）", body = HttpResult<String>),
-        (status = 404, description = "prod 环境 app 不存在", body = HttpResult<String>),
-        (status = 409, description = "数据库已存在（含并发创建竞态复检）", body = HttpResult<String>),
-        (status = 500, description = "容器侧执行失败（PG 未就绪/SQL 失败）", body = HttpResult<String>)
+        (status = 200, description = "数据库已创建", body = HttpResult<String>)
     ),
     tag = "Userapp · 双态 · 数据库",
     operation_id = "userapp_db_create_database",

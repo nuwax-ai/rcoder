@@ -211,7 +211,9 @@ impl AppService {
         let usage = match self.runtime.get_app_resource_usage(app_id).await {
             Ok(u) => u,
             Err(e) => {
-                warn!("[APP] get_app_resource_usage failed app_id={app_id}: {e} (stats 降级 0)");
+                warn!(
+                    "[APP] get_app_resource_usage failed app_id={app_id}: {e} (stats fallback to zero)"
+                );
                 Default::default()
             }
         };
@@ -228,7 +230,9 @@ impl AppService {
         {
             Ok(u) => u,
             Err(e) => {
-                warn!("[APP] dev resource usage failed app_id={app_id}: {e} (stats 降级 0)");
+                warn!(
+                    "[APP] dev resource usage failed app_id={app_id}: {e} (stats fallback to zero)"
+                );
                 Default::default()
             }
         };
@@ -401,7 +405,7 @@ impl AppService {
             Ok(envelope) => match envelope.data {
                 Some(data) if data.list.is_empty() => {
                     Err(AppOperationError::DevNotRunning(format!(
-                        "app {app_id} dev 会话未运行，请先启动开发服务（dev 日志仅在开发服务运行期间可用）"
+                        "app {app_id} development service is not running; start it before requesting development logs"
                     )))
                 }
                 _ => Ok(()),

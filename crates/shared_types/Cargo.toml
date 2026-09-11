@@ -91,5 +91,6 @@ async-trait = { workspace = true }
 shared_types_grpc = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }

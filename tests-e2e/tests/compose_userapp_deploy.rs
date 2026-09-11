@@ -117,16 +117,42 @@ fn trunc(v: &Value, n: usize) -> String {
 
 /// 显式清理 builder 容器（docker rm；compose 冒烟防残留）。
 fn cleanup_builder(app_id: &str) {
-    let name = format!("rcoder-app-builder-{app_id}");
-    std::process::Command::new("docker")
-        .args(["rm", "-f", &name])
-        .output()
-        .ok();
+    if let Err(error) =
+        rcoder_e2e::common::resources::cleanup_container(&format!("rcoder-app-builder-{app_id}"))
+    {
+        eprintln!("owned builder cleanup failed: {error}");
+    }
 }
 
 /// 前置探测：app-runtime 镜像存在 + agent-runner 镜像含 template-cli。
 /// 返回 None = 前置不满足（调用方 skip）。
 async fn preflight(report: &JsonlReporter) -> Option<()> {
+    let toolchains = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docker/verify-userapp-toolchains.py"
+        ))
+        .output();
+    let (compatible, detail) = match toolchains {
+        Ok(output) => (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ),
+        Err(error) => (false, error.to_string()),
+    };
+    report.assert_hard(
+        "builder/runtime artifact toolchains are compatible",
+        compatible,
+        detail,
+    );
+    if !compatible {
+        return None;
+    }
+
     let runtime_ok = std::process::Command::new("docker")
         .args(["image", "inspect", "dev-app-runtime:latest"])
         .output()
@@ -498,6 +524,17 @@ async fn fetch_and_verify_artifact(
             sha256_actual == sha256_expect
         ),
     );
+    if ok && let Some(root) = std::env::var_os("E2E_REPORT_DIR") {
+        let saved = std::fs::write(
+            std::path::PathBuf::from(root).join("verified-artifact.zip"),
+            &bytes,
+        );
+        report.assert_hard(
+            "verified artifact retained for reproducible deployment",
+            saved.is_ok(),
+            saved.err().map(|e| e.to_string()).unwrap_or_default(),
+        );
+    }
     ok.then_some(())
 }
 
@@ -510,7 +547,7 @@ async fn deploy_and_verify_traffic(
     user: &str,
     release_id: &str,
     sha256: &str,
-) {
+) -> bool {
     // 制品 URL 用容器可达形态（app 容器并入 compose 主网络，按服务名回拉 rcoder）；
     // static 端点按 release_id 精确定位制品——勿直拼 build 响应的 artifact_path
     let artifact_url = format!(
@@ -530,9 +567,16 @@ async fn deploy_and_verify_traffic(
         format!("HTTP {s}, body 截断: {}", trunc(&b, 200)),
     );
     if !started {
-        return;
+        return false;
     }
 
+    let identity =
+        rcoder_e2e::common::resources::register_created_container(&format!("rcoder-app-{app}"));
+    report.assert_hard(
+        "prod resource registered at creation",
+        identity.is_ok(),
+        identity.err().unwrap_or_default(),
+    );
     // 七路流量：next=/、react=/react、vue=/vue、四后端 readiness（strip_prefix 后路径）
     let probes: &[(&str, &str)] = &[
         ("next /", "/"),
@@ -549,6 +593,34 @@ async fn deploy_and_verify_traffic(
     let mut pending: Vec<(&str, &str)> = probes.to_vec();
     let mut first_seen: Vec<(String, u128)> = Vec::new();
     while !pending.is_empty() && t0.elapsed() < ready_budget() {
+        let status = std::process::Command::new("docker")
+            .args([
+                "exec",
+                &format!("rcoder-app-{app}"),
+                "wget",
+                "-T",
+                "5",
+                "-qO-",
+                "http://127.0.0.1:3010/v1/deploy/status",
+            ])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                serde_json::from_slice::<Value>(&output.stdout)
+                    .ok()
+                    .map(|body| body["data"].clone())
+            });
+        if let Some(status) = status
+            && status["phase"] == "failed"
+        {
+            report.assert_hard(
+                "cold deployment has no terminal orchestration failure",
+                false,
+                trunc(&status, 1500),
+            );
+            break;
+        }
         let mut still_pending = Vec::new();
         for (name, path) in pending {
             let ok = match env
@@ -586,6 +658,7 @@ async fn deploy_and_verify_traffic(
             },
         );
     }
+    pending.is_empty()
 }
 
 /// 部署后 prod 观测族验收（health / logs 三接口 / stats / events）——运行态
@@ -729,8 +802,10 @@ async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str
     )
     .await;
     report.assert_hard(
-        "db prod create-database 重复 → 409",
-        s.as_u16() == 409,
+        "db prod create-database 重复 → HTTP 200 + ERR_CONFLICT",
+        s.as_u16() == 200
+            && b["code"] == "ERR_CONFLICT"
+            && b["message"].as_str().is_some_and(str::is_ascii),
         format!("HTTP {s}, body 截断: {}", trunc(&b, 100)),
     );
 
@@ -742,8 +817,10 @@ async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str
     )
     .await;
     report.assert_hard(
-        "db prod 不存在 app → 404（ERR_APP_NOT_FOUND）",
-        s.as_u16() == 404 && b["code"].as_str() == Some("ERR_APP_NOT_FOUND"),
+        "db prod 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
+        s.as_u16() == 200
+            && b["code"].as_str() == Some("ERR_APP_NOT_FOUND")
+            && b["message"].as_str().is_some_and(str::is_ascii),
         format!("HTTP {s}, body 截断: {}", trunc(&b, 100)),
     );
 }
@@ -1048,6 +1125,21 @@ async fn verify_stop_and_wake(env: &Env, report: &JsonlReporter, app: &str, user
 
 /// 回收：prod delete purge → 流量转 502。
 async fn cleanup_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
+    let identity =
+        rcoder_e2e::common::resources::register_created_container(&format!("rcoder-app-{app}"));
+    report.assert_hard(
+        "prod image and container identity recorded before cleanup",
+        identity.is_ok(),
+        identity
+            .err()
+            .unwrap_or_else(|| "resource receipt recorded".into()),
+    );
+    let capture = rcoder_e2e::common::resources::capture_container(&format!("rcoder-app-{app}"));
+    report.assert_hard(
+        "prod diagnostics captured before deletion",
+        capture.is_ok(),
+        capture.err().unwrap_or_default(),
+    );
     let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/{app}/prod/delete"),
@@ -1139,7 +1231,13 @@ async fn userapp_deploy_full_chain() {
             fetch_and_verify_artifact(&env, &report, &app, user, &release_id, &sha256).await
     {
         // ⑤ 部署 + 七路流量 ⑤b prod 观测族 ⑥ 回收
-        deploy_and_verify_traffic(&env, &report, &app, user, &release_id, &sha256).await;
+        if !deploy_and_verify_traffic(&env, &report, &app, user, &release_id, &sha256).await {
+            cleanup_prod(&env, &report, &app, user).await;
+            cleanup_builder(&app);
+            let path = report.path.display().to_string();
+            assert!(report.finish(), "cold deployment failed: {path}");
+            return;
+        }
         verify_prod_observability(&env, &report, &app, user).await;
         // 运行态扩展。顺序敏感：热部署（C5）须在 db prod 改密（C3）之前——
         // 实测抓到产品缺陷 28P01 auth_failed：reset-password 改 PG 密码后

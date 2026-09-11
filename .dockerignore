@@ -49,3 +49,10 @@ dist
 *.swp
 *.swo
 *~
+
+# Local credentials, acceptance reports and alternate build output are never image inputs.
+.env*
+**/.env*
+.codex/
+tests-e2e/reports/
+target-console/

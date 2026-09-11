@@ -181,6 +181,12 @@ fn parse_dated_name(name: &str, prefix: &str) -> Option<NaiveDate> {
 
 /// `.staging/` 目录清空（换入失败残留；成功换入后本就为空）。
 async fn sweep_staging(staging_root: &Path) -> usize {
+    let Some(workspace) = staging_root.parent() else {
+        return 0;
+    };
+    let Ok(_lease) = super::run_dir::staging_lease(workspace) else {
+        return 0;
+    };
     let Ok(mut entries) = tokio::fs::read_dir(staging_root).await else {
         return 0;
     };

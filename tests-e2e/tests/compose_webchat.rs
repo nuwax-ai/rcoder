@@ -14,19 +14,15 @@
 use std::time::Duration;
 
 use rcoder_e2e::common::scenario::{assert_hard_all, collect_reported_web, count_event};
-use rcoder_e2e::common::{
-    Backend, Env, TestUserGuard, base_payload_web, chat_web_reported, cross_bin_lock,
-};
+use rcoder_e2e::common::{Backend, Env, base_payload_web, chat_web_reported, cross_bin_lock};
 
 /// WebAgentRunner 容器按 project_id 命名（compose 前缀 dev-master-rcoder-{project_id}）；
 /// TestUserGuard 只清 agent-runner 前缀，本域需自理。
 fn cleanup_project(project_id: &str) {
     let name = format!("dev-master-rcoder-{project_id}");
-    drop(
-        std::process::Command::new("docker")
-            .args(["rm", "-f", &name])
-            .output(),
-    );
+    if let Err(error) = rcoder_e2e::common::resources::cleanup_container(&name) {
+        eprintln!("owned project cleanup failed: {error}");
+    }
 }
 
 /// WebAgentRunner 容器清理守卫（Drop 语义，panic 安全——对齐 TestUserGuard 模式；
@@ -48,7 +44,6 @@ async fn webchat_full_turn(backend: &str) {
     let Some((env, report)) = Env::compose_or_skip(scenario, backend).await else {
         return;
     };
-    let _user_guard = TestUserGuard::new(&env, "webchat-f");
 
     let backend_enum = if backend == "anthropic" {
         Backend::Anthropic
@@ -75,6 +70,10 @@ async fn webchat_full_turn(backend: &str) {
         format!("回显 {:?}", data.project_id),
     );
     let project = data.project_id.clone();
+    rcoder_e2e::common::resources::register_created_container(&format!(
+        "dev-master-rcoder-{project}"
+    ))
+    .expect("record newly created project identity");
     // 服务端生成 project 的容器清理守卫（panic 安全；chat 失败路径无 project 可清，
     // 依赖服务端闲置回收）
     let _project_guard = ProjectGuard {
@@ -124,7 +123,6 @@ async fn webchat_project_reuse() {
     let Some((env, report)) = Env::compose_or_skip(scenario, "openai").await else {
         return;
     };
-    let _user_guard = TestUserGuard::new(&env, "webchat-r");
 
     let mut req1 = base_payload_web(
         &env,
@@ -181,7 +179,6 @@ async fn webchat_two_turn_seq() {
     let Some((env, report)) = Env::compose_or_skip(scenario, "openai").await else {
         return;
     };
-    let _user_guard = TestUserGuard::new(&env, "webchat-s2");
 
     let mut req1 = base_payload_web(
         &env,

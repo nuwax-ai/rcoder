@@ -113,7 +113,16 @@ impl AppService {
                     .collect()
             })
             .unwrap_or(registered_http_ports);
-        let info = match self.runtime.patch_deployment(params).await {
+        let info = match self
+            .runtime
+            .patch_deployment_if_version(
+                params,
+                shared_types::AppMutationPrecondition {
+                    resource_version: current.resource_version.clone(),
+                },
+            )
+            .await
+        {
             Ok(info) => info,
             Err(e) => {
                 // patch 失败：Deployment 原样仍在运行，恢复 pingora 路由（对齐 delete_app

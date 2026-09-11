@@ -31,57 +31,22 @@ test-all:
 # Rust e2e 黑盒集成测试（tests-e2e crate；JSONL 报告供 agent 追溯）
 # ============================================================================
 
-# compose 环境（本地 docker compose，RCODER_URL 默认 http://127.0.0.1:8090）
-# 前置: make dev-up / make dev-restart 且 .env.local 含 LLM 配置
+# 显式入口严格验收：缺少前置、skip、aborted、空筛选和报告遗漏均失败。
+# E2E_SUITE=compose_userapp_dev E2E_FILTER=case_name 可聚焦；无环境 workspace 测试仍可 skip。
+.PHONY: test-e2e test-e2e-compose test-e2e-compose-deploy test-e2e-k8s
+
+test-e2e:
+	python3 tests-e2e/tools/run.py --group userapp
+
 test-e2e-compose:
-	@echo "🧪 Rust e2e（compose 环境；串行；报告在 tests-e2e/reports/）..."
-	@status=0; \
-	cargo test -p rcoder-e2e --test compose_sse --test compose_session --test compose_userapp --test compose_userapp_dev --test compose_webchat -- --test-threads=1 || status=$$?; \
-	latest=$$(ls -t tests-e2e/reports/ 2>/dev/null | head -1); \
-	echo ""; \
-	if [ -n "$$latest" ]; then \
-		echo "📋 报告目录: tests-e2e/reports/$$latest"; \
-		python3 -c "import json; s=json.load(open('tests-e2e/reports/$$latest/summary.json')); [print(f\"  {e['verdict']:>7}  {e['scenario']}__{e['backend']}\") for e in s['scenarios']]" 2>/dev/null || true; \
-	fi; \
-	exit $$status
+	python3 tests-e2e/tools/run.py --group compose
 
-# compose userApp 部署全链（template-cli 7 服务模板→构建→部署→七路流量；~8-15 分钟，
-# 构建依赖外网 npm/maven/pypi/goproxy/crates。镜像前置不满足时场景 verdict=skip）
 test-e2e-compose-deploy:
-	@echo "🧪 Rust e2e（compose userApp 部署全链；串行；报告在 tests-e2e/reports/）..."
-	@status=0; \
-	cargo test -p rcoder-e2e --test compose_userapp_deploy -- --test-threads=1 || status=$$?; \
-	latest=$$(ls -t tests-e2e/reports/ 2>/dev/null | head -1); \
-	echo ""; \
-	if [ -n "$$latest" ]; then \
-		echo "📋 报告目录: tests-e2e/reports/$$latest"; \
-		python3 -c "import json; s=json.load(open('tests-e2e/reports/$$latest/summary.json')); [print(f\"  {e['verdict']:>7}  {e['scenario']}__{e['backend']}\") for e in s['scenarios']]" 2>/dev/null || true; \
-	fi; \
-	exit $$status
+	python3 tests-e2e/tools/run.py --group deploy
 
-# K8s 专项（目标: 个人开发测试 K8s——20/229 单节点；19 机有生产环境禁用）。
-# 配置在 .env.local（参照 .env.local.example）或环境变量：TEST_K8S_SSH、
-# LB_ENTRY_HOSTS（单节点一个 IP 即可，场景退化同入口）。
-# ⚠️ 负载均衡场景默认 ignore（此前已验证），确认后 RUN_LB=1 显式开启。
-# 例: make test-e2e-k8s  /  make test-e2e-k8s RUN_LB=1
+# 仅显式选择测试集群；本轮不执行真实集群测试。
 test-e2e-k8s:
-	@echo "🧪 Rust e2e（K8s；串行；报告在 tests-e2e/reports/）..."
-	@echo "   ⚠️ 仅个人测试 K8s（20/229）；19 机有生产环境，未经指示禁用"
-	@if [ -n "$(RUN_LB)" ]; then \
-		echo "   负载均衡场景开启（--ignored）"; \
-		extra="--ignored"; \
-	else \
-		echo "   负载均衡场景默认关闭（RUN_LB=1 开启）——仅跑 gate 冒烟"; \
-		extra=""; \
-	fi; \
-	status=0; \
-	cargo test -p rcoder-e2e --test k8s_lb -- --test-threads=1 $$extra || status=$$?; \
-	latest=$$(ls -t tests-e2e/reports/ 2>/dev/null | head -1); \
-	echo ""; \
-	if [ -n "$$latest" ]; then \
-		echo "📋 报告目录: tests-e2e/reports/$$latest"; \
-	fi; \
-	exit $$status
+	python3 tests-e2e/tools/run.py --group k8s $(if $(RUN_LB),--ignored,)
 
 # ============================================================================
 # 🧪 eBPF 工具安装测试（快速验证 Makefile 变量传递）

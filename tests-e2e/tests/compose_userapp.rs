@@ -15,6 +15,14 @@ fn http_ok(body: &Value) -> bool {
     body["code"].as_str() == Some("0000")
 }
 
+fn error_envelope(status: reqwest::StatusCode, body: &Value, code: &str) -> bool {
+    status.as_u16() == 200
+        && body["code"] == code
+        && body["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty() && m.is_ascii())
+}
+
 async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, Value) {
     let resp = env
         .http
@@ -32,11 +40,11 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
 /// 显式清理 build 触发的 builder 容器（rcoder-app-builder-<app_id>；
 /// TestUserGuard 只清 agent-runner 前缀，builder 需场景自理）。
 fn cleanup_builder(app_id: &str) {
-    let name = format!("rcoder-app-builder-{app_id}");
-    std::process::Command::new("docker")
-        .args(["rm", "-f", &name])
-        .output()
-        .ok();
+    if let Err(error) =
+        rcoder_e2e::common::resources::cleanup_container(&format!("rcoder-app-builder-{app_id}"))
+    {
+        eprintln!("owned builder cleanup failed: {error}");
+    }
 }
 
 /// rcoder 侧 publish 任务体系已删（构建链收敛为 file-server `/api/userapp/*`
@@ -60,13 +68,15 @@ async fn test_publish_endpoints_removed(env: &Env, report: &JsonlReporter) {
 /// 解析顺位 header > body——缺 header 时 body `app_id` 自定位受理；header 与
 /// body 双缺 → 400 快速失败（双来源指引 message，不挂起）。
 async fn test_build_identifier_validation(env: &Env, report: &JsonlReporter) {
-    // ① 缺 header + body 自定位 → 受理（200 + task_id）
+    let app = format!("app-e2e-{}-nohdr", &env.run_tag[..10]);
+    rcoder_e2e::common::fixtures::failing_build(env, report, &app).await;
+    // Body supplies the identifier; all resources belong to this case.
     let t0 = Instant::now();
     let resp = env
         .http
         .post(format!("{}/api/v1/userapp/build", env.rcoder))
         .timeout(Duration::from_secs(30))
-        .json(&json!({"app_id": "app-e2e-noheader", "user_id": "e2e-user"}))
+        .json(&json!({"app_id": app, "user_id": "e2e-user"}))
         .send()
         .await
         .expect("http post");
@@ -83,7 +93,7 @@ async fn test_build_identifier_validation(env: &Env, report: &JsonlReporter) {
         ),
     );
 
-    // ② 双缺（header 与 body 均无 app_id）→ 400 双来源指引
+    // ② 双缺（header 与 body 均无 app_id）→ HTTP 200 + ERR_VALIDATION 双来源指引
     let t1 = Instant::now();
     let resp = env
         .http
@@ -97,14 +107,18 @@ async fn test_build_identifier_validation(env: &Env, report: &JsonlReporter) {
     let body = resp.text().await.unwrap_or_default();
     let elapsed = t1.elapsed();
     report.assert_hard(
-        "build 双缺 app_id → 400 双来源指引且不挂起",
-        status.as_u16() == 400 && body.contains("X-App-Id") && elapsed < Duration::from_secs(5),
+        "build 双缺 app_id → HTTP 200 + ERR_VALIDATION 双来源指引且不挂起",
+        status.as_u16() == 200
+            && body.contains("ERR_VALIDATION")
+            && body.contains("missing app_id")
+            && elapsed < Duration::from_secs(5),
         format!(
             "HTTP {status}, {:.1}s, body 截断: {}",
             elapsed.as_secs_f64(),
             &body[..body.len().min(80)]
         ),
     );
+    cleanup_builder(&app);
 }
 
 /// file-server 构建链终态收敛：create-workspace → build 受理（task_id + artifact_path）
@@ -131,6 +145,8 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
         &format!("{}", ws_status.as_u16()),
         &format!("HTTP {ws_status}, body 截断: {}", trunc(&ws_body, 120)),
     );
+
+    rcoder_e2e::common::fixtures::failing_build(env, report, &ident).await;
 
     let resp = env
         .http
@@ -207,14 +223,14 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
     }
     report.assert_hard(
         "build 任务 180s 内到达终态（不挂死）",
-        terminal.is_some(),
+        terminal.as_deref() == Some("failed"),
         match &terminal {
             Some(s) => format!("status={s}, {:.0}s", t0.elapsed().as_secs_f64()),
             None => "180s 未到终态（疑似挂死）".to_owned(),
         },
     );
 
-    // static 按 app 直下：两段路径（不传文件名）；无 completed 产物（failed）→ 404，
+    // static 按 app 直下：两段路径（不传文件名）；无 completed 产物（failed）→ HTTP 200 + ERR_APP_NOT_FOUND，
     // completed → 200。本场景 workspace 无真实项目，预期 failed + 404
     let static_resp = env
         .http
@@ -230,7 +246,7 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
     let static_ok = match static_resp {
         Ok(r) => {
             let code = r.status().as_u16();
-            expected_ok == (code == 200)
+            code == 404 && !expected_ok
         }
         Err(_) => false,
     };
@@ -242,7 +258,7 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
     );
 }
 
-/// start 无 url 三态语义：不存在 + 缺 user_id → 400；不存在 + 带 user_id → 创建
+/// start 无 url 三态语义：不存在 + 缺 user_id → HTTP 200 + ERR_VALIDATION；不存在 + 带 user_id → 创建
 /// 空容器（200，基础设施形态）；restart 无 url 对不存在 app → 仍 404（重启不创建）。
 async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
     let suffix = format!(
@@ -260,8 +276,8 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
     )
     .await;
     report.assert_hard(
-        "start 无 url 缺 user_id → 422（必填字段提取层拒绝）",
-        s1.as_u16() == 422,
+        "start 无 url 缺 user_id → HTTP 200 + ERR_VALIDATION",
+        error_envelope(s1, &b1, "ERR_VALIDATION"),
         format!("HTTP {s1}, {}", trunc(&b1, 100)),
     );
 
@@ -317,16 +333,16 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
         );
     }
 
-    // ③ restart 无 url 对不存在 app → 404（重启语义不创建；user_id 必填带到业务层）
-    let (s3, _) = post_json(
+    // ③ restart 无 url 对不存在 app → HTTP 200 + ERR_APP_NOT_FOUND（重启语义不创建；user_id 必填带到业务层）
+    let (s3, b3) = post_json(
         env,
         &format!("/api/v1/userapp/app-e2e-norestart-{suffix}/restart"),
         json!({"user_id": "e2e-user"}),
     )
     .await;
     report.assert_hard(
-        "restart 无 url 对不存在的 app → 404（不创建）",
-        s3.as_u16() == 404,
+        "restart 无 url 对不存在的 app → HTTP 200 + ERR_APP_NOT_FOUND（不创建）",
+        error_envelope(s3, &b3, "ERR_APP_NOT_FOUND"),
         format!("HTTP {s3}"),
     );
 }
@@ -440,10 +456,10 @@ async fn test_env_scoped_files_and_storage(env: &Env, report: &JsonlReporter) {
     );
 
     // env 必填校验：非法值 400
-    let (bad_s, _) = get_json(env, &format!("/api/v1/userapp/{ident}/staging/storage")).await;
+    let (bad_s, bad_b) = get_json(env, &format!("/api/v1/userapp/{ident}/staging/storage")).await;
     report.assert_hard(
-        "非法 env → 400（必填显式，无缺省）",
-        bad_s.as_u16() == 400,
+        "非法 env → HTTP 200 + ERR_VALIDATION（必填显式，无缺省）",
+        error_envelope(bad_s, &bad_b, "ERR_VALIDATION"),
         format!("HTTP {bad_s}"),
     );
 
@@ -641,35 +657,39 @@ async fn userapp_compose_regression() {
 async fn test_query_pagination_validation(env: &Env, report: &JsonlReporter) {
     let user = "e2e-user";
     // 400：page < 1
-    let (s, _) = post_json(
+    let (s, b) = post_json(
         env,
         "/api/v1/userapp/query",
         json!({"user_id": user, "page": 0}),
     )
     .await;
-    report.assert_hard("query page=0 → 400", s.as_u16() == 400, format!("HTTP {s}"));
+    report.assert_hard(
+        "query page=0 → HTTP 200 + ERR_VALIDATION",
+        error_envelope(s, &b, "ERR_VALIDATION"),
+        format!("HTTP {s}"),
+    );
     // 400：page_size 超界（>100）
-    let (s, _) = post_json(
+    let (s, b) = post_json(
         env,
         "/api/v1/userapp/query",
         json!({"user_id": user, "page_size": 101}),
     )
     .await;
     report.assert_hard(
-        "query page_size=101 → 400（1..=100）",
-        s.as_u16() == 400,
+        "query page_size=101 → HTTP 200 + ERR_VALIDATION（1..=100）",
+        error_envelope(s, &b, "ERR_VALIDATION"),
         format!("HTTP {s}"),
     );
     // 400：非法 sort_by
-    let (s, _) = post_json(
+    let (s, b) = post_json(
         env,
         "/api/v1/userapp/query",
         json!({"user_id": user, "sort_by": "bogus_field"}),
     )
     .await;
     report.assert_hard(
-        "query sort_by=bogus → 400（仅 app_id/name/created_at）",
-        s.as_u16() == 400,
+        "query sort_by=bogus → HTTP 200 + ERR_VALIDATION（仅 app_id/name/created_at）",
+        error_envelope(s, &b, "ERR_VALIDATION"),
         format!("HTTP {s}"),
     );
     // 合法：sort_by=app_id + 分页结构
@@ -701,33 +721,33 @@ async fn test_update_stop_restart(env: &Env, report: &JsonlReporter) {
     let user = "e2e-user";
 
     // 404：update / stop 不存在 app
-    let (s, _) = post_json(
+    let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/app-e2e-noup-{suffix}/update"),
         json!({"user_id": user}),
     )
     .await;
     report.assert_hard(
-        "update 不存在 app → 404",
-        s.as_u16() == 404,
+        "update 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
+        error_envelope(s, &b, "ERR_APP_NOT_FOUND"),
         format!("HTTP {s}"),
     );
-    let (s, _) = post_json(
+    let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/app-e2e-nostop-{suffix}/stop?user_id={user}"),
         json!({}),
     )
     .await;
     report.assert_hard(
-        "stop 不存在 app → 404",
-        s.as_u16() == 404,
+        "stop 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
+        error_envelope(s, &b, "ERR_APP_NOT_FOUND"),
         format!("HTTP {s}"),
     );
     // 400：stop 缺 user_id query
-    let (s, _) = post_json(env, "/api/v1/userapp/app-e2e-any/stop", json!({})).await;
+    let (s, b) = post_json(env, "/api/v1/userapp/app-e2e-any/stop", json!({})).await;
     report.assert_hard(
-        "stop 缺 user_id query → 400",
-        s.as_u16() == 400,
+        "stop 缺 user_id query → HTTP 200 + ERR_VALIDATION",
+        error_envelope(s, &b, "ERR_VALIDATION"),
         format!("HTTP {s}"),
     );
 
@@ -835,7 +855,7 @@ async fn test_storage_guards(env: &Env, report: &JsonlReporter) {
         s.is_success() && http_ok(&b) && b["data"]["exists"] == false,
         format!("HTTP {s}, body 截断: {}", trunc(&b, 120)),
     );
-    // clear 未 delete → 409（前置：app 有计算资源——Docker 模式下 ghost app 的
+    // clear 未 delete → HTTP 200 + ERR_CONFLICT（前置：app 有计算资源——Docker 模式下 ghost app 的
     // deployment 查询返回 None → 守卫通过 → 幂等成功；须真实容器验证守卫分支）
     let guard_app = format!(
         "app-e2e-clr-{}{}",
@@ -856,8 +876,8 @@ async fn test_storage_guards(env: &Env, report: &JsonlReporter) {
         )
         .await;
         report.assert_hard(
-            "storage/clear 对未 delete 的 app → 409",
-            s.as_u16() == 409,
+            "storage/clear 对未 delete 的 app → HTTP 200 + ERR_INVALID_STATE",
+            error_envelope(s, &b, "ERR_INVALID_STATE"),
             format!("HTTP {s}, body 截断: {}", trunc(&b, 100)),
         );
         drop(
@@ -875,7 +895,7 @@ async fn test_storage_guards(env: &Env, report: &JsonlReporter) {
             format!("HTTP {cs}"),
         );
     }
-    // destroy confirm 不匹配 → 400
+    // destroy confirm 不匹配 → HTTP 200 + ERR_VALIDATION
     let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/app-e2e-ghost-{user}/prod/storage/destroy"),
@@ -883,8 +903,8 @@ async fn test_storage_guards(env: &Env, report: &JsonlReporter) {
     )
     .await;
     report.assert_hard(
-        "storage/destroy confirm≠app_id → 400",
-        s.as_u16() == 400,
+        "storage/destroy confirm≠app_id → HTTP 200 + ERR_VALIDATION",
+        error_envelope(s, &b, "ERR_VALIDATION"),
         format!("HTTP {s}, body 截断: {}", trunc(&b, 100)),
     );
 }
@@ -898,39 +918,39 @@ async fn test_recycle_policy(env: &Env, report: &JsonlReporter) {
         std::process::id() % 1000
     );
     // 400：stage=dev
-    let (s, _) = post_json(
+    let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/app-e2e-rc-{suffix}/dev/recycle-policy"),
         json!({"user_id": user, "recycle_enabled": true}),
     )
     .await;
     report.assert_hard(
-        "recycle-policy stage=dev → 400（仅 prod）",
-        s.as_u16() == 400,
+        "recycle-policy stage=dev → HTTP 200 + ERR_VALIDATION（仅 prod）",
+        error_envelope(s, &b, "ERR_VALIDATION"),
         format!("HTTP {s}"),
     );
     // 400：三可选字段全缺
-    let (s, _) = post_json(
+    let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/app-e2e-rc-{suffix}/prod/recycle-policy"),
         json!({"user_id": user}),
     )
     .await;
     report.assert_hard(
-        "recycle-policy 三字段全缺 → 400",
-        s.as_u16() == 400,
+        "recycle-policy 三字段全缺 → HTTP 200 + ERR_VALIDATION",
+        error_envelope(s, &b, "ERR_VALIDATION"),
         format!("HTTP {s}"),
     );
     // 400：非法 user_id
-    let (s, _) = post_json(
+    let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/app-e2e-rc-{suffix}/prod/recycle-policy"),
         json!({"user_id": "bad user!", "recycle_enabled": true}),
     )
     .await;
     report.assert_hard(
-        "recycle-policy 非法 user_id → 400",
-        s.as_u16() == 400,
+        "recycle-policy 非法 user_id → HTTP 200 + ERR_VALIDATION",
+        error_envelope(s, &b, "ERR_VALIDATION"),
         format!("HTTP {s}"),
     );
 
@@ -975,50 +995,50 @@ async fn test_recycle_policy(env: &Env, report: &JsonlReporter) {
 async fn test_observation_error_shapes(env: &Env, report: &JsonlReporter) {
     let user = "e2e-user";
     let ghost = "app-e2e-ghost-obs";
-    // health 不存在 app → 404
-    let (s, _) = get_json(
+    // health 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND
+    let (s, b) = get_json(
         env,
         &format!("/api/v1/userapp/{ghost}/prod/health?user_id={user}"),
     )
     .await;
     report.assert_hard(
-        "health 不存在 app → 404",
-        s.as_u16() == 404,
+        "health 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
+        error_envelope(s, &b, "ERR_APP_NOT_FOUND"),
         format!("HTTP {s}"),
     );
-    // logs sources/query 不存在 app → 404
-    let (s, _) = post_json(
+    // logs sources/query 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND
+    let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/{ghost}/prod/logs/sources/query?user_id={user}"),
         json!({}),
     )
     .await;
     report.assert_hard(
-        "logs/sources/query 不存在 app → 404",
-        s.as_u16() == 404,
+        "logs/sources/query 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
+        error_envelope(s, &b, "ERR_APP_NOT_FOUND"),
         format!("HTTP {s}"),
     );
-    // logs/query 不存在 app → 404
-    let (s, _) = post_json(
+    // logs/query 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND
+    let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/{ghost}/prod/logs/query?user_id={user}"),
         json!({"tail": 10}),
     )
     .await;
     report.assert_hard(
-        "logs/query 不存在 app → 404",
-        s.as_u16() == 404,
+        "logs/query 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
+        error_envelope(s, &b, "ERR_APP_NOT_FOUND"),
         format!("HTTP {s}"),
     );
-    // 非法 stage → 400
-    let (s, _) = get_json(
+    // 非法 stage → HTTP 200 + ERR_VALIDATION
+    let (s, b) = get_json(
         env,
         &format!("/api/v1/userapp/{ghost}/staging/health?user_id={user}"),
     )
     .await;
     report.assert_hard(
-        "health 非法 stage → 400",
-        s.as_u16() == 400,
+        "health 非法 stage → HTTP 200 + ERR_VALIDATION",
+        error_envelope(s, &b, "ERR_VALIDATION"),
         format!("HTTP {s}"),
     );
 }

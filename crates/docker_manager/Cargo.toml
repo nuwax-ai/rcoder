@@ -71,4 +71,5 @@ kubernetes = ["kube", "k8s-openapi"]
 ebpf-debug = []
 
 [dev-dependencies]
+rustls = { workspace = true }
 tempfile = "3"

@@ -1,4 +1,5 @@
 mod agent;
+pub mod archive_links;
 mod container;
 mod model;
 mod runtime_config;
@@ -114,7 +115,10 @@ pub use app_cli_logs::{
 
 // app-cli 部署相位契约（rcoder ↔ app-cli 单一事实源；deploy/status wire 枚举）
 pub mod app_cli_deploy;
-pub use app_cli_deploy::AppCliDeployPhase;
+pub use app_cli_deploy::{
+    AppCliDeployPhase, AppDeploymentOperation, AppDeploymentRecovery, AppEnvSnapshot,
+    AppMutationPrecondition,
+};
 
 // gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）
 pub use shared_types_grpc::grpc;
@@ -226,3 +230,5 @@ pub use workspace_manifest::{
     WorkspaceMeta, build_release_lock, discover_projects, parse_project, parse_workspace,
     validate_project, validate_service_id, validate_topology, validate_workspace,
 };
+
+pub mod userapp_http;

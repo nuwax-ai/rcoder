@@ -689,10 +689,26 @@ fn userapp_openapi_annotations_are_complete() {
                     .parse::<u16>()
                     .is_ok_and(|c| (400..600).contains(&c))
             });
-            assert!(
-                has_error_code,
-                "OpenAPI 操作未声明任何 4xx/5xx 错误响应: {path}"
-            );
+            if shared_types::userapp_http::is_formal_path(path) {
+                assert_eq!(
+                    success, "200",
+                    "formal UserApp response must be HTTP 200: {path}"
+                );
+                assert!(
+                    !has_error_code,
+                    "formal UserApp errors belong in the HTTP 200 envelope: {path}"
+                );
+                let schema = serde_json::to_string(ok).expect("response schema");
+                assert!(
+                    schema.contains("HttpResult") || ok.content.contains_key("text/event-stream"),
+                    "formal response must document HttpResult or SSE: {path}"
+                );
+            } else {
+                assert!(
+                    has_error_code,
+                    "legacy/stream operation must document transport errors: {path}"
+                );
+            }
             checked += 1;
         }
     }

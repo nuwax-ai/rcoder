@@ -8,7 +8,6 @@ use axum::response::{IntoResponse, Response};
 use shared_types::error_codes;
 
 use crate::router::AppState;
-use crate::userapp_builder::registered_builder;
 
 use super::upstream::USERAPP_API_PREFIX;
 
@@ -55,15 +54,75 @@ pub(super) fn classify_dev_absent(path: &str) -> DevAbsentAction {
     }
 }
 
-/// 短路语义的容器在否判定（peek）：只读探测，不 ensure、不写探活缓存、
-/// 不触发自愈——短路路径必须零副作用。
-/// 短路语义的容器在否判定（peek）：**仅以注册表 miss 为 absent 信号**，
-/// 不做探活——3s 探测在容器内重量构建（多服务 build/依赖安装）下会假阴性，
-/// 把进行中的 tasks 进度轮询误杀（轮询恰是该接口的核心场景）。注册命中即
-/// 视为在：慢/死 IP 由转发路径兜底（send 失败 502 + 下请求探活自愈）。
-/// 零副作用承诺不变：只读注册表，不 ensure 不自愈不清缓存。
-pub(super) fn dev_container_absent(state: &AppState, app_id: &str) -> bool {
-    registered_builder(state, app_id).is_none()
+/// Authoritative read-only lookup. Cache misses never prove absence, and lookup
+/// errors must not be converted to successful cancellation or trigger provisioning.
+pub(super) async fn existing_dev_addr(
+    state: &AppState,
+    app_id: &str,
+) -> Result<Option<String>, HttpResultError> {
+    resolve_existing_dev(
+        state
+            .runtime()
+            .find_container(app_id, &shared_types::ServiceType::UserappBuilder),
+        app_id,
+        &state.config.app_manager.namespace,
+        &state.cluster_domain,
+    )
+    .await
+}
+
+async fn resolve_existing_dev(
+    lookup: impl Future<
+        Output = container_runtime_api::ContainerRuntimeResult<
+            Option<container_runtime_api::RuntimeContainerInfo>,
+        >,
+    >,
+    app_id: &str,
+    namespace: &str,
+    cluster_domain: &str,
+) -> Result<Option<String>, HttpResultError> {
+    let found = lookup
+        .await
+        .map_err(|e| HttpResultError::bad_gateway(format!("lookup dev container failed: {e}")))?;
+    let Some(info) = found else {
+        return Ok(None);
+    };
+    if info.service_type.as_ref() != Some(&shared_types::ServiceType::UserappBuilder)
+        || info.identity_key() != Some(app_id)
+    {
+        return Err(HttpResultError::bad_gateway(
+            "dev container ownership mismatch",
+        ));
+    }
+    if info.status != container_runtime_api::ContainerRuntimeStatus::Running {
+        return Err(HttpResultError::bad_gateway(
+            "dev container exists but is not running",
+        ));
+    }
+    let host = shared_types::build_backend_addr(
+        &info.container_name,
+        &info.container_ip,
+        namespace,
+        cluster_domain,
+    );
+    if host.trim().is_empty() {
+        return Err(HttpResultError::bad_gateway(
+            "dev container address unavailable",
+        ));
+    }
+    Ok(Some(format!(
+        "http://{host}:{}",
+        shared_types::AGENT_FILE_SERVER_PORT
+    )))
+}
+
+pub(super) async fn dev_container_absent(
+    state: &AppState,
+    app_id: &str,
+) -> Result<bool, HttpResultError> {
+    existing_dev_addr(state, app_id)
+        .await
+        .map(|addr| addr.is_none())
 }
 
 /// 全站 HttpResult 信封短路响应（HTTP 恒 200，调用方按信封 code 判断：
@@ -433,5 +492,90 @@ mod tests {
             };
             assert_eq!(kind, expected, "{pattern} 语义分类漂移");
         }
+    }
+}
+
+#[cfg(test)]
+mod authoritative_lookup_tests {
+    use super::*;
+    use container_runtime_api::{
+        ContainerRuntimeError, ContainerRuntimeStatus, RuntimeContainerInfo,
+    };
+
+    fn builder() -> RuntimeContainerInfo {
+        RuntimeContainerInfo {
+            container_id: "owned-builder".into(),
+            container_name: "rcoder-app-builder-app-a".into(),
+            container_ip: "127.0.0.2".into(),
+            status: ContainerRuntimeStatus::Running,
+            created_at: chrono::Utc::now(),
+            env_vars: None,
+            service_type: Some(shared_types::ServiceType::UserappBuilder),
+            app_id: Some("app-a".into()),
+            project_id: None,
+            user_id: None,
+            pod_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn replica_without_registry_resolves_runtime_and_preserves_query_failure() {
+        let resolved = resolve_existing_dev(
+            async { Ok(Some(builder())) },
+            "app-a",
+            "test",
+            "cluster.local",
+        )
+        .await
+        .expect("runtime found");
+        assert!(resolved.expect("address").contains("127.0.0.2"));
+        assert!(
+            resolve_existing_dev(async { Ok(None) }, "app-a", "test", "cluster.local")
+                .await
+                .expect("authoritative absence")
+                .is_none()
+        );
+        assert!(
+            resolve_existing_dev(
+                async {
+                    Err(ContainerRuntimeError::ConnectionError(
+                        "API unavailable".into(),
+                    ))
+                },
+                "app-a",
+                "test",
+                "cluster.local"
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_wrong_family_and_higher_priority_identity_are_rejected() {
+        let mut wrong_family = builder();
+        wrong_family.service_type = Some(shared_types::ServiceType::Userapp);
+        assert!(
+            resolve_existing_dev(
+                async { Ok(Some(wrong_family)) },
+                "app-a",
+                "test",
+                "cluster.local"
+            )
+            .await
+            .is_err()
+        );
+        let mut wrong_key = builder();
+        wrong_key.pod_id = Some("another-pod".into());
+        assert!(
+            resolve_existing_dev(
+                async { Ok(Some(wrong_key)) },
+                "app-a",
+                "test",
+                "cluster.local"
+            )
+            .await
+            .is_err()
+        );
     }
 }

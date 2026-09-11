@@ -26,9 +26,13 @@ fn run_dir() -> &'static Path {
     static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
     RUN_DIR.get_or_init(|| {
         let tag = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("reports")
-            .join(format!("{tag}_p{}", std::process::id()));
+        let dir = std::env::var_os("E2E_REPORT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("reports")
+                    .join(format!("{tag}_p{}", std::process::id()))
+            });
         std::fs::create_dir_all(&dir).expect("create reports run dir");
         dir
     })
@@ -119,6 +123,10 @@ impl JsonlReporter {
     /// 跳过场景（环境门控未过等）：写终态行并消耗 self（测试函数随后 return）。
     pub fn skip(mut self, reason: &str) {
         self.write_end(Verdict::Skip, Some(reason));
+        assert!(
+            std::env::var("E2E_STRICT").as_deref() != Ok("1"),
+            "required E2E scenario skipped: {reason}"
+        );
     }
 
     /// chat 请求留痕（request 须已脱敏；失败时 ok=false + error）。

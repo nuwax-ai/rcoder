@@ -100,4 +100,7 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
             "/api/v1/userapp/storage/{app_stage}/query",
             post(handlers::query_storage),
         )
+        .layer(axum::middleware::from_fn(
+            shared_types::userapp_http::envelope_errors,
+        ))
 }

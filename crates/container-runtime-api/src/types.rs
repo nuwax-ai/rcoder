@@ -13,6 +13,8 @@ use crate::ContainerRuntime;
 /// Container runtime errors
 #[derive(Error, Debug)]
 pub enum ContainerRuntimeError {
+    #[error("Concurrent resource update: {0}")]
+    Conflict(String),
     #[error("Connection error: {0}")]
     ConnectionError(String),
 

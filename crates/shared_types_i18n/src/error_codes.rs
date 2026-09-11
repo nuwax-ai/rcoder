@@ -224,6 +224,8 @@ pub const ERR_WORKSPACE_NO_SERVICES: &str = "ERR_WORKSPACE_NO_SERVICES";
 
 /// UserApp dev 会话未运行——dev 日志仅在开发服务运行期间可用（app-cli 管理
 /// API :3010 随 dev 会话拉起/退出）。日志受理期快速失败 → 400；启动 dev 后即可查询。
+pub const ERR_HOT_DEPLOY_ENV_CHANGE: &str = "ERR_HOT_DEPLOY_ENV_CHANGE";
+
 pub const ERR_DEV_NOT_RUNNING: &str = "ERR_DEV_NOT_RUNNING";
 
 /// 判断错误码是否可重试（Java 据此决定是否指数退避重发）。
@@ -307,6 +309,7 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_RESOURCE_EXHAUSTED => "error.resource_exhausted",
         ERR_WORKSPACE_EMPTY => "error.workspace_empty",
         ERR_WORKSPACE_NO_SERVICES => "error.workspace_no_services",
+        ERR_HOT_DEPLOY_ENV_CHANGE => "error.hot_deploy_env_change",
         ERR_DEV_NOT_RUNNING => "error.dev_not_running",
         ERR_UNKNOWN => "error.unknown",
         _ => "error.undefined",
@@ -415,6 +418,7 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_WORKSPACE_NO_SERVICES => {
             "UserApp workspace has no enabled services (invalid or missing manifest)"
         }
+        ERR_HOT_DEPLOY_ENV_CHANGE => "Hot deployment cannot change business env; use pod mode",
         ERR_DEV_NOT_RUNNING => {
             "UserApp dev server is not running (dev logs are only available while it runs)"
         }
@@ -482,6 +486,7 @@ mod tests {
             ERR_MODEL_UNAVAILABLE,
             ERR_WORKSPACE_EMPTY,
             ERR_WORKSPACE_NO_SERVICES,
+            ERR_HOT_DEPLOY_ENV_CHANGE,
             ERR_DEV_NOT_RUNNING,
         ];
 

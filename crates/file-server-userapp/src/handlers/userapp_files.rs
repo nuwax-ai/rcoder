@@ -482,7 +482,7 @@ mod tests {
     use super::*;
     use axum::extract::Path;
 
-    use file_server::extract::AppJson;
+    use crate::extract::AppJson;
 
     use super::tests_support::make_state;
 

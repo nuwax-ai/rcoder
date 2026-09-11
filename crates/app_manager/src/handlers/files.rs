@@ -47,10 +47,7 @@ pub struct AppUploadForm {
     ),
     request_body(content = AppUploadForm, content_type = "multipart/form-data", description = "上传文件（multipart：user_id 必填）"),
     responses(
-        (status = 200, description = "上传成功", body = HttpResult<UploadResult>),
-        (status = 400, description = "multipart 解析失败 / 缺 file 或 user_id 字段 / app_stage 非法", body = HttpResult<String>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>),
-        (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
+        (status = 200, description = "上传成功", body = HttpResult<UploadResult>)
     ),
     tag = "Userapp · 双态 · 文件与存储"
 )]
@@ -162,9 +159,7 @@ pub struct UploadFromUrlRequest {
     ),
     request_body = UploadFromUrlRequest,
     responses(
-        (status = 200, description = "下载并上传成功", body = HttpResult<UploadResult>),
-        (status = 400, description = "URL 非法或不是 HTTP(S) / app_stage 非法", body = HttpResult<String>),
-        (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
+        (status = 200, description = "下载并上传成功", body = HttpResult<UploadResult>)
     ),
     tag = "Userapp · 双态 · 文件与存储"
 )]
@@ -219,10 +214,7 @@ pub struct ListFilesQuery {
         ("path" = Option<String>, Query, description = "子目录（相对环境根，如 code/data/logs；默认列根）")
     ),
     responses(
-        (status = 200, description = "查询成功", body = HttpResult<Vec<FileInfo>>),
-        (status = 400, description = "app_stage 非法", body = HttpResult<String>),
-        (status = 404, description = "应用/路径不存在", body = HttpResult<String>),
-        (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
+        (status = 200, description = "查询成功", body = HttpResult<Vec<FileInfo>>)
     ),
     tag = "Userapp · 双态 · 文件与存储"
 )]
@@ -273,10 +265,7 @@ pub struct DeleteFileRequest {
     ),
     request_body = DeleteFileRequest,
     responses(
-        (status = 200, description = "删除成功", body = HttpResult<String>),
-        (status = 400, description = "app_stage 非法", body = HttpResult<String>),
-        (status = 404, description = "文件/应用不存在", body = HttpResult<String>),
-        (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
+        (status = 200, description = "删除成功", body = HttpResult<String>)
     ),
     tag = "Userapp · 双态 · 文件与存储"
 )]

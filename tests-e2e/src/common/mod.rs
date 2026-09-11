@@ -8,6 +8,10 @@ pub mod report;
 pub mod scenario;
 pub mod sse;
 
+pub mod fixtures;
+pub mod resources;
+pub mod retry;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -103,8 +107,14 @@ fn cfg_or_env_or(cfg: &HashMap<String, String>, key: &str, default: &str) -> Str
 impl Env {
     pub fn load() -> Self {
         let cfg = load_env_local();
-        let run_tag = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-        let hhmmss = run_tag.split('_').nth(1).unwrap_or("000000").to_owned();
+        let case_id = std::env::var("E2E_CASE_ID")
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
+        let run_tag = format!(
+            "{}_{}",
+            &case_id[..12],
+            std::env::var("E2E_RUN_ID").unwrap_or_else(|_| "direct".into())
+        );
+        let hhmmss = &case_id[..12];
         // W3C traceparent 注入：e2e 发起 trace（每 Env 实例 = 每场景独立
         // trace_id），rcoder 侧 make_span_with_trace_parent 提取继承——
         // OTLP 开启时全链路同一 trace，失败排查用 trace_id 检索。
@@ -119,10 +129,7 @@ impl Env {
             rcoder: cfg_or_env_or(&cfg, "RCODER_URL", "http://127.0.0.1:8090"),
             api_key: cfg_or_env(&cfg, "LLM_API_KEY"),
             base_url: cfg_or_env(&cfg, "LLM_BASE_URL"),
-            base_url_anthropic: cfg
-                .get("LLM_BASE_URL_ANTHROPIC")
-                .cloned()
-                .unwrap_or_default(),
+            base_url_anthropic: cfg_or_env(&cfg, "LLM_BASE_URL_ANTHROPIC"),
             model: cfg_or_env(&cfg, "LLM_MODEL"),
             model_pro: cfg_or_env(&cfg, "LLM_MODEL_PRO"),
             run_tag: run_tag.clone(),
@@ -154,13 +161,17 @@ impl Env {
     /// compose 门控：探测 /health（2s）+ LLM 配置完整性；任一不满足 → skip。
     /// `cargo test --workspace` 在无环境机器上由此保持全绿（PG-gated 同模式）。
     pub async fn compose_or_skip(scenario: &str, backend: &str) -> Option<(Self, JsonlReporter)> {
-        let env = Self::load();
+        let mut env = Self::load();
+        // A Compose scenario must never inherit a remote cleanup target from .env.local.
+        env.k8s_ssh.clear();
         let report = JsonlReporter::begin(
             scenario,
             backend,
             json!({ "rcoder": env.rcoder, "model": env.model, "user": env.user, "trace_id": env.trace_id }),
         );
-        if env.api_key.is_empty() || env.model.is_empty() || env.base_url.is_empty() {
+        if backend != "compose"
+            && (env.api_key.is_empty() || env.model.is_empty() || env.base_url.is_empty())
+        {
             report.skip(
                 "LLM config missing: 检查 .env.local / LLM_API_KEY / LLM_MODEL / LLM_BASE_URL \
                  （空 model_provider 会让 agent 调用失败、场景慢死）",
@@ -383,7 +394,7 @@ pub fn sanitize_request(req: &ComputerChatRequest) -> Value {
 
 /// 场景清理 guard：Drop 时删除该 user 的 agent 容器（不等闲置回收）。
 /// Docker 模式 docker rm；K8s 模式（TEST_K8S_SSH）远程 kubectl 删
-/// STS/svc/PVC（ns 硬限定 + user 前缀严格匹配双重保护，与 Python 套件一致）。
+/// STS/svc；agent PVC 永不删除。Compose 入口强制本地清理。
 pub struct TestUserGuard {
     pub user: String,
     k8s: Option<(String, String)>,
@@ -409,30 +420,18 @@ impl Drop for TestUserGuard {
 }
 
 fn cleanup_docker(user: &str) -> String {
-    let name_filter = format!("dev-rcoder-agent-runner-{user}");
-    let out = std::process::Command::new("docker")
-        .args(["ps", "-aq", "--filter", &format!("name={name_filter}")])
-        .output();
-    let Ok(out) = out else {
-        return "docker ps failed".to_owned();
-    };
-    let ids = String::from_utf8_lossy(&out.stdout);
-    let ids: Vec<&str> = ids.split_whitespace().collect();
-    if ids.is_empty() {
-        return "no containers".to_owned();
-    }
-    let mut args = vec!["rm", "-f"];
-    args.extend(ids.iter().copied());
-    match std::process::Command::new("docker").args(&args).output() {
-        Ok(o) if o.status.success() => format!("removed {} container(s)", ids.len()),
-        Ok(o) => format!("rm failed: {}", String::from_utf8_lossy(&o.stderr)),
-        Err(e) => format!("docker rm exec failed: {e}"),
+    match resources::cleanup_container(&format!("dev-rcoder-agent-runner-{user}")) {
+        Ok(()) => "owned resource cleanup complete".into(),
+        Err(error) => format!("owned resource cleanup failed: {error}"),
     }
 }
 
 fn cleanup_k8s(ssh: &str, ns: &str, user: &str) -> String {
+    if ns == "nuwax-k8s-prod" {
+        return "production cleanup is forbidden".into();
+    }
     let list = std::process::Command::new("ssh")
-        .args([ssh, "kubectl", "-n", ns, "get", "sts,svc,pvc", "-o", "name"])
+        .args([ssh, "kubectl", "-n", ns, "get", "sts,svc", "-o", "name"])
         .output();
     let Ok(out) = list else {
         return "ssh kubectl get failed".to_owned();
@@ -443,7 +442,7 @@ fn cleanup_k8s(ssh: &str, ns: &str, user: &str) -> String {
         .lines()
         .map(str::trim)
         .filter(|l| l.contains('/'))
-        .filter(|l| l.rsplit('/').next().is_some_and(|n| n.starts_with(&prefix)))
+        .filter(|l| l.rsplit('/').next().is_some_and(|n| n == prefix))
         .map(str::to_owned)
         .collect();
     if targets.is_empty() {

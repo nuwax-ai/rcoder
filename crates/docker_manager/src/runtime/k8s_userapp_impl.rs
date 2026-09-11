@@ -25,30 +25,99 @@ use super::kubernetes_runtime::{KubernetesRuntime, read_app_expose_env};
 impl UserAppDeploymentRuntime for KubernetesRuntime {
     // ===== Deployment 生命周期（Userapp 专用，转调 k8s_deployment.rs 的 inherent 方法）=====
 
-    /// 热部署收敛：仅更新 ConfigMap data，**保留原 labels/metadata、不触碰
-    /// Deployment**（config-hash 注解不动 → 无 Recreate → 热部署效果保持）。
+    async fn app_env_snapshot(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::AppEnvSnapshot> {
+        let deployment = self
+            .deployments_api()
+            .get(&self.app_deployment_name(app_id))
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("read env deployment: {e}")))?;
+        let name = deployment
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.spec.as_ref())
+            .and_then(|s| s.containers.first())
+            .and_then(|c| c.env_from.as_ref())
+            .and_then(|sources| {
+                sources
+                    .iter()
+                    .find_map(|s| s.config_map_ref.as_ref().map(|r| r.name.clone()))
+            })
+            .ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError(
+                    "app has no env ConfigMap reference".into(),
+                )
+            })?;
+        let cm = self
+            .configmaps_api()
+            .get(&name)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("read env configmap: {e}")))?;
+        Ok(shared_types::AppEnvSnapshot {
+            env: cm.data.unwrap_or_default().into_iter().collect(),
+            deployment_uid: deployment.metadata.uid,
+            deployment_version: deployment.metadata.resource_version,
+            resource_name: Some(name),
+            resource_version: cm.metadata.resource_version,
+        })
+    }
+
     async fn update_env_configmap(
         &self,
         app_id: &str,
         env: &std::collections::HashMap<String, String>,
     ) -> ContainerRuntimeResult<()> {
-        let name = self.app_config_name(app_id);
-        let api = self.configmaps_api();
-        // 先读现有对象保 labels（tenant/space 归属标记随 apply 字段所有权走，
-        // 重建不带上会被 SSA 抹掉）
-        let existing = api
-            .get(&name)
+        let snapshot = self.app_env_snapshot(app_id).await?;
+        self.update_env_configmap_if_version(app_id, env, &snapshot)
             .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("get configmap {name}: {e}")))?;
-        let mut cm = existing;
-        cm.data = Some(env.clone().into_iter().collect());
-        let body = serde_json::to_value(&cm)
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("serialize configmap: {e}")))?;
-        api.patch(&name, &Self::ssa_patch_params(), &Patch::Apply(body))
+    }
+
+    async fn update_env_configmap_if_version(
+        &self,
+        app_id: &str,
+        env: &std::collections::HashMap<String, String>,
+        snapshot: &shared_types::AppEnvSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        let current = self.app_env_snapshot(app_id).await?;
+        if current.deployment_uid != snapshot.deployment_uid
+            || current.deployment_version != snapshot.deployment_version
+            || current.resource_name != snapshot.resource_name
+            || current.resource_version != snapshot.resource_version
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "hot deployment or env changed concurrently".into(),
+            ));
+        }
+        let name = snapshot.resource_name.as_deref().ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError("env resource name missing".into())
+        })?;
+        let version = snapshot.resource_version.as_deref().ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError("env resource version missing".into())
+        })?;
+        let patch = serde_json::json!({"metadata": {"resourceVersion": version}, "data": env});
+        // Merge carries the API-server resourceVersion precondition; env keys only add/update.
+        self.configmaps_api()
+            .patch(
+                name,
+                &kube::api::PatchParams::default(),
+                &Patch::Merge(patch),
+            )
             .await
             .map_err(|e| {
-                ContainerRuntimeError::K8sError(format!("apply configmap (env-only): {e}"))
+                ContainerRuntimeError::K8sError(format!("conditional hot env commit: {e}"))
             })?;
+        let committed = self.app_env_snapshot(app_id).await?;
+        if committed.deployment_uid != snapshot.deployment_uid
+            || committed.deployment_version != snapshot.deployment_version
+            || committed.resource_name != snapshot.resource_name
+            || committed.env != *env
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "deployment changed during hot env convergence; inspect active operation".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -99,6 +168,40 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        let app_id = params
+            .project_id
+            .as_deref()
+            .ok_or_else(|| ContainerRuntimeError::ConfigurationError("missing app_id".into()))?;
+        let current = self
+            .deployments_api()
+            .get(&self.app_deployment_name(app_id))
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("read deployment version: {e}"))
+            })?;
+        self.patch_deployment_if_version(
+            params,
+            shared_types::AppMutationPrecondition {
+                resource_version: current.metadata.resource_version,
+            },
+        )
+        .await
+    }
+
+    async fn patch_deployment_if_version(
+        &self,
+        params: ContainerCreateParams,
+        expected: shared_types::AppMutationPrecondition,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        let version = expected
+            .resource_version
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError(
+                    "K8s update requires resource_version".into(),
+                )
+            })?;
         let app_id = params.project_id.clone().ok_or_else(|| {
             ContainerRuntimeError::ConfigurationError(
                 "patch_deployment requires project_id (app_id)".to_string(),
@@ -106,12 +209,13 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         })?;
         let (gateway_name, gateway_namespace, http_expose) = read_app_expose_env();
         // SSA re-apply 全部资源（幂等 create-or-update，收敛到新 desired state）
-        self.create_app_resources(
+        self.write_app_resources(
             &app_id,
             &params,
             gateway_name.as_deref(),
             gateway_namespace.as_deref(),
             http_expose,
+            Some(version),
         )
         .await?;
         // 清理 update 后不再需要的端口/配置资源（HTTPRoute/NodePort/ConfigMap/Secret orphan）

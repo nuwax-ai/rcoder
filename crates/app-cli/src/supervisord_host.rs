@@ -93,6 +93,7 @@ impl SupervisordHost {
         args: &CliArgs,
         release: &ReleaseLock,
         runtime_status: &RuntimeStatusService,
+        run_migrations: bool,
     ) -> Result<()> {
         runtime_status.set_ready(false);
         supervisor::validate_runtime_compatibility(release)?;
@@ -112,7 +113,7 @@ impl SupervisordHost {
 
         // 1. migrate（Fail Fast，与 builtin 同语义）
         for spec in &specs {
-            if !spec.run.migrate.is_empty() {
+            if run_migrations && !spec.run.migrate.is_empty() {
                 info!("🛠️  migrate {}", spec.service_id);
                 let cwd = args.workspace.join(&spec.dir);
                 supervisor::run_transient(&spec.run.migrate, &cwd)

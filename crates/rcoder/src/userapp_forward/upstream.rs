@@ -286,6 +286,16 @@ pub(crate) async fn forward_to_dev(
     req: Request,
     explicit_user_id: Option<&str>,
 ) -> Response {
+    if !matches!(
+        super::semantics::classify_dev_absent(req.uri().path()),
+        super::semantics::DevAbsentAction::Ensure
+    ) {
+        return match super::semantics::existing_dev_addr(state, app_id).await {
+            Ok(Some(addr)) => forward_to_addr("dev", app_id, &addr, req).await,
+            Ok(None) => super::semantics::unavailable_response(app_id),
+            Err(error) => error.into_response(),
+        };
+    }
     let addr = match resolve_dev_addr(state, app_id, explicit_user_id).await {
         Ok(addr) => addr,
         Err(resp) => return *resp,

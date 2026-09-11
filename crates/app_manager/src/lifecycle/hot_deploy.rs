@@ -19,7 +19,6 @@ use std::time::Duration;
 use shared_types::AppCliDeployPhase;
 use tracing::{info, warn};
 
-use super::deploy_wait::parse_deploy_status;
 use crate::error::AppOperationError;
 use crate::error::AppResult;
 use crate::models::AppRuntimeInfo;
@@ -66,18 +65,16 @@ impl AppService {
         };
 
         // 前置：容器配置了部署令牌（未配置 = 端点禁用 = 镜像未升级到 server 形态）
-        let token = self
+        let env_snapshot = self
             .runtime
-            .get_app_container_spec(app_id)
+            .app_env_snapshot(app_id)
             .await
-            .ok()
-            .and_then(|spec| spec.env)
-            .as_ref()
-            .and_then(|env| {
-                env.get("APP_CLI_DEPLOY_TOKEN")
-                    .cloned()
-                    .filter(|t| !t.trim().is_empty())
-            });
+            .map_err(|e| AppOperationError::Backend(format!("read hot deployment env: {e}")))?;
+        let token = env_snapshot
+            .env
+            .get("APP_CLI_DEPLOY_TOKEN")
+            .cloned()
+            .filter(|token| !token.trim().is_empty());
         let Some(token) = token else {
             warn!(
                 "[APP] hot deploy fallback: APP_CLI_DEPLOY_TOKEN not set on app {app_id} \
@@ -88,7 +85,38 @@ impl AppService {
 
         // 受理
         let base = format!("http://{ip}:{APP_CLI_ADMIN_PORT}");
+        let client = reqwest::Client::new();
+        let capability = client
+            .get(format!("{base}/v1/deploy/status"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| {
+                AppOperationError::Backend(format!("hot deployment capability probe failed: {e}"))
+            })?;
+        if capability.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let capability: serde_json::Value = capability
+            .error_for_status()
+            .map_err(|e| {
+                AppOperationError::Backend(format!("hot deployment capability status: {e}"))
+            })?
+            .json()
+            .await
+            .map_err(|e| {
+                AppOperationError::Backend(format!("hot deployment capability body: {e}"))
+            })?;
+        if capability
+            .pointer("/data/protocol_version")
+            .and_then(|v| v.as_u64())
+            != Some(2)
+        {
+            return Ok(None);
+        }
+        let operation_id = uuid::Uuid::new_v4().simple().to_string();
         let body = serde_json::json!({
+            "operation_id": operation_id,
             "url": url,
             "release_id": release_id,
             "sha256": if sha256.is_empty() { None } else { Some(sha256) },
@@ -110,17 +138,18 @@ impl AppService {
                 )));
             }
             Ok(r) => {
-                warn!(
-                    "[APP] hot deploy fallback: /v1/deploy returned {} (server-form image required)",
+                return Err(AppOperationError::Backend(format!(
+                    "hot deployment request rejected: HTTP {}",
                     r.status()
-                );
-                return Ok(None);
+                )));
             }
             Err(e) => {
-                warn!("[APP] hot deploy fallback: connect {base} failed: {e}");
-                return Ok(None);
+                return Err(AppOperationError::Backend(format!(
+                    "hot deployment acceptance uncertain; inspect operation {operation_id} before retry: {e}"
+                )));
             }
         }
+
         info!("[APP] hot deploy accepted: app_id={app_id}, release_id={release_id}");
 
         // 轮询到终态（running=成功——server 在编排+bridge readiness 完成后才置 Running）
@@ -146,16 +175,27 @@ impl AppService {
                     .json::<serde_json::Value>()
                     .await
                     .ok()
-                    .map(|v| parse_deploy_status(&v)),
+                    .and_then(|v| v.pointer("/data/operation").cloned())
+                    .and_then(|v| {
+                        serde_json::from_value::<shared_types::AppDeploymentOperation>(v).ok()
+                    }),
                 _ => None,
             };
             // 穷尽 match：新增 AppCliDeployPhase 变体时编译错，强制同步本判据
-            match probe.as_ref().and_then(|p| p.phase) {
+            match probe
+                .as_ref()
+                .filter(|p| p.operation_id == operation_id && p.request_release_id == release_id)
+                .map(|p| p.phase)
+            {
                 Some(AppCliDeployPhase::Running) => break,
                 Some(AppCliDeployPhase::Failed) => {
-                    let error = "hot deploy failed on container (see app-cli logs; \
-                                 redeploy old artifact URL to roll back)"
-                        .to_string();
+                    let error = format!(
+                        "hot deploy operation {operation_id} failed: {}",
+                        probe
+                            .as_ref()
+                            .and_then(|p| p.error.as_deref())
+                            .unwrap_or("see app-cli logs for recovery outcome")
+                    );
                     return Err(AppOperationError::Backend(error));
                 }
                 // deploying/orchestrating（换应用进行中）、idle（受理竞态窗口）、
@@ -170,42 +210,36 @@ impl AppService {
         }
 
         // 收敛 env 三元组进 ConfigMap（不触发 Recreate）：Pod 重建恢复最新版本
-        self.converge_deploy_env_after_hot(app_id, url, release_id, sha256)
-            .await;
+        self.converge_deploy_env_after_hot(app_id, url, release_id, sha256, &env_snapshot)
+            .await?;
         info!("[APP] hot deploy done (pod kept): app_id={app_id}, release_id={release_id}");
         Ok(Some(()))
     }
 
     /// 热部署成功后的 env 收敛：live env 读回 → 剥离历史三元组 → 注入本次
-    /// 三元组 → 仅 apply ConfigMap。读回失败仅 warn（收敛是尽力而为——最坏
-    /// 情况 Pod 重建回旧版本，不影响当前运行）。
+    /// 三元组 → 条件写入 ConfigMap。任何冲突或失败均显式报告，禁止伪装完全成功。
     async fn converge_deploy_env_after_hot(
         &self,
         app_id: &str,
         url: &str,
         release_id: &str,
         sha256: &str,
-    ) {
-        let env = match self.runtime.get_app_container_spec(app_id).await {
-            Ok(spec) => spec.env.unwrap_or_default(),
-            Err(e) => {
-                warn!(
-                    "[APP] hot deploy env convergence skipped (live read failed): app_id={app_id}: {e}"
-                );
-                return;
-            }
-        };
-        let mut env: std::collections::HashMap<String, String> = env.into_iter().collect();
+        snapshot: &shared_types::AppEnvSnapshot,
+    ) -> AppResult<()> {
+        let mut env = snapshot.env.clone();
         crate::release_flow::identity::strip_release_identity(&mut env);
         env.insert("APP_DEPLOY_URL".to_string(), url.to_string());
         env.insert("APP_RELEASE_ID".to_string(), release_id.to_string());
         env.insert("APP_DEPLOY_SHA256".to_string(), sha256.to_string());
-        if let Err(e) = self.runtime.update_env_configmap(app_id, &env).await {
-            warn!(
-                "[APP] hot deploy env convergence failed (pod rebuild restores old version): \
-                 app_id={app_id}: {e}"
-            );
-        }
+        self.runtime
+            .update_env_configmap_if_version(app_id, &env, snapshot)
+            .await
+            .map_err(|e| {
+                AppOperationError::Backend(format!(
+                    "application activated but deployment env convergence failed: {e}"
+                ))
+            })?;
+        Ok(())
     }
 }
 

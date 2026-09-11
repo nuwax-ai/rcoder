@@ -37,9 +37,7 @@ use crate::models::{
 - 跨应用批量对账用 `POST /api/v1/userapp/storage/{app_stage}/query` 分页面。
 "#,
     responses(
-        (status = 200, description = "查询成功", body = HttpResult<StorageInfo>),
-        (status = 400, description = "app_stage 非法", body = HttpResult<String>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>)
+        (status = 200, description = "查询成功", body = HttpResult<StorageInfo>)
     ),
     tag = "Userapp · 双态 · 文件与存储"
 )]
@@ -79,11 +77,7 @@ pub async fn get_app_storage(
     ),
     request_body = ClearStorageRequest,
     responses(
-        (status = 200, description = "清空成功", body = HttpResult<String>),
-        (status = 400, description = "app_stage 非法 / user_id 缺失或非法", body = HttpResult<String>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>),
-        (status = 409, description = "prod 下应用仍存在，需先 delete", body = HttpResult<String>),
-        (status = 502, description = "dev 下开发容器不可达（或容器内无 clear 端点——旧镜像需换代）", body = HttpResult<String>)
+        (status = 200, description = "清空成功", body = HttpResult<String>)
     ),
     tag = "Userapp · 双态 · 文件与存储"
 )]
@@ -123,10 +117,7 @@ pub async fn clear_app_storage(
     ),
     request_body = DestroyStorageRequest,
     responses(
-        (status = 200, description = "已销毁", body = HttpResult<String>),
-        (status = 400, description = "confirm 缺失/不匹配 app_id / app_stage 非法", body = HttpResult<String>),
-        (status = 409, description = "prod 下应用仍存在，需先 delete", body = HttpResult<String>),
-        (status = 500, description = "PVC 卡 Terminating，需运维介入（pvc-protection finalizer 未移除）", body = HttpResult<String>)
+        (status = 200, description = "已销毁", body = HttpResult<String>)
     ),
     tag = "Userapp · 双态 · 文件与存储"
 )]
@@ -171,8 +162,7 @@ pub async fn destroy_app_storage(
 - 常用过滤维度以 `QueryStorageRequest` 字段为准（Swagger 内展开可见）。
 "#,
     responses(
-        (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<StorageInfo>>),
-        (status = 400, description = "分页参数错误 / app_stage 非法", body = HttpResult<String>)
+        (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<StorageInfo>>)
     ),
     tag = "Userapp · 双态 · 文件与存储"
 )]

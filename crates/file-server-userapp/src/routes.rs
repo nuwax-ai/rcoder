@@ -52,7 +52,11 @@ fn userapp_router() -> OpenApiRouter<UserAppState> {
 /// userApp 域顶层：nest `/api/v1/userapp` 前缀（路径注解为相对路径，文档收集时
 /// 自动带前缀——与 file-server 侧原组织一致）。
 pub(crate) fn userapp_top_router() -> OpenApiRouter<UserAppState> {
-    OpenApiRouter::new().nest("/api/v1/userapp", userapp_router())
+    OpenApiRouter::new()
+        .nest("/api/v1/userapp", userapp_router())
+        .layer(axum::middleware::from_fn(
+            shared_types::userapp_http::envelope_errors,
+        ))
 }
 
 /// userApp 域独立 OpenAPI 文档（含 Userapp tag；rcoder 聚合与本地 swagger 用）。

@@ -327,6 +327,44 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    async fn app_env_snapshot(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::AppEnvSnapshot> {
+        let spec = self.get_app_container_spec(app_id).await?;
+        Ok(shared_types::AppEnvSnapshot {
+            env: spec.env.unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+
+    async fn update_env_configmap_if_version(
+        &self,
+        app_id: &str,
+        env: &std::collections::HashMap<String, String>,
+        snapshot: &shared_types::AppEnvSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        if snapshot.resource_version.is_some() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "conditional env writes unsupported".into(),
+            ));
+        }
+        self.update_env_configmap(app_id, env).await
+    }
+
+    async fn patch_deployment_if_version(
+        &self,
+        params: ContainerCreateParams,
+        expected: shared_types::AppMutationPrecondition,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        if expected.resource_version.is_some() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "conditional deployment writes unsupported".into(),
+            ));
+        }
+        self.patch_deployment(params).await
+    }
+
     /// 仅更新 app env 的 ConfigMap（K8s），**不触碰 Deployment 模板**——热部署成功后
     /// 把部署三元组收敛进 env（Pod 重建时恢复最新版本），又不触发 config-hash
     /// 变更导致的 Recreate（保持热部署"不换 Pod"的效果）。

@@ -2,7 +2,7 @@
 //!
 //! file-server 全局 `AppError` shape（`{success, code:"UNKNOWN_ERROR", error:{...}}`）
 //! 服务于 TS 对齐路由不能动；userApp 域（Rust 独有业务）在此把错误统一渲染为
-//! HttpResult 形态 + 语义 HTTP 状态码。翻译点在跨 crate 边界（错误从 file-server
+//! HttpResult 形态 + HTTP 200。翻译点在跨 crate 边界（错误从 file-server
 //! 共享设施流出的 handler 出口）——`From<AppError>` 让 `?` 直接传播。
 
 use axum::Json;
@@ -27,7 +27,7 @@ impl From<AppError> for UserAppError {
 impl IntoResponse for UserAppError {
     fn into_response(self) -> Response {
         use shared_types::error_codes as ec;
-        let (code, status) = match &self.0 {
+        let (code, _status) = match &self.0 {
             AppError::Validation(..) | AppError::ValidationI18n(..) | AppError::Business(_) => {
                 (ec::ERR_VALIDATION, StatusCode::BAD_REQUEST)
             }
@@ -42,7 +42,7 @@ impl IntoResponse for UserAppError {
             ),
         };
         let result = HttpResult::<()>::error(code, &self.0.to_string());
-        (status, Json(result)).into_response()
+        Json(result).into_response()
     }
 }
 

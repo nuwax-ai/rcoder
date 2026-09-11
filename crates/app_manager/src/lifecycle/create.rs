@@ -3,7 +3,7 @@
 //! create_app + validate/provision/runtime/assemble 创建流水。
 
 use chrono::Utc;
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument};
 use uuid::Uuid;
 
 use crate::models::*;
@@ -22,11 +22,8 @@ impl AppService {
         // 不可重入，已持锁调用会永久挂起（activate 的 ensure_app_runtime 走
         // [`create_app_locked`] 内核避免此问题）。
         //
-        // 多副本并发 create 同名 app：历史方案是 workspace 根级 flock（依赖 CephFS
-        // RWX 共享挂载）——RBD 卷形态下 rcoder 不再挂卷，flock 基础不复存在，删除。
-        // 现状语义：两副本并发 create 同名 → SSA force 合并（后写覆盖）。create 已
-        // 从 REST 面删除（仅内部 ensure/start-deploy 路径），且 Java 六步编排串行，
-        // 风险面收敛；如未来需要强互斥再引入 PG advisory lock。
+        // Multi-replica creation is resolved at the runtime create boundary.
+        // Never compensate by the logical name: another replica may own that resource.
         let app_id = self.validate_create_request(&request).await?;
         // 与发布流水线/delete 串行: 防发布流水线 EnsureApp 建 Deployment 与并发
         // DELETE 互踩 (删成功但 Deployment 复活/半删半建脏状态)。
@@ -70,17 +67,9 @@ impl AppService {
         );
         self.provision_app_workspace(app_id, &request).await?;
         // provision_app_workspace 失败不走此分支：PVC/目录保留，下次 create 幂等复用。
-        if let Err(error) = self.create_app_runtime(app_id, &request).await {
-            // 部分失败兜底（create_deployment 可能已部分建成/后续步骤残留）：
-            // best-effort 删除 Deployment，容忍 NotFound（create_deployment 自身失败时
-            // 尚未产生部署）；清理失败仅 warn，绝不覆盖原始错误。
-            if let Err(cleanup_error) = self.runtime.delete_deployment(app_id).await {
-                warn!(
-                    "[APP] best-effort cleanup after create_app_runtime failure: delete_deployment app_id={app_id} failed (NotFound tolerated): {cleanup_error}"
-                );
-            }
-            return Err(error);
-        }
+        // The runtime owns partial-create compensation: only it has the IDs/UIDs
+        // returned by successful create calls. A name conflict establishes no ownership.
+        self.create_app_runtime(app_id, &request).await?;
         // 同 ID 删除后重建时，必须清除旧的 stopped/wake-blocked 内存态。
         self.activity.mark_running(app_id);
         // 业务元数据落库/缓存（name/租户/业务创建时间;集群不持有。request 随后 move 进 assemble）
@@ -113,7 +102,7 @@ impl AppService {
             && !shared_types::IDENTIFIER_RE.is_match(request.user_id.trim())
         {
             return Err(AppOperationError::Validation(
-                "user_id 仅允许字母、数字、下划线和连字符（1-64 字符）".to_string(),
+                "user_id must contain 1-64 letters, digits, underscores or hyphens".to_string(),
             ));
         }
         // app_id：外部指定（DNS-1123 label ≤33，如 app-order-svc 或数值 project_id；

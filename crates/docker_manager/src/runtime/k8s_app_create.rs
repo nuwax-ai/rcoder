@@ -19,7 +19,6 @@ use k8s_openapi::api::core::v1::{
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 #[cfg(feature = "kubernetes")]
-use kube::api::Patch;
 #[cfg(feature = "kubernetes")]
 use tracing::info;
 
@@ -36,71 +35,6 @@ use super::k8s_pvc::K8sPvcOps;
 use super::kubernetes_runtime::KubernetesRuntime;
 
 impl KubernetesRuntime {
-    /// apply ConfigMap（存 env，非敏感）—— SSA create-or-update
-    async fn apply_app_configmap(
-        &self,
-        app_id: &str,
-        env: &std::collections::HashMap<String, String>,
-        tenant_id: Option<&str>,
-        space_id: Option<&str>,
-    ) -> ContainerRuntimeResult<()> {
-        let cm = ConfigMap {
-            metadata: ObjectMeta {
-                name: Some(self.app_config_name(app_id)),
-                namespace: Some(self.namespace.clone()),
-                labels: Some(self.build_app_labels(app_id, tenant_id, space_id)),
-                ..Default::default()
-            },
-            data: Some(env.clone().into_iter().collect()),
-            ..Default::default()
-        };
-        let body = serde_json::to_value(&cm)
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("serialize configmap: {e}")))?;
-        self.configmaps_api()
-            .patch(
-                &self.app_config_name(app_id),
-                &Self::ssa_patch_params(),
-                &Patch::Apply(body),
-            )
-            .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("apply configmap: {e}")))?;
-        Ok(())
-    }
-
-    /// apply Secret（存 secrets，敏感）—— SSA create-or-update
-    async fn apply_app_secret(
-        &self,
-        app_id: &str,
-        secrets: &std::collections::HashMap<String, String>,
-        tenant_id: Option<&str>,
-        space_id: Option<&str>,
-    ) -> ContainerRuntimeResult<()> {
-        // K8s Secret data 需要 base64；StringData 更方便
-        use k8s_openapi::api::core::v1::Secret;
-        let secret = Secret {
-            metadata: ObjectMeta {
-                name: Some(self.app_secret_name(app_id)),
-                namespace: Some(self.namespace.clone()),
-                labels: Some(self.build_app_labels(app_id, tenant_id, space_id)),
-                ..Default::default()
-            },
-            string_data: Some(secrets.clone().into_iter().collect()),
-            ..Default::default()
-        };
-        let body = serde_json::to_value(&secret)
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("serialize secret: {e}")))?;
-        self.secrets_api()
-            .patch(
-                &self.app_secret_name(app_id),
-                &Self::ssa_patch_params(),
-                &Patch::Apply(body),
-            )
-            .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("apply secret: {e}")))?;
-        Ok(())
-    }
-
-    /// 构建 Deployment 资源
     fn build_app_deployment(
         &self,
         app_id: &str,
@@ -306,28 +240,160 @@ impl KubernetesRuntime {
         Ok(deployment)
     }
 
-    /// apply Deployment（SSA create-or-update）。抽出供 create_app_resources 与
-    /// patch_deployment（Phase 3）复用。
-    async fn apply_app_deployment(
+    /// Stage operation-owned configuration, then conditionally commit the Deployment.
+    /// Configuration names are unique: losing writers cannot alter the running generation.
+    async fn write_app_generation(
         &self,
         app_id: &str,
         params: &ContainerCreateParams,
+        expected: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
-        let deployment = self.build_app_deployment(app_id, params)?;
-        let body = serde_json::to_value(&deployment)
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("serialize deployment: {e}")))?;
-        self.deployments_api()
-            .patch(
-                &self.app_deployment_name(app_id),
-                &Self::ssa_patch_params(),
-                &Patch::Apply(body),
+        use k8s_openapi::api::core::v1::Secret;
+        use kube::api::{DeleteParams, PostParams, Preconditions};
+        let operation = uuid::Uuid::new_v4().simple().to_string();
+        let stem = format!("ua-{app_id}-{}", &operation[..16]);
+        let cm_name = format!("{stem}-env");
+        let secret_name = format!("{stem}-sec");
+        let mut labels = self.build_app_labels(
+            app_id,
+            params.tenant_id.as_deref(),
+            params.space_id.as_deref(),
+        );
+        labels.insert("rcoder.io/creation-operation".into(), operation);
+        let metadata = |name: String| ObjectMeta {
+            name: Some(name),
+            namespace: Some(self.namespace.clone()),
+            labels: Some(labels.clone()),
+            ..Default::default()
+        };
+        let cm = self
+            .configmaps_api()
+            .create(
+                &PostParams::default(),
+                &ConfigMap {
+                    metadata: metadata(cm_name.clone()),
+                    data: Some(params.env.clone().unwrap_or_default().into_iter().collect()),
+                    ..Default::default()
+                },
             )
             .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("apply deployment: {e}")))?;
-        Ok(())
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("stage generation env: {e}")))?;
+        let cm_uid = cm.metadata.uid.clone().ok_or_else(|| {
+            ContainerRuntimeError::K8sError("created configmap missing UID".into())
+        })?;
+        let mut secret_uid = None;
+        let mut compensation_safe = true;
+        let result = async {
+            let secret = self
+                .secrets_api()
+                .create(
+                    &PostParams::default(),
+                    &Secret {
+                        metadata: metadata(secret_name.clone()),
+                        string_data: Some(
+                            params
+                                .secrets
+                                .clone()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .collect(),
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    ContainerRuntimeError::K8sError(format!("stage generation secret: {e}"))
+                })?;
+            secret_uid = secret.metadata.uid;
+            if secret_uid.is_none() {
+                return Err(ContainerRuntimeError::K8sError(
+                    "created secret missing UID".into(),
+                ));
+            }
+            let mut deployment = self.build_app_deployment(app_id, params)?;
+            deployment.metadata.resource_version = expected.map(str::to_owned);
+            let container = deployment
+                .spec
+                .as_mut()
+                .and_then(|s| s.template.spec.as_mut())
+                .and_then(|p| p.containers.first_mut())
+                .ok_or_else(|| {
+                    ContainerRuntimeError::ConfigurationError(
+                        "deployment missing app container".into(),
+                    )
+                })?;
+            container.env_from = Some(vec![
+                EnvFromSource {
+                    config_map_ref: Some(ConfigMapEnvSource {
+                        name: cm_name.clone(),
+                        optional: Some(false),
+                    }),
+                    ..Default::default()
+                },
+                EnvFromSource {
+                    secret_ref: Some(SecretEnvSource {
+                        name: secret_name.clone(),
+                        optional: Some(false),
+                    }),
+                    ..Default::default()
+                },
+            ]);
+            let api = self.deployments_api();
+            compensation_safe = false;
+            let commit = if expected.is_some() {
+                api.replace(
+                    &self.app_deployment_name(app_id),
+                    &PostParams::default(),
+                    &deployment,
+                )
+                .await
+            } else {
+                api.create(&PostParams::default(), &deployment).await
+            };
+            // A lost response may hide a successful commit. Retain its referenced
+            // configuration unless the API definitively rejected the write.
+            if let Err(kube::Error::Api(error)) = &commit {
+                compensation_safe = (400..500).contains(&error.code) && error.code != 408;
+            }
+            commit.map_err(|e| match e {
+                kube::Error::Api(ref error) if error.code == 409 => {
+                    ContainerRuntimeError::Conflict(format!("conditional deployment commit: {e}"))
+                }
+                _ => ContainerRuntimeError::K8sError(format!("conditional deployment commit: {e}")),
+            })?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() && compensation_safe {
+            // Only successful create receipts authorize compensation. No PVC/service/deployment deletion.
+            let dp = DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: Some(cm_uid),
+                    resource_version: None,
+                }),
+                ..Default::default()
+            };
+            if let Err(error) = self.configmaps_api().delete(&cm_name, &dp).await {
+                tracing::warn!("cleanup owned generation env failed: {error}");
+            }
+            if let Some(uid) = secret_uid {
+                let dp = DeleteParams {
+                    preconditions: Some(Preconditions {
+                        uid: Some(uid),
+                        resource_version: None,
+                    }),
+                    ..Default::default()
+                };
+                if let Err(error) = self.secrets_api().delete(&secret_name, &dp).await {
+                    tracing::warn!("cleanup owned generation secret failed: {error}");
+                }
+            }
+        }
+        result
     }
 
-    /// 创建 Userapp 的全部 K8s 资源（SSA apply，幂等 create-or-update）：
+    /// Create UserApp resources using an exclusive Deployment create:
     /// ConfigMap/Secret/Service/Deployment/HTTPRoute/NodePort。
     pub async fn create_app_resources(
         &self,
@@ -336,6 +402,26 @@ impl KubernetesRuntime {
         gateway_name: Option<&str>,
         gateway_namespace: Option<&str>,
         http_expose: HttpExpose,
+    ) -> ContainerRuntimeResult<Vec<AppPortStatus>> {
+        self.write_app_resources(
+            app_id,
+            params,
+            gateway_name,
+            gateway_namespace,
+            http_expose,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn write_app_resources(
+        &self,
+        app_id: &str,
+        params: &ContainerCreateParams,
+        gateway_name: Option<&str>,
+        gateway_namespace: Option<&str>,
+        http_expose: HttpExpose,
+        expected: Option<&str>,
     ) -> ContainerRuntimeResult<Vec<AppPortStatus>> {
         let tenant_id = params.tenant_id.as_deref();
         let space_id = params.space_id.as_deref();
@@ -350,24 +436,9 @@ impl KubernetesRuntime {
             params.storage_size.as_deref(),
         )
         .await?;
-        // 1. ConfigMap（env）
-        if let Some(env) = &params.env
-            && !env.is_empty()
-        {
-            self.apply_app_configmap(app_id, env, tenant_id, space_id)
-                .await?;
-        }
-        // 2. Secret（secrets）
-        if let Some(secrets) = &params.secrets
-            && !secrets.is_empty()
-        {
-            self.apply_app_secret(app_id, secrets, tenant_id, space_id)
-                .await?;
-        }
-        // 3. Service（ClusterIP，所有端口；HTTPRoute 用它做 backendRef）
+        self.write_app_generation(app_id, params, expected).await?;
+        // Publish networking only after the conditional commit succeeded.
         self.apply_app_service(app_id, params).await?;
-        // 4. Deployment（SSA apply）
-        self.apply_app_deployment(app_id, params).await?;
         info!("[K8S-APP] Deployment applied for app: {app_id}");
         // 5. HTTP 入口 —— 按 http_expose：
         //    - Gateway 模式：apply HTTPRoute（path /apps/{id}），失败降级 warn 不阻塞
@@ -475,5 +546,208 @@ mod tests {
                 "卷内平级目录 {m:?} 应是宿主段 {sub_suffix} 的前缀"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod conditional_tests {
+    use super::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn runtime(client: kube::Client) -> KubernetesRuntime {
+        use super::super::kubernetes_runtime::KubernetesRuntimeConfig;
+        KubernetesRuntime {
+            client,
+            namespace: "review-test".into(),
+            config: KubernetesRuntimeConfig {
+                namespace: "review-test".into(),
+                cluster_domain: "cluster.local".into(),
+                pod_ttl_seconds: None,
+                image_pull_secret: None,
+                service_account_name: "test".into(),
+                nfs_server: "unused".into(),
+                nfs_path: "/unused".into(),
+                storage_class: "unused".into(),
+                access_mode: "ReadWriteOnce".into(),
+                docker_manager_config: Default::default(),
+                kubernetes_config: Default::default(),
+            },
+            pod_cache: Default::default(),
+            subvolume_path_cache: Default::default(),
+        }
+    }
+
+    /// Real kube client and real generation writer; only the API server is a local
+    /// deterministic adapter. No kubeconfig/in-cluster discovery or cluster access.
+    #[tokio::test]
+    async fn conditional_writers_have_one_winner_and_compensate_only_owned_config() {
+        run_conditional_writers(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn lost_commit_response_does_not_delete_potentially_active_config() {
+        run_conditional_writers(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_creates_never_compensate_the_winning_deployment() {
+        run_conditional_writers(false, true).await;
+    }
+
+    async fn run_conditional_writers(lose_success_response: bool, create: bool) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let version = Arc::new(AtomicU64::new(42));
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let captured = captured.clone();
+                let version = version.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    let (head, offset, length) = loop {
+                        let n = stream.read(&mut buf).await.expect("read request");
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buf[..n]);
+                        if let Some(offset) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&bytes[..offset]).to_string();
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().expect("length"))
+                                })
+                                .unwrap_or(0);
+                            break (head, offset + 4, length);
+                        }
+                    };
+                    while bytes.len() < offset + length {
+                        let n = stream.read(&mut buf).await.expect("body");
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buf[..n]);
+                    }
+                    let line = head.lines().next().expect("request line");
+                    let method = line.split_whitespace().next().expect("method");
+                    let path = line.split_whitespace().nth(1).expect("path");
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&bytes[offset..offset + length]).expect("JSON");
+                    captured.lock().expect("capture").push((
+                        method.to_owned(),
+                        path.to_owned(),
+                        body.clone(),
+                    ));
+                    let mut reply = body;
+                    let mut status = 200;
+                    if (method == "PUT" || method == "POST") && path.contains("/deployments") {
+                        if create {
+                            assert!(reply["metadata"]["resourceVersion"].is_null());
+                        } else {
+                            assert_eq!(reply["metadata"]["resourceVersion"], "42");
+                        }
+                        if version
+                            .compare_exchange(42, 43, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_err()
+                        {
+                            status = 409;
+                            reply = serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","message":"conflict","reason":"Conflict","code":409});
+                        } else {
+                            reply["metadata"]["uid"] = "deployment-owned".into();
+                            reply["metadata"]["resourceVersion"] = "43".into();
+                            if lose_success_response {
+                                // The API committed, but the client never receives its receipt.
+                                return;
+                            }
+                        }
+                    } else if method == "POST" {
+                        let name = reply["metadata"]["name"].as_str().expect("name").to_owned();
+                        reply["metadata"]["uid"] = format!("owned-{name}").into();
+                        reply["metadata"]["resourceVersion"] = "1".into();
+                        status = 201;
+                    } else if method == "DELETE" {
+                        assert!(path.contains("/configmaps/") || path.contains("/secrets/"));
+                        assert!(
+                            reply["preconditions"]["uid"]
+                                .as_str()
+                                .expect("UID required")
+                                .starts_with("owned-")
+                        );
+                        reply = serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success","code":200});
+                    }
+                    let payload = serde_json::to_vec(&reply).expect("serialize");
+                    let headers = format!(
+                        "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    stream.write_all(headers.as_bytes()).await.expect("headers");
+                    stream.write_all(&payload).await.expect("response");
+                });
+            }
+        });
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let config = kube::Config::new(format!("http://{addr}").parse().expect("URI"));
+        let rt = runtime(kube::Client::try_from(config).expect("local client"));
+        let params = ContainerCreateParams::builder()
+            .project_id("app-review")
+            .service_type(ServiceType::Userapp)
+            .image_override("runtime:test")
+            .build();
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                rt.write_app_generation(
+                    "app-review",
+                    &params,
+                    if create { None } else { Some("42") }
+                ),
+                rt.write_app_generation(
+                    "app-review",
+                    &params,
+                    if create { None } else { Some("42") }
+                )
+            )
+        })
+        .await
+        .expect("bounded conditional writes");
+        if lose_success_response {
+            assert!(
+                a.is_err() && b.is_err(),
+                "one conflict and one uncertain commit"
+            );
+        } else {
+            assert_ne!(
+                a.is_ok(),
+                b.is_ok(),
+                "only one version-42 update may commit"
+            );
+        }
+        let seen = requests.lock().expect("requests");
+        assert_eq!(
+            seen.iter()
+                .filter(|(method, _, _)| method == "DELETE")
+                .count(),
+            2
+        );
+        let names: std::collections::HashSet<_> = seen
+            .iter()
+            .filter(|(method, path, _)| method == "POST" && !path.contains("/deployments"))
+            .map(|(_, _, body)| body["metadata"]["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(
+            names.len(),
+            4,
+            "each writer owns distinct config and secret"
+        );
+        server.abort();
     }
 }

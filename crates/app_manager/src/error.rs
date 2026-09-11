@@ -37,6 +37,7 @@ pub enum AppOperationError {
     Backend(String),
     /// 乐观锁冲突（409 ERR_CONFLICT）—— expected_resource_version 不匹配
     Conflict(String),
+    HotDeployEnvChange(String),
 }
 
 impl AppOperationError {
@@ -51,6 +52,7 @@ impl AppOperationError {
             Self::DevNotRunning(_) => ERR_DEV_NOT_RUNNING,
             Self::Backend(_) => ERR_BACKEND_ERROR,
             Self::Conflict(_) => ERR_CONFLICT,
+            Self::HotDeployEnvChange(_) => shared_types::error_codes::ERR_HOT_DEPLOY_ENV_CHANGE,
         }
     }
 
@@ -64,7 +66,8 @@ impl AppOperationError {
             | Self::Validation(m)
             | Self::DevNotRunning(m)
             | Self::Backend(m)
-            | Self::Conflict(m) => m,
+            | Self::Conflict(m)
+            | Self::HotDeployEnvChange(m) => m,
         }
     }
 }

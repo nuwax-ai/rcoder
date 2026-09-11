@@ -1,3 +1,4 @@
+AGENT_BASE_IMAGE ?= dev-rcoder-agent-base:latest
 # ============================================================================
 # Docker 镜像构建
 # ============================================================================
@@ -63,7 +64,7 @@ docker-build-master:
 	docker build \
 		--build-arg BASE_IMAGE=dev-master-rcoder-base:latest \
 		--build-arg CARGO_FLAGS="$$MASTER_CARGO_FLAGS" \
-		--build-arg CACHEBUST=$$(date +%s) \
+		--build-arg CACHEBUST=$(AGENT_TOOLS_CACHE_KEY) \
 		-f docker/rcoder-master/Dockerfile -t dev-master-rcoder:latest .;)
 	@echo "✅ master-rcoder 镜像构建完成！"
 	@if [ "$(PUSH_IMAGE)" = "true" ]; then \
@@ -113,6 +114,8 @@ docker-build-master-base:
 # 本地开发调试默认开启上述功能（http-server / grpc-server 仍由 agent_runner 默认 features 提供）
 # 注意：kubernetes feature 仅用于 K8s 环境，Docker Compose 模式不要启用
 CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug
+# Explicitly bump to refresh external agent tools; routine Rust builds reuse them.
+AGENT_TOOLS_CACHE_KEY ?= 1
 
 # 构建 agent-runner 镜像（基于基础镜像，快速构建）
 # pingap 版本说明（构建注入，单一来源 = app-cli devtool.rs DEFAULT_PINGAP_VERSION/COMMIT，
@@ -132,17 +135,22 @@ docker-build-agent-runner:
 		done; \
 	fi
 	@# 检查基础镜像是否存在
-	@if ! docker image inspect dev-rcoder-agent-base:latest >/dev/null 2>&1; then \
+	@if ! docker image inspect "$(AGENT_BASE_IMAGE)" >/dev/null 2>&1; then \
+		if [ "$(AGENT_BASE_IMAGE)" != "dev-rcoder-agent-base:latest" ]; then echo "Missing AGENT_BASE_IMAGE=$(AGENT_BASE_IMAGE)"; exit 1; fi; \
 		echo "⚠️  基础镜像 dev-rcoder-agent-base:latest 不存在，先构建基础镜像..."; \
 		$(MAKE) docker-build-agent-base; \
 	else \
-		echo "✓ 基础镜像 dev-rcoder-agent-base:latest 已存在"; \
+		echo "✓ 基础镜像 $(AGENT_BASE_IMAGE) 已存在"; \
+	fi
+	@if docker image inspect dev-app-runtime:latest >/dev/null 2>&1; then \
+		python3 docker/verify-userapp-toolchains.py --builder "$(AGENT_BASE_IMAGE)" || { \
+			echo "Builder base/runtime mismatch: rebuild docker-build-agent-base or set AGENT_BASE_IMAGE to a compatible local image"; exit 1; }; \
 	fi
 	@echo "📦 步骤1: 在 debian:12 环境中构建 agent_runner 二进制（确保 GLIBC 版本兼容）..."
 	@# 🔧 调试模式：默认启用 ebpf-debug feature，允许使用 eBPF 诊断工具
 	@echo "🔧 Cargo features: $(CARGO_FEATURES)"
 	@# 计算业务代码哈希，只有代码变化时才重新编译（系统依赖和 Rust 安装保持缓存）
-	$(eval CRATES_HASH := $(shell find crates Cargo.toml Cargo.lock -name "*.rs" -o -name "Cargo.toml" -o -name "Cargo.lock" 2>/dev/null | sort | xargs cat 2>/dev/null | md5sum | cut -d' ' -f1))
+	$(eval CRATES_HASH := $(shell python3 docker/cargo-source-hash.py))
 	@echo "🔑 业务代码哈希: $(CRATES_HASH)"
 	@# 🔥 关键修改：通过 CARGO_FEATURES 变量控制
 	@# tokio-console 观测模式：AGENT_CONSOLE=1 时传 tokio_unstable RUSTFLAGS +
@@ -159,10 +167,10 @@ docker-build-agent-runner:
 	@echo "📦 步骤2: 复制二进制文件到 agent-runner 目录..."
 	@# 创建容器并复制 agent_runner 二进制文件
 	@mkdir -p docker/rcoder-agent-runner/bin
-	@docker create --name build-container dev-rcoder-agent-runner-build
-	@docker cp build-container:/build/target/release/agent_runner docker/rcoder-agent-runner/bin/
-	@docker cp build-container:/build/crates/app-cli/target/release/app-cli docker/rcoder-agent-runner/bin/
-	@docker rm build-container
+	@set -eu; build_id=$$(docker create dev-rcoder-agent-runner-build); \
+	trap 'docker rm -f "$$build_id" >/dev/null' EXIT; \
+	docker cp "$$build_id":/build/target/release/agent_runner docker/rcoder-agent-runner/bin/; \
+	docker cp "$$build_id":/build/crates/app-cli/target/release/app-cli docker/rcoder-agent-runner/bin/
 	@docker rmi dev-rcoder-agent-runner-build
 	@echo "📦 步骤3: 构建最终的 agent-runner 镜像（基于基础镜像，快速）..."
 	@# 🔧 根据 CARGO_FEATURES 决定是否安装 eBPF 工具
@@ -177,20 +185,20 @@ docker-build-agent-runner:
 	cd docker/rcoder-agent-runner && \
 		if [ -n "$(BUILDX_BUILDER)" ]; then \
 			docker buildx build --builder $(BUILDX_BUILDER) --platform linux/$(DOCKER_HOST_ARCH) --load \
-				--build-arg BASE_IMAGE=dev-rcoder-agent-base:latest \
+				--build-arg BASE_IMAGE="$(AGENT_BASE_IMAGE)" \
 				--build-arg PINGAP_VERSION=$$PINGAP_VERSION \
 				--build-arg PINGAP_COMMIT=$$PINGAP_COMMIT \
-				--build-arg CACHEBUST=$$(date +%s) \
+				--build-arg CACHEBUST=$(AGENT_TOOLS_CACHE_KEY) \
 				--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
 				--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
 				--build-arg INSTALL_ALLOY="$${INSTALL_EBPF}" \
 				-f Dockerfile -t dev-rcoder-agent-runner:latest . ; \
 		else \
 			docker build \
-				--build-arg BASE_IMAGE=dev-rcoder-agent-base:latest \
+				--build-arg BASE_IMAGE="$(AGENT_BASE_IMAGE)" \
 				--build-arg PINGAP_VERSION=$$PINGAP_VERSION \
 				--build-arg PINGAP_COMMIT=$$PINGAP_COMMIT \
-				--build-arg CACHEBUST=$$(date +%s) \
+				--build-arg CACHEBUST=$(AGENT_TOOLS_CACHE_KEY) \
 				--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
 				--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
 				--build-arg INSTALL_ALLOY="$${INSTALL_EBPF}" \
@@ -220,10 +228,7 @@ APP_RUNTIME_DIR := docker/app-runtime-base
 # 构建 dev-app-runtime-base（基础设施层: PG/dbx/ttyd/supervisor + Rust app-cli）
 docker-build-app-runtime-base:
 	@echo "🐳 构建 dev-app-runtime-base:latest ..."
-	@docker build --build-context rcoder=$(PWD) \
-		--build-arg PINGAP_VERSION=0.14.1 \
-		--build-arg PINGAP_COMMIT=c74e4eaa44e64958cffa18c33e8bbf5995b6844f \
-		-t dev-app-runtime-base:latest -f $(APP_RUNTIME_DIR)/Dockerfile $(APP_RUNTIME_DIR)
+	@python3 docker/build-app-runtime.py $(APP_RUNTIME_DIR)
 	@echo "✅ dev-app-runtime-base:latest 构建完成"
 
 # 构建 dev-app-runtime（多语言运行时: base + Node/Python/Java/Go），UserApp 部署用此镜像

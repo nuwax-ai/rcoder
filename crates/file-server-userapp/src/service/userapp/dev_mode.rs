@@ -76,12 +76,12 @@ pub async fn run_dev_builds(
         let Some(argv) = proj.manifest.devbuild_argv().map(Vec::from) else {
             tracing::info!(
                 service = proj.service_id(),
-                "[DEV_BUILD] devrun 自足，跳过编译"
+                "[DEV_BUILD] devrun is self-contained; skipping build"
             );
             if let Some(p) = &progress {
                 p.emit(BuildProgressEvent::Log {
                     service: proj.service_id().to_string(),
-                    line: "devrun 自足（不消费构建产物），跳过编译".to_string(),
+                    line: "devrun does not consume build artifacts; skipping build".to_string(),
                 })
                 .await;
             }

@@ -101,10 +101,15 @@ impl AppService {
                 spec.command,
                 // 读回的 env 必含 create 时注入的保留变量，先剥离再走 inject
                 //（inject 从当前发布锁重新注入权威值；用户显式提交保留变量仍拒绝）。
-                request.env.clone().or(spec.env.map(|mut env| {
-                    strip_release_identity(&mut env);
-                    env
-                })),
+                match request.env.clone() {
+                    Some(env) => Some(crate::release_flow::identity::replace_business_env(
+                        env, spec.env,
+                    )),
+                    None => spec.env.map(|mut env| {
+                        strip_release_identity(&mut env);
+                        env
+                    }),
+                },
                 request.secrets.clone().or(spec.secrets),
                 // resources **字段级**合并（非整体 or）：request 携带字段生效，None 字段
                 // 回退 live 值——整体回退会让"只传 storage 扩容"清空 live 的 cpu/memory

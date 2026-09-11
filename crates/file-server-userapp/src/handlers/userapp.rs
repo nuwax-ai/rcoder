@@ -21,7 +21,7 @@ use async_stream::stream;
 use crate::service::userapp::UserappBuildTask;
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use garde::Validate;
@@ -29,6 +29,7 @@ use serde::Serialize;
 use shared_types::HttpResult;
 
 use crate::UserAppState;
+use crate::extract::{AppJson, AppPath, AppQuery};
 use crate::models::{
     BuildCreatedData, BuildTaskSnapshot, BuildTaskStatus, BuildUserAppBody, CancelData,
     ConfirmData, DetectData, ProjectChainBody, StreamQuery, UserappTaskScopeQuery,
@@ -36,7 +37,6 @@ use crate::models::{
 use crate::service::userapp;
 use crate::service::userapp::tasks::BuildProgressEvent;
 use file_server::error::{AppError, AppResult};
-use file_server::extract::{AppJson, AppPath, AppQuery};
 
 // ── HttpResult 转换层 ──────────────────────────────────────────────────────────
 
@@ -56,32 +56,12 @@ pub(crate) enum UserAppReply<T> {
 
 impl<T: Serialize> IntoResponse for UserAppReply<T> {
     fn into_response(self) -> Response {
-        use shared_types::error_codes as ec;
         match self {
             UserAppReply::Ok(data) => Json(HttpResult::success(data)).into_response(),
-            UserAppReply::ErrCode(code, message) => (
-                StatusCode::BAD_REQUEST,
-                Json(HttpResult::<T>::error(code, &message)),
-            )
-                .into_response(),
-            UserAppReply::Err(e) => {
-                let (code, status) = match &e {
-                    AppError::Validation(..)
-                    | AppError::ValidationI18n(..)
-                    | AppError::Business(_) => (ec::ERR_VALIDATION, StatusCode::BAD_REQUEST),
-                    AppError::Resource(_) => (ec::ERR_NOT_FOUND, StatusCode::NOT_FOUND),
-                    AppError::Network(_) => (ec::ERR_SERVICE_UNAVAILABLE, StatusCode::BAD_GATEWAY),
-                    AppError::Permission(_)
-                    | AppError::System(_)
-                    | AppError::File(_)
-                    | AppError::Process(_) => (
-                        ec::ERR_INTERNAL_SERVER_ERROR,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    ),
-                };
-                let result = HttpResult::<T>::error(code, &e.to_string());
-                (status, Json(result)).into_response()
+            UserAppReply::ErrCode(code, message) => {
+                Json(HttpResult::<T>::error(code, &message)).into_response()
             }
+            UserAppReply::Err(e) => crate::UserAppError::from(e).into_response(),
         }
     }
 }
@@ -137,7 +117,6 @@ fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
     request_body = BuildUserAppBody,
     responses(
         (status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 task_id（轮询/SSE 用）与 artifact_path（受理时即确定：builds/workspace-package-{release_id}.zip，release_id 预生成）+ status=pending。同 app_id 已有活跃任务时在队列排队（per-app 互斥）；全局任务容量满时 4xx 拒绝。后续状态：轮询 GET /tasks/{task_id} 或订阅 GET /tasks/{task_id}/logs/stream（SSE，构建日志行以 log 事件实时推送）。"),
-        (status = 400, description = "受理前置校验拒绝（HttpResult 信封，非任务）：code=ERR_WORKSPACE_EMPTY——workspace 为空（尚未创建/导入项目）；code=ERR_WORKSPACE_NO_SERVICES——manifest 缺失/损坏或无 enabled 服务（message 含 fix 指引）。此时不创建任务、无 task_id"),
     ),
     tag = "Userapp · dev · 构建任务"
 )]
@@ -253,7 +232,6 @@ pub(crate) async fn get_task(
             description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 0 递增（首条事件 id:0）。断线续传两种方式（二选一）：① 请求带 `Last-Event-ID: <最后收到的seq>` 头（SSE 规范标准方式，浏览器 EventSource 自动重连自动携带，服务端从该 seq 之后回放）；② query `?from_seq=<最后seq+1>`（从该 seq 开始含本身回放；头存在时被忽略）。\n\n事件清单（event 名 → data 载荷）：\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始构建某服务）\n- `log` → `{'event':'log','service':'<服务ID>','line':'一行构建输出'}`（构建日志行，实时逐行推送；出现在该服务的 building 与 build_ok/build_fail 之间，行序即进程输出顺序）\n- `build_ok` → `{'event':'build_ok','service':'...'}`（服务构建成功）\n- `build_fail` → `{'event':'build_fail','service':'...','error':'...'}`\n- `completed`（终态）→ `{'event':'completed','release_id':'...','sha256':'...','size_bytes':N,'file_name':'...','artifact_path':'builds/workspace-package-{release_id}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端按上述任一方式带游标重连续传\n\n说明：构建日志以本流 `log` 事件实时推送（前端单流订阅即可）；断线按上述续传协议补齐——回放环有界（超环容量的早期行不可回补），长任务/超大输出建议任务创建后尽早订阅。构建串行执行（按 service_id 字母序逐服务构建），日志行按服务分段有序、不交错。`stage` 事件类型为协议预留，当前任务流不发送。终态事件（completed/failed/cancelled）后服务端关闭流；续传游标已越过终态事件（客户端早已收到终态）时订阅即刻关闭、不再等待。每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
             content_type = "text/event-stream",
         ),
-        (status = 404, description = "Task not found（HttpResult JSON，非 SSE）"),
     ),
     tag = "Userapp · dev · 构建任务"
 )]
@@ -284,7 +262,7 @@ pub(crate) async fn stream_task_logs(
         headers.get("last-event-id").and_then(|v| v.to_str().ok()),
         q.from_seq,
     );
-    let (replay, mut rx) = task.subscribe(from_seq).await;
+    let (replay, mut rx, terminal_seq) = task.subscribe_snapshot(from_seq).await;
 
     let progress = stream! {
         // 回放历史事件（seq >= from_seq）
@@ -295,10 +273,8 @@ pub(crate) async fn stream_task_logs(
                 return;
             }
         }
-        // 回放耗尽未遇终态，但任务此刻已是终态：说明续传游标已越过终态事件
-        // （客户端早已收到终态）——不会再有新事件，直接关流。否则 broadcast
-        // 存活期内 recv 永远 pending，流只剩 keep-alive 悬挂不关闭。
-        if task.is_terminal().await {
+        // Only the subscription snapshot can prove that the cursor passed terminal.
+        if terminal_seq.is_some_and(|seq| from_seq > seq) {
             return;
         }
         // 实时跟随 broadcast
@@ -376,6 +352,7 @@ pub(crate) async fn cancel_task(
 /// 任务的取消内核（soft cancel + kill 编译进程组 + emit Cancelled 终态）。
 /// cancel_task handler 与 dev_stop 的在途任务联动取消共用。
 pub(crate) async fn cancel_build_task(task: &Arc<UserappBuildTask>) {
+    let _commit = task.commit_guard().await;
     task.cancel();
     // 硬 cancel：kill 当前 build 子进程组（run_command_to_log 用 process_group(0)，pid==pgid）。
     if let Some(pid) = task.pid() {
@@ -520,10 +497,180 @@ mod tests {
 #[cfg(test)]
 mod stream_close_tests {
     use super::*;
+    use crate::extract::{AppPath, AppQuery};
     use crate::models::BuildTaskKind;
-    use file_server::extract::{AppPath, AppQuery};
 
     use super::super::userapp_files::tests_support::make_state;
+
+    #[tokio::test]
+    async fn terminal_after_subscription_is_delivered() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        let task = state
+            .build_tasks
+            .create("app-1".into(), BuildTaskKind::DevStart)
+            .await
+            .expect("create task");
+        let response = stream_task_logs(
+            State(state),
+            AppPath(task.id.clone()),
+            AppQuery(StreamQuery {
+                app_id: "app-1".into(),
+                user_id: "u".into(),
+                from_seq: 0,
+            }),
+            HeaderMap::new(),
+        )
+        .await;
+        task.emit(BuildProgressEvent::Failed {
+            error: "after subscribe".into(),
+        })
+        .await;
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), 65536),
+        )
+        .await
+        .expect("stream closes")
+        .expect("body");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("event: failed"),
+            "terminal must be delivered: {text}"
+        );
+        assert!(
+            text.contains("id: 0"),
+            "terminal cursor must be delivered: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_consumer_gets_explicit_lag_and_reconnect_replays_in_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        let task = state
+            .build_tasks
+            .create("app-1".into(), BuildTaskKind::Build)
+            .await
+            .expect("task");
+        let scope = || {
+            AppQuery(StreamQuery {
+                app_id: "app-1".into(),
+                user_id: "u".into(),
+                from_seq: 0,
+            })
+        };
+        let response = stream_task_logs(
+            State(state.clone()),
+            AppPath(task.id.clone()),
+            scope(),
+            HeaderMap::new(),
+        )
+        .await;
+        for index in 0..2100 {
+            task.emit(BuildProgressEvent::Log {
+                service: "web".into(),
+                line: index.to_string(),
+            })
+            .await;
+        }
+        task.emit(BuildProgressEvent::Failed {
+            error: "terminal after lag".into(),
+        })
+        .await;
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), 65536),
+        )
+        .await
+        .expect("lag closes")
+        .expect("body");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("event: stream_lagged"));
+        assert!(!text.contains("event: completed"));
+        let response = stream_task_logs(
+            State(state),
+            AppPath(task.id.clone()),
+            scope(),
+            HeaderMap::new(),
+        )
+        .await;
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("replay closes")
+        .expect("body");
+        let text = String::from_utf8_lossy(&bytes);
+        let ids: Vec<u64> = text
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("id: ")
+                    .map(|id| id.parse().expect("sequence"))
+            })
+            .collect();
+        assert_eq!(ids, (0..=2100).collect::<Vec<_>>());
+        assert!(text.contains("event: failed"));
+    }
+
+    #[tokio::test]
+    async fn terminal_emitted_during_replay_follows_snapshot_events() {
+        use futures_util::StreamExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        let task = state
+            .build_tasks
+            .create("app-1".into(), BuildTaskKind::Build)
+            .await
+            .expect("task");
+        for index in 0..2 {
+            task.emit(BuildProgressEvent::Log {
+                service: "web".into(),
+                line: index.to_string(),
+            })
+            .await;
+        }
+        let response = stream_task_logs(
+            State(state),
+            AppPath(task.id.clone()),
+            AppQuery(StreamQuery {
+                app_id: "app-1".into(),
+                user_id: "u".into(),
+                from_seq: 0,
+            }),
+            HeaderMap::new(),
+        )
+        .await;
+        let mut stream = response.into_body().into_data_stream();
+        let first = stream
+            .next()
+            .await
+            .expect("first replay frame")
+            .expect("frame");
+        task.emit(BuildProgressEvent::Failed {
+            error: "during replay".into(),
+        })
+        .await;
+        let mut all = first.to_vec();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(frame) = stream.next().await {
+                all.extend_from_slice(&frame.expect("frame"));
+            }
+        })
+        .await
+        .expect("terminal delivered");
+        let text = String::from_utf8_lossy(&all);
+        let ids: Vec<u64> = text
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("id: ")
+                    .map(|id| id.parse().expect("sequence"))
+            })
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert!(text.contains("event: failed"));
+    }
 
     /// 终态任务 + 续传游标越过终态事件 → 流即刻关闭。
     /// 回归锁：修复前此场景 replay 为空、broadcast 存活期内 recv 永远 pending，

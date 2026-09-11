@@ -27,8 +27,7 @@ use crate::models::{
     path = "/api/v1/userapp/query",
     request_body = QueryAppsRequest,
     responses(
-        (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<AppRuntimeInfo>>),
-        (status = 500, description = "集群查询失败", body = HttpResult<String>)
+        (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<AppRuntimeInfo>>)
     ),
     tag = "Userapp · prod · 应用查询"
 )]
@@ -53,8 +52,7 @@ pub async fn query_apps(
     path = "/api/v1/userapp/runtime",
     params(OwnerParams),
     responses(
-        (status = 200, description = "对账成功（仅该 user_id 归属的应用）", body = HttpResult<Vec<AppRuntimeInfo>>),
-        (status = 500, description = "集群查询失败", body = HttpResult<String>)
+        (status = 200, description = "对账成功（仅该 user_id 归属的应用）", body = HttpResult<Vec<AppRuntimeInfo>>)
     ),
     tag = "Userapp · prod · 应用查询"
 )]
@@ -94,8 +92,7 @@ pub async fn list_app_runtimes(
 - 不存在 → 404；查询失败（集群不可达）→ 500。
 "#,
     responses(
-        (status = 200, description = "查询成功", body = HttpResult<AppRuntimeInfo>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>)
+        (status = 200, description = "查询成功", body = HttpResult<AppRuntimeInfo>)
     ),
     tag = "Userapp · prod · 应用查询"
 )]
@@ -131,10 +128,7 @@ pub async fn get_app(
     ),
     request_body = UpdateAppRequest,
     responses(
-        (status = 200, description = "更新成功", body = HttpResult<AppRuntimeInfo>),
-        (status = 400, description = "user_id 非法等参数校验失败", body = HttpResult<String>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>),
-        (status = 409, description = "乐观锁冲突（expected_resource_version 与当前不符；Docker 模式忽略校验）", body = HttpResult<String>)
+        (status = 200, description = "更新成功", body = HttpResult<AppRuntimeInfo>)
     ),
     tag = "Userapp · prod · 部署与启停"
 )]
@@ -177,10 +171,7 @@ pub async fn update_app(
 - 乐观锁：`expected_resource_version` 不匹配 → 409。
 "#,
     responses(
-        (status = 200, description = "删除成功", body = HttpResult<String>),
-        (status = 400, description = "app_stage 非法或 dev 不支持 / user_id 非法", body = HttpResult<String>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>),
-        (status = 409, description = "resource_version 不匹配", body = HttpResult<String>)
+        (status = 200, description = "删除成功", body = HttpResult<String>)
     ),
     tag = "Userapp · 双态 · 生命周期"
 )]
@@ -256,9 +247,7 @@ dev + prod 两个阶段的容器、对应的 PVC/目录数据与元数据行。
   三步串接。**无 confirm**——与终端用户的确认由调用方负责。
 "#,
     responses(
-        (status = 200, description = "已彻底删除（app 不存在也成功——幂等）", body = HttpResult<String>),
-        (status = 400, description = "app_id/user_id 非法", body = HttpResult<String>),
-        (status = 500, description = "删除链任一步真实失败，幂等重试收敛", body = HttpResult<String>)
+        (status = 200, description = "已彻底删除（app 不存在也成功——幂等）", body = HttpResult<String>)
     ),
     tag = "Userapp · 双态 · 生命周期"
 )]

@@ -40,6 +40,7 @@ impl AppService {
             AppOperationError::Validation(msg)
         })?;
         validate_app_id(app_id)?;
+        let request = self.validate_hot_env(app_id, request).await?;
 
         let (release_id, sql_report) = if let Some(url) = request
             .url
@@ -102,6 +103,7 @@ impl AppService {
         request: StartAppRequest,
     ) -> AppResult<StartAppResult> {
         validate_app_id(app_id)?;
+        let request = self.validate_hot_env(app_id, request).await?;
         // 带 url 时 activate 自带 stop+切流，无需先 stop；仅传统 restart 走 stop+start
         if request.url.is_none() {
             self.restart_app(app_id).await?;
@@ -224,11 +226,21 @@ impl AppService {
             None => match self.runtime.get_app_container_spec(app_id).await {
                 Ok(spec) => spec.env.unwrap_or_default(),
                 Err(e) => {
-                    // 首次部署（app 不存在）无 live 可回退；存在但读回失败不阻断——
-                    // 部署三元组仍注入，业务 env 丢失由调用方重试自愈
-                    tracing::warn!(
-                        "[APP] start-deploy env live fallback failed (empty base): app_id={app_id}: {e}"
-                    );
+                    if self
+                        .runtime
+                        .get_deployment_status(app_id)
+                        .await
+                        .map_err(|error| {
+                            AppOperationError::Backend(format!(
+                                "read deployment before env fallback: {error}"
+                            ))
+                        })?
+                        .is_some()
+                    {
+                        return Err(AppOperationError::Backend(format!(
+                            "read live deployment env: {e}"
+                        )));
+                    }
                     std::collections::HashMap::new()
                 }
             },
@@ -343,13 +355,47 @@ impl AppService {
             .await
     }
 
+    async fn validate_hot_env(
+        &self,
+        app_id: &str,
+        mut request: StartAppRequest,
+    ) -> AppResult<StartAppRequest> {
+        if request.deploy_mode == Some(DeployMode::Hot)
+            && let Some(env) = &request.env
+        {
+            let live = self
+                .runtime
+                .get_app_container_spec(app_id)
+                .await
+                .map_err(|error| {
+                    AppOperationError::Validation(format!(
+                        "cannot verify hot deployment env; use pod mode: {error}"
+                    ))
+                })?;
+            if crate::release_flow::identity::business_env(env.clone())
+                != crate::release_flow::identity::business_env(live.env.unwrap_or_default())
+            {
+                return Err(AppOperationError::HotDeployEnvChange(
+                    "hot deployment cannot change business env; use pod mode".into(),
+                ));
+            }
+            request.env = None;
+        }
+        Ok(request)
+    }
+
     /// env / idle 覆盖（对已存在 app；复用 update 的整段替换语义）。
     async fn apply_start_overrides(
         &self,
         app_id: &str,
         request: &StartAppRequest,
     ) -> AppResult<()> {
-        if request.env.is_some() {
+        if request.env.is_some()
+            && request
+                .url
+                .as_deref()
+                .is_none_or(|url| url.trim().is_empty())
+        {
             let current = self.get_app(app_id).await?;
             let update = UpdateAppRequest {
                 user_id: request.user_id.clone(),
@@ -589,6 +635,63 @@ mod tests {
             runtime.create_calls.load(Ordering::SeqCst),
             0,
             "existing app start must reuse (scale), not create"
+        );
+    }
+}
+
+#[cfg(test)]
+mod env_contract_tests {
+    use super::*;
+    use crate::test_support::{MockRuntime, test_service};
+    use std::{collections::HashMap, sync::Arc};
+
+    #[tokio::test]
+    async fn hot_env_change_rejected_before_runtime_mutation_equal_env_removed() {
+        let root = tempfile::tempdir().expect("workspace");
+        let runtime = Arc::new(MockRuntime::default());
+        runtime.specs.insert(
+            "env-app".into(),
+            container_runtime_api::ContainerSpecSnapshot {
+                env: Some(HashMap::from([
+                    ("BUSINESS".into(), "A".into()),
+                    ("APP_CLI_DEPLOY_TOKEN".into(), "platform".into()),
+                ])),
+                ..Default::default()
+            },
+        );
+        let service = test_service(root.path(), runtime.clone());
+        let request = |value: &str| {
+            serde_json::from_value::<StartAppRequest>(serde_json::json!({
+            "user_id": "test-user", "url": "http://127.0.0.1:1/artifact.zip", "deploy_mode": "hot", "env": {"BUSINESS": value}
+        })).expect("request")
+        };
+        let error = service
+            .start_app_enhanced("env-app", request("B"))
+            .await
+            .expect_err("reject before deployment");
+        assert_eq!(
+            error.code(),
+            shared_types::error_codes::ERR_HOT_DEPLOY_ENV_CHANGE
+        );
+        assert_eq!(
+            runtime
+                .create_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            runtime
+                .delete_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let accepted = service
+            .validate_hot_env("env-app", request("A"))
+            .await
+            .expect("same env");
+        assert!(
+            accepted.env.is_none(),
+            "equal business env must not trigger an update"
         );
     }
 }

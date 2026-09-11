@@ -32,6 +32,7 @@ use crate::supervisord_host::SupervisordHost;
 
 /// server 全局状态（api 层与主循环共享；读多写少，std RwLock 短临界区不跨 await）。
 pub struct ServerState {
+    admission: std::sync::Mutex<()>,
     phase: RwLock<ServerPhase>,
     release: RwLock<Option<ReleaseLock>>,
     ready: RuntimeStatusService,
@@ -92,6 +93,8 @@ pub struct DeployRequest {
 /// （rcoder 侧同枚举穷尽 match，新增相位编译期强制同步决策）。
 #[derive(Debug, Clone, Default, serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct DeployStatus {
+    pub protocol_version: u32,
+    pub operation: Option<shared_types::AppDeploymentOperation>,
     pub phase: AppCliDeployPhase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release_id: Option<String>,
@@ -117,11 +120,13 @@ impl ServerState {
     pub fn new(ready: RuntimeStatusService) -> Self {
         let (deploy_tx, deploy_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
+            admission: std::sync::Mutex::new(()),
             phase: RwLock::new(ServerPhase::Idle),
             release: RwLock::new(None),
             ready,
             deploy_status: RwLock::new(DeployStatus {
                 phase: AppCliDeployPhase::Idle,
+                protocol_version: 2,
                 ..Default::default()
             }),
             deploy_tx,
@@ -136,6 +141,14 @@ impl ServerState {
     }
 
     pub fn set_phase(&self, phase: ServerPhase) {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.set_phase_locked(phase);
+    }
+
+    fn set_phase_locked(&self, phase: ServerPhase) {
         let mut guard = self.phase.write().expect("phase lock");
         *guard = phase.clone();
         drop(guard);
@@ -143,6 +156,47 @@ impl ServerState {
         status.phase = AppCliDeployPhase::from(&phase);
         if let ServerPhase::Failed(err) = &phase {
             status.error = Some(err.clone());
+        }
+        if let Some(op) = &mut status.operation {
+            if op.phase != AppCliDeployPhase::Failed {
+                op.phase = AppCliDeployPhase::from(&phase);
+                if let ServerPhase::Failed(error) = &phase {
+                    op.error = Some(error.clone());
+                }
+            } else if let Some(recovery) = &mut op.recovery {
+                match &phase {
+                    ServerPhase::Running => recovery.status = "restored".into(),
+                    ServerPhase::Failed(error) => {
+                        recovery.status = "failed".into();
+                        recovery.error = Some(error.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn begin_failure(&self, error: String, recovering: bool) {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.set_phase_locked(ServerPhase::Failed(error));
+        if recovering {
+            if let Some(operation) = &mut self
+                .deploy_status
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .operation
+            {
+                operation.recovery = Some(shared_types::AppDeploymentRecovery {
+                    status: "pending".into(),
+                    error: None,
+                    database_migrations_reversed: false,
+                });
+            }
+            // Keep admission closed until restoration and old orchestration finish.
+            self.set_phase_locked(ServerPhase::Orchestrating);
         }
     }
 
@@ -154,10 +208,16 @@ impl ServerState {
     pub fn set_release(&self, release: ReleaseLock) {
         let rid = release.release_id.clone();
         *self.release.write().expect("release lock") = Some(release);
-        self.deploy_status
+        let mut status = self
+            .deploy_status
             .write()
-            .expect("deploy status lock")
-            .release_id = Some(rid);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.release_id = Some(rid.clone());
+        if let Some(op) = &mut status.operation
+            && op.phase != AppCliDeployPhase::Failed
+        {
+            op.artifact_release_id = Some(rid);
+        }
     }
 
     /// 部署代（日志游标 boot_id 语义：换代后旧 cursor 失效重放）。
@@ -169,25 +229,58 @@ impl ServerState {
 
     /// /ready 判定（api 探针 handler 消费）。
     pub(crate) fn readiness_ok(&self) -> bool {
-        self.phase().readiness_ok(self.ready.is_ready())
+        self.ready.is_ready() || self.phase().readiness_ok(false)
     }
 
     /// 热部署受理（api 端点调用）：相位守卫 + 通知主循环。
+    #[cfg(test)]
     pub(crate) fn try_accept_deploy(&self, req: DeployRequest) -> Result<(), String> {
-        if !self.phase().accepts_deploy() {
+        self.try_accept_deploy_with_id(req, uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    pub(crate) fn try_accept_deploy_with_id(
+        &self,
+        req: DeployRequest,
+        operation_id: String,
+    ) -> Result<(), String> {
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| "deployment admission lock poisoned")?;
+        let phase = self.phase();
+        if !phase.accepts_deploy() {
             return Err(format!(
                 "deploy in progress (phase={}); retry after terminal",
-                self.phase().as_str()
+                phase.as_str()
             ));
         }
-        // 受理即切 Deploying：rcoder 轮询方依赖 /v1/deploy/status 区分新旧代——
-        // 若保持 Running 直到主循环 pick up，受理后首次轮询会读到**旧代** running
-        // 而误判成功（竞态窗口 = POLL_INTERVAL + 调度延迟，全链 e2e 热部署
-        // 实测抓到：受理 200 但容器实际编排失败已转 failed）
-        self.set_phase(ServerPhase::Deploying);
-        self.deploy_tx
-            .send(req)
-            .map_err(|_| "server loop exited".to_string())
+        let previous = self.deploy_status();
+        {
+            let mut status = self
+                .deploy_status
+                .write()
+                .map_err(|_| "deployment status lock poisoned")?;
+            status.protocol_version = 2;
+            status.error = None;
+            status.operation = Some(shared_types::AppDeploymentOperation {
+                operation_id,
+                request_release_id: req.release_id.clone(),
+                artifact_release_id: None,
+                recovery: None,
+                phase: AppCliDeployPhase::Deploying,
+                error: None,
+            });
+        }
+        self.set_phase_locked(ServerPhase::Deploying);
+        if self.deploy_tx.send(req).is_err() {
+            self.set_phase_locked(phase);
+            *self
+                .deploy_status
+                .write()
+                .map_err(|_| "deployment status lock poisoned")? = previous;
+            return Err("server loop exited".into());
+        }
+        Ok(())
     }
 
     pub(crate) fn deploy_status(&self) -> DeployStatus {
@@ -213,6 +306,7 @@ impl ServerState {
 
 /// serve 主入口：api 常驻 + 状态机主循环（阻塞至 SIGTERM）。
 pub async fn serve(args: &CliArgs) -> Result<()> {
+    crate::deploy::cleanup_startup(&args.workspace).await?;
     let ready = RuntimeStatusService::default();
     let state = Arc::new(ServerState::new(ready.clone()));
 
@@ -290,8 +384,74 @@ enum Next {
 enum InitialAction {
     /// env/热部署触发：下载制品后编排。
     Deploy(DeployRequest),
+    Prepared(crate::deploy::PreparedDeploy),
     /// 卷上既有 release.lock（Pod 重建恢复）：跳过下载直接编排。
     Existing,
+    /// Restore old processes without executing database migrations again.
+    Recover,
+}
+
+/// Prepare while the existing supervisor continues serving. Failed requests do
+/// not leave this wait loop and never reach the stop/activate boundary.
+async fn next_prepared(
+    args: &CliArgs,
+    state: &ServerState,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DeployRequest>,
+) -> Option<InitialAction> {
+    loop {
+        let request = rx.recv().await?;
+        match crate::deploy::prepare(
+            &args.workspace,
+            &request.url,
+            &request.release_id,
+            request.sha256.as_deref(),
+        )
+        .await
+        {
+            Ok(Some(prepared)) => return Some(InitialAction::Prepared(prepared)),
+            Ok(None) => match crate::manifest::read_release_lock(&args.workspace) {
+                Ok(release) => {
+                    state.set_release(release);
+                    state.set_phase(ServerPhase::Running);
+                }
+                Err(error) => state.set_phase(ServerPhase::Failed(format!(
+                    "read unchanged release: {error:#}"
+                ))),
+            },
+            Err(error) => state.set_phase(ServerPhase::Failed(format!("prepare: {error:#}"))),
+        }
+    }
+}
+
+async fn recover_code(
+    args: &CliArgs,
+    state: &ServerState,
+    error: String,
+    allow_restore: bool,
+) -> Option<InitialAction> {
+    state.ready.set_ready(false);
+    state.begin_failure(error.clone(), allow_restore);
+    if !allow_restore {
+        return None;
+    }
+    match crate::deploy::restore_previous(&args.workspace).await {
+        Ok(true) => {
+            tracing::warn!(
+                "restoring previous code and orchestration; database migrations are not reversed"
+            );
+            Some(InitialAction::Recover)
+        }
+        Ok(false) => {
+            state.set_phase(ServerPhase::Failed(error));
+            None
+        }
+        Err(error) => {
+            state.set_phase(ServerPhase::Failed(format!(
+                "restore previous code failed: {error:#}"
+            )));
+            None
+        }
+    }
 }
 
 async fn server_loop(
@@ -322,26 +482,43 @@ async fn server_loop(
             }
         };
 
-        // ── Deploying：下载/解压/校验全部成功才动旧服务（失败旧服务零感知）──
-        if let InitialAction::Deploy(request) = &action {
-            state.set_phase(ServerPhase::Deploying);
-            tracing::info!(
-                "server: deploying release_id={} url={}",
-                request.release_id,
-                request.url
-            );
-            if let Err(e) = crate::deploy::deploy(
-                &args.workspace,
-                &request.url,
-                &request.release_id,
-                request.sha256.as_deref(),
-            )
-            .await
-            {
-                tracing::error!("server: deploy stage failed: {e:#}");
-                state.set_phase(ServerPhase::Failed(format!("deploy: {e:#}")));
-                continue;
+        let run_migrations = !matches!(action, InitialAction::Recover);
+        let allow_restore = matches!(
+            action,
+            InitialAction::Deploy(_) | InitialAction::Prepared(_)
+        );
+        let prepared = match action {
+            InitialAction::Deploy(request) => {
+                state.set_phase(ServerPhase::Deploying);
+                match crate::deploy::prepare(
+                    &args.workspace,
+                    &request.url,
+                    &request.release_id,
+                    request.sha256.as_deref(),
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        state.set_phase(ServerPhase::Failed(format!("prepare: {error:#}")));
+                        continue;
+                    }
+                }
             }
+            InitialAction::Prepared(prepared) => Some(prepared),
+            InitialAction::Existing | InitialAction::Recover => None,
+        };
+        if let Some(prepared) = prepared
+            && let Err(error) = crate::deploy::activate(&args.workspace, prepared).await
+        {
+            if error.code_preserved && state.release().is_some() {
+                state.begin_failure(format!("activate: {error:#}"), true);
+                pending = Some(InitialAction::Recover);
+            } else {
+                pending =
+                    recover_code(args, state, format!("activate: {error:#}"), allow_restore).await;
+            }
+            continue;
         }
 
         // ── Orchestrating：读 lock → 编排（migrate → services → pingap → readiness）──
@@ -352,7 +529,8 @@ async fn server_loop(
             }
             Err(e) => {
                 tracing::error!("server: read release lock after deploy: {e:#}");
-                state.set_phase(ServerPhase::Failed(format!("release lock: {e:#}")));
+                pending =
+                    recover_code(args, state, format!("release lock: {e:#}"), allow_restore).await;
                 continue;
             }
         }
@@ -362,23 +540,26 @@ async fn server_loop(
         let mut hot_rx = state.deploy_rx.lock().await;
         if let Some(host) = &host {
             let runtime_status = state.runtime_status();
+            let Some(release) = state.release() else {
+                state.set_phase(ServerPhase::Failed(
+                    "orchestration release is missing".into(),
+                ));
+                continue;
+            };
             if let Err(e) = host
-                .orchestrate(
-                    args,
-                    &state.release().expect("release set"),
-                    &runtime_status,
-                )
+                .orchestrate(args, &release, &runtime_status, run_migrations)
                 .await
             {
                 tracing::error!("server: orchestration failed: {e:#}");
-                state.set_phase(ServerPhase::Failed(format!("orchestrate: {e:#}")));
                 let _ = host.stop_all().await;
+                pending =
+                    recover_code(args, state, format!("orchestrate: {e:#}"), allow_restore).await;
                 continue;
             }
             state.set_phase(ServerPhase::Running);
             let next = tokio::select! {
-                maybe = hot_rx.recv() => match maybe {
-                    Some(next_req) => Next::Redeploy(InitialAction::Deploy(next_req)),
+                maybe = next_prepared(args, state, &mut hot_rx) => match maybe {
+                    Some(action) => Next::Redeploy(action),
                     None => Next::Exit,
                 },
                 () = crate::supervisor::sigterm_watch() => Next::Exit,
@@ -390,7 +571,13 @@ async fn server_loop(
                 }
                 Next::Wait => {}
                 Next::Redeploy(action) => {
-                    let _ = host.stop_all().await;
+                    state.ready.set_ready(false);
+                    if let Err(error) = host.stop_all().await {
+                        state.set_phase(ServerPhase::Failed(format!(
+                            "stop before activation failed: {error:#}"
+                        )));
+                        return;
+                    }
                     pending = Some(action);
                 }
             }
@@ -407,6 +594,7 @@ async fn server_loop(
             runtime_status,
             cancel.clone(),
             Some(running_tx),
+            run_migrations,
         ));
         // 先等编排就绪（Running）；就绪后递进一轮等终态/热部署/信号。
         let next = tokio::select! {
@@ -424,23 +612,24 @@ async fn server_loop(
                 }
                 Ok(Err(e)) => {
                     tracing::error!("server: orchestration failed: {e:#}");
-                    state.set_phase(ServerPhase::Failed(format!("orchestrate: {e:#}")));
+                    pending = recover_code(args, state, format!("orchestrate: {e:#}"), allow_restore).await;
                     Next::Wait
                 }
                 Err(join) => {
                     tracing::error!("server: orchestration task panicked: {join}");
-                    state.set_phase(ServerPhase::Failed("orchestrate panicked".into()));
+                    pending = recover_code(args, state, format!("orchestrate panicked: {join}"), allow_restore).await;
                     Next::Wait
                 }
             },
-            maybe = hot_rx.recv() => match maybe {
-                Some(next_req) => {
+            maybe = next_prepared(args, state, &mut hot_rx) => match maybe {
+                Some(action) => {
                     tracing::info!("server: hot deploy received, stopping current services");
+                    state.ready.set_ready(false);
                     cancel.cancel();
                     if let Err(join) = sup.await {
                         tracing::error!("server: orchestration task panicked during cancel: {join}");
                     }
-                    Next::Redeploy(InitialAction::Deploy(next_req))
+                    Next::Redeploy(action)
                 }
                 None => Next::Exit,
             },
@@ -451,17 +640,6 @@ async fn server_loop(
                     }
                 }
             }
-            maybe = hot_rx.recv() => match maybe {
-                Some(next_req) => {
-                    tracing::info!("server: hot deploy received, stopping current services");
-                    cancel.cancel();
-                    if let Err(join) = sup.await {
-                        tracing::error!("server: orchestration task panicked during cancel: {join}");
-                    }
-                    Next::Redeploy(InitialAction::Deploy(next_req))
-                }
-                None => Next::Exit,
-            },
             () = crate::supervisor::sigterm_watch() => {
                 cancel.cancel();
                 let _ = sup.await;
@@ -487,6 +665,60 @@ mod tests {
     /// 内部状态机 → wire 相位转换矩阵：as_str 委托共享枚举，Failed 负载
     /// 丢弃（error 走 DeployStatus.error 独立字段）。新增 ServerPhase 变体
     /// 时 From 实现编译错强制同步本矩阵。
+    #[test]
+    fn concurrent_deploy_admission_has_one_winner() {
+        let state = Arc::new(state());
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|n| {
+                let state = state.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state
+                        .try_accept_deploy(DeployRequest {
+                            url: "http://127.0.0.1/artifact".into(),
+                            release_id: format!("r{n}"),
+                            sha256: None,
+                        })
+                        .is_ok()
+                })
+            })
+            .collect();
+        let accepted = handles
+            .into_iter()
+            .map(|h| usize::from(h.join().expect("thread")))
+            .sum::<usize>();
+        assert_eq!(accepted, 1);
+        let status = state.deploy_status();
+        assert_eq!(status.protocol_version, 2);
+        assert_eq!(
+            status.operation.expect("operation").phase,
+            AppCliDeployPhase::Deploying
+        );
+    }
+
+    #[test]
+    fn failed_operation_is_not_completed_by_old_generation_recovery() {
+        let state = state();
+        state
+            .try_accept_deploy_with_id(
+                DeployRequest {
+                    url: "http://x".into(),
+                    release_id: "requested".into(),
+                    sha256: None,
+                },
+                "op-a".into(),
+            )
+            .expect("accept");
+        state.set_phase(ServerPhase::Failed("prepare failed".into()));
+        state.set_phase(ServerPhase::Running);
+        let operation = state.deploy_status().operation.expect("operation");
+        assert_eq!(operation.operation_id, "op-a");
+        assert_eq!(operation.phase, AppCliDeployPhase::Failed);
+        assert_eq!(operation.error.as_deref(), Some("prepare failed"));
+    }
+
     #[test]
     fn server_phase_to_wire_phase_matrix() {
         let cases = [
@@ -534,7 +766,13 @@ mod tests {
         assert!(!st.readiness_ok(), "runtime not ready → 503");
         st.ready.set_ready(true);
         assert!(st.readiness_ok());
-        // 过渡/失败态：摘流
+        // Preparation/failure of a new deployment does not remove a healthy old app.
+        st.set_phase(ServerPhase::Deploying);
+        assert!(st.readiness_ok());
+        st.set_phase(ServerPhase::Failed("prepare failed".into()));
+        assert!(st.readiness_ok());
+        // Activation explicitly stops the serving generation.
+        st.ready.set_ready(false);
         for phase in [ServerPhase::Deploying, ServerPhase::Orchestrating] {
             st.set_phase(phase);
             assert!(!st.readiness_ok());

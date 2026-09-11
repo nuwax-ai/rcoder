@@ -174,7 +174,9 @@ pub fn routes() -> Router<Arc<AppState>> {
     for path in CONTAINER_PASS_THROUGH_PATHS {
         router = router.route(path, any(forward::forward_userapp));
     }
-    router
+    router.layer(axum::middleware::from_fn(
+        shared_types::userapp_http::envelope_errors,
+    ))
 }
 
 /// 容器内 file-server 幂等建 workspace 目录（execute-command 等接口的 cwd 前置；

@@ -15,13 +15,13 @@ use shared_types::HttpResult;
 
 use super::userapp::{UserAppReply, reply};
 use crate::UserAppState;
+use crate::extract::{AppJson as Json, AppQuery as Query};
 use crate::models::{
     BuildTaskStatus, DevOpBody, UserappDevList, UserappDevListQuery, UserappDevProcess,
     UserappDevStopped, UserappDevTaskCreated, UserappFrameworkDetection, UserappFrameworkInfo,
     UserappFrameworkInfoQuery, UserappServiceFrameworkInfo,
 };
 use file_server::error::AppError;
-use file_server::extract::{AppJson as Json, AppQuery as Query};
 use file_server::models::DevProcess;
 use file_server::service::dev_server::StoppedDev;
 use file_server::workspace::resolve_userapp_dev;
@@ -127,7 +127,6 @@ fn map_app_cli_evt(json: &str) -> Option<EvtOutcome> {
     request_body = DevOpBody,
     responses(
         (status = 200, body = HttpResult<UserappDevTaskCreated>, description = "启动任务已创建（task_id）"),
-        (status = 400, description = "受理前置校验拒绝（HttpResult 信封，非任务）：code=ERR_WORKSPACE_EMPTY——workspace 为空（尚未创建/导入项目）；code=ERR_WORKSPACE_NO_SERVICES——manifest 缺失/损坏或无 enabled 服务（message 含 fix 指引）。此时不创建任务、无 task_id"),
     ),
     tag = "Userapp · dev · 进程管理"
 )]
@@ -185,6 +184,11 @@ pub(crate) async fn dev_stop(
     let result = async {
         body.validate().map_err(file_server::error::from_garde)?;
         let key = dev_key(&body.app_id);
+        let lifecycle = state.build_tasks.dev_lifecycle(&body.app_id).await;
+        let mut generation = lifecycle.lock().await;
+        *generation = generation
+            .checked_add(1)
+            .ok_or_else(|| AppError::system("dev lifecycle generation exhausted"))?;
         // 先取消在途任务（kill 编译进程组 + 终态 Cancelled），再停服务——
         // 顺序保证任务侧不会再有 start 动作追上来
         for task in state.build_tasks.active_tasks_for_app(&body.app_id).await {
@@ -234,7 +238,6 @@ pub(crate) async fn dev_stop(
     request_body = DevOpBody,
     responses(
         (status = 200, body = HttpResult<UserappDevTaskCreated>, description = "重启任务已创建（task_id）"),
-        (status = 400, description = "受理前置校验拒绝（同 dev/start）：ERR_WORKSPACE_EMPTY / ERR_WORKSPACE_NO_SERVICES，不创建任务"),
     ),
     tag = "Userapp · dev · 进程管理"
 )]
@@ -296,6 +299,8 @@ async fn spawn_dev_task(
         DevTaskAction::Start => crate::models::BuildTaskKind::DevStart,
         DevTaskAction::Restart => crate::models::BuildTaskKind::DevRestart,
     };
+    let lifecycle = state.build_tasks.dev_lifecycle(app_id).await;
+    let generation = *lifecycle.lock().await;
     let task = state
         .build_tasks
         .create(app_id.to_string(), kind)
@@ -421,13 +426,16 @@ async fn spawn_dev_task(
             // - 源码态：ensure 源码目录 release.lock（mtime 检测自动重锁），
             //   app-cli 直接编排源码 workspace（devrun 优先、run 兜底）。
             // 两种形态失败语义一致：旧运行态原样保留，任务 Failed。
-            let run_root = if dev_source_mode {
-                crate::service::userapp::dev_mode::ensure_dev_lock(&ws).await?
+            let prepared = if dev_source_mode {
+                None
             } else {
-                crate::service::userapp::run_dir::prepare_run_dir(&ws, &release_id).await?
+                Some(crate::service::userapp::run_dir::prepare_run_dir(&ws, &release_id).await?)
             };
-            // 启动/重启（start_dev 内 poll_alive 宽松就绪——app-cli 进程存活
-            // 即成功；单服务启动成败经 EVT 事件流逐服务呈现，见下方终态判定）
+            if !task_clone.commit_start(&lifecycle, generation, async {
+            let run_root = match prepared {
+                Some(prepared) => prepared.activate()?,
+                None => crate::service::userapp::dev_mode::ensure_dev_lock(&ws).await?,
+            };
             match action {
                 DevTaskAction::Start => {
                     state
@@ -441,6 +449,10 @@ async fn spawn_dev_task(
                         .restart_dev(&key, &run_root, base_path.as_deref(), Some(on_event.clone()))
                         .await?;
                 }
+            }
+                Ok::<(), AppError>(())
+            }).await? {
+                return Ok(());
             }
             // bounded 等 app-cli 终局事件：start_dev 在 9080（pingap）listen 即
             // 返回，但逐服务 readiness 探测可能仍在进行（java 60s 窗口）——done
@@ -755,7 +767,7 @@ mod precheck_reply_tests {
         )
         .await;
         let resp = reply.into_response();
-        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let (parts, body) = resp.into_parts();
         drop(parts);
         let bytes = axum::body::to_bytes(body, 16 * 1024)

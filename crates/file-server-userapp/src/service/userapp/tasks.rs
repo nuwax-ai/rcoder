@@ -73,6 +73,7 @@ pub struct BuildTask {
     /// 当前 build 子进程 pid (cancel 时 kill_process_group 用)。
     /// AtomicU32 (0 = 未设置) 而非 Mutex: build_generic 的 on_pid 回调是同步的, 需同步写。
     pid: AtomicU32,
+    commit: Mutex<()>,
 }
 
 impl BuildTask {
@@ -105,7 +106,34 @@ impl BuildTask {
             terminal_at: AtomicI64::new(0),
             created_at: now,
             pid: AtomicU32::new(0),
+            commit: Mutex::new(()),
         })
+    }
+
+    /// Serializes process creation with cancellation's commit boundary.
+    pub async fn commit_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.commit.lock().await
+    }
+
+    /// Holds both lifecycle and task boundaries until process submission completes.
+    pub async fn commit_start<F, E>(
+        &self,
+        lifecycle: &Mutex<u64>,
+        expected: u64,
+        start: F,
+    ) -> Result<bool, E>
+    where
+        F: Future<Output = Result<(), E>>,
+    {
+        let generation = lifecycle.lock().await;
+        let _commit = self.commit_guard().await;
+        if *generation != expected || self.is_cancelled() {
+            self.cancel();
+            self.emit(BuildProgressEvent::Cancelled).await;
+            return Ok(false);
+        }
+        start.await?;
+        Ok(true)
     }
 
     /// 当前快照(查询用)。
@@ -194,7 +222,26 @@ impl BuildTask {
         Vec<(u64, BuildProgressEvent)>,
         broadcast::Receiver<(u64, BuildProgressEvent)>,
     ) {
+        let (replay, receiver, _) = self.subscribe_snapshot(from_seq).await;
+        (replay, receiver)
+    }
+
+    /// Receiver, replay and terminal cursor belong to one atomic snapshot.
+    /// A terminal emitted after this snapshot must be consumed from the receiver.
+    pub async fn subscribe_snapshot(
+        &self,
+        from_seq: u64,
+    ) -> (
+        Vec<(u64, BuildProgressEvent)>,
+        broadcast::Receiver<(u64, BuildProgressEvent)>,
+        Option<u64>,
+    ) {
         let s = self.state.lock().await;
+        let terminal_seq = matches!(
+            s.status,
+            BuildTaskStatus::Completed | BuildTaskStatus::Failed | BuildTaskStatus::Cancelled
+        )
+        .then(|| s.seq.saturating_sub(1));
         let receiver = self.tx.subscribe();
         let replay = s
             .history
@@ -202,7 +249,7 @@ impl BuildTask {
             .filter(|(seq, _)| *seq >= from_seq)
             .cloned()
             .collect();
-        (replay, receiver)
+        (replay, receiver, terminal_seq)
     }
 
     /// 记录当前 build 子进程 pid (build_generic spawn 后经 on_pid 回调同步写入)。
@@ -317,6 +364,7 @@ fn apply_event(state: &mut TaskState, event: &BuildProgressEvent) {
 pub struct BuildTaskStore {
     map: Mutex<HashMap<BuildTaskId, Arc<BuildTask>>>,
     max_retained_tasks: usize,
+    dev_lifecycles: Mutex<HashMap<String, std::sync::Weak<Mutex<u64>>>>,
 }
 
 /// `BuildTaskStore::create` 容量耗尽错误(硬上限:全活跃任务达上限且无终态任务可淘汰)。
@@ -333,9 +381,22 @@ impl Default for BuildTaskStore {
 }
 
 impl BuildTaskStore {
+    /// Weak entries avoid retaining every app ever seen by this process.
+    pub async fn dev_lifecycle(&self, app_id: &str) -> Arc<Mutex<u64>> {
+        let mut entries = self.dev_lifecycles.lock().await;
+        entries.retain(|_, value| value.strong_count() > 0);
+        if let Some(existing) = entries.get(app_id).and_then(std::sync::Weak::upgrade) {
+            return existing;
+        }
+        let lifecycle = Arc::new(Mutex::new(0));
+        entries.insert(app_id.to_owned(), Arc::downgrade(&lifecycle));
+        lifecycle
+    }
+
     pub fn new() -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
+            dev_lifecycles: Mutex::new(HashMap::new()),
             max_retained_tasks: MAX_RETAINED_TASKS,
         }
     }
@@ -344,6 +405,7 @@ impl BuildTaskStore {
     fn with_max_retained_tasks(max_retained_tasks: usize) -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
+            dev_lifecycles: Mutex::new(HashMap::new()),
             max_retained_tasks,
         }
     }
@@ -527,5 +589,43 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert!(map.contains_key(&replacement.id));
         assert!(!map.contains_key(&completed.id));
+    }
+    #[tokio::test]
+    async fn stopped_generation_cannot_commit_after_preparation() {
+        let store = BuildTaskStore::new();
+        let task = store
+            .create("app-gap".into(), BuildTaskKind::DevStart)
+            .await
+            .expect("task");
+        let lifecycle = store.dev_lifecycle("app-gap").await;
+        let expected = *lifecycle.lock().await;
+        let prepared = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let worker_lifecycle = lifecycle.clone();
+        let worker_prepared = prepared.clone();
+        let worker_resume = resume.clone();
+        let submitted = Arc::new(AtomicBool::new(false));
+        let worker_submitted = submitted.clone();
+        let worker = tokio::spawn(async move {
+            worker_prepared.wait().await;
+            worker_resume.wait().await;
+            task.commit_start(&worker_lifecycle, expected, async {
+                worker_submitted.store(true, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            })
+            .await
+            .expect("commit check")
+        });
+        prepared.wait().await;
+        // Same boundary used by dev_stop, while preparation is paused outside it.
+        *lifecycle.lock().await += 1;
+        resume.wait().await;
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+                .await
+                .expect("bounded")
+                .expect("worker")
+        );
+        assert!(!submitted.load(Ordering::SeqCst));
     }
 }

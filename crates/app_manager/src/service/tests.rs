@@ -24,9 +24,9 @@ pub(crate) fn create_request(app_id: &str) -> CreateAppRequest {
     }
 }
 
-/// R2：create_app_runtime 失败——断言 delete_deployment 兜底被调用、原始错误原样返回（不被清理覆盖）。
+/// R01：runtime 未返回创建凭据时，service 不得按名字补偿删除竞争赢家。
 #[tokio::test]
-pub(crate) async fn create_app_runtime_failure_triggers_best_effort_cleanup() {
+pub(crate) async fn create_app_runtime_failure_does_not_delete_unowned_resources() {
     let root = tempfile::tempdir().expect("tempdir");
     let runtime = Arc::new(MockRuntime::default());
     runtime.create_fails.store(true, Ordering::SeqCst);
@@ -56,8 +56,8 @@ pub(crate) async fn create_app_runtime_failure_triggers_best_effort_cleanup() {
     assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         runtime.delete_calls.load(Ordering::SeqCst),
-        1,
-        "delete_deployment fallback must be called after create_app_runtime failure"
+        0,
+        "failed creation does not establish ownership of the named deployment"
     );
 }
 
@@ -89,7 +89,7 @@ pub(crate) async fn create_app_cleanup_failure_keeps_original_error() {
         error.to_string().contains("create_deployment failed"),
         "original error must not be masked by cleanup failure, got: {error}"
     );
-    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
 }
 
 /// 回归（userapp_metadata）：update 不带 name（name 是"仅元数据"调用方常省略）

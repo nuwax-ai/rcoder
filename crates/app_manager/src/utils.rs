@@ -14,6 +14,7 @@ use super::models::*;
 /// thiserror variant 无 source，`{e}` 即 variant Display（含原始 daemon message）。
 pub(super) fn map_runtime_error(ctx: &str, e: ContainerRuntimeError) -> AppOperationError {
     match e {
+        ContainerRuntimeError::Conflict(_) => AppOperationError::Conflict(format!("{ctx}: {e}")),
         // 容器/deployment 不存在 = app 不存在（404）
         ContainerRuntimeError::ContainerNotFound(_) => {
             AppOperationError::NotFound(format!("{ctx}: {e}"))

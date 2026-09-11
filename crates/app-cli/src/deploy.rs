@@ -2,18 +2,11 @@
 //!
 //! rcoder `start {url}` 经 Deployment env 注入三元组：`APP_DEPLOY_URL`（制品 zip 地址）、
 //! `APP_RELEASE_ID`（部署身份标识）、`APP_DEPLOY_SHA256`（可选校验，空 = 信任内网源）。
-//! 本段在 api / 编排读 release.lock **之前**执行（main.rs 最先调用）：
-//!
-//! 1. marker：`{卷根}/.deploy-state.toml` 的 release_id 一致且 code/ 在位 → 跳过
-//!    （幂等重启，pod 重启不重下载）；
-//! 2. 清 `.incoming/` 残片 + 流式下载到 `{卷根}/.incoming/{release_id}.zip.part`
-//!    （sha256 增量计算）；
-//! 3. zip 魔数校验（拦 HTTP 200 + 错误信封 body）→ 解压到 `{卷根}/.staging/{release_id}`
-//!    （zip-slip 防护）并校验包内 release.lock.toml 可解析（包完整性闸门）；
-//! 4. 换 code/：旧 code → `.previous`（保留一代，紧急人工恢复用）→ staging → code；
-//! 5. 写 `.deploy-state.toml`。下载后的任一步失败统一清 `.part` 残片。
-//!
-//! 失败由 main 退出非零 → supervisord 重试；code/ 现场不破坏（换卷只做同 fs rename）。
+//! prepare downloads and validates into operation-owned temporary resources while
+//! the old application continues serving. activate promotes prepared code only after
+//! the caller stops the old processes. restore_previous restores code only; database
+//! migration effects are never described as rolled back. RAII removes temporary
+//! resources on completion, error, and cancellation, including blocking extraction.
 
 use std::path::Path;
 use std::time::Duration;
@@ -22,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, warn};
+use tracing::warn;
 
 /// 部署状态 marker 文件名（卷根下，跨 code 换代存续）。
 const DEPLOY_STATE_FILE: &str = ".deploy-state.toml";
@@ -144,119 +137,221 @@ impl LivenessHold {
     }
 }
 
-/// 执行一次部署（marker 未命中时）。
+/// Prepared files are owned by this operation. Drop cleans failures/cancellation.
+/// Extraction moves the owner into its blocking worker, so cancellation cannot race cleanup.
+pub(crate) struct PreparedDeploy {
+    staging: tempfile::TempDir,
+    _lease: std::fs::File,
+    state: DeployState,
+}
+
 pub(crate) async fn deploy(
     workspace: &Path,
     url: &str,
     release_id: &str,
     expected_sha: Option<&str>,
 ) -> Result<()> {
-    validate_release_id_fs_safe(release_id)?;
-    let volume_root = workspace.parent().with_context(|| {
-        format!(
-            "workspace {} has no parent for volume root",
-            workspace.display()
-        )
-    })?;
-
-    // 1. marker 幂等：同 release_id 且 code 在位 → 跳过
-    if let Some(state) = read_state(volume_root).await
-        && state.release_id == release_id
-        && tokio::fs::try_exists(workspace.join("release.lock.toml"))
-            .await
-            .unwrap_or(false)
-    {
-        info!("📦 deploy stage skipped (marker hit): release_id={release_id}");
-        return Ok(());
+    if let Some(prepared) = prepare(workspace, url, release_id, expected_sha).await? {
+        activate(workspace, prepared).await?;
     }
+    Ok(())
+}
 
-    info!(
-        "📦 deploy stage: release_id={release_id} url={url} sha256={}",
-        expected_sha.unwrap_or("(skip verify)")
-    );
-
-    // 2. 清跨重启残留的下载中转残片（上次失败路径遗留；成功路径本就自清）
-    sweep_incoming_parts(&incoming_dir(volume_root)).await;
-
-    // 3. 流式下载（sha256 增量）
-    let incoming = volume_root.join(INCOMING_DIR);
+pub(crate) async fn prepare(
+    workspace: &Path,
+    url: &str,
+    release_id: &str,
+    expected_sha: Option<&str>,
+) -> Result<Option<PreparedDeploy>> {
+    validate_release_id_fs_safe(release_id)?;
+    let root = workspace.parent().context("workspace has no volume root")?;
+    if let Some(state) = read_state(root).await
+        && state.release_id == release_id
+        && expected_sha.is_none_or(|sha| sha.eq_ignore_ascii_case(&state.sha256))
+        && tokio::fs::try_exists(workspace.join("release.lock.toml")).await?
+    {
+        return Ok(None);
+    }
+    tokio::fs::create_dir_all(root)
+        .await
+        .context("create volume root")?;
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".deploy-prepare.lock"))
+        .context("open preparation lease")?;
+    lease
+        .try_lock()
+        .context("another artifact preparation owns this volume")?;
+    let incoming = incoming_dir(root);
+    let staging_root = root.join(STAGING_DIR);
     tokio::fs::create_dir_all(&incoming)
         .await
-        .with_context(|| format!("create {}", incoming.display()))?;
-    let part = incoming.join(format!("{release_id}.zip.part"));
-    let actual_sha = download_to_file(url, &part).await?;
-    let actual_hex = to_hex(&actual_sha);
-    if let Some(expected) = expected_sha
-        && expected != actual_hex
-    {
-        if let Err(e) = tokio::fs::remove_file(&part).await {
-            warn!("remove mismatched part {} failed: {e}", part.display());
-        }
-        bail!(
-            "artifact sha256 mismatch: expected {expected}, downloaded {actual_hex} (release_id={release_id})"
-        );
-    }
-
-    // 4. 魔数校验 → 解压 → 包完整性闸门 → 原子换入：任一步失败统一清 .part
-    //    （对齐 sha mismatch 的清理语义，消除解压/lock/promote 失败的残片残留路径）。
-    let staged: Result<()> = async {
-        verify_zip_magic(&part).await?;
-        let staging = volume_root.join(STAGING_DIR).join(release_id);
-        if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
-            tokio::fs::remove_dir_all(&staging)
-                .await
-                .with_context(|| format!("clean stale staging {}", staging.display()))?;
-        }
-        extract_zip(&part, &staging)
-            .await
-            .with_context(|| format!("extract package to {}", staging.display()))?;
-        crate::manifest::read_release_lock(&staging).context(
-            "staged package has no parsable release.lock.toml — not a platform artifact?",
-        )?;
-
-        let previous = volume_root.join(PREVIOUS_DIR);
-        if tokio::fs::try_exists(&previous).await.unwrap_or(false) {
-            tokio::fs::remove_dir_all(&previous)
-                .await
-                .with_context(|| format!("clean old {}", previous.display()))?;
-        }
-        if tokio::fs::try_exists(workspace).await.unwrap_or(false) {
-            tokio::fs::rename(workspace, &previous)
-                .await
-                .with_context(|| format!("move current code to {}", previous.display()))?;
-        }
-        tokio::fs::rename(&staging, workspace)
-            .await
-            .with_context(|| format!("promote staging to {}", workspace.display()))?;
-        Ok(())
-    }
-    .await;
-    if let Err(e) = staged {
-        if let Err(remove_err) = tokio::fs::remove_file(&part).await {
-            warn!(
-                "remove failed part {} after deploy error: {remove_err}",
-                part.display()
-            );
-        }
-        return Err(e);
-    }
-
-    // 5. 写 marker + 清 .part
-    let state = DeployState {
-        release_id: release_id.to_string(),
-        sha256: actual_hex.clone(),
-        deployed_at: chrono::Utc::now().to_rfc3339(),
-    };
-    let state_path = volume_root.join(DEPLOY_STATE_FILE);
-    let content = toml::to_string_pretty(&state).context("serialize deploy state")?;
-    tokio::fs::write(&state_path, content)
+        .context("create incoming directory")?;
+    tokio::fs::create_dir_all(&staging_root)
         .await
-        .with_context(|| format!("write {}", state_path.display()))?;
-    if let Err(e) = tokio::fs::remove_file(&part).await {
-        warn!("remove part {} failed: {e}", part.display());
+        .context("create staging directory")?;
+    // The OS lease outlives blocking extraction, including cancellation. Only a
+    // holder can reclaim leftovers from a terminated operation.
+    clean_owned_temporary(&incoming).await?;
+    clean_owned_temporary(&staging_root).await?;
+    let part = tempfile::Builder::new()
+        .prefix("deploy-")
+        .suffix(".part")
+        .tempfile_in(&incoming)?;
+    let actual_hex = to_hex(&download_to_file(url, part.path()).await?);
+    if let Some(expected) = expected_sha
+        && !expected.eq_ignore_ascii_case(&actual_hex)
+    {
+        bail!("artifact sha256 mismatch: expected {expected}, downloaded {actual_hex}");
     }
-    info!("✅ deploy stage complete: release_id={release_id} sha256={actual_hex}");
+    verify_zip_magic(part.path()).await?;
+    let staging = tempfile::Builder::new()
+        .prefix("deploy-")
+        .tempdir_in(staging_root)?;
+    let limits = ExtractionLimits::from_env()?;
+    let (staging, lease) =
+        tokio::task::spawn_blocking(move || -> Result<(tempfile::TempDir, std::fs::File)> {
+            extract_zip_sync(part.path(), staging.path(), limits)?;
+            crate::manifest::read_release_lock(staging.path())
+                .context("staged package has no parsable release.lock.toml")?;
+            Ok((staging, lease))
+        })
+        .await
+        .context("join artifact preparation")??;
+    Ok(Some(PreparedDeploy {
+        staging,
+        _lease: lease,
+        state: DeployState {
+            release_id: release_id.to_owned(),
+            sha256: actual_hex,
+            deployed_at: chrono::Utc::now().to_rfc3339(),
+        },
+    }))
+}
+
+/// Startup reclamation is exclusive with every live preparation, including
+/// extraction that continues after its async caller has been cancelled.
+pub(crate) async fn cleanup_startup(workspace: &Path) -> Result<()> {
+    let root = workspace.parent().context("workspace has no volume root")?;
+    tokio::fs::create_dir_all(root).await?;
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".deploy-prepare.lock"))?;
+    lease
+        .try_lock()
+        .context("active preparation prevents startup cleanup")?;
+    for directory in [root.join(INCOMING_DIR), root.join(STAGING_DIR)] {
+        if tokio::fs::try_exists(&directory).await? {
+            clean_owned_temporary(&directory).await?;
+        }
+    }
     Ok(())
+}
+
+async fn clean_owned_temporary(directory: &Path) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_name().to_string_lossy().starts_with("deploy-") {
+            continue;
+        }
+        if entry.file_type().await?.is_dir() {
+            tokio::fs::remove_dir_all(entry.path()).await?;
+        } else {
+            tokio::fs::remove_file(entry.path()).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Activate only after the caller has stopped the previous generation.
+#[derive(Debug)]
+pub(crate) struct ActivationFailure {
+    pub error: anyhow::Error,
+    pub code_preserved: bool,
+}
+impl std::fmt::Display for ActivationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+impl std::error::Error for ActivationFailure {}
+
+pub(crate) async fn activate(
+    workspace: &Path,
+    prepared: PreparedDeploy,
+) -> Result<(), ActivationFailure> {
+    let mut code_preserved = true;
+    activate_inner(workspace, prepared, &mut code_preserved)
+        .await
+        .map_err(|error| ActivationFailure {
+            error,
+            code_preserved,
+        })
+}
+
+async fn activate_inner(
+    workspace: &Path,
+    prepared: PreparedDeploy,
+    code_preserved: &mut bool,
+) -> Result<()> {
+    let root = workspace.parent().context("workspace has no volume root")?;
+    let previous = root.join(PREVIOUS_DIR);
+    if tokio::fs::try_exists(&previous).await? {
+        tokio::fs::remove_dir_all(&previous)
+            .await
+            .context("clean previous generation")?;
+    }
+    let had_previous = tokio::fs::try_exists(workspace).await?;
+    if had_previous {
+        tokio::fs::rename(workspace, &previous)
+            .await
+            .context("preserve previous generation")?;
+        *code_preserved = false;
+    }
+    if let Err(error) = tokio::fs::rename(prepared.staging.path(), workspace).await {
+        if had_previous {
+            tokio::fs::rename(&previous, workspace)
+                .await
+                .context("restore previous after failed promotion")?;
+            *code_preserved = true;
+        }
+        return Err(error).context("promote prepared generation");
+    }
+    *code_preserved = false;
+    let marker = tempfile::NamedTempFile::new_in(root)?;
+    tokio::fs::write(marker.path(), toml::to_string_pretty(&prepared.state)?).await?;
+    tokio::fs::rename(marker.path(), root.join(DEPLOY_STATE_FILE))
+        .await
+        .context("commit deployment marker")?;
+    Ok(())
+}
+
+/// Restore code only. Database migrations are deliberately not reversed.
+pub(crate) async fn restore_previous(workspace: &Path) -> Result<bool> {
+    let root = workspace.parent().context("workspace has no volume root")?;
+    let previous = root.join(PREVIOUS_DIR);
+    if !tokio::fs::try_exists(previous.join("release.lock.toml")).await? {
+        return Ok(false);
+    }
+    if tokio::fs::try_exists(workspace).await? {
+        tokio::fs::remove_dir_all(workspace)
+            .await
+            .context("remove failed code generation")?;
+    }
+    tokio::fs::rename(previous, workspace)
+        .await
+        .context("restore previous code generation")?;
+    let marker = root.join(DEPLOY_STATE_FILE);
+    if tokio::fs::try_exists(&marker).await? {
+        tokio::fs::remove_file(marker).await?;
+    }
+    Ok(true)
 }
 
 /// 下载中转目录路径（卷根下）。
@@ -270,6 +365,7 @@ fn incoming_dir(volume_root: &Path) -> std::path::PathBuf {
 /// 但历史版本残片 / 进程被 SIGKILL 的窗口仍可能留档——下载前统一扫掉，
 /// 对齐 file-server 侧 hygiene sweep 的模型。失败仅 warn（清理是卫生动作，
 /// 不阻断部署主流程）。
+#[cfg(test)]
 async fn sweep_incoming_parts(dir: &Path) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return; // 目录不存在 = 无残片
@@ -319,7 +415,10 @@ async fn verify_zip_magic(part: &Path) -> Result<()> {
 
 /// 流式下载到文件，返回内容 sha256。无整体超时（大制品），仅连接超时。
 async fn download_to_file(url: &str, dest: &Path) -> Result<[u8; 32]> {
+    let max_bytes = budget("APP_DEPLOY_MAX_DOWNLOAD_BYTES", 4 * 1024 * 1024 * 1024)?;
+    let idle = Duration::from_secs(budget("APP_DEPLOY_READ_IDLE_SECONDS", 60)?);
     let client = reqwest::Client::builder()
+        .read_timeout(idle)
         .connect_timeout(Duration::from_secs(15))
         .build()
         .context("build deploy http client")?;
@@ -335,8 +434,18 @@ async fn download_to_file(url: &str, dest: &Path) -> Result<[u8; 32]> {
         .with_context(|| format!("create {}", dest.display()))?;
     let mut hasher = Sha256::new();
     use futures::StreamExt;
-    while let Some(chunk) = stream.next().await {
+    let mut downloaded = 0u64;
+    while let Some(chunk) = tokio::time::timeout(idle, stream.next())
+        .await
+        .context("download read idle timeout")?
+    {
         let chunk = chunk.context("download stream")?;
+        downloaded = downloaded
+            .checked_add(chunk.len() as u64)
+            .context("download size overflow")?;
+        if downloaded > max_bytes {
+            bail!("download size exceeds limit");
+        }
         hasher.update(&chunk);
         file.write_all(&chunk).await?;
     }
@@ -350,58 +459,99 @@ async fn download_to_file(url: &str, dest: &Path) -> Result<[u8; 32]> {
 ///
 /// 错误 context 附文件首 4 字节 hex——解压层失败（EOCD/InvalidArchive）时自诊断：
 /// 看到非 PK 头（如 7b22636f = `{"co`）即知 body 是错误信封而非 zip。
-async fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
-    let zip_path = zip_path.to_path_buf();
-    let dest = dest.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let mut head = [0u8; 4];
-        let head_hex = std::fs::File::open(&zip_path)
-            .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
-            .ok()
-            .map(|_| head.iter().map(|b| format!("{b:02x}")).collect::<String>())
-            .unwrap_or_else(|| "<unreadable>".to_string());
-        let file = std::fs::File::open(&zip_path)
-            .with_context(|| format!("open {}", zip_path.display()))?;
-        let mut archive = zip::ZipArchive::new(file).with_context(|| {
-            format!(
-                "open zip {} (first 4 bytes: 0x{head_hex})",
-                zip_path.display()
-            )
-        })?;
-        for index in 0..archive.len() {
-            let mut entry = archive
-                .by_index(index)
-                .with_context(|| format!("zip entry #{index}"))?;
-            let Some(rel) = entry.enclosed_name() else {
-                bail!("zip entry escapes destination (zip-slip): {}", entry.name());
-            };
-            let out_path = dest.join(rel);
-            if entry.is_dir() {
-                std::fs::create_dir_all(&out_path)
-                    .with_context(|| format!("mkdir {}", out_path.display()))?;
-            } else {
-                if let Some(parent) = out_path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("mkdir {}", parent.display()))?;
-                }
-                let mut out = std::fs::File::create(&out_path)
-                    .with_context(|| format!("create {}", out_path.display()))?;
-                std::io::copy(&mut entry, &mut out)?;
-                #[cfg(unix)]
-                if let Some(mode) = entry.unix_mode() {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Err(e) =
-                        std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))
-                    {
-                        warn!("set perms {} failed: {e}", out_path.display());
-                    }
-                }
+#[derive(Clone, Copy)]
+pub(crate) struct ExtractionLimits {
+    total: u64,
+    file: u64,
+    entries: usize,
+}
+
+fn budget(key: &str, default: u64) -> Result<u64> {
+    match std::env::var(key) {
+        Ok(value) => {
+            let n: u64 = value.parse().with_context(|| format!("invalid {key}"))?;
+            if n == 0 {
+                bail!("{key} must be positive");
             }
+            Ok(n)
         }
-        Ok(())
-    })
-    .await
-    .context("join extract task")?
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(e).with_context(|| format!("read {key}")),
+    }
+}
+
+impl ExtractionLimits {
+    pub(crate) fn from_env() -> Result<Self> {
+        Ok(Self {
+            total: budget("APP_DEPLOY_MAX_EXTRACTED_BYTES", 4 * 1024 * 1024 * 1024)?,
+            file: budget("APP_DEPLOY_MAX_FILE_BYTES", 1024 * 1024 * 1024)?,
+            entries: usize::try_from(budget("APP_DEPLOY_MAX_ENTRIES", 100_000)?)?,
+        })
+    }
+}
+
+pub(crate) fn extract_zip_sync(
+    zip_path: &Path,
+    dest: &Path,
+    limits: ExtractionLimits,
+) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut archive =
+        zip::ZipArchive::new(std::fs::File::open(zip_path)?).context("open artifact zip")?;
+    if archive.len() > limits.entries {
+        bail!("zip entry count exceeds limit");
+    }
+    let mut total = 0u64;
+    let mut links = shared_types::archive_links::ArchiveSymlinks::default();
+    let mut buffer = [0u8; 65536];
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let rel = entry
+            .enclosed_name()
+            .context("zip entry escapes destination (zip-slip)")?;
+        let out_path = shared_types::archive_links::checked_archive_output(dest, &rel)?;
+        if entry.is_symlink() {
+            let mut target = String::new();
+            (&mut entry)
+                .take((shared_types::archive_links::MAX_ARCHIVE_LINK_BYTES + 1) as u64)
+                .read_to_string(&mut target)?;
+            let size = target.len() as u64;
+            total = total.checked_add(size).context("zip total overflow")?;
+            if size > limits.file || total > limits.total {
+                bail!("zip extracted size exceeds limit");
+            }
+            links.record(&rel, &target)?;
+            continue;
+        }
+        if entry.is_dir() {
+            std::fs::create_dir_all(out_path)?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::fs::File::create(&out_path)?;
+        let mut size = 0u64;
+        loop {
+            let n = entry.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            size = size.checked_add(n as u64).context("zip size overflow")?;
+            total = total.checked_add(n as u64).context("zip total overflow")?;
+            if size > limits.file || total > limits.total {
+                bail!("zip extracted size exceeds limit");
+            }
+            out.write_all(&buffer[..n])?;
+        }
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(out_path, std::fs::Permissions::from_mode(mode & 0o777))?;
+        }
+    }
+    links.install(dest)?;
+    Ok(())
 }
 
 async fn read_state(volume_root: &Path) -> Option<DeployState> {
@@ -493,6 +643,124 @@ format = "jsonl"
 
 [services.env]
 "#;
+
+    #[tokio::test]
+    async fn preparation_lease_protects_active_staging_and_reclaims_stale_owned_files() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("code");
+        let incoming = root.path().join(INCOMING_DIR);
+        tokio::fs::create_dir_all(&incoming)
+            .await
+            .expect("incoming");
+        tokio::fs::write(incoming.join("deploy-stale.part"), "stale")
+            .await
+            .expect("stale");
+        tokio::fs::write(incoming.join("unrelated"), "keep")
+            .await
+            .expect("unrelated");
+        let url = serve_once(build_zip(&[("release.lock.toml", MINIMAL_LOCK)])).await;
+        let prepared = prepare(&workspace, &url, "prepared", None)
+            .await
+            .expect("prepare")
+            .expect("new");
+        let staging = prepared.staging.path().to_owned();
+        assert!(!incoming.join("deploy-stale.part").exists());
+        assert!(incoming.join("unrelated").exists());
+        assert!(
+            prepare(&workspace, "http://127.0.0.1:1/unused", "contender", None)
+                .await
+                .is_err()
+        );
+        assert!(
+            cleanup_startup(&workspace).await.is_err(),
+            "startup sweep must respect the live lease"
+        );
+        assert!(staging.exists(), "contender must not clean active staging");
+        drop(prepared);
+        assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn preparation_does_not_replace_serving_code_and_drop_cleans_staging() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("code");
+        tokio::fs::create_dir_all(&workspace).await.expect("mkdir");
+        tokio::fs::write(workspace.join("old.txt"), "old")
+            .await
+            .expect("old");
+        let url = serve_once(build_zip(&[
+            ("release.lock.toml", MINIMAL_LOCK),
+            ("new.txt", "new"),
+        ]))
+        .await;
+        let prepared = prepare(&workspace, &url, "new-release", None)
+            .await
+            .expect("prepare")
+            .expect("prepared");
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.join("old.txt"))
+                .await
+                .expect("old"),
+            "old"
+        );
+        assert!(!workspace.join("new.txt").exists());
+        let staging = prepared.staging.path().to_path_buf();
+        assert!(staging.exists());
+        drop(prepared);
+        assert!(!staging.exists());
+        assert_eq!(
+            std::fs::read_dir(incoming_dir(root.path()))
+                .expect("incoming")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_manifest_cleans_staging_and_download() {
+        let root = tempfile::tempdir().expect("root");
+        let url = serve_once(build_zip(&[("untrusted.txt", "payload")])).await;
+        assert!(
+            prepare(&root.path().join("code"), &url, "bad", None)
+                .await
+                .is_err()
+        );
+        for name in [INCOMING_DIR, STAGING_DIR] {
+            assert_eq!(
+                std::fs::read_dir(root.path().join(name))
+                    .expect("directory")
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn zip_limits_count_actual_extracted_bytes_and_entries() {
+        let root = tempfile::tempdir().expect("root");
+        let archive = root.path().join("input.zip");
+        std::fs::write(&archive, build_zip(&[("a", "123456"), ("b", "123456")])).expect("zip");
+        for limits in [
+            ExtractionLimits {
+                file: 5,
+                total: 100,
+                entries: 5,
+            },
+            ExtractionLimits {
+                file: 100,
+                total: 10,
+                entries: 5,
+            },
+            ExtractionLimits {
+                file: 100,
+                total: 100,
+                entries: 1,
+            },
+        ] {
+            let out = tempfile::tempdir().expect("out");
+            assert!(extract_zip_sync(&archive, out.path(), limits).is_err());
+        }
+    }
 
     fn build_zip(entries: &[(&str, &str)]) -> Vec<u8> {
         let mut buf = std::io::Cursor::new(Vec::new());
@@ -753,5 +1021,41 @@ format = "jsonl"
         assert!(validate_release_id_fs_safe(".hidden").is_err());
         assert!(validate_release_id_fs_safe("a/b").is_err());
         assert!(validate_release_id_fs_safe("").is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn deploy_preserves_internal_dependency_symlink() {
+        use std::io::Write;
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("artifact.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).expect("zip"));
+        zip.start_file("lib/index.js", zip::write::SimpleFileOptions::default())
+            .expect("file");
+        zip.write_all(b"module.exports = 42").expect("content");
+        zip.add_symlink(
+            "node_modules/next",
+            "../lib",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .expect("link");
+        zip.finish().expect("finish");
+        let out = root.path().join("out");
+        std::fs::create_dir_all(&out).expect("out");
+        extract_zip_sync(
+            &path,
+            &out,
+            ExtractionLimits {
+                total: 4096,
+                file: 4096,
+                entries: 100,
+            },
+        )
+        .expect("extract");
+        assert!(out.join("node_modules/next").is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(out.join("node_modules/next/index.js"))
+                .expect("read linked dependency"),
+            "module.exports = 42"
+        );
     }
 }

@@ -48,7 +48,8 @@ pub async fn extract_to(zip_path: PathBuf, dst: PathBuf) -> AppResult<()> {
     Ok(())
 }
 
-fn extract_blocking(zip_path: &Path, dst: &Path) -> AppResult<()> {
+/// Synchronous extraction for callers that move resource guards into their own blocking worker.
+pub fn extract_blocking(zip_path: &Path, dst: &Path) -> AppResult<()> {
     extract_blocking_with_limits(zip_path, dst, EXTRACTION_LIMITS)
 }
 
@@ -69,8 +70,9 @@ fn extract_blocking_with_limits(
     }
     std::fs::create_dir_all(dst)?;
     let mut extracted_bytes = 0_u64;
+    let mut links = shared_types::archive_links::ArchiveSymlinks::default();
     for i in 0..archive.len() {
-        let entry = archive
+        let mut entry = archive
             .by_index(i)
             .map_err(|e| AppError::file(format!("zip entry {i} read failed: {e}")))?;
         let name = entry.name().to_string();
@@ -82,6 +84,28 @@ fn extract_blocking_with_limits(
                 continue;
             }
         };
+        let relative = target
+            .strip_prefix(dst)
+            .map_err(|e| AppError::validation(format!("archive path: {e}")))?;
+        let target = shared_types::archive_links::checked_archive_output(dst, relative)
+            .map_err(|e| AppError::validation(format!("archive output: {e}")))?;
+        if entry.is_symlink() {
+            let mut link = String::new();
+            (&mut entry)
+                .take((shared_types::archive_links::MAX_ARCHIVE_LINK_BYTES + 1) as u64)
+                .read_to_string(&mut link)?;
+            let size = link.len() as u64;
+            extracted_bytes = extracted_bytes
+                .checked_add(size)
+                .ok_or_else(|| AppError::validation("zip extracted size overflow"))?;
+            if size > limits.file_bytes || extracted_bytes > limits.total_bytes {
+                return Err(AppError::validation("zip extracted size exceeds limit"));
+            }
+            links
+                .record(relative, &link)
+                .map_err(|e| AppError::validation(format!("archive link: {e}")))?;
+            continue;
+        }
         if entry.is_dir() {
             std::fs::create_dir_all(&target)?;
         } else {
@@ -111,17 +135,25 @@ fn extract_blocking_with_limits(
                 .min(limits.file_bytes)
                 .checked_add(1)
                 .ok_or_else(|| AppError::validation("zip extraction limit overflow"))?;
-            let copied = std::io::copy(&mut entry.take(copy_limit), &mut out)?;
+            let copied = std::io::copy(&mut (&mut entry).take(copy_limit), &mut out)?;
             if copied >= copy_limit {
                 return Err(AppError::validation(format!(
                     "zip entry {name} or extracted total exceeds size limit"
                 )));
+            }
+            #[cfg(unix)]
+            if let Some(mode) = entry.unix_mode() {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode & 0o777))?;
             }
             extracted_bytes = extracted_bytes
                 .checked_add(copied)
                 .ok_or_else(|| AppError::validation("zip extracted size overflow"))?;
         }
     }
+    links
+        .install(dst)
+        .map_err(|e| AppError::validation(format!("archive links: {e}")))?;
     Ok(())
 }
 

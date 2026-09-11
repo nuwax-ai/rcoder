@@ -12,11 +12,6 @@
 //! 任一失败则退出非零且不组装部署布局。
 
 use std::fs;
-use std::io;
-// Read 仅供 cfg(unix) 的 zip 符号链接条目读取（read_to_string 需要 trait 在
-// 作用域）；非 unix 编译该路径被门控，导入一并门控避免 unused 警告
-#[cfg(unix)]
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -238,63 +233,7 @@ fn assemble_deploy_dir(workspace: &Path, tasks: &[BuildTask], deploy_dir: &Path)
 /// 保留 unix 可执行位与**符号链接条目**（standalone 类产物用 symlink 指向
 /// 依赖目录——写成普通文件会破坏模块解析）。
 fn extract_zip(zip_path: &Path, dst: &Path) -> Result<()> {
-    let file = fs::File::open(zip_path).with_context(|| format!("open {}", zip_path.display()))?;
-    let mut archive = zip::ZipArchive::new(file).context("open zip archive")?;
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .with_context(|| format!("zip entry #{index}"))?;
-        let Some(relative) = entry.enclosed_name() else {
-            bail!("zip 条目路径逃逸（拒绝解压）: {}", entry.name());
-        };
-        let out_path = dst.join(relative);
-        #[cfg(unix)]
-        if entry.is_symlink() {
-            // 符号链接条目：内容即目标路径（相对/绝对均按原样创建）。
-            // standalone 类产物用 symlink 指向依赖目录——写成普通文件会破坏
-            // 模块解析（如 next 的 .next/node_modules/pg-<hash>）。
-            let mut target = String::new();
-            entry
-                .read_to_string(&mut target)
-                .with_context(|| format!("read symlink target {}", entry.name()))?;
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            if out_path.exists() || out_path.is_symlink() {
-                fs::remove_file(&out_path)
-                    .with_context(|| format!("remove {}", out_path.display()))?;
-            }
-            std::os::unix::fs::symlink(&target, &out_path)
-                .with_context(|| format!("symlink {} -> {}", out_path.display(), target))?;
-            continue;
-        }
-        #[cfg(not(unix))]
-        if entry.is_symlink() {
-            // Windows 创建符号链接需开发者模式/管理员权限——降级为普通文件
-            // （内容为目标路径字符串）。standalone 类制品的模块解析会因此破坏，
-            // 明确告警暴露而非静默降级（Fail Fast）。
-            println!(
-                "⚠️  zip 符号链接条目 {} 在 Windows 降级为普通文件——standalone 产物可能无法运行",
-                entry.name()
-            );
-        }
-        if entry.is_dir() {
-            fs::create_dir_all(&out_path)?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut out_file = fs::File::create(&out_path)?;
-            io::copy(&mut entry, &mut out_file)?;
-            #[cfg(unix)]
-            if let Some(mode) = entry.unix_mode() {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&out_path, fs::Permissions::from_mode(mode))
-                    .with_context(|| format!("chmod {}", out_path.display()))?;
-            }
-        }
-    }
-    Ok(())
+    crate::deploy::extract_zip_sync(zip_path, dst, crate::deploy::ExtractionLimits::from_env()?)
 }
 
 /// 递归拷贝目录（静态内容目录用；不追符号链接，产物目录为普通树）。
@@ -337,6 +276,15 @@ mod tests {
             let plain: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
             writer.start_file("conf/app.toml", plain).expect("add conf");
             writer.write_all(b"key = 1\n").expect("write conf");
+            writer
+                .start_file(
+                    "node_modules/pg/index.js",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .expect("linked dependency");
+            writer
+                .write_all(b"module.exports = 42")
+                .expect("dependency content");
             // 符号链接条目：add_symlink 是 zip 写侧正规 API，读侧用 is_symlink 识别
             let plain_options: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
             writer

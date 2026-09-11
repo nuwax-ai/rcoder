@@ -98,7 +98,10 @@ pub(crate) async fn forward_userapp(
             Ok(v) => v,
             Err(e) => return e.into_response(),
         };
-        if dev_container_absent(&state, &app_id) {
+        if match dev_container_absent(&state, &app_id).await {
+            Ok(absent) => absent,
+            Err(error) => return error.into_response(),
+        } {
             return match classify_dev_absent(&path) {
                 DevAbsentAction::SkipSuccess(SkipKind::CancelTask(task_id)) => {
                     info!(
@@ -172,7 +175,7 @@ pub(crate) async fn forward_userapp(
     match stage {
         UserappStage::Dev => {
             // 停止/查询短路：仅容器不在时生效（容器在则照常转发）
-            if let Some(resp) = dev_absent_short_circuit(&state, &app_id, &path) {
+            if let Some(resp) = dev_absent_short_circuit(&state, &app_id, &path).await {
                 return resp;
             }
             info!(
@@ -263,8 +266,7 @@ path 即身份：path `app_id` 定位目标开发容器（幂等 ensure + 探活
 `X-App-Id` header 要求；URI 原样转发至容器内同形态路由（零改写流式透传）。
 "#,
     responses(
-        (status = 200, description = "探测结果（HttpResult 信封，data 含类型推断与文件清单）", body = HttpResult<serde_json::Value>),
-        (status = 400, description = "app_stage 非 dev / app_id 非法 / 容器侧参数校验失败", body = HttpResult<String>)
+        (status = 200, description = "探测结果（HttpResult 信封，data 含类型推断与文件清单）", body = HttpResult<serde_json::Value>)
     ),
     tag = "Userapp · dev · 工作区与工具链",
 )]
@@ -293,8 +295,7 @@ pub(crate) async fn flat_dev_projects_detect(
 **仅 dev**；定位与转发语义同 [`flat_dev_projects_detect`]。
 "#,
     responses(
-        (status = 200, description = "确认结果（HttpResult 信封）", body = HttpResult<serde_json::Value>),
-        (status = 400, description = "app_stage 非 dev / app_id 非法 / 容器侧参数校验失败", body = HttpResult<String>)
+        (status = 200, description = "确认结果（HttpResult 信封）", body = HttpResult<serde_json::Value>)
     ),
     tag = "Userapp · dev · 工作区与工具链",
 )]
@@ -323,8 +324,7 @@ pub(crate) async fn flat_dev_projects_confirm(
 定位与转发语义同 [`flat_dev_projects_detect`]。
 "#,
     responses(
-        (status = 200, description = "安装结果（HttpResult 信封）", body = HttpResult<serde_json::Value>),
-        (status = 400, description = "app_stage 非 dev / app_id 非法 / 容器侧参数校验失败", body = HttpResult<String>)
+        (status = 200, description = "安装结果（HttpResult 信封）", body = HttpResult<serde_json::Value>)
     ),
     tag = "Userapp · dev · 工作区与工具链",
 )]
@@ -481,7 +481,7 @@ async fn forward_new_endpoint(
                 return HttpResultError::bad_request(e).into_response();
             }
             let explicit_user_id = header_user.or(body_user);
-            if let Some(resp) = dev_absent_short_circuit(state, &app_id, &path) {
+            if let Some(resp) = dev_absent_short_circuit(state, &app_id, &path).await {
                 return resp;
             }
             info!(
@@ -508,7 +508,7 @@ async fn forward_new_endpoint(
                 .into_response();
             };
             let explicit_user_id = header_user.or(query_user);
-            if let Some(resp) = dev_absent_short_circuit(state, &app_id, &path) {
+            if let Some(resp) = dev_absent_short_circuit(state, &app_id, &path).await {
                 return resp;
             }
             info!(
@@ -523,10 +523,15 @@ async fn forward_new_endpoint(
 /// 容器不在时的短路分派（查询类 unavailable / dev-stop skip-success）；
 /// cancel 兜底不可达——tasks 分支已按 query app_id 处理。容器在（或该路径
 /// 无短路语义）返回 `None` 照常转发。
-fn dev_absent_short_circuit(state: &AppState, app_id: &str, path: &str) -> Option<Response> {
+async fn dev_absent_short_circuit(state: &AppState, app_id: &str, path: &str) -> Option<Response> {
     let action = classify_dev_absent(path);
-    if matches!(action, DevAbsentAction::Ensure) || !dev_container_absent(state, app_id) {
+    if matches!(action, DevAbsentAction::Ensure) {
         return None;
+    }
+    match dev_container_absent(state, app_id).await {
+        Ok(false) => return None,
+        Err(error) => return Some(error.into_response()),
+        Ok(true) => {}
     }
     Some(match action {
         DevAbsentAction::SkipSuccess(SkipKind::DevStop) => {
