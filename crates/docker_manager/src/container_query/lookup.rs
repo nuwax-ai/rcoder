@@ -264,7 +264,14 @@ impl DockerManager {
         service_type: &shared_types::ServiceType,
     ) -> DockerResult<Option<ContainerQueryResult>> {
         // 1. 查 Map (如果存在且运行中，直接返回)
-        if let Some(info) = self.containers.get(user_id).await {
+        // 类型校验对齐 find_project_container：containers 键空间被 project_id 与
+        // user_id 共享，撞值时异族条目视为 miss 落实时查询（None 兼容旧条目）
+        if let Some(info) = self.containers.get(user_id).await
+            && info
+                .service_type
+                .as_ref()
+                .is_none_or(|container_service_type| container_service_type == service_type)
+        {
             return Ok(Some(ContainerQueryResult::new(
                 info.container_id.clone(),
                 info.container_name.clone(),

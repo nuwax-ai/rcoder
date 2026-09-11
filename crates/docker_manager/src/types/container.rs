@@ -58,6 +58,12 @@ pub struct DockerContainerConfig {
     /// 容器安全配置（可选，仅 Docker 模式生效），透传到 bollard HostConfig
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security: Option<shared_types::ServiceSecurityConfig>,
+    /// 容器 labels（可选）：结构化身份标签（service-type/identifier），对齐
+    /// Docker Userapp 容器与 K8s build_standard_labels 的身份载体——rcoder
+    /// 重启后 Docker API list 仍可按 label 还原身份（当前消费侧暂未切换，
+    /// 为重启窗口的 label 直读铺路）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<HashMap<String, String>>,
 }
 
 /// 挂载点配置
@@ -119,6 +125,7 @@ impl DockerContainerConfig {
             space_id: None,
             isolation_type: None,
             security: None,
+            labels: None,
         }
     }
 }

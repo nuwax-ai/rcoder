@@ -94,6 +94,11 @@ impl AgentContainerRuntime for ProbeRuntime {
                 status: ContainerRuntimeStatus::Running,
                 created_at: Utc::now(),
                 env_vars: None,
+                service_type: None,
+                project_id: None,
+                user_id: None,
+                pod_id: None,
+                app_id: None,
             })),
             FindBehavior::Missing => Ok(None),
             FindBehavior::Fail => Err(ContainerRuntimeError::ConnectionError(

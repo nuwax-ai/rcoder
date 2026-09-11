@@ -239,6 +239,10 @@ pub async fn startup_cleanup(config: &AppConfig) {
 }
 
 pub async fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(String, String)> {
+    // K8s 部署下命名真源是 kubernetes_config（pod/PVC 前缀优先读它，见
+    // KubernetesRuntime::service_container_prefix）——容器名反解必须与创建侧
+    // 同源，否则前缀配置漂移时反解系统性失准。k8s 配置缺失的键回退
+    // docker 多镜像链（compose 部署的主源，行为不变）。
     let docker_config = config
         .docker_config
         .as_ref()
@@ -255,9 +259,20 @@ pub async fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(Strin
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get ComputerAgentRunner service config: {e}"))?;
 
+    let k8s_rcoder = config
+        .kubernetes_config
+        .as_ref()
+        .and_then(|k8s| k8s.get_service_config(&shared_types::ServiceType::WebAgentRunner))
+        .map(|cfg| cfg.container_prefix().to_string());
+    let k8s_computer = config
+        .kubernetes_config
+        .as_ref()
+        .and_then(|k8s| k8s.get_service_config(&shared_types::ServiceType::ComputerAgentRunner))
+        .map(|cfg| cfg.container_prefix().to_string());
+
     Ok((
-        rcoder_cfg.container_prefix().to_string(),
-        computer_cfg.container_prefix().to_string(),
+        k8s_rcoder.unwrap_or_else(|| rcoder_cfg.container_prefix().to_string()),
+        k8s_computer.unwrap_or_else(|| computer_cfg.container_prefix().to_string()),
     ))
 }
 

@@ -235,14 +235,22 @@ impl KubernetesRuntime {
         Ok(rx)
     }
 
-    /// 查询 app 相关的 K8s Events（调度/拉取/启动/崩溃）。
-    /// 过滤 involvedObject.name 以 deployment 名开头的 events，按时间倒序，取最近 50 条。
+    /// 查询 app 相关的 K8s Events（调度/拉取/启动/崩溃），按时间倒序，取最近 50 条。
+    ///
+    /// 归属判定 = **确定性对象名单 + 等值匹配**（不用名字前缀）：
+    /// - 名单一：六个确定性派生对象名（Deployment 本体 / -config / -secret /
+    ///   -svc / -route / -nodeport）+ workspace PVC；
+    /// - 名单二：该 app 的 Pod 名集合（Deployment hash 名不可预测，按
+    ///   `rcoder.io/app-id` 标签实查一次）。
+    ///
+    /// 前缀匹配已被证伪：`rcoder-app-3` 是 `rcoder-app-39-xxx` 的前缀，数字型
+    /// app_id 互为前缀即串台；等值名单对任何 app_id 形态恒正确。
     pub async fn app_events(
         &self,
         app_id: &str,
     ) -> ContainerRuntimeResult<Vec<container_runtime_api::AppEventInfo>> {
         use k8s_openapi::api::core::v1::Event;
-        let deploy_name = self.app_deployment_name(app_id);
+        let object_names = self.app_event_object_names(app_id).await;
         let events: Api<Event> = Api::namespaced(self.client.clone(), &self.namespace);
         // list namespace 内所有 events（K8s 默认保留 ~1h，数量有限）
         let list = events
@@ -254,8 +262,7 @@ impl KubernetesRuntime {
             .into_iter()
             .filter_map(|ev| {
                 let name = ev.involved_object.name.as_ref()?;
-                // 只要关联对象名以 deployment 名开头（覆盖 Pod rcoder-app-{id}-xxx + Deployment 本身）
-                if !name.starts_with(&deploy_name) {
+                if !event_belongs_to_app(name, &object_names) {
                     return None;
                 }
                 Some(container_runtime_api::AppEventInfo {
@@ -276,6 +283,31 @@ impl KubernetesRuntime {
         result.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         result.truncate(50);
         Ok(result)
+    }
+
+    /// app 全部关联 K8s 对象名集合（事件归属白名单）。
+    async fn app_event_object_names(&self, app_id: &str) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::from([
+            self.app_deployment_name(app_id),
+            self.app_config_name(app_id),
+            self.app_secret_name(app_id),
+            self.app_service_name(app_id),
+            self.app_http_route_name(app_id),
+            self.app_nodeport_name(app_id),
+        ]);
+        if let Ok(pvc) = self.app_workspace_pvc_name(app_id) {
+            names.insert(pvc);
+        }
+        // Pod 名 = {deploy}-{rs-hash}-{pod-hash} 不可预测——按 app-id 标签实查
+        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
+        if let Ok(pods) = self.pods_api().list(&lp).await {
+            for pod in pods.items {
+                if let Some(name) = pod.metadata.name {
+                    names.insert(name);
+                }
+            }
+        }
+        names
     }
 
     /// 查询 app 实时资源用量（CPU/内存）。
@@ -396,5 +428,53 @@ impl KubernetesRuntime {
             cpu_limit_cores: limit_cpu,
             mem_limit_bytes: limit_mem,
         })
+    }
+}
+
+/// 事件关联对象名是否属于该 app（等值白名单匹配，纯函数）。
+fn event_belongs_to_app(name: &str, object_names: &std::collections::HashSet<String>) -> bool {
+    object_names.contains(name)
+}
+
+#[cfg(test)]
+mod app_event_tests {
+    use super::event_belongs_to_app;
+    use std::collections::HashSet;
+
+    /// app 3 的名单必须覆盖六派生名 + Pod 名，且不含 app 39 的任何对象名——
+    /// 数字型 app_id 互为前缀是旧 `starts_with` 方案的串台根源，等值匹配恒免疫。
+    #[test]
+    fn exact_name_list_isolates_numeric_prefix_app_ids() {
+        let names: HashSet<String> = [
+            "rcoder-app-3",
+            "rcoder-app-3-config",
+            "rcoder-app-3-secret",
+            "rcoder-app-3-svc",
+            "rcoder-app-3-route",
+            "rcoder-app-3-nodeport",
+            "rcoder-app-3-6f9c8d7b5-x2p4q", // Pod（hash 名，来自标签实查）
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        for hit in [
+            "rcoder-app-3",
+            "rcoder-app-3-svc",
+            "rcoder-app-3-6f9c8d7b5-x2p4q",
+        ] {
+            assert!(event_belongs_to_app(hit, &names), "{hit} should match");
+        }
+        // app 39 的对象名（deployment/pod/svc）一个都不命中
+        for miss in [
+            "rcoder-app-39",
+            "rcoder-app-39-64dd4c4879-w6lrt",
+            "rcoder-app-39-svc",
+            "rcoder-app-39-config",
+        ] {
+            assert!(!event_belongs_to_app(miss, &names), "{miss} must NOT match");
+        }
+        // builder pod（STS 名形态）也不在 app 名单内
+        assert!(!event_belongs_to_app("rcoder-app-builder-3-0", &names));
     }
 }

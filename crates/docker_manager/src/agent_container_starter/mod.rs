@@ -140,7 +140,12 @@ impl<'a> AgentContainerStarter<'a> {
             .name_prefix(service_config.container_prefix())
             .work_dir(service_config.work_dir.clone())
             .network_mode(service_config.network_mode.clone())
-            .auto_remove(true);
+            .auto_remove(true)
+            // 结构化身份 label（对齐 K8s build_standard_labels / Docker Userapp
+            // 容器的身份载体）：rcoder 重启后 Docker API list 按 label 还原身份
+            // （消费侧暂未切换，铺重启窗口的 label 直读）
+            .label("service-type", service_type.to_string())
+            .label("identifier", container_id.clone());
 
         // 添加隔离类型相关配置
         if let Some(ref pid) = pod_id {

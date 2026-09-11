@@ -76,6 +76,17 @@ impl KubernetesRuntime {
                     })
                     .unwrap_or_else(Utc::now);
 
+                // 标签直读身份（与查询的 service_type 一致；标签缺失时回退查询
+                // 类型，防御 bare-pod 等历史形态）
+                let (label_type, label_slots) = match pod.metadata.labels.as_ref() {
+                    Some(labels) => super::k8s_service::container_identity_from_labels(labels),
+                    None => (
+                        None,
+                        container_runtime_api::ContainerIdentitySlots::default(),
+                    ),
+                };
+                let fallback_slots =
+                    container_runtime_api::slots_from_identifier(service_type, identifier);
                 let pod_info = RuntimeContainerInfo {
                     container_id: uid,
                     // agent-runner 走 STS：pod 名 = {sts_name}-0，但 container_name 用作寻址基名
@@ -87,6 +98,11 @@ impl KubernetesRuntime {
                     status,
                     created_at,
                     env_vars: None,
+                    service_type: label_type.or_else(|| Some(service_type.clone())),
+                    project_id: label_slots.project_id.or(fallback_slots.project_id),
+                    user_id: label_slots.user_id.or(fallback_slots.user_id),
+                    pod_id: label_slots.pod_id.or(fallback_slots.pod_id),
+                    app_id: label_slots.app_id.or(fallback_slots.app_id),
                 };
 
                 // Update cache if running
@@ -263,16 +279,17 @@ impl KubernetesRuntime {
             let status = Self::extract_pod_status(&pod);
             let metadata = &pod.metadata;
 
-            // 从 Pod 的 labels 中提取环境变量信息
+            // 从 Pod 的 labels 中提取环境变量信息 + 结构化身份（标签直读）
+            let empty_labels = std::collections::BTreeMap::new();
+            let labels = metadata.labels.as_ref().unwrap_or(&empty_labels);
             let mut env_vars = std::collections::HashMap::new();
-            if let Some(labels) = &metadata.labels {
-                if let Some(project_id) = labels.get("project_id") {
-                    env_vars.insert("PROJECT_ID".to_string(), project_id.clone());
-                }
-                if let Some(user_id) = labels.get("user_id") {
-                    env_vars.insert("USER_ID".to_string(), user_id.clone());
-                }
+            if let Some(project_id) = labels.get("project_id") {
+                env_vars.insert("PROJECT_ID".to_string(), project_id.clone());
             }
+            if let Some(user_id) = labels.get("user_id") {
+                env_vars.insert("USER_ID".to_string(), user_id.clone());
+            }
+            let (service_type, slots) = super::k8s_service::container_identity_from_labels(labels);
 
             let pod_info = RuntimeContainerInfo {
                 container_id: metadata.uid.clone().unwrap_or_default(),
@@ -299,6 +316,11 @@ impl KubernetesRuntime {
                     })
                     .unwrap_or_else(Utc::now),
                 env_vars: Some(env_vars),
+                service_type,
+                project_id: slots.project_id,
+                user_id: slots.user_id,
+                pod_id: slots.pod_id,
+                app_id: slots.app_id,
             };
             result.push(pod_info);
         }

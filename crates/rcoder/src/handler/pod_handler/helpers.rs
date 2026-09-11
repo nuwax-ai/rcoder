@@ -487,7 +487,8 @@ pub(crate) fn is_container_running(status: &str) -> bool {
 }
 
 /// userApp dev 开发容器定位（agent 族 status/stop 共享前言）：
-/// project 映射优先，miss 走 UserappBuilder 实时查（只读，不触发探活自愈）。
+/// project 映射优先（带归属交叉校验），miss 走 UserappBuilder 实时查（只读，
+/// 不触发探活/ensure 自愈）。
 ///
 /// - `Ok(Some)`：定位成功
 /// - `Ok(None)`：容器不存在（调用方决定 not_alive / ERR_CONTAINER_NOT_FOUND）
@@ -499,6 +500,15 @@ pub(crate) async fn resolve_userapp_dev_container(
     log_tag: &str,
 ) -> Result<Option<ContainerBasicInfo>, AppError> {
     if let Some(info) = state.get_project(app_id).and_then(|p| p.container_info()) {
+        // 归属交叉校验（cross_verify_registration 同款）：注册表被跨族污染时
+        // （生产 pod 地址），探活/remediation 不一定触发（生产容器 60000 同样
+        // 应答），此处主动以带类型分流的 find 真实值比对刷新；find 失败/非
+        // Running 返回 None 时维持注册值——不吞错、不伪装"不存在"
+        if let Some(updated) =
+            crate::userapp_builder::cross_verify_registration(state, app_id, &info).await
+        {
+            return Ok(Some(updated));
+        }
         return Ok(Some(info));
     }
     match state

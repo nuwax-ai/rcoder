@@ -117,16 +117,18 @@ impl K8sPodOps for KubernetesRuntime {
         let status = Self::extract_pod_status(pod);
         let metadata = &pod.metadata;
 
-        // 从 Pod 的 labels 中提取环境变量信息
+        // 从 Pod 的 labels 中提取环境变量信息 + 结构化身份（标签直读，消费方
+        // 不再从容器名反解）
+        let empty_labels = std::collections::BTreeMap::new();
+        let labels = metadata.labels.as_ref().unwrap_or(&empty_labels);
         let mut env_vars = std::collections::HashMap::new();
-        if let Some(labels) = &metadata.labels {
-            if let Some(project_id) = labels.get("project_id") {
-                env_vars.insert("PROJECT_ID".to_string(), project_id.clone());
-            }
-            if let Some(user_id) = labels.get("user_id") {
-                env_vars.insert("USER_ID".to_string(), user_id.clone());
-            }
+        if let Some(project_id) = labels.get("project_id") {
+            env_vars.insert("PROJECT_ID".to_string(), project_id.clone());
         }
+        if let Some(user_id) = labels.get("user_id") {
+            env_vars.insert("USER_ID".to_string(), user_id.clone());
+        }
+        let (service_type, slots) = super::k8s_service::container_identity_from_labels(labels);
 
         RuntimeContainerInfo {
             container_id: metadata.uid.clone().unwrap_or_default(),
@@ -152,6 +154,11 @@ impl K8sPodOps for KubernetesRuntime {
                 })
                 .unwrap_or_else(Utc::now),
             env_vars: Some(env_vars),
+            service_type,
+            project_id: slots.project_id,
+            user_id: slots.user_id,
+            pod_id: slots.pod_id,
+            app_id: slots.app_id,
         }
     }
 

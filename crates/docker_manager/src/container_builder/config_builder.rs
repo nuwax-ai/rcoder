@@ -49,6 +49,8 @@ pub struct ContainerConfigBuilder {
     isolation_type: Option<String>,
     // 容器安全配置（可选，仅 Docker 模式生效）
     security: Option<ServiceSecurityConfig>,
+    // 容器 labels（身份标签等）
+    labels: Option<HashMap<String, String>>,
 }
 
 impl ContainerConfigBuilder {
@@ -79,6 +81,7 @@ impl ContainerConfigBuilder {
             space_id: None,
             isolation_type: None,
             security: None,
+            labels: None,
         }
     }
 
@@ -219,6 +222,14 @@ impl ContainerConfigBuilder {
         self
     }
 
+    /// 附加容器 label（身份标签等；重复键后者覆盖）
+    pub fn label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.labels
+            .get_or_insert_with(HashMap::new)
+            .insert(key.into(), value.into());
+        self
+    }
+
     /// 构建 DockerContainerConfig
     ///
     /// # Returns
@@ -264,6 +275,7 @@ impl ContainerConfigBuilder {
             space_id: self.space_id,
             isolation_type: self.isolation_type,
             security: self.security,
+            labels: self.labels,
         };
 
         debug!(

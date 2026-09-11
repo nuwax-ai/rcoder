@@ -243,6 +243,68 @@ pub struct RuntimeContainerInfo {
     pub created_at: DateTime<Utc>,
     /// 容器环境变量（可选，用于获取 project_id 等信息）
     pub env_vars: Option<HashMap<String, String>>,
+    /// 容器服务类型（结构化身份，消费方不再从 container_name 反解）：
+    /// K8s 恒 `Some`（pod 标签 `rcoder.io/service-type` 直读）；Docker 为内存
+    /// 缓存值（rcoder 生命周期内 `Some`，重启窗口 `None` 由名字反解兜底）。
+    pub service_type: Option<ServiceType>,
+    /// 身份槽位（与创建入参一一对应，**语义单一不兼任**——派生定位键走
+    /// [`RuntimeContainerInfo::identity_key`] 的官方优先级，消费方不自行猜测）：
+    pub project_id: Option<String>,
+    /// computer 族用户标识
+    pub user_id: Option<String>,
+    /// 共享子 pod 标识（定位优先级最高）
+    pub pod_id: Option<String>,
+    /// userapp / userapp-builder 的 app 标识
+    pub app_id: Option<String>,
+}
+
+/// 身份槽位组（填充侧的中间结构；单值标识按 [`slots_from_identifier`] 还原）。
+#[derive(Debug, Clone, Default)]
+pub struct ContainerIdentitySlots {
+    pub project_id: Option<String>,
+    pub user_id: Option<String>,
+    pub pod_id: Option<String>,
+    pub app_id: Option<String>,
+}
+
+/// 单值标识按服务类型还原到语义槽位。
+///
+/// 两个"身份坍缩为单值"的来源共用：K8s 标签 `rcoder.io/identifier`（写入侧
+/// 即 container_identifier 派生值）与 Docker 缓存主键（ContainerConfigBuilder
+/// 的 project_id 槽存的就是派生 identifier）。computer 场景下独立容器（user_id
+/// 派生）与共享 pod（pod_id 派生）在单值上不可分，归 user_id 槽——键值恒与
+/// 创建时命名一致（identity_key 语义正确），槽位语义在该场景有损（注释声明）。
+pub fn slots_from_identifier(
+    service_type: &ServiceType,
+    identifier: &str,
+) -> ContainerIdentitySlots {
+    let mut slots = ContainerIdentitySlots::default();
+    match service_type {
+        ServiceType::WebAgentRunner => slots.project_id = Some(identifier.to_string()),
+        ServiceType::ComputerAgentRunner => slots.user_id = Some(identifier.to_string()),
+        ServiceType::Userapp | ServiceType::UserappBuilder => {
+            slots.app_id = Some(identifier.to_string())
+        }
+    }
+    slots
+}
+
+impl RuntimeContainerInfo {
+    /// 结构化身份 → 定位键（复用 `ServiceType::container_identifier` 官方优先级：
+    /// pod_id > 类型槽位）。`service_type` 或槽位缺失（Docker 重启窗口）返回
+    /// None，调用方落名字反解兜底。
+    pub fn identity_key(&self) -> Option<&str> {
+        let service_type = self.service_type.as_ref()?;
+        // app_id 槽映射到 container_identifier 的 project_id 参数位
+        //（userapp 族的标识语义经该参数承载，见其文档）
+        service_type
+            .container_identifier(
+                self.pod_id.as_deref(),
+                self.user_id.as_deref(),
+                self.project_id.as_deref().or(self.app_id.as_deref()),
+            )
+            .ok()
+    }
 }
 
 /// 已被移除的容器信息（用于清理关联资源）
@@ -491,4 +553,57 @@ pub struct AppEventInfo {
     pub object: String,
     /// 发生次数
     pub count: i32,
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    /// 单值标识按类型还原槽位：语义单一不兼任——web→project_id、
+    /// computer→user_id、userapp 两族→app_id；pod_id 不由单值产生。
+    #[test]
+    fn slots_from_identifier_routes_by_service_type() {
+        let s = slots_from_identifier(&ServiceType::WebAgentRunner, "proj-1");
+        assert_eq!(s.project_id.as_deref(), Some("proj-1"));
+        assert!(s.user_id.is_none() && s.app_id.is_none() && s.pod_id.is_none());
+
+        let s = slots_from_identifier(&ServiceType::ComputerAgentRunner, "user-6");
+        assert_eq!(s.user_id.as_deref(), Some("user-6"));
+        assert!(s.project_id.is_none() && s.app_id.is_none());
+
+        for st in [ServiceType::Userapp, ServiceType::UserappBuilder] {
+            let s = slots_from_identifier(&st, "39");
+            assert_eq!(s.app_id.as_deref(), Some("39"), "{st}");
+            assert!(s.project_id.is_none() && s.user_id.is_none(), "{st}");
+        }
+    }
+
+    /// identity_key 复用 container_identifier 官方优先级：pod_id 最高，
+    /// userapp 族经 app_id 槽（映射 project_id 参数位）。
+    #[test]
+    fn identity_key_uses_official_priority() {
+        let mut info = RuntimeContainerInfo {
+            container_id: "c".into(),
+            container_name: "n".into(),
+            container_ip: "127.0.0.1".into(),
+            status: ContainerRuntimeStatus::Running,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            env_vars: None,
+            service_type: Some(ServiceType::UserappBuilder),
+            project_id: None,
+            user_id: None,
+            pod_id: None,
+            app_id: Some("app-23".into()),
+        };
+        assert_eq!(info.identity_key(), Some("app-23"));
+
+        // pod_id 槽优先于类型槽位
+        info.pod_id = Some("pod-9".into());
+        info.user_id = Some("user-6".into());
+        assert_eq!(info.identity_key(), Some("pod-9"));
+
+        // service_type 缺失（Docker 重启窗口）→ None（消费方落反解兜底）
+        info.service_type = None;
+        assert_eq!(info.identity_key(), None);
+    }
 }

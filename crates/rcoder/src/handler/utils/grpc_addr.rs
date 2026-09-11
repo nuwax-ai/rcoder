@@ -56,7 +56,12 @@ pub fn extract_grpc_addr(service_url: &str) -> Result<String, AppError> {
 ///
 /// The configured prefix is the source of truth. Keep the longest configured
 /// prefix first so a prefix like `rcoder` does not steal
-/// `rcoder-computer-agent-runner-*` names.
+/// `rcoder-computer-agent-runner-*` names. Userapp 族前缀与创建侧同源
+/// （部署名/STS 名硬编码 `container_prefix()`，不走镜像配置），同样参与
+/// 最长前缀匹配——`rcoder-app-builder-` 先于 `rcoder-app-` 命中。
+/// 此函数是**名字反解兜底**（输入为裸容器名的场景：SSE 会话注册名、
+/// 存储记录名）；拿到 `RuntimeContainerInfo` 的消费方优先读结构化身份
+/// 字段，勿走此路径。
 pub fn container_identity_from_name<'a>(
     container_name: &'a str,
     rcoder_prefix: &str,
@@ -68,6 +73,14 @@ pub fn container_identity_from_name<'a>(
             ServiceType::ComputerAgentRunner,
         ),
         (rcoder_prefix.to_string(), ServiceType::WebAgentRunner),
+        (
+            ServiceType::UserappBuilder.container_prefix().to_string(),
+            ServiceType::UserappBuilder,
+        ),
+        (
+            ServiceType::Userapp.container_prefix().to_string(),
+            ServiceType::Userapp,
+        ),
     ];
     candidates.sort_by_key(|candidate| Reverse(candidate.0.len()));
     candidates.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
@@ -214,5 +227,50 @@ mod tests {
             container_identity_from_name("rcoder-k8s-project-1", "rcoder-k8s", "computer").unwrap();
         assert_eq!(identifier, "project-1");
         assert_eq!(service_type, ServiceType::WebAgentRunner);
+    }
+
+    /// userapp 两族反解兜底：builder 先于生产命中（最长前缀），app_id 正确剥离。
+    #[test]
+    fn test_container_identity_userapp_families() {
+        let (id, st) = container_identity_from_name(
+            "rcoder-app-builder-23",
+            "web-agent-runner",
+            "computer-agent-runner",
+        )
+        .unwrap();
+        assert_eq!((id, &st), ("23", &ServiceType::UserappBuilder));
+
+        let (id, st) = container_identity_from_name(
+            "rcoder-app-39",
+            "web-agent-runner",
+            "computer-agent-runner",
+        )
+        .unwrap();
+        assert_eq!((id, &st), ("39", &ServiceType::Userapp));
+    }
+
+    /// legacy "rcoder" 前缀配置下，builder/生产名不被 web 前缀吞掉
+    /// （"rcoder-app-builder-23" 若被 "rcoder-" 剥走会误判 WebAgentRunner，
+    /// identifier 残留 "app-builder-23"）。
+    #[test]
+    fn test_container_identity_legacy_prefix_does_not_swallow_userapp() {
+        let (id, st) = container_identity_from_name(
+            "rcoder-app-builder-23",
+            "rcoder",
+            "computer-agent-runner",
+        )
+        .unwrap();
+        assert_eq!((id, &st), ("23", &ServiceType::UserappBuilder));
+
+        let (id, st) =
+            container_identity_from_name("rcoder-app-39", "rcoder", "computer-agent-runner")
+                .unwrap();
+        assert_eq!((id, &st), ("39", &ServiceType::Userapp));
+
+        // web 容器名照常解析
+        let (id, st) =
+            container_identity_from_name("rcoder-project-1", "rcoder", "computer-agent-runner")
+                .unwrap();
+        assert_eq!((id, &st), ("project-1", &ServiceType::WebAgentRunner));
     }
 }

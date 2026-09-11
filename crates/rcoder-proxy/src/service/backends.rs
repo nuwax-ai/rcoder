@@ -324,8 +324,11 @@ impl PingoraProxyService {
         }
 
         // 2. 回退到 vnc_backends/project_backends（向后兼容）
-        // 优先使用 pod_id
+        // pod_id 是 computer 共享子 pod 语义，仅 computer 查询下用它回退——
+        // vnc_backends 混存 user_id/pod_id 键（均 computer 容器），非 computer
+        // 查询误用 pod_id 直查会撞 user_id 键空间拿到别人的后端
         if let Some(pid) = pod_id
+            && matches!(service_type, shared_types::ServiceType::ComputerAgentRunner)
             && let Some(ip) = self.vnc_backends.get(pid)
         {
             return Some(ip.value().clone());

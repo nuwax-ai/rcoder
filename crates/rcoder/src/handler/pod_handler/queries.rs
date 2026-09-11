@@ -46,13 +46,12 @@ pub async fn pod_count(
             continue;
         }
 
-        match container_identity_from_name(
-            &container.container_name,
-            rcoder_prefix,
-            computer_prefix,
-        )
-        .map(|(_, service_type)| service_type)
-        {
+        // 结构化身份字段优先（K8s 标签直读恒有）；缺失（Docker 重启窗口）落名字反解兜底
+        let identity_service_type = container.service_type.clone().or_else(|| {
+            container_identity_from_name(&container.container_name, rcoder_prefix, computer_prefix)
+                .map(|(_, service_type)| service_type)
+        });
+        match identity_service_type {
             Some(ServiceType::WebAgentRunner) => rcoder_count += 1,
             Some(ServiceType::ComputerAgentRunner) => computer_count += 1,
             // Userapp/UserappBuilder 容器不计入 agent 统计
@@ -141,22 +140,34 @@ pub async fn pod_list(
 
         let stored_record = stored_map.get(&docker_container.container_id);
 
-        // 确定服务类型
-        let container_identity = container_identity_from_name(
+        // 确定服务类型：结构化字段优先（K8s 标签直读恒有；userapp 族从
+        // "Unknown" 修正为真实类型），缺失（Docker 重启窗口）落名字反解兜底
+        let fallback_identity = container_identity_from_name(
             &docker_container.container_name,
             rcoder_prefix,
             computer_prefix,
         );
-        let service_type = container_identity
+        let service_type = docker_container
+            .service_type
             .as_ref()
-            .map(|(_, service_type)| service_type.to_string())
+            .map(|st| st.to_string())
+            .or_else(|| {
+                fallback_identity
+                    .as_ref()
+                    .map(|(_, service_type)| service_type.to_string())
+            })
             .unwrap_or_else(|| "Unknown".to_string());
 
-        // 从容器名称提取 user_id（如果是 computer-agent-runner-{user_id}）
-        let user_id = match container_identity {
-            Some((identifier, ServiceType::ComputerAgentRunner)) => Some(identifier.to_string()),
-            _ => None,
-        };
+        // computer 族用户标识：结构化槽位优先，反解兜底
+        let user_id = docker_container
+            .user_id
+            .clone()
+            .or_else(|| match fallback_identity {
+                Some((identifier, ServiceType::ComputerAgentRunner)) => {
+                    Some(identifier.to_string())
+                }
+                _ => None,
+            });
 
         // 获取项目ID和用户ID（从存储或Docker容器信息）
         let project_id = stored_record

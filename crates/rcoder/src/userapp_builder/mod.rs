@@ -388,6 +388,11 @@ mod remediation_tests {
             status: ContainerRuntimeStatus::Running,
             created_at: Utc::now(),
             env_vars: None,
+            service_type: Some(ServiceType::UserappBuilder),
+            project_id: None,
+            user_id: None,
+            pod_id: None,
+            app_id: Some("app-1".to_string()),
         }
     }
 

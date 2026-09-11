@@ -134,6 +134,36 @@ const LABEL_PREFIX: &str = "app.kubernetes.io";
 /// RCoder 自定义标签前缀
 const RCODER_LABEL_PREFIX: &str = "rcoder.io";
 
+/// 从 pod 标签直读容器身份（service_type + 语义槽位）。
+///
+/// 与 [`build_standard_labels`] 对偶的读取侧：STS 族 pod 经 template 继承恒带
+/// `rcoder.io/service-type` 与 `rcoder.io/identifier`，list/get 响应的
+/// `metadata.labels` 零成本可得——消费方据此读结构化字段，不再从容器名反解。
+/// 标签缺失/不可解析返回 None（防御：生产 UserApp pod 无此标签，但其不进
+/// STS 枚举面，正常不会到达此处）；identifier 单值按类型经
+/// [`container_runtime_api::slots_from_identifier`] 还原槽位。
+pub(crate) fn container_identity_from_labels(
+    labels: &BTreeMap<String, String>,
+) -> (
+    Option<ServiceType>,
+    container_runtime_api::ContainerIdentitySlots,
+) {
+    let Some(service_type) = labels
+        .get(&format!("{RCODER_LABEL_PREFIX}/service-type"))
+        .and_then(|v| v.parse::<ServiceType>().ok())
+    else {
+        return (
+            None,
+            container_runtime_api::ContainerIdentitySlots::default(),
+        );
+    };
+    let slots = labels
+        .get(&format!("{RCODER_LABEL_PREFIX}/identifier"))
+        .map(|id| container_runtime_api::slots_from_identifier(&service_type, id))
+        .unwrap_or_default();
+    (Some(service_type), slots)
+}
+
 /// 构建 K8s 标准标签
 ///
 /// 根据 Kubernetes 推荐标签规范，为资源添加标准标签：

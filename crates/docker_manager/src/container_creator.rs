@@ -68,6 +68,7 @@ impl<'a> ContainerCreator<'a> {
         let resource_limits = config.resource_limits.clone();
         let security = config.security.clone();
         let extra_mounts = config.extra_mounts.clone();
+        let config_labels = config.labels;
 
         // 1. 生成容器名称
         let container_identifier = config.pod_id.as_ref().unwrap_or(&project_id);
@@ -144,6 +145,11 @@ impl<'a> ContainerCreator<'a> {
         if let Some(entry) = entrypoint {
             container_body.entrypoint = Some(entry);
         }
+        // 身份 label 纯透传：service-type/identifier 由 starter（持有完整创建
+        // 身份）经 DockerContainerConfig.labels 组装——对齐 Docker Userapp 容器
+        // 与 K8s build_standard_labels 的身份载体，rcoder 重启后 Docker API list
+        // 仍可按 label 还原身份（当前消费侧未切换，铺重启窗口 label 直读）
+        container_body.labels = config_labels;
 
         // 10. 创建并启动容器
         debug!(
