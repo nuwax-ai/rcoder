@@ -28,7 +28,7 @@ pub use manifest::{
 // handlers 域同样要走阻塞池版扫描（manifest 是本模块私有子模块，够不到其内部项）
 pub(crate) use manifest::discover_projects_async;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use file_server::error::{AppError, AppResult};
@@ -373,7 +373,20 @@ pub async fn precheck_dev_workspace(
     };
     if !has_entries {
         return Err(DevPrecheckError::WorkspaceEmpty(format!(
-            "应用工作区为空，请先创建或导入项目: {}",
+            "userapp workspace is empty: create or import a project first ({})",
+            ws.display()
+        )));
+    }
+    // 非空但没有任何服务目录：与"manifest 全 disabled/语法错"分流——前者
+    // 的修复动作是先放项目（初始化模板/上传），后者才是查 manifest 配置。
+    // 混在一个文案会把排障方向带偏（线上 app 35：空 workspace 被误读成
+    // 接口/manifest 问题）。message 英文（项目惯例：错误码经 i18n 表
+    // error.workspace_* 三语翻译，本地化由调用方按 code 驱动）。
+    if !any_project_manifest(&ws).await {
+        return Err(DevPrecheckError::NoServices(format!(
+            "workspace has no service directories: no project.manifest.toml \
+             found under {} — initialize a project template first, or place \
+             a project directory containing project.manifest.toml",
             ws.display()
         )));
     }
@@ -386,6 +399,25 @@ pub async fn precheck_dev_workspace(
         ws,
         dev_source_mode,
     })
+}
+
+/// workspace 一级子目录中是否存在任何 `project.manifest.toml`。
+///
+/// 只做文件存在性探测，不解析内容——用于 [`precheck_dev_workspace`] 的
+/// 错误文案分流（"先放项目" vs "查 manifest 配置"）。
+async fn any_project_manifest(ws: &Path) -> bool {
+    let Ok(mut entries) = tokio::fs::read_dir(ws).await else {
+        return false;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if tokio::fs::metadata(entry.path().join("project.manifest.toml"))
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// 异步发起 build 任务（不阻塞，立即返 task_id + 预生成的产物相对路径）。进度事件
@@ -513,7 +545,7 @@ fn required_release_metadata(name: &str) -> AppResult<String> {
         })
 }
 
-async fn hash_file(path: &std::path::Path) -> AppResult<(String, u64)> {
+async fn hash_file(path: &Path) -> AppResult<(String, u64)> {
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncReadExt;
 
@@ -568,7 +600,7 @@ mod truncate_tests {
 mod precheck_tests {
     use super::*;
 
-    fn config_with_root(root: &std::path::Path) -> Arc<file_server::Config> {
+    fn config_with_root(root: &Path) -> Arc<file_server::Config> {
         Arc::new(file_server::Config {
             userapp_workspace_dir: root.to_path_buf(),
             ..Default::default()
@@ -576,7 +608,7 @@ mod precheck_tests {
     }
 
     /// 与 dev_mode 测试同款 manifest fixture（enabled 服务，无 [devrun]）。
-    fn write_manifest(dir: &std::path::Path, service_id: &str) {
+    fn write_manifest(dir: &Path, service_id: &str) {
         let content = format!(
             "schema_version = 1\n\
              [project]\nservice_id = '{service_id}'\nname = '{service_id}'\ntype = 'node'\n\
@@ -624,19 +656,44 @@ mod precheck_tests {
 
         match precheck_dev_workspace("app-7", &cfg).await {
             Err(DevPrecheckError::NoServices(msg)) => {
-                assert!(msg.contains("no enabled services"), "msg={msg}");
-                assert!(msg.contains("fix"), "fix hint expected: {msg}");
-                // 防双前缀回归：e 内部已含 "discover projects in {ws}: "，链路
-                // 标识只加一次——路径/动词各出现一次
-                assert_eq!(
-                    msg.matches("discover projects").count(),
-                    1,
-                    "prefix must not duplicate: {msg}"
-                );
+                // 非空但无任何服务目录 → "先放项目"指引（不走 discover 文案）
+                assert!(msg.contains("no service directories"), "msg={msg}");
+                assert!(msg.contains("project.manifest.toml"), "msg={msg}");
                 assert_eq!(
                     msg.matches("app-7").count(),
                     1,
                     "workspace path must not duplicate: {msg}"
+                );
+            }
+            _ => panic!("expected NoServices"),
+        }
+    }
+
+    /// 有服务目录但全部 disabled → discover 路径原文案（查 manifest 配置的
+    /// fix 指引）——与"没有服务目录"分流的回归锁。
+    #[tokio::test]
+    async fn precheck_all_disabled_keeps_manifest_fix_hint() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = config_with_root(tmp.path());
+        let ws = tmp.path().join("app-7");
+        let svc = ws.join("backend-go");
+        tokio::fs::create_dir_all(&svc).await.expect("mkdir");
+        let manifest = "schema_version = 1\n\n[project]\nservice_id = \"backend-go\"\n\
+             name = \"Go\"\ntype = \"go\"\nenabled = false\n\n\
+             [build]\ncommand = [\"true\"]\nartifact = \"a.zip\"\n\n\
+             [run]\ncommand = [\"true\"]\n";
+        tokio::fs::write(svc.join("project.manifest.toml"), manifest)
+            .await
+            .expect("write manifest");
+
+        match precheck_dev_workspace("app-7", &cfg).await {
+            Err(DevPrecheckError::NoServices(msg)) => {
+                assert!(msg.contains("no enabled services"), "msg={msg}");
+                assert!(msg.contains("fix"), "fix hint expected: {msg}");
+                assert_eq!(
+                    msg.matches("discover projects").count(),
+                    1,
+                    "prefix must not duplicate: {msg}"
                 );
             }
             _ => panic!("expected NoServices"),
