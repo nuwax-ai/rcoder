@@ -299,7 +299,13 @@ impl KubernetesRuntime {
             names.insert(pvc);
         }
         // Pod 名 = {deploy}-{rs-hash}-{pod-hash} 不可预测——按 app-id 标签实查
-        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
+        // （resource_version=0 走 watch cache，与 fetch_app_pod_info 一致——
+        // 事件归属名单只需名字，不需要最新版本）
+        let lp = ListParams {
+            label_selector: Some(format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX)),
+            resource_version: Some("0".to_string()),
+            ..Default::default()
+        };
         if let Ok(pods) = self.pods_api().list(&lp).await {
             for pod in pods.items {
                 if let Some(name) = pod.metadata.name {
