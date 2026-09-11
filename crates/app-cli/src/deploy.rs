@@ -211,10 +211,9 @@ pub(crate) async fn prepare(
     let staging = tempfile::Builder::new()
         .prefix("deploy-")
         .tempdir_in(staging_root)?;
-    let limits = ExtractionLimits::from_env()?;
     let (staging, lease) =
         tokio::task::spawn_blocking(move || -> Result<(tempfile::TempDir, std::fs::File)> {
-            extract_zip_sync(part.path(), staging.path(), limits)?;
+            extract_zip_sync(part.path(), staging.path())?;
             crate::manifest::read_release_lock(staging.path())
                 .context("staged package has no parsable release.lock.toml")?;
             Ok((staging, lease))
@@ -413,10 +412,9 @@ async fn verify_zip_magic(part: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 流式下载到文件，返回内容 sha256。无整体超时（大制品），仅连接超时。
+/// 流式下载到文件，返回内容 sha256。无整体超时与容量限制；保留连接和读取空闲超时。
 async fn download_to_file(url: &str, dest: &Path) -> Result<[u8; 32]> {
-    let max_bytes = budget("APP_DEPLOY_MAX_DOWNLOAD_BYTES", 4 * 1024 * 1024 * 1024)?;
-    let idle = Duration::from_secs(budget("APP_DEPLOY_READ_IDLE_SECONDS", 60)?);
+    let idle = Duration::from_secs(positive_setting("APP_DEPLOY_READ_IDLE_SECONDS", 60)?);
     let client = reqwest::Client::builder()
         .read_timeout(idle)
         .connect_timeout(Duration::from_secs(15))
@@ -434,18 +432,11 @@ async fn download_to_file(url: &str, dest: &Path) -> Result<[u8; 32]> {
         .with_context(|| format!("create {}", dest.display()))?;
     let mut hasher = Sha256::new();
     use futures::StreamExt;
-    let mut downloaded = 0u64;
     while let Some(chunk) = tokio::time::timeout(idle, stream.next())
         .await
         .context("download read idle timeout")?
     {
         let chunk = chunk.context("download stream")?;
-        downloaded = downloaded
-            .checked_add(chunk.len() as u64)
-            .context("download size overflow")?;
-        if downloaded > max_bytes {
-            bail!("download size exceeds limit");
-        }
         hasher.update(&chunk);
         file.write_all(&chunk).await?;
     }
@@ -455,18 +446,7 @@ async fn download_to_file(url: &str, dest: &Path) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-/// 解压 zip（zip-slip 防护：enclosed_name 拒绝越界条目；unix 权限保留）。
-///
-/// 错误 context 附文件首 4 字节 hex——解压层失败（EOCD/InvalidArchive）时自诊断：
-/// 看到非 PK 头（如 7b22636f = `{"co`）即知 body 是错误信封而非 zip。
-#[derive(Clone, Copy)]
-pub(crate) struct ExtractionLimits {
-    total: u64,
-    file: u64,
-    entries: usize,
-}
-
-fn budget(key: &str, default: u64) -> Result<u64> {
+fn positive_setting(key: &str, default: u64) -> Result<u64> {
     match std::env::var(key) {
         Ok(value) => {
             let n: u64 = value.parse().with_context(|| format!("invalid {key}"))?;
@@ -480,30 +460,13 @@ fn budget(key: &str, default: u64) -> Result<u64> {
     }
 }
 
-impl ExtractionLimits {
-    pub(crate) fn from_env() -> Result<Self> {
-        Ok(Self {
-            total: budget("APP_DEPLOY_MAX_EXTRACTED_BYTES", 4 * 1024 * 1024 * 1024)?,
-            file: budget("APP_DEPLOY_MAX_FILE_BYTES", 1024 * 1024 * 1024)?,
-            entries: usize::try_from(budget("APP_DEPLOY_MAX_ENTRIES", 100_000)?)?,
-        })
-    }
-}
-
-pub(crate) fn extract_zip_sync(
-    zip_path: &Path,
-    dest: &Path,
-    limits: ExtractionLimits,
-) -> Result<()> {
-    use std::io::{Read, Write};
+/// Stream ZIP entries without application-level capacity or entry-count quotas.
+/// Paths, symbolic links and executable permissions retain their safety checks.
+pub(crate) fn extract_zip_sync(zip_path: &Path, dest: &Path) -> Result<()> {
+    use std::io::Read;
     let mut archive =
         zip::ZipArchive::new(std::fs::File::open(zip_path)?).context("open artifact zip")?;
-    if archive.len() > limits.entries {
-        bail!("zip entry count exceeds limit");
-    }
-    let mut total = 0u64;
     let mut links = shared_types::archive_links::ArchiveSymlinks::default();
-    let mut buffer = [0u8; 65536];
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         let rel = entry
@@ -515,11 +478,6 @@ pub(crate) fn extract_zip_sync(
             (&mut entry)
                 .take((shared_types::archive_links::MAX_ARCHIVE_LINK_BYTES + 1) as u64)
                 .read_to_string(&mut target)?;
-            let size = target.len() as u64;
-            total = total.checked_add(size).context("zip total overflow")?;
-            if size > limits.file || total > limits.total {
-                bail!("zip extracted size exceeds limit");
-            }
             links.record(&rel, &target)?;
             continue;
         }
@@ -531,19 +489,7 @@ pub(crate) fn extract_zip_sync(
             std::fs::create_dir_all(parent)?;
         }
         let mut out = std::fs::File::create(&out_path)?;
-        let mut size = 0u64;
-        loop {
-            let n = entry.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            size = size.checked_add(n as u64).context("zip size overflow")?;
-            total = total.checked_add(n as u64).context("zip total overflow")?;
-            if size > limits.file || total > limits.total {
-                bail!("zip extracted size exceeds limit");
-            }
-            out.write_all(&buffer[..n])?;
-        }
+        std::io::copy(&mut entry, &mut out).context("extract artifact entry")?;
         #[cfg(unix)]
         if let Some(mode) = entry.unix_mode() {
             use std::os::unix::fs::PermissionsExt;
@@ -736,29 +682,23 @@ format = "jsonl"
     }
 
     #[test]
-    fn zip_limits_count_actual_extracted_bytes_and_entries() {
+    fn extraction_preserves_content_without_quota_configuration() {
         let root = tempfile::tempdir().expect("root");
         let archive = root.path().join("input.zip");
-        std::fs::write(&archive, build_zip(&[("a", "123456"), ("b", "123456")])).expect("zip");
-        for limits in [
-            ExtractionLimits {
-                file: 5,
-                total: 100,
-                entries: 5,
-            },
-            ExtractionLimits {
-                file: 100,
-                total: 10,
-                entries: 5,
-            },
-            ExtractionLimits {
-                file: 100,
-                total: 100,
-                entries: 1,
-            },
-        ] {
-            let out = tempfile::tempdir().expect("out");
-            assert!(extract_zip_sync(&archive, out.path(), limits).is_err());
+        let content = "x".repeat(20000);
+        let names: Vec<_> = (0..16).map(|i| format!("entry-{i}")).collect();
+        let entries: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), content.as_str()))
+            .collect();
+        std::fs::write(&archive, build_zip(&entries)).expect("zip");
+        let out = tempfile::tempdir().expect("out");
+        extract_zip_sync(&archive, out.path()).expect("extract without quota configuration");
+        for name in names {
+            assert_eq!(
+                std::fs::read_to_string(out.path().join(name)).expect("content"),
+                content
+            );
         }
     }
 
@@ -1041,16 +981,7 @@ format = "jsonl"
         zip.finish().expect("finish");
         let out = root.path().join("out");
         std::fs::create_dir_all(&out).expect("out");
-        extract_zip_sync(
-            &path,
-            &out,
-            ExtractionLimits {
-                total: 4096,
-                file: 4096,
-                entries: 100,
-            },
-        )
-        .expect("extract");
+        extract_zip_sync(&path, &out).expect("extract");
         assert!(out.join("node_modules/next").is_symlink());
         assert_eq!(
             std::fs::read_to_string(out.join("node_modules/next/index.js"))

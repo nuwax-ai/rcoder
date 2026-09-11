@@ -171,24 +171,11 @@ pub(super) async fn existing_dev_addr(
         .suffix(".part")
 ```
 
-## R10 · P2 · 下载与解压缺少实际资源预算
+## R10 · 用户修订：取消 app-cli 容量与条目限制
 
-位置：[crates/app-cli/src/deploy.rs:418](/Users/soddy/Documents/git-workspace/rcoder/crates/app-cli/src/deploy.rs:418)
+用户确认由容器／存储环境管理容量，app-cli 不再主动限制下载字节数、解压总量、单文件大小或条目数量。原四个 `APP_DEPLOY_MAX_*` 配置不再读取；保留连接及读取空闲超时、SHA/ZIP/manifest 校验、路径与链接安全、操作临时目录清理。链接目标的路径合法性校验不属于制品容量配额。
 
-触发与后果：截断或慢响应可长期占用任务，大压缩包可持续耗尽磁盘。
-
-修复：默认下载/总解压 4 GiB、单文件 1 GiB、100000 条目、读取空闲 60 秒；实际读写计数超额即失败并清理。
-
-```rust
-    let max_bytes = budget("APP_DEPLOY_MAX_DOWNLOAD_BYTES", 4 * 1024 * 1024 * 1024)?;
-    let idle = Duration::from_secs(budget("APP_DEPLOY_READ_IDLE_SECONDS", 60)?);
-    let client = reqwest::Client::builder()
-        .read_timeout(idle)
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-        .context("build deploy http client")?;
-    let response = client
-```
+回归已改为有效 B 制品超过旧测试限额仍须部署成功，并保留超时和安全故障必须失败的断言。以下全量验收表属于上一轮修复；本次定向证据另记于 Task。
 
 ## R11 · P1 · 正式 HTTP 错误信封与提取器不一致
 

@@ -118,3 +118,12 @@
 ### 用户追加授权：app-cli npm 发版
 
 用户要求 app-cli 逻辑修改后升级版本并打 tag 发布 npm。本次在完成上述本地验收后，将 Cargo.toml 与独立 Cargo.lock 的 app-cli 版本从 0.3.1 升级为 0.3.2；独立 fmt、Clippy 和 99 个测试再次通过。此次版本字段升级晚于镜像验收，镜像证据仍对应当时的 0.3.1 版本标识，业务代码相同。准备推送 app-cli-v0.3.2，由 release-app-cli.yml 构建五平台并发布六包；发布结果须另行核验。
+
+### 用户修订 R10：移除 app-cli 容量与条目限制，发布 0.3.3
+
+- 范围：app-cli 下载与解压，包括本地 build 复用的解压器；移除四个 APP_DEPLOY_MAX_* 限额。保留默认 60 秒读取空闲超时、路径／链接安全和失败清理。
+- 调整固定回归：有效 B 包超过旧测试容量和条目配置必须成功。旧镜像 run `8efa91019a934ec4acfa5939e5c2713b` 失败，作为本需求的修改前红灯。
+- app-cli 升级 0.3.3；单独 fmt、Clippy、测试及双引擎真实 Docker 回归执行后记录，随后打 app-cli-v0.3.3 发布 npm。
+
+- 0.3.3 独立 fmt/Clippy/99 tests 通过；Python 测试工具 9 项通过；Linux release 构建通过。
+- 严格 Docker 双引擎 run `129dccb503274f86b3c0ebc997f4911d`：2/2 passed，无源码漂移或清理错误。测试镜像 `rcoder-app-cli-0.3.3-test:local`；旧四项限额配置保留在测试环境中，超过它们的有效 B 包成功部署。

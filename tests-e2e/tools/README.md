@@ -15,7 +15,8 @@
 
 `hot_contract.py` 使用真实本地 Docker 镜像 `dev-app-runtime:latest`，启动本次 run 标签限定的容器。
 A/B 制品由本机 HTTP 服务器提供；受控阻塞制造并发窗口，断言操作 ID、manifest ID、实际响应、容器 ID。
-故障覆盖 404、截断、SHA、坏 ZIP、缺 lock 和实际写入解压限额。
+故障覆盖 404、截断、SHA、坏 ZIP、缺 lock、读取空闲超时及不安全链接。
+按用户要求，app-cli 不再设置下载／解压容量及条目限额；B 制品超过测试中保留的旧 APP_DEPLOY_MAX_* 配置，必须成功部署。路径和符号链接安全检查仍保留。
 它不调用或替代 AI，不能作为真实 LLM 测试证据。
 
 运行前必须先构建 builder/runtime，并确认 Compose 的 `RCODER_RUNTIME_IMAGE_DIGEST=dev-app-runtime:latest`。

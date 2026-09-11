@@ -233,7 +233,7 @@ fn assemble_deploy_dir(workspace: &Path, tasks: &[BuildTask], deploy_dir: &Path)
 /// 保留 unix 可执行位与**符号链接条目**（standalone 类产物用 symlink 指向
 /// 依赖目录——写成普通文件会破坏模块解析）。
 fn extract_zip(zip_path: &Path, dst: &Path) -> Result<()> {
-    crate::deploy::extract_zip_sync(zip_path, dst, crate::deploy::ExtractionLimits::from_env()?)
+    crate::deploy::extract_zip_sync(zip_path, dst)
 }
 
 /// 递归拷贝目录（静态内容目录用；不追符号链接，产物目录为普通树）。

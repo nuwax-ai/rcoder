@@ -13,7 +13,7 @@
 |R07|SSE 订阅之后产生的终态必须送达；越过快照终态的游标立即结束|
 |R08|stop/cancel 使旧启动代次失效，返回后旧任务不得重新启动|
 |R09|失败及取消清理本操作下载和 staging，不删除活跃操作临时文件|
-|R10|下载和解压有资源预算及读取空闲超时，实际写入计数|
+|R10|按用户修订：app-cli 下载和解压不设置容量／条目限额；保留读取空闲超时、路径安全和失败清理|
 |R11|正式入口错误信封、提取器、OpenAPI 和英文消息一致，兼容入口不变|
 
 测试必须固定行为而非迁就实现。组件竞争测试与 Docker 黑盒验收分别报告；K8s 本轮仅编译和 API 契约测试，实机测试等用户部署后执行。
@@ -31,7 +31,7 @@
 |R07|`stream_close_tests` 五项：订阅/回放期间终态、越界游标、lagged、重连|完整构建链终态 SSE 回放|
 |R08|`stopped_generation_cannot_commit_after_preparation` 与 `stale_preparation_neither_promotes_nor_leaks` 固定启动及目录提交窗口|dev stop/restart/cancel 生命周期场景|
 |R09|`preparation_lease_protects_active_staging_and_reclaims_stale_owned_files`|双引擎每个失败操作均检查 incoming/staging 无残片|
-|R10|`zip_limits_count_actual_extracted_bytes_and_entries`|下载、单文件、总量、条目与 idle 小预算触发|
+|R10|`extraction_preserves_content_without_quota_configuration`|旧限额变量不再阻止有效 B 制品部署；idle 仍失败|
 |R11|正式路由提取器与 OpenAPI 守卫；保留专用错误码|正式入口 HTTP 200＋错误码；旧 TS header、已删除路由及字节流原协议|
 
 `tests-e2e/tools/contracts.py` 是热部署和完整链的必需步骤清单。修改实现不自动修改此清单；缺少步骤即使记录 pass 也失败。每次严格入口冻结测试二进制并记录 SHA256，源码在编译或执行期间变化即判为非冻结验收。

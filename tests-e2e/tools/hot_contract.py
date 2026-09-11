@@ -90,15 +90,14 @@ B = artifact('manifest-B', 'content-B')
 missing = io.BytesIO()
 with zipfile.ZipFile(missing, 'w') as z:
     z.writestr('unrelated.txt', 'no lock')
-def extend_artifact(entries):
-    data = io.BytesIO(A)
-    with zipfile.ZipFile(data, 'a', zipfile.ZIP_DEFLATED) as archive:
-        for name, content in entries:
-            archive.writestr(name, content)
-    return data.getvalue()
-
-
-PAYLOADS = {'/A': A, '/B': B, '/slow': B, '/truncated': B, '/badzip': b'not a zip', '/missing': missing.getvalue(), '/quota': artifact('quota', 'quota', ('oversize', 'x' * 5000)), '/download-limit': b'PK' + b'x' * 16384, '/idle': B, '/orchestrate': artifact('manifest-broken', 'content-broken', command='missing.js'), '/total-limit': extend_artifact([('total1', 'x'*3000), ('total2', 'y'*3000)]), '/entry-limit': extend_artifact([(f'entry{i}', '') for i in range(9)])}
+# B exceeds all former test budgets, using stored data so download size also grows.
+large_b = io.BytesIO(B)
+with zipfile.ZipFile(large_b, 'a', zipfile.ZIP_STORED) as archive:
+    archive.writestr('large-file', 'x' * 20000)
+    for index in range(12):
+        archive.writestr(f'entries/{index}', 'entry')
+B = large_b.getvalue()
+PAYLOADS = {'/A': A, '/B': B, '/slow': B, '/truncated': B, '/badzip': b'not a zip', '/missing': missing.getvalue(), '/idle': B, '/orchestrate': artifact('manifest-broken', 'content-broken', command='missing.js')}
 def link_payload(links):
     data = io.BytesIO(A)
     with zipfile.ZipFile(data, 'a', zipfile.ZIP_DEFLATED) as archive:
@@ -208,7 +207,7 @@ def main():
         result = poll(lambda: terminal('initial-A'))
         check('A identity', result['phase'] == 'running' and result['artifact_release_id'] == 'manifest-A', str(result))
         check('A serves content', poll(lambda: request_http(app, '/')[1] == b'content-A'), 'actual response body')
-        for name, path, sha in [('missing-url', '/404', None), ('truncated', '/truncated', None), ('sha', '/B', '0'*64), ('zip', '/badzip', None), ('manifest', '/missing', None), ('quota', '/quota', None), ('download-limit', '/download-limit', None), ('total-limit', '/total-limit', None), ('entry-limit', '/entry-limit', None), ('idle', '/idle', None), ('link-escape', '/link-escape', None), ('link-cycle', '/link-cycle', None)]:
+        for name, path, sha in [('missing-url', '/404', None), ('truncated', '/truncated', None), ('sha', '/B', '0'*64), ('zip', '/badzip', None), ('manifest', '/missing', None), ('idle', '/idle', None), ('link-escape', '/link-escape', None), ('link-cycle', '/link-cycle', None)]:
             status, _ = submit(path, name, sha)
             check(name + ' accepted', status == 202, str(status))
             result = poll(lambda: terminal(name))
@@ -236,6 +235,7 @@ def main():
         RELEASE.set()
         result = poll(lambda: terminal('winner-B'))
         check('B identity', result['phase'] == 'running' and result['artifact_release_id'] == 'manifest-B', str(result))
+        check('former capacity and entry settings do not reject B', result['phase'] == 'running', 'B exceeds former download, total, file and entry settings')
         check('B serves content', poll(lambda: request_http(app, '/')[1] == b'content-B'), 'actual response body')
         check('container unchanged', docker('inspect', '--format', '{{.Id}}', container) == container, container)
     finally:

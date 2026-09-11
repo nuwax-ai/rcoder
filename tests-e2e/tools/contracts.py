@@ -1,12 +1,12 @@
 """Reviewed acceptance steps. Changing implementation does not change this catalog."""
-FAULTS = ('missing-url', 'truncated', 'sha', 'zip', 'manifest', 'quota', 'download-limit', 'total-limit', 'entry-limit', 'idle', 'link-escape', 'link-cycle')
+FAULTS = ('missing-url', 'truncated', 'sha', 'zip', 'manifest', 'idle', 'link-escape', 'link-cycle')
 HOT = {
     'A accepted', 'A identity', 'A serves content',
     'broken B accepted', 'broken B operation failed',
     'old code and orchestration restored', 'migration reversal never claimed',
     'recovery does not rerun old migrations', 'slow B accepted',
     'concurrent deployment rejected', 'A serves during prepare',
-    'B identity', 'B serves content', 'container unchanged', 'owned resource cleanup',
+    'former capacity and entry settings do not reject B', 'B identity', 'B serves content', 'container unchanged', 'owned resource cleanup',
 } | {name + suffix for name in FAULTS for suffix in (' accepted', ' fails correct operation', ' old content healthy', ' no temporary residue')}
 REQUIRED = {
     'userapp_hot_deployment_builtin_contract': HOT,
