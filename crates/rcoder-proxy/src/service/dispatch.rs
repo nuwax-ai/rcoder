@@ -237,6 +237,7 @@ impl PortProxy {
                     params,
                     &self.app_backends,
                     &self.metrics,
+                    &self.container_lookup,
                 )
                 .await
             }
