@@ -12,7 +12,7 @@
 - [x] 全部门禁与app-cli版本冻结。
 - [x] app-runtime → dev-restart → dev-hot，核验实际产物。
 - [x] 严格userApp及Compose完整验收、定向清理。
-- [ ] 提交、app-cli tag与六包npm发布核验。
+- [x] 提交、app-cli tag与六包npm发布核验；见发布证据。
 
 本轮所有验证命令/结果和环境限制追加于此；前次审查通过不计本次修复验收。
 
@@ -120,7 +120,7 @@
 - [x] D03 准备失败保留旧服务、切换后显式重部署及取消保护；两引擎各69条断言通过。
 - [x] D05 输入校验和平台 env 隔离；组件与完整部署链通过。
 - [x] D06 严格 E2E 必测映射、真实 A/B 与重启验证；最终33/33及54/54通过。
-- [ ] 完整编译/测试、构建及 Compose 冻结验收；提交和 npm 发布仅在全部验收后执行。
+- [x] 完整编译/测试、构建及 Compose 冻结验收；验收完成后提交并发布npm六包，证据见下。
 
 ### D系列组件证据（最终镜像验收尚未执行）
 - 旧冷判据回归：`cargo test -p app_manager --lib lifecycle::deploy_wait`，1通过/3失败，实际复现身份混用、旧成功误放行及失败被健康掩盖；日志 `/tmp/rcoder-deploy-stage-red.log`。
@@ -168,3 +168,11 @@
 - 最后PG feature all-targets check退出0，`/tmp/rcoder-final-pg-check.log`。Workspace1928项、K8s API140项（普通环境门控分别35/5）、app-cli138单测+2真实进程集成、Python62项及所有Clippy/fmt证据见前文。
 - 验收结束后只补齐台账及将Python __pycache__统一忽略，避免新Docker检查脚本生成的字节码混入提交；业务和测试逻辑未变，原始run指纹及报告不改写。
 - K8s仅编译/API契约，无真实集群操作；生产平台与app-runtime镜像需配套升级以启用协议4，本轮不推镜像或平台v*tag。npm主包+五平台包发布待下节记录，不以本地镜像0.3.4冒充已发布。
+
+## app-cli 0.3.4 发布证据
+- 代码及完整依赖契约提交 `7fb06e4efe90079f33a215165115ba4250bd4bdc`，保留此前用户提交；匹配Cargo版本的`app-cli-v0.3.4`已推送，仅触发app-cli发布。
+- [release-app-cli工作流](https://github.com/nuwax-ai/rcoder/actions/runs/34701043669)全部成功：五平台app-cli、Windows pingap、配对schema gate、npm发布和GitHub Release。
+- [六包发布与安装证据](app-cli-v0.3.4-release.json)：npm官方主包+五平台包版本及latest均0.3.4，主包optionalDependencies精确固定同版本；tarball与integrity已记录。
+- 发布后的macOS ARM64和Linux ARM64主包真实安装、执行`app-cli --version`均为0.3.4。Linux在node:22-bookworm-slim中验证，证明npm glibc兼容通道独立于本地trixie app-runtime镜像；验证容器与临时安装目录已清理。其他平台本地执行未冒充通过，CI smoke/pair gate记录保留。
+- 环境甄别：本机Python默认证书链失败后改用系统curl验证TLS；一个macOS x64旧registry缓存短暂仍显示0.3.3，npm具体版本查询与Cache-Control/no-cache的新鲜官方响应均确认0.3.4。保留失败检查日志，未放宽版本/依赖断言或再次发布。
+- 本轮真实K8s运行仍未执行；平台镜像未推送、平台v*tag未创建。npm发布与本地Compose镜像验收分别完成。

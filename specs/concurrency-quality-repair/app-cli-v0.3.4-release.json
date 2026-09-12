@@ -1,0 +1,148 @@
+{
+  "version": "0.3.4",
+  "tag": "app-cli-v0.3.4",
+  "source_commit": "7fb06e4efe90079f33a215165115ba4250bd4bdc",
+  "workflow_url": "https://github.com/nuwax-ai/rcoder/actions/runs/34701043669",
+  "workflow_conclusion": "success",
+  "jobs": [
+    {
+      "name": "meta",
+      "conclusion": "success"
+    },
+    {
+      "name": "build-pingap-windows",
+      "conclusion": "success"
+    },
+    {
+      "name": "build (aarch64-unknown-linux-gnu, ubuntu-latest, true)",
+      "conclusion": "success"
+    },
+    {
+      "name": "build (x86_64-pc-windows-msvc, windows-latest, false)",
+      "conclusion": "success"
+    },
+    {
+      "name": "build (x86_64-unknown-linux-gnu, ubuntu-latest, true)",
+      "conclusion": "success"
+    },
+    {
+      "name": "build (aarch64-apple-darwin, macos-latest, false)",
+      "conclusion": "success"
+    },
+    {
+      "name": "build (x86_64-apple-darwin, macos-latest, false)",
+      "conclusion": "success"
+    },
+    {
+      "name": "pair-gate-windows",
+      "conclusion": "success"
+    },
+    {
+      "name": "publish-npm",
+      "conclusion": "success"
+    },
+    {
+      "name": "release",
+      "conclusion": "success"
+    }
+  ],
+  "packages": {
+    "app-cli": {
+      "name": "@nuwax-ai/app-cli",
+      "version": "0.3.4",
+      "latest": "0.3.4",
+      "os": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "cpu": [
+        "x64",
+        "arm64"
+      ],
+      "integrity": "sha512-+OYOIZcUuDq1/vMVhlarEx73qmWvfmiEfW5LXOnFKYM+hytFAJOtMnqZo/Aotko4LyJQQjF/AfM4E8S0pCr4/w==",
+      "tarball": "https://registry.npmjs.org/@nuwax-ai/app-cli/-/app-cli-0.3.4.tgz",
+      "optionalDependencies": {
+        "@nuwax-ai/app-cli-linux-x64": "0.3.4",
+        "@nuwax-ai/app-cli-darwin-x64": "0.3.4",
+        "@nuwax-ai/app-cli-linux-arm64": "0.3.4",
+        "@nuwax-ai/app-cli-windows-x64": "0.3.4",
+        "@nuwax-ai/app-cli-darwin-arm64": "0.3.4"
+      }
+    },
+    "app-cli-linux-x64": {
+      "name": "@nuwax-ai/app-cli-linux-x64",
+      "version": "0.3.4",
+      "latest": "0.3.4",
+      "os": [
+        "linux"
+      ],
+      "cpu": [
+        "x64"
+      ],
+      "integrity": "sha512-l9eal9mf6unEcbEZJDAQpD1JFOooeQ/26N4R7UT4T2hl+djWgdXwaD6qgiJ+cN3tE8PZikB8KxZxwynHMg6UAw==",
+      "tarball": "https://registry.npmjs.org/@nuwax-ai/app-cli-linux-x64/-/app-cli-linux-x64-0.3.4.tgz"
+    },
+    "app-cli-linux-arm64": {
+      "name": "@nuwax-ai/app-cli-linux-arm64",
+      "version": "0.3.4",
+      "latest": "0.3.4",
+      "os": [
+        "linux"
+      ],
+      "cpu": [
+        "arm64"
+      ],
+      "integrity": "sha512-IzJtGx7KC8DiaNF4qAHxnCzIItvMaIW/PF6+z3x5FYAG8MhjmIKSNXW6pUDYfZSVKVLXkFj9N/9Fe3loqTAUFg==",
+      "tarball": "https://registry.npmjs.org/@nuwax-ai/app-cli-linux-arm64/-/app-cli-linux-arm64-0.3.4.tgz"
+    },
+    "app-cli-darwin-x64": {
+      "name": "@nuwax-ai/app-cli-darwin-x64",
+      "version": "0.3.4",
+      "latest": "0.3.4",
+      "os": [
+        "darwin"
+      ],
+      "cpu": [
+        "x64"
+      ],
+      "integrity": "sha512-vKekj6n1MtXrpXlXInJs1qK9qhGsslgK/sP+68pvTchJQM7UD7Yo6MlIfSF8XUpCz+igqvTkFj+QYDqE0EqfDg==",
+      "tarball": "https://registry.npmjs.org/@nuwax-ai/app-cli-darwin-x64/-/app-cli-darwin-x64-0.3.4.tgz"
+    },
+    "app-cli-darwin-arm64": {
+      "name": "@nuwax-ai/app-cli-darwin-arm64",
+      "version": "0.3.4",
+      "latest": "0.3.4",
+      "os": [
+        "darwin"
+      ],
+      "cpu": [
+        "arm64"
+      ],
+      "integrity": "sha512-jIibfFvjeahyA75u3YnWGpuPEPkvXp3seJv/288w8Yrcgw+JLNzadWJRz3oQitFDY+7Oo7mPrjNkOTpXXqn8zg==",
+      "tarball": "https://registry.npmjs.org/@nuwax-ai/app-cli-darwin-arm64/-/app-cli-darwin-arm64-0.3.4.tgz"
+    },
+    "app-cli-windows-x64": {
+      "name": "@nuwax-ai/app-cli-windows-x64",
+      "version": "0.3.4",
+      "latest": "0.3.4",
+      "os": [
+        "win32"
+      ],
+      "cpu": [
+        "x64"
+      ],
+      "integrity": "sha512-L52p5VnLDm46eX8otM7+b7oHxRjAD+uiytPBCju11Bxs+VipclU/N8tFhXsrFwq9F4kF8QSPcEeLMs54KXCCPQ==",
+      "tarball": "https://registry.npmjs.org/@nuwax-ai/app-cli-windows-x64/-/app-cli-windows-x64-0.3.4.tgz"
+    }
+  },
+  "installation_checks": {
+    "darwin-arm64": "main package installed from official npm; app-cli --version = app-cli 0.3.4",
+    "linux-arm64": "main package installed from official npm in node:22-bookworm-slim; app-cli --version = app-cli 0.3.4",
+    "resources_cleaned": true
+  },
+  "local_verification_limits": [
+    "Other platform runtime validation is limited to the workflow smoke/pair gates; no local Windows or macOS x64 execution.",
+    "No platform v* tag, container image push, or real Kubernetes cluster operation."
+  ]
+}
