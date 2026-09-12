@@ -116,7 +116,7 @@ pub struct ImportProjectForm {
     pub c_id: String,
     /// 目标根目录覆盖（可选）
     pub custom_target_dir: Option<String>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
     /// 项目 zip（multipart 二进制字段）
     #[schema(format = Binary)]
@@ -135,7 +135,7 @@ pub struct UploadFileForm {
     pub file_path: String,
     /// 自定义目标目录（可选；缺省用 user/cid 推导的默认根）
     pub custom_target_dir: Option<String>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
     /// 上传文件（multipart 二进制字段）
     #[schema(format = Binary)]
@@ -152,7 +152,7 @@ pub struct UploadFilesForm {
     pub c_id: String,
     /// 自定义目标目录（可选；缺省用 user/cid 推导的默认根）
     pub custom_target_dir: Option<String>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
     /// 每个文件的目标相对路径（与 files 一一对应，重复字段）
     pub file_paths: Vec<String>,
@@ -171,7 +171,7 @@ pub struct CreateWorkspaceForm {
     /// 工作区模板 zip（可选）
     #[schema(format = Binary)]
     pub file: Option<String>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时工作区即该目录，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时工作区即该目录，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
 }
 
@@ -204,7 +204,7 @@ pub struct CreateWorkspaceV2Form {
     pub skill_names: Option<Vec<String>>,
     /// 强制更新的技能名 (JSON; 传入时按需安装)
     pub update_skill_names: Option<Vec<String>>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时工作区即该目录，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时工作区即该目录，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
 }
 
@@ -221,7 +221,7 @@ pub struct InitProjectTemplateForm {
     pub file: String,
     /// 是否 git init（双开关：GIT_ENABLED 且为 true 才执行）
     pub enable_git: Option<bool>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时工作区即该目录，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时工作区即该目录，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
 }
 
@@ -240,6 +240,6 @@ pub struct PushSkillsForm {
     pub skill_urls: Option<Vec<String>>,
     /// 智能体 ID (有则可能走实体存储; 须同时满足会话已是软链)
     pub agent_id: Option<String>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
 }

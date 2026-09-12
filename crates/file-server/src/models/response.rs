@@ -300,7 +300,7 @@ pub struct PortAllocation {
     pub port: u16,
 }
 
-// ── 文件系统目录浏览 (/fs/roots, /fs/children, 对齐 TS f979df7) ───────────────────
+// ── 文件系统目录浏览 (/fs/roots, /fs/children, 对齐 TS 1.4.5) ───────────────────
 
 /// 目录浏览条目（目录与文件；是否可选由前端按 `isDir` 判断）。
 #[derive(Debug, Clone, serde::Serialize, ToSchema)]

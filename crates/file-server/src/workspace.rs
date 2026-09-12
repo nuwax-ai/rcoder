@@ -175,9 +175,9 @@ pub fn resolve_userapp_dev(
 /// 语义的 `Path::is_absolute()` 仅用于 `/fs/children`（TS 该处用的正是宿主
 /// 语义 `path.isAbsolute`，两侧恰好同构）。
 pub fn normalize_workspace_path(raw: &str) -> AppResult<String> {
-    let field = || serde_json::json!({ "field": "workspacePath" });
-    shared_types::normalize_absolute_dir(raw, "workspacePath")
-        .map_err(|message| AppError::validation_with(&message, field()))
+    shared_types::normalize_absolute_dir(raw, "workspacePath").map_err(|message| {
+        AppError::validation_with(&message, serde_json::json!({ "field": "workspacePath" }))
+    })
 }
 
 #[async_trait]

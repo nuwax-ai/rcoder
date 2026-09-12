@@ -28,7 +28,7 @@ pub(crate) async fn delete_workspace(
     State(state): State<AppState>,
     Json(body): Json<DeleteWorkspaceBody>,
 ) -> Result<Json<Value>, AppError> {
-    // 绑定目录直接定位删除 (不先建后删, 对齐 TS f979df7 deleteWorkspace)
+    // 绑定目录直接定位删除 (不先建后删, 对齐 TS 1.4.5 deleteWorkspace)
     let path = ws_path(
         &state,
         &body.user_id,

@@ -102,7 +102,7 @@ pub(crate) async fn upload_file(
     let mut cid = None;
     let mut file_path = None;
     let mut custom_target_dir = None;
-    let mut workspace_path = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
+    let mut workspace_path = None; // 项目绑定目录 (对齐 TS 1.4.5, 可选 multipart 字段)
     let mut data = None;
     while let Some(field) = multipart
         .next_field()
@@ -158,7 +158,7 @@ pub(crate) async fn upload_files(
     let mut user_id = None;
     let mut cid = None;
     let mut custom_target_dir = None;
-    let mut workspace_path = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
+    let mut workspace_path = None; // 项目绑定目录 (对齐 TS 1.4.5, 可选 multipart 字段)
     let mut file_paths: Vec<String> = Vec::new();
     let mut files_vec = Vec::new();
     while let Some(field) = multipart
@@ -265,7 +265,7 @@ mod tests {
         body
     }
 
-    /// multipart 文本字段 "workspacePath" 通道: 上传文件落绑定目录 (对齐 TS f979df7,
+    /// multipart 文本字段 "workspacePath" 通道: 上传文件落绑定目录 (对齐 TS 1.4.5,
     /// 字段名与 TS multer 同名——拼错大小写在此测试报红)。
     #[tokio::test]
     async fn upload_file_accepts_workspace_path_multipart_field() {

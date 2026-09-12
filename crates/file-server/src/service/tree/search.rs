@@ -179,6 +179,9 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
         &ctx.search_root,
         threads,
         dua_core::Order::ParentFirst,
+        // dua-core 3.3 新增的平台元数据开关（macOS APFS clone）默认关闭，
+        // 与 3.1 行为一致——search-files 只消费路径与文件类型
+        dua_core::Options::default(),
         descend,
     );
 

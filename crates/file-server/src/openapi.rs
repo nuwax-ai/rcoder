@@ -173,7 +173,7 @@ mod tests {
     fn document_contains_every_registered_operation() {
         let document = generated_document();
         // 73 = TS 对齐域全量（镜像族+build+dev）+ /fs/roots + /fs/children
-        // （对齐 TS f979df7 目录浏览）。userApp 域 33 条已拆至
+        // （对齐 TS 1.4.5 目录浏览）。userApp 域 33 条已拆至
         // file-server-userapp crate（其 routes.rs 测试守卫）。路由增删须同步本计数
         // （防"注册了但没进文档"回归）。
         assert_eq!(document.paths.paths.len(), 73);
@@ -221,7 +221,7 @@ mod tests {
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 
-    /// computer 域全端点 workspacePath 契约守卫（对齐 TS f979df7：TS 全部存量
+    /// computer 域全端点 workspacePath 契约守卫（对齐 TS 1.4.5：TS 全部存量
     /// computer 路由 + 静态路由都接受项目绑定目录）。遍历文档中 `/api/computer`
     /// 前缀全部 operation：GET 参数面须含 `workspacePath`、POST requestBody
     /// schema（JSON / multipart form）须含 `workspacePath` 属性；`/fs/*` 目录
@@ -294,7 +294,7 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "computer 端点缺 workspacePath 契约（对齐 TS f979df7 全路由接受绑定目录）：\n{}",
+            "computer 端点缺 workspacePath 契约（对齐 TS 1.4.5 全路由接受绑定目录）：\n{}",
             offenders.join("\n")
         );
         assert!(

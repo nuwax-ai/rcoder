@@ -1,5 +1,5 @@
 //! /fs/roots 与 /fs/children handlers：文件系统目录浏览（目录选择弹窗，
-//! 对齐 TS f979df7——不锚定工作空间、不带会话上下文，不解析 service）。
+//! 对齐 TS 1.4.5——不锚定工作空间、不带会话上下文，不解析 service）。
 
 use garde::Validate;
 

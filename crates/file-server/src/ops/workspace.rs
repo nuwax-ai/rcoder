@@ -67,7 +67,7 @@ pub struct PushSkillsParams<'a> {
     /// 是否允许 agent-store 软链分支 (computer 布局下成立; userapp 开发卷
     /// 布局 parent 是共享卷根, 传 false 一律走 legacy)
     pub allow_agent_store: bool,
-    /// agent-store 根锚定 (项目绑定目录场景, 对齐 TS f979df7 `getAgentStorePath`
+    /// agent-store 根锚定 (项目绑定目录场景, 对齐 TS 1.4.5 `getAgentStorePath`
     /// ——store 锚定配置根不随绑定漂移); `None` 保持 `ws.parent()` 派生
     /// (默认布局, 与历史行为逐字节一致)。
     pub agent_store_root: Option<&'a Path>,

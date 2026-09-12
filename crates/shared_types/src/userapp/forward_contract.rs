@@ -45,7 +45,7 @@ pub enum ComputerServiceKind {
 /// 不敏感归一）。未匹配（含空值）返回 `None`——由调用方决定缺省语义（TS 缺省
 /// taskAgent，无 general 兼容）。
 pub fn normalize_computer_service_type(value: &str) -> Option<ComputerServiceKind> {
-    let key = value.trim().to_ascii_lowercase();
+    let key = value.trim();
     [
         (SERVICE_TYPE_USERAPP, ComputerServiceKind::Userapp),
         (SERVICE_TYPE_PAGE_APP, ComputerServiceKind::PageApp),
@@ -56,7 +56,7 @@ pub fn normalize_computer_service_type(value: &str) -> Option<ComputerServiceKin
         (SERVICE_TYPE_TASK_AGENT, ComputerServiceKind::TaskAgent),
     ]
     .into_iter()
-    .find(|(wire, _)| key == wire.to_ascii_lowercase())
+    .find(|(wire, _)| key.eq_ignore_ascii_case(wire))
     .map(|(_, kind)| kind)
 }
 

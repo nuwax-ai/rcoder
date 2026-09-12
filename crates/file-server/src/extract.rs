@@ -143,10 +143,14 @@ pub fn merged_workspace_path(explicit: Option<&str>) -> Option<String> {
     if let Some(header) = workspace_path_header_raw().filter(|s| !s.trim().is_empty()) {
         return Some(header);
     }
-    explicit
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    non_empty_trimmed(explicit).map(str::to_string)
+}
+
+/// trim 后非空才保留（对齐 TS `String(x).trim() || null` 的取值语义——
+/// 空白串视为未传）。serviceContext 三要素（appId/workspacePath）与定位
+/// 收口的 trim 过滤统一走此 helper，防止「空白值假激活」与 TS 分歧。
+pub(crate) fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
 }
 
 pub struct AppJson<T>(pub T);

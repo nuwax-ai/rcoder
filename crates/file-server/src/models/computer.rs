@@ -3,7 +3,7 @@
 //! 字段为 `pub`（models 是 crate 内公共层）；serde 属性、garde 校验与
 //! 字段 doc comment 是 wire 契约的一部分，改动须同批核查守卫测试。
 //!
-//! 项目绑定目录 `workspacePath`（可选，对齐 TS nuwax-file-server f979df7）：全部
+//! 项目绑定目录 `workspacePath`（可选，对齐 TS nuwax-file-server 1.4.5）：全部
 //! 契约统一携带；值为一跨平台绝对路径，非空时优先于默认定位（与
 //! `x-workspace-path` header 同语义，header 优先），合法性由收口
 //! `computer_root_for_request` fail-fast 校验。
@@ -26,7 +26,7 @@ pub struct UserCidQuery {
     #[serde(default)]
     #[garde(skip)]
     pub custom_target_dir: Option<String>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
@@ -52,7 +52,7 @@ pub struct FileListQuery {
     #[serde(default)]
     #[garde(skip)]
     pub custom_target_dir: Option<String>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
@@ -86,7 +86,7 @@ pub struct ResolveFileQuery {
     #[serde(default)]
     #[garde(skip)]
     pub custom_target_dir: Option<String>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
@@ -116,7 +116,7 @@ pub struct SearchFilesQuery {
     #[serde(default)]
     #[garde(skip)]
     pub custom_target_dir: Option<String>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
@@ -149,7 +149,7 @@ pub struct InstallBody {
     pub c_id: String,
     /// 语言：typescript/ts → pnpm install；python/py → pip install
     pub programming_language: String,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     pub workspace_path: Option<String>,
 }
@@ -169,7 +169,7 @@ pub struct BuildAgentBody {
     pub agent_id: String,
     /// 安装包版本号
     pub version: String,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     pub workspace_path: Option<String>,
 }
@@ -186,7 +186,7 @@ pub struct CleanupBuildArtifactsBody {
     /// 自定义目标目录（可选；缺省用 user/cid 推导的默认根）
     #[serde(default)]
     pub custom_target_dir: Option<String>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     pub workspace_path: Option<String>,
 }
@@ -206,7 +206,7 @@ pub struct ExecCommandBody {
     /// shell 命令串（经 shell -c 执行，cwd=workspace）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub command: String,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
@@ -225,7 +225,7 @@ pub struct GetLogsQuery {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub c_id: String,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时日志目录为 `{绑定}/.logs`，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时日志目录为 `{绑定}/.logs`，对齐 TS 1.4.5）
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
@@ -249,7 +249,7 @@ pub struct ZipBody {
     /// 额外排除目录（与内置排除表合并，按任意路径段匹配）
     #[serde(default)]
     pub exclude_dirs: Option<Vec<String>>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     pub workspace_path: Option<String>,
 }
@@ -263,7 +263,7 @@ pub struct DeleteWorkspaceBody {
     /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub c_id: String,
-    /// 项目绑定目录（可选；非空时直接定位该目录删除，不先建后删，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；非空时直接定位该目录删除，不先建后删，对齐 TS 1.4.5）
     #[serde(default)]
     pub workspace_path: Option<String>,
 }
@@ -282,7 +282,7 @@ pub struct FilesUpdateBody {
     /// 自定义目标目录（可选；缺省用 user/cid 推导的默认根）
     #[serde(default)]
     pub custom_target_dir: Option<String>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     pub workspace_path: Option<String>,
 }
@@ -308,7 +308,7 @@ pub struct GenerateFileBody {
     /// 绝对目录覆盖；非空则用之，否则回退默认工作区 (与 upload-file 同语义)。
     #[serde(default)]
     pub custom_target_dir: Option<String>,
-    /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
@@ -321,13 +321,13 @@ pub struct GenerateFileBody {
 pub struct CustomTargetQuery {
     #[serde(default)]
     pub custom_target_dir: Option<String>,
-    /// 项目绑定目录（可选；非空时静态文件从该目录解析，对齐 TS f979df7 server.js）
+    /// 用户维度工作目录（可选；非空时静态文件从该目录解析，对齐 TS 1.4.5 server.js）
     #[serde(default)]
     pub workspace_path: Option<String>,
 }
 
 /// `fs/children` 查询参数（目录浏览，不锚定工作区、不带会话上下文；对齐 TS
-/// f979df7 `listFsChildren`——绝对路径校验用宿主语义，等价 TS `path.isAbsolute`）。
+/// `listFsChildren`——绝对路径校验用宿主语义，等价 TS `path.isAbsolute`）。
 #[derive(Deserialize, Validate, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]

@@ -59,17 +59,24 @@ impl GitServiceContext {
     /// kind：header 归一结果（`None`=header 无有效值）优先，未匹配轮到 body/query
     /// 的 `serviceType` 字段归一（对齐 TS `headerType || bodyType` 链——header
     /// 未匹配视为无值而非缺省）。
+    ///
+    /// appId/workspacePath 的 body 值统一 trim 非空过滤（对齐 TS
+    /// `String(x).trim() || null`——空白串视为未传，防「假激活」导致与 TS
+    /// 分歧：TS 对空白值不激活 serviceContext 走 workspaceType 老规则）。
     fn merge(
         body_service_type: Option<&str>,
-        body_app_id: Option<String>,
-        body_workspace_path: Option<String>,
+        body_app_id: Option<&str>,
+        body_workspace_path: Option<&str>,
     ) -> Option<Self> {
         let kind = crate::extract::service_kind()
             .or_else(|| body_service_type.and_then(shared_types::normalize_computer_service_type));
-        // appId：task-local（header x-app-id > query appId）优先，兜底 body 字段
-        let app_id = crate::extract::userapp_app_id().or(body_app_id);
+        // appId：task-local（header x-app-id > query appId，读取器已 trim 过滤）
+        // 优先，兜底 body 字段
+        let app_id = crate::extract::userapp_app_id()
+            .or_else(|| crate::extract::non_empty_trimmed(body_app_id).map(str::to_string));
         // workspacePath 的 header > 显式值合并由收口核心的 merged_workspace_path 做
-        let workspace_path = body_workspace_path;
+        let workspace_path =
+            crate::extract::non_empty_trimmed(body_workspace_path).map(str::to_string);
         match kind {
             // userapp/normalProject 缺 appId = TS 构造失败 → 整体视为无 serviceContext
             Some(ComputerServiceKind::Userapp | ComputerServiceKind::NormalProject)
@@ -109,12 +116,8 @@ async fn resolve_target(
 ) -> Result<(PathBuf, String), AppError> {
     if service.active() {
         let ctx = computer_ctx
+            .filter(|ctx| !ctx.user_id.trim().is_empty() && !ctx.cid.trim().is_empty())
             .ok_or_else(|| AppError::validation("serviceContext mode requires userId and cId"))?;
-        if ctx.user_id.trim().is_empty() || ctx.cid.trim().is_empty() {
-            return Err(AppError::validation(
-                "serviceContext mode requires userId and cId",
-            ));
-        }
         let path = crate::handlers::computer::computer_root_for_context(
             state,
             &ctx.user_id,
@@ -139,8 +142,8 @@ async fn resolve_target(
 pub(super) async fn resolve(q: &GitQuery, state: &AppState) -> Result<(PathBuf, String), AppError> {
     let service = GitServiceContext::merge(
         q.service_type.as_deref(),
-        q.app_id.clone(),
-        q.workspace_path.clone(),
+        q.app_id.as_deref(),
+        q.workspace_path.as_deref(),
     )
     // serviceContext 构造失败（None）= 回落 workspaceType 老规则，与未携带同路径
     .unwrap_or_default();
@@ -174,8 +177,8 @@ pub(super) async fn resolve_body(
     };
     let service = GitServiceContext::merge(
         body.service_type.as_deref(),
-        body.app_id.clone(),
-        body.workspace_path.clone(),
+        body.app_id.as_deref(),
+        body.workspace_path.as_deref(),
     )
     .unwrap_or_default();
     resolve_target(
@@ -274,7 +277,7 @@ mod tests {
             ..crate::Config::default()
         });
         let (path, log_id) = scope_context(Some(ComputerServiceKind::Userapp), None, async {
-            let service = GitServiceContext::merge(None, Some("app-5".into()), None)
+            let service = GitServiceContext::merge(None, Some("app-5"), None)
                 .expect("merge with body app_id");
             resolve_target(
                 &state,
@@ -301,7 +304,7 @@ mod tests {
     async fn service_context_requires_user_and_cid() {
         let state = make_state();
         let err = scope_context(Some(ComputerServiceKind::Userapp), None, async {
-            let service = GitServiceContext::merge(None, Some("app-5".into()), None)
+            let service = GitServiceContext::merge(None, Some("app-5"), None)
                 .expect("merge with body app_id");
             resolve_target(&state, "taskAgent", None, None, &service).await
         })
@@ -320,7 +323,7 @@ mod tests {
         let state = make_state();
         // 默认 userapp 卷根 /app（测试环境不存在）
         let err = scope_context(Some(ComputerServiceKind::Userapp), None, async {
-            let service = GitServiceContext::merge(None, Some("app-nope".into()), None)
+            let service = GitServiceContext::merge(None, Some("app-nope"), None)
                 .expect("merge with body app_id");
             resolve_target(
                 &state,
@@ -386,7 +389,7 @@ mod tests {
         });
         std::fs::create_dir_all(tmp.path().join("u1").join("NormalProject").join("proj-3"))
             .expect("seed workspace");
-        let service = GitServiceContext::merge(Some("normalProject"), Some("proj-3".into()), None)
+        let service = GitServiceContext::merge(Some("normalProject"), Some("proj-3"), None)
             .expect("body channel merge");
         let (path, _) = scope_context(None, None, async {
             resolve_target(
@@ -413,9 +416,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let bound = tmp.path().join("ws");
         std::fs::create_dir_all(&bound).expect("seed bound workspace");
-        let service =
-            GitServiceContext::merge(Some("taskAgent"), None, Some(bound.display().to_string()))
-                .expect("workspace_path merge");
+        let bound_str = bound.display().to_string();
+        let service = GitServiceContext::merge(Some("taskAgent"), None, Some(bound_str.as_str()))
+            .expect("workspace_path merge");
         assert!(service.active(), "workspacePath alone must activate");
         let (path, _) = scope_context(None, None, async {
             resolve_target(
@@ -430,5 +433,27 @@ mod tests {
         .await
         .expect("workspacePath branch");
         assert_eq!(path, bound);
+    }
+
+    /// 空白值不激活（TS `String(x).trim() || null` 同构锁）：body workspacePath
+    /// 为纯空白时不进入 serviceContext 分支，回落 workspaceType 老规则——
+    /// 否则「假激活」会在 pageApp 场景错报 requires userId and cId（TS 侧 200）。
+    #[tokio::test]
+    async fn blank_body_values_do_not_activate_service_context() {
+        let service = GitServiceContext::merge(Some("taskAgent"), Some("   "), Some("   "));
+        let service = service.expect("taskAgent context merges (no appId requirement)");
+        assert!(
+            !service.active(),
+            "blank workspacePath/appId must be filtered to None (not activate)"
+        );
+        // 空白 appId 在 userapp 语境 = 未携带 → 构造失败回落老规则
+        let service = scope_context(Some(ComputerServiceKind::Userapp), None, async {
+            GitServiceContext::merge(None, Some("   "), None)
+        })
+        .await;
+        assert!(
+            service.is_none(),
+            "userapp with blank appId must fail to merge"
+        );
     }
 }

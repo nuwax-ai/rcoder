@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(written, b"hi");
     }
 
-    // ── 项目绑定目录通道 (对齐 TS f979df7): body 字段 + x-workspace-path header ─────
+    // ── 项目绑定目录通道 (对齐 TS 1.4.5): body 字段 + x-workspace-path header ─────
 
     /// body 的 workspacePath 字段 → 文件落绑定目录。
     #[tokio::test]

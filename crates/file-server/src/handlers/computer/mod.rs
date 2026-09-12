@@ -94,13 +94,13 @@ pub(crate) async fn computer_root_for_context(
     app_id: Option<&str>,
     workspace_path: Option<&str>,
 ) -> Result<PathBuf, AppError> {
+    let single_app = state
+        .config
+        .userapp_single_app_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
     if let Some(raw) = crate::extract::merged_workspace_path(workspace_path) {
-        let single_app = state
-            .config
-            .userapp_single_app_id
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
         if single_app {
             return Err(AppError::validation(
                 "workspacePath is not allowed in single-app mode \
@@ -110,22 +110,13 @@ pub(crate) async fn computer_root_for_context(
         let dir = crate::workspace::normalize_workspace_path(&raw)?;
         return Ok(PathBuf::from(dir));
     }
-    let single_app = state
-        .config
-        .userapp_single_app_id
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|s| !s.is_empty());
     match kind {
         Some(shared_types::ComputerServiceKind::Userapp) => {
-            let app_id = app_id
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    AppError::validation(
-                        "userapp request missing app_id: pass `X-App-Id` header or query `appId`",
-                    )
-                })?;
+            let app_id = crate::extract::non_empty_trimmed(app_id).ok_or_else(|| {
+                AppError::validation(
+                    "userapp request missing app_id: pass `X-App-Id` header or query `appId`",
+                )
+            })?;
             crate::workspace::resolve_userapp_dev(app_id, None, &state.config)
         }
         Some(shared_types::ComputerServiceKind::NormalProject) => {
@@ -135,14 +126,13 @@ pub(crate) async fn computer_root_for_context(
                      (this container serves its own app volume only)",
                 ));
             }
-            let app_id = app_id
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    AppError::validation("appId(projectId) is required for normalProject workspace")
-                })?
-                .to_string();
-            shared_types::validate_identifier(&app_id, "appId").map_err(AppError::validation)?;
+            let app_id = crate::extract::non_empty_trimmed(app_id).ok_or_else(|| {
+                AppError::validation("appId(projectId) is required for normalProject workspace")
+            })?;
+            shared_types::validate_identifier(app_id, "appId").map_err(AppError::validation)?;
+            // userId 同为进宿主树路径的拼接段，与 resolve_computer 的
+            // validated_identifier 同源校验（TS 侧无校验，Rust 有意加固）
+            shared_types::validate_identifier(user_id, "userId").map_err(AppError::validation)?;
             Ok(state
                 .config
                 .computer_workspace_dir
@@ -209,10 +199,11 @@ pub(crate) fn agent_store_user_root(
     if crate::extract::is_userapp_request() {
         return state.config.userapp_workspace_dir.clone();
     }
-    if crate::extract::is_normal_project_request() {
-        return state.config.computer_workspace_dir.join(user_id);
-    }
-    if crate::extract::merged_workspace_path(workspace_path).is_some() {
+    // normalProject 与用户维度工作目录（非 userapp）同锚点：store 锚定配置根
+    // {COMPUTER_WORKSPACE_DIR}/{userId}，不随绑定漂移
+    if crate::extract::is_normal_project_request()
+        || crate::extract::merged_workspace_path(workspace_path).is_some()
+    {
         return state.config.computer_workspace_dir.join(user_id);
     }
     ws.parent().unwrap_or(ws).to_path_buf()

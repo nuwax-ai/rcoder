@@ -61,7 +61,7 @@ pub(crate) async fn init_project_template(
 ) -> Result<Json<Value>, AppError> {
     let mut user_id = None;
     let mut cid = None;
-    let mut workspace_path = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
+    let mut workspace_path = None; // 项目绑定目录 (对齐 TS 1.4.5, 可选 multipart 字段)
     let mut data = None;
     let mut enable_git = false;
     while let Some(field) = multipart

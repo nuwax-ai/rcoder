@@ -41,7 +41,7 @@ pub(crate) async fn create_workspace(
 ) -> Result<Json<CreateWorkspaceResponse>, AppError> {
     let mut user_id = None;
     let mut cid = None;
-    let mut workspace_path = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
+    let mut workspace_path = None; // 项目绑定目录 (对齐 TS 1.4.5, 可选 multipart 字段)
     let mut skill_zip = None;
     let mut file_name = None;
     while let Some(field) = multipart
@@ -72,7 +72,7 @@ pub(crate) async fn create_workspace(
         validate_zip_ext(file_name.as_deref())?;
     }
     // 绑定目录优先于默认定位; create_dir_all 即 TS ensureWorkspaceDir 绑定分支
-    // (不存在则递归创建, 对齐 TS f979df7)
+    // (不存在则递归创建, 对齐 TS 1.4.5)
     let ws = ws_path(&state, &user_id, &cid, workspace_path.as_deref()).await?;
     tokio::fs::create_dir_all(&ws).await?;
     let res = crate::service::computer_ws::create_workspace(
@@ -99,7 +99,7 @@ pub(crate) async fn create_workspace_v2(
 ) -> Result<Json<CreateWorkspaceResponse>, AppError> {
     let mut user_id = None;
     let mut cid = None;
-    let mut workspace_path = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
+    let mut workspace_path = None; // 项目绑定目录 (对齐 TS 1.4.5, 可选 multipart 字段)
     let mut skill_zip = None;
     let mut file_name = None;
     let mut skill_urls: Vec<String> = Vec::new();
@@ -195,7 +195,7 @@ pub(crate) async fn create_workspace_v2(
     });
 
     // 绑定目录优先于默认定位; create_dir_all 即 TS ensureWorkspaceDir 绑定分支
-    // (不存在则递归创建, 对齐 TS f979df7)
+    // (不存在则递归创建, 对齐 TS 1.4.5)
     let ws = ws_path(&state, &user_id, &cid, workspace_path.as_deref()).await?;
     tokio::fs::create_dir_all(&ws).await?;
 
@@ -205,7 +205,7 @@ pub(crate) async fn create_workspace_v2(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
     let res = if let Some(agent_id) = agent_id {
-        // agent-store 锚定 (对齐 TS f979df7 getAgentStorePath): store 始终锚定配置根
+        // agent-store 锚定 (对齐 TS 1.4.5 getAgentStorePath): store 始终锚定配置根
         // (userapp→开发卷 / 绑定→{COMPUTER_WORKSPACE_DIR}/{userId}), 不随会话绑定目录
         // 漂移; 默认布局 = ws.parent() (Local={root}/{userId}, Subvolume=per-user PVC)。
         let user_root =

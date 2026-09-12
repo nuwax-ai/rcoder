@@ -57,7 +57,7 @@ pub(crate) async fn get_logs(
     Query(q): Query<GetLogsQuery>,
 ) -> Result<Json<Value>, AppError> {
     q.validate().map_err(crate::error::from_garde)?;
-    // 绑定目录优先于 userapp/默认 (收口内); 日志目录跟随工作区: {ws}/.logs (对齐 TS f979df7)
+    // 绑定目录优先于 userapp/默认 (收口内); 日志目录跟随工作区: {ws}/.logs (对齐 TS 1.4.5)
     let log_dir = resolve_computer_target(
         &state,
         &q.user_id,

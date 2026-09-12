@@ -17,7 +17,7 @@ pub struct CreateAgentStoreParams<'a> {
     /// 项目绑定目录时锚定配置根, 见 handlers::computer::agent_store_user_root)
     pub user_root: &'a Path,
     /// 会话工作区 (显式传入——默认布局 = `user_root/{cid}`, 绑定布局 = 绑定目录本身,
-    /// 不能从 user_root 倒推; 对齐 TS f979df7 会话工作区与 store 根解耦)
+    /// 不能从 user_root 倒推; 对齐 TS 1.4.5 会话工作区与 store 根解耦)
     pub session_workspace: &'a Path,
     pub agent_id: &'a str,
     pub skill_zip: Option<&'a Path>,
@@ -484,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn bound_layout_decouples_session_from_store_root() {
-        // 项目绑定目录布局 (对齐 TS f979df7): 会话工作区 = 绑定目录 (任意路径),
+        // 项目绑定目录布局 (对齐 TS 1.4.5): 会话工作区 = 绑定目录 (任意路径),
         // agent-store 锚定 user_root (配置根/{userId}); 两者解耦, 不再从
         // user_root/{cid} 倒推会话目录。
         let tmp = std::env::temp_dir().join(format!("fs_bound_{}", now_nanos()));

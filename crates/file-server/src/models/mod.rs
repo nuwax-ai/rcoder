@@ -67,7 +67,7 @@ mod tests {
         assert!(visited > 80, "sanity: 至少扫描 80 个源文件, 实际 {visited}");
     }
 
-    /// computer 契约携带绑定目录守卫（对齐 TS f979df7：全部 computer 路由接受
+    /// computer 契约携带绑定目录守卫（对齐 TS 1.4.5：全部 computer 路由接受
     /// workspacePath）：`models/computer.rs` 与 `models/forms.rs` 中凡含 `pub user_id`
     /// 字段的结构体必须同时含 `pub workspace_path` 字段——未来新增 computer 契约
     /// 漏带绑定目录在此报红（按 struct 分块的源码文本扫描，同上守卫范式）。
@@ -91,7 +91,7 @@ mod tests {
                 assert!(
                     !body.contains("pub user_id") || body.contains("pub workspace_path"),
                     "{file}: struct {head} 含 user_id 但缺 workspace_path 字段 \
-                     （TS f979df7 全部 computer 契约须接受绑定目录）"
+                     （TS 1.4.5 全部 computer 契约须接受用户维度工作目录）"
                 );
             }
         }

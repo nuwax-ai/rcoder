@@ -84,7 +84,7 @@ pub(crate) async fn serve_page(
         ("c_id" = String, Path, description = "Computer workspace identifier"),
         ("rest" = String, Path, description = "Workspace-relative file path"),
         ("customTargetDir" = Option<String>, Query, description = "Override workspace root"),
-        ("workspacePath" = Option<String>, Query, description = "Bound workspace dir (TS f979df7), takes precedence over default root; customTargetDir wins over it")
+        ("workspacePath" = Option<String>, Query, description = "Bound workspace dir (TS 1.4.5), takes precedence over default root; customTargetDir wins over it")
     ),
     description = r#"
 以 HTTP 直读 computer 树（两级 `{root}/{user_id}/{cId}` Electron 全局根语义）
