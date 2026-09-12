@@ -35,7 +35,7 @@ impl AppService {
         name: &str,
         deploy_env: Option<std::collections::HashMap<String, String>>,
         user_id: Option<String>,
-        process_lock: tokio::sync::OwnedMutexGuard<()>,
+        process_lock: crate::service::AppOperationGuard,
     ) -> Result<(), AppOperationError> {
         match self.get_app(rcoder_app_id).await {
             Ok(_) => {
@@ -47,6 +47,7 @@ impl AppService {
                     "[APP] app already exists; image/ports/probes are constant after first create \
                      and will NOT be reconciled to the desired image"
                 );
+                process_lock.finish().await?;
                 return Ok(());
             }
             Err(AppOperationError::NotFound(_)) => {} // 不存在 → create

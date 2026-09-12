@@ -350,6 +350,15 @@ async fn scenario_cross_entry_cursor_reconnect() {
         min_b.is_some_and(|m| m > cursor) || ids_b.is_empty(),
         format!("min={:?} > {cursor}（空=turn 已结束零增量，正确）", min_b),
     );
+    report.assert_hard(
+        "跨入口续传符合轮次边界",
+        evs_a.iter().any(|e| e.event == "end_turn") || !ids_b.is_empty(),
+        format!(
+            "first segment completed={}, resumed events={}",
+            evs_a.iter().any(|e| e.event == "end_turn"),
+            ids_b.len()
+        ),
+    );
     // 首段窗口内 turn 已结束 → 终端即清后无增量是正确行为；未结束 → 必须收到后续事件
     let first_seg_done = evs_a.iter().any(|e| e.event == "end_turn");
     if first_seg_done {
@@ -432,11 +441,7 @@ async fn scenario_new_session_cross_entry() {
         let ids = sse::ids_of(&evs);
         let text = sse::chunks_text(&evs);
         report.assert_hard(
-            &format!(
-                "轮{i} chat@{} 1s后SSE@{} 收到事件",
-                short(&chat_url),
-                short(&sse_url)
-            ),
+            &format!("轮{i} 新会话跨入口收到事件"),
             !ids.is_empty(),
             format!("{} 个", ids.len()),
         );
@@ -447,10 +452,6 @@ async fn scenario_new_session_cross_entry() {
         );
     }
     assert_hard_all(report).await;
-}
-
-fn short(url: &str) -> String {
-    url.trim_start_matches("http://").to_owned()
 }
 
 // 负载均衡场景默认 ignore（多入口轮换/跨入口续传已验证通过；重跑须明确

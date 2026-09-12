@@ -47,10 +47,14 @@ fn create_internal_routes(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// 健康检查路由
+/// 健康检查与版本元数据路由
+///
+/// `/version` 的免鉴权由 `ApiKeyValidator::EXEMPT_PATHS` 白名单实现
+/// （中间件链：body 限制/trace/HTTP 指标/locale 仍然生效）。
 fn health_routes(state: &Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(handler::health_check))
+        .route("/version", get(handler::version_check))
         .with_state(state.clone())
 }
 

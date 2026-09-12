@@ -250,7 +250,51 @@ impl ProjectAdapter {
     pub fn remove(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
         // per-project 锁（lockmap）：与 insert 共享，序列化同 project 并发操作。
         let _project_guard = self.project_locks.entry_by_ref(project_id);
+        self.remove_locked(project_id)
+    }
 
+    /// Conditional removal shares the same per-project lock as insert/remove.
+    pub fn remove_if_generation(
+        &self,
+        project_id: &str,
+        expected_generation: &str,
+    ) -> Option<Arc<ProjectAndContainerInfo>> {
+        let _project_guard = self.project_locks.entry_by_ref(project_id);
+        if !self
+            .projects
+            .view(project_id, |_, info| {
+                info.persistence_identity().generation == expected_generation
+            })
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        self.remove_locked(project_id)
+    }
+
+    pub fn remove_if_container_identity(
+        &self,
+        project_id: &str,
+        generation: &str,
+        container_id: &str,
+    ) -> Option<Arc<ProjectAndContainerInfo>> {
+        let _project_guard = self.project_locks.entry_by_ref(project_id);
+        let matches = self
+            .projects
+            .view(project_id, |_, info| {
+                info.persistence_identity().generation == generation
+                    && info
+                        .container_info()
+                        .is_some_and(|c| c.container_id == container_id)
+            })
+            .unwrap_or(false);
+        if !matches {
+            return None;
+        }
+        self.remove_locked(project_id)
+    }
+
+    fn remove_locked(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
         // 1. 先从主存储移除，获取 info 所有权（避免后续从 map 读取时被并发修改）
         let (_, info) = self.projects.remove(project_id)?;
 

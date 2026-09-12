@@ -14,6 +14,12 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// Protocol v2 identifies operations but does not promise process-group quiescence.
+pub const APP_CLI_OPERATION_ID_DEPLOY_PROTOCOL: u32 = 2;
+
+/// Protocol v3 publishes terminal operations only after mutations have stopped.
+pub const APP_CLI_QUIESCENT_DEPLOY_PROTOCOL: u32 = 3;
+
 /// app-cli server 状态机相位（wire 值 snake_case，锁死勿漂移）。
 ///
 /// 转移图：`Idle → Deploying → Orchestrating → Running`；任一部署/编排

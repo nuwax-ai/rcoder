@@ -1,0 +1,491 @@
+{
+  "absolute_agent_work_dir_anthropic": [
+    "agent cwd = 绝对路径（pwd 输出回显）",
+    "session_id 非空",
+    "含 end_turn（完整轮）"
+  ],
+  "absolute_agent_work_dir_openai": [
+    "agent cwd = 绝对路径（pwd 输出回显）",
+    "session_id 非空",
+    "含 end_turn（完整轮）"
+  ],
+  "after_terminal_anthropic": [
+    "0 消息事件（终端即清）"
+  ],
+  "after_terminal_openai": [
+    "0 消息事件（终端即清）"
+  ],
+  "concurrent_subscribers_anthropic": [
+    "两个订阅者都收到",
+    "两者内容非空",
+    "实时流共享（seq 交集）",
+    "至少一端收到完整轮（end_turn）"
+  ],
+  "concurrent_subscribers_openai": [
+    "两个订阅者都收到",
+    "两者内容非空",
+    "实时流共享（seq 交集）",
+    "至少一端收到完整轮（end_turn）"
+  ],
+  "cross_turn_reconnect_anthropic": [
+    "turn1 收到",
+    "turn2 完整链（恰 1 prompt_start + ≥1 end_turn）",
+    "turn2 开头非 turn1 内容",
+    "重连收到 turn2",
+    "零 turn1 残留"
+  ],
+  "cross_turn_reconnect_openai": [
+    "turn1 收到",
+    "turn2 完整链（恰 1 prompt_start + ≥1 end_turn）",
+    "turn2 开头非 turn1 内容",
+    "重连收到 turn2",
+    "零 turn1 残留"
+  ],
+  "full_turn_anthropic": [
+    "id 单调无重复",
+    "id 行存在",
+    "session_id 非空",
+    "含 end_turn（完整轮）",
+    "含 prompt_start",
+    "含流式 chunk",
+    "回答含数字内容"
+  ],
+  "full_turn_openai": [
+    "id 单调无重复",
+    "id 行存在",
+    "session_id 非空",
+    "含 end_turn（完整轮）",
+    "含 prompt_start",
+    "含流式 chunk",
+    "回答含数字内容"
+  ],
+  "model_switch_anthropic": [
+    "上下文延续（记得 CAP）+ 回答了新问题 BASE",
+    "第二轮 seq 全 > 第一轮（零历史重放）",
+    "第二轮收到事件"
+  ],
+  "model_switch_multi_anthropic": [
+    "turn0(default) seq 全 > 前轮（隔离）",
+    "turn0(default) 完整执行",
+    "turn0(default) 收到事件",
+    "turn1 无 turn0 逐字重放",
+    "turn1(pro) seq 全 > 前轮（隔离）",
+    "turn1(pro) 完整执行",
+    "turn1(pro) 收到事件",
+    "turn2 无 turn0 逐字重放",
+    "turn2 无 turn1 逐字重放",
+    "turn2(default) seq 全 > 前轮（隔离）",
+    "turn2(default) 完整执行",
+    "turn2(default) 收到事件",
+    "末轮上下文延续（对比 CAP 与 BASE）"
+  ],
+  "model_switch_multi_openai": [
+    "turn0(default) seq 全 > 前轮（隔离）",
+    "turn0(default) 完整执行",
+    "turn0(default) 收到事件",
+    "turn1 无 turn0 逐字重放",
+    "turn1(pro) seq 全 > 前轮（隔离）",
+    "turn1(pro) 完整执行",
+    "turn1(pro) 收到事件",
+    "turn2 无 turn0 逐字重放",
+    "turn2 无 turn1 逐字重放",
+    "turn2(default) seq 全 > 前轮（隔离）",
+    "turn2(default) 完整执行",
+    "turn2(default) 收到事件",
+    "末轮上下文延续（对比 CAP 与 BASE）"
+  ],
+  "model_switch_openai": [
+    "第二轮 seq 全 > 第一轮（零历史重放）",
+    "第二轮收到事件"
+  ],
+  "no_session_reuse_anthropic": [
+    "SSE 收到第二轮事件",
+    "seq 延续全 > 第一轮",
+    "session_id 复用（响应 == 第一轮）",
+    "上下文延续（记得 CAP）",
+    "第二轮完整执行"
+  ],
+  "no_session_reuse_openai": [
+    "SSE 收到第二轮事件",
+    "seq 延续全 > 第一轮",
+    "session_id 复用（响应 == 第一轮）",
+    "上下文延续（记得 CAP）",
+    "第二轮完整执行"
+  ],
+  "reconnect_no_cursor_anthropic": [
+    "重连流 id 单调无重复",
+    "零已收消息重放（红线）",
+    "首窗口收到事件"
+  ],
+  "reconnect_no_cursor_openai": [
+    "重连流 id 单调无重复",
+    "零已收消息重放（红线）",
+    "首窗口收到事件"
+  ],
+  "reconnect_with_cursor_anthropic": [
+    "增量：全 > 游标",
+    "重连收到增量事件",
+    "重连流 id 单调",
+    "首窗口收到事件"
+  ],
+  "reconnect_with_cursor_openai": [
+    "增量：全 > 游标",
+    "重连收到增量事件",
+    "重连流 id 单调",
+    "首窗口收到事件"
+  ],
+  "two_turn_isolation_anthropic": [
+    "恰一个 end_turn",
+    "恰一个 prompt_start",
+    "第二轮 seq 全 > 第一轮最大"
+  ],
+  "two_turn_isolation_openai": [
+    "恰一个 end_turn",
+    "恰一个 prompt_start",
+    "第二轮 seq 全 > 第一轮最大"
+  ],
+  "userapp_agent_dispatch_anthropic": [
+    "cache-clean 分派 success",
+    "cancel 分派 success",
+    "chat 建会话",
+    "computer 旧形态回归（无 service_type）",
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "status 分派 alive+session 回显",
+    "stop 分派 success"
+  ],
+  "userapp_agent_dispatch_openai": [
+    "cache-clean 分派 success",
+    "cancel 分派 success",
+    "chat 建会话",
+    "computer 旧形态回归（无 service_type）",
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "status 分派 alive+session 回显",
+    "stop 分派 success"
+  ],
+  "userapp_compose_regression": [
+    "/userapp/routes 速查表 → 200",
+    "POST /api/v1/apps/publish/tasks/query 已删除（404）",
+    "POST /api/v1/apps/{app_id}/build 已删除（404）",
+    "build 任务 180s 内到达终态（不挂死）",
+    "build 双缺 app_id → HTTP 200 + ERR_VALIDATION 双来源指引且不挂起",
+    "build 受理（200 + task_id + artifact_path 预生成）",
+    "build 缺 header 时 body app_id 自定位受理且不挂起",
+    "create-workspace 前置（dev 链路载体）",
+    "destroy 后 storage(dev) exists=false",
+    "ensure-workspace 幂等（两次 workspace 路径一致）",
+    "ensure-workspace 首调（懒建容器）",
+    "files(dev) 列表含上传文件（env=dev 根=workspace）",
+    "files-update 写 .logs/probe.log 探针",
+    "fixture workspace created",
+    "get-logs 尾读回显探针行",
+    "health 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
+    "health 非法 stage → HTTP 200 + ERR_VALIDATION",
+    "log 场景前置：create-workspace",
+    "logs/query 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
+    "logs/sources/query 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
+    "query page=0 → HTTP 200 + ERR_VALIDATION",
+    "query page_size=101 → HTTP 200 + ERR_VALIDATION（1..=100）",
+    "query sort_by=bogus → HTTP 200 + ERR_VALIDATION（仅 app_id/name/created_at）",
+    "query 合法形态（sort_by=app_id + 分页结构）",
+    "query 运行时对账：未部署 app 不在运行时列表",
+    "real failing build fixture imported",
+    "recycle-policy prod 成功（200 + runtime 回显）",
+    "recycle-policy stage=dev → HTTP 200 + ERR_VALIDATION（仅 prod）",
+    "recycle-policy 三字段全缺 → HTTP 200 + ERR_VALIDATION",
+    "recycle-policy 非法 user_id → HTTP 200 + ERR_VALIDATION",
+    "restart 无 url 对不存在的 app → HTTP 200 + ERR_APP_NOT_FOUND（不创建）",
+    "runtime 运行时列表（200 + 0000）",
+    "start 无 url 对不存在 app 创建空容器（200）",
+    "start 无 url 缺 user_id → HTTP 200 + ERR_VALIDATION",
+    "static 按 app 直下（两段）与终态一致（completed=200 / 其他=404）",
+    "stop → stopped / replicas=0",
+    "stop 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
+    "stop 后 start 唤醒 → running（120s 轮询兼容 K8s 异步）",
+    "stop 缺 user_id query → HTTP 200 + ERR_VALIDATION",
+    "storage GET 不存在 app → 200 + exists=false",
+    "storage(dev) exists=true（workspace 就绪）",
+    "storage/clear 对未 delete 的 app → HTTP 200 + ERR_INVALID_STATE",
+    "storage/destroy confirm≠app_id → HTTP 200 + ERR_VALIDATION",
+    "storage/dev/destroy 回收开发环境",
+    "storage/dev/query 清单含本 app",
+    "update 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
+    "update/stop 前置：start 空容器",
+    "update{name} → 200（live 回退其余字段）",
+    "upload(dev) 受理（200 + data.file_path 含上传名）",
+    "空容器状态 Running（基础设施形态就绪；120s 轮询兼容 K8s 异步）",
+    "终端代理[dbx] 主端口 → 307 + Location 重定向",
+    "终端代理[ttyd] 主端口 → 307 + Location 重定向",
+    "终端代理[vnc] 主端口 → 307 + Location 重定向",
+    "非法 env → HTTP 200 + ERR_VALIDATION（必填显式，无缺省）"
+  ],
+  "userapp_deploy_full_chain": [
+    "Q05 failed image update preserves physical container and image",
+    "Q05 failed image update preserves real Pingora React content",
+    "Q05 image update baseline has running container and real React content",
+    "Q05 unavailable image update returns explicit backend failure",
+    "app-files prod files 列表含上传物",
+    "app-files prod files/delete → 200",
+    "app-files prod upload → 200",
+    "backend-go/project.manifest.toml 落盘",
+    "backend-java/project.manifest.toml 落盘",
+    "backend-python/project.manifest.toml 落盘",
+    "backend-rust/project.manifest.toml 落盘",
+    "build 受理（200 + task_id + artifact_path 预生成）",
+    "build 终态 = completed（7 服务全量构建成功）",
+    "builder/runtime artifact toolchains are compatible",
+    "completed 快照含 release_id/sha256/size_bytes/file_name",
+    "create-workspace（ensure builder + owner 注册）",
+    "db prod create-database",
+    "db prod create-database 重复 → HTTP 200 + ERR_CONFLICT",
+    "db prod reset-password",
+    "db prod 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
+    "frontend-react-vite/project.manifest.toml 落盘",
+    "frontend-vue3-vite/project.manifest.toml 落盘",
+    "prod delete purge 回收",
+    "prod diagnostics captured before deletion",
+    "prod events（200 + 0000）",
+    "prod health 就绪（200 + 0000）",
+    "prod image and container identity recorded before cleanup",
+    "prod logs/query 快照（200 + 0000）",
+    "prod logs/sources/query 声明源非空",
+    "prod logs/stream SSE 通道（200 + text/event-stream）",
+    "prod resource registered at creation",
+    "prod stats（200 + 0000）",
+    "start(url) 部署受理（200 + Running）",
+    "static 取包 + sha256 与任务快照一致",
+    "stop → stopped",
+    "stop 后 health 探测自动唤醒 → running",
+    "tasks SSE 回放（终态后连流 → 全量事件 + completed + 自然关流）",
+    "tasks cancel 幂等（已终态 → already_terminal=true）",
+    "template-cli 全量模板初始化（init --next + 6×add）",
+    "userapp-next/project.manifest.toml 落盘",
+    "verified artifact retained for reproducible deployment",
+    "workspace 根含 workspace.manifest.toml + 7 个子项目目录",
+    "删除后流量转 502（backend 已注销）",
+    "流量七路[go /api/go/ready]就绪",
+    "流量七路[java readiness]就绪",
+    "流量七路[next /]就绪",
+    "流量七路[python /api/python/ready]就绪",
+    "流量七路[react /react/]就绪",
+    "流量七路[rust /api/rust/ready]就绪",
+    "流量七路[vue /vue/]就绪",
+    "热部署前置：get_app 拿 started_at",
+    "热部署受理（deploy_mode=hot + 新 release_id → 200）",
+    "热部署后流量仍可达",
+    "热部署容器未换（started_at 不变）"
+  ],
+  "userapp_dev_app_proxy_lazy_start": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "懒启动前置：init 模板 zip",
+    "懒启动前置：代理访问服务路由 200",
+    "懒启动前置：任务 completed（服务在跑）",
+    "懒启动前置：容器 Id 记录",
+    "懒启动：容器被应用流量自动重建（新 Id ≠ 旧 Id）"
+  ],
+  "userapp_dev_archive_downloads": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "download-all-files → zip 流（PK 魔数）",
+    "download-all-files 目录不存在 → 空 zip 兜底（200 + PK）",
+    "zip-workspace workspace 已 destroy → 200（resolve 幂等重建，404 不可达）",
+    "zip-workspace → zip 流（PK 魔数 + Content-Disposition 文件名）",
+    "归档前置：generate-file 造内容"
+  ],
+  "userapp_dev_chat_full_turn_anthropic": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "id 单调无重复",
+    "project_id 回显 = app_id",
+    "session_id 非空",
+    "含 end_turn（完整轮）",
+    "含 prompt_start",
+    "含流式 chunk",
+    "回答含数字内容"
+  ],
+  "userapp_dev_chat_full_turn_openai": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "id 单调无重复",
+    "project_id 回显 = app_id",
+    "session_id 非空",
+    "含 end_turn（完整轮）",
+    "含 prompt_start",
+    "含流式 chunk",
+    "回答含数字内容"
+  ],
+  "userapp_dev_chat_workdir_agent_work_dir_anthropic": [
+    "agent 产物落 workspace（agent_work_dir=会话ID 不再劫持定位）",
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "project_id 回显 = app_id",
+    "session_id 非空",
+    "含 end_turn（完整轮）"
+  ],
+  "userapp_dev_chat_workdir_agent_work_dir_openai": [
+    "agent 产物落 workspace（agent_work_dir=会话ID 不再劫持定位）",
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "project_id 回显 = app_id",
+    "session_id 非空",
+    "含 end_turn（完整轮）"
+  ],
+  "userapp_dev_dbx_proxy": [
+    "Pingora dev/dbx 307 query 保留",
+    "Pingora dev/dbx → 200（builder dbx-web GUI）",
+    "Pingora dev/dbx 无尾斜杠 → 307 + 相对 Location 带斜杠",
+    "Pingora dev/dbx 无尾斜杠跟随重定向 → 200 + URL 收敛带斜杠",
+    "create-workspace（ensure 开发容器+建目录+owner 注册）"
+  ],
+  "userapp_dev_files_two_entry_points": [
+    "computer 老路径缺 X-App-Id → 400",
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "两路入口落同一 workspace（list 同时含 direct.txt 与 proxy.txt）",
+    "入口 A：/api/userapp/generate-file（X-App-Id 转发）",
+    "入口 B'：computer 老路径列表，cId 传会话值不参与定位（app_id 独立提取）",
+    "入口 B：/api/computer/generate-file + X-Service-Type/X-App-Id（拦截分流）",
+    "缺 X-App-Id → 400"
+  ],
+  "userapp_dev_new_endpoint_body_query_locate": [
+    "A0：空 workspace dev/restart 快速失败 ERR_WORKSPACE_EMPTY",
+    "A：body-only dev/restart 自定位（零 header，懒创建+任务受理）",
+    "B：query-only dev/list 自定位（零 header，list 信封可达）",
+    "C：camelCase body 不识别 → 400（指引 X-App-Id header 或 body app_id 字段）",
+    "D：TS 老族 header 必填不变（无 X-App-Id 仍 400——反代契约保留）"
+  ],
+  "userapp_dev_owner_header_lazy_ensure": [
+    "A：无 owner 懒创建拒（502 cannot resolve——fail-fast 防孤儿目录，生产行为钉住）",
+    "B'：懒创建后注册表命中（无 header 复用 200——owner 仅创建路径需要）",
+    "B：x-user-id 显式档懒创建成功（拦截分流透传 200）",
+    "C：非法 x-user-id → 400（identifier 白名单防逃逸）"
+  ],
+  "userapp_dev_pg_reset_password": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "同密码复调仍成功（upsert 幂等执行）",
+    "首次改密成功（username upsert 建号/改密）"
+  ],
+  "userapp_dev_pod_identity_list_and_status": [
+    "agent/status userapp 分支经 cross_verify 链返回幂等信封",
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "pod/list builder serviceType 字段直读（user-app-builder，非 Unknown）"
+  ],
+  "userapp_dev_poll_storm_keeps_container": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "轮询风暴前置：init 模板 zip",
+    "轮询风暴：任务正常达终态（未蒸发）",
+    "轮询风暴：容器 Id 全程唯一（启动窗口+编译期无重建/误杀）",
+    "轮询风暴：容器仍存在"
+  ],
+  "userapp_dev_precheck_rejects_empty_and_no_services": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "从未 dev/start → logs/sources/query 400 ERR_DEV_NOT_RUNNING",
+    "无 manifest workspace → dev/start 400 ERR_WORKSPACE_NO_SERVICES",
+    "构造前提：generate-file 写入 probe.txt 成功",
+    "空 workspace → dev/start 400 ERR_WORKSPACE_EMPTY（不创建任务）"
+  ],
+  "userapp_dev_registry_self_heal_after_restart": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "restart 后 get-file-list 经自愈恢复 200（探活失败→刷新注册→转发成功）",
+    "容器 Id 不变（remediate Alive 保容器，非杀重建）"
+  ],
+  "userapp_dev_server_lifecycle": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "dev server 前置：init 模板 zip",
+    "dev zip 部署 → .run/workspace.manifest.toml 存在",
+    "dev/list → port=9080 + pid>0",
+    "dev/start 任务 completed",
+    "dev/start 受理（task_id + pending）",
+    "dev/stop → Stopped",
+    "dev/stop 后 list 空",
+    "dev/stop 后 logs/sources/query → 快速 400 ERR_DEV_NOT_RUNNING",
+    "logs/query orchestrator 源 → app-cli 编排日志可见"
+  ],
+  "userapp_dev_skills_push": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "push-skills → updated_skills 含探针 skill",
+    "push-skills 落盘 .agents/skills/<name>"
+  ],
+  "userapp_dev_task_sse_cursor_past_terminal": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "游标关流前置：init 模板 zip",
+    "游标关流前置：任务达终态",
+    "游标关流：SSE 200 + event-stream",
+    "游标关流：deadline 内服务端主动关流（非悬挂）",
+    "游标关流：越界游标零事件下发"
+  ],
+  "userapp_dev_template_zip_and_projects": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "init-project-template（zip 上传形态）→ workspace_root",
+    "projects/confirm → data.path 非空",
+    "projects/confirm 二次 → 拒绝（一次性状态迁移）",
+    "projects/detect stage=prod → 400（dev-only）",
+    "projects/detect → detected_type 非空"
+  ],
+  "userapp_dev_terminal_cwd_via_ttyd_ws": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "终端 cwd 落 workspace 压平挂载点（pwd 回显含 /home/user/{app}）",
+    "终端 ws 握手（pingora → ws_terminal 子协议 tty）"
+  ],
+  "userapp_dev_two_turn_isolation_anthropic": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "turn2 复用同一 session",
+    "第二轮不含第一轮内容（seq 隔离）"
+  ],
+  "userapp_dev_two_turn_isolation_openai": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "turn2 复用同一 session",
+    "第二轮不含第一轮内容（seq 隔离）"
+  ],
+  "userapp_devbuild_skip_and_fallback_source_mode": [
+    "create-workspace（ensure 开发容器）",
+    "dev/list → port=9080 + pid>0",
+    "dev/start 任务 completed（跳过编译不破坏编排）",
+    "dev/start 受理（task_id）",
+    "dev/stop → Stopped",
+    "init 模板 zip（manifests + dist fixture 直投源码目录）",
+    "只配 devrun 的服务跳过编译（dev-svc marker 不落盘）",
+    "未配 devrun 的服务回落 [build].command（go-svc marker 落盘）"
+  ],
+  "userapp_static_proxy_aligned_build_passes": [
+    "build 受理（200 + task_id）",
+    "completed 快照含 release_id",
+    "create-workspace（ensure 开发容器）",
+    "init 模板 zip（manifests + dist fixture 直投源码目录）",
+    "对齐形态 → build 终态 = completed（一致性检查无误报）"
+  ],
+  "userapp_static_proxy_escape_build_fails": [
+    "base 逃逸 → build 终态 = failed",
+    "build 受理（200 + task_id）",
+    "create-workspace（ensure 开发容器）",
+    "init 模板 zip（manifests + dist fixture 直投源码目录）",
+    "错误文案自明（服务名 + 逃逸 + 期望前缀）"
+  ],
+  "webchat_full_turn_anthropic": [
+    "project_id 自动生成回显",
+    "session_id 非空",
+    "含 end_turn（完整轮）",
+    "含 prompt_start",
+    "含流式消息事件"
+  ],
+  "webchat_full_turn_openai": [
+    "project_id 自动生成回显",
+    "session_id 非空",
+    "含 end_turn（完整轮）",
+    "含 prompt_start",
+    "含流式消息事件"
+  ],
+  "webchat_project_reuse": [
+    "turn2 session_id 非空",
+    "两轮 project_id 一致"
+  ],
+  "webchat_two_turn_seq": [
+    "turn1 有事件",
+    "turn2 含 end_turn",
+    "turn2 有事件",
+    "第二轮 seq 全 > 首轮最大"
+  ],
+  "docker_deletion_identity_contract": [
+    "Docker lifecycle process completed",
+    "Q01 real Docker test executed",
+    "Q01 Docker replacement and volume identity proved",
+    "Docker context retains source probe",
+    "Docker context excludes userapp runtime data",
+    "Docker context excludes app runtime data",
+    "Docker context excludes local credentials",
+    "Docker context owned resources cleaned"
+  ]
+}

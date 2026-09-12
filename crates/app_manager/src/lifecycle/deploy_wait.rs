@@ -116,7 +116,7 @@ impl AppService {
             .and_then(|env| env.get("APP_CLI_DEPLOY_TOKEN").cloned())
             .filter(|t| !t.trim().is_empty());
 
-        let client = reqwest::Client::new();
+        let mut client: Option<reqwest::Client> = None;
         let deadline = tokio::time::Instant::now() + DEPLOY_STAGE_BUDGET;
         loop {
             if tokio::time::Instant::now() >= deadline {
@@ -161,6 +161,18 @@ impl AppService {
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
             if let Some(ip) = ip {
+                let client = match client {
+                    Some(ref client) => client,
+                    ref mut slot @ None => {
+                        slot.insert(reqwest::Client::builder().no_proxy().build().map_err(
+                            |error| {
+                                AppOperationError::Backend(format!(
+                                    "build direct container deployment status client: {error}"
+                                ))
+                            },
+                        )?)
+                    }
+                };
                 let mut req = client
                     .get(format!("http://{ip}:{APP_CLI_ADMIN_PORT}/v1/deploy/status"))
                     .timeout(STATUS_REQUEST_TIMEOUT);

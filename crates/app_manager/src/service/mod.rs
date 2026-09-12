@@ -11,6 +11,8 @@
 //! （可选，K8s 建 HTTPRoute `/apps/{id}`）。TCP 初期不对外。Docker 模式建容器入主网络。
 
 use std::sync::Arc;
+mod operation_lock;
+pub(crate) use operation_lock::AppOperationGuard;
 
 use dashmap::DashMap;
 use tracing::info;
@@ -75,6 +77,14 @@ impl AppService {
         activity: Arc<AppActivityRegistry>,
         pingora: Option<Arc<PingoraProxyService>>,
     ) -> AppResult<Self> {
+        if config.access_mode == AppAccessMode::Docker
+            && config.operation_lock_root != shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT
+        {
+            return Err(AppOperationError::Validation(
+                "Docker application operation lock root must match the shared runtime data root"
+                    .into(),
+            ));
+        }
         // K8s 模式：启动时校验前置条件（RBAC 等）。失败直接返回，
         // 避免 rcoder 显示健康、直到首次创建 app 才暴露 403。
         if config.access_mode == AppAccessMode::Kubernetes {
@@ -129,7 +139,7 @@ impl AppService {
     pub(crate) async fn acquire_process_release_lock(
         &self,
         app_id: &str,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
+    ) -> AppResult<AppOperationGuard> {
         let lock = match self.release_locks.entry(app_id.to_owned()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
             dashmap::mapref::entry::Entry::Vacant(entry) => {
@@ -138,7 +148,23 @@ impl AppService {
                 lock
             }
         };
-        lock.lock_owned().await
+        self.operation_guard(app_id, lock.lock_owned().await, true)
+            .await
+    }
+
+    pub(crate) async fn try_acquire_process_release_lock(
+        &self,
+        app_id: &str,
+    ) -> AppResult<AppOperationGuard> {
+        let lock = self
+            .release_locks
+            .entry(app_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let process = lock.try_lock_owned().map_err(|_| {
+            AppOperationError::Conflict("application operation is in progress".into())
+        })?;
+        self.operation_guard(app_id, process, false).await
     }
 
     /// 锁条目无人持有（strong_count==1，仅 map 自身）时移除，防 DashMap 无界增长。

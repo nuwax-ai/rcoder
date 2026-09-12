@@ -1,6 +1,6 @@
 [package]
 name = "app-cli"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 license = "Apache-2.0"
 description = "UserApp 容器运行时编排器（替代 start.sh，管 pingap + 子项目编排 + 管理 API）"
@@ -41,6 +41,8 @@ async-stream = "0.3"
 tokio = { version = "1", features = ["full"] }
 # server 主循环的编排取消令牌（热部署切换/容器停服级联）
 tokio-util = "0.7"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 axum = "0.8"
 utoipa = { version = "5", features = ["axum_extras"] }
 globset = "0.4"

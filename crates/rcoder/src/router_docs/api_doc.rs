@@ -12,6 +12,7 @@ use crate::handler;
 #[openapi(
     paths(
         handler::health_check,
+        handler::version_check,
         handler::handle_chat,
         handler::agent_session_notification,
         handler::agent_session_cancel,
@@ -117,6 +118,7 @@ use crate::handler;
             shared_types::LogQueryResponse,
             // 响应结构体
             shared_types::HealthCheckResponse,
+            shared_types::VersionResponse,
             shared_types::AgentChatRequest,
             shared_types::ChatResponse,
             shared_types::AgentStopResponse,
@@ -264,7 +266,7 @@ use crate::handler;
         (name = "agent", description = "AI 代理会话管理和实时通知接口"),
         (name = "devcomputer", description = "DevComputer 调试接口（与 /computer 共享容器，自动注入 auto_reload 配置）"),
         (name = "agent-mgmt", description = "Agent 二进制安装/卸载/检查接口(P0-4: rcoder 转发到 agent_runner 容器)"),
-        (name = "system", description = "系统健康检查和状态监控接口"),
+        (name = "system", description = "系统健康检查、版本与系统信息接口"),
     ),
     info(
         description = r#"

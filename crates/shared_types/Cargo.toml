@@ -69,6 +69,9 @@ arc-swap = { workspace = true }
 # Persistent data structures for multi-session tracking (C2/M3 fix)
 imbl = { workspace = true }
 
+# 系统信息采集（VersionResponse::current 链路，/version 端点）
+sysinfo = { workspace = true }
+
 # i18n (国际化)
 shared_types_i18n = { workspace = true }
 

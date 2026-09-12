@@ -25,7 +25,7 @@ async fn subscribe_never_duplicates_under_concurrent_push() {
         let sd = sd.clone();
         tokio::spawn(async move {
             for i in 0..2000u64 {
-                sd.push_message(make_msg(&format!("m{i}")));
+                sd.push_message(make_msg(&format!("m{i}"))).await.unwrap();
                 if i % 100 == 0 {
                     tokio::task::yield_now().await;
                 }
@@ -70,9 +70,9 @@ async fn subscribe_never_duplicates_under_concurrent_push() {
 #[tokio::test]
 async fn replay_since_returns_only_messages_after_from_seq() {
     let sd = SessionData::new(64).await;
-    sd.push_message(make_msg("a")); // seq 1
-    sd.push_message(make_msg("b")); // seq 2
-    sd.push_message(make_msg("c")); // seq 3
+    sd.push_message(make_msg("a")).await.unwrap(); // seq 1
+    sd.push_message(make_msg("b")).await.unwrap(); // seq 2
+    sd.push_message(make_msg("c")).await.unwrap(); // seq 3
 
     let got: Vec<u64> = sd
         .replay_since(1)
@@ -91,8 +91,8 @@ async fn prompt_error_flows_as_terminal_and_clears_ring() {
     let sid = "test-err-terminal";
     let sd = SessionData::new(64).await;
     SESSION_CACHE.insert(sid.to_string(), sd.clone());
-    sd.push_message(make_msg("half_output_1")); // 异常前的半截输出
-    sd.push_message(make_msg("half_output_2"));
+    sd.push_message(make_msg("half_output_1")).await.unwrap(); // 异常前的半截输出
+    sd.push_message(make_msg("half_output_2")).await.unwrap();
 
     let notify = SessionNotify::SessionPromptError(shared_types::SessionPromptError {
         session_id: sid.to_string(),
@@ -118,11 +118,11 @@ async fn prompt_error_flows_as_terminal_and_clears_ring() {
 #[tokio::test]
 async fn terminal_event_clears_ring_immediately() {
     let sd = SessionData::new(64).await;
-    sd.push_message(make_msg("a")); // seq 1
-    sd.push_message(make_msg("b")); // seq 2
+    sd.push_message(make_msg("a")).await.unwrap(); // seq 1
+    sd.push_message(make_msg("b")).await.unwrap(); // seq 2
     let mut end = make_msg("end");
     end.message_type = SessionMessageType::SessionPromptEnd;
-    sd.push_message(end); // 终端：推送后 ring 立即清空
+    sd.push_message(end).await.unwrap(); // 终端：推送后 ring 立即清空
 
     let got: Vec<u64> = sd
         .replay_since(0)
@@ -139,11 +139,11 @@ async fn terminal_event_clears_ring_immediately() {
 #[tokio::test]
 async fn seq_keeps_monotonic_across_clear() {
     let sd = SessionData::new(64).await;
-    sd.push_message(make_msg("a")); // seq 1
-    sd.push_message(make_msg("b")); // seq 2
+    sd.push_message(make_msg("a")).await.unwrap(); // seq 1
+    sd.push_message(make_msg("b")).await.unwrap(); // seq 2
     let cleared = sd.clear_message_buffer().await;
     assert_eq!(cleared, 2);
-    sd.push_message(make_msg("c")); // seq 必须为 3（不随 clear 重置）
+    sd.push_message(make_msg("c")).await.unwrap(); // seq 必须为 3（不随 clear 重置）
 
     let got: Vec<u64> = sd
         .replay_since(0)
@@ -157,8 +157,8 @@ async fn seq_keeps_monotonic_across_clear() {
 #[tokio::test]
 async fn replay_since_is_non_destructive() {
     let sd = SessionData::new(64).await;
-    sd.push_message(make_msg("a"));
-    sd.push_message(make_msg("b"));
+    sd.push_message(make_msg("a")).await.unwrap();
+    sd.push_message(make_msg("b")).await.unwrap();
 
     let first: Vec<u64> = sd
         .replay_since(0)
@@ -189,10 +189,10 @@ fn make_heartbeat() -> UnifiedSessionMessage {
 #[tokio::test]
 async fn heartbeat_not_buffered_and_does_not_advance_seq() {
     let sd = SessionData::new(64).await;
-    sd.push_message(make_heartbeat()); // Heartbeat：不入 ring，seq=0，不递增 next_seq
-    sd.push_message(make_msg("a")); // seq 1
-    sd.push_message(make_heartbeat());
-    sd.push_message(make_msg("b")); // seq 2（Heartbeat 不占 seq 号）
+    sd.push_message(make_heartbeat()).await.unwrap(); // Heartbeat：不入 ring，seq=0，不递增 next_seq
+    sd.push_message(make_msg("a")).await.unwrap(); // seq 1
+    sd.push_message(make_heartbeat()).await.unwrap();
+    sd.push_message(make_msg("b")).await.unwrap(); // seq 2（Heartbeat 不占 seq 号）
 
     let got: Vec<u64> = sd
         .replay_since(0)
@@ -210,11 +210,11 @@ async fn heartbeat_not_buffered_and_does_not_advance_seq() {
 #[tokio::test]
 async fn ring_overflow_drops_oldest_and_keeps_seq_contiguous() {
     let sd = SessionData::new(3).await; // 容量 3
-    sd.push_message(make_msg("a")); // seq 1
-    sd.push_message(make_msg("b")); // seq 2
-    sd.push_message(make_msg("c")); // seq 3
-    sd.push_message(make_msg("d")); // seq 4，挤掉 seq1
-    sd.push_message(make_msg("e")); // seq 5，挤掉 seq2
+    sd.push_message(make_msg("a")).await.unwrap(); // seq 1
+    sd.push_message(make_msg("b")).await.unwrap(); // seq 2
+    sd.push_message(make_msg("c")).await.unwrap(); // seq 3
+    sd.push_message(make_msg("d")).await.unwrap(); // seq 4，挤掉 seq1
+    sd.push_message(make_msg("e")).await.unwrap(); // seq 5，挤掉 seq2
 
     let got: Vec<u64> = sd
         .replay_since(0)
@@ -251,7 +251,7 @@ async fn multi_subscriber_coexistence_and_selective_close() {
     assert!(!second_cancel.is_cancelled());
 
     // 两个订阅者都收到实时消息
-    session.push_message(make_msg("m1"));
+    session.push_message(make_msg("m1")).await.unwrap();
     assert_eq!(
         first_rx.recv().await.expect("first receives").1.sub_type,
         "m1"
@@ -269,7 +269,7 @@ async fn multi_subscriber_coexistence_and_selective_close() {
         "closed subscriber sender must be dropped"
     );
     assert!(!second_cancel.is_cancelled(), "peer subscriber unaffected");
-    session.push_message(make_msg("m2"));
+    session.push_message(make_msg("m2")).await.unwrap();
     assert_eq!(
         second_rx
             .recv()
@@ -351,4 +351,89 @@ async fn ensure_project_session_ignores_stale_session_id() {
     );
 
     registry.remove_by_project(project);
+}
+
+#[tokio::test]
+async fn accepted_messages_survive_command_backpressure() {
+    let session = SessionData::new(2048).await;
+    for _ in 0..1001 {
+        session.push_message(make_msg("delta")).await.unwrap();
+    }
+    assert_eq!(session.replay_since(0).await.len(), 1001);
+}
+
+#[tokio::test]
+async fn slow_subscriber_is_cancelled_without_blocking_peer() {
+    let session = SessionData::new(64).await;
+    let (_, _, _slow_rx, slow_cancel) = session.create_new_connection(1, 0).await.unwrap();
+    let (_, _, mut fast_rx, fast_cancel) = session.create_new_connection(8, 0).await.unwrap();
+    session.push_message(make_msg("first")).await.unwrap();
+    session.push_message(make_msg("second")).await.unwrap();
+    session.replay_since(0).await;
+    assert!(slow_cancel.is_cancelled());
+    assert!(!fast_cancel.is_cancelled());
+    assert_eq!(session.connections_len(), 1);
+    assert_eq!(fast_rx.recv().await.unwrap().1.sub_type, "first");
+    assert_eq!(fast_rx.recv().await.unwrap().1.sub_type, "second");
+}
+
+#[tokio::test]
+async fn cancelled_enqueue_is_not_accepted_and_closed_worker_errors() {
+    let session = SessionData::new(64).await;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert!(
+        session
+            .push_message_with_cancel(make_msg("cancelled"), &cancel)
+            .await
+            .is_err()
+    );
+    assert!(session.replay_since(0).await.is_empty());
+    let worker = session.worker_handle.lock().await.take().unwrap();
+    worker.abort();
+    assert!(worker.await.is_err());
+    assert!(session.push_message(make_msg("closed")).await.is_err());
+}
+
+#[tokio::test]
+async fn terminal_clears_ring_after_slow_subscriber_is_cancelled() {
+    let session = SessionData::new(64).await;
+    let (_, _, _slow_rx, slow_cancel) = session.create_new_connection(1, 0).await.unwrap();
+    let (_, _, mut fast_rx, _) = session.create_new_connection(8, 0).await.unwrap();
+    session.push_message(make_msg("first")).await.unwrap();
+    let mut terminal = make_msg("end_turn");
+    terminal.message_type = SessionMessageType::SessionPromptEnd;
+    session.push_message(terminal).await.unwrap();
+    assert!(session.replay_since(0).await.is_empty());
+    assert!(slow_cancel.is_cancelled());
+    assert_eq!(fast_rx.recv().await.unwrap().1.sub_type, "first");
+    assert_eq!(fast_rx.recv().await.unwrap().1.sub_type, "end_turn");
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_a_backpressured_enqueue() {
+    let session = SessionData::new(2048).await;
+    for _ in 0..COMMAND_CHANNEL_BUFFER_SIZE {
+        assert!(
+            session
+                .command_tx
+                .try_send(SessionCommand::Push {
+                    message: make_msg("queued"),
+                })
+                .is_ok()
+        );
+    }
+    let cancel = CancellationToken::new();
+    let send = session.push_message_with_cancel(make_msg("cancelled"), &cancel);
+    tokio::pin!(send);
+    assert!(futures_util::poll!(send.as_mut()).is_pending());
+    cancel.cancel();
+    assert!(send.await.is_err());
+    let replay = session.replay_since(0).await;
+    assert_eq!(replay.len(), COMMAND_CHANNEL_BUFFER_SIZE);
+    assert!(
+        replay
+            .iter()
+            .all(|(_, message)| message.sub_type == "queued")
+    );
 }

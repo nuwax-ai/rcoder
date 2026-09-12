@@ -95,6 +95,7 @@ async fn run_inner(
     // pingap 失败仍整体 Err 全组清理——入口必需）
     let mut startup_failures: Vec<FailedService> = Vec::new();
     let startup = async {
+        crate::static_hosting::reconcile(&specs, &args.workspace, dev_profile).await?;
         // ── 启动循环（容错）：单服务失败记 EVT 后 continue ──
         for spec in &specs {
             // static 服务：内置静态托管承载（无进程，bind 即成恒成功；dev 源码态
@@ -103,34 +104,14 @@ async fn run_inner(
                 emit_event(&OrchestrationEvent::ServiceStarting {
                     service: spec.service_id.clone(),
                 });
-                match crate::static_hosting::ensure_spawned(spec, &args.workspace) {
-                    Ok(()) => {
-                        info!(
-                            "📄 static host '{}' serving on :{} (content dir {})",
-                            spec.service_id,
-                            spec.port,
-                            spec.static_content_dir.as_deref().unwrap_or("?")
-                        );
-                        emit_event(&OrchestrationEvent::ServiceStartOk {
-                            service: spec.service_id.clone(),
-                        });
-                        // 内置托管也是"用户服务已启动"——纯 static workspace 不触发
-                        // 下方 no-service-started 守卫（bind 即成，恒成功）
-                        started_user_services += 1;
-                    }
-                    Err(e) => {
-                        let error = format!("static host: {e:#}");
-                        warn!("⚠️  {error} — 跳过该服务，继续启动其余服务");
-                        emit_event(&OrchestrationEvent::ServiceStartFail {
-                            service: spec.service_id.clone(),
-                            error: error.clone(),
-                        });
-                        startup_failures.push(FailedService {
-                            service: spec.service_id.clone(),
-                            error,
-                        });
-                    }
-                }
+                info!(
+                    "Static host '{}' serving on :{}",
+                    spec.service_id, spec.port
+                );
+                emit_event(&OrchestrationEvent::ServiceStartOk {
+                    service: spec.service_id.clone(),
+                });
+                started_user_services += 1;
                 continue;
             }
             // migrate（如有）—— per-service：失败=该服务跳过（不再全局 fail-fast；
@@ -276,7 +257,7 @@ async fn run_inner(
     };
     if let Err(e) = startup.await {
         error!("❌ startup failed, shutting down already-started children: {e:#}");
-        shutdown_all(std::mem::take(&mut children), 5).await;
+        shutdown_all(std::mem::take(&mut children), 5).await?;
         return Err(e);
     }
 
@@ -359,7 +340,7 @@ async fn run_inner(
     // 失败路径同样先清理 (此时 children 里至少有 pingap), 与 startup 失败兜底一致。
     if started_user_services == 0 {
         error!("❌ no service started, shutting down already-started children");
-        shutdown_all(std::mem::take(&mut children), 5).await;
+        shutdown_all(std::mem::take(&mut children), 5).await?;
         anyhow::bail!("no service started");
     }
 
@@ -380,7 +361,7 @@ async fn run_inner(
         .iter()
         .map(|failure| failure.service.clone())
         .collect::<Vec<_>>();
-    supervise(children, shutdown_timeout, cancel, known_failed).await;
+    supervise(children, shutdown_timeout, cancel, known_failed).await?;
     runtime_status.set_ready(false);
     Ok(())
 }
@@ -608,7 +589,12 @@ async fn start_service(
 /// 捕获 stdout/stderr（不 `Stdio::null()` 丢弃）：成功走 `info!`，失败带 stderr 返回错误，
 /// 便于排障（Fail Fast：暴露而非吞掉）。
 pub(crate) async fn run_transient(argv: &[String], cwd: &Path) -> Result<()> {
-    let mut child = Command::new(crate::win_cmd::resolve_spawn_program(&argv[0]))
+    run_transient_with_timeout(argv, cwd, Duration::from_secs(300)).await
+}
+
+async fn run_transient_with_timeout(argv: &[String], cwd: &Path, timeout: Duration) -> Result<()> {
+    let program = argv.first().context("migration command is empty")?;
+    let mut child = process_group_command(crate::win_cmd::resolve_spawn_program(program))
         .args(&argv[1..])
         .current_dir(cwd)
         .stdout(Stdio::piped())
@@ -616,6 +602,7 @@ pub(crate) async fn run_transient(argv: &[String], cwd: &Path) -> Result<()> {
         .spawn()
         .with_context(|| format!("spawn migrate: {}", argv.join(" ")))?;
 
+    let groups = child.id().into_iter().collect();
     // 并发 drain stdout/stderr：防 pipe 被写满阻塞 + 捕获失败原因
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -634,17 +621,23 @@ pub(crate) async fn run_transient(argv: &[String], cwd: &Path) -> Result<()> {
         buf
     });
 
-    // migrate 超时兜底：命令等待 stdin / 死循环时会永久卡住启动阶段
-    //（不进 supervise、readiness 恒 false、supervisord 也不重启它——进程
-    // 没退出），与 readiness 120s / bg_chat 150s 同款有限等待
-    const MIGRATE_TIMEOUT: Duration = Duration::from_secs(300);
-    let status = match tokio::time::timeout(MIGRATE_TIMEOUT, child.wait()).await {
+    let outcome = tokio::time::timeout(timeout, child.wait()).await;
+    // A shell may exit successfully while descendants still execute migrations.
+    // Confirm the original group is gone before allowing recovery or success.
+    if let Err(error) = shutdown_all_with_groups(vec![("migration".into(), child)], groups, 0).await
+    {
+        out_task.abort();
+        err_task.abort();
+        return Err(error);
+    }
+    let status = match outcome {
         Ok(status) => status.context("wait migrate")?,
         Err(_) => {
-            let _ = child.kill().await;
+            out_task.abort();
+            err_task.abort();
             anyhow::bail!(
-                "migrate timed out after {}s: {}",
-                MIGRATE_TIMEOUT.as_secs(),
+                "migrate timed out after {}ms: {}",
+                timeout.as_millis(),
                 argv.join(" ")
             );
         }
@@ -727,7 +720,7 @@ async fn start_pingap(
     .await
     {
         error!("❌ pingap initial config confirmation failed: {error:#}");
-        shutdown_all(std::mem::take(children), 5).await;
+        shutdown_all(std::mem::take(children), 5).await?;
         return Err(error).context("confirm initial Pingap config via loopback admin probe");
     } else {
         info!("✅ pingap initial config confirmed (config_hash matched)");
@@ -745,7 +738,11 @@ async fn supervise(
     shutdown_timeout_seconds: u64,
     cancel: Option<tokio_util::sync::CancellationToken>,
     known_failed: Vec<String>,
-) {
+) -> Result<()> {
+    let groups = children
+        .iter()
+        .filter_map(|(_, child)| child.id())
+        .collect();
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("📡 received SIGINT, shutting down");
@@ -768,43 +765,85 @@ async fn supervise(
             }
         }
     }
-    shutdown_all(children, shutdown_timeout_seconds).await;
+    shutdown_all_with_groups(children, groups, shutdown_timeout_seconds).await
 }
 
-/// 优雅停止所有子进程：SIGTERM → 等 `SHUTDOWN_GRACE_SECS` → SIGKILL 残留。
-async fn shutdown_all(mut children: Vec<(String, Child)>, shutdown_timeout_seconds: u64) {
-    // 1. SIGTERM 所有子进程
-    for (_, child) in children.iter_mut() {
+/// A deployment cannot publish a terminal status until shutdown is confirmed.
+#[derive(Debug)]
+pub(crate) struct ShutdownUnconfirmed(pub String);
+impl std::fmt::Display for ShutdownUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shutdown not confirmed: {}", self.0)
+    }
+}
+impl std::error::Error for ShutdownUnconfirmed {}
+
+async fn shutdown_all(children: Vec<(String, Child)>, shutdown_timeout_seconds: u64) -> Result<()> {
+    let groups: Vec<_> = children
+        .iter()
+        .filter_map(|(_, child)| child.id())
+        .collect();
+    shutdown_all_with_groups(children, groups, shutdown_timeout_seconds).await
+}
+
+async fn shutdown_all_with_groups(
+    mut children: Vec<(String, Child)>,
+    groups: Vec<u32>,
+    shutdown_timeout_seconds: u64,
+) -> Result<()> {
+    for (_, child) in &mut children {
         send_term(child);
     }
-    info!(
-        "🛑 SIGTERM sent to {} process(es); grace {}s",
-        children.len(),
-        shutdown_timeout_seconds
-    );
-
-    // 2. grace 窗口内轮询收尸
-    let mut done = vec![false; children.len()];
-    let deadline = std::time::Instant::now() + Duration::from_secs(shutdown_timeout_seconds);
-    while std::time::Instant::now() < deadline {
-        for (i, (_, child)) in children.iter_mut().enumerate() {
-            if !done[i] && matches!(child.try_wait(), Ok(Some(_))) {
-                done[i] = true;
-            }
-        }
-        if done.iter().all(|&d| d) {
-            info!("✅ all children exited gracefully");
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let grace = tokio::time::Instant::now() + Duration::from_secs(shutdown_timeout_seconds);
+    if wait_for_quiescence(&mut children, &groups, grace).await? {
+        return Ok(());
     }
+    for &pid in &groups {
+        #[cfg(unix)]
+        process_utils::kill_process_group(pid, process_utils::KillSignal::SIGKILL);
+        #[cfg(not(unix))]
+        let _ = pid;
+    }
+    #[cfg(not(unix))]
+    for (_, child) in &mut children {
+        child
+            .start_kill()
+            .map_err(|e| ShutdownUnconfirmed(e.to_string()))?;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    if wait_for_quiescence(&mut children, &groups, deadline).await? {
+        return Ok(());
+    }
+    Err(ShutdownUnconfirmed("processes remain after termination deadline".into()).into())
+}
 
-    // 3. 超时 SIGKILL 残留
-    for (i, (name, child)) in children.iter_mut().enumerate() {
-        if !done[i] {
-            send_kill(child);
-            warn!("💀 force-killed {name} (SIGKILL after grace)");
+async fn wait_for_quiescence(
+    children: &mut [(String, Child)],
+    groups: &[u32],
+    deadline: tokio::time::Instant,
+) -> Result<bool> {
+    loop {
+        let mut exited = true;
+        for (name, child) in children.iter_mut() {
+            exited &= child
+                .try_wait()
+                .map_err(|e| ShutdownUnconfirmed(format!("reap {name}: {e}")))?
+                .is_some();
         }
+        #[cfg(unix)]
+        for &pid in groups {
+            exited &= !process_utils::process_group_exists(pid)
+                .map_err(|e| ShutdownUnconfirmed(format!("inspect process group {pid}: {e}")))?;
+        }
+        #[cfg(not(unix))]
+        let _ = groups;
+        if exited {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -824,55 +863,19 @@ fn send_term(child: &mut Child) {
     let _ = child.start_kill();
 }
 
-#[cfg(unix)]
-fn send_kill(child: &mut Child) {
-    if let Some(pid) = child.id()
-        && !process_utils::kill_process_group(pid, process_utils::KillSignal::SIGKILL)
-    {
-        tracing::debug!(pid, "send_kill: signal not delivered");
-    }
-}
-
-#[cfg(not(unix))]
-fn send_kill(child: &mut Child) {
-    let _ = child.start_kill();
-}
-
-/// 轮询所有子进程，第一个退出的返回其名字（500ms 间隔）。
-/// 监测任一子进程退出。`known_failed`：启动判定已失败的服务（readiness
-/// 探测超时等，启动编排按"部分运行态"保留了它们）——其退出**不触发整组停**
-///（与启动容错语义一致：失败的旧进程退出是预期路径，杀掉其余正常服务是
-/// 矛盾行为）；已退出的失败服务从监测集中移除（不再重复判定）。
-/// 成功启动的服务退出仍整组停（防端口残留 crash-loop 的既有语义）。
+/// Detect an unexpected child exit without discarding handles or process-group
+/// identities: final shutdown still has to confirm every original group stopped.
 async fn poll_any_exit(
-    children: &mut Vec<(String, Child)>,
+    children: &mut [(String, Child)],
     known_failed: &[String],
 ) -> Option<String> {
     loop {
-        // 第一个退出的**正常服务**（触发整组停）；已知失败服务的退出静默移出
-        // 监测集（部分运行态语义：失败者退出是预期路径）
-        let mut normal_exit: Option<String> = None;
-        children.retain_mut(|(name, child)| {
-            let exited = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
-            if !exited {
-                return true;
+        for (name, child) in children.iter_mut() {
+            if matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+                && !known_failed.iter().any(|failed| failed == name)
+            {
+                return Some(name.clone());
             }
-            if known_failed.iter().any(|failed| failed == name) {
-                warn!("⚠️  {name}（启动判定失败，已标记）退出 — 不触发整组停");
-                return false; // 移出监测集
-            }
-            if normal_exit.is_none() {
-                normal_exit = Some(name.clone());
-            }
-            false
-        });
-        if let Some(name) = normal_exit {
-            return Some(name);
-        }
-        // 全部退出且均为 known_failed（被移除）：children 空——不再有崩溃可
-        // 监测，阻塞挂起让信号/取消分支主导（外层 supervisor 重启策略收尾）
-        if children.is_empty() {
-            std::future::pending::<()>().await;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -993,5 +996,97 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("not ready within 1 seconds"), "{message}");
         assert!(message.contains("/ready"), "{message}");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forced_shutdown_reaps_real_child_and_confirms_group_absence() {
+        use tokio::io::AsyncBufReadExt;
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "trap '' TERM; echo ready; exec sleep 30"])
+            .process_group(0)
+            .stdout(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("ready"));
+        shutdown_all(vec![("ignores-term".into(), child)], 0)
+            .await
+            .unwrap();
+        assert!(!process_utils::process_group_exists(pid).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quiescence_deadline_does_not_report_a_live_child_as_stopped() {
+        let mut command = Command::new("sleep");
+        command.arg("30").process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let mut children = vec![("alive".into(), child)];
+        assert!(
+            !wait_for_quiescence(&mut children, &[pid], tokio::time::Instant::now())
+                .await
+                .unwrap()
+        );
+        shutdown_all(children, 0).await.unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn migration_timeout_confirms_original_process_group_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "echo $$ > migration.pid; exec sleep 30".into(),
+        ];
+        let result =
+            run_transient_with_timeout(&argv, root.path(), Duration::from_millis(100)).await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        let pid: u32 = std::fs::read_to_string(root.path().join("migration.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!process_utils::process_group_exists(pid).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_migration_cannot_leave_background_group_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().to_owned();
+        let migration = tokio::spawn(async move {
+            let argv = vec![
+                "sh".into(),
+                "-c".into(),
+                "echo $$ > migration.pid; while [ ! -f exit-now ]; do :; done; exit 0".into(),
+            ];
+            run_transient_with_timeout(&argv, &directory, Duration::from_secs(5)).await
+        });
+        let pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(text) = tokio::fs::read_to_string(root.path().join("migration.pid")).await
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Keep a second real process in the migration group, but parent it to the
+        // test so it is reaped deterministically instead of depending on PID 1.
+        let mut command = Command::new("sleep");
+        command.arg("30").process_group(i32::try_from(pid).unwrap());
+        let mut member = command.spawn().unwrap();
+        let reaper = tokio::spawn(async move { member.wait().await.unwrap() });
+        tokio::fs::write(root.path().join("exit-now"), b"go")
+            .await
+            .unwrap();
+        migration.await.unwrap().unwrap();
+        assert!(!reaper.await.unwrap().success());
+        assert!(!process_utils::process_group_exists(pid).unwrap());
     }
 }

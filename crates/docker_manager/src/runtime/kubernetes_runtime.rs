@@ -196,10 +196,67 @@ pub(super) fn read_app_expose_env() -> (Option<String>, Option<String>, HttpExpo
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 impl AgentContainerRuntime for KubernetesRuntime {
+    async fn acquire_builder_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        self.acquire_application_operation(app_id, &ServiceType::UserappBuilder)
+            .await
+    }
+    async fn capture_builder_deletion(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::BuilderDeletionSnapshot> {
+        self.capture_builder(app_id).await
+    }
+    async fn delete_builder_snapshot(
+        &self,
+        snapshot: &shared_types::BuilderDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        self.delete_captured_builder(snapshot).await
+    }
     async fn create_container(
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        let lease = if params.service_type == ServiceType::UserappBuilder {
+            let identifier = params
+                .service_type
+                .container_identifier(
+                    params.pod_id.as_deref(),
+                    params.user_id.as_deref(),
+                    params.project_id.as_deref(),
+                )
+                .map_err(|error| ContainerRuntimeError::ConfigurationError(error.to_string()))?;
+            Some(self.acquire_builder_operation(identifier).await?)
+        } else {
+            None
+        };
+        if let Some(lease) = lease {
+            let runtime = Self {
+                client: self.client.clone(),
+                namespace: self.namespace.clone(),
+                config: self.config.clone(),
+                pod_cache: self.pod_cache.clone(),
+                subvolume_path_cache: self.subvolume_path_cache.clone(),
+            };
+            return tokio::spawn(async move {
+                let result = runtime.create_agent_container(params).await;
+                if result.is_ok() {
+                    lease
+                        .release()
+                        .await
+                        .map_err(ContainerRuntimeError::ConnectionError)?;
+                }
+                result
+            })
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::ContainerCreationError(format!(
+                    "builder creation worker: {e}"
+                ))
+            })?;
+        }
         self.create_agent_container(params).await
     }
 
@@ -445,10 +502,26 @@ impl WorkspaceRuntime for KubernetesRuntime {
         // 委派 K8sPvcOps::destroy_workspace_pvc (service_type=Userapp; 仅 Userapp 走此路径,
         // agent PVC 永不删)。trait 方法默认 no-op, Docker 不覆盖。
         // 显式消歧: WorkspaceRuntime trait 也定义了同名方法(见下)。
-        K8sPvcOps::destroy_workspace_pvc(self, app_id, &ServiceType::Userapp).await?;
+        let snapshot = self.capture_deletion(app_id, None).await?;
+        if snapshot
+            .resources
+            .iter()
+            .any(|r| r.kind == shared_types::AppResourceKind::Deployment)
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "application compute must be deleted before storage".into(),
+            ));
+        }
         // 兜底回收存量第二块 `-data` PVC（单卷化前的旧布局；新部署不存在=幂等 no-op）。
         // 失败不吞：半清理状态（数据卷残留=孤儿计费）比整体失败更难对账。
-        K8sPvcOps::destroy_app_data_pvc(self, app_id).await
+        self.delete_captured(&snapshot, true).await
+    }
+
+    async fn destroy_app_storage_snapshot(
+        &self,
+        snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        self.delete_captured(snapshot, true).await
     }
 
     async fn destroy_workspace_pvc(

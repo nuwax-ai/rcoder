@@ -31,7 +31,12 @@ def check(name, ok, detail):
 
 
 def docker(*args):
-    return subprocess.check_output(['docker', *args], text=True, timeout=90, stderr=subprocess.STDOUT).strip()
+    try:
+        return subprocess.check_output(['docker', *args], text=True, timeout=90, stderr=subprocess.STDOUT).strip()
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f'Docker command failed ({error.returncode}): ' + (error.output or '').replace(TOKEN, '<redacted>')) from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('Docker command timed out after 90 seconds') from None
 
 
 def artifact(release, content, extra=None, command="server.js"):
@@ -85,6 +90,40 @@ format = "jsonl"
     return body.getvalue()
 
 
+def static_artifact(release, content, directory, port, broken=False):
+    original = zipfile.ZipFile(io.BytesIO(artifact(release, content)))
+    manifest = original.read('release.lock.toml').decode().replace('type = "node"', 'type = "static"', 1)
+    manifest = manifest.replace('port = 4200', f'port = {port}\nstatic_content_dir = "{directory}"', 1)
+    manifest = manifest.replace('command = ["node", "server.js"]', 'command = []', 1)
+    if broken:
+        manifest += '''
+[[services]]
+service_id = "broken"
+name = "Broken"
+dir = "broken"
+type = "node"
+kind = "web"
+enabled = true
+port = 4209
+logs = []
+env = {}
+[services.run]
+command = ["node", "missing.js"]
+shutdown_timeout_seconds = 1
+[services.health]
+startup_timeout_seconds = 2
+'''
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, 'w', zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('release.lock.toml', manifest)
+        archive.writestr(f'web/{directory}/index.html', content)
+        if directory != 'static-a':
+            archive.writestr('web/static-a/index.html', 'STALE_STATIC_ROOT')
+        if broken:
+            archive.writestr('broken/placeholder', 'missing program is intentional')
+    return data.getvalue()
+
+
 A = artifact('manifest-A', 'content-A')
 B = artifact('manifest-B', 'content-B')
 missing = io.BytesIO()
@@ -108,6 +147,14 @@ def link_payload(links):
             archive.writestr(link, target)
     return data.getvalue()
 
+
+PAYLOADS.update({
+    '/static-a': static_artifact('static-A', 'STATIC_A', 'static-a', 4202),
+    '/static-b': static_artifact('static-B', 'STATIC_B', 'static-b', 4202),
+    '/static-c': static_artifact('static-C', 'STATIC_C', 'static-c', 4203),
+    '/static-failed': static_artifact('static-failed', 'MUST_NOT_SERVE', 'static-failed', 4204, broken=True),
+    '/after-static': artifact('after-static', 'AFTER_STATIC'),
+})
 
 PAYLOADS['/link-escape'] = link_payload([('escape', '../outside')])
 PAYLOADS['/link-cycle'] = link_payload([('cycle-a', 'cycle-b'), ('cycle-b', 'cycle-a')])
@@ -237,6 +284,33 @@ def main():
         check('B identity', result['phase'] == 'running' and result['artifact_release_id'] == 'manifest-B', str(result))
         check('former capacity and entry settings do not reject B', result['phase'] == 'running', 'B exceeds former download, total, file and entry settings')
         check('B serves content', poll(lambda: request_http(app, '/')[1] == b'content-B'), 'actual response body')
+        def port_closed(port):
+            script = f"fetch('http://127.0.0.1:{port}/health').then(()=>process.exit(1)).catch(()=>process.exit(0))"
+            return subprocess.run(['docker', 'exec', container, 'node', '-e', script], timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+        for path, op, content in [('/static-a', 'static-A', b'STATIC_A'), ('/static-b', 'static-B', b'STATIC_B'), ('/static-c', 'static-C', b'STATIC_C')]:
+            status, data = submit(path, op)
+            check(op + ' accepted', status == 202, str(data))
+            result = poll(lambda: terminal(op))
+            check(op + ' identity', result['phase'] == 'running' and result['artifact_release_id'] == op, str(result))
+            check(op + ' actual content', poll(lambda: request_http(app, '/')[1] == content), 'actual proxy response')
+        check('static old port released', port_closed(4202), 'port 4202 must no longer accept requests')
+        status, data = submit('/static-failed', 'static-failed')
+        check('static failure accepted', status == 202, str(data))
+        def static_restored():
+            result = terminal('static-failed')
+            recovery = (result or {}).get('recovery') or {}
+            if result and result.get('phase') == 'failed' and recovery.get('status') not in ('pending', 'restored'):
+                raise AssertionError('Static deployment failed without restoration: ' + json.dumps(result))
+            return result if result and recovery.get('status') == 'restored' else None
+        result = poll(static_restored)
+        check('static failed deployment restores serving configuration', result['phase'] == 'failed' and request_http(app, '/')[1] == b'STATIC_C' and request_http(base, '/ready')[0] == 200, str(result))
+        check('static failed generation port released', port_closed(4204), 'port 4204 must be released after recovery')
+        status, data = submit('/after-static', 'after-static')
+        check('static removal accepted', status == 202, str(data))
+        result = poll(lambda: terminal('after-static'))
+        check('static removal serves replacement', result['phase'] == 'running' and poll(lambda: request_http(app, '/')[1] == b'AFTER_STATIC'), str(result))
+        check('removed static listener closed', port_closed(4203), 'port 4203 must be released when removed')
         check('container unchanged', docker('inspect', '--format', '{{.Id}}', container) == container, container)
     finally:
         RELEASE.set()

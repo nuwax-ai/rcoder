@@ -474,6 +474,13 @@ async fn session_miss_backfills_from_pg_into_mirror() {
     let project_id = format!("pgfetch-{}", uuid_suffix());
     let session_id = format!("sess-{project_id}");
 
+    // B must load before A commits: startup now restores persisted session identity.
+    // This creates a real cross-replica miss without weakening the miss assertion.
+    let (store_b, _rx_b) =
+        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .expect("connect B");
+
     // 副本 A durable 写入（模拟 chat 落 A）
     let (store_a, _rx_a) =
         PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
@@ -488,11 +495,6 @@ async fn session_miss_backfills_from_pg_into_mirror() {
         .await
         .expect("A durable insert");
 
-    // 副本 B（镜像空，模拟另一 rcoder 副本）——回源直查必中 + hydrate
-    let (store_b, _rx_b) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .expect("connect B");
     assert!(
         store_b.inner().get_by_session_id(&session_id).is_none(),
         "B mirror starts empty"
@@ -510,5 +512,31 @@ async fn session_miss_backfills_from_pg_into_mirror() {
             .get_by_session_id_with_fetch("sess-nonexistent")
             .await
             .is_none()
+    );
+}
+
+/// A completed task is not proof that its final drain committed.
+#[tokio::test]
+async fn shutdown_failure_is_not_success_on_first_or_repeated_call() {
+    use super::{persist_ops::PersistOp, writer::PersistWriter};
+    use std::sync::atomic::AtomicI64;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+        .expect("lazy pool");
+    pool.close().await;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tx.send(PersistOp::RemoveProject {
+        project_id: "shutdown-contract".into(),
+        generation: "old".into(),
+    })
+    .expect("queue operation");
+    let writer = PersistWriter::spawn(pool, rx, Arc::new(AtomicI64::new(1)));
+    assert!(
+        !writer.flush_and_stop(Duration::from_secs(2)).await,
+        "failed final drain must not report success"
+    );
+    assert!(
+        !writer.flush_and_stop(Duration::from_secs(2)).await,
+        "repeated shutdown must preserve failure"
     );
 }

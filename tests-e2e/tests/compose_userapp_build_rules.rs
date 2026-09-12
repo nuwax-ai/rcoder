@@ -413,7 +413,7 @@ async fn userapp_devbuild_skip_and_fallback_source_mode() {
     // marker 即"编译发生过"的黑盒探针（源码态编译不校验 artifact，marker 是
     // 唯一可见证据）。运行侧均 python3 http.server + touch ready（B5 同款范式）。
     let ws_manifest = "schema_version = 1\n\n[workspace]\nname = \"e2e-br-dbs\"\n";
-    let go_manifest = "schema_version = 1\n\n[project]\nservice_id = \"go-svc\"\nname = \"Go API\"\ntype = \"go\"\n\n[build]\ncommand = [\"sh\", \"-c\", \"touch built-go.marker\"]\nartifact = \"artifact.zip\"\n\n[run]\ncommand = [\"sh\", \"-c\", \"touch ready-go && exec python3 -m http.server $PORT --bind 0.0.0.0\"]\n\n[health]\nreadiness_path = \"/ready-go\"\n\n[proxy]\npath = \"/api/go/\"\nstrip_prefix = true\n";
+    let go_manifest = "schema_version = 1\n\n[project]\nservice_id = \"go-svc\"\nname = \"Go API\"\ntype = \"go\"\n\n[build]\ncommand = [\"sh\", \"-c\", \"touch built-go.marker\"]\nartifact = \"artifact.zip\"\n\n[run]\ncommand = [\"sh\", \"-c\", \"echo Q10_OLD_GO > ready-go && exec python3 -m http.server $PORT --bind 0.0.0.0\"]\n\n[health]\nreadiness_path = \"/ready-go\"\n\n[proxy]\npath = \"/api/go/\"\nstrip_prefix = true\n";
     let dev_manifest = "schema_version = 1\n\n[project]\nservice_id = \"dev-svc\"\nname = \"Hot Reload\"\ntype = \"node\"\n\n[build]\ncommand = [\"sh\", \"-c\", \"touch built-dev.marker\"]\nartifact = \"artifact.zip\"\n\n[run]\ncommand = [\"sh\", \"-c\", \"touch ready-dev && exec python3 -m http.server $PORT --bind 0.0.0.0\"]\n\n[health]\nreadiness_path = \"/ready-dev\"\n\n[devrun]\ncommand = [\"sh\", \"-c\", \"touch ready-dev && exec python3 -m http.server $PORT --bind 0.0.0.0\"]\n\n[proxy]\npath = \"/dev/\"\n";
     if !init_zip_workspace(
         &env,
@@ -533,6 +533,110 @@ async fn userapp_devbuild_skip_and_fallback_source_mode() {
         "dev/list → port=9080 + pid>0",
         listed,
         format!("body 截断: {}", trunc(&body, 150)),
+    );
+
+    // Q10: start still builds when an existing process is healthy. A failed build
+    // must not become an idempotent success, nor stop the previously running app.
+    let failing_manifest =
+        format!("{dev_manifest}\n[devbuild]\ncommand = [\"sh\", \"-c\", \"exit 37\"]\n");
+    let changed = env.http.post(format!("{}/api/v1/userapp/generate-file", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .json(&json!({"app_id": app, "user_id": user, "file_name": "dev-svc/project.manifest.toml", "content": failing_manifest}))
+        .send().await.expect("write failing devbuild");
+    let changed: Value = changed.json().await.expect("file write response");
+    report.assert_hard(
+        "Q10 failing build fixture installed",
+        changed["success"] == true || http_ok(&changed),
+        trunc(&changed, 200),
+    );
+    let second: Value = env
+        .http
+        .post(format!("{}/api/v1/userapp/dev/start", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .json(&json!({"app_id": app, "user_id": user}))
+        .send()
+        .await
+        .expect("second start")
+        .json()
+        .await
+        .expect("start response");
+    let second_id = second["data"]["task_id"]
+        .as_str()
+        .expect("second task identity");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut second_terminal = Value::Null;
+    while Instant::now() < deadline {
+        let snapshot: Value = env
+            .http
+            .get(format!(
+                "{}/api/v1/userapp/tasks/{second_id}?app_id={app}&user_id={user}",
+                env.rcoder
+            ))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .expect("second task poll")
+            .json()
+            .await
+            .expect("task JSON");
+        if matches!(
+            snapshot["data"]["status"].as_str(),
+            Some("completed" | "failed" | "cancelled")
+        ) {
+            second_terminal = snapshot;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    report.assert_hard(
+        "Q10 failed build cannot become already-running success",
+        second_terminal["data"]["status"] == "failed",
+        trunc(&second_terminal, 300),
+    );
+    let after: Value = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/dev/list?app_id={app}&user_id={user}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .expect("list after failure")
+        .json()
+        .await
+        .expect("list JSON");
+    report.assert_hard(
+        "Q10 previous process preserved after build failure",
+        listed
+            && body["data"]["list"]
+                .as_array()
+                .and_then(|items| items.iter().find(|item| item["port"] == 9080))
+                .map(|item| &item["pid"])
+                == after["data"]["list"]
+                    .as_array()
+                    .and_then(|items| items.iter().find(|item| item["port"] == 9080))
+                    .map(|item| &item["pid"]),
+        trunc(&after, 200),
+    );
+
+    let pingora =
+        std::env::var("E2E_PINGORA_URL").unwrap_or_else(|_| "http://127.0.0.1:8089".into());
+    let served = env
+        .http
+        .get(format!(
+            "{pingora}/api/v1/userapp/proxy/app/dev/{user}/{app}/api/go/ready-go"
+        ))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .expect("old app proxy response");
+    let status = served.status();
+    let content = served.text().await.expect("old app content");
+    report.assert_hard(
+        "Q10 previous content remains healthy after build failure",
+        status.is_success() && content.trim() == "Q10_OLD_GO",
+        format!("HTTP {status}, {content}"),
     );
 
     // dev/stop → Stopped（收尾，防 builder 残留进程族）

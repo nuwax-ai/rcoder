@@ -158,6 +158,24 @@ impl WorkspaceRuntime for DockerRuntime {
         }
         Ok(())
     }
+
+    async fn destroy_app_storage_snapshot(
+        &self,
+        snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        use container_runtime_api::UserAppDeploymentRuntime;
+        if !self
+            .capture_app_deletion(&snapshot.app_id, None)
+            .await?
+            .resources
+            .is_empty()
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "application container exists; storage deletion rejected".into(),
+            ));
+        }
+        self.destroy_app_pvc(&snapshot.app_id).await
+    }
 }
 
 /// dev 树 identifier 扫描（`list_workspace_identifiers(UserappBuilder)` 的实现体，

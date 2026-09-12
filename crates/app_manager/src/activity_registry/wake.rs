@@ -21,6 +21,25 @@ use shared_types::{AppWakeControl, WakeOutcome};
 
 use super::AppActivityRegistry;
 
+struct WakeOperation {
+    lease: Option<Box<dyn shared_types::AppOperationLease>>,
+    mutating: bool,
+}
+impl Drop for WakeOperation {
+    fn drop(&mut self) {
+        if !self.mutating
+            && let Some(lease) = self.lease.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                if let Err(error) = lease.release().await {
+                    tracing::error!(%error, "release wake preflight ownership failed");
+                }
+            });
+        }
+    }
+}
+
 /// wake 轮询 `get_deployment_status` 的间隔
 const WAKE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// follower 等待 leader 的额外宽限(leader 的 WakeGuard drop 必先广播,follower 不应先超时)
@@ -77,9 +96,9 @@ impl Drop for WakeGuard {
             .outcome
             .take()
             .unwrap_or_else(|| WakeOutcome::Failed(WAKE_LEADER_ABORTED.into()));
-        if let Err(e) = self.handle.tx.send(Some(outcome)) {
-            warn!("activity outcome send failed (no follower): {e}");
-        }
+        // A follower may have cloned the handle without subscribing yet.
+        // Retain the terminal result even when there are currently no receivers.
+        self.handle.tx.send_replace(Some(outcome));
         if let dashmap::mapref::entry::Entry::Occupied(entry) = self.map.entry(self.key.clone())
             && Arc::ptr_eq(entry.get(), &self.handle)
         {
@@ -141,6 +160,29 @@ impl AppActivityRegistry {
 
     /// leader 实际执行唤醒:scale→1 + 轮询直到 Running/Error/超时
     async fn wake_leader(&self, app_id: &str) -> WakeOutcome {
+        let Some(runtime) = self.runtime.get() else {
+            return WakeOutcome::Failed("runtime not initialized".into());
+        };
+        let lease = match runtime.acquire_app_operation(app_id).await {
+            Ok(lease) => lease,
+            Err(error) => return WakeOutcome::Failed(format!("acquire wake operation: {error}")),
+        };
+        let mut operation = WakeOperation {
+            lease,
+            mutating: false,
+        };
+        let outcome = self.wake_leader_locked(app_id, &mut operation).await;
+        if (!operation.mutating
+            || matches!(outcome, WakeOutcome::Ready | WakeOutcome::AlreadyRunning))
+            && let Some(lease) = operation.lease.take()
+            && let Err(error) = lease.release().await
+        {
+            return WakeOutcome::Failed(error);
+        }
+        outcome
+    }
+
+    async fn wake_leader_locked(&self, app_id: &str, operation: &mut WakeOperation) -> WakeOutcome {
         // 唤醒启动前已手动 stop（wake_blocked）：请求即授权覆盖历史 stop
         //（有请求即唤醒语义）；记录基线，唤醒**过程中**新到的 stop 才触发
         // 竞争补偿——时间后到者赢，并发 stop 语义不破。
@@ -154,6 +196,7 @@ impl AppActivityRegistry {
                 return WakeOutcome::Failed("runtime not initialized".into());
             }
         };
+        operation.mutating = true;
         // scale→1(幂等:已是 1 也无害)
         if let Err(e) = rt.scale_deployment(app_id, 1).await {
             return WakeOutcome::Failed(format!("scale_deployment: {e}"));

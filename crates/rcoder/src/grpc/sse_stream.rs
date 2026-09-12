@@ -245,7 +245,7 @@ pub async fn create_grpc_sse_stream(
                 let err_ev =
                     make_stream_error_event(tonic::Code::Internal, "forward task panicked");
                 let sse_event = progress_event_to_sse(&err_ev, &panic_sid);
-                drop(panic_tx.send(Ok(sse_event)).await);
+                drop(panic_tx.try_send(Ok(sse_event)));
                 panic_registry.release_first_client_claim(&panic_sid);
             }
         }
@@ -276,8 +276,9 @@ async fn forward_to_client(
         *client_last_seq = 0;
     }
     let sse_event = progress_event_to_sse(ev, session_id);
-    if tx.send(Ok(sse_event)).await.is_err() {
-        return false; // HTTP 客户端断开
+    if let Err(error) = tx.try_send(Ok(sse_event)) {
+        warn!(%session_id, %error, "Closing SSE subscriber because its queue is full or closed");
+        return false;
     }
     if ev.seq > *client_last_seq {
         *client_last_seq = ev.seq;
@@ -423,6 +424,25 @@ mod tests {
             seq,
             timestamp: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn full_subscriber_does_not_block_forwarder() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(Ok(axum::response::sse::Event::default().data("occupied")))
+            .unwrap();
+        let ev = shared_types::grpc::ProgressEvent::default();
+        let mut last_seq = 0;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            forward_to_client(&tx, &ev, "slow", &mut last_seq),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "full subscriber must not prevent forwarder cancellation/exit"
+        );
+        assert!(!result.unwrap());
     }
 
     #[tokio::test]

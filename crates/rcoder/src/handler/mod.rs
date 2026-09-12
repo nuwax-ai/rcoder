@@ -25,6 +25,7 @@ mod sse_builder;
 pub mod userapp_terminal_proxy_api;
 pub mod utils;
 pub mod validation_rules;
+mod version_handler;
 
 // 调试处理器（仅在启用 debug feature 时可用）
 #[cfg(feature = "debug")]
@@ -51,6 +52,7 @@ pub use pod_handler::*;
 pub use proxy_api::*;
 pub use proxy_handler_api::*;
 pub use userapp_terminal_proxy_api::*;
+pub use version_handler::*;
 
 // 仅在启用 debug feature 时导出 debug handler
 #[cfg(feature = "debug")]

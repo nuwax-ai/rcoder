@@ -27,7 +27,7 @@ impl AppService {
         let app_id = self.validate_create_request(&request).await?;
         // 与发布流水线/delete 串行: 防发布流水线 EnsureApp 建 Deployment 与并发
         // DELETE 互踩 (删成功但 Deployment 复活/半删半建脏状态)。
-        let process_lock = self.acquire_process_release_lock(&app_id).await;
+        let process_lock = self.acquire_process_release_lock(&app_id).await?;
         let result = self.create_app_locked(&app_id, request, process_lock).await;
         if result.is_ok() {
             self.invalidate_deploy_cache().await;
@@ -47,7 +47,7 @@ impl AppService {
         &self,
         app_id: &str,
         request: CreateAppRequest,
-        _process_lock: tokio::sync::OwnedMutexGuard<()>,
+        _process_lock: crate::service::AppOperationGuard,
     ) -> AppResult<AppInfo> {
         // 默认镜像单一收口（见函数 doc）：填充后 params/AppInfo 全链路恒 Some
         let mut request = request;
@@ -65,11 +65,19 @@ impl AppService {
             "[APP] creating app: {} ({}, mode={:?})",
             request.name, app_id, self.config.access_mode
         );
+        let params = match self.build_container_params(app_id, &request).await {
+            Ok(params) => params,
+            Err(error) => {
+                _process_lock.finish().await?;
+                return Err(error);
+            }
+        };
+        _process_lock.mark_mutating()?;
         self.provision_app_workspace(app_id, &request).await?;
         // provision_app_workspace 失败不走此分支：PVC/目录保留，下次 create 幂等复用。
         // The runtime owns partial-create compensation: only it has the IDs/UIDs
         // returned by successful create calls. A name conflict establishes no ownership.
-        self.create_app_runtime(app_id, &request).await?;
+        self.create_app_runtime(app_id, &request, params).await?;
         // 同 ID 删除后重建时，必须清除旧的 stopped/wake-blocked 内存态。
         self.activity.mark_running(app_id);
         // 业务元数据落库/缓存（name/租户/业务创建时间;集群不持有。request 随后 move 进 assemble）
@@ -89,7 +97,9 @@ impl AppService {
                 request.space_id.clone(),
             )
             .await;
-        Ok(self.assemble_app_info(app_id.to_string(), request).await)
+        let info = self.assemble_app_info(app_id.to_string(), request).await;
+        _process_lock.finish().await?;
+        Ok(info)
     }
 
     /// 校验创建请求并解析 app_id（app_id 规范 + 唯一性 + 资源格式 + 端口）。
@@ -211,8 +221,12 @@ impl AppService {
     ///
     /// 注: Userapp 是新开发逻辑 (application-management-service-v2-design.md), /app 路径
     /// 不涉及历史数据迁移 → 不调 lazy_migrate (新应用无旧数据)。Web/Computer 有历史数据才调。
-    async fn create_app_runtime(&self, app_id: &str, request: &CreateAppRequest) -> AppResult<()> {
-        let params = self.build_container_params(app_id, request).await?;
+    async fn create_app_runtime(
+        &self,
+        app_id: &str,
+        request: &CreateAppRequest,
+        params: container_runtime_api::ContainerCreateParams,
+    ) -> AppResult<()> {
         let container_info = self.runtime.create_deployment(params).await.map_err(|e| {
             map_runtime_error(
                 &format!("[APP] create_deployment failed app_id={app_id}"),

@@ -170,24 +170,25 @@ impl SessionWorker {
                         }
                     }
 
-                    // 遍历全部订阅者投递；Closed 的连接在迭代结束后按 id 精确移除
+                    // Deliver without blocking; remove closed or backpressured subscriptions after iteration.
                     // （不在迭代中 remove——DashMap 迭代持 shard 锁，同 shard remove 会死锁）
-                    let mut closed_conns: Vec<u64> = Vec::new();
+                    let mut disconnected_conns: Vec<u64> = Vec::new();
                     for entry in self.connections.iter() {
                         use tokio::sync::mpsc::error::TrySendError;
                         if let Err(send_err) = entry.value().sender.try_send((seq, message.clone()))
                         {
                             match send_err {
                                 TrySendError::Full(_) => {
-                                    // buffer 满（客户端暂时慢）：不禁用 sender；ring buffer 已备份
+                                    // Disconnect slow consumers explicitly; terminal clearing remains unchanged.
+                                    disconnected_conns.push(*entry.key());
                                     warn!(
-                                        "SSE sender buffer full, message buffered: message_type={:?}, sub_type={}",
+                                        "SSE subscriber buffer full, disconnecting: message_type={:?}, sub_type={}",
                                         message.message_type, message.sub_type,
                                     );
                                 }
                                 TrySendError::Closed(_) => {
                                     // receiver 已断开：记录 id，迭代后移除（防重复失败刷日志）
-                                    closed_conns.push(*entry.key());
+                                    disconnected_conns.push(*entry.key());
                                     warn!(
                                         "SSE subscriber {} receiver dropped, will remove: message_type={:?}, sub_type={}",
                                         entry.key(),
@@ -198,7 +199,7 @@ impl SessionWorker {
                             }
                         }
                     }
-                    for id in closed_conns {
+                    for id in disconnected_conns {
                         if let Some((_, conn)) = self.connections.remove(&id) {
                             conn.cancel.cancel();
                         }

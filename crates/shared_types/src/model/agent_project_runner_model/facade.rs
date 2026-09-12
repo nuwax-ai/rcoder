@@ -18,12 +18,32 @@ use crate::{ContainerEntry, ServiceType};
 pub struct ProjectAndContainerInfo {
     /// 内部状态管理
     pub(super) state: ProjectState,
+    persistence: Arc<crate::persistence::ProjectPersistenceIdentity>,
 }
 
 impl ProjectAndContainerInfo {
+    pub fn persistence_identity(&self) -> &crate::persistence::ProjectPersistenceIdentity {
+        &self.persistence
+    }
+
+    pub fn set_persistence_identity(
+        &mut self,
+        identity: crate::persistence::ProjectPersistenceIdentity,
+    ) {
+        self.persistence = Arc::new(identity);
+    }
+
+    pub fn restore_session_identity(&mut self, session_id: &str, generation: String) {
+        self.restore_session(session_id);
+        Arc::make_mut(&mut self.persistence)
+            .sessions
+            .insert(session_id.to_string(), generation);
+    }
+
     pub fn new(project_id: String) -> Self {
         Self {
             state: ProjectState::new(project_id),
+            persistence: Arc::new(Default::default()),
         }
     }
 
@@ -59,11 +79,17 @@ impl ProjectAndContainerInfo {
         extended.request_id = fields.request_id;
         extended.service_type = fields.service_type;
         let mut info = Self {
+            persistence: Arc::new(Default::default()),
             state: ProjectState {
                 core: Arc::new(core),
                 extended: Arc::new(extended),
             },
         };
+        for sid in info.sessions() {
+            Arc::make_mut(&mut info.persistence)
+                .sessions
+                .insert(sid.clone(), uuid::Uuid::new_v4().to_string());
+        }
         // container 包装成 Arc<ContainerEntry>（此时 service_type / container_key 已就绪）
         info.set_container(container);
         info
@@ -75,6 +101,11 @@ impl ProjectAndContainerInfo {
     /// - 更新 latest_session
     /// - 更新 last_activity
     pub fn add_session(&mut self, session_id: impl Into<String>) {
+        let session_id = session_id.into();
+        Arc::make_mut(&mut self.persistence)
+            .sessions
+            .entry(session_id.clone())
+            .or_insert_with(|| uuid::Uuid::new_v4().to_string());
         self.state.update_core(|core| {
             core.add_session(session_id);
         });
@@ -84,6 +115,11 @@ impl ProjectAndContainerInfo {
     /// [`Self::add_session`]，但不触碰 last_activity——恢复动作不代表用户
     /// 活跃，时间戳以持久化行为准（否则重启/回源即把 idle 计时归零）。
     pub fn restore_session(&mut self, session_id: impl Into<String>) {
+        let session_id = session_id.into();
+        Arc::make_mut(&mut self.persistence)
+            .sessions
+            .entry(session_id.clone())
+            .or_insert_with(|| uuid::Uuid::new_v4().to_string());
         self.state.update_core(|core| {
             core.restore_session(session_id);
         });
@@ -93,6 +129,12 @@ impl ProjectAndContainerInfo {
     ///
     /// 返回 true 表示该 session 之前存在。若移除的是 latest，自动重选。
     pub fn remove_session(&mut self, session_id: &str) -> bool {
+        let identity = Arc::make_mut(&mut self.persistence);
+        if let Some(generation) = identity.sessions.remove(session_id) {
+            identity
+                .retired_sessions
+                .insert(session_id.to_string(), generation);
+        }
         let mut removed = false;
         self.state.update_core(|core| {
             removed = core.remove_session(session_id);
@@ -112,6 +154,10 @@ impl ProjectAndContainerInfo {
 
     /// 清空所有 session
     pub fn clear_all_sessions(&mut self) {
+        let identity = Arc::make_mut(&mut self.persistence);
+        identity
+            .retired_sessions
+            .extend(std::mem::take(&mut identity.sessions));
         self.state.update_core(|core| {
             core.clear_all_sessions();
         });

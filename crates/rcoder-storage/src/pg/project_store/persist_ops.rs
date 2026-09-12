@@ -5,7 +5,7 @@
 //!
 //! 丢弃策略（队列深度超阈值时，writer 侧执行）：
 //! - **结构性 op**（Upsert*/Remove*/Add*/Clear*/Delete*）：永不丢弃——丢了会造成
-//!   PG 与镜像的永久性分叉；FIFO 保序保证同 project 的操作顺序与本地镜像一致。
+//!   PG 与镜像的永久性分叉；队列与直写交错使用代次条件和墓碑拒绝过期操作。
 //! - **Touch*/UpdateAgentStatus**：幂等（重放结果一致），可丢弃，仅影响 idle
 //!   判据/状态快照的时间精度（秒级误差可接受）。
 
@@ -19,6 +19,8 @@ use crate::adapter::container_entry_key;
 #[derive(Debug, Clone)]
 pub struct ProjectSnapshot {
     pub project_id: String,
+    pub generation: String,
+    pub predecessor: Option<String>,
     pub user_id: Option<String>,
     pub pod_id: Option<String>,
     pub tenant_id: Option<String>,
@@ -56,6 +58,8 @@ impl ProjectSnapshot {
             })?;
         Ok(Self {
             project_id: info.project_id().to_string(),
+            generation: info.persistence_identity().generation.clone(),
+            predecessor: info.persistence_identity().predecessor.clone(),
             user_id: info.user_id().map(str::to_string),
             pod_id: info.pod_id().map(str::to_string),
             tenant_id: info.tenant_id().map(str::to_string),
@@ -138,20 +142,43 @@ pub enum PersistOp {
     /// 容器整行 upsert
     UpsertContainer(Box<ContainerSnapshot>),
     /// 删除 project（sessions 经 FK ON DELETE CASCADE 级联）
-    RemoveProject { project_id: String },
+    RemoveProject {
+        project_id: String,
+        generation: String,
+    },
+    /// Resource cleanup additionally fences physical container replacement.
+    RemoveProjectForContainer {
+        project_id: String,
+        generation: String,
+        container_id: String,
+        container_name: String,
+    },
     /// 登记 session（含冗余 container_name，resolve 单查直达）
     AddSession {
         project_id: String,
         session_id: String,
+        project_generation: String,
+        generation: String,
+        predecessor: Option<String>,
         container_name: Option<String>,
     },
     /// 移除单个 session
-    RemoveSession { session_id: String },
+    RemoveSession {
+        session_id: String,
+        generation: String,
+    },
     /// 清空 project 的全部 session
-    ClearSessions { project_id: String },
+    ClearSessions {
+        project_id: String,
+        generation: String,
+        sessions: Vec<(String, String)>,
+    },
     /// 删除容器及其全部关联 project（唯一物理销毁触发点的持久化侧；
     /// SQL 侧 DELETE projects WHERE container_name IN (...) + DELETE containers）
-    DeleteContainerWithProjects { container_id: String },
+    DeleteContainerWithProjects {
+        container_id: String,
+        projects: Vec<(String, String)>,
+    },
 
     // ===== 幂等（超深可丢弃） =====
     /// 刷新 project 活跃时间（节流入队）
@@ -194,6 +221,7 @@ impl PersistOp {
             Self::UpsertProject(_) => "upsert_project",
             Self::UpsertContainer(_) => "upsert_container",
             Self::RemoveProject { .. } => "remove_project",
+            Self::RemoveProjectForContainer { .. } => "remove_project_for_container",
             Self::AddSession { .. } => "add_session",
             Self::RemoveSession { .. } => "remove_session",
             Self::ClearSessions { .. } => "clear_sessions",
@@ -228,6 +256,18 @@ pub(in crate::pg) fn structural_ops_for_insert(
     ops.push(PersistOp::AddSession {
         project_id: info.project_id().to_string(),
         session_id: session_id.to_string(),
+        project_generation: info.persistence_identity().generation.clone(),
+        predecessor: info
+            .persistence_identity()
+            .retired_sessions
+            .get(session_id)
+            .cloned(),
+        generation: info
+            .persistence_identity()
+            .sessions
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Session identity missing: {session_id}"))?,
         container_name: info.container_info().map(|_| container_entry_key(info)),
     });
     Ok(ops)
@@ -296,6 +336,9 @@ mod tests {
             PersistOp::AddSession {
                 project_id: "p".into(),
                 session_id: "s".into(),
+                project_generation: "pg".into(),
+                predecessor: None,
+                generation: "sg".into(),
                 container_name: None
             }
             .is_structural()

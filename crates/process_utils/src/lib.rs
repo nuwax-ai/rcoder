@@ -21,6 +21,25 @@ use nix::unistd::Pid;
 #[cfg(unix)]
 pub use nix::sys::signal::Signal as KillSignal;
 
+/// Probe a process group without sending a signal. Only ESRCH proves absence.
+#[cfg(unix)]
+pub fn process_group_exists(pid: u32) -> std::io::Result<bool> {
+    let target = safe_signal_target(pid).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid process group identifier",
+        )
+    })?;
+    match kill(target, None) {
+        Ok(()) => Ok(true),
+        Err(nix::errno::Errno::ESRCH) => Ok(false),
+        // EPERM also proves that a target exists. Keep waiting; never turn an
+        // inaccessible or transiently retiring group into a false absence.
+        Err(nix::errno::Errno::EPERM) => Ok(true),
+        Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
+    }
+}
+
 /// 向 pid 所在进程组发信号 (PID 1 防御版)。
 ///
 /// - `pid > 1`: 发 `-pid` (整个进程组, 可清理孙进程);

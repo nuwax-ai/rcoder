@@ -12,6 +12,8 @@
 /// Userapp 业务元数据行（app_manager 产出/消费 ↔ 存储后端的数据载体）
 #[derive(Debug, Clone)]
 pub struct AppMetadataRecord {
+    /// Fresh identity for each accepted metadata write; deletion compares this value.
+    pub generation: String,
     /// Userapp 应用 ID（app- 前缀，与集群资源名一致）
     pub app_id: String,
     /// 业务名称（仅元数据，集群不持有）
@@ -39,6 +41,15 @@ pub trait AppMetadataPersistence: Send + Sync {
     /// 全量加载（启动时调用；空表返回空 Vec）
     async fn load_all(&self) -> anyhow::Result<Vec<AppMetadataRecord>>;
 
-    /// 删除单行（storage/destroy 后调用；delete/purge 保留行）
-    async fn delete(&self, app_id: &str) -> anyhow::Result<()>;
+    /// Delete only the captured generation. False means absent or superseded;
+    /// callers must never retry an unconditional delete.
+    async fn delete_if_current(&self, app_id: &str, generation: &str) -> anyhow::Result<bool>;
+
+    async fn get(&self, app_id: &str) -> anyhow::Result<Option<AppMetadataRecord>> {
+        Ok(self
+            .load_all()
+            .await?
+            .into_iter()
+            .find(|row| row.app_id == app_id))
+    }
 }

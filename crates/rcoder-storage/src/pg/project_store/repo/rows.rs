@@ -24,6 +24,8 @@ pub(in crate::pg) struct ContainerRow {
 /// projects 表行
 #[derive(sqlx::FromRow)]
 pub(in crate::pg) struct ProjectRow {
+    pub generation: String,
+    pub session_identities: Option<serde_json::Value>,
     pub project_id: String,
     pub user_id: Option<String>,
     pub pod_id: Option<String>,
@@ -43,6 +45,8 @@ pub(in crate::pg) struct ProjectRow {
 /// sessions 表行
 #[derive(sqlx::FromRow)]
 pub(in crate::pg) struct SessionRow {
+    pub generation: String,
+    pub project_generation: String,
     pub session_id: String,
     pub project_id: String,
     #[allow(dead_code)]

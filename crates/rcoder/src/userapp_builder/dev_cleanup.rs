@@ -1,26 +1,11 @@
-//! Userapp 开发资源回收（[`shared_types::UserappDevCleanup`] 契约实现）。
-//!
-//! app 删除（purge）时回收 UserappBuilder 开发资源——per-app 开发容器 +
-//! per-app RWO PVC +（Docker 模式）开发卷宿主目录（挂载压平四目录 + 旧布局遗留）。
-//! 经契约注入 app_manager（其 runtime 视图无 agent 能力）；幂等，失败 best-effort
-//! 由调用方决定（purge 路径 warn 不阻断，下次收敛）。
-
+//! Captured builder deletion. No cleanup target is rediscovered by app name.
+use shared_types::{AppOperationLease, BuilderDeletionSnapshot, ProjectStore, UserappDevDeletion};
 use std::sync::Arc;
 
-use shared_types::ServiceType;
-use tracing::info;
-
-/// [`shared_types::UserappDevCleanup`] 实现：app 删除（purge）时回收 UserappBuilder
-/// 开发资源——per-app 开发容器 + per-app RWO PVC +（Docker 模式）宿主 bind 目录。
-///
-/// 经契约注入 app_manager（其 runtime 视图无 agent 能力）；幂等，失败 best-effort
-/// 由调用方决定（purge 路径 warn 不阻断，下次收敛）。
 pub struct UserappDevResourcesCleanup {
     runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
-    /// 宿主注册表（purge 后同步摘除，防下一个请求 ensure 复活已删 app 的容器+PVC）。
     projects: Arc<crate::storage::ProjectStoreBackend>,
 }
-
 impl UserappDevResourcesCleanup {
     pub fn new(
         runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
@@ -29,99 +14,205 @@ impl UserappDevResourcesCleanup {
         Self { runtime, projects }
     }
 }
-
-#[async_trait::async_trait]
-impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
-    async fn cleanup(&self, app_id: &str) -> Result<(), String> {
-        // 1. 停/删开发容器（幂等；失败不阻断 PVC 回收，K8s 下 PVC 有 Pod 引用时
-        //    pvc-protection 会挂住删除——容器先删是 PVC 能删的前提）
-        if let Err(e) = self
-            .runtime
-            .stop_container_by_identifier(app_id, &ServiceType::UserappBuilder)
-            .await
-        {
-            tracing::warn!(
-                "[USERAPP_DEV_CLEANUP] stop dev container failed (continuing): app_id={app_id}: {e}"
-            );
-        } else {
-            info!("[USERAPP_DEV_CLEANUP] dev container stopped: app_id={app_id}");
+struct CapturedDeletion {
+    runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
+    projects: Arc<crate::storage::ProjectStoreBackend>,
+    snapshot: BuilderDeletionSnapshot,
+    registry_identity: Option<(String, String)>,
+    operation: BuilderOperation,
+    _local: tokio::sync::OwnedMutexGuard<()>,
+}
+// Read-only capture may be abandoned safely. Once deletion starts, an uncertain
+// Kubernetes operation retains its lease instead of admitting a competing writer.
+struct BuilderOperation {
+    lease: Option<Box<dyn AppOperationLease>>,
+    mutating: bool,
+}
+impl Drop for BuilderOperation {
+    fn drop(&mut self) {
+        if self.mutating {
+            return;
         }
-
-        // 2. per-app 开发 PVC 回收（幂等；Docker 模式 trait no-op）
-        self.runtime
-            .destroy_workspace_pvc(app_id, &ServiceType::UserappBuilder)
-            .await
-            .map_err(|e| format!("destroy dev PVC failed: {e}"))?;
-
-        // 3. Docker 模式开发卷目录清理：经 **rcoder 容器内锚点路径**删除（bind 双向
-        //    同步宿主）。不 resolve 宿主绝对路径——它在 rcoder 容器内不可见（OrbStack
-        //    下是 VM fs，非宿主共享），历史实现因此静默失效（宿主 userapp-workspace
-        //    残留 app-* 目录的根因）。K8s 模式锚点无 bind，is_dir false 自然跳过。
-        //    新布局 dev/{user_id}/ 下四目录 + 旧布局 {锚点}/{app_id} 硬切遗留；
-        //    user_id 不经 trait 契约传递（仅 app_id），按 app_id 唯一性通配扫
-        //    dev/*/ 一层定位属主目录（per-user 目录数小，遍历成本可忽略）。
-        {
-            // 四段后缀 = 挂载压平布局的 app 侧段（单一事实源
-            // paths::userapp_dev_app_suffixes；uid 不经 trait 契约传递，通配扫
-            // dev/*/ 一层定位属主目录后拼后缀）
-            let sub_paths = shared_types::paths::userapp_dev_app_suffixes(app_id);
-            let dev_root = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
-                .join("dev");
-            // 全段走 tokio::fs：本函数在 async 上下文里跑，Path 的同步谓词会阻塞
-            // worker 线程。metadata/try_exists 均跟随符号链接，与 Path::is_dir/exists
-            // 语义一致（删除路径上宁可跟随，让异常链接暴露成 remove 错误而非漏删）。
-            if tokio::fs::metadata(&dev_root)
-                .await
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
-            {
-                let mut rd = tokio::fs::read_dir(&dev_root)
-                    .await
-                    .map_err(|e| format!("read dev root {}: {e}", dev_root.display()))?;
-                while let Some(user_dir) = rd
-                    .next_entry()
-                    .await
-                    .map_err(|e| format!("iterate dev root: {e}"))?
-                {
-                    for sub in &sub_paths {
-                        let target = user_dir.path().join(sub);
-                        if tokio::fs::try_exists(&target).await.unwrap_or(false) {
-                            tokio::fs::remove_dir_all(&target).await.map_err(|e| {
-                                format!("remove dev bind dir {}: {e}", target.display())
-                            })?;
-                            info!(
-                                "[USERAPP_DEV_CLEANUP] dev bind dir removed: {}",
-                                target.display()
-                            );
-                        }
+        if let Some(lease) = self.lease.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(async move {
+                    if let Err(error) = lease.release().await {
+                        tracing::error!(%error, "Failed to release read-only builder operation");
                     }
+                });
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Builder operation release requires an active runtime")
                 }
             }
-            // 旧布局（{app_id} 直挂锚点根下）硬切遗留清理
-            let legacy_dir =
-                std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
-                    .join(app_id);
-            if tokio::fs::try_exists(&legacy_dir).await.unwrap_or(false) {
-                tokio::fs::remove_dir_all(&legacy_dir)
+        }
+    }
+}
+#[async_trait::async_trait]
+impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
+    async fn capture(&self, app_id: &str) -> Result<Box<dyn UserappDevDeletion>, String> {
+        let local = super::lifecycle::acquire(app_id).await;
+        let operation = self
+            .runtime
+            .acquire_builder_operation(app_id)
+            .await
+            .map_err(|e| format!("acquire builder deletion: {e}"))?;
+        let operation = BuilderOperation {
+            lease: Some(operation),
+            mutating: false,
+        };
+        let snapshot = self
+            .runtime
+            .capture_builder_deletion(app_id)
+            .await
+            .map_err(|e| format!("capture builder deletion: {e}"))?;
+        let registry_identity = self
+            .projects
+            .get(app_id)
+            .map(|project| {
+                if project.service_type() != Some(shared_types::ServiceType::UserappBuilder) {
+                    return Err("registration belongs to another service family".to_string());
+                }
+                let container = project.container_info().ok_or_else(|| {
+                    "builder registration has no physical container identity".to_string()
+                })?;
+                if container.container_id.is_empty() {
+                    return Err("builder registration has empty container ID".into());
+                }
+                Ok((
+                    project.persistence_identity().generation.clone(),
+                    container.container_id,
+                ))
+            })
+            .transpose()?;
+        Ok(Box::new(CapturedDeletion {
+            runtime: self.runtime.clone(),
+            projects: self.projects.clone(),
+            snapshot,
+            registry_identity,
+            operation,
+            _local: local,
+        }))
+    }
+}
+#[async_trait::async_trait]
+impl UserappDevDeletion for CapturedDeletion {
+    async fn cleanup(self: Box<Self>) -> Result<(), String> {
+        // Once accepted, retain both leases until every blocking filesystem action
+        // finishes even if the HTTP caller disconnects or cancels its future.
+        tokio::spawn(async move { self.execute().await })
+            .await
+            .map_err(|e| format!("builder cleanup task failed: {e}"))?
+    }
+}
+impl CapturedDeletion {
+    async fn execute(mut self: Box<Self>) -> Result<(), String> {
+        self.operation.mutating =
+            !self.snapshot.resources.is_empty() || self.snapshot.docker_bind_cleanup;
+        self.runtime
+            .delete_builder_snapshot(&self.snapshot)
+            .await
+            .map_err(|e| format!("delete captured builder: {e}"))?;
+        if self.snapshot.docker_bind_cleanup {
+            remove_bind_directories(&self.snapshot.app_id).await?;
+        }
+        match &self.registry_identity {
+            Some((generation, container_id)) => {
+                if !self
+                    .projects
+                    .remove_durable_if_container_identity(
+                        &self.snapshot.app_id,
+                        generation,
+                        container_id,
+                    )
                     .await
-                    .map_err(|e| format!("remove legacy dev dir {}: {e}", legacy_dir.display()))?;
-                info!(
-                    "[USERAPP_DEV_CLEANUP] legacy dev dir removed: {}",
-                    legacy_dir.display()
-                );
+                    .map_err(|e| format!("remove captured builder registration: {e}"))?
+                    && self.projects.get(&self.snapshot.app_id).is_some()
+                {
+                    return Err("builder registration changed during cleanup".into());
+                }
+            }
+            None if self.projects.get(&self.snapshot.app_id).is_some() => {
+                return Err("builder registration appeared after deletion capture".into());
+            }
+            None => {}
+        }
+        crate::userapp_forward::invalidate_probe_cache(&self.snapshot.app_id);
+        if let Some(operation) = self.operation.lease.take() {
+            operation.release().await?;
+        }
+        tracing::info!(app_id = %self.snapshot.app_id, operation_id = %self.snapshot.operation_id, "Captured builder resources deleted");
+        Ok(())
+    }
+}
+async fn remove_if_present(path: &std::path::Path) -> Result<(), String> {
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "remove captured builder bind directory {}: {e}",
+            path.display()
+        )),
+    }
+}
+async fn remove_bind_directories(app_id: &str) -> Result<(), String> {
+    let anchor = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
+    match tokio::fs::read_dir(anchor.join("dev")).await {
+        Ok(mut entries) => {
+            while let Some(user) = entries
+                .next_entry()
+                .await
+                .map_err(|e| format!("read builder owners: {e}"))?
+            {
+                if !user
+                    .file_type()
+                    .await
+                    .map_err(|e| format!("stat builder owner: {e}"))?
+                    .is_dir()
+                {
+                    continue;
+                }
+                for suffix in shared_types::paths::userapp_dev_app_suffixes(app_id) {
+                    remove_if_present(&user.path().join(suffix)).await?;
+                }
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("read builder bind root: {e}")),
+    }
+    remove_if_present(&anchor.join(app_id)).await
+}
 
-        // 4. 摘注册与探活缓存：purge 后注册表残留死 IP 会让下一个请求
-        //    ensure→探活失败→重建（已删 app 的容器+PVC 复活）。
-        //    durable：purge 期间并发 dev chat 的 durable insert 与本删除同走
-        //    同步事务（消除"remove 入队→durable 提交→writer 重放删行"倒挂）
-        if self.projects.remove_durable(app_id).await.is_some() {
-            info!("[USERAPP_DEV_CLEANUP] dev registry entry removed: app_id={app_id}");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Lease(tokio::sync::oneshot::Sender<()>);
+    #[async_trait::async_trait]
+    impl AppOperationLease for Lease {
+        async fn release(self: Box<Self>) -> Result<(), String> {
+            self.0.send(()).map_err(|_| "receiver gone".into())
         }
-        crate::userapp_forward::invalidate_probe_cache(app_id);
-
-        info!("[USERAPP_DEV_CLEANUP] dev resources cleaned: app_id={app_id}");
-        Ok(())
+    }
+    #[tokio::test]
+    async fn abandoned_read_only_capture_releases_lease() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        drop(BuilderOperation {
+            lease: Some(Box::new(Lease(send))),
+            mutating: false,
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), receive)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn uncertain_mutation_does_not_release_distributed_lease() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        drop(BuilderOperation {
+            lease: Some(Box::new(Lease(send))),
+            mutating: true,
+        });
+        assert!(receive.await.is_err());
     }
 }

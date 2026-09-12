@@ -40,6 +40,11 @@ impl KubernetesRuntime {
                     .as_ref()
                     .and_then(|sp| sp.storage_class_name.clone());
                 if pvc.metadata.deletion_timestamp.is_some() {
+                    if service_type_label == shared_types::ServiceType::Userapp.to_string() {
+                        return Err(ContainerRuntimeError::Conflict(format!(
+                            "application PVC {pvc_name} is terminating"
+                        )));
+                    }
                     // PVC is in Terminating state — it's being deleted.
                     // We must wait for it to be fully removed before creating a new one,
                     // otherwise the new pod will reference a PVC that's about to disappear.

@@ -27,6 +27,9 @@ docker/specs/
 # docker/rcoder-agent-runner/  # 保留（包含 downloads/ 用于 LibreOffice 预下载）
 docker/computer-cache/
 docker/computer-project-workspace/
+# Local UserApp workspaces and persistent application data are runtime mounts.
+docker/userapp-workspace/
+docker/app-workspace/
 
 # 测试文件
 tests/

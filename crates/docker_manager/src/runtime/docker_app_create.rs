@@ -5,6 +5,7 @@
 
 use container_runtime_api::{
     ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, ExposeType,
+    UserAppDeploymentRuntime,
 };
 use shared_types::{ContainerBasicInfo, ServiceType};
 use std::time::Duration;
@@ -18,13 +19,28 @@ use super::docker_runtime::{
 };
 use std::collections::HashMap;
 
+struct PreparedAppContainer {
+    app_id: String,
+    image: String,
+    container_name: String,
+    main_network: String,
+    config: bollard::models::ContainerCreateBody,
+}
+
 impl DockerRuntime {
     pub(crate) async fn create_deployment_impl(
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        let prepared = self.prepare_app_container(params).await?;
+        self.create_prepared_app_container(prepared).await
+    }
+
+    async fn prepare_app_container(
+        &self,
+        params: ContainerCreateParams,
+    ) -> ContainerRuntimeResult<PreparedAppContainer> {
         use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
-        use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
 
         let app_id = params.project_id.clone().ok_or_else(|| {
             ContainerRuntimeError::ConfigurationError(
@@ -36,6 +52,22 @@ impl DockerRuntime {
                 "create_deployment requires image_override".to_string(),
             )
         })?;
+        if params.service_type != ServiceType::Userapp
+            || app_id.trim().is_empty()
+            || image.trim().is_empty()
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "application creation requires UserApp identity and a nonempty image".into(),
+            ));
+        }
+        self.inner
+            .ensure_image_exists(&image)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::DockerError(format!(
+                    "prepare application image {image}: {error}"
+                ))
+            })?;
         let container_name = app_deployment_name(&app_id);
 
         // env（env + secrets 合并；Docker 模式无 Secret 概念）
@@ -71,7 +103,10 @@ impl DockerRuntime {
         // labels（供对账/list 过滤）
         let mut labels: HashMap<String, String> = HashMap::new();
         labels.insert("managed-by".to_string(), "rcoder-app-manager".to_string());
-        labels.insert("app-id".to_string(), app_id.clone());
+        labels.insert(
+            shared_types::USERAPP_DOCKER_APP_ID_LABEL.to_string(),
+            app_id.clone(),
+        );
         labels.insert("service-type".to_string(), ServiceType::Userapp.to_string());
         if let Some(t) = &params.tenant_id {
             labels.insert("tenant".to_string(), t.clone());
@@ -116,8 +151,14 @@ impl DockerRuntime {
 
         // 加入主网络（与 rcoder 同网络，Pingora 才能通过 container_ip 访问）
         // 同时保留网络名，供 start 后按网卡定位 container_ip（多网卡时避免 values().next() 取错）
-        let main_network = self.inner.detect_main_network_name().await.ok();
-        let network_mode = main_network.clone();
+        let main_network = self
+            .inner
+            .detect_main_network_name()
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::DockerError(format!("prepare application network: {error}"))
+            })?;
+        let network_mode = Some(main_network.clone());
 
         let host_config = HostConfig {
             mounts,
@@ -143,6 +184,27 @@ impl DockerRuntime {
             ..Default::default()
         };
 
+        Ok(PreparedAppContainer {
+            app_id,
+            image,
+            container_name,
+            main_network,
+            config,
+        })
+    }
+
+    async fn create_prepared_app_container(
+        &self,
+        prepared: PreparedAppContainer,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
+        let PreparedAppContainer {
+            app_id,
+            image,
+            container_name,
+            main_network,
+            config,
+        } = prepared;
         let client = self.inner.get_docker_client();
         let created = client
             .create_container(
@@ -196,7 +258,7 @@ impl DockerRuntime {
 
         // 短轮询等待 container_ip 就绪（容器刚 start，IP 可能尚未分配）。
         // 优先取主网络网卡的 IP，回退任意网卡；最多重试 6 次 × 200ms。
-        let preferred = main_network.as_deref();
+        let preferred = Some(main_network.as_str());
         let ip = {
             let mut ip = String::new();
             for attempt in 0..6u32 {
@@ -243,39 +305,25 @@ impl DockerRuntime {
     }
 
     /// 更新 Userapp 容器：Docker 不支持 in-place 改 image/env/command，必须重建。
-    /// force-remove 旧容器（best-effort，不存在则忽略）后用新 params 走 create_deployment。
-    /// 工作空间目录不在 runtime 层（由 service 层管理），重建不丢数据。
+    /// 完成配置、镜像、挂载与网络准备后，仅删除已验证归属的物理容器身份。
+    /// 准备失败保留旧运行单元；删除失败中止，不吞错继续创建。
     pub(crate) async fn patch_deployment_impl(
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
-        use bollard::query_parameters::RemoveContainerOptions;
-        let app_id = params.project_id.clone().ok_or_else(|| {
+        let app_id = params.project_id.as_deref().ok_or_else(|| {
             ContainerRuntimeError::ConfigurationError(
-                "patch_deployment requires project_id (app_id)".to_string(),
+                "patch_deployment requires project_id (app_id)".into(),
             )
         })?;
-        let name = app_deployment_name(&app_id);
-        let client = self.inner.get_docker_client();
-        // 旧容器 best-effort 强删（image/env/command 变了必须重建；不存在则忽略错误）
-        if let Err(e) = client
-            .remove_container(
-                &name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
-            tracing::debug!(
-                "[DOCKER] Best-effort remove old container {} failed (may not exist): {}",
-                name,
-                e
-            );
-        }
-        // 用新 params 重建（复用 create_deployment 全套逻辑：mount/env/labels/ports/start）
-        self.create_deployment_impl(params).await
+        let snapshot = self.capture_app_deletion(app_id, None).await?;
+        let prepared = self.prepare_app_container(params).await.map_err(|error| {
+            ContainerRuntimeError::PreparationFailed(shared_types::AppPreparationFailure {
+                message: error.to_string(),
+            })
+        })?;
+        self.delete_app_snapshot(&snapshot).await?;
+        self.create_prepared_app_container(prepared).await
     }
 
     pub(crate) async fn scale_deployment_impl(
@@ -369,64 +417,6 @@ impl DockerRuntime {
             .start_container(&name, None::<StartContainerOptions>)
             .await
             .map_err(|e| ContainerRuntimeError::ContainerStartError(e.to_string()))?;
-        Ok(())
-    }
-
-    pub(crate) async fn delete_deployment_impl(&self, app_id: &str) -> ContainerRuntimeResult<()> {
-        use bollard::query_parameters::RemoveContainerOptions;
-        let name = app_deployment_name(app_id);
-        let client = self.inner.get_docker_client();
-        // 404 容忍 + 真实失败透传（对齐 K8s 侧 k8s_app_lifecycle 契约）：
-        // 调用方 delete_app(purge=true) 依赖本步成功才继续 destroy_app_pvc
-        //（Docker 语义=删 workspace 目录）——全量吞错会让容器还在运行而
-        // bind mount 源目录被删，写入进入孤儿 inode，数据丢失
-        match client
-            .remove_container(
-                &name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
-            Ok(()) => {}
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => {
-                tracing::debug!("[DOCKER] delete container {} not found, skip", name);
-            }
-            Err(e) => {
-                // 非 404 失败：inspect 二次确认区分"并发消失"与"真删除失败"。
-                // 仅 inspect 明确 404 才判不存在（容忍并发删除）；inspect 自身
-                // 失败（含 daemon 不可达——remove/inspect 同时连不上）保守透传
-                // ——吞掉会让 purge 在 daemon 故障期删 workspace 目录，容器在跑
-                // 而 bind mount 源被删 = 数据丢失
-                match client.inspect_container(&name, None).await {
-                    Ok(_) => {
-                        return Err(ContainerRuntimeError::DockerError(format!(
-                            "delete container {name}: {e}"
-                        )));
-                    }
-                    Err(bollard::errors::Error::DockerResponseServerError {
-                        status_code: 404,
-                        ..
-                    }) => {
-                        tracing::debug!(
-                            "[DOCKER] delete container {} vanished concurrently ({e}), skip",
-                            name
-                        );
-                    }
-                    Err(inspect_err) => {
-                        return Err(ContainerRuntimeError::DockerError(format!(
-                            "delete container {name} failed: {e} (existence check also failed: {inspect_err})"
-                        )));
-                    }
-                }
-            }
-        }
-        // 清理内存态回收策略（K8s 靠注解随 Deployment 自动消失；Docker 需显式清，防孤儿堆积）
-        drop(self.recycle_policy.remove(app_id));
         Ok(())
     }
 }

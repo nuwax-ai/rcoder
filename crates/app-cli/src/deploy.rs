@@ -137,11 +137,23 @@ impl LivenessHold {
     }
 }
 
+/// Explicit unlock also releases an inherited/duplicated file description. Relying
+/// on close alone can leave the lock alive in a concurrently spawned child.
+struct PreparationLease(std::fs::File);
+
+impl Drop for PreparationLease {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::error!(%error, "Failed to release artifact preparation lease");
+        }
+    }
+}
+
 /// Prepared files are owned by this operation. Drop cleans failures/cancellation.
 /// Extraction moves the owner into its blocking worker, so cancellation cannot race cleanup.
 pub(crate) struct PreparedDeploy {
     staging: tempfile::TempDir,
-    _lease: std::fs::File,
+    _lease: PreparationLease,
     state: DeployState,
 }
 
@@ -185,6 +197,7 @@ pub(crate) async fn prepare(
     lease
         .try_lock()
         .context("another artifact preparation owns this volume")?;
+    let lease = PreparationLease(lease);
     let incoming = incoming_dir(root);
     let staging_root = root.join(STAGING_DIR);
     tokio::fs::create_dir_all(&incoming)
@@ -212,7 +225,7 @@ pub(crate) async fn prepare(
         .prefix("deploy-")
         .tempdir_in(staging_root)?;
     let (staging, lease) =
-        tokio::task::spawn_blocking(move || -> Result<(tempfile::TempDir, std::fs::File)> {
+        tokio::task::spawn_blocking(move || -> Result<(tempfile::TempDir, PreparationLease)> {
             extract_zip_sync(part.path(), staging.path())?;
             crate::manifest::read_release_lock(staging.path())
                 .context("staged package has no parsable release.lock.toml")?;
@@ -245,6 +258,7 @@ pub(crate) async fn cleanup_startup(workspace: &Path) -> Result<()> {
     lease
         .try_lock()
         .context("active preparation prevents startup cleanup")?;
+    let _lease = PreparationLease(lease);
     for directory in [root.join(INCOMING_DIR), root.join(STAGING_DIR)] {
         if tokio::fs::try_exists(&directory).await? {
             clean_owned_temporary(&directory).await?;
@@ -547,6 +561,32 @@ fn volume_root_of(workspace: &Path) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preparation_lease_releases_while_inherited_descriptor_survives() {
+        let file = tempfile::NamedTempFile::new().expect("lease file");
+        let owner = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.path())
+            .expect("open owner");
+        owner.try_lock().expect("first owner");
+        let inherited = owner.try_clone().expect("inherited description");
+        let next = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.path())
+            .expect("next owner");
+        assert!(
+            next.try_lock().is_err(),
+            "active operation remains exclusive"
+        );
+        drop(super::PreparationLease(owner));
+        next.try_lock()
+            .expect("completed operation releases even with inherited description");
+        next.unlock().expect("release next");
+        drop(inherited);
+    }
+
     use super::*;
 
     /// 与 workspace-manifest golden fixture 同形状的最小可解析 lock。

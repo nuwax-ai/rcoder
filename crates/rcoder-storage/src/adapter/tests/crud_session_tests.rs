@@ -510,3 +510,31 @@ fn test_save_container_update() {
 
 use std::sync::Barrier;
 use std::thread;
+
+#[test]
+fn conditional_remove_preserves_changed_container_identity() {
+    let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.into(), TEST_CLUSTER_DOMAIN.into());
+    let mut original = create_test_info_with_container("conditional-project", "old-container");
+    let generation = original.persistence_identity().generation.clone();
+    let old_id = original.container_info().unwrap().container_id;
+    adapter
+        .insert("conditional-project".into(), Arc::new(original.clone()))
+        .unwrap();
+    let mut replacement = original.container_info().unwrap();
+    replacement.container_id = "new-physical-id".into();
+    original.set_container(Some(replacement));
+    adapter
+        .insert("conditional-project".into(), Arc::new(original))
+        .unwrap();
+    assert!(
+        adapter
+            .remove_if_container_identity("conditional-project", &generation, &old_id)
+            .is_none()
+    );
+    assert!(adapter.contains_key("conditional-project"));
+    assert!(
+        adapter
+            .remove_if_container_identity("conditional-project", &generation, "new-physical-id")
+            .is_some()
+    );
+}

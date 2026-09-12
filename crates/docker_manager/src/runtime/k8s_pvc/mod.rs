@@ -85,10 +85,6 @@ pub(crate) trait K8sPvcOps {
     /// workspace 卷上）——仅 destroy_app_pvc 兜底回收存量旧 PVC 时使用。
     fn app_data_pvc_name(&self, app_id: &str) -> ContainerRuntimeResult<String>;
 
-    /// 销毁 Userapp per-app 数据卷（app purge 时随 `-workspace` 卷一并回收）。
-    /// 幂等：PVC 不存在返回 Ok。
-    async fn destroy_app_data_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()>;
-
     /// 等待 PVC 进入 Bound 状态
     ///
     /// 保留用于 WaitForFirstConsumer 模式下切换为预绑定策略时使用。
@@ -404,13 +400,17 @@ impl K8sPvcOps for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
+        if !matches!(
+            service_type,
+            ServiceType::Userapp | ServiceType::UserappBuilder
+        ) {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "agent workspace PVC deletion is forbidden".into(),
+            ));
+        }
         // UserappBuilder 现为 per-app RWO PVC（app 删除 purge 时随容器一并回收,
         // 调用方为 Userapp 域 REST 流程, 符合"agent PVC 永不删"约束的例外面）。
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
-        self.destroy_pvc_core(&pvc_name).await
-    }
-    async fn destroy_app_data_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
-        let pvc_name = self.app_data_pvc_name(app_id)?;
         self.destroy_pvc_core(&pvc_name).await
     }
 }

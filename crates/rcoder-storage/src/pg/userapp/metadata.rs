@@ -26,8 +26,11 @@ impl AppMetadataPersistence for PgAppMetadataPersistence {
         Ok(super::repo::metadata_repo::fetch_all(&self.pool).await?)
     }
 
-    async fn delete(&self, app_id: &str) -> anyhow::Result<()> {
-        super::repo::metadata_repo::delete(&self.pool, app_id).await?;
-        Ok(())
+    async fn get(&self, app_id: &str) -> anyhow::Result<Option<AppMetadataRecord>> {
+        Ok(super::repo::metadata_repo::fetch_one(&self.pool, app_id).await?)
+    }
+
+    async fn delete_if_current(&self, app_id: &str, generation: &str) -> anyhow::Result<bool> {
+        Ok(super::repo::metadata_repo::delete_if_current(&self.pool, app_id, generation).await?)
     }
 }

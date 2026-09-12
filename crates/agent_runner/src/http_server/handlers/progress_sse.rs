@@ -21,8 +21,7 @@ use axum::{
     response::sse::{Event, Sse},
 };
 use chrono::Utc;
-use futures_util::stream::{Stream, StreamExt};
-use tokio_stream::wrappers::ReceiverStream;
+use futures_util::stream::Stream;
 use tracing::{error, info, warn};
 
 use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
@@ -124,52 +123,6 @@ fn create_agent_not_found_event(session_id: &str, log_prefix: &'static str) -> E
     Event::default().event("end_turn").data(json_data)
 }
 
-/// 创建心跳消息流
-///
-/// 定期发送符合 UnifiedSessionMessage 格式的心跳消息
-fn create_heartbeat_stream(
-    session_id: String,
-    log_prefix: &'static str,
-) -> impl Stream<Item = Result<Event, Infallible>> + Send {
-    let heartbeat_interval = Duration::from_secs(15);
-    let (tx, rx) = tokio::sync::mpsc::channel(10);
-
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(heartbeat_interval);
-        // 立即发送第一个心跳，然后按间隔发送
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-
-            // 创建心跳消息
-            let heartbeat_msg = UnifiedSessionMessage::heartbeat(session_id.clone());
-            let json_str = match serde_json::to_string(&heartbeat_msg) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(
-                        "[{}] Failed to serialize heartbeat message: {}",
-                        log_prefix, e
-                    );
-                    continue;
-                }
-            };
-
-            // 使用 sub_type ("ping") 作为事件名
-            if tx
-                .send(Ok(Event::default().event("ping").data(json_str)))
-                .await
-                .is_err()
-            {
-                // 接收端已关闭，停止发送心跳
-                break;
-            }
-        }
-    });
-
-    ReceiverStream::new(rx)
-}
-
 /// 进度流 (SSE) 的共享实现
 ///
 /// 直接从 SESSION_CACHE 订阅消息流，无需 gRPC。
@@ -254,7 +207,7 @@ pub(crate) async fn progress_sse(
         log_prefix, session_id
     );
     // 2. 创建新的消息订阅（DashMap 锁已释放，此处 await 安全）
-    let (_conn_id, replay_messages, message_rx, _cancel_token) =
+    let (conn_id, replay_messages, message_rx, cancel_token) =
         match session_data.create_new_connection(1000, 0).await {
             Ok(conn) => conn,
             Err(e) => {
@@ -277,76 +230,177 @@ pub(crate) async fn progress_sse(
             }
         };
 
-    // 3. 创建消息流和心跳流
-    // UnifiedSessionMessage 已使用 #[serde(rename_all = "camelCase")], 序列化后符合 RCoder 约定
-
-    // 📼 回放 ring buffer 中的历史消息
-    let replay_stream =
-        futures_util::stream::iter(replay_messages.into_iter().map(move |(seq, msg)| {
-            let _ = seq; // HTTP server 直接序列化 UnifiedSessionMessage（无 seq 字段），与 gRPC ProgressEvent 不同
-            let is_terminal = matches!(msg.message_type, SessionMessageType::SessionPromptEnd);
-            let json_str = match serde_json::to_string(&msg) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("[{}] Failed to serialize replay message: {}", log_prefix, e);
-                    return (Ok(Event::default().data("{}")), false);
-                }
-            };
-            (
-                Ok(Event::default().event(msg.sub_type).data(json_str)),
-                is_terminal,
-            )
-        }));
-
-    let real_time_stream = ReceiverStream::new(message_rx).map(move |(seq, msg)| {
-        let _ = seq;
-        let is_terminal = matches!(msg.message_type, SessionMessageType::SessionPromptEnd);
-        let json_str = match serde_json::to_string(&msg) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("[{}] Failed to serialize message: {}", log_prefix, e);
-                return (Ok(Event::default().data("{}")), false);
-            }
-        };
-        (
-            Ok(Event::default().event(msg.sub_type).data(json_str)),
-            is_terminal,
-        )
-    });
-
-    // 回放流 + 实时流
-    let message_stream = replay_stream.chain(real_time_stream);
-
-    // 4. 创建心跳流（标记为非终端）
-    let heartbeat_stream =
-        create_heartbeat_stream(session_id.clone(), log_prefix).map(|event| (event, false));
-
-    // 5. 合并两个流，并用 scan 监测终止条件
-    // select 会继续轮询心跳流（永不结束），所以必须在合并流层面检测终止
-    // 终止条件：
-    //   - 收到 SessionPromptEnd（终端消息）→ 发送后结束流
-    //   - channel 关闭 → message_stream 返回 None，scan 最终也会结束
-    let merged_stream = futures_util::stream::select(message_stream, heartbeat_stream).scan(
-        false,
-        |seen_terminal, (event, is_terminal)| {
-            if *seen_terminal {
-                // 已发送终端消息，结束流
-                return std::future::ready(None);
-            }
-
-            if is_terminal {
-                *seen_terminal = true;
-            }
-
-            std::future::ready(Some(event))
-        },
+    let stream = subscription_stream(
+        session_data,
+        conn_id,
+        session_id,
+        log_prefix,
+        replay_messages,
+        message_rx,
+        cancel_token,
     );
+    Ok(Sse::new(stream))
+}
 
+struct SubscriptionGuard {
+    session: std::sync::Arc<crate::service::SessionData>,
+    conn_id: u64,
+}
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        self.session.close_connection(self.conn_id);
+    }
+}
+
+fn subscription_stream(
+    session: std::sync::Arc<crate::service::SessionData>,
+    conn_id: u64,
+    session_id: String,
+    log_prefix: &'static str,
+    replay_messages: Vec<(u64, UnifiedSessionMessage)>,
+    mut message_rx: tokio::sync::mpsc::Receiver<(u64, UnifiedSessionMessage)>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> SseStream {
+    // Capture the guard before first poll, so dropping an unpolled response also cleans up.
+    let registration = SubscriptionGuard { session, conn_id };
     info!(
         "[{}] SSE stream established: session_id={}",
         log_prefix, session_id
     );
+    Box::pin(async_stream::stream! {
+        let _registration = registration;
+        let mut replay = replay_messages.into_iter();
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if cancel.is_cancelled() { break; }
+            let message = if let Some((_, message)) = replay.next() {
+                message
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    message = message_rx.recv() => {
+                        match message { Some((_, message)) => message, None => break }
+                    }
+                    _ = heartbeat.tick() => UnifiedSessionMessage::heartbeat(session_id.clone()),
+                }
+            };
+            let terminal = matches!(message.message_type, SessionMessageType::SessionPromptEnd);
+            match serde_json::to_string(&message) {
+                Ok(json) => yield Ok(Event::default().event(message.sub_type).data(json)),
+                Err(error) => {
+                    error!(%error, log_prefix, "Failed to serialize session message");
+                    break;
+                }
+            }
+            if terminal { break; }
+        }
+    })
+}
 
-    let stream: SseStream = Box::pin(merged_stream);
-    Ok(Sse::new(stream))
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+    use futures_util::StreamExt;
+    #[tokio::test]
+    async fn cancelled_subscription_ends_and_releases_its_registration() {
+        let session = crate::service::SessionData::new(64).await;
+        let (id, replay, rx, cancel) = session.create_new_connection(8, 0).await.unwrap();
+        let mut stream = subscription_stream(
+            session.clone(),
+            id,
+            "test".into(),
+            "test",
+            replay,
+            rx,
+            cancel.clone(),
+        );
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(stream);
+        assert_eq!(session.connections_len(), 0);
+    }
+    #[tokio::test]
+    async fn dropping_unpolled_stream_only_removes_its_subscription() {
+        let session = crate::service::SessionData::new(64).await;
+        let (id, replay, rx, cancel) = session.create_new_connection(8, 0).await.unwrap();
+        let (_peer, _, _peer_rx, peer_cancel) = session.create_new_connection(8, 0).await.unwrap();
+        let stream = subscription_stream(
+            session.clone(),
+            id,
+            "test".into(),
+            "test",
+            replay,
+            rx,
+            cancel.clone(),
+        );
+        drop(stream);
+        assert!(cancel.is_cancelled());
+        assert!(!peer_cancel.is_cancelled());
+        assert_eq!(session.connections_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_message_channel_ends_without_heartbeats() {
+        let session = crate::service::SessionData::new(64).await;
+        let (id, replay, _original_rx, _) = session.create_new_connection(8, 0).await.unwrap();
+        let (sender, rx) = tokio::sync::mpsc::channel(1);
+        drop(sender);
+        let mut stream = subscription_stream(
+            session.clone(),
+            id,
+            "test".into(),
+            "test",
+            replay,
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(session.connections_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_then_live_terminal_is_ordered_and_closes_immediately() {
+        use axum::response::IntoResponse;
+        let session = crate::service::SessionData::new(64).await;
+        let mut first = UnifiedSessionMessage::heartbeat("test".into());
+        first.message_type = SessionMessageType::AgentSessionUpdate;
+        first.sub_type = "first".into();
+        session.push_message(first).await.unwrap();
+        let (id, replay, rx, cancel) = session.create_new_connection(8, 0).await.unwrap();
+        let mut terminal = UnifiedSessionMessage::heartbeat("test".into());
+        terminal.message_type = SessionMessageType::SessionPromptEnd;
+        terminal.sub_type = "end_turn".into();
+        session.push_message(terminal).await.unwrap();
+        let stream = subscription_stream(
+            session.clone(),
+            id,
+            "test".into(),
+            "test",
+            replay,
+            rx,
+            cancel,
+        );
+        let body = Sse::new(stream).into_response().into_body();
+        let data = tokio::time::timeout(Duration::from_secs(1), axum::body::to_bytes(body, 65536))
+            .await
+            .unwrap()
+            .unwrap();
+        let text = std::str::from_utf8(&data).unwrap();
+        assert!(text.find("event: first").unwrap() < text.find("event: end_turn").unwrap());
+        assert_eq!(text.matches("event: end_turn").count(), 1);
+        assert_eq!(session.connections_len(), 0);
+    }
 }

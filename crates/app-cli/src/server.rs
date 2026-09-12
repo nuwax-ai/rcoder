@@ -30,6 +30,11 @@ use crate::runtime_status::RuntimeStatusService;
 use crate::supervisor;
 use crate::supervisord_host::SupervisordHost;
 
+#[cfg(unix)]
+const DEPLOY_PROTOCOL: u32 = shared_types::app_cli_deploy::APP_CLI_QUIESCENT_DEPLOY_PROTOCOL;
+#[cfg(not(unix))]
+const DEPLOY_PROTOCOL: u32 = shared_types::app_cli_deploy::APP_CLI_OPERATION_ID_DEPLOY_PROTOCOL;
+
 /// server 全局状态（api 层与主循环共享；读多写少，std RwLock 短临界区不跨 await）。
 pub struct ServerState {
     admission: std::sync::Mutex<()>,
@@ -126,7 +131,7 @@ impl ServerState {
             ready,
             deploy_status: RwLock::new(DeployStatus {
                 phase: AppCliDeployPhase::Idle,
-                protocol_version: 2,
+                protocol_version: DEPLOY_PROTOCOL,
                 ..Default::default()
             }),
             deploy_tx,
@@ -181,22 +186,31 @@ impl ServerState {
             .admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.set_phase_locked(ServerPhase::Failed(error));
-        if recovering {
-            if let Some(operation) = &mut self
-                .deploy_status
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .operation
-            {
-                operation.recovery = Some(shared_types::AppDeploymentRecovery {
-                    status: "pending".into(),
-                    error: None,
-                    database_migrations_reversed: false,
-                });
-            }
-            // Keep admission closed until restoration and old orchestration finish.
-            self.set_phase_locked(ServerPhase::Orchestrating);
+        // Publish failure and recovery intent in one snapshot: a reader must not
+        // mistake the interval before restoration for a completed deployment.
+        let phase = if recovering {
+            ServerPhase::Orchestrating
+        } else {
+            ServerPhase::Failed(error.clone())
+        };
+        *self
+            .phase
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = phase.clone();
+        let mut status = self
+            .deploy_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.phase = AppCliDeployPhase::from(&phase);
+        status.error = Some(error.clone());
+        if let Some(operation) = &mut status.operation {
+            operation.phase = AppCliDeployPhase::Failed;
+            operation.error = Some(error);
+            operation.recovery = recovering.then(|| shared_types::AppDeploymentRecovery {
+                status: "pending".into(),
+                error: None,
+                database_migrations_reversed: false,
+            });
         }
     }
 
@@ -260,7 +274,7 @@ impl ServerState {
                 .deploy_status
                 .write()
                 .map_err(|_| "deployment status lock poisoned")?;
-            status.protocol_version = 2;
+            status.protocol_version = DEPLOY_PROTOCOL;
             status.error = None;
             status.operation = Some(shared_types::AppDeploymentOperation {
                 operation_id,
@@ -423,6 +437,15 @@ async fn next_prepared(
     }
 }
 
+/// Keep the API alive and admission closed when a writer may still be active.
+/// No recovery directory writes or releasable terminal status follow this point.
+async fn hold_unconfirmed(state: &ServerState, error: String) {
+    state.ready.set_ready(false);
+    state.begin_failure(error.clone(), true);
+    tracing::error!(%error, "Deployment remains pending until process shutdown is confirmed; operator recovery required");
+    crate::supervisor::sigterm_watch().await;
+}
+
 async fn recover_code(
     args: &CliArgs,
     state: &ServerState,
@@ -551,7 +574,17 @@ async fn server_loop(
                 .await
             {
                 tracing::error!("server: orchestration failed: {e:#}");
-                let _ = host.stop_all().await;
+                if let Err(stop_error) = host.stop_all().await {
+                    hold_unconfirmed(state, format!("orchestrate: {e:#}; stop: {stop_error:#}"))
+                        .await;
+                    return;
+                }
+                if e.downcast_ref::<supervisor::ShutdownUnconfirmed>()
+                    .is_some()
+                {
+                    hold_unconfirmed(state, format!("orchestrate: {e:#}")).await;
+                    return;
+                }
                 pending =
                     recover_code(args, state, format!("orchestrate: {e:#}"), allow_restore).await;
                 continue;
@@ -573,9 +606,11 @@ async fn server_loop(
                 Next::Redeploy(action) => {
                     state.ready.set_ready(false);
                     if let Err(error) = host.stop_all().await {
-                        state.set_phase(ServerPhase::Failed(format!(
-                            "stop before activation failed: {error:#}"
-                        )));
+                        hold_unconfirmed(
+                            state,
+                            format!("stop before activation failed: {error:#}"),
+                        )
+                        .await;
                         return;
                     }
                     pending = Some(action);
@@ -612,13 +647,17 @@ async fn server_loop(
                 }
                 Ok(Err(e)) => {
                     tracing::error!("server: orchestration failed: {e:#}");
+                    if e.downcast_ref::<supervisor::ShutdownUnconfirmed>().is_some() {
+                        hold_unconfirmed(state, format!("orchestrate: {e:#}")).await;
+                        return;
+                    }
                     pending = recover_code(args, state, format!("orchestrate: {e:#}"), allow_restore).await;
                     Next::Wait
                 }
                 Err(join) => {
                     tracing::error!("server: orchestration task panicked: {join}");
-                    pending = recover_code(args, state, format!("orchestrate panicked: {join}"), allow_restore).await;
-                    Next::Wait
+                    hold_unconfirmed(state, format!("orchestrate panicked: {join}")).await;
+                    return;
                 }
             },
             maybe = next_prepared(args, state, &mut hot_rx) => match maybe {
@@ -626,8 +665,16 @@ async fn server_loop(
                     tracing::info!("server: hot deploy received, stopping current services");
                     state.ready.set_ready(false);
                     cancel.cancel();
-                    if let Err(join) = sup.await {
-                        tracing::error!("server: orchestration task panicked during cancel: {join}");
+                    match sup.await {
+                        Ok(Ok(())) => {},
+                        Ok(Err(error)) => {
+                            hold_unconfirmed(state, format!("stop before activation failed: {error:#}")).await;
+                            return;
+                        }
+                        Err(join) => {
+                            hold_unconfirmed(state, format!("orchestration task panicked during cancel: {join}")).await;
+                            return;
+                        }
                     }
                     Next::Redeploy(action)
                 }
@@ -691,7 +738,7 @@ mod tests {
             .sum::<usize>();
         assert_eq!(accepted, 1);
         let status = state.deploy_status();
-        assert_eq!(status.protocol_version, 2);
+        assert_eq!(status.protocol_version, DEPLOY_PROTOCOL);
         assert_eq!(
             status.operation.expect("operation").phase,
             AppCliDeployPhase::Deploying
@@ -717,6 +764,41 @@ mod tests {
         assert_eq!(operation.operation_id, "op-a");
         assert_eq!(operation.phase, AppCliDeployPhase::Failed);
         assert_eq!(operation.error.as_deref(), Some("prepare failed"));
+    }
+
+    #[test]
+    fn failure_snapshot_keeps_admission_closed_until_recovery_finishes() {
+        let state = state();
+        let request = || DeployRequest {
+            url: "http://x".into(),
+            release_id: "requested".into(),
+            sha256: None,
+        };
+        state
+            .try_accept_deploy_with_id(request(), "op-a".into())
+            .expect("accept");
+        state.begin_failure("activate failed".into(), true);
+        let snapshot = state.deploy_status();
+        assert_eq!(snapshot.phase, AppCliDeployPhase::Orchestrating);
+        let operation = snapshot.operation.expect("operation");
+        assert_eq!(operation.phase, AppCliDeployPhase::Failed);
+        assert_eq!(operation.recovery.expect("recovery").status, "pending");
+        assert!(
+            state
+                .try_accept_deploy_with_id(request(), "op-b".into())
+                .is_err()
+        );
+        state.set_phase(ServerPhase::Running);
+        let snapshot = state.deploy_status();
+        let operation = snapshot.operation.expect("operation");
+        assert_eq!(operation.operation_id, "op-a");
+        assert_eq!(operation.phase, AppCliDeployPhase::Failed);
+        assert_eq!(operation.recovery.expect("recovery").status, "restored");
+        assert!(
+            state
+                .try_accept_deploy_with_id(request(), "op-b".into())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -836,5 +918,40 @@ mod tests {
         assert_eq!(st.boot_id(), "rel-gen-2");
         // 部署进度快照携带当前 release_id
         assert_eq!(st.deploy_status().release_id.as_deref(), Some("rel-gen-2"));
+    }
+    #[tokio::test]
+    async fn unconfirmed_stop_keeps_api_state_pending_and_rejects_new_deployment() {
+        let state = state();
+        state
+            .try_accept_deploy_with_id(
+                DeployRequest {
+                    url: "http://unused".into(),
+                    release_id: "new".into(),
+                    sha256: None,
+                },
+                "operation".into(),
+            )
+            .unwrap();
+        let hold = hold_unconfirmed(&state, "process group remains".into());
+        tokio::pin!(hold);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut hold)
+                .await
+                .is_err()
+        );
+        let status = state.deploy_status();
+        assert_eq!(status.phase, AppCliDeployPhase::Orchestrating);
+        let operation = status.operation.unwrap();
+        assert_eq!(operation.phase, AppCliDeployPhase::Failed);
+        assert_eq!(operation.recovery.unwrap().status, "pending");
+        assert!(
+            state
+                .try_accept_deploy(DeployRequest {
+                    url: "http://unused".into(),
+                    release_id: "later".into(),
+                    sha256: None
+                })
+                .is_err()
+        );
     }
 }

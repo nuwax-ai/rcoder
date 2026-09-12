@@ -355,24 +355,24 @@ impl SessionData {
         false
     }
 
-    pub fn push_message(&self, message: UnifiedSessionMessage) {
-        // 使用 try_send 提供背压保护：通道满时丢弃消息而不是无限增长
-        // 这是安全的，因为：
-        // 1. ring buffer 已经缓存了最近的消息（用于重连时恢复）
-        // 2. SSE 客户端断线重连后会从 ring buffer 获取历史消息
-        if self
-            .command_tx
-            .try_send(SessionCommand::Push { message })
-            .is_err()
-        {
-            // 检查是否因为 worker 已完成导致通道关闭
-            if self.is_worker_finished_nonblocking() {
-                warn!(
-                    "[SessionData] Failed to push message: SessionWorker has exited (normal exit, cancelled, or panicked). Messages will be lost until session is recreated"
-                );
-            } else {
-                warn!("Failed to push message: command channel full (backpressure)");
-            }
+    /// Enqueue reliably. Dropping this future before admission cancels the send.
+    pub async fn push_message(&self, message: UnifiedSessionMessage) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::Push { message })
+            .await
+            .map_err(|_| anyhow::anyhow!("session worker has exited"))
+    }
+
+    /// Explicit cancellation for callers that retain their producer future.
+    pub async fn push_message_with_cancel(
+        &self,
+        message: UnifiedSessionMessage,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("session message enqueue cancelled"),
+            result = self.push_message(message) => result,
         }
     }
 
@@ -558,9 +558,9 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
                 .entry(session_id.to_string())
                 .and_modify(|d| *d = new_data.clone())
                 .or_insert_with(|| new_data.clone());
-            new_data.push_message(notify.to_unified_message());
+            new_data.push_message(notify.to_unified_message()).await?;
         } else {
-            existing.push_message(notify.to_unified_message());
+            existing.push_message(notify.to_unified_message()).await?;
         }
         return Ok(());
     }
@@ -581,7 +581,9 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
         }
     };
 
-    session_data.push_message(notify.to_unified_message());
+    session_data
+        .push_message(notify.to_unified_message())
+        .await?;
     Ok(())
 }
 

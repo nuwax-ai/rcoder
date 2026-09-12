@@ -61,6 +61,10 @@ impl KubernetesRuntime {
                 .await?;
         }
 
+        if service_type == ServiceType::UserappBuilder {
+            self.claim_builder_storage(identifier).await?;
+        }
+
         // Check if pod already exists and is running.
         // 读守卫物化到独立块内结束（scrutinee 临时值在 Rust 里存活到整个 if 语句
         // 结束——即便 .cloned() 只解决 entry 的数据借用，guard 仍会跨下方 await；

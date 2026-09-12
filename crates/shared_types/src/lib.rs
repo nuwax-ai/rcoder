@@ -31,7 +31,7 @@ pub use userapp::db_align::{
     AlignCredentialsOutcome, AlignCredentialsRequest, AlignError, CommandOutcome, PgCommandRunner,
     align_pg_credentials,
 };
-pub use userapp::dev_cleanup::UserappDevCleanup;
+pub use userapp::dev_cleanup::{BuilderDeletionSnapshot, UserappDevCleanup, UserappDevDeletion};
 pub use userapp::dev_locator::{UserappDevEnsure, UserappDevLocator};
 pub use userapp::forward_contract::{
     APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, SERVICE_TYPE_HEADER,
@@ -115,6 +115,12 @@ pub use app_cli_logs::{
 
 // app-cli 部署相位契约（rcoder ↔ app-cli 单一事实源；deploy/status wire 枚举）
 pub mod app_cli_deploy;
+pub mod app_resource_deletion;
+pub use app_resource_deletion::{
+    AppDeletionSnapshot, AppFileMutationMarker, AppOperationLease, AppPreparationFailure,
+    AppResourceIdentity, AppResourceKind, USERAPP_DOCKER_APP_ID_LABEL,
+};
+
 pub use app_cli_deploy::{
     AppCliDeployPhase, AppDeploymentOperation, AppDeploymentRecovery, AppEnvSnapshot,
     AppMutationPrecondition,
@@ -177,6 +183,7 @@ pub use model::{
     SessionPromptStart,
     TextAttachment,
     UnifiedSessionMessage,
+    VersionResponse,
     VncStatusResponse,
 };
 
@@ -232,3 +239,6 @@ pub use workspace_manifest::{
 };
 
 pub mod userapp_http;
+
+pub mod persistence;
+pub use persistence::FlushOutcome;

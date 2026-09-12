@@ -22,6 +22,123 @@ use super::docker_runtime::{
 
 #[async_trait]
 impl UserAppDeploymentRuntime for DockerRuntime {
+    async fn acquire_app_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        self.acquire_application_file_lease(app_id, &shared_types::ServiceType::Userapp)
+            .await
+            .map(Some)
+    }
+
+    async fn capture_app_deletion(
+        &self,
+        app_id: &str,
+        _expected: Option<&str>,
+    ) -> ContainerRuntimeResult<shared_types::AppDeletionSnapshot> {
+        let name = app_deployment_name(app_id);
+        let mut snapshot = shared_types::AppDeletionSnapshot {
+            app_id: app_id.into(),
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            resources: vec![],
+        };
+        match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&name, None)
+            .await
+        {
+            Ok(info) => {
+                let labels = info
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.labels.as_ref())
+                    .ok_or_else(|| {
+                        ContainerRuntimeError::Conflict(
+                            "application container has no ownership labels".into(),
+                        )
+                    })?;
+                if labels
+                    .get(shared_types::USERAPP_DOCKER_APP_ID_LABEL)
+                    .map(String::as_str)
+                    != Some(app_id)
+                    || labels.get("service-type").map(String::as_str)
+                        != Some(shared_types::ServiceType::Userapp.to_string().as_str())
+                {
+                    return Err(ContainerRuntimeError::Conflict(
+                        "application container ownership mismatch".into(),
+                    ));
+                }
+                let uid = info.id.filter(|id| !id.is_empty()).ok_or_else(|| {
+                    ContainerRuntimeError::DockerError("application container has no ID".into())
+                })?;
+                snapshot.resources.push(shared_types::AppResourceIdentity {
+                    kind: shared_types::AppResourceKind::Container,
+                    name,
+                    uid,
+                    resource_version: None,
+                });
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(error) => {
+                return Err(ContainerRuntimeError::DockerError(format!(
+                    "capture application container: {error}"
+                )));
+            }
+        }
+        Ok(snapshot)
+    }
+
+    async fn delete_app_snapshot(
+        &self,
+        snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        for identity in &snapshot.resources {
+            if identity.kind != shared_types::AppResourceKind::Container || identity.uid.is_empty()
+            {
+                return Err(ContainerRuntimeError::ConfigurationError(
+                    "invalid Docker deletion identity".into(),
+                ));
+            }
+            match self
+                .inner
+                .get_docker_client()
+                .remove_container(
+                    &identity.uid,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(error) => {
+                    return Err(ContainerRuntimeError::DockerError(format!(
+                        "delete captured container: {error}"
+                    )));
+                }
+            }
+        }
+        // A replacement invalidates the old operation's routing/metadata cleanup.
+        if !self
+            .capture_app_deletion(&snapshot.app_id, None)
+            .await?
+            .resources
+            .is_empty()
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "application container was replaced during deletion".into(),
+            ));
+        }
+        self.recycle_policy.remove(&snapshot.app_id);
+        Ok(())
+    }
     async fn create_deployment(
         &self,
         params: ContainerCreateParams,
@@ -55,7 +172,8 @@ impl UserAppDeploymentRuntime for DockerRuntime {
     }
 
     async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
-        self.delete_deployment_impl(app_id).await
+        let snapshot = self.capture_app_deletion(app_id, None).await?;
+        self.delete_app_snapshot(&snapshot).await
     }
 
     async fn get_deployment_status(
@@ -198,7 +316,10 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         let mut out = Vec::with_capacity(summaries.len());
         for s in summaries {
             let Some(labels) = &s.labels else { continue };
-            let Some(app_id) = labels.get("app-id").cloned() else {
+            let Some(app_id) = labels
+                .get(shared_types::USERAPP_DOCKER_APP_ID_LABEL)
+                .cloned()
+            else {
                 continue;
             };
             let running = s.state == Some(ContainerSummaryStateEnum::RUNNING);

@@ -216,8 +216,8 @@ impl AppService {
             return Ok((Some(release_id), None));
         }
 
-        // 1. PVC ensure（K8s；Docker no-op）
-        self.ensure_app_workspace_ready(app_id, None).await?;
+        // The runtime provisions storage under the application operation lease.
+        // Preparing it here would race with a concurrent purge before acquiring that lease.
 
         // 2. env 组装：request.env 整段替换 or live 回退；剥离历史保留键（防误伤）
         // + 校验用户显式键（防伪造）；叠加部署三元组（权威覆盖业务同名键）。
@@ -281,7 +281,7 @@ impl AppService {
             }
             Err(AppOperationError::NotFound(_)) => {
                 // 首次部署 → ensure 创建（镜像/端口/探针平台内定，env 携带部署三元组）
-                let lock = self.acquire_process_release_lock(app_id).await;
+                let lock = self.acquire_process_release_lock(app_id).await?;
                 self.ensure_app_runtime(app_id, app_id, Some(env), Some(explicit_user_id), lock)
                     .await?;
             }
@@ -338,9 +338,6 @@ impl AppService {
              app_id={app_id}, user_id={user_id}"
         );
 
-        // PVC ensure（K8s；Docker no-op）
-        self.ensure_app_workspace_ready(app_id, None).await?;
-
         // env：整段替换（app 不存在无 live 可回退）；剥离历史保留键 + 校验；
         // **不注入部署三元组**——容器内 app-cli 据此判定未部署进 idle
         let mut env = request.env.clone().unwrap_or_default();
@@ -350,7 +347,7 @@ impl AppService {
         // ensure 创建：ports=http:9080 + 探针=3010 与部署容器平台内定一致——
         // update 通道无权改 ports（恒 live 回退），空容器若缺 9080，后续部署的
         // 应用入口流量永久断流
-        let lock = self.acquire_process_release_lock(app_id).await;
+        let lock = self.acquire_process_release_lock(app_id).await?;
         self.ensure_app_runtime(app_id, app_id, Some(env), Some(user_id), lock)
             .await
     }

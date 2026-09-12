@@ -74,13 +74,78 @@ impl DockerRuntime {
 
 #[async_trait]
 impl AgentContainerRuntime for DockerRuntime {
+    async fn acquire_builder_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        self.acquire_builder_lease(app_id).await
+    }
+    async fn capture_builder_deletion(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::BuilderDeletionSnapshot> {
+        self.capture_builder(app_id).await
+    }
+    async fn delete_builder_snapshot(
+        &self,
+        snapshot: &shared_types::BuilderDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        self.delete_captured_builder(snapshot).await
+    }
     async fn create_container(
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
-        // start_agent_container 被标记为 deprecated 是因为返回的 container_id 可能过期，
-        // 但 ContainerRuntime trait 的调用方应通过 find_container 获取最新信息，
-        // 因此在 runtime 适配层使用是安全的。
+        let prepared = if params.service_type == ServiceType::UserappBuilder {
+            Some(
+                crate::agent_container_starter::AgentContainerStarter::new(&self.inner)
+                    .preflight(&params)
+                    .await
+                    .map_err(|error| {
+                        ContainerRuntimeError::ConfigurationError(error.to_string())
+                    })?,
+            )
+        } else {
+            None
+        };
+        let lease = if params.service_type == ServiceType::UserappBuilder {
+            let identifier = params
+                .service_type
+                .container_identifier(
+                    params.pod_id.as_deref(),
+                    params.user_id.as_deref(),
+                    params.project_id.as_deref(),
+                )
+                .map_err(|error| ContainerRuntimeError::ConfigurationError(error.to_string()))?;
+            Some(self.acquire_builder_operation(identifier).await?)
+        } else {
+            None
+        };
+        if let Some(lease) = lease {
+            let prepared = prepared.ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError("builder preflight result missing".into())
+            })?;
+            let inner = self.inner.clone();
+            return tokio::spawn(async move {
+                let result = crate::agent_container_starter::AgentContainerStarter::new(&inner)
+                    .start_prepared(params, prepared)
+                    .await
+                    .map_err(|e| ContainerRuntimeError::ContainerCreationError(e.to_string()));
+                if result.is_ok() {
+                    lease
+                        .release()
+                        .await
+                        .map_err(ContainerRuntimeError::ConnectionError)?;
+                }
+                result
+            })
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::ContainerCreationError(format!(
+                    "builder creation worker: {e}"
+                ))
+            })?;
+        }
         #[allow(deprecated)]
         self.inner
             .start_agent_container(params)

@@ -41,6 +41,31 @@ pub trait AgentContainerRuntime: Send + Sync {
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo>;
 
+    async fn acquire_builder_operation(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "builder operation lease unsupported".into(),
+        ))
+    }
+    async fn capture_builder_deletion(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::BuilderDeletionSnapshot> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "identity-bound builder deletion unsupported".into(),
+        ))
+    }
+    async fn delete_builder_snapshot(
+        &self,
+        _snapshot: &shared_types::BuilderDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "identity-bound builder deletion unsupported".into(),
+        ))
+    }
+
     /// Get container information by project_id
     async fn get_container_info(
         &self,
@@ -277,6 +302,16 @@ pub trait WorkspaceRuntime: Send + Sync {
         Ok(()) // default no-op (Docker / 未实现)
     }
 
+    /// Destroy only the storage identities captured before compute deletion.
+    async fn destroy_app_storage_snapshot(
+        &self,
+        _snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "identity-bound storage deletion is not supported by this runtime".into(),
+        ))
+    }
+
     /// 调整 per-app PVC 容量（Userapp 专用；K8s PVC **只扩不能缩**）。
     ///
     /// K8s: 读 PVC 当前 `requests.storage` → 等量 no-op / 更大 patch 扩容
@@ -435,6 +470,34 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     }
 
     /// 删除 Deployment 及其关联资源（Service/HTTPRoute/ConfigMap/Secret 等）
+    async fn capture_app_deletion(
+        &self,
+        _app_id: &str,
+        _expected_resource_version: Option<&str>,
+    ) -> ContainerRuntimeResult<shared_types::AppDeletionSnapshot> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "identity-bound deletion is not supported by this runtime".into(),
+        ))
+    }
+
+    /// Distributed runtime operation lease; Docker uses the service's shared file lock.
+    async fn acquire_app_operation(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        Ok(None)
+    }
+
+    /// Delete only the captured compute identities, never newly discovered resources.
+    async fn delete_app_snapshot(
+        &self,
+        _snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "identity-bound deletion is not supported by this runtime".into(),
+        ))
+    }
+
     async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         let _ = app_id;
         Err(ContainerRuntimeError::ConfigurationError(

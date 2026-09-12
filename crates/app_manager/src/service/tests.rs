@@ -24,6 +24,120 @@ pub(crate) fn create_request(app_id: &str) -> CreateAppRequest {
     }
 }
 
+#[tokio::test]
+async fn failed_update_restores_registered_ports_not_drifted_live_ports() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime = Arc::new(MockRuntime::default());
+    let mut service = test_service(root.path(), runtime.clone());
+    service.pingora = Some(Arc::new(PingoraProxyService::new(
+        rcoder_proxy::ProxyConfig::default(),
+    )));
+    runtime.deployments.insert(
+        "port-drift".into(),
+        DeploymentStatus {
+            app_id: "port-drift".into(),
+            phase: "Running".into(),
+            pod_ip: Some("10.0.0.1".into()),
+            ..Default::default()
+        },
+    );
+    runtime.specs.insert(
+        "port-drift".into(),
+        container_runtime_api::ContainerSpecSnapshot {
+            ports: Some(vec![container_runtime_api::AppPortSpec {
+                name: "http".into(),
+                port: 9081,
+                expose_type: container_runtime_api::ExposeType::Http,
+                strip_prefix: None,
+            }]),
+            ..Default::default()
+        },
+    );
+    service
+        .register_pingora_backends("port-drift", &[9080], "10.0.0.1")
+        .await;
+    runtime.create_fails.store(true, Ordering::SeqCst);
+    let request = UpdateAppRequest {
+        user_id: "u-test".into(),
+        image: Some("registry.example/app-runtime:test".into()),
+        name: None,
+        env: None,
+        secrets: None,
+        resources: None,
+        tenant_id: None,
+        space_id: None,
+        recycle_enabled: None,
+        idle_timeout_seconds: None,
+        expected_resource_version: None,
+    };
+    assert!(service.update_app("port-drift", request).await.is_err());
+    assert_eq!(
+        runtime.create_calls.load(Ordering::SeqCst),
+        1,
+        "patch was attempted"
+    );
+    assert_eq!(service.registered_http_ports("port-drift"), vec![9080]);
+}
+
+#[tokio::test]
+async fn waiting_delete_rechecks_version_after_acquiring_operation_lock() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime = Arc::new(MockRuntime::default());
+    let service = test_service(root.path(), runtime.clone());
+    runtime.deployments.insert(
+        "delete-race".into(),
+        DeploymentStatus {
+            app_id: "delete-race".into(),
+            phase: "Running".into(),
+            resource_version: Some("1".into()),
+            ..Default::default()
+        },
+    );
+    let writer = service
+        .acquire_process_release_lock("delete-race")
+        .await
+        .expect("writer lock");
+    let deletion = service.delete_app("delete-race", true, Some("1"));
+    tokio::pin!(deletion);
+    assert!(futures_util::poll!(deletion.as_mut()).is_pending());
+    runtime
+        .deployments
+        .get_mut("delete-race")
+        .expect("deployment")
+        .resource_version = Some("2".into());
+    drop(writer);
+    assert!(matches!(
+        deletion.await,
+        Err(AppOperationError::Conflict(_))
+    ));
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn independent_services_share_application_file_lock() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let first = test_service(root.path(), Arc::new(MockRuntime::default()));
+    let second = test_service(root.path(), Arc::new(MockRuntime::default()));
+    let held = first
+        .acquire_process_release_lock("cross-process")
+        .await
+        .expect("first lock");
+    let contender = second.acquire_process_release_lock("cross-process");
+    tokio::pin!(contender);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), contender.as_mut())
+            .await
+            .is_err()
+    );
+    drop(held);
+    let guard = tokio::time::timeout(std::time::Duration::from_secs(2), contender)
+        .await
+        .expect("released lock must progress")
+        .expect("second lock");
+    drop(guard);
+}
+
 /// R01：runtime 未返回创建凭据时，service 不得按名字补偿删除竞争赢家。
 #[tokio::test]
 pub(crate) async fn create_app_runtime_failure_does_not_delete_unowned_resources() {
@@ -164,7 +278,10 @@ pub(crate) async fn update_app_without_name_keeps_metadata_name() {
 pub(crate) async fn update_app_conflicts_while_release_lock_held() {
     let root = tempfile::tempdir().expect("tempdir");
     let service = test_service(root.path(), Arc::new(MockRuntime::default()));
-    let _publish_lock = service.acquire_process_release_lock("app-busy").await;
+    let _publish_lock = service
+        .acquire_process_release_lock("app-busy")
+        .await
+        .expect("operation lock");
 
     let request = UpdateAppRequest {
         user_id: "u1".into(),
@@ -373,6 +490,7 @@ pub(crate) async fn delete_app_purge_keeps_metadata_row_until_explicit_destroy()
     let persistence = InMemoryMetadataPersistence::new(vec![]);
     let service = test_service(root.path(), runtime);
     service.set_metadata_persistence(persistence.clone());
+    service.set_dev_cleanup(Arc::new(StubDevCleanup::default()));
     let app_dir = root.path().join("app-purge");
     tokio::fs::create_dir_all(app_dir.join("code"))
         .await
@@ -471,6 +589,7 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
     // 注入持久化 + 元数据:过滤生效
     let persistence = InMemoryMetadataPersistence::new(vec![
         AppMetadataRecord {
+            generation: uuid::Uuid::new_v4().to_string(),
             app_id: "app-alpha".into(),
             name: Some("alpha".into()),
             user_id: Some("u1".into()),
@@ -479,6 +598,7 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
             created_at: chrono::Utc::now() - chrono::Duration::hours(2),
         },
         AppMetadataRecord {
+            generation: uuid::Uuid::new_v4().to_string(),
             app_id: "app-beta".into(),
             name: Some("beta".into()),
             user_id: Some("u1".into()),
@@ -643,7 +763,9 @@ pub(crate) async fn purge_app_dev_cleanup_failure_propagates_and_keeps_metadata(
 
     assert!(matches!(error, AppOperationError::Backend(_)));
     assert!(
-        error.to_string().contains("destroy userapp dev resources"),
+        error
+            .to_string()
+            .contains("destroy captured userapp dev resources"),
         "dev cleanup failure message, got: {error}"
     );
     // 前置步骤已执行（重试时幂等跳过/重做）
@@ -671,7 +793,7 @@ pub(crate) async fn purge_app_query_failure_propagates_not_treated_as_absent() {
 
     assert!(matches!(error, AppOperationError::Backend(_)));
     assert!(
-        error.to_string().contains("failed to query app status"),
+        error.to_string().contains("capture purge resources"),
         "query failure message, got: {error}"
     );
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
@@ -696,7 +818,141 @@ pub(crate) async fn purge_app_without_dev_cleanup_injected_is_hard_error() {
         error.to_string().contains("dev cleanup not injected"),
         "not-injected message, got: {error}"
     );
-    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
     assert!(service.metadata.lookup("app-p5").is_some());
+}
+
+#[tokio::test]
+async fn rejected_delete_version_releases_kubernetes_operation_before_return() {
+    let root = tempfile::tempdir().expect("directory");
+    let runtime = Arc::new(MockRuntime::default());
+    runtime.deployments.insert(
+        "version-lease".into(),
+        DeploymentStatus {
+            resource_version: Some("2".into()),
+            ..Default::default()
+        },
+    );
+    let mut service = test_service(root.path(), runtime.clone());
+    service.config.access_mode = AppAccessMode::Kubernetes;
+    assert!(matches!(
+        service.delete_app("version-lease", false, Some("1")).await,
+        Err(AppOperationError::Conflict(_))
+    ));
+    assert!(!runtime.lease_held.load(Ordering::SeqCst));
+    service
+        .acquire_process_release_lock("version-lease")
+        .await
+        .expect("next operation admitted")
+        .finish()
+        .await
+        .expect("release");
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cancelled_docker_mutation_blocks_later_deletion_before_side_effects() {
+    let root = tempfile::tempdir().expect("directory");
+    let runtime = Arc::new(MockRuntime::default());
+    let service = test_service(root.path(), runtime.clone());
+    let operation = service
+        .acquire_process_release_lock("cancelled-writer")
+        .await
+        .expect("lease");
+    operation.mark_mutating().expect("durable mutation marker");
+    drop(operation);
+    assert!(matches!(
+        service.delete_app("cancelled-writer", false, None).await,
+        Err(AppOperationError::Conflict(_))
+    ));
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn production_lock_prefix_keeps_builder_shaped_ids_separate() {
+    let root = tempfile::tempdir().expect("directory");
+    let service = test_service(root.path(), Arc::new(MockRuntime::default()));
+    let guard = service
+        .acquire_process_release_lock("builder-foo")
+        .await
+        .expect("prod lease");
+    let directory =
+        std::path::Path::new(&service.config.operation_lock_root).join(".app-operation-locks");
+    assert!(directory.join("prod-builder-foo.lock").exists());
+    assert!(!directory.join("builder-foo.lock").exists());
+    guard.finish().await.expect("release");
+}
+
+#[tokio::test]
+async fn create_reserved_env_rejection_does_not_provision_or_retain_ownership() {
+    for kubernetes in [false, true] {
+        let root = tempfile::tempdir().expect("directory");
+        let runtime = Arc::new(MockRuntime::default());
+        let mut service = test_service(root.path(), runtime.clone());
+        if kubernetes {
+            service.config.access_mode = AppAccessMode::Kubernetes;
+        }
+        let mut request = create_request("invalid-env");
+        request.env = Some(std::collections::HashMap::from([(
+            "RCODER_PINGAP_VERSION".into(),
+            "forged".into(),
+        )]));
+        assert!(matches!(
+            service.create_app(request).await,
+            Err(AppOperationError::Validation(_))
+        ));
+        assert_eq!(runtime.ensure_workspace_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+        service
+            .try_acquire_process_release_lock("invalid-env")
+            .await
+            .expect("rejection releases ownership")
+            .finish()
+            .await
+            .expect("release next operation");
+    }
+}
+
+#[tokio::test]
+async fn failed_update_preparation_releases_lease_for_next_update() {
+    let root = tempfile::tempdir().expect("directory");
+    let runtime = Arc::new(MockRuntime::default());
+    runtime.deployments.insert(
+        "prepare-retry".into(),
+        DeploymentStatus {
+            app_id: "prepare-retry".into(),
+            phase: "Running".into(),
+            pod_ip: Some("10.0.0.1".into()),
+            ..Default::default()
+        },
+    );
+    runtime
+        .patch_preparation_fails
+        .store(true, Ordering::SeqCst);
+    let service = test_service(root.path(), runtime.clone());
+    let request = || UpdateAppRequest {
+        user_id: "u-test".into(),
+        image: Some("unavailable:image".into()),
+        name: None,
+        env: None,
+        secrets: None,
+        resources: None,
+        tenant_id: None,
+        space_id: None,
+        recycle_enabled: None,
+        idle_timeout_seconds: None,
+        expected_resource_version: None,
+    };
+    for _ in 0..2 {
+        let error = service
+            .update_app("prepare-retry", request())
+            .await
+            .expect_err("preparation fails");
+        assert!(matches!(error, AppOperationError::Backend(_)));
+        assert!(error.to_string().contains("image preparation failed"));
+    }
+    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
 }

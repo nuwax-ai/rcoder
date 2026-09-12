@@ -1,16 +1,26 @@
-//! Userapp 开发资源清理契约（跨 crate，按模块契约约定置于 shared_types）。
-
+//! Identity-bound UserApp builder deletion contracts.
 use async_trait::async_trait;
 
-/// Userapp 开发资源回收（per-app 开发容器 + 开发 PVC）。
-///
-/// app_manager 的 runtime 视图（`UserAppRuntime`）经 ISP 分层不含 agent 容器能力，
-/// 但 app 删除（purge）需要回收 UserappBuilder 开发容器与 per-app RWO PVC——
-/// 经此契约回调到宿主（rcoder，持有 `ContainerRuntime` 全量视图）执行。
-///
-/// 实现要求：幂等（资源不存在视为成功）；失败语义由调用方决定
-/// （purge 路径 best-effort：失败 warn 不阻断 app 删除，下次 purge 重试收敛）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuilderDeletionSnapshot {
+    pub app_id: String,
+    pub operation_id: String,
+    pub resources: Vec<crate::AppResourceIdentity>,
+    pub docker_bind_cleanup: bool,
+}
+
+/// A captured deletion owns its lifecycle lease until committed or dropped.
+#[async_trait]
+pub trait UserappDevDeletion: Send {
+    async fn cleanup(self: Box<Self>) -> Result<(), String>;
+}
+
 #[async_trait]
 pub trait UserappDevCleanup: Send + Sync {
-    async fn cleanup(&self, app_id: &str) -> Result<(), String>;
+    async fn capture(&self, _app_id: &str) -> Result<Box<dyn UserappDevDeletion>, String> {
+        Err("identity-bound builder deletion is unsupported".into())
+    }
+    async fn cleanup(&self, app_id: &str) -> Result<(), String> {
+        self.capture(app_id).await?.cleanup().await
+    }
 }

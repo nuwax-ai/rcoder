@@ -12,14 +12,14 @@ pub(in crate::pg) async fn upsert<'e>(
     record: &AppMetadataRecord,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        r#"INSERT INTO userapp_metadata (app_id, name, user_id, tenant_id, space_id, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,now())
+        r#"INSERT INTO userapp_metadata (app_id, name, user_id, tenant_id, space_id, created_at, updated_at, generation)
+           VALUES ($1,$2,$3,$4,$5,$6,now(),$7)
            ON CONFLICT (app_id) DO UPDATE SET
              name=EXCLUDED.name,
              user_id=EXCLUDED.user_id,
              tenant_id=EXCLUDED.tenant_id,
              space_id=EXCLUDED.space_id,
-             updated_at=now()"#,
+             updated_at=now(), generation=EXCLUDED.generation"#,
     )
     .bind(&record.app_id)
     .bind(&record.name)
@@ -27,6 +27,7 @@ pub(in crate::pg) async fn upsert<'e>(
     .bind(&record.tenant_id)
     .bind(&record.space_id)
     .bind(record.created_at)
+    .bind(&record.generation)
     .execute(db)
     .await?;
     Ok(())
@@ -40,40 +41,64 @@ type MetadataRow = (
     Option<String>,
     Option<String>,
     DateTime<Utc>,
+    String,
 );
+
+pub(in crate::pg) async fn fetch_one<'e>(
+    db: impl PgExecutor<'e>,
+    app_id: &str,
+) -> Result<Option<AppMetadataRecord>, sqlx::Error> {
+    let row: Option<MetadataRow> = sqlx::query_as("SELECT app_id, name, user_id, tenant_id, space_id, created_at, generation FROM userapp_metadata WHERE app_id = $1").bind(app_id).fetch_optional(db).await?;
+    Ok(row.map(
+        |(app_id, name, user_id, tenant_id, space_id, created_at, generation)| AppMetadataRecord {
+            app_id,
+            name,
+            user_id,
+            tenant_id,
+            space_id,
+            created_at,
+            generation,
+        },
+    ))
+}
 
 /// 全量加载（启动恢复；空表返回空）
 pub(in crate::pg) async fn fetch_all<'e>(
     db: impl PgExecutor<'e>,
 ) -> Result<Vec<AppMetadataRecord>, sqlx::Error> {
     let rows: Vec<MetadataRow> = sqlx::query_as(
-        "SELECT app_id, name, user_id, tenant_id, space_id, created_at FROM userapp_metadata",
+        "SELECT app_id, name, user_id, tenant_id, space_id, created_at, generation FROM userapp_metadata",
     )
     .fetch_all(db)
     .await?;
     Ok(rows
         .into_iter()
         .map(
-            |(app_id, name, user_id, tenant_id, space_id, created_at)| AppMetadataRecord {
-                app_id,
-                name,
-                user_id,
-                tenant_id,
-                space_id,
-                created_at,
+            |(app_id, name, user_id, tenant_id, space_id, created_at, generation)| {
+                AppMetadataRecord {
+                    generation,
+                    app_id,
+                    name,
+                    user_id,
+                    tenant_id,
+                    space_id,
+                    created_at,
+                }
             },
         )
         .collect())
 }
 
 /// 删除单行（storage/destroy 后调用）
-pub(in crate::pg) async fn delete<'e>(
+pub(in crate::pg) async fn delete_if_current<'e>(
     db: impl PgExecutor<'e>,
     app_id: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM userapp_metadata WHERE app_id = $1")
+    generation: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM userapp_metadata WHERE app_id = $1 AND generation = $2")
         .bind(app_id)
+        .bind(generation)
         .execute(db)
         .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }

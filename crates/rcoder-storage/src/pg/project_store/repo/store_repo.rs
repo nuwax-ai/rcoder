@@ -3,7 +3,16 @@
 //! 写语句与 PersistOp 一一对应（幂等 upsert / delete，writer 整批重放安全）；
 //! 读语句服务启动全量加载。执行器泛型 `impl PgExecutor`（官方范式）。
 
+use shared_types::persistence::PersistenceOperationOutcome;
 use sqlx::{PgConnection, PgExecutor};
+
+fn outcome(rows: u64) -> PersistenceOperationOutcome {
+    if rows == 0 {
+        PersistenceOperationOutcome::Superseded
+    } else {
+        PersistenceOperationOutcome::Committed
+    }
+}
 
 use crate::pg::project_store::persist_ops::{ContainerSnapshot, ProjectSnapshot};
 
@@ -15,8 +24,8 @@ use super::rows::{ContainerRow, ProjectRow, SessionRow};
 pub(in crate::pg) async fn upsert_container<'e>(
     db: impl PgExecutor<'e>,
     c: &ContainerSnapshot,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<PersistenceOperationOutcome, sqlx::Error> {
+    let result = sqlx::query(
         // 防回退守卫（与 upsert_project 同构）：durable 降级快照与 write-behind
         // 重放可交错——created_at 跨容器重建单调（同容器名的重建必是新时刻），
         // 旧快照条件不满足被跳过，防止 container_ip/status/service_url 回退
@@ -25,7 +34,8 @@ pub(in crate::pg) async fn upsert_container<'e>(
         r#"INSERT INTO containers
            (container_name, container_id, logical_id, service_type, container_ip,
             internal_port, external_port, status, service_url, last_activity, created_at, version)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1)
+           SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1
+           WHERE NOT EXISTS (SELECT 1 FROM container_tombstones WHERE container_id=$2)
            ON CONFLICT (container_name) DO UPDATE SET
              container_id=EXCLUDED.container_id, logical_id=EXCLUDED.logical_id,
              service_type=EXCLUDED.service_type, container_ip=EXCLUDED.container_ip,
@@ -48,7 +58,7 @@ pub(in crate::pg) async fn upsert_container<'e>(
     .bind(c.created_at)
     .execute(db)
     .await?;
-    Ok(())
+    Ok(outcome(result.rows_affected()))
 }
 
 /// 刷新容器活跃时间（Touch，节流后由 writer 调用）
@@ -75,19 +85,31 @@ pub(in crate::pg) async fn touch_container<'e>(
 pub(in crate::pg) async fn delete_container_with_projects(
     db: &mut PgConnection,
     container_id: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM projects WHERE container_name IN \
-         (SELECT container_name FROM containers WHERE container_id = $1)",
-    )
-    .bind(container_id)
-    .execute(&mut *db)
-    .await?;
-    sqlx::query("DELETE FROM containers WHERE container_id = $1")
+    projects: &[(String, String)],
+) -> Result<PersistenceOperationOutcome, sqlx::Error> {
+    sqlx::query("INSERT INTO container_tombstones(container_id) VALUES($1) ON CONFLICT DO NOTHING")
         .bind(container_id)
         .execute(&mut *db)
         .await?;
-    Ok(())
+    let mut applied = false;
+    for (project_id, generation) in projects {
+        // Retire only the project incarnation captured when deletion was accepted.
+        let still_owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects p JOIN containers c ON c.container_name=p.container_name WHERE p.project_id=$1 AND p.generation=$2 AND c.container_id=$3)")
+            .bind(project_id).bind(generation).bind(container_id).fetch_one(&mut *db).await?;
+        if still_owned {
+            applied |= remove_project(&mut *db, project_id, generation).await?
+                == PersistenceOperationOutcome::Committed;
+        }
+    }
+    let result = sqlx::query("DELETE FROM containers WHERE container_id=$1")
+        .bind(container_id)
+        .execute(&mut *db)
+        .await?;
+    Ok(if applied {
+        PersistenceOperationOutcome::Committed
+    } else {
+        outcome(result.rows_affected())
+    })
 }
 
 /// 全量容器行（启动加载）
@@ -105,22 +127,28 @@ pub(in crate::pg) async fn fetch_all_containers<'e>(
 
 // ========== projects ==========
 
-/// project 整行 upsert（version 自增）
-pub(in crate::pg) async fn upsert_project<'e>(
-    db: impl PgExecutor<'e>,
+/// Identity-fenced project upsert; zero affected rows explicitly report Superseded.
+pub(in crate::pg) async fn upsert_project(
+    db: &mut PgConnection,
     p: &ProjectSnapshot,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        // 防回退守卫（WHERE ...last_activity >= ...）：durable 直写与 write-behind
-        // 队列可交错（writer 退避积压时，旧 UpsertProject 快照会在 durable 提交后
-        // 重放）——last_activity 随每次 chat 的 update_activity 单调刷新，旧快照
-        // 条件不满足被跳过，防止整行覆盖回退（latest_session/model_provider 等）。
-        // 相等放行：同 project 同毫秒的连续快照内容差异可忽略。
+) -> Result<PersistenceOperationOutcome, sqlx::Error> {
+    if let Some(previous) = &p.predecessor {
+        sqlx::query("INSERT INTO project_tombstones(project_id,generation) SELECT $1,$2 WHERE NOT EXISTS (SELECT 1 FROM project_tombstones WHERE project_id=$1 AND generation=$3) ON CONFLICT DO NOTHING")
+            .bind(&p.project_id).bind(previous).bind(&p.generation).execute(&mut *db).await?;
+        sqlx::query("DELETE FROM sessions WHERE project_id=$1 AND project_generation=$2 AND EXISTS(SELECT 1 FROM project_tombstones WHERE project_id=$1 AND generation=$2)")
+            .bind(&p.project_id).bind(previous).execute(&mut *db).await?;
+    }
+    let result = sqlx::query(
+        // Incarnation changes require an explicit predecessor. Tombstones permanently
+        // fence delayed writes from retired generations, independently of wall clocks.
+        // Within one live generation, retain the existing last_activity ordering;
+        // equal timestamps use SQL commit order (this is not a revision CAS).
         r#"INSERT INTO projects
            (project_id, user_id, pod_id, tenant_id, space_id, isolation_type,
             container_name, latest_session, model_provider, request_id, agent_status,
-            service_type, last_activity, created_at, version)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,1)
+            service_type, last_activity, created_at, generation, version)
+           SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1
+           WHERE NOT EXISTS (SELECT 1 FROM project_tombstones WHERE project_id=$1 AND generation=$15)
            ON CONFLICT (project_id) DO UPDATE SET
              user_id=EXCLUDED.user_id, pod_id=EXCLUDED.pod_id,
              tenant_id=EXCLUDED.tenant_id, space_id=EXCLUDED.space_id,
@@ -130,8 +158,9 @@ pub(in crate::pg) async fn upsert_project<'e>(
              model_provider=EXCLUDED.model_provider, request_id=EXCLUDED.request_id,
              agent_status=EXCLUDED.agent_status, service_type=EXCLUDED.service_type,
              last_activity=EXCLUDED.last_activity, created_at=EXCLUDED.created_at,
-             version=projects.version+1
-           WHERE EXCLUDED.last_activity >= projects.last_activity"#,
+             generation=EXCLUDED.generation, version=projects.version+1
+           WHERE (projects.generation=EXCLUDED.generation AND EXCLUDED.last_activity >= projects.last_activity)
+              OR projects.generation=$16"#,
     )
     .bind(&p.project_id)
     .bind(&p.user_id)
@@ -147,21 +176,42 @@ pub(in crate::pg) async fn upsert_project<'e>(
     .bind(&p.service_type)
     .bind(p.last_activity)
     .bind(p.created_at)
+    .bind(&p.generation)
+    .bind(&p.predecessor)
     .execute(db)
     .await?;
-    Ok(())
+    Ok(outcome(result.rows_affected()))
 }
 
 /// 删除 project（sessions 经 FK ON DELETE CASCADE 级联）
-pub(in crate::pg) async fn remove_project<'e>(
-    db: impl PgExecutor<'e>,
+pub(in crate::pg) async fn remove_project(
+    db: &mut PgConnection,
     project_id: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM projects WHERE project_id = $1")
+    generation: &str,
+) -> Result<PersistenceOperationOutcome, sqlx::Error> {
+    sqlx::query("INSERT INTO project_tombstones(project_id,generation) VALUES($1,$2) ON CONFLICT DO NOTHING")
+        .bind(project_id).bind(generation).execute(&mut *db).await?;
+    let result = sqlx::query("DELETE FROM projects WHERE project_id=$1 AND generation=$2")
         .bind(project_id)
-        .execute(db)
+        .bind(generation)
+        .execute(&mut *db)
         .await?;
-    Ok(())
+    Ok(outcome(result.rows_affected()))
+}
+
+/// The caller locks the captured container name and project before this predicate.
+pub(in crate::pg) async fn remove_project_for_container(
+    db: &mut PgConnection,
+    project_id: &str,
+    generation: &str,
+    container_id: &str,
+) -> Result<PersistenceOperationOutcome, sqlx::Error> {
+    let matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects p JOIN containers c ON c.container_name=p.container_name WHERE p.project_id=$1 AND p.generation=$2 AND c.container_id=$3)")
+        .bind(project_id).bind(generation).bind(container_id).fetch_one(&mut *db).await?;
+    if !matches {
+        return Ok(PersistenceOperationOutcome::Superseded);
+    }
+    remove_project(db, project_id, generation).await
 }
 
 /// 刷新 project 活跃时间（Touch）
@@ -203,7 +253,7 @@ pub(in crate::pg) async fn fetch_all_projects<'e>(
     sqlx::query_as(
         "SELECT project_id, user_id, pod_id, tenant_id, space_id, isolation_type, \
          container_name, latest_session, model_provider, request_id, agent_status, \
-         service_type, last_activity, created_at FROM projects",
+         service_type, last_activity, created_at, generation, (SELECT jsonb_object_agg(session_id,generation) FROM sessions WHERE project_id=projects.project_id AND project_generation=projects.generation) AS session_identities FROM projects",
     )
     .fetch_all(db)
     .await
@@ -212,50 +262,76 @@ pub(in crate::pg) async fn fetch_all_projects<'e>(
 // ========== sessions ==========
 
 /// 登记 session（upsert：重复登记即刷新归属与冗余容器名）
-pub(in crate::pg) async fn add_session<'e>(
-    db: impl PgExecutor<'e>,
+pub(in crate::pg) async fn add_session(
+    db: &mut PgConnection,
     project_id: &str,
     session_id: &str,
     container_name: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"INSERT INTO sessions (session_id, project_id, container_name)
-           VALUES ($1,$2,$3)
+    project_generation: &str,
+    generation: &str,
+    predecessor: Option<&str>,
+) -> Result<PersistenceOperationOutcome, sqlx::Error> {
+    if let Some(previous) = predecessor {
+        sqlx::query("INSERT INTO session_tombstones(session_id,generation) SELECT $1,$2 WHERE NOT EXISTS(SELECT 1 FROM session_tombstones WHERE session_id=$1 AND generation=$3) ON CONFLICT DO NOTHING")
+            .bind(session_id).bind(previous).bind(generation).execute(&mut *db).await?;
+    }
+    let result = sqlx::query(
+        r#"INSERT INTO sessions (session_id, project_id, container_name, project_generation, generation)
+           SELECT $1,$2,$3,$4,$5
+           WHERE EXISTS (SELECT 1 FROM projects WHERE project_id=$2 AND generation=$4)
+             AND NOT EXISTS (SELECT 1 FROM session_tombstones WHERE session_id=$1 AND generation=$5)
            ON CONFLICT (session_id) DO UPDATE SET
              project_id=EXCLUDED.project_id,
              container_name=EXCLUDED.container_name,
-             last_seen_at=now()"#,
+             last_seen_at=now(), generation=EXCLUDED.generation, project_generation=EXCLUDED.project_generation
+           WHERE (sessions.generation=EXCLUDED.generation AND sessions.project_generation=EXCLUDED.project_generation)
+              OR sessions.generation=$6
+              OR EXISTS(SELECT 1 FROM project_tombstones WHERE project_id=sessions.project_id AND generation=sessions.project_generation)"#,
     )
     .bind(session_id)
     .bind(project_id)
     .bind(container_name)
+    .bind(project_generation)
+    .bind(generation)
+    .bind(predecessor)
     .execute(db)
     .await?;
-    Ok(())
+    Ok(outcome(result.rows_affected()))
 }
 
 /// 移除单个 session
-pub(in crate::pg) async fn remove_session<'e>(
-    db: impl PgExecutor<'e>,
+pub(in crate::pg) async fn remove_session(
+    db: &mut PgConnection,
     session_id: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM sessions WHERE session_id = $1")
+    generation: &str,
+) -> Result<PersistenceOperationOutcome, sqlx::Error> {
+    sqlx::query("INSERT INTO session_tombstones(session_id,generation) VALUES($1,$2) ON CONFLICT DO NOTHING")
+        .bind(session_id).bind(generation).execute(&mut *db).await?;
+    let result = sqlx::query("DELETE FROM sessions WHERE session_id=$1 AND generation=$2")
         .bind(session_id)
-        .execute(db)
+        .bind(generation)
+        .execute(&mut *db)
         .await?;
-    Ok(())
+    Ok(outcome(result.rows_affected()))
 }
 
-/// 清空 project 的全部 session
-pub(in crate::pg) async fn clear_sessions<'e>(
-    db: impl PgExecutor<'e>,
-    project_id: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM sessions WHERE project_id = $1")
-        .bind(project_id)
-        .execute(db)
-        .await?;
-    Ok(())
+/// Clear only session identities captured at admission, never later additions.
+pub(in crate::pg) async fn clear_sessions(
+    db: &mut PgConnection,
+    _project_id: &str,
+    _generation: &str,
+    sessions: &[(String, String)],
+) -> Result<PersistenceOperationOutcome, sqlx::Error> {
+    let mut applied = false;
+    for (id, generation) in sessions {
+        applied |= remove_session(&mut *db, id, generation).await?
+            == PersistenceOperationOutcome::Committed;
+    }
+    Ok(if applied {
+        PersistenceOperationOutcome::Committed
+    } else {
+        PersistenceOperationOutcome::Superseded
+    })
 }
 
 /// 刷新 session 活跃时间（TouchSession）
@@ -276,7 +352,7 @@ pub(in crate::pg) async fn touch_session<'e>(
 pub(in crate::pg) async fn fetch_all_sessions<'e>(
     db: impl PgExecutor<'e>,
 ) -> Result<Vec<SessionRow>, sqlx::Error> {
-    sqlx::query_as("SELECT session_id, project_id, container_name FROM sessions")
+    sqlx::query_as("SELECT session_id, project_id, container_name, generation, project_generation FROM sessions")
         .fetch_all(db)
         .await
 }
@@ -300,7 +376,8 @@ pub(in crate::pg) async fn fetch_project_by_session(
     let Some(project) = sqlx::query_as::<_, ProjectRow>(
         "SELECT p.project_id, p.user_id, p.pod_id, p.tenant_id, p.space_id, \
          p.isolation_type, p.container_name, p.latest_session, p.model_provider, \
-         p.request_id, p.agent_status, p.service_type, p.last_activity, p.created_at \
+         p.request_id, p.agent_status, p.service_type, p.last_activity, p.created_at, p.generation, \
+         (SELECT jsonb_object_agg(session_id,generation) FROM sessions WHERE project_id=p.project_id AND project_generation=p.generation) AS session_identities \
          FROM projects p \
          WHERE p.project_id = (SELECT project_id FROM sessions WHERE session_id = $1)",
     )

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Strict E2E launcher. Each selected libtest case owns an isolated report directory."""
 import atexit
+from contextlib import nullcontext
 import argparse
 import hashlib
 import json
@@ -10,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import uuid
 from cleanup import cleanup_case
 from contracts import REQUIRED
@@ -17,22 +19,45 @@ from contracts import REQUIRED
 ROOT = Path(__file__).resolve().parents[1]
 REPO = ROOT.parent
 GROUPS = {
-    'userapp': ['compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_userapp_faults', 'compose_userapp_deploy'],
+    'userapp': ['compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_userapp_faults', 'compose_userapp_deploy', 'compose_lifecycle', 'pg_storage_faults'],
     'compose': ['compose_sse', 'compose_session', 'compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_webchat'],
     'deploy': ['compose_userapp_deploy'],
     'k8s': ['k8s_lb'],
 }
 
 
-def validate_reports(directory, scenario=None):
+def validate_reports(directory, scenario=None, run_id=None, case_id=None):
     files = list(directory.glob('*.jsonl'))
     errors = []
     observed = set()
+    identities = json.loads(Path(__file__).with_name('report_identities.json').read_text())
+    expected_identities = {(row['scenario'], row['backend']) for row in identities.get(scenario, [])}
+    observed_identities = set()
+    if scenario is not None and scenario not in REQUIRED:
+        errors.append(f"unregistered acceptance contract: {scenario}")
     if not files:
         return ['no scenario reports produced']
     for path in files:
         try:
             lines = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+            if any(not isinstance(line, dict) for line in lines):
+                raise ValueError('report rows must be JSON objects')
+            if not lines or lines[0].get('kind') != 'scenario_begin':
+                errors.append(f'{path.name}: scenario begin must be the first record')
+            if run_id is not None and any(line.get('run_id') != run_id for line in lines):
+                errors.append(f'{path.name}: run identity mismatch')
+            if case_id is not None and any(line.get('case_id') != case_id for line in lines):
+                errors.append(f'{path.name}: case identity mismatch')
+            if run_id is not None and any(line.get('test_name') != scenario for line in lines):
+                errors.append(f'{path.name}: canonical test identity mismatch')
+            for line in lines:
+                if line.get('kind') == 'scenario_begin':
+                    identity = (line.get('scenario'), line.get('backend'))
+                    if identity in observed_identities:
+                        errors.append(f'{path.name}: duplicate scenario/backend report')
+                    observed_identities.add(identity)
+                    if scenario is not None and identity not in expected_identities:
+                        errors.append(f'{path.name}: unregistered scenario/backend identity')
             ends = [line for line in lines if line.get('kind') == 'scenario_end']
             if sum(line.get('kind') == 'scenario_begin' for line in lines) != 1:
                 errors.append(f'{path.name}: missing or duplicate scenario begin')
@@ -50,6 +75,10 @@ def validate_reports(directory, scenario=None):
                 errors.append(f'{path.name}: records after terminal')
         except (ValueError, OSError) as exc:
             errors.append(f'{path.name}: unreadable report: {exc}')
+    if scenario is not None and not expected_identities:
+        errors.append(f'unregistered report identity contract: {scenario}')
+    if expected_identities - observed_identities:
+        errors.append('missing required scenario/backend reports')
     missing = REQUIRED.get(scenario, set()) - observed
     if missing:
         errors.append("missing required acceptance steps: " + ", ".join(sorted(missing)))
@@ -85,6 +114,96 @@ def container_identities():
         return rows.splitlines()
     except (OSError, subprocess.CalledProcessError) as exc:
         return {'unavailable': type(exc).__name__}
+
+
+def terminate_process_group(process, grace=90):
+    """Wait for cleanup children as well as the libtest parent before fallback cleanup."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        process.poll()  # reap the parent; its children can still be cleaning up
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+class CaseCancellation:
+    """Install before launch and keep cancellation non-throwing until cleanup ends."""
+    def __init__(self, interrupted=False):
+        self.cancelled = interrupted
+        self.previous = {}
+
+    def __enter__(self):
+        for number in (signal.SIGINT, signal.SIGTERM):
+            self.previous[number] = signal.signal(number, self.record)
+        return self
+
+    def record(self, _signal, _frame):
+        self.cancelled = True
+
+    def __exit__(self, *_error):
+        for number, handler in self.previous.items():
+            signal.signal(number, handler)
+
+
+def settle_case(process, cleanup, exit_code=0, interrupted=False, cancellation=None):
+    """Settle owned resources under the same cancellation scope as process launch."""
+    scope = nullcontext(cancellation) if cancellation is not None else CaseCancellation(interrupted)
+    errors = []
+    with scope as state:
+        try:
+            if process is not None:
+                terminate_process_group(process)
+        except Exception as error:
+            errors.append('case process group cleanup failed: ' + type(error).__name__)
+        try:
+            errors.extend(cleanup())
+        except Exception as error:
+            errors.append('owned case cleanup failed: ' + type(error).__name__)
+        return errors, 130 if state.cancelled else exit_code, state.cancelled
+
+
+def execute_case(cmd, env, log, cleanup, timeout=3600):
+    # No owned process exists before this handler is installed. It remains active
+    # across Popen's return, wait exit, finally entry and all resource cleanup.
+    with CaseCancellation() as cancellation:
+        process = None
+        exit_code = 1
+        errors = []
+        try:
+            process = subprocess.Popen(cmd, cwd=REPO, env=env, stdout=log,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+            deadline = time.monotonic() + timeout
+            while True:
+                if cancellation.cancelled:
+                    exit_code = 130
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    exit_code = 124
+                    break
+                try:
+                    exit_code = process.wait(timeout=min(0.2, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except Exception as error:
+            errors.append('case execution failed: ' + type(error).__name__)
+        finally:
+            cleanup_errors, exit_code, interrupted = settle_case(
+                process, cleanup, exit_code, cancellation=cancellation)
+            errors.extend(cleanup_errors)
+        return errors, 130 if cancellation.cancelled else exit_code, cancellation.cancelled
 
 
 def main():
@@ -159,6 +278,11 @@ def main():
         manifest['infrastructure_error'] = 'selection matched no scenarios'
         print(f'ERROR: selection matched no scenarios; report: {run}', file=sys.stderr)
         return 1
+    unknown = [case['test'] for case in manifest['planned'] if case['test'] not in REQUIRED]
+    if unknown:
+        manifest['infrastructure_error'] = 'unregistered acceptance contracts: ' + ', '.join(unknown)
+        persist()
+        return 2
     for case in manifest['planned']:
         case_dir = run / case['suite'] / case['test']
         case_dir.mkdir(parents=True)
@@ -170,27 +294,12 @@ def main():
         if args.ignored:
             cmd += ['--include-ignored']
         with (case_dir / 'process.log').open('w') as log:
-            process = subprocess.Popen(cmd, cwd=REPO, env=case_env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-            interrupted = False
-            try:
-                exit_code = process.wait(timeout=3600)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-                interrupted = isinstance(error, KeyboardInterrupt)
-                exit_code = 130 if interrupted else 124
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait()
-        errors = validate_reports(case_dir, case["test"])
-        errors.extend(cleanup_case(case_id, run_id, case_dir, existing_ids))
+            cleanup_errors, exit_code, interrupted = execute_case(
+                cmd, case_env, log,
+                lambda: cleanup_case(case_id, run_id, case_dir, existing_ids),
+            )
+        errors = validate_reports(case_dir, case["test"], run_id, case_id)
+        errors.extend(cleanup_errors)
         for cleanup in (case_dir / 'resources').glob('*-cleanup.json'):
             try:
                 if json.loads(cleanup.read_text()).get('ok') is not True:

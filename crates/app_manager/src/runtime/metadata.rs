@@ -62,6 +62,7 @@ impl AppMetadataStore {
             .map(|existing| existing.created_at)
             .unwrap_or_else(chrono::Utc::now);
         let row = AppMetadataRecord {
+            generation: uuid::Uuid::new_v4().to_string(),
             app_id: app_id.to_string(),
             name,
             user_id,
@@ -77,14 +78,44 @@ impl AppMetadataStore {
         self.cache.insert(app_id.to_string(), row);
     }
 
-    /// storage/destroy 后删行（cache 移除 + PG delete 失败仅 warn）。
-    pub async fn record_deleted(&self, app_id: &str) {
-        if let Some(p) = self.persistence()
-            && let Err(e) = p.delete(app_id).await
+    /// Capture before any deletion side effects; persistence is authoritative.
+    pub async fn deletion_generation(&self, app_id: &str) -> anyhow::Result<Option<String>> {
+        let row = match self.persistence() {
+            Some(persistence) => persistence.get(app_id).await?,
+            None => self.lookup(app_id),
+        };
+        Ok(row.map(|row| row.generation))
+    }
+
+    pub async fn record_deleted(
+        &self,
+        app_id: &str,
+        generation: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let Some(generation) = generation else {
+            anyhow::ensure!(
+                self.deletion_generation(app_id).await?.is_none(),
+                "application metadata appeared during deletion"
+            );
+            return Ok(());
+        };
+        if let Some(persistence) = self.persistence()
+            && !persistence.delete_if_current(app_id, generation).await?
         {
-            warn!("[APP_METADATA] delete failed app_id={app_id}: {e}");
+            anyhow::ensure!(
+                persistence.get(app_id).await?.is_none(),
+                "application metadata changed during deletion"
+            );
         }
-        self.cache.remove(app_id);
+        if let dashmap::mapref::entry::Entry::Occupied(entry) = self.cache.entry(app_id.to_owned())
+        {
+            anyhow::ensure!(
+                entry.get().generation == generation,
+                "cached application metadata changed during deletion"
+            );
+            entry.remove();
+        }
+        Ok(())
     }
 
     /// query join：按 app_id 取元数据（cache miss = 该 app 无业务元数据记录）。
@@ -148,6 +179,41 @@ mod tests {
         assert_eq!(rows[0].app_id, "app-a");
     }
 
+    #[tokio::test]
+    async fn stale_metadata_cleanup_preserves_new_write() {
+        let persistence = InMemoryMetadataPersistence::new(vec![]);
+        let first = AppMetadataStore::default();
+        let second = AppMetadataStore::default();
+        first.set_persistence(persistence.clone());
+        second.set_persistence(persistence.clone());
+        first
+            .record("metadata-race", Some("A".into()), None, None, None)
+            .await;
+        let captured = first
+            .deletion_generation("metadata-race")
+            .await
+            .expect("capture");
+        second
+            .record("metadata-race", Some("B".into()), None, None, None)
+            .await;
+        assert!(
+            first
+                .record_deleted("metadata-race", captured.as_deref())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            persistence
+                .get("metadata-race")
+                .await
+                .expect("read")
+                .expect("replacement")
+                .name
+                .as_deref(),
+            Some("B")
+        );
+    }
+
     /// update 不刷新 created_at：cache 命中旧记录回填原值（与 PG ON CONFLICT 语义
     /// 对齐——此前内存整行覆盖，改一次名创建时间就漂移）。
     #[tokio::test]
@@ -174,6 +240,7 @@ mod tests {
     #[tokio::test]
     async fn record_deleted_removes_cache_and_persists_delete() {
         let persistence = InMemoryMetadataPersistence::new(vec![AppMetadataRecord {
+            generation: uuid::Uuid::new_v4().to_string(),
             app_id: "app-b".into(),
             name: Some("beta".into()),
             user_id: None,
@@ -183,7 +250,11 @@ mod tests {
         }]);
         let store = AppMetadataStore::default();
         store.set_persistence(persistence.clone());
-        store.record_deleted("app-b").await;
+        let generation = store.deletion_generation("app-b").await.expect("capture");
+        store
+            .record_deleted("app-b", generation.as_deref())
+            .await
+            .expect("delete current");
         assert!(store.lookup("app-b").is_none(), "cache cleared");
         let rows = persistence.load_all().await.expect("persisted");
         assert!(rows.iter().all(|r| r.app_id != "app-b"));
@@ -193,6 +264,7 @@ mod tests {
     fn apply_loaded_populates_cache() {
         let store = AppMetadataStore::default();
         store.apply_loaded(vec![AppMetadataRecord {
+            generation: uuid::Uuid::new_v4().to_string(),
             app_id: "app-c".into(),
             name: Some("gamma".into()),
             user_id: None,

@@ -11,6 +11,32 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use roxmltree::Node;
 
+/// A parsed RPC fault is a completed response, distinct from lost or malformed replies.
+#[derive(Debug)]
+struct RpcFault(serde_json::Value);
+
+impl std::fmt::Display for RpcFault {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "supervisord fault: {}", self.0)
+    }
+}
+
+impl std::error::Error for RpcFault {}
+
+impl RpcFault {
+    fn is_complete(&self) -> bool {
+        self.0
+            .get("faultCode")
+            .and_then(serde_json::Value::as_i64)
+            .is_some()
+            && self
+                .0
+                .get("faultString")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+    }
+}
+
 /// supervisord 控制客户端（unix socket）。
 pub(crate) struct SupervisorClient {
     socket: std::path::PathBuf,
@@ -95,7 +121,10 @@ impl SupervisorClient {
     /// getAllProcessInfo：每组一行状态（name/group/statename/description/...）。
     pub(crate) async fn get_all_process_info(&self) -> Result<Vec<serde_json::Value>> {
         let value = self.call("supervisor.getAllProcessInfo", &[]).await?;
-        Ok(value.as_array().cloned().unwrap_or_default())
+        value
+            .as_array()
+            .cloned()
+            .ok_or_else(|| anyhow!("getAllProcessInfo returned non-array: {value}"))
     }
 
     /// 执行一次 XML-RPC 调用（HTTP/1.1 POST /RPC2 over unix socket）。
@@ -106,15 +135,52 @@ impl SupervisorClient {
             body.len()
         ) + &body;
 
-        let response = self.transport(&request).await?;
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(60), self.transport(&request))
+                .await
+                .map_err(|_| anyhow!("supervisord {method} response deadline exceeded"))
+                .and_then(|result| result)
+                .map_err(|error| {
+                    if matches!(
+                        method,
+                        "supervisor.getVersion" | "supervisor.getAllProcessInfo"
+                    ) {
+                        error
+                    } else {
+                        crate::supervisor::ShutdownUnconfirmed(format!(
+                            "supervisord {method} outcome unknown: {error:#}"
+                        ))
+                        .into()
+                    }
+                })?;
         let text = String::from_utf8_lossy(&response);
-        let xml = split_body(&text).ok_or_else(|| {
-            anyhow!(
-                "malformed XML-RPC response (no body split): {}",
-                truncate(&text, 200)
-            )
-        })?;
-        parse_response(xml)
+        let outcome = split_body(&text)
+            .ok_or_else(|| {
+                anyhow!(
+                    "malformed XML-RPC response (no body split): {}",
+                    truncate(&text, 200)
+                )
+            })
+            .and_then(parse_response);
+        outcome.map_err(|error| {
+            if matches!(
+                method,
+                "supervisor.getVersion" | "supervisor.getAllProcessInfo"
+            ) || (method == "supervisor.startProcess"
+                && error
+                    .downcast_ref::<RpcFault>()
+                    .is_some_and(RpcFault::is_complete))
+            {
+                // A rejected start may already have run child processes. The caller must
+                // still stop and confirm all dynamic groups before restoring directories.
+                error
+            } else {
+                crate::supervisor::ShutdownUnconfirmed(format!(
+                    "supervisord {method} did not confirm completion: {error:#}"
+                ))
+                .into()
+            }
+        })
     }
 
     /// unix socket 传输。tokio 的 UnixStream 仅 unix 存在——Windows 编译不过，
@@ -200,7 +266,7 @@ fn parse_response(xml: &str) -> Result<serde_json::Value> {
             .map(parse_value)
             .transpose()?
             .unwrap_or(serde_json::Value::Null);
-        return Err(anyhow!("supervisord fault: {detail}"));
+        return Err(RpcFault(detail).into());
     }
     let params =
         child_elem(root, "params").ok_or_else(|| anyhow!("methodResponse without params"))?;
@@ -353,6 +419,60 @@ mod tests {
         let arr = value.as_array().unwrap();
         assert_eq!(arr[0]["name"], "app-svc-web");
         assert_eq!(arr[0]["pid"], 42);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpc_fault_distinguishes_completed_start_failure_from_unknown_mutation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("supervisor.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let fault = r#"<methodResponse><fault><value><struct><member><name>faultCode</name><value><int>50</int></value></member><member><name>faultString</name><value><string>SPAWN_ERROR: app-svc-web</string></value></member></struct></value></fault></methodResponse>"#;
+        let server = tokio::spawn(async move {
+            for body in [fault, "malformed XML", fault] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let header = String::from_utf8(request).unwrap();
+                let length: usize = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                stream.read_exact(&mut vec![0; length]).await.unwrap();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let client = SupervisorClient::new(socket);
+        let error = client.start_process_wait("app-svc-web").await.unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::supervisor::ShutdownUnconfirmed>()
+                .is_none(),
+            "Completed start fault must permit the caller's stop-and-confirm recovery: {error:#}"
+        );
+        assert!(error.to_string().contains("SPAWN_ERROR"));
+        let malformed = client.start_process_wait("app-svc-web").await.unwrap_err();
+        assert!(
+            malformed
+                .downcast_ref::<crate::supervisor::ShutdownUnconfirmed>()
+                .is_some()
+        );
+        let stop = client.stop_remove_group("app-svc-web").await.unwrap_err();
+        assert!(
+            stop.downcast_ref::<crate::supervisor::ShutdownUnconfirmed>()
+                .is_some()
+        );
+        server.await.unwrap();
     }
 
     #[test]

@@ -24,6 +24,8 @@ pub(crate) mod k8s_agent_query;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_app_create;
 #[cfg(feature = "kubernetes")]
+mod k8s_app_deletion;
+#[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_app_expose;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_app_helpers;
@@ -31,6 +33,8 @@ pub(crate) mod k8s_app_helpers;
 pub(crate) mod k8s_app_lifecycle;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_app_observation;
+#[cfg(feature = "kubernetes")]
+mod k8s_app_operation;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_app_query;
 #[cfg(feature = "kubernetes")]
@@ -53,3 +57,7 @@ pub use docker_runtime::DockerRuntime;
 #[cfg(feature = "kubernetes")]
 pub use kubernetes_runtime::KubernetesRuntime;
 pub use manager::RuntimeManager;
+
+mod docker_builder_deletion;
+#[cfg(feature = "kubernetes")]
+mod k8s_builder_deletion;

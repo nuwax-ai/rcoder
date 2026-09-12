@@ -1,0 +1,374 @@
+{
+  "absolute_agent_work_dir_anthropic": [
+    {
+      "scenario": "absolute_agent_work_dir",
+      "backend": "anthropic"
+    }
+  ],
+  "absolute_agent_work_dir_openai": [
+    {
+      "scenario": "absolute_agent_work_dir",
+      "backend": "openai"
+    }
+  ],
+  "after_terminal_anthropic": [
+    {
+      "scenario": "after_terminal_empty",
+      "backend": "anthropic"
+    }
+  ],
+  "after_terminal_openai": [
+    {
+      "scenario": "after_terminal_empty",
+      "backend": "openai"
+    }
+  ],
+  "concurrent_subscribers_anthropic": [
+    {
+      "scenario": "concurrent_subscribers",
+      "backend": "anthropic"
+    }
+  ],
+  "concurrent_subscribers_openai": [
+    {
+      "scenario": "concurrent_subscribers",
+      "backend": "openai"
+    }
+  ],
+  "cross_turn_reconnect_anthropic": [
+    {
+      "scenario": "cross_turn_reconnect",
+      "backend": "anthropic"
+    }
+  ],
+  "cross_turn_reconnect_openai": [
+    {
+      "scenario": "cross_turn_reconnect",
+      "backend": "openai"
+    }
+  ],
+  "full_turn_anthropic": [
+    {
+      "scenario": "full_turn_delivery",
+      "backend": "anthropic"
+    }
+  ],
+  "full_turn_openai": [
+    {
+      "scenario": "full_turn_delivery",
+      "backend": "openai"
+    }
+  ],
+  "lb_cross_entry_cursor_reconnect": [
+    {
+      "scenario": "lb_cross_entry_cursor_reconnect",
+      "backend": "k8s"
+    }
+  ],
+  "lb_entry_rotation": [
+    {
+      "scenario": "lb_entry_rotation",
+      "backend": "k8s"
+    }
+  ],
+  "lb_new_session_cross_entry": [
+    {
+      "scenario": "lb_new_session_cross_entry",
+      "backend": "k8s"
+    }
+  ],
+  "model_switch_anthropic": [
+    {
+      "scenario": "model_switch",
+      "backend": "anthropic"
+    }
+  ],
+  "model_switch_multi_anthropic": [
+    {
+      "scenario": "model_switch_multi",
+      "backend": "anthropic"
+    }
+  ],
+  "model_switch_multi_openai": [
+    {
+      "scenario": "model_switch_multi",
+      "backend": "openai"
+    }
+  ],
+  "model_switch_openai": [
+    {
+      "scenario": "model_switch",
+      "backend": "openai"
+    }
+  ],
+  "no_session_reuse_anthropic": [
+    {
+      "scenario": "no_session_reuse",
+      "backend": "anthropic"
+    }
+  ],
+  "no_session_reuse_openai": [
+    {
+      "scenario": "no_session_reuse",
+      "backend": "openai"
+    }
+  ],
+  "pg_storage_lifecycle_contract": [
+    {
+      "scenario": "pg_storage_lifecycle_contract",
+      "backend": "postgres17"
+    }
+  ],
+  "reconnect_no_cursor_anthropic": [
+    {
+      "scenario": "reconnect_no_cursor",
+      "backend": "anthropic"
+    }
+  ],
+  "reconnect_no_cursor_openai": [
+    {
+      "scenario": "reconnect_no_cursor",
+      "backend": "openai"
+    }
+  ],
+  "reconnect_with_cursor_anthropic": [
+    {
+      "scenario": "reconnect_with_cursor",
+      "backend": "anthropic"
+    }
+  ],
+  "reconnect_with_cursor_openai": [
+    {
+      "scenario": "reconnect_with_cursor",
+      "backend": "openai"
+    }
+  ],
+  "two_turn_isolation_anthropic": [
+    {
+      "scenario": "two_turn_isolation",
+      "backend": "anthropic"
+    }
+  ],
+  "two_turn_isolation_openai": [
+    {
+      "scenario": "two_turn_isolation",
+      "backend": "openai"
+    }
+  ],
+  "userapp_agent_dispatch_anthropic": [
+    {
+      "scenario": "userapp_agent_dispatch",
+      "backend": "anthropic"
+    }
+  ],
+  "userapp_agent_dispatch_openai": [
+    {
+      "scenario": "userapp_agent_dispatch",
+      "backend": "openai"
+    }
+  ],
+  "userapp_compose_regression": [
+    {
+      "scenario": "userapp_compose",
+      "backend": "compose"
+    }
+  ],
+  "userapp_deploy_full_chain": [
+    {
+      "scenario": "userapp_deploy_full_chain",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_app_proxy_lazy_start": [
+    {
+      "scenario": "userapp_dev_app_proxy_lazy",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_archive_downloads": [
+    {
+      "scenario": "userapp_dev_archive",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_chat_full_turn_anthropic": [
+    {
+      "scenario": "userapp_dev_chat_full_turn",
+      "backend": "anthropic"
+    }
+  ],
+  "userapp_dev_chat_full_turn_openai": [
+    {
+      "scenario": "userapp_dev_chat_full_turn",
+      "backend": "openai"
+    }
+  ],
+  "userapp_dev_chat_workdir_agent_work_dir_anthropic": [
+    {
+      "scenario": "userapp_dev_chat_workdir",
+      "backend": "anthropic"
+    }
+  ],
+  "userapp_dev_chat_workdir_agent_work_dir_openai": [
+    {
+      "scenario": "userapp_dev_chat_workdir",
+      "backend": "openai"
+    }
+  ],
+  "userapp_dev_dbx_proxy": [
+    {
+      "scenario": "userapp_dev_dbx",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_files_two_entry_points": [
+    {
+      "scenario": "userapp_dev_files",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_new_endpoint_body_query_locate": [
+    {
+      "scenario": "userapp_dev_nep",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_owner_header_lazy_ensure": [
+    {
+      "scenario": "userapp_dev_owner",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_pg_reset_password": [
+    {
+      "scenario": "userapp_dev_pg_reset_password",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_pod_identity_list_and_status": [
+    {
+      "scenario": "userapp_pod_identity",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_poll_storm_keeps_container": [
+    {
+      "scenario": "userapp_dev_poll_storm",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_precheck_rejects_empty_and_no_services": [
+    {
+      "scenario": "userapp_dev_precheck",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_registry_self_heal_after_restart": [
+    {
+      "scenario": "userapp_dev_heal",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_server_lifecycle": [
+    {
+      "scenario": "userapp_dev_server",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_skills_push": [
+    {
+      "scenario": "userapp_dev_skills",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_task_sse_cursor_past_terminal": [
+    {
+      "scenario": "userapp_dev_sse_cursor",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_template_zip_and_projects": [
+    {
+      "scenario": "userapp_dev_tpl_zip",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_terminal_cwd_via_ttyd_ws": [
+    {
+      "scenario": "userapp_dev_ttyd",
+      "backend": "compose"
+    }
+  ],
+  "userapp_dev_two_turn_isolation_anthropic": [
+    {
+      "scenario": "userapp_dev_two_turn",
+      "backend": "anthropic"
+    }
+  ],
+  "userapp_dev_two_turn_isolation_openai": [
+    {
+      "scenario": "userapp_dev_two_turn",
+      "backend": "openai"
+    }
+  ],
+  "userapp_devbuild_skip_and_fallback_source_mode": [
+    {
+      "scenario": "userapp_devbuild_rules",
+      "backend": "compose"
+    }
+  ],
+  "userapp_hot_deployment_builtin_contract": [
+    {
+      "scenario": "userapp_hot_deployment_builtin_contract",
+      "backend": "compose"
+    }
+  ],
+  "userapp_hot_deployment_supervisord_contract": [
+    {
+      "scenario": "userapp_hot_deployment_supervisord_contract",
+      "backend": "compose"
+    }
+  ],
+  "userapp_static_proxy_aligned_build_passes": [
+    {
+      "scenario": "userapp_static_proxy_aligned",
+      "backend": "compose"
+    }
+  ],
+  "userapp_static_proxy_escape_build_fails": [
+    {
+      "scenario": "userapp_static_proxy_escape",
+      "backend": "compose"
+    }
+  ],
+  "webchat_full_turn_anthropic": [
+    {
+      "scenario": "webchat_full_turn",
+      "backend": "anthropic"
+    }
+  ],
+  "webchat_full_turn_openai": [
+    {
+      "scenario": "webchat_full_turn",
+      "backend": "openai"
+    }
+  ],
+  "webchat_project_reuse": [
+    {
+      "scenario": "webchat_project_reuse",
+      "backend": "openai"
+    }
+  ],
+  "webchat_two_turn_seq": [
+    {
+      "scenario": "webchat_two_turn_seq",
+      "backend": "openai"
+    }
+  ],
+  "docker_deletion_identity_contract": [
+    {
+      "scenario": "docker_deletion_identity_contract",
+      "backend": "compose"
+    }
+  ]
+}

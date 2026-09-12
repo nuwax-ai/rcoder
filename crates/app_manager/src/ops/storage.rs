@@ -228,7 +228,7 @@ impl crate::service::AppService {
                     "confirm must equal app_id for destroy (high-risk op): got confirm='{confirm}'"
                 )));
             }
-            // 显式 dev destroy 必须确定性执行（区别于 purge 链的 best-effort 联动）：
+            // 显式 dev destroy 必须确定性执行：
             // 未注入即硬错，不静默跳过
             let cleanup = self
                 .dev_cleanup
@@ -249,16 +249,54 @@ impl crate::service::AppService {
             );
             return Ok(());
         }
-        self.destroy_app_storage_keep_metadata(app_id, confirm)
+        validate_app_id(app_id)?;
+        if confirm != app_id {
+            return Err(AppOperationError::Validation(
+                "confirm must equal app_id for destroy".into(),
+            ));
+        }
+        let _release_lock = self.acquire_process_release_lock(app_id).await?;
+        self.ensure_app_deleted(app_id, "destroying PVC").await?;
+        let metadata_generation =
+            self.metadata
+                .deletion_generation(app_id)
+                .await
+                .map_err(|error| {
+                    AppOperationError::Backend(format!("capture metadata deletion: {error}"))
+                })?;
+        let dev_deletion = self.capture_dev_deletion(app_id).await?;
+        _release_lock.mark_mutating()?;
+        self.destroy_app_storage_keep_metadata(app_id, confirm, None, dev_deletion)
             .await?;
         // 独立 storage/destroy 接口：与 PVC 同生命周期，元数据行同步删除
         // （三档删除语义的第三档）。
-        self.metadata.record_deleted(app_id).await;
+        self.metadata
+            .record_deleted(app_id, metadata_generation.as_deref())
+            .await
+            .map_err(|error| {
+                AppOperationError::Conflict(format!("metadata cleanup not committed: {error}"))
+            })?;
         // user_id 卷分区定位：Docker 下宿主目录定位由 destroy_app_pvc 的
         // prod/*/ 通配扫描兜底（正确性不依赖 metadata），显式值用于对账与
         // 未来精确直删。
         info!("[APP] app PVC destroyed: {} (user_id={})", app_id, user_id);
+        _release_lock.finish().await?;
         Ok(())
+    }
+
+    pub(crate) async fn capture_dev_deletion(
+        &self,
+        app_id: &str,
+    ) -> AppResult<Box<dyn shared_types::UserappDevDeletion>> {
+        let cleanup = self
+            .dev_cleanup
+            .read()
+            .map_err(|_| AppOperationError::Backend("dev cleanup lock poisoned".into()))?
+            .clone()
+            .ok_or_else(|| AppOperationError::Backend("userapp dev cleanup not injected".into()))?;
+        cleanup.capture(app_id).await.map_err(|error| {
+            AppOperationError::Backend(format!("capture userapp dev deletion: {error}"))
+        })
     }
 
     /// 销毁持久存储但**保留业务元数据行**（delete_app 的 purge 分支专用）。
@@ -270,6 +308,8 @@ impl crate::service::AppService {
         &self,
         app_id: &str,
         confirm: &str,
+        captured: Option<&shared_types::AppDeletionSnapshot>,
+        dev_deletion: Box<dyn shared_types::UserappDevDeletion>,
     ) -> AppResult<()> {
         validate_app_id(app_id)?;
         if confirm != app_id {
@@ -284,30 +324,21 @@ impl crate::service::AppService {
         // 双形态"删持久卷"语义在此收口，本层不再单独删目录（防双删漂移）。
         // 失败不吞：destroy 是显式高危操作（confirm=app_id），残留即孤儿；
         // 失败时外层 record_deleted 未执行，幂等重试收敛。
+        let snapshot = match captured {
+            Some(snapshot) => snapshot.clone(),
+            None => self
+                .runtime
+                .capture_app_deletion(app_id, None)
+                .await
+                .map_err(|e| map_runtime_error("capture app storage deletion", e))?,
+        };
         self.runtime
-            .destroy_app_pvc(app_id)
+            .destroy_app_storage_snapshot(&snapshot)
             .await
             .map_err(|e| map_runtime_error("destroy_app_pvc failed", e))?;
-        // Userapp 开发资源回收（UserappBuilder 开发容器 + per-app 开发 PVC）：
-        // 经 UserappDevCleanup 契约回调宿主（app_manager 的 runtime 视图无 agent
-        // 能力，ISP 分层）；best-effort——失败仅 warn 不阻断 purge，下次幂等收敛。
-        let dev_cleanup = self.dev_cleanup.read().expect("dev_cleanup lock").clone();
-        match dev_cleanup {
-            Some(cleanup) => {
-                if let Err(e) = cleanup.cleanup(app_id).await {
-                    warn!(
-                        "[APP] userapp dev resources cleanup failed (best-effort, will converge on next purge): app_id={app_id}: {e}"
-                    );
-                } else {
-                    info!("[APP] userapp dev resources cleaned: app_id={app_id}");
-                }
-            }
-            None => {
-                warn!(
-                    "[APP] dev cleanup not injected, skip UserappBuilder resources recycle: app_id={app_id}"
-                );
-            }
-        }
+        dev_deletion.cleanup().await.map_err(|error| {
+            AppOperationError::Backend(format!("destroy captured userapp dev resources: {error}"))
+        })?;
         info!("[APP] app PVC destroyed (metadata retained): {}", app_id);
         Ok(())
     }
@@ -321,16 +352,33 @@ impl crate::service::AppService {
     /// （与用户的确认由调用方负责）。幂等：app 不存在 = 其余步骤照做并成功
     /// （重入收敛）；状态查询失败透传（不当作"不存在"——对齐
     /// fetch_runtime_status_or_err 的两态分类）。dev 回收确定性执行（未注入
-    /// 硬错、失败透传），区别于 delete_app purge 分支的 best-effort——本接口
+    /// 硬错、失败透传）——本接口
     /// 契约是"彻底删除"，静默跳过 dev 会让成功响应与实际状态不一致。
     pub async fn purge_app(&self, app_id: &str) -> AppResult<()> {
         validate_app_id(app_id)?;
         // 与发布链（prepare/activate/confirm/delete-release）及 create/update/delete
         // 串行：purge 全程删计算+存储，不能与写版本包/切 code 并发。
-        let release_lock = self.acquire_process_release_lock(app_id).await;
+        let release_lock = self.acquire_process_release_lock(app_id).await?;
+        let dev_deletion = self.capture_dev_deletion(app_id).await?;
+        let metadata_generation =
+            self.metadata
+                .deletion_generation(app_id)
+                .await
+                .map_err(|error| {
+                    AppOperationError::Backend(format!("capture purge metadata: {error}"))
+                })?;
+        let snapshot = self
+            .runtime
+            .capture_app_deletion(app_id, None)
+            .await
+            .map_err(|e| map_runtime_error("capture purge resources", e))?;
         // 1. prod 计算面：存在才拆（防护序列 + 失败对称恢复见 tear_down_compute_plane）
         match self.runtime.get_deployment_status(app_id).await {
-            Ok(Some(previous)) => self.tear_down_compute_plane(app_id, &previous).await?,
+            Ok(Some(previous)) => {
+                release_lock.mark_mutating()?;
+                self.tear_down_compute_plane(app_id, &previous, &snapshot)
+                    .await?
+            }
             Ok(None) => info!(
                 "[APP] purge: compute plane already absent (idempotent skip): {}",
                 app_id
@@ -348,26 +396,28 @@ impl crate::service::AppService {
         // 2. prod 持久存储（K8s: 删 PVC + Ceph subvolume + 存量 -data 兜底；Docker:
         //    通配 prod/*/ 删该 app 四目录 + 旧布局兜底——双形态在 destroy_app_pvc
         //    收口，幂等）
-        self.runtime.destroy_app_pvc(app_id).await.map_err(|e| {
-            map_runtime_error(&format!("[APP] destroy_app_pvc failed app_id={app_id}"), e)
-        })?;
+        release_lock.mark_mutating()?;
+        self.runtime
+            .destroy_app_storage_snapshot(&snapshot)
+            .await
+            .map_err(|e| {
+                map_runtime_error(&format!("[APP] destroy_app_pvc failed app_id={app_id}"), e)
+            })?;
         // 3. dev 开发环境（builder 容器 + dev PVC + Docker dev 目录 + 注册/探活
         //    摘除，UserappDevCleanup 四步）：确定性执行——未注入硬错，失败透传
-        let cleanup = self
-            .dev_cleanup
-            .read()
-            .expect("dev_cleanup lock")
-            .clone()
-            .ok_or_else(|| {
-                AppOperationError::Backend("userapp dev cleanup not injected".to_string())
-            })?;
-        cleanup.cleanup(app_id).await.map_err(|e| {
-            AppOperationError::Backend(format!("destroy userapp dev resources (app {app_id}): {e}"))
+        dev_deletion.cleanup().await.map_err(|error| {
+            AppOperationError::Backend(format!("destroy captured userapp dev resources: {error}"))
         })?;
-        // 4. 元数据行删除（永久删除语义；record_deleted 内部 PG 失败仅 warn
-        //    不阻断——行残留只影响 name/owner 对账，不影响资源已删的事实）
-        self.metadata.record_deleted(app_id).await;
-        drop(release_lock);
+        // 4. Metadata cleanup is conditional on the captured generation; failures remain visible.
+        self.metadata
+            .record_deleted(app_id, metadata_generation.as_deref())
+            .await
+            .map_err(|error| {
+                AppOperationError::Conflict(format!(
+                    "purge metadata cleanup not committed: {error}"
+                ))
+            })?;
+        release_lock.finish().await?;
         self.remove_unused_process_release_lock(app_id);
         self.invalidate_deploy_cache().await;
         info!(

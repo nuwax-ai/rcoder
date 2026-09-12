@@ -1,7 +1,7 @@
 //! write-behind writer：消费 PersistOp 队列，批量落 PostgreSQL
 //!
 //! - **批处理**：先 recv 阻塞等一条，再 try_recv 聚合（单批上限 200），单事务提交
-//! - **保序**：FIFO；同 project 的操作顺序与本地镜像应用顺序一致
+//! - **顺序**：队列自身 FIFO；与 durable 直写交错由身份条件和墓碑保护，不能假设调用时序等于提交时序。
 //! - **重试**：整批失败（PG 抖动）指数退避后重试整批——所有语句均为幂等
 //!   upsert/delete，重放安全；结构性 op 永不丢弃
 //! - **超深丢弃**：队列深度超 10k 时丢弃 Touch 类幂等 op（保结构、舍精度）
@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use shared_types::{FlushOutcome, persistence::PersistenceOperationOutcome};
 use sqlx::{PgPool, Transaction};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -34,9 +34,12 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// writer 句柄（PgStore 持有；rcoder 优雅关停时调用 flush_and_stop）
 pub struct PersistWriter {
+    #[cfg(test)]
+    drain_count: Arc<AtomicUsize>,
     cancel: CancellationToken,
-    /// JoinHandle 一次性取出（flush_and_stop 取 &self；锁不跨 await）
-    handle: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Every caller observes the same terminal result; a caller timeout does not detach it.
+    completion: tokio::sync::watch::Receiver<Option<FlushOutcome>>,
+    pending: Arc<AtomicI64>,
     /// 队列深度采样（writer task 每批后更新，监控用；非精确实时值）
     depth: Arc<AtomicUsize>,
 }
@@ -50,12 +53,40 @@ impl PersistWriter {
     ) -> Self {
         let cancel = CancellationToken::new();
         let depth = Arc::new(AtomicUsize::new(0));
-        let handle = tokio::spawn(run(pool, rx, cancel.clone(), Arc::clone(&depth), pending));
+        let drain_count = Arc::new(AtomicUsize::new(0));
+        let (completion_tx, completion) = tokio::sync::watch::channel(None);
+        let handle = tokio::spawn(run(
+            pool,
+            rx,
+            cancel.clone(),
+            Arc::clone(&depth),
+            pending.clone(),
+            drain_count.clone(),
+        ));
+        let task_pending = pending.clone();
+        tokio::spawn(async move {
+            let outcome = match handle.await {
+                Ok(outcome) => outcome,
+                Err(error) => FlushOutcome::Incomplete {
+                    pending: task_pending.load(Ordering::Acquire).max(0) as usize,
+                    reason: format!("Persist writer task failed: {error}"),
+                },
+            };
+            completion_tx.send_replace(Some(outcome));
+        });
         Self {
+            #[cfg(test)]
+            drain_count,
             cancel,
-            handle: std::sync::Mutex::new(Some(handle)),
+            completion,
+            pending,
             depth,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_count(&self) -> usize {
+        self.drain_count.load(Ordering::Acquire)
     }
 
     /// 当前队列深度采样（监控/告警用，非精确实时值）
@@ -63,31 +94,33 @@ impl PersistWriter {
         self.depth.load(Ordering::Relaxed)
     }
 
-    /// 优雅关停：通知退出并等待队列排空（有界）。返回 true=全部落盘。
-    /// 幂等：重复调用/已停止返回 true。
+    /// Compatibility predicate; detailed callers should consume `flush_outcome`.
     pub async fn flush_and_stop(&self, timeout: Duration) -> bool {
+        self.flush_outcome(timeout).await.is_complete()
+    }
+
+    /// All shutdown callers wait for the same drain and retain its final result.
+    pub async fn flush_outcome(&self, timeout: Duration) -> FlushOutcome {
         self.cancel.cancel();
-        let handle = {
-            // 毒化（持锁 panic）时从 PoisonError 取回 guard——关停路径不因历史 panic 卡死
-            let mut guard = self
-                .handle
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.take()
-        };
-        let Some(handle) = handle else {
-            return true; // 已停止
-        };
-        match tokio::time::timeout(timeout, handle).await {
-            Ok(Ok(())) => true,
-            Ok(Err(e)) => {
-                warn!("[STORAGE_PG] writer task panicked: {e}");
-                false
+        let mut completion = self.completion.clone();
+        let wait = async {
+            loop {
+                if let Some(outcome) = completion.borrow_and_update().clone() {
+                    return outcome;
+                }
+                if completion.changed().await.is_err() {
+                    return FlushOutcome::Incomplete {
+                        pending: self.pending.load(Ordering::Acquire).max(0) as usize,
+                        reason: "Persist writer completion channel closed".into(),
+                    };
+                }
             }
-            Err(_) => {
-                warn!("[STORAGE_PG] writer flush timeout after {timeout:?}");
-                false
-            }
+        };
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(outcome) => outcome,
+            Err(_) => FlushOutcome::TimedOut {
+                pending: self.pending.load(Ordering::Acquire).max(0) as usize,
+            },
         }
     }
 }
@@ -99,9 +132,11 @@ async fn run(
     cancel: CancellationToken,
     depth: Arc<AtomicUsize>,
     pending: Arc<AtomicI64>,
-) {
+    drain_count: Arc<AtomicUsize>,
+) -> FlushOutcome {
     info!("[STORAGE_PG] persist writer started");
     let mut backoff = Duration::from_secs(1);
+    let mut rejected = 0usize;
     // 被 cancel 打断的未落盘批次（跨 loop 迭代累积，关停排空时统一尽力落盘）
     let mut interrupted: Vec<PersistOp> = Vec::new();
     loop {
@@ -144,7 +179,7 @@ async fn run(
         loop {
             match execute_batch(&pool, &batch).await {
                 Ok(size) => {
-                    debug!("[STORAGE_PG] batch committed: {size} ops (dropped={dropped})");
+                    debug!("[STORAGE_PG] batch resolved: {size} ops (dropped={dropped})");
                     pending.fetch_sub(size as i64, Ordering::AcqRel);
                     backoff = Duration::from_secs(1);
                     depth.store(rx.len(), Ordering::Relaxed);
@@ -171,6 +206,7 @@ async fn run(
                         let (committed, quarantined, remaining) =
                             isolate_poison_ops(&pool, &batch, &cancel).await;
                         pending.fetch_sub(committed as i64, Ordering::AcqRel);
+                        rejected += quarantined.len();
                         for (op, err) in quarantined {
                             error!(
                                 "[STORAGE_PG] dropped deterministic-error op (kind={}, mirror/PG may diverge): {err:#}",
@@ -202,6 +238,7 @@ async fn run(
         }
     }
 
+    drain_count.fetch_add(1, Ordering::AcqRel);
     // 关停排空：被 cancel 打断的未落盘批次 + 剩余结构性 op 尽力落盘（有界）
     if !interrupted.is_empty() {
         warn!(
@@ -230,7 +267,7 @@ async fn run(
     if !remaining.is_empty() {
         match execute_batch(&pool, &remaining).await {
             Ok(size) => {
-                info!("[STORAGE_PG] shutdown drain committed {size} ops");
+                info!("[STORAGE_PG] shutdown drain resolved {size} ops");
                 pending.fetch_sub(size as i64, Ordering::AcqRel);
             }
             Err(e) => error!(
@@ -240,15 +277,34 @@ async fn run(
         }
     }
     info!("[STORAGE_PG] persist writer stopped");
+    let remaining = pending.load(Ordering::Acquire).max(0) as usize;
+    if remaining == 0 && rejected == 0 {
+        FlushOutcome::Complete
+    } else {
+        FlushOutcome::Incomplete {
+            pending: remaining,
+            reason: format!(
+                "Persistence incomplete: {remaining} pending, {rejected} rejected operations"
+            ),
+        }
+    }
 }
 
 /// 单事务执行一批 op
 async fn execute_batch(pool: &PgPool, batch: &[PersistOp]) -> anyhow::Result<usize> {
     let mut tx: Transaction<'_, sqlx::Postgres> = pool.begin().await?;
+    lock_ops(&mut tx, batch).await?;
+    let mut superseded = 0usize;
     for op in batch {
-        execute_op(&mut tx, op).await?;
+        if execute_op(&mut tx, op).await? == PersistenceOperationOutcome::Superseded {
+            superseded += 1;
+        }
     }
     tx.commit().await?;
+    info!(
+        committed = batch.len() - superseded,
+        superseded, "[STORAGE_PG] persistence batch resolved"
+    );
     Ok(batch.len())
 }
 
@@ -306,44 +362,162 @@ fn is_deterministic_pg_error(e: &anyhow::Error) -> bool {
     false
 }
 
-/// 单 op → repo 调用（全部幂等：upsert / delete，重放安全）。
+/// Acquire a stable sorted key set once per transaction, preventing lock-order cycles.
+pub(in crate::pg) async fn lock_ops(
+    tx: &mut Transaction<'_, sqlx::Postgres>,
+    ops: &[PersistOp],
+) -> anyhow::Result<()> {
+    let mut keys = std::collections::BTreeSet::new();
+    for op in ops {
+        match op {
+            PersistOp::UpsertProject(p) => {
+                keys.insert(format!("project:{}", p.project_id));
+            }
+            PersistOp::RemoveProject { project_id, .. }
+            | PersistOp::TouchProject { project_id, .. }
+            | PersistOp::UpdateAgentStatus { project_id, .. } => {
+                keys.insert(format!("project:{project_id}"));
+            }
+            PersistOp::RemoveProjectForContainer {
+                project_id,
+                container_id,
+                container_name,
+                ..
+            } => {
+                keys.insert(format!("project:{project_id}"));
+                keys.insert(format!("container:{container_id}"));
+                keys.insert(format!("container-name:{container_name}"));
+            }
+            PersistOp::AddSession {
+                project_id,
+                session_id,
+                ..
+            } => {
+                keys.insert(format!("project:{project_id}"));
+                keys.insert(format!("session:{session_id}"));
+            }
+            PersistOp::RemoveSession { session_id, .. }
+            | PersistOp::TouchSession { session_id, .. } => {
+                keys.insert(format!("session:{session_id}"));
+            }
+            PersistOp::ClearSessions {
+                project_id,
+                sessions,
+                ..
+            } => {
+                keys.insert(format!("project:{project_id}"));
+                for (id, _) in sessions {
+                    keys.insert(format!("session:{id}"));
+                }
+            }
+            PersistOp::DeleteContainerWithProjects {
+                container_id,
+                projects,
+            } => {
+                keys.insert(format!("container:{container_id}"));
+                for (id, _) in projects {
+                    keys.insert(format!("project:{id}"));
+                }
+            }
+            PersistOp::UpsertContainer(c) => {
+                keys.insert(format!("container-name:{}", c.container_name));
+                if let Some(id) = &c.container_id {
+                    keys.insert(format!("container:{id}"));
+                }
+            }
+            PersistOp::TouchContainer { .. } => {}
+        }
+    }
+    for key in keys {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 719324))")
+            .bind(key)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Single operation result: Committed and Superseded are distinct successful SQL outcomes.
 /// 事务内执行器解引用传参（官方 transaction 示例范式）。
 pub(in crate::pg) async fn execute_op(
     tx: &mut Transaction<'_, sqlx::Postgres>,
     op: &PersistOp,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PersistenceOperationOutcome> {
     use PersistOp as Op;
     let db = &mut **tx;
-    match op {
+    let outcome = match op {
         Op::UpsertContainer(c) => repo::upsert_container(db, c).await?,
         Op::UpsertProject(p) => repo::upsert_project(db, p).await?,
-        Op::RemoveProject { project_id } => repo::remove_project(db, project_id).await?,
+        Op::RemoveProject {
+            project_id,
+            generation,
+        } => repo::remove_project(db, project_id, generation).await?,
+        Op::RemoveProjectForContainer {
+            project_id,
+            generation,
+            container_id,
+            ..
+        } => repo::remove_project_for_container(db, project_id, generation, container_id).await?,
         Op::AddSession {
             project_id,
             session_id,
             container_name,
-        } => repo::add_session(db, project_id, session_id, container_name.as_deref()).await?,
-        Op::RemoveSession { session_id } => repo::remove_session(db, session_id).await?,
-        Op::ClearSessions { project_id } => repo::clear_sessions(db, project_id).await?,
-        Op::DeleteContainerWithProjects { container_id } => {
-            repo::delete_container_with_projects(db, container_id).await?
+            project_generation,
+            generation,
+            predecessor,
+        } => {
+            repo::add_session(
+                db,
+                project_id,
+                session_id,
+                container_name.as_deref(),
+                project_generation,
+                generation,
+                predecessor.as_deref(),
+            )
+            .await?
         }
+        Op::RemoveSession {
+            session_id,
+            generation,
+        } => repo::remove_session(db, session_id, generation).await?,
+        Op::ClearSessions {
+            project_id,
+            generation,
+            sessions,
+        } => repo::clear_sessions(db, project_id, generation, sessions).await?,
+        Op::DeleteContainerWithProjects {
+            container_id,
+            projects,
+        } => repo::delete_container_with_projects(db, container_id, projects).await?,
         Op::TouchProject {
             project_id,
             last_activity,
-        } => repo::touch_project(db, project_id, *last_activity).await?,
+        } => {
+            repo::touch_project(db, project_id, *last_activity).await?;
+            PersistenceOperationOutcome::Committed
+        }
         Op::TouchContainer {
             container_name,
             last_activity,
-        } => repo::touch_container(db, container_name, *last_activity).await?,
+        } => {
+            repo::touch_container(db, container_name, *last_activity).await?;
+            PersistenceOperationOutcome::Committed
+        }
         Op::TouchSession {
             session_id,
             last_seen_at,
-        } => repo::touch_session(db, session_id, *last_seen_at).await?,
+        } => {
+            repo::touch_session(db, session_id, *last_seen_at).await?;
+            PersistenceOperationOutcome::Committed
+        }
         Op::UpdateAgentStatus {
             project_id,
             agent_status,
-        } => repo::update_agent_status(db, project_id, agent_status).await?,
-    }
-    Ok(())
+        } => {
+            repo::update_agent_status(db, project_id, agent_status).await?;
+            PersistenceOperationOutcome::Committed
+        }
+    };
+    Ok(outcome)
 }

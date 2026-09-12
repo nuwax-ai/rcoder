@@ -75,14 +75,59 @@ impl ProjectStoreBackend {
         }
     }
 
-    /// 结构性删除的 durable 变体（stop/清理路径）：与插入类 durable 同事务
-    /// 语义——消除"remove 入队 → durable insert 提交 → writer 重放删行"的
-    /// 倒挂窗口（跨副本可见性契约）。Memory 模式等价普通内存删。
+    /// Structural deletion captures the project generation before database I/O.
+    /// Delayed fallback cannot delete a newer generation. Memory removes locally.
     pub async fn remove_durable(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
         match self {
             Self::Memory(inner) => inner.remove(project_id),
             #[cfg(feature = "pg")]
             Self::Postgres(store) => store.remove_durable(project_id).await,
+        }
+    }
+
+    /// Remove only the project incarnation captured by the resource operation.
+    pub async fn remove_durable_if_generation(
+        &self,
+        project_id: &str,
+        expected_generation: &str,
+    ) -> anyhow::Result<bool> {
+        match self {
+            Self::Memory(inner) => Ok(inner
+                .remove_if_generation(project_id, expected_generation)
+                .is_some()),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .remove_durable_if_generation(project_id, expected_generation)
+                    .await
+            }
+        }
+    }
+
+    pub async fn remove_durable_if_container_identity(
+        &self,
+        project_id: &str,
+        expected_generation: &str,
+        expected_container_id: &str,
+    ) -> anyhow::Result<bool> {
+        match self {
+            Self::Memory(inner) => Ok(inner
+                .remove_if_container_identity(
+                    project_id,
+                    expected_generation,
+                    expected_container_id,
+                )
+                .is_some()),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .remove_durable_if_container_identity(
+                        project_id,
+                        expected_generation,
+                        expected_container_id,
+                    )
+                    .await
+            }
         }
     }
 
@@ -158,11 +203,18 @@ impl ProjectStoreBackend {
 
     /// 优雅关停：PG 模式 flush write-behind 队列（有界等待）；
     /// Memory 模式 no-op 返回 true（参数留待 PG 分支使用）。返回 false = 有结构性 op 未落盘。
-    pub async fn shutdown_flush(&self, _timeout: std::time::Duration) -> bool {
+    pub async fn shutdown_flush(&self, timeout: std::time::Duration) -> bool {
+        self.shutdown_flush_outcome(timeout).await.is_complete()
+    }
+
+    pub async fn shutdown_flush_outcome(
+        &self,
+        _timeout: std::time::Duration,
+    ) -> shared_types::FlushOutcome {
         match self {
-            Self::Memory(_) => true,
+            Self::Memory(_) => shared_types::FlushOutcome::Complete,
             #[cfg(feature = "pg")]
-            Self::Postgres(store) => store.writer().flush_and_stop(_timeout).await,
+            Self::Postgres(store) => store.shutdown_flush_outcome(_timeout).await,
         }
     }
 }

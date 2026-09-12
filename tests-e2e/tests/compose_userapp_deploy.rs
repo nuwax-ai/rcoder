@@ -882,6 +882,129 @@ async fn verify_app_files_prod(env: &Env, report: &JsonlReporter, app: &str, use
     );
 }
 
+/// Q05: a rejected image preparation must preserve the live physical runtime and traffic.
+async fn verify_failed_image_update_preserves_runtime(
+    env: &Env,
+    report: &JsonlReporter,
+    app: &str,
+    user: &str,
+) {
+    async fn identity(name: &str) -> Result<Value, String> {
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::process::Command::new("docker")
+                .args([
+                    "inspect",
+                    "--format",
+                    r#"{"id":{{json .Id}},"image":{{json .Image}},"running":{{json .State.Running}}}"#,
+                    name,
+                ])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|error| format!("Docker identity deadline: {error}"))?
+        .map_err(|error| format!("Docker identity command: {error}"))?;
+        if !output.status.success() {
+            return Err("Docker runtime identity is unavailable".into());
+        }
+        serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
+    }
+    async fn traffic(env: &Env, url: &str) -> Result<(u16, Vec<u8>), String> {
+        let response = env
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status().as_u16();
+        let body = response.bytes().await.map_err(|error| error.to_string())?;
+        Ok((status, body.to_vec()))
+    }
+    let name = format!("rcoder-app-{app}");
+    let url = format!(
+        "{}/api/v1/userapp/proxy/app/prod/{user}/{app}/react/",
+        pingora_base()
+    );
+    let before = identity(&name).await;
+    let baseline = traffic(env, &url).await;
+    let ready = before.as_ref().is_ok_and(|value| {
+        value["id"].as_str().is_some_and(|id| !id.is_empty()) && value["running"] == true
+    }) && baseline
+        .as_ref()
+        .is_ok_and(|(status, body)| *status == 200 && !body.is_empty());
+    report.assert_hard(
+        "Q05 image update baseline has running container and real React content",
+        ready,
+        format!(
+            "identity={before:?}; traffic_status={:?}",
+            baseline.as_ref().map(|(status, _)| status)
+        ),
+    );
+    let (Ok(before), Ok((_, baseline))) = (before, baseline) else {
+        return;
+    };
+    if !ready {
+        return;
+    }
+    // Valid registry syntax and a fresh repository prevent a cached-image shortcut.
+    // Port 1 on the local Docker daemon host is the intentionally refused registry.
+    let image = format!(
+        "127.0.0.1:1/rcoder-e2e-missing-{}:q05",
+        uuid::Uuid::new_v4().simple()
+    );
+    let (status, result) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/update"),
+        json!({"user_id": user, "image": image}),
+    )
+    .await;
+    report.assert_hard(
+        "Q05 unavailable image update returns explicit backend failure",
+        status == reqwest::StatusCode::OK
+            && result["code"].as_str() == Some(shared_types::ERR_BACKEND_ERROR)
+            && result["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+        format!(
+            "image={image}; HTTP {status}; response={}",
+            trunc(&result, 400)
+        ),
+    );
+    let after = identity(&name).await;
+    report.assert_hard(
+        "Q05 failed image update preserves physical container and image",
+        after.as_ref().is_ok_and(|value| {
+            value["id"] == before["id"]
+                && value["image"] == before["image"]
+                && value["running"] == true
+        }),
+        format!("before={before}; after={after:?}"),
+    );
+    let after_traffic = traffic(env, &url).await;
+    report.assert_hard(
+        "Q05 failed image update preserves real Pingora React content",
+        after_traffic
+            .as_ref()
+            .is_ok_and(|(status, body)| *status == 200 && *body == baseline),
+        format!(
+            "baseline_sha256={}; after={:?}",
+            Sha256::digest(&baseline)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            after_traffic.as_ref().map(|(status, body)| (
+                *status,
+                Sha256::digest(body)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ))
+        ),
+    );
+}
+
 /// C5 热部署：同 url + 新 release_id + deploy_mode=hot → 容器不换（started_at 不变）。
 async fn verify_hot_redeploy(
     env: &Env,
@@ -1244,6 +1367,7 @@ async fn userapp_deploy_full_chain() {
         // 热部署重新编排的 migrate 用旧凭据连 PG 被拒（db 管理与部署链
         // 凭据不同步，待产品层修复；测试顺序规避并锁现状）
         verify_app_files_prod(&env, &report, &app, user).await;
+        verify_failed_image_update_preserves_runtime(&env, &report, &app, user).await;
         verify_hot_redeploy(&env, &report, &app, user, &release_id, &sha256).await;
         verify_db_prod(&env, &report, &app, user).await;
         verify_stop_and_wake(&env, &report, &app, user).await;

@@ -111,13 +111,13 @@ pub async fn graceful_shutdown(
             "[STORAGE_PG] container cleanup skipped (postgres mode: agent containers survive restarts)"
         );
         if let Some(backend) = &projects {
-            if !backend
-                .shutdown_flush(std::time::Duration::from_secs(5))
-                .await
-            {
-                error!("[STORAGE_PG] shutdown flush incomplete: some ops may be lost");
-            } else {
+            let outcome = backend
+                .shutdown_flush_outcome(std::time::Duration::from_secs(5))
+                .await;
+            if outcome.is_complete() {
                 info!("[STORAGE_PG] shutdown flush completed");
+            } else {
+                error!(?outcome, "[STORAGE_PG] shutdown flush incomplete");
             }
         }
         info!(" RCoder graceful shutdown completed");

@@ -68,6 +68,23 @@ pub(super) fn hydrate_project(
         None
     })?;
     let mut info = ProjectAndContainerInfo::new(row.project_id.clone());
+    let sessions = row
+        .session_identities
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|(id, g)| g.as_str().map(|g| (id.clone(), g.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    info.set_persistence_identity(shared_types::persistence::ProjectPersistenceIdentity {
+        generation: row.generation.clone(),
+        predecessor: None,
+        sessions,
+        retired_sessions: Default::default(),
+    });
     info.set_service_type(Some(service_type));
     info.set_user_id(row.user_id.clone());
     info.set_pod_id(row.pod_id.clone());
@@ -205,6 +222,7 @@ impl crate::pg::PgStore {
         fetched_by: &str,
         (project_row, container_row): (ProjectRow, Option<ContainerRow>),
     ) -> Arc<ProjectAndContainerInfo> {
+        let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
         let mut container_by_name = HashMap::new();
         if let Some(row) = container_row {
             let name = row.container_name.clone();
@@ -219,8 +237,13 @@ impl crate::pg::PgStore {
         // session 键抛掉——同 project 多 session 并发回源时互相驱逐，回源缓存
         // 永不生效（每消息一次主库查询）
         if let Some(existing) = self.inner.get(&project_row.project_id) {
+            if existing.persistence_identity().generation != project_row.generation {
+                return existing;
+            }
             for sid in existing.sessions().iter() {
-                info.restore_session(sid.clone());
+                if let Some(generation) = existing.persistence_identity().sessions.get(sid) {
+                    info.restore_session_identity(sid, generation.clone());
+                }
             }
         }
         let info = Arc::new(info);

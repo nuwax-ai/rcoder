@@ -23,6 +23,28 @@ use super::kubernetes_runtime::{KubernetesRuntime, read_app_expose_env};
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 impl UserAppDeploymentRuntime for KubernetesRuntime {
+    async fn acquire_app_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        self.acquire_application_operation(app_id, &ServiceType::Userapp)
+            .await
+            .map(Some)
+    }
+    async fn capture_app_deletion(
+        &self,
+        app_id: &str,
+        expected: Option<&str>,
+    ) -> ContainerRuntimeResult<shared_types::AppDeletionSnapshot> {
+        self.capture_deletion(app_id, expected).await
+    }
+
+    async fn delete_app_snapshot(
+        &self,
+        snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        self.delete_captured(snapshot, false).await
+    }
     // ===== Deployment 生命周期（Userapp 专用，转调 k8s_deployment.rs 的 inherent 方法）=====
 
     async fn app_env_snapshot(
@@ -270,7 +292,8 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
     }
 
     async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
-        self.delete_app_resources(app_id).await
+        let snapshot = self.capture_deletion(app_id, None).await?;
+        self.delete_captured(&snapshot, false).await
     }
 
     async fn get_deployment_status(

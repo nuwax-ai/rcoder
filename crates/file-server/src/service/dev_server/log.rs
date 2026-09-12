@@ -353,7 +353,7 @@ mod evt_tests {
             Arc::new(move |json: &str| {
                 sink.lock().expect("lock").push(json.to_string());
             });
-        let _handle = spawn_log_pipe_with_events(reader, main.clone(), temp.clone(), callback);
+        let handle = spawn_log_pipe_with_events(reader, main.clone(), temp.clone(), callback);
         use tokio::io::AsyncWriteExt as _;
         writer
             .write_all(
@@ -361,13 +361,13 @@ mod evt_tests {
             )
             .await
             .expect("write");
-        // 管道消费是异步的：轮询等回调命中（有界）
-        for _ in 0..50 {
-            if hits.lock().expect("lock").len() == 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        // The first callback does not prove later lines have reached disk.
+        // Close input and await EOF processing before asserting complete output.
+        drop(writer);
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("log pipe must finish after EOF")
+            .expect("log pipe task must not panic");
         {
             let hits = hits.lock().expect("lock");
             assert_eq!(

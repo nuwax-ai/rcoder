@@ -68,6 +68,10 @@ pub struct AppManagerConfig {
     /// 工作空间根目录（Docker 模式 = 宿主机路径；K8s 模式 = rcoder Pod 内 PVC 挂载点）
     pub workspace_root: Option<String>,
 
+    /// Docker operation locks must live on the shared userApp data filesystem.
+    /// All replicas using that data must use the same directory.
+    pub operation_lock_root: String,
+
     /// K8s 命名空间
     pub namespace: String,
 
@@ -107,6 +111,7 @@ impl Default for AppManagerConfig {
         Self {
             enabled: true,
             workspace_root: std::env::var("RCODER_WORKSPACE_ROOT").ok(),
+            operation_lock_root: shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT.to_owned(),
             namespace: std::env::var("RCODER_K8S_NAMESPACE")
                 .unwrap_or_else(|_| "default".to_string()),
             gateway_name: std::env::var("RCODER_K8S_GATEWAY_NAME").ok(),

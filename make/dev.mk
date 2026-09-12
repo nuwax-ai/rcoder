@@ -6,7 +6,7 @@ dev-build: docker-build
 	@echo ""
 	@echo "🎉 构建完成！"
 	@echo "  ✓ Docker 镜像: dev-master-rcoder:latest"
-	@echo "  ✓ Docker 镜像: dev-computer-agent-runner:latest"
+	@echo "  ✓ Docker 镜像: dev-rcoder-agent-runner:latest"
 	@echo ""
 	@echo "💡 下一步: make dev-up 启动容器"
 
@@ -35,8 +35,8 @@ dev-down:
 dev-restart: dev-build
 	@echo "🔄 重启容器服务（使用最新构建的镜像）..."
 	@if [ -f "docker/docker-compose.yml" ]; then \
-		docker-compose -f docker/docker-compose.yml down; \
-		docker-compose -f docker/docker-compose.yml up -d; \
+		docker-compose -f docker/docker-compose.yml down || exit $$?; \
+		docker-compose -f docker/docker-compose.yml up -d || exit $$?; \
 		echo "✅ 容器已重启！"; \
 	else \
 		echo "❌ 错误: 未找到 docker-compose.yml"; \

@@ -71,7 +71,33 @@ pub struct ChatTrace<'a> {
     pub elapsed_ms: u128,
 }
 
+/// Capture canonical runner identity once; event payloads cannot override it.
+#[derive(Clone, Debug)]
+struct ReportIdentity {
+    run_id: Option<String>,
+    case_id: Option<String>,
+    test_name: Option<String>,
+}
+
+impl ReportIdentity {
+    fn capture() -> Self {
+        let read = |name| std::env::var(name).ok().filter(|value| !value.is_empty());
+        Self {
+            run_id: read("E2E_RUN_ID"),
+            case_id: read("E2E_CASE_ID"),
+            test_name: read("E2E_TEST_NAME"),
+        }
+    }
+
+    fn stamp(&self, line: &mut Value) {
+        line["run_id"] = json!(self.run_id);
+        line["case_id"] = json!(self.case_id);
+        line["test_name"] = json!(self.test_name);
+    }
+}
+
 pub struct JsonlReporter {
+    identity: ReportIdentity,
     file: Mutex<File>,
     pub path: PathBuf,
     scenario: String,
@@ -100,6 +126,7 @@ impl JsonlReporter {
             .filter(|u| !u.is_empty())
             .map(str::to_owned);
         let reporter = Self {
+            identity: ReportIdentity::capture(),
             file: Mutex::new(file),
             path,
             scenario: scenario.to_owned(),
@@ -290,6 +317,7 @@ impl JsonlReporter {
     }
 
     fn write_line(&self, mut line: Value) {
+        self.identity.stamp(&mut line);
         line["ts"] = json!(chrono::Local::now().to_rfc3339());
         if let Ok(mut file) = self.file.lock()
             && let Ok(body) = serde_json::to_string(&line)
@@ -312,6 +340,46 @@ impl Drop for JsonlReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_event_retains_captured_canonical_identity() {
+        let path =
+            std::env::temp_dir().join(format!("rcoder-report-{}.jsonl", uuid::Uuid::new_v4()));
+        let reporter = JsonlReporter {
+            identity: ReportIdentity {
+                run_id: Some("run-1".to_owned()),
+                case_id: Some("case-1".to_owned()),
+                test_name: Some("canonical_test".to_owned()),
+            },
+            file: Mutex::new(File::create(&path).unwrap()),
+            path: path.clone(),
+            scenario: "legacy_alias".to_owned(),
+            backend: "compose".to_owned(),
+            base_url: None,
+            started: Instant::now(),
+            hard_pass: Cell::new(0),
+            hard_fail: Cell::new(0),
+            failed_names: RefCell::new(Vec::new()),
+            end_written: Cell::new(true),
+        };
+        for kind in ["scenario_begin", "assert", "scenario_end"] {
+            reporter.write_line(json!({"kind": kind, "run_id": "foreign-run",
+                "case_id": "foreign-case", "test_name": "foreign-test"}));
+        }
+        drop(reporter);
+        let body = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let rows: Vec<Value> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert_eq!(row["run_id"], "run-1");
+            assert_eq!(row["case_id"], "case-1");
+            assert_eq!(row["test_name"], "canonical_test");
+        }
+    }
 
     #[test]
     fn verdict_str_round() {

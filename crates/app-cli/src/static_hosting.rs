@@ -11,9 +11,11 @@
 //! ——由启动循环分派。幂等：热部署重编排（builtin Redeploy / supervisord 重
 //! orchestrate）不二次 bind 同端口。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::LazyLock;
+use tokio::sync::{Mutex, watch};
+use tokio_util::sync::CancellationToken;
 
 use axum::Router;
 use axum::extract::State;
@@ -24,8 +26,251 @@ use workspace_manifest::ProjectType;
 
 use crate::manifest::ServiceSpec;
 
-/// 已托管服务集合（service_id → listener 已起；幂等防热部署重编排二次 bind）。
-static HOSTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static HOSTED: LazyLock<StaticHostManager> = LazyLock::new(StaticHostManager::default);
+
+#[derive(Default)]
+pub struct StaticHostManager {
+    hosts: Mutex<HashMap<u16, HostedService>>,
+}
+
+struct HostedService {
+    root: watch::Sender<PathBuf>,
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+    drained: watch::Receiver<bool>,
+}
+
+impl Drop for HostedService {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.task.abort();
+    }
+}
+
+struct CancelWorkerOnDrop(CancellationToken);
+impl Drop for CancelWorkerOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+impl HostedService {
+    async fn stop(&mut self) -> anyhow::Result<()> {
+        self.cancel.cancel();
+        let wait = async {
+            while !*self.drained.borrow_and_update() {
+                self.drained.changed().await.map_err(|_| {
+                    anyhow::anyhow!("static connection owner exited without confirming drain")
+                })?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(3), wait)
+            .await
+            .map_err(|_| {
+                crate::supervisor::ShutdownUnconfirmed(
+                    "static connection drain deadline exceeded".into(),
+                )
+            })?
+            .map_err(|error| crate::supervisor::ShutdownUnconfirmed(error.to_string()))?;
+        self.task.abort();
+        Ok(())
+    }
+}
+
+/// Own every connection driver. Cancellation of the monitor cannot detach HTTP
+/// connections: this worker closes accept, drains briefly, then aborts and joins.
+async fn serve_owned_connections(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    cancel: CancellationToken,
+    drained: watch::Sender<bool>,
+) {
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((socket, _)) => {
+                    let service = hyper_util::service::TowerToHyperService::new(router.clone());
+                    let cancelled = cancel.clone();
+                    connections.spawn(async move {
+                        let connection = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(hyper_util::rt::TokioIo::new(socket), service);
+                        tokio::pin!(connection);
+                        tokio::select! {
+                            result = &mut connection => { if let Err(error) = result { tracing::debug!(%error, "Static HTTP connection ended"); } },
+                            () = cancelled.cancelled() => {
+                                connection.as_mut().graceful_shutdown();
+                                drop(connection.await);
+                            }
+                        }
+                    });
+                }
+                Err(error) => { tracing::error!(%error, "Static accept failed"); cancel.cancel(); break; }
+            },
+            _ = connections.join_next(), if !connections.is_empty() => {},
+        }
+    }
+    drop(listener);
+    if tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
+    drained.send_replace(true);
+}
+
+fn bind_listener(port: u16) -> std::io::Result<std::net::TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    // Reclaim a stopped listener's address even while old HTTP sockets remain
+    // in TIME_WAIT. This never enables reuse_port or competing live listeners.
+    #[cfg(unix)]
+    socket.set_reuseaddr(true)?;
+    socket
+        .bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        .map_err(|error| std::io::Error::new(error.kind(), format!("bind: {error}")))?;
+    socket
+        .listen(1024)
+        .map_err(|error| std::io::Error::new(error.kind(), format!("listen: {error}")))?
+        .into_std()
+}
+
+impl StaticHostManager {
+    /// Stage every new bind before changing active roots. A rejected configuration
+    /// leaves serving listeners unchanged. Reuse is based on the actual live port,
+    /// allowing services to exchange ports without an unnecessary bind conflict.
+    pub async fn reconcile(
+        &self,
+        specs: &[ServiceSpec],
+        workspace: &Path,
+        dev_profile: bool,
+    ) -> anyhow::Result<()> {
+        self.reconcile_with_bind(specs, workspace, dev_profile, bind_listener)
+            .await
+    }
+
+    async fn reconcile_with_bind(
+        &self,
+        specs: &[ServiceSpec],
+        workspace: &Path,
+        dev_profile: bool,
+        mut bind: impl FnMut(u16) -> std::io::Result<std::net::TcpListener>,
+    ) -> anyhow::Result<()> {
+        let mut desired = HashMap::new();
+        let mut names = HashSet::new();
+        for spec in specs
+            .iter()
+            .filter(|spec| spec.enabled && hosts_statically(spec, dev_profile))
+        {
+            anyhow::ensure!(
+                names.insert(&spec.service_id),
+                "duplicate static service {}",
+                spec.service_id
+            );
+            let content = spec.static_content_dir.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "static service '{}' has no static_content_dir in release lock",
+                    spec.service_id
+                )
+            })?;
+            let root = workspace.join(&spec.dir).join(content);
+            anyhow::ensure!(
+                desired.insert(spec.port, root).is_none(),
+                "duplicate static port {}",
+                spec.port
+            );
+        }
+        let mut hosts = self.hosts.lock().await;
+        // A finished monitor can still have a worker draining connections.
+        // Rebinding is allowed only after that owner confirms every socket closed.
+        for port in desired.keys() {
+            if let Some(host) = hosts.get_mut(port)
+                && (host.task.is_finished() || host.cancel.is_cancelled())
+            {
+                host.stop().await?;
+                hosts.remove(port);
+            }
+        }
+        let mut staged = HashMap::new();
+        for (&port, root) in &desired {
+            if hosts
+                .get(&port)
+                .is_some_and(|host| !host.task.is_finished())
+            {
+                continue;
+            }
+            let listener = bind(port)
+                .map_err(|e| anyhow::anyhow!("bind static host 127.0.0.1:{port}: {e}"))?;
+            listener.set_nonblocking(true)?;
+            staged.insert(port, tokio::net::TcpListener::from_std(listener)?);
+            if !root.is_dir() {
+                tracing::warn!(path = %root.display(), "Static content directory is missing; serving 404 until created");
+            }
+        }
+        // All requested binds succeeded; publish roots, then retire old owners.
+        let removed: Vec<_> = hosts
+            .keys()
+            .filter(|port| !desired.contains_key(port))
+            .copied()
+            .collect();
+        for (port, root) in desired {
+            if let Some(listener) = staged.remove(&port) {
+                let (root_tx, root_rx) = watch::channel(root);
+                let cancel = CancellationToken::new();
+                let (drained_tx, drained) = watch::channel(false);
+                let worker = tokio::spawn(serve_owned_connections(
+                    listener,
+                    router_with_root(root_rx),
+                    cancel.clone(),
+                    drained_tx,
+                ));
+                // Capture the guard before first poll so aborting an unpolled
+                // monitor still cancels its owned connection worker.
+                let guard = CancelWorkerOnDrop(cancel.clone());
+                let task = tokio::spawn(async move {
+                    let _guard = guard;
+                    if let Err(error) = worker.await {
+                        tracing::error!(port, %error, "Static connection owner failed");
+                    }
+                });
+                hosts.insert(
+                    port,
+                    HostedService {
+                        root: root_tx,
+                        cancel,
+                        task,
+                        drained,
+                    },
+                );
+            } else if let Some(host) = hosts.get(&port) {
+                host.root.send_replace(root);
+            }
+        }
+        // Keep lifecycle ownership registered until drain is confirmed, including
+        // cancellation or an incomplete stop. A later reconcile must finish it.
+        for port in removed {
+            if let Some(host) = hosts.get_mut(&port) {
+                host.stop().await?;
+            }
+            hosts.remove(&port);
+        }
+        Ok(())
+    }
+}
+
+pub async fn reconcile(
+    specs: &[ServiceSpec],
+    workspace: &Path,
+    dev_profile: bool,
+) -> anyhow::Result<()> {
+    HOSTED.reconcile(specs, workspace, dev_profile).await
+}
 
 /// static 服务是否应走内置托管（而非 spawn 进程）：
 /// `type = static` 且（非 dev 源码形态 或 未配 `[devrun]`）。
@@ -34,64 +279,13 @@ pub fn hosts_statically(spec: &ServiceSpec, dev_profile: bool) -> bool {
     spec.r#type == ProjectType::Static && !(dev_profile && spec.devrun.is_some())
 }
 
-/// 启动某 static 服务的托管 listener（幂等：已在托管则 Ok）。bind 失败回滚
-/// 标记并上抛（端口被外部占用 = 编排 fail-fast）。
-pub fn ensure_spawned(spec: &ServiceSpec, workspace: &Path) -> anyhow::Result<()> {
-    {
-        let mut guard = HOSTED.lock().expect("static hosted set lock");
-        let hosted = guard.get_or_insert_with(HashSet::new);
-        if hosted.contains(&spec.service_id) {
-            return Ok(());
-        }
-        hosted.insert(spec.service_id.clone());
-    }
-    let spawn_result = spawn_listener(spec, workspace);
-    if spawn_result.is_err() {
-        HOSTED
-            .lock()
-            .expect("static hosted set lock")
-            .get_or_insert_with(HashSet::new)
-            .remove(&spec.service_id);
-    }
-    spawn_result
-}
-
-fn spawn_listener(spec: &ServiceSpec, workspace: &Path) -> anyhow::Result<()> {
-    // 托管内容根：{workspace}/{dir}/{static_content_dir}（lock 透传的
-    // [build].artifact 目录；hosts_statically 已保证 static 服务必达）
-    let Some(content_dir) = &spec.static_content_dir else {
-        anyhow::bail!(
-            "static service '{}' has no static_content_dir in release lock",
-            spec.service_id
-        )
-    };
-    let root = workspace.join(&spec.dir).join(content_dir);
-    // 产物缺失可见性：root 不存在（如源码态未跑过构建）不阻断 bind（后续构建
-    // 出目录即自动生效——每请求实时读），但必须 warn 留痕（否则 404 无迹可循）
-    if !root.is_dir() {
-        tracing::warn!(
-            "static host '{}' content dir missing (serving 404 until it appears): {}",
-            spec.service_id,
-            root.display()
-        );
-    }
-    let listener = std::net::TcpListener::bind(("127.0.0.1", spec.port))
-        .map_err(|e| anyhow::anyhow!("bind static host 127.0.0.1:{}: {e}", spec.port))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| anyhow::anyhow!("static host listener nonblocking: {e}"))?;
-    let listener = tokio::net::TcpListener::from_std(listener)
-        .map_err(|e| anyhow::anyhow!("static host listener async: {e}"))?;
-    let router = router(root);
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, router).await {
-            tracing::error!("static host exited: {e}");
-        }
-    });
-    Ok(())
-}
-
+#[cfg(test)]
 fn router(root: PathBuf) -> Router {
+    let (_tx, rx) = watch::channel(root);
+    router_with_root(rx)
+}
+
+fn router_with_root(root: watch::Receiver<PathBuf>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/{*path}", get(serve).head(serve))
@@ -105,7 +299,8 @@ async fn health() -> Response {
 }
 
 /// 递归 serve 静态目录；未匹配路径 SPA fallback 到 index.html；HEAD 剥 body。
-async fn serve(State(root): State<PathBuf>, method: Method, uri: Uri) -> Response {
+async fn serve(State(root): State<watch::Receiver<PathBuf>>, method: Method, uri: Uri) -> Response {
+    let root = root.borrow().clone();
     let Some(target) = resolve_target(&root, uri.path()) else {
         return not_found();
     };
@@ -289,6 +484,217 @@ mod tests {
         // 穿越拒绝
         let (status, _, _) = get(&router, "/..%2f..%2fetc%2fpasswd").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn hot_reconfigure_changes_actual_static_content() {
+        // Keep port-release assertions isolated from unrelated tests spawning
+        // process groups. On Unix, CLOEXEC descriptors can survive temporarily
+        // between fork and exec in those children, outside this server's owner.
+        const ISOLATED: &str = "APP_CLI_STATIC_LIFECYCLE_TEST_CHILD";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "static_hosting::tests::hot_reconfigure_changes_actual_static_content",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .kill_on_drop(true)
+                .output();
+            let output = tokio::time::timeout(std::time::Duration::from_secs(30), output)
+                .await
+                .expect("isolated static lifecycle deadline")
+                .expect("spawn isolated static lifecycle test");
+            assert!(
+                output.status.success(),
+                "isolated static lifecycle failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().expect("workspace");
+        for (dir, content) in [("dist-a", "RELEASE_A"), ("dist-b", "RELEASE_B")] {
+            std::fs::create_dir_all(root.path().join("web").join(dir)).expect("dir");
+            std::fs::write(
+                root.path().join("web").join(dir).join("index.html"),
+                content,
+            )
+            .expect("file");
+        }
+        let probe = bind_listener(0).expect("port");
+        let port = probe.local_addr().expect("address").port();
+        let mut probe = Some(probe);
+        let mut spec = crate::manifest::ServiceSpec {
+            service_id: uuid::Uuid::new_v4().to_string(),
+            name: "Web".into(),
+            dir: "web".into(),
+            r#type: ProjectType::Static,
+            kind: workspace_manifest::ProjectKind::Web,
+            enabled: true,
+            port,
+            devbuild: None,
+            run: Default::default(),
+            devrun: None,
+            static_content_dir: Some("dist-a".into()),
+            health: Default::default(),
+            proxy: None,
+            logs: Vec::new(),
+            env: Default::default(),
+        };
+        let manager = StaticHostManager::default();
+        manager
+            .reconcile_with_bind(
+                std::slice::from_ref(&spec),
+                root.path(),
+                false,
+                |requested| {
+                    assert_eq!(requested, port);
+                    Ok(probe.take().expect("reserved A listener"))
+                },
+            )
+            .await
+            .expect("start A");
+        let url = format!("http://127.0.0.1:{port}/");
+        assert_eq!(
+            reqwest::get(&url).await.unwrap().text().await.unwrap(),
+            "RELEASE_A"
+        );
+        spec.static_content_dir = Some("dist-b".into());
+        manager
+            .reconcile(std::slice::from_ref(&spec), root.path(), false)
+            .await
+            .expect("switch B");
+        assert_eq!(
+            reqwest::get(&url).await.unwrap().text().await.unwrap(),
+            "RELEASE_B"
+        );
+        let accepted = spec.clone();
+        let occupied = bind_listener(0).expect("occupied port");
+        spec.port = occupied.local_addr().expect("occupied address").port();
+        spec.static_content_dir = Some("dist-a".into());
+        assert!(
+            manager
+                .reconcile(std::slice::from_ref(&spec), root.path(), false)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            reqwest::get(&url).await.unwrap().text().await.unwrap(),
+            "RELEASE_B",
+            "rejected bind must preserve serving root"
+        );
+        let mut reserved = Some(occupied);
+        manager
+            .reconcile_with_bind(
+                std::slice::from_ref(&spec),
+                root.path(),
+                false,
+                |requested| {
+                    assert_eq!(requested, spec.port);
+                    Ok(reserved.take().expect("reserved replacement listener"))
+                },
+            )
+            .await
+            .unwrap();
+        let changed_url = format!("http://127.0.0.1:{}/", spec.port);
+        assert_eq!(
+            reqwest::get(&changed_url)
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "RELEASE_A"
+        );
+        let mut previous = Some(bind_listener(port).expect("old port released"));
+        manager
+            .reconcile_with_bind(
+                std::slice::from_ref(&accepted),
+                root.path(),
+                false,
+                |requested| {
+                    assert_eq!(requested, port);
+                    Ok(previous.take().expect("reserved previous listener"))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reqwest::get(&url).await.unwrap().text().await.unwrap(),
+            "RELEASE_B",
+            "recovery restores accepted root and port"
+        );
+        assert!(
+            bind_listener(spec.port).is_ok(),
+            "recovery releases rejected generation port"
+        );
+        // A completed response proves this persistent connection is owned by
+        // the server before its monitor is aborted. Leave the next request partial.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut held = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        held.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !response
+                .windows(b"RELEASE_B".len())
+                .any(|chunk| chunk == b"RELEASE_B")
+            {
+                let mut chunk = [0u8; 1024];
+                let length = held.read(&mut chunk).await.unwrap();
+                assert!(length > 0, "response ended before its expected body");
+                response.extend_from_slice(&chunk[..length]);
+            }
+        })
+        .await
+        .unwrap();
+        held.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Stall:")
+            .await
+            .unwrap();
+        {
+            let mut hosts = manager.hosts.lock().await;
+            let host = hosts.get_mut(&port).unwrap();
+            host.task.abort();
+            let _ = (&mut host.task).await;
+        }
+        manager
+            .reconcile(std::slice::from_ref(&accepted), root.path(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reqwest::get(&url).await.unwrap().text().await.unwrap(),
+            "RELEASE_B",
+            "exited listener must be restarted"
+        );
+        let mut trailing = Vec::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            held.read_to_end(&mut trailing),
+        )
+        .await
+        .expect("old connection must reach EOF before rebind completes");
+        if let Err(error) = closed {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ),
+                "unexpected old connection error: {error}"
+            );
+        }
+        manager.reconcile(&[], root.path(), false).await.unwrap();
+        assert!(
+            bind_listener(port).is_ok(),
+            "removed static service releases port"
+        );
     }
 
     /// hosts_statically 分派：static 且非 devrun-dev → 托管；

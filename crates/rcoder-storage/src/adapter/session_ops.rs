@@ -12,6 +12,22 @@ use super::{ProjectAdapter, container_entry_key};
 use tracing::debug;
 
 impl ProjectAdapter {
+    /// Restore a database session identity without generating a new lifecycle.
+    #[cfg(feature = "pg")]
+    pub(crate) fn restore_session_with_identity(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        generation: String,
+    ) -> bool {
+        if let Entry::Occupied(mut entry) = self.projects.entry(project_id.to_string()) {
+            Arc::make_mut(entry.get_mut()).restore_session_identity(session_id, generation);
+        } else {
+            return false;
+        }
+        self.restore_session_to_project(project_id, session_id)
+    }
+
     // ========== Session 操作 ==========
 
     /// 通过 session_id 获取项目信息

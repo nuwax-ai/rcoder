@@ -1,6 +1,7 @@
 """Reclaim only this case's reserved namespace or this run's explicit label."""
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import urllib.request
@@ -21,12 +22,39 @@ def cleanup_case(case_id, run_id, directory, existing_ids=()):
     errors = []
     root = directory / 'resources'
     root.mkdir(exist_ok=True)
+    # A PG child may have been killed during cleanup. Named volumes and a
+    # pre-creation receipt let the parent remove the whole owned Compose project.
+    context_directory = directory / 'build-context'
+    if (context_directory / 'ownership.json').exists():
+        try:
+            from build_context_contract import cleanup as cleanup_build_context
+            cleanup_build_context(context_directory, run_id, case_id, existing_ids)
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            errors.append('Docker build context ownership cleanup failed: ' + type(error).__name__)
+    receipt_path = directory / 'pg-contract' / 'ownership.json'
+    if receipt_path.exists():
+        try:
+            receipt = json.loads(receipt_path.read_text())
+            project = receipt['project']
+            config = Path(receipt['compose_file']).resolve()
+            if receipt.get('run_id') != run_id or receipt.get('case_id') != case_id or not re.fullmatch(r'rcoder-pg-[0-9a-f]{16}', project) or config != (directory / 'pg-contract' / 'compose.json').resolve():
+                raise ValueError('PG ownership receipt mismatch')
+            project_ids = command('docker', 'ps', '-aq', '--no-trunc', '--filter', 'label=com.docker.compose.project=' + project).split()
+            if project_ids:
+                project_containers = json.loads(command('docker', 'inspect', *project_ids))
+                if any(row['Id'] in existing_ids or (row['Config'].get('Labels') or {}).get('rcoder.e2e.run') != run_id for row in project_containers):
+                    raise ValueError('PG project contains a preexisting or foreign container')
+            result = subprocess.run(['docker', 'compose', '-p', project, '-f', str(config), 'down', '-v', '--remove-orphans'], env=dict(os.environ, PG_CONTRACT_PASSWORD='unused-for-cleanup'), capture_output=True, text=True, timeout=60)
+            record = {'project': project, 'run_id': run_id, 'case_id': case_id, 'ok': result.returncode == 0}
+            (root / 'pg-project-fallback-cleanup.json').write_text(json.dumps(record))
+            if result.returncode:
+                errors.append('PG owned project cleanup failed')
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            errors.append('PG ownership cleanup failed: ' + type(error).__name__)
     try:
         ids = command('docker', 'ps', '-aq', '--no-trunc').split()
-        if not ids:
-            return errors
         # Never persist the full inspect result, which includes secrets.
-        containers = json.loads(command('docker', 'inspect', *ids))
+        containers = json.loads(command('docker', 'inspect', *ids)) if ids else []
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         return ['cleanup inventory failed: ' + type(error).__name__]
     registered = {}
@@ -41,6 +69,9 @@ def cleanup_case(case_id, run_id, directory, existing_ids=()):
         name = container['Name'].lstrip('/')
         cid = container['Id']
         if not owned(container, case_id, run_id, registered):
+            continue
+        if (container['Config'].get('Labels') or {}).get('com.docker.compose.project', '').startswith('rcoder-pg-'):
+            errors.append('PG project container remains; refusing bare container removal: ' + name)
             continue
         if cid in existing_ids:
             errors.append(name + ' existed before this run; refusing cleanup')
@@ -72,4 +103,24 @@ def cleanup_case(case_id, run_id, directory, existing_ids=()):
             record['error'] = type(error).__name__
             errors.append(name + ' owned cleanup failed: ' + type(error).__name__)
         (root / (name + '-fallback-cleanup.json')).write_text(json.dumps(record, indent=2))
+    receipt_path = directory / 'docker-lifecycle' / 'ownership.json'
+    if receipt_path.exists():
+        record = {'ok': False, 'run_id': run_id, 'case_id': case_id}
+        try:
+            receipt = json.loads(receipt_path.read_text())
+            volume = receipt['volume_name']
+            if receipt.get('run_id') != run_id or receipt.get('case_id') != case_id or not re.fullmatch(r'rcoder-test-identity-[0-9a-f]{32}', volume):
+                raise ValueError('Docker volume ownership receipt mismatch')
+            record['volume'] = volume
+            names = command('docker', 'volume', 'ls', '--format', '{{.Name}}').splitlines()
+            if volume in names:
+                info = json.loads(command('docker', 'volume', 'inspect', volume))[0]
+                labels = info.get('Labels') or {}
+                if labels.get('rcoder.e2e.run') != run_id or labels.get('rcoder.e2e.case') != case_id:
+                    raise ValueError('Docker volume was replaced by another owner')
+                command('docker', 'volume', 'rm', volume)
+            record['ok'] = True
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            errors.append('Docker owned volume cleanup failed: ' + type(error).__name__)
+        (root / 'docker-volume-fallback-cleanup.json').write_text(json.dumps(record))
     return errors

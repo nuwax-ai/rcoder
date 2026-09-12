@@ -18,6 +18,7 @@ pub mod hygiene;
 pub mod import;
 mod manifest;
 pub mod run_dir;
+pub(crate) mod start_events;
 pub mod tasks;
 
 // 重导出 manifest 类型：保持 userapp 模块公开面。

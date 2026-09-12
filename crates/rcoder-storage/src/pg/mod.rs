@@ -50,6 +50,11 @@ const TOUCH_THROTTLE_TTI: Duration = Duration::from_secs(3600);
 
 /// PostgreSQL 持久化后端
 pub struct PgStore {
+    /// Serializes local mirror mutation and immutable operation registration; never spans await.
+    registration: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    closing: std::sync::atomic::AtomicBool,
+    active_writes: std::sync::atomic::AtomicUsize,
+    write_finished: tokio::sync::Notify,
     /// 内存镜像（读写共用；启动时由 load 模块全量重建）
     inner: ProjectAdapter,
     /// write-behind 队列生产端（消费端在 PersistWriter）
@@ -67,6 +72,29 @@ pub struct PgStore {
 }
 
 impl PgStore {
+    /// Stop admission before draining accepted direct writes and the fallback queue.
+    pub async fn shutdown_flush_outcome(&self, timeout: Duration) -> shared_types::FlushOutcome {
+        let deadline = tokio::time::Instant::now() + timeout;
+        {
+            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            self.closing.store(true, Ordering::Release);
+        }
+        loop {
+            let done = self.write_finished.notified();
+            if self.active_writes.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            if tokio::time::timeout_at(deadline, done).await.is_err() {
+                return shared_types::FlushOutcome::TimedOut {
+                    pending: self.pending_ops.load(Ordering::Acquire).max(0) as usize,
+                };
+            }
+        }
+        self.writer
+            .flush_outcome(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+    }
+
     /// 连接 + 迁移 + 全量加载，构造 PG 后端。
     ///
     /// 返回 `(store, cleanup_rx)`：与 ProjectAdapter::new 同形，CleanupRequest
@@ -127,6 +155,10 @@ impl PgStore {
         let writer = PersistWriter::spawn(pool.clone(), ops_rx, Arc::clone(&pending_ops));
 
         let store = Self {
+            registration: std::sync::Mutex::new(std::collections::HashMap::new()),
+            closing: std::sync::atomic::AtomicBool::new(false),
+            active_writes: std::sync::atomic::AtomicUsize::new(0),
+            write_finished: tokio::sync::Notify::new(),
             inner,
             ops_tx,
             touch_throttled: Cache::builder().time_to_idle(TOUCH_THROTTLE_TTI).build(),
@@ -180,12 +212,11 @@ impl PgStore {
     fn enqueue_structural(&self, op: PersistOp) {
         self.pending_ops.fetch_add(1, Ordering::AcqRel);
         if let Err(op) = self.ops_tx.send(op) {
-            self.pending_ops.fetch_sub(1, Ordering::AcqRel);
+            // Retain the pending count: a closed queue is not durable success.
             // writer 已停止（仅发生在关停期）：丢弃并告警
             tracing::warn!(
-                "[STORAGE_PG] persist queue closed, dropped {}: {:?}",
-                op.0.kind(),
-                op.0
+                "[STORAGE_PG] persist queue closed, dropped operation: kind={}",
+                op.0.kind()
             );
         }
     }
@@ -206,6 +237,25 @@ impl PgStore {
         if should_send {
             self.enqueue_structural(op);
         }
+    }
+
+    fn prepare_info(
+        &self,
+        mut info: Arc<ProjectAndContainerInfo>,
+        retired: &std::collections::HashMap<String, String>,
+    ) -> Arc<ProjectAndContainerInfo> {
+        if let Some(existing) = self.inner.get(info.project_id()) {
+            Arc::make_mut(&mut info)
+                .set_persistence_identity(existing.persistence_identity().clone());
+        } else if let Some(previous) = retired.get(info.project_id()) {
+            let mut identity = shared_types::persistence::ProjectPersistenceIdentity::default();
+            for sid in info.sessions() {
+                identity.sessions.insert(sid.clone(), uuid_generation());
+            }
+            identity.predecessor = Some(previous.clone());
+            Arc::make_mut(&mut info).set_persistence_identity(identity);
+        }
+        info
     }
 
     /// 从 info 构造并按 FK 顺序（先容器后 project）入队快照。
@@ -247,4 +297,8 @@ impl ContainerLookup for PgStore {
     ) -> Option<shared_types::ProjectScope> {
         self.inner.find_project_scope(project_id, service_type)
     }
+}
+
+fn uuid_generation() -> String {
+    shared_types::persistence::ProjectPersistenceIdentity::default().generation
 }

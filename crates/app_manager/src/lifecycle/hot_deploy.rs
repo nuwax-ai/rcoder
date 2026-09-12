@@ -41,6 +41,21 @@ impl AppService {
         release_id: &str,
         sha256: &str,
     ) -> AppResult<Option<()>> {
+        let operation = self.try_acquire_process_release_lock(app_id).await?;
+        let result = self
+            .try_deploy_via_container_api_locked(app_id, url, release_id, sha256, &operation)
+            .await;
+        finish_hot_operation(operation, result).await
+    }
+
+    async fn try_deploy_via_container_api_locked(
+        &self,
+        app_id: &str,
+        url: &str,
+        release_id: &str,
+        sha256: &str,
+        operation: &crate::service::AppOperationGuard,
+    ) -> AppResult<Option<()>> {
         // 前置：app 存在且 Running 且有可路由 IP
         let app: AppRuntimeInfo = match self.get_app(app_id).await {
             Ok(app) => app,
@@ -107,11 +122,7 @@ impl AppService {
             .map_err(|e| {
                 AppOperationError::Backend(format!("hot deployment capability body: {e}"))
             })?;
-        if capability
-            .pointer("/data/protocol_version")
-            .and_then(|v| v.as_u64())
-            != Some(2)
-        {
+        if !supports_hot_protocol(&capability) {
             return Ok(None);
         }
         let operation_id = uuid::Uuid::new_v4().simple().to_string();
@@ -121,6 +132,7 @@ impl AppService {
             "release_id": release_id,
             "sha256": if sha256.is_empty() { None } else { Some(sha256) },
         });
+        operation.mark_mutating()?;
         let resp = reqwest::Client::new()
             .post(format!("{base}/v1/deploy"))
             .timeout(Duration::from_secs(30))
@@ -131,6 +143,7 @@ impl AppService {
         match resp {
             Ok(r) if r.status().as_u16() == 202 => {}
             Ok(r) if r.status().as_u16() == 409 => {
+                operation.mark_rejected_before_mutation();
                 // 透传容器侧错误体（含 "deploy in progress (phase=...)" 真实相位）
                 let detail = r.text().await.unwrap_or_default();
                 return Err(AppOperationError::Conflict(format!(
@@ -171,14 +184,11 @@ impl AppService {
                 .send()
                 .await;
             let probe = match resp {
-                Ok(r) if r.status().is_success() => r
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .and_then(|v| v.pointer("/data/operation").cloned())
-                    .and_then(|v| {
-                        serde_json::from_value::<shared_types::AppDeploymentOperation>(v).ok()
-                    }),
+                Ok(r) if r.status().is_success() => {
+                    r.json::<serde_json::Value>().await.ok().and_then(|v| {
+                        observe_hot_operation(&v, &operation_id, release_id, operation)
+                    })
+                }
                 _ => None,
             };
             // 穷尽 match：新增 AppCliDeployPhase 变体时编译错，强制同步本判据
@@ -210,8 +220,15 @@ impl AppService {
         }
 
         // 收敛 env 三元组进 ConfigMap（不触发 Recreate）：Pod 重建恢复最新版本
-        self.converge_deploy_env_after_hot(app_id, url, release_id, sha256, &env_snapshot)
-            .await?;
+        self.converge_deploy_env_after_hot(
+            app_id,
+            url,
+            release_id,
+            sha256,
+            &env_snapshot,
+            operation,
+        )
+        .await?;
         info!("[APP] hot deploy done (pod kept): app_id={app_id}, release_id={release_id}");
         Ok(Some(()))
     }
@@ -225,6 +242,7 @@ impl AppService {
         release_id: &str,
         sha256: &str,
         snapshot: &shared_types::AppEnvSnapshot,
+        operation: &crate::service::AppOperationGuard,
     ) -> AppResult<()> {
         let mut env = snapshot.env.clone();
         crate::release_flow::identity::strip_release_identity(&mut env);
@@ -235,6 +253,9 @@ impl AppService {
             .update_env_configmap_if_version(app_id, &env, snapshot)
             .await
             .map_err(|e| {
+                if matches!(e, container_runtime_api::ContainerRuntimeError::Conflict(_)) {
+                    operation.mark_completed();
+                }
                 AppOperationError::Backend(format!(
                     "application activated but deployment env convergence failed: {e}"
                 ))
@@ -243,11 +264,86 @@ impl AppService {
     }
 }
 
+fn supports_hot_protocol(document: &serde_json::Value) -> bool {
+    document
+        .pointer("/data/protocol_version")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|version| {
+            version == u64::from(shared_types::app_cli_deploy::APP_CLI_OPERATION_ID_DEPLOY_PROTOCOL)
+                || version
+                    == u64::from(shared_types::app_cli_deploy::APP_CLI_QUIESCENT_DEPLOY_PROTOCOL)
+        })
+}
+
+async fn finish_hot_operation(
+    operation: crate::service::AppOperationGuard,
+    result: AppResult<Option<()>>,
+) -> AppResult<Option<()>> {
+    if result.is_ok() || !operation.has_unfinished_mutation() {
+        operation.finish().await?;
+    }
+    result
+}
+
+/// Only a matched, quiescent failure completes ownership. A failed operation
+/// can coexist with active restoration, so its phase alone is insufficient.
+fn observe_hot_operation(
+    document: &serde_json::Value,
+    operation_id: &str,
+    release_id: &str,
+    guard: &crate::service::AppOperationGuard,
+) -> Option<shared_types::AppDeploymentOperation> {
+    let operation: shared_types::AppDeploymentOperation =
+        serde_json::from_value(document.pointer("/data/operation")?.clone()).ok()?;
+    if operation.operation_id != operation_id || operation.request_release_id != release_id {
+        return None;
+    }
+    if operation.phase == AppCliDeployPhase::Failed {
+        if document
+            .pointer("/data/protocol_version")
+            .and_then(serde_json::Value::as_u64)?
+            < u64::from(shared_types::app_cli_deploy::APP_CLI_QUIESCENT_DEPLOY_PROTOCOL)
+        {
+            return None;
+        }
+        let server_phase: AppCliDeployPhase =
+            serde_json::from_value(document.pointer("/data/phase")?.clone()).ok()?;
+        let recovery_complete = operation
+            .recovery
+            .as_ref()
+            .is_none_or(|recovery| matches!(recovery.status.as_str(), "restored" | "failed"));
+        if !matches!(
+            server_phase,
+            AppCliDeployPhase::Running | AppCliDeployPhase::Failed
+        ) || !recovery_complete
+        {
+            return None;
+        }
+        guard.mark_completed();
+    }
+    Some(operation)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::models::StartAppRequest;
     use crate::test_support::{MockRuntime, test_service};
     use std::sync::Arc;
+
+    #[test]
+    fn hot_capability_accepts_operation_identity_and_quiescent_protocols() {
+        for (version, supported) in [(0, false), (1, false), (2, true), (3, true), (4, false)] {
+            assert_eq!(
+                super::supports_hot_protocol(
+                    &serde_json::json!({"data":{"protocol_version":version}})
+                ),
+                supported
+            );
+        }
+        assert!(!super::supports_hot_protocol(
+            &serde_json::json!({"data":{}})
+        ));
+    }
 
     /// app 不存在 → 回退换 Pod（None），不触发任何容器调用。
     #[tokio::test]
@@ -312,5 +408,96 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[tokio::test]
+    async fn confirmed_hot_failure_releases_ownership_while_pending_and_foreign_status_do_not() {
+        for kubernetes in [false, true] {
+            for (protocol, operation_id, phase, recovery, release) in [
+                (3, "current", "failed", None, true),
+                (3, "current", "running", Some("restored"), true),
+                (3, "current", "failed", Some("failed"), true),
+                (3, "current", "orchestrating", Some("pending"), false),
+                (3, "current", "failed", Some("unknown"), false),
+                (3, "old", "failed", None, false),
+                (2, "current", "failed", None, false),
+            ] {
+                let root = tempfile::tempdir().expect("directory");
+                let runtime = Arc::new(MockRuntime::default());
+                let mut service = test_service(root.path(), runtime.clone());
+                if kubernetes {
+                    service.config.access_mode = crate::config::AppAccessMode::Kubernetes;
+                }
+                let guard = service
+                    .acquire_process_release_lock("hot-terminal")
+                    .await
+                    .expect("lease");
+                guard.mark_mutating().expect("accepted mutation");
+                let document = serde_json::json!({"data": {"protocol_version":protocol,"phase":phase,"operation": {
+                    "operation_id":operation_id,"request_release_id":"release-b", "artifact_release_id":null,
+                    "phase":"failed","error":"download 404", "recovery": recovery.map(|status| serde_json::json!({
+                        "status":status,"error":null,"database_migrations_reversed":false
+                    }))
+                }}});
+                let observed =
+                    super::observe_hot_operation(&document, "current", "release-b", &guard);
+                assert_eq!(observed.is_some(), release);
+                let result = super::finish_hot_operation(
+                    guard,
+                    Err(crate::error::AppOperationError::Backend("failed".into())),
+                )
+                .await;
+                assert!(result.is_err());
+                let next = service
+                    .try_acquire_process_release_lock("hot-terminal")
+                    .await;
+                assert_eq!(
+                    next.is_ok(),
+                    release,
+                    "k8s={kubernetes}, phase={phase}, recovery={recovery:?}"
+                );
+                if let Ok(next) = next {
+                    next.finish().await.expect("release next");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hot_env_cas_rejection_releases_but_uncertain_write_retains_ownership() {
+        for failure in [1, 2] {
+            let root = tempfile::tempdir().expect("directory");
+            let runtime = Arc::new(MockRuntime::default());
+            runtime
+                .env_commit_failure
+                .store(failure, std::sync::atomic::Ordering::SeqCst);
+            let mut service = test_service(root.path(), runtime);
+            service.config.access_mode = crate::config::AppAccessMode::Kubernetes;
+            let guard = service
+                .acquire_process_release_lock("hot-env")
+                .await
+                .expect("lease");
+            guard.mark_mutating().expect("accepted mutation");
+            let result = service
+                .converge_deploy_env_after_hot(
+                    "hot-env",
+                    "http://artifact",
+                    "release-b",
+                    "",
+                    &Default::default(),
+                    &guard,
+                )
+                .await;
+            assert!(result.is_err());
+            assert!(
+                super::finish_hot_operation(guard, result.map(|()| Some(())))
+                    .await
+                    .is_err()
+            );
+            let next = service.try_acquire_process_release_lock("hot-env").await;
+            assert_eq!(next.is_ok(), failure == 1);
+            if let Ok(next) = next {
+                next.finish().await.expect("release");
+            }
+        }
     }
 }

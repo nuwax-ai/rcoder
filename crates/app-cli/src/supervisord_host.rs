@@ -66,10 +66,18 @@ impl SupervisordHost {
 
     /// 停掉全部动态组（热部署切换 / 容器停服级联）。
     pub(crate) async fn stop_all(&self) -> Result<()> {
+        let mut failures = Vec::new();
         for name in self.dynamic_groups().await? {
-            if let Err(e) = self.client.stop_remove_group(&name).await {
-                warn!("stop dynamic group {name} failed (continue): {e:#}");
+            if let Err(error) = self.client.stop_remove_group(&name).await {
+                failures.push(format!("{name}: {error:#}"));
             }
+        }
+        if !failures.is_empty() {
+            bail!("dynamic groups did not stop: {}", failures.join("; "));
+        }
+        let remaining = self.dynamic_groups().await?;
+        if !remaining.is_empty() {
+            bail!("dynamic groups remain after stop: {}", remaining.join(", "));
         }
         Ok(())
     }
@@ -77,12 +85,18 @@ impl SupervisordHost {
     /// 当前动态组名集合（app-svc-* / app-pingap）。
     async fn dynamic_groups(&self) -> Result<Vec<String>> {
         let infos = self.client.get_all_process_info().await?;
-        Ok(infos
-            .iter()
-            .filter_map(|info| info.get("group").and_then(|g| g.as_str()))
-            .filter(|g| g.starts_with(SVC_PROGRAM_PREFIX) || *g == PINGAP_PROGRAM)
-            .map(str::to_string)
-            .collect())
+        let mut groups = std::collections::BTreeSet::new();
+        for info in infos {
+            let group = info
+                .get("group")
+                .and_then(|group| group.as_str())
+                .filter(|group| !group.is_empty())
+                .context("supervisord process info has no group identity")?;
+            if group.starts_with(SVC_PROGRAM_PREFIX) || group == PINGAP_PROGRAM {
+                groups.insert(group.to_owned());
+            }
+        }
+        Ok(groups.into_iter().collect())
     }
 
     /// 编排：migrate → 写 specs/conf → reload → 旧组摘除 → 依赖序启动 →
@@ -141,9 +155,9 @@ impl SupervisordHost {
         // 2.6 static 服务托管（无进程——内置静态承载于 lock 端口；幂等，热部署
         // 重 orchestrate 不二次 bind。run-service spec/conf 不为 static 生成
         //（下方循环跳过 command 为空的服务）。
+        crate::static_hosting::reconcile(&specs, &args.workspace, false).await?;
         for spec in &specs {
             if crate::static_hosting::hosts_statically(spec, false) {
-                crate::static_hosting::ensure_spawned(spec, &args.workspace)?;
                 info!(
                     "📄 static host '{}' serving on :{}",
                     spec.service_id, spec.port
@@ -198,7 +212,7 @@ impl SupervisordHost {
             if !new_names.contains(old)
                 && let Err(e) = self.client.stop_remove_group(old).await
             {
-                warn!("prune stale group {old} failed (continue): {e:#}");
+                return Err(e).with_context(|| format!("stop stale group {old}"));
             }
         }
 
@@ -497,5 +511,41 @@ NODE_ENV = "production"
         assert_eq!(safe_program_token("web-1_2.3"), "web-1_2.3");
         assert_eq!(safe_program_token("a b"), "");
         assert_eq!(safe_program_token("a\nb"), "");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_group_fault_is_not_swallowed_as_success() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("supervisor.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            for failed in [false, true] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 8192];
+                let size = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                let body = if failed {
+                    assert!(request.contains("supervisor.stopProcessGroup"));
+                    r#"<methodResponse><fault><value><struct><member><name>faultString</name><value><string>stop failed</string></value></member></struct></value></fault></methodResponse>"#
+                } else {
+                    assert!(request.contains("supervisor.getAllProcessInfo"));
+                    r#"<methodResponse><params><param><value><array><data><value><struct><member><name>group</name><value><string>app-svc-web</string></value></member></struct></value></data></array></value></param></params></methodResponse>"#
+                };
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let host = SupervisordHost {
+            client: SupervisorClient::new(path),
+            conf_path: root.path().join("unused.conf"),
+        };
+        assert!(
+            host.stop_all()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("did not stop")
+        );
+        server.await.unwrap();
     }
 }

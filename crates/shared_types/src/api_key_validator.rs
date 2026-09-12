@@ -43,6 +43,7 @@ impl ApiKeyValidator {
         "/health",
         "/metrics",
         "/api/docs",
+        "/version",
         "/proxy/status",
         "/proxy/stats",
     ];
@@ -105,6 +106,7 @@ mod tests {
         assert!(ApiKeyValidator::is_exempt_path("/metrics"));
         assert!(ApiKeyValidator::is_exempt_path("/api/docs"));
         assert!(ApiKeyValidator::is_exempt_path("/api/docs/openapi.json"));
+        assert!(ApiKeyValidator::is_exempt_path("/version"));
         assert!(!ApiKeyValidator::is_exempt_path("/chat"));
         assert!(!ApiKeyValidator::is_exempt_path(
             "/computer/vnc/user1/proj1/vnc.html"

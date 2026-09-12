@@ -26,6 +26,11 @@ fn mk_status(app_id: &str, phase: &str) -> DeploymentStatus {
 
 /// mock runtime:计数 scale 调用,可配置 status 相位与 scale 行为(panic/err)
 struct MockRuntime {
+    track_lease: bool,
+    lease_held: Arc<AtomicBool>,
+    fail_scale: AtomicBool,
+    pause_scale: AtomicBool,
+    scale_entered: Notify,
     scale_calls: Arc<AtomicU32>,
     // 返回的相位;首次 scale 后切到 running_after_scale
     running_after_scale: bool,
@@ -44,6 +49,11 @@ struct MockRuntime {
 impl MockRuntime {
     fn new(running_after_scale: bool) -> Self {
         Self {
+            track_lease: false,
+            lease_held: Arc::new(AtomicBool::new(false)),
+            fail_scale: AtomicBool::new(false),
+            pause_scale: AtomicBool::new(false),
+            scale_entered: Notify::new(),
             scale_calls: Arc::new(AtomicU32::new(0)),
             running_after_scale,
             panic_on_nth: AtomicU32::new(0),
@@ -55,12 +65,44 @@ impl MockRuntime {
     }
 }
 
+struct TestWakeLease(Arc<AtomicBool>);
+#[async_trait::async_trait]
+impl shared_types::AppOperationLease for TestWakeLease {
+    async fn release(self: Box<Self>) -> Result<(), String> {
+        self.0.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+}
 #[async_trait::async_trait]
 impl WorkspaceRuntime for MockRuntime {}
 #[async_trait::async_trait]
 impl UserAppDeploymentRuntime for MockRuntime {
+    async fn acquire_app_operation(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        if !self.track_lease {
+            return Ok(None);
+        }
+        if self.lease_held.swap(true, Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::Conflict(
+                "operation still owned".into(),
+            ));
+        }
+        Ok(Some(Box::new(TestWakeLease(self.lease_held.clone()))))
+    }
+
     async fn scale_deployment(&self, _app_id: &str, _replicas: i32) -> ContainerRuntimeResult<()> {
         let n = self.scale_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        self.scale_entered.notify_one();
+        if self.pause_scale.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        if self.fail_scale.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConnectionError(
+                "uncertain scale result".into(),
+            ));
+        }
         let panic_nth = self.panic_on_nth.load(Ordering::SeqCst);
         if panic_nth > 0 && n == panic_nth {
             panic!("mock scale panic #{}", n);
@@ -433,6 +475,30 @@ fn wake_completion_respects_concurrent_but_not_preexisting_stop() {
 }
 
 #[test]
+fn completed_wake_is_retained_for_follower_that_has_not_subscribed_yet() {
+    for outcome in [WakeOutcome::Ready, WakeOutcome::Failed("cancelled".into())] {
+        let map = Arc::new(DashMap::new());
+        let (tx, initial_rx) = watch::channel(None::<WakeOutcome>);
+        drop(initial_rx);
+        let handle = Arc::new(WakeHandle { tx });
+        map.insert("late-follower".into(), handle.clone());
+        // The follower selected its role but has not subscribed yet.
+        let follower_handle = handle.clone();
+        drop(WakeGuard {
+            map,
+            key: "late-follower".into(),
+            handle,
+            outcome: Some(outcome.clone()),
+        });
+        let receiver = follower_handle.tx.subscribe();
+        assert_eq!(
+            format!("{:?}", *receiver.borrow()),
+            format!("{:?}", Some(outcome))
+        );
+    }
+}
+
+#[test]
 fn forget_app_clears_deleted_app_state() {
     let registry = AppActivityRegistry::new(Duration::from_secs(2));
     registry.seed_accessed("app-deleted");
@@ -443,4 +509,45 @@ fn forget_app_clears_deleted_app_state() {
     assert!(!registry.is_stopped("app-deleted"));
     assert!(!registry.is_wake_blocked("app-deleted"));
     assert_eq!(registry.last_accessed_at("app-deleted"), None);
+}
+
+#[tokio::test]
+async fn wake_failed_mutation_retains_lease_but_success_releases() {
+    for fail in [false, true] {
+        let mut rt = MockRuntime::new(true);
+        rt.track_lease = true;
+        rt.fail_scale.store(fail, Ordering::SeqCst);
+        let rt = Arc::new(rt);
+        let reg = AppActivityRegistry::new_with(Duration::from_secs(2), Duration::from_millis(1));
+        reg.set_runtime(rt.clone());
+        reg.mark_stopped("lease-wake");
+        let outcome = reg.ensure_running("lease-wake").await;
+        assert_eq!(matches!(outcome, WakeOutcome::Failed(_)), fail);
+        assert_eq!(rt.lease_held.load(Ordering::SeqCst), fail);
+        if fail {
+            assert!(rt.acquire_app_operation("lease-wake").await.is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_wake_after_scale_started_retains_lease() {
+    let mut rt = MockRuntime::new(true);
+    rt.track_lease = true;
+    rt.pause_scale.store(true, Ordering::SeqCst);
+    let rt = Arc::new(rt);
+    let reg = Arc::new(AppActivityRegistry::new_with(
+        Duration::from_secs(2),
+        Duration::from_millis(1),
+    ));
+    reg.set_runtime(rt.clone());
+    reg.mark_stopped("cancelled-wake");
+    let task = tokio::spawn(async move { reg.ensure_running("cancelled-wake").await });
+    tokio::time::timeout(Duration::from_secs(2), rt.scale_entered.notified())
+        .await
+        .expect("scale entered");
+    task.abort();
+    assert!(task.await.expect_err("cancelled").is_cancelled());
+    assert!(rt.lease_held.load(Ordering::SeqCst));
+    assert!(rt.acquire_app_operation("cancelled-wake").await.is_err());
 }

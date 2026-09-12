@@ -29,6 +29,10 @@ use crate::service::AppService;
 /// 历史用途 wait_app_ready 已退役，现有消费者见 purge 链不缺席测试）。
 #[derive(Default)]
 pub(crate) struct MockRuntime {
+    pub lease_held: Arc<AtomicBool>,
+    pub env_commit_failure: AtomicUsize,
+    pub patch_preparation_fails: AtomicBool,
+    pub ensure_workspace_calls: AtomicUsize,
     pub delete_calls: AtomicUsize,
     pub delete_fails: AtomicBool,
     /// list_deployments 穿透计数（查询缓存测试用）
@@ -66,6 +70,22 @@ pub(crate) struct MockRuntime {
 
 #[async_trait]
 impl WorkspaceRuntime for MockRuntime {
+    async fn ensure_workspace(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _storage_size: Option<&str>,
+    ) -> ContainerRuntimeResult<()> {
+        self.ensure_workspace_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn destroy_app_storage_snapshot(
+        &self,
+        snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        self.destroy_app_pvc(&snapshot.app_id).await
+    }
     // 其余 workspace 族方法走默认实现（resolve_workspace_path → Ok(None)，
     // get_container_app_dir 因此落到 `workspace_root/{app_id}`，测试用 tempdir 承接）；
     // 覆写 resize_app_storage（update 扩容链路断言需要记录与注入）与
@@ -130,8 +150,74 @@ impl WorkspaceRuntime for MockRuntime {
     }
 }
 
+struct MockOperationLease(Arc<AtomicBool>);
+#[async_trait]
+impl shared_types::AppOperationLease for MockOperationLease {
+    async fn release(self: Box<Self>) -> Result<(), String> {
+        self.0.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl UserAppDeploymentRuntime for MockRuntime {
+    async fn update_env_configmap_if_version(
+        &self,
+        _app_id: &str,
+        _env: &std::collections::HashMap<String, String>,
+        _snapshot: &shared_types::AppEnvSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        match self.env_commit_failure.load(Ordering::SeqCst) {
+            1 => Err(ContainerRuntimeError::Conflict(
+                "env compare-and-swap rejected".into(),
+            )),
+            2 => Err(ContainerRuntimeError::ConnectionError(
+                "env result uncertain".into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    async fn acquire_app_operation(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        if self
+            .lease_held
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(ContainerRuntimeError::Conflict("operation owned".into()));
+        }
+        Ok(Some(Box::new(MockOperationLease(self.lease_held.clone()))))
+    }
+
+    async fn capture_app_deletion(
+        &self,
+        app_id: &str,
+        expected: Option<&str>,
+    ) -> ContainerRuntimeResult<shared_types::AppDeletionSnapshot> {
+        let current = self.get_deployment_status(app_id).await?;
+        if let Some(expected) = expected
+            && current.as_ref().and_then(|s| s.resource_version.as_deref()) != Some(expected)
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "deletion version changed".into(),
+            ));
+        }
+        Ok(shared_types::AppDeletionSnapshot {
+            app_id: app_id.into(),
+            operation_id: "test-operation".into(),
+            resources: vec![],
+        })
+    }
+
+    async fn delete_app_snapshot(
+        &self,
+        snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        self.delete_deployment(&snapshot.app_id).await
+    }
     async fn get_app_container_spec(
         &self,
         app_id: &str,
@@ -248,6 +334,13 @@ impl UserAppDeploymentRuntime for MockRuntime {
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        if self.patch_preparation_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::PreparationFailed(
+                shared_types::AppPreparationFailure {
+                    message: "image preparation failed".into(),
+                },
+            ));
+        }
         // update_app 路径：与 create 同构（不注入失败；登记 deployments 供 get_app）
         self.create_deployment(params).await
     }
@@ -258,6 +351,7 @@ impl UserAppDeploymentRuntime for MockRuntime {
 pub(crate) fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime>) -> AppService {
     let config = AppManagerConfig {
         workspace_root: Some(workspace_root.to_string_lossy().into_owned()),
+        operation_lock_root: workspace_root.to_string_lossy().into_owned(),
         access_mode: AppAccessMode::Docker,
         ..AppManagerConfig::default()
     };
@@ -323,13 +417,29 @@ upstream_includes = []
 /// `service.dev_cleanup` 的 RwLock）。
 #[derive(Default)]
 pub(crate) struct StubDevCleanup {
-    pub calls: AtomicUsize,
-    pub fails: AtomicBool,
+    pub calls: Arc<AtomicUsize>,
+    pub fails: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl shared_types::UserappDevCleanup for StubDevCleanup {
-    async fn cleanup(&self, _app_id: &str) -> Result<(), String> {
+    async fn capture(
+        &self,
+        _app_id: &str,
+    ) -> Result<Box<dyn shared_types::UserappDevDeletion>, String> {
+        Ok(Box::new(StubDevDeletion {
+            calls: self.calls.clone(),
+            fails: self.fails.clone(),
+        }))
+    }
+}
+struct StubDevDeletion {
+    calls: Arc<AtomicUsize>,
+    fails: Arc<AtomicBool>,
+}
+#[async_trait]
+impl shared_types::UserappDevDeletion for StubDevDeletion {
+    async fn cleanup(self: Box<Self>) -> Result<(), String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.fails.load(Ordering::SeqCst) {
             Err("mock dev cleanup failure".into())
@@ -368,11 +478,10 @@ impl shared_types::AppMetadataPersistence for InMemoryMetadataPersistence {
         Ok(self.rows.lock().expect("rows lock").clone())
     }
 
-    async fn delete(&self, app_id: &str) -> anyhow::Result<()> {
-        self.rows
-            .lock()
-            .expect("rows lock")
-            .retain(|r| r.app_id != app_id);
-        Ok(())
+    async fn delete_if_current(&self, app_id: &str, generation: &str) -> anyhow::Result<bool> {
+        let mut rows = self.rows.lock().expect("rows lock");
+        let before = rows.len();
+        rows.retain(|r| r.app_id != app_id || r.generation != generation);
+        Ok(rows.len() != before)
     }
 }

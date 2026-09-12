@@ -288,6 +288,10 @@ bollard = { version = "0.21" }
 # Cache library
 moka = { version = "0.12", features = ["future", "sync"] }
 
+# 系统信息（/version 端点跨平台读 OS 版本/内核版本）；default-features=false
+# 裁掉磁盘/网络/进程/rayon 模块，仅保留 system（os_version/kernel_version 等）。
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
 # TUI
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream"] }

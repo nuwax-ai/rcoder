@@ -15,10 +15,12 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
+        let operation = self.acquire_process_release_lock(app_id).await?;
         let previous = self.fetch_runtime_status_or_err(app_id).await?;
         let previous_wake_on_traffic = previous
             .wake_on_traffic
             .unwrap_or_else(|| !self.activity.is_wake_blocked(app_id));
+        operation.mark_mutating()?;
         self.runtime
             .patch_wake_on_traffic(app_id, true)
             .await
@@ -44,6 +46,7 @@ impl AppService {
         }
         self.activity.mark_running(app_id);
         info!("[APP] app started (scale=1): {}", app_id);
+        operation.finish().await?;
         self.get_app(app_id).await
     }
 
@@ -65,11 +68,13 @@ impl AppService {
         wake_on_traffic: bool,
     ) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
+        let operation = self.acquire_process_release_lock(app_id).await?;
         let previous = self.fetch_runtime_status_or_err(app_id).await?;
         let previous_wake_on_traffic = previous
             .wake_on_traffic
             .unwrap_or_else(|| !self.activity.is_wake_blocked(app_id));
         // 先阻断内存态唤醒，再持久化停止原因，避免 scale0 与请求触发 scale1 竞态。
+        operation.mark_mutating()?;
         self.activity.mark_wake_blocked(app_id);
         if let Err(error) = self
             .runtime
@@ -100,6 +105,7 @@ impl AppService {
             self.activity.mark_recycled(app_id);
         }
         info!("[APP] app stopped (scale=0): {}", app_id);
+        operation.finish().await?;
         self.get_app(app_id).await
     }
 
@@ -122,7 +128,9 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
+        let operation = self.acquire_process_release_lock(app_id).await?;
         self.ensure_app_exists(app_id).await?;
+        operation.mark_mutating()?;
         self.runtime.restart_deployment(app_id).await.map_err(|e| {
             map_runtime_error(
                 &format!("[APP] restart_deployment failed app_id={app_id}"),
@@ -130,6 +138,7 @@ impl AppService {
             )
         })?;
         info!("[APP] app restarted (rollout): {}", app_id);
+        operation.finish().await?;
         self.get_app(app_id).await
     }
 

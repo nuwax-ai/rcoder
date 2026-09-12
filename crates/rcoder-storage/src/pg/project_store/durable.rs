@@ -1,212 +1,353 @@
-//! durable 直写：会话创建的结构性 op 同步事务提交（chat 返回即落库契约）。
-//!
-//! 与 write-behind（writer.rs，高频幂等 op 的吞吐路径）互补：低频高价值的
-//! 结构性写在调用点同步提交，超时/失败降级回队列（HA 语义不变）。
-//! op 集与降级路径共用 [`structural_ops_for_insert`]（单一构造点，零漂移）。
-
-use std::sync::Arc;
-use std::time::Duration;
-
-use shared_types::ProjectAndContainerInfo;
-
+//! Durable writes and queued fallbacks execute identical, identity-fenced operations.
+//! SQL transaction order is not business order; retired identities fence delayed retries.
 use super::persist_ops::{PersistOp, structural_ops_for_insert};
 use super::writer::execute_op;
 use crate::adapter::container_entry_key;
 use crate::pg::PgStore;
+use shared_types::{ProjectAndContainerInfo, persistence::PersistenceWriteOutcome};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Dropping a cancelled durable request queues its immutable registered operations.
+struct PendingWrite<'a> {
+    store: &'a PgStore,
+    ops: Option<Vec<PersistOp>>,
+}
+impl Drop for PendingWrite<'_> {
+    fn drop(&mut self) {
+        if let Some(ops) = self.ops.take() {
+            let count = ops.len() as i64;
+            for op in ops {
+                self.store.enqueue_structural(op);
+            }
+            self.store
+                .pending_ops
+                .fetch_sub(count, std::sync::atomic::Ordering::AcqRel);
+        }
+        self.store
+            .active_writes
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.store.write_finished.notify_waiters();
+    }
+}
 
 impl PgStore {
-    /// 结构性写的事务直写超时：正常毫秒级完成；超时降级走 write-behind。
+    fn register_durable(&self, ops: Vec<PersistOp>) -> PendingWrite<'_> {
+        self.pending_ops
+            .fetch_add(ops.len() as i64, std::sync::atomic::Ordering::AcqRel);
+        self.active_writes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        PendingWrite {
+            store: self,
+            ops: Some(ops),
+        }
+    }
+
     const DURABLE_COMMIT_TIMEOUT: Duration = Duration::from_millis(600);
 
-    /// 会话创建的结构性 op **事务直写**（durable 路径）：
-    /// 内存镜像更新 + container/project/session 于同一 sqlx 事务提交——
-    /// 方法返回（Ok）即 PG 主库已提交，chat 侧据此保证"session_id 交到
-    /// 前端手上时任何副本回源直查必命中"。
-    ///
-    /// 提交超时/失败降级：事务丢弃（drop=rollback），改入 write-behind
-    /// 队列（现有异步路径）——chat 不失败（内存真源），可见性窗口仅在
-    /// PG 故障态退化。降级路径 op 会入队，成功路径不入队（无双写）。
     pub async fn insert_with_session_durable(
         &self,
         project_id: String,
         info: Arc<ProjectAndContainerInfo>,
         session_id: &str,
     ) -> anyhow::Result<()> {
-        // 1. 内存镜像（与 insert_with_session 的内存部分一致）
-        self.inner
-            .insert_with_session(project_id, Arc::clone(&info), Some(session_id))?;
-
-        // 2. 事务直写（op 集单一构造点，复用 writer 的 execute_op 执行）
-        let session_project = info.project_id().to_string();
-        let ops = structural_ops_for_insert(&info, session_id)?;
-        let durable = async {
-            let result: anyhow::Result<()> = async {
-                let mut tx = self.pool.begin().await?;
-                for op in &ops {
-                    execute_op(&mut tx, op).await?;
-                }
-                tx.commit().await?;
-                Ok(())
-            }
-            .await;
-            result
+        let ops = {
+            let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            anyhow::ensure!(
+                !self.closing.load(std::sync::atomic::Ordering::Acquire),
+                "Persistence is shutting down"
+            );
+            let mut info = self.prepare_info(info, &registration);
+            Arc::make_mut(&mut info).add_session(session_id);
+            let ops = structural_ops_for_insert(&info, session_id)?;
+            self.inner
+                .insert_with_session(project_id, info, Some(session_id))?;
+            self.register_durable(ops)
         };
-        match tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, durable).await {
-            Ok(Ok(())) => {
-                tracing::debug!(
-                    "[STORAGE_PG] durable commit ok: project_id={}, session_id={}",
-                    session_project,
-                    session_id
-                );
-                Ok(())
-            }
-            outcome => {
-                let reason = match outcome {
-                    Ok(Ok(())) => unreachable!("covered by first arm"),
-                    Ok(Err(e)) => format!("sql error: {e}"),
-                    Err(_) => "timeout".to_string(),
-                };
-                tracing::warn!(
-                    "[STORAGE_PG] durable commit failed ({reason}), falling back to write-behind: project_id={}, session_id={}",
-                    session_project,
-                    session_id
-                );
-                // 降级：op 集与成功路径同源（幂等，writer 重放安全；
-                // upsert 的 last_activity 防回退守卫拦住旧快照覆盖）
-                for op in ops {
-                    self.enqueue_structural(op);
-                }
-                Ok(())
-            }
-        }
+        self.execute_durable(ops, "insert_session").await;
+        Ok(())
     }
 
-    /// 追加 session 的 durable 变体（/chat 域响应后映射补录）：
-    /// 内存 add + AddSession 单条事务直写，超时/失败降级 write-behind
-    /// （降级后由队列按序重放——project 行若尚未 flush 会在队列中先于
-    /// AddSession 执行，FK 依赖最终成立）。
-    ///
-    /// 返回 `Ok(false)` 表示 project 不存在（并发删除，内存 add 未发生）。
     pub async fn add_session_durable(
         &self,
         project_id: &str,
         session_id: &str,
     ) -> anyhow::Result<bool> {
-        // 1. 内存镜像（与 add_session_to_project 的内存部分一致）
-        if !self.inner.add_session_to_project(project_id, session_id) {
-            return Ok(false);
-        }
-        let container_name = self
-            .inner
-            .get(project_id)
-            .map(|info| container_entry_key(&info));
-
-        // 2. 单条事务直写
-        let op = PersistOp::AddSession {
-            project_id: project_id.to_string(),
-            session_id: session_id.to_string(),
-            container_name,
+        let op = {
+            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            anyhow::ensure!(
+                !self.closing.load(std::sync::atomic::Ordering::Acquire),
+                "Persistence is shutting down"
+            );
+            if !self.inner.add_session_to_project(project_id, session_id) {
+                return Ok(false);
+            }
+            let info = self.inner.get(project_id).ok_or_else(|| {
+                anyhow::anyhow!("Project disappeared during session registration: {project_id}")
+            })?;
+            let op = PersistOp::AddSession {
+                project_id: project_id.to_string(),
+                session_id: session_id.to_string(),
+                project_generation: info.persistence_identity().generation.clone(),
+                predecessor: info
+                    .persistence_identity()
+                    .retired_sessions
+                    .get(session_id)
+                    .cloned(),
+                generation: info
+                    .persistence_identity()
+                    .sessions
+                    .get(session_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("Session identity missing: {session_id}"))?,
+                container_name: info.container_info().map(|_| container_entry_key(&info)),
+            };
+            self.register_durable(vec![op])
         };
-        self.execute_structural_durable(op, "add_session").await;
+        self.execute_durable(op, "add_session").await;
         Ok(true)
     }
 
-    /// 结构性删除的 durable 变体：内存删 + 单条事务直写。
-    ///
-    /// 消除 durable 直写与 write-behind 队列的**倒挂窗口**：删除走队列时，
-    /// 时序可为 remove 入队 → durable insert 提交返回 → writer 重放积压的
-    /// RemoveProject 把 durable 刚提交的行删掉（破坏"返回即落库"跨副本可见
-    /// 性契约）。删除类与插入类同走同步事务后，PG 行级锁串行化天然保序——
-    /// 最终态取决于真实调用顺序。低频路径（stop/清理），同步代价可忽略。
     pub async fn remove_durable(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
-        let removed = self.inner.remove(project_id)?;
-        self.touch_throttled.invalidate(&format!("p:{project_id}"));
-        self.execute_structural_durable(
-            PersistOp::RemoveProject {
-                project_id: project_id.to_string(),
-            },
-            "remove",
-        )
-        .await;
+        let (removed, op) = {
+            let mut registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
+            let removed = self.inner.remove(project_id)?;
+            let generation = removed.persistence_identity().generation.clone();
+            registration.insert(project_id.to_string(), generation.clone());
+            self.touch_throttled.invalidate(&format!("p:{project_id}"));
+            (
+                removed,
+                self.register_durable(vec![PersistOp::RemoveProject {
+                    project_id: project_id.to_string(),
+                    generation,
+                }]),
+            )
+        };
+        self.execute_durable(op, "remove").await;
         Some(removed)
     }
 
-    /// [`Self::remove_durable`] 的 clear_session 同构（stop 场景清全部会话）。
-    pub async fn clear_session_durable(&self, project_id: &str) {
-        self.inner.clear_session(project_id);
-        self.execute_structural_durable(
-            PersistOp::ClearSessions {
+    pub async fn remove_durable_if_generation(
+        &self,
+        project_id: &str,
+        expected_generation: &str,
+    ) -> anyhow::Result<bool> {
+        let registered = {
+            let mut registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            anyhow::ensure!(
+                !self.closing.load(std::sync::atomic::Ordering::Acquire),
+                "Persistence is shutting down"
+            );
+            let Some(removed) = self
+                .inner
+                .remove_if_generation(project_id, expected_generation)
+            else {
+                return Ok(false);
+            };
+            let generation = removed.persistence_identity().generation.clone();
+            registration.insert(project_id.to_string(), generation.clone());
+            self.register_durable(vec![PersistOp::RemoveProject {
                 project_id: project_id.to_string(),
-            },
-            "clear_sessions",
-        )
-        .await;
+                generation,
+            }])
+        };
+        match self
+            .execute_durable(registered, "remove_if_generation")
+            .await
+        {
+            PersistenceWriteOutcome::Committed => Ok(true),
+            PersistenceWriteOutcome::Superseded => Ok(false),
+            PersistenceWriteOutcome::Deferred { reason } => Err(anyhow::anyhow!(
+                "Conditional project removal deferred: {reason}"
+            )),
+        }
     }
 
-    /// [`Self::remove_durable`] 的单 session 删除同构。
-    pub async fn clear_session_one_durable(&self, project_id: &str, session_id: &str) -> bool {
-        if !self.inner.clear_session_one(project_id, session_id) {
-            return false;
+    pub async fn remove_durable_if_container_identity(
+        &self,
+        project_id: &str,
+        generation: &str,
+        container_id: &str,
+    ) -> anyhow::Result<bool> {
+        let registered = {
+            let mut registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            anyhow::ensure!(
+                !self.closing.load(std::sync::atomic::Ordering::Acquire),
+                "Persistence is shutting down"
+            );
+            let Some(removed) =
+                self.inner
+                    .remove_if_container_identity(project_id, generation, container_id)
+            else {
+                return Ok(false);
+            };
+            let container = removed.container_info().ok_or_else(|| {
+                anyhow::anyhow!("Container identity disappeared during conditional removal")
+            })?;
+            registration.insert(project_id.to_string(), generation.to_string());
+            self.register_durable(vec![PersistOp::RemoveProjectForContainer {
+                project_id: project_id.to_string(),
+                generation: generation.to_string(),
+                container_id: container_id.to_string(),
+                container_name: container.container_name,
+            }])
+        };
+        match self
+            .execute_durable(registered, "remove_if_container_identity")
+            .await
+        {
+            PersistenceWriteOutcome::Committed => Ok(true),
+            PersistenceWriteOutcome::Superseded => Ok(false),
+            PersistenceWriteOutcome::Deferred { reason } => Err(anyhow::anyhow!(
+                "Conditional container project removal deferred: {reason}"
+            )),
         }
-        self.touch_throttled.invalidate(&format!("s:{session_id}"));
-        self.execute_structural_durable(
-            PersistOp::RemoveSession {
+    }
+
+    pub async fn clear_session_durable(&self, project_id: &str) {
+        let op = {
+            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            let Some(info) = self.inner.get(project_id) else {
+                return;
+            };
+            let op = PersistOp::ClearSessions {
+                project_id: project_id.to_string(),
+                generation: info.persistence_identity().generation.clone(),
+                sessions: info
+                    .persistence_identity()
+                    .sessions
+                    .iter()
+                    .map(|(id, g)| (id.clone(), g.clone()))
+                    .collect(),
+            };
+            self.inner.clear_session(project_id);
+            self.register_durable(vec![op])
+        };
+        self.execute_durable(op, "clear_sessions").await;
+    }
+
+    pub async fn clear_session_one_durable(&self, project_id: &str, session_id: &str) -> bool {
+        let op = {
+            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+                return false;
+            }
+            let Some(info) = self.inner.get(project_id) else {
+                return false;
+            };
+            let Some(generation) = info
+                .persistence_identity()
+                .sessions
+                .get(session_id)
+                .cloned()
+            else {
+                return false;
+            };
+            if !self.inner.clear_session_one(project_id, session_id) {
+                return false;
+            }
+            self.touch_throttled.invalidate(&format!("s:{session_id}"));
+            self.register_durable(vec![PersistOp::RemoveSession {
                 session_id: session_id.to_string(),
-            },
-            "remove_session",
-        )
-        .await;
+                generation,
+            }])
+        };
+        self.execute_durable(op, "remove_session").await;
         true
     }
 
-    /// [`Self::remove_durable`] 的容器级删除同构（容器销毁路径）。
     pub async fn delete_container_with_projects_durable(
         &self,
         container_id: &str,
     ) -> (bool, usize) {
-        let result = self.inner.delete_container_with_projects(container_id);
-        if result.0 {
-            self.execute_structural_durable(
-                PersistOp::DeleteContainerWithProjects {
+        let (result, op) = {
+            let mut registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+                return (false, 0);
+            }
+            let projects: Vec<_> = self
+                .inner
+                .get_projects_by_container_id(container_id)
+                .iter()
+                .map(|p| {
+                    (
+                        p.project_id().to_string(),
+                        p.persistence_identity().generation.clone(),
+                    )
+                })
+                .collect();
+            let result = self.inner.delete_container_with_projects(container_id);
+            if !result.0 {
+                return result;
+            }
+            for (id, generation) in &projects {
+                registration.insert(id.clone(), generation.clone());
+            }
+            (
+                result,
+                self.register_durable(vec![PersistOp::DeleteContainerWithProjects {
                     container_id: container_id.to_string(),
-                },
-                "delete_container",
+                    projects,
+                }]),
             )
-            .await;
-        }
+        };
+        self.execute_durable(op, "delete_container").await;
         result
     }
 
-    /// 单条结构性 op 的事务直写（600ms 超时降级 write-behind 队列）。
-    /// op 已在内存侧生效——降级入队由 writer 幂等重放兜底。
-    async fn execute_structural_durable(&self, op: PersistOp, name: &str) {
+    async fn execute_durable(
+        &self,
+        mut registered: PendingWrite<'_>,
+        name: &str,
+    ) -> PersistenceWriteOutcome {
         let durable = async {
-            let result: anyhow::Result<()> = async {
-                let mut tx = self.pool.begin().await?;
-                execute_op(&mut tx, &op).await?;
-                tx.commit().await?;
-                Ok(())
+            let mut tx = self.pool.begin().await?;
+            let mut superseded = 0usize;
+            if let Some(ops) = &registered.ops {
+                super::writer::lock_ops(&mut tx, ops).await?;
+                for op in ops {
+                    if execute_op(&mut tx, op).await?
+                        == shared_types::persistence::PersistenceOperationOutcome::Superseded
+                    {
+                        superseded += 1;
+                    }
+                }
             }
-            .await;
-            result
+            tx.commit().await?;
+            Ok::<_, anyhow::Error>(superseded)
         };
         match tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, durable).await {
-            Ok(Ok(())) => {
-                // 只打 op.kind()：op 全量 Debug 会含 ProjectSnapshot 的
-                // model_provider（明文 api_key），防止日后接入 UpsertProject 泄密
-                tracing::debug!("[STORAGE_PG] durable {name} ok: op={}", op.kind());
+            Ok(Ok(superseded)) => {
+                if let Some(ops) = registered.ops.take() {
+                    tracing::info!(
+                        committed = ops.len() - superseded,
+                        superseded,
+                        "[STORAGE_PG] durable {name} resolved"
+                    );
+                    self.pending_ops
+                        .fetch_sub(ops.len() as i64, std::sync::atomic::Ordering::AcqRel);
+                }
+                if superseded == 0 {
+                    PersistenceWriteOutcome::Committed
+                } else {
+                    PersistenceWriteOutcome::Superseded
+                }
             }
             outcome => {
                 let reason = match outcome {
-                    Ok(Ok(())) => unreachable!("covered by first arm"),
-                    Ok(Err(e)) => format!("sql error: {e}"),
-                    Err(_) => "timeout".to_string(),
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => "timeout".into(),
+                    Ok(Ok(_)) => return PersistenceWriteOutcome::Committed,
                 };
-                tracing::warn!(
-                    "[STORAGE_PG] durable {name} failed ({reason}), falling back to write-behind: op={}",
-                    op.kind()
-                );
-                self.enqueue_structural(op);
+                tracing::warn!("[STORAGE_PG] durable {name} deferred: {reason}");
+                // PendingWrite queues on drop, also covering request cancellation.
+                PersistenceWriteOutcome::Deferred { reason }
             }
         }
     }

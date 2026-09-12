@@ -65,6 +65,8 @@ pub(crate) async fn sync_once(
         return Ok(());
     }
 
+    let baseline: HashMap<_, _> = inner.iter().into_iter().collect();
+
     // 三表读入单事务（REPEATABLE READ）：三次独立 pool acquire 会拿到三个
     // 不同语句快照，跨快照可产生瞬态"孤儿 session"（project 在快照 1 有、
     // 快照 2 无）触发误判。单事务保证三表同一一致性视图。
@@ -91,7 +93,13 @@ pub(crate) async fn sync_once(
             && !self_confirm_project_alive(store, pool, &project_id).await
         {
             debug!("[STORAGE_PG] sync remove project {project_id} (deleted on peer replica)");
-            inner.remove(&project_id);
+            let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
+            if let (Some(expected), Some(current)) =
+                (baseline.get(&project_id), inner.get(&project_id))
+                && Arc::ptr_eq(expected, &current)
+            {
+                inner.remove(&project_id);
+            }
         }
     }
     // session 删除：镜像各 project 的 session 中不在 PG 的（同样二次确认）
@@ -110,7 +118,14 @@ pub(crate) async fn sync_once(
             && !self_confirm_session_alive(store, pool, &sid).await
         {
             debug!("[STORAGE_PG] sync remove session {sid} (deleted on peer replica)");
-            inner.clear_session_one(&project_id, &sid);
+            let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
+            if let (Some(expected), Some(current)) =
+                (baseline.get(&project_id), inner.get(&project_id))
+                && expected.persistence_identity().sessions.get(&sid)
+                    == current.persistence_identity().sessions.get(&sid)
+            {
+                inner.clear_session_one(&project_id, &sid);
+            }
         }
     }
 
@@ -126,7 +141,18 @@ pub(crate) async fn sync_once(
             .push(row.session_id.clone());
     }
     for row in projects {
+        let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
         let existing = inner.get(&row.project_id);
+        if let Some(current) = &existing {
+            if baseline
+                .get(&row.project_id)
+                .is_none_or(|previous| !Arc::ptr_eq(previous, current))
+            {
+                continue; // Local mutation after snapshot admission wins until the next sync.
+            }
+        } else if baseline.contains_key(&row.project_id) {
+            continue;
+        }
         if let Some(current) = &existing
             && project_signature(current) == row_signature(&row)
         {
@@ -138,9 +164,13 @@ pub(crate) async fn sync_once(
         // merge 语义：整条 insert 会把快照后本地新增的 session 抛掉（hydrate
         // 出的 info 无 session 集合）——先保留镜像现有 sessions 再替换
         //（restore：重建不刷 last_activity，活跃历史以持久化行为准）
-        if let Some(current) = &existing {
+        if let Some(current) = &existing
+            && current.persistence_identity().generation == row.generation
+        {
             for sid in current.sessions().iter() {
-                info.restore_session(sid.clone());
+                if let Some(generation) = current.persistence_identity().sessions.get(sid) {
+                    info.restore_session_identity(sid, generation.clone());
+                }
             }
         }
         if let Err(e) = inner.insert(row.project_id.clone(), Arc::new(info)) {
@@ -161,11 +191,19 @@ pub(crate) async fn sync_once(
     //    project 已存在的新 session 单独补）
     let mut added_sessions = 0usize;
     for row in &sessions {
+        let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
         let Some(info) = inner.get(&row.project_id) else {
             continue; // 孤儿 session（project 行缺失，FK 下不应出现）
         };
         if !info.sessions().contains(row.session_id.as_str()) {
-            inner.add_session_to_project(&row.project_id, &row.session_id);
+            if info.persistence_identity().generation != row.project_generation {
+                continue;
+            }
+            inner.restore_session_with_identity(
+                &row.project_id,
+                &row.session_id,
+                row.generation.clone(),
+            );
             added_sessions += 1;
         }
     }
@@ -184,6 +222,7 @@ pub(crate) async fn sync_once(
 /// （base_url/api_key 变更不只看 id）都参与比对。
 fn project_signature(info: &shared_types::ProjectAndContainerInfo) -> String {
     let mut sig = String::with_capacity(128);
+    sig.push_str(&info.persistence_identity().generation);
     sig.push_str("u:");
     sig.push_str(info.user_id().unwrap_or(""));
     sig.push_str("|p:");
@@ -233,6 +272,7 @@ fn project_signature(info: &shared_types::ProjectAndContainerInfo) -> String {
 
 fn row_signature(row: &repo::ProjectRow) -> String {
     let mut sig = String::with_capacity(128);
+    sig.push_str(&row.generation);
     sig.push_str("u:");
     sig.push_str(row.user_id.as_deref().unwrap_or(""));
     sig.push_str("|p:");

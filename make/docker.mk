@@ -16,17 +16,13 @@ BUILDX_BUILDER ?=
 # Docker 镜像构建（仅构建镜像，不编译）
 # 串行构建镜像，避免资源竞争
 docker-build:
-	@echo "🔨 开始构建主镜像..."
-	@task_build_status=0; \
-	$(MAKE) docker-build-master & master_pid=$$!; \
-	$(MAKE) docker-build-agent-runner & agent_pid=$$!; \
-	wait $$master_pid || task_build_status=$$?; \
-	wait $$agent_pid || task_build_status=$$?; \
-	exit $$task_build_status
+	@echo "🔨 依次构建 agent-runner 和主镜像..."
+	@$(MAKE) docker-build-agent-runner
+	@$(MAKE) docker-build-master
 	@echo ""
 	@echo "✅ 所有 Docker 镜像构建完成！"
 	@echo "  ✓ dev-master-rcoder:latest"
-	@echo "  ✓ dev-computer-agent-runner:latest"
+	@echo "  ✓ dev-rcoder-agent-runner:latest"
 	@echo ""
 	@echo "🎯 使用方式："
 	@echo "  docker run -d -p 8087:8087 dev-master-rcoder:latest"
@@ -121,8 +117,8 @@ AGENT_TOOLS_CACHE_KEY ?= 1
 # pingap 版本说明（构建注入，单一来源 = app-cli devtool.rs DEFAULT_PINGAP_VERSION/COMMIT，
 # 与生产 build_config 16-app-runtime.mk 同值；三处同步改）
 docker-build-agent-runner:
-	@echo "🐳 构建 rcoder-agent-runner 镜像（本地开发用 dev-computer-agent-runner）..."
-	@echo "📍 镜像名称: dev-computer-agent-runner:latest"
+	@echo "🐳 构建 rcoder-agent-runner 镜像（本地开发用 dev-rcoder-agent-runner）..."
+	@echo "📍 镜像名称: dev-rcoder-agent-runner:latest"
 	@# 生产源头同步：start-up*.sh 以 build-agent-docker 仓库为单一事实源，
 	@# 构建前自动拉取防止本地/生产启动行为漂移（ime_server.py 等本地维护文件不在此清单）
 	@BUILD_CONFIG_DIR=~/Documents/git-workspace/build-agent-docker/build_config/rcoder-agent-runner; \
@@ -144,7 +140,7 @@ docker-build-agent-runner:
 	fi
 	@if docker image inspect dev-app-runtime:latest >/dev/null 2>&1; then \
 		python3 docker/verify-userapp-toolchains.py --builder "$(AGENT_BASE_IMAGE)" || { \
-			echo "Builder base/runtime mismatch: rebuild docker-build-agent-base or set AGENT_BASE_IMAGE to a compatible local image"; exit 1; }; \
+			echo "Builder/runtime toolchain verification failed; inspect the diagnostic above. Rebuild or select compatible images only if a version mismatch is reported"; exit 1; }; \
 	fi
 	@echo "📦 步骤1: 在 debian:12 环境中构建 agent_runner 二进制（确保 GLIBC 版本兼容）..."
 	@# 🔧 调试模式：默认启用 ebpf-debug feature，允许使用 eBPF 诊断工具
@@ -204,7 +200,7 @@ docker-build-agent-runner:
 				--build-arg INSTALL_ALLOY="$${INSTALL_EBPF}" \
 				-f Dockerfile -t dev-rcoder-agent-runner:latest . ; \
 		fi;)
-	@echo "✅ dev-computer-agent-runner 镜像构建完成！"
+	@echo "✅ dev-rcoder-agent-runner 镜像构建完成！"
 	@if [ "$(CARGO_FEATURES)" != "" ]; then \
 		echo "🔧 eBPF 调试模式已启用，容器将以特权模式运行"; \
 	else \

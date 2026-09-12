@@ -436,6 +436,7 @@ impl KubernetesRuntime {
             params.storage_size.as_deref(),
         )
         .await?;
+        self.claim_app_storage(app_id).await?;
         self.write_app_generation(app_id, params, expected).await?;
         // Publish networking only after the conditional commit succeeded.
         self.apply_app_service(app_id, params).await?;
@@ -581,6 +582,400 @@ mod conditional_tests {
         }
     }
 
+    #[tokio::test]
+    async fn agent_lookup_preserves_api_failure_instead_of_not_found() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 2048];
+                loop {
+                    let count = stream.read(&mut buffer).await.expect("request");
+                    assert!(count > 0, "request closed before complete headers");
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(offset) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        let head = String::from_utf8_lossy(&request[..offset]);
+                        assert!(head.starts_with("GET "), "{head}");
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().expect("length"))
+                            })
+                            .unwrap_or(0);
+                        while request.len() < offset + 4 + length {
+                            let count = stream.read(&mut buffer).await.expect("body");
+                            assert!(count > 0);
+                            request.extend_from_slice(&buffer[..count]);
+                        }
+                        break;
+                    }
+                }
+                let body = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","message":"lookup forbidden","code":403}"#;
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.expect("reply");
+            }
+        });
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let config = kube::Config::new(format!("http://{address}").parse().expect("uri"));
+        let runtime = runtime(kube::Client::try_from(config).expect("client"));
+        let result = runtime
+            .get_container_info_inner("lookup-error", &ServiceType::WebAgentRunner)
+            .await;
+        server.abort();
+        assert!(
+            result.is_err(),
+            "API failure must not become successful absence: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_delete_sends_uid_and_version_and_stops_on_conflict() {
+        use shared_types::{AppDeletionSnapshot, AppResourceIdentity, AppResourceKind};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 2048];
+            let (offset, length) = loop {
+                let n = stream.read(&mut buffer).await.expect("request");
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+                if let Some(offset) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&bytes[..offset]);
+                    let mut request_line = head
+                        .lines()
+                        .next()
+                        .expect("request line")
+                        .split_whitespace();
+                    assert_eq!(request_line.next(), Some("DELETE"));
+                    let uri = request_line.next().expect("URI");
+                    assert_eq!(
+                        uri.split('?').next(),
+                        Some(
+                            "/api/v1/namespaces/review-test/persistentvolumeclaims/claimed-storage"
+                        )
+                    );
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|length| length.trim().parse::<usize>().expect("length"))
+                        })
+                        .expect("content length");
+                    break (offset + 4, length);
+                }
+            };
+            while bytes.len() < offset + length {
+                let n = stream.read(&mut buffer).await.expect("body");
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes[offset..offset + length]).expect("JSON");
+            assert_eq!(body["preconditions"]["uid"], "storage-uid");
+            assert_eq!(body["preconditions"]["resourceVersion"], "42");
+            let response = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Conflict","message":"new storage use claim","code":409}"#;
+            stream.write_all(format!("HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.expect("response");
+        });
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let config = kube::Config::new(format!("http://{address}").parse().expect("uri"));
+        let runtime = runtime(kube::Client::try_from(config).expect("client"));
+        let snapshot = AppDeletionSnapshot {
+            app_id: "claimed-app".into(),
+            operation_id: "delete-old".into(),
+            resources: vec![AppResourceIdentity {
+                kind: AppResourceKind::PersistentVolumeClaim,
+                name: "claimed-storage".into(),
+                uid: "storage-uid".into(),
+                resource_version: Some("42".into()),
+            }],
+        };
+        assert!(matches!(
+            runtime.delete_captured(&snapshot, true).await,
+            Err(ContainerRuntimeError::Conflict(_))
+        ));
+        server.await.expect("adapter assertions");
+    }
+
+    #[tokio::test]
+    async fn agent_pvc_ensure_creates_workspace_without_deletion() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let config = kube::Config::new(format!("http://{address}").parse().expect("URI"));
+        let runtime = runtime(kube::Client::try_from(config).expect("client"));
+        let family = ServiceType::WebAgentRunner;
+        let expected_name = runtime
+            .workspace_pvc_name("retained-agent", &family)
+            .expect("PVC name");
+        let expected_family = family.to_string();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut bytes = Vec::new();
+                let mut buffer = [0u8; 2048];
+                let (head, offset, length) = loop {
+                    let count = stream.read(&mut buffer).await.expect("request");
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(offset) = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&bytes[..offset]).into_owned();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().expect("length"))
+                            })
+                            .unwrap_or(0);
+                        break (head, offset + 4, length);
+                    }
+                };
+                while bytes.len() < offset + length {
+                    let count = stream.read(&mut buffer).await.expect("body");
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let (status, body) = if index == 0 {
+                    assert!(head.starts_with("GET "), "{head}");
+                    assert!(head.contains(&expected_name), "{head}");
+                    (
+                        404,
+                        serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"not found","code":404}),
+                    )
+                } else {
+                    assert!(
+                        head.starts_with("POST "),
+                        "ensure may create but must never delete: {head}"
+                    );
+                    let mut object: serde_json::Value =
+                        serde_json::from_slice(&bytes[offset..offset + length]).expect("PVC");
+                    assert_eq!(object["metadata"]["name"], expected_name);
+                    assert_eq!(
+                        object["metadata"]["labels"]["service_type"],
+                        expected_family
+                    );
+                    object["metadata"]["uid"] = "retained-agent-pvc".into();
+                    object["metadata"]["resourceVersion"] = "1".into();
+                    (201, object)
+                };
+                let body = body.to_string();
+                stream.write_all(format!("HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.expect("response");
+            }
+        });
+        runtime
+            .ensure_workspace_pvc("retained-agent", &family, None)
+            .await
+            .expect("agent workspace creation is allowed");
+        server.await.expect("API assertions");
+    }
+
+    #[tokio::test]
+    async fn agent_pvc_destroy_is_rejected_before_any_api_request() {
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let config = kube::Config::new("http://127.0.0.1:1".parse().expect("uri"));
+        let runtime = runtime(kube::Client::try_from(config).expect("client"));
+        let result = K8sPvcOps::destroy_workspace_pvc(
+            &runtime,
+            "protected-agent",
+            &ServiceType::WebAgentRunner,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ContainerRuntimeError::ConfigurationError(message)) if message.contains("forbidden"))
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_reuse_claim_sends_uid_and_resource_version_cas() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let mut patched = false;
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut bytes = Vec::new();
+                let mut buffer = [0u8; 2048];
+                let (head, offset, length) = loop {
+                    let n = stream.read(&mut buffer).await.expect("request");
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(offset) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&bytes[..offset]).to_string();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|length| length.trim().parse::<usize>().expect("length"))
+                            })
+                            .unwrap_or(0);
+                        break (head, offset + 4, length);
+                    }
+                };
+                while bytes.len() < offset + length {
+                    let n = stream.read(&mut buffer).await.expect("body");
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                let (code, response) = if head.starts_with("PATCH ") {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&bytes[offset..offset + length]).expect("patch");
+                    assert_eq!(body["metadata"]["uid"], "pvc-owned");
+                    assert_eq!(body["metadata"]["resourceVersion"], "42");
+                    assert!(
+                        !body["metadata"]["annotations"]["rcoder.io/storage-use-operation"]
+                            .as_str()
+                            .expect("claim")
+                            .is_empty()
+                    );
+                    patched = true;
+                    (
+                        200,
+                        serde_json::json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"rcoder-app-claim-test-workspace","labels":{"service_type":"user-app"},"uid":"pvc-owned","resourceVersion":"43"}}),
+                    )
+                } else if head
+                    .lines()
+                    .next()
+                    .expect("request line")
+                    .contains("-data ")
+                {
+                    (
+                        404,
+                        serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404,"message":"legacy volume absent"}),
+                    )
+                } else {
+                    (
+                        200,
+                        serde_json::json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"rcoder-app-claim-test-workspace","labels":{"service_type":"user-app"},"uid":"pvc-owned","resourceVersion":"42"}}),
+                    )
+                };
+                let body = response.to_string();
+                stream.write_all(format!("HTTP/1.1 {code} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.expect("response");
+            }
+            assert!(patched);
+        });
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let config = kube::Config::new(format!("http://{address}").parse().expect("uri"));
+        let runtime = runtime(kube::Client::try_from(config).expect("client"));
+        runtime
+            .claim_app_storage("claim-test")
+            .await
+            .expect("claim");
+        server.await.expect("adapter assertions");
+    }
+
+    #[tokio::test]
+    async fn application_operation_lease_excludes_purge_and_release_is_identity_bound() {
+        for (replaced, cancelled) in [(false, false), (true, false), (false, true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let address = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move {
+                for request_index in 0..if cancelled { 2 } else { 3 } {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0u8; 2048];
+                    let (head, offset, length) = loop {
+                        let n = stream.read(&mut buffer).await.expect("read");
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(offset) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&bytes[..offset]).to_string();
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().expect("length"))
+                                })
+                                .unwrap_or(0);
+                            break (head, offset + 4, length);
+                        }
+                    };
+                    while bytes.len() < offset + length {
+                        let n = stream.read(&mut buffer).await.expect("body");
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                    }
+                    let mut body: serde_json::Value =
+                        serde_json::from_slice(&bytes[offset..offset + length]).expect("json");
+                    let conflict = request_index == 1 || (request_index == 2 && replaced);
+                    if request_index < 2 {
+                        assert!(head.starts_with("POST "));
+                        assert!(
+                            !body["metadata"]["annotations"]["rcoder.io/operation-id"]
+                                .as_str()
+                                .expect("operation")
+                                .is_empty()
+                        );
+                        body["metadata"]["uid"] = "lease-owner".into();
+                        body["metadata"]["resourceVersion"] = "42".into();
+                    } else {
+                        assert!(head.starts_with("DELETE "));
+                        assert_eq!(body["preconditions"]["uid"], "lease-owner");
+                        assert_eq!(body["preconditions"]["resourceVersion"], "42");
+                        body = serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success","code":200});
+                    }
+                    let code = if conflict { 409 } else { 200 };
+                    if conflict {
+                        body = serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Conflict","message":"another operation owns this resource","code":409});
+                    }
+                    let body = body.to_string();
+                    stream.write_all(format!("HTTP/1.1 {code} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.expect("response");
+                }
+            });
+            drop(rustls::crypto::ring::default_provider().install_default());
+            let config = kube::Config::new(format!("http://{address}").parse().expect("uri"));
+            let runtime = runtime(kube::Client::try_from(config).expect("client"));
+            let writer = runtime
+                .acquire_application_operation("writer-paused", &ServiceType::Userapp)
+                .await
+                .expect("writer lease");
+            let writer = if cancelled {
+                drop(writer);
+                None
+            } else {
+                Some(writer)
+            };
+            // The writer is paused after acquiring ownership and before its Deployment POST.
+            assert!(matches!(
+                runtime
+                    .acquire_application_operation("writer-paused", &ServiceType::Userapp)
+                    .await,
+                Err(ContainerRuntimeError::Conflict(_))
+            ));
+            if let Some(writer) = writer {
+                let released = writer.release().await;
+                assert_eq!(
+                    released.is_err(),
+                    replaced,
+                    "old release cannot remove a replacement operation"
+                );
+            }
+            server.await.expect("adapter assertions");
+        }
+    }
+
     /// Real kube client and real generation writer; only the API server is a local
     /// deterministic adapter. No kubeconfig/in-cluster discovery or cluster access.
     #[tokio::test]
@@ -695,6 +1090,7 @@ mod conditional_tests {
                 });
             }
         });
+        drop(rustls::crypto::ring::default_provider().install_default());
         drop(rustls::crypto::ring::default_provider().install_default());
         let config = kube::Config::new(format!("http://{addr}").parse().expect("URI"));
         let rt = runtime(kube::Client::try_from(config).expect("local client"));

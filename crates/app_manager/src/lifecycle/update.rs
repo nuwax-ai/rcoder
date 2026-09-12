@@ -43,6 +43,7 @@ impl AppService {
                 "app {app_id} is being activated/published, retry after it finishes"
             ))
         })?;
+        let _update_lock = self.operation_guard(app_id, _update_lock, false).await?;
         let current = self.fetch_runtime_status_or_err(app_id).await?;
         // 乐观锁：expected_resource_version 不匹配 → 409 Conflict
         // （Docker resource_version=None → 跳过校验，开发环境 last-write-wins 可接受）
@@ -50,9 +51,11 @@ impl AppService {
             && let Some(actual) = &current.resource_version
             && expected != actual
         {
-            return Err(AppOperationError::Conflict(format!(
+            let error = AppOperationError::Conflict(format!(
                 "resource version mismatch: expected={expected}, actual={actual}"
-            )));
+            ));
+            _update_lock.finish().await?;
+            return Err(error);
         }
         let params = self
             .build_container_params_from_update(app_id, &request, &current)
@@ -61,6 +64,7 @@ impl AppService {
         // K8s 下 resources.storage 是 per-app PVC 扩容目标（仅扩不缩、在线生效
         // 不重建 Pod）；Docker no-op。失败阻断整个 update——该字段对外承诺生效，
         // 静默降级会让调用方以为已扩容。
+        _update_lock.mark_mutating()?;
         if let Some(new_size) = params.storage_size.as_deref() {
             match self.runtime.resize_app_storage(app_id, new_size).await {
                 Ok(StorageResizeOutcome::Resized { from, to }) => {
@@ -82,6 +86,7 @@ impl AppService {
                     current: cur,
                     requested,
                 }) => {
+                    _update_lock.finish().await?;
                     return Err(AppOperationError::Validation(format!(
                         "K8s PVC supports expansion only: app {app_id} requested {requested} < current {cur}"
                     )));
@@ -112,7 +117,7 @@ impl AppService {
                     .map(|p| p.port)
                     .collect()
             })
-            .unwrap_or(registered_http_ports);
+            .unwrap_or_else(|| registered_http_ports.clone());
         let info = match self
             .runtime
             .patch_deployment_if_version(
@@ -129,8 +134,16 @@ impl AppService {
                 // 的失败恢复分支）——否则应用还在跑但 /api/v1/userapp/proxy/app/prod/{id} 502，直到
                 // 下次成功 update 或进程重启。
                 let previous_host = current.pod_ip.clone().unwrap_or_default();
-                self.register_pingora_backends(app_id, &http_ports, &previous_host)
+                self.register_pingora_backends(app_id, &registered_http_ports, &previous_host)
                     .await;
+                if self.config.access_mode == crate::config::AppAccessMode::Docker
+                    && matches!(
+                        &e,
+                        container_runtime_api::ContainerRuntimeError::PreparationFailed(_)
+                    )
+                {
+                    _update_lock.finish().await?;
+                }
                 return Err(map_runtime_error(
                     &format!("[APP] patch_deployment failed app_id={app_id}"),
                     e,
@@ -165,7 +178,7 @@ impl AppService {
                 request.space_id.clone(),
             )
             .await;
-        drop(_update_lock);
+        _update_lock.finish().await?;
         self.remove_unused_process_release_lock(app_id);
         self.invalidate_deploy_cache().await;
         self.get_app(app_id).await
@@ -180,31 +193,45 @@ impl AppService {
         expected_resource_version: Option<&str>,
     ) -> AppResult<()> {
         validate_app_id(app_id)?;
+        let release_lock = self.acquire_process_release_lock(app_id).await?;
         let previous = self.fetch_runtime_status_or_err(app_id).await?;
         // 乐观锁（同 update_app）：expected 不匹配 → 409 Conflict
         if let Some(expected) = expected_resource_version
             && let Some(actual) = &previous.resource_version
             && expected != actual
         {
-            return Err(AppOperationError::Conflict(format!(
+            let error = AppOperationError::Conflict(format!(
                 "resource version mismatch: expected={expected}, actual={actual}"
-            )));
+            ));
+            release_lock.finish().await?;
+            return Err(error);
         }
         // delete/purge 必须与 prepare/activate/confirm/delete-release 串行，避免删除 PVC
         // 时另一个任务仍在写版本包或切换 code。
-        let release_lock = self.acquire_process_release_lock(app_id).await;
+        let snapshot = self
+            .runtime
+            .capture_app_deletion(app_id, previous.resource_version.as_deref())
+            .await
+            .map_err(|error| map_runtime_error("capture app deletion", error))?;
+        let dev_deletion = if purge {
+            Some(self.capture_dev_deletion(app_id).await?)
+        } else {
+            None
+        };
         info!("[APP] deleting app: {} (purge={})", app_id, purge);
 
+        release_lock.mark_mutating()?;
         // 1. 删除计算面（防护序列与失败对称恢复见 tear_down_compute_plane）
-        self.tear_down_compute_plane(app_id, &previous).await?;
+        self.tear_down_compute_plane(app_id, &previous, &snapshot)
+            .await?;
 
         // 2. purge=true 必须销毁持久存储（K8s: PVC + Ceph subvolume；Docker:
         //    workspace 目录），与 API 的“全部删除”语义一致。仅清空目录却保留 PVC
         //    会继续占用配额，并让成功响应与实际状态不一致。
         //    元数据行**保留**（三档语义：delete/purge 保留行支持误删找回，仅独立
         //    storage/destroy 接口删行）。
-        if purge {
-            self.destroy_app_storage_keep_metadata(app_id, app_id)
+        if let Some(dev_deletion) = dev_deletion {
+            self.destroy_app_storage_keep_metadata(app_id, app_id, Some(&snapshot), dev_deletion)
                 .await?;
             info!("[APP] persistent storage destroyed: {}", app_id);
         } else {
@@ -214,7 +241,7 @@ impl AppService {
             );
         }
 
-        drop(release_lock);
+        release_lock.finish().await?;
         self.remove_unused_process_release_lock(app_id);
         self.invalidate_deploy_cache().await;
         Ok(())
@@ -231,6 +258,7 @@ impl AppService {
         &self,
         app_id: &str,
         previous: &DeploymentStatus,
+        snapshot: &shared_types::AppDeletionSnapshot,
     ) -> AppResult<()> {
         // 失败恢复依据先取出（unregister 会移除注册表条目）：pingora_ports 里的是
         // 当前实际生效的 Http 端口——比 previous.ports 反推可靠（Docker 后端的状态
@@ -242,11 +270,11 @@ impl AppService {
         // 先注销 Pingora backend（K8s/Docker 都执行：Docker 旧 container_ip 失效；
         // K8s 侧 backend 指向 Service FQDN，删除后集群资源整体消失）。
         self.unregister_pingora_backends(app_id).await;
-        // 删除计算资源（K8s: Deployment/Service/HTTPRoute/NodePort/ConfigMap/Secret
-        // + label orphan 扫描兜底；Docker: 容器）。持久存储默认保留。
+        // Delete only the captured compute identities. Storage uses the same
+        // pre-deletion snapshot in the explicit purge path.
         // 先阻止并发流量唤醒；删除失败时恢复原活动状态。
         self.activity.mark_wake_blocked(app_id);
-        if let Err(error) = self.runtime.delete_deployment(app_id).await {
+        if let Err(error) = self.runtime.delete_app_snapshot(snapshot).await {
             self.restore_activity_state(app_id, previous, previous_wake_on_traffic);
             self.register_pingora_backends(
                 app_id,

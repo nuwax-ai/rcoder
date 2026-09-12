@@ -1,7 +1,7 @@
 //! Agent 容器启动编排
 //!
 //! 从 DockerManager::start_agent_container() 提取。
-//! 职责：参数解析 → 旧容器清理 → 配置准备 → 委托 create_container → 健康检查
+//! 职责：参数和配置预检 → 旧容器清理 → 委托 create_container → 健康检查
 
 use container_runtime_api::ContainerCreateParams;
 use shared_types::{ContainerBasicInfo, ServiceType};
@@ -16,9 +16,9 @@ use super::{DockerError, DockerResult};
 /// Agent 容器启动器
 ///
 /// 编排完整的 Agent 容器启动流程：
-/// 1. 预检查工作目录
+/// 1. 预检查身份、资源参数、服务配置和镜像
 /// 2. 清理旧容器
-/// 3. 获取服务配置和镜像
+/// 3. 使用预检结果准备配置
 /// 4. 构建容器配置（挂载、环境变量、网络）
 /// 5. 委托 create_container 创建并启动
 /// 6. 等待健康检查通过
@@ -26,12 +26,65 @@ pub(crate) struct AgentContainerStarter<'a> {
     manager: &'a DockerManager,
 }
 
+pub(crate) struct PreparedAgentConfig {
+    service_config: shared_types::ServiceImageConfig,
+    image: String,
+    container_id: String,
+}
+
 impl<'a> AgentContainerStarter<'a> {
     pub fn new(manager: &'a DockerManager) -> Self {
         Self { manager }
     }
 
+    pub(crate) async fn preflight(
+        &self,
+        params: &ContainerCreateParams,
+    ) -> DockerResult<PreparedAgentConfig> {
+        let container_id = params
+            .service_type
+            .container_identifier(
+                params.pod_id.as_deref(),
+                params.user_id.as_deref(),
+                params.project_id.as_deref(),
+            )
+            .map_err(|e| DockerError::ConfigurationError(e.to_string()))?
+            .to_owned();
+        if let Some(limits) = &params.resource_limits {
+            limits.validate().map_err(|e| {
+                DockerError::ConfigurationError(format!("Invalid resource limits: {e}"))
+            })?;
+        }
+        let service_config = self
+            .manager
+            .get_service_config(&params.service_type)
+            .await?;
+        let image = self
+            .manager
+            .select_image(&params.service_type, None)
+            .await?;
+        Ok(PreparedAgentConfig {
+            service_config,
+            image,
+            container_id,
+        })
+    }
+
     pub async fn start(&self, params: ContainerCreateParams) -> DockerResult<ContainerBasicInfo> {
+        let prepared = self.preflight(&params).await?;
+        self.start_prepared(params, prepared).await
+    }
+
+    pub(crate) async fn start_prepared(
+        &self,
+        params: ContainerCreateParams,
+        prepared: PreparedAgentConfig,
+    ) -> DockerResult<ContainerBasicInfo> {
+        let PreparedAgentConfig {
+            service_config,
+            image,
+            container_id,
+        } = prepared;
         let ContainerCreateParams {
             project_id,
             user_id,
@@ -95,18 +148,7 @@ impl<'a> AgentContainerStarter<'a> {
             }
         }
 
-        // 2. 获取配置和镜像
-        let service_config = self.manager.get_service_config(&service_type).await?;
-        let image = self.manager.select_image(&service_type, None).await?;
-
-        // 3. 准备配置
         use crate::container_builder::ContainerConfigBuilder;
-
-        // 确定用于构建容器配置的主 ID（复用 ServiceType::container_identifier 单一事实源）
-        let container_id: String = service_type
-            .container_identifier(pod_id.as_deref(), user_id.as_deref(), project_id.as_deref())
-            .map_err(|e| DockerError::ConfigurationError(e.to_string()))?
-            .to_string();
 
         // 解析容器内工作目录路径
         let mut variables = std::collections::HashMap::new();
@@ -378,5 +420,40 @@ impl<'a> AgentContainerStarter<'a> {
                 )))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    use container_runtime_api::{AgentContainerRuntime, ContainerRuntimeError};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn missing_builder_configuration_fails_before_operation_lease_or_docker_api() {
+        let mut config = crate::DockerManagerConfig::default();
+        config.multi_image_config.services.clear();
+        let (_actor, containers) = crate::container_state_actor::ContainerStateActor::new();
+        let manager = DockerManager {
+            docker: bollard::Docker::connect_with_http(
+                "http://127.0.0.1:9",
+                1,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .unwrap(),
+            config,
+            containers,
+            main_network_name: Arc::new(tokio::sync::RwLock::new("unused".into())),
+            api_cache: Arc::new(crate::api_cache::DockerApiCache::new(1, 1, 1)),
+        };
+        let runtime = crate::runtime::docker_runtime::DockerRuntime::new(Arc::new(manager));
+        let params = ContainerCreateParams::builder()
+            .project_id("preflight-test".to_string())
+            .service_type(ServiceType::UserappBuilder)
+            .build();
+        let result = runtime.create_container(params).await;
+        assert!(
+            matches!(result, Err(ContainerRuntimeError::ConfigurationError(message)) if message.contains("not enabled"))
+        );
     }
 }

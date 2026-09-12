@@ -34,6 +34,7 @@ async fn app_metadata_upsert_keeps_created_at_and_roundtrip() {
 
     // 首次 upsert（create 语义）
     repo.upsert(&shared_types::AppMetadataRecord {
+        generation: "metadata-v1".into(),
         app_id: app_id.clone(),
         name: Some("v1".into()),
         user_id: Some("u-1".into()),
@@ -45,6 +46,7 @@ async fn app_metadata_upsert_keeps_created_at_and_roundtrip() {
     .expect("upsert v1");
     // 二次 upsert（update 语义:name/space 刷新,created_at 传 now 但不得生效）
     repo.upsert(&shared_types::AppMetadataRecord {
+        generation: "metadata-v2".into(),
         app_id: app_id.clone(),
         name: Some("v2".into()),
         user_id: Some("u-1".into()),
@@ -71,7 +73,17 @@ async fn app_metadata_upsert_keeps_created_at_and_roundtrip() {
         "created_at must NOT be refreshed by upsert"
     );
 
-    repo.delete(&app_id).await.expect("delete");
+    assert!(
+        !repo
+            .delete_if_current(&app_id, "superseded-generation")
+            .await
+            .expect("old delete")
+    );
+    assert!(
+        repo.delete_if_current(&app_id, &row.generation)
+            .await
+            .expect("delete")
+    );
     let rows = repo.load_all().await.expect("reload");
     assert!(rows.iter().all(|r| r.app_id != app_id));
 }

@@ -52,9 +52,12 @@ impl KubernetesRuntime {
         // Query K8s API — 按类型分流的 selector（单一事实源，与 find_container_inner 共用）
         for query in pod_label_selectors(identifier, service_type) {
             let lp = ListParams::default().labels(&query);
-            if let Ok(pods) = self.pods().list(&lp).await
-                && let Some(pod) = pods.items.into_iter().next()
-            {
+            let pods = self.pods().list(&lp).await.map_err(|error| {
+                ContainerRuntimeError::K8sError(format!(
+                    "query container pods with selector {query}: {error}"
+                ))
+            })?;
+            if let Some(pod) = pods.items.into_iter().next() {
                 let status = Self::extract_pod_status(&pod);
                 let metadata = &pod.metadata;
                 let uid = metadata.uid.clone().unwrap_or_default();

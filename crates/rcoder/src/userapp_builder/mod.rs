@@ -8,6 +8,7 @@
 
 mod dev_cleanup;
 mod dev_locator;
+mod lifecycle;
 
 pub use dev_cleanup::UserappDevResourcesCleanup;
 pub use dev_locator::UserappDevLocator;
@@ -116,6 +117,7 @@ pub(crate) async fn ensure_userapp_builder(
     app_id: &str,
     explicit_user_id: Option<&str>,
 ) -> Result<ContainerBasicInfo> {
+    let _lifecycle = lifecycle::acquire(app_id).await;
     // 长度 Fail Fast（仅新建路径需要——注册命中说明历史上已建成，不受限）：
     // K8s 下 STS pod 的 controller-revision-hash label =
     // `rcoder-app-builder-{app_id}-{10位hash}` 受 63 字节限，超长必然
@@ -152,6 +154,7 @@ pub(crate) async fn ensure_userapp_builder_probed(
     app_id: &str,
     explicit_user_id: Option<&str>,
 ) -> Result<(ContainerBasicInfo, bool)> {
+    let _lifecycle = lifecycle::acquire(app_id).await;
     if let Some(info) = registered_builder(state, app_id) {
         let addr = dev_file_server_addr(state, &info);
         if probe_file_server(&addr).await {
