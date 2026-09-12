@@ -27,8 +27,16 @@ const DYNAMIC_ADD_LOCK: &str = ".dynamic_add.lock";
 /// 智能体级实体存储路径: `{user_root}/.agent-store/{agent_id}`。
 ///
 /// `user_root` = 会话工作区的父目录 (该 user 的稳定根), 两种 resolver 模式下均成立:
-/// - Local: `{COMPUTER_WORKSPACE_DIR}/{userId}` (对齐 TS `{COMPUTER_WORKSPACE_DIR}/{userId}/.agent-store/...`)
+/// - Local: `{COMPUTER_WORKSPACE_DIR}/{userId}` (对齐 TS `{COMPUTER_WORKSPACE_DIR}/{userId}/.agent-store/...`
+///   ——normalProject 与 taskAgent 共用同一实体子树，TS 1.4.5 同款)
 /// - Subvolume (per-user PVC): `{cephfs-root}/{subvolumePath}` (user_id 已被 PVC 吸收)
+///
+/// ⚠️ TS 6ab47b7 起 userapp 的 store 布局变为随工作区就近
+/// （`{workspacePath}/.agent-store/{agentId}`，默认 `{UWS}/.agent-store/{appId}/{agentId}`
+/// 含 appId 段）——该布局服务其 manifest 共享技能视图（多智能体共享工作区场景，
+/// 本仓暂缓复刻），且 Rust 侧 userapp 的 store 消费链现状不可达（userapp 直转
+/// 恒 legacy、computer 拦截路径被 `is_dir_link` 门控首推必 legacy），故布局同步
+/// 与 manifest 视图捆绑暂缓——激活条件见 workspace-manifest 复刻任务。
 ///
 /// store 与会话工作区 (`{user_root}/{cId}`) 同属一棵树, 相对软链可跨节点解析。
 /// ⚠️ 不要从工作区叶子路径倒推多级父目录 — subvolumePath 深度不定。
