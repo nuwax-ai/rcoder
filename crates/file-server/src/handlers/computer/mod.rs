@@ -38,8 +38,31 @@ async fn ws_path(
     computer_root_for_request(state, user_id, cid, workspace_path).await
 }
 
-/// computer 域请求根目录（服务场景类型 + 用户维度工作目录的**单一收口**——
-/// ws_path 与静态文件共用，消除多处独立 if 的漂移面）。
+/// computer 域请求根目录（task-local 薄壳）：从请求中间件 scope 的上下文
+/// （header 通道）取三要素后调 [`computer_root_for_context`] 核心收口。
+pub(crate) async fn computer_root_for_request(
+    state: &AppState,
+    user_id: &str,
+    cid: &str,
+    workspace_path: Option<&str>,
+) -> Result<PathBuf, AppError> {
+    computer_root_for_context(
+        state,
+        user_id,
+        cid,
+        crate::extract::service_kind(),
+        crate::extract::userapp_app_id().as_deref(),
+        workspace_path,
+    )
+    .await
+}
+
+/// computer 域定位核心（服务场景类型 + 用户维度工作目录的**单一收口**——
+/// task-local 薄壳与 git 族 serviceContext 分支共用，消除多处独立 if 的漂移面）。
+///
+/// `kind`/`app_id` 由调用方合并（header 通道 task-local 或 body/query 显式值）；
+/// `workspace_path` 传入**未与 header 合并**的显式值，本函数内经
+/// [`crate::extract::merged_workspace_path`] 合并（header 优先）。
 ///
 /// 定位优先级（对齐 TS 1.4.5 `resolveWorkspaceDir`）：
 /// 1. **用户维度工作目录 workspacePath**（header `x-workspace-path` > body/query
@@ -51,22 +74,24 @@ async fn ws_path(
 ///    ⚠️ single-app 模式（生产运行容器）fail-closed 拒绝——运行容器只服务
 ///    本 app 卷，与 customTargetDir 在该模式的收紧先例一致（workspace.rs
 ///    `resolve_userapp_dev`）；TS 无 single-app 概念，此为有意偏离。
-/// 2. userApp 分流（X-Service-Type=userapp，经反向代理/rcoder 拦截层透传）：
+/// 2. userApp 分流（kind=userapp，经反向代理/rcoder 拦截层透传）：
 ///    workspace 切到开发卷 `{USERAPP_WORKSPACE_DIR}/{app_id}`。**app_id 是独立
 ///    字段**（header `x-app-id` > query `appId`，见 [`crate::extract::userapp_app_id`]），
 ///    cId 是会话字段**不参与** userapp 定位（勿兼任）；缺失 fail-fast。
-/// 3. normalProject 分流（X-Service-Type=normalProject，常规项目主容器共享
-///    工作区）：`{COMPUTER_WORKSPACE_DIR}/{userId}/NormalProject/{projectId}`
+/// 3. normalProject 分流（kind=normalProject，常规项目主容器共享工作区）：
+///    `{COMPUTER_WORKSPACE_DIR}/{userId}/NormalProject/{projectId}`
 ///    （projectId 复用 app_id 通道传递，TS 字面规则不走 WorkspaceResolver）；
 ///    app_id 缺失 fail-fast（文案对齐 TS）。⚠️ TS 侧 projectId 不过路径段校验，
 ///    此处过 [`crate::workspace`] identifier 校验为有意加固（进宿主树路径拼接，
 ///    与 resolve_userapp_dev 同源纪律）。
 /// 4. 默认 resolver（pageApp/taskAgent/缺省：Local `{root}/{userId}/{cId}` /
 ///    Subvolume per-agent PVC）。
-pub(crate) async fn computer_root_for_request(
+pub(crate) async fn computer_root_for_context(
     state: &AppState,
     user_id: &str,
     cid: &str,
+    kind: Option<shared_types::ComputerServiceKind>,
+    app_id: Option<&str>,
     workspace_path: Option<&str>,
 ) -> Result<PathBuf, AppError> {
     if let Some(raw) = crate::extract::merged_workspace_path(workspace_path) {
@@ -85,48 +110,57 @@ pub(crate) async fn computer_root_for_request(
         let dir = crate::workspace::normalize_workspace_path(&raw)?;
         return Ok(PathBuf::from(dir));
     }
-    if crate::extract::is_userapp_request() {
-        let app_id = crate::extract::userapp_app_id().ok_or_else(|| {
-            AppError::validation(
-                "userapp request missing app_id: pass `X-App-Id` header or query `appId`",
-            )
-        })?;
-        return crate::workspace::resolve_userapp_dev(&app_id, None, &state.config);
-    }
-    if crate::extract::is_normal_project_request() {
-        if state
-            .config
-            .userapp_single_app_id
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty())
-        {
-            return Err(AppError::validation(
-                "normalProject is not supported in single-app mode \
-                 (this container serves its own app volume only)",
-            ));
+    let single_app = state
+        .config
+        .userapp_single_app_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    match kind {
+        Some(shared_types::ComputerServiceKind::Userapp) => {
+            let app_id = app_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::validation(
+                        "userapp request missing app_id: pass `X-App-Id` header or query `appId`",
+                    )
+                })?;
+            crate::workspace::resolve_userapp_dev(app_id, None, &state.config)
         }
-        let app_id = crate::extract::userapp_app_id()
-            .ok_or_else(|| {
-                AppError::validation("appId(projectId) is required for normalProject workspace")
-            })?
-            .trim()
-            .to_string();
-        shared_types::validate_identifier(&app_id, "appId").map_err(AppError::validation)?;
-        return Ok(state
-            .config
-            .computer_workspace_dir
-            .join(user_id)
-            .join("NormalProject")
-            .join(app_id));
+        Some(shared_types::ComputerServiceKind::NormalProject) => {
+            if single_app {
+                return Err(AppError::validation(
+                    "normalProject is not supported in single-app mode \
+                     (this container serves its own app volume only)",
+                ));
+            }
+            let app_id = app_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::validation("appId(projectId) is required for normalProject workspace")
+                })?
+                .to_string();
+            shared_types::validate_identifier(&app_id, "appId").map_err(AppError::validation)?;
+            Ok(state
+                .config
+                .computer_workspace_dir
+                .join(user_id)
+                .join("NormalProject")
+                .join(app_id))
+        }
+        // pageApp / taskAgent / 缺省：默认 resolver
+        _ => {
+            state
+                .resolver
+                .resolve_computer(&ComputerContext {
+                    user_id: user_id.to_string(),
+                    cid: cid.to_string(),
+                })
+                .await
+        }
     }
-    state
-        .resolver
-        .resolve_computer(&ComputerContext {
-            user_id: user_id.to_string(),
-            cid: cid.to_string(),
-        })
-        .await
 }
 
 /// computer 目标路径: `customTargetDir` trim 后非空则用之, 否则回退默认工作区 (对齐 nuwax)。
@@ -402,7 +436,7 @@ mod tests {
     {
         let app_id = app_id.map(str::to_string);
         crate::extract::SERVICE_KIND
-            .scope(kind, async move {
+            .scope(Some(kind), async move {
                 crate::extract::USERAPP_APP_ID.scope(app_id, f).await
             })
             .await

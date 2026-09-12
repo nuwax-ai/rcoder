@@ -295,10 +295,165 @@ async fn userapp_dev_files_two_entry_points() {
 }
 
 // ============================================================
-// 场景 2：PG 改密 dev（reset-password；全新容器 PG initdb 有就绪窗口，轮询收敛）
-//          首调成功（username upsert 建号）；同密码复调仍成功（upsert 幂等执行）
-//          （align-credentials HTTP 入口已下线——start 部署链内嵌对齐）
+// 场景 1b：git 族 serviceContext（X-Service-Type/X-App-Id 拦截转发 →
+//           容器内 git 域 serviceContext 分支落开发卷；无 LLM 依赖）
 // ============================================================
+#[tokio::test]
+async fn userapp_dev_git_service_context() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_git_ctx";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "g1");
+    let user = "e2e-ud-user";
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 造文件（拦截路径，同场景 1 入口 B）——git add 的工作区内容
+    let resp = env
+        .http
+        .post(format!("{}/api/computer/generate-file", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-Service-Type", "userapp")
+        .header("X-App-Id", &app)
+        .json(&json!({"userId": user, "cId": app, "fileName": "git-ctx.txt", "content": "git serviceContext e2e"}))
+        .send()
+        .await
+        .expect("seed file");
+    report.assert_hard(
+        "前置：generate-file 造 git 工作区文件",
+        resp.status().is_success(),
+        format!("HTTP {}", resp.status()),
+    );
+
+    // git init：双 header（serviceContext 激活=appId 存在）+ workspaceType 老字段
+    // 传 taskAgent（证明 serviceContext 优先级覆盖：若回落老规则，主容器
+    // {CWS}/{user}/{cid} 不存在 → Resource 错）
+    let resp = env
+        .http
+        .post(format!("{}/api/git/init", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-Service-Type", "userapp")
+        .header("X-App-Id", &app)
+        .json(&json!({"workspaceType": "taskAgent", "userId": user, "cId": app}))
+        .send()
+        .await
+        .expect("git init");
+    let si = resp.status();
+    let bi: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "git init：serviceContext（userapp+appId）覆盖 workspaceType 老规则落开发卷",
+        si.is_success() && bi["success"].as_bool() == Some(true),
+        format!("HTTP {si}, {}", trunc(&bi, 120)),
+    );
+
+    // git add + commit + status：同一 serviceContext 定位（helper 统一带双 header）
+    async fn git_call(
+        env: &Env,
+        app: &str,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> reqwest::Response {
+        let mut req = env
+            .http
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).expect("method"),
+                format!("{}{path}", env.rcoder),
+            );
+        if !body.is_null() {
+            req = req.json(&body);
+        }
+        req.timeout(Duration::from_secs(30))
+            .header("X-Service-Type", "userapp")
+            .header("X-App-Id", app)
+            .send()
+            .await
+            .expect("git call")
+    }
+
+    let resp = git_call(
+        &env,
+        &app,
+        "POST",
+        "/api/git/add",
+        json!({"workspaceType": "taskAgent", "userId": user, "cId": app, "files": ["git-ctx.txt"]}),
+    )
+    .await;
+    let sa = resp.status();
+    let ba: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "git add：serviceContext 定位下暂存文件",
+        sa.is_success() && ba["success"].as_bool() == Some(true),
+        format!("HTTP {sa}, {}", trunc(&ba, 120)),
+    );
+
+    let resp = git_call(
+        &env,
+        &app,
+        "POST",
+        "/api/git/commit",
+        json!({"workspaceType": "taskAgent", "userId": user, "cId": app, "message": "e2e: git serviceContext"}),
+    )
+    .await;
+    let sc = resp.status();
+    let bc: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "git commit：serviceContext 定位下提交",
+        sc.is_success() && bc["success"].as_bool() == Some(true),
+        format!("HTTP {sc}, {}", trunc(&bc, 120)),
+    );
+
+    // GET status（query 通道 userId/cId + headers）→ 干净工作区（无未提交变更）
+    let resp = git_call(
+        &env,
+        &app,
+        "GET",
+        &format!("/api/git/status?workspaceType=taskAgent&userId={user}&cId={app}"),
+        Value::Null,
+    )
+    .await;
+    let ss = resp.status();
+    let bs: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "git status：GET serviceContext 查询通道命中同一定位",
+        ss.is_success() && bs["success"].as_bool() == Some(true),
+        format!("HTTP {ss}, {}", trunc(&bs, 120)),
+    );
+
+    // 负例：serviceContext 激活（appId 在）但缺 userId → 400 VALIDATION（文案含 requires userId and cId）
+    let resp = env
+        .http
+        .get(format!("{}/api/git/status?workspaceType=taskAgent", env.rcoder))
+        .timeout(Duration::from_secs(15))
+        .header("X-Service-Type", "userapp")
+        .header("X-App-Id", &app)
+        .send()
+        .await
+        .expect("missing userId");
+    let sn = resp.status();
+    let bn: Value = resp.json().await.unwrap_or(Value::Null);
+    let rejected = sn.as_u16() == 400
+        && bn["error"]["type"].as_str() == Some("VALIDATION_ERROR")
+        && bn["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("requires userId and cId"));
+    report.assert_hard(
+        "负例：serviceContext 激活但缺 userId/cId → 400 VALIDATION",
+        rejected,
+        format!("HTTP {sn}, {}", trunc(&bn, 120)),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
 #[tokio::test]
 async fn userapp_dev_pg_reset_password() {
     rcoder_e2e::common::cross_bin_lock::acquire();

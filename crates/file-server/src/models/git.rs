@@ -7,18 +7,20 @@
 use garde::Validate;
 use serde::Deserialize;
 
-/// GET 路由公共查询 (workspaceType + project/computer 标识 + 多租户)。
+/// GET 路由公共查询 (workspaceType + project/computer 标识 + 多租户 +
+/// serviceContext body/query 通道)。
 #[derive(Deserialize, utoipa::IntoParams, utoipa::ToSchema)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct GitQuery {
-    /// 工作区类型: `project`(项目工作区) / `computer`(Electron 容器根) 二选一
+    /// 工作区类型（老规则定位）: `pageApp` / `taskAgent` 二选一；携带有效
+    /// serviceContext（appId/workspacePath 任一存在）时优先级被覆盖
     pub workspace_type: Option<String>,
-    /// 项目 ID（workspaceType=project 时必填）
+    /// 项目 ID（workspaceType=pageApp 时必填）
     pub project_id: Option<String>,
-    /// 用户 ID（workspaceType=computer 时必填）
+    /// 用户 ID（workspaceType=taskAgent 与 serviceContext 模式必填）
     pub user_id: Option<String>,
-    /// 容器/实例 ID（workspaceType=computer 时必填）
+    /// 容器/实例 ID（workspaceType=taskAgent 与 serviceContext 模式必填）
     pub c_id: Option<String>,
     /// 租户 ID（多租户隔离；本地部署可缺省）
     #[serde(default)]
@@ -29,27 +31,43 @@ pub struct GitQuery {
     /// 隔离类型（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub isolation_type: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/
+    /// taskAgent，大小写不敏感；header `x-service-type` 优先——收口层合并）
+    #[serde(default)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
+    pub app_id: Option<String>,
+    /// serviceContext 通道：用户维度工作目录（header `x-workspace-path` 优先
+    /// ——收口层合并）
+    #[serde(default)]
+    pub workspace_path: Option<String>,
 }
 
 /// POST 路由公共 body (写操作基类, 被 FilesBody / CommitBody 等经 serde flatten 复用)。
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GitWriteBody {
-    /// 工作区类型：project / computer
+    /// 工作区类型（老规则定位）：pageApp / taskAgent；携带有效 serviceContext
+    /// （appId/workspacePath 任一存在）时优先级被覆盖
     pub workspace_type: String,
-    /// 项目 ID（workspaceType=project 时必填）
+    /// 项目 ID（workspaceType=pageApp 时必填）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub project_id: Option<String>,
-    /// 用户 ID（workspaceType=computer 时必填）
+    /// 用户 ID（workspaceType=taskAgent 与 serviceContext 模式必填）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub user_id: Option<String>,
-    /// 容器/实例 ID（workspaceType=computer 时必填）
+    /// 容器/实例 ID（workspaceType=taskAgent 与 serviceContext 模式必填）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
@@ -70,6 +88,21 @@ pub struct GitWriteBody {
     /// 隔离类型（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub isolation_type: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/
+    /// taskAgent，大小写不敏感；header `x-service-type` 优先——收口层合并）
+    #[serde(default)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
+    pub app_id: Option<String>,
+    /// serviceContext 通道：用户维度工作目录（header `x-workspace-path` 优先
+    /// ——收口层合并）
+    #[serde(default)]
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]

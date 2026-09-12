@@ -29,31 +29,31 @@ pub use shared_types::{
 // ── 请求级服务场景上下文 (task_local, 由请求中间件 scope 注入) ──────────────────
 tokio::task_local! {
     /// `X-Service-Type` 归一化后的服务场景类型（恒 scope：header 缺失/未匹配
-    /// 值 scope 缺省档 `TaskAgent`，对齐 TS `resolveServiceContext` 的缺省）。
-    pub(crate) static SERVICE_KIND: ComputerServiceKind;
+    /// 值 scope `None`——对齐 TS `resolveServiceContext` 的 `headerType ||
+    /// bodyType || 缺省` 链：header 未匹配视为无值，轮到 body/query 通道，
+    /// 全缺失由消费方按缺省 taskAgent 布局处理）。
+    pub(crate) static SERVICE_KIND: Option<ComputerServiceKind>;
     /// 定位的独立 app_id（header `x-app-id` 优先，缺省 query `appId`
     /// 兜底；原始值存储，合法性由定位收口 `resolve_userapp_dev` 校验——与
     /// WORKSPACE_PATH 同款「中间件存原始值、收口 fail-fast」模式）。
     pub(crate) static USERAPP_APP_ID: Option<String>;
 }
 
-/// 当前请求的服务场景类型（task_local 未设置时缺省 [`ComputerServiceKind::TaskAgent`]，
-/// 对齐 TS `resolveServiceContext` 未匹配回落 taskAgent 的缺省语义）。
-pub fn service_kind() -> ComputerServiceKind {
-    SERVICE_KIND
-        .try_with(|kind| *kind)
-        .unwrap_or(ComputerServiceKind::TaskAgent)
+/// 当前请求 header 通道的服务场景类型（`None` = header 缺失/未匹配，
+/// 由消费方决定 body/query 兜底与缺省布局）。
+pub fn service_kind() -> Option<ComputerServiceKind> {
+    SERVICE_KIND.try_with(|kind| *kind).ok().flatten()
 }
 
 /// 当前请求是否为 userApp 场景（`X-Service-Type: userapp`）。
 pub fn is_userapp_request() -> bool {
-    service_kind() == ComputerServiceKind::Userapp
+    service_kind() == Some(ComputerServiceKind::Userapp)
 }
 
 /// 当前请求是否为 normalProject 场景（`X-Service-Type: normalProject`，
 /// 常规项目主容器共享工作区 `{CWS}/{userId}/NormalProject/{projectId}`）。
 pub fn is_normal_project_request() -> bool {
-    service_kind() == ComputerServiceKind::NormalProject
+    service_kind() == Some(ComputerServiceKind::NormalProject)
 }
 
 /// 当前请求的独立 app_id（对齐 TS `resolveServiceContext` 的两级提取：
@@ -71,18 +71,17 @@ pub fn userapp_app_id() -> Option<String> {
 }
 
 /// 中间件：读 `X-Service-Type` header → 归一化为四值类型 scope 注入
-/// （缺失/未匹配 scope 缺省档 `TaskAgent`，对齐 TS 1.4.5 词表终态——无
-/// general 兼容），同时提取定位用 app_id（header `x-app-id` 优先，缺省
-/// query `appId` 兜底——Java 静态文件族 query 恒带 `appId`）。query 值不做
-/// percent-decode：app_id 是 identifier 字符集，含转义序列会在定位收口校验
-/// fail-fast。
+/// （缺失/未匹配 scope `None`——header 通道视为无值，对齐 TS `headerType ||
+/// bodyType` 链；缺省 taskAgent 由消费方处理，词表终态无 general 兼容），
+/// 同时提取定位用 app_id（header `x-app-id` 优先，缺省 query `appId` 兜底——
+/// Java 静态文件族 query 恒带 `appId`）。query 值不做 percent-decode：
+/// app_id 是 identifier 字符集，含转义序列会在定位收口校验 fail-fast。
 pub async fn scope_service_context(req: Request, next: axum::middleware::Next) -> Response {
     let kind = req
         .headers()
         .get(SERVICE_TYPE_HEADER)
         .and_then(|v| v.to_str().ok())
-        .and_then(shared_types::normalize_computer_service_type)
-        .unwrap_or(ComputerServiceKind::TaskAgent);
+        .and_then(shared_types::normalize_computer_service_type);
     let app_id = req
         .headers()
         .get(APP_ID_HEADER)
