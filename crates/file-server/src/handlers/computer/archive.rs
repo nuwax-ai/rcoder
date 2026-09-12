@@ -37,7 +37,7 @@ pub(crate) async fn zip_workspace(
         &state,
         &body.user_id,
         &body.c_id,
-        body.workspace_dir.as_deref(),
+        body.workspace_path.as_deref(),
     )
     .await?;
     let filename = format!("{}_{}.zip", body.user_id, body.c_id);
@@ -68,7 +68,7 @@ pub(crate) async fn download_all_files(
         &q.user_id,
         &q.c_id,
         q.custom_target_dir.as_deref(),
-        q.workspace_dir.as_deref(),
+        q.workspace_path.as_deref(),
     )
     .await?;
     let prefix = format!("{}_{}/", q.user_id, q.c_id);

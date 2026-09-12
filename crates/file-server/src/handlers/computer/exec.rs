@@ -33,7 +33,7 @@ pub(crate) async fn execute_command(
         &state,
         &body.user_id,
         &body.c_id,
-        body.workspace_dir.as_deref(),
+        body.workspace_path.as_deref(),
     )
     .await?;
     execute_command_impl(&state, cwd, &body.command).await
@@ -63,7 +63,7 @@ pub(crate) async fn get_logs(
         &q.user_id,
         &q.c_id,
         None,
-        q.workspace_dir.as_deref(),
+        q.workspace_path.as_deref(),
     )
     .await?
     .join(".logs");

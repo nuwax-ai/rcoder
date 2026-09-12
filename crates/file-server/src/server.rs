@@ -107,7 +107,7 @@ impl FileServer {
     /// agent-runner 开发容器内嵌形态（[`crate::routes::api_router_container`]）：
     /// 全量业务路由**含 `/api/v1/userapp`**（容器是 userApp 域本地实现的宿主），
     /// 不含 swagger/fallback/`/`/`/health`（与宿主 agent_runner 冲突）。
-    /// 中间件栈与 [`Self::router_base`] 一致（含 scope_userapp_flag——容器内
+    /// 中间件栈与 [`Self::router_base`] 一致（含 scope_service_context——容器内
     /// X-Service-Type 切开发卷的主场景层）。
     pub fn router_container(&self) -> Result<Router> {
         let request_body_limit = usize::try_from(self.state.config.request_body_max_bytes)
@@ -137,7 +137,7 @@ impl FileServer {
 /// `router()`/`router_container()`/`router_base()` 三形态与 file-server-userapp
 /// 组装的 userapp 子树共用本函数——**单一事实源**，中间件演进只改这里。
 /// 泛型于 state 类型（from_fn 中间件不依赖 state），调用方各自 `with_state`。
-/// `scope_userapp_flag` / `scope_workspace_dir` 对 userapp 子树是 no-op
+/// `scope_service_context` / `scope_workspace_path` 对 userapp 子树是 no-op
 /// （其 handler 不读这两个 task-local），包含无行为差异。
 pub fn apply_common_layers<S: Clone + Send + Sync + 'static>(
     router: Router<S>,
@@ -147,8 +147,8 @@ pub fn apply_common_layers<S: Clone + Send + Sync + 'static>(
         .layer(DefaultBodyLimit::max(request_body_limit))
         .layer(from_fn(request_id_layer))
         .layer(from_fn(locale_layer))
-        .layer(from_fn(crate::extract::scope_userapp_flag))
-        .layer(from_fn(crate::extract::scope_workspace_dir))
+        .layer(from_fn(crate::extract::scope_service_context))
+        .layer(from_fn(crate::extract::scope_workspace_path))
         .layer(from_fn(request_log_layer))
         .layer(
             TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {

@@ -3,9 +3,9 @@
 //! 字段为 `pub`（models 是 crate 内公共层）；serde 属性、garde 校验与
 //! 字段 doc comment 是 wire 契约的一部分，改动须同批核查守卫测试。
 //!
-//! 项目绑定目录 `workspaceDir`（可选，对齐 TS nuwax-file-server f979df7）：全部
+//! 项目绑定目录 `workspacePath`（可选，对齐 TS nuwax-file-server f979df7）：全部
 //! 契约统一携带；值为一跨平台绝对路径，非空时优先于默认定位（与
-//! `x-workspace-dir` header 同语义，header 优先），合法性由收口
+//! `x-workspace-path` header 同语义，header 优先），合法性由收口
 //! `computer_root_for_request` fail-fast 校验。
 
 use super::code::FileOp;
@@ -29,7 +29,7 @@ pub struct UserCidQuery {
     /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
     #[serde(default)]
     #[garde(skip)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
 }
 
 /// `get-file-list` 查询参数: 在 `UserCidQuery` 基础上新增 `relativePath` / `recursive`
@@ -55,7 +55,7 @@ pub struct FileListQuery {
     /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
     #[serde(default)]
     #[garde(skip)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
     /// 相对工作区根的子目录 (可多级), 空 → 列根目录。
     #[serde(default)]
     #[garde(skip)]
@@ -89,7 +89,7 @@ pub struct ResolveFileQuery {
     /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
     #[serde(default)]
     #[garde(skip)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
     /// 待解析的文件相对路径 (不补扩展名，逐候选目录查找)
     #[garde(custom(crate::validation_rules::not_blank))]
     pub file_path: String,
@@ -119,7 +119,7 @@ pub struct SearchFilesQuery {
     /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
     #[serde(default)]
     #[garde(skip)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
     /// 搜索起始子目录 (可多级)，空 → 从工作区根搜起
     #[serde(default)]
     #[garde(skip)]
@@ -151,7 +151,7 @@ pub struct InstallBody {
     pub programming_language: String,
     /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
     #[serde(default)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -171,7 +171,7 @@ pub struct BuildAgentBody {
     pub version: String,
     /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
     #[serde(default)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -188,7 +188,7 @@ pub struct CleanupBuildArtifactsBody {
     pub custom_target_dir: Option<String>,
     /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
     #[serde(default)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Deserialize, Validate, utoipa::ToSchema)]
@@ -209,7 +209,7 @@ pub struct ExecCommandBody {
     /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
     #[serde(default)]
     #[garde(skip)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Deserialize, Validate, utoipa::IntoParams)]
@@ -228,7 +228,7 @@ pub struct GetLogsQuery {
     /// 项目绑定目录（可选；跨平台绝对路径，非空时日志目录为 `{绑定}/.logs`，对齐 TS f979df7）
     #[serde(default)]
     #[garde(skip)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
     /// 读取末尾行数（缺省取最近若干行）
     #[serde(default = "default_tail_lines")]
     pub tail_lines: usize,
@@ -251,7 +251,7 @@ pub struct ZipBody {
     pub exclude_dirs: Option<Vec<String>>,
     /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
     #[serde(default)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -265,7 +265,7 @@ pub struct DeleteWorkspaceBody {
     pub c_id: String,
     /// 项目绑定目录（可选；非空时直接定位该目录删除，不先建后删，对齐 TS f979df7）
     #[serde(default)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -284,7 +284,7 @@ pub struct FilesUpdateBody {
     pub custom_target_dir: Option<String>,
     /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
     #[serde(default)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Deserialize, Validate, utoipa::ToSchema)]
@@ -311,7 +311,7 @@ pub struct GenerateFileBody {
     /// 项目绑定目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS f979df7）
     #[serde(default)]
     #[garde(skip)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
 }
 
 /// `/static/{user_id}/{c_id}/*` 的 `?customTargetDir=` 覆盖参数（无 utoipa 派生：
@@ -323,7 +323,7 @@ pub struct CustomTargetQuery {
     pub custom_target_dir: Option<String>,
     /// 项目绑定目录（可选；非空时静态文件从该目录解析，对齐 TS f979df7 server.js）
     #[serde(default)]
-    pub workspace_dir: Option<String>,
+    pub workspace_path: Option<String>,
 }
 
 /// `fs/children` 查询参数（目录浏览，不锚定工作区、不带会话上下文；对齐 TS

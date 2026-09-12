@@ -11,6 +11,55 @@ pub const SERVICE_TYPE_HEADER: &str = "x-service-type";
 /// 但推荐 wire 上一律传全小写 `userapp`。
 pub const SERVICE_TYPE_USERAPP: &str = "userapp";
 
+/// pageApp 场景标记值（对齐 TS 1.4.5 `SERVICE_TYPE.PAGEAPP`，驼峰值）。
+pub const SERVICE_TYPE_PAGE_APP: &str = "pageApp";
+
+/// normalProject（常规项目，主容器共享工作区）标记值（对齐 TS 1.4.5
+/// `SERVICE_TYPE.NORMAL_PROJECT`；工作区 `{CWS}/{userId}/NormalProject/{projectId}`，
+/// projectId 复用 `x-app-id`/`appId` 通道传递）。
+pub const SERVICE_TYPE_NORMAL_PROJECT: &str = "normalProject";
+
+/// taskAgent（通用智能体/缺省类型）标记值（对齐 TS 1.4.5
+/// `SERVICE_TYPE.TASK_AGENT`；TS 终态无 `general` 兼容，未匹配值回落本档）。
+pub const SERVICE_TYPE_TASK_AGENT: &str = "taskAgent";
+
+/// `x-service-type` 值归一化后的服务场景类型（对齐 TS `resolveServiceContext`
+/// 的 `normalizedType`：大小写不敏感匹配四值词表，未匹配 → None，调用方按
+/// 缺省 [`ComputerServiceKind::TaskAgent`] 处理）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputerServiceKind {
+    /// userApp（子容器，工作区切开发卷 `{UWS}/{appId}`）。
+    Userapp,
+    /// pageApp（主容器，工作区沿用 `{CWS}/{userId}/{cId}`）。
+    PageApp,
+    /// normalProject（主容器共享工作区 `{CWS}/{userId}/NormalProject/{projectId}`）。
+    NormalProject,
+    /// taskAgent（通用智能体，`{CWS}/{userId}/{cId}`；缺省档）。
+    TaskAgent,
+}
+
+/// 把 `x-service-type` 原始值归一化为 [`ComputerServiceKind`]。
+///
+/// trim + ASCII 小写后与四值词表匹配（`PageApp`/`NormalProject` 等驼峰变体
+/// 与全小写变体均命中，对齐 TS `Object.values(SERVICE_TYPE).find(...)` 大小写
+/// 不敏感归一）。未匹配（含空值）返回 `None`——由调用方决定缺省语义（TS 缺省
+/// taskAgent，无 general 兼容）。
+pub fn normalize_computer_service_type(value: &str) -> Option<ComputerServiceKind> {
+    let key = value.trim().to_ascii_lowercase();
+    [
+        (SERVICE_TYPE_USERAPP, ComputerServiceKind::Userapp),
+        (SERVICE_TYPE_PAGE_APP, ComputerServiceKind::PageApp),
+        (
+            SERVICE_TYPE_NORMAL_PROJECT,
+            ComputerServiceKind::NormalProject,
+        ),
+        (SERVICE_TYPE_TASK_AGENT, ComputerServiceKind::TaskAgent),
+    ]
+    .into_iter()
+    .find(|(wire, _)| key == wire.to_ascii_lowercase())
+    .map(|(_, kind)| kind)
+}
+
 /// 判断 `x-service-type` header 值是否标记 userApp 场景。
 ///
 /// 值经 trim + ASCII 小写归一后与 [`SERVICE_TYPE_USERAPP`] 比较——`userapp` /
@@ -18,7 +67,7 @@ pub const SERVICE_TYPE_USERAPP: &str = "userapp";
 /// 三个消费点（rcoder computer_intercept、file-server-proxy 60000 分流、
 /// 容器内 file-server scope 注入）统一走本函数，禁止各自重写比较逻辑。
 pub fn is_userapp_service_type_value(value: &str) -> bool {
-    value.trim().to_ascii_lowercase() == SERVICE_TYPE_USERAPP
+    normalize_computer_service_type(value) == Some(ComputerServiceKind::Userapp)
 }
 
 /// 开发容器定位 header：Java 调 rcoder 主服务的所有 userApp 请求统一携带，
@@ -36,14 +85,15 @@ pub const APP_STAGE_HEADER: &str = "x-app-stage";
 /// （进宿主树路径 `dev/{user_id}/{app_id}` 拼接，防逃逸——与 app_id 同源）。
 pub const USER_ID_HEADER: &str = "x-user-id";
 
-/// 项目绑定目录 header（对齐 TS nuwax-file-server f979df7 `resolveServiceContext`）：
-/// Java/前端注入，值为一跨平台绝对路径（POSIX `/a/b`、Windows 盘符 `C:/a/b`、UNC
-/// `//server/share/a/b`）。computer 域工作区定位收口（file-server
-/// `computer_root_for_request`）据此把工作区切到该目录——优先级高于
-/// `X-Service-Type` 分流与默认规则；合法性（绝对/无点段/长度/控制字符）由
-/// 收口处 [`normalize_workspace_dir`]（file-server 侧）fail-fast 校验，header
-/// 本身不做归一。与 body/query 的 `workspaceDir` 字段同语义（header 优先）。
-pub const WORKSPACE_DIR_HEADER: &str = "x-workspace-dir";
+/// 用户维度工作目录 header（对齐 TS nuwax-file-server 1.4.5 `resolveServiceContext`，
+/// 原名 `x-workspace-dir` 随 f979df7→00134aa 改名）：Java/前端注入，值为一跨平台
+/// 绝对路径（POSIX `/a/b`、Windows 盘符 `C:/a/b`、UNC `//server/share/a/b`）。
+/// computer 域工作区定位收口（file-server `computer_root_for_request`）据此把
+/// 工作区切到该目录——优先认传入（高于 `X-Service-Type` 分流与默认规则）；
+/// 合法性（绝对/无点段/长度/控制字符）由收口处 `normalize_workspace_path`
+/// （file-server 侧）fail-fast 校验，header 本身不做归一。与 body/query 的
+/// `workspacePath` 字段同语义（header 优先）。
+pub const WORKSPACE_PATH_HEADER: &str = "x-workspace-path";
 
 /// [`APP_STAGE_HEADER`] 的值：开发阶段（UserappBuilder 开发容器）。
 pub const APP_STAGE_DEV: &str = "dev";
@@ -86,6 +136,39 @@ mod tests {
         assert!(!is_userapp_service_type_value(""));
     }
 
+    /// 四值词表归一化：驼峰与全小写变体均命中，未匹配（含 general 旧值）→ None
+    /// （对齐 TS 1.4.5 `normalizedType`——general 兼容已在 TS 6321f7e 删除）。
+    #[test]
+    fn normalize_computer_service_type_matches_full_vocabulary() {
+        use ComputerServiceKind as K;
+        for (raw, expected) in [
+            ("userapp", K::Userapp),
+            ("Userapp", K::Userapp),
+            (" pageApp ", K::PageApp),
+            ("pageapp", K::PageApp),
+            ("PageApp", K::PageApp),
+            ("normalProject", K::NormalProject),
+            ("NormalProject", K::NormalProject),
+            ("normalproject", K::NormalProject),
+            ("taskAgent", K::TaskAgent),
+            ("TASKAGENT", K::TaskAgent),
+        ] {
+            assert_eq!(
+                normalize_computer_service_type(raw),
+                Some(expected),
+                "raw value {raw:?} must normalize to {expected:?}"
+            );
+        }
+        // 未匹配（含 general 旧值、编排层枚举值、空串）→ None（缺省由调用方定）
+        for raw in ["general", "generalAgent", "user-app", "", "  "] {
+            assert_eq!(
+                normalize_computer_service_type(raw),
+                None,
+                "raw value {raw:?} must not match the vocabulary"
+            );
+        }
+    }
+
     /// userApp 分派 header 名族统一小写 `x-` 前缀（HTTP/1.1 大小写不敏感，
     /// HeaderMap 归一小写比较——一处改名另一处漂移即在此报红）。
     #[test]
@@ -96,10 +179,11 @@ mod tests {
         assert_eq!(USER_ID_HEADER, "x-user-id");
     }
 
-    /// 绑定目录 header 名与 TS `resolveServiceContext` 读取的 header 名逐字一致
-    /// （对齐 nuwax-file-server f979df7）——一侧改名另一侧漂移即在此报红。
+    /// 用户维度工作目录 header 名与 TS `resolveServiceContext` 读取的 header 名
+    /// 逐字一致（对齐 nuwax-file-server 1.4.5，00134aa 自 `x-workspace-dir`
+    /// 改名）——一侧改名另一侧漂移即在此报红。
     #[test]
-    fn workspace_dir_header_matches_ts_contract() {
-        assert_eq!(WORKSPACE_DIR_HEADER, "x-workspace-dir");
+    fn workspace_path_header_matches_ts_contract() {
+        assert_eq!(WORKSPACE_PATH_HEADER, "x-workspace-path");
     }
 }

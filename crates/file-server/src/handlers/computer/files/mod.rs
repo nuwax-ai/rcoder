@@ -33,7 +33,7 @@ pub(crate) async fn delete_workspace(
         &state,
         &body.user_id,
         &body.c_id,
-        body.workspace_dir.as_deref(),
+        body.workspace_path.as_deref(),
     )
     .await?;
     // 不存在视为已删除 (对齐 nuwax, 只 warn)
@@ -60,7 +60,7 @@ pub(crate) async fn files_update(
         &body.user_id,
         &body.c_id,
         body.custom_target_dir.as_deref(),
-        body.workspace_dir.as_deref(),
+        body.workspace_path.as_deref(),
     )
     .await?;
     let count = files_update_core(&path, body.files).await?;

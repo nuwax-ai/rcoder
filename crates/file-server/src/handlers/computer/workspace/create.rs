@@ -41,7 +41,7 @@ pub(crate) async fn create_workspace(
 ) -> Result<Json<CreateWorkspaceResponse>, AppError> {
     let mut user_id = None;
     let mut cid = None;
-    let mut workspace_dir = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
+    let mut workspace_path = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
     let mut skill_zip = None;
     let mut file_name = None;
     while let Some(field) = multipart
@@ -52,7 +52,7 @@ pub(crate) async fn create_workspace(
         match field.name().unwrap_or("") {
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
-            "workspaceDir" => workspace_dir = Some(text_field(field).await?),
+            "workspacePath" => workspace_path = Some(text_field(field).await?),
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
                 skill_zip = Some(
@@ -73,7 +73,7 @@ pub(crate) async fn create_workspace(
     }
     // 绑定目录优先于默认定位; create_dir_all 即 TS ensureWorkspaceDir 绑定分支
     // (不存在则递归创建, 对齐 TS f979df7)
-    let ws = ws_path(&state, &user_id, &cid, workspace_dir.as_deref()).await?;
+    let ws = ws_path(&state, &user_id, &cid, workspace_path.as_deref()).await?;
     tokio::fs::create_dir_all(&ws).await?;
     let res = crate::service::computer_ws::create_workspace(
         &ws,
@@ -99,7 +99,7 @@ pub(crate) async fn create_workspace_v2(
 ) -> Result<Json<CreateWorkspaceResponse>, AppError> {
     let mut user_id = None;
     let mut cid = None;
-    let mut workspace_dir = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
+    let mut workspace_path = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
     let mut skill_zip = None;
     let mut file_name = None;
     let mut skill_urls: Vec<String> = Vec::new();
@@ -119,7 +119,7 @@ pub(crate) async fn create_workspace_v2(
         match field.name().unwrap_or("") {
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
-            "workspaceDir" => workspace_dir = Some(text_field(field).await?),
+            "workspacePath" => workspace_path = Some(text_field(field).await?),
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
                 skill_zip = Some(
@@ -196,7 +196,7 @@ pub(crate) async fn create_workspace_v2(
 
     // 绑定目录优先于默认定位; create_dir_all 即 TS ensureWorkspaceDir 绑定分支
     // (不存在则递归创建, 对齐 TS f979df7)
-    let ws = ws_path(&state, &user_id, &cid, workspace_dir.as_deref()).await?;
+    let ws = ws_path(&state, &user_id, &cid, workspace_path.as_deref()).await?;
     tokio::fs::create_dir_all(&ws).await?;
 
     // 有 agentId → 走实体存储 + 软链; 否则走旧路径
@@ -209,7 +209,7 @@ pub(crate) async fn create_workspace_v2(
         // (userapp→开发卷 / 绑定→{COMPUTER_WORKSPACE_DIR}/{userId}), 不随会话绑定目录
         // 漂移; 默认布局 = ws.parent() (Local={root}/{userId}, Subvolume=per-user PVC)。
         let user_root =
-            super::super::agent_store_user_root(&state, &user_id, &ws, workspace_dir.as_deref());
+            super::super::agent_store_user_root(&state, &user_id, &ws, workspace_path.as_deref());
         crate::service::computer_ws::create_workspace_with_agent_store(
             crate::service::computer_ws::CreateAgentStoreParams {
                 user_root: &user_root,

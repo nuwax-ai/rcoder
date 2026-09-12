@@ -42,7 +42,7 @@ async fn push_skills_to_workspace_impl(
 ) -> Result<Json<Value>, AppError> {
     let mut user_id = None;
     let mut cid = None;
-    let mut workspace_dir = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
+    let mut workspace_path = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
     let mut zip_data = None;
     let mut skill_urls: Vec<String> = Vec::new();
     let mut agent_id: Option<String> = None;
@@ -54,7 +54,7 @@ async fn push_skills_to_workspace_impl(
         match field.name().unwrap_or("") {
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
-            "workspaceDir" => workspace_dir = Some(text_field(field).await?),
+            "workspacePath" => workspace_path = Some(text_field(field).await?),
             "file" => {
                 zip_data = Some(
                     file_field(
@@ -83,11 +83,11 @@ async fn push_skills_to_workspace_impl(
     state
         .skill_downloader
         .validate_url_count(skill_urls.len())?;
-    let ws = ws_path(&state, &user_id, &cid, workspace_dir.as_deref()).await?;
+    let ws = ws_path(&state, &user_id, &cid, workspace_path.as_deref()).await?;
     // agent-store 根锚定 (绑定目录场景 store 锚定配置根, 对齐 TS f979df7; 默认
     // None = ws.parent() 派生)
     let store_root =
-        super::super::agent_store_user_root(&state, &user_id, &ws, workspace_dir.as_deref());
+        super::super::agent_store_user_root(&state, &user_id, &ws, workspace_path.as_deref());
     push_skills_impl(
         &state,
         crate::ops::workspace::PushSkillsParams {

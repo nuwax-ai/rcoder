@@ -4,10 +4,10 @@
 //! 与 `resolveServiceContext` 体系无关（TS 侧同款设计：两个 /fs 端点不解析
 //! service，multer 临时目录也不走该体系）。绝对路径校验用宿主语义
 //! `Path::is_absolute`（等价 TS `path.isAbsolute`，两侧恰好同构；区别于
-//! `workspace::normalize_workspace_dir` 的平台无关字符串规则）。
+//! `workspace::normalize_workspace_path` 的平台无关字符串规则）。
 //!
 //! 跨平台：mac/Linux 根为 `/`，Windows 根为盘符列表；返回路径分隔符统一为 `/`
-//! （与 workspaceDir 校验/落库的规范化一致，Windows 侧 fs 均接受正斜杠）。
+//! （与 workspacePath 校验/落库的规范化一致，Windows 侧 fs 均接受正斜杠）。
 
 use crate::error::{AppError, AppResult};
 use crate::models::response::{FsEntry, FsRootEntry};

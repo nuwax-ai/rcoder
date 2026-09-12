@@ -32,7 +32,7 @@ pub(crate) async fn install_project(
         &state,
         &body.user_id,
         &body.c_id,
-        body.workspace_dir.as_deref(),
+        body.workspace_path.as_deref(),
     )
     .await?;
     install_project_impl(&state, ws, &body.programming_language).await
@@ -55,7 +55,7 @@ pub(crate) async fn build_agent_package(
         &state,
         &body.user_id,
         &body.c_id,
-        body.workspace_dir.as_deref(),
+        body.workspace_path.as_deref(),
     )
     .await?;
     if !tokio::fs::try_exists(&ws).await.unwrap_or(false) {
@@ -117,7 +117,7 @@ pub(crate) async fn cleanup_build_artifacts(
         &body.user_id,
         &body.c_id,
         body.custom_target_dir.as_deref(),
-        body.workspace_dir.as_deref(),
+        body.workspace_path.as_deref(),
     )
     .await?;
     if !tokio::fs::try_exists(&ws).await.unwrap_or(false) {

@@ -102,7 +102,7 @@ pub(crate) async fn upload_file(
     let mut cid = None;
     let mut file_path = None;
     let mut custom_target_dir = None;
-    let mut workspace_dir = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
+    let mut workspace_path = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
     let mut data = None;
     while let Some(field) = multipart
         .next_field()
@@ -114,7 +114,7 @@ pub(crate) async fn upload_file(
             "cId" => cid = Some(text_field(field).await?),
             "filePath" => file_path = Some(text_field(field).await?),
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
-            "workspaceDir" => workspace_dir = Some(text_field(field).await?),
+            "workspacePath" => workspace_path = Some(text_field(field).await?),
             "file" => {
                 data = Some(
                     file_field(
@@ -140,7 +140,7 @@ pub(crate) async fn upload_file(
         &v.user_id,
         &v.cid,
         custom_target_dir.as_deref(),
-        workspace_dir.as_deref(),
+        workspace_path.as_deref(),
     )
     .await?;
     upload_file_impl(&ws, &v.file_path, v.data).await
@@ -158,7 +158,7 @@ pub(crate) async fn upload_files(
     let mut user_id = None;
     let mut cid = None;
     let mut custom_target_dir = None;
-    let mut workspace_dir = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
+    let mut workspace_path = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
     let mut file_paths: Vec<String> = Vec::new();
     let mut files_vec = Vec::new();
     while let Some(field) = multipart
@@ -170,7 +170,7 @@ pub(crate) async fn upload_files(
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
-            "workspaceDir" => workspace_dir = Some(text_field(field).await?),
+            "workspacePath" => workspace_path = Some(text_field(field).await?),
             "filePaths" => file_paths.push(text_field(field).await?),
             "files" => {
                 let original = field.file_name().map(|s| s.to_string());
@@ -198,7 +198,7 @@ pub(crate) async fn upload_files(
         &v.user_id,
         &v.cid,
         custom_target_dir.as_deref(),
-        workspace_dir.as_deref(),
+        workspace_path.as_deref(),
     )
     .await?;
     upload_files_impl(&ws, &file_paths, &files_vec).await
@@ -265,10 +265,10 @@ mod tests {
         body
     }
 
-    /// multipart 文本字段 "workspaceDir" 通道: 上传文件落绑定目录 (对齐 TS f979df7,
+    /// multipart 文本字段 "workspacePath" 通道: 上传文件落绑定目录 (对齐 TS f979df7,
     /// 字段名与 TS multer 同名——拼错大小写在此测试报红)。
     #[tokio::test]
-    async fn upload_file_accepts_workspace_dir_multipart_field() {
+    async fn upload_file_accepts_workspace_path_multipart_field() {
         use tower::ServiceExt;
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -289,7 +289,7 @@ mod tests {
                 ("userId", "u"),
                 ("cId", "c"),
                 ("filePath", "nested/uploaded.txt"),
-                ("workspaceDir", &bound.to_string_lossy()),
+                ("workspacePath", &bound.to_string_lossy()),
             ],
             "uploaded.txt",
             b"payload",

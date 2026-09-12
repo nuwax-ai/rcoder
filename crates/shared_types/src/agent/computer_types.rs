@@ -145,8 +145,8 @@ pub struct ComputerChatRequest {
     ///    由容器内创建
     ///
     /// 📋 Java 配套契约：chat 传绝对 agent_work_dir 后，后续 `/api/computer/*`
-    /// 文件族接口（get-logs、execute-command 等）须以 `workspaceDir`
-    /// （body/query 或 `x-workspace-dir` header）传同一绝对路径，`cid` 保持单段
+    /// 文件族接口（get-logs、execute-command 等）须以 `workspacePath`
+    /// （body/query 或 `x-workspace-path` header）传同一绝对路径，`cid` 保持单段
     /// （cid 通道拒 `/`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "/home/user/web/proj_001")]

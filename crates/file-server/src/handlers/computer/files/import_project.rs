@@ -61,7 +61,7 @@ pub(crate) async fn import_project(
     let mut user_id = None;
     let mut cid = None;
     let mut custom_target_dir = None;
-    let mut workspace_dir = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
+    let mut workspace_path = None; // 项目绑定目录 (对齐 TS f979df7, 可选 multipart 字段)
     let mut data = None;
     let mut file_name = None;
     while let Some(field) = multipart
@@ -73,7 +73,7 @@ pub(crate) async fn import_project(
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
-            "workspaceDir" => workspace_dir = Some(text_field(field).await?),
+            "workspacePath" => workspace_path = Some(text_field(field).await?),
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
                 data = Some(
@@ -96,7 +96,7 @@ pub(crate) async fn import_project(
         &v.user_id,
         &v.cid,
         custom_target_dir.as_deref(),
-        workspace_dir.as_deref(),
+        workspace_path.as_deref(),
     )
     .await?;
     let target = import_project_core(target_dir, v.data).await?;

@@ -221,14 +221,14 @@ mod tests {
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 
-    /// computer 域全端点 workspaceDir 契约守卫（对齐 TS f979df7：TS 全部存量
+    /// computer 域全端点 workspacePath 契约守卫（对齐 TS f979df7：TS 全部存量
     /// computer 路由 + 静态路由都接受项目绑定目录）。遍历文档中 `/api/computer`
-    /// 前缀全部 operation：GET 参数面须含 `workspaceDir`、POST requestBody
-    /// schema（JSON / multipart form）须含 `workspaceDir` 属性；`/fs/*` 目录
+    /// 前缀全部 operation：GET 参数面须含 `workspacePath`、POST requestBody
+    /// schema（JSON / multipart form）须含 `workspacePath` 属性；`/fs/*` 目录
     /// 浏览端点例外（TS 侧不带会话上下文）。新增端点漏带字段在此报红——
     /// 文档驱动 = 与路由注册面同源，接线遗漏的最强检测。
     #[test]
-    fn computer_endpoints_accept_workspace_dir() {
+    fn computer_endpoints_accept_workspace_path() {
         let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");
         let schemas = value["components"]["schemas"]
             .as_object()
@@ -255,12 +255,12 @@ mod tests {
                 let Some(op) = op.as_object() else {
                     continue;
                 };
-                let has_workspace_dir = if method == "get" {
+                let has_workspace_path = if method == "get" {
                     op.get("parameters")
                         .and_then(Value::as_array)
                         .is_some_and(|params| {
                             params.iter().any(|p| {
-                                p.get("name").and_then(Value::as_str) == Some("workspaceDir")
+                                p.get("name").and_then(Value::as_str) == Some("workspacePath")
                             })
                         })
                 } else {
@@ -279,14 +279,14 @@ mod tests {
                                 target
                                     .get("properties")
                                     .and_then(Value::as_object)
-                                    .map(|props| props.contains_key("workspaceDir"))
+                                    .map(|props| props.contains_key("workspacePath"))
                             })
                         })
                         .unwrap_or(false)
                 };
-                if !has_workspace_dir {
+                if !has_workspace_path {
                     offenders.push(format!(
-                        "{method} {path}: 契约面缺 workspaceDir (GET 查参数 / POST 查 body schema)"
+                        "{method} {path}: 契约面缺 workspacePath (GET 查参数 / POST 查 body schema)"
                     ));
                 }
                 checked += 1;
@@ -294,7 +294,7 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "computer 端点缺 workspaceDir 契约（对齐 TS f979df7 全路由接受绑定目录）：\n{}",
+            "computer 端点缺 workspacePath 契约（对齐 TS f979df7 全路由接受绑定目录）：\n{}",
             offenders.join("\n")
         );
         assert!(

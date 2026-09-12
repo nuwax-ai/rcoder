@@ -68,11 +68,11 @@ mod tests {
     }
 
     /// computer 契约携带绑定目录守卫（对齐 TS f979df7：全部 computer 路由接受
-    /// workspaceDir）：`models/computer.rs` 与 `models/forms.rs` 中凡含 `pub user_id`
-    /// 字段的结构体必须同时含 `pub workspace_dir` 字段——未来新增 computer 契约
+    /// workspacePath）：`models/computer.rs` 与 `models/forms.rs` 中凡含 `pub user_id`
+    /// 字段的结构体必须同时含 `pub workspace_path` 字段——未来新增 computer 契约
     /// 漏带绑定目录在此报红（按 struct 分块的源码文本扫描，同上守卫范式）。
     #[test]
-    fn computer_contracts_carry_workspace_dir() {
+    fn computer_contracts_carry_workspace_path() {
         for file in ["computer.rs", "forms.rs"] {
             let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("src/models")
@@ -89,8 +89,8 @@ mod tests {
                 let head = chunk.split('{').next().unwrap_or_default().trim();
                 let body = chunk.split_once('{').map(|(_, rest)| rest).unwrap_or("");
                 assert!(
-                    !body.contains("pub user_id") || body.contains("pub workspace_dir"),
-                    "{file}: struct {head} 含 user_id 但缺 workspace_dir 字段 \
+                    !body.contains("pub user_id") || body.contains("pub workspace_path"),
+                    "{file}: struct {head} 含 user_id 但缺 workspace_path 字段 \
                      （TS f979df7 全部 computer 契约须接受绑定目录）"
                 );
             }

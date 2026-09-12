@@ -153,12 +153,12 @@ pub fn resolve_userapp_dev(
     Ok(config.userapp_workspace_dir.join(app_id))
 }
 
-// ── 项目绑定目录 (workspaceDir, 对齐 TS nuwax-file-server f979df7) ───────────────
+// ── 用户维度工作目录 (workspacePath, 对齐 TS nuwax-file-server 1.4.5) ──────────────
 
-/// 校验并归一化项目绑定目录：薄封装 [`shared_types::normalize_absolute_dir`]
+/// 校验并归一化用户维度工作目录：薄封装 [`shared_types::normalize_absolute_dir`]
 /// （规则自本文件提取至 shared_types 单一事实源，行为与 TS
-/// `normalizeWorkspaceDir` + `canonicalizeDir` 同构不变），错误类型转换为
-/// 带 `field: workspaceDir` 的 `AppError`。
+/// `normalizeWorkspacePath` + `canonicalizeDir` 同构不变），错误类型转换为
+/// 带 `field: workspacePath` 的 `AppError`。
 ///
 /// 绝对路径判断是**跨平台字符串规则**（任意宿主平台上 POSIX 与 Windows 两种
 /// 形态都接受，对齐 TS 平台无关校验）；只做格式校验，不限制目录范围
@@ -174,9 +174,9 @@ pub fn resolve_userapp_dev(
 /// 行为同构（TS 校验刻意平台无关），故 shared_types 侧为纯字符串实现。宿主
 /// 语义的 `Path::is_absolute()` 仅用于 `/fs/children`（TS 该处用的正是宿主
 /// 语义 `path.isAbsolute`，两侧恰好同构）。
-pub fn normalize_workspace_dir(raw: &str) -> AppResult<String> {
-    let field = || serde_json::json!({ "field": "workspaceDir" });
-    shared_types::normalize_absolute_dir(raw, "workspaceDir")
+pub fn normalize_workspace_path(raw: &str) -> AppResult<String> {
+    let field = || serde_json::json!({ "field": "workspacePath" });
+    shared_types::normalize_absolute_dir(raw, "workspacePath")
         .map_err(|message| AppError::validation_with(&message, field()))
 }
 
@@ -488,80 +488,80 @@ mod tests {
         assert_eq!(path, PathBuf::from("/app/app-abc123"));
     }
 
-    // ── 项目绑定目录校验 (对齐 TS f979df7 normalizeWorkspaceDir) ─────────────────
+    // ── 用户维度工作目录校验 (对齐 TS 1.4.5 normalizeWorkspacePath) ────────────────
 
     #[test]
-    fn normalize_workspace_dir_accepts_posix_absolute() {
-        assert_eq!(normalize_workspace_dir("/a/b").expect("posix"), "/a/b");
-        assert_eq!(normalize_workspace_dir("  /a/b  ").expect("trim"), "/a/b");
+    fn normalize_workspace_path_accepts_posix_absolute() {
+        assert_eq!(normalize_workspace_path("/a/b").expect("posix"), "/a/b");
+        assert_eq!(normalize_workspace_path("  /a/b  ").expect("trim"), "/a/b");
         // 任何 // 开头的输入 TS 都按 UNC 处理：折叠中间重复分隔符、保留前导 //
         assert_eq!(
-            normalize_workspace_dir("//a//b").expect("unc lead"),
+            normalize_workspace_path("//a//b").expect("unc lead"),
             "//a/b"
         );
-        assert_eq!(normalize_workspace_dir("/").expect("bare root"), "/");
+        assert_eq!(normalize_workspace_path("/").expect("bare root"), "/");
         // 裸 UNC 前导保留（与 TS 逐位一致：折叠成 / 后 unc 补回 //）
-        assert_eq!(normalize_workspace_dir("//").expect("bare unc"), "//");
+        assert_eq!(normalize_workspace_path("//").expect("bare unc"), "//");
     }
 
     #[test]
-    fn normalize_workspace_dir_normalizes_windows_forms() {
+    fn normalize_workspace_path_normalizes_windows_forms() {
         // 平台无关规则：Windows 形态在任意宿主平台上都接受（macOS 上可全量测试）
         assert_eq!(
-            normalize_workspace_dir("c:/x").expect("drive upper"),
+            normalize_workspace_path("c:/x").expect("drive upper"),
             "C:/x"
         );
         assert_eq!(
-            normalize_workspace_dir("C:\\a\\b").expect("backslash"),
+            normalize_workspace_path("C:\\a\\b").expect("backslash"),
             "C:/a/b"
         );
         assert_eq!(
-            normalize_workspace_dir("\\\\srv\\share\\a").expect("unc backslash"),
+            normalize_workspace_path("\\\\srv\\share\\a").expect("unc backslash"),
             "//srv/share/a"
         );
         assert_eq!(
-            normalize_workspace_dir("//srv/share/a").expect("unc slash"),
+            normalize_workspace_path("//srv/share/a").expect("unc slash"),
             "//srv/share/a"
         );
         assert_eq!(
-            normalize_workspace_dir("C:/").expect("minimal drive"),
+            normalize_workspace_path("C:/").expect("minimal drive"),
             "C:/"
         );
     }
 
     #[test]
-    fn normalize_workspace_dir_de_verbatims_windows_extended_length() {
+    fn normalize_workspace_path_de_verbatims_windows_extended_length() {
         // Windows verbatim（\\?\ 扩展长度路径）de-verbatim：剥前缀产出可用路径
         // （Electron 客户端长路径场景）；消费方拿到的归一化值在 Windows fs 可用
         assert_eq!(
-            normalize_workspace_dir(r"\\?\C:\Users\dev\proj").expect("verbatim drive"),
+            normalize_workspace_path(r"\\?\C:\Users\dev\proj").expect("verbatim drive"),
             "C:/Users/dev/proj"
         );
         assert_eq!(
-            normalize_workspace_dir(r"\\?\UNC\server\share\p").expect("verbatim unc"),
+            normalize_workspace_path(r"\\?\UNC\server\share\p").expect("verbatim unc"),
             "//server/share/p"
         );
         // 非法 verbatim / 设备命名空间显式拒绝
-        assert!(normalize_workspace_dir(r"\\?\foo\bar").is_err());
-        assert!(normalize_workspace_dir(r"\\.\PhysicalDrive0").is_err());
+        assert!(normalize_workspace_path(r"\\?\foo\bar").is_err());
+        assert!(normalize_workspace_path(r"\\.\PhysicalDrive0").is_err());
     }
 
     #[test]
-    fn normalize_workspace_dir_rejects_invalid() {
+    fn normalize_workspace_path_rejects_invalid() {
         // 相对路径 / 裸盘符（无斜杠）
-        assert!(normalize_workspace_dir("a/b").is_err());
-        assert!(normalize_workspace_dir("./a").is_err());
-        assert!(normalize_workspace_dir("C:").is_err());
+        assert!(normalize_workspace_path("a/b").is_err());
+        assert!(normalize_workspace_path("./a").is_err());
+        assert!(normalize_workspace_path("C:").is_err());
         // 点段拒绝（fail-fast，不静默归一）
-        assert!(normalize_workspace_dir("/a/./b").is_err());
-        assert!(normalize_workspace_dir("/a/../b").is_err());
-        assert!(normalize_workspace_dir("C:/a/..").is_err());
+        assert!(normalize_workspace_path("/a/./b").is_err());
+        assert!(normalize_workspace_path("/a/../b").is_err());
+        assert!(normalize_workspace_path("C:/a/..").is_err());
         // 超长（trim 后计；512 边界通过、513 拒绝）
-        assert!(normalize_workspace_dir(&format!("/{}", "a".repeat(511))).is_ok());
-        assert!(normalize_workspace_dir(&format!("/{}", "a".repeat(512))).is_err());
+        assert!(normalize_workspace_path(&format!("/{}", "a".repeat(511))).is_ok());
+        assert!(normalize_workspace_path(&format!("/{}", "a".repeat(512))).is_err());
         // 控制字符（\x01 / \x7f / \0）
-        assert!(normalize_workspace_dir("/a\u{1}b").is_err());
-        assert!(normalize_workspace_dir("/a\u{7f}b").is_err());
-        assert!(normalize_workspace_dir("/a\0b").is_err());
+        assert!(normalize_workspace_path("/a\u{1}b").is_err());
+        assert!(normalize_workspace_path("/a\u{7f}b").is_err());
+        assert!(normalize_workspace_path("/a\0b").is_err());
     }
 }

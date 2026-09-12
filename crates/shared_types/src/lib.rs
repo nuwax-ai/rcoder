@@ -34,8 +34,10 @@ pub use userapp::db_align::{
 pub use userapp::dev_cleanup::{BuilderDeletionSnapshot, UserappDevCleanup, UserappDevDeletion};
 pub use userapp::dev_locator::{UserappDevEnsure, UserappDevLocator};
 pub use userapp::forward_contract::{
-    APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, SERVICE_TYPE_HEADER,
-    SERVICE_TYPE_USERAPP, USER_ID_HEADER, WORKSPACE_DIR_HEADER, is_userapp_service_type_value,
+    APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, ComputerServiceKind,
+    SERVICE_TYPE_HEADER, SERVICE_TYPE_NORMAL_PROJECT, SERVICE_TYPE_PAGE_APP,
+    SERVICE_TYPE_TASK_AGENT, SERVICE_TYPE_USERAPP, USER_ID_HEADER, WORKSPACE_PATH_HEADER,
+    is_userapp_service_type_value, normalize_computer_service_type,
 };
 pub use userapp::metadata::{AppMetadataPersistence, AppMetadataRecord};
 
