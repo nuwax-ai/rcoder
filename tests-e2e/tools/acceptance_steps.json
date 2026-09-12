@@ -351,7 +351,10 @@
     "git commit：serviceContext 定位下提交",
     "git status：GET query 通道 serviceContext 命中同一定位",
     "userapp 默认布局在主 pod 不可达 → 404 Workspace does not exist（TS 同构锁）",
-    "负例：serviceContext 激活但缺 userId/cId → 400 + 分支专属文案"
+    "负例：serviceContext 激活但缺 userId/cId → 400 + 分支专属文案",
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "header 通道：git init 拦截转发 → 容器内 serviceContext 落开发卷",
+    "header 通道：git status 同一定位（GET 转发链）"
   ],
   "userapp_dev_new_endpoint_body_query_locate": [
     "A0：空 workspace dev/restart 快速失败 ERR_WORKSPACE_EMPTY",

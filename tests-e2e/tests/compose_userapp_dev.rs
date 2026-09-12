@@ -295,15 +295,16 @@ async fn userapp_dev_files_two_entry_points() {
 }
 
 // ============================================================
-// 场景 1b：git 族 serviceContext（主 pod git 域新分支；无 LLM/开发容器依赖）
+// 场景 1b：git 族 serviceContext（主 pod body 通道 + 容器内 header 通道）
 // - workspacePath 绑定通道全链：generate-file 绑定目录 → git init/add/commit/
 //   status 同一 serviceContext 定位（workspaceType 传 pageApp——回落老规则必
 //   400 缺 projectId，200 即"覆盖语义"成立的证明）
+// - header 通道（X-Service-Type/X-App-Id 拦截转发 → dev 容器内嵌 file-server
+//   git 域 serviceContext 落开发卷；须 agent-runner 镜像含本分支——dev-hot
+//   只更主 pod 会使此段撞容器内旧代码 404）
 // - userapp 默认布局在主 pod 404 "Workspace does not exist"：per-app 卷挂
 //   dev 容器内、主 pod 无可见性（TS 主 pod 进程同构行为锁）
 // - 负例：serviceContext 激活但缺 userId/cId → 分支专属文案
-// 注：header 通道（X-Service-Type 拦截转发）落到 dev 容器内嵌 file-server
-//     （镜像未含本分支），须重建 agent-runner 镜像后补 header 段断言。
 // ============================================================
 #[tokio::test]
 async fn userapp_dev_git_service_context() {
@@ -449,7 +450,60 @@ async fn userapp_dev_git_service_context() {
         format!("HTTP {sn}, {}", trunc(&bn, 120)),
     );
 
+    // ── header 通道：X-Service-Type/X-App-Id 拦截转发 → dev 容器内嵌
+    // file-server 的 git 域 serviceContext 落开发卷（agent-runner 镜像须含
+    // 本分支；dev-hot 只更主 pod 时此段撞容器旧代码 404——环境前置说明）
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+    let resp = env
+        .http
+        .post(format!("{}/api/git/init", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-Service-Type", "userapp")
+        .header("X-App-Id", &app)
+        .json(&json!({"workspaceType": "taskAgent", "userId": user, "cId": "conv-hdr"}))
+        .send()
+        .await
+        .expect("git init via header");
+    let sh = resp.status();
+    let bh: Value = resp.json().await.unwrap_or(Value::Null);
+    let init_ok = sh.is_success()
+        && bh["success"].as_bool() == Some(true)
+        && bh["logId"].as_str() == Some(&format!("computer:{user}:conv-hdr"));
+    report.assert_hard(
+        "header 通道：git init 拦截转发 → 容器内 serviceContext 落开发卷",
+        init_ok,
+        format!("HTTP {sh}, {}", trunc(&bh, 120)),
+    );
+
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/git/status?workspaceType=taskAgent&userId={user}&cId=conv-hdr",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(30))
+        .header("X-Service-Type", "userapp")
+        .header("X-App-Id", &app)
+        .send()
+        .await
+        .expect("git status via header");
+    let sh2 = resp.status();
+    let bh2: Value = resp.json().await.unwrap_or(Value::Null);
+    let status_ok = sh2.is_success()
+        && bh2["success"].as_bool() == Some(true)
+        && bh2["logId"].as_str() == Some(&format!("computer:{user}:conv-hdr"));
+    report.assert_hard(
+        "header 通道：git status 同一定位（GET 转发链）",
+        status_ok,
+        format!("HTTP {sh2}, {}", trunc(&bh2, 120)),
+    );
+
     assert_hard_all(report).await;
+    cleanup_builder(&app);
 }
 
 #[tokio::test]
