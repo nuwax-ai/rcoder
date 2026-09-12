@@ -344,6 +344,15 @@
     "入口 B：/api/computer/generate-file + X-Service-Type/X-App-Id（拦截分流）",
     "缺 X-App-Id → 400"
   ],
+  "userapp_dev_git_service_context": [
+    "前置：generate-file 经 workspacePath 绑定目录造 git 工作区文件",
+    "git init：serviceContext（workspacePath 通道）覆盖 workspaceType 老规则",
+    "git add：serviceContext 定位下暂存文件",
+    "git commit：serviceContext 定位下提交",
+    "git status：GET query 通道 serviceContext 命中同一定位",
+    "userapp 默认布局在主 pod 不可达 → 404 Workspace does not exist（TS 同构锁）",
+    "负例：serviceContext 激活但缺 userId/cId → 400 + 分支专属文案"
+  ],
   "userapp_dev_new_endpoint_body_query_locate": [
     "A0：空 workspace dev/restart 快速失败 ERR_WORKSPACE_EMPTY",
     "A：body-only dev/restart 自定位（零 header，懒创建+任务受理）",

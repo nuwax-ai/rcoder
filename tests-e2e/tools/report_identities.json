@@ -227,6 +227,12 @@
       "backend": "compose"
     }
   ],
+  "userapp_dev_git_service_context": [
+    {
+      "scenario": "userapp_git_ctx",
+      "backend": "compose"
+    }
+  ],
   "userapp_dev_new_endpoint_body_query_locate": [
     {
       "scenario": "userapp_dev_nep",
