@@ -55,7 +55,7 @@ publish = false
 agent-client-protocol = { version = "2" }
 
 # MCP 协议 - rmcp 官方库
-rmcp = { version = "3.1"}
+rmcp = { version = "3.3"}
 # mcp-proxy convert fallback 参数解析与文件重写。
 mcp-proxy-args = { version = "=0.2.3" }
 
@@ -135,7 +135,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 
 # UUID
-uuid = { version = "1.24", features = ["serde", "v4", "v7"] }
+uuid = { version = "1.26", features = ["serde", "v4", "v7"] }
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
@@ -202,7 +202,7 @@ hex = "0.4"
 walkdir = "2.5"
 # 并行目录遍历 (work-stealing 线程池), 用于 file-server search-files。
 # 取代手写 BFS: 零 syscall d_type + 多线程并行, dua-cli (gitoxide 作者 Byron 维护) 的核心库。
-dua-core = "3.1"
+dua-core = "3.3"
 # HTTP client。reqwest 0.13 的 default-tls 本就是 rustls(aws-lc-rs + rustls-platform-verifier 读 OS 根证书)，
 # 并无 openssl/native-tls。这里 default-features=false + 显式 rustls 固化“全 workspace 用 rustls”，
 # 防止未来 reqwest 改默认后悄悄回退；charset/http2/system-proxy 补回原默认特性。
@@ -239,9 +239,9 @@ shellexpand = "3.1"
 winnow = "1.0.4"
 workspace-manifest = { path = "crates/workspace-manifest" }
 shlex = "2.0"
-smallvec = "1.15"
+smallvec = "1.16"
 
-toml = "1.1.4"
+toml = "1.1.6"
 which = "8.0"
 
 
