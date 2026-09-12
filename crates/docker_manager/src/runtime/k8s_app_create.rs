@@ -583,6 +583,135 @@ mod conditional_tests {
     }
 
     #[tokio::test]
+    async fn hot_env_commit_sends_resource_version_and_preserves_conflict() {
+        use container_runtime_api::UserAppDeploymentRuntime;
+        for conflict in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let address = listener.local_addr().expect("address");
+            let target = std::collections::HashMap::from([
+                (
+                    "APP_DEPLOY_OPERATION_ID".to_owned(),
+                    "operation-b".to_owned(),
+                ),
+                (
+                    "APP_DEPLOY_GENERATION_ID".to_owned(),
+                    "generation".to_owned(),
+                ),
+            ]);
+            let desired = target.clone();
+            let server = tokio::spawn(async move {
+                for step in 0..if conflict { 3 } else { 5 } {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    let (head, offset, length) = loop {
+                        let n = stream.read(&mut buffer).await.expect("read");
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(offset) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&bytes[..offset]).into_owned();
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|n| n.trim().parse::<usize>().expect("length"))
+                                })
+                                .unwrap_or(0);
+                            break (head, offset + 4, length);
+                        }
+                    };
+                    while bytes.len() < offset + length {
+                        let n = stream.read(&mut buffer).await.expect("body");
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                    }
+                    let (status, reply) = match step {
+                        0 | 3 => {
+                            assert!(
+                                head.starts_with("GET ") && head.contains("/deployments/"),
+                                "{head}"
+                            );
+                            (
+                                200,
+                                serde_json::json!({"apiVersion":"apps/v1","kind":"Deployment",
+                                "metadata":{"name":"rcoder-app-hot","uid":"deployment-owned","resourceVersion":"10"},
+                                "spec":{"selector":{"matchLabels":{"app":"hot"}},"template":{"spec":{"containers":[
+                                    {"name":"app","envFrom":[{"configMapRef":{"name":"hot-env"}}]}
+                                ]}}}}),
+                            )
+                        }
+                        1 | 4 => {
+                            assert!(
+                                head.starts_with("GET ") && head.contains("/configmaps/hot-env"),
+                                "{head}"
+                            );
+                            (
+                                200,
+                                serde_json::json!({"apiVersion":"v1","kind":"ConfigMap",
+                                "metadata":{"name":"hot-env","resourceVersion":if step == 1 {"42"} else {"43"}},
+                                "data": if step == 1 {serde_json::json!({"OLD_IDENTITY":"stale"})} else {serde_json::json!(desired)}}),
+                            )
+                        }
+                        2 => {
+                            assert!(
+                                head.starts_with("PATCH ") && head.contains("/configmaps/hot-env"),
+                                "{head}"
+                            );
+                            let body: serde_json::Value =
+                                serde_json::from_slice(&bytes[offset..offset + length])
+                                    .expect("patch JSON");
+                            assert_eq!(body["metadata"]["resourceVersion"], "42");
+                            let mut expected = serde_json::json!(desired);
+                            expected["OLD_IDENTITY"] = serde_json::Value::Null;
+                            assert_eq!(body["data"], expected);
+                            if conflict {
+                                (
+                                    409,
+                                    serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Conflict","message":"stale writer","code":409}),
+                                )
+                            } else {
+                                (
+                                    200,
+                                    serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"hot-env","resourceVersion":"43"},"data":desired}),
+                                )
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    let body = serde_json::to_vec(&reply).expect("reply");
+                    stream.write_all(format!("HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.expect("headers");
+                    stream.write_all(&body).await.expect("reply");
+                }
+            });
+            drop(rustls::crypto::ring::default_provider().install_default());
+            let config = kube::Config::new(format!("http://{address}").parse().expect("URI"));
+            let runtime = runtime(kube::Client::try_from(config).expect("client"));
+            let snapshot = shared_types::AppEnvSnapshot {
+                deployment_uid: Some("deployment-owned".into()),
+                deployment_version: Some("10".into()),
+                resource_name: Some("hot-env".into()),
+                resource_version: Some("42".into()),
+                env: std::collections::HashMap::from([("OLD_IDENTITY".into(), "stale".into())]),
+            };
+            let result = runtime
+                .update_env_configmap_if_version("hot", &target, &snapshot)
+                .await;
+            if conflict {
+                assert!(
+                    matches!(result, Err(ContainerRuntimeError::Conflict(_))),
+                    "{result:?}"
+                );
+            } else {
+                result.expect("committed and read back");
+            }
+            server.await.expect("contract assertions");
+        }
+    }
+
+    #[tokio::test]
     async fn agent_lookup_preserves_api_failure_instead_of_not_found() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

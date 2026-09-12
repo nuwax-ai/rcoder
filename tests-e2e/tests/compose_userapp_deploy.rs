@@ -661,6 +661,141 @@ async fn deploy_and_verify_traffic(
     pending.is_empty()
 }
 
+/// 轻量部署不传请求 release_id；请求身份与 manifest 身份不同源也必须完成。
+/// 正确性与性能分别断言，禁止用耗时或生成 ID 前缀代替操作完成证明。
+async fn verify_url_lightweight_deploy_without_release_id(
+    env: &Env,
+    report: &JsonlReporter,
+    app: &str,
+    user: &str,
+    release_id: &str,
+    sha256: &str,
+) {
+    let artifact_url = format!(
+        "{}/api/v1/userapp/static/{app}?release_id={release_id}&user_id={user}",
+        rcoder_internal()
+    );
+    let t0 = Instant::now();
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/{app}/start", env.rcoder))
+        .timeout(Duration::from_secs(100))
+        .json(&json!({"user_id": user, "url": artifact_url, "sha256": sha256}))
+        .send()
+        .await;
+    let mut request_release_id = None;
+    let (ok, detail) = match resp {
+        Ok(r) => {
+            let status = r.status();
+            let body: Value = r.json().await.unwrap_or(Value::Null);
+            request_release_id = body["data"]["release_id"].as_str().map(str::to_owned);
+            (
+                status.is_success()
+                    && http_ok(&body)
+                    && body["data"]["release_id"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty() && id != release_id),
+                format!(
+                    "HTTP {status}, {:.1}s, {}",
+                    t0.elapsed().as_secs_f64(),
+                    trunc(&body, 160)
+                ),
+            )
+        }
+        Err(e) => (
+            false,
+            format!(
+                "request error after {:.1}s: {e}",
+                t0.elapsed().as_secs_f64()
+            ),
+        ),
+    };
+    let fast = t0.elapsed() < Duration::from_secs(90);
+    report.assert_hard("deploy.lightweight.generated-request-identity", ok, detail);
+    report.assert_hard(
+        "deploy.lightweight.confirmation-under-90s",
+        fast,
+        format!("confirmation took {:.1}s", t0.elapsed().as_secs_f64()),
+    );
+    if !ok {
+        return;
+    }
+    let container = format!("rcoder-app-{app}");
+    let inspect = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{json .Config.Env}}", &container])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<Vec<String>>(&output.stdout).ok());
+    let env_value = |key: &str| {
+        inspect.as_ref().and_then(|values| {
+            values.iter().find_map(|value| {
+                value
+                    .split_once('=')
+                    .filter(|(name, _)| *name == key)
+                    .map(|(_, value)| value)
+            })
+        })
+    };
+    let expected_operation = env_value("APP_DEPLOY_OPERATION_ID");
+    let expected_generation = env_value("APP_DEPLOY_GENERATION_ID");
+    let status = std::process::Command::new("docker")
+        .args([
+            "exec",
+            &container,
+            "wget",
+            "-T",
+            "5",
+            "-qO-",
+            "http://127.0.0.1:3010/v1/deploy/status",
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<Value>(&output.stdout).ok());
+    let operation = status.as_ref().map(|body| &body["data"]["operation"]);
+    let identity_matches = expected_operation.is_some_and(|id| !id.is_empty())
+        && expected_generation.is_some_and(|id| !id.is_empty())
+        && operation.is_some_and(|operation| {
+            operation["operation_id"].as_str() == expected_operation
+                && operation["deployment_generation_id"].as_str() == expected_generation
+                && operation["request_release_id"].as_str() == request_release_id.as_deref()
+                && operation["artifact_release_id"].as_str() == Some(release_id)
+                && operation["deploy_stage"] == "succeeded"
+                && operation["persisted"] == true
+        });
+    report.assert_hard(
+        "deploy.lightweight.exact-operation-and-artifact",
+        identity_matches,
+        format!("expected operation={expected_operation:?}, generation={expected_generation:?}, status={status:?}"),
+    );
+    // 流量复核：换 pod 后探 /react/（完整七路已由冷部署场景锁过）
+    let pingora = pingora_base();
+    let base = format!("{pingora}/api/v1/userapp/proxy/app/prod/{user}/{app}");
+    let t1 = Instant::now();
+    let mut traffic_ok = false;
+    while t1.elapsed() < ready_budget() {
+        let probe = env
+            .http
+            .get(format!("{base}/react/"))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if probe {
+            traffic_ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    report.assert_hard(
+        "轻量重部署后流量恢复（/react/）",
+        traffic_ok,
+        format!("{:.0}s 内未恢复", t1.elapsed().as_secs_f64()),
+    );
+}
+
 /// 部署后 prod 观测族验收（health / logs 三接口 / stats / events）——运行态
 /// 主链此前 e2e 零覆盖（logs 三接口转发 app-cli :3010 曾有断链史，audit 批修复）。
 async fn verify_prod_observability(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
@@ -782,8 +917,15 @@ async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str
         format!("HTTP {s}, body 截断: {}", trunc(&b, 120)),
     );
 
-    // create-database + 409 重复
-    let dbname = format!("e2e_db_{}", &app[app.len().saturating_sub(8)..]);
+    // create-database + 409 重复（后缀非 [a-zA-Z0-9_] 字符归一为 '_'——app id 尾段
+    // 含 '-' 时会撞 PG 标识符白名单 ERR_VALIDATION，属测试数据竞态非产品问题）
+    let dbname = format!(
+        "e2e_db_{}",
+        app[app.len().saturating_sub(8)..]
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    );
     let (s, b) = post_json(
         env,
         "/api/v1/userapp/db/prod/create-database",
@@ -1369,12 +1511,24 @@ async fn userapp_deploy_full_chain() {
         verify_app_files_prod(&env, &report, &app, user).await;
         verify_failed_image_update_preserves_runtime(&env, &report, &app, user).await;
         verify_hot_redeploy(&env, &report, &app, user, &release_id, &sha256).await;
+        // 轻量部署（无 release_id，独立操作身份确认）——须在 db prod 改密前（同为
+        // 重新编排链，复用热部署的凭据时序约束）
+        verify_url_lightweight_deploy_without_release_id(
+            &env,
+            &report,
+            &app,
+            user,
+            &release_id,
+            &sha256,
+        )
+        .await;
         verify_db_prod(&env, &report, &app, user).await;
         verify_stop_and_wake(&env, &report, &app, user).await;
         cleanup_prod(&env, &report, &app, user).await;
-    } else {
-        cleanup_prod(&env, &report, &app, user).await;
     }
+    // No production request was sent when build/artifact preparation failed.
+    // Keep the original failure and clean the builder; do not invent a missing
+    // production resource or execute deletion against an uncreated deployment.
     cleanup_builder(&app);
 
     let path = report.path.display().to_string();

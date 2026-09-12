@@ -4,10 +4,13 @@ from pathlib import Path
 
 FAULTS = ('missing-url', 'truncated', 'sha', 'zip', 'manifest', 'idle', 'link-escape', 'link-cycle')
 HOT = {
-    'A accepted', 'A identity', 'A serves content',
+    'Docker contract process completed',
+    'cold A operation configured', 'A identity', 'A serves content',
     'broken B accepted', 'broken B operation failed',
-    'old code and orchestration restored', 'migration reversal never claimed',
-    'recovery does not rerun old migrations', 'slow B accepted',
+    'switched failure does not restore old readiness', 'migration reversal never claimed',
+    'failed switch does not rerun old migrations', 'manual redeploy accepted', 'manual redeploy restores A',
+    'restart retains B operation identity', 'restart retains B content despite cold A env',
+    'restart preserves container identity', 'slow B accepted',
     'concurrent deployment rejected', 'A serves during prepare',
     'former capacity and entry settings do not reject B', 'B identity', 'B serves content', 'container unchanged', 'owned resource cleanup',
 } | {name + suffix for name in FAULTS for suffix in (' accepted', ' fails correct operation', ' old content healthy', ' no temporary residue')}
@@ -48,7 +51,7 @@ HOT.update({
 })
 HOT.update({
     'static old port released', 'static failure accepted',
-    'static failed deployment restores serving configuration',
+    'static failed deployment stays failed',
     'static failed generation port released', 'static removal accepted',
     'static removal serves replacement', 'removed static listener closed',
 })

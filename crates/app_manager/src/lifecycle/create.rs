@@ -49,6 +49,21 @@ impl AppService {
         request: CreateAppRequest,
         _process_lock: crate::service::AppOperationGuard,
     ) -> AppResult<AppInfo> {
+        let result = self
+            .create_app_with_guard(app_id, request, &_process_lock)
+            .await;
+        if result.is_ok() || !_process_lock.has_unfinished_mutation() {
+            _process_lock.finish().await?;
+        }
+        result
+    }
+
+    pub(crate) async fn create_app_with_guard(
+        &self,
+        app_id: &str,
+        request: CreateAppRequest,
+        _process_lock: &crate::service::AppOperationGuard,
+    ) -> AppResult<AppInfo> {
         // 默认镜像单一收口（见函数 doc）：填充后 params/AppInfo 全链路恒 Some
         let mut request = request;
         if request
@@ -68,7 +83,7 @@ impl AppService {
         let params = match self.build_container_params(app_id, &request).await {
             Ok(params) => params,
             Err(error) => {
-                _process_lock.finish().await?;
+                _process_lock.mark_completed();
                 return Err(error);
             }
         };
@@ -98,7 +113,6 @@ impl AppService {
             )
             .await;
         let info = self.assemble_app_info(app_id.to_string(), request).await;
-        _process_lock.finish().await?;
         Ok(info)
     }
 

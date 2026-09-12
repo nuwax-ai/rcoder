@@ -10,6 +10,15 @@ use docker_manager::runtime_selection::RuntimeType;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Packaging probes must execute the binary without bootstrapping services or storage.
+    if std::env::args_os()
+        .skip(1)
+        .eq([std::ffi::OsString::from("--version")])
+    {
+        println!("rcoder {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Feature 开关: 启动读一次 env + eprintln 打印状态 (console, tracing 未就绪也可见)
     shared_types::FeatureFlags::init();
 

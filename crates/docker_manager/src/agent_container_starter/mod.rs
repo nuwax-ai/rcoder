@@ -75,6 +75,23 @@ impl<'a> AgentContainerStarter<'a> {
         self.start_prepared(params, prepared).await
     }
 
+    async fn clear_previous_container_for_rebuild(&self, project_id: &str) -> DockerResult<()> {
+        let Some(existing) = self.manager.get_container_info(project_id).await else {
+            return Ok(());
+        };
+        let physical_id = &existing.container_id;
+        if self
+            .manager
+            .find_container_authoritative(physical_id)
+            .await?
+            .is_some()
+        {
+            // Explicit rebuild retains force-delete semantics, unlike create's reuse path.
+            self.manager.stop_container_by_id(physical_id).await?;
+        }
+        self.manager.retire_container_cache(physical_id).await
+    }
+
     pub(crate) async fn start_prepared(
         &self,
         params: ContainerCreateParams,
@@ -110,42 +127,10 @@ impl<'a> AgentContainerStarter<'a> {
         // 挂载目录预创建由 apply_auto_mounts 统一处理（绑定挂载机制：rcoder 容器内
         // 创建目录会自动同步宿主机，bind 源即刻可见）。
 
-        // 2. 清理旧容器（如果提供了 project_id）
-        if let Some(ref id) = project_id
-            && let Some(existing) = self.manager.get_container_info(id).await
-        {
-            // 实时确认再删：内存缓存命中 ≠ 容器存在（脏值误调 rm）；容器真实
-            // 存在才删（running=重建替换、stopped=尸体清理），查询失败保守跳过
-            // ——创建链的 try_reuse_existing_container 会按实时状态兜底
-            // （复用/删除），清理动作永远建立在确证之上。
-            match self
-                .manager
-                .find_container_realtime(&existing.container_name)
-                .await
-            {
-                Ok(Some(rc)) => {
-                    warn!(
-                        "Removing existing container {} (state={}) for rebuild...",
-                        existing.container_name,
-                        if rc.is_running { "running" } else { "stopped" }
-                    );
-                    self.manager.stop_container(id).await?;
-                }
-                Ok(None) => {
-                    // 容器已不存在：仅清缓存记录（stop 幂等——rm 对 404 跳过）
-                    debug!(
-                        "Existing container {} no longer exists (stale cache), clearing entry",
-                        existing.container_name
-                    );
-                    self.manager.stop_container(id).await?;
-                }
-                Err(e) => {
-                    warn!(
-                        "Verify existing container {} failed, skip cleanup (create path will reconcile): {e}",
-                        existing.container_name
-                    );
-                }
-            }
+        // Preserve the existing rebuild behavior, but capture its physical target once.
+        if project_id.is_some() {
+            self.clear_previous_container_for_rebuild(&container_id)
+                .await?;
         }
 
         use crate::container_builder::ContainerConfigBuilder;
@@ -428,6 +413,191 @@ mod preflight_tests {
     use super::*;
     use container_runtime_api::{AgentContainerRuntime, ContainerRuntimeError};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn prepared_rebuild_uses_canonical_pod_key_and_preserves_project_container() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (actor, containers) = crate::container_state_actor::ContainerStateActor::new();
+        tokio::spawn(actor.run());
+        let family = ServiceType::UserappBuilder;
+        let mut config = crate::DockerManagerConfig::default();
+        config.multi_image_config.services.insert(
+            family.to_string(),
+            serde_json::from_value(serde_json::json!({
+                "service_type": family, "enabled":true, "image":"canonical-test-image"
+            }))
+            .unwrap(),
+        );
+        let manager = DockerManager {
+            docker: bollard::Docker::connect_with_http(
+                &format!("http://{address}"),
+                1,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .unwrap(),
+            config,
+            containers,
+            main_network_name: Arc::new(tokio::sync::RwLock::new("test".into())),
+            api_cache: Arc::new(crate::api_cache::DockerApiCache::new(600, 600, 100)),
+        };
+        for (key, physical_id) in [
+            ("project-one", "project-physical"),
+            ("pod-one", "pod-physical"),
+        ] {
+            manager
+                .containers
+                .insert(
+                    key.into(),
+                    crate::DockerContainerInfo::new(
+                        physical_id.into(),
+                        format!("builder-{key}"),
+                        key.into(),
+                        "image".into(),
+                    ),
+                )
+                .await;
+            manager
+                .api_cache
+                .insert_network(physical_id.into(), Some(Arc::new(Default::default())))
+                .await;
+        }
+        let server = tokio::spawn(async move {
+            for phase in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                let count = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                assert!(
+                    request.contains("/containers/pod-physical"),
+                    "rebuild must use preflight's canonical pod identity: {request}"
+                );
+                let (status, body) = if phase == 2 {
+                    assert!(request.starts_with("DELETE "));
+                    // Stop the real start_prepared chain at the selected mutation,
+                    // before mounts, image downloads, or container creation.
+                    (500, r#"{"message":"injected deletion failure"}"#)
+                } else {
+                    (
+                        200,
+                        r#"{"Id":"pod-physical","Name":"/builder-pod-one","State":{"Status":"running"}}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let params = ContainerCreateParams::builder()
+            .project_id("project-one".to_string())
+            .pod_id("pod-one")
+            .service_type(family)
+            .build();
+        let starter = AgentContainerStarter::new(&manager);
+        let prepared = starter.preflight(&params).await.unwrap();
+        assert_eq!(prepared.container_id, "pod-one");
+        let result = starter.start_prepared(params, prepared).await;
+        server.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(DockerError::BollardError(
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 500,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(
+            manager
+                .containers
+                .get("project-one")
+                .await
+                .unwrap()
+                .container_id,
+            "project-physical"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_keeps_replacement_registered_after_identity_capture() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (actor, containers) = crate::container_state_actor::ContainerStateActor::new();
+        tokio::spawn(actor.run());
+        let manager = Arc::new(DockerManager {
+            docker: bollard::Docker::connect_with_http(
+                &format!("http://{address}"),
+                1,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .unwrap(),
+            config: crate::DockerManagerConfig::default(),
+            containers,
+            main_network_name: Arc::new(tokio::sync::RwLock::new("test".into())),
+            api_cache: Arc::new(crate::api_cache::DockerApiCache::new(600, 600, 100)),
+        });
+        let old = crate::DockerContainerInfo::new(
+            "old-id".into(),
+            "builder".into(),
+            "one".into(),
+            "image".into(),
+        );
+        manager.containers.insert("one".into(), old.clone()).await;
+        // Avoid an unrelated network request so the barrier targets the identity inspect.
+        manager
+            .api_cache
+            .insert_network("old-id".into(), Some(Arc::new(Default::default())))
+            .await;
+        let writer = manager.clone();
+        let server = tokio::spawn(async move {
+            for phase in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                let count = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                assert!(
+                    request.contains("/containers/old-id"),
+                    "must not retarget deletion using a mutable project key: {request}"
+                );
+                if phase == 0 {
+                    let mut replacement = old.clone();
+                    replacement.container_id = "new-id".into();
+                    writer.containers.insert("one".into(), replacement).await;
+                }
+                let (status, body) = if phase == 2 {
+                    assert!(request.starts_with("DELETE "));
+                    assert!(
+                        request.contains("force=true"),
+                        "preserve explicit rebuild semantics"
+                    );
+                    (204, "")
+                } else {
+                    (
+                        200,
+                        r#"{"Id":"old-id","Name":"/builder","State":{"Status":"running"}}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        AgentContainerStarter::new(&manager)
+            .clear_previous_container_for_rebuild("one")
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            manager.containers.get("one").await.unwrap().container_id,
+            "new-id"
+        );
+    }
 
     #[tokio::test]
     async fn missing_builder_configuration_fails_before_operation_lease_or_docker_api() {

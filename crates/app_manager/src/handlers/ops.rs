@@ -49,10 +49,13 @@ pub async fn start_app(
         request.url.is_some(),
         request.user_id
     );
-    let result = state
-        .app_service
-        .start_app_enhanced(&app_id, request)
-        .await?;
+    // The accepted coordinator owns its lease even when the HTTP client disconnects.
+    let service = state.app_service.clone();
+    let result = await_deployment_response(
+        tokio::spawn(async move { service.start_app_enhanced(&app_id, request).await }),
+        std::time::Duration::from_secs(300),
+    )
+    .await?;
     Ok(Json(HttpResult::success(result)))
 }
 
@@ -127,10 +130,13 @@ pub async fn restart_app(
         app_id,
         request.url.is_some()
     );
-    let result = state
-        .app_service
-        .restart_app_enhanced(&app_id, request)
-        .await?;
+    // The accepted coordinator owns its lease even when the HTTP client disconnects.
+    let service = state.app_service.clone();
+    let result = await_deployment_response(
+        tokio::spawn(async move { service.restart_app_enhanced(&app_id, request).await }),
+        std::time::Duration::from_secs(300),
+    )
+    .await?;
     Ok(Json(HttpResult::success(result)))
 }
 
@@ -185,4 +191,41 @@ pub async fn set_recycle_policy(
         .set_recycle_policy(&app_id, request)
         .await?;
     Ok(Json(HttpResult::success(runtime)))
+}
+
+/// Dropping the JoinHandle on timeout detaches the owned coordinator; it does not
+/// cancel a remote mutation or release its application lease prematurely.
+async fn await_deployment_response<T>(
+    task: tokio::task::JoinHandle<crate::error::AppResult<T>>,
+    budget: std::time::Duration,
+) -> Result<T, AppError> {
+    tokio::time::timeout(budget, task).await
+        .map_err(|_| AppError::internal_server_error("deployment confirmation timed out; reconciliation continues; inspect deployment status before retrying"))?
+        .map_err(|error| AppError::internal_server_error(&format!("deployment coordinator failed: {error}")))?
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod deployment_response_tests {
+    use super::*;
+    #[tokio::test]
+    async fn response_timeout_does_not_cancel_owned_coordinator() {
+        let (release, proceed) = tokio::sync::oneshot::channel();
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            proceed.await.unwrap();
+            completed.send(()).unwrap();
+            Ok(())
+        });
+        assert!(
+            await_deployment_response(task, std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), completion)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }

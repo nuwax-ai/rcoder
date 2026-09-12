@@ -37,6 +37,23 @@ impl AppService {
         user_id: Option<String>,
         process_lock: crate::service::AppOperationGuard,
     ) -> Result<(), AppOperationError> {
+        let result = self
+            .ensure_app_runtime_with_guard(rcoder_app_id, name, deploy_env, user_id, &process_lock)
+            .await;
+        if result.is_ok() || !process_lock.has_unfinished_mutation() {
+            process_lock.finish().await?;
+        }
+        result
+    }
+
+    pub(crate) async fn ensure_app_runtime_with_guard(
+        &self,
+        rcoder_app_id: &str,
+        name: &str,
+        deploy_env: Option<std::collections::HashMap<String, String>>,
+        user_id: Option<String>,
+        process_lock: &crate::service::AppOperationGuard,
+    ) -> Result<(), AppOperationError> {
         match self.get_app(rcoder_app_id).await {
             Ok(_) => {
                 // app 已存在：image/ports/probes 首次设定后恒定，不自动 reconcile(#14)。
@@ -47,7 +64,6 @@ impl AppService {
                     "[APP] app already exists; image/ports/probes are constant after first create \
                      and will NOT be reconciled to the desired image"
                 );
-                process_lock.finish().await?;
                 return Ok(());
             }
             Err(AppOperationError::NotFound(_)) => {} // 不存在 → create
@@ -63,6 +79,8 @@ impl AppService {
         // 不适用于此处：update 通道走 build_container_params_from_update 的 live
         // 回退，token 自然保留）。app-cli server 侧 /v1/deploy 鉴权消费。
         let mut env = deploy_env.unwrap_or_default();
+        env.entry(shared_types::APP_DEPLOY_GENERATION_ID.into())
+            .or_insert_with(|| uuid::Uuid::new_v4().simple().to_string());
         env.entry("APP_CLI_DEPLOY_TOKEN".to_string())
             .or_insert_with(|| uuid::Uuid::new_v4().simple().to_string());
         let request = CreateAppRequest {
@@ -98,7 +116,7 @@ impl AppService {
             recycle_enabled: None,
             idle_timeout_seconds: None,
         };
-        self.create_app_locked(rcoder_app_id, request, process_lock)
+        self.create_app_with_guard(rcoder_app_id, request, process_lock)
             .await
             .map(|_| ())
     }

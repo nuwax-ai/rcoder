@@ -29,17 +29,7 @@ impl AppService {
         app_id: &str,
         request: StartAppRequest,
     ) -> AppResult<StartAppResult> {
-        // user_id 必填（白名单；空串/非法字符 400）——owner 分区与 metadata 注册的
-        // 唯一来源，DTO 层缺字段已由反序列化 422 拦截，此处覆盖空串/格式。
-        request.validate().map_err(|e| {
-            let msg = e
-                .iter()
-                .map(|(p, err)| format!("{p}: {}", err.message()))
-                .collect::<Vec<_>>()
-                .join("; ");
-            AppOperationError::Validation(msg)
-        })?;
-        validate_app_id(app_id)?;
+        validate_start_request(app_id, &request)?;
         let request = self.validate_hot_env(app_id, request).await?;
 
         let (release_id, sql_report) = if let Some(url) = request
@@ -102,7 +92,7 @@ impl AppService {
         app_id: &str,
         request: StartAppRequest,
     ) -> AppResult<StartAppResult> {
-        validate_app_id(app_id)?;
+        validate_start_request(app_id, &request)?;
         let request = self.validate_hot_env(app_id, request).await?;
         // 带 url 时 activate 自带 stop+切流，无需先 stop；仅传统 restart 走 stop+start
         if request.url.is_none() {
@@ -191,14 +181,7 @@ impl AppService {
         };
         validate_release_id_fs_safe(&release_id)?;
 
-        // 空 sha256 = 跳过校验（信任内网源；app-cli 侧同语义），仍参与 env 传递
-        let sha256 = request
-            .sha256
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("")
-            .to_string();
+        let sha256 = normalize_deploy_sha(request.sha256.as_deref())?;
 
         info!(
             "[APP] start-deploy: app_id={app_id}, release_id={release_id}, url={url}, sha256_given={}, mode={:?}",
@@ -210,11 +193,19 @@ impl AppService {
         //    PG/ttyd/dbx 不断连）；前置不满足自动落回下方换 Pod 权威链
         if request.deploy_mode == Some(DeployMode::Hot)
             && let Some(()) = self
-                .try_deploy_via_container_api(app_id, url, &release_id, &sha256)
+                .try_deploy_via_container_api(
+                    app_id,
+                    url,
+                    &release_id,
+                    &sha256,
+                    request.env.as_ref(),
+                )
                 .await?
         {
             return Ok((Some(release_id), None));
         }
+
+        let operation = self.try_acquire_process_release_lock(app_id).await?;
 
         // The runtime provisions storage under the application operation lease.
         // Preparing it here would race with a concurrent purge before acquiring that lease.
@@ -250,6 +241,15 @@ impl AppService {
         env.insert("APP_DEPLOY_URL".to_string(), url.to_string());
         env.insert("APP_RELEASE_ID".to_string(), release_id.clone());
         env.insert("APP_DEPLOY_SHA256".to_string(), sha256);
+        let operation_id = uuid::Uuid::new_v4().simple().to_string();
+        env.insert(
+            shared_types::APP_DEPLOY_OPERATION_ID.into(),
+            operation_id.clone(),
+        );
+        env.insert(
+            shared_types::APP_DEPLOY_GENERATION_ID.into(),
+            operation_id.clone(),
+        );
 
         // 3. ensure/re-apply 运行容器：env 变更 → config-hash → Recreate rollout
         //    → 新 Pod 启动时 app-cli 部署段生效
@@ -263,7 +263,7 @@ impl AppService {
                 // 已存在 → update 通道（env 显式整段替换，其余字段 live 回退）。
                 // 镜像缺省 = 当前平台默认（RCODER_RUNTIME_IMAGE_DIGEST）——重新部署
                 // 顺带收敛运行时镜像到最新配置（对齐"大升级全量更新"运维语义）。
-                // 乐观锁跳过：部署是权威写，last-write-wins。
+                // The retained operation lease and runtime resourceVersion fence serialize the commit.
                 let update = UpdateAppRequest {
                     user_id: request.user_id.clone(),
                     name: None,
@@ -277,13 +277,19 @@ impl AppService {
                     recycle_enabled: None,
                     idle_timeout_seconds: None,
                 };
-                self.update_app(app_id, update).await?;
+                self.update_app_with_guard(app_id, update, &operation)
+                    .await?;
             }
             Err(AppOperationError::NotFound(_)) => {
                 // 首次部署 → ensure 创建（镜像/端口/探针平台内定，env 携带部署三元组）
-                let lock = self.acquire_process_release_lock(app_id).await?;
-                self.ensure_app_runtime(app_id, app_id, Some(env), Some(explicit_user_id), lock)
-                    .await?;
+                self.ensure_app_runtime_with_guard(
+                    app_id,
+                    app_id,
+                    Some(env),
+                    Some(explicit_user_id),
+                    &operation,
+                )
+                .await?;
             }
             Err(e) => return Err(e),
         }
@@ -292,7 +298,8 @@ impl AppService {
         //    启动）——不等用户服务启动/bridge 探活（服务起不起是用户代码域，
         //    readiness 探针照常摘流；返回成功 ≠ 立即接流量）。容器侧部署失败
         //    （下载 404/sha256 不匹配/解压损坏）在此同步上报并透传 error 文本。
-        self.wait_deploy_stage(app_id, &release_id).await?;
+        self.wait_deploy_stage(app_id, &operation_id, &operation)
+            .await?;
 
         // 5. 包内 database SQL 自动执行（缺省开；单文件失败仅收集进 report 不阻断）
         let mut sql_report: Option<DatabaseSqlReport> = None;
@@ -317,6 +324,7 @@ impl AppService {
                 }
             }
         }
+        operation.finish().await?;
         Ok((Some(release_id), sql_report))
     }
 
@@ -355,11 +363,24 @@ impl AppService {
     async fn validate_hot_env(
         &self,
         app_id: &str,
-        mut request: StartAppRequest,
+        request: StartAppRequest,
     ) -> AppResult<StartAppRequest> {
         if request.deploy_mode == Some(DeployMode::Hot)
             && let Some(env) = &request.env
         {
+            if self
+                .runtime
+                .get_deployment_status(app_id)
+                .await
+                .map_err(|error| {
+                    AppOperationError::Backend(format!(
+                        "read deployment before hot env validation: {error}"
+                    ))
+                })?
+                .is_none()
+            {
+                return Ok(request);
+            }
             let live = self
                 .runtime
                 .get_app_container_spec(app_id)
@@ -376,7 +397,7 @@ impl AppService {
                     "hot deployment cannot change business env; use pod mode".into(),
                 ));
             }
-            request.env = None;
+            // Retain the requested env for the authoritative check under the hot lease.
         }
         Ok(request)
     }
@@ -449,7 +470,45 @@ impl AppService {
     }
 }
 
-/// 自动生成 release_id（`rel-{yyMMddHHmmss}-{8 位随机}`；调用方未传标记时用）。
+/// Validate both public entrypoints before stop, metadata writes or lease acquisition.
+fn validate_start_request(app_id: &str, request: &StartAppRequest) -> AppResult<()> {
+    request.validate().map_err(|errors| {
+        AppOperationError::Validation(
+            errors
+                .iter()
+                .map(|(path, error)| format!("{path}: {}", error.message()))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    })?;
+    validate_app_id(app_id)?;
+    normalize_deploy_sha(request.sha256.as_deref())?;
+    if let Some(release_id) = request
+        .release_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        validate_release_id_fs_safe(release_id)?;
+    }
+    if let Some(env) = &request.env {
+        crate::release_flow::identity::ensure_business_env(env)?;
+    }
+    Ok(())
+}
+
+/// Validate the entire digest before any deployment side effect or filesystem use.
+fn normalize_deploy_sha(sha: Option<&str>) -> AppResult<String> {
+    let sha = sha.map(str::trim).unwrap_or("");
+    if !sha.is_empty() && (sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err(AppOperationError::Validation(
+            "sha256 must contain exactly 64 hexadecimal characters".into(),
+        ));
+    }
+    Ok(sha.to_ascii_lowercase())
+}
+
+/// Request correlation identity; deliberately independent of artifact content.
 fn generate_release_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -488,12 +547,65 @@ fn validate_release_id_fs_safe(release_id: &str) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_release_id, validate_release_id_fs_safe};
+    use super::{generate_release_id, normalize_deploy_sha, validate_release_id_fs_safe};
     use crate::AppServiceTrait;
     use crate::models::StartAppRequest;
     use crate::test_support::{MockRuntime, test_service};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn sha_validation_rejects_non_hex_and_unicode_without_slicing() {
+        for invalid in [
+            "a".repeat(15) + "é",
+            "g".repeat(64),
+            "a".repeat(16) + &"/".repeat(48),
+            "a".repeat(63),
+        ] {
+            assert!(normalize_deploy_sha(Some(&invalid)).is_err());
+        }
+        assert_eq!(
+            normalize_deploy_sha(Some(&"AB".repeat(32))).unwrap(),
+            "ab".repeat(32)
+        );
+        assert_eq!(normalize_deploy_sha(None).unwrap(), "");
+        assert_eq!(normalize_deploy_sha(Some("  ")).unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn invalid_digest_and_reserved_identity_have_no_runtime_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        let svc = test_service(tmp.path(), runtime.clone());
+        let invalid = StartAppRequest {
+            user_id: "u-test".into(),
+            url: Some("http://localhost/artifact.zip".into()),
+            sha256: Some("a".repeat(15) + "é"),
+            ..Default::default()
+        };
+        assert!(
+            svc.start_app_enhanced("app-validation", invalid)
+                .await
+                .is_err()
+        );
+        let forged = StartAppRequest {
+            user_id: "u-test".into(),
+            env: Some(
+                [(
+                    shared_types::APP_DEPLOY_OPERATION_ID.into(),
+                    "forged".into(),
+                )]
+                .into(),
+            ),
+            ..Default::default()
+        };
+        assert!(
+            svc.start_app_enhanced("app-validation", forged)
+                .await
+                .is_err()
+        );
+        assert!(runtime.deployments.is_empty());
+    }
 
     #[test]
     fn release_id_shape_and_uniqueness() {
@@ -643,9 +755,17 @@ mod env_contract_tests {
     use std::{collections::HashMap, sync::Arc};
 
     #[tokio::test]
-    async fn hot_env_change_rejected_before_runtime_mutation_equal_env_removed() {
+    async fn hot_env_change_rejected_before_runtime_mutation_equal_env_retained_for_locked_check() {
         let root = tempfile::tempdir().expect("workspace");
         let runtime = Arc::new(MockRuntime::default());
+        runtime.deployments.insert(
+            "env-app".into(),
+            container_runtime_api::DeploymentStatus {
+                app_id: "env-app".into(),
+                phase: "Running".into(),
+                ..Default::default()
+            },
+        );
         runtime.specs.insert(
             "env-app".into(),
             container_runtime_api::ContainerSpecSnapshot {
@@ -687,8 +807,8 @@ mod env_contract_tests {
             .await
             .expect("same env");
         assert!(
-            accepted.env.is_none(),
-            "equal business env must not trigger an update"
+            accepted.env.is_some(),
+            "equal business env must be rechecked under the operation lease"
         );
     }
 }

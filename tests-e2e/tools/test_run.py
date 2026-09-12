@@ -170,6 +170,41 @@ class ReportTests(unittest.TestCase):
             (root / 'a.jsonl').write_text('\n'.join(map(json.dumps, rows)))
             self.assertTrue(validate_reports(root, 'userapp_hot_deployment_builtin_contract'))
 
+    def test_lightweight_deployment_steps_cannot_be_omitted(self):
+        scenario = 'userapp_deploy_full_chain'
+        steps = REQUIRED[scenario]
+        for omitted in ('deploy.lightweight.generated-request-identity',
+                        'deploy.lightweight.confirmation-under-90s',
+                        'deploy.lightweight.exact-operation-and-artifact',
+                        '轻量重部署后流量恢复（/react/）'):
+            with self.subTest(omitted=omitted), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                rows = [{'kind': 'scenario_begin'}]
+                rows += [{'kind': 'assert', 'name': name, 'level': 'hard', 'ok': True}
+                         for name in steps if name != omitted]
+                rows += [{'kind': 'scenario_end', 'verdict': 'pass',
+                          'hard_pass': len(steps) - 1, 'hard_fail': 0}]
+                (root / 'a.jsonl').write_text('\n'.join(map(json.dumps, rows)))
+                self.assertTrue(validate_reports(root, scenario))
+
+    def test_hot_restart_and_manual_recovery_are_mandatory(self):
+        scenario = 'userapp_hot_deployment_builtin_contract'
+        for omitted in ('restart retains B operation identity',
+                        'restart retains B content despite cold A env',
+                        'restart preserves container identity', 'manual redeploy restores A',
+                        'switched failure does not restore old readiness'):
+            with self.subTest(omitted=omitted), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                steps = REQUIRED[scenario]
+                self.assertIn(omitted, steps)
+                rows = [{'kind': 'scenario_begin'}]
+                rows += [{'kind': 'assert', 'name': name, 'level': 'hard', 'ok': True}
+                         for name in steps if name != omitted]
+                rows += [{'kind': 'scenario_end', 'verdict': 'pass',
+                          'hard_pass': len(steps) - 1, 'hard_fail': 0}]
+                (root / 'a.jsonl').write_text('\n'.join(map(json.dumps, rows)))
+                self.assertTrue(validate_reports(root, scenario))
+
     def test_zero_assertions_and_duplicate_terminal_fail(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'a.jsonl'

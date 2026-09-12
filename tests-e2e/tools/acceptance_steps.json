@@ -272,7 +272,11 @@
     "热部署前置：get_app 拿 started_at",
     "热部署受理（deploy_mode=hot + 新 release_id → 200）",
     "热部署后流量仍可达",
-    "热部署容器未换（started_at 不变）"
+    "热部署容器未换（started_at 不变）",
+    "deploy.lightweight.generated-request-identity",
+    "deploy.lightweight.confirmation-under-90s",
+    "轻量重部署后流量恢复（/react/）",
+    "deploy.lightweight.exact-operation-and-artifact"
   ],
   "userapp_dev_app_proxy_lazy_start": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
@@ -486,6 +490,12 @@
     "Docker context excludes userapp runtime data",
     "Docker context excludes app runtime data",
     "Docker context excludes local credentials",
-    "Docker context owned resources cleaned"
+    "Docker context owned resources cleaned",
+    "Docker artifacts production stage exists",
+    "Docker artifacts create without command override",
+    "Docker artifacts preserve agent_runner",
+    "Docker artifacts preserve app-cli",
+    "Docker artifacts exclude source cache and toolchain",
+    "Docker artifacts owned resources cleaned"
   ]
 }

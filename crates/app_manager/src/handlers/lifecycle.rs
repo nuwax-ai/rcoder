@@ -266,6 +266,22 @@ pub async fn purge_app(
         "[APP] purging app (permanent): {} (user_id={:?})",
         app_id, user_id
     );
-    state.app_service.purge_app(&app_id).await?;
+    // Keep the entire admitted purge alive across HTTP caller cancellation.
+    // The service owns conditional metadata/cache cleanup and mutation completion.
+    let service = state.app_service.clone();
+    let purge_id = app_id.clone();
+    tokio::spawn(async move {
+        let result = service.purge_app(&purge_id).await;
+        if let Err(error) = &result {
+            tracing::error!(app_id = %purge_id, %error, "Owned application purge failed");
+        }
+        result
+    })
+    .await
+    .map_err(|error| {
+        crate::models::AppOperationError::Backend(format!(
+            "Application purge worker failed: {error}"
+        ))
+    })??;
     Ok(Json(HttpResult::success("已彻底删除".to_string())))
 }

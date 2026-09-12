@@ -42,26 +42,20 @@ pub(crate) struct SupervisordHost {
 
 impl SupervisordHost {
     /// 引擎探测：socket 存在 + XML-RPC ping 成功（serve 启动时调用一次）。
-    pub(crate) async fn detect() -> Option<Self> {
+    pub(crate) async fn detect() -> Result<Option<Self>> {
         if !crate::xmlrpc::socket_exists() {
-            return None;
+            return Ok(None);
         }
         let client = SupervisorClient::new(crate::xmlrpc::default_socket_path());
-        match client.ping().await {
-            Ok(version) => {
-                info!("service host: supervisord {version} detected (engine=supervisord)");
-                Some(Self {
-                    client,
-                    conf_path: PathBuf::from(CONF_PATH),
-                })
-            }
-            Err(e) => {
-                warn!(
-                    "service host: supervisord socket exists but ping failed: {e:#} (engine=builtin)"
-                );
-                None
-            }
-        }
+        let version = client
+            .ping()
+            .await
+            .context("supervisord socket exists but RPC is unavailable")?;
+        info!("service host: supervisord {version} detected (engine=supervisord)");
+        Ok(Some(Self {
+            client,
+            conf_path: PathBuf::from(CONF_PATH),
+        }))
     }
 
     /// 停掉全部动态组（热部署切换 / 容器停服级联）。

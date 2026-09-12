@@ -142,6 +142,11 @@ RUN if [ -f /build/target/release/codex-acp-agent ]; then \
 # 设置执行权限
 RUN chmod +x /app/bin/rcoder /app/bin/agent_runner
 
+# Both shipped binaries must load and exit successfully in the actual runtime stage.
+# A healthy dev-hot rcoder alone does not prove the embedded WebChat agent can run.
+COPY docker/verify-runtime-binaries.py /usr/local/bin/verify-runtime-binaries.py
+RUN python3 /usr/local/bin/verify-runtime-binaries.py /app/bin
+
 # 暴露端口
 EXPOSE 8086
 EXPOSE 60000

@@ -131,6 +131,12 @@ impl DockerRuntime {
                     )));
                 }
             }
+            self.inner
+                .retire_container_cache(&resource.uid)
+                .await
+                .map_err(|error| {
+                    Error::DockerError(format!("retire deleted container cache: {error}"))
+                })?;
         }
         if !self
             .capture_builder(&snapshot.app_id)
@@ -246,6 +252,135 @@ impl shared_types::AppOperationLease for BuilderFileLease {
 mod tests {
     use super::*;
     use shared_types::AppOperationLease;
+    #[tokio::test]
+    async fn captured_delete_retires_only_deleted_identity_caches() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let name = "rcoder-app-builder-one";
+        let (actor, containers) = crate::container_state_actor::ContainerStateActor::new();
+        tokio::spawn(actor.run());
+        let manager = Arc::new(crate::DockerManager {
+            docker: bollard::Docker::connect_with_http(
+                &format!("http://{address}"),
+                1,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .unwrap(),
+            config: crate::DockerManagerConfig::default(),
+            containers,
+            main_network_name: Arc::new(tokio::sync::RwLock::new("test".into())),
+            api_cache: Arc::new(crate::api_cache::DockerApiCache::new(600, 600, 100)),
+        });
+        let query = |id: &str| {
+            Arc::new(crate::ContainerQueryResult::new(
+                id.into(),
+                name.into(),
+                crate::ContainerStatus::Running,
+                true,
+                "192.0.2.1".into(),
+                chrono::Utc::now(),
+            ))
+        };
+        manager
+            .api_cache
+            .insert_status("old-id".into(), Some(query("old-id")))
+            .await;
+        manager
+            .api_cache
+            .insert_status(name.into(), Some(query("old-id")))
+            .await;
+        manager
+            .api_cache
+            .insert_network("old-id".into(), Some(Arc::new(Default::default())))
+            .await;
+        manager
+            .containers
+            .insert(
+                "old-alias".into(),
+                crate::DockerContainerInfo::new(
+                    "old-id".into(),
+                    name.into(),
+                    "one".into(),
+                    "image".into(),
+                ),
+            )
+            .await;
+        manager
+            .containers
+            .insert(
+                "new-alias".into(),
+                crate::DockerContainerInfo::new(
+                    "new-id".into(),
+                    name.into(),
+                    "one".into(),
+                    "image".into(),
+                ),
+            )
+            .await;
+        let writer = manager.clone();
+        let replacement = query("new-id");
+        let server = tokio::spawn(async move {
+            for phase in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                let count = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                let (status,body) = match phase {
+                    0 => (200, serde_json::json!({"Id":"old-id","Name":format!("/{name}"),"Config":{"Labels":{"service-type":ServiceType::UserappBuilder.to_string(),"identifier":"one"}}}).to_string()),
+                    1 => {
+                        assert!(request.starts_with("DELETE ") && request.contains("/containers/old-id?"),"{request}");
+                        writer.api_cache.insert_status(name.into(),Some(replacement.clone())).await;
+                        (204,String::new())
+                    },
+                    _ => (404,r#"{"message":"not found"}"#.into()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let runtime = DockerRuntime::new(manager.clone());
+        let snapshot = BuilderDeletionSnapshot {
+            app_id: "one".into(),
+            operation_id: "test".into(),
+            docker_bind_cleanup: true,
+            resources: vec![AppResourceIdentity {
+                kind: AppResourceKind::Container,
+                name: name.into(),
+                uid: "old-id".into(),
+                resource_version: None,
+            }],
+        };
+        runtime.delete_captured_builder(&snapshot).await.unwrap();
+        server.await.unwrap();
+        assert!(manager.containers.get("old-alias").await.is_none());
+        assert_eq!(
+            manager
+                .containers
+                .get("new-alias")
+                .await
+                .unwrap()
+                .container_id,
+            "new-id"
+        );
+        assert!(manager.api_cache.get_status("old-id").await.is_none());
+        assert!(manager.api_cache.get_network("old-id").await.is_none());
+        assert_eq!(
+            manager
+                .api_cache
+                .get_status(name)
+                .await
+                .unwrap()
+                .unwrap()
+                .container_id,
+            "new-id"
+        );
+    }
+
     #[test]
     fn captured_builder_requires_actual_family_and_identifier_labels() {
         let inspect = |family: &str, identifier: &str| {

@@ -45,11 +45,27 @@ pub(crate) const PLATFORM_ENV_KEYS: &[&str] = &[
     "APP_RELEASE_ID",
     "APP_DEPLOY_SHA256",
     "APP_CLI_DEPLOY_TOKEN",
+    shared_types::APP_DEPLOY_OPERATION_ID,
+    shared_types::APP_DEPLOY_GENERATION_ID,
     "APP_ID",
     "PGDATA",
     "DBX_DATA_DIR",
     "USERAPP_WORKSPACE_DIR",
 ];
+
+/// Only external request entrypoints use this validation. Trusted runtime assembly
+/// may carry platform values, which must survive business-environment replacement.
+pub(crate) fn ensure_business_env(env: &HashMap<String, String>) -> AppResult<()> {
+    ensure_no_reserved_env(env)?;
+    for key in PLATFORM_ENV_KEYS {
+        if env.contains_key(*key) {
+            return Err(AppOperationError::Validation(format!(
+                "environment variable {key} is reserved by the platform"
+            )));
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn replace_business_env(
     mut business: HashMap<String, String>,
@@ -97,6 +113,27 @@ mod tests {
         let env = HashMap::from([("RCODER_PINGAP_VERSION".to_owned(), "user-value".to_owned())]);
         let error = ensure_no_reserved_env(&env).expect_err("reserved value must fail");
         assert!(error.to_string().contains("reserved"), "{error}");
+    }
+
+    #[test]
+    fn deployment_identity_is_platform_managed_and_survives_business_replacement() {
+        for key in [
+            shared_types::APP_DEPLOY_OPERATION_ID,
+            shared_types::APP_DEPLOY_GENERATION_ID,
+            "APP_CLI_DEPLOY_TOKEN",
+        ] {
+            let platform = HashMap::from([(key.into(), "platform-value".into())]);
+            assert!(ensure_business_env(&platform).is_err());
+            let replaced = replace_business_env(
+                HashMap::from([("BUSINESS".into(), "new".into())]),
+                Some(platform),
+            );
+            assert_eq!(
+                replaced.get(key).map(String::as_str),
+                Some("platform-value")
+            );
+            assert!(!business_env(replaced).contains_key(key));
+        }
     }
 
     #[test]

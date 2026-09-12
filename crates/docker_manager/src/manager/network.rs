@@ -35,6 +35,7 @@ impl DockerManager {
             return Ok(HashMap::new());
         }
 
+        let query_generation = self.api_cache.begin_query().await;
         // 2. 缓存未命中，调用 Docker API（带超时）
         let timeout = Duration::from_secs(self.config.api_timeout_quick_seconds);
         let inspect = match self.inspect_with_timeout(container_id, timeout).await {
@@ -48,9 +49,15 @@ impl DockerManager {
                     "[NETWORK] Container does not exist, caching empty network: container_id={}",
                     container_id
                 );
-                self.api_cache
-                    .insert_network(container_id.to_string(), None)
-                    .await;
+                if !self
+                    .api_cache
+                    .publish_network(&query_generation, container_id.to_string(), None)
+                    .await
+                {
+                    debug!(
+                        "Discarded negative network cache fill after lifecycle change: {container_id}"
+                    );
+                }
                 return Ok(HashMap::new());
             }
             Err(DockerError::Timeout(_)) => {
@@ -92,9 +99,13 @@ impl DockerManager {
             // 🔧 使用 Arc 包装，减少 clone 开销
             Some(Arc::new(network_ips.clone()))
         };
-        self.api_cache
-            .insert_network(container_id.to_string(), result_to_cache)
-            .await;
+        if !self
+            .api_cache
+            .publish_network(&query_generation, container_id.to_string(), result_to_cache)
+            .await
+        {
+            debug!("Discarded network cache fill after lifecycle change: {container_id}");
+        }
 
         Ok(network_ips)
     }

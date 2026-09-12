@@ -4,8 +4,8 @@
 //! `APP_RELEASE_ID`（部署身份标识）、`APP_DEPLOY_SHA256`（可选校验，空 = 信任内网源）。
 //! prepare downloads and validates into operation-owned temporary resources while
 //! the old application continues serving. activate promotes prepared code only after
-//! the caller stops the old processes. restore_previous restores code only; database
-//! migration effects are never described as rolled back. RAII removes temporary
+//! the caller stops the old processes. Failed promotion repairs directory consistency;
+//! business recovery requires an explicit deployment and never reverses migrations. RAII removes temporary
 //! resources on completion, error, and cancellation, including blocking extraction.
 
 use std::path::Path;
@@ -179,7 +179,7 @@ pub(crate) async fn prepare(
     let root = workspace.parent().context("workspace has no volume root")?;
     if let Some(state) = read_state(root).await
         && state.release_id == release_id
-        && expected_sha.is_none_or(|sha| sha.eq_ignore_ascii_case(&state.sha256))
+        && expected_sha.is_some_and(|sha| sha.eq_ignore_ascii_case(&state.sha256))
         && tokio::fs::try_exists(workspace.join("release.lock.toml")).await?
     {
         return Ok(None);
@@ -283,36 +283,7 @@ async fn clean_owned_temporary(directory: &Path) -> Result<()> {
 }
 
 /// Activate only after the caller has stopped the previous generation.
-#[derive(Debug)]
-pub(crate) struct ActivationFailure {
-    pub error: anyhow::Error,
-    pub code_preserved: bool,
-}
-impl std::fmt::Display for ActivationFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:#}", self.error)
-    }
-}
-impl std::error::Error for ActivationFailure {}
-
-pub(crate) async fn activate(
-    workspace: &Path,
-    prepared: PreparedDeploy,
-) -> Result<(), ActivationFailure> {
-    let mut code_preserved = true;
-    activate_inner(workspace, prepared, &mut code_preserved)
-        .await
-        .map_err(|error| ActivationFailure {
-            error,
-            code_preserved,
-        })
-}
-
-async fn activate_inner(
-    workspace: &Path,
-    prepared: PreparedDeploy,
-    code_preserved: &mut bool,
-) -> Result<()> {
+pub(crate) async fn activate(workspace: &Path, prepared: PreparedDeploy) -> Result<()> {
     let root = workspace.parent().context("workspace has no volume root")?;
     let previous = root.join(PREVIOUS_DIR);
     if tokio::fs::try_exists(&previous).await? {
@@ -325,46 +296,21 @@ async fn activate_inner(
         tokio::fs::rename(workspace, &previous)
             .await
             .context("preserve previous generation")?;
-        *code_preserved = false;
     }
     if let Err(error) = tokio::fs::rename(prepared.staging.path(), workspace).await {
         if had_previous {
             tokio::fs::rename(&previous, workspace)
                 .await
                 .context("restore previous after failed promotion")?;
-            *code_preserved = true;
         }
         return Err(error).context("promote prepared generation");
     }
-    *code_preserved = false;
     let marker = tempfile::NamedTempFile::new_in(root)?;
     tokio::fs::write(marker.path(), toml::to_string_pretty(&prepared.state)?).await?;
     tokio::fs::rename(marker.path(), root.join(DEPLOY_STATE_FILE))
         .await
         .context("commit deployment marker")?;
     Ok(())
-}
-
-/// Restore code only. Database migrations are deliberately not reversed.
-pub(crate) async fn restore_previous(workspace: &Path) -> Result<bool> {
-    let root = workspace.parent().context("workspace has no volume root")?;
-    let previous = root.join(PREVIOUS_DIR);
-    if !tokio::fs::try_exists(previous.join("release.lock.toml")).await? {
-        return Ok(false);
-    }
-    if tokio::fs::try_exists(workspace).await? {
-        tokio::fs::remove_dir_all(workspace)
-            .await
-            .context("remove failed code generation")?;
-    }
-    tokio::fs::rename(previous, workspace)
-        .await
-        .context("restore previous code generation")?;
-    let marker = root.join(DEPLOY_STATE_FILE);
-    if tokio::fs::try_exists(&marker).await? {
-        tokio::fs::remove_file(marker).await?;
-    }
-    Ok(true)
 }
 
 /// 下载中转目录路径（卷根下）。
@@ -829,6 +775,7 @@ format = "jsonl"
     async fn marker_hit_skips_download() {
         let (_dir, workspace) = make_volume();
         let zip_bytes = build_zip(&[("release.lock.toml", MINIMAL_LOCK)]);
+        let sha = format!("{:x}", Sha256::digest(&zip_bytes));
         let url = serve_once(zip_bytes).await;
         deploy(&workspace, &url, "rel-001", None)
             .await
@@ -836,7 +783,7 @@ format = "jsonl"
 
         // 第二次：URL 指向必然失败的地址（连接拒绝端口），marker 命中应跳过下载
         let bad_url = "http://127.0.0.1:1/nothing.zip";
-        deploy(&workspace, bad_url, "rel-001", None)
+        deploy(&workspace, bad_url, "rel-001", Some(&sha))
             .await
             .expect("marker skip");
         // code 仍是第一次部署的内容

@@ -20,6 +20,22 @@ pub const APP_CLI_OPERATION_ID_DEPLOY_PROTOCOL: u32 = 2;
 /// Protocol v3 publishes terminal operations only after mutations have stopped.
 pub const APP_CLI_QUIESCENT_DEPLOY_PROTOCOL: u32 = 3;
 
+/// Protocol v4 separates cold/hot operation identity, deployment stage and serving health.
+/// A successful operation is durably recorded before it becomes observable.
+pub const APP_CLI_UNIFIED_DEPLOY_PROTOCOL: u32 = 4;
+pub const APP_DEPLOY_OPERATION_ID: &str = "APP_DEPLOY_OPERATION_ID";
+pub const APP_DEPLOY_GENERATION_ID: &str = "APP_DEPLOY_GENERATION_ID";
+
+/// Immutable result of the artifact activation stage, independent of service readiness.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AppDeploymentStage {
+    #[default]
+    Pending,
+    Succeeded,
+    Failed,
+}
+
 /// app-cli server 状态机相位（wire 值 snake_case，锁死勿漂移）。
 ///
 /// 转移图：`Idle → Deploying → Orchestrating → Running`；任一部署/编排
@@ -79,6 +95,13 @@ impl std::str::FromStr for AppCliDeployPhase {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct AppDeploymentOperation {
     pub operation_id: String,
+    #[serde(default)]
+    pub deployment_generation_id: String,
+    #[serde(default)]
+    pub deploy_stage: AppDeploymentStage,
+    /// This operation result has been committed to the journal and verified.
+    #[serde(default)]
+    pub persisted: bool,
     pub request_release_id: String,
     pub artifact_release_id: Option<String>,
     #[serde(default)]

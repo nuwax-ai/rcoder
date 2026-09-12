@@ -124,6 +124,14 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                     )));
                 }
             }
+            self.inner
+                .retire_container_cache(&identity.uid)
+                .await
+                .map_err(|error| {
+                    ContainerRuntimeError::DockerError(format!(
+                        "retire deleted container cache: {error}"
+                    ))
+                })?;
         }
         // A replacement invalidates the old operation's routing/metadata cleanup.
         if !self

@@ -225,13 +225,86 @@ fn purge_app(app_id: &str) -> Result<(), String> {
         ])
         .output()
         .map_err(|e| e.to_string())?;
-    if !response.status.success() {
-        return Err("owned UserApp purge request failed".into());
+    classify_purge_response(
+        response.status.success(),
+        response.status.code(),
+        &response.stdout,
+        &response.stderr,
+        &super::Env::load().api_key,
+    )
+}
+
+fn classify_purge_response(
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+    api_key: &str,
+) -> Result<(), String> {
+    let redact = |text: &str| {
+        if api_key.is_empty() {
+            text.to_owned()
+        } else {
+            text.replace(api_key, "[REDACTED]")
+        }
+    };
+    if !success {
+        return Err(serde_json::json!({
+            "category": "transport",
+            "transport": if exit_code == Some(28) { "timeout" } else { "curl_failure" },
+            "exit_code": exit_code,
+            "stderr": redact(&String::from_utf8_lossy(stderr)),
+        })
+        .to_string());
     }
-    let body: serde_json::Value = serde_json::from_slice(&response.stdout)
-        .map_err(|e| format!("invalid purge envelope: {e}"))?;
+    let body: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|error| format!("invalid purge envelope: {error}"))?;
     if body["code"] != "0000" {
-        return Err(format!("owned UserApp purge rejected: {}", body["code"]));
+        return Err(serde_json::json!({
+            "category": "business",
+            "code": redact(body["code"].as_str().unwrap_or("<missing>")),
+            "message": redact(body["message"].as_str().unwrap_or("<missing>")),
+        })
+        .to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod purge_diagnostics_tests {
+    use super::classify_purge_response;
+
+    #[test]
+    fn purge_timeout_preserves_exit_code_and_redacts_stderr() {
+        let error =
+            classify_purge_response(false, Some(28), b"", b"timeout secret-key", "secret-key")
+                .expect_err("transport error");
+        let value: serde_json::Value = serde_json::from_str(&error).expect("diagnostic JSON");
+        assert_eq!(value["transport"], "timeout");
+        assert_eq!(value["exit_code"], 28);
+        assert_eq!(value["stderr"], "timeout [REDACTED]");
+    }
+
+    #[test]
+    fn purge_rejection_keeps_business_identity_and_redacts_message() {
+        let error = classify_purge_response(
+            true,
+            Some(0),
+            br#"{"code":"ERR_CONFLICT","message":"pending secret-key"}"#,
+            b"",
+            "secret-key",
+        )
+        .expect_err("business rejection");
+        let value: serde_json::Value = serde_json::from_str(&error).expect("diagnostic JSON");
+        assert_eq!(value["code"], "ERR_CONFLICT");
+        assert_eq!(value["message"], "pending [REDACTED]");
+    }
+
+    #[test]
+    fn purge_success_definition_is_unchanged() {
+        assert!(classify_purge_response(true, Some(0), br#"{"code":"0000"}"#, b"", "").is_ok());
+        assert!(
+            classify_purge_response(true, Some(0), br#"{"code":"ERR_CONFLICT"}"#, b"", "").is_err()
+        );
+    }
 }

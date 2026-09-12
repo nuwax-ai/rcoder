@@ -411,7 +411,9 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         _app_id: &str,
         _env: &std::collections::HashMap<String, String>,
     ) -> ContainerRuntimeResult<()> {
-        Ok(())
+        Err(ContainerRuntimeError::ConfigurationError(
+            "runtime does not support mutable deployment environment".into(),
+        ))
     }
 
     /// 更新一个已存在的 Deployment/容器（全量替换 desired state）。

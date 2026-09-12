@@ -6,7 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 
-from build_context_contract import run as build_context_run
+from build_context_contract import run as build_context_run, run_artifacts
 
 REPO = Path(__file__).resolve().parents[2]
 TEST = 'stale_deletion_receipt_preserves_replacement_container_and_volume'
@@ -46,6 +46,8 @@ def main():
     except Exception as error:
         record('Docker lifecycle execution', False, str(error))
     for item in build_context_run(Path(os.environ['E2E_REPORT_DIR']) / 'build-context', os.environ['E2E_RUN_ID'], os.environ['E2E_CASE_ID']):
+        record(item['name'], item['ok'], item['detail'])
+    for item in run_artifacts(Path(os.environ['E2E_REPORT_DIR']) / 'build-artifacts', os.environ['E2E_RUN_ID'], os.environ['E2E_CASE_ID']):
         record(item['name'], item['ok'], item['detail'])
     return int(not assertions or any(not item['ok'] for item in assertions))
 

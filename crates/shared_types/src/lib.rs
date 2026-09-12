@@ -122,8 +122,9 @@ pub use app_resource_deletion::{
 };
 
 pub use app_cli_deploy::{
-    AppCliDeployPhase, AppDeploymentOperation, AppDeploymentRecovery, AppEnvSnapshot,
-    AppMutationPrecondition,
+    APP_CLI_UNIFIED_DEPLOY_PROTOCOL, APP_DEPLOY_GENERATION_ID, APP_DEPLOY_OPERATION_ID,
+    AppCliDeployPhase, AppDeploymentOperation, AppDeploymentRecovery, AppDeploymentStage,
+    AppEnvSnapshot, AppMutationPrecondition,
 };
 
 // gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）

@@ -104,6 +104,145 @@ fn cfg_or_env_or(cfg: &HashMap<String, String>, key: &str, default: &str) -> Str
         .unwrap_or_else(|| default.to_owned())
 }
 
+/// Pure admission policy: only the strict launcher supplies resource/report ownership.
+fn context_admission(strict: bool, fields: &[Option<String>; 4]) -> Result<bool, String> {
+    let names = [
+        "E2E_RUN_ID",
+        "E2E_CASE_ID",
+        "E2E_REPORT_DIR",
+        "E2E_TEST_NAME",
+    ];
+    let missing: Vec<_> = names
+        .into_iter()
+        .zip(fields)
+        .filter_map(|(name, value)| {
+            value
+                .as_ref()
+                .is_none_or(|value| value.trim().is_empty())
+                .then_some(name)
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(true);
+    }
+    if strict {
+        Err(format!(
+            "strict E2E context missing: {}",
+            missing.join(", ")
+        ))
+    } else {
+        Ok(false)
+    }
+}
+
+/// Run before reading configuration, creating clients, reports or external resources.
+pub fn require_context_or_skip() -> bool {
+    let fields = [
+        "E2E_RUN_ID",
+        "E2E_CASE_ID",
+        "E2E_REPORT_DIR",
+        "E2E_TEST_NAME",
+    ]
+    .map(|name| std::env::var(name).ok());
+    match context_admission(std::env::var("E2E_STRICT").as_deref() == Ok("1"), &fields) {
+        Ok(true) => true,
+        Ok(false) => {
+            eprintln!(
+                "E2E skipped: launcher ownership context absent; use make test-e2e selection"
+            );
+            false
+        }
+        Err(error) => panic!("{error}"),
+    }
+}
+
+#[cfg(test)]
+mod context_gate_tests {
+    use super::context_admission;
+
+    fn complete() -> [Option<String>; 4] {
+        ["run", "case", "/tmp/report", "scenario"].map(|value| Some(value.into()))
+    }
+
+    #[test]
+    fn unregistered_workspace_skips_even_with_external_environment_available() {
+        assert_eq!(
+            context_admission(false, &[None, None, None, None]),
+            Ok(false)
+        );
+        for index in 0..4 {
+            for absent in [None, Some(String::new()), Some("  ".into())] {
+                let mut fields = complete();
+                fields[index] = absent;
+                assert_eq!(context_admission(false, &fields), Ok(false));
+            }
+        }
+    }
+
+    #[test]
+    fn strict_missing_any_ownership_field_fails_before_execution() {
+        let names = [
+            "E2E_RUN_ID",
+            "E2E_CASE_ID",
+            "E2E_REPORT_DIR",
+            "E2E_TEST_NAME",
+        ];
+        for index in 0..4 {
+            let mut fields = complete();
+            fields[index] = None;
+            assert!(
+                context_admission(true, &fields)
+                    .unwrap_err()
+                    .contains(names[index])
+            );
+        }
+    }
+
+    #[test]
+    fn context_gate_child() {
+        if let Ok(expected) = std::env::var("RCODER_E2E_GATE_CHILD") {
+            assert_eq!(super::require_context_or_skip().to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn process_gate_skips_without_context_and_fails_strict_before_io() {
+        for strict in [false, true] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "common::context_gate_tests::context_gate_child",
+                    "--nocapture",
+                ])
+                .env("RCODER_E2E_GATE_CHILD", "false")
+                .env("E2E_STRICT", if strict { "1" } else { "0" });
+            for key in [
+                "E2E_RUN_ID",
+                "E2E_CASE_ID",
+                "E2E_REPORT_DIR",
+                "E2E_TEST_NAME",
+            ] {
+                child.env_remove(key);
+            }
+            let output = child.output().unwrap();
+            assert_eq!(output.status.success(), !strict);
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(diagnostic.contains(if strict {
+                "strict E2E context missing"
+            } else {
+                "E2E skipped"
+            }));
+        }
+    }
+
+    #[test]
+    fn registered_execution_is_admitted_without_weakening_scenario_assertions() {
+        assert_eq!(context_admission(true, &complete()), Ok(true));
+        assert_eq!(context_admission(false, &complete()), Ok(true));
+    }
+}
+
 impl Env {
     pub fn load() -> Self {
         let cfg = load_env_local();
@@ -158,9 +297,12 @@ impl Env {
         format!("{}-{name}", self.user)
     }
 
-    /// compose 门控：探测 /health（2s）+ LLM 配置完整性；任一不满足 → skip。
-    /// `cargo test --workspace` 在无环境机器上由此保持全绿（PG-gated 同模式）。
+    /// Check launcher ownership before configuration, reporting or network I/O.
+    /// Registered scenarios then check health and their own LLM requirements.
     pub async fn compose_or_skip(scenario: &str, backend: &str) -> Option<(Self, JsonlReporter)> {
+        if !require_context_or_skip() {
+            return None;
+        }
         let mut env = Self::load();
         // A Compose scenario must never inherit a remote cleanup target from .env.local.
         env.k8s_ssh.clear();
@@ -512,6 +654,9 @@ pub mod cross_bin_lock {
     /// 阻塞获取跨二进制互斥锁（另一测试二进制持有时自旋等待；
     /// 其进程退出后端口立即释放）。
     pub fn acquire() {
+        if !super::require_context_or_skip() {
+            return;
+        }
         if HELD.get().is_some() {
             return;
         }

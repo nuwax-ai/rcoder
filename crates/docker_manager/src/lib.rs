@@ -294,3 +294,6 @@ pub mod global {
         Ok(f(&manager))
     }
 }
+
+#[cfg(test)]
+mod cache_retirement_tests;

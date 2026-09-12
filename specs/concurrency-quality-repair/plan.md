@@ -14,7 +14,7 @@ purge在计算面删除前捕获PVC身份；所有复用PVC的创建/重建/唤�
 AgentRegistry单writer处理具体upsert/remove，阻塞worker加文件锁读最新文件合并，独占tmp原子替换后刷新内存；调用方cancel不打断已受理提交，写错误上抛。
 
 ## 主审实现
-主平台SSE发送/异常兜底受取消且满队列断流；开发任务先检查构建错误与取消再幂等，同队列Done作为保序屏障，移除50ms排空与detach，120s缺Done失败。static管理器保存配置/状态/取消句柄，同端口更新root，换端口先bind再切换，移除回收；失败恢复同步旧静态配置。
+主平台SSE发送/异常兜底受取消且满队列断流；开发任务先检查构建错误与取消再幂等，同队列Done作为保序屏障，移除50ms排空与detach，120s缺Done失败。static管理器保存配置/状态/取消句柄，同端口更新root，换端口先bind再切换，移除回收；切换失败回收静态监听；旧业务恢复由显式重部署完成（D03）。
 新增错误遵循现有信封/SSE协议，公开错误同步OpenAPI/i18n，平台日志英文。
 
 ## E2E和构建
@@ -34,3 +34,30 @@ Docker生产归属采用shared_types的app-id标签常量；builder独立inspect
 按用户追加建议，AgentRegistry内存视图改为ArcSwap<RegistryEntries>：查询一次load并在同一不可变视图完成遍历；blocking writer仍持串行写锁及OS文件锁，读取最新文件、应用具体操作、原子落盘成功后store完整Arc。持久化提交不做无锁化，失败不发布，取消不打断已受理提交。读者持有旧视图不会阻止发布，也不会看到原视图被原地修改。沿用agent_runner现有arc-swap依赖，无新增依赖。
 
 构建入口采用顺序递归make，先agent-runner的实际工具链检查和构建，再master；保留原30秒探测截止与兼容性断言。用真实Docker合成上下文验证排除规则，用隔离子目标及make -j4验证顺序和失败传播。
+
+agent-runner 编译 Dockerfile 增加 scratch artifacts 最终阶段，仅 COPY 两个既有路径的二进制，提供默认 CMD 以兼容 docker create；镜像层检查与容器导出检查分离，前者禁止隐藏的源码与缓存，后者核验内容与执行权限。
+
+PG、热部署及构建测试创建前持久化 ownership 和 pending 状态。Docker CLI 超时不等于 daemon 取消；清理只在已知创建结束或捕获唯一归属一致的物理 ID 后确认成功。迟到资源先更新凭据再删除；通用兜底不得绕过专用创建状态检查。保留原失败结果，后续收束另附证据。
+
+真实E2E增补：HTTP purge由持有Arc service的独立任务执行完整service方法，取消caller不取消收尾，worker错误/panic仍沿原保护保留marker。Docker缓存失效按物理ID谓词进行；创建使用无缓存回退的权威inspect，Running无地址保留，停止容器DELETE force=false。原重建路径保留语义，但捕获actor身份一次，后续查询与删除只用捕获ID。清理报告保存脱敏后的传输类别、退出码及业务code/message，成功定义和截止时间不变。
+
+重建仍只在原有project_id存在边界触发，但查找键改为已经派生的PreparedAgentConfig.container_id；用同时登记project/pod两实例的真实preflight→start_prepared契约测试证明不访问错误实例。
+
+- Docker缓存用Arc身份token记录查询代次，所有失效与条件回填共享短提交锁，Docker/网络I/O留在锁外。状态双别名一次条件发布，网络成功及404负缓存同样校验；无关失效仅保守丢弃回填。stop_by_id已按物理ID退役，移除调用方末尾按逻辑键无条件remove。
+
+- common统一无I/O上下文门控，由Compose、PG、K8s与跨进程场景锁受理入口调用。Env::load保留配置读取职责，不将普通单元测试误当E2E；严格入口继续使用固定报告身份目录和必经断言。
+
+## D01–D06：统一部署实施方案（优先于此前恢复描述）
+shared_types 定义协议 v4、操作代次和独立 AppDeploymentStage。env 冷启动与 HTTP hot 共用原子受理入口。冷等待只认匹配 operation_id 的部署段成功，不依赖请求或 manifest release_id。非空 SHA 完整校验后统一小写，自动 release_id 不再从 SHA 截断派生。
+app-cli 在卷根以应用文件锁、独占临时文件和原子替换保存 generation/operation/目标/有效制品/切换阶段。同代次重启恢复有效版本，新代次覆盖旧恢复意图；切换中断禁止猜测启动。准备失败保留旧业务，切换后失败仅保留现场供显式重部署，不自动恢复旧编排。静态服务管理器与进程组退出确认保留。
+hot 成功须 Running、操作匹配与持久化确认，K8s 回写带 resourceVersion 并检查归属；Docker 验证持久化记录而非伪造可变 env。已有 preaccept 回退保留，网络错误不当作不存在；受理不确定保留操作保护。
+本批完成后继续 Q01–Q12 冻结验收：独立 app-cli 测试、workspace 默认/K8s/PG gates、镜像构建、dev-restart、dev-hot、严格两套 E2E。所有通过后才提交、app-cli patch tag 与 npm 六包发布。真实 K8s 未执行。
+
+HTTP 等待保持300秒软预算；协调任务独立于请求存活，最长30分钟进行有单次请求超时的对账，超时仍未知则保留操作凭据并报告，禁止当作完成释放。冷部署创建/更新使用借用guard内核，不重入锁，持有到部署段确认与后置SQL结束。hot env在锁内快照重新校验。纯env/secrets保留键校验在获取租约前执行。
+app-cli 启动先建立退出证明：supervisord停止业务组；builtin只在新Linux进程命名空间/启动代次证明旧进程已结束后恢复。无法证明的app-cli单进程重启保持pending、要求容器重启；不发布可重试终态。记录放卷根，不进行配额或容量限制。
+
+最终边界补强：hot 完成使用匹配 operation → /ready 业务就绪 → 再匹配 operation 的检查顺序；成功和失败终态均要求 persisted，未确认结果不得释放操作凭据。Existing 启动不得改写未附着或其他 generation 的部署记录；已有工作区的有效制品身份可作为首次 hot 的 baseline，无需虚构下载 URL。协调器进程 scope 独立于部署结果保存：先验证旧进程退出并停止已知业务，再原子保存并读回当前 owner，最后允许编排。
+
+正常停机补强：协调器owner增加Active/Quiescent（旧字段缺失默认Active）；成功启动证明及Active提交后才标记ownership_claimed。关闭受理复用现有锁与409明确拒绝，随后driver返回可检查的退出结果；保留prepare JoinHandle以等待真实停写，关闭静态监听并检查全部结果，最后原子fsync/readback Quiescent。启动被拒、未成功claim、任务panic/error或30秒停写确认超时均保留Active。部署receipt的失败/切换边界不因Quiescent被改判成功。
+
+镜像 ABI 补强：本地 master-base 记录 Dockerfile.base 及 COPY 输入指纹；docker-build-master 在编译前核对，不匹配提示显式重建基础镜像。来源指纹只证明构建定义一致，最终运行层仍执行 rcoder/agent_runner 的无副作用 --version，验证实际动态链接及退出状态。本轮先显式重建 master-base，再按 runtime → dev-restart → dev-hot 重建验收。

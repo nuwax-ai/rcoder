@@ -541,14 +541,21 @@ async fn userapp_devbuild_skip_and_fallback_source_mode() {
         format!("{dev_manifest}\n[devbuild]\ncommand = [\"sh\", \"-c\", \"exit 37\"]\n");
     let changed = env.http.post(format!("{}/api/v1/userapp/generate-file", env.rcoder))
         .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &app)
         .json(&json!({"app_id": app, "user_id": user, "file_name": "dev-svc/project.manifest.toml", "content": failing_manifest}))
         .send().await.expect("write failing devbuild");
     let changed: Value = changed.json().await.expect("file write response");
+    let fixture_installed = changed["success"] == true || http_ok(&changed);
     report.assert_hard(
         "Q10 failing build fixture installed",
-        changed["success"] == true || http_ok(&changed),
+        fixture_installed,
         trunc(&changed, 200),
     );
+    if !fixture_installed {
+        cleanup_builder(&app);
+        assert_hard_all(report).await;
+        return;
+    }
     let second: Value = env
         .http
         .post(format!("{}/api/v1/userapp/dev/start", env.rcoder))

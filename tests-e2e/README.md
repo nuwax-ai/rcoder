@@ -21,15 +21,17 @@ make test-e2e-k8s
 make test-e2e-k8s RUN_LB=1        # 开启 lb 场景（等价 cargo test -- --ignored）
 
 # 单场景过滤
-cargo test -p rcoder-e2e --test compose_sse -- --test-threads=1 reconnect
+make test-e2e-compose E2E_SUITE=compose_sse E2E_FILTER=reconnect
 ```
 
 环境门控（双层）：
 
 1. 本 crate 不在 workspace `default-members`：裸 `cargo test` / `cargo build` 不碰它
-2. `cargo test --workspace` 时每场景入口探测环境（compose /health 2s；K8s TEST_K8S_SSH + 首入口
-   /health），不可达 → `verdict=skip`，无环境机器保持全绿（与 rcoder-storage PG-gated 同模式）；
-   lb 三场景额外 `#[ignore]`——`cargo test --workspace` 不会跑，重跑须显式 `--ignored`
+2. `cargo test --workspace` 和直接 `cargo test -p rcoder-e2e` 缺少完整 launcher 上下文时，
+   在读取 `.env.local`、创建 HTTP client 或执行任何外部 I/O 前明确跳过，即使本地服务健康也不会创建未登记资源。
+3. 显式 make 入口提供 `E2E_RUN_ID`、`E2E_CASE_ID`、`E2E_REPORT_DIR`、`E2E_TEST_NAME`；
+   `E2E_STRICT=1` 下任一字段缺失或为空立即失败。后续环境缺失、skip、aborted 仍不能通过严格验收。
+   PG、Compose 和 K8s 入口使用同一上下文门控。不要用手填部分环境变量替代 make 选择入口。
 
 配置读取：环境变量 > 仓库根 `.env.local`（模板 `.env.local.example`）> 默认值。
 关键项：`RCODER_URL`（默认 `http://127.0.0.1:8090`）、`LLM_API_KEY` / `LLM_BASE_URL` /

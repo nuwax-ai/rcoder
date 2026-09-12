@@ -20,7 +20,7 @@ use std::time::Instant;
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, NetworkingConfig, PortBinding};
 use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
 use chrono::Utc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::manager::DockerManager;
 use shared_types::HTTP_DEFAULT_PORT;
@@ -223,18 +223,20 @@ impl<'a> ContainerCreator<'a> {
 
     /// 尝试复用已有的运行中容器
     ///
-    /// 如果同名容器正在运行且 IP 有效，直接复用。
-    /// 如果容器已停止或 IP 为空，删除旧容器后返回 None。
+    /// Inspect Docker before reuse; cached Running does not prove existence.
+    /// A running container without an address is retained and reported as not ready.
     async fn try_reuse_existing_container(
         &self,
         container_name: &str,
         project_id: &str,
         image: &str,
     ) -> DockerResult<Option<DockerContainerInfo>> {
-        let result = match self.manager.find_container_realtime(container_name).await {
-            Ok(Some(r)) => r,
-            Ok(None) => return Ok(None),
-            Err(_) => return Ok(None),
+        let Some(result) = self
+            .manager
+            .find_container_authoritative(container_name)
+            .await?
+        else {
+            return Ok(None);
         };
 
         if result.is_running && !result.container_ip.is_empty() {
@@ -258,26 +260,14 @@ impl<'a> ContainerCreator<'a> {
             return Ok(Some(info));
         }
 
-        // 容器已停止或 IP 为空，清理
         if result.is_running {
-            warn!(
-                "[CREATE] Container running but empty IP, deleting: name={}",
-                result.container_name
-            );
-        } else {
-            warn!(
-                "[CREATE] Found stopped container, deleting: name={}, status={:?}",
-                result.container_name, result.status
-            );
+            return Err(DockerError::ContainerStartError(format!(
+                "Running container has no network address: {container_name}"
+            )));
         }
-
-        if let Err(e) = self
-            .manager
-            .stop_container_by_id(&result.container_id)
-            .await
-        {
-            error!("[CREATE] Failed to delete old container: {}", e);
-        }
+        self.manager
+            .remove_stopped_container(&result.container_id)
+            .await?;
 
         Ok(None)
     }
@@ -622,6 +612,157 @@ mod tests {
         assert_eq!(
             hc.cap_drop,
             Some(vec!["NET_RAW".to_string(), "NET_ADMIN".to_string()])
+        );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_cache_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn fixture(status: u16, body: String) -> (DockerManager, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                let count = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                assert!(
+                    request.starts_with("GET "),
+                    "must never delete a running container: {request}"
+                );
+                let response = format!(
+                    "HTTP/1.1 {status} response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let (actor, containers) = crate::container_state_actor::ContainerStateActor::new();
+        tokio::spawn(actor.run());
+        let manager = DockerManager {
+            docker: bollard::Docker::connect_with_http(
+                &format!("http://{address}"),
+                1,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .unwrap(),
+            config: crate::DockerManagerConfig::default(),
+            containers,
+            main_network_name: Arc::new(tokio::sync::RwLock::new("test".into())),
+            api_cache: Arc::new(crate::api_cache::DockerApiCache::new(600, 600, 100)),
+        };
+        let old = crate::ContainerQueryResult::new(
+            "deleted-id".into(),
+            "builder".into(),
+            ContainerStatus::Running,
+            true,
+            "192.0.2.1".into(),
+            Utc::now(),
+        );
+        manager
+            .api_cache
+            .insert_status("builder".into(), Some(Arc::new(old)))
+            .await;
+        (manager, server)
+    }
+
+    #[tokio::test]
+    async fn stopped_cleanup_never_forces_a_concurrently_running_container() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                let count = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                let deleting = request.starts_with("DELETE ");
+                let (status, body) = if deleting {
+                    assert!(request.contains("/containers/old-id?"));
+                    assert!(
+                        !request.contains("force=true"),
+                        "must let Docker protect a newly running container: {request}"
+                    );
+                    (409, r#"{"message":"container is running"}"#)
+                } else {
+                    (
+                        200,
+                        r#"{"Id":"old-id","Name":"/builder","State":{"Status":"exited"},"NetworkSettings":{"Networks":{}}}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                if deleting {
+                    return;
+                }
+            }
+            panic!("expected conditional deletion");
+        });
+        let (mut manager, unused_server) = fixture(404, "{}".into()).await;
+        unused_server.abort();
+        manager.docker = bollard::Docker::connect_with_http(
+            &format!("http://{address}"),
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let result = ContainerCreator::new(&manager)
+            .try_reuse_existing_container("builder", "app", "image")
+            .await;
+        server.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(DockerError::BollardError(
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 409,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_does_not_reuse_deleted_physical_identity_from_cache() {
+        let (manager, server) = fixture(404, r#"{"message":"not found"}"#.into()).await;
+        let result = ContainerCreator::new(&manager)
+            .try_reuse_existing_container("builder", "app", "image")
+            .await
+            .unwrap();
+        server.abort();
+        assert!(result.is_none(), "cached Running is not physical existence");
+    }
+
+    #[tokio::test]
+    async fn create_propagates_authoritative_query_failure() {
+        let (manager, server) = fixture(500, r#"{"message":"daemon failed"}"#.into()).await;
+        let result = ContainerCreator::new(&manager)
+            .try_reuse_existing_container("builder", "app", "image")
+            .await;
+        server.abort();
+        assert!(
+            result.is_err(),
+            "query failure must not become reuse or absence"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_preserves_running_container_without_network_address() {
+        let (manager, server) = fixture(200, r#"{"Id":"replacement-id","Name":"/builder","State":{"Status":"running"},"NetworkSettings":{"Networks":{}}}"#.into()).await;
+        let result = ContainerCreator::new(&manager)
+            .try_reuse_existing_container("builder", "app", "image")
+            .await;
+        server.abort();
+        assert!(
+            matches!(result, Err(DockerError::ContainerStartError(message)) if message.contains("no network address")),
+            "running without an address must fail without deleting"
         );
     }
 }

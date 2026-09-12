@@ -7,7 +7,7 @@
 /logs
 .zcode
 tests/sse_e2e/results
-tests/sse_e2e/__pycache__
+__pycache__/
 /target-console
 docker/app-runtime-base/downloads/
 

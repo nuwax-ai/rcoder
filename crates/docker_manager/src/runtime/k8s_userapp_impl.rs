@@ -118,8 +118,18 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         let version = snapshot.resource_version.as_deref().ok_or_else(|| {
             ContainerRuntimeError::ConfigurationError("env resource version missing".into())
         })?;
-        let patch = serde_json::json!({"metadata": {"resourceVersion": version}, "data": env});
-        // Merge carries the API-server resourceVersion precondition; env keys only add/update.
+        let mut data = serde_json::to_value(env).map_err(|error| {
+            ContainerRuntimeError::ConfigurationError(format!("serialize deployment env: {error}"))
+        })?;
+        // JSON Merge Patch needs explicit nulls to remove keys; otherwise stale
+        // platform identity fields survive and the readback cannot converge.
+        if let Some(values) = data.as_object_mut() {
+            for key in snapshot.env.keys().filter(|key| !env.contains_key(*key)) {
+                values.insert(key.clone(), serde_json::Value::Null);
+            }
+        }
+        let patch = serde_json::json!({"metadata": {"resourceVersion": version}, "data": data});
+        // The API server enforces this resourceVersion against the actual write.
         self.configmaps_api()
             .patch(
                 name,
@@ -127,8 +137,16 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
                 &Patch::Merge(patch),
             )
             .await
-            .map_err(|e| {
-                ContainerRuntimeError::K8sError(format!("conditional hot env commit: {e}"))
+            .map_err(|e| match e {
+                kube::Error::Api(response) if response.code == 409 => {
+                    ContainerRuntimeError::Conflict(format!(
+                        "conditional hot env commit: {}",
+                        response.message
+                    ))
+                }
+                other => {
+                    ContainerRuntimeError::K8sError(format!("conditional hot env commit: {other}"))
+                }
             })?;
         let committed = self.app_env_snapshot(app_id).await?;
         if committed.deployment_uid != snapshot.deployment_uid

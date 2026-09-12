@@ -162,7 +162,7 @@ impl DockerManager {
                             "Container {} does not exist in Docker (status 404, already cleaned up), skipping destroy",
                             container_id
                         );
-                        return Ok(());
+                        return self.retire_container_cache(container_id).await;
                     }
                     _ => {
                         warn!(
@@ -203,7 +203,10 @@ impl DockerManager {
         )
         .await
         {
-            Ok(Ok(())) => {}
+            Ok(Ok(()))
+            | Ok(Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            })) => {}
             Ok(Err(e)) => {
                 warn!("Failed to remove container {}: {}", container_id, e);
                 return Err(DockerError::BollardError(e));
@@ -222,22 +225,40 @@ impl DockerManager {
 
         info!("container destroy succeeded: {}", container_id);
 
-        // 单次 actor 往返移除所有匹配 container_id 的条目（替代 list()+逐个 remove 的 O(n²)）。
-        // 同一容器可能存于多个 key（project_id/pod_id），一次清空避免孤儿缓存。
-        let removed = self
-            .containers
-            .remove_all_by_container_id(container_id)
-            .await;
-        if !removed.is_empty() {
-            self.api_cache.invalidate(container_id).await;
-            for info in &removed {
-                self.api_cache
-                    .invalidate(info.container_name.as_str())
-                    .await;
-            }
-        }
+        self.retire_container_cache(container_id).await?;
 
         Ok(())
+    }
+
+    /// Let Docker reject deletion if a stopped container became running meanwhile.
+    pub(crate) async fn remove_stopped_container(&self, container_id: &str) -> DockerResult<()> {
+        let result = tokio::time::timeout(
+            Duration::from_secs(self.config.api_timeout_quick_seconds),
+            self.docker.remove_container(
+                container_id,
+                Some(RemoveContainerOptions {
+                    force: false,
+                    ..Default::default()
+                }),
+            ),
+        )
+        .await
+        .map_err(|_| DockerError::Timeout(format!("remove stopped container {container_id}")))?;
+        match result {
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => self.retire_container_cache(container_id).await,
+            Err(error) => Err(DockerError::BollardError(error)),
+        }
+    }
+
+    /// Invalidate a deleted physical identity without evicting its replacement.
+    pub(crate) async fn retire_container_cache(&self, container_id: &str) -> DockerResult<()> {
+        self.containers
+            .remove_all_by_container_id(container_id)
+            .await;
+        self.api_cache.invalidate_container(container_id).await
     }
 
     /// 停止并删除容器
@@ -254,9 +275,6 @@ impl DockerManager {
         // 调用通过ID停止的方法（已包含缓存失效和映射移除）
         self.stop_container_by_id(&container_info.container_id)
             .await?;
-
-        // 从映射中移除
-        self.containers.remove(project_id).await;
 
         Ok(())
     }

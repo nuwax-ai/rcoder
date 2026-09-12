@@ -1,7 +1,7 @@
 # 独立的构建 Dockerfile - 仅用于构建 agent_runner 二进制
 # 使用 debian:12 作为基础镜像，确保 GLIBC 版本与运行环境一致
 
-FROM debian:12
+FROM debian:12 AS builder
 
 # 设置工作目录
 WORKDIR /build
@@ -67,3 +67,10 @@ RUN echo "🔧 Cargo flags: ${CARGO_FLAGS}" && \
 # 必须 cd 进 crate 目录单独编；输出在 crate 自己的 target 下。
 # dev/start（manifest 引擎 spawn app-cli）的前置。
 RUN cd crates/app-cli && cargo build --release
+
+# Export only the artifacts consumed by make; compiler layers remain build cache.
+# docker create needs a command, but the extraction container is never started.
+FROM scratch AS artifacts
+COPY --from=builder /build/target/release/agent_runner /build/target/release/agent_runner
+COPY --from=builder /build/crates/app-cli/target/release/app-cli /build/crates/app-cli/target/release/app-cli
+CMD ["/build/target/release/agent_runner"]

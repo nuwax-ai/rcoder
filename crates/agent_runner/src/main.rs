@@ -52,6 +52,8 @@ fn create_model_env_resolver(
 // 路由创建函数已移动到 handler 模块
 
 fn main() -> anyhow::Result<()> {
+    // Help/version exit before PID 1 supervision, telemetry, or background tool launches.
+    let cli_args = CliArgs::parse();
     // 容器内若为 PID 1(被 start-up.sh exec / 直跑),re-exec 自己为子进程 + 本进程做 PID 1 监督
     // (回收孤儿 + 转发 SIGTERM/SIGINT)。等价 tini,但纯 Rust 库、无需镜像装 tini 或命令前置。
     // 关键:监督进程的 waitpid(-1) 与 app 的 tokio::process 在 **不同进程**(app 是 PID 2 子进程),
@@ -61,11 +63,11 @@ fn main() -> anyhow::Result<()> {
         .enable_log(true)
         .timeout(Duration::from_secs(15))
         .launch()?;
-    agent_runner_main()
+    agent_runner_main(cli_args)
 }
 
 #[tokio::main]
-async fn agent_runner_main() -> anyhow::Result<()> {
+async fn agent_runner_main(cli_args: CliArgs) -> anyhow::Result<()> {
     // 🔥 设置自定义 Panic Hook，确保 panic 信息被记录
     set_panic_hook();
 
@@ -134,9 +136,6 @@ async fn agent_runner_main() -> anyhow::Result<()> {
     tokio::spawn(async {
         agent_runner::agent_mgmt::checker::init_builtin_agent_versions().await;
     });
-
-    // 解析命令行参数
-    let cli_args = CliArgs::parse();
 
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args)?;

@@ -51,7 +51,7 @@ impl DockerManager {
 
     /// 实时查询容器状态（使用缓存 + 超时保护）
     ///
-    /// 此方法直接查询 Docker API 获取最新的容器状态（返回的 container_id 保证新鲜）。
+    /// 此方法可返回缓存状态；生命周期决策必须使用 find_container_authoritative。
     ///
     /// 🔧 优化：使用 Moka 缓存减少 Docker API 调用，使用超时保护防止阻塞
     /// 📝 缓存策略：同时缓存 container_id 和 container_name，支持 404 响应缓存
@@ -66,18 +66,35 @@ impl DockerManager {
         &self,
         identifier: &str,
     ) -> DockerResult<Option<ContainerQueryResult>> {
+        self.find_container_status(identifier, true).await
+    }
+
+    /// Lifecycle decisions must inspect Docker and never fall back to cached state.
+    pub(crate) async fn find_container_authoritative(
+        &self,
+        identifier: &str,
+    ) -> DockerResult<Option<ContainerQueryResult>> {
+        self.find_container_status(identifier, false).await
+    }
+
+    async fn find_container_status(
+        &self,
+        identifier: &str,
+        allow_cache: bool,
+    ) -> DockerResult<Option<ContainerQueryResult>> {
         debug!(
             "[REALTIME] Getting container status: identifier={}",
             identifier
         );
 
         // 1. 尝试从缓存获取（只缓存成功结果，不缓存 404）
-        if let Some(Some(cached)) = self.api_cache.get_status(identifier).await {
+        if allow_cache && let Some(Some(cached)) = self.api_cache.get_status(identifier).await {
             debug!("[REALTIME] cache hit: identifier={}", identifier);
             // Arc::clone 只是增加引用计数，开销很小
             return Ok(Some((*cached).clone()));
         }
 
+        let query_generation = self.api_cache.begin_query().await;
         // 2. 缓存未命中，调用 Docker API（带超时）
         let timeout = Duration::from_secs(self.config.api_timeout_quick_seconds);
         let result = match self.inspect_with_timeout(identifier, timeout).await {
@@ -145,14 +162,17 @@ impl DockerManager {
                 );
                 let result_arc = Arc::new(query_result);
 
-                // 同时用 container_id 和 container_name 作为缓存 key
-                // Arc::clone 只是增加引用计数，开销很小
-                self.api_cache
-                    .insert_status(container_id.clone(), Some(result_arc.clone()))
-                    .await;
-                self.api_cache
-                    .insert_status(container_name.clone(), Some(result_arc.clone()))
-                    .await;
+                if !self
+                    .api_cache
+                    .publish_status(
+                        &query_generation,
+                        &[container_id.clone(), container_name.clone()],
+                        Some(result_arc.clone()),
+                    )
+                    .await
+                {
+                    debug!("Discarded status cache fill after lifecycle change: {container_id}");
+                }
 
                 info!(
                     "[REALTIME] Container status query succeeded: id={}, name={}, status={:?}, running={}, ip={}",
@@ -174,7 +194,13 @@ impl DockerManager {
                 // 原因：容器可能刚被创建，缓存 404 会导致 SSE 连接时序问题
                 // 容器状态变化快，404 缓存收益小但风险大
                 // 同时清理 network_cache 避免残留旧 IP（容器重建后 IP 可能变化）
-                self.api_cache.invalidate(identifier).await;
+                if !self
+                    .api_cache
+                    .invalidate_if_current(&query_generation, identifier)
+                    .await
+                {
+                    debug!("Discarded stale not-found cache invalidation: {identifier}");
+                }
                 debug!(
                     "[REALTIME] Container does not exist (not caching 404): identifier={}",
                     identifier
@@ -187,7 +213,9 @@ impl DockerManager {
                     identifier
                 );
                 // 超时时，尝试返回缓存中的旧值（如果有的话）
-                if let Some(Some(cached)) = self.api_cache.get_status(identifier).await {
+                if allow_cache
+                    && let Some(Some(cached)) = self.api_cache.get_status(identifier).await
+                {
                     return Ok(Some((*cached).clone()));
                 }
                 return Err(DockerError::Timeout(format!(

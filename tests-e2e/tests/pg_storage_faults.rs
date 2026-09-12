@@ -3,12 +3,7 @@ use rcoder_e2e::common::report::JsonlReporter;
 
 #[test]
 fn pg_storage_lifecycle_contract() {
-    if std::env::var_os("E2E_REPORT_DIR").is_none() {
-        assert_ne!(
-            std::env::var("E2E_STRICT").as_deref(),
-            Ok("1"),
-            "strict PG suite requires report directory"
-        );
+    if !rcoder_e2e::common::require_context_or_skip() {
         return;
     }
     let report = JsonlReporter::begin(

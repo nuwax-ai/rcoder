@@ -916,6 +916,65 @@ async fn create_reserved_env_rejection_does_not_provision_or_retain_ownership() 
 }
 
 #[tokio::test]
+async fn update_reserved_secrets_rejects_before_mutation_and_releases_ownership() {
+    for kubernetes in [false, true] {
+        for key in [
+            shared_types::APP_DEPLOY_OPERATION_ID,
+            shared_types::APP_DEPLOY_GENERATION_ID,
+            "APP_CLI_DEPLOY_TOKEN",
+        ] {
+            let root = tempfile::tempdir().expect("directory");
+            let runtime = Arc::new(MockRuntime::default());
+            let mut service = test_service(root.path(), runtime.clone());
+            if kubernetes {
+                service.config.access_mode = AppAccessMode::Kubernetes;
+            }
+            runtime.deployments.insert(
+                "reserved-secret".into(),
+                DeploymentStatus {
+                    app_id: "reserved-secret".into(),
+                    phase: "Running".into(),
+                    resource_version: Some("before".into()),
+                    ..Default::default()
+                },
+            );
+            let mut request = update_request_with_storage(Some("200Gi"));
+            request.secrets = Some(std::collections::HashMap::from([(
+                key.into(),
+                "forged".into(),
+            )]));
+            let error = service
+                .update_app("reserved-secret", request)
+                .await
+                .expect_err("platform identity cannot be injected through secrets");
+            assert!(matches!(error, AppOperationError::Validation(_)), "{error}");
+            assert!(error.to_string().contains(key));
+            assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(runtime.ensure_workspace_calls.load(Ordering::SeqCst), 0);
+            assert!(runtime.resize_calls.is_empty());
+            assert!(runtime.create_params_history.is_empty());
+            assert_eq!(
+                runtime
+                    .deployments
+                    .get("reserved-secret")
+                    .unwrap()
+                    .resource_version
+                    .as_deref(),
+                Some("before"),
+            );
+            service
+                .try_acquire_process_release_lock("reserved-secret")
+                .await
+                .expect("validation failure releases ownership")
+                .finish()
+                .await
+                .expect("release next operation");
+        }
+    }
+}
+
+#[tokio::test]
 async fn failed_update_preparation_releases_lease_for_next_update() {
     let root = tempfile::tempdir().expect("directory");
     let runtime = Arc::new(MockRuntime::default());
@@ -955,4 +1014,138 @@ async fn failed_update_preparation_releases_lease_for_next_update() {
     }
     assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(test)]
+mod purge_http_cancellation {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    struct ControlledCleanup {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        completed: Arc<Notify>,
+        outcome: u8,
+    }
+    #[async_trait::async_trait]
+    impl shared_types::UserappDevCleanup for ControlledCleanup {
+        async fn capture(
+            &self,
+            _: &str,
+        ) -> Result<Box<dyn shared_types::UserappDevDeletion>, String> {
+            Ok(Box::new(Self {
+                entered: self.entered.clone(),
+                release: self.release.clone(),
+                completed: self.completed.clone(),
+                outcome: self.outcome,
+            }))
+        }
+    }
+    #[async_trait::async_trait]
+    impl shared_types::UserappDevDeletion for ControlledCleanup {
+        async fn cleanup(self: Box<Self>) -> Result<(), String> {
+            tokio::spawn(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.completed.notify_one();
+                match self.outcome {
+                    0 => Ok(()),
+                    1 => Err("runtime deletion outcome is unknown".into()),
+                    _ => panic!("controlled deletion worker panic"),
+                }
+            })
+            .await
+            .map_err(|error| format!("cleanup worker failed: {error}"))?
+        }
+    }
+
+    async fn cancelled_purge(outcome: u8) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        let (service, runtime, _, persistence) = purge_test_service(root.path(), runtime).await;
+        let app_id = "cancelled-http-purge";
+        seed_running_app(&service, &runtime, app_id).await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let completed = Arc::new(Notify::new());
+        *service.dev_cleanup.write().expect("cleanup lock") = Some(Arc::new(ControlledCleanup {
+            entered: entered.clone(),
+            release: release.clone(),
+            completed: completed.clone(),
+            outcome,
+        }));
+        let service = Arc::new(service);
+        let state = Arc::new(crate::handlers::AppManagerState {
+            app_service: service.clone(),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("HTTP client"),
+        });
+        let caller = tokio::spawn(async move {
+            crate::handlers::purge_app(
+                axum::extract::State(state),
+                axum::extract::Path(app_id.into()),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .expect("entered deletion");
+        caller.abort();
+        assert!(caller.await.expect_err("caller cancelled").is_cancelled());
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), completed.notified())
+            .await
+            .expect("owned deletion completed");
+        // The process lock is a deterministic completion barrier for the outer
+        // purge: its guard must survive caller cancellation until all tail work.
+        let next = tokio::time::timeout(
+            Duration::from_secs(3),
+            service.acquire_process_release_lock(app_id),
+        )
+        .await
+        .expect("operation ended");
+        let marker = root
+            .path()
+            .join(".app-operation-locks/prod-cancelled-http-purge.lock");
+        use shared_types::AppMetadataPersistence as _;
+        if outcome == 0 {
+            let next = next.expect("completed purge must release durable mutation marker");
+            next.finish()
+                .await
+                .expect("release new read-only operation");
+            assert!(
+                service.metadata.lookup(app_id).is_none(),
+                "metadata tail must complete"
+            );
+            assert!(
+                persistence
+                    .load_all()
+                    .await
+                    .expect("metadata persistence")
+                    .iter()
+                    .all(|row| row.app_id != app_id)
+            );
+            assert!(std::fs::read(marker).expect("marker").is_empty());
+        } else {
+            assert!(next.is_err(), "unknown deletion must not release marker");
+            assert!(service.metadata.lookup(app_id).is_some());
+            assert!(!std::fs::read(marker).expect("marker").is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn caller_cancelled_success_finishes_metadata_and_marker() {
+        cancelled_purge(0).await;
+    }
+    #[tokio::test]
+    async fn caller_cancelled_unknown_error_preserves_marker() {
+        cancelled_purge(1).await;
+    }
+    #[tokio::test]
+    async fn caller_cancelled_worker_panic_preserves_marker() {
+        cancelled_purge(2).await;
+    }
 }

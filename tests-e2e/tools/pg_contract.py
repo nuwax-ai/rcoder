@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import signal
 import uuid
+from cleanup import cleanup_pg_project
 
 REPO = Path(__file__).resolve().parents[2]
 CASES = (
@@ -33,7 +34,10 @@ def main():
         'environment': {'POSTGRES_USER': 'contract', 'POSTGRES_PASSWORD': '${PG_CONTRACT_PASSWORD}', 'POSTGRES_DB': 'contract'},
         'ports': ['127.0.0.1::5432'], 'volumes': ['data:/var/lib/postgresql/data'], 'labels': {'rcoder.e2e.run': run_id},
         'healthcheck': {'test': ['CMD-SHELL', 'pg_isready -U contract -d contract'], 'interval': '1s', 'timeout': '3s', 'retries': 60}}}, 'volumes': {'data': {}}}))
-    (directory / 'ownership.json').write_text(json.dumps({'run_id': run_id, 'case_id': os.environ['E2E_CASE_ID'], 'project': project, 'compose_file': str(config)}))
+    receipt_path = directory / 'ownership.json'
+    receipt = {'run_id': run_id, 'case_id': os.environ['E2E_CASE_ID'], 'project': project,
+               'compose_file': str(config), 'creation_state': 'not_started'}
+    receipt_path.write_text(json.dumps(receipt))
     env = dict(os.environ, PG_CONTRACT_PASSWORD=password)
     compose = ['docker', 'compose', '-p', project, '-f', str(config)]
     assertions = []
@@ -61,11 +65,19 @@ def main():
         expected = ['pg::project_store::lifecycle_tests::lifecycle_contract_' + case for case in CASES]
         if not set(expected) <= names:
             raise RuntimeError('required PG lifecycle test missing from executable')
+        receipt['creation_state'] = 'pending'
+        receipt_path.write_text(json.dumps(receipt))
         command(compose + ['up', '-d', '--wait', '--wait-timeout', '90'], stdout=subprocess.DEVNULL)
+        receipt['creation_state'] = 'completed'
+        receipt_path.write_text(json.dumps(receipt))
         cid = command(compose + ['ps', '-q', 'postgres'], capture_output=True, text=True).stdout.strip()
+        if not cid:
+            raise RuntimeError('PG container identity is missing after successful startup')
         identity = command(['docker', 'inspect', '--format', '{{.Id}} {{.Image}} {{index .Config.Labels "rcoder.e2e.run"}}', cid], capture_output=True, text=True).stdout.strip()
         if not identity.endswith(' ' + run_id):
             raise RuntimeError('PG resource ownership mismatch')
+        receipt['container_id'] = identity.split()[0]
+        receipt_path.write_text(json.dumps(receipt))
         (directory / 'identity.txt').write_text(identity)
         address = command(compose + ['port', 'postgres', '5432'], capture_output=True, text=True).stdout.strip()
         env.update(RCODER_PG_TEST_DSN=f'postgres://contract:{password}@{address}/contract', RCODER_PG_TEST_STRICT='1')
@@ -84,10 +96,11 @@ def main():
         except subprocess.TimeoutExpired:
             record('PG diagnostics collected before cleanup', False, 'log collection timed out')
         try:
-            cleanup = subprocess.run(compose + ['down', '-v', '--remove-orphans'], env=env, capture_output=True, text=True, timeout=60)
-            record('PG owned project cleanup', cleanup.returncode == 0, cleanup.stderr.replace(password, '[REDACTED]'))
-        except subprocess.TimeoutExpired:
-            record('PG owned project cleanup', False, 'cleanup timed out: ' + project)
+            cleanup = cleanup_pg_project(directory.parent, run_id, os.environ['E2E_CASE_ID'])
+            (directory / 'cleanup.json').write_text(json.dumps(cleanup, indent=2))
+            record('PG owned project cleanup', cleanup['ok'], cleanup['detail'])
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            record('PG owned project cleanup', False, 'PG cleanup unresolved: ' + type(error).__name__)
     return int(not assertions or any(not item['ok'] for item in assertions))
 
 if __name__ == '__main__':

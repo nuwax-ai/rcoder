@@ -48,6 +48,7 @@ docker-build-master:
 	else \
 		echo "✓ 基础镜像 dev-master-rcoder-base:latest 已存在"; \
 	fi
+	@python3 docker/master-base-contract.py check dev-master-rcoder-base:latest
 	@echo "📦 使用 Dockerfile 多阶段构建（基于基础镜像）..."
 	@# 🔧 根据 CARGO_FEATURES 决定是否启用 eBPF 调试
 	@(if [ "$(CARGO_FEATURES)" != "" ]; then \
@@ -76,7 +77,8 @@ docker-build-master-base:
 	@echo "🐳 构建 master-rcoder-base 基础镜像..."
 	@echo "📍 镜像名称: dev-master-rcoder-base:latest"
 	@echo "⏳ 这可能需要较长时间（包含所有运行时依赖安装）..."
-	@docker build -f docker/rcoder-master/Dockerfile.base -t dev-master-rcoder-base:latest .
+	@docker build --build-arg RCODER_MASTER_BASE_SOURCE_SHA=$$(python3 docker/master-base-contract.py fingerprint) \
+		-f docker/rcoder-master/Dockerfile.base -t dev-master-rcoder-base:latest .
 	@echo "✅ master-rcoder-base 基础镜像构建完成！"
 	@if [ "$(PUSH_IMAGE)" = "true" ]; then \
 		echo "📤 推送基础镜像到阿里云仓库..."; \

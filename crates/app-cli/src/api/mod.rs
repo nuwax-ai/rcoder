@@ -175,6 +175,9 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
 pub(super) struct DeployBody {
     #[serde(default)]
     pub operation_id: Option<String>,
+    /// Expected cold deployment generation; stale callers cannot mutate a replacement.
+    #[serde(default)]
+    pub deployment_generation_id: Option<String>,
     /// 制品包下载 URL（workspace 整体包 zip）。
     pub url: String,
     /// 发布版本标记（幂等键）。
@@ -208,7 +211,8 @@ pub(super) struct DeployAcceptedData {
         (status = 202, body = envelope::HttpResult<DeployAcceptedData>, description = "Deploy accepted; poll /v1/deploy/status"),
         (status = 403, body = envelope::HttpResult<String>, description = "Token missing/mismatch or endpoint disabled"),
         (status = 409, body = envelope::HttpResult<String>, description = "Deploy already in progress"),
-        (status = 400, body = envelope::HttpResult<String>, description = "Invalid body (sha256 shape etc.)")
+        (status = 400, body = envelope::HttpResult<String>, description = "Invalid body (sha256 shape etc.)"),
+        (status = 500, body = envelope::HttpResult<String>, description = "Deployment admission task failed; inspect operation status before retrying")
     ),
     tag = "Runtime Deploy"
 )]
@@ -229,6 +233,15 @@ async fn submit_deploy(
             "sha256 must be 64 hex characters",
         );
     }
+    if let Some(generation) = body.deployment_generation_id.as_deref()
+        && !state.server.matches_generation(generation)
+    {
+        return envelope::error(
+            StatusCode::CONFLICT,
+            "DEPLOY_GENERATION_CONFLICT",
+            "deployment generation does not match this container",
+        );
+    }
     let operation_id = body
         .operation_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
@@ -244,14 +257,31 @@ async fn submit_deploy(
             "invalid operation_id",
         );
     }
-    match state.server.try_accept_deploy_with_id(
-        DeployRequest {
-            url: body.url,
-            release_id: body.release_id,
-            sha256: body.sha256,
-        },
-        operation_id.clone(),
-    ) {
+    let server = state.server.clone();
+    let accepted_id = operation_id.clone();
+    // Journal fsync runs on the blocking pool; accepted commits survive HTTP cancellation.
+    let admission = tokio::task::spawn_blocking(move || {
+        server.try_accept_deploy_with_id(
+            DeployRequest {
+                url: body.url,
+                release_id: body.release_id,
+                sha256: body.sha256.map(|value| value.to_ascii_lowercase()),
+            },
+            accepted_id,
+        )
+    })
+    .await;
+    let admission = match admission {
+        Ok(result) => result,
+        Err(error) => {
+            return envelope::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DEPLOY_ADMISSION_FAILED",
+                format!("deployment admission task failed: {error}"),
+            );
+        }
+    };
+    match admission {
         Ok(()) => envelope::ok(
             StatusCode::ACCEPTED,
             DeployAcceptedData {
@@ -260,7 +290,14 @@ async fn submit_deploy(
                 poll: "/v1/deploy/status".to_string(),
             },
         ),
-        Err(message) => envelope::error(StatusCode::CONFLICT, "DEPLOY_IN_PROGRESS", message),
+        Err(crate::server::AdmissionError::Busy(message)) => {
+            envelope::error(StatusCode::CONFLICT, "DEPLOY_IN_PROGRESS", message)
+        }
+        Err(error) => envelope::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DEPLOY_ADMISSION_FAILED",
+            error.to_string(),
+        ),
     }
 }
 
@@ -605,6 +642,25 @@ mod tests {
         assert_eq!(
             body["data"]["error"].as_str(),
             Some("artifact sha256 mismatch")
+        );
+    }
+
+    /// 令牌回显 wire：request_release_id Some 时透出（rcoder 部署等待的比对源）、
+    /// None 时跳过（无请求方路径，旧消费者看不到字段）。
+    #[tokio::test]
+    async fn deploy_status_request_release_id_wire() {
+        let state = test_state();
+        // 无请求方：字段不出现在 wire
+        let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"].get("request_release_id"), None);
+
+        state.server.set_request_release_id("rel-token-x");
+        let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["data"]["request_release_id"].as_str(),
+            Some("rel-token-x")
         );
     }
 

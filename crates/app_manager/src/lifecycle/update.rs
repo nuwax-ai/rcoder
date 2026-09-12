@@ -26,6 +26,13 @@ impl AppService {
         request: UpdateAppRequest,
     ) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
+        if let Some(env) = &request.env {
+            crate::release_flow::identity::ensure_business_env(env)?;
+        }
+        if let Some(secrets) = &request.secrets {
+            crate::release_flow::identity::ensure_business_env(secrets)?;
+        }
+
         // 与发布串行（同 create/delete 的 per-app 进程级发布锁），但**不排队傻等**——
         // activate 等就绪可达 30 分钟，update 等它没有意义；锁被占（发布进行中）立即
         // 409 让调用方稍后重试。delete 保持阻塞等待语义（清理动作，等一下无妨）。
@@ -44,6 +51,24 @@ impl AppService {
             ))
         })?;
         let _update_lock = self.operation_guard(app_id, _update_lock, false).await?;
+        let result = self
+            .update_app_with_guard(app_id, request, &_update_lock)
+            .await;
+        if result.is_ok() || !_update_lock.has_unfinished_mutation() {
+            _update_lock.finish().await?;
+        }
+        result?;
+        self.get_app(app_id).await
+    }
+
+    /// Trusted deployment assembly calls this while retaining the application lease
+    /// through stage confirmation. This method never re-enters the operation lock.
+    pub(crate) async fn update_app_with_guard(
+        &self,
+        app_id: &str,
+        request: UpdateAppRequest,
+        _update_lock: &crate::service::AppOperationGuard,
+    ) -> AppResult<()> {
         let current = self.fetch_runtime_status_or_err(app_id).await?;
         // 乐观锁：expected_resource_version 不匹配 → 409 Conflict
         // （Docker resource_version=None → 跳过校验，开发环境 last-write-wins 可接受）
@@ -54,7 +79,7 @@ impl AppService {
             let error = AppOperationError::Conflict(format!(
                 "resource version mismatch: expected={expected}, actual={actual}"
             ));
-            _update_lock.finish().await?;
+            _update_lock.mark_completed();
             return Err(error);
         }
         let params = self
@@ -86,7 +111,7 @@ impl AppService {
                     current: cur,
                     requested,
                 }) => {
-                    _update_lock.finish().await?;
+                    _update_lock.mark_completed();
                     return Err(AppOperationError::Validation(format!(
                         "K8s PVC supports expansion only: app {app_id} requested {requested} < current {cur}"
                     )));
@@ -142,7 +167,7 @@ impl AppService {
                         container_runtime_api::ContainerRuntimeError::PreparationFailed(_)
                     )
                 {
-                    _update_lock.finish().await?;
+                    _update_lock.mark_completed();
                 }
                 return Err(map_runtime_error(
                     &format!("[APP] patch_deployment failed app_id={app_id}"),
@@ -178,10 +203,9 @@ impl AppService {
                 request.space_id.clone(),
             )
             .await;
-        _update_lock.finish().await?;
         self.remove_unused_process_release_lock(app_id);
         self.invalidate_deploy_cache().await;
-        self.get_app(app_id).await
+        Ok(())
     }
 
     /// 删除应用（v2 §5.3：默认保留持久存储，purge=true 才清空数据面）。

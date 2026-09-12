@@ -28,11 +28,10 @@ pub struct StartAppRequest {
     /// （metadata 回退→runtime 兜底 app_id 的孤儿目录路径已随必填化退役。）
     #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
-    /// 发布版本标记（幂等键）。缺省自动生成（`rel-{时间戳}-{随机}`）并在响应返回；
-    /// 显式传入时同 id+同内容重复部署幂等命中。
+    /// 请求版本标记。缺省自动生成并在响应返回；与制品 manifest 身份和内部部署操作 ID 分离。
     #[garde(skip)]
     pub release_id: Option<String>,
-    /// 制品 sha256（64 位十六进制小写）。可选——给出则下载后校验一致性，
+    /// 制品 sha256（64 位 ASCII 十六进制，大小写统一）。可选——给出则部署前校验格式、下载后校验一致性，
     /// 缺省跳过校验（信任内网源）。
     #[garde(skip)]
     pub sha256: Option<String>,

@@ -39,6 +39,9 @@ fn k8s_entries(env: &Env) -> Vec<String> {
 
 /// K8s gate：TEST_K8S_SSH 存在 + 首入口 /health 可达。
 async fn k8s_or_skip(scenario: &str) -> Option<(Env, JsonlReporter, Vec<String>)> {
+    if !rcoder_e2e::common::require_context_or_skip() {
+        return None;
+    }
     let env = Env::load();
     // entries 提前构造（环境行记录实际入口，排查时可见）
     let entries = k8s_entries(&env);
