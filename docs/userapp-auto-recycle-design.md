@@ -27,7 +27,7 @@ UserApp 全量业务接口已验证通过。长期运行的 UserApp 占用 K8s �
 
 1. 闲置超过阈值 → 自动 **scale replicas → 0**（回收算力，**不删任何资源**：Deployment/Service/NodePort/PVC/pingora 路由全保留）。
 2. 有真实流量到达 → 自动 **scale → 1** 拉起，等 Ready 后代理。
-3. 全局开关 + 可配阈值（默认 5 天），per-app 可覆盖。
+3. 全局开关 + 可配阈值（默认 2 小时），per-app 可覆盖。
 
 **现状缺口**（勘探结论）：
 - `cleanup_task`（[cleaner.rs:206](../../crates/rcoder/src/cleanup_task/cleaner.rs)）**故意跳过 UserApp**——UserApp 不进 `state.projects` 表，扫描器看不到。
@@ -38,7 +38,7 @@ UserApp 全量业务接口已验证通过。长期运行的 UserApp 占用 K8s �
 ### 1.2 功能需求
 
 - **R1 自动回收**：闲置超过阈值的 Running UserApp → scale replicas 0。仅回收 `managed-by=rcoder-app-manager` 的 Deployment；跳过 `protection_seconds` 内新建的 app。
-- **R2 配置开关**：全局 `enabled`(默认 true，可由部署侧关闭) + `idle_timeout_seconds`(默认 432000=5天) + `scan_interval_seconds`(默认 3600) + `wake_timeout_seconds`(默认 60) + `protection_seconds`(默认 300)。
+- **R2 配置开关**：全局 `enabled`(默认 true，可由部署侧关闭) + `idle_timeout_seconds`(默认 7200=2小时) + `scan_interval_seconds`(默认 3600) + `wake_timeout_seconds`(默认 60) + `protection_seconds`(默认 300)。
 - **R3 流量唤醒**：仅由空闲回收产生的 stopped UserApp 收到 `/api/v1/userapp/proxy/app/prod/{user_id}/{id}/...`（应用流量族，touch）或 `/api/v1/userapp/proxy/{tool}/prod/{user_id}/{id}/...`（工具族，wake-without-touch）请求时，自动 scale 1 → 轮询 Ready（上限 `wake_timeout`）→ Ready 后正常代理；超时返回 503+`Retry-After: 15`。用户手动停止和发布切换期间禁止流量唤醒。
 - **R4 per-app 回收策略（付费/免费分层）**：默认所有 UserApp **可回收**（= 免费用户语义）。允许对**单独 app** 设为不回收——通过 `CreateAppRequest`/`UpdateAppRequest` 的 `recycle_enabled: Option<bool>` 字段（rcoder 持久化为 Deployment 注解 `rcoder.io/recycle-enabled`），`false` = **永不回收**（付费 / 需常驻的 app）。另支持 `idle_timeout_seconds: Option<u64>` 字段（注解 `rcoder.io/idle-timeout-seconds`）覆盖全局阈值。**rcoder 不感知"付费/免费"业务概念**，只看布尔；tier→bool 映射由 Java 调用方决定（付费 → `recycle_enabled=false`）。
 
@@ -205,7 +205,7 @@ pub enum WakeOutcome { Ready, AlreadyRunning, Timeout, Failed(String) }
 ```rust
 pub struct UserAppRecycleConfig {
     #[serde(default = "default_true")] pub enabled: bool,       // default true（免费用户默认回收；部署侧可 helm/env 关闭）
-    #[serde(default = "default_5d")] pub idle_timeout_seconds: u64,        // 432000
+    #[serde(default = "default_2h")] pub idle_timeout_seconds: u64,        // 7200
     #[serde(default = "default_1h")] pub scan_interval_seconds: u64,       // 3600
     #[serde(default = "default_60")] pub wake_timeout_seconds: u64,        // 60
     #[serde(default = "default_300")] pub protection_seconds: u64,         // 300

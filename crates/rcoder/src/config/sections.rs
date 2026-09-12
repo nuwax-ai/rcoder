@@ -199,7 +199,7 @@ pub struct UserAppRecycleConfig {
     /// 是否启用自动回收 + 流量唤醒（默认 true；部署侧可 env/helm 关闭）
     #[serde(default = "default_userapp_recycle_enabled")]
     pub enabled: bool,
-    /// 闲置超时阈值（秒），默认 432000（5 天）
+    /// 闲置超时阈值（秒），默认 7200（2 小时）
     #[serde(default = "default_userapp_idle_timeout_seconds")]
     pub idle_timeout_seconds: u64,
     /// 回收扫描间隔（秒），默认 3600（1 小时）
@@ -218,7 +218,7 @@ fn default_userapp_recycle_enabled() -> bool {
 }
 
 fn default_userapp_idle_timeout_seconds() -> u64 {
-    432000 // 5 天
+    7200 // 2 小时
 }
 
 fn default_userapp_scan_interval_seconds() -> u64 {

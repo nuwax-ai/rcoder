@@ -253,7 +253,7 @@ mod tests {
 
     fn cfg() -> UserAppRecycleRuntimeConfig {
         UserAppRecycleRuntimeConfig {
-            idle_timeout: Duration::from_secs(432_000), // 5d
+            idle_timeout: Duration::from_secs(7_200), // 2h
             scan_interval: Duration::from_secs(3600),
             protection: Duration::from_secs(300),
         }
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn decide_skips_below_threshold() {
-        // idle=100s < 全局阈值 432000s
+        // idle=100s < 全局阈值 7200s
         let d = decide_recycle(
             &RecycleEvalInput {
                 replicas: 1,
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn decide_per_app_threshold_overrides_global() {
-        // per-app 阈值=60s;idle=100s > 60 → Recycle(即便全局 432000 本会跳过)
+        // per-app 阈值=60s;idle=100s > 60 → Recycle(即便全局 7200 本会跳过)
         let d = decide_recycle(
             &RecycleEvalInput {
                 replicas: 1,
