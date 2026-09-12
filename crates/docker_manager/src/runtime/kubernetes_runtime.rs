@@ -242,11 +242,15 @@ impl AgentContainerRuntime for KubernetesRuntime {
             };
             return tokio::spawn(async move {
                 let result = runtime.create_agent_container(params).await;
-                if result.is_ok() {
-                    lease
-                        .release()
-                        .await
-                        .map_err(ContainerRuntimeError::ConnectionError)?;
+                // 成败都释放：Err 是确定性返回（无在途写——create_agent_container
+                // 全内联 await，且本 spawn 已隔离调用方 cancel），保留锁只会把一次
+                // 可重试失败放大成该 app 的永久 409（迟到写复活由 UID CAS 兜底）。
+                if let Err(release_error) = lease.release().await {
+                    if result.is_ok() {
+                        return Err(ContainerRuntimeError::ConnectionError(release_error));
+                    }
+                    tracing::error!(error = %release_error,
+                        "release builder operation lease after failed create");
                 }
                 result
             })
@@ -541,5 +545,174 @@ impl WorkspaceRuntime for KubernetesRuntime {
         // 委派 K8sPvcOps::resize_app_pvc（读当前值→比较→patch/事实拒绝）。
         // trait 方法默认 no-op, Docker 不覆盖（bind 目录无容量语义）。
         K8sPvcOps::resize_app_pvc(self, app_id, new_size).await
+    }
+}
+
+#[cfg(all(test, feature = "kubernetes"))]
+mod create_lease_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn runtime(client: Client) -> KubernetesRuntime {
+        KubernetesRuntime {
+            client,
+            namespace: "review-test".into(),
+            config: KubernetesRuntimeConfig {
+                namespace: "review-test".into(),
+                cluster_domain: "cluster.local".into(),
+                pod_ttl_seconds: None,
+                image_pull_secret: None,
+                service_account_name: "test".into(),
+                nfs_server: "unused".into(),
+                nfs_path: "/unused".into(),
+                storage_class: "unused".into(),
+                access_mode: "ReadWriteOnce".into(),
+                docker_manager_config: Default::default(),
+                kubernetes_config: Default::default(),
+            },
+            pod_cache: Default::default(),
+            subvolume_path_cache: Default::default(),
+        }
+    }
+
+    /// 读一个完整 HTTP 请求（head + body），返回 (请求行起的 head, body)。
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 2048];
+        let (head, offset, length) = loop {
+            let n = stream.read(&mut buffer).await.expect("read");
+            assert!(n > 0);
+            bytes.extend_from_slice(&buffer[..n]);
+            if let Some(offset) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&bytes[..offset]).to_string();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().expect("length"))
+                    })
+                    .unwrap_or(0);
+                break (head, offset + 4, length);
+            }
+        };
+        while bytes.len() < offset + length {
+            let n = stream.read(&mut buffer).await.expect("body");
+            assert!(n > 0);
+            bytes.extend_from_slice(&buffer[..n]);
+        }
+        (head, bytes[offset..offset + length].to_vec())
+    }
+
+    async fn write_reply(stream: &mut tokio::net::TcpStream, code: u16, body: &serde_json::Value) {
+        let body = body.to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 {code} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("response");
+    }
+
+    /// create 中途确定性失败（claim builder storage 被 API server 403 拒——线上
+    /// 0.1.264 实测形态）时，operation lease 必须被显式释放：Err 只 drop 会把
+    /// ConfigMap 锁留在集群里，该 app 的后续 ensure 全部 409（5 把 builder 锁
+    /// 全残留的事故）。断言核心 = 失败后到达的锁 DELETE 请求。
+    #[tokio::test]
+    async fn create_container_releases_operation_lease_when_create_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            // 前 4 个请求：acquire POST ConfigMap → ensure 探测 GET PVC →
+            // claim 读 GET PVC → claim PATCH PVC（注入 403）。
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let (head, body) = read_request(&mut stream).await;
+                if head.starts_with("POST ") && head.contains("/configmaps") {
+                    let mut object: serde_json::Value =
+                        serde_json::from_slice(&body).expect("acquire body");
+                    object["metadata"]["uid"] = "lease-owner".into();
+                    object["metadata"]["resourceVersion"] = "42".into();
+                    write_reply(&mut stream, 200, &object).await;
+                } else if head.starts_with("GET ") && head.contains("persistentvolumeclaims") {
+                    write_reply(
+                        &mut stream,
+                        200,
+                        &serde_json::json!({
+                            "apiVersion":"v1","kind":"PersistentVolumeClaim",
+                            "metadata":{
+                                "name":"rcoder-app-builder-errclaim-workspace",
+                                "labels":{"service_type":"user-app-builder"},
+                                "uid":"pvc-owned","resourceVersion":"42"}
+                        }),
+                    )
+                    .await;
+                } else if head.starts_with("PATCH ") && head.contains("persistentvolumeclaims") {
+                    write_reply(
+                        &mut stream,
+                        403,
+                        &serde_json::json!({
+                            "apiVersion":"v1","kind":"Status","status":"Failure",
+                            "reason":"Forbidden","code":403,
+                            "message":"persistentvolumeclaims is forbidden: cannot patch"
+                        }),
+                    )
+                    .await;
+                } else {
+                    panic!("unexpected request: {head}");
+                }
+            }
+            // 第 5 个请求：失败路径的锁释放 DELETE（本测试的修复断言核心；
+            // 回归时（Err 不释放）此处 accept 超时，saw_release 保持 false）。
+            let mut saw_release = false;
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
+            {
+                let (head, body) = read_request(&mut stream).await;
+                assert!(
+                    head.starts_with("DELETE ")
+                        && head.contains("/configmaps/rcoder-operation-builder-errclaim"),
+                    "{head}"
+                );
+                let preconditions: serde_json::Value =
+                    serde_json::from_slice(&body).expect("release body");
+                assert_eq!(preconditions["preconditions"]["uid"], "lease-owner");
+                assert_eq!(preconditions["preconditions"]["resourceVersion"], "42");
+                write_reply(
+                    &mut stream,
+                    200,
+                    &serde_json::json!({"apiVersion":"v1","kind":"Status",
+                        "status":"Success","code":200}),
+                )
+                .await;
+                saw_release = true;
+            }
+            assert!(
+                saw_release,
+                "operation lease ConfigMap must be deleted after a failed create"
+            );
+        });
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let config = Config::new(format!("http://{address}").parse().expect("uri"));
+        let runtime = runtime(Client::try_from(config).expect("client"));
+        let params = ContainerCreateParams::builder()
+            .project_id("errclaim")
+            .user_id("u-lease")
+            .service_type(ServiceType::UserappBuilder)
+            .storage_size("10Gi")
+            .build();
+        let result = runtime.create_container(params).await;
+        let error = result.expect_err("create must fail at claim builder storage");
+        assert!(
+            error.to_string().contains("claim builder storage"),
+            "{error}"
+        );
+        server.await.expect("adapter assertions");
     }
 }

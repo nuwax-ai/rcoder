@@ -131,11 +131,14 @@ impl AgentContainerRuntime for DockerRuntime {
                     .start_prepared(params, prepared)
                     .await
                     .map_err(|e| ContainerRuntimeError::ContainerCreationError(e.to_string()));
-                if result.is_ok() {
-                    lease
-                        .release()
-                        .await
-                        .map_err(ContainerRuntimeError::ConnectionError)?;
+                // 与 Kubernetes 侧同型：成败都释放（Docker lease 为 flock，drop 即
+                // 释放；此处对齐为显式释放路径，与 K8s ConfigMap lease 表达一致）。
+                if let Err(release_error) = lease.release().await {
+                    if result.is_ok() {
+                        return Err(ContainerRuntimeError::ConnectionError(release_error));
+                    }
+                    tracing::error!(error = %release_error,
+                        "release builder operation lease after failed create");
                 }
                 result
             })

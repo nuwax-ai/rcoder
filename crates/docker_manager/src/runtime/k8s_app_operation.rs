@@ -1,5 +1,7 @@
 //! Per-application operation mutex. No expiration or automatic stale-owner takeover.
 //! A crashed owner's ConfigMap requires operator recovery after proving quiescence.
+//! Deterministic failures (the operation returned Err) are released explicitly by the
+//! calling site; the Drop guard below only retains leases for panic/cancel paths.
 use super::kubernetes_runtime::KubernetesRuntime;
 use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
 use k8s_openapi::api::core::v1::ConfigMap;
