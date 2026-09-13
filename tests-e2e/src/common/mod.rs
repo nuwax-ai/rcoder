@@ -572,8 +572,22 @@ fn cleanup_k8s(ssh: &str, ns: &str, user: &str) -> String {
     if ns == "nuwax-k8s-prod" {
         return "production cleanup is forbidden".into();
     }
+    let mut base_args = vec!["kubectl".to_owned()];
+    if let Ok(context) = std::env::var("TEST_K8S_CONTEXT") {
+        if context.is_empty()
+            || !context
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_@./:-".contains(&b))
+        {
+            return "invalid TEST_K8S_CONTEXT".to_owned();
+        }
+        base_args.extend(["--context".to_owned(), context]);
+    }
+    base_args.extend(["-n".to_owned(), ns.to_owned()]);
     let list = std::process::Command::new("ssh")
-        .args([ssh, "kubectl", "-n", ns, "get", "sts,svc", "-o", "name"])
+        .arg(ssh)
+        .args(&base_args)
+        .args(["get", "sts,svc", "-o", "name"])
         .output();
     let Ok(out) = list else {
         return "ssh kubectl get failed".to_owned();
@@ -590,12 +604,8 @@ fn cleanup_k8s(ssh: &str, ns: &str, user: &str) -> String {
     if targets.is_empty() {
         return "no resources".to_owned();
     }
-    let mut args = vec![
-        "kubectl".to_owned(),
-        "-n".to_owned(),
-        ns.to_owned(),
-        "delete".to_owned(),
-    ];
+    let mut args = base_args;
+    args.push("delete".to_owned());
     args.extend(targets.iter().cloned());
     match std::process::Command::new("ssh")
         .args([ssh])

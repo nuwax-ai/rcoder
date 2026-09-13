@@ -35,6 +35,7 @@ include make/quality.mk
 include make/pyroscope.mk
 include make/agent-runner.mk
 include make/observability.mk
+include make/remote-k8s.mk
 
 # 本地编译（仅编译，不构建镜像）
 build:
@@ -67,6 +68,7 @@ uninstall:
 
 # 默认目标：显示帮助信息
 help:
+	@echo "  make remote-k8s-verify SUITE=smoke - 远端同步、构建、部署及验证（配置见 specs/remote-k8s-dev/README.md）"
 	@echo "rcoder 开发模式 Makefile"
 	@echo ""
 	@echo "📦 编译和安装："

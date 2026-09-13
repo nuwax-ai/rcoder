@@ -74,7 +74,8 @@ class Run:
         return subprocess.check_output(args, cwd=ROOT.parent, text=True, timeout=90)
 
     def kube(self, *args):
-        command = shlex.join(['kubectl', '-n', self.args.namespace, *args])
+        context = getattr(self.args, 'context', None)
+        command = shlex.join(['kubectl', *(['--context', context] if context else []), '-n', self.args.namespace, *args])
         return self.local('ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', self.args.ssh, command)
 
     def inventory(self):
@@ -144,6 +145,13 @@ class Run:
         raise TimeoutError('Polling deadline: ' + str(value)[:1000])
 
     def prepare(self):
+        if self.args.namespace != 'nuwax-k8s-test':
+            if not re.fullmatch(r'rcoder-e2e-[a-z0-9][a-z0-9-]{0,35}', self.args.namespace):
+                raise ValueError('Only dedicated rcoder-e2e-* namespaces are accepted')
+            ns = json.loads(self.kube('get', 'namespace', self.args.namespace, '-o', 'json'))
+            owner = getattr(self.args, 'environment_id', None)
+            if not owner or ns['metadata'].get('labels', {}).get('rcoder.dev/environment') != owner:
+                raise ValueError('Remote E2E namespace ownership mismatch')
         nodes = json.loads(self.kube('get', 'nodes', '-o', 'json'))['items']
         addresses = {a['address'] for n in nodes for a in n['status']['addresses']}
         self.check('entry_targets_test_nodes', all(urllib.parse.urlparse(url).hostname in addresses for url in (self.args.url, self.args.proxy_url)))
@@ -178,7 +186,7 @@ class Run:
 
     def workspace(self):
         self.created = True  # Record intent before sending any creation request.
-        self.save('ownership.json', {'run_id': self.id, 'app_id': self.app, 'creation_intent': True})
+        self.save('ownership.json', {'run_id': self.id, 'app_id': self.app, 'user_id': self.user, 'creation_intent': True})
         payload = {'app_id': self.app, 'user_id': self.user}
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(lambda e: self.request('/api/v1/userapp/workspace', payload, e, timeout=240), self.entries[:2]))
@@ -311,7 +319,7 @@ strip_prefix = false
                 raise AssertionError('Refusing cleanup of a preexisting identity')
             if any(r['kind'] == 'Deployment' and r['name'] == 'rcoder-app-' + self.app for r in owned):
                 self.api('/api/v1/userapp/' + self.app + '/prod/delete', {'user_id': self.user, 'purge': True}, timeout=180)
-            self.api('/api/v1/userapp/' + self.app + '/delete/app', {}, timeout=180)
+            self.api('/api/v1/userapp/' + self.app + '/delete/app', {'user_id': self.user}, timeout=180)
             remaining = self.poll(lambda: [r for r in self.inventory() if self.owned(r)], lambda r: not r, 180)
             self.check('cleanup', not remaining, remaining)
         after = self.inventory()
@@ -326,7 +334,9 @@ strip_prefix = false
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--ssh', default=os.environ.get('TEST_K8S_SSH'), required=not os.environ.get('TEST_K8S_SSH'))
-    parser.add_argument('--namespace', default='nuwax-k8s-test', choices=['nuwax-k8s-test'])
+    parser.add_argument('--namespace', default='nuwax-k8s-test')
+    parser.add_argument('--context')
+    parser.add_argument('--environment-id')
     parser.add_argument('--deployment', default='nuwax-k8s-test-rcoder')
     parser.add_argument('--url', required=True)
     parser.add_argument('--proxy-url', required=True)

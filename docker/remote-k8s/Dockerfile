@@ -1,0 +1,31 @@
+# Uses the bundled BuildKit Dockerfile frontend; no extra frontend image pull.
+# Runtime images contain browsers/language tools; their resolved digests are in the receipt.
+ARG RUST_IMAGE=rust:1.95-trixie
+ARG RCODER_BASE
+ARG COMPUTER_BASE
+ARG RUNTIME_BASE
+FROM ${RUST_IMAGE} AS build
+ARG APT_MIRROR=http://deb.debian.org
+RUN sed -i "s#http://deb.debian.org#${APT_MIRROR}#g" /etc/apt/sources.list.d/debian.sources
+RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config protobuf-compiler libprotobuf-dev libclang-dev && rm -rf /var/lib/apt/lists/*
+ARG CARGO_MIRROR=
+RUN if [ -n "$CARGO_MIRROR" ]; then mkdir -p /usr/local/cargo && printf '[source.crates-io]\nreplace-with = "remote-mirror"\n[source.remote-mirror]\nregistry = "%s"\n' "$CARGO_MIRROR" > /usr/local/cargo/config.toml; fi
+WORKDIR /src
+COPY . .
+ARG CARGO_JOBS=4
+ENV CARGO_TARGET_DIR=/cache/target CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN --mount=type=cache,id=rcoder-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=rcoder-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=rcoder-cargo-target,target=/cache/target,sharing=locked \
+    cargo build --locked --jobs ${CARGO_JOBS} --profile dev -p rcoder -p agent_runner -p file-server-proxy --features rcoder/rcoder-pg --bin rcoder --bin agent_runner --bin file-server-proxy && \
+    cargo build --locked --jobs ${CARGO_JOBS} --profile dev --manifest-path crates/app-cli/Cargo.toml && \
+    mkdir /out && cp /cache/target/debug/rcoder /cache/target/debug/agent_runner /cache/target/debug/app-cli /cache/target/debug/file-server-proxy /out/
+FROM ${RCODER_BASE} AS rcoder
+COPY --link --from=build /out/rcoder /out/agent_runner /app/bin/
+COPY --link --from=build /out/agent_runner /usr/local/bin/agent_runner
+COPY --link docker/rcoder-master/agent-runner-start.sh /app/agent-runner-start.sh
+FROM ${COMPUTER_BASE} AS computer
+COPY --link --from=build /out/agent_runner /out/app-cli /usr/local/bin/
+FROM ${RUNTIME_BASE} AS runtime
+COPY --link --from=build /out/app-cli /out/file-server-proxy /usr/local/bin/
+COPY --link docker/app-runtime-base/start-app.sh /usr/local/bin/start-app.sh

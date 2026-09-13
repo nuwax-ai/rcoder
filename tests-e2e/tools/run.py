@@ -215,18 +215,27 @@ def main():
     parser.add_argument('--suite', default=os.environ.get('E2E_SUITE', ''))
     parser.add_argument('--filter', default=os.environ.get('E2E_FILTER', ''))
     parser.add_argument('--ignored', action='store_true')
+    parser.add_argument('--remote-k8s', action='store_true', help='Dedicated owned namespace; no Docker inventory or cleanup')
     args = parser.parse_args()
+    if args.remote_k8s:
+        if args.group != 'k8s':
+            parser.error('--remote-k8s requires --group k8s')
+        from remote_k8s_cleanup import validate
+        validate(os.environ)
     suites = args.suite.split(',') if args.suite else GROUPS[args.group]
     known = set(sum(GROUPS.values(), []))
     if not suites or any(s not in known for s in suites):
         parser.error('unknown or empty suite selection')
+    if args.remote_k8s and any(s not in GROUPS['k8s'] for s in suites):
+        parser.error('--remote-k8s only accepts K8s suites')
     run_id = uuid.uuid4().hex
     run = ROOT / 'reports' / run_id
     run.mkdir(parents=True)
     env = dict(os.environ, E2E_RUN_ID=run_id, E2E_STRICT='1')
     manifest = {'run_id': run_id, 'head': output('git', 'rev-parse', 'HEAD'),
                 'worktree_sha256': source_fingerprint(),
-                'containers_before': container_identities(),
+                'containers_before': [] if args.remote_k8s else container_identities(),
+                'remote_k8s': args.remote_k8s,
                 'suites': suites, 'filter': args.filter, 'planned': [], 'results': []}
     def persist():
         completed = {(row['suite'], row['test']) for row in manifest['results']}
@@ -293,10 +302,15 @@ def main():
         cmd = [case['executable'], case['test'], '--exact', '--test-threads=1', '--nocapture']
         if args.ignored:
             cmd += ['--include-ignored']
+        if args.remote_k8s:
+            from remote_k8s_cleanup import cleanup as remote_cleanup
+            cleanup_action = lambda: remote_cleanup(case_id, run_id, case_dir, case_env)
+        else:
+            cleanup_action = lambda: cleanup_case(case_id, run_id, case_dir, existing_ids)
         with (case_dir / 'process.log').open('w') as log:
             cleanup_errors, exit_code, interrupted = execute_case(
                 cmd, case_env, log,
-                lambda: cleanup_case(case_id, run_id, case_dir, existing_ids),
+                cleanup_action,
             )
         errors = validate_reports(case_dir, case["test"], run_id, case_id)
         errors.extend(cleanup_errors)
@@ -306,7 +320,7 @@ def main():
                     errors.append(f'cleanup failed: {cleanup.name}')
             except (OSError, ValueError):
                 errors.append(f'unreadable cleanup evidence: {cleanup.name}')
-        manifest['containers_after'] = container_identities()
+        manifest['containers_after'] = [] if args.remote_k8s else container_identities()
         if exit_code:
             errors.append(f'libtest exit {exit_code}')
         verdict = 'fail' if errors else 'pass'
