@@ -60,6 +60,12 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
 /// 创建（owner 走 metadata 链——浏览器终端 URL 无入参携带能力）。
 #[async_trait::async_trait]
 impl shared_types::UserappDevEnsure for UserappDevLocator {
+    async fn dev_builder_exists(&self, app_id: &str) -> Result<bool, String> {
+        // 与 dev_container_alive 同一类型化事实源：find_container 按
+        // UserappBuilder 身份键匹配——容器被删/被他人 IP 复用时恒 false。
+        shared_types::UserappDevLocator::dev_container_alive(self, app_id).await
+    }
+
     async fn ensure_dev_container(
         &self,
         app_id: &str,

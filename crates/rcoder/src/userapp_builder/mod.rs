@@ -126,15 +126,37 @@ pub(crate) async fn ensure_userapp_builder_until(
     let owner = resolve_owner(
         explicit_user_id,
         state.app_service.get_app_owner(app_id).await?.as_deref(),
-    )?;
+    )
+    .with_context(|| {
+        format!("cannot resolve owner user_id for app {app_id}; pass user_id explicitly")
+    })?;
     let identity = state.userapp_store.ensure_identity(app_id, &owner).await?;
-    if identity.current_operation_id.is_none()
+    if !builder_fenced_by_current_operation(state, &identity).await?
         && let Some(info) = registered_or_discovered_builder(state, app_id).await?
         && let Some(verified) = cross_verify_registration(state, app_id, &info).await?
     {
         return Ok(verified);
     }
     creation::ensure(state, app_id, &owner, _lifecycle, deadline).await
+}
+
+/// 当前操作是否围栏 builder：仅 builder 变更族（Ensure/Adopt/Stop/Restart/
+/// DestroyDevStorage）跳过注册快路径——生产部署等无关操作进行中，已验证的
+/// 注册继续服务（部署期 app-cli 经 rcoder static 转发下载制品依赖此路径，
+/// 否则新受理会与在途部署操作自冲突）。
+async fn builder_fenced_by_current_operation(
+    state: &AppState,
+    identity: &shared_types::UserAppLifecycleRecord,
+) -> Result<bool> {
+    let Some(operation_id) = identity.current_operation_id.as_deref() else {
+        return Ok(false);
+    };
+    let operation = state
+        .userapp_store
+        .get_operation(&identity.app_id, operation_id)
+        .await?
+        .ok_or_else(|| anyhow!("Current operation record is missing: {operation_id}"))?;
+    Ok(operation.kind.affects_builder())
 }
 
 /// 探活自愈版 [`ensure_userapp_builder`]：注册命中后连容器 file-server 探活
@@ -171,10 +193,13 @@ async fn ensure_userapp_builder_probed_until(
     let owner = resolve_owner(
         explicit_user_id,
         state.app_service.get_app_owner(app_id).await?.as_deref(),
-    )?;
+    )
+    .with_context(|| {
+        format!("cannot resolve owner user_id for app {app_id}; pass user_id explicitly")
+    })?;
     let identity = state.userapp_store.ensure_identity(app_id, &owner).await?;
 
-    if identity.current_operation_id.is_none()
+    if !builder_fenced_by_current_operation(state, &identity).await?
         && let Some(info) = registered_or_discovered_builder(state, app_id).await?
     {
         let addr = dev_file_server_addr(state, &info);
@@ -290,18 +315,15 @@ pub(crate) async fn cross_verify_registration(
         return Ok(None);
     };
     validate_builder_identity(app_id, &rc)?;
-    let owner = state
-        .app_service
-        .get_app_owner(app_id)
-        .await?
-        .ok_or_else(|| anyhow!("Builder owner metadata is unavailable: {app_id}"))?;
-    if rc.user_id.as_deref() != Some(owner.as_str()) {
-        return Err(anyhow!("Builder runtime ownership conflict: {app_id}"));
-    }
-    adoption::verify_live_builder(state, app_id, &rc.container_id).await?;
+    // 非 Running（含已删除容器的注册缓存残影）先归 None——调用方按需重建；
+    // 此时 verify 的 capture 查无物理负载，会误报"身份变更"。
     if rc.status != container_runtime_api::ContainerRuntimeStatus::Running {
         return Ok(None);
     }
+    // owner 校验统一由 verify_live_builder 的运行时 capture 以绑定标签
+    // （rcoder.io/owner-id）执行；user_id 身份槽位对 userapp 族恒为空
+    // （身份键是 app_id），不能与 owner 比较。
+    adoption::verify_live_builder(state, app_id, &rc.container_id).await?;
     let Some(updated) = refreshed_registration(registered, &rc) else {
         return Ok(Some(registered.clone()));
     };
@@ -378,9 +400,8 @@ async fn registered_or_discovered_builder(
         .get_app_owner(app_id)
         .await?
         .ok_or_else(|| anyhow!("Builder owner metadata unavailable: {app_id}"))?;
-    if actual.user_id.as_deref() != Some(owner.as_str()) {
-        return Err(anyhow!("Builder runtime ownership conflict: {app_id}"));
-    }
+    // owner 绑定由下方 verify_live_builder 以 rcoder.io/owner-id 标签校验；
+    // userapp 族身份槽位不含 user_id，不在此比较（注册登记仍需 owner）。
     if actual.status != container_runtime_api::ContainerRuntimeStatus::Running {
         return Ok(None);
     }

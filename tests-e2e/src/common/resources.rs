@@ -301,7 +301,42 @@ fn cleanup_inner(name: &str, delete: bool) -> Result<(), String> {
         }
     }
     if receipt.as_ref().is_some_and(|r| r["id"] != id) {
-        return Err("container identity changed since registration; refusing cleanup".into());
+        // 系统自愈/重建会产生同应用新容器（同 app/owner/lifecycle 标签）：
+        // 校验当前容器标签仍与登记的应用身份一致则刷新回执继续清理；
+        // 标签不符（真身份对调）依旧拒绝。
+        let labels = Command::new("docker")
+            .args(["inspect", "--format", "{{json .Config.Labels}}", &id])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !labels.status.success() {
+            return Err("container identity changed; label verification failed".into());
+        }
+        let labels: serde_json::Value =
+            serde_json::from_slice(&labels.stdout).map_err(|e| e.to_string())?;
+        let matches_receipt = receipt.as_ref().is_some_and(|r| {
+            labels["rcoder.io/application-id"].as_str() == r["app_id"].as_str()
+                && r["user_id"]
+                    .as_str()
+                    .is_some_and(|owner| labels["rcoder.io/owner-id"].as_str() == Some(owner))
+                && r["lifecycle_id"].as_str().is_some_and(|lifecycle| {
+                    labels["rcoder.io/lifecycle-id"].as_str() == Some(lifecycle)
+                })
+        });
+        if !matches_receipt {
+            return Err("container identity changed since registration; refusing cleanup".into());
+        }
+        let mut refreshed = receipt.clone().unwrap_or_default();
+        refreshed["id"] = serde_json::json!(id);
+        if let Some(root) = std::env::var_os("E2E_REPORT_DIR") {
+            let path = PathBuf::from(root)
+                .join("resources")
+                .join(format!("{name}-ownership.json"));
+            std::fs::write(
+                &path,
+                serde_json::to_string(&refreshed).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        }
     }
     let diagnostics = (|| -> Result<(), String> {
         if let Some(root) = std::env::var_os("E2E_REPORT_DIR") {

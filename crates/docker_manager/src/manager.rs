@@ -31,8 +31,15 @@ pub struct DockerManager {
 impl DockerManager {
     /// 创建新的 Docker 管理器
     pub async fn new(config: DockerManagerConfig) -> DockerResult<Self> {
+        // 与 rcoder::docker_init 同源的容器侧 socket 约定：DOCKER_SOCKET_PATH
+        // 指定非默认挂载点（如隔离测试的故障代理 socket）时按显式路径连接。
         let docker = if let Some(host) = &config.docker_host {
             Docker::connect_with_http(host, 120, API_DEFAULT_VERSION)?
+        } else if let Ok(socket) = std::env::var("DOCKER_SOCKET_PATH")
+            && !socket.trim().is_empty()
+            && socket != "/var/run/docker.sock"
+        {
+            Docker::connect_with_socket(&socket, 120, API_DEFAULT_VERSION)?
         } else {
             Docker::connect_with_local_defaults()?
         };

@@ -45,13 +45,21 @@ impl HostPathResolver {
     pub async fn new_with_docker_socket(docker_socket_path: Option<String>) -> DockerResult<Self> {
         debug!("startingcreated HostPathResolver");
 
-        // 创建容器自检器
+        // 创建容器自检器；未显式指定时沿用与 DockerManager::new 同源的
+        // 容器侧 socket 约定（DOCKER_SOCKET_PATH，如隔离测试的代理 socket）。
         let socket_path = docker_socket_path
             .as_deref()
-            .unwrap_or("/var/run/docker.sock");
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var("DOCKER_SOCKET_PATH")
+                    .ok()
+                    .map(|socket| socket.trim().to_owned())
+                    .filter(|socket| !socket.is_empty())
+            })
+            .unwrap_or_else(|| "/var/run/docker.sock".to_owned());
 
         let inspector = Arc::new(
-            ContainerSelfInspector::new(socket_path)
+            ContainerSelfInspector::new(&socket_path)
                 .await
                 .map_err(|e| {
                     DockerError::ConfigurationError(format!(

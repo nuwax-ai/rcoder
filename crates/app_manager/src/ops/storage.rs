@@ -45,6 +45,20 @@ impl crate::service::AppService {
         app_id: &str,
     ) -> AppResult<StorageInfo> {
         validate_app_id(app_id)?;
+        // 权威生命周期记录缺失 = 应用从未存在（墓碑也保留 owner）：per-app
+        // 存储只能随应用创建产生，直接判定不存在。存在记录但 owner 缺失仍走
+        // 下游 InvalidState（异常数据不得静默）。存储读取错误照常上抛——
+        // 只有权威"查无"能证明不存在，不能把存储故障当不存在。
+        let authoritative_absent = self.metadata.lookup(app_id).await?.is_none();
+        if authoritative_absent {
+            return Ok(StorageInfo {
+                app_id: app_id.to_string(),
+                exists: false,
+                path: String::new(),
+                modified_at: None,
+                is_orphan: false,
+            });
+        }
         let is_orphan = match app_stage {
             UserappStage::Prod => self.is_storage_orphan(app_id).await?,
             UserappStage::Dev => self.is_dev_storage_orphan(app_id).await?,

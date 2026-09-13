@@ -30,7 +30,11 @@ REQUIRED = {'cluster_ready', 'concurrent_ensure', 'ensure_retry', 'builder_ident
             'sse_terminal', 'sse_past_terminal', 'cross_replica_cancel', 'cold_deploy',
             'content_A', 'hot_env_rejected', 'hot_failure', 'old_content_healthy',
             'hot_deploy', 'content_B', 'hot_pod_preserved', 'deploy_identity',
-            'stop_idempotent', 'stop_zero_pods', 'wake_new_pod', 'wake', 'wake_content_B', 'cleanup', 'baseline_preserved'}
+            'lifecycle_active', 'stop_request_operation', 'stop_operation_by_request',
+            'lifecycle_stable_stop_wake',
+            'stop_idempotent', 'stop_zero_pods', 'wake_new_pod', 'wake', 'wake_content_B', 'cleanup',
+            'tombstone_deleted', 'tombstone_old_ensure_rejected', 'recreate_new_lifecycle',
+            'recreate_deleted', 'baseline_preserved'}
 
 
 def compact_resource(row):
@@ -58,6 +62,7 @@ class Run:
         self.tunnel = None
         self.baseline = []
         self.created = False
+        self.lifecycle_id = None
         self.base = args.url.rstrip('/')
         self.entries = []
         self.trace = uuid.uuid4().hex
@@ -184,6 +189,9 @@ class Run:
                         raise
                     time.sleep(.2)
 
+    def lifecycle(self):
+        return self.api(f'/api/v1/userapp/{self.app}/lifecycle?' + urllib.parse.urlencode({'user_id': self.user}))
+
     def workspace(self):
         self.created = True  # Record intent before sending any creation request.
         self.save('ownership.json', {'run_id': self.id, 'app_id': self.app, 'user_id': self.user, 'creation_intent': True})
@@ -201,6 +209,11 @@ class Run:
         builders = [r for r in inventory if r['kind'] == 'Pod' and r['name'].startswith('rcoder-app-builder-' + self.app)]
         self.check('builder_identity', len(builders) == 1 and not any(r['name'] == 'rcoder-operation-builder-' + self.app for r in inventory), builders)
         self.builder_uid = builders[0]['uid']
+        record = self.lifecycle()
+        self.save('lifecycle.json', record)
+        self.check('lifecycle_active', bool(record['lifecycle_id']) and record['state'] == 'Active'
+                   and record['lifecycle_epoch'] == 1 and record['metadata_revision'] >= 1, record)
+        self.lifecycle_id = record['lifecycle_id']
         for i, entry in enumerate(self.entries):
             status, data = self.request('/api/v1/userapp/generate-file', {**payload, 'file_name': f'replica-{i}.txt', 'content': self.id}, entry, {'X-App-Id': self.app})
             self.check(f'file_write_{i}', status == 200 and data.get('success') is True, data)
@@ -297,9 +310,15 @@ strip_prefix = false
                    and data.get('protocol_version') == 4 and operation.get('request_release_id') == hot['release_id']
                    and operation.get('phase') == 'running' and operation.get('deployment_generation_id')
                    and operation.get('deploy_stage') == 'succeeded' and operation.get('persisted') is True, data)
+        stop_request_id = 'stop-' + uuid.uuid4().hex
         for _ in range(2):
-            self.api('/api/v1/userapp/' + self.app + '/stop?user_id=' + self.user, {})
-        self.check('stop_idempotent', True)
+            status, envelope = self.request('/api/v1/userapp/' + self.app + '/stop?' + urllib.parse.urlencode({'user_id': self.user, 'request_id': stop_request_id}), {})
+            self.check('stop_idempotent', status == 200 and envelope.get('code') == '0000', envelope)
+        self.check('stop_request_operation', bool(envelope.get('operation_id')), envelope)
+        view = self.api('/api/v1/userapp/' + self.app + '/operations/by-request?' + urllib.parse.urlencode({'user_id': self.user, 'request_id': stop_request_id}))
+        self.save('stop-operation.json', view)
+        self.check('stop_operation_by_request', view and view['operation_id'] == envelope['operation_id']
+                   and view['kind'] == 'Stop' and view['state'] == 'Succeeded' and view['lifecycle_id'] == self.lifecycle_id, view)
         stopped = self.poll(lambda: [r for r in self.inventory() if r['kind'] == 'Pod' and r['name'].startswith('rcoder-app-' + self.app + '-')], lambda rows: not rows, 120)
         self.check('stop_zero_pods', not stopped)
         self.api(path, {'user_id': self.user}, timeout=240)
@@ -308,6 +327,9 @@ strip_prefix = false
         awakened = self.prod_pod()
         self.save('production-wake.json', awakened)
         self.check('wake_new_pod', awakened['uid'] != after['uid'], awakened['uid'])
+        stable = self.lifecycle()
+        self.check('lifecycle_stable_stop_wake', stable['lifecycle_id'] == self.lifecycle_id
+                   and stable['state'] == 'Active' and stable['lifecycle_epoch'] == 1, stable)
 
     def cleanup(self):
         if self.created:
@@ -320,8 +342,31 @@ strip_prefix = false
             if any(r['kind'] == 'Deployment' and r['name'] == 'rcoder-app-' + self.app for r in owned):
                 self.api('/api/v1/userapp/' + self.app + '/prod/delete', {'user_id': self.user, 'purge': True}, timeout=180)
             self.api('/api/v1/userapp/' + self.app + '/delete/app', {'user_id': self.user}, timeout=180)
+            if self.lifecycle_id is None:
+                remaining = self.poll(lambda: [r for r in self.inventory() if self.owned(r)], lambda r: not r, 180)
+                self.check('cleanup', not remaining, remaining)
+                return self.preserve_baseline()
+            tombstone = self.lifecycle()
+            self.save('lifecycle-tombstone.json', tombstone)
+            self.check('tombstone_deleted', tombstone['state'] == 'Deleted'
+                       and tombstone['lifecycle_id'] == self.lifecycle_id, tombstone)
+            status, rejected = self.request('/api/v1/userapp/workspace', {'app_id': self.app, 'user_id': self.user}, timeout=120)
+            self.save('tombstone-ensure.json', rejected)
+            self.check('tombstone_old_ensure_rejected', status == 200 and rejected.get('code') != '0000', rejected)
+            recreated = self.api('/api/v1/userapp/' + self.app + '/recreate', {'user_id': self.user, 'expected_lifecycle_id': self.lifecycle_id, 'request_id': 'recreate-' + self.id}, timeout=120)
+            self.save('lifecycle-recreated.json', recreated)
+            self.check('recreate_new_lifecycle', recreated['lifecycle_id'] != self.lifecycle_id
+                       and recreated['lifecycle_epoch'] == tombstone['lifecycle_epoch'] + 1
+                       and recreated['state'] == 'Active', recreated)
+            self.api('/api/v1/userapp/' + self.app + '/delete/app', {'user_id': self.user, 'lifecycle_id': recreated['lifecycle_id']}, timeout=180)
+            final = self.lifecycle()
+            self.check('recreate_deleted', final['state'] == 'Deleted'
+                       and final['lifecycle_id'] == recreated['lifecycle_id'], final)
             remaining = self.poll(lambda: [r for r in self.inventory() if self.owned(r)], lambda r: not r, 180)
             self.check('cleanup', not remaining, remaining)
+        self.preserve_baseline()
+
+    def preserve_baseline(self):
         after = self.inventory()
         self.save('after-cleanup.json', after)
         # Workload/PVC UIDs are stable; unrelated Pods can legitimately roll independently.

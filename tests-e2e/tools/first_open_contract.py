@@ -4,6 +4,7 @@ import json
 import sqlite3
 import time
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -53,6 +54,23 @@ def exercise(base, app, user, database):
             return {'entry': entry, 'http_status': response.status,
                     'elapsed_seconds': time.monotonic() - started, 'success': success}
 
+    def admitted_operation():
+        # 受理窗口观察走 HTTP。宿主直读 bind 挂载的 SQLite 与容器内 WAL/shm
+        # mmap 跨 OS 不相干——写侧 checkpoint 截断可致容器 SIGBUS（实测 Exit 135）。
+        # 数据库直读仅保留在全部请求静止后的终态校验。
+        url = base + '/api/v1/userapp/' + app + '/operations/current?user_id=' + urllib.parse.quote(user)
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                body = json.load(response)
+        except urllib.error.HTTPError:
+            return None
+        if body.get('code') != '0000' or not body.get('data'):
+            return None
+        operation = body['data']
+        if operation.get('kind') != 'EnsureBuilder' or operation.get('state') not in ('Pending', 'Running'):
+            return None
+        return operation
+
     # Observe admission before querying a read-only route. A query before any
     # operation exists may legitimately return not-found and must not create it.
     with ThreadPoolExecutor(max_workers=5) as pool:
@@ -60,19 +78,20 @@ def exercise(base, app, user, database):
         deadline = time.monotonic() + 20
         accepted = None
         while time.monotonic() < deadline:
-            pending = [op for op in operations(database, app)
-                       if op['kind'] == 'EnsureBuilder' and op['state'] in ('Pending', 'Running')]
-            if len(pending) == 1:
-                accepted = pending[0]
+            pending = admitted_operation()
+            if pending is not None:
+                accepted = pending
                 break
             if leader.done():
                 leader.result()  # preserve a concrete HTTP error when available
                 raise RuntimeError('first-open did not expose the required in-flight operation window')
-            time.sleep(0.01)
+            time.sleep(0.05)
         if accepted is None:
             raise RuntimeError('first-open durable acceptance was not observed')
         followers = [pool.submit(request, entry) for entry in ENTRIES]
         results = [leader.result()] + [future.result() for future in followers]
+    # 静默期（全部请求终态、写侧停止）后再直读数据库做终态对账。
+    time.sleep(1)
     completed = [op for op in operations(database, app) if op['kind'] == 'EnsureBuilder']
     if (len(completed) != 1 or completed[0]['operation_id'] != accepted['operation_id']
             or completed[0]['state'] != 'Succeeded'):

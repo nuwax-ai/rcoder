@@ -168,8 +168,19 @@ def main():
             except (OSError, RuntimeError):
                 pass
             command('docker', 'start', cid)
+            # 随机宿主端口（127.0.0.1::8090）在容器 kill→start 后会重新分配，
+            # 探活前须重解析映射端口。
+            base = 'http://' + command(*compose, 'port', 'rcoder', '8090')
+            receipt['base'] = base
             wait_ready(base)
-            restored = db_operation(root, receipt['app_id'])
+            # 恢复隔离由重启实例的异步扫描落库（启动+5s 周期）；有界等待
+            # quarantine 终态，不放宽断言本身。
+            deadline = time.monotonic() + 20
+            while True:
+                restored = db_operation(root, receipt['app_id'])
+                if restored['state'] == 'RecoveryRequired' or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.5)
             after = owned_builder_rows(receipt)
             attempts = (control / 'create-attempts.jsonl').read_text().splitlines()
             if (restored['operation_id'] != original['operation_id'] or restored['state'] != 'RecoveryRequired'
@@ -183,7 +194,9 @@ def main():
                 'builder_ids': [row['Id'] for row in after], 'rcoder_id': cid, 'image_id': image_id}, indent=2))
             record('Docker ' + mode + ' restart quarantines without replay', True)
         except (OSError, ValueError, KeyError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
-            record('Docker ' + mode + ' execution', False, type(error).__name__)
+            detail = type(error).__name__ if isinstance(error, (OSError, subprocess.SubprocessError)) \
+                else type(error).__name__ + ': ' + str(error)
+            record('Docker ' + mode + ' execution', False, detail)
         finally:
             if (root / 'control/barrier.json').exists():
                 (root / 'control/release').write_text('discard')

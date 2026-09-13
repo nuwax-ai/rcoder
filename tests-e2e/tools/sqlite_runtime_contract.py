@@ -245,7 +245,10 @@ def main():
             receipt['builder_id'] = builder['Id']
             record(f'SQLite Compose {index} one builder identity', True)
             receipt_path.write_text(json.dumps(receipt, indent=2))
-            op = http(receipt['base'], path + '/operations/current?user_id=' + receipt['user_id'])['data']
+            # current 指针在成功终态后按设计清空；用 first-open 回传的
+            # operation_id 定位已完成操作做归属断言。
+            op = http(receipt['base'], path + '/operations/' + concurrency['operation_id']
+                      + '?user_id=' + receipt['user_id'])['data']
             if not op or op['state'] != 'Succeeded' or op['lifecycle_id'] != life['lifecycle_id']:
                 raise RuntimeError('builder creation has no matching successful durable operation')
             before = snapshot_db(root.resolve(), receipt['app_id'])
@@ -261,9 +264,21 @@ def main():
                                       'label=rcoder.io/application-id=' + receipt['app_id'], '--filter',
                                       'label=service-type=user-app-builder').split()
             if current_builder != [receipt['builder_id']]:
+                # 失败取证：登记的 builder 身份与重建后清单
+                evidence = {
+                    'registered_builder_id': receipt['builder_id'],
+                    'current_builder_ids': current_builder,
+                    'builder_rows': [json.loads(row) for row in (
+                        command('docker', 'inspect', *current_builder).splitlines() if current_builder else [])],
+                    'recreation': {'old_id': old_id, 'new_id': new_id},
+                    'new_instance_log': subprocess.run(['docker', 'logs', '--tail', '300', new_id],
+                                                       capture_output=True, text=True, timeout=30).stdout[-60000:],
+                }
+                (root / 'builder-replacement.json').write_text(json.dumps(evidence, indent=2)[:100000])
                 raise RuntimeError('rcoder recreation replaced the existing application builder')
             after_life = http(receipt['base'], path + '/lifecycle?user_id=' + receipt['user_id'])['data']
-            after_op = http(receipt['base'], path + '/operations/current?user_id=' + receipt['user_id'])['data']
+            after_op = http(receipt['base'], path + '/operations/' + concurrency['operation_id']
+                            + '?user_id=' + receipt['user_id'])['data']
             after = snapshot_db(root.resolve(), receipt['app_id'])
             if old_id == new_id or before != after or life != after_life or op != after_op:
                 raise RuntimeError('container recreation did not preserve lifecycle and operation exactly')
@@ -301,7 +316,10 @@ def main():
 
         except (OSError, ValueError, KeyError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
             # Do not include raw CLI stderr or URLs which may contain credentials.
-            record(f'SQLite Compose {index} execution', False, type(error).__name__)
+            # Constructed RuntimeError/ValueError messages are safe literals.
+            detail = type(error).__name__ if isinstance(error, (OSError, subprocess.SubprocessError)) \
+                else type(error).__name__ + ': ' + str(error)
+            record(f'SQLite Compose {index} execution', False, detail)
         finally:
             try:
                 result = cleanup(root, run_id, case_id)

@@ -1989,8 +1989,14 @@ async fn userapp_dev_owner_header_lazy_ensure() {
     report.assert_hard(
         "B：x-user-id 显式档懒创建成功（拦截分流透传 200）",
         ok_b,
-        format!("HTTP {status_b}, {}", trunc(&body_b, 120)),
+        format!("HTTP {status_b}, {}", trunc(&body_b, 140)),
     );
+    // 懒创建走原生拦截分流（非 create_workspace 辅助），显式登记本场景
+    // 拥有的 builder 身份——严格清理入口要求创建回执。
+    if ok_b {
+        rcoder_e2e::common::resources::register_builder_attempt(&app, user, true)
+            .expect("register lazy-created builder identity");
+    }
 
     // B'｜懒创建后注册表命中：无 header 再调同 app → 200（owner 只在创建路径需要）
     let resp = env
@@ -2125,6 +2131,12 @@ async fn userapp_dev_new_endpoint_body_query_locate() {
         ok_a,
         format!("HTTP {status_a}, {}", trunc(&body_a, 140)),
     );
+    // 懒创建经 dev 转发链发生（非 create_workspace 辅助），显式登记本场景
+    // 拥有的 builder 身份——严格清理入口要求创建回执。
+    if ok_a {
+        rcoder_e2e::common::resources::register_builder_attempt(&app, user, true)
+            .expect("register lazy-created builder identity");
+    }
 
     // B｜query-only GET dev/list：无 header，query app_id+user_id 自定位
     let resp = env

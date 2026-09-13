@@ -44,4 +44,13 @@ pub trait UserappDevEnsure: Send + Sync {
         app_id: &str,
         user_id: Option<&str>,
     ) -> Result<crate::ContainerBasicInfo, String>;
+
+    /// 注册表命中值的类型化身份核验：按 app 身份键查运行时确认 builder
+    /// 物理存在。内存 lookup 表不随容器删除失效，且容器 IP 可被其他应用
+    /// 的 builder 复用（端口探测通过≠身份正确）；代理 fast path 接受注册
+    /// IP 前必须经此核验。默认 false——未实现时调用方走 miss→ensure。
+    async fn dev_builder_exists(&self, app_id: &str) -> Result<bool, String> {
+        let _ = app_id;
+        Ok(false)
+    }
 }

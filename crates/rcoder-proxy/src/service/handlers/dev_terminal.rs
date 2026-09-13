@@ -73,9 +73,24 @@ pub(crate) async fn find_dev_container(
             lookup.find_by_project_id(app_id, &shared_types::ServiceType::UserappBuilder)
         })
         .filter(|ip| !ip.is_empty())
-        && utils::tcp_port_reachable(&ip, probe_port).await
     {
-        return Ok(ip);
+        // 注册表 IP 是内存残影：不随容器删除失效，且 IP 可被其他应用的
+        // builder 复用（端口探测通过≠身份正确——跨应用污染形态）。接受该
+        // IP 前先经类型化身份核验（按 app 身份键查运行时）；核验不可用
+        // （回调未注入）时退回端口探测旧语义。
+        let identity_ok = match dev_ensure.load_full() {
+            Some(ensurer) => match ensurer.dev_builder_exists(app_id).await {
+                Ok(exists) => exists,
+                Err(e) => {
+                    warn!("[DEV_TERMINAL] builder identity check failed: app_id={app_id}: {e}");
+                    false
+                }
+            },
+            None => true,
+        };
+        if identity_ok && utils::tcp_port_reachable(&ip, probe_port).await {
+            return Ok(ip);
+        }
     }
     // miss（或命中死值——容器被外部删除后内存表残留旧 IP，探测失败）
     // → 懒启动（显式 owner 档：URL user_id 段直取，宿主树

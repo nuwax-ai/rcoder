@@ -16,7 +16,7 @@ CASES = {
         'activity_registry::tests::traffic_wake_does_not_confirm_a_replacement_running_resource',
         'service::tests::storage_expansion_receipt_is_bound_to_the_update_operation',
         'service::tests::update_commits_a_durable_operation_matching_runtime_context',
-        'handlers::control::tests::retry_handler_separates_pending_execution_from_confirmed_builder_reconciliation',
+        'handlers::control::builder_retry_tests::retry_handler_separates_pending_execution_from_confirmed_builder_reconciliation',
     ),
     'docker_manager': (
         'runtime::docker_builder_deletion::tests::captured_file_release_requires_inactive_original_inode_and_owner',
@@ -89,8 +89,12 @@ def main():
             if set(cases) - names:
                 raise RuntimeError('required concurrency cases absent: ' + ', '.join(sorted(set(cases) - names)))
             for case in cases:
+                # 契约子进程自含运行镜像 env：部分组件用例（如 update 扩容回执）
+                # 解析部署镜像，宿主 shell 未必导出该变量。
+                case_env = dict(os.environ, RCODER_RUNTIME_IMAGE_DIGEST=os.environ.get(
+                    'RCODER_RUNTIME_IMAGE_DIGEST', 'dev-app-runtime:latest'))
                 result = subprocess.run([str(frozen), case, '--exact', '--nocapture'], cwd=REPO,
-                                        capture_output=True, text=True, timeout=120)
+                                        capture_output=True, text=True, timeout=120, env=case_env)
                 log = result.stdout + result.stderr
                 (directory / (target + '-' + case.replace('::', '-') + '.log')).write_text(log)
                 record('Concurrency ' + case, passed_exactly_one(result.returncode, log))

@@ -276,6 +276,20 @@ impl UserAppOperationKind {
     pub fn ends_lifecycle(self) -> bool {
         matches!(self, Self::DeleteApplication)
     }
+
+    /// Whether the operation mutates or fences the shared dev builder itself.
+    /// Unrelated in-flight operations (e.g. a production deployment) must not
+    /// invalidate a verified builder registration for dev forwarding.
+    pub fn affects_builder(self) -> bool {
+        matches!(
+            self,
+            Self::EnsureBuilder
+                | Self::AdoptBuilder
+                | Self::StopBuilder
+                | Self::RestartBuilder
+                | Self::DestroyDevStorage
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]

@@ -499,8 +499,10 @@ impl AppService {
     ) -> AppResult<String> {
         validate_app_id(app_id)?;
         if app_stage == shared_types::UserappStage::Prod {
-            // 幻报拦截：ensure_running 对不存在的 app 返回 AlreadyRunning
-            // （stopped-set 语义），get_app NotFound 兜底 404
+            // 权威存在性检查前移：不存在的 app 直接 ERR_APP_NOT_FOUND。唤醒
+            // 协调器现在会校验权威身份，对无记录 app 返回 Failed（runtime
+            // 缺失），若先唤醒会把"应用不存在"吞成可重试的唤醒失败。
+            self.get_app(app_id).await?;
             use shared_types::AppWakeControl;
             match self.activity.ensure_running(app_id).await {
                 shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}

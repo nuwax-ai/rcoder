@@ -483,11 +483,16 @@ async fn stop_container_runtime_mode(
 pub fn get_container_patterns_for_enabled_services(
     multi_image_config: &shared_types::MultiImageConfig,
 ) -> Vec<String> {
-    // 直接遍历 services，获取启用的服务配置并使用其 container_prefix()
+    // 直接遍历 services，获取启用的服务配置并使用其 container_prefix()。
+    // UserappBuilder 排除：userApp 生命周期为持久化权威（SQLite/PG），builder
+    // 容器跨 rcoder 重启存活，重启后经注册表 miss→权威发现再导入；启动/停机
+    // 全量清删会摧毁在途工作区（Agent 容器仍属内存注册表语义，照旧清理）。
     multi_image_config
         .services
         .values()
-        .filter(|config| config.enabled)
+        .filter(|config| {
+            config.enabled && config.service_type != shared_types::ServiceType::UserappBuilder
+        })
         .map(|config| {
             let prefix = config.container_prefix();
             let pattern = format!("{}-*", prefix);
