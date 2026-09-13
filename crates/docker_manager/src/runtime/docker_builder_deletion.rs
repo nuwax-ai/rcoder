@@ -252,6 +252,52 @@ impl shared_types::AppOperationLease for BuilderFileLease {
 mod tests {
     use super::*;
     use shared_types::AppOperationLease;
+
+    #[tokio::test]
+    async fn failed_builder_completion_clears_only_confirmed_rejection_marker() {
+        for status in [403, 409, 408, 500] {
+            let root = tempfile::tempdir().unwrap();
+            let lease = lock_builder_file(root.path(), "builder-test.lock").unwrap();
+            let failure =
+                super::super::builder_completion::docker_error(crate::DockerError::BollardError(
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: status,
+                        message: "failed".into(),
+                    },
+                ));
+            let result: container_runtime_api::ContainerRuntimeResult<()> =
+                super::super::builder_completion::finish(Box::new(lease), Err(failure)).await;
+            assert!(result.is_err());
+            let next = lock_builder_file(root.path(), "builder-test.lock");
+            if matches!(status, 403 | 409) {
+                Box::new(next.expect("confirmed rejection permits retry"))
+                    .release()
+                    .await
+                    .unwrap();
+            } else {
+                assert!(next.is_err(), "unconfirmed outcome must require recovery");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_marker_release_does_not_erase_other_owner_or_original_error() {
+        let root = tempfile::tempdir().unwrap();
+        let lease = lock_builder_file(root.path(), "builder-test.lock").unwrap();
+        std::fs::write(root.path().join("builder-test.lock"), "replacement-owner").unwrap();
+        let failure = container_runtime_api::ContainerRuntimeError::RequestRejected(
+            shared_types::RuntimeRequestRejection::from_status(403, "original denial".into())
+                .unwrap(),
+        );
+        let result: container_runtime_api::ContainerRuntimeResult<()> =
+            super::super::builder_completion::finish(Box::new(lease), Err(failure)).await;
+        assert!(result.unwrap_err().to_string().contains("original denial"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("builder-test.lock")).unwrap(),
+            "replacement-owner"
+        );
+        assert!(lock_builder_file(root.path(), "builder-test.lock").is_err());
+    }
     #[tokio::test]
     async fn captured_delete_retires_only_deleted_identity_caches() {
         use std::sync::Arc;

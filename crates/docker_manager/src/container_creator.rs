@@ -339,9 +339,7 @@ impl<'a> ContainerCreator<'a> {
             .docker
             .create_container(Some(create_options), body)
             .await
-            .map_err(|e| {
-                DockerError::ContainerCreationError(format!("failed to create container: {}", e))
-            })?;
+            .map_err(DockerError::BollardError)?;
 
         let container_id = result.id.clone();
 
@@ -349,9 +347,7 @@ impl<'a> ContainerCreator<'a> {
             .docker
             .start_container(&container_id, None::<StartContainerOptions>)
             .await
-            .map_err(|e| {
-                DockerError::ContainerStartError(format!("failed to start container: {}", e))
-            })?;
+            .map_err(DockerError::BollardError)?;
 
         Ok(container_id)
     }
@@ -623,6 +619,14 @@ mod lifecycle_cache_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn fixture(status: u16, body: String) -> (DockerManager, tokio::task::JoinHandle<()>) {
+        fixture_request(Some(status), body, "GET ").await
+    }
+
+    async fn fixture_request(
+        status: Option<u16>,
+        body: String,
+        method: &'static str,
+    ) -> (DockerManager, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -631,10 +635,10 @@ mod lifecycle_cache_tests {
                 let mut request = [0; 8192];
                 let count = stream.read(&mut request).await.unwrap();
                 let request = String::from_utf8_lossy(&request[..count]);
-                assert!(
-                    request.starts_with("GET "),
-                    "must never delete a running container: {request}"
-                );
+                assert!(request.starts_with(method), "unexpected request: {request}");
+                let Some(status) = status else {
+                    return;
+                };
                 let response = format!(
                     "HTTP/1.1 {status} response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -669,6 +673,34 @@ mod lifecycle_cache_tests {
             .insert_status("builder".into(), Some(Arc::new(old)))
             .await;
         (manager, server)
+    }
+
+    #[tokio::test]
+    async fn docker_create_preserves_rejection_and_lost_response_evidence() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for status in [Some(403), Some(408), Some(500), None] {
+                let (manager, server) =
+                    fixture_request(status, r#"{"message":"denied"}"#.into(), "POST ").await;
+                let result = ContainerCreator::new(&manager)
+                    .docker_create_and_start("builder", ContainerCreateBody::default())
+                    .await;
+                server.abort();
+                if let Err(error) = server.await {
+                    assert!(error.is_cancelled(), "HTTP adapter failed: {error}");
+                }
+                let classified =
+                    crate::runtime::builder_completion::docker_error(result.unwrap_err());
+                assert_eq!(
+                    matches!(
+                        classified,
+                        container_runtime_api::ContainerRuntimeError::RequestRejected(_)
+                    ),
+                    status == Some(403)
+                );
+            }
+        })
+        .await
+        .expect("Docker failure exchange exceeded deadline");
     }
 
     #[tokio::test]

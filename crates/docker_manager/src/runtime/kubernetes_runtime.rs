@@ -242,17 +242,7 @@ impl AgentContainerRuntime for KubernetesRuntime {
             };
             return tokio::spawn(async move {
                 let result = runtime.create_agent_container(params).await;
-                // 成败都释放：Err 是确定性返回（无在途写——create_agent_container
-                // 全内联 await，且本 spawn 已隔离调用方 cancel），保留锁只会把一次
-                // 可重试失败放大成该 app 的永久 409（迟到写复活由 UID CAS 兜底）。
-                if let Err(release_error) = lease.release().await {
-                    if result.is_ok() {
-                        return Err(ContainerRuntimeError::ConnectionError(release_error));
-                    }
-                    tracing::error!(error = %release_error,
-                        "release builder operation lease after failed create");
-                }
-                result
+                super::builder_completion::finish(lease, result).await
             })
             .await
             .map_err(|e| {
@@ -624,95 +614,181 @@ mod create_lease_tests {
     /// 全残留的事故）。断言核心 = 失败后到达的锁 DELETE 请求。
     #[tokio::test]
     async fn create_container_releases_operation_lease_when_create_fails() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let address = listener.local_addr().expect("address");
-        let server = tokio::spawn(async move {
-            // 前 4 个请求：acquire POST ConfigMap → ensure 探测 GET PVC →
-            // claim 读 GET PVC → claim PATCH PVC（注入 403）。
-            for _ in 0..4 {
-                let (mut stream, _) = listener.accept().await.expect("accept");
-                let (head, body) = read_request(&mut stream).await;
-                if head.starts_with("POST ") && head.contains("/configmaps") {
-                    let mut object: serde_json::Value =
-                        serde_json::from_slice(&body).expect("acquire body");
-                    object["metadata"]["uid"] = "lease-owner".into();
-                    object["metadata"]["resourceVersion"] = "42".into();
-                    write_reply(&mut stream, 200, &object).await;
-                } else if head.starts_with("GET ") && head.contains("persistentvolumeclaims") {
+        claim_failure(Some(403), true, false).await;
+    }
+
+    #[tokio::test]
+    async fn create_container_retains_lease_when_claim_response_is_lost() {
+        claim_failure(None, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn create_container_retains_lease_when_claim_returns_server_error() {
+        claim_failure(Some(500), false, false).await;
+    }
+
+    #[tokio::test]
+    async fn cached_builder_propagates_service_write_failure() {
+        claim_failure(Some(403), true, true).await;
+        claim_failure(None, false, true).await;
+    }
+
+    async fn claim_failure(code: Option<u16>, should_release: bool, cached: bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let address = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move {
+                // 前 4 个请求：acquire POST ConfigMap → ensure 探测 GET PVC →
+                // claim 读 GET PVC → claim PATCH PVC；缓存场景继续 GET/PATCH Service。
+                for _ in 0..if cached { 6 } else { 4 } {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let (head, body) = read_request(&mut stream).await;
+                    if head.starts_with("POST ") && head.contains("/configmaps") {
+                        let mut object: serde_json::Value =
+                            serde_json::from_slice(&body).expect("acquire body");
+                        object["metadata"]["uid"] = "lease-owner".into();
+                        object["metadata"]["resourceVersion"] = "42".into();
+                        write_reply(&mut stream, 200, &object).await;
+                    } else if head.starts_with("GET ") && head.contains("persistentvolumeclaims") {
+                        write_reply(
+                            &mut stream,
+                            200,
+                            &serde_json::json!({
+                                "apiVersion":"v1","kind":"PersistentVolumeClaim",
+                                "metadata":{
+                                    "name":"rcoder-app-builder-errclaim-workspace",
+                                    "labels":{"service_type":"user-app-builder"},
+                                    "uid":"pvc-owned","resourceVersion":"42"}
+                            }),
+                        )
+                        .await;
+                    } else if head.starts_with("PATCH ") && head.contains("persistentvolumeclaims")
+                    {
+                        if cached {
+                            write_reply(
+                                &mut stream,
+                                200,
+                                &serde_json::json!({
+                                    "apiVersion":"v1", "kind":"PersistentVolumeClaim",
+                                    "metadata":{"uid":"pvc-owned", "resourceVersion":"43"}
+                                }),
+                            )
+                            .await;
+                            continue;
+                        }
+                        // Receiving the write and closing without a response models an
+                        // unknown server outcome, not a rejected request.
+                        let Some(code) = code else {
+                            continue;
+                        };
+                        write_reply(
+                            &mut stream,
+                            code,
+                            &serde_json::json!({
+                                "apiVersion":"v1","kind":"Status","status":"Failure",
+                                "reason":"Failure","code":code,
+                                "message":"persistentvolumeclaims is forbidden: cannot patch"
+                            }),
+                        )
+                        .await;
+                    } else if cached && head.starts_with("GET ") && head.contains("/services/") {
+                        write_reply(
+                            &mut stream,
+                            200,
+                            &serde_json::json!({
+                                "apiVersion":"v1", "kind":"Service",
+                                "metadata":{"name":"rcoder-app-builder-errclaim-svc"},
+                                "spec":{"ports":[]}
+                            }),
+                        )
+                        .await;
+                    } else if cached && head.starts_with("PATCH ") && head.contains("/services/") {
+                        if let Some(code) = code {
+                            write_reply(&mut stream, code, &serde_json::json!({
+                                "apiVersion":"v1", "kind":"Status", "status":"Failure",
+                                "reason":"Failure", "code":code, "message":"service patch failed"
+                            })).await;
+                        }
+                    } else {
+                        panic!("unexpected request: {head}");
+                    }
+                }
+                // 后续请求：失败路径的锁释放 DELETE（本测试的修复断言核心；
+                // 回归时（Err 不释放）此处 accept 超时，saw_release 保持 false）。
+                let mut saw_release = false;
+                if let Ok(Ok((mut stream, _))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
+                {
+                    let (head, body) = read_request(&mut stream).await;
+                    assert!(
+                        head.starts_with("DELETE ")
+                            && head.contains("/configmaps/rcoder-operation-builder-errclaim"),
+                        "{head}"
+                    );
+                    let preconditions: serde_json::Value =
+                        serde_json::from_slice(&body).expect("release body");
+                    assert_eq!(preconditions["preconditions"]["uid"], "lease-owner");
+                    assert_eq!(preconditions["preconditions"]["resourceVersion"], "42");
                     write_reply(
                         &mut stream,
                         200,
-                        &serde_json::json!({
-                            "apiVersion":"v1","kind":"PersistentVolumeClaim",
-                            "metadata":{
-                                "name":"rcoder-app-builder-errclaim-workspace",
-                                "labels":{"service_type":"user-app-builder"},
-                                "uid":"pvc-owned","resourceVersion":"42"}
-                        }),
-                    )
-                    .await;
-                } else if head.starts_with("PATCH ") && head.contains("persistentvolumeclaims") {
-                    write_reply(
-                        &mut stream,
-                        403,
-                        &serde_json::json!({
-                            "apiVersion":"v1","kind":"Status","status":"Failure",
-                            "reason":"Forbidden","code":403,
-                            "message":"persistentvolumeclaims is forbidden: cannot patch"
-                        }),
-                    )
-                    .await;
-                } else {
-                    panic!("unexpected request: {head}");
-                }
-            }
-            // 第 5 个请求：失败路径的锁释放 DELETE（本测试的修复断言核心；
-            // 回归时（Err 不释放）此处 accept 超时，saw_release 保持 false）。
-            let mut saw_release = false;
-            if let Ok(Ok((mut stream, _))) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
-            {
-                let (head, body) = read_request(&mut stream).await;
-                assert!(
-                    head.starts_with("DELETE ")
-                        && head.contains("/configmaps/rcoder-operation-builder-errclaim"),
-                    "{head}"
-                );
-                let preconditions: serde_json::Value =
-                    serde_json::from_slice(&body).expect("release body");
-                assert_eq!(preconditions["preconditions"]["uid"], "lease-owner");
-                assert_eq!(preconditions["preconditions"]["resourceVersion"], "42");
-                write_reply(
-                    &mut stream,
-                    200,
-                    &serde_json::json!({"apiVersion":"v1","kind":"Status",
+                        &serde_json::json!({"apiVersion":"v1","kind":"Status",
                         "status":"Success","code":200}),
-                )
-                .await;
-                saw_release = true;
+                    )
+                    .await;
+                    saw_release = true;
+                }
+                assert_eq!(
+                    saw_release, should_release,
+                    "lease release must depend on confirmed rejection, not just Err"
+                );
+            });
+            drop(rustls::crypto::ring::default_provider().install_default());
+            let config = Config::new(format!("http://{address}").parse().expect("uri"));
+            let runtime = runtime(Client::try_from(config).expect("client"));
+            if cached {
+                runtime.pod_cache.write().await.insert(
+                    "errclaim".into(),
+                    CachedPod {
+                        info: RuntimeContainerInfo {
+                            container_id: "pod-existing".into(),
+                            container_name: "rcoder-app-builder-errclaim-0".into(),
+                            container_ip: "10.0.0.1".into(),
+                            status: ContainerRuntimeStatus::Running,
+                            created_at: chrono::Utc::now(),
+                            env_vars: None,
+                            service_type: Some(ServiceType::UserappBuilder),
+                            project_id: None,
+                            user_id: None,
+                            pod_id: None,
+                            app_id: Some("errclaim".into()),
+                        },
+                        service_type: ServiceType::UserappBuilder,
+                        cached_at: std::time::Instant::now(),
+                    },
+                );
             }
+            let params = ContainerCreateParams::builder()
+                .project_id("errclaim")
+                .user_id("u-lease")
+                .service_type(ServiceType::UserappBuilder)
+                .storage_size("10Gi")
+                .build();
+            let result = runtime.create_container(params).await;
+            let error = result.expect_err("create must propagate the injected mutation failure");
             assert!(
-                saw_release,
-                "operation lease ConfigMap must be deleted after a failed create"
+                error.to_string().contains(if cached {
+                    "patch agent service"
+                } else {
+                    "claim builder storage"
+                }),
+                "{error}"
             );
-        });
-        drop(rustls::crypto::ring::default_provider().install_default());
-        let config = Config::new(format!("http://{address}").parse().expect("uri"));
-        let runtime = runtime(Client::try_from(config).expect("client"));
-        let params = ContainerCreateParams::builder()
-            .project_id("errclaim")
-            .user_id("u-lease")
-            .service_type(ServiceType::UserappBuilder)
-            .storage_size("10Gi")
-            .build();
-        let result = runtime.create_container(params).await;
-        let error = result.expect_err("create must fail at claim builder storage");
-        assert!(
-            error.to_string().contains("claim builder storage"),
-            "{error}"
-        );
-        server.await.expect("adapter assertions");
+            server.await.expect("adapter assertions");
+        })
+        .await
+        .expect("builder rejection exchange exceeded deadline");
     }
 }

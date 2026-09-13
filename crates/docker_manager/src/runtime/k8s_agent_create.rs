@@ -80,8 +80,11 @@ impl KubernetesRuntime {
         };
         if cached_running {
             info!("[K8S] Pod {} already exists and is running", pod_name);
+            // Creation owns a mutation lease: service reconciliation errors must
+            // reach its completion policy, not be swallowed by read-side self-heal.
+            self.create_agent_service(identifier, &service_type).await?;
             return self
-                .get_container_info_by_identifier_inner(identifier, &service_type)
+                .get_container_info_inner(identifier, &service_type)
                 .await?
                 .ok_or_else(|| ContainerRuntimeError::ContainerNotFound(identifier.to_string()));
         }
@@ -107,7 +110,7 @@ impl KubernetesRuntime {
         self.create_agent_service(identifier, &service_type).await?;
 
         // Get pod info
-        self.get_container_info_by_identifier_inner(identifier, &service_type)
+        self.get_container_info_inner(identifier, &service_type)
             .await?
             .ok_or_else(|| {
                 ContainerRuntimeError::ContainerCreationError(

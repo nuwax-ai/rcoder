@@ -317,9 +317,10 @@ impl K8sServiceOps for KubernetesRuntime {
                         .patch(&svc_name, &Self::ssa_patch_params(), &Patch::Apply(body))
                         .await
                         .map_err(|e| {
-                            ContainerRuntimeError::K8sError(format!(
-                                "patch agent service '{svc_name}': {e}"
-                            ))
+                            crate::runtime::builder_completion::k8s_error(
+                                format!("patch agent service '{svc_name}': {e}"),
+                                e,
+                            )
                         })?;
                     info!(
                         "[K8S] Service {} patched to converge expected ports (was missing some)",
@@ -332,10 +333,10 @@ impl K8sServiceOps for KubernetesRuntime {
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {}
             Err(e) => {
-                return Err(ContainerRuntimeError::K8sError(format!(
-                    "Failed to check Service '{}': {}",
-                    svc_name, e
-                )));
+                return Err(crate::runtime::builder_completion::k8s_error(
+                    format!("Failed to check Service '{}': {}", svc_name, e),
+                    e,
+                ));
             }
         }
 
@@ -345,10 +346,10 @@ impl K8sServiceOps for KubernetesRuntime {
             .create(&PostParams::default(), &service)
             .await
             .map_err(|e| {
-                ContainerRuntimeError::ContainerCreationError(format!(
-                    "Failed to create Service '{}': {}",
-                    svc_name, e
-                ))
+                crate::runtime::builder_completion::k8s_error(
+                    format!("Failed to create Service '{}': {}", svc_name, e),
+                    e,
+                )
             })?;
 
         info!(

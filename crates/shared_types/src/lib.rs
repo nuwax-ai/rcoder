@@ -118,10 +118,12 @@ pub use app_cli_logs::{
 // app-cli 部署相位契约（rcoder ↔ app-cli 单一事实源；deploy/status wire 枚举）
 pub mod app_cli_deploy;
 pub mod app_resource_deletion;
+pub mod runtime_request_failure;
 pub use app_resource_deletion::{
     AppDeletionSnapshot, AppFileMutationMarker, AppOperationLease, AppPreparationFailure,
     AppResourceIdentity, AppResourceKind, USERAPP_DOCKER_APP_ID_LABEL,
 };
+pub use runtime_request_failure::RuntimeRequestRejection;
 
 pub use app_cli_deploy::{
     APP_CLI_UNIFIED_DEPLOY_PROTOCOL, APP_DEPLOY_GENERATION_ID, APP_DEPLOY_OPERATION_ID,

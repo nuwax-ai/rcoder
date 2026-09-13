@@ -14,7 +14,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 use tracing::{debug, info, warn};
 
-use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
+use container_runtime_api::ContainerRuntimeResult;
 use shared_types::ServiceType;
 
 use crate::runtime::k8s_pod::K8sPodOps;
@@ -99,7 +99,12 @@ impl KubernetesRuntime {
         services
             .create(&PostParams::default(), &svc)
             .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("create headless svc: {e}")))?;
+            .map_err(|e| {
+                crate::runtime::builder_completion::k8s_error(
+                    format!("create headless svc: {e}"),
+                    e,
+                )
+            })?;
         debug!("[K8S-STS] headless Service created: {}", svc_name);
         Ok(())
     }
@@ -119,10 +124,10 @@ impl KubernetesRuntime {
                 Ok(())
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
-            Err(e) => Err(ContainerRuntimeError::K8sError(format!(
-                "delete headless svc {}: {}",
-                svc_name, e
-            ))),
+            Err(e) => Err(crate::runtime::builder_completion::k8s_error(
+                format!("delete headless svc {}: {}", svc_name, e),
+                e,
+            )),
         }
     }
 
@@ -246,17 +251,19 @@ impl KubernetesRuntime {
                 sts_api
                     .create(&PostParams::default(), &sts)
                     .await
-                    .map_err(|e| ContainerRuntimeError::K8sError(format!("create sts: {e}")))?;
+                    .map_err(|e| {
+                        crate::runtime::builder_completion::k8s_error(format!("create sts: {e}"), e)
+                    })?;
                 info!(
                     "[K8S-STS] StatefulSet created: {} (replicas={}, type={:?})",
                     sts_name, replicas, service_type
                 );
             }
             Err(e) => {
-                return Err(ContainerRuntimeError::K8sError(format!(
-                    "get sts {}: {}",
-                    sts_name, e
-                )));
+                return Err(crate::runtime::builder_completion::k8s_error(
+                    format!("get sts {}: {}", sts_name, e),
+                    e,
+                ));
             }
         }
         Ok(())
@@ -288,10 +295,10 @@ impl KubernetesRuntime {
                 Ok(_) => break,
                 Err(kube::Error::Api(ae)) if ae.code == 409 => {
                     if create_start.elapsed() > max_create_wait {
-                        return Err(ContainerRuntimeError::K8sError(format!(
-                            "recreate sts {sts_name}: still exists after {:.1}s of retries",
-                            create_start.elapsed().as_secs_f64()
-                        )));
+                        return Err(crate::runtime::builder_completion::k8s_error(
+                            format!("recreate sts {sts_name}: conflict retry budget exhausted"),
+                            kube::Error::Api(ae),
+                        ));
                     }
                     warn!(
                         "[K8S-STS] {} still being deleted (409), retrying in 2s... (elapsed {:.1}s)",
@@ -301,9 +308,10 @@ impl KubernetesRuntime {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
                 Err(e) => {
-                    return Err(ContainerRuntimeError::K8sError(format!(
-                        "recreate sts: {e}"
-                    )));
+                    return Err(crate::runtime::builder_completion::k8s_error(
+                        format!("recreate sts: {e}"),
+                        e,
+                    ));
                 }
             }
         }
@@ -326,9 +334,10 @@ impl KubernetesRuntime {
             Ok(sts) => sts,
             Err(kube::Error::Api(ae)) if ae.code == 404 => return Ok(false),
             Err(e) => {
-                return Err(ContainerRuntimeError::K8sError(format!(
-                    "get sts {sts_name}: {e}"
-                )));
+                return Err(crate::runtime::builder_completion::k8s_error(
+                    format!("get sts {sts_name}: {e}"),
+                    e,
+                ));
             }
         };
         // 按容器名定位（不依赖位次）：build 时 agent 主容器在首位，防御
@@ -374,7 +383,12 @@ impl KubernetesRuntime {
         sts_api
             .patch(&sts_name, &PatchParams::default(), &Patch::Merge(patch))
             .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("scale sts {sts_name}: {e}")))?;
+            .map_err(|e| {
+                crate::runtime::builder_completion::k8s_error(
+                    format!("scale sts {sts_name}: {e}"),
+                    e,
+                )
+            })?;
         debug!("[K8S-STS] scaled {} to replicas={}", sts_name, replicas);
         Ok(())
     }
@@ -405,10 +419,10 @@ impl KubernetesRuntime {
                 debug!("[K8S-STS] StatefulSet {} not found, skip delete", sts_name);
                 Ok(())
             }
-            Err(e) => Err(ContainerRuntimeError::K8sError(format!(
-                "delete sts {}: {}",
-                sts_name, e
-            ))),
+            Err(e) => Err(crate::runtime::builder_completion::k8s_error(
+                format!("delete sts {}: {}", sts_name, e),
+                e,
+            )),
         }
     }
 }

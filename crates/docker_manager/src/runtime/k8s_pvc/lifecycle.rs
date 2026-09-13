@@ -60,10 +60,10 @@ impl KubernetesRuntime {
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => ("not_found", None),
             Err(e) => {
-                return Err(ContainerRuntimeError::K8sError(format!(
-                    "Failed to check PVC '{}': {}",
-                    pvc_name, e
-                )));
+                return Err(crate::runtime::builder_completion::k8s_error(
+                    format!("Failed to check PVC '{}': {}", pvc_name, e),
+                    e,
+                ));
             }
         };
 
@@ -119,7 +119,10 @@ impl KubernetesRuntime {
                                     ..Default::default()
                                 };
                                 if let Err(e) = self.pvcs().delete(pvc_name, &dp).await {
-                                    warn!("[K8S] force delete PVC {} failed: {}", pvc_name, e);
+                                    return Err(crate::runtime::builder_completion::k8s_error(
+                                        format!("force delete PVC {pvc_name}: {e}"),
+                                        e,
+                                    ));
                                 }
                                 // Wait a bit more for the API to reflect the deletion
                                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -213,11 +216,10 @@ impl KubernetesRuntime {
                 }
                 Err(kube::Error::Api(ae)) if ae.code == 409 => {
                     if create_start.elapsed() > max_create_wait {
-                        return Err(ContainerRuntimeError::ContainerCreationError(format!(
-                            "Failed to create PVC '{}': still exists after {:.1}s of retries",
-                            pvc_name,
-                            create_start.elapsed().as_secs_f64()
-                        )));
+                        return Err(crate::runtime::builder_completion::k8s_error(
+                            format!("create PVC {pvc_name}: conflict retry budget exhausted"),
+                            kube::Error::Api(ae),
+                        ));
                     }
                     warn!(
                         "[K8S] PVC {} still being deleted (409), retrying in 2s... (elapsed {:.1}s)",
@@ -227,10 +229,10 @@ impl KubernetesRuntime {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
                 Err(e) => {
-                    return Err(ContainerRuntimeError::ContainerCreationError(format!(
-                        "Failed to create PVC '{}': {}",
-                        pvc_name, e
-                    )));
+                    return Err(crate::runtime::builder_completion::k8s_error(
+                        format!("Failed to create PVC '{}': {}", pvc_name, e),
+                        e,
+                    ));
                 }
             }
         }

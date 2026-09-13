@@ -68,10 +68,12 @@ impl KubernetesRuntime {
     pub(super) async fn claim_builder_storage(&self, app_id: &str) -> Result<()> {
         let name = self.workspace_pvc_name(app_id, &ServiceType::UserappBuilder)?;
         let api = self.builder_api(Kind::PersistentVolumeClaim)?;
-        let object = api
-            .get(&name)
-            .await
-            .map_err(|error| map_error("read builder storage claim", error))?;
+        let object = api.get(&name).await.map_err(|error| {
+            super::builder_completion::k8s_error(
+                format!("read builder storage claim: {error}"),
+                error,
+            )
+        })?;
         validate_owner(Kind::PersistentVolumeClaim, &object, app_id)?;
         if object.metadata.deletion_timestamp.is_some() {
             return Err(Error::Conflict("builder storage is terminating".into()));
@@ -80,7 +82,12 @@ impl KubernetesRuntime {
         let patch = serde_json::json!({"metadata":{"uid":receipt.uid,"resourceVersion":receipt.resource_version,"annotations":{"rcoder.io/storage-use-operation":uuid::Uuid::new_v4().to_string()}}});
         api.patch(&name, &PatchParams::default(), &Patch::Merge(patch))
             .await
-            .map_err(|error| map_error("claim builder storage", error))?;
+            .map_err(|error| {
+                super::builder_completion::k8s_error(
+                    format!("claim builder storage: {error}"),
+                    error,
+                )
+            })?;
         Ok(())
     }
 
