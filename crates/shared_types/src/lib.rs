@@ -247,3 +247,5 @@ pub mod userapp_http;
 
 pub mod persistence;
 pub use persistence::FlushOutcome;
+
+pub use userapp::lifecycle::*;

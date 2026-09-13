@@ -66,29 +66,73 @@ impl KubernetesRuntime {
     }
 
     pub(super) async fn claim_builder_storage(&self, app_id: &str) -> Result<()> {
+        // One budget and one operation identity cover all attempts. A timed-out
+        // PATCH is an unknown write: callers must retain the recovery fence.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.claim_builder_storage_inner(app_id),
+        )
+        .await
+        .map_err(|_| {
+            Error::Timeout(
+                "builder storage claim exceeded its deadline; outcome requires verification".into(),
+            )
+        })?
+    }
+
+    async fn claim_builder_storage_inner(&self, app_id: &str) -> Result<()> {
         let name = self.workspace_pvc_name(app_id, &ServiceType::UserappBuilder)?;
         let api = self.builder_api(Kind::PersistentVolumeClaim)?;
-        let object = api.get(&name).await.map_err(|error| {
-            super::builder_completion::k8s_error(
-                format!("read builder storage claim: {error}"),
-                error,
-            )
-        })?;
-        validate_owner(Kind::PersistentVolumeClaim, &object, app_id)?;
-        if object.metadata.deletion_timestamp.is_some() {
-            return Err(Error::Conflict("builder storage is terminating".into()));
-        }
-        let receipt = identity(Kind::PersistentVolumeClaim, object)?;
-        let patch = serde_json::json!({"metadata":{"uid":receipt.uid,"resourceVersion":receipt.resource_version,"annotations":{"rcoder.io/storage-use-operation":uuid::Uuid::new_v4().to_string()}}});
-        api.patch(&name, &PatchParams::default(), &Patch::Merge(patch))
-            .await
-            .map_err(|error| {
+        let operation = uuid::Uuid::new_v4();
+        let mut original = None;
+        for attempt in 0..4 {
+            let object = api.get(&name).await.map_err(|error| {
                 super::builder_completion::k8s_error(
-                    format!("claim builder storage: {error}"),
+                    format!("read builder storage claim: {error}"),
                     error,
                 )
             })?;
-        Ok(())
+            validate_owner(Kind::PersistentVolumeClaim, &object, app_id)?;
+            if object.metadata.deletion_timestamp.is_some() {
+                return Err(Error::Conflict("builder storage is terminating".into()));
+            }
+            // Conservatively reject label changes as well as replacement. Once
+            // lifecycle labels are installed this also fences a new lifetime.
+            let owner = object.metadata.labels.clone();
+            let receipt = identity(Kind::PersistentVolumeClaim, object)?;
+            match &original {
+                Some((uid, labels)) if uid != &receipt.uid || labels != &owner => {
+                    return Err(Error::Conflict(
+                        "builder storage identity changed while claiming".into(),
+                    ));
+                }
+                None => original = Some((receipt.uid.clone(), owner)),
+                _ => {}
+            }
+            let patch = serde_json::json!({"metadata":{"uid":receipt.uid,"resourceVersion":receipt.resource_version,"annotations":{"rcoder.io/storage-use-operation":operation.to_string()}}});
+            match api
+                .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(kube::Error::Api(response)) if response.code == 409 && attempt < 3 => {
+                    let jitter = (operation.as_bytes()[attempt] % 25) as u64;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        25 * (1 << attempt) + jitter,
+                    ))
+                    .await;
+                }
+                Err(error) => {
+                    return Err(super::builder_completion::k8s_error(
+                        format!("claim builder storage: {error}"),
+                        error,
+                    ));
+                }
+            }
+        }
+        Err(Error::Conflict(
+            "builder storage claim retry budget exhausted".into(),
+        ))
     }
 
     pub(super) async fn delete_captured_builder(

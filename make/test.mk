@@ -44,7 +44,7 @@ test-e2e-compose:
 test-e2e-compose-deploy:
 	python3 tests-e2e/tools/run.py --group deploy
 
-# 仅显式选择测试集群；本轮不执行真实集群测试。
+# 仅显式选择测试集群。
 test-e2e-k8s:
 	python3 tests-e2e/tools/run.py --group k8s $(if $(RUN_LB),--ignored,)
 
@@ -109,3 +109,8 @@ test-pyroscope-offcpu:
 	docker run --rm test-pyroscope-offcpu which pyroscope && echo "✅ pyroscope 已安装" || echo "❌ pyroscope 未安装"; \
 	echo "=== 验证 offcputime-bpfcc ===" && \
 	docker run --rm test-pyroscope-offcpu which offcputime-bpfcc && echo "✅ offcputime-bpfcc 已安装" || echo "❌ offcputime-bpfcc 未安装")
+
+# Real K8s userApp acceptance; explicit NodePort URLs and SSH test target required.
+.PHONY: test-e2e-k8s-userapp
+test-e2e-k8s-userapp:
+	python3 tests-e2e/tools/k8s_userapp.py --ssh "$(TEST_K8S_SSH)" --url "$(RCODER_URL)" --proxy-url "$(E2E_PINGORA_URL)"

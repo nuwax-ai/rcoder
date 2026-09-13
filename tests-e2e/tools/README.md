@@ -31,3 +31,20 @@ A/B 制品由本机 HTTP 服务器提供；受控阻塞制造并发窗口，断�
 已有容器不因名称前缀相似而被删除。清理失败和诊断采集失败独立计入结果。
 
 完整部署前会探测实际镜像的 Python SOABI、架构和 Java 版本，拒绝旧 builder 基础镜像与 runtime 配对。构建可通过 `AGENT_BASE_IMAGE` 指定本地已验证的基础镜像；也可先运行 `make docker-build-agent-base` 重建默认基础镜像。用 `python3 docker/verify-userapp-toolchains.py --builder <image> --runtime <image>` 单独检查，输出包含不可变镜像 ID。
+
+## 显式真实 K8s userApp 验收
+
+用户授权个人测试集群后，可运行不依赖 Docker/LLM 的专用入口：
+
+```bash
+make test-e2e-k8s-userapp \
+  TEST_K8S_SSH=soddy@192.168.32.131 \
+  RCODER_URL=http://192.168.32.131:30295 \
+  E2E_PINGORA_URL=http://192.168.32.131:30435
+```
+
+仅支持 `nuwax-k8s-test`，检查入口属于实际节点。通过 SSH 转发直连不同 rcoder Pod；构建真实 A/B 静态制品，验证任务/SSE、冷部署、容器内热部署、失败保旧、停止后新 Pod 恢复 B 和资源清理。无需改动日常 Compose 配置。
+
+该入口独立生成 `reports/<run-id>/summary.json`、断言、请求、源码指纹和 K8s 镜像/UID 证据。所有必要断言必须通过；并发失败可记录后继续验证后续链路，但整体仍返回非零。它不覆盖原有 Agent/SSE LB、真实 AI 或七语言工具链全套场景。
+
+行为规范和真实结果见 `specs/k8s-userapp-acceptance/`。测试前必须已有用户对目标集群的明确授权。

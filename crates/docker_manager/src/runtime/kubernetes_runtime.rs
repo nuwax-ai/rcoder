@@ -633,6 +633,109 @@ mod create_lease_tests {
         claim_failure(None, false, true).await;
     }
 
+    #[tokio::test]
+    async fn storage_claim_retries_only_same_uid_conflicts() {
+        storage_claim_conflict(false, 409, 2).await;
+    }
+
+    #[tokio::test]
+    async fn storage_claim_replacement_is_never_patched() {
+        storage_claim_conflict(true, 409, 1).await;
+    }
+
+    #[tokio::test]
+    async fn storage_claim_forbidden_is_not_retried() {
+        storage_claim_conflict(false, 403, 1).await;
+    }
+
+    #[tokio::test]
+    async fn storage_claim_conflict_budget_is_bounded() {
+        storage_claim_conflict(false, 409, 4).await;
+    }
+
+    async fn storage_claim_conflict(replaced: bool, code: u16, expected_patches: usize) {
+        drop(rustls::crypto::ring::default_provider().install_default());
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server =
+                tokio::spawn(async move {
+                    let mut patches = Vec::new();
+                    loop {
+                        let accepted = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            listener.accept(),
+                        )
+                        .await;
+                        let Ok(Ok((mut stream, _))) = accepted else {
+                            break;
+                        };
+                        let (head, body) = read_request(&mut stream).await;
+                        assert!(head.contains("persistentvolumeclaims"), "{head}");
+                        if head.starts_with("GET ") {
+                            let uid = if replaced && !patches.is_empty() {
+                                "replacement"
+                            } else {
+                                "original"
+                            };
+                            write_reply(
+                                &mut stream,
+                                200,
+                                &serde_json::json!({
+                                    "apiVersion":"v1","kind":"PersistentVolumeClaim",
+                                    "metadata":{"name":"rcoder-app-builder-review-workspace",
+                                        "uid":uid,"resourceVersion":(patches.len()+1).to_string(),
+                                        "labels":{"service_type":"user-app-builder"}}
+                                }),
+                            )
+                            .await;
+                        } else {
+                            assert!(head.starts_with("PATCH "), "{head}");
+                            let patch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            assert_eq!(patch["metadata"]["uid"], "original");
+                            assert_eq!(
+                                patch["metadata"]["resourceVersion"],
+                                (patches.len() + 1).to_string()
+                            );
+                            patches.push(patch);
+                            if expected_patches == 2 && patches.len() == 2 {
+                                write_reply(
+                                    &mut stream,
+                                    200,
+                                    &serde_json::json!({
+                                        "apiVersion":"v1","kind":"PersistentVolumeClaim",
+                                        "metadata":{"uid":"original","resourceVersion":"3"}
+                                    }),
+                                )
+                                .await;
+                            } else {
+                                write_reply(&mut stream, code, &serde_json::json!({
+                                "apiVersion":"v1","kind":"Status","status":"Failure",
+                                "reason":"Failure","code":code,"message":"injected rejection"
+                            })).await;
+                            }
+                        }
+                    }
+                    patches
+                });
+            let client =
+                Client::try_from(Config::new(format!("http://{address}").parse().unwrap()))
+                    .unwrap();
+            let result = runtime(client).claim_builder_storage("review").await;
+            assert_eq!(result.is_ok(), expected_patches == 2, "{result:?}");
+            let patches = server.await.unwrap();
+            assert_eq!(patches.len(), expected_patches);
+            for patch in &patches {
+                assert_eq!(
+                    patch["metadata"]["annotations"], patches[0]["metadata"]["annotations"],
+                    "retry must keep the original operation identity"
+                );
+            }
+        })
+        .await
+        .expect("claim regression must finish within its total budget");
+    }
+
     async fn claim_failure(code: Option<u16>, should_release: bool, cached: bool) {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

@@ -311,13 +311,12 @@ gix = "0.87.1"
 # i18n (国际化)
 rust-i18n = "4"
 
-# PostgreSQL 持久化后端（rcoder-storage 的 pg feature）。
+# SQL 持久化公共特性；具体驱动由 rcoder-storage 的 pg/sqlite feature 选择。
 # default-features=false + 显式 rustls：与全 workspace TLS 固化 rustls 的策略一致
-# （见 reqwest 注释）；不启用 macros（用 sqlx::query 运行时绑定，免编译期 DATABASE_URL）。
+# （见 reqwest 注释）；macros 用于嵌入迁移，query 使用运行时绑定，无编译期 DATABASE_URL。
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
-    "postgres",
     "migrate",
     "macros",
     "chrono",

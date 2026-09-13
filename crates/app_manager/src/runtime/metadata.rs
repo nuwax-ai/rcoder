@@ -92,26 +92,35 @@ impl AppMetadataStore {
         app_id: &str,
         generation: Option<&str>,
     ) -> anyhow::Result<()> {
-        let Some(generation) = generation else {
-            anyhow::ensure!(
-                self.deletion_generation(app_id).await?.is_none(),
-                "application metadata appeared during deletion"
-            );
+        if let Some(persistence) = self.persistence() {
+            // Cache is not a deletion authority. Capture its value solely to
+            // avoid evicting a later local write when SQL completion returns.
+            let cached_generation = self.lookup(app_id).map(|row| row.generation);
+            let deleted = match generation {
+                Some(generation) => persistence.delete_if_current(app_id, generation).await?,
+                None => false,
+            };
+            if !deleted {
+                anyhow::ensure!(
+                    persistence.get(app_id).await?.is_none(),
+                    "application metadata changed during deletion"
+                );
+            }
+            if let dashmap::mapref::entry::Entry::Occupied(entry) =
+                self.cache.entry(app_id.to_owned())
+                && cached_generation.as_deref() == Some(entry.get().generation.as_str())
+            {
+                entry.remove();
+            }
             return Ok(());
-        };
-        if let Some(persistence) = self.persistence()
-            && !persistence.delete_if_current(app_id, generation).await?
-        {
-            anyhow::ensure!(
-                persistence.get(app_id).await?.is_none(),
-                "application metadata changed during deletion"
-            );
         }
+        // In-memory fallback has a single authority: compare and remove under
+        // one entry guard, including the expected-absence case.
         if let dashmap::mapref::entry::Entry::Occupied(entry) = self.cache.entry(app_id.to_owned())
         {
             anyhow::ensure!(
-                entry.get().generation == generation,
-                "cached application metadata changed during deletion"
+                generation == Some(entry.get().generation.as_str()),
+                "application metadata changed during deletion"
             );
             entry.remove();
         }
@@ -212,6 +221,121 @@ mod tests {
                 .as_deref(),
             Some("B")
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_delete_is_not_vetoed_by_an_older_replica_cache() {
+        let persistence = InMemoryMetadataPersistence::new(vec![]);
+        let first = AppMetadataStore::default();
+        let second = AppMetadataStore::default();
+        first.set_persistence(persistence.clone());
+        second.set_persistence(persistence.clone());
+        first
+            .record("stale-replica", Some("A".into()), None, None, None)
+            .await;
+        second
+            .record("stale-replica", Some("B".into()), None, None, None)
+            .await;
+        let captured = first.deletion_generation("stale-replica").await.unwrap();
+        assert_ne!(
+            first.lookup("stale-replica").unwrap().generation,
+            captured.as_ref().unwrap().as_str()
+        );
+        first
+            .record_deleted("stale-replica", captured.as_deref())
+            .await
+            .unwrap();
+        assert!(persistence.get("stale-replica").await.unwrap().is_none());
+        assert!(first.lookup("stale-replica").is_none());
+    }
+
+    #[tokio::test]
+    async fn authoritative_absence_invalidates_a_stale_cache_entry() {
+        let persistence = InMemoryMetadataPersistence::new(vec![]);
+        let store = AppMetadataStore::default();
+        store.set_persistence(persistence.clone());
+        store.record("ghost", None, None, None, None).await;
+        let cached = store.lookup("ghost").unwrap();
+        assert!(
+            persistence
+                .delete_if_current("ghost", &cached.generation)
+                .await
+                .unwrap()
+        );
+        store.record_deleted("ghost", None).await.unwrap();
+        assert!(store.lookup("ghost").is_none());
+    }
+
+    #[tokio::test]
+    async fn late_delete_completion_preserves_a_new_local_cache_write() {
+        struct DelayedDelete {
+            inner: Arc<dyn shared_types::AppMetadataPersistence>,
+            deleted: tokio::sync::Notify,
+            resume: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl shared_types::AppMetadataPersistence for DelayedDelete {
+            async fn upsert(&self, row: &AppMetadataRecord) -> anyhow::Result<()> {
+                self.inner.upsert(row).await
+            }
+            async fn load_all(&self) -> anyhow::Result<Vec<AppMetadataRecord>> {
+                self.inner.load_all().await
+            }
+            async fn get(&self, app_id: &str) -> anyhow::Result<Option<AppMetadataRecord>> {
+                self.inner.get(app_id).await
+            }
+            async fn delete_if_current(
+                &self,
+                app_id: &str,
+                generation: &str,
+            ) -> anyhow::Result<bool> {
+                let deleted = self.inner.delete_if_current(app_id, generation).await?;
+                self.deleted.notify_one();
+                self.resume.notified().await;
+                Ok(deleted)
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let persistence = Arc::new(DelayedDelete {
+                inner: InMemoryMetadataPersistence::new(vec![]),
+                deleted: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            });
+            let store = Arc::new(AppMetadataStore::default());
+            store.set_persistence(persistence.clone());
+            store
+                .record("late-local", Some("old".into()), None, None, None)
+                .await;
+            let generation = store.deletion_generation("late-local").await.unwrap();
+            let deleting = store.clone();
+            let task = tokio::spawn(async move {
+                deleting
+                    .record_deleted("late-local", generation.as_deref())
+                    .await
+            });
+            persistence.deleted.notified().await;
+            store
+                .record("late-local", Some("new".into()), None, None, None)
+                .await;
+            persistence.resume.notify_one();
+            task.await.unwrap().unwrap();
+            assert_eq!(
+                store.lookup("late-local").unwrap().name.as_deref(),
+                Some("new")
+            );
+            assert_eq!(
+                persistence
+                    .get("late-local")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .name
+                    .as_deref(),
+                Some("new")
+            );
+        })
+        .await
+        .expect("deletion/cache race must complete within its deadline");
     }
 
     /// update 不刷新 created_at：cache 命中旧记录回填原值（与 PG ON CONFLICT 语义

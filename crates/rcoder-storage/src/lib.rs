@@ -30,3 +30,6 @@ pub use backend::ProjectStoreBackend;
 pub use shared_types::{
     CLEANUP_CHANNEL_CAPACITY, CleanupRequest, ContainerEntry, IdleContainerInfo, StorageStats,
 };
+
+#[cfg(any(feature = "pg", feature = "sqlite"))]
+pub mod userapp_lifecycle;
