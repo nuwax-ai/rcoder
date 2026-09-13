@@ -60,23 +60,22 @@ impl GitServiceContext {
     /// 的 `serviceType` 字段归一（对齐 TS `headerType || bodyType` 链——header
     /// 未匹配视为无值而非缺省）。
     ///
-    /// appId/workspacePath 的 body 值统一 trim 非空过滤（对齐 TS
+    /// appId/workspacePath 的显式值统一 trim 非空过滤（对齐 TS
     /// `String(x).trim() || null`——空白串视为未传，防「假激活」导致与 TS
     /// 分歧：TS 对空白值不激活 serviceContext 走 workspaceType 老规则）。
+    ///
+    /// workspacePath 在此就完成 header > body/query 合并（而非留给定位核心）：
+    /// `active()` 激活判定先于定位——header-only（仅 `x-workspace-path`、
+    /// 无 appId/无 body 字段）必须在 merge 产物里可见，否则假性不激活回落
+    /// workspaceType 老规则（TS `extractServiceContext` 读到 header 即激活）。
     fn merge(
         body_service_type: Option<&str>,
         body_app_id: Option<&str>,
         body_workspace_path: Option<&str>,
     ) -> Option<Self> {
-        let kind = crate::extract::service_kind()
-            .or_else(|| body_service_type.and_then(shared_types::normalize_computer_service_type));
-        // appId：task-local（header x-app-id > query appId，读取器已 trim 过滤）
-        // 优先，兜底 body 字段
-        let app_id = crate::extract::userapp_app_id()
-            .or_else(|| crate::extract::non_empty_trimmed(body_app_id).map(str::to_string));
-        // workspacePath 的 header > 显式值合并由收口核心的 merged_workspace_path 做
-        let workspace_path =
-            crate::extract::non_empty_trimmed(body_workspace_path).map(str::to_string);
+        let kind = crate::extract::merged_service_kind(body_service_type);
+        let app_id = crate::extract::merged_request_app_id(body_app_id);
+        let workspace_path = crate::extract::merged_workspace_path(body_workspace_path);
         match kind {
             // userapp/normalProject 缺 appId = TS 构造失败 → 整体视为无 serviceContext
             Some(ComputerServiceKind::Userapp | ComputerServiceKind::NormalProject)
@@ -455,5 +454,36 @@ mod tests {
             service.is_none(),
             "userapp with blank appId must fail to merge"
         );
+    }
+
+    /// header-only workspacePath 激活（P1 回归锁）：仅 `x-workspace-path`
+    /// header、无 appId/无 body 字段时必须激活 serviceContext——TS
+    /// `extractServiceContext` 读到 header 即激活；此前实现把 header 合并
+    /// 留在定位核心，active() 判定在前导致假性不激活回落老规则。
+    #[tokio::test]
+    async fn header_only_workspace_path_activates_service_context() {
+        let state = make_state();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bound = tmp.path().join("ws");
+        std::fs::create_dir_all(&bound).expect("seed bound workspace");
+        let raw = bound.display().to_string();
+        let (path, _) = crate::extract::WORKSPACE_PATH
+            .scope(Some(raw), async {
+                let service =
+                    GitServiceContext::merge(None, None, None).expect("taskAgent context merges");
+                assert!(service.active(), "header-only workspacePath must activate");
+                resolve_target(
+                    &state,
+                    // 老规则回落形态（pageApp 缺 projectId 必 400）——激活则不触达
+                    "pageApp",
+                    None,
+                    computer_ctx("u1", "c1").as_ref(),
+                    &service,
+                )
+                .await
+            })
+            .await
+            .expect("header-only workspacePath branch");
+        assert_eq!(path, bound);
     }
 }

@@ -44,6 +44,42 @@ pub fn agent_store_path(user_root: &Path, agent_id: &str) -> PathBuf {
     user_root.join(".agent-store").join(agent_id)
 }
 
+/// 跨 agent store 链接冲突检测（共享工作区防线，见 [`link_workspace_to_agent_store`]）。
+///
+/// 工作区 agent 目录的 store 链是**目录级**整体链接——若现有链已指向另一
+/// agentId 的实体子树，重链会让先驻 agent 的技能被静默覆盖（TS 已在 6ab47b7
+/// 用 manifest 引用表实现多 agent 技能并集视图，Rust 复刻暂缓）。在此之前，
+/// 对该破坏场景 fail-fast：仅当能解析出 `.agent-store/{owner}` 且
+/// `owner != agent_id` 时拒绝；同 agent 重入幂等放行，非本机制建立/不可解析
+/// 的链接不误伤。
+pub async fn detect_cross_agent_link_conflict(workspace: &Path, agent_id: &str) -> AppResult<()> {
+    let link = workspace.join(".agents").join("skills");
+    if !is_dir_link(&link) {
+        return Ok(());
+    }
+    // Unix 相对链 / Windows junction 绝对目标均可读；不可读（异形链接）放行
+    let Ok(target) = fs::read_link(&link).await else {
+        return Ok(());
+    };
+    let mut components = target.components();
+    while let Some(component) = components.next() {
+        if component.as_os_str() == ".agent-store"
+            && let Some(owner) = components.next()
+        {
+            let owner = owner.as_os_str().to_string_lossy();
+            if owner != agent_id {
+                return Err(crate::error::AppError::validation(format!(
+                    "agent skill store conflict: workspace is linked to agent '{owner}', \
+                     refusing to relink to agent '{agent_id}' (shared-workspace multi-agent \
+                     skill view is not yet supported)"
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 /// 创建实体目录 `{agent_store}/{skills,agents}`, 返回两个子目录路径。
 pub async fn ensure_agent_store_dirs(
     user_root: &Path,
@@ -541,5 +577,101 @@ mod tests {
             assert!(s.join("a.md").exists(), "{dir}/skills/a.md should exist");
             assert!(a.join("b.md").exists(), "{dir}/agents/b.md should exist");
         }
+    }
+    /// 跨 agent store 链接冲突防线（P1 回归锁）：共享工作区先后由 A、B 接管时，
+    /// B 的重链会让 A 的技能被静默覆盖——防线在此场景 fail-fast；同 agent 重入
+    /// 与无链工作区幂等放行（manifest 并集视图复刻前的过渡防线）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cross_agent_link_conflict_rejected_same_agent_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).await.unwrap();
+
+        // 无链工作区（首次创建）→ 放行
+        assert!(
+            detect_cross_agent_link_conflict(&ws, "agent-a")
+                .await
+                .is_ok()
+        );
+
+        // 建链到 agent-a 的 store（模拟 A 已创建工作区；链接目标含
+        // `.agent-store/{agentId}` 段——本机制建立的形态）
+        let store_a = tmp
+            .path()
+            .join("u1")
+            .join(".agent-store")
+            .join("agent-a")
+            .join("skills");
+        fs::create_dir_all(&store_a).await.unwrap();
+        let link = ws.join(".agents").join("skills");
+        fs::create_dir_all(link.parent().unwrap()).await.unwrap();
+        fs::symlink(
+            pathdiff::diff_paths(&store_a, link.parent().unwrap()).unwrap(),
+            &link,
+        )
+        .await
+        .unwrap();
+
+        // 同 agent 重入 → 幂等放行
+        assert!(
+            detect_cross_agent_link_conflict(&ws, "agent-a")
+                .await
+                .is_ok()
+        );
+
+        // 不同 agent 接管 → 拒绝（防静默覆盖）
+        let err = detect_cross_agent_link_conflict(&ws, "agent-b")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("agent skill store conflict"), "{msg}");
+        assert!(msg.contains("agent-a") && msg.contains("agent-b"), "{msg}");
+
+        // 异形链（目标不含 .agent-store 段，非本机制建立）→ 不误伤放行
+        let ws3 = tmp.path().join("ws3");
+        fs::create_dir_all(ws3.join(".agents")).await.unwrap();
+        let foreign = tmp.path().join("foreign-skills");
+        fs::create_dir_all(&foreign).await.unwrap();
+        fs::symlink(
+            pathdiff::diff_paths(&foreign, ws3.join(".agents")).unwrap(),
+            ws3.join(".agents").join("skills"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            detect_cross_agent_link_conflict(&ws3, "agent-b")
+                .await
+                .is_ok(),
+            "foreign-shaped link must not be rejected"
+        );
+
+        // 相对链解析出的 owner 是 .agent-store 段的直接下一级（store 布局形态）
+        let ws2 = tmp.path().join("ws2");
+        fs::create_dir_all(ws2.join(".agents")).await.unwrap();
+        let user_root = tmp.path().join("root").join("u1");
+        let store = user_root
+            .join(".agent-store")
+            .join("agent-a")
+            .join("skills");
+        fs::create_dir_all(&store).await.unwrap();
+        fs::symlink(
+            pathdiff::diff_paths(&store, ws2.join(".agents")).unwrap(),
+            ws2.join(".agents").join("skills"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            detect_cross_agent_link_conflict(&ws2, "agent-b")
+                .await
+                .is_err(),
+            "store 布局形态的跨 agent 同样拒绝"
+        );
+        assert!(
+            detect_cross_agent_link_conflict(&ws2, "agent-a")
+                .await
+                .is_ok(),
+            "store 布局形态的同 agent 放行"
+        );
     }
 }

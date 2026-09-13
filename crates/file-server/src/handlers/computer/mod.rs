@@ -29,30 +29,43 @@ pub mod workspace;
 
 // ── 跨组共享 helper (子模块经 super:: 访问) ──────────────────────────────────────
 
+/// 请求级 serviceContext 显式通道（body/query 字段——header 通道由中间件
+/// task-local 承担，收口内合并：header 优先 > 显式字段，对齐 TS
+/// `resolveServiceContext` 的 merged 取值序）。
+#[derive(Default)]
+pub(crate) struct ServiceScope<'a> {
+    /// body/query 的 `serviceType` 字段（归一化在收口内做）
+    pub service_type: Option<&'a str>,
+    /// body/query 的 `appId` 字段
+    pub app_id: Option<&'a str>,
+    /// body/query 的 `workspacePath` 字段（与 header 的合并在收口内做）
+    pub workspace_path: Option<&'a str>,
+}
+
 async fn ws_path(
     state: &AppState,
     user_id: &str,
     cid: &str,
-    workspace_path: Option<&str>,
+    scope: ServiceScope<'_>,
 ) -> Result<PathBuf, AppError> {
-    computer_root_for_request(state, user_id, cid, workspace_path).await
+    computer_root_for_request(state, user_id, cid, scope).await
 }
 
-/// computer 域请求根目录（task-local 薄壳）：从请求中间件 scope 的上下文
-/// （header 通道）取三要素后调 [`computer_root_for_context`] 核心收口。
+/// computer 域请求根目录（通道合并薄壳）：header（task-local）优先 > 显式
+/// body/query 字段，合并后调 [`computer_root_for_context`] 核心收口。
 pub(crate) async fn computer_root_for_request(
     state: &AppState,
     user_id: &str,
     cid: &str,
-    workspace_path: Option<&str>,
+    scope: ServiceScope<'_>,
 ) -> Result<PathBuf, AppError> {
     computer_root_for_context(
         state,
         user_id,
         cid,
-        crate::extract::service_kind(),
-        crate::extract::userapp_app_id().as_deref(),
-        workspace_path,
+        crate::extract::merged_service_kind(scope.service_type),
+        crate::extract::merged_request_app_id(scope.app_id).as_deref(),
+        scope.workspace_path,
     )
     .await
 }
@@ -166,9 +179,9 @@ async fn resolve_computer_target(
     user_id: &str,
     cid: &str,
     custom_target_dir: Option<&str>,
-    workspace_path: Option<&str>,
+    scope: ServiceScope<'_>,
 ) -> Result<PathBuf, AppError> {
-    let default_path = ws_path(state, user_id, cid, workspace_path).await?;
+    let default_path = ws_path(state, user_id, cid, scope).await?;
     match custom_target_dir.map(str::trim).filter(|s| !s.is_empty()) {
         Some(ct) => Ok(PathBuf::from(ct)),
         None => Ok(default_path),
@@ -264,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn no_binding_resolves_default_two_level() {
         let (state, resolver) = make_state();
-        let path = computer_root_for_request(&state, "u1", "c1", None)
+        let path = computer_root_for_request(&state, "u1", "c1", ServiceScope::default())
             .await
             .expect("resolve default");
         // 默认二级布局 {computer_root}/{user}/{cid} (现状回归)
@@ -279,9 +292,17 @@ mod tests {
     async fn bound_dir_short_circuits_resolver_and_normalizes() {
         let (state, resolver) = make_state();
         // 反斜杠输入 → 归一为 / (对齐 TS canonicalizeDir)
-        let path = computer_root_for_request(&state, "u1", "c1", Some("/tmp/bound\\\\ws"))
-            .await
-            .expect("resolve bound");
+        let path = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                workspace_path: Some("/tmp/bound\\\\ws"),
+                ..ServiceScope::default()
+            },
+        )
+        .await
+        .expect("resolve bound");
         assert_eq!(path, PathBuf::from("/tmp/bound/ws"));
         // 绑定短路在 resolver 之前: 零调用 (Subvolume ensure-PVC 副作用不可达)
         assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
@@ -291,7 +312,16 @@ mod tests {
     async fn bound_dir_wins_over_userapp_flag() {
         let (state, resolver) = make_state();
         let path = scope_kind(shared_types::ComputerServiceKind::Userapp, None, async {
-            computer_root_for_request(&state, "u1", "c1", Some("/tmp/bound")).await
+            computer_root_for_request(
+                &state,
+                "u1",
+                "c1",
+                ServiceScope {
+                    workspace_path: Some("/tmp/bound"),
+                    ..ServiceScope::default()
+                },
+            )
+            .await
         })
         .await
         .expect("bound wins over userapp");
@@ -307,7 +337,9 @@ mod tests {
         let path = scope_kind(
             shared_types::ComputerServiceKind::Userapp,
             Some("app-9"),
-            async { computer_root_for_request(&state, "u1", "1561913", None).await },
+            async {
+                computer_root_for_request(&state, "u1", "1561913", ServiceScope::default()).await
+            },
         )
         .await
         .expect("userapp dev volume");
@@ -318,7 +350,7 @@ mod tests {
     async fn userapp_flag_without_app_id_fails_fast() {
         let (state, resolver) = make_state();
         let err = scope_kind(shared_types::ComputerServiceKind::Userapp, None, async {
-            computer_root_for_request(&state, "u1", "app-9", None).await
+            computer_root_for_request(&state, "u1", "app-9", ServiceScope::default()).await
         })
         .await
         .expect_err("missing app_id must fail fast");
@@ -338,7 +370,7 @@ mod tests {
         let err = scope_kind(
             shared_types::ComputerServiceKind::Userapp,
             Some("  "),
-            async { computer_root_for_request(&state, "u1", "c1", None).await },
+            async { computer_root_for_request(&state, "u1", "c1", ServiceScope::default()).await },
         )
         .await
         .expect_err("blank app_id must fail fast");
@@ -353,7 +385,9 @@ mod tests {
         let path = scope_kind(
             shared_types::ComputerServiceKind::NormalProject,
             Some("proj-7"),
-            async { computer_root_for_request(&state, "u1", "1561913", None).await },
+            async {
+                computer_root_for_request(&state, "u1", "1561913", ServiceScope::default()).await
+            },
         )
         .await
         .expect("normalProject workspace");
@@ -375,7 +409,7 @@ mod tests {
         let err = scope_kind(
             shared_types::ComputerServiceKind::NormalProject,
             None,
-            async { computer_root_for_request(&state, "u1", "c1", None).await },
+            async { computer_root_for_request(&state, "u1", "c1", ServiceScope::default()).await },
         )
         .await
         .expect_err("normalProject missing projectId must fail fast");
@@ -392,7 +426,7 @@ mod tests {
         let err = scope_kind(
             shared_types::ComputerServiceKind::NormalProject,
             Some("../escape"),
-            async { computer_root_for_request(&state, "u1", "c1", None).await },
+            async { computer_root_for_request(&state, "u1", "c1", ServiceScope::default()).await },
         )
         .await
         .expect_err("traversal projectId must be rejected");
@@ -409,7 +443,7 @@ mod tests {
         let err = scope_kind(
             shared_types::ComputerServiceKind::NormalProject,
             Some("proj-7"),
-            async { computer_root_for_request(&state, "u1", "c1", None).await },
+            async { computer_root_for_request(&state, "u1", "c1", ServiceScope::default()).await },
         )
         .await
         .expect_err("single-app must reject normalProject");
@@ -437,9 +471,17 @@ mod tests {
     async fn invalid_bound_dirs_fail_fast_400() {
         let (state, resolver) = make_state();
         for bad in ["relative/path", "/a/../b", "C:", "/a/./b"] {
-            let err = computer_root_for_request(&state, "u1", "c1", Some(bad))
-                .await
-                .expect_err(bad);
+            let err = computer_root_for_request(
+                &state,
+                "u1",
+                "c1",
+                ServiceScope {
+                    workspace_path: Some(bad),
+                    ..ServiceScope::default()
+                },
+            )
+            .await
+            .expect_err(bad);
             assert!(matches!(err, AppError::Validation(..)), "{bad}: {err:?}");
         }
         // 无效绑定同样不触达 resolver
@@ -453,9 +495,17 @@ mod tests {
             userapp_single_app_id: Some("app-owned".into()),
             ..crate::Config::default()
         });
-        let err = computer_root_for_request(&state, "u1", "c1", Some("/tmp/bound"))
-            .await
-            .expect_err("single-app must reject binding");
+        let err = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                workspace_path: Some("/tmp/bound"),
+                ..ServiceScope::default()
+            },
+        )
+        .await
+        .expect_err("single-app must reject binding");
         assert!(err.to_string().contains("single-app"));
     }
 
@@ -468,7 +518,10 @@ mod tests {
             "u1",
             "c1",
             Some("/tmp/custom-target"),
-            Some("/tmp/bound"),
+            ServiceScope {
+                workspace_path: Some("/tmp/bound"),
+                ..ServiceScope::default()
+            },
         )
         .await
         .expect("custom wins");
@@ -508,5 +561,78 @@ mod tests {
         )
         .await;
         assert_eq!(root, state.config.computer_workspace_dir.join("u1"));
+    }
+    /// body/query 显式 serviceType 通道（P1 回归锁，对齐 TS `resolveServiceContext`
+    /// 的 header > body/query 合并序）：无 header 时显式 `serviceType=normalProject`
+    /// + `appId` 必须走 NormalProject 共享工作区定位——此前实现只读 header 通道，
+    /// 该请求静默落默认 `{CWS}/{userId}/{cId}`，读写目标与 TS 上游分歧。
+    #[tokio::test]
+    async fn explicit_service_type_without_header_resolves_normal_project() {
+        let (state, resolver) = make_state();
+        let path = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                service_type: Some("normalProject"),
+                app_id: Some("proj-7"),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect("explicit normalProject resolves shared workspace");
+        assert_eq!(
+            path,
+            state
+                .config
+                .computer_workspace_dir
+                .join("u1")
+                .join("NormalProject")
+                .join("proj-7")
+        );
+        // 显式通道同样不触达 resolver（TS 字面规则）
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
+
+        // 显式 userapp 通道同理落开发卷（header 缺失不阻断分派）
+        let path = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                service_type: Some("userapp"),
+                app_id: Some("app-9"),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect("explicit userapp resolves dev volume");
+        assert_eq!(path, state.config.userapp_workspace_dir.join("app-9"));
+    }
+
+    /// header 通道优先于显式字段（TS 合并序锁）：header=taskAgent 显式传
+    /// normalProject → header 胜出落默认布局。
+    #[tokio::test]
+    async fn header_kind_wins_over_explicit_service_type() {
+        let (state, resolver) = make_state();
+        let path = scope_kind(shared_types::ComputerServiceKind::TaskAgent, None, async {
+            computer_root_for_request(
+                &state,
+                "u1",
+                "c1",
+                ServiceScope {
+                    service_type: Some("normalProject"),
+                    app_id: Some("proj-7"),
+                    workspace_path: None,
+                },
+            )
+            .await
+        })
+        .await
+        .expect("header wins");
+        assert_eq!(
+            path,
+            state.config.computer_workspace_dir.join("u1").join("c1")
+        );
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -16,6 +16,7 @@ use crate::ops::files_read::{
     FileListParams, SearchFilesParams, get_file_list_impl, resolve_file_impl, search_files_impl,
 };
 
+use super::ServiceScope;
 use super::resolve_computer_target;
 
 // ── get-file-list ───────────────────────────────────────────────────────────────
@@ -42,7 +43,11 @@ pub(crate) async fn get_file_list(
         &q.user_id,
         &q.c_id,
         q.custom_target_dir.as_deref(),
-        q.workspace_path.as_deref(),
+        ServiceScope {
+            service_type: q.service_type.as_deref(),
+            app_id: q.app_id.as_deref(),
+            workspace_path: q.workspace_path.as_deref(),
+        },
     )
     .await?;
     get_file_list_impl(
@@ -81,7 +86,11 @@ pub(crate) async fn resolve_file(
         &q.user_id,
         &q.c_id,
         q.custom_target_dir.as_deref(),
-        q.workspace_path.as_deref(),
+        ServiceScope {
+            service_type: q.service_type.as_deref(),
+            app_id: q.app_id.as_deref(),
+            workspace_path: q.workspace_path.as_deref(),
+        },
     )
     .await?;
     resolve_file_impl(
@@ -116,7 +125,11 @@ pub(crate) async fn search_files(
         &q.user_id,
         &q.c_id,
         q.custom_target_dir.as_deref(),
-        q.workspace_path.as_deref(),
+        ServiceScope {
+            service_type: q.service_type.as_deref(),
+            app_id: q.app_id.as_deref(),
+            workspace_path: q.workspace_path.as_deref(),
+        },
     )
     .await?;
     search_files_impl(
@@ -192,6 +205,8 @@ mod tests {
             proxy_path: None,
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
             relative_path: None,
             recursive: None, // 缺省 = 递归
         });
@@ -222,6 +237,8 @@ mod tests {
             proxy_path: None,
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
             relative_path: None,
             recursive: Some("false".into()),
         });
@@ -251,6 +268,8 @@ mod tests {
             proxy_path: None,
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
             relative_path: None,
             recursive: None,
         });
@@ -275,6 +294,8 @@ mod tests {
             proxy_path: Some("/proxy".into()),
             custom_target_dir: Some(custom.to_string_lossy().into_owned()),
             workspace_path: None,
+            service_type: None,
+            app_id: None,
             relative_path: None,
             recursive: Some("false".into()),
         });
@@ -305,6 +326,8 @@ mod tests {
             proxy_path: Some("/proxy".into()),
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
             relative_path: None,
             recursive: Some("false".into()),
         });
@@ -328,6 +351,8 @@ mod tests {
             proxy_path: Some("/proxy".into()),
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
             file_path: "sub/c.txt".into(),
         });
         let res = resolve_file(State(state), q).await.expect("resolve ok");
@@ -350,6 +375,8 @@ mod tests {
             proxy_path: None,
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
             file_path: "nope.txt".into(),
         });
         let res = resolve_file(State(state), q).await.expect("resolve ok");
@@ -371,6 +398,8 @@ mod tests {
             proxy_path: None,
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
             file_path: "".into(),
         });
         let err = resolve_file(State(state), q)
@@ -393,6 +422,8 @@ mod tests {
             proxy_path: Some("/proxy".into()),
             custom_target_dir: Some(custom.to_string_lossy().into_owned()),
             workspace_path: None,
+            service_type: None,
+            app_id: None,
             file_path: "f.txt".into(),
         });
         let res = resolve_file(State(state), q).await.expect("resolve ok");
@@ -419,6 +450,8 @@ mod tests {
             proxy_path: Some("/proxy".into()),
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
             relative_path: None,
             kw: ".txt".into(),
             limit: "100".into(),
@@ -450,6 +483,8 @@ mod tests {
             proxy_path: None,
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
             relative_path: None,
             kw: "x".into(),
             limit: "0".into(), // 非正
@@ -474,6 +509,8 @@ mod tests {
             proxy_path: None,
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
             relative_path: None,
             kw: "".into(),
             limit: "100".into(),
@@ -509,6 +546,8 @@ mod tests {
             proxy_path: None,
             custom_target_dir: None,
             workspace_path: Some(bound.to_string_lossy().into_owned()),
+            service_type: None,
+            app_id: None,
             relative_path: None,
             recursive: None,
         });
@@ -534,6 +573,8 @@ mod tests {
             proxy_path: None,
             custom_target_dir: None,
             workspace_path: Some("relative/nope".into()),
+            service_type: None,
+            app_id: None,
             relative_path: None,
             recursive: None,
         });

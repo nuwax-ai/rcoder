@@ -153,6 +153,20 @@ pub(crate) fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// 合并服务场景类型来源（对齐 TS `resolveServiceContext` 的取值序）：
+/// header（task-local 归一结果，`None`=header 无有效值）优先 > body/query 的
+/// `serviceType` 字段归一。两通道皆无有效值 → `None`（由消费方按缺省
+/// taskAgent 布局处理）。
+pub(crate) fn merged_service_kind(explicit: Option<&str>) -> Option<ComputerServiceKind> {
+    service_kind().or_else(|| explicit.and_then(shared_types::normalize_computer_service_type))
+}
+
+/// 合并 appId 来源（header `x-app-id` > query `appId`（task-local 读取器内
+/// 已合并））优先 > body/query 的 `appId` 显式字段（trim 非空过滤）。
+pub(crate) fn merged_request_app_id(explicit: Option<&str>) -> Option<String> {
+    userapp_app_id().or_else(|| non_empty_trimmed(explicit).map(str::to_string))
+}
+
 pub struct AppJson<T>(pub T);
 
 impl<S, T> FromRequest<S> for AppJson<T>

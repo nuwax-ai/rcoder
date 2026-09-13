@@ -30,6 +30,16 @@ pub struct UserCidQuery {
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    #[garde(skip)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub app_id: Option<String>,
 }
 
 /// `get-file-list` 查询参数: 在 `UserCidQuery` 基础上新增 `relativePath` / `recursive`
@@ -56,6 +66,16 @@ pub struct FileListQuery {
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    #[garde(skip)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub app_id: Option<String>,
     /// 相对工作区根的子目录 (可多级), 空 → 列根目录。
     #[serde(default)]
     #[garde(skip)]
@@ -90,6 +110,16 @@ pub struct ResolveFileQuery {
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    #[garde(skip)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub app_id: Option<String>,
     /// 待解析的文件相对路径 (不补扩展名，逐候选目录查找)
     #[garde(custom(crate::validation_rules::not_blank))]
     pub file_path: String,
@@ -120,6 +150,16 @@ pub struct SearchFilesQuery {
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    #[garde(skip)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub app_id: Option<String>,
     /// 搜索起始子目录 (可多级)，空 → 从工作区根搜起
     #[serde(default)]
     #[garde(skip)]
@@ -152,6 +192,14 @@ pub struct InstallBody {
     /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    pub app_id: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -172,6 +220,14 @@ pub struct BuildAgentBody {
     /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    pub app_id: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -189,6 +245,14 @@ pub struct CleanupBuildArtifactsBody {
     /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    pub app_id: Option<String>,
 }
 
 #[derive(Deserialize, Validate, utoipa::ToSchema)]
@@ -210,6 +274,16 @@ pub struct ExecCommandBody {
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    #[garde(skip)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub app_id: Option<String>,
 }
 
 #[derive(Deserialize, Validate, utoipa::IntoParams)]
@@ -229,6 +303,16 @@ pub struct GetLogsQuery {
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    #[garde(skip)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub app_id: Option<String>,
     /// 读取末尾行数（缺省取最近若干行）
     #[serde(default = "default_tail_lines")]
     pub tail_lines: usize,
@@ -252,6 +336,14 @@ pub struct ZipBody {
     /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    pub app_id: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -266,6 +358,14 @@ pub struct DeleteWorkspaceBody {
     /// 用户维度工作目录（可选；非空时直接定位该目录删除，不先建后删，对齐 TS 1.4.5）
     #[serde(default)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    pub app_id: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -285,6 +385,14 @@ pub struct FilesUpdateBody {
     /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     #[serde(default)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    pub app_id: Option<String>,
 }
 
 #[derive(Deserialize, Validate, utoipa::ToSchema)]
@@ -312,6 +420,16 @@ pub struct GenerateFileBody {
     #[serde(default)]
     #[garde(skip)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    #[garde(skip)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub app_id: Option<String>,
 }
 
 /// `/static/{user_id}/{c_id}/*` 的 `?customTargetDir=` 覆盖参数（无 utoipa 派生：
@@ -324,6 +442,14 @@ pub struct CustomTargetQuery {
     /// 用户维度工作目录（可选；非空时静态文件从该目录解析，对齐 TS 1.4.5 server.js）
     #[serde(default)]
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（userapp/pageApp/normalProject/taskAgent，
+    /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
+    #[serde(default)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    pub app_id: Option<String>,
 }
 
 /// `fs/children` 查询参数（目录浏览，不锚定工作区、不带会话上下文；对齐 TS

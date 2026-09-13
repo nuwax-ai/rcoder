@@ -7,6 +7,7 @@ use axum::extract::State;
 use garde::Validate;
 use serde_json::Value;
 
+use super::ServiceScope;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
@@ -33,7 +34,11 @@ pub(crate) async fn execute_command(
         &state,
         &body.user_id,
         &body.c_id,
-        body.workspace_path.as_deref(),
+        ServiceScope {
+            service_type: body.service_type.as_deref(),
+            app_id: body.app_id.as_deref(),
+            workspace_path: body.workspace_path.as_deref(),
+        },
     )
     .await?;
     execute_command_impl(&state, cwd, &body.command).await
@@ -63,7 +68,11 @@ pub(crate) async fn get_logs(
         &q.user_id,
         &q.c_id,
         None,
-        q.workspace_path.as_deref(),
+        ServiceScope {
+            service_type: q.service_type.as_deref(),
+            app_id: q.app_id.as_deref(),
+            workspace_path: q.workspace_path.as_deref(),
+        },
     )
     .await?
     .join(".logs");

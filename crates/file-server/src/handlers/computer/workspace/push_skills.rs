@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::ops::multipart::{file_field, text_field};
 use crate::ops::workspace::push_skills_impl;
 
+use super::super::ServiceScope;
 use super::super::ws_path;
 use super::require_workspace_fields;
 use crate::AppState;
@@ -42,7 +43,9 @@ async fn push_skills_to_workspace_impl(
 ) -> Result<Json<Value>, AppError> {
     let mut user_id = None;
     let mut cid = None;
-    let mut workspace_path = None; // 项目绑定目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut workspace_path = None; // 用户维度工作目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut service_type = None; // serviceContext 通道 (对齐 TS 1.4.5)
+    let mut app_id = None;
     let mut zip_data = None;
     let mut skill_urls: Vec<String> = Vec::new();
     let mut agent_id: Option<String> = None;
@@ -55,6 +58,8 @@ async fn push_skills_to_workspace_impl(
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
+            "serviceType" => service_type = Some(text_field(field).await?),
+            "appId" => app_id = Some(text_field(field).await?),
             "file" => {
                 zip_data = Some(
                     file_field(
@@ -83,7 +88,17 @@ async fn push_skills_to_workspace_impl(
     state
         .skill_downloader
         .validate_url_count(skill_urls.len())?;
-    let ws = ws_path(&state, &user_id, &cid, workspace_path.as_deref()).await?;
+    let ws = ws_path(
+        &state,
+        &user_id,
+        &cid,
+        ServiceScope {
+            service_type: service_type.as_deref(),
+            app_id: app_id.as_deref(),
+            workspace_path: workspace_path.as_deref(),
+        },
+    )
+    .await?;
     // agent-store 根锚定 (绑定目录场景 store 锚定配置根, 对齐 TS 1.4.5; 默认
     // None = ws.parent() 派生)
     let store_root =

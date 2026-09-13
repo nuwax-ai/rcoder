@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::ops::multipart::{file_field, text_field};
 use crate::ops::workspace::init_project_template_impl;
 
+use super::super::ServiceScope;
 use super::super::ws_path;
 use crate::AppState;
 use crate::error::AppError;
@@ -61,7 +62,9 @@ pub(crate) async fn init_project_template(
 ) -> Result<Json<Value>, AppError> {
     let mut user_id = None;
     let mut cid = None;
-    let mut workspace_path = None; // 项目绑定目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut workspace_path = None; // 用户维度工作目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut service_type = None; // serviceContext 通道 (对齐 TS 1.4.5)
+    let mut app_id = None;
     let mut data = None;
     let mut enable_git = false;
     while let Some(field) = multipart
@@ -73,6 +76,8 @@ pub(crate) async fn init_project_template(
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
+            "serviceType" => service_type = Some(text_field(field).await?),
+            "appId" => app_id = Some(text_field(field).await?),
             "file" => {
                 data = Some(
                     file_field(
@@ -94,6 +99,16 @@ pub(crate) async fn init_project_template(
     }
     let fields = InitTemplateFields { user_id, cid, data };
     let v = fields.into_validated()?;
-    let ws = ws_path(&state, &v.user_id, &v.cid, workspace_path.as_deref()).await?;
+    let ws = ws_path(
+        &state,
+        &v.user_id,
+        &v.cid,
+        ServiceScope {
+            service_type: service_type.as_deref(),
+            app_id: app_id.as_deref(),
+            workspace_path: workspace_path.as_deref(),
+        },
+    )
+    .await?;
     init_project_template_impl(&state, ws, v.data, enable_git).await
 }

@@ -111,7 +111,11 @@ pub(crate) async fn serve_computer(
         &state,
         &user_id,
         &c_id,
-        q.workspace_path.as_deref(),
+        super::computer::ServiceScope {
+            service_type: q.service_type.as_deref(),
+            app_id: q.app_id.as_deref(),
+            workspace_path: q.workspace_path.as_deref(),
+        },
     )
     .await
     {

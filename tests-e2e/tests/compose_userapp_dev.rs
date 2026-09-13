@@ -450,6 +450,54 @@ async fn userapp_dev_git_service_context() {
         format!("HTTP {sn}, {}", trunc(&bn, 120)),
     );
 
+    // ── computer 域 query 显式 serviceType 通道（P1 复现锁）：无 header 时
+    // query 的 serviceType=normalProject + appId 必须落共享工作区
+    // {CWS}/{userId}/NormalProject/{projectId}——此前 Rust 只读 header 通道，
+    // 该请求静默落默认 {CWS}/{userId}/{cId} 与 TS 上游分歧
+    let np_proj = format!("np-{app}");
+    // POST 路由走 body 字段通道（GenerateFileBody 的 serviceType/appId；
+    // query 通道仅 GET 模型消费——TS merged 序对 POST 同为 body 优先）
+    let resp = env
+        .http
+        .post(format!("{}/api/computer/generate-file", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .json(&json!({
+            "serviceType": "normalProject", "appId": np_proj,
+            "userId": user, "cId": "c1",
+            "fileName": "np-ctx.txt", "content": "normalProject explicit channel"
+        }))
+        .send()
+        .await
+        .expect("generate-file via explicit serviceType");
+    let sgn = resp.status();
+    let bgn: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "computer body 通道：serviceType=normalProject 无 header 仍按共享工作区定位",
+        sgn.is_success() && bgn["success"].as_bool() == Some(true),
+        format!("HTTP {sgn}, {}", trunc(&bgn, 120)),
+    );
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/computer/get-file-list?serviceType=normalProject&appId={np_proj}&userId={user}&cId=c1&recursive=false",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .expect("list via explicit serviceType");
+    let snp = resp.status();
+    let bnp: Value = resp.json().await.unwrap_or(Value::Null);
+    let np_hit = snp.is_success()
+        && bnp["files"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|f| f["name"] == "np-ctx.txt"));
+    report.assert_hard(
+        "computer query 通道：同一定位读回（get-file-list 见 np-ctx.txt）",
+        np_hit,
+        format!("HTTP {snp}, {}", trunc(&bnp, 120)),
+    );
+
     // ── header 通道：X-Service-Type/X-App-Id 拦截转发 → dev 容器内嵌
     // file-server 的 git 域 serviceContext 落开发卷（agent-runner 镜像须含
     // 本分支；dev-hot 只更主 pod 时此段撞容器旧代码 404——环境前置说明）

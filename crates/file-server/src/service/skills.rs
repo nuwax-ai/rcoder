@@ -97,6 +97,11 @@ pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppRes
     let session_workspace = user_root.join(cid);
     fs::create_dir_all(&session_workspace).await?;
 
+    // 共享工作区防线：现有 store 链指向其他 agent 时 fail-fast（重链会静默
+    // 覆盖先驻 agent 技能；manifest 并集视图复刻前的过渡防线）
+    crate::service::agent_store::detect_cross_agent_link_conflict(&session_workspace, agent_id)
+        .await?;
+
     let (agent_skills_dir, agent_agents_dir) =
         crate::service::agent_store::ensure_agent_store_dirs(user_root, agent_id).await?;
 

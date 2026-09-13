@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use crate::ops::files::import_project_core;
 use crate::ops::multipart::{file_field, text_field, validate_zip_ext};
 
+use super::super::ServiceScope;
 use super::super::resolve_computer_target;
 use crate::AppState;
 use crate::error::AppError;
@@ -61,7 +62,9 @@ pub(crate) async fn import_project(
     let mut user_id = None;
     let mut cid = None;
     let mut custom_target_dir = None;
-    let mut workspace_path = None; // 项目绑定目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut workspace_path = None; // 用户维度工作目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut service_type = None; // serviceContext 通道 (对齐 TS 1.4.5)
+    let mut app_id = None;
     let mut data = None;
     let mut file_name = None;
     while let Some(field) = multipart
@@ -74,6 +77,8 @@ pub(crate) async fn import_project(
             "cId" => cid = Some(text_field(field).await?),
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
+            "serviceType" => service_type = Some(text_field(field).await?),
+            "appId" => app_id = Some(text_field(field).await?),
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
                 data = Some(
@@ -96,7 +101,11 @@ pub(crate) async fn import_project(
         &v.user_id,
         &v.cid,
         custom_target_dir.as_deref(),
-        workspace_path.as_deref(),
+        ServiceScope {
+            service_type: service_type.as_deref(),
+            app_id: app_id.as_deref(),
+            workspace_path: workspace_path.as_deref(),
+        },
     )
     .await?;
     let target = import_project_core(target_dir, v.data).await?;

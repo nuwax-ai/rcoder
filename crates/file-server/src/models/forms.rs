@@ -118,6 +118,10 @@ pub struct ImportProjectForm {
     pub custom_target_dir: Option<String>,
     /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
+    pub app_id: Option<String>,
     /// 项目 zip（multipart 二进制字段）
     #[schema(format = Binary)]
     pub file: String,
@@ -137,6 +141,10 @@ pub struct UploadFileForm {
     pub custom_target_dir: Option<String>,
     /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
+    pub app_id: Option<String>,
     /// 上传文件（multipart 二进制字段）
     #[schema(format = Binary)]
     pub file: String,
@@ -154,6 +162,10 @@ pub struct UploadFilesForm {
     pub custom_target_dir: Option<String>,
     /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
+    pub app_id: Option<String>,
     /// 每个文件的目标相对路径（与 files 一一对应，重复字段）
     pub file_paths: Vec<String>,
     /// 上传文件列表（multipart 重复字段）
@@ -173,6 +185,10 @@ pub struct CreateWorkspaceForm {
     pub file: Option<String>,
     /// 用户维度工作目录（可选；跨平台绝对路径，非空时工作区即该目录，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
+    pub app_id: Option<String>,
 }
 
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
@@ -206,6 +222,10 @@ pub struct CreateWorkspaceV2Form {
     pub update_skill_names: Option<Vec<String>>,
     /// 用户维度工作目录（可选；跨平台绝对路径，非空时工作区即该目录，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
+    pub app_id: Option<String>,
 }
 
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
@@ -223,6 +243,10 @@ pub struct InitProjectTemplateForm {
     pub enable_git: Option<bool>,
     /// 用户维度工作目录（可选；跨平台绝对路径，非空时工作区即该目录，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
+    pub app_id: Option<String>,
 }
 
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
@@ -242,4 +266,8 @@ pub struct PushSkillsForm {
     pub agent_id: Option<String>,
     /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
     pub workspace_path: Option<String>,
+    /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
+    pub app_id: Option<String>,
 }

@@ -11,7 +11,7 @@ use crate::models::{UserCidQuery, ZipBody};
 
 use crate::ops::archive::{download_all_files_impl, zip_workspace_impl};
 
-use super::{resolve_computer_target, ws_path};
+use super::{ServiceScope, resolve_computer_target, ws_path};
 
 /// workspace 打包下载
 ///
@@ -37,7 +37,11 @@ pub(crate) async fn zip_workspace(
         &state,
         &body.user_id,
         &body.c_id,
-        body.workspace_path.as_deref(),
+        ServiceScope {
+            service_type: body.service_type.as_deref(),
+            app_id: body.app_id.as_deref(),
+            workspace_path: body.workspace_path.as_deref(),
+        },
     )
     .await?;
     let filename = format!("{}_{}.zip", body.user_id, body.c_id);
@@ -68,7 +72,11 @@ pub(crate) async fn download_all_files(
         &q.user_id,
         &q.c_id,
         q.custom_target_dir.as_deref(),
-        q.workspace_path.as_deref(),
+        ServiceScope {
+            service_type: q.service_type.as_deref(),
+            app_id: q.app_id.as_deref(),
+            workspace_path: q.workspace_path.as_deref(),
+        },
     )
     .await?;
     let prefix = format!("{}_{}/", q.user_id, q.c_id);

@@ -352,6 +352,8 @@
     "git status：GET query 通道 serviceContext 命中同一定位",
     "userapp 默认布局在主 pod 不可达 → 404 Workspace does not exist（TS 同构锁）",
     "负例：serviceContext 激活但缺 userId/cId → 400 + 分支专属文案",
+    "computer body 通道：serviceType=normalProject 无 header 仍按共享工作区定位",
+    "computer query 通道：同一定位读回（get-file-list 见 np-ctx.txt）",
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
     "header 通道：git init 拦截转发 → 容器内 serviceContext 落开发卷",
     "header 通道：git status 同一定位（GET 转发链）"

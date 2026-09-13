@@ -11,7 +11,7 @@ pub mod upload;
 use axum::extract::State;
 use serde_json::{Value, json};
 
-use super::{resolve_computer_target, ws_path};
+use super::{ServiceScope, resolve_computer_target, ws_path};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
@@ -33,7 +33,11 @@ pub(crate) async fn delete_workspace(
         &state,
         &body.user_id,
         &body.c_id,
-        body.workspace_path.as_deref(),
+        ServiceScope {
+            service_type: body.service_type.as_deref(),
+            app_id: body.app_id.as_deref(),
+            workspace_path: body.workspace_path.as_deref(),
+        },
     )
     .await?;
     // 不存在视为已删除 (对齐 nuwax, 只 warn)
@@ -60,7 +64,11 @@ pub(crate) async fn files_update(
         &body.user_id,
         &body.c_id,
         body.custom_target_dir.as_deref(),
-        body.workspace_path.as_deref(),
+        ServiceScope {
+            service_type: body.service_type.as_deref(),
+            app_id: body.app_id.as_deref(),
+            workspace_path: body.workspace_path.as_deref(),
+        },
     )
     .await?;
     let count = files_update_core(&path, body.files).await?;

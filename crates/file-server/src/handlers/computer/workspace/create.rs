@@ -4,6 +4,7 @@ use axum::extract::State;
 
 use crate::ops::multipart::{file_field, text_field, validate_zip_ext};
 
+use super::super::ServiceScope;
 use super::super::ws_path;
 use super::require_workspace_fields;
 use crate::AppState;
@@ -41,7 +42,9 @@ pub(crate) async fn create_workspace(
 ) -> Result<Json<CreateWorkspaceResponse>, AppError> {
     let mut user_id = None;
     let mut cid = None;
-    let mut workspace_path = None; // 项目绑定目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut workspace_path = None; // 用户维度工作目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut service_type = None;
+    let mut app_id = None;
     let mut skill_zip = None;
     let mut file_name = None;
     while let Some(field) = multipart
@@ -53,6 +56,8 @@ pub(crate) async fn create_workspace(
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
+            "serviceType" => service_type = Some(text_field(field).await?),
+            "appId" => app_id = Some(text_field(field).await?),
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
                 skill_zip = Some(
@@ -73,7 +78,17 @@ pub(crate) async fn create_workspace(
     }
     // 绑定目录优先于默认定位; create_dir_all 即 TS ensureWorkspaceDir 绑定分支
     // (不存在则递归创建, 对齐 TS 1.4.5)
-    let ws = ws_path(&state, &user_id, &cid, workspace_path.as_deref()).await?;
+    let ws = ws_path(
+        &state,
+        &user_id,
+        &cid,
+        ServiceScope {
+            service_type: service_type.as_deref(),
+            app_id: app_id.as_deref(),
+            workspace_path: workspace_path.as_deref(),
+        },
+    )
+    .await?;
     tokio::fs::create_dir_all(&ws).await?;
     let res = crate::service::computer_ws::create_workspace(
         &ws,
@@ -99,7 +114,9 @@ pub(crate) async fn create_workspace_v2(
 ) -> Result<Json<CreateWorkspaceResponse>, AppError> {
     let mut user_id = None;
     let mut cid = None;
-    let mut workspace_path = None; // 项目绑定目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut workspace_path = None; // 用户维度工作目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut service_type = None;
+    let mut app_id = None;
     let mut skill_zip = None;
     let mut file_name = None;
     let mut skill_urls: Vec<String> = Vec::new();
@@ -120,6 +137,8 @@ pub(crate) async fn create_workspace_v2(
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
+            "serviceType" => service_type = Some(text_field(field).await?),
+            "appId" => app_id = Some(text_field(field).await?),
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
                 skill_zip = Some(
@@ -196,7 +215,17 @@ pub(crate) async fn create_workspace_v2(
 
     // 绑定目录优先于默认定位; create_dir_all 即 TS ensureWorkspaceDir 绑定分支
     // (不存在则递归创建, 对齐 TS 1.4.5)
-    let ws = ws_path(&state, &user_id, &cid, workspace_path.as_deref()).await?;
+    let ws = ws_path(
+        &state,
+        &user_id,
+        &cid,
+        ServiceScope {
+            service_type: service_type.as_deref(),
+            app_id: app_id.as_deref(),
+            workspace_path: workspace_path.as_deref(),
+        },
+    )
+    .await?;
     tokio::fs::create_dir_all(&ws).await?;
 
     // 有 agentId → 走实体存储 + 软链; 否则走旧路径

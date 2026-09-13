@@ -93,6 +93,12 @@ mod tests {
                     "{file}: struct {head} 含 user_id 但缺 workspace_path 字段 \
                      （TS 1.4.5 全部 computer 契约须接受用户维度工作目录）"
                 );
+                assert!(
+                    !body.contains("pub workspace_path")
+                        || (body.contains("pub service_type") && body.contains("pub app_id")),
+                    "{file}: struct {head} 含 workspace_path 但缺 service_type/app_id 字段 \
+                     （TS 1.4.5 serviceContext 三通道：header > body/query，model 须可承载显式字段）"
+                );
             }
         }
     }

@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::ops::files::generate_file_impl;
 
+use super::super::ServiceScope;
 use super::super::resolve_computer_target;
 use crate::AppState;
 use crate::error::AppError;
@@ -36,7 +37,11 @@ pub(crate) async fn generate_file(
         &body.user_id,
         &body.c_id,
         body.custom_target_dir.as_deref(),
-        body.workspace_path.as_deref(),
+        ServiceScope {
+            service_type: body.service_type.as_deref(),
+            app_id: body.app_id.as_deref(),
+            workspace_path: body.workspace_path.as_deref(),
+        },
     )
     .await?;
     generate_file_impl(ws, body.file_name.trim(), body.content.unwrap_or_default()).await
@@ -85,6 +90,8 @@ mod tests {
             content: Some("hi".into()),
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
         };
         let res = generate_file(State(state), Json(body))
             .await
@@ -111,6 +118,8 @@ mod tests {
             content: Some("x".into()),
             custom_target_dir: Some(custom.to_string_lossy().into_owned()),
             workspace_path: None,
+            service_type: None,
+            app_id: None,
         };
         generate_file(State(state), Json(body))
             .await
@@ -132,6 +141,8 @@ mod tests {
             content: Some("pwned".into()),
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
         };
         let err = generate_file(State(state), Json(body))
             .await
@@ -158,6 +169,8 @@ mod tests {
             content: None,
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
         };
         let err = generate_file(State(state), Json(body))
             .await
@@ -183,6 +196,8 @@ mod tests {
             content: Some("hi".into()),
             custom_target_dir: None,
             workspace_path: None,
+            service_type: None,
+            app_id: None,
         };
         let res = generate_file(State(state), Json(body))
             .await
@@ -212,6 +227,8 @@ mod tests {
             content: Some("x".into()),
             custom_target_dir: None,
             workspace_path: Some(bound.to_string_lossy().into_owned()),
+            service_type: None,
+            app_id: None,
         };
         generate_file(State(state), Json(body))
             .await

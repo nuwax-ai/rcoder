@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::ops::files::{upload_file_impl, upload_files_impl};
 use crate::ops::multipart::{file_field, text_field};
 
+use super::super::ServiceScope;
 use super::super::resolve_computer_target;
 use crate::AppState;
 use crate::error::AppError;
@@ -102,7 +103,9 @@ pub(crate) async fn upload_file(
     let mut cid = None;
     let mut file_path = None;
     let mut custom_target_dir = None;
-    let mut workspace_path = None; // 项目绑定目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut workspace_path = None; // 用户维度工作目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut service_type = None; // serviceContext 通道 (对齐 TS 1.4.5)
+    let mut app_id = None;
     let mut data = None;
     while let Some(field) = multipart
         .next_field()
@@ -115,6 +118,8 @@ pub(crate) async fn upload_file(
             "filePath" => file_path = Some(text_field(field).await?),
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
+            "serviceType" => service_type = Some(text_field(field).await?),
+            "appId" => app_id = Some(text_field(field).await?),
             "file" => {
                 data = Some(
                     file_field(
@@ -140,7 +145,11 @@ pub(crate) async fn upload_file(
         &v.user_id,
         &v.cid,
         custom_target_dir.as_deref(),
-        workspace_path.as_deref(),
+        ServiceScope {
+            service_type: service_type.as_deref(),
+            app_id: app_id.as_deref(),
+            workspace_path: workspace_path.as_deref(),
+        },
     )
     .await?;
     upload_file_impl(&ws, &v.file_path, v.data).await
@@ -158,7 +167,9 @@ pub(crate) async fn upload_files(
     let mut user_id = None;
     let mut cid = None;
     let mut custom_target_dir = None;
-    let mut workspace_path = None; // 项目绑定目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut workspace_path = None; // 用户维度工作目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut service_type = None; // serviceContext 通道 (对齐 TS 1.4.5)
+    let mut app_id = None;
     let mut file_paths: Vec<String> = Vec::new();
     let mut files_vec = Vec::new();
     while let Some(field) = multipart
@@ -171,6 +182,8 @@ pub(crate) async fn upload_files(
             "cId" => cid = Some(text_field(field).await?),
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
+            "serviceType" => service_type = Some(text_field(field).await?),
+            "appId" => app_id = Some(text_field(field).await?),
             "filePaths" => file_paths.push(text_field(field).await?),
             "files" => {
                 let original = field.file_name().map(|s| s.to_string());
@@ -198,7 +211,11 @@ pub(crate) async fn upload_files(
         &v.user_id,
         &v.cid,
         custom_target_dir.as_deref(),
-        workspace_path.as_deref(),
+        ServiceScope {
+            service_type: service_type.as_deref(),
+            app_id: app_id.as_deref(),
+            workspace_path: workspace_path.as_deref(),
+        },
     )
     .await?;
     upload_files_impl(&ws, &file_paths, &files_vec).await

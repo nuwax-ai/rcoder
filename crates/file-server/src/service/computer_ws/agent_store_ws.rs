@@ -61,6 +61,11 @@ pub async fn create_workspace_with_agent_store(
     let session_workspace = session_workspace.to_path_buf();
     fs::create_dir_all(&session_workspace).await?;
 
+    // 共享工作区防线：现有 store 链指向其他 agent 时 fail-fast（防目录级重链
+    // 静默覆盖先驻 agent 技能；manifest 并集视图复刻前的过渡防线）
+    crate::service::agent_store::detect_cross_agent_link_conflict(&session_workspace, agent_id)
+        .await?;
+
     // 1. 确保 agent-store 目录
     let (agent_skills_dir, agent_agents_dir) =
         crate::service::agent_store::ensure_agent_store_dirs(user_root, agent_id).await?;
