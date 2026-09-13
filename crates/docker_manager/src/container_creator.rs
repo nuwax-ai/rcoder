@@ -69,6 +69,9 @@ impl<'a> ContainerCreator<'a> {
         let security = config.security.clone();
         let extra_mounts = config.extra_mounts.clone();
         let config_labels = config.labels;
+        let protected_builder = config_labels
+            .as_ref()
+            .is_some_and(|labels| labels.contains_key("rcoder.io/lifecycle-id"));
 
         // 1. 生成容器名称
         let container_identifier = config.pod_id.as_ref().unwrap_or(&project_id);
@@ -80,7 +83,12 @@ impl<'a> ContainerCreator<'a> {
 
         // 2. 检查并复用已有容器
         if let Some(info) = self
-            .try_reuse_existing_container(&container_name, &project_id, &image)
+            .try_reuse_existing_container(
+                &container_name,
+                &project_id,
+                &image,
+                config_labels.as_ref(),
+            )
             .await?
         {
             return Ok(info);
@@ -172,6 +180,11 @@ impl<'a> ContainerCreator<'a> {
         // 11. 等待并健康检查
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         if let Err(e) = self.manager.check_container_health(&container_id).await {
+            if protected_builder {
+                return Err(DockerError::ContainerStartError(format!(
+                    "Builder health check failed; resource retained for verification: {e}"
+                )));
+            }
             // 健康检查失败：容器已启动但不健康，回滚停止容器防止孤儿泄漏
             warn!(
                 "[CREATE] Container {} started but health check failed: {}. Rolling back...",
@@ -230,10 +243,29 @@ impl<'a> ContainerCreator<'a> {
         container_name: &str,
         project_id: &str,
         image: &str,
+        expected_labels: Option<&HashMap<String, String>>,
     ) -> DockerResult<Option<DockerContainerInfo>> {
+        let protected_id = if let Some(expected_labels) =
+            expected_labels.filter(|labels| labels.contains_key("rcoder.io/lifecycle-id"))
+        {
+            match self
+                .manager
+                .get_docker_client()
+                .inspect_container(container_name, None)
+                .await
+            {
+                Ok(details) => Some(validate_builder_reuse(&details, expected_labels, image)?),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
         let Some(result) = self
             .manager
-            .find_container_authoritative(container_name)
+            .find_container_authoritative(protected_id.as_deref().unwrap_or(container_name))
             .await?
         else {
             return Ok(None);
@@ -264,6 +296,32 @@ impl<'a> ContainerCreator<'a> {
             return Err(DockerError::ContainerStartError(format!(
                 "Running container has no network address: {container_name}"
             )));
+        }
+        if protected_id.is_some() {
+            if !matches!(
+                result.status,
+                ContainerStatus::Creating | ContainerStatus::Stopped | ContainerStatus::Exited
+            ) {
+                return Err(DockerError::ContainerStartError(format!(
+                    "Builder is not in a startable state: {}",
+                    result.status
+                )));
+            }
+            self.manager
+                .get_docker_client()
+                .start_container(&result.container_id, None::<StartContainerOptions>)
+                .await?;
+            let info = DockerContainerInfo::new(
+                result.container_id,
+                result.container_name,
+                project_id.into(),
+                image.into(),
+            );
+            self.manager
+                .containers
+                .insert(project_id.into(), info.clone())
+                .await;
+            return Ok(Some(info));
         }
         self.manager
             .remove_stopped_container(&result.container_id)
@@ -334,14 +392,59 @@ impl<'a> ContainerCreator<'a> {
             platform: self.manager.config.default_platform.clone(),
         };
 
+        let expected_labels = body.labels.clone();
+        let expected_image = body.image.clone();
         let result = self
             .manager
             .docker
             .create_container(Some(create_options), body)
-            .await
-            .map_err(DockerError::BollardError)?;
-
-        let container_id = result.id.clone();
+            .await;
+        let container_id = match result {
+            Ok(result) => result.id,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409, ..
+            }) if expected_labels
+                .as_ref()
+                .is_some_and(|labels| labels.contains_key("rcoder.io/lifecycle-id")) =>
+            {
+                let details = self
+                    .manager
+                    .docker
+                    .inspect_container(container_name, None)
+                    .await?;
+                let labels = expected_labels.as_ref().ok_or_else(|| {
+                    DockerError::ConfigurationError("Builder labels missing".into())
+                })?;
+                let image = expected_image.as_deref().ok_or_else(|| {
+                    DockerError::ConfigurationError("Builder image missing".into())
+                })?;
+                let id = validate_builder_reuse(&details, labels, image)?;
+                if details.state.as_ref().and_then(|state| state.running) == Some(true) {
+                    return Ok(id);
+                }
+                if !matches!(
+                    details
+                        .state
+                        .as_ref()
+                        .and_then(|state| state.status.as_ref()),
+                    Some(
+                        bollard::models::ContainerStateStatusEnum::CREATED
+                            | bollard::models::ContainerStateStatusEnum::EXITED
+                    )
+                ) {
+                    return Err(DockerError::ContainerStartError(
+                        "Competing builder is not in a startable state".into(),
+                    ));
+                }
+                id
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if container_id.is_empty() {
+            return Err(DockerError::ContainerCreationError(
+                "Docker create returned no physical container ID; recovery required".into(),
+            ));
+        }
 
         self.manager
             .docker
@@ -360,6 +463,50 @@ impl<'a> ContainerCreator<'a> {
 /// 构建挂载点列表
 ///
 /// 按 container_path 去重，防止 Docker "Duplicate mount point" 错误
+fn validate_builder_reuse(
+    details: &bollard::models::ContainerInspectResponse,
+    expected: &HashMap<String, String>,
+    image: &str,
+) -> DockerResult<String> {
+    let config = details.config.as_ref().ok_or_else(|| {
+        DockerError::ConfigurationError("Builder container config missing".into())
+    })?;
+    let actual = config.labels.as_ref().ok_or_else(|| {
+        DockerError::ConfigurationError(
+            "Builder container identity missing; adoption required".into(),
+        )
+    })?;
+    for key in ["service-type", "identifier"]
+        .into_iter()
+        .chain(shared_types::USERAPP_RESOURCE_IDENTITY_KEYS)
+    {
+        let value = expected
+            .get(key)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                DockerError::ConfigurationError(format!("Expected builder identity missing: {key}"))
+            })?;
+        if actual.get(key) != Some(value) {
+            return Err(DockerError::ConfigurationError(format!(
+                "Builder resource identity mismatch: {key}"
+            )));
+        }
+    }
+    if config.image.as_deref() != Some(image) {
+        return Err(DockerError::ConfigurationError(
+            "Builder image configuration changed".into(),
+        ));
+    }
+    details
+        .id
+        .as_ref()
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            DockerError::ConfigurationError("Builder physical container ID missing".into())
+        })
+}
+
 fn build_mounts(
     host_path: &str,
     container_path: &str,
@@ -539,6 +686,53 @@ mod tests {
     use super::*;
     use shared_types::ServiceSecurityConfig;
     use std::collections::HashMap;
+
+    #[test]
+    fn builder_reuse_checks_physical_identity_without_requiring_creation_operation() {
+        let context = shared_types::UserAppExecutionContext {
+            app_id: "app".into(),
+            user_id: "owner".into(),
+            lifecycle_id: "life-one".into(),
+            operation_id: "operation-one".into(),
+            executor_id: "executor-one".into(),
+            request_fingerprint: "ab".repeat(32),
+        };
+        let mut expected: HashMap<_, _> = context.resource_metadata().into_iter().collect();
+        expected.insert(
+            "service-type".into(),
+            shared_types::ServiceType::UserappBuilder.to_string(),
+        );
+        expected.insert("identifier".into(), "app".into());
+        let mut actual = expected.clone();
+        actual.insert("rcoder.io/operation-id".into(), "prior-creation".into());
+        let mut details: bollard::models::ContainerInspectResponse =
+            serde_json::from_value(serde_json::json!({
+                "Id": "physical-one", "Config": {"Image": "builder:one", "Labels": actual}
+            }))
+            .unwrap();
+        assert_eq!(
+            validate_builder_reuse(&details, &expected, "builder:one").unwrap(),
+            "physical-one"
+        );
+        assert!(validate_builder_reuse(&details, &expected, "builder:two").is_err());
+        for key in shared_types::USERAPP_RESOURCE_IDENTITY_KEYS {
+            let mut changed = details.clone();
+            changed
+                .config
+                .as_mut()
+                .unwrap()
+                .labels
+                .as_mut()
+                .unwrap()
+                .insert(key.into(), "replacement".into());
+            assert!(
+                validate_builder_reuse(&changed, &expected, "builder:one").is_err(),
+                "{key}"
+            );
+        }
+        details.id = None;
+        assert!(validate_builder_reuse(&details, &expected, "builder:one").is_err());
+    }
 
     /// security = None（未配置 security 块）→ 走代码默认（非 ebpf-debug：
     /// privileged=false + cap_drop=[NET_RAW,NET_ADMIN]，security_opt/cap_add 为 None）
@@ -747,7 +941,7 @@ mod lifecycle_cache_tests {
         )
         .unwrap();
         let result = ContainerCreator::new(&manager)
-            .try_reuse_existing_container("builder", "app", "image")
+            .try_reuse_existing_container("builder", "app", "image", None)
             .await;
         server.await.unwrap();
         assert!(matches!(
@@ -765,7 +959,7 @@ mod lifecycle_cache_tests {
     async fn create_does_not_reuse_deleted_physical_identity_from_cache() {
         let (manager, server) = fixture(404, r#"{"message":"not found"}"#.into()).await;
         let result = ContainerCreator::new(&manager)
-            .try_reuse_existing_container("builder", "app", "image")
+            .try_reuse_existing_container("builder", "app", "image", None)
             .await
             .unwrap();
         server.abort();
@@ -776,7 +970,7 @@ mod lifecycle_cache_tests {
     async fn create_propagates_authoritative_query_failure() {
         let (manager, server) = fixture(500, r#"{"message":"daemon failed"}"#.into()).await;
         let result = ContainerCreator::new(&manager)
-            .try_reuse_existing_container("builder", "app", "image")
+            .try_reuse_existing_container("builder", "app", "image", None)
             .await;
         server.abort();
         assert!(
@@ -789,7 +983,7 @@ mod lifecycle_cache_tests {
     async fn create_preserves_running_container_without_network_address() {
         let (manager, server) = fixture(200, r#"{"Id":"replacement-id","Name":"/builder","State":{"Status":"running"},"NetworkSettings":{"Networks":{}}}"#.into()).await;
         let result = ContainerCreator::new(&manager)
-            .try_reuse_existing_container("builder", "app", "image")
+            .try_reuse_existing_container("builder", "app", "image", None)
             .await;
         server.abort();
         assert!(

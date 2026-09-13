@@ -365,6 +365,7 @@ pub struct BuildTaskStore {
     map: Mutex<HashMap<BuildTaskId, Arc<BuildTask>>>,
     max_retained_tasks: usize,
     dev_lifecycles: Mutex<HashMap<String, std::sync::Weak<Mutex<u64>>>>,
+    workspace_activity: Mutex<HashMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>>,
 }
 
 /// `BuildTaskStore::create` 容量耗尽错误(硬上限:全活跃任务达上限且无终态任务可淘汰)。
@@ -381,6 +382,18 @@ impl Default for BuildTaskStore {
 }
 
 impl BuildTaskStore {
+    /// Workers retain a read lease until execution exits. A workspace reset
+    /// obtains the write lease, so a Cancelled event alone cannot authorize deletion.
+    pub async fn workspace_activity(&self, app_id: &str) -> Arc<tokio::sync::RwLock<()>> {
+        let mut entries = self.workspace_activity.lock().await;
+        entries.retain(|_, value| value.strong_count() > 0);
+        if let Some(existing) = entries.get(app_id).and_then(std::sync::Weak::upgrade) {
+            return existing;
+        }
+        let activity = Arc::new(tokio::sync::RwLock::new(()));
+        entries.insert(app_id.to_owned(), Arc::downgrade(&activity));
+        activity
+    }
     /// Weak entries avoid retaining every app ever seen by this process.
     pub async fn dev_lifecycle(&self, app_id: &str) -> Arc<Mutex<u64>> {
         let mut entries = self.dev_lifecycles.lock().await;
@@ -397,6 +410,7 @@ impl BuildTaskStore {
         Self {
             map: Mutex::new(HashMap::new()),
             dev_lifecycles: Mutex::new(HashMap::new()),
+            workspace_activity: Mutex::new(HashMap::new()),
             max_retained_tasks: MAX_RETAINED_TASKS,
         }
     }
@@ -406,6 +420,7 @@ impl BuildTaskStore {
         Self {
             map: Mutex::new(HashMap::new()),
             dev_lifecycles: Mutex::new(HashMap::new()),
+            workspace_activity: Mutex::new(HashMap::new()),
             max_retained_tasks,
         }
     }
@@ -462,6 +477,41 @@ impl BuildTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_event_does_not_release_a_workers_workspace_lease() {
+        let store = BuildTaskStore::new();
+        let activity = store.workspace_activity("reset-app").await;
+        let worker = activity.clone().read_owned().await;
+        let task = store
+            .create("reset-app".into(), BuildTaskKind::Build)
+            .await
+            .expect("task");
+        task.cancel();
+        task.emit(BuildProgressEvent::Cancelled).await;
+        assert!(task.is_terminal().await);
+        let same_activity = store.workspace_activity("reset-app").await;
+        assert!(Arc::ptr_eq(&activity, &same_activity));
+        assert!(
+            same_activity.clone().try_write_owned().is_err(),
+            "cancelled worker still owns workspace until it exits"
+        );
+        let unrelated = store.workspace_activity("another-app").await;
+        let _unrelated_reset = unrelated
+            .try_write_owned()
+            .expect("other apps are independent");
+        drop(worker);
+        let reset = same_activity
+            .clone()
+            .try_write_owned()
+            .expect("worker has exited");
+        assert!(
+            same_activity.clone().try_read_owned().is_err(),
+            "reset excludes new work"
+        );
+        drop(reset);
+        assert!(same_activity.try_read_owned().is_ok());
+    }
 
     #[tokio::test]
     async fn subscription_has_no_gap_between_replay_and_live_events() {

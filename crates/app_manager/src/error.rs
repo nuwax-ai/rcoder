@@ -35,6 +35,9 @@ pub enum AppOperationError {
     DevNotRunning(String),
     /// 后端运行时错误（500 ERR_BACKEND_ERROR，兜底）
     Backend(String),
+    /// One remote HTTP request was explicitly rejected. This does not prove a
+    /// multi-request operation had no earlier effects; callers retain that boundary.
+    RuntimeRejected(shared_types::RuntimeRequestRejection),
     /// 乐观锁冲突（409 ERR_CONFLICT）—— expected_resource_version 不匹配
     Conflict(String),
     HotDeployEnvChange(String),
@@ -51,6 +54,8 @@ impl AppOperationError {
             Self::Validation(_) => ERR_VALIDATION,
             Self::DevNotRunning(_) => ERR_DEV_NOT_RUNNING,
             Self::Backend(_) => ERR_BACKEND_ERROR,
+            Self::RuntimeRejected(rejection) if rejection.status == 409 => ERR_CONFLICT,
+            Self::RuntimeRejected(_) => ERR_BACKEND_ERROR,
             Self::Conflict(_) => ERR_CONFLICT,
             Self::HotDeployEnvChange(_) => shared_types::error_codes::ERR_HOT_DEPLOY_ENV_CHANGE,
         }
@@ -59,6 +64,7 @@ impl AppOperationError {
     /// 人读错误信息（含完整因果链，由 service 构造时拼入）
     pub fn message(&self) -> &str {
         match self {
+            Self::RuntimeRejected(rejection) => &rejection.message,
             Self::NotFound(m)
             | Self::AlreadyExists(m)
             | Self::InvalidState(m)
@@ -79,6 +85,22 @@ impl fmt::Display for AppOperationError {
 }
 
 impl std::error::Error for AppOperationError {}
+
+impl From<shared_types::UserAppStoreError> for AppOperationError {
+    fn from(error: shared_types::UserAppStoreError) -> Self {
+        use shared_types::UserAppStoreError;
+        let message = error.to_string();
+        match error {
+            UserAppStoreError::OwnershipConflict
+            | UserAppStoreError::LifecycleConflict
+            | UserAppStoreError::OperationInProgress(_)
+            | UserAppStoreError::VersionConflict => Self::Conflict(message),
+            UserAppStoreError::NotFound => Self::NotFound(message),
+            UserAppStoreError::InvalidOperation(_) => Self::InvalidState(message),
+            UserAppStoreError::Storage(_) => Self::Backend(message),
+        }
+    }
+}
 
 /// app service 操作返回类型
 pub type AppResult<T> = Result<T, AppOperationError>;

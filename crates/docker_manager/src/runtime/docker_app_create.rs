@@ -10,12 +10,10 @@ use container_runtime_api::{
 use shared_types::{ContainerBasicInfo, ServiceType};
 use std::time::Duration;
 
-use tracing::info;
-
 use super::docker_app_mounts::build_prod_flat_mounts;
 use super::docker_runtime::{
-    APP_COMMAND_LABEL, APP_PORTS_LABEL, DockerRuntime, RecyclePolicy, app_deployment_name,
-    encode_ports_label, extract_container_ip,
+    APP_COMMAND_LABEL, APP_PORTS_LABEL, DockerRuntime, app_deployment_name, encode_ports_label,
+    extract_container_ip,
 };
 use std::collections::HashMap;
 
@@ -108,6 +106,12 @@ impl DockerRuntime {
             app_id.clone(),
         );
         labels.insert("service-type".to_string(), ServiceType::Userapp.to_string());
+        if let Some(context) = &params.execution_context {
+            context
+                .validate_identity(&app_id, params.user_id.as_deref())
+                .map_err(ContainerRuntimeError::ConfigurationError)?;
+            labels.extend(context.resource_metadata());
+        }
         if let Some(t) = &params.tenant_id {
             labels.insert("tenant".to_string(), t.clone());
         }
@@ -316,7 +320,27 @@ impl DockerRuntime {
                 "patch_deployment requires project_id (app_id)".into(),
             )
         })?;
-        let snapshot = self.capture_app_deletion(app_id, None).await?;
+        params.validate_execution_context()?;
+        let snapshot = if let Some(context) = &params.execution_context {
+            let target = match &params.mutation_target {
+                Some(target) => target.clone(),
+                None => self.capture_stop_target(context).await?,
+            };
+            if target.resource.kind != shared_types::AppResourceKind::Container
+                || target.resource.name != app_deployment_name(app_id)
+            {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Captured application update target changed".into(),
+                ));
+            }
+            shared_types::AppDeletionSnapshot {
+                app_id: app_id.into(),
+                operation_id: context.operation_id.clone(),
+                resources: vec![target.resource],
+            }
+        } else {
+            self.capture_app_deletion(app_id, None).await?
+        };
         let prepared = self.prepare_app_container(params).await.map_err(|error| {
             ContainerRuntimeError::PreparationFailed(shared_types::AppPreparationFailure {
                 message: error.to_string(),
@@ -332,8 +356,21 @@ impl DockerRuntime {
         replicas: i32,
     ) -> ContainerRuntimeResult<()> {
         use bollard::query_parameters::{StartContainerOptions, StopContainerOptions};
-        let name = app_deployment_name(app_id);
+        if !(0..=1).contains(&replicas) {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Docker application replicas must be zero or one".into(),
+            ));
+        }
         let client = self.inner.get_docker_client();
+        let name = match self.capture_app_container_id(app_id).await? {
+            Some(id) => id,
+            None if replicas == 0 => return Ok(()),
+            None => {
+                return Err(ContainerRuntimeError::ContainerStartError(
+                    "Application container does not exist".into(),
+                ));
+            }
+        };
         if replicas == 0 {
             // stop 幂等语义：容器已停（304）bollard 当成功；并发消失（404）容忍
             // ——stop 的目标态就是"不在跑"，容器没了目标态已达成（对齐
@@ -350,10 +387,11 @@ impl DockerRuntime {
             {
                 match e {
                     bollard::errors::Error::DockerResponseServerError {
-                        status_code: 404, ..
+                        status_code: 304 | 404,
+                        ..
                     } => {
                         tracing::debug!(
-                            "[DOCKER] stop container {name} not found (raced removal?), idempotent ok"
+                            "[DOCKER] captured container {name} already stopped or absent"
                         );
                     }
                     other => {
@@ -370,34 +408,180 @@ impl DockerRuntime {
         Ok(())
     }
 
-    /// Docker 无 K8s 注解,改用内存态存储回收策略(merge 语义:None=不改该字段)。
-    pub(crate) async fn patch_recycle_policy_impl(
+    pub(super) async fn capture_stop_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        context
+            .validate_identity(&context.app_id, Some(&context.user_id))
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let name = app_deployment_name(&context.app_id);
+        let container = self
+            .inner
+            .get_docker_client()
+            .inspect_container(&name, None)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::DockerError(format!(
+                    "Inspect application stop target: {error}"
+                ))
+            })?;
+        let uid = validate_app_container_target(&context.app_id, &container)?;
+        let labels = container
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .ok_or_else(|| {
+                ContainerRuntimeError::Conflict(
+                    "Application stop target has no identity labels".into(),
+                )
+            })?;
+        let metadata = labels
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        context
+            .validate_application_metadata(&metadata)
+            .map_err(ContainerRuntimeError::Conflict)?;
+        Ok(shared_types::UserAppMutationTarget {
+            context: context.clone(),
+            resource: shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::Container,
+                name,
+                uid,
+                resource_version: None,
+            },
+        })
+    }
+
+    pub(super) async fn restart_captured_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        // Both calls retain the original physical ID. A failed stop does not
+        // authorize starting another resource selected by the logical name.
+        self.stop_captured_target(target).await?;
+        self.start_captured_target(target).await
+    }
+
+    pub(super) async fn start_captured_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        use bollard::query_parameters::StartContainerOptions;
+        target
+            .context
+            .validate_identity(&target.context.app_id, Some(&target.context.user_id))
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if target.resource.kind != shared_types::AppResourceKind::Container
+            || target.resource.name != app_deployment_name(&target.context.app_id)
+            || target.resource.uid.is_empty()
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Invalid captured application start target".into(),
+            ));
+        }
+        match self
+            .inner
+            .get_docker_client()
+            .start_container(&target.resource.uid, None::<StartContainerOptions>)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => Ok(()),
+            Err(error) => Err(ContainerRuntimeError::ContainerStartError(format!(
+                "Start captured application: {error}"
+            ))),
+        }
+    }
+
+    pub(super) async fn stop_captured_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        use bollard::query_parameters::StopContainerOptions;
+        target
+            .context
+            .validate_identity(&target.context.app_id, Some(&target.context.user_id))
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if target.resource.kind != shared_types::AppResourceKind::Container
+            || target.resource.uid.is_empty()
+            || target.resource.name != app_deployment_name(&target.context.app_id)
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Invalid physical application stop target".into(),
+            ));
+        }
+        match self
+            .inner
+            .get_docker_client()
+            .stop_container(
+                &target.resource.uid,
+                Some(StopContainerOptions {
+                    t: Some(10),
+                    signal: Some(String::new()),
+                }),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304 | 404,
+                ..
+            }) => Ok(()),
+            Err(error) => {
+                let message = format!("Stop captured application: {error}");
+                if let bollard::errors::Error::DockerResponseServerError { status_code, .. } =
+                    &error
+                    && let Some(rejection) = shared_types::RuntimeRequestRejection::from_status(
+                        *status_code,
+                        message.clone(),
+                    )
+                {
+                    return Err(ContainerRuntimeError::RequestRejected(rejection));
+                }
+                Err(ContainerRuntimeError::ContainerStopError(message))
+            }
+        }
+    }
+
+    async fn capture_app_container_id(
         &self,
         app_id: &str,
-        recycle_enabled: Option<bool>,
-        idle_timeout_seconds: Option<u64>,
-    ) -> ContainerRuntimeResult<()> {
-        // merge 语义统一:Occupied 合并旧值,Vacant 以 default(全 None) 为基底 merge。
-        // and_modify/or_insert_with 把两分支的 merge 语义收敛为一处表达。
-        self.recycle_policy
-            .entry(app_id.to_string())
-            .and_modify(|p| *p = p.merge(recycle_enabled, idle_timeout_seconds))
-            .or_insert_with(|| {
-                RecyclePolicy::default().merge(recycle_enabled, idle_timeout_seconds)
-            });
-        info!(
-            "[DOCKER-APP] recycle policy patched: {app_id} (enabled={:?}, idle_timeout={:?})",
-            recycle_enabled, idle_timeout_seconds
-        );
-        Ok(())
+    ) -> ContainerRuntimeResult<Option<String>> {
+        let name = app_deployment_name(app_id);
+        match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&name, None)
+            .await
+        {
+            Ok(container) => validate_app_container_target(app_id, &container).map(Some),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(error) => Err(ContainerRuntimeError::DockerError(format!(
+                "Inspect application mutation target: {error}"
+            ))),
+        }
     }
 
     pub(crate) async fn restart_deployment_impl(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         use bollard::query_parameters::{StartContainerOptions, StopContainerOptions};
-        let name = app_deployment_name(app_id);
+        let name = self
+            .capture_app_container_id(app_id)
+            .await?
+            .ok_or_else(|| {
+                ContainerRuntimeError::ContainerStartError(
+                    "Application container does not exist".into(),
+                )
+            })?;
         let client = self.inner.get_docker_client();
-        // best-effort: 容器可能已停止，忽略 stop 失败
-        if let Err(e) = client
+        // Restart must never start after an uncertain or rejected stop. Docker
+        // already-stopped (304) is the only safe no-op response here.
+        if let Err(error) = client
             .stop_container(
                 &name,
                 Some(StopContainerOptions {
@@ -406,17 +590,92 @@ impl DockerRuntime {
                 }),
             )
             .await
+            && !matches!(
+                &error,
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 304,
+                    ..
+                }
+            )
         {
-            tracing::debug!(
-                "[DOCKER] Best-effort stop container {} before restart failed: {}",
-                name,
-                e
-            );
+            return Err(ContainerRuntimeError::ContainerStopError(format!(
+                "Stop captured application before restart: {error}"
+            )));
         }
         client
             .start_container(&name, None::<StartContainerOptions>)
             .await
             .map_err(|e| ContainerRuntimeError::ContainerStartError(e.to_string()))?;
         Ok(())
+    }
+}
+
+fn validate_app_container_target(
+    app_id: &str,
+    container: &bollard::models::ContainerInspectResponse,
+) -> ContainerRuntimeResult<String> {
+    let labels = container
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
+        .ok_or_else(|| {
+            ContainerRuntimeError::Conflict(
+                "Application mutation target has no ownership labels".into(),
+            )
+        })?;
+    if labels
+        .get(shared_types::USERAPP_DOCKER_APP_ID_LABEL)
+        .map(String::as_str)
+        != Some(app_id)
+        || labels.get("service-type").map(String::as_str)
+            != Some(ServiceType::Userapp.to_string().as_str())
+        || labels.get("managed-by").map(String::as_str) != Some("rcoder-app-manager")
+    {
+        return Err(ContainerRuntimeError::Conflict(
+            "Application mutation target ownership changed".into(),
+        ));
+    }
+    container
+        .id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            ContainerRuntimeError::DockerError(
+                "Application mutation target has no physical container ID".into(),
+            )
+        })
+}
+
+#[cfg(test)]
+mod mutation_target_tests {
+    use super::*;
+    #[test]
+    fn application_mutation_requires_physical_identity_and_correct_family() {
+        let target: bollard::models::ContainerInspectResponse = serde_json::from_value(serde_json::json!({
+            "Id":"physical-original", "Config":{"Labels":{
+                (shared_types::USERAPP_DOCKER_APP_ID_LABEL):"app-one", "service-type":ServiceType::Userapp.to_string(), "managed-by":"rcoder-app-manager"
+            }}
+        })).expect("inspect");
+        assert_eq!(
+            validate_app_container_target("app-one", &target).expect("identity"),
+            "physical-original"
+        );
+        assert!(validate_app_container_target("app-two", &target).is_err());
+        let mut builder = target.clone();
+        builder
+            .config
+            .as_mut()
+            .expect("config")
+            .labels
+            .as_mut()
+            .expect("labels")
+            .insert(
+                "service-type".into(),
+                ServiceType::UserappBuilder.to_string(),
+            );
+        assert!(validate_app_container_target("app-one", &builder).is_err());
+        let mut missing = target;
+        missing.id = None;
+        assert!(validate_app_container_target("app-one", &missing).is_err());
     }
 }

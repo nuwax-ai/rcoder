@@ -11,6 +11,16 @@ use super::docker_runtime::DockerRuntime;
 /// **`destroy_app_pvc` 重写** (Docker 模式 destroy = 删 app workspace 目录, 对应 K8s 删 PVC+subvolume).
 #[async_trait]
 impl WorkspaceRuntime for DockerRuntime {
+    async fn capture_app_storage_resize(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppStorageResizeTarget>> {
+        context
+            .validate_identity(&context.app_id, Some(&context.user_id))
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        Ok(None)
+    }
+
     async fn workspace_volume_name(
         &self,
         app_id: &str,

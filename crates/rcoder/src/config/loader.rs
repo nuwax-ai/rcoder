@@ -110,6 +110,9 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     );
 
     storage::apply_storage_env_overrides(&mut config)?;
+    config
+        .userapp_storage
+        .apply_overrides(|key| std::env::var(key).ok())?;
 
     // 验证 API Key 配置
     if config.api_key_auth.enabled && config.api_key_auth.api_key.trim().is_empty() {

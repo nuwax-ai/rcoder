@@ -13,6 +13,7 @@ pub enum AppError {
         code: String,
         internal_message: Option<String>,
         i18n_key: Option<String>,
+        operation_id: Option<String>,
     },
 }
 
@@ -28,6 +29,7 @@ impl AppError {
             code: code.to_string(),
             internal_message: None,
             i18n_key: None,
+            operation_id: None,
         }
     }
 
@@ -37,6 +39,7 @@ impl AppError {
             code: code.to_string(),
             internal_message: Some(msg.into()),
             i18n_key: None,
+            operation_id: None,
         }
     }
 
@@ -46,7 +49,21 @@ impl AppError {
             code: code.to_string(),
             internal_message: None,
             i18n_key: Some(i18n_key.to_string()),
+            operation_id: None,
         }
+    }
+
+    /// Attach a verified durable operation identity without changing the error code.
+    pub fn with_operation_id(self, id: String) -> Self {
+        let mut error = match self {
+            structured @ Self::Structured { .. } => structured,
+            Self::AnyhowError(error) => Self::generic(format!("{error:#}")),
+            Self::IoError(error) => Self::generic(error.to_string()),
+        };
+        if let Self::Structured { operation_id, .. } = &mut error {
+            *operation_id = Some(id);
+        }
+        error
     }
 
     /// Create an internal server error
@@ -80,7 +97,7 @@ impl axum::response::IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let locale = crate::current_request_locale();
 
-        let (code, internal_message, i18n_key) = match self {
+        let (code, internal_message, i18n_key, operation_id) = match self {
             AppError::AnyhowError(e) => (
                 crate::error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
                 // {e:#} = anyhow alternate Display，展开完整因果链（顶层 context → 底层根因）。
@@ -88,17 +105,20 @@ impl axum::response::IntoResponse for AppError {
                 // 违反 Fail Fast：调用方/运维只看到 "[APP] create_deployment 失败"，看不到根因。
                 Some(format!("{e:#}")),
                 None,
+                None,
             ),
             AppError::IoError(e) => (
                 crate::error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
                 Some(e.to_string()),
+                None,
                 None,
             ),
             AppError::Structured {
                 code,
                 internal_message,
                 i18n_key,
-            } => (code, internal_message, i18n_key),
+                operation_id,
+            } => (code, internal_message, i18n_key, operation_id),
         };
         let status = status_from_code(&code);
 
@@ -124,6 +144,10 @@ impl axum::response::IntoResponse for AppError {
             crate::HttpResult::<String>::error_with_locale(&code, locale)
         };
 
+        let response = match operation_id {
+            Some(id) => response.with_operation_id(id),
+            None => response,
+        };
         (status, axum::Json(response)).into_response()
     }
 }
@@ -157,7 +181,9 @@ fn status_from_code(code: &str) -> axum::http::StatusCode {
         | ec::ERR_AGENT_MGMT_ARCHIVE_BOMB
         | ec::ERR_AGENT_MGMT_UNSUPPORTED_TYPE
         | ec::ERR_OPERATION_NOT_SUPPORTED => axum::http::StatusCode::BAD_REQUEST,
-        ec::ERR_AGENT_MGMT_COMMAND_TIMEOUT => axum::http::StatusCode::GATEWAY_TIMEOUT,
+        ec::ERR_AGENT_MGMT_COMMAND_TIMEOUT | ec::ERR_USERAPP_WAIT_TIMEOUT => {
+            axum::http::StatusCode::GATEWAY_TIMEOUT
+        }
         ec::ERR_AGENT_MGMT_PERMISSION_DENIED => axum::http::StatusCode::FORBIDDEN,
         ec::ERR_AGENT_MGMT_DISK_FULL => axum::http::StatusCode::INSUFFICIENT_STORAGE,
         ec::ERR_AGENT_MGMT_STREAM_TRUNCATED => axum::http::StatusCode::BAD_REQUEST,

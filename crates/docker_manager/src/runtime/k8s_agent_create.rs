@@ -57,12 +57,26 @@ impl KubernetesRuntime {
             && (shared_types::per_agent_pvc_enabled()
                 || matches!(service_type, ServiceType::UserappBuilder))
         {
-            self.ensure_workspace_pvc(identifier, &service_type, params.storage_size.as_deref())
+            if let Some(context) = &params.execution_context {
+                self.ensure_owned_workspace_pvc(
+                    context,
+                    &service_type,
+                    params.storage_size.as_deref(),
+                )
                 .await?;
+            } else {
+                self.ensure_workspace_pvc(
+                    identifier,
+                    &service_type,
+                    params.storage_size.as_deref(),
+                )
+                .await?;
+            }
         }
 
         if service_type == ServiceType::UserappBuilder {
-            self.claim_builder_storage(identifier).await?;
+            self.claim_builder_storage_with_context(identifier, params.execution_context.as_ref())
+                .await?;
         }
 
         // Check if pod already exists and is running.
@@ -78,7 +92,7 @@ impl KubernetesRuntime {
                     && entry.info.status == ContainerRuntimeStatus::Running
             })
         };
-        if cached_running {
+        if cached_running && params.execution_context.is_none() {
             info!("[K8S] Pod {} already exists and is running", pod_name);
             // Creation owns a mutation lease: service reconciliation errors must
             // reach its completion policy, not be swallowed by read-side self-heal.
@@ -100,8 +114,17 @@ impl KubernetesRuntime {
         // service_type 重名/不匹配由 ensure_agent_statefulset 内部删旧重建处理。
         self.ensure_agent_headless_service(identifier, &service_type)
             .await?;
-        self.ensure_agent_statefulset(identifier, &service_type, pod_spec, 1)
-            .await?;
+        if let Some(context) = params.execution_context.as_ref() {
+            if service_type != ServiceType::UserappBuilder {
+                return Err(ContainerRuntimeError::ConfigurationError(
+                    "Application context requires builder StatefulSet".into(),
+                ));
+            }
+            self.ensure_builder_statefulset(context, pod_spec).await?;
+        } else {
+            self.ensure_agent_statefulset(identifier, &service_type, pod_spec, 1)
+                .await?;
+        }
 
         // Wait for pod to be ready
         self.wait_for_pod_ready(identifier, &service_type).await?;

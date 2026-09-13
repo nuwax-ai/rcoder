@@ -15,6 +15,30 @@ pub(crate) struct AppOperationGuard {
 }
 
 impl AppOperationGuard {
+    pub(crate) fn lease_receipt(&self) -> AppResult<shared_types::UserAppOperationLeaseReceipt> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.receipt().ok_or_else(|| {
+                AppOperationError::Backend("Runtime lease has no durable identity".into())
+            });
+        }
+        #[cfg(unix)]
+        if let Some(file) = &self._file {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = file.metadata().map_err(|error| {
+                AppOperationError::Backend(format!("Read operation lock identity: {error}"))
+            })?;
+            return Ok(shared_types::UserAppOperationLeaseReceipt::Docker {
+                service_type: shared_types::ServiceType::Userapp,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                token: self.marker.operation_id().into(),
+            });
+        }
+        Err(AppOperationError::Backend(
+            "Operation lease identity is unavailable".into(),
+        ))
+    }
+
     pub(crate) fn mark_mutating(&self) -> AppResult<()> {
         if self
             .side_effect_started

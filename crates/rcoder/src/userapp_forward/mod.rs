@@ -12,6 +12,7 @@
 //! （幂等；注册 state.projects 防孤立清理）。
 
 pub(crate) mod db;
+mod error_body;
 pub(crate) mod forward;
 pub(crate) mod semantics;
 pub(crate) mod upstream;
@@ -87,7 +88,8 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
 pub(crate) mod guard_tables {
     /// rcoder 本地实现的 userapp 路径快照（`routes()` 显式入口部分；
     /// 守卫闭包比对用——改动路由须同步）。
-    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 15] = [
+    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 16] = [
+        "/api/v1/userapp/{app_id}/builder/adopt",
         "/api/v1/userapp/workspace",
         "/api/v1/userapp/db/{app_stage}/reset-password",
         "/api/v1/userapp/db/{app_stage}/create-database",
@@ -111,7 +113,13 @@ pub(crate) mod guard_tables {
     /// 守卫闭包比对——该清单增删须同步。原 `{app_id}/db/*` 两路已下线，数据库
     /// 管理统一走转发层 `/api/v1/userapp/db/{app_stage}/*`；文件/存储八接口已加
     /// `{app_stage}` 段显式分派 dev/prod）。
-    pub(crate) const APP_MANAGER_PATHS: [&str; 24] = [
+    pub(crate) const APP_MANAGER_PATHS: [&str; 30] = [
+        "/api/v1/userapp/{app_id}/lifecycle",
+        "/api/v1/userapp/{app_id}/operations/current",
+        "/api/v1/userapp/{app_id}/operations/by-request",
+        "/api/v1/userapp/{app_id}/operations/{operation_id}",
+        "/api/v1/userapp/{app_id}/operations/{operation_id}/retry",
+        "/api/v1/userapp/{app_id}/recreate",
         "/api/v1/userapp/query",
         "/api/v1/userapp/runtime",
         "/api/v1/userapp/{app_id}",

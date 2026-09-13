@@ -439,6 +439,7 @@ pub async fn start_build_task(
     app_id: String,
     timeout_secs: u64,
 ) -> Result<(BuildTaskId, String), AppError> {
+    let workspace_activity = store.workspace_activity(&app_id).await.read_owned().await;
     // 容量耗尽(全活跃任务达上限)→ 立即拒绝,不再越过上限插入(#12)。
     let task = store
         .create(app_id.clone(), BuildTaskKind::Build)
@@ -457,6 +458,7 @@ pub async fn start_build_task(
     let task_spawn = task.clone();
     let config = Arc::clone(config);
     tokio::spawn(async move {
+        let _workspace_activity = workspace_activity;
         let result = build_workspace_package(
             &config,
             build_manager.as_ref(),

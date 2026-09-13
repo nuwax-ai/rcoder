@@ -32,6 +32,12 @@ pub(crate) struct PreparedAgentConfig {
     container_id: String,
 }
 
+impl PreparedAgentConfig {
+    pub(crate) fn image(&self) -> &str {
+        &self.image
+    }
+}
+
 impl<'a> AgentContainerStarter<'a> {
     pub fn new(manager: &'a DockerManager) -> Self {
         Self { manager }
@@ -103,6 +109,7 @@ impl<'a> AgentContainerStarter<'a> {
             container_id,
         } = prepared;
         let ContainerCreateParams {
+            execution_context,
             project_id,
             user_id,
             service_type,
@@ -128,7 +135,7 @@ impl<'a> AgentContainerStarter<'a> {
         // 创建目录会自动同步宿主机，bind 源即刻可见）。
 
         // Preserve the existing rebuild behavior, but capture its physical target once.
-        if project_id.is_some() {
+        if project_id.is_some() && execution_context.is_none() {
             self.clear_previous_container_for_rebuild(&container_id)
                 .await?;
         }
@@ -173,6 +180,12 @@ impl<'a> AgentContainerStarter<'a> {
             // （消费侧暂未切换，铺重启窗口的 label 直读）
             .label("service-type", service_type.to_string())
             .label("identifier", container_id.clone());
+
+        if let Some(context) = &execution_context {
+            for (key, value) in context.resource_metadata() {
+                builder = builder.label(key, value);
+            }
+        }
 
         // 添加隔离类型相关配置
         if let Some(ref pid) = pod_id {
@@ -370,6 +383,13 @@ impl<'a> AgentContainerStarter<'a> {
                 Ok(info)
             }
             Err(e) => {
+                if execution_context.is_some() {
+                    // A failed probe does not authorize deleting an admitted
+                    // builder or a resource reused by this operation.
+                    return Err(DockerError::ContainerStartError(format!(
+                        "Builder health check failed; resource retained for verification: {e}"
+                    )));
+                }
                 // 健康检查失败，回滚：停止并删除孤儿容器
                 warn!(
                     "[DOCKER_MGR] Health check failed for container {} after {:?} (total {:?}): {}. Rolling back...",

@@ -14,7 +14,13 @@ use super::models::*;
 /// thiserror variant 无 source，`{e}` 即 variant Display（含原始 daemon message）。
 pub(super) fn map_runtime_error(ctx: &str, e: ContainerRuntimeError) -> AppOperationError {
     match e {
-        ContainerRuntimeError::Conflict(_) => AppOperationError::Conflict(format!("{ctx}: {e}")),
+        ContainerRuntimeError::RequestRejected(mut rejection) => {
+            rejection.message = format!("{ctx}: {}", rejection.message);
+            AppOperationError::RuntimeRejected(rejection)
+        }
+        ContainerRuntimeError::Conflict(_) | ContainerRuntimeError::OperationInProgress(_) => {
+            AppOperationError::Conflict(format!("{ctx}: {e}"))
+        }
         // 容器/deployment 不存在 = app 不存在（404）
         ContainerRuntimeError::ContainerNotFound(_) => {
             AppOperationError::NotFound(format!("{ctx}: {e}"))
@@ -112,19 +118,6 @@ pub(super) fn validate_app_id(app_id: &str) -> AppResult<()> {
         ));
     }
     Ok(())
-}
-
-/// 从 PortConfig 列表提取 HTTP 端口号（供 Pingora backend 注册，create/update 共用）
-pub(super) fn http_port_numbers(ports: &Option<Vec<PortConfig>>) -> Vec<u16> {
-    ports
-        .as_ref()
-        .map(|ps| {
-            ps.iter()
-                .filter(|p| p.expose_type == ExposeType::Http)
-                .map(|p| p.port)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// 运行时 phase → 应用状态枚举
@@ -378,46 +371,6 @@ mod tests {
     #[test]
     fn extract_reason_returns_none_for_normal_log() {
         assert_eq!(extract_reason("normal log message"), None);
-    }
-
-    // ---------------- http_port_numbers ----------------
-
-    #[test]
-    fn http_port_numbers_filters_http_only() {
-        // 2 HTTP + 1 TCP → 只返回 HTTP 端口
-        let ports = Some(vec![
-            PortConfig {
-                name: "web".into(),
-                port: 8080,
-                expose_type: ExposeType::Http,
-                strip_prefix: None,
-            },
-            PortConfig {
-                name: "db".into(),
-                port: 5432,
-                expose_type: ExposeType::Tcp,
-                strip_prefix: None,
-            },
-        ]);
-        assert_eq!(http_port_numbers(&ports), vec![8080]);
-    }
-
-    #[test]
-    fn http_port_numbers_none_returns_empty() {
-        let result: Vec<u16> = http_port_numbers(&None);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn http_port_numbers_tcp_only_returns_empty() {
-        let tcp_only = Some(vec![PortConfig {
-            name: "db".into(),
-            port: 5432,
-            expose_type: ExposeType::Tcp,
-            strip_prefix: None,
-        }]);
-        let result: Vec<u16> = http_port_numbers(&tcp_only);
-        assert!(result.is_empty());
     }
 
     // ---------------- map_expose_type / map_health_check_type ----------------

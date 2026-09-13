@@ -23,3 +23,12 @@ pub mod forward_contract;
 pub mod metadata;
 
 pub mod lifecycle;
+pub mod workspace_clear;
+
+pub mod builder_control;
+
+pub mod resource_binding;
+
+pub mod operation_lease;
+
+pub mod builder_recovery;

@@ -19,11 +19,40 @@ from contracts import REQUIRED
 ROOT = Path(__file__).resolve().parents[1]
 REPO = ROOT.parent
 GROUPS = {
-    'userapp': ['compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_userapp_faults', 'compose_userapp_deploy', 'compose_lifecycle', 'pg_storage_faults'],
+    'userapp': ['compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_userapp_faults', 'compose_userapp_deploy', 'compose_lifecycle', 'pg_storage_faults', 'sqlite_storage_contract', 'sqlite_compose_runtime', 'userapp_concurrency_contract', 'native_lifecycle_crash', 'docker_lifecycle_crash'],
     'compose': ['compose_sse', 'compose_session', 'compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_webchat'],
     'deploy': ['compose_userapp_deploy'],
     'k8s': ['k8s_lb'],
 }
+
+
+def select_registered_cases(suite, discovered, case_filter='', *, catalog=None,
+                            required=None, identities=None):
+    """Freeze suite membership independently of executable discovery.
+
+    An explicit filter narrows required membership, never adds unknown cases.
+    Full suites must retain every reviewed scenario, even when others still run.
+    """
+    catalog = catalog if catalog is not None else json.loads(
+        Path(__file__).with_name('suite_cases.json').read_text())
+    required = REQUIRED if required is None else required
+    identities = identities if identities is not None else json.loads(
+        Path(__file__).with_name('report_identities.json').read_text())
+    registered = catalog.get(suite, [])
+    if not registered or len(registered) != len(set(registered)):
+        raise ValueError('missing or duplicate suite contract: ' + suite)
+    invalid = [name for name in registered if name not in required or not identities.get(name)]
+    if invalid:
+        raise ValueError('incomplete acceptance registration: ' + ', '.join(sorted(invalid)))
+    discovered = {name for name in discovered if not name.startswith('gate_')}
+    unknown = discovered - set(registered)
+    if unknown:
+        raise ValueError('unregistered suite scenarios: ' + ', '.join(sorted(unknown)))
+    expected = {name for name in registered if not case_filter or case_filter in name}
+    missing = expected - discovered
+    if missing:
+        raise ValueError('required scenarios missing from executable: ' + ', '.join(sorted(missing)))
+    return sorted(expected)
 
 
 def validate_reports(directory, scenario=None, run_id=None, case_id=None):
@@ -116,24 +145,39 @@ def container_identities():
         return {'unavailable': type(exc).__name__}
 
 
+def signal_owned_group(process, number):
+    """False means confirmed gone; permission failures on live groups still fail."""
+    try:
+        os.killpg(process.pid, number)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Darwin can return EPERM during teardown of an empty orphan group.
+        # Reaped leader alone is insufficient: a cleanup child may still run.
+        if sys.platform != 'darwin' or process.poll() is None:
+            raise
+        inventory = subprocess.run(['ps', '-axo', 'pgid='], capture_output=True,
+                                   text=True, check=True, timeout=5)
+        groups = {int(line.strip()) for line in inventory.stdout.splitlines() if line.strip()}
+        if not groups:
+            raise RuntimeError('process group inventory returned no processes')
+        if process.pid in groups:
+            raise
+        return False
+
+
 def terminate_process_group(process, grace=90):
     """Wait for cleanup children as well as the libtest parent before fallback cleanup."""
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
+    if not signal_owned_group(process, signal.SIGTERM):
         return
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         process.poll()  # reap the parent; its children can still be cleaning up
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
+        if not signal_owned_group(process, 0):
             return
         time.sleep(0.1)
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    signal_owned_group(process, signal.SIGKILL)
     process.wait()
 
 
@@ -274,13 +318,16 @@ def main():
     for suite in suites:
         executable = executables[suite]
         listing = subprocess.check_output([executable, '--list', '--format=terse'], text=True)
-        for line in listing.splitlines():
-            if not line.endswith(': test'):
-                continue
-            name = line.removesuffix(': test')
-            # Gate-only smoke tests deliberately skip; these are not acceptance scenarios.
-            if name.startswith('gate_') or (args.filter and args.filter not in name):
-                continue
+        discovered = [line.removesuffix(': test') for line in listing.splitlines()
+                      if line.endswith(': test')]
+        try:
+            selected = select_registered_cases(suite, discovered, args.filter)
+        except ValueError as error:
+            manifest['infrastructure_error'] = str(error)
+            persist()
+            print(f'ERROR: {error}; report: {run}', file=sys.stderr)
+            return 2
+        for name in selected:
             manifest['planned'].append({'suite': suite, 'test': name, 'executable': executable})
     (run / 'manifest.json').write_text(json.dumps(manifest, indent=2))
     if not manifest['planned']:

@@ -45,11 +45,38 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
         .timeout(Duration::from_secs(90))
         .json(&body)
         .send()
-        .await
-        .expect("http post");
+        .await;
+    let resp = match resp {
+        Ok(response) => response,
+        Err(error) => {
+            if matches!(
+                path,
+                "/api/v1/userapp/workspace" | "/api/v1/userapp/ensure-workspace"
+            ) {
+                rcoder_e2e::common::resources::register_builder_attempt(
+                    body["app_id"].as_str().expect("workspace app identity"),
+                    body["user_id"].as_str().expect("workspace owner identity"),
+                    false,
+                )
+                .expect("register uncertain workspace resource");
+            }
+            panic!("HTTP POST failed: {error}");
+        }
+    };
     let status = resp.status();
-    let body = resp.json().await.unwrap_or(Value::Null);
-    (status, body)
+    let response: Value = resp.json().await.unwrap_or(Value::Null);
+    if matches!(
+        path,
+        "/api/v1/userapp/workspace" | "/api/v1/userapp/ensure-workspace"
+    ) {
+        rcoder_e2e::common::resources::register_builder_attempt(
+            body["app_id"].as_str().expect("workspace app identity"),
+            body["user_id"].as_str().expect("workspace owner identity"),
+            status.is_success() && http_ok(&response),
+        )
+        .expect("register workspace resource identity");
+    }
+    (status, response)
 }
 
 /// 场景内唯一 app_id（run_tag+pid 防跨进程撞名；≤63 字符约束内）。
@@ -106,9 +133,19 @@ async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user:
             .json(&json!({"app_id": app_id, "user_id": user}))
             .send()
             .await;
-        let Ok(resp) = resp else { continue };
+        let Ok(resp) = resp else {
+            rcoder_e2e::common::resources::register_builder_attempt(app_id, user, false)
+                .expect("register uncertain builder creation");
+            continue;
+        };
         status = resp.status();
         body = resp.json().await.unwrap_or(Value::Null);
+        rcoder_e2e::common::resources::register_builder_attempt(
+            app_id,
+            user,
+            status.is_success() && http_ok(&body),
+        )
+        .expect("register builder creation identity");
         if status.is_success() && http_ok(&body) {
             break;
         }
@@ -2730,7 +2767,17 @@ async fn userapp_dev_app_proxy_lazy_start() {
         cleanup_builder(&app);
         return;
     };
-    cleanup_builder(&app);
+    let removed =
+        rcoder_e2e::common::resources::remove_builder_for_recreation(&app, user, &id_before);
+    report.assert_hard(
+        "lazy recreation removes only captured builder",
+        removed.is_ok(),
+        format!("{removed:?}"),
+    );
+    if removed.is_err() {
+        assert_hard_all(report).await;
+        return;
+    }
 
     let resp = env
         .http
@@ -2760,6 +2807,13 @@ async fn userapp_dev_app_proxy_lazy_start() {
         format!("before={id_before:.12}, after={id_after:?}"),
     );
 
+    let replacement =
+        rcoder_e2e::common::resources::register_builder_replacement(&app, user, &id_before);
+    report.assert_hard(
+        "lazy recreation records same-lifecycle replacement",
+        replacement.is_ok(),
+        format!("{replacement:?}"),
+    );
     assert_hard_all(report).await;
     cleanup_builder(&app);
 }

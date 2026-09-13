@@ -167,6 +167,12 @@ pub(crate) async fn files_update(
     State(state): State<UserAppState>,
     Json(body): Json<UserappFilesUpdateBody>,
 ) -> Result<Json<Value>, AppError> {
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&body.app_id)
+        .await
+        .read_owned()
+        .await;
     let path = resolve_userapp_dev(
         &body.app_id,
         body.custom_target_dir.as_deref(),
@@ -224,6 +230,12 @@ pub(crate) async fn upload_file(
         }
     }
     let app_id = require_app_field(app_id, "app_id")?;
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&app_id)
+        .await
+        .read_owned()
+        .await;
     let user_id = require_app_field(user_id, "user_id")?;
     let file_path = require_app_field(file_path, "file_path")?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
@@ -277,6 +289,12 @@ pub(crate) async fn upload_files(
         }
     }
     let app_id = require_app_field(app_id, "app_id")?;
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&app_id)
+        .await
+        .read_owned()
+        .await;
     let user_id = require_app_field(user_id, "user_id")?;
     tracing::debug!(app_id = %app_id, user_id, "userapp upload-files");
     if file_paths.len() != files_vec.len() {
@@ -340,6 +358,12 @@ pub(crate) async fn generate_file(
     Json(body): Json<UserappGenerateFileBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(file_server::error::from_garde)?;
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&body.app_id)
+        .await
+        .read_owned()
+        .await;
     let ws = resolve_userapp_dev(
         &body.app_id,
         body.custom_target_dir.as_deref(),
@@ -394,6 +418,12 @@ pub(crate) async fn import_project(
         }
     }
     let app_id = require_app_field(app_id, "app_id")?;
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&app_id)
+        .await
+        .read_owned()
+        .await;
     let user_id = require_app_field(user_id, "user_id")?;
     let data: TemporaryFile = data.ok_or_else(|| AppError::validation("file is required"))?;
     validate_zip_ext(file_name.as_deref())?;
@@ -636,6 +666,50 @@ mod tests {
             std::fs::read(tmp.path().join("app-3").join("pkg.json")).unwrap(),
             b"{}"
         );
+    }
+
+    #[tokio::test]
+    async fn files_update_waits_for_workspace_reset_to_finish() {
+        use futures_util::FutureExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        let reset = state
+            .build_tasks
+            .workspace_activity("app-reset")
+            .await
+            .write_owned()
+            .await;
+        let update = files_update(
+            State(state),
+            Json(UserappFilesUpdateBody {
+                app_id: "app-reset".into(),
+                user_id: "u".into(),
+                files: vec![crate::models::UserappFileOp {
+                    operation: "create".into(),
+                    name: "after-reset.txt".into(),
+                    is_dir: None,
+                    contents: Some("new content".into()),
+                    rename_from: None,
+                }],
+                custom_target_dir: None,
+            }),
+        );
+        tokio::pin!(update);
+        assert!(
+            update.as_mut().now_or_never().is_none(),
+            "write must wait for reset"
+        );
+        let path = tmp.path().join("app-reset/after-reset.txt");
+        assert!(
+            !path.exists(),
+            "no workspace write before reset releases its lease"
+        );
+        drop(reset);
+        tokio::time::timeout(std::time::Duration::from_secs(2), update)
+            .await
+            .expect("write deadline")
+            .expect("write after reset");
+        assert_eq!(tokio::fs::read(path).await.expect("file"), b"new content");
     }
 
     /// resolve_userapp_dev: customTargetDir 信任覆盖 + identifier 路径穿越拒绝。

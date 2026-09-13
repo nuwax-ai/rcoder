@@ -85,8 +85,10 @@ pub async fn get_app_storage(
 pub async fn clear_app_storage(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, app_stage)): Path<(String, String)>,
-    Json(req): Json<ClearStorageRequest>,
+    body: Result<Json<ClearStorageRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
+    let Json(mut req) = body
+        .map_err(|_| AppError::validation_error("A valid storage clear JSON body is required"))?;
     let app_stage = super::parse_app_stage_param(&app_stage)?;
     req.validate()
         .map_err(shared_types::garde_err_to_app_error)?;
@@ -96,11 +98,29 @@ pub async fn clear_app_storage(
         app_stage.as_str(),
         req.user_id
     );
-    state
-        .app_service
-        .clear_app_storage(app_stage, &app_id, &req.user_id)
-        .await?;
-    Ok(Json(HttpResult::success("存储已清空".to_string())))
+    let request_id = req
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let owner = req.user_id.clone();
+    let service = state.app_service.clone();
+    let target = app_id.clone();
+    let result = tokio::spawn(async move {
+        service
+            .clear_app_storage_controlled(app_stage, &target, req)
+            .await
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "Storage clear worker interrupted");
+        AppError::internal_server_error(
+            "Storage clear worker interrupted; query its operation before retrying",
+        )
+    })?;
+    let id = super::control::control_result(&state, &app_id, &owner, &request_id, result).await?;
+    Ok(Json(
+        HttpResult::success("Storage cleared".to_string()).with_operation_id(id),
+    ))
 }
 
 /// 销毁应用持久存储
@@ -121,12 +141,15 @@ pub async fn clear_app_storage(
     ),
     tag = "Userapp · 双态 · 文件与存储"
 )]
-#[instrument(skip(state, req))]
+#[instrument(skip(state, body))]
 pub async fn destroy_app_storage(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, app_stage)): Path<(String, String)>,
-    Json(req): Json<DestroyStorageRequest>,
+    body: Result<Json<DestroyStorageRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
+    let Json(mut req) = body.map_err(|_| {
+        AppError::validation_error("A valid storage destruction JSON body is required")
+    })?;
     let app_stage = super::parse_app_stage_param(&app_stage)?;
     req.validate()
         .map_err(shared_types::garde_err_to_app_error)?;
@@ -136,13 +159,30 @@ pub async fn destroy_app_storage(
         app_stage.as_str(),
         req.user_id
     );
-    state
-        .app_service
-        .destroy_app_storage(app_stage, &app_id, &req.user_id, &req.confirm)
-        .await?;
-    Ok(Json(HttpResult::success(
-        "存储已销毁，配额已释放".to_string(),
-    )))
+    let request_id = req
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let owner = req.user_id.clone();
+    let worker_service = state.app_service.clone();
+    let worker_app = app_id.clone();
+    let result = tokio::spawn(async move {
+        worker_service
+            .destroy_app_storage_controlled(app_stage, &worker_app, req)
+            .await
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "Storage destruction worker interrupted");
+        AppError::internal_server_error(
+            "Storage destruction worker interrupted; query the operation before retrying",
+        )
+    })?;
+    let operation_id =
+        super::control::control_result(&state, &app_id, &owner, &request_id, result).await?;
+    Ok(Json(
+        HttpResult::success("Storage destroyed".to_string()).with_operation_id(operation_id),
+    ))
 }
 
 /// 分页查询持久存储清单

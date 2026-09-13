@@ -301,6 +301,12 @@ pub struct KeepalivePodResponse {
 /// 重启容器请求
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct RestartPodRequest {
+    /// Expected userApp lifecycle; required after explicit recreation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_id: Option<String>,
+    /// Idempotency key for a userApp production restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// 用户唯一标识符 (必填)
     #[schema(example = "user_123")]
     #[serde(default)]
@@ -388,6 +394,12 @@ pub struct RestartPodResponse {
 /// 停止容器请求
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct StopPodRequest {
+    /// UserApp lifecycle token, required after explicit recreation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_id: Option<String>,
+    /// UserApp control request deduplication token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// 用户唯一标识符 (必填)
     #[schema(example = "user_123")]
     #[serde(default)]

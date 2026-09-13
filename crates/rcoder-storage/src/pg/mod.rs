@@ -14,6 +14,7 @@
 // 两业务域目录化(开闭原则:改一个域不碰另一个域的文件):
 // - project_store/  主服务域(ProjectStore 契约的 PG 后端实现全部)
 // - userapp/        Userapp 业务域(activity/metadata)
+pub(crate) mod connection;
 mod project_store;
 
 #[cfg(test)]
@@ -32,7 +33,6 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use moka::sync::Cache;
-use sqlx::postgres::PgPoolOptions;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -107,41 +107,7 @@ impl PgStore {
         namespace: String,
         cluster_domain: String,
     ) -> anyhow::Result<(Self, mpsc::Receiver<shared_types::CleanupRequest>)> {
-        let dsn = config.to_dsn().map_err(anyhow::Error::msg)?;
-        // 语句超时在 acquire 后的会话级设置（防单条慢查询拖死连接）
-        let statement_timeout_ms = config.statement_timeout_secs() * 1000;
-        let pool = PgPoolOptions::new()
-            .max_connections(config.max_connections())
-            // 预热连接（启动即建，冷启动首批查询免付建连延迟）
-            .min_connections(config.min_connections())
-            .acquire_timeout(Duration::from_secs(config.connect_timeout_secs()))
-            // 连接最大寿命：CNPG failover 后指向旧 primary 的僵尸连接，到期在
-            // release/recycle 时关闭重建即自愈（默认 600s，见 config.rs 注释）
-            .max_lifetime(Duration::from_secs(config.max_lifetime_secs()))
-            .after_connect(move |conn, _meta| {
-                Box::pin(async move {
-                    // SET 语句不支持参数占位符；set_config 是等价的标准做法且可参数化
-                    // （sqlx 新版 SqlSafeStr 约束也禁止 format! 动态拼 SQL）
-                    sqlx::query("SELECT set_config('statement_timeout', $1, false)")
-                        .bind(statement_timeout_ms.to_string())
-                        .execute(&mut *conn)
-                        .await?;
-                    Ok(())
-                })
-            })
-            .connect(&dsn)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "PG connect failed ({}/{}): {e}",
-                    config.host.as_deref().unwrap_or("?"),
-                    config.database.as_deref().unwrap_or("?")
-                )
-            })?;
-        info!(
-            "[STORAGE_PG] connected: {} (password not logged)",
-            config.describe()
-        );
+        let pool = connection::connect_pool(config).await?;
 
         // 迁移：sqlx migrate 自带 advisory lock，多副本并发启动安全
         sqlx::migrate!("./migrations")

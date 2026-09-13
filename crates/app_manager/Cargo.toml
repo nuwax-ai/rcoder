@@ -64,3 +64,6 @@ tokio-util = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 zip = { workspace = true }
+
+[dev-dependencies]
+rcoder-storage = { workspace = true, features = ["sqlite"] }

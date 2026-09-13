@@ -9,9 +9,7 @@ use tracing::{info, instrument};
 use shared_types::{AppError, HttpResult};
 
 use super::state::AppManagerState;
-use crate::models::{
-    AppRuntimeInfo, OwnerParams, RecyclePolicyRequest, StartAppRequest, StartAppResult,
-};
+use crate::models::{AppRuntimeInfo, RecyclePolicyRequest, StartAppRequest, StartAppResult};
 
 /// 启动应用或轻量部署
 ///
@@ -29,17 +27,15 @@ use crate::models::{
     ),
     tag = "Userapp · prod · 部署与启停"
 )]
-#[instrument(skip(state))]
+#[instrument(skip(state, body))]
 pub async fn start_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-    body: Option<Json<StartAppRequest>>,
+    body: Result<Json<StartAppRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<HttpResult<StartAppResult>>, AppError> {
-    let Some(Json(request)) = body else {
-        return Err(AppError::validation_error(
-            "request body with required `user_id` is required for start",
-        ));
-    };
+    let Json(mut request) = body.map_err(|_| {
+        AppError::validation_error("A valid start JSON body with user_id is required")
+    })?;
     request
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
@@ -50,13 +46,24 @@ pub async fn start_app(
         request.user_id
     );
     // The accepted coordinator owns its lease even when the HTTP client disconnects.
+    let request_id = request
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let owner = request.user_id.clone();
+    let worker_app_id = app_id.clone();
     let service = state.app_service.clone();
     let result = await_deployment_response(
-        tokio::spawn(async move { service.start_app_enhanced(&app_id, request).await }),
+        tokio::spawn(async move { service.start_app_enhanced(&worker_app_id, request).await }),
         std::time::Duration::from_secs(300),
     )
-    .await?;
-    Ok(Json(HttpResult::success(result)))
+    .await;
+    let result =
+        correlate_deployment_response(&state, &app_id, &owner, &request_id, result).await?;
+    let operation_id = result.operation_id.clone();
+    let mut response = HttpResult::success(result);
+    response.operation_id = operation_id;
+    Ok(Json(response))
 }
 
 /// 停止应用（scale replicas = 0）
@@ -65,15 +72,16 @@ pub async fn start_app(
     path = "/api/v1/userapp/{app_id}/stop",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        OwnerParams,
+        ("user_id" = String, Query, description = "Application owner"),
+        ("lifecycle_id" = Option<String>, Query, description = "Required after explicit recreation"),
+        ("request_id" = Option<String>, Query, description = "Idempotent request token"),
     ),
     description = r#"
 把运行容器缩到 0 副本停止应用：**数据卷 / 元数据全部保留**，随时可 `start` 重启
 （区别于 delete 后的 storage 面）。
 
-- 停止后进入 stopped 集合；生产面流量与文件操作会按"有请求即唤醒"语义自动
-  scale 回 1（single-flight，唤醒窗口内返回 503+Retry-After）；
-- 与闲置回收协同：`recycle-policy` 到期也会触发同一 stop 路径；
+- 显式停止会阻断流量唤醒，后续需要显式 start；
+- 闲置回收保留流量唤醒能力，与显式 stop 的策略不同；
 - 需要"彻底销毁"走 delete → （可选）storage/clear | destroy。
 "#,
     responses(
@@ -85,14 +93,37 @@ pub async fn start_app(
 pub async fn stop_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-    Query(owner): Query<OwnerParams>,
+    request: Result<
+        Query<shared_types::UserAppControlRequest>,
+        axum::extract::rejection::QueryRejection,
+    >,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    owner
-        .validate()
-        .map_err(shared_types::garde_err_to_app_error)?;
-    info!("[APP] stopping app: {} (user_id={})", app_id, owner.user_id);
-    let runtime = state.app_service.stop_app(&app_id).await?;
-    Ok(Json(HttpResult::success(runtime)))
+    let Query(mut request) = request
+        .map_err(|_| AppError::validation_error("Valid stop query parameters are required"))?;
+    shared_types::validate_identifier(&request.user_id, "user_id")
+        .map_err(|_| AppError::validation_error("Invalid user_id query parameter"))?;
+    let request_id = request
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let owner = request.user_id.clone();
+    info!("[APP] stopping app: {} (user_id={})", app_id, owner);
+    let result = state
+        .app_service
+        .stop_app_controlled(&app_id, request)
+        .await;
+    let runtime =
+        super::control::control_result(&state, &app_id, &owner, &request_id, result).await?;
+    let operation = state
+        .app_service
+        .get_control_operation_by_request(&app_id, &owner, &request_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::internal_server_error("Stop completed without a durable operation record")
+        })?;
+    Ok(Json(
+        HttpResult::success(runtime).with_operation_id(operation.operation_id),
+    ))
 }
 
 /// 重启应用
@@ -111,17 +142,15 @@ pub async fn stop_app(
     ),
     tag = "Userapp · prod · 部署与启停"
 )]
-#[instrument(skip(state))]
+#[instrument(skip(state, body))]
 pub async fn restart_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-    body: Option<Json<StartAppRequest>>,
+    body: Result<Json<StartAppRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<HttpResult<StartAppResult>>, AppError> {
-    let Some(Json(request)) = body else {
-        return Err(AppError::validation_error(
-            "request body with required `user_id` is required for restart",
-        ));
-    };
+    let Json(mut request) = body.map_err(|_| {
+        AppError::validation_error("A valid restart JSON body with user_id is required")
+    })?;
     request
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
@@ -131,13 +160,24 @@ pub async fn restart_app(
         request.url.is_some()
     );
     // The accepted coordinator owns its lease even when the HTTP client disconnects.
+    let request_id = request
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let owner = request.user_id.clone();
+    let worker_app_id = app_id.clone();
     let service = state.app_service.clone();
     let result = await_deployment_response(
-        tokio::spawn(async move { service.restart_app_enhanced(&app_id, request).await }),
+        tokio::spawn(async move { service.restart_app_enhanced(&worker_app_id, request).await }),
         std::time::Duration::from_secs(300),
     )
-    .await?;
-    Ok(Json(HttpResult::success(result)))
+    .await;
+    let result =
+        correlate_deployment_response(&state, &app_id, &owner, &request_id, result).await?;
+    let operation_id = result.operation_id.clone();
+    let mut response = HttpResult::success(result);
+    response.operation_id = operation_id;
+    Ok(Json(response))
 }
 
 /// 设置闲置回收策略
@@ -172,8 +212,10 @@ pub async fn restart_app(
 pub async fn set_recycle_policy(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, app_stage)): Path<(String, String)>,
-    Json(request): Json<RecyclePolicyRequest>,
+    request: Result<Json<RecyclePolicyRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
+    let Json(mut request) = request
+        .map_err(|_| AppError::validation_error("A valid recycle policy JSON body is required"))?;
     if shared_types::UserappStage::parse(&app_stage) != Some(shared_types::UserappStage::Prod) {
         return Err(AppError::validation_error(
             "`recycle-policy` is a prod-runtime capability: pass app_stage=prod (dev environment has no recycle semantics)",
@@ -186,15 +228,52 @@ pub async fn set_recycle_policy(
         "[APP] setting recycle policy: {} (user_id={})",
         app_id, request.user_id
     );
-    let runtime = state
+    let request_id = request
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let owner = request.user_id.clone();
+    let result = state.app_service.set_recycle_policy(&app_id, request).await;
+    let runtime =
+        super::control::control_result(&state, &app_id, &owner, &request_id, result).await?;
+    let operation = state
         .app_service
-        .set_recycle_policy(&app_id, request)
-        .await?;
-    Ok(Json(HttpResult::success(runtime)))
+        .get_control_operation_by_request(&app_id, &owner, &request_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::internal_server_error("Policy completed without a durable operation record")
+        })?;
+    Ok(Json(
+        HttpResult::success(runtime).with_operation_id(operation.operation_id),
+    ))
 }
 
 /// Dropping the JoinHandle on timeout detaches the owned coordinator; it does not
 /// cancel a remote mutation or release its application lease prematurely.
+async fn correlate_deployment_response<T>(
+    state: &AppManagerState,
+    app_id: &str,
+    owner: &str,
+    request_id: &str,
+    result: Result<T, AppError>,
+) -> Result<T, AppError> {
+    let error = match result {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state
+            .app_service
+            .get_control_operation_by_request(app_id, owner, request_id),
+    )
+    .await
+    {
+        Ok(Ok(Some(operation))) => Err(error.with_operation_id(operation.operation_id)),
+        _ => Err(error),
+    }
+}
+
 async fn await_deployment_response<T>(
     task: tokio::task::JoinHandle<crate::error::AppResult<T>>,
     budget: std::time::Duration,
@@ -208,6 +287,91 @@ async fn await_deployment_response<T>(
 #[cfg(test)]
 mod deployment_response_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_start_and_restart_bodies_use_the_business_envelope() {
+        let directory = tempfile::tempdir().expect("handler test directory");
+        let runtime = Arc::new(crate::test_support::MockRuntime::default());
+        let service =
+            Arc::new(crate::test_support::test_service(directory.path(), runtime.clone()).await);
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/userapp/{app_id}/start",
+                axum::routing::post(start_app),
+            )
+            .route(
+                "/api/v1/userapp/{app_id}/restart",
+                axum::routing::post(restart_app),
+            )
+            .layer(axum::middleware::from_fn(
+                shared_types::userapp_http::envelope_errors,
+            ))
+            .with_state(Arc::new(AppManagerState {
+                app_service: service.clone(),
+                http_client: reqwest::Client::new(),
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        struct Server(tokio::task::JoinHandle<()>);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server = Server(tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("HTTP test server");
+        }));
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .expect("HTTP client");
+        for action in ["start", "restart"] {
+            for (content_type, body) in [
+                ("application/json", "{"),
+                ("application/json", "{}"),
+                (
+                    "application/json",
+                    r#"{"user_id":"owner","deploy_mode":"invalid"}"#,
+                ),
+                ("text/plain", r#"{"user_id":"owner"}"#),
+            ] {
+                let response = client
+                    .post(format!(
+                        "http://{address}/api/v1/userapp/invalid-body/{action}"
+                    ))
+                    .header("content-type", content_type)
+                    .body(body)
+                    .send()
+                    .await
+                    .expect("HTTP response");
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                let envelope: serde_json::Value =
+                    response.json().await.expect("JSON error envelope");
+                assert_eq!(envelope["code"], shared_types::error_codes::ERR_VALIDATION);
+                assert!(envelope["message"].as_str().expect("message").is_ascii());
+            }
+        }
+        assert_eq!(
+            runtime
+                .create_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(
+            service
+                .metadata
+                .store
+                .get_application("invalid-body")
+                .await
+                .expect("application query")
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn response_timeout_does_not_cancel_owned_coordinator() {
         let (release, proceed) = tokio::sync::oneshot::channel();

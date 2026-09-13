@@ -32,6 +32,7 @@ fn userapp_router() -> OpenApiRouter<UserAppState> {
         .routes(routes!(userapp_app_files::list))
         .routes(routes!(userapp_app_files::delete))
         .routes(routes!(userapp_app_files::clear))
+        .routes(routes!(userapp_app_files::clear_target))
         .routes(routes!(userapp_dev::ensure_workspace))
         .routes(routes!(userapp_dev::execute_command))
         .routes(routes!(userapp_dev::get_logs))
@@ -112,6 +113,7 @@ mod tests {
             "/api/v1/userapp/app-files/list",
             "/api/v1/userapp/app-files/delete",
             "/api/v1/userapp/app-files/clear",
+            "/api/v1/userapp/app-files/clear-target",
             "/api/v1/userapp/ensure-workspace",
             "/api/v1/userapp/execute-command",
             "/api/v1/userapp/get-logs",
@@ -132,7 +134,7 @@ mod tests {
                 "userapp path missing: {path}"
             );
         }
-        assert_eq!(document.paths.paths.len(), 33);
+        assert_eq!(document.paths.paths.len(), 34);
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 

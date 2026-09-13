@@ -1,53 +1,72 @@
-//! Userapp 应用业务元数据缓存 + 影子持久化（extension-impl）。
-//!
-//! PG 模式下 `POST /apps/query` 的 name/created_at 过滤数据源：集群不持有这两个字段
-//! （rcoder 无状态），由 PG `userapp_metadata` 表补充。内存 cache 全量镜像（启动
-//! load_all），写路径低频同步 upsert（create_app/update_app 成功后，失败仅 warn）。
-//! 删除对齐三档语义：delete/purge 保留行（误删找回），storage/destroy 删行。
-//!
-//! 纯内存模式（Docker Compose）：cache 为空、persistence None——query 的
-//! name/created_at 过滤维持忽略 + warn（旧行为）。
+//! Authoritative userApp metadata projection. No process-local ownership cache.
+use std::{collections::HashMap, sync::Arc};
 
-use std::sync::Arc;
+use crate::models::{AppOperationError, AppResult};
+use shared_types::{
+    AppMetadataRecord, UserAppLifecycleRecord, UserAppLifecycleState, UserAppLifecycleStore,
+};
 
-use dashmap::DashMap;
-use shared_types::AppMetadataRecord;
-use tokio::sync::OnceCell;
-use tracing::warn;
+#[cfg(test)]
+use shared_types::UserAppMetadataPatch;
 
-/// 应用元数据缓存（AppService 持有；进程内单例语义，跨副本由 PG 承载）。
-#[derive(Default)]
 pub(crate) struct AppMetadataStore {
-    cache: DashMap<String, AppMetadataRecord>,
-    persistence: OnceCell<Arc<dyn shared_types::AppMetadataPersistence>>,
+    pub(crate) store: Arc<dyn UserAppLifecycleStore>,
 }
 
 impl AppMetadataStore {
-    /// 注入影子持久化（PG 模式 main 在 AppService 构造后调用）。
-    pub fn set_persistence(&self, p: Arc<dyn shared_types::AppMetadataPersistence>) {
-        if self.persistence.set(p).is_err() {
-            warn!("[APP_METADATA] set_persistence called twice; keeping existing");
+    /// Validate the caller's lifecycle token; never manufacture it from the
+    /// current row for an external request. Admission still performs the final CAS.
+    pub(crate) async fn validate_request_lifecycle(
+        &self,
+        app_id: &str,
+        owner: &str,
+        expected_lifecycle: Option<&str>,
+    ) -> AppResult<()> {
+        match self.store.get_application(app_id).await? {
+            Some(app) => {
+                if app.user_id != owner {
+                    return Err(shared_types::UserAppStoreError::OwnershipConflict.into());
+                }
+                if app.state != UserAppLifecycleState::Active
+                    || expected_lifecycle.is_some_and(|expected| expected != app.lifecycle_id)
+                    || (app.lifecycle_epoch > 1 && expected_lifecycle.is_none())
+                {
+                    return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+                }
+                Ok(())
+            }
+            None if expected_lifecycle.is_some() => {
+                Err(shared_types::UserAppStoreError::LifecycleConflict.into())
+            }
+            None => Ok(()),
         }
     }
 
-    /// 已注入的持久化（None=纯内存模式，name/created_at 过滤不可用）
-    pub fn persistence(&self) -> Option<Arc<dyn shared_types::AppMetadataPersistence>> {
-        self.persistence.get().cloned()
+    pub(crate) fn new(store: Arc<dyn UserAppLifecycleStore>) -> Self {
+        Self { store }
     }
 
-    /// 启动恢复：PG 全量加载写入内存 cache。
-    pub fn apply_loaded(&self, rows: Vec<AppMetadataRecord>) {
-        for row in rows {
-            self.cache.insert(row.app_id.clone(), row);
+    /// Resolve ownership from authoritative storage before any runtime mutation.
+    pub async fn owner_for_write(&self, app_id: &str, supplied: &str) -> AppResult<String> {
+        let supplied = (!supplied.trim().is_empty()).then_some(supplied);
+        match self.store.get_application(app_id).await? {
+            Some(app) => {
+                if app.state != UserAppLifecycleState::Active {
+                    return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+                }
+                if supplied.is_some_and(|owner| owner != app.user_id) {
+                    return Err(shared_types::UserAppStoreError::OwnershipConflict.into());
+                }
+                Ok(app.user_id)
+            }
+            None => supplied.map(str::to_owned).ok_or_else(|| {
+                AppOperationError::Validation("Application owner is required".into())
+            }),
         }
     }
 
-    /// create/update 成功后记录元数据（cache 写 + PG upsert 失败仅 warn 不阻塞业务）。
-    ///
-    /// `created_at`：PG 侧 ON CONFLICT 不更新该列（仅首次 insert 生效）；内存 cache
-    /// 此前每次用 now() 整行覆盖——改一次名 cache 里的创建时间就被刷新，query 的
-    /// created_at 过滤随之漂移、重启后又回退为 PG 原值。现与 PG 对齐：cache 命中
-    /// 旧记录时回填原 created_at，仅首次插入用 now()。
+    /// None preserves a field. Explicit clear operations use UserAppMetadataPatch.
+    #[cfg(test)]
     pub async fn record(
         &self,
         app_id: &str,
@@ -55,351 +74,197 @@ impl AppMetadataStore {
         user_id: Option<String>,
         tenant_id: Option<String>,
         space_id: Option<String>,
-    ) {
-        let created_at = self
-            .cache
-            .get(app_id)
-            .map(|existing| existing.created_at)
-            .unwrap_or_else(chrono::Utc::now);
-        let row = AppMetadataRecord {
-            generation: uuid::Uuid::new_v4().to_string(),
-            app_id: app_id.to_string(),
-            name,
-            user_id,
-            tenant_id,
-            space_id,
-            created_at,
+    ) -> AppResult<()> {
+        let owner = match user_id.filter(|owner| !owner.trim().is_empty()) {
+            Some(owner) => owner,
+            None => self
+                .lookup(app_id)
+                .await?
+                .and_then(|row| row.user_id)
+                .ok_or_else(|| {
+                    AppOperationError::Validation("Application owner is required".into())
+                })?,
         };
-        if let Some(p) = self.persistence()
-            && let Err(e) = p.upsert(&row).await
-        {
-            warn!("[APP_METADATA] upsert failed app_id={app_id} (query filters may be stale): {e}");
-        }
-        self.cache.insert(app_id.to_string(), row);
-    }
-
-    /// Capture before any deletion side effects; persistence is authoritative.
-    pub async fn deletion_generation(&self, app_id: &str) -> anyhow::Result<Option<String>> {
-        let row = match self.persistence() {
-            Some(persistence) => persistence.get(app_id).await?,
-            None => self.lookup(app_id),
-        };
-        Ok(row.map(|row| row.generation))
-    }
-
-    pub async fn record_deleted(
-        &self,
-        app_id: &str,
-        generation: Option<&str>,
-    ) -> anyhow::Result<()> {
-        if let Some(persistence) = self.persistence() {
-            // Cache is not a deletion authority. Capture its value solely to
-            // avoid evicting a later local write when SQL completion returns.
-            let cached_generation = self.lookup(app_id).map(|row| row.generation);
-            let deleted = match generation {
-                Some(generation) => persistence.delete_if_current(app_id, generation).await?,
-                None => false,
-            };
-            if !deleted {
-                anyhow::ensure!(
-                    persistence.get(app_id).await?.is_none(),
-                    "application metadata changed during deletion"
-                );
-            }
-            if let dashmap::mapref::entry::Entry::Occupied(entry) =
-                self.cache.entry(app_id.to_owned())
-                && cached_generation.as_deref() == Some(entry.get().generation.as_str())
-            {
-                entry.remove();
-            }
+        let app = self.store.ensure_identity(app_id, &owner).await?;
+        if name.is_none() && tenant_id.is_none() && space_id.is_none() {
             return Ok(());
         }
-        // In-memory fallback has a single authority: compare and remove under
-        // one entry guard, including the expected-absence case.
-        if let dashmap::mapref::entry::Entry::Occupied(entry) = self.cache.entry(app_id.to_owned())
-        {
-            anyhow::ensure!(
-                generation == Some(entry.get().generation.as_str()),
-                "application metadata changed during deletion"
-            );
-            entry.remove();
-        }
+        self.store
+            .patch_metadata(&UserAppMetadataPatch {
+                app_id: app_id.into(),
+                user_id: owner,
+                lifecycle_id: app.lifecycle_id,
+                expected_revision: app.metadata_revision,
+                name: name.map(Some),
+                tenant_id: tenant_id.map(Some),
+                space_id: space_id.map(Some),
+            })
+            .await?;
         Ok(())
     }
 
-    /// query join：按 app_id 取元数据（cache miss = 该 app 无业务元数据记录）。
-    pub fn lookup(&self, app_id: &str) -> Option<AppMetadataRecord> {
-        self.cache.get(app_id).map(|r| r.clone())
+    pub async fn lookup(&self, app_id: &str) -> AppResult<Option<AppMetadataRecord>> {
+        Ok(self
+            .store
+            .get_application(app_id)
+            .await?
+            .filter(|app| app.state != UserAppLifecycleState::Deleted)
+            .map(project))
+    }
+
+    /// A bounded page per query, materialized before any runtime request or sort.
+    pub async fn snapshot(&self) -> AppResult<HashMap<String, AppMetadataRecord>> {
+        let mut result = HashMap::new();
+        let mut cursor = None;
+        loop {
+            let page = self.store.list_applications(cursor.as_deref(), 256).await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|app| app.app_id.clone());
+            for app in page {
+                if app.state != UserAppLifecycleState::Deleted {
+                    result.insert(app.app_id.clone(), project(app));
+                }
+            }
+        }
+        Ok(result)
+    }
+}
+
+fn project(app: UserAppLifecycleRecord) -> AppMetadataRecord {
+    AppMetadataRecord {
+        generation: app.lifecycle_id,
+        app_id: app.app_id,
+        user_id: Some(app.user_id),
+        name: app.name,
+        tenant_id: app.tenant_id,
+        space_id: app.space_id,
+        created_at: app.created_at,
     }
 }
 
 impl crate::service::AppService {
-    /// 注入元数据持久化（PG 模式 main 在 AppService 构造后调用）。
-    pub fn set_metadata_persistence(&self, p: Arc<dyn shared_types::AppMetadataPersistence>) {
-        self.metadata.set_persistence(p);
+    pub fn set_dev_cleanup(
+        &self,
+        cleanup: Arc<dyn shared_types::UserappDevCleanup>,
+    ) -> AppResult<()> {
+        *self.dev_cleanup.write().map_err(|_| {
+            AppOperationError::Backend("Userapp dev cleanup lock poisoned".into())
+        })? = Some(cleanup);
+        Ok(())
     }
-
-    /// 启动恢复：PG 全量加载元数据进内存镜像（query join 数据源）。
-    pub fn apply_metadata_loaded(&self, rows: Vec<AppMetadataRecord>) {
-        let count = rows.len();
-        self.metadata.apply_loaded(rows);
-        tracing::info!("[APP_METADATA] userapp_metadata loaded: {count} rows");
-    }
-
-    /// 注入开发资源回收回调（宿主 rcoder 装配时调用；purge 回收 UserappBuilder
-    /// 开发容器与 per-app PVC，app_manager 自身 runtime 视图无 agent 能力）。
-    pub fn set_dev_cleanup(&self, cleanup: Arc<dyn shared_types::UserappDevCleanup>) {
-        *self.dev_cleanup.write().expect("dev_cleanup lock") = Some(cleanup);
-    }
-
-    /// 注入开发容器定位回调（宿主 rcoder 装配时调用；文件/存储接口 `env=dev`
-    /// 分支经此幂等 ensure UserappBuilder 并解析其 file-server 地址）。
-    pub fn set_dev_locator(&self, locator: Arc<dyn shared_types::UserappDevLocator>) {
-        *self.dev_locator.write().expect("dev_locator lock") = Some(locator);
+    pub fn set_dev_locator(
+        &self,
+        locator: Arc<dyn shared_types::UserappDevLocator>,
+    ) -> AppResult<()> {
+        *self.dev_locator.write().map_err(|_| {
+            AppOperationError::Backend("Userapp dev locator lock poisoned".into())
+        })? = Some(locator);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::InMemoryMetadataPersistence;
-    use shared_types::AppMetadataPersistence as _;
+    use rcoder_storage::userapp_lifecycle::SqliteUserAppStore;
 
     #[tokio::test]
-    async fn record_upserts_cache_and_persistence() {
-        let persistence = InMemoryMetadataPersistence::new(vec![]);
-        let store = AppMetadataStore::default();
-        store.set_persistence(persistence.clone());
-        store
-            .record(
-                "app-a",
-                Some("alpha".into()),
-                Some("u1".into()),
-                Some("t1".into()),
-                None,
-            )
-            .await;
-        let meta = store.lookup("app-a").expect("cached after record");
-        assert_eq!(meta.name.as_deref(), Some("alpha"));
-        assert_eq!(meta.tenant_id.as_deref(), Some("t1"));
-        assert!(meta.space_id.is_none());
-        let rows = persistence.load_all().await.expect("persisted");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].app_id, "app-a");
-    }
-
-    #[tokio::test]
-    async fn stale_metadata_cleanup_preserves_new_write() {
-        let persistence = InMemoryMetadataPersistence::new(vec![]);
-        let first = AppMetadataStore::default();
-        let second = AppMetadataStore::default();
-        first.set_persistence(persistence.clone());
-        second.set_persistence(persistence.clone());
-        first
-            .record("metadata-race", Some("A".into()), None, None, None)
-            .await;
-        let captured = first
-            .deletion_generation("metadata-race")
+    async fn independent_readers_observe_committed_metadata_and_noop_keeps_revision() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("userapp.sqlite3");
+        let first = Arc::new(SqliteUserAppStore::open(&path).await.expect("first store"));
+        let second = Arc::new(SqliteUserAppStore::open(&path).await.expect("second store"));
+        let writer = AppMetadataStore::new(first.clone());
+        let reader = AppMetadataStore::new(second.clone());
+        writer
+            .record("a", Some("alpha".into()), Some("owner".into()), None, None)
             .await
-            .expect("capture");
-        second
-            .record("metadata-race", Some("B".into()), None, None, None)
-            .await;
-        assert!(
-            first
-                .record_deleted("metadata-race", captured.as_deref())
-                .await
-                .is_err()
-        );
+            .expect("record");
         assert_eq!(
-            persistence
-                .get("metadata-race")
+            reader
+                .lookup("a")
                 .await
                 .expect("read")
-                .expect("replacement")
+                .expect("present")
                 .name
                 .as_deref(),
-            Some("B")
+            Some("alpha")
         );
-    }
-
-    #[tokio::test]
-    async fn authoritative_delete_is_not_vetoed_by_an_older_replica_cache() {
-        let persistence = InMemoryMetadataPersistence::new(vec![]);
-        let first = AppMetadataStore::default();
-        let second = AppMetadataStore::default();
-        first.set_persistence(persistence.clone());
-        second.set_persistence(persistence.clone());
-        first
-            .record("stale-replica", Some("A".into()), None, None, None)
-            .await;
-        second
-            .record("stale-replica", Some("B".into()), None, None, None)
-            .await;
-        let captured = first.deletion_generation("stale-replica").await.unwrap();
-        assert_ne!(
-            first.lookup("stale-replica").unwrap().generation,
-            captured.as_ref().unwrap().as_str()
-        );
-        first
-            .record_deleted("stale-replica", captured.as_deref())
+        let before = second
+            .get_application("a")
             .await
-            .unwrap();
-        assert!(persistence.get("stale-replica").await.unwrap().is_none());
-        assert!(first.lookup("stale-replica").is_none());
-    }
-
-    #[tokio::test]
-    async fn authoritative_absence_invalidates_a_stale_cache_entry() {
-        let persistence = InMemoryMetadataPersistence::new(vec![]);
-        let store = AppMetadataStore::default();
-        store.set_persistence(persistence.clone());
-        store.record("ghost", None, None, None, None).await;
-        let cached = store.lookup("ghost").unwrap();
-        assert!(
-            persistence
-                .delete_if_current("ghost", &cached.generation)
+            .expect("read")
+            .expect("present");
+        writer
+            .record("a", Some("alpha".into()), Some("owner".into()), None, None)
+            .await
+            .expect("noop");
+        let after = second
+            .get_application("a")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(before, after);
+        writer
+            .record("a", Some("beta".into()), Some("owner".into()), None, None)
+            .await
+            .expect("update");
+        assert_eq!(
+            reader.snapshot().await.expect("snapshot")["a"]
+                .name
+                .as_deref(),
+            Some("beta")
+        );
+        assert!(matches!(
+            reader.owner_for_write("a", "foreign").await,
+            Err(AppOperationError::Conflict(_))
+        ));
+        first.close().await;
+        second.close().await;
+        let reopened = Arc::new(SqliteUserAppStore::open(&path).await.expect("reopen"));
+        assert_eq!(
+            AppMetadataStore::new(reopened.clone())
+                .lookup("a")
                 .await
-                .unwrap()
+                .expect("read")
+                .expect("present")
+                .name
+                .as_deref(),
+            Some("beta")
         );
-        store.record_deleted("ghost", None).await.unwrap();
-        assert!(store.lookup("ghost").is_none());
+        reopened.close().await;
     }
 
     #[tokio::test]
-    async fn late_delete_completion_preserves_a_new_local_cache_write() {
-        struct DelayedDelete {
-            inner: Arc<dyn shared_types::AppMetadataPersistence>,
-            deleted: tokio::sync::Notify,
-            resume: tokio::sync::Notify,
-        }
-        #[async_trait::async_trait]
-        impl shared_types::AppMetadataPersistence for DelayedDelete {
-            async fn upsert(&self, row: &AppMetadataRecord) -> anyhow::Result<()> {
-                self.inner.upsert(row).await
-            }
-            async fn load_all(&self) -> anyhow::Result<Vec<AppMetadataRecord>> {
-                self.inner.load_all().await
-            }
-            async fn get(&self, app_id: &str) -> anyhow::Result<Option<AppMetadataRecord>> {
-                self.inner.get(app_id).await
-            }
-            async fn delete_if_current(
-                &self,
-                app_id: &str,
-                generation: &str,
-            ) -> anyhow::Result<bool> {
-                let deleted = self.inner.delete_if_current(app_id, generation).await?;
-                self.deleted.notify_one();
-                self.resume.notified().await;
-                Ok(deleted)
-            }
-        }
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            let persistence = Arc::new(DelayedDelete {
-                inner: InMemoryMetadataPersistence::new(vec![]),
-                deleted: tokio::sync::Notify::new(),
-                resume: tokio::sync::Notify::new(),
-            });
-            let store = Arc::new(AppMetadataStore::default());
-            store.set_persistence(persistence.clone());
-            store
-                .record("late-local", Some("old".into()), None, None, None)
-                .await;
-            let generation = store.deletion_generation("late-local").await.unwrap();
-            let deleting = store.clone();
-            let task = tokio::spawn(async move {
-                deleting
-                    .record_deleted("late-local", generation.as_deref())
-                    .await
-            });
-            persistence.deleted.notified().await;
-            store
-                .record("late-local", Some("new".into()), None, None, None)
-                .await;
-            persistence.resume.notify_one();
-            task.await.unwrap().unwrap();
-            assert_eq!(
-                store.lookup("late-local").unwrap().name.as_deref(),
-                Some("new")
-            );
-            assert_eq!(
-                persistence
-                    .get("late-local")
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .name
-                    .as_deref(),
-                Some("new")
-            );
-        })
-        .await
-        .expect("deletion/cache race must complete within its deadline");
-    }
-
-    /// update 不刷新 created_at：cache 命中旧记录回填原值（与 PG ON CONFLICT 语义
-    /// 对齐——此前内存整行覆盖，改一次名创建时间就漂移）。
-    #[tokio::test]
-    async fn record_keeps_original_created_at_on_update() {
-        let store = AppMetadataStore::default();
-        store
-            .record("app-ts", Some("first".into()), None, None, None)
-            .await;
-        let original = store.lookup("app-ts").expect("cached").created_at;
-
-        // 让时间走一点，确保 now() 不同（chrono 精度足够分辨本测试的间隔）
-        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-        store
-            .record("app-ts", Some("renamed".into()), None, None, None)
-            .await;
-        let updated = store.lookup("app-ts").expect("still cached");
-        assert_eq!(updated.name.as_deref(), Some("renamed"));
-        assert_eq!(
-            updated.created_at, original,
-            "created_at must not be refreshed by update"
+    async fn storage_failure_is_neither_absence_nor_successful_registration() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(
+            SqliteUserAppStore::open(&directory.path().join("userapp.sqlite3"))
+                .await
+                .expect("store"),
         );
-    }
-
-    #[tokio::test]
-    async fn record_deleted_removes_cache_and_persists_delete() {
-        let persistence = InMemoryMetadataPersistence::new(vec![AppMetadataRecord {
-            generation: uuid::Uuid::new_v4().to_string(),
-            app_id: "app-b".into(),
-            name: Some("beta".into()),
-            user_id: None,
-            tenant_id: None,
-            space_id: None,
-            created_at: chrono::Utc::now(),
-        }]);
-        let store = AppMetadataStore::default();
-        store.set_persistence(persistence.clone());
-        let generation = store.deletion_generation("app-b").await.expect("capture");
-        store
-            .record_deleted("app-b", generation.as_deref())
+        let metadata = AppMetadataStore::new(store.clone());
+        metadata
+            .record("a", None, Some("owner".into()), None, None)
             .await
-            .expect("delete current");
-        assert!(store.lookup("app-b").is_none(), "cache cleared");
-        let rows = persistence.load_all().await.expect("persisted");
-        assert!(rows.iter().all(|r| r.app_id != "app-b"));
-    }
-
-    #[test]
-    fn apply_loaded_populates_cache() {
-        let store = AppMetadataStore::default();
-        store.apply_loaded(vec![AppMetadataRecord {
-            generation: uuid::Uuid::new_v4().to_string(),
-            app_id: "app-c".into(),
-            name: Some("gamma".into()),
-            user_id: None,
-            tenant_id: None,
-            space_id: None,
-            created_at: chrono::Utc::now(),
-        }]);
-        assert_eq!(
-            store.lookup("app-c").and_then(|m| m.name),
-            Some("gamma".into())
-        );
-        assert!(store.lookup("app-x").is_none());
+            .expect("record");
+        store.close().await;
+        assert!(matches!(
+            metadata.lookup("a").await,
+            Err(AppOperationError::Backend(_))
+        ));
+        assert!(matches!(
+            metadata.owner_for_write("a", "owner").await,
+            Err(AppOperationError::Backend(_))
+        ));
+        assert!(matches!(
+            metadata
+                .record("b", None, Some("owner".into()), None, None)
+                .await,
+            Err(AppOperationError::Backend(_))
+        ));
+        assert!(metadata.snapshot().await.is_err());
     }
 }

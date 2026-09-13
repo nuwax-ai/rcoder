@@ -81,6 +81,9 @@ pub struct AppActivityRegistry {
     recycling: Arc<DashMap<String, Arc<Notify>>>,
     /// runtime 延迟注入(wake 需要 scale + 查 status;启动早期拿不到,故 OnceLock)
     runtime: OnceLock<Arc<dyn UserAppRuntime>>,
+    /// Weak reference avoids a service/registry ownership cycle. Runtime access
+    /// remains read-only here; all wake mutations go through the coordinator.
+    coordinator: OnceLock<std::sync::Weak<crate::service::AppService>>,
     /// 集群真实状态兜底缓存(app_id → 快照;TTL 过期自动失效)。
     /// 多副本下本进程内存表可能不知情其他副本的 stop,集群 replicas 是权威事实源。
     /// sync 版 Cache:get/insert 均同步——mark_* 状态写点(同步方法)可直接刷新。
@@ -109,6 +112,7 @@ impl AppActivityRegistry {
             waking: Arc::new(DashMap::new()),
             recycling: Arc::new(DashMap::new()),
             runtime: OnceLock::new(),
+            coordinator: OnceLock::new(),
             remote_state: moka::sync::Cache::builder()
                 .time_to_live(REMOTE_STATE_TTL)
                 .max_capacity(REMOTE_STATE_MAX_ENTRIES)
@@ -123,6 +127,17 @@ impl AppActivityRegistry {
         if self.runtime.set(rt).is_err() {
             warn!("[ACTIVITY] set_runtime called twice; keeping existing runtime");
         }
+    }
+
+    pub(crate) fn set_coordinator(
+        &self,
+        service: std::sync::Weak<crate::service::AppService>,
+    ) -> crate::models::AppResult<()> {
+        self.coordinator.set(service).map_err(|_| {
+            crate::models::AppOperationError::InvalidState(
+                "Activity lifecycle coordinator is already initialized".into(),
+            )
+        })
     }
 
     /// 标记 app 为 stopped(scale0)。AppService::stop_app / 回收扫描器调用。
@@ -174,12 +189,9 @@ impl AppActivityRegistry {
             self.waking.entry(app_id.to_string())
         {
             let handle = entry.remove();
-            if let Err(e) = handle
+            handle
                 .tx
-                .send(Some(WakeOutcome::Failed("app was deleted".into())))
-            {
-                warn!("activity outcome send failed (no follower): {e}");
-            }
+                .send_replace(Some(WakeOutcome::Failed("Application was deleted".into())));
         }
         if let dashmap::mapref::entry::Entry::Occupied(entry) =
             self.recycling.entry(app_id.to_string())

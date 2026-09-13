@@ -421,6 +421,12 @@ pub(crate) async fn confirm_project(
 ) -> UserAppReply<ConfirmData> {
     let result = async {
         body.validate().map_err(file_server::error::from_garde)?;
+        let _workspace_activity = state
+            .build_tasks
+            .workspace_activity(&app_id)
+            .await
+            .read_owned()
+            .await;
         let workspace =
             file_server::workspace::resolve_userapp_dev(&app_id, None, &state.fs.config)?;
         let path = userapp::import::confirm_project(&workspace, &body.project_dir).await?;

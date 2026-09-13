@@ -4,7 +4,9 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 mod storage;
+mod userapp_storage;
 pub use storage::{StorageBackend, StorageConfig};
+pub use userapp_storage::{UserAppStorageBackend, UserAppStorageConfig};
 
 /// 命令行参数
 #[derive(Parser, Debug)]
@@ -96,6 +98,9 @@ pub struct AppConfig {
     /// 存储后端配置（rcoder-pg：memory=纯内存单节点，postgres=PG 持久化）
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Durable userApp control plane, independent of Agent storage.
+    #[serde(default)]
+    pub userapp_storage: UserAppStorageConfig,
     /// API Key 鉴权配置
     #[serde(default)]
     pub api_key_auth: ApiKeyAuthConfig,
@@ -131,6 +136,7 @@ impl Default for AppConfig {
             cleanup_config: CleanupConfigSettings::default(),
             userapp_recycle: UserAppRecycleConfig::default(),
             storage: StorageConfig::default(),
+            userapp_storage: UserAppStorageConfig::default(),
             api_key_auth: ApiKeyAuthConfig {
                 enabled: false,
                 api_key: generate_random_api_key(),

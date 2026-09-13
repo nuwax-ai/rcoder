@@ -73,3 +73,6 @@ ebpf-debug = []
 [dev-dependencies]
 rustls = { workspace = true }
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

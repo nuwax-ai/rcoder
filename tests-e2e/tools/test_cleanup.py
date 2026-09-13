@@ -151,5 +151,22 @@ class OwnershipTests(unittest.TestCase):
         self.assertTrue(owned(self.container('rcoder-review-id', labels={'rcoder.e2e.run': 'run'}), 'abcdef123456', 'run', {}))
         self.assertFalse(owned(self.container('rcoder-review-id', labels={'rcoder.e2e.run': 'other'}), 'abcdef123456', 'run', {}))
 
+
+class BuilderReceiptTests(unittest.TestCase):
+    def test_fallback_uses_current_receipt_and_never_uses_old_replacement_identity(self):
+        from cleanup import builder_purge_body
+        row = {'Id':'new', 'Name':'/rcoder-app-builder-app', 'Config':{'Labels':{
+            'service-type':'user-app-builder', 'rcoder.io/application-id':'app',
+            'rcoder.io/owner-id':'owner', 'rcoder.io/lifecycle-id':'life'}}}
+        receipt = {'id':'new', 'name':'rcoder-app-builder-app', 'app_id':'app',
+                   'user_id':'owner', 'lifecycle_id':'life', 'case_id':'case',
+                   'predecessors':[{'id':'old'}]}
+        self.assertEqual(builder_purge_body(row,receipt,'case'), {
+            'user_id':'owner','lifecycle_id':'life','request_id':'cleanup-case-app'})
+        for field in ('id','app_id','user_id','lifecycle_id','case_id'):
+            wrong = dict(receipt, **{field:'other'})
+            with self.assertRaises(ValueError): builder_purge_body(row,wrong,'case')
+        with self.assertRaises(ValueError): builder_purge_body(row,None,'case')
+
 if __name__ == '__main__':
     unittest.main()

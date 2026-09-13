@@ -179,3 +179,5 @@ error.workspace_no_services: "應用工作區無可用服務：manifest 缺失�
 error.dev_not_running: "開發服務未運行：dev 日誌僅在開發服務運行期間可用，請先啟動開發服務"
 
 error.hot_deploy_env_change: "熱部署不能變更業務環境變數，請使用 pod 模式"
+
+error.userapp_wait_timeout: "等待開發容器逾時；已受理的操作可能仍在執行"

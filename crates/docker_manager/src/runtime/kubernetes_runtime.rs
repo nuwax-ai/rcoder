@@ -215,10 +215,77 @@ impl AgentContainerRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         self.delete_captured_builder(snapshot).await
     }
+    async fn inspect_builder_workspace(
+        &self,
+        snapshot: &shared_types::BuilderDeletionSnapshot,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::UserAppBuilderWorkspaceEndpoint> {
+        self.captured_builder_workspace(snapshot, context).await
+    }
+    async fn inspect_builder_candidate(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.capture_builder_compute_with_binding(context, None, true)
+            .await
+    }
+
+    async fn capture_builder_adoption(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        expected_container_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        let target = self
+            .capture_builder_compute_with_binding(context, None, true)
+            .await?;
+        if target.pod.as_ref().map(|pod| pod.uid.as_str()) != Some(expected_container_id)
+            || expected_container_id.is_empty()
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Physical builder changed before adoption".into(),
+            ));
+        }
+        Ok(target)
+    }
+    async fn capture_bound_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.capture_builder_compute_with_binding(context, binding, false)
+            .await
+    }
+
+    async fn capture_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.capture_builder_compute(context).await
+    }
+
+    async fn apply_builder_control(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        restart: bool,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        let result = self.apply_builder_compute(target, restart).await?;
+        if let Some(pod) = &target.pod {
+            let mut cache = self.pod_cache.write().await;
+            if cache.get(&target.context.app_id).is_some_and(|cached| {
+                cached.service_type == ServiceType::UserappBuilder
+                    && cached.info.container_id == pod.uid
+            }) {
+                cache.remove(&target.context.app_id);
+            }
+        }
+        Ok(result)
+    }
+
     async fn create_container(
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        params.validate_execution_context()?;
         let lease = if params.service_type == ServiceType::UserappBuilder {
             let identifier = params
                 .service_type
@@ -228,7 +295,19 @@ impl AgentContainerRuntime for KubernetesRuntime {
                     params.project_id.as_deref(),
                 )
                 .map_err(|error| ContainerRuntimeError::ConfigurationError(error.to_string()))?;
-            Some(self.acquire_builder_operation(identifier).await?)
+            if let Some(context) = &params.execution_context {
+                context
+                    .validate_identity(identifier, params.user_id.as_deref())
+                    .map_err(ContainerRuntimeError::ConfigurationError)?;
+            }
+            Some(
+                self.acquire_application_operation_with_context(
+                    identifier,
+                    &params.service_type,
+                    params.execution_context.as_ref(),
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -241,7 +320,11 @@ impl AgentContainerRuntime for KubernetesRuntime {
                 subvolume_path_cache: self.subvolume_path_cache.clone(),
             };
             return tokio::spawn(async move {
-                let result = runtime.create_agent_container(params).await;
+                let result = if params.resource_binding.is_some() {
+                    runtime.resume_bound_builder(&params).await
+                } else {
+                    runtime.create_agent_container(params).await
+                };
                 super::builder_completion::finish(lease, result).await
             })
             .await
@@ -527,6 +610,21 @@ impl WorkspaceRuntime for KubernetesRuntime {
         K8sPvcOps::destroy_workspace_pvc(self, identifier, service_type).await
     }
 
+    async fn capture_app_storage_resize(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppStorageResizeTarget>> {
+        self.capture_storage_resize(context).await.map(Some)
+    }
+
+    async fn resize_app_storage_target(
+        &self,
+        target: &shared_types::UserAppStorageResizeTarget,
+        new_size: &str,
+    ) -> ContainerRuntimeResult<StorageResizeOutcome> {
+        self.resize_storage_target(target, new_size).await
+    }
+
     async fn resize_app_storage(
         &self,
         app_id: &str,
@@ -721,11 +819,33 @@ mod create_lease_tests {
             let client =
                 Client::try_from(Config::new(format!("http://{address}").parse().unwrap()))
                     .unwrap();
-            let result = runtime(client).claim_builder_storage("review").await;
+            let context = shared_types::UserAppExecutionContext {
+                app_id: "review".into(),
+                user_id: "owner".into(),
+                lifecycle_id: "lifecycle-one".into(),
+                operation_id: "admitted-operation".into(),
+                executor_id: "executor-one".into(),
+                request_fingerprint: "ab".repeat(32),
+            };
+            let result = runtime(client)
+                .claim_builder_storage_with_context("review", Some(&context))
+                .await;
             assert_eq!(result.is_ok(), expected_patches == 2, "{result:?}");
             let patches = server.await.unwrap();
             assert_eq!(patches.len(), expected_patches);
             for patch in &patches {
+                assert_eq!(
+                    patch["metadata"]["annotations"]["rcoder.io/storage-use-operation"],
+                    "admitted-operation"
+                );
+                assert_eq!(
+                    patch["metadata"]["annotations"]["rcoder.io/lifecycle-id"],
+                    "lifecycle-one"
+                );
+                assert_eq!(
+                    patch["metadata"]["annotations"]["rcoder.io/owner-id"],
+                    "owner"
+                );
                 assert_eq!(
                     patch["metadata"]["annotations"], patches[0]["metadata"]["annotations"],
                     "retry must keep the original operation identity"

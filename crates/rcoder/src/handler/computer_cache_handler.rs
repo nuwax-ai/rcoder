@@ -254,7 +254,7 @@ async fn cache_clean_userapp_dev(
     request: &CacheCleanRequest,
 ) -> Result<HttpResult<CacheCleanResponse>, AppError> {
     // owner 解析：显式 user_id > metadata（get_app_owner）> fail-fast
-    let metadata_owner = state.app_service.get_app_owner(app_id).await;
+    let metadata_owner = state.app_service.get_app_owner(app_id).await?;
     let owner = crate::userapp_builder::resolve_owner(
         request.user_id.as_deref(),
         metadata_owner.as_deref(),

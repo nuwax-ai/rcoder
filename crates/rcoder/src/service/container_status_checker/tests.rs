@@ -139,7 +139,7 @@ impl UserAppDeploymentRuntime for ProbeRuntime {
 
 /// 轻量 AppState 字面量构造（绕过 AppState::new 的 AppService 装配副作用）。
 /// 状态检查器只消费 runtime / grpc_pool / projects 三个字段。
-async fn test_state(runtime: Arc<ProbeRuntime>) -> Arc<AppState> {
+async fn test_state(runtime: Arc<ProbeRuntime>) -> (Arc<AppState>, tempfile::TempDir) {
     let (adapter, _cleanup_rx) =
         ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
     let activity = Arc::new(app_manager::AppActivityRegistry::new(Duration::from_secs(
@@ -150,12 +150,20 @@ async fn test_state(runtime: Arc<ProbeRuntime>) -> Arc<AppState> {
         access_mode: AppAccessMode::Docker,
         ..AppManagerConfig::default()
     };
+    let metadata_dir = tempfile::tempdir().expect("metadata directory");
+    let metadata_store = rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
+        &metadata_dir.path().join("userapp.sqlite3"),
+    )
+    .await
+    .expect("SQLite metadata store");
+    let metadata_store = Arc::new(metadata_store);
     let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(
         app_manager::service::AppService::new(
             manager_config,
             runtime.clone(),
             activity.clone(),
             None,
+            metadata_store.clone(),
         )
         .await
         .expect("AppService 构造失败"),
@@ -164,7 +172,8 @@ async fn test_state(runtime: Arc<ProbeRuntime>) -> Arc<AppState> {
     let agent_download_manager =
         Arc::new(AgentDownloadManager::new(download_dir.path()).expect("下载管理器构造失败"));
     let (pod_created_tx, _) = broadcast::channel(32);
-    Arc::new(AppState {
+    let state = Arc::new(AppState {
+        userapp_store: metadata_store,
         config: AppConfig::default(),
         projects: Arc::new(ProjectStoreBackend::Memory(Arc::new(adapter))),
         pingora_service: None,
@@ -181,7 +190,8 @@ async fn test_state(runtime: Arc<ProbeRuntime>) -> Arc<AppState> {
         app_service,
         activity,
         cluster_domain: "cluster.local".to_string(),
-    })
+    });
+    (state, metadata_dir)
 }
 
 fn checker(config: ContainerStatusCheckerConfig, state: Arc<AppState>) -> ContainerStatusChecker {
@@ -220,7 +230,8 @@ fn container_info(
 
 #[tokio::test]
 async fn record_failure_escalates_and_pins_first_failure_time() {
-    let state = test_state(Arc::new(ProbeRuntime::new(FindBehavior::Missing))).await;
+    let (state, _metadata_dir) =
+        test_state(Arc::new(ProbeRuntime::new(FindBehavior::Missing))).await;
     let c = checker(ContainerStatusCheckerConfig::default(), state);
 
     c.record_failure("k", "addr", &anyhow::anyhow!("boom"));
@@ -245,7 +256,8 @@ async fn record_failure_escalates_and_pins_first_failure_time() {
 
 #[tokio::test]
 async fn record_success_resets_failure_state_completely() {
-    let state = test_state(Arc::new(ProbeRuntime::new(FindBehavior::Missing))).await;
+    let (state, _metadata_dir) =
+        test_state(Arc::new(ProbeRuntime::new(FindBehavior::Missing))).await;
     let c = checker(ContainerStatusCheckerConfig::default(), state);
 
     c.record_failure("k", "addr", &anyhow::anyhow!("boom"));
@@ -263,7 +275,8 @@ async fn record_success_resets_failure_state_completely() {
 
 #[tokio::test]
 async fn should_skip_requires_threshold_and_unexpired_window() {
-    let state = test_state(Arc::new(ProbeRuntime::new(FindBehavior::Missing))).await;
+    let (state, _metadata_dir) =
+        test_state(Arc::new(ProbeRuntime::new(FindBehavior::Missing))).await;
     let config = ContainerStatusCheckerConfig {
         failure_threshold: 3,
         skip_duration: Duration::from_secs(300),
@@ -314,7 +327,7 @@ async fn should_skip_requires_threshold_and_unexpired_window() {
 #[tokio::test]
 async fn check_container_exists_dispatches_lookup_key_by_service_type() {
     let probe = Arc::new(ProbeRuntime::new(FindBehavior::Found));
-    let state = test_state(probe.clone()).await;
+    let (state, _metadata_dir) = test_state(probe.clone()).await;
     let c = checker(ContainerStatusCheckerConfig::default(), state);
 
     // ComputerAgentRunner：用 user_id 查
@@ -361,14 +374,14 @@ async fn check_container_exists_dispatches_lookup_key_by_service_type() {
 #[tokio::test]
 async fn check_container_exists_treats_error_and_missing_user_id_as_absent() {
     // 查询 Err：保守视为不存在（触发连接清理路径）
-    let state = test_state(Arc::new(ProbeRuntime::new(FindBehavior::Fail))).await;
+    let (state, _metadata_dir) = test_state(Arc::new(ProbeRuntime::new(FindBehavior::Fail))).await;
     let c = checker(ContainerStatusCheckerConfig::default(), state);
     let info = container_info("proj", Some("user"), ServiceType::ComputerAgentRunner);
     assert!(!c.check_container_exists(&info, "addr").await);
 
     // ComputerAgentRunner 缺 user_id：视为不存在且不查
     let probe = Arc::new(ProbeRuntime::new(FindBehavior::Found));
-    let state = test_state(probe.clone()).await;
+    let (state, _metadata_dir) = test_state(probe.clone()).await;
     let c = checker(ContainerStatusCheckerConfig::default(), state);
     let info = container_info("proj", None, ServiceType::ComputerAgentRunner);
     assert!(!c.check_container_exists(&info, "addr").await);
@@ -378,7 +391,7 @@ async fn check_container_exists_treats_error_and_missing_user_id_as_absent() {
 #[tokio::test]
 async fn cleanup_stale_health_states_removes_unknown_or_expired_only() {
     let probe = Arc::new(ProbeRuntime::new(FindBehavior::Missing));
-    let state = test_state(probe).await;
+    let (state, _metadata_dir) = test_state(probe).await;
     let config = ContainerStatusCheckerConfig {
         health_reset_interval: Duration::from_secs(1800),
         ..Default::default()

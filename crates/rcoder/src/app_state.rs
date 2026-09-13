@@ -37,6 +37,7 @@ pub struct SessionInfo {
 /// 应用状态
 #[derive(Clone)]
 pub struct AppState {
+    pub userapp_store: Arc<dyn shared_types::UserAppLifecycleStore>,
     /// 应用配置
     pub config: AppConfig,
     /// 项目适配器 - 纯 DashMap 内存存储 + RAII 自动资源回收
@@ -112,16 +113,23 @@ impl AppState {
         // 初始化应用管理服务（Docker / K8s 统一构造，运行时由 access_mode 决定行为）。
         // 保留具体类型 Arc：dev_locator 注入需要在其上调用 inherent setter
         // （发生在下方 Self Arc 包装之后——locator 以 Weak 回指 state）。
+        let userapp_store = config
+            .userapp_storage
+            .open(config.app_manager.access_mode, &config.storage.postgres)
+            .await?;
         let app_service_arc: Arc<app_manager::service::AppService> = Arc::new(
             app_manager::service::AppService::new(
                 config.app_manager.clone(),
                 runtime.clone(),
                 activity.clone(),
                 pingora.clone(),
+                userapp_store.clone(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?,
         );
+
+        app_service_arc.attach_activity_coordinator()?;
 
         // Userapp 开发资源回收回调（app purge 时回收 UserappBuilder 开发容器 +
         // per-app PVC；app_manager 的 runtime 视图无 agent 能力，经契约委托本进程）
@@ -129,37 +137,14 @@ impl AppState {
             crate::userapp_builder::UserappDevResourcesCleanup::new(
                 runtime.clone(),
                 projects.clone(),
+                userapp_store.clone(),
             ),
-        ));
+        ))?;
 
-        // P3：PG 模式的应用业务元数据持久化（query name/created_at 过滤数据源）。
-        // 装配在 AppService 构造后（内存 cache 在其内部）；load 失败阻断启动——
-        // 过滤数据缺失会让 query 语义静默漂移，宁可 Fail Fast。
-        if projects.is_postgres() {
-            #[cfg(feature = "rcoder-pg")]
-            {
-                let ProjectStoreBackend::Postgres(store) = &*projects else {
-                    unreachable!("is_postgres 为真的分支");
-                };
-                let metadata_persistence: Arc<dyn shared_types::AppMetadataPersistence> = Arc::new(
-                    rcoder_storage::pg::userapp::metadata::PgAppMetadataPersistence::new(
-                        store.pool().clone(),
-                    ),
-                );
-                match metadata_persistence.load_all().await {
-                    Ok(rows) => {
-                        app_service_arc.set_metadata_persistence(metadata_persistence);
-                        app_service_arc.apply_metadata_loaded(rows);
-                    }
-                    Err(e) => {
-                        anyhow::bail!("[STORAGE_PG] userapp_metadata load failed: {e:#}");
-                    }
-                }
-            }
-        }
         let app_service: Arc<dyn app_manager::AppServiceTrait> = app_service_arc.clone();
 
         let state = Arc::new(Self {
+            userapp_store,
             config,
             projects,
             pingora_service: pingora,
@@ -181,10 +166,14 @@ impl AppState {
         // userApp 文件/存储接口 env=dev 分支的开发容器定位回调（幂等 ensure +
         // 探活自愈 + file-server 地址解析）。Weak 挂接防
         // AppState → app_service → dev_locator → AppState 引用环。
-        app_service_arc.set_dev_locator(Arc::new(crate::userapp_builder::UserappDevLocator::new(
-            Arc::downgrade(&state),
-        )));
+        app_service_arc.set_dev_locator(Arc::new(
+            crate::userapp_builder::UserappDevLocator::new(Arc::downgrade(&state)),
+        ))?;
 
+        app_service_arc.set_builder_recovery(Arc::new(
+            crate::userapp_builder::retry::PendingBuilderRecovery::new(Arc::downgrade(&state)),
+        ))?;
+        crate::userapp_builder::start_recovery(Arc::downgrade(&state));
         Ok(state)
     }
 

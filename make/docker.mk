@@ -121,14 +121,13 @@ AGENT_TOOLS_CACHE_KEY ?= 1
 docker-build-agent-runner:
 	@echo "🐳 构建 rcoder-agent-runner 镜像（本地开发用 dev-rcoder-agent-runner）..."
 	@echo "📍 镜像名称: dev-rcoder-agent-runner:latest"
-	@# 生产源头同步：start-up*.sh 以 build-agent-docker 仓库为单一事实源，
-	@# 构建前自动拉取防止本地/生产启动行为漂移（ime_server.py 等本地维护文件不在此清单）
+	@# Compare the production source before building; never overwrite this worktree.
 	@BUILD_CONFIG_DIR=~/Documents/git-workspace/build-agent-docker/build_config/rcoder-agent-runner; \
 	if [ -d "$$BUILD_CONFIG_DIR" ]; then \
 		for f in start-up.sh start-up-common.sh start-up-docker-extra.sh start-up-k8s-extra.sh; do \
-			if [ -f "$$BUILD_CONFIG_DIR/$$f" ] && ! cmp -s "docker/rcoder-agent-runner/$$f" "$$BUILD_CONFIG_DIR/$$f"; then \
-				cp -p "$$BUILD_CONFIG_DIR/$$f" "docker/rcoder-agent-runner/$$f"; \
-				echo "🔄 已同步生产源头: $$f"; \
+			if [ ! -f "$$BUILD_CONFIG_DIR/$$f" ] || ! cmp -s "docker/rcoder-agent-runner/$$f" "$$BUILD_CONFIG_DIR/$$f"; then \
+				echo "Builder startup script differs or is missing: $$f. Review and reconcile both repositories before building." >&2; \
+				exit 1; \
 			fi; \
 		done; \
 	fi

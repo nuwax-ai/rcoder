@@ -8,40 +8,18 @@
 //!   其他副本的 stop 时查集群真实 replicas（moka TTL 缓存节流）。
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::Utc;
 use dashmap::DashMap;
 use tokio::sync::watch;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use container_runtime_api::UserAppRuntime;
 use shared_types::{AppWakeControl, WakeOutcome};
 
 use super::AppActivityRegistry;
 
-struct WakeOperation {
-    lease: Option<Box<dyn shared_types::AppOperationLease>>,
-    mutating: bool,
-}
-impl Drop for WakeOperation {
-    fn drop(&mut self) {
-        if !self.mutating
-            && let Some(lease) = self.lease.take()
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
-            runtime.spawn(async move {
-                if let Err(error) = lease.release().await {
-                    tracing::error!(%error, "release wake preflight ownership failed");
-                }
-            });
-        }
-    }
-}
-
-/// wake 轮询 `get_deployment_status` 的间隔
-const WAKE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// follower 等待 leader 的额外宽限(leader 的 WakeGuard drop 必先广播,follower 不应先超时)
 const WAKE_FOLLOWER_GRACE: Duration = Duration::from_secs(10);
 /// leader 异常退出(panic)时广播给 follower 的失败原因
@@ -108,17 +86,46 @@ impl Drop for WakeGuard {
 }
 
 impl AppActivityRegistry {
-    /// 仅供流量唤醒成功路径使用（测试直调，pub(super)）。
-    /// `preexisting_block`：唤醒启动前 app 已手动 stop（wake_blocked）——请求即
-    /// 授权覆盖历史 stop，成功时一并解除阻断。唤醒**过程中**新到的手动 stop
-    /// （在途 scale1 可能覆盖 stop_app 的 scale0）仍需尊重 → 返回 false，
-    /// 由调用方补偿 scale0（时间后到者赢）。
-    pub(super) fn try_mark_woken(&self, app_id: &str, preexisting_block: bool) -> bool {
-        if !preexisting_block && self.wake_blocked.contains(app_id) {
+    async fn probe_remote_state(&self, app_id: &str) -> Result<RemoteState, String> {
+        if let Some(state) = self.remote_state.get(app_id) {
+            return Ok(state);
+        }
+        let runtime = self
+            .runtime
+            .get()
+            .ok_or_else(|| "Runtime is unavailable".to_owned())?;
+        let status = runtime
+            .get_deployment_status(app_id)
+            .await
+            .map_err(|error| format!("Read application runtime state: {error}"))?
+            .ok_or_else(|| format!("Application runtime not found: {app_id}"))?;
+        let state = RemoteState {
+            stopped: status.replicas <= 0,
+            manual_stop: status.wake_on_traffic == Some(false),
+        };
+        self.remote_state.insert(app_id.to_string(), state);
+        Ok(state)
+    }
+
+    /// Called under the admitted lifecycle operation lock after checking the
+    /// authoritative wake policy. Starting replicas are not readiness evidence:
+    /// keep traffic routed through the coordinator until completion is confirmed.
+    /// Only this pre-mutation boundary may clear an older manual-stop hint;
+    /// late failure paths must not overwrite a newer control's local state.
+    pub(crate) fn prepare_traffic_wake(&self, app_id: &str) {
+        self.wake_blocked.remove(app_id);
+        self.stopped.insert(app_id.to_string());
+        self.remote_state.invalidate(app_id);
+        self.note_dirty(app_id);
+    }
+
+    /// Traffic wake never clears a manual stop, including a stop arriving during
+    /// completion. Only an explicit control operation may remove that block.
+    pub(crate) fn try_mark_woken(&self, app_id: &str) -> bool {
+        if self.wake_blocked.contains(app_id) {
             return false;
         }
         self.stopped.remove(app_id);
-        self.wake_blocked.remove(app_id);
         self.last_accessed.insert(app_id.to_string(), Utc::now());
         self.note_dirty(app_id);
         self.remote_state
@@ -148,91 +155,15 @@ impl AppActivityRegistry {
         true
     }
 
-    async fn keep_intentionally_stopped(
-        runtime: &Arc<dyn UserAppRuntime>,
-        app_id: &str,
-    ) -> WakeOutcome {
-        if let Err(error) = runtime.scale_deployment(app_id, 0).await {
-            warn!(app_id, %error, "failed to restore scale0 after wake raced with stop");
-        }
-        WakeOutcome::Failed("app is intentionally stopped".into())
-    }
-
-    /// leader 实际执行唤醒:scale→1 + 轮询直到 Running/Error/超时
+    /// The registry only merges callers. Durable admission, runtime identity and
+    /// wake policy are checked by the lifecycle coordinator under its operation lock.
     async fn wake_leader(&self, app_id: &str) -> WakeOutcome {
-        let Some(runtime) = self.runtime.get() else {
-            return WakeOutcome::Failed("runtime not initialized".into());
+        let Some(service) = self.coordinator.get().and_then(std::sync::Weak::upgrade) else {
+            return WakeOutcome::Failed("Activity lifecycle coordinator is unavailable".into());
         };
-        let lease = match runtime.acquire_app_operation(app_id).await {
-            Ok(lease) => lease,
-            Err(error) => return WakeOutcome::Failed(format!("acquire wake operation: {error}")),
-        };
-        let mut operation = WakeOperation {
-            lease,
-            mutating: false,
-        };
-        let outcome = self.wake_leader_locked(app_id, &mut operation).await;
-        if (!operation.mutating
-            || matches!(outcome, WakeOutcome::Ready | WakeOutcome::AlreadyRunning))
-            && let Some(lease) = operation.lease.take()
-            && let Err(error) = lease.release().await
-        {
-            return WakeOutcome::Failed(error);
-        }
-        outcome
-    }
-
-    async fn wake_leader_locked(&self, app_id: &str, operation: &mut WakeOperation) -> WakeOutcome {
-        // 唤醒启动前已手动 stop（wake_blocked）：请求即授权覆盖历史 stop
-        //（有请求即唤醒语义）；记录基线，唤醒**过程中**新到的 stop 才触发
-        // 竞争补偿——时间后到者赢，并发 stop 语义不破。
-        let preexisting_block = self.wake_blocked.contains(app_id);
-        if !preexisting_block && !self.stopped.contains(app_id) {
-            return WakeOutcome::AlreadyRunning;
-        }
-        let rt = match self.runtime.get() {
-            Some(rt) => rt.clone(),
-            None => {
-                return WakeOutcome::Failed("runtime not initialized".into());
-            }
-        };
-        operation.mutating = true;
-        // scale→1(幂等:已是 1 也无害)
-        if let Err(e) = rt.scale_deployment(app_id, 1).await {
-            return WakeOutcome::Failed(format!("scale_deployment: {e}"));
-        }
-        if !preexisting_block && self.wake_blocked.contains(app_id) {
-            return Self::keep_intentionally_stopped(&rt, app_id).await;
-        }
-        // 轮询 get_deployment_status 直到 Running / Error / 超时
-        let deadline = Instant::now() + self.wake_timeout;
-        loop {
-            if !preexisting_block && self.wake_blocked.contains(app_id) {
-                return Self::keep_intentionally_stopped(&rt, app_id).await;
-            }
-            match rt.get_deployment_status(app_id).await {
-                Ok(Some(s)) if s.phase == "Running" => {
-                    // 唤醒成功不能覆盖**并发**手动 stop；若竞争失败，补偿 scale0。
-                    if !self.try_mark_woken(app_id, preexisting_block) {
-                        return Self::keep_intentionally_stopped(&rt, app_id).await;
-                    }
-                    debug!("[ACTIVITY] app {} woken (Ready)", app_id);
-                    return WakeOutcome::Ready;
-                }
-                Ok(Some(s)) if s.phase == "Error" => {
-                    return WakeOutcome::Failed(s.message.unwrap_or_else(|| "app error".into()));
-                }
-                _ => {}
-            }
-            if Instant::now() >= deadline {
-                // 超时:app 仍在后台启动,保持 stopped 态,下次请求重新发起 wake(幂等 scale)
-                warn!(
-                    "[ACTIVITY] wake timeout for app {} (left starting in background)",
-                    app_id
-                );
-                return WakeOutcome::Timeout;
-            }
-            sleep(WAKE_POLL_INTERVAL).await;
+        match service.wake_app_on_traffic(app_id, self.wake_timeout).await {
+            Ok(outcome) => outcome,
+            Err(error) => WakeOutcome::Failed(error.to_string()),
         }
     }
 
@@ -276,51 +207,38 @@ impl AppWakeControl for AppActivityRegistry {
             || self.recycling.contains_key(app_id)
     }
 
-    /// 兜底判定：TTL 缓存命中零 IO；miss 查一次 `get_deployment_status`。
-    /// 查到 stopped 回填内存标记（manual_stop 档对齐 rebuild_stopped_apps），
-    /// 让本副本后续请求走内存快路，并使 `ensure_running` 的兜底分支自然
-    /// 衔接到 wake_leader。查询失败（API 瞬断）不缓存，行为退化同旧（仅
-    /// 内存视图）。
+    /// The advisory proxy trait only carries a boolean. Errors are not cached;
+    /// the control entry below uses the fallible probe and never reports success
+    /// from a failed runtime query.
     async fn remote_stopped(&self, app_id: &str) -> bool {
-        if let Some(state) = self.remote_state.get(app_id) {
-            return self.backfill_remote_state(app_id, state);
-        }
-        let Some(rt) = self.runtime.get().cloned() else {
-            return false;
-        };
-        let state = match rt.get_deployment_status(app_id).await {
-            // replicas==0 即停（K8s derive_phase 恒 Stopped；Docker stop 后同为 Stopped）
-            Ok(Some(s)) => RemoteState {
-                stopped: s.replicas <= 0,
-                manual_stop: s.wake_on_traffic == Some(false),
-            },
-            // app 不存在：非 stopped 负缓存（防幻报 app 每请求白查）
-            Ok(None) => RemoteState::default(),
-            Err(e) => {
-                warn!(
-                    "[ACTIVITY] remote state probe failed (fallback to memory view): app_id={app_id}: {e}"
-                );
-                return false;
+        match self.probe_remote_state(app_id).await {
+            Ok(state) => self.backfill_remote_state(app_id, state),
+            Err(error) => {
+                warn!(%app_id, %error, "Remote application state probe failed");
+                false
             }
-        };
-        self.remote_state.insert(app_id.to_string(), state);
-        self.backfill_remote_state(app_id, state)
+        }
     }
 
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome {
         // 回收过渡期的请求必须等 scale0 完成，再由唤醒 single-flight scale1。
         self.wait_for_recycle_transition(app_id).await;
-        // 有请求即唤醒（2026-08 拍板）：手动 stop（wake_blocked）不再拒绝——
-        // 请求本身就是把 app 拉起来的授权；唤醒过程中新到的 stop 由
-        // wake_leader 的竞争保护尊重（时间后到者赢）。
+        // Local stop flags may outlive an operation completed by another replica.
+        // The coordinator validates durable state and live policy before mutation.
         if !self.stopped.contains(app_id) && !self.wake_blocked.contains(app_id) {
             // 多副本兜底：内存无记录不代表集群在跑（其他副本 stop 后本副本
             // 不知情；本副本重启后未覆盖）。查集群真实 replicas（TTL 缓存
             // 节流），查到 stopped 会回填内存标记，继续走下方唤醒流程。
-            if !self.remote_stopped(app_id).await {
-                return WakeOutcome::AlreadyRunning;
+            match self.probe_remote_state(app_id).await {
+                Ok(state) => {
+                    self.backfill_remote_state(app_id, state);
+                }
+                Err(error) => return WakeOutcome::Failed(error),
             }
         }
+        // A cached replica count is only a routing hint. Even a running workload
+        // must pass durable lifecycle admission and physical identity validation
+        // before this control entry point reports success.
         // 只在同步作用域内持有 DashMap entry guard，禁止 shard 锁跨越 await。
         let role = match self.waking.entry(app_id.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(e) => WakeRole::Follower(e.get().clone()),

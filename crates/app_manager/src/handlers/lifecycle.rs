@@ -100,8 +100,10 @@ pub async fn list_app_runtimes(
 pub async fn get_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-    Query(owner): Query<OwnerParams>,
+    owner: Result<Query<OwnerParams>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
+    let Query(owner) = owner
+        .map_err(|_| AppError::validation_error("A valid user_id query parameter is required"))?;
     owner
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
@@ -109,7 +111,10 @@ pub async fn get_app(
         "[APP] getting app runtime: {} (user_id={})",
         app_id, owner.user_id
     );
-    let runtime = state.app_service.get_app(&app_id).await?;
+    let runtime = state
+        .app_service
+        .get_app_for_owner(&app_id, owner.user_id.trim())
+        .await?;
     Ok(Json(HttpResult::success(runtime)))
 }
 
@@ -136,14 +141,33 @@ pub async fn get_app(
 pub async fn update_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-    Json(request): Json<UpdateAppRequest>,
+    request: Result<Json<UpdateAppRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
+    let Json(request) =
+        request.map_err(|_| AppError::validation_error("A valid update JSON body is required"))?;
     request
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
     info!("[APP] updating app: {}", app_id);
-    let runtime = state.app_service.update_app(&app_id, request).await?;
-    Ok(Json(HttpResult::success(runtime)))
+    let mut request = request;
+    let request_id = request
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let owner = request.user_id.clone();
+    let result = state.app_service.update_app(&app_id, request).await;
+    let runtime =
+        super::control::control_result(&state, &app_id, &owner, &request_id, result).await?;
+    let operation = state
+        .app_service
+        .get_control_operation_by_request(&app_id, &owner, &request_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::internal_server_error("Update completed without a durable operation record")
+        })?;
+    Ok(Json(
+        HttpResult::success(runtime).with_operation_id(operation.operation_id),
+    ))
 }
 
 /// 删除应用
@@ -179,45 +203,57 @@ pub async fn update_app(
 pub async fn delete_app(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, app_stage)): Path<(String, String)>,
-    body: Option<Json<DeleteAppRequest>>,
+    body: Result<Json<DeleteAppRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
     if shared_types::UserappStage::parse(&app_stage) != Some(shared_types::UserappStage::Prod) {
         return Err(AppError::validation_error(
             "`delete` is a prod-runtime capability: pass app_stage=prod (to tear down a dev environment use the storage destroy endpoint with app_stage=dev)",
         ));
     }
-    let Some(Json(body)) = body else {
-        return Err(AppError::validation_error(
-            "request body with required `user_id` is required for delete",
-        ));
-    };
+    let Json(mut body) = body.map_err(|error| {
+        AppError::validation_error(&format!("Invalid application deletion request: {error}"))
+    })?;
     let purge = body.purge.unwrap_or(false);
     let user_id = body.user_id.trim().to_string();
-    let expected_rv = body.expected_resource_version.clone();
-    // user_id 白名单校验后补录 owner 元数据（start 同款 best-effort——失败仅
-    // 告警：后续 purge 的目录解析回退 metadata owner / 通配兜底）
-    {
-        body.validate()
-            .map_err(shared_types::garde_err_to_app_error)?;
-        if let Err(e) = state
-            .app_service
-            .record_dev_registration(&app_id, &user_id)
-            .await
-        {
-            tracing::warn!(
-                "[APP] delete owner registration failed (ignored): app_id={app_id}: {e}"
-            );
+    body.validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
+    // Deletion validates an existing identity; it never registers or changes ownership.
+    match state.app_service.get_app_owner(&app_id).await? {
+        Some(owner) if owner == user_id => {}
+        Some(_) => {
+            return Err(crate::models::AppOperationError::Conflict(
+                "Application ownership conflict".into(),
+            )
+            .into());
         }
-        info!(
-            "[APP] deleting app: {} (purge={}, user_id={})",
-            app_id, purge, user_id
-        );
+        None => {
+            return Err(crate::models::AppOperationError::NotFound(format!(
+                "Application identity not found: {app_id}"
+            ))
+            .into());
+        }
     }
-    state
+    info!(
+        "[APP] deleting app: {} (purge={}, user_id={})",
+        app_id, purge, user_id
+    );
+    let request_id = body
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let result = state.app_service.delete_app_controlled(&app_id, body).await;
+    super::control::control_result(&state, &app_id, &user_id, &request_id, result).await?;
+    let operation = state
         .app_service
-        .delete_app(&app_id, purge, expected_rv.as_deref())
-        .await?;
-    Ok(Json(HttpResult::success("删除成功".to_string())))
+        .get_control_operation_by_request(&app_id, &user_id, &request_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::internal_server_error("Delete completed without a durable operation record")
+        })?;
+    Ok(Json(
+        HttpResult::success("Application resources deleted".to_string())
+            .with_operation_id(operation.operation_id),
+    ))
 }
 
 /// 彻底删除应用（永久删除，幂等）
@@ -232,22 +268,16 @@ pub async fn delete_app(
     ),
     request_body = PurgeAppRequest,
     description = r#"
-彻底删除应用（永久删除·不可逆·幂等）：只给 app_id，自动删除该应用
-dev + prod 两个阶段的容器、对应的 PVC/目录数据与元数据行。
-
-- **幂等**：app 不存在（从未创建/已删除）= 任务成功；重复调用 = 成功
-  （每步底层幂等：K8s 删除 404 视为成功、Docker 目录不存在跳过）；
-- **body 可选**：不发 body（或发空 body）也成功；`user_id` 仅为日志与
-  对账，资源定位不依赖它；
-- **失败语义（Fail Fast）**：删除链任一步真实失败（状态查询/计算面删除/
-  PVC 销毁/dev 环境回收）立即透传 500；已执行步骤保留现场，调用方重试
-  同一接口即可收敛，不会死锁（内部锁为 RAII + 进程内存态）；
-- 与 `{app_stage}/delete` + `storage/destroy` 的关系：等效
-  `prod/delete`(purge=true) → `prod/storage/destroy` → `dev/storage/destroy`
-  三步串接。**无 confirm**——与终端用户的确认由调用方负责。
+Delete captured dev and prod compute/storage resources and retain a durable lifecycle tombstone.
+The body requires user_id. Recreated applications additionally require lifecycle_id.
+request_id deduplicates the same intent; reusing it with different parameters is a conflict.
+Successful deletion is idempotent within the same lifecycle. Rebuilding requires the explicit
+recreate endpoint. Unknown identities are rejected without touching runtime resources.
+Failures retain durable recovery evidence; uncertain writes cannot be retried as a new deletion.
+Business responses use HTTP 200 and HttpResult; inspect code for the result.
 "#,
     responses(
-        (status = 200, description = "已彻底删除（app 不存在也成功——幂等）", body = HttpResult<String>)
+        (status = 200, description = "Deletion completed; lifecycle tombstone retained", body = HttpResult<String>)
     ),
     tag = "Userapp · 双态 · 生命周期"
 )]
@@ -255,23 +285,31 @@ dev + prod 两个阶段的容器、对应的 PVC/目录数据与元数据行。
 pub async fn purge_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-    body: Option<Json<PurgeAppRequest>>,
+    body: Result<Json<PurgeAppRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    if let Some(Json(req)) = &body {
-        req.validate()
-            .map_err(shared_types::garde_err_to_app_error)?;
-    }
-    let user_id = body.as_ref().and_then(|Json(r)| r.user_id.clone());
-    info!(
-        "[APP] purging app (permanent): {} (user_id={:?})",
-        app_id, user_id
-    );
+    let Json(mut request) = body.map_err(|error| {
+        AppError::validation_error(&format!("Invalid full deletion request: {error}"))
+    })?;
+    request
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
+    let request_id = request
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let user_id = request.user_id.clone();
+    let control = shared_types::UserAppControlRequest {
+        user_id: user_id.clone(),
+        lifecycle_id: request.lifecycle_id,
+        request_id: Some(request_id.clone()),
+    };
+    info!(app_id, user_id, "Deleting application lifecycle");
     // Keep the entire admitted purge alive across HTTP caller cancellation.
     // The service owns conditional metadata/cache cleanup and mutation completion.
     let service = state.app_service.clone();
     let purge_id = app_id.clone();
-    tokio::spawn(async move {
-        let result = service.purge_app(&purge_id).await;
+    let result = tokio::spawn(async move {
+        let result = service.purge_app_controlled(&purge_id, control).await;
         if let Err(error) = &result {
             tracing::error!(app_id = %purge_id, %error, "Owned application purge failed");
         }
@@ -282,6 +320,267 @@ pub async fn purge_app(
         crate::models::AppOperationError::Backend(format!(
             "Application purge worker failed: {error}"
         ))
-    })??;
-    Ok(Json(HttpResult::success("已彻底删除".to_string())))
+    })
+    .and_then(std::convert::identity);
+    super::control::control_result(&state, &app_id, &user_id, &request_id, result).await?;
+    let operation = state
+        .app_service
+        .get_control_operation_by_request(&app_id, &user_id, &request_id)
+        .await?;
+    let mut response = HttpResult::success("Application deleted".to_string());
+    if let Some(operation) = operation {
+        response = response.with_operation_id(operation.operation_id);
+    }
+    Ok(Json(response))
+}
+
+#[cfg(test)]
+mod deletion_ownership_tests {
+    use super::*;
+    use crate::AppServiceTrait as _;
+    use crate::test_support::{MockRuntime, test_service};
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn failed_purge_returns_its_admitted_operation_without_retrying_cleanup() {
+        let directory = tempfile::tempdir().expect("directory");
+        let runtime = Arc::new(MockRuntime::default());
+        let service = Arc::new(test_service(directory.path(), runtime.clone()).await);
+        service
+            .record_dev_registration("purge-failure", "owner")
+            .await
+            .expect("identity");
+        let dev = Arc::new(crate::test_support::StubDevCleanup::default());
+        service.set_dev_cleanup(dev.clone()).expect("dev cleanup");
+        runtime.deployments.insert(
+            "purge-failure".into(),
+            container_runtime_api::DeploymentStatus {
+                app_id: "purge-failure".into(),
+                replicas: 1,
+                ready_replicas: 1,
+                phase: "Running".into(),
+                ..Default::default()
+            },
+        );
+        runtime.delete_fails.store(true, Ordering::SeqCst);
+        let state = Arc::new(AppManagerState {
+            app_service: service.clone(),
+            http_client: reqwest::Client::new(),
+        });
+        let request: PurgeAppRequest = serde_json::from_value(serde_json::json!({
+            "user_id":"owner", "request_id":"purge-failure-request"
+        }))
+        .expect("purge body");
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            purge_app(
+                State(state),
+                Path("purge-failure".into()),
+                Ok(Json(request)),
+            ),
+        )
+        .await
+        .expect("bounded purge")
+        .expect_err("injected deletion failure");
+        let record = service
+            .metadata
+            .store
+            .get_operation_by_request("purge-failure", "purge-failure-request")
+            .await
+            .expect("operation query")
+            .expect("admitted operation");
+        match error {
+            AppError::Structured { operation_id, .. } => {
+                assert_eq!(operation_id.as_deref(), Some(record.operation_id.as_str()))
+            }
+            other => panic!("Expected correlated error: {other:?}"),
+        }
+        assert_eq!(
+            record.state,
+            shared_types::UserAppOperationState::RecoveryRequired
+        );
+        assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dev.calls.load(Ordering::SeqCst), 0);
+        assert!(runtime.deployments.contains_key("purge-failure"));
+    }
+
+    #[tokio::test]
+    async fn runtime_query_requires_the_persisted_owner_before_runtime_access() {
+        let directory = tempfile::tempdir().expect("directory");
+        let runtime = Arc::new(MockRuntime::default());
+        let service = Arc::new(test_service(directory.path(), runtime.clone()).await);
+        service
+            .record_dev_registration("query-owner", "original-owner")
+            .await
+            .expect("owner");
+        runtime.deployments.insert(
+            "query-owner".into(),
+            container_runtime_api::DeploymentStatus {
+                app_id: "query-owner".into(),
+                phase: "Running".into(),
+                ..Default::default()
+            },
+        );
+        // A runtime read consumes this injected failure. Unauthorized access must
+        // be rejected before touching the backend, rather than fail incidentally there.
+        runtime.status_fails.store(1, Ordering::SeqCst);
+        let state = Arc::new(AppManagerState {
+            app_service: service.clone(),
+            http_client: reqwest::Client::new(),
+        });
+        let request: OwnerParams =
+            serde_json::from_value(serde_json::json!({"user_id":"different-owner"}))
+                .expect("owner query");
+        assert!(
+            get_app(
+                State(state.clone()),
+                Path("query-owner".into()),
+                Ok(Query(request))
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(runtime.status_fails.load(Ordering::SeqCst), 1);
+        runtime.status_fails.store(0, Ordering::SeqCst);
+        let request: OwnerParams =
+            serde_json::from_value(serde_json::json!({"user_id":"original-owner"}))
+                .expect("owner query");
+        assert!(
+            get_app(State(state), Path("query-owner".into()), Ok(Query(request)))
+                .await
+                .is_ok()
+        );
+        assert!(
+            service.release_locks.is_empty(),
+            "read must not acquire a mutation lease"
+        );
+        assert!(
+            service
+                .metadata
+                .store
+                .unfinished_operations(None, 10)
+                .await
+                .expect("operations")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_query_rejects_lifecycle_recreated_during_runtime_read() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let directory = tempfile::tempdir().expect("directory");
+            let runtime = Arc::new(MockRuntime::default());
+            let service = Arc::new(test_service(directory.path(), runtime.clone()).await);
+            let before = service
+                .metadata
+                .store
+                .ensure_identity("query-race", "owner")
+                .await
+                .expect("identity");
+            runtime.deployments.insert(
+                "query-race".into(),
+                container_runtime_api::DeploymentStatus {
+                    app_id: "query-race".into(),
+                    phase: "Running".into(),
+                    ..Default::default()
+                },
+            );
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            *runtime.status_barrier.lock().expect("barrier") = Some(barrier.clone());
+            // join! keeps cancellation scoped to this test, without a detached task.
+            let read = service.get_app_for_owner("query-race", "owner");
+            let replace = async {
+                barrier.wait().await;
+                let deletion = crate::service::OwnedOperation::admit(
+                    service.metadata.store.clone(),
+                    shared_types::UserAppAdmission {
+                        runtime_policy_on_success: None,
+                        command: None,
+                        app_id: "query-race".into(),
+                        user_id: "owner".into(),
+                        lifecycle_id: Some(before.lifecycle_id.clone()),
+                        operation_id: "query-race-delete".into(),
+                        request_id: Some("query-race-delete".into()),
+                        kind: shared_types::UserAppOperationKind::DeleteApplication,
+                        request_fingerprint: "a".repeat(64),
+                        metadata: None,
+                    },
+                )
+                .await
+                .expect("test deletion admission");
+                crate::test_support::complete_empty_deletion_fixture(deletion, "owner").await;
+                service
+                    .metadata
+                    .store
+                    .recreate(
+                        "query-race",
+                        "owner",
+                        &before.lifecycle_id,
+                        "query-race-recreate",
+                    )
+                    .await
+                    .expect("new generation");
+                barrier.wait().await;
+            };
+            let (result, ()) = tokio::join!(read, replace);
+            assert!(
+                matches!(result, Err(crate::models::AppOperationError::Conflict(_))),
+                "{result:?}"
+            );
+            assert!(service.release_locks.is_empty());
+        })
+        .await
+        .expect("bounded lifecycle query race");
+    }
+
+    #[tokio::test]
+    async fn delete_validates_owner_without_registering_or_deleting_foreign_resources() {
+        for existing_owner in [None, Some("original-owner")] {
+            let directory = tempfile::tempdir().expect("directory");
+            let runtime = Arc::new(MockRuntime::default());
+            let service = Arc::new(test_service(directory.path(), runtime.clone()).await);
+            if let Some(owner) = existing_owner {
+                service
+                    .record_dev_registration("delete-owner", owner)
+                    .await
+                    .expect("owner");
+            }
+            runtime.deployments.insert(
+                "delete-owner".into(),
+                container_runtime_api::DeploymentStatus {
+                    app_id: "delete-owner".into(),
+                    phase: "Running".into(),
+                    ..Default::default()
+                },
+            );
+            let state = Arc::new(AppManagerState {
+                app_service: service.clone(),
+                http_client: reqwest::Client::new(),
+            });
+            let body: DeleteAppRequest = serde_json::from_value(
+                serde_json::json!({"user_id":"request-owner","purge":false}),
+            )
+            .expect("body");
+            assert!(
+                delete_app(
+                    State(state),
+                    Path(("delete-owner".into(), "prod".into())),
+                    Ok(Json(body))
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                service
+                    .metadata
+                    .lookup("delete-owner")
+                    .await
+                    .expect("metadata")
+                    .and_then(|row| row.user_id)
+                    .as_deref(),
+                existing_owner
+            );
+            assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+        }
+    }
 }

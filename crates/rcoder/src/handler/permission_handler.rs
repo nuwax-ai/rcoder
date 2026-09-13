@@ -140,6 +140,7 @@ async fn forward_permission_resolution(
         Ok(Json(HttpResult::success(dto)))
     } else {
         Ok(Json(HttpResult {
+            operation_id: None,
             code: dto.error_code.clone().unwrap_or_else(|| {
                 shared_types::error_codes::ERR_PERMISSION_RESOLVE_FAILED.to_string()
             }),

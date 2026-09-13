@@ -8,8 +8,6 @@
 //! - 容器定位按 `X-App-Id` header（白名单校验）；容器不在线 502（dev）/
 //!   503+Retry-After（prod 唤醒失败）
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
@@ -18,7 +16,7 @@ use tracing::{info, warn};
 use shared_types::{APP_ID_HEADER, USER_ID_HEADER};
 
 use crate::router::AppState;
-use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder};
+use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder_until};
 
 use super::semantics::HttpResultError;
 
@@ -129,12 +127,31 @@ async fn resolve_dev_addr(
     app_id: &str,
     explicit_user_id: Option<&str>,
 ) -> Result<String, Box<Response>> {
-    let mut info = ensure_userapp_builder(state, app_id, explicit_user_id)
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
+    tokio::time::timeout_at(
+        deadline,
+        resolve_dev_addr_inner(state, app_id, explicit_user_id, deadline),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(builder_control_response(
+            &shared_types::UserAppWaitTimeout { operation_id: None }.into(),
+        ))
+    })
+}
+
+async fn resolve_dev_addr_inner(
+    state: &AppState,
+    app_id: &str,
+    explicit_user_id: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<String, Box<Response>> {
+    let mut info = ensure_userapp_builder_until(state, app_id, explicit_user_id, deadline)
         .await
         .map_err(|e| {
             warn!("[USERAPP_FORWARD] ensure dev container failed: app_id={app_id}: {e:#}");
-            HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}"))
-                .into_boxed_response()
+            builder_control_response(&e)
         })?;
     let mut addr = dev_file_server_addr(state, &info);
     // 探活正缓存(30s): 每次转发都探活会给高频文件操作(批量列表/读写)平添一个
@@ -153,7 +170,12 @@ async fn resolve_dev_addr(
         // 先验容器真实状态再决定处置：Running 则保容器（探活失败是超时/未就绪
         // 抖动，编译高负载/新容器启动窗口常见），只有真死才清注册重建——
         // 防误杀正在跑任务的容器
-        match crate::userapp_builder::remediate_stale_registry(state, app_id).await {
+        match crate::userapp_builder::remediate_stale_registry(state, app_id)
+            .await
+            .map_err(|error| {
+                HttpResultError::bad_gateway(format!("verify builder state: {error:#}"))
+                    .into_boxed_response()
+            })? {
             crate::userapp_builder::RegistryRemediation::Alive(info) => {
                 info!(
                     "[USERAPP_FORWARD] dev container alive on inspect, keep without rebuild: app_id={app_id}"
@@ -166,24 +188,14 @@ async fn resolve_dev_addr(
                 return Ok(dev_file_server_addr(state, &info));
             }
             crate::userapp_builder::RegistryRemediation::Gone => {
-                // 就地清 container 字段而非 remove_project：remove 在 PG 模式会持久化删除
-                // project 行及其 sessions（刚 durable 写入的会话映射全丢、跨副本路由失效），
-                // 且需先关 SSE 流避免后台 gRPC 对死地址空转——清 container 让 ensure 走重建路径即可。
-                state.shutdown_sse_streams_for_project(app_id);
-                if let Some(mut info) = state.get_project(app_id).map(|p| (*p).clone()) {
-                    info.set_container(None);
-                    if let Err(e) = state.insert_project(app_id.to_string(), Arc::new(info)) {
-                        warn!(
-                            "[USERAPP_FORWARD] clear stale container field failed: app_id={app_id}: {e}"
-                        );
-                    }
-                }
-                info = ensure_userapp_builder(state, app_id, explicit_user_id)
+                // Re-enter coordinated ensure, which rechecks the latest registry
+                // and runtime under the application lock. The observation above
+                // does not authorize clearing a newer registration or its streams.
+                info = ensure_userapp_builder_until(state, app_id, explicit_user_id, deadline)
                     .await
                     .map_err(|e| {
                         warn!("[USERAPP_FORWARD] re-ensure dev container failed: app_id={app_id}: {e:#}");
-                        HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}"))
-                            .into_boxed_response()
+                        builder_control_response(&e)
                     })?;
                 addr = dev_file_server_addr(state, &info);
                 // 重建的新容器可能仍在启动(agent_runner+file-server+PG 全套)——不写探活
@@ -197,14 +209,29 @@ async fn resolve_dev_addr(
         // file-server 同样在 60000 应答——借 30s 探活缓存 miss 窗口做归属交叉
         // 校验（成本：每 app 每 30s 一次 K8s get），污染即自愈刷回 builder 值
         if let Some(updated) =
-            crate::userapp_builder::cross_verify_registration(state, app_id, &info).await
+            crate::userapp_builder::cross_verify_registration(state, app_id, &info)
+                .await
+                .map_err(|error| {
+                    HttpResultError::bad_gateway(format!("verify builder identity: {error:#}"))
+                        .into_boxed_response()
+                })?
         {
             cache.insert(app_id.to_string(), std::time::Instant::now());
             return Ok(dev_file_server_addr(state, &updated));
         }
-        cache.insert(app_id.to_string(), std::time::Instant::now());
+        return Err(
+            HttpResultError::bad_gateway("Builder is no longer running").into_boxed_response()
+        );
     }
     Ok(addr)
+}
+
+fn builder_control_response(error: &anyhow::Error) -> Box<Response> {
+    let mut response = crate::userapp_builder::control_error(error).into_response();
+    // Legacy TS forwarding keeps its gateway status. Formal routes normalize
+    // the same envelope to HTTP 200 without dropping code or operation identity.
+    *response.status_mut() = axum::http::StatusCode::BAD_GATEWAY;
+    Box::new(response)
 }
 
 /// 探活正缓存: app_id → 最近一次探活成功时刻(重建自愈后刷新)。
@@ -292,13 +319,15 @@ pub(crate) async fn forward_to_dev(
     ) {
         return match super::semantics::existing_dev_addr(state, app_id).await {
             Ok(Some(addr)) => forward_to_addr("dev", app_id, &addr, req).await,
-            Ok(None) => super::semantics::unavailable_response(app_id),
-            Err(error) => error.into_response(),
+            Ok(None) => {
+                super::error_body::reject(req, super::semantics::unavailable_response(app_id)).await
+            }
+            Err(error) => super::error_body::reject(req, error.into_response()).await,
         };
     }
     let addr = match resolve_dev_addr(state, app_id, explicit_user_id).await {
         Ok(addr) => addr,
-        Err(resp) => return *resp,
+        Err(resp) => return super::error_body::reject(req, *resp).await,
     };
     forward_to_addr("dev", app_id, &addr, req).await
 }
@@ -306,8 +335,8 @@ pub(crate) async fn forward_to_dev(
 /// 全量透传一个请求到该 app 生产运行容器的 file-server-proxy（同 path+query）。
 ///
 /// 定位语义（与 pod ensure prod 分支同款）：
-/// 1. 存在性检查（`get_app`）——`ensure_running` 对不存在的 app 返回 AlreadyRunning
-///    （stopped-set 语义），必须前置拦截防幻报；
+/// 1. 存在性检查（`get_app`）——读取应用详情并区分不存在与查询失败；
+///    后续唤醒还会在协调器内独立验证生命周期与物理资源身份；
 /// 2. 唤醒——闲置回收（scale 0）的 app 自动拉起（用户拍板：文件操作前容器没启动
 ///    要自动启动）；Timeout/Failed → 503 + Retry-After（对齐 proxy_http 流量唤醒）；
 /// 3. 地址——K8s 确定性命名 FQDN（Service 换 Pod DNS 自愈）；Docker 直查容器 IPv4
@@ -318,23 +347,17 @@ pub(crate) async fn forward_to_dev(
 pub(crate) async fn forward_to_prod(state: &AppState, app_id: &str, req: Request) -> Response {
     let addr = match resolve_prod_addr(state, app_id).await {
         Ok(addr) => addr,
-        Err(resp) => return *resp,
+        Err(resp) => return super::error_body::reject(req, *resp).await,
     };
     forward_to_addr("prod runtime", app_id, &addr, req).await
 }
 
 /// 定位（含唤醒）生产运行容器 file-server addr（`http://{host}:60000`）。
 async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box<Response>> {
-    // 幻报拦截：不存在的 app 直接 404（pod ensure prod 同款语义）
     if let Err(e) = state.app_service.get_app(app_id).await {
-        info!(
-            "[USERAPP_FORWARD] prod forward target check failed (treated as not found): app_id={app_id}: {e}"
-        );
+        info!("[USERAPP_FORWARD] prod forward target check failed: app_id={app_id}: {e}");
         return Err(Box::new(
-            HttpResultError::not_found(format!(
-                "userapp prod app not found or unavailable: {app_id}"
-            ))
-            .into_response(),
+            shared_types::AppError::with_message(e.code(), e.message().to_owned()).into_response(),
         ));
     }
     // 唤醒（仅 stopped 真时触发——Running 高频文件操作零开销）。is_stopped
@@ -375,8 +398,12 @@ async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box
             .runtime()
             .get_container_info_by_identifier(app_id, &shared_types::ServiceType::Userapp)
             .await
-            .ok()
-            .flatten()
+            .map_err(|error| {
+                HttpResultError::bad_gateway(format!(
+                    "Lookup production runtime address failed: {error}"
+                ))
+                .into_boxed_response()
+            })?
             .map(|info| info.container_ip)
             .filter(|ip| !ip.is_empty())
     };
@@ -389,8 +416,11 @@ async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box
             // 走到这里 = get_app 成功但容器定位失败（回收过渡态等）
             warn!("[USERAPP_FORWARD] prod runtime addr unavailable: app_id={app_id}");
             Err(Box::new(
-                HttpResultError::not_found(format!("runtime address for app {app_id} unavailable"))
-                    .into_response(),
+                HttpResultError::service_unavailable(
+                    format!("Runtime address for app {app_id} unavailable"),
+                    WAKE_503_RETRY_AFTER_SECS,
+                )
+                .into_response(),
             ))
         }
     }
@@ -398,3 +428,39 @@ async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box
 
 /// 唤醒 503 的 Retry-After 秒数（对齐 proxy_http 流量唤醒面）。
 const WAKE_503_RETRY_AFTER_SECS: u32 = 15;
+
+#[cfg(test)]
+mod control_response_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_builder_errors_preserve_operation_identity_and_business_code() {
+        let cases = [
+            (
+                anyhow::Error::from(shared_types::UserAppWaitTimeout {
+                    operation_id: Some("accepted-builder".into()),
+                }),
+                shared_types::error_codes::ERR_USERAPP_WAIT_TIMEOUT,
+                "accepted-builder",
+            ),
+            (
+                anyhow::Error::from(shared_types::UserAppStoreError::OperationInProgress(
+                    "conflicting-operation".into(),
+                )),
+                shared_types::error_codes::ERR_CONFLICT,
+                "conflicting-operation",
+            ),
+        ];
+        for (error, code, operation_id) in cases {
+            let response = *builder_control_response(&error.context("Forward builder lookup"));
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("error envelope");
+            let envelope: serde_json::Value = serde_json::from_slice(&body).expect("JSON envelope");
+            assert_eq!(envelope["code"], code);
+            assert_eq!(envelope["operation_id"], operation_id);
+            assert_eq!(envelope["success"], false);
+        }
+    }
+}

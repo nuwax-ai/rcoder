@@ -27,7 +27,7 @@ use file_server::service::dev_server::StoppedDev;
 use file_server::workspace::resolve_userapp_dev;
 
 /// 进程表 key（与 web projectId 空间隔离; log_dir 剥前缀）。
-fn dev_key(app_id: &str) -> String {
+pub(super) fn dev_key(app_id: &str) -> String {
     format!("userapp:{app_id}")
 }
 
@@ -279,6 +279,12 @@ async fn spawn_dev_task(
     action: DevTaskAction,
     precheck: crate::service::userapp::DevWorkspacePrecheck,
 ) -> Result<String, AppError> {
+    let workspace_activity = state
+        .build_tasks
+        .workspace_activity(app_id)
+        .await
+        .read_owned()
+        .await;
     let kind = match action {
         DevTaskAction::Start => crate::models::BuildTaskKind::DevStart,
         DevTaskAction::Restart => crate::models::BuildTaskKind::DevRestart,
@@ -304,6 +310,7 @@ async fn spawn_dev_task(
     let app_id = app_id.to_string();
     let task_clone = task.clone();
     tokio::spawn(async move {
+        let _workspace_activity = workspace_activity;
         let key = dev_key(&app_id);
         // 编译（形态分派）：
         // - 产物态（现状）：manifest 同核编译（单一编译事实源）——discover →

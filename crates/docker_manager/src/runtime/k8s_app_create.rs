@@ -199,6 +199,13 @@ impl KubernetesRuntime {
             ..Default::default()
         };
 
+        let mut annotations = merge_app_annotations(params).unwrap_or_default();
+        if let Some(context) = &params.execution_context {
+            context
+                .validate_identity(app_id, params.user_id.as_deref())
+                .map_err(ContainerRuntimeError::ConfigurationError)?;
+            annotations.extend(context.resource_metadata());
+        }
         let deployment = Deployment {
             metadata: ObjectMeta {
                 name: Some(self.app_deployment_name(app_id)),
@@ -206,7 +213,7 @@ impl KubernetesRuntime {
                 labels: Some(full_labels.clone()),
                 // Deployment metadata.annotations：port-expose + recycle 配置（SSA 单一事实源，
                 // 供读路径/重启重建还原 expose_type 与回收策略）。
-                annotations: merge_app_annotations(params),
+                annotations: Some(annotations),
                 ..Default::default()
             },
             spec: Some(DeploymentSpec {
@@ -247,9 +254,26 @@ impl KubernetesRuntime {
         app_id: &str,
         params: &ContainerCreateParams,
         expected: Option<&str>,
+        target: Option<&shared_types::AppResourceIdentity>,
     ) -> ContainerRuntimeResult<()> {
         use k8s_openapi::api::core::v1::Secret;
         use kube::api::{DeleteParams, PostParams, Preconditions};
+        params.validate_execution_context()?;
+        if params.execution_context.is_some() && expected.is_some() && target.is_none() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Conditional lifecycle update requires a captured target".into(),
+            ));
+        }
+        if let Some(target) = target
+            && (target.kind != shared_types::AppResourceKind::Deployment
+                || target.uid.is_empty()
+                || target.name != self.app_deployment_name(app_id)
+                || target.resource_version.as_deref() != expected)
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Captured update target does not match requested commit".into(),
+            ));
+        }
         let operation = uuid::Uuid::new_v4().simple().to_string();
         let stem = format!("ua-{app_id}-{}", &operation[..16]);
         let cm_name = format!("{stem}-env");
@@ -313,6 +337,7 @@ impl KubernetesRuntime {
             }
             let mut deployment = self.build_app_deployment(app_id, params)?;
             deployment.metadata.resource_version = expected.map(str::to_owned);
+            deployment.metadata.uid = target.as_ref().map(|resource| resource.uid.clone());
             let container = deployment
                 .spec
                 .as_mut()
@@ -423,6 +448,27 @@ impl KubernetesRuntime {
         http_expose: HttpExpose,
         expected: Option<&str>,
     ) -> ContainerRuntimeResult<Vec<AppPortStatus>> {
+        params.validate_execution_context()?;
+        let target = if let Some(target) = &params.mutation_target {
+            let resource = &target.resource;
+            if resource.kind != shared_types::AppResourceKind::Deployment
+                || resource.name != self.app_deployment_name(app_id)
+                || resource.resource_version.as_deref() != expected
+            {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Captured application update target changed".into(),
+                ));
+            }
+            Some(resource.clone())
+        } else {
+            match (&params.execution_context, expected) {
+                (Some(context), Some(version)) => Some(
+                    self.capture_owned_app_identity(context, Some(version))
+                        .await?,
+                ),
+                _ => None,
+            }
+        };
         let tenant_id = params.tenant_id.as_deref();
         let space_id = params.space_id.as_deref();
         // 0. workspace PVC: Userapp (K8s 永远 per-app) per-app RWO RBD 单卷——
@@ -430,14 +476,25 @@ impl KubernetesRuntime {
         //    subPath 目录由 kubelet 自动创建，故只 ensure 单块 PVC
         //    （历史第二块 `-data` PVC 已随单卷化退役；destroy 侧兜底回收存量）。
         //    销毁走 destroy_app_pvc。
-        self.ensure_workspace_pvc(
-            app_id,
-            &ServiceType::Userapp,
-            params.storage_size.as_deref(),
-        )
-        .await?;
-        self.claim_app_storage(app_id).await?;
-        self.write_app_generation(app_id, params, expected).await?;
+        if let Some(context) = &params.execution_context {
+            self.ensure_owned_workspace_pvc(
+                context,
+                &ServiceType::Userapp,
+                params.storage_size.as_deref(),
+            )
+            .await?;
+        } else {
+            self.ensure_workspace_pvc(
+                app_id,
+                &ServiceType::Userapp,
+                params.storage_size.as_deref(),
+            )
+            .await?;
+        }
+        self.claim_app_storage_with_context(app_id, params.execution_context.as_ref())
+            .await?;
+        self.write_app_generation(app_id, params, expected, target.as_ref())
+            .await?;
         // Publish networking only after the conditional commit succeeded.
         self.apply_app_service(app_id, params).await?;
         info!("[K8S-APP] Deployment applied for app: {app_id}");
@@ -580,6 +637,272 @@ mod conditional_tests {
             pod_cache: Default::default(),
             subvolume_path_cache: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn owned_pvc_create_echoes_identity_and_validates_competing_winner() {
+        use super::super::k8s_pvc::K8sPvcOps as _;
+        tokio::time::timeout(std::time::Duration::from_secs(12), async {
+            for outcome in ["created", "same-lifecycle", "foreign-lifecycle", "wrong-access"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                let address = listener.local_addr().expect("address");
+                drop(rustls::crypto::ring::default_provider().install_default());
+                let config = kube::Config::new(format!("http://{address}").parse().expect("URI"));
+                let runtime = runtime(kube::Client::try_from(config).expect("client"));
+                let name = runtime.workspace_pvc_name("fence", &ServiceType::Userapp).expect("PVC name");
+                let server = tokio::spawn(async move {
+                    let mut winner = serde_json::Value::Null;
+                    for step in 0..if outcome == "created" {2} else {3} {
+                        let (mut stream, _) = listener.accept().await.expect("accept");
+                        let mut bytes = Vec::new(); let mut chunk = [0u8; 4096];
+                        let (head, offset, length) = loop {
+                            let count = stream.read(&mut chunk).await.expect("read"); assert!(count > 0);
+                            bytes.extend_from_slice(&chunk[..count]);
+                            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                                let length = head.lines().find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("length"))
+                                }).unwrap_or(0);
+                                break (head, end + 4, length);
+                            }
+                        };
+                        while bytes.len() < offset + length {
+                            let count = stream.read(&mut chunk).await.expect("body"); assert!(count > 0); bytes.extend_from_slice(&chunk[..count]);
+                        }
+                        let (status, reply) = match step {
+                            0 => {
+                                assert!(head.starts_with("GET ") && head.contains(&name), "{head}");
+                                (404, serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"not created","code":404}))
+                            }
+                            1 => {
+                                assert!(head.starts_with("POST ") && head.contains("/persistentvolumeclaims"), "{head}");
+                                winner = serde_json::from_slice(&bytes[offset..offset+length]).expect("PVC POST");
+                                assert_eq!(winner["metadata"]["name"], name);
+                                assert_eq!(winner["metadata"]["annotations"]["rcoder.io/application-id"], "fence");
+                                assert_eq!(winner["metadata"]["annotations"]["rcoder.io/owner-id"], "owner-one");
+                                assert_eq!(winner["metadata"]["annotations"]["rcoder.io/lifecycle-id"], "life-one");
+                                assert_eq!(winner["metadata"]["annotations"]["rcoder.io/storage-use-operation"], "create-one");
+                                assert_eq!(winner["spec"]["resources"]["requests"]["storage"], "7Gi");
+                                winner["metadata"]["uid"] = "winner-uid".into(); winner["metadata"]["resourceVersion"] = "8".into();
+                                if outcome == "created" { (201, winner.clone()) }
+                                else { (409, serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"AlreadyExists","message":"winner committed","code":409})) }
+                            }
+                            2 => {
+                                assert!(head.starts_with("GET ") && head.contains(&name), "creation conflict must inspect winner: {head}");
+                                if outcome == "foreign-lifecycle" { winner["metadata"]["annotations"]["rcoder.io/lifecycle-id"] = "replacement-life".into(); }
+                                if outcome == "wrong-access" { winner["spec"]["accessModes"] = serde_json::json!(["ReadWriteMany"]); }
+                                (200, winner.clone())
+                            }
+                            _ => unreachable!(),
+                        };
+                        let body = serde_json::to_vec(&reply).expect("reply");
+                        stream.write_all(format!("HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.expect("headers");
+                        stream.write_all(&body).await.expect("body");
+                    }
+                });
+                let context = shared_types::UserAppExecutionContext {
+                    app_id:"fence".into(),user_id:"owner-one".into(),lifecycle_id:"life-one".into(),operation_id:"create-one".into(),executor_id:"executor-one".into(),request_fingerprint:"a".repeat(64),
+                };
+                let result = runtime.ensure_owned_workspace_pvc(&context, &ServiceType::Userapp, Some("7Gi")).await;
+                if matches!(outcome, "created" | "same-lifecycle") { result.expect("owned PVC established"); }
+                else { assert!(matches!(result, Err(ContainerRuntimeError::Conflict(_))), "{outcome}: {result:?}"); }
+                server.await.expect("PVC wire assertions");
+            }
+        }).await.expect("bounded owned PVC creation scenarios");
+    }
+
+    #[tokio::test]
+    async fn pvc_expansion_sends_captured_identity_and_propagates_conflict() {
+        use super::super::k8s_pvc::K8sPvcOps as _;
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            for conflict in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                let address = listener.local_addr().expect("address");
+                drop(rustls::crypto::ring::default_provider().install_default());
+                let config = kube::Config::new(format!("http://{address}").parse().expect("URI"));
+                let runtime = runtime(kube::Client::try_from(config).expect("client"));
+                let name = runtime.workspace_pvc_name("fence", &ServiceType::Userapp).expect("name");
+                let server = tokio::spawn(async move {
+                    let pvc = serde_json::json!({"apiVersion":"v1","kind":"PersistentVolumeClaim",
+                        "metadata":{"name":name,"uid":"original-storage","resourceVersion":"47","labels":{"service_type":ServiceType::Userapp.to_string()}},
+                        "spec":{"resources":{"requests":{"storage":"1Gi"}}}});
+                    for step in 0..2 {
+                        let (mut stream, _) = listener.accept().await.expect("accept");
+                        let mut bytes = Vec::new(); let mut chunk = [0u8; 4096];
+                        let (head, offset, length) = loop {
+                            let count = stream.read(&mut chunk).await.expect("read"); assert!(count > 0);
+                            bytes.extend_from_slice(&chunk[..count]);
+                            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                                let length = head.lines().find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("length"))
+                                }).unwrap_or(0);
+                                break (head, end + 4, length);
+                            }
+                        };
+                        while bytes.len() < offset + length {
+                            let count = stream.read(&mut chunk).await.expect("body"); assert!(count > 0); bytes.extend_from_slice(&chunk[..count]);
+                        }
+                        assert!(head.contains(&format!("/persistentvolumeclaims/{name}")), "{head}");
+                        if step == 0 { assert!(head.starts_with("GET "), "{head}"); }
+                        else {
+                            assert!(head.starts_with("PATCH "), "{head}");
+                            let patch: serde_json::Value = serde_json::from_slice(&bytes[offset..offset+length]).expect("patch");
+                            assert_eq!(patch["metadata"]["uid"], "original-storage");
+                            assert_eq!(patch["metadata"]["resourceVersion"], "47");
+                            assert_eq!(patch["spec"]["resources"]["requests"]["storage"], "2Gi");
+                        }
+                        let rejected = step == 1 && conflict;
+                        let status = if rejected {409} else {200};
+                        let body = serde_json::to_vec(&if rejected {
+                            serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Conflict","message":"replacement PVC","code":409})
+                        } else {pvc.clone()}).expect("reply");
+                        stream.write_all(format!("HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.expect("headers");
+                        stream.write_all(&body).await.expect("reply");
+                    }
+                });
+                let result = runtime.resize_app_pvc("fence", "2Gi").await;
+                if conflict { assert!(matches!(result, Err(ContainerRuntimeError::Conflict(_))), "{result:?}"); }
+                else { assert!(matches!(result, Ok(container_runtime_api::StorageResizeOutcome::Resized {from, to}) if from == "1Gi" && to == "2Gi")); }
+                server.await.expect("wire assertions");
+            }
+        }).await.expect("bounded PVC expansion scenario");
+    }
+
+    #[tokio::test]
+    async fn update_rejects_replacement_lifecycle_before_pvc_or_config_requests() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|value| value == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).await.expect("read");
+                    assert!(count > 0); request.extend_from_slice(&chunk[..count]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.starts_with("GET ") && request.contains("/deployments/rcoder-app-fence"), "identity check must precede all resource effects: {request}");
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "apiVersion":"apps/v1","kind":"Deployment",
+                    "metadata":{"name":"rcoder-app-fence","uid":"replacement-uid","resourceVersion":"71",
+                        "labels":{"app.kubernetes.io/name":"user-app","app.kubernetes.io/instance":"fence","app.kubernetes.io/managed-by":"rcoder-app-manager","app.kubernetes.io/part-of":"rcoder","rcoder.io/app-id":"fence"},
+                        "annotations":{"rcoder.io/application-id":"fence","rcoder.io/owner-id":"owner-one","rcoder.io/lifecycle-id":"replacement-life"}}
+                })).expect("reply");
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.expect("headers");
+                stream.write_all(&body).await.expect("reply");
+            });
+            drop(rustls::crypto::ring::default_provider().install_default());
+            let config = kube::Config::new(format!("http://{address}").parse().expect("URI"));
+            let runtime = runtime(kube::Client::try_from(config).expect("client"));
+            let params = ContainerCreateParams::builder().project_id("fence").user_id("owner-one").service_type(ServiceType::Userapp).execution_context(shared_types::UserAppExecutionContext {
+                app_id:"fence".into(),user_id:"owner-one".into(),lifecycle_id:"old-life".into(),operation_id:"update-one".into(),executor_id:"executor-one".into(),request_fingerprint:"a".repeat(64),
+            }).build();
+            let result = runtime.write_app_resources("fence", &params, None, None, HttpExpose::Pingora, Some("71")).await;
+            assert!(matches!(result, Err(ContainerRuntimeError::Conflict(ref message)) if message.contains("lifecycle-id")), "old lifecycle must be rejected at preflight: {result:?}");
+            server.await.expect("request assertions");
+        }).await.expect("bounded update identity scenario");
+    }
+
+    #[tokio::test]
+    async fn workload_mutations_send_preconditions_and_do_not_retry_rejections() {
+        // Real HTTP transport and Kubernetes serialization; no cluster resources.
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            for action in ["scale", "wake", "recycle", "stop"] {
+                for rejection in [0, 409, 403] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                    let address = listener.local_addr().expect("address");
+                    let server = tokio::spawn(async move {
+                        let deployment = serde_json::json!({
+                            "apiVersion":"apps/v1", "kind":"Deployment",
+                            "metadata":{"name":"rcoder-app-fence","uid":"captured-original","resourceVersion":"71",
+                                "annotations":{"rcoder.io/application-id":"fence","rcoder.io/owner-id":"owner-one","rcoder.io/lifecycle-id":"life-one"},
+                                "labels":{"app.kubernetes.io/name":"user-app","app.kubernetes.io/instance":"fence",
+                                    "app.kubernetes.io/managed-by":"rcoder-app-manager","app.kubernetes.io/part-of":"rcoder","rcoder.io/app-id":"fence"}},
+                            "spec":{"replicas":1,"selector":{"matchLabels":{"app":"fence"}},"template":{"spec":{"containers":[{"name":"app","image":"fixture"}]}}}
+                        });
+                        for step in 0..2 {
+                            let (mut stream, _) = listener.accept().await.expect("accept");
+                            let mut bytes = Vec::new();
+                            let mut buffer = [0u8; 4096];
+                            let (head, offset, length) = loop {
+                                let count = stream.read(&mut buffer).await.expect("read");
+                                assert!(count > 0, "unexpected request EOF");
+                                bytes.extend_from_slice(&buffer[..count]);
+                                if let Some(end) = bytes.windows(4).position(|value| value == b"\r\n\r\n") {
+                                    let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                                    let length = head.lines().find_map(|line| {
+                                        let (key, value) = line.split_once(':')?;
+                                        key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("length"))
+                                    }).unwrap_or(0);
+                                    break (head, end + 4, length);
+                                }
+                            };
+                            while bytes.len() < offset + length {
+                                let count = stream.read(&mut buffer).await.expect("body");
+                                assert!(count > 0);
+                                bytes.extend_from_slice(&buffer[..count]);
+                            }
+                            assert!(head.contains("/deployments/rcoder-app-fence"), "{head}");
+                            let (status, reply) = if step == 0 {
+                                assert!(head.starts_with("GET "), "{head}");
+                                (200, deployment.clone())
+                            } else {
+                                assert!(head.starts_with("PATCH "), "{head}");
+                                assert!(head.to_ascii_lowercase().contains("application/merge-patch+json"), "{head}");
+                                let patch: serde_json::Value = serde_json::from_slice(&bytes[offset..offset + length]).expect("patch");
+                                assert_eq!(patch["metadata"]["uid"], "captured-original");
+                                assert_eq!(patch["metadata"]["resourceVersion"], "71");
+                                match action {
+                                    "stop" => {
+                                        assert_eq!(patch["spec"]["replicas"], 0);
+                                        assert_eq!(patch["metadata"]["annotations"]["rcoder.io/wake-on-traffic"], "false");
+                                    }
+                                    "scale" => assert_eq!(patch["spec"]["replicas"], 0),
+                                    "wake" => assert_eq!(patch["metadata"]["annotations"]["rcoder.io/wake-on-traffic"], "false"),
+                                    "recycle" => assert_eq!(patch["metadata"]["annotations"]["rcoder.io/recycle-enabled"], "false"),
+                                    _ => unreachable!(),
+                                }
+                                if rejection == 0 { (200, deployment.clone()) }
+                                else { (rejection, serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":if rejection == 409 {"Conflict"} else {"Forbidden"},"message":"write rejected","code":rejection})) }
+                            };
+                            let reply = serde_json::to_vec(&reply).expect("reply");
+                            stream.write_all(format!("HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len()).as_bytes()).await.expect("headers");
+                            stream.write_all(&reply).await.expect("response");
+                        }
+                        // Dropping the listener makes an unintended retry fail,
+                        // rather than accepting a later unconditional write.
+                    });
+                    drop(rustls::crypto::ring::default_provider().install_default());
+                    let config = kube::Config::new(format!("http://{address}").parse().expect("URI"));
+                    let runtime = runtime(kube::Client::try_from(config).expect("client"));
+                    let result = match action {
+                        "stop" => {
+                            let context = shared_types::UserAppExecutionContext {
+                                app_id: "fence".into(), user_id: "owner-one".into(), lifecycle_id: "life-one".into(),
+                                operation_id: "stop-one".into(), executor_id: "executor-one".into(), request_fingerprint: "a".repeat(64),
+                            };
+                            let target = runtime.capture_stop_target(&context, Some("71")).await.expect("capture stop target");
+                            runtime.stop_captured_target(&target, false).await
+                        }
+                        "scale" => runtime.scale_app("fence", 0).await,
+                        "wake" => runtime.patch_app_wake_on_traffic("fence", false).await,
+                        "recycle" => runtime.patch_app_recycle_policy("fence", Some(false), None).await,
+                        _ => unreachable!(),
+                    };
+                    match rejection {
+                        0 => result.expect("conditional commit"),
+                        409 => assert!(matches!(result, Err(ContainerRuntimeError::Conflict(_))), "{result:?}"),
+                        403 => assert!(matches!(result, Err(ContainerRuntimeError::RequestRejected(ref rejection)) if rejection.status == 403 && rejection.message.contains("write rejected")), "typed explicit refusal must remain visible: {result:?}"),
+                        _ => unreachable!("fixture only uses success, conflict or forbidden"),
+                    }
+                    server.await.expect("wire assertions");
+                }
+            }
+        }).await.expect("bounded API contract scenario");
     }
 
     #[tokio::test]
@@ -1014,13 +1337,15 @@ mod conditional_tests {
 
     #[tokio::test]
     async fn application_operation_lease_excludes_purge_and_release_is_identity_bound() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
         for (replaced, cancelled) in [(false, false), (true, false), (false, true)] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind");
             let address = listener.local_addr().expect("address");
             let server = tokio::spawn(async move {
-                for request_index in 0..if cancelled { 2 } else { 3 } {
+                let mut winner = serde_json::Value::Null;
+                for request_index in 0..if cancelled { 3 } else { 4 } {
                     let (mut stream, _) = listener.accept().await.expect("accept");
                     let mut bytes = Vec::new();
                     let mut buffer = [0u8; 2048];
@@ -1046,19 +1371,30 @@ mod conditional_tests {
                         assert!(n > 0);
                         bytes.extend_from_slice(&buffer[..n]);
                     }
-                    let mut body: serde_json::Value =
-                        serde_json::from_slice(&bytes[offset..offset + length]).expect("json");
-                    let conflict = request_index == 1 || (request_index == 2 && replaced);
+                    let mut body: serde_json::Value = if length == 0 { serde_json::Value::Null } else {
+                        serde_json::from_slice(&bytes[offset..offset + length]).expect("json")
+                    };
+                    assert!(head.contains("/configmaps"), "{head}");
+                    let conflict = request_index == 1 || (request_index == 3 && replaced);
                     if request_index < 2 {
                         assert!(head.starts_with("POST "));
                         assert!(
-                            !body["metadata"]["annotations"]["rcoder.io/operation-id"]
+                            !body["metadata"]["annotations"]["rcoder.io/legacy-operation-id"]
                                 .as_str()
                                 .expect("operation")
                                 .is_empty()
                         );
+                        assert!(body["metadata"]["annotations"]["rcoder.io/operation-id"].is_null(), "legacy token must not advertise a joinable durable operation");
+                        assert_eq!(body["metadata"]["labels"]["rcoder.io/operation-app"], "writer-paused");
+                        assert_eq!(body["metadata"]["labels"]["rcoder.io/operation-family"], ServiceType::Userapp.to_string());
                         body["metadata"]["uid"] = "lease-owner".into();
                         body["metadata"]["resourceVersion"] = "42".into();
+                        if request_index == 0 { winner = body.clone(); }
+                    } else if request_index == 2 {
+                        assert!(head.starts_with("GET "));
+                        assert!(head.contains("/configmaps/rcoder-operation-prod-writer-paused"));
+                        assert_eq!(length, 0);
+                        body = winner.clone();
                     } else {
                         assert!(head.starts_with("DELETE "));
                         assert_eq!(body["preconditions"]["uid"], "lease-owner");
@@ -1091,7 +1427,11 @@ mod conditional_tests {
                 runtime
                     .acquire_application_operation("writer-paused", &ServiceType::Userapp)
                     .await,
-                Err(ContainerRuntimeError::Conflict(_))
+                Err(ContainerRuntimeError::OperationInProgress(ref operation))
+                    if operation.app_id == "writer-paused"
+                        && operation.service_type == ServiceType::Userapp
+                        && operation.resource_name == "rcoder-operation-prod-writer-paused"
+                        && operation.operation_id.is_none()
             ));
             if let Some(writer) = writer {
                 let released = writer.release().await;
@@ -1103,6 +1443,7 @@ mod conditional_tests {
             }
             server.await.expect("adapter assertions");
         }
+        }).await.expect("bounded operation lease wire scenario");
     }
 
     /// Real kube client and real generation writer; only the API server is a local
@@ -1233,12 +1574,14 @@ mod conditional_tests {
                 rt.write_app_generation(
                     "app-review",
                     &params,
-                    if create { None } else { Some("42") }
+                    if create { None } else { Some("42") },
+                    None
                 ),
                 rt.write_app_generation(
                     "app-review",
                     &params,
-                    if create { None } else { Some("42") }
+                    if create { None } else { Some("42") },
+                    None
                 )
             )
         })
@@ -1274,5 +1617,89 @@ mod conditional_tests {
             "each writer owns distinct config and secret"
         );
         server.abort();
+    }
+    #[tokio::test]
+    async fn deletion_waits_for_disappearance_and_stops_on_untrusted_observation() {
+        use shared_types::{AppDeletionSnapshot, AppResourceIdentity, AppResourceKind};
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for outcome in ["gone", "query-error", "replacement"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                let address = listener.local_addr().expect("address");
+                let server = tokio::spawn(async move {
+                    let steps = if outcome == "gone" { 5 } else { 3 };
+                    for step in 0..steps {
+                        let (mut stream, _) = listener.accept().await.expect("accept");
+                        let mut bytes = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        let (head, offset, length) = loop {
+                            let count = stream.read(&mut chunk).await.expect("read request");
+                            assert!(count > 0, "incomplete request");
+                            bytes.extend_from_slice(&chunk[..count]);
+                            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                                let length = head.lines().find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("length"))
+                                }).unwrap_or(0);
+                                break (head, end + 4, length);
+                            }
+                        };
+                        while bytes.len() < offset + length {
+                            let count = stream.read(&mut chunk).await.expect("read body");
+                            assert!(count > 0, "incomplete body");
+                            bytes.extend_from_slice(&chunk[..count]);
+                        }
+                        let first = head.lines().next().expect("request line");
+                        let later_resource = step >= 3;
+                        let path = if later_resource { "/api/v1/namespaces/review-test/services/next-service" }
+                            else { "/apis/apps/v1/namespaces/review-test/deployments/original" };
+                        let method = if step == 0 || step == 3 { "DELETE" } else { "GET" };
+                        assert!(first.starts_with(&format!("{method} {path}")), "unexpected request {first}");
+                        let (code, body) = if method == "DELETE" {
+                            let request: serde_json::Value = serde_json::from_slice(&bytes[offset..offset + length]).expect("delete JSON");
+                            assert_eq!(request["preconditions"]["uid"], if later_resource { "service-uid" } else { "original-uid" });
+                            assert_eq!(request["preconditions"]["resourceVersion"], "7");
+                            assert_eq!(request["propagationPolicy"], "Foreground");
+                            (200, serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Success","code":200}))
+                        } else if step == 1 || (step == 2 && outcome == "replacement") {
+                            // First observation is still terminating: another resource
+                            // cannot be deleted before a later authoritative observation.
+                            (200, serde_json::json!({"kind":"Deployment","apiVersion":"apps/v1","metadata": {
+                                "name":"original", "uid": if step == 1 { "original-uid" } else { "replacement-uid" },
+                                "resourceVersion":"8", "deletionTimestamp":"2026-01-01T00:00:00Z"
+                            }}))
+                        } else if step == 2 && outcome == "query-error" {
+                            (503, serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"ServiceUnavailable","message":"injected observation failure","code":503}))
+                        } else {
+                            (404, serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","message":"captured resource absent","code":404}))
+                        };
+                        let body = body.to_string();
+                        let response = format!("HTTP/1.1 {code} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                        stream.write_all(response.as_bytes()).await.expect("response");
+                        stream.shutdown().await.expect("close");
+                    }
+                });
+                drop(rustls::crypto::ring::default_provider().install_default());
+                let config = kube::Config::new(format!("http://{address}").parse().expect("URI"));
+                let runtime = runtime(kube::Client::try_from(config).expect("client"));
+                let snapshot = AppDeletionSnapshot {
+                    app_id: "app".into(), operation_id: "delete-original".into(),
+                    resources: vec![
+                        AppResourceIdentity { kind: AppResourceKind::Deployment, name: "original".into(), uid: "original-uid".into(), resource_version: Some("7".into()) },
+                        AppResourceIdentity { kind: AppResourceKind::Service, name: "next-service".into(), uid: "service-uid".into(), resource_version: Some("7".into()) },
+                    ],
+                };
+                let result = runtime.delete_captured(&snapshot, false).await;
+                match outcome {
+                    "gone" => result.expect("all captured resources confirmed absent"),
+                    "replacement" => assert!(matches!(result, Err(ContainerRuntimeError::Conflict(_)))),
+                    _ => match result {
+                        Err(ContainerRuntimeError::K8sError(message)) => assert!(message.contains("observe captured resource deletion"), "must propagate the failed observation rather than trying another delete: {message}"),
+                        other => panic!("expected observation failure, got {other:?}"),
+                    },
+                }
+                server.await.expect("wire assertions");
+            }
+        }).await.expect("bounded deletion scenarios");
     }
 }

@@ -17,6 +17,14 @@ use shared_types::UserappStage;
 use crate::models::*;
 use crate::utils::*;
 
+/// Keep captured local guards alive through the terminal SQL commit, including
+/// failure commits. Moving execution to a helper must not shorten their lifetime.
+#[derive(Default)]
+pub(crate) struct StorageClearLeases {
+    development: Option<Box<dyn shared_types::UserappDevDeletion>>,
+    directories: Vec<shared_types::storage_contents::StorageDirectoryLease>,
+}
+
 /// app_stage → 卷形态的 ServiceType（K8s PVC label / Docker 目录树都按它分形）。
 fn service_type_of(app_stage: UserappStage) -> ServiceType {
     match app_stage {
@@ -38,8 +46,8 @@ impl crate::service::AppService {
     ) -> AppResult<StorageInfo> {
         validate_app_id(app_id)?;
         let is_orphan = match app_stage {
-            UserappStage::Prod => self.is_storage_orphan(app_id).await,
-            UserappStage::Dev => self.is_dev_storage_orphan(app_id).await,
+            UserappStage::Prod => self.is_storage_orphan(app_id).await?,
+            UserappStage::Dev => self.is_dev_storage_orphan(app_id).await?,
         };
         let (exists, path) = self.storage_path_info(app_stage, app_id).await?;
         let modified_at = if shared_types::is_kubernetes_runtime() {
@@ -87,10 +95,12 @@ impl crate::service::AppService {
             // Docker：workspace_volume_name 返回的是展示标识（通配串，非可 stat
             // 路径）——存在性用元数据 uid 精确定位对应树的 workspace 段。
             let ws_dir = match app_stage {
-                UserappStage::Prod => self.app_prod_dirs(app_id)[0].clone(),
-                UserappStage::Dev => self.app_dev_dirs(app_id)[0].clone(),
+                UserappStage::Prod => self.app_prod_dirs(app_id).await?[0].clone(),
+                UserappStage::Dev => self.app_dev_dirs(app_id).await?[0].clone(),
             };
-            let exists = tokio::fs::metadata(&ws_dir).await.is_ok();
+            let exists = tokio::fs::try_exists(&ws_dir)
+                .await
+                .map_err(|error| map_io_error("inspect application storage", error, true))?;
             Ok((exists, path))
         }
     }
@@ -116,30 +126,37 @@ impl crate::service::AppService {
     /// `{app_id}/ + data/{app_id}/ + logs/{app_id}/ + agent-store/{app_id}/`，bind
     /// 双向同步宿主——Docker 模式 clear 的四目录定位；布局单一事实源
     /// [`shared_types::paths::userapp_prod_subpaths`]）。owner user_id 查元数据，
-    /// 缺失/空白兜底 app_id（与 docker_app_runtime 组装 bind 源的兜底一致）。
-    fn app_prod_dirs(&self, app_id: &str) -> [std::path::PathBuf; 4] {
-        let uid = self.app_owner_uid(app_id);
-        shared_types::paths::userapp_prod_subpaths(&uid, app_id).map(|sub| {
-            std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(sub)
-        })
+    /// Missing ownership is an error; never derive a destructive path from app_id as user_id.
+    async fn app_prod_dirs(&self, app_id: &str) -> AppResult<[std::path::PathBuf; 4]> {
+        let uid = self.app_owner_uid(app_id).await?;
+        Ok(
+            shared_types::paths::userapp_prod_subpaths(&uid, app_id).map(|sub| {
+                std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(sub)
+            }),
+        )
     }
 
     /// per-app dev 四目录的 rcoder 容器内锚点路径（`{锚点}/dev/{user_id}/` 下与
     /// prod 同构四段；布局单一事实源 [`shared_types::paths::userapp_dev_subpaths`]）。
-    fn app_dev_dirs(&self, app_id: &str) -> [std::path::PathBuf; 4] {
-        let uid = self.app_owner_uid(app_id);
-        shared_types::paths::userapp_dev_subpaths(&uid, app_id).map(|sub| {
-            std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(sub)
-        })
+    async fn app_dev_dirs(&self, app_id: &str) -> AppResult<[std::path::PathBuf; 4]> {
+        let uid = self.app_owner_uid(app_id).await?;
+        Ok(
+            shared_types::paths::userapp_dev_subpaths(&uid, app_id).map(|sub| {
+                std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(sub)
+            }),
+        )
     }
 
-    /// app owner user_id（元数据查询；缺失/空白兜底 app_id——与 bind 源组装兜底一致）。
-    fn app_owner_uid(&self, app_id: &str) -> String {
+    /// Resolve the stored owner; missing ownership cannot authorize storage access.
+    async fn app_owner_uid(&self, app_id: &str) -> AppResult<String> {
         self.metadata
             .lookup(app_id)
+            .await?
             .and_then(|r| r.user_id)
             .filter(|u| !u.trim().is_empty())
-            .unwrap_or_else(|| app_id.to_string())
+            .ok_or_else(|| {
+                AppOperationError::InvalidState("Application owner is unavailable".into())
+            })
     }
 
     /// 清空应用持久存储内容（数据语义；卷对象去留按运行时能力与环境语义）。
@@ -155,62 +172,327 @@ impl crate::service::AppService {
         app_id: &str,
         user_id: &str,
     ) -> AppResult<()> {
-        validate_app_id(app_id)?;
-        if app_stage == UserappStage::Dev {
-            let base = self
-                .app_files_base(UserappStage::Dev, app_id, Some(user_id))
-                .await?;
-            let resp = reqwest::Client::new()
-                .post(format!("{base}/api/v1/userapp/app-files/clear"))
-                .timeout(std::time::Duration::from_secs(60))
-                .json(&serde_json::json!({"app_id": app_id, "user_id": user_id}))
+        self.clear_app_storage_controlled(
+            app_stage,
+            app_id,
+            ClearStorageRequest {
+                user_id: user_id.into(),
+                lifecycle_id: None,
+                request_id: None,
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Execute only an already admitted clear under the caller's operation lease.
+    /// Recovery observes an existing builder; it never ensures a builder while
+    /// its own clear operation occupies the application's durable operation slot.
+    pub(crate) async fn execute_storage_clear(
+        &self,
+        app_id: &str,
+        user_id: &str,
+        production: bool,
+        operation: &mut crate::service::OwnedOperation,
+        guard: &crate::service::AppOperationGuard,
+        leases: &mut StorageClearLeases,
+    ) -> AppResult<()> {
+        operation.bind_lease(guard, user_id).await?;
+        let workspace_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .map_err(|error| {
+                AppOperationError::Backend(format!("Create direct workspace client: {error}"))
+            })?;
+        let target = if !production {
+            let mut ticket = self.capture_dev_deletion(app_id).await?;
+            let receipt = ticket.receipt();
+            let context = operation.execution_context(user_id);
+            let endpoint = ticket
+                .workspace_endpoint(&context)
+                .await
+                .map_err(AppOperationError::Backend)?;
+            let base_url = endpoint.base_url();
+            let response = workspace_client
+                .get(format!("{base_url}/api/v1/userapp/app-files/clear-target"))
+                .query(&shared_types::UserAppWorkspaceClearProbe {
+                    app_id: app_id.into(),
+                    user_id: user_id.to_owned(),
+                })
+                .timeout(std::time::Duration::from_secs(10))
                 .send()
                 .await
-                .map_err(|e| {
-                    AppOperationError::Backend(format!(
-                        "forward clear-dev-workspace to dev container (app {app_id}): {e}"
-                    ))
+                .map_err(|error| {
+                    AppOperationError::Backend(format!("Observe workspace clear target: {error}"))
                 })?;
-            let checked =
-                crate::ops::files::check_status(resp, "clear-dev-workspace", app_id).await?;
-            drop(checked);
-            info!(
-                "[APP] dev workspace cleared (container/volume retained): {}",
-                app_id
-            );
-            return Ok(());
-        }
-        self.ensure_app_deleted(app_id, "clearing storage").await?;
-        if shared_types::is_kubernetes_runtime() {
-            self.runtime
-                .destroy_app_pvc(app_id)
+            let response =
+                crate::ops::files::check_status(response, "observe-clear-target", app_id).await?;
+            let target: shared_types::UserAppWorkspaceClearTarget =
+                response.json().await.map_err(|error| {
+                    AppOperationError::Backend(format!("Decode workspace clear target: {error}"))
+                })?;
+            if target.app_id != app_id || target.instance_id.is_empty() {
+                return Err(AppOperationError::Conflict(
+                    "Workspace clear target identity mismatch".into(),
+                ));
+            }
+            // The HTTP probe must be bracketed by uncached observations
+            // of the same physical pod/container, under the builder lease.
+            if ticket
+                .workspace_endpoint(&context)
                 .await
-                .map_err(|e| map_runtime_error("destroy_app_pvc (clear storage) failed", e))?;
-            info!(
-                "[APP] app storage cleared (PVC removed, recreated empty on next create): {}",
-                app_id
-            );
-            return Ok(());
-        }
-        // prod 四目录（workspace 发布制品 + PG/dbx 数据 + 日志 + agent-store）：
-        // "清空持久存储"语义的主体；owner 查元数据（元数据行在 clear 场景恒保留），
-        // 缺失兜底 app_id（与 bind 源组装的兜底一致）。
-        for dir in self.app_prod_dirs(app_id) {
-            if tokio::fs::try_exists(&dir).await.unwrap_or(false)
-                && let Err(e) = Self::purge_dir_contents(&dir).await
+                .map_err(AppOperationError::Backend)?
+                != endpoint
             {
-                return Err(map_io_error("failed to clear app storage", e, false));
+                return Err(AppOperationError::Conflict(
+                    "Builder endpoint changed during workspace target observation".into(),
+                ));
+            }
+            leases.development = Some(ticket);
+            shared_types::UserAppStorageClearTarget::Development {
+                base_url,
+                instance_id: target.instance_id,
+                endpoint,
+                receipt: Box::new(receipt),
+            }
+        } else {
+            self.ensure_app_deleted(app_id, "clearing storage").await?;
+            let snapshot = self
+                .runtime
+                .capture_app_deletion(app_id, None)
+                .await
+                .map_err(|error| map_runtime_error("Capture storage clear resources", error))?;
+            if self.config.access_mode == crate::config::AppAccessMode::Docker {
+                for path in self.app_prod_dirs(app_id).await? {
+                    leases.directories.push(
+                        shared_types::storage_contents::StorageDirectoryLease::capture(&path)
+                            .await
+                            .map_err(|error| {
+                                map_io_error("Capture storage directory", error, false)
+                            })?,
+                    );
+                }
+            }
+            let directories = leases
+                .directories
+                .iter()
+                .map(|lease| lease.receipt.clone())
+                .collect();
+            shared_types::UserAppStorageClearTarget::Production {
+                snapshot,
+                directories,
+            }
+        };
+        let evidence = shared_types::UserAppStorageClear {
+            context: operation.execution_context(user_id),
+            target,
+        };
+        evidence.validate().map_err(AppOperationError::Conflict)?;
+        let checkpoint = serde_json::to_value(&evidence).map_err(|error| {
+            AppOperationError::Backend(format!("Encode storage clear target: {error}"))
+        })?;
+        operation
+            .checkpoint("clear_target_captured", checkpoint.clone())
+            .await?;
+        match &evidence.target {
+            shared_types::UserAppStorageClearTarget::Development {
+                base_url,
+                instance_id,
+                ..
+            } => {
+                let ticket = leases.development.as_mut().ok_or_else(|| {
+                    AppOperationError::Backend("Captured builder lease is unavailable".into())
+                })?;
+                ticket
+                    .begin_external_mutation()
+                    .map_err(AppOperationError::Backend)?;
+                guard.mark_mutating()?;
+                let response = workspace_client
+                    .post(format!("{base_url}/api/v1/userapp/app-files/clear"))
+                    .timeout(std::time::Duration::from_secs(120))
+                    .json(&shared_types::UserAppWorkspaceClearRequest {
+                        app_id: app_id.into(),
+                        user_id: user_id.to_owned(),
+                        expected_instance_id: instance_id.clone(),
+                    })
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        AppOperationError::Backend(format!("Clear development workspace: {error}"))
+                    })?;
+                let response =
+                    crate::ops::files::check_status(response, "clear-dev-workspace", app_id)
+                        .await?;
+                let result: shared_types::UserAppWorkspaceClearResult =
+                    response.json().await.map_err(|error| {
+                        AppOperationError::Backend(format!(
+                            "Decode workspace clear result: {error}"
+                        ))
+                    })?;
+                if !result.confirms(instance_id) {
+                    return Err(AppOperationError::Backend(
+                        "Workspace clear did not confirm success".into(),
+                    ));
+                }
+                ticket
+                    .finish_external_mutation()
+                    .await
+                    .map_err(AppOperationError::Backend)?;
+            }
+            shared_types::UserAppStorageClearTarget::Production {
+                snapshot,
+                directories,
+            } => {
+                self.ensure_app_deleted(app_id, "clearing captured storage")
+                    .await?;
+                if self.config.access_mode == crate::config::AppAccessMode::Docker {
+                    if leases
+                        .directories
+                        .iter()
+                        .map(|lease| &lease.receipt)
+                        .ne(directories.iter())
+                    {
+                        return Err(AppOperationError::Conflict(
+                            "Storage directory leases differ from captured evidence".into(),
+                        ));
+                    }
+                    for directory in &leases.directories {
+                        directory.validate_current().await.map_err(|error| {
+                            map_io_error("Validate captured storage directory", error, false)
+                        })?;
+                    }
+                }
+                guard.mark_mutating()?;
+                if self.config.access_mode == crate::config::AppAccessMode::Kubernetes {
+                    self.runtime
+                        .destroy_app_storage_snapshot(snapshot)
+                        .await
+                        .map_err(|error| map_runtime_error("Clear captured storage", error))?;
+                } else {
+                    for directory in &leases.directories {
+                        directory.clear().await.map_err(|error| {
+                            map_io_error("Clear captured storage directory", error, false)
+                        })?;
+                    }
+                }
             }
         }
-        info!("[APP] app storage cleared: {}", app_id);
-        Ok(())
+        operation
+            .checkpoint("storage_contents_cleared", checkpoint)
+            .await?;
+        Ok::<(), AppOperationError>(())
+    }
+
+    pub async fn clear_app_storage_controlled(
+        &self,
+        app_stage: UserappStage,
+        app_id: &str,
+        request: ClearStorageRequest,
+    ) -> AppResult<String> {
+        use garde::Validate as _;
+        use sha2::Digest as _;
+        validate_app_id(app_id)?;
+        request
+            .validate()
+            .map_err(|error| AppOperationError::Validation(error.to_string()))?;
+        let guard = self.acquire_process_release_lock(app_id).await?;
+        let result = async {
+            self.metadata
+                .validate_request_lifecycle(
+                    app_id,
+                    &request.user_id,
+                    request.lifecycle_id.as_deref(),
+                )
+                .await?;
+            self.get_lifecycle(app_id, &request.user_id).await?;
+            let kind = match app_stage {
+                UserappStage::Dev => shared_types::UserAppOperationKind::ClearDevStorage,
+                UserappStage::Prod => shared_types::UserAppOperationKind::ClearProdStorage,
+            };
+            let fingerprint = hex::encode(sha2::Sha256::digest(
+                shared_types::encode_userapp_intent(
+                    &serde_json::json!({"stage":app_stage.as_str(), "request":request}),
+                )
+                .map_err(|error| {
+                    AppOperationError::Backend(format!("Encode storage clear intent: {error}"))
+                })?,
+            ));
+            let control = shared_types::UserAppControlRequest {
+                user_id: request.user_id.clone(),
+                lifecycle_id: request.lifecycle_id.clone(),
+                request_id: request.request_id.clone(),
+            };
+            if let Some(existing) = self
+                .replay_control(app_id, &control, kind, &fingerprint)
+                .await?
+            {
+                return Ok(existing.operation_id);
+            }
+            // Ensure must finish before admitting clear: builder ensure has its
+            // own durable operation and must not wait on the clear it is serving.
+            if app_stage == UserappStage::Dev {
+                self.app_files_base(app_stage, app_id, Some(&request.user_id))
+                    .await?;
+            }
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let mut operation = crate::service::OwnedOperation::admit(
+                self.metadata.store.clone(),
+                shared_types::UserAppAdmission {
+                    runtime_policy_on_success: None,
+                    metadata: None,
+                    command: Some(shared_types::UserAppControlCommand::ClearStorage {
+                        production: app_stage == UserappStage::Prod,
+                    }),
+                    kind,
+                    app_id: app_id.into(),
+                    user_id: request.user_id.clone(),
+                    lifecycle_id: request.lifecycle_id,
+                    request_id: request.request_id,
+                    operation_id: operation_id.clone(),
+                    request_fingerprint: fingerprint,
+                },
+            )
+            .await?;
+            let mut clear_leases = StorageClearLeases::default();
+            let mutation = self
+                .execute_storage_clear(
+                    app_id,
+                    &request.user_id,
+                    app_stage == UserappStage::Prod,
+                    &mut operation,
+                    &guard,
+                    &mut clear_leases,
+                )
+                .await;
+            match mutation {
+                Ok(()) => {
+                    operation.succeed().await?;
+                    guard.mark_completed();
+                    Ok(operation_id)
+                }
+                Err(error) => {
+                    if guard.has_unfinished_mutation() {
+                        operation.fail(&error).await?;
+                    } else {
+                        operation.reject_without_mutation(&error).await?;
+                    }
+                    Err(error)
+                }
+            }
+        }
+        .await;
+        if result.is_ok() || !guard.has_unfinished_mutation() {
+            guard.finish().await?;
+        }
+        result
     }
 
     /// 销毁应用持久存储 PVC（高危·不可逆·释放配额）。
     ///
     /// - `prod`：安全约束 ① 仅当 app 计算资源已不存在（已 delete）时允许（否则
     ///   INVALID_STATE）；② body `confirm` 必须等于 app_id。K8s 删 PVC 对象，
-    ///   Docker 等价删 bind 目录；元数据行同步删除（三档删除语义的第三档）。
+    ///   Docker 等价删 bind 目录；保留应用生命周期和元数据。
     /// - `dev`：销毁**整个开发环境** = UserappDevCleanup 四步回收（builder 容器 +
     ///   dev PVC + Docker dev 目录 + 摘注册/探活缓存）；**不动 metadata**（owner
     ///   保留——create-workspace 幂等重建开发环境）。幂等：资源不存在视为成功。
@@ -221,66 +503,174 @@ impl crate::service::AppService {
         user_id: &str,
         confirm: &str,
     ) -> AppResult<()> {
-        if app_stage == UserappStage::Dev {
-            validate_app_id(app_id)?;
-            if confirm != app_id {
-                return Err(AppOperationError::Validation(format!(
-                    "confirm must equal app_id for destroy (high-risk op): got confirm='{confirm}'"
-                )));
-            }
-            // 显式 dev destroy 必须确定性执行：
-            // 未注入即硬错，不静默跳过
-            let cleanup = self
-                .dev_cleanup
-                .read()
-                .expect("dev_cleanup lock")
-                .clone()
-                .ok_or_else(|| {
-                    AppOperationError::Backend("userapp dev cleanup not injected".to_string())
-                })?;
-            cleanup.cleanup(app_id).await.map_err(|e| {
-                AppOperationError::Backend(format!(
-                    "destroy userapp dev resources (app {app_id}): {e}"
-                ))
-            })?;
-            info!(
-                "[APP] userapp dev environment destroyed (metadata retained): {}",
-                app_id
-            );
-            return Ok(());
-        }
+        self.destroy_app_storage_controlled(
+            app_stage,
+            app_id,
+            DestroyStorageRequest {
+                user_id: user_id.into(),
+                confirm: confirm.into(),
+                lifecycle_id: None,
+                request_id: None,
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn destroy_app_storage_controlled(
+        &self,
+        app_stage: UserappStage,
+        app_id: &str,
+        request: DestroyStorageRequest,
+    ) -> AppResult<String> {
+        use garde::Validate as _;
+        use sha2::Digest as _;
         validate_app_id(app_id)?;
-        if confirm != app_id {
+        request
+            .validate()
+            .map_err(|error| AppOperationError::Validation(error.to_string()))?;
+        if request.confirm != app_id {
             return Err(AppOperationError::Validation(
                 "confirm must equal app_id for destroy".into(),
             ));
         }
-        let _release_lock = self.acquire_process_release_lock(app_id).await?;
-        self.ensure_app_deleted(app_id, "destroying PVC").await?;
-        let metadata_generation =
+        let guard = self.acquire_process_release_lock(app_id).await?;
+        let result = async {
             self.metadata
-                .deletion_generation(app_id)
-                .await
+                .validate_request_lifecycle(
+                    app_id,
+                    &request.user_id,
+                    request.lifecycle_id.as_deref(),
+                )
+                .await?;
+            self.get_lifecycle(app_id, &request.user_id).await?;
+            let production = app_stage == UserappStage::Prod;
+            let command = shared_types::UserAppControlCommand::DestroyStorage { production };
+            let fingerprint = hex::encode(sha2::Sha256::digest(
+                shared_types::encode_userapp_intent(
+                    &serde_json::json!({"stage":app_stage.as_str(), "request":request}),
+                )
                 .map_err(|error| {
-                    AppOperationError::Backend(format!("capture metadata deletion: {error}"))
-                })?;
-        let dev_deletion = self.capture_dev_deletion(app_id).await?;
-        _release_lock.mark_mutating()?;
-        self.destroy_app_storage_keep_metadata(app_id, confirm, None, dev_deletion)
+                    AppOperationError::Backend(format!(
+                        "Encode storage destruction intent: {error}"
+                    ))
+                })?,
+            ));
+            let control = shared_types::UserAppControlRequest {
+                user_id: request.user_id.clone(),
+                lifecycle_id: request.lifecycle_id.clone(),
+                request_id: request.request_id.clone(),
+            };
+            if let Some(existing) = self
+                .replay_control(app_id, &control, command.kind(), &fingerprint)
+                .await?
+            {
+                return Ok(existing.operation_id);
+            }
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let mut operation = crate::service::OwnedOperation::admit(
+                self.metadata.store.clone(),
+                shared_types::UserAppAdmission {
+                    runtime_policy_on_success: None,
+                    metadata: None,
+                    kind: command.kind(),
+                    command: Some(command),
+                    app_id: app_id.into(),
+                    user_id: request.user_id.clone(),
+                    lifecycle_id: request.lifecycle_id,
+                    request_id: request.request_id,
+                    operation_id: operation_id.clone(),
+                    request_fingerprint: fingerprint,
+                },
+            )
             .await?;
-        // 独立 storage/destroy 接口：与 PVC 同生命周期，元数据行同步删除
-        // （三档删除语义的第三档）。
-        self.metadata
-            .record_deleted(app_id, metadata_generation.as_deref())
-            .await
-            .map_err(|error| {
-                AppOperationError::Conflict(format!("metadata cleanup not committed: {error}"))
-            })?;
-        // user_id 卷分区定位：Docker 下宿主目录定位由 destroy_app_pvc 的
-        // prod/*/ 通配扫描兜底（正确性不依赖 metadata），显式值用于对账与
-        // 未来精确直删。
-        info!("[APP] app PVC destroyed: {} (user_id={})", app_id, user_id);
-        _release_lock.finish().await?;
+            match self
+                .execute_storage_destruction(
+                    app_id,
+                    &request.user_id,
+                    production,
+                    &mut operation,
+                    &guard,
+                )
+                .await
+            {
+                Ok(()) => {
+                    operation.succeed().await?;
+                    guard.mark_completed();
+                    self.invalidate_deploy_cache().await;
+                    Ok(operation_id)
+                }
+                Err(error) => {
+                    if guard.has_unfinished_mutation() {
+                        operation.fail(&error).await?;
+                    } else {
+                        operation.reject_without_mutation(&error).await?;
+                    }
+                    Err(error)
+                }
+            }
+        }
+        .await;
+        if result.is_ok() || !guard.has_unfinished_mutation() {
+            guard.finish().await?;
+        }
+        result
+    }
+
+    pub(crate) async fn execute_storage_destruction(
+        &self,
+        app_id: &str,
+        owner: &str,
+        production: bool,
+        operation: &mut crate::service::OwnedOperation,
+        guard: &crate::service::AppOperationGuard,
+    ) -> AppResult<()> {
+        operation.bind_lease(guard, owner).await?;
+        if production {
+            self.ensure_app_deleted(app_id, "destroying captured storage")
+                .await?;
+        }
+        let development = self.capture_dev_deletion(app_id).await?;
+        let snapshot = if production {
+            Some(
+                self.runtime
+                    .capture_app_deletion(app_id, None)
+                    .await
+                    .map_err(|error| map_runtime_error("Capture storage destruction", error))?,
+            )
+        } else {
+            None
+        };
+        let evidence = shared_types::UserAppStorageDestruction {
+            context: operation.execution_context(owner),
+            production: snapshot,
+            development: development.receipt(),
+        };
+        evidence.validate().map_err(AppOperationError::Conflict)?;
+        let checkpoint = serde_json::to_value(&evidence).map_err(|error| {
+            AppOperationError::Backend(format!("Encode storage destruction checkpoint: {error}"))
+        })?;
+        operation
+            .checkpoint("storage_captured", checkpoint.clone())
+            .await?;
+        guard.mark_mutating()?;
+        if let Some(snapshot) = &evidence.production {
+            self.ensure_app_deleted(app_id, "destroying captured storage")
+                .await?;
+            self.runtime
+                .destroy_app_storage_snapshot(snapshot)
+                .await
+                .map_err(|error| map_runtime_error("Destroy captured storage", error))?;
+            operation
+                .checkpoint("production_storage_removed", checkpoint.clone())
+                .await?;
+        }
+        development.cleanup().await.map_err(|error| {
+            AppOperationError::Backend(format!("Destroy captured development storage: {error}"))
+        })?;
+        operation
+            .checkpoint("development_storage_removed", checkpoint)
+            .await?;
         Ok(())
     }
 
@@ -294,84 +684,167 @@ impl crate::service::AppService {
             .map_err(|_| AppOperationError::Backend("dev cleanup lock poisoned".into()))?
             .clone()
             .ok_or_else(|| AppOperationError::Backend("userapp dev cleanup not injected".into()))?;
-        cleanup.capture(app_id).await.map_err(|error| {
+        let deletion = cleanup.capture(app_id).await.map_err(|error| {
             AppOperationError::Backend(format!("capture userapp dev deletion: {error}"))
-        })
+        })?;
+        let receipt = deletion.receipt();
+        if receipt.runtime.app_id != app_id {
+            return Err(AppOperationError::Conflict(
+                "Captured development deletion belongs to another application".into(),
+            ));
+        }
+        Ok(deletion)
     }
 
     /// 销毁持久存储但**保留业务元数据行**（delete_app 的 purge 分支专用）。
     ///
-    /// 三档删除语义：delete/purge 保留行（误删找回——重建同 ID 应用后 name/created_at
-    /// 仍在），仅独立的 storage/destroy 接口（[`Self::destroy_app_storage`]）删行。
-    /// 此前 purge 直接复用 destroy_app_storage 把行也删了，违反契约。
-    pub(crate) async fn destroy_app_storage_keep_metadata(
-        &self,
-        app_id: &str,
-        confirm: &str,
-        captured: Option<&shared_types::AppDeletionSnapshot>,
-        dev_deletion: Box<dyn shared_types::UserappDevDeletion>,
-    ) -> AppResult<()> {
-        validate_app_id(app_id)?;
-        if confirm != app_id {
-            return Err(AppOperationError::Validation(format!(
-                "confirm must equal app_id for destroy (high-risk op): got confirm='{confirm}'"
-            )));
-        }
-        self.ensure_app_deleted(app_id, "destroying PVC").await?;
-        // K8s：删单卷 PVC（destroy 内兜底回收存量 `-data` PVC）。
-        // Docker：destroy_app_pvc 删 prod 树该 app 四目录（通配 prod/*/ 一层，
-        // 与 dev cleanup 同款模式）+ 旧 RCODER_WORKSPACE_ROOT 制品目录兜底——
-        // 双形态"删持久卷"语义在此收口，本层不再单独删目录（防双删漂移）。
-        // 失败不吞：destroy 是显式高危操作（confirm=app_id），残留即孤儿；
-        // 失败时外层 record_deleted 未执行，幂等重试收敛。
-        let snapshot = match captured {
-            Some(snapshot) => snapshot.clone(),
-            None => self
-                .runtime
-                .capture_app_deletion(app_id, None)
-                .await
-                .map_err(|e| map_runtime_error("capture app storage deletion", e))?,
-        };
-        self.runtime
-            .destroy_app_storage_snapshot(&snapshot)
-            .await
-            .map_err(|e| map_runtime_error("destroy_app_pvc failed", e))?;
-        dev_deletion.cleanup().await.map_err(|error| {
-            AppOperationError::Backend(format!("destroy captured userapp dev resources: {error}"))
-        })?;
-        info!("[APP] app PVC destroyed (metadata retained): {}", app_id);
-        Ok(())
+    /// Production purge and standalone storage destruction retain identity.
+    /// Only full delete/app terminates the durable application lifecycle.
+    /// Full deletion ends the lifecycle only after all captured resources are removed.
+    /// A failed or cancelled execution retains its durable operation for recovery.
+    pub async fn purge_app(&self, app_id: &str) -> AppResult<()> {
+        let app = self
+            .metadata
+            .store
+            .get_application(app_id)
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
+            })?;
+        self.purge_app_controlled(
+            app_id,
+            shared_types::UserAppControlRequest {
+                user_id: app.user_id,
+                lifecycle_id: None,
+                request_id: None,
+            },
+        )
+        .await
     }
 
-    /// 彻底删除应用（永久删除·不可逆·幂等）：只给 app_id，一步收敛
-    /// ① prod 计算面 + ② prod PVC/目录 + ③ dev 开发环境 + ④ 元数据行。
-    ///
-    /// 与三档删除语义的关系：等效 `{app_id}/prod/delete`(purge=true) →
-    /// `{app_id}/prod/storage/destroy`（删行）→ `{app_id}/dev/storage/destroy`
-    /// 的串接，供调用方（Java）"部分 app 需彻底删除"一步调用；无 confirm
-    /// （与用户的确认由调用方负责）。幂等：app 不存在 = 其余步骤照做并成功
-    /// （重入收敛）；状态查询失败透传（不当作"不存在"——对齐
-    /// fetch_runtime_status_or_err 的两态分类）。dev 回收确定性执行（未注入
-    /// 硬错、失败透传）——本接口
-    /// 契约是"彻底删除"，静默跳过 dev 会让成功响应与实际状态不一致。
-    pub async fn purge_app(&self, app_id: &str) -> AppResult<()> {
+    pub async fn purge_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<()> {
         validate_app_id(app_id)?;
+        let release_lock = self.acquire_process_release_lock(app_id).await?;
+        let result = self
+            .purge_app_admitted(app_id, request, &release_lock)
+            .await;
+        if result.is_ok() || !release_lock.has_unfinished_mutation() {
+            release_lock.finish().await?;
+        }
+        result
+    }
+
+    async fn purge_app_admitted(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+        release_lock: &crate::service::AppOperationGuard,
+    ) -> AppResult<()> {
+        // Read identity after acquiring the operation guard; a previous lifecycle
+        // must never authorize deleting resources created while this caller waited.
+        let app = self.get_lifecycle(app_id, &request.user_id).await?;
+        if request
+            .lifecycle_id
+            .as_ref()
+            .is_some_and(|id| id != &app.lifecycle_id)
+            || (app.lifecycle_epoch > 1 && request.lifecycle_id.is_none())
+        {
+            return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+        }
+        use sha2::Digest as _;
+        let fingerprint = hex::encode(sha2::Sha256::digest(
+            shared_types::encode_userapp_intent(&request).map_err(|error| {
+                AppOperationError::Backend(format!("Encode application deletion intent: {error}"))
+            })?,
+        ));
+        if self
+            .replay_control(
+                app_id,
+                &request,
+                shared_types::UserAppOperationKind::DeleteApplication,
+                &fingerprint,
+            )
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if app.state == shared_types::UserAppLifecycleState::Deleted {
+            return Ok(());
+        }
+        let mut operation = crate::service::OwnedOperation::admit(
+            self.metadata.store.clone(),
+            shared_types::UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: Some(shared_types::UserAppControlCommand::DeleteApplication),
+                metadata: None,
+                app_id: app_id.into(),
+                user_id: app.user_id,
+                lifecycle_id: Some(app.lifecycle_id),
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                request_id: request.request_id,
+                request_fingerprint: fingerprint,
+                kind: shared_types::UserAppOperationKind::DeleteApplication,
+            },
+        )
+        .await?;
+        match self
+            .purge_app_resources(app_id, &request.user_id, &mut operation, release_lock)
+            .await
+        {
+            Ok(()) => {
+                operation.succeed().await?;
+                release_lock.mark_completed();
+                self.activity.forget_app(app_id);
+                self.invalidate_deploy_cache().await;
+                Ok(())
+            }
+            Err(error) => {
+                operation.fail(&error).await.map_err(|persist| AppOperationError::Backend(
+                    format!("Application deletion failed: {error}; recording failure also failed: {persist}")
+                ))?;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn purge_app_resources(
+        &self,
+        app_id: &str,
+        owner: &str,
+        operation: &mut crate::service::OwnedOperation,
+        release_lock: &crate::service::AppOperationGuard,
+    ) -> AppResult<()> {
+        operation.bind_lease(release_lock, owner).await?;
         // 与发布链（prepare/activate/confirm/delete-release）及 create/update/delete
         // 串行：purge 全程删计算+存储，不能与写版本包/切 code 并发。
-        let release_lock = self.acquire_process_release_lock(app_id).await?;
         let dev_deletion = self.capture_dev_deletion(app_id).await?;
-        let metadata_generation =
-            self.metadata
-                .deletion_generation(app_id)
-                .await
-                .map_err(|error| {
-                    AppOperationError::Backend(format!("capture purge metadata: {error}"))
-                })?;
         let snapshot = self
             .runtime
             .capture_app_deletion(app_id, None)
             .await
             .map_err(|e| map_runtime_error("capture purge resources", e))?;
+        let mut checkpoint = shared_types::UserAppDeletionCheckpoint {
+            stage: shared_types::UserAppDeletionStage::Captured,
+            schema_version: 1,
+            context: operation.execution_context(owner),
+            kind: shared_types::UserAppOperationKind::DeleteApplication,
+            production: snapshot.clone(),
+            development: Some(dev_deletion.receipt()),
+        };
+        checkpoint.validate().map_err(AppOperationError::Conflict)?;
+        operation
+            .checkpoint(
+                "resources_captured",
+                serde_json::to_value(&checkpoint).map_err(|error| {
+                    AppOperationError::Backend(format!("Encode deletion checkpoint: {error}"))
+                })?,
+            )
+            .await?;
         // 1. prod 计算面：存在才拆（防护序列 + 失败对称恢复见 tear_down_compute_plane）
         match self.runtime.get_deployment_status(app_id).await {
             Ok(Some(previous)) => {
@@ -379,10 +852,26 @@ impl crate::service::AppService {
                 self.tear_down_compute_plane(app_id, &previous, &snapshot)
                     .await?
             }
-            Ok(None) => info!(
-                "[APP] purge: compute plane already absent (idempotent skip): {}",
-                app_id
-            ),
+            Ok(None) => {
+                if snapshot.resources.iter().any(|resource| {
+                    resource.kind != shared_types::AppResourceKind::PersistentVolumeClaim
+                }) {
+                    release_lock.mark_mutating()?;
+                    self.tear_down_compute_plane(
+                        app_id,
+                        &container_runtime_api::DeploymentStatus {
+                            app_id: app_id.into(),
+                            ..Default::default()
+                        },
+                        &snapshot,
+                    )
+                    .await?;
+                }
+                info!(
+                    "[APP] purge: captured compute resources are absent: {}",
+                    app_id
+                );
+            }
             Err(e) => {
                 warn!(
                     "[APP] purge: query app status failed app_id={}: {}",
@@ -393,58 +882,53 @@ impl crate::service::AppService {
                 )));
             }
         }
-        // 2. prod 持久存储（K8s: 删 PVC + Ceph subvolume + 存量 -data 兜底；Docker:
-        //    通配 prod/*/ 删该 app 四目录 + 旧布局兜底——双形态在 destroy_app_pvc
-        //    收口，幂等）
+        operation
+            .deletion_progress(
+                &mut checkpoint,
+                shared_types::UserAppDeletionStage::ComputeRemoved,
+            )
+            .await?;
         release_lock.mark_mutating()?;
-        self.runtime
-            .destroy_app_storage_snapshot(&snapshot)
-            .await
-            .map_err(|e| {
-                map_runtime_error(&format!("[APP] destroy_app_pvc failed app_id={app_id}"), e)
-            })?;
-        // 3. dev 开发环境（builder 容器 + dev PVC + Docker dev 目录 + 注册/探活
-        //    摘除，UserappDevCleanup 四步）：确定性执行——未注入硬错，失败透传
-        dev_deletion.cleanup().await.map_err(|error| {
-            AppOperationError::Backend(format!("destroy captured userapp dev resources: {error}"))
-        })?;
-        // 4. Metadata cleanup is conditional on the captured generation; failures remain visible.
-        self.metadata
-            .record_deleted(app_id, metadata_generation.as_deref())
-            .await
-            .map_err(|error| {
-                AppOperationError::Conflict(format!(
-                    "purge metadata cleanup not committed: {error}"
-                ))
-            })?;
-        release_lock.finish().await?;
-        self.remove_unused_process_release_lock(app_id);
-        self.invalidate_deploy_cache().await;
-        info!(
-            "[APP] app purged everywhere (compute + prod storage + dev env + metadata): {}",
-            app_id
-        );
+        self.finish_captured_purge(app_id, operation, &mut checkpoint, dev_deletion)
+            .await?;
+        // Keep the file/runtime lease until the durable terminal record commits.
         Ok(())
     }
 
-    /// 清空目录内容 (逐子项 remove), 保留目录本身（Docker 模式专用）。
-    pub(super) async fn purge_dir_contents(dir: &std::path::Path) -> std::io::Result<()> {
-        let mut rd = tokio::fs::read_dir(dir).await?;
-        while let Some(entry) = rd.next_entry().await? {
-            let p = entry.path();
-            // metadata 而非 entry.file_type()：前者跟随符号链接，与 Path::is_dir 语义
-            // 一致（链接指向目录时仍走 remove_dir_all 分支）；后者用 d_type 不跟随，
-            // 会把这类条目误判成文件。
-            if tokio::fs::metadata(&p)
-                .await
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
-            {
-                tokio::fs::remove_dir_all(&p).await?;
-            } else {
-                tokio::fs::remove_file(&p).await?;
-            }
+    /// Both purge entry points retain the captured targets through every stage.
+    pub(crate) async fn finish_captured_purge(
+        &self,
+        app_id: &str,
+        operation: &mut crate::service::OwnedOperation,
+        checkpoint: &mut shared_types::UserAppDeletionCheckpoint,
+        dev_deletion: Box<dyn shared_types::UserappDevDeletion>,
+    ) -> AppResult<()> {
+        if checkpoint.development.as_ref() != Some(&dev_deletion.receipt()) {
+            return Err(AppOperationError::Conflict(
+                "Development deletion ticket changed after capture".into(),
+            ));
         }
+        self.ensure_app_deleted(app_id, "destroying captured storage")
+            .await?;
+        self.runtime
+            .destroy_app_storage_snapshot(&checkpoint.production)
+            .await
+            .map_err(|error| map_runtime_error("Destroy captured production storage", error))?;
+        operation
+            .deletion_progress(
+                checkpoint,
+                shared_types::UserAppDeletionStage::ProductionStorageRemoved,
+            )
+            .await?;
+        dev_deletion.cleanup().await.map_err(|error| {
+            AppOperationError::Backend(format!("destroy captured userapp dev resources: {error}"))
+        })?;
+        operation
+            .deletion_progress(
+                checkpoint,
+                shared_types::UserAppDeletionStage::DevelopmentRemoved,
+            )
+            .await?;
         Ok(())
     }
 
@@ -471,18 +955,14 @@ impl crate::service::AppService {
             ));
         }
         let filters = request.filters.unwrap_or_default();
-        if filters.tenant_id.is_some() || filters.space_id.is_some() {
-            warn!(
-                "[APP] query_storage tenant_id/space_id filters not supported in stateless mode (rcoder holds no app→tenant mapping), ignored"
-            );
-        }
+        let metadata = self.metadata.snapshot().await?;
         let service_type = service_type_of(app_stage);
         // dev 逐项 alive 探测通道（仅 Dev 使用；未注入时保守判"在"→非 orphan）
         let dev_locator = if app_stage == UserappStage::Dev {
             Some(
                 self.dev_locator
                     .read()
-                    .expect("dev_locator lock")
+                    .map_err(|_| AppOperationError::Backend("Dev locator lock poisoned".into()))?
                     .clone()
                     .ok_or_else(|| {
                         AppOperationError::Backend("dev container locator not injected".to_string())
@@ -526,20 +1006,33 @@ impl crate::service::AppService {
         async fn dev_alive(
             locator: &Option<std::sync::Arc<dyn shared_types::UserappDevLocator>>,
             app_id: &str,
-        ) -> bool {
-            match locator {
-                Some(locator) => matches!(locator.dev_container_alive(app_id).await, Ok(true)),
-                None => {
-                    warn!(
-                        "[APP] query_storage dev alive probe unavailable, conservatively treating as non-orphan: app_id={app_id}"
-                    );
-                    true
-                }
-            }
+        ) -> AppResult<bool> {
+            let locator = locator.as_ref().ok_or_else(|| {
+                AppOperationError::Backend("Dev locator is not configured".into())
+            })?;
+            locator
+                .dev_container_alive(app_id)
+                .await
+                .map_err(AppOperationError::Backend)
         }
         let filtered: Vec<String> = entries
             .into_iter()
             .filter(|app_id| {
+                let Some(owner) = metadata.get(app_id) else {
+                    return false;
+                };
+                if owner.user_id.as_deref() != Some(request.user_id.as_str())
+                    || filters
+                        .tenant_id
+                        .as_ref()
+                        .is_some_and(|tenant| owner.tenant_id.as_ref() != Some(tenant))
+                    || filters
+                        .space_id
+                        .as_ref()
+                        .is_some_and(|space| owner.space_id.as_ref() != Some(space))
+                {
+                    return false;
+                }
                 if let Some(ids) = app_ids_filter
                     && !ids.iter().any(|x| x == app_id)
                 {
@@ -555,7 +1048,7 @@ impl crate::service::AppService {
                 let is_orphan = if app_stage == UserappStage::Prod {
                     !existing.contains(&app_id)
                 } else {
-                    !dev_alive(&dev_locator, &app_id).await
+                    !dev_alive(&dev_locator, &app_id).await?
                 };
                 if is_orphan {
                     kept.push(app_id);
@@ -576,19 +1069,9 @@ impl crate::service::AppService {
             let is_orphan = if app_stage == UserappStage::Prod {
                 !existing.contains(&app_id)
             } else {
-                !dev_alive(&dev_locator, &app_id).await
+                !dev_alive(&dev_locator, &app_id).await?
             };
-            // 单项标识解析失败（瞬时 K8s API 抖动）不中断整个列表：warn + 标记 not exist
-            let (exists, path) = match self.storage_path_info(app_stage, &app_id).await {
-                Ok(ok) => ok,
-                Err(e) => {
-                    warn!(
-                        "[APP] list storage resolve {} failed, mark not exist: {}",
-                        app_id, e
-                    );
-                    (false, std::path::PathBuf::new())
-                }
-            };
+            let (exists, path) = self.storage_path_info(app_stage, &app_id).await?;
             let modified_at = if shared_types::is_kubernetes_runtime() {
                 None
             } else {
@@ -622,42 +1105,27 @@ impl crate::service::AppService {
         })
     }
 
-    /// 存储是否为孤儿（无对应运行应用）。Ok(None)=orphan；Ok(Some)/Err=非孤儿（保守）。
-    pub(super) async fn is_storage_orphan(&self, app_id: &str) -> bool {
-        match self.runtime.get_deployment_status(app_id).await {
-            Ok(None) => true,
-            Ok(Some(_)) => false,
-            Err(e) => {
-                // 瞬时 API 错误保守视为"非 orphan"（避免误删在用数据），但落日志可见
-                warn!(
-                    "[APP] is_storage_orphan query status failed app_id={}: {}",
-                    app_id, e
-                );
-                false
-            }
-        }
+    /// Only a successful runtime query can establish absence.
+    pub(super) async fn is_storage_orphan(&self, app_id: &str) -> AppResult<bool> {
+        Ok(self
+            .runtime
+            .get_deployment_status(app_id)
+            .await
+            .map_err(|error| map_runtime_error("query storage compute ownership", error))?
+            .is_none())
     }
 
-    /// dev 卷是否为孤儿（dev 卷/目录在而 builder 容器不在）。探测失败保守判非孤儿
-    /// （与 prod 语义对齐——避免误删在用开发环境）。
-    async fn is_dev_storage_orphan(&self, app_id: &str) -> bool {
-        let Some(locator) = self.dev_locator.read().expect("dev_locator lock").clone() else {
-            warn!(
-                "[APP] is_dev_storage_orphan locator not injected, conservatively non-orphan: app_id={app_id}"
-            );
-            return false;
-        };
-        match locator.dev_container_alive(app_id).await {
-            Ok(false) => true,
-            Ok(true) => false,
-            Err(e) => {
-                warn!(
-                    "[APP] is_dev_storage_orphan probe failed app_id={}: {} (conservatively non-orphan)",
-                    app_id, e
-                );
-                false
-            }
-        }
+    async fn is_dev_storage_orphan(&self, app_id: &str) -> AppResult<bool> {
+        let locator = self
+            .dev_locator
+            .read()
+            .map_err(|_| AppOperationError::Backend("Dev locator lock poisoned".into()))?
+            .clone()
+            .ok_or_else(|| AppOperationError::Backend("Dev locator is not configured".into()))?;
+        Ok(!locator
+            .dev_container_alive(app_id)
+            .await
+            .map_err(AppOperationError::Backend)?)
     }
 }
 
@@ -668,14 +1136,46 @@ mod tests {
     use super::*;
     use crate::test_support::{MockRuntime, test_service};
 
+    /// dev query 依赖 locator 做 builder 在跑探测——stub 恒"在"（非 orphan）
+    struct StubDevLocator;
+    #[async_trait::async_trait]
+    impl shared_types::UserappDevLocator for StubDevLocator {
+        async fn dev_file_server_addr(
+            &self,
+            _app_id: &str,
+            _user_id: Option<&str>,
+        ) -> Result<String, String> {
+            Ok("http://127.0.0.1:60000".to_string())
+        }
+        async fn dev_container_alive(&self, _app_id: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+
     /// storage 的 app_stage 分派落点：workspace_volume_name / list_workspace_identifiers
     /// 必须按 app_stage 换 ServiceType（dev→UserappBuilder / prod→Userapp）——K8s 卷
     /// label 与 Docker 目录树都按它分形，分派错即查错卷。
     #[tokio::test]
     async fn storage_env_dispatches_service_type() {
         let runtime = Arc::new(MockRuntime::default());
-        let service = test_service(std::path::Path::new("/tmp/ws"), runtime.clone());
+        let root = tempfile::tempdir().expect("test root");
+        let service = test_service(root.path(), runtime.clone()).await;
+        service
+            .set_dev_locator(Arc::new(StubDevLocator))
+            .expect("locator");
+        for app in ["app-1", "app-dev", "app-prod"] {
+            service
+                .metadata
+                .record(app, None, Some("u1".into()), None, None)
+                .await
+                .expect("owner");
+        }
 
+        service
+            .metadata
+            .record("app-1", None, Some("u1".into()), None, None)
+            .await
+            .expect("register owner");
         service
             .get_app_storage(UserappStage::Prod, "app-1")
             .await
@@ -697,22 +1197,6 @@ mod tests {
     /// prod 枚举 Userapp 卷（并入运行中 app 兜底）。
     #[tokio::test]
     async fn query_storage_env_selects_volume_family() {
-        /// dev query 依赖 locator 做 builder 在跑探测——stub 恒"在"（非 orphan）
-        struct StubDevLocator;
-        #[async_trait::async_trait]
-        impl shared_types::UserappDevLocator for StubDevLocator {
-            async fn dev_file_server_addr(
-                &self,
-                _app_id: &str,
-                _user_id: Option<&str>,
-            ) -> Result<String, String> {
-                Ok("http://127.0.0.1:60000".to_string())
-            }
-            async fn dev_container_alive(&self, _app_id: &str) -> Result<bool, String> {
-                Ok(true)
-            }
-        }
-
         let runtime = Arc::new(MockRuntime::default());
         runtime
             .workspace_ids
@@ -720,7 +1204,18 @@ mod tests {
         runtime
             .workspace_ids
             .insert("Userapp".to_string(), vec!["app-prod".to_string()]);
-        let service = test_service(std::path::Path::new("/tmp/ws"), runtime.clone());
+        let root = tempfile::tempdir().expect("test root");
+        let service = test_service(root.path(), runtime.clone()).await;
+        service
+            .set_dev_locator(Arc::new(StubDevLocator))
+            .expect("locator");
+        for app in ["app-1", "app-dev", "app-prod"] {
+            service
+                .metadata
+                .record(app, None, Some("u1".into()), None, None)
+                .await
+                .expect("owner");
+        }
         *service.dev_locator.write().expect("dev_locator lock") = Some(Arc::new(StubDevLocator));
 
         let dev_resp = service

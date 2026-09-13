@@ -5,16 +5,10 @@
 //! 流式逻辑见 [`super::progress_sse`]——与 `/computer/progress` 和
 //! `/devcomputer/progress` 完全同源，本文件只保留路由专属的 utoipa 元数据与日志前缀。
 
-use axum::{
-    Json,
-    extract::Path,
-    http::{HeaderMap, StatusCode},
-    response::sse::Sse,
-};
-use shared_types::HttpResult;
+use axum::{extract::Path, http::HeaderMap};
 use tracing::info;
 
-use super::progress_sse::{SseStream, progress_sse};
+use super::progress_sse::{ProgressResponse, progress_sse};
 
 /// 本路由的日志前缀（运维按前缀 grep，不得随重构改变）
 const LOG_PREFIX: &str = "RCoder";
@@ -38,7 +32,7 @@ const LOG_PREFIX: &str = "RCoder";
 pub async fn handle_rcoder_progress(
     headers: HeaderMap,
     Path(session_id): Path<String>,
-) -> Result<Sse<SseStream>, (StatusCode, Json<HttpResult<String>>)> {
+) -> ProgressResponse {
     info!(
         "📡 [{}] Progress stream subscribed: session_id={}",
         LOG_PREFIX, session_id

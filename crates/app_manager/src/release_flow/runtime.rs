@@ -1,11 +1,9 @@
 //! 发布激活的运行时编排（自 rcoder/userapp_publish/app_lifecycle 下沉）：
-//! ensure_app_runtime（幂等建/取运行单元）。
+//! 统一装配空运行单元参数；生命周期受理由部署协调器负责。
 //!
 //! 历史的 wait_app_ready（轮询 readiness 转-ready，300s）已退役：部署链的
 //! 同步等待点前移到部署段完成（[`crate::lifecycle`] 的 wait_deploy_stage，
 //! 轮询容器内 app-cli `/v1/deploy/status`）；readiness 探针仅负责 K8s 摘流。
-
-use tracing::info;
 
 use crate::models::commons::{ExposeType, HealthCheckType};
 use crate::models::{AppOperationError, CreateAppRequest, HealthCheckConfig, PortConfig};
@@ -21,54 +19,14 @@ const APP_LIVENESS_PATH: &str = "/health";
 const APP_READINESS_PATH: &str = "/ready";
 
 impl AppService {
-    /// 确保 app 计算单元存在：不存在则 create_app（幂等；image/ports 首次设定后恒定）。
-    ///
-    /// `deploy_env`：部署三元组等 env 随 create 注入（start {url} 首次部署路径）。
-    /// `user_id`：显式 owner（start 无 url 创建空容器的场景，Docker 数据卷分区
-    /// `prod/{user_id}/data/{app_id}` 依赖）；None = metadata 回退（发布链 ensure
-    /// 无 user 上下文，Java 先 create 的场景回填已存值）。
-    /// `process_lock`：调用方已持有的该 app 进程级发布锁——create 分支走
-    /// [`create_app_locked`]（已持锁内核），避免公共 `create_app` 的重入取锁死锁。
-    pub(crate) async fn ensure_app_runtime(
+    pub(crate) fn empty_runtime_request(
         &self,
         rcoder_app_id: &str,
         name: &str,
         deploy_env: Option<std::collections::HashMap<String, String>>,
-        user_id: Option<String>,
-        process_lock: crate::service::AppOperationGuard,
-    ) -> Result<(), AppOperationError> {
-        let result = self
-            .ensure_app_runtime_with_guard(rcoder_app_id, name, deploy_env, user_id, &process_lock)
-            .await;
-        if result.is_ok() || !process_lock.has_unfinished_mutation() {
-            process_lock.finish().await?;
-        }
-        result
-    }
-
-    pub(crate) async fn ensure_app_runtime_with_guard(
-        &self,
-        rcoder_app_id: &str,
-        name: &str,
-        deploy_env: Option<std::collections::HashMap<String, String>>,
-        user_id: Option<String>,
-        process_lock: &crate::service::AppOperationGuard,
-    ) -> Result<(), AppOperationError> {
-        match self.get_app(rcoder_app_id).await {
-            Ok(_) => {
-                // app 已存在：image/ports/probes 首次设定后恒定，不自动 reconcile(#14)。
-                // 注:app_service trait 只暴露运行时信息(AppRuntimeInfo,无 image 字段)，无法在此
-                // 直接比对存储镜像;改为记录期望 image,平台升级 app-runtime 后运维可据日志发现滞后。
-                info!(
-                    app_id = %rcoder_app_id,
-                    "[APP] app already exists; image/ports/probes are constant after first create \
-                     and will NOT be reconciled to the desired image"
-                );
-                return Ok(());
-            }
-            Err(AppOperationError::NotFound(_)) => {} // 不存在 → create
-            Err(e) => return Err(e),
-        }
+        owner: &str,
+        lifecycle_id: Option<&str>,
+    ) -> Result<CreateAppRequest, AppOperationError> {
         let image = std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").map_err(|_| {
             AppOperationError::Backend(
                 "RCODER_RUNTIME_IMAGE_DIGEST env not set (app-runtime image for create_app)"
@@ -83,14 +41,12 @@ impl AppService {
             .or_insert_with(|| uuid::Uuid::new_v4().simple().to_string());
         env.entry("APP_CLI_DEPLOY_TOKEN".to_string())
             .or_insert_with(|| uuid::Uuid::new_v4().simple().to_string());
-        let request = CreateAppRequest {
+        Ok(CreateAppRequest {
             app_id: Some(rcoder_app_id.to_string()),
+            lifecycle_id: lifecycle_id.map(str::to_owned),
+            request_id: None,
             name: name.to_string(),
-            // owner 优先级：显式传入 > metadata 回填(Java 先 create 的场景)；
-            // 均无值空串(record 侧转 None, 部署 URL 降级旧短形态)
-            user_id: user_id
-                .or_else(|| self.metadata.lookup(rcoder_app_id).and_then(|m| m.user_id))
-                .unwrap_or_default(),
+            user_id: owner.into(),
             image: Some(image),
             command: None,
             env: Some(env),
@@ -115,9 +71,6 @@ impl AppService {
             // 发布编排创建的 Userapp 默认参与闲置回收（= 免费用户语义）；如需付费常驻由调用方另行 update。
             recycle_enabled: None,
             idle_timeout_seconds: None,
-        };
-        self.create_app_with_guard(rcoder_app_id, request, process_lock)
-            .await
-            .map(|_| ())
+        })
     }
 }

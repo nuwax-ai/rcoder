@@ -151,10 +151,7 @@ async fn ensure_userapp_dev(
             .await
             .map_err(|e| {
                 error!("[POD_ENSURE] ensure userapp dev container failed: app_id={app_id}: {e:#}");
-                AppError::with_message(
-                    shared_types::error_codes::ERR_BACKEND_ERROR,
-                    format!("ensure userapp dev container failed: {e:#}"),
-                )
+                crate::userapp_builder::control_error(&e)
             })?;
     info!(
         "[POD_ENSURE] userapp dev container ready: app_id={app_id}, container={}, ip={}",

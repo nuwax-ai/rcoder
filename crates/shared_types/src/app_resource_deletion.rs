@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 /// callers explicitly await release before reporting completion.
 #[async_trait::async_trait]
 pub trait AppOperationLease: Send + Sync {
+    fn receipt(&self) -> Option<crate::UserAppOperationLeaseReceipt> {
+        None
+    }
     async fn release(self: Box<Self>) -> Result<(), String>;
 }
 
@@ -36,6 +39,258 @@ pub struct AppDeletionSnapshot {
     pub resources: Vec<AppResourceIdentity>,
 }
 
+/// Captured resource target bound to one admitted control operation. Persist this
+/// receipt before runtime mutation; never rediscover the target by name on retry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserAppMutationTarget {
+    pub context: crate::UserAppExecutionContext,
+    pub resource: AppResourceIdentity,
+}
+
+/// Confirmed deletion boundaries. A remote acknowledgement without confirmed
+/// disappearance must never advance these stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserAppDeletionStage {
+    Captured,
+    ComputeRemoved,
+    ProductionStorageRemoved,
+    DevelopmentRemoved,
+}
+
+/// Complete deletion evidence, bound to one durable operation. This is not an
+/// execution lease: an uncertain writer still requires reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAppDeletionCheckpoint {
+    pub stage: UserAppDeletionStage,
+    pub schema_version: u32,
+    pub context: crate::UserAppExecutionContext,
+    pub kind: crate::UserAppOperationKind,
+    pub production: AppDeletionSnapshot,
+    pub development: Option<crate::UserappDevDeletionReceipt>,
+}
+
+impl UserAppDeletionCheckpoint {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1 {
+            return Err("Unsupported application deletion checkpoint version".into());
+        }
+        self.context
+            .validate_identity(&self.context.app_id, Some(&self.context.user_id))?;
+        let needs_development = match self.kind {
+            crate::UserAppOperationKind::DeleteCompute => false,
+            crate::UserAppOperationKind::PurgeResources
+            | crate::UserAppOperationKind::DeleteApplication => true,
+            _ => return Err("Operation kind does not support this deletion checkpoint".into()),
+        };
+        if self.production.app_id != self.context.app_id
+            || self.development.is_some() != needs_development
+        {
+            return Err("Deletion checkpoint application or resource scope mismatch".into());
+        }
+        if !needs_development
+            && matches!(
+                self.stage,
+                UserAppDeletionStage::ProductionStorageRemoved
+                    | UserAppDeletionStage::DevelopmentRemoved
+            )
+        {
+            return Err("Compute-only deletion cannot complete storage cleanup".into());
+        }
+        validate_deletion_resources(&self.production.operation_id, &self.production.resources)?;
+        if let Some(development) = &self.development {
+            if development.runtime.app_id != self.context.app_id {
+                return Err(
+                    "Development deletion checkpoint belongs to another application".into(),
+                );
+            }
+            validate_deletion_resources(
+                &development.runtime.operation_id,
+                &development.runtime.resources,
+            )?;
+            if development.registry.as_ref().is_some_and(|identity| {
+                identity.generation.is_empty() || identity.container_id.is_empty()
+            }) {
+                return Err("Development registry identity is incomplete".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify stored evidence against the authoritative operation, not caller IDs.
+    pub fn validate_operation(
+        &self,
+        operation: &crate::UserAppOperationRecord,
+    ) -> Result<(), String> {
+        self.validate()?;
+        if self.context.app_id != operation.app_id
+            || self.context.lifecycle_id != operation.lifecycle_id
+            || self.context.operation_id != operation.operation_id
+            || operation.executor_id.as_deref() != Some(self.context.executor_id.as_str())
+            || self.context.request_fingerprint != operation.request_fingerprint
+            || self.kind != operation.kind
+        {
+            return Err("Deletion checkpoint does not belong to the stored operation".into());
+        }
+        Ok(())
+    }
+}
+
+fn validate_deletion_resources(
+    operation_id: &str,
+    resources: &[AppResourceIdentity],
+) -> Result<(), String> {
+    crate::validate_identifier(operation_id, "resource_operation_id")?;
+    for resource in resources {
+        if resource.name.is_empty() || resource.uid.is_empty() {
+            return Err("Deletion resource identity is incomplete".into());
+        }
+        if resource.kind != AppResourceKind::Container
+            && resource
+                .resource_version
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Err("Kubernetes deletion resource version is missing".into());
+        }
+    }
+    Ok(())
+}
+
+/// Original storage-destruction scope. Production storage destruction retains
+/// its existing contract of also removing development resources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAppStorageDestruction {
+    pub context: crate::UserAppExecutionContext,
+    pub production: Option<AppDeletionSnapshot>,
+    pub development: crate::UserappDevDeletionReceipt,
+}
+
+/// Evidence for clearing contents. This records selected targets, not authority
+/// to replay an uncertain operation or to substitute replacement resources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAppStorageClear {
+    pub context: crate::UserAppExecutionContext,
+    pub target: UserAppStorageClearTarget,
+}
+
+impl UserAppStorageClear {
+    pub fn validate(&self) -> Result<(), String> {
+        self.context
+            .validate_identity(&self.context.app_id, Some(&self.context.user_id))?;
+        match &self.target {
+            UserAppStorageClearTarget::Production {
+                snapshot,
+                directories,
+            } => {
+                if snapshot.app_id != self.context.app_id
+                    || directories
+                        .iter()
+                        .any(|directory| !directory.path.is_absolute())
+                {
+                    return Err("Storage clear production target mismatch".into());
+                }
+                validate_deletion_resources(&snapshot.operation_id, &snapshot.resources)
+            }
+            UserAppStorageClearTarget::Development {
+                base_url,
+                instance_id,
+                endpoint,
+                receipt,
+            } => {
+                if base_url.is_empty()
+                    || instance_id.is_empty()
+                    || endpoint.container_id.is_empty()
+                    || endpoint.address.is_unspecified()
+                    || *base_url != endpoint.base_url()
+                    || receipt.runtime.app_id != self.context.app_id
+                {
+                    return Err("Storage clear development target mismatch".into());
+                }
+                validate_deletion_resources(
+                    &receipt.runtime.operation_id,
+                    &receipt.runtime.resources,
+                )?;
+                if receipt.runtime.docker_bind_cleanup {
+                    let [container] = receipt.runtime.resources.as_slice() else {
+                        return Err("Storage clear Docker target must name one container".into());
+                    };
+                    if container.kind != AppResourceKind::Container
+                        || container.uid != endpoint.container_id
+                    {
+                        return Err("Storage clear endpoint differs from captured container".into());
+                    }
+                } else if !receipt
+                    .runtime
+                    .resources
+                    .iter()
+                    .any(|resource| resource.kind == AppResourceKind::StatefulSet)
+                {
+                    return Err("Storage clear Kubernetes workload receipt is missing".into());
+                }
+                if receipt.registry.as_ref().is_some_and(|identity| {
+                    identity.generation.is_empty() || identity.container_id.is_empty()
+                }) {
+                    return Err("Storage clear registry identity is incomplete".into());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UserAppStorageClearTarget {
+    Development {
+        base_url: String,
+        instance_id: String,
+        endpoint: crate::UserAppBuilderWorkspaceEndpoint,
+        receipt: Box<crate::UserappDevDeletionReceipt>,
+    },
+    Production {
+        snapshot: AppDeletionSnapshot,
+        directories: Vec<crate::storage_contents::CapturedStorageDirectory>,
+    },
+}
+
+impl UserAppStorageDestruction {
+    pub fn validate(&self) -> Result<(), String> {
+        self.context
+            .validate_identity(&self.context.app_id, Some(&self.context.user_id))?;
+        if let Some(production) = &self.production {
+            if production.app_id != self.context.app_id {
+                return Err("Storage destruction production ownership mismatch".into());
+            }
+            validate_deletion_resources(&production.operation_id, &production.resources)?;
+        }
+        if self.development.runtime.app_id != self.context.app_id {
+            return Err("Storage destruction development ownership mismatch".into());
+        }
+        validate_deletion_resources(
+            &self.development.runtime.operation_id,
+            &self.development.runtime.resources,
+        )?;
+        if self.development.registry.as_ref().is_some_and(|identity| {
+            identity.generation.is_empty() || identity.container_id.is_empty()
+        }) {
+            return Err("Storage destruction registry identity is incomplete".into());
+        }
+        Ok(())
+    }
+}
+
+/// PVC expansion receipt captured before runtime effects and durable checkpointed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserAppStorageResizeTarget {
+    pub context: crate::UserAppExecutionContext,
+    pub resource: AppResourceIdentity,
+    pub current_size: String,
+}
+
 /// Durable mutation ownership inside an exclusively locked application lock file.
 /// A nonempty marker is never reclaimed by time or process liveness heuristics.
 pub struct AppFileMutationMarker {
@@ -48,6 +303,22 @@ impl Default for AppFileMutationMarker {
     }
 }
 impl AppFileMutationMarker {
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+    /// Bind a marker to an admitted operation. This does not authorize reclaiming
+    /// a nonempty file; callers still acquire the file lock and check cleanliness.
+    pub fn for_operation(operation_id: &str) -> std::io::Result<Self> {
+        crate::validate_identifier(operation_id, "operation_id").map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid application operation ID",
+            )
+        })?;
+        Ok(Self {
+            operation_id: operation_id.into(),
+        })
+    }
     pub fn new() -> Self {
         Self {
             operation_id: uuid::Uuid::new_v4().to_string(),

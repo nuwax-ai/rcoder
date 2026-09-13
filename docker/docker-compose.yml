@@ -10,6 +10,10 @@ services:
       - "60000:60000" # file-server 分流代理入口（all_rust → 主端口; K8s 形态同构缩小版）
       - "7681:7681" # ttyd Web 终端端口
     environment:
+      # Single rcoder instance; userApp metadata is independent of Agent storage.
+      - RCODER_USERAPP_STORAGE_BACKEND=sqlite
+      - RCODER_USERAPP_SQLITE_PATH=/app/data/userapp.sqlite3
+      - RCODER_USERAPP_ENSURE_TIMEOUT_SECONDS=${RCODER_USERAPP_ENSURE_TIMEOUT_SECONDS:-90}
       - TZ=Asia/Shanghai
       - RCODER_PORT=${RCODER_PORT:-8090}
       - RUST_LOG=debug,bollard=info,h2=info,hyper=info,tonic=info # debug 基线 + 收敛三方库噪声（bollard 全量 inspect JSON dump / h2 帧日志）
@@ -46,6 +50,8 @@ services:
       # Grafana Explore → Tempo 查看 trace（火焰图/瀑布），trace_id 与 JSON 日志一致
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
     volumes:
+      # Persist the directory, including SQLite WAL/SHM; never share between deployments.
+      - ${RCODER_DATA_DIR:-./data/rcoder}:/app/data
       # 挂载 Docker socket
       - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
       # 🎯 挂载本地测试配置文件（使用与主容器相同的镜像）

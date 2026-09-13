@@ -14,7 +14,7 @@ name = "rcoder"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["userapp-sqlite"]
 
 # 调试功能：启用 /debug/* 路由，用于开发和问题排查
 # 生产环境默认不启用，需要显式添加 --features debug
@@ -32,14 +32,16 @@ ebpf-debug = ["docker_manager/ebpf-debug"]
 
 # Kubernetes 支持：启用 Kubernetes 运行时模式
 # 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
-kubernetes = ["docker_manager/kubernetes", "shared_types/kubernetes", "app_manager/kubernetes", "file-server/kubernetes", "kube", "k8s-openapi"]
+userapp-sqlite = ["rcoder-storage/sqlite"]
 
-# PostgreSQL 持久化存储后端（rcoder-storage/pg 转发）。
-# 运行期经 [storage].backend / RCODER_STORAGE_BACKEND=postgres 激活（env 可灰度回退 memory）；
-# 仅 k8s 编译变体启用（docker compose 路径不编译 sqlx，行为零改动）
+kubernetes = ["rcoder-storage/pg", "docker_manager/kubernetes", "shared_types/kubernetes", "app_manager/kubernetes", "file-server/kubernetes", "kube", "k8s-openapi"]
+
+# Agent 项目/会话 PostgreSQL 后端；运行期由 [storage].backend 选择。
+# userApp 后端独立配置，不因 Agent 仍使用 memory 而回退到内存。
 rcoder-pg = ["kubernetes", "rcoder-storage/pg"]
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 filetime = { workspace = true }
 http-body-util = { workspace = true }
 
@@ -47,6 +49,7 @@ http-body-util = { workspace = true }
 workspace = true
 
 [dependencies]
+sha2 = { workspace = true }
 # Internal crates
 shared_types = { workspace = true }
 rcoder-storage = { workspace = true }

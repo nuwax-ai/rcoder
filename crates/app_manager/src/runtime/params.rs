@@ -268,9 +268,10 @@ impl AppService {
         // owner user_id：input 显式值（create）优先，update 路径查元数据；两处皆无则
         // 不设置（runtime 侧兜底 app_id——旧 app 元数据缺失场景）。Docker 模式数据卷
         // bind 源（prod/{user_id}/data/{app_id}）按它分区。
+        let metadata_snapshot = self.metadata.lookup(app_id).await?;
         let owner_user_id = user_id
             .filter(|uid| !uid.trim().is_empty())
-            .or_else(|| self.metadata.lookup(app_id).and_then(|r| r.user_id));
+            .or_else(|| metadata_snapshot.and_then(|r| r.user_id));
         if let Some(uid) = owner_user_id {
             builder = builder.user_id(uid);
         }
@@ -346,7 +347,7 @@ fn health_check_from_snapshot(hc: AppHealthCheck) -> HealthCheckConfig {
 }
 
 /// 解析平台默认运行时镜像（单一 app-runtime 镜像策略：测试/生产由部署 env 区分，
-/// 与发布链 `ensure_app_runtime` 同读 `RCODER_RUNTIME_IMAGE_DIGEST`）。
+/// 与发布链 `empty_runtime_request` 同读 `RCODER_RUNTIME_IMAGE_DIGEST`）。
 /// env 未配置且调用方未显式传 image → Backend 错误（部署缺配置，fail fast）。
 pub(crate) fn default_runtime_image(env_value: &Option<String>) -> AppResult<String> {
     env_value
@@ -376,6 +377,8 @@ mod tests {
 
     fn empty_update_request(image: &str) -> UpdateAppRequest {
         UpdateAppRequest {
+            request_id: None,
+            lifecycle_id: None,
             user_id: "u1".into(),
             name: None,
             image: Some(image.to_owned()),
@@ -396,7 +399,7 @@ mod tests {
         tokio::fs::create_dir_all(app_dir.join("code"))
             .await
             .expect("create code dir");
-        test_service(root, Arc::new(MockRuntime::default()))
+        test_service(root, Arc::new(MockRuntime::default())).await
     }
 
     /// 只传 image 的 update：secrets/resources/health_check 缺省时从 live 快照回退
@@ -466,7 +469,7 @@ mod tests {
                 ]),
             },
         );
-        let service = test_service(root.path(), runtime);
+        let service = test_service(root.path(), runtime).await;
 
         let params = service
             .build_container_params_from_update(
@@ -545,7 +548,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let service = test_service(root.path(), runtime);
+        let service = test_service(root.path(), runtime).await;
 
         let mut request = empty_update_request("img:v2");
         request.resources = Some(ResourceLimits {
@@ -610,7 +613,7 @@ mod tests {
                 ports: None,
             },
         );
-        let service = test_service(root.path(), runtime);
+        let service = test_service(root.path(), runtime).await;
         let mut request = empty_update_request("img:v2");
         request.secrets = Some(HashMap::from([("NEW".into(), "new".into())]));
 

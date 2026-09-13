@@ -40,7 +40,8 @@ use super::locale_from_headers;
 pub(crate) type SseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
 /// 进度流的返回类型（三条路由共用）
-pub(crate) type ProgressResponse = Result<Sse<SseStream>, (StatusCode, Json<HttpResult<String>>)>;
+pub(crate) type ProgressResponse =
+    Result<Sse<SseStream>, (StatusCode, Json<Box<HttpResult<String>>>)>;
 
 /// 检查 Agent 是否处于 idle 状态
 ///
@@ -189,7 +190,7 @@ pub(crate) async fn progress_sse(
             );
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(HttpResult::error_with_message(
+                Json(Box::new(HttpResult::error_with_message(
                     ERR_SESSION_NOT_FOUND,
                     locale,
                     &format!(
@@ -197,7 +198,7 @@ pub(crate) async fn progress_sse(
                         get_i18n_message("error.session_not_found", locale),
                         session_id
                     ),
-                )),
+                ))),
             ));
         }
     };
@@ -217,7 +218,7 @@ pub(crate) async fn progress_sse(
                 );
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(HttpResult::error_with_message(
+                    Json(Box::new(HttpResult::error_with_message(
                         ERR_INTERNAL_SERVER_ERROR,
                         locale,
                         &format!(
@@ -225,7 +226,7 @@ pub(crate) async fn progress_sse(
                             get_i18n_message("error.internal_server_error", locale),
                             e
                         ),
-                    )),
+                    ))),
                 ));
             }
         };

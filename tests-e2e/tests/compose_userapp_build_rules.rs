@@ -83,9 +83,19 @@ async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user:
             .json(&json!({"app_id": app_id, "user_id": user}))
             .send()
             .await;
-        let Ok(resp) = resp else { continue };
+        let Ok(resp) = resp else {
+            rcoder_e2e::common::resources::register_builder_attempt(app_id, user, false)
+                .expect("register uncertain builder creation");
+            continue;
+        };
         status = resp.status();
         body = resp.json().await.unwrap_or(Value::Null);
+        rcoder_e2e::common::resources::register_builder_attempt(
+            app_id,
+            user,
+            status.is_success() && http_ok(&body),
+        )
+        .expect("register builder creation identity");
         if status.is_success() && http_ok(&body) {
             break;
         }

@@ -15,6 +15,12 @@ pub struct CreateAppRequest {
     /// None=自动生成 `app-{8hex}`）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
+    /// Required when creating resources in an explicitly recreated lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_id: Option<String>,
+    /// Idempotency key for this creation intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// 应用名称
     pub name: String,
     /// 归属用户 ID（部署访问 URL `/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}` 的组成段；
@@ -23,7 +29,7 @@ pub struct CreateAppRequest {
     /// 容器镜像（可选；完整地址含 registry + 命名空间）。
     ///
     /// **缺省 = 平台默认运行时镜像**（env `RCODER_RUNTIME_IMAGE_DIGEST`，部署层按
-    /// 环境注入——测试/生产各一份，与发布链 `ensure_app_runtime` 同源）。当前
+    /// 环境注入——测试/生产各一份，与发布链 `empty_runtime_request` 同源）。当前
     /// userApp 统一单一 app-runtime 镜像，调用方通常无需传；显式传入用于临时
     /// 指定特殊版本（如灰度）。env 未配置且未传入 → ERR_BACKEND_ERROR。
     pub image: Option<String>,
@@ -116,6 +122,14 @@ pub enum SortOrder {
 /// （env `RCODER_RUNTIME_IMAGE_DIGEST`）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct UpdateAppRequest {
+    /// Caller token for idempotent control requests. Reuse with different parameters conflicts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
+    pub request_id: Option<String>,
+    /// Expected lifecycle; required after explicit application recreation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
+    pub lifecycle_id: Option<String>,
     /// 宿主机数据卷分区归属目录名（必填；Docker compose 挂载路径组成段，
     /// 容器未启动时按此自动唤醒后挂载）
     #[garde(pattern(shared_types::IDENTIFIER_RE))]
@@ -164,6 +178,12 @@ pub struct UpdateAppRequest {
 /// 比 `UpdateAppRequest` 轻——无需 image、不走全量 SSA。至少需传一个字段（皆 None → ERR_VALIDATION）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct RecyclePolicyRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
+    pub lifecycle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
+    pub request_id: Option<String>,
     /// 宿主机数据卷分区归属目录名（Docker compose 形态挂载路径
     /// `prod/{user_id}/data/{app_id}` 的组成段）：容器未启动时按
     /// user_id+app_id+app_stage 自动唤醒后挂载，策略落点才有效
@@ -189,6 +209,12 @@ pub struct RecyclePolicyRequest {
 /// 删除应用请求
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct DeleteAppRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
+    pub lifecycle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
+    pub request_id: Option<String>,
     /// 是否同时清空持久存储（默认 `false`：只删计算面，保留数据面）
     #[garde(skip)]
     #[serde(default)]
@@ -205,15 +231,18 @@ pub struct DeleteAppRequest {
     pub expected_resource_version: Option<String>,
 }
 
-/// 彻底删除应用请求（永久删除：dev+prod 容器与 PVC/目录、元数据行全删）
-///
-/// body 整体可选——不发也成功（`Option<Json>` 提取器语义：缺 body/空 body
-/// 折为 None）；`user_id` 仅为日志与对账，资源定位不依赖它（目录删除走
-/// `prod/*/`、`dev/*/` 通配扫描按 app_id 匹配）。
+/// Full deletion retains the lifecycle tombstone and requires the registered owner.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct PurgeAppRequest {
-    /// 归属用户 ID（可选；携带时做标识符白名单校验）
+    /// Registered application owner.
     #[garde(pattern(shared_types::IDENTIFIER_RE))]
+    pub user_id: String,
+    /// Required after an explicit lifecycle recreation.
     #[serde(default)]
-    pub user_id: Option<String>,
+    #[garde(skip)]
+    pub lifecycle_id: Option<String>,
+    /// Caller-provided idempotency key.
+    #[serde(default)]
+    #[garde(skip)]
+    pub request_id: Option<String>,
 }

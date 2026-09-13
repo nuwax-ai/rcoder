@@ -20,7 +20,7 @@ use super::*;
     tag = "pod",
     operation_id = "pod_stop",
     summary = "停止并销毁容器（保留数据卷）",
-    description = "根据 user_id / project_id / service_type 定位容器并销毁：K8s 删 STS + Service（PVC 保留，数据不丢，下次 ensure 重建挂回），Docker 删容器。携带 app_id 时进入 userApp 分派：dev=销毁 UserappBuilder 开发容器（per-app PVC 保留）；prod=scale-to-0 停止生产实例（阻断流量唤醒，ensure 可显式唤醒）。容器不存在时幂等返回成功。注意：对话状态在 agent 内存中，停止即断会话。"
+    description = "根据 user_id / project_id / service_type 定位容器并销毁：K8s 删 STS + Service（PVC 保留，数据不丢，下次 ensure 重建挂回），Docker 删容器。携带 app_id 时进入 userApp 分派：dev=按持久化生命周期与实际计算资源身份停止 UserappBuilder（PVC 与 Service 保留；携带 lifecycle_id/request_id）；prod=scale-to-0 停止生产实例（阻断流量唤醒，ensure 可显式唤醒）。容器不存在时幂等返回成功。注意：对话状态在 agent 内存中，停止即断会话。"
 )]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_stop(
@@ -37,9 +37,29 @@ pub async fn pod_stop(
     ) {
         Ok(AppTarget::NotApp) => {}
         Ok(AppTarget::Dev(app_id)) => {
-            return stop_userapp_dev(&state, app_id).await;
+            return stop_userapp_dev(
+                &state,
+                app_id,
+                shared_types::UserAppControlRequest {
+                    user_id: request.user_id,
+                    lifecycle_id: request.lifecycle_id,
+                    request_id: request.request_id,
+                },
+            )
+            .await;
         }
-        Ok(AppTarget::Prod(app_id)) => return stop_userapp_prod(&state, locale, app_id).await,
+        Ok(AppTarget::Prod(app_id)) => {
+            return stop_userapp_prod(
+                &state,
+                app_id,
+                shared_types::UserAppControlRequest {
+                    user_id: request.user_id,
+                    lifecycle_id: request.lifecycle_id,
+                    request_id: request.request_id,
+                },
+            )
+            .await;
+        }
         Err(e) => {
             error!("[POD_STOP] invalid app target: {}", e);
             return Ok(invalid_app_target_response(locale, &e));
@@ -183,85 +203,51 @@ pub async fn pod_stop(
 // userApp 分派实现（app_id/app_stage）
 // ============================================================================
 
-/// stop 的 userApp dev 分支：销毁 UserappBuilder 开发容器（per-app PVC 保留，
-/// 数据不丢）。清注册 container 字段而非 remove_project——保 PG 侧 project 行
-/// 与会话映射；探活缓存一并失效，防下次 ensure 命中死 IP。
+/// Stop builder compute through the durable, identity-bound lifecycle coordinator.
+/// Storage and service identity are retained for a later explicit ensure.
 async fn stop_userapp_dev(
     state: &Arc<AppState>,
     app_id: String,
+    request: shared_types::UserAppControlRequest,
 ) -> Result<HttpResult<StopPodResponse>, AppError> {
-    // 区分查询错误与真不存在（K8s API 瞬断不应误报幂等成功）
-    let existed = state
-        .runtime()
-        .get_container_info_by_identifier(&app_id, &ServiceType::UserappBuilder)
+    let result = crate::userapp_builder::control::execute(state, &app_id, request, false)
         .await
-        .map_err(|e| {
-            error!("[POD_STOP] userapp dev container lookup failed: app_id={app_id}: {e:#}");
-            AppError::with_message(
-                shared_types::error_codes::ERR_BACKEND_ERROR,
-                format!("userapp dev container lookup failed: {e:#}"),
-            )
-        })?;
-    if existed.is_none() {
-        info!(
-            "[POD_STOP] userapp dev container does not exist (idempotent no-op): app_id={app_id}"
-        );
-        return Ok(HttpResult::success(StopPodResponse {
-            was_existing: false,
-            message: "Userapp dev 容器不存在（幂等空操作）".to_string(),
-        }));
-    }
-
-    // 物理销毁（K8s：STS+svc，per-app PVC 保留；Docker：删容器+卷映射，宿主目录保留）
-    state
-        .runtime()
-        .stop_container_by_identifier(&app_id, &ServiceType::UserappBuilder)
-        .await
-        .map_err(|e| {
-            error!("[POD_STOP] userapp dev stop failed: app_id={app_id}: {e:#}");
-            AppError::with_message(
-                shared_types::error_codes::ERR_BACKEND_ERROR,
-                format!("userapp dev stop failed: {e:#}"),
-            )
-        })?;
-    info!("[POD_STOP] userapp dev 容器已销毁: app_id={app_id}");
-
-    // 清 SSE 流 + 注册表 container 字段（保 PG project 行与会话映射）
-    state.clear_project_container_field(&app_id);
-    crate::userapp_forward::invalidate_probe_cache(&app_id);
-
-    info!("[POD_STOP] userapp dev stop completed: app_id={app_id}");
+        .map_err(|error| crate::userapp_builder::control_error(&error))?;
     Ok(HttpResult::success(StopPodResponse {
-        was_existing: true,
-        message: "Userapp dev 容器已停止（开发卷保留，数据不丢）".to_string(),
-    }))
+        was_existing: result.was_existing,
+        message: "UserApp development compute stopped; workspace data preserved".into(),
+    })
+    .with_operation_id(result.operation_id))
 }
 
 /// stop 的 userApp prod 分支：scale-to-0 停止（阻断流量唤醒；显式 ensure 仍可唤醒）。
 async fn stop_userapp_prod(
     state: &Arc<AppState>,
-    locale: &str,
     app_id: String,
+    mut request: shared_types::UserAppControlRequest,
 ) -> Result<HttpResult<StopPodResponse>, AppError> {
-    // 存在性校验：不存在的 app 幂等语义不适用（app 元数据仍在，需明确报错防幻报）
-    if let Err(e) = state.app_service.get_app(&app_id).await {
-        error!("[POD_STOP] userapp prod app not found: app_id={app_id}: {e:#}");
-        return Ok(HttpResult::error_with_message(
-            shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
-            locale,
-            &format!("userapp prod app not found: app_id={app_id}"),
-        ));
-    }
-    state.app_service.stop_app(&app_id).await.map_err(|e| {
-        error!("[POD_STOP] userapp prod stop failed: app_id={app_id}: {e:#}");
-        AppError::with_message(
-            shared_types::error_codes::ERR_BACKEND_ERROR,
-            format!("userapp prod stop failed: {e:#}"),
-        )
-    })?;
-    info!("[POD_STOP] userapp prod 已停止（scale 0）: app_id={app_id}");
+    shared_types::validate_identifier(&request.user_id, "user_id")
+        .map_err(|_| AppError::validation_error("Invalid user_id for application stop"))?;
+    let request_id = request
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let owner = request.user_id.clone();
+    state
+        .app_service
+        .stop_app_controlled(&app_id, request)
+        .await?;
+    let operation = state
+        .app_service
+        .get_control_operation_by_request(&app_id, &owner, &request_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::internal_server_error("Stop completed without a durable operation record")
+        })?;
+    info!("[POD_STOP] userapp prod stopped: app_id={app_id}");
     Ok(HttpResult::success(StopPodResponse {
         was_existing: true,
-        message: "Userapp 生产实例已停止（流量唤醒已阻断，ensure 可显式唤醒）".to_string(),
-    }))
+        message: "UserApp production instance stopped; traffic wake is disabled".into(),
+    })
+    .with_operation_id(operation.operation_id))
 }

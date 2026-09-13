@@ -13,6 +13,7 @@ kubernetes = []
 workspace = true
 
 [dependencies]
+sha2.workspace = true
 
 serde.workspace = true
 workspace-manifest = { workspace = true }
@@ -97,3 +98,6 @@ shared_types_grpc = { workspace = true }
 tempfile = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }

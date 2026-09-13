@@ -14,40 +14,148 @@ impl AppService {
     /// 启动应用（scale replicas = 1）
     #[instrument(skip(self))]
     pub async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
-        validate_app_id(app_id)?;
-        let operation = self.acquire_process_release_lock(app_id).await?;
-        let previous = self.fetch_runtime_status_or_err(app_id).await?;
-        let previous_wake_on_traffic = previous
-            .wake_on_traffic
-            .unwrap_or_else(|| !self.activity.is_wake_blocked(app_id));
-        operation.mark_mutating()?;
-        self.runtime
-            .patch_wake_on_traffic(app_id, true)
-            .await
-            .map_err(|error| {
-                map_runtime_error(
-                    &format!("[APP] enable wake-on-traffic failed app_id={app_id}"),
-                    error,
-                )
+        let identity = self
+            .metadata
+            .store
+            .get_application(app_id)
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
             })?;
-        if let Err(error) = self.runtime.scale_deployment(app_id, 1).await {
-            if let Err(restore_error) = self
-                .runtime
-                .patch_wake_on_traffic(app_id, previous_wake_on_traffic)
-                .await
-            {
-                warn!(app_id, %restore_error, "failed to restore wake block after scale1 failure");
-            }
-            self.restore_activity_state(app_id, &previous, previous_wake_on_traffic);
-            return Err(map_runtime_error(
-                &format!("[APP] scale_deployment failed app_id={app_id}"),
-                error,
+        self.start_app_controlled(
+            app_id,
+            shared_types::UserAppControlRequest {
+                user_id: identity.user_id,
+                lifecycle_id: None,
+                request_id: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn start_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<AppRuntimeInfo> {
+        self.activate_existing_runtime(app_id, request, false).await
+    }
+
+    pub async fn restart_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<AppRuntimeInfo> {
+        self.activate_existing_runtime(app_id, request, true).await
+    }
+
+    async fn activate_existing_runtime(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+        restart: bool,
+    ) -> AppResult<AppRuntimeInfo> {
+        let kind = if restart {
+            shared_types::UserAppOperationKind::Restart
+        } else {
+            shared_types::UserAppOperationKind::Start
+        };
+        validate_app_id(app_id)?;
+        let guard = self.acquire_process_release_lock(app_id).await?;
+        let result = async {
+            self.metadata
+                .validate_request_lifecycle(
+                    app_id,
+                    &request.user_id,
+                    request.lifecycle_id.as_deref(),
+                )
+                .await?;
+            use sha2::Digest as _;
+            let fingerprint = hex::encode(sha2::Sha256::digest(
+                shared_types::encode_userapp_intent(&request).map_err(|error| {
+                    AppOperationError::Backend(format!("Encode runtime activation intent: {error}"))
+                })?,
             ));
+            if self
+                .replay_control(app_id, &request, kind, &fingerprint)
+                .await?
+                .is_some()
+            {
+                return self.get_app(app_id).await;
+            }
+            let previous = self.fetch_runtime_status_or_err(app_id).await?;
+            let mut operation = crate::service::OwnedOperation::admit(
+                self.metadata.store.clone(),
+                shared_types::UserAppAdmission {
+                    runtime_policy_on_success: None,
+                    command: Some(if restart {
+                        shared_types::UserAppControlCommand::Restart
+                    } else {
+                        shared_types::UserAppControlCommand::Start { traffic: false }
+                    }),
+                    app_id: app_id.into(),
+                    user_id: request.user_id.clone(),
+                    lifecycle_id: request.lifecycle_id.clone(),
+                    request_id: request.request_id.clone(),
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    kind,
+                    request_fingerprint: fingerprint,
+                    metadata: None,
+                },
+            )
+            .await?;
+            let mutation = async {
+                operation.bind_lease(&guard, &request.user_id).await?;
+                let context = operation.execution_context(&request.user_id);
+                let target = self
+                    .runtime
+                    .capture_app_mutation_target(&context, previous.resource_version.as_deref())
+                    .await
+                    .map_err(|error| {
+                        map_runtime_error("Capture runtime activation target", error)
+                    })?;
+                operation
+                    .checkpoint(
+                        if restart {
+                            "restarting_runtime"
+                        } else {
+                            "starting_runtime"
+                        },
+                        serde_json::json!({"target":target}),
+                    )
+                    .await?;
+                guard.mark_mutating()?;
+                let result = if restart {
+                    self.runtime.restart_app_target(&target).await
+                } else {
+                    self.runtime.start_app_target(&target).await
+                };
+                result.map_err(|error| map_runtime_error("Activate captured application", error))
+            }
+            .await;
+            match mutation {
+                Ok(()) => {
+                    operation.confirm_effects().await?;
+                    operation.succeed().await?;
+                    guard.mark_completed();
+                }
+                Err(error) => {
+                    if guard.has_unfinished_mutation() {
+                        operation.fail(&error).await?;
+                    } else {
+                        operation.reject_without_mutation(&error).await?;
+                    }
+                    return Err(error);
+                }
+            }
+            self.activity.mark_running(app_id);
+            self.get_app(app_id).await
         }
-        self.activity.mark_running(app_id);
-        info!("[APP] app started (scale=1): {}", app_id);
-        operation.finish().await?;
-        self.get_app(app_id).await
+        .await;
+        if result.is_ok() || !guard.has_unfinished_mutation() {
+            guard.finish().await?;
+        }
+        result
     }
 
     /// 停止应用（scale replicas = 0）
@@ -67,46 +175,164 @@ impl AppService {
         app_id: &str,
         wake_on_traffic: bool,
     ) -> AppResult<AppRuntimeInfo> {
+        let identity = self
+            .metadata
+            .store
+            .get_application(app_id)
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
+            })?;
+        self.scale_to_zero_controlled(
+            app_id,
+            shared_types::UserAppControlRequest {
+                user_id: identity.user_id,
+                // Only the internal recycler supplies the authoritative current token.
+                lifecycle_id: wake_on_traffic.then_some(identity.lifecycle_id),
+                request_id: None,
+            },
+            wake_on_traffic,
+        )
+        .await
+    }
+
+    pub async fn stop_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<AppRuntimeInfo> {
+        self.scale_to_zero_controlled(app_id, request, false).await
+    }
+
+    async fn scale_to_zero_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+        wake_on_traffic: bool,
+    ) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
         let operation = self.acquire_process_release_lock(app_id).await?;
-        let previous = self.fetch_runtime_status_or_err(app_id).await?;
-        let previous_wake_on_traffic = previous
+        let result = async {
+            self.metadata
+                .validate_request_lifecycle(
+                    app_id,
+                    &request.user_id,
+                    request.lifecycle_id.as_deref(),
+                )
+                .await?;
+            use sha2::Digest as _;
+            let fingerprint = hex::encode(sha2::Sha256::digest(
+                shared_types::encode_userapp_intent(
+                    &serde_json::json!({"request":request,"wake_on_traffic":wake_on_traffic}),
+                )
+                .map_err(|error| {
+                    AppOperationError::Backend(format!("Encode stop intent: {error}"))
+                })?,
+            ));
+            if self
+                .replay_control(
+                    app_id,
+                    &request,
+                    shared_types::UserAppOperationKind::Stop,
+                    &fingerprint,
+                )
+                .await?
+                .is_some()
+            {
+                return self.get_app(app_id).await;
+            }
+            let previous = self.fetch_runtime_status_or_err(app_id).await?;
+            let mut durable = crate::service::OwnedOperation::admit(
+                self.metadata.store.clone(),
+                shared_types::UserAppAdmission {
+                    runtime_policy_on_success: None,
+                    command: Some(shared_types::UserAppControlCommand::Stop { wake_on_traffic }),
+                    app_id: app_id.into(),
+                    user_id: request.user_id.clone(),
+                    lifecycle_id: request.lifecycle_id.clone(),
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    request_id: request.request_id.clone(),
+                    request_fingerprint: fingerprint,
+                    kind: shared_types::UserAppOperationKind::Stop,
+                    metadata: None,
+                },
+            )
+            .await?;
+            let mutation = async {
+                durable.bind_lease(&operation, &request.user_id).await?;
+                let context = durable.execution_context(&request.user_id);
+                let target = self
+                    .runtime
+                    .capture_app_mutation_target(&context, previous.resource_version.as_deref())
+                    .await
+                    .map_err(|error| map_runtime_error("Capture application stop target", error))?;
+                durable
+                    .checkpoint(
+                        "stopping_runtime",
+                        serde_json::json!({"target":target,"wake_on_traffic":wake_on_traffic}),
+                    )
+                    .await?;
+                self.apply_scale_zero(&target, wake_on_traffic, &previous, &operation)
+                    .await
+            }
+            .await;
+            match mutation {
+                Ok(()) => {
+                    durable.confirm_effects().await?;
+                    durable.succeed().await?;
+                    operation.mark_completed();
+                }
+                Err(error) => {
+                    if operation.has_unfinished_mutation() {
+                        durable.fail(&error).await?;
+                    } else {
+                        durable.reject_without_mutation(&error).await?;
+                    }
+                    return Err(error);
+                }
+            }
+            self.get_app(app_id).await
+        }
+        .await;
+        if result.is_ok() || !operation.has_unfinished_mutation() {
+            operation.finish().await?;
+        }
+        result
+    }
+
+    pub(crate) async fn apply_scale_zero(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        wake_on_traffic: bool,
+        previous: &DeploymentStatus,
+        operation: &crate::service::AppOperationGuard,
+    ) -> AppResult<()> {
+        let app_id = &target.context.app_id;
+        let previous_wake = previous
             .wake_on_traffic
             .unwrap_or_else(|| !self.activity.is_wake_blocked(app_id));
-        // 先阻断内存态唤醒，再持久化停止原因，避免 scale0 与请求触发 scale1 竞态。
         operation.mark_mutating()?;
         self.activity.mark_wake_blocked(app_id);
-        if let Err(error) = self
-            .runtime
-            .patch_wake_on_traffic(app_id, wake_on_traffic)
-            .await
-        {
-            self.restore_activity_state(app_id, &previous, previous_wake_on_traffic);
-            return Err(map_runtime_error(
-                &format!("[APP] patch wake-on-traffic failed app_id={app_id}"),
+        if let Err(error) = self.runtime.stop_app_target(target, wake_on_traffic).await {
+            // This target operation makes exactly one remote stop/scale request.
+            // A structured rejection therefore proves this stop had no effects.
+            if matches!(
                 error,
-            ));
-        }
-        if let Err(error) = self.runtime.scale_deployment(app_id, 0).await {
-            self.restore_activity_state(app_id, &previous, previous_wake_on_traffic);
-            if let Err(restore_error) = self
-                .runtime
-                .patch_wake_on_traffic(app_id, previous_wake_on_traffic)
-                .await
-            {
-                warn!(app_id, %restore_error, "failed to restore wake-on-traffic after scale0 failure");
+                container_runtime_api::ContainerRuntimeError::RequestRejected(_)
+            ) {
+                operation.mark_rejected_before_mutation();
+                self.restore_activity_state(app_id, previous, previous_wake);
             }
-            return Err(map_runtime_error(
-                &format!("[APP] scale_deployment failed app_id={app_id}"),
-                error,
-            ));
+            // Do not issue a compensating name-based patch after an uncertain
+            // response or version conflict. It could modify a replacement.
+            // Keep traffic wake blocked until recovery resolves the stop outcome.
+            return Err(map_runtime_error("Stop captured application", error));
         }
         if wake_on_traffic {
             self.activity.mark_recycled(app_id);
         }
-        info!("[APP] app stopped (scale=0): {}", app_id);
-        operation.finish().await?;
-        self.get_app(app_id).await
+        info!(app_id, operation_id = %target.context.operation_id, "Application stopped using captured resource identity");
+        Ok(())
     }
 
     pub(crate) fn restore_activity_state(
@@ -127,74 +353,23 @@ impl AppService {
     /// 重启应用（rollout restart）
     #[instrument(skip(self))]
     pub async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
-        validate_app_id(app_id)?;
-        let operation = self.acquire_process_release_lock(app_id).await?;
-        self.ensure_app_exists(app_id).await?;
-        operation.mark_mutating()?;
-        self.runtime.restart_deployment(app_id).await.map_err(|e| {
-            map_runtime_error(
-                &format!("[APP] restart_deployment failed app_id={app_id}"),
-                e,
-            )
-        })?;
-        info!("[APP] app restarted (rollout): {}", app_id);
-        operation.finish().await?;
-        self.get_app(app_id).await
-    }
-
-    /// 设置闲置回收策略（动态、免重启：strategic-merge Deployment 注解，不碰 pod template）。
-    /// 供管理/运营面策略调整调用。Fail Fast：两字段皆 None → ERR_VALIDATION。
-    #[instrument(skip(self))]
-    pub async fn set_recycle_policy(
-        &self,
-        app_id: &str,
-        request: RecyclePolicyRequest,
-    ) -> AppResult<AppRuntimeInfo> {
-        validate_app_id(app_id)?;
-        // Fail Fast:先校验请求形状,再查 app 是否存在(空请求不浪费 K8s GET)
-        validate_recycle_policy_fields(
-            request.recycle_enabled,
-            request.idle_timeout_seconds,
-            request.wake_on_traffic,
-        )?;
-        self.ensure_app_exists(app_id).await?;
-        self.runtime
-            .patch_recycle_policy(
-                app_id,
-                request.recycle_enabled,
-                request.idle_timeout_seconds,
-            )
-            .await
-            .map_err(|e| {
-                map_runtime_error(
-                    &format!("[APP] patch_recycle_policy failed app_id={app_id}"),
-                    e,
-                )
+        let identity = self
+            .metadata
+            .store
+            .get_application(app_id)
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
             })?;
-        // 流量唤醒语义独立注解（rcoder.io/wake-on-traffic），trait 默认 no-op
-        //（无持久注解能力的 runtime 安全降级）；patch 失败上抛——注解写入是
-        // 显式请求语义，静默丢弃会让 wake_on_traffic 回读与期望不一致。
-        if let Some(enabled) = request.wake_on_traffic {
-            self.runtime
-                .patch_wake_on_traffic(app_id, enabled)
-                .await
-                .map_err(|e| {
-                    // recycle 字段已生效（上方 patch 成功）：整体报错需注明部分
-                    // 生效态，避免计费侧按"全部未生效"重放整组 patch。
-                    map_runtime_error(
-                        &format!(
-                            "[APP] patch_wake_on_traffic failed app_id={app_id} \
-                             (recycle_enabled/idle_timeout already applied)",
-                        ),
-                        e,
-                    )
-                })?;
-        }
-        info!(
-            "[APP] recycle policy updated: {} (enabled={:?}, idle_timeout={:?}, wake_on_traffic={:?})",
-            app_id, request.recycle_enabled, request.idle_timeout_seconds, request.wake_on_traffic
-        );
-        self.get_app(app_id).await
+        self.restart_app_controlled(
+            app_id,
+            shared_types::UserAppControlRequest {
+                user_id: identity.user_id,
+                lifecycle_id: None,
+                request_id: None,
+            },
+        )
+        .await
     }
 
     /// 获取资源使用情况（app_stage 分派：prod=运行容器 label 查询；dev=开发容器
@@ -441,7 +616,7 @@ impl AppService {
 }
 
 /// 校验 recycle-policy 请求至少带一个字段(纯函数,便于单测)。
-fn validate_recycle_policy_fields(
+pub(super) fn validate_recycle_policy_fields(
     recycle_enabled: Option<bool>,
     idle_timeout_seconds: Option<u64>,
     wake_on_traffic: Option<bool>,

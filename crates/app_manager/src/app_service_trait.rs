@@ -12,6 +12,41 @@ use super::models::*;
 ///   业务元数据由调用方（Java）持久化。
 #[async_trait]
 pub trait AppServiceTrait: Send + Sync {
+    async fn retry_control_operation(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+        request: shared_types::UserAppRetryRequest,
+    ) -> AppResult<shared_types::UserAppOperationView>;
+    /// Internal recovery entry, not an HTTP mutation API. Returns false for
+    /// operations that lack safe Pending control inputs or were claimed elsewhere.
+    async fn resume_pending_control(
+        &self,
+        operation: &shared_types::UserAppOperationRecord,
+    ) -> AppResult<bool>;
+    async fn get_lifecycle(
+        &self,
+        app_id: &str,
+        user_id: &str,
+    ) -> AppResult<shared_types::UserAppLifecycleRecord>;
+    async fn get_control_operation(
+        &self,
+        app_id: &str,
+        user_id: &str,
+        operation_id: Option<&str>,
+    ) -> AppResult<Option<shared_types::UserAppOperationView>>;
+    async fn get_control_operation_by_request(
+        &self,
+        app_id: &str,
+        user_id: &str,
+        request_id: &str,
+    ) -> AppResult<Option<shared_types::UserAppOperationView>>;
+    async fn recreate_identity(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppRecreateRequest,
+    ) -> AppResult<shared_types::UserAppLifecycleRecord>;
+
     /// 记录开发注册（userApp create-workspace 时 owner user_id 落库；
     /// name 为空 = 开发期，部署 create_app 后 upsert 补全业务字段）
     async fn record_dev_registration(&self, app_id: &str, user_id: &str) -> AppResult<()>;
@@ -38,6 +73,28 @@ pub trait AppServiceTrait: Send + Sync {
     /// 获取应用运行时详情（实时查集群）
     async fn get_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
 
+    /// Public owner-scoped read. The second identity read prevents returning a
+    /// runtime observation across deletion/recreation without taking a write lease.
+    async fn get_app_for_owner(&self, app_id: &str, user_id: &str) -> AppResult<AppRuntimeInfo> {
+        let before = self.get_lifecycle(app_id, user_id).await?;
+        if before.state != shared_types::UserAppLifecycleState::Active {
+            return Err(AppOperationError::Conflict(
+                "Application lifecycle is not active".into(),
+            ));
+        }
+        let runtime = self.get_app(app_id).await?;
+        let after = self.get_lifecycle(app_id, user_id).await?;
+        if after.lifecycle_id != before.lifecycle_id
+            || after.lifecycle_epoch != before.lifecycle_epoch
+            || after.state != shared_types::UserAppLifecycleState::Active
+        {
+            return Err(AppOperationError::Conflict(
+                "Application lifecycle changed during runtime query".into(),
+            ));
+        }
+        Ok(runtime)
+    }
+
     /// 更新应用（全量替换 desired state）。rcoder 无状态，调用方需发送完整新状态
     /// （`image` 必填）。K8s SSA re-apply 幂等；Docker 重建容器。详见 v2 设计 §5.2。
     async fn update_app(
@@ -54,10 +111,17 @@ pub trait AppServiceTrait: Send + Sync {
         expected_resource_version: Option<&str>,
     ) -> AppResult<()>;
 
-    /// 彻底删除应用（永久删除·幂等·无 confirm）：只给 app_id——prod 计算面 +
-    /// prod PVC + dev 开发环境 + 元数据行全删。app 不存在 = 其余步骤照做并
-    /// 成功（重入收敛）；状态查询失败透传（不当作"不存在"）
+    async fn delete_app_controlled(&self, app_id: &str, request: DeleteAppRequest)
+    -> AppResult<()>;
+
+    /// Delete captured userApp resources and retain a lifecycle tombstone.
     async fn purge_app(&self, app_id: &str) -> AppResult<()>;
+
+    async fn purge_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<()>;
 
     /// 查询单个应用持久存储状态（prod=运行卷 / dev=开发卷；O(1) stat，不含 size_bytes）
     async fn get_app_storage(
@@ -74,6 +138,12 @@ pub trait AppServiceTrait: Send + Sync {
         app_id: &str,
         user_id: &str,
     ) -> AppResult<()>;
+    async fn clear_app_storage_controlled(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+        request: ClearStorageRequest,
+    ) -> AppResult<String>;
 
     /// 销毁应用持久存储（prod：删 PVC，需 confirm==app_id 且 app 已 delete；
     /// dev：销毁整个开发环境=builder 容器+dev 卷+目录，不动 metadata）
@@ -84,6 +154,12 @@ pub trait AppServiceTrait: Send + Sync {
         user_id: &str,
         confirm: &str,
     ) -> AppResult<()>;
+    async fn destroy_app_storage_controlled(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+        request: DestroyStorageRequest,
+    ) -> AppResult<String>;
 
     /// PG 凭据对齐（Userapp 运行容器内）：验证传入密码，不一致则重置
     /// （流程单头 `shared_types::align_pg_credentials`，exec 通道实现）
@@ -98,7 +174,7 @@ pub trait AppServiceTrait: Send + Sync {
 
     /// 查 app 的 owner user_id（userapp_metadata；create-workspace/publish 注册）。
     /// 未注册返回 None（调用方自行兜底）。
-    async fn get_app_owner(&self, app_id: &str) -> Option<String>;
+    async fn get_app_owner(&self, app_id: &str) -> AppResult<Option<String>>;
 
     /// 分页查询持久存储（强制分页，无全量模式；prod=运行卷清单，dev=开发卷清单）
     async fn query_storage(
@@ -109,6 +185,11 @@ pub trait AppServiceTrait: Send + Sync {
 
     /// 启动应用（scale replicas = 1；内部传统语义，发布链/编排用）
     async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
+    async fn start_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<AppRuntimeInfo>;
 
     /// 统一部署+启动（无参数 = 传统 start；带 url = 轻量部署 prepare→activate→启动；
     /// 可选 app_stage/idle/pg 对齐）——REST 面删除 create 后的统一入口
@@ -127,12 +208,22 @@ pub trait AppServiceTrait: Send + Sync {
 
     /// 停止应用（scale replicas = 0）
     async fn stop_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
+    async fn stop_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<AppRuntimeInfo>;
 
     /// 闲置回收专用 scale0：持久化允许流量唤醒的停止原因。
     async fn recycle_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
 
     /// 重启应用（rollout restart）
     async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
+    async fn restart_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<AppRuntimeInfo>;
 
     /// 设置闲置回收策略（动态、免重启：只 patch Deployment 注解）。供管理/运营面策略调整调用。
     async fn set_recycle_policy(

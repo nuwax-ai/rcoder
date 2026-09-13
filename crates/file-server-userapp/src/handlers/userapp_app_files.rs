@@ -74,6 +74,12 @@ pub(crate) async fn upload(
     let user_id = require_app_field(user_id, "user_id")?;
     let target = require_app_field(target, "target")?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&app_id)
+        .await
+        .read_owned()
+        .await;
     let root = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
     let result = upload_impl(&root, &target, flatten, data.path(), data.size()).await?;
     info!(app_id = %app_id, user_id = %user_id, target = %target, "app-files upload done");
@@ -181,6 +187,12 @@ pub(crate) async fn upload_from_url(
     State(state): State<UserAppState>,
     Json(body): Json<AppFilesUploadFromUrlBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&body.app_id)
+        .await
+        .read_owned()
+        .await;
     let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
     let downloader = Downloader::new(DownloadConfig::default());
     let cancel = CancellationToken::new();
@@ -228,6 +240,12 @@ pub(crate) async fn list(
     Query(params): Query<AppFilesListParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     tracing::debug!(app_id = %params.app_id, user_id = %params.user_id, "app-files list");
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&params.app_id)
+        .await
+        .read_owned()
+        .await;
     let root = resolve_userapp_dev(&params.app_id, None, &state.fs.config)?;
     if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
         return Ok(Json(json!({"success": true, "files": []})));
@@ -300,6 +318,12 @@ pub(crate) async fn delete(
     Json(body): Json<AppFilesDeleteBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     info!(app_id = %body.app_id, user_id = %body.user_id, path = %body.path, "app-files delete");
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&body.app_id)
+        .await
+        .read_owned()
+        .await;
     let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
     if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
         return Err(AppError::resource(format!(
@@ -337,6 +361,44 @@ pub(crate) async fn delete(
 
 // ── 清空 workspace（json {app_id}）─────────────────────────────────────────────
 
+static CLEAR_INSTANCE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
+
+/// 查询开发工作区重置实例
+///
+/// 内部控制协议：在捕获的单个 builder 实例上读取进程身份，不通过负载均衡地址。
+/// 调用方随后将返回的 instance_id 作为 expected_instance_id 提交至 clear；
+/// 查询不创建工作区、不清理文件。成功返回未包装的目标 DTO，业务失败沿用错误信封。
+#[utoipa::path(get, path = "/app-files/clear-target",
+    params(
+        ("app_id"=String, Query, description = "Application identifier whose workspace will be reset"),
+        ("user_id"=String, Query, description = "Application owner identifier from the lifecycle operation")
+    ),
+    responses((status=200, description="Reset target identity, or a business error envelope", body=shared_types::UserAppWorkspaceClearTarget)),
+    tag = "Userapp · 双态 · 文件与存储")]
+pub(crate) async fn clear_target(
+    State(state): State<UserAppState>,
+    Query(query): Query<shared_types::UserAppWorkspaceClearProbe>,
+) -> Result<Json<shared_types::UserAppWorkspaceClearTarget>, AppError> {
+    shared_types::validate_identifier(&query.user_id, "user_id").map_err(AppError::validation)?;
+    resolve_userapp_dev(&query.app_id, None, &state.fs.config)?;
+    Ok(Json(shared_types::UserAppWorkspaceClearTarget {
+        app_id: query.app_id,
+        instance_id: CLEAR_INSTANCE.clone(),
+    }))
+}
+
+fn validate_clear_instance(body: &AppFilesClearBody, current: &str) -> AppResult<()> {
+    shared_types::validate_identifier(&body.app_id, "app_id").map_err(AppError::validation)?;
+    shared_types::validate_identifier(&body.user_id, "user_id").map_err(AppError::validation)?;
+    if body.expected_instance_id.is_empty() || body.expected_instance_id != current {
+        return Err(AppError::business(
+            "Workspace clear target changed; observe its current identity before submitting a new operation",
+        ));
+    }
+    Ok(())
+}
+
 /// 清空 workspace 内容（留容器留卷）
 ///
 /// rcoder `POST /api/v1/userapp/{app_id}/dev/storage/clear` 的容器侧实现：
@@ -351,48 +413,86 @@ pub(crate) async fn delete(
 内容、保留根目录本身。幂等：workspace 不存在视为已空直接成功。与 prod 的
 storage/clear（K8s 删 PVC 重建空卷）语义不同——开发容器常驻，卷重建要求先
 销毁容器，得不偿失。
+
+内部控制请求须携带 app_id、user_id 及通过 clear-target 捕获的 expected_instance_id。
+进程实例已替换时拒绝请求，不清理替代实例。成功响应为未包装的
+{success: true, instance_id}，调用方必须核对 instance_id；HTTP 200 错误信封不代表清理成功。
 "#,
-    responses(file_server::openapi::JsonApiResponses),
+    responses((status=200, description="Confirmed reset acknowledgement, or a business error envelope", body=shared_types::UserAppWorkspaceClearResult)),
     tag = "Userapp · 双态 · 文件与存储"
 )]
 pub(crate) async fn clear(
     State(state): State<UserAppState>,
     Json(body): Json<AppFilesClearBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<shared_types::UserAppWorkspaceClearResult>, AppError> {
+    validate_clear_instance(&body, &CLEAR_INSTANCE)?;
     info!(
         app_id = %body.app_id,
         user_id = %body.user_id,
         "app-files clear (workspace reset)"
     );
     let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
-    if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
-        return Ok(Json(json!({"success": true})));
-    }
-    let mut entries = tokio::fs::read_dir(&root)
+    // Dropping the HTTP observer must not release a lease while filesystem
+    // operations accepted by the worker are still running.
+    tokio::spawn(reset_workspace(state, body.app_id, root))
         .await
-        .map_err(|e| AppError::system(format!("read workspace {}: {e}", root.display())))?;
-    while let Some(entry) = entries
-        .next_entry()
+        .map_err(|error| {
+            AppError::system(format!("Workspace reset worker interrupted: {error}"))
+        })??;
+    Ok(Json(shared_types::UserAppWorkspaceClearResult {
+        success: true,
+        instance_id: CLEAR_INSTANCE.clone(),
+    }))
+}
+
+async fn reset_workspace(
+    state: UserAppState,
+    app_id: String,
+    root: std::path::PathBuf,
+) -> AppResult<()> {
+    let directory = shared_types::storage_contents::StorageDirectoryLease::capture(&root)
         .await
-        .map_err(|e| AppError::system(format!("traverse workspace: {e}")))?
+        .map_err(|error| AppError::system(format!("Capture workspace directory: {error}")))?;
+    let lifecycle = state.build_tasks.dev_lifecycle(&app_id).await;
     {
-        let path = entry.path();
-        // metadata 而非 entry.file_type()：前者跟随符号链接，与 Path::is_dir 语义一致
-        let remove = if tokio::fs::metadata(&path)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
-            tokio::fs::remove_dir_all(&path).await
-        } else {
-            tokio::fs::remove_file(&path).await
-        };
-        remove.map_err(|e| {
-            AppError::system(format!("clear workspace entry {}: {e}", path.display()))
-        })?;
+        let mut generation = lifecycle.lock().await;
+        *generation = generation
+            .checked_add(1)
+            .ok_or_else(|| AppError::system("Dev lifecycle generation exhausted"))?;
+        for task in state.build_tasks.active_tasks_for_app(&app_id).await {
+            super::userapp::cancel_build_task(&task).await;
+        }
     }
-    info!(app_id = %body.app_id, "app-files clear done (root retained)");
-    Ok(Json(json!({"success": true})))
+    // Release lifecycle before awaiting workers: commit_start needs it in order
+    // to observe cancellation and release its workspace activity lease.
+    let activity = state.build_tasks.workspace_activity(&app_id).await;
+    let _exclusive =
+        tokio::time::timeout(std::time::Duration::from_secs(90), activity.write_owned())
+            .await
+            .map_err(|_| {
+                AppError::business("Workspace workers did not finish before reset deadline")
+            })?;
+    let mut generation = lifecycle.lock().await;
+    directory.validate_current().await.map_err(|error| {
+        AppError::business(format!("Workspace directory changed before reset: {error}"))
+    })?;
+    *generation = generation
+        .checked_add(1)
+        .ok_or_else(|| AppError::system("Dev lifecycle generation exhausted"))?;
+    // Include newer tasks that finished before the exclusive lease was queued.
+    let key = super::userapp_dev_server::dev_key(&app_id);
+    let stopped = state.fs.dev_server.stop_dev(&key).await?;
+    if stopped.killed_pids.iter().any(|process| !process.killed) {
+        return Err(AppError::business(
+            "Development processes are still running; workspace was not cleared",
+        ));
+    }
+    state.fs.log_cache.delete(&key)?;
+    directory.clear().await.map_err(|error| {
+        AppError::system(format!("Clear workspace {}: {error}", root.display()))
+    })?;
+    info!(%app_id, "app-files clear done (root retained)");
+    Ok(())
 }
 
 // ── 共用防护 ─────────────────────────────────────────────────────────────────────
@@ -434,4 +534,182 @@ async fn ensure_within_root(
 
 fn map_archive_error(e: download_utils::ArchiveError) -> AppError {
     AppError::validation(format!("archive error: {e}"))
+}
+
+#[cfg(test)]
+mod clear_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn registered_routes_preserve_the_internal_reset_wire_contract() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt as _;
+
+        let directory = tempfile::tempdir().expect("fixture");
+        let state = super::super::userapp_files::tests_support::make_state(directory.path().into());
+        let workspace = directory.path().join("clear-wire");
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("workspace");
+        tokio::fs::write(workspace.join("keep.txt"), b"original")
+            .await
+            .expect("content");
+        let (router, _) = crate::routes::userapp_top_router().split_for_parts();
+        let router = router.with_state(state);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            router.clone().oneshot(
+                Request::builder()
+                    .uri("/api/v1/userapp/app-files/clear-target?app_id=clear-wire&user_id=owner")
+                    .body(Body::empty())
+                    .expect("probe"),
+            ),
+        )
+        .await
+        .expect("probe deadline")
+        .expect("probe response");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("probe body");
+        let target: shared_types::UserAppWorkspaceClearTarget =
+            serde_json::from_slice(&bytes).expect("unwrapped target DTO");
+        assert_eq!(target.app_id, "clear-wire");
+        assert!(!target.instance_id.is_empty());
+
+        for (instance, succeeds) in [
+            ("previous-instance", false),
+            (target.instance_id.as_str(), true),
+        ] {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                router.clone().oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/userapp/app-files/clear")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&AppFilesClearBody {
+                                app_id: target.app_id.clone(),
+                                user_id: "owner".into(),
+                                expected_instance_id: instance.into(),
+                            })
+                            .expect("clear JSON"),
+                        ))
+                        .expect("clear request"),
+                ),
+            )
+            .await
+            .expect("clear deadline")
+            .expect("clear response");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .expect("clear body");
+            let result =
+                serde_json::from_slice::<shared_types::UserAppWorkspaceClearResult>(&bytes);
+            if succeeds {
+                assert_eq!(status, axum::http::StatusCode::OK);
+                assert!(
+                    result
+                        .expect("unwrapped reset DTO")
+                        .confirms(&target.instance_id)
+                );
+                assert!(!workspace.join("keep.txt").exists());
+                assert!(workspace.is_dir());
+            } else {
+                assert!(!status.is_success());
+                assert!(
+                    result.is_err(),
+                    "business error must not decode as a reset acknowledgement"
+                );
+                assert_eq!(
+                    tokio::fs::read(workspace.join("keep.txt"))
+                        .await
+                        .expect("retained content"),
+                    b"original"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replaced_instance_is_rejected_before_workspace_mutation() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let state = super::super::userapp_files::tests_support::make_state(directory.path().into());
+        let workspace = directory.path().join("clear-identity");
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("workspace");
+        tokio::fs::write(workspace.join("keep.txt"), b"original")
+            .await
+            .expect("content");
+        let target = clear_target(
+            State(state.clone()),
+            Query(shared_types::UserAppWorkspaceClearProbe {
+                app_id: "clear-identity".into(),
+                user_id: "owner".into(),
+            }),
+        )
+        .await
+        .expect("target identity")
+        .0;
+        assert!(!target.instance_id.is_empty());
+        let result = clear(
+            State(state.clone()),
+            Json(AppFilesClearBody {
+                app_id: "clear-identity".into(),
+                user_id: "owner".into(),
+                expected_instance_id: "previous-process".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Business(_))));
+        assert_eq!(
+            tokio::fs::read(workspace.join("keep.txt"))
+                .await
+                .expect("retained content"),
+            b"original"
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            clear(
+                State(state),
+                Json(AppFilesClearBody {
+                    app_id: "clear-identity".into(),
+                    user_id: "owner".into(),
+                    expected_instance_id: target.instance_id.clone(),
+                }),
+            ),
+        )
+        .await
+        .expect("clear deadline")
+        .expect("matching instance");
+        assert!(result.0.success);
+        assert_eq!(result.0.instance_id, target.instance_id);
+        assert!(workspace.is_dir());
+        assert!(
+            tokio::fs::read_dir(workspace)
+                .await
+                .expect("root")
+                .next_entry()
+                .await
+                .expect("entry")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn clear_requires_an_explicit_instance_identity_on_the_wire() {
+        assert!(
+            serde_json::from_value::<AppFilesClearBody>(json!({"app_id":"app", "user_id":"owner"}))
+                .is_err()
+        );
+        let request = AppFilesClearBody {
+            app_id: "app".into(),
+            user_id: "owner".into(),
+            expected_instance_id: String::new(),
+        };
+        assert!(validate_clear_instance(&request, "current").is_err());
+    }
 }

@@ -29,6 +29,7 @@ use crate::service::AppService;
 /// 历史用途 wait_app_ready 已退役，现有消费者见 purge 链不缺席测试）。
 #[derive(Default)]
 pub(crate) struct MockRuntime {
+    pub scale_calls: AtomicUsize,
     pub lease_held: Arc<AtomicBool>,
     pub env_commit_failure: AtomicUsize,
     pub patch_preparation_fails: AtomicBool,
@@ -40,6 +41,11 @@ pub(crate) struct MockRuntime {
     pub create_calls: AtomicUsize,
     pub create_fails: AtomicBool,
     pub status_fails: AtomicUsize,
+    pub stop_failure_status: AtomicUsize,
+    pub policy_calls: AtomicUsize,
+    /// Deterministic read window for lifecycle query races; clone outside the
+    /// mutex before awaiting either barrier phase.
+    pub status_barrier: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// start_app（scale>0）后 phase 停在 Error：模拟新版本启动即崩（部署段
     /// 等待器的 Error 态快速失败测试用）。
     pub crash_on_start: AtomicBool,
@@ -124,6 +130,31 @@ impl WorkspaceRuntime for MockRuntime {
         Ok(())
     }
 
+    async fn capture_app_storage_resize(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppStorageResizeTarget>> {
+        Ok(Some(shared_types::UserAppStorageResizeTarget {
+            context: context.clone(),
+            resource: shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+                name: format!("test-pvc-{}", context.app_id),
+                uid: format!("pvc-{}", context.lifecycle_id),
+                resource_version: Some("1".into()),
+            },
+            current_size: "100Gi".into(),
+        }))
+    }
+
+    async fn resize_app_storage_target(
+        &self,
+        target: &shared_types::UserAppStorageResizeTarget,
+        new_size: &str,
+    ) -> ContainerRuntimeResult<StorageResizeOutcome> {
+        self.resize_app_storage(&target.context.app_id, new_size)
+            .await
+    }
+
     async fn resize_app_storage(
         &self,
         app_id: &str,
@@ -150,9 +181,19 @@ impl WorkspaceRuntime for MockRuntime {
     }
 }
 
-struct MockOperationLease(Arc<AtomicBool>);
+struct MockOperationLease(Arc<AtomicBool>, String);
 #[async_trait]
 impl shared_types::AppOperationLease for MockOperationLease {
+    fn receipt(&self) -> Option<shared_types::UserAppOperationLeaseReceipt> {
+        Some(shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+            service_type: ServiceType::Userapp,
+            namespace: "test".into(),
+            name: format!("rcoder-operation-prod-{}", self.1),
+            uid: format!("lease-{}", self.1),
+            resource_version: "1".into(),
+            token: "test-operation".into(),
+        })
+    }
     async fn release(self: Box<Self>) -> Result<(), String> {
         self.0.store(false, Ordering::SeqCst);
         Ok(())
@@ -161,6 +202,19 @@ impl shared_types::AppOperationLease for MockOperationLease {
 
 #[async_trait]
 impl UserAppDeploymentRuntime for MockRuntime {
+    async fn patch_app_policy_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        _policy: &shared_types::UserAppRuntimePolicy,
+    ) -> ContainerRuntimeResult<()> {
+        assert_eq!(
+            target.resource.uid,
+            format!("test-{}", target.context.lifecycle_id)
+        );
+        self.policy_calls.fetch_add(1, Ordering::SeqCst);
+        // Docker policy is persisted by the coordinator, with no runtime writes.
+        Ok(())
+    }
     async fn update_env_configmap_if_version(
         &self,
         _app_id: &str,
@@ -189,7 +243,10 @@ impl UserAppDeploymentRuntime for MockRuntime {
         {
             return Err(ContainerRuntimeError::Conflict("operation owned".into()));
         }
-        Ok(Some(Box::new(MockOperationLease(self.lease_held.clone()))))
+        Ok(Some(Box::new(MockOperationLease(
+            self.lease_held.clone(),
+            _app_id.into(),
+        ))))
     }
 
     async fn capture_app_deletion(
@@ -242,6 +299,11 @@ impl UserAppDeploymentRuntime for MockRuntime {
         &self,
         app_id: &str,
     ) -> ContainerRuntimeResult<Option<DeploymentStatus>> {
+        let barrier = self.status_barrier.lock().expect("status barrier").clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
         // 注入的瞬时后端错误（模拟 API 抖动/网络瞬断），扣减后恢复
         let pending = self.status_fails.load(Ordering::SeqCst);
         if pending > 0 {
@@ -258,7 +320,114 @@ impl UserAppDeploymentRuntime for MockRuntime {
             .map(|entry| entry.value().clone()))
     }
 
+    async fn capture_app_mutation_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        expected_resource_version: Option<&str>,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        context
+            .validate_identity(&context.app_id, Some(&context.user_id))
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let status = self
+            .get_deployment_status(&context.app_id)
+            .await?
+            .ok_or_else(|| ContainerRuntimeError::Conflict("Stop target missing".into()))?;
+        if expected_resource_version
+            .is_some_and(|value| status.resource_version.as_deref() != Some(value))
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Stop target version changed".into(),
+            ));
+        }
+        Ok(shared_types::UserAppMutationTarget {
+            context: context.clone(),
+            resource: shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::Deployment,
+                name: context.app_id.clone(),
+                uid: format!("test-{}", context.lifecycle_id),
+                resource_version: status.resource_version,
+            },
+        })
+    }
+
+    async fn restart_app_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.start_app_target(target).await
+    }
+
+    async fn start_app_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.scale_calls.fetch_add(1, Ordering::SeqCst);
+        match self.deployments.entry(target.context.app_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if entry.get().resource_version != target.resource.resource_version {
+                    return Err(ContainerRuntimeError::Conflict(
+                        "Start target version changed".into(),
+                    ));
+                }
+                let status = entry.get_mut();
+                status.replicas = 1;
+                status.ready_replicas = 1;
+                status.phase = if self.crash_on_start.load(Ordering::SeqCst) {
+                    "Error"
+                } else {
+                    "Running"
+                }
+                .into();
+                status.wake_on_traffic = Some(true);
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => Err(ContainerRuntimeError::Conflict(
+                "Start target removed".into(),
+            )),
+        }
+    }
+
+    async fn stop_app_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        wake_on_traffic: bool,
+    ) -> ContainerRuntimeResult<()> {
+        self.scale_calls.fetch_add(1, Ordering::SeqCst);
+        let failure = self.stop_failure_status.load(Ordering::SeqCst);
+        if failure != 0 {
+            if let Some(rejection) = shared_types::RuntimeRequestRejection::from_status(
+                failure as u16,
+                "Injected stop request rejection".into(),
+            ) {
+                return Err(ContainerRuntimeError::RequestRejected(rejection));
+            }
+            return Err(ContainerRuntimeError::ConnectionError(
+                "Injected uncertain stop result".into(),
+            ));
+        }
+        // One entry guard models the runtime's conditional atomic stop commit.
+        match self.deployments.entry(target.context.app_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if entry.get().resource_version != target.resource.resource_version {
+                    return Err(ContainerRuntimeError::Conflict(
+                        "Stop target version changed".into(),
+                    ));
+                }
+                let status = entry.get_mut();
+                status.replicas = 0;
+                status.ready_replicas = 0;
+                status.phase = "Stopped".into();
+                status.wake_on_traffic = Some(wake_on_traffic);
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => Err(ContainerRuntimeError::Conflict(
+                "Stop target removed".into(),
+            )),
+        }
+    }
+
     async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
+        self.scale_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(mut entry) = self.deployments.get_mut(app_id) {
             let status = entry.value_mut();
             status.replicas = replicas;
@@ -348,7 +517,15 @@ impl UserAppDeploymentRuntime for MockRuntime {
 
 /// 直构造 AppService（绕过 `new` 的 HostPathResolver/K8s 前置校验副作用），
 /// Docker 模式 + 指定 workspace_root（测试 tempdir）。
-pub(crate) fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime>) -> AppService {
+pub(crate) async fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime>) -> AppService {
+    tokio::fs::create_dir_all(workspace_root)
+        .await
+        .expect("test workspace");
+    let store = rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
+        &workspace_root.join(format!("metadata-{}.sqlite3", uuid::Uuid::new_v4())),
+    )
+    .await
+    .expect("SQLite metadata store");
     let config = AppManagerConfig {
         workspace_root: Some(workspace_root.to_string_lossy().into_owned()),
         operation_lock_root: workspace_root.to_string_lossy().into_owned(),
@@ -362,9 +539,10 @@ pub(crate) fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime>) -> 
         pingora: None,
         pingora_ports: DashMap::new(),
         release_locks: DashMap::new(),
-        metadata: crate::runtime::metadata::AppMetadataStore::default(),
+        metadata: crate::runtime::metadata::AppMetadataStore::new(Arc::new(store)),
         dev_cleanup: std::sync::RwLock::new(None),
         dev_locator: std::sync::RwLock::new(None),
+        builder_recovery: std::sync::RwLock::new(None),
         deploy_list_cache: tokio::sync::Mutex::new(None),
     }
 }
@@ -425,20 +603,26 @@ pub(crate) struct StubDevCleanup {
 impl shared_types::UserappDevCleanup for StubDevCleanup {
     async fn capture(
         &self,
-        _app_id: &str,
+        app_id: &str,
     ) -> Result<Box<dyn shared_types::UserappDevDeletion>, String> {
         Ok(Box::new(StubDevDeletion {
+            app_id: app_id.into(),
             calls: self.calls.clone(),
             fails: self.fails.clone(),
         }))
     }
 }
 struct StubDevDeletion {
+    app_id: String,
     calls: Arc<AtomicUsize>,
     fails: Arc<AtomicBool>,
 }
 #[async_trait]
 impl shared_types::UserappDevDeletion for StubDevDeletion {
+    fn receipt(&self) -> shared_types::UserappDevDeletionReceipt {
+        dev_deletion_receipt(&self.app_id)
+    }
+
     async fn cleanup(self: Box<Self>) -> Result<(), String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.fails.load(Ordering::SeqCst) {
@@ -449,39 +633,76 @@ impl shared_types::UserappDevDeletion for StubDevDeletion {
     }
 }
 
-/// 内存版 [`shared_types::AppMetadataPersistence`]（query 过滤测试注入用；
-/// rows 可从测试侧直接读写断言）。
-pub(crate) struct InMemoryMetadataPersistence {
-    pub rows: std::sync::Mutex<Vec<shared_types::AppMetadataRecord>>,
-}
-
-impl InMemoryMetadataPersistence {
-    pub fn new(rows: Vec<shared_types::AppMetadataRecord>) -> Arc<Self> {
-        Arc::new(Self {
-            rows: std::sync::Mutex::new(rows),
-        })
+pub(crate) fn dev_deletion_receipt(app_id: &str) -> shared_types::UserappDevDeletionReceipt {
+    shared_types::UserappDevDeletionReceipt {
+        runtime: shared_types::BuilderDeletionSnapshot {
+            resource_binding: None,
+            app_id: app_id.into(),
+            operation_id: "fixture-builder-deletion".into(),
+            resources: vec![shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::Container,
+                name: format!("rcoder-app-builder-{app_id}"),
+                uid: "fixture-builder-uid".into(),
+                resource_version: None,
+            }],
+            docker_bind_cleanup: false,
+        },
+        registry: Some(shared_types::BuilderRegistryIdentity {
+            generation: "fixture-project-generation".into(),
+            container_id: "fixture-builder-uid".into(),
+        }),
     }
 }
 
-#[async_trait]
-impl shared_types::AppMetadataPersistence for InMemoryMetadataPersistence {
-    async fn upsert(&self, record: &shared_types::AppMetadataRecord) -> anyhow::Result<()> {
-        let mut rows = self.rows.lock().expect("rows lock");
-        match rows.iter_mut().find(|r| r.app_id == record.app_id) {
-            Some(existing) => *existing = record.clone(),
-            None => rows.push(record.clone()),
-        }
-        Ok(())
+/// Storage-only fixture: all resource inventories were empty. Exercise the same
+/// confirmed-stage protocol without running a container engine.
+pub(crate) async fn complete_empty_deletion_fixture(
+    mut operation: crate::service::OwnedOperation,
+    owner: &str,
+) {
+    use shared_types::UserAppDeletionStage as Stage;
+    let context = operation.execution_context(owner);
+    let app_id = context.app_id.clone();
+    let mut checkpoint = shared_types::UserAppDeletionCheckpoint {
+        schema_version: 1,
+        stage: Stage::Captured,
+        context,
+        kind: shared_types::UserAppOperationKind::DeleteApplication,
+        production: shared_types::AppDeletionSnapshot {
+            app_id: app_id.clone(),
+            operation_id: "empty-production".into(),
+            resources: vec![],
+        },
+        development: Some(shared_types::UserappDevDeletionReceipt {
+            runtime: shared_types::BuilderDeletionSnapshot {
+                resource_binding: None,
+                app_id,
+                operation_id: "empty-development".into(),
+                resources: vec![],
+                docker_bind_cleanup: false,
+            },
+            registry: None,
+        }),
+    };
+    operation
+        .checkpoint(
+            "resources_captured",
+            serde_json::to_value(&checkpoint).expect("fixture checkpoint"),
+        )
+        .await
+        .expect("captured");
+    for stage in [
+        Stage::ComputeRemoved,
+        Stage::ProductionStorageRemoved,
+        Stage::DevelopmentRemoved,
+    ] {
+        operation
+            .deletion_progress(&mut checkpoint, stage)
+            .await
+            .expect("confirmed empty resource boundary");
     }
-
-    async fn load_all(&self) -> anyhow::Result<Vec<shared_types::AppMetadataRecord>> {
-        Ok(self.rows.lock().expect("rows lock").clone())
-    }
-
-    async fn delete_if_current(&self, app_id: &str, generation: &str) -> anyhow::Result<bool> {
-        let mut rows = self.rows.lock().expect("rows lock");
-        let before = rows.len();
-        rows.retain(|r| r.app_id != app_id || r.generation != generation);
-        Ok(rows.len() != before)
-    }
+    operation
+        .succeed()
+        .await
+        .expect("fixture deletion completion");
 }

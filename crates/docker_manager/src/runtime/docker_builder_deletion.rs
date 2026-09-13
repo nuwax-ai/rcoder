@@ -4,6 +4,40 @@ use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResu
 use shared_types::{AppResourceIdentity, AppResourceKind, BuilderDeletionSnapshot, ServiceType};
 
 impl DockerRuntime {
+    pub(super) async fn captured_builder_workspace(
+        &self,
+        snapshot: &BuilderDeletionSnapshot,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> Result<shared_types::UserAppBuilderWorkspaceEndpoint> {
+        context
+            .validate_identity(&snapshot.app_id, Some(&context.user_id))
+            .map_err(Error::Conflict)?;
+        let [resource] = snapshot.resources.as_slice() else {
+            return Err(Error::Conflict(
+                "Builder container receipt is ambiguous or missing".into(),
+            ));
+        };
+        if resource.kind != AppResourceKind::Container || resource.uid.is_empty() {
+            return Err(Error::Conflict(
+                "Builder container receipt is invalid".into(),
+            ));
+        }
+        let info = self
+            .inner
+            .get_docker_client()
+            .inspect_container(&resource.uid, None)
+            .await
+            .map_err(|error| {
+                Error::DockerError(format!("Inspect captured builder endpoint: {error}"))
+            })?;
+        workspace_endpoint_from_bound_container(
+            &info,
+            resource,
+            context,
+            snapshot.resource_binding.as_ref(),
+        )
+    }
+
     pub(super) async fn acquire_builder_lease(
         &self,
         app_id: &str,
@@ -16,6 +50,25 @@ impl DockerRuntime {
         app_id: &str,
         family: &ServiceType,
     ) -> Result<Box<dyn shared_types::AppOperationLease>> {
+        self.acquire_application_file_lease_with_context(app_id, family, None)
+            .await
+    }
+
+    pub(super) async fn acquire_application_file_lease_with_context(
+        &self,
+        app_id: &str,
+        family: &ServiceType,
+        context: Option<&shared_types::UserAppExecutionContext>,
+    ) -> Result<Box<dyn shared_types::AppOperationLease>> {
+        let marker = if let Some(context) = context {
+            context
+                .validate_identity(app_id, Some(&context.user_id))
+                .map_err(Error::ConfigurationError)?;
+            shared_types::AppFileMutationMarker::for_operation(&context.operation_id)
+                .map_err(|error| Error::ConfigurationError(error.to_string()))?
+        } else {
+            shared_types::AppFileMutationMarker::new()
+        };
         let prefix = match family {
             ServiceType::Userapp => "prod",
             ServiceType::UserappBuilder => "builder",
@@ -39,18 +92,50 @@ impl DockerRuntime {
             .join(".app-operation-locks");
         let name = format!("{prefix}-{app_id}.lock");
         let mut pending = tokio::task::spawn_blocking(move || {
-            lock_builder_file(&root, &name).map(|lease| UnclaimedBuilderLease(Some(lease)))
+            lock_builder_file_with_marker(&root, &name, marker)
+                .map(|lease| UnclaimedBuilderLease(Some(lease)))
         })
         .await
         .map_err(|e| Error::DockerError(format!("builder operation lease worker: {e}")))??;
-        let lease = pending
+        let mut lease = pending
             .0
             .take()
             .ok_or_else(|| Error::DockerError("builder lease was already claimed".into()))?;
+        lease.service_type = family.clone();
         Ok(Box::new(lease))
     }
+    pub(super) async fn release_captured_file_lease(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> Result<()> {
+        context
+            .validate_identity(&context.app_id, Some(&context.user_id))
+            .map_err(Error::ConfigurationError)?;
+        receipt.validate().map_err(Error::ConfigurationError)?;
+        let prefix = match receipt.service_type() {
+            ServiceType::Userapp => "prod",
+            ServiceType::UserappBuilder => "builder",
+            _ => {
+                return Err(Error::ConfigurationError(
+                    "Invalid application lease family".into(),
+                ));
+            }
+        };
+        let path = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+            .join(".app-operation-locks")
+            .join(format!("{prefix}-{}.lock", context.app_id));
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || release_file_receipt(&path, &receipt))
+            .await
+            .map_err(|error| {
+                Error::DockerError(format!("Operation lease cleanup worker failed: {error}"))
+            })?
+    }
+
     pub(super) async fn capture_builder(&self, app_id: &str) -> Result<BuilderDeletionSnapshot> {
         let mut snapshot = BuilderDeletionSnapshot {
+            resource_binding: None,
             app_id: app_id.into(),
             operation_id: uuid::Uuid::new_v4().to_string(),
             resources: vec![],
@@ -152,7 +237,59 @@ impl DockerRuntime {
     }
 }
 
-fn builder_identity(
+#[cfg(test)]
+fn workspace_endpoint_from_container(
+    info: &bollard::models::ContainerInspectResponse,
+    resource: &AppResourceIdentity,
+    context: &shared_types::UserAppExecutionContext,
+) -> Result<shared_types::UserAppBuilderWorkspaceEndpoint> {
+    workspace_endpoint_from_bound_container(info, resource, context, None)
+}
+
+fn workspace_endpoint_from_bound_container(
+    info: &bollard::models::ContainerInspectResponse,
+    resource: &AppResourceIdentity,
+    context: &shared_types::UserAppExecutionContext,
+    binding: Option<&shared_types::UserAppResourceBinding>,
+) -> Result<shared_types::UserAppBuilderWorkspaceEndpoint> {
+    let actual = super::docker_builder_control::control_identity_with_binding(
+        info,
+        &resource.name,
+        context,
+        binding,
+        false,
+    )?;
+    if actual != *resource {
+        return Err(Error::Conflict(
+            "Captured builder container identity changed".into(),
+        ));
+    }
+    if info.state.as_ref().and_then(|state| state.running) != Some(true) {
+        return Err(Error::Conflict(
+            "Captured builder container is not running".into(),
+        ));
+    }
+    let preferred = info
+        .host_config
+        .as_ref()
+        .and_then(|config| config.network_mode.as_deref());
+    let address = super::docker_runtime::extract_container_ip(info, preferred)
+        .parse::<std::net::IpAddr>()
+        .map_err(|error| {
+            Error::ConfigurationError(format!("Invalid builder endpoint address: {error}"))
+        })?;
+    if address.is_unspecified() {
+        return Err(Error::ConfigurationError(
+            "Builder endpoint address is unspecified".into(),
+        ));
+    }
+    Ok(shared_types::UserAppBuilderWorkspaceEndpoint {
+        container_id: actual.uid,
+        address,
+    })
+}
+
+pub(super) fn builder_identity(
     info: bollard::models::ContainerInspectResponse,
     name: &str,
     app_id: &str,
@@ -182,7 +319,16 @@ fn builder_identity(
     })
 }
 
+#[cfg(test)]
 fn lock_builder_file(root: &std::path::Path, name: &str) -> Result<BuilderFileLease> {
+    lock_builder_file_with_marker(root, name, shared_types::AppFileMutationMarker::new())
+}
+
+fn lock_builder_file_with_marker(
+    root: &std::path::Path,
+    name: &str,
+    marker: shared_types::AppFileMutationMarker,
+) -> Result<BuilderFileLease> {
     std::fs::create_dir_all(root)
         .map_err(|e| Error::DockerError(format!("builder operation lock directory: {e}")))?;
     let file = std::fs::OpenOptions::new()
@@ -196,7 +342,6 @@ fn lock_builder_file(root: &std::path::Path, name: &str) -> Result<BuilderFileLe
         .map_err(|e| Error::Conflict(format!("builder operation lease unavailable: {e}")))?;
     shared_types::AppFileMutationMarker::check_clean(&file)
         .map_err(|e| Error::Conflict(format!("builder operation requires recovery: {e}")))?;
-    let marker = shared_types::AppFileMutationMarker::new();
     marker
         .begin(&file)
         .map_err(|e| Error::DockerError(format!("persist builder operation marker: {e}")))?;
@@ -204,7 +349,73 @@ fn lock_builder_file(root: &std::path::Path, name: &str) -> Result<BuilderFileLe
         file,
         marker,
         unlocked: false,
+        service_type: ServiceType::UserappBuilder,
     })
+}
+
+#[cfg(unix)]
+fn release_file_receipt(
+    path: &std::path::Path,
+    receipt: &shared_types::UserAppOperationLeaseReceipt,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let shared_types::UserAppOperationLeaseReceipt::Docker {
+        device,
+        inode,
+        token,
+        ..
+    } = receipt
+    else {
+        return Err(Error::Conflict("Operation lease runtime mismatch".into()));
+    };
+    let before = std::fs::symlink_metadata(path)
+        .map_err(|error| Error::Conflict(format!("Operation lease file unavailable: {error}")))?;
+    if !before.is_file() || before.dev() != *device || before.ino() != *inode {
+        return Err(Error::Conflict(
+            "Operation lease file identity changed".into(),
+        ));
+    }
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| Error::DockerError(format!("Open operation lease receipt: {error}")))?;
+    file.try_lock()
+        .map_err(|error| Error::Conflict(format!("Operation lease remains active: {error}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| Error::DockerError(format!("Read operation lease identity: {error}")))?;
+    let current = std::fs::symlink_metadata(path)
+        .map_err(|error| Error::Conflict(format!("Recheck operation lease identity: {error}")))?;
+    if opened.dev() != *device
+        || opened.ino() != *inode
+        || !current.is_file()
+        || current.dev() != *device
+        || current.ino() != *inode
+    {
+        return Err(Error::Conflict(
+            "Operation lease file identity changed".into(),
+        ));
+    }
+    let marker = shared_types::AppFileMutationMarker::for_operation(token)
+        .map_err(|error| Error::ConfigurationError(error.to_string()))?;
+    marker
+        .complete(&file)
+        .map_err(|error| Error::Conflict(format!("Operation lease ownership changed: {error}")))?;
+    file.unlock()
+        .map_err(|error| Error::DockerError(format!("Unlock completed operation lease: {error}")))
+}
+
+#[cfg(not(unix))]
+fn release_file_receipt(
+    _: &std::path::Path,
+    _: &shared_types::UserAppOperationLeaseReceipt,
+) -> Result<()> {
+    Err(Error::ConfigurationError(
+        "Physical operation lease recovery requires Unix".into(),
+    ))
 }
 
 // Cancellation before the blocking lock-acquisition result is delivered cannot
@@ -221,6 +432,7 @@ impl Drop for UnclaimedBuilderLease {
 }
 
 struct BuilderFileLease {
+    service_type: ServiceType,
     file: std::fs::File,
     marker: shared_types::AppFileMutationMarker,
     unlocked: bool,
@@ -236,6 +448,30 @@ impl Drop for BuilderFileLease {
 }
 #[async_trait::async_trait]
 impl shared_types::AppOperationLease for BuilderFileLease {
+    fn receipt(&self) -> Option<shared_types::UserAppOperationLeaseReceipt> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = match self.file.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    tracing::error!(%error, "Read builder lease identity failed");
+                    return None;
+                }
+            };
+            Some(shared_types::UserAppOperationLeaseReceipt::Docker {
+                service_type: self.service_type.clone(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                token: self.marker.operation_id().to_owned(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     async fn release(mut self: Box<Self>) -> std::result::Result<(), String> {
         self.marker
             .complete(&self.file)
@@ -252,6 +488,113 @@ impl shared_types::AppOperationLease for BuilderFileLease {
 mod tests {
     use super::*;
     use shared_types::AppOperationLease;
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_file_release_requires_inactive_original_inode_and_owner() {
+        let root = tempfile::tempdir().expect("fixture");
+        let path = root.path().join("builder-app.lock");
+        let lease = lock_builder_file_with_marker(
+            root.path(),
+            "builder-app.lock",
+            shared_types::AppFileMutationMarker::for_operation("original").expect("marker"),
+        )
+        .expect("lease");
+        let receipt = lease.receipt().expect("receipt");
+        assert!(
+            release_file_receipt(&path, &receipt).is_err(),
+            "live lease cannot be reclaimed"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("marker"), "original");
+        drop(lease);
+        release_file_receipt(&path, &receipt).expect("completed orphan release");
+        release_file_receipt(&path, &receipt).expect("idempotent same inode release");
+        assert!(std::fs::read(&path).expect("empty marker").is_empty());
+        let next = lock_builder_file_with_marker(
+            root.path(),
+            "builder-app.lock",
+            shared_types::AppFileMutationMarker::for_operation("replacement-owner")
+                .expect("marker"),
+        )
+        .expect("next owner");
+        drop(next);
+        assert!(release_file_receipt(&path, &receipt).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("replacement marker"),
+            "replacement-owner"
+        );
+        std::fs::rename(&path, root.path().join("retained-original-inode"))
+            .expect("keep inode alive");
+        std::fs::write(&path, "new-physical-file").expect("replacement");
+        assert!(release_file_receipt(&path, &receipt).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("replacement file"),
+            "new-physical-file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_file_release_rejects_symbolic_link_even_to_original_inode() {
+        let root = tempfile::tempdir().expect("fixture");
+        let path = root.path().join("builder-app.lock");
+        let retained = root.path().join("retained");
+        let lease = lock_builder_file_with_marker(
+            root.path(),
+            "builder-app.lock",
+            shared_types::AppFileMutationMarker::for_operation("original").expect("marker"),
+        )
+        .expect("lease");
+        let receipt = lease.receipt().expect("receipt");
+        drop(lease);
+        std::fs::rename(&path, &retained).expect("rename");
+        std::os::unix::fs::symlink(&retained, &path).expect("alias");
+        assert!(release_file_receipt(&path, &receipt).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&retained).expect("original marker"),
+            "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_operation_marker_echoes_identity_without_authorizing_takeover() {
+        let root = tempfile::tempdir().unwrap();
+        let name = "builder-durable.lock";
+        let marker = shared_types::AppFileMutationMarker::for_operation("operation-one").unwrap();
+        let lease = lock_builder_file_with_marker(root.path(), name, marker).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let physical = std::fs::metadata(root.path().join(name)).unwrap();
+            let receipt = lease.receipt().expect("durable lease receipt");
+            assert_eq!(
+                receipt,
+                shared_types::UserAppOperationLeaseReceipt::Docker {
+                    service_type: ServiceType::UserappBuilder,
+                    device: physical.dev(),
+                    inode: physical.ino(),
+                    token: "operation-one".into(),
+                }
+            );
+            receipt.validate().expect("valid physical receipt");
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(name)).unwrap(),
+            "operation-one"
+        );
+        Box::new(lease).release().await.unwrap();
+        assert!(std::fs::read(root.path().join(name)).unwrap().is_empty());
+
+        let marker = shared_types::AppFileMutationMarker::for_operation("operation-one").unwrap();
+        drop(lock_builder_file_with_marker(root.path(), name, marker).unwrap());
+        // Even an identical durable operation must prove recovery safety first.
+        let marker = shared_types::AppFileMutationMarker::for_operation("operation-one").unwrap();
+        assert!(lock_builder_file_with_marker(root.path(), name, marker).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(name)).unwrap(),
+            "operation-one"
+        );
+    }
 
     #[tokio::test]
     async fn failed_builder_completion_clears_only_confirmed_rejection_marker() {
@@ -391,6 +734,7 @@ mod tests {
         });
         let runtime = DockerRuntime::new(manager.clone());
         let snapshot = BuilderDeletionSnapshot {
+            resource_binding: None,
             app_id: "one".into(),
             operation_id: "test".into(),
             docker_bind_cleanup: true,
@@ -524,6 +868,80 @@ mod tests {
             assert_eq!(next.metadata().expect("metadata").len() > 0, !completed);
             next.unlock().expect("next unlock");
             drop(duplicate);
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_requires_captured_id_owner_lifecycle_family_and_running_address() {
+        let context = shared_types::UserAppExecutionContext {
+            app_id: "app".into(),
+            user_id: "owner".into(),
+            lifecycle_id: "life".into(),
+            operation_id: "clear".into(),
+            executor_id: "worker".into(),
+            request_fingerprint: "a".repeat(64),
+        };
+        let resource = AppResourceIdentity {
+            kind: AppResourceKind::Container,
+            name: "builder-app".into(),
+            uid: "physical-original".into(),
+            resource_version: None,
+        };
+        let mut labels = context.resource_metadata();
+        labels.insert(
+            "service-type".into(),
+            ServiceType::UserappBuilder.to_string(),
+        );
+        labels.insert("identifier".into(), "app".into());
+        let original = serde_json::json!({
+            "Id": resource.uid, "Config": {"Labels": labels}, "State": {"Running": true},
+            "HostConfig": {"NetworkMode": "main"},
+            "NetworkSettings": {"Networks": {"main": {"IPAddress": "172.20.0.4"}}}
+        });
+        let inspect = serde_json::from_value(original.clone()).expect("inspect fixture");
+        let endpoint = workspace_endpoint_from_container(&inspect, &resource, &context)
+            .expect("physical target");
+        assert_eq!(endpoint.container_id, "physical-original");
+        assert_eq!(
+            endpoint.base_url(),
+            format!("http://172.20.0.4:{}", shared_types::AGENT_FILE_SERVER_PORT)
+        );
+        for (pointer, value) in [
+            ("/Id", serde_json::json!("replacement")),
+            (
+                "/Config/Labels/rcoder.io~1owner-id",
+                serde_json::json!("foreign-owner"),
+            ),
+            (
+                "/Config/Labels/rcoder.io~1lifecycle-id",
+                serde_json::json!("next-life"),
+            ),
+            (
+                "/Config/Labels/service-type",
+                serde_json::json!(ServiceType::Userapp.to_string()),
+            ),
+            (
+                "/Config/Labels/identifier",
+                serde_json::json!("another-app"),
+            ),
+            ("/State/Running", serde_json::json!(false)),
+            (
+                "/NetworkSettings/Networks/main/IPAddress",
+                serde_json::json!(""),
+            ),
+        ] {
+            let mut changed = original.clone();
+            *changed.pointer_mut(pointer).expect("fixture field") = value;
+            let inspect = serde_json::from_value(changed).expect("changed fixture");
+            assert!(
+                workspace_endpoint_from_container(&inspect, &resource, &context).is_err(),
+                "accepted changed field {pointer}"
+            );
         }
     }
 }

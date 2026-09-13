@@ -66,6 +66,71 @@ pub trait AgentContainerRuntime: Send + Sync {
         ))
     }
 
+    async fn inspect_builder_workspace(
+        &self,
+        _snapshot: &shared_types::BuilderDeletionSnapshot,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::UserAppBuilderWorkspaceEndpoint> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Physical builder workspace inspection is unsupported".into(),
+        ))
+    }
+
+    /// Read-only inspection for explicit adoption. It must verify immutable
+    /// physical identity and owner; missing lifecycle metadata is allowed here.
+    /// Read-only candidate identity, including a scaled-to-zero StatefulSet.
+    /// Missing lifecycle labels do not authorize writes; callers must retrieve
+    /// the durable binding and revalidate through capture_bound_builder_control.
+    async fn inspect_builder_candidate(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Builder candidate inspection is unsupported".into(),
+        ))
+    }
+
+    async fn capture_builder_adoption(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _expected_container_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Explicit builder adoption is unsupported".into(),
+        ))
+    }
+    async fn capture_bound_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        if binding.is_some() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Physical builder bindings are unsupported".into(),
+            ));
+        }
+        self.capture_builder_control(context).await
+    }
+
+    async fn capture_builder_control(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound builder controls are unsupported".into(),
+        ))
+    }
+
+    async fn apply_builder_control(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+        _restart: bool,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound builder controls are unsupported".into(),
+        ))
+    }
+
     /// Get container information by project_id
     async fn get_container_info(
         &self,
@@ -312,6 +377,26 @@ pub trait WorkspaceRuntime: Send + Sync {
         ))
     }
 
+    /// None explicitly means a backend without volume-capacity semantics.
+    async fn capture_app_storage_resize(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppStorageResizeTarget>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured application storage resize is unsupported".into(),
+        ))
+    }
+
+    async fn resize_app_storage_target(
+        &self,
+        _target: &shared_types::UserAppStorageResizeTarget,
+        _new_size: &str,
+    ) -> ContainerRuntimeResult<StorageResizeOutcome> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured application storage resize is unsupported".into(),
+        ))
+    }
+
     /// 调整 per-app PVC 容量（Userapp 专用；K8s PVC **只扩不能缩**）。
     ///
     /// K8s: 读 PVC 当前 `requests.storage` → 等量 no-op / 更大 patch 扩容
@@ -430,6 +515,47 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// Capture and validate a mutation target for the already admitted lifecycle.
+    async fn capture_app_mutation_target(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _expected_resource_version: Option<&str>,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound application stop is not supported by this runtime".into(),
+        ))
+    }
+
+    async fn restart_app_target(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound application restart is unsupported".into(),
+        ))
+    }
+
+    async fn start_app_target(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound application start is unsupported".into(),
+        ))
+    }
+
+    /// Stop only this captured target. K8s commits wake policy and scale in one
+    /// conditional write; Docker addresses the immutable physical container ID.
+    async fn stop_app_target(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+        _wake_on_traffic: bool,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound application stop is not supported by this runtime".into(),
+        ))
+    }
+
     /// 伸缩 Deployment 副本数（K8s scale；Docker: 0=stop, >=1=start）
     async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
         let _ = (app_id, replicas);
@@ -447,8 +573,23 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     }
 
     /// 修改闲置回收策略（只 patch Deployment `metadata.annotations`，不碰 pod template → 不触发 rollout）。
-    /// 字段 `None` = 不改该键；至少一个 `Some` 由上层校验。K8s/Docker 均已 override；
-    /// 未实现的 runtime 返回 Err（Fail Fast，避免策略被静默丢弃）。生效于下个扫描 tick。
+    /// Project policy onto a captured workload. Docker deliberately leaves policy
+    /// persistence to the coordinator's lifecycle store; K8s updates all supplied
+    /// annotations in one UID/resourceVersion-conditional request.
+    async fn patch_app_policy_target(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+        _policy: &shared_types::UserAppRuntimePolicy,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured policy projection is unsupported".into(),
+        ))
+    }
+
+    /// Legacy uncoordinated policy interface; formal controls use captured targets.
+    /// Fields set to None remain unchanged. K8s retains this adapter for internal
+    /// compatibility; Docker rejects it because applied policy belongs to the
+    /// lifecycle store and cannot be persisted by an uncoordinated runtime call.
     async fn patch_recycle_policy(
         &self,
         app_id: &str,
@@ -483,6 +624,18 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     }
 
     /// Distributed runtime operation lease; Docker uses the service's shared file lock.
+    /// Release only a captured application operation mutex. The coordinator must
+    /// first reserve a confirmed final checkpoint with a SQL revision claim.
+    async fn release_app_operation_receipt(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Conditional operation release is unsupported".into(),
+        ))
+    }
+
     async fn acquire_app_operation(
         &self,
         _app_id: &str,

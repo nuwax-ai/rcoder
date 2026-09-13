@@ -60,10 +60,4 @@ pub struct AppFilesDeleteBody {
     pub path: String,
 }
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct AppFilesClearBody {
-    /// Userapp 应用 ID（定位）。
-    pub app_id: String,
-    /// 宿主机数据卷分区归属目录名（必填；懒唤醒挂载定位）。
-    pub user_id: String,
-}
+pub use shared_types::UserAppWorkspaceClearRequest as AppFilesClearBody;

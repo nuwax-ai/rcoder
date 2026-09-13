@@ -30,11 +30,38 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
         .timeout(Duration::from_secs(60))
         .json(&body)
         .send()
-        .await
-        .expect("http post");
+        .await;
+    let resp = match resp {
+        Ok(response) => response,
+        Err(error) => {
+            if matches!(
+                path,
+                "/api/v1/userapp/workspace" | "/api/v1/userapp/ensure-workspace"
+            ) {
+                rcoder_e2e::common::resources::register_builder_attempt(
+                    body["app_id"].as_str().expect("workspace app identity"),
+                    body["user_id"].as_str().expect("workspace owner identity"),
+                    false,
+                )
+                .expect("register uncertain workspace resource");
+            }
+            panic!("HTTP POST failed: {error}");
+        }
+    };
     let status = resp.status();
-    let body = resp.json().await.unwrap_or(Value::Null);
-    (status, body)
+    let response: Value = resp.json().await.unwrap_or(Value::Null);
+    if matches!(
+        path,
+        "/api/v1/userapp/workspace" | "/api/v1/userapp/ensure-workspace"
+    ) {
+        rcoder_e2e::common::resources::register_builder_attempt(
+            body["app_id"].as_str().expect("workspace app identity"),
+            body["user_id"].as_str().expect("workspace owner identity"),
+            status.is_success() && http_ok(&response),
+        )
+        .expect("register workspace resource identity");
+    }
+    (status, response)
 }
 
 /// 显式清理 build 触发的 builder 容器（rcoder-app-builder-<app_id>；
@@ -1130,6 +1157,12 @@ async fn test_ensure_workspace_idempotent(env: &Env, report: &JsonlReporter) {
         (status, body)
     };
     let (s1, b1) = call().await;
+    rcoder_e2e::common::resources::register_builder_attempt(
+        &ident,
+        user,
+        s1.is_success() && http_ok(&b1),
+    )
+    .expect("register initial ensure identity");
     let first_ok = s1.is_success()
         && http_ok(&b1)
         && b1["data"]["workspace"]

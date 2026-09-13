@@ -11,6 +11,48 @@ import run
 from run import validate_reports, terminate_process_group
 from contracts import REQUIRED
 
+class SelectionTests(unittest.TestCase):
+    def select(self, discovered, filter_text='', **overrides):
+        args = dict(catalog={'suite': ['alpha', 'beta']},
+                    required={'alpha': set(), 'beta': set()},
+                    identities={'alpha': [{'scenario': 'a'}], 'beta': [{'scenario': 'b'}]})
+        args.update(overrides)
+        return run.select_registered_cases('suite', discovered, filter_text, **args)
+
+    def test_full_suite_rejects_removed_case_even_when_other_case_remains(self):
+        with self.assertRaisesRegex(ValueError, 'required scenarios missing.*beta'):
+            self.select(['alpha'])
+
+    def test_full_suite_requires_all_registered_cases_and_ignores_gate(self):
+        self.assertEqual(self.select(['beta', 'gate_health', 'alpha']), ['alpha', 'beta'])
+
+    def test_explicit_filter_allows_registered_subset(self):
+        self.assertEqual(self.select(['alpha'], 'alpha'), ['alpha'])
+
+    def test_explicit_filter_cannot_hide_missing_selected_case(self):
+        with self.assertRaisesRegex(ValueError, 'required scenarios missing.*beta'):
+            self.select(['alpha'], 'beta')
+
+    def test_unmatched_filter_returns_empty_for_launcher_zero_selection_failure(self):
+        self.assertEqual(self.select(['alpha', 'beta'], 'absent'), [])
+
+    def test_unknown_cases_cannot_enter_existing_suite(self):
+        with self.assertRaisesRegex(ValueError, 'unregistered suite scenarios'):
+            self.select(['alpha', 'beta', 'unreviewed'])
+
+    def test_registered_case_requires_both_assertions_and_report_identity(self):
+        for overrides in ({'required': {'alpha': set()}}, {'identities': {'alpha': [1]}}):
+            with self.assertRaisesRegex(ValueError, 'incomplete acceptance registration.*beta'):
+                self.select(['alpha', 'beta'], **overrides)
+
+    def test_frozen_suite_catalog_is_fully_registered(self):
+        root = Path(run.__file__).parent
+        catalog = json.loads((root / 'suite_cases.json').read_text())
+        self.assertEqual(set(catalog), set(sum(run.GROUPS.values(), [])))
+        for suite, cases in catalog.items():
+            self.assertEqual(run.select_registered_cases(suite, cases), sorted(cases))
+
+
 class ReportTests(unittest.TestCase):
     def test_first_cancellation_during_settle_or_cleanup_is_deferred(self):
         for phase in ('settle', 'cleanup'):
@@ -102,6 +144,27 @@ class ReportTests(unittest.TestCase):
                 self.assertTrue(done.exists(), 'cleanup child must finish before fallback cleanup')
             finally:
                 terminate_process_group(parent, grace=1)
+
+    def test_darwin_eperm_requires_independent_proof_of_empty_group(self):
+        from types import SimpleNamespace
+        process = SimpleNamespace(pid=12345, poll=lambda: 0)
+        with patch('run.sys.platform', 'darwin'), patch('run.os.killpg', side_effect=PermissionError):
+            with patch('run.subprocess.run', return_value=SimpleNamespace(stdout='1\n23456\n')):
+                self.assertFalse(run.signal_owned_group(process, 0))
+            with patch('run.subprocess.run', return_value=SimpleNamespace(stdout='1\n12345\n')):
+                with self.assertRaises(PermissionError):
+                    run.signal_owned_group(process, 0)
+            with patch('run.subprocess.run', side_effect=subprocess.CalledProcessError(1, ['ps'])):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    run.signal_owned_group(process, 0)
+            with patch('run.subprocess.run', return_value=SimpleNamespace(stdout='')):
+                with self.assertRaises(RuntimeError):
+                    run.signal_owned_group(process, 0)
+            with patch('run.subprocess.run') as inventory:
+                process.poll = lambda: None
+                with self.assertRaises(PermissionError):
+                    run.signal_owned_group(process, 0)
+                inventory.assert_not_called()
 
     def test_failed_assertion_cannot_be_hidden_by_pass_terminal(self):
         with tempfile.TemporaryDirectory() as temp:

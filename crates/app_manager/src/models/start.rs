@@ -16,8 +16,16 @@ use utoipa::ToSchema;
 /// start 无 `url` 且 app 不存在时**创建空容器**（基础设施形态：PG/ttyd/dbx
 /// 常驻 + app-cli idle 等部署，此形态 `user_id` 必填）；restart 无 `url` 对
 /// 不存在的 app 仍 404（重启语义不创建）。
-#[derive(Debug, Clone, Default, Deserialize, ToSchema, garde::Validate)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct StartAppRequest {
+    /// Idempotency identity for the complete deployment and configuration intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(length(min = 1, max = 128), pattern(shared_types::IDENTIFIER_RE))]
+    pub request_id: Option<String>,
+    /// Expected lifecycle; required after explicit application recreation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
+    pub lifecycle_id: Option<String>,
     /// 制品包下载 URL（workspace 整体包 zip）。给出即触发轻量部署链。
     #[garde(skip)]
     pub url: Option<String>,
@@ -64,7 +72,7 @@ pub struct StartAppRequest {
 }
 
 /// 部署模式枚举（非法值 serde 直接 400）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum DeployMode {
     #[default]
@@ -84,8 +92,11 @@ pub struct StartPgCredential {
 }
 
 /// start/restart 响应（传统启停语义 = runtime 字段；部署增强字段按请求出现）。
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StartAppResult {
+    /// Durable operation for this complete start/restart request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
     /// 运行时信息（状态/访问 URL/端口等，与传统启停响应同构）
     #[serde(flatten)]
     pub runtime: super::response::AppRuntimeInfo,

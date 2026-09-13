@@ -14,6 +14,55 @@ use shared_types::{
 };
 
 impl KubernetesRuntime {
+    pub(super) async fn captured_builder_workspace(
+        &self,
+        snapshot: &BuilderDeletionSnapshot,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> Result<shared_types::UserAppBuilderWorkspaceEndpoint> {
+        context
+            .validate_identity(&snapshot.app_id, Some(&context.user_id))
+            .map_err(Error::Conflict)?;
+        let mut workloads = snapshot
+            .resources
+            .iter()
+            .filter(|resource| resource.kind == Kind::StatefulSet);
+        let workload = workloads
+            .next()
+            .ok_or_else(|| Error::Conflict("Captured builder StatefulSet is missing".into()))?;
+        if workloads.next().is_some() || workload.uid.is_empty() {
+            return Err(Error::Conflict(
+                "Captured builder StatefulSet is ambiguous".into(),
+            ));
+        }
+        let actual = self
+            .capture_builder_compute_with_binding(
+                context,
+                snapshot.resource_binding.as_ref(),
+                false,
+            )
+            .await?;
+        if actual
+            .workload
+            .as_ref()
+            .map(|resource| resource.uid.as_str())
+            != Some(workload.uid.as_str())
+        {
+            return Err(Error::Conflict("Captured builder workload changed".into()));
+        }
+        let pod_name = self.agent_pod_name(&snapshot.app_id, &ServiceType::UserappBuilder)?;
+        let pod = self
+            .pods()
+            .get(&pod_name)
+            .await
+            .map_err(|error| map_error("inspect captured builder pod", error))?;
+        workspace_endpoint_from_bound_pod(
+            &pod,
+            workload,
+            context,
+            snapshot.resource_binding.as_ref(),
+        )
+    }
+
     fn builder_api(&self, kind: Kind) -> Result<Api<DynamicObject>> {
         let (group, name) = match kind {
             Kind::StatefulSet => ("apps", "StatefulSet"),
@@ -36,6 +85,7 @@ impl KubernetesRuntime {
     pub(super) async fn capture_builder(&self, app_id: &str) -> Result<BuilderDeletionSnapshot> {
         let family = ServiceType::UserappBuilder;
         let mut snapshot = BuilderDeletionSnapshot {
+            resource_binding: None,
             app_id: app_id.into(),
             operation_id: uuid::Uuid::new_v4().to_string(),
             resources: vec![],
@@ -65,12 +115,24 @@ impl KubernetesRuntime {
         Ok(snapshot)
     }
 
-    pub(super) async fn claim_builder_storage(&self, app_id: &str) -> Result<()> {
+    pub(super) async fn claim_builder_storage_with_context(
+        &self,
+        app_id: &str,
+        context: Option<&shared_types::UserAppExecutionContext>,
+    ) -> Result<()> {
+        if let Some(context) = context {
+            context
+                .validate_identity(app_id, Some(&context.user_id))
+                .map_err(Error::ConfigurationError)?;
+        }
+        let operation = context
+            .map(|context| context.operation_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // One budget and one operation identity cover all attempts. A timed-out
         // PATCH is an unknown write: callers must retain the recovery fence.
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            self.claim_builder_storage_inner(app_id),
+            self.claim_builder_storage_inner(app_id, &operation, context),
         )
         .await
         .map_err(|_| {
@@ -80,10 +142,14 @@ impl KubernetesRuntime {
         })?
     }
 
-    async fn claim_builder_storage_inner(&self, app_id: &str) -> Result<()> {
+    async fn claim_builder_storage_inner(
+        &self,
+        app_id: &str,
+        operation: &str,
+        context: Option<&shared_types::UserAppExecutionContext>,
+    ) -> Result<()> {
         let name = self.workspace_pvc_name(app_id, &ServiceType::UserappBuilder)?;
         let api = self.builder_api(Kind::PersistentVolumeClaim)?;
-        let operation = uuid::Uuid::new_v4();
         let mut original = None;
         for attempt in 0..4 {
             let object = api.get(&name).await.map_err(|error| {
@@ -93,6 +159,21 @@ impl KubernetesRuntime {
                 )
             })?;
             validate_owner(Kind::PersistentVolumeClaim, &object, app_id)?;
+            if let Some(context) = context {
+                let annotations = object.metadata.annotations.as_ref();
+                for (key, expected) in [
+                    ("rcoder.io/lifecycle-id", &context.lifecycle_id),
+                    ("rcoder.io/owner-id", &context.user_id),
+                ] {
+                    if let Some(actual) = annotations.and_then(|values| values.get(key))
+                        && actual != expected
+                    {
+                        return Err(Error::Conflict(
+                            "Builder storage lifecycle ownership changed".into(),
+                        ));
+                    }
+                }
+            }
             if object.metadata.deletion_timestamp.is_some() {
                 return Err(Error::Conflict("builder storage is terminating".into()));
             }
@@ -109,14 +190,26 @@ impl KubernetesRuntime {
                 None => original = Some((receipt.uid.clone(), owner)),
                 _ => {}
             }
-            let patch = serde_json::json!({"metadata":{"uid":receipt.uid,"resourceVersion":receipt.resource_version,"annotations":{"rcoder.io/storage-use-operation":operation.to_string()}}});
+            let mut annotations = serde_json::Map::new();
+            annotations.insert("rcoder.io/storage-use-operation".into(), operation.into());
+            if let Some(context) = context {
+                annotations.insert(
+                    "rcoder.io/lifecycle-id".into(),
+                    context.lifecycle_id.clone().into(),
+                );
+                annotations.insert("rcoder.io/owner-id".into(), context.user_id.clone().into());
+            }
+            let patch = serde_json::json!({"metadata":{"uid":receipt.uid,"resourceVersion":receipt.resource_version,"annotations":annotations}});
             match api
                 .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
                 .await
             {
                 Ok(_) => return Ok(()),
                 Err(kube::Error::Api(response)) if response.code == 409 && attempt < 3 => {
-                    let jitter = (operation.as_bytes()[attempt] % 25) as u64;
+                    let jitter = operation
+                        .bytes()
+                        .fold(attempt as u64, |sum, byte| sum + u64::from(byte))
+                        % 25;
                     tokio::time::sleep(std::time::Duration::from_millis(
                         25 * (1 << attempt) + jitter,
                     ))
@@ -209,6 +302,130 @@ impl KubernetesRuntime {
     }
 }
 
+#[cfg(test)]
+pub(super) fn workspace_endpoint_from_pod(
+    pod: &k8s_openapi::api::core::v1::Pod,
+    workload: &AppResourceIdentity,
+    context: &shared_types::UserAppExecutionContext,
+) -> Result<shared_types::UserAppBuilderWorkspaceEndpoint> {
+    workspace_endpoint_from_bound_pod(pod, workload, context, None)
+}
+
+pub(super) fn workspace_endpoint_from_bound_pod(
+    pod: &k8s_openapi::api::core::v1::Pod,
+    workload: &AppResourceIdentity,
+    context: &shared_types::UserAppExecutionContext,
+    binding: Option<&shared_types::UserAppResourceBinding>,
+) -> Result<shared_types::UserAppBuilderWorkspaceEndpoint> {
+    if pod.metadata.deletion_timestamp.is_some()
+        || !pod
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    owner.controller == Some(true)
+                        && owner.kind == "StatefulSet"
+                        && owner.api_version == "apps/v1"
+                        && owner.uid == workload.uid
+                        && owner.name == workload.name
+                })
+            })
+    {
+        return Err(Error::Conflict(
+            "Builder pod does not belong to the captured workload".into(),
+        ));
+    }
+    let labels = pod
+        .metadata
+        .labels
+        .as_ref()
+        .ok_or_else(|| Error::Conflict("Builder pod family labels are missing".into()))?;
+    let (family, slots) = super::k8s_service::container_identity_from_labels(labels);
+    if family != Some(ServiceType::UserappBuilder)
+        || family.as_ref().and_then(|family| {
+            family
+                .container_identifier(
+                    slots.pod_id.as_deref(),
+                    slots.user_id.as_deref(),
+                    slots.project_id.as_deref().or(slots.app_id.as_deref()),
+                )
+                .ok()
+        }) != Some(context.app_id.as_str())
+    {
+        return Err(Error::Conflict(
+            "Builder pod family or application mismatch".into(),
+        ));
+    }
+    let annotations = pod.metadata.annotations.clone().unwrap_or_default();
+    let owner = annotations
+        .get("rcoder.io/owner-id")
+        .map(String::as_str)
+        .or_else(|| {
+            pod.spec
+                .as_ref()
+                .and_then(|spec| {
+                    spec.containers
+                        .iter()
+                        .find(|container| container.name == "agent")
+                })
+                .and_then(|container| container.env.as_ref())
+                .and_then(|env| {
+                    env.iter()
+                        .find(|entry| entry.name == "USER_ID" && entry.value_from.is_none())
+                })
+                .and_then(|entry| entry.value.as_deref())
+        });
+    if !shared_types::builder_identity_is_bound(
+        context,
+        &annotations,
+        &workload.uid,
+        owner,
+        binding,
+    )
+    .map_err(Error::Conflict)?
+    {
+        return Err(Error::Conflict(
+            "Builder pod requires explicit physical resource adoption".into(),
+        ));
+    }
+    let status = pod
+        .status
+        .as_ref()
+        .ok_or_else(|| Error::Conflict("Builder pod status is missing".into()))?;
+    if status.phase.as_deref() != Some("Running")
+        || !status.conditions.as_ref().is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+        })
+    {
+        return Err(Error::Conflict("Captured builder pod is not ready".into()));
+    }
+    let container_id = pod
+        .metadata
+        .uid
+        .as_ref()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| Error::Conflict("Builder pod UID is missing".into()))?
+        .clone();
+    let address = status
+        .pod_ip
+        .as_deref()
+        .ok_or_else(|| Error::Conflict("Builder pod IP is missing".into()))?
+        .parse::<std::net::IpAddr>()
+        .map_err(|error| Error::ConfigurationError(format!("Invalid builder pod IP: {error}")))?;
+    if address.is_unspecified() {
+        return Err(Error::ConfigurationError(
+            "Builder pod IP is unspecified".into(),
+        ));
+    }
+    Ok(shared_types::UserAppBuilderWorkspaceEndpoint {
+        container_id,
+        address,
+    })
+}
+
 fn validate_owner(kind: Kind, object: &DynamicObject, app_id: &str) -> Result<()> {
     let key = if kind == Kind::PersistentVolumeClaim {
         "service_type"
@@ -276,6 +493,50 @@ fn map_error(context: &str, error: kube::Error) -> Error {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn endpoint_inspection_stops_at_replaced_or_forbidden_workload() {
+        for forbidden in [false, true] {
+            let (runtime, server, requests) = adapter(forbidden).await;
+            let context = shared_types::UserAppExecutionContext {
+                app_id: "review".into(),
+                user_id: "owner".into(),
+                lifecycle_id: "life".into(),
+                operation_id: "clear".into(),
+                executor_id: "worker".into(),
+                request_fingerprint: "a".repeat(64),
+            };
+            let snapshot = BuilderDeletionSnapshot {
+                resource_binding: None,
+                app_id: "review".into(),
+                operation_id: "capture".into(),
+                docker_bind_cleanup: false,
+                resources: vec![AppResourceIdentity {
+                    kind: Kind::StatefulSet,
+                    name: "rcoder-app-builder-review".into(),
+                    uid: "original-uid".into(),
+                    resource_version: Some("1".into()),
+                }],
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                runtime.captured_builder_workspace(&snapshot, &context),
+            )
+            .await;
+            server.abort();
+            assert!(server.await.expect_err("fixture stopped").is_cancelled());
+            assert!(result.expect("inspection deadline").is_err());
+            let requests = requests.lock().expect("captured requests");
+            assert_eq!(
+                requests.len(),
+                1,
+                "must not query a replacement pod after rejection"
+            );
+            assert!(requests[0].starts_with(
+                "GET /apis/apps/v1/namespaces/review-test/statefulsets/rcoder-app-builder-review "
+            ));
+        }
+    }
 
     fn runtime(client: kube::Client) -> KubernetesRuntime {
         use super::super::kubernetes_runtime::KubernetesRuntimeConfig;
@@ -387,5 +648,87 @@ mod tests {
         assert_eq!(body["propagationPolicy"], "Foreground");
         receipt.resource_version = None;
         assert!(deletion_params(&receipt).is_err());
+    }
+}
+
+#[cfg(test)]
+mod workspace_endpoint_tests {
+    use super::*;
+
+    fn context() -> shared_types::UserAppExecutionContext {
+        shared_types::UserAppExecutionContext {
+            app_id: "review".into(),
+            user_id: "owner".into(),
+            lifecycle_id: "life".into(),
+            operation_id: "clear".into(),
+            executor_id: "worker".into(),
+            request_fingerprint: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn endpoint_requires_ready_pod_owned_by_the_captured_statefulset_and_lifecycle() {
+        let context = context();
+        let resource = AppResourceIdentity {
+            kind: Kind::StatefulSet,
+            name: "rcoder-app-builder-review".into(),
+            uid: "captured-sts".into(),
+            resource_version: Some("1".into()),
+        };
+        let original = serde_json::json!({
+            "apiVersion":"v1", "kind":"Pod",
+            "metadata": {
+                "name":"rcoder-app-builder-review-0", "uid":"physical-pod",
+                "annotations":context.resource_metadata(),
+                "labels":{"rcoder.io/service-type":ServiceType::UserappBuilder.to_string(),"rcoder.io/identifier":"review"},
+                "ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":resource.name,"uid":resource.uid,"controller":true}]
+            },
+            "status":{"phase":"Running","podIP":"10.2.0.5","conditions":[{"type":"Ready","status":"True"}]}
+        });
+        let pod = serde_json::from_value(original.clone()).expect("pod fixture");
+        let endpoint =
+            workspace_endpoint_from_pod(&pod, &resource, &context).expect("physical pod");
+        assert_eq!(endpoint.container_id, "physical-pod");
+        assert_eq!(
+            endpoint.base_url(),
+            format!("http://10.2.0.5:{}", shared_types::AGENT_FILE_SERVER_PORT)
+        );
+        for (pointer, value) in [
+            (
+                "/metadata/ownerReferences/0/uid",
+                serde_json::json!("recreated-sts"),
+            ),
+            (
+                "/metadata/ownerReferences/0/controller",
+                serde_json::json!(false),
+            ),
+            (
+                "/metadata/annotations/rcoder.io~1owner-id",
+                serde_json::json!("foreign-owner"),
+            ),
+            (
+                "/metadata/annotations/rcoder.io~1lifecycle-id",
+                serde_json::json!("next-life"),
+            ),
+            (
+                "/metadata/labels/rcoder.io~1service-type",
+                serde_json::json!(ServiceType::Userapp.to_string()),
+            ),
+            (
+                "/metadata/labels/rcoder.io~1identifier",
+                serde_json::json!("another-app"),
+            ),
+            ("/metadata/uid", serde_json::json!("")),
+            ("/status/conditions/0/status", serde_json::json!("False")),
+            ("/status/podIP", serde_json::json!("service.cluster.local")),
+        ] {
+            let mut changed = original.clone();
+            *changed.pointer_mut(pointer).expect("fixture field") = value;
+            let pod = serde_json::from_value(changed).expect("changed pod");
+            assert!(
+                workspace_endpoint_from_pod(&pod, &resource, &context).is_err(),
+                "accepted changed field {pointer}"
+            );
+        }
     }
 }

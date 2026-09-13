@@ -376,5 +376,35 @@
       "scenario": "docker_deletion_identity_contract",
       "backend": "compose"
     }
+  ],
+  "sqlite_storage_lifecycle_contract": [
+    {
+      "scenario": "sqlite_storage_lifecycle_contract",
+      "backend": "sqlite-component"
+    }
+  ],
+  "sqlite_compose_recreation_contract": [
+    {
+      "scenario": "sqlite_compose_recreation_contract",
+      "backend": "sqlite-compose"
+    }
+  ],
+  "userapp_concurrency_component_contract": [
+    {
+      "scenario": "userapp_concurrency_component_contract",
+      "backend": "concurrency-component"
+    }
+  ],
+  "native_terminal_release_crash_contract": [
+    {
+      "scenario": "native_terminal_release_crash_contract",
+      "backend": "native-process"
+    }
+  ],
+  "docker_runtime_crash_recovery_contract": [
+    {
+      "scenario": "docker_runtime_crash_recovery_contract",
+      "backend": "docker-crash"
+    }
   ]
 }

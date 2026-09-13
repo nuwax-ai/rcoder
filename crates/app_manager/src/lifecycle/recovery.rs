@@ -1,0 +1,538 @@
+//! Replay only unclaimed controls with their original durable inputs. A retained
+//! runtime marker/lease blocks this entry; elapsed time never grants ownership.
+
+use shared_types::{
+    UserAppControlCommand as Command, UserAppOperationRecord, UserAppOperationState,
+};
+use tokio::time::{Duration, Instant, timeout_at};
+
+use crate::models::{AppOperationError, AppResult};
+use crate::service::{AppService, OwnedOperation};
+use crate::utils::map_runtime_error;
+
+impl AppService {
+    pub fn set_builder_recovery(
+        &self,
+        recovery: std::sync::Arc<dyn shared_types::UserAppBuilderRecovery>,
+    ) -> AppResult<()> {
+        *self.builder_recovery.write().map_err(|_| {
+            AppOperationError::Backend("Builder recovery registry lock poisoned".into())
+        })? = Some(recovery);
+        Ok(())
+    }
+
+    /// Resume the same unclaimed operation; a retry never clears a runtime lease
+    /// or invents missing command inputs from current deployment configuration.
+    pub async fn retry_control_operation(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+        request: shared_types::UserAppRetryRequest,
+    ) -> AppResult<shared_types::UserAppOperationView> {
+        use garde::Validate as _;
+        request
+            .validate()
+            .map_err(|error| AppOperationError::Validation(error.to_string()))?;
+        shared_types::validate_identifier(operation_id, "operation_id")
+            .map_err(AppOperationError::Validation)?;
+        let identity = self.get_lifecycle(app_id, &request.user_id).await?;
+        if identity.lifecycle_id != request.lifecycle_id {
+            return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+        }
+        let operation = self
+            .metadata
+            .store
+            .get_operation(app_id, operation_id)
+            .await?
+            .ok_or_else(|| AppOperationError::NotFound("Application operation not found".into()))?;
+        if operation.lifecycle_id != request.lifecycle_id {
+            return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+        }
+        // A completed successful request is safe to observe repeatedly. Never
+        // re-execute it, even if the caller still holds its admission revision.
+        if operation.state == UserAppOperationState::Succeeded {
+            return Ok(operation.into());
+        }
+        if operation.revision != request.expected_revision {
+            return Err(shared_types::UserAppStoreError::VersionConflict.into());
+        }
+        let recoverable_final = matches!(
+            operation.state,
+            UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
+        ) && shared_types::userapp_operation_has_final_evidence(&operation);
+        let pending_builder = operation.state == UserAppOperationState::Pending
+            && matches!(
+                operation.kind,
+                shared_types::UserAppOperationKind::EnsureBuilder
+                    | shared_types::UserAppOperationKind::StopBuilder
+                    | shared_types::UserAppOperationKind::RestartBuilder
+                    | shared_types::UserAppOperationKind::AdoptBuilder
+            );
+        if !recoverable_final
+            && !pending_builder
+            && (operation.state != UserAppOperationState::Pending || operation.command.is_none())
+        {
+            return Err(AppOperationError::InvalidState(
+                "Operation cannot be replayed automatically; inspect its state and recovery evidence".into(),
+            ));
+        }
+        let completed_builder = recoverable_final
+            && matches!(
+                operation.kind,
+                shared_types::UserAppOperationKind::EnsureBuilder
+                    | shared_types::UserAppOperationKind::StopBuilder
+                    | shared_types::UserAppOperationKind::RestartBuilder
+            );
+        let resumed = if pending_builder || completed_builder {
+            let recovery = self
+                .builder_recovery
+                .read()
+                .map_err(|_| {
+                    AppOperationError::Backend("Builder recovery registry lock poisoned".into())
+                })?
+                .clone()
+                .ok_or_else(|| {
+                    AppOperationError::Backend("Builder recovery is not configured".into())
+                })?;
+            if pending_builder {
+                recovery
+                    .resume_pending(&operation)
+                    .await
+                    .map_err(AppOperationError::Backend)?
+            } else {
+                recovery
+                    .reconcile_completed(&operation)
+                    .await
+                    .map_err(AppOperationError::Backend)?
+            }
+        } else {
+            self.resume_pending_control(&operation).await?
+        };
+        if !resumed {
+            return Err(AppOperationError::Conflict(
+                "Operation changed or cannot be safely claimed; query its current state".into(),
+            ));
+        }
+        self.get_control_operation(app_id, &request.user_id, Some(operation_id))
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::NotFound("Application operation not found after retry".into())
+            })
+    }
+
+    /// Reconcile a durable final checkpoint without replaying any resource write.
+    async fn reconcile_completed_control(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> AppResult<bool> {
+        if !matches!(
+            snapshot.state,
+            UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
+        ) || !shared_types::userapp_operation_has_final_evidence(snapshot)
+        {
+            return Ok(false);
+        }
+        let binding = self
+            .metadata
+            .store
+            .get_operation_lease(&snapshot.app_id, &snapshot.operation_id)
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::Conflict(
+                    "Completed operation has no physical lease receipt".into(),
+                )
+            })?;
+        let reserved = self
+            .metadata
+            .store
+            .reserve_completed_operation(snapshot)
+            .await?;
+        let release = self
+            .runtime
+            .release_app_operation_receipt(&binding.context, &binding.receipt)
+            .await;
+        let (state, error_message) = match release {
+            Ok(()) => (UserAppOperationState::Succeeded, None),
+            Err(error) => (
+                UserAppOperationState::RecoveryRequired,
+                Some(format!(
+                    "Conditional operation lease cleanup failed: {error}"
+                )),
+            ),
+        };
+        self.metadata
+            .store
+            .advance(&shared_types::UserAppOperationProgress {
+                app_id: reserved.app_id.clone(),
+                lifecycle_id: reserved.lifecycle_id.clone(),
+                operation_id: reserved.operation_id.clone(),
+                expected_revision: reserved.revision,
+                executor_id: binding.context.executor_id.clone(),
+                state,
+                step: reserved.step,
+                checkpoint: reserved.checkpoint,
+                error_code: error_message
+                    .as_ref()
+                    .map(|_| shared_types::error_codes::ERR_BACKEND_ERROR.into()),
+                error_message,
+            })
+            .await?;
+        if state == UserAppOperationState::Succeeded {
+            self.metadata.store.forget_operation_lease(&binding).await?;
+        }
+        Ok(true)
+    }
+
+    pub async fn resume_pending_control(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> AppResult<bool> {
+        if self.reconcile_completed_control(snapshot).await? {
+            return Ok(true);
+        }
+        if snapshot.state != UserAppOperationState::Pending
+            || snapshot.command.is_none()
+            || matches!(
+                snapshot.command,
+                Some(Command::StopBuilder | Command::RestartBuilder)
+            )
+        {
+            return Ok(false);
+        }
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let preflight = async {
+            let guard = self
+                .try_acquire_process_release_lock(&snapshot.app_id)
+                .await?;
+            let current = self
+                .metadata
+                .store
+                .get_operation(&snapshot.app_id, &snapshot.operation_id)
+                .await?
+                .ok_or_else(|| {
+                    AppOperationError::NotFound("Recovery operation no longer exists".into())
+                })?;
+            if current.state != UserAppOperationState::Pending
+                || current.revision != snapshot.revision
+            {
+                guard.finish().await?;
+                return Ok(None);
+            }
+            let identity = self
+                .metadata
+                .store
+                .get_application(&current.app_id)
+                .await?
+                .ok_or_else(|| {
+                    AppOperationError::NotFound("Recovery application identity is missing".into())
+                })?;
+            // Full deletion enters Deleting in its admission transaction. Only
+            // that same lifecycle's linked deletion may continue in this state.
+            let expected_state = if current.kind.ends_lifecycle() {
+                shared_types::UserAppLifecycleState::Deleting
+            } else {
+                shared_types::UserAppLifecycleState::Active
+            };
+            if identity.lifecycle_id != current.lifecycle_id || identity.state != expected_state {
+                return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+            }
+            if identity.current_operation_id.as_deref() != Some(&current.operation_id) {
+                return Err(AppOperationError::Conflict(
+                    "Recovery operation no longer owns the lifecycle".into(),
+                ));
+            }
+            Ok::<_, AppOperationError>(Some((guard, identity, current)))
+        };
+        let Some((guard, identity, current)) =
+            timeout_at(deadline, preflight).await.map_err(|_| {
+                AppOperationError::Backend("Control recovery preflight deadline exceeded".into())
+            })??
+        else {
+            return Ok(false);
+        };
+        let Some(command) = current.command.clone() else {
+            guard.finish().await?;
+            return Ok(false);
+        };
+        let Some(mut operation) =
+            OwnedOperation::claim_pending(self.metadata.store.clone(), current).await?
+        else {
+            guard.finish().await?;
+            return Ok(false);
+        };
+        if let Command::Deploy { restart, .. } = &command {
+            let guard = std::sync::Arc::new(guard);
+            let execute = async {
+                let input = operation.execution_input(&identity.user_id).await?;
+                let input = super::deploy_control::DeployInput::decode(&input, *restart)?;
+                self.execute_deploy_input(&snapshot.app_id, input, &mut operation, guard.clone())
+                    .await
+            };
+            let result = tokio::time::timeout(Duration::from_secs(420), execute)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AppOperationError::Backend(
+                        "Deployment recovery deadline exceeded".into(),
+                    ))
+                });
+            let result = match result {
+                Ok(_) => {
+                    operation.succeed().await?;
+                    guard.mark_completed();
+                    self.activity.mark_running(&snapshot.app_id);
+                    Ok(true)
+                }
+                Err(error) => {
+                    if guard.has_unfinished_mutation() {
+                        operation.fail(&error).await?;
+                    } else {
+                        operation.reject_without_mutation(&error).await?;
+                    }
+                    Err(error)
+                }
+            };
+            let guard = std::sync::Arc::try_unwrap(guard).map_err(|_| {
+                AppOperationError::Conflict("Recovery deployment still owns resource lease".into())
+            })?;
+            if result.is_ok() || !guard.has_unfinished_mutation() {
+                guard.finish().await?;
+            }
+            return result;
+        }
+        let mut clear_leases = crate::ops::StorageClearLeases::default();
+        let execute = async {
+            if matches!(&command, Command::Create { .. } | Command::Update { .. }) {
+                let input = operation.execution_input(&identity.user_id).await?;
+                let (params, previous) = super::config_input::decode(&input)?;
+                if matches!(&command, Command::Create { .. }) {
+                    if previous.is_some() {
+                        return Err(AppOperationError::InvalidState(
+                            "Creation input contains update state".into(),
+                        ));
+                    }
+                    self.execute_creation(
+                        &snapshot.app_id,
+                        &identity.user_id,
+                        params,
+                        &mut operation,
+                        &guard,
+                    )
+                    .await?;
+                    return Ok(container_runtime_api::DeploymentStatus::default());
+                }
+                let previous = previous.ok_or_else(|| {
+                    AppOperationError::InvalidState("Update input is missing prior state".into())
+                })?;
+                self.execute_update(
+                    &snapshot.app_id,
+                    &identity.user_id,
+                    params,
+                    previous.clone(),
+                    &mut operation,
+                    &guard,
+                )
+                .await?;
+                return Ok(previous);
+            }
+            if let Command::ClearStorage { production } = &command {
+                self.execute_storage_clear(
+                    &snapshot.app_id,
+                    &identity.user_id,
+                    *production,
+                    &mut operation,
+                    &guard,
+                    &mut clear_leases,
+                )
+                .await?;
+                return Ok(container_runtime_api::DeploymentStatus::default());
+            }
+            if let Command::DestroyStorage { production } = &command {
+                self.execute_storage_destruction(
+                    &snapshot.app_id,
+                    &identity.user_id,
+                    *production,
+                    &mut operation,
+                    &guard,
+                )
+                .await?;
+                return Ok(container_runtime_api::DeploymentStatus::default());
+            }
+            if matches!(&command, Command::DeleteApplication) {
+                self.purge_app_resources(
+                    &snapshot.app_id,
+                    &identity.user_id,
+                    &mut operation,
+                    &guard,
+                )
+                .await?;
+                return Ok(container_runtime_api::DeploymentStatus::default());
+            }
+            if let Command::DeleteResources {
+                purge,
+                expected_resource_version,
+            } = &command
+            {
+                self.execute_resource_deletion(
+                    &snapshot.app_id,
+                    &identity.user_id,
+                    *purge,
+                    expected_resource_version.as_deref(),
+                    &mut operation,
+                    &guard,
+                )
+                .await?;
+                // Deletion has no prior runtime policy to restore on completion.
+                return Ok(container_runtime_api::DeploymentStatus::default());
+            }
+            operation.bind_lease(&guard, &identity.user_id).await?;
+            let previous = self.fetch_runtime_status_or_err(&snapshot.app_id).await?;
+            if matches!(command, Command::Start { traffic: true })
+                && previous.wake_on_traffic == Some(false)
+            {
+                return Err(AppOperationError::InvalidState(
+                    "Traffic recovery cannot override an intentional stop".into(),
+                ));
+            }
+            let context = operation.execution_context(&identity.user_id);
+            let target = self
+                .runtime
+                .capture_app_mutation_target(&context, previous.resource_version.as_deref())
+                .await
+                .map_err(|error| map_runtime_error("Capture recovery control target", error))?;
+            operation
+                .checkpoint(
+                    "recovery_control_target",
+                    serde_json::json!({"target":target,"command":command}),
+                )
+                .await?;
+            if matches!(command, Command::Start { traffic: true }) {
+                self.restore_activity_state(&snapshot.app_id, &previous, true);
+            }
+            match &command {
+                Command::Deploy { .. }
+                | Command::Create { .. }
+                | Command::Update { .. }
+                | Command::StopBuilder
+                | Command::RestartBuilder
+                | Command::DeleteResources { .. }
+                | Command::DeleteApplication
+                | Command::DestroyStorage { .. }
+                | Command::ClearStorage { .. } => {
+                    return Err(AppOperationError::InvalidState(
+                        "Deletion must use its captured-resource executor".into(),
+                    ));
+                }
+                Command::SetRecyclePolicy { policy } => {
+                    if self.config.access_mode == crate::config::AppAccessMode::Kubernetes {
+                        guard.mark_mutating()?;
+                    }
+                    let projected = self.runtime.patch_app_policy_target(&target, policy).await;
+                    if matches!(
+                        &projected,
+                        Err(container_runtime_api::ContainerRuntimeError::RequestRejected(_))
+                    ) {
+                        guard.mark_rejected_before_mutation();
+                    }
+                    projected.map_err(|error| {
+                        map_runtime_error("Recover captured runtime policy", error)
+                    })?;
+                }
+                Command::Stop { wake_on_traffic } => {
+                    self.apply_scale_zero(&target, *wake_on_traffic, &previous, &guard)
+                        .await?;
+                }
+                Command::Restart => {
+                    guard.mark_mutating()?;
+                    self.runtime
+                        .restart_app_target(&target)
+                        .await
+                        .map_err(|error| {
+                            map_runtime_error("Restart captured recovery target", error)
+                        })?;
+                }
+                Command::Start { traffic } => {
+                    if !*traffic || previous.phase != "Running" {
+                        guard.mark_mutating()?;
+                        self.runtime
+                            .start_app_target(&target)
+                            .await
+                            .map_err(|error| {
+                                map_runtime_error("Start captured recovery target", error)
+                            })?;
+                    }
+                    if *traffic {
+                        self.wait_for_captured_wake(&target).await?;
+                    }
+                }
+            }
+            Ok::<_, AppOperationError>(previous)
+        };
+        let result = timeout_at(deadline, execute).await.unwrap_or_else(|_| {
+            Err(AppOperationError::Backend(
+                "Control recovery execution deadline exceeded".into(),
+            ))
+        });
+        match result {
+            Ok(previous) => {
+                if matches!(
+                    command,
+                    Command::Start { .. }
+                        | Command::Restart
+                        | Command::Stop { .. }
+                        | Command::SetRecyclePolicy { .. }
+                ) {
+                    operation.confirm_effects().await?;
+                }
+                operation.succeed().await?;
+                guard.mark_completed();
+                match command {
+                    Command::DestroyStorage { .. }
+                    | Command::ClearStorage { .. }
+                    | Command::Update { .. }
+                    | Command::StopBuilder
+                    | Command::RestartBuilder => {}
+                    Command::Create { .. } | Command::Deploy { .. } => {
+                        self.activity.mark_running(&snapshot.app_id)
+                    }
+                    Command::DeleteResources { .. } | Command::DeleteApplication => {
+                        self.activity.forget_app(&snapshot.app_id)
+                    }
+                    Command::Start { traffic: true } => {
+                        if !self.activity.try_mark_woken(&snapshot.app_id) {
+                            guard.finish().await?;
+                            return Err(AppOperationError::Conflict(
+                                "Application was stopped during recovery completion".into(),
+                            ));
+                        }
+                    }
+                    Command::Start { traffic: false } | Command::Restart => {
+                        self.activity.mark_running(&snapshot.app_id)
+                    }
+                    Command::Stop { .. } => {}
+                    Command::SetRecyclePolicy { policy } => {
+                        if previous.replicas == 0
+                            && let Some(wake) = policy.wake_on_traffic
+                        {
+                            self.restore_activity_state(&snapshot.app_id, &previous, wake);
+                        }
+                    }
+                }
+                guard.finish().await?;
+                self.invalidate_deploy_cache().await;
+                Ok(true)
+            }
+            Err(error) => {
+                if guard.has_unfinished_mutation() || snapshot.kind.ends_lifecycle() {
+                    operation.fail(&error).await?;
+                    if !guard.has_unfinished_mutation() {
+                        guard.finish().await?;
+                    }
+                } else {
+                    operation.reject_without_mutation(&error).await?;
+                    guard.finish().await?;
+                }
+                Err(error)
+            }
+        }
+    }
+}

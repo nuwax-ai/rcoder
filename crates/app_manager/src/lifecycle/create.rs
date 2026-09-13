@@ -14,13 +14,11 @@ impl AppService {
     /// 创建应用（公共入口：自动获取进程级发布锁）
     ///
     /// ⚠️ 调用方不得已持 `acquire_process_release_lock(app_id)` —— tokio Mutex
-    /// 不可重入，已持锁调用会永久挂起（activate 的 ensure_app_runtime 走
-    /// `create_app_locked` 内核避免此问题）。
+    /// 不可重入，已持锁调用须使用共享执行内核，不能再次调用公共入口。
     #[instrument(skip(self, request))]
     pub async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo> {
         // ⚠️ 调用方不得已持 `acquire_process_release_lock(app_id)` —— tokio Mutex
-        // 不可重入，已持锁调用会永久挂起（activate 的 ensure_app_runtime 走
-        // [`create_app_locked`] 内核避免此问题）。
+        // Non-reentrant: callers holding the application guard use the execution kernel.
         //
         // Multi-replica creation is resolved at the runtime create boundary.
         // Never compensate by the logical name: another replica may own that resource.
@@ -36,13 +34,11 @@ impl AppService {
     }
 
     /// 已持锁内核：调用方持有该 app 的进程级发布锁（防止与发布流水线互踩），
-    /// 本函数不再取锁。供 `create_app` 公共包装和 `ensure_app_runtime`（activate
-    /// 锁内调用）共用——拆分正是为了消除 activate→ensure_app_runtime→create_app
-    /// 的重入死锁。
+    /// 本函数不再取锁；公共 create 入口将已取得的锁传入，避免重入。
     ///
     /// 入口统一解析默认镜像（单一收口）：image 缺省 → 平台默认运行时镜像
     /// （env `RCODER_RUNTIME_IMAGE_DIGEST`，测试/生产由部署注入；与发布链
-    /// ensure_app_runtime 同源）。填充后全链路（params/AppInfo）恒 Some。
+    /// empty_runtime_request 同源）。填充后全链路（params/AppInfo）恒 Some。
     pub(crate) async fn create_app_locked(
         &self,
         app_id: &str,
@@ -80,40 +76,167 @@ impl AppService {
             "[APP] creating app: {} ({}, mode={:?})",
             request.name, app_id, self.config.access_mode
         );
-        let params = match self.build_container_params(app_id, &request).await {
-            Ok(params) => params,
-            Err(error) => {
-                _process_lock.mark_completed();
-                return Err(error);
-            }
-        };
-        _process_lock.mark_mutating()?;
-        self.provision_app_workspace(app_id, &request).await?;
-        // provision_app_workspace 失败不走此分支：PVC/目录保留，下次 create 幂等复用。
-        // The runtime owns partial-create compensation: only it has the IDs/UIDs
-        // returned by successful create calls. A name conflict establishes no ownership.
-        self.create_app_runtime(app_id, &request, params).await?;
-        // 同 ID 删除后重建时，必须清除旧的 stopped/wake-blocked 内存态。
-        self.activity.mark_running(app_id);
-        // 业务元数据落库/缓存（name/租户/业务创建时间;集群不持有。request 随后 move 进 assemble）
-        // user_id：request 显式值优先；空串=未设置（内部 ensure 构造无 user 上下文），
-        // **回填已存值**——create-workspace/build 已注册的 owner 不被覆盖清空
-        // （record 是整行 upsert；start-deploy 经此路径，清空会让 purge 的
-        // prod/{user_id}/data 定位与 apps 代理 URL 拼接丢 owner）。
-        let user_id = Some(request.user_id.clone())
-            .filter(|u| !u.trim().is_empty())
-            .or_else(|| self.metadata.lookup(app_id).and_then(|m| m.user_id.clone()));
         self.metadata
-            .record(
+            .validate_request_lifecycle(app_id, &request.user_id, request.lifecycle_id.as_deref())
+            .await?;
+        request.user_id = self
+            .metadata
+            .owner_for_write(app_id, &request.user_id)
+            .await?;
+        use sha2::Digest as _;
+        let fingerprint = hex::encode(sha2::Sha256::digest(
+            shared_types::encode_userapp_intent(&request).map_err(|error| {
+                AppOperationError::Backend(format!("Encode creation intent: {error}"))
+            })?,
+        ));
+        let control = shared_types::UserAppControlRequest {
+            user_id: request.user_id.clone(),
+            lifecycle_id: request.lifecycle_id.clone(),
+            request_id: request.request_id.clone(),
+        };
+        // The first registration is read-only with respect to runtime resources.
+        // Metadata changes and operation admission below commit atomically.
+        let identity = self
+            .metadata
+            .store
+            .ensure_identity(app_id, &request.user_id)
+            .await?;
+        if self
+            .replay_control(
                 app_id,
-                Some(request.name.clone()),
-                user_id,
-                request.tenant_id.clone(),
-                request.space_id.clone(),
+                &control,
+                shared_types::UserAppOperationKind::Create,
+                &fingerprint,
+            )
+            .await?
+            .is_some()
+        {
+            return Ok(self.assemble_app_info(app_id.to_owned(), request).await);
+        }
+        match self.runtime.get_deployment_status(app_id).await {
+            Ok(Some(_)) => {
+                return Err(AppOperationError::AlreadyExists(format!(
+                    "Application already exists: {app_id}"
+                )));
+            }
+            Ok(None) => {}
+            Err(error) => return Err(map_runtime_error("Read application creation target", error)),
+        }
+        let params = self.build_container_params(app_id, &request).await?;
+        let input = super::config_input::encode(&params, None)?;
+        let mut operation = crate::service::OwnedOperation::admit_with_input(
+            self.metadata.store.clone(),
+            shared_types::UserAppAdmission {
+                runtime_policy_on_success: Some(shared_types::UserAppRuntimePolicy {
+                    recycle_enabled: params.recycle_enabled,
+                    idle_timeout_seconds: params.idle_timeout_seconds,
+                    wake_on_traffic: Some(true),
+                }),
+                command: Some(shared_types::UserAppControlCommand::Create {
+                    input_digest: input.digest(),
+                }),
+                app_id: app_id.into(),
+                user_id: request.user_id.clone(),
+                lifecycle_id: request.lifecycle_id.clone(),
+                operation_id: Uuid::new_v4().to_string(),
+                request_id: request.request_id.clone(),
+                request_fingerprint: fingerprint,
+                kind: shared_types::UserAppOperationKind::Create,
+                metadata: Some(shared_types::UserAppMetadataPatch {
+                    app_id: app_id.into(),
+                    user_id: request.user_id.clone(),
+                    lifecycle_id: identity.lifecycle_id,
+                    expected_revision: identity.metadata_revision,
+                    name: Some(Some(request.name.clone())),
+                    tenant_id: request.tenant_id.clone().map(Some),
+                    space_id: request.space_id.clone().map(Some),
+                }),
+            },
+            Some(&input),
+        )
+        .await?;
+        let mutation = self
+            .execute_creation(
+                app_id,
+                &request.user_id,
+                params,
+                &mut operation,
+                _process_lock,
             )
             .await;
-        let info = self.assemble_app_info(app_id.to_string(), request).await;
-        Ok(info)
+        // Ownership persists if the remote result or terminal commit is uncertain.
+        // The operation record remains available for identity-aware recovery.
+        match mutation {
+            Ok(()) => operation.succeed().await?,
+            Err(error) => {
+                if _process_lock.has_unfinished_mutation() {
+                    operation.fail(&error).await?;
+                } else {
+                    operation.reject_without_mutation(&error).await?;
+                }
+                return Err(error);
+            }
+        }
+        _process_lock.mark_completed();
+        self.activity.mark_running(app_id);
+        Ok(self.assemble_app_info(app_id.to_owned(), request).await)
+    }
+
+    pub(crate) async fn execute_creation(
+        &self,
+        app_id: &str,
+        owner: &str,
+        mut params: container_runtime_api::ContainerCreateParams,
+        operation: &mut crate::service::OwnedOperation,
+        guard: &crate::service::AppOperationGuard,
+    ) -> AppResult<()> {
+        operation.bind_lease(guard, owner).await?;
+        params.execution_context = Some(operation.execution_context(owner));
+        params
+            .validate_execution_context()
+            .map_err(|error| map_runtime_error("Validate creation execution", error))?;
+        if self
+            .runtime
+            .get_deployment_status(app_id)
+            .await
+            .map_err(|error| map_runtime_error("Observe creation recovery target", error))?
+            .is_some()
+        {
+            return Err(AppOperationError::AlreadyExists(
+                "Application creation target already exists".into(),
+            ));
+        }
+        let ports = params
+            .ports
+            .as_ref()
+            .map(|ports| {
+                ports
+                    .iter()
+                    .filter(|port| {
+                        matches!(port.expose_type, container_runtime_api::ExposeType::Http)
+                    })
+                    .map(|port| port.port)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        operation
+            .checkpoint(
+                "creating_runtime",
+                serde_json::json!({"context":params.execution_context}),
+            )
+            .await?;
+        guard.mark_mutating()?;
+        let resource = self
+            .runtime
+            .create_deployment(params)
+            .await
+            .map_err(|error| map_runtime_error("Create application runtime", error))?;
+        self.register_pingora_backends(app_id, &ports, &resource.container_ip)
+            .await;
+        operation
+            .checkpoint("runtime_created", serde_json::json!({"resource":resource}))
+            .await?;
+        Ok(())
     }
 
     /// 校验创建请求并解析 app_id（app_id 规范 + 唯一性 + 资源格式 + 端口）。
@@ -134,21 +257,6 @@ impl AppService {
         let app_id = match &request.app_id {
             Some(id) => {
                 validate_app_id(id)?;
-                // 唯一性：已存在 → ERR_APP_ALREADY_EXISTS（防止 SSA force=true 静默覆盖）
-                match self.runtime.get_deployment_status(id).await {
-                    Ok(Some(_)) => {
-                        return Err(AppOperationError::AlreadyExists(format!(
-                            "app already exists: {id}"
-                        )));
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        return Err(map_runtime_error(
-                            &format!("[APP] check app existence failed app_id={id}"),
-                            error,
-                        ));
-                    }
-                }
                 id.clone()
             }
             None => format!("app-{}", &Uuid::new_v4().to_string()[..8]),
@@ -213,53 +321,10 @@ impl AppService {
         Ok(app_id)
     }
 
-    /// provision：ensure per-app PVC（带用户配额 requests.storage）。
-    ///
-    /// 顺序硬约束：K8s ensure PVC 必须在 create_deployment 之前——首次 ensure
-    /// 带配额，否则 create_deployment 内 ensure 命中 active 复用会丢配额。
-    /// 工作空间目录（code/data/logs）不再由 rcoder 建：K8s 镜像自带 + app-cli
-    /// 部署段换 code/；Docker bind 源目录由 docker runtime 在 create 前建。
-    async fn provision_app_workspace(
-        &self,
-        app_id: &str,
-        request: &CreateAppRequest,
-    ) -> AppResult<()> {
-        let storage_size = request
-            .resources
-            .as_ref()
-            .and_then(|r| r.storage.as_deref());
-        self.ensure_app_workspace_ready(app_id, storage_size).await
-    }
-
     /// 创建运行时资源：build params → create_deployment → 注册 Pingora backend。
     ///
     /// 注: Userapp 是新开发逻辑 (application-management-service-v2-design.md), /app 路径
     /// 不涉及历史数据迁移 → 不调 lazy_migrate (新应用无旧数据)。Web/Computer 有历史数据才调。
-    async fn create_app_runtime(
-        &self,
-        app_id: &str,
-        request: &CreateAppRequest,
-        params: container_runtime_api::ContainerCreateParams,
-    ) -> AppResult<()> {
-        let container_info = self.runtime.create_deployment(params).await.map_err(|e| {
-            map_runtime_error(
-                &format!("[APP] create_deployment failed app_id={app_id}"),
-                e,
-            )
-        })?;
-        info!(
-            "[APP] app resources created: {} (container={})",
-            app_id, container_info.container_name
-        );
-        // Docker 模式：为 HTTP 端口注册 Pingora backend（/api/v1/userapp/proxy/app/prod 免端口代理按 APP_ENTRY_PORT 优查 → container_ip）
-        // 注册错误忽略不阻断：pingora backend 幂等可重建（update/restart/启动时 rebuild 会补齐），
-        // 不应因注册失败回滚已建成的 Deployment。
-        let http_ports = http_port_numbers(&request.ports);
-        self.register_pingora_backends(app_id, &http_ports, &container_info.container_ip)
-            .await;
-        Ok(())
-    }
-
     /// 装配 AppInfo：实时查运行时状态，合并端口 external_port（K8s node_port），构建 access/health/status。
     ///
     /// status 用运行时 phase 映射（不再硬编码 Running）——刚创建的 Pod 通常还是 Starting，甚至镜像
@@ -296,7 +361,7 @@ impl AppService {
             }
         }
 
-        let access = self.build_access_info(&app_id, &ports);
+        let access = self.build_access_info(&app_id, &ports, Some(&request.user_id));
         let health = runtime_status
             .as_ref()
             .map(health_from_status)

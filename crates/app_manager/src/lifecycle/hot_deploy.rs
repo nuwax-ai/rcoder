@@ -24,7 +24,7 @@ use tracing::{info, warn};
 
 use crate::error::AppOperationError;
 use crate::error::AppResult;
-use crate::models::AppRuntimeInfo;
+use crate::models::{AppRuntimeInfo, StartAppRequest};
 use crate::service::AppService;
 
 /// 热部署受理/轮询端口（app-cli 管理 API 常量对齐）。
@@ -34,18 +34,64 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const HOT_DEPLOY_BUDGET: Duration = Duration::from_secs(300);
 const HOT_RECONCILIATION_BUDGET: Duration = Duration::from_secs(30 * 60);
 
+/// Artifact identity passed together so the hot coordinator cannot mix releases.
+pub(crate) struct HotArtifact<'a> {
+    pub url: &'a str,
+    pub release_id: &'a str,
+    pub sha256: &'a str,
+}
+
 impl AppService {
     /// 尝试热部署。`Ok(Some(()))` = 完成（调用方跳过换 Pod 链）；`Ok(None)` = 前置不满足，回退换 Pod；`Err` = 受理后失败（现场
     /// 保留）。409（已有部署在进行）如实上抛冲突。
+    #[cfg(test)]
     pub(crate) async fn try_deploy_via_container_api(
         &self,
         app_id: &str,
         url: &str,
         release_id: &str,
         sha256: &str,
-        requested_business_env: Option<&std::collections::HashMap<String, String>>,
+        request: &StartAppRequest,
     ) -> AppResult<Option<()>> {
-        let operation = self.try_acquire_process_release_lock(app_id).await?;
+        let guard = Arc::new(self.try_acquire_process_release_lock(app_id).await?);
+        let result = self
+            .try_deploy_via_container_api_with_guard(
+                app_id,
+                HotArtifact {
+                    url,
+                    release_id,
+                    sha256,
+                },
+                request,
+                guard.clone(),
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await;
+        let guard = Arc::try_unwrap(guard)
+            .map_err(|_| AppOperationError::Conflict("Hot executor still owns lease".into()))?;
+        finish_hot_operation(guard, result).await
+    }
+
+    pub(crate) async fn try_deploy_via_container_api_with_guard(
+        &self,
+        app_id: &str,
+        artifact: HotArtifact<'_>,
+        request: &StartAppRequest,
+        operation: Arc<crate::service::AppOperationGuard>,
+        operation_id: &str,
+    ) -> AppResult<Option<()>> {
+        let HotArtifact {
+            url,
+            release_id,
+            sha256,
+        } = artifact;
+        self.metadata
+            .validate_request_lifecycle(
+                app_id,
+                request.user_id.trim(),
+                request.lifecycle_id.as_deref(),
+            )
+            .await?;
         // 前置：app 存在且 Running 且有可路由 IP
         let app: AppRuntimeInfo = match self.get_app(app_id).await {
             Ok(app) => app,
@@ -53,7 +99,6 @@ impl AppService {
                 info!(
                     "[APP] hot deploy fallback: app {app_id} not found (first deploy → pod path)"
                 );
-                operation.finish().await?;
                 return Ok(None);
             }
             Err(e) => return Err(e),
@@ -64,7 +109,7 @@ impl AppService {
             .app_env_snapshot(app_id)
             .await
             .map_err(|e| AppOperationError::Backend(format!("read hot deployment env: {e}")))?;
-        if let Some(requested) = requested_business_env {
+        if let Some(requested) = request.env.as_ref() {
             validate_requested_hot_env(requested, &env_snapshot.env)?;
         }
         let Some(ip) = app
@@ -76,7 +121,6 @@ impl AppService {
             .filter(|s| !s.is_empty())
         else {
             warn!("[APP] hot deploy fallback: app {app_id} has no ready runtime IP");
-            operation.finish().await?;
             return Ok(None);
         };
 
@@ -90,7 +134,6 @@ impl AppService {
                 "[APP] hot deploy fallback: APP_CLI_DEPLOY_TOKEN not set on app {app_id} \
                  (server-form image required)"
             );
-            operation.finish().await?;
             return Ok(None);
         };
 
@@ -106,7 +149,6 @@ impl AppService {
                 AppOperationError::Backend(format!("hot deployment capability probe failed: {e}"))
             })?;
         if capability.status().as_u16() == 404 {
-            operation.finish().await?;
             return Ok(None);
         }
         let capability: serde_json::Value = capability
@@ -120,7 +162,6 @@ impl AppService {
                 AppOperationError::Backend(format!("hot deployment capability body: {e}"))
             })?;
         if !supports_hot_protocol(&capability) {
-            operation.finish().await?;
             return Ok(None);
         }
         let generation_id = env_snapshot
@@ -142,17 +183,22 @@ impl AppService {
             token,
             env_snapshot,
             generation_id,
-            operation_id: uuid::Uuid::new_v4().simple().to_string(),
+            operation_id: operation_id.to_owned(),
             operation,
         };
         // Once the request can be accepted, cancellation of the HTTP caller must
         // not abandon status observation or configuration convergence.
-        await_hot_coordinator(tokio::spawn(task.run()), HOT_DEPLOY_BUDGET).await
+        tokio::time::timeout(HOT_DEPLOY_BUDGET, task.execute())
+            .await
+            .map_err(|_| {
+                AppOperationError::Backend("Hot deployment execution deadline exceeded".into())
+            })?
     }
 }
 
 /// Dropping the JoinHandle detaches the owned coordinator; it does not cancel
 /// the accepted deployment or its conditional configuration commit.
+#[cfg(test)]
 async fn await_hot_coordinator(
     task: tokio::task::JoinHandle<AppResult<Option<()>>>,
     budget: Duration,
@@ -176,17 +222,20 @@ struct HotDeploymentTask {
     env_snapshot: shared_types::AppEnvSnapshot,
     generation_id: String,
     operation_id: String,
-    operation: crate::service::AppOperationGuard,
+    operation: Arc<crate::service::AppOperationGuard>,
 }
 
 impl HotDeploymentTask {
+    #[cfg(test)]
     async fn run(self) -> AppResult<Option<()>> {
         let result = self.execute().await;
         if let Err(error) = &result {
             warn!(app_id = %self.app_id, operation_id = %self.operation_id, %error,
                 "Hot deployment coordinator stopped with an error");
         }
-        finish_hot_operation(self.operation, result).await
+        let operation = Arc::try_unwrap(self.operation)
+            .map_err(|_| AppOperationError::Conflict("Hot operation still has observers".into()))?;
+        finish_hot_operation(operation, result).await
     }
 
     async fn execute(&self) -> AppResult<Option<()>> {
@@ -405,7 +454,7 @@ async fn converge_deploy_env_after_hot(
     app_id: &str,
     snapshot: &shared_types::AppEnvSnapshot,
     env: &std::collections::HashMap<String, String>,
-    operation: &crate::service::AppOperationGuard,
+    _operation: &crate::service::AppOperationGuard,
 ) -> AppResult<()> {
     // Docker environment is immutable. The matched protocol-4 Running status
     // is accepted only after durable journal readback, checked by the observer.
@@ -416,9 +465,9 @@ async fn converge_deploy_env_after_hot(
         .update_env_configmap_if_version(app_id, env, snapshot)
         .await
         .map_err(|e| {
-            if matches!(e, container_runtime_api::ContainerRuntimeError::Conflict(_)) {
-                operation.mark_completed();
-            }
+            // Activation has already changed the running release. A rejected
+            // metadata CAS does not undo that effect or prove full completion;
+            // retain ownership and the durable recovery record.
             AppOperationError::Backend(format!(
                 "application activated but deployment env convergence failed: {e}"
             ))
@@ -456,6 +505,7 @@ fn supports_hot_protocol(document: &serde_json::Value) -> bool {
         })
 }
 
+#[cfg(test)]
 async fn finish_hot_operation(
     operation: crate::service::AppOperationGuard,
     result: AppResult<Option<()>>,
@@ -521,7 +571,7 @@ fn observe_hot_operation(
 
 #[cfg(test)]
 mod tests {
-    use crate::models::StartAppRequest;
+    use super::StartAppRequest;
     use crate::test_support::{MockRuntime, test_service};
     use std::sync::Arc;
 
@@ -545,10 +595,19 @@ mod tests {
     async fn hot_deploy_falls_back_when_app_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MockRuntime::default());
-        let svc = test_service(tmp.path(), runtime.clone());
+        let svc = test_service(tmp.path(), runtime.clone()).await;
 
         let outcome = svc
-            .try_deploy_via_container_api("app-nope", "http://x/p.zip", "rel-1", "", None)
+            .try_deploy_via_container_api(
+                "app-nope",
+                "http://x/p.zip",
+                "rel-1",
+                "",
+                &StartAppRequest {
+                    user_id: "owner".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("fallback must not error");
         assert!(outcome.is_none(), "missing app must fall back to pod path");
@@ -569,10 +628,19 @@ mod tests {
                 ..Default::default()
             },
         );
-        let svc = test_service(tmp.path(), runtime);
+        let svc = test_service(tmp.path(), runtime).await;
 
         let outcome = svc
-            .try_deploy_via_container_api("app-live", "http://x/p.zip", "rel-1", "", None)
+            .try_deploy_via_container_api(
+                "app-live",
+                "http://x/p.zip",
+                "rel-1",
+                "",
+                &StartAppRequest {
+                    user_id: "owner".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("fallback must not error");
         assert!(
@@ -645,7 +713,7 @@ mod tests {
             ] {
                 let root = tempfile::tempdir().expect("directory");
                 let runtime = Arc::new(MockRuntime::default());
-                let mut service = test_service(root.path(), runtime.clone());
+                let mut service = test_service(root.path(), runtime.clone()).await;
                 if kubernetes {
                     service.config.access_mode = crate::config::AppAccessMode::Kubernetes;
                 }
@@ -691,14 +759,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hot_env_cas_rejection_releases_but_uncertain_write_retains_ownership() {
+    async fn activated_hot_env_commit_failure_always_retains_recovery_ownership() {
         for failure in [1, 2] {
             let root = tempfile::tempdir().expect("directory");
             let runtime = Arc::new(MockRuntime::default());
             runtime
                 .env_commit_failure
                 .store(failure, std::sync::atomic::Ordering::SeqCst);
-            let mut service = test_service(root.path(), runtime);
+            let mut service = test_service(root.path(), runtime).await;
             service.config.access_mode = crate::config::AppAccessMode::Kubernetes;
             let guard = service
                 .acquire_process_release_lock("hot-env")
@@ -721,7 +789,10 @@ mod tests {
                     .is_err()
             );
             let next = service.try_acquire_process_release_lock("hot-env").await;
-            assert_eq!(next.is_ok(), failure == 1);
+            assert!(
+                next.is_err(),
+                "activation must remain recoverable after env failure {failure}"
+            );
             if let Ok(next) = next {
                 next.finish().await.expect("release");
             }
@@ -741,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn running_requires_exact_generation_successful_stage_and_persisted_receipt() {
         let root = tempfile::tempdir().expect("directory");
-        let service = test_service(root.path(), Arc::new(MockRuntime::default()));
+        let service = test_service(root.path(), Arc::new(MockRuntime::default())).await;
         let guard = service
             .acquire_process_release_lock("hot-identity")
             .await
@@ -789,7 +860,7 @@ mod tests {
             runtime
                 .env_commit_failure
                 .store(2, std::sync::atomic::Ordering::SeqCst);
-            let service = test_service(root.path(), runtime.clone());
+            let service = test_service(root.path(), runtime.clone()).await;
             let guard = service
                 .acquire_process_release_lock("hot-cancel")
                 .await
@@ -834,7 +905,7 @@ mod tests {
                 env_snapshot: Default::default(),
                 generation_id: "generation".into(),
                 operation_id: "operation".into(),
-                operation: guard,
+                operation: Arc::new(guard),
             };
             let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
             let caller = tokio::spawn(async move {
@@ -935,7 +1006,7 @@ mod tests {
         });
         let root = tempfile::tempdir().expect("root");
         let runtime = Arc::new(MockRuntime::default());
-        let service = test_service(root.path(), runtime.clone());
+        let service = test_service(root.path(), runtime.clone()).await;
         let task = super::HotDeploymentTask {
             runtime,
             access_mode: crate::config::AppAccessMode::Docker,
@@ -948,10 +1019,12 @@ mod tests {
             env_snapshot: Default::default(),
             generation_id: "generation".into(),
             operation_id: "operation".into(),
-            operation: service
-                .acquire_process_release_lock("ready-test")
-                .await
-                .expect("lease"),
+            operation: Arc::new(
+                service
+                    .acquire_process_release_lock("ready-test")
+                    .await
+                    .expect("lease"),
+            ),
         };
         let client = super::admin_client().expect("client");
         assert!(
@@ -983,7 +1056,10 @@ mod tests {
             "another operation appearing after /ready must not complete this one"
         );
         assert_eq!(status_reads.load(Ordering::SeqCst), 5);
-        task.operation.finish().await.expect("finish");
+        let guard = Arc::try_unwrap(task.operation)
+            .ok()
+            .expect("exclusive guard");
+        guard.finish().await.expect("finish");
         server.abort();
     }
 }

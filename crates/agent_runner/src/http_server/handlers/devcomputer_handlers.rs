@@ -12,16 +12,10 @@
 //! `#[utoipa::path]` 属性——直接复用会让 `/devcomputer/progress/{session_id}`
 //! 从 OpenAPI 文档里消失。流式逻辑本身仍在 [`super::progress_sse`]，无副本。
 
-use axum::{
-    Json,
-    extract::Path,
-    http::{HeaderMap, StatusCode},
-    response::sse::Sse,
-};
-use shared_types::HttpResult;
+use axum::{extract::Path, http::HeaderMap};
 use tracing::info;
 
-use super::progress_sse::{SseStream, progress_sse};
+use super::progress_sse::{ProgressResponse, progress_sse};
 
 /// 与 /computer/progress 同前缀（两者共享容器与逻辑，日志上不做区分）
 const LOG_PREFIX: &str = "HTTP";
@@ -43,7 +37,7 @@ const LOG_PREFIX: &str = "HTTP";
 pub async fn devcomputer_progress(
     headers: HeaderMap,
     Path(session_id): Path<String>,
-) -> Result<Sse<SseStream>, (StatusCode, Json<HttpResult<String>>)> {
+) -> ProgressResponse {
     // 订阅日志由各薄 handler 自己打（progress_sse 内部不打）。此处文本与重构前
     // 委托 handle_computer_progress 时完全一致，运维 grep 不受影响。
     info!(

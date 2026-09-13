@@ -137,19 +137,22 @@ mod tests {
         assert!(delete.is_err(), "delete 缺 user_id 应拒");
     }
 
-    /// purge 请求：user_id 可选（body 整体可选——资源定位走 app_id 通配，
-    /// user_id 仅为日志/对账），空对象与携带均可反序列化。
+    /// Full deletion requires ownership and preserves lifecycle/request tokens.
     #[test]
-    fn purge_app_request_user_id_is_optional() {
-        let empty: PurgeAppRequest =
-            serde_json::from_value(serde_json::json!({})).expect("empty body must parse");
-        assert_eq!(empty.user_id, None);
-
-        let with_user: PurgeAppRequest = serde_json::from_value(serde_json::json!({
-            "user_id": "u-purge"
+    fn purge_app_request_requires_owner_and_preserves_control_identity() {
+        assert!(serde_json::from_value::<PurgeAppRequest>(serde_json::json!({})).is_err());
+        let request: PurgeAppRequest = serde_json::from_value(serde_json::json!({
+            "user_id": "u-purge", "lifecycle_id": "life-one", "request_id": "request-one"
         }))
-        .expect("user_id body must parse");
-        assert_eq!(with_user.user_id.as_deref(), Some("u-purge"));
+        .expect("control request");
+        assert_eq!(request.user_id, "u-purge");
+        assert_eq!(request.lifecycle_id.as_deref(), Some("life-one"));
+        assert_eq!(request.request_id.as_deref(), Some("request-one"));
+        let initial: PurgeAppRequest =
+            serde_json::from_value(serde_json::json!({"user_id": "u-purge"}))
+                .expect("first lifecycle request");
+        assert_eq!(initial.lifecycle_id, None);
+        assert_eq!(initial.request_id, None);
     }
 
     /// query 请求：filters/sort 键与 SortOrder 小写值。

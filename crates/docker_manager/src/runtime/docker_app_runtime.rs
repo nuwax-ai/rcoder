@@ -31,6 +31,14 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             .map(Some)
     }
 
+    async fn release_app_operation_receipt(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<()> {
+        self.release_captured_file_lease(context, receipt).await
+    }
+
     async fn capture_app_deletion(
         &self,
         app_id: &str,
@@ -144,7 +152,6 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                 "application container was replaced during deletion".into(),
             ));
         }
-        self.recycle_policy.remove(&snapshot.app_id);
         Ok(())
     }
     async fn create_deployment(
@@ -161,18 +168,62 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         self.patch_deployment_impl(params).await
     }
 
+    async fn capture_app_mutation_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        _expected_resource_version: Option<&str>,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        self.capture_stop_target(context).await
+    }
+
+    async fn restart_app_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.restart_captured_target(target).await
+    }
+
+    async fn start_app_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.start_captured_target(target).await
+    }
+
+    async fn stop_app_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        _wake_on_traffic: bool,
+    ) -> ContainerRuntimeResult<()> {
+        // Docker wake policy is represented by the durable Stop intent and the
+        // service activity state; there is no mutable container annotation API.
+        self.stop_captured_target(target).await
+    }
+
     async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
         self.scale_deployment_impl(app_id, replicas).await
     }
 
-    async fn patch_recycle_policy(
+    async fn patch_app_policy_target(
         &self,
-        app_id: &str,
-        recycle_enabled: Option<bool>,
-        idle_timeout_seconds: Option<u64>,
+        target: &shared_types::UserAppMutationTarget,
+        _policy: &shared_types::UserAppRuntimePolicy,
     ) -> ContainerRuntimeResult<()> {
-        self.patch_recycle_policy_impl(app_id, recycle_enabled, idle_timeout_seconds)
-            .await
+        target
+            .context
+            .validate_identity(&target.context.app_id, Some(&target.context.user_id))
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if target.resource.kind != shared_types::AppResourceKind::Container
+            || target.resource.uid.is_empty()
+            || target.resource.name != app_deployment_name(&target.context.app_id)
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Invalid Docker policy target".into(),
+            ));
+        }
+        // No label rewrite or in-memory policy cache. The lifecycle transaction
+        // persists policy for this application generation after this validation.
+        Ok(())
     }
 
     async fn restart_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
@@ -211,7 +262,6 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         let ip = extract_container_ip(&inspect, None);
         // 提前借用 inspect 提取 ports（避免下方 inspect.state 消费后借用冲突）
         let ports = extract_container_ports(&inspect);
-        let rp = self.recycle_policy_of(app_id);
         Ok(Some(DeploymentStatus {
             app_id: app_id.to_string(),
             replicas: if running { 1 } else { 0 },
@@ -224,8 +274,6 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             started_at: inspect.state.as_ref().and_then(|s| s.started_at.clone()),
             ports,
             resource_version: None,
-            recycle_enabled: rp.recycle_enabled,
-            idle_timeout_seconds: rp.idle_timeout_seconds,
             ..Default::default()
         }))
     }
@@ -348,7 +396,6 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                         .collect()
                 })
                 .unwrap_or_default();
-            let rp = self.recycle_policy_of(&app_id);
             out.push(DeploymentStatus {
                 app_id,
                 replicas: if running { 1 } else { 0 },
@@ -361,8 +408,6 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                 started_at: None,
                 ports,
                 resource_version: None,
-                recycle_enabled: rp.recycle_enabled,
-                idle_timeout_seconds: rp.idle_timeout_seconds,
                 ..Default::default()
             });
         }

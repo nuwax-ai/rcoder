@@ -15,39 +15,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
-
 use crate::DockerManager;
-
-/// Docker 内存态回收策略（Docker 无 K8s 注解；字段 None = 未设/沿用默认）。
-#[derive(Clone, Copy, Default)]
-pub(super) struct RecyclePolicy {
-    pub(super) recycle_enabled: Option<bool>,
-    pub(super) idle_timeout_seconds: Option<u64>,
-}
-
-impl RecyclePolicy {
-    /// merge：参数为 None 则保留旧值（self），Some 则覆盖。返回新策略。
-    pub(super) fn merge(
-        self,
-        recycle_enabled: Option<bool>,
-        idle_timeout_seconds: Option<u64>,
-    ) -> Self {
-        Self {
-            recycle_enabled: recycle_enabled.or(self.recycle_enabled),
-            idle_timeout_seconds: idle_timeout_seconds.or(self.idle_timeout_seconds),
-        }
-    }
-}
 
 /// Docker runtime implementation wrapping DockerManager
 pub struct DockerRuntime {
     pub(super) inner: Arc<DockerManager>,
     /// TTL cache for list_containers result (15 seconds)
     list_cache: Cache<(), Vec<RuntimeContainerInfo>>,
-    /// Userapp 闲置回收策略（Docker 无 K8s 注解，改用内存态；dev 模式可接受重启丢失，
-    /// 与 pingora_ports 同架构）。app_id → RecyclePolicy，merge 语义。
-    pub(super) recycle_policy: DashMap<String, RecyclePolicy>,
 }
 
 impl DockerRuntime {
@@ -59,16 +33,7 @@ impl DockerRuntime {
                 .max_capacity(1)
                 .time_to_live(Duration::from_secs(15))
                 .build(),
-            recycle_policy: DashMap::new(),
         }
-    }
-
-    /// 读 app 的回收策略（内存态）。未设置 → 默认（recyclable）。
-    pub(super) fn recycle_policy_of(&self, app_id: &str) -> RecyclePolicy {
-        self.recycle_policy
-            .get(app_id)
-            .map(|e| *e.value())
-            .unwrap_or_default()
     }
 }
 
@@ -92,10 +57,82 @@ impl AgentContainerRuntime for DockerRuntime {
     ) -> ContainerRuntimeResult<()> {
         self.delete_captured_builder(snapshot).await
     }
+    async fn inspect_builder_workspace(
+        &self,
+        snapshot: &shared_types::BuilderDeletionSnapshot,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::UserAppBuilderWorkspaceEndpoint> {
+        self.captured_builder_workspace(snapshot, context).await
+    }
+    async fn inspect_builder_candidate(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.capture_builder_compute_with_binding(context, None, true)
+            .await
+    }
+
+    async fn capture_builder_adoption(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        expected_container_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        let target = self
+            .capture_builder_compute_with_binding(context, None, true)
+            .await?;
+        if target
+            .workload
+            .as_ref()
+            .map(|resource| resource.uid.as_str())
+            != Some(expected_container_id)
+            || expected_container_id.is_empty()
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Physical builder changed before adoption".into(),
+            ));
+        }
+        Ok(target)
+    }
+    async fn capture_bound_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.capture_builder_compute_with_binding(context, binding, false)
+            .await
+    }
+
+    async fn capture_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.capture_builder_compute(context).await
+    }
+
+    async fn apply_builder_control(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        restart: bool,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        let result = self.apply_builder_compute(target, restart).await?;
+        if let Some(resource) = &target.workload {
+            self.inner
+                .retire_container_cache(&resource.uid)
+                .await
+                .map_err(|error| {
+                    ContainerRuntimeError::DockerError(format!(
+                        "Retire controlled builder cache: {error}"
+                    ))
+                })?;
+        }
+        Ok(result)
+    }
+
     async fn create_container(
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        params.validate_execution_context()?;
         let prepared = if params.service_type == ServiceType::UserappBuilder {
             Some(
                 crate::agent_container_starter::AgentContainerStarter::new(&self.inner)
@@ -117,7 +154,19 @@ impl AgentContainerRuntime for DockerRuntime {
                     params.project_id.as_deref(),
                 )
                 .map_err(|error| ContainerRuntimeError::ConfigurationError(error.to_string()))?;
-            Some(self.acquire_builder_operation(identifier).await?)
+            if let Some(context) = &params.execution_context {
+                context
+                    .validate_identity(identifier, params.user_id.as_deref())
+                    .map_err(ContainerRuntimeError::ConfigurationError)?;
+            }
+            Some(
+                self.acquire_application_file_lease_with_context(
+                    identifier,
+                    &params.service_type,
+                    params.execution_context.as_ref(),
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -127,10 +176,16 @@ impl AgentContainerRuntime for DockerRuntime {
             })?;
             let inner = self.inner.clone();
             return tokio::spawn(async move {
-                let result = crate::agent_container_starter::AgentContainerStarter::new(&inner)
-                    .start_prepared(params, prepared)
-                    .await
-                    .map_err(super::builder_completion::docker_error);
+                let result = if params.resource_binding.is_some() {
+                    Self::new(inner.clone())
+                        .resume_bound_builder(&params, prepared.image())
+                        .await
+                } else {
+                    crate::agent_container_starter::AgentContainerStarter::new(&inner)
+                        .start_prepared(params, prepared)
+                        .await
+                        .map_err(super::builder_completion::docker_error)
+                };
                 super::builder_completion::finish(lease, result).await
             })
             .await

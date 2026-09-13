@@ -89,6 +89,7 @@ pub async fn ready_check() -> (
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(HttpResult {
+                operation_id: None,
                 code: "SERVICE_NOT_READY".to_string(),
                 message: "Service is starting, gRPC not ready".to_string(),
                 data: Some(health_response),
@@ -161,6 +162,7 @@ pub fn build_health_response(
         HttpResult::success(health_response)
     } else {
         HttpResult {
+            operation_id: None,
             code: "SERVICE_NOT_READY".to_string(),
             message: "Service is starting, gRPC not ready".to_string(),
             data: Some(health_response),

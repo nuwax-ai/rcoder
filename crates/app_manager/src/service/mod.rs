@@ -1,9 +1,7 @@
-//! 应用管理服务层（统一 Docker / K8s 后端，无状态）
-//!
-//! rcoder 是无状态的应用 pod 引擎：
-//! - 写操作（create/start/stop/restart/delete）转调 [`container_runtime_api::ContainerRuntime`] 的 Deployment 能力；
-//! - 读操作（get/query/list）实时查集群，返回 [`AppRuntimeInfo`]；
-//! - 业务元数据（name/image/command/app_stage 等）由调用方（Java）持久化，rcoder 不存。
+//! Application lifecycle coordinator backed by the userApp lifecycle store.
+//! SQLite (single-instance Docker) and PostgreSQL (Kubernetes) share admission,
+//! ownership, generation and operation contracts. Runtime state remains the
+//! authority for physical resources; short SQL transactions precede mutations.
 //!
 //! K8s 模式 `create_deployment` 创建 ConfigMap/Secret/ClusterIP Service/Deployment；
 //! HTTP 入口按 `http_expose`：Pingora（默认，两后端统一，本服务注册 Pingora backend
@@ -11,7 +9,9 @@
 //! （可选，K8s 建 HTTPRoute `/apps/{id}`）。TCP 初期不对外。Docker 模式建容器入主网络。
 
 use std::sync::Arc;
+mod control;
 mod operation_lock;
+pub(crate) use control::OwnedOperation;
 pub(crate) use operation_lock::AppOperationGuard;
 
 use dashmap::DashMap;
@@ -46,14 +46,16 @@ pub struct AppService {
     /// 同一 rcoder 进程内按 app 串行化 release 操作。PVC 文件锁继续负责跨进程互斥；
     /// 先等异步锁可避免同 app 的并发请求长期占用 Tokio blocking 线程等待 flock。
     pub(crate) release_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
-    /// 应用业务元数据（name/租户/业务创建时间;集群不持有）。PG 模式 query 的
-    /// name/created_at 过滤数据源；纯内存模式恒空（过滤忽略+warn）。
+    /// Persistent application identity, lifecycle and metadata; never an
+    /// in-memory authority or a best-effort fallback after a storage failure.
     pub(crate) metadata: AppMetadataStore,
     /// Userapp 开发资源回收回调（宿主注入；purge 时回收 UserappBuilder 开发容器
     /// 与 per-app PVC——app_manager 的 runtime 视图无 agent 能力，经契约委托宿主）。
     pub(crate) dev_cleanup: std::sync::RwLock<Option<Arc<dyn shared_types::UserappDevCleanup>>>,
     /// Userapp 开发容器定位回调（宿主注入；文件/存储接口 `app_stage=dev` 分支经此
     /// ensure/定位 UserappBuilder 的 file-server——同 dev_cleanup 的委托根因）。
+    pub(crate) builder_recovery:
+        std::sync::RwLock<Option<Arc<dyn shared_types::UserAppBuilderRecovery>>>,
     pub(crate) dev_locator: std::sync::RwLock<Option<Arc<dyn shared_types::UserappDevLocator>>>,
     /// Deployment 列表查询缓存（TTL + 写路径失效 + single-flight）。防查询面
     /// 轮询频繁穿透到 Docker daemon/K8s apiserver——Docker daemon 高负载下
@@ -70,12 +72,18 @@ pub(crate) struct DeployListCacheEntry {
 }
 
 impl AppService {
+    /// Attach after constructing the owning Arc; the registry must not own us.
+    pub fn attach_activity_coordinator(self: &Arc<Self>) -> AppResult<()> {
+        self.activity.set_coordinator(Arc::downgrade(self))
+    }
+
     /// 创建新的应用管理服务
     pub async fn new(
         config: AppManagerConfig,
         runtime: Arc<dyn UserAppRuntime>,
         activity: Arc<AppActivityRegistry>,
         pingora: Option<Arc<PingoraProxyService>>,
+        store: Arc<dyn shared_types::UserAppLifecycleStore>,
     ) -> AppResult<Self> {
         if config.access_mode == AppAccessMode::Docker
             && config.operation_lock_root != shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT
@@ -113,9 +121,10 @@ impl AppService {
             pingora_ports: DashMap::new(),
             deploy_list_cache: tokio::sync::Mutex::new(None),
             release_locks: DashMap::new(),
-            metadata: AppMetadataStore::default(),
+            metadata: AppMetadataStore::new(store),
             dev_cleanup: std::sync::RwLock::new(None),
             dev_locator: std::sync::RwLock::new(None),
+            builder_recovery: std::sync::RwLock::new(None),
         };
         // K8s Pingora 模式：启动时从集群重建 Pingora backends——修复 pingora_ports 内存态
         // 丢失导致的重启 silent 404（list_deployments 的 expose_type 已由 Deployment annotation
@@ -181,22 +190,57 @@ impl AppService {
 // list/query/get/update/delete 编排实现拆至 lifecycle/{query,update}.rs（extension-impl）。
 #[async_trait::async_trait]
 impl super::AppServiceTrait for AppService {
+    async fn retry_control_operation(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+        request: shared_types::UserAppRetryRequest,
+    ) -> AppResult<shared_types::UserAppOperationView> {
+        self.retry_control_operation(app_id, operation_id, request)
+            .await
+    }
+    async fn resume_pending_control(
+        &self,
+        operation: &shared_types::UserAppOperationRecord,
+    ) -> AppResult<bool> {
+        self.resume_pending_control(operation).await
+    }
+
+    async fn get_lifecycle(
+        &self,
+        app_id: &str,
+        user_id: &str,
+    ) -> AppResult<shared_types::UserAppLifecycleRecord> {
+        self.get_lifecycle(app_id, user_id).await
+    }
+    async fn get_control_operation(
+        &self,
+        app_id: &str,
+        user_id: &str,
+        operation_id: Option<&str>,
+    ) -> AppResult<Option<shared_types::UserAppOperationView>> {
+        self.get_control_operation(app_id, user_id, operation_id)
+            .await
+    }
+    async fn get_control_operation_by_request(
+        &self,
+        app_id: &str,
+        user_id: &str,
+        request_id: &str,
+    ) -> AppResult<Option<shared_types::UserAppOperationView>> {
+        self.get_control_operation_by_request(app_id, user_id, request_id)
+            .await
+    }
+    async fn recreate_identity(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppRecreateRequest,
+    ) -> AppResult<shared_types::UserAppLifecycleRecord> {
+        self.recreate_identity(app_id, request).await
+    }
+
     async fn record_dev_registration(&self, app_id: &str, user_id: &str) -> AppResult<()> {
-        // 开发注册：owner user_id 权威覆盖；已部署 app 的业务字段（name/tenant/space
-        // 由 create_app 落库）合并保留——record 是整行 upsert，全传 None 会把
-        // 已部署应用的 name/租户列 NULL 掉（query-by-name 过滤随之失效）
-        let existing = self.metadata.lookup(app_id);
-        let (name, tenant, space) = match &existing {
-            Some(row) => (
-                row.name.clone(),
-                row.tenant_id.clone(),
-                row.space_id.clone(),
-            ),
-            None => (None, None, None),
-        };
-        self.metadata
-            .record(app_id, name, Some(user_id.to_string()), tenant, space)
-            .await;
+        self.metadata.store.ensure_identity(app_id, user_id).await?;
         Ok(())
     }
 
@@ -241,8 +285,24 @@ impl super::AppServiceTrait for AppService {
             .await
     }
 
+    async fn delete_app_controlled(
+        &self,
+        app_id: &str,
+        request: DeleteAppRequest,
+    ) -> AppResult<()> {
+        self.delete_app_controlled(app_id, request).await
+    }
+
     async fn purge_app(&self, app_id: &str) -> AppResult<()> {
         self.purge_app(app_id).await
+    }
+
+    async fn purge_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<()> {
+        self.purge_app_controlled(app_id, request).await
     }
 
     async fn get_app_storage(
@@ -253,6 +313,15 @@ impl super::AppServiceTrait for AppService {
         self.get_app_storage(app_stage, app_id).await
     }
 
+    async fn clear_app_storage_controlled(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+        request: ClearStorageRequest,
+    ) -> AppResult<String> {
+        self.clear_app_storage_controlled(app_stage, app_id, request)
+            .await
+    }
     async fn clear_app_storage(
         &self,
         app_stage: shared_types::UserappStage,
@@ -262,6 +331,15 @@ impl super::AppServiceTrait for AppService {
         self.clear_app_storage(app_stage, app_id, user_id).await
     }
 
+    async fn destroy_app_storage_controlled(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+        request: DestroyStorageRequest,
+    ) -> AppResult<String> {
+        self.destroy_app_storage_controlled(app_stage, app_id, request)
+            .await
+    }
     async fn destroy_app_storage(
         &self,
         app_stage: shared_types::UserappStage,
@@ -285,8 +363,8 @@ impl super::AppServiceTrait for AppService {
         self.execute_database_sql(app_id).await
     }
 
-    async fn get_app_owner(&self, app_id: &str) -> Option<String> {
-        self.metadata.lookup(app_id).and_then(|r| r.user_id)
+    async fn get_app_owner(&self, app_id: &str) -> AppResult<Option<String>> {
+        Ok(self.metadata.lookup(app_id).await?.and_then(|r| r.user_id))
     }
 
     async fn query_storage(
@@ -317,12 +395,35 @@ impl super::AppServiceTrait for AppService {
         self.start_app(app_id).await
     }
 
+    async fn start_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<AppRuntimeInfo> {
+        self.start_app_controlled(app_id, request).await
+    }
+
     async fn stop_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         self.stop_app(app_id).await
+    }
+    async fn stop_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<AppRuntimeInfo> {
+        self.stop_app_controlled(app_id, request).await
     }
 
     async fn recycle_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         self.recycle_app(app_id).await
+    }
+
+    async fn restart_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<AppRuntimeInfo> {
+        self.restart_app_controlled(app_id, request).await
     }
 
     async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {

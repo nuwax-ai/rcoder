@@ -3,7 +3,7 @@ use super::{k8s_pvc::K8sPvcOps, kubernetes_runtime::KubernetesRuntime};
 use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResult as Result};
 use kube::{
     Api,
-    api::{DeleteParams, ListParams, Patch, PatchParams, Preconditions},
+    api::{DeleteParams, ListParams, Patch, PatchParams, Preconditions, PropagationPolicy},
     core::{ApiResource, DynamicObject, GroupVersionKind},
 };
 use shared_types::{
@@ -127,6 +127,7 @@ impl KubernetesRuntime {
             }
             let api = self.deletion_api(resource.kind)?;
             let params = DeleteParams {
+                propagation_policy: Some(PropagationPolicy::Foreground),
                 preconditions: Some(Preconditions {
                     uid: Some(resource.uid.clone()),
                     resource_version: Some(version),
@@ -138,28 +139,31 @@ impl KubernetesRuntime {
                 Err(kube::Error::Api(error)) if error.code == 404 => {}
                 Err(error) => return Err(map_error("delete captured application resource", error)),
             }
-            if storage {
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            // DELETE acknowledgement is not disappearance. Confirm every
+            // captured kind before permitting the next destructive boundary.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            tokio::time::timeout_at(deadline, async {
                 loop {
                     match api.get(&resource.name).await {
-                        Err(kube::Error::Api(error)) if error.code == 404 => break,
+                        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(()),
                         Ok(current) if current.metadata.uid.as_deref() != Some(&resource.uid) => {
                             return Err(Error::Conflict(
-                                "storage was replaced while deletion completed".into(),
+                                "application resource was replaced while deletion completed".into(),
                             ));
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            return Err(map_error("observe captured storage deletion", error));
+                            return Err(map_error("observe captured resource deletion", error));
                         }
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(Error::Timeout(
-                            "captured storage is still terminating".into(),
-                        ));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
+            })
+            .await
+            .map_err(|_| {
+                Error::Timeout("captured application resource is still terminating".into())
+            })??;
+            if storage {
                 self.subvolume_path_cache
                     .write()
                     .await
@@ -171,6 +175,17 @@ impl KubernetesRuntime {
 
     /// Every writer that reuses storage advances its CAS version before starting a pod.
     pub(super) async fn claim_app_storage(&self, app_id: &str) -> Result<()> {
+        self.claim_app_storage_with_context(app_id, None).await
+    }
+
+    pub(super) async fn claim_app_storage_with_context(
+        &self,
+        app_id: &str,
+        context: Option<&shared_types::UserAppExecutionContext>,
+    ) -> Result<()> {
+        let operation_id = context
+            .map(|context| context.operation_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         for (index, name) in [
             self.workspace_pvc_name(app_id, &ServiceType::Userapp)?,
             self.app_data_pvc_name(app_id)?,
@@ -185,6 +200,20 @@ impl KubernetesRuntime {
                 Err(error) => return Err(map_error("read app storage claim", error)),
             };
             ensure_userapp_pvc(&pvc)?;
+            if let Some(context) = context {
+                context
+                    .validate_identity(app_id, Some(&context.user_id))
+                    .map_err(Error::ConfigurationError)?;
+                let annotations = pvc.metadata.annotations.as_ref().ok_or_else(|| {
+                    Error::Conflict(
+                        "Application storage requires explicit lifecycle adoption".into(),
+                    )
+                })?;
+                context
+                    .validate_application_metadata(annotations)
+                    .map_err(Error::Conflict)?;
+            }
+
             if pvc.metadata.deletion_timestamp.is_some() {
                 return Err(Error::Conflict("app storage is terminating".into()));
             }
@@ -195,7 +224,7 @@ impl KubernetesRuntime {
             let version = pvc.metadata.resource_version.ok_or_else(|| {
                 Error::ConfigurationError("app storage has no resourceVersion".into())
             })?;
-            let patch = serde_json::json!({"metadata":{"uid":uid,"resourceVersion":version,"annotations":{"rcoder.io/storage-use-operation":uuid::Uuid::new_v4().to_string()}}});
+            let patch = serde_json::json!({"metadata":{"uid":uid,"resourceVersion":version,"annotations":{"rcoder.io/storage-use-operation":operation_id}}});
             api.patch(&name, &PatchParams::default(), &Patch::Merge(patch))
                 .await
                 .map_err(|error| map_error("claim app storage", error))?;

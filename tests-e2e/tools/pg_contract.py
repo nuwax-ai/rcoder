@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import signal
 import uuid
+from storage_contract_cases import PG_USERAPP_CASE, passed_exactly_one
 from cleanup import cleanup_pg_project
 
 REPO = Path(__file__).resolve().parents[2]
@@ -17,7 +18,7 @@ CASES = (
     'container_delete_preserves_changed_association',
     'legacy_schema_backfill_is_stable',
     'flush_failure_shared_between_concurrent_callers',
-        'cancelled_durable_write_is_queued_and_shutdown_waits',
+    'cancelled_durable_write_is_queued_and_shutdown_waits',
 )
 
 def main():
@@ -33,7 +34,7 @@ def main():
     config.write_text(json.dumps({'services': {'postgres': {'image': 'postgres:17',
         'environment': {'POSTGRES_USER': 'contract', 'POSTGRES_PASSWORD': '${PG_CONTRACT_PASSWORD}', 'POSTGRES_DB': 'contract'},
         'ports': ['127.0.0.1::5432'], 'volumes': ['data:/var/lib/postgresql/data'], 'labels': {'rcoder.e2e.run': run_id},
-        'healthcheck': {'test': ['CMD-SHELL', 'pg_isready -U contract -d contract'], 'interval': '1s', 'timeout': '3s', 'retries': 60}}}, 'volumes': {'data': {}}}))
+        'healthcheck': {'test': ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U contract -d contract'], 'interval': '1s', 'timeout': '3s', 'retries': 60}}}, 'volumes': {'data': {}}}))
     receipt_path = directory / 'ownership.json'
     receipt = {'run_id': run_id, 'case_id': os.environ['E2E_CASE_ID'], 'project': project,
                'compose_file': str(config), 'creation_state': 'not_started'}
@@ -53,7 +54,7 @@ def main():
             (directory / 'command-failure.log').write_text(detail.replace(password, '[REDACTED]'))
             raise
     try:
-        build = command(['cargo', 'test', '-p', 'rcoder-storage', '--locked', '--features', 'pg', '--lib', '--no-run', '--message-format=json'], capture_output=True, text=True)
+        build = command(['cargo', 'test', '-p', 'rcoder-storage', '--locked', '--features', 'pg,sqlite', '--lib', '--no-run', '--message-format=json'], capture_output=True, text=True)
         artifacts = [json.loads(line) for line in build.stdout.splitlines()]
         binary = next(row['executable'] for row in artifacts if row.get('reason') == 'compiler-artifact' and row.get('executable'))
         frozen = directory / 'pg-tests'
@@ -63,7 +64,7 @@ def main():
         listing = command([str(frozen), '--list', '--format=terse'], capture_output=True, text=True).stdout
         names = {line.removesuffix(': test') for line in listing.splitlines() if line.endswith(': test')}
         expected = ['pg::project_store::lifecycle_tests::lifecycle_contract_' + case for case in CASES]
-        if not set(expected) <= names:
+        if not set(expected + [PG_USERAPP_CASE]) <= names:
             raise RuntimeError('required PG lifecycle test missing from executable')
         receipt['creation_state'] = 'pending'
         receipt_path.write_text(json.dumps(receipt))
@@ -80,13 +81,17 @@ def main():
         receipt_path.write_text(json.dumps(receipt))
         (directory / 'identity.txt').write_text(identity)
         address = command(compose + ['port', 'postgres', '5432'], capture_output=True, text=True).stdout.strip()
-        env.update(RCODER_PG_TEST_DSN=f'postgres://contract:{password}@{address}/contract', RCODER_PG_TEST_STRICT='1')
+        env.update(RCODER_PG_TEST_DSN=f'postgres://contract:{password}@{address}/contract', RCODER_PG_TEST_STRICT='1', RCODER_USERAPP_PG_TEST_DSN=f'postgres://contract:{password}@{address}/contract')
         record('PG17 isolated environment ready', True, identity)
         for name, case in zip(expected, CASES):
             result = subprocess.run([str(frozen), name, '--exact', '--nocapture'], cwd=REPO, env=env, capture_output=True, text=True, timeout=120)
             log = (result.stdout + result.stderr).replace(password, '[REDACTED]')
             (directory / (case + '.log')).write_text(log)
-            record('PG ' + case, result.returncode == 0 and '1 passed; 0 failed; 0 ignored' in log)
+            record('PG ' + case, passed_exactly_one(result.returncode, log))
+        result = subprocess.run([str(frozen), PG_USERAPP_CASE, '--exact', '--include-ignored', '--nocapture'], cwd=REPO, env=env, capture_output=True, text=True, timeout=180)
+        log = (result.stdout + result.stderr).replace(password, '[REDACTED]')
+        (directory / 'userapp-transactions.log').write_text(log)
+        record('PG userApp transactions and restart', passed_exactly_one(result.returncode, log))
     except Exception as error:
         record('PG contract execution', False, str(error).replace(password, '[REDACTED]'))
     finally:

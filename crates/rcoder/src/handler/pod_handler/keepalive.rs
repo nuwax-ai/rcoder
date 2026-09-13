@@ -266,10 +266,7 @@ async fn keepalive_userapp_dev(
                 error!(
                     "[POD_KEEPALIVE] ensure userapp dev container failed: app_id={app_id}: {e:#}"
                 );
-                AppError::with_message(
-                    shared_types::error_codes::ERR_BACKEND_ERROR,
-                    format!("ensure userapp dev container failed: {e:#}"),
-                )
+                crate::userapp_builder::control_error(&e)
             })?;
     let current = state
         .update_activity(&app_id)

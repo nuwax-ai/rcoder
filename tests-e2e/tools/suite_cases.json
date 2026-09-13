@@ -1,0 +1,102 @@
+{
+  "compose_lifecycle": [
+    "docker_deletion_identity_contract"
+  ],
+  "compose_session": [
+    "absolute_agent_work_dir_anthropic",
+    "absolute_agent_work_dir_openai",
+    "concurrent_subscribers_anthropic",
+    "concurrent_subscribers_openai",
+    "cross_turn_reconnect_anthropic",
+    "cross_turn_reconnect_openai",
+    "model_switch_multi_anthropic",
+    "model_switch_multi_openai",
+    "no_session_reuse_anthropic",
+    "no_session_reuse_openai",
+    "reconnect_no_cursor_anthropic",
+    "reconnect_no_cursor_openai",
+    "reconnect_with_cursor_anthropic",
+    "reconnect_with_cursor_openai"
+  ],
+  "compose_sse": [
+    "after_terminal_anthropic",
+    "after_terminal_openai",
+    "full_turn_anthropic",
+    "full_turn_openai",
+    "model_switch_anthropic",
+    "model_switch_openai",
+    "two_turn_isolation_anthropic",
+    "two_turn_isolation_openai"
+  ],
+  "compose_userapp": [
+    "userapp_compose_regression"
+  ],
+  "compose_userapp_build_rules": [
+    "userapp_devbuild_skip_and_fallback_source_mode",
+    "userapp_static_proxy_aligned_build_passes",
+    "userapp_static_proxy_escape_build_fails"
+  ],
+  "compose_userapp_deploy": [
+    "userapp_deploy_full_chain"
+  ],
+  "compose_userapp_dev": [
+    "userapp_agent_dispatch_anthropic",
+    "userapp_agent_dispatch_openai",
+    "userapp_dev_app_proxy_lazy_start",
+    "userapp_dev_archive_downloads",
+    "userapp_dev_chat_full_turn_anthropic",
+    "userapp_dev_chat_full_turn_openai",
+    "userapp_dev_chat_workdir_agent_work_dir_anthropic",
+    "userapp_dev_chat_workdir_agent_work_dir_openai",
+    "userapp_dev_dbx_proxy",
+    "userapp_dev_files_two_entry_points",
+    "userapp_dev_git_service_context",
+    "userapp_dev_new_endpoint_body_query_locate",
+    "userapp_dev_owner_header_lazy_ensure",
+    "userapp_dev_pg_reset_password",
+    "userapp_dev_pod_identity_list_and_status",
+    "userapp_dev_poll_storm_keeps_container",
+    "userapp_dev_precheck_rejects_empty_and_no_services",
+    "userapp_dev_registry_self_heal_after_restart",
+    "userapp_dev_server_lifecycle",
+    "userapp_dev_skills_push",
+    "userapp_dev_task_sse_cursor_past_terminal",
+    "userapp_dev_template_zip_and_projects",
+    "userapp_dev_terminal_cwd_via_ttyd_ws",
+    "userapp_dev_two_turn_isolation_anthropic",
+    "userapp_dev_two_turn_isolation_openai"
+  ],
+  "compose_userapp_faults": [
+    "userapp_hot_deployment_builtin_contract",
+    "userapp_hot_deployment_supervisord_contract"
+  ],
+  "compose_webchat": [
+    "webchat_full_turn_anthropic",
+    "webchat_full_turn_openai",
+    "webchat_project_reuse",
+    "webchat_two_turn_seq"
+  ],
+  "docker_lifecycle_crash": [
+    "docker_runtime_crash_recovery_contract"
+  ],
+  "k8s_lb": [
+    "lb_cross_entry_cursor_reconnect",
+    "lb_entry_rotation",
+    "lb_new_session_cross_entry"
+  ],
+  "native_lifecycle_crash": [
+    "native_terminal_release_crash_contract"
+  ],
+  "pg_storage_faults": [
+    "pg_storage_lifecycle_contract"
+  ],
+  "sqlite_compose_runtime": [
+    "sqlite_compose_recreation_contract"
+  ],
+  "sqlite_storage_contract": [
+    "sqlite_storage_lifecycle_contract"
+  ],
+  "userapp_concurrency_contract": [
+    "userapp_concurrency_component_contract"
+  ]
+}

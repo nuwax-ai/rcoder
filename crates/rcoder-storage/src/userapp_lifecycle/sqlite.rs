@@ -1,3 +1,6 @@
+mod exclusive_directory;
+mod restart;
+
 use super::{domain, sql::implement_store, storage};
 use shared_types::{UserAppLifecycleRecord, UserAppOperationRecord, UserAppStoreError as Error};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -5,8 +8,25 @@ use std::{path::Path, time::Duration};
 
 pub struct SqliteUserAppStore {
     pool: sqlx::SqlitePool,
+    /// Deployed SQLite storage belongs to exactly one rcoder process.
+    _instance_lock: Option<std::fs::File>,
 }
 impl SqliteUserAppStore {
+    pub async fn open_exclusive(path: &Path) -> Result<Self, Error> {
+        let path = path.to_owned();
+        let (path, lock) = tokio::task::spawn_blocking(move || exclusive_directory::acquire(&path))
+            .await
+            .map_err(storage)??;
+        let mut store = Self::open(&path).await?;
+        // Owning the process-exclusive directory lock proves that no previous
+        // SQLite writer remains. It does not prove that its remote write failed.
+        if let Err(error) = restart::quarantine(&store).await {
+            store.pool.close().await;
+            return Err(error);
+        }
+        store._instance_lock = Some(lock);
+        Ok(store)
+    }
     /// The caller provisions a private local directory. Never creates an in-memory
     /// fallback or changes permissions on existing application data.
     pub async fn open(path: &Path) -> Result<Self, Error> {
@@ -49,7 +69,10 @@ impl SqliteUserAppStore {
                 "SQLite durability configuration was not applied".into(),
             ));
         }
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            _instance_lock: None,
+        })
     }
     pub async fn close(&self) {
         self.pool.close().await;
@@ -58,5 +81,6 @@ impl SqliteUserAppStore {
 implement_store!(
     SqliteUserAppStore,
     "BEGIN IMMEDIATE",
-    "SELECT record FROM userapp_lifecycles WHERE app_id=$1"
+    "SELECT record FROM userapp_lifecycles WHERE app_id=$1",
+    "SELECT l.record, o.record FROM userapp_lifecycles l LEFT JOIN userapp_operations o ON o.operation_id=json_extract(l.record, '$.current_operation_id') AND o.app_id=l.app_id WHERE l.app_id > $1 ORDER BY l.app_id LIMIT $2"
 );

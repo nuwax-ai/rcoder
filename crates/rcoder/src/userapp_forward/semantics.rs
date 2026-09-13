@@ -277,14 +277,6 @@ impl HttpResultError {
         }
     }
 
-    pub(super) fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            status: axum::http::StatusCode::NOT_FOUND,
-            message: message.into(),
-            retry_after_secs: None,
-        }
-    }
-
     pub(super) fn service_unavailable(message: impl Into<String>, retry_after_secs: u32) -> Self {
         Self {
             status: axum::http::StatusCode::SERVICE_UNAVAILABLE,

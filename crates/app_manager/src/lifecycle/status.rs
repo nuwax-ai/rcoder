@@ -13,6 +13,54 @@ use crate::service::AppService;
 use crate::utils::*;
 
 impl AppService {
+    pub(crate) async fn overlay_stored_runtime_policy(
+        &self,
+        status: &mut DeploymentStatus,
+    ) -> AppResult<()> {
+        if self.config.access_mode == AppAccessMode::Docker
+            && let Some(identity) = self.metadata.store.get_application(&status.app_id).await?
+            && identity.state == shared_types::UserAppLifecycleState::Active
+        {
+            apply_runtime_policy(status, &identity.runtime_policy);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn overlay_stored_runtime_policies(
+        &self,
+        statuses: &mut [DeploymentStatus],
+    ) -> AppResult<()> {
+        if self.config.access_mode != AppAccessMode::Docker || statuses.is_empty() {
+            return Ok(());
+        }
+        let mut policies = std::collections::HashMap::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .metadata
+                .store
+                .list_applications(cursor.as_deref(), 128)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|identity| identity.app_id.clone());
+            for identity in page {
+                if identity.state == shared_types::UserAppLifecycleState::Active {
+                    policies.insert(identity.app_id, identity.runtime_policy);
+                }
+            }
+        }
+        // Mutate the snapshot only after every page succeeds. A failed storage
+        // read must not return a partially overlaid policy list.
+        for status in statuses {
+            if let Some(policy) = policies.get(&status.app_id) {
+                apply_runtime_policy(status, policy);
+            }
+        }
+        Ok(())
+    }
+
     /// 实时查询单个应用运行时状态（None 表示不存在）
     pub(crate) async fn fetch_runtime_status(&self, app_id: &str) -> Option<DeploymentStatus> {
         match self.runtime.get_deployment_status(app_id).await {
@@ -35,7 +83,10 @@ impl AppService {
         app_id: &str,
     ) -> AppResult<DeploymentStatus> {
         match self.runtime.get_deployment_status(app_id).await {
-            Ok(Some(s)) => Ok(s),
+            Ok(Some(mut s)) => {
+                self.overlay_stored_runtime_policy(&mut s).await?;
+                Ok(s)
+            }
             Ok(None) => Err(AppOperationError::NotFound(format!(
                 "app does not exist: {app_id}"
             ))),
@@ -56,7 +107,11 @@ impl AppService {
     }
 
     /// DeploymentStatus → AppRuntimeInfo（含访问地址构建 + conditions 派生）
-    pub(crate) fn build_runtime_info(&self, status: DeploymentStatus) -> AppRuntimeInfo {
+    pub(crate) fn build_runtime_info(
+        &self,
+        status: DeploymentStatus,
+        owner: Option<&str>,
+    ) -> AppRuntimeInfo {
         let conditions = derive_conditions(&status);
         let health = health_from_status(&status);
 
@@ -89,7 +144,7 @@ impl AppService {
             status.ports
         };
 
-        let access = self.build_access_info(&status.app_id, &ports);
+        let access = self.build_access_info(&status.app_id, &ports, owner);
         AppRuntimeInfo {
             status: phase_to_status(&status.phase),
             access,
@@ -113,16 +168,62 @@ impl AppService {
         }
     }
 
+    /// Recover deletion fences from authoritative lifecycle state, including
+    /// applications whose compute container has already disappeared.
+    async fn pending_deletion_fences(&self) -> AppResult<std::collections::HashSet<String>> {
+        use shared_types::{UserAppLifecycleState, UserAppOperationKind};
+        let mut blocked = std::collections::HashSet::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .metadata
+                .store
+                .list_control_snapshots(cursor.as_deref(), 128)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page
+                .last()
+                .map(|snapshot| snapshot.application.app_id.clone());
+            for snapshot in page {
+                let identity = snapshot.application;
+                if identity.state != UserAppLifecycleState::Active
+                    || snapshot.operation.is_some_and(|operation| {
+                        matches!(
+                            operation.kind,
+                            UserAppOperationKind::DeleteCompute
+                                | UserAppOperationKind::PurgeResources
+                                | UserAppOperationKind::DeleteApplication
+                        )
+                    })
+                {
+                    blocked.insert(identity.app_id);
+                }
+            }
+        }
+        Ok(blocked)
+    }
+
     /// 重建活动状态内存态(rcoder 重启后调用):`list_deployments` →
     /// replicas==0 的 `mark_stopped`(支持流量唤醒识别 stopped app);replicas>0 的 `seed_accessed`(种
     /// last_accessed=now,给 Running app 完整 grace 周期,避免重启后立刻被回收)。失败向上传播。
     pub(crate) async fn rebuild_stopped_apps(&self) -> AppResult<()> {
-        let deploys = self.runtime.list_deployments().await.map_err(|e| {
+        let mut deploys = self.runtime.list_deployments().await.map_err(|e| {
             map_runtime_error("[APP] list_deployments failed (rebuild_stopped_apps)", e)
         })?;
+        self.overlay_stored_runtime_policies(&mut deploys).await?;
+        let deletion_fences = self.pending_deletion_fences().await?;
+        // All reads must succeed before publishing a partially restored state.
+        for app_id in &deletion_fences {
+            self.activity.mark_wake_blocked(app_id);
+        }
         let mut stopped = 0u32;
         let mut running = 0u32;
         for s in deploys {
+            if deletion_fences.contains(&s.app_id) {
+                continue;
+            }
             if s.replicas == 0 {
                 if s.wake_on_traffic == Some(false) {
                     self.activity.mark_wake_blocked(&s.app_id);
@@ -147,15 +248,13 @@ impl AppService {
         Ok(())
     }
 
-    /// app 归属用户（userapp_metadata.user_id；缓存查不到返回 None）。
-    fn owner_user_id(&self, app_id: &str) -> Option<String> {
-        self.metadata
-            .lookup(app_id)
-            .and_then(|m| m.user_id.filter(|u| !u.trim().is_empty()))
-    }
-
     /// 构建访问信息（按 `http_expose` 决定 HTTP path；一律只返 path，host 由 Java 拼）
-    pub(super) fn build_access_info(&self, app_id: &str, ports: &[AppPortStatus]) -> AccessInfo {
+    pub(super) fn build_access_info(
+        &self,
+        app_id: &str,
+        ports: &[AppPortStatus],
+        owner: Option<&str>,
+    ) -> AccessInfo {
         let http_port = ports.iter().find(|p| p.expose_type == RtExposeType::Http);
 
         // 一律只返 path，host 由 Java 拼（Java 必然已知 RCoder / gateway 入口，否则访问不了）：
@@ -171,7 +270,7 @@ impl AppService {
                 if http_port.is_none() {
                     None
                 } else {
-                    match self.owner_user_id(app_id) {
+                    match owner {
                         Some(user_id) => {
                             Some(format!("/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}"))
                         }
@@ -230,4 +329,13 @@ impl AppService {
             },
         }
     }
+}
+
+fn apply_runtime_policy(
+    status: &mut DeploymentStatus,
+    policy: &shared_types::UserAppRuntimePolicy,
+) {
+    status.recycle_enabled = policy.recycle_enabled.or(status.recycle_enabled);
+    status.idle_timeout_seconds = policy.idle_timeout_seconds.or(status.idle_timeout_seconds);
+    status.wake_on_traffic = policy.wake_on_traffic.or(status.wake_on_traffic);
 }

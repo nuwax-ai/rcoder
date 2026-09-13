@@ -12,6 +12,8 @@
 //! rcoder 转发层的 `/api/v1/userapp/db/{app_stage}/*`（app_stage 双环境 + username upsert
 //! + dbx 同步的超集实现，见 rcoder userapp_forward::db）。
 
+pub mod control;
+pub use control::*;
 pub mod files;
 pub mod lifecycle;
 pub mod logs;

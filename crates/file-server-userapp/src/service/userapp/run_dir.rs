@@ -12,7 +12,31 @@ pub const STAGING_DIR: &str = ".staging";
 
 /// Shared with hygiene: a live worker keeps this lease even if its async caller
 /// is cancelled. Never unlink the lock file (that would split the lock domain).
-pub(super) fn staging_lease(ws: &Path) -> AppResult<std::fs::File> {
+#[derive(Debug)]
+pub(super) struct StagingLease {
+    file: std::fs::File,
+    released: bool,
+}
+
+impl StagingLease {
+    fn release(&mut self) -> std::io::Result<()> {
+        if !self.released {
+            self.file.unlock()?;
+            self.released = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagingLease {
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            tracing::error!(%error, "Release dev preparation lease failed");
+        }
+    }
+}
+
+pub(super) fn staging_lease(ws: &Path) -> AppResult<StagingLease> {
     let lease = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -22,21 +46,24 @@ pub(super) fn staging_lease(ws: &Path) -> AppResult<std::fs::File> {
     lease
         .try_lock()
         .map_err(|e| AppError::business(format!("dev preparation is busy: {e}")))?;
-    Ok(lease)
+    Ok(StagingLease {
+        file: lease,
+        released: false,
+    })
 }
 
 #[derive(Debug)]
 pub struct PreparedRun {
     // Field order releases the directory before the lease.
     staging: tempfile::TempDir,
-    _lease: std::fs::File,
+    _lease: StagingLease,
     workspace: PathBuf,
 }
 
 impl PreparedRun {
     /// Must run inside the generation commit guard. No suspension between the
     /// two renames: cancellation cannot leave a half-promoted directory.
-    pub fn activate(self) -> AppResult<PathBuf> {
+    pub fn activate(mut self) -> AppResult<PathBuf> {
         let run = self.workspace.join(RUN_DIR);
         let previous = self.workspace.join(PREVIOUS_DIR);
         let had_run = run.try_exists()?;
@@ -56,6 +83,9 @@ impl PreparedRun {
                 "activate dev directory: {error}; previous directory preserved"
             )));
         }
+        // Closing alone can leave flock held by a transient fork/dup. The
+        // staging path has been promoted, so cleanup no longer needs the lease.
+        self._lease.release()?;
         Ok(run)
     }
 }
@@ -163,6 +193,26 @@ mod tests {
         assert!(run.join("start.sh").is_file());
         // staging 已被 promote 走（不存在）
         assert!(!ws.path().join(STAGING_DIR).join("rel-1").exists());
+    }
+
+    #[tokio::test]
+    async fn activation_releases_lease_with_a_duplicated_file_description() {
+        let ws = tempfile::tempdir().expect("workspace");
+        make_package(ws.path(), "one");
+        make_package(ws.path(), "two");
+        let prepared = prepare_run_dir(ws.path(), "one").await.expect("prepare");
+        // Model a transient fork/dup retaining the open file description.
+        let inherited = prepared
+            ._lease
+            .file
+            .try_clone()
+            .expect("duplicate description");
+        prepared.activate().expect("activate first");
+        let second = prepare_run_dir(ws.path(), "two")
+            .await
+            .expect("completed worker must release lease explicitly");
+        second.activate().expect("activate second");
+        drop(inherited);
     }
 
     #[tokio::test]

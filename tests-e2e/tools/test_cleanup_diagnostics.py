@@ -40,6 +40,13 @@ class CleanupDiagnostics(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             container = {'Id': 'owned', 'Name': '/rcoder-app-builder-case123456-owned', 'Image': 'image', 'State': {}, 'Config': {'Labels': {'rcoder.e2e.run': 'run'}, 'Env': ['DEPLOY_TOKEN=private-key']}}
+            container['Config']['Labels'].update({'service-type':'user-app-builder',
+                'rcoder.io/application-id':'case123456-owned', 'rcoder.io/owner-id':'owner',
+                'rcoder.io/lifecycle-id':'life'})
+            (root / 'resources').mkdir()
+            (root / 'resources/rcoder-app-builder-case123456-owned-ownership.json').write_text(json.dumps({
+                'id':'owned', 'name':'rcoder-app-builder-case123456-owned', 'case_id':'case123456-rest',
+                'app_id':'case123456-owned', 'user_id':'owner', 'lifecycle_id':'life'}))
             with patch('cleanup.command', side_effect=['owned', json.dumps([container]), subprocess.CalledProcessError(1, ['docker', 'logs'], output='failed private-key')]), patch('cleanup.urllib.request.urlopen', side_effect=TimeoutError('timeout private-key')):
                 errors = cleanup_case('case123456-rest', 'run', root)
             data = json.loads((root / 'resources/rcoder-app-builder-case123456-owned-fallback-cleanup.json').read_text())

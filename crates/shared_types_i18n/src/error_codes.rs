@@ -181,6 +181,8 @@ pub const ERR_NOT_FOUND: &str = "ERR_NOT_FOUND";
 
 /// 资源冲突（已存在）
 pub const ERR_CONFLICT: &str = "ERR_CONFLICT";
+/// Waiting expired; the accepted operation may still be running.
+pub const ERR_USERAPP_WAIT_TIMEOUT: &str = "ERR_USERAPP_WAIT_TIMEOUT";
 
 // ========== 应用管理服务（app_manager v2）错误码 ==========
 //
@@ -299,6 +301,7 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_MODEL_UNAVAILABLE => "error.model_unavailable",
         ERR_NOT_FOUND => "error.not_found",
         ERR_CONFLICT => "error.conflict",
+        ERR_USERAPP_WAIT_TIMEOUT => "error.userapp_wait_timeout",
         ERR_APP_NOT_FOUND => "error.app_not_found",
         ERR_APP_ALREADY_EXISTS => "error.app_already_exists",
         ERR_INVALID_STATE => "error.invalid_state",
@@ -412,6 +415,9 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_OPERATION_NOT_SUPPORTED => "Operation not supported",
         ERR_FILE_NOT_FOUND => "File not found",
         ERR_BACKEND_ERROR => "Backend API call failed",
+        ERR_USERAPP_WAIT_TIMEOUT => {
+            "Builder ensure deadline exceeded; the accepted operation may still be running"
+        }
         ERR_IMAGE_PULL_FAILED => "Image pull failed",
         ERR_RESOURCE_EXHAUSTED => "Cluster resources exhausted",
         ERR_WORKSPACE_EMPTY => "UserApp workspace is empty (no project created or imported yet)",

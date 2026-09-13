@@ -43,6 +43,12 @@ pub(crate) async fn ensure_workspace(
 ) -> UserAppReply<UserappEnsureWorkspaceData> {
     let result = async {
         body.validate().map_err(file_server::error::from_garde)?;
+        let _workspace_activity = state
+            .build_tasks
+            .workspace_activity(&body.app_id)
+            .await
+            .read_owned()
+            .await;
         let ws = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
         tokio::fs::create_dir_all(&ws)
             .await
@@ -65,8 +71,21 @@ pub(crate) async fn execute_command(
     Json(body): Json<UserappExecCommandBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(file_server::error::from_garde)?;
+    let activity = state
+        .build_tasks
+        .workspace_activity(&body.app_id)
+        .await
+        .read_owned()
+        .await;
     let cwd = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
-    let r = execute_command_core(&state.fs, cwd, &body.command).await?;
+    let r = tokio::spawn(async move {
+        let _activity = activity;
+        execute_command_core(&state.fs, cwd, &body.command).await
+    })
+    .await
+    .map_err(|error| {
+        AppError::system(format!("Workspace command worker interrupted: {error}"))
+    })??;
     // 外层恒 success=true，命令结果由 exit_code 表达（语义同 computer 域 TS 契约）
     Ok(Json(json!({
         "success": true,
@@ -149,8 +168,23 @@ pub(crate) async fn install_project(
     Json(body): Json<UserappInstallBody>,
 ) -> Result<axum::Json<HttpResult<Value>>, crate::UserAppError> {
     tracing::debug!(app_id = %app_id, user_id = %body.user_id, "userapp install-project");
+    let activity = state
+        .build_tasks
+        .workspace_activity(&app_id)
+        .await
+        .read_owned()
+        .await;
     let ws = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
-    let r = install_project_core(&state.fs, ws, &body.programming_language).await?;
+    let r = tokio::spawn(async move {
+        let _activity = activity;
+        install_project_core(&state.fs, ws, &body.programming_language).await
+    })
+    .await
+    .map_err(|error| {
+        AppError::system(format!(
+            "Workspace installation worker interrupted: {error}"
+        ))
+    })??;
     Ok(axum::Json(HttpResult::success(json!({
         "success": true,
         "message": "Project dependencies installed successfully",
@@ -264,7 +298,22 @@ pub(crate) async fn init_project_template(
     tracing::debug!(app_id = %app_id, user_id, "userapp init-project-template");
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     let ws = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
-    let ws = init_project_template_core(&state.fs, ws, data, enable_git).await?;
+    let activity = state
+        .build_tasks
+        .workspace_activity(&app_id)
+        .await
+        .read_owned()
+        .await;
+    let ws = tokio::spawn(async move {
+        let _activity = activity;
+        init_project_template_core(&state.fs, ws, data, enable_git).await
+    })
+    .await
+    .map_err(|error| {
+        AppError::system(format!(
+            "Template initialization worker interrupted: {error}"
+        ))
+    })??;
     Ok(Json(json!({
         "success": true,
         "message": "Project template initialized successfully",
@@ -321,16 +370,28 @@ pub(crate) async fn push_skills_to_workspace(
     let user_id = require_app_field(user_id, "user_id")?;
     tracing::debug!(app_id = %app_id, user_id, "userapp push-skills");
     let ws = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
-    let r = push_skills_core(
-        &state.fs,
-        &ws,
-        &app_id,
-        zip_data.as_ref(),
-        skill_urls,
-        agent_id.as_deref(),
-        false,
-    )
-    .await?;
+    let activity = state
+        .build_tasks
+        .workspace_activity(&app_id)
+        .await
+        .read_owned()
+        .await;
+    let worker_workspace = ws.clone();
+    let r = tokio::spawn(async move {
+        let _activity = activity;
+        push_skills_core(
+            &state.fs,
+            &worker_workspace,
+            &app_id,
+            zip_data.as_ref(),
+            skill_urls,
+            agent_id.as_deref(),
+            false,
+        )
+        .await
+    })
+    .await
+    .map_err(|error| AppError::system(format!("Skill push worker interrupted: {error}")))??;
     let message = if r.updated.is_empty() {
         "No valid skill directories found in file or skillUrls".to_string()
     } else {

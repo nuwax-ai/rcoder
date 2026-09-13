@@ -14,7 +14,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 use tracing::{debug, info, warn};
 
-use container_runtime_api::ContainerRuntimeResult;
+use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
 use shared_types::ServiceType;
 
 use crate::runtime::k8s_pod::K8sPodOps;
@@ -30,6 +30,65 @@ const SERVICE_TYPE_LABEL: &str = "rcoder.io/service-type";
 pub(crate) const TEMPLATE_HASH_ANNOTATION: &str = "rcoder.io/template-hash";
 
 impl KubernetesRuntime {
+    /// Builder creation never repairs an ownership/configuration conflict by
+    /// deleting a workload. A conflicting POST re-reads and validates the winner.
+    pub(crate) async fn ensure_builder_statefulset(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        pod_spec: PodSpec,
+    ) -> ContainerRuntimeResult<()> {
+        context
+            .validate_identity(&context.app_id, Some(&context.user_id))
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let family = ServiceType::UserappBuilder;
+        let mut desired = self.build_agent_statefulset(&context.app_id, &family, pod_spec, 1)?;
+        desired
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .extend(context.resource_metadata());
+        let desired_spec = desired.spec.as_mut().ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError("Builder StatefulSet spec missing".into())
+        })?;
+        desired_spec
+            .template
+            .metadata
+            .get_or_insert_default()
+            .annotations
+            .get_or_insert_default()
+            .extend(context.resource_metadata());
+        let name = self.pod_name(&context.app_id, &family)?;
+        let api = self.statefulsets();
+        let existing = match api.get_opt(&name).await {
+            Ok(Some(existing)) => existing,
+            Ok(None) => match api.create(&PostParams::default(), &desired).await {
+                Ok(_) => return Ok(()),
+                Err(kube::Error::Api(status)) if status.code == 409 => {
+                    api.get(&name).await.map_err(|error| {
+                        super::builder_completion::k8s_error(
+                            format!("Read competing builder StatefulSet: {error}"),
+                            error,
+                        )
+                    })?
+                }
+                Err(error) => {
+                    return Err(super::builder_completion::k8s_error(
+                        format!("Create builder StatefulSet: {error}"),
+                        error,
+                    ));
+                }
+            },
+            Err(error) => {
+                return Err(super::builder_completion::k8s_error(
+                    format!("Read builder StatefulSet: {error}"),
+                    error,
+                ));
+            }
+        };
+        validate_builder_statefulset(&existing, &desired, context)?;
+        self.scale_captured_statefulset(&existing, &family, 1).await
+    }
+
     /// StatefulSet API 访问器（与 pods()/pvcs() 对齐）。
     pub(crate) fn statefulsets(&self) -> Api<StatefulSet> {
         Api::namespaced(self.client.clone(), &self.namespace)
@@ -241,7 +300,7 @@ impl KubernetesRuntime {
                         );
                     }
                     // 类型匹配：scale 到期望 replicas（幂等）
-                    self.scale_agent_statefulset(identifier, service_type, replicas)
+                    self.scale_captured_statefulset(&existing, service_type, replicas)
                         .await?;
                 }
             }
@@ -366,22 +425,26 @@ impl KubernetesRuntime {
         Ok(drifted)
     }
 
-    /// scale StatefulSet 到指定 replicas（patch spec.replicas）。
-    pub(crate) async fn scale_agent_statefulset(
+    async fn scale_captured_statefulset(
         &self,
-        identifier: &str,
+        existing: &StatefulSet,
         service_type: &ServiceType,
         replicas: i32,
     ) -> ContainerRuntimeResult<()> {
-        let sts_name = self.pod_name(identifier, service_type)?;
-        let sts_api = self.statefulsets();
-        // Merge patch 只改 replicas（不触碰其他字段, 无需 SSA）。
-        // ⚠️ 不可加 .force()：force 是 SSA(Apply) 的字段所有权语义, kube 客户端
-        // 对 force + Merge 组合直接拒绝（"force only works with Patch::Apply"）——
-        // 旧版 kube 静默忽略此组合, 依赖升级后校验生效即 latent bug 显形。
-        let patch = serde_json::json!({ "spec": { "replicas": replicas } });
-        sts_api
-            .patch(&sts_name, &PatchParams::default(), &Patch::Merge(patch))
+        let patch = conditional_scale_patch(existing, service_type, replicas)?;
+        let sts_name = existing
+            .metadata
+            .name
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError("StatefulSet name missing".into())
+            })?;
+        if existing.spec.as_ref().and_then(|spec| spec.replicas) == Some(replicas) {
+            return Ok(());
+        }
+        self.statefulsets()
+            .patch(sts_name, &PatchParams::default(), &Patch::Merge(patch))
             .await
             .map_err(|e| {
                 crate::runtime::builder_completion::k8s_error(
@@ -450,6 +513,109 @@ fn workspace_claim_name(spec: &PodSpec) -> Option<String> {
 /// SPACE_ID/ISOLATION_TYPE（请求携带时才注入）随请求抖动，混入指纹会让
 /// 同版本的 ensure 对比误报 drift（参数噪声淹没版本信号）；这些字段的
 /// 期望变更本来也不在滚动/重建语义内（ensure 恒不更新模板）。
+fn validate_builder_statefulset(
+    existing: &StatefulSet,
+    desired: &StatefulSet,
+    context: &shared_types::UserAppExecutionContext,
+) -> ContainerRuntimeResult<()> {
+    let conflict = |message: &str| ContainerRuntimeError::Conflict(message.into());
+    let annotations = existing
+        .metadata
+        .annotations
+        .as_ref()
+        .ok_or_else(|| conflict("Builder StatefulSet requires identity adoption"))?;
+    context
+        .validate_resource_metadata(annotations)
+        .map_err(ContainerRuntimeError::Conflict)?;
+    let desired_hash = desired
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|values| values.get(TEMPLATE_HASH_ANNOTATION));
+    if desired_hash.is_none() || annotations.get(TEMPLATE_HASH_ANNOTATION) != desired_hash {
+        return Err(conflict("Builder StatefulSet configuration changed"));
+    }
+    let template = existing
+        .spec
+        .as_ref()
+        .map(|spec| &spec.template)
+        .ok_or_else(|| conflict("Builder StatefulSet template missing"))?;
+    let identity = template
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.annotations.as_ref())
+        .ok_or_else(|| conflict("Builder pod template identity missing"))?;
+    context
+        .validate_resource_metadata(identity)
+        .map_err(ContainerRuntimeError::Conflict)?;
+    let existing_pod = template
+        .spec
+        .as_ref()
+        .ok_or_else(|| conflict("Builder pod spec missing"))?;
+    let desired_pod = desired
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.spec.as_ref())
+        .ok_or_else(|| conflict("Desired builder pod spec missing"))?;
+    if workspace_claim_name(existing_pod) != workspace_claim_name(desired_pod) {
+        return Err(conflict("Builder workspace claim changed"));
+    }
+    // Inspect the actual launch fields too: an external patch can leave the
+    // recorded template hash unchanged. Ignore API-defaulted probe/port fields.
+    for desired_container in &desired_pod.containers {
+        let actual = existing_pod
+            .containers
+            .iter()
+            .find(|container| container.name == desired_container.name)
+            .ok_or_else(|| conflict("Builder container missing"))?;
+        if actual.image != desired_container.image
+            || actual.command != desired_container.command
+            || actual.args != desired_container.args
+        {
+            return Err(conflict("Builder container launch configuration changed"));
+        }
+    }
+    Ok(())
+}
+
+fn conditional_scale_patch(
+    existing: &StatefulSet,
+    service_type: &ServiceType,
+    replicas: i32,
+) -> ContainerRuntimeResult<serde_json::Value> {
+    if existing.metadata.deletion_timestamp.is_some()
+        || existing
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(SERVICE_TYPE_LABEL))
+            != Some(&service_type.to_string())
+    {
+        return Err(ContainerRuntimeError::Conflict(
+            "StatefulSet ownership changed or deletion is in progress".into(),
+        ));
+    }
+    let uid = existing
+        .metadata
+        .uid
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError("StatefulSet UID missing".into())
+        })?;
+    let version = existing
+        .metadata
+        .resource_version
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError("StatefulSet resource version missing".into())
+        })?;
+    Ok(
+        serde_json::json!({"metadata": {"uid": uid, "resourceVersion": version}, "spec": {"replicas": replicas}}),
+    )
+}
+
 fn agent_template_hash(pod_spec: &PodSpec) -> String {
     let mut spec = pod_spec.clone();
     for container in &mut spec.containers {
@@ -471,6 +637,84 @@ fn agent_template_hash(pod_spec: &PodSpec) -> String {
 #[cfg(all(test, feature = "kubernetes"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builder_reuse_requires_lifecycle_configuration_and_template_identity() {
+        let context = shared_types::UserAppExecutionContext {
+            app_id: "app-one".into(),
+            user_id: "owner".into(),
+            lifecycle_id: "life-one".into(),
+            operation_id: "operation-one".into(),
+            executor_id: "executor-one".into(),
+            request_fingerprint: "ab".repeat(32),
+        };
+        let mut annotations = context.resource_metadata();
+        annotations.insert(TEMPLATE_HASH_ANNOTATION.into(), "template-one".into());
+        let desired = StatefulSet {
+            metadata: ObjectMeta {
+                annotations: Some(annotations.clone()),
+                ..Default::default()
+            },
+            spec: Some(StatefulSetSpec {
+                template: PodTemplateSpec {
+                    metadata: Some(ObjectMeta {
+                        annotations: Some(annotations),
+                        ..Default::default()
+                    }),
+                    spec: Some(sample_pod_spec("builder:one")),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_builder_statefulset(&desired, &desired, &context).is_ok());
+        let mut next_operation = context.clone();
+        next_operation.operation_id = "operation-two".into();
+        assert!(validate_builder_statefulset(&desired, &desired, &next_operation).is_ok());
+        next_operation.lifecycle_id = "life-two".into();
+        assert!(validate_builder_statefulset(&desired, &desired, &next_operation).is_err());
+        let mut foreign = desired.clone();
+        foreign.metadata.annotations = None;
+        assert!(validate_builder_statefulset(&foreign, &desired, &context).is_err());
+        foreign = desired.clone();
+        foreign.spec.as_mut().unwrap().template.metadata = None;
+        assert!(validate_builder_statefulset(&foreign, &desired, &context).is_err());
+        foreign = desired.clone();
+        foreign
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(TEMPLATE_HASH_ANNOTATION.into(), "other-template".into());
+        assert!(validate_builder_statefulset(&foreign, &desired, &context).is_err());
+    }
+
+    #[test]
+    fn scale_patch_keeps_captured_identity_and_rejects_unowned_resources() {
+        let mut existing = StatefulSet {
+            metadata: ObjectMeta {
+                name: Some("builder-one".into()),
+                uid: Some("physical-original".into()),
+                resource_version: Some("17".into()),
+                labels: Some(
+                    [(
+                        SERVICE_TYPE_LABEL.into(),
+                        ServiceType::UserappBuilder.to_string(),
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let patch = conditional_scale_patch(&existing, &ServiceType::UserappBuilder, 1).unwrap();
+        assert_eq!(patch["metadata"]["uid"], "physical-original");
+        assert_eq!(patch["metadata"]["resourceVersion"], "17");
+        assert_eq!(patch["spec"]["replicas"], 1);
+        assert!(conditional_scale_patch(&existing, &ServiceType::Userapp, 1).is_err());
+        existing.metadata.resource_version = None;
+        assert!(conditional_scale_patch(&existing, &ServiceType::UserappBuilder, 1).is_err());
+    }
 
     fn sample_pod_spec(image: &str) -> PodSpec {
         use k8s_openapi::api::core::v1::{Container, EnvVar};

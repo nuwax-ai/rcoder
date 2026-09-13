@@ -5,13 +5,19 @@ use std::sync::Arc;
 pub struct UserappDevResourcesCleanup {
     runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
     projects: Arc<crate::storage::ProjectStoreBackend>,
+    store: Arc<dyn shared_types::UserAppLifecycleStore>,
 }
 impl UserappDevResourcesCleanup {
     pub fn new(
         runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
         projects: Arc<crate::storage::ProjectStoreBackend>,
+        store: Arc<dyn shared_types::UserAppLifecycleStore>,
     ) -> Self {
-        Self { runtime, projects }
+        Self {
+            runtime,
+            projects,
+            store,
+        }
     }
 }
 struct CapturedDeletion {
@@ -24,9 +30,56 @@ struct CapturedDeletion {
 }
 // Read-only capture may be abandoned safely. Once deletion starts, an uncertain
 // Kubernetes operation retains its lease instead of admitting a competing writer.
-struct BuilderOperation {
+pub(super) struct BuilderOperation {
     lease: Option<Box<dyn AppOperationLease>>,
     mutating: bool,
+}
+impl BuilderOperation {
+    pub(super) fn receipt(&self) -> Result<shared_types::UserAppOperationLeaseReceipt, String> {
+        self.lease
+            .as_ref()
+            .and_then(|lease| lease.receipt())
+            .ok_or_else(|| "Builder operation lease has no durable identity receipt".into())
+    }
+
+    pub(super) fn new(lease: Box<dyn AppOperationLease>) -> Self {
+        Self {
+            lease: Some(lease),
+            mutating: false,
+        }
+    }
+
+    pub(super) async fn finish_read_only(&mut self) -> Result<(), String> {
+        if self.mutating {
+            return Err("Builder operation has already submitted a mutation".into());
+        }
+        let lease = self
+            .lease
+            .take()
+            .ok_or_else(|| "Builder operation lease is unavailable".to_owned())?;
+        lease.release().await
+    }
+
+    pub(super) fn begin_external_mutation(&mut self) -> Result<(), String> {
+        if self.lease.is_none() || self.mutating {
+            return Err("Builder operation is not available for external mutation".into());
+        }
+        self.mutating = true;
+        Ok(())
+    }
+
+    pub(super) async fn finish_external_mutation(&mut self) -> Result<(), String> {
+        if !self.mutating {
+            return Err("Builder external mutation has not started".into());
+        }
+        let lease = self
+            .lease
+            .take()
+            .ok_or_else(|| "Builder external mutation lease is unavailable".to_owned())?;
+        lease.release().await?;
+        self.mutating = false;
+        Ok(())
+    }
 }
 impl Drop for BuilderOperation {
     fn drop(&mut self) {
@@ -62,11 +115,51 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
             lease: Some(operation),
             mutating: false,
         };
-        let snapshot = self
+        let mut snapshot = self
             .runtime
             .capture_builder_deletion(app_id)
             .await
             .map_err(|e| format!("capture builder deletion: {e}"))?;
+        if let Some(resource) = snapshot.resources.iter().find(|resource| {
+            matches!(
+                resource.kind,
+                shared_types::AppResourceKind::Container
+                    | shared_types::AppResourceKind::StatefulSet
+            )
+        }) {
+            snapshot.resource_binding = self
+                .store
+                .get_resource_binding(&shared_types::ServiceType::UserappBuilder, &resource.uid)
+                .await
+                .map_err(|error| format!("Read builder resource binding: {error}"))?;
+            let app = self
+                .store
+                .get_application(app_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Builder lifecycle is missing".to_owned())?;
+            let context = shared_types::UserAppExecutionContext {
+                app_id: app_id.into(),
+                user_id: app.user_id,
+                lifecycle_id: app.lifecycle_id,
+                operation_id: "capture-deletion".into(),
+                executor_id: "reader".into(),
+                request_fingerprint: "0".repeat(64),
+            };
+            let actual = self
+                .runtime
+                .capture_bound_builder_control(&context, snapshot.resource_binding.as_ref())
+                .await
+                .map_err(|error| format!("Verify builder deletion ownership: {error}"))?;
+            if actual
+                .workload
+                .as_ref()
+                .map(|workload| workload.uid.as_str())
+                != Some(resource.uid.as_str())
+            {
+                return Err("Builder changed during deletion capture".into());
+            }
+        }
         let registry_identity = self
             .projects
             .get(app_id)
@@ -98,6 +191,39 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
 }
 #[async_trait::async_trait]
 impl UserappDevDeletion for CapturedDeletion {
+    async fn workspace_endpoint(
+        &mut self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> Result<shared_types::UserAppBuilderWorkspaceEndpoint, String> {
+        self.runtime
+            .inspect_builder_workspace(&self.snapshot, context)
+            .await
+            .map_err(|error| format!("Inspect captured builder workspace: {error}"))
+    }
+
+    fn begin_external_mutation(&mut self) -> Result<(), String> {
+        self.operation.begin_external_mutation()
+    }
+
+    async fn finish_external_mutation(&mut self) -> Result<(), String> {
+        self.operation.finish_external_mutation().await
+    }
+
+    fn receipt(&self) -> shared_types::UserappDevDeletionReceipt {
+        shared_types::UserappDevDeletionReceipt {
+            runtime: self.snapshot.clone(),
+            registry: self
+                .registry_identity
+                .as_ref()
+                .map(
+                    |(generation, container_id)| shared_types::BuilderRegistryIdentity {
+                        generation: generation.clone(),
+                        container_id: container_id.clone(),
+                    },
+                ),
+        }
+    }
+
     async fn cleanup(self: Box<Self>) -> Result<(), String> {
         // Once accepted, retain both leases until every blocking filesystem action
         // finishes even if the HTTP caller disconnects or cancels its future.
@@ -209,10 +335,53 @@ mod tests {
     #[tokio::test]
     async fn uncertain_mutation_does_not_release_distributed_lease() {
         let (send, receive) = tokio::sync::oneshot::channel();
-        drop(BuilderOperation {
+        let mut operation = BuilderOperation {
             lease: Some(Box::new(Lease(send))),
-            mutating: true,
-        });
+            mutating: false,
+        };
+        operation
+            .begin_external_mutation()
+            .expect("begin external write");
+        drop(operation);
         assert!(receive.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn confirmed_external_write_releases_once_and_cannot_be_reused() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut operation = BuilderOperation {
+            lease: Some(Box::new(Lease(send))),
+            mutating: false,
+        };
+        assert!(operation.finish_external_mutation().await.is_err());
+        operation.begin_external_mutation().expect("begin");
+        assert!(
+            operation.begin_external_mutation().is_err(),
+            "cannot overlap writes"
+        );
+        operation
+            .finish_external_mutation()
+            .await
+            .expect("release after confirmation");
+        receive.await.expect("lease released");
+        assert!(!operation.mutating);
+        assert!(operation.begin_external_mutation().is_err());
+        assert!(operation.finish_external_mutation().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_external_lease_release_preserves_uncertain_state() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        drop(receive);
+        let mut operation = BuilderOperation {
+            lease: Some(Box::new(Lease(send))),
+            mutating: false,
+        };
+        operation.begin_external_mutation().expect("begin");
+        assert!(operation.finish_external_mutation().await.is_err());
+        assert!(
+            operation.mutating,
+            "release failure cannot be treated as read-only cleanup"
+        );
     }
 }

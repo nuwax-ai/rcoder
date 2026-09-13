@@ -1,6 +1,16 @@
 #!/bin/bash
 set -e
 
+# Fail before starting auxiliary services when the SQLite directory is not writable.
+if [ "${RCODER_USERAPP_STORAGE_BACKEND:-}" = "sqlite" ]; then
+    RCODER_SQLITE_DIRECTORY=$(dirname -- "${RCODER_USERAPP_SQLITE_PATH:?SQLite path is required}")
+    mkdir -p -- "$RCODER_SQLITE_DIRECTORY"
+    if [ ! -w "$RCODER_SQLITE_DIRECTORY" ]; then
+        echo "UserApp SQLite directory is not writable: $RCODER_SQLITE_DIRECTORY" >&2
+        exit 1
+    fi
+fi
+
 echo "🚀 启动 RCoder 服务..."
 
 # 设置环境变量

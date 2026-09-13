@@ -112,6 +112,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .merge(userapp_proxy::proxy_api_routes(state.clone()))
         .merge(agent_mgmt::agent_mgmt_routes(state.clone()))
         .merge(app_manager_routes(&state))
+        .merge(crate::userapp_builder::adoption::routes().with_state(state.clone()))
         // userApp 文件域转发层: /api/v1/userapp 本地入口 + 容器侧接口显式透传清单
         // （build/tasks/static 等构建链接口在 file-server 侧，逐条登记于
         // CONTAINER_PASS_THROUGH_PATHS；原 {*rest} 通配与 {app_id} 参数路由同树时

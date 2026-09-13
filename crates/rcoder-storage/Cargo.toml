@@ -13,7 +13,7 @@ default = []
 # 未选择 pg/sqlite 后端时不编译 sqlx。
 # rcoder 侧经 feature `rcoder-pg = ["kubernetes", "rcoder-storage/pg"]` 转发开启。
 pg = ["sqlx", "sqlx/postgres", "moka"]
-sqlite = ["sqlx", "sqlx/sqlite-bundled"]
+sqlite = ["sqlx", "sqlx/sqlite-bundled", "dep:nix"]
 
 [lints]
 workspace = true
@@ -41,6 +41,7 @@ sqlx = { workspace = true, optional = true }
 moka = { workspace = true, optional = true }
 
 uuid = { workspace = true }
+nix = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

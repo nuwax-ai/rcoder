@@ -18,7 +18,7 @@ use super::*;
     tag = "pod",
     operation_id = "pod_restart",
     summary = "重启容器（销毁后重建）",
-    description = "根据 user_id 和 project_id 重启容器。如果容器存在，先销毁再创建新容器；如果不存在，直接创建。"
+    description = "Agent requests restart or recreate their container. UserApp dev requests carry user_id, lifecycle_id and request_id into durable admission, restart captured compute identity, retain workspace storage, and never recreate after an uncertain restart error. UserApp prod requests use the production lifecycle coordinator."
 )]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_restart(
@@ -35,9 +35,29 @@ pub async fn pod_restart(
     ) {
         Ok(AppTarget::NotApp) => {}
         Ok(AppTarget::Dev(app_id)) => {
-            return restart_userapp_dev(&state, locale, app_id, request.user_id.as_str()).await;
+            return restart_userapp_dev(
+                &state,
+                app_id,
+                shared_types::UserAppControlRequest {
+                    user_id: request.user_id.clone(),
+                    lifecycle_id: request.lifecycle_id.clone(),
+                    request_id: request.request_id.clone(),
+                },
+            )
+            .await;
         }
-        Ok(AppTarget::Prod(app_id)) => return restart_userapp_prod(&state, app_id).await,
+        Ok(AppTarget::Prod(app_id)) => {
+            return restart_userapp_prod(
+                &state,
+                app_id,
+                shared_types::UserAppControlRequest {
+                    user_id: request.user_id.clone(),
+                    lifecycle_id: request.lifecycle_id.clone(),
+                    request_id: request.request_id.clone(),
+                },
+            )
+            .await;
+        }
         Err(e) => {
             error!("[POD_RESTART] invalid app target: {}", e);
             return Ok(invalid_app_target_response(locale, &e));
@@ -217,112 +237,65 @@ pub async fn pod_restart(
 // userApp 分派实现（app_id/app_stage）
 // ============================================================================
 
-/// restart 的 userApp dev 分支：原地重启优先（K8s：pod 名/IP/60000 转发地址不变，
-/// dev 运行态全保）；Docker 运行时无原地重启（trait 默认 NotImplemented）→
-/// 回落 stop + 清注册 + ensure 正路重建（per-app 卷保留，dev 数据不丢）。
+/// Restart the captured builder compute identity through durable admission.
+/// Unknown runtime failures never trigger destructive stop-and-create fallback.
 async fn restart_userapp_dev(
     state: &Arc<AppState>,
-    locale: &str,
     app_id: String,
-    user_id: &str,
+    request: shared_types::UserAppControlRequest,
 ) -> Result<HttpResult<RestartPodResponse>, AppError> {
-    // 区分查询错误与真不存在（K8s API 瞬断不应误报 404 语义）
-    let existed = state
-        .runtime()
-        .get_container_info_by_identifier(&app_id, &ServiceType::UserappBuilder)
+    let result = crate::userapp_builder::control::execute(state, &app_id, request, true)
         .await
-        .map_err(|e| {
-            error!("[POD_RESTART] userapp dev container lookup failed: app_id={app_id}: {e:#}");
-            AppError::with_message(
-                shared_types::error_codes::ERR_BACKEND_ERROR,
-                format!("userapp dev container lookup failed: {e:#}"),
-            )
-        })?;
-    let Some(existing) = existed else {
-        return Ok(HttpResult::error_with_message(
-            shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
-            locale,
-            &format!("userapp dev container not found: app_id={app_id}"),
-        ));
-    };
-    let inplace = state
-        .runtime()
-        .restart_container_inplace(&app_id, &ServiceType::UserappBuilder)
-        .await;
-    let (info, message) = match inplace {
-        Ok(()) => {
-            info!("[POD_RESTART] userapp dev 容器原地重启完成: app_id={app_id}");
-            (
-                existing,
-                "Userapp dev 容器已原地重启（地址不变）".to_string(),
-            )
-        }
-        Err(e) => {
-            info!(
-                "[POD_RESTART] userapp dev 原地重启不可用（Docker 运行时等），回落重建: app_id={app_id}: {e:#}"
-            );
-            // stop 失败与主路径同款降级：记日志继续重建（K8s STS 已删 404 / Docker
-            // 映射缺失等良性竞态不阻断；真 API 故障由后续 recreate 的报错兜底）
-            if let Err(e) = state
-                .runtime()
-                .stop_container_by_identifier(&app_id, &ServiceType::UserappBuilder)
-                .await
-            {
-                warn!("[POD_RESTART] userapp dev stop 失败（继续重建）: app_id={app_id}: {e:#}");
-            }
-            // 清注册表 container 字段（防 ensure 命中死注册不重建——同探活自愈
-            // 的就地清模式，不 remove_project 以保 PG 侧 project 行与会话映射）
-            state.clear_project_container_field(&app_id);
-            let recreated =
-                crate::userapp_builder::ensure_userapp_builder(state, &app_id, Some(user_id))
-                    .await
-                    .map_err(|e| {
-                        error!("[POD_RESTART] userapp dev recreate failed: app_id={app_id}: {e:#}");
-                        AppError::with_message(
-                            shared_types::error_codes::ERR_BACKEND_ERROR,
-                            format!("userapp dev restart (recreate phase) failed: {e:#}"),
-                        )
-                    })?;
-            (
-                recreated,
-                "Userapp dev 容器已重建（卷保留，数据不丢）".to_string(),
-            )
-        }
-    };
-    info!("[POD_RESTART] userapp dev 容器重启完成: app_id={app_id}");
+        .map_err(|error| crate::userapp_builder::control_error(&error))?;
+    let info = result.container.ok_or_else(|| {
+        AppError::internal_server_error("Builder restart completed without a container identity")
+            .with_operation_id(result.operation_id.clone())
+    })?;
     Ok(HttpResult::success(RestartPodResponse {
-        was_existing: true,
+        was_existing: result.was_existing,
         restarted: true,
         container_info: PodContainerInfo {
-            container_id: info.container_id.clone(),
-            status: "Running".to_string(),
+            container_id: info.container_id,
+            status: "Running".into(),
         },
-        message,
-    }))
+        message: "UserApp development compute restarted; workspace data preserved".into(),
+    })
+    .with_operation_id(result.operation_id))
 }
 
 /// restart 的 userApp prod 分支：滚动重启（rollout）。
 async fn restart_userapp_prod(
     state: &Arc<AppState>,
     app_id: String,
+    mut request: shared_types::UserAppControlRequest,
 ) -> Result<HttpResult<RestartPodResponse>, AppError> {
-    state.app_service.restart_app(&app_id).await.map_err(|e| {
-        error!("[POD_RESTART] userapp prod restart failed: app_id={app_id}: {e:#}");
-        AppError::with_message(
-            shared_types::error_codes::ERR_BACKEND_ERROR,
-            format!("userapp prod restart failed: {e:#}"),
-        )
-    })?;
-    info!("[POD_RESTART] userapp prod 滚动重启完成: app_id={app_id}");
-    Ok(HttpResult::success(RestartPodResponse {
+    let request_id = request
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let owner = request.user_id.clone();
+    state
+        .app_service
+        .restart_app_controlled(&app_id, request)
+        .await?;
+    let operation = state
+        .app_service
+        .get_control_operation_by_request(&app_id, &owner, &request_id)
+        .await?;
+    info!(app_id, "UserApp production restart completed");
+    let mut response = HttpResult::success(RestartPodResponse {
         was_existing: true,
         restarted: true,
         container_info: PodContainerInfo {
-            container_id: app_id.clone(),
-            status: "Running".to_string(),
+            container_id: app_id,
+            status: "Running".into(),
         },
-        message: "Userapp 生产实例已滚动重启".to_string(),
-    }))
+        message: "UserApp production instance restarted".into(),
+    });
+    if let Some(operation) = operation {
+        response = response.with_operation_id(operation.operation_id);
+    }
+    Ok(response)
 }
 
 // ============================================================================

@@ -31,7 +31,10 @@ pub use userapp::db_align::{
     AlignCredentialsOutcome, AlignCredentialsRequest, AlignError, CommandOutcome, PgCommandRunner,
     align_pg_credentials,
 };
-pub use userapp::dev_cleanup::{BuilderDeletionSnapshot, UserappDevCleanup, UserappDevDeletion};
+pub use userapp::dev_cleanup::{
+    BuilderDeletionSnapshot, BuilderRegistryIdentity, UserappDevCleanup, UserappDevDeletion,
+    UserappDevDeletionReceipt,
+};
 pub use userapp::dev_locator::{UserappDevEnsure, UserappDevLocator};
 pub use userapp::forward_contract::{
     APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, ComputerServiceKind,
@@ -73,6 +76,8 @@ pub use permission_types::{
 pub mod constants;
 // 工作区路径常量 (单一事实源, 所有 crate 共用: rcoder/docker_manager/agent_runner)
 pub mod paths;
+pub mod storage_contents;
+pub use app_resource_deletion::{UserAppStorageClear, UserAppStorageClearTarget};
 pub use constants::*;
 
 // 错误码定义模块 — 重导出自 shared_types_i18n（过渡期兼容）
@@ -95,8 +100,9 @@ pub use shared_types_i18n::{
     ERR_PERMISSION_NOT_FOUND, ERR_PERMISSION_RESOLVE_FAILED, ERR_PROJECT_NOT_FOUND,
     ERR_PROXY_DISABLED, ERR_PROXY_SERVICE_UNAVAILABLE, ERR_RESOURCE_EXHAUSTED, ERR_RESUME_FAILED,
     ERR_RETRY_EXHAUSTED, ERR_SERVICE_UNAVAILABLE, ERR_SESSION_NOT_FOUND, ERR_STOP_FAILED,
-    ERR_TOO_MANY_REQUESTS, ERR_UNKNOWN, ERR_VALIDATION, ERR_WORKSPACE_ERROR, SUCCESS, error_codes,
-    get_error_description, get_error_message, get_i18n_message, get_i18n_message_default,
+    ERR_TOO_MANY_REQUESTS, ERR_UNKNOWN, ERR_USERAPP_WAIT_TIMEOUT, ERR_VALIDATION,
+    ERR_WORKSPACE_ERROR, SUCCESS, error_codes, get_error_description, get_error_message,
+    get_i18n_message, get_i18n_message_default,
 };
 
 // Validation 模块
@@ -121,7 +127,9 @@ pub mod app_resource_deletion;
 pub mod runtime_request_failure;
 pub use app_resource_deletion::{
     AppDeletionSnapshot, AppFileMutationMarker, AppOperationLease, AppPreparationFailure,
-    AppResourceIdentity, AppResourceKind, USERAPP_DOCKER_APP_ID_LABEL,
+    AppResourceIdentity, AppResourceKind, USERAPP_DOCKER_APP_ID_LABEL, UserAppDeletionCheckpoint,
+    UserAppDeletionStage, UserAppMutationTarget, UserAppStorageDestruction,
+    UserAppStorageResizeTarget,
 };
 pub use runtime_request_failure::RuntimeRequestRejection;
 
@@ -249,3 +257,14 @@ pub mod persistence;
 pub use persistence::FlushOutcome;
 
 pub use userapp::lifecycle::*;
+pub use userapp::workspace_clear::*;
+
+pub use userapp::builder_control::*;
+
+pub use userapp::resource_binding::{
+    AdoptBuilderRequest, UserAppResourceBinding, builder_identity_is_bound,
+};
+
+pub use userapp::operation_lease::*;
+
+pub use userapp::builder_recovery::UserAppBuilderRecovery;

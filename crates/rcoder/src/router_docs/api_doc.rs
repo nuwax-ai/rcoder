@@ -74,6 +74,13 @@ use crate::handler;
         handler::devcomputer_notify_resolved,
         handler::devcomputer_agent_progress_notification,
         // 应用管理接口
+        crate::userapp_builder::adoption::adopt_builder,
+        app_manager::handlers::get_lifecycle,
+        app_manager::handlers::get_current_operation,
+        app_manager::handlers::retry_operation,
+        app_manager::handlers::get_operation,
+        app_manager::handlers::get_operation_by_request,
+        app_manager::handlers::recreate_identity,
         app_manager::handlers::query_apps,
         app_manager::handlers::get_app,
         app_manager::handlers::update_app,

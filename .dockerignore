@@ -30,6 +30,9 @@ docker/computer-project-workspace/
 # Local UserApp workspaces and persistent application data are runtime mounts.
 docker/userapp-workspace/
 docker/app-workspace/
+# SQLite databases, WAL/SHM and instance locks must never enter image layers.
+data/rcoder/
+docker/data/rcoder/
 
 # 测试文件
 tests/

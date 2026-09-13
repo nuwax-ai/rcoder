@@ -55,6 +55,21 @@ def cleanup_pg_project(directory, run_id, case_id, existing_ids=()):
             'creation_settled': settled, 'ok': result.returncode == 0 and settled, 'detail': detail}
 
 
+def builder_purge_body(container, receipt, case_id):
+    labels = container['Config'].get('Labels') or {}
+    name = container['Name'].lstrip('/')
+    app = name.removeprefix('rcoder-app-builder-')
+    if (not receipt or receipt.get('id') != container['Id'] or receipt.get('name') != name
+            or receipt.get('case_id') != case_id or receipt.get('app_id') != app
+            or labels.get('service-type') != 'user-app-builder'
+            or labels.get('rcoder.io/application-id') != app
+            or not receipt.get('user_id') or labels.get('rcoder.io/owner-id') != receipt['user_id']
+            or not receipt.get('lifecycle_id') or labels.get('rcoder.io/lifecycle-id') != receipt['lifecycle_id']):
+        raise ValueError('builder cleanup requires a matching captured physical lifecycle receipt')
+    return {'user_id': receipt['user_id'], 'lifecycle_id': receipt['lifecycle_id'],
+            'request_id': 'cleanup-' + case_id + '-' + app}
+
+
 def cleanup_case(case_id, run_id, directory, existing_ids=()):
     errors = []
     root = directory / 'resources'
@@ -94,6 +109,28 @@ def cleanup_case(case_id, run_id, directory, existing_ids=()):
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
             errors.append('PG ownership cleanup failed: ' + type(error).__name__)
             (root / 'pg-project-fallback-cleanup.json').write_text(json.dumps({'run_id': run_id, 'case_id': case_id, 'ok': False, 'detail': errors[-1]}))
+    for receipt_path in (directory / 'docker-crash').glob('*/ownership.json'):
+        try:
+            receipt = json.loads(receipt_path.read_text())
+            managed_names.update({receipt['project'] + '-rcoder-1', receipt['project'] + '-docker-proxy-1',
+                                  'rcoder-app-builder-' + receipt['app_id']})
+            from docker_crash_contract import cleanup as cleanup_docker_crash
+            result = cleanup_docker_crash(receipt_path.parent, run_id, case_id)
+            (receipt_path.parent / 'fallback-cleanup.json').write_text(json.dumps(result, indent=2))
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+            errors.append('Docker crash fixture cleanup failed: ' + type(error).__name__)
+    # A SQLite recreation contract owns an entire isolated control plane. Its
+    # application cleanup must use that plane, never the daily RCODER_URL.
+    for receipt_path in (directory / 'sqlite-runtime').glob('*/ownership.json'):
+        try:
+            receipt = json.loads(receipt_path.read_text())
+            managed_names.add(receipt['project'] + '-rcoder-1')
+            managed_names.add('rcoder-app-builder-' + receipt['app_id'])
+            from sqlite_runtime_contract import cleanup as cleanup_sqlite_runtime
+            result = cleanup_sqlite_runtime(receipt_path.parent, run_id, case_id)
+            (receipt_path.parent / 'fallback-cleanup.json').write_text(json.dumps(result, indent=2))
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+            errors.append('SQLite isolated runtime cleanup failed: ' + type(error).__name__)
     try:
         ids = command('docker', 'ps', '-aq', '--no-trunc').split()
         # Never persist the full inspect result, which includes secrets.
@@ -101,11 +138,13 @@ def cleanup_case(case_id, run_id, directory, existing_ids=()):
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         return ['cleanup inventory failed: ' + type(error).__name__]
     registered = {}
+    registered_receipts = {}
     for path in root.glob('*-ownership.json'):
         try:
             receipt = json.loads(path.read_text())
             if receipt.get('case_id') == case_id:
                 registered[receipt['id']] = receipt['name']
+                registered_receipts[receipt['id']] = receipt
         except (ValueError, KeyError):
             errors.append('invalid ownership receipt: ' + path.name)
     for container in containers:
@@ -136,7 +175,8 @@ def cleanup_case(case_id, run_id, directory, existing_ids=()):
             if name.startswith('rcoder-app-builder-'):
                 app_id = name.removeprefix('rcoder-app-builder-')
                 base = os.environ.get('RCODER_URL', 'http://127.0.0.1:8090')
-                request = urllib.request.Request(base + '/api/v1/userapp/' + app_id + '/delete/app', data=b'{}', headers={'Content-Type': 'application/json'})
+                payload = builder_purge_body(container, registered_receipts.get(cid), case_id)
+                request = urllib.request.Request(base + '/api/v1/userapp/' + app_id + '/delete/app', data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
                 with urllib.request.urlopen(request, timeout=60) as response:
                     body = json.load(response)
                     if body.get('code') != '0000':

@@ -14,6 +14,30 @@ use super::handlers;
 /// 创建应用管理路由
 pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
     Router::new()
+        .route(
+            "/api/v1/userapp/{app_id}/lifecycle",
+            get(handlers::get_lifecycle),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/operations/current",
+            get(handlers::get_current_operation),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/operations/by-request",
+            get(handlers::get_operation_by_request),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/operations/{operation_id}",
+            get(handlers::get_operation),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/operations/{operation_id}/retry",
+            post(handlers::retry_operation),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/recreate",
+            post(handlers::recreate_identity),
+        )
         // 应用生命周期
         .route("/api/v1/userapp/query", post(handlers::query_apps))
         .route("/api/v1/userapp/runtime", get(handlers::list_app_runtimes))

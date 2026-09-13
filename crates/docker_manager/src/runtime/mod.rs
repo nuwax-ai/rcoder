@@ -7,8 +7,11 @@ pub(crate) mod builder_completion;
 pub(crate) mod docker_app_create;
 pub(crate) mod docker_app_mounts;
 mod docker_app_runtime;
+mod docker_builder_control;
 pub mod docker_runtime;
 pub(crate) mod docker_workspace;
+#[cfg(feature = "kubernetes")]
+mod k8s_builder_control;
 pub(crate) mod k8s_runtime_helpers;
 pub mod kubernetes_runtime;
 pub mod manager;

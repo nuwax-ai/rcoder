@@ -207,6 +207,7 @@ impl K8sPvcOps for KubernetesRuntime {
             access_mode,
             storage_class_name,
             storage_size.unwrap_or(default_size),
+            None,
         )
         .await
     }
@@ -329,6 +330,7 @@ impl K8sPvcOps for KubernetesRuntime {
                 ContainerRuntimeError::K8sError(format!("Failed to get PVC '{pvc_name}': {other}"))
             }
         })?;
+        let identity = pvc_resize_identity(&pvc_name, &pvc.metadata)?;
         let current = pvc
             .spec
             .as_ref()
@@ -341,58 +343,8 @@ impl K8sPvcOps for KubernetesRuntime {
                     "PVC '{pvc_name}' has no spec.resources.requests.storage"
                 ))
             })?;
-        match compare_storage_quantity(&current, new_size) {
-            StorageVerdict::Equal => {
-                info!(
-                    "[K8S] PVC {} resize no-op: requested {} equals current {}",
-                    pvc_name, new_size, current
-                );
-                Ok(StorageResizeOutcome::AlreadyEqual)
-            }
-            StorageVerdict::Shrink => {
-                // Ok 载事实（K8s 层不做错误决策）；app_manager 收到后转 400
-                info!(
-                    "[K8S] PVC {} resize rejected: requested {} < current {} (K8s PVC 不可缩容)",
-                    pvc_name, new_size, current
-                );
-                Ok(StorageResizeOutcome::ShrinkRejected {
-                    requested: new_size.to_string(),
-                    current,
-                })
-            }
-            StorageVerdict::Grow => {
-                // merge patch requests.storage → external-resizer 异步扩容（在线，
-                // kubelet 扩文件系统不重建 Pod）；SC 须 allowVolumeExpansion=true
-                let patch = serde_json::json!({
-                    "spec": { "resources": { "requests": { "storage": new_size } } }
-                });
-                self.pvcs()
-                    .patch(
-                        &pvc_name,
-                        &kube::api::PatchParams::default(),
-                        &kube::api::Patch::Merge(&patch),
-                    )
-                    .await
-                    .map_err(|e| {
-                        ContainerRuntimeError::K8sError(format!(
-                            "Failed to patch PVC '{}' requests.storage to {}: {}",
-                            pvc_name, new_size, e
-                        ))
-                    })?;
-                info!(
-                    "[K8S] PVC {} resize requested: {} -> {} (external-resizer async, online)",
-                    pvc_name, current, new_size
-                );
-                Ok(StorageResizeOutcome::Resized {
-                    from: current,
-                    to: new_size.to_string(),
-                })
-            }
-            StorageVerdict::Invalid => Err(ContainerRuntimeError::ConfigurationError(format!(
-                "invalid storage quantity (current={current:?}, requested={new_size:?}); \
-                 expected K8s Quantity format like \"100Gi\""
-            ))),
-        }
+        self.resize_captured_pvc(&identity, &current, new_size)
+            .await
     }
 
     async fn destroy_workspace_pvc(
@@ -413,6 +365,211 @@ impl K8sPvcOps for KubernetesRuntime {
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
         self.destroy_pvc_core(&pvc_name).await
     }
+}
+
+impl KubernetesRuntime {
+    pub(super) async fn ensure_owned_workspace_pvc(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        service_type: &ServiceType,
+        storage_size: Option<&str>,
+    ) -> ContainerRuntimeResult<()> {
+        context
+            .validate_identity(&context.app_id, Some(&context.user_id))
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if !matches!(
+            service_type,
+            ServiceType::Userapp | ServiceType::UserappBuilder
+        ) {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Lifecycle-owned PVC requires UserApp family".into(),
+            ));
+        }
+        let name = self.workspace_pvc_name(&context.app_id, service_type)?;
+        self.ensure_pvc_core(
+            &name,
+            &service_type.to_string(),
+            "ReadWriteOnce".into(),
+            userapp_storage_class(),
+            storage_size.unwrap_or(DEFAULT_USERAPP_PVC_STORAGE_SIZE),
+            Some(context),
+        )
+        .await
+    }
+
+    pub(super) async fn capture_storage_resize(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::UserAppStorageResizeTarget> {
+        context
+            .validate_identity(&context.app_id, Some(&context.user_id))
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let name = self.workspace_pvc_name(&context.app_id, &ServiceType::Userapp)?;
+        let pvc = self.pvcs().get(&name).await.map_err(|error| {
+            ContainerRuntimeError::K8sError(format!("Capture application storage resize: {error}"))
+        })?;
+        let resource = pvc_resize_identity(&name, &pvc.metadata)?;
+        let metadata = pvc.metadata.annotations.as_ref().ok_or_else(|| {
+            ContainerRuntimeError::Conflict(
+                "Application storage requires lifecycle adoption".into(),
+            )
+        })?;
+        context
+            .validate_application_metadata(metadata)
+            .map_err(ContainerRuntimeError::Conflict)?;
+        let current_size = pvc
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.resources.as_ref())
+            .and_then(|resources| resources.requests.as_ref())
+            .and_then(|requests| requests.get("storage"))
+            .map(|value| value.0.clone())
+            .ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError(
+                    "Application storage has no requested capacity".into(),
+                )
+            })?;
+        Ok(shared_types::UserAppStorageResizeTarget {
+            context: context.clone(),
+            resource,
+            current_size,
+        })
+    }
+
+    pub(super) async fn resize_storage_target(
+        &self,
+        target: &shared_types::UserAppStorageResizeTarget,
+        new_size: &str,
+    ) -> ContainerRuntimeResult<StorageResizeOutcome> {
+        target
+            .context
+            .validate_identity(&target.context.app_id, Some(&target.context.user_id))
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let expected = self.workspace_pvc_name(&target.context.app_id, &ServiceType::Userapp)?;
+        if target.resource.name != expected
+            || target.resource.kind != shared_types::AppResourceKind::PersistentVolumeClaim
+            || target.resource.uid.is_empty()
+            || target
+                .resource
+                .resource_version
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Incomplete captured storage resize identity".into(),
+            ));
+        }
+        self.resize_captured_pvc(&target.resource, &target.current_size, new_size)
+            .await
+    }
+
+    async fn resize_captured_pvc(
+        &self,
+        identity: &shared_types::AppResourceIdentity,
+        current: &str,
+        new_size: &str,
+    ) -> ContainerRuntimeResult<StorageResizeOutcome> {
+        let pvc_name = &identity.name;
+        let current = current.to_owned();
+        match compare_storage_quantity(&current, new_size) {
+            StorageVerdict::Equal => {
+                info!(
+                    "[K8S] PVC {} resize no-op: requested {} equals current {}",
+                    pvc_name, new_size, current
+                );
+                Ok(StorageResizeOutcome::AlreadyEqual)
+            }
+            StorageVerdict::Shrink => {
+                // Ok 载事实（K8s 层不做错误决策）；app_manager 收到后转 400
+                info!(
+                    "[K8S] PVC {} resize rejected: requested {} < current {} (PVC shrinking is unsupported)",
+                    pvc_name, new_size, current
+                );
+                Ok(StorageResizeOutcome::ShrinkRejected {
+                    requested: new_size.to_string(),
+                    current,
+                })
+            }
+            StorageVerdict::Grow => {
+                // merge patch requests.storage → external-resizer 异步扩容（在线，
+                // kubelet 扩文件系统不重建 Pod）；SC 须 allowVolumeExpansion=true
+                let patch = serde_json::json!({
+                    "metadata": {"uid": identity.uid, "resourceVersion": identity.resource_version},
+                    "spec": { "resources": { "requests": { "storage": new_size } } }
+                });
+                self.pvcs()
+                    .patch(
+                        pvc_name,
+                        &kube::api::PatchParams::default(),
+                        &kube::api::Patch::Merge(&patch),
+                    )
+                    .await
+                    .map_err(|error| match &error {
+                        kube::Error::Api(response) if response.code == 409 => ContainerRuntimeError::Conflict(format!("PVC resize precondition failed for {pvc_name}: {error}")),
+                        _ => ContainerRuntimeError::K8sError(format!("Failed to patch PVC '{pvc_name}' requests.storage to {new_size}: {error}")),
+                    })?;
+                info!(
+                    "[K8S] PVC {} resize requested: {} -> {} (external-resizer async, online)",
+                    pvc_name, current, new_size
+                );
+                Ok(StorageResizeOutcome::Resized {
+                    from: current,
+                    to: new_size.to_string(),
+                })
+            }
+            StorageVerdict::Invalid => Err(ContainerRuntimeError::ConfigurationError(format!(
+                "invalid storage quantity (current={current:?}, requested={new_size:?}); \
+                 expected K8s Quantity format like \"100Gi\""
+            ))),
+        }
+    }
+}
+
+/// Capture a production PVC identity even for no-op size requests. A name or
+/// matching capacity cannot establish resource ownership.
+#[cfg(feature = "kubernetes")]
+fn pvc_resize_identity(
+    expected_name: &str,
+    metadata: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+) -> ContainerRuntimeResult<shared_types::AppResourceIdentity> {
+    if metadata.name.as_deref() != Some(expected_name) || metadata.deletion_timestamp.is_some() {
+        return Err(ContainerRuntimeError::Conflict(
+            "PVC resize target changed or is deleting".into(),
+        ));
+    }
+    if metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("service_type"))
+        .map(String::as_str)
+        != Some(ServiceType::Userapp.to_string().as_str())
+    {
+        return Err(ContainerRuntimeError::Conflict(
+            "PVC resize target is not a production UserApp volume".into(),
+        ));
+    }
+    let uid = metadata
+        .uid
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError("PVC resize target has no UID".into())
+        })?;
+    let version = metadata
+        .resource_version
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError(
+                "PVC resize target has no resource version".into(),
+            )
+        })?;
+    Ok(shared_types::AppResourceIdentity {
+        kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+        name: expected_name.into(),
+        uid: uid.into(),
+        resource_version: Some(version.into()),
+    })
 }
 
 /// quantity 归一比较结果（`resize_app_pvc` 决策用）。
@@ -444,6 +601,36 @@ fn compare_storage_quantity(current: &str, requested: &str) -> StorageVerdict {
 #[cfg(all(test, feature = "kubernetes"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pvc_resize_identity_rejects_replacement_family_and_missing_preconditions() {
+        let original = k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some("pvc-original".into()),
+            uid: Some("uid-original".into()),
+            resource_version: Some("47".into()),
+            labels: Some(std::collections::BTreeMap::from([(
+                "service_type".into(),
+                ServiceType::Userapp.to_string(),
+            )])),
+            ..Default::default()
+        };
+        let identity = pvc_resize_identity("pvc-original", &original).expect("identity");
+        assert_eq!(identity.uid, "uid-original");
+        assert_eq!(identity.resource_version.as_deref(), Some("47"));
+        assert!(pvc_resize_identity("other-name", &original).is_err());
+        let mut foreign = original.clone();
+        foreign.labels.as_mut().expect("labels").insert(
+            "service_type".into(),
+            ServiceType::UserappBuilder.to_string(),
+        );
+        assert!(pvc_resize_identity("pvc-original", &foreign).is_err());
+        let mut missing = original.clone();
+        missing.uid = None;
+        assert!(pvc_resize_identity("pvc-original", &missing).is_err());
+        let mut missing = original;
+        missing.resource_version = None;
+        assert!(pvc_resize_identity("pvc-original", &missing).is_err());
+    }
 
     #[test]
     fn compare_storage_quantity_verdicts() {

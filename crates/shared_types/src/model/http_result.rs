@@ -27,6 +27,9 @@ fn get_trace_id_from_context() -> Option<String> {
 #[allow(dead_code)]
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct HttpResult<T> {
+    /// Durable control operation associated with this response, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
     /// 业务状态码。`"0000"` 表示成功,其他码对应 `error_codes` 模块中常量(前缀如 `ERR_*`)。
     #[schema(example = "0000")]
     pub code: String,
@@ -45,8 +48,13 @@ pub struct HttpResult<T> {
 }
 
 impl<T> HttpResult<T> {
+    pub fn with_operation_id(mut self, operation_id: String) -> Self {
+        self.operation_id = Some(operation_id);
+        self
+    }
     pub fn success(data: T) -> Self {
         HttpResult {
+            operation_id: None,
             code: SUCCESS.to_string(),
             message: get_error_message(SUCCESS, DEFAULT_LOCALE),
             data: Some(data),
@@ -57,6 +65,7 @@ impl<T> HttpResult<T> {
 
     pub fn error(code: &str, message: &str) -> Self {
         HttpResult {
+            operation_id: None,
             code: code.to_string(),
             message: message.to_string(),
             data: None,
@@ -73,6 +82,7 @@ impl<T> HttpResult<T> {
     pub fn error_with_locale(code: &str, locale: &str) -> Self {
         let message = get_error_message(code, locale);
         HttpResult {
+            operation_id: None,
             code: code.to_string(),
             message,
             data: None,
@@ -89,6 +99,7 @@ impl<T> HttpResult<T> {
     /// * `custom_message` - 自定义错误消息（会覆盖默认翻译）
     pub fn error_with_message(code: &str, _locale: &str, custom_message: &str) -> Self {
         HttpResult {
+            operation_id: None,
             code: code.to_string(),
             message: custom_message.to_string(),
             data: None,
@@ -100,6 +111,7 @@ impl<T> HttpResult<T> {
     /// 创建成功响应（带多语言）
     pub fn success_with_locale(data: T, locale: &str) -> Self {
         HttpResult {
+            operation_id: None,
             code: SUCCESS.to_string(),
             message: get_error_message(SUCCESS, locale),
             data: Some(data),
@@ -123,7 +135,11 @@ impl<T: Serialize> Serialize for HttpResult<T> {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("HttpResult", 5)?;
+        let mut state = serializer
+            .serialize_struct("HttpResult", 5 + usize::from(self.operation_id.is_some()))?;
+        if let Some(operation_id) = &self.operation_id {
+            state.serialize_field("operation_id", operation_id)?;
+        }
         state.serialize_field("code", &self.code)?;
         state.serialize_field("message", &self.message)?;
         state.serialize_field("data", &self.data)?;
@@ -158,5 +174,27 @@ impl<T: Serialize> IntoResponse for HttpResult<T> {
             )
                 .into_response(),
         }
+    }
+}
+
+#[cfg(test)]
+mod operation_identity_tests {
+    use super::HttpResult;
+
+    #[test]
+    fn optional_operation_identity_preserves_existing_response_data() {
+        let legacy =
+            serde_json::to_value(HttpResult::success(serde_json::json!({"app_id":"app"}))).unwrap();
+        assert!(legacy.get("operation_id").is_none());
+        let mut controlled = serde_json::to_value(
+            HttpResult::success(serde_json::json!({"app_id":"app"}))
+                .with_operation_id("operation-one".into()),
+        )
+        .unwrap();
+        assert_eq!(controlled["operation_id"], "operation-one");
+        controlled.as_object_mut().unwrap().remove("operation_id");
+        assert_eq!(controlled, legacy);
+        let old: HttpResult<serde_json::Value> = serde_json::from_value(legacy).unwrap();
+        assert!(old.operation_id.is_none());
     }
 }

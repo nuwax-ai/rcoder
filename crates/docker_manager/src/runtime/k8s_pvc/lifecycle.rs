@@ -31,10 +31,21 @@ impl KubernetesRuntime {
         access_mode: String,
         storage_class_name: Option<String>,
         storage_size: &str,
+        context: Option<&shared_types::UserAppExecutionContext>,
     ) -> ContainerRuntimeResult<()> {
         // Check if PVC already exists and its state
         let (pvc_status, existing_sc) = match self.pvcs().get(pvc_name).await {
             Ok(pvc) => {
+                if let Some(context) = context {
+                    validate_owned_pvc(&pvc.metadata, service_type_label, context)?;
+                    validate_owned_pvc_configuration(
+                        &pvc,
+                        pvc_name,
+                        &access_mode,
+                        storage_class_name.as_deref(),
+                        storage_size,
+                    )?;
+                }
                 let sc = pvc
                     .spec
                     .as_ref()
@@ -168,6 +179,14 @@ impl KubernetesRuntime {
             metadata: ObjectMeta {
                 name: Some(pvc_name.to_string()),
                 namespace: Some(self.namespace.clone()),
+                annotations: context.map(|context| {
+                    let mut metadata = context.resource_metadata();
+                    metadata.insert(
+                        "rcoder.io/storage-use-operation".into(),
+                        context.operation_id.clone(),
+                    );
+                    metadata
+                }),
                 labels: Some({
                     let mut m = BTreeMap::new();
                     m.insert("app".to_string(), "rcoder".to_string());
@@ -184,8 +203,8 @@ impl KubernetesRuntime {
                 // access_mode/storage_class_name 由调用方按卷型决定:
                 // Userapp 域（运行卷/开发卷/data 卷）RWO RBD 单容器独占,
                 // 其余用全局配置。
-                access_modes: Some(vec![access_mode]),
-                storage_class_name,
+                access_modes: Some(vec![access_mode.clone()]),
+                storage_class_name: storage_class_name.clone(),
                 resources: Some(VolumeResourceRequirements {
                     requests: Some({
                         let mut r = BTreeMap::new();
@@ -208,6 +227,16 @@ impl KubernetesRuntime {
         loop {
             match self.pvcs().create(&PostParams::default(), &pvc).await {
                 Ok(pvc_created) => {
+                    if let Some(context) = context {
+                        validate_owned_pvc(&pvc_created.metadata, service_type_label, context)?;
+                        validate_owned_pvc_configuration(
+                            &pvc_created,
+                            pvc_name,
+                            &access_mode,
+                            storage_class_name.as_deref(),
+                            storage_size,
+                        )?;
+                    }
                     info!(
                         "[K8S] PVC {} created successfully",
                         pvc_created.metadata.name.as_deref().unwrap_or("unknown")
@@ -215,6 +244,23 @@ impl KubernetesRuntime {
                     return Ok(());
                 }
                 Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                    if let Some(context) = context {
+                        let winner = self.pvcs().get(pvc_name).await.map_err(|error| {
+                            crate::runtime::builder_completion::k8s_error(
+                                format!("Read competing PVC creation {pvc_name}: {error}"),
+                                error,
+                            )
+                        })?;
+                        validate_owned_pvc(&winner.metadata, service_type_label, context)?;
+                        validate_owned_pvc_configuration(
+                            &winner,
+                            pvc_name,
+                            &access_mode,
+                            storage_class_name.as_deref(),
+                            storage_size,
+                        )?;
+                        return Ok(());
+                    }
                     if create_start.elapsed() > max_create_wait {
                         return Err(crate::runtime::builder_completion::k8s_error(
                             format!("create PVC {pvc_name}: conflict retry budget exhausted"),
@@ -345,5 +391,132 @@ impl KubernetesRuntime {
         self.subvolume_path_cache.write().await.remove(pvc_name);
         info!("[K8S] PVC destroyed: {}", pvc_name);
         Ok(())
+    }
+}
+
+fn validate_owned_pvc_configuration(
+    pvc: &PersistentVolumeClaim,
+    name: &str,
+    access_mode: &str,
+    storage_class: Option<&str>,
+    requested_size: &str,
+) -> ContainerRuntimeResult<()> {
+    let spec = pvc.spec.as_ref().ok_or_else(|| {
+        ContainerRuntimeError::Conflict("Application PVC configuration is missing".into())
+    })?;
+    if pvc.metadata.name.as_deref() != Some(name)
+        || !spec
+            .access_modes
+            .as_ref()
+            .is_some_and(|modes| modes.len() == 1 && modes[0] == access_mode)
+        || storage_class
+            .is_some_and(|expected| spec.storage_class_name.as_deref() != Some(expected))
+    {
+        return Err(ContainerRuntimeError::Conflict(
+            "Application PVC storage configuration differs from the requested configuration".into(),
+        ));
+    }
+    let current = spec
+        .resources
+        .as_ref()
+        .and_then(|resources| resources.requests.as_ref())
+        .and_then(|requests| requests.get("storage"))
+        .and_then(|size| shared_types::parse_memory_quantity(&size.0));
+    let requested = shared_types::parse_memory_quantity(requested_size);
+    // Capacity may have been expanded in this lifecycle. Reuse never shrinks it;
+    // insufficient capacity must use the explicit conditional expansion path.
+    if !matches!((current, requested), (Some(current), Some(requested)) if current >= requested) {
+        return Err(ContainerRuntimeError::Conflict(
+            "Application PVC capacity is invalid or below the requested size".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Only explicit lifecycle identity authorizes reuse. Existing unmarked volumes
+/// require adoption; neither their name nor their health proves ownership.
+fn validate_owned_pvc(
+    metadata: &ObjectMeta,
+    family: &str,
+    context: &shared_types::UserAppExecutionContext,
+) -> ContainerRuntimeResult<()> {
+    if metadata.deletion_timestamp.is_some()
+        || metadata.uid.as_deref().is_none_or(str::is_empty)
+        || metadata
+            .resource_version
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return Err(ContainerRuntimeError::Conflict(
+            "Application PVC is deleting or has incomplete identity".into(),
+        ));
+    }
+    if metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("service_type"))
+        .map(String::as_str)
+        != Some(family)
+    {
+        return Err(ContainerRuntimeError::Conflict(
+            "Application PVC service family changed".into(),
+        ));
+    }
+    let annotations = metadata.annotations.as_ref().ok_or_else(|| {
+        ContainerRuntimeError::Conflict(
+            "Application PVC requires explicit lifecycle adoption".into(),
+        )
+    })?;
+    context
+        .validate_application_metadata(annotations)
+        .map_err(ContainerRuntimeError::Conflict)
+}
+
+#[cfg(test)]
+mod lifecycle_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn pvc_reuse_requires_existing_matching_lifecycle_and_family() {
+        let context = shared_types::UserAppExecutionContext {
+            app_id: "app-one".into(),
+            user_id: "owner-one".into(),
+            lifecycle_id: "life-one".into(),
+            operation_id: "create-one".into(),
+            executor_id: "executor-one".into(),
+            request_fingerprint: "a".repeat(64),
+        };
+        let family = shared_types::ServiceType::Userapp.to_string();
+        let metadata = ObjectMeta {
+            name: Some("pvc-one".into()),
+            uid: Some("physical-one".into()),
+            resource_version: Some("4".into()),
+            labels: Some(BTreeMap::from([("service_type".into(), family.clone())])),
+            annotations: Some(context.resource_metadata()),
+            ..Default::default()
+        };
+        validate_owned_pvc(&metadata, &family, &context).expect("same lifecycle");
+        let mut next_operation = context.clone();
+        next_operation.operation_id = "update-one".into();
+        next_operation.request_fingerprint = "b".repeat(64);
+        validate_owned_pvc(&metadata, &family, &next_operation)
+            .expect("same owner and lifecycle, different operation");
+        let mut replacement = context;
+        replacement.lifecycle_id = "replacement-life".into();
+        assert!(validate_owned_pvc(&metadata, &family, &replacement).is_err());
+        let mut unlabeled = metadata.clone();
+        unlabeled.annotations = None;
+        assert!(validate_owned_pvc(&unlabeled, &family, &next_operation).is_err());
+        assert!(
+            validate_owned_pvc(
+                &metadata,
+                &shared_types::ServiceType::UserappBuilder.to_string(),
+                &next_operation
+            )
+            .is_err()
+        );
+        let mut incomplete = metadata;
+        incomplete.uid = None;
+        assert!(validate_owned_pvc(&incomplete, &family, &next_operation).is_err());
     }
 }

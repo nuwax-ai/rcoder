@@ -61,7 +61,15 @@ pub async fn envelope_errors(request: Request, next: Next) -> Response {
         .filter(|m| m.is_ascii())
         .map(str::to_owned)
         .unwrap_or_else(|| crate::error_codes::get_error_message(code, "en-US"));
-    let normalized = axum::Json(crate::HttpResult::<()>::error(code, &message)).into_response();
+    let mut envelope = crate::HttpResult::<()>::error(code, &message);
+    if let Some(operation_id) = parsed
+        .as_ref()
+        .and_then(|value| value["operation_id"].as_str())
+        .filter(|id| crate::validate_identifier(id, "operation_id").is_ok())
+    {
+        envelope = envelope.with_operation_id(operation_id.to_owned());
+    }
+    let normalized = axum::Json(envelope).into_response();
     parts.status = StatusCode::OK;
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     parts.headers.insert(
@@ -74,6 +82,39 @@ pub async fn envelope_errors(request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn formal_error_preserves_durable_operation_identity() {
+        use tower::ServiceExt as _;
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/userapp/example/stop",
+                axum::routing::post(|| async {
+                    crate::AppError::conflict("Operation requires recovery")
+                        .with_operation_id("operation-original".into())
+                }),
+            )
+            .layer(axum::middleware::from_fn(envelope_errors));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/userapp/example/stop")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("response body");
+        let envelope: serde_json::Value = serde_json::from_slice(&body).expect("envelope");
+        assert_eq!(envelope["code"], crate::error_codes::ERR_CONFLICT);
+        assert_eq!(envelope["operation_id"], "operation-original");
+        assert_eq!(envelope["message"], "Operation requires recovery");
+        assert_eq!(envelope["success"], false);
+    }
     #[test]
     fn legacy_and_stream_contracts_are_explicit() {
         for path in [

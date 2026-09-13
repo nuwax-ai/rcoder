@@ -183,3 +183,5 @@ grpc.status.vnc_backend_not_ready: "noVNC 代理就绪，但 Xvnc 后端（5900�
 
 
 error.hot_deploy_env_change: "热部署不能变更业务环境变量，请使用 pod 模式"
+
+error.userapp_wait_timeout: "等待开发容器超时；已受理的操作可能仍在执行"

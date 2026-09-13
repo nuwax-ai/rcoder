@@ -13,6 +13,8 @@ use crate::ContainerRuntime;
 /// Container runtime errors
 #[derive(Error, Debug)]
 pub enum ContainerRuntimeError {
+    #[error(transparent)]
+    OperationInProgress(Box<shared_types::UserAppOperationInProgress>),
     #[error("Runtime request rejected: {0}")]
     RequestRejected(shared_types::RuntimeRequestRejection),
     #[error("Application preparation failed before replacement: {0}")]

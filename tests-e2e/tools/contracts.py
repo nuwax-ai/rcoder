@@ -93,3 +93,39 @@ REQUIRED['docker_deletion_identity_contract'] |= {
     'Docker lifecycle process completed', 'Q01 real Docker test executed',
     'Q01 Docker replacement and volume identity proved',
 }
+
+# New userApp persistence contracts are required independently of Agent PG tests.
+from storage_contract_cases import SQLITE_TARGETS
+REQUIRED['pg_storage_lifecycle_contract'].add('PG userApp transactions and restart')
+REQUIRED['sqlite_storage_lifecycle_contract'] = {
+    'SQLite contract process completed', 'SQLite frozen cases present',
+    *('SQLite ' + case for case in SQLITE_TARGETS),
+}
+
+REQUIRED['sqlite_compose_recreation_contract'] = {'SQLite contract process completed'} | {
+    f'SQLite Compose {index} {step}' for index in range(3) for step in (
+        'configuration', 'first-open convergence', 'one builder identity', 'HTTP persisted', 'recreated identity', 'invalid startup rejected', 'owned cleanup',
+    )
+}
+
+from concurrency_contract import CASES as CONCURRENCY_CASES
+REQUIRED['userapp_concurrency_component_contract'] = {'Concurrency contract process completed'} | {
+    'Concurrency ' + case for cases in CONCURRENCY_CASES.values() for case in cases
+}
+
+REQUIRED['native_terminal_release_crash_contract'] = {
+    'Native contract process completed', 'Native terminal committed before release',
+    'Native worker terminated by SIGKILL', 'Native terminal retry not executed again',
+    'Native unreceipted marker not reclaimed', 'Native owned process cleanup',
+}
+
+REQUIRED['docker_runtime_crash_recovery_contract'] = {'Docker crash contract process completed'} | {
+    'Docker ' + mode + ' ' + step for mode in ('before_create', 'after_start') for step in (
+        'exact barrier established', 'SIGKILL observed', 'restart quarantines without replay', 'owned cleanup',
+    )
+}
+
+REQUIRED['userapp_dev_app_proxy_lazy_start'].update({
+    'lazy recreation removes only captured builder',
+    'lazy recreation records same-lifecycle replacement',
+})

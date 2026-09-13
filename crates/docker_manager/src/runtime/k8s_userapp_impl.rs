@@ -23,6 +23,15 @@ use super::kubernetes_runtime::{KubernetesRuntime, read_app_expose_env};
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 impl UserAppDeploymentRuntime for KubernetesRuntime {
+    async fn release_app_operation_receipt(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<()> {
+        self.release_captured_application_operation(context, receipt)
+            .await
+    }
+
     async fn acquire_app_operation(
         &self,
         app_id: &str,
@@ -283,6 +292,37 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         })
     }
 
+    async fn capture_app_mutation_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        expected_resource_version: Option<&str>,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        self.capture_stop_target(context, expected_resource_version)
+            .await
+    }
+
+    async fn restart_app_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.restart_captured_target(target).await
+    }
+
+    async fn start_app_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.start_captured_target(target).await
+    }
+
+    async fn stop_app_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        wake_on_traffic: bool,
+    ) -> ContainerRuntimeResult<()> {
+        self.stop_captured_target(target, wake_on_traffic).await
+    }
+
     async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
         self.scale_app(app_id, replicas).await
     }
@@ -295,6 +335,14 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         self.patch_app_recycle_policy(app_id, recycle_enabled, idle_timeout_seconds)
             .await
+    }
+
+    async fn patch_app_policy_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        policy: &shared_types::UserAppRuntimePolicy,
+    ) -> ContainerRuntimeResult<()> {
+        self.patch_captured_policy(target, policy).await
     }
 
     async fn patch_wake_on_traffic(

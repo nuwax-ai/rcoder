@@ -6,12 +6,18 @@
 //! 构建任务本体在 agent-runner 容器内 file-server（`/api/v1/userapp/build` + tasks 查询），
 //! rcoder 不再做发布任务编排（旧 publish 任务体系已随 `/api/v1/userapp/publish` 接口族删除）。
 
+pub(crate) mod adoption;
+pub(crate) mod control;
+mod creation;
 mod dev_cleanup;
 mod dev_locator;
 mod lifecycle;
+mod recovery;
+pub(crate) mod retry;
 
 pub use dev_cleanup::UserappDevResourcesCleanup;
 pub use dev_locator::UserappDevLocator;
+pub(crate) use recovery::start_recovery;
 
 use std::sync::{Arc, Weak};
 
@@ -38,7 +44,7 @@ pub(crate) enum RegistryRemediation {
     /// 刷新（治"注册表死 IP"本源），调用方继续使用返回的 info，**不杀不重建**
     /// （透传由本次请求定成败）。
     Alive(ContainerBasicInfo),
-    /// 容器 Stopped/不存在（或 runtime 查询失败）：走既有清注册重建路径。
+    /// Only an authoritative absent/stopped result permits the rebuild path.
     Gone,
 }
 
@@ -49,43 +55,12 @@ pub(crate) enum RegistryRemediation {
 pub(crate) async fn remediate_stale_registry(
     state: &AppState,
     app_id: &str,
-) -> RegistryRemediation {
-    let Ok(Some(rc)) = state
-        .runtime()
-        .find_container(app_id, &ServiceType::UserappBuilder)
-        .await
-    else {
-        // 查询失败与不存在同判 Gone：重建路径的同名清理已实时化（只删真实
-        // 存在的容器），双层防护下 runtime 瞬时故障不会误删活容器
-        return RegistryRemediation::Gone;
-    };
-    if rc.status != container_runtime_api::ContainerRuntimeStatus::Running {
-        return RegistryRemediation::Gone;
-    }
-    // Running：以 inspect 真实值刷新注册。注册缺失走重建（防御——调用方
-    // 语义上只在"注册命中但探活失败"时进入本函数）。
-    let Some(mut project) = state.get_project(app_id).map(|p| (*p).clone()) else {
-        return RegistryRemediation::Gone;
-    };
-    let Some(existing) = project.container_info() else {
-        return RegistryRemediation::Gone;
-    };
-    if let Some(updated) = refreshed_registration(&existing, &rc) {
-        project.set_container(Some(updated.clone()));
-        if let Err(e) = state.insert_project(app_id.to_string(), Arc::new(project)) {
-            tracing::warn!(
-                "[USERAPP_BUILDER] refresh registry from inspect failed: app_id={app_id}: {e:#}"
-            );
-        } else {
-            info!(
-                "[USERAPP_BUILDER] registry refreshed from inspect (container alive, probe failure was transient): app_id={app_id}, ip={}",
-                updated.container_ip
-            );
-        }
-        RegistryRemediation::Alive(updated)
-    } else {
-        // 与注册一致（探活失败是纯抖动，注册本来就没脏）：零写直接复用
-        RegistryRemediation::Alive(existing.clone())
+) -> Result<RegistryRemediation> {
+    let existing = registered_builder(state, app_id)
+        .ok_or_else(|| anyhow!("Builder registration changed during inspection: {app_id}"))?;
+    match cross_verify_registration(state, app_id, &existing).await? {
+        Some(info) => Ok(RegistryRemediation::Alive(info)),
+        None => Ok(RegistryRemediation::Gone),
     }
 }
 
@@ -117,6 +92,21 @@ pub(crate) async fn ensure_userapp_builder(
     app_id: &str,
     explicit_user_id: Option<&str>,
 ) -> Result<ContainerBasicInfo> {
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
+    within_builder_deadline(
+        deadline,
+        ensure_userapp_builder_until(state, app_id, explicit_user_id, deadline),
+    )
+    .await
+}
+
+pub(crate) async fn ensure_userapp_builder_until(
+    state: &AppState,
+    app_id: &str,
+    explicit_user_id: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<ContainerBasicInfo> {
     let _lifecycle = lifecycle::acquire(app_id).await;
     // 长度 Fail Fast（仅新建路径需要——注册命中说明历史上已建成，不受限）：
     // K8s 下 STS pod 的 controller-revision-hash label =
@@ -133,10 +123,18 @@ pub(crate) async fn ensure_userapp_builder(
             shared_types::USERAPP_APP_ID_MAX_LEN
         ));
     }
-    match registered_builder(state, app_id) {
-        Some(info) => Ok(info),
-        None => create_builder_and_register(state, app_id, explicit_user_id).await,
+    let owner = resolve_owner(
+        explicit_user_id,
+        state.app_service.get_app_owner(app_id).await?.as_deref(),
+    )?;
+    let identity = state.userapp_store.ensure_identity(app_id, &owner).await?;
+    if identity.current_operation_id.is_none()
+        && let Some(info) = registered_or_discovered_builder(state, app_id).await?
+        && let Some(verified) = cross_verify_registration(state, app_id, &info).await?
+    {
+        return Ok(verified);
     }
+    creation::ensure(state, app_id, &owner, _lifecycle, deadline).await
 }
 
 /// 探活自愈版 [`ensure_userapp_builder`]：注册命中后连容器 file-server 探活
@@ -154,23 +152,51 @@ pub(crate) async fn ensure_userapp_builder_probed(
     app_id: &str,
     explicit_user_id: Option<&str>,
 ) -> Result<(ContainerBasicInfo, bool)> {
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
+    within_builder_deadline(
+        deadline,
+        ensure_userapp_builder_probed_until(state, app_id, explicit_user_id, deadline),
+    )
+    .await
+}
+
+async fn ensure_userapp_builder_probed_until(
+    state: &AppState,
+    app_id: &str,
+    explicit_user_id: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<(ContainerBasicInfo, bool)> {
     let _lifecycle = lifecycle::acquire(app_id).await;
-    if let Some(info) = registered_builder(state, app_id) {
+    let owner = resolve_owner(
+        explicit_user_id,
+        state.app_service.get_app_owner(app_id).await?.as_deref(),
+    )?;
+    let identity = state.userapp_store.ensure_identity(app_id, &owner).await?;
+
+    if identity.current_operation_id.is_none()
+        && let Some(info) = registered_or_discovered_builder(state, app_id).await?
+    {
         let addr = dev_file_server_addr(state, &info);
         if probe_file_server(&addr).await {
             // 探活过 ≠ 归属正确：跨族污染形态下生产容器的 file-server 同样在
             // 60000 应答（探活恒过、remediation 永不触发）——追加归属交叉校验
-            if let Some(updated) = cross_verify_registration(state, app_id, &info).await {
+            if let Some(updated) = cross_verify_registration(state, app_id, &info).await? {
                 return Ok((updated, false));
             }
-            return Ok((info, false));
+            // Creation validates the runtime independently; do not erase a
+            // registration that may have changed while probing.
+            return Ok((
+                creation::ensure(state, app_id, &owner, _lifecycle, deadline).await?,
+                true,
+            ));
         }
         tracing::warn!(
             "[USERAPP_ENSURE] dev container probe failed (stale registry?), verifying container state: app_id={app_id}, addr={addr}"
         );
         // 先验容器真实状态再决定处置：Running 则保容器（探活失败是超时/未就绪
         // 抖动），只有真死才清注册重建——防误杀正在跑任务的容器
-        match remediate_stale_registry(state, app_id).await {
+        match remediate_stale_registry(state, app_id).await? {
             RegistryRemediation::Alive(info) => {
                 tracing::info!(
                     "[USERAPP_ENSURE] dev container alive on inspect, keep without rebuild: app_id={app_id}"
@@ -178,15 +204,64 @@ pub(crate) async fn ensure_userapp_builder_probed(
                 return Ok((info, false));
             }
             RegistryRemediation::Gone => {
-                // 就地清 container 字段而非 remove_project（保 PG project 行与会话映射）
-                state.clear_project_container_field(app_id);
-                let info = create_builder_and_register(state, app_id, explicit_user_id).await?;
+                // Publish a verified replacement only after durable creation.
+                let info = creation::ensure(state, app_id, &owner, _lifecycle, deadline).await?;
                 return Ok((info, true));
             }
         }
     }
-    let info = create_builder_and_register(state, app_id, explicit_user_id).await?;
+    let info = creation::ensure(state, app_id, &owner, _lifecycle, deadline).await?;
     Ok((info, true))
+}
+
+/// Covers all waiter work, including metadata/runtime reads before admission
+/// and physical identity verification after completion. Spawned creation owns
+/// its lease independently and is not cancelled by dropping this waiter.
+async fn within_builder_deadline<T>(
+    deadline: tokio::time::Instant,
+    work: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(shared_types::UserAppWaitTimeout { operation_id: None }.into());
+    }
+    tokio::time::timeout_at(deadline, work)
+        .await
+        .map_err(|_| shared_types::UserAppWaitTimeout { operation_id: None })?
+}
+
+/// Preserve typed lifecycle failures through anyhow context into HTTP envelopes.
+/// Never classify an operation by searching its formatted error text.
+pub(crate) fn control_error(error: &anyhow::Error) -> shared_types::AppError {
+    if let Some(control) = error.downcast_ref::<shared_types::BuilderControlError>() {
+        return shared_types::AppError::with_message(
+            shared_types::error_codes::ERR_BACKEND_ERROR,
+            control.message.clone(),
+        )
+        .with_operation_id(control.operation_id.clone());
+    }
+    if let Some(timeout) = error.downcast_ref::<shared_types::UserAppWaitTimeout>() {
+        let response = shared_types::AppError::with_message(
+            shared_types::error_codes::ERR_USERAPP_WAIT_TIMEOUT,
+            "Builder ensure deadline exceeded; the accepted operation may still be running",
+        );
+        return match &timeout.operation_id {
+            Some(id) => response.with_operation_id(id.clone()),
+            None => response,
+        };
+    }
+    if let Some(shared_types::UserAppStoreError::OperationInProgress(id)) =
+        error.downcast_ref::<shared_types::UserAppStoreError>()
+    {
+        return shared_types::AppError::with_message(
+            shared_types::error_codes::ERR_CONFLICT,
+            "A conflicting application operation is in progress",
+        )
+        .with_operation_id(id.clone());
+    }
+    shared_types::AppError::with_message(
+        shared_types::error_codes::ERR_BACKEND_ERROR,
+        format!("Ensure userApp dev container failed: {error:#}"),
+    )
 }
 
 /// 探活通过后的**跨族污染交叉校验**（补"探活失败才自愈"的触发缺口）。
@@ -197,7 +272,7 @@ pub(crate) async fn ensure_userapp_builder_probed(
 /// 文件族 60000 则是"错容器成功"更隐蔽）。此处以带类型分流的
 /// `find_container` 真实值与注册值比对：不一致即以 inspect 值刷新注册
 /// （复用 [`refreshed_registration`]），把自愈触发从"探活失败"扩展到
-/// "归属不符"。find 失败/非 Running 时不推翻注册（探活已过的条目维持现状）。
+/// "归属不符"。查询失败返回错误；权威不存在/非 Running 返回 None，禁止复用旧地址。
 ///
 /// 成本：一次 pods().get（K8s 单 get，毫秒级）。调用方为低频管理面
 /// （ensure_probed）与热路径的 30s 探活缓存 miss 分支，频率受控。
@@ -205,35 +280,52 @@ pub(crate) async fn cross_verify_registration(
     state: &AppState,
     app_id: &str,
     registered: &ContainerBasicInfo,
-) -> Option<ContainerBasicInfo> {
-    let Ok(Some(rc)) = state
+) -> Result<Option<ContainerBasicInfo>> {
+    let Some(rc) = state
         .runtime()
         .find_container(app_id, &ServiceType::UserappBuilder)
         .await
+        .context("inspect builder registration")?
     else {
-        return None;
+        return Ok(None);
     };
+    validate_builder_identity(app_id, &rc)?;
+    let owner = state
+        .app_service
+        .get_app_owner(app_id)
+        .await?
+        .ok_or_else(|| anyhow!("Builder owner metadata is unavailable: {app_id}"))?;
+    if rc.user_id.as_deref() != Some(owner.as_str()) {
+        return Err(anyhow!("Builder runtime ownership conflict: {app_id}"));
+    }
+    adoption::verify_live_builder(state, app_id, &rc.container_id).await?;
     if rc.status != container_runtime_api::ContainerRuntimeStatus::Running {
-        return None;
+        return Ok(None);
     }
-    let updated = refreshed_registration(registered, &rc)?;
+    let Some(updated) = refreshed_registration(registered, &rc) else {
+        return Ok(Some(registered.clone()));
+    };
     if let Some(mut project) = state.get_project(app_id).map(|p| (*p).clone()) {
+        project.set_service_type(Some(ServiceType::UserappBuilder));
         project.set_container(Some(updated.clone()));
-        if let Err(e) = state.insert_project(app_id.to_string(), Arc::new(project)) {
-            tracing::warn!(
-                "[USERAPP_BUILDER] refresh contaminated registry failed: app_id={app_id}: {e}"
-            );
-            // 写回失败也返回新值——本次请求路由正确比注册表持久一致更紧要，
-            // 下一次校验会再试写
-            return Some(updated);
-        }
+        state
+            .insert_project(app_id.to_string(), Arc::new(project))
+            .context("persist verified builder registration")?;
     }
-    tracing::warn!(
-        "[USERAPP_BUILDER] cross-family registry contamination self-healed: app_id={app_id}, registered={} -> actual={}",
-        registered.container_name,
-        updated.container_name
-    );
-    Some(updated)
+    info!(app_id, container_id = %updated.container_id, "Builder registration refreshed from authoritative runtime");
+    Ok(Some(updated))
+}
+
+fn validate_builder_identity(
+    app_id: &str,
+    actual: &container_runtime_api::RuntimeContainerInfo,
+) -> Result<()> {
+    if actual.service_type.as_ref() != Some(&ServiceType::UserappBuilder)
+        || actual.identity_key() != Some(app_id)
+    {
+        return Err(anyhow!("Builder runtime identity conflict: {app_id}"));
+    }
+    Ok(())
 }
 
 /// 开发容器 file-server 轻量探活（连接失败/非 2xx 均不可用）。
@@ -264,19 +356,105 @@ pub(crate) fn registered_builder(state: &AppState, app_id: &str) -> Option<Conta
     state.projects.get(app_id).and_then(|p| p.container_info())
 }
 
-/// 创建 UserappBuilder(幂等)并注册进 state.projects,返回容器信息。
+/// Registry misses perform an authoritative read before creating anything.
+async fn registered_or_discovered_builder(
+    state: &AppState,
+    app_id: &str,
+) -> Result<Option<ContainerBasicInfo>> {
+    if let Some(info) = registered_builder(state, app_id) {
+        return Ok(Some(info));
+    }
+    let Some(actual) = state
+        .runtime()
+        .find_container(app_id, &ServiceType::UserappBuilder)
+        .await
+        .context("discover existing builder")?
+    else {
+        return Ok(None);
+    };
+    validate_builder_identity(app_id, &actual)?;
+    let owner = state
+        .app_service
+        .get_app_owner(app_id)
+        .await?
+        .ok_or_else(|| anyhow!("Builder owner metadata unavailable: {app_id}"))?;
+    if actual.user_id.as_deref() != Some(owner.as_str()) {
+        return Err(anyhow!("Builder runtime ownership conflict: {app_id}"));
+    }
+    if actual.status != container_runtime_api::ContainerRuntimeStatus::Running {
+        return Ok(None);
+    }
+    let info = ContainerBasicInfo {
+        container_id: actual.container_id,
+        container_name: actual.container_name,
+        container_ip: actual.container_ip.clone(),
+        internal_port: AGENT_FILE_SERVER_PORT,
+        external_port: 0,
+        project_id: app_id.into(),
+        status: String::from(actual.status),
+        created_at: actual.created_at,
+        service_url: format!("http://{}:{}", actual.container_ip, AGENT_FILE_SERVER_PORT),
+    };
+    adoption::verify_live_builder(state, app_id, &info.container_id).await?;
+    register_builder(state, app_id, &owner, &info)?;
+    Ok(Some(info))
+}
+
+fn register_builder(
+    state: &AppState,
+    app_id: &str,
+    owner: &str,
+    info: &ContainerBasicInfo,
+) -> Result<()> {
+    let mut project = state
+        .get_project(app_id)
+        .map(|old| (*old).clone())
+        .unwrap_or_else(|| ProjectAndContainerInfo::new(app_id.to_owned()));
+    project.set_service_type(Some(ServiceType::UserappBuilder));
+    project.set_user_id(Some(owner.into()));
+    project.set_container(Some(info.clone()));
+    state
+        .insert_project(app_id.into(), Arc::new(project))
+        .context("register verified UserApp builder")
+}
+
+async fn confirm_builder_ready(
+    state: &AppState,
+    app_id: &str,
+    info: ContainerBasicInfo,
+    deadline: tokio::time::Instant,
+) -> Result<ContainerBasicInfo> {
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            if let Some(actual) = cross_verify_registration(state, app_id, &info).await? {
+                if actual.container_id != info.container_id {
+                    return Err(anyhow!("Builder resource replaced before readiness"));
+                }
+                if probe_file_server(&dev_file_server_addr(state, &actual)).await {
+                    return Ok(actual);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .context("Builder readiness deadline exceeded")?
+}
+
+/// Create a builder without publishing its registration before the confirmation deadline.
 ///
 /// 直接调 `runtime.create_container`(UserappBuilder → `create_agent_container`),
 /// **不走 ComputerContainerManager**(避免 ComputerAgentRunner 专属的 lazy_migrate)。
-async fn create_builder_and_register(
+async fn create_builder_inner(
     state: &AppState,
     app_id: &str,
     explicit_user_id: Option<&str>,
+    execution_context: shared_types::UserAppExecutionContext,
 ) -> Result<ContainerBasicInfo> {
     // owner 解析三档：显式传（请求入参）> userapp_metadata.owner（create-workspace/
     // start 注册落库）> fail-fast 报错。绝不兜底 app_id 兼任——旧兜底会把宿主树
     // 挂成 dev/{app_id}/{app_id} 孤儿目录（数据落错树不可回收，且对调用方不可见）。
-    let metadata_owner = state.app_service.get_app_owner(app_id).await;
+    let metadata_owner = state.app_service.get_app_owner(app_id).await?;
     let owner_user_id =
         resolve_owner(explicit_user_id, metadata_owner.as_deref()).with_context(|| {
             format!("cannot resolve owner user_id for app {app_id}; pass user_id explicitly")
@@ -284,33 +462,22 @@ async fn create_builder_and_register(
     // UserappBuilder identifier = app_id（值经 project_id 槽位进容器基建——
     // state.projects/ContainerCreateParams 共用 project 键空间）；挂载由
     // mounts/k8s_agent_create auto-inject 统一组装（dev 四目录压平）。
-    let params = ContainerCreateParams::builder()
+    let bound_target = adoption::capture_bound_target(state, &execution_context).await?;
+    let mut params = ContainerCreateParams::builder()
+        .execution_context(execution_context)
         .project_id(app_id.to_string())
-        .user_id(owner_user_id)
+        .user_id(owner_user_id.clone())
         .service_type(ServiceType::UserappBuilder)
         .storage_size(DEFAULT_BUILDER_STORAGE_SIZE)
         .build();
+
+    params.resource_binding = bound_target.resource_binding;
 
     let container_info = state
         .runtime()
         .create_container(params)
         .await
         .context("ensure UserappBuilder failed")?;
-
-    // 注册到 state.projects(后续转发/部署据 app_id 查 container_name/ip)。
-    let project_info = if let Some(existing) = state.get_project(app_id) {
-        let mut info = (*existing).clone();
-        info.set_container(Some(container_info.clone()));
-        info
-    } else {
-        let mut info = ProjectAndContainerInfo::new(app_id.to_string());
-        info.set_service_type(Some(ServiceType::UserappBuilder));
-        info.set_container(Some(container_info.clone()));
-        info
-    };
-    state
-        .insert_project(app_id.to_string(), Arc::new(project_info))
-        .context("register UserappBuilder to projects failed")?;
 
     info!(
         "[USERAPP_BUILDER] UserappBuilder ensured: app_id={}, container={}, ip={}",
@@ -324,13 +491,18 @@ async fn create_builder_and_register(
 /// 空白字符串视为未传（pod 分派层 body 字段可能携空串）。
 /// cache/clean 的 userApp 分派共用（owner 三档同源）。
 pub(crate) fn resolve_owner(explicit: Option<&str>, metadata: Option<&str>) -> Result<String> {
-    if let Some(uid) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        return Ok(uid.to_string());
+    let explicit = explicit.map(str::trim).filter(|s| !s.is_empty());
+    let metadata = metadata.map(str::trim).filter(|s| !s.is_empty());
+    if let (Some(requested), Some(owner)) = (explicit, metadata)
+        && requested != owner
+    {
+        return Err(anyhow!("Application ownership conflict"));
     }
-    if let Some(uid) = metadata.map(str::trim).filter(|s| !s.is_empty()) {
-        return Ok(uid.to_string());
-    }
-    Err(anyhow!("missing user_id"))
+    let owner = metadata
+        .or(explicit)
+        .ok_or_else(|| anyhow!("missing user_id"))?;
+    shared_types::validate_identifier(owner, "user_id").map_err(anyhow::Error::msg)?;
+    Ok(owner.to_owned())
 }
 
 /// 供 bin 装配（main.rs）构造 Pingora 代理的 dev 容器懒启动回调
@@ -347,9 +519,10 @@ mod tests {
     #[test]
     fn resolve_owner_prefers_explicit_then_metadata_then_fails() {
         // 显式传优先（与 metadata 冲突时显式赢）
+        assert!(resolve_owner(Some("u-explicit"), Some("u-meta")).is_err());
         assert_eq!(
-            resolve_owner(Some("u-explicit"), Some("u-meta")).unwrap(),
-            "u-explicit"
+            resolve_owner(Some("u-meta"), Some("u-meta")).unwrap(),
+            "u-meta"
         );
         // 显式空白 → 降级 metadata
         assert_eq!(resolve_owner(Some("  "), Some("u-meta")).unwrap(), "u-meta");
@@ -434,5 +607,145 @@ mod remediation_tests {
     fn refreshed_registration_updates_on_id_change() {
         let existing = registered("192.168.97.8", "id-old");
         assert!(refreshed_registration(&existing, &inspected("192.168.97.8", "id-new")).is_some());
+    }
+}
+
+#[cfg(test)]
+mod ownership_regressions {
+    use super::*;
+    #[test]
+    fn resolving_owner_never_overwrites_a_different_registered_owner() {
+        assert!(resolve_owner(Some("replacement-owner"), Some("original-owner")).is_err());
+        assert!(resolve_owner(Some("../foreign"), None).is_err());
+        assert_eq!(
+            resolve_owner(Some(" original-owner "), Some("original-owner")).expect("same owner"),
+            "original-owner"
+        );
+    }
+    #[test]
+    fn builder_validation_uses_official_identity_priority_and_service_family() {
+        let mut actual = container_runtime_api::RuntimeContainerInfo {
+            container_id: "id".into(),
+            container_name: "builder".into(),
+            container_ip: "127.0.0.1".into(),
+            status: container_runtime_api::ContainerRuntimeStatus::Running,
+            created_at: chrono::Utc::now(),
+            env_vars: None,
+            service_type: Some(ServiceType::UserappBuilder),
+            project_id: None,
+            user_id: Some("owner".into()),
+            pod_id: None,
+            app_id: Some("app".into()),
+        };
+        assert!(validate_builder_identity("app", &actual).is_ok());
+        actual.pod_id = Some("different-pod".into());
+        assert!(validate_builder_identity("app", &actual).is_err());
+        actual.pod_id = None;
+        actual.service_type = Some(ServiceType::Userapp);
+        assert!(validate_builder_identity("app", &actual).is_err());
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::within_builder_deadline;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn expired_deadline_does_not_poll_new_work() {
+        let executed = AtomicBool::new(false);
+        let result = within_builder_deadline(Instant::now(), async {
+            executed.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!executed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nested_waits_share_one_deadline() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(10);
+        let result = within_builder_deadline(deadline, async {
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            within_builder_deadline(deadline, async {
+                tokio::time::sleep(Duration::from_secs(7)).await;
+                Ok(())
+            })
+            .await
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(Instant::now() - started, Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiter_timeout_does_not_cancel_an_accepted_worker() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = completed.clone();
+        let worker = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            worker_completed.store(true, Ordering::SeqCst);
+        });
+        let result = within_builder_deadline(
+            Instant::now() + Duration::from_secs(5),
+            std::future::pending::<anyhow::Result<()>>(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!completed.load(Ordering::SeqCst));
+        worker.await.expect("accepted worker completion");
+        assert!(completed.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod control_error_tests {
+    use super::control_error;
+    use axum::{body::to_bytes, response::IntoResponse as _};
+
+    #[tokio::test]
+    async fn wrapped_timeout_preserves_code_and_operation_identity() {
+        let error = anyhow::Error::new(shared_types::UserAppWaitTimeout {
+            operation_id: Some("accepted-builder".into()),
+        })
+        .context("upstream lookup");
+        let response = control_error(&error).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            envelope["code"],
+            shared_types::error_codes::ERR_USERAPP_WAIT_TIMEOUT
+        );
+        assert_eq!(envelope["operation_id"], "accepted-builder");
+        assert_eq!(envelope["success"], false);
+    }
+
+    #[tokio::test]
+    async fn conflict_classification_requires_a_typed_cause() {
+        let error = anyhow::Error::new(shared_types::UserAppStoreError::OperationInProgress(
+            "owner-operation".into(),
+        ))
+        .context("admission");
+        let response = control_error(&error).into_response();
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(envelope["code"], shared_types::error_codes::ERR_CONFLICT);
+        assert_eq!(envelope["operation_id"], "owner-operation");
+        let text_only = anyhow::anyhow!("Application operation in progress: owner-operation");
+        let response = control_error(&text_only).into_response();
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            envelope["code"],
+            shared_types::error_codes::ERR_BACKEND_ERROR
+        );
+        assert!(envelope.get("operation_id").is_none());
     }
 }

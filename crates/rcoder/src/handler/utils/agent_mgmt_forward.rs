@@ -543,11 +543,13 @@ mod tests {
             code,
             internal_message,
             i18n_key,
+            operation_id,
         } = &err
         {
             assert_eq!(code, ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED);
             assert!(internal_message.is_none());
             assert!(i18n_key.is_none());
+            assert!(operation_id.is_none());
         } else {
             panic!("expected Structured error, got {err:?}");
         }

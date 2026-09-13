@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use garde::Validate as _;
-use tracing::{instrument, warn};
+use tracing::instrument;
 
 use crate::models::*;
 use crate::service::AppService;
@@ -26,9 +26,10 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn list_app_runtimes(&self, user_id: &str) -> AppResult<Vec<AppRuntimeInfo>> {
         let statuses = self.list_deployments_cached().await?;
+        let metadata = self.metadata.snapshot().await?;
         let (owned, unowned): (Vec<_>, Vec<_>) = statuses.into_iter().partition(|s| {
-            self.metadata
-                .lookup(&s.app_id)
+            metadata
+                .get(&s.app_id)
                 .is_some_and(|m| m.user_id.as_deref() == Some(user_id))
         });
         if !unowned.is_empty() {
@@ -40,7 +41,10 @@ impl AppService {
         }
         Ok(owned
             .into_iter()
-            .map(|s| self.build_runtime_info(s))
+            .map(|s| {
+                let owner = metadata.get(&s.app_id).and_then(|m| m.user_id.as_deref());
+                self.build_runtime_info(s, owner)
+            })
             .collect())
     }
 
@@ -48,9 +52,13 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn list_all_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
         let statuses = self.list_deployments_cached().await?;
+        let metadata = self.metadata.snapshot().await?;
         Ok(statuses
             .into_iter()
-            .map(|s| self.build_runtime_info(s))
+            .map(|s| {
+                let owner = metadata.get(&s.app_id).and_then(|m| m.user_id.as_deref());
+                self.build_runtime_info(s, owner)
+            })
             .collect())
     }
 
@@ -58,6 +66,16 @@ impl AppService {
     /// TTL 内直接返回快照；过期穿透查询——持 tokio Mutex 期间并发请求等待，
     /// 天然 single-flight 防击穿（只有一个请求打到 daemon）；穿透带超时。
     async fn list_deployments_cached(
+        &self,
+    ) -> AppResult<Vec<container_runtime_api::DeploymentStatus>> {
+        let mut statuses = self.list_raw_deployments_cached().await?;
+        // Do not hold the runtime-cache mutex while reading lifecycle storage.
+        // Applied Docker policies must be fresh even when runtime status is cached.
+        self.overlay_stored_runtime_policies(&mut statuses).await?;
+        Ok(statuses)
+    }
+
+    async fn list_raw_deployments_cached(
         &self,
     ) -> AppResult<Vec<container_runtime_api::DeploymentStatus>> {
         let mut guard = self.deploy_list_cache.lock().await;
@@ -106,10 +124,10 @@ impl AppService {
             AppOperationError::Validation(msg)
         })?;
         let mut items = self.list_app_runtimes(request.user_id.trim()).await?;
+        let metadata = self.metadata.snapshot().await?;
 
         // 过滤：status/app_ids 为运行时字段直接生效；name/created_at 需业务元数据
-        // （集群不持有），仅 PG 模式（metadata 持久化已注入）经内存 join 生效，
-        // 纯内存模式维持忽略 + warn（旧行为）。
+        // （集群不持有），SQLite 和 PG 均使用权威存储快照进行关联过滤。
         if let Some(filters) = &request.filters {
             if let Some(status) = &filters.status {
                 items.retain(|app| status.contains(&app.status));
@@ -118,7 +136,7 @@ impl AppService {
                 items.retain(|app| app_ids.contains(&app.app_id));
             }
             if filters.name.is_some() || filters.created_at.is_some() {
-                if self.metadata.persistence().is_some() {
+                {
                     let name = filters.name.as_deref();
                     // DateRange RFC3339 解析失败 → 400（过滤已生效，非法参数应被告知）
                     let range = match &filters.created_at {
@@ -144,7 +162,7 @@ impl AppService {
                         None => None,
                     };
                     items.retain(|app| {
-                        let Some(meta) = self.metadata.lookup(&app.app_id) else {
+                        let Some(meta) = metadata.get(&app.app_id) else {
                             // 无元数据记录的 app（非 PG 时代创建）不满足 name/created_at 过滤
                             return false;
                         };
@@ -155,10 +173,6 @@ impl AppService {
                                 meta.created_at >= start && meta.created_at <= end
                             })
                     });
-                } else {
-                    warn!(
-                        "[APP] query_apps name/created_at filters require business metadata (PG mode), ignored"
-                    );
                 }
             }
         }
@@ -170,25 +184,17 @@ impl AppService {
                     items.sort_by(|a, b| a.app_id.cmp(&b.app_id));
                 }
                 "name" => {
-                    if self.metadata.persistence().is_none() {
-                        warn!("[APP] sort_by=name requires business metadata (PG mode), no-op");
-                    }
                     items.sort_by_key(|app| {
-                        self.metadata
-                            .lookup(&app.app_id)
-                            .and_then(|m| m.name)
+                        metadata
+                            .get(&app.app_id)
+                            .and_then(|m| m.name.clone())
                             .unwrap_or_default()
                     });
                 }
                 "created_at" => {
-                    if self.metadata.persistence().is_none() {
-                        warn!(
-                            "[APP] sort_by=created_at requires business metadata (PG mode), no-op"
-                        );
-                    }
                     // (缺元数据排最后, 时间升序)：bool false < true 保证有元数据的排前
                     items.sort_by_key(|app| {
-                        let meta = self.metadata.lookup(&app.app_id);
+                        let meta = metadata.get(&app.app_id);
                         (meta.is_none(), meta.map(|m| m.created_at))
                     });
                 }
@@ -247,7 +253,8 @@ impl AppService {
     pub async fn get_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
         let status = self.fetch_runtime_status_or_err(app_id).await?;
-        Ok(self.build_runtime_info(status))
+        let metadata = self.metadata.lookup(app_id).await?;
+        Ok(self.build_runtime_info(status, metadata.as_ref().and_then(|m| m.user_id.as_deref())))
     }
 }
 
@@ -257,6 +264,77 @@ mod tests {
     use crate::test_support::{MockRuntime, test_service};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+
+    async fn commit_policy_fixture(service: &AppService, app_id: &str, seconds: u64) {
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let policy = shared_types::UserAppRuntimePolicy {
+            idle_timeout_seconds: Some(seconds),
+            ..Default::default()
+        };
+        let operation = crate::service::OwnedOperation::admit(
+            service.metadata.store.clone(),
+            shared_types::UserAppAdmission {
+                runtime_policy_on_success: None,
+                app_id: app_id.into(),
+                user_id: "policy-owner".into(),
+                lifecycle_id: None,
+                request_id: Some(operation_id.clone()),
+                operation_id,
+                request_fingerprint: "a".repeat(64),
+                kind: shared_types::UserAppOperationKind::SetRecyclePolicy,
+                command: Some(shared_types::UserAppControlCommand::SetRecyclePolicy { policy }),
+                metadata: None,
+            },
+        )
+        .await
+        .expect("fixture admission");
+        operation.succeed().await.expect("fixture applied policy");
+    }
+
+    #[tokio::test]
+    async fn cached_runtime_list_reads_fresh_policy_across_storage_pages() {
+        let directory = tempfile::tempdir().expect("directory");
+        let runtime = Arc::new(MockRuntime::default());
+        let service = test_service(directory.path(), runtime.clone()).await;
+        for index in 0..129 {
+            let app_id = format!("policy-page-{index:03}");
+            deployed(&runtime, &app_id);
+            service
+                .metadata
+                .store
+                .ensure_identity(&app_id, "policy-owner")
+                .await
+                .expect("identity");
+        }
+        commit_policy_fixture(&service, "policy-page-128", 450).await;
+        let first = service.list_deployments_cached().await.expect("first list");
+        assert_eq!(
+            first
+                .iter()
+                .find(|status| status.app_id == "policy-page-128")
+                .expect("last page")
+                .idle_timeout_seconds,
+            Some(450)
+        );
+        commit_policy_fixture(&service, "policy-page-128", 900).await;
+        let second = service
+            .list_deployments_cached()
+            .await
+            .expect("cached runtime list");
+        assert_eq!(
+            second
+                .iter()
+                .find(|status| status.app_id == "policy-page-128")
+                .expect("updated policy")
+                .idle_timeout_seconds,
+            Some(900)
+        );
+        assert_eq!(
+            runtime.list_calls.load(Ordering::SeqCst),
+            1,
+            "policy refresh does not refetch runtime state"
+        );
+    }
 
     fn deployed(runtime: &MockRuntime, app_id: &str) {
         runtime.deployments.insert(
@@ -276,7 +354,8 @@ mod tests {
     async fn owned_list(svc: &AppService, app_id: &str, user_id: &str) -> usize {
         svc.metadata
             .record(app_id, None, Some(user_id.to_string()), None, None)
-            .await;
+            .await
+            .expect("metadata registration");
         svc.list_app_runtimes(user_id).await.unwrap().len()
     }
 
@@ -286,7 +365,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MockRuntime::default());
         deployed(&runtime, "app-a");
-        let svc = test_service(tmp.path(), runtime.clone());
+        let svc = test_service(tmp.path(), runtime.clone()).await;
 
         let r1 = owned_list(&svc, "app-a", "u1").await;
         let r2 = owned_list(&svc, "app-a", "u1").await;
@@ -305,7 +384,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MockRuntime::default());
         deployed(&runtime, "app-a");
-        let svc = test_service(tmp.path(), runtime.clone());
+        let svc = test_service(tmp.path(), runtime.clone()).await;
 
         owned_list(&svc, "app-a", "u1").await;
         deployed(&runtime, "app-b"); // 模拟并发新建（绕过 service 写路径）
@@ -313,7 +392,8 @@ mod tests {
         // 两个 app 都注册给同一 owner 后对账
         svc.metadata
             .record("app-b", None, Some("u1".to_string()), None, None)
-            .await;
+            .await
+            .expect("metadata registration");
         let r = svc.list_app_runtimes("u1").await.unwrap();
         assert_eq!(r.len(), 2, "invalidated cache must refetch");
         assert_eq!(runtime.list_calls.load(Ordering::Relaxed), 2);
@@ -325,7 +405,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MockRuntime::default());
         deployed(&runtime, "app-a");
-        let svc = test_service(tmp.path(), runtime.clone());
+        let svc = test_service(tmp.path(), runtime.clone()).await;
 
         owned_list(&svc, "app-a", "u1").await;
         // 把缓存时间戳拨回 TTL 之前，模拟过期
