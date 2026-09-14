@@ -198,6 +198,7 @@ impl KubernetesRuntime {
             // PVC resourceVersion 会被控制面（绑定/扩容/卷挂载记账）并发 bump，
             // 单发条件写对首个 PATCH 撞 409 过敏（K8s 实测抓出）。
             let mut attempts = 0u32;
+            let claim_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             let mut claim_uid: Option<String> = None;
             loop {
                 attempts += 1;
@@ -246,7 +247,13 @@ impl KubernetesRuntime {
                     .await
                 {
                     Ok(_) => break,
-                    Err(kube::Error::Api(conflict)) if conflict.code == 409 && attempts < 4 => {
+                    // spec §5：4 次/3 秒总预算——次数与总时限双限（GET/PATCH
+                    // 各自的等待时间计入预算，超时即上抛由上层裁决）。
+                    Err(kube::Error::Api(conflict))
+                        if conflict.code == 409
+                            && attempts < 4
+                            && std::time::Instant::now() < claim_deadline =>
+                    {
                         tracing::warn!(
                             pvc = %name,
                             attempt = attempts,
@@ -302,6 +309,15 @@ fn map_error(context: &str, error: kube::Error) -> Error {
     match &error {
         kube::Error::Api(response) if response.code == 409 => {
             Error::Conflict(format!("{context}: {error}"))
+        }
+        // 403 是 API server 的确定性拒绝（RBAC/准入），无在途结果——结构化
+        // 保留状态码供确定性分类；对外码不变（非 409 的 RuntimeRejected 仍
+        // 映射 ERR_BACKEND_ERROR，与旧 K8sError→Backend 一致）。
+        kube::Error::Api(response) if response.code == 403 => {
+            Error::RequestRejected(shared_types::RuntimeRequestRejection {
+                status: 403,
+                message: format!("{context}: {error}"),
+            })
         }
         _ => Error::K8sError(format!("{context}: {error}")),
     }

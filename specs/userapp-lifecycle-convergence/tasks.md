@@ -44,8 +44,11 @@ staging 目录+重启 cephfs nodeplugin+删陈旧 attachment+重启 k3s-agent（
 - create/deploy 族 RecoveryRequired 操作无自动对账入口（计划内明确范围外；
   claim 409 修复已消除主要触发源；测试库残留一条 incident 记录
   e2e-k8s-41a696d8e48f4eb9@RecoveryRequired，物理资源已清）
-- prod delete 后遗留的 legacy ConfigMap 操作锁需手工清（本次一例）
-- start(url) 部署的整请求级 request_id/operation_id 幂等（组合受理）仍未暴露
+- 旧形态 ConfigMap 操作锁需手工清（本次一例）
+- ~~start(url) 整请求级 request_id 幂等（组合受理）仍未暴露~~ **登记修正
+  （09-14 复核）**：deploy_control.rs 已实现整请求指纹 + replay_control +
+  checkpoint 存完整响应——单 Deploy 操作承载全部子步骤，幂等已成立；
+  后续批次补 e2e 断言固化与回放快路径前移（残留锁不挡已成功请求回放）
 
 ## 2026-09-14 用户要求移交 zcode
 

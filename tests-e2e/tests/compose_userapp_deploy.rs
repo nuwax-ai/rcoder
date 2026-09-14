@@ -137,6 +137,19 @@ async fn get_json_with_app(env: &Env, path: &str, app_id: &str) -> (reqwest::Sta
     (status, body)
 }
 
+/// docker inspect 读生产容器 Id（幂等重放不换容器的断言依据）。
+fn docker_inspect_id(container: &str) -> Option<String> {
+    let out = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{.Id}}", container])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
 fn trunc(v: &Value, n: usize) -> String {
     let s = v.to_string();
     s.chars().take(n).collect()
@@ -581,10 +594,11 @@ async fn deploy_and_verify_traffic(
         "{}/api/v1/userapp/static/{app}?release_id={release_id}&user_id={user}",
         rcoder_internal()
     );
+    let request_id = format!("cold-{app}");
     let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/{app}/start"),
-        json!({"user_id": user, "url": artifact_url, "release_id": release_id, "sha256": sha256}),
+        json!({"user_id": user, "url": artifact_url, "release_id": release_id, "sha256": sha256, "request_id": request_id}),
     )
     .await;
     let started = s.is_success() && http_ok(&b);
@@ -604,6 +618,66 @@ async fn deploy_and_verify_traffic(
         identity.is_ok(),
         identity.err().unwrap_or_default(),
     );
+
+    // D′：整请求 request_id 幂等——同 id 同参重放返回存储响应且不重新部署
+    // （容器 Id 不变）；同 id 异参拒绝；by-request 查询定位该 Deploy 操作。
+    let container_id_before = docker_inspect_id(&format!("rcoder-app-{app}"));
+    let (rs, rb) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/start"),
+        json!({"user_id": user, "url": artifact_url, "release_id": release_id, "sha256": sha256, "request_id": request_id}),
+    )
+    .await;
+    let replay_ok = rs.is_success()
+        && http_ok(&rb)
+        && rb["data"]["release_id"].as_str() == Some(release_id)
+        && rb["data"]["status"].as_str() == Some("running");
+    let container_id_after = docker_inspect_id(&format!("rcoder-app-{app}"));
+    report.assert_hard(
+        "start request_id 同参重放=存储响应且零重部署",
+        replay_ok && container_id_before.is_some() && container_id_before == container_id_after,
+        format!(
+            "HTTP {rs}, before={:?} after={:?}, body 截断: {}",
+            container_id_before
+                .as_deref()
+                .map(|id| &id[..12.min(id.len())]),
+            container_id_after
+                .as_deref()
+                .map(|id| &id[..12.min(id.len())]),
+            trunc(&rb, 160)
+        ),
+    );
+    let wrong_sha = format!("{}{}", "a".repeat(63), "1");
+    let (cs, cb) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/start"),
+        json!({"user_id": user, "url": artifact_url, "release_id": release_id, "sha256": wrong_sha, "request_id": request_id}),
+    )
+    .await;
+    report.assert_hard(
+        "start request_id 异参重用→ERR_CONFLICT",
+        cs.is_success()
+            && cb["code"].as_str() == Some("ERR_CONFLICT")
+            && cb["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("reused with different parameters")),
+        format!("HTTP {cs}, body 截断: {}", trunc(&cb, 160)),
+    );
+    let (qs, qb) = get_json(
+        env,
+        &format!(
+            "/api/v1/userapp/{app}/operations/by-request?user_id={user}&request_id={request_id}"
+        ),
+    )
+    .await;
+    report.assert_hard(
+        "operations/by-request 定位 Deploy 操作（Succeeded）",
+        qs.is_success()
+            && qb["data"]["kind"].as_str() == Some("StartDeployment")
+            && qb["data"]["state"].as_str() == Some("Succeeded"),
+        format!("HTTP {qs}, body 截断: {}", trunc(&qb, 160)),
+    );
+
     // 七路流量：next=/、react=/react、vue=/vue、四后端 readiness（strip_prefix 后路径）
     let probes: &[(&str, &str)] = &[
         ("next /", "/"),

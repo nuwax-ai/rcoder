@@ -50,6 +50,128 @@ pub enum ContainerRuntimeError {
 
     #[error("Container exec failed: {0}")]
     ContainerExecError(String),
+
+    /// A multi-stage creation chain aborted at [`CreationProgress::failed_at`].
+    /// The `source` preserves the original error for wire-faithful mapping;
+    /// `progress` carries the in-process orchestration knowledge (stages,
+    /// retained idempotent resources, rejection definitiveness) that upper
+    /// layers may use to prove the whole operation can safely finish as
+    /// Failed. This is NOT derived from remote observation.
+    #[error("Application creation aborted: {source}")]
+    CreationAborted {
+        progress: CreationProgress,
+        source: Box<ContainerRuntimeError>,
+    },
+}
+
+/// One stage of the K8s application creation chain, in execution order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum CreationStage {
+    /// Read-only capture of the current deployment identity (no write-capable
+    /// call exists at this stage).
+    #[default]
+    Capture,
+    /// Workspace PVC ensure: read-verify when the PVC exists, create only
+    /// when absent.
+    PvcEnsure,
+    /// Conditional storage-claim annotation writes (uid/resourceVersion
+    /// preconditions; may touch several PVCs in sequence).
+    StorageClaim,
+    /// Generation ConfigMap/Secret writes plus the conditional Deployment
+    /// submit. The first stage whose retained artifacts are not idempotent.
+    WriteGeneration,
+    /// Service publish.
+    ApplyService,
+}
+
+impl CreationStage {
+    /// Stages whose failure can never carry a whole-operation safe-finish
+    /// proof: once generation writes start, retained artifacts are no longer
+    /// idempotent and a definitive rejection of one request does not describe
+    /// the whole operation.
+    pub fn generation_started(self) -> bool {
+        matches!(self, Self::WriteGeneration | Self::ApplyService)
+    }
+}
+
+/// Cumulative progress of a creation chain up to its failure point. Recorded
+/// by the orchestrator as stages complete — in-process knowledge, never
+/// inferred from post-hoc remote reads (a late-landing in-flight request is
+/// invisible to observation, which is exactly why the proof below only relies
+/// on per-request definitive outcomes).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CreationProgress {
+    /// Stage whose request failed.
+    pub failed_at: CreationStage,
+    /// Whether the failing request itself returned a definitive rejection
+    /// (conditional-write precondition failure, explicit API denial, or local
+    /// validation before dispatch) rather than a timeout/transport/5xx whose
+    /// remote outcome remains pending.
+    pub definitive_rejection: bool,
+    /// Idempotent artifacts this operation may leave behind (PVC ensure /
+    /// claim annotations). Recorded explicitly so a safe failure never
+    /// masquerades as zero mutation.
+    pub retained_idempotent_resources: Vec<String>,
+}
+
+impl CreationProgress {
+    /// Whole-operation safe-finish predicate: the caller may settle the
+    /// operation as Failed (releasing fences) because every issued request
+    /// either completed or was definitively rejected, and no
+    /// generation-or-later stage was ever attempted.
+    pub fn safe_finish_ok(&self) -> bool {
+        if self.failed_at.generation_started() {
+            return false;
+        }
+        // Capture has no write-capable call: nothing was dispatched, so a
+        // lost response proves nothing is pending. Ensure/claim stages may
+        // dispatch writes, so only a definitive rejection counts.
+        self.failed_at == CreationStage::Capture || self.definitive_rejection
+    }
+
+    /// Human-readable retention summary (empty means nothing was attempted).
+    pub fn retained_summary(&self) -> String {
+        if self.retained_idempotent_resources.is_empty() {
+            "no remote writes were issued".to_string()
+        } else {
+            self.retained_idempotent_resources.join(", ")
+        }
+    }
+}
+
+impl ContainerRuntimeError {
+    /// Whether this error class represents a definitive rejection of the
+    /// request (nothing remains pending remotely), as opposed to
+    /// timeout/transport/5xx classes whose outcome may still land.
+    pub fn is_definitive_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::Conflict(_)
+                | Self::RequestRejected(_)
+                | Self::ConfigurationError(_)
+                | Self::ContainerNotFound(_)
+        )
+    }
+
+    /// True when this error is a creation abort carrying a whole-operation
+    /// safe-finish proof (see [`CreationProgress::safe_finish_ok`]).
+    pub fn creation_safe_finish(&self) -> bool {
+        matches!(
+            self,
+            Self::CreationAborted { progress, .. } if progress.safe_finish_ok()
+        )
+    }
+
+    /// Retention note for a safe finish; `None` when the abort does not
+    /// qualify (upper layers must not decorate unsafe failures with it).
+    pub fn creation_safe_finish_note(&self) -> Option<String> {
+        match self {
+            Self::CreationAborted { progress, .. } if progress.safe_finish_ok() => {
+                Some(progress.retained_summary())
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Result type for container operations
@@ -148,6 +270,93 @@ impl Default for AgentPodDiagnostic {
             waiting_reason: None,
             detail: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod creation_progress_tests {
+    use super::{ContainerRuntimeError, CreationProgress, CreationStage};
+
+    fn progress(failed_at: CreationStage, definitive: bool) -> CreationProgress {
+        CreationProgress {
+            failed_at,
+            definitive_rejection: definitive,
+            retained_idempotent_resources: Vec::new(),
+        }
+    }
+
+    /// 安全结束谓词矩阵：捕获阶段任意错误安全（无写能力调用被发出）；
+    /// ensure/claim 阶段仅确定性拒绝安全；generation 之后永不安全。
+    #[test]
+    fn safe_finish_matrix() {
+        // 捕获阶段：只读，无在途写——超时也算安全
+        assert!(progress(CreationStage::Capture, false).safe_finish_ok());
+        assert!(progress(CreationStage::Capture, true).safe_finish_ok());
+        // ensure/claim：确定性拒→安全；未知（超时/传输/5xx）→保持围栏
+        assert!(progress(CreationStage::PvcEnsure, true).safe_finish_ok());
+        assert!(!progress(CreationStage::PvcEnsure, false).safe_finish_ok());
+        assert!(progress(CreationStage::StorageClaim, true).safe_finish_ok());
+        assert!(!progress(CreationStage::StorageClaim, false).safe_finish_ok());
+        // generation 写面开始后：确定性拒也不构成整操作证明（保留物非幂等）
+        assert!(!progress(CreationStage::WriteGeneration, true).safe_finish_ok());
+        assert!(!progress(CreationStage::ApplyService, true).safe_finish_ok());
+    }
+
+    /// 确定性拒绝分类：条件写冲突/结构化拒绝/本地前置校验/404 是确定性；
+    /// 超时/连接/5xx/K8sError 字符串不可证。
+    #[test]
+    fn definitive_rejection_classification() {
+        assert!(ContainerRuntimeError::Conflict("precondition".into()).is_definitive_rejection());
+        assert!(
+            ContainerRuntimeError::RequestRejected(shared_types::RuntimeRequestRejection {
+                status: 403,
+                message: "denied".into()
+            })
+            .is_definitive_rejection()
+        );
+        assert!(
+            ContainerRuntimeError::ConfigurationError("local".into()).is_definitive_rejection()
+        );
+        assert!(ContainerRuntimeError::ContainerNotFound("gone".into()).is_definitive_rejection());
+        assert!(!ContainerRuntimeError::Timeout("pending".into()).is_definitive_rejection());
+        assert!(!ContainerRuntimeError::ConnectionError("lost".into()).is_definitive_rejection());
+        assert!(!ContainerRuntimeError::K8sError("503 text".into()).is_definitive_rejection());
+    }
+
+    /// 安全结束注记仅在证明成立时给出，且显式列出保留物（无保留物=
+    /// 「无远端写被发出」，不冒充零变更语义由清单自证）。
+    #[test]
+    fn safe_finish_note_gates_on_proof() {
+        let safe = ContainerRuntimeError::CreationAborted {
+            progress: CreationProgress {
+                failed_at: CreationStage::StorageClaim,
+                definitive_rejection: true,
+                retained_idempotent_resources: vec!["workspace pvc ensured: p1".into()],
+            },
+            source: Box::new(ContainerRuntimeError::Conflict("rejected".into())),
+        };
+        assert_eq!(
+            safe.creation_safe_finish_note().as_deref(),
+            Some("workspace pvc ensured: p1")
+        );
+        assert!(safe.creation_safe_finish());
+
+        let unsafe_abort = ContainerRuntimeError::CreationAborted {
+            progress: progress(CreationStage::StorageClaim, false),
+            source: Box::new(ContainerRuntimeError::Timeout("pending".into())),
+        };
+        assert_eq!(unsafe_abort.creation_safe_finish_note(), None);
+        assert!(!unsafe_abort.creation_safe_finish());
+
+        // 捕获阶段安全且无保留物：注记如实陈述「无远端写被发出」
+        let nothing_issued = ContainerRuntimeError::CreationAborted {
+            progress: progress(CreationStage::Capture, false),
+            source: Box::new(ContainerRuntimeError::ConnectionError("probe lost".into())),
+        };
+        assert_eq!(
+            nothing_issued.creation_safe_finish_note().as_deref(),
+            Some("no remote writes were issued")
+        );
     }
 }
 

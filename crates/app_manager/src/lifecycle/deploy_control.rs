@@ -45,6 +45,40 @@ impl DeployInput {
     }
 }
 
+/// 整请求指纹：完整 StartAppRequest 的规范化字节 sha256（对象键序无关）。
+/// 快路径与锁内受理共用，单一事实源。
+fn deploy_fingerprint(request: &StartAppRequest) -> AppResult<String> {
+    use sha2::Digest as _;
+    Ok(hex::encode(sha2::Sha256::digest(
+        shared_types::encode_userapp_intent(request)
+            .map_err(|_| AppOperationError::Backend("Encode deployment intent".into()))?,
+    )))
+}
+
+fn kind_from_restart(restart: bool) -> UserAppOperationKind {
+    if restart {
+        UserAppOperationKind::RestartDeployment
+    } else {
+        UserAppOperationKind::StartDeployment
+    }
+}
+
+fn control_request(request: &StartAppRequest) -> shared_types::UserAppControlRequest {
+    shared_types::UserAppControlRequest {
+        user_id: request.user_id.clone(),
+        lifecycle_id: request.lifecycle_id.clone(),
+        request_id: request.request_id.clone(),
+    }
+}
+
+/// 回放已成功操作的持久化完整响应（deployment_completed checkpoint）。
+fn decode_stored_deploy_result(
+    previous: &shared_types::UserAppOperationRecord,
+) -> AppResult<StartAppResult> {
+    serde_json::from_value(previous.checkpoint.clone())
+        .map_err(|_| AppOperationError::Backend("Stored deployment result is unavailable".into()))
+}
+
 impl AppService {
     pub(super) async fn deploy_controlled(
         &self,
@@ -81,28 +115,13 @@ impl AppService {
             .store
             .ensure_identity(app_id, &request.user_id)
             .await?;
-        use sha2::Digest as _;
-        let fingerprint = hex::encode(sha2::Sha256::digest(
-            shared_types::encode_userapp_intent(&request)
-                .map_err(|_| AppOperationError::Backend("Encode deployment intent".into()))?,
-        ));
-        let kind = if restart {
-            UserAppOperationKind::RestartDeployment
-        } else {
-            UserAppOperationKind::StartDeployment
-        };
-        let control = shared_types::UserAppControlRequest {
-            user_id: request.user_id.clone(),
-            lifecycle_id: request.lifecycle_id.clone(),
-            request_id: request.request_id.clone(),
-        };
+        let fingerprint = deploy_fingerprint(&request)?;
+        let kind = kind_from_restart(restart);
         if let Some(previous) = self
-            .replay_control(app_id, &control, kind, &fingerprint)
+            .replay_control(app_id, &control_request(&request), kind, &fingerprint)
             .await?
         {
-            return serde_json::from_value(previous.checkpoint).map_err(|_| {
-                AppOperationError::Backend("Stored deployment result is unavailable".into())
-            });
+            return decode_stored_deploy_result(&previous);
         }
         let operation_id = uuid::Uuid::new_v4().to_string();
         let input = self

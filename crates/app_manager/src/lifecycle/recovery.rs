@@ -23,6 +23,20 @@ impl AppService {
 
     /// Resume the same unclaimed operation; a retry never clears a runtime lease
     /// or invents missing command inputs from current deployment configuration.
+    /// 只读观察围栏应用的运行时实况（诊断用；观察结果不构成任何裁决依据）。
+    async fn observe_uncertain_runtime(&self, app_id: &str) -> String {
+        match self.runtime.get_deployment_status(app_id).await {
+            Ok(Some(status)) => format!(
+                "observed runtime deployment present (phase={}, ready={})",
+                status.phase, status.ready_replicas
+            ),
+            Ok(None) => "observed runtime deployment absent at observation time (not proof of \
+                 absence; a late write may still land)"
+                .to_string(),
+            Err(error) => format!("runtime observation unavailable: {error}"),
+        }
+    }
+
     pub async fn retry_control_operation(
         &self,
         app_id: &str,
@@ -72,9 +86,16 @@ impl AppService {
             && !pending_builder
             && (operation.state != UserAppOperationState::Pending || operation.command.is_none())
         {
-            return Err(AppOperationError::InvalidState(
-                "Operation cannot be replayed automatically; inspect its state and recovery evidence".into(),
-            ));
+            // B′：未知结果的围栏操作不自动重放；拒绝响应附只读观察证据
+            // （纯 GET，不改任何状态、不释放任何锁）供人工裁决。观察不
+            // 构成裁决——"查无"不能证明迟到写不会落盘（R02）。
+            let observed = self.observe_uncertain_runtime(app_id).await;
+            return Err(AppOperationError::InvalidState(format!(
+                "Operation cannot be replayed automatically ({observed}; last step: {}; \
+                 manual reconciliation required — the fence stays until the outcome \
+                 is verified by an operator)",
+                operation.step
+            )));
         }
         let completed_builder = recoverable_final
             && matches!(

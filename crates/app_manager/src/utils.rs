@@ -25,6 +25,10 @@ pub(super) fn map_runtime_error(ctx: &str, e: ContainerRuntimeError) -> AppOpera
         ContainerRuntimeError::ContainerNotFound(_) => {
             AppOperationError::NotFound(format!("{ctx}: {e}"))
         }
+        // 创建链中止：按内部原始错误映射（wire 保真——409 冲突仍是
+        // ERR_CONFLICT、结构化拒绝保持原语义）；「可安全结束」信号不进
+        // wire，由 execute_classification 层单独消费。
+        ContainerRuntimeError::CreationAborted { source, .. } => map_runtime_error(ctx, *source),
         // 其余 8 类（Connection/Creation/Start/Stop/Configuration/Timeout/K8s/Docker）
         // 都是后端运行时/基础设施问题，客户端不可恢复，归 Backend(500)。
         // ConfigurationError 在 runtime 是内部前置条件（params 缺字段），非用户输入，

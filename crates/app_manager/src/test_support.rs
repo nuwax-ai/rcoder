@@ -72,6 +72,10 @@ pub(crate) struct MockRuntime {
     pub destroy_pvc_calls: AtomicUsize,
     /// 注入 destroy_app_pvc 失败（true → ConnectionError）
     pub destroy_pvc_fails: AtomicBool,
+    /// 注入 create_deployment 返回 CreationAborted（创建编排安全结束证明
+    /// 测试）：Some((failed_at, definitive)) —— source 随 definitive 选
+    /// Conflict/Timeout，retained 附样例清单。
+    pub create_abort: std::sync::Mutex<Option<(container_runtime_api::CreationStage, bool)>>,
 }
 
 #[async_trait]
@@ -465,6 +469,28 @@ impl UserAppDeploymentRuntime for MockRuntime {
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some((stage, definitive)) = *self
+            .create_abort
+            .lock()
+            .expect("create_abort injection lock")
+        {
+            let source = if definitive {
+                ContainerRuntimeError::Conflict("mock claim rejected".into())
+            } else {
+                ContainerRuntimeError::Timeout("mock claim outcome pending".into())
+            };
+            return Err(ContainerRuntimeError::CreationAborted {
+                progress: container_runtime_api::CreationProgress {
+                    failed_at: stage,
+                    definitive_rejection: definitive,
+                    retained_idempotent_resources: vec![
+                        "workspace pvc ensured: rcoder-app-abort-workspace".into(),
+                        "storage-claim annotations may persist".into(),
+                    ],
+                },
+                source: Box::new(source),
+            });
+        }
         if self.create_fails.load(Ordering::SeqCst) {
             return Err(ContainerRuntimeError::ContainerCreationError(
                 "mock create_deployment failure".into(),

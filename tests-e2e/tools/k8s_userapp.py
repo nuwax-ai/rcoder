@@ -31,7 +31,7 @@ REQUIRED = {'cluster_ready', 'concurrent_ensure', 'ensure_retry', 'builder_ident
             'content_A', 'hot_env_rejected', 'hot_failure', 'old_content_healthy',
             'hot_deploy', 'content_B', 'hot_pod_preserved', 'deploy_identity',
             'lifecycle_active', 'stop_request_operation', 'stop_operation_by_request',
-            'lifecycle_stable_stop_wake',
+            'lifecycle_stable_stop_wake', 'request_id_replay_no_redeploy', 'request_id_by_request',
             'stop_idempotent', 'stop_zero_pods', 'wake_new_pod', 'wake', 'wake_content_B', 'cleanup',
             'tombstone_deleted', 'tombstone_old_ensure_rejected', 'recreate_new_lifecycle',
             'recreate_deleted', 'baseline_preserved'}
@@ -283,12 +283,24 @@ strip_prefix = false
 
     def deploy(self, artifact_a, release_a, artifact_b, release_b):
         path = '/api/v1/userapp/' + self.app + '/start'
+        cold_request_id = 'cold-' + self.id[:20]
         before = time.monotonic()
-        cold = self.api(path, {'user_id': self.user, **artifact_a}, timeout=360)
+        cold = self.api(path, {'user_id': self.user, 'request_id': cold_request_id, **artifact_a}, timeout=360)
         self.check('cold_deploy', time.monotonic() - before < 180, cold)
         self.check('content_A', self.content(self.id + '-A'))
         pod = self.prod_pod()
         self.save('production-A.json', pod)
+        # D′：整请求 request_id 幂等——同参重放返回存储响应、Pod 不换、
+        # by-request 查询定位该 Deploy 操作。
+        replayed = self.api(path, {'user_id': self.user, 'request_id': cold_request_id, **artifact_a}, timeout=120)
+        replay_pod = self.prod_pod()
+        self.check('request_id_replay_no_redeploy',
+                   replayed.get('release_id') == cold.get('release_id') and replay_pod['uid'] == pod['uid'],
+                   {'replayed': replayed, 'pod_uid': pod['uid'], 'replay_pod_uid': replay_pod['uid']})
+        view = self.api('/api/v1/userapp/' + self.app + '/operations/by-request?' + urllib.parse.urlencode(
+            {'user_id': self.user, 'request_id': cold_request_id}))
+        self.check('request_id_by_request',
+                   view and view['kind'] == 'StartDeployment' and view['state'] == 'Succeeded', view)
         status, result = self.request(path, {'user_id': self.user, **artifact_b, 'deploy_mode': 'hot', 'env': {'UNACCEPTED_CHANGE': '1'}}, timeout=90)
         self.check('hot_env_rejected', status == 200 and result.get('code') == 'ERR_HOT_DEPLOY_ENV_CHANGE', result)
         status, result = self.request(path, {'user_id': self.user, **artifact_b, 'sha256': '0' * 64, 'deploy_mode': 'hot'}, timeout=180)

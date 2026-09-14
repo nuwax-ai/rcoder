@@ -191,6 +191,204 @@ pub(crate) async fn create_app_runtime_failure_does_not_delete_unowned_resources
     );
 }
 
+/// A′：创建链在 claim 阶段被确定性拒绝且仅保留幂等资源 → 操作落 Failed
+/// （step=rejected_without_mutation），错误消息显式记录保留资源（不冒充
+/// 零变更），围栏释放——后续创建可直接重新受理。
+#[tokio::test]
+pub(crate) async fn creation_safe_failure_settles_failed_and_releases_fence() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime = Arc::new(MockRuntime::default());
+    *runtime.create_abort.lock().expect("injection") =
+        Some((container_runtime_api::CreationStage::StorageClaim, true));
+    let service = test_service(root.path(), runtime.clone()).await;
+    let app_dir = root.path().join("app-safe");
+    tokio::fs::create_dir_all(app_dir.join("code"))
+        .await
+        .expect("create code dir");
+    tokio::fs::write(
+        app_dir.join("code").join("release.lock.toml"),
+        release_lock(),
+    )
+    .await
+    .expect("write release lock");
+    let mut request = create_request("app-safe");
+    request.request_id = Some("safe-failure-1".into());
+
+    let error = service
+        .create_app(request)
+        .await
+        .expect_err("definitive claim rejection must fail creation");
+    // wire 保真：source 是 Conflict → ERR_CONFLICT；安全注记进 message
+    assert!(
+        matches!(&error, AppOperationError::Conflict(message)
+            if message.contains("safe failure")
+                && message.contains("workspace pvc ensured")
+                && message.contains("storage-claim annotations may persist")),
+        "wire keeps conflict class with explicit retention note, got: {error}"
+    );
+
+    let operation = service
+        .metadata
+        .store
+        .get_operation_by_request("app-safe", "safe-failure-1")
+        .await
+        .expect("read")
+        .expect("operation");
+    assert_eq!(operation.state, shared_types::UserAppOperationState::Failed);
+    assert_eq!(operation.step, "rejected_without_mutation");
+    assert!(
+        operation
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("safe failure")),
+        "{operation:?}"
+    );
+
+    // 围栏已释放：同一 app 的下一次创建可直接受理并成功
+    *runtime.create_abort.lock().expect("injection") = None;
+    service
+        .create_app(create_request("app-safe"))
+        .await
+        .expect("subsequent creation admits after safe failure");
+}
+
+/// A′ 对照：claim 阶段未知结果（超时类）不构成安全证明 → 操作保持
+/// RecoveryRequired 围栏，后续创建被「操作进行中」拒绝（R02 保守语义）。
+#[tokio::test]
+pub(crate) async fn creation_unknown_outcome_keeps_recovery_fence() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime = Arc::new(MockRuntime::default());
+    *runtime.create_abort.lock().expect("injection") =
+        Some((container_runtime_api::CreationStage::StorageClaim, false));
+    let service = test_service(root.path(), runtime.clone()).await;
+    let app_dir = root.path().join("app-unknown");
+    tokio::fs::create_dir_all(app_dir.join("code"))
+        .await
+        .expect("create code dir");
+    tokio::fs::write(
+        app_dir.join("code").join("release.lock.toml"),
+        release_lock(),
+    )
+    .await
+    .expect("write release lock");
+    let mut request = create_request("app-unknown");
+    request.request_id = Some("unknown-outcome-1".into());
+
+    let error = service
+        .create_app(request)
+        .await
+        .expect_err("unknown claim outcome must fail creation");
+    // source Timeout → Backend（wire 不变），且无安全注记
+    assert!(
+        matches!(&error, AppOperationError::Backend(message)
+            if !message.contains("safe failure")),
+        "unknown outcome keeps backend class without safe note, got: {error}"
+    );
+
+    let operation = service
+        .metadata
+        .store
+        .get_operation_by_request("app-unknown", "unknown-outcome-1")
+        .await
+        .expect("read")
+        .expect("operation");
+    assert_eq!(
+        operation.state,
+        shared_types::UserAppOperationState::RecoveryRequired
+    );
+
+    // 围栏仍在：新创建被未完成变更围栏挡回
+    let fenced = service
+        .create_app(create_request("app-unknown"))
+        .await
+        .expect_err("fence must block new operations");
+    assert!(
+        matches!(&fenced, AppOperationError::Conflict(message)
+            if message.contains("requires operator recovery")),
+        "expected recovery fence conflict, got: {fenced}"
+    );
+}
+
+/// B′：未知围栏操作的 retry 拒绝必须携带只读观察证据且零状态迁移——
+/// 观察不裁决（R02：查无≠安全），围栏原样保留。
+#[tokio::test]
+pub(crate) async fn uncertain_retry_refusal_carries_readonly_observation() {
+    for observation in ["absent", "unavailable"] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        *runtime.create_abort.lock().expect("injection") =
+            Some((container_runtime_api::CreationStage::StorageClaim, false));
+        let service = test_service(root.path(), runtime.clone()).await;
+        let app_dir = root.path().join("app-diag");
+        tokio::fs::create_dir_all(app_dir.join("code"))
+            .await
+            .expect("create code dir");
+        tokio::fs::write(
+            app_dir.join("code").join("release.lock.toml"),
+            release_lock(),
+        )
+        .await
+        .expect("write release lock");
+        let mut request = create_request("app-diag");
+        request.request_id = Some("diag-1".into());
+        service
+            .create_app(request)
+            .await
+            .expect_err("uncertain creation fails");
+        let operation = service
+            .metadata
+            .store
+            .get_operation_by_request("app-diag", "diag-1")
+            .await
+            .expect("read")
+            .expect("operation");
+        assert_eq!(
+            operation.state,
+            shared_types::UserAppOperationState::RecoveryRequired
+        );
+
+        // "unavailable" 形态在重试调用前注入（避免被 create 前置查询提前消费）
+        if observation == "unavailable" {
+            runtime.status_fails.store(1, Ordering::SeqCst);
+        }
+        let refusal = service
+            .retry_control_operation(
+                "app-diag",
+                &operation.operation_id,
+                shared_types::UserAppRetryRequest {
+                    user_id: "u-test".into(),
+                    lifecycle_id: operation.lifecycle_id.clone(),
+                    expected_revision: operation.revision,
+                },
+            )
+            .await
+            .expect_err("uncertain operations are not replayable");
+        let expected_fragment = if observation == "absent" {
+            "observed runtime deployment absent"
+        } else {
+            "runtime observation unavailable"
+        };
+        let proof_caveat_required = observation == "absent";
+        assert!(
+            matches!(&refusal, AppOperationError::InvalidState(message)
+                if message.contains(expected_fragment)
+                    && message.contains("manual reconciliation required")
+                    && (!proof_caveat_required || message.contains("not proof of absence"))),
+            "[{observation}] refusal carries read-only evidence, got: {refusal}"
+        );
+        // 零状态迁移：操作记录逐字节不变
+        assert_eq!(
+            service
+                .metadata
+                .store
+                .get_operation("app-diag", &operation.operation_id)
+                .await
+                .expect("read"),
+            Some(operation)
+        );
+    }
+}
+
 /// R2 对照：清理自身失败也不改变原始错误（只 warn）。
 #[tokio::test]
 pub(crate) async fn create_app_cleanup_failure_keeps_original_error() {
@@ -3009,6 +3207,46 @@ async fn pending_configuration_recovery_uses_private_resolved_input_once() {
                 .contains("original-private-value")
         );
     }
+}
+
+/// D′：已成功请求的幂等回放不触发任何新的 runtime 调用（replay 保留在
+/// deploy_admitted 内部、ensure_identity 之后；新 app 的 lifecycle 在
+/// ensure_identity 时创建，不存在时 replay 无法查重——此时 replay 跳过，
+/// 走锁内首次受理，新 app 正常创建）。
+#[tokio::test]
+async fn completed_deploy_replay_is_idempotent() {
+    let directory = tempfile::tempdir().expect("directory");
+    let (service, runtime) = created_app_service(directory.path(), "replay-idempotent").await;
+    let request = StartAppRequest {
+        user_id: "u-test".into(),
+        request_id: Some("replay-locked".into()),
+        ..Default::default()
+    };
+    let first = service
+        .start_app_enhanced("replay-idempotent", request.clone())
+        .await
+        .expect("first control");
+    let create_before = runtime.create_calls.load(Ordering::SeqCst);
+    let policy_before = runtime.policy_calls.load(Ordering::SeqCst);
+
+    let replayed = service
+        .start_app_enhanced("replay-idempotent", request)
+        .await
+        .expect("replay must return stored result");
+    assert_eq!(
+        serde_json::to_value(&first).unwrap(),
+        serde_json::to_value(&replayed).unwrap()
+    );
+    assert_eq!(
+        runtime.create_calls.load(Ordering::SeqCst),
+        create_before,
+        "replay must not re-create"
+    );
+    assert_eq!(
+        runtime.policy_calls.load(Ordering::SeqCst),
+        policy_before,
+        "replay must not reapply overrides"
+    );
 }
 
 #[tokio::test]

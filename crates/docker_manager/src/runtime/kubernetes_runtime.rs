@@ -1014,4 +1014,104 @@ mod create_lease_tests {
         .await
         .expect("builder rejection exchange exceeded deadline");
     }
+
+    /// write_app_resources 的阶段进度包装：claim 拒绝/未知结果都必须以
+    /// CreationAborted 上抛并携带累计进度——确定性拒绝（403）携带整操作
+    /// 安全结束证明，未知类（5xx）不得携带（上层保持围栏）。
+    async fn app_creation_claim_outcome(
+        patch_code: u16,
+    ) -> container_runtime_api::CreationProgress {
+        drop(rustls::crypto::ring::default_provider().install_default());
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let pvc_reply = serde_json::json!({
+                    "apiVersion":"v1","kind":"PersistentVolumeClaim",
+                    "metadata":{"name":"rcoder-app-progclaim-workspace",
+                        "uid":"pvc-uid","resourceVersion":"7",
+                        "labels":{"service_type":"user-app"}}
+                });
+                // ① ensure GET（active 复用）② claim 读 GET ③ claim PATCH
+                for step in 0..3 {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let (head, _body) = read_request(&mut stream).await;
+                    assert!(head.contains("persistentvolumeclaims"), "{head}");
+                    if head.starts_with("GET ") {
+                        write_reply(&mut stream, 200, &pvc_reply).await;
+                    } else if step == 2 {
+                        write_reply(
+                            &mut stream,
+                            patch_code,
+                            &serde_json::json!({
+                                "apiVersion":"v1","kind":"Status","status":"Failure",
+                                "reason":"Injected","code":patch_code,"message":"injected"
+                            }),
+                        )
+                        .await;
+                    } else {
+                        panic!("unexpected request before claim patch: {head}");
+                    }
+                }
+            });
+            let client =
+                Client::try_from(Config::new(format!("http://{address}").parse().unwrap()))
+                    .unwrap();
+            let params = ContainerCreateParams::builder()
+                .project_id("progclaim")
+                .user_id("u-prog")
+                .service_type(ServiceType::Userapp)
+                .storage_size("10Gi")
+                .build();
+            let error = runtime(client)
+                .write_app_resources("progclaim", &params, None, None, Default::default(), None)
+                .await
+                .expect_err("claim outcome must abort creation");
+            server.await.expect("scripted exchange completed");
+            let ContainerRuntimeError::CreationAborted { progress, .. } = &error else {
+                panic!("creation failure must carry progress, got: {error}");
+            };
+            progress.clone()
+        })
+        .await
+        .expect("progress regression must finish within its budget")
+    }
+
+    #[tokio::test]
+    async fn app_creation_claim_rejection_proves_safe_finish() {
+        let progress = app_creation_claim_outcome(403).await;
+        assert_eq!(
+            progress.failed_at,
+            container_runtime_api::CreationStage::StorageClaim
+        );
+        assert!(progress.definitive_rejection);
+        assert!(progress.safe_finish_ok(), "{progress:?}");
+        assert!(
+            progress
+                .retained_idempotent_resources
+                .iter()
+                .any(|item| item.contains("workspace pvc ensured")),
+            "{progress:?}"
+        );
+        assert!(
+            progress
+                .retained_idempotent_resources
+                .iter()
+                .any(|item| item.contains("storage-claim annotations may persist")),
+            "部分认领可能性必须显式记录，不得冒充零变更: {progress:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_creation_unknown_claim_outcome_retains_fence() {
+        let progress = app_creation_claim_outcome(503).await;
+        assert_eq!(
+            progress.failed_at,
+            container_runtime_api::CreationStage::StorageClaim
+        );
+        assert!(!progress.definitive_rejection);
+        assert!(!progress.safe_finish_ok(), "{progress:?}");
+    }
 }

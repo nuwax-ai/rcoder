@@ -449,23 +449,51 @@ impl KubernetesRuntime {
         expected: Option<&str>,
     ) -> ContainerRuntimeResult<Vec<AppPortStatus>> {
         params.validate_execution_context()?;
+        // 阶段进度在编排层逐段累计（进程内事实，非远端观察）：失败时包成
+        // CreationAborted 携带「保留资源清单 + 拒绝确定性」上抛，供上层
+        // 生成整操作级安全结束证明（见 CreationProgress::safe_finish_ok）。
+        let mut progress = container_runtime_api::CreationProgress::default();
+        let aborted = |stage: container_runtime_api::CreationStage,
+                       progress: &mut container_runtime_api::CreationProgress,
+                       source: ContainerRuntimeError| {
+            progress.failed_at = stage;
+            progress.definitive_rejection = source.is_definitive_rejection();
+            ContainerRuntimeError::CreationAborted {
+                progress: progress.clone(),
+                source: Box::new(source),
+            }
+        };
         let target = if let Some(target) = &params.mutation_target {
             let resource = &target.resource;
             if resource.kind != shared_types::AppResourceKind::Deployment
                 || resource.name != self.app_deployment_name(app_id)
                 || resource.resource_version.as_deref() != expected
             {
-                return Err(ContainerRuntimeError::Conflict(
-                    "Captured application update target changed".into(),
-                ));
+                progress.failed_at = container_runtime_api::CreationStage::Capture;
+                progress.definitive_rejection = true;
+                return Err(ContainerRuntimeError::CreationAborted {
+                    progress,
+                    source: Box::new(ContainerRuntimeError::Conflict(
+                        "Captured application update target changed".into(),
+                    )),
+                });
             }
             Some(resource.clone())
         } else {
             match (&params.execution_context, expected) {
-                (Some(context), Some(version)) => Some(
-                    self.capture_owned_app_identity(context, Some(version))
-                        .await?,
-                ),
+                (Some(context), Some(version)) => match self
+                    .capture_owned_app_identity(context, Some(version))
+                    .await
+                {
+                    Ok(captured) => Some(captured),
+                    Err(error) => {
+                        return Err(aborted(
+                            container_runtime_api::CreationStage::Capture,
+                            &mut progress,
+                            error,
+                        ));
+                    }
+                },
                 _ => None,
             }
         };
@@ -476,27 +504,68 @@ impl KubernetesRuntime {
         //    subPath 目录由 kubelet 自动创建，故只 ensure 单块 PVC
         //    （历史第二块 `-data` PVC 已随单卷化退役；destroy 侧兜底回收存量）。
         //    销毁走 destroy_app_pvc。
-        if let Some(context) = &params.execution_context {
+        let ensured_pvc = self.workspace_pvc_name(app_id, &ServiceType::Userapp)?;
+        let ensure_result = if let Some(context) = &params.execution_context {
             self.ensure_owned_workspace_pvc(
                 context,
                 &ServiceType::Userapp,
                 params.storage_size.as_deref(),
             )
-            .await?;
+            .await
         } else {
             self.ensure_workspace_pvc(
                 app_id,
                 &ServiceType::Userapp,
                 params.storage_size.as_deref(),
             )
-            .await?;
+            .await
+        };
+        if let Err(error) = ensure_result {
+            return Err(aborted(
+                container_runtime_api::CreationStage::PvcEnsure,
+                &mut progress,
+                error,
+            ));
         }
-        self.claim_app_storage_with_context(app_id, params.execution_context.as_ref())
-            .await?;
-        self.write_app_generation(app_id, params, expected, target.as_ref())
-            .await?;
+        progress
+            .retained_idempotent_resources
+            .push(format!("workspace pvc ensured: {ensured_pvc}"));
+        if let Err(error) = self
+            .claim_app_storage_with_context(app_id, params.execution_context.as_ref())
+            .await
+        {
+            // claim 逐 PVC 顺序执行：失败时无法从外部得知已成功标注了几个——
+            // 如实记录注解可能残留，不冒充零变更。
+            progress
+                .retained_idempotent_resources
+                .push("storage-claim annotations may persist on application PVCs".into());
+            return Err(aborted(
+                container_runtime_api::CreationStage::StorageClaim,
+                &mut progress,
+                error,
+            ));
+        }
+        progress
+            .retained_idempotent_resources
+            .push("storage claim annotations applied".into());
+        if let Err(error) = self
+            .write_app_generation(app_id, params, expected, target.as_ref())
+            .await
+        {
+            return Err(aborted(
+                container_runtime_api::CreationStage::WriteGeneration,
+                &mut progress,
+                error,
+            ));
+        }
         // Publish networking only after the conditional commit succeeded.
-        self.apply_app_service(app_id, params).await?;
+        if let Err(error) = self.apply_app_service(app_id, params).await {
+            return Err(aborted(
+                container_runtime_api::CreationStage::ApplyService,
+                &mut progress,
+                error,
+            ));
+        }
         info!("[K8S-APP] Deployment applied for app: {app_id}");
         // 5. HTTP 入口 —— 按 http_expose：
         //    - Gateway 模式：apply HTTPRoute（path /apps/{id}），失败降级 warn 不阻塞
