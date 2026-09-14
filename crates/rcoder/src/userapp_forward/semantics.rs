@@ -520,7 +520,14 @@ mod authoritative_lookup_tests {
         )
         .await
         .expect("runtime found");
-        assert!(resolved.expect("address").contains("127.0.0.2"));
+        // Use the shared crate's effective feature selection, including Cargo
+        // feature unification, while asserting the complete address contract.
+        let expected = if shared_types::is_kubernetes_runtime() {
+            "http://rcoder-app-builder-app-a-svc.test.svc.cluster.local:60000"
+        } else {
+            "http://127.0.0.2:60000"
+        };
+        assert_eq!(resolved.as_deref(), Some(expected));
         assert!(
             resolve_existing_dev(async { Ok(None) }, "app-a", "test", "cluster.local")
                 .await
