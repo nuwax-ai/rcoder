@@ -131,8 +131,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_policy_case_sensitive() {
-        // wire 值是小写 snake_case，大小写不敏感的方案留后续
+    fn resolve_policy_wrong_case_fallback() {
+        // wire 值是小写 snake_case；错误大小写回落 AllRust（parse_route_policy Err）
         assert_eq!(resolve_policy(Some("AllRust")), RoutePolicy::AllRust);
     }
 }
