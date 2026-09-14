@@ -169,10 +169,22 @@ pub fn register_runtime(runtime: Arc<dyn WorkspaceRuntime>) {
     }
 }
 
+/// merged_router 装配产物：file-server 路由 + 预览协调器句柄（None=未启用）。
+///
+/// 协调器在此构造的原因：执行器（DevServerExecutor）须持 DevServerManager，
+/// 而 DevServerManager 与协调器一同回注 file-server AppState（打破构造环）。
+pub struct MergedFileServer {
+    pub router: Router,
+    pub coordinator: Option<Arc<preview_coordinator::PreviewCoordinator>>,
+}
+
 /// 构造合并进 rcoder 主 Router 的 file-server 基础路由（无独立 listener/端口）。
 ///
+/// `preview`（None 或 disabled）→ 不装配协调器，全部现状行为。
 /// 返回 `Err` 时主服务照常启动（缺 file-server 路由不致命，warn 可见）。
-pub fn merged_router() -> Result<Router, String> {
+pub fn merged_router(
+    preview: crate::preview_assembly::PreviewAssembly,
+) -> Result<MergedFileServer, String> {
     let Some(runtime) = RUNTIME.get().cloned() else {
         return Err(
             "workspace runtime not registered (file-server routes not mounted)".to_string(),
@@ -184,11 +196,59 @@ pub fn merged_router() -> Result<Router, String> {
         Arc::new(SubvolumeWorkspaceResolver::new(path_resolver));
 
     let fs_config = Config::load().map_err(|e| format!("load file-server config: {e:#}"))?;
-    let fs_server = FileServer::builder(fs_config)
-        .with_workspace_resolver(fs_resolver)
+
+    // 预览协调器装配（存储/证据/令牌已由 preview_assembly::bootstrap 构建校验）：
+    // dev_manager → executor → coordinator，三者同实例回注 AppState。
+    let mut coordinator: Option<Arc<preview_coordinator::PreviewCoordinator>> = None;
+    let mut dev_manager_override: Option<Arc<file_server::DevServerManager>> = None;
+    let mut preview_state: Option<Arc<dyn shared_types::PreviewCoordination>> = None;
+    if preview.enabled() {
+        let store = preview
+            .store
+            .clone()
+            .ok_or_else(|| "preview assembly lacks store".to_string())?;
+        let mut section = preview
+            .config
+            .clone()
+            .ok_or_else(|| "preview assembly lacks config".to_string())?;
+        // 对等副本主 API 端口：派发目标与本进程对外 API 同端口（config.port 未在此
+        // 作用域，由调用方在 bootstrap 后覆写；此处兜底默认）。
+        if section.peer_api_port == 0 {
+            section.peer_api_port = 8086;
+        }
+        let dev_manager = Arc::new(file_server::DevServerManager::new(Arc::new(
+            fs_config.clone(),
+        )));
+        let executor = Arc::new(file_server::service::dev_server::DevServerExecutor::new(
+            dev_manager.clone(),
+        ));
+        let service = Arc::new(preview_coordinator::PreviewCoordinator::new(
+            store,
+            executor,
+            preview.evidence.clone(),
+            preview.token.clone(),
+            section,
+        ));
+        coordinator = Some(service.clone());
+        preview_state = Some(service);
+        dev_manager_override = Some(dev_manager);
+    }
+
+    let mut builder = FileServer::builder(fs_config).with_workspace_resolver(fs_resolver);
+    if let Some(manager) = dev_manager_override {
+        builder = builder.with_dev_server(manager);
+    }
+    if let Some(state) = preview_state {
+        builder = builder.with_preview_coordination(Some(state));
+    }
+    let fs_server = builder
         .build()
         .map_err(|e| format!("build merged file-server: {e:#}"))?;
-    fs_server
+    let router = fs_server
         .router_base()
-        .map_err(|e| format!("build merged file-server router: {e:#}"))
+        .map_err(|e| format!("build merged file-server router: {e:#}"))?;
+    Ok(MergedFileServer {
+        router,
+        coordinator,
+    })
 }

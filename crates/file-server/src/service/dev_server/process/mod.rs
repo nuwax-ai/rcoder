@@ -81,7 +81,7 @@ pub fn build_dev_args(dev_script: &str, port: u16, base_path: Option<&str>) -> A
 }
 
 /// 规范化 basePath 为 `/x/` 形式 (对齐 nuwax)。
-fn normalize_base_path(b: &str) -> String {
+pub(super) fn normalize_base_path(b: &str) -> String {
     let b = b.trim();
     if b.is_empty() {
         "/".to_string()

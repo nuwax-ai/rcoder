@@ -62,6 +62,11 @@ pub async fn spawn_file_server_proxy(rust_upstream_port: u16) {
         rust_upstream_port,
         ts_upstream_port: NUWAX_FILE_SERVER_INTERNAL_PORT,
         policy,
+        // 沙箱容器无多副本预览协调需求（K8s 共享部署才启用）；env 透传
+        // 供未来沙箱形态统一配置，缺省 false 保持历史分流行为。
+        coordinated_dev_lifecycle: std::env::var("FILE_SERVER_COORDINATED_DEV_LIFECYCLE")
+            .ok()
+            .is_some_and(|v| v == "true" || v == "1"),
     });
     match file_server_proxy::try_start().await {
         Ok(address) => {

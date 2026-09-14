@@ -218,19 +218,52 @@ async fn main() -> anyhow::Result<()> {
     let ws_runtime: Arc<dyn container_runtime_api::WorkspaceRuntime> = runtime.clone();
     file_server_embed::register_runtime(ws_runtime);
 
+    // Custom Page 预览协调器装配（config 段 preview_coordinator）：
+    // 存储构建（K8s=PG / 其他=进程内）+ 令牌 fail-fast + kube 宿主证据；
+    // 未配置/enabled=false → 全部现状行为（协调器 None）。
+    let mut preview_asm = preview_assembly::bootstrap(&bootstrap_result.config).await?;
+    if let Some(section) = preview_asm.config.as_mut() {
+        // 对等副本派发端口 = 本进程对外主 API 端口（同 Service 8086 面）。
+        section.peer_api_port = bootstrap_result.config.port;
+    }
+    let merged_fs = match file_server_embed::merged_router(preview_asm) {
+        Ok(merged) => merged,
+        Err(e) => {
+            warn!("file-server 路由装配失败（主服务照常启动）: {e}");
+            file_server_embed::MergedFileServer {
+                router: axum::Router::new(),
+                coordinator: None,
+            }
+        }
+    };
+    if let Some(coordinator) = merged_fs.coordinator.as_ref() {
+        // 启动对账（同 Pod 旧 boot 代次实例判停）+ 后台任务（心跳/刷盘/回收）。
+        coordinator.run_startup_reconcile().await;
+        coordinator.spawn_background_tasks(shutdown_tx.clone());
+    }
+    let preview_enabled = merged_fs.coordinator.is_some();
+
     // 60000 file-server 分流反代（Java/外部入口，独立 crate file-server-proxy）：
     // x-service-type: userapp → 本主服务（8086），其余 → TS nuwax-file-server（60001）。
     // 配置无条件注册（段缺失时兜底默认端口但 rust 上游对准本服务实际端口，
     // 供运行时 `rcoder file-server start` 拉起）；段存在时自动启动（本地 dev 无段
     // 则不监听 60000）。运行时启停经
     // /api/system/file-server/*（`rcoder file-server {start,stop,restart,status}`）。
+    // 预览协调启用时：dev 生命周期 7 端点在所有策略下改路 Rust 上游（coordinated_dev_lifecycle）。
     file_server_proxy::init(
         bootstrap_result
             .config
             .file_server_proxy
             .clone()
+            .map(|mut c| {
+                if preview_enabled {
+                    c.coordinated_dev_lifecycle = true;
+                }
+                c
+            })
             .unwrap_or_else(|| file_server_proxy::FileServerProxyConfig {
                 rust_upstream_port: bootstrap_result.config.port,
+                coordinated_dev_lifecycle: preview_enabled,
                 ..file_server_proxy::FileServerProxyConfig::default()
             }),
     );
@@ -273,7 +306,11 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     let runtime_for_shutdown = state.runtime().clone();
-    let app = router::create_router(state, Some(Arc::clone(&bootstrap_result.telemetry)));
+    let app = router::create_router(
+        state,
+        Some(Arc::clone(&bootstrap_result.telemetry)),
+        merged_fs,
+    );
     let server_handle =
         server::start_http_server(app, bootstrap_result.config.port, shutdown_tx.clone()).await?;
 

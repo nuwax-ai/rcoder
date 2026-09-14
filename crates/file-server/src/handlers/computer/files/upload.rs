@@ -250,6 +250,7 @@ mod tests {
                 SkillDownloader::new(&config).expect("construct skill downloader"),
             ),
             config,
+            preview: None,
             started_at: std::time::Instant::now(),
         }
     }

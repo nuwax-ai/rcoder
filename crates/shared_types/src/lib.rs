@@ -57,6 +57,24 @@ pub use shared_types_i18n::{
 pub mod request_locale;
 pub use request_locale::{current_request_locale, scope_request_locale};
 
+// Custom Page（WebAgentRunner 开发阶段 Vite 预览）协调契约——身份/状态机/存储与协调
+// trait/HTTP 兼容信封；kube-free、storage-free，后端由 rcoder-storage(PG) 与
+// preview-coordinator(进程内) 提供。
+pub mod preview;
+pub use preview::{
+    AcceptStartInput, AcceptStartOutcome, ActivityFlushEntry, ExecutorLogChunk, ExecutorLogLine,
+    ExecutorStartTicket, ExecutorStopOutcome, ExecutorVerifyReport, PREVIEW_PORT_MAX,
+    PREVIEW_PORT_MIN, PREVIEW_PORT_RESERVED_MAX, PREVIEW_PORT_RESERVED_MIN, PreviewCoordination,
+    PreviewCoordinationError, PreviewExecutor, PreviewExecutorError, PreviewForwardCheck,
+    PreviewHostIdentity, PreviewInstanceRecord, PreviewInstanceState, PreviewKeepAliveEnvelope,
+    PreviewKeepAliveRequest, PreviewKeyInput, PreviewLifecycleStore, PreviewListEntry,
+    PreviewOperationKind, PreviewOperationRecord, PreviewOperationState, PreviewProjectIdentity,
+    PreviewRestartEnvelope, PreviewRestartRequest, PreviewRouteResolution, PreviewStartEnvelope,
+    PreviewStartRequest, PreviewStopEnvelope, PreviewStopRequest, PreviewStoreError,
+    is_preview_port, preview_key,
+};
+pub use preview::{PreviewPortAllocation, PreviewPortPoolStatus};
+
 // HTTP 请求提取器模块（支持 JSON body 和 Query string 两种参数方式）
 pub mod i18n_extractors;
 pub use i18n_extractors::I18nJsonOrQuery;

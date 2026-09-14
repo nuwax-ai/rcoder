@@ -105,6 +105,7 @@ fn all_rust_policy_routes_everything_to_rust() {
         rust_upstream_port: 60002,
         ts_upstream_port: 60001,
         policy: RoutePolicy::AllRust,
+        coordinated_dev_lifecycle: false,
     };
     for (path, header) in [
         ("/health", None),
@@ -131,6 +132,7 @@ fn all_ts_policy_routes_everything_to_ts() {
         rust_upstream_port: 8086,
         ts_upstream_port: 41234,
         policy: RoutePolicy::AllTs,
+        coordinated_dev_lifecycle: false,
     };
     for (path, header) in [
         ("/health", None),
@@ -195,6 +197,7 @@ fn custom_ports_respected() {
         rust_upstream_port: 18086,
         ts_upstream_port: 6001,
         policy: RoutePolicy::TsFirst,
+        coordinated_dev_lifecycle: false,
     };
     assert_eq!(
         c.upstream_port_for("/api/v1/userapp/dev/start", None),

@@ -497,6 +497,8 @@ pub(crate) mod tests_support {
             skill_downloader: Arc::new(
                 SkillDownloader::new(&config).expect("construct skill downloader"),
             ),
+            // userapp 沙箱形态无 Custom Page 预览协调（None=现状本机行为）
+            preview: None,
             config,
             started_at: std::time::Instant::now(),
         };

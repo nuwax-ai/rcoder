@@ -89,21 +89,22 @@ fn app_manager_routes(state: &Arc<AppState>) -> Router {
 /// （merge 在 api-key layer 之后，同 internal 先例）；computer 域拦截层：
 /// header X-Service-Type=userapp 的请求短路转发到该 app 开发容器
 /// （反向代理转来的 TS 老路径，body 零解析）。
-fn file_server_routes_with_intercept(state: &Arc<AppState>) -> Router {
-    match crate::file_server_embed::merged_router() {
-        Ok(fs_router) => fs_router.layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::userapp_forward::computer_intercept,
-        )),
-        Err(e) => {
-            tracing::warn!("file-server routes not mounted on main service: {e}");
-            Router::new()
-        }
-    }
+fn file_server_routes_with_intercept(
+    state: &Arc<AppState>,
+    merged: crate::file_server_embed::MergedFileServer,
+) -> Router {
+    merged.router.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::userapp_forward::computer_intercept,
+    ))
 }
 
 /// 创建 Axum 路由
-pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>>) -> Router {
+pub fn create_router(
+    state: Arc<AppState>,
+    telemetry: Option<Arc<TelemetryGuard>>,
+    merged_fs: crate::file_server_embed::MergedFileServer,
+) -> Router {
     let mut router = Router::new()
         .merge(health_routes(&state))
         .merge(api::api_routes(state.clone()))
@@ -148,7 +149,14 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         layers::apply_global_middleware(router, api_key_config)
             // 内部 API（供 rcoder-gateway 调用，绕过 API Key 鉴权）
             .merge(create_internal_routes(state.clone()))
-            .merge(file_server_routes_with_intercept(&state)),
+            // 预览协调器跨 Pod 内部执行端点（自带令牌鉴权；未装配时空 Router）
+            .merge(
+                merged_fs
+                    .coordinator
+                    .clone()
+                    .map_or_else(Router::new, |c| { preview_coordinator::internal_router(c) })
+            )
+            .merge(file_server_routes_with_intercept(&state, merged_fs)),
     ))
 }
 

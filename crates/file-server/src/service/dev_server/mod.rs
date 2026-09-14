@@ -11,6 +11,7 @@
 //! - 存活轮询超时后仍返回成功 (nuwax 行为)
 //! - keep-alive 被动探活, 无空闲自动停止
 
+pub mod coordinated;
 pub mod error_classify;
 pub mod log;
 pub mod port_pool;
@@ -20,6 +21,7 @@ mod stop;
 mod support;
 mod types;
 
+pub use coordinated::DevServerExecutor;
 pub use error_classify::{STDERR_RING_CAP, StderrRing, ViteStartupError};
 pub use log::read_dev_log;
 pub use port_pool::{PortPool, PortPoolStatus};
@@ -180,6 +182,8 @@ mod tests {
                     port: 0,
                     project_id: "ghost".to_string(),
                     started_at: 0,
+                    instance_id: None,
+                    base_path: None,
                     log_dir: std::path::PathBuf::from("/tmp/nonexistent-fs-test"),
                     temp_log_name: "ghost.log".to_string(),
                 },

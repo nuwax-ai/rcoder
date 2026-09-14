@@ -331,6 +331,8 @@ frontend-detector = { path = "crates/frontend-detector" }
 shared_types = { path = "crates/shared_types" }
 shared_types_grpc = { path = "crates/shared_types_grpc" }
 shared_types_i18n = { path = "crates/shared_types_i18n" }
+# Custom Page 预览协调器（进程内权威存储 + 契约测试套件；协调服务对象批次 2 接入）
+preview-coordinator = { path = "crates/preview-coordinator" }
 rcoder-storage = { path = "crates/rcoder-storage" }
 agent_config = { path = "crates/agent_config" }
 agent_abstraction = { path = "crates/agent_abstraction" }

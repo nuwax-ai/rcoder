@@ -81,6 +81,10 @@ pub struct AppConfig {
     /// 段缺失 → None → 不监听 60000（本地 dev 形态）；K8s 部署经 helm 渲染此段。
     #[serde(default)]
     pub file_server_proxy: Option<file_server_proxy::FileServerProxyConfig>,
+    /// Custom Page 预览协调器（多副本 dev 生命周期/预览路由收口）。
+    /// 段缺失/None/enabled=false → 不装配（全部现状行为）。K8s 经 helm 渲染。
+    #[serde(default)]
+    pub preview_coordinator: Option<preview_coordinator::CoordinatorConfig>,
     /// Docker 配置(docker 运行时读,K8s 不读)
     pub docker_config: Option<DockerConfig>,
     /// K8s 运行时配置(K8s 运行时读,docker 不读;与 docker_config 完全分家)
@@ -131,6 +135,7 @@ impl Default for AppConfig {
             port: 8087,
             proxy_config: Some(ProxyConfig::default()),
             file_server_proxy: None,
+            preview_coordinator: None,
             docker_config: Some(DockerConfig::default()),
             kubernetes_config: None,
             cleanup_config: CleanupConfigSettings::default(),

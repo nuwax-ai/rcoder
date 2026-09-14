@@ -16,9 +16,9 @@ use crate::service::pnpm::{self, InstallOptions, LogFiles};
 use std::path::Path;
 
 /// 启动锁守卫: drop 时自动从 starting 集合移除 (防 early return 泄漏)。
-struct StartingGuard<'a> {
-    starting: &'a Mutex<HashSet<String>>,
-    project_id: String,
+pub(super) struct StartingGuard<'a> {
+    pub(super) starting: &'a Mutex<HashSet<String>>,
+    pub(super) project_id: String,
 }
 impl Drop for StartingGuard<'_> {
     fn drop(&mut self) {
@@ -112,7 +112,29 @@ impl DevServerManager {
             armed: true,
         };
 
-        let ldir = log::log_dir(&self.config, project_id);
+        let started = self
+            .spawn_and_register(project_id, project_id, project_path, port, base_path, None)
+            .await?;
+        port_alloc.disarm(); // 分配成功且就绪, 不再归还端口 (Drop 变 no-op)
+        Ok(started)
+    }
+
+    /// 共享启动管线（legacy start 与协调票据模式共用）：npmrc → dev-inject →
+    /// 依赖安装 → spawn → 就绪轮询 → 登记。
+    ///
+    /// `registry_key`：processes 表键（legacy=project_id；协调票据=preview_key）。
+    /// `log_key`：日志目录命名键（恒 project_id，get-dev-log 兼容）。
+    /// `instance_id`：协调票据的实例身份（legacy 为 None）。
+    pub(super) async fn spawn_and_register(
+        &self,
+        registry_key: &str,
+        log_key: &str,
+        project_path: &Path,
+        port: u16,
+        base_path: Option<&str>,
+        instance_id: Option<&str>,
+    ) -> AppResult<StartedDev> {
+        let ldir = log::log_dir(&self.config, log_key);
         tokio::fs::create_dir_all(&ldir)
             .await
             .map_err(|e| AppError::system(format!("create dev log dir: {e}")))?;
@@ -201,7 +223,8 @@ impl DevServerManager {
         drop(child);
 
         // 就绪轮询 (在登记到 map 之前): 进程早退 → 读 stderr ring 分类成结构化错误;
-        // 端口经 AllocGuard 自动释放。避免把"启动失败已死的 vite"当成成功。
+        // 端口归还由调用方守卫（legacy AllocGuard / 协调器存储端口记账）。避免把
+        // "启动失败已死的 vite"当成成功。
         self.poll_alive(
             pid,
             port,
@@ -211,18 +234,23 @@ impl DevServerManager {
         )
         .await?;
 
+        // 探活 base：显式值规范化（与 build_dev_args 同规则）或按端口组合的默认值
+        let effective_base = base_path
+            .map(process::normalize_base_path)
+            .unwrap_or_else(|| format!("/proxy/{port}/"));
         lock(&self.processes)?.insert(
-            project_id.to_string(),
+            registry_key.to_string(),
             DevProcess {
                 pid,
                 port,
-                project_id: project_id.to_string(),
+                project_id: log_key.to_string(),
                 started_at: now,
+                instance_id: instance_id.map(str::to_string),
+                base_path: Some(effective_base),
                 log_dir: ldir.clone(),
                 temp_log_name: log::temp_log_name(now),
             },
         );
-        port_alloc.disarm(); // 分配成功且就绪, 不再归还端口 (Drop 变 no-op)
 
         Ok(StartedDev { pid, port })
     }
@@ -322,6 +350,8 @@ impl DevServerManager {
                 pid,
                 port: PINGAP_ENTRY_PORT,
                 project_id: project_id.to_string(),
+                instance_id: None,
+                base_path: None,
                 started_at: now,
                 log_dir: ldir.clone(),
                 temp_log_name: log::temp_log_name(now),

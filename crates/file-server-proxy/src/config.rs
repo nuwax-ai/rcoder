@@ -22,6 +22,11 @@ pub struct FileServerProxyConfig {
     /// 路由策略（两种部署形态）
     #[serde(default)]
     pub policy: RoutePolicy,
+    /// dev 生命周期路径（start/stop/restart/keep-alive 等 7 端点）在**所有策略**下
+    /// 导向 Rust 上游（Custom Page 预览协调收口；与 rcoder `preview_coordinator.enabled`
+    /// 同源配置渲染）。默认 false=分流行为与历史完全一致。
+    #[serde(default)]
+    pub coordinated_dev_lifecycle: bool,
 }
 
 impl Default for FileServerProxyConfig {
@@ -31,6 +36,7 @@ impl Default for FileServerProxyConfig {
             rust_upstream_port: 8086,
             ts_upstream_port: NUWAX_FILE_SERVER_INTERNAL_PORT,
             policy: RoutePolicy::default(),
+            coordinated_dev_lifecycle: false,
         }
     }
 }
@@ -110,13 +116,38 @@ fn is_userapp_service_type(header_value: Option<&str>) -> bool {
     header_value.is_some_and(shared_types::is_userapp_service_type_value)
 }
 
+/// dev 生命周期精确端点集合（`/api/build/*` 下由预览协调器收口的子集；
+/// build/parse 等其余 build 端点不受影响）。
+pub const COORDINATED_DEV_PATHS: [&str; 7] = [
+    "/api/build/start-dev",
+    "/api/build/stop-dev",
+    "/api/build/restart-dev",
+    "/api/build/keep-alive",
+    "/api/build/list-dev",
+    "/api/build/port-pool-status",
+    "/api/build/get-dev-log",
+];
+
+/// dev 生命周期端点判定（容忍尾斜杠；非前缀匹配——`/api/build/start-dev-2` 不命中）。
+pub fn is_coordinated_dev_path(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    COORDINATED_DEV_PATHS.contains(&trimmed)
+}
+
 impl FileServerProxyConfig {
     /// 分流规则纯函数（按 [`RoutePolicy`] 分派）：
     /// - [`RoutePolicy::TsFirst`]：`/api/v1/userapp*` 前缀或
     ///   `x-service-type: userapp` header（任一命中）→ Rust 上游，其余 → TS 上游
     /// - [`RoutePolicy::AllRust`]：一律 Rust 上游
     /// - [`RoutePolicy::AllTs`]：一律 TS 上游
+    ///
+    /// 例外（优先于策略）：`coordinated_dev_lifecycle` 开启时，dev 生命周期 7 端点
+    /// 在**所有策略**下导向 Rust 上游——TS 无身份协调（多副本下误重建/误停），
+    /// 这些端点必须由 Rust 协调器受理。
     pub fn upstream_port_for(&self, path: &str, service_type_header: Option<&str>) -> Upstream {
+        if self.coordinated_dev_lifecycle && is_coordinated_dev_path(path) {
+            return Upstream::Rust(self.rust_upstream_port);
+        }
         let to_rust = match self.policy {
             RoutePolicy::TsFirst => {
                 is_userapp_path(path) || is_userapp_service_type(service_type_header)
@@ -128,6 +159,84 @@ impl FileServerProxyConfig {
             Upstream::Rust(self.rust_upstream_port)
         } else {
             Upstream::Ts(self.ts_upstream_port)
+        }
+    }
+}
+
+#[cfg(test)]
+mod coordinated_dev_tests {
+    use super::*;
+
+    fn config(policy: RoutePolicy, coordinated: bool) -> FileServerProxyConfig {
+        FileServerProxyConfig {
+            policy,
+            coordinated_dev_lifecycle: coordinated,
+            ..FileServerProxyConfig::default()
+        }
+    }
+
+    #[test]
+    fn dev_lifecycle_paths_go_rust_in_all_policies_when_enabled() {
+        for policy in [
+            RoutePolicy::TsFirst,
+            RoutePolicy::AllRust,
+            RoutePolicy::AllTs,
+        ] {
+            let cfg = config(policy, true);
+            for path in COORDINATED_DEV_PATHS {
+                assert!(
+                    matches!(cfg.upstream_port_for(path, None), Upstream::Rust(_)),
+                    "{policy:?} {path} must route to rust"
+                );
+                // 尾斜杠容忍
+                assert!(
+                    matches!(
+                        cfg.upstream_port_for(&format!("{path}/"), None),
+                        Upstream::Rust(_)
+                    ),
+                    "{policy:?} {path}/ must route to rust"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_paths_keep_policy_semantics_when_enabled() {
+        // build 域其余端点不受影响
+        let ts_first = config(RoutePolicy::TsFirst, true);
+        assert!(matches!(
+            ts_first.upstream_port_for("/api/build/build", None),
+            Upstream::Ts(_)
+        ));
+        assert!(matches!(
+            ts_first.upstream_port_for("/api/project/list", None),
+            Upstream::Ts(_)
+        ));
+        assert!(matches!(
+            ts_first.upstream_port_for("/api/v1/userapp/dev/list", None),
+            Upstream::Rust(_)
+        ));
+        // 前缀不误命中
+        assert!(matches!(
+            ts_first.upstream_port_for("/api/build/start-dev-2", None),
+            Upstream::Ts(_)
+        ));
+        // AllTs 下非 dev 端点仍全走 TS（回退通道语义保留）
+        let all_ts = config(RoutePolicy::AllTs, true);
+        assert!(matches!(
+            all_ts.upstream_port_for("/api/build/build", None),
+            Upstream::Ts(_)
+        ));
+    }
+
+    #[test]
+    fn disabled_flag_keeps_legacy_routing_exactly() {
+        let ts_first = config(RoutePolicy::TsFirst, false);
+        for path in COORDINATED_DEV_PATHS {
+            assert!(
+                matches!(ts_first.upstream_port_for(path, None), Upstream::Ts(_)),
+                "{path} must stay on ts when coordination disabled"
+            );
         }
     }
 }

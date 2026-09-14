@@ -36,27 +36,7 @@ impl DevServerManager {
                 killed.push(KilledPid { pid, killed: true });
                 continue;
             }
-            let ok = process::kill_process_group(pid);
-            process::wait_for_stop(
-                pid,
-                self.config.dev_stop_check_interval_ms,
-                self.config.dev_stop_max_attempts,
-            )
-            .await;
-            let mut k = ok;
-            if process::is_process_running(pid) {
-                tracing::warn!("dev server (pid {pid}) 未在 SIGTERM 宽限期退出, 升级 SIGKILL");
-                let force_sent = process::kill_process_group_force(pid);
-                process::wait_for_stop(
-                    pid,
-                    self.config.dev_stop_check_interval_ms,
-                    self.config.dev_stop_max_attempts,
-                )
-                .await;
-                // zombie 进程在父进程回收前 `kill(pid, 0)` 仍会返回存在，
-                // 但 SIGKILL 已成功送达时业务上应视为 killed，对齐 nuwax killProcess。
-                k = k || force_sent || !process::is_process_running(pid);
-            }
+            let k = self.terminate_pid_group(pid).await;
             if k && let Some(group) = pgid {
                 stopped_groups.insert(group);
             }
@@ -69,6 +49,33 @@ impl DevServerManager {
         Ok(StoppedDev {
             killed_pids: killed,
         })
+    }
+
+    /// 单 pid 的终止升级（SIGTERM 宽限 → SIGKILL）。供 legacy stop_dev（候选循环）
+    /// 与协调票据 stop_coordinated（仅记录 pid）共用。
+    pub(super) async fn terminate_pid_group(&self, pid: u32) -> bool {
+        let ok = process::kill_process_group(pid);
+        process::wait_for_stop(
+            pid,
+            self.config.dev_stop_check_interval_ms,
+            self.config.dev_stop_max_attempts,
+        )
+        .await;
+        let mut k = ok;
+        if process::is_process_running(pid) {
+            tracing::warn!("dev server (pid {pid}) 未在 SIGTERM 宽限期退出, 升级 SIGKILL");
+            let force_sent = process::kill_process_group_force(pid);
+            process::wait_for_stop(
+                pid,
+                self.config.dev_stop_check_interval_ms,
+                self.config.dev_stop_max_attempts,
+            )
+            .await;
+            // zombie 进程在父进程回收前 `kill(pid, 0)` 仍会返回存在，
+            // 但 SIGKILL 已成功送达时业务上应视为 killed，对齐 nuwax killProcess。
+            k = k || force_sent || !process::is_process_running(pid);
+        }
+        k
     }
 
     /// 全量优雅停止 (供 main.rs graceful shutdown 调用):

@@ -45,3 +45,5 @@ nix = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# PG 契约测试复用 preview-coordinator 的存储契约断言全集
+preview-coordinator = { workspace = true }

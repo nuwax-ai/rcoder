@@ -28,6 +28,30 @@ pub(crate) async fn get_dev_log(
     State(state): State<AppState>,
     Query(q): Query<DevLogQuery>,
 ) -> Result<Json<DevLog>, AppError> {
+    // 协调域：日志按宿主归属读取（本地直读或远端转发），不再假设本机持有。
+    if let Some(preview) = state.preview.clone() {
+        let chunk = preview
+            .read_dev_log(&q.project_id, &q.log_type, q.start_index)
+            .await
+            .map_err(super::dev::coordination_error)?;
+        return Ok(Json(DevLog {
+            success: true,
+            message: "Get log successfully".to_string(),
+            logs: chunk
+                .logs
+                .into_iter()
+                .map(|l| crate::models::LogLine {
+                    line: l.line,
+                    content: l.content,
+                })
+                .collect(),
+            total_lines: chunk.total_lines,
+            start_index: q.start_index,
+            log_file_name: chunk.log_file_name,
+            cache_hit: false,
+            file_too_large: false,
+        }));
+    }
     let log_dir = crate::service::dev_server::log::log_dir(&state.config, &q.project_id);
     let snapshot = crate::service::dev_server::log::snapshot_dev_log(&log_dir, &q.log_type).await?;
     let mut cache_hit = false;

@@ -70,6 +70,7 @@ async fn in_process_router_serves_rust_domain_without_upstream_listener() {
         rust_upstream_port: RUST_UPSTREAM_PORT,
         ts_upstream_port: TS_UPSTREAM_PORT,
         policy: RoutePolicy::TsFirst,
+        coordinated_dev_lifecycle: false,
     });
     file_server_proxy::try_start().await.expect("start");
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

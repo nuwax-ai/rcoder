@@ -42,7 +42,7 @@ fn app_id_of_key(key: &str) -> Option<&str> {
 /// 探测窗口内两者时间差可达数十秒。done 到达即 break（快路径零等待）；
 /// 超时兜底按当前累积清单判终态（事件流仍是真相源）。曾为 2s：java 60s
 /// 探测场景下 done 必然迟到、终态后事件被丢，部分失败误判 Completed。
-const START_DONE_WAIT_MAX_SECS: u64 = 120;
+const START_DONE_WAIT_MAX_SECS: u64 = 3600;
 
 /// 任务级日志行（快速路径说明等）的事件 service 标识——对齐编排日志源
 /// `service_id=app-cli` 的既有命名。

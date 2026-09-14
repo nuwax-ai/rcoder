@@ -13,6 +13,45 @@ use crate::models::{
 
 // 响应结构 DevStarted/DevStopped/DevList/KeepAlive/PortPool 在 crate::models
 // （带 ToSchema，200 body 注解引用之）。
+
+/// 协调错误 → 既有错误信封映射（Unavailable→500 / Conflict→400 业务错 / Invalid→400 校验）。
+pub(super) fn coordination_error(error: shared_types::PreviewCoordinationError) -> AppError {
+    match error {
+        shared_types::PreviewCoordinationError::Unavailable(message) => AppError::system(message),
+        shared_types::PreviewCoordinationError::Conflict(message) => AppError::business(message),
+        shared_types::PreviewCoordinationError::Invalid(message) => AppError::validation(message),
+    }
+}
+
+/// BuildQuery → 协调身份（调用方已解析真实目录）。
+fn identity_from_query(
+    q: &BuildQuery,
+    resolved_path: std::path::PathBuf,
+) -> shared_types::PreviewProjectIdentity {
+    shared_types::PreviewProjectIdentity {
+        project_id: q.project_id.clone(),
+        tenant_id: q.tenant_id.clone(),
+        space_id: q.space_id.clone(),
+        isolation_type: q.isolation_type.clone(),
+        resolved_path: resolved_path.to_string_lossy().into_owned(),
+    }
+}
+
+/// 协调域判定：userapp 开发卷（app_id）不进 Custom Page 协调。
+fn coordination_takes_over(state: &AppState, q: &BuildQuery) -> bool {
+    state.preview.is_some()
+        && q.app_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+}
+
+fn envelope_pid(pid: i64) -> AppResult<u32> {
+    u32::try_from(pid)
+        .map_err(|_| AppError::system(format!("dev server pid {pid} out of u32 range")))
+}
+
 async fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> AppResult<std::path::PathBuf> {
     if let Some(app_id) = q.app_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         return crate::workspace::resolve_userapp_dev(app_id, None, &state.config);
@@ -48,6 +87,24 @@ pub(crate) async fn start_dev(
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<DevStarted>, AppError> {
     let path = project_path(&state, &q).await?;
+    if coordination_takes_over(&state, &q)
+        && let Some(preview) = state.preview.clone()
+    {
+        let envelope = preview
+            .start_dev(shared_types::PreviewStartRequest {
+                identity: identity_from_query(&q, path),
+                base_path: q.base_path.clone(),
+            })
+            .await
+            .map_err(coordination_error)?;
+        return Ok(Json(DevStarted {
+            success: envelope.success,
+            message: envelope.message,
+            project_id: envelope.project_id,
+            pid: envelope_pid(envelope.pid)?,
+            port: envelope.port,
+        }));
+    }
     let base = q.base_path.as_deref();
     let started = state
         .dev_server
@@ -88,6 +145,25 @@ pub(crate) async fn stop_dev(
     {
         return Err(AppError::validation("pid: is required"));
     }
+    if coordination_takes_over(&state, &q)
+        && let Some(preview) = state.preview.clone()
+    {
+        let pid = q.pid.as_deref().and_then(|p| p.trim().parse::<i64>().ok());
+        let envelope = preview
+            .stop_dev(&shared_types::PreviewStopRequest {
+                project_id: q.project_id.clone(),
+                pid,
+            })
+            .await
+            .map_err(coordination_error)?;
+        return Ok(Json(DevStopped {
+            success: envelope.success,
+            message: envelope.message,
+            project_id: envelope.project_id,
+            pid: None,
+            killed_pids: Vec::new(),
+        }));
+    }
     let stopped = state.dev_server.stop_dev(&q.project_id).await?;
     state.log_cache.delete(&q.project_id)?;
     // message 对齐 nuwax stopDevUtils: 全杀 "Stopped" / 部分杀 "Partially stopped..." / 无候选 "No running process found"
@@ -126,6 +202,24 @@ pub(crate) async fn restart_dev(
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<DevStarted>, AppError> {
     let path = project_path(&state, &q).await?;
+    if coordination_takes_over(&state, &q)
+        && let Some(preview) = state.preview.clone()
+    {
+        let envelope = preview
+            .restart_dev(shared_types::PreviewRestartRequest {
+                identity: identity_from_query(&q, path),
+                base_path: q.base_path.clone(),
+            })
+            .await
+            .map_err(coordination_error)?;
+        return Ok(Json(DevStarted {
+            success: envelope.success,
+            message: envelope.message,
+            project_id: envelope.project_id,
+            pid: envelope_pid(envelope.pid)?,
+            port: envelope.port,
+        }));
+    }
     let base = q.base_path.as_deref();
     let started = state
         .dev_server
@@ -155,6 +249,29 @@ pub(crate) async fn restart_dev(
     tag = "Build"
 )]
 pub(crate) async fn list_dev(State(state): State<AppState>) -> Result<Json<DevList>, AppError> {
+    if let Some(preview) = state.preview.clone() {
+        let entries = preview.list_dev().await.map_err(coordination_error)?;
+        let list = entries
+            .into_iter()
+            .map(|e| crate::models::DevProcess {
+                pid: e.pid.and_then(|p| u32::try_from(p).ok()).unwrap_or(0),
+                port: e.port.unwrap_or(0),
+                project_id: e.project_id,
+                started_at: e
+                    .started_at
+                    .map(|t| t.timestamp_millis())
+                    .unwrap_or_default(),
+                instance_id: None,
+                base_path: None,
+                log_dir: std::path::PathBuf::new(),
+                temp_log_name: String::new(),
+            })
+            .collect();
+        return Ok(Json(DevList {
+            success: true,
+            list,
+        }));
+    }
     let list = state.dev_server.list_dev()?;
     Ok(Json(DevList {
         success: true,
@@ -192,6 +309,42 @@ pub(crate) async fn keep_alive(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::system("base_path missing after garde validation"))?;
     let path = project_path_keep(&state, &q).await?;
+    // 协调域：userapp 开发卷（app_id）不进协调。
+    if state.preview.is_some()
+        && q.app_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        && let Some(preview) = state.preview.clone()
+    {
+        let envelope = preview
+            .keep_alive_dev(&shared_types::PreviewKeepAliveRequest {
+                identity: shared_types::PreviewProjectIdentity {
+                    project_id: q.project_id.clone(),
+                    tenant_id: q.tenant_id.clone(),
+                    space_id: q.space_id.clone(),
+                    isolation_type: q.isolation_type.clone(),
+                    resolved_path: path.to_string_lossy().into_owned(),
+                },
+                port: q.port,
+                pid: Some(i64::from(pid)),
+                base_path: Some(base_str.to_string()),
+            })
+            .await
+            .map_err(coordination_error)?;
+        return Ok(Json(KeepAlive {
+            success: envelope.success,
+            project_id: envelope.project_id,
+            pid: envelope
+                .pid
+                .map_or(pid, |p| u32::try_from(p).unwrap_or(pid)),
+            port: envelope.port.unwrap_or(q.port),
+            message: envelope.message,
+            action: envelope.action,
+            reason: envelope.reason,
+        }));
+    }
     let result = state
         .dev_server
         .keep_alive(&q.project_id, pid, q.port, Some(base_str), &path)
@@ -212,6 +365,7 @@ pub(crate) async fn keep_alive(
         port: out_port,
         message,
         action,
+        reason: None,
     }))
 }
 
@@ -230,6 +384,27 @@ pub(crate) async fn keep_alive(
 pub(crate) async fn port_pool_status(
     State(state): State<AppState>,
 ) -> Result<Json<PortPool>, AppError> {
+    if let Some(preview) = state.preview.clone() {
+        let status = preview
+            .port_pool_status()
+            .await
+            .map_err(coordination_error)?;
+        let allocations = status
+            .allocations
+            .into_iter()
+            .map(|a| crate::models::PortAllocation {
+                project_id: a.project_id,
+                port: a.port,
+            })
+            .collect();
+        return Ok(Json(PortPool {
+            success: true,
+            message: "Get port pool status successfully".to_string(),
+            port_range: status.port_range,
+            total_allocated: status.total_allocated,
+            allocations,
+        }));
+    }
     let status = state.dev_server.port_pool_status()?;
     Ok(Json(PortPool {
         success: true,

@@ -22,6 +22,7 @@ pub mod grpc;
 pub mod handler;
 pub mod http_client;
 pub mod middleware;
+pub mod preview_assembly;
 pub mod proxy_init;
 pub mod router;
 pub mod router_docs;

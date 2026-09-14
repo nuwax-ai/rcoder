@@ -229,6 +229,9 @@ async fn main() {
         rust_upstream_port: settings.rust_upstream_port,
         ts_upstream_port: settings.ts_upstream_port,
         policy: settings.policy,
+        // 独立形态（npm/Electron）无预览协调器（rcoder 主进程装配），恒关；
+        // rcoder 嵌入形态由 config.yml 渲染该开关。
+        coordinated_dev_lifecycle: false,
     });
     match file_server_proxy::try_start().await {
         Ok(address) => {

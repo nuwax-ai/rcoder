@@ -19,6 +19,8 @@ use crate::{
 pub struct FileServerBuilder {
     config: Config,
     resolver: Option<Arc<dyn WorkspaceResolver>>,
+    dev_server: Option<Arc<DevServerManager>>,
+    preview: Option<Arc<dyn shared_types::PreviewCoordination>>,
 }
 
 impl FileServerBuilder {
@@ -26,11 +28,29 @@ impl FileServerBuilder {
         Self {
             config,
             resolver: None,
+            dev_server: None,
+            preview: None,
         }
     }
 
     pub fn with_workspace_resolver(mut self, resolver: Arc<dyn WorkspaceResolver>) -> Self {
         self.resolver = Some(resolver);
+        self
+    }
+
+    /// 外部注入 DevServerManager（预览协调装配用：协调器执行器需先持本管理器，
+    /// 再随协调器一同回注 AppState——打破「协调器↔DevServerManager」构造环）。
+    pub fn with_dev_server(mut self, dev_server: Arc<DevServerManager>) -> Self {
+        self.dev_server = Some(dev_server);
+        self
+    }
+
+    /// 注入预览协调器（None/不调=现状本机行为）。
+    pub fn with_preview_coordination(
+        mut self,
+        preview: Option<Arc<dyn shared_types::PreviewCoordination>>,
+    ) -> Self {
+        self.preview = preview;
         self
     }
 
@@ -51,10 +71,13 @@ impl FileServerBuilder {
         );
         let state = AppState {
             resolver,
-            dev_server: Arc::new(DevServerManager::new(config.clone())),
+            dev_server: self
+                .dev_server
+                .unwrap_or_else(|| Arc::new(DevServerManager::new(config.clone()))),
             build_manager: Arc::new(BuildManager::new(config.max_build_concurrency)),
             log_cache: Arc::new(LogCacheManager::new(&config)),
             skill_downloader,
+            preview: self.preview,
             config,
             started_at: std::time::Instant::now(),
         };

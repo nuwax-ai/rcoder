@@ -70,6 +70,7 @@ agent_provisioning = { workspace = true }
 file-server = { workspace = true }
 file-server-userapp = { workspace = true }
 file-server-proxy = { workspace = true }
+preview-coordinator = { workspace = true }
 app_manager = { path = "../app_manager" }
 
 # 🚀 无锁配置热更新

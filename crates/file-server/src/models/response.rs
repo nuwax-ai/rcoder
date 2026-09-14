@@ -170,6 +170,9 @@ pub struct KeepAlive {
     /// 心跳结果动作（"restarted" = 探活失败已重启；存活时省略）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// 降级原因（宿主不可达/实例未知/端口不符——多副本协调新增；存活/重启时省略）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// port-pool-status 响应。
@@ -284,6 +287,12 @@ pub struct DevProcess {
     pub project_id: String,
     /// 启动时间（Unix 毫秒）
     pub started_at: i64,
+    /// 预览实例 ID（协调票据模式登记；legacy 启动为 None，不上 wire）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// 探活 base path（协调票据模式登记；内部状态不上 wire）
+    #[serde(skip)]
+    pub base_path: Option<String>,
     #[serde(skip)]
     pub log_dir: std::path::PathBuf,
     #[serde(skip)]

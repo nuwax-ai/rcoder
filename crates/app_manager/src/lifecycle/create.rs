@@ -226,11 +226,25 @@ impl AppService {
             )
             .await?;
         guard.mark_mutating()?;
-        let resource = self
-            .runtime
-            .create_deployment(params)
-            .await
-            .map_err(|error| map_runtime_error("Create application runtime", error))?;
+        let resource = match self.runtime.create_deployment(params).await {
+            Ok(resource) => resource,
+            Err(error) => {
+                // 整操作级安全结束证明（创建编排层累计进度 + 逐请求确定性
+                // 结果）：失败发生在首个 generation 写之前且保留物仅幂等类
+                // （PVC ensure/claim 注解）→ 复位变更标记，外层既有分类走
+                // reject_without_mutation 落 Failed 并释放围栏。证明不是
+                // 零变更——保留资源显式记录在错误消息中（R04：不冒充）。
+                let safe_note = error.creation_safe_finish_note();
+                if safe_note.is_some() {
+                    guard.mark_rejected_before_mutation();
+                }
+                let ctx = match &safe_note {
+                    Some(note) => format!("Create application runtime (safe failure; {note})"),
+                    None => "Create application runtime".to_string(),
+                };
+                return Err(map_runtime_error(&ctx, error));
+            }
+        };
         self.register_pingora_backends(app_id, &ports, &resource.container_ip)
             .await;
         operation

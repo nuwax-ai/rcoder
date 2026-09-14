@@ -1,0 +1,233 @@
+//! 后台任务：心跳轮询 / activity 刷盘 / 空闲回收 / 启动对账 / starting 自愈。
+//!
+//! 只负责本 Pod 宿主的实例（list_by_host(mine)）；全部经权威存储 CAS 收口。
+//! 空闲回收判定阈值含安全余量 = idle_secs + 2×刷盘间隔（消除"activity 还在
+//! 别的副本内存里未刷盘"的边界竞态——宁可晚回收，不误回收）。
+use std::sync::Arc;
+use std::time::Duration;
+
+use shared_types::{PreviewCoordination as _, PreviewInstanceState};
+
+use crate::identity::reboot_reconcile_args;
+use crate::service::PreviewCoordinator;
+
+impl PreviewCoordinator {
+    /// 启动对账（装配时调用一次）：同 Pod UID 旧 boot 代次的活跃行 → Stopped。
+    pub async fn run_startup_reconcile(&self) {
+        let (pod_uid, boot_id) = reboot_reconcile_args();
+        match self.store.reconcile_host_reboot(&pod_uid, &boot_id).await {
+            Ok(reconciled) if !reconciled.is_empty() => {
+                tracing::info!(
+                    count = reconciled.len(),
+                    "preview startup reconcile: prior-boot instances marked stopped"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("preview startup reconcile failed: {error}"),
+        }
+    }
+
+    /// 一轮心跳扫描：本机实例探活上报；Starting 自愈（迟到的启动完成补发布）；
+    /// 登记缺失/身份不符 → Unknown；确认死 → Failed。
+    pub async fn run_heartbeat_sweep(&self) {
+        let rows = match self.store.list_by_host(&self.host().host_id, true).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!("preview heartbeat sweep read failed: {error}");
+                return;
+            }
+        };
+        for row in rows {
+            let report = match self
+                .executor
+                .verify_local(&row.preview_key, &row.instance_id)
+                .await
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    tracing::warn!(
+                        preview_key = %row.preview_key,
+                        "preview heartbeat verify error: {error}"
+                    );
+                    continue;
+                }
+            };
+            if !report.identity_match {
+                ignore_store_result(
+                    self.store
+                        .mark_unknown(
+                            &row.preview_key,
+                            &row.instance_id,
+                            "local registration lost or mismatched",
+                        )
+                        .await,
+                    "mark_unknown",
+                );
+                continue;
+            }
+            if !report.alive {
+                ignore_store_result(
+                    self.store
+                        .mark_failed(
+                            &row.preview_key,
+                            &row.instance_id,
+                            row.revision,
+                            "heartbeat: registered process not alive",
+                        )
+                        .await,
+                    "mark_failed",
+                );
+                continue;
+            }
+            match row.state {
+                PreviewInstanceState::Starting => {
+                    // 自愈：受理时启动预算超时但进程随后就绪 → 补发布
+                    let Some(pid) = report.pid else { continue };
+                    let Some(port) = report.port else { continue };
+                    match self
+                        .store
+                        .publish_running(
+                            &row.preview_key,
+                            &row.operation_id,
+                            row.revision,
+                            pid,
+                            port,
+                            row.base_path.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(_) => tracing::info!(
+                            preview_key = %row.preview_key,
+                            "preview heartbeat self-healed a late start into ready"
+                        ),
+                        Err(shared_types::PreviewStoreError::Conflict(_)) => {}
+                        Err(error) => {
+                            tracing::warn!(preview_key = %row.preview_key, "self-heal publish: {error}")
+                        }
+                    }
+                }
+                _ => {
+                    ignore_store_result(
+                        self.store
+                            .refresh_heartbeat(&row.preview_key, &row.instance_id)
+                            .await,
+                        "refresh_heartbeat",
+                    );
+                }
+            }
+        }
+    }
+
+    /// 一轮 activity 刷盘（GREATEST 合并；失败丢弃，下一轮 keep-alive 会再攒）。
+    pub async fn run_activity_flush(&self) {
+        let entries = self.activity().drain();
+        if entries.is_empty() {
+            return;
+        }
+        match self.store.flush_activity(&entries).await {
+            Ok(updated) => tracing::debug!(updated, "preview activity flushed"),
+            Err(error) => tracing::warn!(
+                dropped = entries.len(),
+                "preview activity flush failed (entries dropped; next keep-alive re-accumulates): {error}"
+            ),
+        }
+    }
+
+    /// 一轮空闲回收（仅本机实例；阈值含 2×刷盘间隔安全余量）。
+    pub async fn run_idle_recycle(&self) {
+        let idle_secs = self.config().idle_recycle_secs;
+        if idle_secs == 0 {
+            return;
+        }
+        let margin = 2 * self.config().activity_flush_interval_secs;
+        let threshold = Duration::from_secs(idle_secs + margin);
+        let rows = match self.store.list_by_host(&self.host().host_id, true).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!("preview idle recycle read failed: {error}");
+                return;
+            }
+        };
+        for row in rows {
+            if row.state != PreviewInstanceState::Ready {
+                continue;
+            }
+            let idle = chrono::Utc::now()
+                .signed_duration_since(row.last_activity_at)
+                .to_std()
+                .unwrap_or_default();
+            if idle < threshold {
+                continue;
+            }
+            tracing::info!(
+                preview_key = %row.preview_key,
+                idle_secs = idle.as_secs(),
+                "preview idle recycle: admitting stop"
+            );
+            let envelope = self
+                .stop_dev(&shared_types::PreviewStopRequest {
+                    project_id: row.project_id.clone(),
+                    pid: row.pid,
+                })
+                .await;
+            if let Err(error) = envelope {
+                tracing::warn!(preview_key = %row.preview_key, "idle recycle stop: {error}");
+            }
+        }
+    }
+
+    /// 启动全部后台循环（rcoder 装配调用；shutdown 广播后各循环退出，
+    /// flusher 退出前补一轮刷盘）。项目停机信号惯例=broadcast::Sender<()>。
+    pub fn spawn_background_tasks(self: &Arc<Self>, shutdown: tokio::sync::broadcast::Sender<()>) {
+        let heartbeat = Arc::clone(self);
+        let mut shutdown_heartbeat = shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(
+                heartbeat.config().heartbeat_interval_secs.max(1),
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => heartbeat.run_heartbeat_sweep().await,
+                    _ = shutdown_heartbeat.recv() => break,
+                }
+            }
+        });
+        let flusher = Arc::clone(self);
+        let mut shutdown_flusher = shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(
+                flusher.config().activity_flush_interval_secs.max(1),
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => flusher.run_activity_flush().await,
+                    _ = shutdown_flusher.recv() => {
+                        flusher.run_activity_flush().await;
+                        break;
+                    }
+                }
+            }
+        });
+        let recycler = Arc::clone(self);
+        let mut shutdown_recycler = shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => recycler.run_idle_recycle().await,
+                    _ = shutdown_recycler.recv() => break,
+                }
+            }
+        });
+    }
+}
+
+/// 后台路径的存储写回失败只记日志（正确性由 CAS 与下一轮扫描收敛）。
+fn ignore_store_result(result: Result<impl Send, shared_types::PreviewStoreError>, context: &str) {
+    if let Err(error) = result {
+        tracing::debug!(context, "background preview store write skipped: {error}");
+    }
+}

@@ -43,5 +43,8 @@ pub struct AppState {
     pub build_manager: Arc<BuildManager>,
     pub log_cache: Arc<LogCacheManager>,
     pub skill_downloader: Arc<SkillDownloader>,
+    /// Custom Page 预览协调（多副本路由/生命周期收口）。None=现状本机行为
+    /// （agent-runner 内嵌 / 独立部署 / 协调未启用形态）。
+    pub preview: Option<Arc<dyn shared_types::PreviewCoordination>>,
     pub started_at: std::time::Instant,
 }
