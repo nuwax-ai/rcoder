@@ -4,15 +4,16 @@
 //!
 //! ```text
 //! 外部(rcoder userapp_forward / Java) → :60000 file-server-proxy
-//!   └─ AllRust → 127.0.0.1:{agent_runner HTTP 端口}
+//!   └─ policy（FILE_SERVER_PROXY_POLICY env）→ 127.0.0.1:{agent_runner HTTP 端口}
 //! agent_runner HTTP (8086) = 自身路由(/chat /computer/* /health …) + file-server 路由
 //!   (/api/project /api/computer /api/git /api/build /api/version …，两族路径零冲突)
 //! ```
 //!
 //! 与独立 listener 方案（内嵌 file-server 单独绑 60002）相比：少一个 listener 与
 //! 端口配置；与 rcoder 主 pod（8086 merge + 60000 分流代理）架构完全对称。
-//! 复用接口族（push-skills-to-workspace 等）最终走 Rust 还是 TS nuwax-file-server
-//! 尚未拍板，60000 proxy 是未来的路由策略切换控制点（`RoutePolicy` 加值即可）。
+//! 60000 proxy 策略由 env `FILE_SERVER_PROXY_POLICY` 控制（对齐主 pod
+//! config.yml `file_server_proxy.policy`）：`all_rust`（默认）/ `ts_first` /
+//! `all_ts`。容器内 TS nuwax-file-server（60001）由 start-up.sh 拉起热备。
 //!
 //! agent_runner 是 per-agent 容器,workspace 在本地 (`/home/user`),直接用
 //! file-server 默认的 `LocalWorkspaceResolver`,不需要 Subvolume / cephfs 聚合解析。
@@ -48,22 +49,26 @@ pub fn merged_router() -> Result<Router, String> {
         .map_err(|e| format!("build merged file-server router: {e}"))
 }
 
-/// 启动 60000 前置分流代理（AllRust → agent_runner 自身 HTTP 端口）。
+/// 启动 60000 前置分流代理（`FILE_SERVER_PROXY_POLICY` 控制路由策略）。
 ///
 /// 上游即本进程的 8086（file-server 路由已 merge），不再有独立内嵌 listener。
 /// `rust_upstream_port`: agent_runner HTTP 端口（main 的 `config.port`）。
 /// 失败只 `warn!` 不阻断（外部经 60000 的请求会 502，8086 直连路径不受影响）。
 pub async fn spawn_file_server_proxy(rust_upstream_port: u16) {
     let listen_port = env_port("FILE_SERVER_PORT", AGENT_FILE_SERVER_PORT);
+    let policy = resolve_policy(std::env::var("FILE_SERVER_PROXY_POLICY").ok().as_deref());
     file_server_proxy::init(FileServerProxyConfig {
         listen_port,
         rust_upstream_port,
         ts_upstream_port: NUWAX_FILE_SERVER_INTERNAL_PORT,
-        policy: RoutePolicy::AllRust,
+        policy,
     });
     match file_server_proxy::try_start().await {
         Ok(address) => {
-            info!("file-server 前置代理启动: {address} → 127.0.0.1:{rust_upstream_port} (AllRust)")
+            info!(
+                "file-server 前置代理启动: {address} → 127.0.0.1:{rust_upstream_port} ({})",
+                policy.as_str()
+            )
         }
         Err(e) => warn!("file-server-proxy (container form) start failed: {e}"),
     }
@@ -77,5 +82,57 @@ fn env_port(name: &str, default: u16) -> u16 {
             default
         }),
         Err(_) => default,
+    }
+}
+
+/// 解析路由策略 env 值（纯函数，可测）。
+///
+/// 缺省或非法值均回落 `AllRust`（锚定容器现行为，零变化）。
+/// 非 `all_rust` 档 `info!` 留痕——切档操作可见。
+fn resolve_policy(env_value: Option<&str>) -> RoutePolicy {
+    let Some(raw) = env_value else {
+        return RoutePolicy::AllRust;
+    };
+    match file_server_proxy::parse_route_policy(raw) {
+        Ok(policy) => {
+            if policy != RoutePolicy::AllRust {
+                info!("file-server-proxy 策略已切换: {raw} (非默认 all_rust)");
+            }
+            policy
+        }
+        Err(msg) => {
+            warn!("{msg}, fallback to all_rust");
+            RoutePolicy::AllRust
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_policy_default() {
+        // 缺省 = AllRust（容器现行为零变化）
+        assert_eq!(resolve_policy(None), RoutePolicy::AllRust);
+    }
+
+    #[test]
+    fn resolve_policy_three_wires() {
+        assert_eq!(resolve_policy(Some("all_rust")), RoutePolicy::AllRust);
+        assert_eq!(resolve_policy(Some("ts_first")), RoutePolicy::TsFirst);
+        assert_eq!(resolve_policy(Some("all_ts")), RoutePolicy::AllTs);
+    }
+
+    #[test]
+    fn resolve_policy_illegal_fallback() {
+        assert_eq!(resolve_policy(Some("bogus")), RoutePolicy::AllRust);
+        assert_eq!(resolve_policy(Some("")), RoutePolicy::AllRust);
+    }
+
+    #[test]
+    fn resolve_policy_wrong_case_fallback() {
+        // wire 值是小写 snake_case；错误大小写回落 AllRust（parse_route_policy Err）
+        assert_eq!(resolve_policy(Some("AllRust")), RoutePolicy::AllRust);
     }
 }
