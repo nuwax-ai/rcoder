@@ -98,6 +98,16 @@ impl DevServerManager {
         Ok(ExecutorStopOutcome::Stopped)
     }
 
+    /// 纯登记身份校验（无探活；转发放行热路径）。
+    pub fn registration_matches_coordinated(&self, preview_key: &str, instance_id: &str) -> bool {
+        lock(&self.processes)
+            .map(|m| {
+                m.get(preview_key)
+                    .is_some_and(|p| p.instance_id.as_deref() == Some(instance_id))
+            })
+            .unwrap_or(false)
+    }
+
     /// 票据校验：登记匹配 + 进程探活（心跳/恢复判定用）。
     pub async fn verify_coordinated(
         &self,
@@ -190,6 +200,16 @@ impl PreviewExecutor for DevServerExecutor {
             .verify_coordinated(preview_key, instance_id)
             .await
             .map_err(executor_error)
+    }
+
+    async fn registration_matches(
+        &self,
+        preview_key: &str,
+        instance_id: &str,
+    ) -> Result<bool, PreviewExecutorError> {
+        Ok(self
+            .manager
+            .registration_matches_coordinated(preview_key, instance_id))
     }
 
     async fn read_log_local(

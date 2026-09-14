@@ -58,7 +58,9 @@ struct VerifyResponse {
 
 /// 内部端点 Router（挂在协调器所在 rcoder 主 API 上）。
 pub fn internal_router(coordinator: Arc<PreviewCoordinator>) -> Router {
-    let token = dispatch_token();
+    // 令牌由协调器显式持有（构造期 fail-fast 校验），与派发客户端同源；
+    // 不再读 env——配置自定义 internal_token_env 时两处必须一致。
+    let token = coordinator.token.clone();
     Router::new()
         .route("/api/v1/preview-internal/stop", post(stop_endpoint))
         .route("/api/v1/preview-internal/verify", post(verify_endpoint))
@@ -68,11 +70,6 @@ pub fn internal_router(coordinator: Arc<PreviewCoordinator>) -> Router {
             token_guard,
         ))
         .with_state(coordinator)
-}
-
-fn dispatch_token() -> String {
-    // 与 dispatch 客户端同源的令牌获取方式（装配方构造前已 fail-fast 校验非空）。
-    crate::token::internal_token_from_env().unwrap_or_default()
 }
 
 async fn token_guard(

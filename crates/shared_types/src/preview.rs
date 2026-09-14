@@ -502,6 +502,14 @@ pub trait PreviewExecutor: Send + Sync {
         instance_id: &str,
     ) -> Result<ExecutorVerifyReport, PreviewExecutorError>;
 
+    /// 纯登记身份校验（无探活、纯内存查找——转发放行的热路径用；
+    /// 存活检测属心跳轮询职责，转发死 vite 得到连接拒绝与现状语义一致）。
+    async fn registration_matches(
+        &self,
+        preview_key: &str,
+        instance_id: &str,
+    ) -> Result<bool, PreviewExecutorError>;
+
     /// 本地日志读取（get-dev-log 转发源）。
     async fn read_log_local(
         &self,

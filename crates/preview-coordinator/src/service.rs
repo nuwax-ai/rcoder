@@ -14,12 +14,13 @@ use shared_types::preview::degraded_reason;
 use shared_types::{
     AcceptStartInput, AcceptStartOutcome, ExecutorLogChunk, ExecutorStartTicket,
     ExecutorStopOutcome, ExecutorVerifyReport, PREVIEW_PORT_MAX, PREVIEW_PORT_MIN,
-    PreviewCoordination, PreviewCoordinationError, PreviewForwardCheck, PreviewHostIdentity,
-    PreviewInstanceRecord, PreviewInstanceState, PreviewKeepAliveEnvelope, PreviewKeepAliveRequest,
-    PreviewKeyInput, PreviewListEntry, PreviewPortAllocation, PreviewPortPoolStatus,
-    PreviewProjectIdentity, PreviewRestartEnvelope, PreviewRestartRequest, PreviewRouteResolution,
-    PreviewStartEnvelope, PreviewStartRequest, PreviewStopEnvelope, PreviewStopRequest,
-    PreviewStoreError, is_preview_port, preview_key,
+    PREVIEW_PORT_RESERVED_MAX, PREVIEW_PORT_RESERVED_MIN, PreviewCoordination,
+    PreviewCoordinationError, PreviewForwardCheck, PreviewHostIdentity, PreviewInstanceRecord,
+    PreviewInstanceState, PreviewKeepAliveEnvelope, PreviewKeepAliveRequest, PreviewKeyInput,
+    PreviewListEntry, PreviewPortAllocation, PreviewPortPoolStatus, PreviewProjectIdentity,
+    PreviewRestartEnvelope, PreviewRestartRequest, PreviewRouteResolution, PreviewStartEnvelope,
+    PreviewStartRequest, PreviewStopEnvelope, PreviewStopRequest, PreviewStoreError,
+    is_preview_port, preview_key,
 };
 
 use crate::activity::ActivityAccumulator;
@@ -92,6 +93,8 @@ pub struct PreviewCoordinator {
     pub(crate) executor: Arc<dyn shared_types::PreviewExecutor>,
     evidence: Arc<dyn HostEvidence>,
     dispatch: RemoteDispatch,
+    /// 内部令牌（派发客户端与内部端点 guard 同源；显式持有避免 env 名漂移）。
+    pub(crate) token: String,
     host: PreviewHostIdentity,
     config: CoordinatorConfig,
     route_cache: RouteCache,
@@ -108,7 +111,7 @@ impl PreviewCoordinator {
     ) -> Self {
         let host = local_host_identity();
         let dispatch = RemoteDispatch::new(
-            internal_token,
+            internal_token.clone(),
             config.peer_api_port,
             config.remote_dispatch_timeout_secs,
         );
@@ -121,6 +124,7 @@ impl PreviewCoordinator {
             executor,
             evidence,
             dispatch,
+            token: internal_token,
             host,
             config,
             route_cache,
@@ -269,11 +273,15 @@ impl PreviewCoordinator {
         Err(unavailable("preview start exhausted port retry budget"))
     }
 
-    /// 受理后已知的换端口候选（避开冲突口；分配器已排除全局占用）。
+    /// 受理后已知的换端口候选（避开冲突口与保留区；分配器已排除全局占用）。
     fn next_candidate(prev: u16) -> u16 {
-        let mut next = prev.wrapping_add(1).max(PREVIEW_PORT_MIN);
-        if next > PREVIEW_PORT_MAX {
-            next = PREVIEW_PORT_MIN;
+        let mut next = if prev >= PREVIEW_PORT_MAX {
+            PREVIEW_PORT_MIN
+        } else {
+            prev + 1
+        };
+        if (PREVIEW_PORT_RESERVED_MIN..=PREVIEW_PORT_RESERVED_MAX).contains(&next) {
+            next = PREVIEW_PORT_RESERVED_MAX + 1;
         }
         next
     }
@@ -800,12 +808,14 @@ impl PreviewCoordination for PreviewCoordinator {
         {
             return PreviewForwardCheck::IdentityMismatch;
         }
+        // 登记匹配即放行（纯内存查找，无探活——存活是心跳轮询的职责；
+        // 转发到已死 vite 得到连接拒绝，语义与现状一致）。
         match self
             .executor
-            .verify_local(&row.preview_key, &row.instance_id)
+            .registration_matches(&row.preview_key, &row.instance_id)
             .await
         {
-            Ok(report) if report.identity_match && report.alive => PreviewForwardCheck::Allowed,
+            Ok(true) => PreviewForwardCheck::Allowed,
             _ => PreviewForwardCheck::NotReady,
         }
     }
