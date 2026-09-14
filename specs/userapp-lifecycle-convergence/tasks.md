@@ -1,5 +1,32 @@
 # 实施任务
 
+## 2026-09-15 三缺口修复批次（Codex 审查修订版）：安全结束证明+只读诊断+replay 幂等固化
+
+按 Codex R01-R06 全部接受的审查结论实施（commit `e69b342`），三入口全绿验收：
+
+- **A′ 安全结束证明**：`CreationProgress` 进度追踪 + `CreationAborted` 变体（5 阶段
+  枚举+确定性拒绝分类+保留资源清单）；`write_app_resources` 逐阶段记录；
+  `execute_creation` 消费证明→安全→Failed（保留物显式记录不冒充零变更）/
+  非安全→RecoveryRequired 围栏不变。热部署不产生证明（R01）。wire 保真
+  （source 原类别映射，R06）。K8s map_error 403 结构化。
+- **B′ 只读诊断**：retry 端点对未知 RecoveryRequired 附 runtime 观察
+  （absent=「非证明」/present/unavailable）+step+人工指引。不改状态（R02/R05）。
+- **D′ replay 幂等**：replay 保留在 deploy_admitted ensure_identity 后（前移
+  快路径对新 app 失败 R03-c 缓解；快路径方法已删除）；e2e 补三断言
+  （同参重放 uid 不变/异参冲突/by-request 查询）；K8s E2E 补两断言。
+
+验收：test-e2e 39/39（reports/2212053626584600b35cfa4201c18f92）+
+test-e2e-compose 55/55（34f71bb0a1a84029b026faea119944f9）+
+K8s E2E verdict=pass 47 PASS 含 D′ 两新断言（run 15abd22a266f4809）。
+全仓 fmt/clippy×3/workspace 2101/Python 90 全绿。
+发布 0.1.269（首次 0.1.268 网络超时 bump 二次成功）；131 机 3/3 副本滚动
+收敛（第二次 CephFS 死挂载处置：3 死挂载+8 陈旧 attachment+nodeplugin
+重启+k3s-agent 重启）。
+
+Phase 2（后续单独批次）：C′ 受理顺序重排（SQL 受理先行→claim executor→
+context 取锁→bind receipt→条件写授权→远端写）+ 终态证明接管 + legacy 锁
+受控诊断/人工恢复入口。
+
 ## 2026-09-14 本地 Docker 验收、发布与个人 K8s 回归终态（zcode 执行）
 
 按移交授权完成全链。三轮 E2E 实测暴露 10 项实现缺陷并修复入库（`87c2e44` + `6058345`）：
