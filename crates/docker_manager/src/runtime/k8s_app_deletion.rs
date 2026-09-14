@@ -194,40 +194,69 @@ impl KubernetesRuntime {
         .enumerate()
         {
             let api = self.deletion_api(Kind::PersistentVolumeClaim)?;
-            let pvc = match api.get(&name).await {
-                Ok(pvc) => pvc,
-                Err(kube::Error::Api(error)) if error.code == 404 && index == 1 => continue,
-                Err(error) => return Err(map_error("read app storage claim", error)),
-            };
-            ensure_userapp_pvc(&pvc)?;
-            if let Some(context) = context {
-                context
-                    .validate_identity(app_id, Some(&context.user_id))
-                    .map_err(Error::ConfigurationError)?;
-                let annotations = pvc.metadata.annotations.as_ref().ok_or_else(|| {
-                    Error::Conflict(
-                        "Application storage requires explicit lifecycle adoption".into(),
-                    )
-                })?;
-                context
-                    .validate_application_metadata(annotations)
-                    .map_err(Error::Conflict)?;
-            }
+            // spec §5：PATCH 明确 409 且重读 UID 不变、未删除才重试（4 次）。
+            // PVC resourceVersion 会被控制面（绑定/扩容/卷挂载记账）并发 bump，
+            // 单发条件写对首个 PATCH 撞 409 过敏（K8s 实测抓出）。
+            let mut attempts = 0u32;
+            let mut claim_uid: Option<String> = None;
+            loop {
+                attempts += 1;
+                let pvc = match api.get(&name).await {
+                    Ok(pvc) => pvc,
+                    Err(kube::Error::Api(error)) if error.code == 404 && index == 1 => break,
+                    Err(error) => return Err(map_error("read app storage claim", error)),
+                };
+                ensure_userapp_pvc(&pvc)?;
+                if let Some(context) = context {
+                    context
+                        .validate_identity(app_id, Some(&context.user_id))
+                        .map_err(Error::ConfigurationError)?;
+                    let annotations = pvc.metadata.annotations.as_ref().ok_or_else(|| {
+                        Error::Conflict(
+                            "Application storage requires explicit lifecycle adoption".into(),
+                        )
+                    })?;
+                    context
+                        .validate_application_metadata(annotations)
+                        .map_err(Error::Conflict)?;
+                }
 
-            if pvc.metadata.deletion_timestamp.is_some() {
-                return Err(Error::Conflict("app storage is terminating".into()));
+                if pvc.metadata.deletion_timestamp.is_some() {
+                    return Err(Error::Conflict("app storage is terminating".into()));
+                }
+                let uid = pvc
+                    .metadata
+                    .uid
+                    .ok_or_else(|| Error::ConfigurationError("app storage has no UID".into()))?;
+                match &claim_uid {
+                    None => claim_uid = Some(uid.clone()),
+                    Some(previous) if previous != &uid => {
+                        return Err(Error::Conflict(
+                            "app storage was replaced while claiming".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+                let version = pvc.metadata.resource_version.ok_or_else(|| {
+                    Error::ConfigurationError("app storage has no resourceVersion".into())
+                })?;
+                let patch = serde_json::json!({"metadata":{"uid":uid,"resourceVersion":version,"annotations":{"rcoder.io/storage-use-operation":operation_id}}});
+                match api
+                    .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(kube::Error::Api(conflict)) if conflict.code == 409 && attempts < 4 => {
+                        tracing::warn!(
+                            pvc = %name,
+                            attempt = attempts,
+                            "[K8S] app storage claim 409 (concurrent resourceVersion bump); re-reading and retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    Err(error) => return Err(map_error("claim app storage", error)),
+                }
             }
-            let uid = pvc
-                .metadata
-                .uid
-                .ok_or_else(|| Error::ConfigurationError("app storage has no UID".into()))?;
-            let version = pvc.metadata.resource_version.ok_or_else(|| {
-                Error::ConfigurationError("app storage has no resourceVersion".into())
-            })?;
-            let patch = serde_json::json!({"metadata":{"uid":uid,"resourceVersion":version,"annotations":{"rcoder.io/storage-use-operation":operation_id}}});
-            api.patch(&name, &PatchParams::default(), &Patch::Merge(patch))
-                .await
-                .map_err(|error| map_error("claim app storage", error))?;
         }
         Ok(())
     }
