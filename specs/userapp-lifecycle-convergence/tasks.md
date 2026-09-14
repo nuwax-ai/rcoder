@@ -1,5 +1,52 @@
 # 实施任务
 
+## 2026-09-14 本地 Docker 验收、发布与个人 K8s 回归终态（zcode 执行）
+
+按移交授权完成全链。三轮 E2E 实测暴露 10 项实现缺陷并修复入库（`87c2e44` + `6058345`）：
+builder ownership 误用身份槽位（userapp 族 user_id 恒空→ensure 100% 失败）、
+cross_verify 对非 Running 先 verify 致缓存残影误报、无关在途操作跳过注册快路径
+（部署期制品下载自冲突 502）、graceful shutdown/启动清理全量清删 builder（违背
+持久化跨重启语义）、dev 代理 fast path 跨应用污染（注册 IP 复用+端口探测通过→
+打到他人容器）、storage/logs 幻影 app 语义（权威查无→exists=false/NOT_FOUND
+前置）、owner 失败消息恢复 pinned 契约、DockerManager/HostPathResolver 尊重
+DOCKER_SOCKET_PATH、app storage claim 409 有界重试（K8s 控制面并发 bump
+resourceVersion）。测试侧：first_open 受理观察改 HTTP（宿主直读 bind 挂载
+SQLite 跨 OS mmap 臂 SIGBUS）、crash 契约端口重解析+隔离态有界等待、
+sqlite 契约 current 指针语义修正、并发契约路径/env 自含、K8s 脚本补
+lifecycle/操作身份/墓碑 recreate 八断言。
+
+验收证据（全部 exit 0、源码指纹前后一致）：
+- `make test-e2e`（userapp 组）39/39 场景全绿：reports/a68ffd9783b04cd4954b8e435be7596a
+- `make test-e2e-compose` 55/55 全绿：reports/e209f11b178940ccbf9eb8dbe1c5ddcc
+- 隔离套件独立复验：SQLite 21 断言、Docker crash 8 断言全绿
+- 全仓 fmt/三组 Clippy（-D warnings）/workspace 2094 通过/0 失败
+
+发布与部署：主仓 `f1986dc`→`6058345` 已 push（feature-userapp）；构建仓
+`05a2fea`/`727be4e`/`4e24043`（test 分支）；Chart **0.1.266→0.1.267**（267 含
+claim 重试修复）；131 机 `nuwax-k8s-test` 3/3 副本滚动至 0.1.267，PG userApp
+生命周期七表落库（_sqlx_userapp_migrations 应用）。
+
+K8s 回归：`make test-e2e-k8s-userapp`（run 3624c408f8d141c19bf62c742ade0dff）
+**verdict=pass，38 计划断言含新增 8 项新协议全过**（lifecycle_active /
+stop_request_operation（operation_id 回显）/ stop_operation_by_request（按
+request 幂等查询）/ lifecycle_stable_stop_wake / tombstone_deleted /
+tombstone_old_ensure_rejected / recreate_new_lifecycle / recreate_deleted），
+首开并发/跨副本/A-B 制品/cold-hot 部署/stop-wake/定向清理/基线保留全绿，
+run 资源零残留。
+
+131 机部署插曲（已处置，非新版本缺陷）：CephFS CSI 在 soddy 节点的 5 个
+globalmount 死挂载残骸（09-11 MDS 失联事故遗留，lstat permission denied）+
+5 天前 volumeattachment 记账，阻断新副本 staging。处置=懒卸载死挂载+清
+staging 目录+重启 cephfs nodeplugin+删陈旧 attachment+重启 k3s-agent（kubelet
+内存记账刷新）后滚动收敛；数据零损。
+
+已知缺口（如实登记，非阻塞）：
+- create/deploy 族 RecoveryRequired 操作无自动对账入口（计划内明确范围外；
+  claim 409 修复已消除主要触发源；测试库残留一条 incident 记录
+  e2e-k8s-41a696d8e48f4eb9@RecoveryRequired，物理资源已清）
+- prod delete 后遗留的 legacy ConfigMap 操作锁需手工清（本次一例）
+- start(url) 部署的整请求级 request_id/operation_id 幂等（组合受理）仍未暴露
+
 ## 2026-09-14 用户要求移交 zcode
 
 当前不宣布完成，不继续启动提交/镜像发布/集群部署。完整移交见 [HANDOFF-zcode-2026-09-14.md](HANDOFF-zcode-2026-09-14.md)。用户新增授权：本地 Compose 通过后 commit/push，构建仓 `make setup k8s-helm-rcoder-version-publish ENV=test`，再部署个人 `soddy@192.168.32.131` 的 `nuwax-k8s-test` 并做真实 K8s 回归；该授权替代前文“由用户部署”的旧边界。
