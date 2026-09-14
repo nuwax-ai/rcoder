@@ -374,6 +374,82 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
     );
 }
 
+/// pod/ensure(prod) 空容器预启动：未发布 app 不再报 CONTAINER_NOT_FOUND——
+/// ensure 语义三态的第三态（不存在 → owner 解析 → 复用 start 无 url 空容器链，
+/// PG/终端固定服务可用）；归属冲突拒绝创建（防他人 ensure 抢建陌生 app）。
+async fn test_pod_ensure_prod_empty_container(env: &Env, report: &JsonlReporter) {
+    let suffix = format!(
+        "{}{}",
+        &env.run_tag.replace('_', "")[..10],
+        std::process::id() % 1000
+    );
+
+    // ① 不存在 + user_id → 200 success + created:true（空容器预创建）
+    let app_id = format!("app-e2e-podens-{suffix}");
+    let (s1, b1) = post_json(
+        env,
+        "/computer/pod/ensure",
+        json!({"user_id": "e2e-user", "app_id": app_id, "app_stage": "prod", "service_type": "userapp"}),
+    )
+    .await;
+    report.assert_hard(
+        "pod/ensure(prod) 对不存在 app 空容器预创建（200+created:true）",
+        s1.is_success() && http_ok(&b1) && b1["data"]["created"].as_bool() == Some(true),
+        format!("HTTP {s1}, body 截断: {}", trunc(&b1, 150)),
+    );
+
+    // ② 二次 ensure → 已存在走唤醒路径 AlreadyRunning：created:false
+    let (s2, b2) = post_json(
+        env,
+        "/computer/pod/ensure",
+        json!({"user_id": "e2e-user", "app_id": app_id, "app_stage": "prod", "service_type": "userapp"}),
+    )
+    .await;
+    report.assert_hard(
+        "pod/ensure(prod) 二次幂等（200+created:false）",
+        s2.is_success() && http_ok(&b2) && b2["data"]["created"].as_bool() == Some(false),
+        format!("HTTP {s2}, body 截断: {}", trunc(&b2, 150)),
+    );
+
+    // cleanup：purge 删除空容器（连数据卷一起清，防 compose 环境残留）
+    drop(
+        post_json(
+            env,
+            &format!("/api/v1/userapp/{app_id}/prod/delete"),
+            json!({"user_id": "e2e-user", "purge": true}),
+        )
+        .await,
+    );
+
+    // ③ metadata 已注册 owner 的 app + 他人 user_id → 归属冲突拒绝创建（不抢建）
+    let other_app = format!("app-e2e-podown-{suffix}");
+    let (ws_s, ws_b) = post_json(
+        env,
+        "/api/v1/userapp/workspace",
+        json!({"app_id": other_app, "user_id": "e2e-user"}),
+    )
+    .await;
+    let ws_ready = ws_s.is_success() && http_ok(&ws_b);
+    report.assert_hard(
+        "归属冲突前置：ensure-workspace 注册 owner（200）",
+        ws_ready,
+        format!("HTTP {ws_s}, body 截断: {}", trunc(&ws_b, 150)),
+    );
+    if ws_ready {
+        let (s3, b3) = post_json(
+            env,
+            "/computer/pod/ensure",
+            json!({"user_id": "e2e-other", "app_id": other_app, "app_stage": "prod", "service_type": "userapp"}),
+        )
+        .await;
+        report.assert_hard(
+            "pod/ensure(prod) 他人 user_id 对已注册 app → ERR_VALIDATION（归属冲突不创建）",
+            error_envelope(s3, &b3, "ERR_VALIDATION"),
+            format!("HTTP {s3}, body 截断: {}", trunc(&b3, 150)),
+        );
+    }
+}
+
 /// env 维度文件/存储链路（`{app_id}/{env}/*` 八接口新形态的 dev 侧回归锚）：
 /// create-workspace → upload(dev) → files(dev) 断言 → storage(dev) 查询 →
 /// storage/{env}/query 清单 → 非法 env 400 → destroy(dev) 回收 → exists 复查。
@@ -666,6 +742,7 @@ async fn userapp_compose_regression() {
     test_build_identifier_validation(&env, &report).await;
     test_build_reaches_terminal(&env, &report).await;
     test_start_without_app_semantics(&env, &report).await;
+    test_pod_ensure_prod_empty_container(&env, &report).await;
     test_env_scoped_files_and_storage(&env, &report).await;
     test_dev_logs_and_listing(&env, &report).await;
     test_query_pagination_validation(&env, &report).await;

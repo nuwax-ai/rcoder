@@ -38,7 +38,9 @@ pub async fn pod_ensure(
         Ok(AppTarget::Dev(app_id)) => {
             return ensure_userapp_dev(&state, app_id, request.user_id.as_str()).await;
         }
-        Ok(AppTarget::Prod(app_id)) => return ensure_userapp_prod(&state, locale, app_id).await,
+        Ok(AppTarget::Prod(app_id)) => {
+            return ensure_userapp_prod(&state, locale, app_id, request.user_id.as_str()).await;
+        }
         Err(e) => {
             error!("[POD_ENSURE] invalid app target: {}", e);
             return Ok(invalid_app_target_response(locale, &e));
@@ -167,22 +169,33 @@ async fn ensure_userapp_dev(
     }))
 }
 
-/// ensure 的 userApp prod 分支：先验存在（防对不存在 app_id 幻报 AlreadyRunning），
-/// 再唤醒（Ready/AlreadyRunning 成功，Timeout/Failed 报错）。
+/// ensure 的 userApp prod 分支：三态分派——已存在→唤醒（Ready/AlreadyRunning
+/// 成功，Timeout/Failed 报错）；**不存在→空容器预创建**（复用 start 无 url
+/// 三态链：supervisord 固定服务 PG/dbx/终端即可用、应用未部署，正式发布走
+/// update 分支承接、PG 凭据由发布链 align）；API 查询故障→报错（
+/// `fetch_runtime_status_or_err` 的精确分类保证只有"集群真不存在"才创建，
+/// 瞬时故障不误建容器）。
 async fn ensure_userapp_prod(
     state: &Arc<AppState>,
     locale: &str,
     app_id: String,
+    user_id: &str,
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
-    // 存在性校验：ensure_running 只在 stopped 集合命中时走唤醒，不存在的 app
-    // 会返回 AlreadyRunning——必须先经 get_app 拦住幻报
-    if let Err(e) = state.app_service.get_app(&app_id).await {
-        error!("[POD_ENSURE] userapp prod app not found: app_id={app_id}: {e:#}");
-        return Ok(HttpResult::error_with_message(
-            shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
-            locale,
-            &format!("userapp prod app not found: {e:#}"),
-        ));
+    match state.app_service.get_app(&app_id).await {
+        Ok(_) => {}
+        Err(app_manager::AppOperationError::NotFound(_)) => {
+            return ensure_userapp_prod_created(state, locale, app_id, user_id).await;
+        }
+        Err(e) => {
+            // API Server 不可达/RBAC 拒绝等查询故障：语义=查询失败而非应用不存在，
+            // 与唤醒路径的 Timeout/Failed 同码（Backend），不触发创建
+            error!("[POD_ENSURE] query userapp prod app failed: app_id={app_id}: {e:#}");
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_BACKEND_ERROR,
+                locale,
+                &format!("query userapp prod app failed: {e:#}"),
+            ));
+        }
     }
     use shared_types::AppWakeControl;
     let outcome = state.activity.ensure_running(&app_id).await;
@@ -217,6 +230,77 @@ async fn ensure_userapp_prod(
                 shared_types::error_codes::ERR_BACKEND_ERROR,
                 locale,
                 &format!("userapp prod ensure failed: {e}"),
+            ))
+        }
+    }
+}
+
+/// prod 空容器预创建子分支：owner 三级解析（显式 user_id > metadata 注册值 >
+/// 报错，与 dev 分支 ensure_userapp_builder 同源语义——归属冲突/缺失拒绝创建）
+/// 后复用 start 无 url 三态链（不存在+user_id → 创建空容器；deploy_controlled
+/// 的锁/幂等编排全程兜底，并发 ensure 由其 operation 锁收敛）。
+async fn ensure_userapp_prod_created(
+    state: &Arc<AppState>,
+    locale: &str,
+    app_id: String,
+    user_id: &str,
+) -> Result<HttpResult<EnsurePodResponse>, AppError> {
+    let metadata_owner = match state.app_service.get_app_owner(&app_id).await {
+        Ok(owner) => owner,
+        Err(e) => {
+            error!(
+                "[POD_ENSURE] query owner for prod container create failed: app_id={app_id}: {e:#}"
+            );
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_BACKEND_ERROR,
+                locale,
+                &format!("query app owner failed: {e:#}"),
+            ));
+        }
+    };
+    let owner = match crate::userapp_builder::resolve_owner(
+        Some(user_id),
+        metadata_owner.as_deref(),
+    ) {
+        Ok(owner) => owner,
+        Err(e) => {
+            error!(
+                "[POD_ENSURE] resolve owner for prod container create failed: app_id={app_id}: {e:#}"
+            );
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &format!("cannot resolve owner user_id for app {app_id}: {e:#}"),
+            ));
+        }
+    };
+    let request = app_manager::models::StartAppRequest {
+        user_id: owner,
+        ..Default::default()
+    };
+    match state.app_service.start_app_enhanced(&app_id, request).await {
+        Ok(result) => {
+            info!(
+                "[POD_ENSURE] userapp prod empty container created: app_id={app_id}, status={:?}, phase={:?}",
+                result.runtime.status, result.runtime.phase
+            );
+            Ok(HttpResult::success(EnsurePodResponse {
+                created: true,
+                container_info: PodContainerInfo {
+                    container_id: app_id.clone(),
+                    status: format!("{:?}", result.runtime.status),
+                },
+                message: "Userapp 生产容器已预创建（应用未部署，PG/终端服务可用）".to_string(),
+            }))
+        }
+        Err(e) => {
+            error!(
+                "[POD_ENSURE] create userapp prod empty container failed: app_id={app_id}: {e:#}"
+            );
+            Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_BACKEND_ERROR,
+                locale,
+                &format!("create userapp prod container failed: {e:#}"),
             ))
         }
     }
