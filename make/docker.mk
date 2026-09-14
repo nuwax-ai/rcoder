@@ -100,6 +100,7 @@ docker-build-master-base:
 #   - pyroscope     (agent_runner):         性能分析 (CPU/Memory)
 #   - otel          (agent_runner):         OpenTelemetry 追踪
 #   - debug         (rcoder):               调试路由
+#   - hotpath       (rcoder, agent_runner): 本地性能剖析（本地 dev 默认开启；见下方说明与 AGENTS.md）
 #   - proxy         (agent_runner):         Pingora + 模型密钥代理（可选；见下方说明）
 #   - kubernetes    (rcoder, docker_manager): Kubernetes 运行时支持
 #   - http-server   (agent_runner):         HTTP REST API 服务（默认启用）
@@ -109,9 +110,14 @@ docker-build-master-base:
 # 需要密钥经 Pingora 注入时，构建前设置例如：
 #   make dev-restart CARGO_FEATURES='--features ebpf-debug,pyroscope,otel,debug,proxy'
 #
+# hotpath 默认开启基础档（函数耗时/路由剖析/runtime 指标；容器内 6770/6771 绑 127.0.0.1，
+# 观测方式见 AGENTS.md「AI 调试路由」）。按需叠加内存剖析 / MCP 档，构建前设置例如：
+#   make dev-restart CARGO_FEATURES='--features ebpf-debug,pyroscope,otel,debug,hotpath,hotpath-alloc'
+# 生产构建（build-agent-docker）不含 hotpath，零影响。
+#
 # 本地开发调试默认开启上述功能（http-server / grpc-server 仍由 agent_runner 默认 features 提供）
 # 注意：kubernetes feature 仅用于 K8s 环境，Docker Compose 模式不要启用
-CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug
+CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug,hotpath
 # Explicitly bump to refresh external agent tools; routine Rust builds reuse them.
 AGENT_TOOLS_CACHE_KEY ?= 1
 

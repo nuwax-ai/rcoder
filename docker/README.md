@@ -39,7 +39,7 @@ make dev-logs
 |------|------|------|
 | **Pyroscope** | http://localhost:4040 | CPU 性能分析火焰图 |
 | **Prometheus** | http://localhost:9091 | 时序指标查询 |
-| **Grafana** | http://localhost:3000 | 进程监控 Dashboard (admin/admin) |
+| **Grafana** | http://localhost:3300 | 进程监控 Dashboard (admin/admin) |
 
 ### 创建测试容器
 
@@ -78,7 +78,7 @@ curl -X POST http://127.0.0.1:8088/computer/chat \
 # 检查端口占用
 lsof -i :4040   # Pyroscope
 lsof -i :9091   # Prometheus
-lsof -i :3000   # Grafana
+lsof -i :3300   # Grafana
 lsof -i :8088   # RCoder API
 ```
 
@@ -103,7 +103,7 @@ flowchart TB
             direction LR
             Pyro["Pyroscope<br/>:4040"]
             Prom["Prometheus<br/>:9091"]
-            Graf["Grafana<br/>:3000"]
+            Graf["Grafana<br/>:3300"]
             Pyro --> Prom --> Graf
         end
         
@@ -166,7 +166,7 @@ flowchart LR
 |------|------|----------|--------|------|
 | **Pyroscope** | 4040 | 无需登录 | Alloy eBPF (97 Hz) | CPU 性能分析火焰图 |
 | **Prometheus** | 9091 | 无需登录 | Alloy Process Exporter (15s) | 时序指标存储 |
-| **Grafana** | 3000 | admin / admin | Prometheus | 可视化 Dashboard |
+| **Grafana** | 3300 | admin / admin | Prometheus | 可视化 Dashboard |
 
 ### Grafana Dashboard
 
@@ -302,7 +302,7 @@ curl -X POST http://127.0.0.1:8088/agent/session/cancel \
 # 一键检查所有服务状态
 curl -s http://localhost:4040/health  # Pyroscope
 curl -s http://localhost:9091/-/healthy  # Prometheus
-curl -s http://localhost:3000/api/health  # Grafana
+curl -s http://localhost:3300/api/health  # Grafana
 curl -s http://localhost:8088/health  # RCoder
 ```
 
@@ -314,7 +314,7 @@ curl -s http://localhost:8088/health  # RCoder
 services=(
     "Pyroscope:4040:/health"
     "Prometheus:9091:/-/healthy"
-    "Grafana:3000:/api/health"
+    "Grafana:3300:/api/health"
     "RCoder:8088:/health"
 )
 
@@ -338,7 +338,7 @@ curl -s 'http://localhost:9091/api/v1/query?query=up' | jq '.data.result[]'
 curl -s 'http://localhost:4040/ingest?name=agent_runner' | jq
 
 # 检查 Grafana 数据源连接
-curl -s 'http://admin:admin@localhost:3000/api/datasources' | jq '.[] | select(.name=="Prometheus") | .isDefault'
+curl -s 'http://admin:admin@localhost:3300/api/datasources' | jq '.[] | select(.name=="Prometheus") | .isDefault'
 ```
 
 ---
@@ -521,7 +521,7 @@ prometheus:
 ```bash
 lsof -i :4040  # Pyroscope
 lsof -i :9091  # Prometheus
-lsof -i :3000  # Grafana
+lsof -i :3300  # Grafana
 lsof -i :8088  # RCoder
 ```
 

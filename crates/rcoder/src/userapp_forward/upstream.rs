@@ -257,6 +257,8 @@ async fn probe_dev_container(addr: &str) -> bool {
         .unwrap_or(false)
 }
 
+// Hotpath 埋点：userapp 反代完整往返（请求头透传 + 上游 send + 响应流组装；feature 关闭时 no-op）
+#[hotpath::measure]
 async fn forward_to_addr(target_label: &str, app_id: &str, addr: &str, req: Request) -> Response {
     let target = format!("{addr}{}", req.uri());
 

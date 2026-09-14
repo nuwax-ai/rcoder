@@ -142,12 +142,14 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
 
     // 全局中间件 → internal / file-server 两面在鉴权层之后 merge（不受
     // API Key 约束的既有语义）→ 安全响应头覆盖全部面。
-    layers::apply_security_headers(
+    // 最外层 hotpath::axum! 剖析层（feature 关闭时原样返回 router）：按路由模板
+    // 统计延迟/4xx/5xx，覆盖含中间件的完整请求栈；须在所有 route/merge 之后包裹。
+    hotpath::axum!(layers::apply_security_headers(
         layers::apply_global_middleware(router, api_key_config)
             // 内部 API（供 rcoder-gateway 调用，绕过 API Key 鉴权）
             .merge(create_internal_routes(state.clone()))
             .merge(file_server_routes_with_intercept(&state)),
-    )
+    ))
 }
 
 #[cfg(test)]

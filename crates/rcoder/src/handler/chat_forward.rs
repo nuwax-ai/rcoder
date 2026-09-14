@@ -112,6 +112,8 @@ pub struct ForwardChatOpts<'a> {
 /// span 覆盖整个 turn 等待（含重试/智能等待）——chat POST 的墙钟大头；
 /// 耗时指标由 SpanMetricsLayer 从 span 自动记录（method="chat"）；
 /// 出口仅记录业务结果计数。
+// Hotpath 埋点：chat 转发整链路（整 turn 墙钟含重试；feature 关闭时 no-op）
+#[hotpath::measure]
 #[instrument(skip_all, fields(tag = %opts.log_tag))]
 pub async fn forward_chat(
     grpc_pool: &Arc<GrpcChannelPool>,

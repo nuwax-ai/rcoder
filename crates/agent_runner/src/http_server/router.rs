@@ -211,16 +211,19 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         Router::new()
     };
 
-    // 组合路由
-    Router::new()
-        .merge(computer_routes)
-        .merge(devcomputer_routes)
-        .merge(rcoder_routes)
-        .merge(api_routes)
-        .merge(agent_mgmt_routes)
-        .merge(file_server_routes)
-        .merge(create_swagger_ui())
-        .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024)) // 🔥 50MB body 限制
+    // 组合路由。最外层 hotpath::axum! 剖析层（feature 关闭时原样返回 router）：
+    // 按路由模板统计延迟/4xx/5xx，覆盖 body limit 之下全部路由；须在所有 merge 之后包裹。
+    hotpath::axum!(
+        Router::new()
+            .merge(computer_routes)
+            .merge(devcomputer_routes)
+            .merge(rcoder_routes)
+            .merge(api_routes)
+            .merge(agent_mgmt_routes)
+            .merge(file_server_routes)
+            .merge(create_swagger_ui())
+            .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024))
+    ) // 🔥 50MB body 限制
 }
 
 /// liveness 检查端点（/health）：纯"进程活"立即 200，不检查 gRPC。

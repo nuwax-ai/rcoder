@@ -9,6 +9,7 @@ use rcoder::*;
 use docker_manager::runtime_selection::RuntimeType;
 
 #[tokio::main]
+#[hotpath::main]
 async fn main() -> anyhow::Result<()> {
     // Packaging probes must execute the binary without bootstrapping services or storage.
     if std::env::args_os()
@@ -21,6 +22,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Feature 开关: 启动读一次 env + eprintln 打印状态 (console, tracing 未就绪也可见)
     shared_types::FeatureFlags::init();
+
+    // Hotpath tokio runtime 指标采样线程（feature 关闭时 no-op）
+    hotpath::tokio_runtime!();
 
     // 版本标识 (先 eprintln 保证 console 一定输出; bootstrap 后再 info! 写文件日志)
     let version_line = format!(

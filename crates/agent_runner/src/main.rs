@@ -67,7 +67,11 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[tokio::main]
+#[hotpath::main]
 async fn agent_runner_main(cli_args: CliArgs) -> anyhow::Result<()> {
+    // Hotpath tokio runtime 指标采样线程（feature 关闭时 no-op）
+    hotpath::tokio_runtime!();
+
     // 🔥 设置自定义 Panic Hook，确保 panic 信息被记录
     set_panic_hook();
 

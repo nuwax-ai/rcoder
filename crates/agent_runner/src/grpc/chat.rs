@@ -12,6 +12,8 @@ use crate::service::{ChatHandlerContext, ChatHandlerInput, handle_chat_core};
 use super::conversion::{convert_agent_config, convert_attachments, convert_model_provider};
 use super::locale::locale_from_grpc_request;
 
+// Hotpath 埋点：gRPC chat 入口（tonic 无 layer，函数级即入口级；feature 关闭时 no-op）
+#[hotpath::measure]
 pub async fn chat(
     app_state: &Arc<AppState>,
     request: Request<GrpcChatRequest>,

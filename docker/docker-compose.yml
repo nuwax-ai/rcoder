@@ -226,7 +226,7 @@ services:
     image: grafana/grafana:latest
     container_name: rcoder-grafana
     ports:
-      - "3000:3000"
+      - "3300:3000" # 宿主机 3300 → 容器 3000（3000 与其他工具冲突）
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin

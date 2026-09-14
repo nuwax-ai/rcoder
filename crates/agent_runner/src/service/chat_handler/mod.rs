@@ -27,6 +27,8 @@ use tracing::info;
 // ---------------------------------------------------------------------------
 
 /// 执行 Chat 请求的核心逻辑（编排四阶段：探活 → 准备 → 下发 → 组装）。
+// Hotpath 埋点：HTTP 与 gRPC 双协议漏斗点（feature 关闭时 no-op）
+#[hotpath::measure]
 pub async fn handle_chat_core(
     input: ChatHandlerInput,
     context: &ChatHandlerContext,

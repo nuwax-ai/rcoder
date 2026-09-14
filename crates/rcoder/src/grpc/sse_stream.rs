@@ -37,6 +37,8 @@ use tracing::{Instrument, error, info, warn};
 /// 不直接传 `Arc<AppState>` 是因为 rcoder 同时作为 lib 和 bin 编译，
 /// `crate::router::AppState` 在两边是不同的类型实例。改用闭包解耦：
 /// 调用方在 lib 内部捕获 state 引用，bin crate 不需要知道 AppState 类型。
+// Hotpath 埋点：SSE 订阅建立时延（async fn spawn 转发任务后即返回，不覆盖订阅生命周期；feature 关闭时 no-op）
+#[hotpath::measure]
 #[allow(clippy::too_many_arguments)] // SSE 流构建本质多参;diag_ctx 为新增诊断上下文
 pub async fn create_grpc_sse_stream(
     registry: Arc<crate::grpc::SessionStreamRegistry>,

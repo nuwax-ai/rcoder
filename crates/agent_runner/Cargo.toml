@@ -42,6 +42,16 @@ otel = []  # 启用 OpenTelemetry 追踪功能
 # Pyroscope 连续性能分析
 pyroscope = ["dep:pyroscope"]
 
+# Hotpath 本地性能剖析（hotpath-rs；仅本地开发，不进 default，与 pyroscope 可共存）。
+# feature 关闭时 hotpath 宏全部 no-op、零依赖编译，代码里宏裸用不配 cfg。
+# axum-0-8 供 http_server/router.rs 装配处 hotpath::axum!（关闭时原样返回 router）；
+# tokio 供 hotpath::tokio_runtime!() runtime 指标线程。
+hotpath = ["hotpath/hotpath", "hotpath/threads", "hotpath/tokio", "hotpath/axum-0-8"]
+# 叠加内存分配剖析（依赖本 crate hotpath；开启后 #[hotpath::main] 安装计数全局分配器）
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+# 叠加 MCP server（127.0.0.1:6771，AI 实时查询性能数据；见 AGENTS.md）
+hotpath-mcp = ["hotpath", "hotpath/hotpath-mcp"]
+
 [lints]
 workspace = true
 
@@ -149,6 +159,9 @@ tokio-tungstenite = { workspace = true }
 
 # Pyroscope Continuous Profiling
 pyroscope = { workspace = true, optional = true }
+
+# 本地性能剖析（hotpath-rs）：非 optional，feature 由上方 hotpath* 打开内部特性
+hotpath = { workspace = true }
 
 # Unix 信号处理（用于僵尸进程回收，仅 Unix 平台）
 [target.'cfg(unix)'.dependencies]
