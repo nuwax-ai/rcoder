@@ -112,15 +112,20 @@ pub(super) fn validate_app_id(app_id: &str) -> AppResult<()> {
             shared_types::USERAPP_APP_ID_MAX_LEN
         )));
     }
-    // 小写字母数字（builder 复合键要求 app_id 段无 '-'，见函数文档；
-    // 支持纯数值 project_id 与 app{8hex} 缺省生成）
-    if !app_id
+    // 小写字母数字与内部 '-'（DNS-1123 label segment：首尾必须字母数字；
+    // 复合键时代的 '-' 全禁令随用户绑定移除失效——共享模型下 app_id 无
+    // 分隔符歧义，支持 `app-xxx` 形态与纯数值 project_id）
+    let valid_charset = app_id
         .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-    {
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    let valid_edges = app_id
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && app_id.chars().last().is_some_and(|c| c.is_ascii_alphanumeric());
+    if !valid_charset || !valid_edges {
         return Err(AppOperationError::Validation(format!(
-            "invalid app_id: must be lowercase alphanumeric (no '-'; builder instance \
-             composite id requirement, got '{app_id}')"
+            "invalid app_id: must be lowercase alphanumeric with inner hyphens (DNS-1123 label), got '{app_id}'"
         )));
     }
     Ok(())
@@ -253,6 +258,7 @@ mod tests {
         assert!(validate_app_id("appordersvc").is_ok());
         assert!(validate_app_id("app1a2b3c4d").is_ok());
         assert!(validate_app_id("appa").is_ok()); // 最短合法
+        assert!(validate_app_id("app-e2e-empty1").is_ok()); // 内部连字符（复合键禁令解除）
         // 外部自有体系 ID：纯数值（Java 侧 project_id，≤20 位）
         assert!(validate_app_id("1234567890123456789").is_ok());
         assert!(validate_app_id("123").is_ok());

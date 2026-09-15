@@ -94,7 +94,7 @@ async fn test_publish_endpoints_removed(env: &Env, report: &JsonlReporter) {
 /// 解析顺位 header > body——缺 header 时 body `app_id` 自定位受理；header 与
 /// body 双缺 → 400 快速失败（双来源指引 message，不挂起）。
 async fn test_build_identifier_validation(env: &Env, report: &JsonlReporter) {
-    let app = format!("app-e2e-{}-nohdr", &env.run_tag[..10]);
+    let app = format!("ae2e-{}-nohdr", &env.run_tag[..10]);
     rcoder_e2e::common::fixtures::failing_build(env, report, &app).await;
     // Body supplies the identifier; all resources belong to this case.
     let t0 = Instant::now();
@@ -152,7 +152,7 @@ async fn test_build_identifier_validation(env: &Env, report: &JsonlReporter) {
 async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
     // ident 唯一化：run_tag(秒级)+pid——不同测试进程同秒启动也不撞名
     let ident = format!(
-        "app-e2e-rs-{}{}",
+        "ae2rs-{}{}",
         &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000
     );
@@ -295,7 +295,7 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
     );
 
     // ① 不存在（body 空）→ 200 创建空容器（无用户维度必填字段）
-    let app_id = format!("app-e2e-empty-{suffix}");
+    let app_id = format!("ae2emp-{suffix}");
     let (s2, b2) = post_json(env, &format!("/api/v1/userapp/{app_id}/start"), json!({})).await;
     let created = s2.is_success() && http_ok(&b2);
     report.assert_hard(
@@ -344,7 +344,7 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
     // ③ restart 无 url 对不存在 app → HTTP 200 + ERR_APP_NOT_FOUND（重启语义不创建；user_id 必填带到业务层）
     let (s3, b3) = post_json(
         env,
-        &format!("/api/v1/userapp/app-e2e-norestart-{suffix}/restart"),
+        &format!("/api/v1/userapp/ae2nrs-{suffix}/restart"),
         json!({"user_id": "e2e-user"}),
     )
     .await;
@@ -366,7 +366,7 @@ async fn test_pod_ensure_prod_empty_container(env: &Env, report: &JsonlReporter)
     );
 
     // ① 不存在 + user_id → 200 success + created:true（空容器预创建）
-    let app_id = format!("app-e2e-podens-{suffix}");
+    let app_id = format!("ae2pde-{suffix}");
     let (s1, b1) = post_json(
         env,
         "/computer/pod/ensure",
@@ -403,7 +403,7 @@ async fn test_pod_ensure_prod_empty_container(env: &Env, report: &JsonlReporter)
     );
 
     // ③ metadata 已注册 owner 的 app + 他人 user_id → 归属冲突拒绝创建（不抢建）
-    let other_app = format!("app-e2e-podown-{suffix}");
+    let other_app = format!("ae2pdo-{suffix}");
     let (ws_s, ws_b) = post_json(
         env,
         "/api/v1/userapp/workspace",
@@ -436,7 +436,7 @@ async fn test_pod_ensure_prod_empty_container(env: &Env, report: &JsonlReporter)
 /// storage/{env}/query 清单 → 非法 env 400 → destroy(dev) 回收 → exists 复查。
 async fn test_env_scoped_files_and_storage(env: &Env, report: &JsonlReporter) {
     let ident = format!(
-        "app-e2e-env-{}{}",
+        "ae2env-{}{}",
         &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000
     );
@@ -599,7 +599,7 @@ fn trunc(v: &Value, n: usize) -> String {
 /// query（owner 过滤）/runtime（运行时列表）双列表接口。
 async fn test_dev_logs_and_listing(env: &Env, report: &JsonlReporter) {
     let ident = format!(
-        "app-e2e-log-{}{}",
+        "ae2log-{}{}",
         &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000
     );
@@ -808,7 +808,7 @@ async fn test_update_stop_restart(env: &Env, report: &JsonlReporter) {
     // 404：update / stop 不存在 app
     let (s, b) = post_json(
         env,
-        &format!("/api/v1/userapp/app-e2e-noup-{suffix}/update"),
+        &format!("/api/v1/userapp/ae2nup-{suffix}/update"),
         json!({"user_id": user}),
     )
     .await;
@@ -819,7 +819,7 @@ async fn test_update_stop_restart(env: &Env, report: &JsonlReporter) {
     );
     let (s, b) = post_json(
         env,
-        &format!("/api/v1/userapp/app-e2e-nostop-{suffix}/stop?user_id={user}"),
+        &format!("/api/v1/userapp/ae2nst-{suffix}/stop?user_id={user}"),
         json!({}),
     )
     .await;
@@ -829,7 +829,7 @@ async fn test_update_stop_restart(env: &Env, report: &JsonlReporter) {
         format!("HTTP {s}"),
     );
     // 400：stop 缺 user_id query
-    let (s, b) = post_json(env, "/api/v1/userapp/app-e2e-any/stop", json!({})).await;
+    let (s, b) = post_json(env, "/api/v1/userapp/ae2e-any/stop", json!({})).await;
     report.assert_hard(
         "stop 缺 user_id query → HTTP 200 + ERR_VALIDATION",
         error_envelope(s, &b, "ERR_VALIDATION"),
@@ -837,7 +837,7 @@ async fn test_update_stop_restart(env: &Env, report: &JsonlReporter) {
     );
 
     // 闭环：空容器 → update{name} → stop → 唤醒
-    let app_id = format!("app-e2e-usr-{suffix}");
+    let app_id = format!("ae2usr-{suffix}");
     let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/{app_id}/start"),
@@ -932,7 +932,7 @@ async fn test_storage_guards(env: &Env, report: &JsonlReporter) {
     // GET 随机 app：200 + exists=false（不校验 app 存在性）
     let (s, b) = get_json(
         env,
-        &format!("/api/v1/userapp/app-e2e-ghost-{user}/prod/storage?user_id={user}"),
+        &format!("/api/v1/userapp/ae2gho-{user}/prod/storage?user_id={user}"),
     )
     .await;
     report.assert_hard(
@@ -943,7 +943,7 @@ async fn test_storage_guards(env: &Env, report: &JsonlReporter) {
     // clear 未 delete → HTTP 200 + ERR_CONFLICT（前置：app 有计算资源——Docker 模式下 ghost app 的
     // deployment 查询返回 None → 守卫通过 → 幂等成功；须真实容器验证守卫分支）
     let guard_app = format!(
-        "app-e2e-clr-{}{}",
+        "ae2clr-{}{}",
         &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000
     );
@@ -983,7 +983,7 @@ async fn test_storage_guards(env: &Env, report: &JsonlReporter) {
     // destroy confirm 不匹配 → HTTP 200 + ERR_VALIDATION
     let (s, b) = post_json(
         env,
-        &format!("/api/v1/userapp/app-e2e-ghost-{user}/prod/storage/destroy"),
+        &format!("/api/v1/userapp/ae2gho-{user}/prod/storage/destroy"),
         json!({"user_id": user, "confirm": "wrong-confirm"}),
     )
     .await;
@@ -1005,7 +1005,7 @@ async fn test_recycle_policy(env: &Env, report: &JsonlReporter) {
     // 400：stage=dev
     let (s, b) = post_json(
         env,
-        &format!("/api/v1/userapp/app-e2e-rc-{suffix}/dev/recycle-policy"),
+        &format!("/api/v1/userapp/ae2rc-{suffix}/dev/recycle-policy"),
         json!({"user_id": user, "recycle_enabled": true}),
     )
     .await;
@@ -1017,7 +1017,7 @@ async fn test_recycle_policy(env: &Env, report: &JsonlReporter) {
     // 400：三可选字段全缺
     let (s, b) = post_json(
         env,
-        &format!("/api/v1/userapp/app-e2e-rc-{suffix}/prod/recycle-policy"),
+        &format!("/api/v1/userapp/ae2rc-{suffix}/prod/recycle-policy"),
         json!({"user_id": user}),
     )
     .await;
@@ -1029,7 +1029,7 @@ async fn test_recycle_policy(env: &Env, report: &JsonlReporter) {
     // 400：非法 user_id
     let (s, b) = post_json(
         env,
-        &format!("/api/v1/userapp/app-e2e-rc-{suffix}/prod/recycle-policy"),
+        &format!("/api/v1/userapp/ae2rc-{suffix}/prod/recycle-policy"),
         json!({"user_id": "bad user!", "recycle_enabled": true}),
     )
     .await;
@@ -1040,7 +1040,7 @@ async fn test_recycle_policy(env: &Env, report: &JsonlReporter) {
     );
 
     // 成功：空容器上设置
-    let app_id = format!("app-e2e-rc-{suffix}");
+    let app_id = format!("ae2rc-{suffix}");
     let (cs, cb) = post_json(
         env,
         &format!("/api/v1/userapp/{app_id}/start"),
@@ -1079,7 +1079,7 @@ async fn test_recycle_policy(env: &Env, report: &JsonlReporter) {
 /// A5 观测接口错误形态（404/400）。
 async fn test_observation_error_shapes(env: &Env, report: &JsonlReporter) {
     let user = "e2e-user";
-    let ghost = "app-e2e-ghost-obs";
+    let ghost = "ae2gho-obs";
     // health 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND
     let (s, b) = get_json(
         env,
@@ -1150,7 +1150,7 @@ async fn test_terminal_proxy_redirects(env: &Env, report: &JsonlReporter) {
         ("dbx", "dbx/prod/{user}/{app}/ws"),
         ("vnc", "vnc/dev/{user}/{app}/x"),
     ] {
-        let app = format!("app-e2e-{tool}");
+        let app = format!("ae2e-{tool}");
         let url = format!(
             "/api/v1/userapp/proxy/{}",
             path.replace("{user}", user).replace("{app}", &app)
@@ -1195,7 +1195,7 @@ async fn test_terminal_proxy_redirects(env: &Env, report: &JsonlReporter) {
 /// A7 ensure-workspace 幂等。
 async fn test_ensure_workspace_idempotent(env: &Env, report: &JsonlReporter) {
     let ident = format!(
-        "app-e2e-ew-{}{}",
+        "ae2ew-{}{}",
         &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000
     );

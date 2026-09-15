@@ -1055,7 +1055,7 @@ async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str
     let (s, b) = post_json(
         env,
         "/api/v1/userapp/db/prod/reset-password",
-        json!({"app_id": "app-e2e-ghost-db", "user_id": user, "password": "x"}),
+        json!({"app_id": "ae2gho-db", "user_id": user, "password": "x"}),
     )
     .await;
     report.assert_hard(
@@ -1557,7 +1557,7 @@ async fn userapp_deploy_full_chain() {
     }
 
     let app = format!(
-        "app-e2e-dep-{}p{}",
+        "ae2e-dep-{}p{}",
         &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000
     );

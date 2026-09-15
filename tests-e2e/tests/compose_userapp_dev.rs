@@ -1069,7 +1069,7 @@ async fn userapp_dev_archive_downloads() {
     let bytes = resp.bytes().await.unwrap_or_default();
     let zip_ok = status.is_success()
         && ct.contains("application/zip")
-        && cd.contains(&format!("{user}_{app}"))
+        && cd.contains(&format!("{app}.zip"))
         && bytes.len() > 4
         && bytes[..2] == *b"PK";
     report.assert_hard(
@@ -1929,12 +1929,12 @@ async fn userapp_dev_owner_header_lazy_ensure() {
     let app = scoped_app(&env, "o1");
     let user = "e2e-ud-ohuser";
 
-    // A｜复现生产故障：全新 app（无注册、无 x-user-id）→ 502 cannot resolve
-    //    （不走 create-workspace——正是生产 Java 的接入形态）
+    // A｜共享模型：全新 app（无注册、无 x-user-id）直接懒创建受理——
+    //    builder 按 app_id 定位（owner 解析链已随用户绑定移除退役）
     let resp = env
         .http
         .post(format!("{}/api/computer/generate-file", env.rcoder))
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(180))
         .header("X-Service-Type", "userapp")
         .header("X-App-Id", &app)
         .json(&json!({"userId": user, "cId": app, "fileName": "a.txt", "content": "x"}))
@@ -1943,12 +1943,9 @@ async fn userapp_dev_owner_header_lazy_ensure() {
         .expect("no-owner post");
     let status_a = resp.status();
     let body_a: Value = resp.json().await.unwrap_or(Value::Null);
-    let ok_a = status_a.as_u16() == 502
-        && body_a["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("cannot resolve owner user_id for app"));
+    let ok_a = status_a.is_success() && body_a["success"].as_bool() == Some(true);
     report.assert_hard(
-        "A：无 owner 懒创建拒（502 cannot resolve——fail-fast 防孤儿目录，生产行为钉住）",
+        "A：无 owner 懒创建直接受理（共享 builder 按 app_id 定位）",
         ok_a,
         format!("HTTP {status_a}, {}", trunc(&body_a, 160)),
     );
@@ -2013,11 +2010,12 @@ async fn userapp_dev_owner_header_lazy_ensure() {
         format!("HTTP {status_r}, {}", trunc(&body_r, 120)),
     );
 
-    // C｜白名单：非法 x-user-id（路径逃逸形态）→ 400（防宿主树拼接逃逸）
+    // C｜spec §2.1：旧 x-user-id 按名称移除（不读值、不校验、不因值 400）
+    //    ——非法值（路径逃逸形态）同样被剥离，请求正常受理
     let resp = env
         .http
         .post(format!("{}/api/computer/generate-file", env.rcoder))
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(60))
         .header("X-Service-Type", "userapp")
         .header("X-App-Id", &app)
         .header("X-User-Id", "../escape")
@@ -2028,11 +2026,8 @@ async fn userapp_dev_owner_header_lazy_ensure() {
     let status_c = resp.status();
     let body_c: Value = resp.json().await.unwrap_or(Value::Null);
     report.assert_hard(
-        "C：非法 x-user-id → 400（identifier 白名单防逃逸）",
-        status_c.as_u16() == 400
-            && body_c["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("user_id")),
+        "C：非法 x-user-id 按名称忽略（不 400——spec §2.1）",
+        status_c.is_success() && body_c["success"].as_bool() == Some(true),
         format!("HTTP {status_c}, {}", trunc(&body_c, 120)),
     );
 
@@ -3290,8 +3285,7 @@ async fn scenario_two_users_share_app() {
         format!("owner 容器数=1, ensure 幂等"),
     );
 
-    // 负例：app_id 含 '-' 被 validate_app_id 拒
-    // workspace 可能 HTTP 200 + success:false 信封——两种都算拒
+    // 正例：app_id 内部 '-' 合法（复合键禁令解除；DNS-1123 label 内部连字符）
     match env
         .http
         .post(format!("{}/api/v1/userapp/workspace", env.rcoder))
@@ -3303,15 +3297,17 @@ async fn scenario_two_users_share_app() {
         Ok(r) => {
             let status = r.status();
             let b: Value = r.json().await.unwrap_or(Value::Null);
-            let rejected = !status.is_success() || !b["success"].as_bool().unwrap_or(false);
+            // 共享模型：内部 '-' 合法（DNS-1123；复合键禁令解除），
+            // 非法档改锚定路径逃逸形态（'..' 段与首尾 '-' 仍拒）
+            let accepted = status.is_success() && b["success"].as_bool().unwrap_or(false);
             report.assert_hard(
-                "负例：app_id 含 '-' 被拒（字符集 [a-z0-9]）",
-                rejected,
+                "正例：app_id 含内部 '-' 受理（DNS-1123 label）",
+                accepted,
                 format!("HTTP {status}, {}", trunc(&b, 100)),
             );
         }
         Err(e) => {
-            report.assert_hard("负例：app_id 含 '-' 被拒", false, format!("请求失败: {e}"));
+            report.assert_hard("正例：app_id 含内部 '-' 受理", false, format!("请求失败: {e}"));
         }
     }
 

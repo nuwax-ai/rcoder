@@ -1963,6 +1963,50 @@ prepare_pg                                       # PG 非阻塞准备（initdb �
 supervisord -c /etc/supervisor/supervisord.conf  # daemon，autostart postgres/dbx/ttyd
 log "supervisord started (manages: postgresql, dbx, ttyd — autorestart on crash)"
 
+# ========== TS nuwax-file-server 热备（60001，file-server-proxy 第二上游）==========
+# 对齐主 pod start-services.sh：nuwax-file-server start --env production --port 60001
+# 后台 daemonize + /health 轮询 + 失败重试。ENABLE_TS_FILE_SERVER 默认 true。
+start_ts_file_server() {
+    if [ "${ENABLE_TS_FILE_SERVER:-true}" != "true" ]; then
+        log "TS file-server skipped (ENABLE_TS_FILE_SERVER=${ENABLE_TS_FILE_SERVER:-true})"
+        return
+    fi
+    if ! command -v nuwax-file-server >/dev/null 2>&1; then
+        log "TS file-server skipped (nuwax-file-server not found)"
+        return
+    fi
+
+    local TS_PORT=60001
+    local TS_LOG="/home/user/logs/nuwax-file-server.log"
+    mkdir -p /home/user/logs
+
+    log "Starting nuwax-file-server (TS) on port ${TS_PORT}..."
+    nuwax-file-server start --env production --port ${TS_PORT} >> ${TS_LOG} 2>&1 &
+    log "nuwax-file-server (TS) start triggered, health check in background..."
+
+    (
+        MAX_RETRIES=3
+        RETRY_COUNT=0
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            sleep 5
+            HTTP_STATUS=$(curl -s --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" http://127.0.0.1:${TS_PORT}/health 2>/dev/null || echo "000")
+            if [ "$HTTP_STATUS" = "200" ]; then
+                echo "[$(date)] nuwax-file-server (TS) health check passed" >> ${TS_LOG}
+                break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "[$(date)] nuwax-file-server (TS) health check failed (attempt ${RETRY_COUNT}/${MAX_RETRIES}), HTTP: ${HTTP_STATUS}" >> ${TS_LOG}
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                # serviceManager 内部检查 PID 文件 + start.lock，有旧进程先 stop 再 start
+                sleep 2
+                nuwax-file-server start --env production --port ${TS_PORT} >> ${TS_LOG} 2>&1 &
+                echo "[$(date)] nuwax-file-server (TS) restart triggered" >> ${TS_LOG}
+            fi
+        done
+    ) &
+}
+start_ts_file_server
+
 # ========== MCP Proxy 服务在 X11 就绪后启动 ==========
 # 注意：chrome-devtools-mcp 需要 X11 来启动 Chromium 浏览器
 # 因此必须等待 Xvnc 启动后才能启动 MCP Proxy
@@ -2367,7 +2411,11 @@ export RCODER_EMBED_FILE_SERVER=true; \
 export PROJECT_SOURCE_DIR=/home/user; \
 export USERAPP_WORKSPACE_DIR=\${USERAPP_WORKSPACE_DIR:-/home/user}; \
 export USERAPP_LOG_DIR=\${USERAPP_LOG_DIR:-/home/user/logs}; \
+export USERAPP_SINGLE_APP_ID=\${USERAPP_SINGLE_APP_ID:-\${APP_ID:-}}; \
+export LOG_BASE_DIR=/home/user/logs; \
+export COMPUTER_LOG_DIR=/home/user/logs; \
 export FILE_SERVER_PORT=60000; \
+export FILE_SERVER_PROXY_POLICY=\${FILE_SERVER_PROXY_POLICY:-all_rust}; \
 export PATH=/usr/local/bin:/usr/local/cargo/bin:\$PATH"
 
 # 如果命令行传递了参数，则执行该参数（以 root 身份，但 HOME=/home/user）

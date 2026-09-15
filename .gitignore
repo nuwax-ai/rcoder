@@ -60,3 +60,4 @@ target-tssync/
 # Isolated remote build receipts, tools, locks, and source manifests.
 /.remote-k8s/
 target-check/
+/target-appcli/

@@ -1,6 +1,8 @@
 # 构建产物（最重要：排除 target 避免传输19GB）
 target/
 **/target/
+target-check/
+target-appcli/
 
 # Git 相关
 .git
