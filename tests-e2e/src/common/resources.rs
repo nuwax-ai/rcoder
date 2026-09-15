@@ -177,11 +177,11 @@ fn require_container_absent(id: &str) -> Result<(), String> {
 
 /// Deliberate test fault: remove only the registered physical builder, retaining
 /// application identity and data. This is not full application cleanup.
-pub fn remove_builder_for_recreation(app_id: &str, user_id: &str, id: &str) -> Result<(), String> {
+pub fn remove_builder_for_recreation(app_id: &str, _user_id: &str, id: &str) -> Result<(), String> {
     let root =
         PathBuf::from(std::env::var_os("E2E_REPORT_DIR").ok_or("strict report context required")?)
             .join("resources");
-    let name = format!("rcoder-app-builder-{user_id}-{app_id}");
+    let name = format!("rcoder-app-builder-{app_id}");
     let previous: serde_json::Value = serde_json::from_slice(
         &std::fs::read(root.join(format!("{name}-ownership.json")))
             .map_err(|error| error.to_string())?,
@@ -189,7 +189,6 @@ pub fn remove_builder_for_recreation(app_id: &str, user_id: &str, id: &str) -> R
     .map_err(|error| error.to_string())?;
     if previous["id"] != id
         || previous["app_id"] != app_id
-        || previous["user_id"] != user_id
         || previous["case_id"].as_str() != std::env::var("E2E_CASE_ID").ok().as_deref()
         || previous["service_type"] != "user-app-builder"
     {

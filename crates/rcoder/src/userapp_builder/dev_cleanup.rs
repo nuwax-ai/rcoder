@@ -287,9 +287,9 @@ impl CapturedDeletion {
                 .map_err(|e| format!("delete collaborator builder ({instance}): {e}"))?;
         }
         if self.snapshot.docker_bind_cleanup {
-            // snapshot.app_id 应用共享后即纯 app_id（存量复合残留右切兼容）
-            let pure_app = shared_types::legacy_composite_app_segment(&self.snapshot.app_id);
-            remove_bind_directories(pure_app).await?;
+            // snapshot.app_id 应用共享后恒纯 app_id——app_id 内部连字符已合法
+            // （DNS-1123），不能按 '-' 右切还原（会把 ae2env-xxx 切成 xxx）
+            remove_bind_directories(&self.snapshot.app_id).await?;
         }
         match &self.registry_identity {
             Some((generation, container_id)) => {
