@@ -533,5 +533,16 @@
     "上传 vite 项目 zip",
     "start-dev 前置",
     "HMR WebSocket 握手（Upgrade 全链透传）"
+  ],
+  "userapp_dev_two_users_share_app": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "u2 pod/ensure 协作者实例受理（轻量路径，不撞 owner lifecycle）",
+    "两实例容器并存（rcoder-app-builder-{u1}-{app} + {u2}-{app}）",
+    "u1 写入 owner-only.txt",
+    "u2 工作区不可见 u1 文件（实例隔离）",
+    "D5：无显式 user_id 回落 owner 实例（幂等，不建第二容器）",
+    "负例：app_id 含 '-' 被拒（字符集 [a-z0-9]）",
+    "u1 purge 删除 app（受理）",
+    "purge 后两实例容器全清（owner+协作者）"
   ]
 }

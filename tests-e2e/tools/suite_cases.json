@@ -64,7 +64,8 @@
     "userapp_dev_template_zip_and_projects",
     "userapp_dev_terminal_cwd_via_ttyd_ws",
     "userapp_dev_two_turn_isolation_anthropic",
-    "userapp_dev_two_turn_isolation_openai"
+    "userapp_dev_two_turn_isolation_openai",
+    "userapp_dev_two_users_share_app"
   ],
   "compose_userapp_faults": [
     "userapp_hot_deployment_builtin_contract",

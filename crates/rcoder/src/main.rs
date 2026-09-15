@@ -243,9 +243,16 @@ async fn main() -> anyhow::Result<()> {
         // Pingora 预览路由槽回填（协调器晚于 Pingora 启动，与 dev_ensure 同款模式）：
         // `/proxy/{port}` 预览解析 + `/internal/preview-forward` 宿主校验入口。
         if let Some(pingora_service) = proxy_result.pingora_service.as_ref() {
+            let proxy_listen_port = bootstrap_result
+                .config
+                .proxy_config
+                .as_ref()
+                .map(|proxy| proxy.listen_port)
+                .unwrap_or(8088);
             pingora_service.set_preview_routing(rcoder_proxy::service::PreviewRouteDeps {
                 coordination: coordinator.clone(),
                 peer_api_port: bootstrap_result.config.port,
+                peer_proxy_port: proxy_listen_port,
                 internal_token: coordinator.internal_token().to_string(),
             });
         }

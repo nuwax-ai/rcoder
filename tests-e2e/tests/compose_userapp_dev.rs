@@ -3227,11 +3227,14 @@ async fn scenario_two_users_share_app() {
         .post(format!("{}/api/v1/userapp/generate-file", env.rcoder))
         .timeout(Duration::from_secs(60))
         .header("X-App-Id", &app)
+        .header("x-user-id", u1)
         .json(&json!({"app_id": app, "user_id": u1, "file_name": "owner-only.txt", "content": "u1 secret"}))
         .send()
         .await;
     let w1_ok = matches!(&w1, Ok(r) if r.status().is_success());
     report.assert_hard("u1 写入 owner-only.txt", w1_ok, "generate-file".into());
+    // 实例定位契约：透传族经 `x-user-id` header（Java 出站统一携带）；
+    // query 的 user_id 是容器内接口自身参数，不参与宿主定位
     let list2 = env
         .http
         .get(format!(
@@ -3240,6 +3243,7 @@ async fn scenario_two_users_share_app() {
         ))
         .timeout(Duration::from_secs(60))
         .header("X-App-Id", &app)
+        .header("x-user-id", u2)
         .send()
         .await;
     let leak = match list2 {
@@ -3258,19 +3262,40 @@ async fn scenario_two_users_share_app() {
     // chat workdir：两用户各自 chat 回显复合键 project（session 映射实例化）
     // ——信封级断言（完整 chat 需 LLM，双用户文件/容器断言已覆盖核心语义）
 
-    // 负例：双缺 user_id → 400/业务错（fail-fast，绝不兜底建孤儿）
-    let neg = env
+    // D5 正向：无显式 user_id → 回落 metadata owner 实例（老调用兼容），
+    // 幂等受理且不新建第二容器（owner 容器数恒 1）
+    let fallback = env
         .http
         .post(format!("{}/computer/pod/ensure", env.rcoder))
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(120))
         .json(&json!({"app_id": app, "app_stage": "dev"}))
         .send()
         .await;
-    let neg_rejected = matches!(&neg, Ok(r) if !r.status().is_success());
+    let owner_count_unchanged = match fallback {
+        Ok(r) => {
+            let s = r.status();
+            let b: Value = r.json().await.unwrap_or(Value::Null);
+            let ok = s.is_success() && b["success"].as_bool().unwrap_or(false);
+            let count = std::process::Command::new("docker")
+                .args([
+                    "ps",
+                    "-a",
+                    "--filter",
+                    &format!("name=rcoder-app-builder-{u1}-{app}"),
+                    "--format",
+                    "{{.Names}}",
+                ])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().lines().count())
+                .unwrap_or(99);
+            ok && count == 1
+        }
+        Err(_) => false,
+    };
     report.assert_hard(
-        "负例：双缺 user_id 被拒（fail-fast）",
-        neg_rejected,
-        format!("{:?}", neg.as_ref().map(|r| r.status())),
+        "D5：无显式 user_id 回落 owner 实例（幂等，不建第二容器）",
+        owner_count_unchanged,
+        format!("owner 容器数=1, ensure 幂等"),
     );
 
     // 负例：app_id 含 '-' 被 validate_app_id 拒
@@ -3301,7 +3326,7 @@ async fn scenario_two_users_share_app() {
     // purge：owner 删除 app（连协作者实例一起清——capture 排除法全清语义）
     let del = post_json(
         &env,
-        &format!("/api/v1/userapp/{app}/dev/delete"),
+        &format!("/api/v1/userapp/{app}/prod/delete"),
         json!({"user_id": u1, "purge": true}),
     )
     .await;

@@ -76,9 +76,11 @@ pub async fn handle_port_proxy_request(
         upstream_request.insert_header("x-preview-internal-token", &deps.internal_token)?;
         upstream_request.insert_header("Host", "127.0.0.1")?;
         utils::set_common_headers(upstream_request)?;
-        ctx.preview_peer = Some((host_ip, deps.peer_api_port));
+        // /internal/preview-forward 注册在宿主的 Pingora 代理面（非 axum 主
+        // API）——转发上游必须用对等副本的 proxy 端口（实测 8086 会 404→502）
+        ctx.preview_peer = Some((host_ip, deps.peer_proxy_port));
         ctx.preview_origin_port = Some(port);
-        ctx.target_port = Some(deps.peer_api_port);
+        ctx.target_port = Some(deps.peer_proxy_port);
         return Ok(());
     }
 

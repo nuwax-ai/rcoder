@@ -424,5 +424,11 @@
       "scenario": "cpp_hmr_websocket",
       "backend": "compose"
     }
+  ],
+  "userapp_dev_two_users_share_app": [
+    {
+      "scenario": "userapp_dev_two_users_share_app",
+      "backend": "compose"
+    }
   ]
 }

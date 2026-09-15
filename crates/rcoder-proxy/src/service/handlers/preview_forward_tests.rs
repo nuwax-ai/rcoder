@@ -116,6 +116,7 @@ fn slot_with(
         PreviewRouteDeps {
             coordination: Arc::new(StubCoordination { resolution }),
             peer_api_port: 8086,
+            peer_proxy_port: 8088,
             internal_token: "unit-test-token".into(),
         },
     )))))
@@ -190,8 +191,8 @@ async fn port_proxy_forwards_to_remote_host_when_resolved() {
     );
     assert_eq!(
         ctx.preview_peer,
-        Some(("10.1.2.3".to_string(), 8086)),
-        "上游覆盖为宿主 Pod 主 API 端口"
+        Some(("10.1.2.3".to_string(), 8088)),
+        "上游覆盖为宿主 Pod 的 Pingora 代理端口"
     );
     assert_eq!(ctx.preview_origin_port, Some(4200));
 }

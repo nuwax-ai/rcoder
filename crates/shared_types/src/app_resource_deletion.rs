@@ -100,7 +100,13 @@ impl UserAppDeletionCheckpoint {
         }
         validate_deletion_resources(&self.production.operation_id, &self.production.resources)?;
         if let Some(development) = &self.development {
-            if development.runtime.app_id != self.context.app_id {
+            // development.runtime.app_id 携带实例复合 identifier
+            //（`{user_id}-{app_id}`）——按 app 段还原比对（与 capture 侧
+            // capture_dev_deletion 的还原语义同源；非复合形态原样比对）
+            let development_app = crate::parse_builder_instance_id(&development.runtime.app_id)
+                .map(|(_, app)| app)
+                .unwrap_or(development.runtime.app_id.as_str());
+            if development_app != self.context.app_id {
                 return Err(
                     "Development deletion checkpoint belongs to another application".into(),
                 );

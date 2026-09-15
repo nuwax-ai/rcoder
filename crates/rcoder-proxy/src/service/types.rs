@@ -280,8 +280,11 @@ pub const AUDIO_WS_PORT: u16 = 6089; // 音频 WebSocket 流
 /// 槽同款回填模式（PortProxy 与 PingoraProxyService 共享同一 Arc）。
 pub struct PreviewRouteDeps {
     pub coordination: Arc<dyn shared_types::PreviewCoordination>,
-    /// 对等副本主 API 端口（跨 Pod 内部入口宿主面）。
+    /// 对等副本主 API 端口（跨 Pod stop/verify/log 派发 → axum 内部端点）。
     pub peer_api_port: u16,
+    /// 对等副本 Pingora 代理端口（跨 Pod 预览转发 `/internal/preview-forward`
+    /// 的宿主面——该路由注册在 Pingora 路由表，非 axum 主 API）。
+    pub peer_proxy_port: u16,
     /// 内部令牌（转发 hop 注入；宿主侧校验，不符 404）。
     pub internal_token: String,
 }
