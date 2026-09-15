@@ -8,6 +8,7 @@ use super::error_classify::{STDERR_RING_CAP, StderrRing};
 use super::log;
 use super::port_pool::PortPool;
 use super::process;
+use super::supervise::SupervisedChild;
 use super::support::{early_exit_err, ldrtemp, lock, read_dev_script};
 use super::types::{AliveProbe, DevServerManager, StartedDev};
 use crate::error::{AppError, AppResult};
@@ -51,14 +52,14 @@ impl Drop for AllocGuard<'_> {
 impl DevServerManager {
     /// start-dev (对齐 nuwax startDevServer)。
     ///
-    /// `on_event`：app-cli 编排事件行回调（仅 manifest 引擎消费——Userapp dev
-    /// 链路转发任务 SSE；web 域 vite 路径传 None）。
+    /// `hooks`：app-cli 编排事件钩子（仅 manifest 引擎消费——Userapp dev
+    /// 链路转发任务 SSE + 流结束通知；web 域 vite 路径传 None）。
     pub async fn start_dev(
         &self,
         project_id: &str,
         project_path: &Path,
         base_path: Option<&str>,
-        on_event: Option<process::OnLineCallback>,
+        hooks: Option<super::supervise::DevEventHooks>,
     ) -> AppResult<StartedDev> {
         // 启动锁
         {
@@ -74,7 +75,7 @@ impl DevServerManager {
             starting: &self.starting,
             project_id: project_id.to_string(),
         };
-        self.start_dev_inner(project_id, project_path, base_path, on_event)
+        self.start_dev_inner(project_id, project_path, base_path, hooks)
             .await
     }
 
@@ -83,7 +84,7 @@ impl DevServerManager {
         project_id: &str,
         project_path: &Path,
         base_path: Option<&str>,
-        on_event: Option<process::OnLineCallback>,
+        hooks: Option<super::supervise::DevEventHooks>,
     ) -> AppResult<StartedDev> {
         // Userapp workspace 分流：workspace.manifest.toml 存在 → app-cli 引擎。
         // manifest 多服务（Java/Go 等）的正确运行态 = app-cli 按 run.command
@@ -94,7 +95,7 @@ impl DevServerManager {
         let manifest = project_path.join("workspace.manifest.toml");
         if tokio::fs::try_exists(&manifest).await.unwrap_or(false) {
             return self
-                .start_dev_manifest(project_id, project_path, on_event)
+                .start_dev_manifest(project_id, project_path, hooks)
                 .await;
         }
         // 幂等: 已运行则返回现有 pid/port
@@ -268,7 +269,7 @@ impl DevServerManager {
         &self,
         project_id: &str,
         project_path: &Path,
-        on_event: Option<process::OnLineCallback>,
+        hooks: Option<super::supervise::DevEventHooks>,
     ) -> AppResult<StartedDev> {
         // 单一来源 shared_types::APP_ENTRY_PORT（release 流程、Pingora 免端口代理同值）
         const PINGAP_ENTRY_PORT: u16 = shared_types::APP_ENTRY_PORT;
@@ -295,8 +296,11 @@ impl DevServerManager {
         // env 注入 APP_CLI_RUN_PROFILE=dev：源码态 dev 链路信号——app-cli 编排
         // 时 [devrun].command 优先、[run].command 兜底（产物态/生产不注入恒走
         // [run]，见 app-cli supervisor::effective_run_argv）。
+        // P1-03：编排器程序可经 config.app_cli_bin 覆盖（默认 PATH 的 app-cli；
+        // 测试注入受控假编排器，生产行为不变）。
+        let program = self.config.app_cli_bin.as_deref().unwrap_or("app-cli");
         let (child, stdout, stderr) = process::spawn_dev(
-            "app-cli",
+            program,
             &[
                 "--workspace".to_string(),
                 project_path.display().to_string(),
@@ -308,18 +312,20 @@ impl DevServerManager {
             project_path,
             &[("APP_CLI_RUN_PROFILE".to_string(), "dev".to_string())],
         )?;
-        let pid = child
-            .id()
-            .ok_or_else(|| AppError::system("spawned app-cli has no pid"))?;
+        // P1-03：Child 收编唯一监督 worker（wait/reap 真实 ExitStatus + stdout
+        // 管道句柄 + stderr ring）——不再 drop(child)；停止仍走进程组信号路径。
         let stderr_ring: Arc<StderrRing> = Arc::new(Mutex::new(
             std::collections::VecDeque::with_capacity(STDERR_RING_CAP),
         ));
+        let supervised = SupervisedChild::adopt(child, stderr_ring.clone());
+        let pid = supervised.pid();
         if let Some(out) = stdout {
-            // EVT 识别（on_event Some 时回调编排事件行；None 退化为普通管道——
-            // 回调为 no-op 的闭包，日志行为不变）
-            let sink =
-                on_event.unwrap_or_else(|| Arc::new(|_json: &str| {}) as process::OnLineCallback);
-            log::spawn_log_pipe_with_events(out, main_log.clone(), temp_log.clone(), sink);
+            // EVT 识别（hooks Some 时回调编排事件行；None 退化为 no-op 闭包，
+            // 日志行为不变）；管道结束（EOF/读错）经 hooks.on_end 上报恰好一次。
+            let pipe_hooks = hooks.unwrap_or_else(super::supervise::DevEventHooks::noop);
+            let pipe =
+                log::spawn_log_pipe_with_events(out, main_log.clone(), temp_log.clone(), pipe_hooks);
+            supervised.attach_stdout(pipe);
         }
         if let Some(err) = stderr {
             log::spawn_log_pipe_with_ring(
@@ -329,7 +335,6 @@ impl DevServerManager {
                 stderr_ring.clone(),
             );
         }
-        drop(child);
 
         // 早退检测 + 宽松就绪（pingap 按 [proxy] path 路由，根路径可能 404——
         // HTTP 判不通但进程存活即通过）
@@ -357,6 +362,7 @@ impl DevServerManager {
                 temp_log_name: log::temp_log_name(now),
             },
         );
+        lock(&self.supervised)?.insert(project_id.to_string(), supervised);
 
         Ok(StartedDev {
             pid,

@@ -14,6 +14,9 @@ impl DevServerManager {
     /// 释放端口 + 清 temp 日志)。候选 pid = 内存 Map pid ∪ `ps` 扫描 pid (去重)。
     pub async fn stop_dev(&self, project_id: &str) -> AppResult<StoppedDev> {
         let proc = lock(&self.processes)?.remove(project_id);
+        // P1-03：监督句柄同步摘除（进程组终止后句柄的 wait worker 自行收割
+        // 退出；此处不等待——停止确认语义在 dev 任务层经 wait_exit 处理）。
+        let supervised = lock(&self.supervised)?.remove(project_id);
         // 候选 pid: 内存 Map + 系统扫描 (去重)
         let mut candidates: Vec<u32> = Vec::new();
         if let Some(p) = &proc {
@@ -45,6 +48,16 @@ impl DevServerManager {
         if let Some(p) = proc {
             self.port_pool.release(project_id);
             log::cleanup_temp_logs(&p.log_dir).await;
+        }
+        // stdout 管道有界排空（进程组已停；后代持有写端时窗口到期放弃）。
+        if let Some(supervised) = supervised {
+            supervised
+                .drain_stdout(std::time::Duration::from_secs(
+                    self.config.dev_stop_max_attempts as u64
+                        * self.config.dev_stop_check_interval_ms
+                        / 1000,
+                ))
+                .await;
         }
         Ok(StoppedDev {
             killed_pids: killed,

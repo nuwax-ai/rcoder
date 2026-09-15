@@ -16,6 +16,7 @@ pub mod error_classify;
 pub mod log;
 pub mod port_pool;
 pub mod process;
+pub mod supervise;
 mod start;
 mod stop;
 mod support;
@@ -26,28 +27,39 @@ pub use error_classify::{STDERR_RING_CAP, StderrRing, ViteStartupError};
 pub use log::read_dev_log;
 pub use port_pool::{PortPool, PortPoolStatus};
 pub use process::{is_process_running, is_project_alive, kill_process_group, now_ms};
+pub use supervise::{ChildExit, DevEventHooks, StreamEndReason, SupervisedChild};
 pub use types::KeepAliveResult;
 pub use types::{DevServerManager, StartedDev, StoppedDev};
 
 use crate::models::{DevProcess, ReadDevLogResult};
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::error::AppResult;
 use support::lock;
 
 impl DevServerManager {
-    /// restart-dev = stop + start（`on_event` 语义同 [`Self::start_dev`]）。
+    /// restart-dev = stop + start（`hooks` 语义同 [`Self::start_dev`]）。
     pub async fn restart_dev(
         &self,
         project_id: &str,
         project_path: &Path,
         base_path: Option<&str>,
-        on_event: Option<process::OnLineCallback>,
+        hooks: Option<DevEventHooks>,
     ) -> AppResult<StartedDev> {
         self.stop_dev(project_id).await?;
-        self.start_dev(project_id, project_path, base_path, on_event)
+        self.start_dev(project_id, project_path, base_path, hooks)
             .await
+    }
+
+    /// 取 UserApp manifest 编排进程的监督句柄（P1-03/P1-04：调用方经此
+    /// 观察 exit/stderr 尾部与有界排空；未登记（vite 路径或未启动）None）。
+    pub fn supervised_child(&self, project_id: &str) -> Option<Arc<SupervisedChild>> {
+        lock(&self.supervised)
+            .ok()?
+            .get(project_id)
+            .cloned()
     }
 
     /// keep-alive (对齐 nuwax: 探活, 不存活则重启)。
@@ -161,7 +173,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_all_empty_is_noop() {
         // 空实例表 → 立即返回, 不 panic
-        let mgr = DevServerManager::new(std::sync::Arc::new(
+        let mgr = DevServerManager::new(Arc::new(
             Config::from_env().expect("test config"),
         ));
         mgr.shutdown_all().await;
@@ -170,7 +182,7 @@ mod tests {
     #[tokio::test]
     async fn drop_with_stale_entry_does_not_panic() {
         // 塞一个不可能存活的 pid: Drop 对其 SIGKILL 返回 false 但不 panic, 仍还端口 + 清表
-        let mgr = DevServerManager::new(std::sync::Arc::new(
+        let mgr = DevServerManager::new(Arc::new(
             Config::from_env().expect("test config"),
         ));
         {
@@ -199,11 +211,10 @@ mod tests {
         // 的循环逻辑——server ready 时首轮探活即返回，而非固定盲等 sleep。
         let mut config = Config::from_env().expect("test config");
         config.dev_alive_poll_interval_ms = 10;
-        let mgr = DevServerManager::new(std::sync::Arc::new(config));
+        let mgr = DevServerManager::new(Arc::new(config));
         // pid 用当前进程 → is_process_running 恒 true
         let pid = std::process::id();
-        let ring: std::sync::Arc<StderrRing> =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let ring: Arc<StderrRing> = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let start = std::time::Instant::now();
         let res = mgr
             .poll_alive(pid, 0, None, &ring, &|_port, _base, _timeout| {

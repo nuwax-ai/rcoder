@@ -49,6 +49,10 @@ pub struct KeepAliveResult {
 pub struct DevServerManager {
     pub(super) processes: Mutex<HashMap<String, DevProcess>>,
     pub(super) starting: Mutex<HashSet<String>>,
+    /// UserApp manifest 编排进程（app-cli）的监督句柄（P1-03：唯一
+    /// wait/reap + stdout 管道 + stderr ring；vite 路径不登记）。key 与
+    /// processes 同（project_id）；stop_dev 同步摘除。
+    pub(super) supervised: Mutex<HashMap<String, Arc<super::supervise::SupervisedChild>>>,
     pub(super) port_pool: PortPool,
     pub(super) config: Arc<Config>,
 }
@@ -64,6 +68,7 @@ impl DevServerManager {
         Self {
             processes: Mutex::new(HashMap::new()),
             starting: Mutex::new(HashSet::new()),
+            supervised: Mutex::new(HashMap::new()),
             port_pool: pool,
             config,
         }

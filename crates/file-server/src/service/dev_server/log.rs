@@ -156,30 +156,33 @@ where
 pub const APP_CLI_EVT_PREFIX: &str = "APP-CLI-EVT ";
 
 /// 同 [`spawn_log_pipe`], 额外识别 app-cli 编排事件行：行首
-/// [`APP_CLI_EVT_PREFIX`] 匹配 → 去前缀的 JSON 部分回调 `on_event`（dev 链路
-/// 转发任务 SSE）；EVT 行照常写日志（排障可见），非 EVT 行只写日志不回调。
+/// [`APP_CLI_EVT_PREFIX`] 匹配 → 去前缀的 JSON 部分回调 `hooks.on_line`
+/// （dev 链路转发任务 SSE）；EVT 行照常写日志（排障可见），非 EVT 行只写
+/// 日志不回调。管道结束（EOF/读错）时回调 `hooks.on_end` 恰好一次（P1-03：
+/// 调用方据此终结"等编排事件流"的等待——旧版 EOF 只静默退出，等待方只能
+/// 靠窗口超时兜底）。
 pub fn spawn_log_pipe_with_events<R>(
     reader: R,
     main_path: PathBuf,
     temp_path: PathBuf,
-    on_event: super::process::OnLineCallback,
+    hooks: super::supervise::DevEventHooks,
 ) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         let mut lines = BufReader::new(reader).lines();
-        loop {
+        let end_reason = loop {
             let line = match lines.next_line().await {
                 Ok(Some(l)) => l,
-                Ok(None) => break,
+                Ok(None) => break super::supervise::StreamEndReason::Eof,
                 Err(e) => {
                     tracing::warn!(error = %e, "log pipe read failed, stream logging stopped");
-                    break;
+                    break super::supervise::StreamEndReason::ReadFailed(e.to_string());
                 }
             };
             if let Some(json) = line.strip_prefix(APP_CLI_EVT_PREFIX) {
-                on_event(json);
+                (hooks.on_line)(json);
             }
             let prefixed = format!("{}{}", timestamp_prefix(), line);
             if let Err(e) = append_line(&main_path, &prefixed).await {
@@ -188,6 +191,9 @@ where
             if let Err(e) = append_line(&temp_path, &prefixed).await {
                 tracing::warn!(error = %e, "append_line (temp log) failed");
             }
+        };
+        if let Some(on_end) = hooks.on_end {
+            on_end(&end_reason);
         }
     })
 }
@@ -349,11 +355,13 @@ mod evt_tests {
         let (mut writer, reader) = tokio::io::duplex(4096);
         let hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = hits.clone();
-        let callback: crate::service::dev_server::process::OnLineCallback =
-            Arc::new(move |json: &str| {
+        let hooks = crate::service::dev_server::DevEventHooks {
+            on_line: Arc::new(move |json: &str| {
                 sink.lock().expect("lock").push(json.to_string());
-            });
-        let handle = spawn_log_pipe_with_events(reader, main.clone(), temp.clone(), callback);
+            }) as crate::service::dev_server::process::OnLineCallback,
+            on_end: None,
+        };
+        let handle = spawn_log_pipe_with_events(reader, main.clone(), temp.clone(), hooks);
         use tokio::io::AsyncWriteExt as _;
         writer
             .write_all(

@@ -165,6 +165,7 @@ impl Config {
         parse!(dev_stop_max_attempts, "DEV_STOP_MAX_ATTEMPTS");
         parse!(dev_command_timeout_secs, "DEV_COMMAND_TIMEOUT_SECS");
         parse!(max_build_concurrency, "MAX_BUILD_CONCURRENCY");
+        self.app_cli_bin = env_opt_string("FILE_SERVER_APP_CLI_BIN")?;
         self.validate()?;
         Ok(self)
     }
@@ -276,6 +277,7 @@ impl Config {
             dev_stop_max_attempts: env_parse("DEV_STOP_MAX_ATTEMPTS", 50)?,
             dev_command_timeout_secs: env_parse("DEV_COMMAND_TIMEOUT_SECS", 600)?,
             max_build_concurrency: env_parse("MAX_BUILD_CONCURRENCY", 20)?,
+            app_cli_bin: env_opt_string("FILE_SERVER_APP_CLI_BIN")?,
         };
         config.validate()?;
         Ok(config)

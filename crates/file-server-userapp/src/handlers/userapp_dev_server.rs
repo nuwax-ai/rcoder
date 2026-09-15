@@ -343,14 +343,23 @@ async fn spawn_dev_task(
             .map(Some)
         };
         let (evt_tx, event_pipe) = StartEventPipe::new(task_clone.clone());
-        let on_event = {
-            let tx = evt_tx.clone();
-            std::sync::Arc::new(move |json: &str| match map_app_cli_evt(json) {
-                Some(event) => {
-                    drop(tx.send(event));
-                }
-                None => tracing::warn!(json, "[DEV_START] unparsed app-cli EVT line dropped"),
-            }) as file_server::service::dev_server::process::OnLineCallback
+        let hook_tx = evt_tx.clone();
+        let runtime_hooks_tx = evt_tx.clone();
+        let hooks = file_server::service::dev_server::DevEventHooks {
+            on_line: {
+                let tx = hook_tx;
+                std::sync::Arc::new(move |json: &str| match map_app_cli_evt(json) {
+                    Some(event) => {
+                        drop(tx.send(event));
+                    }
+                    None => tracing::warn!(json, "[DEV_START] unparsed app-cli EVT line dropped"),
+                }) as file_server::service::dev_server::process::OnLineCallback
+            },
+            on_end: Some(std::sync::Arc::new(move |end| {
+                drop(runtime_hooks_tx.send(EvtOutcome::StreamEnded {
+                    reason: end.to_string(),
+                }));
+            })),
         };
         let outcome = async {
             result?;
@@ -405,13 +414,13 @@ async fn spawn_dev_task(
                 DevTaskAction::Start => {
                     state
                         .fs.dev_server
-                        .start_dev(&key, &run_root, base_path.as_deref(), Some(on_event.clone()))
+                        .start_dev(&key, &run_root, base_path.as_deref(), Some(hooks.clone()))
                         .await?;
                 }
                 DevTaskAction::Restart => {
                     state
                         .fs.dev_server
-                        .restart_dev(&key, &run_root, base_path.as_deref(), Some(on_event.clone()))
+                        .restart_dev(&key, &run_root, base_path.as_deref(), Some(hooks.clone()))
                         .await?;
                 }
             }
@@ -419,6 +428,20 @@ async fn spawn_dev_task(
             }).await? {
                 return Ok(());
             }
+            if let Some(supervised) = state.fs.dev_server.supervised_child(&key) {
+                let exit_tx = evt_tx.clone();
+                let span = tracing::Span::current();
+                tokio::spawn({
+                    let supervised = supervised.clone();
+                    async move {
+                        if let Some(exit) = supervised.wait_exit(std::time::Duration::from_secs(START_DONE_WAIT_MAX_SECS)).await {
+                            let _guard = span.enter();
+                            drop(exit_tx.send(EvtOutcome::ProducerExited { exit: exit.describe() }));
+                        }
+                    }
+                });
+            }
+            let _ = drop(evt_tx);
             event_pipe.finish(std::time::Duration::from_secs(START_DONE_WAIT_MAX_SECS)).await
         }
         .await;
