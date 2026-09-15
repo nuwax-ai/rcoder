@@ -421,10 +421,7 @@ fn purge_body(app_id: &str, receipt: Option<&serde_json::Value>) -> Result<Strin
     if receipt["app_id"].as_str() != Some(app_id) {
         return Err("application receipt identity does not match cleanup target".into());
     }
-    let user_id = receipt["user_id"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or("application receipt is missing its registered owner")?;
+    // 共享模型：user_id 不再是必填归属档（owner 标签/注册已退役）
     let lifecycle_id = receipt["lifecycle_id"]
         .as_str()
         .filter(|value| !value.is_empty())
@@ -434,7 +431,6 @@ fn purge_body(app_id: &str, receipt: Option<&serde_json::Value>) -> Result<Strin
         .filter(|value| !value.is_empty())
         .ok_or("application receipt is missing its test case identity")?;
     Ok(serde_json::json!({
-        "user_id": user_id,
         "lifecycle_id": lifecycle_id,
         "request_id": format!("cleanup-{case_id}-{app_id}"),
     })
