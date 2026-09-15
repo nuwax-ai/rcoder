@@ -25,7 +25,6 @@ impl AppService {
         self.start_app_controlled(
             app_id,
             shared_types::UserAppControlRequest {
-                user_id: identity.user_id,
                 lifecycle_id: None,
                 request_id: None,
             },
@@ -94,7 +93,7 @@ impl AppService {
                         shared_types::UserAppControlCommand::Start { traffic: false }
                     }),
                     app_id: app_id.into(),
-                    user_id: request.user_id.clone(),
+                    user_id: String::new(),
                     lifecycle_id: request.lifecycle_id.clone(),
                     request_id: request.request_id.clone(),
                     operation_id: uuid::Uuid::new_v4().to_string(),
@@ -186,7 +185,6 @@ impl AppService {
         self.scale_to_zero_controlled(
             app_id,
             shared_types::UserAppControlRequest {
-                user_id: identity.user_id,
                 // Only the internal recycler supplies the authoritative current token.
                 lifecycle_id: wake_on_traffic.then_some(identity.lifecycle_id),
                 request_id: None,
@@ -248,7 +246,7 @@ impl AppService {
                     runtime_policy_on_success: None,
                     command: Some(shared_types::UserAppControlCommand::Stop { wake_on_traffic }),
                     app_id: app_id.into(),
-                    user_id: request.user_id.clone(),
+                    user_id: String::new(),
                     lifecycle_id: request.lifecycle_id.clone(),
                     operation_id: uuid::Uuid::new_v4().to_string(),
                     request_id: request.request_id.clone(),
@@ -364,7 +362,6 @@ impl AppService {
         self.restart_app_controlled(
             app_id,
             shared_types::UserAppControlRequest {
-                user_id: identity.user_id,
                 lifecycle_id: None,
                 request_id: None,
             },

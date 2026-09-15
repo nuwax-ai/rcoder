@@ -46,7 +46,6 @@ impl AppService {
             lifecycle_id: lifecycle_id.map(str::to_owned),
             request_id: None,
             name: name.to_string(),
-            user_id: owner.into(),
             image: Some(image),
             command: None,
             env: Some(env),

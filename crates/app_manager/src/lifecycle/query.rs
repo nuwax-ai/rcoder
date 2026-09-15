@@ -123,7 +123,7 @@ impl AppService {
                 .join("; ");
             AppOperationError::Validation(msg)
         })?;
-        let mut items = self.list_app_runtimes(request.user_id.trim()).await?;
+        let mut items = self.list_app_runtimes("").await?;
         let metadata = self.metadata.snapshot().await?;
 
         // 过滤：status/app_ids 为运行时字段直接生效；name/created_at 需业务元数据
@@ -302,7 +302,7 @@ mod tests {
             service
                 .metadata
                 .store
-                .ensure_identity(&app_id, "policy-owner")
+                .ensure_identity(&app_id)
                 .await
                 .expect("identity");
         }

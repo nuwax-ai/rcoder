@@ -17,7 +17,7 @@ macro_rules! implement_store {
                 let mut tx = self.pool.begin_with($begin).await.map_err(storage)?;
                 let encoded: Option<String> = sqlx::query_scalar($locked).bind(&binding.app_id).fetch_optional(&mut *tx).await.map_err(storage)?;
                 let mut app: UserAppLifecycleRecord = serde_json::from_str(&encoded.ok_or(Error::NotFound)?).map_err(storage)?;
-                domain::validate_active(&app))?;
+                domain::validate_active(&app)?;
                 if app.lifecycle_id != binding.lifecycle_id { return Err(Error::LifecycleConflict); }
                 let encoded: Option<String> = sqlx::query_scalar("SELECT record FROM userapp_operations WHERE app_id=$1 AND operation_id=$2")
                     .bind(&binding.app_id).bind(&progress.operation_id).fetch_optional(&mut *tx).await.map_err(storage)?;
@@ -70,7 +70,6 @@ macro_rules! implement_store {
             async fn ensure_identity(
                 &self,
                 app_id: &str,
-                user_id: &str,
             ) -> Result<UserAppLifecycleRecord, Error> {
                 let proposed = domain::identity(app_id)?;
                 let mut tx = self
@@ -125,8 +124,7 @@ macro_rules! implement_store {
                 &self,
                 legacy: &shared_types::AppMetadataRecord,
             ) -> Result<UserAppLifecycleRecord, Error> {
-                let owner = legacy.as_deref().filter(|owner| !owner.trim().is_empty())
-                    .ok_or_else(|| Error::InvalidOperation("legacy application owner is missing".into()))?;
+                // Owner validation removed with user binding removal
                 let mut proposed = domain::identity(&legacy.app_id)?;
                 proposed.name = legacy.name.clone();
                 proposed.tenant_id = legacy.tenant_id.clone();
@@ -521,7 +519,6 @@ macro_rules! implement_store {
             async fn recreate(
                 &self,
                 app_id: &str,
-                user_id: &str,
                 expected_lifecycle_id: &str,
                 request_id: &str,
             ) -> Result<UserAppLifecycleRecord, Error> {
@@ -587,4 +584,5 @@ macro_rules! implement_store {
             }
         }
     };
+}
 pub(super) use implement_store;

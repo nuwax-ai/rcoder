@@ -190,7 +190,6 @@ impl crate::service::AppService {
             app_stage,
             app_id,
             ClearStorageRequest {
-                user_id: user_id.into(),
                 lifecycle_id: None,
                 request_id: None,
             },
@@ -211,7 +210,7 @@ impl crate::service::AppService {
         guard: &crate::service::AppOperationGuard,
         leases: &mut StorageClearLeases,
     ) -> AppResult<()> {
-        operation.bind_lease(guard, user_id).await?;
+        operation.bind_lease(guard).await?;
         let workspace_client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -222,7 +221,7 @@ impl crate::service::AppService {
         let target = if !production {
             let mut ticket = self.capture_dev_deletion(app_id).await?;
             let receipt = ticket.receipt();
-            let context = operation.execution_context(user_id);
+            let context = operation.execution_context();
             let endpoint = ticket
                 .workspace_endpoint(&context)
                 .await
@@ -232,7 +231,6 @@ impl crate::service::AppService {
                 .get(format!("{base_url}/api/v1/userapp/app-files/clear-target"))
                 .query(&shared_types::UserAppWorkspaceClearProbe {
                     app_id: app_id.into(),
-                    user_id: user_id.to_owned(),
                 })
                 .timeout(std::time::Duration::from_secs(10))
                 .send()
@@ -299,7 +297,7 @@ impl crate::service::AppService {
             }
         };
         let evidence = shared_types::UserAppStorageClear {
-            context: operation.execution_context(user_id),
+            context: operation.execution_context(),
             target,
         };
         evidence.validate().map_err(AppOperationError::Conflict)?;
@@ -327,7 +325,6 @@ impl crate::service::AppService {
                     .timeout(std::time::Duration::from_secs(120))
                     .json(&shared_types::UserAppWorkspaceClearRequest {
                         app_id: app_id.into(),
-                        user_id: user_id.to_owned(),
                         expected_instance_id: instance_id.clone(),
                     })
                     .send()
@@ -433,7 +430,7 @@ impl crate::service::AppService {
                 })?,
             ));
             let control = shared_types::UserAppControlRequest {
-                user_id: request.user_id.clone(),
+                user_id: String::new(),
                 lifecycle_id: request.lifecycle_id.clone(),
                 request_id: request.request_id.clone(),
             };
@@ -460,7 +457,7 @@ impl crate::service::AppService {
                     }),
                     kind,
                     app_id: app_id.into(),
-                    user_id: request.user_id.clone(),
+                    user_id: String::new(),
                     lifecycle_id: request.lifecycle_id,
                     request_id: request.request_id,
                     operation_id: operation_id.clone(),
@@ -521,7 +518,6 @@ impl crate::service::AppService {
             app_stage,
             app_id,
             DestroyStorageRequest {
-                user_id: user_id.into(),
                 confirm: confirm.into(),
                 lifecycle_id: None,
                 request_id: None,
@@ -571,7 +567,7 @@ impl crate::service::AppService {
                 })?,
             ));
             let control = shared_types::UserAppControlRequest {
-                user_id: request.user_id.clone(),
+                user_id: String::new(),
                 lifecycle_id: request.lifecycle_id.clone(),
                 request_id: request.request_id.clone(),
             };
@@ -590,7 +586,7 @@ impl crate::service::AppService {
                     kind: command.kind(),
                     command: Some(command),
                     app_id: app_id.into(),
-                    user_id: request.user_id.clone(),
+                    user_id: String::new(),
                     lifecycle_id: request.lifecycle_id,
                     request_id: request.request_id,
                     operation_id: operation_id.clone(),
@@ -656,7 +652,7 @@ impl crate::service::AppService {
             None
         };
         let evidence = shared_types::UserAppStorageDestruction {
-            context: operation.execution_context(owner),
+            context: operation.execution_context(),
             production: snapshot,
             development: development.receipt(),
         };
@@ -733,7 +729,6 @@ impl crate::service::AppService {
         self.purge_app_controlled(
             app_id,
             shared_types::UserAppControlRequest {
-                user_id: app.user_id,
                 lifecycle_id: None,
                 request_id: None,
             },
@@ -802,7 +797,6 @@ impl crate::service::AppService {
                 command: Some(shared_types::UserAppControlCommand::DeleteApplication),
                 metadata: None,
                 app_id: app_id.into(),
-                user_id: app.user_id,
                 lifecycle_id: Some(app.lifecycle_id),
                 operation_id: uuid::Uuid::new_v4().to_string(),
                 request_id: request.request_id,
@@ -850,7 +844,7 @@ impl crate::service::AppService {
         let mut checkpoint = shared_types::UserAppDeletionCheckpoint {
             stage: shared_types::UserAppDeletionStage::Captured,
             schema_version: 1,
-            context: operation.execution_context(owner),
+            context: operation.execution_context(),
             kind: shared_types::UserAppOperationKind::DeleteApplication,
             production: snapshot.clone(),
             development: Some(dev_deletion.receipt()),

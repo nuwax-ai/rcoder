@@ -183,7 +183,7 @@ async fn attach_coordinator(
     );
     use shared_types::UserAppLifecycleStore as _;
     store
-        .ensure_identity(app_id, "wake-owner")
+        .ensure_identity(app_id)
         .await
         .expect("application identity");
     let service = Arc::new(crate::service::AppService {

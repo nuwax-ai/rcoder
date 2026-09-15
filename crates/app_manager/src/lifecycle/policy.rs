@@ -35,7 +35,7 @@ impl AppService {
                 })?,
             ));
             let control = shared_types::UserAppControlRequest {
-                user_id: request.user_id.clone(),
+                user_id: String::new(),
                 lifecycle_id: request.lifecycle_id.clone(),
                 request_id: request.request_id.clone(),
             };
@@ -62,7 +62,7 @@ impl AppService {
                 shared_types::UserAppAdmission {
                     runtime_policy_on_success: None,
                     app_id: app_id.into(),
-                    user_id: request.user_id.clone(),
+                    user_id: String::new(),
                     lifecycle_id: request.lifecycle_id.clone(),
                     request_id: request.request_id.clone(),
                     operation_id: uuid::Uuid::new_v4().to_string(),

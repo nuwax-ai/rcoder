@@ -240,7 +240,7 @@ impl super::AppServiceTrait for AppService {
     }
 
     async fn record_dev_registration(&self, app_id: &str, user_id: &str) -> AppResult<()> {
-        self.metadata.store.ensure_identity(app_id, user_id).await?;
+        self.metadata.store.ensure_identity(app_id).await?;
         Ok(())
     }
 

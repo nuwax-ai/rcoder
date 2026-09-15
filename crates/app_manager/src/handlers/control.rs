@@ -201,7 +201,7 @@ mod tests {
         service
             .metadata
             .store
-            .ensure_identity("correlation", "owner")
+            .ensure_identity("correlation")
             .await
             .expect("identity");
         service

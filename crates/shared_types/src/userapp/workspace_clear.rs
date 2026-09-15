@@ -26,8 +26,6 @@ impl UserAppBuilderWorkspaceEndpoint {
 pub struct UserAppWorkspaceClearProbe {
     /// Business application identifier whose development workspace is selected.
     pub app_id: String,
-    /// Application owner used to verify access and select the owner workspace.
-    pub user_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -44,7 +42,6 @@ pub struct UserAppWorkspaceClearRequest {
     /// Business application identifier whose development workspace is selected.
     pub app_id: String,
     /// Application owner used to verify access and select the owner workspace.
-    pub user_id: String,
     /// Exact process nonce returned by the target probe. A mismatch rejects the
     /// reset before stopping workers or clearing files; this is not a lifecycle ID.
     pub expected_instance_id: String,

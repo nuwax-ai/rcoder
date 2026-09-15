@@ -50,7 +50,7 @@ pub async fn start_app(
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone();
-    let owner = request.user_id.clone();
+    let owner = String::new();
     let worker_app_id = app_id.clone();
     let service = state.app_service.clone();
     let result = await_deployment_response(
@@ -106,7 +106,7 @@ pub async fn stop_app(
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone();
-    let owner = request.user_id.clone();
+    let owner = String::new();
     info!("[APP] stopping app: {} (user_id={})", app_id, owner);
     let result = state
         .app_service
@@ -164,7 +164,7 @@ pub async fn restart_app(
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone();
-    let owner = request.user_id.clone();
+    let owner = String::new();
     let worker_app_id = app_id.clone();
     let service = state.app_service.clone();
     let result = await_deployment_response(
@@ -232,7 +232,7 @@ pub async fn set_recycle_policy(
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone();
-    let owner = request.user_id.clone();
+    let owner = String::new();
     let result = state.app_service.set_recycle_policy(&app_id, request).await;
     let runtime =
         super::control::control_result(&state, &app_id, &owner, &request_id, result).await?;

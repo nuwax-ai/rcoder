@@ -90,7 +90,7 @@ impl AppService {
             })?,
         ));
         let control = shared_types::UserAppControlRequest {
-            user_id: request.user_id.clone(),
+            user_id: String::new(),
             lifecycle_id: request.lifecycle_id.clone(),
             request_id: request.request_id.clone(),
         };
@@ -99,7 +99,7 @@ impl AppService {
         let identity = self
             .metadata
             .store
-            .ensure_identity(app_id, &request.user_id)
+            .ensure_identity(app_id)
             .await?;
         if self
             .replay_control(
@@ -136,7 +136,7 @@ impl AppService {
                     input_digest: input.digest(),
                 }),
                 app_id: app_id.into(),
-                user_id: request.user_id.clone(),
+                user_id: String::new(),
                 lifecycle_id: request.lifecycle_id.clone(),
                 operation_id: Uuid::new_v4().to_string(),
                 request_id: request.request_id.clone(),
@@ -144,7 +144,7 @@ impl AppService {
                 kind: shared_types::UserAppOperationKind::Create,
                 metadata: Some(shared_types::UserAppMetadataPatch {
                     app_id: app_id.into(),
-                    user_id: request.user_id.clone(),
+                    user_id: String::new(),
                     lifecycle_id: identity.lifecycle_id,
                     expected_revision: identity.metadata_revision,
                     name: Some(Some(request.name.clone())),
@@ -191,7 +191,7 @@ impl AppService {
         guard: &crate::service::AppOperationGuard,
     ) -> AppResult<()> {
         operation.bind_lease(guard, owner).await?;
-        params.execution_context = Some(operation.execution_context(owner));
+        params.execution_context = Some(operation.execution_context());
         params
             .validate_execution_context()
             .map_err(|error| map_runtime_error("Validate creation execution", error))?;
@@ -259,8 +259,8 @@ impl AppService {
         // user_id：归属用户（部署访问 URL 段 + metadata 数据源），identifier 规范。
         // 空串放行——内部发布链 ensure 构造无 user 上下文（回填已存值或空，
         // record 侧空转 None）；外部 REST 路径的必填由 handler 层校验兜底。
-        if !request.user_id.trim().is_empty()
-            && !shared_types::IDENTIFIER_RE.is_match(request.user_id.trim())
+        if !"".is_empty()
+            && !shared_types::IDENTIFIER_RE.is_match("")
         {
             return Err(AppOperationError::Validation(
                 "user_id must contain 1-64 letters, digits, underscores or hyphens".to_string(),

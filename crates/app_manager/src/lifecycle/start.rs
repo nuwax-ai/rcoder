@@ -80,7 +80,6 @@ impl AppService {
             app_id,
             shared_types::AlignCredentialsRequest {
                 app_id: app_id.to_string(),
-                user_id: user_id.to_string(),
                 username: cred.username.clone(),
                 password: cred.password.clone(),
             },

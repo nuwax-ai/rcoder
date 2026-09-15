@@ -166,7 +166,6 @@ impl AppService {
                     input_digest: input.digest(),
                 }),
                 app_id: app_id.into(),
-                user_id: owner.clone(),
                 lifecycle_id: request.lifecycle_id.clone(),
                 operation_id: uuid::Uuid::new_v4().to_string(),
                 request_id: request.request_id.clone(),
@@ -174,7 +173,6 @@ impl AppService {
                 kind: shared_types::UserAppOperationKind::Update,
                 metadata: Some(shared_types::UserAppMetadataPatch {
                     app_id: app_id.into(),
-                    user_id: owner.clone(),
                     lifecycle_id: identity.lifecycle_id,
                     expected_revision: identity.metadata_revision,
                     name: request.name.clone().map(Some),
@@ -229,7 +227,7 @@ impl AppService {
                 "Application update target changed after admission".into(),
             ));
         }
-        let context = operation.execution_context(owner);
+        let context = operation.execution_context();
         params.execution_context = Some(context.clone());
         params
             .validate_execution_context()

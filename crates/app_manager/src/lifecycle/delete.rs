@@ -27,7 +27,6 @@ impl AppService {
         self.delete_app_controlled(
             app_id,
             DeleteAppRequest {
-                user_id: identity.user_id,
                 purge: Some(purge),
                 expected_resource_version: expected_resource_version.map(str::to_owned),
                 lifecycle_id: None,
@@ -65,7 +64,7 @@ impl AppService {
                 shared_types::UserAppOperationKind::DeleteCompute
             };
             let identity = shared_types::UserAppControlRequest {
-                user_id: request.user_id.clone(),
+                user_id: String::new(),
                 lifecycle_id: request.lifecycle_id.clone(),
                 request_id: request.request_id.clone(),
             };
@@ -88,7 +87,7 @@ impl AppService {
                         expected_resource_version: request.expected_resource_version.clone(),
                     }),
                     app_id: app_id.into(),
-                    user_id: request.user_id.clone(),
+                    user_id: String::new(),
                     lifecycle_id: request.lifecycle_id.clone(),
                     operation_id: uuid::Uuid::new_v4().to_string(),
                     request_id: request.request_id.clone(),
@@ -187,7 +186,7 @@ impl AppService {
         let mut checkpoint = shared_types::UserAppDeletionCheckpoint {
             stage: shared_types::UserAppDeletionStage::Captured,
             schema_version: 1,
-            context: durable.execution_context(owner),
+            context: durable.execution_context(),
             kind,
             production: snapshot.clone(),
             development: dev_deletion.as_ref().map(|deletion| deletion.receipt()),

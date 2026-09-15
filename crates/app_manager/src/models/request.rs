@@ -25,7 +25,6 @@ pub struct CreateAppRequest {
     pub name: String,
     /// 归属用户 ID（部署访问 URL `/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}` 的组成段；
     /// 存 userapp_metadata.user_id，"我的应用"过滤/归属校验数据源）
-    pub user_id: String,
     /// 容器镜像（可选；完整地址含 registry + 命名空间）。
     ///
     /// **缺省 = 平台默认运行时镜像**（env `RCODER_RUNTIME_IMAGE_DIGEST`，部署层按
@@ -63,8 +62,6 @@ pub struct CreateAppRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct QueryAppsRequest {
     /// 归属用户 ID（必填——按 metadata owner 过滤"我的应用"；无归属记录的应用不返回）
-    #[garde(pattern(shared_types::IDENTIFIER_RE))]
-    pub user_id: String,
     /// 页码
     #[garde(skip)]
     pub page: Option<u32>,
@@ -132,8 +129,6 @@ pub struct UpdateAppRequest {
     pub lifecycle_id: Option<String>,
     /// 宿主机数据卷分区归属目录名（必填；Docker compose 挂载路径组成段，
     /// 容器未启动时按此自动唤醒后挂载）
-    #[garde(pattern(shared_types::IDENTIFIER_RE))]
-    pub user_id: String,
     /// 应用名称（仅元数据，不影响 K8s 资源命名；rcoder 忽略）
     #[garde(skip)]
     pub name: Option<String>,
@@ -187,8 +182,6 @@ pub struct RecyclePolicyRequest {
     /// 宿主机数据卷分区归属目录名（Docker compose 形态挂载路径
     /// `prod/{user_id}/data/{app_id}` 的组成段）：容器未启动时按
     /// user_id+app_id+app_stage 自动唤醒后挂载，策略落点才有效
-    #[garde(pattern(shared_types::IDENTIFIER_RE))]
-    pub user_id: String,
     /// 是否参与闲置回收。None=不改；Some(true)=可回收（免费默认）；Some(false)=永不回收（付费/常驻）。
     #[serde(skip_serializing_if = "Option::is_none")]
     #[garde(skip)]
@@ -222,8 +215,6 @@ pub struct DeleteAppRequest {
     /// 宿主机数据卷分区归属目录名（必填；标识符白名单校验）——purge 时按
     /// `prod/{user_id}/data/{app_id}` 精确定位宿主目录；缺省回退
     /// userapp_metadata.owner 的兜底路径退役。
-    #[garde(pattern(shared_types::IDENTIFIER_RE))]
-    pub user_id: String,
     /// 乐观锁：传入 `GET /apps/{id}` 返回的 `resource_version`；不匹配 → 409 ERR_CONFLICT。
     /// 不传 = 不校验（向后兼容）。Docker 模式忽略。
     #[garde(skip)]
@@ -235,8 +226,6 @@ pub struct DeleteAppRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct PurgeAppRequest {
     /// Registered application owner.
-    #[garde(pattern(shared_types::IDENTIFIER_RE))]
-    pub user_id: String,
     /// Required after an explicit lifecycle recreation.
     #[serde(default)]
     #[garde(skip)]

@@ -687,7 +687,7 @@ pub(crate) async fn complete_empty_deletion_fixture(
     owner: &str,
 ) {
     use shared_types::UserAppDeletionStage as Stage;
-    let context = operation.execution_context(owner);
+    let context = operation.execution_context();
     let app_id = context.app_id.clone();
     let mut checkpoint = shared_types::UserAppDeletionCheckpoint {
         schema_version: 1,

@@ -98,17 +98,16 @@ impl OwnedOperation {
     ) -> AppResult<shared_types::UserAppExecutionInput> {
         Ok(self
             .store
-            .read_execution_input(&self.execution_context(owner))
+            .read_execution_input(&self.execution_context())
             .await?)
     }
 
     pub(crate) async fn bind_lease(
         &self,
         guard: &super::AppOperationGuard,
-        owner: &str,
     ) -> AppResult<()> {
         self.store
-            .bind_operation_lease(&self.execution_context(owner), &guard.lease_receipt()?)
+            .bind_operation_lease(&self.execution_context(), &guard.lease_receipt()?)
             .await?;
         Ok(())
     }
@@ -205,10 +204,9 @@ impl OwnedOperation {
         .await
     }
 
-    pub(crate) fn execution_context(&self, owner: &str) -> shared_types::UserAppExecutionContext {
+    pub(crate) fn execution_context(&self) -> shared_types::UserAppExecutionContext {
         shared_types::UserAppExecutionContext {
             app_id: self.record.app_id.clone(),
-            user_id: owner.into(),
             lifecycle_id: self.record.lifecycle_id.clone(),
             operation_id: self.record.operation_id.clone(),
             executor_id: self.executor.clone(),
@@ -437,7 +435,7 @@ mod tests {
         let identity = service
             .metadata
             .store
-            .ensure_identity("query", "owner")
+            .ensure_identity("query")
             .await
             .expect("identity");
         let mut operation = OwnedOperation::admit(
@@ -509,7 +507,7 @@ mod tests {
         let old = service
             .metadata
             .store
-            .ensure_identity("recreate", "owner")
+            .ensure_identity("recreate")
             .await
             .expect("identity");
         let deletion = OwnedOperation::admit(

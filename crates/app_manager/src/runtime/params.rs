@@ -61,7 +61,7 @@ impl AppService {
                 space_id: request.space_id.clone(),
                 recycle_enabled: request.recycle_enabled,
                 idle_timeout_seconds: request.idle_timeout_seconds,
-                user_id: Some(request.user_id.clone()),
+                user_id: Some(String::new()),
             },
         )
         .await
@@ -146,7 +146,7 @@ impl AppService {
                 idle_timeout_seconds: request
                     .idle_timeout_seconds
                     .or(current.idle_timeout_seconds),
-                user_id: Some(request.user_id.clone()),
+                user_id: Some(String::new()),
             },
         )
         .await

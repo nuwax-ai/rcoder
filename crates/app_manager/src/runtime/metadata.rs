@@ -85,14 +85,13 @@ impl AppMetadataStore {
                     AppOperationError::Validation("Application owner is required".into())
                 })?,
         };
-        let app = self.store.ensure_identity(app_id, &owner).await?;
+        let app = self.store.ensure_identity(app_id).await?;
         if name.is_none() && tenant_id.is_none() && space_id.is_none() {
             return Ok(());
         }
         self.store
             .patch_metadata(&UserAppMetadataPatch {
                 app_id: app_id.into(),
-                user_id: owner,
                 lifecycle_id: app.lifecycle_id,
                 expected_revision: app.metadata_revision,
                 name: name.map(Some),

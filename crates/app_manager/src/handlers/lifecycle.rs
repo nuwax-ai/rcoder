@@ -154,7 +154,7 @@ pub async fn update_app(
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone();
-    let owner = request.user_id.clone();
+    let owner = String::new();
     let result = state.app_service.update_app(&app_id, request).await;
     let runtime =
         super::control::control_result(&state, &app_id, &owner, &request_id, result).await?;
@@ -297,9 +297,8 @@ pub async fn purge_app(
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone();
-    let user_id = request.user_id.clone();
+    let user_id = String::new();
     let control = shared_types::UserAppControlRequest {
-        user_id: user_id.clone(),
         lifecycle_id: request.lifecycle_id,
         request_id: Some(request_id.clone()),
     };
@@ -470,7 +469,7 @@ mod deletion_ownership_tests {
             let before = service
                 .metadata
                 .store
-                .ensure_identity("queryrace", "owner")
+                .ensure_identity("queryrace")
                 .await
                 .expect("identity");
             runtime.deployments.insert(

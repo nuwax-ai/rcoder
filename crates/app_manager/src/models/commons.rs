@@ -137,6 +137,4 @@ pub struct InternalPort {
 #[into_params(parameter_in = Query)]
 pub struct OwnerParams {
     /// 宿主机数据卷分区归属目录名（必填；Docker compose 挂载路径组成段）
-    #[garde(pattern(shared_types::IDENTIFIER_RE))]
-    pub user_id: String,
 }

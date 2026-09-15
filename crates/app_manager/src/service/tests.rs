@@ -34,7 +34,7 @@ async fn failed_update_restores_registered_ports_not_drifted_live_ports() {
     service
         .metadata
         .store
-        .ensure_identity("portdrift", "u-test")
+        .ensure_identity("portdrift")
         .await
         .expect("owner identity");
     service.pingora = Some(Arc::new(PingoraProxyService::new(
@@ -97,7 +97,7 @@ async fn waiting_delete_rechecks_version_after_acquiring_operation_lock() {
     service
         .metadata
         .store
-        .ensure_identity("deleterace", "u-test")
+        .ensure_identity("deleterace")
         .await
         .expect("owner identity");
     runtime.deployments.insert(
@@ -603,7 +603,6 @@ async fn admit_recovery_control(
     let admission = shared_types::UserAppAdmission {
         runtime_policy_on_success: None,
         app_id: app_id.into(),
-        user_id: identity.user_id,
         lifecycle_id: Some(identity.lifecycle_id),
         request_id: Some(operation_id.clone()),
         operation_id,
@@ -1896,7 +1895,7 @@ async fn rejected_delete_version_releases_kubernetes_operation_before_return() {
     service
         .metadata
         .store
-        .ensure_identity("versionlease", "u-test")
+        .ensure_identity("versionlease")
         .await
         .expect("owner identity");
     service.config.access_mode = AppAccessMode::Kubernetes;
@@ -1923,7 +1922,7 @@ async fn cancelled_docker_mutation_blocks_later_deletion_before_side_effects() {
     service
         .metadata
         .store
-        .ensure_identity("cancelledwriter", "u-test")
+        .ensure_identity("cancelledwriter")
         .await
         .expect("owner identity");
     let operation = service
@@ -2064,7 +2063,7 @@ async fn failed_update_preparation_releases_lease_for_next_update() {
     service
         .metadata
         .store
-        .ensure_identity("prepareretry", "u-test")
+        .ensure_identity("prepareretry")
         .await
         .expect("authoritative application identity");
     let request = || UpdateAppRequest {
@@ -3147,7 +3146,6 @@ async fn pending_configuration_recovery_uses_private_resolved_input_once() {
             kind: command.kind(),
             command: Some(command),
             app_id: identity.app_id.clone(),
-            user_id: identity.user_id,
             lifecycle_id: Some(identity.lifecycle_id),
             operation_id: uuid::Uuid::new_v4().to_string(),
             request_id: None,
@@ -3365,7 +3363,6 @@ async fn pending_composite_deployment_recovers_original_control_and_completion()
             input_digest: input.digest(),
         }),
         app_id: identity.app_id,
-        user_id: identity.user_id,
         lifecycle_id: Some(identity.lifecycle_id),
         operation_id: uuid::Uuid::new_v4().to_string(),
         request_id: request.request_id.clone(),

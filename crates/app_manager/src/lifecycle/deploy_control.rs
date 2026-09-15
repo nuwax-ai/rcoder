@@ -65,7 +65,7 @@ fn kind_from_restart(restart: bool) -> UserAppOperationKind {
 
 fn control_request(request: &StartAppRequest) -> shared_types::UserAppControlRequest {
     shared_types::UserAppControlRequest {
-        user_id: request.user_id.clone(),
+        user_id: String::new(),
         lifecycle_id: request.lifecycle_id.clone(),
         request_id: request.request_id.clone(),
     }
@@ -113,7 +113,7 @@ impl AppService {
         let identity = self
             .metadata
             .store
-            .ensure_identity(app_id, &request.user_id)
+            .ensure_identity(app_id)
             .await?;
         let fingerprint = deploy_fingerprint(&request)?;
         let kind = kind_from_restart(restart);
@@ -154,7 +154,6 @@ impl AppService {
                     input_digest: encoded.digest(),
                 }),
                 app_id: app_id.into(),
-                user_id: identity.user_id,
                 lifecycle_id: Some(identity.lifecycle_id),
                 operation_id: operation_id.clone(),
                 request_id: input.request.request_id.clone(),
@@ -266,7 +265,7 @@ impl AppService {
                     &UpdateAppRequest {
                         request_id: None,
                         lifecycle_id: request.lifecycle_id.clone(),
-                        user_id: request.user_id.clone(),
+                        user_id: String::new(),
                         name: None,
                         image: None,
                         env: Some(env),

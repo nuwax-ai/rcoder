@@ -88,7 +88,7 @@ impl AppService {
         self.metadata
             .validate_request_lifecycle(
                 app_id,
-                request.user_id.trim(),
+                "",
                 request.lifecycle_id.as_deref(),
             )
             .await?;
