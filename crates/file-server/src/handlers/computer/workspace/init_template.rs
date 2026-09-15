@@ -76,7 +76,7 @@ pub(crate) async fn init_project_template(
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
-            "serviceType" => service_type = Some(text_field(field).await?),
+            "serviceType" | "workspaceType" => service_type = Some(text_field(field).await?),
             "appId" => app_id = Some(text_field(field).await?),
             "file" => {
                 data = Some(

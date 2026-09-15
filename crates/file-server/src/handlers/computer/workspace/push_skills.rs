@@ -58,7 +58,7 @@ async fn push_skills_to_workspace_impl(
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
-            "serviceType" => service_type = Some(text_field(field).await?),
+            "serviceType" | "workspaceType" => service_type = Some(text_field(field).await?),
             "appId" => app_id = Some(text_field(field).await?),
             "file" => {
                 zip_data = Some(

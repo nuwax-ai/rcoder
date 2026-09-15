@@ -1,7 +1,8 @@
 //! HTTP 提取器适配层：把 Axum 原生 rejection 统一映射为 file-server `AppError`。
 //!
 //! 另含请求级 task-local 标记（中间件 scope 注入）：
-//! - 服务场景类型（`SERVICE_KIND`）：`X-Service-Type` header 值经
+//! - 服务场景类型（`SERVICE_KIND`）：`X-Workspace-Type` header 值（回退
+//!   `X-Service-Type`）经
 //!   `normalize_computer_service_type` 归一后的四值类型（userApp 切开发卷 /
 //!   normalProject 共享工作区 / pageApp·taskAgent 默认）——由
 //!   [`scope_service_context`] 读 header 注入，computer 域 workspace 定位
@@ -23,7 +24,7 @@ use crate::error::AppError;
 // 分流契约常量与 rcoder 转发层共用 shared_types 单一事实源。
 pub use shared_types::{
     APP_ID_HEADER, ComputerServiceKind, SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP,
-    WORKSPACE_PATH_HEADER,
+    WORKSPACE_PATH_HEADER, WORKSPACE_TYPE_HEADER,
 };
 
 // ── 请求级服务场景上下文 (task_local, 由请求中间件 scope 注入) ──────────────────
@@ -77,9 +78,12 @@ pub fn userapp_app_id() -> Option<String> {
 /// Java 静态文件族 query 恒带 `appId`）。query 值不做 percent-decode：
 /// app_id 是 identifier 字符集，含转义序列会在定位收口校验 fail-fast。
 pub async fn scope_service_context(req: Request, next: axum::middleware::Next) -> Response {
+    // 工作空间定位 header 通道（TS 88a1827）：x-workspace-type 优先；
+    // 滚动升级窗口内 x-service-type 作为回退（显式偏离：TS 侧无回退）。
     let kind = req
         .headers()
-        .get(SERVICE_TYPE_HEADER)
+        .get(WORKSPACE_TYPE_HEADER)
+        .or_else(|| req.headers().get(SERVICE_TYPE_HEADER))
         .and_then(|v| v.to_str().ok())
         .and_then(shared_types::normalize_computer_service_type);
     let app_id = req

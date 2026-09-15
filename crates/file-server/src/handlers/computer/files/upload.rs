@@ -118,7 +118,7 @@ pub(crate) async fn upload_file(
             "filePath" => file_path = Some(text_field(field).await?),
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
-            "serviceType" => service_type = Some(text_field(field).await?),
+            "serviceType" | "workspaceType" => service_type = Some(text_field(field).await?),
             "appId" => app_id = Some(text_field(field).await?),
             "file" => {
                 data = Some(
@@ -182,7 +182,7 @@ pub(crate) async fn upload_files(
             "cId" => cid = Some(text_field(field).await?),
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
-            "serviceType" => service_type = Some(text_field(field).await?),
+            "serviceType" | "workspaceType" => service_type = Some(text_field(field).await?),
             "appId" => app_id = Some(text_field(field).await?),
             "filePaths" => file_paths.push(text_field(field).await?),
             "files" => {

@@ -56,7 +56,7 @@ pub(crate) async fn create_workspace(
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
-            "serviceType" => service_type = Some(text_field(field).await?),
+            "serviceType" | "workspaceType" => service_type = Some(text_field(field).await?),
             "appId" => app_id = Some(text_field(field).await?),
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
@@ -137,7 +137,7 @@ pub(crate) async fn create_workspace_v2(
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
-            "serviceType" => service_type = Some(text_field(field).await?),
+            "serviceType" | "workspaceType" => service_type = Some(text_field(field).await?),
             "appId" => app_id = Some(text_field(field).await?),
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
