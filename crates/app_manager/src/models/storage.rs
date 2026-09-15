@@ -94,13 +94,13 @@ mod tests {
         );
 
         let destroy: DestroyStorageRequest = serde_json::from_value(serde_json::json!({
-            "user_id": "u1", "confirm": "app-1",
+            "user_id": "u1", "confirm": "app1",
         }))
         .expect("destroy body");
         assert_eq!(destroy.user_id, "u1");
         assert!(
             serde_json::from_value::<DestroyStorageRequest>(serde_json::json!({
-                "confirm": "app-1",
+                "confirm": "app1",
             }))
             .is_err(),
             "destroy 缺 user_id 应拒"

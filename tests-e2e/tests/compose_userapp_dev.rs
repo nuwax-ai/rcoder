@@ -79,35 +79,33 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
     (status, response)
 }
 
-/// 场景内唯一 app_id（run_tag+pid 防跨进程撞名；≤63 字符约束内）。
+/// 场景内唯一 app_id（run_tag+pid 防跨进程撞名）。
 fn scoped_app(env: &Env, tag: &str) -> String {
-    // run_tag 前 6 位=日期：同日重跑（同 tag）会撞容器名（Docker 409，
-    // 上轮 cleanup 未达时残留即冲突）——加 pid 段对齐主套件 ident 模式。
-    // K8s 边界（229 实测产品 bug）：builder STS pod label 值 =
-    // 前缀(19)+app_id+controller-hash(11) 限 63 字节 → app_id 实际上限
-    // ~33 字符（远小于 identifier 白名单 64）——tag 压缩到单字母+缩写，
-    // 总长 ~26 字符双环境安全
+    // 复合键改造后 app_id 字符集收紧 [a-z0-9]（禁 `-`，分隔符保留给复合串
+    // `{user_id}-{app_id}` 的 rsplit_once 右切）、上限 22（复合总长 ≤33 的
+    // STS controller-revision-hash 63 字节预算）。run_tag 前 6 位=日期：
+    // 同日重跑（同 tag）会撞容器名（Docker 409）——pid 段防跨进程撞名。
     let short_tag: String = tag
         .split('-')
         .filter_map(|part| part.chars().next())
         .collect();
-    format!(
-        "e2e-ud-{}-p{}-{}",
-        &env.run_tag.replace('_', "")[..10],
+    let raw = format!(
+        "e2eud{}p{}{}",
+        &env.run_tag.replace('_', "").to_lowercase()[..10],
         std::process::id() % 1000,
-        short_tag
-    )
-    .chars()
-    .take(33)
-    .collect()
+        short_tag.to_lowercase()
+    );
+    raw.chars().take(22).collect()
 }
 
 /// 显式清理开发容器（Docker: docker rm；K8s 模式由 rcoder 闲置回收兜底，
 /// 测试内不等待——场景各自创建唯一 app_id 不复用）。
-fn cleanup_builder(app_id: &str) {
-    if let Err(error) =
-        rcoder_e2e::common::resources::cleanup_container(&format!("rcoder-app-builder-{app_id}"))
-    {
+fn cleanup_builder(user_id: &str, app_id: &str) {
+    // 复合键后容器名 = rcoder-app-builder-{user_id}-{app_id}（user_id 段可含 '-'，
+    // rsplit_once 右切还原——清理侧传创建时的实例 user）。
+    if let Err(error) = rcoder_e2e::common::resources::cleanup_container(&format!(
+        "rcoder-app-builder-{user_id}-{app_id}"
+    )) {
         eprintln!("owned builder cleanup failed: {error}");
     }
 }
@@ -194,7 +192,7 @@ async fn userapp_dev_files_two_entry_points() {
 
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -328,7 +326,7 @@ async fn userapp_dev_files_two_entry_points() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 // ============================================================
@@ -540,7 +538,7 @@ async fn userapp_dev_git_service_context() {
     // 本分支；dev-hot 只更主 pod 时此段撞容器旧代码 404——环境前置说明）
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
     let resp = env
@@ -588,7 +586,7 @@ async fn userapp_dev_git_service_context() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 #[tokio::test]
@@ -605,7 +603,7 @@ async fn userapp_dev_pg_reset_password() {
 
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -639,7 +637,7 @@ async fn userapp_dev_pg_reset_password() {
     );
     if !ok_first {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -658,7 +656,7 @@ async fn userapp_dev_pg_reset_password() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 // ============================================================
@@ -676,7 +674,7 @@ async fn scenario_userapp_chat_full_turn(backend: Backend) {
 
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -693,16 +691,16 @@ async fn scenario_userapp_chat_full_turn(backend: Backend) {
     let Ok(data) = chat_reported(&env, &report, "turn1", &env.rcoder, &req).await else {
         report.assert_hard("chat 成功", false, "chat 失败（见 chat_request 行）".into());
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     };
     let sid = data.session_id.clone();
     report.assert_hard("session_id 非空", !sid.is_empty(), sid.clone());
-    // userApp 特有：project_id 回显 = app_id（路由到该 app 开发容器的锚点）
+    // userApp 特有：project_id 回显 = 复合键（session 映射/路由锚点已实例化）
     report.assert_hard(
-        "project_id 回显 = app_id",
-        data.project_id == app,
-        format!("回显 {:?}，期望 {app:?}", data.project_id),
+        "project_id 回显 = 复合键",
+        data.project_id == format!("{user}-{app}"),
+        format!("回显 {:?}，期望 {user}-{app:?}", data.project_id),
     );
 
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -751,7 +749,7 @@ async fn scenario_userapp_chat_full_turn(backend: Backend) {
     report.diagnostic("回答文本", &text, "agent_message_chunk 拼接全文");
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 #[tokio::test]
@@ -783,7 +781,7 @@ async fn scenario_userapp_chat_workdir_agent_work_dir(backend: Backend) {
 
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -802,15 +800,15 @@ async fn scenario_userapp_chat_workdir_agent_work_dir(backend: Backend) {
     let Ok(data) = chat_reported(&env, &report, "turn1", &env.rcoder, &req).await else {
         report.assert_hard("chat 成功", false, "chat 失败（见 chat_request 行）".into());
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     };
     let sid = data.session_id.clone();
     report.assert_hard("session_id 非空", !sid.is_empty(), sid.clone());
     report.assert_hard(
-        "project_id 回显 = app_id",
-        data.project_id == app,
-        format!("回显 {:?}，期望 {app:?}", data.project_id),
+        "project_id 回显 = 复合键",
+        data.project_id == format!("{user}-{app}"),
+        format!("回显 {:?}，期望 {user}-{app:?}", data.project_id),
     );
 
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -862,7 +860,7 @@ async fn scenario_userapp_chat_workdir_agent_work_dir(backend: Backend) {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 #[tokio::test]
@@ -892,7 +890,7 @@ async fn scenario_userapp_two_turn_isolation(backend: Backend) {
 
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -918,7 +916,7 @@ async fn scenario_userapp_two_turn_isolation(backend: Backend) {
             "chat 失败（见 chat_request 行）".into(),
         );
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     };
     let sid = d1.session_id.clone();
@@ -948,7 +946,7 @@ async fn scenario_userapp_two_turn_isolation(backend: Backend) {
             "chat 失败（见 chat_request 行）".into(),
         );
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     };
     report.assert_hard(
@@ -994,7 +992,7 @@ async fn scenario_userapp_two_turn_isolation(backend: Backend) {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 #[tokio::test]
@@ -1027,7 +1025,7 @@ async fn userapp_dev_archive_downloads() {
 
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -1149,7 +1147,7 @@ async fn userapp_dev_archive_downloads() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 // ============================================================
@@ -1168,7 +1166,7 @@ async fn userapp_dev_skills_push() {
 
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -1237,7 +1235,7 @@ async fn userapp_dev_skills_push() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 // ============================================================
@@ -1256,7 +1254,7 @@ async fn userapp_dev_template_zip_and_projects() {
 
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -1306,7 +1304,7 @@ async fn userapp_dev_template_zip_and_projects() {
     );
     if !init_ok {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -1374,7 +1372,7 @@ async fn userapp_dev_template_zip_and_projects() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 // ============================================================
@@ -1393,7 +1391,7 @@ async fn userapp_dev_dbx_proxy() {
 
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -1504,7 +1502,7 @@ async fn userapp_dev_dbx_proxy() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 // ============================================================
@@ -1525,7 +1523,7 @@ async fn userapp_dev_server_lifecycle() {
 
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -1598,7 +1596,7 @@ async fn userapp_dev_server_lifecycle() {
     );
     if task_id.is_empty() {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -1768,7 +1766,7 @@ async fn userapp_dev_server_lifecycle() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 // ============================================================
@@ -1788,7 +1786,7 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
 
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -1801,7 +1799,7 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
         _ => {
             report.assert_hard("chat 建会话", false, "chat 失败".into());
             assert_hard_all(report).await;
-            cleanup_builder(&app);
+            cleanup_builder(user, &app);
             return;
         }
     };
@@ -1898,7 +1896,7 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 #[tokio::test]
@@ -2041,7 +2039,7 @@ async fn userapp_dev_owner_header_lazy_ensure() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 // ============================================================
@@ -2096,7 +2094,7 @@ async fn userapp_dev_new_endpoint_body_query_locate() {
             "init-project-template 上传失败".to_string(),
         );
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -2209,7 +2207,7 @@ async fn userapp_dev_new_endpoint_body_query_locate() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 // ============================================================
@@ -2234,7 +2232,7 @@ async fn userapp_dev_precheck_rejects_empty_and_no_services() {
     // create-workspace 只建空目录（file-server ensure_workspace 仅 create_dir_all）
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -2314,12 +2312,12 @@ async fn userapp_dev_precheck_rejects_empty_and_no_services() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 /// docker inspect 读容器 Id（cleanup_builder 同款 std::process::Command 先例）。
-fn docker_inspect_id(app_id: &str) -> Option<String> {
-    let name = format!("rcoder-app-builder-{app_id}");
+fn docker_inspect_id(user_id: &str, app_id: &str) -> Option<String> {
+    let name = format!("rcoder-app-builder-{user_id}-{app_id}");
     let out = std::process::Command::new("docker")
         .args(["inspect", "--format", "{{.Id}}", &name])
         .output()
@@ -2357,24 +2355,24 @@ async fn userapp_dev_registry_self_heal_after_restart() {
     // 在 restart 后跳过探活直打旧 IP；注册表脏 IP 正是本场景要构造的输入
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
-    let Some(id_before) = docker_inspect_id(&app) else {
+    let Some(id_before) = docker_inspect_id(user, &app) else {
         report.assert_hard(
             "restart 前容器 inspect 可得 Id（基线）",
             false,
             "docker inspect 失败（容器未建或 CLI 异常）".to_string(),
         );
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     };
 
     // docker restart CLI 返回时容器已 Running——无"restart 进行中触发请求走
     // Gone 重建分支"的竞态窗口
-    let name = format!("rcoder-app-builder-{app}");
+    let name = format!("rcoder-app-builder-{user}-{app}");
     let restart_ok = std::process::Command::new("docker")
         .args(["restart", &name])
         .output()
@@ -2423,7 +2421,7 @@ async fn userapp_dev_registry_self_heal_after_restart() {
 
     // 核心不变量：container_id 不变 = Alive 分支保容器（重建必换 Id）。
     // IP 是否变化不断言——自定 bridge 网络同址复用是合法退化。
-    let id_after = docker_inspect_id(&app);
+    let id_after = docker_inspect_id(user, &app);
     report.assert_hard(
         "容器 Id 不变（remediate Alive 保容器，非杀重建）",
         matches!(&id_after, Some(a) if *a == id_before),
@@ -2435,7 +2433,7 @@ async fn userapp_dev_registry_self_heal_after_restart() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 /// 剥 ANSI 转义序列（ttyd OUTPUT 帧是原始字节含转义，非 base64；
@@ -2483,7 +2481,7 @@ async fn userapp_dev_terminal_cwd_via_ttyd_ws() {
     // workspace 目录存在即满足 cwd 解析前提（resolve_in_candidates 要求目录在）
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -2525,7 +2523,7 @@ async fn userapp_dev_terminal_cwd_via_ttyd_ws() {
             format!("30s 窗口耗尽，url={ws_url}"),
         );
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     };
     report.assert_hard(
@@ -2578,7 +2576,7 @@ async fn userapp_dev_terminal_cwd_via_ttyd_ws() {
 
     ws.close(None).await.ok();
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 // ============================================================
@@ -2712,7 +2710,7 @@ async fn userapp_dev_app_proxy_lazy_start() {
     let user = "e2e-ud-user";
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -2732,7 +2730,7 @@ async fn userapp_dev_app_proxy_lazy_start() {
     let Some(task_id) = dev_start_task(&env, &app, user).await else {
         report.assert_hard("懒启动前置：dev/start 受理", false, "未拿到 task_id".into());
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     };
     let terminal = poll_task_terminal(
@@ -2768,7 +2766,7 @@ async fn userapp_dev_app_proxy_lazy_start() {
     );
 
     // 3. 删容器 → 应用流量访问 → 容器应自动重建（Id 必变）
-    let id_before = docker_inspect_id(&app);
+    let id_before = docker_inspect_id(user, &app);
     report.assert_hard(
         "懒启动前置：容器 Id 记录",
         id_before.is_some(),
@@ -2776,7 +2774,7 @@ async fn userapp_dev_app_proxy_lazy_start() {
     );
     let Some(id_before) = id_before else {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     };
     let removed =
@@ -2807,7 +2805,7 @@ async fn userapp_dev_app_proxy_lazy_start() {
     let mut id_after = None;
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(30) {
-        if let Some(id) = docker_inspect_id(&app) {
+        if let Some(id) = docker_inspect_id(user, &app) {
             id_after = Some(id);
             break;
         }
@@ -2827,7 +2825,7 @@ async fn userapp_dev_app_proxy_lazy_start() {
         format!("{replacement:?}"),
     );
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 /// 场景：受理后高频轮询不误杀容器——dev/start 受理后零等待进入 0.5s 间隔
@@ -2850,7 +2848,7 @@ async fn userapp_dev_poll_storm_keeps_container() {
     let user = "e2e-ud-user";
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -2868,7 +2866,7 @@ async fn userapp_dev_poll_storm_keeps_container() {
             "未拿到 task_id".into(),
         );
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     };
 
@@ -2878,7 +2876,7 @@ async fn userapp_dev_poll_storm_keeps_container() {
     let mut terminal = None;
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(90) {
-        if let Some(id) = docker_inspect_id(&app) {
+        if let Some(id) = docker_inspect_id(user, &app) {
             seen_ids.insert(id);
         }
         if let Ok(r) = env
@@ -2903,7 +2901,7 @@ async fn userapp_dev_poll_storm_keeps_container() {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    if let Some(id) = docker_inspect_id(&app) {
+    if let Some(id) = docker_inspect_id(user, &app) {
         seen_ids.insert(id);
     }
     report.diagnostic(
@@ -2923,12 +2921,12 @@ async fn userapp_dev_poll_storm_keeps_container() {
     );
     report.assert_hard(
         "轮询风暴：容器仍存在",
-        docker_inspect_id(&app).is_some(),
+        docker_inspect_id(user, &app).is_some(),
         "终态后容器应存活".into(),
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 /// 场景：SSE 游标过头即刻关流——终态任务带越界 from_seq 订阅 logs/stream，
@@ -2946,7 +2944,7 @@ async fn userapp_dev_task_sse_cursor_past_terminal() {
     let user = "e2e-ud-user";
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -2964,7 +2962,7 @@ async fn userapp_dev_task_sse_cursor_past_terminal() {
             "未拿到 task_id".into(),
         );
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     };
     let terminal = poll_task_terminal(
@@ -3009,7 +3007,7 @@ async fn userapp_dev_task_sse_cursor_past_terminal() {
         Err(e) => {
             report.assert_hard("游标关流：SSE 连接建立", false, format!("{e}"));
             assert_hard_all(report).await;
-            cleanup_builder(&app);
+            cleanup_builder(user, &app);
             return;
         }
     };
@@ -3048,7 +3046,7 @@ async fn userapp_dev_task_sse_cursor_past_terminal() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
 }
 
 // ============================================================
@@ -3071,7 +3069,7 @@ async fn userapp_dev_pod_identity_list_and_status() {
 
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
-        cleanup_builder(&app);
+        cleanup_builder(user, &app);
         return;
     }
 
@@ -3086,7 +3084,7 @@ async fn userapp_dev_pod_identity_list_and_status() {
         .expect("pod list");
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or(Value::Null);
-    let builder_name = format!("rcoder-app-builder-{app}");
+    let builder_name = format!("rcoder-app-builder-{user}-{app}");
     let found = body["data"]["containers"]
         .as_array()
         .and_then(|list| {
@@ -3138,5 +3136,221 @@ async fn userapp_dev_pod_identity_list_and_status() {
     );
 
     assert_hard_all(report).await;
-    cleanup_builder(&app);
+    cleanup_builder(user, &app);
+}
+
+// ============================================================
+// 场景：双用户同 app——复合键 (user_id, app_id) 协作实例
+// ============================================================
+async fn scenario_two_users_share_app() {
+    let scenario = "userapp_dev_two_users_share_app";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "tw");
+    let u1 = "e2e-ud-owner";
+    let u2 = "e2e-ud-mate";
+
+    // u1 create-workspace：owner 实例（lifecycle 受理 + owner 注册）
+    if !create_workspace(&env, &report, &app, u1).await {
+        assert_hard_all(report).await;
+        cleanup_builder(u1, &app);
+        return;
+    }
+
+    // u2 pod/ensure：协作者轻量路径（不进 lifecycle admit，独立实例）
+    let resp = env
+        .http
+        .post(format!("{}/computer/pod/ensure", env.rcoder))
+        .timeout(Duration::from_secs(600))
+        .json(&json!({"user_id": u2, "app_id": app, "app_stage": "dev", "service_type": "userapp"}))
+        .send()
+        .await;
+    let (su2, bu2) = match resp {
+        Ok(r) => {
+            let s = r.status();
+            let b = r.json().await.unwrap_or(Value::Null);
+            (s, b)
+        }
+        Err(e) => {
+            report.assert_hard(
+                "u2 pod/ensure 协作者实例受理",
+                false,
+                format!("请求失败: {e}"),
+            );
+            assert_hard_all(report).await;
+            cleanup_builder(u1, &app);
+            return;
+        }
+    };
+    let ok_u2 = su2.is_success() && bu2["success"].as_bool().unwrap_or(false);
+    report.assert_hard(
+        "u2 pod/ensure 协作者实例受理（轻量路径，不撞 owner lifecycle）",
+        ok_u2,
+        format!("HTTP {su2}, {}", trunc(&bu2, 120)),
+    );
+    if !ok_u2 {
+        assert_hard_all(report).await;
+        cleanup_builder(u1, &app);
+        return;
+    }
+
+    // 两容器并存（复合名）
+    let name1 = format!("rcoder-app-builder-{u1}-{app}");
+    let name2 = format!("rcoder-app-builder-{u2}-{app}");
+    let both = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name={name1}"),
+            "--filter",
+            &format!("name={name2}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .map(|o| {
+            let names = String::from_utf8_lossy(&o.stdout).to_string();
+            names.contains(&name1) && names.contains(&name2)
+        })
+        .unwrap_or(false);
+    report.assert_hard(
+        "两实例容器并存（rcoder-app-builder-{u1}-{app} + {u2}-{app}）",
+        both,
+        format!("{name1} / {name2}"),
+    );
+
+    // 文件互不可见：u1 写文件，u2 的列表不应见到（独立 PVC subPath 工作区）
+    let w1 = env
+        .http
+        .post(format!("{}/api/v1/userapp/generate-file", env.rcoder))
+        .timeout(Duration::from_secs(60))
+        .header("X-App-Id", &app)
+        .json(&json!({"app_id": app, "user_id": u1, "file_name": "owner-only.txt", "content": "u1 secret"}))
+        .send()
+        .await;
+    let w1_ok = matches!(&w1, Ok(r) if r.status().is_success());
+    report.assert_hard("u1 写入 owner-only.txt", w1_ok, "generate-file".into());
+    let list2 = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/get-file-list?app_id={app}&user_id={u2}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(60))
+        .header("X-App-Id", &app)
+        .send()
+        .await;
+    let leak = match list2 {
+        Ok(r) => {
+            let body: Value = r.json().await.unwrap_or(Value::Null);
+            body.to_string().contains("owner-only.txt")
+        }
+        Err(_) => true, // 请求失败按泄漏处理（保守）
+    };
+    report.assert_hard(
+        "u2 工作区不可见 u1 文件（实例隔离）",
+        !leak,
+        "owner-only.txt 不应出现在 u2 列表".into(),
+    );
+
+    // chat workdir：两用户各自 chat 回显复合键 project（session 映射实例化）
+    // ——信封级断言（完整 chat 需 LLM，双用户文件/容器断言已覆盖核心语义）
+
+    // 负例：双缺 user_id → 400/业务错（fail-fast，绝不兜底建孤儿）
+    let neg = env
+        .http
+        .post(format!("{}/computer/pod/ensure", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .json(&json!({"app_id": app, "app_stage": "dev"}))
+        .send()
+        .await;
+    let neg_rejected = matches!(&neg, Ok(r) if !r.status().is_success());
+    report.assert_hard(
+        "负例：双缺 user_id 被拒（fail-fast）",
+        neg_rejected,
+        format!("{:?}", neg.as_ref().map(|r| r.status())),
+    );
+
+    // 负例：app_id 含 '-' 被 validate_app_id 拒
+    // workspace 可能 HTTP 200 + success:false 信封——两种都算拒
+    match env
+        .http
+        .post(format!("{}/api/v1/userapp/workspace", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .json(&json!({"app_id": "bad-app-id", "user_id": u1}))
+        .send()
+        .await
+    {
+        Ok(r) => {
+            let status = r.status();
+            let b: Value = r.json().await.unwrap_or(Value::Null);
+            let rejected = !status.is_success() || !b["success"].as_bool().unwrap_or(false);
+            report.assert_hard(
+                "负例：app_id 含 '-' 被拒（字符集 [a-z0-9]）",
+                rejected,
+                format!("HTTP {status}, {}", trunc(&b, 100)),
+            );
+        }
+        Err(e) => {
+            report.assert_hard("负例：app_id 含 '-' 被拒", false, format!("请求失败: {e}"));
+        }
+    }
+
+    // purge：owner 删除 app（连协作者实例一起清——capture 排除法全清语义）
+    let del = post_json(
+        &env,
+        &format!("/api/v1/userapp/{app}/dev/delete"),
+        json!({"user_id": u1, "purge": true}),
+    )
+    .await;
+    let del_ok = del.0.is_success() && del.1["success"].as_bool().unwrap_or(false);
+    report.assert_hard(
+        "u1 purge 删除 app（受理）",
+        del_ok,
+        format!("HTTP {}, {}", del.0, trunc(&del.1, 120)),
+    );
+    if del_ok {
+        // 删除是异步编排：轮询两容器消失（上限 180s）
+        let mut gone = false;
+        for _ in 0..36 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let out = std::process::Command::new("docker")
+                .args([
+                    "ps",
+                    "-a",
+                    "--filter",
+                    &format!("name=rcoder-app-builder-{u1}-{app}"),
+                    "--filter",
+                    &format!("name=rcoder-app-builder-{u2}-{app}"),
+                    "--format",
+                    "{{.Names}}",
+                ])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if out.is_empty() {
+                gone = true;
+                break;
+            }
+        }
+        report.assert_hard(
+            "purge 后两实例容器全清（owner+协作者）",
+            gone,
+            "docker ps 无 rcoder-app-builder-{u1|u2}-{app}".into(),
+        );
+    }
+
+    assert_hard_all(report).await;
+    // 兜底清理（purge 失败时防残留）
+    cleanup_builder(u1, &app);
+    cleanup_builder(u2, &app);
+}
+
+#[tokio::test]
+async fn userapp_dev_two_users_share_app() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    scenario_two_users_share_app().await;
 }

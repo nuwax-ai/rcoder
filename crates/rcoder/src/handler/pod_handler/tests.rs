@@ -193,16 +193,16 @@ fn app_target_no_app_id_falls_through_to_agent_path() {
 #[test]
 fn app_target_dev_and_prod_dispatch() {
     assert!(matches!(
-        parse_app_target(Some("app-1"), None, None),
-        Ok(AppTarget::Dev(id)) if id == "app-1"
+        parse_app_target(Some("app1"), None, None),
+        Ok(AppTarget::Dev(id)) if id == "app1"
     ));
     assert!(matches!(
-        parse_app_target(Some("app-1"), Some("dev"), None),
-        Ok(AppTarget::Dev(id)) if id == "app-1"
+        parse_app_target(Some("app1"), Some("dev"), None),
+        Ok(AppTarget::Dev(id)) if id == "app1"
     ));
     assert!(matches!(
-        parse_app_target(Some("app-1"), Some("prod"), None),
-        Ok(AppTarget::Prod(id)) if id == "app-1"
+        parse_app_target(Some("app1"), Some("prod"), None),
+        Ok(AppTarget::Prod(id)) if id == "app1"
     ));
     // 空串 app_id 视为未传（回 agent 路径）
     assert!(matches!(
@@ -214,9 +214,9 @@ fn app_target_dev_and_prod_dispatch() {
 #[test]
 fn app_target_validates_stage_and_conflicts() {
     // app_id 与非 userapp 的 service_type 互斥
-    assert!(parse_app_target(Some("app-1"), None, Some("computer-agent-runner")).is_err());
+    assert!(parse_app_target(Some("app1"), None, Some("computer-agent-runner")).is_err());
     // 非法 stage 值
-    assert!(parse_app_target(Some("app-1"), Some("staging"), None).is_err());
+    assert!(parse_app_target(Some("app1"), Some("staging"), None).is_err());
     // app_stage 依附于 app_id
     assert!(parse_app_target(None, Some("dev"), None).is_err());
     // identifier 白名单（防容器名/bind 路径注入）
@@ -230,18 +230,18 @@ fn app_target_validates_stage_and_conflicts() {
 fn app_target_accepts_userapp_service_type_alongside_app_id() {
     // userapp 搭配 app_id → 正常分派（缺省/显式 dev 与 prod）
     assert!(matches!(
-        parse_app_target(Some("app-1"), None, Some("userapp")),
-        Ok(AppTarget::Dev(id)) if id == "app-1"
+        parse_app_target(Some("app1"), None, Some("userapp")),
+        Ok(AppTarget::Dev(id)) if id == "app1"
     ));
     assert!(matches!(
-        parse_app_target(Some("app-1"), Some("prod"), Some("userapp")),
-        Ok(AppTarget::Prod(id)) if id == "app-1"
+        parse_app_target(Some("app1"), Some("prod"), Some("userapp")),
+        Ok(AppTarget::Prod(id)) if id == "app1"
     ));
     // 大小写不敏感 + 既有 ServiceType 变体同义
     for variant in ["USERAPP", "Userapp", "user-app"] {
         assert!(
             matches!(
-                parse_app_target(Some("app-1"), None, Some(variant)),
+                parse_app_target(Some("app1"), None, Some(variant)),
                 Ok(AppTarget::Dev(_))
             ),
             "service_type={variant:?} 应视为 userapp 变体放行"
@@ -256,14 +256,14 @@ fn app_target_accepts_userapp_service_type_alongside_app_id() {
 #[test]
 fn userapp_minimal_request_deserializes_without_user_or_project() {
     for raw in [
-        r#"{"app_id":"app-1"}"#,
-        r#"{"app_id":"app-1","app_stage":"dev"}"#,
-        r#"{"app_id":"app-1","app_stage":"prod"}"#,
+        r#"{"app_id":"app1"}"#,
+        r#"{"app_id":"app1","app_stage":"dev"}"#,
+        r#"{"app_id":"app1","app_stage":"prod"}"#,
     ] {
         let ensured: EnsurePodRequest = serde_json::from_str(raw)
             .unwrap_or_else(|e| panic!("EnsurePodRequest {raw} 应可反序列化: {e}"));
         assert_eq!(ensured.user_id, "");
-        assert_eq!(ensured.app_id.as_deref(), Some("app-1"));
+        assert_eq!(ensured.app_id.as_deref(), Some("app1"));
         let ka: KeepalivePodRequest = serde_json::from_str(raw)
             .unwrap_or_else(|e| panic!("KeepalivePodRequest {raw} 应可反序列化: {e}"));
         assert!(ka.app_stage.is_some() || ka.app_stage.is_none());
@@ -273,7 +273,7 @@ fn userapp_minimal_request_deserializes_without_user_or_project() {
         let sp: StopPodRequest = serde_json::from_str(raw)
             .unwrap_or_else(|e| panic!("StopPodRequest {raw} 应可反序列化: {e}"));
         assert_eq!(sp.user_id, "");
-        assert_eq!(sp.app_id.as_deref(), Some("app-1"));
+        assert_eq!(sp.app_id.as_deref(), Some("app1"));
     }
 }
 

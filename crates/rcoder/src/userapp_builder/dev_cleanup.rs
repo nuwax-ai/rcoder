@@ -26,6 +26,12 @@ struct CapturedDeletion {
     snapshot: BuilderDeletionSnapshot,
     registry_identity: Option<(String, String)>,
     operation: BuilderOperation,
+    /// 协作者实例（owner 实例之外的全部 `{user_id}-{app_id}` 实例）：
+    /// (复合 identifier, 捕获快照)。cleanup 时与主快照一并删除。
+    extra_instances: Vec<(String, BuilderDeletionSnapshot)>,
+    /// 协作者实例的 operation 锁（capture 时获取，cleanup 完成后释放——
+    /// 防清扫期间并发 ensure 重建实例）。
+    extra_leases: Vec<Box<dyn AppOperationLease>>,
     _local: tokio::sync::OwnedMutexGuard<()>,
 }
 // Read-only capture may be abandoned safely. Once deletion starts, an uncertain
@@ -105,10 +111,23 @@ impl Drop for BuilderOperation {
 #[async_trait::async_trait]
 impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
     async fn capture(&self, app_id: &str) -> Result<Box<dyn UserappDevDeletion>, String> {
+        // app 级进程内互斥（destroy 语义覆盖全部实例；实例级 ensure 用复合键
+        // 锁，键空间不冲突）。
         let local = super::lifecycle::acquire(app_id).await;
+        let app = self
+            .store
+            .get_application(app_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Builder lifecycle is missing".to_owned())?;
+        // owner 实例复合 identifier——正式 evidence 链覆盖 lifecycle 持有的
+        // owner 实例；协作者实例（无 lifecycle 受理）在 capture 时清点、
+        // cleanup 时一并清扫（见 CapturedDeletion.extra_instances）。
+        let owner_instance = shared_types::builder_instance_id(&app.user_id, app_id)
+            .map_err(|error| format!("compose owner builder instance: {error}"))?;
         let operation = self
             .runtime
-            .acquire_builder_operation(app_id)
+            .acquire_builder_operation(&owner_instance)
             .await
             .map_err(|e| format!("acquire builder deletion: {e}"))?;
         let operation = BuilderOperation {
@@ -117,7 +136,7 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
         };
         let mut snapshot = self
             .runtime
-            .capture_builder_deletion(app_id)
+            .capture_builder_deletion(&owner_instance)
             .await
             .map_err(|e| format!("capture builder deletion: {e}"))?;
         if let Some(resource) = snapshot.resources.iter().find(|resource| {
@@ -132,16 +151,10 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
                 .get_resource_binding(&shared_types::ServiceType::UserappBuilder, &resource.uid)
                 .await
                 .map_err(|error| format!("Read builder resource binding: {error}"))?;
-            let app = self
-                .store
-                .get_application(app_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "Builder lifecycle is missing".to_owned())?;
             let context = shared_types::UserAppExecutionContext {
-                app_id: app_id.into(),
-                user_id: app.user_id,
-                lifecycle_id: app.lifecycle_id,
+                app_id: owner_instance.clone(),
+                user_id: app.user_id.clone(),
+                lifecycle_id: app.lifecycle_id.clone(),
                 operation_id: "capture-deletion".into(),
                 executor_id: "reader".into(),
                 request_fingerprint: "0".repeat(64),
@@ -160,9 +173,35 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
                 return Err("Builder changed during deletion capture".into());
             }
         }
+        // 协作者实例清点（label/名字聚合；排除 owner 实例）：各实例持有
+        // operation 锁（防清扫期间并发 ensure 重建）+ 捕获快照，cleanup 时删除。
+        let mut extra_instances = Vec::new();
+        let mut extra_leases = Vec::new();
+        for instance in self
+            .runtime
+            .find_builder_instances(app_id)
+            .await
+            .map_err(|e| format!("enumerate builder instances: {e}"))?
+        {
+            if instance == owner_instance {
+                continue;
+            }
+            let lease = self
+                .runtime
+                .acquire_builder_operation(&instance)
+                .await
+                .map_err(|e| format!("acquire builder instance deletion ({instance}): {e}"))?;
+            let extra_snapshot = self
+                .runtime
+                .capture_builder_deletion(&instance)
+                .await
+                .map_err(|e| format!("capture builder instance deletion ({instance}): {e}"))?;
+            extra_leases.push(lease);
+            extra_instances.push((instance, extra_snapshot));
+        }
         let registry_identity = self
             .projects
-            .get(app_id)
+            .get(&owner_instance)
             .map(|project| {
                 if project.service_type() != Some(shared_types::ServiceType::UserappBuilder) {
                     return Err("registration belongs to another service family".to_string());
@@ -185,6 +224,8 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
             snapshot,
             registry_identity,
             operation,
+            extra_instances,
+            extra_leases,
             _local: local,
         }))
     }
@@ -240,8 +281,21 @@ impl CapturedDeletion {
             .delete_builder_snapshot(&self.snapshot)
             .await
             .map_err(|e| format!("delete captured builder: {e}"))?;
+        // 协作者实例清扫（best-effort 顺序删除；任一失败即报错保留剩余快照
+        // 供人工/再次 capture 处置）
+        for (instance, snapshot) in &self.extra_instances {
+            self.runtime
+                .delete_builder_snapshot(snapshot)
+                .await
+                .map_err(|e| format!("delete collaborator builder ({instance}): {e}"))?;
+        }
         if self.snapshot.docker_bind_cleanup {
-            remove_bind_directories(&self.snapshot.app_id).await?;
+            // snapshot.app_id 是复合 identifier——bind 目录清扫按纯 app 段
+            // （dev/*/{app_id} 形态，跨全部协作者 user 目录）
+            let pure_app = shared_types::parse_builder_instance_id(&self.snapshot.app_id)
+                .map(|(_, app)| app.to_string())
+                .unwrap_or_else(|| self.snapshot.app_id.clone());
+            remove_bind_directories(&pure_app).await?;
         }
         match &self.registry_identity {
             Some((generation, container_id)) => {
@@ -264,11 +318,24 @@ impl CapturedDeletion {
             }
             None => {}
         }
+        // 协作者实例注册表条目清理（key=复合 identifier；best-effort——注册是
+        // 观测缓存，物理资源已删，残留条目经探活自愈路径自然失效）
+        for (instance, _) in &self.extra_instances {
+            // remove 返回 Option<Arc<..>>（带 Drop 语义）——显式绑定避免
+            // let _ 立即析构告警；观测缓存条目删除本身即目的
+            let _removed = self.projects.remove(instance);
+        }
         crate::userapp_forward::invalidate_probe_cache(&self.snapshot.app_id);
+        for (instance, _) in &self.extra_instances {
+            crate::userapp_forward::invalidate_probe_cache(instance);
+        }
+        for lease in self.extra_leases.drain(..) {
+            lease.release().await?;
+        }
         if let Some(operation) = self.operation.lease.take() {
             operation.release().await?;
         }
-        tracing::info!(app_id = %self.snapshot.app_id, operation_id = %self.snapshot.operation_id, "Captured builder resources deleted");
+        tracing::info!(app_id = %self.snapshot.app_id, operation_id = %self.snapshot.operation_id, collaborators = self.extra_instances.len(), "Captured builder resources deleted");
         Ok(())
     }
 }

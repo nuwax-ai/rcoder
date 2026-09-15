@@ -43,10 +43,11 @@ fn register_container_identity(
         }
     }
     if let Some(owner) = expected_owner {
-        let app_id = name
+        let instance = name
             .strip_prefix("rcoder-app-builder-")
             .ok_or("invalid builder name")?;
-        if record["app_id"] != app_id
+        // record.app_id（docker label application-id）与容器名同为复合实例串
+        if record["app_id"] != instance
             || record["user_id"] != owner
             || record["service_type"] != shared_types::ServiceType::UserappBuilder.to_string()
             || !record["lifecycle_id"]
@@ -115,7 +116,8 @@ pub fn register_builder_attempt(app_id: &str, user_id: &str, required: bool) -> 
             "ps",
             "-aq",
             "--filter",
-            &format!("label=rcoder.io/application-id={app_id}"),
+            // 复合键后 application-id 标签值 = `{user_id}-{app_id}` 实例串
+            &format!("label=rcoder.io/application-id={user_id}-{app_id}"),
             "--filter",
             &format!("label=rcoder.io/owner-id={user_id}"),
             "--filter",
@@ -137,7 +139,11 @@ pub fn register_builder_attempt(app_id: &str, user_id: &str, required: bool) -> 
     if count != 1 {
         return Err("expected exactly one owned builder after creation".into());
     }
-    register_container_identity(&format!("rcoder-app-builder-{app_id}"), Some(user_id), None)
+    register_container_identity(
+        &format!("rcoder-app-builder-{user_id}-{app_id}"),
+        Some(user_id),
+        None,
+    )
 }
 
 fn prove_builder_replacement(
@@ -181,7 +187,7 @@ pub fn remove_builder_for_recreation(app_id: &str, user_id: &str, id: &str) -> R
     let root =
         PathBuf::from(std::env::var_os("E2E_REPORT_DIR").ok_or("strict report context required")?)
             .join("resources");
-    let name = format!("rcoder-app-builder-{app_id}");
+    let name = format!("rcoder-app-builder-{user_id}-{app_id}");
     let previous: serde_json::Value = serde_json::from_slice(
         &std::fs::read(root.join(format!("{name}-ownership.json")))
             .map_err(|error| error.to_string())?,
@@ -217,7 +223,7 @@ pub fn register_builder_replacement(
 ) -> Result<(), String> {
     require_container_absent(previous_id)?;
     register_container_identity(
-        &format!("rcoder-app-builder-{app_id}"),
+        &format!("rcoder-app-builder-{user_id}-{app_id}"),
         Some(user_id),
         Some(previous_id),
     )

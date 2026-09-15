@@ -123,6 +123,10 @@ async fn run(
     owner: &str,
 ) -> Result<BuilderControlResult> {
     let executor = uuid::Uuid::new_v4().to_string();
+    // owner 实例复合 identifier（adoption 属 owner 生命周期操作——受理按纯
+    // app_id，物理资源定位/绑定按复合键）
+    let instance =
+        shared_types::builder_instance_id(owner, &record.app_id).map_err(anyhow::Error::msg)?;
     let claimed = state
         .userapp_store
         .advance(&UserAppOperationProgress {
@@ -139,7 +143,7 @@ async fn run(
         })
         .await?;
     let context = UserAppExecutionContext {
-        app_id: claimed.app_id.clone(),
+        app_id: instance,
         user_id: owner.into(),
         lifecycle_id: claimed.lifecycle_id.clone(),
         operation_id: claimed.operation_id.clone(),
@@ -283,9 +287,14 @@ pub(super) async fn capture_bound_target(
         .await?)
 }
 
+/// 只读活体校验：以 lifecycle（纯 app_id）+ 复合 identifier + 实例归属构造
+/// capture context，校验物理负载未被替换且归属注解（rcoder.io/owner-id）与
+/// 实例 user 一致。owner 实例传 owner，协作者实例传协作者。
 pub(super) async fn verify_live_builder(
     state: &AppState,
     app_id: &str,
+    instance: &str,
+    instance_user: &str,
     physical_id: &str,
 ) -> Result<()> {
     let app = state
@@ -297,8 +306,8 @@ pub(super) async fn verify_live_builder(
         return Err(UserAppStoreError::LifecycleConflict.into());
     }
     let context = UserAppExecutionContext {
-        app_id: app_id.into(),
-        user_id: app.user_id,
+        app_id: instance.into(),
+        user_id: instance_user.into(),
         lifecycle_id: app.lifecycle_id,
         operation_id: "read-only-verification".into(),
         executor_id: "reader".into(),

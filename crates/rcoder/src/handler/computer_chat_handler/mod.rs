@@ -304,7 +304,10 @@ async fn run_userapp_dev_chat_flow(
                     locale,
                 ))
             })?;
-    state.update_activity(&project_id);
+    // 注册/会话映射键 = 复合 identifier（协作模型多实例——注册信息携带）；
+    // work_dir/workspace 仍按纯 app_id（容器内路径契约不变）。
+    let instance_key = container_info.project_id.clone();
+    state.update_activity(&instance_key);
 
     // 3. workspace 就绪（容器内幂等建目录；userapp_forward 公共调用）
     let addr = crate::userapp_builder::dev_file_server_addr(&state, &container_info);
@@ -318,9 +321,10 @@ async fn run_userapp_dev_chat_flow(
         )));
     }
 
-    // 4. Agent 状态探活 + session 解析（复用 computer 实现，按 project_id 映射通用）
-    session::probe_agent_status(&state, &container_info, &project_id, locale).await;
-    let request_for_forward = session::resolve_forward_request(&state, &request, &project_id);
+    // 4. Agent 状态探活 + session 解析（复用 computer 实现；session 映射按
+    //    复合实例键——多用户同 app 各会话映射各自容器）
+    session::probe_agent_status(&state, &container_info, &instance_key, locale).await;
+    let request_for_forward = session::resolve_forward_request(&state, &request, &instance_key);
 
     // 5. gRPC 转发（service_type=UserappBuilder → agent_runner 开发卷 work_dir）
     let forward_params = forward::ComputerForwardParams {
@@ -339,12 +343,13 @@ async fn run_userapp_dev_chat_flow(
     };
     let result = forward::forward_computer_request_to_container(forward_params).await;
 
-    // 6. 会话映射更新（service_type=UserappBuilder；session→project 映射供 SSE/会话族接口路由）
+    // 6. 会话映射更新（service_type=UserappBuilder；session→实例复合键映射
+    //    供 SSE/会话族接口路由到该用户的容器）
     session::update_session_mappings_after_response(
         &state,
         &result,
         &user_id,
-        &project_id,
+        &instance_key,
         &container_info,
         &request,
         &shared_types::ServiceType::UserappBuilder,

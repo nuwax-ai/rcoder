@@ -82,6 +82,48 @@ impl KubernetesRuntime {
         ))
     }
 
+    /// 按 app 维度枚举全部 builder 实例 identifier（协作模型多实例）：
+    /// STS 与 PVC 双源（`rcoder.io/app-id` label——STS 覆盖在跑实例、PVC 覆盖
+    /// 孤儿卷），读 `rcoder.io/identifier` 收集复合键。注意两族 service_type
+    /// 标签键不同（STS `rcoder.io/service-type`、PVC `service_type`）。
+    pub(super) async fn find_builder_instances(&self, app_id: &str) -> Result<Vec<String>> {
+        use kube::api::ListParams;
+        let selectors = [
+            format!(
+                "rcoder.io/app-id={app_id},rcoder.io/service-type={}",
+                ServiceType::UserappBuilder
+            ),
+            format!(
+                "rcoder.io/app-id={app_id},service_type={}",
+                ServiceType::UserappBuilder
+            ),
+        ];
+        let mut identifiers = std::collections::BTreeSet::new();
+        for (kind, selector) in [
+            (Kind::StatefulSet, &selectors[0]),
+            (Kind::PersistentVolumeClaim, &selectors[1]),
+        ] {
+            let lp = ListParams::default().labels(selector);
+            let items = self
+                .builder_api(kind)?
+                .list(&lp)
+                .await
+                .map_err(|error| map_error("list builder instances", error))?;
+            for object in items {
+                if let Some(identifier) = object
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("rcoder.io/identifier"))
+                    .filter(|id| shared_types::parse_builder_instance_id(id).is_some())
+                {
+                    identifiers.insert(identifier.clone());
+                }
+            }
+        }
+        Ok(identifiers.into_iter().collect())
+    }
+
     pub(super) async fn capture_builder(&self, app_id: &str) -> Result<BuilderDeletionSnapshot> {
         let family = ServiceType::UserappBuilder;
         let mut snapshot = BuilderDeletionSnapshot {

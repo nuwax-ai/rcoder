@@ -43,6 +43,10 @@ pub(crate) async fn execute(
         {
             return Err(UserAppStoreError::LifecycleConflict.into());
         }
+        // owner 实例复合 identifier（stop/restart 属 owner 生命周期操作——
+        // 操作/恢复按纯 app_id 受理，物理资源定位/锁/注册按复合键）。
+        let instance = shared_types::builder_instance_id(&request.user_id, &app_id)
+            .map_err(anyhow::Error::msg)?;
         let command = if restart {
             UserAppControlCommand::RestartBuilder
         } else {
@@ -91,7 +95,7 @@ pub(crate) async fn execute(
                 return Err(UserAppStoreError::OperationInProgress(record.operation_id).into());
             }
         };
-        execute_pending(&owned, record, &request.user_id, restart).await
+        execute_pending(&owned, record, &instance, &request.user_id, restart).await
     })
     .await
     .context("Builder control observer interrupted")?
@@ -129,6 +133,7 @@ async fn advance(
 async fn execute_pending(
     state: &AppState,
     mut record: UserAppOperationRecord,
+    instance: &str,
     owner: &str,
     restart: bool,
 ) -> Result<BuilderControlResult> {
@@ -144,7 +149,7 @@ async fn execute_pending(
     )
     .await?;
     let context = UserAppExecutionContext {
-        app_id: record.app_id.clone(),
+        app_id: instance.to_string(),
         user_id: owner.into(),
         lifecycle_id: record.lifecycle_id.clone(),
         operation_id: record.operation_id.clone(),
@@ -155,10 +160,7 @@ async fn execute_pending(
     let mut mutating = false;
     let operation = std::panic::AssertUnwindSafe(async {
         lease = Some(BuilderOperation::new(
-            state
-                .runtime()
-                .acquire_builder_operation(&record.app_id)
-                .await?,
+            state.runtime().acquire_builder_operation(instance).await?,
         ));
         let receipt = lease
             .as_ref()
@@ -212,8 +214,10 @@ async fn execute_pending(
                 + std::time::Duration::from_secs(
                     state.config.userapp_storage.ensure_timeout_seconds,
                 );
-            let info = super::confirm_builder_ready(state, &record.app_id, info, deadline).await?;
-            super::register_builder(state, &record.app_id, owner, &info)?;
+            let info =
+                super::confirm_builder_ready(state, &record.app_id, instance, info, deadline)
+                    .await?;
+            super::register_builder(state, instance, &info)?;
             Some(info)
         } else {
             None
@@ -236,7 +240,7 @@ async fn execute_pending(
         .await?;
         // Registration is an observation, not authority. Do not clear an entire
         // project/session or overwrite a newer registry generation after stopping.
-        crate::userapp_forward::invalidate_probe_cache(&record.app_id);
+        crate::userapp_forward::invalidate_probe_cache(instance);
         let guard = lease
             .as_mut()
             .ok_or_else(|| anyhow!("Builder operation lease missing"))?;
@@ -376,6 +380,9 @@ pub(super) async fn reconcile_completed(
     if binding.receipt.service_type() != &shared_types::ServiceType::UserappBuilder {
         return Err(anyhow!("Builder recovery lease family mismatch"));
     }
+    // 恢复只按已存证据行事：lease binding context 的 app_id 槽即创建时的
+    // 复合 identifier（不从纯 app_id 重派生）。
+    let instance = binding.context.app_id.clone();
     let mut reserved = state
         .userapp_store
         .reserve_completed_operation(snapshot)
@@ -405,7 +412,7 @@ pub(super) async fn reconcile_completed(
     .await?;
     result?;
     forget_released_lease(state, &binding).await;
-    crate::userapp_forward::invalidate_probe_cache(&snapshot.app_id);
+    crate::userapp_forward::invalidate_probe_cache(&instance);
     Ok(true)
 }
 
@@ -437,6 +444,10 @@ pub(super) async fn resume_pending(
     if app.lifecycle_id != record.lifecycle_id || app.state != UserAppLifecycleState::Active {
         return Err(UserAppStoreError::LifecycleConflict.into());
     }
-    execute_pending(state, current, &app.user_id, restart).await?;
+    // owner 实例复合 identifier（resume 的操作由 owner 受理，实例恒为
+    // {owner}-{app_id}）
+    let instance = shared_types::builder_instance_id(&app.user_id, &record.app_id)
+        .map_err(anyhow::Error::msg)?;
+    execute_pending(state, current, &instance, &app.user_id, restart).await?;
     Ok(true)
 }

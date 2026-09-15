@@ -393,7 +393,7 @@ impl super::AppService {
             .clone()
             .ok_or_else(|| AppOperationError::Backend("Dev locator is not configured".into()))?;
         if locator
-            .dev_container_alive(app_id)
+            .dev_container_alive(app_id, None)
             .await
             .map_err(AppOperationError::Backend)?
         {
@@ -426,7 +426,7 @@ mod tests {
         async fn dev_file_server_addr(&self, _: &str, _: Option<&str>) -> Result<String, String> {
             Err("No builder".into())
         }
-        async fn dev_container_alive(&self, _: &str) -> Result<bool, String> {
+        async fn dev_container_alive(&self, _: &str, _: Option<&str>) -> Result<bool, String> {
             Ok(false)
         }
     }

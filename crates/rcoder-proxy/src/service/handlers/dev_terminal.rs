@@ -67,19 +67,25 @@ pub(crate) async fn find_dev_container(
             pingora_core::ErrorType::HTTPStatus(400),
         ));
     }
-    if let Some(ip) = container_lookup
-        .as_ref()
-        .and_then(|lookup| {
-            lookup.find_by_project_id(app_id, &shared_types::ServiceType::UserappBuilder)
+    // 定位键 = 复合 identifier `{user_id}-{app_id}`（协作模型多实例——同 app
+    // 每用户独立容器）。组装失败（app_id 含 '-' 等结构冲突）跳过注册表快路，
+    // 由 ensure 链给出明确错误。
+    let instance = shared_types::builder_instance_id(user_id, app_id).ok();
+    if let Some(ip) = instance
+        .as_deref()
+        .and_then(|key| {
+            container_lookup.as_ref().and_then(|lookup| {
+                lookup.find_by_project_id(key, &shared_types::ServiceType::UserappBuilder)
+            })
         })
         .filter(|ip| !ip.is_empty())
     {
         // 注册表 IP 是内存残影：不随容器删除失效，且 IP 可被其他应用的
         // builder 复用（端口探测通过≠身份正确——跨应用污染形态）。接受该
-        // IP 前先经类型化身份核验（按 app 身份键查运行时）；核验不可用
+        // IP 前先经类型化身份核验（按复合身份键查运行时）；核验不可用
         // （回调未注入）时退回端口探测旧语义。
         let identity_ok = match dev_ensure.load_full() {
-            Some(ensurer) => match ensurer.dev_builder_exists(app_id).await {
+            Some(ensurer) => match ensurer.dev_builder_exists(app_id, Some(user_id)).await {
                 Ok(exists) => exists,
                 Err(e) => {
                     warn!("[DEV_TERMINAL] builder identity check failed: app_id={app_id}: {e}");
@@ -93,7 +99,7 @@ pub(crate) async fn find_dev_container(
         }
     }
     // miss（或命中死值——容器被外部删除后内存表残留旧 IP，探测失败）
-    // → 懒启动（显式 owner 档：URL user_id 段直取，宿主树
+    // → 懒启动（显式实例档：URL user_id 段直取，宿主树
     // `dev/{user_id}/{app_id}` 分区正确，不依赖 metadata 兜底）。
     // 槽未回填（AppState 就绪前）视为未注入，维持 404 指引。
     let Some(ensurer) = dev_ensure.load_full() else {

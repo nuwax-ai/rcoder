@@ -213,21 +213,21 @@ async fn touch_throttle_collapses_writes_within_window() {
     // 窗口取 500ms（循环名义 50ms 留 10 倍余量）：此前 100ms 窗口下负载漂移
     // 可使循环实际超窗（实测 ~110ms），第一段断言高频 flaky
     let reg = AppActivityRegistry::new_with(Duration::from_secs(1), Duration::from_millis(500));
-    reg.touch("app-a");
-    let t0 = reg.last_accessed_at("app-a").expect("first touch recorded");
+    reg.touch("appa");
+    let t0 = reg.last_accessed_at("appa").expect("first touch recorded");
 
     // 窗口内多次 touch 不更新
     for _ in 0..10 {
-        reg.touch("app-a");
+        reg.touch("appa");
         sleep(Duration::from_millis(5)).await;
     }
-    assert_eq!(reg.last_accessed_at("app-a"), Some(t0), "throttled");
+    assert_eq!(reg.last_accessed_at("appa"), Some(t0), "throttled");
 
     // 超过窗口后更新
     sleep(Duration::from_millis(600)).await;
-    reg.touch("app-a");
+    reg.touch("appa");
     assert!(
-        reg.last_accessed_at("app-a").unwrap() > t0,
+        reg.last_accessed_at("appa").unwrap() > t0,
         "updated after window"
     );
 }
@@ -238,8 +238,8 @@ async fn wake_concurrent_dedup_scales_once() {
     let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
     reg.set_runtime(rt.clone());
     let reg = Arc::new(reg);
-    let _fixture = attach_coordinator(&reg, rt.clone(), "app-x").await;
-    reg.mark_stopped("app-x");
+    let _fixture = attach_coordinator(&reg, rt.clone(), "appx").await;
+    reg.mark_stopped("appx");
 
     // 5 并发唤醒:无论时序如何都只 scale 一次——
     // leader 拉起后 mark_running 清 stopped,后到者走 leader 路径时 is_stopped=false → AlreadyRunning(不再 scale);
@@ -247,7 +247,7 @@ async fn wake_concurrent_dedup_scales_once() {
     let mut handles = vec![];
     for _ in 0..5 {
         let r = reg.clone();
-        handles.push(tokio::spawn(async move { r.ensure_running("app-x").await }));
+        handles.push(tokio::spawn(async move { r.ensure_running("appx").await }));
     }
     let outcomes: Vec<WakeOutcome> = futures_util::future::join_all(handles)
         .await
@@ -275,15 +275,15 @@ async fn wake_timeout_when_never_ready() {
     let reg = AppActivityRegistry::new_with(Duration::from_millis(300), Duration::from_millis(50));
     reg.set_runtime(rt.clone());
     let reg = Arc::new(reg);
-    let _fixture = attach_coordinator(&reg, rt.clone(), "app-t").await;
-    reg.mark_stopped("app-t");
+    let _fixture = attach_coordinator(&reg, rt.clone(), "appt").await;
+    reg.mark_stopped("appt");
 
-    let outcome = reg.ensure_running("app-t").await;
+    let outcome = reg.ensure_running("appt").await;
     assert_eq!(outcome, WakeOutcome::Timeout);
     // Timeout retains the durable mutation; another request cannot start again.
-    assert!(reg.is_stopped("app-t"));
+    assert!(reg.is_stopped("appt"));
     assert!(matches!(
-        reg.ensure_running("app-t").await,
+        reg.ensure_running("appt").await,
         WakeOutcome::Failed(_)
     ));
     assert_eq!(rt.scale_calls.load(Ordering::SeqCst), 1);
@@ -295,13 +295,13 @@ async fn manually_stopped_app_rejects_traffic_without_runtime_write() {
     let runtime = Arc::new(MockRuntime::new(true));
     let scale_calls = runtime.scale_calls.clone();
     reg.set_runtime(runtime);
-    reg.mark_wake_blocked("app-manual");
+    reg.mark_wake_blocked("appmanual");
 
-    let outcome = reg.ensure_running("app-manual").await;
+    let outcome = reg.ensure_running("appmanual").await;
 
     assert!(matches!(outcome, WakeOutcome::Failed(_)), "got {outcome:?}");
     assert_eq!(scale_calls.load(Ordering::SeqCst), 0);
-    assert!(reg.is_wake_blocked("app-manual"));
+    assert!(reg.is_wake_blocked("appmanual"));
 }
 
 #[tokio::test]
@@ -312,23 +312,23 @@ async fn recycle_transition_waits_for_stop_then_wakes_once() {
         Duration::from_millis(10),
     ));
     registry.set_runtime(runtime.clone());
-    let _fixture = attach_coordinator(&registry, runtime.clone(), "app-r").await;
-    registry.seed_accessed("app-r");
+    let _fixture = attach_coordinator(&registry, runtime.clone(), "appr").await;
+    registry.seed_accessed("appr");
     let observed = registry
-        .last_accessed_at("app-r")
+        .last_accessed_at("appr")
         .expect("seeded access timestamp");
     let transition = registry
-        .try_begin_recycle("app-r", observed)
+        .try_begin_recycle("appr", observed)
         .expect("unchanged app may enter recycle transition");
 
     let wake = tokio::spawn({
         let registry = registry.clone();
-        async move { registry.ensure_running("app-r").await }
+        async move { registry.ensure_running("appr").await }
     });
     tokio::task::yield_now().await;
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
 
-    registry.mark_stopped("app-r");
+    registry.mark_stopped("appr");
     drop(transition);
     let outcome = wake.await.expect("wake task");
     assert_eq!(outcome, WakeOutcome::Ready);
@@ -338,15 +338,15 @@ async fn recycle_transition_waits_for_stop_then_wakes_once() {
 #[tokio::test]
 async fn recycle_transition_rejects_stale_access_observation() {
     let registry = AppActivityRegistry::new_with(Duration::from_secs(2), Duration::from_millis(0));
-    registry.seed_accessed("app-r");
+    registry.seed_accessed("appr");
     let observed = registry
-        .last_accessed_at("app-r")
+        .last_accessed_at("appr")
         .expect("seeded access timestamp");
     sleep(Duration::from_millis(1)).await;
-    registry.touch("app-r");
+    registry.touch("appr");
 
-    assert!(registry.try_begin_recycle("app-r", observed).is_none());
-    assert!(!registry.is_stopped("app-r"));
+    assert!(registry.try_begin_recycle("appr", observed).is_none());
+    assert!(!registry.is_stopped("appr"));
 }
 
 #[tokio::test]
@@ -359,30 +359,30 @@ async fn wake_leader_panic_cleans_flight_but_retains_uncertain_operation() {
         Duration::from_millis(50),
     ));
     reg.set_runtime(rt.clone());
-    let _fixture = attach_coordinator(&reg, rt.clone(), "app-p").await;
-    reg.mark_stopped("app-p");
+    let _fixture = attach_coordinator(&reg, rt.clone(), "appp").await;
+    reg.mark_stopped("appp");
 
     // 第一次唤醒(leader panic)
     let jh = tokio::spawn({
         let r = reg.clone();
-        async move { r.ensure_running("app-p").await }
+        async move { r.ensure_running("appp").await }
     });
     drop(jh.await); // task panic → JoinError,吞掉
 
     // 守卫应已移除 waking 条目(未泄漏)
     assert!(
-        !reg.is_waking("app-p"),
+        !reg.is_waking("appp"),
         "waking entry must be cleaned after leader panic"
     );
 
     // The flight is gone, but the durable mutation and lease remain fenced.
-    let outcome = reg.ensure_running("app-p").await;
+    let outcome = reg.ensure_running("appp").await;
     assert!(
         matches!(outcome, WakeOutcome::Failed(_)),
         "second wake must not retry an uncertain mutation: {:?}",
         outcome
     );
-    assert!(reg.is_stopped("app-p"));
+    assert!(reg.is_stopped("appp"));
     assert_eq!(rt.scale_calls.load(Ordering::SeqCst), 1);
 }
 
@@ -397,13 +397,13 @@ async fn remote_stopped_backfills_and_wakes_when_cluster_says_stopped() {
     let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
     reg.set_runtime(rt.clone());
     let reg = Arc::new(reg);
-    let _fixture = attach_coordinator(&reg, rt.clone(), "app-x").await;
-    assert!(!reg.is_stopped("app-x"), "前置：内存视图无记录");
+    let _fixture = attach_coordinator(&reg, rt.clone(), "appx").await;
+    assert!(!reg.is_stopped("appx"), "前置：内存视图无记录");
 
-    let outcome = reg.ensure_running("app-x").await;
+    let outcome = reg.ensure_running("appx").await;
     assert!(matches!(outcome, WakeOutcome::Ready), "got {outcome:?}");
     assert_eq!(rt.scale_calls.load(Ordering::SeqCst), 1);
-    assert!(!reg.is_stopped("app-x"), "唤醒成功后内存标记清除");
+    assert!(!reg.is_stopped("appx"), "唤醒成功后内存标记清除");
 }
 
 /// Running app 的兜底查询负缓存：TTL 内重复判定零额外集群查询。
@@ -413,8 +413,8 @@ async fn remote_stopped_negative_cache_avoids_extra_queries() {
     let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
     reg.set_runtime(rt.clone());
 
-    assert!(!reg.remote_stopped("app-run").await);
-    assert!(!reg.remote_stopped("app-run").await);
+    assert!(!reg.remote_stopped("apprun").await);
+    assert!(!reg.remote_stopped("apprun").await);
     assert_eq!(
         rt.status_calls.load(Ordering::SeqCst),
         1,
@@ -424,7 +424,7 @@ async fn remote_stopped_negative_cache_avoids_extra_queries() {
     // The negative probe cache must not authorize control success without a
     // coordinator that can check durable lifecycle and resource identity.
     assert!(matches!(
-        reg.ensure_running("app-run").await,
+        reg.ensure_running("apprun").await,
         WakeOutcome::Failed(_)
     ));
     assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1);
@@ -436,15 +436,15 @@ async fn cached_running_state_cannot_bypass_a_remote_manual_stop() {
     *runtime.phase.lock().expect("phase") = "Running".into();
     let registry = Arc::new(AppActivityRegistry::new(Duration::from_secs(2)));
     registry.set_runtime(runtime.clone());
-    let _fixture = attach_coordinator(&registry, runtime.clone(), "cached-stop").await;
-    assert!(!registry.remote_stopped("cached-stop").await);
+    let _fixture = attach_coordinator(&registry, runtime.clone(), "cachedstop").await;
+    assert!(!registry.remote_stopped("cachedstop").await);
     assert_eq!(runtime.status_calls.load(Ordering::SeqCst), 1);
 
     // Another replica commits a manual stop while this replica retains its
     // negative probe cache and has no local stopped flag.
     *runtime.phase.lock().expect("phase") = "Stopped".into();
     *runtime.wake_on_traffic.lock().expect("policy") = Some(false);
-    let outcome = registry.ensure_running("cached-stop").await;
+    let outcome = registry.ensure_running("cachedstop").await;
     assert!(
         matches!(&outcome, WakeOutcome::Failed(message) if message.contains("intentionally stopped")),
         "{outcome:?}"
@@ -460,10 +460,10 @@ async fn cached_running_state_requires_a_durable_application_identity() {
     *runtime.phase.lock().expect("phase") = "Running".into();
     let registry = Arc::new(AppActivityRegistry::new(Duration::from_secs(2)));
     registry.set_runtime(runtime.clone());
-    let _fixture = attach_coordinator(&registry, runtime.clone(), "registered-app").await;
-    assert!(!registry.remote_stopped("unregistered-app").await);
+    let _fixture = attach_coordinator(&registry, runtime.clone(), "registeredapp").await;
+    assert!(!registry.remote_stopped("unregisteredapp").await);
 
-    let outcome = registry.ensure_running("unregistered-app").await;
+    let outcome = registry.ensure_running("unregisteredapp").await;
     assert!(
         matches!(&outcome, WakeOutcome::Failed(message) if message.contains("Application identity not found")),
         "{outcome:?}"
@@ -480,12 +480,12 @@ async fn remote_stopped_err_not_cached_retries_next_call() {
     let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
     reg.set_runtime(rt.clone());
 
-    assert!(!reg.remote_stopped("app-e").await, "瞬断退化为 false");
+    assert!(!reg.remote_stopped("appe").await, "瞬断退化为 false");
     assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1);
 
     rt.fail_status.store(false, Ordering::SeqCst);
     assert!(
-        !reg.remote_stopped("app-e").await,
+        !reg.remote_stopped("appe").await,
         "恢复后重查（Err 未缓存）"
     );
     assert_eq!(rt.status_calls.load(Ordering::SeqCst), 2);
@@ -500,9 +500,9 @@ async fn remote_stopped_manual_stop_backfills_wake_blocked_tier() {
     let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
     reg.set_runtime(rt);
 
-    assert!(reg.remote_stopped("app-m").await);
+    assert!(reg.remote_stopped("appm").await);
     assert!(
-        reg.is_wake_blocked("app-m"),
+        reg.is_wake_blocked("appm"),
         "manual_stop 档回填 wake_blocked"
     );
 }
@@ -513,12 +513,12 @@ async fn mark_writes_refresh_remote_cache_immediately() {
     let rt = Arc::new(MockRuntime::new(true));
     let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
     reg.set_runtime(rt.clone());
-    assert!(!reg.remote_stopped("app-c").await); // 查一次（Running）缓存 false
+    assert!(!reg.remote_stopped("appc").await); // 查一次（Running）缓存 false
     assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1);
 
-    reg.mark_wake_blocked("app-c"); // 本副本 stop → 缓存即时刷新
+    reg.mark_wake_blocked("appc"); // 本副本 stop → 缓存即时刷新
     assert!(
-        reg.remote_stopped("app-c").await,
+        reg.remote_stopped("appc").await,
         "mark 后缓存立即为 stopped"
     );
     assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1, "零额外集群查询");
@@ -530,16 +530,16 @@ fn merge_accessed_takes_max_and_backfills_memory() {
     let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(1));
     let old_t = Utc::now() - chrono::Duration::hours(10);
     let new_t = Utc::now() - chrono::Duration::minutes(1);
-    reg.last_accessed.insert("app-g".to_string(), old_t);
+    reg.last_accessed.insert("appg".to_string(), old_t);
 
     // PG 较新 → 覆盖内存并返回新值
-    assert_eq!(reg.merge_accessed("app-g", new_t), new_t);
-    assert_eq!(reg.last_accessed_at("app-g"), Some(new_t), "新值已回写内存");
+    assert_eq!(reg.merge_accessed("appg", new_t), new_t);
+    assert_eq!(reg.last_accessed_at("appg"), Some(new_t), "新值已回写内存");
 
     // PG 较旧 → 保内存新值（返回值仍为较新者）
     let stale_t = old_t - chrono::Duration::hours(1);
-    assert_eq!(reg.merge_accessed("app-g", stale_t), new_t);
-    assert_eq!(reg.last_accessed_at("app-g"), Some(new_t), "旧值不覆盖");
+    assert_eq!(reg.merge_accessed("appg", stale_t), new_t);
+    assert_eq!(reg.last_accessed_at("appg"), Some(new_t), "旧值不覆盖");
 }
 
 /// 验证 Fix3:leader 中途 panic(result 未写入)时,`WakeGuard` drop 必须广播 `Failed`,
@@ -549,7 +549,7 @@ async fn guard_broadcasts_failed_on_drop_when_leader_did_not_finish() {
     let map: Arc<DashMap<String, Arc<WakeHandle>>> = Arc::new(DashMap::new());
     let (tx, _) = watch::channel(None::<WakeOutcome>);
     let handle = Arc::new(WakeHandle { tx });
-    map.insert("app-g".to_string(), handle.clone());
+    map.insert("appg".to_string(), handle.clone());
 
     // follower 先 subscribe(模拟并发请求 join 到 leader)
     let rx = handle.tx.subscribe();
@@ -562,7 +562,7 @@ async fn guard_broadcasts_failed_on_drop_when_leader_did_not_finish() {
     {
         let _guard = WakeGuard {
             map: map.clone(),
-            key: "app-g".to_string(),
+            key: "appg".to_string(),
             handle: handle.clone(),
             outcome: None,
         };
@@ -579,7 +579,7 @@ async fn guard_broadcasts_failed_on_drop_when_leader_did_not_finish() {
         other => panic!("expected Failed, got {:?}", other),
     }
     assert!(
-        !map.contains_key("app-g"),
+        !map.contains_key("appg"),
         "entry must be removed on guard drop"
     );
 }
@@ -588,17 +588,17 @@ async fn guard_broadcasts_failed_on_drop_when_leader_did_not_finish() {
 fn wake_completion_respects_all_manual_stops() {
     let registry = AppActivityRegistry::new(Duration::from_secs(2));
     // A stop arriving during wake cannot be cleared by completion.
-    registry.mark_stopped("app-stop-race");
-    registry.mark_wake_blocked("app-stop-race");
-    assert!(!registry.try_mark_woken("app-stop-race"));
-    assert!(registry.is_wake_blocked("app-stop-race"));
-    assert!(registry.is_stopped("app-stop-race"));
+    registry.mark_stopped("appstoprace");
+    registry.mark_wake_blocked("appstoprace");
+    assert!(!registry.try_mark_woken("appstoprace"));
+    assert!(registry.is_wake_blocked("appstoprace"));
+    assert!(registry.is_stopped("appstoprace"));
 
     // A preexisting manual stop is equally authoritative.
     let registry2 = AppActivityRegistry::new(Duration::from_secs(2));
-    registry2.mark_wake_blocked("app-stop-old");
-    assert!(!registry2.try_mark_woken("app-stop-old"));
-    assert!(registry2.is_wake_blocked("app-stop-old"));
+    registry2.mark_wake_blocked("appstopold");
+    assert!(!registry2.try_mark_woken("appstopold"));
+    assert!(registry2.is_wake_blocked("appstopold"));
 }
 
 #[test]
@@ -608,12 +608,12 @@ fn completed_wake_is_retained_for_follower_that_has_not_subscribed_yet() {
         let (tx, initial_rx) = watch::channel(None::<WakeOutcome>);
         drop(initial_rx);
         let handle = Arc::new(WakeHandle { tx });
-        map.insert("late-follower".into(), handle.clone());
+        map.insert("latefollower".into(), handle.clone());
         // The follower selected its role but has not subscribed yet.
         let follower_handle = handle.clone();
         drop(WakeGuard {
             map,
-            key: "late-follower".into(),
+            key: "latefollower".into(),
             handle,
             outcome: Some(outcome.clone()),
         });
@@ -633,26 +633,26 @@ fn deletion_outcome_is_retained_for_a_late_wake_subscriber() {
     let handle = Arc::new(WakeHandle { tx });
     registry
         .waking
-        .insert("deleted-late-subscriber".into(), handle.clone());
-    registry.forget_app("deleted-late-subscriber");
+        .insert("deletedlatesubscriber".into(), handle.clone());
+    registry.forget_app("deletedlatesubscriber");
     let receiver = handle.tx.subscribe();
     assert!(
         matches!(&*receiver.borrow(), Some(WakeOutcome::Failed(message)) if message == "Application was deleted")
     );
-    assert!(!registry.waking.contains_key("deleted-late-subscriber"));
+    assert!(!registry.waking.contains_key("deletedlatesubscriber"));
 }
 
 #[test]
 fn forget_app_clears_deleted_app_state() {
     let registry = AppActivityRegistry::new(Duration::from_secs(2));
-    registry.seed_accessed("app-deleted");
-    registry.mark_wake_blocked("app-deleted");
+    registry.seed_accessed("appdeleted");
+    registry.mark_wake_blocked("appdeleted");
 
-    registry.forget_app("app-deleted");
+    registry.forget_app("appdeleted");
 
-    assert!(!registry.is_stopped("app-deleted"));
-    assert!(!registry.is_wake_blocked("app-deleted"));
-    assert_eq!(registry.last_accessed_at("app-deleted"), None);
+    assert!(!registry.is_stopped("appdeleted"));
+    assert!(!registry.is_wake_blocked("appdeleted"));
+    assert_eq!(registry.last_accessed_at("appdeleted"), None);
 }
 
 #[tokio::test]
@@ -664,13 +664,13 @@ async fn wake_failed_mutation_retains_lease_but_success_releases() {
         let reg = AppActivityRegistry::new_with(Duration::from_secs(2), Duration::from_millis(1));
         reg.set_runtime(rt.clone());
         let reg = Arc::new(reg);
-        let _fixture = attach_coordinator(&reg, rt.clone(), "lease-wake").await;
-        reg.mark_stopped("lease-wake");
-        let outcome = reg.ensure_running("lease-wake").await;
+        let _fixture = attach_coordinator(&reg, rt.clone(), "leasewake").await;
+        reg.mark_stopped("leasewake");
+        let outcome = reg.ensure_running("leasewake").await;
         assert_eq!(matches!(outcome, WakeOutcome::Failed(_)), fail);
         assert_eq!(rt.lease_held.load(Ordering::SeqCst), fail);
         if fail {
-            assert!(rt.acquire_app_operation("lease-wake").await.is_err());
+            assert!(rt.acquire_app_operation("leasewake").await.is_err());
         }
     }
 }
@@ -685,16 +685,16 @@ async fn cancelled_wake_after_scale_started_retains_lease() {
         Duration::from_millis(1),
     ));
     reg.set_runtime(rt.clone());
-    let _fixture = attach_coordinator(&reg, rt.clone(), "cancelled-wake").await;
-    reg.mark_stopped("cancelled-wake");
-    let task = tokio::spawn(async move { reg.ensure_running("cancelled-wake").await });
+    let _fixture = attach_coordinator(&reg, rt.clone(), "cancelledwake").await;
+    reg.mark_stopped("cancelledwake");
+    let task = tokio::spawn(async move { reg.ensure_running("cancelledwake").await });
     tokio::time::timeout(Duration::from_secs(2), rt.scale_entered.notified())
         .await
         .expect("scale entered");
     task.abort();
     assert!(task.await.expect_err("cancelled").is_cancelled());
     assert!(rt.lease_held.load(Ordering::SeqCst));
-    assert!(rt.acquire_app_operation("cancelled-wake").await.is_err());
+    assert!(rt.acquire_app_operation("cancelledwake").await.is_err());
 }
 
 #[tokio::test]
@@ -704,10 +704,10 @@ async fn traffic_observing_remote_manual_stop_does_not_start_the_application() {
     *runtime.wake_on_traffic.lock().expect("wake policy") = Some(false);
     let registry = AppActivityRegistry::new_with(Duration::from_secs(1), Duration::from_millis(1));
     registry.set_runtime(runtime.clone());
-    let outcome = registry.ensure_running("remote-manual-stop").await;
+    let outcome = registry.ensure_running("remotemanualstop").await;
     assert!(matches!(outcome, WakeOutcome::Failed(_)), "{outcome:?}");
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
-    assert!(registry.is_wake_blocked("remote-manual-stop"));
+    assert!(registry.is_wake_blocked("remotemanualstop"));
     assert!(
         registry.waking.is_empty(),
         "rejected traffic must not retain a wake flight"
@@ -721,11 +721,11 @@ async fn wake_runtime_query_failure_is_not_already_running() {
     let registry = AppActivityRegistry::new(Duration::from_secs(1));
     registry.set_runtime(runtime.clone());
     assert!(matches!(
-        registry.ensure_running("query-failure").await,
+        registry.ensure_running("queryfailure").await,
         WakeOutcome::Failed(_)
     ));
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
-    assert!(registry.remote_state.get("query-failure").is_none());
+    assert!(registry.remote_state.get("queryfailure").is_none());
 }
 
 #[tokio::test]
@@ -753,9 +753,9 @@ async fn traffic_wake_does_not_confirm_a_replacement_running_resource() {
     runtime.replace_after_start.store(true, Ordering::SeqCst);
     let registry = Arc::new(AppActivityRegistry::new(Duration::from_secs(2)));
     registry.set_runtime(runtime.clone());
-    let fixture = attach_coordinator(&registry, runtime.clone(), "replaced-wake").await;
-    registry.mark_stopped("replaced-wake");
-    let outcome = registry.ensure_running("replaced-wake").await;
+    let fixture = attach_coordinator(&registry, runtime.clone(), "replacedwake").await;
+    registry.mark_stopped("replacedwake");
+    let outcome = registry.ensure_running("replacedwake").await;
     assert!(
         matches!(outcome, WakeOutcome::Failed(ref message) if message.contains("replaced")),
         "{outcome:?}"
@@ -776,9 +776,9 @@ async fn traffic_wake_does_not_confirm_a_replacement_running_resource() {
     );
     assert_eq!(
         operations[0].checkpoint["target"]["resource"]["uid"],
-        "uid-replaced-wake"
+        "uid-replacedwake"
     );
-    assert!(registry.is_stopped("replaced-wake"));
+    assert!(registry.is_stopped("replacedwake"));
 }
 
 #[tokio::test]
@@ -787,30 +787,30 @@ async fn traffic_wake_retains_confirmation_gate_while_start_is_in_flight() {
     runtime.pause_scale.store(true, Ordering::SeqCst);
     let registry = Arc::new(AppActivityRegistry::new(Duration::from_secs(2)));
     registry.set_runtime(runtime.clone());
-    let _fixture = attach_coordinator(&registry, runtime.clone(), "pending-ready").await;
-    registry.mark_stopped("pending-ready");
+    let _fixture = attach_coordinator(&registry, runtime.clone(), "pendingready").await;
+    registry.mark_stopped("pendingready");
     let worker = tokio::spawn({
         let registry = registry.clone();
-        async move { registry.ensure_running("pending-ready").await }
+        async move { registry.ensure_running("pendingready").await }
     });
     tokio::time::timeout(Duration::from_secs(2), runtime.scale_entered.notified())
         .await
         .expect("start request entered");
     assert!(
-        registry.is_stopped("pending-ready"),
+        registry.is_stopped("pendingready"),
         "Starting replicas must not clear the confirmation gate"
     );
-    assert!(registry.is_waking("pending-ready"));
+    assert!(registry.is_waking("pendingready"));
     assert!(runtime.lease_held.load(Ordering::SeqCst));
     let result = tokio::time::timeout(Duration::from_secs(4), worker)
         .await
         .expect("bounded observation")
         .expect("worker");
     assert_eq!(result, WakeOutcome::Timeout);
-    assert!(registry.is_stopped("pending-ready"));
+    assert!(registry.is_stopped("pendingready"));
     assert!(runtime.lease_held.load(Ordering::SeqCst));
     assert!(matches!(
-        registry.ensure_running("pending-ready").await,
+        registry.ensure_running("pendingready").await,
         WakeOutcome::Failed(_)
     ));
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);

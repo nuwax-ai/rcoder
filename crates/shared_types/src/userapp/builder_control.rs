@@ -138,9 +138,14 @@ impl BuilderCreationEvidence {
     ) -> Result<(), String> {
         self.target.validate()?;
         let context = &self.target.context;
+        // app 级 operation（lifecycle，纯 app_id）与实例级 evidence（复合
+        // identifier `{user_id}-{app_id}`）的 app 段必须一致——实例串右切还原
+        let app_segment = crate::parse_builder_instance_id(&context.app_id)
+            .map(|(_, app)| app.to_string())
+            .unwrap_or_else(|| context.app_id.clone());
         if !self.creation_lease_released
             || operation.kind != crate::UserAppOperationKind::EnsureBuilder
-            || context.app_id != operation.app_id
+            || app_segment != operation.app_id
             || context.lifecycle_id != operation.lifecycle_id
             || context.operation_id != operation.operation_id
             || operation.executor_id.as_deref() != Some(context.executor_id.as_str())

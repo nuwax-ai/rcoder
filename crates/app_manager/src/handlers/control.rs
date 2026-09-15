@@ -325,7 +325,7 @@ mod builder_retry_tests {
             };
             let admitted = store
                 .admit(&UserAppAdmission {
-                    app_id: "retry-builder".into(),
+                    app_id: "retrybuilder".into(),
                     user_id: "owner".into(),
                     lifecycle_id: None,
                     operation_id: "original-operation".into(),

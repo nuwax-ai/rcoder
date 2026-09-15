@@ -266,14 +266,15 @@ impl AppService {
                 "user_id must contain 1-64 letters, digits, underscores or hyphens".to_string(),
             ));
         }
-        // app_id：外部指定（DNS-1123 label ≤33，如 app-order-svc 或数值 project_id；
-        // 校验 + 唯一性）or 自动生成（app-{8hex}）
+        // app_id：外部指定（小写字母数字 ≤22，如数值 project_id；禁 '-'
+        // ——builder 复合键 {user_id}-{app_id} 的解析无歧义要求；
+        // 校验 + 唯一性）or 自动生成（app{8hex}）
         let app_id = match &request.app_id {
             Some(id) => {
                 validate_app_id(id)?;
                 id.clone()
             }
-            None => format!("app-{}", &Uuid::new_v4().to_string()[..8]),
+            None => format!("app{}", &Uuid::new_v4().to_string()[..8]),
         };
 
         // 资源限制格式（K8s Quantity: storage / ephemeral_storage）→ ERR_VALIDATION

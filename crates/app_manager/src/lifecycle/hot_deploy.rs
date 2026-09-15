@@ -599,7 +599,7 @@ mod tests {
 
         let outcome = svc
             .try_deploy_via_container_api(
-                "app-nope",
+                "appnope",
                 "http://x/p.zip",
                 "rel-1",
                 "",
@@ -619,9 +619,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MockRuntime::default());
         runtime.deployments.insert(
-            "app-live".into(),
+            "applive".into(),
             container_runtime_api::DeploymentStatus {
-                app_id: "app-live".into(),
+                app_id: "applive".into(),
                 replicas: 1,
                 ready_replicas: 1,
                 phase: "Running".into(),
@@ -632,7 +632,7 @@ mod tests {
 
         let outcome = svc
             .try_deploy_via_container_api(
-                "app-live",
+                "applive",
                 "http://x/p.zip",
                 "rel-1",
                 "",
@@ -718,7 +718,7 @@ mod tests {
                     service.config.access_mode = crate::config::AppAccessMode::Kubernetes;
                 }
                 let guard = service
-                    .acquire_process_release_lock("hot-terminal")
+                    .acquire_process_release_lock("hotterminal")
                     .await
                     .expect("lease");
                 guard.mark_mutating().expect("accepted mutation");
@@ -744,7 +744,7 @@ mod tests {
                 .await;
                 assert!(result.is_err());
                 let next = service
-                    .try_acquire_process_release_lock("hot-terminal")
+                    .try_acquire_process_release_lock("hotterminal")
                     .await;
                 assert_eq!(
                     next.is_ok(),
@@ -814,7 +814,7 @@ mod tests {
         let root = tempfile::tempdir().expect("directory");
         let service = test_service(root.path(), Arc::new(MockRuntime::default())).await;
         let guard = service
-            .acquire_process_release_lock("hot-identity")
+            .acquire_process_release_lock("hotidentity")
             .await
             .expect("lease");
         for (generation, stage, persisted, accepted) in [
@@ -862,7 +862,7 @@ mod tests {
                 .store(2, std::sync::atomic::Ordering::SeqCst);
             let service = test_service(root.path(), runtime.clone()).await;
             let guard = service
-                .acquire_process_release_lock("hot-cancel")
+                .acquire_process_release_lock("hotcancel")
                 .await
                 .expect("lease");
             let accepted = Arc::new(tokio::sync::Notify::new());
@@ -896,7 +896,7 @@ mod tests {
             let task = super::HotDeploymentTask {
                 runtime,
                 access_mode: crate::config::AppAccessMode::Docker,
-                app_id: "hot-cancel".into(),
+                app_id: "hotcancel".into(),
                 url: "http://artifact".into(),
                 release_id: "request".into(),
                 sha256: String::new(),
@@ -946,7 +946,7 @@ mod tests {
                     .is_some()
             );
             service
-                .try_acquire_process_release_lock("hot-cancel")
+                .try_acquire_process_release_lock("hotcancel")
                 .await
                 .expect("released ownership")
                 .finish()
@@ -1010,7 +1010,7 @@ mod tests {
         let task = super::HotDeploymentTask {
             runtime,
             access_mode: crate::config::AppAccessMode::Docker,
-            app_id: "ready-test".into(),
+            app_id: "readytest".into(),
             url: "http://artifact".into(),
             release_id: "request".into(),
             sha256: String::new(),
@@ -1021,7 +1021,7 @@ mod tests {
             operation_id: "operation".into(),
             operation: Arc::new(
                 service
-                    .acquire_process_release_lock("ready-test")
+                    .acquire_process_release_lock("readytest")
                     .await
                     .expect("lease"),
             ),

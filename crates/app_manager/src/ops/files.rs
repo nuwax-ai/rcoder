@@ -341,6 +341,6 @@ mod tests {
     #[test]
     fn urlencode_encodes_reserved_chars() {
         assert_eq!(urlencode("a b&c=d"), "a%20b%26c%3Dd");
-        assert_eq!(urlencode("app-1.2_x"), "app-1.2_x");
+        assert_eq!(urlencode("app1.2_x"), "app1.2_x");
     }
 }

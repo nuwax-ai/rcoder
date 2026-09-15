@@ -209,6 +209,9 @@ impl AgentContainerRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<shared_types::BuilderDeletionSnapshot> {
         self.capture_builder(app_id).await
     }
+    async fn find_builder_instances(&self, app_id: &str) -> ContainerRuntimeResult<Vec<String>> {
+        self.find_builder_instances(app_id).await
+    }
     async fn delete_builder_snapshot(
         &self,
         snapshot: &shared_types::BuilderDeletionSnapshot,

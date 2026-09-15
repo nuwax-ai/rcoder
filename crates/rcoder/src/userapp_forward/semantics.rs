@@ -472,7 +472,7 @@ mod tests {
             // 模式串占位符替换为样例值后分类
             let sample = pattern
                 .replace("{task_id}", "t-1")
-                .replace("{app_id}", "app-1");
+                .replace("{app_id}", "app1");
             let kind = classify_kind(&sample);
             let expected = match *pattern {
                 "/api/v1/userapp/tasks/{task_id}" => "unavailable",
@@ -503,7 +503,7 @@ mod authoritative_lookup_tests {
             created_at: chrono::Utc::now(),
             env_vars: None,
             service_type: Some(shared_types::ServiceType::UserappBuilder),
-            app_id: Some("app-a".into()),
+            app_id: Some("appa".into()),
             project_id: None,
             user_id: None,
             pod_id: None,
@@ -514,7 +514,7 @@ mod authoritative_lookup_tests {
     async fn replica_without_registry_resolves_runtime_and_preserves_query_failure() {
         let resolved = resolve_existing_dev(
             async { Ok(Some(builder())) },
-            "app-a",
+            "appa",
             "test",
             "cluster.local",
         )
@@ -529,7 +529,7 @@ mod authoritative_lookup_tests {
         };
         assert_eq!(resolved.as_deref(), Some(expected));
         assert!(
-            resolve_existing_dev(async { Ok(None) }, "app-a", "test", "cluster.local")
+            resolve_existing_dev(async { Ok(None) }, "appa", "test", "cluster.local")
                 .await
                 .expect("authoritative absence")
                 .is_none()
@@ -541,7 +541,7 @@ mod authoritative_lookup_tests {
                         "API unavailable".into(),
                     ))
                 },
-                "app-a",
+                "appa",
                 "test",
                 "cluster.local"
             )
@@ -557,7 +557,7 @@ mod authoritative_lookup_tests {
         assert!(
             resolve_existing_dev(
                 async { Ok(Some(wrong_family)) },
-                "app-a",
+                "appa",
                 "test",
                 "cluster.local"
             )
@@ -569,7 +569,7 @@ mod authoritative_lookup_tests {
         assert!(
             resolve_existing_dev(
                 async { Ok(Some(wrong_key)) },
-                "app-a",
+                "appa",
                 "test",
                 "cluster.local"
             )

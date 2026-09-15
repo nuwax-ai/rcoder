@@ -67,9 +67,10 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
 /// 显式清理 build 触发的 builder 容器（rcoder-app-builder-<app_id>；
 /// TestUserGuard 只清 agent-runner 前缀，builder 需场景自理）。
 fn cleanup_builder(app_id: &str) {
-    if let Err(error) =
-        rcoder_e2e::common::resources::cleanup_container(&format!("rcoder-app-builder-{app_id}"))
-    {
+    // 复合键后容器名含实例 user 段（本文件场景 owner 恒为 e2e-user）
+    if let Err(error) = rcoder_e2e::common::resources::cleanup_container(&format!(
+        "rcoder-app-builder-e2e-user-{app_id}"
+    )) {
         eprintln!("owned builder cleanup failed: {error}");
     }
 }

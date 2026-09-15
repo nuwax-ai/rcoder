@@ -244,28 +244,29 @@ async fn clean_cache_dir(cache_dir: &Path) -> std::io::Result<u64> {
 /// userApp dev 分派：清 app 开发工作区的 `.cache`（app 项目自身的构建缓存，
 /// 如 vite/webpack 输出）。
 ///
-/// 目标路径 = `{USERAPP_WORKSPACE_ROOT}/dev/{owner}/{app_id}/.cache`（dev 四
-/// 目录中工作区段的隐藏缓存目录）。owner 三档解析与 ensure_userapp_builder
-/// 同源（显式 user_id > app 元数据 > fail-fast，绝不兜底 app_id——防宿主树
-/// 挂错位置不可回收）；owner 过 identifier 白名单（防路径穿越）。
+/// 目标路径 = `{USERAPP_WORKSPACE_ROOT}/dev/{user_id}/{app_id}/.cache`（dev 四
+/// 目录中工作区段的隐藏缓存目录）。实例定位解析与 ensure_userapp_builder 同源
+/// （显式 user_id = 实例定位者，缺失回落 metadata owner，绝不兜底 app_id——
+/// 防宿主树挂错位置不可回收）；user 过 identifier 白名单（防路径穿越）。
 async fn cache_clean_userapp_dev(
     state: &AppState,
     app_id: &str,
     request: &CacheCleanRequest,
 ) -> Result<HttpResult<CacheCleanResponse>, AppError> {
-    // owner 解析：显式 user_id > metadata（get_app_owner）> fail-fast
+    // 实例归属解析：显式 user_id > metadata（get_app_owner）> fail-fast
     let metadata_owner = state.app_service.get_app_owner(app_id).await?;
-    let owner = crate::userapp_builder::resolve_owner(
+    let owner = crate::userapp_builder::resolve_dev_target(
         request.user_id.as_deref(),
         metadata_owner.as_deref(),
     )
     .map_err(|e| {
-        warn!("[CACHE_CLEAN][USERAPP] cannot resolve owner: app_id={app_id}: {e}");
+        warn!("[CACHE_CLEAN][USERAPP] cannot resolve instance user: app_id={app_id}: {e}");
         AppError::with_message(
             ERR_VALIDATION,
             "cannot resolve owner user_id for app; pass user_id explicitly",
         )
-    })?;
+    })?
+    .instance_user;
     shared_types::validate_identifier(&owner, "user_id").map_err(|e| {
         warn!("[CACHE_CLEAN][USERAPP] rejected: invalid owner={owner}: {e}");
         AppError::with_message(ERR_VALIDATION, e.to_string())
@@ -380,11 +381,11 @@ mod tests {
     /// 从 app 元数据解析）；既有 computer 形态（user_id 必传）不受影响。
     #[test]
     fn cache_clean_request_deserializes_userapp_wire_form() {
-        let raw = r#"{"service_type":"userapp","app_id":"app-1"}"#;
+        let raw = r#"{"service_type":"userapp","app_id":"app1"}"#;
         let req: CacheCleanRequest = serde_json::from_str(raw)
             .unwrap_or_else(|e| panic!("userApp 形态 {raw} 应可反序列化: {e}"));
         assert_eq!(req.service_type.as_deref(), Some("userapp"));
-        assert_eq!(req.app_id.as_deref(), Some("app-1"));
+        assert_eq!(req.app_id.as_deref(), Some("app1"));
         assert!(req.app_stage.is_none());
         assert!(req.user_id.is_none());
 

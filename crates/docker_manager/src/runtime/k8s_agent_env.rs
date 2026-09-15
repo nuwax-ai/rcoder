@@ -20,10 +20,23 @@ pub(crate) fn build_agent_env_vars(
     k8s_service: Option<&K8sServiceConfig>,
     params: &ContainerCreateParams,
 ) -> Vec<EnvVar> {
+    // 容器内契约（agent_runner profiler 标签、PROJECT_ID env）要纯 app_id：
+    // 优先取显式 builder_app_id（创建路径直传，语义不重载）；存量/迁移路径
+    // 缺失时回落 project_id 右切还原（project_id 槽位在 builder 场景装复合
+    // identifier；非 builder 或存量裸 app_id 原样透传）。
+    let project_id_for_env = match params.builder_app_id.as_deref() {
+        Some(app_id) => app_id.to_string(),
+        None if matches!(service_type, ServiceType::UserappBuilder) => {
+            shared_types::parse_builder_instance_id(project_id_val)
+                .map(|(_, app_id)| app_id.to_string())
+                .unwrap_or_else(|| project_id_val.to_string())
+        }
+        None => project_id_val.to_string(),
+    };
     let mut env_vars = vec![
         EnvVar {
             name: "PROJECT_ID".to_string(),
-            value: Some(project_id_val.to_string()),
+            value: Some(project_id_for_env),
             ..Default::default()
         },
         EnvVar {

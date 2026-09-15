@@ -201,6 +201,16 @@ impl K8sPvcOps for KubernetesRuntime {
                 DEFAULT_PVC_STORAGE_SIZE,
             ),
         };
+        let mut extra_labels: Vec<(String, String)> = Vec::new();
+        // builder 复合键时代的聚合标签：identifier=`{user_id}-{app_id}`，
+        // 按 app 聚合清理（destroy dev storage 遍历协作者实例/孤儿 PVC）不能
+        // 从 PVC 名前缀推断（user_id 段可含 '-'），依赖显式 label。
+        if matches!(service_type, ServiceType::UserappBuilder) {
+            extra_labels.push(("rcoder.io/identifier".to_string(), identifier.to_string()));
+            if let Some((_, app_id)) = shared_types::parse_builder_instance_id(identifier) {
+                extra_labels.push(("rcoder.io/app-id".to_string(), app_id.to_string()));
+            }
+        }
         self.ensure_pvc_core(
             &pvc_name,
             &service_type.to_string(),
@@ -208,6 +218,7 @@ impl K8sPvcOps for KubernetesRuntime {
             storage_class_name,
             storage_size.unwrap_or(default_size),
             None,
+            &extra_labels,
         )
         .await
     }
@@ -393,6 +404,7 @@ impl KubernetesRuntime {
             userapp_storage_class(),
             storage_size.unwrap_or(DEFAULT_USERAPP_PVC_STORAGE_SIZE),
             Some(context),
+            &[],
         )
         .await
     }

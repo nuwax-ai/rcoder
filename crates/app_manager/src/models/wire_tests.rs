@@ -47,7 +47,7 @@ mod tests {
     #[test]
     fn create_app_request_accepts_snake_wire() {
         let req: CreateAppRequest = serde_json::from_value(serde_json::json!({
-            "app_id": "app-order-svc",
+            "app_id": "apporder-svc",
             "name": "订单服务",
             "user_id": "u6",
             "image": "registry.example/app-runtime:1",
@@ -63,7 +63,7 @@ mod tests {
             "idle_timeout_seconds": 600
         }))
         .expect("snake request wire must deserialize");
-        assert_eq!(req.app_id.as_deref(), Some("app-order-svc"));
+        assert_eq!(req.app_id.as_deref(), Some("apporder-svc"));
         assert_eq!(req.user_id, "u6");
         let ports = req.ports.as_ref().expect("ports");
         assert_eq!(ports.len(), 2);
@@ -164,7 +164,7 @@ mod tests {
             "page_size": 20,
             "filters": {
                 "status": ["running", "error"],
-                "app_ids": ["app-1"],
+                "app_ids": ["app1"],
                 "name": "订单"
             },
             "sort_by": "created_at",
@@ -174,7 +174,7 @@ mod tests {
         assert!(matches!(req.sort_order, Some(SortOrder::Desc)));
         let filters = req.filters.expect("filters");
         assert!(
-            matches!(filters, AppFilters { ref app_ids, .. } if app_ids.as_deref() == Some(&["app-1".to_string()][..]))
+            matches!(filters, AppFilters { ref app_ids, .. } if app_ids.as_deref() == Some(&["app1".to_string()][..]))
         );
     }
 
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn app_runtime_info_round_trips_snake_wire() {
         let info: AppRuntimeInfo = serde_json::from_value(serde_json::json!({
-            "app_id": "app-x",
+            "app_id": "appx",
             "status": "running",
             "phase": "Running",
             "message": null,
@@ -252,7 +252,7 @@ mod tests {
             "user_id": "u6",
             "page": 1,
             "page_size": 20,
-            "filters": {"orphan_only": true, "app_ids": ["app-1"]}
+            "filters": {"orphan_only": true, "app_ids": ["app1"]}
         }))
         .expect("storage query snake wire");
         assert!(matches!(
@@ -264,7 +264,7 @@ mod tests {
         ));
 
         let info = StorageInfo {
-            app_id: "app-1".into(),
+            app_id: "app1".into(),
             exists: true,
             path: "/data/app-1".into(),
             modified_at: Some("2026-08-20T00:00:00Z".into()),

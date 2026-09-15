@@ -408,7 +408,7 @@ mod tests {
     async fn update_missing_fields_fall_back_to_live_spec() {
         let root = tempfile::tempdir().expect("tempdir");
         let runtime = Arc::new(MockRuntime::default());
-        let app_dir = root.path().join("app-fb");
+        let app_dir = root.path().join("appfb");
         tokio::fs::create_dir_all(app_dir.join("code"))
             .await
             .expect("create code dir");
@@ -419,7 +419,7 @@ mod tests {
         .await
         .expect("write release lock");
         runtime.specs.insert(
-            "app-fb".into(),
+            "appfb".into(),
             ContainerSpecSnapshot {
                 command: Some(vec![
                     "java".into(),
@@ -473,7 +473,7 @@ mod tests {
 
         let params = service
             .build_container_params_from_update(
-                "app-fb",
+                "appfb",
                 &empty_update_request("img:v2"),
                 &DeploymentStatus::default(),
             )
@@ -537,7 +537,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let runtime = Arc::new(MockRuntime::default());
         runtime.specs.insert(
-            "app-fm".into(),
+            "appfm".into(),
             ContainerSpecSnapshot {
                 resources: Some(AppResourceRequirements {
                     cpu: Some("1".into()),
@@ -559,7 +559,7 @@ mod tests {
         });
 
         let params = service
-            .build_container_params_from_update("app-fm", &request, &DeploymentStatus::default())
+            .build_container_params_from_update("appfm", &request, &DeploymentStatus::default())
             .await
             .expect("params");
 
@@ -587,7 +587,7 @@ mod tests {
     async fn update_explicit_fields_override_live_spec() {
         let root = tempfile::tempdir().expect("tempdir");
         let runtime = Arc::new(MockRuntime::default());
-        let app_dir = root.path().join("app-ov");
+        let app_dir = root.path().join("appov");
         tokio::fs::create_dir_all(app_dir.join("code"))
             .await
             .expect("create code dir");
@@ -598,7 +598,7 @@ mod tests {
         .await
         .expect("write release lock");
         runtime.specs.insert(
-            "app-ov".into(),
+            "appov".into(),
             ContainerSpecSnapshot {
                 command: None,
                 env: None,
@@ -618,7 +618,7 @@ mod tests {
         request.secrets = Some(HashMap::from([("NEW".into(), "new".into())]));
 
         let params = service
-            .build_container_params_from_update("app-ov", &request, &DeploymentStatus::default())
+            .build_container_params_from_update("appov", &request, &DeploymentStatus::default())
             .await
             .expect("params");
 
@@ -634,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn update_explicit_reserved_env_still_rejected() {
         let root = tempfile::tempdir().expect("tempdir");
-        let service = service_with_release_lock(root.path(), "app-reserved").await;
+        let service = service_with_release_lock(root.path(), "appreserved").await;
         let mut request = empty_update_request("img:v2");
         request.env = Some(HashMap::from([(
             "RCODER_PINGAP_VERSION".to_owned(),
@@ -643,7 +643,7 @@ mod tests {
 
         let error = service
             .build_container_params_from_update(
-                "app-reserved",
+                "appreserved",
                 &request,
                 &DeploymentStatus::default(),
             )
@@ -656,11 +656,11 @@ mod tests {
     #[tokio::test]
     async fn update_fallback_absent_snapshot_field_stays_empty() {
         let root = tempfile::tempdir().expect("tempdir");
-        let service = service_with_release_lock(root.path(), "app-empty").await;
+        let service = service_with_release_lock(root.path(), "appempty").await;
 
         let params = service
             .build_container_params_from_update(
-                "app-empty",
+                "appempty",
                 &empty_update_request("img:v2"),
                 &DeploymentStatus::default(),
             )

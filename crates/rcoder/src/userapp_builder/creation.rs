@@ -22,12 +22,13 @@ static SIGNALS: LazyLock<Mutex<HashMap<String, watch::Sender<u64>>>> =
 pub(super) async fn ensure(
     state: &AppState,
     app_id: &str,
+    instance: &str,
     owner: &str,
     lease: OwnedMutexGuard<()>,
     deadline: Instant,
 ) -> Result<ContainerBasicInfo> {
     let app = state.userapp_store.ensure_identity(app_id, owner).await?;
-    let fingerprint = creation_fingerprint(state, app_id, owner)?;
+    let fingerprint = instance_fingerprint(state, app_id, instance, owner)?;
     let admission = state
         .userapp_store
         .admit(&UserAppAdmission {
@@ -47,7 +48,7 @@ pub(super) async fn ensure(
         UserAppAdmissionOutcome::Accepted(record) => {
             // Detach only the HTTP waiter. The worker retains its lease and
             // commits its outcome even when this request is cancelled.
-            drop(spawn_operation(state, &record, owner, lease)?);
+            drop(spawn_operation(state, &record, instance, owner, lease)?);
             record
         }
         UserAppAdmissionOutcome::Existing(record) => {
@@ -55,12 +56,22 @@ pub(super) async fn ensure(
             record
         }
     };
-    wait(state, &operation, deadline).await
+    wait(state, &operation, instance, deadline).await
 }
 
-fn creation_fingerprint(state: &AppState, app_id: &str, owner: &str) -> Result<String> {
+/// builder 实例创建指纹（owner 受理路径与协作者轻量路径同源）：键含复合
+/// identifier 与实例 user——同实例重创建指纹稳定，换实例/换 user 即变。
+/// 注意：与复合键化之前的指纹（纯 app_id 键）不兼容，升级后存量 pending
+/// 恢复会判 configuration_changed 转 RecoveryRequired（存量重建语义，已拍板）。
+pub(super) fn instance_fingerprint(
+    state: &AppState,
+    app_id: &str,
+    instance: &str,
+    instance_user: &str,
+) -> Result<String> {
     use sha2::{Digest, Sha256};
-    let config = serde_json::json!({"schema":1,"app_id":app_id,"user_id":owner,
+    let config = serde_json::json!({"schema":2,"app_id":app_id,"instance":instance,
+        "user_id":instance_user,
         "storage":super::DEFAULT_BUILDER_STORAGE_SIZE,
         "docker":state.config.docker_config,"kubernetes":state.config.kubernetes_config});
     Ok(
@@ -74,6 +85,7 @@ fn creation_fingerprint(state: &AppState, app_id: &str, owner: &str) -> Result<S
 fn spawn_operation(
     state: &AppState,
     record: &UserAppOperationRecord,
+    instance: &str,
     owner: &str,
     lease: OwnedMutexGuard<()>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
@@ -85,6 +97,7 @@ fn spawn_operation(
     let worker_state = state.clone();
     let worker_record = record.clone();
     let owner = owner.to_owned();
+    let instance = instance.to_string();
     let worker = tokio::spawn(async move {
         let executor = uuid::Uuid::new_v4().to_string();
         let owned = worker_state.clone();
@@ -108,9 +121,10 @@ fn spawn_operation(
             let creation = super::create_builder_inner(
                 &owned,
                 &claimed.app_id,
-                Some(&owner),
+                &instance,
+                &owner,
                 shared_types::UserAppExecutionContext {
-                    app_id: claimed.app_id.clone(),
+                    app_id: instance.clone(),
                     user_id: owner.clone(),
                     lifecycle_id: claimed.lifecycle_id.clone(),
                     operation_id: claimed.operation_id.clone(),
@@ -140,8 +154,14 @@ fn spawn_operation(
             };
             let result = match created {
                 Ok(info) => {
-                    super::confirm_builder_ready(&owned, &claimed.app_id, info, ready_deadline)
-                        .await
+                    super::confirm_builder_ready(
+                        &owned,
+                        &claimed.app_id,
+                        &instance,
+                        info,
+                        ready_deadline,
+                    )
+                    .await
                 }
                 Err(error) => Err(error),
             };
@@ -149,7 +169,10 @@ fn spawn_operation(
             let (status, value, error) = match result {
                 Ok(info) => {
                     let context = shared_types::UserAppExecutionContext {
-                        app_id: claimed.app_id.clone(), user_id: owner.clone(),
+                        // capture 侧按复合 identifier 定位容器（与上方 create_builder_inner
+                        // 同源）；claimed.app_id 是 lifecycle 纯 app_id，用它会 inspect
+                        // 少 user 段的旧名单 → 404 → workload 缺失（实测踩坑）
+                        app_id: instance.clone(), user_id: owner.clone(),
                         lifecycle_id: claimed.lifecycle_id.clone(), operation_id: claimed.operation_id.clone(),
                         executor_id: claimed_id.clone(), request_fingerprint: claimed.request_fingerprint.clone(),
                     };
@@ -162,7 +185,7 @@ fn spawn_operation(
                     completion = progress(&owned.userapp_store, &claimed, &claimed_id,
                         UserAppOperationState::Running, "builder_ready_confirmed",
                         serde_json::to_value(&evidence)?, None).await?;
-                    super::register_builder(&owned, &claimed.app_id, &owner, &info)?;
+                    super::register_builder(&owned, &instance, &info)?;
                     (
                         UserAppOperationState::Succeeded,
                         serde_json::to_value(info)?,
@@ -306,7 +329,11 @@ pub(super) async fn resume_pending(
             "Pending builder lifecycle does not match recovery target"
         ));
     }
-    if creation_fingerprint(state, &current.app_id, &identity.user_id)?
+    // 恢复指纹按 owner 实例复合键重算（record/identity 不含实例段——owner
+    // 受理操作的实例恒为 {identity.user_id}-{app_id}）
+    let instance = shared_types::builder_instance_id(&identity.user_id, &current.app_id)
+        .map_err(anyhow::Error::msg)?;
+    if instance_fingerprint(state, &current.app_id, &instance, &identity.user_id)?
         != current.request_fingerprint
     {
         let executor = uuid::Uuid::new_v4().to_string();
@@ -340,7 +367,7 @@ pub(super) async fn resume_pending(
     // Occupy the recovery scheduler slot until the actual worker finishes,
     // including its final checkpoint and notification cleanup. Dropping this
     // observer still detaches rather than aborting the admitted operation.
-    spawn_operation(state, &current, &identity.user_id, lease)?
+    spawn_operation(state, &current, &instance, &identity.user_id, lease)?
         .await
         .context("Observe recovered builder worker")??;
     Ok(true)
@@ -374,6 +401,7 @@ async fn progress(
 async fn wait(
     state: &AppState,
     accepted: &UserAppOperationRecord,
+    instance: &str,
     deadline: Instant,
 ) -> Result<ContainerBasicInfo> {
     let operation = wait_record(&state.userapp_store, accepted, deadline).await?;
@@ -391,7 +419,7 @@ async fn wait(
     }
     let info: ContainerBasicInfo = serde_json::from_value(operation.checkpoint)
         .context("decode completed builder resource identity")?;
-    let verified = super::cross_verify_registration(state, &accepted.app_id, &info)
+    let verified = super::cross_verify_registration(state, &accepted.app_id, instance, &info)
         .await?
         .ok_or_else(|| anyhow!("Completed builder is no longer running"))?;
     if verified.container_id != info.container_id {
@@ -477,17 +505,20 @@ pub(super) async fn reconcile_completed(
         .reserve_completed_operation(snapshot)
         .await?;
     let result = async {
+        let context = &evidence.target.context;
+        // evidence 持有的是创建时实例上下文（app_id 槽=复合 identifier）——
+        // 按其恢复定位/注册，不从纯 app_id 重派生。
         let current =
             super::adoption::capture_bound_target(state, &evidence.target.context).await?;
-        let info =
-            super::cross_verify_registration(state, &snapshot.app_id, &evidence.container).await?;
-        let info = validate_completed_resource(&evidence, &current, info)?;
-        super::register_builder(
+        let info = super::cross_verify_registration(
             state,
             &snapshot.app_id,
-            &evidence.target.context.user_id,
-            &info,
-        )?;
+            &context.app_id,
+            &evidence.container,
+        )
+        .await?;
+        let info = validate_completed_resource(&evidence, &current, info)?;
+        super::register_builder(state, &context.app_id, &info)?;
         Ok::<_, anyhow::Error>(info)
     }
     .await;

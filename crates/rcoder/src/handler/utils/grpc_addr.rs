@@ -251,7 +251,7 @@ mod tests {
 
     /// legacy "rcoder" 前缀配置下，builder/生产名不被 web 前缀吞掉
     /// （"rcoder-app-builder-23" 若被 "rcoder-" 剥走会误判 WebAgentRunner，
-    /// identifier 残留 "app-builder-23"）。
+    /// identifier 残留 "appbuilder-23"）。
     #[test]
     fn test_container_identity_legacy_prefix_does_not_swallow_userapp() {
         let (id, st) = container_identity_from_name(

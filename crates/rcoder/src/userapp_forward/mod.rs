@@ -256,12 +256,12 @@ mod tests {
 
     #[test]
     fn create_workspace_body_is_snake_case() {
-        let raw = serde_json::json!({"app_id": "app-1", "user_id": "u1"});
+        let raw = serde_json::json!({"app_id": "app1", "user_id": "u1"});
         let body: CreateWorkspaceBody = serde_json::from_value(raw).expect("deserialize");
-        assert_eq!(body.app_id, "app-1");
+        assert_eq!(body.app_id, "app1");
         assert_eq!(body.user_id, "u1");
         // 旧 camel wire 已废弃：未知键被忽略后必填字段缺失即拒
-        let legacy = serde_json::json!({"appId": "app-1", "userId": "u1"});
+        let legacy = serde_json::json!({"appId": "app1", "userId": "u1"});
         assert!(serde_json::from_value::<CreateWorkspaceBody>(legacy).is_err());
     }
 

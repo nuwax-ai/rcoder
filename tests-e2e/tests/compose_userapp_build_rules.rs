@@ -45,28 +45,27 @@ fn trunc(v: &Value, n: usize) -> String {
     }
 }
 
-/// 场景内唯一 app_id（run_tag+pid 防跨进程撞名；与 compose_userapp_dev 同款，
-/// 前缀 app- 对齐 logs 族命名约束）。
+/// 场景内唯一 app_id（与 compose_userapp_dev 同款；复合键改造后 [a-z0-9]
+/// 禁 `-`、上限 22——前缀字母段对齐 logs 族命名约束）。
 fn scoped_app(env: &Env, tag: &str) -> String {
     let short_tag: String = tag
         .split('-')
         .filter_map(|part| part.chars().next())
         .collect();
-    format!(
-        "app-e2e-br-{}-p{}-{}",
-        &env.run_tag.replace('_', "")[..10],
+    let raw = format!(
+        "appe2ebr{}p{}{}",
+        &env.run_tag.replace('_', "").to_lowercase()[..10],
         std::process::id() % 1000,
-        short_tag
-    )
-    .chars()
-    .take(37)
-    .collect()
+        short_tag.to_lowercase()
+    );
+    raw.chars().take(22).collect()
 }
 
 fn cleanup_builder(app_id: &str) {
-    if let Err(error) =
-        rcoder_e2e::common::resources::cleanup_container(&format!("rcoder-app-builder-{app_id}"))
-    {
+    // 复合键后容器名含实例 user 段（本文件场景 owner 恒为 e2e-br-user）
+    if let Err(error) = rcoder_e2e::common::resources::cleanup_container(&format!(
+        "rcoder-app-builder-e2e-br-user-{app_id}"
+    )) {
         eprintln!("owned builder cleanup failed: {error}");
     }
 }

@@ -347,15 +347,15 @@ mod deletion_ownership_tests {
         let runtime = Arc::new(MockRuntime::default());
         let service = Arc::new(test_service(directory.path(), runtime.clone()).await);
         service
-            .record_dev_registration("purge-failure", "owner")
+            .record_dev_registration("purgefailure", "owner")
             .await
             .expect("identity");
         let dev = Arc::new(crate::test_support::StubDevCleanup::default());
         service.set_dev_cleanup(dev.clone()).expect("dev cleanup");
         runtime.deployments.insert(
-            "purge-failure".into(),
+            "purgefailure".into(),
             container_runtime_api::DeploymentStatus {
-                app_id: "purge-failure".into(),
+                app_id: "purgefailure".into(),
                 replicas: 1,
                 ready_replicas: 1,
                 phase: "Running".into(),
@@ -373,11 +373,7 @@ mod deletion_ownership_tests {
         .expect("purge body");
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            purge_app(
-                State(state),
-                Path("purge-failure".into()),
-                Ok(Json(request)),
-            ),
+            purge_app(State(state), Path("purgefailure".into()), Ok(Json(request))),
         )
         .await
         .expect("bounded purge")
@@ -385,7 +381,7 @@ mod deletion_ownership_tests {
         let record = service
             .metadata
             .store
-            .get_operation_by_request("purge-failure", "purge-failure-request")
+            .get_operation_by_request("purgefailure", "purge-failure-request")
             .await
             .expect("operation query")
             .expect("admitted operation");
@@ -401,7 +397,7 @@ mod deletion_ownership_tests {
         );
         assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
         assert_eq!(dev.calls.load(Ordering::SeqCst), 0);
-        assert!(runtime.deployments.contains_key("purge-failure"));
+        assert!(runtime.deployments.contains_key("purgefailure"));
     }
 
     #[tokio::test]
@@ -410,13 +406,13 @@ mod deletion_ownership_tests {
         let runtime = Arc::new(MockRuntime::default());
         let service = Arc::new(test_service(directory.path(), runtime.clone()).await);
         service
-            .record_dev_registration("query-owner", "original-owner")
+            .record_dev_registration("queryowner", "original-owner")
             .await
             .expect("owner");
         runtime.deployments.insert(
-            "query-owner".into(),
+            "queryowner".into(),
             container_runtime_api::DeploymentStatus {
-                app_id: "query-owner".into(),
+                app_id: "queryowner".into(),
                 phase: "Running".into(),
                 ..Default::default()
             },
@@ -434,7 +430,7 @@ mod deletion_ownership_tests {
         assert!(
             get_app(
                 State(state.clone()),
-                Path("query-owner".into()),
+                Path("queryowner".into()),
                 Ok(Query(request))
             )
             .await
@@ -446,7 +442,7 @@ mod deletion_ownership_tests {
             serde_json::from_value(serde_json::json!({"user_id":"original-owner"}))
                 .expect("owner query");
         assert!(
-            get_app(State(state), Path("query-owner".into()), Ok(Query(request)))
+            get_app(State(state), Path("queryowner".into()), Ok(Query(request)))
                 .await
                 .is_ok()
         );
@@ -474,13 +470,13 @@ mod deletion_ownership_tests {
             let before = service
                 .metadata
                 .store
-                .ensure_identity("query-race", "owner")
+                .ensure_identity("queryrace", "owner")
                 .await
                 .expect("identity");
             runtime.deployments.insert(
-                "query-race".into(),
+                "queryrace".into(),
                 container_runtime_api::DeploymentStatus {
-                    app_id: "query-race".into(),
+                    app_id: "queryrace".into(),
                     phase: "Running".into(),
                     ..Default::default()
                 },
@@ -488,7 +484,7 @@ mod deletion_ownership_tests {
             let barrier = Arc::new(tokio::sync::Barrier::new(2));
             *runtime.status_barrier.lock().expect("barrier") = Some(barrier.clone());
             // join! keeps cancellation scoped to this test, without a detached task.
-            let read = service.get_app_for_owner("query-race", "owner");
+            let read = service.get_app_for_owner("queryrace", "owner");
             let replace = async {
                 barrier.wait().await;
                 let deletion = crate::service::OwnedOperation::admit(
@@ -496,7 +492,7 @@ mod deletion_ownership_tests {
                     shared_types::UserAppAdmission {
                         runtime_policy_on_success: None,
                         command: None,
-                        app_id: "query-race".into(),
+                        app_id: "queryrace".into(),
                         user_id: "owner".into(),
                         lifecycle_id: Some(before.lifecycle_id.clone()),
                         operation_id: "query-race-delete".into(),
@@ -513,7 +509,7 @@ mod deletion_ownership_tests {
                     .metadata
                     .store
                     .recreate(
-                        "query-race",
+                        "queryrace",
                         "owner",
                         &before.lifecycle_id,
                         "query-race-recreate",

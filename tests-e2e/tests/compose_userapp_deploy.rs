@@ -157,9 +157,10 @@ fn trunc(v: &Value, n: usize) -> String {
 
 /// 显式清理 builder 容器（docker rm；compose 冒烟防残留）。
 fn cleanup_builder(app_id: &str) {
-    if let Err(error) =
-        rcoder_e2e::common::resources::cleanup_container(&format!("rcoder-app-builder-{app_id}"))
-    {
+    // 复合键后容器名含实例 user 段（本文件场景 owner 恒为 e2e-dep-user）
+    if let Err(error) = rcoder_e2e::common::resources::cleanup_container(&format!(
+        "rcoder-app-builder-e2e-dep-user-{app_id}"
+    )) {
         eprintln!("owned builder cleanup failed: {error}");
     }
 }

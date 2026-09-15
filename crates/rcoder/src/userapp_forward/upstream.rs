@@ -157,11 +157,13 @@ async fn resolve_dev_addr_inner(
     // 探活正缓存(30s): 每次转发都探活会给高频文件操作(批量列表/读写)平添一个
     // RTT; 成功后窗口内免探。失败路径(自愈重建)不受缓存影响; 窗口内死容器漏检
     // 可接受——send 失败仍会 502, 下一请求自愈。
+    // 键 = 注册信息携带的复合 identifier（`{user_id}-{app_id}`，实例粒度）。
     let cache = PROBE_OK.get_or_init(dashmap::DashMap::new);
+    let probe_key = probe_cache_key(app_id, &info);
     // view 回调式读取：不产生 Ref guard（锁仅在闭包内持有），结构性杜绝
     // guard 跨 await 的自死锁可能——不依赖"临时值即时 drop"的写法纪律
     let probe_fresh = cache
-        .view(app_id, |_, t| t.elapsed() < PROBE_TTL)
+        .view(&probe_key, |_, t| t.elapsed() < PROBE_TTL)
         .unwrap_or(false);
     if !probe_fresh && !probe_dev_container(&addr).await {
         warn!(
@@ -170,7 +172,7 @@ async fn resolve_dev_addr_inner(
         // 先验容器真实状态再决定处置：Running 则保容器（探活失败是超时/未就绪
         // 抖动，编译高负载/新容器启动窗口常见），只有真死才清注册重建——
         // 防误杀正在跑任务的容器
-        match crate::userapp_builder::remediate_stale_registry(state, app_id)
+        match crate::userapp_builder::remediate_stale_registry(state, app_id, &probe_key)
             .await
             .map_err(|error| {
                 HttpResultError::bad_gateway(format!("verify builder state: {error:#}"))
@@ -184,7 +186,7 @@ async fn resolve_dev_addr_inner(
                 // 窗口内不再重复付 3s 探活超时——否则编译高峰期每个请求都要
                 // probe 超时+inspect 一次。窗口内容器真死漏检与既有语义一致
                 // （send 失败 502，下一请求自愈）。
-                cache.insert(app_id.to_string(), std::time::Instant::now());
+                cache.insert(probe_key, std::time::Instant::now());
                 return Ok(dev_file_server_addr(state, &info));
             }
             crate::userapp_builder::RegistryRemediation::Gone => {
@@ -209,14 +211,14 @@ async fn resolve_dev_addr_inner(
         // file-server 同样在 60000 应答——借 30s 探活缓存 miss 窗口做归属交叉
         // 校验（成本：每 app 每 30s 一次 K8s get），污染即自愈刷回 builder 值
         if let Some(updated) =
-            crate::userapp_builder::cross_verify_registration(state, app_id, &info)
+            crate::userapp_builder::cross_verify_registration(state, app_id, &probe_key, &info)
                 .await
                 .map_err(|error| {
                     HttpResultError::bad_gateway(format!("verify builder identity: {error:#}"))
                         .into_boxed_response()
                 })?
         {
-            cache.insert(app_id.to_string(), std::time::Instant::now());
+            cache.insert(probe_key, std::time::Instant::now());
             return Ok(dev_file_server_addr(state, &updated));
         }
         return Err(
@@ -234,15 +236,28 @@ fn builder_control_response(error: &anyhow::Error) -> Box<Response> {
     Box::new(response)
 }
 
-/// 探活正缓存: app_id → 最近一次探活成功时刻(重建自愈后刷新)。
+/// 探活正缓存: 复合 identifier → 最近一次探活成功时刻(重建自愈后刷新)。
 static PROBE_OK: std::sync::OnceLock<dashmap::DashMap<String, std::time::Instant>> =
     std::sync::OnceLock::new();
 const PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// 摘除探活正缓存条目（app purge 后调用，防缓存内残留已删 app 的健康时刻）。
-pub(crate) fn invalidate_probe_cache(app_id: &str) {
+/// 探活缓存键：注册信息携带的复合 identifier（`{user_id}-{app_id}`）；
+/// 非复合形态（异常/存量残留注册）回落纯 app_id，保探活节流不失效。
+fn probe_cache_key(app_id: &str, info: &shared_types::ContainerBasicInfo) -> String {
+    if shared_types::parse_builder_instance_id(&info.project_id).is_some() {
+        info.project_id.clone()
+    } else {
+        app_id.to_string()
+    }
+}
+
+/// 摘除探活正缓存条目（app purge/容器重建后调用，防缓存残留已删实例的
+/// 健康时刻）。键 = 复合 identifier（invalidate 侧自行派生时用 app 级
+/// 兜底键——多数调用点只有纯 app_id 上下文，实例粒度失效由 rebuild 路径
+/// 的注册刷新间接覆盖）。
+pub(crate) fn invalidate_probe_cache(key: &str) {
     if let Some(cache) = PROBE_OK.get() {
-        cache.remove(app_id);
+        cache.remove(key);
     }
 }
 

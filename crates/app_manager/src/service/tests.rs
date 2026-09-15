@@ -10,7 +10,7 @@ pub(crate) fn create_request(app_id: &str) -> CreateAppRequest {
         app_id: Some(app_id.to_owned()),
         lifecycle_id: None,
         request_id: None,
-        name: "r2-app".into(),
+        name: "r2app".into(),
         user_id: "u-test".to_string(),
         image: Some("registry.example/app-runtime:test".into()),
         command: None,
@@ -34,23 +34,23 @@ async fn failed_update_restores_registered_ports_not_drifted_live_ports() {
     service
         .metadata
         .store
-        .ensure_identity("port-drift", "u-test")
+        .ensure_identity("portdrift", "u-test")
         .await
         .expect("owner identity");
     service.pingora = Some(Arc::new(PingoraProxyService::new(
         rcoder_proxy::ProxyConfig::default(),
     )));
     runtime.deployments.insert(
-        "port-drift".into(),
+        "portdrift".into(),
         DeploymentStatus {
-            app_id: "port-drift".into(),
+            app_id: "portdrift".into(),
             phase: "Running".into(),
             pod_ip: Some("10.0.0.1".into()),
             ..Default::default()
         },
     );
     runtime.specs.insert(
-        "port-drift".into(),
+        "portdrift".into(),
         container_runtime_api::ContainerSpecSnapshot {
             ports: Some(vec![container_runtime_api::AppPortSpec {
                 name: "http".into(),
@@ -62,7 +62,7 @@ async fn failed_update_restores_registered_ports_not_drifted_live_ports() {
         },
     );
     service
-        .register_pingora_backends("port-drift", &[9080], "10.0.0.1")
+        .register_pingora_backends("portdrift", &[9080], "10.0.0.1")
         .await;
     runtime.create_fails.store(true, Ordering::SeqCst);
     let request = UpdateAppRequest {
@@ -80,13 +80,13 @@ async fn failed_update_restores_registered_ports_not_drifted_live_ports() {
         idle_timeout_seconds: None,
         expected_resource_version: None,
     };
-    assert!(service.update_app("port-drift", request).await.is_err());
+    assert!(service.update_app("portdrift", request).await.is_err());
     assert_eq!(
         runtime.create_calls.load(Ordering::SeqCst),
         1,
         "patch was attempted"
     );
-    assert_eq!(service.registered_http_ports("port-drift"), vec![9080]);
+    assert_eq!(service.registered_http_ports("portdrift"), vec![9080]);
 }
 
 #[tokio::test]
@@ -97,28 +97,28 @@ async fn waiting_delete_rechecks_version_after_acquiring_operation_lock() {
     service
         .metadata
         .store
-        .ensure_identity("delete-race", "u-test")
+        .ensure_identity("deleterace", "u-test")
         .await
         .expect("owner identity");
     runtime.deployments.insert(
-        "delete-race".into(),
+        "deleterace".into(),
         DeploymentStatus {
-            app_id: "delete-race".into(),
+            app_id: "deleterace".into(),
             phase: "Running".into(),
             resource_version: Some("1".into()),
             ..Default::default()
         },
     );
     let writer = service
-        .acquire_process_release_lock("delete-race")
+        .acquire_process_release_lock("deleterace")
         .await
         .expect("writer lock");
-    let deletion = service.delete_app("delete-race", true, Some("1"));
+    let deletion = service.delete_app("deleterace", true, Some("1"));
     tokio::pin!(deletion);
     assert!(futures_util::poll!(deletion.as_mut()).is_pending());
     runtime
         .deployments
-        .get_mut("delete-race")
+        .get_mut("deleterace")
         .expect("deployment")
         .resource_version = Some("2".into());
     drop(writer);
@@ -136,10 +136,10 @@ async fn independent_services_share_application_file_lock() {
     let first = test_service(root.path(), Arc::new(MockRuntime::default())).await;
     let second = test_service(root.path(), Arc::new(MockRuntime::default())).await;
     let held = first
-        .acquire_process_release_lock("cross-process")
+        .acquire_process_release_lock("crossprocess")
         .await
         .expect("first lock");
-    let contender = second.acquire_process_release_lock("cross-process");
+    let contender = second.acquire_process_release_lock("crossprocess");
     tokio::pin!(contender);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(50), contender.as_mut())
@@ -162,7 +162,7 @@ pub(crate) async fn create_app_runtime_failure_does_not_delete_unowned_resources
     runtime.create_fails.store(true, Ordering::SeqCst);
     let service = test_service(root.path(), runtime.clone()).await;
     // build_container_params 需 code/release.lock.toml，预铺现场
-    let app_dir = root.path().join("app-r2");
+    let app_dir = root.path().join("appr2");
     tokio::fs::create_dir_all(app_dir.join("code"))
         .await
         .expect("create code dir");
@@ -174,7 +174,7 @@ pub(crate) async fn create_app_runtime_failure_does_not_delete_unowned_resources
     .expect("write release lock");
 
     let error = service
-        .create_app(create_request("app-r2"))
+        .create_app(create_request("appr2"))
         .await
         .expect_err("create_app must fail");
 
@@ -201,7 +201,7 @@ pub(crate) async fn creation_safe_failure_settles_failed_and_releases_fence() {
     *runtime.create_abort.lock().expect("injection") =
         Some((container_runtime_api::CreationStage::StorageClaim, true));
     let service = test_service(root.path(), runtime.clone()).await;
-    let app_dir = root.path().join("app-safe");
+    let app_dir = root.path().join("appsafe");
     tokio::fs::create_dir_all(app_dir.join("code"))
         .await
         .expect("create code dir");
@@ -211,8 +211,8 @@ pub(crate) async fn creation_safe_failure_settles_failed_and_releases_fence() {
     )
     .await
     .expect("write release lock");
-    let mut request = create_request("app-safe");
-    request.request_id = Some("safe-failure-1".into());
+    let mut request = create_request("appsafe");
+    request.request_id = Some("safefailure1".into());
 
     let error = service
         .create_app(request)
@@ -230,7 +230,7 @@ pub(crate) async fn creation_safe_failure_settles_failed_and_releases_fence() {
     let operation = service
         .metadata
         .store
-        .get_operation_by_request("app-safe", "safe-failure-1")
+        .get_operation_by_request("appsafe", "safefailure1")
         .await
         .expect("read")
         .expect("operation");
@@ -247,7 +247,7 @@ pub(crate) async fn creation_safe_failure_settles_failed_and_releases_fence() {
     // 围栏已释放：同一 app 的下一次创建可直接受理并成功
     *runtime.create_abort.lock().expect("injection") = None;
     service
-        .create_app(create_request("app-safe"))
+        .create_app(create_request("appsafe"))
         .await
         .expect("subsequent creation admits after safe failure");
 }
@@ -261,7 +261,7 @@ pub(crate) async fn creation_unknown_outcome_keeps_recovery_fence() {
     *runtime.create_abort.lock().expect("injection") =
         Some((container_runtime_api::CreationStage::StorageClaim, false));
     let service = test_service(root.path(), runtime.clone()).await;
-    let app_dir = root.path().join("app-unknown");
+    let app_dir = root.path().join("appunknown");
     tokio::fs::create_dir_all(app_dir.join("code"))
         .await
         .expect("create code dir");
@@ -271,8 +271,8 @@ pub(crate) async fn creation_unknown_outcome_keeps_recovery_fence() {
     )
     .await
     .expect("write release lock");
-    let mut request = create_request("app-unknown");
-    request.request_id = Some("unknown-outcome-1".into());
+    let mut request = create_request("appunknown");
+    request.request_id = Some("unknownoutcome1".into());
 
     let error = service
         .create_app(request)
@@ -288,7 +288,7 @@ pub(crate) async fn creation_unknown_outcome_keeps_recovery_fence() {
     let operation = service
         .metadata
         .store
-        .get_operation_by_request("app-unknown", "unknown-outcome-1")
+        .get_operation_by_request("appunknown", "unknownoutcome1")
         .await
         .expect("read")
         .expect("operation");
@@ -299,7 +299,7 @@ pub(crate) async fn creation_unknown_outcome_keeps_recovery_fence() {
 
     // 围栏仍在：新创建被未完成变更围栏挡回
     let fenced = service
-        .create_app(create_request("app-unknown"))
+        .create_app(create_request("appunknown"))
         .await
         .expect_err("fence must block new operations");
     assert!(
@@ -319,7 +319,7 @@ pub(crate) async fn uncertain_retry_refusal_carries_readonly_observation() {
         *runtime.create_abort.lock().expect("injection") =
             Some((container_runtime_api::CreationStage::StorageClaim, false));
         let service = test_service(root.path(), runtime.clone()).await;
-        let app_dir = root.path().join("app-diag");
+        let app_dir = root.path().join("appdiag");
         tokio::fs::create_dir_all(app_dir.join("code"))
             .await
             .expect("create code dir");
@@ -329,7 +329,7 @@ pub(crate) async fn uncertain_retry_refusal_carries_readonly_observation() {
         )
         .await
         .expect("write release lock");
-        let mut request = create_request("app-diag");
+        let mut request = create_request("appdiag");
         request.request_id = Some("diag-1".into());
         service
             .create_app(request)
@@ -338,7 +338,7 @@ pub(crate) async fn uncertain_retry_refusal_carries_readonly_observation() {
         let operation = service
             .metadata
             .store
-            .get_operation_by_request("app-diag", "diag-1")
+            .get_operation_by_request("appdiag", "diag-1")
             .await
             .expect("read")
             .expect("operation");
@@ -353,7 +353,7 @@ pub(crate) async fn uncertain_retry_refusal_carries_readonly_observation() {
         }
         let refusal = service
             .retry_control_operation(
-                "app-diag",
+                "appdiag",
                 &operation.operation_id,
                 shared_types::UserAppRetryRequest {
                     user_id: "u-test".into(),
@@ -381,7 +381,7 @@ pub(crate) async fn uncertain_retry_refusal_carries_readonly_observation() {
             service
                 .metadata
                 .store
-                .get_operation("app-diag", &operation.operation_id)
+                .get_operation("appdiag", &operation.operation_id)
                 .await
                 .expect("read"),
             Some(operation)
@@ -397,7 +397,7 @@ pub(crate) async fn create_app_cleanup_failure_keeps_original_error() {
     runtime.create_fails.store(true, Ordering::SeqCst);
     runtime.delete_fails.store(true, Ordering::SeqCst);
     let service = test_service(root.path(), runtime.clone()).await;
-    let app_dir = root.path().join("app-r2b");
+    let app_dir = root.path().join("appr2b");
     tokio::fs::create_dir_all(app_dir.join("code"))
         .await
         .expect("create code dir");
@@ -409,7 +409,7 @@ pub(crate) async fn create_app_cleanup_failure_keeps_original_error() {
     .expect("write release lock");
 
     let error = service
-        .create_app(create_request("app-r2b"))
+        .create_app(create_request("appr2b"))
         .await
         .expect_err("create_app must fail");
 
@@ -430,7 +430,7 @@ pub(crate) async fn update_app_without_name_keeps_metadata_name() {
     let runtime = Arc::new(MockRuntime::default());
     let service = test_service(root.path(), runtime).await;
     // create_app 需要 code/release.lock.toml
-    let app_dir = root.path().join("app-meta");
+    let app_dir = root.path().join("appmeta");
     tokio::fs::create_dir_all(app_dir.join("code"))
         .await
         .expect("create code dir");
@@ -441,13 +441,13 @@ pub(crate) async fn update_app_without_name_keeps_metadata_name() {
     .await
     .expect("write release lock");
 
-    let mut create = create_request("app-meta");
+    let mut create = create_request("appmeta");
     create.name = "alpha".into();
     service.create_app(create).await.expect("create app");
     assert_eq!(
         service
             .metadata
-            .lookup("app-meta")
+            .lookup("appmeta")
             .await
             .expect("metadata query")
             .and_then(|m| m.name),
@@ -471,13 +471,13 @@ pub(crate) async fn update_app_without_name_keeps_metadata_name() {
         expected_resource_version: None,
     };
     service
-        .update_app("app-meta", update_no_name.clone())
+        .update_app("appmeta", update_no_name.clone())
         .await
         .expect("update without name");
     assert_eq!(
         service
             .metadata
-            .lookup("app-meta")
+            .lookup("appmeta")
             .await
             .expect("metadata query")
             .and_then(|m| m.name),
@@ -489,13 +489,13 @@ pub(crate) async fn update_app_without_name_keeps_metadata_name() {
     update_with_name.image = Some("registry.example/app-runtime:v3".into());
     update_with_name.name = Some("beta".into());
     service
-        .update_app("app-meta", update_with_name)
+        .update_app("appmeta", update_with_name)
         .await
         .expect("update with name");
     assert_eq!(
         service
             .metadata
-            .lookup("app-meta")
+            .lookup("appmeta")
             .await
             .expect("metadata query")
             .and_then(|m| m.name),
@@ -510,7 +510,7 @@ pub(crate) async fn update_app_conflicts_while_release_lock_held() {
     let root = tempfile::tempdir().expect("tempdir");
     let service = test_service(root.path(), Arc::new(MockRuntime::default())).await;
     let _publish_lock = service
-        .acquire_process_release_lock("app-busy")
+        .acquire_process_release_lock("appbusy")
         .await
         .expect("operation lock");
 
@@ -530,7 +530,7 @@ pub(crate) async fn update_app_conflicts_while_release_lock_held() {
         expected_resource_version: None,
     };
     let error = service
-        .update_app("app-busy", request)
+        .update_app("appbusy", request)
         .await
         .expect_err("update during publish must 409");
     assert!(
@@ -629,10 +629,10 @@ async fn admit_recovery_control(
 #[tokio::test]
 async fn pending_control_recovery_keeps_the_original_operation_and_executes_once() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "recover-control").await;
+    let (service, runtime) = created_app_service(directory.path(), "recovercontrol").await;
     let pending = admit_recovery_control(
         &service,
-        "recover-control",
+        "recovercontrol",
         shared_types::UserAppControlCommand::Restart,
     )
     .await;
@@ -652,7 +652,7 @@ async fn pending_control_recovery_keeps_the_original_operation_and_executes_once
     let completed = service
         .metadata
         .store
-        .get_operation("recover-control", &pending.operation_id)
+        .get_operation("recovercontrol", &pending.operation_id)
         .await
         .expect("operation query")
         .expect("operation");
@@ -674,10 +674,10 @@ async fn pending_control_recovery_keeps_the_original_operation_and_executes_once
 #[tokio::test]
 async fn pending_control_recovery_does_not_take_over_a_running_executor() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "recover-running").await;
+    let (service, runtime) = created_app_service(directory.path(), "recoverrunning").await;
     let pending = admit_recovery_control(
         &service,
-        "recover-running",
+        "recoverrunning",
         shared_types::UserAppControlCommand::Start { traffic: false },
     )
     .await;
@@ -695,7 +695,7 @@ async fn pending_control_recovery_does_not_take_over_a_running_executor() {
     let running = service
         .metadata
         .store
-        .get_operation("recover-running", &pending.operation_id)
+        .get_operation("recoverrunning", &pending.operation_id)
         .await
         .expect("operation query")
         .expect("operation");
@@ -712,15 +712,15 @@ async fn pending_control_recovery_does_not_take_over_a_running_executor() {
 #[tokio::test]
 async fn traffic_rechecks_stale_local_block_but_respects_committed_manual_stop() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "stale-wake-block").await;
+    let (service, runtime) = created_app_service(directory.path(), "stalewakeblock").await;
     let service = Arc::new(service);
     service.attach_activity_coordinator().expect("coordinator");
-    service.activity.mark_wake_blocked("stale-wake-block");
+    service.activity.mark_wake_blocked("stalewakeblock");
     let result =
-        shared_types::AppWakeControl::ensure_running(service.activity.as_ref(), "stale-wake-block")
+        shared_types::AppWakeControl::ensure_running(service.activity.as_ref(), "stalewakeblock")
             .await;
     assert_eq!(result, shared_types::WakeOutcome::AlreadyRunning);
-    assert!(!service.activity.is_wake_blocked("stale-wake-block"));
+    assert!(!service.activity.is_wake_blocked("stalewakeblock"));
     assert_eq!(
         runtime.scale_calls.load(Ordering::SeqCst),
         0,
@@ -728,7 +728,7 @@ async fn traffic_rechecks_stale_local_block_but_respects_committed_manual_stop()
     );
     service
         .stop_app_controlled(
-            "stale-wake-block",
+            "stalewakeblock",
             shared_types::UserAppControlRequest {
                 user_id: "u-test".into(),
                 lifecycle_id: None,
@@ -739,10 +739,10 @@ async fn traffic_rechecks_stale_local_block_but_respects_committed_manual_stop()
         .expect("intentional stop");
     let before = runtime.scale_calls.load(Ordering::SeqCst);
     let result =
-        shared_types::AppWakeControl::ensure_running(service.activity.as_ref(), "stale-wake-block")
+        shared_types::AppWakeControl::ensure_running(service.activity.as_ref(), "stalewakeblock")
             .await;
     assert!(matches!(result, shared_types::WakeOutcome::Failed(_)));
-    assert!(service.activity.is_wake_blocked("stale-wake-block"));
+    assert!(service.activity.is_wake_blocked("stalewakeblock"));
     assert_eq!(
         runtime.scale_calls.load(Ordering::SeqCst),
         before,
@@ -753,10 +753,10 @@ async fn traffic_rechecks_stale_local_block_but_respects_committed_manual_stop()
 #[tokio::test]
 async fn pending_traffic_recovery_cannot_override_a_manual_stop() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "recover-manual").await;
+    let (service, runtime) = created_app_service(directory.path(), "recovermanual").await;
     service
         .stop_app_controlled(
-            "recover-manual",
+            "recovermanual",
             shared_types::UserAppControlRequest {
                 user_id: "u-test".into(),
                 lifecycle_id: None,
@@ -768,7 +768,7 @@ async fn pending_traffic_recovery_cannot_override_a_manual_stop() {
     let prior_scale_calls = runtime.scale_calls.load(Ordering::SeqCst);
     let pending = admit_recovery_control(
         &service,
-        "recover-manual",
+        "recovermanual",
         shared_types::UserAppControlCommand::Start { traffic: true },
     )
     .await;
@@ -781,12 +781,12 @@ async fn pending_traffic_recovery_cannot_override_a_manual_stop() {
     let failed = service
         .metadata
         .store
-        .get_operation("recover-manual", &pending.operation_id)
+        .get_operation("recovermanual", &pending.operation_id)
         .await
         .expect("operation query")
         .expect("operation");
     assert_eq!(failed.state, shared_types::UserAppOperationState::Failed);
-    assert!(service.activity.is_wake_blocked("recover-manual"));
+    assert!(service.activity.is_wake_blocked("recovermanual"));
     assert!(failed.checkpoint.is_null());
 }
 
@@ -794,7 +794,7 @@ async fn pending_traffic_recovery_cannot_override_a_manual_stop() {
 async fn stop_rejection_releases_ownership_but_uncertain_result_retains_it() {
     for status in [403, 408, 500] {
         let directory = tempfile::tempdir().expect("directory");
-        let (service, runtime) = created_app_service(directory.path(), "stop-outcome").await;
+        let (service, runtime) = created_app_service(directory.path(), "stopoutcome").await;
         runtime.stop_failure_status.store(status, Ordering::SeqCst);
         let request = shared_types::UserAppControlRequest {
             user_id: "u-test".into(),
@@ -802,7 +802,7 @@ async fn stop_rejection_releases_ownership_but_uncertain_result_retains_it() {
             request_id: Some("stop-outcome-request".into()),
         };
         let error = service
-            .stop_app_controlled("stop-outcome", request)
+            .stop_app_controlled("stopoutcome", request)
             .await
             .expect_err("injected failure");
         let rejected = status == 403;
@@ -813,7 +813,7 @@ async fn stop_rejection_releases_ownership_but_uncertain_result_retains_it() {
         let record = service
             .metadata
             .store
-            .get_operation_by_request("stop-outcome", "stop-outcome-request")
+            .get_operation_by_request("stopoutcome", "stop-outcome-request")
             .await
             .expect("operation query")
             .expect("operation");
@@ -825,9 +825,9 @@ async fn stop_rejection_releases_ownership_but_uncertain_result_retains_it() {
                 shared_types::UserAppOperationState::RecoveryRequired
             }
         );
-        assert_eq!(service.activity.is_wake_blocked("stop-outcome"), !rejected);
+        assert_eq!(service.activity.is_wake_blocked("stopoutcome"), !rejected);
         let next = service
-            .try_acquire_process_release_lock("stop-outcome")
+            .try_acquire_process_release_lock("stopoutcome")
             .await;
         if rejected {
             next.expect("definitive rejection releases marker")
@@ -847,7 +847,7 @@ async fn stop_rejection_releases_ownership_but_uncertain_result_retains_it() {
 #[tokio::test]
 async fn policy_control_is_durable_idempotent_and_does_not_restart_runtime() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "durable-policy").await;
+    let (service, runtime) = created_app_service(directory.path(), "durablepolicy").await;
     let request = RecyclePolicyRequest {
         user_id: "u-test".into(),
         lifecycle_id: None,
@@ -857,11 +857,11 @@ async fn policy_control_is_durable_idempotent_and_does_not_restart_runtime() {
         wake_on_traffic: Some(false),
     };
     service
-        .set_recycle_policy("durable-policy", request.clone())
+        .set_recycle_policy("durablepolicy", request.clone())
         .await
         .expect("policy");
     service
-        .set_recycle_policy("durable-policy", request.clone())
+        .set_recycle_policy("durablepolicy", request.clone())
         .await
         .expect("repeat");
     assert_eq!(runtime.policy_calls.load(Ordering::SeqCst), 1);
@@ -870,13 +870,13 @@ async fn policy_control_is_durable_idempotent_and_does_not_restart_runtime() {
     let identity = service
         .metadata
         .store
-        .get_application("durable-policy")
+        .get_application("durablepolicy")
         .await
         .expect("identity query")
         .expect("identity");
     assert_eq!(identity.runtime_policy.recycle_enabled, Some(false));
     let status = service
-        .get_app("durable-policy")
+        .get_app("durablepolicy")
         .await
         .expect("policy readback");
     assert_eq!(status.recycle_enabled, Some(false));
@@ -886,7 +886,7 @@ async fn policy_control_is_durable_idempotent_and_does_not_restart_runtime() {
     changed.wake_on_traffic = Some(true);
     assert!(
         service
-            .set_recycle_policy("durable-policy", changed)
+            .set_recycle_policy("durablepolicy", changed)
             .await
             .is_err()
     );
@@ -898,14 +898,14 @@ async fn creation_commits_initial_runtime_policy() {
     let directory = tempfile::tempdir().expect("directory");
     let runtime = Arc::new(MockRuntime::default());
     let service = test_service(directory.path(), runtime).await;
-    let mut request = create_request("initial-runtime-policy");
+    let mut request = create_request("initialruntimepolicy");
     request.recycle_enabled = Some(false);
     request.idle_timeout_seconds = Some(1800);
     service.create_app(request).await.expect("create");
     let identity = service
         .metadata
         .store
-        .get_application("initial-runtime-policy")
+        .get_application("initialruntimepolicy")
         .await
         .expect("read")
         .expect("identity");
@@ -922,10 +922,10 @@ async fn creation_commits_initial_runtime_policy() {
 #[tokio::test]
 async fn configuration_update_commits_new_policy_and_releases_operation_marker() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "update-policy").await;
+    let (service, runtime) = created_app_service(directory.path(), "updatepolicy").await;
     service
         .set_recycle_policy(
-            "update-policy",
+            "updatepolicy",
             RecyclePolicyRequest {
                 user_id: "u-test".into(),
                 lifecycle_id: None,
@@ -942,7 +942,7 @@ async fn configuration_update_commits_new_policy_and_releases_operation_marker()
     update.recycle_enabled = Some(true);
     update.idle_timeout_seconds = Some(900);
     let result = service
-        .update_app("update-policy", update.clone())
+        .update_app("updatepolicy", update.clone())
         .await
         .expect("configuration update");
     assert_eq!(result.recycle_enabled, Some(true));
@@ -950,12 +950,12 @@ async fn configuration_update_commits_new_policy_and_releases_operation_marker()
     assert_eq!(result.wake_on_traffic, Some(false));
     let calls = runtime.create_calls.load(Ordering::SeqCst);
     service
-        .update_app("update-policy", update)
+        .update_app("updatepolicy", update)
         .await
         .expect("exact replay after successful update");
     assert_eq!(runtime.create_calls.load(Ordering::SeqCst), calls);
     let next = service
-        .acquire_process_release_lock("update-policy")
+        .acquire_process_release_lock("updatepolicy")
         .await
         .expect("successful update releases resource marker");
     next.finish().await.expect("release test lease");
@@ -964,7 +964,7 @@ async fn configuration_update_commits_new_policy_and_releases_operation_marker()
 #[tokio::test]
 async fn pending_policy_recovery_applies_the_original_policy() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "recover-policy").await;
+    let (service, runtime) = created_app_service(directory.path(), "recoverpolicy").await;
     let policy = shared_types::UserAppRuntimePolicy {
         recycle_enabled: Some(false),
         idle_timeout_seconds: Some(450),
@@ -973,7 +973,7 @@ async fn pending_policy_recovery_applies_the_original_policy() {
     let previous_wake = service
         .metadata
         .store
-        .get_application("recover-policy")
+        .get_application("recoverpolicy")
         .await
         .expect("read previous policy")
         .expect("identity")
@@ -981,7 +981,7 @@ async fn pending_policy_recovery_applies_the_original_policy() {
         .wake_on_traffic;
     let pending = admit_recovery_control(
         &service,
-        "recover-policy",
+        "recoverpolicy",
         shared_types::UserAppControlCommand::SetRecyclePolicy {
             policy: policy.clone(),
         },
@@ -998,7 +998,7 @@ async fn pending_policy_recovery_applies_the_original_policy() {
         service
             .metadata
             .store
-            .get_application("recover-policy")
+            .get_application("recoverpolicy")
             .await
             .expect("read")
             .expect("identity")
@@ -1014,17 +1014,17 @@ async fn pending_policy_recovery_applies_the_original_policy() {
 #[tokio::test]
 async fn update_commits_a_durable_operation_matching_runtime_context() {
     let root = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(root.path(), "durable-update").await;
+    let (service, runtime) = created_app_service(root.path(), "durableupdate").await;
     let mut request = update_request_with_storage(None);
     request.name = Some("updated-name".into());
     request.request_id = Some("update-request".into());
     service
-        .update_app("durable-update", request.clone())
+        .update_app("durableupdate", request.clone())
         .await
         .expect("update");
     let calls = runtime.create_calls.load(Ordering::SeqCst);
     service
-        .update_app("durable-update", request.clone())
+        .update_app("durableupdate", request.clone())
         .await
         .expect("exact retry");
     assert_eq!(
@@ -1034,13 +1034,13 @@ async fn update_commits_a_durable_operation_matching_runtime_context() {
     );
     request.name = Some("different-intent".into());
     assert!(matches!(
-        service.update_app("durable-update", request).await,
+        service.update_app("durableupdate", request).await,
         Err(AppOperationError::Conflict(_))
     ));
     assert_eq!(runtime.create_calls.load(Ordering::SeqCst), calls);
     let context = runtime
         .create_params_history
-        .get("durable-update")
+        .get("durableupdate")
         .and_then(|history| {
             history
                 .last()
@@ -1049,7 +1049,7 @@ async fn update_commits_a_durable_operation_matching_runtime_context() {
         .expect("runtime received operation context");
     let target = runtime
         .create_params_history
-        .get("durable-update")
+        .get("durableupdate")
         .and_then(|history| {
             history
                 .last()
@@ -1060,7 +1060,7 @@ async fn update_commits_a_durable_operation_matching_runtime_context() {
     let operation = service
         .metadata
         .store
-        .get_operation("durable-update", &context.operation_id)
+        .get_operation("durableupdate", &context.operation_id)
         .await
         .expect("read operation")
         .expect("operation persisted");
@@ -1080,21 +1080,21 @@ async fn update_commits_a_durable_operation_matching_runtime_context() {
     );
     assert_eq!(operation.kind, shared_types::UserAppOperationKind::Update);
     let queried = service
-        .get_control_operation_by_request("durable-update", "u-test", "update-request")
+        .get_control_operation_by_request("durableupdate", "u-test", "update-request")
         .await
         .expect("query by caller token")
         .expect("operation");
     assert_eq!(queried.operation_id, operation.operation_id);
     assert!(
         service
-            .get_control_operation_by_request("durable-update", "foreign", "update-request")
+            .get_control_operation_by_request("durableupdate", "foreign", "update-request")
             .await
             .is_err()
     );
     let app = service
         .metadata
         .store
-        .get_application("durable-update")
+        .get_application("durableupdate")
         .await
         .expect("read identity")
         .expect("identity");
@@ -1105,7 +1105,7 @@ async fn update_commits_a_durable_operation_matching_runtime_context() {
 #[tokio::test]
 async fn explicit_stop_is_durable_idempotent_and_blocks_traffic_wake() {
     let root = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(root.path(), "durable-stop").await;
+    let (service, runtime) = created_app_service(root.path(), "durablestop").await;
     let request = shared_types::UserAppControlRequest {
         user_id: "u-test".into(),
         lifecycle_id: None,
@@ -1113,18 +1113,18 @@ async fn explicit_stop_is_durable_idempotent_and_blocks_traffic_wake() {
     };
     let before = runtime.scale_calls.load(Ordering::SeqCst);
     service
-        .stop_app_controlled("durable-stop", request.clone())
+        .stop_app_controlled("durablestop", request.clone())
         .await
         .expect("stop");
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), before + 1);
-    assert!(service.activity.is_wake_blocked("durable-stop"));
+    assert!(service.activity.is_wake_blocked("durablestop"));
     service
-        .stop_app_controlled("durable-stop", request.clone())
+        .stop_app_controlled("durablestop", request.clone())
         .await
         .expect("exact retry");
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), before + 1);
     let operation = service
-        .get_control_operation_by_request("durable-stop", "u-test", "stop-request")
+        .get_control_operation_by_request("durablestop", "u-test", "stop-request")
         .await
         .expect("query")
         .expect("operation");
@@ -1136,7 +1136,7 @@ async fn explicit_stop_is_durable_idempotent_and_blocks_traffic_wake() {
     let persisted = service
         .metadata
         .store
-        .get_operation_by_request("durable-stop", "stop-request")
+        .get_operation_by_request("durablestop", "stop-request")
         .await
         .expect("stored operation")
         .expect("receipt");
@@ -1152,7 +1152,7 @@ async fn explicit_stop_is_durable_idempotent_and_blocks_traffic_wake() {
     foreign.user_id = "foreign".into();
     assert!(
         service
-            .stop_app_controlled("durable-stop", foreign)
+            .stop_app_controlled("durablestop", foreign)
             .await
             .is_err()
     );
@@ -1163,11 +1163,11 @@ async fn explicit_stop_is_durable_idempotent_and_blocks_traffic_wake() {
 #[tokio::test]
 async fn compute_delete_failure_keeps_wake_blocked_until_reconciliation() {
     let root = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(root.path(), "delete-fence").await;
+    let (service, runtime) = created_app_service(root.path(), "deletefence").await;
     runtime.delete_fails.store(true, Ordering::SeqCst);
     let result = service
         .delete_app_controlled(
-            "delete-fence",
+            "deletefence",
             DeleteAppRequest {
                 user_id: "u-test".into(),
                 lifecycle_id: None,
@@ -1178,10 +1178,10 @@ async fn compute_delete_failure_keeps_wake_blocked_until_reconciliation() {
         )
         .await;
     assert!(result.is_err());
-    assert!(service.activity.is_wake_blocked("delete-fence"));
-    assert!(runtime.deployments.contains_key("delete-fence"));
+    assert!(service.activity.is_wake_blocked("deletefence"));
+    assert!(runtime.deployments.contains_key("deletefence"));
     let operation = service
-        .get_control_operation_by_request("delete-fence", "u-test", "delete-fence-request")
+        .get_control_operation_by_request("deletefence", "u-test", "delete-fence-request")
         .await
         .expect("query")
         .expect("operation");
@@ -1190,13 +1190,13 @@ async fn compute_delete_failure_keeps_wake_blocked_until_reconciliation() {
         shared_types::UserAppOperationState::RecoveryRequired
     );
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
-    service.activity.forget_app("delete-fence");
+    service.activity.forget_app("deletefence");
     service
         .rebuild_stopped_apps()
         .await
         .expect("restore activity from durable deletion");
     assert!(
-        service.activity.is_wake_blocked("delete-fence"),
+        service.activity.is_wake_blocked("deletefence"),
         "a still-running old container cannot remove the deletion fence on restart"
     );
 }
@@ -1204,11 +1204,11 @@ async fn compute_delete_failure_keeps_wake_blocked_until_reconciliation() {
 #[tokio::test]
 async fn compute_delete_replays_after_runtime_disappears_and_preserves_lifecycle() {
     let root = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(root.path(), "durable-delete").await;
+    let (service, runtime) = created_app_service(root.path(), "durabledelete").await;
     let before = service
         .metadata
         .store
-        .get_application("durable-delete")
+        .get_application("durabledelete")
         .await
         .expect("read")
         .expect("identity");
@@ -1220,18 +1220,18 @@ async fn compute_delete_replays_after_runtime_disappears_and_preserves_lifecycle
         expected_resource_version: None,
     };
     service
-        .delete_app_controlled("durable-delete", request.clone())
+        .delete_app_controlled("durabledelete", request.clone())
         .await
         .expect("delete compute");
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
     service
-        .delete_app_controlled("durable-delete", request.clone())
+        .delete_app_controlled("durabledelete", request.clone())
         .await
         .expect("exact replay despite absent runtime");
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
     assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
     let operation = service
-        .get_control_operation_by_request("durable-delete", "u-test", "delete-request")
+        .get_control_operation_by_request("durabledelete", "u-test", "delete-request")
         .await
         .expect("query")
         .expect("operation");
@@ -1246,20 +1246,20 @@ async fn compute_delete_replays_after_runtime_disappears_and_preserves_lifecycle
     let after = service
         .metadata
         .store
-        .get_application("durable-delete")
+        .get_application("durabledelete")
         .await
         .expect("read")
         .expect("identity retained");
     assert_eq!(after.lifecycle_id, before.lifecycle_id);
     assert_eq!(after.state, shared_types::UserAppLifecycleState::Active);
     let mut another = request.clone();
-    another.request_id = Some("delete-already-absent".into());
+    another.request_id = Some("deletealreadyabsent".into());
     service
-        .delete_app_controlled("durable-delete", another)
+        .delete_app_controlled("durabledelete", another)
         .await
         .expect("known lifecycle with absent compute is idempotent");
     let absent = service
-        .get_control_operation_by_request("durable-delete", "u-test", "delete-already-absent")
+        .get_control_operation_by_request("durabledelete", "u-test", "deletealreadyabsent")
         .await
         .expect("query")
         .expect("record");
@@ -1268,7 +1268,7 @@ async fn compute_delete_replays_after_runtime_disappears_and_preserves_lifecycle
     changed.purge = Some(true);
     assert!(matches!(
         service
-            .delete_app_controlled("durable-delete", changed)
+            .delete_app_controlled("durabledelete", changed)
             .await,
         Err(AppOperationError::Conflict(_))
     ));
@@ -1278,16 +1278,16 @@ async fn compute_delete_replays_after_runtime_disappears_and_preserves_lifecycle
 #[tokio::test]
 pub(crate) async fn update_app_storage_resize_triggered() {
     let root = tempfile::tempdir().expect("tempdir");
-    let (service, runtime) = created_app_service(root.path(), "app-resize").await;
+    let (service, runtime) = created_app_service(root.path(), "appresize").await;
     let create_calls_before = runtime.create_calls.load(Ordering::SeqCst);
 
     service
-        .update_app("app-resize", update_request_with_storage(Some("200Gi")))
+        .update_app("appresize", update_request_with_storage(Some("200Gi")))
         .await
         .expect("update with storage");
 
     assert_eq!(
-        runtime.resize_calls.get("app-resize").map(|c| c.clone()),
+        runtime.resize_calls.get("appresize").map(|c| c.clone()),
         Some(vec!["200Gi".to_string()]),
         "resize target forwarded"
     );
@@ -1303,7 +1303,7 @@ pub(crate) async fn update_app_storage_resize_triggered() {
 #[tokio::test]
 pub(crate) async fn update_app_storage_shrink_rejected_blocks_update() {
     let root = tempfile::tempdir().expect("tempdir");
-    let (service, runtime) = created_app_service(root.path(), "app-shrink").await;
+    let (service, runtime) = created_app_service(root.path(), "appshrink").await;
     *runtime.resize_outcome.lock().expect("outcome lock") =
         Some(StorageResizeOutcome::ShrinkRejected {
             current: "200Gi".into(),
@@ -1312,7 +1312,7 @@ pub(crate) async fn update_app_storage_shrink_rejected_blocks_update() {
     let create_calls_before = runtime.create_calls.load(Ordering::SeqCst);
 
     let error = service
-        .update_app("app-shrink", update_request_with_storage(Some("50Gi")))
+        .update_app("appshrink", update_request_with_storage(Some("50Gi")))
         .await
         .expect_err("shrink must be rejected");
     assert!(
@@ -1330,12 +1330,12 @@ pub(crate) async fn update_app_storage_shrink_rejected_blocks_update() {
 #[tokio::test]
 pub(crate) async fn update_app_storage_resize_failure_blocks_update() {
     let root = tempfile::tempdir().expect("tempdir");
-    let (service, runtime) = created_app_service(root.path(), "app-rfail").await;
+    let (service, runtime) = created_app_service(root.path(), "apprfail").await;
     runtime.resize_fails.store(true, Ordering::SeqCst);
     let create_calls_before = runtime.create_calls.load(Ordering::SeqCst);
 
     let error = service
-        .update_app("app-rfail", update_request_with_storage(Some("200Gi")))
+        .update_app("apprfail", update_request_with_storage(Some("200Gi")))
         .await
         .expect_err("resize failure must block update");
     assert!(
@@ -1353,10 +1353,10 @@ pub(crate) async fn update_app_storage_resize_failure_blocks_update() {
 #[tokio::test]
 pub(crate) async fn update_app_without_storage_skips_resize() {
     let root = tempfile::tempdir().expect("tempdir");
-    let (service, runtime) = created_app_service(root.path(), "app-nosize").await;
+    let (service, runtime) = created_app_service(root.path(), "appnosize").await;
 
     service
-        .update_app("app-nosize", update_request_with_storage(None))
+        .update_app("appnosize", update_request_with_storage(None))
         .await
         .expect("update without storage");
 
@@ -1412,7 +1412,7 @@ pub(crate) async fn production_storage_destroy_preserves_application_identity() 
     service
         .set_dev_cleanup(Arc::new(StubDevCleanup::default()))
         .expect("inject dev cleanup");
-    let app_dir = root.path().join("app-purge");
+    let app_dir = root.path().join("apppurge");
     tokio::fs::create_dir_all(app_dir.join("code"))
         .await
         .expect("create code dir");
@@ -1423,27 +1423,27 @@ pub(crate) async fn production_storage_destroy_preserves_application_identity() 
     .await
     .expect("write release lock");
 
-    let mut create = create_request("app-purge");
+    let mut create = create_request("apppurge");
     create.user_id = "u-purge".into();
     create.name = "keep-me".into();
     service.create_app(create).await.expect("create app");
     assert!(
         service
             .metadata
-            .lookup("app-purge")
+            .lookup("apppurge")
             .await
             .expect("metadata query")
             .is_some()
     );
 
     service
-        .delete_app("app-purge", true, None)
+        .delete_app("apppurge", true, None)
         .await
         .expect("purge delete");
     assert!(
         service
             .metadata
-            .lookup("app-purge")
+            .lookup("apppurge")
             .await
             .expect("metadata query")
             .is_some(),
@@ -1455,23 +1455,23 @@ pub(crate) async fn production_storage_destroy_preserves_application_identity() 
             .await
             .expect("persisted")
             .iter()
-            .any(|r| r.app_id == "app-purge"),
+            .any(|r| r.app_id == "apppurge"),
         "PG row retained after purge"
     );
 
     service
         .destroy_app_storage(
             shared_types::UserappStage::Prod,
-            "app-purge",
+            "apppurge",
             "u-purge",
-            "app-purge",
+            "apppurge",
         )
         .await
         .expect("explicit destroy");
     assert!(
         service
             .metadata
-            .lookup("app-purge")
+            .lookup("apppurge")
             .await
             .expect("metadata query")
             .is_some(),
@@ -1488,7 +1488,7 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
 
     let root = tempfile::tempdir().expect("tempdir");
     let runtime = Arc::new(MockRuntime::default());
-    for app_id in ["app-alpha", "app-beta"] {
+    for app_id in ["appalpha", "appbeta"] {
         runtime.deployments.insert(
             app_id.into(),
             DeploymentStatus {
@@ -1515,7 +1515,7 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
     let legacy = vec![
         AppMetadataRecord {
             generation: uuid::Uuid::new_v4().to_string(),
-            app_id: "app-alpha".into(),
+            app_id: "appalpha".into(),
             name: Some("alpha".into()),
             user_id: Some("u1".into()),
             tenant_id: None,
@@ -1524,7 +1524,7 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
         },
         AppMetadataRecord {
             generation: uuid::Uuid::new_v4().to_string(),
-            app_id: "app-beta".into(),
+            app_id: "appbeta".into(),
             name: Some("beta".into()),
             user_id: Some("u1".into()),
             tenant_id: None,
@@ -1543,7 +1543,7 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
 
     let response = service.query_apps(by_name("alpha")).await.expect("query");
     assert_eq!(response.items.len(), 1, "name filter now effective");
-    assert_eq!(response.items[0].app_id, "app-alpha");
+    assert_eq!(response.items[0].app_id, "appalpha");
 
     // created_at range:只含 2 小时前创建的 alpha
     let now = chrono::Utc::now();
@@ -1567,7 +1567,7 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
         .await
         .expect("query by range");
     assert_eq!(response.items.len(), 1);
-    assert_eq!(response.items[0].app_id, "app-alpha");
+    assert_eq!(response.items[0].app_id, "appalpha");
 }
 
 // ===== purge_app（彻底删除：dev+prod 容器/PVC + 元数据行，幂等）=====
@@ -1608,7 +1608,7 @@ async fn seed_running_app(service: &AppService, runtime: &MockRuntime, app_id: &
         .metadata
         .record(
             app_id,
-            Some("purge-me".into()),
+            Some("purgeme".into()),
             Some("u-purge".into()),
             None,
             None,
@@ -1624,18 +1624,18 @@ pub(crate) async fn purge_app_deletes_everything_and_metadata_row() {
     let runtime = Arc::new(MockRuntime::default());
     let (service, runtime, dev, persistence) =
         purge_test_service(root.path(), runtime.clone()).await;
-    seed_running_app(&service, &runtime, "app-p1").await;
+    seed_running_app(&service, &runtime, "appp1").await;
 
-    service.purge_app("app-p1").await.expect("purge app");
+    service.purge_app("appp1").await.expect("purge app");
 
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
-    assert!(runtime.deployments.get("app-p1").is_none());
+    assert!(runtime.deployments.get("appp1").is_none());
     assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 1);
     assert_eq!(dev.calls.load(Ordering::SeqCst), 1);
     assert!(
         service
             .metadata
-            .lookup("app-p1")
+            .lookup("appp1")
             .await
             .expect("metadata query")
             .is_none(),
@@ -1648,7 +1648,7 @@ pub(crate) async fn purge_app_deletes_everything_and_metadata_row() {
             .expect("persisted")
             .iter()
             .any(
-                |r| r.app_id == "app-p1" && r.state == shared_types::UserAppLifecycleState::Deleted
+                |r| r.app_id == "appp1" && r.state == shared_types::UserAppLifecycleState::Deleted
             ),
         "PG row deleted by purge_app"
     );
@@ -1664,11 +1664,11 @@ pub(crate) async fn purge_app_on_absent_app_is_idempotent_and_still_cleans_rest(
     // 不预置 deployment（计算面缺席），仅预置元数据行使断言非空洞
     service
         .metadata
-        .record("app-p2", None, Some("u-purge".into()), None, None)
+        .record("appp2", None, Some("u-purge".into()), None, None)
         .await
         .expect("metadata registration");
 
-    service.purge_app("app-p2").await.expect("idempotent purge");
+    service.purge_app("appp2").await.expect("idempotent purge");
 
     assert_eq!(
         runtime.delete_calls.load(Ordering::SeqCst),
@@ -1680,7 +1680,7 @@ pub(crate) async fn purge_app_on_absent_app_is_idempotent_and_still_cleans_rest(
     assert!(
         service
             .metadata
-            .lookup("app-p2")
+            .lookup("appp2")
             .await
             .expect("metadata query")
             .is_none(),
@@ -1696,10 +1696,10 @@ pub(crate) async fn purge_app_dev_cleanup_failure_propagates_and_keeps_metadata(
     let runtime = Arc::new(MockRuntime::default());
     let (service, runtime, dev, _persistence) =
         purge_test_service(root.path(), runtime.clone()).await;
-    seed_running_app(&service, &runtime, "app-p3").await;
+    seed_running_app(&service, &runtime, "appp3").await;
     dev.fails.store(true, Ordering::SeqCst);
 
-    let error = service.purge_app("app-p3").await.expect_err("must fail");
+    let error = service.purge_app("appp3").await.expect_err("must fail");
 
     assert!(matches!(error, AppOperationError::Backend(_)));
     assert!(
@@ -1715,7 +1715,7 @@ pub(crate) async fn purge_app_dev_cleanup_failure_propagates_and_keeps_metadata(
     assert!(
         service
             .metadata
-            .lookup("app-p3")
+            .lookup("appp3")
             .await
             .expect("metadata query")
             .is_some(),
@@ -1728,7 +1728,7 @@ async fn failed_purge_retains_both_runtime_and_registry_deletion_receipts() {
     let root = tempfile::tempdir().expect("directory");
     let (service, runtime, dev, _) =
         purge_test_service(root.path(), Arc::new(MockRuntime::default())).await;
-    let app_id = "purge-receipts";
+    let app_id = "purgereceipts";
     seed_running_app(&service, &runtime, app_id).await;
     dev.fails.store(true, Ordering::SeqCst);
     assert!(service.purge_app(app_id).await.is_err());
@@ -1830,10 +1830,10 @@ pub(crate) async fn purge_app_query_failure_propagates_not_treated_as_absent() {
     let runtime = Arc::new(MockRuntime::default());
     let (service, runtime, dev, _persistence) =
         purge_test_service(root.path(), runtime.clone()).await;
-    seed_running_app(&service, &runtime, "app-p4").await;
+    seed_running_app(&service, &runtime, "appp4").await;
     runtime.status_fails.store(1, Ordering::SeqCst);
 
-    let error = service.purge_app("app-p4").await.expect_err("must fail");
+    let error = service.purge_app("appp4").await.expect_err("must fail");
 
     assert!(matches!(error, AppOperationError::Backend(_)));
     assert!(
@@ -1846,7 +1846,7 @@ pub(crate) async fn purge_app_query_failure_propagates_not_treated_as_absent() {
     assert!(
         service
             .metadata
-            .lookup("app-p4")
+            .lookup("appp4")
             .await
             .expect("metadata query")
             .is_some()
@@ -1860,9 +1860,9 @@ pub(crate) async fn purge_app_without_dev_cleanup_injected_is_hard_error() {
     let runtime = Arc::new(MockRuntime::default());
     // 不注入 dev_cleanup（test_service 默认 None）
     let service = test_service(root.path(), runtime.clone()).await;
-    seed_running_app(&service, &runtime, "app-p5").await;
+    seed_running_app(&service, &runtime, "appp5").await;
 
-    let error = service.purge_app("app-p5").await.expect_err("must fail");
+    let error = service.purge_app("appp5").await.expect_err("must fail");
 
     assert!(matches!(error, AppOperationError::Backend(_)));
     assert!(
@@ -1874,7 +1874,7 @@ pub(crate) async fn purge_app_without_dev_cleanup_injected_is_hard_error() {
     assert!(
         service
             .metadata
-            .lookup("app-p5")
+            .lookup("appp5")
             .await
             .expect("metadata query")
             .is_some()
@@ -1886,7 +1886,7 @@ async fn rejected_delete_version_releases_kubernetes_operation_before_return() {
     let root = tempfile::tempdir().expect("directory");
     let runtime = Arc::new(MockRuntime::default());
     runtime.deployments.insert(
-        "version-lease".into(),
+        "versionlease".into(),
         DeploymentStatus {
             resource_version: Some("2".into()),
             ..Default::default()
@@ -1896,17 +1896,17 @@ async fn rejected_delete_version_releases_kubernetes_operation_before_return() {
     service
         .metadata
         .store
-        .ensure_identity("version-lease", "u-test")
+        .ensure_identity("versionlease", "u-test")
         .await
         .expect("owner identity");
     service.config.access_mode = AppAccessMode::Kubernetes;
     assert!(matches!(
-        service.delete_app("version-lease", false, Some("1")).await,
+        service.delete_app("versionlease", false, Some("1")).await,
         Err(AppOperationError::Conflict(_))
     ));
     assert!(!runtime.lease_held.load(Ordering::SeqCst));
     service
-        .acquire_process_release_lock("version-lease")
+        .acquire_process_release_lock("versionlease")
         .await
         .expect("next operation admitted")
         .finish()
@@ -1923,17 +1923,17 @@ async fn cancelled_docker_mutation_blocks_later_deletion_before_side_effects() {
     service
         .metadata
         .store
-        .ensure_identity("cancelled-writer", "u-test")
+        .ensure_identity("cancelledwriter", "u-test")
         .await
         .expect("owner identity");
     let operation = service
-        .acquire_process_release_lock("cancelled-writer")
+        .acquire_process_release_lock("cancelledwriter")
         .await
         .expect("lease");
     operation.mark_mutating().expect("durable mutation marker");
     drop(operation);
     assert!(matches!(
-        service.delete_app("cancelled-writer", false, None).await,
+        service.delete_app("cancelledwriter", false, None).await,
         Err(AppOperationError::Conflict(_))
     ));
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
@@ -1945,13 +1945,13 @@ async fn production_lock_prefix_keeps_builder_shaped_ids_separate() {
     let root = tempfile::tempdir().expect("directory");
     let service = test_service(root.path(), Arc::new(MockRuntime::default())).await;
     let guard = service
-        .acquire_process_release_lock("builder-foo")
+        .acquire_process_release_lock("builderfoo")
         .await
         .expect("prod lease");
     let directory =
         std::path::Path::new(&service.config.operation_lock_root).join(".app-operation-locks");
-    assert!(directory.join("prod-builder-foo.lock").exists());
-    assert!(!directory.join("builder-foo.lock").exists());
+    assert!(directory.join("prod-builderfoo.lock").exists());
+    assert!(!directory.join("builderfoo.lock").exists());
     guard.finish().await.expect("release");
 }
 
@@ -1964,7 +1964,7 @@ async fn create_reserved_env_rejection_does_not_provision_or_retain_ownership() 
         if kubernetes {
             service.config.access_mode = AppAccessMode::Kubernetes;
         }
-        let mut request = create_request("invalid-env");
+        let mut request = create_request("invalidenv");
         request.env = Some(std::collections::HashMap::from([(
             "RCODER_PINGAP_VERSION".into(),
             "forged".into(),
@@ -1976,7 +1976,7 @@ async fn create_reserved_env_rejection_does_not_provision_or_retain_ownership() 
         assert_eq!(runtime.ensure_workspace_calls.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
         service
-            .try_acquire_process_release_lock("invalid-env")
+            .try_acquire_process_release_lock("invalidenv")
             .await
             .expect("rejection releases ownership")
             .finish()
@@ -2000,9 +2000,9 @@ async fn update_reserved_secrets_rejects_before_mutation_and_releases_ownership(
                 service.config.access_mode = AppAccessMode::Kubernetes;
             }
             runtime.deployments.insert(
-                "reserved-secret".into(),
+                "reservedsecret".into(),
                 DeploymentStatus {
-                    app_id: "reserved-secret".into(),
+                    app_id: "reservedsecret".into(),
                     phase: "Running".into(),
                     resource_version: Some("before".into()),
                     ..Default::default()
@@ -2014,7 +2014,7 @@ async fn update_reserved_secrets_rejects_before_mutation_and_releases_ownership(
                 "forged".into(),
             )]));
             let error = service
-                .update_app("reserved-secret", request)
+                .update_app("reservedsecret", request)
                 .await
                 .expect_err("platform identity cannot be injected through secrets");
             assert!(matches!(error, AppOperationError::Validation(_)), "{error}");
@@ -2027,14 +2027,14 @@ async fn update_reserved_secrets_rejects_before_mutation_and_releases_ownership(
             assert_eq!(
                 runtime
                     .deployments
-                    .get("reserved-secret")
+                    .get("reservedsecret")
                     .unwrap()
                     .resource_version
                     .as_deref(),
                 Some("before"),
             );
             service
-                .try_acquire_process_release_lock("reserved-secret")
+                .try_acquire_process_release_lock("reservedsecret")
                 .await
                 .expect("validation failure releases ownership")
                 .finish()
@@ -2049,9 +2049,9 @@ async fn failed_update_preparation_releases_lease_for_next_update() {
     let root = tempfile::tempdir().expect("directory");
     let runtime = Arc::new(MockRuntime::default());
     runtime.deployments.insert(
-        "prepare-retry".into(),
+        "prepareretry".into(),
         DeploymentStatus {
-            app_id: "prepare-retry".into(),
+            app_id: "prepareretry".into(),
             phase: "Running".into(),
             pod_ip: Some("10.0.0.1".into()),
             ..Default::default()
@@ -2064,7 +2064,7 @@ async fn failed_update_preparation_releases_lease_for_next_update() {
     service
         .metadata
         .store
-        .ensure_identity("prepare-retry", "u-test")
+        .ensure_identity("prepareretry", "u-test")
         .await
         .expect("authoritative application identity");
     let request = || UpdateAppRequest {
@@ -2084,7 +2084,7 @@ async fn failed_update_preparation_releases_lease_for_next_update() {
     };
     for _ in 0..2 {
         let error = service
-            .update_app("prepare-retry", request())
+            .update_app("prepareretry", request())
             .await
             .expect_err("preparation fails");
         assert!(matches!(error, AppOperationError::Backend(_)));
@@ -2147,7 +2147,7 @@ mod purge_http_cancellation {
         let root = tempfile::tempdir().expect("tempdir");
         let runtime = Arc::new(MockRuntime::default());
         let (service, runtime, _, persistence) = purge_test_service(root.path(), runtime).await;
-        let app_id = "cancelled-http-purge";
+        let app_id = "cancelledhttppurge";
         seed_running_app(&service, &runtime, app_id).await;
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -2198,7 +2198,7 @@ mod purge_http_cancellation {
         .expect("operation ended");
         let marker = root
             .path()
-            .join(".app-operation-locks/prod-cancelled-http-purge.lock");
+            .join(".app-operation-locks/prod-cancelledhttppurge.lock");
 
         if outcome == 0 {
             let next = next.expect("completed purge must release durable mutation marker");
@@ -2260,7 +2260,7 @@ async fn durable_owner_conflict_precedes_runtime_creation() {
     service
         .metadata
         .record(
-            "owner-conflict",
+            "ownerconflict",
             None,
             Some("original-owner".into()),
             None,
@@ -2276,7 +2276,7 @@ async fn durable_owner_conflict_precedes_runtime_creation() {
         .await
         .expect("manifest");
     let error = service
-        .create_app(create_request("owner-conflict"))
+        .create_app(create_request("ownerconflict"))
         .await
         .expect_err("conflicting owner");
     assert!(matches!(error, AppOperationError::Conflict(_)), "{error}");
@@ -2285,7 +2285,7 @@ async fn durable_owner_conflict_precedes_runtime_creation() {
         0,
         "owner rejection must precede runtime creation"
     );
-    assert!(!runtime.deployments.contains_key("owner-conflict"));
+    assert!(!runtime.deployments.contains_key("ownerconflict"));
 }
 
 #[tokio::test]
@@ -2293,7 +2293,7 @@ async fn full_delete_deduplicates_and_rejects_old_lifecycle_after_recreation() {
     let root = tempfile::tempdir().expect("directory");
     let runtime = Arc::new(MockRuntime::default());
     let (service, runtime, dev, store) = purge_test_service(root.path(), runtime).await;
-    let app_id = "purge-request-fence";
+    let app_id = "purgerequestfence";
     seed_running_app(&service, &runtime, app_id).await;
     let original = store
         .get_application(app_id)
@@ -2357,13 +2357,13 @@ async fn creation_records_lifecycle_execution_and_replays_without_new_resources(
     let root = tempfile::tempdir().expect("directory");
     let runtime = Arc::new(MockRuntime::default());
     let service = test_service(root.path(), runtime.clone()).await;
-    let mut request = create_request("durable-create");
+    let mut request = create_request("durablecreate");
     request.request_id = Some("create-request".into());
     service.create_app(request.clone()).await.expect("create");
     let context = {
         let history = runtime
             .create_params_history
-            .get("durable-create")
+            .get("durablecreate")
             .expect("create parameters");
         assert_eq!(history.len(), 1);
         history[0]
@@ -2372,12 +2372,12 @@ async fn creation_records_lifecycle_execution_and_replays_without_new_resources(
             .expect("execution context")
     };
     context
-        .validate_identity("durable-create", Some("u-test"))
+        .validate_identity("durablecreate", Some("u-test"))
         .expect("valid credential");
     let persisted = service
         .metadata
         .store
-        .get_operation_by_request("durable-create", "create-request")
+        .get_operation_by_request("durablecreate", "create-request")
         .await
         .expect("read")
         .expect("operation");
@@ -2396,7 +2396,7 @@ async fn creation_records_lifecycle_execution_and_replays_without_new_resources(
     assert_eq!(
         runtime
             .create_params_history
-            .get("durable-create")
+            .get("durablecreate")
             .expect("history")
             .len(),
         1
@@ -2406,7 +2406,7 @@ async fn creation_records_lifecycle_execution_and_replays_without_new_resources(
     assert_eq!(
         runtime
             .create_params_history
-            .get("durable-create")
+            .get("durablecreate")
             .expect("history")
             .len(),
         1
@@ -2417,19 +2417,19 @@ async fn creation_records_lifecycle_execution_and_replays_without_new_resources(
 #[tokio::test]
 async fn storage_expansion_receipt_is_bound_to_the_update_operation() {
     let root = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(root.path(), "resize-receipt").await;
+    let (service, runtime) = created_app_service(root.path(), "resizereceipt").await;
     let request: UpdateAppRequest = serde_json::from_value(serde_json::json!({
         "user_id":"u-test", "request_id":"resize-operation", "resources":{"storage":"200Gi"}
     }))
     .expect("request");
     service
-        .update_app("resize-receipt", request)
+        .update_app("resizereceipt", request)
         .await
         .expect("update");
     let operation = service
         .metadata
         .store
-        .get_operation_by_request("resize-receipt", "resize-operation")
+        .get_operation_by_request("resizereceipt", "resize-operation")
         .await
         .expect("read")
         .expect("operation");
@@ -2448,7 +2448,7 @@ async fn storage_expansion_receipt_is_bound_to_the_update_operation() {
     assert_eq!(
         runtime
             .resize_calls
-            .get("resize-receipt")
+            .get("resizereceipt")
             .expect("resize history")
             .as_slice(),
         &["200Gi".to_owned()]
@@ -2458,8 +2458,8 @@ async fn storage_expansion_receipt_is_bound_to_the_update_operation() {
 #[tokio::test]
 async fn controlled_start_persists_target_and_replays_without_another_runtime_write() {
     let root = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(root.path(), "durable-start").await;
-    service.stop_app("durable-start").await.expect("stop");
+    let (service, runtime) = created_app_service(root.path(), "durablestart").await;
+    service.stop_app("durablestart").await.expect("stop");
     let request = shared_types::UserAppControlRequest {
         user_id: "u-test".into(),
         lifecycle_id: None,
@@ -2467,14 +2467,14 @@ async fn controlled_start_persists_target_and_replays_without_another_runtime_wr
     };
     let before = runtime.scale_calls.load(Ordering::SeqCst);
     service
-        .start_app_controlled("durable-start", request.clone())
+        .start_app_controlled("durablestart", request.clone())
         .await
         .expect("start");
-    assert!(!service.activity.is_wake_blocked("durable-start"));
+    assert!(!service.activity.is_wake_blocked("durablestart"));
     let operation = service
         .metadata
         .store
-        .get_operation_by_request("durable-start", "start-request")
+        .get_operation_by_request("durablestart", "start-request")
         .await
         .expect("read")
         .expect("operation");
@@ -2489,7 +2489,7 @@ async fn controlled_start_persists_target_and_replays_without_another_runtime_wr
     assert_eq!(target.context.operation_id, operation.operation_id);
     assert_eq!(target.context.lifecycle_id, operation.lifecycle_id);
     service
-        .start_app_controlled("durable-start", request.clone())
+        .start_app_controlled("durablestart", request.clone())
         .await
         .expect("replay");
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), before + 1);
@@ -2497,7 +2497,7 @@ async fn controlled_start_persists_target_and_replays_without_another_runtime_wr
     stale.lifecycle_id = Some("obsolete-life".into());
     assert!(
         service
-            .start_app_controlled("durable-start", stale)
+            .start_app_controlled("durablestart", stale)
             .await
             .is_err()
     );
@@ -2508,7 +2508,7 @@ async fn controlled_start_persists_target_and_replays_without_another_runtime_wr
 #[tokio::test]
 async fn controlled_restart_deduplicates_and_is_distinct_from_start() {
     let root = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(root.path(), "durable-restart").await;
+    let (service, runtime) = created_app_service(root.path(), "durablerestart").await;
     let request = shared_types::UserAppControlRequest {
         user_id: "u-test".into(),
         lifecycle_id: None,
@@ -2516,13 +2516,13 @@ async fn controlled_restart_deduplicates_and_is_distinct_from_start() {
     };
     let before = runtime.scale_calls.load(Ordering::SeqCst);
     service
-        .restart_app_controlled("durable-restart", request.clone())
+        .restart_app_controlled("durablerestart", request.clone())
         .await
         .expect("restart");
     let operation = service
         .metadata
         .store
-        .get_operation_by_request("durable-restart", "restart-request")
+        .get_operation_by_request("durablerestart", "restart-request")
         .await
         .expect("read")
         .expect("operation");
@@ -2535,13 +2535,13 @@ async fn controlled_restart_deduplicates_and_is_distinct_from_start() {
         serde_json::from_value(operation.checkpoint["target"].clone()).expect("restart receipt");
     assert_eq!(target.context.operation_id, operation.operation_id);
     service
-        .restart_app_controlled("durable-restart", request.clone())
+        .restart_app_controlled("durablerestart", request.clone())
         .await
         .expect("replay");
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), before + 1);
     assert!(
         service
-            .start_app_controlled("durable-restart", request.clone())
+            .start_app_controlled("durablerestart", request.clone())
             .await
             .is_err(),
         "same request key cannot change operation kind"
@@ -2550,7 +2550,7 @@ async fn controlled_restart_deduplicates_and_is_distinct_from_start() {
     stale.lifecycle_id = Some("obsolete-life".into());
     assert!(
         service
-            .restart_app_controlled("durable-restart", stale)
+            .restart_app_controlled("durablerestart", stale)
             .await
             .is_err()
     );
@@ -2560,10 +2560,10 @@ async fn controlled_restart_deduplicates_and_is_distinct_from_start() {
 #[tokio::test]
 async fn explicit_retry_checks_owner_lifecycle_and_revision_before_execution() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "retry-control").await;
+    let (service, runtime) = created_app_service(directory.path(), "retrycontrol").await;
     let pending = admit_recovery_control(
         &service,
-        "retry-control",
+        "retrycontrol",
         shared_types::UserAppControlCommand::Restart,
     )
     .await;
@@ -2588,7 +2588,7 @@ async fn explicit_retry_checks_owner_lifecycle_and_revision_before_execution() {
     ] {
         assert!(
             service
-                .retry_control_operation("retry-control", &pending.operation_id, invalid)
+                .retry_control_operation("retrycontrol", &pending.operation_id, invalid)
                 .await
                 .is_err()
         );
@@ -2597,7 +2597,7 @@ async fn explicit_retry_checks_owner_lifecycle_and_revision_before_execution() {
             service
                 .metadata
                 .store
-                .get_operation("retry-control", &pending.operation_id)
+                .get_operation("retrycontrol", &pending.operation_id)
                 .await
                 .expect("read"),
             Some(pending.clone())
@@ -2605,7 +2605,7 @@ async fn explicit_retry_checks_owner_lifecycle_and_revision_before_execution() {
     }
     for _ in 0..2 {
         let result = service
-            .retry_control_operation("retry-control", &pending.operation_id, request.clone())
+            .retry_control_operation("retrycontrol", &pending.operation_id, request.clone())
             .await
             .expect("retry or observe success");
         assert_eq!(result.operation_id, pending.operation_id);
@@ -2617,10 +2617,10 @@ async fn explicit_retry_checks_owner_lifecycle_and_revision_before_execution() {
 #[tokio::test]
 async fn explicit_retry_cannot_take_over_a_claimed_operation() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "retry-claimed").await;
+    let (service, runtime) = created_app_service(directory.path(), "retryclaimed").await;
     let pending = admit_recovery_control(
         &service,
-        "retry-claimed",
+        "retryclaimed",
         shared_types::UserAppControlCommand::Restart,
     )
     .await;
@@ -2631,13 +2631,13 @@ async fn explicit_retry_cannot_take_over_a_claimed_operation() {
     let before = service
         .metadata
         .store
-        .get_operation("retry-claimed", &pending.operation_id)
+        .get_operation("retryclaimed", &pending.operation_id)
         .await
         .expect("read")
         .expect("operation");
     let result = service
         .retry_control_operation(
-            "retry-claimed",
+            "retryclaimed",
             &pending.operation_id,
             shared_types::UserAppRetryRequest {
                 user_id: "u-test".into(),
@@ -2652,7 +2652,7 @@ async fn explicit_retry_cannot_take_over_a_claimed_operation() {
         service
             .metadata
             .store
-            .get_operation("retry-claimed", &pending.operation_id)
+            .get_operation("retryclaimed", &pending.operation_id)
             .await
             .expect("read"),
         Some(before)
@@ -2663,14 +2663,14 @@ async fn explicit_retry_cannot_take_over_a_claimed_operation() {
 async fn pending_delete_recovery_preserves_scope_and_original_operation() {
     for purge in [false, true] {
         let directory = tempfile::tempdir().expect("directory");
-        let (service, runtime) = created_app_service(directory.path(), "recover-delete").await;
+        let (service, runtime) = created_app_service(directory.path(), "recoverdelete").await;
         let dev = Arc::new(StubDevCleanup::default());
         service
             .set_dev_cleanup(dev.clone())
             .expect("attach cleanup");
         let pending = admit_recovery_control(
             &service,
-            "recover-delete",
+            "recoverdelete",
             shared_types::UserAppControlCommand::DeleteResources {
                 purge,
                 expected_resource_version: None,
@@ -2695,11 +2695,11 @@ async fn pending_delete_recovery_preserves_scope_and_original_operation() {
             usize::from(purge)
         );
         assert_eq!(dev.calls.load(Ordering::SeqCst), usize::from(purge));
-        assert!(runtime.deployments.get("recover-delete").is_none());
+        assert!(runtime.deployments.get("recoverdelete").is_none());
         let completed = service
             .metadata
             .store
-            .get_operation("recover-delete", &pending.operation_id)
+            .get_operation("recoverdelete", &pending.operation_id)
             .await
             .expect("read")
             .expect("operation");
@@ -2723,7 +2723,7 @@ async fn pending_delete_recovery_preserves_scope_and_original_operation() {
         assert_eq!(checkpoint.development.is_some(), purge);
         assert_eq!(
             service
-                .get_lifecycle("recover-delete", "u-test")
+                .get_lifecycle("recoverdelete", "u-test")
                 .await
                 .expect("retained lifecycle")
                 .state,
@@ -2735,15 +2735,15 @@ async fn pending_delete_recovery_preserves_scope_and_original_operation() {
 #[tokio::test]
 async fn pending_delete_recovery_checks_original_expected_resource_version() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "recover-delete-version").await;
+    let (service, runtime) = created_app_service(directory.path(), "recoverdeleteversion").await;
     runtime
         .deployments
-        .get_mut("recover-delete-version")
+        .get_mut("recoverdeleteversion")
         .expect("runtime")
         .resource_version = Some("new-version".into());
     let pending = admit_recovery_control(
         &service,
-        "recover-delete-version",
+        "recoverdeleteversion",
         shared_types::UserAppControlCommand::DeleteResources {
             purge: false,
             expected_resource_version: Some("old-version".into()),
@@ -2756,11 +2756,11 @@ async fn pending_delete_recovery_checks_original_expected_resource_version() {
     ));
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
     assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
-    assert!(runtime.deployments.get("recover-delete-version").is_some());
+    assert!(runtime.deployments.get("recoverdeleteversion").is_some());
     let failed = service
         .metadata
         .store
-        .get_operation("recover-delete-version", &pending.operation_id)
+        .get_operation("recoverdeleteversion", &pending.operation_id)
         .await
         .expect("read")
         .expect("operation");
@@ -2772,7 +2772,7 @@ async fn pending_delete_recovery_checks_original_expected_resource_version() {
 async fn pending_full_delete_recovery_owns_deleting_lifecycle_until_completion() {
     for cleanup_fails in [false, true] {
         let directory = tempfile::tempdir().expect("directory");
-        let (service, runtime) = created_app_service(directory.path(), "recover-full-delete").await;
+        let (service, runtime) = created_app_service(directory.path(), "recoverfulldelete").await;
         let dev = Arc::new(StubDevCleanup::default());
         dev.fails.store(cleanup_fails, Ordering::SeqCst);
         service
@@ -2780,12 +2780,12 @@ async fn pending_full_delete_recovery_owns_deleting_lifecycle_until_completion()
             .expect("attach cleanup");
         let pending = admit_recovery_control(
             &service,
-            "recover-full-delete",
+            "recoverfulldelete",
             shared_types::UserAppControlCommand::DeleteApplication,
         )
         .await;
         let identity = service
-            .get_lifecycle("recover-full-delete", "u-test")
+            .get_lifecycle("recoverfulldelete", "u-test")
             .await
             .expect("admitted identity");
         assert_eq!(
@@ -2805,12 +2805,12 @@ async fn pending_full_delete_recovery_owns_deleting_lifecycle_until_completion()
         let operation = service
             .metadata
             .store
-            .get_operation("recover-full-delete", &pending.operation_id)
+            .get_operation("recoverfulldelete", &pending.operation_id)
             .await
             .expect("read")
             .expect("operation");
         let identity = service
-            .get_lifecycle("recover-full-delete", "u-test")
+            .get_lifecycle("recoverfulldelete", "u-test")
             .await
             .expect("identity");
         assert_eq!(identity.lifecycle_id, pending.lifecycle_id);
@@ -2832,7 +2832,7 @@ async fn pending_full_delete_recovery_owns_deleting_lifecycle_until_completion()
                 checkpoint.stage,
                 shared_types::UserAppDeletionStage::ProductionStorageRemoved
             );
-            assert!(service.activity.is_wake_blocked("recover-full-delete"));
+            assert!(service.activity.is_wake_blocked("recoverfulldelete"));
         } else {
             assert_eq!(
                 operation.state,
@@ -2863,13 +2863,13 @@ async fn pending_full_delete_recovery_owns_deleting_lifecycle_until_completion()
 async fn controlled_storage_destruction_checks_owner_and_replays_without_duplicate_cleanup() {
     for production in [false, true] {
         let directory = tempfile::tempdir().expect("directory");
-        let (service, runtime) = created_app_service(directory.path(), "controlled-storage").await;
+        let (service, runtime) = created_app_service(directory.path(), "controlledstorage").await;
         let dev = Arc::new(StubDevCleanup::default());
         service
             .set_dev_cleanup(dev.clone())
             .expect("cleanup adapter");
         if production {
-            runtime.deployments.remove("controlled-storage");
+            runtime.deployments.remove("controlledstorage");
         }
         let stage = if production {
             shared_types::UserappStage::Prod
@@ -2878,7 +2878,7 @@ async fn controlled_storage_destruction_checks_owner_and_replays_without_duplica
         };
         let request = DestroyStorageRequest {
             user_id: "u-test".into(),
-            confirm: "controlled-storage".into(),
+            confirm: "controlledstorage".into(),
             lifecycle_id: None,
             request_id: Some("storage-request".into()),
         };
@@ -2886,7 +2886,7 @@ async fn controlled_storage_destruction_checks_owner_and_replays_without_duplica
             service
                 .destroy_app_storage_controlled(
                     stage,
-                    "controlled-storage",
+                    "controlledstorage",
                     DestroyStorageRequest {
                         user_id: "foreign-owner".into(),
                         ..request.clone()
@@ -2898,12 +2898,12 @@ async fn controlled_storage_destruction_checks_owner_and_replays_without_duplica
         assert_eq!(dev.calls.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
         let operation_id = service
-            .destroy_app_storage_controlled(stage, "controlled-storage", request.clone())
+            .destroy_app_storage_controlled(stage, "controlledstorage", request.clone())
             .await
             .expect("destroy");
         assert_eq!(
             service
-                .destroy_app_storage_controlled(stage, "controlled-storage", request)
+                .destroy_app_storage_controlled(stage, "controlledstorage", request)
                 .await
                 .expect("replay"),
             operation_id
@@ -2917,7 +2917,7 @@ async fn controlled_storage_destruction_checks_owner_and_replays_without_duplica
         let operation = service
             .metadata
             .store
-            .get_operation("controlled-storage", &operation_id)
+            .get_operation("controlledstorage", &operation_id)
             .await
             .expect("read")
             .expect("operation");
@@ -2931,7 +2931,7 @@ async fn controlled_storage_destruction_checks_owner_and_replays_without_duplica
         assert_eq!(evidence.context.operation_id, operation_id);
         assert_eq!(
             service
-                .get_lifecycle("controlled-storage", "u-test")
+                .get_lifecycle("controlledstorage", "u-test")
                 .await
                 .expect("identity")
                 .state,
@@ -2943,9 +2943,9 @@ async fn controlled_storage_destruction_checks_owner_and_replays_without_duplica
 #[tokio::test]
 async fn controlled_production_clear_preserves_scope_and_request_identity() {
     let directory = tempfile::tempdir().expect("directory");
-    let (mut service, runtime) = created_app_service(directory.path(), "clear-production").await;
+    let (mut service, runtime) = created_app_service(directory.path(), "clearproduction").await;
     service.config.access_mode = AppAccessMode::Kubernetes;
-    runtime.deployments.remove("clear-production");
+    runtime.deployments.remove("clearproduction");
     let request = ClearStorageRequest {
         user_id: "u-test".into(),
         lifecycle_id: None,
@@ -2955,7 +2955,7 @@ async fn controlled_production_clear_preserves_scope_and_request_identity() {
         service
             .clear_app_storage_controlled(
                 shared_types::UserappStage::Prod,
-                "clear-production",
+                "clearproduction",
                 ClearStorageRequest {
                     user_id: "wrong-owner".into(),
                     ..request.clone()
@@ -2968,7 +2968,7 @@ async fn controlled_production_clear_preserves_scope_and_request_identity() {
     let id = service
         .clear_app_storage_controlled(
             shared_types::UserappStage::Prod,
-            "clear-production",
+            "clearproduction",
             request.clone(),
         )
         .await
@@ -2977,7 +2977,7 @@ async fn controlled_production_clear_preserves_scope_and_request_identity() {
         service
             .clear_app_storage_controlled(
                 shared_types::UserappStage::Prod,
-                "clear-production",
+                "clearproduction",
                 request
             )
             .await
@@ -2989,7 +2989,7 @@ async fn controlled_production_clear_preserves_scope_and_request_identity() {
     let operation = service
         .metadata
         .store
-        .get_operation("clear-production", &id)
+        .get_operation("clearproduction", &id)
         .await
         .expect("read")
         .expect("operation");
@@ -3009,7 +3009,7 @@ async fn controlled_production_clear_preserves_scope_and_request_identity() {
     ));
     assert_eq!(
         service
-            .get_lifecycle("clear-production", "u-test")
+            .get_lifecycle("clearproduction", "u-test")
             .await
             .expect("identity")
             .state,
@@ -3020,11 +3020,11 @@ async fn controlled_production_clear_preserves_scope_and_request_identity() {
 #[tokio::test]
 async fn controlled_production_clear_refuses_existing_compute_before_storage_effects() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "clear-running").await;
+    let (service, runtime) = created_app_service(directory.path(), "clearrunning").await;
     let result = service
         .clear_app_storage_controlled(
             shared_types::UserappStage::Prod,
-            "clear-running",
+            "clearrunning",
             ClearStorageRequest {
                 user_id: "u-test".into(),
                 lifecycle_id: None,
@@ -3038,7 +3038,7 @@ async fn controlled_production_clear_refuses_existing_compute_before_storage_eff
     let operation = service
         .metadata
         .store
-        .get_operation_by_request("clear-running", "clear-running-request")
+        .get_operation_by_request("clearrunning", "clear-running-request")
         .await
         .expect("read")
         .expect("recorded rejection");
@@ -3049,12 +3049,12 @@ async fn controlled_production_clear_refuses_existing_compute_before_storage_eff
 #[tokio::test]
 async fn pending_storage_clear_reuses_operation_without_recreating_compute() {
     let directory = tempfile::tempdir().expect("directory");
-    let (mut service, runtime) = created_app_service(directory.path(), "recover-clear").await;
+    let (mut service, runtime) = created_app_service(directory.path(), "recoverclear").await;
     service.config.access_mode = AppAccessMode::Kubernetes;
-    runtime.deployments.remove("recover-clear");
+    runtime.deployments.remove("recoverclear");
     let pending = admit_recovery_control(
         &service,
-        "recover-clear",
+        "recoverclear",
         shared_types::UserAppControlCommand::ClearStorage { production: true },
     )
     .await;
@@ -3075,7 +3075,7 @@ async fn pending_storage_clear_reuses_operation_without_recreating_compute() {
     let completed = service
         .metadata
         .store
-        .get_operation("recover-clear", &pending.operation_id)
+        .get_operation("recoverclear", &pending.operation_id)
         .await
         .expect("read")
         .expect("record");
@@ -3087,7 +3087,7 @@ async fn pending_storage_clear_reuses_operation_without_recreating_compute() {
     assert_eq!(completed.command, pending.command);
     assert_eq!(
         service
-            .get_lifecycle("recover-clear", "u-test")
+            .get_lifecycle("recoverclear", "u-test")
             .await
             .expect("identity")
             .state,
@@ -3099,14 +3099,14 @@ async fn pending_storage_clear_reuses_operation_without_recreating_compute() {
 async fn pending_configuration_recovery_uses_private_resolved_input_once() {
     for update in [false, true] {
         let directory = tempfile::tempdir().expect("directory");
-        let (service, runtime) = created_app_service(directory.path(), "recover-config").await;
+        let (service, runtime) = created_app_service(directory.path(), "recoverconfig").await;
         let identity = service
-            .get_lifecycle("recover-config", "u-test")
+            .get_lifecycle("recoverconfig", "u-test")
             .await
             .expect("identity");
         let mut params = runtime
             .create_params_history
-            .get("recover-config")
+            .get("recoverconfig")
             .expect("history")[0]
             .clone();
         params.execution_context = None;
@@ -3118,12 +3118,12 @@ async fn pending_configuration_recovery_uses_private_resolved_input_once() {
         let previous = if update {
             Some(
                 service
-                    .fetch_runtime_status_or_err("recover-config")
+                    .fetch_runtime_status_or_err("recoverconfig")
                     .await
                     .expect("prior state"),
             )
         } else {
-            runtime.deployments.remove("recover-config");
+            runtime.deployments.remove("recoverconfig");
             None
         };
         let input = shared_types::UserAppExecutionInput::new(
@@ -3179,7 +3179,7 @@ async fn pending_configuration_recovery_uses_private_resolved_input_once() {
         assert_eq!(runtime.create_calls.load(Ordering::SeqCst), before + 1);
         let env = runtime
             .create_params_history
-            .get("recover-config")
+            .get("recoverconfig")
             .expect("history")
             .last()
             .expect("latest")
@@ -3193,7 +3193,7 @@ async fn pending_configuration_recovery_uses_private_resolved_input_once() {
         let completed = service
             .metadata
             .store
-            .get_operation("recover-config", &pending.operation_id)
+            .get_operation("recoverconfig", &pending.operation_id)
             .await
             .expect("read")
             .expect("operation");
@@ -3216,21 +3216,21 @@ async fn pending_configuration_recovery_uses_private_resolved_input_once() {
 #[tokio::test]
 async fn completed_deploy_replay_is_idempotent() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "replay-idempotent").await;
+    let (service, runtime) = created_app_service(directory.path(), "replayidempotent").await;
     let request = StartAppRequest {
         user_id: "u-test".into(),
-        request_id: Some("replay-locked".into()),
+        request_id: Some("replaylocked".into()),
         ..Default::default()
     };
     let first = service
-        .start_app_enhanced("replay-idempotent", request.clone())
+        .start_app_enhanced("replayidempotent", request.clone())
         .await
         .expect("first control");
     let create_before = runtime.create_calls.load(Ordering::SeqCst);
     let policy_before = runtime.policy_calls.load(Ordering::SeqCst);
 
     let replayed = service
-        .start_app_enhanced("replay-idempotent", request)
+        .start_app_enhanced("replayidempotent", request)
         .await
         .expect("replay must return stored result");
     assert_eq!(
@@ -3253,7 +3253,7 @@ async fn completed_deploy_replay_is_idempotent() {
 async fn enhanced_start_and_restart_deduplicate_complete_policy_intent() {
     for restart in [false, true] {
         let directory = tempfile::tempdir().expect("directory");
-        let (service, runtime) = created_app_service(directory.path(), "composite-start").await;
+        let (service, runtime) = created_app_service(directory.path(), "compositestart").await;
         let request = StartAppRequest {
             user_id: "u-test".into(),
             request_id: Some("complete-control".into()),
@@ -3262,21 +3262,21 @@ async fn enhanced_start_and_restart_deduplicate_complete_policy_intent() {
         };
         let first = if restart {
             service
-                .restart_app_enhanced("composite-start", request.clone())
+                .restart_app_enhanced("compositestart", request.clone())
                 .await
         } else {
             service
-                .start_app_enhanced("composite-start", request.clone())
+                .start_app_enhanced("compositestart", request.clone())
                 .await
         }
         .expect("control");
         let second = if restart {
             service
-                .restart_app_enhanced("composite-start", request.clone())
+                .restart_app_enhanced("compositestart", request.clone())
                 .await
         } else {
             service
-                .start_app_enhanced("composite-start", request.clone())
+                .start_app_enhanced("compositestart", request.clone())
                 .await
         }
         .expect("replay");
@@ -3292,7 +3292,7 @@ async fn enhanced_start_and_restart_deduplicate_complete_policy_intent() {
         let record = service
             .metadata
             .store
-            .get_operation_by_request("composite-start", "complete-control")
+            .get_operation_by_request("compositestart", "complete-control")
             .await
             .unwrap()
             .unwrap();
@@ -3307,7 +3307,7 @@ async fn enhanced_start_and_restart_deduplicate_complete_policy_intent() {
         assert_eq!(record.checkpoint["idle_timeout_seconds"], 812);
         assert_eq!(
             service
-                .get_lifecycle("composite-start", "u-test")
+                .get_lifecycle("compositestart", "u-test")
                 .await
                 .unwrap()
                 .runtime_policy
@@ -3320,10 +3320,10 @@ async fn enhanced_start_and_restart_deduplicate_complete_policy_intent() {
         };
         let error = if restart {
             service
-                .restart_app_enhanced("composite-start", changed)
+                .restart_app_enhanced("compositestart", changed)
                 .await
         } else {
-            service.start_app_enhanced("composite-start", changed).await
+            service.start_app_enhanced("compositestart", changed).await
         }
         .expect_err("changed intent");
         assert!(matches!(error, AppOperationError::Conflict(_)));
@@ -3334,22 +3334,22 @@ async fn enhanced_start_and_restart_deduplicate_complete_policy_intent() {
 #[tokio::test]
 async fn pending_composite_deployment_recovers_original_control_and_completion() {
     let directory = tempfile::tempdir().expect("directory");
-    let (service, runtime) = created_app_service(directory.path(), "recover-composite").await;
+    let (service, runtime) = created_app_service(directory.path(), "recovercomposite").await;
     let request = StartAppRequest {
         user_id: "u-test".into(),
-        request_id: Some("recover-complete".into()),
+        request_id: Some("recovercomplete".into()),
         idle_timeout_seconds: Some(714),
         ..Default::default()
     };
     let previous = service
-        .fetch_runtime_status_or_err("recover-composite")
+        .fetch_runtime_status_or_err("recovercomposite")
         .await
         .unwrap();
     let input = shared_types::UserAppExecutionInput::new(serde_json::to_string(&serde_json::json!({
         "version": 1, "request": request, "params": null, "previous": previous, "restart": false,
     })).unwrap());
     let identity = service
-        .get_lifecycle("recover-composite", "u-test")
+        .get_lifecycle("recovercomposite", "u-test")
         .await
         .unwrap();
     use sha2::Digest as _;
@@ -3386,7 +3386,7 @@ async fn pending_composite_deployment_recovers_original_control_and_completion()
     };
     assert!(service.resume_pending_control(&pending).await.unwrap());
     let replay = service
-        .start_app_enhanced("recover-composite", request)
+        .start_app_enhanced("recovercomposite", request)
         .await
         .unwrap();
     assert_eq!(

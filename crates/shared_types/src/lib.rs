@@ -131,6 +131,11 @@ pub use validation::{
     validate_agent_work_dir_for_service, validate_identifier,
 };
 
+pub use userapp::builder_instance::{
+    USERAPP_BUILDER_INSTANCE_ID_MAX_LEN, builder_instance_id, parse_builder_instance_id,
+    validate_builder_instance_id,
+};
+
 // Userapp 日志域契约（rcoder ↔ app-cli 单一事实源；OpenAPI schema 同源派生）
 pub mod app_cli_logs;
 pub use app_cli_logs::{

@@ -364,11 +364,11 @@ mod tests {
     async fn deploy_list_cache_hits_within_ttl() {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MockRuntime::default());
-        deployed(&runtime, "app-a");
+        deployed(&runtime, "appa");
         let svc = test_service(tmp.path(), runtime.clone()).await;
 
-        let r1 = owned_list(&svc, "app-a", "u1").await;
-        let r2 = owned_list(&svc, "app-a", "u1").await;
+        let r1 = owned_list(&svc, "appa", "u1").await;
+        let r2 = owned_list(&svc, "appa", "u1").await;
         assert_eq!(r1, 1);
         assert_eq!(r2, 1);
         assert_eq!(
@@ -383,15 +383,15 @@ mod tests {
     async fn deploy_list_cache_invalidated_by_writes() {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MockRuntime::default());
-        deployed(&runtime, "app-a");
+        deployed(&runtime, "appa");
         let svc = test_service(tmp.path(), runtime.clone()).await;
 
-        owned_list(&svc, "app-a", "u1").await;
-        deployed(&runtime, "app-b"); // 模拟并发新建（绕过 service 写路径）
+        owned_list(&svc, "appa", "u1").await;
+        deployed(&runtime, "appb"); // 模拟并发新建（绕过 service 写路径）
         svc.invalidate_deploy_cache().await;
         // 两个 app 都注册给同一 owner 后对账
         svc.metadata
-            .record("app-b", None, Some("u1".to_string()), None, None)
+            .record("appb", None, Some("u1".to_string()), None, None)
             .await
             .expect("metadata registration");
         let r = svc.list_app_runtimes("u1").await.unwrap();
@@ -404,10 +404,10 @@ mod tests {
     async fn deploy_list_cache_expires_after_ttl() {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MockRuntime::default());
-        deployed(&runtime, "app-a");
+        deployed(&runtime, "appa");
         let svc = test_service(tmp.path(), runtime.clone()).await;
 
-        owned_list(&svc, "app-a", "u1").await;
+        owned_list(&svc, "appa", "u1").await;
         // 把缓存时间戳拨回 TTL 之前，模拟过期
         {
             let mut guard = svc.deploy_list_cache.lock().await;
@@ -416,7 +416,7 @@ mod tests {
                     - (AppService::DEPLOY_LIST_TTL + Duration::from_secs(1));
             }
         }
-        owned_list(&svc, "app-a", "u1").await;
+        owned_list(&svc, "appa", "u1").await;
         assert_eq!(
             runtime.list_calls.load(Ordering::Relaxed),
             2,

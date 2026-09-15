@@ -23,7 +23,9 @@ use crate::runtime::kubernetes_runtime::KubernetesRuntime;
 #[cfg(feature = "kubernetes")]
 impl KubernetesRuntime {
     /// PVC ensure 核心（workspace 卷）：存在检查/terminating
-    /// 等待/SC 漂移可见/创建重试。`service_type_label` 仅作为 PVC label 值。
+    /// 等待/SC 漂移可见/创建重试。`service_type_label` 仅作为 PVC label 值；
+    /// `extra_labels` 供按业务维度聚合（builder 复合键时代的 app-id/identifier
+    /// ——孤儿 PVC 的聚合清理依赖 label 而非从 STS 反查）。
     pub(super) async fn ensure_pvc_core(
         &self,
         pvc_name: &str,
@@ -32,6 +34,7 @@ impl KubernetesRuntime {
         storage_class_name: Option<String>,
         storage_size: &str,
         context: Option<&shared_types::UserAppExecutionContext>,
+        extra_labels: &[(String, String)],
     ) -> ContainerRuntimeResult<()> {
         // Check if PVC already exists and its state
         let (pvc_status, existing_sc) = match self.pvcs().get(pvc_name).await {
@@ -195,6 +198,9 @@ impl KubernetesRuntime {
                         "rcoder-runtime".to_string(),
                     );
                     m.insert("service_type".to_string(), service_type_label.to_string());
+                    for (k, v) in extra_labels {
+                        m.insert(k.clone(), v.clone());
+                    }
                     m
                 }),
                 ..Default::default()

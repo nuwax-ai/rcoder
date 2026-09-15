@@ -33,7 +33,7 @@ mod tests {
 
     #[test]
     fn identifier_accepts_valid() {
-        assert!(identifier("app-Order_01", &()).is_ok());
+        assert!(identifier("appOrder_01", &()).is_ok());
     }
 
     #[test]

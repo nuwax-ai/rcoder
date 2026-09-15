@@ -18,8 +18,16 @@ pub struct ContainerCreateParams {
     /// Explicit durable proof for an adopted legacy builder resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_binding: Option<shared_types::UserAppResourceBinding>,
-    /// Project identifier (used as container name base for RCoder service)
+    /// Project identifier (used as container name base for RCoder service)。
+    /// UserappBuilder 场景此槽位装复合实例串 `{user_id}-{app_id}`（命名链
+    /// 单一事实源）——**容器内契约消费方（env 注入等）不得直接用本字段**，
+    /// 改用 [`Self::builder_app_id`]（显式纯段，语义不重载）。
     pub project_id: Option<String>,
+    /// UserappBuilder 的纯 app_id 段（容器内契约：agent_runner profiler 标签、
+    /// PROJECT_ID env 等）。仅 builder 创建路径填充；None=非 builder 或存量
+    /// 路径（消费方回落 project_id 右切，兼容存量裸 app_id 形态）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_app_id: Option<String>,
     /// User identifier (used as container name base for ComputerAgentRunner)
     pub user_id: Option<String>,
     /// Service type determining container purpose
@@ -124,6 +132,7 @@ pub struct ContainerCreateParamsBuilder {
     execution_context: Option<shared_types::UserAppExecutionContext>,
     resource_binding: Option<shared_types::UserAppResourceBinding>,
     project_id: Option<String>,
+    builder_app_id: Option<String>,
     user_id: Option<String>,
     service_type: Option<ServiceType>,
     resource_limits: Option<ServiceResourceLimits>,
@@ -153,6 +162,12 @@ impl ContainerCreateParamsBuilder {
         self.execution_context = Some(context);
         self
     }
+    /// UserappBuilder 容器内契约的纯 app_id（显式传值，避免 project_id 复用歧义）。
+    pub fn builder_app_id(mut self, app_id: impl Into<String>) -> Self {
+        self.builder_app_id = Some(app_id.into());
+        self
+    }
+
     pub fn project_id(mut self, project_id: impl Into<String>) -> Self {
         self.project_id = Some(project_id.into());
         self
@@ -254,6 +269,7 @@ impl ContainerCreateParamsBuilder {
             mutation_target: None,
             resource_binding: self.resource_binding,
             project_id: self.project_id,
+            builder_app_id: self.builder_app_id,
             user_id: self.user_id,
             service_type: self.service_type.unwrap_or(ServiceType::WebAgentRunner),
             resource_limits: self.resource_limits,

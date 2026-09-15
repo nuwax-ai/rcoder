@@ -78,20 +78,26 @@ pub(super) fn validate_upload_target(target: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// 校验 app_id 格式（DNS-1123 label，≤ USERAPP_APP_ID_MAX_LEN）
+/// 校验 app_id 格式（小写字母数字，≤ USERAPP_APP_ID_MAX_LEN）
 ///
 /// app_id 直接来自 HTTP 路径参数，会流入文件系统路径拼接（delete/upload/logs/list）。
-/// 此校验是路径穿越的纵深防御（Fail Fast）：白名单字符集 `[a-z0-9-]` 天然排除
+/// 此校验是路径穿越的纵深防御（Fail Fast）：白名单字符集 `[a-z0-9]` 天然排除
 /// `..`、`/`、绝对路径，避免恶意 app_id 触达工作空间目录之外。
 ///
-/// 不强制 `app-` 前缀：create_app 缺省自动生成 `app-{8hex}`，外部也可指定自有
+/// 不强制 `app` 前缀：create_app 缺省自动生成 `app{8hex}`，外部也可指定自有
 /// 体系 ID（如 Java 侧数值 project_id，≤20 位）。两者命名空间不冲突——下游无
-/// `strip_prefix("app-")` 归一化，`app-123` 与 `123` 是两个独立 app；create 侧
+/// `strip_prefix("app")` 归一化，`app123` 与 `123` 是两个独立 app；create 侧
 /// 另有唯一性检查兜底。
 ///
-/// 长度上限 33（`USERAPP_APP_ID_MAX_LEN`）：K8s 下 builder STS pod 的
-/// controller-revision-hash label = `rcoder-app-builder-{app_id}-{10位hash}`
-/// 受 K8s 63 字节限，超长 app_id 创建必然失败且表象含糊——入口拒绝。
+/// **禁 `-`（builder 复合键结构性要求）**：dev builder 容器以
+/// `{user_id}-{app_id}` 复合 identifier 定位（见
+/// `shared_types::builder_instance_id`），唯一可用分隔符是 `-`（K8s svc 名
+/// DNS-1035 不允许 `.`/`_`），app_id 段含 `-` 会使复合串解析歧义——入口拒绝。
+///
+/// 长度上限 22（`USERAPP_APP_ID_MAX_LEN`）：K8s 下 builder STS pod 的
+/// controller-revision-hash label = `rcoder-app-builder-{user_id}-{app_id}-{10位hash}`
+/// 受 K8s 63 字节限（user_id 现网 10 位），超长复合 id 创建必然失败且表象
+/// 含糊——入口拒绝。
 pub(super) fn validate_app_id(app_id: &str) -> AppResult<()> {
     if app_id.is_empty() {
         return Err(AppOperationError::Validation(
@@ -106,20 +112,16 @@ pub(super) fn validate_app_id(app_id: &str) -> AppResult<()> {
             shared_types::USERAPP_APP_ID_MAX_LEN
         )));
     }
-    // DNS-1123 label 合规（[a-z0-9]([-a-z0-9]*[a-z0-9])?；支持 app-order-svc、
-    // 纯数值 project_id 等，首尾约束见下）
+    // 小写字母数字（builder 复合键要求 app_id 段无 '-'，见函数文档；
+    // 支持纯数值 project_id 与 app{8hex} 缺省生成）
     if !app_id
         .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     {
         return Err(AppOperationError::Validation(format!(
-            "invalid app_id: must be DNS-1123 label (lowercase alphanumeric or '-', got '{app_id}')"
+            "invalid app_id: must be lowercase alphanumeric (no '-'; builder instance \
+             composite id requirement, got '{app_id}')"
         )));
-    }
-    if app_id.starts_with('-') || app_id.ends_with('-') {
-        return Err(AppOperationError::Validation(
-            "invalid app_id: must not start/end with '-'".to_string(),
-        ));
     }
     Ok(())
 }
@@ -248,27 +250,28 @@ mod tests {
 
     #[test]
     fn validate_app_id_ok() {
-        assert!(validate_app_id("app-order-svc").is_ok());
-        assert!(validate_app_id("app-1a2b3c4d").is_ok());
-        assert!(validate_app_id("app-a").is_ok()); // 最短合法
+        assert!(validate_app_id("appordersvc").is_ok());
+        assert!(validate_app_id("app1a2b3c4d").is_ok());
+        assert!(validate_app_id("appa").is_ok()); // 最短合法
         // 外部自有体系 ID：纯数值（Java 侧 project_id，≤20 位）
         assert!(validate_app_id("1234567890123456789").is_ok());
         assert!(validate_app_id("123").is_ok());
-        // 上限边界：恰好 33 字符
-        let edge = format!("app-{}", "x".repeat(29));
+        // 上限边界：恰好 22 字符
+        let edge = format!("app{}", "x".repeat(19));
         assert_eq!(edge.len(), shared_types::USERAPP_APP_ID_MAX_LEN);
         assert!(validate_app_id(&edge).is_ok());
     }
 
     #[test]
     fn validate_app_id_err_too_long() {
-        // 超 33：K8s builder STS revision-hash label 超 63 字节必炸，
+        // 超 22：K8s builder STS revision-hash label 超 63 字节必炸
+        //（复合 identifier {user_id}-{app_id} 预算），
         // 入口 Fail Fast（而非 apiserver FailedCreate 含糊表象）
-        let too_long = format!("app-{}", "x".repeat(30));
+        let too_long = format!("app{}", "x".repeat(20));
         let err = validate_app_id(&too_long).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("USERAPP_APP_ID_MAX_LEN") || msg.contains("33"),
+            msg.contains("USERAPP_APP_ID_MAX_LEN") || msg.contains("22"),
             "报错应带上限指引: {msg}"
         );
     }
@@ -281,26 +284,28 @@ mod tests {
 
     #[test]
     fn validate_app_id_err_bare_prefix() {
-        // 裸 "app-"（尾部 '-'）非法
+        // 裸 "app"（无 '-' 前缀时代尾部 '-'）现为合法短 id；
+        // 连字符拒绝改由本用例锚定
+        assert!(validate_app_id("app").is_ok());
         assert!(validate_app_id("app-").is_err());
     }
 
     #[test]
     fn validate_app_id_err_uppercase() {
         // 大写非法（DNS-1123 label）
-        assert!(validate_app_id("app-UPPER").is_err());
+        assert!(validate_app_id("appUPPER").is_err());
     }
 
     #[test]
     fn validate_app_id_err_path_traversal() {
         // 含 ../ 等穿越字符
-        assert!(validate_app_id("app-../../../etc").is_err());
+        assert!(validate_app_id("app../../../etc").is_err());
     }
 
     #[test]
     fn validate_app_id_err_trailing_dash() {
         // 尾部 '-' 非法
-        assert!(validate_app_id("app-trailing-").is_err());
+        assert!(validate_app_id("apptrailing-").is_err());
     }
 
     // ---------------- validate_upload_target ----------------

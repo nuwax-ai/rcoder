@@ -261,7 +261,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            svc.start_app_enhanced("app-validation", invalid)
+            svc.start_app_enhanced("appvalidation", invalid)
                 .await
                 .is_err()
         );
@@ -277,7 +277,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            svc.start_app_enhanced("app-validation", forged)
+            svc.start_app_enhanced("appvalidation", forged)
                 .await
                 .is_err()
         );
@@ -327,7 +327,7 @@ mod tests {
             env: Some([("APP_FOO".to_string(), "1".to_string())].into()),
             ..Default::default()
         };
-        let result = svc.start_app_enhanced("app-empty-1", request).await;
+        let result = svc.start_app_enhanced("appempty1", request).await;
         assert!(
             result.is_ok(),
             "empty app provisioning must succeed: {result:?}"
@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(
             runtime
                 .create_params_history
-                .get("app-empty-1")
+                .get("appempty1")
                 .expect("creation history")
                 .len(),
             1
@@ -352,7 +352,7 @@ mod tests {
         );
         // owner 落 metadata：后续 Docker 数据卷分区（prod/{user}/data/{app}）依据
         assert_eq!(
-            svc.get_app_owner("app-empty-1")
+            svc.get_app_owner("appempty1")
                 .await
                 .expect("owner query")
                 .as_deref(),
@@ -362,7 +362,7 @@ mod tests {
         // no deployment identity is injected for an empty application.
         let params = runtime
             .create_params_history
-            .get("app-empty-1")
+            .get("appempty1")
             .and_then(|v| v.first().cloned())
             .expect("create params must be captured");
         let env = params.env.as_ref().expect("env captured");
@@ -388,7 +388,7 @@ mod tests {
         let svc = test_service(tmp.path(), runtime.clone()).await;
 
         let err = svc
-            .start_app_enhanced("app-empty-2", StartAppRequest::default())
+            .start_app_enhanced("appempty-2", StartAppRequest::default())
             .await
             .expect_err("empty user_id must be rejected");
         assert!(
@@ -405,9 +405,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MockRuntime::default());
         runtime.deployments.insert(
-            "app-exist-1".into(),
+            "appexist1".into(),
             container_runtime_api::DeploymentStatus {
-                app_id: "app-exist-1".into(),
+                app_id: "appexist1".into(),
                 replicas: 0,
                 ready_replicas: 0,
                 phase: "Stopped".into(),
@@ -418,7 +418,7 @@ mod tests {
 
         let result = svc
             .start_app_enhanced(
-                "app-exist-1",
+                "appexist1",
                 StartAppRequest {
                     user_id: "u1".into(),
                     ..Default::default()
@@ -445,15 +445,15 @@ mod env_contract_tests {
         let root = tempfile::tempdir().expect("workspace");
         let runtime = Arc::new(MockRuntime::default());
         runtime.deployments.insert(
-            "env-app".into(),
+            "envapp".into(),
             container_runtime_api::DeploymentStatus {
-                app_id: "env-app".into(),
+                app_id: "envapp".into(),
                 phase: "Running".into(),
                 ..Default::default()
             },
         );
         runtime.specs.insert(
-            "env-app".into(),
+            "envapp".into(),
             container_runtime_api::ContainerSpecSnapshot {
                 env: Some(HashMap::from([
                     ("BUSINESS".into(), "A".into()),
@@ -469,7 +469,7 @@ mod env_contract_tests {
         })).expect("request")
         };
         let error = service
-            .start_app_enhanced("env-app", request("B"))
+            .start_app_enhanced("envapp", request("B"))
             .await
             .expect_err("reject before deployment");
         assert_eq!(
@@ -489,7 +489,7 @@ mod env_contract_tests {
             0
         );
         let accepted = service
-            .validate_hot_env("env-app", request("A"))
+            .validate_hot_env("envapp", request("A"))
             .await
             .expect("same env");
         assert!(

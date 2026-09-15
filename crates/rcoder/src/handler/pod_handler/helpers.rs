@@ -490,6 +490,10 @@ pub(crate) fn is_container_running(status: &str) -> bool {
 /// project 映射优先（带归属交叉校验），miss 走 UserappBuilder 实时查（只读，
 /// 不触发探活/ensure 自愈）。
 ///
+/// 定位键 = 复合 identifier `{user_id}-{app_id}`（协作模型多实例）：显式
+/// user_id 是实例定位者，缺失回落 metadata owner（与 ensure 链同源语义）；
+/// 双缺（无显式且 app 无 identity）= 无容器可定位，归 `Ok(None)`。
+///
 /// - `Ok(Some)`：定位成功
 /// - `Ok(None)`：容器不存在（调用方决定 not_alive / ERR_CONTAINER_NOT_FOUND）
 /// - `Err`：runtime 故障（500 透传——不吞错误伪装"不存在"，防客户端误判
@@ -497,10 +501,31 @@ pub(crate) fn is_container_running(status: &str) -> bool {
 pub(crate) async fn resolve_userapp_dev_container(
     state: &AppState,
     app_id: &str,
+    user_id: Option<&str>,
     log_tag: &str,
 ) -> Result<Option<ContainerBasicInfo>, AppError> {
-    if let Some(info) = state.get_project(app_id).and_then(|p| p.container_info()) {
-        return crate::userapp_builder::cross_verify_registration(state, app_id, &info)
+    let metadata_owner = state
+        .app_service
+        .get_app_owner(app_id)
+        .await
+        .map_err(|error| {
+            AppError::internal_server_error(&format!("Resolve app owner: {error:#}"))
+        })?;
+    let instance =
+        match crate::userapp_builder::resolve_dev_target(user_id, metadata_owner.as_deref()) {
+            Ok(target) => target.instance_id(app_id).map_err(|error| {
+                AppError::internal_server_error(&format!("Compose builder instance id: {error}"))
+            })?,
+            Err(_) => {
+                info!("📭 [{log_tag}] no dev instance user resolvable: app_id={app_id}");
+                return Ok(None);
+            }
+        };
+    if let Some(info) = state
+        .get_project(&instance)
+        .and_then(|p| p.container_info())
+    {
+        return crate::userapp_builder::cross_verify_registration(state, app_id, &instance, &info)
             .await
             .map_err(|error| {
                 AppError::internal_server_error(&format!("Verify builder identity: {error:#}"))
@@ -508,12 +533,14 @@ pub(crate) async fn resolve_userapp_dev_container(
     }
     match state
         .runtime()
-        .get_container_info_by_identifier(app_id, &ServiceType::UserappBuilder)
+        .get_container_info_by_identifier(&instance, &ServiceType::UserappBuilder)
         .await
     {
         Ok(info) => {
             if info.is_none() {
-                info!("📭 [{log_tag}] dev builder container not found: app_id={app_id}");
+                info!(
+                    "📭 [{log_tag}] dev builder container not found: app_id={app_id}, instance={instance}"
+                );
             }
             Ok(info)
         }

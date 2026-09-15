@@ -702,7 +702,12 @@ impl crate::service::AppService {
             AppOperationError::Backend(format!("capture userapp dev deletion: {error}"))
         })?;
         let receipt = deletion.receipt();
-        if receipt.runtime.app_id != app_id {
+        // snapshot 携带 owner 实例复合 identifier（`{owner}-{app_id}`）——
+        // 归属校验按复合键的 app 段还原比对
+        let snapshot_app = shared_types::parse_builder_instance_id(&receipt.runtime.app_id)
+            .map(|(_, app)| app)
+            .unwrap_or(receipt.runtime.app_id.as_str());
+        if snapshot_app != app_id {
             return Err(AppOperationError::Conflict(
                 "Captured development deletion belongs to another application".into(),
             ));
@@ -1016,7 +1021,9 @@ impl crate::service::AppService {
         entries.sort();
         let app_ids_filter = filters.app_ids.as_deref();
         let orphan_only = filters.orphan_only.unwrap_or(false);
-        // dev 在跑判定（探测通道缺失时保守判"在"→非 orphan）
+        // dev 在跑判定（探测通道缺失时保守判"在"→非 orphan）。
+        // 多实例协作模型：owner 实例回落档（orphan 全量语义见 destroy 链的
+        // app-id 聚合扫描；此处列表按 owner 过滤，owner 视角自洽）。
         async fn dev_alive(
             locator: &Option<std::sync::Arc<dyn shared_types::UserappDevLocator>>,
             app_id: &str,
@@ -1025,7 +1032,7 @@ impl crate::service::AppService {
                 AppOperationError::Backend("Dev locator is not configured".into())
             })?;
             locator
-                .dev_container_alive(app_id)
+                .dev_container_alive(app_id, None)
                 .await
                 .map_err(AppOperationError::Backend)
         }
@@ -1137,7 +1144,7 @@ impl crate::service::AppService {
             .clone()
             .ok_or_else(|| AppOperationError::Backend("Dev locator is not configured".into()))?;
         Ok(!locator
-            .dev_container_alive(app_id)
+            .dev_container_alive(app_id, None)
             .await
             .map_err(AppOperationError::Backend)?)
     }
@@ -1161,7 +1168,11 @@ mod tests {
         ) -> Result<String, String> {
             Ok("http://127.0.0.1:60000".to_string())
         }
-        async fn dev_container_alive(&self, _app_id: &str) -> Result<bool, String> {
+        async fn dev_container_alive(
+            &self,
+            _app_id: &str,
+            _: Option<&str>,
+        ) -> Result<bool, String> {
             Ok(true)
         }
     }
@@ -1177,7 +1188,7 @@ mod tests {
         service
             .set_dev_locator(Arc::new(StubDevLocator))
             .expect("locator");
-        for app in ["app-1", "app-dev", "app-prod"] {
+        for app in ["app1", "appdev", "appprod"] {
             service
                 .metadata
                 .record(app, None, Some("u1".into()), None, None)
@@ -1187,19 +1198,19 @@ mod tests {
 
         service
             .metadata
-            .record("app-1", None, Some("u1".into()), None, None)
+            .record("app1", None, Some("u1".into()), None, None)
             .await
             .expect("register owner");
         service
-            .get_app_storage(UserappStage::Prod, "app-1")
+            .get_app_storage(UserappStage::Prod, "app1")
             .await
             .expect("prod storage");
         service
-            .get_app_storage(UserappStage::Dev, "app-1")
+            .get_app_storage(UserappStage::Dev, "app1")
             .await
             .expect("dev storage");
 
-        let calls = runtime.volume_name_calls.get("app-1").expect("calls");
+        let calls = runtime.volume_name_calls.get("app1").expect("calls");
         assert_eq!(
             *calls,
             vec!["Userapp".to_string(), "UserappBuilder".to_string()],
@@ -1214,16 +1225,16 @@ mod tests {
         let runtime = Arc::new(MockRuntime::default());
         runtime
             .workspace_ids
-            .insert("UserappBuilder".to_string(), vec!["app-dev".to_string()]);
+            .insert("UserappBuilder".to_string(), vec!["appdev".to_string()]);
         runtime
             .workspace_ids
-            .insert("Userapp".to_string(), vec!["app-prod".to_string()]);
+            .insert("Userapp".to_string(), vec!["appprod".to_string()]);
         let root = tempfile::tempdir().expect("test root");
         let service = test_service(root.path(), runtime.clone()).await;
         service
             .set_dev_locator(Arc::new(StubDevLocator))
             .expect("locator");
-        for app in ["app-1", "app-dev", "app-prod"] {
+        for app in ["app1", "appdev", "appprod"] {
             service
                 .metadata
                 .record(app, None, Some("u1".into()), None, None)
@@ -1250,7 +1261,7 @@ mod tests {
                 .iter()
                 .map(|i| i.app_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["app-dev"],
+            vec!["appdev"],
             "dev 清单只含开发卷"
         );
 
@@ -1272,7 +1283,7 @@ mod tests {
                 .iter()
                 .map(|i| i.app_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["app-prod"],
+            vec!["appprod"],
             "prod 清单只含运行卷"
         );
     }

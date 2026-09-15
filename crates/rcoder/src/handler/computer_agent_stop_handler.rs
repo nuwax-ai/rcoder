@@ -301,9 +301,13 @@ async fn stop_userapp_dev(
     app_id: &str,
     request: &ComputerAgentStopRequest,
 ) -> Result<HttpResult<ComputerAgentStopResponse>, AppError> {
-    let Some(container_info) =
-        super::pod_handler::resolve_userapp_dev_container(state, app_id, "COMPUTER_STOP][USERAPP")
-            .await?
+    let Some(container_info) = super::pod_handler::resolve_userapp_dev_container(
+        state,
+        app_id,
+        request.user_id.as_deref(),
+        "COMPUTER_STOP][USERAPP",
+    )
+    .await?
     else {
         warn!("[COMPUTER_STOP][USERAPP] dev builder container not found: app_id={app_id}");
         return Ok(HttpResult::error_with_locale(

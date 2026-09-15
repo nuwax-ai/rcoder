@@ -57,6 +57,15 @@ pub trait AgentContainerRuntime: Send + Sync {
             "identity-bound builder deletion unsupported".into(),
         ))
     }
+
+    /// 按 app 维度枚举全部 builder 实例 identifier（协作模型多实例——同 app
+    /// 每用户独立容器，复合键 `{user_id}-{app_id}`）。destroy 链清盘用：
+    /// owner 实例之外还要清扫全部协作者实例及其 PVC。
+    /// K8s 按 `rcoder.io/app-id` label（STS + PVC）；Docker 按容器名前缀解析。
+    /// 默认空（后端不支持时 destroy 仅覆盖 owner 实例，调用方自行告警）。
+    async fn find_builder_instances(&self, _app_id: &str) -> ContainerRuntimeResult<Vec<String>> {
+        Ok(Vec::new())
+    }
     async fn delete_builder_snapshot(
         &self,
         _snapshot: &shared_types::BuilderDeletionSnapshot,
