@@ -77,11 +77,11 @@ impl AppService {
             request.name, app_id, self.config.access_mode
         );
         self.metadata
-            .validate_request_lifecycle(app_id, &request.user_id, request.lifecycle_id.as_deref())
+            .validate_request_lifecycle(app_id), request.lifecycle_id.as_deref())
             .await?;
-        request.user_id = self
+        String::new() = self
             .metadata
-            .owner_for_write(app_id, &request.user_id)
+            .owner_for_write(app_id, &String::new())
             .await?;
         use sha2::Digest as _;
         let fingerprint = hex::encode(sha2::Sha256::digest(
@@ -90,7 +90,6 @@ impl AppService {
             })?,
         ));
         let control = shared_types::UserAppControlRequest {
-            user_id: String::new(),
             lifecycle_id: request.lifecycle_id.clone(),
             request_id: request.request_id.clone(),
         };
@@ -136,7 +135,6 @@ impl AppService {
                     input_digest: input.digest(),
                 }),
                 app_id: app_id.into(),
-                user_id: String::new(),
                 lifecycle_id: request.lifecycle_id.clone(),
                 operation_id: Uuid::new_v4().to_string(),
                 request_id: request.request_id.clone(),
@@ -144,7 +142,6 @@ impl AppService {
                 kind: shared_types::UserAppOperationKind::Create,
                 metadata: Some(shared_types::UserAppMetadataPatch {
                     app_id: app_id.into(),
-                    user_id: String::new(),
                     lifecycle_id: identity.lifecycle_id,
                     expected_revision: identity.metadata_revision,
                     name: Some(Some(request.name.clone())),
@@ -158,7 +155,7 @@ impl AppService {
         let mutation = self
             .execute_creation(
                 app_id,
-                &request.user_id,
+                &String::new(),
                 params,
                 &mut operation,
                 _process_lock,
@@ -190,7 +187,7 @@ impl AppService {
         operation: &mut crate::service::OwnedOperation,
         guard: &crate::service::AppOperationGuard,
     ) -> AppResult<()> {
-        operation.bind_lease(guard, owner).await?;
+        operation.bind_lease(guard).await?;
         params.execution_context = Some(operation.execution_context());
         params
             .validate_execution_context()
@@ -376,7 +373,7 @@ impl AppService {
             }
         }
 
-        let access = self.build_access_info(&app_id, &ports, Some(&request.user_id));
+        let access = self.build_access_info(&app_id, &ports, Some(&String::new()));
         let health = runtime_status
             .as_ref()
             .map(health_from_status)

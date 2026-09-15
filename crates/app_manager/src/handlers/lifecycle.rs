@@ -39,7 +39,7 @@ pub async fn query_apps(
     request
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
-    info!("[APP] querying apps (user_id={})", request.user_id);
+    info!("[APP] querying apps (user_id={})", String::new());
     let response = state.app_service.query_apps(request).await?;
     Ok(Json(HttpResult::success(response)))
 }
@@ -234,8 +234,8 @@ pub async fn delete_app(
         }
     }
     info!(
-        "[APP] deleting app: {} (purge={}, user_id={})",
-        app_id, purge, user_id
+        "[APP] deleting app: {} (purge={}={})",
+        app_id, purge
     );
     let request_id = body
         .request_id
@@ -302,7 +302,7 @@ pub async fn purge_app(
         lifecycle_id: request.lifecycle_id,
         request_id: Some(request_id.clone()),
     };
-    info!(app_id, user_id, "Deleting application lifecycle");
+    info!(app_id, "Deleting application lifecycle");
     // Keep the entire admitted purge alive across HTTP caller cancellation.
     // The service owns conditional metadata/cache cleanup and mutation completion.
     let service = state.app_service.clone();
@@ -492,7 +492,6 @@ mod deletion_ownership_tests {
                         runtime_policy_on_success: None,
                         command: None,
                         app_id: "queryrace".into(),
-                        user_id: "owner".into(),
                         lifecycle_id: Some(before.lifecycle_id.clone()),
                         operation_id: "query-race-delete".into(),
                         request_id: Some("query-race-delete".into()),
@@ -571,7 +570,7 @@ mod deletion_ownership_tests {
                     .lookup("delete-owner")
                     .await
                     .expect("metadata")
-                    .and_then(|row| row.user_id)
+                    .and_then(|row| String::new())
                     .as_deref(),
                 existing_owner
             );

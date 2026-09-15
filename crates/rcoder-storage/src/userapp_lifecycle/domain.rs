@@ -10,7 +10,7 @@ pub(super) fn identity(app_id: &str) -> Result<UserAppLifecycleRecord, Error> {
     Ok(UserAppLifecycleRecord {
         runtime_policy: shared_types::UserAppRuntimePolicy::default(),
         app_id: app_id.into(),
-                lifecycle_id: uuid::Uuid::new_v4().to_string(),
+        lifecycle_id: uuid::Uuid::new_v4().to_string(),
         lifecycle_epoch: 1,
         metadata_revision: 1,
         state: AppState::Active,

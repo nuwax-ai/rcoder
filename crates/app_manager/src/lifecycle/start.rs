@@ -73,7 +73,6 @@ impl AppService {
     pub(super) async fn align_start_pg(
         &self,
         app_id: &str,
-        user_id: &str,
         cred: &StartPgCredential,
     ) -> AppResult<()> {
         self.align_db_credentials(
@@ -189,7 +188,6 @@ mod tests {
         let service = test_service(directory.path(), runtime.clone()).await;
         for url in ["", " ", "\t\n"] {
             let request = StartAppRequest {
-                user_id: "blank-owner".into(),
                 url: Some(url.into()),
                 ..Default::default()
             };
@@ -254,7 +252,6 @@ mod tests {
         let runtime = Arc::new(MockRuntime::default());
         let svc = test_service(tmp.path(), runtime.clone()).await;
         let invalid = StartAppRequest {
-            user_id: "u-test".into(),
             url: Some("http://localhost/artifact.zip".into()),
             sha256: Some("a".repeat(15) + "é"),
             ..Default::default()
@@ -265,7 +262,6 @@ mod tests {
                 .is_err()
         );
         let forged = StartAppRequest {
-            user_id: "u-test".into(),
             env: Some(
                 [(
                     shared_types::APP_DEPLOY_OPERATION_ID.into(),
@@ -322,7 +318,6 @@ mod tests {
         let svc = test_service(tmp.path(), runtime.clone()).await;
 
         let request = StartAppRequest {
-            user_id: "u-empty".into(),
             env: Some([("APP_FOO".to_string(), "1".to_string())].into()),
             ..Default::default()
         };
@@ -419,7 +414,6 @@ mod tests {
             .start_app_enhanced(
                 "appexist1",
                 StartAppRequest {
-                    user_id: "u1".into(),
                     ..Default::default()
                 },
             )

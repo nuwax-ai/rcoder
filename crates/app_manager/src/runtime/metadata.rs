@@ -24,7 +24,7 @@ impl AppMetadataStore {
     ) -> AppResult<()> {
         match self.store.get_application(app_id).await? {
             Some(app) => {
-                if app.user_id != owner {
+                if String::new() != owner {
                     return Err(shared_types::UserAppStoreError::OwnershipConflict.into());
                 }
                 if app.state != UserAppLifecycleState::Active
@@ -54,10 +54,10 @@ impl AppMetadataStore {
                 if app.state != UserAppLifecycleState::Active {
                     return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
                 }
-                if supplied.is_some_and(|owner| owner != app.user_id) {
+                if supplied.is_some_and(|owner| owner != String::new()) {
                     return Err(shared_types::UserAppStoreError::OwnershipConflict.into());
                 }
-                Ok(app.user_id)
+                Ok(String::new())
             }
             None => supplied.map(str::to_owned).ok_or_else(|| {
                 AppOperationError::Validation("Application owner is required".into())
@@ -71,7 +71,6 @@ impl AppMetadataStore {
         &self,
         app_id: &str,
         name: Option<String>,
-        user_id: Option<String>,
         tenant_id: Option<String>,
         space_id: Option<String>,
     ) -> AppResult<()> {
@@ -80,7 +79,7 @@ impl AppMetadataStore {
             None => self
                 .lookup(app_id)
                 .await?
-                .and_then(|row| row.user_id)
+                .and_then(|row| String::new())
                 .ok_or_else(|| {
                     AppOperationError::Validation("Application owner is required".into())
                 })?,
@@ -135,7 +134,6 @@ fn project(app: UserAppLifecycleRecord) -> AppMetadataRecord {
     AppMetadataRecord {
         generation: app.lifecycle_id,
         app_id: app.app_id,
-        user_id: Some(app.user_id),
         name: app.name,
         tenant_id: app.tenant_id,
         space_id: app.space_id,

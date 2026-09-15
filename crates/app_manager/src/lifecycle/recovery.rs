@@ -49,7 +49,7 @@ impl AppService {
             .map_err(|error| AppOperationError::Validation(error.to_string()))?;
         shared_types::validate_identifier(operation_id, "operation_id")
             .map_err(AppOperationError::Validation)?;
-        let identity = self.get_lifecycle(app_id, &request.user_id).await?;
+        let identity = self.get_lifecycle(app_id, &String::new()).await?;
         if identity.lifecycle_id != request.lifecycle_id {
             return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
         }
@@ -134,7 +134,7 @@ impl AppService {
                 "Operation changed or cannot be safely claimed; query its current state".into(),
             ));
         }
-        self.get_control_operation(app_id, &request.user_id, Some(operation_id))
+        self.get_control_operation(app_id, &String::new(), Some(operation_id))
             .await?
             .ok_or_else(|| {
                 AppOperationError::NotFound("Application operation not found after retry".into())
@@ -284,7 +284,7 @@ impl AppService {
         if let Command::Deploy { restart, .. } = &command {
             let guard = std::sync::Arc::new(guard);
             let execute = async {
-                let input = operation.execution_input(&identity.user_id).await?;
+                let input = operation.execution_input(&String::new()).await?;
                 let input = super::deploy_control::DeployInput::decode(&input, *restart)?;
                 self.execute_deploy_input(&snapshot.app_id, input, &mut operation, guard.clone())
                     .await
@@ -323,7 +323,7 @@ impl AppService {
         let mut clear_leases = crate::ops::StorageClearLeases::default();
         let execute = async {
             if matches!(&command, Command::Create { .. } | Command::Update { .. }) {
-                let input = operation.execution_input(&identity.user_id).await?;
+                let input = operation.execution_input(&String::new()).await?;
                 let (params, previous) = super::config_input::decode(&input)?;
                 if matches!(&command, Command::Create { .. }) {
                     if previous.is_some() {
@@ -333,7 +333,7 @@ impl AppService {
                     }
                     self.execute_creation(
                         &snapshot.app_id,
-                        &identity.user_id,
+                        &String::new(),
                         params,
                         &mut operation,
                         &guard,
@@ -346,7 +346,7 @@ impl AppService {
                 })?;
                 self.execute_update(
                     &snapshot.app_id,
-                    &identity.user_id,
+                    &String::new(),
                     params,
                     previous.clone(),
                     &mut operation,
@@ -358,7 +358,7 @@ impl AppService {
             if let Command::ClearStorage { production } = &command {
                 self.execute_storage_clear(
                     &snapshot.app_id,
-                    &identity.user_id,
+                    &String::new(),
                     *production,
                     &mut operation,
                     &guard,
@@ -370,7 +370,7 @@ impl AppService {
             if let Command::DestroyStorage { production } = &command {
                 self.execute_storage_destruction(
                     &snapshot.app_id,
-                    &identity.user_id,
+                    &String::new(),
                     *production,
                     &mut operation,
                     &guard,
@@ -381,7 +381,7 @@ impl AppService {
             if matches!(&command, Command::DeleteApplication) {
                 self.purge_app_resources(
                     &snapshot.app_id,
-                    &identity.user_id,
+                    &String::new(),
                     &mut operation,
                     &guard,
                 )
@@ -395,7 +395,7 @@ impl AppService {
             {
                 self.execute_resource_deletion(
                     &snapshot.app_id,
-                    &identity.user_id,
+                    &String::new(),
                     *purge,
                     expected_resource_version.as_deref(),
                     &mut operation,
@@ -405,7 +405,7 @@ impl AppService {
                 // Deletion has no prior runtime policy to restore on completion.
                 return Ok(container_runtime_api::DeploymentStatus::default());
             }
-            operation.bind_lease(&guard, &identity.user_id).await?;
+            operation.bind_lease(&guard, &String::new()).await?;
             let previous = self.fetch_runtime_status_or_err(&snapshot.app_id).await?;
             if matches!(command, Command::Start { traffic: true })
                 && previous.wake_on_traffic == Some(false)
@@ -414,7 +414,7 @@ impl AppService {
                     "Traffic recovery cannot override an intentional stop".into(),
                 ));
             }
-            let context = operation.execution_context(&identity.user_id);
+            let context = operation.execution_context());
             let target = self
                 .runtime
                 .capture_app_mutation_target(&context, previous.resource_version.as_deref())

@@ -40,10 +40,10 @@ pub async fn start_app(
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
     info!(
-        "[APP] starting app: {} (deploy={}, user_id={})",
+        "[APP] starting app: {} (deploy={}={})",
         app_id,
         request.url.is_some(),
-        request.user_id
+        String::new()
     );
     // The accepted coordinator owns its lease even when the HTTP client disconnects.
     let request_id = request
@@ -100,7 +100,7 @@ pub async fn stop_app(
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
     let Query(mut request) = request
         .map_err(|_| AppError::validation_error("Valid stop query parameters are required"))?;
-    shared_types::validate_identifier(&request.user_id, "user_id")
+    shared_types::validate_identifier(&String::new(), "user_id")
         .map_err(|_| AppError::validation_error("Invalid user_id query parameter"))?;
     let request_id = request
         .request_id
@@ -226,7 +226,7 @@ pub async fn set_recycle_policy(
         .map_err(shared_types::garde_err_to_app_error)?;
     info!(
         "[APP] setting recycle policy: {} (user_id={})",
-        app_id, request.user_id
+        app_id, String::new()
     );
     let request_id = request
         .request_id

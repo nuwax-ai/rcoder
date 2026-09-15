@@ -330,7 +330,7 @@ impl UserAppDeploymentRuntime for MockRuntime {
         expected_resource_version: Option<&str>,
     ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
         context
-            .validate_identity(&context.app_id, Some(&context.user_id))
+            .validate_identity(&context.app_id, Some(&String::new()))
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         let status = self
             .get_deployment_status(&context.app_id)

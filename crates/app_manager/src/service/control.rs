@@ -250,7 +250,7 @@ impl super::AppService {
         let Some(request_id) = request.request_id.as_deref() else {
             return Ok(None);
         };
-        let app = self.get_lifecycle(app_id, &request.user_id).await?;
+        let app = self.get_lifecycle(app_id, &String::new()).await?;
         let Some(operation) = self
             .metadata
             .store
@@ -286,7 +286,6 @@ impl super::AppService {
     pub async fn get_lifecycle(
         &self,
         app_id: &str,
-        user_id: &str,
     ) -> AppResult<shared_types::UserAppLifecycleRecord> {
         crate::utils::validate_app_id(app_id)?;
         let app = self
@@ -297,7 +296,7 @@ impl super::AppService {
             .ok_or_else(|| {
                 AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
             })?;
-        if app.user_id != user_id {
+        if String::new() != user_id {
             return Err(shared_types::UserAppStoreError::OwnershipConflict.into());
         }
         Ok(app)
@@ -305,10 +304,9 @@ impl super::AppService {
     pub async fn get_control_operation(
         &self,
         app_id: &str,
-        user_id: &str,
         operation_id: Option<&str>,
     ) -> AppResult<Option<shared_types::UserAppOperationView>> {
-        let app = self.get_lifecycle(app_id, user_id).await?;
+        let app = self.get_lifecycle(app_id).await?;
         let Some(id) = operation_id.or(app.current_operation_id.as_deref()) else {
             return Ok(None);
         };
@@ -328,10 +326,9 @@ impl super::AppService {
     pub async fn get_control_operation_by_request(
         &self,
         app_id: &str,
-        user_id: &str,
         request_id: &str,
     ) -> AppResult<Option<shared_types::UserAppOperationView>> {
-        let app = self.get_lifecycle(app_id, user_id).await?;
+        let app = self.get_lifecycle(app_id).await?;
         let operation = self
             .metadata
             .store
@@ -356,7 +353,7 @@ impl super::AppService {
             .validate()
             .map_err(|error| AppOperationError::Validation(error.to_string()))?;
         let lease = self.acquire_process_release_lock(app_id).await?;
-        let current = self.get_lifecycle(app_id, &request.user_id).await?;
+        let current = self.get_lifecycle(app_id, &String::new()).await?;
         if current.state != shared_types::UserAppLifecycleState::Deleted {
             // On an active lifecycle the store can only return an exact prior
             // recreation result; it cannot create another generation here.
@@ -365,7 +362,7 @@ impl super::AppService {
                 .store
                 .recreate(
                     app_id,
-                    &request.user_id,
+                    &String::new(),
                     &request.expected_lifecycle_id,
                     &request.request_id,
                 )
@@ -404,7 +401,7 @@ impl super::AppService {
             .store
             .recreate(
                 app_id,
-                &request.user_id,
+                &String::new(),
                 &request.expected_lifecycle_id,
                 &request.request_id,
             )
@@ -445,7 +442,6 @@ mod tests {
                 command: None,
                 metadata: None,
                 app_id: "query".into(),
-                user_id: "owner".into(),
                 lifecycle_id: Some(identity.lifecycle_id),
                 operation_id: "operation-query".into(),
                 request_id: Some("request".into()),
@@ -517,7 +513,6 @@ mod tests {
                 command: None,
                 metadata: None,
                 app_id: "recreate".into(),
-                user_id: "owner".into(),
                 lifecycle_id: Some(old.lifecycle_id.clone()),
                 operation_id: "delete".into(),
                 request_id: None,
@@ -529,7 +524,6 @@ mod tests {
         .expect("admit");
         crate::test_support::complete_empty_deletion_fixture(deletion, "owner").await;
         let request = shared_types::UserAppRecreateRequest {
-            user_id: "owner".into(),
             expected_lifecycle_id: old.lifecycle_id.clone(),
             request_id: "recreate-request".into(),
         };
@@ -541,7 +535,6 @@ mod tests {
         assert_eq!(next.lifecycle_epoch, 2);
         for lifecycle_id in [None, Some(old.lifecycle_id.clone())] {
             let late = crate::models::StartAppRequest {
-                user_id: "owner".into(),
                 lifecycle_id,
                 ..Default::default()
             };
@@ -601,7 +594,6 @@ mod tests {
                 .recreate_identity(
                     "recreate",
                     shared_types::UserAppRecreateRequest {
-                        user_id: "owner".into(),
                         expected_lifecycle_id: old.lifecycle_id,
                         request_id: "different-request".into()
                     }

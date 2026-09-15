@@ -70,11 +70,9 @@ impl AppService {
         _update_lock: &crate::service::AppOperationGuard,
     ) -> AppResult<()> {
         self.metadata
-            .validate_request_lifecycle(app_id, &request.user_id, request.lifecycle_id.as_deref())
+            .validate_request_lifecycle(app_id), request.lifecycle_id.as_deref())
             .await?;
-        let owner = self
-            .metadata
-            .owner_for_write(app_id, &request.user_id)
+        let owner: Option<String> = None)
             .await?;
         use sha2::Digest as _;
         let fingerprint = hex::encode(sha2::Sha256::digest(
@@ -218,7 +216,7 @@ impl AppService {
         operation: &mut crate::service::OwnedOperation,
         _update_lock: &crate::service::AppOperationGuard,
     ) -> AppResult<()> {
-        operation.bind_lease(_update_lock, owner).await?;
+        operation.bind_lease(_update_lock).await?;
         let observed = self.fetch_runtime_status_or_err(app_id).await?;
         if observed.resource_version != current.resource_version
             || observed.created_at != current.created_at

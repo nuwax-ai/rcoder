@@ -11,7 +11,6 @@ pub(crate) fn create_request(app_id: &str) -> CreateAppRequest {
         lifecycle_id: None,
         request_id: None,
         name: "r2app".into(),
-        user_id: "u-test".to_string(),
         image: Some("registry.example/app-runtime:test".into()),
         command: None,
         env: None,
@@ -68,7 +67,6 @@ async fn failed_update_restores_registered_ports_not_drifted_live_ports() {
     let request = UpdateAppRequest {
         request_id: None,
         lifecycle_id: None,
-        user_id: "u-test".into(),
         image: Some("registry.example/app-runtime:test".into()),
         name: None,
         env: None,
@@ -356,7 +354,6 @@ pub(crate) async fn uncertain_retry_refusal_carries_readonly_observation() {
                 "appdiag",
                 &operation.operation_id,
                 shared_types::UserAppRetryRequest {
-                    user_id: "u-test".into(),
                     lifecycle_id: operation.lifecycle_id.clone(),
                     expected_revision: operation.revision,
                 },
@@ -458,7 +455,6 @@ pub(crate) async fn update_app_without_name_keeps_metadata_name() {
     let update_no_name = UpdateAppRequest {
         request_id: None,
         lifecycle_id: None,
-        user_id: "u-test".into(),
         name: None,
         image: Some("registry.example/app-runtime:v2".into()),
         env: None,
@@ -517,7 +513,6 @@ pub(crate) async fn update_app_conflicts_while_release_lock_held() {
     let request = UpdateAppRequest {
         request_id: None,
         lifecycle_id: None,
-        user_id: "u-test".into(),
         name: None,
         image: Some("registry.example/app-runtime:v2".into()),
         env: None,
@@ -568,7 +563,6 @@ fn update_request_with_storage(storage: Option<&str>) -> UpdateAppRequest {
     UpdateAppRequest {
         request_id: None,
         lifecycle_id: None,
-        user_id: "u-test".into(),
         name: None,
         image: Some("registry.example/app-runtime:v2".into()),
         env: None,
@@ -729,7 +723,6 @@ async fn traffic_rechecks_stale_local_block_but_respects_committed_manual_stop()
         .stop_app_controlled(
             "stalewakeblock",
             shared_types::UserAppControlRequest {
-                user_id: "u-test".into(),
                 lifecycle_id: None,
                 request_id: Some("committed-manual-stop".into()),
             },
@@ -757,7 +750,6 @@ async fn pending_traffic_recovery_cannot_override_a_manual_stop() {
         .stop_app_controlled(
             "recovermanual",
             shared_types::UserAppControlRequest {
-                user_id: "u-test".into(),
                 lifecycle_id: None,
                 request_id: Some("manual-stop-before-recovery".into()),
             },
@@ -796,7 +788,6 @@ async fn stop_rejection_releases_ownership_but_uncertain_result_retains_it() {
         let (service, runtime) = created_app_service(directory.path(), "stopoutcome").await;
         runtime.stop_failure_status.store(status, Ordering::SeqCst);
         let request = shared_types::UserAppControlRequest {
-            user_id: "u-test".into(),
             lifecycle_id: None,
             request_id: Some("stop-outcome-request".into()),
         };
@@ -848,7 +839,6 @@ async fn policy_control_is_durable_idempotent_and_does_not_restart_runtime() {
     let directory = tempfile::tempdir().expect("directory");
     let (service, runtime) = created_app_service(directory.path(), "durablepolicy").await;
     let request = RecyclePolicyRequest {
-        user_id: "u-test".into(),
         lifecycle_id: None,
         request_id: Some("policy-request".into()),
         recycle_enabled: Some(false),
@@ -926,7 +916,6 @@ async fn configuration_update_commits_new_policy_and_releases_operation_marker()
         .set_recycle_policy(
             "updatepolicy",
             RecyclePolicyRequest {
-                user_id: "u-test".into(),
                 lifecycle_id: None,
                 request_id: Some("initial-policy".into()),
                 recycle_enabled: Some(false),
@@ -1106,7 +1095,6 @@ async fn explicit_stop_is_durable_idempotent_and_blocks_traffic_wake() {
     let root = tempfile::tempdir().expect("directory");
     let (service, runtime) = created_app_service(root.path(), "durablestop").await;
     let request = shared_types::UserAppControlRequest {
-        user_id: "u-test".into(),
         lifecycle_id: None,
         request_id: Some("stop-request".into()),
     };
@@ -1144,7 +1132,7 @@ async fn explicit_stop_is_durable_idempotent_and_blocks_traffic_wake() {
             .expect("persisted physical stop target");
     assert_eq!(target.context.operation_id, operation.operation_id);
     assert_eq!(target.context.lifecycle_id, persisted.lifecycle_id);
-    assert_eq!(target.context.user_id, "u-test");
+    assert_eq!(target.String::new(), "u-test");
     assert!(!target.resource.uid.is_empty());
     assert_eq!(persisted.checkpoint["wake_on_traffic"], false);
     let mut foreign = request;
@@ -1168,7 +1156,6 @@ async fn compute_delete_failure_keeps_wake_blocked_until_reconciliation() {
         .delete_app_controlled(
             "deletefence",
             DeleteAppRequest {
-                user_id: "u-test".into(),
                 lifecycle_id: None,
                 request_id: Some("delete-fence-request".into()),
                 purge: Some(false),
@@ -1212,7 +1199,6 @@ async fn compute_delete_replays_after_runtime_disappears_and_preserves_lifecycle
         .expect("read")
         .expect("identity");
     let request = DeleteAppRequest {
-        user_id: "u-test".into(),
         request_id: Some("delete-request".into()),
         purge: Some(false),
         lifecycle_id: Some(before.lifecycle_id.clone()),
@@ -1498,7 +1484,6 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
     }
     let service = test_service(root.path(), runtime.clone()).await;
     let by_name = |name: &str| QueryAppsRequest {
-        user_id: "u1".into(),
         page: None,
         page_size: None,
         filters: Some(AppFilters {
@@ -1516,7 +1501,6 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
             generation: uuid::Uuid::new_v4().to_string(),
             app_id: "appalpha".into(),
             name: Some("alpha".into()),
-            user_id: Some("u1".into()),
             tenant_id: None,
             space_id: None,
             created_at: chrono::Utc::now() - chrono::Duration::hours(2),
@@ -1525,7 +1509,6 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
             generation: uuid::Uuid::new_v4().to_string(),
             app_id: "appbeta".into(),
             name: Some("beta".into()),
-            user_id: Some("u1".into()),
             tenant_id: None,
             space_id: None,
             created_at: chrono::Utc::now(),
@@ -1548,7 +1531,6 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
     let now = chrono::Utc::now();
     let response = service
         .query_apps(QueryAppsRequest {
-            user_id: "u1".into(),
             page: None,
             page_size: None,
             filters: Some(AppFilters {
@@ -2069,7 +2051,6 @@ async fn failed_update_preparation_releases_lease_for_next_update() {
     let request = || UpdateAppRequest {
         request_id: None,
         lifecycle_id: None,
-        user_id: "u-test".into(),
         image: Some("unavailable:image".into()),
         name: None,
         env: None,
@@ -2171,7 +2152,6 @@ mod purge_http_cancellation {
                 axum::extract::State(state),
                 axum::extract::Path(app_id.into()),
                 Ok(axum::Json(PurgeAppRequest {
-                    user_id: "u-purge".into(),
                     lifecycle_id: None,
                     request_id: Some("cancelled-purge-request".into()),
                 })),
@@ -2300,7 +2280,6 @@ async fn full_delete_deduplicates_and_rejects_old_lifecycle_after_recreation() {
         .expect("read")
         .expect("identity");
     let request = shared_types::UserAppControlRequest {
-        user_id: "u-purge".into(),
         lifecycle_id: Some(original.lifecycle_id.clone()),
         request_id: Some("full-delete-request".into()),
     };
@@ -2460,7 +2439,6 @@ async fn controlled_start_persists_target_and_replays_without_another_runtime_wr
     let (service, runtime) = created_app_service(root.path(), "durablestart").await;
     service.stop_app("durablestart").await.expect("stop");
     let request = shared_types::UserAppControlRequest {
-        user_id: "u-test".into(),
         lifecycle_id: None,
         request_id: Some("start-request".into()),
     };
@@ -2509,7 +2487,6 @@ async fn controlled_restart_deduplicates_and_is_distinct_from_start() {
     let root = tempfile::tempdir().expect("directory");
     let (service, runtime) = created_app_service(root.path(), "durablerestart").await;
     let request = shared_types::UserAppControlRequest {
-        user_id: "u-test".into(),
         lifecycle_id: None,
         request_id: Some("restart-request".into()),
     };
@@ -2567,13 +2544,11 @@ async fn explicit_retry_checks_owner_lifecycle_and_revision_before_execution() {
     )
     .await;
     let request = shared_types::UserAppRetryRequest {
-        user_id: "u-test".into(),
         lifecycle_id: pending.lifecycle_id.clone(),
         expected_revision: pending.revision,
     };
     for invalid in [
         shared_types::UserAppRetryRequest {
-            user_id: "other-owner".into(),
             ..request.clone()
         },
         shared_types::UserAppRetryRequest {
@@ -2639,7 +2614,6 @@ async fn explicit_retry_cannot_take_over_a_claimed_operation() {
             "retryclaimed",
             &pending.operation_id,
             shared_types::UserAppRetryRequest {
-                user_id: "u-test".into(),
                 lifecycle_id: pending.lifecycle_id,
                 expected_revision: before.revision,
             },
@@ -2876,7 +2850,6 @@ async fn controlled_storage_destruction_checks_owner_and_replays_without_duplica
             shared_types::UserappStage::Dev
         };
         let request = DestroyStorageRequest {
-            user_id: "u-test".into(),
             confirm: "controlledstorage".into(),
             lifecycle_id: None,
             request_id: Some("storage-request".into()),
@@ -2887,7 +2860,6 @@ async fn controlled_storage_destruction_checks_owner_and_replays_without_duplica
                     stage,
                     "controlledstorage",
                     DestroyStorageRequest {
-                        user_id: "foreign-owner".into(),
                         ..request.clone()
                     }
                 )
@@ -2946,7 +2918,6 @@ async fn controlled_production_clear_preserves_scope_and_request_identity() {
     service.config.access_mode = AppAccessMode::Kubernetes;
     runtime.deployments.remove("clearproduction");
     let request = ClearStorageRequest {
-        user_id: "u-test".into(),
         lifecycle_id: None,
         request_id: Some("clear-request".into()),
     };
@@ -2956,7 +2927,6 @@ async fn controlled_production_clear_preserves_scope_and_request_identity() {
                 shared_types::UserappStage::Prod,
                 "clearproduction",
                 ClearStorageRequest {
-                    user_id: "wrong-owner".into(),
                     ..request.clone()
                 }
             )
@@ -3025,7 +2995,6 @@ async fn controlled_production_clear_refuses_existing_compute_before_storage_eff
             shared_types::UserappStage::Prod,
             "clearrunning",
             ClearStorageRequest {
-                user_id: "u-test".into(),
                 lifecycle_id: None,
                 request_id: Some("clear-running-request".into()),
             },
@@ -3216,7 +3185,6 @@ async fn completed_deploy_replay_is_idempotent() {
     let directory = tempfile::tempdir().expect("directory");
     let (service, runtime) = created_app_service(directory.path(), "replayidempotent").await;
     let request = StartAppRequest {
-        user_id: "u-test".into(),
         request_id: Some("replaylocked".into()),
         ..Default::default()
     };
@@ -3253,7 +3221,6 @@ async fn enhanced_start_and_restart_deduplicate_complete_policy_intent() {
         let directory = tempfile::tempdir().expect("directory");
         let (service, runtime) = created_app_service(directory.path(), "compositestart").await;
         let request = StartAppRequest {
-            user_id: "u-test".into(),
             request_id: Some("complete-control".into()),
             idle_timeout_seconds: Some(812),
             ..Default::default()
@@ -3334,7 +3301,6 @@ async fn pending_composite_deployment_recovers_original_control_and_completion()
     let directory = tempfile::tempdir().expect("directory");
     let (service, runtime) = created_app_service(directory.path(), "recovercomposite").await;
     let request = StartAppRequest {
-        user_id: "u-test".into(),
         request_id: Some("recovercomplete".into()),
         idle_timeout_seconds: Some(714),
         ..Default::default()

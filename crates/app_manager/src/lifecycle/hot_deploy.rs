@@ -604,7 +604,6 @@ mod tests {
                 "rel-1",
                 "",
                 &StartAppRequest {
-                    user_id: "owner".into(),
                     ..Default::default()
                 },
             )
@@ -637,7 +636,6 @@ mod tests {
                 "rel-1",
                 "",
                 &StartAppRequest {
-                    user_id: "owner".into(),
                     ..Default::default()
                 },
             )

@@ -82,7 +82,7 @@ mod tests {
     fn storage_requests_require_user_id() {
         let clear: ClearStorageRequest =
             serde_json::from_value(serde_json::json!({"user_id": "u1"})).expect("clear body");
-        assert_eq!(clear.user_id, "u1");
+        assert_eq!(clear, "u1");
         assert!(
             serde_json::from_value::<ClearStorageRequest>(serde_json::json!({})).is_err(),
             "clear 缺 user_id 应拒"
@@ -92,7 +92,7 @@ mod tests {
             "user_id": "u1", "confirm": "app1",
         }))
         .expect("destroy body");
-        assert_eq!(destroy.user_id, "u1");
+        assert_eq!(destroy, "u1");
         assert!(
             serde_json::from_value::<DestroyStorageRequest>(serde_json::json!({
                 "confirm": "app1",

@@ -61,7 +61,6 @@ impl AppService {
         &self,
         app_stage: UserappStage,
         app_id: &str,
-        user_id: Option<&str>,
     ) -> AppResult<String> {
         if app_stage == UserappStage::Dev {
             let locator = self
@@ -73,7 +72,7 @@ impl AppService {
                     AppOperationError::Backend("dev container locator not injected".to_string())
                 })?;
             return locator
-                .dev_file_server_addr(app_id, user_id)
+                .dev_file_server_addr(app_id)
                 .await
                 .map_err(|e| {
                     AppOperationError::Backend(format!(
@@ -118,7 +117,6 @@ impl AppService {
         &self,
         app_stage: UserappStage,
         app_id: &str,
-        user_id: &str,
         file_data: Vec<u8>,
         target: &str,
         flatten: bool,
@@ -140,7 +138,7 @@ impl AppService {
         let part = reqwest::multipart::Part::bytes(file_data).file_name(file_name);
         let form = reqwest::multipart::Form::new()
             .text("app_id", app_id.to_string())
-            .text("user_id", user_id.to_string())
+            .text("user_id".to_string())
             .text("target", target.to_string())
             .text("flatten", flatten.to_string())
             .part("file", part);
@@ -172,7 +170,6 @@ impl AppService {
         &self,
         app_stage: UserappStage,
         app_id: &str,
-        user_id: &str,
         url: &str,
         target: &str,
         flatten: bool,
@@ -223,7 +220,6 @@ impl AppService {
         &self,
         app_stage: UserappStage,
         app_id: &str,
-        user_id: &str,
         subpath: Option<&str>,
     ) -> AppResult<Vec<FileInfo>> {
         validate_app_id(app_id)?;
@@ -266,7 +262,6 @@ impl AppService {
         &self,
         app_stage: UserappStage,
         app_id: &str,
-        user_id: &str,
         file_path: &str,
     ) -> AppResult<()> {
         validate_app_id(app_id)?;

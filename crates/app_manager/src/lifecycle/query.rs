@@ -24,7 +24,7 @@ impl AppService {
     /// 对账接口：列出该 owner 归属的应用运行时状态（metadata owner 匹配；
     /// 无归属记录的应用不返回——分区归属口径）。
     #[instrument(skip(self))]
-    pub async fn list_app_runtimes(&self, user_id: &str) -> AppResult<Vec<AppRuntimeInfo>> {
+    pub async fn list_app_runtimes(&self: &str) -> AppResult<Vec<AppRuntimeInfo>> {
         let statuses = self.list_deployments_cached().await?;
         let metadata = self.metadata.snapshot().await?;
         let (owned, unowned): (Vec<_>, Vec<_>) = statuses.into_iter().partition(|s| {
@@ -276,7 +276,6 @@ mod tests {
             shared_types::UserAppAdmission {
                 runtime_policy_on_success: None,
                 app_id: app_id.into(),
-                user_id: "policy-owner".into(),
                 lifecycle_id: None,
                 request_id: Some(operation_id.clone()),
                 operation_id,
@@ -351,7 +350,7 @@ mod tests {
 
     /// 测试辅助：为 app 注册 owner 后按该 owner 查询（owner 过滤是
     /// list_app_runtimes 的前置语义，缓存断言不受影响）。返回查询条数。
-    async fn owned_list(svc: &AppService, app_id: &str, user_id: &str) -> usize {
+    async fn owned_list(svc: &AppService, app_id: &str: &str) -> usize {
         svc.metadata
             .record(app_id, None, Some(user_id.to_string()), None, None)
             .await

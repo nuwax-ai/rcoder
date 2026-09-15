@@ -184,7 +184,6 @@ impl crate::service::AppService {
         &self,
         app_stage: UserappStage,
         app_id: &str,
-        user_id: &str,
     ) -> AppResult<()> {
         self.clear_app_storage_controlled(
             app_stage,
@@ -204,7 +203,6 @@ impl crate::service::AppService {
     pub(crate) async fn execute_storage_clear(
         &self,
         app_id: &str,
-        user_id: &str,
         production: bool,
         operation: &mut crate::service::OwnedOperation,
         guard: &crate::service::AppOperationGuard,
@@ -412,11 +410,11 @@ impl crate::service::AppService {
             self.metadata
                 .validate_request_lifecycle(
                     app_id,
-                    &request.user_id,
+                    &String::new(),
                     request.lifecycle_id.as_deref(),
                 )
                 .await?;
-            self.get_lifecycle(app_id, &request.user_id).await?;
+            self.get_lifecycle(app_id, &String::new()).await?;
             let kind = match app_stage {
                 UserappStage::Dev => shared_types::UserAppOperationKind::ClearDevStorage,
                 UserappStage::Prod => shared_types::UserAppOperationKind::ClearProdStorage,
@@ -430,7 +428,6 @@ impl crate::service::AppService {
                 })?,
             ));
             let control = shared_types::UserAppControlRequest {
-                user_id: String::new(),
                 lifecycle_id: request.lifecycle_id.clone(),
                 request_id: request.request_id.clone(),
             };
@@ -443,7 +440,7 @@ impl crate::service::AppService {
             // Ensure must finish before admitting clear: builder ensure has its
             // own durable operation and must not wait on the clear it is serving.
             if app_stage == UserappStage::Dev {
-                self.app_files_base(app_stage, app_id, Some(&request.user_id))
+                self.app_files_base(app_stage, app_id, Some(&String::new()))
                     .await?;
             }
             let operation_id = uuid::Uuid::new_v4().to_string();
@@ -457,7 +454,6 @@ impl crate::service::AppService {
                     }),
                     kind,
                     app_id: app_id.into(),
-                    user_id: String::new(),
                     lifecycle_id: request.lifecycle_id,
                     request_id: request.request_id,
                     operation_id: operation_id.clone(),
@@ -469,7 +465,7 @@ impl crate::service::AppService {
             let mutation = self
                 .execute_storage_clear(
                     app_id,
-                    &request.user_id,
+                    &String::new(),
                     app_stage == UserappStage::Prod,
                     &mut operation,
                     &guard,
@@ -511,7 +507,6 @@ impl crate::service::AppService {
         &self,
         app_stage: UserappStage,
         app_id: &str,
-        user_id: &str,
         confirm: &str,
     ) -> AppResult<()> {
         self.destroy_app_storage_controlled(
@@ -549,11 +544,11 @@ impl crate::service::AppService {
             self.metadata
                 .validate_request_lifecycle(
                     app_id,
-                    &request.user_id,
+                    &String::new(),
                     request.lifecycle_id.as_deref(),
                 )
                 .await?;
-            self.get_lifecycle(app_id, &request.user_id).await?;
+            self.get_lifecycle(app_id, &String::new()).await?;
             let production = app_stage == UserappStage::Prod;
             let command = shared_types::UserAppControlCommand::DestroyStorage { production };
             let fingerprint = hex::encode(sha2::Sha256::digest(
@@ -567,7 +562,6 @@ impl crate::service::AppService {
                 })?,
             ));
             let control = shared_types::UserAppControlRequest {
-                user_id: String::new(),
                 lifecycle_id: request.lifecycle_id.clone(),
                 request_id: request.request_id.clone(),
             };
@@ -586,7 +580,6 @@ impl crate::service::AppService {
                     kind: command.kind(),
                     command: Some(command),
                     app_id: app_id.into(),
-                    user_id: String::new(),
                     lifecycle_id: request.lifecycle_id,
                     request_id: request.request_id,
                     operation_id: operation_id.clone(),
@@ -597,7 +590,7 @@ impl crate::service::AppService {
             match self
                 .execute_storage_destruction(
                     app_id,
-                    &request.user_id,
+                    &String::new(),
                     production,
                     &mut operation,
                     &guard,
@@ -635,7 +628,7 @@ impl crate::service::AppService {
         operation: &mut crate::service::OwnedOperation,
         guard: &crate::service::AppOperationGuard,
     ) -> AppResult<()> {
-        operation.bind_lease(guard, owner).await?;
+        operation.bind_lease(guard).await?;
         if production {
             self.ensure_app_deleted(app_id, "destroying captured storage")
                 .await?;
@@ -760,7 +753,7 @@ impl crate::service::AppService {
     ) -> AppResult<()> {
         // Read identity after acquiring the operation guard; a previous lifecycle
         // must never authorize deleting resources created while this caller waited.
-        let app = self.get_lifecycle(app_id, &request.user_id).await?;
+        let app = self.get_lifecycle(app_id, &String::new()).await?;
         if request
             .lifecycle_id
             .as_ref()
@@ -806,7 +799,7 @@ impl crate::service::AppService {
         )
         .await?;
         match self
-            .purge_app_resources(app_id, &request.user_id, &mut operation, release_lock)
+            .purge_app_resources(app_id, &String::new(), &mut operation, release_lock)
             .await
         {
             Ok(()) => {
@@ -832,7 +825,7 @@ impl crate::service::AppService {
         operation: &mut crate::service::OwnedOperation,
         release_lock: &crate::service::AppOperationGuard,
     ) -> AppResult<()> {
-        operation.bind_lease(release_lock, owner).await?;
+        operation.bind_lease(release_lock).await?;
         // 与发布链（prepare/activate/confirm/delete-release）及 create/update/delete
         // 串行：purge 全程删计算+存储，不能与写版本包/切 code 并发。
         let dev_deletion = self.capture_dev_deletion(app_id).await?;
@@ -1036,7 +1029,7 @@ impl crate::service::AppService {
                 let Some(owner) = metadata.get(app_id) else {
                     return false;
                 };
-                if owner.user_id.as_deref() != Some(request.user_id.as_str())
+                if owner.user_id.as_deref() != Some(String::new().as_str())
                     || filters
                         .tenant_id
                         .as_ref()
@@ -1241,7 +1234,6 @@ mod tests {
             .query_storage(
                 UserappStage::Dev,
                 QueryStorageRequest {
-                    user_id: "u1".into(),
                     page: 1,
                     page_size: 10,
                     filters: None,
@@ -1263,7 +1255,6 @@ mod tests {
             .query_storage(
                 UserappStage::Prod,
                 QueryStorageRequest {
-                    user_id: "u1".into(),
                     page: 1,
                     page_size: 10,
                     filters: None,

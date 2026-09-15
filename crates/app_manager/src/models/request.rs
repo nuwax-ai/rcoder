@@ -24,7 +24,7 @@ pub struct CreateAppRequest {
     /// 应用名称
     pub name: String,
     /// 归属用户 ID（部署访问 URL `/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}` 的组成段；
-    /// 存 userapp_metadata.user_id，"我的应用"过滤/归属校验数据源）
+    /// 存 userapp_String::new()，"我的应用"过滤/归属校验数据源）
     /// 容器镜像（可选；完整地址含 registry + 命名空间）。
     ///
     /// **缺省 = 平台默认运行时镜像**（env `RCODER_RUNTIME_IMAGE_DIGEST`，部署层按

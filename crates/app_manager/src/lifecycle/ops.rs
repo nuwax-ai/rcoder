@@ -65,7 +65,7 @@ impl AppService {
             self.metadata
                 .validate_request_lifecycle(
                     app_id,
-                    &request.user_id,
+                    &String::new(),
                     request.lifecycle_id.as_deref(),
                 )
                 .await?;
@@ -93,7 +93,6 @@ impl AppService {
                         shared_types::UserAppControlCommand::Start { traffic: false }
                     }),
                     app_id: app_id.into(),
-                    user_id: String::new(),
                     lifecycle_id: request.lifecycle_id.clone(),
                     request_id: request.request_id.clone(),
                     operation_id: uuid::Uuid::new_v4().to_string(),
@@ -104,8 +103,8 @@ impl AppService {
             )
             .await?;
             let mutation = async {
-                operation.bind_lease(&guard, &request.user_id).await?;
-                let context = operation.execution_context(&request.user_id);
+                operation.bind_lease(&guard, &String::new()).await?;
+                let context = operation.execution_context());
                 let target = self
                     .runtime
                     .capture_app_mutation_target(&context, previous.resource_version.as_deref())
@@ -214,7 +213,7 @@ impl AppService {
             self.metadata
                 .validate_request_lifecycle(
                     app_id,
-                    &request.user_id,
+                    &String::new(),
                     request.lifecycle_id.as_deref(),
                 )
                 .await?;
@@ -246,7 +245,6 @@ impl AppService {
                     runtime_policy_on_success: None,
                     command: Some(shared_types::UserAppControlCommand::Stop { wake_on_traffic }),
                     app_id: app_id.into(),
-                    user_id: String::new(),
                     lifecycle_id: request.lifecycle_id.clone(),
                     operation_id: uuid::Uuid::new_v4().to_string(),
                     request_id: request.request_id.clone(),
@@ -257,8 +255,8 @@ impl AppService {
             )
             .await?;
             let mutation = async {
-                durable.bind_lease(&operation, &request.user_id).await?;
-                let context = durable.execution_context(&request.user_id);
+                durable.bind_lease(&operation, &String::new()).await?;
+                let context = durable.execution_context());
                 let target = self
                     .runtime
                     .capture_app_mutation_target(&context, previous.resource_version.as_deref())
@@ -492,7 +490,6 @@ impl AppService {
         &self,
         app_stage: shared_types::UserappStage,
         app_id: &str,
-        user_id: &str,
     ) -> AppResult<String> {
         validate_app_id(app_id)?;
         if app_stage == shared_types::UserappStage::Prod {
@@ -533,7 +530,7 @@ impl AppService {
         // dev 日志受理前置检查：app-cli 管理 API（:3010）随 dev 会话拉起/退出，
         // 会话不在时该端口为死端口——直连只会挂满连接超时（15s）后 500。
         // 未运行即刻 4xx 快速失败（ERR_DEV_NOT_RUNNING）。
-        self.ensure_dev_logs_running(&file_server, app_id, user_id)
+        self.ensure_dev_logs_running(&file_server, app_id)
             .await?;
         // http://{host}:60000 → http://{host}:{APP_CLI_ADMIN_PORT}（host 段原样保留，仅换管理端口）
         let host = file_server
@@ -558,7 +555,6 @@ impl AppService {
         &self,
         file_server_base: &str,
         app_id: &str,
-        user_id: &str,
     ) -> AppResult<()> {
         let response = reqwest::Client::new()
             .get(format!(

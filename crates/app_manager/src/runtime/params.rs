@@ -36,7 +36,6 @@ struct AppParamsInput {
     /// app owner 用户 ID（create/update 路径均来自请求必填字段；None 仅剩内部
     /// 兼容路径 → inner 从元数据查）。Docker 模式数据卷 bind 源（prod/{user_id}/data/{app_id}）
     /// 与宿主树分区依赖它；K8s 不消费（env/挂载只用 app_id）。
-    user_id: Option<String>,
 }
 
 impl AppService {
@@ -61,7 +60,6 @@ impl AppService {
                 space_id: request.space_id.clone(),
                 recycle_enabled: request.recycle_enabled,
                 idle_timeout_seconds: request.idle_timeout_seconds,
-                user_id: Some(String::new()),
             },
         )
         .await
@@ -146,7 +144,6 @@ impl AppService {
                 idle_timeout_seconds: request
                     .idle_timeout_seconds
                     .or(current.idle_timeout_seconds),
-                user_id: Some(String::new()),
             },
         )
         .await
@@ -379,7 +376,6 @@ mod tests {
         UpdateAppRequest {
             request_id: None,
             lifecycle_id: None,
-            user_id: "u1".into(),
             name: None,
             image: Some(image.to_owned()),
             env: None,

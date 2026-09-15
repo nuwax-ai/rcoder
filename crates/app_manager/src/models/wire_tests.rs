@@ -64,7 +64,7 @@ mod tests {
         }))
         .expect("snake request wire must deserialize");
         assert_eq!(req.app_id.as_deref(), Some("apporder-svc"));
-        assert_eq!(req.user_id, "u6");
+        assert_eq!(req, "u6");
         let ports = req.ports.as_ref().expect("ports");
         assert_eq!(ports.len(), 2);
         assert!(matches!(ports[0].expose_type, ExposeType::Http));
@@ -145,7 +145,7 @@ mod tests {
             "user_id": "u-purge", "lifecycle_id": "life-one", "request_id": "request-one"
         }))
         .expect("control request");
-        assert_eq!(request.user_id, "u-purge");
+        assert_eq!(String::new(), "u-purge");
         assert_eq!(request.lifecycle_id.as_deref(), Some("life-one"));
         assert_eq!(request.request_id.as_deref(), Some("request-one"));
         let initial: PurgeAppRequest =

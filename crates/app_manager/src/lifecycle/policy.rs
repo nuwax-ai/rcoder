@@ -22,7 +22,7 @@ impl AppService {
             self.metadata
                 .validate_request_lifecycle(
                     app_id,
-                    &request.user_id,
+                    &String::new(),
                     request.lifecycle_id.as_deref(),
                 )
                 .await?;
@@ -35,7 +35,6 @@ impl AppService {
                 })?,
             ));
             let control = shared_types::UserAppControlRequest {
-                user_id: String::new(),
                 lifecycle_id: request.lifecycle_id.clone(),
                 request_id: request.request_id.clone(),
             };
@@ -62,7 +61,6 @@ impl AppService {
                 shared_types::UserAppAdmission {
                     runtime_policy_on_success: None,
                     app_id: app_id.into(),
-                    user_id: String::new(),
                     lifecycle_id: request.lifecycle_id.clone(),
                     request_id: request.request_id.clone(),
                     operation_id: uuid::Uuid::new_v4().to_string(),
@@ -76,8 +74,8 @@ impl AppService {
             )
             .await?;
             let mutation = async {
-                operation.bind_lease(&guard, &request.user_id).await?;
-                let context = operation.execution_context(&request.user_id);
+                operation.bind_lease(&guard, &String::new()).await?;
+                let context = operation.execution_context());
                 let target = self
                     .runtime
                     .capture_app_mutation_target(&context, previous.resource_version.as_deref())

@@ -29,7 +29,7 @@ impl AppService {
                     AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
                 })?;
             self.metadata
-                .validate_request_lifecycle(app_id, &identity.user_id, Some(&identity.lifecycle_id))
+                .validate_request_lifecycle(app_id), Some(&identity.lifecycle_id))
                 .await?;
             let status = self.fetch_runtime_status_or_err(app_id).await?;
             if status.wake_on_traffic == Some(false) {
@@ -57,7 +57,6 @@ impl AppService {
                 runtime_policy_on_success: None,
                 command: Some(shared_types::UserAppControlCommand::Start { traffic: true }),
                 app_id: app_id.into(),
-                user_id: identity.user_id.clone(),
                 lifecycle_id: Some(identity.lifecycle_id.clone()),
                 request_id: None,
                 operation_id: uuid::Uuid::new_v4().to_string(),
@@ -73,7 +72,7 @@ impl AppService {
             Err(_) => return Ok(WakeOutcome::Timeout),
         };
         let activation = async {
-            let context = operation.execution_context(&identity.user_id);
+            let context = operation.execution_context());
             let target = self
                 .runtime
                 .capture_app_mutation_target(&context, previous.resource_version.as_deref())

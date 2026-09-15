@@ -65,7 +65,6 @@ fn kind_from_restart(restart: bool) -> UserAppOperationKind {
 
 fn control_request(request: &StartAppRequest) -> shared_types::UserAppControlRequest {
     shared_types::UserAppControlRequest {
-        user_id: String::new(),
         lifecycle_id: request.lifecycle_id.clone(),
         request_id: request.request_id.clone(),
     }
@@ -108,7 +107,7 @@ impl AppService {
         guard: Arc<AppOperationGuard>,
     ) -> AppResult<StartAppResult> {
         self.metadata
-            .validate_request_lifecycle(app_id, &request.user_id, request.lifecycle_id.as_deref())
+            .validate_request_lifecycle(app_id), request.lifecycle_id.as_deref())
             .await?;
         let identity = self
             .metadata
@@ -142,7 +141,6 @@ impl AppService {
                     .is_none()
                     .then(|| shared_types::UserAppMetadataPatch {
                         app_id: app_id.into(),
-                        user_id: identity.user_id.clone(),
                         lifecycle_id: identity.lifecycle_id.clone(),
                         expected_revision: identity.metadata_revision,
                         name: Some(Some(app_id.into())),
@@ -265,7 +263,6 @@ impl AppService {
                     &UpdateAppRequest {
                         request_id: None,
                         lifecycle_id: request.lifecycle_id.clone(),
-                        user_id: String::new(),
                         name: None,
                         image: None,
                         env: Some(env),
@@ -285,7 +282,7 @@ impl AppService {
                     app_id,
                     app_id,
                     Some(env),
-                    &request.user_id,
+                    &String::new(),
                     request.lifecycle_id.as_deref(),
                 )?;
                 create.recycle_enabled = request.idle_timeout_seconds.map(|value| value > 0);
@@ -318,8 +315,8 @@ impl AppService {
             restart,
             ..
         } = input;
-        operation.bind_lease(&guard, &request.user_id).await?;
-        let context = operation.execution_context(&request.user_id);
+        operation.bind_lease(&guard, &String::new()).await?;
+        let context = operation.execution_context());
         super::start::validate_start_request(app_id, &request)?;
         let url = request
             .url
@@ -355,7 +352,7 @@ impl AppService {
                 if let Some(previous) = previous {
                     self.execute_update(
                         app_id,
-                        &request.user_id,
+                        &String::new(),
                         params,
                         previous,
                         operation,
@@ -363,7 +360,7 @@ impl AppService {
                     )
                     .await?;
                 } else {
-                    self.execute_creation(app_id, &request.user_id, params, operation, &guard)
+                    self.execute_creation(app_id, &String::new(), params, operation, &guard)
                         .await?;
                 }
             } else {
@@ -440,7 +437,7 @@ impl AppService {
         };
         let (pg_aligned, pg_error) = match &request.pg {
             Some(credentials) => match self
-                .align_start_pg(app_id, &request.user_id, credentials)
+                .align_start_pg(app_id, &String::new(), credentials)
                 .await
             {
                 Ok(()) => (Some(true), None),

@@ -52,7 +52,7 @@ pub async fn get_app_storage(
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
     info!(
-        "[APP] getting app storage: {} (app_stage={}, user_id={})",
+        "[APP] getting app storage: {} (app_stage={}={})",
         app_id,
         app_stage.as_str(),
         owner.user_id
@@ -93,7 +93,7 @@ pub async fn clear_app_storage(
     req.validate()
         .map_err(shared_types::garde_err_to_app_error)?;
     info!(
-        "[APP] clearing app storage: {} (app_stage={}, user_id={})",
+        "[APP] clearing app storage: {} (app_stage={}={})",
         app_id,
         app_stage.as_str(),
         req.user_id
@@ -154,7 +154,7 @@ pub async fn destroy_app_storage(
     req.validate()
         .map_err(shared_types::garde_err_to_app_error)?;
     info!(
-        "[APP] destroying app storage: {} (app_stage={}, user_id={})",
+        "[APP] destroying app storage: {} (app_stage={}={})",
         app_id,
         app_stage.as_str(),
         req.user_id

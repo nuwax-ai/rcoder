@@ -182,7 +182,7 @@ pub async fn upload_from_url(
     let flatten = req.flatten.unwrap_or(false);
     let result = state
         .app_service
-        .upload_from_url(app_stage, &app_id, &req.user_id, &req.url, &target, flatten)
+        .upload_from_url(app_stage, &app_id, &req, &req.url, &target, flatten)
         .await?;
     Ok(Json(HttpResult::success(result)))
 }
@@ -227,7 +227,7 @@ pub async fn list_files(
     let app_stage = super::parse_app_stage_param(&app_stage)?;
     q.validate().map_err(shared_types::garde_err_to_app_error)?;
     info!(
-        "[APP] listing files: {} (app_stage={}, user_id={}, subpath={:?})",
+        "[APP] listing files: {} (app_stage={}={}, subpath={:?})",
         app_id,
         app_stage.as_str(),
         q.user_id,
@@ -235,7 +235,7 @@ pub async fn list_files(
     );
     let files = state
         .app_service
-        .list_files(app_stage, &app_id, &q.user_id, q.path.as_deref())
+        .list_files(app_stage, &app_id, &q, q.path.as_deref())
         .await?;
     Ok(Json(HttpResult::success(files)))
 }
@@ -279,15 +279,15 @@ pub async fn delete_file(
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
     info!(
-        "[APP] deleting file: {}/{} (app_stage={}, user_id={})",
+        "[APP] deleting file: {}/{} (app_stage={}={})",
         app_id,
         request.path,
         app_stage.as_str(),
-        request.user_id
+        String::new()
     );
     state
         .app_service
-        .delete_file(app_stage, &app_id, &request.user_id, &request.path)
+        .delete_file(app_stage, &app_id, &String::new(), &request.path)
         .await?;
     Ok(Json(HttpResult::success("文件删除成功".to_string())))
 }

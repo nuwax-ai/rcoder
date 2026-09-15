@@ -51,7 +51,7 @@ pub(super) async fn control_result<T>(
 fn owner(query: Result<Query<OwnerParams>, QueryRejection>) -> Result<String, AppError> {
     let Query(query) = query
         .map_err(|_| AppError::validation_error("A valid user_id query parameter is required"))?;
-    shared_types::validate_identifier(&query.user_id, "user_id")
+    shared_types::validate_identifier(&query, "user_id")
         .map_err(|_| AppError::validation_error("Invalid user_id query parameter"))?;
     Ok(query.user_id)
 }
@@ -159,11 +159,11 @@ pub async fn get_operation_by_request(
     let Query(query) = query.map_err(|_| {
         AppError::validation_error("Valid user_id and request_id query parameters are required")
     })?;
-    shared_types::validate_identifier(&query.user_id, "user_id")
+    shared_types::validate_identifier(&query, "user_id")
         .map_err(|_| AppError::validation_error("Invalid user_id query parameter"))?;
     let operation = state
         .app_service
-        .get_control_operation_by_request(&app_id, &query.user_id, &query.request_id)
+        .get_control_operation_by_request(&app_id, &query, &query.request_id)
         .await?;
     Ok(Json(HttpResult::success(operation)))
 }
@@ -210,7 +210,6 @@ mod tests {
             .admit(&shared_types::UserAppAdmission {
                 runtime_policy_on_success: None,
                 app_id: "correlation".into(),
-                user_id: "owner".into(),
                 lifecycle_id: None,
                 operation_id: "persisted-operation".into(),
                 request_id: Some("caller-request".into()),
@@ -326,7 +325,6 @@ mod builder_retry_tests {
             let admitted = store
                 .admit(&UserAppAdmission {
                     app_id: "retrybuilder".into(),
-                    user_id: "owner".into(),
                     lifecycle_id: None,
                     operation_id: "original-operation".into(),
                     request_id: Some("original-request".into()),
@@ -343,7 +341,6 @@ mod builder_retry_tests {
                 | UserAppAdmissionOutcome::Existing(record) => record,
             };
             let request = shared_types::UserAppRetryRequest {
-                user_id: "owner".into(),
                 lifecycle_id: record.lifecycle_id.clone(),
                 expected_revision: record.revision,
             };
@@ -353,7 +350,6 @@ mod builder_retry_tests {
             });
             for invalid in [
                 shared_types::UserAppRetryRequest {
-                    user_id: "other-owner".into(),
                     ..request.clone()
                 },
                 shared_types::UserAppRetryRequest {
@@ -434,7 +430,6 @@ mod builder_retry_tests {
             assert_eq!(recorder.0.lock().unwrap().len(), 2);
             let context = shared_types::UserAppExecutionContext {
                 app_id: record.app_id.clone(),
-                user_id: "owner".into(),
                 lifecycle_id: record.lifecycle_id.clone(),
                 operation_id: record.operation_id.clone(),
                 executor_id: "worker".into(),

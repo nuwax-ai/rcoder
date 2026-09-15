@@ -47,7 +47,7 @@ impl AppService {
             self.metadata
                 .validate_request_lifecycle(
                     app_id,
-                    &request.user_id,
+                    &String::new(),
                     request.lifecycle_id.as_deref(),
                 )
                 .await?;
@@ -64,7 +64,6 @@ impl AppService {
                 shared_types::UserAppOperationKind::DeleteCompute
             };
             let identity = shared_types::UserAppControlRequest {
-                user_id: String::new(),
                 lifecycle_id: request.lifecycle_id.clone(),
                 request_id: request.request_id.clone(),
             };
@@ -77,7 +76,7 @@ impl AppService {
             }
             // A known lifecycle may already have no compute workload. Still
             // capture typed residual resources; query failures are never absence.
-            self.get_lifecycle(app_id, &request.user_id).await?;
+            self.get_lifecycle(app_id, &String::new()).await?;
             let mut durable = crate::service::OwnedOperation::admit(
                 self.metadata.store.clone(),
                 shared_types::UserAppAdmission {
@@ -87,7 +86,6 @@ impl AppService {
                         expected_resource_version: request.expected_resource_version.clone(),
                     }),
                     app_id: app_id.into(),
-                    user_id: String::new(),
                     lifecycle_id: request.lifecycle_id.clone(),
                     operation_id: uuid::Uuid::new_v4().to_string(),
                     request_id: request.request_id.clone(),
@@ -100,7 +98,7 @@ impl AppService {
             let mutation = self
                 .execute_resource_deletion(
                     app_id,
-                    &request.user_id,
+                    &String::new(),
                     purge,
                     request.expected_resource_version.as_deref(),
                     &mut durable,
@@ -144,7 +142,7 @@ impl AppService {
         durable: &mut crate::service::OwnedOperation,
         release_lock: &crate::service::AppOperationGuard,
     ) -> AppResult<()> {
-        durable.bind_lease(release_lock, owner).await?;
+        durable.bind_lease(release_lock).await?;
         let kind = if purge {
             shared_types::UserAppOperationKind::PurgeResources
         } else {

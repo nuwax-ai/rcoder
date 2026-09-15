@@ -209,26 +209,23 @@ impl super::AppServiceTrait for AppService {
     async fn get_lifecycle(
         &self,
         app_id: &str,
-        user_id: &str,
     ) -> AppResult<shared_types::UserAppLifecycleRecord> {
-        self.get_lifecycle(app_id, user_id).await
+        self.get_lifecycle(app_id).await
     }
     async fn get_control_operation(
         &self,
         app_id: &str,
-        user_id: &str,
         operation_id: Option<&str>,
     ) -> AppResult<Option<shared_types::UserAppOperationView>> {
-        self.get_control_operation(app_id, user_id, operation_id)
+        self.get_control_operation(app_id, operation_id)
             .await
     }
     async fn get_control_operation_by_request(
         &self,
         app_id: &str,
-        user_id: &str,
         request_id: &str,
     ) -> AppResult<Option<shared_types::UserAppOperationView>> {
-        self.get_control_operation_by_request(app_id, user_id, request_id)
+        self.get_control_operation_by_request(app_id, request_id)
             .await
     }
     async fn recreate_identity(
@@ -239,7 +236,7 @@ impl super::AppServiceTrait for AppService {
         self.recreate_identity(app_id, request).await
     }
 
-    async fn record_dev_registration(&self, app_id: &str, user_id: &str) -> AppResult<()> {
+    async fn record_dev_registration(&self, app_id: &str: &str) -> AppResult<()> {
         self.metadata.store.ensure_identity(app_id).await?;
         Ok(())
     }
@@ -255,7 +252,7 @@ impl super::AppServiceTrait for AppService {
         self.query_apps(request).await
     }
 
-    async fn list_app_runtimes(&self, user_id: &str) -> AppResult<Vec<AppRuntimeInfo>> {
+    async fn list_app_runtimes(&self: &str) -> AppResult<Vec<AppRuntimeInfo>> {
         self.list_app_runtimes(user_id).await
     }
 
@@ -326,9 +323,8 @@ impl super::AppServiceTrait for AppService {
         &self,
         app_stage: shared_types::UserappStage,
         app_id: &str,
-        user_id: &str,
     ) -> AppResult<()> {
-        self.clear_app_storage(app_stage, app_id, user_id).await
+        self.clear_app_storage(app_stage, app_id).await
     }
 
     async fn destroy_app_storage_controlled(
@@ -344,10 +340,9 @@ impl super::AppServiceTrait for AppService {
         &self,
         app_stage: shared_types::UserappStage,
         app_id: &str,
-        user_id: &str,
         confirm: &str,
     ) -> AppResult<()> {
-        self.destroy_app_storage(app_stage, app_id, user_id, confirm)
+        self.destroy_app_storage(app_stage, app_id, confirm)
             .await
     }
 
@@ -458,9 +453,8 @@ impl super::AppServiceTrait for AppService {
         &self,
         app_stage: shared_types::UserappStage,
         app_id: &str,
-        user_id: &str,
     ) -> AppResult<String> {
-        self.log_api_base(app_stage, app_id, user_id).await
+        self.log_api_base(app_stage, app_id).await
     }
 
     async fn get_app_events(
@@ -474,12 +468,11 @@ impl super::AppServiceTrait for AppService {
         &self,
         app_stage: shared_types::UserappStage,
         app_id: &str,
-        user_id: &str,
         file_data: Vec<u8>,
         target: &str,
         flatten: bool,
     ) -> AppResult<UploadResult> {
-        self.upload_file(app_stage, app_id, user_id, file_data, target, flatten)
+        self.upload_file(app_stage, app_id, file_data, target, flatten)
             .await
     }
 
@@ -487,12 +480,11 @@ impl super::AppServiceTrait for AppService {
         &self,
         app_stage: shared_types::UserappStage,
         app_id: &str,
-        user_id: &str,
         url: &str,
         target: &str,
         flatten: bool,
     ) -> AppResult<UploadResult> {
-        self.upload_from_url(app_stage, app_id, user_id, url, target, flatten)
+        self.upload_from_url(app_stage, app_id, url, target, flatten)
             .await
     }
 
@@ -500,20 +492,18 @@ impl super::AppServiceTrait for AppService {
         &self,
         app_stage: shared_types::UserappStage,
         app_id: &str,
-        user_id: &str,
         subpath: Option<&str>,
     ) -> AppResult<Vec<FileInfo>> {
-        self.list_files(app_stage, app_id, user_id, subpath).await
+        self.list_files(app_stage, app_id, subpath).await
     }
 
     async fn delete_file(
         &self,
         app_stage: shared_types::UserappStage,
         app_id: &str,
-        user_id: &str,
         file_path: &str,
     ) -> AppResult<()> {
-        self.delete_file(app_stage, app_id, user_id, file_path)
+        self.delete_file(app_stage, app_id, file_path)
             .await
     }
 }
