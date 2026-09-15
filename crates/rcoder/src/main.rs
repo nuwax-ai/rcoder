@@ -240,6 +240,15 @@ async fn main() -> anyhow::Result<()> {
         // 启动对账（同 Pod 旧 boot 代次实例判停）+ 后台任务（心跳/刷盘/回收）。
         coordinator.run_startup_reconcile().await;
         coordinator.spawn_background_tasks(shutdown_tx.clone());
+        // Pingora 预览路由槽回填（协调器晚于 Pingora 启动，与 dev_ensure 同款模式）：
+        // `/proxy/{port}` 预览解析 + `/internal/preview-forward` 宿主校验入口。
+        if let Some(pingora_service) = proxy_result.pingora_service.as_ref() {
+            pingora_service.set_preview_routing(rcoder_proxy::service::PreviewRouteDeps {
+                coordination: coordinator.clone(),
+                peer_api_port: bootstrap_result.config.port,
+                internal_token: coordinator.internal_token().to_string(),
+            });
+        }
     }
     let preview_enabled = merged_fs.coordinator.is_some();
 

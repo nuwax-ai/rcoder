@@ -61,8 +61,19 @@ impl PortProxy {
                     original_uri,
                     params,
                     self.use_round_robin,
+                    &self.preview_slot,
+                    ctx,
                 )
                 .await?;
+            }
+            RouteType::PreviewForward => {
+                // 校验与短路在 request_filter（404/410/503）；此处仅重写路径。
+                handlers::preview_forward::handle_preview_forward_request(
+                    upstream_request,
+                    original_uri,
+                    &params,
+                    ctx,
+                )?;
             }
             RouteType::ProdAppProxy => {
                 handlers::app_proxy::handle_prod_app_request(
@@ -230,6 +241,9 @@ impl PortProxy {
                     &self.metrics,
                 )
                 .await
+            }
+            RouteType::PreviewForward => {
+                handlers::preview_forward::handle_preview_forward_upstream(ctx).await
             }
             RouteType::ProdAppProxy => {
                 handlers::app_proxy::handle_prod_app_upstream(

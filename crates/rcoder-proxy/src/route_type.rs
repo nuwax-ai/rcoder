@@ -33,6 +33,16 @@ pub enum RouteType {
     /// - `/proxy/3000/`
     PortProxy,
 
+    /// Custom Page 预览转发宿主侧入口:
+    /// `/internal/preview-forward/{instance_id}/{port}/{*path}`
+    ///
+    /// 仅供 rcoder 副本间协调转发（`x-preview-internal-token` 令牌校验 +
+    /// 实例/宿主/登记三重身份校验，见 request_filter 短路逻辑）；
+    /// 校验通过后剥离前缀，剩余路径原样（含 query/base/HMR ws）转本机 vite。
+    /// 令牌缺失/不符 → 404（不暴露端点存在性）；身份不匹配 → 410
+    /// （触发转发方缓存失效重解析）；登记缺失（对账中）→ 503。
+    PreviewForward,
+
     /// userApp 生产应用流量代理（免端口）: `/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}/{*path}`
     ///
     /// - `user_id`: 用户 ID（不参与解析；日志排障/归属鉴权锚点）

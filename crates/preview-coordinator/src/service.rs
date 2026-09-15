@@ -148,6 +148,11 @@ impl PreviewCoordinator {
         &self.config
     }
 
+    /// 内部令牌（rcoder 装配 Pingora 转发槽回填用；与派发客户端/内部端点同源）。
+    pub fn internal_token(&self) -> &str {
+        &self.token
+    }
+
     fn heartbeat_fresh(&self, row: &PreviewInstanceRecord) -> bool {
         row.last_heartbeat_at.is_some_and(|at| {
             let age = chrono::Utc::now()
@@ -795,6 +800,10 @@ impl PreviewCoordination for PreviewCoordinator {
                 PreviewRouteResolution::Unavailable
             }
         }
+    }
+
+    async fn invalidate_route(&self, port: u16) {
+        self.route_cache.invalidate(port);
     }
 
     async fn check_forward(&self, instance_id: &str, port: u16) -> PreviewForwardCheck {

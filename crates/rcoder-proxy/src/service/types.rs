@@ -225,6 +225,14 @@ pub struct TrackingCtx {
     pub upstream_status: Option<u16>,
     /// 错误响应体缓冲（仅在 4xx/5xx 时收集）
     pub error_body_buf: Vec<u8>,
+    /// 预览路由覆盖上游（跨 Pod 转发=宿主 Pod:peer_api_port；
+    /// 宿主侧 internal 路由=127.0.0.1:vite_port）。None=非预览路径。
+    pub preview_peer: Option<(String, u16)>,
+    /// 预览转发校验已过的 vite 端口（internal/preview-forward 路由用，
+    /// request_filter 校验通过后记录，后续阶段免重复校验）。
+    pub preview_forward_port: Option<u16>,
+    /// 预览跨 Pod 转发的原始入口端口（`/proxy/{port}`；宿主 410 后失效缓存用）。
+    pub preview_origin_port: Option<u16>,
 }
 
 impl Default for TrackingCtx {
@@ -246,6 +254,9 @@ impl TrackingCtx {
             api_service_name: None,
             upstream_status: None,
             error_body_buf: Vec::new(),
+            preview_peer: None,
+            preview_forward_port: None,
+            preview_origin_port: None,
         }
     }
 }
@@ -262,3 +273,15 @@ pub const AUDIO_WS_PORT: u16 = 6089; // 音频 WebSocket 流
 // 注：跨 crate 共享的端口常量（NOVNC_PORT、WS_TERMINAL_PORT、TTYD_PORT、IME_PORT 等）
 // 统一定义在 `shared_types::constants`，本 crate 直接引用，不在本地重复定义。
 // （IME_PORT 已提升 shared_types——K8s Service 端口清单消费同值。）
+
+/// 预览路由依赖（rcoder 装配后经 ArcSwap 槽回填；None 槽=预览路由未启用）。
+///
+/// rcoder 主进程装配协调器晚于 Pingora 启动——与 dev_ensure/app_runtime_ip
+/// 槽同款回填模式（PortProxy 与 PingoraProxyService 共享同一 Arc）。
+pub struct PreviewRouteDeps {
+    pub coordination: Arc<dyn shared_types::PreviewCoordination>,
+    /// 对等副本主 API 端口（跨 Pod 内部入口宿主面）。
+    pub peer_api_port: u16,
+    /// 内部令牌（转发 hop 注入；宿主侧校验，不符 404）。
+    pub internal_token: String,
+}

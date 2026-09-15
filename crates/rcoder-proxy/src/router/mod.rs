@@ -62,7 +62,18 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
 /// `/proxy/80` → route not found → 404，app 根路径完全不可达。
 fn insert_port_proxy_routes(router: &mut Router<RouteType>) -> Result<(), crate::ProxyError> {
     insert_route(router, "/proxy/{port}/{*path}", RouteType::PortProxy)?;
-    insert_route(router, "/proxy/{port}", RouteType::PortProxy)
+    insert_route(router, "/proxy/{port}", RouteType::PortProxy)?;
+    // Custom Page 预览转发宿主入口（成对注册：根形态无尾随 path 时兜底）
+    insert_route(
+        router,
+        "/internal/preview-forward/{instance_id}/{port}/{*path}",
+        RouteType::PreviewForward,
+    )?;
+    insert_route(
+        router,
+        "/internal/preview-forward/{instance_id}/{port}",
+        RouteType::PreviewForward,
+    )
 }
 
 /// 健康检查 `/health` + 🔒 API 密钥代理 `/api/{service_name}/{*path}`。

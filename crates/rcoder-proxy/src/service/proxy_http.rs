@@ -41,8 +41,21 @@ impl ProxyHttp for PortProxy {
     async fn request_filter(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> PingoraResult<bool> {
+        // Custom Page 预览转发内部入口：令牌校验（缺失/不符 → 404，不暴露端点
+        // 存在性）+ 实例身份校验（不匹配 → 410 触发转发方缓存失效重解析；
+        // 登记缺失（对账中）→ 503）。校验通过记 ctx（后续阶段免重复校验）。
+        // 在 dbx/wake 之前——内部入口无唤醒语义，且必须先挡住外部探测。
+        if session
+            .req_header()
+            .uri
+            .path()
+            .starts_with("/internal/preview-forward")
+        {
+            return Self::preview_forward_gate(session, ctx, &self.preview_slot).await;
+        }
+
         // dbx 入口尾斜杠规范化（先于唤醒判定——重定向后的二次请求才进入 wake，
         // stopped app 不在无子路径请求上空等一轮）。
         let raw_uri = session.req_header().uri.clone();
@@ -242,6 +255,19 @@ impl ProxyHttp for PortProxy {
     where
         Self::CTX: Send,
     {
+        // 预览跨 Pod 转发收到宿主 410（身份不匹配：IP 复用/实例换代）——
+        // 立即失效本端口的解析缓存，下次请求重解析到新宿主（免等 TTL）。
+        if ctx.preview_peer.is_some()
+            && upstream_response.status == 410
+            && let Some(origin_port) = ctx.preview_origin_port
+            && let Some(deps) = self.preview_slot.load().as_ref()
+        {
+            tracing::info!(
+                port = origin_port,
+                "preview forward got 410 from host; invalidating route cache"
+            );
+            deps.coordination.invalidate_route(origin_port).await;
+        }
         // 记录响应状态
         let status = upstream_response.status;
         let status_text = status.to_string();
@@ -367,6 +393,80 @@ fn dbx_root_redirect_location(
             })
         }
         _ => None,
+    }
+}
+
+/// 预览转发闸门挂载（impl PortProxy 块，非 ProxyHttp trait 成员）。
+impl PortProxy {
+    /// 预览转发内部入口闸门（request_filter 专用短路）。
+    ///
+    /// 语义（spec 行为不变量 11/12）：
+    /// - 槽未装配/令牌缺失或不符 → 404（外部探测者不可区分端点是否存在）；
+    /// - 实例/宿主/端口身份不匹配（IP 复用、实例换代）→ 410（转发方据此失效
+    ///   缓存重解析）；
+    /// - 权威库称本机宿主但本地登记缺失（对账/心跳收敛中）→ 503，不转发；
+    /// - 校验通过 → 记 `ctx.preview_forward_port` 放行（后续阶段不再重复校验）。
+    async fn preview_forward_gate(
+        session: &mut Session,
+        ctx: &mut TrackingCtx,
+        preview_slot: &std::sync::Arc<
+            arc_swap::ArcSwapOption<std::sync::Arc<super::types::PreviewRouteDeps>>,
+        >,
+    ) -> PingoraResult<bool> {
+        async fn respond(status: u16, session: &mut Session) -> PingoraResult<bool> {
+            let resp = ResponseHeader::build(status, None)?;
+            session.write_response_header(Box::new(resp), true).await?;
+            Ok(true)
+        }
+        let Some(deps) = preview_slot.load().as_ref().map(std::sync::Arc::clone) else {
+            return respond(404, session).await;
+        };
+        let token_ok = session
+            .req_header()
+            .headers
+            .get("x-preview-internal-token")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|provided| provided == deps.internal_token);
+        if !token_ok {
+            return respond(404, session).await;
+        }
+        // 路径手工解析（request_filter 阶段无 matchit 参数）：
+        // /internal/preview-forward/{instance_id}/{port}/{rest...}
+        let segments: Vec<&str> = session
+            .req_header()
+            .uri
+            .path()
+            .trim_start_matches('/')
+            .split('/')
+            .collect();
+        // [internal, preview-forward, {instance_id}, {port}, {rest...}...]
+        if segments.len() < 5 || segments[0] != "internal" || segments[1] != "preview-forward" {
+            // 根形态（无 rest）由路由层兜底，但无 rest 的转发无意义——404
+            return respond(404, session).await;
+        }
+        let instance_id = segments[2];
+        let Ok(vite_port) = segments[3].parse::<u16>() else {
+            return respond(404, session).await;
+        };
+        match deps
+            .coordination
+            .check_forward(instance_id, vite_port)
+            .await
+        {
+            shared_types::PreviewForwardCheck::Allowed => {
+                ctx.preview_forward_port = Some(vite_port);
+                Ok(false)
+            }
+            shared_types::PreviewForwardCheck::IdentityMismatch => {
+                tracing::info!(
+                    instance_id,
+                    vite_port,
+                    "preview forward identity mismatch -> 410 (forwarder should re-resolve)"
+                );
+                respond(410, session).await
+            }
+            shared_types::PreviewForwardCheck::NotReady => respond(503, session).await,
+        }
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! 处理 `/proxy/{port}/{*path}` 路径的端口反向代理。
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use matchit::Params;
 use pingora_core::Result as PingoraResult;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error};
 
-use crate::service::types::{ProxyMetrics, TrackingCtx};
+use crate::service::types::{PreviewRouteDeps, ProxyMetrics, TrackingCtx};
 use crate::service::utils;
+use shared_types::PreviewRouteResolution;
 
 /// 处理端口代理请求
 ///
@@ -29,6 +30,8 @@ pub async fn handle_port_proxy_request(
     original_uri: &http::Uri,
     params: Params<'_, '_>,
     use_round_robin: bool,
+    preview_slot: &Arc<ArcSwapOption<Arc<PreviewRouteDeps>>>,
+    ctx: &mut TrackingCtx,
 ) -> PingoraResult<()> {
     // 从路径参数中提取端口
     let port_str = params.get("port").ok_or_else(|| {
@@ -55,6 +58,29 @@ pub async fn handle_port_proxy_request(
         "portproxyrequest: port={}, target_path={}",
         port, target_path
     );
+
+    // Custom Page 预览解析：命中远端宿主 → 跨 Pod 转发（重写为内部入口 + 令牌）；
+    // 命中本机/未命中/存储不可用 → 走下方既有本机路径（行为与现状一致）。
+    if let Some(deps) = preview_slot.load().as_ref()
+        && let PreviewRouteResolution::Forward {
+            instance_id,
+            port: preview_port,
+            host_ip,
+        } = deps.coordination.resolve_route(port).await
+    {
+        let internal_path =
+            format!("/internal/preview-forward/{instance_id}/{preview_port}{target_path}");
+        let internal_uri = utils::rewrite_uri(original_uri, internal_path)?;
+        upstream_request.set_uri(internal_uri);
+        // 令牌头覆盖（客户端伪造值被替换为进程持有令牌）
+        upstream_request.insert_header("x-preview-internal-token", &deps.internal_token)?;
+        upstream_request.insert_header("Host", "127.0.0.1")?;
+        utils::set_common_headers(upstream_request)?;
+        ctx.preview_peer = Some((host_ip, deps.peer_api_port));
+        ctx.preview_origin_port = Some(port);
+        ctx.target_port = Some(deps.peer_api_port);
+        return Ok(());
+    }
 
     // 设置 Host 头
     upstream_request.insert_header("Host", "127.0.0.1")?;
@@ -93,6 +119,17 @@ pub async fn handle_port_proxy_upstream(
     backend_host: &str,
     metrics: &Arc<ProxyMetrics>,
 ) -> PingoraResult<Box<HttpPeer>> {
+    // 预览跨 Pod 覆盖上游：宿主 Pod 的主 API 端口（路径已重写为内部入口）。
+    if let Some((host_ip, peer_port)) = ctx.preview_peer.clone() {
+        let mut peer = HttpPeer::new((host_ip.as_str(), peer_port), false, "".to_string());
+        peer.options.connection_timeout = Some(Duration::from_secs(10));
+        peer.options.read_timeout = None;
+        peer.options.write_timeout = None;
+        peer.options.total_connection_timeout = Some(Duration::from_secs(15));
+        peer.options.idle_timeout = Some(Duration::from_secs(3600));
+        ctx.upstream_host = Some(host_ip);
+        return Ok(Box::new(peer));
+    }
     // 从路径参数中提取端口
     let port_str = params.get("port").ok_or_else(|| {
         error!("port proxy route missing port params");

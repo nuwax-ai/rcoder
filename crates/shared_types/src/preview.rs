@@ -578,6 +578,9 @@ pub trait PreviewCoordination: Send + Sync {
     /// `/proxy/{port}` 预览路由解析（内存缓存→权威库；错误降级 NotPreview 同义）。
     async fn resolve_route(&self, port: u16) -> PreviewRouteResolution;
 
+    /// 失效某端口的解析缓存（宿主 410 身份拒绝后由转发方调用——下次请求立即重解析）。
+    async fn invalidate_route(&self, port: u16);
+
     /// 宿主侧转发校验（`/internal/preview-forward` 四重校验的协调器侧）。
     async fn check_forward(&self, instance_id: &str, port: u16) -> PreviewForwardCheck;
 

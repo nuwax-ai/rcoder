@@ -74,6 +74,9 @@ pub struct PingoraProxyService {
     /// userApp 运行容器 IPv4 解析（Docker 模式；ArcSwap 槽——启动后经
     /// [`Self::set_app_runtime_ip_resolver`] 回填，PortProxy 共享同槽实时见）
     pub(crate) app_runtime_ip_slot: Arc<ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>>,
+    /// Custom Page 预览路由依赖（ArcSwap 槽——协调器装配晚于 Pingora 启动，
+    /// main 侧经 [`Self::set_preview_routing`] 回填）
+    pub(crate) preview_slot: Arc<ArcSwapOption<Arc<PreviewRouteDeps>>>,
 }
 
 /// 为了兼容现有接口，我们保留原来的 PortProxyService 别名
@@ -111,6 +114,8 @@ pub struct PortProxy {
     pub(crate) dev_ensure_slot: Arc<ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>>,
     /// userApp 运行容器 IPv4 解析槽（与 PingoraProxyService 共享同一 Arc）
     pub(crate) app_runtime_ip_slot: Arc<ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>>,
+    /// 预览路由依赖槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) preview_slot: Arc<ArcSwapOption<Arc<PreviewRouteDeps>>>,
 }
 
 impl PingoraProxyService {
@@ -136,6 +141,7 @@ impl PingoraProxyService {
             wake_control: None,
             dev_ensure_slot: Arc::new(ArcSwapOption::from(None)),
             app_runtime_ip_slot: Arc::new(ArcSwapOption::from(None)),
+            preview_slot: Arc::new(ArcSwapOption::from(None)),
         }
     }
 
@@ -173,6 +179,11 @@ impl PingoraProxyService {
     /// PortProxy 共享槽，无锁生效）
     pub fn set_dev_ensure(&self, de: Arc<dyn shared_types::UserappDevEnsure>) {
         self.dev_ensure_slot.store(Some(Arc::new(de)));
+    }
+
+    /// 回填预览路由依赖（协调器装配晚于 Pingora 启动；PortProxy 共享槽实时见）。
+    pub fn set_preview_routing(&self, deps: PreviewRouteDeps) {
+        self.preview_slot.store(Some(Arc::new(Arc::new(deps))));
     }
 
     /// 设置负载均衡算法
@@ -227,6 +238,7 @@ impl PingoraProxyService {
             wake_control: self.wake_control.clone(),
             dev_ensure_slot: Arc::clone(&self.dev_ensure_slot),
             app_runtime_ip_slot: self.app_runtime_ip_slot.clone(),
+            preview_slot: Arc::clone(&self.preview_slot),
         })
     }
 }
@@ -249,6 +261,7 @@ impl Clone for PingoraProxyService {
             wake_control: self.wake_control.clone(),
             dev_ensure_slot: Arc::clone(&self.dev_ensure_slot),
             app_runtime_ip_slot: self.app_runtime_ip_slot.clone(),
+            preview_slot: Arc::clone(&self.preview_slot),
         }
     }
 }
