@@ -52,8 +52,7 @@ impl DevServerManager {
         // stdout 管道有界排空（进程组已停；后代持有写端时窗口到期放弃）。
         if let Some(supervised) = supervised {
             let drain_timeout = std::time::Duration::from_secs(
-                self.config.dev_stop_max_attempts as u64
-                    * self.config.dev_stop_check_interval_ms
+                self.config.dev_stop_max_attempts as u64 * self.config.dev_stop_check_interval_ms
                     / 1000,
             );
             supervised.drain_stdout(drain_timeout).await;
@@ -66,10 +65,10 @@ impl DevServerManager {
             let cleanup_project_id = project_id.to_string();
             let cleanup_map = self.cleanup_state.clone();
             tokio::spawn(async move {
-                if supervised.wait_exit(drain_timeout).await.is_some() {
-                    if let Ok(mut cleanup) = cleanup_map.lock() {
-                        cleanup.insert(cleanup_project_id, CleanupStatus::Cleaned);
-                    }
+                if supervised.wait_exit(drain_timeout).await.is_some()
+                    && let Ok(mut cleanup) = cleanup_map.lock()
+                {
+                    cleanup.insert(cleanup_project_id, CleanupStatus::Cleaned);
                 }
             });
         }

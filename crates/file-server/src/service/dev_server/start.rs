@@ -330,8 +330,12 @@ impl DevServerManager {
             // EVT 识别（hooks Some 时回调编排事件行；None 退化为 no-op 闭包，
             // 日志行为不变）；管道结束（EOF/读错）经 hooks.on_end 上报恰好一次。
             let pipe_hooks = hooks.unwrap_or_else(super::supervise::DevEventHooks::noop);
-            let pipe =
-                log::spawn_log_pipe_with_events(out, main_log.clone(), temp_log.clone(), pipe_hooks);
+            let pipe = log::spawn_log_pipe_with_events(
+                out,
+                main_log.clone(),
+                temp_log.clone(),
+                pipe_hooks,
+            );
             supervised.attach_stdout(pipe);
         }
         if let Some(err) = stderr {

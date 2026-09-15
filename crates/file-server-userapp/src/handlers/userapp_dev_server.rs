@@ -350,11 +350,7 @@ async fn spawn_dev_task(
         // pingap 确认余量（30s）与调度余量（120s），再取上限 1200s 兜底。
         let launch_budget_secs = std::cmp::min(
             START_DONE_WAIT_MAX_SECS,
-            state
-                .fs
-                .config
-                .dev_command_timeout_secs
-                .saturating_add(150),
+            state.fs.config.dev_command_timeout_secs.saturating_add(150),
         );
         let hook_tx = evt_tx.clone();
         let runtime_hooks_tx = evt_tx.clone();
@@ -454,7 +450,7 @@ async fn spawn_dev_task(
                     }
                 });
             }
-            let _ = drop(evt_tx);
+            drop(evt_tx);
             event_pipe.finish(std::time::Duration::from_secs(launch_budget_secs)).await
         }
         .await;

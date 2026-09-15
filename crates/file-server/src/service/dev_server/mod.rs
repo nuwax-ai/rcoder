@@ -16,9 +16,9 @@ pub mod error_classify;
 pub mod log;
 pub mod port_pool;
 pub mod process;
-pub mod supervise;
 mod start;
 mod stop;
+pub mod supervise;
 mod support;
 mod types;
 
@@ -56,10 +56,7 @@ impl DevServerManager {
     /// 取 UserApp manifest 编排进程的监督句柄（P1-03/P1-04：调用方经此
     /// 观察 exit/stderr 尾部与有界排空；未登记（vite 路径或未启动）None）。
     pub fn supervised_child(&self, project_id: &str) -> Option<Arc<SupervisedChild>> {
-        lock(&self.supervised)
-            .ok()?
-            .get(project_id)
-            .cloned()
+        lock(&self.supervised).ok()?.get(project_id).cloned()
     }
 
     /// 是否存在未完成的进程清理状态（P1-05）：stop_dev 未在停止窗口内
@@ -182,18 +179,14 @@ mod tests {
     #[tokio::test]
     async fn shutdown_all_empty_is_noop() {
         // 空实例表 → 立即返回, 不 panic
-        let mgr = DevServerManager::new(Arc::new(
-            Config::from_env().expect("test config"),
-        ));
+        let mgr = DevServerManager::new(Arc::new(Config::from_env().expect("test config")));
         mgr.shutdown_all().await;
     }
 
     #[tokio::test]
     async fn drop_with_stale_entry_does_not_panic() {
         // 塞一个不可能存活的 pid: Drop 对其 SIGKILL 返回 false 但不 panic, 仍还端口 + 清表
-        let mgr = DevServerManager::new(Arc::new(
-            Config::from_env().expect("test config"),
-        ));
+        let mgr = DevServerManager::new(Arc::new(Config::from_env().expect("test config")));
         {
             let mut procs = mgr.processes.lock().unwrap();
             procs.insert(
@@ -223,7 +216,8 @@ mod tests {
         let mgr = DevServerManager::new(Arc::new(config));
         // pid 用当前进程 → is_process_running 恒 true
         let pid = std::process::id();
-        let ring: Arc<StderrRing> = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let ring: Arc<StderrRing> =
+            Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let start = std::time::Instant::now();
         let res = mgr
             .poll_alive(pid, 0, None, &ring, &|_port, _base, _timeout| {

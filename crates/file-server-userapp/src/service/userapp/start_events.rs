@@ -20,11 +20,17 @@ const PRODUCER_EXIT_DRAIN_WINDOW: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub(crate) enum StartEvent {
     Event(BuildProgressEvent),
-    Done { failed: Vec<(String, String)> },
+    Done {
+        failed: Vec<(String, String)>,
+    },
     /// 编排进程退出（`exit`=人读描述 + 可选 stderr 尾部；任意退出码）。
-    ProducerExited { exit: String },
+    ProducerExited {
+        exit: String,
+    },
     /// stdout 事件管道结束（EOF/读错）——事件通道不再有新输入。
-    StreamEnded { reason: String },
+    StreamEnded {
+        reason: String,
+    },
 }
 
 /// Aborting the caller also stops the progress consumer, including while waiting.
@@ -89,18 +95,16 @@ async fn consume(
     let mut drain_deadline: Option<tokio::time::Instant> = None;
     loop {
         let event = match drain_deadline {
-            Some(deadline) => {
-                match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(event) => event,
-                    Err(_) => {
-                        let exit = exited.as_deref().unwrap_or("unknown");
-                        return Err(exited_failure(
-                            exit,
-                            "drain window elapsed without completion event".into(),
-                        ));
-                    }
+            Some(deadline) => match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(event) => event,
+                Err(_) => {
+                    let exit = exited.as_deref().unwrap_or("unknown");
+                    return Err(exited_failure(
+                        exit,
+                        "drain window elapsed without completion event".into(),
+                    ));
                 }
-            }
+            },
             None => rx.recv().await,
         };
         let Some(event) = event else {
@@ -110,9 +114,7 @@ async fn consume(
                     &exit,
                     "event channel closed without completion event".into(),
                 ),
-                None => AppError::business(
-                    "Startup event stream closed before completion",
-                ),
+                None => AppError::business("Startup event stream closed before completion"),
             });
         };
         match event {
@@ -123,8 +125,7 @@ async fn consume(
             StartEvent::ProducerExited { exit } => {
                 tracing::warn!(%exit, "startup orchestrator exited before completion event");
                 exited = Some(exit);
-                drain_deadline =
-                    Some(tokio::time::Instant::now() + PRODUCER_EXIT_DRAIN_WINDOW);
+                drain_deadline = Some(tokio::time::Instant::now() + PRODUCER_EXIT_DRAIN_WINDOW);
             }
             StartEvent::StreamEnded { reason } => {
                 if let Some(exit) = exited {

@@ -40,6 +40,9 @@ impl std::fmt::Display for StreamEndReason {
     }
 }
 
+/// stdout/stderr 管道结束回调（P1-03）。
+pub type StreamEndCallback = Arc<dyn Fn(&StreamEndReason) + Send + Sync>;
+
 /// dev 启动的事件钩子（userapp manifest 链路；web/vite 路径传 None）。
 ///
 /// - `on_line`：每原始行去 `APP-CLI-EVT ` 前缀后的 JSON（同旧
@@ -50,7 +53,7 @@ impl std::fmt::Display for StreamEndReason {
 #[derive(Clone)]
 pub struct DevEventHooks {
     pub on_line: OnLineCallback,
-    pub on_end: Option<Arc<dyn Fn(&StreamEndReason) + Send + Sync>>,
+    pub on_end: Option<StreamEndCallback>,
 }
 
 impl DevEventHooks {
@@ -157,13 +160,9 @@ impl SupervisedChild {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(mut handle) = handle
-            && tokio::time::timeout(window, &mut handle)
-                .await
-                .is_err()
+            && tokio::time::timeout(window, &mut handle).await.is_err()
         {
-            tracing::warn!(
-                "stdout drain window exceeded; a descendant may hold the pipe open"
-            );
+            tracing::warn!("stdout drain window exceeded; a descendant may hold the pipe open");
         }
     }
 }
@@ -195,16 +194,21 @@ mod tests {
         let child = spawn_child("/bin/sh", &["-c", "sleep 5"]);
         let supervised = SupervisedChild::adopt(child, ring());
         assert!(
-            supervised.wait_exit(Duration::from_millis(100)).await.is_none(),
+            supervised
+                .wait_exit(Duration::from_millis(100))
+                .await
+                .is_none(),
             "child must still be running"
         );
         assert!(supervised.exited().is_none());
         // SIGKILL 直杀（不经 stop 路径）——watcher 必须能观察到并收割。
         let pid = supervised.pid() as i32;
-        let _ = tokio::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status()
-            .await;
+        drop(
+            tokio::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status()
+                .await,
+        );
         let exit = supervised
             .wait_exit(Duration::from_secs(5))
             .await
@@ -233,16 +237,11 @@ mod tests {
     #[tokio::test]
     async fn drain_stdout_is_bounded_when_pipe_stays_open() {
         // 父进程立即退出，孙进程继承 stdout 并长睡——管道不 EOF。
-        let child = spawn_child(
-            "/bin/sh",
-            &["-c", "(sleep 30 &) ; exit 0"],
-        );
+        let child = spawn_child("/bin/sh", &["-c", "(sleep 30 &) ; exit 0"]);
         let supervised = SupervisedChild::adopt(child, ring());
         supervised.attach_stdout(tokio::spawn(async {})); // 占位已结束的管道 task
         let start = std::time::Instant::now();
-        supervised
-            .drain_stdout(Duration::from_millis(200))
-            .await;
+        supervised.drain_stdout(Duration::from_millis(200)).await;
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "drain must honour the bounded window"
