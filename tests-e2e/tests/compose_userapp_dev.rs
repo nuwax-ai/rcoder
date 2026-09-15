@@ -55,7 +55,6 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
             ) {
                 rcoder_e2e::common::resources::register_builder_attempt(
                     body["app_id"].as_str().expect("workspace app identity"),
-                    body["user_id"].as_str().expect("workspace owner identity"),
                     false,
                 )
                 .expect("register uncertain workspace resource");
@@ -71,7 +70,6 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
     ) {
         rcoder_e2e::common::resources::register_builder_attempt(
             body["app_id"].as_str().expect("workspace app identity"),
-            body["user_id"].as_str().expect("workspace owner identity"),
             status.is_success() && http_ok(&response),
         )
         .expect("register workspace resource identity");
@@ -100,12 +98,12 @@ fn scoped_app(env: &Env, tag: &str) -> String {
 
 /// 显式清理开发容器（Docker: docker rm；K8s 模式由 rcoder 闲置回收兜底，
 /// 测试内不等待——场景各自创建唯一 app_id 不复用）。
-fn cleanup_builder(user_id: &str, app_id: &str) {
-    // 复合键后容器名 = rcoder-app-builder-{user_id}-{app_id}（user_id 段可含 '-'，
+fn cleanup_builder(_user_id: &str, app_id: &str) {
+    // 应用共享：builder 容器名 = rcoder-app-builder-{app_id}（无用户段；
     // rsplit_once 右切还原——清理侧传创建时的实例 user）。
-    if let Err(error) = rcoder_e2e::common::resources::cleanup_container(&format!(
-        "rcoder-app-builder-{user_id}-{app_id}"
-    )) {
+    if let Err(error) =
+        rcoder_e2e::common::resources::cleanup_container(&format!("rcoder-app-builder-{app_id}"))
+    {
         eprintln!("owned builder cleanup failed: {error}");
     }
 }
@@ -132,7 +130,7 @@ async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user:
             .send()
             .await;
         let Ok(resp) = resp else {
-            rcoder_e2e::common::resources::register_builder_attempt(app_id, user, false)
+            rcoder_e2e::common::resources::register_builder_attempt(app_id, false)
                 .expect("register uncertain builder creation");
             continue;
         };
@@ -140,7 +138,6 @@ async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user:
         body = resp.json().await.unwrap_or(Value::Null);
         rcoder_e2e::common::resources::register_builder_attempt(
             app_id,
-            user,
             status.is_success() && http_ok(&body),
         )
         .expect("register builder creation identity");
@@ -696,11 +693,12 @@ async fn scenario_userapp_chat_full_turn(backend: Backend) {
     };
     let sid = data.session_id.clone();
     report.assert_hard("session_id 非空", !sid.is_empty(), sid.clone());
-    // userApp 特有：project_id 回显 = 复合键（session 映射/路由锚点已实例化）
+    // userApp 特有：project_id 回显 = 纯 app_id（应用共享，session 映射/路由
+    // 锚点按 (stage, app_id) 实例化——用户绑定移除）
     report.assert_hard(
-        "project_id 回显 = 复合键",
-        data.project_id == format!("{user}-{app}"),
-        format!("回显 {:?}，期望 {user}-{app:?}", data.project_id),
+        "project_id 回显 = 纯 app_id",
+        data.project_id == app,
+        format!("回显 {:?}，期望 {app:?}", data.project_id),
     );
 
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -806,9 +804,9 @@ async fn scenario_userapp_chat_workdir_agent_work_dir(backend: Backend) {
     let sid = data.session_id.clone();
     report.assert_hard("session_id 非空", !sid.is_empty(), sid.clone());
     report.assert_hard(
-        "project_id 回显 = 复合键",
-        data.project_id == format!("{user}-{app}"),
-        format!("回显 {:?}，期望 {user}-{app:?}", data.project_id),
+        "project_id 回显 = 纯 app_id",
+        data.project_id == app,
+        format!("回显 {:?}，期望 {app:?}", data.project_id),
     );
 
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -1992,7 +1990,7 @@ async fn userapp_dev_owner_header_lazy_ensure() {
     // 懒创建走原生拦截分流（非 create_workspace 辅助），显式登记本场景
     // 拥有的 builder 身份——严格清理入口要求创建回执。
     if ok_b {
-        rcoder_e2e::common::resources::register_builder_attempt(&app, user, true)
+        rcoder_e2e::common::resources::register_builder_attempt(&app, true)
             .expect("register lazy-created builder identity");
     }
 
@@ -2132,7 +2130,7 @@ async fn userapp_dev_new_endpoint_body_query_locate() {
     // 懒创建经 dev 转发链发生（非 create_workspace 辅助），显式登记本场景
     // 拥有的 builder 身份——严格清理入口要求创建回执。
     if ok_a {
-        rcoder_e2e::common::resources::register_builder_attempt(&app, user, true)
+        rcoder_e2e::common::resources::register_builder_attempt(&app, true)
             .expect("register lazy-created builder identity");
     }
 
@@ -2316,8 +2314,8 @@ async fn userapp_dev_precheck_rejects_empty_and_no_services() {
 }
 
 /// docker inspect 读容器 Id（cleanup_builder 同款 std::process::Command 先例）。
-fn docker_inspect_id(user_id: &str, app_id: &str) -> Option<String> {
-    let name = format!("rcoder-app-builder-{user_id}-{app_id}");
+fn docker_inspect_id(_user_id: &str, app_id: &str) -> Option<String> {
+    let name = format!("rcoder-app-builder-{app_id}");
     let out = std::process::Command::new("docker")
         .args(["inspect", "--format", "{{.Id}}", &name])
         .output()
@@ -2372,7 +2370,7 @@ async fn userapp_dev_registry_self_heal_after_restart() {
 
     // docker restart CLI 返回时容器已 Running——无"restart 进行中触发请求走
     // Gone 重建分支"的竞态窗口
-    let name = format!("rcoder-app-builder-{user}-{app}");
+    let name = format!("rcoder-app-builder-{app}");
     let restart_ok = std::process::Command::new("docker")
         .args(["restart", &name])
         .output()
@@ -3084,7 +3082,7 @@ async fn userapp_dev_pod_identity_list_and_status() {
         .expect("pod list");
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or(Value::Null);
-    let builder_name = format!("rcoder-app-builder-{user}-{app}");
+    let builder_name = format!("rcoder-app-builder-{app}");
     let found = body["data"]["containers"]
         .as_array()
         .and_then(|list| {
@@ -3140,7 +3138,7 @@ async fn userapp_dev_pod_identity_list_and_status() {
 }
 
 // ============================================================
-// 场景：双用户同 app——复合键 (user_id, app_id) 协作实例
+// 场景：双用户同 app——应用共享（用户绑定移除）：单一 builder + 共享工作区
 // ============================================================
 async fn scenario_two_users_share_app() {
     let scenario = "userapp_dev_two_users_share_app";
@@ -3158,7 +3156,7 @@ async fn scenario_two_users_share_app() {
         return;
     }
 
-    // u2 pod/ensure：协作者轻量路径（不进 lifecycle admit，独立实例）
+    // u2 pod/ensure：应用共享——同 app 命中同一 builder（不建第二实例）
     let resp = env
         .http
         .post(format!("{}/computer/pod/ensure", env.rcoder))
@@ -3185,7 +3183,7 @@ async fn scenario_two_users_share_app() {
     };
     let ok_u2 = su2.is_success() && bu2["success"].as_bool().unwrap_or(false);
     report.assert_hard(
-        "u2 pod/ensure 协作者实例受理（轻量路径，不撞 owner lifecycle）",
+        "u2 pod/ensure 同 app 受理（共享 builder，幂等复用）",
         ok_u2,
         format!("HTTP {su2}, {}", trunc(&bu2, 120)),
     );
@@ -3195,30 +3193,24 @@ async fn scenario_two_users_share_app() {
         return;
     }
 
-    // 两容器并存（复合名）
-    let name1 = format!("rcoder-app-builder-{u1}-{app}");
-    let name2 = format!("rcoder-app-builder-{u2}-{app}");
-    let both = std::process::Command::new("docker")
+    // 应用共享：同 app 恒一容器（u2 ensure 不建第二实例）
+    let shared_name = format!("rcoder-app-builder-{app}");
+    let single = std::process::Command::new("docker")
         .args([
             "ps",
             "-a",
             "--filter",
-            &format!("name={name1}"),
-            "--filter",
-            &format!("name={name2}"),
+            &format!("name={shared_name}"),
             "--format",
             "{{.Names}}",
         ])
         .output()
-        .map(|o| {
-            let names = String::from_utf8_lossy(&o.stdout).to_string();
-            names.contains(&name1) && names.contains(&name2)
-        })
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().lines().count() == 1)
         .unwrap_or(false);
     report.assert_hard(
-        "两实例容器并存（rcoder-app-builder-{u1}-{app} + {u2}-{app}）",
-        both,
-        format!("{name1} / {name2}"),
+        "双用户同 app 共享单一 builder 容器（rcoder-app-builder-{app}）",
+        single,
+        format!("期望容器数=1（{shared_name}）"),
     );
 
     // 文件互不可见：u1 写文件，u2 的列表不应见到（独立 PVC subPath 工作区）
@@ -3246,17 +3238,17 @@ async fn scenario_two_users_share_app() {
         .header("x-user-id", u2)
         .send()
         .await;
-    let leak = match list2 {
+    let shared_visibility = match list2 {
         Ok(r) => {
             let body: Value = r.json().await.unwrap_or(Value::Null);
             body.to_string().contains("owner-only.txt")
         }
-        Err(_) => true, // 请求失败按泄漏处理（保守）
+        Err(_) => false, // 请求失败按不可见处理（重试由上层场景覆盖）
     };
     report.assert_hard(
-        "u2 工作区不可见 u1 文件（实例隔离）",
-        !leak,
-        "owner-only.txt 不应出现在 u2 列表".into(),
+        "u2 可见 u1 文件（共享工作区——应用共享模型）",
+        shared_visibility,
+        "owner-only.txt 应出现在共享文件列表".into(),
     );
 
     // chat workdir：两用户各自 chat 回显复合键 project（session 映射实例化）
@@ -3281,7 +3273,7 @@ async fn scenario_two_users_share_app() {
                     "ps",
                     "-a",
                     "--filter",
-                    &format!("name=rcoder-app-builder-{u1}-{app}"),
+                    &format!("name=rcoder-app-builder-{app}"),
                     "--format",
                     "{{.Names}}",
                 ])

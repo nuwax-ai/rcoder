@@ -63,9 +63,9 @@ fn scoped_app(env: &Env, tag: &str) -> String {
 
 fn cleanup_builder(app_id: &str) {
     // 复合键后容器名含实例 user 段（本文件场景 owner 恒为 e2e-br-user）
-    if let Err(error) = rcoder_e2e::common::resources::cleanup_container(&format!(
-        "rcoder-app-builder-e2e-br-user-{app_id}"
-    )) {
+    if let Err(error) =
+        rcoder_e2e::common::resources::cleanup_container(&format!("rcoder-app-builder-{app_id}"))
+    {
         eprintln!("owned builder cleanup failed: {error}");
     }
 }
@@ -83,7 +83,7 @@ async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user:
             .send()
             .await;
         let Ok(resp) = resp else {
-            rcoder_e2e::common::resources::register_builder_attempt(app_id, user, false)
+            rcoder_e2e::common::resources::register_builder_attempt(app_id, false)
                 .expect("register uncertain builder creation");
             continue;
         };
@@ -91,7 +91,6 @@ async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user:
         body = resp.json().await.unwrap_or(Value::Null);
         rcoder_e2e::common::resources::register_builder_attempt(
             app_id,
-            user,
             status.is_success() && http_ok(&body),
         )
         .expect("register builder creation identity");

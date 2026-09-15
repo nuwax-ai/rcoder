@@ -40,7 +40,6 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
             ) {
                 rcoder_e2e::common::resources::register_builder_attempt(
                     body["app_id"].as_str().expect("workspace app identity"),
-                    body["user_id"].as_str().expect("workspace owner identity"),
                     false,
                 )
                 .expect("register uncertain workspace resource");
@@ -56,7 +55,6 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
     ) {
         rcoder_e2e::common::resources::register_builder_attempt(
             body["app_id"].as_str().expect("workspace app identity"),
-            body["user_id"].as_str().expect("workspace owner identity"),
             status.is_success() && http_ok(&response),
         )
         .expect("register workspace resource identity");
@@ -67,10 +65,10 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
 /// 显式清理 build 触发的 builder 容器（rcoder-app-builder-<app_id>；
 /// TestUserGuard 只清 agent-runner 前缀，builder 需场景自理）。
 fn cleanup_builder(app_id: &str) {
-    // 复合键后容器名含实例 user 段（本文件场景 owner 恒为 e2e-user）
-    if let Err(error) = rcoder_e2e::common::resources::cleanup_container(&format!(
-        "rcoder-app-builder-e2e-user-{app_id}"
-    )) {
+    // 应用共享：builder 容器名 = rcoder-app-builder-{app_id}（无用户段）
+    if let Err(error) =
+        rcoder_e2e::common::resources::cleanup_container(&format!("rcoder-app-builder-{app_id}"))
+    {
         eprintln!("owned builder cleanup failed: {error}");
     }
 }
@@ -286,8 +284,9 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
     );
 }
 
-/// start 无 url 三态语义：不存在 + 缺 user_id → HTTP 200 + ERR_VALIDATION；不存在 + 带 user_id → 创建
-/// 空容器（200，基础设施形态）；restart 无 url 对不存在 app → 仍 404（重启不创建）。
+/// start 无 url 语义（用户绑定移除后）：不存在 → 创建空容器（200，基础设施
+/// 形态；多余 user_id 字段按未知值忽略）；restart 无 url 对不存在 app → 仍
+/// 404（重启不创建）。
 async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
     let suffix = format!(
         "{}{}",
@@ -295,28 +294,9 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
         std::process::id() % 1000
     );
 
-    // ① 不存在 + 缺 user_id → 422（serde 提取层拒缺必填字段——user_id 必填化
-    //    后 Json 反序列化先于 garde 校验，axum 裸 422；带提示 missing field）
-    let (s1, b1) = post_json(
-        env,
-        &format!("/api/v1/userapp/app-e2e-nokey-{suffix}/start"),
-        json!({}),
-    )
-    .await;
-    report.assert_hard(
-        "start 无 url 缺 user_id → HTTP 200 + ERR_VALIDATION",
-        error_envelope(s1, &b1, "ERR_VALIDATION"),
-        format!("HTTP {s1}, {}", trunc(&b1, 100)),
-    );
-
-    // ② 不存在 + 带 user_id → 200 创建空容器（Running，无部署内容）
+    // ① 不存在（body 空）→ 200 创建空容器（无用户维度必填字段）
     let app_id = format!("app-e2e-empty-{suffix}");
-    let (s2, b2) = post_json(
-        env,
-        &format!("/api/v1/userapp/{app_id}/start"),
-        json!({"user_id": "e2e-user"}),
-    )
-    .await;
+    let (s2, b2) = post_json(env, &format!("/api/v1/userapp/{app_id}/start"), json!({})).await;
     let created = s2.is_success() && http_ok(&b2);
     report.assert_hard(
         "start 无 url 对不存在 app 创建空容器（200）",
@@ -1237,7 +1217,6 @@ async fn test_ensure_workspace_idempotent(env: &Env, report: &JsonlReporter) {
     let (s1, b1) = call().await;
     rcoder_e2e::common::resources::register_builder_attempt(
         &ident,
-        user,
         s1.is_success() && http_ok(&b1),
     )
     .expect("register initial ensure identity");

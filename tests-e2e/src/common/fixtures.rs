@@ -11,7 +11,7 @@ pub async fn failing_build(env: &Env, report: &JsonlReporter, app: &str) {
         .await
         .expect("create test workspace");
     let body: serde_json::Value = workspace.json().await.expect("workspace envelope");
-    super::resources::register_builder_attempt(app, "e2e-user", body["code"] == "0000")
+    super::resources::register_builder_attempt(app, body["code"] == "0000")
         .expect("register fixture builder identity");
     report.assert_hard(
         "fixture workspace created",

@@ -106,7 +106,7 @@ fn register_container_identity(
 /// Observe a successful or uncertain builder creation immediately. Only the
 /// current case's namespace and authoritative owner/family labels can authorize
 /// registration; absence after an unsuccessful HTTP response is not an error.
-pub fn register_builder_attempt(app_id: &str, user_id: &str, required: bool) -> Result<(), String> {
+pub fn register_builder_attempt(app_id: &str, required: bool) -> Result<(), String> {
     let case = std::env::var("E2E_CASE_ID").map_err(|_| "strict case identity is required")?;
     if !case.get(..10).is_some_and(|prefix| app_id.contains(prefix)) {
         return Err("builder app ID is outside the current case namespace".into());
@@ -116,10 +116,8 @@ pub fn register_builder_attempt(app_id: &str, user_id: &str, required: bool) -> 
             "ps",
             "-aq",
             "--filter",
-            // 复合键后 application-id 标签值 = `{user_id}-{app_id}` 实例串
-            &format!("label=rcoder.io/application-id={user_id}-{app_id}"),
-            "--filter",
-            &format!("label=rcoder.io/owner-id={user_id}"),
+            // 应用共享（用户绑定移除）：application-id 标签值 = 纯 app_id
+            &format!("label=rcoder.io/application-id={app_id}"),
             "--filter",
             &format!(
                 "label=service-type={}",
@@ -139,11 +137,7 @@ pub fn register_builder_attempt(app_id: &str, user_id: &str, required: bool) -> 
     if count != 1 {
         return Err("expected exactly one owned builder after creation".into());
     }
-    register_container_identity(
-        &format!("rcoder-app-builder-{user_id}-{app_id}"),
-        Some(user_id),
-        None,
-    )
+    register_container_identity(&format!("rcoder-app-builder-{app_id}"), None, None)
 }
 
 fn prove_builder_replacement(
