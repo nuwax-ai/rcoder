@@ -62,6 +62,15 @@ impl DevServerManager {
             .cloned()
     }
 
+    /// 是否存在未完成的进程清理状态（P1-05）：stop_dev 未在停止窗口内
+    /// 观察到退出时记录 Cleaning；再次受理 dev/start 必须确认清理完毕。
+    pub fn has_uncleaned_cleanup(&self, project_id: &str) -> AppResult<bool> {
+        Ok(matches!(
+            lock(&self.cleanup_state)?.get(project_id),
+            Some(types::CleanupStatus::Cleaning)
+        ))
+    }
+
     /// keep-alive (对齐 nuwax: 探活, 不存活则重启)。
     pub async fn keep_alive(
         &self,

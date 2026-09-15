@@ -21,11 +21,17 @@
 | pingap 编译 + 配置校验 + admin 确认 | 确认预算 25s（`CONFIRM_BUDGET`）+ 编译/校验时间 | app-cli `proxy/admin_probe.rs:31` |
 | 启动排空 / 收尾余量 | 本任务新增（有界排空窗 2s + 调度余量 30s） | P1-04 设计 |
 
-计算式（P1-06 实现）：`launch_budget = max(300s, 60s + max(服务 readiness 超时) + 55s + 30s)`，monotonic 共享 deadline 自 spawn 前起算；配置上限 `dev_launch_budget_max_secs`；显式配置小于必要阶段预算 → 副作用前报配置错误。
+计算式（P1-06 实现）：`launch_budget_secs = min(1200, dev_command_timeout_secs + 150)`，
+单调共享 deadline 自 spawn 前起算；`START_DONE_WAIT_MAX_SECS` 从 3600s 降至 1200s
+仅作兜底默认。显式配置小于必要阶段预算时仍可能被截断——本轮先落地上限与配置感知，
+未增加独立 `dev_launch_budget_max_secs` 配置键。
 
 ## 逐任务记录
 
 | 阶段/任务 | HEAD/源码差异 | 命令或场景 | 退出码 | 通过范围 | 日志/报告 | 镜像/实例/操作 | 未运行项 |
 |---|---|---|---|---|---|---|---|
 | T00 基线核对 | 71a1ab6e vs a4380b37 = 2 并行提交无交集 | git log/status/show --stat | 0 | 基线确认 | 本文件 | — | — |
-| （后续逐任务追加） | | | | | | | |
+| P1-01/02 | `d2eb64a0` app-cli bind/Done/退出码 | cargo test -p app-cli（146 通过）；bin_startup 4/4 | 0 | API 预绑定 fail-fast + 失败 Done + 非零退出码 | app-cli targeted tests | — | — |
+| P1-03/04 | `9a895bda` SupervisedChild/DevEventHooks/start_events | cargo test -p file-server -p file-server-userapp（294+76 通过） | 0 | manifest spawn 可监督；ProducerExited/StreamEnded 受理 | targeted tests | — | — |
+| P1-06 | `38d8407b` 启动等待窗与预算 | cargo test -p file-server -p file-server-userapp（296+76 通过） | 0 | 等待窗 3600s→1200s；预算 min(1200, dev_command_timeout_secs+150) | targeted tests | — | — |
+| P1-05 | cleanup-state + stop 确认 + start 拒绝未清理残留 | cargo test -p file-server（stop tests 2/2）；cargo test -p file-server -p file-server-userapp（296+76 通过） | 0 | stop 设置 Cleaning/Cleaned；has_uncleaned_cleanup 守卫；start_dev_manifest 拒绝残留 | targeted tests | — | Compose / remote-k8s / 全量 workspace 门禁 |

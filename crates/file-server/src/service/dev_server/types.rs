@@ -45,6 +45,16 @@ pub struct KeepAliveResult {
     pub port: Option<u16>,
 }
 
+/// 进程停止后未确认清理状态（P1-05）：并发 dev 操作互斥清理——
+/// 旧 supervised 退出后再次受理 dev/start 前必须确认清理完毕。
+#[derive(Debug, Clone, Copy)]
+pub enum CleanupStatus {
+    /// 正在清理：进程已停止但 stdout 排空/状态摘除未完成。
+    Cleaning,
+    /// 清理完成：可以接受新的 dev 操作。
+    Cleaned,
+}
+
 /// dev server 进程管理器 (经 Arc 注入 AppState)。
 pub struct DevServerManager {
     pub(super) processes: Mutex<HashMap<String, DevProcess>>,
@@ -53,6 +63,9 @@ pub struct DevServerManager {
     /// wait/reap + stdout 管道 + stderr ring；vite 路径不登记）。key 与
     /// processes 同（project_id）；stop_dev 同步摘除。
     pub(super) supervised: Mutex<HashMap<String, Arc<super::supervise::SupervisedChild>>>,
+    /// 进程停止后未确认清理状态表（P1-05）：并发 dev 操作互斥清理——
+    /// 旧 supervised 退出后再次受理 dev/start 前必须确认清理完毕。
+    pub(super) cleanup_state: Arc<Mutex<HashMap<String, CleanupStatus>>>,
     pub(super) port_pool: PortPool,
     pub(super) config: Arc<Config>,
 }
@@ -69,6 +82,7 @@ impl DevServerManager {
             processes: Mutex::new(HashMap::new()),
             starting: Mutex::new(HashSet::new()),
             supervised: Mutex::new(HashMap::new()),
+            cleanup_state: Arc::new(Mutex::new(HashMap::new())),
             port_pool: pool,
             config,
         }

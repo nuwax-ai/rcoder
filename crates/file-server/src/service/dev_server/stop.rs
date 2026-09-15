@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use super::log;
 use super::process;
 use super::support::lock;
-use super::types::{DevServerManager, StoppedDev};
+use super::types::{CleanupStatus, DevServerManager, StoppedDev};
 use crate::error::AppResult;
 use crate::models::KilledPid;
 
@@ -51,13 +51,27 @@ impl DevServerManager {
         }
         // stdout 管道有界排空（进程组已停；后代持有写端时窗口到期放弃）。
         if let Some(supervised) = supervised {
-            supervised
-                .drain_stdout(std::time::Duration::from_secs(
-                    self.config.dev_stop_max_attempts as u64
-                        * self.config.dev_stop_check_interval_ms
-                        / 1000,
-                ))
-                .await;
+            let drain_timeout = std::time::Duration::from_secs(
+                self.config.dev_stop_max_attempts as u64
+                    * self.config.dev_stop_check_interval_ms
+                    / 1000,
+            );
+            supervised.drain_stdout(drain_timeout).await;
+            // P1-05：记录 cleanup_status。即使进程已退出，仍可能有子进程继承 stdout
+            // 导致 EOF 未到达——在 wait_exit 结束前标记 Cleaning，完成后再标 Cleaned。
+            {
+                let mut cleanup = lock(&self.cleanup_state)?;
+                cleanup.insert(project_id.to_string(), CleanupStatus::Cleaning);
+            }
+            let cleanup_project_id = project_id.to_string();
+            let cleanup_map = self.cleanup_state.clone();
+            tokio::spawn(async move {
+                if supervised.wait_exit(drain_timeout).await.is_some() {
+                    if let Ok(mut cleanup) = cleanup_map.lock() {
+                        cleanup.insert(cleanup_project_id, CleanupStatus::Cleaned);
+                    }
+                }
+            });
         }
         Ok(StoppedDev {
             killed_pids: killed,
@@ -140,5 +154,73 @@ impl Drop for DevServerManager {
             self.port_pool.release(project_id);
         }
         procs.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::dev_server::{StderrRing, supervise::SupervisedChild};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn manager() -> DevServerManager {
+        let mut config = crate::Config::from_env().expect("test config");
+        config.dev_stop_check_interval_ms = 10;
+        config.dev_stop_max_attempts = 20;
+        DevServerManager::new(Arc::new(config))
+    }
+
+    fn spawn_child(cmd: &str) -> tokio::process::Child {
+        tokio::process::Command::new("/bin/sh")
+            .args(["-c", cmd])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child")
+    }
+
+    fn adopt(child: tokio::process::Child) -> Arc<SupervisedChild> {
+        let ring: Arc<StderrRing> = Arc::new(Mutex::new(VecDeque::new()));
+        SupervisedChild::adopt(child, ring)
+    }
+
+    #[tokio::test]
+    async fn stop_cleanup_state_transitions_to_cleaned_for_immediate_exit() {
+        let mgr = manager();
+        let project = "p1-05-clean";
+        let child = spawn_child("true");
+        let supervised = adopt(child);
+        // immediate-exit child may already be gone; don't assert wait_exit state
+        mgr.supervised
+            .lock()
+            .unwrap()
+            .insert(project.to_string(), supervised);
+
+        let _stopped = mgr.stop_dev(project).await.expect("stop");
+
+        // short-lived child already exited -> cleanup should quickly flip to Cleaned.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!mgr.has_uncleaned_cleanup(project).unwrap());
+    }
+
+    #[tokio::test]
+    async fn stop_cleanup_remains_cleaning_until_exit_observed() {
+        let mgr = manager();
+        let project = "p1-05-hang";
+        let child = spawn_child("sleep 30");
+        let supervised = adopt(child);
+        mgr.supervised
+            .lock()
+            .unwrap()
+            .insert(project.to_string(), supervised);
+
+        let _stopped = mgr.stop_dev(project).await.expect("stop");
+
+        // Immediately after stop_dev returns, cleanup watcher may still be pending.
+        // With a long-lived child, has_uncleaned_cleanup should initially be true.
+        assert!(mgr.has_uncleaned_cleanup(project).unwrap());
     }
 }

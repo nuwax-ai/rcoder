@@ -280,6 +280,13 @@ impl DevServerManager {
                 port: p.port,
             });
         }
+        // P1-05：旧 supervised 停止后未确认清理（如进程组残留或 stdout 排空未完成）——
+        // 拒绝新 manifest 启动，直到后台清理确认完成。避免并发 dev 操作撞端口或误用残留状态。
+        if self.has_uncleaned_cleanup(project_id)? {
+            return Err(AppError::business(
+                "previous orchestrator cleanup unconfirmed; retry after stop completes",
+            ));
+        }
 
         let ldir = log::log_dir(&self.config, project_id);
         tokio::fs::create_dir_all(ldir.join("app-cli"))
