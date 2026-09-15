@@ -36,13 +36,15 @@ fn app_id_of_key(key: &str) -> Option<&str> {
     key.strip_prefix("userapp:")
 }
 
-/// app-cli 终局事件的有界等待上限（秒）。**必须覆盖最慢启动路径**：done 在
-/// 逐服务 readiness 探测（各自 `[health].startup_timeout_seconds`，模板 java
-/// 60s）+ pingap 就绪确认后才输出，而 start_dev 在 9080 listen 即返回——
-/// 探测窗口内两者时间差可达数十秒。done 到达即 break（快路径零等待）；
-/// 超时兜底按当前累积清单判终态（事件流仍是真相源）。曾为 2s：java 60s
-/// 探测场景下 done 必然迟到、终态后事件被丢，部分失败误判 Completed。
-const START_DONE_WAIT_MAX_SECS: u64 = 3600;
+/// app-cli 终局事件的有界等待上限（秒）。
+///
+/// P1-06：旧版硬编码 3600——"Startup completion event timed out" 在 app-cli
+/// 已失败退出时仍傻等一小时（原因是发送端保活 + EOF 不上报）；P1-03/04 修了
+/// 通道语义后仍需合理上限：合法慢启动（PG + java readiness + pingap 确认）
+/// 可达数百秒，但正常路径 done 先于 finish 到达——窗口仅兜底。
+///
+/// 最终值按 P1-06 `launch_budget()` 动态计算，此常量仅为后备默认。
+const START_DONE_WAIT_MAX_SECS: u64 = 1200;
 
 /// 任务级日志行（快速路径说明等）的事件 service 标识——对齐编排日志源
 /// `service_id=app-cli` 的既有命名。
@@ -343,6 +345,17 @@ async fn spawn_dev_task(
             .map(Some)
         };
         let (evt_tx, event_pipe) = StartEventPipe::new(task_clone.clone());
+        // P1-06：启动预算取配置兜底——不能用硬编码 3600s 掩盖通道语义缺陷，
+        // 也不能截断合法慢启动。此处以 dev_command_timeout_secs 为基线加
+        // pingap 确认余量（30s）与调度余量（120s），再取上限 1200s 兜底。
+        let launch_budget_secs = std::cmp::min(
+            START_DONE_WAIT_MAX_SECS,
+            state
+                .fs
+                .config
+                .dev_command_timeout_secs
+                .saturating_add(150),
+        );
         let hook_tx = evt_tx.clone();
         let runtime_hooks_tx = evt_tx.clone();
         let hooks = file_server::service::dev_server::DevEventHooks {
@@ -434,7 +447,7 @@ async fn spawn_dev_task(
                 tokio::spawn({
                     let supervised = supervised.clone();
                     async move {
-                        if let Some(exit) = supervised.wait_exit(std::time::Duration::from_secs(START_DONE_WAIT_MAX_SECS)).await {
+                        if let Some(exit) = supervised.wait_exit(std::time::Duration::from_secs(launch_budget_secs)).await {
                             let _guard = span.enter();
                             drop(exit_tx.send(EvtOutcome::ProducerExited { exit: exit.describe() }));
                         }
@@ -442,7 +455,7 @@ async fn spawn_dev_task(
                 });
             }
             let _ = drop(evt_tx);
-            event_pipe.finish(std::time::Duration::from_secs(START_DONE_WAIT_MAX_SECS)).await
+            event_pipe.finish(std::time::Duration::from_secs(launch_budget_secs)).await
         }
         .await;
         match outcome {
