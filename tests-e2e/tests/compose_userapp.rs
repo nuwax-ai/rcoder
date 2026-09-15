@@ -417,6 +417,7 @@ async fn test_pod_ensure_prod_empty_container(env: &Env, report: &JsonlReporter)
         format!("HTTP {ws_s}, body 截断: {}", trunc(&ws_b, 150)),
     );
     if ws_ready {
+        // 共享模型：他人 user_id 对已注册 app 同样受理（无归属冲突档）
         let (s3, b3) = post_json(
             env,
             "/computer/pod/ensure",
@@ -424,8 +425,8 @@ async fn test_pod_ensure_prod_empty_container(env: &Env, report: &JsonlReporter)
         )
         .await;
         report.assert_hard(
-            "pod/ensure(prod) 他人 user_id 对已注册 app → ERR_VALIDATION（归属冲突不创建）",
-            error_envelope(s3, &b3, "ERR_VALIDATION"),
+            "pod/ensure(prod) 他人 user_id 对已注册 app → 受理（共享，无归属冲突）",
+            s3.is_success() && http_ok(&b3),
             format!("HTTP {s3}, body 截断: {}", trunc(&b3, 150)),
         );
     }
@@ -828,11 +829,11 @@ async fn test_update_stop_restart(env: &Env, report: &JsonlReporter) {
         error_envelope(s, &b, "ERR_APP_NOT_FOUND"),
         format!("HTTP {s}"),
     );
-    // 400：stop 缺 user_id query
+    // 共享模型：user_id query 不再必填——缺省同样语义（不存在 app → NOT_FOUND）
     let (s, b) = post_json(env, "/api/v1/userapp/ae2e-any/stop", json!({})).await;
     report.assert_hard(
-        "stop 缺 user_id query → HTTP 200 + ERR_VALIDATION",
-        error_envelope(s, &b, "ERR_VALIDATION"),
+        "stop 缺 user_id query → HTTP 200 + ERR_APP_NOT_FOUND（共享模型无必填档）",
+        error_envelope(s, &b, "ERR_APP_NOT_FOUND"),
         format!("HTTP {s}"),
     );
 
@@ -1026,7 +1027,8 @@ async fn test_recycle_policy(env: &Env, report: &JsonlReporter) {
         error_envelope(s, &b, "ERR_VALIDATION"),
         format!("HTTP {s}"),
     );
-    // 400：非法 user_id
+    // 共享模型：多余 user_id 字段按未知值忽略（不校验）——受理语义由
+    // recycle 字段自身决定（app 不存在 → NOT_FOUND）
     let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/ae2rc-{suffix}/prod/recycle-policy"),
@@ -1034,8 +1036,8 @@ async fn test_recycle_policy(env: &Env, report: &JsonlReporter) {
     )
     .await;
     report.assert_hard(
-        "recycle-policy 非法 user_id → HTTP 200 + ERR_VALIDATION",
-        error_envelope(s, &b, "ERR_VALIDATION"),
+        "recycle-policy 非法 user_id 忽略 → HTTP 200 + ERR_APP_NOT_FOUND",
+        error_envelope(s, &b, "ERR_APP_NOT_FOUND"),
         format!("HTTP {s}"),
     );
 

@@ -64,3 +64,18 @@ dist
 .codex/
 tests-e2e/reports/
 target-console/
+# 其余构建/同步产物（曾致 3GB+ 上下文）
+target-tssync/
+target-console/
+fuzz/
+.remote-k8s/
+.devspace/
+.devspace/
+.claude/
+.codeartsdoer/
+.qoder/
+.workbuddy/
+.zcode/
+.specify/
+crates/app-cli/node_modules/
+crates/app-cli/dist/

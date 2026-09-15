@@ -1516,7 +1516,7 @@ async fn userapp_dev_server_lifecycle() {
     };
     // logs/query 等接口要求 app_id 整体以 "app-" 开头（scoped_app 产物
     // 以 run_tag 开头不满足）——本场景自拼合规名（app- + tag 压缩段）
-    let app = format!("app-{}", scoped_app(&env, "srv"));
+    let app = scoped_app(&env, "srv");
     let user = "e2e-ud-user";
 
     if !create_workspace(&env, &report, &app, user).await {
@@ -2019,7 +2019,7 @@ async fn userapp_dev_owner_header_lazy_ensure() {
         .header("X-Service-Type", "userapp")
         .header("X-App-Id", &app)
         .header("X-User-Id", "../escape")
-        .json(&json!({"fileName": "c.txt", "content": "x"}))
+        .json(&json!({"userId": user, "cId": app, "fileName": "c.txt", "content": "x"}))
         .send()
         .await
         .expect("bad uid post");
@@ -2219,7 +2219,7 @@ async fn userapp_dev_precheck_rejects_empty_and_no_services() {
         return;
     };
     // logs 族接口沿用 app- 前缀形态（lifecycle 场景同款自拼，最稳）
-    let app = format!("app-{}", scoped_app(&env, "prechk"));
+    let app = scoped_app(&env, "prechk");
     let user = "e2e-ud-user";
 
     // create-workspace 只建空目录（file-server ensure_workspace 仅 create_dir_all）
@@ -2341,7 +2341,7 @@ async fn userapp_dev_registry_self_heal_after_restart() {
         eprintln!("[{scenario}] K8s 模式跳过（Docker 注册表自愈专属场景）");
         return;
     }
-    let app = format!("app-{}", scoped_app(&env, "heal"));
+    let app = scoped_app(&env, "heal");
     let user = "e2e-ud-user";
 
     // create-workspace 后不再调 get-file-list——避免探活正缓存（PROBE_OK 30s）
@@ -2468,7 +2468,7 @@ async fn userapp_dev_terminal_cwd_via_ttyd_ws() {
         eprintln!("[{scenario}] K8s 模式跳过（终端 ws 链路 compose 专属场景）");
         return;
     }
-    let app = format!("app-{}", scoped_app(&env, "ttyd"));
+    let app = scoped_app(&env, "ttyd");
     let user = "e2e-ud-user";
 
     // workspace 目录存在即满足 cwd 解析前提（resolve_in_candidates 要求目录在）
@@ -2699,7 +2699,7 @@ async fn userapp_dev_app_proxy_lazy_start() {
         eprintln!("[{scenario}] K8s 模式跳过（docker rm/inspect 专属场景）");
         return;
     }
-    let app = format!("app-{}", scoped_app(&env, "lzy"));
+    let app = scoped_app(&env, "lzy");
     let user = "e2e-ud-user";
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
@@ -2837,7 +2837,7 @@ async fn userapp_dev_poll_storm_keeps_container() {
         eprintln!("[{scenario}] K8s 模式跳过（docker inspect 专属场景）");
         return;
     }
-    let app = format!("app-{}", scoped_app(&env, "storm"));
+    let app = scoped_app(&env, "storm");
     let user = "e2e-ud-user";
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
@@ -2933,7 +2933,7 @@ async fn userapp_dev_task_sse_cursor_past_terminal() {
     let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
         return;
     };
-    let app = format!("app-{}", scoped_app(&env, "cur"));
+    let app = scoped_app(&env, "cur");
     let user = "e2e-ud-user";
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
