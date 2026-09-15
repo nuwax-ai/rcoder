@@ -16,7 +16,171 @@ use crate::service::dev_server::{log, process};
 
 const CAPTURE_LIMIT: usize = 1024 * 1024;
 
+/// install 入口（含 pnpm≥12 ignored-builds 自愈）。
+///
+/// pnpm 12 起 `--reporter=ndjson` 下被阻断的依赖构建脚本（ERR_PNPM_IGNORED_BUILDS,
+/// 如 esbuild postinstall）会让 install 以 exit 1 失败（plain reporter 仅告警——
+/// pnpm 12.4.1 实测）。自愈：解析被阻断的包名 → `pnpm approve-builds <pkgs>` 显式
+/// 放行（等价用户交互确认，非 dangerously-allow-all-builds 全量放开）→ 重试一次。
+/// pnpm <12 无此失败码，路径不触发。
 pub(super) async fn install(
+    cwd: &Path,
+    options: &InstallOptions,
+    logs: Option<&LogFiles>,
+    timeout_secs: u64,
+) -> Result<InstallOutcome, InstallError> {
+    install_with_heal(cwd, options, logs, timeout_secs, true).await
+}
+
+/// 单次执行 + 失败自愈判定（heal 门控防递归：自愈重试后不再触发）。
+async fn install_with_heal(
+    cwd: &Path,
+    options: &InstallOptions,
+    logs: Option<&LogFiles>,
+    timeout_secs: u64,
+    heal_allowed: bool,
+) -> Result<InstallOutcome, InstallError> {
+    let result = install_once(cwd, options, logs, timeout_secs).await;
+    if !heal_allowed {
+        return result;
+    }
+    let is_ignored_builds = matches!(
+        &result,
+        Err(InstallError::Failed { code, message, .. })
+            if code.as_deref() == Some("ERR_PNPM_IGNORED_BUILDS")
+                || message.contains("ERR_PNPM_IGNORED_BUILDS")
+    );
+    if !is_ignored_builds {
+        return result;
+    }
+    // 完整 "Ignored build scripts: a@1, b@2" 清单在 tail 里——Failed.message 只保留
+    // 最后一行。双通道解析：先 message，空则读 install 主日志尾部（LogFiles.main
+    // 已实时写入完整输出）。
+    let from_message = result
+        .as_ref()
+        .err()
+        .and_then(|e| match e {
+            InstallError::Failed { message, .. } => Some(extract_ignored_build_packages(message)),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let packages = if !from_message.is_empty() {
+        from_message
+    } else if let Some(logs) = logs
+        && let Ok(tail) = read_tail(&logs.main, 64 * 1024).await
+    {
+        extract_ignored_build_packages(&tail)
+    } else {
+        Vec::new()
+    };
+    if packages.is_empty() {
+        tracing::warn!(
+            cwd = %cwd.display(),
+            "pnpm ignored-builds failure carried no parseable package list; no self-heal"
+        );
+        return result;
+    }
+    tracing::info!(
+        cwd = %cwd.display(),
+        packages = ?packages,
+        "pnpm ignored-builds: approving blocked build scripts and retrying install once"
+    );
+    approve_builds(cwd, &packages, timeout_secs).await;
+    // 自愈重试等价 install_once（heal_allowed=false 分支只透传单次结果，
+    // 不再触发自愈——直调避免 async 递归 boxing）。
+    install_once(cwd, options, logs, timeout_secs).await
+}
+
+/// 读文件尾部（自愈解析被阻断包名的兜底通道）。
+async fn read_tail(path: &Path, limit: u64) -> std::io::Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    let start = len.saturating_sub(limit);
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).await?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// 从失败 message 提取被阻断的包名（`Ignored build scripts: a@1.2.3, b@2` → [a, b]）。
+fn extract_ignored_build_packages(message: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in message.lines() {
+        // 日志管道会给行加 `[时间戳] ╰─▶ ` 前缀——用 contains 定位再取后段
+        let Some(marker) = line.find("Ignored build scripts:") else {
+            continue;
+        };
+        let rest = &line[marker + "Ignored build scripts:".len()..];
+        for token in rest.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            // name@version → name（scoped 包 @scope/name@version 取第一个 @ 前段以外全部）
+            let name = match token.rsplit_once('@') {
+                Some((head, version))
+                    if !head.is_empty()
+                        && version.chars().all(|c| c.is_ascii_digit() || c == '.') =>
+                {
+                    head
+                }
+                _ => token,
+            };
+            if !name.is_empty() && !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// 显式放行被阻断的构建脚本（非交互 `pnpm approve-builds <pkgs>`；best-effort，
+/// 失败仅告警——随后重试的 install 会给出真实失败原因）。
+async fn approve_builds(cwd: &Path, packages: &[String], timeout_secs: u64) {
+    let mut command = Command::new("pnpm");
+    command
+        .arg("approve-builds")
+        .args(packages)
+        .current_dir(cwd);
+    if let Ok(path) = std::env::var("PATH") {
+        command.env("PATH", path);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        command.env("HOME", home);
+    }
+    command.env_remove("CI");
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command.spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(source) => {
+            tracing::warn!(%source, "pnpm approve-builds spawn failed");
+            return;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+        Ok(Ok(status)) if status.success() => {}
+        Ok(Ok(status)) => {
+            tracing::warn!(
+                exit_code = status.code().unwrap_or(-1),
+                "pnpm approve-builds non-success (retry install will surface real error)"
+            );
+        }
+        Ok(Err(source)) => tracing::warn!(%source, "pnpm approve-builds wait failed"),
+        Err(_) => {
+            tracing::warn!("pnpm approve-builds timed out");
+            drop(child.start_kill());
+            drop(child.wait().await);
+        }
+    }
+}
+
+async fn install_once(
     cwd: &Path,
     options: &InstallOptions,
     logs: Option<&LogFiles>,
