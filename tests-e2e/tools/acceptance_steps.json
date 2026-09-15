@@ -192,16 +192,15 @@
     "recycle-policy prod 成功（200 + runtime 回显）",
     "recycle-policy stage=dev → HTTP 200 + ERR_VALIDATION（仅 prod）",
     "recycle-policy 三字段全缺 → HTTP 200 + ERR_VALIDATION",
-    "recycle-policy 非法 user_id → HTTP 200 + ERR_VALIDATION",
+    "recycle-policy 非法 user_id 忽略 → HTTP 200 + ERR_APP_NOT_FOUND",
     "restart 无 url 对不存在的 app → HTTP 200 + ERR_APP_NOT_FOUND（不创建）",
     "runtime 运行时列表（200 + 0000）",
     "start 无 url 对不存在 app 创建空容器（200）",
-    "start 无 url 缺 user_id → HTTP 200 + ERR_VALIDATION",
     "static 按 app 直下（两段）与终态一致（completed=200 / 其他=404）",
     "stop → stopped / replicas=0",
     "stop 不存在 app → HTTP 200 + ERR_APP_NOT_FOUND",
     "stop 后 start 唤醒 → running（120s 轮询兼容 K8s 异步）",
-    "stop 缺 user_id query → HTTP 200 + ERR_VALIDATION",
+    "stop 缺 user_id query → HTTP 200 + ERR_APP_NOT_FOUND（共享模型无必填档）",
     "storage GET 不存在 app → 200 + exists=false",
     "storage(dev) exists=true（workspace 就绪）",
     "storage/clear 对未 delete 的 app → HTTP 200 + ERR_INVALID_STATE",
@@ -366,10 +365,10 @@
     "D：TS 老族 header 必填不变（无 X-App-Id 仍 400——反代契约保留）"
   ],
   "userapp_dev_owner_header_lazy_ensure": [
-    "A：无 owner 懒创建拒（502 cannot resolve——fail-fast 防孤儿目录，生产行为钉住）",
+    "A：无 owner 懒创建直接受理（共享 builder 按 app_id 定位）",
     "B'：懒创建后注册表命中（无 header 复用 200——owner 仅创建路径需要）",
     "B：x-user-id 显式档懒创建成功（拦截分流透传 200）",
-    "C：非法 x-user-id → 400（identifier 白名单防逃逸）"
+    "C：非法 x-user-id 按名称忽略（不 400——spec §2.1）"
   ],
   "userapp_dev_pg_reset_password": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
@@ -536,13 +535,12 @@
   ],
   "userapp_dev_two_users_share_app": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
-    "u2 pod/ensure 协作者实例受理（轻量路径，不撞 owner lifecycle）",
-    "两实例容器并存（rcoder-app-builder-{u1}-{app} + {u2}-{app}）",
+    "u2 pod/ensure 同 app 受理（共享 builder，幂等复用）",
+    "双用户同 app 共享单一 builder 容器（rcoder-app-builder-{app}）",
     "u1 写入 owner-only.txt",
-    "u2 工作区不可见 u1 文件（实例隔离）",
+    "u2 可见 u1 文件（共享工作区——应用共享模型）",
     "D5：无显式 user_id 回落 owner 实例（幂等，不建第二容器）",
-    "负例：app_id 含 '-' 被拒（字符集 [a-z0-9]）",
-    "u1 purge 删除 app（受理）",
+    "正例：app_id 含内部 '-' 受理（DNS-1123 label）",
     "purge 后两实例容器全清（owner+协作者）"
   ]
 }
