@@ -64,6 +64,23 @@ pub struct ServerState {
     cancel: CancellationToken,
     /// 日志布局（跟随服务托管引擎；serve 探测后设置，legacy 默认 Builtin）。
     log_layout: RwLock<LogLayout>,
+    /// 运行操作内核槽位（阶段二：serve 在 ownership 认领后注入；legacy 形态
+    /// 恒 None——api 层 /v1/runtime/* 相应 503）。
+    runtime_kernel: std::sync::OnceLock<Arc<crate::runtime_kernel::RuntimeKernel>>,
+    /// 运行控制信号通道（源码编排/停止业务——api → 主循环；与部署通道并行）。
+    control_tx: tokio::sync::mpsc::UnboundedSender<ControlSignal>,
+    control_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ControlSignal>>,
+    /// 当前执行中的运行操作 ID（dispatch 写入，主循环边界收束）。
+    current_runtime_operation: RwLock<Option<String>>,
+}
+
+/// 运行控制信号（阶段二 dispatch 目标；server_loop 解释执行）。
+#[derive(Debug, Clone)]
+pub(crate) enum ControlSignal {
+    /// 源码编排（workspace 当前内容 + release lock）。
+    OrchestrateSource { operation_id: String },
+    /// 停止业务服务（保持管理面）。
+    StopBusiness { operation_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,7 +186,12 @@ impl From<&ServerPhase> for AppCliDeployPhase {
 impl ServerState {
     pub fn new(ready: RuntimeStatusService) -> Self {
         let (deploy_tx, deploy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
+            runtime_kernel: std::sync::OnceLock::new(),
+            control_tx,
+            control_rx: tokio::sync::Mutex::new(control_rx),
+            current_runtime_operation: RwLock::new(None),
             admission: std::sync::Mutex::new(()),
             accepting: std::sync::atomic::AtomicBool::new(true),
             shutdown_unconfirmed: std::sync::atomic::AtomicBool::new(false),
@@ -193,6 +215,62 @@ impl ServerState {
             cancel: CancellationToken::new(),
             log_layout: RwLock::new(LogLayout::Builtin),
         }
+    }
+
+    /// 运行操作内核（api 层 /v1/runtime/* 消费；未注入返回 None）。
+    pub(crate) fn runtime_kernel(&self) -> Option<Arc<crate::runtime_kernel::RuntimeKernel>> {
+        self.runtime_kernel.get().cloned()
+    }
+
+    /// 注入运行操作内核（serve 在 ownership 认领后调用；幂等拒绝二次注入）。
+    pub(crate) fn set_runtime_kernel(
+        &self,
+        kernel: Arc<crate::runtime_kernel::RuntimeKernel>,
+    ) -> bool {
+        self.runtime_kernel.set(kernel).is_ok()
+    }
+
+    /// 当前执行中的运行操作（dispatch 设置；主循环边界收束后清除）。
+    pub(crate) fn set_current_runtime_operation(&self, operation_id: Option<String>) {
+        *self
+            .current_runtime_operation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = operation_id;
+    }
+
+    pub(crate) fn current_runtime_operation(&self) -> Option<String> {
+        self.current_runtime_operation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 主循环边界收束运行操作（成功/失败/恢复保护三态；先持久化终态再清槽）。
+    pub(crate) async fn finish_current_runtime_operation(
+        &self,
+        state: shared_types::RuntimeOperationState,
+        error: Option<(String, String)>,
+    ) {
+        let Some(kernel) = self.runtime_kernel() else {
+            return;
+        };
+        let Some(operation_id) = self.current_runtime_operation() else {
+            return;
+        };
+        let sequence = kernel
+            .store()
+            .replay_events(&operation_id, u64::MAX)
+            .map(|events| events.len() as u64 + 1)
+            .unwrap_or(2);
+        if let Err(persist_error) = kernel
+            .finish(&operation_id, state, error, None, sequence.max(2))
+            .await
+        {
+            tracing::error!(
+                "runtime operation terminal persist failed (op {operation_id}): {persist_error:#}"
+            );
+        }
+        self.set_current_runtime_operation(None);
     }
 
     fn close_admission(&self) {
@@ -719,6 +797,29 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
             }
         }
     };
+    // 阶段二运行操作内核：ownership 认领后装配（状态根 + 身份 + 恢复）。
+    // 恢复出的非终态操作置 RecoveryRequired 并挂恢复保护——写操作被拒直至
+    // 显式收束（spec §3.3 崩溃注入语义）。
+    if ownership_claimed {
+        match assemble_runtime_kernel(&state, args).await {
+            Ok(kernel) => {
+                let recovered = kernel
+                    .recover()
+                    .await
+                    .context("recover runtime operation state")?;
+                if !recovered.is_empty() {
+                    tracing::warn!("runtime operations held for recovery: {:?}", recovered);
+                }
+                state.set_runtime_kernel(kernel);
+            }
+            Err(error) => {
+                // 状态根不可用 = 持久受理不可承诺：保持 /v1/runtime/* 关闭
+                //（503），既有部署链不受影响——降级可观测，不静默假装支持。
+                tracing::error!("runtime kernel unavailable: {error:#}");
+            }
+        }
+    }
+
     // 启动恢复完成（含 Failed 相位——可再次部署修复的合法可查状态）：开放
     // 写端点受理与 /ready 判定。quiescence 失败路径不开放（进程保护现场至退出）。
     if ownership_claimed {
@@ -833,6 +934,83 @@ async fn join_supervisor(
     let result = task.await;
     *joined = true;
     result.context("supervisor task panicked")?
+}
+
+/// 装配运行操作内核（serve 专用；dispatch 把内核动作翻译进既有执行通道）。
+async fn assemble_runtime_kernel(
+    state: &Arc<ServerState>,
+    args: &crate::config::CliArgs,
+) -> Result<Arc<crate::runtime_kernel::RuntimeKernel>> {
+    use crate::runtime_kernel::{DispatchAction, RuntimeKernel, RuntimeStore};
+    let store = RuntimeStore::open(&args.workspace)?;
+    let application_id = std::env::var("PROJECT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "unknown-app".to_string());
+    let workspace_id = args
+        .workspace
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "workspace".to_string());
+    let source_root = args
+        .workspace
+        .canonicalize()
+        .unwrap_or_else(|_| args.workspace.clone())
+        .to_string_lossy()
+        .to_string();
+    let identity = store.load_or_init_identity(
+        application_id,
+        "userapp-dev".to_string(),
+        workspace_id,
+        source_root,
+        state.generation.clone(),
+    )?;
+    let dispatch_state = state.clone();
+    let dispatch = Box::new(move |action: DispatchAction| match action {
+        DispatchAction::DeployArtifact {
+            operation_id,
+            url,
+            sha256,
+        } => {
+            dispatch_state.set_current_runtime_operation(Some(operation_id.clone()));
+            // release_id 语义 = 调用方请求标识（request_release_id 驱动等待方
+            // 确认）；以 runtime 操作 ID 承载，形成 API 侧可观察的关联。
+            let marker = format!("runtime-{operation_id}");
+            let request = DeployRequest {
+                url,
+                release_id: marker,
+                sha256,
+            };
+            if dispatch_state.deploy_tx.send(request).is_err() {
+                tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
+            }
+        }
+        DispatchAction::OrchestrateSource { operation_id } => {
+            dispatch_state.set_current_runtime_operation(Some(operation_id.clone()));
+            if dispatch_state
+                .control_tx
+                .send(ControlSignal::OrchestrateSource {
+                    operation_id: operation_id.clone(),
+                })
+                .is_err()
+            {
+                tracing::error!("runtime dispatch: control channel closed ({operation_id})");
+            }
+        }
+        DispatchAction::StopBusiness { operation_id } => {
+            dispatch_state.set_current_runtime_operation(Some(operation_id.clone()));
+            if dispatch_state
+                .control_tx
+                .send(ControlSignal::StopBusiness {
+                    operation_id: operation_id.clone(),
+                })
+                .is_err()
+            {
+                tracing::error!("runtime dispatch: control channel closed ({operation_id})");
+            }
+        }
+    });
+    Ok(Arc::new(RuntimeKernel::new(store, identity, dispatch)))
 }
 
 async fn establish_startup_quiescence(
@@ -960,6 +1138,8 @@ enum InitialAction {
     Prepared(crate::deploy::PreparedDeploy),
     /// 卷上既有 release.lock（Pod 重建恢复）：跳过下载直接编排。
     Existing,
+    /// 运行控制 stop：停止业务服务（保持管理面），完成当前运行操作。
+    StopBusiness,
 }
 
 /// Prepare while the existing supervisor continues serving. Failed requests do
@@ -1004,6 +1184,12 @@ async fn next_prepared(
 }
 
 async fn fail_preparation(state: &ServerState, error: String) {
+    state
+        .finish_current_runtime_operation(
+            shared_types::RuntimeOperationState::Failed,
+            Some(("ERR_BACKEND_ERROR".to_string(), error.clone())),
+        )
+        .await;
     if state.preparations.is_poisoned() {
         hold_unconfirmed(state, error).await;
         return;
@@ -1020,6 +1206,15 @@ async fn fail_preparation(state: &ServerState, error: String) {
 /// Keep the API alive and admission closed when a writer may still be active.
 /// No recovery directory writes or releasable terminal status follow this point.
 async fn hold_unconfirmed(state: &ServerState, error: String) {
+    state
+        .finish_current_runtime_operation(
+            shared_types::RuntimeOperationState::RecoveryRequired,
+            Some((
+                shared_types::ERR_RECOVERY_REQUIRED.to_string(),
+                error.clone(),
+            )),
+        )
+        .await;
     state.ready.set_ready(false);
     state.begin_failure(error.clone(), true);
     tracing::error!(%error, "Deployment remains pending until process shutdown is confirmed; operator recovery required");
@@ -1031,6 +1226,12 @@ async fn fail_activation(
     state: &ServerState,
     error: String,
 ) -> Option<InitialAction> {
+    state
+        .finish_current_runtime_operation(
+            shared_types::RuntimeOperationState::Failed,
+            Some(("ERR_BACKEND_ERROR".to_string(), error.clone())),
+        )
+        .await;
     state.ready.set_ready(false);
     if let Err(error) = state.preparations.drain().await {
         hold_unconfirmed(state, format!("preparation shutdown: {error:#}")).await;
@@ -1071,10 +1272,29 @@ async fn server_loop(
                     state.set_phase(ServerPhase::Idle);
                 }
                 let mut rx = state.deploy_rx.lock().await;
+                let mut control = state.control_rx.lock().await;
                 tokio::select! {
                     maybe = rx.recv() => match maybe {
                         Some(req) => InitialAction::Deploy(req),
                         None => return Ok(()), // api 层全退（不可能，防御）
+                    },
+                    signal = control.recv() => match signal {
+                        Some(ControlSignal::OrchestrateSource { .. }) => {
+                            InitialAction::Existing
+                        }
+                        Some(ControlSignal::StopBusiness { .. }) => {
+                            InitialAction::StopBusiness
+                        }
+                        None => {
+                            // api 层全退（防御）；部署通道仍存活时继续等
+                            tokio::select! {
+                                maybe = rx.recv() => match maybe {
+                                    Some(req) => InitialAction::Deploy(req),
+                                    None => return Ok(()),
+                                },
+                                () = state.cancel.cancelled() => return Ok(()),
+                            }
+                        }
                     },
                     () = state.cancel.cancelled() => return Ok(()),
                 }
@@ -1082,11 +1302,49 @@ async fn server_loop(
         };
 
         let run_migrations = true;
+        if matches!(action, InitialAction::StopBusiness) {
+            // stop：停止业务服务（host.stop_all / builtin cancel 等价路径经
+            // static reconcile 清空 + orchestrator 令牌取消由既有语义承载——
+            // 首版经 stop_all + reconcile 达成，保持管理面可用）。
+            let stopped = async {
+                if let Some(host) = host.as_ref() {
+                    host.stop_all().await?;
+                }
+                crate::static_hosting::reconcile(&[], &args.workspace, false).await
+            }
+            .await;
+            match stopped {
+                Ok(()) => {
+                    state.set_phase(ServerPhase::Idle);
+                    state
+                        .finish_current_runtime_operation(
+                            shared_types::RuntimeOperationState::Succeeded,
+                            None,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    tracing::error!("runtime stop business failed: {error:#}");
+                    state.set_phase(ServerPhase::Failed(format!("stop: {error:#}")));
+                    state
+                        .finish_current_runtime_operation(
+                            shared_types::RuntimeOperationState::RecoveryRequired,
+                            Some((
+                                shared_types::ERR_BACKEND_ERROR.into(),
+                                format!("stop business unconfirmed: {error:#}"),
+                            )),
+                        )
+                        .await;
+                }
+            }
+            continue;
+        }
         let deployment_attempt = matches!(
             action,
             InitialAction::Deploy(_) | InitialAction::Prepared(_)
         );
         let prepared = match action {
+            InitialAction::StopBusiness => unreachable!("handled above"),
             InitialAction::Deploy(request) => {
                 state.set_phase(ServerPhase::Deploying);
                 state.set_request_release_id(&request.release_id);
@@ -1185,6 +1443,12 @@ async fn server_loop(
                 pending = fail_activation(args, state, format!("persist running: {error:#}")).await;
                 continue;
             }
+            state
+                .finish_current_runtime_operation(
+                    shared_types::RuntimeOperationState::Succeeded,
+                    None,
+                )
+                .await;
             let next = tokio::select! {
                 maybe = next_prepared(args, state, &mut hot_rx) => match maybe {
                     Some(action) => Next::Redeploy(action),
@@ -1238,6 +1502,14 @@ async fn server_loop(
                         }
                         pending = fail_activation(args, state, format!("persist running: {error:#}")).await;
                         continue;
+                }
+                if result.is_ok() {
+                    state
+                        .finish_current_runtime_operation(
+                            shared_types::RuntimeOperationState::Succeeded,
+                            None,
+                        )
+                        .await;
                 }
                 tokio::select! {
                     outcome = &mut sup => { sup_joined = true; match outcome {

@@ -31,5 +31,6 @@ pub mod builder_control;
 pub mod resource_binding;
 
 pub mod operation_lease;
+pub mod runtime_control;
 
 pub mod builder_recovery;

@@ -36,6 +36,7 @@ use crate::server::{DeployRequest, ServerState};
 
 mod envelope;
 mod proxy;
+mod runtime;
 
 use envelope::ApiJson;
 
@@ -51,7 +52,13 @@ use envelope::ApiJson;
         proxy::reload,
         proxy::status,
         proxy::effective_config,
-        proxy::upstreams
+        proxy::upstreams,
+        runtime::identity,
+        runtime::status,
+        runtime::submit_operation,
+        runtime::get_operation,
+        runtime::operation_events,
+        runtime::cancel_operation,
     ),
     components(schemas(
         LogQueryRequest,
@@ -67,7 +74,8 @@ use envelope::ApiJson;
     tags(
         (name = "Runtime Logs", description = "Multi-service declared file logs"),
         (name = "Runtime Proxy", description = "Pingap validation and runtime status"),
-        (name = "Runtime Deploy", description = "Hot deploy without pod replacement")
+        (name = "Runtime Deploy", description = "Hot deploy without pod replacement"),
+        (name = "Runtime Control", description = "Single runtime owner operations (start/restart/deploy/stop)")
     )
 )]
 struct ApiDoc;
@@ -157,6 +165,25 @@ fn api_router(state: AppState) -> Router {
         .route("/v1/proxy/upstreams", get(proxy::upstreams))
         .route("/v1/deploy", post(submit_deploy))
         .route("/v1/deploy/status", get(deploy_status))
+        .route("/v1/runtime/identity", get(runtime::identity))
+        .route("/v1/runtime/status", get(runtime::status))
+        .route("/v1/runtime/operations", post(runtime::submit_operation))
+        .route(
+            "/v1/runtime/operations/{operation_id}",
+            get(runtime::get_operation),
+        )
+        .route(
+            "/v1/runtime/operations/{operation_id}/events",
+            get(runtime::operation_events),
+        )
+        .route(
+            "/v1/runtime/operations/{operation_id}/events/stream",
+            get(runtime::operation_events_sse),
+        )
+        .route(
+            "/v1/runtime/operations/{operation_id}/cancel",
+            post(runtime::cancel_operation),
+        )
         .with_state(state)
 }
 

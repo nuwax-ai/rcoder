@@ -22,6 +22,7 @@ pub mod manifest;
 pub mod orchestration_events;
 pub mod proxy;
 pub mod run_service;
+pub mod runtime_kernel;
 pub mod runtime_status;
 pub mod server;
 pub mod static_hosting;
