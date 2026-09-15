@@ -1557,7 +1557,7 @@ async fn userapp_deploy_full_chain() {
     }
 
     let app = format!(
-        "ae2e-dep-{}p{}",
+        "adep{}p{}",
         &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000
     );

@@ -22,7 +22,7 @@ SQLITE_CASES = (
     'sqlite_database_file_alias_cannot_bypass_directory_ownership',
     'sqlite_linked_sidecars_and_lock_fail_before_touching_the_target',
     'sqlite_failed_initialization_releases_the_instance_lock',
-    'same_owner_registration_is_noop_and_other_owner_is_rejected',
+    'repeated_registration_is_an_idempotent_noop',
     'concurrent_ensure_joins_but_different_intent_does_not',
     'old_progress_cannot_overwrite_new_checkpoint',
     'request_replay_returns_original_and_rejects_changed_parameters',

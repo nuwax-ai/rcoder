@@ -43,7 +43,6 @@ pub(crate) async fn upload(
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut app_id = None;
-    let mut user_id = None;
     let mut target = None;
     let mut flatten = false;
     let mut data = None;
@@ -54,7 +53,9 @@ pub(crate) async fn upload(
     {
         match field.name().unwrap_or("") {
             "app_id" => app_id = Some(text_field(field).await?),
-            "user_id" => user_id = Some(text_field(field).await?),
+            "user_id" => {
+                text_field(field).await?;
+            }
             "target" => target = Some(text_field(field).await?),
             "flatten" => flatten = matches!(text_field(field).await?.trim(), "true" | "1" | "yes"),
             "file" => {
@@ -71,7 +72,6 @@ pub(crate) async fn upload(
         }
     }
     let app_id = require_app_field(app_id, "app_id")?;
-    let user_id = require_app_field(user_id, "user_id")?;
     let target = require_app_field(target, "target")?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     let _workspace_activity = state
@@ -82,7 +82,7 @@ pub(crate) async fn upload(
         .await;
     let root = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
     let result = upload_impl(&root, &target, flatten, data.path(), data.size()).await?;
-    info!(app_id = %app_id, user_id = %user_id, target = %target, "app-files upload done");
+    info!(app_id = %app_id, target = %target, "app-files upload done");
     Ok(Json(json!({
         "success": true,
         "file_path": result.file_path,

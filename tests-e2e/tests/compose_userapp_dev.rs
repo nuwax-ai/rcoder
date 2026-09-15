@@ -3307,7 +3307,11 @@ async fn scenario_two_users_share_app() {
             );
         }
         Err(e) => {
-            report.assert_hard("正例：app_id 含内部 '-' 受理", false, format!("请求失败: {e}"));
+            report.assert_hard(
+                "正例：app_id 含内部 '-' 受理",
+                false,
+                format!("请求失败: {e}"),
+            );
         }
     }
 

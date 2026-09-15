@@ -263,7 +263,6 @@ pub(crate) async fn init_project_template(
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
     let mut app_id = None;
-    let mut user_id = None;
     let mut data = None;
     let mut enable_git = false;
     while let Some(field) = multipart
@@ -273,7 +272,9 @@ pub(crate) async fn init_project_template(
     {
         match field.name().unwrap_or("") {
             "app_id" => app_id = Some(text_field(field).await?),
-            "user_id" => user_id = Some(text_field(field).await?),
+            "user_id" => {
+                text_field(field).await?;
+            }
             "file" => {
                 data = Some(
                     file_field(
@@ -294,8 +295,7 @@ pub(crate) async fn init_project_template(
         }
     }
     let app_id = require_app_field(app_id, "app_id")?;
-    let user_id = require_app_field(user_id, "user_id")?;
-    tracing::debug!(app_id = %app_id, user_id, "userapp init-project-template");
+    tracing::debug!(app_id = %app_id, "userapp init-project-template");
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     let ws = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
     let activity = state
@@ -332,7 +332,6 @@ pub(crate) async fn push_skills_to_workspace(
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
     let mut app_id = None;
-    let mut user_id = None;
     let mut zip_data = None;
     let mut skill_urls: Vec<String> = Vec::new();
     let mut agent_id: Option<String> = None;
@@ -343,7 +342,9 @@ pub(crate) async fn push_skills_to_workspace(
     {
         match field.name().unwrap_or("") {
             "app_id" => app_id = Some(text_field(field).await?),
-            "user_id" => user_id = Some(text_field(field).await?),
+            "user_id" => {
+                text_field(field).await?;
+            }
             "file" => {
                 zip_data = Some(
                     file_field(
@@ -367,8 +368,7 @@ pub(crate) async fn push_skills_to_workspace(
         }
     }
     let app_id = require_app_field(app_id, "app_id")?;
-    let user_id = require_app_field(user_id, "user_id")?;
-    tracing::debug!(app_id = %app_id, user_id, "userapp push-skills");
+    tracing::debug!(app_id = %app_id, "userapp push-skills");
     let ws = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
     let activity = state
         .build_tasks

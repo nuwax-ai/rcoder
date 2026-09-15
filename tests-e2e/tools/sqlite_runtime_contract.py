@@ -37,6 +37,9 @@ def service_config(root, image, run_id, case_id, socket, config_path=None):
         'RCODER_USERAPP_RECYCLE_ENABLED': 'false', 'RCODER_AUTO_CLEANUP': 'false',
         'RCODER_WORKSPACE_ROOT': '/app/app-workspace', 'DOCKER_SOCKET_PATH': '/var/run/docker.sock',
         'RUST_LOG': 'info', 'ENABLE_TTYD': 'false',
+        # preview_coordinator.enabled 的内部令牌经 env 注入（fail-fast）——
+        # 隔离栈与 dev compose 同源（默认 dev 令牌）
+        'RCODER_PREVIEW_INTERNAL_TOKEN': 'local-dev-preview-token-0123456789',
     }
     mounts = [{'type': 'bind', 'source': str(root / folder), 'target': '/app/' + folder}
               for folder in ('data', 'logs', 'project_workspace', 'computer-project-workspace',
@@ -240,8 +243,10 @@ def main():
                 raise RuntimeError('first-open did not produce exactly one physical builder')
             builder = json.loads(command('docker', 'inspect', builders[0]))[0]
             labels = builder['Config'].get('Labels') or {}
-            if labels.get('rcoder.io/owner-id') != receipt['user_id'] or labels.get('rcoder.io/lifecycle-id') != life['lifecycle_id']:
-                raise RuntimeError('first-open builder owner or lifecycle mismatched')
+            # 共享模型：owner-id 标签已退役（用户绑定移除）；物理身份锚定
+            # application-id == app_id + lifecycle-id == 权威 lifecycle
+            if labels.get('rcoder.io/application-id') != receipt['app_id'] or labels.get('rcoder.io/lifecycle-id') != life['lifecycle_id']:
+                raise RuntimeError('first-open builder identity or lifecycle mismatched')
             receipt['builder_id'] = builder['Id']
             record(f'SQLite Compose {index} one builder identity', True)
             receipt_path.write_text(json.dumps(receipt, indent=2))
