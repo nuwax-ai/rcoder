@@ -31,15 +31,13 @@ const POD_READY_TIMEOUT_SECS: u64 = 300;
 const POD_TERMINATION_TIMEOUT_SECS: u64 = 30;
 #[cfg(feature = "kubernetes")]
 const FORCE_DELETE_CLEANUP_TIMEOUT_SECS: u64 = 15;
-#[cfg(feature = "kubernetes")]
-const POD_POLL_INTERVAL_SECS: u64 = 1;
 
 /// Pod 生命周期管理操作的 trait extension
 ///
 /// 为 `KubernetesRuntime` 添加 Pod 相关方法：
 /// - Pod 命名 (`pod_name`)
-/// - 状态提取 (`extract_pod_status`, `runtime_info_from_pod`, `detect_container_failure`)
-/// - 就绪等待 (`wait_for_pod_ready`)
+/// - 状态提取 (`extract_pod_status`, `runtime_info_from_pod`)
+/// - 就绪等待 (`wait_for_pod_ready`，watch 观察——批次 A)
 /// - 终止等待 (`wait_for_pod_terminated`)
 #[cfg(feature = "kubernetes")]
 #[async_trait]
@@ -59,12 +57,6 @@ pub(crate) trait K8sPodOps {
 
     /// 从 Pod 对象构建 RuntimeContainerInfo
     fn runtime_info_from_pod(pod: &Pod) -> RuntimeContainerInfo;
-
-    /// 检测容器失败原因
-    ///
-    /// 从 container_statuses 中提取 waiting 状态的 reason，
-    /// 用于诊断 CrashLoopBackOff、ImagePullBackOff 等问题。
-    fn detect_container_failure(pod: &Pod) -> Option<String>;
 
     /// 等待 Pod 就绪
     ///
@@ -162,19 +154,6 @@ impl K8sPodOps for KubernetesRuntime {
         }
     }
 
-    fn detect_container_failure(pod: &Pod) -> Option<String> {
-        let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
-        for cs in statuses {
-            if let Some(state) = &cs.state
-                && let Some(waiting) = &state.waiting
-                && let Some(reason) = &waiting.reason
-            {
-                return Some(reason.clone());
-            }
-        }
-        None
-    }
-
     async fn wait_for_pod_ready(
         &self,
         identifier: &str,
@@ -182,104 +161,48 @@ impl K8sPodOps for KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         // Pod wait timeout: configurable from config, default 120s
         let timeout = std::time::Duration::from_secs(self.config.pod_ttl_seconds.unwrap_or(120));
-        let start = std::time::Instant::now();
         // agent-runner 走 StatefulSet，pod 稳定名为 {sts_name}-0（非裸 pod 的 {sts_name}）。
         let pod_name = self.agent_pod_name(identifier, service_type)?;
-
-        while start.elapsed() < timeout {
-            match self.pods().get(&pod_name).await {
-                Ok(pod) => {
-                    // 检查 Pod phase，提前识别永久失败状态
-                    if let Some(phase) = pod.status.as_ref().and_then(|s| s.phase.as_deref()) {
-                        match phase {
-                            "Failed" => {
-                                // Pod 实际失败：容器异常退出/OOM/镜像拉失败 等
-                                let reason = Self::detect_container_failure(&pod);
-                                return Err(ContainerRuntimeError::K8sError(format!(
-                                    "Pod {} entered terminal state: Failed, reason: {:?}",
-                                    pod_name, reason
-                                )));
-                            }
-                            "Succeeded" => {
-                                // 容器跑完正常退出（run-to-completion 场景，例如一次性任务型 Pod）。
-                                // 这不是失败：pod 已成功执行到结束。对调用方而言"ready" 的语义是
-                                // "容器至少跑起来过"，Succeeded 满足这个语义。
-                                info!(
-                                    "[K8S] Pod {} completed with phase=Succeeded (run-to-completion)",
-                                    pod_name
-                                );
-                                return Ok(());
-                            }
-                            "Running" => {
-                                // Pod 运行中，检查 Ready condition
-                            }
-                            _ => {
-                                // Pending 等其他状态，继续等待
-                            }
-                        }
-                    }
-
-                    // 检测 CrashLoopBackOff 和 ImagePullBackOff
-                    if let Some(reason) = Self::detect_container_failure(&pod) {
-                        match reason.as_str() {
-                            "CrashLoopBackOff" => {
-                                return Err(ContainerRuntimeError::K8sError(format!(
-                                    "Pod {} is in CrashLoopBackOff state",
-                                    pod_name
-                                )));
-                            }
-                            "ImagePullBackOff" => {
-                                return Err(ContainerRuntimeError::K8sError(format!(
-                                    "Pod {} failed to pull image: {:?}",
-                                    pod_name,
-                                    pod.status
-                                        .as_ref()
-                                        .and_then(|s| s.container_statuses.as_ref())
-                                )));
-                            }
-                            _ => {
-                                // 其他 waiting 状态，继续等待
-                                debug!("[K8S] Pod {} waiting: {}", pod_name, reason);
-                            }
-                        }
-                    }
-
-                    // 检查 Pod 是否 Ready (需要 readinessProbe 返回成功)
-                    if let Some(status) = &pod.status
-                        && let Some(conditions) = &status.conditions
-                    {
-                        let all_ready = conditions
-                            .iter()
-                            .any(|c| c.type_ == "Ready" && c.status == "True");
-                        if all_ready {
-                            info!("[K8S] Pod {} is Ready", pod_name);
-                            return Ok(());
-                        }
-                        // 调试用：打印当前状态
-                        let ready_status = conditions
-                            .iter()
-                            .map(|c| format!("{}={}", c.type_, c.status))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        debug!("[K8S] Pod {} conditions: {}", pod_name, ready_status);
-                    }
-                }
-                Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                    // Pod 还没创建，继续等待
-                }
-                Err(e) => {
-                    return Err(ContainerRuntimeError::K8sError(format!(
-                        "Failed to get pod '{}': {}",
-                        pod_name, e
-                    )));
-                }
+        // kube-runtime 批次 A：轮询改单对象 watch（总 deadline 覆盖初始 LIST/
+        // 重连/复核——KR03）；判定语义逐字保留（分类器 = 原 phase/reason/Ready
+        // 三段判据，KR01）。调用方取消 = drop 本 future（select 分支随流一并
+        // 释放，KR04——观察不持后台任务）。
+        let deadline = std::time::Instant::now() + timeout;
+        let started = std::time::Instant::now();
+        let verdict = super::k8s_observation::await_pod_verdict(
+            &self.pods(),
+            &pod_name,
+            deadline,
+            tokio_util::sync::CancellationToken::new(),
+            super::k8s_observation::classify_pod_readiness,
+        )
+        .await;
+        info!(
+            "[K8S] Pod {} readiness observation finished in {:.1}s",
+            pod_name,
+            started.elapsed().as_secs_f64()
+        );
+        match verdict {
+            Ok(super::k8s_observation::Verdict::Complete(())) => {
+                info!("[K8S] Pod {} is Ready", pod_name);
+                Ok(())
             }
-            tokio::time::sleep(std::time::Duration::from_secs(POD_POLL_INTERVAL_SECS)).await;
+            Ok(super::k8s_observation::Verdict::Rejected(reason)) => Err(
+                ContainerRuntimeError::K8sError(format!("Pod {pod_name}: {reason}")),
+            ),
+            Ok(super::k8s_observation::Verdict::Pending) => Err(ContainerRuntimeError::K8sError(
+                format!("Pod {pod_name}: observation ended while pending"),
+            )),
+            Err(super::k8s_observation::ObservationError::Deadline { last_transient }) => {
+                Err(ContainerRuntimeError::Timeout(format!(
+                    "Pod did not become ready in time (last observation: {})",
+                    last_transient.as_deref().unwrap_or("none")
+                )))
+            }
+            Err(error) => Err(ContainerRuntimeError::K8sError(format!(
+                "Failed to get pod '{pod_name}': {error}"
+            ))),
         }
-
-        Err(ContainerRuntimeError::Timeout(
-            "Pod did not become ready in time".to_string(),
-        ))
     }
 
     async fn wait_for_pod_terminated(&self, pod_name: &str) -> ContainerRuntimeResult<()> {

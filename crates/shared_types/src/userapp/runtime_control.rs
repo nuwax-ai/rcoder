@@ -8,6 +8,7 @@
 //! 关键身份二分（spec §3.1）：
 //! - `runtime_instance_id`：进程每次启动新生成，旧实例请求一律不修改新实例；
 //! - `deployment_generation_id`：持久运行代次，跨正常重建延续。
+//!
 //! 两者不得合并。
 
 use serde::{Deserialize, Serialize};

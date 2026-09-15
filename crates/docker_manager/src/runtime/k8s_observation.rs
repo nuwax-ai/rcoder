@@ -1,0 +1,313 @@
+//! Kubernetes 私有观察模块（kube-runtime 接入批次 A，specs/kube-runtime-adoption）。
+//!
+//! 仅承载 Kubernetes 流消费、总截止时间与错误分类；**不含任何写操作能力**
+//! （不创建/删除/patch、不形成通用协调器）。业务判定（Ready 语义、Builder
+//! 双资源校验）留在各业务模块，经纯分类器回调注入。
+//!
+//! 不变量（spec KR01–KR06）：
+//! - 总 deadline 覆盖初始 LIST、连接、重连、退避与最后复核，嵌套不重置预算；
+//! - 取消仅终止本观察（drop 流）；HTTP 等待者取消不取消已受理共享操作；
+//! - 403/不可恢复错误及时失败（保留 API 分类）；断连/410/正常 EOF 由
+//!   kube-runtime watcher 按其协议续接（锁定版本 4.2 自带 RV 恢复与退避
+//!   重连——不自行实现 RV 协议），均在原预算内恢复；
+//! - 意外整体流结束是观察失败，不当作业务成功，不永久悬挂；
+//! - watch 是观察：观察超时/断连不授权释放操作租约或重新创建。
+
+#[cfg(feature = "kubernetes")]
+use std::time::Instant;
+
+#[cfg(feature = "kubernetes")]
+use futures_util::StreamExt as _;
+#[cfg(feature = "kubernetes")]
+use k8s_openapi::api::core::v1::Pod;
+#[cfg(feature = "kubernetes")]
+use kube::runtime::watcher;
+
+/// 单次观察的结构化结果错误（保留 API 分类，不退化成字符串识别）。
+#[cfg(feature = "kubernetes")]
+#[derive(Debug)]
+pub(crate) enum ObservationError {
+    /// 总预算耗尽（附最后观察到的暂态原因，可能为空）。
+    Deadline { last_transient: Option<String> },
+    /// 调用方取消（本观察的流已释放；不影响已受理共享操作）。
+    Cancelled,
+    /// 不可恢复错误：403/认证失败/资源类型不支持等（附 API code）。
+    Fatal { code: Option<u16>, message: String },
+    /// 意外整体流结束（watcher 终止且无业务结论）。
+    StreamEnded { message: String },
+}
+
+#[cfg(feature = "kubernetes")]
+impl std::fmt::Display for ObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ObservationError::Deadline { last_transient } => match last_transient {
+                Some(reason) => write!(
+                    f,
+                    "observation deadline exceeded (last transient: {reason})"
+                ),
+                None => write!(f, "observation deadline exceeded"),
+            },
+            ObservationError::Cancelled => write!(f, "observation cancelled"),
+            ObservationError::Fatal { code, message } => match code {
+                Some(code) => write!(f, "unrecoverable apiserver error ({code}): {message}"),
+                None => write!(f, "unrecoverable observation error: {message}"),
+            },
+            ObservationError::StreamEnded { message } => {
+                write!(f, "watch stream ended without a verdict: {message}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "kubernetes")]
+impl ObservationError {
+    /// API 分类码提取（watcher::Error 各源；保留 API code，传输错误无码）。
+    fn from_watcher(error: &watcher::Error) -> Option<Self> {
+        // watcher::Error 内嵌 kube_client::Error 源；403/401 不可恢复。
+        // 410（RV 过期）由 watcher 自行 re-list 恢复，不在此拦。
+        let source = match error {
+            watcher::Error::InitialListFailed(source)
+            | watcher::Error::WatchStartFailed(source)
+            | watcher::Error::WatchFailed(source) => source,
+            watcher::Error::WatchError(status) => {
+                if status.code == 401 || status.code == 403 {
+                    return Some(ObservationError::Fatal {
+                        code: Some(status.code),
+                        message: status.message.clone(),
+                    });
+                }
+                return None;
+            }
+            watcher::Error::NoResourceVersion => return None,
+        };
+        match source {
+            kube::Error::Api(ae) if ae.code == 401 || ae.code == 403 => {
+                Some(ObservationError::Fatal {
+                    code: Some(ae.code),
+                    message: ae.message.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// 观察判定（plan §2 纯判定模型）：由同步分类函数对完整观察对象产出。
+#[cfg(feature = "kubernetes")]
+#[derive(Debug)]
+pub(crate) enum Verdict<T> {
+    /// 尚无可判定状态，继续观察。
+    Pending,
+    /// 观察完成（业务语义由调用方的 T 承载）。
+    Complete(T),
+    /// 明确拒绝（业务失败分类，携带原因）。
+    Rejected(String),
+}
+
+/// Pod 就绪等待的纯状态分类器（KR01：保留既有 Ready/Succeeded 成功与
+/// Failed/CrashLoopBackOff/ImagePullBackOff 失败语义——逐字对齐
+/// `wait_for_pod_ready` 原轮询实现的判定，抽纯函数供 watch 与测试共用）。
+#[cfg(feature = "kubernetes")]
+pub(crate) fn classify_pod_readiness(pod: &Pod) -> Verdict<()> {
+    // phase 终态与 waiting reason 判定（与原实现同序：phase 先、reason 后）
+    if let Some(status) = &pod.status {
+        match status.phase.as_deref() {
+            Some("Failed") => {
+                let reason = waiting_reason(pod).unwrap_or_else(|| "unknown".to_string());
+                return Verdict::Rejected(format!(
+                    "pod entered terminal state: Failed, reason: {reason}"
+                ));
+            }
+            Some("Succeeded") => return Verdict::Complete(()),
+            _ => {}
+        }
+    }
+    if let Some(reason) = waiting_reason(pod) {
+        match reason.as_str() {
+            "CrashLoopBackOff" => {
+                return Verdict::Rejected("pod is in CrashLoopBackOff state".into());
+            }
+            "ImagePullBackOff" => {
+                return Verdict::Rejected("pod failed to pull image (ImagePullBackOff)".into());
+            }
+            _ => {}
+        }
+    }
+    // Ready condition（readinessProbe 真实通过；Running 不足）
+    if let Some(status) = &pod.status
+        && let Some(conditions) = &status.conditions
+        && conditions
+            .iter()
+            .any(|c| c.type_ == "Ready" && c.status == "True")
+    {
+        return Verdict::Complete(());
+    }
+    Verdict::Pending
+}
+
+/// 容器 waiting reason 提取（CrashLoopBackOff/ImagePullBackOff 诊断源）。
+#[cfg(feature = "kubernetes")]
+fn waiting_reason(pod: &Pod) -> Option<String> {
+    pod.status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find_map(|cs| {
+            cs.state
+                .as_ref()
+                .and_then(|state| state.waiting.as_ref())
+                .and_then(|waiting| waiting.reason.clone())
+        })
+}
+
+/// 对单个固定名称 Pod 的有界观察：watcher 流（field_selector 锁名）+
+/// 总 deadline + 取消边界；分类回调注入业务判定。
+///
+/// 返回 `Complete(T)` / `Rejected(reason)` 由分类器给出；错误见
+/// [`ObservationError`]。**不做任何写操作**；删除事件（对象消失）在
+/// readiness 语义下继续等待（STS 控制器可重建同名 Pod），不判定成功。
+#[cfg(feature = "kubernetes")]
+pub(crate) async fn await_pod_verdict<T: Clone>(
+    api: &kube::Api<Pod>,
+    pod_name: &str,
+    deadline: Instant,
+    cancel: tokio_util::sync::CancellationToken,
+    classify: impl Fn(&Pod) -> Verdict<T>,
+) -> Result<Verdict<T>, ObservationError> {
+    let config = watcher::Config::default()
+        .fields(&format!("metadata.name={pod_name}"))
+        // 连接轮换上限（非业务总预算——总预算由 deadline 承载）
+        .timeout(290);
+    let stream = watcher(api.clone(), config);
+    tokio::pin!(stream);
+    let mut last_transient: Option<String> = None;
+    loop {
+        // 预算先行（KR03：嵌套等待共享同一 deadline，不重置）
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| ObservationError::Deadline {
+                last_transient: last_transient.clone(),
+            })?;
+        let event = tokio::select! {
+            () = cancel.cancelled() => return Err(ObservationError::Cancelled),
+            _ = tokio::time::sleep(remaining) => {
+                return Err(ObservationError::Deadline { last_transient });
+            }
+            event = stream.next() => event,
+        };
+        let Some(event) = event else {
+            // watcher 流意外终止（非正常 EOF——正常 EOF 由 watcher 内部续接）
+            return Err(ObservationError::StreamEnded {
+                message: "watcher terminated before a verdict".into(),
+            });
+        };
+        match event {
+            Ok(watcher::Event::Apply(pod)) | Ok(watcher::Event::InitApply(pod)) => {
+                match classify(&pod) {
+                    Verdict::Complete(value) => return Ok(Verdict::Complete(value)),
+                    Verdict::Rejected(reason) => return Ok(Verdict::Rejected(reason)),
+                    Verdict::Pending => {}
+                }
+            }
+            Ok(watcher::Event::Delete(_)) => {
+                // 对象消失：readiness 语义下继续等（可被重建）；记暂态原因
+                last_transient = Some("observed object deletion; awaiting recreation".into());
+            }
+            Ok(watcher::Event::Init) | Ok(watcher::Event::InitDone) => {}
+            Err(error) => {
+                if let Some(fatal) = ObservationError::from_watcher(&error) {
+                    return Err(fatal);
+                }
+                // 暂态（传输断连/429/服务端 5xx）：watcher 自带退避重连，记录
+                // 最后原因供超时诊断（KR05：原预算内恢复，不重置 deadline）。
+                last_transient = Some(error.to_string());
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "kubernetes"))]
+#[path = "k8s_observation_tests.rs"]
+mod observation_contract_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pod(phase: Option<&str>, ready: Option<bool>, reason: Option<&str>) -> Pod {
+        let conditions = ready.map(|ready| {
+            vec![k8s_openapi::api::core::v1::PodCondition {
+                type_: "Ready".to_string(),
+                status: if ready { "True".into() } else { "False".into() },
+                ..Default::default()
+            }]
+        });
+        let waiting = reason.map(|reason| k8s_openapi::api::core::v1::ContainerStateWaiting {
+            reason: Some(reason.to_string()),
+            ..Default::default()
+        });
+        let state = waiting.map(|waiting| k8s_openapi::api::core::v1::ContainerState {
+            waiting: Some(waiting),
+            ..Default::default()
+        });
+        let container_statuses = state.map(|state| {
+            vec![k8s_openapi::api::core::v1::ContainerStatus {
+                state: Some(state),
+                ..Default::default()
+            }]
+        });
+        Pod {
+            status: Some(k8s_openapi::api::core::v1::PodStatus {
+                phase: phase.map(str::to_string),
+                conditions,
+                container_statuses,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// KR01 语义锁：分类器逐态断言（成功/失败/继续等待三档，对齐原轮询判据）。
+    #[test]
+    fn classify_pod_readiness_matches_legacy_semantics() {
+        // Ready=True → 成功
+        assert!(matches!(
+            classify_pod_readiness(&pod(Some("Running"), Some(true), None)),
+            Verdict::Complete(())
+        ));
+        // Succeeded → 成功（run-to-completion 语义保留）
+        assert!(matches!(
+            classify_pod_readiness(&pod(Some("Succeeded"), None, None)),
+            Verdict::Complete(())
+        ));
+        // Failed → 拒绝
+        assert!(matches!(
+            classify_pod_readiness(&pod(Some("Failed"), None, None)),
+            Verdict::Rejected(_)
+        ));
+        // CrashLoopBackOff / ImagePullBackOff → 拒绝
+        assert!(matches!(
+            classify_pod_readiness(&pod(Some("Running"), None, Some("CrashLoopBackOff"))),
+            Verdict::Rejected(_)
+        ));
+        assert!(matches!(
+            classify_pod_readiness(&pod(Some("Pending"), None, Some("ImagePullBackOff"))),
+            Verdict::Rejected(_)
+        ));
+        // Running 未 Ready / Pending / 其他 waiting reason → 继续等待
+        assert!(matches!(
+            classify_pod_readiness(&pod(Some("Running"), Some(false), None)),
+            Verdict::Pending
+        ));
+        assert!(matches!(
+            classify_pod_readiness(&pod(Some("Pending"), None, Some("ContainerCreating"))),
+            Verdict::Pending
+        ));
+        assert!(matches!(
+            classify_pod_readiness(&pod(None, None, None)),
+            Verdict::Pending
+        ));
+    }
+}
