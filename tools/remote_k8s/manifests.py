@@ -5,6 +5,8 @@ from common import LABEL, digest
 
 
 def render(c, images, password, registry_auth=None):
+    import secrets as _secrets
+    preview_token = _secrets.token_hex(24)
     labels = {LABEL: c.id}
     out = []
 
@@ -93,7 +95,11 @@ def render(c, images, password, registry_auth=None):
               'docker_config': {'multi_image_config': {'global_defaults': {}, 'services': services,
                   'selection_strategy': 'ServiceOnly', 'cache_config': {'enabled': True, 'ttl_seconds': 3600, 'max_entries': 50}}},
               'api_key_auth': {'enabled': False, 'api_key': ''},
-              'proxy_config': {'listen_port': 8088, 'default_backend_port': 8086, 'backend_host': '127.0.0.1', 'port_param': 'port', 'health_check': {'enabled': True, 'interval_seconds': 5, 'timeout_seconds': 1, 'healthy_threshold': 2, 'unhealthy_threshold': 3}}}
+              'proxy_config': {'listen_port': 8088, 'default_backend_port': 8086, 'backend_host': '127.0.0.1', 'port_param': 'port', 'health_check': {'enabled': True, 'interval_seconds': 5, 'timeout_seconds': 1, 'healthy_threshold': 2, 'unhealthy_threshold': 3}},
+              # Custom Page 多副本预览协调器（K8s=平台 PG；令牌经 env 注入不入 configmap）
+              'preview_coordinator': {'enabled': True, 'internal_token_env': 'RCODER_PREVIEW_INTERNAL_TOKEN', 'peer_api_port': 8086},
+              # 60000 分流代理（dev 生命周期 7 端点全策略导向 Rust 上游）
+              'file_server_proxy': {'listen_port': 60000, 'rust_upstream_port': 8086, 'ts_upstream_port': 60001, 'policy': 'ts_first', 'coordinated_dev_lifecycle': True}}
     config_name = 'rcoder-config-' + digest(config)[:12]
     obj('ConfigMap', config_name, data={'config.yml': json.dumps(config)}, immutable=True)
     env = {'CONTAINER_RUNTIME': 'kubernetes', 'RCODER_PORT': '8086', 'RCODER_K8S_NAMESPACE': c.ns,
@@ -125,7 +131,13 @@ def render(c, images, password, registry_auth=None):
                 'env': [{'name': k, 'value': v} for k, v in env.items()] + [
                     {'name': 'RCODER_PG_PASSWORD', 'valueFrom': {'secretKeyRef': {'name': 'postgres', 'key': 'password'}}},
                     {'name': 'RCODER_PG_URL', 'valueFrom': {'secretKeyRef': {'name': 'postgres', 'key': 'url'}}},
-                    {'name': 'RCODER_USERAPP_PG_URL', 'valueFrom': {'secretKeyRef': {'name': 'postgres', 'key': 'url'}}}],
+                    {'name': 'RCODER_USERAPP_PG_URL', 'valueFrom': {'secretKeyRef': {'name': 'postgres', 'key': 'url'}}},
+                    # 预览协调内部令牌（每次部署随机生成；跨 Pod 派发/转发入口鉴权）
+                    {'name': 'RCODER_PREVIEW_INTERNAL_TOKEN', 'value': preview_token},
+                    # 宿主身份（Downward API）：POD_UID=Unknown 恢复证据锚点，POD_IP=跨 Pod 转发寻址
+                    {'name': 'POD_NAME', 'valueFrom': {'fieldRef': {'fieldPath': 'metadata.name'}}},
+                    {'name': 'POD_UID', 'valueFrom': {'fieldRef': {'fieldPath': 'metadata.uid'}}},
+                    {'name': 'POD_IP', 'valueFrom': {'fieldRef': {'fieldPath': 'status.podIP'}}}],
                 'ports': [{'name': 'http', 'containerPort': 8086}, {'name': 'proxy', 'containerPort': 8088}],
                 'startupProbe': {'httpGet': {'path': '/health', 'port': 'http'}, 'periodSeconds': 5, 'failureThreshold': 60},
                 'readinessProbe': {'httpGet': {'path': '/health', 'port': 'http'}, 'periodSeconds': 5},

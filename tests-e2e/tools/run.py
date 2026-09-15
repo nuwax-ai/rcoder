@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REPO = ROOT.parent
 GROUPS = {
     'userapp': ['compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_userapp_faults', 'compose_userapp_deploy', 'compose_lifecycle', 'pg_storage_faults', 'sqlite_storage_contract', 'sqlite_compose_runtime', 'userapp_concurrency_contract', 'native_lifecycle_crash', 'docker_lifecycle_crash'],
-    'compose': ['compose_sse', 'compose_session', 'compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_webchat'],
+    'compose': ['compose_sse', 'compose_session', 'compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_webchat', 'custom_page_preview'],
     'deploy': ['compose_userapp_deploy'],
     'k8s': ['k8s_lb'],
 }

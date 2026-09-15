@@ -406,5 +406,23 @@
       "scenario": "docker_runtime_crash_recovery_contract",
       "backend": "docker-crash"
     }
+  ],
+  "cpp_lifecycle_envelopes": [
+    {
+      "scenario": "cpp_lifecycle_envelopes",
+      "backend": "compose"
+    }
+  ],
+  "cpp_preview_http": [
+    {
+      "scenario": "cpp_preview_http",
+      "backend": "compose"
+    }
+  ],
+  "cpp_hmr_websocket": [
+    {
+      "scenario": "cpp_hmr_websocket",
+      "backend": "compose"
+    }
   ]
 }

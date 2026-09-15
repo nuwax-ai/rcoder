@@ -39,6 +39,16 @@ file_server_proxy:
   rust_upstream_port: 8090
   ts_upstream_port: 60001
   policy: all_rust
+  # dev 生命周期 7 端点全策略导向 Rust 上游（与 preview_coordinator.enabled 联动）
+  coordinated_dev_lifecycle: true
+
+# Custom Page 多副本预览协调器（Compose 单节点=进程内权威存储；dev 生命周期
+# 收口 + /proxy/{port} 预览路由。令牌经 env RCODER_PREVIEW_INTERNAL_TOKEN 注入，
+# 缺失/过短启动 fail-fast）
+preview_coordinator:
+  enabled: true
+  internal_token_env: RCODER_PREVIEW_INTERNAL_TOKEN
+  peer_api_port: 8090
 
 # Pingora 反向代理配置
 proxy_config:

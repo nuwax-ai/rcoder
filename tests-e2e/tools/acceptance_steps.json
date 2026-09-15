@@ -511,5 +511,27 @@
     "Docker artifacts preserve app-cli",
     "Docker artifacts exclude source cache and toolchain",
     "Docker artifacts owned resources cleaned"
+  ],
+  "cpp_lifecycle_envelopes": [
+    "上传 vite 项目 zip",
+    "start-dev 信封（success/pid>0/port 池内）",
+    "start-dev 幂等返回同实例",
+    "keep-alive alive 信封（success/message/action=None）",
+    "list-dev 聚合视图含项目",
+    "get-dev-log 协调读取成功",
+    "stop-dev 信封（success + Stopped）",
+    "keep-alive 终态重建信封（action=start）"
+  ],
+  "cpp_preview_http": [
+    "上传 vite 项目 zip",
+    "start-dev 前置",
+    "/proxy/{port}/ 预览 200",
+    "预览内容为 vite index.html",
+    "停止后预览回环拒绝（502，与现状语义一致）"
+  ],
+  "cpp_hmr_websocket": [
+    "上传 vite 项目 zip",
+    "start-dev 前置",
+    "HMR WebSocket 握手（Upgrade 全链透传）"
   ]
 }

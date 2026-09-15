@@ -98,5 +98,10 @@
   ],
   "userapp_concurrency_contract": [
     "userapp_concurrency_component_contract"
+  ],
+  "custom_page_preview": [
+    "cpp_lifecycle_envelopes",
+    "cpp_preview_http",
+    "cpp_hmr_websocket"
   ]
 }

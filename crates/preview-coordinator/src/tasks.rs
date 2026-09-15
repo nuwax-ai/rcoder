@@ -52,6 +52,17 @@ impl PreviewCoordinator {
                     continue;
                 }
             };
+            // Starting 行归启动预算管（execute_start 超时自会收敛），心跳不碰：
+            // 冷缓存 pnpm install 可达数分钟，期间执行器必然无本地登记——若在此
+            // 判定 registration lost 会误转 Unknown，随后 publish_running CAS 失败
+            // （E2E/K8s 冷装实测 state=unknown 根因）。已登记且存活的迟到完成
+            // 在此自愈补发布。
+            if row.state == PreviewInstanceState::Starting {
+                if report.identity_match {
+                    self.heal_late_start(&row, &report).await;
+                }
+                continue;
+            }
             if !report.identity_match {
                 ignore_store_result(
                     self.store
@@ -79,41 +90,46 @@ impl PreviewCoordinator {
                 );
                 continue;
             }
-            match row.state {
-                PreviewInstanceState::Starting => {
-                    // 自愈：受理时启动预算超时但进程随后就绪 → 补发布
-                    let Some(pid) = report.pid else { continue };
-                    let Some(port) = report.port else { continue };
-                    match self
-                        .store
-                        .publish_running(
-                            &row.preview_key,
-                            &row.operation_id,
-                            row.revision,
-                            pid,
-                            port,
-                            row.base_path.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(_) => tracing::info!(
-                            preview_key = %row.preview_key,
-                            "preview heartbeat self-healed a late start into ready"
-                        ),
-                        Err(shared_types::PreviewStoreError::Conflict(_)) => {}
-                        Err(error) => {
-                            tracing::warn!(preview_key = %row.preview_key, "self-heal publish: {error}")
-                        }
-                    }
-                }
-                _ => {
-                    ignore_store_result(
-                        self.store
-                            .refresh_heartbeat(&row.preview_key, &row.instance_id)
-                            .await,
-                        "refresh_heartbeat",
-                    );
-                }
+            ignore_store_result(
+                self.store
+                    .refresh_heartbeat(&row.preview_key, &row.instance_id)
+                    .await,
+                "refresh_heartbeat",
+            );
+        }
+    }
+
+    /// Starting 迟到完成自愈：预算超时后进程才就绪 → 补发布为 Ready。
+    async fn heal_late_start(
+        &self,
+        row: &shared_types::PreviewInstanceRecord,
+        report: &shared_types::ExecutorVerifyReport,
+    ) {
+        if !report.alive {
+            return; // 已登记但进程死：留给启动预算/下一轮处理，不在此判死
+        }
+        let (Some(pid), Some(port)) = (report.pid, report.port) else {
+            return;
+        };
+        match self
+            .store
+            .publish_running(
+                &row.preview_key,
+                &row.operation_id,
+                row.revision,
+                pid,
+                port,
+                row.base_path.as_deref(),
+            )
+            .await
+        {
+            Ok(_) => tracing::info!(
+                preview_key = %row.preview_key,
+                "preview heartbeat self-healed a late start into ready"
+            ),
+            Err(shared_types::PreviewStoreError::Conflict(_)) => {}
+            Err(error) => {
+                tracing::warn!(preview_key = %row.preview_key, "self-heal publish: {error}")
             }
         }
     }

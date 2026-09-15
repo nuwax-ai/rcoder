@@ -17,6 +17,11 @@ ENV CARGO_TARGET_DIR=/cache/target CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH
 RUN --mount=type=cache,id=rcoder-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=rcoder-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=rcoder-cargo-target,target=/cache/target,sharing=locked \
+    # buildkit COPY 将全部源文件 mtime 归一化为同一值——cache mount 里上次的
+    # cargo fingerprint 记录的 mtime 与之相等 → 增量判定 stale 失效（实测：
+    # tasks.rs 变更后 cargo 未重编成员、cp 出旧 bin）。touch workspace 成员源
+    # 强制重编（第三方依赖走缓存不受影响，成员重编 ~分钟级）。
+    find /src/crates -name '*.rs' -exec touch {} + && \
     cargo build --locked --jobs ${CARGO_JOBS} --profile dev -p rcoder -p agent_runner -p file-server-proxy --features rcoder/rcoder-pg --bin rcoder --bin agent_runner --bin file-server-proxy && \
     cargo build --locked --jobs ${CARGO_JOBS} --profile dev --manifest-path crates/app-cli/Cargo.toml && \
     mkdir /out && cp /cache/target/debug/rcoder /cache/target/debug/agent_runner /cache/target/debug/app-cli /cache/target/debug/file-server-proxy /out/

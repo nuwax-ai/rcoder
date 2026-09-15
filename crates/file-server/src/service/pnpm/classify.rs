@@ -7,7 +7,14 @@ pub(super) fn classify_failure(
     summary: &InstallSummary,
     fallback_output: &str,
 ) -> (FailureKind, Option<String>, String) {
-    let code = summary.error_codes.last().cloned();
+    // code 优先取 ndjson 事件里的 error_codes；缺失时兜底扫纯文本 `Error: ERR_PNPM_*`
+    // 行（pnpm≥12 的 ignored-builds 等失败在 stderr 打纯文本、不走 ndjson 事件流——
+    // 不扫则 code=None/Unknown，调用方（如 ignored-builds 自愈）无法精确门控）。
+    let code = summary
+        .error_codes
+        .last()
+        .cloned()
+        .or_else(|| extract_plain_error_code(fallback_output));
     let message = summary
         .diagnostics
         .last()
@@ -26,6 +33,18 @@ pub(super) fn classify_failure(
     )
     .to_ascii_lowercase();
     (classify_text(&haystack), code, message)
+}
+
+/// 纯文本 `Error: ERR_PNPM_XXX` 行的码提取（倒序找最近一个）。
+fn extract_plain_error_code(fallback_output: &str) -> Option<String> {
+    fallback_output.lines().rev().find_map(|line| {
+        let token = line
+            .trim()
+            .strip_prefix("Error: ")?
+            .split_whitespace()
+            .next()?;
+        token.starts_with("ERR_PNPM_").then(|| token.to_string())
+    })
 }
 
 fn classify_text(value: &str) -> FailureKind {
