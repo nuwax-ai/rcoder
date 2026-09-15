@@ -18,8 +18,6 @@ pub(crate) async fn execute(
     restart: bool,
 ) -> Result<BuilderControlResult> {
     shared_types::validate_identifier(app_id, "app_id").map_err(|error| anyhow!(error))?;
-    shared_types::validate_identifier(&request, "user_id")
-        .map_err(|error| anyhow!(error))?;
     request
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
@@ -32,9 +30,6 @@ pub(crate) async fn execute(
             .get_application(&app_id)
             .await?
             .ok_or(UserAppStoreError::NotFound)?;
-        if app != request {
-            return Err(UserAppStoreError::OwnershipConflict.into());
-        }
         if app.state != UserAppLifecycleState::Active
             || request
                 .lifecycle_id
@@ -43,10 +38,8 @@ pub(crate) async fn execute(
         {
             return Err(UserAppStoreError::LifecycleConflict.into());
         }
-        // owner 实例复合 identifier（stop/restart 属 owner 生命周期操作——
-        // 操作/恢复按纯 app_id 受理，物理资源定位/锁/注册按复合键）。
-        let instance = shared_types::builder_instance_id(&request, &app_id)
-            .map_err(anyhow::Error::msg)?;
+        // 应用共享：物理资源定位/锁/注册按纯 app_id（与受理同一键）。
+        let instance = app_id.clone();
         let command = if restart {
             UserAppControlCommand::RestartBuilder
         } else {
@@ -94,7 +87,7 @@ pub(crate) async fn execute(
                 return Err(UserAppStoreError::OperationInProgress(record.operation_id).into());
             }
         };
-        execute_pending(&owned, record, &instance, &request, restart).await
+        execute_pending(&owned, record, &instance, restart).await
     })
     .await
     .context("Builder control observer interrupted")?
@@ -133,7 +126,6 @@ async fn execute_pending(
     state: &AppState,
     mut record: UserAppOperationRecord,
     instance: &str,
-
     restart: bool,
 ) -> Result<BuilderControlResult> {
     let executor = uuid::Uuid::new_v4().to_string();
@@ -442,10 +434,8 @@ pub(super) async fn resume_pending(
     if app.lifecycle_id != record.lifecycle_id || app.state != UserAppLifecycleState::Active {
         return Err(UserAppStoreError::LifecycleConflict.into());
     }
-    // owner 实例复合 identifier（resume 的操作由 owner 受理，实例恒为
-    // {owner}-{app_id}）
-    let instance = shared_types::builder_instance_id(&app, &record.app_id)
-        .map_err(anyhow::Error::msg)?;
-    execute_pending(state, current, &instance, &app, restart).await?;
+    // 应用共享：instance == 纯 app_id
+    let instance = record.app_id.clone();
+    execute_pending(state, current, &instance, restart).await?;
     Ok(true)
 }

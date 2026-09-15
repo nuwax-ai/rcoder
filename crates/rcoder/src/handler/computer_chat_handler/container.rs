@@ -27,6 +27,7 @@ use super::helpers::ensure_project_mapping_in_state;
 pub(super) async fn ensure_container_ready(
     state: &Arc<AppState>,
     request: &ComputerChatRequest,
+    user_id: &str,
     project_id: &str,
     locale: &'static str,
 ) -> Result<ContainerBasicInfo, ChatFlowExit> {
@@ -108,6 +109,7 @@ pub(super) async fn ensure_container_ready(
 #[instrument(skip_all, fields(user_id = %user_id))]
 async fn wait_for_concurrent_creation(
     state: &Arc<AppState>,
+    user_id: &str,
 ) -> Option<ContainerBasicInfo> {
     let mut waited_container_info: Option<ContainerBasicInfo> = None;
 
@@ -192,6 +194,7 @@ async fn wait_for_concurrent_creation(
 async fn create_container_with_marker(
     state: &Arc<AppState>,
     request: &ComputerChatRequest,
+    user_id: &str,
     project_id: &str,
     locale: &'static str,
 ) -> Result<ContainerBasicInfo, ChatFlowExit> {
@@ -201,6 +204,7 @@ async fn create_container_with_marker(
         .insert(user_id.to_string(), std::time::Instant::now());
 
     let options = crate::service::computer_container_manager::ContainerCreateOptions {
+        user_id: user_id.to_string(),
         project_id: project_id.to_string(),
         resource_limits: resolve_resource_limits_from_config(
             state,
@@ -248,6 +252,7 @@ async fn create_container_with_marker(
 async fn recreate_container_with_empty_ip(
     state: &Arc<AppState>,
     request: &ComputerChatRequest,
+    user_id: &str,
     project_id: &str,
     container_info: &ContainerBasicInfo,
 ) -> Result<ContainerBasicInfo, ChatFlowExit> {
@@ -276,6 +281,7 @@ async fn recreate_container_with_empty_ip(
         );
     }
     let options = crate::service::computer_container_manager::ContainerCreateOptions {
+        user_id: user_id.to_string(),
         project_id: user_id.to_string(), // ComputerAgentRunner 使用 user_id 作为 project_id
         resource_limits: resolve_resource_limits_from_config(
             state,

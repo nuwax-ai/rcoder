@@ -95,7 +95,7 @@ impl UserAppDeploymentRuntime for MockRuntime {
         _expected_version: Option<&str>,
     ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
         context
-            .validate_identity(&context.app_id, Some(&String::new()))
+            .validate_identity(&context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         Ok(shared_types::UserAppMutationTarget {
             context: context.clone(),

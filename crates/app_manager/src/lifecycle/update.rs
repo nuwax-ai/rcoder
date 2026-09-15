@@ -70,9 +70,7 @@ impl AppService {
         _update_lock: &crate::service::AppOperationGuard,
     ) -> AppResult<()> {
         self.metadata
-            .validate_request_lifecycle(app_id), request.lifecycle_id.as_deref())
-            .await?;
-        let owner: Option<String> = None)
+            .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
             .await?;
         use sha2::Digest as _;
         let fingerprint = hex::encode(sha2::Sha256::digest(
@@ -182,14 +180,7 @@ impl AppService {
         )
         .await?;
         let result = self
-            .execute_update(
-                app_id,
-                &owner,
-                params,
-                current,
-                &mut operation,
-                _update_lock,
-            )
+            .execute_update(app_id, params, current, &mut operation, _update_lock)
             .await;
         match result {
             Ok(()) => {
@@ -210,7 +201,6 @@ impl AppService {
     pub(crate) async fn execute_update(
         &self,
         app_id: &str,
-        owner: &str,
         mut params: container_runtime_api::ContainerCreateParams,
         current: container_runtime_api::DeploymentStatus,
         operation: &mut crate::service::OwnedOperation,

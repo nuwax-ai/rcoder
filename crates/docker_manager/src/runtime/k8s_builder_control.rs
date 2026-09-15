@@ -428,27 +428,8 @@ fn workload_identity_with_binding(
         ));
     }
     let metadata = sts.metadata.annotations.clone().unwrap_or_default();
-    let owner = metadata
-        .get("rcoder.io/owner-id")
-        .map(String::as_str)
-        .or_else(|| {
-            sts.spec
-                .as_ref()
-                .and_then(|spec| spec.template.spec.as_ref())
-                .and_then(|spec| {
-                    spec.containers
-                        .iter()
-                        .find(|container| container.name == "agent")
-                })
-                .and_then(|container| container.env.as_ref())
-                .and_then(|env| {
-                    env.iter()
-                        .find(|entry| entry.name == "USER_ID" && entry.value_from.is_none())
-                })
-                .and_then(|entry| entry.value.as_deref())
-        });
     let uid = required(sts.metadata.uid.as_deref(), "workload UID")?;
-    if !shared_types::builder_identity_is_bound(context, &metadata, &uid, owner, binding)
+    if !shared_types::builder_identity_is_bound(context, &metadata, &uid, binding)
         .map_err(Error::Conflict)?
         && !adoption
     {
@@ -547,7 +528,6 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let context = UserAppExecutionContext {
             app_id: "app".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             operation_id: "stop".into(),
             executor_id: "worker".into(),
@@ -700,7 +680,6 @@ mod tests {
         let target = BuilderControlTarget {
             resource_binding: wake.then(|| shared_types::UserAppResourceBinding {
                 app_id: "app".into(),
-                user_id: "owner".into(),
                 lifecycle_id: "life".into(),
                 service_type: ServiceType::UserappBuilder,
                 physical_uid: "sts-original".into(),
@@ -738,7 +717,6 @@ mod tests {
     fn workload_and_pod_identity_reject_replacement_ownership() {
         let context = UserAppExecutionContext {
             app_id: "app".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             operation_id: "stop".into(),
             executor_id: "worker".into(),

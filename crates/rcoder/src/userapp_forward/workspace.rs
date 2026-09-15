@@ -17,10 +17,9 @@ use crate::{AppError, HttpResult};
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateWorkspaceBody {
-    /// Userapp 应用 ID（同时是开发容器与 workspace 目录的标识）
+    /// Userapp 应用 ID（同时是开发容器与 workspace 目录的标识；应用共享，
+    /// 无用户绑定——多余的 user_id 字段按未知值忽略）
     pub app_id: String,
-    /// 用户 ID（owner，落 userapp_metadata；发布编排与 apps 代理 URL 拼接使用）
-    pub user_id: String,
 }
 
 /// `POST /api/v1/userapp/workspace`：创建项目显式入口（幂等）。
@@ -48,16 +47,12 @@ pub(crate) async fn create_workspace(
 ) -> Result<HttpResult<serde_json::Value>, AppError> {
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
-    shared_types::validate_identifier(&body, "user_id")
-        .map_err(|e| AppError::bad_request(&e))?;
 
-    // 1. metadata 注册 owner（部署前即可被发布编排/apps URL 拼接查到）。
-    //    **必须先于 ensure 开发容器**：builder 挂载压平的宿主树 dev/{user_id}/{app_id}
-    //    组装依赖 owner user_id（create_builder_and_register 查元数据），先注册后
-    //    ensure 才能首次创建即落正确分区（否则兜底 app_id 分区）。
+    // 1. metadata 注册 identity（部署前即可被发布编排查到）。必须先于
+    //    ensure 开发容器（builder 按固定命名空间挂载，先注册后 ensure）。
     state
         .app_service
-        .record_dev_registration(&body.app_id, &body)
+        .record_dev_registration(&body.app_id)
         .await
         .map_err(|e| {
             tracing::warn!(
@@ -70,8 +65,8 @@ pub(crate) async fn create_workspace(
             )
         })?;
 
-    // 2. ensure 开发容器（幂等；注册 state.projects）——owner 显式档直传
-    let info = ensure_userapp_builder(&state, &body.app_id, Some(&body))
+    // 2. ensure 开发容器（幂等；注册 state.projects）——应用共享按 app_id 定位
+    let info = ensure_userapp_builder(&state, &body.app_id)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -86,17 +81,16 @@ pub(crate) async fn create_workspace(
 
     // 3. 容器内建 workspace 目录（幂等）
     let addr = dev_file_server_addr(&state, &info);
-    super::ensure_workspace_via_dev(&addr, &body.app_id, &body)
+    super::ensure_workspace_via_dev(&addr, &body.app_id)
         .await
         .map_err(|e| AppError::with_message(shared_types::error_codes::ERR_CONTAINER_ERROR, e))?;
 
     info!(
-        "[USERAPP_FORWARD] workspace created: app_id={}, user_id={}, container={}, ip={}",
-        body.app_id, body, info.container_name, info.container_ip
+        "[USERAPP_FORWARD] workspace created: app_id={}, container={}, ip={}",
+        body.app_id, info.container_name, info.container_ip
     );
     Ok(HttpResult::success(json!({
         "app_id": body.app_id,
-        "user_id": body,
         "container_name": info.container_name,
         "container_ip": info.container_ip,
     })))

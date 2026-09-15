@@ -12,7 +12,6 @@ use shared_types::{
 fn validate_request(app_id: &str, request: &AdoptBuilderRequest) -> Result<()> {
     for (field, value) in [
         ("app_id", app_id),
-        ("user_id", request.as_str()),
         ("lifecycle_id", request.lifecycle_id.as_str()),
         ("request_id", request.request_id.as_str()),
     ] {
@@ -78,7 +77,7 @@ pub(crate) async fn execute(
                 .into());
             }
         };
-        run(&state, record, &request).await
+        run(&state, record).await
     })
     .await
     .context("Observe builder adoption worker")?
@@ -112,20 +111,14 @@ pub(super) async fn resume_pending(
     if app.state != UserAppLifecycleState::Active || app.lifecycle_id != current.lifecycle_id {
         return Err(UserAppStoreError::LifecycleConflict.into());
     }
-    run(state, current, &app).await?;
+    run(state, current).await?;
     Ok(true)
 }
 
-async fn run(
-    state: &AppState,
-    record: UserAppOperationRecord,
-
-) -> Result<BuilderControlResult> {
+async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<BuilderControlResult> {
     let executor = uuid::Uuid::new_v4().to_string();
-    // owner 实例复合 identifier（adoption 属 owner 生命周期操作——受理按纯
-    // app_id，物理资源定位/绑定按复合键）
-    let instance =
-        shared_types::builder_instance_id(owner, &record.app_id).map_err(anyhow::Error::msg)?;
+    // 应用共享：builder identifier == 纯 app_id（受理与物理资源定位同一键）
+    let instance = record.app_id.clone();
     let claimed = state
         .userapp_store
         .advance(&UserAppOperationProgress {
@@ -154,7 +147,7 @@ async fn run(
         let input = state.userapp_store.read_execution_input(&context).await?;
         let request: AdoptBuilderRequest =
             serde_json::from_str(input.encoded()).context("Decode builder adoption request")?;
-        if request.lifecycle_id != context.lifecycle_id || request != context {
+        if request.lifecycle_id != context.lifecycle_id {
             return Err(anyhow!("Stored adoption identity mismatch"));
         }
         let mut lease = super::dev_cleanup::BuilderOperation::new(
@@ -284,14 +277,12 @@ pub(super) async fn capture_bound_target(
         .await?)
 }
 
-/// 只读活体校验：以 lifecycle（纯 app_id）+ 复合 identifier + 实例归属构造
-/// capture context，校验物理负载未被替换且归属注解（rcoder.io/owner-id）与
-/// 实例 user 一致。owner 实例传 owner，协作者实例传协作者。
+/// 只读活体校验：以 lifecycle 构造 capture context（builder identifier =
+/// 纯 app_id），校验物理负载未被替换。应用共享，无归属注解可比对。
 pub(super) async fn verify_live_builder(
     state: &AppState,
     app_id: &str,
     instance: &str,
-
     physical_id: &str,
 ) -> Result<()> {
     let app = state
@@ -378,12 +369,7 @@ mod tests {
             expected_container_id: "physical-uid".into(),
         };
         validate_request("app", &request).expect("valid");
-        for field in [
-            "user_id",
-            "lifecycle_id",
-            "request_id",
-            "expected_container_id",
-        ] {
+        for field in ["lifecycle_id", "request_id", "expected_container_id"] {
             let mut encoded = serde_json::to_value(&request).expect("encode");
             encoded[field] = serde_json::json!("");
             let invalid = serde_json::from_value(encoded).expect("request shape");

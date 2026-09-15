@@ -193,10 +193,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 /// 全新容器的 file-server 有启动窗口（镜像全套 agent_runner+PG+file-server），
 /// 连接类失败按 5s/10s/15s 退避重试（HTTP 4xx/5xx 业务错误不重试，直接上抛）。
 /// 错误返回面向日志的描述串（调用方各自映射响应类型）。
-pub(crate) async fn ensure_workspace_via_dev(
-    addr: &str,
-    app_id: &str,
-) -> Result<(), String> {
+pub(crate) async fn ensure_workspace_via_dev(addr: &str, app_id: &str) -> Result<(), String> {
     // 五档退避最坏 120s：agent_runner(file-server 60000) 在宿主高负载（多 builder 并发
     // 构建/对话）下启动可超 30s——原三档 30s 上限在 e2e 六场景并行时实测不够
     // （后发容器被先发容器负载拖慢 → 60000 连接失败）。
@@ -229,7 +226,7 @@ pub(crate) async fn ensure_workspace_via_dev(
         let resp = crate::http_client::shared_client()
             .post(format!("{addr}/api/v1/userapp/ensure-workspace"))
             .timeout(std::time::Duration::from_secs(30))
-            .json(&serde_json::json!({"app_id": app_id, "user_id": user_id}))
+            .json(&serde_json::json!({"app_id": app_id}))
             .send()
             .await;
         match resp {
@@ -255,13 +252,17 @@ mod tests {
 
     #[test]
     fn create_workspace_body_is_snake_case() {
-        let raw = serde_json::json!({"app_id": "app1", "user_id": "u1"});
+        let raw = serde_json::json!({"app_id": "app1"});
         let body: CreateWorkspaceBody = serde_json::from_value(raw).expect("deserialize");
         assert_eq!(body.app_id, "app1");
-        assert_eq!(body, "u1");
         // 旧 camel wire 已废弃：未知键被忽略后必填字段缺失即拒
-        let legacy = serde_json::json!({"appId": "app1", "userId": "u1"});
+        let legacy = serde_json::json!({"appId": "app1"});
         assert!(serde_json::from_value::<CreateWorkspaceBody>(legacy).is_err());
+        // 多余 user_id 按未知值忽略（用户绑定已移除）
+        let legacy_user = serde_json::json!({"app_id": "app2", "user_id": "u1"});
+        let body: CreateWorkspaceBody =
+            serde_json::from_value(legacy_user).expect("unknown fields ignored");
+        assert_eq!(body.app_id, "app2");
     }
 
     #[test]

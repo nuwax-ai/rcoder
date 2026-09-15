@@ -89,18 +89,16 @@ fn refreshed_registration(
 
 /// 确保 UserappBuilder 开发容器存在（幂等）并返回容器信息。
 ///
-/// `explicit_user_id`：请求入参显式携带的 owner（优先档；`None`/空白视为未传，
-/// 走 metadata 注册值）。新建容器时用于组装宿主树 `dev/{user_id}/{app_id}`。
+/// 应用共享：按 app_id 定位唯一 dev 容器（无用户维度），miss 创建注册。
 pub(crate) async fn ensure_userapp_builder(
     state: &AppState,
     app_id: &str,
-    explicit_user_id: Option<&str>,
 ) -> Result<ContainerBasicInfo> {
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
     within_builder_deadline(
         deadline,
-        ensure_userapp_builder_until(state, app_id, explicit_user_id, deadline),
+        ensure_userapp_builder_until(state, app_id, deadline),
     )
     .await
 }
@@ -108,81 +106,45 @@ pub(crate) async fn ensure_userapp_builder(
 pub(crate) async fn ensure_userapp_builder_until(
     state: &AppState,
     app_id: &str,
-    explicit_user_id: Option<&str>,
     deadline: tokio::time::Instant,
 ) -> Result<ContainerBasicInfo> {
-    let target = resolve_dev_target(
-        explicit_user_id,
-        state.app_service.get_app_owner(app_id).await?.as_deref(),
-    )
-    .with_context(|| {
-        format!("cannot resolve dev instance user for app {app_id}; pass user_id explicitly")
-    })?;
     // deadline 包裹由调用方负责（ensure_userapp_builder 包装/upstream 自带
     // timeout_at）——此处只透传，保持既有错误形态。
-    ensure_builder_target_until(state, app_id, &target, deadline).await
+    ensure_builder_target_until(state, app_id, deadline).await
 }
 
-/// 双路径 ensure 体（`ensure_userapp_builder_until` /
-/// `ensure_userapp_builder_probed_until` 共用）：owner 实例走 lifecycle 受理
-/// （admit/恢复/围栏，语义不变）；非 owner 协作者实例走轻量路径（复合键
-/// 进程内锁 + docker_manager 侧 K8s operation 锁 fence，不经 lifecycle
-/// admit——app 级 operation 会让跨用户并发 ensure 误撞
-/// OperationInProgress）。两路径的容器命名/注册表/探活键统一为复合
-/// identifier。
+/// ensure 体：应用共享模型——builder identifier == 纯 app_id，恒走
+/// lifecycle 受理（admit/恢复/围栏）。
 async fn ensure_builder_target_until(
     state: &AppState,
     app_id: &str,
-    target: &DevTarget,
     deadline: tokio::time::Instant,
 ) -> Result<ContainerBasicInfo> {
-    let instance = target.instance_id(app_id)?;
-    let _lifecycle = lifecycle::acquire(&instance).await;
-    // 复合 identifier 长度 Fail Fast（仅新建路径——注册命中说明历史上已
-    // 建成，不受限）：STS pod 的 controller-revision-hash label =
-    // `rcoder-app-builder-{user_id}-{app_id}-{10位hash}` 受 63 字节限，超长
-    // 必然 FailedCreate 且表象含糊（ensure 500/连接超时，真因只在 kubectl
-    // events）。入口明确拒绝（229 全链 e2e 实测抓出的既有纪律，复合键化沿用）。
-    if instance.chars().count() > shared_types::USERAPP_BUILDER_INSTANCE_ID_MAX_LEN
-        && registered_builder(state, &instance).is_none()
+    let instance = app_id;
+    let _lifecycle = lifecycle::acquire(instance).await;
+    // app_id 长度 Fail Fast（仅新建路径——注册命中说明历史上已建成，不受限）：
+    // STS pod 的 controller-revision-hash label =
+    // `rcoder-app-builder-{app_id}-{10位hash}` 受 63 字节限，超长必然 FailedCreate
+    // 且表象含糊（ensure 500/连接超时，真因只在 kubectl events）。入口明确拒绝
+    //（229 全链 e2e 实测抓出的既有纪律，共享模型沿用）。
+    if instance.chars().count() > shared_types::USERAPP_APP_ID_MAX_LEN
+        && registered_builder(state, instance).is_none()
     {
         return Err(anyhow!(
-            "builder instance id length {} exceeds {} (K8s StatefulSet label 63-byte limit; \
-             see USERAPP_BUILDER_INSTANCE_ID_MAX_LEN)",
+            "builder app_id length {} exceeds {} (K8s StatefulSet label 63-byte limit; \
+             see USERAPP_APP_ID_MAX_LEN)",
             instance.chars().count(),
-            shared_types::USERAPP_BUILDER_INSTANCE_ID_MAX_LEN
+            shared_types::USERAPP_APP_ID_MAX_LEN
         ));
     }
-    if target.is_owner_instance {
-        let identity = state
-            .userapp_store
-            .ensure_identity(app_id, &target.instance_user)
-            .await?;
-        if !builder_fenced_by_current_operation(state, &identity).await?
-            && let Some(info) = registered_or_discovered_builder(state, &instance).await?
-            && let Some(verified) =
-                cross_verify_registration(state, app_id, &instance, &info).await?
-        {
-            return Ok(verified);
-        }
-        creation::ensure(
-            state,
-            app_id,
-            &instance,
-            &target.instance_user,
-            _lifecycle,
-            deadline,
-        )
-        .await
-    } else {
-        if let Some(info) = registered_or_discovered_builder(state, &instance).await?
-            && let Some(verified) =
-                cross_verify_registration(state, app_id, &instance, &info).await?
-        {
-            return Ok(verified);
-        }
-        create_instance_builder(state, app_id, &instance, &target.instance_user, deadline).await
+    let identity = state.userapp_store.ensure_identity(app_id).await?;
+    if !builder_fenced_by_current_operation(state, &identity).await?
+        && let Some(info) = registered_or_discovered_builder(state, instance).await?
+        && let Some(verified) = cross_verify_registration(state, app_id, instance, &info).await?
+    {
+        return Ok(verified);
     }
+    creation::ensure(state, app_id, instance, _lifecycle, deadline).await
 }
 
 /// 当前操作是否围栏 builder：仅 builder 变更族（Ensure/Adopt/Stop/Restart/
@@ -204,26 +166,15 @@ async fn builder_fenced_by_current_operation(
     Ok(operation.kind.affects_builder())
 }
 
-/// 探活自愈版 [`ensure_userapp_builder`]：注册命中后连容器 file-server 探活
-/// （3s 超时）。探活失败**不直接判死**——先经 [`remediate_stale_registry`]
-/// 以容器真实状态裁决：Running 保容器（负载抖动/启动窗口），真死才清注册重建。
-///
-/// 供低频管理面调用（pod ensure/keepalive）：**先探活再返回**，防"注册表命中
-/// 死容器"幻报就绪；热路径（转发/chat）不适用——它们有自己的节流
-/// 探活（forward 30s 正缓存）或按需自愈语义。
-///
-/// 返回 `(info, created)`——created 由本函数判定（真死重建/miss 创建=true，
-/// 探活通过或经裁决保容器=false），调用方无需再读注册表推断。
 pub(crate) async fn ensure_userapp_builder_probed(
     state: &AppState,
     app_id: &str,
-    explicit_user_id: Option<&str>,
 ) -> Result<(ContainerBasicInfo, bool)> {
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
     within_builder_deadline(
         deadline,
-        ensure_userapp_builder_probed_until(state, app_id, explicit_user_id, deadline),
+        ensure_userapp_builder_probed_until(state, app_id, deadline),
     )
     .await
 }
@@ -231,82 +182,48 @@ pub(crate) async fn ensure_userapp_builder_probed(
 async fn ensure_userapp_builder_probed_until(
     state: &AppState,
     app_id: &str,
-    explicit_user_id: Option<&str>,
     deadline: tokio::time::Instant,
 ) -> Result<(ContainerBasicInfo, bool)> {
-    let target = resolve_dev_target(
-        explicit_user_id,
-        state.app_service.get_app_owner(app_id).await?.as_deref(),
-    )
-    .with_context(|| {
-        format!("cannot resolve dev instance user for app {app_id}; pass user_id explicitly")
-    })?;
-    let instance = target.instance_id(app_id)?;
-    let _lifecycle = lifecycle::acquire(&instance).await;
-    if instance.chars().count() > shared_types::USERAPP_BUILDER_INSTANCE_ID_MAX_LEN
-        && registered_builder(state, &instance).is_none()
+    let instance = app_id;
+    let _lifecycle = lifecycle::acquire(instance).await;
+    if instance.chars().count() > shared_types::USERAPP_APP_ID_MAX_LEN
+        && registered_builder(state, instance).is_none()
     {
         return Err(anyhow!(
-            "builder instance id length {} exceeds {} (K8s StatefulSet label 63-byte limit; \
-             see USERAPP_BUILDER_INSTANCE_ID_MAX_LEN)",
+            "builder app_id length {} exceeds {} (K8s StatefulSet label 63-byte limit; \
+             see USERAPP_APP_ID_MAX_LEN)",
             instance.chars().count(),
-            shared_types::USERAPP_BUILDER_INSTANCE_ID_MAX_LEN
+            shared_types::USERAPP_APP_ID_MAX_LEN
         ));
     }
-    // owner 实例：lifecycle 受理在身（围栏/恢复）；非 owner 实例：轻量路径
-    // （复合键锁 fence，无 lifecycle 操作）。探活/自愈两路径同构。
-    // `_lifecycle`（复合键进程内互斥）在创建分支移交给 creation worker
-    // （防同进程并发创建），探活/裁决分支由本函数持有至返回。
-    let fenced = if target.is_owner_instance {
-        let identity = state
-            .userapp_store
-            .ensure_identity(app_id, &target.instance_user)
-            .await?;
-        builder_fenced_by_current_operation(state, &identity).await?
-    } else {
-        false
-    };
+    let identity = state.userapp_store.ensure_identity(app_id).await?;
+    let fenced = builder_fenced_by_current_operation(state, &identity).await?;
 
-    /// 就绪裁决后按路径创建（owner=lifecycle admit，非 owner=轻量直建）。
-    /// `lease`：复合键进程内互斥，创建期间持有（owner 路径移交 worker）。
+    /// 就绪裁决后创建（lifecycle admit 路径）。`lease`：进程内互斥，
+    /// 创建期间持有（移交 worker）。
     async fn rebuild(
         state: &AppState,
         app_id: &str,
         instance: &str,
-        target: &DevTarget,
         deadline: tokio::time::Instant,
         lease: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<ContainerBasicInfo> {
-        if target.is_owner_instance {
-            creation::ensure(
-                state,
-                app_id,
-                instance,
-                &target.instance_user,
-                lease,
-                deadline,
-            )
-            .await
-        } else {
-            let _held = lease;
-            create_instance_builder(state, app_id, instance, &target.instance_user, deadline).await
-        }
+        creation::ensure(state, app_id, instance, lease, deadline).await
     }
 
-    if !fenced && let Some(info) = registered_or_discovered_builder(state, &instance).await? {
+    if !fenced && let Some(info) = registered_or_discovered_builder(state, instance).await? {
         let addr = dev_file_server_addr(state, &info);
         if probe_file_server(&addr).await {
             // 探活过 ≠ 归属正确：跨族污染形态下生产容器的 file-server 同样在
             // 60000 应答（探活恒过、remediation 永不触发）——追加归属交叉校验
-            if let Some(updated) =
-                cross_verify_registration(state, app_id, &instance, &info).await?
+            if let Some(updated) = cross_verify_registration(state, app_id, instance, &info).await?
             {
                 return Ok((updated, false));
             }
             // Creation validates the runtime independently; do not erase a
             // registration that may have changed while probing.
             return Ok((
-                rebuild(state, app_id, &instance, &target, deadline, _lifecycle).await?,
+                rebuild(state, app_id, instance, deadline, _lifecycle).await?,
                 true,
             ));
         }
@@ -315,7 +232,7 @@ async fn ensure_userapp_builder_probed_until(
         );
         // 先验容器真实状态再决定处置：Running 则保容器（探活失败是超时/未就绪
         // 抖动），只有真死才清注册重建——防误杀正在跑任务的容器
-        match remediate_stale_registry(state, app_id, &instance).await? {
+        match remediate_stale_registry(state, app_id, instance).await? {
             RegistryRemediation::Alive(info) => {
                 tracing::info!(
                     "[USERAPP_ENSURE] dev container alive on inspect, keep without rebuild: app_id={app_id}"
@@ -324,12 +241,12 @@ async fn ensure_userapp_builder_probed_until(
             }
             RegistryRemediation::Gone => {
                 // Publish a verified replacement only after durable creation.
-                let info = rebuild(state, app_id, &instance, &target, deadline, _lifecycle).await?;
+                let info = rebuild(state, app_id, instance, deadline, _lifecycle).await?;
                 return Ok((info, true));
             }
         }
     }
-    let info = rebuild(state, app_id, &instance, &target, deadline, _lifecycle).await?;
+    let info = rebuild(state, app_id, instance, deadline, _lifecycle).await?;
     Ok((info, true))
 }
 
@@ -418,12 +335,9 @@ pub(crate) async fn cross_verify_registration(
     if rc.status != container_runtime_api::ContainerRuntimeStatus::Running {
         return Ok(None);
     }
-    // 实例归属校验统一由 verify_live_builder 的运行时 capture 以绑定注解
-    // （rcoder.io/owner-id）执行；user_id 身份槽位对 userapp 族恒为空
-    // （身份键是复合 identifier），不能与实例归属比较。
-    let instance_user = instance_owner(instance)?;
-    adoption::verify_live_builder(state, app_id, instance, &instance_user, &rc.container_id)
-        .await?;
+    // 物理身份校验由 verify_live_builder 的运行时 capture 执行（应用共享，
+    // 无归属注解可比对）。
+    adoption::verify_live_builder(state, app_id, instance, &rc.container_id).await?;
     let Some(updated) = refreshed_registration(registered, &rc) else {
         return Ok(Some(registered.clone()));
     };
@@ -436,14 +350,6 @@ pub(crate) async fn cross_verify_registration(
     }
     info!(app_id, instance, container_id = %updated.container_id, "Builder registration refreshed from authoritative runtime");
     Ok(Some(updated))
-}
-
-/// 复合 identifier 的实例归属段（`{user_id}-{app_id}` 右切 user 段）。
-/// 非复合形态（存量/畸形）显式报错——复合键是 builder 定位单一形态。
-fn instance_owner(instance: &str) -> Result<String> {
-    shared_types::parse_builder_instance_id(instance)
-        .map(|(user, _)| user.to_string())
-        .ok_or_else(|| anyhow!("builder instance id is not composite: {instance}"))
 }
 
 fn validate_builder_identity(
@@ -506,9 +412,7 @@ async fn registered_or_discovered_builder(
         return Ok(None);
     };
     validate_builder_identity(instance, &actual)?;
-    let instance_user = instance_owner(instance)?;
-    // 实例归属绑定由下方 verify_live_builder 以 rcoder.io/owner-id 注解校验；
-    // userapp 族身份槽位不含 user_id，不在此比较（注册登记需实例归属）。
+    // 物理身份绑定由下方 verify_live_builder 校验（应用共享，无归属注解）。
     if actual.status != container_runtime_api::ContainerRuntimeStatus::Running {
         return Ok(None);
     }
@@ -523,23 +427,17 @@ async fn registered_or_discovered_builder(
         created_at: actual.created_at,
         service_url: format!("http://{}:{}", actual.container_ip, AGENT_FILE_SERVER_PORT),
     };
-    let app_id = shared_types::parse_builder_instance_id(instance)
-        .map(|(_, app_id)| app_id.to_string())
-        .unwrap_or_else(|| instance.to_string());
-    adoption::verify_live_builder(state, &app_id, instance, &instance_user, &info.container_id)
-        .await?;
+    adoption::verify_live_builder(state, instance, instance, &info.container_id).await?;
     register_builder(state, instance, &info)?;
     Ok(Some(info))
 }
 
 fn register_builder(state: &AppState, instance: &str, info: &ContainerBasicInfo) -> Result<()> {
-    let instance_user = instance_owner(instance)?;
     let mut project = state
         .get_project(instance)
         .map(|old| (*old).clone())
         .unwrap_or_else(|| ProjectAndContainerInfo::new(instance.to_owned()));
     project.set_service_type(Some(ServiceType::UserappBuilder));
-    project.set_user_id(Some(instance_user));
     project.set_container(Some(info.clone()));
     state
         .insert_project(instance.into(), Arc::new(project))
@@ -574,14 +472,12 @@ async fn confirm_builder_ready(
 ///
 /// 直接调 `runtime.create_container`(UserappBuilder → `create_agent_container`),
 /// **不走 ComputerContainerManager**(避免 ComputerAgentRunner 专属的 lazy_migrate)。
-/// `instance` = 复合 identifier（装 project_id 槽位——docker_manager 命名链
-/// 单一来源，STS/PVC/svc/label/锁名随之复合化）；`instance_user` = 实例归属
-/// （owner 或协作者，注解 owner-id 的值）。
+/// `instance` = 纯 app_id（装 project_id 槽位——docker_manager 命名链单一来源，
+/// STS/PVC/svc/label/锁名随之派生；应用共享后与 app_id 恒等）。
 async fn create_builder_inner(
     state: &AppState,
     app_id: &str,
     instance: &str,
-
     execution_context: shared_types::UserAppExecutionContext,
 ) -> Result<ContainerBasicInfo> {
     let bound_target = adoption::capture_bound_target(state, &execution_context).await?;
@@ -591,7 +487,6 @@ async fn create_builder_inner(
         // 容器内契约（env/profiler）的纯 app_id 显式直传——消费方不再从
         // project_id 复合槽右切（字段语义不重载）
         .builder_app_id(app_id.to_string())
-        (instance_user.to_string())
         .service_type(ServiceType::UserappBuilder)
         .storage_size(DEFAULT_BUILDER_STORAGE_SIZE)
         .build();
@@ -611,185 +506,10 @@ async fn create_builder_inner(
     Ok(container_info)
 }
 
-/// 非 owner 协作者实例创建（轻量路径，**不经 lifecycle admit**）：
-/// 并发 fence = 复合键进程内互斥（调用方持有）+ docker_manager 侧 K8s
-/// operation ConfigMap 锁（锁名随复合 identifier 自动复合化）。app 须已
-/// 存在且 Active（identity 由 owner 链建立；此处只读校验，不动 lifecycle）。
-/// 就绪确认与注册与 owner 路径同构（探活 + 跨族污染交叉校验）。
-async fn create_instance_builder(
-    state: &AppState,
-    app_id: &str,
-    instance: &str,
-
-    deadline: tokio::time::Instant,
-) -> Result<ContainerBasicInfo> {
-    let app = state
-        .userapp_store
-        .get_application(app_id)
-        .await?
-        .ok_or_else(|| {
-            anyhow!("Application identity missing for collaborator builder: app {app_id}")
-        })?;
-    if app.state != shared_types::UserAppLifecycleState::Active {
-        return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
-    }
-    // 实例执行上下文：app_id 槽 = 复合 identifier（STS 名派生 + 注解校验）；
-    // operation 维度合成实例级标识（无 lifecycle operation 可引用），
-    // request_fingerprint 与 owner 路径同源算法（creation_fingerprint 的
-    // instance 维度），保证同实例重创建指纹稳定。
-    let context = shared_types::UserAppExecutionContext {
-        app_id: instance.to_string(),
-        lifecycle_id: app.lifecycle_id,
-        operation_id: format!("instance-{}", uuid::Uuid::new_v4().simple()),
-        executor_id: uuid::Uuid::new_v4().simple().to_string(),
-        request_fingerprint: creation::instance_fingerprint(
-            state,
-            app_id,
-            instance,
-            instance_user,
-        )?,
-    };
-    let info = create_builder_inner(state, app_id, instance, instance_user, context).await?;
-    let verified = confirm_builder_ready(state, app_id, info, deadline).await?;
-    register_builder(state, instance, &verified)?;
-    Ok(verified)
-}
-
-/// dev 宿主树 owner 解析（纯函数，**owner 锚定语义**——prod 空容器预创建等
-/// 归属锚点链专用）：显式传 > metadata 注册值 > 报错；显式与 metadata 同时
-/// 存在且不等 = 归属冲突 fail-fast。
-///
-/// dev builder 复合键时代的实例定位**不走此函数**（用 [`resolve_dev_target`]
-/// ——显式 user_id 是实例定位者，不必等于 owner）。
-///
-/// 空白字符串视为未传（pod 分派层 body 字段可能携空串）。
-/// cache/clean 的 userApp 分派共用（owner 三档同源）。
-pub(crate) fn resolve_owner(explicit: Option<&str>, metadata: Option<&str>) -> Result<String> {
-    let explicit = explicit.map(str::trim).filter(|s| !s.is_empty());
-    let metadata = metadata.map(str::trim).filter(|s| !s.is_empty());
-    if let (Some(requested), Some(owner)) = (explicit, metadata)
-        && requested != owner
-    {
-        return Err(anyhow!("Application ownership conflict"));
-    }
-    let owner = metadata
-        .or(explicit)
-        .ok_or_else(|| anyhow!("missing user_id"))?;
-    shared_types::validate_identifier(owner, "user_id").map_err(anyhow::Error::msg)?;
-    Ok(owner.to_owned())
-}
-
-/// dev builder 实例定位目标（协作模型：同 app 多用户各自独立容器）。
-pub(crate) struct DevTarget {
-    /// 实例归属 user_id：该用户的独立 builder（容器/PVC/工作区）。
-    pub instance_user: String,
-    /// 是否 owner 实例（走 lifecycle 受理创建；非 owner 走轻量实例路径）。
-    /// app 尚无 identity 时首个显式调用者即成为 owner（creator 语义不变）。
-    pub is_owner_instance: bool,
-}
-
-impl DevTarget {
-    /// 复合 identifier `{instance_user}-{app_id}`（builder 定位单一形态）。
-    pub fn instance_id(&self, app_id: &str) -> Result<String> {
-        shared_types::builder_instance_id(&self.instance_user, app_id).map_err(anyhow::Error::msg)
-    }
-}
-
-/// dev 实例定位解析（纯函数）：显式 user_id = 实例定位者（**不必等于 owner**
-/// ——共享 space 协作者各自建独立容器）；无显式回落 metadata owner（老调用
-/// 兼容）；app 无 identity 时显式者首写为 owner；双缺 fail-fast（绝不兜底
-/// app_id 兼任——孤儿目录树防线）。
-pub(crate) fn resolve_dev_target(
-    explicit: Option<&str>,
-    metadata_owner: Option<&str>,
-) -> Result<DevTarget> {
-    let explicit = explicit.map(str::trim).filter(|s| !s.is_empty());
-    let metadata = metadata_owner.map(str::trim).filter(|s| !s.is_empty());
-    let (instance_user, is_owner_instance) = match (explicit, metadata) {
-        (Some(user), Some(owner)) => (user.to_owned(), user == owner),
-        // 首写者成为 owner（Java 侧 creator 先 create-workspace 的既有序）
-        (Some(user), None) => (user.to_owned(), true),
-        // 老调用兼容：无显式回落 owner 实例
-        (None, Some(owner)) => (owner.to_owned(), true),
-        (None, None) => return Err(anyhow!("missing user_id")),
-    };
-    shared_types::validate_identifier(&instance_user, "user_id").map_err(anyhow::Error::msg)?;
-    Ok(DevTarget {
-        instance_user,
-        is_owner_instance,
-    })
-}
-
 /// 供 bin 装配（main.rs）构造 Pingora 代理的 dev 容器懒启动回调
 /// （`UserappDevLocator` 实现 `UserappDevEnsure` 契约；`new` 为 crate 内可见）。
 pub fn dev_ensure_for_proxy(state: Weak<AppState>) -> Arc<UserappDevLocator> {
     Arc::new(UserappDevLocator::new(state))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::resolve_owner;
-
-    /// owner 三档：显式优先（含空白显式降级）> metadata > fail-fast。
-    /// resolve_owner（owner 锚定语义——prod 空容器预创建等归属锚点链）：
-    /// 冲突即拒 / 空白降级 / 双缺 fail-fast。
-    #[test]
-    fn resolve_owner_prefers_explicit_then_metadata_then_fails() {
-        // 显式与 metadata 冲突 → 归属冲突拒绝（prod 归属锚点防线）
-        assert!(resolve_owner(Some("u-explicit"), Some("u-meta")).is_err());
-        assert_eq!(
-            resolve_owner(Some("u-meta"), Some("u-meta")).unwrap(),
-            "u-meta"
-        );
-        // 显式空白 → 降级 metadata
-        assert_eq!(resolve_owner(Some("  "), Some("u-meta")).unwrap(), "u-meta");
-        // 无显式 → metadata
-        assert_eq!(resolve_owner(None, Some("u-meta")).unwrap(), "u-meta");
-        // metadata 空白 → 视为未注册
-        assert!(resolve_owner(None, Some(" ")).is_err());
-        // 双缺 → fail-fast（绝不兜底 app_id 建孤儿目录树）
-        assert!(resolve_owner(None, None).is_err());
-    }
-
-    /// resolve_dev_target（dev 实例定位语义——协作模型）：显式 = 实例定位者
-    /// （不必等于 owner），无显式回落 owner，首写者成为 owner，双缺 fail-fast。
-    #[test]
-    fn resolve_dev_target_locates_instance_user_without_owner_conflict() {
-        use super::resolve_dev_target;
-        // 协作者：显式 ≠ metadata owner → 非冲突，独立实例
-        let collaborator =
-            resolve_dev_target(Some("1769678981"), Some("1754545591")).expect("collaborator");
-        assert_eq!(collaborator.instance_user, "1769678981");
-        assert!(!collaborator.is_owner_instance);
-        assert_eq!(
-            collaborator.instance_id("77").unwrap(),
-            "1769678981-77",
-            "复合 identifier 右切可还原归属"
-        );
-        // owner 本人：显式 == metadata
-        let owner = resolve_dev_target(Some("1754545591"), Some("1754545591")).unwrap();
-        assert!(owner.is_owner_instance);
-        // 无显式 → 回落 owner 实例（老调用兼容）
-        let fallback = resolve_dev_target(None, Some("1754545591")).unwrap();
-        assert_eq!(fallback.instance_user, "1754545591");
-        assert!(fallback.is_owner_instance);
-        // 显式空白 → 同无显式
-        let blank = resolve_dev_target(Some("  "), Some("1754545591")).unwrap();
-        assert!(blank.is_owner_instance);
-        // app 无 identity：显式者首写为 owner（creator 语义）
-        let first_writer = resolve_dev_target(Some("u-new"), None).unwrap();
-        assert_eq!(first_writer.instance_user, "u-new");
-        assert!(first_writer.is_owner_instance);
-        // 双缺 → fail-fast
-        assert!(resolve_dev_target(None, None).is_err());
-        // 复合串结构约束：app_id 含 '-' 拒绝（解析无歧义保证）
-        assert!(
-            resolve_dev_target(Some("u1"), Some("o1"))
-                .unwrap()
-                .instance_id("e2e-app")
-                .is_err()
-        );
-    }
 }
 
 #[cfg(test)]
@@ -823,6 +543,7 @@ mod remediation_tests {
             env_vars: None,
             service_type: Some(ServiceType::UserappBuilder),
             project_id: None,
+            user_id: None,
             pod_id: None,
             app_id: Some("app1".to_string()),
         }
@@ -863,41 +584,6 @@ mod remediation_tests {
     fn refreshed_registration_updates_on_id_change() {
         let existing = registered("192.168.97.8", "id-old");
         assert!(refreshed_registration(&existing, &inspected("192.168.97.8", "id-new")).is_some());
-    }
-}
-
-#[cfg(test)]
-mod ownership_regressions {
-    use super::*;
-    #[test]
-    fn resolving_owner_never_overwrites_a_different_registered_owner() {
-        assert!(resolve_owner(Some("replacement-owner"), Some("original-owner")).is_err());
-        assert!(resolve_owner(Some("../foreign"), None).is_err());
-        assert_eq!(
-            resolve_owner(Some(" original-owner "), Some("original-owner")).expect("same owner"),
-            "original-owner"
-        );
-    }
-    #[test]
-    fn builder_validation_uses_official_identity_priority_and_service_family() {
-        let mut actual = container_runtime_api::RuntimeContainerInfo {
-            container_id: "id".into(),
-            container_name: "builder".into(),
-            container_ip: "127.0.0.1".into(),
-            status: container_runtime_api::ContainerRuntimeStatus::Running,
-            created_at: chrono::Utc::now(),
-            env_vars: None,
-            service_type: Some(ServiceType::UserappBuilder),
-            project_id: None,
-            pod_id: None,
-            app_id: Some("app".into()),
-        };
-        assert!(validate_builder_identity("app", &actual).is_ok());
-        actual.pod_id = Some("different-pod".into());
-        assert!(validate_builder_identity("app", &actual).is_err());
-        actual.pod_id = None;
-        actual.service_type = Some(ServiceType::Userapp);
-        assert!(validate_builder_identity("app", &actual).is_err());
     }
 }
 

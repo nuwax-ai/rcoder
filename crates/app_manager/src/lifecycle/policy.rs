@@ -20,11 +20,7 @@ impl AppService {
         let guard = self.acquire_process_release_lock(app_id).await?;
         let result = async {
             self.metadata
-                .validate_request_lifecycle(
-                    app_id,
-                    &String::new(),
-                    request.lifecycle_id.as_deref(),
-                )
+                .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
                 .await?;
             use sha2::Digest as _;
             let fingerprint = hex::encode(sha2::Sha256::digest(
@@ -74,8 +70,8 @@ impl AppService {
             )
             .await?;
             let mutation = async {
-                operation.bind_lease(&guard, &String::new()).await?;
-                let context = operation.execution_context());
+                operation.bind_lease(&guard).await?;
+                let context = operation.execution_context();
                 let target = self
                     .runtime
                     .capture_app_mutation_target(&context, previous.resource_version.as_deref())

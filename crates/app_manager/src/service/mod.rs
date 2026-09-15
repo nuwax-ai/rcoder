@@ -206,10 +206,7 @@ impl super::AppServiceTrait for AppService {
         self.resume_pending_control(operation).await
     }
 
-    async fn get_lifecycle(
-        &self,
-        app_id: &str,
-    ) -> AppResult<shared_types::UserAppLifecycleRecord> {
+    async fn get_lifecycle(&self, app_id: &str) -> AppResult<shared_types::UserAppLifecycleRecord> {
         self.get_lifecycle(app_id).await
     }
     async fn get_control_operation(
@@ -217,8 +214,7 @@ impl super::AppServiceTrait for AppService {
         app_id: &str,
         operation_id: Option<&str>,
     ) -> AppResult<Option<shared_types::UserAppOperationView>> {
-        self.get_control_operation(app_id, operation_id)
-            .await
+        self.get_control_operation(app_id, operation_id).await
     }
     async fn get_control_operation_by_request(
         &self,
@@ -236,7 +232,7 @@ impl super::AppServiceTrait for AppService {
         self.recreate_identity(app_id, request).await
     }
 
-    async fn record_dev_registration(&self, app_id: &str: &str) -> AppResult<()> {
+    async fn record_dev_registration(&self, app_id: &str) -> AppResult<()> {
         self.metadata.store.ensure_identity(app_id).await?;
         Ok(())
     }
@@ -252,8 +248,8 @@ impl super::AppServiceTrait for AppService {
         self.query_apps(request).await
     }
 
-    async fn list_app_runtimes(&self: &str) -> AppResult<Vec<AppRuntimeInfo>> {
-        self.list_app_runtimes(user_id).await
+    async fn list_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
+        self.list_app_runtimes().await
     }
 
     async fn list_all_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
@@ -342,8 +338,7 @@ impl super::AppServiceTrait for AppService {
         app_id: &str,
         confirm: &str,
     ) -> AppResult<()> {
-        self.destroy_app_storage(app_stage, app_id, confirm)
-            .await
+        self.destroy_app_storage(app_stage, app_id, confirm).await
     }
 
     async fn align_db_credentials(
@@ -359,7 +354,10 @@ impl super::AppServiceTrait for AppService {
     }
 
     async fn get_app_owner(&self, app_id: &str) -> AppResult<Option<String>> {
-        Ok(self.metadata.lookup(app_id).await?.and_then(|r| r.user_id))
+        // 用户绑定已移除：应用共享、无 owner 可解析。恒返回 None，调用方
+        // 按固定命名空间（dev/userapp/{app_id}）定位 dev 资源。
+        let _ = app_id;
+        Ok(None)
     }
 
     async fn query_storage(
@@ -503,8 +501,7 @@ impl super::AppServiceTrait for AppService {
         app_id: &str,
         file_path: &str,
     ) -> AppResult<()> {
-        self.delete_file(app_stage, app_id, file_path)
-            .await
+        self.delete_file(app_stage, app_id, file_path).await
     }
 }
 

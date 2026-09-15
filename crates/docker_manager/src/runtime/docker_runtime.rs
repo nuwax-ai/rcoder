@@ -484,11 +484,7 @@ impl DockerRuntime {
             let mut env_vars = HashMap::new();
             // 容器内契约要纯 app_id：builder 场景 project_id 槽是复合串——
             // 缓存条目创建时若带显式 builder_app_id 则直用，否则右切还原
-            let project_id_env = if c.service_type.as_ref() == Some(&ServiceType::UserappBuilder) {
-                c.project_id.clone()
-            } else {
-                c.project_id.clone()
-            };
+            let project_id_env = c.project_id.clone();
             env_vars.insert("PROJECT_ID".to_string(), project_id_env);
             if let Some(ref user_id) = c.user_id {
                 env_vars.insert("USER_ID".to_string(), user_id.clone());

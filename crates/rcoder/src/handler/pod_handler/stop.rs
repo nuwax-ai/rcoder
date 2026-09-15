@@ -224,20 +224,17 @@ async fn stop_userapp_prod(
     app_id: String,
     mut request: shared_types::UserAppControlRequest,
 ) -> Result<HttpResult<StopPodResponse>, AppError> {
-    shared_types::validate_identifier(&request.user_id, "user_id")
-        .map_err(|_| AppError::validation_error("Invalid user_id for application stop"))?;
     let request_id = request
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone();
-    let owner = request.user_id.clone();
     state
         .app_service
         .stop_app_controlled(&app_id, request)
         .await?;
     let operation = state
         .app_service
-        .get_control_operation_by_request(&app_id, &owner, &request_id)
+        .get_control_operation_by_request(&app_id, &request_id)
         .await?
         .ok_or_else(|| {
             AppError::internal_server_error("Stop completed without a durable operation record")

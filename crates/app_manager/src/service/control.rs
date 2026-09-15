@@ -92,20 +92,14 @@ impl OwnedOperation {
         Ok(owned)
     }
 
-    pub(crate) async fn execution_input(
-        &self,
-        owner: &str,
-    ) -> AppResult<shared_types::UserAppExecutionInput> {
+    pub(crate) async fn execution_input(&self) -> AppResult<shared_types::UserAppExecutionInput> {
         Ok(self
             .store
             .read_execution_input(&self.execution_context())
             .await?)
     }
 
-    pub(crate) async fn bind_lease(
-        &self,
-        guard: &super::AppOperationGuard,
-    ) -> AppResult<()> {
+    pub(crate) async fn bind_lease(&self, guard: &super::AppOperationGuard) -> AppResult<()> {
         self.store
             .bind_operation_lease(&self.execution_context(), &guard.lease_receipt()?)
             .await?;
@@ -250,7 +244,7 @@ impl super::AppService {
         let Some(request_id) = request.request_id.as_deref() else {
             return Ok(None);
         };
-        let app = self.get_lifecycle(app_id, &String::new()).await?;
+        let app = self.get_lifecycle(app_id).await?;
         let Some(operation) = self
             .metadata
             .store
@@ -296,9 +290,6 @@ impl super::AppService {
             .ok_or_else(|| {
                 AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
             })?;
-        if String::new() != user_id {
-            return Err(shared_types::UserAppStoreError::OwnershipConflict.into());
-        }
         Ok(app)
     }
     pub async fn get_control_operation(
@@ -353,19 +344,14 @@ impl super::AppService {
             .validate()
             .map_err(|error| AppOperationError::Validation(error.to_string()))?;
         let lease = self.acquire_process_release_lock(app_id).await?;
-        let current = self.get_lifecycle(app_id, &String::new()).await?;
+        let current = self.get_lifecycle(app_id).await?;
         if current.state != shared_types::UserAppLifecycleState::Deleted {
             // On an active lifecycle the store can only return an exact prior
             // recreation result; it cannot create another generation here.
             let existing = self
                 .metadata
                 .store
-                .recreate(
-                    app_id,
-                    &String::new(),
-                    &request.expected_lifecycle_id,
-                    &request.request_id,
-                )
+                .recreate(app_id, &request.expected_lifecycle_id, &request.request_id)
                 .await?;
             lease.finish().await?;
             return Ok(existing);
@@ -388,7 +374,7 @@ impl super::AppService {
             .clone()
             .ok_or_else(|| AppOperationError::Backend("Dev locator is not configured".into()))?;
         if locator
-            .dev_container_alive(app_id, None)
+            .dev_container_alive(app_id)
             .await
             .map_err(AppOperationError::Backend)?
         {
@@ -399,12 +385,7 @@ impl super::AppService {
         let app = self
             .metadata
             .store
-            .recreate(
-                app_id,
-                &String::new(),
-                &request.expected_lifecycle_id,
-                &request.request_id,
-            )
+            .recreate(app_id, &request.expected_lifecycle_id, &request.request_id)
             .await?;
         lease.finish().await?;
         Ok(app)
@@ -418,10 +399,10 @@ mod tests {
     struct NoBuilder;
     #[async_trait::async_trait]
     impl shared_types::UserappDevLocator for NoBuilder {
-        async fn dev_file_server_addr(&self, _: &str, _: Option<&str>) -> Result<String, String> {
+        async fn dev_file_server_addr(&self, _: &str) -> Result<String, String> {
             Err("No builder".into())
         }
-        async fn dev_container_alive(&self, _: &str, _: Option<&str>) -> Result<bool, String> {
+        async fn dev_container_alive(&self, _: &str) -> Result<bool, String> {
             Ok(false)
         }
     }
@@ -458,14 +439,8 @@ mod tests {
             )
             .await
             .expect("checkpoint");
-        assert!(
-            service
-                .get_control_operation("query", "foreign", None)
-                .await
-                .is_err()
-        );
         let public = service
-            .get_control_operation("query", "owner", None)
+            .get_control_operation("query", None)
             .await
             .expect("query")
             .expect("current");
@@ -477,14 +452,14 @@ mod tests {
         operation.succeed().await.expect("complete");
         assert!(
             service
-                .get_control_operation("query", "owner", None)
+                .get_control_operation("query", None)
                 .await
                 .expect("current")
                 .is_none()
         );
         assert_eq!(
             service
-                .get_control_operation("query", "owner", Some("operation-query"))
+                .get_control_operation("query", Some("operation-query"))
                 .await
                 .expect("history")
                 .expect("record")
@@ -522,7 +497,7 @@ mod tests {
         )
         .await
         .expect("admit");
-        crate::test_support::complete_empty_deletion_fixture(deletion, "owner").await;
+        crate::test_support::complete_empty_deletion_fixture(deletion).await;
         let request = shared_types::UserAppRecreateRequest {
             expected_lifecycle_id: old.lifecycle_id.clone(),
             request_id: "recreate-request".into(),
@@ -561,16 +536,9 @@ mod tests {
         );
         service
             .metadata
-            .validate_request_lifecycle("recreate", "owner", Some(&next.lifecycle_id))
+            .validate_request_lifecycle("recreate", Some(&next.lifecycle_id))
             .await
             .expect("current lifecycle is accepted");
-        assert!(
-            service
-                .metadata
-                .validate_request_lifecycle("recreate", "foreign", Some(&next.lifecycle_id))
-                .await
-                .is_err()
-        );
         runtime.deployments.insert(
             "recreate".into(),
             container_runtime_api::DeploymentStatus {
@@ -585,7 +553,7 @@ mod tests {
         assert_eq!(next, duplicate);
         assert!(
             service
-                .get_control_operation("recreate", "owner", Some("delete"))
+                .get_control_operation("recreate", Some("delete"))
                 .await
                 .is_err()
         );

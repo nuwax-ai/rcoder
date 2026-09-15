@@ -19,9 +19,8 @@ use container_runtime_api::ContainerRuntimeError;
 /// mkdir 兜底，root 属主，风险低）。
 pub(super) async fn build_prod_flat_mounts(
     app_id: &str,
-    user_id: Option<&str>,
+    _user_id: Option<&str>,
 ) -> container_runtime_api::ContainerRuntimeResult<Vec<Mount>> {
-    let uid = user_id.unwrap_or(app_id);
     let host_root = crate::path::resolve_container_path_to_host(std::path::Path::new(
         shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
     ))
@@ -87,7 +86,7 @@ mod tests {
                 "/home/user/.agent-store".to_string(),
             ]
         );
-        assert_eq!(subs[0], "prod/u1/a1");
+        assert_eq!(subs[0], "prod/userapp/a1");
         assert!(subs[1].ends_with("data/a1") && targets[1].ends_with("/data"));
         assert!(subs[2].ends_with("logs/a1") && targets[2].ends_with("/logs"));
         assert!(subs[3].ends_with("agent-store/a1") && targets[3].ends_with("/.agent-store"));

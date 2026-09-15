@@ -19,14 +19,10 @@ impl AppMetadataStore {
     pub(crate) async fn validate_request_lifecycle(
         &self,
         app_id: &str,
-        owner: &str,
         expected_lifecycle: Option<&str>,
     ) -> AppResult<()> {
         match self.store.get_application(app_id).await? {
             Some(app) => {
-                if String::new() != owner {
-                    return Err(shared_types::UserAppStoreError::OwnershipConflict.into());
-                }
                 if app.state != UserAppLifecycleState::Active
                     || expected_lifecycle.is_some_and(|expected| expected != app.lifecycle_id)
                     || (app.lifecycle_epoch > 1 && expected_lifecycle.is_none())
@@ -46,25 +42,6 @@ impl AppMetadataStore {
         Self { store }
     }
 
-    /// Resolve ownership from authoritative storage before any runtime mutation.
-    pub async fn owner_for_write(&self, app_id: &str, supplied: &str) -> AppResult<String> {
-        let supplied = (!supplied.trim().is_empty()).then_some(supplied);
-        match self.store.get_application(app_id).await? {
-            Some(app) => {
-                if app.state != UserAppLifecycleState::Active {
-                    return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
-                }
-                if supplied.is_some_and(|owner| owner != String::new()) {
-                    return Err(shared_types::UserAppStoreError::OwnershipConflict.into());
-                }
-                Ok(String::new())
-            }
-            None => supplied.map(str::to_owned).ok_or_else(|| {
-                AppOperationError::Validation("Application owner is required".into())
-            }),
-        }
-    }
-
     /// None preserves a field. Explicit clear operations use UserAppMetadataPatch.
     #[cfg(test)]
     pub async fn record(
@@ -74,16 +51,6 @@ impl AppMetadataStore {
         tenant_id: Option<String>,
         space_id: Option<String>,
     ) -> AppResult<()> {
-        let owner = match user_id.filter(|owner| !owner.trim().is_empty()) {
-            Some(owner) => owner,
-            None => self
-                .lookup(app_id)
-                .await?
-                .and_then(|row| String::new())
-                .ok_or_else(|| {
-                    AppOperationError::Validation("Application owner is required".into())
-                })?,
-        };
         let app = self.store.ensure_identity(app_id).await?;
         if name.is_none() && tenant_id.is_none() && space_id.is_none() {
             return Ok(());
@@ -176,7 +143,7 @@ mod tests {
         let writer = AppMetadataStore::new(first.clone());
         let reader = AppMetadataStore::new(second.clone());
         writer
-            .record("a", Some("alpha".into()), Some("owner".into()), None, None)
+            .record("a", Some("alpha".into()), None, None)
             .await
             .expect("record");
         assert_eq!(
@@ -195,7 +162,7 @@ mod tests {
             .expect("read")
             .expect("present");
         writer
-            .record("a", Some("alpha".into()), Some("owner".into()), None, None)
+            .record("a", Some("alpha".into()), None, None)
             .await
             .expect("noop");
         let after = second
@@ -205,7 +172,7 @@ mod tests {
             .expect("present");
         assert_eq!(before, after);
         writer
-            .record("a", Some("beta".into()), Some("owner".into()), None, None)
+            .record("a", Some("beta".into()), None, None)
             .await
             .expect("update");
         assert_eq!(
@@ -214,10 +181,6 @@ mod tests {
                 .as_deref(),
             Some("beta")
         );
-        assert!(matches!(
-            reader.owner_for_write("a", "foreign").await,
-            Err(AppOperationError::Conflict(_))
-        ));
         first.close().await;
         second.close().await;
         let reopened = Arc::new(SqliteUserAppStore::open(&path).await.expect("reopen"));
@@ -244,7 +207,7 @@ mod tests {
         );
         let metadata = AppMetadataStore::new(store.clone());
         metadata
-            .record("a", None, Some("owner".into()), None, None)
+            .record("a", None, None, None)
             .await
             .expect("record");
         store.close().await;
@@ -253,13 +216,7 @@ mod tests {
             Err(AppOperationError::Backend(_))
         ));
         assert!(matches!(
-            metadata.owner_for_write("a", "owner").await,
-            Err(AppOperationError::Backend(_))
-        ));
-        assert!(matches!(
-            metadata
-                .record("b", None, Some("owner".into()), None, None)
-                .await,
+            metadata.record("b", None, None, None).await,
             Err(AppOperationError::Backend(_))
         ));
         assert!(metadata.snapshot().await.is_err());

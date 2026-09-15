@@ -71,14 +71,11 @@ impl AppService {
                 .ok_or_else(|| {
                     AppOperationError::Backend("dev container locator not injected".to_string())
                 })?;
-            return locator
-                .dev_file_server_addr(app_id)
-                .await
-                .map_err(|e| {
-                    AppOperationError::Backend(format!(
-                        "locate dev container file-server (app {app_id}): {e}"
-                    ))
-                });
+            return locator.dev_file_server_addr(app_id).await.map_err(|e| {
+                AppOperationError::Backend(format!(
+                    "locate dev container file-server (app {app_id}): {e}"
+                ))
+            });
         }
         match self.activity.ensure_running(app_id).await {
             shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
@@ -128,9 +125,7 @@ impl AppService {
                 "file data is empty".to_string(),
             ));
         }
-        let base = self
-            .app_files_base(app_stage, app_id, Some(user_id))
-            .await?;
+        let base = self.app_files_base(app_stage, app_id).await?;
         let file_name = std::path::Path::new(target)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -138,7 +133,6 @@ impl AppService {
         let part = reqwest::multipart::Part::bytes(file_data).file_name(file_name);
         let form = reqwest::multipart::Form::new()
             .text("app_id", app_id.to_string())
-            .text("user_id".to_string())
             .text("target", target.to_string())
             .text("flatten", flatten.to_string())
             .part("file", part);
@@ -176,12 +170,9 @@ impl AppService {
     ) -> AppResult<UploadResult> {
         validate_app_id(app_id)?;
         validate_upload_target(target)?;
-        let base = self
-            .app_files_base(app_stage, app_id, Some(user_id))
-            .await?;
+        let base = self.app_files_base(app_stage, app_id).await?;
         let body = serde_json::json!({
             "app_id": app_id,
-            "user_id": user_id,
             "url": url,
             "target": target,
             "flatten": flatten,
@@ -223,13 +214,10 @@ impl AppService {
         subpath: Option<&str>,
     ) -> AppResult<Vec<FileInfo>> {
         validate_app_id(app_id)?;
-        let base = self
-            .app_files_base(app_stage, app_id, Some(user_id))
-            .await?;
+        let base = self.app_files_base(app_stage, app_id).await?;
         let mut url = format!(
-            "{base}/api/v1/userapp/app-files/list?app_id={}&user_id={}",
-            urlencode(app_id),
-            urlencode(user_id)
+            "{base}/api/v1/userapp/app-files/list?app_id={}",
+            urlencode(app_id)
         );
         if let Some(p) = subpath.map(str::trim).filter(|p| !p.is_empty()) {
             url.push_str("&path=");
@@ -270,10 +258,8 @@ impl AppService {
                 "file path is empty".to_string(),
             ));
         }
-        let base = self
-            .app_files_base(app_stage, app_id, Some(user_id))
-            .await?;
-        let body = serde_json::json!({"app_id": app_id, "user_id": user_id, "path": file_path});
+        let base = self.app_files_base(app_stage, app_id).await?;
+        let body = serde_json::json!({"app_id": app_id, "path": file_path});
         let resp = reqwest::Client::new()
             .post(format!("{base}/api/v1/userapp/app-files/delete"))
             .json(&body)

@@ -22,6 +22,7 @@ pub(super) async fn ensure_project_workspace_exists(
     isolation_type: Option<&str>,
     tenant_id: Option<&str>,
     space_id: Option<&str>,
+    user_id: &str,
     work_dir_id: &str,
 ) -> Result<(), AppError> {
     // 解析主容器侧应创建的路径（None = 跳过预创建）
@@ -98,6 +99,7 @@ pub(super) async fn ensure_project_workspace_exists(
 /// * `request` - 聊天请求
 pub(super) fn ensure_project_mapping_in_state(
     state: &Arc<AppState>,
+    user_id: &str,
     project_id: &str,
     container_info: &ContainerBasicInfo,
     request: &ComputerChatRequest,

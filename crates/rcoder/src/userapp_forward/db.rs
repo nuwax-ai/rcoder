@@ -50,16 +50,11 @@ enum ExecChannel<'a> {
 impl shared_types::PgCommandRunner for ExecChannel<'_> {
     async fn run(&self, command: &str) -> Result<shared_types::CommandOutcome, String> {
         match self {
-            Self::DevHttp {
-                base,
-                app_id,
-                user_id,
-            } => {
+            Self::DevHttp { base, app_id } => {
                 let resp = crate::http_client::shared_client()
                     .post(format!("{base}/api/v1/userapp/execute-command"))
                     .json(&serde_json::json!({
                         "app_id": app_id,
-                        "user_id": user_id,
                         "command": command,
                     }))
                     .timeout(std::time::Duration::from_secs(90))
@@ -118,7 +113,7 @@ async fn resolve_exec_target<'a>(
 ) -> Result<ExecChannel<'a>, AppError> {
     match app_stage {
         UserappStage::Dev => {
-            let (info, _recreated) = ensure_userapp_builder_probed(state, app_id, Some(user_id))
+            let (info, _recreated) = ensure_userapp_builder_probed(state, app_id)
                 .await
                 .map_err(|e| {
                     tracing::error!(
@@ -255,13 +250,13 @@ pub(crate) async fn reset_password(
         .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
-    shared_types::validate_identifier(&body, "user_id")
+    shared_types::validate_identifier(&body.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
     if body.password.is_empty() {
         return Err(AppError::bad_request("password must not be empty"));
     }
 
-    let runner = resolve_exec_target(&state, app_stage, &body.app_id, &body).await?;
+    let runner = resolve_exec_target(&state, app_stage, &body.app_id).await?;
 
     // username 缺省 → 重置 superuser（CURRENT_USER 语义，与 computer 版/app_manager
     // 版同源）；指定 → 账号 upsert（存在 ALTER / 不存在 CREATE ROLE 建号）
@@ -339,10 +334,10 @@ pub(crate) async fn create_database(
         .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
-    shared_types::validate_identifier(&body, "user_id")
+    shared_types::validate_identifier(&body.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
 
-    let runner = resolve_exec_target(&state, app_stage, &body.app_id, &body).await?;
+    let runner = resolve_exec_target(&state, app_stage, &body.app_id).await?;
     shared_types::create_pg_database(&runner, &body.database, body.owner.as_deref())
         .await
         .map_err(|e| AppError::with_message(db_admin_error_code(&e), e.to_string()))?;

@@ -1068,17 +1068,12 @@ async fn update_commits_a_durable_operation_matching_runtime_context() {
     );
     assert_eq!(operation.kind, shared_types::UserAppOperationKind::Update);
     let queried = service
-        .get_control_operation_by_request("durableupdate", "u-test", "update-request")
+        .get_control_operation_by_request("durableupdate", "update-request")
         .await
         .expect("query by caller token")
         .expect("operation");
     assert_eq!(queried.operation_id, operation.operation_id);
-    assert!(
-        service
-            .get_control_operation_by_request("durableupdate", "foreign", "update-request")
-            .await
-            .is_err()
-    );
+
     let app = service
         .metadata
         .store
@@ -1111,7 +1106,7 @@ async fn explicit_stop_is_durable_idempotent_and_blocks_traffic_wake() {
         .expect("exact retry");
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), before + 1);
     let operation = service
-        .get_control_operation_by_request("durablestop", "u-test", "stop-request")
+        .get_control_operation_by_request("durablestop", "stop-request")
         .await
         .expect("query")
         .expect("operation");
@@ -1132,17 +1127,8 @@ async fn explicit_stop_is_durable_idempotent_and_blocks_traffic_wake() {
             .expect("persisted physical stop target");
     assert_eq!(target.context.operation_id, operation.operation_id);
     assert_eq!(target.context.lifecycle_id, persisted.lifecycle_id);
-    assert_eq!(target.String::new(), "u-test");
     assert!(!target.resource.uid.is_empty());
     assert_eq!(persisted.checkpoint["wake_on_traffic"], false);
-    let mut foreign = request;
-    foreign.user_id = "foreign".into();
-    assert!(
-        service
-            .stop_app_controlled("durablestop", foreign)
-            .await
-            .is_err()
-    );
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), before + 1);
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
 }
@@ -1167,7 +1153,7 @@ async fn compute_delete_failure_keeps_wake_blocked_until_reconciliation() {
     assert!(service.activity.is_wake_blocked("deletefence"));
     assert!(runtime.deployments.contains_key("deletefence"));
     let operation = service
-        .get_control_operation_by_request("deletefence", "u-test", "delete-fence-request")
+        .get_control_operation_by_request("deletefence", "delete-fence-request")
         .await
         .expect("query")
         .expect("operation");
@@ -1216,7 +1202,7 @@ async fn compute_delete_replays_after_runtime_disappears_and_preserves_lifecycle
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
     assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
     let operation = service
-        .get_control_operation_by_request("durabledelete", "u-test", "delete-request")
+        .get_control_operation_by_request("durabledelete", "delete-request")
         .await
         .expect("query")
         .expect("operation");
@@ -1244,7 +1230,7 @@ async fn compute_delete_replays_after_runtime_disappears_and_preserves_lifecycle
         .await
         .expect("known lifecycle with absent compute is idempotent");
     let absent = service
-        .get_control_operation_by_request("durabledelete", "u-test", "deletealreadyabsent")
+        .get_control_operation_by_request("durabledelete", "deletealreadyabsent")
         .await
         .expect("query")
         .expect("record");
@@ -1409,7 +1395,6 @@ pub(crate) async fn production_storage_destroy_preserves_application_identity() 
     .expect("write release lock");
 
     let mut create = create_request("apppurge");
-    create.user_id = "u-purge".into();
     create.name = "keep-me".into();
     service.create_app(create).await.expect("create app");
     assert!(
@@ -1445,12 +1430,7 @@ pub(crate) async fn production_storage_destroy_preserves_application_identity() 
     );
 
     service
-        .destroy_app_storage(
-            shared_types::UserappStage::Prod,
-            "apppurge",
-            "u-purge",
-            "apppurge",
-        )
+        .destroy_app_storage(shared_types::UserappStage::Prod, "apppurge", "apppurge")
         .await
         .expect("explicit destroy");
     assert!(
@@ -1587,13 +1567,7 @@ async fn seed_running_app(service: &AppService, runtime: &MockRuntime, app_id: &
     );
     service
         .metadata
-        .record(
-            app_id,
-            Some("purgeme".into()),
-            Some("u-purge".into()),
-            None,
-            None,
-        )
+        .record(app_id, Some("purgeme".into()), None, None)
         .await
         .expect("metadata registration");
 }
@@ -1645,7 +1619,7 @@ pub(crate) async fn purge_app_on_absent_app_is_idempotent_and_still_cleans_rest(
     // 不预置 deployment（计算面缺席），仅预置元数据行使断言非空洞
     service
         .metadata
-        .record("appp2", None, Some("u-purge".into()), None, None)
+        .record("appp2", None, None, None)
         .await
         .expect("metadata registration");
 
@@ -2230,43 +2204,6 @@ mod purge_http_cancellation {
     }
 }
 
-/// A conflicting durable owner must be rejected before provision/create effects.
-#[tokio::test]
-async fn durable_owner_conflict_precedes_runtime_creation() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let runtime = Arc::new(MockRuntime::default());
-    let service = test_service(root.path(), runtime.clone()).await;
-    service
-        .metadata
-        .record(
-            "ownerconflict",
-            None,
-            Some("original-owner".into()),
-            None,
-            None,
-        )
-        .await
-        .expect("register owner");
-    let code = root.path().join("owner-conflict/code");
-    tokio::fs::create_dir_all(&code)
-        .await
-        .expect("code directory");
-    tokio::fs::write(code.join("release.lock.toml"), release_lock())
-        .await
-        .expect("manifest");
-    let error = service
-        .create_app(create_request("ownerconflict"))
-        .await
-        .expect_err("conflicting owner");
-    assert!(matches!(error, AppOperationError::Conflict(_)), "{error}");
-    assert_eq!(
-        runtime.create_calls.load(Ordering::SeqCst),
-        0,
-        "owner rejection must precede runtime creation"
-    );
-    assert!(!runtime.deployments.contains_key("ownerconflict"));
-}
-
 #[tokio::test]
 async fn full_delete_deduplicates_and_rejects_old_lifecycle_after_recreation() {
     let root = tempfile::tempdir().expect("directory");
@@ -2283,10 +2220,6 @@ async fn full_delete_deduplicates_and_rejects_old_lifecycle_after_recreation() {
         lifecycle_id: Some(original.lifecycle_id.clone()),
         request_id: Some("full-delete-request".into()),
     };
-    let mut foreign = request.clone();
-    foreign.user_id = "foreign-owner".into();
-    assert!(service.purge_app_controlled(app_id, foreign).await.is_err());
-    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
     service
         .purge_app_controlled(app_id, request.clone())
         .await
@@ -2308,7 +2241,7 @@ async fn full_delete_deduplicates_and_rejects_old_lifecycle_after_recreation() {
         shared_types::UserAppOperationState::Succeeded
     );
     let replacement = store
-        .recreate(app_id, "u-purge", &original.lifecycle_id, "rebuild-request")
+        .recreate(app_id, &original.lifecycle_id, "rebuild-request")
         .await
         .expect("recreate");
     assert_ne!(original.lifecycle_id, replacement.lifecycle_id);
@@ -2350,7 +2283,7 @@ async fn creation_records_lifecycle_execution_and_replays_without_new_resources(
             .expect("execution context")
     };
     context
-        .validate_identity("durablecreate", Some("u-test"))
+        .validate_identity("durablecreate")
         .expect("valid credential");
     let persisted = service
         .metadata
@@ -2549,9 +2482,6 @@ async fn explicit_retry_checks_owner_lifecycle_and_revision_before_execution() {
     };
     for invalid in [
         shared_types::UserAppRetryRequest {
-            ..request.clone()
-        },
-        shared_types::UserAppRetryRequest {
             lifecycle_id: "old-lifecycle".into(),
             ..request.clone()
         },
@@ -2696,7 +2626,7 @@ async fn pending_delete_recovery_preserves_scope_and_original_operation() {
         assert_eq!(checkpoint.development.is_some(), purge);
         assert_eq!(
             service
-                .get_lifecycle("recoverdelete", "u-test")
+                .get_lifecycle("recoverdelete")
                 .await
                 .expect("retained lifecycle")
                 .state,
@@ -2758,7 +2688,7 @@ async fn pending_full_delete_recovery_owns_deleting_lifecycle_until_completion()
         )
         .await;
         let identity = service
-            .get_lifecycle("recoverfulldelete", "u-test")
+            .get_lifecycle("recoverfulldelete")
             .await
             .expect("admitted identity");
         assert_eq!(
@@ -2783,7 +2713,7 @@ async fn pending_full_delete_recovery_owns_deleting_lifecycle_until_completion()
             .expect("read")
             .expect("operation");
         let identity = service
-            .get_lifecycle("recoverfulldelete", "u-test")
+            .get_lifecycle("recoverfulldelete")
             .await
             .expect("identity");
         assert_eq!(identity.lifecycle_id, pending.lifecycle_id);
@@ -2854,20 +2784,6 @@ async fn controlled_storage_destruction_checks_owner_and_replays_without_duplica
             lifecycle_id: None,
             request_id: Some("storage-request".into()),
         };
-        assert!(
-            service
-                .destroy_app_storage_controlled(
-                    stage,
-                    "controlledstorage",
-                    DestroyStorageRequest {
-                        ..request.clone()
-                    }
-                )
-                .await
-                .is_err()
-        );
-        assert_eq!(dev.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
         let operation_id = service
             .destroy_app_storage_controlled(stage, "controlledstorage", request.clone())
             .await
@@ -2902,7 +2818,7 @@ async fn controlled_storage_destruction_checks_owner_and_replays_without_duplica
         assert_eq!(evidence.context.operation_id, operation_id);
         assert_eq!(
             service
-                .get_lifecycle("controlledstorage", "u-test")
+                .get_lifecycle("controlledstorage")
                 .await
                 .expect("identity")
                 .state,
@@ -2921,19 +2837,6 @@ async fn controlled_production_clear_preserves_scope_and_request_identity() {
         lifecycle_id: None,
         request_id: Some("clear-request".into()),
     };
-    assert!(
-        service
-            .clear_app_storage_controlled(
-                shared_types::UserappStage::Prod,
-                "clearproduction",
-                ClearStorageRequest {
-                    ..request.clone()
-                }
-            )
-            .await
-            .is_err()
-    );
-    assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
     let id = service
         .clear_app_storage_controlled(
             shared_types::UserappStage::Prod,
@@ -2978,7 +2881,7 @@ async fn controlled_production_clear_preserves_scope_and_request_identity() {
     ));
     assert_eq!(
         service
-            .get_lifecycle("clearproduction", "u-test")
+            .get_lifecycle("clearproduction")
             .await
             .expect("identity")
             .state,
@@ -3055,7 +2958,7 @@ async fn pending_storage_clear_reuses_operation_without_recreating_compute() {
     assert_eq!(completed.command, pending.command);
     assert_eq!(
         service
-            .get_lifecycle("recoverclear", "u-test")
+            .get_lifecycle("recoverclear")
             .await
             .expect("identity")
             .state,
@@ -3069,7 +2972,7 @@ async fn pending_configuration_recovery_uses_private_resolved_input_once() {
         let directory = tempfile::tempdir().expect("directory");
         let (service, runtime) = created_app_service(directory.path(), "recoverconfig").await;
         let identity = service
-            .get_lifecycle("recoverconfig", "u-test")
+            .get_lifecycle("recoverconfig")
             .await
             .expect("identity");
         let mut params = runtime
@@ -3272,7 +3175,7 @@ async fn enhanced_start_and_restart_deduplicate_complete_policy_intent() {
         assert_eq!(record.checkpoint["idle_timeout_seconds"], 812);
         assert_eq!(
             service
-                .get_lifecycle("compositestart", "u-test")
+                .get_lifecycle("compositestart")
                 .await
                 .unwrap()
                 .runtime_policy
@@ -3312,10 +3215,7 @@ async fn pending_composite_deployment_recovers_original_control_and_completion()
     let input = shared_types::UserAppExecutionInput::new(serde_json::to_string(&serde_json::json!({
         "version": 1, "request": request, "params": null, "previous": previous, "restart": false,
     })).unwrap());
-    let identity = service
-        .get_lifecycle("recovercomposite", "u-test")
-        .await
-        .unwrap();
+    let identity = service.get_lifecycle("recovercomposite").await.unwrap();
     use sha2::Digest as _;
     let admission = shared_types::UserAppAdmission {
         metadata: None,

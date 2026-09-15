@@ -660,8 +660,8 @@ mod tests {
         );
         // 段序与布局事实源配对：卷内 {app_id}/ 对应宿主树 workspace 段，
         // data/logs/agent-store 平级子目录对应宿主树三数据段的 app 子层
-        let subs = shared_types::paths::userapp_prod_subpaths("u1", "a1");
-        assert_eq!(subs[0], "prod/u1/a1");
+        let subs = shared_types::paths::userapp_prod_subpaths("a1");
+        assert_eq!(subs[0], "prod/userapp/a1");
         assert!(mounts[0].0 == "a1" && mounts[0].1.ends_with("/a1"));
         for (m, sub_suffix) in mounts
             .iter()
@@ -749,7 +749,6 @@ mod conditional_tests {
                                 winner = serde_json::from_slice(&bytes[offset..offset+length]).expect("PVC POST");
                                 assert_eq!(winner["metadata"]["name"], name);
                                 assert_eq!(winner["metadata"]["annotations"]["rcoder.io/application-id"], "fence");
-                                assert_eq!(winner["metadata"]["annotations"]["rcoder.io/owner-id"], "owner-one");
                                 assert_eq!(winner["metadata"]["annotations"]["rcoder.io/lifecycle-id"], "life-one");
                                 assert_eq!(winner["metadata"]["annotations"]["rcoder.io/storage-use-operation"], "create-one");
                                 assert_eq!(winner["spec"]["resources"]["requests"]["storage"], "7Gi");
@@ -771,7 +770,7 @@ mod conditional_tests {
                     }
                 });
                 let context = shared_types::UserAppExecutionContext {
-                    app_id:"fence".into(),user_id:"owner-one".into(),lifecycle_id:"life-one".into(),operation_id:"create-one".into(),executor_id:"executor-one".into(),request_fingerprint:"a".repeat(64),
+                    app_id:"fence".into(),lifecycle_id:"life-one".into(),operation_id:"create-one".into(),executor_id:"executor-one".into(),request_fingerprint:"a".repeat(64),
                 };
                 let result = runtime.ensure_owned_workspace_pvc(&context, &ServiceType::Userapp, Some("7Gi")).await;
                 if matches!(outcome, "created" | "same-lifecycle") { result.expect("owned PVC established"); }
@@ -868,7 +867,7 @@ mod conditional_tests {
             let config = kube::Config::new(format!("http://{address}").parse().expect("URI"));
             let runtime = runtime(kube::Client::try_from(config).expect("client"));
             let params = ContainerCreateParams::builder().project_id("fence").user_id("owner-one").service_type(ServiceType::Userapp).execution_context(shared_types::UserAppExecutionContext {
-                app_id:"fence".into(),user_id:"owner-one".into(),lifecycle_id:"old-life".into(),operation_id:"update-one".into(),executor_id:"executor-one".into(),request_fingerprint:"a".repeat(64),
+                app_id:"fence".into(),lifecycle_id:"old-life".into(),operation_id:"update-one".into(),executor_id:"executor-one".into(),request_fingerprint:"a".repeat(64),
             }).build();
             let result = runtime.write_app_resources("fence", &params, None, None, HttpExpose::Pingora, Some("71")).await;
             assert!(matches!(result, Err(ContainerRuntimeError::Conflict(ref message)) if message.contains("lifecycle-id")), "old lifecycle must be rejected at preflight: {result:?}");
@@ -951,7 +950,7 @@ mod conditional_tests {
                     let result = match action {
                         "stop" => {
                             let context = shared_types::UserAppExecutionContext {
-                                app_id: "fence".into(), user_id: "owner-one".into(), lifecycle_id: "life-one".into(),
+                                app_id: "fence".into(), lifecycle_id: "life-one".into(),
                                 operation_id: "stop-one".into(), executor_id: "executor-one".into(), request_fingerprint: "a".repeat(64),
                             };
                             let target = runtime.capture_stop_target(&context, Some("71")).await.expect("capture stop target");

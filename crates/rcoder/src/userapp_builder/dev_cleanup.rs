@@ -120,11 +120,9 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "Builder lifecycle is missing".to_owned())?;
-        // owner 实例复合 identifier——正式 evidence 链覆盖 lifecycle 持有的
-        // owner 实例；协作者实例（无 lifecycle 受理）在 capture 时清点、
-        // cleanup 时一并清扫（见 CapturedDeletion.extra_instances）。
-        let owner_instance = shared_types::builder_instance_id(&app, app_id)
-            .map_err(|error| format!("compose owner builder instance: {error}"))?;
+        // 应用共享：instance == 纯 app_id（正式 evidence 链覆盖 lifecycle
+        // 持有的唯一 builder；协作者实例模型已随用户绑定移除）。
+        let owner_instance = app_id.to_string();
         let operation = self
             .runtime
             .acquire_builder_operation(&owner_instance)
@@ -289,12 +287,9 @@ impl CapturedDeletion {
                 .map_err(|e| format!("delete collaborator builder ({instance}): {e}"))?;
         }
         if self.snapshot.docker_bind_cleanup {
-            // snapshot.app_id 是复合 identifier——bind 目录清扫按纯 app 段
-            // （dev/*/{app_id} 形态，跨全部协作者 user 目录）
-            let pure_app = shared_types::parse_builder_instance_id(&self.snapshot.app_id)
-                .map(|(_, app)| app.to_string())
-                .unwrap_or_else(|| self.snapshot.app_id.clone());
-            remove_bind_directories(&pure_app).await?;
+            // snapshot.app_id 应用共享后即纯 app_id（存量复合残留右切兼容）
+            let pure_app = shared_types::legacy_composite_app_segment(&self.snapshot.app_id);
+            remove_bind_directories(pure_app).await?;
         }
         match &self.registry_identity {
             Some((generation, container_id)) => {

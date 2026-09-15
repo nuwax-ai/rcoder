@@ -85,7 +85,7 @@ pub(crate) async fn find_dev_container(
         // IP 前先经类型化身份核验（按复合身份键查运行时）；核验不可用
         // （回调未注入）时退回端口探测旧语义。
         let identity_ok = match dev_ensure.load_full() {
-            Some(ensurer) => match ensurer.dev_builder_exists(app_id, Some(user_id)).await {
+            Some(ensurer) => match ensurer.dev_builder_exists(app_id).await {
                 Ok(exists) => exists,
                 Err(e) => {
                     warn!("[DEV_TERMINAL] builder identity check failed: app_id={app_id}: {e}");
@@ -99,14 +99,13 @@ pub(crate) async fn find_dev_container(
         }
     }
     // miss（或命中死值——容器被外部删除后内存表残留旧 IP，探测失败）
-    // → 懒启动（显式实例档：URL user_id 段直取，宿主树
-    // `dev/{user_id}/{app_id}` 分区正确，不依赖 metadata 兜底）。
+    // → 懒启动（应用共享：按 app_id 定位，URL 用户占位段不参与）。
     // 槽未回填（AppState 就绪前）视为未注入，维持 404 指引。
     let Some(ensurer) = dev_ensure.load_full() else {
         info!("[DEV_TERMINAL] dev container not found: app_id={app_id} (create workspace first)");
         return Err(not_found_error(app_id));
     };
-    match ensurer.ensure_dev_container(app_id, Some(user_id)).await {
+    match ensurer.ensure_dev_container(app_id).await {
         Ok(info) if !info.container_ip.is_empty() => {
             info!("[DEV_TERMINAL] dev container ensured on demand: app_id={app_id}");
             Ok(info.container_ip)

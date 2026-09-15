@@ -90,7 +90,6 @@ async fn fixture() -> (
         command: None,
         metadata: None,
         app_id: "terminal-app".into(),
-        user_id: "owner".into(),
         lifecycle_id: None,
         operation_id: "terminal-operation".into(),
         request_id: Some("terminal-request".into()),
@@ -107,7 +106,6 @@ async fn fixture() -> (
         .unwrap();
     let context = UserAppExecutionContext {
         app_id: running.app_id.clone(),
-        user_id: request.user_id.clone(),
         lifecycle_id: running.lifecycle_id.clone(),
         operation_id: running.operation_id.clone(),
         executor_id: "worker-A".into(),

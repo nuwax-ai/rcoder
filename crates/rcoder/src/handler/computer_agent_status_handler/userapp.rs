@@ -18,7 +18,6 @@ pub(super) async fn status_userapp_dev(
     let Some(container_info) = crate::handler::pod_handler::resolve_userapp_dev_container(
         state,
         app_id,
-        request.user_id.as_deref(),
         "COMPUTER_AGENT_STATUS][USERAPP",
     )
     .await?
@@ -86,6 +85,7 @@ pub(super) async fn status_userapp_dev(
     };
 
     Ok(HttpResult::success(ComputerAgentStatusResponse {
+        user_id: request.user_id.clone(),
         project_id: app_id.to_string(),
         is_alive: true,
         session_id,

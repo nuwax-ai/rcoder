@@ -26,6 +26,7 @@ impl KubernetesRuntime {
     /// 等待/SC 漂移可见/创建重试。`service_type_label` 仅作为 PVC label 值；
     /// `extra_labels` 供按业务维度聚合（builder 复合键时代的 app-id/identifier
     /// ——孤儿 PVC 的聚合清理依赖 label 而非从 STS 反查）。
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn ensure_pvc_core(
         &self,
         pvc_name: &str,
@@ -486,7 +487,6 @@ mod lifecycle_ownership_tests {
     fn pvc_reuse_requires_existing_matching_lifecycle_and_family() {
         let context = shared_types::UserAppExecutionContext {
             app_id: "app-one".into(),
-            user_id: "owner-one".into(),
             lifecycle_id: "life-one".into(),
             operation_id: "create-one".into(),
             executor_id: "executor-one".into(),

@@ -138,6 +138,7 @@ pub async fn debug_list_projects(
         .map(|(pid, info)| DebugProjectInfo {
             project_id: pid.clone(),
             session_id: info.session_id().map(|s| s.to_string()),
+            user_id: info.user_id().map(|s| s.to_string()),
             service_type: info.service_type().map(|st| st.to_string()),
             container_id: info.container_info().map(|c| c.container_id.clone()),
             agent_status_name: info.status().map(|s| format!("{:?}", s)),
@@ -219,6 +220,7 @@ pub async fn debug_dump_summary(
         .map(|(pid, info)| DebugProjectInfo {
             project_id: pid.clone(),
             session_id: info.session_id().map(|s| s.to_string()),
+            user_id: info.user_id().map(|s| s.to_string()),
             service_type: info.service_type().map(|st| st.to_string()),
             container_id: info.container_info().map(|c| c.container_id.clone()),
             agent_status_name: info.status().map(|s| format!("{:?}", s)),

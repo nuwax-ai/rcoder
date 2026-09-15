@@ -202,16 +202,13 @@ pub(crate) fn build_standard_labels(
         format!("{}/identifier", RCODER_LABEL_PREFIX),
         identifier.to_string(),
     );
-    // builder 复合键时代的 app 维度聚合标签：identifier 是 `{user_id}-{app_id}`
-    // 复合串，按 app 聚合的查询/清理（destroy dev storage 遍历全部协作者实例）
-    // 依赖此标签，不能从 identifier 前缀推断（user_id 段可含 '-'）。
+    // builder 的 app 维度聚合标签（identifier 应用共享后即纯 app_id；存量
+    // 复合键残留右切还原，保按 app 聚合的查询/清理可用）。
     if matches!(service_type, ServiceType::UserappBuilder) {
-        if let Some((_, app_id)) = shared_types::parse_builder_instance_id(identifier) {
-            labels.insert(
-                format!("{}/app-id", RCODER_LABEL_PREFIX),
-                app_id.to_string(),
-            );
-        }
+        labels.insert(
+            format!("{}/app-id", RCODER_LABEL_PREFIX),
+            shared_types::legacy_composite_app_segment(identifier).to_string(),
+        );
     }
 
     labels

@@ -21,30 +21,13 @@ impl AppService {
     /// 而不是把 HTTP 请求挂死到连接超时（Docker daemon 高负载实战）。
     const DEPLOY_LIST_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// 对账接口：列出该 owner 归属的应用运行时状态（metadata owner 匹配；
-    /// 无归属记录的应用不返回——分区归属口径）。
+    /// 对账接口：列出全部 rcoder 托管的应用运行时状态（应用共享，无 owner 过滤）。
     #[instrument(skip(self))]
-    pub async fn list_app_runtimes(&self: &str) -> AppResult<Vec<AppRuntimeInfo>> {
+    pub async fn list_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
         let statuses = self.list_deployments_cached().await?;
-        let metadata = self.metadata.snapshot().await?;
-        let (owned, unowned): (Vec<_>, Vec<_>) = statuses.into_iter().partition(|s| {
-            metadata
-                .get(&s.app_id)
-                .is_some_and(|m| m.user_id.as_deref() == Some(user_id))
-        });
-        if !unowned.is_empty() {
-            tracing::debug!(
-                owner = user_id,
-                skipped = unowned.len(),
-                "list_app_runtimes skipped apps without matching owner metadata"
-            );
-        }
-        Ok(owned
+        Ok(statuses
             .into_iter()
-            .map(|s| {
-                let owner = metadata.get(&s.app_id).and_then(|m| m.user_id.as_deref());
-                self.build_runtime_info(s, owner)
-            })
+            .map(|s| self.build_runtime_info(s))
             .collect())
     }
 
@@ -52,13 +35,9 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn list_all_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
         let statuses = self.list_deployments_cached().await?;
-        let metadata = self.metadata.snapshot().await?;
         Ok(statuses
             .into_iter()
-            .map(|s| {
-                let owner = metadata.get(&s.app_id).and_then(|m| m.user_id.as_deref());
-                self.build_runtime_info(s, owner)
-            })
+            .map(|s| self.build_runtime_info(s))
             .collect())
     }
 
@@ -123,7 +102,7 @@ impl AppService {
                 .join("; ");
             AppOperationError::Validation(msg)
         })?;
-        let mut items = self.list_app_runtimes("").await?;
+        let mut items = self.list_app_runtimes().await?;
         let metadata = self.metadata.snapshot().await?;
 
         // 过滤：status/app_ids 为运行时字段直接生效；name/created_at 需业务元数据
@@ -253,8 +232,7 @@ impl AppService {
     pub async fn get_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
         let status = self.fetch_runtime_status_or_err(app_id).await?;
-        let metadata = self.metadata.lookup(app_id).await?;
-        Ok(self.build_runtime_info(status, metadata.as_ref().and_then(|m| m.user_id.as_deref())))
+        Ok(self.build_runtime_info(status))
     }
 }
 
@@ -348,14 +326,14 @@ mod tests {
         );
     }
 
-    /// 测试辅助：为 app 注册 owner 后按该 owner 查询（owner 过滤是
-    /// list_app_runtimes 的前置语义，缓存断言不受影响）。返回查询条数。
-    async fn owned_list(svc: &AppService, app_id: &str: &str) -> usize {
+    /// 测试辅助：注册 identity 后全量查询（应用共享，无 owner 过滤；
+    /// 缓存断言不受影响）。返回查询条数。
+    async fn owned_list(svc: &AppService, app_id: &str) -> usize {
         svc.metadata
-            .record(app_id, None, Some(user_id.to_string()), None, None)
+            .record(app_id, None, None, None)
             .await
             .expect("metadata registration");
-        svc.list_app_runtimes(user_id).await.unwrap().len()
+        svc.list_app_runtimes().await.unwrap().len()
     }
 
     /// TTL 内命中缓存：多次查询只穿透一次到 runtime。
@@ -366,8 +344,8 @@ mod tests {
         deployed(&runtime, "appa");
         let svc = test_service(tmp.path(), runtime.clone()).await;
 
-        let r1 = owned_list(&svc, "appa", "u1").await;
-        let r2 = owned_list(&svc, "appa", "u1").await;
+        let r1 = owned_list(&svc, "appa").await;
+        let r2 = owned_list(&svc, "appa").await;
         assert_eq!(r1, 1);
         assert_eq!(r2, 1);
         assert_eq!(
@@ -385,15 +363,15 @@ mod tests {
         deployed(&runtime, "appa");
         let svc = test_service(tmp.path(), runtime.clone()).await;
 
-        owned_list(&svc, "appa", "u1").await;
+        owned_list(&svc, "appa").await;
         deployed(&runtime, "appb"); // 模拟并发新建（绕过 service 写路径）
         svc.invalidate_deploy_cache().await;
-        // 两个 app 都注册给同一 owner 后对账
+        // 注册第二个 app 后对账（应用共享）
         svc.metadata
-            .record("appb", None, Some("u1".to_string()), None, None)
+            .record("appb", None, None, None)
             .await
             .expect("metadata registration");
-        let r = svc.list_app_runtimes("u1").await.unwrap();
+        let r = svc.list_app_runtimes().await.unwrap();
         assert_eq!(r.len(), 2, "invalidated cache must refetch");
         assert_eq!(runtime.list_calls.load(Ordering::Relaxed), 2);
     }
@@ -406,7 +384,7 @@ mod tests {
         deployed(&runtime, "appa");
         let svc = test_service(tmp.path(), runtime.clone()).await;
 
-        owned_list(&svc, "appa", "u1").await;
+        owned_list(&svc, "appa").await;
         // 把缓存时间戳拨回 TTL 之前，模拟过期
         {
             let mut guard = svc.deploy_list_cache.lock().await;
@@ -415,7 +393,7 @@ mod tests {
                     - (AppService::DEPLOY_LIST_TTL + Duration::from_secs(1));
             }
         }
-        owned_list(&svc, "appa", "u1").await;
+        owned_list(&svc, "appa").await;
         assert_eq!(
             runtime.list_calls.load(Ordering::Relaxed),
             2,

@@ -168,7 +168,6 @@ impl KubernetesRuntime {
                 context.lifecycle_id.clone(),
             );
             annotations.insert("rcoder.io/executor-id".into(), context.executor_id.clone());
-            annotations.insert("rcoder.io/owner-id".into(), context.user_id.clone());
             annotations.insert(
                 "rcoder.io/request-fingerprint".into(),
                 context.request_fingerprint.clone(),

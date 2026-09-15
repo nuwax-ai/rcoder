@@ -307,16 +307,7 @@ pub(super) fn control_identity_with_binding(
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    let owner = labels
-        .get("rcoder.io/owner-id")
-        .map(String::as_str)
-        .or_else(|| {
-            info.config
-                .as_ref()
-                .and_then(|config| config.env.as_ref())
-                .and_then(|env| env.iter().find_map(|entry| entry.strip_prefix("USER_ID=")))
-        });
-    if !shared_types::builder_identity_is_bound(context, &metadata, &identity.uid, owner, binding)
+    if !shared_types::builder_identity_is_bound(context, &metadata, &identity.uid, binding)
         .map_err(Error::Conflict)?
         && !adoption
     {

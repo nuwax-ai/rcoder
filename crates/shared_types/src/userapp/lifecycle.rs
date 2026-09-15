@@ -127,11 +127,7 @@ mod execution_context_tests {
             controller.validate_resource_metadata(&metadata).is_err(),
             "creation reuse still requires matching configuration"
         );
-        for key in [
-            "rcoder.io/application-id",
-            "rcoder.io/owner-id",
-            "rcoder.io/lifecycle-id",
-        ] {
+        for key in ["rcoder.io/application-id", "rcoder.io/lifecycle-id"] {
             let mut changed = metadata.clone();
             changed.insert(key.into(), "replacement".into());
             assert!(controller.validate_application_metadata(&changed).is_err());
@@ -168,8 +164,6 @@ mod execution_context_tests {
         };
         assert!(context.validate_identity("app-one").is_ok());
         assert!(context.validate_identity("app-two").is_err());
-        assert!(context.validate_identity("app-one").is_err());
-        assert!(context.validate_identity("app-one").is_err());
         let mut invalid = context.clone();
         invalid.operation_id.clear();
         assert!(invalid.validate_identity("app-one").is_err());

@@ -15,8 +15,8 @@ use tracing::{info, warn};
 
 use shared_types::APP_ID_HEADER;
 
-/// 旧用户 header 名（仅用于转发边界移除，不再是 UserApp 对外契约）
-const LEGACY_USER_ID_HEADER: &str = "x-user-id";
+/// 旧用户定位 header（Java 不再发送；意外携带时按名称移除——spec §2.1）。
+pub(super) const LEGACY_USER_ID_HEADER: &str = "x-user-id";
 
 use crate::router::AppState;
 use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder_until};
@@ -95,19 +95,6 @@ pub(super) fn missing_app_id_response() -> Response {
     .into_response()
 }
 
-/// 旧 x-user-id 按名称移除（Java 不再发送；意外携带时剥离防下游消费）
-/// metadata 兜底；透传族 body 流式不解析，header 是零成本显式档来源）。
-///
-/// identifier 白名单必做：user_id 进宿主树路径 `dev/{user_id}/{app_id}` 拼接，
-/// 含 `/` 即逃逸开发卷根——非法值 400 fail-fast（与 `require_app_id` 同源，
-/// 不静默降级防配置错误被吞）。
-pub(super) fn strip_legacy_user_id_header(headers: &mut axum::http::HeaderMap) {
-    // 旧 x-user-id 按名称移除（不读取值）：Java 不再发送，意外携带时
-    // 转发边界剥离以防下游消费（spec §2.1）
-    headers.remove(LEGACY_USER_ID_HEADER);
-}
-}
-
 /// 定位（miss 幂等 ensure）开发容器 file-server addr。
 ///
 /// 注册表脏值自愈：容器被外部删除（docker rm / 回收）后 state.projects 残留死 IP，
@@ -115,32 +102,24 @@ pub(super) fn strip_legacy_user_id_header(headers: &mut axum::http::HeaderMap) {
 /// 探活失败**不直接判死**：先经 `crate::userapp_builder::remediate_stale_registry`
 /// 以容器运行时真实状态裁决——Running 保容器（高负载超时/启动窗口抖动），
 /// 真死才清注册重建。
-async fn resolve_dev_addr(
-    state: &AppState,
-    app_id: &str,
-
-) -> Result<String, Box<Response>> {
+async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Box<Response>> {
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
-    tokio::time::timeout_at(
-        deadline,
-        resolve_dev_addr_inner(state, app_id, explicit_user_id, deadline),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        Err(builder_control_response(
-            &shared_types::UserAppWaitTimeout { operation_id: None }.into(),
-        ))
-    })
+    tokio::time::timeout_at(deadline, resolve_dev_addr_inner(state, app_id, deadline))
+        .await
+        .unwrap_or_else(|_| {
+            Err(builder_control_response(
+                &shared_types::UserAppWaitTimeout { operation_id: None }.into(),
+            ))
+        })
 }
 
 async fn resolve_dev_addr_inner(
     state: &AppState,
     app_id: &str,
-
     deadline: tokio::time::Instant,
 ) -> Result<String, Box<Response>> {
-    let mut info = ensure_userapp_builder_until(state, app_id, explicit_user_id, deadline)
+    let mut info = ensure_userapp_builder_until(state, app_id, deadline)
         .await
         .map_err(|e| {
             warn!("[USERAPP_FORWARD] ensure dev container failed: app_id={app_id}: {e:#}");
@@ -186,7 +165,7 @@ async fn resolve_dev_addr_inner(
                 // Re-enter coordinated ensure, which rechecks the latest registry
                 // and runtime under the application lock. The observation above
                 // does not authorize clearing a newer registration or its streams.
-                info = ensure_userapp_builder_until(state, app_id, explicit_user_id, deadline)
+                info = ensure_userapp_builder_until(state, app_id, deadline)
                     .await
                     .map_err(|e| {
                         warn!("[USERAPP_FORWARD] re-ensure dev container failed: app_id={app_id}: {e:#}");
@@ -234,13 +213,13 @@ static PROBE_OK: std::sync::OnceLock<dashmap::DashMap<String, std::time::Instant
     std::sync::OnceLock::new();
 const PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// 探活缓存键：注册信息携带的复合 identifier（`{user_id}-{app_id}`）；
-/// 非复合形态（异常/存量残留注册）回落纯 app_id，保探活节流不失效。
+/// 探活缓存键：注册信息携带的 identifier（应用共享后 = 纯 app_id；
+/// 存量残留复合注册沿用其原键，保探活节流不失效）。
 fn probe_cache_key(app_id: &str, info: &shared_types::ContainerBasicInfo) -> String {
-    if shared_types::parse_builder_instance_id(&info.project_id).is_some() {
-        info.project_id.clone()
-    } else {
+    if info.project_id.is_empty() {
         app_id.to_string()
+    } else {
+        info.project_id.clone()
     }
 }
 
@@ -270,7 +249,9 @@ async fn probe_dev_container(addr: &str) -> bool {
 async fn forward_to_addr(target_label: &str, app_id: &str, addr: &str, req: Request) -> Response {
     let target = format!("{addr}{}", req.uri());
 
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
+    // 旧用户定位 header 在转发边界按名称移除（spec §2.1：不读取值、不因值拒收）
+    parts.headers.remove(LEGACY_USER_ID_HEADER);
     let listed = connection_listed_tokens(&parts.headers);
     // 循环外一次构造引用视图（原先每个 header 重建一次 Vec）
     let listed_refs: Vec<&str> = listed.iter().map(String::as_str).collect();
@@ -314,15 +295,7 @@ async fn forward_to_addr(target_label: &str, app_id: &str, addr: &str, req: Requ
 }
 
 /// 全量透传一个请求到该 app 开发容器的 file-server（同 path+query）。
-///
-/// `explicit_user_id`：请求入参显式携带的 owner（懒创建容器的宿主树分区
-/// 显式档；透传族 body 内 user_id 流式不解析，仅 query 可见的接口传值）。
-pub(crate) async fn forward_to_dev(
-    state: &AppState,
-    app_id: &str,
-    req: Request,
-
-) -> Response {
+pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request) -> Response {
     if !matches!(
         super::semantics::classify_dev_absent(req.uri().path()),
         super::semantics::DevAbsentAction::Ensure
@@ -335,7 +308,7 @@ pub(crate) async fn forward_to_dev(
             Err(error) => super::error_body::reject(req, error.into_response()).await,
         };
     }
-    let addr = match resolve_dev_addr(state, app_id, explicit_user_id).await {
+    let addr = match resolve_dev_addr(state, app_id).await {
         Ok(addr) => addr,
         Err(resp) => return super::error_body::reject(req, *resp).await,
     };

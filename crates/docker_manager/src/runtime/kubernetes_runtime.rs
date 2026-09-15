@@ -824,7 +824,6 @@ mod create_lease_tests {
                     .unwrap();
             let context = shared_types::UserAppExecutionContext {
                 app_id: "review".into(),
-                user_id: "owner".into(),
                 lifecycle_id: "lifecycle-one".into(),
                 operation_id: "admitted-operation".into(),
                 executor_id: "executor-one".into(),
@@ -844,10 +843,6 @@ mod create_lease_tests {
                 assert_eq!(
                     patch["metadata"]["annotations"]["rcoder.io/lifecycle-id"],
                     "lifecycle-one"
-                );
-                assert_eq!(
-                    patch["metadata"]["annotations"]["rcoder.io/owner-id"],
-                    "owner"
                 );
                 assert_eq!(
                     patch["metadata"]["annotations"], patches[0]["metadata"]["annotations"],

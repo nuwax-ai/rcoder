@@ -197,39 +197,6 @@ pub(super) fn require_query_app_id(query: Option<&str>) -> Result<String, HttpRe
         .map_err(HttpResultError::bad_request)
 }
 
-/// tasks 族 query `user_id` 必填（宿主机数据卷分区定位 + dev 容器懒创建显式
-/// owner 档——宿主树 `dev/{user_id}/{app_id}` 分区直取，不依赖 metadata 注册兜底）。
-pub(super) fn require_query_user_id(query: Option<&str>) -> Result<String, HttpResultError> {
-    let raw = query_param(query, "user_id")
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let Some(raw) = raw else {
-        return Err(HttpResultError::bad_request(
-            "missing required query parameter `user_id` for tasks endpoints",
-        ));
-    };
-    shared_types::validate_identifier(raw, "user_id")
-        .map(|_| raw.to_string())
-        .map_err(HttpResultError::bad_request)
-}
-
-/// static/{app_id} 的 query `user_id` 必填（🟢 ensure 显式档：懒创建容器
-/// 宿主树分区直取，不依赖 metadata 注册）。非 static 路径返回 None（不要求）；
-/// 调用方已按 static 前缀分派。
-pub(super) fn require_static_user_id(query: Option<&str>) -> Result<String, HttpResultError> {
-    let raw = query_param(query, "user_id")
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let Some(raw) = raw else {
-        return Err(HttpResultError::bad_request(
-            "missing required query parameter `user_id` for static artifact download",
-        ));
-    };
-    shared_types::validate_identifier(raw, "user_id")
-        .map(|_| raw.to_string())
-        .map_err(HttpResultError::bad_request)
-}
-
 /// 可选档 query id 提取（新 userApp 接口族 query 自定位）：缺失/空白返回
 /// `Ok(None)`（调用方按「header > query」合并），存在则过 identifier 白名单
 /// （非法 400 fail-fast，不静默降级——防配置错误被吞）。
@@ -409,14 +376,7 @@ mod tests {
     #[test]
     fn static_user_id_required_and_validated() {
         // 必填（缺失 / 只有其他参数 → 400）
-        assert!(require_static_user_id(None).is_err());
-        assert!(require_static_user_id(Some("release_id=r1")).is_err());
-        assert_eq!(
-            require_static_user_id(Some("release_id=r1&user_id=u1")).unwrap(),
-            "u1"
-        );
         // 白名单校验（含 / 即拒）
-        assert!(require_static_user_id(Some("user_id=../evil")).is_err());
     }
 
     /// 短路信封形状：cancel 幂等终态（与容器侧 CancelData 同构）。
@@ -505,6 +465,7 @@ mod authoritative_lookup_tests {
             service_type: Some(shared_types::ServiceType::UserappBuilder),
             app_id: Some("appa".into()),
             project_id: None,
+            user_id: None,
             pod_id: None,
         }
     }

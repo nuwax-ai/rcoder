@@ -23,7 +23,6 @@ pub(super) async fn ensure(
     state: &AppState,
     app_id: &str,
     instance: &str,
-
     lease: OwnedMutexGuard<()>,
     deadline: Instant,
 ) -> Result<ContainerBasicInfo> {
@@ -47,7 +46,7 @@ pub(super) async fn ensure(
         UserAppAdmissionOutcome::Accepted(record) => {
             // Detach only the HTTP waiter. The worker retains its lease and
             // commits its outcome even when this request is cancelled.
-            drop(spawn_operation(state, &record, lease)?);
+            drop(spawn_operation(state, &record, instance, lease)?);
             record
         }
         UserAppAdmissionOutcome::Existing(record) => {
@@ -55,22 +54,16 @@ pub(super) async fn ensure(
             record
         }
     };
-    wait(state, &operation, deadline).await
+    wait(state, &operation, instance, deadline).await
 }
 
-/// builder 实例创建指纹（owner 受理路径与协作者轻量路径同源）：键含复合
-/// identifier 与实例 user——同实例重创建指纹稳定，换实例/换 user 即变。
-/// 注意：与复合键化之前的指纹（纯 app_id 键）不兼容，升级后存量 pending
-/// 恢复会判 configuration_changed 转 RecoveryRequired（存量重建语义，已拍板）。
-pub(super) fn instance_fingerprint(
-    state: &AppState,
-    app_id: &str,
-    instance: &str,
-
-) -> Result<String> {
+/// builder 创建指纹：键含 app_id 与平台配置——同 app 重创建指纹稳定，
+/// 配置变更即变。schema 3 起 user 维度已移除（应用共享，无实例 user）；
+/// 与复合键时代（schema 2）指纹不兼容，存量 pending 恢复会判
+/// configuration_changed 转 RecoveryRequired（存量重建语义，已拍板）。
+pub(super) fn instance_fingerprint(state: &AppState, app_id: &str) -> Result<String> {
     use sha2::{Digest, Sha256};
-    let config = serde_json::json!({"schema":2,"app_id":app_id,"instance":instance,
-        "user_id":instance_user,
+    let config = serde_json::json!({"schema":3,"app_id":app_id,
         "storage":super::DEFAULT_BUILDER_STORAGE_SIZE,
         "docker":state.config.docker_config,"kubernetes":state.config.kubernetes_config});
     Ok(
@@ -84,6 +77,7 @@ pub(super) fn instance_fingerprint(
 fn spawn_operation(
     state: &AppState,
     record: &UserAppOperationRecord,
+    instance: &str,
     lease: OwnedMutexGuard<()>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let (signal, _) = watch::channel(0);
@@ -93,8 +87,7 @@ fn spawn_operation(
         .insert(record.operation_id.clone(), signal.clone());
     let worker_state = state.clone();
     let worker_record = record.clone();
-        let _ = owner;
-        let _ = instance;
+    let instance = instance.to_string();
     let worker = tokio::spawn(async move {
         let executor = uuid::Uuid::new_v4().to_string();
         let owned = worker_state.clone();
@@ -118,7 +111,8 @@ fn spawn_operation(
             let creation = super::create_builder_inner(
                 &owned,
                 &claimed.app_id,
-shared_types::UserAppExecutionContext {
+                &instance,
+                shared_types::UserAppExecutionContext {
                     app_id: instance.clone(),
                     lifecycle_id: claimed.lifecycle_id.clone(),
                     operation_id: claimed.operation_id.clone(),
@@ -148,7 +142,11 @@ shared_types::UserAppExecutionContext {
             };
             let result = match created {
                 Ok(info) => {
-                    super::confirm_builder_ready(&owned, &claimed.app_id, info,
+                    super::confirm_builder_ready(
+                        &owned,
+                        &claimed.app_id,
+                        &instance,
+                        info,
                         ready_deadline,
                     )
                     .await
@@ -159,10 +157,9 @@ shared_types::UserAppExecutionContext {
             let (status, value, error) = match result {
                 Ok(info) => {
                     let context = shared_types::UserAppExecutionContext {
-                        // capture 侧按复合 identifier 定位容器（与上方 create_builder_inner
-                        // 同源）；claimed.app_id 是 lifecycle 纯 app_id，用它会 inspect
-                        // 少 user 段的旧名单 → 404 → workload 缺失（实测踩坑）
-                        app_id: instance.clone(), user_id: owner.clone(),
+                        // capture 侧按 app identifier 定位容器（与上方
+                        // create_builder_inner 同源；应用共享后两者恒等）
+                        app_id: instance.clone(),
                         lifecycle_id: claimed.lifecycle_id.clone(), operation_id: claimed.operation_id.clone(),
                         executor_id: claimed_id.clone(), request_fingerprint: claimed.request_fingerprint.clone(),
                     };
@@ -319,13 +316,9 @@ pub(super) async fn resume_pending(
             "Pending builder lifecycle does not match recovery target"
         ));
     }
-    // 恢复指纹按 owner 实例复合键重算（record/identity 不含实例段——owner
-    // 受理操作的实例恒为 {identity}-{app_id}）
-    let instance = shared_types::builder_instance_id(&identity, &current.app_id)
-        .map_err(anyhow::Error::msg)?;
-    if instance_fingerprint(state, &current.app_id, &instance, &identity)?
-        != current.request_fingerprint
-    {
+    // 恢复指纹按共享模型重算（应用共享：instance == app_id）
+    let instance = current.app_id.clone();
+    if instance_fingerprint(state, &current.app_id)? != current.request_fingerprint {
         let executor = uuid::Uuid::new_v4().to_string();
         let claimed = progress(
             &state.userapp_store,
@@ -357,7 +350,7 @@ pub(super) async fn resume_pending(
     // Occupy the recovery scheduler slot until the actual worker finishes,
     // including its final checkpoint and notification cleanup. Dropping this
     // observer still detaches rather than aborting the admitted operation.
-    spawn_operation(state, &current, &instance, &identity, lease)?
+    spawn_operation(state, &current, &instance, lease)?
         .await
         .context("Observe recovered builder worker")??;
     Ok(true)
@@ -679,10 +672,7 @@ mod tests {
         store: &Arc<dyn UserAppLifecycleStore>,
         app_id: &str,
     ) -> UserAppOperationRecord {
-        store
-            .ensure_identity(app_id, "owner")
-            .await
-            .expect("identity");
+        store.ensure_identity(app_id).await.expect("identity");
         match store
             .admit(&UserAppAdmission {
                 runtime_policy_on_success: None,
@@ -775,38 +765,12 @@ mod tests {
             validate_completed_resource(&evidence, &replacement, Some(evidence.container.clone()))
                 .is_err()
         );
-        let mut wrong_owner = evidence.target.clone();
-        wrong_owner.context = "other-owner".into();
-        assert!(
-            validate_completed_resource(&evidence, &wrong_owner, Some(evidence.container.clone()))
-                .is_err()
-        );
         let mut other_pod = evidence.container.clone();
         other_pod.container_id = "other-pod".into();
         assert!(validate_completed_resource(&evidence, &evidence.target, Some(other_pod)).is_err());
-        let mut wrong_owner_evidence = evidence.clone();
-        wrong_owner_evidence.target.context = "foreign-owner".into();
-        let invalid_owner = progress(
-            &store,
-            &running,
-            "worker",
-            UserAppOperationState::Running,
-            "builder_ready_confirmed",
-            serde_json::to_value(&wrong_owner_evidence).expect("encode"),
-            None,
-        )
-        .await
-        .expect("persist forged owner evidence for storage authorization test");
-        assert!(
-            store
-                .reserve_completed_operation(&invalid_owner)
-                .await
-                .is_err(),
-            "stored owner must authorize final recovery"
-        );
         let saved = progress(
             &store,
-            &invalid_owner,
+            &running,
             "worker",
             UserAppOperationState::Running,
             "builder_ready_confirmed",

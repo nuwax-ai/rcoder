@@ -24,10 +24,7 @@ pub trait AppServiceTrait: Send + Sync {
         &self,
         operation: &shared_types::UserAppOperationRecord,
     ) -> AppResult<bool>;
-    async fn get_lifecycle(
-        &self,
-        app_id: &str,
-    ) -> AppResult<shared_types::UserAppLifecycleRecord>;
+    async fn get_lifecycle(&self, app_id: &str) -> AppResult<shared_types::UserAppLifecycleRecord>;
     async fn get_control_operation(
         &self,
         app_id: &str,
@@ -44,9 +41,9 @@ pub trait AppServiceTrait: Send + Sync {
         request: shared_types::UserAppRecreateRequest,
     ) -> AppResult<shared_types::UserAppLifecycleRecord>;
 
-    /// 记录开发注册（userApp create-workspace 时 owner user_id 落库；
-    /// name 为空 = 开发期，部署 create_app 后 upsert 补全业务字段）
-    async fn record_dev_registration(&self, app_id: &str: &str) -> AppResult<()>;
+    /// 记录开发注册（userApp create-workspace 时落 identity；name 为空 = 开发期，
+    /// 部署 create_app 后 upsert 补全业务字段）
+    async fn record_dev_registration(&self, app_id: &str) -> AppResult<()>;
 
     /// 创建应用（返回完整 [`AppInfo`]，rcoder 此时持有请求参数）
     async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo>;
@@ -61,8 +58,8 @@ pub trait AppServiceTrait: Send + Sync {
     /// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态
     ///
     /// 供 Java 在 rcoder/自身重启后对账（rcoder 不持久化 app 元数据）。
-    /// 按 metadata owner 过滤（无归属记录的应用不返回——分区归属口径）。
-    async fn list_app_runtimes(&self: &str) -> AppResult<Vec<AppRuntimeInfo>>;
+    /// 应用共享（无 owner 过滤），与 [`Self::list_all_app_runtimes`] 同口径。
+    async fn list_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>>;
 
     /// 无过滤全量版（系统内部扫描面：闲置回收器覆盖所有 app，与归属无关）。
     async fn list_all_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>>;
@@ -72,7 +69,7 @@ pub trait AppServiceTrait: Send + Sync {
 
     /// Public owner-scoped read. The second identity read prevents returning a
     /// runtime observation across deletion/recreation without taking a write lease.
-    async fn get_app_for_owner(&self, app_id: &str: &str) -> AppResult<AppRuntimeInfo> {
+    async fn get_app_for_owner(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         let before = self.get_lifecycle(app_id).await?;
         if before.state != shared_types::UserAppLifecycleState::Active {
             return Err(AppOperationError::Conflict(

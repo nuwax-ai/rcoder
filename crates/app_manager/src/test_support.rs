@@ -330,7 +330,7 @@ impl UserAppDeploymentRuntime for MockRuntime {
         expected_resource_version: Option<&str>,
     ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
         context
-            .validate_identity(&context.app_id, Some(&String::new()))
+            .validate_identity(&context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         let status = self
             .get_deployment_status(&context.app_id)
@@ -682,10 +682,7 @@ pub(crate) fn dev_deletion_receipt(app_id: &str) -> shared_types::UserappDevDele
 
 /// Storage-only fixture: all resource inventories were empty. Exercise the same
 /// confirmed-stage protocol without running a container engine.
-pub(crate) async fn complete_empty_deletion_fixture(
-    mut operation: crate::service::OwnedOperation,
-    owner: &str,
-) {
+pub(crate) async fn complete_empty_deletion_fixture(mut operation: crate::service::OwnedOperation) {
     use shared_types::UserAppDeletionStage as Stage;
     let context = operation.execution_context();
     let app_id = context.app_id.clone();

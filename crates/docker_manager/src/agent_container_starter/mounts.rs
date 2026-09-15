@@ -142,15 +142,13 @@ pub(super) async fn apply_auto_mounts(
                         )
                     }
                     // UserappBuilder 完整开发容器（per-app）——挂载压平:
-                    // 宿主 {根}/dev/{user_id}/{app_id} → 容器 /home/user/{app_id}
+                    // 宿主 {根}/dev/userapp/{app_id} → 容器 /home/user/{app_id}
                     // （env/user 层只在宿主树, 容器内不体现）; data/logs/agent-store 三个
-                    // 兄弟挂载在主挂载之后追加。user_id 缺失兜底 app_id（防御旧调用方,
-                    // create_builder_and_register 已传真实值）。
+                    // 兄弟挂载在主挂载之后追加。应用共享：固定命名空间，无用户段。
                     // resolution path 由 config user-app-builder 段配置为
                     // /app/userapp-workspace, 经 rcoder compose bind 反解宿主根。
                     ServiceType::UserappBuilder => {
                         let pid = project_id.unwrap_or("default");
-                        let uid = user_id.unwrap_or(pid);
                         // 宿主子路径 = 挂载压平四目录之一（布局单一事实源 paths::userapp_dev_subpaths）
                         (
                             shared_types::paths::userapp_dev_subpaths(pid)[0].clone(),
@@ -220,7 +218,6 @@ pub(super) async fn apply_auto_mounts(
             // 差异）——宿主侧只删不解析（purge），无影响。
             if pod_id.is_none() && matches!(service_type, ServiceType::UserappBuilder) {
                 let pid = project_id.unwrap_or("default");
-                let uid = user_id.unwrap_or(pid);
                 // data/logs/agent-store = 布局四目录的后三段（单一事实源），与
                 // 容器内挂载点按序配对
                 let subs = shared_types::paths::userapp_dev_subpaths(pid);

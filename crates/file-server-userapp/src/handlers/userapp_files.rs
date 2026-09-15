@@ -183,7 +183,6 @@ pub(crate) async fn files_update(
     Ok(Json(json!({
         "success": true,
         "message": "User files updated successfully",
-        "user_id": body,
         "app_id": body.app_id,
         "files_count": count,
     })))

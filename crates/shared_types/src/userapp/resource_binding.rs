@@ -53,13 +53,9 @@ pub fn builder_identity_is_bound(
     context: &UserAppExecutionContext,
     metadata: &std::collections::BTreeMap<String, String>,
     physical_uid: &str,
-    physical_owner: Option<&str>,
     binding: Option<&UserAppResourceBinding>,
 ) -> Result<bool, String> {
     context.validate_identity(&context.app_id)?;
-    if physical_owner.is_some() {
-        return Err("Builder physical owner evidence is missing or conflicting".into());
-    }
     for (key, expected) in [
         ("rcoder.io/application-id", context.app_id.as_str()),
         ("rcoder.io/lifecycle-id", context.lifecycle_id.as_str()),
@@ -108,16 +104,9 @@ mod tests {
             adopted_by_operation: "adopt".into(),
         };
         let mut metadata = std::collections::BTreeMap::new();
+        assert!(!builder_identity_is_bound(&context, &metadata, "uid", None).expect("candidate"));
         assert!(
-            !builder_identity_is_bound(&context, &metadata, "uid", Some("owner"), None)
-                .expect("candidate")
-        );
-        assert!(
-            builder_identity_is_bound(&context, &metadata, "uid", Some("owner"), Some(&binding))
-                .expect("bound")
-        );
-        assert!(
-            builder_identity_is_bound(&context, &metadata, "uid", None, Some(&binding)).is_err()
+            builder_identity_is_bound(&context, &metadata, "uid", Some(&binding)).expect("bound")
         );
         let complete_metadata = context.resource_metadata();
         assert!(
@@ -125,17 +114,13 @@ mod tests {
                 &context,
                 &complete_metadata,
                 "replacement-uid",
-                Some("owner"),
                 Some(&binding)
             )
             .is_err(),
             "native labels must not hide a stale physical receipt"
         );
         metadata.insert("rcoder.io/lifecycle-id".into(), "older-life".into());
-        assert!(
-            builder_identity_is_bound(&context, &metadata, "uid", Some("owner"), Some(&binding))
-                .is_err()
-        );
+        assert!(builder_identity_is_bound(&context, &metadata, "uid", Some(&binding)).is_err());
     }
 
     #[test]

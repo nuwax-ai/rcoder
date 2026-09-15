@@ -877,7 +877,7 @@ mod workspace_endpoint_tests {
     use super::*;
 
     #[test]
-    fn endpoint_requires_captured_id_owner_lifecycle_family_and_running_address() {
+    fn endpoint_requires_captured_id_lifecycle_family_and_running_address() {
         let context = shared_types::UserAppExecutionContext {
             app_id: "app".into(),
             lifecycle_id: "life".into(),
@@ -912,10 +912,6 @@ mod workspace_endpoint_tests {
         );
         for (pointer, value) in [
             ("/Id", serde_json::json!("replacement")),
-            (
-                "/Config/Labels/rcoder.io~1owner-id",
-                serde_json::json!("foreign-owner"),
-            ),
             (
                 "/Config/Labels/rcoder.io~1lifecycle-id",
                 serde_json::json!("next-life"),

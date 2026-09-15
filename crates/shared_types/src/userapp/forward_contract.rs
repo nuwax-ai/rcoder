@@ -79,11 +79,6 @@ pub const APP_ID_HEADER: &str = "x-app-id";
 /// 字段同词表——同一 app_id 可同时存在 builder 与生产 Deployment，必须显式区分。
 pub const APP_STAGE_HEADER: &str = "x-app-stage";
 
-/// userApp owner 显式档 header（Java 出站统一携带）：rcoder 拦截/透传层零 body
-/// 解析即可拿到懒创建开发容器的 owner user_id（owner 三档解析的显式档）。
-/// 缺失/空白 = 未传（降级 metadata 兜底）；值须过 identifier 白名单
-/// （进宿主树路径 `dev/{user_id}/{app_id}` 拼接，防逃逸——与 app_id 同源）。
-
 /// 用户维度工作目录 header（对齐 TS nuwax-file-server 1.4.5 `resolveServiceContext`，
 /// 原名 `x-workspace-dir` 随 f979df7→00134aa 改名）：Java/前端注入，值为一跨平台
 /// 绝对路径（POSIX `/a/b`、Windows 盘符 `C:/a/b`、UNC `//server/share/a/b`）。

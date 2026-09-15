@@ -146,14 +146,14 @@ pub async fn pod_ensure(
 async fn ensure_userapp_dev(
     state: &Arc<AppState>,
     app_id: String,
+    _user_id: &str,
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
-    let (info, created) =
-        crate::userapp_builder::ensure_userapp_builder_probed(state, &app_id, Some(user_id))
-            .await
-            .map_err(|e| {
-                error!("[POD_ENSURE] ensure userapp dev container failed: app_id={app_id}: {e:#}");
-                crate::userapp_builder::control_error(&e)
-            })?;
+    let (info, created) = crate::userapp_builder::ensure_userapp_builder_probed(state, &app_id)
+        .await
+        .map_err(|e| {
+            error!("[POD_ENSURE] ensure userapp dev container failed: app_id={app_id}: {e:#}");
+            crate::userapp_builder::control_error(&e)
+        })?;
     info!(
         "[POD_ENSURE] userapp dev container ready: app_id={app_id}, container={}, ip={}",
         info.container_name, info.container_ip
@@ -178,11 +178,12 @@ async fn ensure_userapp_prod(
     state: &Arc<AppState>,
     locale: &str,
     app_id: String,
+    _user_id: &str,
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
     match state.app_service.get_app(&app_id).await {
         Ok(_) => {}
         Err(app_manager::AppOperationError::NotFound(_)) => {
-            return ensure_userapp_prod_created(state, locale, app_id, user_id).await;
+            return ensure_userapp_prod_created(state, locale, app_id).await;
         }
         Err(e) => {
             // API Server 不可达/RBAC 拒绝等查询故障：语义=查询失败而非应用不存在，
@@ -233,47 +234,15 @@ async fn ensure_userapp_prod(
     }
 }
 
-/// prod 空容器预创建子分支：owner 三级解析（显式 user_id > metadata 注册值 >
-/// 报错，与 dev 分支 ensure_userapp_builder 同源语义——归属冲突/缺失拒绝创建）
-/// 后复用 start 无 url 三态链（不存在+user_id → 创建空容器；deploy_controlled
-/// 的锁/幂等编排全程兜底，并发 ensure 由其 operation 锁收敛）。
+/// prod 空容器预创建子分支：应用共享（无 owner 解析），复用 start 无 url
+/// 三态链（不存在 → 创建空容器；deploy_controlled 的锁/幂等编排全程兜底，
+/// 并发 ensure 由其 operation 锁收敛）。
 async fn ensure_userapp_prod_created(
     state: &Arc<AppState>,
     locale: &str,
     app_id: String,
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
-    let metadata_owner = match state.app_service.get_app_owner(&app_id).await {
-        Ok(owner) => owner,
-        Err(e) => {
-            error!(
-                "[POD_ENSURE] query owner for prod container create failed: app_id={app_id}: {e:#}"
-            );
-            return Ok(HttpResult::error_with_message(
-                shared_types::error_codes::ERR_BACKEND_ERROR,
-                locale,
-                &format!("query app owner failed: {e:#}"),
-            ));
-        }
-    };
-    let owner = match crate::userapp_builder::resolve_owner(
-        Some(user_id),
-        metadata_owner.as_deref(),
-    ) {
-        Ok(owner) => owner,
-        Err(e) => {
-            error!(
-                "[POD_ENSURE] resolve owner for prod container create failed: app_id={app_id}: {e:#}"
-            );
-            return Ok(HttpResult::error_with_message(
-                shared_types::error_codes::ERR_VALIDATION,
-                locale,
-                &format!("cannot resolve owner user_id for app {app_id}: {e:#}"),
-            ));
-        }
-    };
-    let request = app_manager::models::StartAppRequest {
-        ..Default::default()
-    };
+    let request = app_manager::models::StartAppRequest::default();
     match state.app_service.start_app_enhanced(&app_id, request).await {
         Ok(result) => {
             info!(

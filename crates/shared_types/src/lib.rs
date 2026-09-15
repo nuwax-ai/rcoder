@@ -131,6 +131,7 @@ pub use validation::{
     validate_agent_work_dir_for_service, validate_identifier,
 };
 
+pub use userapp::builder_instance::legacy_composite_app_segment;
 pub use userapp::builder_instance::validate_builder_app_id;
 
 // Userapp 日志域契约（rcoder ↔ app-cli 单一事实源；OpenAPI schema 同源派生）

@@ -107,11 +107,7 @@ impl AppService {
     }
 
     /// DeploymentStatus → AppRuntimeInfo（含访问地址构建 + conditions 派生）
-    pub(crate) fn build_runtime_info(
-        &self,
-        status: DeploymentStatus,
-        owner: Option<&str>,
-    ) -> AppRuntimeInfo {
+    pub(crate) fn build_runtime_info(&self, status: DeploymentStatus) -> AppRuntimeInfo {
         let conditions = derive_conditions(&status);
         let health = health_from_status(&status);
 
@@ -120,7 +116,7 @@ impl AppService {
         // Gateway 模式：K8s status.ports 已含 HTTP（HTTPRoute backendRef），无需补。
         // ⚠️ 重启风险（pingora_ports 内存态丢失，已知限制）：
         //   - Docker：HTTP 端口补不出 → access.external.http = null（Java 可感知降级）
-        //   - K8s Pingora：status.ports（containerPort）仍含 HTTP → access 返有效 /api/v1/userapp/proxy/app/prod/{user_id}/{app_id}，
+        //   - K8s Pingora：status.ports（containerPort）仍含 HTTP → access 返有效 /api/v1/userapp/proxy/app/prod/0/{app_id}，
         //     但 Pingora backend 未重注册 → 访问 404（静默坏路径）。根治：启动从 containerPorts 重建 backends（TODO）
         let ports = if self.config.http_expose == HttpExpose::Pingora {
             let mut merged = status.ports.clone();
@@ -144,7 +140,7 @@ impl AppService {
             status.ports
         };
 
-        let access = self.build_access_info(&status.app_id, &ports, owner);
+        let access = self.build_access_info(&status.app_id, &ports);
         AppRuntimeInfo {
             status: phase_to_status(&status.phase),
             access,
@@ -249,39 +245,19 @@ impl AppService {
     }
 
     /// 构建访问信息（按 `http_expose` 决定 HTTP path；一律只返 path，host 由 Java 拼）
-    pub(super) fn build_access_info(
-        &self,
-        app_id: &str,
-        ports: &[AppPortStatus],
-        owner: Option<&str>,
-    ) -> AccessInfo {
+    pub(super) fn build_access_info(&self, app_id: &str, ports: &[AppPortStatus]) -> AccessInfo {
         let http_port = ports.iter().find(|p| p.expose_type == RtExposeType::Http);
 
         // 一律只返 path，host 由 Java 拼（Java 必然已知 RCoder / gateway 入口，否则访问不了）：
-        // - Pingora 模式（默认，两后端统一）：/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}
-        //   （免端口——代理内部固定拨 pingap 统一入口 APP_ENTRY_PORT=9080；
-        //   与开发预览 /api/v1/userapp/proxy/app/dev/{user_id}/{app_id} 同构，切环境只改 dev→prod；
-        //   user_id 来自 userapp_metadata，缺值（存量行/内部 ensure 无上下文）无法锚定
-        //   归属 → 返 None 由调用方降级处理）
+        // - Pingora 模式（默认，两后端统一）：/api/v1/userapp/proxy/app/prod/0/{app_id}
+        //   （URL 第三段为保留的用户占位段，固定 "0"——用户绑定已移除，应用共享；
+        //   免端口——代理内部固定拨 pingap 统一入口 APP_ENTRY_PORT=9080；
+        //   与开发预览 /api/v1/userapp/proxy/app/dev/0/{app_id} 同构，切环境只改 dev→prod）
         // - Gateway 模式（K8s 可选）：/apps/{app_id}
         // TCP 初期不对外（external.tcp 空）；internal 始终给 ClusterIP FQDN / 容器名。
         let http_url = match self.config.http_expose {
             HttpExpose::Pingora => {
-                if http_port.is_none() {
-                    None
-                } else {
-                    match owner {
-                        Some(user_id) => {
-                            Some(format!("/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}"))
-                        }
-                        None => {
-                            warn!(
-                                "[APP] metadata user_id missing, cannot build access URL: {app_id}"
-                            );
-                            None
-                        }
-                    }
-                }
+                http_port.map(|_| format!("/api/v1/userapp/proxy/app/prod/0/{app_id}"))
             }
             HttpExpose::Gateway => http_port.map(|_| format!("/apps/{}", app_id)),
         };

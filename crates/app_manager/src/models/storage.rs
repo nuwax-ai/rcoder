@@ -12,8 +12,6 @@ pub struct ClearStorageRequest {
     #[serde(default)]
     #[garde(length(min = 1, max = 128))]
     pub request_id: Option<String>,
-    /// 归属用户 ID（必填，白名单校验；dev 分支经容器清 workspace 时开发容器
-    /// 懒创建的宿主树 `dev/{user_id}/{app_id}` 分区依据）
 }
 
 /// 销毁 PVC 请求（高危·不可逆；强制 `confirm == app_id` 二次确认）
@@ -25,10 +23,8 @@ pub struct DestroyStorageRequest {
     #[serde(default)]
     #[garde(length(min = 1, max = 128))]
     pub request_id: Option<String>,
-    /// 归属用户 ID（必填，白名单校验；Docker compose 部署下销毁宿主树
-    /// `prod/{user_id}/` 该 app 四目录的分区定位——K8s 走 PVC 对象、
-    /// Docker 走 prod/*/ 通配扫描兜底，显式值用于对账与未来精确直删）
-    /// 必须等于 path 的 `app_id`（防误调 / 防脚本批量误删 / 防重放）
+    /// 二次确认值：必须等于 path 的 `app_id`
+    /// （防误调 / 防脚本批量误删 / 防重放）
     #[garde(skip)]
     pub confirm: String,
 }
@@ -36,7 +32,6 @@ pub struct DestroyStorageRequest {
 /// 存储查询请求（**强制分页，无全量模式**——扫存储后端代价高）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueryStorageRequest {
-    /// 宿主机数据卷分区归属目录名（必填；存储清单按分区归属枚举）
     /// 页码（必填，从 1 开始）
     pub page: u32,
     /// 每页数量（必填，上限 100）
@@ -77,28 +72,16 @@ pub struct StorageInfo {
 mod tests {
     use super::*;
 
-    /// wire 契约：clear/destroy body 的 user_id 必填——缺字段即拒。
+    /// wire 契约：destroy body 的 confirm 必填——缺字段即拒。
     #[test]
-    fn storage_requests_require_user_id() {
-        let clear: ClearStorageRequest =
-            serde_json::from_value(serde_json::json!({"user_id": "u1"})).expect("clear body");
-        assert_eq!(clear, "u1");
-        assert!(
-            serde_json::from_value::<ClearStorageRequest>(serde_json::json!({})).is_err(),
-            "clear 缺 user_id 应拒"
-        );
-
-        let destroy: DestroyStorageRequest = serde_json::from_value(serde_json::json!({
-            "user_id": "u1", "confirm": "app1",
+    fn destroy_requires_confirm() {
+        serde_json::from_value::<DestroyStorageRequest>(serde_json::json!({
+            "confirm": "app1",
         }))
         .expect("destroy body");
-        assert_eq!(destroy, "u1");
         assert!(
-            serde_json::from_value::<DestroyStorageRequest>(serde_json::json!({
-                "confirm": "app1",
-            }))
-            .is_err(),
-            "destroy 缺 user_id 应拒"
+            serde_json::from_value::<DestroyStorageRequest>(serde_json::json!({})).is_err(),
+            "destroy 缺 confirm 应拒"
         );
     }
 }

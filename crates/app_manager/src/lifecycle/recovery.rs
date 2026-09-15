@@ -49,7 +49,7 @@ impl AppService {
             .map_err(|error| AppOperationError::Validation(error.to_string()))?;
         shared_types::validate_identifier(operation_id, "operation_id")
             .map_err(AppOperationError::Validation)?;
-        let identity = self.get_lifecycle(app_id, &String::new()).await?;
+        let identity = self.get_lifecycle(app_id).await?;
         if identity.lifecycle_id != request.lifecycle_id {
             return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
         }
@@ -134,7 +134,7 @@ impl AppService {
                 "Operation changed or cannot be safely claimed; query its current state".into(),
             ));
         }
-        self.get_control_operation(app_id, &String::new(), Some(operation_id))
+        self.get_control_operation(app_id, Some(operation_id))
             .await?
             .ok_or_else(|| {
                 AppOperationError::NotFound("Application operation not found after retry".into())
@@ -264,7 +264,7 @@ impl AppService {
             }
             Ok::<_, AppOperationError>(Some((guard, identity, current)))
         };
-        let Some((guard, identity, current)) =
+        let Some((guard, _identity, current)) =
             timeout_at(deadline, preflight).await.map_err(|_| {
                 AppOperationError::Backend("Control recovery preflight deadline exceeded".into())
             })??
@@ -284,7 +284,7 @@ impl AppService {
         if let Command::Deploy { restart, .. } = &command {
             let guard = std::sync::Arc::new(guard);
             let execute = async {
-                let input = operation.execution_input(&String::new()).await?;
+                let input = operation.execution_input().await?;
                 let input = super::deploy_control::DeployInput::decode(&input, *restart)?;
                 self.execute_deploy_input(&snapshot.app_id, input, &mut operation, guard.clone())
                     .await
@@ -323,7 +323,7 @@ impl AppService {
         let mut clear_leases = crate::ops::StorageClearLeases::default();
         let execute = async {
             if matches!(&command, Command::Create { .. } | Command::Update { .. }) {
-                let input = operation.execution_input(&String::new()).await?;
+                let input = operation.execution_input().await?;
                 let (params, previous) = super::config_input::decode(&input)?;
                 if matches!(&command, Command::Create { .. }) {
                     if previous.is_some() {
@@ -331,14 +331,8 @@ impl AppService {
                             "Creation input contains update state".into(),
                         ));
                     }
-                    self.execute_creation(
-                        &snapshot.app_id,
-                        &String::new(),
-                        params,
-                        &mut operation,
-                        &guard,
-                    )
-                    .await?;
+                    self.execute_creation(&snapshot.app_id, params, &mut operation, &guard)
+                        .await?;
                     return Ok(container_runtime_api::DeploymentStatus::default());
                 }
                 let previous = previous.ok_or_else(|| {
@@ -346,7 +340,6 @@ impl AppService {
                 })?;
                 self.execute_update(
                     &snapshot.app_id,
-                    &String::new(),
                     params,
                     previous.clone(),
                     &mut operation,
@@ -358,7 +351,6 @@ impl AppService {
             if let Command::ClearStorage { production } = &command {
                 self.execute_storage_clear(
                     &snapshot.app_id,
-                    &String::new(),
                     *production,
                     &mut operation,
                     &guard,
@@ -370,7 +362,6 @@ impl AppService {
             if let Command::DestroyStorage { production } = &command {
                 self.execute_storage_destruction(
                     &snapshot.app_id,
-                    &String::new(),
                     *production,
                     &mut operation,
                     &guard,
@@ -379,13 +370,8 @@ impl AppService {
                 return Ok(container_runtime_api::DeploymentStatus::default());
             }
             if matches!(&command, Command::DeleteApplication) {
-                self.purge_app_resources(
-                    &snapshot.app_id,
-                    &String::new(),
-                    &mut operation,
-                    &guard,
-                )
-                .await?;
+                self.purge_app_resources(&snapshot.app_id, &mut operation, &guard)
+                    .await?;
                 return Ok(container_runtime_api::DeploymentStatus::default());
             }
             if let Command::DeleteResources {
@@ -395,7 +381,6 @@ impl AppService {
             {
                 self.execute_resource_deletion(
                     &snapshot.app_id,
-                    &String::new(),
                     *purge,
                     expected_resource_version.as_deref(),
                     &mut operation,
@@ -405,7 +390,7 @@ impl AppService {
                 // Deletion has no prior runtime policy to restore on completion.
                 return Ok(container_runtime_api::DeploymentStatus::default());
             }
-            operation.bind_lease(&guard, &String::new()).await?;
+            operation.bind_lease(&guard).await?;
             let previous = self.fetch_runtime_status_or_err(&snapshot.app_id).await?;
             if matches!(command, Command::Start { traffic: true })
                 && previous.wake_on_traffic == Some(false)
@@ -414,7 +399,7 @@ impl AppService {
                     "Traffic recovery cannot override an intentional stop".into(),
                 ));
             }
-            let context = operation.execution_context());
+            let context = operation.execution_context();
             let target = self
                 .runtime
                 .capture_app_mutation_target(&context, previous.resource_version.as_deref())

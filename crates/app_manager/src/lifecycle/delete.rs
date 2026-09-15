@@ -16,7 +16,7 @@ impl AppService {
         purge: bool,
         expected_resource_version: Option<&str>,
     ) -> AppResult<()> {
-        let identity = self
+        let _identity = self
             .metadata
             .store
             .get_application(app_id)
@@ -45,11 +45,7 @@ impl AppService {
         let release_lock = self.acquire_process_release_lock(app_id).await?;
         let result = async {
             self.metadata
-                .validate_request_lifecycle(
-                    app_id,
-                    &String::new(),
-                    request.lifecycle_id.as_deref(),
-                )
+                .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
                 .await?;
             use sha2::Digest as _;
             let fingerprint = hex::encode(sha2::Sha256::digest(
@@ -76,7 +72,7 @@ impl AppService {
             }
             // A known lifecycle may already have no compute workload. Still
             // capture typed residual resources; query failures are never absence.
-            self.get_lifecycle(app_id, &String::new()).await?;
+            self.get_lifecycle(app_id).await?;
             let mut durable = crate::service::OwnedOperation::admit(
                 self.metadata.store.clone(),
                 shared_types::UserAppAdmission {
@@ -98,7 +94,6 @@ impl AppService {
             let mutation = self
                 .execute_resource_deletion(
                     app_id,
-                    &String::new(),
                     purge,
                     request.expected_resource_version.as_deref(),
                     &mut durable,
@@ -136,7 +131,6 @@ impl AppService {
     pub(crate) async fn execute_resource_deletion(
         &self,
         app_id: &str,
-        owner: &str,
         purge: bool,
         expected_resource_version: Option<&str>,
         durable: &mut crate::service::OwnedOperation,

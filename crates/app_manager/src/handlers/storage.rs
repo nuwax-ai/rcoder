@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
 };
 use garde::Validate as _;
 use tracing::{info, instrument};
@@ -13,8 +13,7 @@ use shared_types::{AppError, HttpResult};
 
 use super::state::AppManagerState;
 use crate::models::{
-    ClearStorageRequest, DestroyStorageRequest, OwnerParams, PaginatedResponse,
-    QueryStorageRequest, StorageInfo,
+    ClearStorageRequest, DestroyStorageRequest, PaginatedResponse, QueryStorageRequest, StorageInfo,
 };
 
 /// 查询应用持久存储状态
@@ -24,7 +23,6 @@ use crate::models::{
     params(
         ("app_id" = String, Path, description = "应用 ID"),
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器开发卷（is_orphan=卷在而 builder 容器不在）/ `prod`=生产运行卷"),
-        OwnerParams
     ),
     description = r#"
 查询单个应用持久存储（per-app PVC / Docker bind 卷）的状态与用量：容量、已用、
@@ -45,17 +43,12 @@ use crate::models::{
 pub async fn get_app_storage(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, app_stage)): Path<(String, String)>,
-    Query(owner): Query<OwnerParams>,
 ) -> Result<Json<HttpResult<StorageInfo>>, AppError> {
     let app_stage = super::parse_app_stage_param(&app_stage)?;
-    owner
-        .validate()
-        .map_err(shared_types::garde_err_to_app_error)?;
     info!(
-        "[APP] getting app storage: {} (app_stage={}={})",
+        "[APP] getting app storage: {} (app_stage={})",
         app_id,
-        app_stage.as_str(),
-        owner.user_id
+        app_stage.as_str()
     );
     let info = state
         .app_service
@@ -93,16 +86,14 @@ pub async fn clear_app_storage(
     req.validate()
         .map_err(shared_types::garde_err_to_app_error)?;
     info!(
-        "[APP] clearing app storage: {} (app_stage={}={})",
+        "[APP] clearing app storage: {} (app_stage={})",
         app_id,
-        app_stage.as_str(),
-        req.user_id
+        app_stage.as_str()
     );
     let request_id = req
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone();
-    let owner = req.user_id.clone();
     let service = state.app_service.clone();
     let target = app_id.clone();
     let result = tokio::spawn(async move {
@@ -117,7 +108,7 @@ pub async fn clear_app_storage(
             "Storage clear worker interrupted; query its operation before retrying",
         )
     })?;
-    let id = super::control::control_result(&state, &app_id, &owner, &request_id, result).await?;
+    let id = super::control::control_result(&state, &app_id, &request_id, result).await?;
     Ok(Json(
         HttpResult::success("Storage cleared".to_string()).with_operation_id(id),
     ))
@@ -154,16 +145,14 @@ pub async fn destroy_app_storage(
     req.validate()
         .map_err(shared_types::garde_err_to_app_error)?;
     info!(
-        "[APP] destroying app storage: {} (app_stage={}={})",
+        "[APP] destroying app storage: {} (app_stage={})",
         app_id,
-        app_stage.as_str(),
-        req.user_id
+        app_stage.as_str()
     );
     let request_id = req
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone();
-    let owner = req.user_id.clone();
     let worker_service = state.app_service.clone();
     let worker_app = app_id.clone();
     let result = tokio::spawn(async move {
@@ -178,8 +167,7 @@ pub async fn destroy_app_storage(
             "Storage destruction worker interrupted; query the operation before retrying",
         )
     })?;
-    let operation_id =
-        super::control::control_result(&state, &app_id, &owner, &request_id, result).await?;
+    let operation_id = super::control::control_result(&state, &app_id, &request_id, result).await?;
     Ok(Json(
         HttpResult::success("Storage destroyed".to_string()).with_operation_id(operation_id),
     ))

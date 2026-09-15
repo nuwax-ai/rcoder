@@ -29,6 +29,16 @@ pub fn validate_builder_app_id(app_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 存量复合 identifier（`{user_id}-{app_id}`）右切还原纯 app 段；
+/// 非复合形态（已是纯 app_id）原样返回。仅供清理/对账链兼容存量数据，
+/// 新代码禁止构造复合键。
+pub fn legacy_composite_app_segment(identifier: &str) -> &str {
+    match identifier.rsplit_once('-') {
+        Some((_, app)) => app,
+        None => identifier,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

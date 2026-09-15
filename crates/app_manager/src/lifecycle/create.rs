@@ -77,11 +77,7 @@ impl AppService {
             request.name, app_id, self.config.access_mode
         );
         self.metadata
-            .validate_request_lifecycle(app_id), request.lifecycle_id.as_deref())
-            .await?;
-        String::new() = self
-            .metadata
-            .owner_for_write(app_id, &String::new())
+            .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
             .await?;
         use sha2::Digest as _;
         let fingerprint = hex::encode(sha2::Sha256::digest(
@@ -95,11 +91,7 @@ impl AppService {
         };
         // The first registration is read-only with respect to runtime resources.
         // Metadata changes and operation admission below commit atomically.
-        let identity = self
-            .metadata
-            .store
-            .ensure_identity(app_id)
-            .await?;
+        let identity = self.metadata.store.ensure_identity(app_id).await?;
         if self
             .replay_control(
                 app_id,
@@ -153,13 +145,7 @@ impl AppService {
         )
         .await?;
         let mutation = self
-            .execute_creation(
-                app_id,
-                &String::new(),
-                params,
-                &mut operation,
-                _process_lock,
-            )
+            .execute_creation(app_id, params, &mut operation, _process_lock)
             .await;
         // Ownership persists if the remote result or terminal commit is uncertain.
         // The operation record remains available for identity-aware recovery.
@@ -182,7 +168,6 @@ impl AppService {
     pub(crate) async fn execute_creation(
         &self,
         app_id: &str,
-        owner: &str,
         mut params: container_runtime_api::ContainerCreateParams,
         operation: &mut crate::service::OwnedOperation,
         guard: &crate::service::AppOperationGuard,
@@ -253,18 +238,7 @@ impl AppService {
     /// 校验创建请求并解析 app_id（app_id 规范 + 唯一性 + 资源格式 + 端口）。
     /// 任一校验失败 Fail Fast 返回 ERR_VALIDATION / ERR_APP_ALREADY_EXISTS。
     async fn validate_create_request(&self, request: &CreateAppRequest) -> AppResult<String> {
-        // user_id：归属用户（部署访问 URL 段 + metadata 数据源），identifier 规范。
-        // 空串放行——内部发布链 ensure 构造无 user 上下文（回填已存值或空，
-        // record 侧空转 None）；外部 REST 路径的必填由 handler 层校验兜底。
-        if !"".is_empty()
-            && !shared_types::IDENTIFIER_RE.is_match("")
-        {
-            return Err(AppOperationError::Validation(
-                "user_id must contain 1-64 letters, digits, underscores or hyphens".to_string(),
-            ));
-        }
-        // app_id：外部指定（小写字母数字 ≤22，如数值 project_id；禁 '-'
-        // ——builder 复合键 {user_id}-{app_id} 的解析无歧义要求；
+        // app_id：外部指定（小写字母数字 ≤22，如数值 project_id；禁 '-'；
         // 校验 + 唯一性）or 自动生成（app{8hex}）
         let app_id = match &request.app_id {
             Some(id) => {
@@ -373,7 +347,7 @@ impl AppService {
             }
         }
 
-        let access = self.build_access_info(&app_id, &ports, Some(&String::new()));
+        let access = self.build_access_info(&app_id, &ports);
         let health = runtime_status
             .as_ref()
             .map(health_from_status)

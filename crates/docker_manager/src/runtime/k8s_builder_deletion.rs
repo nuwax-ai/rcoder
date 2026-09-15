@@ -115,7 +115,7 @@ impl KubernetesRuntime {
                     .labels
                     .as_ref()
                     .and_then(|labels| labels.get("rcoder.io/identifier"))
-                    .filter(|id| shared_types::parse_builder_instance_id(id).is_some())
+                    .filter(|id| !id.trim().is_empty())
                 {
                     identifiers.insert(identifier.clone());
                 }
@@ -203,10 +203,7 @@ impl KubernetesRuntime {
             validate_owner(Kind::PersistentVolumeClaim, &object, app_id)?;
             if let Some(context) = context {
                 let annotations = object.metadata.annotations.as_ref();
-                for (key, expected) in [
-                    ("rcoder.io/lifecycle-id", &context.lifecycle_id),
-                    ("rcoder.io/owner-id", &context.user_id),
-                ] {
+                for (key, expected) in [("rcoder.io/lifecycle-id", &context.lifecycle_id)] {
                     if let Some(actual) = annotations.and_then(|values| values.get(key))
                         && actual != expected
                     {
@@ -239,7 +236,6 @@ impl KubernetesRuntime {
                     "rcoder.io/lifecycle-id".into(),
                     context.lifecycle_id.clone().into(),
                 );
-                annotations.insert("rcoder.io/owner-id".into(), context.user_id.clone().into());
             }
             let patch = serde_json::json!({"metadata":{"uid":receipt.uid,"resourceVersion":receipt.resource_version,"annotations":annotations}});
             match api
@@ -400,32 +396,8 @@ pub(super) fn workspace_endpoint_from_bound_pod(
         ));
     }
     let annotations = pod.metadata.annotations.clone().unwrap_or_default();
-    let owner = annotations
-        .get("rcoder.io/owner-id")
-        .map(String::as_str)
-        .or_else(|| {
-            pod.spec
-                .as_ref()
-                .and_then(|spec| {
-                    spec.containers
-                        .iter()
-                        .find(|container| container.name == "agent")
-                })
-                .and_then(|container| container.env.as_ref())
-                .and_then(|env| {
-                    env.iter()
-                        .find(|entry| entry.name == "USER_ID" && entry.value_from.is_none())
-                })
-                .and_then(|entry| entry.value.as_deref())
-        });
-    if !shared_types::builder_identity_is_bound(
-        context,
-        &annotations,
-        &workload.uid,
-        owner,
-        binding,
-    )
-    .map_err(Error::Conflict)?
+    if !shared_types::builder_identity_is_bound(context, &annotations, &workload.uid, binding)
+        .map_err(Error::Conflict)?
     {
         return Err(Error::Conflict(
             "Builder pod requires explicit physical resource adoption".into(),
@@ -542,7 +514,6 @@ mod tests {
             let (runtime, server, requests) = adapter(forbidden).await;
             let context = shared_types::UserAppExecutionContext {
                 app_id: "review".into(),
-                user_id: "owner".into(),
                 lifecycle_id: "life".into(),
                 operation_id: "clear".into(),
                 executor_id: "worker".into(),
@@ -700,7 +671,6 @@ mod workspace_endpoint_tests {
     fn context() -> shared_types::UserAppExecutionContext {
         shared_types::UserAppExecutionContext {
             app_id: "review".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             operation_id: "clear".into(),
             executor_id: "worker".into(),
@@ -743,10 +713,6 @@ mod workspace_endpoint_tests {
             (
                 "/metadata/ownerReferences/0/controller",
                 serde_json::json!(false),
-            ),
-            (
-                "/metadata/annotations/rcoder.io~1owner-id",
-                serde_json::json!("foreign-owner"),
             ),
             (
                 "/metadata/annotations/rcoder.io~1lifecycle-id",

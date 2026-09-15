@@ -202,14 +202,14 @@ impl K8sPvcOps for KubernetesRuntime {
             ),
         };
         let mut extra_labels: Vec<(String, String)> = Vec::new();
-        // builder 复合键时代的聚合标签：identifier=`{user_id}-{app_id}`，
-        // 按 app 聚合清理（destroy dev storage 遍历协作者实例/孤儿 PVC）不能
-        // 从 PVC 名前缀推断（user_id 段可含 '-'），依赖显式 label。
+        // builder 聚合标签（identifier 应用共享后即纯 app_id；存量复合键
+        // 残留右切还原，保按 app 聚合清理可用）。
         if matches!(service_type, ServiceType::UserappBuilder) {
             extra_labels.push(("rcoder.io/identifier".to_string(), identifier.to_string()));
-            if let Some((_, app_id)) = shared_types::parse_builder_instance_id(identifier) {
-                extra_labels.push(("rcoder.io/app-id".to_string(), app_id.to_string()));
-            }
+            extra_labels.push((
+                "rcoder.io/app-id".to_string(),
+                shared_types::legacy_composite_app_segment(identifier).to_string(),
+            ));
         }
         self.ensure_pvc_core(
             &pvc_name,

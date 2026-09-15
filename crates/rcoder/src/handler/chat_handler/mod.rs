@@ -302,6 +302,7 @@ async fn forward_request_to_container_service(
             user_prompt: request.user_prompt.clone(),
             agent_config: request.agent_config.clone(),
             service_type: Some(shared_types::ServiceType::WebAgentRunner),
+            user_id: None,
             is_devcomputer: false,
             agent_work_dir: request.agent_work_dir.clone(),
             app_id: None,

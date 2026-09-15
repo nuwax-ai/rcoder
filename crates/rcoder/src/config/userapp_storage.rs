@@ -157,7 +157,7 @@ mod tests {
             .open(app_manager::AppAccessMode::Docker, &pg)
             .await
             .unwrap();
-        let before = store.ensure_identity("config-app", "owner").await.unwrap();
+        let before = store.ensure_identity("config-app").await.unwrap();
         assert!(path.is_file());
         assert!(
             config

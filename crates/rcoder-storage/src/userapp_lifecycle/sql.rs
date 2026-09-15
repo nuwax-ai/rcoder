@@ -392,7 +392,7 @@ macro_rules! implement_store {
                 // EnsureBuilder's typed final evidence follows successful runtime
                 // completion, which has already released its creation mutex.
                 if operation.kind == shared_types::UserAppOperationKind::EnsureBuilder {
-                    let evidence: shared_types::BuilderCreationEvidence = serde_json::from_value(operation.checkpoint.clone()).map_err(storage)?;
+                    let _evidence: shared_types::BuilderCreationEvidence = serde_json::from_value(operation.checkpoint.clone()).map_err(storage)?;
                     if app.state != shared_types::UserAppLifecycleState::Active { return Err(Error::LifecycleConflict); }
                 } else {
                 let binding: Option<String> = sqlx::query_scalar("SELECT record FROM userapp_operation_leases WHERE app_id=$1 AND operation_id=$2 AND lifecycle_id=$3").bind(&operation.app_id).bind(&operation.operation_id).bind(&operation.lifecycle_id).fetch_optional(&mut *tx).await.map_err(storage)?;

@@ -14,7 +14,7 @@ impl AppService {
     /// 启动应用（scale replicas = 1）
     #[instrument(skip(self))]
     pub async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
-        let identity = self
+        let _identity = self
             .metadata
             .store
             .get_application(app_id)
@@ -63,11 +63,7 @@ impl AppService {
         let guard = self.acquire_process_release_lock(app_id).await?;
         let result = async {
             self.metadata
-                .validate_request_lifecycle(
-                    app_id,
-                    &String::new(),
-                    request.lifecycle_id.as_deref(),
-                )
+                .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
                 .await?;
             use sha2::Digest as _;
             let fingerprint = hex::encode(sha2::Sha256::digest(
@@ -103,8 +99,8 @@ impl AppService {
             )
             .await?;
             let mutation = async {
-                operation.bind_lease(&guard, &String::new()).await?;
-                let context = operation.execution_context());
+                operation.bind_lease(&guard).await?;
+                let context = operation.execution_context();
                 let target = self
                     .runtime
                     .capture_app_mutation_target(&context, previous.resource_version.as_deref())
@@ -211,11 +207,7 @@ impl AppService {
         let operation = self.acquire_process_release_lock(app_id).await?;
         let result = async {
             self.metadata
-                .validate_request_lifecycle(
-                    app_id,
-                    &String::new(),
-                    request.lifecycle_id.as_deref(),
-                )
+                .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
                 .await?;
             use sha2::Digest as _;
             let fingerprint = hex::encode(sha2::Sha256::digest(
@@ -255,8 +247,8 @@ impl AppService {
             )
             .await?;
             let mutation = async {
-                durable.bind_lease(&operation, &String::new()).await?;
-                let context = durable.execution_context());
+                durable.bind_lease(&operation).await?;
+                let context = durable.execution_context();
                 let target = self
                     .runtime
                     .capture_app_mutation_target(&context, previous.resource_version.as_deref())
@@ -349,7 +341,7 @@ impl AppService {
     /// 重启应用（rollout restart）
     #[instrument(skip(self))]
     pub async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
-        let identity = self
+        let _identity = self
             .metadata
             .store
             .get_application(app_id)
@@ -465,7 +457,7 @@ impl AppService {
         }
         // health 不在接口面收 user_id（⚪/dev🟢 不补参）——传 None 走 metadata
         // owner 链（ensure 侧取值链自降级，无需此处预查）
-        let base = self.app_files_base(app_stage, app_id, None).await?;
+        let base = self.app_files_base(app_stage, app_id).await?;
         let ok = reqwest::Client::new()
             .get(format!("{base}/health"))
             .timeout(std::time::Duration::from_secs(5))
@@ -524,14 +516,11 @@ impl AppService {
                 })?;
             return Ok(format!("http://{ip}:{}", shared_types::APP_CLI_ADMIN_PORT));
         }
-        let file_server = self
-            .app_files_base(app_stage, app_id, Some(user_id))
-            .await?;
+        let file_server = self.app_files_base(app_stage, app_id).await?;
         // dev 日志受理前置检查：app-cli 管理 API（:3010）随 dev 会话拉起/退出，
         // 会话不在时该端口为死端口——直连只会挂满连接超时（15s）后 500。
         // 未运行即刻 4xx 快速失败（ERR_DEV_NOT_RUNNING）。
-        self.ensure_dev_logs_running(&file_server, app_id)
-            .await?;
+        self.ensure_dev_logs_running(&file_server, app_id).await?;
         // http://{host}:60000 → http://{host}:{APP_CLI_ADMIN_PORT}（host 段原样保留，仅换管理端口）
         let host = file_server
             .trim_start_matches("http://")
@@ -551,14 +540,10 @@ impl AppService {
     /// `DevNotRunning`；预检自身 transport 失败/非 200/解码失败一律
     /// fail-open：预检不构成新故障面，照旧由后续 :3010 连接兜底
     /// （拿不准放行，对齐 model_probe 惯例）。
-    async fn ensure_dev_logs_running(
-        &self,
-        file_server_base: &str,
-        app_id: &str,
-    ) -> AppResult<()> {
+    async fn ensure_dev_logs_running(&self, file_server_base: &str, app_id: &str) -> AppResult<()> {
         let response = reqwest::Client::new()
             .get(format!(
-                "{file_server_base}/api/v1/userapp/dev/list?app_id={app_id}&user_id={user_id}"
+                "{file_server_base}/api/v1/userapp/dev/list?app_id={app_id}"
             ))
             .timeout(DEV_LOGS_PRECHECK_TIMEOUT)
             .send()

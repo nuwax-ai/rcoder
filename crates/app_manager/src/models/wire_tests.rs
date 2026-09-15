@@ -9,11 +9,10 @@
 mod tests {
     use crate::models::commons::{ExposeType, HealthCheckType};
     use crate::models::request::{
-        AppFilters, CreateAppRequest, DeleteAppRequest, PurgeAppRequest, QueryAppsRequest,
-        SortOrder, UpdateAppRequest,
+        AppFilters, CreateAppRequest, PurgeAppRequest, QueryAppsRequest, SortOrder,
+        UpdateAppRequest,
     };
     use crate::models::response::{AppRuntimeInfo, PaginatedResponse, Pagination};
-    use crate::models::start::StartAppRequest;
     use crate::models::storage::{QueryStorageRequest, StorageFilters, StorageInfo};
 
     fn assert_no_camel(json: &serde_json::Value, ctx: &str) {
@@ -64,7 +63,6 @@ mod tests {
         }))
         .expect("snake request wire must deserialize");
         assert_eq!(req.app_id.as_deref(), Some("apporder-svc"));
-        assert_eq!(req, "u6");
         let ports = req.ports.as_ref().expect("ports");
         assert_eq!(ports.len(), 2);
         assert!(matches!(ports[0].expose_type, ExposeType::Http));
@@ -112,45 +110,17 @@ mod tests {
         assert_eq!(legacy.image.as_deref(), Some("i"));
     }
 
-    /// 必填契约：缺 user_id 的请求体直接反序列化拒绝（422）。
+    /// Full deletion preserves lifecycle/request tokens; unknown legacy fields are ignored.
     #[test]
-    fn requests_missing_user_id_are_rejected() {
-        let update: Result<UpdateAppRequest, _> =
-            serde_json::from_value(serde_json::json!({"image": "i"}));
-        assert!(update.is_err(), "update 缺 user_id 应拒");
-
-        let query: Result<QueryAppsRequest, _> = serde_json::from_value(serde_json::json!({
-            "page": 1
-        }));
-        assert!(query.is_err(), "query 缺 user_id 应拒");
-
-        let storage: Result<QueryStorageRequest, _> =
-            serde_json::from_value(serde_json::json!({"page": 1}));
-        assert!(storage.is_err(), "storage query 缺 user_id 应拒");
-
-        let start: Result<StartAppRequest, _> = serde_json::from_value(serde_json::json!({
-            "url": "http://x"
-        }));
-        assert!(start.is_err(), "start 缺 user_id 应拒");
-
-        let delete: Result<DeleteAppRequest, _> = serde_json::from_value(serde_json::json!({}));
-        assert!(delete.is_err(), "delete 缺 user_id 应拒");
-    }
-
-    /// Full deletion requires ownership and preserves lifecycle/request tokens.
-    #[test]
-    fn purge_app_request_requires_owner_and_preserves_control_identity() {
-        assert!(serde_json::from_value::<PurgeAppRequest>(serde_json::json!({})).is_err());
+    fn purge_app_request_preserves_control_identity() {
         let request: PurgeAppRequest = serde_json::from_value(serde_json::json!({
-            "user_id": "u-purge", "lifecycle_id": "life-one", "request_id": "request-one"
+            "lifecycle_id": "life-one", "request_id": "request-one"
         }))
         .expect("control request");
-        assert_eq!(String::new(), "u-purge");
         assert_eq!(request.lifecycle_id.as_deref(), Some("life-one"));
         assert_eq!(request.request_id.as_deref(), Some("request-one"));
         let initial: PurgeAppRequest =
-            serde_json::from_value(serde_json::json!({"user_id": "u-purge"}))
-                .expect("first lifecycle request");
+            serde_json::from_value(serde_json::json!({})).expect("first lifecycle request");
         assert_eq!(initial.lifecycle_id, None);
         assert_eq!(initial.request_id, None);
     }

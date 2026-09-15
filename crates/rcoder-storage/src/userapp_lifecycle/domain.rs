@@ -302,7 +302,7 @@ pub(super) fn patch_metadata(
 
 /// SQL callers cannot bypass the coordinator's deletion evidence ordering.
 fn validate_deletion_progress(
-    app: &UserAppLifecycleRecord,
+    _app: &UserAppLifecycleRecord,
     operation: &UserAppOperationRecord,
     progress: &UserAppOperationProgress,
 ) -> Result<(), Error> {
@@ -383,7 +383,7 @@ fn validate_deletion_progress(
 }
 
 fn validate_storage_destruction_progress(
-    app: &UserAppLifecycleRecord,
+    _app: &UserAppLifecycleRecord,
     operation: &UserAppOperationRecord,
     progress: &UserAppOperationProgress,
 ) -> Result<(), Error> {

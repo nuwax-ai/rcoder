@@ -80,10 +80,7 @@ pub async fn query_app_log_sources(
     params
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
-    let base = state
-        .app_service
-        .log_api_base(app_stage, &app_id, &params.user_id)
-        .await?;
+    let base = state.app_service.log_api_base(app_stage, &app_id).await?;
     forward_json(&state, base.clone(), "/v1/logs/sources/query", request).await
 }
 
@@ -127,10 +124,7 @@ pub async fn query_app_logs(
     params
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
-    let base = state
-        .app_service
-        .log_api_base(app_stage, &app_id, &params.user_id)
-        .await?;
+    let base = state.app_service.log_api_base(app_stage, &app_id).await?;
     forward_json(&state, base, "/v1/logs/query", request).await
 }
 
@@ -174,10 +168,7 @@ pub async fn stream_app_logs_v1(
     params
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
-    let base = state
-        .app_service
-        .log_api_base(app_stage, &app_id, &params.user_id)
-        .await?;
+    let base = state.app_service.log_api_base(app_stage, &app_id).await?;
     let response = state
         .http_client
         .post(format!("{base}/v1/logs/stream"))

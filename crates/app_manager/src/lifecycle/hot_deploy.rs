@@ -86,11 +86,7 @@ impl AppService {
             sha256,
         } = artifact;
         self.metadata
-            .validate_request_lifecycle(
-                app_id,
-                "",
-                request.lifecycle_id.as_deref(),
-            )
+            .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
             .await?;
         // 前置：app 存在且 Running 且有可路由 IP
         let app: AppRuntimeInfo = match self.get_app(app_id).await {

@@ -24,7 +24,6 @@ impl AppService {
         rcoder_app_id: &str,
         name: &str,
         deploy_env: Option<std::collections::HashMap<String, String>>,
-        owner: &str,
         lifecycle_id: Option<&str>,
     ) -> Result<CreateAppRequest, AppOperationError> {
         let image = std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").map_err(|_| {

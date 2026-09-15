@@ -202,6 +202,7 @@ mod tests {
 
     fn request_with_work_dir(agent_work_dir: Option<&str>) -> ComputerChatRequest {
         ComputerChatRequest {
+            user_id: "user_1".to_string(),
             project_id: Some("proj_1".to_string()),
             agent_work_dir: agent_work_dir.map(str::to_string),
             prompt: "hi".to_string(),

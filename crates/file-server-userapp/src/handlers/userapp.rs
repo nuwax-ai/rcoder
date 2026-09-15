@@ -85,9 +85,7 @@ pub(crate) fn reply<T>(r: AppResult<T>) -> UserAppReply<T> {
 fn validate_task_scope(scope: &UserappTaskScopeQuery, task_id: &str) -> Result<(), AppError> {
     shared_types::validate_identifier(&scope.app_id, "app_id")
         .map_err(|e| AppError::validation(e.to_string()))?;
-    shared_types::validate_identifier(&scope, "user_id")
-        .map_err(|e| AppError::validation(e.to_string()))?;
-    tracing::debug!(app_id = %scope.app_id, user_id = %scope, %task_id, "task scope access");
+    tracing::debug!(app_id = %scope.app_id, %task_id, "task scope access");
     Ok(())
 }
 
@@ -145,7 +143,7 @@ pub(crate) async fn build_workspace(
         )
         .await?;
 
-        tracing::info!(app_id = %body.app_id, user_id = %body, %task_id, %artifact_path, "userapp build task started");
+        tracing::info!(app_id = %body.app_id, %task_id, %artifact_path, "userapp build task started");
         Ok(BuildCreatedData {
             task_id,
             status: BuildTaskStatus::Pending,

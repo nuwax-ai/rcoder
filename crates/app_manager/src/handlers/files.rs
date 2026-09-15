@@ -120,7 +120,7 @@ pub async fn upload_file(
 
     let result = state
         .app_service
-        .upload_file(app_stage, &app_id, &user_id, data, &target, flatten)
+        .upload_file(app_stage, &app_id, data, &target, flatten)
         .await?;
 
     Ok(Json(HttpResult::success(result)))
@@ -182,7 +182,7 @@ pub async fn upload_from_url(
     let flatten = req.flatten.unwrap_or(false);
     let result = state
         .app_service
-        .upload_from_url(app_stage, &app_id, &req, &req.url, &target, flatten)
+        .upload_from_url(app_stage, &app_id, &req.url, &target, flatten)
         .await?;
     Ok(Json(HttpResult::success(result)))
 }
@@ -235,7 +235,7 @@ pub async fn list_files(
     );
     let files = state
         .app_service
-        .list_files(app_stage, &app_id, &q, q.path.as_deref())
+        .list_files(app_stage, &app_id, q.path.as_deref())
         .await?;
     Ok(Json(HttpResult::success(files)))
 }
@@ -287,7 +287,7 @@ pub async fn delete_file(
     );
     state
         .app_service
-        .delete_file(app_stage, &app_id, &String::new(), &request.path)
+        .delete_file(app_stage, &app_id, &request.path)
         .await?;
     Ok(Json(HttpResult::success("文件删除成功".to_string())))
 }

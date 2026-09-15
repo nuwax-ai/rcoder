@@ -1,6 +1,5 @@
 //! Durable operation queries and explicit identity recreation.
 use super::AppManagerState;
-use crate::models::OwnerParams;
 use axum::{
     Json,
     extract::{
@@ -18,7 +17,6 @@ use std::sync::Arc;
 pub(super) async fn control_result<T>(
     state: &AppManagerState,
     app_id: &str,
-    owner: &str,
     request_id: &str,
     result: crate::models::AppResult<T>,
 ) -> Result<T, AppError> {
@@ -31,7 +29,7 @@ pub(super) async fn control_result<T>(
         std::time::Duration::from_secs(5),
         state
             .app_service
-            .get_control_operation_by_request(app_id, owner, request_id),
+            .get_control_operation_by_request(app_id, request_id),
     )
     .await
     {
@@ -46,14 +44,6 @@ pub(super) async fn control_result<T>(
             Err(error)
         }
     }
-}
-
-fn owner(query: Result<Query<OwnerParams>, QueryRejection>) -> Result<String, AppError> {
-    let Query(query) = query
-        .map_err(|_| AppError::validation_error("A valid user_id query parameter is required"))?;
-    shared_types::validate_identifier(&query, "user_id")
-        .map_err(|_| AppError::validation_error("Invalid user_id query parameter"))?;
-    Ok(query.user_id)
 }
 
 /// Retry or reconcile an application operation.
@@ -92,64 +82,57 @@ pub async fn retry_operation(
 
 /// Read application lifecycle.
 #[utoipa::path(get, path="/api/v1/userapp/{app_id}/lifecycle",
-    params(("app_id"=String, Path, description="Application identifier"), ("user_id"=String, Query, description="Application owner identifier")),
+    params(("app_id"=String, Path, description="Application identifier")),
     responses((status=200, description="HttpResult envelope with the durable state or business error code", body=HttpResult<UserAppLifecycleRecord>)), tag="Userapp · 双态 · 生命周期")]
 pub async fn get_lifecycle(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-    query: Result<Query<OwnerParams>, QueryRejection>,
 ) -> Result<Json<HttpResult<UserAppLifecycleRecord>>, AppError> {
-    let owner = owner(query)?;
     Ok(Json(HttpResult::success(
-        state.app_service.get_lifecycle(&app_id, &owner).await?,
+        state.app_service.get_lifecycle(&app_id).await?,
     )))
 }
 
 /// Read the current application operation.
 #[utoipa::path(get, path="/api/v1/userapp/{app_id}/operations/current",
-    params(("app_id"=String, Path, description="Application identifier"), ("user_id"=String, Query, description="Application owner identifier")),
+    params(("app_id"=String, Path, description="Application identifier")),
     responses((status=200, description="HttpResult envelope with the durable state or business error code", body=HttpResult<Option<UserAppOperationView>>)), tag="Userapp · 双态 · 生命周期")]
 pub async fn get_current_operation(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-    query: Result<Query<OwnerParams>, QueryRejection>,
 ) -> Result<Json<HttpResult<Option<UserAppOperationView>>>, AppError> {
-    let owner = owner(query)?;
     Ok(Json(HttpResult::success(
         state
             .app_service
-            .get_control_operation(&app_id, &owner, None)
+            .get_control_operation(&app_id, None)
             .await?,
     )))
 }
 
 /// Read an application operation.
 #[utoipa::path(get, path="/api/v1/userapp/{app_id}/operations/{operation_id}",
-    params(("app_id"=String, Path, description="Application identifier"), ("operation_id"=String, Path, description="Durable operation identifier"), ("user_id"=String, Query, description="Application owner identifier")),
+    params(("app_id"=String, Path, description="Application identifier"), ("operation_id"=String, Path, description="Durable operation identifier")),
     responses((status=200, description="HttpResult envelope with the durable state or business error code", body=HttpResult<Option<UserAppOperationView>>)), tag="Userapp · 双态 · 生命周期")]
 pub async fn get_operation(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, operation_id)): Path<(String, String)>,
-    query: Result<Query<OwnerParams>, QueryRejection>,
 ) -> Result<Json<HttpResult<Option<UserAppOperationView>>>, AppError> {
-    let owner = owner(query)?;
     Ok(Json(HttpResult::success(
         state
             .app_service
-            .get_control_operation(&app_id, &owner, Some(&operation_id))
+            .get_control_operation(&app_id, Some(&operation_id))
             .await?,
     )))
 }
 
 #[derive(serde::Deserialize)]
 pub struct OperationRequestQuery {
-    pub user_id: String,
     pub request_id: String,
 }
 
 /// Find an operation by request identity.
 #[utoipa::path(get, path="/api/v1/userapp/{app_id}/operations/by-request",
-    params(("app_id"=String, Path, description="Application identifier"), ("user_id"=String, Query, description="Application owner identifier"), ("request_id"=String, Query, description="Original request deduplication identifier")),
+    params(("app_id"=String, Path, description="Application identifier"), ("request_id"=String, Query, description="Original request deduplication identifier")),
     responses((status=200, description="HttpResult envelope with the durable state or business error code", body=HttpResult<Option<UserAppOperationView>>)), tag="Userapp · 双态 · 生命周期")]
 pub async fn get_operation_by_request(
     State(state): State<Arc<AppManagerState>>,
@@ -157,13 +140,11 @@ pub async fn get_operation_by_request(
     query: Result<Query<OperationRequestQuery>, QueryRejection>,
 ) -> Result<Json<HttpResult<Option<UserAppOperationView>>>, AppError> {
     let Query(query) = query.map_err(|_| {
-        AppError::validation_error("Valid user_id and request_id query parameters are required")
+        AppError::validation_error("A valid request_id query parameter is required")
     })?;
-    shared_types::validate_identifier(&query, "user_id")
-        .map_err(|_| AppError::validation_error("Invalid user_id query parameter"))?;
     let operation = state
         .app_service
-        .get_control_operation_by_request(&app_id, &query, &query.request_id)
+        .get_control_operation_by_request(&app_id, &query.request_id)
         .await?;
     Ok(Json(HttpResult::success(operation)))
 }
@@ -226,15 +207,14 @@ mod tests {
             app_service: service,
             http_client: reqwest::Client::new(),
         };
-        for (owner, request, expected) in [
-            ("owner", "caller-request", Some("persisted-operation")),
-            ("other-owner", "caller-request", None),
-            ("owner", "unaccepted-request", None),
+        for (request, expected) in [
+            ("caller-request", Some("persisted-operation")),
+            ("unaccepted-request", None),
         ] {
             let result: crate::models::AppResult<()> = Err(
                 crate::models::AppOperationError::Backend("Original runtime failure".into()),
             );
-            let error = control_result(&state, "correlation", owner, request, result)
+            let error = control_result(&state, "correlation", request, result)
                 .await
                 .expect_err("original failure");
             match error {
@@ -349,9 +329,6 @@ mod builder_retry_tests {
                 http_client: reqwest::Client::new(),
             });
             for invalid in [
-                shared_types::UserAppRetryRequest {
-                    ..request.clone()
-                },
                 shared_types::UserAppRetryRequest {
                     lifecycle_id: "old-lifecycle".into(),
                     ..request.clone()

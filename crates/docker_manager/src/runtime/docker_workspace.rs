@@ -120,7 +120,7 @@ impl WorkspaceRuntime for DockerRuntime {
                     uid_entries.push(entry.file_name().to_string_lossy().to_string());
                 }
             }
-            for uid in uid_entries {
+            for _uid in uid_entries {
                 for sub in shared_types::paths::userapp_prod_subpaths(app_id) {
                     let dir =
                         std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)

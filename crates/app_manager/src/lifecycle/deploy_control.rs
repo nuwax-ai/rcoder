@@ -107,13 +107,9 @@ impl AppService {
         guard: Arc<AppOperationGuard>,
     ) -> AppResult<StartAppResult> {
         self.metadata
-            .validate_request_lifecycle(app_id), request.lifecycle_id.as_deref())
+            .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
             .await?;
-        let identity = self
-            .metadata
-            .store
-            .ensure_identity(app_id)
-            .await?;
+        let identity = self.metadata.store.ensure_identity(app_id).await?;
         let fingerprint = deploy_fingerprint(&request)?;
         let kind = kind_from_restart(restart);
         if let Some(previous) = self
@@ -282,7 +278,6 @@ impl AppService {
                     app_id,
                     app_id,
                     Some(env),
-                    &String::new(),
                     request.lifecycle_id.as_deref(),
                 )?;
                 create.recycle_enabled = request.idle_timeout_seconds.map(|value| value > 0);
@@ -315,8 +310,8 @@ impl AppService {
             restart,
             ..
         } = input;
-        operation.bind_lease(&guard, &String::new()).await?;
-        let context = operation.execution_context());
+        operation.bind_lease(&guard).await?;
+        let context = operation.execution_context();
         super::start::validate_start_request(app_id, &request)?;
         let url = request
             .url
@@ -350,17 +345,10 @@ impl AppService {
         if !hot {
             if let Some(params) = params {
                 if let Some(previous) = previous {
-                    self.execute_update(
-                        app_id,
-                        &String::new(),
-                        params,
-                        previous,
-                        operation,
-                        &guard,
-                    )
-                    .await?;
+                    self.execute_update(app_id, params, previous, operation, &guard)
+                        .await?;
                 } else {
-                    self.execute_creation(app_id, &String::new(), params, operation, &guard)
+                    self.execute_creation(app_id, params, operation, &guard)
                         .await?;
                 }
             } else {
@@ -436,10 +424,7 @@ impl AppService {
             None
         };
         let (pg_aligned, pg_error) = match &request.pg {
-            Some(credentials) => match self
-                .align_start_pg(app_id, &String::new(), credentials)
-                .await
-            {
+            Some(credentials) => match self.align_start_pg(app_id, credentials).await {
                 Ok(()) => (Some(true), None),
                 Err(error) => {
                     let message = error.to_string();

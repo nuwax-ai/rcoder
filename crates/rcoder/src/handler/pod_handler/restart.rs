@@ -150,6 +150,7 @@ pub async fn pod_restart(
     );
 
     let options = ContainerCreateOptions {
+        user_id: request.user_id.clone(),
         project_id: request.project_id.clone(),
         resource_limits,
         pod_id: request.pod_id.clone(),
@@ -270,14 +271,13 @@ async fn restart_userapp_prod(
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone();
-    let owner = request.user_id.clone();
     state
         .app_service
         .restart_app_controlled(&app_id, request)
         .await?;
     let operation = state
         .app_service
-        .get_control_operation_by_request(&app_id, &owner, &request_id)
+        .get_control_operation_by_request(&app_id, &request_id)
         .await?;
     info!(app_id, "UserApp production restart completed");
     let mut response = HttpResult::success(RestartPodResponse {

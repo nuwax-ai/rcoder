@@ -251,7 +251,7 @@ fn primary_document_groups_userapp_by_business_domain() {
 /// 天然无单 app 归属——user_id 仍必须）：
 /// - `query` / `runtime` / `storage/{app_stage}/query` 三条的 app_id
 #[test]
-fn userapp_params_app_and_owner_visible() {
+fn userapp_params_app_id_visible() {
     let document = primary_document();
     let schemas = &document.components.as_ref().map(|c| c.schemas.clone());
     /// 豁免：列表跨 app 查询类（无单 app 归属，user_id 仍必须）
@@ -269,19 +269,15 @@ fn userapp_params_app_and_owner_visible() {
             let params = op.parameters.iter().flatten();
             let mut has_app_id =
                 APP_ID_EXEMPT.contains(&path.as_str()) || path.contains("{app_id}");
-            let mut has_user_id = false;
             for p in params {
-                // 15 族镜像接口的 camelCase（appId/userId）是永久 TS 契约——
+                // 15 族镜像接口的 camelCase（appId）是永久 TS 契约——
                 // 参数名双词表兼容（容器侧 IntoParams serde rename_all camelCase）
                 if p.name == "app_id" || p.name == "appId" {
                     has_app_id = true;
                 }
-                if p.name == "user_id" || p.name == "userId" {
-                    has_user_id = true;
-                }
             }
             // request body schema 属性兜底（$ref 解引用）
-            if !has_app_id || !has_user_id {
+            if !has_app_id {
                 let body_ref = op
                     .request_body
                     .as_ref()
@@ -301,19 +297,12 @@ fn userapp_params_app_and_owner_visible() {
                         if k == "app_id" || k == "appId" {
                             has_app_id = true;
                         }
-                        if k == "user_id" || k == "userId" {
-                            has_user_id = true;
-                        }
                     }
                 }
             }
             assert!(
                 has_app_id,
                 "{method} {path}: 缺 app_id 入参（path/query/body 任一位置）——用户铁律：userApp 接口必须携带"
-            );
-            assert!(
-                has_user_id,
-                "{method} {path}: 缺 user_id 入参（query/body 任一位置）——用户铁律：userApp 接口必须携带"
             );
             checked += 1;
         }

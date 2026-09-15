@@ -184,6 +184,7 @@ pub fn build_computer_workspace_path(
     isolation_type: Option<&str>,
     tenant_id: Option<&str>,
     space_id: Option<&str>,
+    user_id: &str,
     project_id: &str,
 ) -> Result<String, PathValidationError> {
     validate_identifier(project_id, "project_id")?;
@@ -234,6 +235,7 @@ pub fn build_computer_workspace_path(
 /// 短路（本函数不感知部署拓扑）。
 pub fn map_container_work_dir_to_host(
     work_dir_id: &str,
+    user_id: &str,
 ) -> Result<Option<PathBuf>, PathValidationError> {
     let suffix = if work_dir_id == "/home/user" {
         ""

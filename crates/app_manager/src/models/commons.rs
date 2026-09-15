@@ -130,11 +130,3 @@ pub struct InternalPort {
     /// 端口号
     pub port: u16,
 }
-
-/// 单 app 运维/查询接口的归属用户 query 参数（必填——宿主卷分区定位，
-/// 容器未启动时按此自动唤醒挂载）。
-#[derive(Debug, serde::Deserialize, utoipa::IntoParams, garde::Validate)]
-#[into_params(parameter_in = Query)]
-pub struct OwnerParams {
-    /// 宿主机数据卷分区归属目录名（必填；Docker compose 挂载路径组成段）
-}

@@ -11,7 +11,6 @@ fn request(id: &str, kind: Kind) -> UserAppAdmission {
         command: None,
         metadata: None,
         app_id: "contract-app".into(),
-        user_id: "owner".into(),
         lifecycle_id: None,
         operation_id: id.into(),
         request_id: Some(id.into()),
@@ -60,16 +59,12 @@ async fn storage_deletion_preserves_lifecycle(store: &dyn UserAppLifecycleStore)
 }
 
 async fn admission_metadata_is_atomic(store: &dyn UserAppLifecycleStore) {
-    let app = store
-        .ensure_identity("atomic-admission-app", "owner")
-        .await
-        .unwrap();
+    let app = store.ensure_identity("atomic-admission-app").await.unwrap();
     let mut req = request("atomic-admission", Kind::Update);
     req.app_id = app.app_id.clone();
     req.lifecycle_id = Some(app.lifecycle_id.clone());
     req.metadata = Some(shared_types::UserAppMetadataPatch {
         app_id: app.app_id.clone(),
-        user_id: app.user_id.clone(),
         lifecycle_id: app.lifecycle_id.clone(),
         expected_revision: app.metadata_revision,
         name: Some(Some("admitted-name".into())),
@@ -134,10 +129,7 @@ async fn metadata_changes_commit_with_admission_and_never_before_rejection() {
 #[tokio::test]
 async fn sqlite_failure_after_operation_insert_rolls_back_entire_admission() {
     let (directory, store) = database().await;
-    let app = store
-        .ensure_identity("atomic-failure", "owner")
-        .await
-        .unwrap();
+    let app = store.ensure_identity("atomic-failure").await.unwrap();
     let observer = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
@@ -153,7 +145,6 @@ async fn sqlite_failure_after_operation_insert_rolls_back_entire_admission() {
     req.lifecycle_id = Some(app.lifecycle_id.clone());
     req.metadata = Some(shared_types::UserAppMetadataPatch {
         app_id: app.app_id.clone(),
-        user_id: app.user_id.clone(),
         lifecycle_id: app.lifecycle_id.clone(),
         expected_revision: app.metadata_revision,
         name: Some(Some("must-not-commit".into())),
@@ -220,22 +211,12 @@ async fn request_identity_spans_recreation_and_control(store: &dyn UserAppLifecy
     complete(store, &op, State::Succeeded).await;
     assert!(matches!(
         store
-            .recreate(
-                &deletion.app_id,
-                "owner",
-                &op.lifecycle_id,
-                "request-space-delete"
-            )
+            .recreate(&deletion.app_id, &op.lifecycle_id, "request-space-delete")
             .await,
         Err(Error::InvalidOperation(_))
     ));
     let recreated = store
-        .recreate(
-            &deletion.app_id,
-            "owner",
-            &op.lifecycle_id,
-            "request-space-recreate",
-        )
+        .recreate(&deletion.app_id, &op.lifecycle_id, "request-space-recreate")
         .await
         .unwrap();
     let mut changed = request("request-space-start", Kind::Start);
@@ -256,12 +237,7 @@ async fn request_identity_spans_recreation_and_control(store: &dyn UserAppLifecy
     );
     assert_eq!(
         store
-            .recreate(
-                &deletion.app_id,
-                "owner",
-                &op.lifecycle_id,
-                "request-space-recreate"
-            )
+            .recreate(&deletion.app_id, &op.lifecycle_id, "request-space-recreate")
             .await
             .unwrap(),
         recreated
@@ -284,7 +260,6 @@ async fn paginated_scan_and_import_contract(store: &dyn UserAppLifecycleStore) {
     let old = shared_types::AppMetadataRecord {
         app_id: "import-contract".into(),
         generation: "legacy-generation".into(),
-        user_id: Some("owner".into()),
         name: Some("original".into()),
         tenant_id: Some("tenant".into()),
         space_id: None,
@@ -294,32 +269,6 @@ async fn paginated_scan_and_import_contract(store: &dyn UserAppLifecycleStore) {
     assert_eq!(imported.created_at, old.created_at);
     assert_eq!(imported.name, old.name);
     assert_eq!(imported, store.import_application(&old).await.unwrap());
-    assert!(matches!(
-        store
-            .import_application(&shared_types::AppMetadataRecord {
-                user_id: Some("intruder".into()),
-                ..old.clone()
-            })
-            .await,
-        Err(Error::OwnershipConflict)
-    ));
-    assert!(
-        store
-            .import_application(&shared_types::AppMetadataRecord {
-                app_id: "owner-missing".into(),
-                user_id: None,
-                ..old.clone()
-            })
-            .await
-            .is_err()
-    );
-    assert!(
-        store
-            .get_application("owner-missing")
-            .await
-            .unwrap()
-            .is_none()
-    );
     let mut delete = request("import-delete", Kind::DeleteApplication);
     delete.app_id = old.app_id.clone();
     let op = operation(store.admit(&delete).await.unwrap());
@@ -381,7 +330,7 @@ async fn sqlite_paginated_recovery_and_legacy_import() {
 
 async fn control_command_is_durable_and_part_of_deduplication(store: &dyn UserAppLifecycleStore) {
     store
-        .ensure_identity("control-command", "owner")
+        .ensure_identity("control-command")
         .await
         .expect("identity");
     let mut input = request("control-command-start", Kind::Start);
@@ -445,10 +394,7 @@ async fn runtime_policy_commits_only_with_success(store: &dyn UserAppLifecycleSt
         ("unknown", State::RecoveryRequired),
     ] {
         let app_id = format!("policy-{label}");
-        let before = store
-            .ensure_identity(&app_id, "owner")
-            .await
-            .expect("identity");
+        let before = store.ensure_identity(&app_id).await.expect("identity");
         let policy = shared_types::UserAppRuntimePolicy {
             recycle_enabled: Some(false),
             idle_timeout_seconds: Some(0),
@@ -501,7 +447,7 @@ async fn runtime_policy_commits_only_with_success(store: &dyn UserAppLifecycleSt
             )
             .await;
             let recreated = store
-                .recreate(&app_id, "owner", &before.lifecycle_id, "policy-recreate")
+                .recreate(&app_id, &before.lifecycle_id, "policy-recreate")
                 .await
                 .expect("recreate");
             assert_eq!(
@@ -523,10 +469,7 @@ async fn configuration_policy_is_transactional(store: &dyn UserAppLifecycleStore
             ("unknown", State::RecoveryRequired),
         ] {
             let app_id = format!("config-policy-{kind_label}-{label}");
-            store
-                .ensure_identity(&app_id, "owner")
-                .await
-                .expect("identity");
+            store.ensure_identity(&app_id).await.expect("identity");
             let original = shared_types::UserAppRuntimePolicy {
                 recycle_enabled: Some(false),
                 idle_timeout_seconds: Some(600),
@@ -606,7 +549,7 @@ async fn configuration_policy_is_transactional(store: &dyn UserAppLifecycleStore
     let mut invalid = request("policy-wrong-kind", Kind::EnsureBuilder);
     invalid.app_id = "config-policy-wrong-kind".into();
     store
-        .ensure_identity(&invalid.app_id, "owner")
+        .ensure_identity(&invalid.app_id)
         .await
         .expect("identity");
     invalid.runtime_policy_on_success = Some(Default::default());
@@ -633,10 +576,7 @@ async fn sqlite_instance_directory_is_exclusive_and_restart_preserves_data() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("userapp.sqlite3");
     let first = SqliteUserAppStore::open_exclusive(&path).await.unwrap();
-    let before = first
-        .ensure_identity("persistent-app", "owner")
-        .await
-        .unwrap();
+    let before = first.ensure_identity("persistent-app").await.unwrap();
     assert!(SqliteUserAppStore::open_exclusive(&path).await.is_err());
     // A second database filename cannot hide sharing the same instance directory.
     assert!(
@@ -670,7 +610,7 @@ async fn sqlite_directory_alias_uses_the_same_instance_lock() {
         .await
         .expect("first instance");
     let before = first
-        .ensure_identity("directory-alias", "owner")
+        .ensure_identity("directory-alias")
         .await
         .expect("identity");
     assert!(
@@ -704,10 +644,7 @@ async fn sqlite_database_file_alias_cannot_bypass_directory_ownership() {
     let first = SqliteUserAppStore::open_exclusive(&path)
         .await
         .expect("first instance");
-    let identity = first
-        .ensure_identity("file-alias", "owner")
-        .await
-        .expect("identity");
+    let identity = first.ensure_identity("file-alias").await.expect("identity");
     for hard_link in [false, true] {
         let alias_directory = root
             .path()
@@ -785,30 +722,17 @@ async fn sqlite_failed_initialization_releases_the_instance_lock() {
         .await
         .expect("lock released after initialization error");
     repaired
-        .ensure_identity("repaired", "owner")
+        .ensure_identity("repaired")
         .await
         .expect("durable write");
     repaired.close().await;
 }
 
 #[tokio::test]
-async fn same_owner_registration_is_noop_and_other_owner_is_rejected() {
+async fn repeated_registration_is_an_idempotent_noop() {
     let (_directory, store) = database().await;
-    let first = store
-        .ensure_identity("contract-app", "owner")
-        .await
-        .unwrap();
-    assert_eq!(
-        first,
-        store
-            .ensure_identity("contract-app", "owner")
-            .await
-            .unwrap()
-    );
-    assert!(matches!(
-        store.ensure_identity("contract-app", "other").await,
-        Err(Error::OwnershipConflict)
-    ));
+    let first = store.ensure_identity("contract-app").await.unwrap();
+    assert_eq!(first, store.ensure_identity("contract-app").await.unwrap());
 }
 
 #[tokio::test]
@@ -884,16 +808,16 @@ async fn deletion_and_recreation_fence_late_unqualified_requests() {
         UserAppLifecycleState::Deleting
     );
     assert!(matches!(
-        store.ensure_identity("contract-app", "owner").await,
+        store.ensure_identity("contract-app").await,
         Err(Error::LifecycleConflict)
     ));
     complete(&store, &op, State::Succeeded).await;
     assert!(matches!(
-        store.ensure_identity("contract-app", "owner").await,
+        store.ensure_identity("contract-app").await,
         Err(Error::LifecycleConflict)
     ));
     let new = store
-        .recreate("contract-app", "owner", &op.lifecycle_id, "recreate-1")
+        .recreate("contract-app", &op.lifecycle_id, "recreate-1")
         .await
         .unwrap();
     assert_eq!(new.lifecycle_epoch, 2);
@@ -901,7 +825,7 @@ async fn deletion_and_recreation_fence_late_unqualified_requests() {
     assert_eq!(
         new,
         store
-            .recreate("contract-app", "owner", &op.lifecycle_id, "recreate-1")
+            .recreate("contract-app", &op.lifecycle_id, "recreate-1")
             .await
             .unwrap()
     );
@@ -1021,13 +945,9 @@ async fn joined_request_identity_remains_idempotent_after_completion() {
 #[tokio::test]
 async fn metadata_cas_preserves_unmentioned_fields_and_noop_revision() {
     let (_directory, store) = database().await;
-    let app = store
-        .ensure_identity("contract-app", "owner")
-        .await
-        .unwrap();
+    let app = store.ensure_identity("contract-app").await.unwrap();
     let patch = shared_types::UserAppMetadataPatch {
         app_id: app.app_id,
-        user_id: app.user_id,
         lifecycle_id: app.lifecycle_id,
         expected_revision: 1,
         name: Some(Some("A".into())),
@@ -1089,7 +1009,6 @@ async fn postgres_real_transactions_and_restart_contract() {
         let old = shared_types::AppMetadataRecord {
             app_id: "legacy-pg-app".into(),
             generation: "legacy-pg-generation".into(),
-            user_id: Some("owner".into()),
             name: Some("original name".into()),
             tenant_id: None,
             space_id: None,
@@ -1133,17 +1052,8 @@ async fn postgres_real_transactions_and_restart_contract() {
         configuration_policy_is_transactional(&store).await;
         deletion_success_requires_committed_evidence(&store).await;
         control_snapshot_links_identity_and_operation(&store).await;
-        let a = store
-            .ensure_identity("contract-app", "owner")
-            .await
-            .unwrap();
-        assert_eq!(
-            a,
-            store
-                .ensure_identity("contract-app", "owner")
-                .await
-                .unwrap()
-        );
+        let a = store.ensure_identity("contract-app").await.unwrap();
+        assert_eq!(a, store.ensure_identity("contract-app").await.unwrap());
         let first = request("first", Kind::EnsureBuilder);
         let second = request("second", Kind::EnsureBuilder);
         let (a, b) = tokio::join!(store.admit(&first), store.admit(&second));
@@ -1178,7 +1088,7 @@ async fn postgres_real_transactions_and_restart_contract() {
         );
         complete(&store, &deletion, State::Succeeded).await;
         let next = store
-            .recreate("contract-app", "owner", &op.lifecycle_id, "recreation")
+            .recreate("contract-app", &op.lifecycle_id, "recreation")
             .await
             .unwrap();
         assert_eq!(next.lifecycle_epoch, 2);
@@ -1236,10 +1146,7 @@ async fn postgres_real_transactions_and_restart_contract() {
 
 async fn control_snapshot_links_identity_and_operation(store: &dyn UserAppLifecycleStore) {
     for app_id in ["snapshot-contract-a", "snapshot-contract-b"] {
-        store
-            .ensure_identity(app_id, "owner")
-            .await
-            .expect("identity");
+        store.ensure_identity(app_id).await.expect("identity");
     }
     assert!(store.list_control_snapshots(None, 0).await.is_err());
     let before = store
@@ -1290,7 +1197,7 @@ async fn sqlite_control_snapshot_contract() {
 async fn sqlite_control_snapshot_rejects_broken_operation_link() {
     let (directory, store) = database().await;
     let mut identity = store
-        .ensure_identity("snapshot-corrupt", "owner")
+        .ensure_identity("snapshot-corrupt")
         .await
         .expect("identity");
     identity.current_operation_id = Some("missing-operation".into());
@@ -1347,7 +1254,6 @@ async fn deletion_success_requires_committed_evidence(store: &dyn UserAppLifecyc
         kind: Kind::DeleteApplication,
         context: shared_types::UserAppExecutionContext {
             app_id: input.app_id.clone(),
-            user_id: "owner".into(),
             lifecycle_id: running.lifecycle_id.clone(),
             operation_id: running.operation_id.clone(),
             executor_id: "worker-A".into(),
@@ -1445,11 +1351,10 @@ async fn complete(store: &dyn UserAppLifecycleStore, op: &UserAppOperationRecord
     }
     let mut running = store.advance(&claim).await.unwrap();
     if storage && state == State::Succeeded {
-        let identity = store.get_application(&op.app_id).await.unwrap().unwrap();
+        let _identity = store.get_application(&op.app_id).await.unwrap().unwrap();
         let evidence = shared_types::UserAppStorageDestruction {
             context: shared_types::UserAppExecutionContext {
                 app_id: op.app_id.clone(),
-                user_id: identity.user_id,
                 lifecycle_id: op.lifecycle_id.clone(),
                 operation_id: op.operation_id.clone(),
                 executor_id: "worker-A".into(),
@@ -1498,14 +1403,13 @@ async fn complete(store: &dyn UserAppLifecycleStore, op: &UserAppOperationRecord
     }
     if deletion && state == State::Succeeded {
         use shared_types::{UserAppDeletionCheckpoint, UserAppDeletionStage as Stage};
-        let identity = store.get_application(&op.app_id).await.unwrap().unwrap();
+        let _identity = store.get_application(&op.app_id).await.unwrap().unwrap();
         let mut checkpoint = UserAppDeletionCheckpoint {
             schema_version: 1,
             stage: Stage::Captured,
             kind: op.kind,
             context: shared_types::UserAppExecutionContext {
                 app_id: op.app_id.clone(),
-                user_id: identity.user_id,
                 lifecycle_id: op.lifecycle_id.clone(),
                 operation_id: op.operation_id.clone(),
                 executor_id: "worker-A".into(),
@@ -1645,7 +1549,6 @@ async fn private_execution_input_contract(store: &dyn UserAppLifecycleStore) {
     );
     let context = shared_types::UserAppExecutionContext {
         app_id: op.app_id.clone(),
-        user_id: req.user_id.clone(),
         lifecycle_id: op.lifecycle_id.clone(),
         operation_id: op.operation_id.clone(),
         executor_id: "worker-A".into(),
@@ -1701,12 +1604,11 @@ async fn sqlite_private_execution_input_contract() {
 
 async fn physical_binding_is_atomic_and_cannot_cross_lifecycles(store: &dyn UserAppLifecycleStore) {
     let app = store
-        .ensure_identity("binding-app", "owner")
+        .ensure_identity("binding-app")
         .await
         .expect("identity");
     let input = shared_types::UserAppExecutionInput::new(
         serde_json::to_string(&shared_types::AdoptBuilderRequest {
-            user_id: "owner".into(),
             lifecycle_id: app.lifecycle_id.clone(),
             request_id: "binding-adopt".into(),
             expected_container_id: "physical-original".into(),
@@ -1732,7 +1634,6 @@ async fn physical_binding_is_atomic_and_cannot_cross_lifecycles(store: &dyn User
         .expect("claim");
     let binding = shared_types::UserAppResourceBinding {
         app_id: app.app_id.clone(),
-        user_id: app.user_id.clone(),
         lifecycle_id: app.lifecycle_id.clone(),
         service_type: shared_types::ServiceType::UserappBuilder,
         physical_uid: "physical-original".into(),
@@ -1791,17 +1692,11 @@ async fn physical_binding_is_atomic_and_cannot_cross_lifecycles(store: &dyn User
     let deletion = operation(store.admit(&deletion).await.expect("delete admission"));
     complete(store, &deletion, State::Succeeded).await;
     let next = store
-        .recreate(
-            &app.app_id,
-            &app.user_id,
-            &app.lifecycle_id,
-            "binding-recreate",
-        )
+        .recreate(&app.app_id, &app.lifecycle_id, "binding-recreate")
         .await
         .expect("recreate");
     let input = shared_types::UserAppExecutionInput::new(
         serde_json::to_string(&shared_types::AdoptBuilderRequest {
-            user_id: "owner".into(),
             lifecycle_id: next.lifecycle_id.clone(),
             request_id: "replacement-adopt".into(),
             expected_container_id: binding.physical_uid.clone(),
@@ -1884,7 +1779,6 @@ async fn operation_lease_contract(store: &dyn UserAppLifecycleStore) {
             .unwrap();
         let context = shared_types::UserAppExecutionContext {
             app_id: running.app_id.clone(),
-            user_id: req.user_id.clone(),
             lifecycle_id: running.lifecycle_id.clone(),
             operation_id: running.operation_id.clone(),
             executor_id: "worker-A".into(),

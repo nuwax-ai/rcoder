@@ -13,7 +13,7 @@ use tracing::{info, instrument};
 use shared_types::{AppError, HttpResult};
 
 use super::state::AppManagerState;
-use crate::models::{HealthInfo, OwnerParams, ResourceStats};
+use crate::models::{HealthInfo, ResourceStats};
 
 /// 获取应用健康状态（由运行时状态派生）
 #[utoipa::path(
@@ -22,7 +22,6 @@ use crate::models::{HealthInfo, OwnerParams, ResourceStats};
     params(
         ("app_id" = String, Path, description = "应用 ID"),
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）；`prod`=运行容器（Userapp）"),
-        OwnerParams,
     ),
     description = r#"
 轻量探活面，返回运行时状态派生的健康快照（`HealthInfo`），适合轮询面板 /
@@ -42,11 +41,7 @@ use crate::models::{HealthInfo, OwnerParams, ResourceStats};
 pub async fn get_app_health(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, app_stage)): Path<(String, String)>,
-    Query(owner): Query<OwnerParams>,
 ) -> Result<Json<HttpResult<HealthInfo>>, AppError> {
-    owner
-        .validate()
-        .map_err(shared_types::garde_err_to_app_error)?;
     let app_stage = super::parse_app_stage_param(&app_stage)?;
     info!(
         "[APP] getting app health: {} app_stage={}",
@@ -116,7 +111,6 @@ pub async fn get_app_stats(
     params(
         ("app_id" = String, Path, description = "应用 ID"),
         ("app_stage" = String, Path, description = "目标环境：仅支持 `prod`（运行容器 K8s Events）"),
-        OwnerParams,
     ),
     description = r#"
 查运行容器的 Kubernetes Events（Pod 调度 / 拉取 / 启动 / 崩溃事件），用于
@@ -133,20 +127,13 @@ pub async fn get_app_stats(
 pub async fn get_app_events(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, app_stage)): Path<(String, String)>,
-    Query(owner): Query<OwnerParams>,
 ) -> Result<Json<HttpResult<Vec<container_runtime_api::AppEventInfo>>>, AppError> {
     if shared_types::UserappStage::parse(&app_stage) != Some(shared_types::UserappStage::Prod) {
         return Err(AppError::validation_error(
             "`events` is a prod-runtime capability: pass app_stage=prod (dev environment has no k8s events)",
         ));
     }
-    owner
-        .validate()
-        .map_err(shared_types::garde_err_to_app_error)?;
-    info!(
-        "[APP] getting app events: {} (user_id={})",
-        app_id, owner.user_id
-    );
+    info!("[APP] getting app events: {}", app_id);
     let events = state.app_service.get_app_events(&app_id).await?;
     Ok(Json(HttpResult::success(events)))
 }

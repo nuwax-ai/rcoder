@@ -211,6 +211,7 @@ async fn probe_vnc_via_grpc(
     state: &AppState,
     locale: &'static str,
     target: VncProbeTarget<'_>,
+    user_id: Option<&str>,
     project_id: Option<&str>,
     log_ctx: &str,
 ) -> Result<HttpResult<VncStatusResponse>, AppError> {
@@ -226,6 +227,7 @@ async fn probe_vnc_via_grpc(
         Ok(mut client) => {
             let grpc_request = crate::grpc::new_request_with_locale(
                 shared_types::grpc::GetVncStatusRequest {
+                    user_id: user_id.map(String::from),
                     project_id: project_id.map(String::from),
                 },
                 locale,

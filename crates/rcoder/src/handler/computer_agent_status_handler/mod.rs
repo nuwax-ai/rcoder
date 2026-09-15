@@ -283,6 +283,7 @@ pub async fn computer_agent_status(
     // 6. Agent 存活，从 存储 获取完整信息
     let response = if let Some(project_info) = state.get_project(project_id) {
         ComputerAgentStatusResponse {
+            user_id: request.user_id.clone(),
             project_id: project_id.to_string(),
             is_alive: true,
             session_id: project_info.session_id().map(|s| s.to_string()),
@@ -339,6 +340,7 @@ pub async fn computer_agent_status(
         }
 
         ComputerAgentStatusResponse {
+            user_id: request.user_id.clone(),
             project_id: project_id.to_string(),
             is_alive: true,
             session_id: None, // 恢复时暂时无法获知 session_id

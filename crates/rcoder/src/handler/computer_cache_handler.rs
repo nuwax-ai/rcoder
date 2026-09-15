@@ -204,6 +204,7 @@ pub async fn computer_cache_clean(
     );
 
     Ok(HttpResult::success(CacheCleanResponse {
+        user_id: user_id.to_string(),
         deleted_entries: deleted,
     }))
 }
@@ -243,37 +244,16 @@ async fn clean_cache_dir(cache_dir: &Path) -> std::io::Result<u64> {
 /// userApp dev 分派：清 app 开发工作区的 `.cache`（app 项目自身的构建缓存，
 /// 如 vite/webpack 输出）。
 ///
-/// 目标路径 = `{USERAPP_WORKSPACE_ROOT}/dev/{user_id}/{app_id}/.cache`（dev 四
-/// 目录中工作区段的隐藏缓存目录）。实例定位解析与 ensure_userapp_builder 同源
-/// （显式 user_id = 实例定位者，缺失回落 metadata owner，绝不兜底 app_id——
-/// 防宿主树挂错位置不可回收）；user 过 identifier 白名单（防路径穿越）。
+/// 目标路径 = `{USERAPP_WORKSPACE_ROOT}/dev/userapp/{app_id}/.cache`（dev 固定
+/// 命名空间下工作区段的隐藏缓存目录）。应用共享：按 app_id 定位，无用户维度。
 async fn cache_clean_userapp_dev(
-    state: &AppState,
+    _state: &AppState,
     app_id: &str,
     request: &CacheCleanRequest,
 ) -> Result<HttpResult<CacheCleanResponse>, AppError> {
-    // 实例归属解析：显式 user_id > metadata（get_app_owner）> fail-fast
-    let metadata_owner = state.app_service.get_app_owner(app_id).await?;
-    let owner = crate::userapp_builder::resolve_dev_target(
-        request.user_id.as_deref(),
-        metadata_owner.as_deref(),
-    )
-    .map_err(|e| {
-        warn!("[CACHE_CLEAN][USERAPP] cannot resolve instance user: app_id={app_id}: {e}");
-        AppError::with_message(
-            ERR_VALIDATION,
-            "cannot resolve owner user_id for app; pass user_id explicitly",
-        )
-    })?
-    .instance_user;
-    shared_types::validate_identifier(&owner, "user_id").map_err(|e| {
-        warn!("[CACHE_CLEAN][USERAPP] rejected: invalid owner={owner}: {e}");
-        AppError::with_message(ERR_VALIDATION, e.to_string())
-    })?;
-
     let cache_dir = Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
         .join("dev")
-        .join(&owner)
+        .join(shared_types::paths::USERAPP_STORAGE_NAMESPACE)
         .join(app_id)
         .join(".cache");
 
@@ -281,10 +261,12 @@ async fn cache_clean_userapp_dev(
     let deleted = clean_cache_dir(&cache_dir).await?;
 
     info!(
-        "[CACHE_CLEAN][USERAPP] cleaned app dev workspace cache: app_id={app_id}, owner={owner}, deleted_entries={deleted}",
+        "[CACHE_CLEAN][USERAPP] cleaned app dev workspace cache: app_id={app_id}, deleted_entries={deleted}",
     );
 
+    // 共享 Computer 契约的回显字段；userApp 无用户绑定，仅回显调用方入参
     Ok(HttpResult::success(CacheCleanResponse {
+        user_id: request.user_id.clone().unwrap_or_default(),
         deleted_entries: deleted,
     }))
 }

@@ -642,7 +642,6 @@ mod tests {
     fn builder_reuse_requires_lifecycle_configuration_and_template_identity() {
         let context = shared_types::UserAppExecutionContext {
             app_id: "app-one".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life-one".into(),
             operation_id: "operation-one".into(),
             executor_id: "executor-one".into(),

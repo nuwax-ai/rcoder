@@ -212,9 +212,6 @@ pub struct DeleteAppRequest {
     #[garde(skip)]
     #[serde(default)]
     pub purge: Option<bool>,
-    /// 宿主机数据卷分区归属目录名（必填；标识符白名单校验）——purge 时按
-    /// `prod/{user_id}/data/{app_id}` 精确定位宿主目录；缺省回退
-    /// userapp_metadata.owner 的兜底路径退役。
     /// 乐观锁：传入 `GET /apps/{id}` 返回的 `resource_version`；不匹配 → 409 ERR_CONFLICT。
     /// 不传 = 不校验（向后兼容）。Docker 模式忽略。
     #[garde(skip)]
@@ -222,10 +219,10 @@ pub struct DeleteAppRequest {
     pub expected_resource_version: Option<String>,
 }
 
-/// Full deletion retains the lifecycle tombstone and requires the registered owner.
+/// Full deletion retains the lifecycle tombstone.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct PurgeAppRequest {
-    /// Registered application owner.
+    /// Previous lifecycle token.
     /// Required after an explicit lifecycle recreation.
     #[serde(default)]
     #[garde(skip)]

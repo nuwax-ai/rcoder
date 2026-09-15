@@ -41,7 +41,6 @@ fn request() -> UserAppAdmission {
             expected_resource_version: None,
         }),
         app_id: "native-crash-app".into(),
-        user_id: "owner".into(),
         lifecycle_id: None,
         operation_id: "native-delete-operation".into(),
         request_id: Some("native-delete-request".into()),
@@ -69,9 +68,7 @@ fn progress(
 }
 async fn execute(root: &Path, store: &SqliteUserAppStore) -> Result<()> {
     let intent = request();
-    let identity = store
-        .ensure_identity(&intent.app_id, &intent.user_id)
-        .await?;
+    let identity = store.ensure_identity(&intent.app_id).await?;
     let UserAppAdmissionOutcome::Accepted(operation) = store.admit(&intent).await? else {
         bail!("native worker must start with a new admission");
     };
@@ -97,7 +94,6 @@ async fn execute(root: &Path, store: &SqliteUserAppStore) -> Result<()> {
         kind: intent.kind,
         context: shared_types::UserAppExecutionContext {
             app_id: intent.app_id.clone(),
-            user_id: identity.user_id,
             lifecycle_id: identity.lifecycle_id,
             operation_id: operation.operation_id.clone(),
             executor_id: "native-worker".into(),

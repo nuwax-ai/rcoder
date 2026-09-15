@@ -344,13 +344,10 @@ mod tests {
             result.unwrap().runtime.status,
             crate::models::AppStatus::Running
         );
-        // owner 落 metadata：后续 Docker 数据卷分区（prod/{user}/data/{app}）依据
+        // 用户绑定已移除：无 owner 可解析（dev 资源按固定命名空间定位）
         assert_eq!(
-            svc.get_app_owner("appempty1")
-                .await
-                .expect("owner query")
-                .as_deref(),
-            Some("u-empty")
+            svc.get_app_owner("appempty1").await.expect("owner query"),
+            None
         );
         // Exactly one creation carries platform ports, business env and tokens;
         // no deployment identity is injected for an empty application.

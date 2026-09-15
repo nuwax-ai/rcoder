@@ -5,7 +5,7 @@ use std::sync::{Arc, Weak};
 
 use shared_types::ServiceType;
 
-use super::{dev_file_server_addr, ensure_userapp_builder_probed, resolve_dev_target};
+use super::{dev_file_server_addr, ensure_userapp_builder_probed};
 use crate::router::AppState;
 
 /// Weak 挂接 [`AppState`]——注入发生在 `AppState` Arc 包装后；Weak 防与
@@ -24,36 +24,15 @@ impl UserappDevLocator {
             .upgrade()
             .ok_or_else(|| "app state already dropped".to_string())
     }
-
-    /// 复合定位键：显式 user_id（实例定位者）优先，缺失回落 metadata owner。
-    /// 双缺（app 无 identity 且无显式）返回 Err——调用方按"无容器"处理。
-    async fn instance_key(
-        state: &AppState,
-        app_id: &str,
-    ) -> Result<String, String> {
-        let owner = state
-            .app_service
-            .get_app_owner(app_id)
-            .await
-            .map_err(|e| format!("resolve app owner (app {app_id}): {e:#}"))?;
-        let target = resolve_dev_target(user_id, owner.as_deref())
-            .map_err(|e| format!("resolve dev instance (app {app_id}): {e:#}"))?;
-        target
-            .instance_id(app_id)
-            .map_err(|e| format!("compose builder instance id (app {app_id}): {e}"))
-    }
 }
 
 #[async_trait::async_trait]
 impl shared_types::UserappDevLocator for UserappDevLocator {
-    async fn dev_file_server_addr(
-        &self,
-        app_id: &str,
-    ) -> Result<String, String> {
+    async fn dev_file_server_addr(&self, app_id: &str) -> Result<String, String> {
         let state = self.state()?;
         // 低频管理面语义：先探活再返回（注册表命中死容器时自愈重建），
         // 与 pod ensure/keepalive 同款；热路径转发层不走这里（自有 30s 探活缓存）。
-        let (info, created) = ensure_userapp_builder_probed(&state, app_id, user_id)
+        let (info, created) = ensure_userapp_builder_probed(&state, app_id)
             .await
             .map_err(|e| format!("ensure UserappBuilder (app {app_id}): {e:#}"))?;
         if created {
@@ -62,15 +41,11 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
         Ok(dev_file_server_addr(&state, &info))
     }
 
-    async fn dev_container_alive(
-        &self,
-        app_id: &str,
-    ) -> Result<bool, String> {
+    async fn dev_container_alive(&self, app_id: &str) -> Result<bool, String> {
         let state = self.state()?;
-        let instance = Self::instance_key(&state, app_id, user_id).await?;
         state
             .runtime()
-            .find_container(&instance, &ServiceType::UserappBuilder)
+            .find_container(app_id, &ServiceType::UserappBuilder)
             .await
             .map(|found| found.is_some())
             .map_err(|e| format!("find UserappBuilder (app {app_id}): {e}"))
@@ -78,29 +53,26 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
 }
 
 /// 终端代理（rcoder-proxy）的 dev 容器懒启动回调：容器不在时自动 ensure
-/// 创建（路由路径 `{user_id}/{app_id}` 双段携带实例定位者）。
+/// 创建。应用共享：按 app_id 定位（URL 用户占位段不参与）。
 #[async_trait::async_trait]
 impl shared_types::UserappDevEnsure for UserappDevLocator {
-    async fn dev_builder_exists(
-        &self,
-        app_id: &str,
-    ) -> Result<bool, String> {
-        // 与 dev_container_alive 同一类型化事实源：find_container 按复合
-        // 身份键匹配——容器被删/被他人 IP 复用时恒 false。
-        shared_types::UserappDevLocator::dev_container_alive(self, app_id, user_id).await
-    }
-
     async fn ensure_dev_container(
         &self,
         app_id: &str,
     ) -> Result<shared_types::ContainerBasicInfo, String> {
         let state = self.state()?;
-        let (info, created) = ensure_userapp_builder_probed(&state, app_id, user_id)
+        let (info, created) = ensure_userapp_builder_probed(&state, app_id)
             .await
             .map_err(|e| format!("ensure UserappBuilder (app {app_id}): {e:#}"))?;
         if created {
             tracing::info!("[USERAPP_DEV_LOCATOR] builder ensured on demand: app_id={app_id}");
         }
         Ok(info)
+    }
+
+    async fn dev_builder_exists(&self, app_id: &str) -> Result<bool, String> {
+        // 与 dev_container_alive 同一类型化事实源：find_container 按身份键
+        // 匹配——容器被删/被他人 IP 复用时恒 false。
+        shared_types::UserappDevLocator::dev_container_alive(self, app_id).await
     }
 }

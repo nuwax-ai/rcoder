@@ -100,23 +100,19 @@ pub async fn stop_app(
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
     let Query(mut request) = request
         .map_err(|_| AppError::validation_error("Valid stop query parameters are required"))?;
-    shared_types::validate_identifier(&String::new(), "user_id")
-        .map_err(|_| AppError::validation_error("Invalid user_id query parameter"))?;
     let request_id = request
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone();
-    let owner = String::new();
-    info!("[APP] stopping app: {} (user_id={})", app_id, owner);
+    info!("[APP] stopping app: {}", app_id);
     let result = state
         .app_service
         .stop_app_controlled(&app_id, request)
         .await;
-    let runtime =
-        super::control::control_result(&state, &app_id, &owner, &request_id, result).await?;
+    let runtime = super::control::control_result(&state, &app_id, &request_id, result).await?;
     let operation = state
         .app_service
-        .get_control_operation_by_request(&app_id, &owner, &request_id)
+        .get_control_operation_by_request(&app_id, &request_id)
         .await?
         .ok_or_else(|| {
             AppError::internal_server_error("Stop completed without a durable operation record")
@@ -226,19 +222,18 @@ pub async fn set_recycle_policy(
         .map_err(shared_types::garde_err_to_app_error)?;
     info!(
         "[APP] setting recycle policy: {} (user_id={})",
-        app_id, String::new()
+        app_id,
+        String::new()
     );
     let request_id = request
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone();
-    let owner = String::new();
     let result = state.app_service.set_recycle_policy(&app_id, request).await;
-    let runtime =
-        super::control::control_result(&state, &app_id, &owner, &request_id, result).await?;
+    let runtime = super::control::control_result(&state, &app_id, &request_id, result).await?;
     let operation = state
         .app_service
-        .get_control_operation_by_request(&app_id, &owner, &request_id)
+        .get_control_operation_by_request(&app_id, &request_id)
         .await?
         .ok_or_else(|| {
             AppError::internal_server_error("Policy completed without a durable operation record")
@@ -253,7 +248,7 @@ pub async fn set_recycle_policy(
 async fn correlate_deployment_response<T>(
     state: &AppManagerState,
     app_id: &str,
-    owner: &str,
+    _owner: &str,
     request_id: &str,
     result: Result<T, AppError>,
 ) -> Result<T, AppError> {
@@ -265,7 +260,7 @@ async fn correlate_deployment_response<T>(
         std::time::Duration::from_secs(5),
         state
             .app_service
-            .get_control_operation_by_request(app_id, owner, request_id),
+            .get_control_operation_by_request(app_id, request_id),
     )
     .await
     {

@@ -113,6 +113,7 @@ pub(super) async fn confirm_container_removed(
 /// 届时只需在本函数内决定 key 策略,调用方签名不变(开放-封闭)。
 pub(super) fn register_vnc_backend(
     state: &AppState,
+    user_id: &str,
     container_info: &ContainerBasicInfo,
     service_type: &ServiceType,
 ) {
@@ -278,6 +279,7 @@ pub(super) fn parse_service_type(raw: Option<&str>) -> Result<ServiceType, Strin
 /// 容器标识符字符串
 pub(super) fn container_identifier_for_service(
     service_type: &ServiceType,
+    user_id: &str,
     project_id: &str,
     pod_id: Option<&str>,
 ) -> Result<String, AppError> {
@@ -501,28 +503,10 @@ pub(crate) async fn resolve_userapp_dev_container(
     app_id: &str,
     log_tag: &str,
 ) -> Result<Option<ContainerBasicInfo>, AppError> {
-    let metadata_owner = state
-        .app_service
-        .get_app_owner(app_id)
-        .await
-        .map_err(|error| {
-            AppError::internal_server_error(&format!("Resolve app owner: {error:#}"))
-        })?;
-    let instance =
-        match crate::userapp_builder::resolve_dev_target(user_id, metadata_owner.as_deref()) {
-            Ok(target) => target.instance_id(app_id).map_err(|error| {
-                AppError::internal_server_error(&format!("Compose builder instance id: {error}"))
-            })?,
-            Err(_) => {
-                info!("📭 [{log_tag}] no dev instance user resolvable: app_id={app_id}");
-                return Ok(None);
-            }
-        };
-    if let Some(info) = state
-        .get_project(&instance)
-        .and_then(|p| p.container_info())
-    {
-        return crate::userapp_builder::cross_verify_registration(state, app_id, &instance, &info)
+    // 应用共享：builder identifier == 纯 app_id
+    let instance = app_id;
+    if let Some(info) = state.get_project(instance).and_then(|p| p.container_info()) {
+        return crate::userapp_builder::cross_verify_registration(state, app_id, instance, &info)
             .await
             .map_err(|error| {
                 AppError::internal_server_error(&format!("Verify builder identity: {error:#}"))
@@ -530,7 +514,7 @@ pub(crate) async fn resolve_userapp_dev_container(
     }
     match state
         .runtime()
-        .get_container_info_by_identifier(&instance, &ServiceType::UserappBuilder)
+        .get_container_info_by_identifier(instance, &ServiceType::UserappBuilder)
         .await
     {
         Ok(info) => {
@@ -564,6 +548,7 @@ pub(crate) fn agent_prod_unsupported<T>(locale: &'static str) -> HttpResult<T> {
 /// restart 四处原为 15 行×4 逐字重复，仅日志 tag 不同）。
 /// 返回 Some(错误信封) 时调用方直接 `return Ok(resp)`；T 由响应类型推断。
 pub(crate) fn validate_pod_ids<T>(
+    user_id: &str,
     project_id: &str,
     locale: &'static str,
     log_tag: &str,

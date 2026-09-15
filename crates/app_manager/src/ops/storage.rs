@@ -142,9 +142,8 @@ impl crate::service::AppService {
     /// [`shared_types::paths::userapp_prod_subpaths`]）。owner user_id 查元数据，
     /// Missing ownership is an error; never derive a destructive path from app_id as user_id.
     async fn app_prod_dirs(&self, app_id: &str) -> AppResult<[std::path::PathBuf; 4]> {
-        let uid = self.app_owner_uid(app_id).await?;
         Ok(
-            shared_types::paths::userapp_prod_subpaths(&uid, app_id).map(|sub| {
+            shared_types::paths::userapp_prod_subpaths(app_id).map(|sub| {
                 std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(sub)
             }),
         )
@@ -153,24 +152,11 @@ impl crate::service::AppService {
     /// per-app dev 四目录的 rcoder 容器内锚点路径（`{锚点}/dev/{user_id}/` 下与
     /// prod 同构四段；布局单一事实源 [`shared_types::paths::userapp_dev_subpaths`]）。
     async fn app_dev_dirs(&self, app_id: &str) -> AppResult<[std::path::PathBuf; 4]> {
-        let uid = self.app_owner_uid(app_id).await?;
         Ok(
-            shared_types::paths::userapp_dev_subpaths(&uid, app_id).map(|sub| {
+            shared_types::paths::userapp_dev_subpaths(app_id).map(|sub| {
                 std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(sub)
             }),
         )
-    }
-
-    /// Resolve the stored owner; missing ownership cannot authorize storage access.
-    async fn app_owner_uid(&self, app_id: &str) -> AppResult<String> {
-        self.metadata
-            .lookup(app_id)
-            .await?
-            .and_then(|r| r.user_id)
-            .filter(|u| !u.trim().is_empty())
-            .ok_or_else(|| {
-                AppOperationError::InvalidState("Application owner is unavailable".into())
-            })
     }
 
     /// 清空应用持久存储内容（数据语义；卷对象去留按运行时能力与环境语义）。
@@ -180,11 +166,7 @@ impl crate::service::AppService {
     /// - `dev`：经开发容器 file-server 清空 workspace 内容（**留容器留卷**——
     ///   "重置开发工作区"语义；开发容器常驻，卷重建要求先销毁容器，得不偿失）。
     ///   幂等；容器内为旧镜像（无 clear 端点）时 404 上抛 Backend。
-    pub async fn clear_app_storage(
-        &self,
-        app_stage: UserappStage,
-        app_id: &str,
-    ) -> AppResult<()> {
+    pub async fn clear_app_storage(&self, app_stage: UserappStage, app_id: &str) -> AppResult<()> {
         self.clear_app_storage_controlled(
             app_stage,
             app_id,
@@ -408,13 +390,9 @@ impl crate::service::AppService {
         let guard = self.acquire_process_release_lock(app_id).await?;
         let result = async {
             self.metadata
-                .validate_request_lifecycle(
-                    app_id,
-                    &String::new(),
-                    request.lifecycle_id.as_deref(),
-                )
+                .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
                 .await?;
-            self.get_lifecycle(app_id, &String::new()).await?;
+            self.get_lifecycle(app_id).await?;
             let kind = match app_stage {
                 UserappStage::Dev => shared_types::UserAppOperationKind::ClearDevStorage,
                 UserappStage::Prod => shared_types::UserAppOperationKind::ClearProdStorage,
@@ -440,8 +418,7 @@ impl crate::service::AppService {
             // Ensure must finish before admitting clear: builder ensure has its
             // own durable operation and must not wait on the clear it is serving.
             if app_stage == UserappStage::Dev {
-                self.app_files_base(app_stage, app_id, Some(&String::new()))
-                    .await?;
+                self.app_files_base(app_stage, app_id).await?;
             }
             let operation_id = uuid::Uuid::new_v4().to_string();
             let mut operation = crate::service::OwnedOperation::admit(
@@ -465,7 +442,6 @@ impl crate::service::AppService {
             let mutation = self
                 .execute_storage_clear(
                     app_id,
-                    &String::new(),
                     app_stage == UserappStage::Prod,
                     &mut operation,
                     &guard,
@@ -542,13 +518,9 @@ impl crate::service::AppService {
         let guard = self.acquire_process_release_lock(app_id).await?;
         let result = async {
             self.metadata
-                .validate_request_lifecycle(
-                    app_id,
-                    &String::new(),
-                    request.lifecycle_id.as_deref(),
-                )
+                .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
                 .await?;
-            self.get_lifecycle(app_id, &String::new()).await?;
+            self.get_lifecycle(app_id).await?;
             let production = app_stage == UserappStage::Prod;
             let command = shared_types::UserAppControlCommand::DestroyStorage { production };
             let fingerprint = hex::encode(sha2::Sha256::digest(
@@ -588,13 +560,7 @@ impl crate::service::AppService {
             )
             .await?;
             match self
-                .execute_storage_destruction(
-                    app_id,
-                    &String::new(),
-                    production,
-                    &mut operation,
-                    &guard,
-                )
+                .execute_storage_destruction(app_id, production, &mut operation, &guard)
                 .await
             {
                 Ok(()) => {
@@ -623,7 +589,6 @@ impl crate::service::AppService {
     pub(crate) async fn execute_storage_destruction(
         &self,
         app_id: &str,
-        owner: &str,
         production: bool,
         operation: &mut crate::service::OwnedOperation,
         guard: &crate::service::AppOperationGuard,
@@ -691,12 +656,8 @@ impl crate::service::AppService {
             AppOperationError::Backend(format!("capture userapp dev deletion: {error}"))
         })?;
         let receipt = deletion.receipt();
-        // snapshot 携带 owner 实例复合 identifier（`{owner}-{app_id}`）——
-        // 归属校验按复合键的 app 段还原比对
-        let snapshot_app = shared_types::parse_builder_instance_id(&receipt.runtime.app_id)
-            .map(|(_, app)| app)
-            .unwrap_or(receipt.runtime.app_id.as_str());
-        if snapshot_app != app_id {
+        // snapshot 的 app identifier 已是纯 app_id（用户绑定移除，无复合键）
+        if receipt.runtime.app_id != app_id {
             return Err(AppOperationError::Conflict(
                 "Captured development deletion belongs to another application".into(),
             ));
@@ -711,7 +672,7 @@ impl crate::service::AppService {
     /// Full deletion ends the lifecycle only after all captured resources are removed.
     /// A failed or cancelled execution retains its durable operation for recovery.
     pub async fn purge_app(&self, app_id: &str) -> AppResult<()> {
-        let app = self
+        let _app = self
             .metadata
             .store
             .get_application(app_id)
@@ -753,7 +714,7 @@ impl crate::service::AppService {
     ) -> AppResult<()> {
         // Read identity after acquiring the operation guard; a previous lifecycle
         // must never authorize deleting resources created while this caller waited.
-        let app = self.get_lifecycle(app_id, &String::new()).await?;
+        let app = self.get_lifecycle(app_id).await?;
         if request
             .lifecycle_id
             .as_ref()
@@ -799,7 +760,7 @@ impl crate::service::AppService {
         )
         .await?;
         match self
-            .purge_app_resources(app_id, &String::new(), &mut operation, release_lock)
+            .purge_app_resources(app_id, &mut operation, release_lock)
             .await
         {
             Ok(()) => {
@@ -821,7 +782,6 @@ impl crate::service::AppService {
     pub(crate) async fn purge_app_resources(
         &self,
         app_id: &str,
-        owner: &str,
         operation: &mut crate::service::OwnedOperation,
         release_lock: &crate::service::AppOperationGuard,
     ) -> AppResult<()> {
@@ -1019,25 +979,24 @@ impl crate::service::AppService {
                 AppOperationError::Backend("Dev locator is not configured".into())
             })?;
             locator
-                .dev_container_alive(app_id, None)
+                .dev_container_alive(app_id)
                 .await
                 .map_err(AppOperationError::Backend)
         }
         let filtered: Vec<String> = entries
             .into_iter()
             .filter(|app_id| {
-                let Some(owner) = metadata.get(app_id) else {
+                let Some(record) = metadata.get(app_id) else {
                     return false;
                 };
-                if owner.user_id.as_deref() != Some(String::new().as_str())
-                    || filters
-                        .tenant_id
-                        .as_ref()
-                        .is_some_and(|tenant| owner.tenant_id.as_ref() != Some(tenant))
+                if filters
+                    .tenant_id
+                    .as_ref()
+                    .is_some_and(|tenant| record.tenant_id.as_ref() != Some(tenant))
                     || filters
                         .space_id
                         .as_ref()
-                        .is_some_and(|space| owner.space_id.as_ref() != Some(space))
+                        .is_some_and(|space| record.space_id.as_ref() != Some(space))
                 {
                     return false;
                 }
@@ -1131,7 +1090,7 @@ impl crate::service::AppService {
             .clone()
             .ok_or_else(|| AppOperationError::Backend("Dev locator is not configured".into()))?;
         Ok(!locator
-            .dev_container_alive(app_id, None)
+            .dev_container_alive(app_id)
             .await
             .map_err(AppOperationError::Backend)?)
     }
@@ -1148,18 +1107,10 @@ mod tests {
     struct StubDevLocator;
     #[async_trait::async_trait]
     impl shared_types::UserappDevLocator for StubDevLocator {
-        async fn dev_file_server_addr(
-            &self,
-            _app_id: &str,
-            _user_id: Option<&str>,
-        ) -> Result<String, String> {
+        async fn dev_file_server_addr(&self, _app_id: &str) -> Result<String, String> {
             Ok("http://127.0.0.1:60000".to_string())
         }
-        async fn dev_container_alive(
-            &self,
-            _app_id: &str,
-            _: Option<&str>,
-        ) -> Result<bool, String> {
+        async fn dev_container_alive(&self, _app_id: &str) -> Result<bool, String> {
             Ok(true)
         }
     }
@@ -1178,14 +1129,14 @@ mod tests {
         for app in ["app1", "appdev", "appprod"] {
             service
                 .metadata
-                .record(app, None, Some("u1".into()), None, None)
+                .record(app, None, None, None)
                 .await
                 .expect("owner");
         }
 
         service
             .metadata
-            .record("app1", None, Some("u1".into()), None, None)
+            .record("app1", None, None, None)
             .await
             .expect("register owner");
         service
@@ -1224,7 +1175,7 @@ mod tests {
         for app in ["app1", "appdev", "appprod"] {
             service
                 .metadata
-                .record(app, None, Some("u1".into()), None, None)
+                .record(app, None, None, None)
                 .await
                 .expect("owner");
         }

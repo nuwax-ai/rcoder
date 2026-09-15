@@ -56,7 +56,6 @@ mod tests {
         let outcome = store
             .admit(&UserAppAdmission {
                 app_id: app.into(),
-                user_id: "owner".into(),
                 lifecycle_id: None,
                 operation_id: format!("operation-{app}"),
                 request_id: Some(format!("request-{app}")),
