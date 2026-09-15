@@ -10,7 +10,7 @@ impl DockerRuntime {
         context: &shared_types::UserAppExecutionContext,
     ) -> Result<shared_types::UserAppBuilderWorkspaceEndpoint> {
         context
-            .validate_identity(&snapshot.app_id, Some(&context.user_id))
+            .validate_identity(&snapshot.app_id)
             .map_err(Error::Conflict)?;
         let [resource] = snapshot.resources.as_slice() else {
             return Err(Error::Conflict(
@@ -62,7 +62,7 @@ impl DockerRuntime {
     ) -> Result<Box<dyn shared_types::AppOperationLease>> {
         let marker = if let Some(context) = context {
             context
-                .validate_identity(app_id, Some(&context.user_id))
+                .validate_identity(app_id)
                 .map_err(Error::ConfigurationError)?;
             shared_types::AppFileMutationMarker::for_operation(&context.operation_id)
                 .map_err(|error| Error::ConfigurationError(error.to_string()))?
@@ -110,7 +110,7 @@ impl DockerRuntime {
         receipt: &shared_types::UserAppOperationLeaseReceipt,
     ) -> Result<()> {
         context
-            .validate_identity(&context.app_id, Some(&context.user_id))
+            .validate_identity(&context.app_id)
             .map_err(Error::ConfigurationError)?;
         receipt.validate().map_err(Error::ConfigurationError)?;
         let prefix = match receipt.service_type() {
@@ -880,7 +880,6 @@ mod workspace_endpoint_tests {
     fn endpoint_requires_captured_id_owner_lifecycle_family_and_running_address() {
         let context = shared_types::UserAppExecutionContext {
             app_id: "app".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             operation_id: "clear".into(),
             executor_id: "worker".into(),

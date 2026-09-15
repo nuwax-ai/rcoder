@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct UserAppResourceBinding {
     pub app_id: String,
-    pub user_id: String,
     pub lifecycle_id: String,
     /// Bound resource family: user-app-builder (UserappBuilder). The shared family
     /// type also represents web-agent-runner (WebAgentRunner), computer-agent-runner
@@ -23,7 +22,7 @@ impl UserAppResourceBinding {
         context: &UserAppExecutionContext,
         physical_uid: &str,
     ) -> Result<(), String> {
-        context.validate_identity(&self.app_id, Some(&self.user_id))?;
+        context.validate_identity(&self.app_id)?;
         if self.lifecycle_id != context.lifecycle_id
             || self.service_type != ServiceType::UserappBuilder
             || self.physical_uid.is_empty()
@@ -40,7 +39,6 @@ impl UserAppResourceBinding {
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AdoptBuilderRequest {
-    pub user_id: String,
     /// Current lifecycle returned by the platform; always explicit for adoption.
     pub lifecycle_id: String,
     /// Stable request identity for exact retries.
@@ -58,13 +56,12 @@ pub fn builder_identity_is_bound(
     physical_owner: Option<&str>,
     binding: Option<&UserAppResourceBinding>,
 ) -> Result<bool, String> {
-    context.validate_identity(&context.app_id, Some(&context.user_id))?;
-    if physical_owner != Some(context.user_id.as_str()) {
+    context.validate_identity(&context.app_id)?;
+    if physical_owner.is_some() {
         return Err("Builder physical owner evidence is missing or conflicting".into());
     }
     for (key, expected) in [
         ("rcoder.io/application-id", context.app_id.as_str()),
-        ("rcoder.io/owner-id", context.user_id.as_str()),
         ("rcoder.io/lifecycle-id", context.lifecycle_id.as_str()),
     ] {
         if metadata
@@ -98,7 +95,6 @@ mod tests {
     fn binding_allows_absent_lifecycle_but_never_conflicting_physical_evidence() {
         let context = UserAppExecutionContext {
             app_id: "app".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             operation_id: "control".into(),
             executor_id: "worker".into(),
@@ -106,7 +102,6 @@ mod tests {
         };
         let binding = UserAppResourceBinding {
             app_id: "app".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             service_type: ServiceType::UserappBuilder,
             physical_uid: "uid".into(),
@@ -147,7 +142,6 @@ mod tests {
     fn binding_requires_exact_physical_identity_and_lifecycle() {
         let context = UserAppExecutionContext {
             app_id: "app".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             operation_id: "control".into(),
             executor_id: "worker".into(),
@@ -155,7 +149,6 @@ mod tests {
         };
         let binding = UserAppResourceBinding {
             app_id: "app".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             service_type: ServiceType::UserappBuilder,
             physical_uid: "uid".into(),
@@ -167,7 +160,7 @@ mod tests {
         replacement.lifecycle_id = "new-life".into();
         assert!(binding.validate(&replacement, "uid").is_err());
         replacement = context;
-        replacement.user_id = "other-owner".into();
+        replacement.app_id = "other-app".into();
         assert!(binding.validate(&replacement, "uid").is_err());
     }
 }

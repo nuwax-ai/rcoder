@@ -12,9 +12,8 @@ pub fn encode_userapp_intent<T: Serialize>(intent: &T) -> Result<Vec<u8>, serde_
 }
 
 /// Stable reuse identity, distinct from the operation/executor that created it.
-pub const USERAPP_RESOURCE_IDENTITY_KEYS: [&str; 4] = [
+pub const USERAPP_RESOURCE_IDENTITY_KEYS: [&str; 3] = [
     "rcoder.io/application-id",
-    "rcoder.io/owner-id",
     "rcoder.io/lifecycle-id",
     "rcoder.io/request-fingerprint",
 ];
@@ -24,7 +23,6 @@ pub const USERAPP_RESOURCE_IDENTITY_KEYS: [&str; 4] = [
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserAppExecutionContext {
     pub app_id: String,
-    pub user_id: String,
     pub lifecycle_id: String,
     pub operation_id: String,
     pub executor_id: String,
@@ -36,7 +34,6 @@ impl UserAppExecutionContext {
     pub fn resource_metadata(&self) -> std::collections::BTreeMap<String, String> {
         [
             ("rcoder.io/application-id", &self.app_id),
-            ("rcoder.io/owner-id", &self.user_id),
             ("rcoder.io/lifecycle-id", &self.lifecycle_id),
             ("rcoder.io/operation-id", &self.operation_id),
             ("rcoder.io/executor-id", &self.executor_id),
@@ -68,10 +65,9 @@ impl UserAppExecutionContext {
         &self,
         metadata: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), String> {
-        self.validate_identity(&self.app_id, Some(&self.user_id))?;
+        self.validate_identity(&self.app_id)?;
         for (key, expected) in [
             ("rcoder.io/application-id", &self.app_id),
-            ("rcoder.io/owner-id", &self.user_id),
             ("rcoder.io/lifecycle-id", &self.lifecycle_id),
         ] {
             if metadata.get(key) != Some(expected) {
@@ -81,13 +77,12 @@ impl UserAppExecutionContext {
         Ok(())
     }
 
-    pub fn validate_identity(&self, app_id: &str, user_id: Option<&str>) -> Result<(), String> {
-        if self.app_id != app_id || user_id != Some(self.user_id.as_str()) {
-            return Err("Application execution ownership mismatch".into());
+    pub fn validate_identity(&self, app_id: &str) -> Result<(), String> {
+        if self.app_id != app_id {
+            return Err("Application execution identity mismatch".into());
         }
         for (name, value) in [
             ("app_id", &self.app_id),
-            ("user_id", &self.user_id),
             ("lifecycle_id", &self.lifecycle_id),
             ("operation_id", &self.operation_id),
             ("executor_id", &self.executor_id),
@@ -115,7 +110,6 @@ mod execution_context_tests {
     fn control_identity_does_not_reuse_creation_configuration_digest() {
         let creator = UserAppExecutionContext {
             app_id: "app-one".into(),
-            user_id: "owner-one".into(),
             lifecycle_id: "life-one".into(),
             operation_id: "create-one".into(),
             executor_id: "executor-one".into(),
@@ -167,42 +161,21 @@ mod execution_context_tests {
     fn execution_context_requires_exact_ownership_and_nonempty_credentials() {
         let context = UserAppExecutionContext {
             app_id: "app-one".into(),
-            user_id: "owner-one".into(),
             lifecycle_id: "life-one".into(),
             operation_id: "op-one".into(),
             executor_id: "executor-one".into(),
             request_fingerprint: "ab".repeat(32),
         };
-        assert!(
-            context
-                .validate_identity("app-one", Some("owner-one"))
-                .is_ok()
-        );
-        assert!(
-            context
-                .validate_identity("app-two", Some("owner-one"))
-                .is_err()
-        );
-        assert!(
-            context
-                .validate_identity("app-one", Some("owner-two"))
-                .is_err()
-        );
-        assert!(context.validate_identity("app-one", None).is_err());
+        assert!(context.validate_identity("app-one").is_ok());
+        assert!(context.validate_identity("app-two").is_err());
+        assert!(context.validate_identity("app-one").is_err());
+        assert!(context.validate_identity("app-one").is_err());
         let mut invalid = context.clone();
         invalid.operation_id.clear();
-        assert!(
-            invalid
-                .validate_identity("app-one", Some("owner-one"))
-                .is_err()
-        );
+        assert!(invalid.validate_identity("app-one").is_err());
         invalid = context;
         invalid.request_fingerprint = "z".repeat(64);
-        assert!(
-            invalid
-                .validate_identity("app-one", Some("owner-one"))
-                .is_err()
-        );
+        assert!(invalid.validate_identity("app-one").is_err());
     }
 }
 
@@ -220,7 +193,7 @@ pub struct UserAppLifecycleRecord {
     #[serde(default)]
     pub runtime_policy: UserAppRuntimePolicy,
     pub app_id: String,
-    pub user_id: String,
+
     pub lifecycle_id: String,
     pub lifecycle_epoch: i64,
     pub metadata_revision: i64,
@@ -354,7 +327,6 @@ pub struct UserAppAdmission {
     pub command: Option<UserAppControlCommand>,
     pub metadata: Option<UserAppMetadataPatch>,
     pub app_id: String,
-    pub user_id: String,
     pub lifecycle_id: Option<String>,
     pub operation_id: String,
     pub request_id: Option<String>,
@@ -450,7 +422,6 @@ impl UserAppRuntimePolicy {
 /// Caller identity for controls without a configuration body (for example stop).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserAppControlRequest {
-    pub user_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -484,7 +455,6 @@ pub struct UserAppOperationProgress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct UserAppMetadataPatch {
     pub app_id: String,
-    pub user_id: String,
     pub lifecycle_id: String,
     pub expected_revision: i64,
     #[serde(
@@ -576,7 +546,6 @@ pub trait UserAppLifecycleStore: Send + Sync {
     async fn ensure_identity(
         &self,
         app_id: &str,
-        user_id: &str,
     ) -> Result<UserAppLifecycleRecord, UserAppStoreError>;
     async fn get_application(
         &self,
@@ -701,7 +670,6 @@ pub trait UserAppLifecycleStore: Send + Sync {
     async fn recreate(
         &self,
         app_id: &str,
-        user_id: &str,
         expected_lifecycle_id: &str,
         request_id: &str,
     ) -> Result<UserAppLifecycleRecord, UserAppStoreError>;
@@ -767,8 +735,6 @@ impl From<UserAppOperationRecord> for UserAppOperationView {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct UserAppRetryRequest {
-    #[garde(pattern(crate::IDENTIFIER_RE))]
-    pub user_id: String,
     #[garde(length(min = 1, max = 128))]
     pub lifecycle_id: String,
     #[garde(range(min = 1))]
@@ -777,8 +743,6 @@ pub struct UserAppRetryRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct UserAppRecreateRequest {
-    #[garde(pattern(crate::IDENTIFIER_RE))]
-    pub user_id: String,
     #[garde(length(min = 1, max = 128))]
     pub expected_lifecycle_id: String,
     #[garde(length(min = 1, max = 128))]

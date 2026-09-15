@@ -86,7 +86,7 @@ impl KubernetesRuntime {
         adoption: bool,
     ) -> Result<BuilderControlTarget> {
         context
-            .validate_identity(&context.app_id, Some(&context.user_id))
+            .validate_identity(&context.app_id)
             .map_err(Error::Conflict)?;
         let name = self.pod_name(&context.app_id, &ServiceType::UserappBuilder)?;
         let api: Api<StatefulSet> = Api::namespaced(self.client.clone(), &self.namespace);

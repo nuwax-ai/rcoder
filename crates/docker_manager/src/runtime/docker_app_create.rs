@@ -108,7 +108,7 @@ impl DockerRuntime {
         labels.insert("service-type".to_string(), ServiceType::Userapp.to_string());
         if let Some(context) = &params.execution_context {
             context
-                .validate_identity(&app_id, params.user_id.as_deref())
+                .validate_identity(&app_id)
                 .map_err(ContainerRuntimeError::ConfigurationError)?;
             labels.extend(context.resource_metadata());
         }
@@ -413,7 +413,7 @@ impl DockerRuntime {
         context: &shared_types::UserAppExecutionContext,
     ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
         context
-            .validate_identity(&context.app_id, Some(&context.user_id))
+            .validate_identity(&context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         let name = app_deployment_name(&context.app_id);
         let container = self
@@ -471,7 +471,7 @@ impl DockerRuntime {
         use bollard::query_parameters::StartContainerOptions;
         target
             .context
-            .validate_identity(&target.context.app_id, Some(&target.context.user_id))
+            .validate_identity(&target.context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         if target.resource.kind != shared_types::AppResourceKind::Container
             || target.resource.name != app_deployment_name(&target.context.app_id)
@@ -504,7 +504,7 @@ impl DockerRuntime {
         use bollard::query_parameters::StopContainerOptions;
         target
             .context
-            .validate_identity(&target.context.app_id, Some(&target.context.user_id))
+            .validate_identity(&target.context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         if target.resource.kind != shared_types::AppResourceKind::Container
             || target.resource.uid.is_empty()

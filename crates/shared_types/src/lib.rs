@@ -39,7 +39,7 @@ pub use userapp::dev_locator::{UserappDevEnsure, UserappDevLocator};
 pub use userapp::forward_contract::{
     APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, ComputerServiceKind,
     SERVICE_TYPE_HEADER, SERVICE_TYPE_NORMAL_PROJECT, SERVICE_TYPE_PAGE_APP,
-    SERVICE_TYPE_TASK_AGENT, SERVICE_TYPE_USERAPP, USER_ID_HEADER, WORKSPACE_PATH_HEADER,
+    SERVICE_TYPE_TASK_AGENT, SERVICE_TYPE_USERAPP, WORKSPACE_PATH_HEADER,
     is_userapp_service_type_value, normalize_computer_service_type,
 };
 pub use userapp::metadata::{AppMetadataPersistence, AppMetadataRecord};
@@ -131,10 +131,7 @@ pub use validation::{
     validate_agent_work_dir_for_service, validate_identifier,
 };
 
-pub use userapp::builder_instance::{
-    USERAPP_BUILDER_INSTANCE_ID_MAX_LEN, builder_instance_id, parse_builder_instance_id,
-    validate_builder_instance_id,
-};
+pub use userapp::builder_instance::validate_builder_app_id;
 
 // Userapp 日志域契约（rcoder ↔ app-cli 单一事实源；OpenAPI schema 同源派生）
 pub mod app_cli_logs;

@@ -85,9 +85,9 @@ pub(crate) fn reply<T>(r: AppResult<T>) -> UserAppReply<T> {
 fn validate_task_scope(scope: &UserappTaskScopeQuery, task_id: &str) -> Result<(), AppError> {
     shared_types::validate_identifier(&scope.app_id, "app_id")
         .map_err(|e| AppError::validation(e.to_string()))?;
-    shared_types::validate_identifier(&scope.user_id, "user_id")
+    shared_types::validate_identifier(&scope, "user_id")
         .map_err(|e| AppError::validation(e.to_string()))?;
-    tracing::debug!(app_id = %scope.app_id, user_id = %scope.user_id, %task_id, "task scope access");
+    tracing::debug!(app_id = %scope.app_id, user_id = %scope, %task_id, "task scope access");
     Ok(())
 }
 
@@ -145,7 +145,7 @@ pub(crate) async fn build_workspace(
         )
         .await?;
 
-        tracing::info!(app_id = %body.app_id, user_id = %body.user_id, %task_id, %artifact_path, "userapp build task started");
+        tracing::info!(app_id = %body.app_id, user_id = %body, %task_id, %artifact_path, "userapp build task started");
         Ok(BuildCreatedData {
             task_id,
             status: BuildTaskStatus::Pending,
@@ -246,7 +246,6 @@ pub(crate) async fn stream_task_logs(
     if let Err(e) = validate_task_scope(
         &UserappTaskScopeQuery {
             app_id: q.app_id.clone(),
-            user_id: q.user_id.clone(),
         },
         &task_id,
     ) {
@@ -522,7 +521,6 @@ mod stream_close_tests {
             AppPath(task.id.clone()),
             AppQuery(StreamQuery {
                 app_id: "app-1".into(),
-                user_id: "u".into(),
                 from_seq: 0,
             }),
             HeaderMap::new(),
@@ -562,7 +560,6 @@ mod stream_close_tests {
         let scope = || {
             AppQuery(StreamQuery {
                 app_id: "app-1".into(),
-                user_id: "u".into(),
                 from_seq: 0,
             })
         };
@@ -642,7 +639,6 @@ mod stream_close_tests {
             AppPath(task.id.clone()),
             AppQuery(StreamQuery {
                 app_id: "app-1".into(),
-                user_id: "u".into(),
                 from_seq: 0,
             }),
             HeaderMap::new(),
@@ -701,7 +697,6 @@ mod stream_close_tests {
             AppPath(task.id.clone()),
             AppQuery(StreamQuery {
                 app_id: "app-1".into(),
-                user_id: "u".into(),
                 from_seq: 999,
             }),
             HeaderMap::new(),
@@ -743,7 +738,6 @@ mod stream_close_tests {
             AppPath(task.id.clone()),
             AppQuery(StreamQuery {
                 app_id: "app-1".into(),
-                user_id: "u".into(),
                 from_seq: 0,
             }),
             HeaderMap::new(),

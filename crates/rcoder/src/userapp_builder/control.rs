@@ -18,7 +18,7 @@ pub(crate) async fn execute(
     restart: bool,
 ) -> Result<BuilderControlResult> {
     shared_types::validate_identifier(app_id, "app_id").map_err(|error| anyhow!(error))?;
-    shared_types::validate_identifier(&request.user_id, "user_id")
+    shared_types::validate_identifier(&request, "user_id")
         .map_err(|error| anyhow!(error))?;
     request
         .request_id
@@ -32,7 +32,7 @@ pub(crate) async fn execute(
             .get_application(&app_id)
             .await?
             .ok_or(UserAppStoreError::NotFound)?;
-        if app.user_id != request.user_id {
+        if app != request {
             return Err(UserAppStoreError::OwnershipConflict.into());
         }
         if app.state != UserAppLifecycleState::Active
@@ -45,7 +45,7 @@ pub(crate) async fn execute(
         }
         // owner 实例复合 identifier（stop/restart 属 owner 生命周期操作——
         // 操作/恢复按纯 app_id 受理，物理资源定位/锁/注册按复合键）。
-        let instance = shared_types::builder_instance_id(&request.user_id, &app_id)
+        let instance = shared_types::builder_instance_id(&request, &app_id)
             .map_err(anyhow::Error::msg)?;
         let command = if restart {
             UserAppControlCommand::RestartBuilder
@@ -71,7 +71,6 @@ pub(crate) async fn execute(
                     UserAppOperationKind::StopBuilder
                 },
                 app_id: app_id.clone(),
-                user_id: request.user_id.clone(),
                 lifecycle_id: request.lifecycle_id,
                 request_id: request.request_id,
                 operation_id: uuid::Uuid::new_v4().to_string(),
@@ -95,7 +94,7 @@ pub(crate) async fn execute(
                 return Err(UserAppStoreError::OperationInProgress(record.operation_id).into());
             }
         };
-        execute_pending(&owned, record, &instance, &request.user_id, restart).await
+        execute_pending(&owned, record, &instance, &request, restart).await
     })
     .await
     .context("Builder control observer interrupted")?
@@ -134,7 +133,7 @@ async fn execute_pending(
     state: &AppState,
     mut record: UserAppOperationRecord,
     instance: &str,
-    owner: &str,
+
     restart: bool,
 ) -> Result<BuilderControlResult> {
     let executor = uuid::Uuid::new_v4().to_string();
@@ -150,7 +149,6 @@ async fn execute_pending(
     .await?;
     let context = UserAppExecutionContext {
         app_id: instance.to_string(),
-        user_id: owner.into(),
         lifecycle_id: record.lifecycle_id.clone(),
         operation_id: record.operation_id.clone(),
         executor_id: executor.clone(),
@@ -446,8 +444,8 @@ pub(super) async fn resume_pending(
     }
     // owner 实例复合 identifier（resume 的操作由 owner 受理，实例恒为
     // {owner}-{app_id}）
-    let instance = shared_types::builder_instance_id(&app.user_id, &record.app_id)
+    let instance = shared_types::builder_instance_id(&app, &record.app_id)
         .map_err(anyhow::Error::msg)?;
-    execute_pending(state, current, &instance, &app.user_id, restart).await?;
+    execute_pending(state, current, &instance, &app, restart).await?;
     Ok(true)
 }

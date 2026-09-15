@@ -214,7 +214,6 @@ mod tests {
             direct_websocket_url: "ws://172.17.0.5:6080/websockify".to_string(),
             container_id: "abc123".to_string(),
             container_ip: "172.17.0.5".to_string(),
-            user_id: "user_123".to_string(),
             project_id: "proj_456".to_string(),
             message: "Test message".to_string(),
         };

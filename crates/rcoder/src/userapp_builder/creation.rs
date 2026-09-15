@@ -23,12 +23,12 @@ pub(super) async fn ensure(
     state: &AppState,
     app_id: &str,
     instance: &str,
-    owner: &str,
+
     lease: OwnedMutexGuard<()>,
     deadline: Instant,
 ) -> Result<ContainerBasicInfo> {
-    let app = state.userapp_store.ensure_identity(app_id, owner).await?;
-    let fingerprint = instance_fingerprint(state, app_id, instance, owner)?;
+    let app = state.userapp_store.ensure_identity(app_id).await?;
+    let fingerprint = instance_fingerprint(state, app_id)?;
     let admission = state
         .userapp_store
         .admit(&UserAppAdmission {
@@ -36,7 +36,6 @@ pub(super) async fn ensure(
             command: None,
             metadata: None,
             app_id: app_id.into(),
-            user_id: owner.into(),
             lifecycle_id: Some(app.lifecycle_id),
             operation_id: uuid::Uuid::new_v4().to_string(),
             request_id: None,
@@ -48,7 +47,7 @@ pub(super) async fn ensure(
         UserAppAdmissionOutcome::Accepted(record) => {
             // Detach only the HTTP waiter. The worker retains its lease and
             // commits its outcome even when this request is cancelled.
-            drop(spawn_operation(state, &record, instance, owner, lease)?);
+            drop(spawn_operation(state, &record, lease)?);
             record
         }
         UserAppAdmissionOutcome::Existing(record) => {
@@ -56,7 +55,7 @@ pub(super) async fn ensure(
             record
         }
     };
-    wait(state, &operation, instance, deadline).await
+    wait(state, &operation, deadline).await
 }
 
 /// builder 实例创建指纹（owner 受理路径与协作者轻量路径同源）：键含复合
@@ -67,7 +66,7 @@ pub(super) fn instance_fingerprint(
     state: &AppState,
     app_id: &str,
     instance: &str,
-    instance_user: &str,
+
 ) -> Result<String> {
     use sha2::{Digest, Sha256};
     let config = serde_json::json!({"schema":2,"app_id":app_id,"instance":instance,
@@ -85,8 +84,6 @@ pub(super) fn instance_fingerprint(
 fn spawn_operation(
     state: &AppState,
     record: &UserAppOperationRecord,
-    instance: &str,
-    owner: &str,
     lease: OwnedMutexGuard<()>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let (signal, _) = watch::channel(0);
@@ -96,8 +93,8 @@ fn spawn_operation(
         .insert(record.operation_id.clone(), signal.clone());
     let worker_state = state.clone();
     let worker_record = record.clone();
-    let owner = owner.to_owned();
-    let instance = instance.to_string();
+        let _ = owner;
+        let _ = instance;
     let worker = tokio::spawn(async move {
         let executor = uuid::Uuid::new_v4().to_string();
         let owned = worker_state.clone();
@@ -121,11 +118,8 @@ fn spawn_operation(
             let creation = super::create_builder_inner(
                 &owned,
                 &claimed.app_id,
-                &instance,
-                &owner,
-                shared_types::UserAppExecutionContext {
+shared_types::UserAppExecutionContext {
                     app_id: instance.clone(),
-                    user_id: owner.clone(),
                     lifecycle_id: claimed.lifecycle_id.clone(),
                     operation_id: claimed.operation_id.clone(),
                     executor_id: claimed_id.clone(),
@@ -154,11 +148,7 @@ fn spawn_operation(
             };
             let result = match created {
                 Ok(info) => {
-                    super::confirm_builder_ready(
-                        &owned,
-                        &claimed.app_id,
-                        &instance,
-                        info,
+                    super::confirm_builder_ready(&owned, &claimed.app_id, info,
                         ready_deadline,
                     )
                     .await
@@ -330,10 +320,10 @@ pub(super) async fn resume_pending(
         ));
     }
     // 恢复指纹按 owner 实例复合键重算（record/identity 不含实例段——owner
-    // 受理操作的实例恒为 {identity.user_id}-{app_id}）
-    let instance = shared_types::builder_instance_id(&identity.user_id, &current.app_id)
+    // 受理操作的实例恒为 {identity}-{app_id}）
+    let instance = shared_types::builder_instance_id(&identity, &current.app_id)
         .map_err(anyhow::Error::msg)?;
-    if instance_fingerprint(state, &current.app_id, &instance, &identity.user_id)?
+    if instance_fingerprint(state, &current.app_id, &instance, &identity)?
         != current.request_fingerprint
     {
         let executor = uuid::Uuid::new_v4().to_string();
@@ -367,7 +357,7 @@ pub(super) async fn resume_pending(
     // Occupy the recovery scheduler slot until the actual worker finishes,
     // including its final checkpoint and notification cleanup. Dropping this
     // observer still detaches rather than aborting the admitted operation.
-    spawn_operation(state, &current, &instance, &identity.user_id, lease)?
+    spawn_operation(state, &current, &instance, &identity, lease)?
         .await
         .context("Observe recovered builder worker")??;
     Ok(true)
@@ -699,7 +689,6 @@ mod tests {
                 command: None,
                 metadata: None,
                 app_id: app_id.into(),
-                user_id: "owner".into(),
                 lifecycle_id: None,
                 operation_id: uuid::Uuid::new_v4().to_string(),
                 request_id: None,
@@ -763,7 +752,6 @@ mod tests {
                 }),
                 context: shared_types::UserAppExecutionContext {
                     app_id: running.app_id.clone(),
-                    user_id: "owner".into(),
                     lifecycle_id: running.lifecycle_id.clone(),
                     operation_id: running.operation_id.clone(),
                     executor_id: "worker".into(),
@@ -788,7 +776,7 @@ mod tests {
                 .is_err()
         );
         let mut wrong_owner = evidence.target.clone();
-        wrong_owner.context.user_id = "other-owner".into();
+        wrong_owner.context = "other-owner".into();
         assert!(
             validate_completed_resource(&evidence, &wrong_owner, Some(evidence.container.clone()))
                 .is_err()
@@ -797,7 +785,7 @@ mod tests {
         other_pod.container_id = "other-pod".into();
         assert!(validate_completed_resource(&evidence, &evidence.target, Some(other_pod)).is_err());
         let mut wrong_owner_evidence = evidence.clone();
-        wrong_owner_evidence.target.context.user_id = "foreign-owner".into();
+        wrong_owner_evidence.target.context = "foreign-owner".into();
         let invalid_owner = progress(
             &store,
             &running,

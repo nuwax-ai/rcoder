@@ -76,8 +76,7 @@ impl UserAppDeletionCheckpoint {
         if self.schema_version != 1 {
             return Err("Unsupported application deletion checkpoint version".into());
         }
-        self.context
-            .validate_identity(&self.context.app_id, Some(&self.context.user_id))?;
+        self.context.validate_identity(&self.context.app_id)?;
         let needs_development = match self.kind {
             crate::UserAppOperationKind::DeleteCompute => false,
             crate::UserAppOperationKind::PurgeResources
@@ -100,13 +99,7 @@ impl UserAppDeletionCheckpoint {
         }
         validate_deletion_resources(&self.production.operation_id, &self.production.resources)?;
         if let Some(development) = &self.development {
-            // development.runtime.app_id 携带实例复合 identifier
-            //（`{user_id}-{app_id}`）——按 app 段还原比对（与 capture 侧
-            // capture_dev_deletion 的还原语义同源；非复合形态原样比对）
-            let development_app = crate::parse_builder_instance_id(&development.runtime.app_id)
-                .map(|(_, app)| app)
-                .unwrap_or(development.runtime.app_id.as_str());
-            if development_app != self.context.app_id {
+            if development.runtime.app_id != self.context.app_id {
                 return Err(
                     "Development deletion checkpoint belongs to another application".into(),
                 );
@@ -185,8 +178,7 @@ pub struct UserAppStorageClear {
 
 impl UserAppStorageClear {
     pub fn validate(&self) -> Result<(), String> {
-        self.context
-            .validate_identity(&self.context.app_id, Some(&self.context.user_id))?;
+        self.context.validate_identity(&self.context.app_id)?;
         match &self.target {
             UserAppStorageClearTarget::Production {
                 snapshot,
@@ -265,8 +257,7 @@ pub enum UserAppStorageClearTarget {
 
 impl UserAppStorageDestruction {
     pub fn validate(&self) -> Result<(), String> {
-        self.context
-            .validate_identity(&self.context.app_id, Some(&self.context.user_id))?;
+        self.context.validate_identity(&self.context.app_id)?;
         if let Some(production) = &self.production {
             if production.app_id != self.context.app_id {
                 return Err("Storage destruction production ownership mismatch".into());

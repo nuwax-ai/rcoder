@@ -146,7 +146,6 @@ pub async fn pod_ensure(
 async fn ensure_userapp_dev(
     state: &Arc<AppState>,
     app_id: String,
-    user_id: &str,
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
     let (info, created) =
         crate::userapp_builder::ensure_userapp_builder_probed(state, &app_id, Some(user_id))
@@ -179,7 +178,6 @@ async fn ensure_userapp_prod(
     state: &Arc<AppState>,
     locale: &str,
     app_id: String,
-    user_id: &str,
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
     match state.app_service.get_app(&app_id).await {
         Ok(_) => {}
@@ -243,7 +241,6 @@ async fn ensure_userapp_prod_created(
     state: &Arc<AppState>,
     locale: &str,
     app_id: String,
-    user_id: &str,
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
     let metadata_owner = match state.app_service.get_app_owner(&app_id).await {
         Ok(owner) => owner,
@@ -275,7 +272,6 @@ async fn ensure_userapp_prod_created(
         }
     };
     let request = app_manager::models::StartAppRequest {
-        user_id: owner,
         ..Default::default()
     };
     match state.app_service.start_app_enhanced(&app_id, request).await {

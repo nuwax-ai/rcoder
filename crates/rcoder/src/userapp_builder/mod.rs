@@ -581,7 +581,7 @@ async fn create_builder_inner(
     state: &AppState,
     app_id: &str,
     instance: &str,
-    instance_user: &str,
+
     execution_context: shared_types::UserAppExecutionContext,
 ) -> Result<ContainerBasicInfo> {
     let bound_target = adoption::capture_bound_target(state, &execution_context).await?;
@@ -591,7 +591,7 @@ async fn create_builder_inner(
         // 容器内契约（env/profiler）的纯 app_id 显式直传——消费方不再从
         // project_id 复合槽右切（字段语义不重载）
         .builder_app_id(app_id.to_string())
-        .user_id(instance_user.to_string())
+        (instance_user.to_string())
         .service_type(ServiceType::UserappBuilder)
         .storage_size(DEFAULT_BUILDER_STORAGE_SIZE)
         .build();
@@ -620,7 +620,7 @@ async fn create_instance_builder(
     state: &AppState,
     app_id: &str,
     instance: &str,
-    instance_user: &str,
+
     deadline: tokio::time::Instant,
 ) -> Result<ContainerBasicInfo> {
     let app = state
@@ -639,7 +639,6 @@ async fn create_instance_builder(
     // instance 维度），保证同实例重创建指纹稳定。
     let context = shared_types::UserAppExecutionContext {
         app_id: instance.to_string(),
-        user_id: instance_user.to_string(),
         lifecycle_id: app.lifecycle_id,
         operation_id: format!("instance-{}", uuid::Uuid::new_v4().simple()),
         executor_id: uuid::Uuid::new_v4().simple().to_string(),
@@ -651,7 +650,7 @@ async fn create_instance_builder(
         )?,
     };
     let info = create_builder_inner(state, app_id, instance, instance_user, context).await?;
-    let verified = confirm_builder_ready(state, app_id, instance, info, deadline).await?;
+    let verified = confirm_builder_ready(state, app_id, info, deadline).await?;
     register_builder(state, instance, &verified)?;
     Ok(verified)
 }
@@ -824,7 +823,6 @@ mod remediation_tests {
             env_vars: None,
             service_type: Some(ServiceType::UserappBuilder),
             project_id: None,
-            user_id: None,
             pod_id: None,
             app_id: Some("app1".to_string()),
         }
@@ -891,7 +889,6 @@ mod ownership_regressions {
             env_vars: None,
             service_type: Some(ServiceType::UserappBuilder),
             project_id: None,
-            user_id: Some("owner".into()),
             pod_id: None,
             app_id: Some("app".into()),
         };

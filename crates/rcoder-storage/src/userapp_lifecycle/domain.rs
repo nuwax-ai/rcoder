@@ -5,14 +5,12 @@ use shared_types::{
     UserAppOperationRecord, UserAppOperationState as OpState, UserAppStoreError as Error,
 };
 
-pub(super) fn identity(app_id: &str, user_id: &str) -> Result<UserAppLifecycleRecord, Error> {
+pub(super) fn identity(app_id: &str) -> Result<UserAppLifecycleRecord, Error> {
     shared_types::validate_identifier(app_id, "app_id").map_err(Error::InvalidOperation)?;
-    shared_types::validate_identifier(user_id, "user_id").map_err(Error::InvalidOperation)?;
     Ok(UserAppLifecycleRecord {
         runtime_policy: shared_types::UserAppRuntimePolicy::default(),
         app_id: app_id.into(),
-        user_id: user_id.into(),
-        lifecycle_id: uuid::Uuid::new_v4().to_string(),
+                lifecycle_id: uuid::Uuid::new_v4().to_string(),
         lifecycle_epoch: 1,
         metadata_revision: 1,
         state: AppState::Active,
@@ -24,15 +22,7 @@ pub(super) fn identity(app_id: &str, user_id: &str) -> Result<UserAppLifecycleRe
     })
 }
 
-pub(super) fn validate_owner(app: &UserAppLifecycleRecord, owner: &str) -> Result<(), Error> {
-    if app.user_id != owner {
-        return Err(Error::OwnershipConflict);
-    }
-    Ok(())
-}
-
-pub(super) fn validate_active(app: &UserAppLifecycleRecord, owner: &str) -> Result<(), Error> {
-    validate_owner(app, owner)?;
+pub(super) fn validate_active(app: &UserAppLifecycleRecord) -> Result<(), Error> {
     if app.state != AppState::Active {
         return Err(Error::LifecycleConflict);
     }
@@ -45,7 +35,6 @@ pub(super) fn admission(
     duplicate: Option<UserAppOperationRecord>,
     active: Option<UserAppOperationRecord>,
 ) -> Result<UserAppAdmissionOutcome, Error> {
-    validate_owner(app, &request.user_id)?;
     if request.runtime_policy_on_success.is_some()
         && !matches!(
             request.kind,
@@ -114,7 +103,7 @@ pub(super) fn admission(
         }
         return Ok(UserAppAdmissionOutcome::Existing(duplicate));
     }
-    validate_active(app, &request.user_id)?;
+    validate_active(app)?;
     if let Some(active) = active {
         if !active.state.is_terminal()
             && active.state != OpState::RecoveryRequired
@@ -284,7 +273,7 @@ pub(super) fn patch_metadata(
     app: &mut UserAppLifecycleRecord,
     patch: &shared_types::UserAppMetadataPatch,
 ) -> Result<(), Error> {
-    validate_active(app, &patch.user_id)?;
+    validate_active(app)?;
     if app.app_id != patch.app_id || app.lifecycle_id != patch.lifecycle_id {
         return Err(Error::LifecycleConflict);
     }
@@ -346,9 +335,6 @@ fn validate_deletion_progress(
     })?;
     next.validate_operation(operation)
         .map_err(Error::InvalidOperation)?;
-    if next.context.user_id != app.user_id {
-        return Err(Error::OwnershipConflict);
-    }
     if operation.checkpoint.is_null() {
         if progress.state != OpState::Running || next.stage != Stage::Captured {
             return Err(Error::InvalidOperation(
@@ -427,9 +413,6 @@ fn validate_storage_destruction_progress(
         })?;
     evidence.validate().map_err(Error::InvalidOperation)?;
     let context = &evidence.context;
-    if context.user_id != app.user_id {
-        return Err(Error::OwnershipConflict);
-    }
     if context.app_id != operation.app_id
         || context.lifecycle_id != operation.lifecycle_id
         || context.operation_id != operation.operation_id
@@ -504,7 +487,7 @@ fn validate_storage_clear_progress(
     evidence.validate().map_err(Error::InvalidOperation)?;
     let context = &evidence.context;
     context
-        .validate_identity(&operation.app_id, Some(&app.user_id))
+        .validate_identity(&operation.app_id)
         .map_err(Error::InvalidOperation)?;
     if context.lifecycle_id != operation.lifecycle_id
         || context.operation_id != operation.operation_id

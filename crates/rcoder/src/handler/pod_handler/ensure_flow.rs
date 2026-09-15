@@ -228,7 +228,6 @@ pub(super) async fn create_with_retry(
         );
 
         let options = ContainerCreateOptions {
-            user_id: request.user_id.clone(),
             project_id: request.project_id.clone(),
             resource_limits: resource_limits.clone(),
             pod_id: request.pod_id.clone(),
@@ -389,7 +388,6 @@ pub(super) async fn get_existing_with_sync(
                         .insert(container_identifier.to_string(), Instant::now());
 
                     let options = ContainerCreateOptions {
-                        user_id: request.user_id.clone(),
                         project_id: request.project_id.clone(),
                         resource_limits,
                         pod_id: request.pod_id.clone(),

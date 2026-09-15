@@ -153,7 +153,7 @@ pub(super) async fn apply_auto_mounts(
                         let uid = user_id.unwrap_or(pid);
                         // 宿主子路径 = 挂载压平四目录之一（布局单一事实源 paths::userapp_dev_subpaths）
                         (
-                            shared_types::paths::userapp_dev_subpaths(uid, pid)[0].clone(),
+                            shared_types::paths::userapp_dev_subpaths(pid)[0].clone(),
                             std::path::PathBuf::from(shared_types::paths::USERAPP_DEV_HOME)
                                 .join(pid),
                         )
@@ -223,7 +223,7 @@ pub(super) async fn apply_auto_mounts(
                 let uid = user_id.unwrap_or(pid);
                 // data/logs/agent-store = 布局四目录的后三段（单一事实源），与
                 // 容器内挂载点按序配对
-                let subs = shared_types::paths::userapp_dev_subpaths(uid, pid);
+                let subs = shared_types::paths::userapp_dev_subpaths(pid);
                 for (sub, container_path) in [
                     (subs[1].clone(), shared_types::paths::USERAPP_DEV_DATA),
                     (subs[2].clone(), shared_types::paths::USERAPP_DEV_LOGS),

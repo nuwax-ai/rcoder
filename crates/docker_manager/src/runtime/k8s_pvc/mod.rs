@@ -386,7 +386,7 @@ impl KubernetesRuntime {
         storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         context
-            .validate_identity(&context.app_id, Some(&context.user_id))
+            .validate_identity(&context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         if !matches!(
             service_type,
@@ -414,7 +414,7 @@ impl KubernetesRuntime {
         context: &shared_types::UserAppExecutionContext,
     ) -> ContainerRuntimeResult<shared_types::UserAppStorageResizeTarget> {
         context
-            .validate_identity(&context.app_id, Some(&context.user_id))
+            .validate_identity(&context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         let name = self.workspace_pvc_name(&context.app_id, &ServiceType::Userapp)?;
         let pvc = self.pvcs().get(&name).await.map_err(|error| {
@@ -455,7 +455,7 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<StorageResizeOutcome> {
         target
             .context
-            .validate_identity(&target.context.app_id, Some(&target.context.user_id))
+            .validate_identity(&target.context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         let expected = self.workspace_pvc_name(&target.context.app_id, &ServiceType::Userapp)?;
         if target.resource.name != expected

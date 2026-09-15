@@ -123,7 +123,7 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
         // owner 实例复合 identifier——正式 evidence 链覆盖 lifecycle 持有的
         // owner 实例；协作者实例（无 lifecycle 受理）在 capture 时清点、
         // cleanup 时一并清扫（见 CapturedDeletion.extra_instances）。
-        let owner_instance = shared_types::builder_instance_id(&app.user_id, app_id)
+        let owner_instance = shared_types::builder_instance_id(&app, app_id)
             .map_err(|error| format!("compose owner builder instance: {error}"))?;
         let operation = self
             .runtime
@@ -153,7 +153,6 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
                 .map_err(|error| format!("Read builder resource binding: {error}"))?;
             let context = shared_types::UserAppExecutionContext {
                 app_id: owner_instance.clone(),
-                user_id: app.user_id.clone(),
                 lifecycle_id: app.lifecycle_id.clone(),
                 operation_id: "capture-deletion".into(),
                 executor_id: "reader".into(),

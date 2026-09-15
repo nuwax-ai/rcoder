@@ -94,7 +94,6 @@ pub async fn internal_pod_ensure(
         ServiceType::ComputerAgentRunner => {
             // 委托给 pod_handler::pod_ensure（ComputerContainerManager）
             let ensure_request = super::pod_handler::EnsurePodRequest {
-                user_id: identifier.clone(),
                 project_id: identifier.clone(),
                 resource_limits: None,
                 pod_id: None,

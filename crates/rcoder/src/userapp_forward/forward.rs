@@ -40,7 +40,7 @@ use super::semantics::{
     require_query_user_id, require_static_user_id, unavailable_response,
 };
 use super::upstream::{
-    STATIC_PATH_PREFIX, TASKS_PATH_PREFIX, explicit_user_id_from_headers, forward_to_dev,
+    STATIC_PATH_PREFIX, TASKS_PATH_PREFIX, strip_legacy_user_id_header, forward_to_dev,
     forward_to_prod, missing_app_id_response, require_app_id,
 };
 
@@ -185,11 +185,9 @@ pub(crate) async fn forward_userapp(
             );
             // 透传族 body 内 user_id 流式不解析——显式档来源：static 前移的
             // query（已处理）与 `x-user-id` header（Java userApp 出站统一携带）
-            let explicit_user_id = match explicit_user_id_from_headers(req.headers()) {
-                Ok(v) => v,
-                Err(resp) => return *resp,
-            };
-            forward_to_dev(&state, &app_id, req, explicit_user_id.as_deref()).await
+            strip_legacy_user_id_header(req.headers_mut());
+            let explicit_user_id: Option<String> = None;
+            forward_to_dev(&state, &app_id, req).await
         }
         UserappStage::Prod => {
             info!(
@@ -239,11 +237,9 @@ async fn fold_env_forward(
     );
     // 门面 body 携 user_id 但流式不解析——显式档走 `x-user-id` header，
     // 缺失时降级 metadata 链（create-workspace/start 前置注册）
-    let explicit_user_id = match explicit_user_id_from_headers(req.headers()) {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
-    forward_to_dev(&state, &app_id, req, explicit_user_id.as_deref()).await
+    strip_legacy_user_id_header(req.headers_mut());
+            let explicit_user_id: Option<String> = None;
+    forward_to_dev(&state, &app_id, req).await
 }
 
 /// 探测开发容器内的项目类型
@@ -363,15 +359,13 @@ pub(crate) async fn computer_intercept(
         UserappStage::Dev => {
             // `x-user-id` header 是 owner 显式档（Java userApp 出站统一携带，
             // 拦截层零 body 解析）；缺失降级 metadata 链，非法值 400 fail-fast
-            let explicit_user_id = match explicit_user_id_from_headers(req.headers()) {
-                Ok(v) => v,
-                Err(resp) => return *resp,
-            };
+            strip_legacy_user_id_header(req.headers_mut());
+            let explicit_user_id: Option<String> = None;
             info!(
                 "[USERAPP_FORWARD] intercepted computer request {} -> dev container (app_id={app_id})",
                 req.uri().path()
             );
-            forward_to_dev(&state, &app_id, req, explicit_user_id.as_deref()).await
+            forward_to_dev(&state, &app_id, req).await
         }
         UserappStage::Prod => {
             info!(
@@ -454,7 +448,7 @@ async fn forward_new_endpoint(
     let path = req.uri().path().to_string();
     // header 档先提取（body 读取前——x-user-id 非法值 400 短路不做无谓读取）
     let header_app = require_app_id(&req);
-    let header_user = match explicit_user_id_from_headers(req.headers()) {
+    let header_user = match strip_legacy_user_id_header(req.headers()) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };

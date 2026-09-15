@@ -21,8 +21,7 @@ pub struct BuilderControlTarget {
 
 impl BuilderControlTarget {
     pub fn validate(&self) -> Result<(), String> {
-        self.context
-            .validate_identity(&self.context.app_id, Some(&self.context.user_id))?;
+        self.context.validate_identity(&self.context.app_id)?;
         if let Some(workload) = &self.workload {
             if workload.name.is_empty() || workload.uid.is_empty() {
                 return Err("Builder compute identity is missing".into());
@@ -73,7 +72,6 @@ mod tests {
     fn compute_control_never_accepts_storage_or_incomplete_pod_receipts() {
         let context = crate::UserAppExecutionContext {
             app_id: "app".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             operation_id: "stop".into(),
             executor_id: "worker".into(),
@@ -138,14 +136,9 @@ impl BuilderCreationEvidence {
     ) -> Result<(), String> {
         self.target.validate()?;
         let context = &self.target.context;
-        // app 级 operation（lifecycle，纯 app_id）与实例级 evidence（复合
-        // identifier `{user_id}-{app_id}`）的 app 段必须一致——实例串右切还原
-        let app_segment = crate::parse_builder_instance_id(&context.app_id)
-            .map(|(_, app)| app.to_string())
-            .unwrap_or_else(|| context.app_id.clone());
         if !self.creation_lease_released
             || operation.kind != crate::UserAppOperationKind::EnsureBuilder
-            || app_segment != operation.app_id
+            || context.app_id != operation.app_id
             || context.lifecycle_id != operation.lifecycle_id
             || context.operation_id != operation.operation_id
             || operation.executor_id.as_deref() != Some(context.executor_id.as_str())

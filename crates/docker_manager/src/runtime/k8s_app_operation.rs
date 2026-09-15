@@ -72,7 +72,7 @@ impl KubernetesRuntime {
         receipt: &shared_types::UserAppOperationLeaseReceipt,
     ) -> ContainerRuntimeResult<()> {
         context
-            .validate_identity(&context.app_id, Some(&context.user_id))
+            .validate_identity(&context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         receipt
             .validate()
@@ -157,7 +157,7 @@ impl KubernetesRuntime {
         let mut annotations = std::collections::BTreeMap::new();
         if let Some(context) = context {
             context
-                .validate_identity(app_id, Some(&context.user_id))
+                .validate_identity(app_id)
                 .map_err(ContainerRuntimeError::ConfigurationError)?;
             annotations.insert(
                 "rcoder.io/operation-id".into(),

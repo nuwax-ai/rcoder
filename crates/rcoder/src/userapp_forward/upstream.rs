@@ -13,7 +13,10 @@ use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
 
-use shared_types::{APP_ID_HEADER, USER_ID_HEADER};
+use shared_types::APP_ID_HEADER;
+
+/// 旧用户 header 名（仅用于转发边界移除，不再是 UserApp 对外契约）
+const LEGACY_USER_ID_HEADER: &str = "x-user-id";
 
 use crate::router::AppState;
 use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder_until};
@@ -92,27 +95,17 @@ pub(super) fn missing_app_id_response() -> Response {
     .into_response()
 }
 
-/// 从 [`USER_ID_HEADER`] 提取 owner 显式档（`Ok(None)` = 缺失/空白，降级
+/// 旧 x-user-id 按名称移除（Java 不再发送；意外携带时剥离防下游消费）
 /// metadata 兜底；透传族 body 流式不解析，header 是零成本显式档来源）。
 ///
 /// identifier 白名单必做：user_id 进宿主树路径 `dev/{user_id}/{app_id}` 拼接，
 /// 含 `/` 即逃逸开发卷根——非法值 400 fail-fast（与 `require_app_id` 同源，
 /// 不静默降级防配置错误被吞）。
-pub(super) fn explicit_user_id_from_headers(
-    headers: &axum::http::HeaderMap,
-) -> Result<Option<String>, Box<Response>> {
-    let Some(raw) = headers
-        .get(USER_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(None);
-    };
-    match shared_types::validate_identifier(raw, "user_id") {
-        Ok(()) => Ok(Some(raw.to_owned())),
-        Err(e) => Err(HttpResultError::bad_request(e).into_boxed_response()),
-    }
+pub(super) fn strip_legacy_user_id_header(headers: &mut axum::http::HeaderMap) {
+    // 旧 x-user-id 按名称移除（不读取值）：Java 不再发送，意外携带时
+    // 转发边界剥离以防下游消费（spec §2.1）
+    headers.remove(LEGACY_USER_ID_HEADER);
+}
 }
 
 /// 定位（miss 幂等 ensure）开发容器 file-server addr。
@@ -125,7 +118,7 @@ pub(super) fn explicit_user_id_from_headers(
 async fn resolve_dev_addr(
     state: &AppState,
     app_id: &str,
-    explicit_user_id: Option<&str>,
+
 ) -> Result<String, Box<Response>> {
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
@@ -144,7 +137,7 @@ async fn resolve_dev_addr(
 async fn resolve_dev_addr_inner(
     state: &AppState,
     app_id: &str,
-    explicit_user_id: Option<&str>,
+
     deadline: tokio::time::Instant,
 ) -> Result<String, Box<Response>> {
     let mut info = ensure_userapp_builder_until(state, app_id, explicit_user_id, deadline)
@@ -328,7 +321,7 @@ pub(crate) async fn forward_to_dev(
     state: &AppState,
     app_id: &str,
     req: Request,
-    explicit_user_id: Option<&str>,
+
 ) -> Response {
     if !matches!(
         super::semantics::classify_dev_absent(req.uri().path()),

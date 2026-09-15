@@ -16,7 +16,7 @@ impl WorkspaceRuntime for DockerRuntime {
         context: &shared_types::UserAppExecutionContext,
     ) -> ContainerRuntimeResult<Option<shared_types::UserAppStorageResizeTarget>> {
         context
-            .validate_identity(&context.app_id, Some(&context.user_id))
+            .validate_identity(&context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         Ok(None)
     }
@@ -68,7 +68,7 @@ impl WorkspaceRuntime for DockerRuntime {
         // （workspace + data/logs/agent-store，对应 K8s 删单卷 PVC）+ 兜底删旧
         // RCODER_WORKSPACE_ROOT/{app_id} 制品目录（四目录化前的旧布局孤儿）。
         // uid 不在本层（无元数据视图）→ 通配扫 `prod/*/` 一层按
-        // userapp_prod_subpaths(uid, app_id) 精确匹配四段——与 dev cleanup
+        // userapp_prod_subpaths(app_id) 精确匹配四段——与 dev cleanup
         // （dev_cleanup.rs 通配 dev/*/）完全同款模式，顺带覆盖 uid 兜底不一致的目录。
         // 幂等：目录不存在返回 Ok（对应 K8s PVC 404→Ok）。app_id 经 service 层
         // validate_app_id 校验（DNS-1123，无 .. / 路径穿越），join 安全。
@@ -121,7 +121,7 @@ impl WorkspaceRuntime for DockerRuntime {
                 }
             }
             for uid in uid_entries {
-                for sub in shared_types::paths::userapp_prod_subpaths(&uid, app_id) {
+                for sub in shared_types::paths::userapp_prod_subpaths(app_id) {
                     let dir =
                         std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
                             .join(&sub);

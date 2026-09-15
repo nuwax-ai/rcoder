@@ -167,7 +167,7 @@ pub(crate) async fn install_project(
     Path((app_id, _app_stage)): Path<(String, String)>,
     Json(body): Json<UserappInstallBody>,
 ) -> Result<axum::Json<HttpResult<Value>>, crate::UserAppError> {
-    tracing::debug!(app_id = %app_id, user_id = %body.user_id, "userapp install-project");
+    tracing::debug!(app_id = %app_id, user_id = %body, "userapp install-project");
     let activity = state
         .build_tasks
         .workspace_activity(&app_id)
@@ -214,7 +214,7 @@ pub(crate) async fn zip_workspace(
     Json(body): Json<UserappZipBody>,
 ) -> Result<Response, AppError> {
     let src = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
-    let filename = format!("{}_{}.zip", body.user_id, body.app_id);
+    let filename = format!("{}_{}.zip", body, body.app_id);
     zip_workspace_impl(
         &state.fs,
         src,
@@ -246,8 +246,8 @@ pub(crate) async fn download_all_files(
 ) -> Result<Response, AppError> {
     q.validate().map_err(file_server::error::from_garde)?;
     let src = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
-    let prefix = format!("{}_{}/", q.user_id, q.app_id);
-    let filename = format!("{}_{}.zip", q.user_id, q.app_id);
+    let prefix = format!("{}_{}/", q, q.app_id);
+    let filename = format!("{}_{}.zip", q, q.app_id);
     download_all_files_impl(&state.fs, src, prefix, filename).await
 }
 
@@ -427,7 +427,6 @@ mod tests {
             State(state),
             AppJson(UserappExecCommandBody {
                 app_id: "app-exec".into(),
-                user_id: "u".into(),
                 command: "printf out-xyz".into(),
             }),
         )

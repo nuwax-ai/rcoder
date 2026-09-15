@@ -355,10 +355,14 @@ pyroscope = { version = "2.1", features = ["backend-pprof-rs"] }
 # 不进 default features → 生产构建（build-agent-docker）完全无感。
 hotpath = { version = "0.25.1", default-features = false }
 
-# 依赖不产出 debuginfo（DWARF）：调试走日志、不进依赖断点，依赖帧回溯缺行号可接受。
+# 开发调试使用日志，不使用源码断点；workspace 成员不产出 debuginfo（DWARF）。
+[profile.dev]
+debug = false
+
+# 依赖同样不产出 debuginfo，回溯缺行号可接受。
 # 收益：unpacked split-debuginfo 下依赖不再生成海量 .o 调试小文件
 # （曾致 deps 百万文件 / target 717GB 的随机小 IO 风暴），编译、链接、清理全面提速。
-# "*" 通配只匹配依赖，workspace 成员仍保留完整调试信息。
+# "*" 通配只匹配依赖。
 [profile.dev.package."*"]
 debug = false
 

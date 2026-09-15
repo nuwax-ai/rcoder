@@ -38,7 +38,7 @@ impl KubernetesRuntime {
         pod_spec: PodSpec,
     ) -> ContainerRuntimeResult<()> {
         context
-            .validate_identity(&context.app_id, Some(&context.user_id))
+            .validate_identity(&context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         let family = ServiceType::UserappBuilder;
         let mut desired = self.build_agent_statefulset(&context.app_id, &family, pod_spec, 1)?;

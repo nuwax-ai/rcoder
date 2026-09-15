@@ -12,7 +12,7 @@ use shared_types::{
 fn validate_request(app_id: &str, request: &AdoptBuilderRequest) -> Result<()> {
     for (field, value) in [
         ("app_id", app_id),
-        ("user_id", request.user_id.as_str()),
+        ("user_id", request.as_str()),
         ("lifecycle_id", request.lifecycle_id.as_str()),
         ("request_id", request.request_id.as_str()),
     ] {
@@ -46,7 +46,6 @@ pub(crate) async fn execute(
             .admit_with_input(
                 &UserAppAdmission {
                     app_id: app_id.clone(),
-                    user_id: request.user_id.clone(),
                     lifecycle_id: Some(request.lifecycle_id.clone()),
                     request_id: Some(request.request_id.clone()),
                     operation_id: uuid::Uuid::new_v4().to_string(),
@@ -79,7 +78,7 @@ pub(crate) async fn execute(
                 .into());
             }
         };
-        run(&state, record, &request.user_id).await
+        run(&state, record, &request).await
     })
     .await
     .context("Observe builder adoption worker")?
@@ -113,14 +112,14 @@ pub(super) async fn resume_pending(
     if app.state != UserAppLifecycleState::Active || app.lifecycle_id != current.lifecycle_id {
         return Err(UserAppStoreError::LifecycleConflict.into());
     }
-    run(state, current, &app.user_id).await?;
+    run(state, current, &app).await?;
     Ok(true)
 }
 
 async fn run(
     state: &AppState,
     record: UserAppOperationRecord,
-    owner: &str,
+
 ) -> Result<BuilderControlResult> {
     let executor = uuid::Uuid::new_v4().to_string();
     // owner 实例复合 identifier（adoption 属 owner 生命周期操作——受理按纯
@@ -144,7 +143,6 @@ async fn run(
         .await?;
     let context = UserAppExecutionContext {
         app_id: instance,
-        user_id: owner.into(),
         lifecycle_id: claimed.lifecycle_id.clone(),
         operation_id: claimed.operation_id.clone(),
         executor_id: executor.clone(),
@@ -156,7 +154,7 @@ async fn run(
         let input = state.userapp_store.read_execution_input(&context).await?;
         let request: AdoptBuilderRequest =
             serde_json::from_str(input.encoded()).context("Decode builder adoption request")?;
-        if request.lifecycle_id != context.lifecycle_id || request.user_id != context.user_id {
+        if request.lifecycle_id != context.lifecycle_id || request != context {
             return Err(anyhow!("Stored adoption identity mismatch"));
         }
         let mut lease = super::dev_cleanup::BuilderOperation::new(
@@ -188,7 +186,6 @@ async fn run(
             .ok_or_else(|| anyhow!("Builder disappeared before adoption"))?;
         let binding = UserAppResourceBinding {
             app_id: context.app_id.clone(),
-            user_id: context.user_id.clone(),
             lifecycle_id: context.lifecycle_id.clone(),
             service_type: shared_types::ServiceType::UserappBuilder,
             physical_uid: workload.uid,
@@ -294,7 +291,7 @@ pub(super) async fn verify_live_builder(
     state: &AppState,
     app_id: &str,
     instance: &str,
-    instance_user: &str,
+
     physical_id: &str,
 ) -> Result<()> {
     let app = state
@@ -307,7 +304,6 @@ pub(super) async fn verify_live_builder(
     }
     let context = UserAppExecutionContext {
         app_id: instance.into(),
-        user_id: instance_user.into(),
         lifecycle_id: app.lifecycle_id,
         operation_id: "read-only-verification".into(),
         executor_id: "reader".into(),
@@ -377,7 +373,6 @@ mod tests {
     #[test]
     fn adoption_requires_explicit_lifecycle_request_and_physical_identity() {
         let request = AdoptBuilderRequest {
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             request_id: "request".into(),
             expected_container_id: "physical-uid".into(),

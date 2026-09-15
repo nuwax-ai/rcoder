@@ -300,7 +300,7 @@ impl AgentContainerRuntime for KubernetesRuntime {
                 .map_err(|error| ContainerRuntimeError::ConfigurationError(error.to_string()))?;
             if let Some(context) = &params.execution_context {
                 context
-                    .validate_identity(identifier, params.user_id.as_deref())
+                    .validate_identity(identifier)
                     .map_err(ContainerRuntimeError::ConfigurationError)?;
             }
             Some(

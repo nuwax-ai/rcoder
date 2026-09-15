@@ -691,7 +691,6 @@ mod tests {
     fn builder_reuse_checks_physical_identity_without_requiring_creation_operation() {
         let context = shared_types::UserAppExecutionContext {
             app_id: "app".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life-one".into(),
             operation_id: "operation-one".into(),
             executor_id: "executor-one".into(),

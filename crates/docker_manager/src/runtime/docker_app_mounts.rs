@@ -31,7 +31,7 @@ pub(super) async fn build_prod_flat_mounts(
             "Userapp prod volume host path resolve failed (rcoder 容器需挂载 userapp-workspace 锚点): {e}"
         ))
     })?;
-    let subs = shared_types::paths::userapp_prod_subpaths(uid, app_id);
+    let subs = shared_types::paths::userapp_prod_subpaths(app_id);
     let mut mounts = Vec::with_capacity(4);
     for (rel, target) in subs.iter().zip(prod_flat_container_paths(app_id)) {
         let precreate =
@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn prod_flat_mounts_pair_with_layout_source() {
-        let subs = shared_types::paths::userapp_prod_subpaths("u1", "a1");
+        let subs = shared_types::paths::userapp_prod_subpaths("a1");
         let targets = prod_flat_container_paths("a1");
         // 段序配对：workspace/data/logs/agent-store → /home/user 下四挂载点
         assert_eq!(
@@ -94,7 +94,7 @@ mod tests {
         // data 段兼容视图与布局事实源一致（清理链存量调用方依赖）
         assert_eq!(
             subs[1],
-            shared_types::paths::userapp_prod_data_subpath("u1", "a1")
+            shared_types::paths::userapp_prod_data_subpath("a1")
         );
     }
 }

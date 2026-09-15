@@ -41,7 +41,6 @@ pub async fn pod_stop(
                 &state,
                 app_id,
                 shared_types::UserAppControlRequest {
-                    user_id: request.user_id,
                     lifecycle_id: request.lifecycle_id,
                     request_id: request.request_id,
                 },
@@ -53,7 +52,6 @@ pub async fn pod_stop(
                 &state,
                 app_id,
                 shared_types::UserAppControlRequest {
-                    user_id: request.user_id,
                     lifecycle_id: request.lifecycle_id,
                     request_id: request.request_id,
                 },

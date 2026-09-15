@@ -94,7 +94,7 @@ pub const USERAPP_DEV_DBX_DATA: &str = "/home/user/data/dbx";
 // dev cleanup（purge 通配清理）、docker_app_runtime/k8s_app_create/app_manager
 // （prod 挂载与清理定位）共用——改布局只动这里。
 
-/// Userapp 宿主树 `{dev|prod}/{user_id}/` 下四目录的 app 侧后缀段
+/// Userapp 宿主树 `{dev|prod}/userapp/` 下四目录的 app 侧后缀段
 /// （`{app_id}` / `data/{app_id}` / `logs/{app_id}` / `agent-store/{app_id}`）——
 /// dev 与 prod 布局同构，共用此 suffix。
 pub fn userapp_dev_app_suffixes(app_id: &str) -> [String; 4] {
@@ -106,22 +106,27 @@ pub fn userapp_dev_app_suffixes(app_id: &str) -> [String; 4] {
     ]
 }
 
-/// Userapp 开发卷宿主树四目录的完整子路径（`dev/{user_id}/…`，锚点相对）。
-pub fn userapp_dev_subpaths(user_id: &str, app_id: &str) -> [String; 4] {
-    userapp_dev_app_suffixes(app_id).map(|s| format!("dev/{user_id}/{s}"))
+/// Userapp 存储命名空间（固定，spec §3——不输出内部服务族字符串）。
+pub const USERAPP_STORAGE_NAMESPACE: &str = "userapp";
+
+/// Userapp 开发卷宿主树四目录的完整子路径（`dev/userapp/…`，锚点相对）。
+/// 布局由用户维度 `dev/{user_id}/…` 迁移为固定命名空间 `dev/userapp/…`
+/// （移除用户绑定后同 app 全使用者共享 dev，spec/userapp-remove-user-id-binding）。
+pub fn userapp_dev_subpaths(app_id: &str) -> [String; 4] {
+    userapp_dev_app_suffixes(app_id).map(|s| format!("dev/{USERAPP_STORAGE_NAMESPACE}/{s}"))
 }
 
-/// Userapp prod 宿主树四目录的完整子路径（`prod/{user_id}/…`，锚点相对）——
+/// Userapp prod 宿主树四目录的完整子路径（`prod/userapp/…`，锚点相对）——
 /// 运行容器四 bind/四 subPath 挂载源与 clear/destroy 清理定位共用，
 /// 与 [`userapp_dev_subpaths`] 布局同构（仅 dev→prod 一层之差）。
-pub fn userapp_prod_subpaths(user_id: &str, app_id: &str) -> [String; 4] {
-    userapp_dev_app_suffixes(app_id).map(|s| format!("prod/{user_id}/{s}"))
+pub fn userapp_prod_subpaths(app_id: &str) -> [String; 4] {
+    userapp_dev_app_suffixes(app_id).map(|s| format!("prod/{USERAPP_STORAGE_NAMESPACE}/{s}"))
 }
 
-/// Userapp prod 数据目录子路径（`prod/{user_id}/data/{app_id}`，锚点相对）——
+/// Userapp prod 数据目录子路径（`prod/userapp/data/{app_id}`，锚点相对）——
 /// [`userapp_prod_subpaths`] 第二段的兼容视图（存量调用方零改动）。
-pub fn userapp_prod_data_subpath(user_id: &str, app_id: &str) -> String {
-    userapp_prod_subpaths(user_id, app_id)[1].clone()
+pub fn userapp_prod_data_subpath(app_id: &str) -> String {
+    userapp_prod_subpaths(app_id)[1].clone()
 }
 
 /// Userapp 运行容器内的应用代码根（**部署契约**：activate 后整体包落此目录，
@@ -142,15 +147,15 @@ mod tests {
 
     #[test]
     fn userapp_prod_subpaths_mirror_dev_layout() {
-        let dev = userapp_dev_subpaths("u1", "a1");
-        let prod = userapp_prod_subpaths("u1", "a1");
+        let dev = userapp_dev_subpaths("a1");
+        let prod = userapp_prod_subpaths("a1");
         assert_eq!(
             prod,
             [
-                "prod/u1/a1".to_string(),
-                "prod/u1/data/a1".to_string(),
-                "prod/u1/logs/a1".to_string(),
-                "prod/u1/agent-store/a1".to_string(),
+                "prod/userapp/a1".to_string(),
+                "prod/userapp/data/a1".to_string(),
+                "prod/userapp/logs/a1".to_string(),
+                "prod/userapp/agent-store/a1".to_string(),
             ]
         );
         // 布局同构：仅 dev→prod 前缀之差
@@ -162,8 +167,8 @@ mod tests {
     #[test]
     fn userapp_prod_data_subpath_stays_compatible() {
         assert_eq!(
-            userapp_prod_data_subpath("u1", "a1"),
-            "prod/u1/data/a1",
+            userapp_prod_data_subpath("a1"),
+            "prod/userapp/data/a1",
             "存量调用方（storage/docker_app_runtime）依赖的 data 段视图不变"
         );
     }

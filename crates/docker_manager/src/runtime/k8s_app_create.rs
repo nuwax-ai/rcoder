@@ -202,7 +202,7 @@ impl KubernetesRuntime {
         let mut annotations = merge_app_annotations(params).unwrap_or_default();
         if let Some(context) = &params.execution_context {
             context
-                .validate_identity(app_id, params.user_id.as_deref())
+                .validate_identity(app_id)
                 .map_err(ContainerRuntimeError::ConfigurationError)?;
             annotations.extend(context.resource_metadata());
         }

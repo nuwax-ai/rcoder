@@ -52,18 +52,15 @@ impl AgentContainerRuntime for DockerRuntime {
         self.capture_builder(app_id).await
     }
     async fn find_builder_instances(&self, app_id: &str) -> ContainerRuntimeResult<Vec<String>> {
-        // Docker 形态：容器名 `rcoder-app-builder-{user_id}-{app_id}`——全量
-        // 列举后按 builder 族 + 复合键 app 段过滤（含已停容器——清扫语义
-        // 要覆盖非 Running 残留；无 PVC 概念，bind 目录由 snapshot 的
-        // docker_bind_cleanup 全 user 清扫覆盖）。
+        // Docker 形态：容器名 `rcoder-app-builder-{app_id}`（纯 app_id，无用户
+        // 维度）——全量列举后按 builder 族 + identifier 过滤（含已停容器——清扫
+        // 语义要覆盖非 Running 残留）。
         let mut result = Vec::new();
         for container in self.list_containers().await? {
             if container.service_type.as_ref() != Some(&ServiceType::UserappBuilder) {
                 continue;
             }
-            if let Some(identifier) = container.identity_key().filter(|id| {
-                shared_types::parse_builder_instance_id(id).is_some_and(|(_, app)| app == app_id)
-            }) {
+            if let Some(identifier) = container.identity_key().filter(|id| *id == app_id) {
                 result.push(identifier.to_string());
             }
         }
@@ -174,7 +171,7 @@ impl AgentContainerRuntime for DockerRuntime {
                 .map_err(|error| ContainerRuntimeError::ConfigurationError(error.to_string()))?;
             if let Some(context) = &params.execution_context {
                 context
-                    .validate_identity(identifier, params.user_id.as_deref())
+                    .validate_identity(identifier)
                     .map_err(ContainerRuntimeError::ConfigurationError)?;
             }
             Some(
@@ -488,9 +485,7 @@ impl DockerRuntime {
             // 容器内契约要纯 app_id：builder 场景 project_id 槽是复合串——
             // 缓存条目创建时若带显式 builder_app_id 则直用，否则右切还原
             let project_id_env = if c.service_type.as_ref() == Some(&ServiceType::UserappBuilder) {
-                shared_types::parse_builder_instance_id(&c.project_id)
-                    .map(|(_, app_id)| app_id.to_string())
-                    .unwrap_or_else(|| c.project_id.clone())
+                c.project_id.clone()
             } else {
                 c.project_id.clone()
             };

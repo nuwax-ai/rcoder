@@ -83,7 +83,6 @@ pub const APP_STAGE_HEADER: &str = "x-app-stage";
 /// 解析即可拿到懒创建开发容器的 owner user_id（owner 三档解析的显式档）。
 /// 缺失/空白 = 未传（降级 metadata 兜底）；值须过 identifier 白名单
 /// （进宿主树路径 `dev/{user_id}/{app_id}` 拼接，防逃逸——与 app_id 同源）。
-pub const USER_ID_HEADER: &str = "x-user-id";
 
 /// 用户维度工作目录 header（对齐 TS nuwax-file-server 1.4.5 `resolveServiceContext`，
 /// 原名 `x-workspace-dir` 随 f979df7→00134aa 改名）：Java/前端注入，值为一跨平台
@@ -176,7 +175,6 @@ mod tests {
         assert_eq!(SERVICE_TYPE_HEADER, "x-service-type");
         assert_eq!(APP_ID_HEADER, "x-app-id");
         assert_eq!(APP_STAGE_HEADER, "x-app-stage");
-        assert_eq!(USER_ID_HEADER, "x-user-id");
     }
 
     /// 用户维度工作目录 header 名与 TS `resolveServiceContext` 读取的 header 名

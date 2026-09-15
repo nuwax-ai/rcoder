@@ -107,7 +107,6 @@ pub(super) async fn ensure_agent_installed_if_needed(
 /// 注册 VNC 后端到 Pingora（用于 WebSocket 代理）
 pub(super) fn register_vnc_backend(
     state: &Arc<AppState>,
-    user_id: &str,
     container_info: &ContainerBasicInfo,
 ) {
     if let Some(ref pingora_service) = state.pingora_service {
@@ -237,7 +236,6 @@ pub(super) fn resolve_forward_request(
 pub(super) async fn update_session_mappings_after_response(
     state: &Arc<AppState>,
     result: &HttpResult<ChatResponse>,
-    user_id: &str,
     project_id: &str,
     container_info: &ContainerBasicInfo,
     request: &ComputerChatRequest,

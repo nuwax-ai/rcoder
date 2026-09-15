@@ -246,7 +246,6 @@ pub async fn pod_keepalive(
 async fn keepalive_userapp_dev(
     state: &Arc<AppState>,
     app_id: String,
-    user_id: &str,
 ) -> Result<HttpResult<KeepalivePodResponse>, AppError> {
     // 单次读取防两读间记录变动（previous 与 existed 自洽）
     let registered = state.get_project(&app_id);

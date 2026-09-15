@@ -210,7 +210,7 @@ impl KubernetesRuntime {
                 ensure_userapp_pvc(&pvc)?;
                 if let Some(context) = context {
                     context
-                        .validate_identity(app_id, Some(&context.user_id))
+                        .validate_identity(app_id)
                         .map_err(Error::ConfigurationError)?;
                     let annotations = pvc.metadata.annotations.as_ref().ok_or_else(|| {
                         Error::Conflict(

@@ -183,7 +183,7 @@ pub(crate) async fn files_update(
     Ok(Json(json!({
         "success": true,
         "message": "User files updated successfully",
-        "user_id": body.user_id,
+        "user_id": body,
         "app_id": body.app_id,
         "files_count": count,
     })))
@@ -568,7 +568,6 @@ mod tests {
         // 2. get-file-list (镜像壳 Query handler) 应看到模板文件
         let q = Query(UserappFileListQuery {
             app_id: "app-1".into(),
-            user_id: "u".into(),
             proxy_path: None,
             custom_target_dir: None,
             relative_path: None,
@@ -590,7 +589,6 @@ mod tests {
             State(state),
             Path(("app-1".into(), "dev".into())),
             AppJson(crate::models::ProjectChainBody {
-                user_id: "u1".into(),
                 project_dir: "demo-app".into(),
             }),
         )
@@ -611,7 +609,6 @@ mod tests {
             State(state.clone()),
             Json(UserappGenerateFileBody {
                 app_id: "app-2".into(),
-                user_id: "u".into(),
                 file_name: "src/a.txt".into(),
                 content: Some("hi".into()),
                 custom_target_dir: None,
@@ -628,7 +625,6 @@ mod tests {
             State(state),
             Query(UserappResolveFileQuery {
                 app_id: "app-2".into(),
-                user_id: "u".into(),
                 proxy_path: Some("/proxy".into()),
                 custom_target_dir: None,
                 file_path: "src/a.txt".into(),
@@ -649,7 +645,6 @@ mod tests {
             State(state),
             Json(UserappFilesUpdateBody {
                 app_id: "app-3".into(),
-                user_id: "u".into(),
                 files: vec![crate::models::UserappFileOp {
                     operation: "create".into(),
                     name: "pkg.json".into(),
@@ -685,7 +680,6 @@ mod tests {
             State(state),
             Json(UserappFilesUpdateBody {
                 app_id: "app-reset".into(),
-                user_id: "u".into(),
                 files: vec![crate::models::UserappFileOp {
                     operation: "create".into(),
                     name: "after-reset.txt".into(),

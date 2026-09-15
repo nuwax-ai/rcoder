@@ -48,7 +48,7 @@ pub(crate) async fn create_workspace(
 ) -> Result<HttpResult<serde_json::Value>, AppError> {
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
-    shared_types::validate_identifier(&body.user_id, "user_id")
+    shared_types::validate_identifier(&body, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
 
     // 1. metadata 注册 owner（部署前即可被发布编排/apps URL 拼接查到）。
@@ -57,7 +57,7 @@ pub(crate) async fn create_workspace(
     //    ensure 才能首次创建即落正确分区（否则兜底 app_id 分区）。
     state
         .app_service
-        .record_dev_registration(&body.app_id, &body.user_id)
+        .record_dev_registration(&body.app_id, &body)
         .await
         .map_err(|e| {
             tracing::warn!(
@@ -71,7 +71,7 @@ pub(crate) async fn create_workspace(
         })?;
 
     // 2. ensure 开发容器（幂等；注册 state.projects）——owner 显式档直传
-    let info = ensure_userapp_builder(&state, &body.app_id, Some(&body.user_id))
+    let info = ensure_userapp_builder(&state, &body.app_id, Some(&body))
         .await
         .map_err(|e| {
             tracing::error!(
@@ -86,17 +86,17 @@ pub(crate) async fn create_workspace(
 
     // 3. 容器内建 workspace 目录（幂等）
     let addr = dev_file_server_addr(&state, &info);
-    super::ensure_workspace_via_dev(&addr, &body.app_id, &body.user_id)
+    super::ensure_workspace_via_dev(&addr, &body.app_id, &body)
         .await
         .map_err(|e| AppError::with_message(shared_types::error_codes::ERR_CONTAINER_ERROR, e))?;
 
     info!(
         "[USERAPP_FORWARD] workspace created: app_id={}, user_id={}, container={}, ip={}",
-        body.app_id, body.user_id, info.container_name, info.container_ip
+        body.app_id, body, info.container_name, info.container_ip
     );
     Ok(HttpResult::success(json!({
         "app_id": body.app_id,
-        "user_id": body.user_id,
+        "user_id": body,
         "container_name": info.container_name,
         "container_ip": info.container_ip,
     })))

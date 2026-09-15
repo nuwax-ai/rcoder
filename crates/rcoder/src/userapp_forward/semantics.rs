@@ -505,7 +505,6 @@ mod authoritative_lookup_tests {
             service_type: Some(shared_types::ServiceType::UserappBuilder),
             app_id: Some("appa".into()),
             project_id: None,
-            user_id: None,
             pod_id: None,
         }
     }

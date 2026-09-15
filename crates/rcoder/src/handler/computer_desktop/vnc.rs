@@ -159,7 +159,6 @@ pub async fn computer_desktop_vnc(
         direct_websocket_url,
         container_id: container_info.container_id.clone(),
         container_ip: container_ip.clone(),
-        user_id: user_id.clone(),
         project_id: project_id.clone(),
         message: "请使用 proxy_vnc_url 或 proxy_websocket_url 通过 Pingora 代理访问 VNC 桌面"
             .to_string(),

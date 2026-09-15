@@ -70,7 +70,7 @@ pub(crate) async fn find_dev_container(
     // 定位键 = 复合 identifier `{user_id}-{app_id}`（协作模型多实例——同 app
     // 每用户独立容器）。组装失败（app_id 含 '-' 等结构冲突）跳过注册表快路，
     // 由 ensure 链给出明确错误。
-    let instance = shared_types::builder_instance_id(user_id, app_id).ok();
+    let instance = Some(app_id.to_string());
     if let Some(ip) = instance
         .as_deref()
         .and_then(|key| {

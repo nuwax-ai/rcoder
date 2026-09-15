@@ -27,7 +27,7 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         target
             .context
-            .validate_identity(&target.context.app_id, Some(&target.context.user_id))
+            .validate_identity(&target.context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         if target.resource.kind != shared_types::AppResourceKind::Deployment
             || target.resource.name != self.app_deployment_name(&target.context.app_id)
@@ -79,7 +79,7 @@ impl KubernetesRuntime {
         expected_version: Option<&str>,
     ) -> ContainerRuntimeResult<shared_types::AppResourceIdentity> {
         context
-            .validate_identity(&context.app_id, Some(&context.user_id))
+            .validate_identity(&context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         let name = self.app_deployment_name(&context.app_id);
         let deployment = self.deployments_api().get(&name).await.map_err(|error| {
@@ -120,7 +120,7 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         target
             .context
-            .validate_identity(&target.context.app_id, Some(&target.context.user_id))
+            .validate_identity(&target.context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         if target.resource.kind != shared_types::AppResourceKind::Deployment
             || target.resource.name != self.app_deployment_name(&target.context.app_id)
@@ -149,7 +149,7 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         target
             .context
-            .validate_identity(&target.context.app_id, Some(&target.context.user_id))
+            .validate_identity(&target.context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         if target.resource.kind != shared_types::AppResourceKind::Deployment
             || target.resource.name != self.app_deployment_name(&target.context.app_id)
@@ -178,7 +178,7 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         target
             .context
-            .validate_identity(&target.context.app_id, Some(&target.context.user_id))
+            .validate_identity(&target.context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         if target.resource.name != self.app_deployment_name(&target.context.app_id) {
             return Err(ContainerRuntimeError::Conflict(

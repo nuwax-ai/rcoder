@@ -39,7 +39,6 @@ pub async fn pod_restart(
                 &state,
                 app_id,
                 shared_types::UserAppControlRequest {
-                    user_id: request.user_id.clone(),
                     lifecycle_id: request.lifecycle_id.clone(),
                     request_id: request.request_id.clone(),
                 },
@@ -51,7 +50,6 @@ pub async fn pod_restart(
                 &state,
                 app_id,
                 shared_types::UserAppControlRequest {
-                    user_id: request.user_id.clone(),
                     lifecycle_id: request.lifecycle_id.clone(),
                     request_id: request.request_id.clone(),
                 },
@@ -152,7 +150,6 @@ pub async fn pod_restart(
     );
 
     let options = ContainerCreateOptions {
-        user_id: request.user_id.clone(),
         project_id: request.project_id.clone(),
         resource_limits,
         pod_id: request.pod_id.clone(),

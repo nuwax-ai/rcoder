@@ -218,7 +218,6 @@ pub async fn computer_agent_stop(
                 let stop_response = ComputerAgentStopResponse {
                     success: true,
                     message,
-                    user_id: user_id.clone(),
                     pod_id: pod_id.clone(),
                     project_id: project_id.to_string(),
                 };
@@ -251,7 +250,6 @@ pub async fn computer_agent_stop(
                         let stop_response = ComputerAgentStopResponse {
                             success: true,
                             message,
-                            user_id: user_id.clone(),
                             pod_id: pod_id.clone(),
                             project_id: project_id.to_string(),
                         };
@@ -349,7 +347,6 @@ async fn stop_userapp_dev(
                 return Ok(HttpResult::success(ComputerAgentStopResponse {
                     success: true,
                     message,
-                    user_id: request.user_id.clone(),
                     pod_id: None,
                     project_id: app_id.to_string(),
                 }));
@@ -370,7 +367,6 @@ async fn stop_userapp_dev(
                     Ok(HttpResult::success(ComputerAgentStopResponse {
                         success: true,
                         message,
-                        user_id: request.user_id.clone(),
                         pod_id: None,
                         project_id: app_id.to_string(),
                     }))

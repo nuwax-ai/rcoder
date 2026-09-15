@@ -133,7 +133,6 @@ pub(super) async fn forward_computer_request_to_container(
             user_prompt: request.user_prompt.clone(),
             agent_config: request.agent_config.clone(),
             service_type: Some(params.service_type.clone()),
-            user_id: Some(request.user_id.clone()),
             is_devcomputer: params.is_devcomputer,
             agent_work_dir: agent_work_dir.clone(),
             app_id: app_id.clone(),

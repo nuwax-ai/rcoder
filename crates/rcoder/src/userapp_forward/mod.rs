@@ -196,7 +196,6 @@ pub fn routes() -> Router<Arc<AppState>> {
 pub(crate) async fn ensure_workspace_via_dev(
     addr: &str,
     app_id: &str,
-    user_id: &str,
 ) -> Result<(), String> {
     // 五档退避最坏 120s：agent_runner(file-server 60000) 在宿主高负载（多 builder 并发
     // 构建/对话）下启动可超 30s——原三档 30s 上限在 e2e 六场景并行时实测不够
@@ -259,7 +258,7 @@ mod tests {
         let raw = serde_json::json!({"app_id": "app1", "user_id": "u1"});
         let body: CreateWorkspaceBody = serde_json::from_value(raw).expect("deserialize");
         assert_eq!(body.app_id, "app1");
-        assert_eq!(body.user_id, "u1");
+        assert_eq!(body, "u1");
         // 旧 camel wire 已废弃：未知键被忽略后必填字段缺失即拒
         let legacy = serde_json::json!({"appId": "app1", "userId": "u1"});
         assert!(serde_json::from_value::<CreateWorkspaceBody>(legacy).is_err());

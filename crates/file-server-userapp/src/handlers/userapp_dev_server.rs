@@ -133,7 +133,7 @@ pub(crate) async fn dev_start(
             Err(e) => return super::userapp::dev_precheck_reply(e),
         };
     let result = async {
-        tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev start");
+        tracing::info!(app_id = %body.app_id, user_id = %body, "userapp dev start");
         let task_id = spawn_dev_task(
             state,
             &body.app_id,
@@ -243,7 +243,7 @@ pub(crate) async fn dev_restart(
             Err(e) => return super::userapp::dev_precheck_reply(e),
         };
     let result = async {
-        tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev restart");
+        tracing::info!(app_id = %body.app_id, user_id = %body, "userapp dev restart");
         let task_id = spawn_dev_task(
             state,
             &body.app_id,
@@ -506,9 +506,9 @@ pub(crate) async fn dev_list(
     let result = async {
         shared_types::validate_identifier(&q.app_id, "app_id")
             .map_err(|e| AppError::validation(e.to_string()))?;
-        shared_types::validate_identifier(&q.user_id, "user_id")
+        shared_types::validate_identifier(&q, "user_id")
             .map_err(|e| AppError::validation(e.to_string()))?;
-        tracing::debug!(app_id = %q.app_id, user_id = %q.user_id, "dev list");
+        tracing::debug!(app_id = %q.app_id, user_id = %q, "dev list");
         let wanted = dev_key(&q.app_id);
         let processes: Vec<DevProcess> = state.fs.dev_server.list_dev()?;
         let list = processes
@@ -555,7 +555,7 @@ pub(crate) async fn framework_info(
     let result = async {
         shared_types::validate_identifier(&q.app_id, "app_id")
             .map_err(|e| AppError::validation(e.to_string()))?;
-        shared_types::validate_identifier(&q.user_id, "user_id")
+        shared_types::validate_identifier(&q, "user_id")
             .map_err(|e| AppError::validation(e.to_string()))?;
         let ws = resolve_userapp_dev(&q.app_id, None, &state.fs.config)?;
         // discover 严格模式：manifest 损坏即 400（识别接口必须给出可信清单，
@@ -718,7 +718,6 @@ mod precheck_reply_tests {
             State(state.clone()),
             Json(DevOpBody {
                 app_id: "app-7".into(),
-                user_id: "u".into(),
                 base_path: None,
             }),
         )

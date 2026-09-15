@@ -210,7 +210,7 @@ pub(crate) async fn upload_from_url(
         .map(|m| m.len())
         .map_err(|e| AppError::system(format!("stat downloaded file: {e}")))?;
     let result = upload_impl(&root, &body.target, body.flatten, tmp.path(), size).await?;
-    info!(app_id = %body.app_id, user_id = %body.user_id, url = %body.url, "app-files upload-from-url done");
+    info!(app_id = %body.app_id, user_id = %body, url = %body.url, "app-files upload-from-url done");
     Ok(Json(json!({
         "success": true,
         "file_path": result.file_path,
@@ -239,7 +239,7 @@ pub(crate) async fn list(
     State(state): State<UserAppState>,
     Query(params): Query<AppFilesListParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    tracing::debug!(app_id = %params.app_id, user_id = %params.user_id, "app-files list");
+    tracing::debug!(app_id = %params.app_id, user_id = %params, "app-files list");
     let _workspace_activity = state
         .build_tasks
         .workspace_activity(&params.app_id)
@@ -317,7 +317,7 @@ pub(crate) async fn delete(
     State(state): State<UserAppState>,
     Json(body): Json<AppFilesDeleteBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    info!(app_id = %body.app_id, user_id = %body.user_id, path = %body.path, "app-files delete");
+    info!(app_id = %body.app_id, user_id = %body, path = %body.path, "app-files delete");
     let _workspace_activity = state
         .build_tasks
         .workspace_activity(&body.app_id)
@@ -380,7 +380,7 @@ pub(crate) async fn clear_target(
     State(state): State<UserAppState>,
     Query(query): Query<shared_types::UserAppWorkspaceClearProbe>,
 ) -> Result<Json<shared_types::UserAppWorkspaceClearTarget>, AppError> {
-    shared_types::validate_identifier(&query.user_id, "user_id").map_err(AppError::validation)?;
+    shared_types::validate_identifier(&query, "user_id").map_err(AppError::validation)?;
     resolve_userapp_dev(&query.app_id, None, &state.fs.config)?;
     Ok(Json(shared_types::UserAppWorkspaceClearTarget {
         app_id: query.app_id,
@@ -390,7 +390,7 @@ pub(crate) async fn clear_target(
 
 fn validate_clear_instance(body: &AppFilesClearBody, current: &str) -> AppResult<()> {
     shared_types::validate_identifier(&body.app_id, "app_id").map_err(AppError::validation)?;
-    shared_types::validate_identifier(&body.user_id, "user_id").map_err(AppError::validation)?;
+    shared_types::validate_identifier(&body, "user_id").map_err(AppError::validation)?;
     if body.expected_instance_id.is_empty() || body.expected_instance_id != current {
         return Err(AppError::business(
             "Workspace clear target changed; observe its current identity before submitting a new operation",
@@ -428,7 +428,7 @@ pub(crate) async fn clear(
     validate_clear_instance(&body, &CLEAR_INSTANCE)?;
     info!(
         app_id = %body.app_id,
-        user_id = %body.user_id,
+        user_id = %body,
         "app-files clear (workspace reset)"
     );
     let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
@@ -591,7 +591,6 @@ mod clear_identity_tests {
                         .body(Body::from(
                             serde_json::to_vec(&AppFilesClearBody {
                                 app_id: target.app_id.clone(),
-                                user_id: "owner".into(),
                                 expected_instance_id: instance.into(),
                             })
                             .expect("clear JSON"),
@@ -648,7 +647,6 @@ mod clear_identity_tests {
             State(state.clone()),
             Query(shared_types::UserAppWorkspaceClearProbe {
                 app_id: "clear-identity".into(),
-                user_id: "owner".into(),
             }),
         )
         .await
@@ -659,7 +657,6 @@ mod clear_identity_tests {
             State(state.clone()),
             Json(AppFilesClearBody {
                 app_id: "clear-identity".into(),
-                user_id: "owner".into(),
                 expected_instance_id: "previous-process".into(),
             }),
         )
@@ -677,7 +674,6 @@ mod clear_identity_tests {
                 State(state),
                 Json(AppFilesClearBody {
                     app_id: "clear-identity".into(),
-                    user_id: "owner".into(),
                     expected_instance_id: target.instance_id.clone(),
                 }),
             ),
@@ -707,7 +703,6 @@ mod clear_identity_tests {
         );
         let request = AppFilesClearBody {
             app_id: "app".into(),
-            user_id: "owner".into(),
             expected_instance_id: String::new(),
         };
         assert!(validate_clear_instance(&request, "current").is_err());

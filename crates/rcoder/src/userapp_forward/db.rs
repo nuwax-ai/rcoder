@@ -39,7 +39,6 @@ enum ExecChannel<'a> {
         /// dev 容器 file-server 基址（`dev_file_server_addr` 产出）
         base: String,
         app_id: String,
-        user_id: String,
     },
     ProdRuntime {
         runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
@@ -116,7 +115,6 @@ async fn resolve_exec_target<'a>(
     state: &'a AppState,
     app_stage: UserappStage,
     app_id: &str,
-    user_id: &str,
 ) -> Result<ExecChannel<'a>, AppError> {
     match app_stage {
         UserappStage::Dev => {
@@ -135,7 +133,6 @@ async fn resolve_exec_target<'a>(
             let channel = ExecChannel::DevHttp {
                 base: crate::userapp_builder::dev_file_server_addr(state, &info),
                 app_id: app_id.to_string(),
-                user_id: user_id.to_string(),
             };
             // builder 内 PG 可能刚 initdb（新容器/重建后），等就绪再执行改密命令
             let wait = channel
@@ -258,13 +255,13 @@ pub(crate) async fn reset_password(
         .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
-    shared_types::validate_identifier(&body.user_id, "user_id")
+    shared_types::validate_identifier(&body, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
     if body.password.is_empty() {
         return Err(AppError::bad_request("password must not be empty"));
     }
 
-    let runner = resolve_exec_target(&state, app_stage, &body.app_id, &body.user_id).await?;
+    let runner = resolve_exec_target(&state, app_stage, &body.app_id, &body).await?;
 
     // username 缺省 → 重置 superuser（CURRENT_USER 语义，与 computer 版/app_manager
     // 版同源）；指定 → 账号 upsert（存在 ALTER / 不存在 CREATE ROLE 建号）
@@ -342,10 +339,10 @@ pub(crate) async fn create_database(
         .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
-    shared_types::validate_identifier(&body.user_id, "user_id")
+    shared_types::validate_identifier(&body, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
 
-    let runner = resolve_exec_target(&state, app_stage, &body.app_id, &body.user_id).await?;
+    let runner = resolve_exec_target(&state, app_stage, &body.app_id, &body).await?;
     shared_types::create_pg_database(&runner, &body.database, body.owner.as_deref())
         .await
         .map_err(|e| AppError::with_message(db_admin_error_code(&e), e.to_string()))?;

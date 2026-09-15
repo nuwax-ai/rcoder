@@ -117,7 +117,7 @@ impl ContainerCreateParams {
                 super::types::ContainerRuntimeError::ConfigurationError(error.to_string())
             })?;
         context
-            .validate_identity(identifier, self.user_id.as_deref())
+            .validate_identity(identifier)
             .map_err(super::types::ContainerRuntimeError::ConfigurationError)
     }
 
@@ -299,7 +299,6 @@ mod mutation_target_tests {
     fn captured_target_requires_the_exact_admitted_operation() {
         let context = shared_types::UserAppExecutionContext {
             app_id: "app-one".into(),
-            user_id: "owner-one".into(),
             lifecycle_id: "life-one".into(),
             operation_id: "update-one".into(),
             executor_id: "executor-one".into(),
@@ -345,7 +344,6 @@ mod mutation_target_tests {
     fn adopted_binding_requires_builder_context_and_current_lifecycle() {
         let context = shared_types::UserAppExecutionContext {
             app_id: "app".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             operation_id: "wake".into(),
             executor_id: "worker".into(),
@@ -353,7 +351,6 @@ mod mutation_target_tests {
         };
         let binding = shared_types::UserAppResourceBinding {
             app_id: "app".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             service_type: ServiceType::UserappBuilder,
             physical_uid: "physical-original".into(),

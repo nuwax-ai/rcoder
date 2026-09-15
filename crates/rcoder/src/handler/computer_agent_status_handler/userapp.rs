@@ -86,7 +86,6 @@ pub(super) async fn status_userapp_dev(
     };
 
     Ok(HttpResult::success(ComputerAgentStatusResponse {
-        user_id: request.user_id.clone(),
         project_id: app_id.to_string(),
         is_alive: true,
         session_id,

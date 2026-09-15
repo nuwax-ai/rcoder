@@ -20,7 +20,7 @@ impl KubernetesRuntime {
         context: &shared_types::UserAppExecutionContext,
     ) -> Result<shared_types::UserAppBuilderWorkspaceEndpoint> {
         context
-            .validate_identity(&snapshot.app_id, Some(&context.user_id))
+            .validate_identity(&snapshot.app_id)
             .map_err(Error::Conflict)?;
         let mut workloads = snapshot
             .resources
@@ -164,7 +164,7 @@ impl KubernetesRuntime {
     ) -> Result<()> {
         if let Some(context) = context {
             context
-                .validate_identity(app_id, Some(&context.user_id))
+                .validate_identity(app_id)
                 .map_err(Error::ConfigurationError)?;
         }
         let operation = context

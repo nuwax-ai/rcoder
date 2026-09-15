@@ -211,7 +211,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
     ) -> ContainerRuntimeResult<()> {
         target
             .context
-            .validate_identity(&target.context.app_id, Some(&target.context.user_id))
+            .validate_identity(&target.context.app_id)
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         if target.resource.kind != shared_types::AppResourceKind::Container
             || target.resource.uid.is_empty()

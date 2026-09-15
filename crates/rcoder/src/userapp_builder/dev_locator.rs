@@ -30,7 +30,6 @@ impl UserappDevLocator {
     async fn instance_key(
         state: &AppState,
         app_id: &str,
-        user_id: Option<&str>,
     ) -> Result<String, String> {
         let owner = state
             .app_service
@@ -50,7 +49,6 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
     async fn dev_file_server_addr(
         &self,
         app_id: &str,
-        user_id: Option<&str>,
     ) -> Result<String, String> {
         let state = self.state()?;
         // 低频管理面语义：先探活再返回（注册表命中死容器时自愈重建），
@@ -67,7 +65,6 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
     async fn dev_container_alive(
         &self,
         app_id: &str,
-        user_id: Option<&str>,
     ) -> Result<bool, String> {
         let state = self.state()?;
         let instance = Self::instance_key(&state, app_id, user_id).await?;
@@ -87,7 +84,6 @@ impl shared_types::UserappDevEnsure for UserappDevLocator {
     async fn dev_builder_exists(
         &self,
         app_id: &str,
-        user_id: Option<&str>,
     ) -> Result<bool, String> {
         // 与 dev_container_alive 同一类型化事实源：find_container 按复合
         // 身份键匹配——容器被删/被他人 IP 复用时恒 false。
@@ -97,7 +93,6 @@ impl shared_types::UserappDevEnsure for UserappDevLocator {
     async fn ensure_dev_container(
         &self,
         app_id: &str,
-        user_id: Option<&str>,
     ) -> Result<shared_types::ContainerBasicInfo, String> {
         let state = self.state()?;
         let (info, created) = ensure_userapp_builder_probed(&state, app_id, user_id)

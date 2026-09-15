@@ -72,7 +72,7 @@ impl DockerRuntime {
         adoption: bool,
     ) -> Result<BuilderControlTarget> {
         context
-            .validate_identity(&context.app_id, Some(&context.user_id))
+            .validate_identity(&context.app_id)
             .map_err(Error::Conflict)?;
         let name = crate::utils::DockerUtils::generate_container_name(
             ServiceType::UserappBuilder.container_prefix(),
@@ -336,7 +336,6 @@ mod tests {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let context = UserAppExecutionContext {
                 app_id: "app".into(),
-                user_id: "owner".into(),
                 lifecycle_id: "life".into(),
                 operation_id: "wake".into(),
                 executor_id: "worker".into(),
@@ -418,7 +417,6 @@ mod tests {
                 context,
                 resource_binding: Some(shared_types::UserAppResourceBinding {
                     app_id: "app".into(),
-                    user_id: "owner".into(),
                     lifecycle_id: "life".into(),
                     service_type: ServiceType::UserappBuilder,
                     physical_uid: "original-id".into(),
@@ -459,7 +457,6 @@ mod tests {
     fn control_identity_rejects_owner_lifecycle_and_family_changes() {
         let context = UserAppExecutionContext {
             app_id: "app".into(),
-            user_id: "owner".into(),
             lifecycle_id: "life".into(),
             operation_id: "stop".into(),
             executor_id: "worker".into(),
@@ -485,7 +482,7 @@ mod tests {
         wrong.lifecycle_id = "new-life".into();
         assert!(control_identity(&info, "builder", &wrong).is_err());
         wrong = context.clone();
-        wrong.user_id = "other".into();
+        wrong.app_id = "other".into();
         assert!(control_identity(&info, "builder", &wrong).is_err());
         labels.insert("service-type".into(), ServiceType::Userapp.to_string());
         let info = serde_json::from_value(

@@ -217,7 +217,6 @@ pub async fn pod_list(
             status: String::from(docker_container.status.clone()),
             service_type: service_type.to_string(),
             project_id,
-            user_id: final_user_id,
             created_at: docker_container.created_at.timestamp_millis().max(0) as u64,
             last_activity: stored_record.map(|r| r.created_at.timestamp_millis().max(0) as u64),
             image: None,

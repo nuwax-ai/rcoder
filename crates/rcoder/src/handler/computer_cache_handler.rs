@@ -204,7 +204,6 @@ pub async fn computer_cache_clean(
     );
 
     Ok(HttpResult::success(CacheCleanResponse {
-        user_id: user_id.to_string(),
         deleted_entries: deleted,
     }))
 }
@@ -286,7 +285,6 @@ async fn cache_clean_userapp_dev(
     );
 
     Ok(HttpResult::success(CacheCleanResponse {
-        user_id: owner,
         deleted_entries: deleted,
     }))
 }

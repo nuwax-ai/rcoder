@@ -34,7 +34,6 @@ async fn redirect_doc_response(
     state: &AppState,
     stage: &str,
     tool: &str,
-    user_id: String,
     app_id: String,
     path: String,
 ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
