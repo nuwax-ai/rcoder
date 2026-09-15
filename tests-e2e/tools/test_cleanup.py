@@ -155,17 +155,21 @@ class OwnershipTests(unittest.TestCase):
 class BuilderReceiptTests(unittest.TestCase):
     def test_fallback_uses_current_receipt_and_never_uses_old_replacement_identity(self):
         from cleanup import builder_purge_body
+        # 共享模型：owner-id 标签退役；receipt.user_id 仅诊断字段（不参与校验）
         row = {'Id':'new', 'Name':'/rcoder-app-builder-app', 'Config':{'Labels':{
             'service-type':'user-app-builder', 'rcoder.io/application-id':'app',
-            'rcoder.io/owner-id':'owner', 'rcoder.io/lifecycle-id':'life'}}}
+            'rcoder.io/lifecycle-id':'life'}}}
         receipt = {'id':'new', 'name':'rcoder-app-builder-app', 'app_id':'app',
                    'user_id':'owner', 'lifecycle_id':'life', 'case_id':'case',
                    'predecessors':[{'id':'old'}]}
         self.assertEqual(builder_purge_body(row,receipt,'case'), {
-            'user_id':'owner','lifecycle_id':'life','request_id':'cleanup-case-app'})
-        for field in ('id','app_id','user_id','lifecycle_id','case_id'):
+            'lifecycle_id':'life','request_id':'cleanup-case-app'})
+        for field in ('id','app_id','lifecycle_id','case_id'):
             wrong = dict(receipt, **{field:'other'})
             with self.assertRaises(ValueError): builder_purge_body(row,wrong,'case')
+        # user_id 不再参与归属校验（改值不拒；缺省亦不拒）
+        self.assertEqual(builder_purge_body(row,dict(receipt, user_id='other'),'case')['request_id'],
+                         'cleanup-case-app')
         with self.assertRaises(ValueError): builder_purge_body(row,None,'case')
 
 if __name__ == '__main__':

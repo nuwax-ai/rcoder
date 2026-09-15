@@ -59,14 +59,15 @@ def builder_purge_body(container, receipt, case_id):
     labels = container['Config'].get('Labels') or {}
     name = container['Name'].lstrip('/')
     app = name.removeprefix('rcoder-app-builder-')
+    # 应用共享模型：owner-id 标签已退役（receipt.user_id 可为空/无标签对应）；
+    # 物理身份锚定 application-id == app_id + lifecycle-id == 权威 lifecycle
     if (not receipt or receipt.get('id') != container['Id'] or receipt.get('name') != name
             or receipt.get('case_id') != case_id or receipt.get('app_id') != app
             or labels.get('service-type') != 'user-app-builder'
             or labels.get('rcoder.io/application-id') != app
-            or not receipt.get('user_id') or labels.get('rcoder.io/owner-id') != receipt['user_id']
             or not receipt.get('lifecycle_id') or labels.get('rcoder.io/lifecycle-id') != receipt['lifecycle_id']):
         raise ValueError('builder cleanup requires a matching captured physical lifecycle receipt')
-    return {'user_id': receipt['user_id'], 'lifecycle_id': receipt['lifecycle_id'],
+    return {'lifecycle_id': receipt['lifecycle_id'],
             'request_id': 'cleanup-' + case_id + '-' + app}
 
 
