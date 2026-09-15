@@ -109,6 +109,12 @@ pub(super) async fn validate(State(state): State<AppState>) -> Response {
     tag = "Runtime Proxy"
 )]
 pub(super) async fn reload(State(state): State<AppState>) -> Response {
+    // 初始化恢复期拒绝运行态变更（P1-01：pingap 配置重载与启动恢复竞争）。
+    if state.server.initializing() {
+        return proxy_error(anyhow::anyhow!(
+            "runtime state changes are rejected until startup recovery completes"
+        ));
+    }
     // admin 探测未注册（supervisor 尚未启动 pingap）时显式报错，绝不静默跳过确认。
     let Some(endpoint) = admin_probe::admin_endpoint() else {
         return proxy_error(anyhow::anyhow!(

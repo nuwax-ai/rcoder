@@ -20,6 +20,10 @@ use crate::proxy::compiler::compile_and_validate;
 use crate::proxy::pingap::PINGAP_PORT;
 use crate::runtime_status::RuntimeStatusService;
 
+/// 失败终局 Done 中编排器自身条目的 service 名（区别于用户服务；平台侧
+/// failed 清单按条目映射进任务失败汇总，编排阶段错误不再依赖超时兜底）。
+pub(crate) const ORCHESTRATOR_FAILURE_SERVICE: &str = "orchestrator";
+
 /// 编排主入口（legacy 直跑形态：一次性编排，无外部取消源）。
 pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result<()> {
     run_inner(args, runtime_status, None, None, true).await
@@ -94,6 +98,8 @@ async fn run_inner(
     // 启动失败清单（容错语义：单服务 migrate/spawn/探测失败不阻塞其余服务；
     // pingap 失败仍整体 Err 全组清理——入口必需）
     let mut startup_failures: Vec<FailedService> = Vec::new();
+    // Done 终局是否已发射（正常路径 :241；失败兜底路径据此保证"至多一次"）。
+    let mut done_emitted = false;
     let startup = async {
         crate::static_hosting::reconcile(&specs, &args.workspace, dev_profile).await?;
         // ── 启动循环（容错）：单服务失败记 EVT 后 continue ──
@@ -241,6 +247,7 @@ async fn run_inner(
         emit_event(&OrchestrationEvent::OrchestrationDone {
             failed: startup_failures.clone(),
         });
+        done_emitted = true;
         if on_running.is_some() && !startup_failures.is_empty() {
             anyhow::bail!(
                 "deployment startup failed for {} service(s)",
@@ -255,10 +262,27 @@ async fn run_inner(
         }
         Ok(())
     };
-    if let Err(e) = startup.await {
-        error!("❌ startup failed, shutting down already-started children: {e:#}");
-        shutdown_all(std::mem::take(&mut children), 5).await?;
-        return Err(e);
+    if let Err(mut error) = startup.await {
+        error!("❌ startup failed, shutting down already-started children: {error:#}");
+        // P1-02：清理错误并入 cause 链，不覆盖原始启动错误（组合后仍可溯因）。
+        if let Err(cleanup_error) = shutdown_all(std::mem::take(&mut children), 5).await {
+            error = error.context(format!(
+                "cleanup after startup failure unconfirmed: {cleanup_error:#}"
+            ));
+        }
+        // P1-02 失败终局事件：旧版 startup 块内 `?` 路径（reconcile /
+        // ensure_spawned / start_pingap）静默跳过 Done——平台侧只能等满窗口
+        // 超时。此处统一补发一次（未发过时），保留已有服务失败清单；编排器
+        // 自身阶段错误以独立 service 条目上报（含清理未确认信息）。
+        if !done_emitted {
+            let mut failed = startup_failures.clone();
+            failed.push(FailedService {
+                service: ORCHESTRATOR_FAILURE_SERVICE.to_string(),
+                error: format!("{error:#}"),
+            });
+            emit_event(&OrchestrationEvent::OrchestrationDone { failed });
+        }
+        return Err(error);
     }
 
     // 运行拓扑汇总：service_id → port → 路由一张表。日志目录、pingap upstream/路由

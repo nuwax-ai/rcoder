@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Parser;
 
 use app_cli::CliArgs;
@@ -94,8 +95,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(()); // 仅 SIGTERM（容器终止/被替换）到达
     }
 
-    // 管理 API（后台并发跑；supervisor 退出时 abort）——legacy 形态以静态
-    // ServerState 承载（读 lock 后直接 Running 相位，readiness 跟随 runtime_status）
+    // 管理 API 预绑定（P1-01）：bind 成功才进入 supervisor 编排——端口冲突等
+    // 失败在一切业务副作用之前 fail-fast（非零退出，不 spawn 任何用户服务）。
+    // legacy 直跑形态无恢复窗口：bind 成功即开放写端点受理。
+    // legacy 形态以静态 ServerState 承载（读 lock 后直接 Running 相位，readiness
+    // 跟随 runtime_status）
     let legacy_state =
         std::sync::Arc::new(app_cli::server::ServerState::new(runtime_status.clone()));
     if let Ok(release) = app_cli::manifest::read_release_lock(&args.workspace) {
@@ -107,27 +111,58 @@ async fn main() -> anyhow::Result<()> {
     let api_workspace = args.workspace.clone();
     let api_pingap_bin = args.pingap_bin.clone();
     let api_state = legacy_state.clone();
+    let (api_listener, api_app) = app_cli::api::bind(
+        &api_addr,
+        api_workspace,
+        api_log_dir,
+        api_pingap_bin,
+        api_state,
+    )
+    .await?;
+    legacy_state.mark_initialized();
+    // API serve future 监督：结束（故障或 listener 关闭）→ cancel → supervisor
+    // 与信号同路径优雅收尾 → main 携 API 错误非零退出。正常关停路径 task 被
+    // abort，不产生记录——无管理面的运行态不可静默存活。
+    let api_failure = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let api_monitor_failure = api_failure.clone();
+    let supervisor_cancel = tokio_util::sync::CancellationToken::new();
+    let api_cancel = supervisor_cancel.clone();
     let api_handle = tokio::spawn(async move {
-        if let Err(error) = app_cli::api::serve(
-            &api_addr,
-            api_workspace,
-            api_log_dir,
-            api_pingap_bin,
-            api_state,
-        )
-        .await
-        {
-            tracing::error!("app-cli API failed: {error:#}");
+        let result = axum::serve(api_listener, api_app)
+            .await
+            .context("serve app-cli management API");
+        if let Err(error) = result {
+            tracing::error!("app-cli management API failed: {error:#}");
+            if let Ok(mut slot) = api_monitor_failure.lock() {
+                *slot = Some(format!("{error:#}"));
+            }
         }
+        api_cancel.cancel();
     });
 
-    // supervisor（前台阻塞，退出 → main 退出 → supervisor [program:app] 重启）
-    match app_cli::supervisor::run(&args, runtime_status).await {
+    // supervisor（前台阻塞，退出 → main 退出 → supervisor [program:app] 重启）。
+    // P1-02：保留原始错误——supervisor Err 决定进程退出码（旧版只记日志并返回
+    // Ok，退出码恒 0，编排器早崩对父进程监督不可见）。
+    let supervisor_result = app_cli::supervisor::run_with_cancel(
+        args.clone(),
+        runtime_status,
+        supervisor_cancel,
+        None,
+        true,
+    )
+    .await;
+    match &supervisor_result {
         Ok(()) => tracing::info!("app-cli supervisor exited normally"),
         Err(e) => tracing::error!("app-cli supervisor error: {e:#}"),
     }
 
     api_handle.abort();
+    if let Ok(slot) = api_failure.lock()
+        && let Some(api_error) = slot.as_ref()
+    {
+        anyhow::bail!("app-cli management API terminated: {api_error}");
+    }
+    supervisor_result?;
     Ok(())
 }
 

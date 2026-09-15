@@ -47,6 +47,9 @@ pub struct ServerState {
     admission: std::sync::Mutex<()>,
     accepting: std::sync::atomic::AtomicBool,
     shutdown_unconfirmed: std::sync::atomic::AtomicBool,
+    /// 启动恢复未完成（P1-01）：API 先 bind 后、恢复完成前，写端点与 /ready
+    /// 就绪判定被门控——恢复期不受理运行态变更、不以 Idle 语义应答探针。
+    initializing: std::sync::atomic::AtomicBool,
     preparations: Arc<preparation::Preparations>,
     journal: std::sync::Mutex<Option<Journal>>,
     generation: String,
@@ -170,6 +173,7 @@ impl ServerState {
             admission: std::sync::Mutex::new(()),
             accepting: std::sync::atomic::AtomicBool::new(true),
             shutdown_unconfirmed: std::sync::atomic::AtomicBool::new(false),
+            initializing: std::sync::atomic::AtomicBool::new(true),
             preparations: Arc::new(preparation::Preparations::default()),
             journal: std::sync::Mutex::new(None),
             generation: std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
@@ -199,6 +203,18 @@ impl ServerState {
         self.accepting
             .store(false, std::sync::atomic::Ordering::Release);
         self.cancel.cancel();
+    }
+
+    /// 启动恢复是否仍在进行（P1-01：API bind 先于恢复，写端点/ready 门控依据）。
+    pub fn initializing(&self) -> bool {
+        self.initializing.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 标记启动恢复完成：开放写端点受理与 ready 判定。
+    /// legacy 直跑形态在 API bind 成功后立即调用（无恢复窗口）。
+    pub fn mark_initialized(&self) {
+        self.initializing
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     pub fn phase(&self) -> ServerPhase {
@@ -604,7 +620,6 @@ impl ServerState {
 /// serve 主入口：api 常驻 + 状态机主循环（阻塞至 SIGTERM）。
 pub async fn serve(args: &CliArgs) -> Result<()> {
     let journal = Journal::open(&args.workspace)?;
-    crate::deploy::cleanup_startup(&args.workspace).await?;
     let ready = RuntimeStatusService::default();
     let mut initial_state = ServerState::new(ready.clone());
     if std::env::var(shared_types::APP_DEPLOY_GENERATION_ID).is_err()
@@ -617,6 +632,43 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
         .journal
         .lock()
         .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))? = Some(journal);
+
+    // 管理 API 预绑定（P1-01）：bind 成功才继续部署清理/启动恢复/业务停启——
+    // 端口冲突在一切运行态副作用之前 fail-fast（未 commit_coordinator、未
+    // stop_all；journal 随 Drop 释放锁，不写 Quiescent）。恢复完成前写端点由
+    // initializing 门控拒绝、/ready 以 initializing 摘流（探针早有人应答的价值
+    // 保留——/health 恒 200 覆盖 kubelet liveness）。serve future 运行期故障 →
+    // cancel 主循环受控收束，不留"无管理面的运行态"。
+    let api_state = state.clone();
+    let api_addr = args.admin_addr.clone();
+    let api_workspace = args.workspace.clone();
+    let api_log_dir = args.log_dir.clone();
+    let api_pingap_bin = args.pingap_bin.clone();
+    let (api_listener, api_app) = crate::api::bind(
+        &api_addr,
+        api_workspace,
+        api_log_dir,
+        api_pingap_bin,
+        api_state,
+    )
+    .await?;
+    let api_failure = Arc::new(std::sync::Mutex::new(None::<String>));
+    let api_monitor_failure = api_failure.clone();
+    let api_monitor_state = state.clone();
+    let api_handle = tokio::spawn(async move {
+        let result = axum::serve(api_listener, api_app)
+            .await
+            .context("serve app-cli management API");
+        if let Err(error) = result {
+            tracing::error!("app-cli management API failed: {error:#}");
+            if let Ok(mut slot) = api_monitor_failure.lock() {
+                *slot = Some(format!("{error:#}"));
+            }
+            api_monitor_state.cancel.cancel();
+        }
+    });
+
+    crate::deploy::cleanup_startup(&args.workspace).await?;
 
     let signal_state = state.clone();
     let signal_task = tokio::spawn(async move {
@@ -667,27 +719,11 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
             }
         }
     };
-
-    // 管理 API 常驻（含探针——Idle/Deploying 态即有人应答，取代 legacy 的
-    // idle.rs / LivenessHold 端口托管）
-    let api_state = state.clone();
-    let api_addr = args.admin_addr.clone();
-    let api_workspace = args.workspace.clone();
-    let api_log_dir = args.log_dir.clone();
-    let api_pingap_bin = args.pingap_bin.clone();
-    let api_handle = tokio::spawn(async move {
-        if let Err(error) = crate::api::serve(
-            &api_addr,
-            api_workspace,
-            api_log_dir,
-            api_pingap_bin,
-            api_state,
-        )
-        .await
-        {
-            tracing::error!("app-cli server API failed: {error}");
-        }
-    });
+    // 启动恢复完成（含 Failed 相位——可再次部署修复的合法可查状态）：开放
+    // 写端点受理与 /ready 判定。quiescence 失败路径不开放（进程保护现场至退出）。
+    if ownership_claimed {
+        state.mark_initialized();
+    }
 
     // 服务托管引擎探测：supervisord socket 可用（容器形态）→ 动态 program 托管
     //（per-service 隔离重启）；否则 builtin（裸跑/dev，与 legacy 同引擎）。
@@ -741,6 +777,16 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
     state.close_admission();
     api_handle.abort();
     signal_task.abort();
+    // API 运行期故障（监控记录）：即使主循环已正常收尾也按失败退出——
+    // 无管理面的实例不可宣称成功（P1-01）。正常关停路径 api task 被
+    // abort，不会写入故障记录。
+    if let Ok(slot) = api_failure.lock()
+        && let Some(api_error) = slot.as_ref()
+    {
+        return Err(
+            anyhow::anyhow!("app-cli management API terminated: {api_error}").context("serve"),
+        );
+    }
     result
 }
 

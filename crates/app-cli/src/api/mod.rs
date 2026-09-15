@@ -95,13 +95,18 @@ impl AppState {
     }
 }
 
-pub async fn serve(
+/// 管理 API 预绑定：构造 router 并真实完成 listener bind，成功才返回。
+/// 调用方必须 await 本函数成功后才允许执行任何运行态副作用（部署清理/
+/// 恢复/业务启停）——bind 失败（端口被占等）在副作用前 fail-fast，不留
+/// "无管理面的运行态"（P1-01）。初始恢复期的写端点由 [`ServerState::initializing`]
+/// 门控拒绝；`serve` future 由调用方 spawn 并监督（故障须触发受控收尾）。
+pub async fn bind(
     addr: &str,
     workspace: PathBuf,
     log_dir: PathBuf,
     pingap_bin: PathBuf,
     server: Arc<ServerState>,
-) -> Result<()> {
+) -> Result<(tokio::net::TcpListener, Router)> {
     let state = AppState {
         server,
         workspace,
@@ -113,6 +118,19 @@ pub async fn serve(
         .await
         .with_context(|| format!("bind app-cli API {addr}"))?;
     tracing::info!("app-cli management API listening on http://{addr}");
+    Ok((listener, app))
+}
+
+/// 便捷包装（bind + 常驻 serve）：不监督运行期故障，仅供测试等简单场景；
+/// 生产形态（legacy main / serve server）必须用 [`bind`] 并监控 serve future。
+pub async fn serve(
+    addr: &str,
+    workspace: PathBuf,
+    log_dir: PathBuf,
+    pingap_bin: PathBuf,
+    server: Arc<ServerState>,
+) -> Result<()> {
+    let (listener, app) = bind(addr, workspace, log_dir, pingap_bin, server).await?;
     axum::serve(listener, app)
         .await
         .context("serve app-cli management API")
@@ -155,7 +173,15 @@ async fn health() -> (StatusCode, Json<Value>) {
 }
 
 /// `/ready` — readiness 探针:状态机驱动（见路由注册处注释）。
+/// 初始化恢复期（serve 形态 API 先于恢复 bind——P1-01）：503 摘流，
+/// 不以 Idle 基础设施语义应答尚未恢复完成的实例。
 async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    if state.server.initializing() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "initializing", "phase": "Initializing" })),
+        );
+    }
     let phase = state.server.phase();
     if state.server.readiness_ok() {
         (
@@ -223,6 +249,15 @@ async fn submit_deploy(
 ) -> Response {
     if let Err(message) = authorize_deploy(&headers) {
         return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
+    }
+    // 初始化恢复期拒绝运行态变更（P1-01：API 先 bind，恢复完成前写端点门控；
+    // token 校验优先——不向未授权方暴露恢复状态）。
+    if state.server.initializing() {
+        return envelope::error(
+            StatusCode::CONFLICT,
+            "SERVER_INITIALIZING",
+            "runtime state changes are rejected until startup recovery completes",
+        );
     }
     if let Some(sha) = body.sha256.as_deref()
         && (sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -606,6 +641,54 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["code"], "DEPLOY_FORBIDDEN");
         assert_eq!(body["data"], serde_json::Value::Null);
+    }
+
+    /// P1-01 初始化门：恢复期 /ready 以 initializing 摘流（不以 Idle 基础
+    /// 设施语义应答未恢复完成的实例）；mark_initialized 后恢复常规相位判定。
+    #[tokio::test]
+    async fn initializing_gate_reports_ready_503_until_marked() {
+        let state = test_state();
+        assert!(state.server.initializing());
+        let (status, body) = call(&state, "GET", "/ready", "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "initializing");
+
+        state.server.mark_initialized();
+        let (status, body) = call(&state, "GET", "/ready", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+    }
+
+    /// P1-01 初始化门：恢复期写端点拒绝运行态变更——proxy/reload 无鉴权，
+    /// 直接以 initializing 门拒绝；mark_initialized 后走常规校验路径（本
+    /// 测试环境无 pingap admin → 正常错误，但不再是初始化门文案）。
+    /// deploy 端点的同款门在 token 校验之后（403 优先——不向未授权方暴露
+    /// 恢复状态），与 reload 共用 `ServerState::initializing` 同一判据。
+    #[tokio::test]
+    async fn initializing_gate_blocks_runtime_state_writes() {
+        let state = test_state();
+        assert!(state.server.initializing());
+        let (status, body) = call(&state, "POST", "/v1/proxy/reload", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("until startup recovery completes"),
+            "initializing gate must reject runtime state writes: {body}"
+        );
+
+        // 门开放后：不再以初始化门拒绝（无 pingap admin → 常规错误文案）。
+        state.server.mark_initialized();
+        let (status, body) = call(&state, "POST", "/v1/proxy/reload", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            !body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("until startup recovery completes"),
+            "gate must be open after mark_initialized: {body}"
+        );
     }
 
     /// deploy/status 成功信封：data.phase 为状态机相位（初始 idle）。
