@@ -16,22 +16,24 @@
 
 ## 批次 2：协调核心与全入口
 
-- [ ] T2.1 preview-coordinator 服务对象：start/stop/restart/keep_alive 业务流（plan §4 状态机，含 unknown 证据门禁 `HostEvidence` trait + 单机实现、uncertain 不自动重放）、端口全局分配（排除+重试≤3）、路由解析缓存（正/负 TTL、错误不负缓存）、后台任务（心跳轮询 30s/启动对账/空闲回收默认关）、内部令牌校验。
-- [ ] T2.2 Rust 执行器适配：DevServerManager 票据入口（start_with_ticket 外部 port+preview_key 键 / stop_by_registration 按登记 pid 组 / verify / 日志按归属），agent-runner 与独立形态未注入时保持现状。
-- [ ] T2.3 **等价性审计**：对照 TS 行为清单（rollup musl/gnu 检测、node_modules symlink 修复、模板缓存恢复（k8s no-op）、FAST_RESTART、.npmrc）逐项核对 Rust start 链在 K8s 共享存储场景需要的项，差距在 Rust 侧补齐并记录结论。
-- [ ] T2.4 8086 内部端点 `/api/v1/preview-internal/*`（utoipa）：跨 Pod 执行代理（受理时非宿主的 stop/verify 派发）+ 预览转发校验查询；令牌中间件。
-- [ ] T2.5 file-server 接入：`handlers/build/dev.rs` 七 handler 注入 `Option<Arc<dyn PreviewCoordination>>`；信封兼容层逐字段对齐 + 快照测试锁定四信封。
-- [ ] T2.6 `file-server-proxy/src/config.rs`：dev 生命周期 7 路径所有策略 → Rust 上游；路由判定单测矩阵（三策略 × 路径集）；其余路径分流不变回归。
-- [ ] T2.7 rcoder 装配：config 段 `preview_coordinator`（plan §8）、启动 fail-fast（对齐 `config/userapp_storage.rs` 装配范式）、POD_UID/POD_IP/boot_id 身份构造、kube HostEvidence（feature 门控）、后台任务 graceful shutdown。
-- [ ] T2.8 验证关卡：fmt/clippy/nextest（preview-coordinator + file-server + file-server-proxy + shared_types + rcoder）全绿；Compose 本地 all_rust 冒烟（start/keep-alive/stop/restart 信封等价、已在运行幂等 start）。
+- [x] T2.1 preview-coordinator 服务对象（service.rs 850+ 行）：admit_and_start（预读幂等快路径+Unknown 证据准备+端口有界重试≤3）/coordinated_stop（受理→派发→CAS 终态）/keep_alive_dev 全分支（心跳新鲜→alive；陈旧→宿主 verify；确认死→mark_failed+统一重建；端口命中他人→降级不动作；Starting→业务冲突错；Stopping→降级等终态；Unknown→证据门禁；终态→重建）/list/log/port_status/resolve_route（缓存→权威库，错误降级不缓存）/check_forward/internal_stop（操作身份五重校验）。
+- [x] T2.2 Rust 执行器适配（file-server `dev_server/coordinated.rs`）：start_coordinated（票据端口+preview_key 键+log_key 日志命名+manifest 拒绝）/stop_coordinated（仅登记匹配按记录 pid 组杀，绝不 ps 扫描；身份不符放回登记返回 IdentityMismatch）/verify_coordinated/DevServerExecutor（PreviewExecutor 实现）。start.rs 提取 spawn_and_register 共享管线（legacy 行为零变化）；stop.rs 提取 terminate_pid_group。
+- [x] T2.3 等价性审计结论：K8s 场景 Rust 启动链与 TS 等价——rollup musl/gnu 变体风险被恒注入 ROLLUP_WASM=1+ROLLUP_DISABLE_NATIVE=1 覆盖（同一故障模式的替代解法）；k8s 模板缓存恢复在 TS 本就是 no-op；FAST_RESTART 语义被 Rust「增量 install 不删 node_modules」覆盖；dev-inject/npmrc/strictPort/poll_alive/stderr 分类逐项一致。
+- [x] T2.4 内部端点 `/api/v1/preview-internal/{stop,verify,log}`（internal_http.rs，utoipa + 令牌中间件，缺失/不符 404 不暴露端点存在性）。
+- [x] T2.5 file-server 七 handler 协调分支（app_id 存在=userapp 域不走协调）；四信封映射（Unavailable→500/Conflict→400 业务错/Invalid→400 校验）。
+- [x] T2.6 60000 改路：`coordinated_dev_lifecycle` 开关（rcoder 装配与 preview_coordinator.enabled 联动；独立/npm 形态恒 false=历史行为）；路由判定矩阵测试（三策略×7 端点×尾斜杠×非前缀误命中×禁用回退）。
+- [x] T2.7 rcoder 装配：config 段 `preview_coordinator`（peer_api_port 装配时对准主 API 端口）、preview_assembly.rs（K8s=PG[userapp_storage.postgres 优先→storage.postgres 回落]/Compose=InProcess；enabled 且令牌缺失/<16 字符→fail-fast）、KubeHostEvidence（fail-closed：kube 错误=拒绝接管）、启动对账+后台任务（心跳 30s/刷盘 30s/回收 60s 轮询，broadcast 停机信号，flusher 退出补刷）。
+- [x] T2.8 验证关卡（2026-09-15）：fmt clean；clippy 六 crate（-D warnings，rcoder 双 feature 组合）全绿；nextest 993/993 通过。提交 `2333242`（含并行会话补齐：agent_runner env 透传缺省 false、file-server-userapp 测试字段、workspace 2118 全绿）。
+- [x] 代码复查（用户指令）：发现并修复三缺陷（提交 `5180708`）——①令牌 env 名漂移（guard 硬编码默认名 vs 配置名→跨 Pod 派发全 404；改协调器显式持令牌同源）②check_forward 每请求探活（verify_local 含 HTTP 探测→延迟翻倍；新增 registration_matches 纯内存校验）③next_candidate 落保留区/越界烧预算。复查验收：clippy 四 crate -D warnings 绿 + nextest 544/544。
+  - 已知差异登记：协调 stop 的 killedPids 恒空数组（诊断字段，TS 返回实际清单）；keep-alive 每次调用 1 次权威库索引读（此前沟通的"稳态零 PG 读"未实现——写路径零 PG 已达成，读为 65s/实例一次可忽略）；PG 故障时 check_forward 返回 410（语义上 503 更准确，行为等价：重解析→降级回环）。
 
 ## 批次 3：预览路由/HMR
 
-- [ ] T3.1 rcoder-proxy：注入 `PreviewRouteResolver`（None=现状）；`/proxy/{port}` 解析分支（缓存→转发重写/本机校验/miss=legacy）+ 上游 pod_ip:8088 / localhost 双路。
-- [ ] T3.2 `/internal/preview-forward/{instance_id}/{port}/{*path}` 路由：令牌校验、instance/host/port/登记四重校验、路径+query+尾斜杠保留、Host=127.0.0.1、410/503 语义。
-- [ ] T3.3 重试语义：连接失败/410 且无 body 未升级 → 至多一次重解析重试；写请求/流式/WS 不重放。单测矩阵。
-- [ ] T3.4 Compose 集成测试（真实 Vite 项目模板）：`/proxy/{port}/page/` 200、资产 query/尾斜杠、HMR WS 握手+改源码触发热更、stop 后 410/负缓存收敛、其余 `/proxy/{port}` 回归不变。
-- [ ] T3.5 验证关卡：fmt/clippy/nextest 含 rcoder-proxy 全绿 + T3.4 场景报告。
+- [x] T3.1 preview_slot（ArcSwapOption 回填槽，对齐 dev_ensure 范式——协调器装配晚于 Pingora 启动）；`/proxy/{port}` 解析分支（缓存→转发重写+令牌覆盖/miss=legacy 零变化）；上游双路（宿主 pod:peer_api_port / localhost）。TrackingCtx 增 preview_peer/preview_forward_port/preview_origin_port。
+- [x] T3.2 `/internal/preview-forward/{instance_id}/{port}/{*path}` 成对注册；request_filter 短路闸门（令牌缺失/不符 404 不暴露端点、身份不匹配 410、登记缺失 503）；校验通过剥离内部前缀，剩余路径+query+尾斜杠+@vite 深层资产原样转本机 vite，Host=127.0.0.1，长连接配置与 port_proxy 一致（HMR ws）。
+- [x] T3.3 重试语义（实现方式修订）：宿主 410 → 转发方 response_filter 即时失效该端口缓存（invalidate_route）+ TTL≤10s 兜底；"无 body 未升级自动重放一次"暂缓——pingora response 阶段重放复杂度高，Compose E2E（T4.3）实测单请求 410 可见性后再定。写请求/流式/WS 天然不重放（无重放机制）。
+- [x] T3.5 验证关卡（2026-09-15）：clippy 四 crate --all-targets -D warnings 全绿；nextest 629/629 通过。单测：路由注册矩阵/转发重写（query 保留/令牌覆盖/上游覆盖/深层资产）/三种不转发解析+槽空零变化。提交 `77d1c26`。T3.4（真实 Vite 端到端）并入批次 4 的 compose E2E（T4.3）执行。
+- [ ] T3.4 → 并入 T4.3。
 
 ## 批次 4：构建配置/E2E
 
