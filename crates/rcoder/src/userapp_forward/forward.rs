@@ -30,7 +30,9 @@ use tracing::info;
 
 use shared_types::HttpResult;
 use shared_types::UserappStage;
-pub use shared_types::{APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, SERVICE_TYPE_HEADER};
+pub use shared_types::{
+    APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, SERVICE_TYPE_HEADER, WORKSPACE_TYPE_HEADER,
+};
 
 use crate::router::AppState;
 
@@ -321,7 +323,7 @@ pub(crate) async fn flat_dev_install_project(
 /// `X-App-Stage` 同样生效（缺省 dev，与 /api/v1/userapp/* 分派一致）。
 pub(crate) async fn computer_intercept(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let is_userapp = req
@@ -339,6 +341,17 @@ pub(crate) async fn computer_intercept(
         Ok(stage) => stage,
         Err(resp) => return *resp,
     };
+    // B06 契约补全：serviceType 只做路由（本拦截层），目录选择单一通道
+    // x-workspace-type（对齐 TS 平台层——容器内 multer/computer 分支消费的
+    // 正是该 header）。老路径客户端只发 X-Service-Type/X-App-Id，路由层在此
+    // 把路由判定翻译成定位通道注入；客户端已显式携带时不覆盖（显式意图
+    // 优先，header > body 优先级不变）
+    if !req.headers().contains_key(WORKSPACE_TYPE_HEADER) {
+        req.headers_mut().insert(
+            WORKSPACE_TYPE_HEADER,
+            axum::http::HeaderValue::from_static(shared_types::SERVICE_TYPE_USERAPP),
+        );
+    }
     match stage {
         UserappStage::Dev => {
             info!(

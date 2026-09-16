@@ -301,9 +301,10 @@ fn cleanup_inner(name: &str, delete: bool) -> Result<(), String> {
         }
     }
     if receipt.as_ref().is_some_and(|r| r["id"] != id) {
-        // 系统自愈/重建会产生同应用新容器（同 app/owner/lifecycle 标签）：
-        // 校验当前容器标签仍与登记的应用身份一致则刷新回执继续清理；
-        // 标签不符（真身份对调）依旧拒绝。
+        // 系统自愈/重建会产生同应用新容器（同 app/lifecycle 标签）：校验当前
+        // 容器标签仍与登记的应用身份一致则刷新回执继续清理；标签不符（真身份
+        // 对调）依旧拒绝。T1 用户绑定移除后 owner-id 标签不再写入——身份锚点
+        // 为 application-id + lifecycle-id（回执 user_id 恒 null，不再比对）。
         let labels = Command::new("docker")
             .args(["inspect", "--format", "{{json .Config.Labels}}", &id])
             .output()
@@ -315,11 +316,9 @@ fn cleanup_inner(name: &str, delete: bool) -> Result<(), String> {
             serde_json::from_slice(&labels.stdout).map_err(|e| e.to_string())?;
         let matches_receipt = receipt.as_ref().is_some_and(|r| {
             labels["rcoder.io/application-id"].as_str() == r["app_id"].as_str()
-                && r["user_id"]
-                    .as_str()
-                    .is_some_and(|owner| labels["rcoder.io/owner-id"].as_str() == Some(owner))
                 && r["lifecycle_id"].as_str().is_some_and(|lifecycle| {
                     labels["rcoder.io/lifecycle-id"].as_str() == Some(lifecycle)
+                        && !lifecycle.is_empty()
                 })
         });
         if !matches_receipt {
