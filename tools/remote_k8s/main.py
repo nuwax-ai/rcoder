@@ -692,8 +692,6 @@ def retest_failed(c, parent_id):
             for case_row in row.get('cases', []):
                 if case_row.get('name') == name:
                     outcome['verdict'] = case_row.get('verdict', outcome['verdict'])
-        if outcome['error'] is None and outcome['verdict'] == 'pass':
-            outcome.pop('error', None)
         outcome['test_id'] = case_test_id
         outcomes.append(outcome)
         if case_test_id:
