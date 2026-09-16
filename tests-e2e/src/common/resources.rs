@@ -216,8 +216,8 @@ pub fn register_builder_replacement(
 ) -> Result<(), String> {
     require_container_absent(previous_id)?;
     register_container_identity(
-        &format!("rcoder-app-builder-{user_id}-{app_id}"),
-        Some(user_id),
+        &format!("rcoder-app-builder-{app_id}"),
+        None,
         Some(previous_id),
     )
 }
