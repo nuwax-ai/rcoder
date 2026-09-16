@@ -37,15 +37,31 @@ const DYNAMIC_ADD_LOCK: &str = ".dynamic_add.lock";
 /// 所有写/prune/链接入口必须先过本校验；持久 manifest 读回同样校验。
 pub fn validate_store_segment(kind: &str, value: &str) -> AppResult<()> {
     let mut components = Path::new(value).components();
-    let single_normal_segment = matches!(components.next(), Some(std::path::Component::Normal(_)))
-        && components.next().is_none();
-    if !single_normal_segment || value.contains('\0') {
+    // 规范形态不变式（Q01）：唯一 Normal 段必须与输入字符串完全相等，且
+    // 输入不得会被 trim 改变（`" .."` 裸串是合法单段，但任何下游 trim 都会
+    // 把它变成 `..`——"校验一种值、使用另一种值"一律拒绝）。后续
+    // normalize_names 的 trim 对已过检值是恒等变换。
+    let canonical_single_segment = matches!(
+        components.next(),
+        Some(std::path::Component::Normal(os)) if os == value
+    ) && components.next().is_none();
+    if !canonical_single_segment || value.contains('\0') || value.trim() != value {
         return Err(crate::error::AppError::validation(format!(
             "invalid {kind} {value:?}: must be a single normalized path segment \
-             (no separators, dot segments, or absolute prefixes)"
+             (no separators, dot segments, surrounding whitespace, or absolute prefixes)"
         )));
     }
     Ok(())
+}
+
+/// 规范化 + 校验清单（Q01）：先 trim/去重，再校验**实际落盘与使用**的值——
+/// 原串（如 `" .."`）合法不代表 trim 后（`..`）合法；全程只使用校验后的值。
+fn canonicalize_names(kind: &str, names: Vec<String>) -> AppResult<Vec<String>> {
+    let canonical = normalize_names(names);
+    for name in &canonical {
+        validate_store_segment(kind, name)?;
+    }
+    Ok(canonical)
 }
 
 /// 智能体级实体存储路径: `{user_root}/.agent-store/{agent_id}`。
@@ -358,6 +374,20 @@ pub async fn link_workspace_to_agent_store(
     agent_agents_dir: &Path,
 ) -> AppResult<()> {
     let start = std::time::Instant::now();
+
+    // Q02：受管根不得是被替换的链接——remove_if_exists/create 会沿链接作用于
+    // 链接目标（越界删除/写入）
+    for agent_dir in crate::service::skills::ALL_AGENT_DIRS {
+        let root = workspace.join(agent_dir);
+        if let Ok(meta) = fs::symlink_metadata(&root).await
+            && meta.is_symlink()
+        {
+            return Err(crate::error::AppError::validation(format!(
+                "managed agent directory is a symlink: {} (refusing to link through a replaced root)",
+                root.display()
+            )));
+        }
+    }
 
     // 尝试对所有 agent 目录创建软链
     let mut link_errors = Vec::new();
@@ -676,13 +706,28 @@ pub async fn sync_shared_skill_view(
     project_id: &str,
     lists: SharedSkillLists,
 ) -> AppResult<()> {
-    // F01：清单名字在任何写/链接前校验（单一路径段）——`../../victim` 这类
-    // 名字会在后续视图校准中 join 成受管范围外的删除/链接目标
-    for name in lists.skills.iter().flatten() {
-        validate_store_segment("skill name", name)?;
-    }
-    for name in lists.subagents.iter().flatten() {
-        validate_store_segment("subagent name", name)?;
+    // F01/Q01：先规范化再校验，且只把**校验后的值**写 manifest 与用于视图
+    // 操作——校验原始串、使用 trim 后的值会让 `" .."` 这类输入把 `..` 落盘
+    // 并 join 成受管范围外的删除/链接目标
+    let skills = lists
+        .skills
+        .map(|names| canonicalize_names("skill name", names))
+        .transpose()?;
+    let subagents = lists
+        .subagents
+        .map(|names| canonicalize_names("subagent name", names))
+        .transpose()?;
+    // Q02：受管根身份核验——`.agents` 本身（及其挂载子目录）不得是链接；
+    // 祖先被替换后 create_dir_all/read_dir 会沿链接作用于目标目录，"无引用
+    // 条目清理"即可越界递归删除。合法 ACP 视图**条目**链接不受影响。
+    let managed_root = workspace.join(".agents");
+    if let Ok(meta) = fs::symlink_metadata(&managed_root).await
+        && meta.is_symlink()
+    {
+        return Err(crate::error::AppError::validation(format!(
+            "managed agent directory is a symlink: {} (refusing to sync through a replaced root)",
+            managed_root.display()
+        )));
     }
     let store_root = project_store_root(user_root, project_id)?;
     fs::create_dir_all(&store_root).await?;
@@ -690,11 +735,11 @@ pub async fn sync_shared_skill_view(
 
     let mut manifest = read_manifest(&store_root).await?;
     let entry = manifest.agents.entry(agent_id.to_string()).or_default();
-    if let Some(skills) = lists.skills {
-        *ViewKind::Skills.manifest_field_mut(entry) = normalize_names(skills);
+    if let Some(skills) = skills {
+        *ViewKind::Skills.manifest_field_mut(entry) = skills;
     }
-    if let Some(subagents) = lists.subagents {
-        *ViewKind::Subagents.manifest_field_mut(entry) = normalize_names(subagents);
+    if let Some(subagents) = subagents {
+        *ViewKind::Subagents.manifest_field_mut(entry) = subagents;
     }
     write_manifest(&store_root, &manifest).await?;
 
@@ -1518,16 +1563,22 @@ mod tests {
 
     #[test]
     fn validate_store_segment_rejects_traversal_and_accepts_normal_names() {
-        // 平台原生 components() 判定：点段/分隔符/绝对前缀一律非"单 Normal 段"。
-        // 注：尾部 `.`/`/` 被归一化掉（"a/." ≡ "a"，join 等价、无逃逸）。
+        // 平台原生 components() 判定 + 规范形态不变式（Q01）：唯一 Normal 段
+        // 必须与输入完全相等——会被归一化改变形态的输入（"a/"、"a/."、前后
+        // 空白包围点段）一律拒绝，杜绝"校验一种值、使用另一种值"。
         for bad in [
             "",
             ".",
             "..",
-            "a/b",
-            "../../victim",
+            " ..",
+            ".. ",
+            " . ",
             "./a",
             "/absolute",
+            "a/",
+            "a/.",
+            "a/b",
+            "../../victim",
             "a\0b",
         ] {
             assert!(
@@ -1613,6 +1664,78 @@ mod tests {
             "keep",
             "受管范围外目录必须原样保留"
         );
+    }
+
+    #[tokio::test]
+    async fn trimmed_dot_segments_rejected_before_manifest_write() {
+        // Q01：原始串（".. "）是合法 Normal 组件，但 trim 后变成 ".."——
+        // 规范化后的值必须在写 manifest 前被拒，不能把 ".." 落盘参与视图操作
+        let tmp = tempfile::tempdir().unwrap();
+        let user_root = tmp.path().join("u1");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).await.unwrap();
+        let result = sync_shared_skill_view(
+            &user_root,
+            &workspace,
+            "agent-a",
+            "proj",
+            SharedSkillLists {
+                skills: Some(vec![".. ".to_string(), "normal".to_string()]),
+                subagents: None,
+            },
+        )
+        .await;
+        assert!(result.is_err(), "trim 后非法的名字必须整单拒绝");
+        let store_root = project_store_root(&user_root, "proj").unwrap();
+        let manifest = read_manifest(&store_root).await.unwrap();
+        assert!(
+            manifest.agents.is_empty(),
+            "非法清单不得写入 manifest: {manifest:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replaced_agents_root_symlink_is_refused_without_touching_target() {
+        // Q02：workspace/.agents 被替换为指向 victim 的链接——同步必须拒绝，
+        // 不得沿链接对 victim 内条目做任何删除/写入
+        let tmp = tempfile::tempdir().unwrap();
+        let user_root = tmp.path().join("u1");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).await.unwrap();
+        let victim = tmp.path().join("victim");
+        fs::create_dir_all(victim.join("skills").join("keep"))
+            .await
+            .unwrap();
+        fs::write(victim.join("skills").join("keep").join("SKILL.md"), "keep")
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, workspace.join(".agents")).unwrap();
+
+        let result = sync_shared_skill_view(
+            &user_root,
+            &workspace,
+            "agent-a",
+            "proj",
+            SharedSkillLists {
+                skills: Some(Vec::new()),
+                subagents: None,
+            },
+        )
+        .await;
+        #[cfg(unix)]
+        {
+            assert!(result.is_err(), "受管根被链接替换时必须拒绝");
+            assert_eq!(
+                fs::read_to_string(victim.join("skills").join("keep").join("SKILL.md"))
+                    .await
+                    .unwrap(),
+                "keep",
+                "链接目标内容必须原样保留"
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = result;
     }
 
     #[tokio::test]
