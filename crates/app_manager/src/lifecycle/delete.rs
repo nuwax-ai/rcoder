@@ -42,7 +42,9 @@ impl AppService {
         request: DeleteAppRequest,
     ) -> AppResult<()> {
         validate_app_id(app_id)?;
-        let release_lock = self.acquire_process_release_lock(app_id).await?;
+        // 快失败：锁被进行中操作（start 等就绪可达数分钟）持有时立即 Conflict，
+        // 调用方稍后重试；本次请求不受理也不排队。
+        let release_lock = self.try_acquire_process_release_lock(app_id).await?;
         let result = async {
             self.metadata
                 .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())

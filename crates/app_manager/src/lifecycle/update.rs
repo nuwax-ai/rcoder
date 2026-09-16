@@ -35,7 +35,8 @@ impl AppService {
 
         // 与发布串行（同 create/delete 的 per-app 进程级发布锁），但**不排队傻等**——
         // activate 等就绪可达 30 分钟，update 等它没有意义；锁被占（发布进行中）立即
-        // 409 让调用方稍后重试。delete 保持阻塞等待语义（清理动作，等一下无妨）。
+        // 409 让调用方稍后重试。stop/restart/delete 外部控制路径同为快失败语义；
+        // start（无 url）与内部回收器保持排队等待。
         // 无并发发布时锁条目可能不存在 → entry 建立并立刻拿到（try 必成功）。
         let lock_arc = match self.release_locks.entry(app_id.to_owned()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),

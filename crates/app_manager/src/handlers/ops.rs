@@ -83,6 +83,10 @@ pub async fn start_app(
 - 显式停止会阻断流量唤醒，后续需要显式 start；
 - 闲置回收保留流量唤醒能力，与显式 stop 的策略不同；
 - 需要"彻底销毁"走 delete → （可选）storage/clear | destroy。
+
+- If another operation holds the lock, this request is rejected without waiting
+  for that operation to finish and is not queued (envelope: HTTP 200 with
+  success=false and code ERR_CONFLICT). Retry later after checking application state.
 "#,
     responses(
         (status = 200, description = "停止成功", body = HttpResult<AppRuntimeInfo>)

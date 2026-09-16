@@ -60,7 +60,14 @@ impl AppService {
             shared_types::UserAppOperationKind::Start
         };
         validate_app_id(app_id)?;
-        let guard = self.acquire_process_release_lock(app_id).await?;
+        // restart 与带 url 的 deploy_controlled 一致：锁被占立即 Conflict；
+        // start 保持排队——本身是等待型操作（等就绪数分钟），调用方宽超时
+        // 预算覆盖排队。
+        let guard = if restart {
+            self.try_acquire_process_release_lock(app_id).await?
+        } else {
+            self.acquire_process_release_lock(app_id).await?
+        };
         let result = async {
             self.metadata
                 .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
@@ -204,7 +211,14 @@ impl AppService {
         wake_on_traffic: bool,
     ) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
-        let operation = self.acquire_process_release_lock(app_id).await?;
+        // 外部 stop 快失败：锁被进行中操作（start 等就绪可达数分钟）持有时立即
+        // Conflict 让调用方稍后重试，不排队占用调用方连接；内部回收器
+        // （wake_on_traffic=true）保持排队——周期扫描的清理动作，等一下无妨。
+        let operation = if wake_on_traffic {
+            self.acquire_process_release_lock(app_id).await?
+        } else {
+            self.try_acquire_process_release_lock(app_id).await?
+        };
         let result = async {
             self.metadata
                 .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())

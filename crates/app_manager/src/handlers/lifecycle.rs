@@ -229,6 +229,9 @@ Successful deletion is idempotent within the same lifecycle. Rebuilding requires
 recreate endpoint. Unknown identities are rejected without touching runtime resources.
 Failures retain durable recovery evidence; uncertain writes cannot be retried as a new deletion.
 Business responses use HTTP 200 and HttpResult; inspect code for the result.
+If another operation holds the lock, this request is rejected without waiting for that
+operation to finish and is not queued (envelope: HTTP 200 with success=false and code
+ERR_CONFLICT). Retry later after checking application state.
 "#,
     responses(
         (status = 200, description = "Deletion completed; lifecycle tombstone retained", body = HttpResult<String>)

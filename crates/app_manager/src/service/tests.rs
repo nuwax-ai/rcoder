@@ -87,8 +87,13 @@ async fn failed_update_restores_registered_ports_not_drifted_live_ports() {
     assert_eq!(service.registered_http_ports("portdrift"), vec![9080]);
 }
 
+/// 外部 delete 快失败 + 版本保护两段覆盖：
+/// 1. 锁被进行中操作持有 → 立即 Conflict（不排队——旧"等锁后复查版本"场景
+///    在新语义下不可达）；
+/// 2. 释放锁后以过期 expected_resource_version 重新发起 → 仍 Conflict，
+///    拿锁后复查版本防误删的保护不丢失（delete/PVC 销毁调用均为 0）。
 #[tokio::test]
-async fn waiting_delete_rechecks_version_after_acquiring_operation_lock() {
+async fn busy_delete_fails_fast_and_stale_version_conflicts_after_release() {
     let root = tempfile::tempdir().expect("tempdir");
     let runtime = Arc::new(MockRuntime::default());
     let service = test_service(root.path(), runtime.clone()).await;
@@ -107,23 +112,41 @@ async fn waiting_delete_rechecks_version_after_acquiring_operation_lock() {
             ..Default::default()
         },
     );
+    // 段 1：锁被占 → 有界时间内 Conflict（1s 是测试防挂预算，不是 HTTP SLA；
+    // 等待语义回归时此处超时失败而非挂死）。
     let writer = service
         .acquire_process_release_lock("deleterace")
         .await
         .expect("writer lock");
-    let deletion = service.delete_app("deleterace", true, Some("1"));
-    tokio::pin!(deletion);
-    assert!(futures_util::poll!(deletion.as_mut()).is_pending());
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        service.delete_app("deleterace", true, Some("1")),
+    )
+    .await
+    .expect("busy delete must not queue behind the held lock")
+    .expect_err("held lock must reject delete");
+    assert!(
+        matches!(&error, AppOperationError::Conflict(message) if message.contains("in progress")),
+        "got: {error}"
+    );
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
+    // 版本在锁被占期间漂移（旧测试的竞争窗口，如今只能发生在拒绝之后）。
     runtime
         .deployments
         .get_mut("deleterace")
         .expect("deployment")
         .resource_version = Some("2".into());
     drop(writer);
-    assert!(matches!(
-        deletion.await,
-        Err(AppOperationError::Conflict(_))
-    ));
+    // 段 2：锁已释放，过期版本重新发起 → 版本复查仍拒绝，零物理副作用。
+    let error = service
+        .delete_app("deleterace", true, Some("1"))
+        .await
+        .expect_err("stale expected version must conflict after lock release");
+    assert!(
+        matches!(&error, AppOperationError::Conflict(_)),
+        "got: {error}"
+    );
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
     assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
 }
@@ -150,6 +173,520 @@ async fn independent_services_share_application_file_lock() {
         .expect("released lock must progress")
         .expect("second lock");
     drop(guard);
+}
+
+/// 外部 stop 快失败：锁被进行中操作持有 → 有界时间内 Conflict，不排队、
+/// 零副作用（无运行时变更/无本次操作持久记录/无唤醒围栏变化）；释放锁
+/// 不会使被拒请求自行执行；释放后重新发起的新请求正常完成。
+#[tokio::test]
+async fn stop_conflicts_immediately_while_release_lock_held() {
+    let root = tempfile::tempdir().expect("directory");
+    let (service, runtime) = created_app_service(root.path(), "stopbusy").await;
+    let held = service
+        .acquire_process_release_lock("stopbusy")
+        .await
+        .expect("held lock");
+    let request = shared_types::UserAppControlRequest {
+        lifecycle_id: None,
+        request_id: Some("stopbusyreject".into()),
+    };
+    // 1s = 测试防挂预算，不是 HTTP SLA；等待语义回归时此处超时失败而非挂死。
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        service.stop_app_controlled("stopbusy", request.clone()),
+    )
+    .await
+    .expect("stop must not queue behind the held lock")
+    .expect_err("held lock must reject stop");
+    assert!(
+        matches!(&error, AppOperationError::Conflict(message) if message.contains("in progress")),
+        "got: {error}"
+    );
+    // 拒绝后零副作用
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        runtime
+            .deployments
+            .get("stopbusy")
+            .expect("deployment")
+            .replicas,
+        1,
+        "rejected stop must not touch the running workload"
+    );
+    assert!(
+        service
+            .get_control_operation_by_request("stopbusy", "stopbusyreject")
+            .await
+            .expect("operation query")
+            .is_none(),
+        "rejected stop must leave no durable operation record"
+    );
+    assert!(!service.activity.is_wake_blocked("stopbusy"));
+    // 释放锁不会使被拒请求自行执行（锁不排队 ≠ 延迟执行）
+    drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        runtime.scale_calls.load(Ordering::SeqCst),
+        0,
+        "rejected stop must not auto-execute after lock release"
+    );
+    // 释放后重新发起新请求（同一 request_id 亦证明拒绝未留下持久痕迹）→ 正常完成
+    service
+        .stop_app_controlled("stopbusy", request)
+        .await
+        .expect("fresh stop after release");
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        runtime
+            .deployments
+            .get("stopbusy")
+            .expect("deployment")
+            .replicas,
+        0
+    );
+    let operation = service
+        .get_control_operation_by_request("stopbusy", "stopbusyreject")
+        .await
+        .expect("operation query")
+        .expect("operation record");
+    assert_eq!(operation.kind, shared_types::UserAppOperationKind::Stop);
+    assert_eq!(
+        operation.state,
+        shared_types::UserAppOperationState::Succeeded
+    );
+}
+
+/// 外部 restart（无 url 路径）快失败：与 stop 同款断言矩阵。
+#[tokio::test]
+async fn restart_conflicts_immediately_while_restart_lock_held() {
+    let root = tempfile::tempdir().expect("directory");
+    let (service, runtime) = created_app_service(root.path(), "restartbusy").await;
+    let held = service
+        .acquire_process_release_lock("restartbusy")
+        .await
+        .expect("held lock");
+    let request = shared_types::UserAppControlRequest {
+        lifecycle_id: None,
+        request_id: Some("restartbusyreject".into()),
+    };
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        service.restart_app_controlled("restartbusy", request.clone()),
+    )
+    .await
+    .expect("restart must not queue behind the held lock")
+    .expect_err("held lock must reject restart");
+    assert!(
+        matches!(&error, AppOperationError::Conflict(message) if message.contains("in progress")),
+        "got: {error}"
+    );
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        service
+            .get_control_operation_by_request("restartbusy", "restartbusyreject")
+            .await
+            .expect("operation query")
+            .is_none(),
+        "rejected restart must leave no durable operation record"
+    );
+    drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        runtime.scale_calls.load(Ordering::SeqCst),
+        0,
+        "rejected restart must not auto-execute after lock release"
+    );
+    service
+        .restart_app_controlled("restartbusy", request)
+        .await
+        .expect("fresh restart after release");
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        runtime
+            .deployments
+            .get("restartbusy")
+            .expect("deployment")
+            .phase,
+        "Running"
+    );
+    let operation = service
+        .get_control_operation_by_request("restartbusy", "restartbusyreject")
+        .await
+        .expect("operation query")
+        .expect("operation record");
+    assert_eq!(operation.kind, shared_types::UserAppOperationKind::Restart);
+    assert_eq!(
+        operation.state,
+        shared_types::UserAppOperationState::Succeeded
+    );
+}
+
+/// 外部 delete 快失败：锁被占立即 Conflict，身份/运行态/持久记录零变化；
+/// 释放后被拒请求不自行执行；重新发起的新删除正常完成。
+#[tokio::test]
+async fn delete_conflicts_immediately_while_release_lock_held() {
+    let root = tempfile::tempdir().expect("directory");
+    let (service, runtime) = created_app_service(root.path(), "deletebusy").await;
+    let held = service
+        .acquire_process_release_lock("deletebusy")
+        .await
+        .expect("held lock");
+    let request = DeleteAppRequest {
+        lifecycle_id: None,
+        request_id: Some("deletebusyreject".into()),
+        purge: Some(false),
+        expected_resource_version: None,
+    };
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        service.delete_app_controlled("deletebusy", request.clone()),
+    )
+    .await
+    .expect("delete must not queue behind the held lock")
+    .expect_err("held lock must reject delete");
+    assert!(
+        matches!(&error, AppOperationError::Conflict(message) if message.contains("in progress")),
+        "got: {error}"
+    );
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        runtime.deployments.contains_key("deletebusy"),
+        "rejected delete must keep the running workload"
+    );
+    assert!(
+        service
+            .metadata
+            .store
+            .get_application("deletebusy")
+            .await
+            .expect("identity query")
+            .is_some(),
+        "rejected delete must keep the lifecycle identity"
+    );
+    assert!(
+        service
+            .get_control_operation_by_request("deletebusy", "deletebusyreject")
+            .await
+            .expect("operation query")
+            .is_none(),
+        "rejected delete must leave no durable operation record"
+    );
+    drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        runtime.delete_calls.load(Ordering::SeqCst),
+        0,
+        "rejected delete must not auto-execute after lock release"
+    );
+    service
+        .delete_app_controlled("deletebusy", request)
+        .await
+        .expect("fresh delete after release");
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
+    assert!(!runtime.deployments.contains_key("deletebusy"));
+}
+
+/// 等待语义保留：无 url 的外部 start 与内部回收器（recycle_app）在锁被占
+/// 期间保持排队（有界窗口内不返回，更不返回 Conflict），释放锁后继续完成。
+/// 与快失败测试互为对照——防止把 try 锁误扩散到等待型入口。
+#[tokio::test]
+async fn start_and_recycle_keep_waiting_for_the_held_lock() {
+    let root = tempfile::tempdir().expect("directory");
+    let (service, runtime) = created_app_service(root.path(), "waitqueue").await;
+
+    // 阶段 1：内部回收路径（recycle_app → wake_on_traffic=true）保持等待
+    let held = service
+        .acquire_process_release_lock("waitqueue")
+        .await
+        .expect("held lock");
+    let recycle = service.recycle_app("waitqueue");
+    tokio::pin!(recycle);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), recycle.as_mut())
+            .await
+            .is_err(),
+        "internal recycler must keep waiting for the lock instead of failing fast"
+    );
+    drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(5), recycle)
+        .await
+        .expect("recycle proceeds after lock release")
+        .expect("recycle succeeds");
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+    {
+        let deployment = runtime.deployments.get("waitqueue").expect("deployment");
+        assert_eq!(deployment.replicas, 0);
+        assert_eq!(deployment.wake_on_traffic, Some(true));
+    }
+
+    // 阶段 2：无 url 的外部 start 保持等待
+    let held = service
+        .acquire_process_release_lock("waitqueue")
+        .await
+        .expect("held lock again");
+    let start = service.start_app_controlled(
+        "waitqueue",
+        shared_types::UserAppControlRequest {
+            lifecycle_id: None,
+            request_id: Some("waitqueuestart".into()),
+        },
+    );
+    tokio::pin!(start);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), start.as_mut())
+            .await
+            .is_err(),
+        "external start (no url) must keep waiting for the lock instead of failing fast"
+    );
+    drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(5), start)
+        .await
+        .expect("start proceeds after lock release")
+        .expect("start succeeds");
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        runtime
+            .deployments
+            .get("waitqueue")
+            .expect("deployment")
+            .replicas,
+        1
+    );
+}
+
+/// 跨实例文件锁层同样快失败：两个独立 AppService 共用锁根，第一实例持锁
+/// （进程 Mutex + flock）时，第二实例的外部 stop/restart/delete 都必须在
+/// 文件锁层立即 Conflict（不能只测同一实例的进程 Mutex）。
+#[tokio::test]
+async fn external_operations_fail_fast_across_service_file_lock() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let first = test_service(root.path(), Arc::new(MockRuntime::default())).await;
+    let second_runtime = Arc::new(MockRuntime::default());
+    let second = test_service(root.path(), second_runtime.clone()).await;
+    let held = first
+        .acquire_process_release_lock("crosslock")
+        .await
+        .expect("first instance lock");
+
+    let control = shared_types::UserAppControlRequest {
+        lifecycle_id: None,
+        request_id: Some("crosslockreject".into()),
+    };
+
+    // 三个外部入口返回类型不同（stop/restart=AppRuntimeInfo，delete=()），
+    // 用泛型 helper 收敛"文件锁层快失败"断言。
+    async fn expect_file_lock_conflict<T>(label: &str, future: impl Future<Output = AppResult<T>>) {
+        let error = match tokio::time::timeout(std::time::Duration::from_secs(1), future).await {
+            Ok(Err(error)) => error,
+            Ok(Ok(_)) => panic!("{label} must be rejected by the cross-instance file lock"),
+            Err(_) => {
+                panic!("{label} must not queue behind the cross-instance file lock")
+            }
+        };
+        assert!(
+            matches!(&error, AppOperationError::Conflict(message) if message.contains("another process")),
+            "{label} got: {error}"
+        );
+    }
+
+    expect_file_lock_conflict(
+        "stop",
+        second.stop_app_controlled("crosslock", control.clone()),
+    )
+    .await;
+    expect_file_lock_conflict(
+        "restart",
+        second.restart_app_controlled("crosslock", control.clone()),
+    )
+    .await;
+    expect_file_lock_conflict(
+        "delete",
+        second.delete_app_controlled(
+            "crosslock",
+            DeleteAppRequest {
+                lifecycle_id: None,
+                request_id: Some("crosslockrejectdelete".into()),
+                purge: Some(false),
+                expected_resource_version: None,
+            },
+        ),
+    )
+    .await;
+    assert_eq!(second_runtime.scale_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(second_runtime.delete_calls.load(Ordering::SeqCst), 0);
+
+    // 释放后第二实例可正常取得文件锁（等待版语义未变，见
+    // independent_services_share_application_file_lock）。
+    drop(held);
+    let guard = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        second.acquire_process_release_lock("crosslock"),
+    )
+    .await
+    .expect("released file lock must progress")
+    .expect("second instance lock");
+    guard.finish().await.expect("finish guard");
+}
+
+/// 按指定 access_mode 直构造 AppService（K8s 分支测试用；test_support 的
+/// test_service 固定 Docker，本任务六文件范围内不改 test_support）。
+async fn test_service_with_mode(
+    workspace_root: &std::path::Path,
+    runtime: Arc<MockRuntime>,
+    access_mode: AppAccessMode,
+) -> AppService {
+    tokio::fs::create_dir_all(workspace_root)
+        .await
+        .expect("test workspace");
+    let store = rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
+        &workspace_root.join(format!("metadata-{}.sqlite3", uuid::Uuid::new_v4())),
+    )
+    .await
+    .expect("SQLite metadata store");
+    let config = AppManagerConfig {
+        workspace_root: Some(workspace_root.to_string_lossy().into_owned()),
+        operation_lock_root: workspace_root.to_string_lossy().into_owned(),
+        access_mode,
+        ..AppManagerConfig::default()
+    };
+    AppService {
+        config,
+        runtime: runtime as Arc<dyn UserAppRuntime>,
+        activity: Arc::new(AppActivityRegistry::new(std::time::Duration::from_secs(
+            300,
+        ))),
+        pingora: None,
+        pingora_ports: DashMap::new(),
+        release_locks: DashMap::new(),
+        metadata: AppMetadataStore::new(Arc::new(store)),
+        dev_cleanup: std::sync::RwLock::new(None),
+        dev_locator: std::sync::RwLock::new(None),
+        builder_recovery: std::sync::RwLock::new(None),
+        deploy_list_cache: tokio::sync::Mutex::new(None),
+    }
+}
+
+/// K8s 模式租约冲突快失败：operation_guard 的 K8s 分支经 acquire_app_operation
+/// 取得跨副本租约；受控 runtime 报告租约被占（MockRuntime 的 Conflict 与
+/// OperationInProgress 在 map_runtime_error 同一映射臂）→ 外部 stop 立即
+/// Conflict、不重试不排队、零运行时变更；租约释放后可正常取得。
+#[tokio::test]
+async fn kubernetes_lease_conflict_fails_fast_without_queueing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime = Arc::new(MockRuntime::default());
+    let service =
+        test_service_with_mode(root.path(), runtime.clone(), AppAccessMode::Kubernetes).await;
+    service
+        .metadata
+        .store
+        .ensure_identity("k8sbusy")
+        .await
+        .expect("owner identity");
+    // 模拟另一副本持有跨实例操作租约
+    runtime.lease_held.store(true, Ordering::SeqCst);
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        service.stop_app_controlled(
+            "k8sbusy",
+            shared_types::UserAppControlRequest {
+                lifecycle_id: None,
+                request_id: Some("k8sbusyreject".into()),
+            },
+        ),
+    )
+    .await
+    .expect("K8s lease conflict must fail fast without queueing")
+    .expect_err("held lease must reject stop");
+    assert!(
+        matches!(&error, AppOperationError::Conflict(_)),
+        "got: {error}"
+    );
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        service
+            .get_control_operation_by_request("k8sbusy", "k8sbusyreject")
+            .await
+            .expect("operation query")
+            .is_none(),
+        "lease-rejected stop must leave no durable operation record"
+    );
+
+    // 租约释放后 try 版可正常取得（快失败不是永久拒绝）
+    runtime.lease_held.store(false, Ordering::SeqCst);
+    let guard = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        service.try_acquire_process_release_lock("k8sbusy"),
+    )
+    .await
+    .expect("free lease must be acquired")
+    .expect("guard");
+    guard.finish().await.expect("finish releases the lease");
+    assert!(!runtime.lease_held.load(Ordering::SeqCst));
+}
+
+/// 正式信封验收：忙锁 stop 经真实 handler + axum router + envelope_errors
+/// 中间件 → HTTP 200、success=false、code=ERR_CONFLICT（不能只看 HTTP 状态）。
+#[tokio::test]
+async fn busy_stop_envelope_returns_http_200_with_err_conflict() {
+    let directory = tempfile::tempdir().expect("directory");
+    let runtime = Arc::new(MockRuntime::default());
+    let service = Arc::new(test_service(directory.path(), runtime.clone()).await);
+    let held = service
+        .acquire_process_release_lock("envelopebusy")
+        .await
+        .expect("held lock");
+    let router = axum::Router::new()
+        .route(
+            "/api/v1/userapp/{app_id}/stop",
+            axum::routing::post(crate::handlers::ops::stop_app),
+        )
+        .layer(axum::middleware::from_fn(
+            shared_types::userapp_http::envelope_errors,
+        ))
+        .with_state(Arc::new(crate::handlers::state::AppManagerState {
+            app_service: service.clone(),
+            http_client: reqwest::Client::new(),
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    struct Server(tokio::task::JoinHandle<()>);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("HTTP test server");
+    }));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("HTTP client");
+    let response = client
+        .post(format!("http://{address}/api/v1/userapp/envelopebusy/stop"))
+        .send()
+        .await
+        .expect("HTTP response");
+    // 业务信封：HTTP 200，失败语义在 body 的 success/code
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let envelope: serde_json::Value = response.json().await.expect("JSON envelope");
+    assert_eq!(envelope["success"], false);
+    assert_eq!(envelope["code"], shared_types::error_codes::ERR_CONFLICT);
+    assert!(
+        envelope["message"]
+            .as_str()
+            .expect("message")
+            .contains("in progress"),
+        "envelope: {envelope}"
+    );
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+    drop(held);
 }
 
 /// R01：runtime 未返回创建凭据时，service 不得按名字补偿删除竞争赢家。
