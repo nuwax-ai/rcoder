@@ -762,6 +762,11 @@ impl RuntimeKernel {
     }
 
     /// 终态发布（server 主循环在执行完成/失败后调用；先持久化再清 active 槽）。
+    ///
+    /// R04 终态单调：已有终态（Succeeded/Failed/Cancelled）或 RecoveryRequired
+    /// 的操作不可被再次 finish 覆盖——迟到的 finish（同态幂等返回 Ok；异态
+    /// 拒绝并保留原终态）只做身份/取消簿记清理。取消收束后的 Cancelled 记录
+    /// 不会被迟到的成功/失败提交改写。
     pub(crate) async fn finish(
         &self,
         operation_id: &str,
@@ -770,30 +775,28 @@ impl RuntimeKernel {
         failure_detail: Option<RuntimeFailureDetail>,
         next_sequence: u64,
     ) -> Result<()> {
-        let mut stored = self
-            .store
-            .load_operation(operation_id)?
-            .context("finish unknown operation")?;
-        let terminal = state.is_terminal() || state == RuntimeOperationState::RecoveryRequired;
-        anyhow::ensure!(terminal, "finish requires a terminal or recovery state");
-        stored.view.state = state;
-        if let Some((code, message)) = error {
-            stored.view.error_code = Some(code);
-            stored.view.error_message = Some(message);
+        let stored = self.write_terminal(operation_id, state, error, failure_detail)?;
+        if stored.view.state != state {
+            // 已有终态未被覆盖（R04）：仅做簿记清理，不重复发终态事件
+            tracing::warn!(
+                operation_id,
+                existing = ?stored.view.state,
+                refused = ?state,
+                "runtime operation already terminal; refusing overwrite (R04)"
+            );
+        } else {
+            let event_name = match stored.view.state {
+                RuntimeOperationState::Succeeded => "Completed",
+                _ => "Failed",
+            };
+            self.emit(
+                operation_id,
+                next_sequence,
+                "terminal",
+                None,
+                Some(event_name),
+            );
         }
-        stored.view.failure_detail = failure_detail;
-        self.store.store_operation(&stored)?;
-        let event_name = match stored.view.state {
-            RuntimeOperationState::Succeeded => "Completed",
-            _ => "Failed",
-        };
-        self.emit(
-            operation_id,
-            next_sequence,
-            "terminal",
-            None,
-            Some(event_name),
-        );
         if let Ok(mut set) = self.cancelled.lock() {
             set.remove(operation_id);
         }
@@ -807,16 +810,68 @@ impl RuntimeKernel {
         Ok(())
     }
 
+    /// 终态写入（无锁内聚版本；调用方自持 admission 锁时用
+    /// [`Self::write_terminal_locked`]）。终态单调：已有终态/恢复保护不覆盖。
+    fn write_terminal(
+        &self,
+        operation_id: &str,
+        state: RuntimeOperationState,
+        error: Option<(String, String)>,
+        failure_detail: Option<RuntimeFailureDetail>,
+    ) -> Result<StoredOperation> {
+        let mut stored = self
+            .store
+            .load_operation(operation_id)?
+            .context("finish unknown operation")?;
+        let terminal = state.is_terminal() || state == RuntimeOperationState::RecoveryRequired;
+        anyhow::ensure!(terminal, "finish requires a terminal or recovery state");
+        if stored.view.state.is_terminal()
+            || stored.view.state == RuntimeOperationState::RecoveryRequired
+        {
+            return Ok(stored);
+        }
+        stored.view.state = state;
+        if let Some((code, message)) = error {
+            stored.view.error_code = Some(code);
+            stored.view.error_message = Some(message);
+        }
+        stored.view.failure_detail = failure_detail;
+        self.store.store_operation(&stored)?;
+        Ok(stored)
+    }
+
+    /// 持久化终态并在**已持有的 admission 锁内**完成身份/取消簿记——
+    /// 提交线性化点唯一（R03：检查与写入之间不再有取消/受理窗口）。
+    fn write_terminal_locked(
+        &self,
+        guard: &mut tokio::sync::MutexGuard<'_, AdmissionState>,
+        operation_id: &str,
+        state: RuntimeOperationState,
+    ) -> Result<()> {
+        let stored = self.write_terminal(operation_id, state, None, None)?;
+        if let Ok(mut set) = self.cancelled.lock() {
+            set.remove(operation_id);
+        }
+        if guard.active_operation_id.as_deref() == Some(operation_id) {
+            guard.active_operation_id = None;
+            if stored.view.state == RuntimeOperationState::RecoveryRequired {
+                guard.recovery_protection = true;
+            }
+        }
+        Ok(())
+    }
+
     /// 执行提交屏障（B03）：在**同一 admission 锁**下原子裁决启动完成的提交。
     ///
-    /// 线性化检查（一次加锁内完成）：
+    /// 线性化检查 + 终态写入（R03：全部在同一锁内完成，取消与成功提交不再
+    /// 存在检查后写入的竞态窗口）：
     /// 1. 本操作仍是 active 执行者（未被并发收束/替换）；
     /// 2. 受理后无取消墓碑（有 → Cancelled，不报成功）；
     /// 3. 受理 revision 仍是当前 revision（Stop 受理会推进 revision——
     ///    推进过 → Superseded：调用方必须停服并让 Stop 执行，A 不报 Succeeded）。
     ///
-    /// 通过 → 原子收束 Succeeded（持久化在锁内，杜绝检查与提交间的受理竞态）。
-    /// 清理未知保持 RecoveryRequired 由调用方经 [`Self::finish`] 表达。
+    /// 通过 → 锁内原子收束 Succeeded。清理未知保持 RecoveryRequired 由调用方
+    /// 经 [`Self::finish`] 表达。
     pub(crate) async fn commit_execution(
         &self,
         operation_id: &str,
@@ -827,20 +882,20 @@ impl RuntimeKernel {
             .map(|events| events.len() as u64 + 1)
             .unwrap_or(2);
         // 持久化用的终态在锁内决定并写入——提交线性化点
-        let guard = self.admission.lock().await;
+        let mut guard = self.admission.lock().await;
         if guard.active_operation_id.as_deref() != Some(operation_id) {
             return Ok(CommitBarrierOutcome::NotActive);
         }
         if self.is_cancelled(operation_id) {
+            self.write_terminal_locked(&mut guard, operation_id, RuntimeOperationState::Cancelled)?;
             drop(guard);
-            self.finish(
+            self.emit(
                 operation_id,
-                RuntimeOperationState::Cancelled,
-                None,
-                None,
                 sequence.max(2),
-            )
-            .await?;
+                "terminal",
+                None,
+                Some("Failed"),
+            );
             return Ok(CommitBarrierOutcome::Cancelled);
         }
         let (_, current_revision) = self.store.load_desired()?;
@@ -853,16 +908,25 @@ impl RuntimeKernel {
             // active 保留（Stop 信号在 server 循环执行并按自身 ID 收束后清除）。
             return Ok(CommitBarrierOutcome::Superseded);
         }
-        drop(guard);
-        self.finish(
-            operation_id,
-            RuntimeOperationState::Succeeded,
-            None,
-            None,
-            sequence.max(2),
-        )
-        .await?;
-        Ok(CommitBarrierOutcome::Committed)
+        let outcome =
+            self.write_terminal_locked(&mut guard, operation_id, RuntimeOperationState::Succeeded);
+        match outcome {
+            Ok(()) => {
+                drop(guard);
+                self.emit(
+                    operation_id,
+                    sequence.max(2),
+                    "terminal",
+                    None,
+                    Some("Completed"),
+                );
+                Ok(CommitBarrierOutcome::Committed)
+            }
+            Err(error) => {
+                // 终态持久化失败：保护保留（active 不清），调用方走恢复路径
+                Err(error)
+            }
+        }
     }
 
     /// 取消请求（受理态返回；不伪称立即完成——spec §3.2 cancel 语义）。
@@ -1513,5 +1577,106 @@ mod tests {
             .await
             .expect_err("blocked");
         assert_eq!(blocked.code, ERR_RECOVERY_REQUIRED);
+    }
+
+    // ===== R03/R04：终态单调与提交线性化 =====
+
+    #[tokio::test]
+    async fn finish_is_monotonic_cancelled_cannot_become_succeeded() {
+        // R04：取消收束后的 Cancelled 记录不得被迟到的成功/失败提交改写
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-mono"))
+            .await
+            .expect("admit");
+        kernel
+            .finish("op-mono", RuntimeOperationState::Cancelled, None, None, 2)
+            .await
+            .expect("cancel settle");
+        kernel
+            .finish("op-mono", RuntimeOperationState::Succeeded, None, None, 3)
+            .await
+            .expect("late finish must not error");
+        let view = kernel.get("op-mono").await.expect("view").expect("exists");
+        assert_eq!(view.state, RuntimeOperationState::Cancelled);
+        // 同态重复 finish 幂等
+        kernel
+            .finish("op-mono", RuntimeOperationState::Cancelled, None, None, 4)
+            .await
+            .expect("idempotent");
+    }
+
+    #[tokio::test]
+    async fn recovery_required_cannot_be_overwritten_by_terminal() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-recovery"))
+            .await
+            .expect("admit");
+        kernel
+            .finish(
+                "op-recovery",
+                RuntimeOperationState::RecoveryRequired,
+                None,
+                None,
+                2,
+            )
+            .await
+            .expect("hold");
+        kernel
+            .finish("op-recovery", RuntimeOperationState::Failed, None, None, 3)
+            .await
+            .expect("late failure must not overwrite protection");
+        let view = kernel
+            .get("op-recovery")
+            .await
+            .expect("view")
+            .expect("exists");
+        assert_eq!(view.state, RuntimeOperationState::RecoveryRequired);
+    }
+
+    #[tokio::test]
+    async fn commit_after_cancel_settles_cancelled_not_succeeded() {
+        // R03：提交屏障在锁内裁决——取消墓碑存在时绝不报成功
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-race"))
+            .await
+            .expect("admit");
+        kernel.request_cancel("op-race").await.expect("cancel");
+        let outcome = kernel.commit_execution("op-race").await.expect("barrier");
+        assert_eq!(outcome, CommitBarrierOutcome::Cancelled);
+        let view = kernel.get("op-race").await.expect("view").expect("exists");
+        assert_eq!(view.state, RuntimeOperationState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn late_cancel_after_commit_cannot_flip_succeeded() {
+        // R03 窗口消除后的可观察面：提交成功后再取消，终态保持 Succeeded
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-commit"))
+            .await
+            .expect("admit");
+        let outcome = kernel.commit_execution("op-commit").await.expect("barrier");
+        assert_eq!(outcome, CommitBarrierOutcome::Committed);
+        kernel
+            .request_cancel("op-commit")
+            .await
+            .expect("late cancel");
+        kernel
+            .finish("op-commit", RuntimeOperationState::Cancelled, None, None, 9)
+            .await
+            .expect("late finish");
+        let view = kernel
+            .get("op-commit")
+            .await
+            .expect("view")
+            .expect("exists");
+        assert_eq!(view.state, RuntimeOperationState::Succeeded);
     }
 }

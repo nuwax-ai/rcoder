@@ -67,6 +67,10 @@ pub struct ServerState {
     /// 运行操作内核槽位（阶段二：serve 在 ownership 认领后注入；legacy 形态
     /// 恒 None——api 层 /v1/runtime/* 相应 503）。
     runtime_kernel: std::sync::OnceLock<Arc<crate::runtime_kernel::RuntimeKernel>>,
+    /// R05：启动路径是否**尝试过**装配运行内核。true 且 runtime_kernel 为
+    /// None = 状态根打开失败（可信状态不可读）——所有写入口 fail-closed；
+    /// false = 从未尝试（测试/无内核上下文）——保持旧语义。
+    kernel_required: std::sync::atomic::AtomicBool,
     /// 运行控制信号通道（源码编排/停止业务——api → 主循环；与部署通道并行）。
     control_tx: tokio::sync::mpsc::UnboundedSender<ControlSignal>,
     control_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ControlSignal>>,
@@ -189,6 +193,7 @@ impl ServerState {
         let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             runtime_kernel: std::sync::OnceLock::new(),
+            kernel_required: std::sync::atomic::AtomicBool::new(false),
             control_tx,
             control_rx: tokio::sync::Mutex::new(control_rx),
             current_runtime_operation: RwLock::new(None),
@@ -218,6 +223,17 @@ impl ServerState {
     }
 
     /// 运行操作内核（api 层 /v1/runtime/* 消费；未注入返回 None）。
+    pub(crate) fn mark_kernel_required(&self) {
+        self.kernel_required
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn kernel_unavailable(&self) -> bool {
+        self.kernel_required
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.runtime_kernel.get().is_none()
+    }
+
     pub(crate) fn runtime_kernel(&self) -> Option<Arc<crate::runtime_kernel::RuntimeKernel>> {
         self.runtime_kernel.get().cloned()
     }
@@ -517,12 +533,23 @@ impl ServerState {
         // B05：恢复保护约束**所有**写入口——旧部署链不得绕过（损坏记录/
         // 未终态操作/部分提交围栏期间，legacy 受理同样拒绝；显式部署也
         // 必须等操作员裁决恢复后进行）。
-        if let Some(kernel) = self.runtime_kernel()
-            && kernel.recovery_protection_active()
-        {
-            return Err(AdmissionError::Busy(
-                "runtime state requires recovery; resolve held operations before deploying".into(),
-            ));
+        // R05：kernel 不可用（状态根打开失败）同样 fail-closed——旧链只在
+        // Some(kernel) 上检查保护会把"可信状态不可读"当成"无保护可查"放行。
+        match self.runtime_kernel() {
+            Some(kernel) if kernel.recovery_protection_active() => {
+                return Err(AdmissionError::Busy(
+                    "runtime state requires recovery; resolve held operations before deploying"
+                        .into(),
+                ));
+            }
+            _ if self.kernel_unavailable() => {
+                return Err(AdmissionError::Busy(
+                    "runtime state unavailable (state root could not be opened); deployment \
+                     admission closed until recovery"
+                        .into(),
+                ));
+            }
+            _ => {}
         }
         let phase = self.phase();
         if !phase.accepts_deploy() {
@@ -847,6 +874,8 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
     // 已进入 first_request。
     let mut kernel_recovery_hold = false;
     if ownership_claimed {
+        // R05：尝试装配即标记——失败（kernel=None）时写入口 fail-closed
+        state.mark_kernel_required();
         match assemble_runtime_kernel(&state, args).await {
             Ok(kernel) => {
                 let recovered = kernel
@@ -905,7 +934,10 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
     };
     // R03/B05：desired 读取先于启动决策；**读取失败同样压制自动启动**
     //（损坏 desired 等价于不可信状态——不允许"读错当 Running 继续起"）。
+    // R05：读错时必须清除已生成的 first_request——否则自动恢复（journal
+    // resume/卷上 release.lock 的 Existing 路径）仍会在不可信状态上启动。
     if ownership_claimed && !kernel_recovery_hold {
+        let mut desired_unreadable = false;
         let desired = match state
             .runtime_kernel()
             .map(|kernel| kernel.store().load_desired())
@@ -915,11 +947,18 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
                 tracing::error!(
                     "desired state unreadable ({error:#}); automatic business recovery suppressed"
                 );
+                desired_unreadable = true;
                 state.set_phase(ServerPhase::Idle);
                 None
             }
             None => None,
         };
+        if desired_unreadable && first_request.is_some() {
+            first_request = None;
+            tracing::error!(
+                "pre-generated startup action discarded: desired state unreadable (R05)"
+            );
+        }
         if desired == Some(shared_types::DesiredState::Stopped)
             && matches!(first_request, Some(InitialAction::Existing))
         {
@@ -1275,6 +1314,9 @@ enum InitialAction {
     StopBusiness {
         operation_id: String,
     },
+    /// 排队期已取消的操作：已按自身 ID 收束 Cancelled，零副作用——
+    /// 不停止无关运行实例、不派发 Stop（R04：取消收束不得变成 Stop 执行）。
+    Settled,
 }
 
 /// 控制信号在服务已停止后的收束（R01）：Reorchestrate 占据执行身份由外层
@@ -1282,9 +1324,11 @@ enum InitialAction {
 async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> InitialAction {
     match signal {
         ControlSignal::OrchestrateSource { operation_id } => {
-            // R03 取消检查点：派发排队期间被取消 → 零副作用收束，不编排
+            // R03/R04 取消检查点：派发排队期间被取消 → 按自身 ID 收束
+            // Cancelled 后零动作返回——不编排、不派发 Stop（取消收束变成
+            // Stop 执行会用 Succeeded 覆盖 Cancelled 并停止无关运行实例）
             if state.settle_cancelled_before_execution(&operation_id).await {
-                return InitialAction::StopBusiness { operation_id };
+                return InitialAction::Settled;
             }
             state.set_current_runtime_operation(Some(operation_id));
             InitialAction::Existing
@@ -1379,12 +1423,9 @@ async fn fail_activation(
     state: &ServerState,
     error: String,
 ) -> Option<InitialAction> {
-    state
-        .finish_current_runtime_operation(
-            shared_types::RuntimeOperationState::Failed,
-            Some(("ERR_BACKEND_ERROR".to_string(), error.clone())),
-        )
-        .await;
+    // R06：先清理、确认后才发布终态——原顺序先记 Failed 再清理，清理未知
+    // 时操作身份已被清除，恢复保护无从挂起。清理失败路径经 hold_unconfirmed
+    // 以 RecoveryRequired 收束（身份保留至该点），成功路径最后记 Failed。
     state.ready.set_ready(false);
     if let Err(error) = state.preparations.drain().await {
         hold_unconfirmed(state, format!("preparation shutdown: {error:#}")).await;
@@ -1400,12 +1441,19 @@ async fn fail_activation(
             format!("{error}; persist failure: {persist_error:#}"),
         )
         .await;
+        return None;
     }
+    state
+        .finish_current_runtime_operation(
+            shared_types::RuntimeOperationState::Failed,
+            Some(("ERR_BACKEND_ERROR".to_string(), error.clone())),
+        )
+        .await;
     None
 }
 
 /// 内核提交屏障结果（B03 收敛形态）。
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum BarrierOutcome {
     /// 屏障通过（已收束 Succeeded）/ 已取消（已收束 Cancelled）/
     /// 无在途操作——调用方继续正常流转。
@@ -1417,6 +1465,12 @@ enum BarrierOutcome {
 /// Running 入口的统一提交屏障（B03）：无内核/无在途操作时直通。
 /// 屏障失败（持久化错误）→ 按原终态语义收束 RecoveryRequired 并视为 Passed
 /// （fail-closed：不报成功，保护保留在内核）。
+///
+/// R01：屏障通过即清理**server 侧执行身份**（内核 finish 只清内核 active 槽，
+/// 残留身份会让后续 Restart B 的 set_current 被旧 A 拒绝、B 完成时误收束 A，
+/// B 永久 Accepted）。
+/// R02：NotActive 不等同提交成功——操作已终态（其他路径收束）时幂等放行；
+/// 非终态则 fail-closed 收束 RecoveryRequired（执行身份丢失，不报成功）。
 async fn commit_running_barrier(state: &ServerState) -> BarrierOutcome {
     let Some(kernel) = state.runtime_kernel() else {
         return BarrierOutcome::Passed;
@@ -1424,9 +1478,46 @@ async fn commit_running_barrier(state: &ServerState) -> BarrierOutcome {
     let Some(operation_id) = state.current_runtime_operation() else {
         return BarrierOutcome::Passed;
     };
+    let settle_identity = || {
+        if state.current_runtime_operation().as_deref() == Some(operation_id.as_str()) {
+            state.set_current_runtime_operation(None);
+        }
+    };
     match kernel.commit_execution(&operation_id).await {
+        Ok(crate::runtime_kernel::CommitBarrierOutcome::Committed)
+        | Ok(crate::runtime_kernel::CommitBarrierOutcome::Cancelled) => {
+            // R01：内核已收束——同步清理 server 执行身份
+            settle_identity();
+            BarrierOutcome::Passed
+        }
         Ok(crate::runtime_kernel::CommitBarrierOutcome::Superseded) => BarrierOutcome::Superseded,
-        Ok(_) => BarrierOutcome::Passed,
+        Ok(crate::runtime_kernel::CommitBarrierOutcome::NotActive) => {
+            match kernel.get(&operation_id).await {
+                Ok(Some(view)) if view.state.is_terminal() => {
+                    // 幂等：操作已被其他路径收束——清理残留身份后放行
+                    settle_identity();
+                    BarrierOutcome::Passed
+                }
+                _ => {
+                    // R02：active 不在本操作且无终态——执行身份丢失，fail-closed
+                    tracing::error!(
+                        "runtime commit barrier: operation {operation_id} lost execution \
+                         identity before commit; settling RecoveryRequired"
+                    );
+                    state
+                        .finish_runtime_operation_by_id(
+                            &operation_id,
+                            shared_types::RuntimeOperationState::RecoveryRequired,
+                            Some((
+                                shared_types::ERR_RECOVERY_REQUIRED.into(),
+                                "execution identity lost before commit barrier".into(),
+                            )),
+                        )
+                        .await;
+                    BarrierOutcome::Passed
+                }
+            }
+        }
         Err(error) => {
             tracing::error!("runtime commit barrier failed (op {operation_id}): {error:#}");
             state
@@ -1502,6 +1593,13 @@ async fn server_loop(
         };
 
         let run_migrations = true;
+        if matches!(action, InitialAction::Settled) {
+            // R04：排队期取消已收束——零副作用回 Idle
+            if !matches!(state.phase(), ServerPhase::Failed(_)) {
+                state.set_phase(ServerPhase::Idle);
+            }
+            continue;
+        }
         if let InitialAction::StopBusiness { operation_id } = action {
             // stop：停止业务服务（保持管理面）。B01：按**自身受理 ID**收束——
             // Stop 从不占据 current 执行槽，禁止 finish_current（它会读
@@ -1546,7 +1644,9 @@ async fn server_loop(
             InitialAction::Deploy(_) | InitialAction::Prepared(_)
         );
         let prepared = match action {
-            InitialAction::StopBusiness { .. } => unreachable!("handled above"),
+            InitialAction::StopBusiness { .. } | InitialAction::Settled => {
+                unreachable!("handled above")
+            }
             InitialAction::Deploy(request) => {
                 state.set_phase(ServerPhase::Deploying);
                 state.set_request_release_id(&request.release_id);
@@ -1699,19 +1799,30 @@ async fn server_loop(
                 },
                 signal = control_rx.recv() => match signal {
                     Some(signal) => {
-                        state.ready.set_ready(false);
-                        if let Err(error) = host.stop_all().await {
-                            hold_unconfirmed(
-                                state,
-                                format!("stop before runtime control failed: {error:#}"),
-                            )
-                            .await;
-                            return Ok(());
+                        // R04：排队期已取消的启动/重启——零副作用收束，不停
+                        // 在跑业务（取消收束不得变成 Stop 执行）
+                        if let ControlSignal::OrchestrateSource { operation_id } = &signal
+                            && state
+                                .runtime_kernel()
+                                .is_some_and(|kernel| kernel.is_cancelled(operation_id))
+                        {
+                            state.settle_cancelled_before_execution(operation_id).await;
+                            Next::Wait
+                        } else {
+                            state.ready.set_ready(false);
+                            if let Err(error) = host.stop_all().await {
+                                hold_unconfirmed(
+                                    state,
+                                    format!("stop before runtime control failed: {error:#}"),
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                            // B01：动作整体交回主循环——Existing 重编排、
+                            // StopBusiness{ID} 由 loop-top 唯一收束路径按 ID 完成
+                            //（stop_all 幂等，重复执行无害）。
+                            Next::Redeploy(settle_control_signal(state, signal).await)
                         }
-                        // B01：动作整体交回主循环——Existing 重编排、
-                        // StopBusiness{ID} 由 loop-top 唯一收束路径按 ID 完成
-                        //（stop_all 幂等，重复执行无害）。
-                        Next::Redeploy(settle_control_signal(state, signal).await)
                     }
                     None => Next::Wait,
                 },
@@ -2821,5 +2932,229 @@ format = "jsonl"
                 })
                 .is_err()
         );
+    }
+
+    // ===== R01/R02/R04：执行身份生命周期与屏障裁决 =====
+
+    fn kernel_for(dir: &std::path::Path) -> std::sync::Arc<crate::runtime_kernel::RuntimeKernel> {
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let identity = shared_types::RuntimeIdentityView {
+            application_id: "app1".into(),
+            service_family: "userapp-dev".into(),
+            workspace_id: "ws-1".into(),
+            source_root: "/workspace".into(),
+            runtime_instance_id: "instance-1".into(),
+            deployment_generation_id: "gen-1".into(),
+            protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: vec![],
+        };
+        let store =
+            crate::runtime_kernel::RuntimeStore::open_with_root(dir.join("state-root"), &workspace)
+                .expect("store");
+        std::sync::Arc::new(crate::runtime_kernel::RuntimeKernel::new(
+            store,
+            identity,
+            Box::new(|_| {}),
+        ))
+    }
+
+    fn runtime_request(
+        kind: shared_types::RuntimeOperationKind,
+        operation_id: &str,
+        revision: u64,
+    ) -> shared_types::RuntimeOperationRequest {
+        shared_types::RuntimeOperationRequest {
+            operation_id: operation_id.into(),
+            expected_runtime_instance_id: "instance-1".into(),
+            expected_revision: revision,
+            workspace_id: "ws-1".into(),
+            kind,
+            profile: shared_types::RunProfileInput::Source {
+                workspace_id: "ws-1".into(),
+            },
+            request_context: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn start_restart_sequence_keeps_execution_identity_per_operation() {
+        // R01：Start A 提交成功必须清理 server 执行身份——否则 Restart B 的
+        // set_current 被旧 A 拒绝、B 完成时误收束 A，B 永久 Accepted。
+        let dir = tempfile::tempdir().unwrap();
+        let state = state();
+        let kernel = kernel_for(dir.path());
+        state.set_runtime_kernel(kernel.clone());
+
+        // A：受理 → 占据身份 → 提交
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Start,
+                "op-a",
+                0,
+            ))
+            .await
+            .expect("admit A");
+        let action = settle_control_signal(
+            &state,
+            ControlSignal::OrchestrateSource {
+                operation_id: "op-a".into(),
+            },
+        )
+        .await;
+        assert!(matches!(action, InitialAction::Existing));
+        assert_eq!(state.current_runtime_operation().as_deref(), Some("op-a"));
+        assert_eq!(commit_running_barrier(&state).await, BarrierOutcome::Passed);
+        // R01 核心：屏障通过后 server 身份必须清理（修复前残留 op-a）
+        assert_eq!(state.current_runtime_operation(), None);
+
+        // B：同一序列的 Restart 不被旧身份阻塞，正常提交
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Restart,
+                "op-b",
+                0,
+            ))
+            .await
+            .expect("admit B");
+        let action = settle_control_signal(
+            &state,
+            ControlSignal::OrchestrateSource {
+                operation_id: "op-b".into(),
+            },
+        )
+        .await;
+        assert!(matches!(action, InitialAction::Existing));
+        assert_eq!(state.current_runtime_operation().as_deref(), Some("op-b"));
+        assert_eq!(commit_running_barrier(&state).await, BarrierOutcome::Passed);
+        for operation in ["op-a", "op-b"] {
+            let view = kernel.get(operation).await.unwrap().expect("record");
+            assert_eq!(view.state, shared_types::RuntimeOperationState::Succeeded);
+        }
+    }
+
+    #[tokio::test]
+    async fn barrier_not_active_on_terminal_operation_is_idempotent_pass() {
+        // R02 幂等分支：操作已被其他路径收束（终态）——NotActive 清残留身份放行
+        let dir = tempfile::tempdir().unwrap();
+        let state = state();
+        let kernel = kernel_for(dir.path());
+        state.set_runtime_kernel(kernel.clone());
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Start,
+                "op-t",
+                0,
+            ))
+            .await
+            .expect("admit");
+        state.set_current_runtime_operation(Some("op-t".into()));
+        // 其他路径已把内核 active 收束（先于 server 屏障）
+        kernel
+            .finish(
+                "op-t",
+                shared_types::RuntimeOperationState::Succeeded,
+                None,
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(commit_running_barrier(&state).await, BarrierOutcome::Passed);
+        assert_eq!(state.current_runtime_operation(), None);
+        let view = kernel.get("op-t").await.unwrap().expect("record");
+        assert_eq!(view.state, shared_types::RuntimeOperationState::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn barrier_not_active_on_live_operation_fails_closed() {
+        // R02 fail-closed 分支：active 不在本操作且无终态（受理 Stop 顶掉了
+        // active 槽）——不得当 Passed 报成功，收束 RecoveryRequired
+        let dir = tempfile::tempdir().unwrap();
+        let state = state();
+        let kernel = kernel_for(dir.path());
+        state.set_runtime_kernel(kernel.clone());
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Start,
+                "op-x",
+                0,
+            ))
+            .await
+            .expect("admit start");
+        state.set_current_runtime_operation(Some("op-x".into()));
+        // Stop 受理顶掉 active（Stop 屏障例外允许 active 期间受理）
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Stop,
+                "op-stop",
+                0,
+            ))
+            .await
+            .expect("admit stop");
+        assert_eq!(commit_running_barrier(&state).await, BarrierOutcome::Passed);
+        let view = kernel.get("op-x").await.unwrap().expect("record");
+        assert_eq!(
+            view.state,
+            shared_types::RuntimeOperationState::RecoveryRequired,
+            "执行身份丢失必须 fail-closed，不得默认成功"
+        );
+        assert_eq!(state.current_runtime_operation(), None);
+    }
+
+    #[tokio::test]
+    async fn kernel_unavailable_closes_legacy_deploy_admission() {
+        // R05：状态根打开失败（尝试装配但 kernel=None）——legacy 部署受理
+        // fail-closed；从未尝试装配的上下文保持旧语义
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = state();
+        *legacy.journal.lock().unwrap() = Some(Journal::open(&dir.path().join("code")).unwrap());
+        legacy.set_phase(ServerPhase::Running);
+        // 未标记：旧语义放行
+        assert!(
+            legacy
+                .try_accept_deploy_with_id(request(), "legacy-ok".into())
+                .is_ok()
+        );
+        // 标记后无 kernel：可信状态不可读，拒绝
+        let dir2 = tempfile::tempdir().unwrap();
+        let blocked = state();
+        *blocked.journal.lock().unwrap() = Some(Journal::open(&dir2.path().join("code")).unwrap());
+        blocked.set_phase(ServerPhase::Running);
+        blocked.mark_kernel_required();
+        assert!(matches!(
+            blocked.try_accept_deploy_with_id(request(), "blocked".into()),
+            Err(AdmissionError::Busy(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_orchestration_settles_without_dispatching_stop() {
+        // R04：排队期取消的启动/重启——按自身 ID 收束 Cancelled，返回 Settled
+        //（不派发 StopBusiness：那会执行无关业务停止并用 Succeeded 覆盖）
+        let dir = tempfile::tempdir().unwrap();
+        let state = state();
+        let kernel = kernel_for(dir.path());
+        state.set_runtime_kernel(kernel.clone());
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Restart,
+                "op-queued",
+                0,
+            ))
+            .await
+            .expect("admit");
+        kernel.request_cancel("op-queued").await.unwrap();
+        let action = settle_control_signal(
+            &state,
+            ControlSignal::OrchestrateSource {
+                operation_id: "op-queued".into(),
+            },
+        )
+        .await;
+        assert!(matches!(action, InitialAction::Settled));
+        assert_eq!(state.current_runtime_operation(), None);
+        let view = kernel.get("op-queued").await.unwrap().expect("record");
+        assert_eq!(view.state, shared_types::RuntimeOperationState::Cancelled);
     }
 }
