@@ -3282,7 +3282,7 @@ async fn scenario_two_users_share_app() {
     report.assert_hard(
         "D5：无显式 user_id 回落 owner 实例（幂等，不建第二容器）",
         owner_count_unchanged,
-        format!("owner 容器数=1, ensure 幂等"),
+        "owner 容器数=1, ensure 幂等".to_string(),
     );
 
     // 正例：app_id 内部 '-' 合法（复合键禁令解除；DNS-1123 label 内部连字符）

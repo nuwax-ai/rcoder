@@ -211,7 +211,8 @@ pub fn remove_builder_for_recreation(app_id: &str, _user_id: &str, id: &str) -> 
 /// Record an explicitly observed replacement without losing predecessor proof.
 pub fn register_builder_replacement(
     app_id: &str,
-    user_id: &str,
+    // T1 后定位与 user 无关；参数保留以维持调用点占位语义（URL 段 "0"）
+    _user_id: &str,
     previous_id: &str,
 ) -> Result<(), String> {
     require_container_absent(previous_id)?;
