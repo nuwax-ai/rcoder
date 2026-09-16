@@ -29,8 +29,13 @@ FROM ${RCODER_BASE} AS rcoder
 COPY --link --from=build /out/rcoder /out/agent_runner /app/bin/
 COPY --link --from=build /out/agent_runner /usr/local/bin/agent_runner
 COPY --link docker/rcoder-master/agent-runner-start.sh /app/agent-runner-start.sh
+RUN chmod +x /app/agent-runner-start.sh
 FROM ${COMPUTER_BASE} AS computer
 COPY --link --from=build /out/agent_runner /out/app-cli /usr/local/bin/
 FROM ${RUNTIME_BASE} AS runtime
 COPY --link --from=build /out/app-cli /out/file-server-proxy /usr/local/bin/
 COPY --link docker/app-runtime-base/start-app.sh /usr/local/bin/start-app.sh
+# git 模式为 100644，COPY 保留源权限——不 chmod 则容器启动即
+# "exec: /usr/local/bin/start-app.sh: permission denied"（CrashLoop）。
+# 对齐 rcoder-master / app-runtime-base Dockerfile 的既有惯例。
+RUN chmod +x /usr/local/bin/start-app.sh

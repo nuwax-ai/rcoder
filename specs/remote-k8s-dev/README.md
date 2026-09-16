@@ -33,6 +33,10 @@ make remote-k8s-sync-stop
 
 `down` 保留 namespace、Gateway、Secret 和所有 PVC。它不承担数据销毁或旧快照回收；需要回收磁盘时，先停止同步与构建，按 receipt 人工确认本环境快照/BuildKit 缓存后处理。不要删除共享 CephFS 根数据。
 
+## Gateway 修复进展（2026-09-16）
+
+个人集群 Gateway 已修复，双节点 NodePort 请求及 `remote-k8s-test SUITE=gateway`、`SUITE=smoke` 均通过。原因是 worker 上 Tailscale 设置的全局 `src_valid_mark=1` 与 Cilium 透明代理路由冲突；后续按用户要求卸载 Tailscale，清理临时兼容配置，并复测 Gateway 通过。详见 [修复记录与回滚说明](gateway-repair-2026-09-16.md)。这不代表 UserApp/Chat 全套或长期稳定性已验收，以下保留原日期的历史结果。
+
 ## 验证记录（2026-09-13）
 
 - 新工作流 11 项、远端清理后端 2 项、原启动器 15 项、UserApp 启动器 4 项：共 32 项回归通过。旧 Make 测试入口 dry-run 保持原命令。

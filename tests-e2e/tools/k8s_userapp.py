@@ -34,6 +34,11 @@ REQUIRED = {'cluster_ready', 'concurrent_ensure', 'ensure_retry', 'builder_ident
             'sse_terminal', 'sse_past_terminal', 'cross_replica_cancel', 'cold_deploy',
             'content_A', 'hot_env_rejected', 'hot_failure', 'old_content_healthy',
             'hot_deploy', 'content_B', 'hot_pod_preserved', 'deploy_identity',
+            'lock_holder_admitted', 'lock_busy_stop_conflict', 'lock_cross_replica_conflict',
+            'lock_busy_restart_conflict', 'lock_busy_delete_conflict', 'lock_holder_still_inflight',
+            'lock_holder_completes', 'lock_rejected_no_auto_execution', 'lock_no_side_effects',
+            'lock_start_window_admitted', 'lock_start_waits_for_holder',
+            'lock_delete_stale_version_conflict', 'lock_delete_version_keeps_resources',
             'lifecycle_active', 'stop_request_operation', 'stop_operation_by_request',
             'lifecycle_stable_stop_wake', 'request_id_replay_no_redeploy', 'request_id_by_request',
             'stop_idempotent', 'stop_zero_pods', 'wake_new_pod', 'wake', 'wake_content_B', 'cleanup',
@@ -56,7 +61,9 @@ class Run:
     def __init__(self, args):
         self.args = args
         self.id = uuid.uuid4().hex
-        self.app = 'e2e-k8s-' + self.id[:16]
+        # app_id 受 USERAPP_APP_ID_MAX_LEN=22 约束（K8s StatefulSet label 63 字节限制）：
+        # 'e2e-k8s-'(8) + 14 hex = 22
+        self.app = 'e2e-k8s-' + self.id[:14]
         self.user = 'e2e-' + self.id[:12]
         report_base = Path(os.environ['E2E_RUN_ROOT']) if os.environ.get('E2E_RUN_ROOT') else ROOT / 'reports'
         self.root = report_base / self.id
@@ -143,6 +150,22 @@ class Run:
         if status != 200 or data.get('code') != '0000':
             raise AssertionError(f'{path}: HTTP {status}: {data}')
         return data['data']
+
+    def api_retry_conflict(self, path, body=None, timeout=180, attempts=20, interval=5):
+        """快失败语义的调用方重试模式：锁被进行中操作（如仍在收敛的后台
+        部署协调器）持有时返回 ERR_CONFLICT——等待后重试（有界），其余业务
+        错误立即上抛。"""
+        last = None
+        for _ in range(attempts):
+            status, envelope = self.request(path, body, timeout=timeout)
+            if status == 200 and envelope.get('code') == '0000':
+                return envelope['data']
+            if status == 200 and envelope.get('code') == 'ERR_CONFLICT':
+                last = envelope
+                time.sleep(interval)
+                continue
+            raise AssertionError(f'{path}: HTTP {status}: {envelope}')
+        raise AssertionError(f'{path}: lock still held after {attempts} retries: {last}')
 
     def poll(self, action, predicate, budget=180):
         deadline = time.monotonic() + budget
@@ -279,6 +302,158 @@ strip_prefix = false
             raise AssertionError('Expected one production pod: ' + str(pods))
         return pods[0]
 
+    # ===== 锁快失败真实场景（stop/restart/delete 忙锁 ERR_CONFLICT；start 等待） =====
+
+    def lock_window_holder(self, artifact, admitted_check):
+        """在副本0发起一个在途持有者（热部署），以操作受理记录为可观察同步点。
+
+        返回 (holder_thread, rid, view_path)；线程结果存 holder_outcome 列表。
+        admitted_check：持有者被受理后需要满足的断言 id（不同窗口分别登记）。
+        """
+        rid = 'lock-holder-' + uuid.uuid4().hex[:16]
+        holder_outcome = []
+
+        def call():
+            holder_outcome.append(self.request('/api/v1/userapp/' + self.app + '/start',
+                                               {'user_id': self.user, 'request_id': rid,
+                                                **artifact, 'deploy_mode': 'hot'},
+                                               self.entries[0], timeout=300))
+
+        thread = threading.Thread(target=call, daemon=True)
+        thread.start()
+        view_path = '/api/v1/userapp/' + self.app + '/operations/by-request?' + urllib.parse.urlencode(
+            {'user_id': self.user, 'request_id': rid})
+
+        def admitted():
+            status, data = self.request(view_path, base=self.entries[1])
+            operation = data.get('data') if isinstance(data, dict) else None
+            return operation if status == 200 and operation and operation.get('operation_id') else None
+
+        operation = self.poll(admitted, bool, 90)
+        self.check(admitted_check,
+                   thread.is_alive() and operation.get('state') != 'Succeeded',
+                   {'operation': operation, 'holder_http_pending': thread.is_alive()})
+        return thread, rid, view_path, holder_outcome
+
+    def lock_fail_fast(self, artifact_b):
+        """忙锁窗口：外部 stop/restart/delete 立即 ERR_CONFLICT（HTTP 200 信封），
+        不等待持有者、无副作用、不排队；释放后不自动执行。"""
+        stop_query = '/api/v1/userapp/' + self.app + '/stop?' + urllib.parse.urlencode(
+            {'user_id': self.user, 'request_id': 'lock-stop-' + self.id[:16]})
+        thread, rid, view_path, holder_outcome = self.lock_window_holder(artifact_b, 'lock_holder_admitted')
+        timings = {}
+        try:
+            # 同实例：stop 打到持有者所在副本（进程内锁冲突）
+            started = time.monotonic()
+            status, envelope = self.request(stop_query, {}, base=self.entries[0], timeout=30)
+            timings['stop_same_replica_ms'] = int((time.monotonic() - started) * 1000)
+            self.check('lock_busy_stop_conflict',
+                       status == 200 and envelope.get('code') == 'ERR_CONFLICT'
+                       and envelope.get('success') is False
+                       and 'in progress' in envelope.get('message', ''),
+                       {'status': status, 'envelope': envelope, 'elapsed_ms': timings['stop_same_replica_ms']})
+            # 跨副本：stop 打到另一 rcoder 实例（ConfigMap 租约互斥）
+            started = time.monotonic()
+            status, cross = self.request(stop_query, {}, base=self.entries[1], timeout=30)
+            timings['stop_other_replica_ms'] = int((time.monotonic() - started) * 1000)
+            self.check('lock_cross_replica_conflict',
+                       status == 200 and cross.get('code') == 'ERR_CONFLICT'
+                       and cross.get('success') is False,
+                       {'status': status, 'envelope': cross, 'elapsed_ms': timings['stop_other_replica_ms']})
+            # restart / delete 忙锁同样快失败
+            started = time.monotonic()
+            status, restarted = self.request('/api/v1/userapp/' + self.app + '/restart',
+                                             {'user_id': self.user, 'request_id': 'lock-restart-' + self.id[:16]},
+                                             base=self.entries[1], timeout=30)
+            timings['restart_ms'] = int((time.monotonic() - started) * 1000)
+            self.check('lock_busy_restart_conflict',
+                       status == 200 and restarted.get('code') == 'ERR_CONFLICT'
+                       and restarted.get('success') is False,
+                       {'status': status, 'envelope': restarted, 'elapsed_ms': timings['restart_ms']})
+            started = time.monotonic()
+            status, deleted = self.request('/api/v1/userapp/' + self.app + '/prod/delete',
+                                           {'user_id': self.user, 'purge': False,
+                                            'request_id': 'lock-delete-' + self.id[:16]},
+                                           base=self.entries[1], timeout=30)
+            timings['delete_ms'] = int((time.monotonic() - started) * 1000)
+            self.check('lock_busy_delete_conflict',
+                       status == 200 and deleted.get('code') == 'ERR_CONFLICT'
+                       and deleted.get('success') is False,
+                       {'status': status, 'envelope': deleted, 'elapsed_ms': timings['delete_ms']})
+            # 冲突请求已返回而持有者仍在途：证明没有等待持锁业务完成
+            _, view = self.request(view_path, base=self.entries[1])
+            operation = view.get('data') or {}
+            self.check('lock_holder_still_inflight',
+                       bool(operation) and operation.get('state') != 'Succeeded'
+                       and thread.is_alive(),
+                       {'operation': operation, 'holder_http_pending': thread.is_alive()})
+        finally:
+            thread.join(300)
+        status, envelope = holder_outcome[0]
+        self.check('lock_holder_completes', status == 200 and envelope.get('code') == '0000',
+                   {'status': status, 'envelope': envelope})
+        # 释放后不自动执行被拒请求：给假想的排队 stop 一个执行窗口后，
+        # 应用仍应 1 副本 Running、无 Stop 操作记录、内容不受影响
+        time.sleep(2)
+        pod = self.prod_pod()
+        status, rejected_view = self.request(
+            '/api/v1/userapp/' + self.app + '/operations/by-request?' + urllib.parse.urlencode(
+                {'user_id': self.user, 'request_id': 'lock-stop-' + self.id[:16]}), base=self.entries[1])
+        self.check('lock_rejected_no_auto_execution',
+                   pod['phase'] == 'Running' and status == 200 and rejected_view.get('code') != '0000',
+                   {'pod': pod, 'by_request': rejected_view})
+        self.check('lock_no_side_effects', self.content(self.id + '-B'))
+        runtime = self.api('/api/v1/userapp/' + self.app + '?' + urllib.parse.urlencode({'user_id': self.user}))
+        self.pre_stop_version = runtime.get('resource_version')
+        self.save('lock-failfast.json', {'timings': timings, 'pre_stop_version': self.pre_stop_version})
+
+    def lock_start_waits(self, artifact_b):
+        """等待语义窗口：无 url start 不快失败——等持有者完成后才返回成功。"""
+        thread, rid, view_path, holder_outcome = self.lock_window_holder(artifact_b, 'lock_start_window_admitted')
+        start_outcome = []
+
+        def call_start():
+            start_outcome.append(self.request('/api/v1/userapp/' + self.app + '/start',
+                                              {'user_id': self.user},
+                                              base=self.entries[1], timeout=300))
+
+        started = time.monotonic()
+        start_thread = threading.Thread(target=call_start, daemon=True)
+        start_thread.start()
+        thread.join(300)
+        holder_done = time.monotonic()
+        start_thread.join(300)
+        start_done = time.monotonic()
+        status, envelope = start_outcome[0]
+        self.check('lock_start_waits_for_holder',
+                   status == 200 and envelope.get('code') == '0000' and start_done >= holder_done,
+                   {'status': status, 'envelope': envelope,
+                    'start_elapsed_ms': int((start_done - started) * 1000),
+                    'holder_done_before_start_return': start_done >= holder_done})
+
+    def delete_version_guard(self):
+        """delete 乐观锁：跨 stop/wake 换代后的过期 resource_version 必须被拒，
+        计算资源与数据卷不受影响。"""
+        stale = getattr(self, 'pre_stop_version', None)
+        runtime = self.api('/api/v1/userapp/' + self.app + '?' + urllib.parse.urlencode({'user_id': self.user}))
+        current = runtime.get('resource_version')
+        status, envelope = self.request('/api/v1/userapp/' + self.app + '/prod/delete',
+                                        {'user_id': self.user, 'purge': False,
+                                         'expected_resource_version': stale,
+                                         'request_id': 'lock-stale-' + self.id[:16]}, timeout=60)
+        self.check('lock_delete_stale_version_conflict',
+                   bool(stale) and current != stale
+                   and status == 200 and envelope.get('code') == 'ERR_CONFLICT'
+                   and envelope.get('success') is False,
+                   {'stale_version': stale, 'current_version': current,
+                    'status': status, 'envelope': envelope})
+        rows = self.inventory()
+        deployment = [r for r in rows if r['kind'] == 'Deployment' and r['name'] == 'rcoder-app-' + self.app]
+        pvcs = [r for r in rows if r['kind'] == 'PersistentVolumeClaim' and self.app in r['name']]
+        self.check('lock_delete_version_keeps_resources', len(deployment) == 1 and bool(pvcs),
+                   {'deployment': deployment, 'pvcs': pvcs})
+
+
     def content(self, expected):
         path = f'/api/v1/userapp/proxy/app/prod/{self.user}/{self.app}/'
         def read():
@@ -327,6 +502,9 @@ strip_prefix = false
                    and data.get('protocol_version') == 4 and operation.get('request_release_id') == hot['release_id']
                    and operation.get('phase') == 'running' and operation.get('deployment_generation_id')
                    and operation.get('deploy_stage') == 'succeeded' and operation.get('persisted') is True, data)
+        # 锁快失败/等待语义真实场景（持有者 = 热部署在途）
+        self.lock_fail_fast(artifact_b)
+        self.lock_start_waits(artifact_b)
         stop_request_id = 'stop-' + uuid.uuid4().hex
         for _ in range(2):
             status, envelope = self.request('/api/v1/userapp/' + self.app + '/stop?' + urllib.parse.urlencode({'user_id': self.user, 'request_id': stop_request_id}), {})
@@ -347,6 +525,8 @@ strip_prefix = false
         stable = self.lifecycle()
         self.check('lifecycle_stable_stop_wake', stable['lifecycle_id'] == self.lifecycle_id
                    and stable['state'] == 'Active' and stable['lifecycle_epoch'] == 1, stable)
+        # delete 乐观锁护栏（stop/wake 换代后的过期版本必须被拒）
+        self.delete_version_guard()
 
     def cleanup(self):
         if self.created:
@@ -357,8 +537,8 @@ strip_prefix = false
             if any(r['uid'] in baseline_uids for r in owned):
                 raise AssertionError('Refusing cleanup of a preexisting identity')
             if any(r['kind'] == 'Deployment' and r['name'] == 'rcoder-app-' + self.app for r in owned):
-                self.api('/api/v1/userapp/' + self.app + '/prod/delete', {'user_id': self.user, 'purge': True}, timeout=180)
-            self.api('/api/v1/userapp/' + self.app + '/delete/app', {'user_id': self.user}, timeout=180)
+                self.api_retry_conflict('/api/v1/userapp/' + self.app + '/prod/delete', {'user_id': self.user, 'purge': True})
+            self.api_retry_conflict('/api/v1/userapp/' + self.app + '/delete/app', {'user_id': self.user})
             if self.lifecycle_id is None:
                 remaining = self.poll(lambda: [r for r in self.inventory() if self.owned(r)], lambda r: not r, 180)
                 self.check('cleanup', not remaining, remaining)

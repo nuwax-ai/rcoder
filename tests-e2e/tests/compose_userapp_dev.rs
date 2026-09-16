@@ -586,6 +586,191 @@ async fn userapp_dev_git_service_context() {
     cleanup_builder(user, &app);
 }
 
+/// Java 完整出站形态的 git 全链：`applyUserAppHeaders` 三件套（x-service-type/
+/// x-workspace-type/x-app-id）与 `applyServiceParams` 双份定位参数（body/query 的
+/// workspaceType=userApp/serviceType/appId/workspacePath）并存 → init/add/commit/
+/// status/log 全通。锁三点：①多源并存下 serviceContext 分支覆盖 workspaceType
+/// 老规则（userApp 不在 pageApp|taskAgent 白名单，回落必 400，200 即覆盖证明）；
+/// ②`/api/git/log` 走统一收口（TS 侧 6321f7e 唯独漏传 serviceContext 的端点，
+/// 同形态在 TS 上 400——Rust 全端点收口的回归锁）；③commit 数据面回读：log 读回
+/// 刚提交的 message（git 操作真实作用于 app 开发卷，非仅 HTTP 200）。
+#[tokio::test]
+async fn userapp_dev_git_full_outbound_shape() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_git_full";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "g7");
+    let user = "e2e-ud-user";
+    let cid = "conv-full";
+    let commit_message = format!("e2e java outbound shape {app}");
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(user, &app);
+        return;
+    }
+
+    // Java 出站 header 三件套（applyUserAppHeaders：仅 userApp 会话附带）
+    let java_headers = |req: reqwest::RequestBuilder| {
+        req.header("X-Service-Type", "userapp")
+            .header("X-Workspace-Type", "userApp")
+            .header("X-App-Id", &app)
+    };
+    // Java 出站 body/query 双份定位参数（applyServiceParams 拼入，与 header 同发）
+    let java_locate = |extra: Value| -> Value {
+        let mut body = json!({
+            "workspaceType": "userApp",
+            "serviceType": "userapp",
+            "appId": app,
+            "workspacePath": format!("/home/user/{app}"),
+            "userId": user,
+            "cId": cid,
+        });
+        if let (Some(obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra_obj {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        body
+    };
+    let log_id = format!("computer:{user}:{cid}");
+
+    // 前置：computer 域 generate-file 同形态（三 header + 双份参数）在 app 开发卷
+    // 造待提交文件——文件族 header 通道回归 + git 内容来源
+    let resp = java_headers(
+        env.http
+            .post(format!("{}/api/computer/generate-file", env.rcoder))
+            .timeout(Duration::from_secs(60))
+            .json(&java_locate(json!({
+                "fileName": "git-full.txt", "content": "java outbound shape e2e"
+            }))),
+    )
+    .send()
+    .await
+    .expect("seed file via java-shaped request");
+    let sg = resp.status();
+    let bg: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "前置：generate-file Java 形态（三 header+双份参数）落 app 开发卷",
+        sg.is_success() && bg["success"].as_bool() == Some(true),
+        format!("HTTP {sg}, {}", trunc(&bg, 120)),
+    );
+
+    // git init：老规则白名单不含 userApp（回落必 400）——200 即 serviceContext 覆盖证明
+    let resp = java_headers(
+        env.http
+            .post(format!("{}/api/git/init", env.rcoder))
+            .timeout(Duration::from_secs(60))
+            .json(&java_locate(json!({}))),
+    )
+    .send()
+    .await
+    .expect("git init");
+    let si = resp.status();
+    let bi: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "git init：多源并存 serviceContext 覆盖 workspaceType=userApp 老规则",
+        si.is_success()
+            && bi["success"].as_bool() == Some(true)
+            && bi["logId"].as_str() == Some(&log_id),
+        format!("HTTP {si}, {}", trunc(&bi, 120)),
+    );
+
+    let resp = java_headers(
+        env.http
+            .post(format!("{}/api/git/add", env.rcoder))
+            .timeout(Duration::from_secs(60))
+            .json(&java_locate(json!({"files": ["git-full.txt"]}))),
+    )
+    .send()
+    .await
+    .expect("git add");
+    let sa = resp.status();
+    let ba: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "git add：同定位暂存 app 开发卷文件",
+        sa.is_success()
+            && ba["success"].as_bool() == Some(true)
+            && ba["logId"].as_str() == Some(&log_id),
+        format!("HTTP {sa}, {}", trunc(&ba, 120)),
+    );
+
+    let resp = java_headers(
+        env.http
+            .post(format!("{}/api/git/commit", env.rcoder))
+            .timeout(Duration::from_secs(60))
+            .json(&java_locate(json!({"message": commit_message}))),
+    )
+    .send()
+    .await
+    .expect("git commit");
+    let sc = resp.status();
+    let bc: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "git commit：同定位提交",
+        sc.is_success()
+            && bc["success"].as_bool() == Some(true)
+            && bc["logId"].as_str() == Some(&log_id),
+        format!("HTTP {sc}, {}", trunc(&bc, 120)),
+    );
+
+    // GET 通道：status + log query 全参（applyServiceParams 的 GET 形态）
+    let query = format!(
+        "workspaceType=userApp&serviceType=userapp&appId={app}&workspacePath=/home/user/{app}&userId={user}&cId={cid}"
+    );
+    let resp = java_headers(
+        env.http
+            .get(format!("{}/api/git/status?{query}", env.rcoder))
+            .timeout(Duration::from_secs(60)),
+    )
+    .send()
+    .await
+    .expect("git status");
+    let ss = resp.status();
+    let bs: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "git status：GET query 双份参数命中同一定位",
+        ss.is_success()
+            && bs["success"].as_bool() == Some(true)
+            && bs["logId"].as_str() == Some(&log_id),
+        format!("HTTP {ss}, {}", trunc(&bs, 120)),
+    );
+
+    // log：TS 侧漏传 serviceContext 的唯一端点（同形态 TS 400）——Rust 统一收口
+    // 须 200，且 commits 数据面读回刚提交的 message（真实作用于 app 开发卷）
+    let resp = java_headers(
+        env.http
+            .get(format!("{}/api/git/log?{query}&maxCount=5", env.rcoder))
+            .timeout(Duration::from_secs(60)),
+    )
+    .send()
+    .await
+    .expect("git log");
+    let sl = resp.status();
+    let bl: Value = resp.json().await.unwrap_or(Value::Null);
+    let log_hit = sl.is_success()
+        && bl["success"].as_bool() == Some(true)
+        && bl["logId"].as_str() == Some(&log_id)
+        && bl["commits"].as_array().is_some_and(|commits| {
+            commits.iter().any(|c| {
+                c["message"]
+                    .as_str()
+                    .is_some_and(|m| m.trim() == commit_message)
+            })
+        });
+    report.assert_hard(
+        "git log：统一收口命中（TS /log 漏 serviceContext 端点锁）+ commits 读回刚提交 message",
+        log_hit,
+        format!("HTTP {sl}, {}", trunc(&bl, 160)),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(user, &app);
+}
+
 #[tokio::test]
 async fn userapp_dev_pg_reset_password() {
     rcoder_e2e::common::cross_bin_lock::acquire();

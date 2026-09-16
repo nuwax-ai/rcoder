@@ -357,6 +357,15 @@
     "header 通道：git init 拦截转发 → 容器内 serviceContext 落开发卷",
     "header 通道：git status 同一定位（GET 转发链）"
   ],
+  "userapp_dev_git_full_outbound_shape": [
+    "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "前置：generate-file Java 形态（三 header+双份参数）落 app 开发卷",
+    "git init：多源并存 serviceContext 覆盖 workspaceType=userApp 老规则",
+    "git add：同定位暂存 app 开发卷文件",
+    "git commit：同定位提交",
+    "git status：GET query 双份参数命中同一定位",
+    "git log：统一收口命中（TS /log 漏 serviceContext 端点锁）+ commits 读回刚提交 message"
+  ],
   "userapp_dev_new_endpoint_body_query_locate": [
     "A0：空 workspace dev/restart 快速失败 ERR_WORKSPACE_EMPTY",
     "A：body-only dev/restart 自定位（零 header，懒创建+任务受理）",

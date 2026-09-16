@@ -233,6 +233,12 @@
       "backend": "compose"
     }
   ],
+  "userapp_dev_git_full_outbound_shape": [
+    {
+      "scenario": "userapp_git_full",
+      "backend": "compose"
+    }
+  ],
   "userapp_dev_new_endpoint_body_query_locate": [
     {
       "scenario": "userapp_dev_nep",

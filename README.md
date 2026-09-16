@@ -316,16 +316,31 @@ file_server_proxy:
 ### 运行测试
 
 ```bash
-# 全量测试（CI 同款门禁；e2e 需要 Docker 环境）
-cargo test --workspace --all-features    # = make test-all
+# 根 workspace：nextest，开启所有 features，收集全部失败
+make test
 
 # 单 crate
-cargo test -p app_manager --all-features
+make test NEXTEST_ARGS='-p app_manager'
 
-# 仅单元/集成
+# 默认 feature 回归 / 独立 app-cli / 文档测试
+make test-default
+make test-app-cli
+make test-doc
+
+# 串行执行 workspace + app-cli + 文档测试；任一失败整体失败
+make test-all
+
+# 仅库单元 / Rust 集成测试目标
 make test-unit
 make test-integration
+
+# 本地 Docker Compose 核心业务集成回归，防止逻辑偏移
+make test-e2e
 ```
+
+需安装 `cargo-nextest`（`cargo install cargo-nextest --locked`）。`make test` 等价于 `cargo nextest run --workspace --no-fail-fast --all-features`；`TEST_FEATURES=` 可切换为默认 features，`NEXTEST_ARGS` 可传 nextest 筛选参数。crate 专用筛选用于对应单个目标，不用于跨 workspace/app-cli 的 `test-all`。`test-doc` 使用 Cargo 文档测试，不接收 `NEXTEST_ARGS`。
+
+`test-all` 不包含 Compose/K8s E2E，也不代替默认 feature 回归。`make test-e2e` 通过专用严格启动器验证核心业务链路；运行前准备本地 Compose 及所需镜像，详见 [E2E 说明](tests-e2e/tools/README.md)。nextest 的环境门控用例通过或跳过不能代替该门禁。失败时逐项区分已批准需求导致的测试预期偏移、代码缺陷和环境问题，修复后重跑对应回归。
 
 ### 代码质量
 
