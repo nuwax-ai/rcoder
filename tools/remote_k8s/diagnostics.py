@@ -19,6 +19,10 @@ CHECK_BUDGET_SECONDS = 120
 ITEM_TIMEOUT_SECONDS = 20
 
 
+class Unknown(Exception):
+    """观察缺失/不可判定——不是失败也不是通过（Q06：空观察不得记 pass）。"""
+
+
 def _probe(label, namespace_hint=''):
     """执行单项检查的通用包装：异常分类 + 计时。"""
 
@@ -38,6 +42,10 @@ def _probe(label, namespace_hint=''):
                 return {'name': label, 'status': 'unknown', 'error_class': 'timeout',
                         'duration_ms': int((time.monotonic() - started) * 1000),
                         'detail': str(error)[:200]}
+            except Unknown as error:
+                return {'name': label, 'status': 'unknown', 'error_class': 'no-observation',
+                        'duration_ms': int((time.monotonic() - started) * 1000),
+                        'detail': str(error)[:200]}
             except Exception as error:  # noqa: BLE001 - 分项隔离：单项失败不拖垮其他诊断
                 # K8s RBAC 拒绝（kubectl 403/Forbidden）是"权限不可判定"，不是
                 # 业务失败：记 unknown，绝不当通过也不误报失败（T07）。
@@ -53,7 +61,7 @@ def _probe(label, namespace_hint=''):
 
 @_probe('ssh-connectivity')
 def _ssh(c):
-    c.ssh(['true'])
+    c.ssh(['true'], timeout=ITEM_TIMEOUT_SECONDS)
     return 'ssh ok'
 
 
@@ -152,7 +160,8 @@ def _ceph(c):
                   '-o', 'jsonpath={.items[*].status.ceph.health}'], timeout=ITEM_TIMEOUT_SECONDS)
     health = rows.strip()
     if not health:
-        return 'no cephcluster CRD reports health'
+        # Q06：空观察不能证明健康——unknown 而非 pass
+        raise Unknown('no cephcluster CRD reports health')
     bad = [value for value in health.split() if value != 'HEALTH_OK']
     if bad:
         raise RuntimeError('ceph health not OK: ' + ' '.join(bad))
@@ -183,10 +192,10 @@ def check(c):
                 results.append(future.result())
                 pending.pop(futures[future], None)
         except concurrent.futures.TimeoutError:
-            # 总预算耗尽：已完成项保留、未完成项记 unknown，始终落部分报告
-            # （T07——超时不得丢失已收集证据，也不得静默漏报未检项）
+            # 总预算耗尽：仅收集**尚未记录**的完成项（Q06：正常循环已 pop 的
+            # 不得重复入报告），未完成项记 unknown，始终落部分报告
             for future, label in futures.items():
-                if future.done() and not future.cancelled():
+                if label in pending and future.done() and not future.cancelled():
                     results.append(future.result())
                     pending.pop(label, None)
     finally:

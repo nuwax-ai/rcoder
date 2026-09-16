@@ -299,6 +299,66 @@ class TestExecuteSuitesPostVerify(unittest.TestCase):
         self.assertEqual(state['verify_calls'], 2)
 
 
+class TestStructuredChatCases(unittest.TestCase):
+    """T04：chat 用例优先消费严格启动器落盘的结构化 summary。"""
+
+    def test_parses_structured_results_and_missing_reports_yield_none(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            context = {'report_dir': root}
+            self.assertIsNone(main._structured_chat_cases(context))
+            run_dir = root / 'e2e-reports' / 'run-1'
+            run_dir.mkdir(parents=True)
+            (run_dir / 'summary.json').write_text(json.dumps({
+                'run_id': 'run-1',
+                'results': [{'suite': 'k8s_lb', 'test': 'chat_alpha', 'verdict': 'fail',
+                             'errors': ['libtest exit 1']},
+                            {'suite': 'k8s_lb', 'test': 'chat_beta', 'verdict': 'pass'},
+                            {'suite': 'other', 'test': 'noise', 'verdict': 'pass'}]}))
+            rows = main._structured_chat_cases(context)
+            self.assertEqual([r['name'] for r in rows], ['chat_alpha', 'chat_beta'])
+            self.assertEqual(rows[0]['verdict'], 'fail')
+            self.assertEqual(rows[0]['errors'], ['libtest exit 1'])
+
+
+class TestExecuteSuitesFailurePathVerify(unittest.TestCase):
+    """Q05：失败/取消路径也执行末尾快照校验，双错误不互相掩盖。"""
+
+    def test_suite_failure_with_clean_snapshot_reraises_original(self):
+        context = {'snapshot_record': {}}
+        original = RuntimeError('business failure')
+
+        def failing_userapp(c, receipt, ctx):
+            raise original
+
+        with patch.object(main.test_snapshot, 'verify', lambda record: None), \
+                patch.object(main, 'run_userapp_suite', failing_userapp):
+            with self.assertRaises(RuntimeError) as caught:
+                main.execute_suites(None, {}, context, 'userapp')
+        self.assertIs(caught.exception, original)
+
+    def test_suite_failure_with_tampered_snapshot_reports_both(self):
+        context = {'snapshot_record': {}}
+        state = {'calls': 0}
+
+        def failing_userapp(c, receipt, ctx):
+            raise RuntimeError('business failure')
+
+        def verify(record):
+            state['calls'] += 1
+            if state['calls'] > 1:
+                raise RuntimeError('content mismatch in snapshot')
+
+        with patch.object(main.test_snapshot, 'verify', verify), \
+                patch.object(main, 'run_userapp_suite', failing_userapp):
+            with self.assertRaises(RuntimeError) as caught:
+                main.execute_suites(None, {}, context, 'userapp')
+        message = str(caught.exception)
+        self.assertIn('business failure', message)
+        self.assertIn('content mismatch in snapshot', message)
+        self.assertEqual(state['calls'], 2)
+
+
 class TestFrozenFingerprintContentSensitivity(unittest.TestCase):
     """T03：冻结模式下 launcher 指纹必须覆盖文件实际内容，而非仅清单 JSON。"""
 
@@ -363,13 +423,14 @@ class TestDiagnosticsClassification(unittest.TestCase):
         row = diagnostics._ceph(TestDiagnosticsClassification.C(ssh_rows='HEALTH_ERR'))
         self.assertEqual(row['status'], 'fail')
 
-    def test_ceph_health_ok_passes_and_empty_is_informational(self):
+    def test_ceph_health_ok_passes_and_empty_is_unknown(self):
         import diagnostics
         row = diagnostics._ceph(TestDiagnosticsClassification.C(ssh_rows='HEALTH_OK'))
         self.assertEqual(row['status'], 'pass')
+        # Q06：空观察不能证明健康——unknown（no-observation），绝不当通过
         row = diagnostics._ceph(TestDiagnosticsClassification.C(ssh_rows=''))
-        self.assertEqual(row['status'], 'pass')
-        self.assertIn('no cephcluster', row['detail'])
+        self.assertEqual(row['status'], 'unknown')
+        self.assertEqual(row['error_class'], 'no-observation')
 
     def test_deployment_not_ready_is_failure(self):
         import diagnostics

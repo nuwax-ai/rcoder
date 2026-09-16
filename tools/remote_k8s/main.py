@@ -191,24 +191,31 @@ def build(c, expected_manifest=None):
         receipt['bases'][key] = pinned
         base_args += ['--build-arg', key + '=' + pinned]
     receipt['timings']['base_resolution_ms'] = int((time.monotonic() - bases_started) * 1000)
-    # T06：缓存 key 锁定构建工具链实际 digest——同 tag 被 registry 更新后必须
-    # miss，不得复用旧 tag 名下的产物。解析失败 → 记 'unresolved:...'（与任何
-    # 已解析轮次不同 key，永不误命中）；构建本身继续使用 tag。
+    # T06/Q03：缓存 key 锁定构建工具链实际 digest——同 tag 被 registry 更新后
+    # 必须 miss。解析失败 → 本轮**完全禁用**缓存读写（不是给失败 key 加字样：
+    # 稳定的失败 key 仍会命中上一轮同失败路径下写入的产物），构建继续用 tag
+    # 并如实记录不可复现性。
     rust_ref = c.get('RUST_IMAGE', 'rust:1.95-trixie')
+    rust_build_arg = rust_ref
+    cache_key_this_round = None
     try:
         rust_info = c.ssh(['docker', 'buildx', 'imagetools', 'inspect', rust_ref], timeout=180)
         rust_match = re.search(r'^Digest:\s*(sha256:[a-f0-9]{64})', rust_info, re.M)
         if not rust_match:
             raise ValueError('no digest in imagetools output')
         receipt['rust_image'] = rust_ref.split('@')[0] + '@' + rust_match.group(1)
+        # 构建也使用解析后的 digest（解析与构建之间 tag 变化不再造成
+        # receipt/cache 标识与实际工具链不一致）
+        rust_build_arg = receipt['rust_image']
+        cache_key_this_round = build_cache.cache_key(
+            receipt['source_sha256'], receipt['bases'], c, rust_image=receipt['rust_image'])
     except (RuntimeError, ValueError) as error:
         receipt['rust_image'] = 'unresolved:' + rust_ref + ':' + type(error).__name__
+        receipt['cache'] = {'disabled': 'rust-image-digest-unresolved'}
         print('Warning: RUST_IMAGE digest unresolved (' + type(error).__name__ +
-              '); reusing cached builds is disabled for this round', flush=True)
-    # R2 保守构建复用：同 key 完整成功 receipt + registry 产物核验 → 复用
-    key = build_cache.cache_key(receipt['source_sha256'], receipt['bases'], c, rust_image=receipt['rust_image'])
-    receipt['cache_key'] = key
-    cached = build_cache.load(c, key)
+              '); build cache read AND write disabled for this round', flush=True)
+    receipt['cache_key'] = cache_key_this_round
+    cached = cache_key_this_round and build_cache.load(c, cache_key_this_round)
     if cached:
         reusable = []
         for target in build_cache.TARGETS:
@@ -227,7 +234,7 @@ def build(c, expected_manifest=None):
             receipt['finished_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             atomic_json(c.state / 'builds' / (build_id + '.json'), receipt)
             atomic_json(c.state / 'build.json', receipt)
-            print('Build reused from', cached['build_id'], '(cache key ' + key[:12] + ')', flush=True)
+            print('Build reused from', cached['build_id'], '(cache key ' + cache_key_this_round[:12] + ')', flush=True)
             return receipt
         print('Cache entry incomplete on registry (missing: ' +
               ', '.join(t for t in build_cache.TARGETS if t not in reusable) + '); rebuilding', flush=True)
@@ -261,10 +268,12 @@ def build(c, expected_manifest=None):
         atomic_json(c.state / 'builds' / (build_id + '.json'), receipt)
         raise
     receipt['status'] = 'built'
-    receipt['cache'] = {'reused': False}
+    if 'cache' not in receipt:
+        receipt['cache'] = {'reused': False}
     receipt['timings']['total_ms'] = int((time.monotonic() - build_started) * 1000)
     receipt['finished_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    build_cache.store(c, key, receipt)
+    if cache_key_this_round:
+        build_cache.store(c, cache_key_this_round, receipt)
     atomic_json(c.state / 'builds' / (build_id + '.json'), receipt)
     atomic_json(c.state / 'build.json', receipt)
     print('Build receipt:', c.state / 'build.json', flush=True)
@@ -444,12 +453,43 @@ def run_chat_suite(c, receipt, context, case=''):
         failure = error  # 场景失败：先解析已完成结果，再上抛（T04）
         output = (context['report_dir'] / 'chat.log').read_text()
     (context['report_dir'] / 'chat.log').write_text(output)
-    cases = [{'name': name, 'verdict': verdict}
-             for verdict, name in CHAT_CASE_PATTERN.findall(output)]
+    # T04：优先消费严格启动器落盘的结构化 summary（含基础设施失败/中断的
+    # aborted 记录）；stdout 正则仅兜底（无报告可解析时绝不伪造用例）
+    cases = _structured_chat_cases(context)
+    if cases is None:
+        cases = [{'name': name, 'verdict': verdict}
+                 for verdict, name in CHAT_CASE_PATTERN.findall(output)]
     context['cases'] = cases
     if failure is not None:
         raise failure
     return cases
+
+
+def _structured_chat_cases(context):
+    """解析本轮 e2e-reports 下严格启动器的结构化 summary（T04）。
+
+    report_dir 每次测试独立新建，目录内即本轮启动器输出；结构化结果包含
+    场景失败与 aborted（无完成进程结果）明细，比 stdout 正则可信。
+    """
+    root = context['report_dir'] / 'e2e-reports'
+    if not root.is_dir():
+        return None
+    rows = []
+    for run_dir in sorted(root.iterdir()):
+        summary = run_dir / 'summary.json'
+        if not summary.exists():
+            continue
+        try:
+            data = json.loads(summary.read_text())
+        except ValueError:
+            continue
+        for result in data.get('results', []):
+            if result.get('suite') == 'k8s_lb' and result.get('test'):
+                rows.append({'name': result['test'],
+                             'verdict': result.get('verdict'),
+                             'errors': result.get('errors', []),
+                             'run_id': data.get('run_id')})
+    return rows or None
 
 
 def run_userapp_suite(c, receipt, context):
@@ -488,25 +528,37 @@ def prepare_test_snapshot(c, manifest_override=None):
 
 
 def execute_suites(c, receipt, context, suite, case=''):
-    """已冻结快照上执行选定套件；运行前后都校验快照未被篡改（T03）。
+    """已冻结快照上执行选定套件；**所有收束路径**（成功/失败/取消）都执行
+    末尾快照校验（Q05）——失败报告必须能区分业务失败与输入篡改；校验错误
+    不掩盖原始错误，两者一并上抛。
 
     运行后校验失败 → 异常 → 调用方 verdict=fail：被篡改输入上的结果不得记 pass。
     """
     test_snapshot.verify(context['snapshot_record'])
     started = time.monotonic()
-    if suite in ['gateway', 'all']:
-        for kind, name in [('gateway', 'rcoder'), ('httproute', 'rcoder')]:
-            row = owned(c, kind, name)
-            conditions = row.get('status', {}).get('conditions', []) if kind == 'gateway' else [x for p in row.get('status', {}).get('parents', []) for x in p.get('conditions', [])]
-            required = ['Accepted', 'ResolvedRefs'] if kind == 'httproute' else ['Accepted']
-            if any(not any(x['type'] == condition and x['status'] == 'True' and
-                           x.get('observedGeneration') == row['metadata']['generation'] for x in conditions) for condition in required):
-                raise RuntimeError(kind + ' does not have current successful conditions')
-        http_health(receipt['gateway_url'])
-    if suite in ['userapp', 'all']:
-        run_userapp_suite(c, receipt, context)
-    if suite in ['chat', 'all']:
-        context['cases'] = run_chat_suite(c, receipt, context, case=case)
+    try:
+        if suite in ['gateway', 'all']:
+            for kind, name in [('gateway', 'rcoder'), ('httproute', 'rcoder')]:
+                row = owned(c, kind, name)
+                conditions = row.get('status', {}).get('conditions', []) if kind == 'gateway' else [x for p in row.get('status', {}).get('parents', []) for x in p.get('conditions', [])]
+                required = ['Accepted', 'ResolvedRefs'] if kind == 'httproute' else ['Accepted']
+                if any(not any(x['type'] == condition and x['status'] == 'True' and
+                               x.get('observedGeneration') == row['metadata']['generation'] for x in conditions) for condition in required):
+                    raise RuntimeError(kind + ' does not have current successful conditions')
+            http_health(receipt['gateway_url'])
+        if suite in ['userapp', 'all']:
+            run_userapp_suite(c, receipt, context)
+        if suite in ['chat', 'all']:
+            context['cases'] = run_chat_suite(c, receipt, context, case=case)
+    except BaseException as suite_error:
+        # Q05：失败/取消也校验快照——输入被篡改的失败与业务失败必须可区分；
+        # 校验错误链在原始错误之后，不互相掩盖
+        try:
+            test_snapshot.verify(context['snapshot_record'])
+        except BaseException as verify_error:
+            raise RuntimeError(f'suite error: {suite_error!r}; '
+                               f'post-run frozen snapshot verification ALSO failed: {verify_error}') from suite_error
+        raise
     elapsed = int((time.monotonic() - started) * 1000)
     test_snapshot.verify(context['snapshot_record'])
     return elapsed
@@ -606,6 +658,9 @@ def retest_failed(c, parent_id):
         raise RuntimeError('Parent frozen test snapshot is not sealed for this environment')
     record['path'] = str(snapshot_dir)
     test_snapshot.verify(record)  # 快照被篡改 → 拒绝
+    # Q04：父报告源码身份与冻结记录绑定核验——重跑输入必须与父报告同源
+    if record.get('source_sha256') != parent.get('test_source_sha256'):
+        raise RuntimeError('Parent report source identity does not match its frozen snapshot')
     # 场景注册校验用冻结快照内的 catalog（T05）：活动目录后续增删场景
     # 不改变父报告冻结输入的合法性边界
     frozen_root = Path(record['path']) / 'source'
@@ -614,37 +669,47 @@ def retest_failed(c, parent_id):
     if unknown:
         raise RuntimeError('Parent failed cases are not registered scenarios: ' + ', '.join(unknown))
     print('Retesting failed cases from parent', parent_id, ':', ', '.join(failed), flush=True)
+    # Q04：重跑复用普通 tests() 的完整收束路径（同轮冻结、部署身份/外部资源
+    # 复核、所有收束路径的快照校验、结构化失败报告）——不绕过任何保护；
+    # 报告目录由 tests() 以新 test_id 唯一创建，历史不可覆盖；取消立即结束
     outcomes = []
     for name in failed:
-        sub_report = c.state / 'tests' / (parent_id + '-retest')
-        # 每个失败用例一次精确重跑；新报告独立成目录，父报告不改写
-        case_report = sub_report / name
-        case_report.mkdir(parents=True, exist_ok=True)
-        context = {'snapshot_record': record,
-                   'snapshot_path': Path(record['path']) / 'source',
-                   'snapshot_manifest_path': Path(record['path']) / 'inputs.json',
-                   'origin_head': parent.get('origin_head', 'unknown'),
-                   'report_dir': case_report}
+        case_test_id = None
         outcome = {'name': name, 'verdict': 'fail'}
         try:
-            execute_suites(c, receipt, context, 'chat', case=name)
-            outcome['verdict'] = 'pass'
+            tests(c, 'chat', case=name, frozen_snapshot=record)
+        except KeyboardInterrupt:
+            raise
         except BaseException as exc:
-            outcome['error'] = type(exc).__name__ + ': ' + str(exc)[:200]
+            outcome['error'] = type(exc).__name__ + ': ' + str(exc)[:300]
+        newest = max((c.state / 'tests').glob('*/summary.json'),
+                     key=lambda p: p.stat().st_mtime, default=None)
+        if newest is not None:
+            row = json.loads(newest.read_text())
+            case_test_id = row.get('test_id')
+            for case_row in row.get('cases', []):
+                if case_row.get('name') == name:
+                    outcome['verdict'] = case_row.get('verdict', outcome['verdict'])
+        if outcome['error'] is None and outcome['verdict'] == 'pass':
+            outcome.pop('error', None)
+        outcome['test_id'] = case_test_id
         outcomes.append(outcome)
-        summary = {'parent_test_id': parent_id, 'retest': True, 'case': name,
-                   'verdict': outcome['verdict'], 'snapshot_id': record['snapshot_id'],
-                   'test_source_sha256': record['source_sha256'],
-                   'server_source_sha256': receipt.get('source_sha256'),
-                   'error': outcome.get('error', ''), 'report': str(case_report)}
-        atomic_json(case_report / 'summary.json', summary)
+        if case_test_id:
+            summary = {'parent_test_id': parent_id, 'retest': True, 'case': name,
+                       'verdict': outcome['verdict'], 'snapshot_id': record['snapshot_id'],
+                       'test_source_sha256': record['source_sha256'],
+                       'server_source_sha256': receipt.get('source_sha256'),
+                       'error': outcome.get('error', ''),
+                       'report': str(c.state / 'tests' / case_test_id)}
+            atomic_json((c.state / 'tests' / case_test_id) / 'retest-summary.json', summary)
     still_failed = [row['name'] for row in outcomes if row['verdict'] != 'pass']
-    summary_path = sub_report / 'summary.json'
-    atomic_json(summary_path, {'parent_test_id': parent_id, 'retest': True,
-                               'cases': outcomes, 'still_failed': still_failed,
-                               'partial_coverage': True,
-                               'note': 'retest covers only previously failed cases; full-suite pass requires a fresh complete run'})
-    print('Retest report:', sub_report, flush=True)
+    summary_path = c.state / 'tests' / (parent_id + '-retest-' + uuid.uuid4().hex[:8])
+    atomic_json(summary_path / 'summary.json', {'parent_test_id': parent_id, 'retest': True,
+                                                'cases': outcomes, 'still_failed': still_failed,
+                                                'partial_coverage': True,
+                                                'note': 'retest covers only previously failed cases; '
+                                                        'full-suite pass requires a fresh complete run'})
+    print('Retest report:', summary_path, flush=True)
     if still_failed:
         raise RuntimeError('Retested cases still failing: ' + ', '.join(still_failed))
 
@@ -663,11 +728,26 @@ def logs(c, destination=None):
         for value in redactions:
             text = text.replace(value, '<redacted>')
         return text
-    pods = c.obj('get', 'pods')['items']
-    # No pod env or Secrets in diagnostics.
-    rows = [{'name': p['metadata']['name'], 'uid': p['metadata']['uid'], 'status': p.get('status')} for p in pods]
-    atomic_json(destination / 'pods.json', rows)
-    (destination / 'events.txt').write_text(scrub(c.kube('get', 'events', '--sort-by=.lastTimestamp')))
+    # Q06：前置查询逐项独立保护——namespace/pods/events 任一失败不得阻止
+    # 其余诊断项收集（错误记录进 collection-errors）
+    try:
+        owned(c, 'namespace', c.ns)
+    except RuntimeError as error:
+        collection_errors.append({'item': 'namespace ownership', 'error_class': 'collect-failed',
+                                  'detail': str(error)[-300:]})
+    try:
+        pods = c.obj('get', 'pods')['items']
+        rows = [{'name': p['metadata']['name'], 'uid': p['metadata']['uid'], 'status': p.get('status')} for p in pods]
+        atomic_json(destination / 'pods.json', rows)
+    except Exception as error:  # noqa: BLE001 - 单项失败不阻止其余收集
+        collection_errors.append({'item': 'pods inventory', 'error_class': 'collect-failed',
+                                  'detail': str(error)[-300:]})
+        pods = []
+    try:
+        (destination / 'events.txt').write_text(scrub(c.kube('get', 'events', '--sort-by=.lastTimestamp')))
+    except Exception as error:  # noqa: BLE001 - 同上
+        collection_errors.append({'item': 'events', 'error_class': 'collect-failed',
+                                  'detail': str(error)[-300:]})
     collection_errors = []
     for pod in pods:
         name = pod['metadata']['name']
