@@ -37,7 +37,7 @@ REQUIRED = {'cluster_ready', 'concurrent_ensure', 'ensure_retry', 'builder_ident
             'lock_holder_admitted', 'lock_busy_stop_conflict', 'lock_cross_replica_conflict',
             'lock_busy_restart_conflict', 'lock_busy_delete_conflict', 'lock_holder_still_inflight',
             'lock_holder_completes', 'lock_rejected_no_auto_execution', 'lock_no_side_effects',
-            'lock_start_window_admitted', 'lock_start_waits_for_holder',
+            'lock_busy_start_conflict',
             'lock_delete_stale_version_conflict', 'lock_delete_version_keeps_resources',
             'lifecycle_active', 'stop_request_operation', 'stop_operation_by_request',
             'lifecycle_stable_stop_wake', 'request_id_replay_no_redeploy', 'request_id_by_request',
@@ -462,34 +462,21 @@ strip_prefix = false
         self.save('lock-failfast.json', {'timings': timings, 'pre_stop_version': self.pre_stop_version})
 
     def lock_start_waits(self, artifact_b):
-        """等待语义窗口：无 url start 不快失败——等持有者完成后才返回成功。"""
-        thread, rid, view_path, holder_outcome = self.lock_window_holder(artifact_b, 'lock_start_window_admitted')
-        start_outcome = []
-
-        def call_start():
-            start_outcome.append(self.request('/api/v1/userapp/' + self.app + '/start',
-                                              {'user_id': self.user},
-                                              base=self.entries[1], timeout=300))
-
+        """忙锁窗口的第二探测：无 url start（HTTP 面）同为快失败——外部生命
+        周期操作（deploy_controlled 批次语义）一致 ERR_CONFLICT 不排队；
+        排队等待语义属于内部路径（流量唤醒/回收器/恢复），由组件测试覆盖
+        （Docker flock 轮询 + K8s 租约轮询单测）与套件 wake 流程验证。"""
+        thread, rid, view_path, holder_outcome = self.lock_window_holder(artifact_b, 'lock_holder_admitted_2')
         started = time.monotonic()
-        start_thread = threading.Thread(target=call_start, daemon=True)
-        start_thread.start()
-        # 先收束两个线程再解包结果——中途异常也不留脱管持有者持锁
-        try:
-            thread.join(300)
-            holder_done = time.monotonic()
-            start_thread.join(300)
-            start_done = time.monotonic()
-        except BaseException:
-            thread.join(300)
-            start_thread.join(300)
-            raise
-        start_status, start_envelope = start_outcome[0] if start_outcome else (0, {})
-        self.check('lock_start_waits_for_holder',
-                   start_status == 200 and start_envelope.get('code') == '0000' and start_done >= holder_done,
-                   {'status': start_status, 'envelope': start_envelope,
-                    'start_elapsed_ms': int((start_done - started) * 1000),
-                    'holder_done_before_start_return': start_done >= holder_done})
+        status, envelope = self.request('/api/v1/userapp/' + self.app + '/start',
+                                        {'user_id': self.user},
+                                        base=self.entries[1], timeout=30)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        thread.join(300)
+        self.check('lock_busy_start_conflict',
+                   status == 200 and envelope.get('code') == 'ERR_CONFLICT'
+                   and envelope.get('success') is False,
+                   {'status': status, 'envelope': envelope, 'elapsed_ms': elapsed_ms})
 
     def delete_version_guard(self):
         """delete 乐观锁：跨 stop/wake 换代后的过期 resource_version 必须被拒，
