@@ -369,24 +369,25 @@ mod tests {
         );
     }
 
-    /// start 无 url 对不存在的 app 且缺 user_id → 400（数据卷分区依赖），
-    /// 不触发任何 create。
+    /// 共享模型：start 无 url 对不存在的 app（无 user_id 亦然）→ 创建空容器
+    ///（用户绑定移除后无必填档；镜像 env 由 with_runtime_image_env 预置）。
     #[tokio::test]
-    async fn start_no_url_without_user_id_is_rejected() {
+    async fn start_no_url_without_user_id_creates_empty_app() {
         with_runtime_image_env();
         let tmp = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MockRuntime::default());
         let svc = test_service(tmp.path(), runtime.clone()).await;
 
-        let err = svc
-            .start_app_enhanced("appempty-2", StartAppRequest::default())
+        let result = svc
+            .start_app_enhanced("appempty2", StartAppRequest::default())
             .await
-            .expect_err("empty user_id must be rejected");
-        assert!(
-            matches!(err, crate::error::AppOperationError::Validation(_)),
-            "got {err:?}"
+            .expect("no-url start without user_id creates the empty app");
+        assert_eq!(
+            runtime.create_calls.load(Ordering::SeqCst),
+            1,
+            "shared model: empty start provisions compute exactly once"
         );
-        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+        assert!(result.operation_id.is_some());
     }
 
     /// 已存在 app 的 start 无 url → 传统启动（scale1），不重复创建。

@@ -12,6 +12,7 @@ use tokio::io::AsyncWriteExt as _;
 use super::{ObservationError, Verdict, await_pod_verdict, classify_pod_readiness};
 
 /// 极简受控 apiserver：按预设脚本应答 GET（LIST）与后续 WATCH 流写入。
+#[allow(dead_code)]
 struct ScriptedApiServer {
     listener: tokio::net::TcpListener,
     /// LIST 应答 JSON（完整 PodList）。
@@ -257,6 +258,94 @@ async fn split_events_in_one_chunk_are_consumed_in_order() {
     server.abort();
 }
 
+/// R09：连续 429（暂态）后有界退避——请求间隔不小于初始退避，且 deadline
+/// 仍统一收束（不无限热循环）。
+#[tokio::test]
+async fn rapid_transient_errors_back_off_between_retries() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let server = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        let mut first = true;
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::AsyncReadExt as _;
+            let mut buf = [0u8; 4096];
+            let mut head = String::new();
+            while !head.contains("\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                head.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            let is_watch = head.contains("watch=true");
+            let body = if first && !is_watch {
+                // 首个 LIST 返回空快照（Pod 恒 Pending——观察永不出终态）
+                first = false;
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "PodList",
+                    "metadata": {"resourceVersion": "10"}, "items": []
+                })
+                .to_string()
+            } else if is_watch {
+                // 持续 429：每次 WATCH 建连立即 429（apiserver 限流形态）
+                let body = serde_json::json!({
+                    "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "message": "Too many requests", "reason": "TooManyRequests", "code": 429
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.expect("429");
+                continue;
+            } else {
+                String::new()
+            };
+            if !body.is_empty() {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.expect("list");
+            }
+        }
+    });
+    let client = ScriptedApiServer::client(address).await;
+    let api: kube::Api<k8s_openapi::api::core::v1::Pod> = kube::Api::default_namespaced(client);
+    // 预算 1.5s：若每错误立即重试（无退避），1.5s 内远超 10 次（含连接建立
+    // 至少几十次）；带 200ms 起步退避则被压到个位数量级。
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let error = await_pod_verdict(
+        &api,
+        "watch-pod",
+        deadline,
+        tokio_util::sync::CancellationToken::new(),
+        classify_pod_readiness,
+    )
+    .await
+    .expect_err("deadline expected");
+    assert!(matches!(error, ObservationError::Deadline { .. }));
+    let total = hits.load(Ordering::SeqCst);
+    assert!(
+        total <= 10,
+        "backoff must bound retry cadence (requests={total})"
+    );
+    server.abort();
+}
+
 /// 事件分类契约锁：LIST 只返回 Pending（未就绪不算成功）——KR01。
 #[tokio::test]
 async fn pending_only_list_does_not_complete() {
@@ -273,6 +362,5 @@ async fn pending_only_list_does_not_complete() {
     .expect_err("pending must not complete");
     assert!(matches!(error, ObservationError::Deadline { .. }));
     server.abort();
-    // 显式使用 ListParams 防止误删导入（观察契约走 watcher::Config）。
-    let _ = ListParams::default();
+    drop(ListParams::default());
 }

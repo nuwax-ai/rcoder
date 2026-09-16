@@ -1,8 +1,7 @@
 //! HTTP 提取器适配层：把 Axum 原生 rejection 统一映射为 file-server `AppError`。
 //!
 //! 另含请求级 task-local 标记（中间件 scope 注入）：
-//! - 服务场景类型（`SERVICE_KIND`）：`X-Workspace-Type` header 值（回退
-//!   `X-Service-Type`）经
+//! - 工作空间定位类型（`WORKSPACE_KIND`）：`X-Workspace-Type` header 值经
 //!   `normalize_computer_service_type` 归一后的四值类型（userApp 切开发卷 /
 //!   normalProject 共享工作区 / pageApp·taskAgent 默认）——由
 //!   [`scope_service_context`] 读 header 注入，computer 域 workspace 定位
@@ -29,32 +28,42 @@ pub use shared_types::{
 
 // ── 请求级服务场景上下文 (task_local, 由请求中间件 scope 注入) ──────────────────
 tokio::task_local! {
-    /// `X-Service-Type` 归一化后的服务场景类型（恒 scope：header 缺失/未匹配
-    /// 值 scope `None`——对齐 TS `resolveServiceContext` 的 `headerType ||
-    /// bodyType || 缺省` 链：header 未匹配视为无值，轮到 body/query 通道，
-    /// 全缺失由消费方按缺省 taskAgent 布局处理）。
-    pub(crate) static SERVICE_KIND: Option<ComputerServiceKind>;
+    /// `X-Workspace-Type` 归一化后的工作空间定位类型（R06：定位单一通道；
+    /// header 缺失/未匹配 scope `None`，轮到 body/query 通道）。
+    pub(crate) static WORKSPACE_KIND: Option<ComputerServiceKind>;
+    /// 旧 `X-Service-Type` header 的归一值（R06：运行时路由概念，**仅作
+    /// 滚动升级期的最后档回退**参与定位——任何显式 workspaceType（header/
+    /// body/query）优先于它，防旧运行时 header 抢占目录类型）。
+    pub(crate) static LEGACY_SERVICE_KIND: Option<ComputerServiceKind>;
     /// 定位的独立 app_id（header `x-app-id` 优先，缺省 query `appId`
     /// 兜底；原始值存储，合法性由定位收口 `resolve_userapp_dev` 校验——与
     /// WORKSPACE_PATH 同款「中间件存原始值、收口 fail-fast」模式）。
     pub(crate) static USERAPP_APP_ID: Option<String>;
 }
 
-/// 当前请求 header 通道的服务场景类型（`None` = header 缺失/未匹配，
-/// 由消费方决定 body/query 兜底与缺省布局）。
-pub fn service_kind() -> Option<ComputerServiceKind> {
-    SERVICE_KIND.try_with(|kind| *kind).ok().flatten()
+/// 当前请求 `x-workspace-type` header 通道的定位类型（`None` = 缺失/未匹配）。
+pub fn workspace_kind() -> Option<ComputerServiceKind> {
+    WORKSPACE_KIND.try_with(|kind| *kind).ok().flatten()
+}
+
+/// 当前请求旧 `x-service-type` header 通道的归一值（R06 最后档回退）。
+pub fn legacy_service_kind() -> Option<ComputerServiceKind> {
+    LEGACY_SERVICE_KIND.try_with(|kind| *kind).ok().flatten()
 }
 
 /// 当前请求是否为 userApp 场景（`X-Service-Type: userapp`）。
 pub fn is_userapp_request() -> bool {
-    service_kind() == Some(ComputerServiceKind::Userapp)
+    // R06：定位判定按合并序（含 body/query 显式值）；旧 service_type
+    // body 值语义仍是 workspaceType 兼容通道（multipart/老 Java 调用方）
+    workspace_kind() == Some(ComputerServiceKind::Userapp)
+        || legacy_service_kind() == Some(ComputerServiceKind::Userapp)
 }
 
 /// 当前请求是否为 normalProject 场景（`X-Service-Type: normalProject`，
 /// 常规项目主容器共享工作区 `{CWS}/{userId}/NormalProject/{projectId}`）。
 pub fn is_normal_project_request() -> bool {
-    service_kind() == Some(ComputerServiceKind::NormalProject)
+    workspace_kind() == Some(ComputerServiceKind::NormalProject)
+        || legacy_service_kind() == Some(ComputerServiceKind::NormalProject)
 }
 
 /// 当前请求的独立 app_id（对齐 TS `resolveServiceContext` 的两级提取：
@@ -78,12 +87,17 @@ pub fn userapp_app_id() -> Option<String> {
 /// Java 静态文件族 query 恒带 `appId`）。query 值不做 percent-decode：
 /// app_id 是 identifier 字符集，含转义序列会在定位收口校验 fail-fast。
 pub async fn scope_service_context(req: Request, next: axum::middleware::Next) -> Response {
-    // 工作空间定位 header 通道（TS 88a1827）：x-workspace-type 优先；
-    // 滚动升级窗口内 x-service-type 作为回退（显式偏离：TS 侧无回退）。
-    let kind = req
+    // 工作空间定位 header 通道（TS 88a1827 / R06）：x-workspace-type 是
+    // 定位唯一 header 通道；旧 x-service-type 分离进 LEGACY 档（仅当
+    // workspaceType 全通道缺席时兜底——显式 workspaceType 必须胜出）。
+    let workspace_kind = req
         .headers()
         .get(WORKSPACE_TYPE_HEADER)
-        .or_else(|| req.headers().get(SERVICE_TYPE_HEADER))
+        .and_then(|v| v.to_str().ok())
+        .and_then(shared_types::normalize_computer_service_type);
+    let legacy_kind = req
+        .headers()
+        .get(SERVICE_TYPE_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(shared_types::normalize_computer_service_type);
     let app_id = req
@@ -97,7 +111,13 @@ pub async fn scope_service_context(req: Request, next: axum::middleware::Next) -
     let fut = next.run(req);
     async {
         USERAPP_APP_ID
-            .scope(app_id, async { SERVICE_KIND.scope(kind, fut).await })
+            .scope(app_id, async {
+                WORKSPACE_KIND
+                    .scope(workspace_kind, async {
+                        LEGACY_SERVICE_KIND.scope(legacy_kind, fut).await
+                    })
+                    .await
+            })
             .await
     }
     .await
@@ -157,12 +177,20 @@ pub(crate) fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// 合并服务场景类型来源（对齐 TS `resolveServiceContext` 的取值序）：
-/// header（task-local 归一结果，`None`=header 无有效值）优先 > body/query 的
-/// `serviceType` 字段归一。两通道皆无有效值 → `None`（由消费方按缺省
-/// taskAgent 布局处理）。
-pub(crate) fn merged_service_kind(explicit: Option<&str>) -> Option<ComputerServiceKind> {
-    service_kind().or_else(|| explicit.and_then(shared_types::normalize_computer_service_type))
+/// 合并工作空间定位类型来源（R06 优先级，对齐 TS `resolveServiceContext`）：
+/// `x-workspace-type` header > body/query 的 `workspaceType` 字段 >
+/// body/query 的旧 `serviceType` 字段（滚动升级）> 旧 `x-service-type`
+/// header（最后档——显式 workspaceType 任何通道都优先于旧运行时 header，
+/// 修复"旧 header 抢占目录类型"）。全通道无有效值 → `None`（缺省
+/// taskAgent 布局）。
+pub(crate) fn merged_workspace_kind(
+    workspace_type: Option<&str>,
+    service_type: Option<&str>,
+) -> Option<ComputerServiceKind> {
+    workspace_kind()
+        .or_else(|| workspace_type.and_then(shared_types::normalize_computer_service_type))
+        .or_else(|| service_type.and_then(shared_types::normalize_computer_service_type))
+        .or_else(legacy_service_kind)
 }
 
 /// 合并 appId 来源（header `x-app-id` > query `appId`（task-local 读取器内
@@ -305,7 +333,95 @@ mod tests {
     use serde::Deserialize;
     use tower::ServiceExt;
 
-    use super::{AppJson, is_userapp_request};
+    use super::{
+        AppJson, ComputerServiceKind, LEGACY_SERVICE_KIND, WORKSPACE_KIND, is_userapp_request,
+    };
+
+    /// R06 场景 1：旧 x-service-type header + body workspaceType=normalProject
+    /// ——显式 workspaceType（body）必须胜出，旧运行时 header 不得抢占目录类型。
+    #[tokio::test]
+    async fn explicit_body_workspace_type_beats_legacy_service_header() {
+        WORKSPACE_KIND
+            .scope(None, async {
+                LEGACY_SERVICE_KIND
+                    .scope(Some(ComputerServiceKind::Userapp), async {
+                        assert_eq!(
+                            super::merged_workspace_kind(Some("normalProject"), None),
+                            Some(ComputerServiceKind::NormalProject)
+                        );
+                    })
+                    .await
+            })
+            .await;
+    }
+
+    /// R06 场景 2：新 header 优先于 body workspaceType（header 通道 > body 通道）。
+    #[tokio::test]
+    async fn workspace_header_beats_body_channel() {
+        WORKSPACE_KIND
+            .scope(Some(ComputerServiceKind::Userapp), async {
+                assert_eq!(
+                    super::merged_workspace_kind(Some("normalProject"), None),
+                    Some(ComputerServiceKind::Userapp)
+                );
+            })
+            .await;
+    }
+
+    /// R06 场景 3：body 同时携带 serviceType 与 workspaceType（独立字段，
+    /// 不再是同一反序列化字段的别名冲突）——workspaceType 优先。
+    #[tokio::test]
+    async fn both_body_fields_deserialize_independently() {
+        #[derive(serde::Deserialize)]
+        struct Body {
+            #[serde(default)]
+            #[serde(rename = "workspaceType")]
+            workspace_type: Option<String>,
+            #[serde(default)]
+            #[serde(rename = "serviceType")]
+            service_type: Option<String>,
+        }
+        let body: Body =
+            serde_json::from_str(r#"{"workspaceType":"normalProject","serviceType":"userapp"}"#)
+                .expect("both fields deserialize independently");
+        assert_eq!(body.workspace_type.as_deref(), Some("normalProject"));
+        assert_eq!(body.service_type.as_deref(), Some("userapp"));
+        // 合并序：workspaceType 通道胜出
+        WORKSPACE_KIND
+            .scope(None, async {
+                assert_eq!(
+                    super::merged_workspace_kind(
+                        body.workspace_type.as_deref(),
+                        body.service_type.as_deref()
+                    ),
+                    Some(ComputerServiceKind::NormalProject)
+                );
+            })
+            .await;
+    }
+
+    /// R06 回退链：无 workspaceType 任何通道 → body serviceType → 旧 header。
+    #[tokio::test]
+    async fn legacy_fallbacks_apply_only_when_workspace_type_absent() {
+        WORKSPACE_KIND
+            .scope(None, async {
+                // body serviceType 兜底（滚动升级：老 Java 只发 serviceType body）
+                assert_eq!(
+                    super::merged_workspace_kind(None, Some("userapp")),
+                    Some(ComputerServiceKind::Userapp)
+                );
+                // 最后档：旧 x-service-type header
+                LEGACY_SERVICE_KIND
+                    .scope(Some(ComputerServiceKind::NormalProject), async {
+                        assert_eq!(
+                            super::merged_workspace_kind(None, None),
+                            Some(ComputerServiceKind::NormalProject)
+                        );
+                    })
+                    .await;
+            })
+            .await;
+    }
 
     /// task-local 服务场景类型：中间件 scope 注入后 handler 内可读；
     /// userapp 判定只命中 userapp 值，normalProject 命中 normalProject，

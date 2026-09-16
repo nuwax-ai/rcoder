@@ -23,6 +23,14 @@ use k8s_openapi::api::core::v1::Pod;
 #[cfg(feature = "kubernetes")]
 use kube::runtime::watcher;
 
+/// R09：暂态错误重试退避（200ms 起、指数 ×2、2s 封顶）——覆盖 kube-runtime
+/// 4.2 watcher 的立即恢复（其源码注释明确恢复发生在 next poll，需调用方
+/// 用退避机制加延迟）。退避等待受统一 deadline 与取消控制（KR03/KR04）。
+#[cfg(feature = "kubernetes")]
+const BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_millis(200);
+#[cfg(feature = "kubernetes")]
+const BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// 单次观察的结构化结果错误（保留 API 分类，不退化成字符串识别）。
 #[cfg(feature = "kubernetes")]
 #[derive(Debug)]
@@ -63,13 +71,21 @@ impl std::fmt::Display for ObservationError {
 #[cfg(feature = "kubernetes")]
 impl ObservationError {
     /// API 分类码提取（watcher::Error 各源；保留 API code，传输错误无码）。
+    /// R09 扩展：401/403 与端点拒绝（404/405/415）不可恢复；解码/请求构建
+    /// 协议错误不可恢复（重试同果）；429/5xx/传输断连为暂态（外层退避）。
+    /// 410（RV 过期）由 watcher 自行 re-list 恢复，不在此拦。
     fn from_watcher(error: &watcher::Error) -> Option<Self> {
-        // watcher::Error 内嵌 kube_client::Error 源；403/401 不可恢复。
-        // 410（RV 过期）由 watcher 自行 re-list 恢复，不在此拦。
         let source = match error {
             watcher::Error::InitialListFailed(source)
             | watcher::Error::WatchStartFailed(source)
             | watcher::Error::WatchFailed(source) => source,
+            watcher::Error::NoResourceVersion => {
+                // 协议违规：响应不满足 watch 契约——重试同果，快速失败
+                return Some(ObservationError::Fatal {
+                    code: None,
+                    message: "watch response lacked resourceVersion (protocol violation)".into(),
+                });
+            }
             watcher::Error::WatchError(status) => {
                 if status.code == 401 || status.code == 403 {
                     return Some(ObservationError::Fatal {
@@ -77,9 +93,9 @@ impl ObservationError {
                         message: status.message.clone(),
                     });
                 }
+                // 429/5xx 等 watch 流内错误：暂态，交外层退避
                 return None;
             }
-            watcher::Error::NoResourceVersion => return None,
         };
         match source {
             kube::Error::Api(ae) if ae.code == 401 || ae.code == 403 => {
@@ -88,6 +104,23 @@ impl ObservationError {
                     message: ae.message.clone(),
                 })
             }
+            kube::Error::Api(ae) if matches!(ae.code, 404 | 405 | 415) => {
+                Some(ObservationError::Fatal {
+                    code: Some(ae.code),
+                    message: format!(
+                        "resource endpoint rejected the observation ({}): {}",
+                        ae.code, ae.message
+                    ),
+                })
+            }
+            kube::Error::SerdeError(error) => Some(ObservationError::Fatal {
+                code: None,
+                message: format!("response decode failed (protocol error): {error}"),
+            }),
+            kube::Error::BuildRequest(error) => Some(ObservationError::Fatal {
+                code: None,
+                message: format!("request build failed (protocol error): {error}"),
+            }),
             _ => None,
         }
     }
@@ -183,6 +216,10 @@ pub(crate) async fn await_pod_verdict<T: Clone>(
     let stream = watcher(api.clone(), config);
     tokio::pin!(stream);
     let mut last_transient: Option<String> = None;
+    // R09 退避状态：暂态错误后先等再消费下一事件（事件在退避窗内到达则
+    // 立即消费——退避约束的是错误后的重新轮询节奏，不丢已到事件）。
+    let mut pending_backoff: Option<std::time::Duration> = None;
+    let mut next_backoff = BACKOFF_INITIAL;
     loop {
         // 预算先行（KR03：嵌套等待共享同一 deadline，不重置）
         let remaining = deadline
@@ -190,12 +227,26 @@ pub(crate) async fn await_pod_verdict<T: Clone>(
             .ok_or_else(|| ObservationError::Deadline {
                 last_transient: last_transient.clone(),
             })?;
-        let event = tokio::select! {
-            () = cancel.cancelled() => return Err(ObservationError::Cancelled),
-            _ = tokio::time::sleep(remaining) => {
-                return Err(ObservationError::Deadline { last_transient });
+        let event = if let Some(backoff) = pending_backoff.take() {
+            let wait = std::cmp::min(backoff, remaining);
+            tokio::select! {
+                () = cancel.cancelled() => return Err(ObservationError::Cancelled),
+                // 退避窗耗尽且无新事件 → 直接进入下一轮预算检查（不消费）
+                _ = tokio::time::sleep(wait) => None,
+                event = stream.next() => Some(event),
             }
-            event = stream.next() => event,
+        } else {
+            tokio::select! {
+                () = cancel.cancelled() => return Err(ObservationError::Cancelled),
+                _ = tokio::time::sleep(remaining) => {
+                    return Err(ObservationError::Deadline { last_transient });
+                }
+                event = stream.next() => Some(event),
+            }
+        };
+        let event = match event {
+            Some(event) => event,
+            None => continue,
         };
         let Some(event) = event else {
             // watcher 流意外终止（非正常 EOF——正常 EOF 由 watcher 内部续接）
@@ -220,9 +271,15 @@ pub(crate) async fn await_pod_verdict<T: Clone>(
                 if let Some(fatal) = ObservationError::from_watcher(&error) {
                     return Err(fatal);
                 }
-                // 暂态（传输断连/429/服务端 5xx）：watcher 自带退避重连，记录
-                // 最后原因供超时诊断（KR05：原预算内恢复，不重置 deadline）。
+                // R09 暂态（传输断连/429/服务端 5xx）：指数退避后再消费
+                //（kube-runtime 4.2 watcher 恢复是立即的——不包退避会热循环）；
+                // 记录最后原因供超时诊断（KR05：原预算内恢复，不重置 deadline）。
                 last_transient = Some(error.to_string());
+                pending_backoff = Some(next_backoff);
+                next_backoff = std::cmp::min(
+                    std::time::Duration::from_secs_f64(next_backoff.as_secs_f64() * 2.0),
+                    BACKOFF_MAX,
+                );
             }
         }
     }

@@ -327,12 +327,8 @@ mod deployment_response_tests {
         for action in ["start", "restart"] {
             for (content_type, body) in [
                 ("application/json", "{"),
-                ("application/json", "{}"),
-                (
-                    "application/json",
-                    r#"{"user_id":"owner","deploy_mode":"invalid"}"#,
-                ),
-                ("text/plain", r#"{"user_id":"owner"}"#),
+                ("application/json", r#"{"deploy_mode":"invalid"}"#),
+                ("text/plain", r#"{}"#),
             ] {
                 let response = client
                     .post(format!(

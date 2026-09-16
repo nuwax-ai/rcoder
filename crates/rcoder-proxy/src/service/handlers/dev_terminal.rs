@@ -52,7 +52,6 @@ pub(crate) async fn find_dev_container(
     container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
     dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
     app_id: &str,
-    user_id: &str,
     probe_port: u16,
 ) -> Result<String, Box<pingora_core::Error>> {
     if let Err(e) = shared_types::validate_identifier(app_id, "app_id") {
@@ -61,15 +60,8 @@ pub(crate) async fn find_dev_container(
             pingora_core::ErrorType::HTTPStatus(400),
         ));
     }
-    if let Err(e) = shared_types::validate_identifier(user_id, "user_id") {
-        warn!("[DEV_TERMINAL] invalid user_id: {}", e);
-        return Err(pingora_core::Error::new(
-            pingora_core::ErrorType::HTTPStatus(400),
-        ));
-    }
-    // 定位键 = 复合 identifier `{user_id}-{app_id}`（协作模型多实例——同 app
-    // 每用户独立容器）。组装失败（app_id 含 '-' 等结构冲突）跳过注册表快路，
-    // 由 ensure 链给出明确错误。
+    // 应用共享（R07）：定位键 = 纯 app_id。URL 的用户占位段不提取、不校验、
+    // 不参与定位（UserApp 去绑定 spec §2.3——同 app 任意非空占位段到同实例）。
     let instance = Some(app_id.to_string());
     if let Some(ip) = instance
         .as_deref()
@@ -131,12 +123,20 @@ fn not_found_error(app_id: &str) -> Box<pingora_core::Error> {
 
 /// 提取并校验 app_id 路径参数。
 /// 路由参数 user_id 提取（工具族新形态 `{user_id}/{app_id}` 双段）。
-pub(crate) fn require_user_id(params: &Params<'_, '_>) -> Result<String, Box<pingora_core::Error>> {
-    let user_id = params.get("user_id").ok_or_else(|| {
-        error!("[DEV_TERMINAL] route missing user_id param");
-        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
-    })?;
-    Ok(user_id.to_owned())
+/// 用户占位段存在性检查（R07）：路由 pattern 携带该段（非空即可匹配），
+/// **不校验值**（identifier 白名单对占位值不适用——`legacy.user` 等任意
+/// 非空合法 URL 段必须到同实例；缺段仍 400——路由本身需要该段存在）。
+pub(crate) fn accept_placeholder_user_id(
+    params: &Params<'_, '_>,
+) -> Result<(), Box<pingora_core::Error>> {
+    params
+        .get("user_id")
+        .is_none()
+        .then(|| {
+            error!("[DEV_TERMINAL] route missing user_id placeholder segment");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        })
+        .map_or(Ok(()), Err)
 }
 
 pub(crate) fn require_app_id(params: &Params<'_, '_>) -> Result<String, Box<pingora_core::Error>> {
@@ -190,12 +190,11 @@ pub async fn handle_dev_ttyd_upstream(
     deps: &DevProxyDeps<'_>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
-    let user_id = require_user_id(&params)?;
+    accept_placeholder_user_id(&params)?;
     let container_ip = find_dev_container(
         deps.container_lookup,
         deps.dev_ensure,
         &app_id,
-        &user_id,
         shared_types::WS_TERMINAL_PORT,
     )
     .await?;
@@ -254,12 +253,11 @@ pub async fn handle_dev_vnc_upstream(
     deps: &DevProxyDeps<'_>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
-    let user_id = require_user_id(&params)?;
+    accept_placeholder_user_id(&params)?;
     let container_ip = find_dev_container(
         deps.container_lookup,
         deps.dev_ensure,
         &app_id,
-        &user_id,
         shared_types::NOVNC_PORT,
     )
     .await?;
@@ -312,11 +310,11 @@ pub async fn handle_dev_audio_request(
         format!("/{remaining}")
     };
 
-    let user_id = require_user_id(&params)?;
+    accept_placeholder_user_id(&params)?;
     // audio 传 0 跳过命中探测：builder 容器无音频服务（svc 亦不声明
     // 6089/6090），探测恒超时只增每请求延迟
     let container_ip =
-        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, &user_id, 0).await?;
+        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, 0).await?;
     deps.metrics.record_request();
     deps.metrics.record_request_port(target_port);
     ctx.target_port = Some(target_port);
@@ -370,14 +368,13 @@ pub async fn handle_dev_ime_request(
     deps: &DevProxyDeps<'_>,
 ) -> PingoraResult<()> {
     let app_id = require_app_id(&params)?;
-    let user_id = require_user_id(&params)?;
+    accept_placeholder_user_id(&params)?;
     let target_path = target_path_of(&params);
 
     let container_ip = find_dev_container(
         deps.container_lookup,
         deps.dev_ensure,
         &app_id,
-        &user_id,
         shared_types::IME_PORT,
     )
     .await?;

@@ -38,6 +38,7 @@ pub(crate) async fn zip_workspace(
         &body.user_id,
         &body.c_id,
         ServiceScope {
+            workspace_type: body.workspace_type.as_deref(),
             service_type: body.service_type.as_deref(),
             app_id: body.app_id.as_deref(),
             workspace_path: body.workspace_path.as_deref(),
@@ -73,6 +74,7 @@ pub(crate) async fn download_all_files(
         &q.c_id,
         q.custom_target_dir.as_deref(),
         ServiceScope {
+            workspace_type: q.workspace_type.as_deref(),
             service_type: q.service_type.as_deref(),
             app_id: q.app_id.as_deref(),
             workspace_path: q.workspace_path.as_deref(),

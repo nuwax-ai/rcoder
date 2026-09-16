@@ -120,6 +120,9 @@ pub struct ImportProjectForm {
     pub workspace_path: Option<String>,
     /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
     pub app_id: Option<String>,
     /// 项目 zip（multipart 二进制字段）
@@ -143,6 +146,9 @@ pub struct UploadFileForm {
     pub workspace_path: Option<String>,
     /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
     pub app_id: Option<String>,
     /// 上传文件（multipart 二进制字段）
@@ -164,6 +170,9 @@ pub struct UploadFilesForm {
     pub workspace_path: Option<String>,
     /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
     pub app_id: Option<String>,
     /// 每个文件的目标相对路径（与 files 一一对应，重复字段）
@@ -187,6 +196,9 @@ pub struct CreateWorkspaceForm {
     pub workspace_path: Option<String>,
     /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
     pub app_id: Option<String>,
 }
@@ -224,6 +236,9 @@ pub struct CreateWorkspaceV2Form {
     pub workspace_path: Option<String>,
     /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
     pub app_id: Option<String>,
 }
@@ -245,6 +260,9 @@ pub struct InitProjectTemplateForm {
     pub workspace_path: Option<String>,
     /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
     pub app_id: Option<String>,
 }
@@ -268,6 +286,9 @@ pub struct PushSkillsForm {
     pub workspace_path: Option<String>,
     /// serviceContext 通道：服务场景类型（header `x-service-type` 优先——收口层合并）
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId）
     pub app_id: Option<String>,
 }

@@ -296,7 +296,7 @@
   "userapp_dev_chat_full_turn_anthropic": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
     "id 单调无重复",
-    "project_id 回显 = app_id",
+    "project_id 回显 = 纯 app_id",
     "session_id 非空",
     "含 end_turn（完整轮）",
     "含 prompt_start",
@@ -306,7 +306,7 @@
   "userapp_dev_chat_full_turn_openai": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
     "id 单调无重复",
-    "project_id 回显 = app_id",
+    "project_id 回显 = 纯 app_id",
     "session_id 非空",
     "含 end_turn（完整轮）",
     "含 prompt_start",
@@ -316,14 +316,14 @@
   "userapp_dev_chat_workdir_agent_work_dir_anthropic": [
     "agent 产物落 workspace（agent_work_dir=会话ID 不再劫持定位）",
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
-    "project_id 回显 = app_id",
+    "project_id 回显 = 纯 app_id",
     "session_id 非空",
     "含 end_turn（完整轮）"
   ],
   "userapp_dev_chat_workdir_agent_work_dir_openai": [
     "agent 产物落 workspace（agent_work_dir=会话ID 不再劫持定位）",
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
-    "project_id 回显 = app_id",
+    "project_id 回显 = 纯 app_id",
     "session_id 非空",
     "含 end_turn（完整轮）"
   ],

@@ -34,9 +34,14 @@ pub struct UserCidQuery {
     /// taskAgent，大小写不敏感；header `x-workspace-type` 优先（回退
     /// `x-service-type`）——收口层合并，对齐 TS 88a1827；wire 双名兼容：
     /// `workspaceType`（新）/`serviceType`（旧））
-    #[serde(default, alias = "workspaceType", alias = "serviceType")]
+    #[serde(default)]
     #[garde(skip)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并——header
+    /// `x-workspace-type` 优先，收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -72,9 +77,14 @@ pub struct FileListQuery {
     /// taskAgent，大小写不敏感；header `x-workspace-type` 优先（回退
     /// `x-service-type`）——收口层合并，对齐 TS 88a1827；wire 双名兼容：
     /// `workspaceType`（新）/`serviceType`（旧））
-    #[serde(default, alias = "workspaceType", alias = "serviceType")]
+    #[serde(default)]
     #[garde(skip)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并——header
+    /// `x-workspace-type` 优先，收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -118,9 +128,14 @@ pub struct ResolveFileQuery {
     /// taskAgent，大小写不敏感；header `x-workspace-type` 优先（回退
     /// `x-service-type`）——收口层合并，对齐 TS 88a1827；wire 双名兼容：
     /// `workspaceType`（新）/`serviceType`（旧））
-    #[serde(default, alias = "workspaceType", alias = "serviceType")]
+    #[serde(default)]
     #[garde(skip)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并——header
+    /// `x-workspace-type` 优先，收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -160,9 +175,14 @@ pub struct SearchFilesQuery {
     /// taskAgent，大小写不敏感；header `x-workspace-type` 优先（回退
     /// `x-service-type`）——收口层合并，对齐 TS 88a1827；wire 双名兼容：
     /// `workspaceType`（新）/`serviceType`（旧））
-    #[serde(default, alias = "workspaceType", alias = "serviceType")]
+    #[serde(default)]
     #[garde(skip)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并——header
+    /// `x-workspace-type` 优先，收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -204,6 +224,9 @@ pub struct InstallBody {
     /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
     #[serde(default)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -232,6 +255,9 @@ pub struct BuildAgentBody {
     /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
     #[serde(default)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -257,6 +283,9 @@ pub struct CleanupBuildArtifactsBody {
     /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
     #[serde(default)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -286,9 +315,14 @@ pub struct ExecCommandBody {
     /// taskAgent，大小写不敏感；header `x-workspace-type` 优先（回退
     /// `x-service-type`）——收口层合并，对齐 TS 88a1827；wire 双名兼容：
     /// `workspaceType`（新）/`serviceType`（旧））
-    #[serde(default, alias = "workspaceType", alias = "serviceType")]
+    #[serde(default)]
     #[garde(skip)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并——header
+    /// `x-workspace-type` 优先，收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -317,9 +351,14 @@ pub struct GetLogsQuery {
     /// taskAgent，大小写不敏感；header `x-workspace-type` 优先（回退
     /// `x-service-type`）——收口层合并，对齐 TS 88a1827；wire 双名兼容：
     /// `workspaceType`（新）/`serviceType`（旧））
-    #[serde(default, alias = "workspaceType", alias = "serviceType")]
+    #[serde(default)]
     #[garde(skip)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并——header
+    /// `x-workspace-type` 优先，收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -352,6 +391,9 @@ pub struct ZipBody {
     /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
     #[serde(default)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -374,6 +416,9 @@ pub struct DeleteWorkspaceBody {
     /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
     #[serde(default)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -401,6 +446,9 @@ pub struct FilesUpdateBody {
     /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
     #[serde(default)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -436,9 +484,14 @@ pub struct GenerateFileBody {
     /// taskAgent，大小写不敏感；header `x-workspace-type` 优先（回退
     /// `x-service-type`）——收口层合并，对齐 TS 88a1827；wire 双名兼容：
     /// `workspaceType`（新）/`serviceType`（旧））
-    #[serde(default, alias = "workspaceType", alias = "serviceType")]
+    #[serde(default)]
     #[garde(skip)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并——header
+    /// `x-workspace-type` 优先，收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]
@@ -460,6 +513,9 @@ pub struct CustomTargetQuery {
     /// 大小写不敏感；header `x-service-type` 优先——收口层合并，对齐 TS 1.4.5）
     #[serde(default)]
     pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并）
+    #[serde(default)]
+    pub workspace_type: Option<String>,
     /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
     /// header `x-app-id` 优先——收口层合并）
     #[serde(default)]

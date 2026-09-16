@@ -23,7 +23,8 @@ use pingora_http::RequestHeader;
 use tracing::debug;
 
 use crate::service::handlers::dev_terminal::{
-    find_dev_container, find_runtime_addr, require_app_id, require_user_id, runtime_target_path_of,
+    accept_placeholder_user_id, find_dev_container, find_runtime_addr, require_app_id,
+    runtime_target_path_of,
 };
 use crate::service::types::{ProxyMetrics, TrackingCtx};
 use crate::service::utils;
@@ -80,12 +81,11 @@ pub async fn handle_dev_dbx_upstream(
     deps: &super::dev_terminal::DevProxyDeps<'_>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
-    let user_id = require_user_id(&params)?;
+    accept_placeholder_user_id(&params)?;
     let container_addr = find_dev_container(
         deps.container_lookup,
         deps.dev_ensure,
         &app_id,
-        &user_id,
         shared_types::DBX_PORT,
     )
     .await?;
@@ -94,9 +94,8 @@ pub async fn handle_dev_dbx_upstream(
     deps.metrics.inc_active();
     ctx.vnc_target_ip = Some(container_addr.clone());
     debug!(
-        "[DEV_DBX] app_id={}, user_id={} -> {}:{}",
+        "[DEV_DBX] app_id={} -> {}:{}",
         app_id,
-        user_id,
         container_addr,
         shared_types::DBX_PORT
     );
@@ -122,16 +121,15 @@ pub async fn handle_prod_dbx_upstream(
     ip_slot: &arc_swap::ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
-    let user_id = require_user_id(&params)?;
+    accept_placeholder_user_id(&params)?;
     let container_addr = find_runtime_addr(ip_slot, container_lookup, &app_id).await?;
 
     metrics.record_request();
     metrics.inc_active();
     ctx.vnc_target_ip = Some(container_addr.clone());
     debug!(
-        "[PROD_DBX] app_id={}, user_id={} -> {}:{}",
+        "[PROD_DBX] app_id={} -> {}:{}",
         app_id,
-        user_id,
         container_addr,
         shared_types::DBX_PORT
     );

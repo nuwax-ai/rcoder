@@ -35,6 +35,7 @@ pub(crate) async fn execute_command(
         &body.user_id,
         &body.c_id,
         ServiceScope {
+            workspace_type: body.workspace_type.as_deref(),
             service_type: body.service_type.as_deref(),
             app_id: body.app_id.as_deref(),
             workspace_path: body.workspace_path.as_deref(),
@@ -69,6 +70,7 @@ pub(crate) async fn get_logs(
         &q.c_id,
         None,
         ServiceScope {
+            workspace_type: q.workspace_type.as_deref(),
             service_type: q.service_type.as_deref(),
             app_id: q.app_id.as_deref(),
             workspace_path: q.workspace_path.as_deref(),

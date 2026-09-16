@@ -585,12 +585,13 @@ mod lifecycle_receipt_tests {
         let body: serde_json::Value =
             serde_json::from_str(&purge_body("receipt-app", Some(&receipt)).expect("body"))
                 .expect("json");
-        assert_eq!(body["user_id"], "receipt-owner");
+        // 共享模型：user_id 不再是 purge body 字段（归属档退役）
+        assert!(body.get("user_id").is_none());
         assert_eq!(body["lifecycle_id"], "original-life");
         assert_eq!(body["request_id"], "cleanup-case-one-receipt-app");
         assert!(purge_body("different-app", Some(&receipt)).is_err());
         assert!(purge_body("receipt-app", None).is_err());
-        for field in ["user_id", "lifecycle_id", "case_id"] {
+        for field in ["lifecycle_id", "case_id"] {
             let mut incomplete = receipt.clone();
             incomplete.as_object_mut().expect("object").remove(field);
             assert!(purge_body("receipt-app", Some(&incomplete)).is_err());

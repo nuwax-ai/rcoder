@@ -38,6 +38,7 @@ pub(crate) async fn generate_file(
         &body.c_id,
         body.custom_target_dir.as_deref(),
         ServiceScope {
+            workspace_type: body.workspace_type.as_deref(),
             service_type: body.service_type.as_deref(),
             app_id: body.app_id.as_deref(),
             workspace_path: body.workspace_path.as_deref(),
@@ -92,6 +93,7 @@ mod tests {
             custom_target_dir: None,
             workspace_path: None,
             service_type: None,
+            workspace_type: None,
             app_id: None,
         };
         let res = generate_file(State(state), Json(body))
@@ -120,6 +122,7 @@ mod tests {
             custom_target_dir: Some(custom.to_string_lossy().into_owned()),
             workspace_path: None,
             service_type: None,
+            workspace_type: None,
             app_id: None,
         };
         generate_file(State(state), Json(body))
@@ -143,6 +146,7 @@ mod tests {
             custom_target_dir: None,
             workspace_path: None,
             service_type: None,
+            workspace_type: None,
             app_id: None,
         };
         let err = generate_file(State(state), Json(body))
@@ -171,6 +175,7 @@ mod tests {
             custom_target_dir: None,
             workspace_path: None,
             service_type: None,
+            workspace_type: None,
             app_id: None,
         };
         let err = generate_file(State(state), Json(body))
@@ -198,6 +203,7 @@ mod tests {
             custom_target_dir: None,
             workspace_path: None,
             service_type: None,
+            workspace_type: None,
             app_id: None,
         };
         let res = generate_file(State(state), Json(body))
@@ -229,6 +235,7 @@ mod tests {
             custom_target_dir: None,
             workspace_path: Some(bound.to_string_lossy().into_owned()),
             service_type: None,
+            workspace_type: None,
             app_id: None,
         };
         generate_file(State(state), Json(body))

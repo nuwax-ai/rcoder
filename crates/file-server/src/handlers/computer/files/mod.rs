@@ -34,6 +34,7 @@ pub(crate) async fn delete_workspace(
         &body.user_id,
         &body.c_id,
         ServiceScope {
+            workspace_type: body.workspace_type.as_deref(),
             service_type: body.service_type.as_deref(),
             app_id: body.app_id.as_deref(),
             workspace_path: body.workspace_path.as_deref(),
@@ -65,6 +66,7 @@ pub(crate) async fn files_update(
         &body.c_id,
         body.custom_target_dir.as_deref(),
         ServiceScope {
+            workspace_type: body.workspace_type.as_deref(),
             service_type: body.service_type.as_deref(),
             app_id: body.app_id.as_deref(),
             workspace_path: body.workspace_path.as_deref(),

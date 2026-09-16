@@ -64,6 +64,7 @@ pub(crate) async fn init_project_template(
     let mut cid = None;
     let mut workspace_path = None; // 用户维度工作目录 (对齐 TS 1.4.5, 可选 multipart 字段)
     let mut service_type = None; // serviceContext 通道 (对齐 TS 1.4.5)
+    let mut workspace_type = None;
     let mut app_id = None;
     let mut data = None;
     let mut enable_git = false;
@@ -76,7 +77,8 @@ pub(crate) async fn init_project_template(
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
             "workspacePath" => workspace_path = Some(text_field(field).await?),
-            "serviceType" | "workspaceType" => service_type = Some(text_field(field).await?),
+            "workspaceType" => workspace_type = Some(text_field(field).await?),
+            "serviceType" => service_type = Some(text_field(field).await?),
             "appId" => app_id = Some(text_field(field).await?),
             "file" => {
                 data = Some(
@@ -104,6 +106,7 @@ pub(crate) async fn init_project_template(
         &v.user_id,
         &v.cid,
         ServiceScope {
+            workspace_type: workspace_type.as_deref(),
             service_type: service_type.as_deref(),
             app_id: app_id.as_deref(),
             workspace_path: workspace_path.as_deref(),

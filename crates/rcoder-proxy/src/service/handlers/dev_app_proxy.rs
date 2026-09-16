@@ -93,7 +93,6 @@ pub async fn handle_dev_app_upstream(
         deps.container_lookup,
         deps.dev_ensure,
         app_id,
-        user_id,
         shared_types::APP_ENTRY_PORT,
     )
     .await?;

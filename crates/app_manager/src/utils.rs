@@ -122,7 +122,10 @@ pub(super) fn validate_app_id(app_id: &str) -> AppResult<()> {
         .chars()
         .next()
         .is_some_and(|c| c.is_ascii_alphanumeric())
-        && app_id.chars().last().is_some_and(|c| c.is_ascii_alphanumeric());
+        && app_id
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
     if !valid_charset || !valid_edges {
         return Err(AppOperationError::Validation(format!(
             "invalid app_id: must be lowercase alphanumeric with inner hyphens (DNS-1123 label), got '{app_id}'"

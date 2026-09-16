@@ -33,6 +33,7 @@ pub(crate) async fn install_project(
         &body.user_id,
         &body.c_id,
         ServiceScope {
+            workspace_type: body.workspace_type.as_deref(),
             service_type: body.service_type.as_deref(),
             app_id: body.app_id.as_deref(),
             workspace_path: body.workspace_path.as_deref(),
@@ -60,6 +61,7 @@ pub(crate) async fn build_agent_package(
         &body.user_id,
         &body.c_id,
         ServiceScope {
+            workspace_type: body.workspace_type.as_deref(),
             service_type: body.service_type.as_deref(),
             app_id: body.app_id.as_deref(),
             workspace_path: body.workspace_path.as_deref(),
@@ -126,6 +128,7 @@ pub(crate) async fn cleanup_build_artifacts(
         &body.c_id,
         body.custom_target_dir.as_deref(),
         ServiceScope {
+            workspace_type: body.workspace_type.as_deref(),
             service_type: body.service_type.as_deref(),
             app_id: body.app_id.as_deref(),
             workspace_path: body.workspace_path.as_deref(),

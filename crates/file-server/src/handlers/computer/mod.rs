@@ -34,7 +34,9 @@ pub mod workspace;
 /// `resolveServiceContext` 的 merged 取值序）。
 #[derive(Default)]
 pub(crate) struct ServiceScope<'a> {
-    /// body/query 的 `serviceType` 字段（归一化在收口内做）
+    /// body/query 的 `workspaceType` 字段（R06：定位显式通道，优先于 serviceType）
+    pub workspace_type: Option<&'a str>,
+    /// body/query 的旧 `serviceType` 字段（R06：回退通道，归一化在收口内做）
     pub service_type: Option<&'a str>,
     /// body/query 的 `appId` 字段
     pub app_id: Option<&'a str>,
@@ -63,7 +65,7 @@ pub(crate) async fn computer_root_for_request(
         state,
         user_id,
         cid,
-        crate::extract::merged_service_kind(scope.service_type),
+        crate::extract::merged_workspace_kind(scope.workspace_type, scope.service_type),
         crate::extract::merged_request_app_id(scope.app_id).as_deref(),
         scope.workspace_path,
     )
@@ -461,7 +463,7 @@ mod tests {
         F: Future<Output = T>,
     {
         let app_id = app_id.map(str::to_string);
-        crate::extract::SERVICE_KIND
+        crate::extract::WORKSPACE_KIND
             .scope(Some(kind), async move {
                 crate::extract::USERAPP_APP_ID.scope(app_id, f).await
             })
@@ -576,6 +578,7 @@ mod tests {
             "c1",
             ServiceScope {
                 service_type: Some("normalProject"),
+                workspace_type: None,
                 app_id: Some("proj-7"),
                 workspace_path: None,
             },
@@ -601,6 +604,7 @@ mod tests {
             "c1",
             ServiceScope {
                 service_type: Some("userapp"),
+                workspace_type: None,
                 app_id: Some("app-9"),
                 workspace_path: None,
             },
@@ -622,6 +626,7 @@ mod tests {
                 "c1",
                 ServiceScope {
                     service_type: Some("normalProject"),
+                    workspace_type: None,
                     app_id: Some("proj-7"),
                     workspace_path: None,
                 },
