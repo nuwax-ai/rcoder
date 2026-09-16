@@ -334,6 +334,12 @@ pub(crate) async fn await_builder_verdict<T: Clone>(
     let mut last_transient: Option<String> = None;
     let mut pending_backoff: Option<std::time::Duration> = None;
     let mut next_backoff = BACKOFF_INITIAL;
+    // K01：跟踪 pod 流的 Init 周期——初始 LIST（或 410 后重列举）快照为空时
+    // watcher 只发 Init+InitDone（没有任何 InitApply/Delete），PodAbsent 完成
+    // 候选永远不会产生，已成功停止会被误判到超时。快照结束仍无 pod → 投递
+    // PodAbsent（与 Delete 同一候选路径，授权仍由调用方的最后 GET 复核链完成）。
+    let mut pod_in_init = false;
+    let mut pod_init_seen_apply = false;
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -355,7 +361,27 @@ pub(crate) async fn await_builder_verdict<T: Clone>(
                 return Err(ObservationError::Deadline { last_transient });
             }
             event = sts_stream.next() => event.map(|inner| inner.map(wrap_sts)),
-            event = pod_stream.next() => event.map(|inner| inner.map(wrap_pod)),
+            event = pod_stream.next() => event.map(|inner| inner.map(|raw| match raw {
+                watcher::Event::Init => {
+                    pod_in_init = true;
+                    pod_init_seen_apply = false;
+                    None
+                }
+                watcher::Event::InitApply(_) => {
+                    pod_init_seen_apply = true;
+                    wrap_pod(raw)
+                }
+                watcher::Event::InitDone => {
+                    let empty_snapshot = pod_in_init && !pod_init_seen_apply;
+                    pod_in_init = false;
+                    if empty_snapshot {
+                        Some(BuilderWatchEventOwned::PodAbsent)
+                    } else {
+                        None
+                    }
+                }
+                other => wrap_pod(other),
+            })),
         };
         let Some(event) = event else {
             return Err(ObservationError::StreamEnded {

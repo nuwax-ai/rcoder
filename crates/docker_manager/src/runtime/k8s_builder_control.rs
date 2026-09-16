@@ -363,11 +363,20 @@ impl KubernetesRuntime {
                             ));
                         }
                     }
-                    // 复核②：STS 身份未替换且 replicas 保持 0。
-                    let current = sts_api
-                        .get(&workload.name)
-                        .await
-                        .map_err(|error| api_error("Verify stopped builder workload", error))?;
+                    // 复核②：STS 身份未替换且 replicas 保持 0。STS 整体消失
+                    // （被带外删除）显式归类为冲突（K01）——捕获身份已不存在，
+                    // 不当作成功也不混入通用后端错误。
+                    let current = match sts_api.get(&workload.name).await {
+                        Ok(current) => current,
+                        Err(kube::Error::Api(error)) if error.code == 404 => {
+                            return Err(Error::Conflict(
+                                "Builder workload vanished while stopping".into(),
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(api_error("Verify stopped builder workload", error));
+                        }
+                    };
                     verify_workload_stable(
                         &current,
                         &target.context,
@@ -375,7 +384,11 @@ impl KubernetesRuntime {
                         workload,
                         Some(0),
                     )
-                    .map_err(rejected_before_write)?;
+                    // K02：写后复核失败不得归类为写前拒绝——patch 已落盘，
+                    // RequestRejected 会让上层释放 mutating 并记 Failed，
+                    // 丢失未知结果保护。复核冲突 = 不确定 → Conflict（上层
+                    // 保留保护，操作转 RecoveryRequired）
+                    .map_err(|reason| Error::Conflict(reason))?;
                     return Ok(None);
                 }
                 BuilderObservation::Ready(boxed) => {
@@ -404,7 +417,9 @@ impl KubernetesRuntime {
                         workload,
                         only_start.then_some(1),
                     )
-                    .map_err(rejected_before_write)?;
+                    // K02：同上——写后（wake/restart 的 scale 写入已发生）复核
+                    // 冲突保持未知结果保护，不当作写前拒绝
+                    .map_err(|reason| Error::Conflict(reason))?;
                     return Ok(Some(info));
                 }
             }

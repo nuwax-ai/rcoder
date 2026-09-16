@@ -439,3 +439,321 @@ pub(super) async fn resume_pending(
     execute_pending(state, current, &instance, restart).await?;
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    //! K02 回归：写后复核冲突不得当作写前拒绝——上层 control worker 必须保留
+    //! mutating 保护、操作转 RecoveryRequired、租约不释放、后续写被围栏拒绝。
+    //! 对照组：真正的事前拒绝（RequestRejected）记 Failed 并释放租约。
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::grpc::{GrpcChannelPool, SessionStreamRegistry};
+    use crate::router::AppState;
+    use crate::storage::{ProjectAdapter, ProjectStoreBackend};
+    use agent_provisioning::AgentDownloadManager;
+    use app_manager::AppActivityRegistry;
+    use app_manager::config::{AppAccessMode, AppManagerConfig};
+    use arc_swap::ArcSwap;
+    use async_trait::async_trait;
+    use container_runtime_api::{
+        AgentContainerRuntime, ContainerCreateParams, ContainerRuntimeError,
+        ContainerRuntimeResult, RuntimeContainerInfo,
+        UserAppDeploymentRuntime, WorkspaceRuntime,
+    };
+    use dashmap::DashMap;
+    use shared_types::{ApiKeyAuthConfig, ContainerBasicInfo};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::broadcast;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum ApplyOutcome {
+        PostWriteConflict,
+        PreWriteRejected,
+    }
+
+    struct FakeLease(Arc<Mutex<LeaseState>>);
+    struct LeaseState {
+        releases: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl shared_types::AppOperationLease for FakeLease {
+        fn receipt(&self) -> Option<shared_types::UserAppOperationLeaseReceipt> {
+            Some(shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+                service_type: shared_types::ServiceType::UserappBuilder,
+                namespace: "test-ns".into(),
+                name: "rcoder-operation-builder-testapp".into(),
+                uid: "lease-uid".into(),
+                resource_version: "1".into(),
+                token: "op-token".into(),
+            })
+        }
+        async fn release(self: Box<Self>) -> Result<(), String> {
+            self.0.lock().expect("lease state").releases += 1;
+            Ok(())
+        }
+    }
+
+    struct ControlRuntime {
+        outcome: ApplyOutcome,
+        lease_state: Arc<Mutex<LeaseState>>,
+    }
+
+    #[async_trait]
+    impl AgentContainerRuntime for ControlRuntime {
+        async fn create_container(
+            &self,
+            _params: ContainerCreateParams,
+        ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+            Err(ContainerRuntimeError::ContainerNotFound("probe".into()))
+        }
+        async fn get_container_info(
+            &self,
+            _project_id: &str,
+        ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+            Ok(None)
+        }
+        async fn find_container(
+            &self,
+            _identifier: &str,
+            _service_type: &shared_types::ServiceType,
+        ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+            Ok(None)
+        }
+        async fn stop_container(&self, _project_id: &str) -> ContainerRuntimeResult<()> {
+            Ok(())
+        }
+        async fn is_container_running(&self, _project_id: &str) -> ContainerRuntimeResult<bool> {
+            Ok(false)
+        }
+        async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
+            Ok(vec![])
+        }
+        async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> ContainerRuntimeResult<()> {
+            Ok(())
+        }
+        async fn acquire_builder_operation(
+            &self,
+            _app_id: &str,
+        ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+            Ok(Box::new(FakeLease(self.lease_state.clone())))
+        }
+        async fn inspect_builder_candidate(
+            &self,
+            context: &UserAppExecutionContext,
+        ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+            Ok(shared_types::BuilderControlTarget {
+                resource_binding: None,
+                context: context.clone(),
+                workload: Some(shared_types::AppResourceIdentity {
+                    kind: shared_types::AppResourceKind::StatefulSet,
+                    name: "rcoder-app-builder-testapp".into(),
+                    uid: "sts-uid".into(),
+                    resource_version: Some("9".into()),
+                }),
+                pod: None,
+            })
+        }
+        async fn capture_bound_builder_control(
+            &self,
+            context: &UserAppExecutionContext,
+            _binding: Option<&shared_types::UserAppResourceBinding>,
+        ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+            Ok(shared_types::BuilderControlTarget {
+                resource_binding: None,
+                context: context.clone(),
+                workload: Some(shared_types::AppResourceIdentity {
+                    kind: shared_types::AppResourceKind::StatefulSet,
+                    name: "rcoder-app-builder-testapp".into(),
+                    uid: "sts-uid".into(),
+                    resource_version: Some("9".into()),
+                }),
+                pod: None,
+            })
+        }
+        async fn apply_builder_control(
+            &self,
+            _target: &shared_types::BuilderControlTarget,
+            _restart: bool,
+        ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+            match self.outcome {
+                // 写已发生（patch 落盘），最终复核发现身份被替换 → K02 修复后
+                // 的错误类别（docker_manager 写后复核不再映射 RequestRejected）
+                ApplyOutcome::PostWriteConflict => Err(ContainerRuntimeError::Conflict(
+                    "builder workload identity changed after write".into(),
+                )),
+                // 真正的事前拒绝（捕获/前置校验阶段）
+                ApplyOutcome::PreWriteRejected => Err(ContainerRuntimeError::RequestRejected(
+                    shared_types::RuntimeRequestRejection {
+                        status: 409,
+                        message: "captured identity stale before write".into(),
+                    },
+                )),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceRuntime for ControlRuntime {}
+    #[async_trait]
+    impl UserAppDeploymentRuntime for ControlRuntime {
+        async fn list_deployments(
+            &self,
+        ) -> ContainerRuntimeResult<Vec<container_runtime_api::DeploymentStatus>> {
+            Ok(vec![])
+        }
+    }
+
+    async fn test_state(
+        outcome: ApplyOutcome,
+    ) -> (Arc<AppState>, Arc<Mutex<LeaseState>>, tempfile::TempDir) {
+        let lease_state = Arc::new(Mutex::new(LeaseState { releases: 0 }));
+        let runtime: Arc<dyn container_runtime_api::ContainerRuntime> = Arc::new(ControlRuntime {
+            outcome,
+            lease_state: lease_state.clone(),
+        });
+        let (adapter, _cleanup_rx) =
+            ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
+        let activity = Arc::new(AppActivityRegistry::new(std::time::Duration::from_secs(
+            300,
+        )));
+        let manager_config = AppManagerConfig {
+            access_mode: AppAccessMode::Docker,
+            ..AppManagerConfig::default()
+        };
+        let metadata_dir = tempfile::tempdir().expect("metadata directory");
+        let metadata_store = rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
+            &metadata_dir.path().join("userapp.sqlite3"),
+        )
+        .await
+        .expect("SQLite metadata store");
+        let metadata_store = Arc::new(metadata_store);
+        shared_types::UserAppLifecycleStore::ensure_identity(metadata_store.as_ref(), "testapp")
+            .await
+            .expect("identity");
+        let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(
+            app_manager::service::AppService::new(
+                manager_config,
+                runtime.clone(),
+                activity.clone(),
+                None,
+                metadata_store.clone(),
+            )
+            .await
+            .expect("AppService"),
+        );
+        let download_dir = tempfile::tempdir().expect("download dir");
+        let agent_download_manager =
+            Arc::new(AgentDownloadManager::new(download_dir.path()).expect("downloads"));
+        let (pod_created_tx, _) = broadcast::channel(32);
+        let state = Arc::new(AppState {
+            userapp_store: metadata_store,
+            config: AppConfig::default(),
+            projects: Arc::new(ProjectStoreBackend::Memory(Arc::new(adapter))),
+            pingora_service: None,
+            grpc_pool: Arc::new(GrpcChannelPool::new()),
+            session_stream_registry: Arc::new(SessionStreamRegistry::new()),
+            api_key_config: Arc::new(ArcSwap::from_pointee(ApiKeyAuthConfig::default())),
+            pod_creating: Arc::new(DashMap::new()),
+            pod_created_tx: Arc::new(pod_created_tx),
+            container_prefix_rcoder: "dev-rcoder".to_string(),
+            container_prefix_computer: "computer-agent-runner".to_string(),
+            runtime,
+            cleanup_rx: Arc::new(Mutex::new(None)),
+            agent_download_manager,
+            app_service,
+            activity,
+            cluster_domain: "cluster.local".to_string(),
+        });
+        (state, lease_state, metadata_dir)
+    }
+
+    async fn operation_state(state: &AppState, request_id: &str) -> UserAppOperationRecord {
+        state
+            .userapp_store
+            .get_operation_by_request("testapp", request_id)
+            .await
+            .expect("operation query")
+            .expect("operation exists")
+    }
+
+    #[tokio::test]
+    async fn post_write_conflict_keeps_protection_and_recovery_required() {
+        let (state, lease_state, _dir) = test_state(ApplyOutcome::PostWriteConflict).await;
+        let _error = execute(
+            &state,
+            "testapp",
+            UserAppControlRequest {
+                lifecycle_id: None,
+                request_id: Some("k02-post-write".into()),
+            },
+            false,
+        )
+        .await
+        .expect_err("conflict surfaces");
+
+        let record = operation_state(&state, "k02-post-write").await;
+        assert_eq!(
+            record.state,
+            UserAppOperationState::RecoveryRequired,
+            "写后冲突必须保持未知结果保护"
+        );
+        assert_eq!(
+            record.step, "compute_captured",
+            "失败必须保留最后的持久证据边界"
+        );
+        assert_eq!(
+            lease_state.lock().expect("lease").releases,
+            0,
+            "租约不得释放（操作员恢复语义）"
+        );
+        // 后续写被围栏拒绝：同一应用的下一个控制操作不得受理
+        let blocked = execute(
+            &state,
+            "testapp",
+            UserAppControlRequest {
+                lifecycle_id: None,
+                request_id: Some("k02-post-write".into()),
+            },
+            false,
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "RecoveryRequired 的应用必须拒绝后续控制操作"
+        );
+        let record2 = operation_state(&state, "k02-post-write").await;
+        assert_eq!(record2.state, UserAppOperationState::RecoveryRequired);
+    }
+
+    #[tokio::test]
+    async fn pre_write_rejection_records_failed_and_releases_lease() {
+        let (state, lease_state, _dir) = test_state(ApplyOutcome::PreWriteRejected).await;
+        execute(
+            &state,
+            "testapp",
+            UserAppControlRequest {
+                lifecycle_id: None,
+                request_id: Some("k02-pre-write".into()),
+            },
+            false,
+        )
+        .await
+        .expect_err("rejection surfaces");
+        let record = operation_state(&state, "k02-pre-write").await;
+        assert_eq!(
+            record.state,
+            UserAppOperationState::Failed,
+            "事前拒绝无副作用，直接记 Failed"
+        );
+        assert_eq!(record.step, "control_failed");
+        assert_eq!(
+            lease_state.lock().expect("lease").releases,
+            1,
+            "无未完成变更的拒绝必须释放租约"
+        );
+    }
+}

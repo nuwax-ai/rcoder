@@ -67,14 +67,12 @@ fn truncate_utf8(value: &mut String, max: usize) {
     if value.len() <= max {
         return;
     }
-    let mut end = max;
+    // K03：先预留省略号字节再回退到字符边界——先找边界再减 3 会再次落进
+    // 多字节字符内部，truncate 直接 panic（事件在业务返回前构造，诊断路径
+    // 不得 panic）。
+    let mut end = max.saturating_sub('…'.len_utf8());
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
-    }
-    if end >= 3 {
-        end -= 3;
-    } else {
-        end = 0;
     }
     value.truncate(end);
     value.push('…');
@@ -182,7 +180,12 @@ fn warn_rate_limited(
     dropped: u64,
     error: &mpsc::error::TrySendError<DiagnosticEvent>,
 ) {
-    let mut last = inner.last_drop_warning.lock().expect("drop warning lock");
+    // K03：诊断限速锁中毒不 panic——拿回内部数据继续（最坏多发/少发一次
+    // 限速告警），诊断错误不得影响业务路径
+    let mut last = inner
+        .last_drop_warning
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = std::time::Instant::now();
     let due = last.is_none_or(|at| now.duration_since(at) >= DROP_WARNING_INTERVAL);
     if due {
@@ -525,5 +528,26 @@ mod tests {
         let publisher = KubernetesEventPublisher::default();
         publisher.publish(event("never sent".into()));
         // inactive 无计数器句柄：行为验证 = 进程不 panic、不发送任何请求
+    }
+
+    // ===== K03：UTF-8 截断不得 panic（先预留省略号再找边界） =====
+
+    #[test]
+    fn truncate_utf8_emoji_at_old_panic_point_is_bounded() {
+        // 修复前：boundary(1021→1020) 再减 3 → 1017 落进 4 字节字符内部，
+        // truncate(1017) panic。修复后必须安全截断且以省略号结尾。
+        for (value, max) in [
+            ("😀".repeat(257), 1021),
+            ("😀".repeat(257), NOTE_MAX_BYTES),
+            ("é".repeat(600), 1021),  // 2 字节字符
+            ("好".repeat(400), 1021), // 3 字节字符
+            ("a😀".repeat(300), 999), // 混合边界
+        ] {
+            let mut text = value.clone();
+            truncate_utf8(&mut text, max);
+            assert!(text.len() <= max, "{value:?} -> len {}", text.len());
+            assert!(text.ends_with('…'), "must end with ellipsis: {text:?}");
+            assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+        }
     }
 }

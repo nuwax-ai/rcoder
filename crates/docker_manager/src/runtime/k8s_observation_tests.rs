@@ -503,3 +503,107 @@ async fn pending_only_list_does_not_complete() {
     server.abort();
     drop(ListParams::default());
 }
+
+// ===== K01：初始 LIST 快照为空也要产生 stop 完成候选 =====
+
+/// 路径感知双流 apiserver：/pods 返回空列表、/statefulsets 返回 replicas=0
+/// 的对象；WATCH 阶段静默挂起（不发任何事件——"已成功停止"现场）。
+async fn spawn_dual_stream_server() -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut text = String::new();
+                let mut buffer = [0u8; 4096];
+                while !text.contains("\r\n\r\n") {
+                    let n = match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    text.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                }
+                let is_watch = text.contains("watch=true");
+                let body = if text.contains("/pods") {
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "PodList",
+                        "metadata": {"resourceVersion": "1"},
+                        "items": []
+                    })
+                    .to_string()
+                } else {
+                    serde_json::json!({
+                        "apiVersion": "apps/v1", "kind": "StatefulSetList",
+                        "metadata": {"resourceVersion": "1"},
+                        "items": [{
+                            "apiVersion": "apps/v1", "kind": "StatefulSet",
+                            "metadata": {"name": "sts-x", "namespace": "default",
+                                         "uid": "sts-uid", "resourceVersion": "2"},
+                            "spec": {"replicas": 0, "serviceName": "svc"},
+                            "status": {"replicas": 0}
+                        }]
+                    })
+                    .to_string()
+                };
+                if is_watch {
+                    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    stream
+                        .write_all(header.as_bytes())
+                        .await
+                        .expect("watch header");
+                    // 静默挂起：不发任何事件，连接由测试结束时关闭
+                    let mut idle = [0u8; 64];
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(30), stream.read(&mut idle)).await;
+                } else {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream
+                        .write_all(header.as_bytes())
+                        .await
+                        .expect("list header");
+                    stream.write_all(body.as_bytes()).await.expect("list body");
+                }
+            });
+        }
+    });
+    address
+}
+
+/// K01：pod 流初始快照为空（没有任何 InitApply/Delete）时，InitDone 必须产生
+/// PodAbsent 完成候选——修复前只有 Delete 事件映射 PodAbsent，"已成功停止"
+/// 的 builder 会被观察等到超时并误判 RecoveryRequired。
+#[tokio::test]
+async fn builder_stop_completes_when_initial_pod_snapshot_is_empty() {
+    let address = spawn_dual_stream_server().await;
+    let client = ScriptedApiServer::client(address).await;
+    let sts_api: kube::Api<k8s_openapi::api::apps::v1::StatefulSet> =
+        kube::Api::default_namespaced(client.clone());
+    let pods: kube::Api<k8s_openapi::api::core::v1::Pod> = kube::Api::default_namespaced(client);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let verdict = super::await_builder_verdict(
+        &sts_api,
+        "sts-x",
+        &pods,
+        "pod-x",
+        deadline,
+        tokio_util::sync::CancellationToken::new(),
+        |event| match event {
+            super::BuilderWatchEvent::PodAbsent => Ok(Verdict::Complete(())),
+            super::BuilderWatchEvent::Sts(_) | super::BuilderWatchEvent::Pod(_) => {
+                Ok(Verdict::Pending)
+            }
+        },
+    )
+    .await
+    .expect("empty snapshot must produce the stop completion candidate");
+    assert!(matches!(verdict, Verdict::Complete(())));
+}
