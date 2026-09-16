@@ -292,7 +292,8 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let target = task().await;
         let consumer = tokio::spawn(consume(target, rx));
-        tx.send(StartEvent::ProducerExited { exit: "1".into() }).unwrap();
+        tx.send(StartEvent::ProducerExited { exit: "1".into() })
+            .unwrap();
         tx.send(StartEvent::Done {
             failed: vec![("web".into(), "probe failed".into())],
         })
