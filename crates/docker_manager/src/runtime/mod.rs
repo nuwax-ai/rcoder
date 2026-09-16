@@ -46,6 +46,8 @@ mod k8s_app_status_derive;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_deployment;
 #[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_event_publisher;
+#[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_observation;
 pub(crate) mod k8s_pod;
 #[cfg(feature = "kubernetes")]

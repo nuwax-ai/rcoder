@@ -69,6 +69,9 @@ pub struct KubernetesRuntime {
     /// 失效时机:PVC destroy(destroy_workspace_pvc 等 remove)+ cleanup_all clear。
     /// 阶段2: rcoder 挂根聚合访问 agent subvolume (/app/cephfs-root/{subvolumePath}/...)。
     pub(crate) subvolume_path_cache: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    /// 受管共享 Event publisher（批次 C）：Arc 共享，clone 不重建；非阻塞
+    /// 提交，单消费者串行发布；Default = inactive（测试构造用）。
+    pub(crate) event_publisher: super::k8s_event_publisher::KubernetesEventPublisher,
 }
 
 #[cfg(feature = "kubernetes")]
@@ -143,6 +146,12 @@ impl KubernetesRuntime {
         // pod_ttl_seconds 是 Copy,move 前读取即可。
         let pod_ttl_seconds = config.container_ttl_seconds;
 
+        // 批次 C：受管 Event publisher 与 runtime 同生命周期（Arc 共享，
+        // clone 不重建）；发布失败绝不影响生命周期路径。计数器句柄为运维
+        // 观测面，metrics 接线前不持有。
+        let (event_publisher, _event_counters) =
+            super::k8s_event_publisher::KubernetesEventPublisher::start(client.clone());
+
         Ok(Self {
             client,
             namespace: namespace.clone(),
@@ -164,6 +173,7 @@ impl KubernetesRuntime {
             },
             pod_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             subvolume_path_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            event_publisher,
         })
     }
 }
@@ -321,6 +331,7 @@ impl AgentContainerRuntime for KubernetesRuntime {
                 config: self.config.clone(),
                 pod_cache: self.pod_cache.clone(),
                 subvolume_path_cache: self.subvolume_path_cache.clone(),
+                event_publisher: self.event_publisher.clone(),
             };
             return tokio::spawn(async move {
                 let result = if params.resource_binding.is_some() {
@@ -663,6 +674,7 @@ mod create_lease_tests {
             },
             pod_cache: Default::default(),
             subvolume_path_cache: Default::default(),
+            event_publisher: Default::default(),
         }
     }
 

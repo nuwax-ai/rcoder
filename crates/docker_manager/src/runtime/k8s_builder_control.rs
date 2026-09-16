@@ -127,7 +127,83 @@ impl KubernetesRuntime {
             .await
     }
 
+    /// 控制编排 + 关键阶段诊断事件（批次 C）：成功事件在真实结果确认后
+    /// 发布；失败区分明确拒绝（RequestRejected/Conflict）与不可确认
+    /// （Timeout/传输错误，对齐 RecoveryRequired 语义）。非阻塞 fire-and-
+    /// forget，发布失败绝不改变控制结果。
     async fn apply_builder_compute_mode(
+        &self,
+        target: &BuilderControlTarget,
+        restart: bool,
+        only_start: bool,
+    ) -> Result<Option<ContainerBasicInfo>> {
+        let outcome = self
+            .apply_builder_compute_mode_inner(target, restart, only_start)
+            .await;
+        self.report_control_outcome(target, restart, only_start, &outcome);
+        outcome
+    }
+
+    fn report_control_outcome(
+        &self,
+        target: &BuilderControlTarget,
+        restart: bool,
+        only_start: bool,
+        outcome: &Result<Option<ContainerBasicInfo>>,
+    ) {
+        let Some(workload) = &target.workload else {
+            return;
+        };
+        let action = match (restart, only_start) {
+            (_, true) => "WakeCompute",
+            (true, false) => "RestartCompute",
+            (false, false) => "StopCompute",
+        };
+        let (type_, reason) = match outcome {
+            Ok(None) => (
+                super::k8s_event_publisher::DiagnosticEventType::Normal,
+                "ComputeStopped",
+            ),
+            Ok(Some(_)) => (
+                super::k8s_event_publisher::DiagnosticEventType::Normal,
+                "ComputeStarted",
+            ),
+            Err(Error::RequestRejected(_) | Error::Conflict(_)) => (
+                super::k8s_event_publisher::DiagnosticEventType::Warning,
+                "ControlRejected",
+            ),
+            Err(_) => (
+                super::k8s_event_publisher::DiagnosticEventType::Warning,
+                "ControlUncertain",
+            ),
+        };
+        let detail = match outcome {
+            Ok(None) => "stopped".to_string(),
+            Ok(Some(info)) => format!("pod={}", info.container_id),
+            Err(error) => format!("{error}"),
+        };
+        let note = format!(
+            "app={} lifecycle={} operation={} {detail}",
+            target.context.app_id, target.context.lifecycle_id, target.context.operation_id
+        );
+        self.event_publisher
+            .publish(super::k8s_event_publisher::DiagnosticEvent::new(
+                type_,
+                reason,
+                action,
+                note,
+                k8s_openapi::api::core::v1::ObjectReference {
+                    api_version: Some("apps/v1".into()),
+                    kind: Some("StatefulSet".into()),
+                    name: Some(workload.name.clone()),
+                    namespace: Some(self.namespace.clone()),
+                    uid: Some(workload.uid.clone()),
+                    ..Default::default()
+                },
+            ));
+    }
+
+    async fn apply_builder_compute_mode_inner(
         &self,
         target: &BuilderControlTarget,
         restart: bool,
@@ -989,6 +1065,7 @@ mod tests {
             },
             pod_cache: Default::default(),
             subvolume_path_cache: Default::default(),
+            event_publisher: Default::default(),
         };
         let target = BuilderControlTarget {
             resource_binding: wake.then(|| shared_types::UserAppResourceBinding {

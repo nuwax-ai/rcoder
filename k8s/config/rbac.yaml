@@ -31,3 +31,7 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps", "secrets"]
     verbs: ["create", "delete", "deletecollection", "get", "list", "watch", "patch", "update"]
+  # kube-runtime Event publisher（批次 C）：诊断事件仅 create/patch，最小授权
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]

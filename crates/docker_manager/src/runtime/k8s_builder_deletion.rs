@@ -571,6 +571,7 @@ mod tests {
             },
             pod_cache: Default::default(),
             subvolume_path_cache: Default::default(),
+            event_publisher: Default::default(),
         }
     }
 

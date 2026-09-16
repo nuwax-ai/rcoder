@@ -42,6 +42,14 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(config['kubernetes_config']['services']['user-app']['image'], images['runtime'])
             role = next(r for r in rows if r['kind'] == 'ClusterRole')
             self.assertTrue(all(set(r['verbs']) <= {'get', 'list', 'watch'} for r in role['rules']))
+            namespaced = next(r for r in rows if r['kind'] == 'Role')
+            # Event publisher（kube-runtime 批次 C）：events.k8s.io 仅 create/patch
+            events = next(r for r in namespaced['rules'] if r['apiGroups'] == ['events.k8s.io'])
+            self.assertEqual(events['resources'], ['events'])
+            self.assertEqual(sorted(events['verbs']), ['create', 'patch'])
+            binding = next(r for r in rows if r['kind'] == 'RoleBinding')
+            self.assertEqual(binding['roleRef']['name'], namespaced['metadata']['name'])
+            self.assertTrue(all(s['kind'] == 'ServiceAccount' and s['name'] == 'rcoder' for s in binding['subjects']))
 
     def test_foreign_resource_rejected_before_mutation(self):
         with tempfile.TemporaryDirectory() as temp:
