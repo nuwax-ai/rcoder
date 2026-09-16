@@ -408,7 +408,7 @@ def run_chat_suite(c, receipt, context, case=''):
                LB_ENTRY_HOSTS=c.get('ENTRY_HOSTS', urllib.parse.urlsplit(receipt['url']).hostname or ''),
                LB_NODEPORT=str(c.nodeport),
                E2E_SOURCE_ROOT=str(snapshot_root),
-               E2E_INPUT_MANIFEST=str(report['snapshot_manifest_path']),
+               E2E_INPUT_MANIFEST=str(context['snapshot_manifest_path']),
                E2E_ORIGIN_HEAD=context['origin_head'],
                E2E_RUN_ROOT=str(context['report_dir'] / 'e2e-reports'))
     for key in ['LLM_API_KEY', 'LLM_MODEL', 'LLM_BASE_URL']:
@@ -431,7 +431,7 @@ def run_userapp_suite(c, receipt, context):
                RCODER_URL=receipt['url'], TEST_K8S_SSH=c.host, TEST_K8S_NS=c.ns,
                TEST_K8S_CONTEXT=c.context, TEST_K8S_ENVIRONMENT_ID=c.id,
                E2E_SOURCE_ROOT=str(snapshot_root),
-               E2E_INPUT_MANIFEST=str(report['snapshot_manifest_path']),
+               E2E_INPUT_MANIFEST=str(context['snapshot_manifest_path']),
                E2E_ORIGIN_HEAD=context['origin_head'],
                E2E_RUN_ROOT=str(context['report_dir'] / 'e2e-reports'))
     launcher = snapshot_root / 'tests-e2e/tools/k8s_userapp.py'
