@@ -88,9 +88,13 @@ except BaseException:
 '''
 
 
-def create(config, build_id):
+def create(config, build_id, expected=None):
+    """冻结远端构建快照。`expected` 给出 verify 轮预先冻结的清单——构建输入
+    必须与该清单逐字一致（同轮输入硬保证），不一致立即失败而非各自漂移。"""
     for attempt in range(3):
         before = manifest()
+        if expected is not None and before != expected:
+            raise RuntimeError('Live source changed between verify freeze and build; rerun verify')
         config.mut('sync', 'flush', config.session)
         sessions = json.loads(config.mut('sync', 'list', config.session, '--template', '{{json .}}'))
         if len(sessions) != 1 or sessions[0].get('conflicts') or sessions[0].get('lastError') or any(

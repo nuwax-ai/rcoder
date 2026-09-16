@@ -17,7 +17,13 @@ from cleanup import cleanup_case
 from contracts import REQUIRED
 
 ROOT = Path(__file__).resolve().parents[1]
-REPO = ROOT.parent
+# 显式输入模式（remote-k8s 冻结快照）：E2E_SOURCE_ROOT 指向快照根（无 .git），
+# E2E_INPUT_MANIFEST 提供冻结清单（name→条目），E2E_ORIGIN_HEAD 提供历史基线
+# HEAD，E2E_RUN_ROOT 重定向报告根。全部缺省时保持活动工作目录旧行为。
+REPO = Path(os.environ.get('E2E_SOURCE_ROOT') or ROOT.parent)
+INPUT_MANIFEST = os.environ.get('E2E_INPUT_MANIFEST')
+ORIGIN_HEAD = os.environ.get('E2E_ORIGIN_HEAD')
+RUN_ROOT = Path(os.environ['E2E_RUN_ROOT']) if os.environ.get('E2E_RUN_ROOT') else ROOT / 'reports'
 GROUPS = {
     'userapp': ['compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_userapp_faults', 'compose_userapp_deploy', 'compose_lifecycle', 'pg_storage_faults', 'sqlite_storage_contract', 'sqlite_compose_runtime', 'userapp_concurrency_contract', 'native_lifecycle_crash', 'docker_lifecycle_crash'],
     'compose': ['compose_sse', 'compose_session', 'compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_webchat', 'custom_page_preview'],
@@ -120,6 +126,14 @@ def output(*args):
 
 def source_fingerprint():
     digest = hashlib.sha256()
+    if INPUT_MANIFEST:
+        # 冻结快照模式：身份 = 快照清单本体（与冻结时的源码身份一致），
+        # 不触达活动工作目录，也不需要 .git。
+        frozen = json.loads(Path(INPUT_MANIFEST).read_text())
+        for name in sorted(frozen):
+            digest.update(name.encode() + b'\0')
+            digest.update(json.dumps(frozen[name], sort_keys=True).encode())
+        return digest.hexdigest()
     paths = subprocess.check_output(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=REPO).split(b'\0')
     for raw in sorted(set(paths)):
         if not raw:
@@ -273,10 +287,13 @@ def main():
     if args.remote_k8s and any(s not in GROUPS['k8s'] for s in suites):
         parser.error('--remote-k8s only accepts K8s suites')
     run_id = uuid.uuid4().hex
-    run = ROOT / 'reports' / run_id
+    run = RUN_ROOT / run_id
     run.mkdir(parents=True)
     env = dict(os.environ, E2E_RUN_ID=run_id, E2E_STRICT='1')
-    manifest = {'run_id': run_id, 'head': output('git', 'rev-parse', 'HEAD'),
+    # 历史基线 HEAD：冻结快照模式下经 E2E_ORIGIN_HEAD 显式提供（快照无
+    # .git；origin head 只是历史锚点，本轮身份是 worktree_sha256）
+    head = ORIGIN_HEAD or output('git', 'rev-parse', 'HEAD')
+    manifest = {'run_id': run_id, 'head': head,
                 'worktree_sha256': source_fingerprint(),
                 'containers_before': [] if args.remote_k8s else container_identities(),
                 'remote_k8s': args.remote_k8s,

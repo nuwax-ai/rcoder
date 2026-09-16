@@ -25,6 +25,10 @@ import uuid
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+# 显式输入模式（remote-k8s 冻结快照）：E2E_SOURCE_ROOT 指向快照根（无 .git），
+# E2E_RUN_ROOT 重定向报告根；缺省时保持活动工作目录旧行为（对齐 run.py）。
+REPO = Path(os.environ.get('E2E_SOURCE_ROOT') or ROOT.parent)
+ORIGIN_HEAD = os.environ.get('E2E_ORIGIN_HEAD')
 REQUIRED = {'cluster_ready', 'concurrent_ensure', 'ensure_retry', 'builder_identity',
             'concurrent_error_contract', 'cross_replica_files', 'build_A', 'build_B', 'artifact_A', 'artifact_B',
             'sse_terminal', 'sse_past_terminal', 'cross_replica_cancel', 'cold_deploy',
@@ -54,7 +58,8 @@ class Run:
         self.id = uuid.uuid4().hex
         self.app = 'e2e-k8s-' + self.id[:16]
         self.user = 'e2e-' + self.id[:12]
-        self.root = ROOT / 'reports' / self.id
+        report_base = Path(os.environ['E2E_RUN_ROOT']) if os.environ.get('E2E_RUN_ROOT') else ROOT / 'reports'
+        self.root = report_base / self.id
         self.root.mkdir(parents=True)
         self.report_lock = threading.RLock()
         self.assertions = []
@@ -68,7 +73,7 @@ class Run:
         self.trace = uuid.uuid4().hex
         self.summary = {'run_id': self.id, 'app_id': self.app, 'namespace': args.namespace,
                         'ssh': args.ssh, 'planned': sorted(REQUIRED), 'verdict': 'aborted',
-                        'head': self.local('git', 'rev-parse', 'HEAD').strip(),
+                        'head': (ORIGIN_HEAD or self.local('git', 'rev-parse', 'HEAD')).strip(),
                         'harness_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
         from run import source_fingerprint
         self.summary['worktree_sha256'] = source_fingerprint()
@@ -76,7 +81,7 @@ class Run:
         print('Report: ' + str(self.root), flush=True)
 
     def local(self, *args):
-        return subprocess.check_output(args, cwd=ROOT.parent, text=True, timeout=90)
+        return subprocess.check_output(args, cwd=REPO, text=True, timeout=90)
 
     def kube(self, *args):
         context = getattr(self.args, 'context', None)

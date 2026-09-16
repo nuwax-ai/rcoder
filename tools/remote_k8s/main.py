@@ -22,6 +22,9 @@ from manifests import render
 import snapshot
 import remote_process
 import registry
+import test_snapshot
+import build_cache
+import diagnostics
 
 
 @contextmanager
@@ -150,13 +153,16 @@ def doctor(c):
     print('SSH / cluster / CRDs / storage / registry reachable. Push and node pull are checked during build/deploy.', flush=True)
 
 
-def build(c):
+def build(c, expected_manifest=None):
     doctor(c)
     sync_start(c)
+    build_started = time.monotonic()
     build_id = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + uuid.uuid4().hex[:8]
-    frozen = snapshot.create(c, build_id)
+    freeze_started = time.monotonic()
+    frozen = snapshot.create(c, build_id, expected=expected_manifest)
     receipt = {k: v for k, v in frozen.items() if k != 'manifest'}
-    receipt.update(build_id=build_id, environment=c.id, namespace=c.ns, context=c.context, status='building', images={}, bases={})
+    receipt.update(build_id=build_id, environment=c.id, namespace=c.ns, context=c.context, status='building', images={}, bases={},
+                   timings={'snapshot_freeze_ms': int((time.monotonic() - freeze_started) * 1000)})
     atomic_json(c.state / 'builds' / (build_id + '.json'), receipt)
     atomic_json(c.state / 'builds' / (build_id + '-source.json'), frozen)
     builder = 'rcoder-' + c.id
@@ -173,6 +179,7 @@ def build(c):
         c.ssh(['docker', 'buildx', 'create', '--name', builder, '--driver', 'docker-container',
                '--driver-opt', 'memory=' + c.get('MEMORY', '16g'), '--driver-opt', 'cpu-quota=' + str(int(c.get('CPUS', '4')) * 100000),
                '--driver-opt', 'cpu-period=100000', '--buildkitd-config', c.remote + '/buildkit.toml'])
+    bases_started = time.monotonic()
     base_args = []
     for key in ['RCODER_BASE', 'COMPUTER_BASE', 'RUNTIME_BASE']:
         ref = c.get(key, required=True)
@@ -183,9 +190,37 @@ def build(c):
         pinned = ref.split('@')[0] + '@' + match.group(1)
         receipt['bases'][key] = pinned
         base_args += ['--build-arg', key + '=' + pinned]
+    receipt['timings']['base_resolution_ms'] = int((time.monotonic() - bases_started) * 1000)
+    # R2 保守构建复用：同 key 完整成功 receipt + registry 产物核验 → 复用
+    key = build_cache.cache_key(receipt['source_sha256'], receipt['bases'], c)
+    receipt['cache_key'] = key
+    cached = build_cache.load(c, key)
+    if cached:
+        reusable = []
+        for target in build_cache.TARGETS:
+            present, error_class = build_cache.artifact_matches(c, cached['images'][target])
+            if present:
+                reusable.append(target)
+            elif error_class == 'registry-error':
+                raise RuntimeError('Registry verification failed while reusing cached build ('
+                                   + target + '); not treating as hit or success')
+        if len(reusable) == len(build_cache.TARGETS):
+            receipt['images'] = dict(cached['images'])
+            receipt['status'] = 'built'
+            receipt['cache'] = {'reused': True, 'reused_from': cached['build_id'],
+                                'source_sha256': cached['source_sha256']}
+            receipt['timings']['total_ms'] = int((time.monotonic() - build_started) * 1000)
+            receipt['finished_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            atomic_json(c.state / 'builds' / (build_id + '.json'), receipt)
+            atomic_json(c.state / 'build.json', receipt)
+            print('Build reused from', cached['build_id'], '(cache key ' + key[:12] + ')', flush=True)
+            return receipt
+        print('Cache entry incomplete on registry (missing: ' +
+              ', '.join(t for t in build_cache.TARGETS if t not in reusable) + '); rebuilding', flush=True)
     try:
         for target in ['rcoder', 'computer', 'runtime']:
             alive(c)
+            target_started = time.monotonic()
             tag = c.get('REGISTRY').rstrip('/') + '/' + c.get('IMAGE_PREFIX', c.ns + '-') + target + ':' + build_id
             if c.get('MOUNT_BASE_LAYERS', 'false') == 'true':
                 receipt.setdefault('base_layer_mounts', {})[target] = registry.mount(c, receipt['bases'][target.upper() + '_BASE'], tag.rsplit(':', 1)[0])
@@ -205,15 +240,21 @@ def build(c):
             if not re.fullmatch('sha256:[a-f0-9]{64}', image_digest):
                 raise RuntimeError('Build did not provide a valid image digest')
             receipt['images'][target] = tag.rsplit(':', 1)[0] + '@' + image_digest
+            receipt['timings']['build_' + target + '_ms'] = int((time.monotonic() - target_started) * 1000)
             atomic_json(c.state / 'builds' / (build_id + '.json'), receipt)
     except BaseException as error:
         receipt.update(status='failed', error_type=type(error).__name__)
         atomic_json(c.state / 'builds' / (build_id + '.json'), receipt)
         raise
     receipt['status'] = 'built'
+    receipt['cache'] = {'reused': False}
+    receipt['timings']['total_ms'] = int((time.monotonic() - build_started) * 1000)
+    receipt['finished_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    build_cache.store(c, key, receipt)
     atomic_json(c.state / 'builds' / (build_id + '.json'), receipt)
     atomic_json(c.state / 'build.json', receipt)
     print('Build receipt:', c.state / 'build.json', flush=True)
+    return receipt
 
 
 def read_receipt(c, name):
@@ -348,56 +389,141 @@ def smoke(c, receipt):
     http_health(receipt['url'])
 
 
-def tests(c, suite):
+CHAT_CASE_PATTERN = re.compile(r'^(pass|fail): k8s_lb::([a-zA-Z0-9_]+)$', re.M)
+
+
+def registered_chat_cases():
+    catalog = json.loads((ROOT / 'tests-e2e/tools/suite_cases.json').read_text())
+    return list(catalog.get('k8s_lb', []))
+
+
+def run_chat_suite(c, receipt, context, case=''):
+    """chat 套件经严格启动器执行；case 精确筛选时记录部分覆盖标记。"""
+    env = dict(os.environ)
+    env.update({k: v for k, v in c.values.items() if k.startswith('LLM_')})
+    snapshot_root = context['snapshot_path']
+    env.update(CARGO_TARGET_DIR=str(c.state / 'e2e-target'),
+               RCODER_URL=receipt['url'], TEST_K8S_SSH=c.host, TEST_K8S_NS=c.ns,
+               TEST_K8S_CONTEXT=c.context, TEST_K8S_ENVIRONMENT_ID=c.id,
+               LB_ENTRY_HOSTS=c.get('ENTRY_HOSTS', urllib.parse.urlsplit(receipt['url']).hostname or ''),
+               LB_NODEPORT=str(c.nodeport),
+               E2E_SOURCE_ROOT=str(snapshot_root),
+               E2E_INPUT_MANIFEST=str(report['snapshot_manifest_path']),
+               E2E_ORIGIN_HEAD=context['origin_head'],
+               E2E_RUN_ROOT=str(context['report_dir'] / 'e2e-reports'))
+    for key in ['LLM_API_KEY', 'LLM_MODEL', 'LLM_BASE_URL']:
+        if not env.get(key):
+            raise ValueError('Missing ' + key + ' (real LLM is required; refusing to mock or skip)')
+    launcher = snapshot_root / 'tests-e2e/tools/run.py'
+    args = ['python3', str(launcher), '--group', 'k8s', '--suite', 'k8s_lb', '--filter', case, '--ignored', '--remote-k8s']
+    output = run(args, timeout=2400, env=env, log=context['report_dir'] / 'chat.log', guard=lambda: alive(c))
+    (context['report_dir'] / 'chat.log').write_text(output)
+    cases = [{'name': name, 'verdict': verdict}
+             for verdict, name in CHAT_CASE_PATTERN.findall(output)]
+    return cases
+
+
+def run_userapp_suite(c, receipt, context):
+    env = dict(os.environ)
+    env.update({k: v for k, v in c.values.items() if k.startswith('LLM_')})
+    snapshot_root = context['snapshot_path']
+    env.update(CARGO_TARGET_DIR=str(c.state / 'e2e-target'),
+               RCODER_URL=receipt['url'], TEST_K8S_SSH=c.host, TEST_K8S_NS=c.ns,
+               TEST_K8S_CONTEXT=c.context, TEST_K8S_ENVIRONMENT_ID=c.id,
+               E2E_SOURCE_ROOT=str(snapshot_root),
+               E2E_INPUT_MANIFEST=str(report['snapshot_manifest_path']),
+               E2E_ORIGIN_HEAD=context['origin_head'],
+               E2E_RUN_ROOT=str(context['report_dir'] / 'e2e-reports'))
+    launcher = snapshot_root / 'tests-e2e/tools/k8s_userapp.py'
+    args = ['python3', str(launcher), '--ssh', c.host,
+            '--namespace', c.ns, '--deployment', 'rcoder', '--context', c.context,
+            '--environment-id', c.id, '--url', receipt['url'], '--proxy-url', receipt['gateway_url'],
+            '--internal-url', 'http://rcoder.' + c.ns + '.svc:8086']
+    output = run(args, timeout=2400, env=env, log=context['report_dir'] / 'userapp.log', guard=lambda: alive(c))
+    (context['report_dir'] / 'userapp.log').write_text(output)
+
+
+def prepare_test_snapshot(c, manifest_override=None):
+    """冻结本轮测试输入（manifest_override：verify 轮的同轮清单）。"""
+    if manifest_override is not None:
+        frozen = test_snapshot.freeze_from_manifest(c, manifest_override)
+    else:
+        frozen = test_snapshot.freeze(c)
+    origin_head = ''
+    try:
+        origin_head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True, timeout=60).strip()
+    except (subprocess.CalledProcessError, OSError):
+        origin_head = 'unknown'
+    frozen['origin_head'] = origin_head
+    return frozen
+
+
+def execute_suites(c, receipt, context, suite, case=''):
+    """已冻结快照上执行选定套件；运行后校验快照未被篡改。"""
+    test_snapshot.verify(context['snapshot_record'])
+    started = time.monotonic()
+    if suite in ['gateway', 'all']:
+        for kind, name in [('gateway', 'rcoder'), ('httproute', 'rcoder')]:
+            row = owned(c, kind, name)
+            conditions = row.get('status', {}).get('conditions', []) if kind == 'gateway' else [x for p in row.get('status', {}).get('parents', []) for x in p.get('conditions', [])]
+            required = ['Accepted', 'ResolvedRefs'] if kind == 'httproute' else ['Accepted']
+            if any(not any(x['type'] == condition and x['status'] == 'True' and
+                           x.get('observedGeneration') == row['metadata']['generation'] for x in conditions) for condition in required):
+                raise RuntimeError(kind + ' does not have current successful conditions')
+        http_health(receipt['gateway_url'])
+    if suite in ['userapp', 'all']:
+        run_userapp_suite(c, receipt, context)
+    if suite in ['chat', 'all']:
+        context['cases'] = run_chat_suite(c, receipt, context, case=case)
+    return int((time.monotonic() - started) * 1000)
+
+
+def tests(c, suite, case='', frozen_snapshot=None):
     receipt = read_receipt(c, 'deployment.json')
     test_id = uuid.uuid4().hex
     report = c.state / 'tests' / test_id
     report.mkdir(parents=True)
     result = {**receipt, 'suite': suite, 'verdict': 'aborted', 'test_id': test_id}
+    if case:
+        result['case_filter'] = case
+        result['partial_coverage'] = True
     atomic_json(report / 'summary.json', result)
     try:
         alive(c)
-        result['test_source_sha256'] = digest(snapshot.manifest())
+        freeze_started = time.monotonic()
+        snapshot_record = frozen_snapshot or prepare_test_snapshot(c)
+        context = {'snapshot_record': snapshot_record,
+                   'snapshot_path': Path(snapshot_record['path']) / 'source',
+                   'snapshot_manifest_path': Path(snapshot_record['path']) / 'inputs.json',
+                   'origin_head': snapshot_record.get('origin_head', 'unknown'),
+                   'report_dir': report}
+        result['snapshot_id'] = snapshot_record['snapshot_id']
+        result['origin_head'] = context['origin_head']
+        result['test_source_sha256'] = snapshot_record['source_sha256']
+        result['test_source'] = {'snapshot_id': snapshot_record['snapshot_id'],
+                                 'source_sha256': snapshot_record['source_sha256']}
+        result['server_source_sha256'] = receipt.get('source_sha256')
+        result['sources_match'] = result['test_source_sha256'] == receipt.get('source_sha256')
+        result['timings'] = {'freeze_ms': int((time.monotonic() - freeze_started) * 1000)}
+        if not result['sources_match']:
+            # test 模式验证已部署版本：两套身份都展示，不假装同轮（verify 同轮
+            # 由 verify() 冻结一次保证）
+            print('Note: test source differs from deployed source (test-mode accepts; '
+                  'use verify for same-round acceptance)', flush=True)
         smoke(c, receipt)
-        if suite in ['gateway', 'all']:
-            for kind, name in [('gateway', 'rcoder'), ('httproute', 'rcoder')]:
-                row = owned(c, kind, name)
-                conditions = row.get('status', {}).get('conditions', []) if kind == 'gateway' else [x for p in row.get('status', {}).get('parents', []) for x in p.get('conditions', [])]
-                required = ['Accepted', 'ResolvedRefs'] if kind == 'httproute' else ['Accepted']
-                if any(not any(x['type'] == condition and x['status'] == 'True' and
-                               x.get('observedGeneration') == row['metadata']['generation'] for x in conditions) for condition in required):
-                    raise RuntimeError(kind + ' does not have current successful conditions')
-            http_health(receipt['gateway_url'])
-        env = dict(os.environ)
-        env.update({k: v for k, v in c.values.items() if k.startswith('LLM_')})
-        env.update(CARGO_TARGET_DIR=str(c.state / 'e2e-target'),
-                   RCODER_URL=receipt['url'], TEST_K8S_SSH=c.host, TEST_K8S_NS=c.ns,
-                   TEST_K8S_CONTEXT=c.context, TEST_K8S_ENVIRONMENT_ID=c.id,
-                   LB_ENTRY_HOSTS=c.get('ENTRY_HOSTS', urllib.parse.urlsplit(receipt['url']).hostname or ''), LB_NODEPORT=str(c.nodeport))
-        if suite in ['userapp', 'all']:
-            args = ['python3', str(ROOT / 'tests-e2e/tools/k8s_userapp.py'), '--ssh', c.host,
-                    '--namespace', c.ns, '--deployment', 'rcoder', '--context', c.context,
-                    '--environment-id', c.id, '--url', receipt['url'], '--proxy-url', receipt['gateway_url'],
-                    '--internal-url', 'http://rcoder.' + c.ns + '.svc:8086']
-            output = run(args, timeout=2400, env=env, log=report / 'userapp.log', guard=lambda: alive(c))
-            (report / 'userapp.log').write_text(output)
-        if suite in ['chat', 'all']:
-            for key in ['LLM_API_KEY', 'LLM_MODEL', 'LLM_BASE_URL']:
-                if not env.get(key):
-                    raise ValueError('Missing ' + key)
-            # Existing strict launcher supplies E2E ownership IDs and validates every scenario report.
-            output = run(['python3', str(ROOT / 'tests-e2e/tools/run.py'), '--group', 'k8s', '--suite', 'k8s_lb', '--filter', '', '--ignored', '--remote-k8s'], timeout=2400, env=env, log=report / 'chat.log', guard=lambda: alive(c))
-            (report / 'chat.log').write_text(output)
+        result['timings']['suites_ms'] = execute_suites(c, receipt, context, suite, case=case)
+        if context.get('cases') is not None:
+            result['cases'] = context['cases']
         alive(c)
         identity(c, receipt)
         result['pods_after'] = pod_identities(c, receipt)
         outside_unchanged(c, receipt['outside_baseline'])
-        result['test_source_sha256_after'] = digest(snapshot.manifest())
-        result['local_source_changed'] = result['test_source_sha256_after'] != result['test_source_sha256']
-        # Read-only health probes execute already-loaded Python against a pinned
-        # deployment; unrelated Rust edits cannot change those running probes.
-        if result['local_source_changed'] and suite in ['userapp', 'chat', 'all']:
-            raise RuntimeError('Local test source changed during acceptance')
+        # 活动目录变化仅记提示（快照身份不受影响）
+        try:
+            live_now = digest(snapshot.manifest())
+            result['live_source_changed_during_test'] = live_now != snapshot_record['source_sha256']
+        except Exception:  # noqa: BLE001 - 提示性观察，不影响判定
+            result['live_source_changed_during_test'] = 'unknown'
         result['verdict'] = 'pass'
     except BaseException as exc:
         result.update(verdict='fail', error=type(exc).__name__ + ': ' + str(exc))
@@ -409,6 +535,79 @@ def tests(c, suite):
     finally:
         atomic_json(report / 'summary.json', result)
         print('Test report:', report, flush=True)
+
+
+def retest_failed(c, parent_id):
+    """失败重跑：复用父报告的冻结测试输入；部署身份变化即拒绝。
+
+    仅处理有可靠场景级结果的失败（chat cases）；构建/环境/aborted 失败没有
+    可信用例集合，明确要求修复后重新运行对应入口。
+    """
+    if not re.fullmatch(r'[0-9a-f]{32}', parent_id or ''):
+        raise ValueError('RUN must be a 32-hex test id')
+    parent_dir = c.state / 'tests' / parent_id
+    parent_summary = parent_dir / 'summary.json'
+    if not parent_summary.exists():
+        raise RuntimeError('Parent test report not found: ' + str(parent_dir))
+    parent = json.loads(parent_summary.read_text())
+    if parent.get('environment') != c.id:
+        raise RuntimeError('Parent report belongs to a different environment')
+    receipt = {k: v for k, v in parent.items()
+               if k in {'images', 'bases', 'build_id', 'environment', 'namespace', 'context',
+                        'source_sha256', 'deployment_uid', 'generation', 'url', 'gateway_url',
+                        'outside_baseline', 'config_sha256'}}
+    identity(c, receipt)  # 部署被替换/换代 → 拒绝旧结果重跑
+    failed = [row['name'] for row in parent.get('cases', []) if row['verdict'] == 'fail']
+    if parent.get('verdict') != 'fail' or not failed:
+        raise RuntimeError('Parent has no reliable failed case results '
+                           '(infrastructure or aborted failures require rerunning the original entrypoint)')
+    registered = registered_chat_cases()
+    unknown = [name for name in failed if name not in registered]
+    if unknown:
+        raise RuntimeError('Parent failed cases are not registered scenarios: ' + ', '.join(unknown))
+    snapshot_dir = c.state / 'test-snapshots' / parent.get('snapshot_id', '')
+    record_path = snapshot_dir / 'snapshot.json'
+    if not parent.get('snapshot_id') or not record_path.exists() or not (snapshot_dir / 'inputs.json').exists():
+        raise RuntimeError('Parent frozen test snapshot is missing or untrustworthy; rerun the original entrypoint')
+    record = json.loads(record_path.read_text())
+    if record.get('status') != 'sealed' or record.get('environment') != c.id:
+        raise RuntimeError('Parent frozen test snapshot is not sealed for this environment')
+    record['path'] = str(snapshot_dir)
+    test_snapshot.verify(record)  # 快照被篡改 → 拒绝
+    print('Retesting failed cases from parent', parent_id, ':', ', '.join(failed), flush=True)
+    outcomes = []
+    for name in failed:
+        sub_report = c.state / 'tests' / (parent_id + '-retest')
+        # 每个失败用例一次精确重跑；新报告独立成目录，父报告不改写
+        case_report = sub_report / name
+        case_report.mkdir(parents=True, exist_ok=True)
+        context = {'snapshot_record': record,
+                   'snapshot_path': Path(record['path']) / 'source',
+                   'snapshot_manifest_path': Path(record['path']) / 'inputs.json',
+                   'origin_head': parent.get('origin_head', 'unknown'),
+                   'report_dir': case_report}
+        outcome = {'name': name, 'verdict': 'fail'}
+        try:
+            execute_suites(c, receipt, context, 'chat', case=name)
+            outcome['verdict'] = 'pass'
+        except BaseException as exc:
+            outcome['error'] = type(exc).__name__ + ': ' + str(exc)[:200]
+        outcomes.append(outcome)
+        summary = {'parent_test_id': parent_id, 'retest': True, 'case': name,
+                   'verdict': outcome['verdict'], 'snapshot_id': record['snapshot_id'],
+                   'test_source_sha256': record['source_sha256'],
+                   'server_source_sha256': receipt.get('source_sha256'),
+                   'error': outcome.get('error', ''), 'report': str(case_report)}
+        atomic_json(case_report / 'summary.json', summary)
+    still_failed = [row['name'] for row in outcomes if row['verdict'] != 'pass']
+    summary_path = sub_report / 'summary.json'
+    atomic_json(summary_path, {'parent_test_id': parent_id, 'retest': True,
+                               'cases': outcomes, 'still_failed': still_failed,
+                               'partial_coverage': True,
+                               'note': 'retest covers only previously failed cases; full-suite pass requires a fresh complete run'})
+    print('Retest report:', sub_report, flush=True)
+    if still_failed:
+        raise RuntimeError('Retested cases still failing: ' + ', '.join(still_failed))
 
 
 def logs(c, destination=None):
@@ -430,17 +629,26 @@ def logs(c, destination=None):
     rows = [{'name': p['metadata']['name'], 'uid': p['metadata']['uid'], 'status': p.get('status')} for p in pods]
     atomic_json(destination / 'pods.json', rows)
     (destination / 'events.txt').write_text(scrub(c.kube('get', 'events', '--sort-by=.lastTimestamp')))
+    collection_errors = []
     for pod in pods:
         name = pod['metadata']['name']
         for container in pod['spec']['containers']:
+            # 逐项采集：单项失败记录 error_class 并继续，绝不吞掉也不覆盖原始错误
             try:
                 data = c.kube('logs', name, '-c', container['name'], '--tail=200')
                 (destination / (name + '-' + container['name'] + '.log')).write_text(scrub(data))
-                if pod['metadata'].get('labels', {}).get('app') == 'rcoder' and container['name'] == 'rcoder':
+            except RuntimeError as error:
+                collection_errors.append({'item': name + '/' + container['name'] + ' logs',
+                                          'error_class': 'collect-failed', 'detail': str(error)[-300:]})
+            if pod['metadata'].get('labels', {}).get('app') == 'rcoder' and container['name'] == 'rcoder':
+                try:
                     data = c.kube('exec', name, '-c', 'rcoder', '--', 'sh', '-c', 'tail -n 200 /app/logs/rcoder.* 2>/dev/null')
                     (destination / (name + '-files.log')).write_text(scrub(data))
-            except RuntimeError:
-                pass
+                except RuntimeError as error:
+                    collection_errors.append({'item': name + '/rcoder file-logs',
+                                              'error_class': 'collect-failed', 'detail': str(error)[-300:]})
+    if collection_errors:
+        atomic_json(destination / 'collection-errors.json', collection_errors)
     print('Diagnostics:', destination, flush=True)
 
 
@@ -467,9 +675,26 @@ def down(c):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['doctor', 'sync-start', 'sync-status', 'sync-stop', 'build', 'deploy', 'test', 'verify', 'logs', 'down'])
-    parser.add_argument('--suite', choices=['smoke', 'userapp', 'chat', 'gateway', 'all'], default='smoke')
+    parser.add_argument('action', choices=['doctor', 'sync-start', 'sync-status', 'sync-stop', 'build', 'deploy',
+                                           'test', 'verify', 'logs', 'down', 'status', 'check', 'retest-failed'])
+    # 参数经环境变量安全传递（make 侧不插值进 shell；见 make/remote-k8s.mk）。
+    parser.add_argument('--suite', choices=['smoke', 'userapp', 'chat', 'gateway', 'all'],
+                        default=os.environ.get('REMOTE_K8S_SUITE', 'smoke'))
+    parser.add_argument('--case', default=os.environ.get('REMOTE_K8S_CASE', ''))
+    parser.add_argument('--run', default=os.environ.get('REMOTE_K8S_RUN', ''))
     args = parser.parse_args()
+    if args.case:
+        # CASE 仅支持 chat 套件（UserApp 是有依赖的完整生命周期链，未建独立
+        # fixture 前不允许任意截断）；精确匹配已注册场景，空集/未知提前拒绝
+        if args.suite != 'chat':
+            parser.error('--case/--filter only supports SUITE=chat (userapp keeps the full lifecycle chain)')
+        if not re.fullmatch(r'[a-zA-Z0-9_]+', args.case):
+            parser.error('CASE must be a single registered scenario name')
+        registered = registered_chat_cases()
+        if args.case not in registered:
+            parser.error('unknown chat case: ' + args.case + ' (registered: ' + ', '.join(registered) + ')')
+    if args.run and args.action != 'retest-failed':
+        parser.error('--run only applies to retest-failed')
     c = Config()
     c.state.mkdir(parents=True, exist_ok=True)
     c.state.chmod(0o700)
@@ -479,19 +704,29 @@ def main():
     if args.action == 'sync-status':
         print(c.mut('sync', 'list', '--label-selector', 'rcoder-session=' + c.session))
         return
+    if args.action == 'status':
+        diagnostics.status(c)
+        return
+    if args.action == 'check':
+        diagnostics.check(c)
+        return
     with lock(c):
         try:
             if args.action == 'sync-start': sync_start(c)
             elif args.action == 'sync-stop': c.mut('sync', 'terminate', '--label-selector', 'rcoder-session=' + c.session)
             elif args.action == 'build': build(c)
             elif args.action == 'deploy': deploy(c)
-            elif args.action == 'test': tests(c, args.suite)
+            elif args.action == 'test': tests(c, args.suite, case=args.case)
             elif args.action == 'logs': logs(c)
             elif args.action == 'down': down(c)
+            elif args.action == 'retest-failed': retest_failed(c, args.run)
             elif args.action == 'verify':
-                build(c)
+                # 同轮输入：冻结一次，构建与测试消费同一清单（R1）
+                frozen = snapshot.manifest()
+                prepared = prepare_test_snapshot(c, manifest_override=frozen)
+                build(c, expected_manifest=frozen)
                 deploy(c)
-                tests(c, args.suite)
+                tests(c, args.suite, case=args.case, frozen_snapshot=prepared)
         except BaseException:
             if args.action in ['deploy', 'verify']:
                 try:
