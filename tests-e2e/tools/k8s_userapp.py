@@ -467,11 +467,17 @@ strip_prefix = false
         started = time.monotonic()
         start_thread = threading.Thread(target=call_start, daemon=True)
         start_thread.start()
-        thread.join(300)
-        holder_done = time.monotonic()
-        start_thread.join(300)
-        start_done = time.monotonic()
-        start_status, start_envelope, _ = start_outcome[0] if start_outcome else (0, {}, '')
+        # 先收束两个线程再解包结果——中途异常也不留脱管持有者持锁
+        try:
+            thread.join(300)
+            holder_done = time.monotonic()
+            start_thread.join(300)
+            start_done = time.monotonic()
+        except BaseException:
+            thread.join(300)
+            start_thread.join(300)
+            raise
+        start_status, start_envelope = start_outcome[0] if start_outcome else (0, {})
         self.check('lock_start_waits_for_holder',
                    start_status == 200 and start_envelope.get('code') == '0000' and start_done >= holder_done,
                    {'status': start_status, 'envelope': start_envelope,
