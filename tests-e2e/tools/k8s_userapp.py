@@ -439,8 +439,15 @@ strip_prefix = false
         status, rejected_view = self.request(
             '/api/v1/userapp/' + self.app + '/operations/by-request?' + urllib.parse.urlencode(
                 {'user_id': self.user, 'request_id': 'lock-stop-' + self.id[:16]}), base=self.entries[1])
+        # 被拒请求允许留下**拒绝记录**（durable evidence，by-request 可查）；
+        # 无自动执行的判据 = pod 仍 Running 且该 request_id 绝无 Succeeded 的
+        # Stop 记录
+        view = rejected_view.get('data') or {}
+        stop_executed = (status == 200 and rejected_view.get('code') == '0000'
+                         and view.get('state') == 'Succeeded'
+                         and view.get('kind') == 'Stop')
         self.check('lock_rejected_no_auto_execution',
-                   pod['phase'] == 'Running' and status == 200 and rejected_view.get('code') != '0000',
+                   pod['phase'] == 'Running' and not stop_executed,
                    {'pod': pod, 'by_request': rejected_view})
         self.check('lock_no_side_effects', self.content(self.id + '-B'))
         runtime = self.api('/api/v1/userapp/' + self.app + '?' + urllib.parse.urlencode({'user_id': self.user}))
