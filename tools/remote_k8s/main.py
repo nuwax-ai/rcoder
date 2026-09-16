@@ -432,7 +432,8 @@ def run_chat_suite(c, receipt, context, case=''):
     env = dict(os.environ)
     env.update({k: v for k, v in c.values.items() if k.startswith('LLM_')})
     snapshot_root = context['snapshot_path']
-    env.update(CARGO_TARGET_DIR=str(c.state / 'e2e-target'),
+    env.update(PYTHONDONTWRITEBYTECODE='1',
+               CARGO_TARGET_DIR=str(c.state / 'e2e-target'),
                RCODER_URL=receipt['url'], TEST_K8S_SSH=c.host, TEST_K8S_NS=c.ns,
                TEST_K8S_CONTEXT=c.context, TEST_K8S_ENVIRONMENT_ID=c.id,
                LB_ENTRY_HOSTS=c.get('ENTRY_HOSTS', urllib.parse.urlsplit(receipt['url']).hostname or ''),
@@ -496,7 +497,8 @@ def run_userapp_suite(c, receipt, context):
     env = dict(os.environ)
     env.update({k: v for k, v in c.values.items() if k.startswith('LLM_')})
     snapshot_root = context['snapshot_path']
-    env.update(CARGO_TARGET_DIR=str(c.state / 'e2e-target'),
+    env.update(PYTHONDONTWRITEBYTECODE='1',
+               CARGO_TARGET_DIR=str(c.state / 'e2e-target'),
                RCODER_URL=receipt['url'], TEST_K8S_SSH=c.host, TEST_K8S_NS=c.ns,
                TEST_K8S_CONTEXT=c.context, TEST_K8S_ENVIRONMENT_ID=c.id,
                E2E_SOURCE_ROOT=str(snapshot_root),

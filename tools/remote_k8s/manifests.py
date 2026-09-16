@@ -140,6 +140,9 @@ def render(c, images, password, registry_auth=None):
                     {'name': 'POD_UID', 'valueFrom': {'fieldRef': {'fieldPath': 'metadata.uid'}}},
                     {'name': 'POD_IP', 'valueFrom': {'fieldRef': {'fieldPath': 'status.podIP'}}}],
                 'ports': [{'name': 'http', 'containerPort': 8086}, {'name': 'proxy', 'containerPort': 8088}],
+                # 8088 = pingora 流量代理（/api/v1/userapp/proxy/* 族）——
+                # Service 必须暴露，否则 Gateway/NodePort 只达 axum(8086)，
+                # 应用流量代理全程 404（131 环境实测）
                 'startupProbe': {'httpGet': {'path': '/health', 'port': 'http'}, 'periodSeconds': 5, 'failureThreshold': 60},
                 'readinessProbe': {'httpGet': {'path': '/health', 'port': 'http'}, 'periodSeconds': 5},
                 'resources': {'requests': {'cpu': '250m', 'memory': '512Mi'}, 'limits': {'cpu': '2', 'memory': '2Gi'}},
@@ -154,6 +157,9 @@ def render(c, images, password, registry_auth=None):
          api='gateway.networking.k8s.io/v1', cluster=True)
     obj('Gateway', 'rcoder', {'gatewayClassName': c.ns, 'listeners': [
         {'name': 'http', 'port': 80, 'protocol': 'HTTP', 'allowedRoutes': {'namespaces': {'from': 'Same'}}}]}, api='gateway.networking.k8s.io/v1')
+    # 应用流量代理族（pingora，8088）先于兜底规则——axum(8086) 不挂载这些路径
     obj('HTTPRoute', 'rcoder', {'parentRefs': [{'name': 'rcoder'}], 'rules': [
+        {'matches': [{'path': {'type': 'PathPrefix', 'value': '/api/v1/userapp/proxy/'}}],
+         'backendRefs': [{'name': 'rcoder', 'port': 8088}]},
         {'matches': [{'path': {'type': 'PathPrefix', 'value': '/'}}], 'backendRefs': [{'name': 'rcoder', 'port': 8086}]}]}, api='gateway.networking.k8s.io/v1')
     return out
