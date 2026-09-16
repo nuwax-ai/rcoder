@@ -235,34 +235,45 @@ pub async fn install_skill_dir(
     Ok(())
 }
 
-/// 逐个子目录并发覆盖更新 agents 目录 (无锁安全)。
+/// 逐个子目录/文件并发覆盖更新 agents 目录 (无锁安全)。
 ///
-/// 每个子目录独立操作: 删旧 → rename 移入。不同子目录天然无冲突;
-/// 同名子目录并发覆盖最终一致。目标目录始终存在, 无"目录空"窗口。
+/// 每个条目独立操作: 删旧 → rename 移入。不同条目天然无冲突;
+/// 同名条目并发覆盖最终一致。目标目录始终存在, 无"目录空"窗口。
+/// F04：视图条目混合目录（多文件 subagent 包）与文件（.md）——删旧按
+/// symlink_metadata 分派（remove_dir_all 对文件 ENOTDIR）；**显式给出的源
+/// 丢失必须失败**（上传源被提前清理 = 假成功），仅 None = 无输入跳过。
 pub async fn update_agents_dir(src: Option<&Path>, dest: &Path) -> AppResult<()> {
     fs::create_dir_all(dest).await?;
-    // try_exists 而非阻塞的 Path::exists()（本函数在 async 上下文）。这个存在性检查
-    // 不能省：否则下面 read_dir 的 ? 会把"src 不存在"从可容忍情况变成返回 Err。
-    // unwrap_or(false) 对齐 Path::exists() 遇任何错误都返回 false 的语义。
-    if let Some(src) = src
-        && fs::try_exists(src).await.unwrap_or(false)
-    {
-        let mut entries = fs::read_dir(src).await?;
-        let mut tasks = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            let dst = dest.join(entry.file_name());
-            let src_entry = entry.path();
-            tasks.push(async move {
-                match fs::remove_dir_all(&dst).await {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
-                move_or_copy_directory(&src_entry, &dst).await
-            });
-        }
-        try_join_all(tasks).await?;
+    let Some(src) = src else {
+        return Ok(());
+    };
+    // try_exists 而非阻塞的 Path::exists()（本函数在 async 上下文）。
+    if !fs::try_exists(src).await.unwrap_or(false) {
+        return Err(crate::error::AppError::validation(format!(
+            "uploaded agents source disappeared before it could be consumed: {}",
+            src.display()
+        )));
     }
+    let mut entries = fs::read_dir(src).await?;
+    let mut tasks = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let dst = dest.join(entry.file_name());
+        let src_entry = entry.path();
+        tasks.push(async move {
+            match fs::symlink_metadata(&dst).await {
+                Ok(meta) if meta.is_dir() && !meta.is_symlink() => {
+                    fs::remove_dir_all(&dst).await?;
+                }
+                Ok(_) => {
+                    fs::remove_file(&dst).await?;
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            move_or_copy_directory(&src_entry, &dst).await
+        });
+    }
+    try_join_all(tasks).await?;
     Ok(())
 }
 

@@ -126,6 +126,10 @@ pub async fn create_workspace_with_agent_store(
 
     // 3a. 处理上传 file → 解压 → install_skill_dir 到 agent-store
     let mut agents_src_dir: Option<PathBuf> = None;
+    // F04：解压 guard 必须存活到 agents 源**消费完成**（update_agents_dir
+    // 在下方第 4 步）——块作用域析构会留下指向已删临时目录的 PathBuf，
+    // update_agents_dir 把"源不存在"当无输入跳过，subagents 上传假成功。
+    let mut zip_extract_guard: Option<tempfile::TempDir> = None;
     if let Some(source) = skill_zip {
         let tmp = session_workspace.join(".tmp");
         fs::create_dir_all(&tmp).await?;
@@ -172,10 +176,12 @@ pub async fn create_workspace_with_agent_store(
             }
         }
 
-        // agents/: 记录源目录 (后续 update_agents_dir 用)
+        // agents/: 记录源目录 (后续 update_agents_dir 用)；guard 一并外移
+        // 存活（F04）
         if let Some(src_agents) = find_dir(&extract_root, "agents").await {
             agents_src_dir = Some(src_agents);
         }
+        zip_extract_guard = Some(extract_guard);
     }
 
     // 3b. 处理 skill_url_map (优先) 或 skill_urls (回退)
@@ -236,9 +242,11 @@ pub async fn create_workspace_with_agent_store(
         }
     }
 
-    // 4. 刷新 agents 子目录 (每次 createWorkspace 覆盖)
+    // 4. 刷新 agents 子目录 (每次 createWorkspace 覆盖)；消费完成后才允许
+    // 释放解压 guard（F04）
     crate::service::agent_store::update_agents_dir(agents_src_dir.as_deref(), &agent_agents_dir)
         .await?;
+    drop(zip_extract_guard);
 
     // 5. 按 skill_names 差集清理 (保留含 .dynamic_add.lock 的)。
     //    None = 客户端未传 skillNames → 跳过 prune (防止空 keep 集误清整个 store)
@@ -576,6 +584,120 @@ mod tests {
                 "{dir}/skills linked in session"
             );
         }
+        drop(fs::remove_dir_all(&tmp).await);
+    }
+
+    // ===== F04：上传 agents 源的消费窗口与文件型条目 =====
+
+    fn zip_with_agents(agent_file_body: &str) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut archive = zip::ZipWriter::new(&mut buf);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        archive.start_file("agents/researcher.md", options).unwrap();
+        archive.write_all(agent_file_body.as_bytes()).unwrap();
+        archive.finish().unwrap();
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn uploaded_agents_are_consumed_before_temp_cleanup_and_file_targets_replace() {
+        // F04：guard 存活到 update_agents_dir 之后——agents/*.md 实际入 store；
+        // 同名 .md 旧文件（非目录）替换不再走 remove_dir_all
+        let tmp = std::env::temp_dir().join(format!(
+            "fs_f04_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).await.unwrap();
+        let user_root = tmp.join("root").join("u1");
+        let session_ws = user_root.join("s1");
+        let zip_path = tmp.join("upload.zip");
+        fs::write(&zip_path, zip_with_agents("agent v1"))
+            .await
+            .unwrap();
+
+        let result = create_workspace_with_agent_store(CreateAgentStoreParams {
+            user_root: &user_root,
+            session_workspace: &session_ws,
+            agent_id: "agent-a",
+            skill_zip: Some(&zip_path),
+            skill_urls: Vec::new(),
+            skill_url_map: None,
+            skill_names: None,
+            update_skill_names: None,
+            hook_config: None,
+            downloader: None,
+            shared_project_id: None,
+        })
+        .await
+        .expect("first upload");
+        assert!(result.failed_skills.is_empty());
+        let agents_dir = user_root
+            .join(".agent-store")
+            .join("agent-a")
+            .join("agents");
+        assert_eq!(
+            fs::read_to_string(agents_dir.join("researcher.md"))
+                .await
+                .unwrap(),
+            "agent v1",
+            "agents 文件必须真实进入 store（修复前 guard 提前析构 → 假成功）"
+        );
+
+        // 同名 .md 更新（旧目标是文件，非目录）
+        fs::write(&zip_path, zip_with_agents("agent v2"))
+            .await
+            .unwrap();
+        create_workspace_with_agent_store(CreateAgentStoreParams {
+            user_root: &user_root,
+            session_workspace: &session_ws,
+            agent_id: "agent-a",
+            skill_zip: Some(&zip_path),
+            skill_urls: Vec::new(),
+            skill_url_map: None,
+            skill_names: None,
+            update_skill_names: None,
+            hook_config: None,
+            downloader: None,
+            shared_project_id: None,
+        })
+        .await
+        .expect("second upload");
+        assert_eq!(
+            fs::read_to_string(agents_dir.join("researcher.md"))
+                .await
+                .unwrap(),
+            "agent v2",
+            "同名 .md 覆盖更新必须成功"
+        );
+        drop(fs::remove_dir_all(&tmp).await);
+    }
+
+    #[tokio::test]
+    async fn vanished_agents_source_fails_instead_of_fake_success() {
+        // F04：显式给出的源丢失必须失败（不再当无输入跳过假成功）
+        let tmp = std::env::temp_dir().join(format!(
+            "fs_f04src_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dest = tmp.join("dest");
+        fs::create_dir_all(&dest).await.unwrap();
+        let missing = tmp.join("missing-agents");
+        let result = crate::service::agent_store::update_agents_dir(Some(&missing), &dest).await;
+        assert!(result.is_err(), "源丢失必须报错");
+        // None = 无输入：合法跳过
+        assert!(
+            crate::service::agent_store::update_agents_dir(None, &dest)
+                .await
+                .is_ok()
+        );
         drop(fs::remove_dir_all(&tmp).await);
     }
 }
