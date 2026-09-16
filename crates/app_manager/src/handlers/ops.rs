@@ -137,6 +137,11 @@ pub async fn stop_app(
         content = StartAppRequest,
         description = "user_id 必填；其余可选——空对象 = 传统 rollout restart。带 url = 部署新版本（等待边界同 start：部署段完成 + SQL 执行，服务启动异步可见，成功 ≠ 立即接流量）；其余字段语义同 start"
     ),
+    description = r#"
+- If another operation holds the lock, this request is rejected without waiting
+  for that operation to finish and is not queued (envelope: HTTP 200 with
+  success=false and code ERR_CONFLICT). Retry later after checking application state.
+"#,
     responses(
         (status = 200, description = "重启/部署成功（部署 = 制品已部署 + SQL 已执行，服务启动中）", body = HttpResult<StartAppResult>)
     ),
