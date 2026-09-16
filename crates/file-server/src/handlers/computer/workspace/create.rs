@@ -218,6 +218,18 @@ pub(crate) async fn create_workspace_v2(
             .ok()
     });
 
+    // F01：清单名/agent ID 在任何目录操作前校验（含分隔符或点段的名字会
+    // 把后续 store/视图的删除与写入解析到受管目录之外）
+    if let Some(agent_id) = agent_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        crate::service::agent_store::validate_store_segment("agent id", agent_id)?;
+    }
+    for name in skill_names.iter().flatten() {
+        crate::service::agent_store::validate_store_segment("skill name", name)?;
+    }
+    for name in update_skill_names.iter().flatten() {
+        crate::service::agent_store::validate_store_segment("skill name", name)?;
+    }
+
     // 绑定目录优先于默认定位; create_dir_all 即 TS ensureWorkspaceDir 绑定分支
     // (不存在则递归创建, 对齐 TS 1.4.5)
     let ws = ws_path(

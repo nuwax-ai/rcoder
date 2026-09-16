@@ -24,6 +24,30 @@ use crate::error::AppResult;
 
 const DYNAMIC_ADD_LOCK: &str = ".dynamic_add.lock";
 
+/// F01 数据保护：skill/subagent 名、agent ID、项目 ID 在 store/共享视图中只允许
+/// 作为**单一路径段**参与 join——含分隔符、`.`/`..` 点段或绝对前缀的名字会把
+/// 删除/写入/链接目标解析到受管目录之外（如清单项 `../../victim` 在视图校准
+/// "实体缺失清孤儿链"分支触发工作区外的递归删除）。
+///
+/// 判定用 [`std::path::Path::components`] 的平台原生归一化：恰好一个
+/// [`std::path::Component::Normal`] 才放行——`.` 被归一成 CurDir、`..` 成
+/// ParentDir、前导 `/` 成 RootDir、Windows 下 `\` 分隔与 `C:` 盘符各成对应
+/// Component，全部不满足"单 Normal 段"（容器内 Linux 运行时 `a\b`、`a:b`
+/// 是合法单段文件名，不误伤；NUL 在任何平台都不是合法路径字节，显式拒绝）。
+/// 所有写/prune/链接入口必须先过本校验；持久 manifest 读回同样校验。
+pub fn validate_store_segment(kind: &str, value: &str) -> AppResult<()> {
+    let mut components = Path::new(value).components();
+    let single_normal_segment = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !single_normal_segment || value.contains('\0') {
+        return Err(crate::error::AppError::validation(format!(
+            "invalid {kind} {value:?}: must be a single normalized path segment \
+             (no separators, dot segments, or absolute prefixes)"
+        )));
+    }
+    Ok(())
+}
+
 /// 智能体级实体存储路径: `{user_root}/.agent-store/{agent_id}`。
 ///
 /// `user_root` = 会话工作区的父目录 (该 user 的稳定根), 两种 resolver 模式下均成立:
@@ -40,8 +64,9 @@ const DYNAMIC_ADD_LOCK: &str = ".dynamic_add.lock";
 ///
 /// store 与会话工作区 (`{user_root}/{cId}`) 同属一棵树, 相对软链可跨节点解析。
 /// ⚠️ 不要从工作区叶子路径倒推多级父目录 — subvolumePath 深度不定。
-pub fn agent_store_path(user_root: &Path, agent_id: &str) -> PathBuf {
-    user_root.join(".agent-store").join(agent_id)
+pub fn agent_store_path(user_root: &Path, agent_id: &str) -> AppResult<PathBuf> {
+    validate_store_segment("agent id", agent_id)?;
+    Ok(user_root.join(".agent-store").join(agent_id))
 }
 
 /// 跨 agent store 链接冲突检测（共享工作区防线，见 [`link_workspace_to_agent_store`]）。
@@ -85,7 +110,7 @@ pub async fn ensure_agent_store_dirs(
     user_root: &Path,
     agent_id: &str,
 ) -> AppResult<(PathBuf, PathBuf)> {
-    let store = agent_store_path(user_root, agent_id);
+    let store = agent_store_path(user_root, agent_id)?;
     let skills_dir = store.join("skills");
     let agents_dir = store.join("agents");
     fs::create_dir_all(&skills_dir).await?;
@@ -170,6 +195,9 @@ pub async fn install_skill_dir(
     skill_name: &str,
     as_dynamic: bool,
 ) -> AppResult<()> {
+    // F01：名字先校验再 join——`../..` 会把"删旧目标"的 remove_dir_all
+    // 解析到 store 之外
+    validate_store_segment("skill name", skill_name)?;
     let dest = dest_skills_dir.join(skill_name);
     // 删旧目标 (同名覆盖, NotFound 安全)
     match fs::remove_dir_all(&dest).await {
@@ -447,10 +475,11 @@ const VIEW_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(20
 /// 项目级协调目录（normalProject）：`{user_root}/.agent-store/np-{project_id}`。
 /// 仅存放 manifest.json 引用表与 .view.lock 视图锁，不存技能实体——同一
 /// agent 的实体全局一份（`agent_store_path`），跨项目复用。
-pub fn project_store_root(user_root: &Path, project_id: &str) -> PathBuf {
-    user_root
+pub fn project_store_root(user_root: &Path, project_id: &str) -> AppResult<PathBuf> {
+    validate_store_segment("project id", project_id)?;
+    Ok(user_root
         .join(".agent-store")
-        .join(format!("np-{project_id}"))
+        .join(format!("np-{project_id}")))
 }
 
 /// manifest 引用表：agents → {skills, subagents}。
@@ -470,19 +499,39 @@ pub struct SkillViewEntry {
 }
 
 /// 读 manifest；文件不存在 → 空表（新项目）；存在但损坏 → 报错（见模块注释）。
+/// 解析成功后校验所有 agent ID 与名字为合法单路径段（F01）——被污染的
+/// manifest 名字会在视图校准中被 join 后删除/链接，读回时必须拒绝。
 async fn read_manifest(project_store_root: &Path) -> AppResult<SkillViewManifest> {
     let path = project_store_root.join(MANIFEST_FILE);
-    match fs::read_to_string(&path).await {
-        Ok(raw) if raw.trim().is_empty() => Ok(SkillViewManifest::default()),
-        Ok(raw) => serde_json::from_str(&raw).map_err(|error| {
+    let raw = match fs::read_to_string(&path).await {
+        Ok(raw) if raw.trim().is_empty() => return Ok(SkillViewManifest::default()),
+        Ok(raw) => raw,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(SkillViewManifest::default()),
+        Err(e) => return Err(e.into()),
+    };
+    let manifest: SkillViewManifest = serde_json::from_str(&raw).map_err(|error| {
+        crate::error::AppError::system(format!(
+            "skill view manifest is corrupt at {}: {error}",
+            path.display()
+        ))
+    })?;
+    for (agent_id, entry) in &manifest.agents {
+        validate_store_segment("agent id", agent_id).map_err(|_| {
             crate::error::AppError::system(format!(
-                "skill view manifest is corrupt at {}: {error}",
+                "skill view manifest at {} contains an invalid agent id",
                 path.display()
             ))
-        }),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(SkillViewManifest::default()),
-        Err(e) => Err(e.into()),
+        })?;
+        for name in entry.skills.iter().chain(entry.subagents.iter()) {
+            validate_store_segment("skill name", name).map_err(|_| {
+                crate::error::AppError::system(format!(
+                    "skill view manifest at {} contains an invalid entry name",
+                    path.display()
+                ))
+            })?;
+        }
     }
+    Ok(manifest)
 }
 
 /// 原子写 manifest（tmp + rename），视图锁内调用。
@@ -627,7 +676,15 @@ pub async fn sync_shared_skill_view(
     project_id: &str,
     lists: SharedSkillLists,
 ) -> AppResult<()> {
-    let store_root = project_store_root(user_root, project_id);
+    // F01：清单名字在任何写/链接前校验（单一路径段）——`../../victim` 这类
+    // 名字会在后续视图校准中 join 成受管范围外的删除/链接目标
+    for name in lists.skills.iter().flatten() {
+        validate_store_segment("skill name", name)?;
+    }
+    for name in lists.subagents.iter().flatten() {
+        validate_store_segment("subagent name", name)?;
+    }
+    let store_root = project_store_root(user_root, project_id)?;
     fs::create_dir_all(&store_root).await?;
     let _guard = ViewGuard::acquire(&store_root).await?;
 
@@ -751,15 +808,21 @@ async fn calibrate_view_entries(
         let mut candidates: Vec<String> = vec![agent_id.to_string()];
         candidates.extend(sources.iter().cloned());
         let mut seen = std::collections::BTreeSet::new();
-        let store_path = candidates
+        let mut store_path: Option<PathBuf> = None;
+        for candidate in candidates
             .into_iter()
             .filter(|candidate| seen.insert(candidate.clone()))
-            .find_map(|candidate| {
-                let path = agent_store_path(user_root, &candidate)
-                    .join(kind.store_sub())
-                    .join(name);
-                path.exists().then_some(path)
-            });
+        {
+            // agent_store_path 内含单路径段校验（F01）；manifest/入口已校验过，
+            // 这里失败即数据异常，按错误上抛而非静默跳过
+            let path = agent_store_path(user_root, &candidate)?
+                .join(kind.store_sub())
+                .join(name);
+            if path.exists() {
+                store_path = Some(path);
+                break;
+            }
+        }
         let Some(store_path) = store_path else {
             remove_any_if_exists(&link_path).await?;
             continue;
@@ -791,7 +854,7 @@ async fn link_dynamic_skills(
     owners.extend(manifest.agents.keys().cloned());
     let mut seen = std::collections::BTreeSet::new();
     for owner in owners.into_iter().filter(|o| seen.insert(o.clone())) {
-        let owner_skills = agent_store_path(user_root, &owner).join("skills");
+        let owner_skills = agent_store_path(user_root, &owner)?.join("skills");
         let mut rd = match fs::read_dir(&owner_skills).await {
             Ok(rd) => rd,
             Err(_) => continue,
@@ -1180,7 +1243,7 @@ mod tests {
             "并集视图同时含两 agent 技能"
         );
         // manifest 记录两 agent 引用
-        let manifest = read_manifest(&project_store_root(&user_root, "proj"))
+        let manifest = read_manifest(&project_store_root(&user_root, "proj").unwrap())
             .await
             .unwrap();
         assert_eq!(manifest.agents.len(), 2);
@@ -1363,7 +1426,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let manifest = read_manifest(&project_store_root(&user_root, "proj"))
+        let manifest = read_manifest(&project_store_root(&user_root, "proj").unwrap())
             .await
             .unwrap();
         // TS 同款：同步者条目无条件落盘（空清单条目无引用，无害），但引用集
@@ -1393,7 +1456,7 @@ mod tests {
         let user_root = tmp.path().join("u1");
         let workspace = tmp.path().join("ws");
         fs::create_dir_all(&workspace).await.unwrap();
-        let store_root = project_store_root(&user_root, "proj");
+        let store_root = project_store_root(&user_root, "proj").unwrap();
         fs::create_dir_all(&store_root).await.unwrap();
         fs::write(store_root.join(MANIFEST_FILE), "{ not json")
             .await
@@ -1429,9 +1492,13 @@ mod tests {
         .await
         .unwrap();
         // 实体被外部删除（各 agent prune 已清）；引用还在 → 孤儿链清理
-        fs::remove_dir_all(agent_store_path(&user_root, "agent-a").join("skills/alpha"))
-            .await
-            .unwrap();
+        fs::remove_dir_all(
+            agent_store_path(&user_root, "agent-a")
+                .unwrap()
+                .join("skills/alpha"),
+        )
+        .await
+        .unwrap();
         sync_shared_skill_view(
             &user_root,
             &workspace,
@@ -1445,5 +1512,137 @@ mod tests {
             view_entry_names(&workspace, "skills").await.is_empty(),
             "实体全缺时清孤儿链"
         );
+    }
+
+    // ===== F01 数据保护回归：清单名/ID 路径穿越必须在任何写/删除前被拒绝 =====
+
+    #[test]
+    fn validate_store_segment_rejects_traversal_and_accepts_normal_names() {
+        // 平台原生 components() 判定：点段/分隔符/绝对前缀一律非"单 Normal 段"。
+        // 注：尾部 `.`/`/` 被归一化掉（"a/." ≡ "a"，join 等价、无逃逸）。
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "../../victim",
+            "./a",
+            "/absolute",
+            "a\0b",
+        ] {
+            assert!(
+                validate_store_segment("skill name", bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+        // Windows 分隔符/盘符在 win 构建下由 components() 识别为多段/前缀；
+        // 容器内 Linux 运行时它们是合法单段文件名，不放进来回测试
+        #[cfg(windows)]
+        for bad in ["a\\b", "..\\..\\victim", "C:evil"] {
+            assert!(
+                validate_store_segment("skill name", bad).is_err(),
+                "must reject {bad:?} on Windows"
+            );
+        }
+        for ok in ["alpha", "my-skill_1.2", "技能", "sub agent name"] {
+            assert!(
+                validate_store_segment("skill name", ok).is_ok(),
+                "must accept {ok:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn install_skill_dir_rejects_escaping_name_without_touching_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_root = tmp.path().join("u1");
+        // 受害目录在 store 同层（= dest_skills_dir/../../victim 解析目标）
+        let victim = tmp.path().join("victim");
+        fs::create_dir_all(&victim).await.unwrap();
+        fs::write(victim.join("data.txt"), "keep").await.unwrap();
+
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).await.unwrap();
+        let skills_dir = user_root
+            .join(".agent-store")
+            .join("agent-a")
+            .join("skills");
+        fs::create_dir_all(&skills_dir).await.unwrap();
+
+        let result = install_skill_dir(&src, &skills_dir, "../../victim", false).await;
+        assert!(result.is_err(), "escaping skill name must be rejected");
+        assert_eq!(
+            fs::read_to_string(victim.join("data.txt")).await.unwrap(),
+            "keep",
+            "受害者目录内容必须原样保留"
+        );
+    }
+
+    #[tokio::test]
+    async fn poisoned_manifest_name_is_rejected_and_deletes_nothing() {
+        // 恶意/损坏清单：名字为 `../../victim`——修复前会在视图校准
+        // "实体缺失清孤儿链"分支把它 join 后递归删除工作区外目录
+        let tmp = tempfile::tempdir().unwrap();
+        let user_root = tmp.path().join("u1");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).await.unwrap();
+        let victim = tmp.path().join("victim");
+        fs::create_dir_all(&victim).await.unwrap();
+        fs::write(victim.join("data.txt"), "keep").await.unwrap();
+
+        let store_root = project_store_root(&user_root, "proj").unwrap();
+        fs::create_dir_all(&store_root).await.unwrap();
+        fs::write(
+            store_root.join(MANIFEST_FILE),
+            r#"{"agents":{"agent-a":{"skills":["../../victim"],"subagents":[]}}}"#,
+        )
+        .await
+        .unwrap();
+
+        let result = sync_shared_skill_view(
+            &user_root,
+            &workspace,
+            "agent-a",
+            "proj",
+            SharedSkillLists::default(),
+        )
+        .await;
+        assert!(result.is_err(), "被污染 manifest 必须整体拒绝");
+        assert_eq!(
+            fs::read_to_string(victim.join("data.txt")).await.unwrap(),
+            "keep",
+            "受管范围外目录必须原样保留"
+        );
+    }
+
+    #[tokio::test]
+    async fn malicious_skill_names_rejected_at_service_entry_without_mutation() {
+        // create-workspace-v2 全链入口级防线：恶意 skillNames 在任何目录
+        // 创建/写入前被 400 拒绝
+        let tmp = tempfile::tempdir().unwrap();
+        let user_root = tmp.path().join("u1");
+        let session_workspace = user_root.join("ws");
+        let result = crate::service::computer_ws::create_workspace_with_agent_store(
+            crate::service::computer_ws::CreateAgentStoreParams {
+                user_root: &user_root,
+                session_workspace: &session_workspace,
+                agent_id: "agent-a",
+                skill_zip: None,
+                skill_urls: Vec::new(),
+                skill_url_map: None,
+                skill_names: Some(vec!["../../victim".to_string()]),
+                update_skill_names: None,
+                hook_config: None,
+                downloader: None,
+                shared_project_id: None,
+            },
+        )
+        .await;
+        assert!(result.is_err(), "恶意 skillNames 必须被拒绝");
+        assert!(
+            !session_workspace.exists(),
+            "校验失败不得留下任何已创建目录"
+        );
+        assert!(!user_root.join(".agent-store").exists(), "store 不得被创建");
     }
 }

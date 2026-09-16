@@ -61,6 +61,28 @@ pub async fn create_workspace_with_agent_store(
     } = params;
     let start = std::time::Instant::now();
 
+    // F01 数据保护：agent ID 与技能清单名在任何写/删除/链接前校验为合法
+    // 单一路径段——含分隔符/点段的名字（`../../victim`）会把 store/视图操作
+    // 解析到受管目录之外（递归删除业务目录、越界写入）
+    crate::service::agent_store::validate_store_segment("agent id", agent_id)?;
+    for name in skill_names.iter().flatten() {
+        crate::service::agent_store::validate_store_segment("skill name", name)?;
+    }
+    for name in update_skill_names.iter().flatten() {
+        crate::service::agent_store::validate_store_segment("skill name", name)?;
+    }
+    if let Some(project_id) = shared_project_id {
+        crate::service::agent_store::validate_store_segment("project id", project_id)?;
+    }
+    for skill_name in skill_url_map
+        .as_ref()
+        .map(|m| m.keys())
+        .into_iter()
+        .flatten()
+    {
+        crate::service::agent_store::validate_store_segment("skill name", skill_name)?;
+    }
+
     // 会话工作区 (显式传入: 默认布局 = user_root/{cid}, 绑定布局 = 绑定目录)
     let session_workspace = session_workspace.to_path_buf();
     fs::create_dir_all(&session_workspace).await?;
