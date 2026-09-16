@@ -150,7 +150,9 @@ def render(c, images, password, registry_auth=None):
             'volumes': [{'name': 'config', 'configMap': {'name': config_name}}, {'name': 'logs', 'emptyDir': {}}] +
                        [{'name': n, 'persistentVolumeClaim': {'claimName': n}} for n in ['workspace', 'computer-workspace', 'cephfs-root']]}}}, api='apps/v1')
     obj('Service', 'rcoder', {'type': 'NodePort', 'selector': {'app': 'rcoder', **labels},
-         'ports': [{'name': 'http', 'port': 8086, 'targetPort': 'http', 'nodePort': c.nodeport}]})
+         'ports': [{'name': 'http', 'port': 8086, 'targetPort': 'http', 'nodePort': c.nodeport},
+                   # pingora 流量代理口（HTTPRoute /api/v1/userapp/proxy/* → 此口）
+                   {'name': 'proxy', 'port': 8088, 'targetPort': 'proxy'}]})
     obj('CiliumGatewayClassConfig', 'rcoder', {'service': {'type': 'NodePort'}}, api='cilium.io/v2alpha1')
     obj('GatewayClass', c.ns, {'controllerName': 'io.cilium/gateway-controller',
          'parametersRef': {'group': 'cilium.io', 'kind': 'CiliumGatewayClassConfig', 'name': 'rcoder', 'namespace': c.ns}},
