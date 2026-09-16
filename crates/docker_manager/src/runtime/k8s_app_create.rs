@@ -870,7 +870,24 @@ mod conditional_tests {
                 app_id:"fence".into(),lifecycle_id:"old-life".into(),operation_id:"update-one".into(),executor_id:"executor-one".into(),request_fingerprint:"a".repeat(64),
             }).build();
             let result = runtime.write_app_resources("fence", &params, None, None, HttpExpose::Pingora, Some("71")).await;
-            assert!(matches!(result, Err(ContainerRuntimeError::Conflict(ref message)) if message.contains("lifecycle-id")), "old lifecycle must be rejected at preflight: {result:?}");
+            // 捕获阶段的身份核验拒绝以 CreationAborted 结构化上抛：失败阶段 =
+            // Capture（先于一切资源副作用）、definitive_rejection、无遗留幂等
+            // 资源；根因 Conflict 指明 lifecycle-id 漂移。
+            assert!(
+                matches!(
+                    &result,
+                    Err(ContainerRuntimeError::CreationAborted { progress, source })
+                        if progress.failed_at == container_runtime_api::CreationStage::Capture
+                            && progress.definitive_rejection
+                            && progress.retained_idempotent_resources.is_empty()
+                            && matches!(
+                                source.as_ref(),
+                                ContainerRuntimeError::Conflict(message)
+                                    if message.contains("lifecycle-id")
+                            )
+                ),
+                "old lifecycle must be rejected at capture, before any resource effects: {result:?}"
+            );
             server.await.expect("request assertions");
         }).await.expect("bounded update identity scenario");
     }

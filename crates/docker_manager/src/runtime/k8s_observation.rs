@@ -282,6 +282,152 @@ pub(crate) async fn await_pod_verdict<T: Clone>(
     }
 }
 
+/// Builder 控制的双资源观察事件（批次 B）：STS 与 Pod 两条流共用一个
+/// deadline/cancel/退避边界；`PodAbsent` 表达 stop 语义下的 Pod 消失完成
+/// （watcher Delete 事件；readiness 单对象观察里它是"等待重建"，这里由
+/// 业务判定决定含义——观察层只投递事实）。
+#[cfg(feature = "kubernetes")]
+pub(crate) enum BuilderWatchEvent<'a> {
+    Sts(&'a k8s_openapi::api::apps::v1::StatefulSet),
+    Pod(&'a Pod),
+    /// Pod 被删除（Delete 事件——仅投递，语义由分类闭包决定）。
+    PodAbsent,
+}
+
+#[cfg(feature = "kubernetes")]
+impl ObservationError {
+    fn from_conflict(message: String) -> Self {
+        ObservationError::Fatal {
+            code: None,
+            message,
+        }
+    }
+}
+
+/// STS + Pod 双流观察（批次 B，plan §3）：
+/// - 两条 watcher 流（各自 field_selector 锁名）在同一 future 的
+///   deadline/cancel 边界内消费；任一流暂态错误共享同一退避（B07 语义）；
+/// - 分类闭包产出 `Ok(Verdict)` 或 `Err(String)`（身份/replicas 冲突 →
+///   Fatal 快速失败，绝不视为暂态重试）；
+/// - 完成候选的**最后 GET 复核**由调用方执行（本函数不提供跨对象事务，
+///   也不授权任何写/租约释放——KR06）。
+#[cfg(feature = "kubernetes")]
+pub(crate) async fn await_builder_verdict<T: Clone>(
+    sts_api: &kube::Api<k8s_openapi::api::apps::v1::StatefulSet>,
+    sts_name: &str,
+    pod_api: &kube::Api<Pod>,
+    pod_name: &str,
+    deadline: Instant,
+    cancel: tokio_util::sync::CancellationToken,
+    mut classify: impl FnMut(BuilderWatchEvent<'_>) -> Result<Verdict<T>, String>,
+) -> Result<Verdict<T>, ObservationError> {
+    let sts_config = watcher::Config::default()
+        .fields(&format!("metadata.name={sts_name}"))
+        .timeout(290);
+    let pod_config = watcher::Config::default()
+        .fields(&format!("metadata.name={pod_name}"))
+        .timeout(290);
+    let sts_stream = watcher(sts_api.clone(), sts_config);
+    let pod_stream = watcher(pod_api.clone(), pod_config);
+    tokio::pin!(sts_stream);
+    tokio::pin!(pod_stream);
+    let mut last_transient: Option<String> = None;
+    let mut pending_backoff: Option<std::time::Duration> = None;
+    let mut next_backoff = BACKOFF_INITIAL;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| ObservationError::Deadline {
+                last_transient: last_transient.clone(),
+            })?;
+        if let Some(backoff) = pending_backoff.take() {
+            // B07 同源纪律：退避窗口只等待，不 poll 任何一条流
+            let wait = std::cmp::min(backoff, remaining);
+            tokio::select! {
+                () = cancel.cancelled() => return Err(ObservationError::Cancelled),
+                _ = tokio::time::sleep(wait) => {}
+            }
+            continue;
+        }
+        let event = tokio::select! {
+            () = cancel.cancelled() => return Err(ObservationError::Cancelled),
+            _ = tokio::time::sleep(remaining) => {
+                return Err(ObservationError::Deadline { last_transient });
+            }
+            event = sts_stream.next() => event.map(|inner| inner.map(wrap_sts)),
+            event = pod_stream.next() => event.map(|inner| inner.map(wrap_pod)),
+        };
+        let Some(event) = event else {
+            return Err(ObservationError::StreamEnded {
+                message: "builder workload watcher terminated before a verdict".into(),
+            });
+        };
+        match event {
+            Ok(Some(wrapped)) => match classify(wrapped.as_ref()) {
+                Ok(Verdict::Complete(value)) => return Ok(Verdict::Complete(value)),
+                Ok(Verdict::Rejected(reason)) => return Ok(Verdict::Rejected(reason)),
+                Ok(Verdict::Pending) => {}
+                Err(conflict) => return Err(ObservationError::from_conflict(conflict)),
+            },
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(fatal) = ObservationError::from_watcher(&error) {
+                    return Err(fatal);
+                }
+                last_transient = Some(error.to_string());
+                pending_backoff = Some(next_backoff);
+                next_backoff = std::cmp::min(
+                    std::time::Duration::from_secs_f64(next_backoff.as_secs_f64() * 2.0),
+                    BACKOFF_MAX,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "kubernetes")]
+fn wrap_sts(
+    event: watcher::Event<k8s_openapi::api::apps::v1::StatefulSet>,
+) -> Option<BuilderWatchEventOwned> {
+    match event {
+        watcher::Event::Apply(obj) | watcher::Event::InitApply(obj) => {
+            Some(BuilderWatchEventOwned::Sts(Box::new(obj)))
+        }
+        watcher::Event::Delete(_) => None,
+        watcher::Event::Init | watcher::Event::InitDone => None,
+    }
+}
+
+#[cfg(feature = "kubernetes")]
+fn wrap_pod(event: watcher::Event<Pod>) -> Option<BuilderWatchEventOwned> {
+    match event {
+        watcher::Event::Apply(obj) | watcher::Event::InitApply(obj) => {
+            Some(BuilderWatchEventOwned::Pod(Box::new(obj)))
+        }
+        watcher::Event::Delete(_) => Some(BuilderWatchEventOwned::PodAbsent),
+        watcher::Event::Init | watcher::Event::InitDone => None,
+    }
+}
+
+/// 分类闭包入参的 owned 形态（select 分支需要拥有对象再借出）。
+#[cfg(feature = "kubernetes")]
+enum BuilderWatchEventOwned {
+    Sts(Box<k8s_openapi::api::apps::v1::StatefulSet>),
+    Pod(Box<Pod>),
+    PodAbsent,
+}
+
+#[cfg(feature = "kubernetes")]
+impl BuilderWatchEventOwned {
+    fn as_ref(&self) -> BuilderWatchEvent<'_> {
+        match self {
+            BuilderWatchEventOwned::Sts(obj) => BuilderWatchEvent::Sts(obj.as_ref()),
+            BuilderWatchEventOwned::Pod(obj) => BuilderWatchEvent::Pod(obj.as_ref()),
+            BuilderWatchEventOwned::PodAbsent => BuilderWatchEvent::PodAbsent,
+        }
+    }
+}
+
 #[cfg(all(test, feature = "kubernetes"))]
 #[path = "k8s_observation_tests.rs"]
 mod observation_contract_tests;

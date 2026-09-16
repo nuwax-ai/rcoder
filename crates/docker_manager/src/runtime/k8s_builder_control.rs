@@ -221,132 +221,284 @@ impl KubernetesRuntime {
         }
         // Only observation is time bounded. A timeout never authorizes lease
         // release; the caller records an uncertain operation for reconciliation.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-        tokio::time::timeout_at(deadline, async {
-            loop {
-                let current = sts_api
-                    .get(&workload.name)
-                    .await
-                    .map_err(|error| api_error("Observe builder workload", error))?;
-                let identity = workload_identity_with_binding(
-                    &current,
-                    &target.context,
-                    target.resource_binding.as_ref(),
-                    false,
-                )?;
-                if identity.uid != workload.uid {
-                    return Err(Error::Conflict(
-                        "Builder workload replaced during control".into(),
-                    ));
-                }
-                if only_start
-                    && current
-                        .spec
-                        .as_ref()
-                        .and_then(|spec| spec.replicas)
-                        .unwrap_or(1)
-                        != 1
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let pod_name = self.agent_pod_name(&target.context.app_id, &ServiceType::UserappBuilder)?;
+        // 批次 B（plan §3）：STS + Pod 双资源 watch 观察——两条流共享总
+        // deadline/退避边界；身份/replicas 冲突快速失败；完成候选由下方
+        // 最后 GET 复核（观察不提供跨对象事务，也不授权任何写或租约释放，
+        // KR06）。同一 Pod 删除后重现（同 UID）回到观察，不放大预算。
+        loop {
+            let observed = {
+                let workload = workload.clone();
+                let sts_name = workload.name.clone();
+                let context = target.context.clone();
+                let binding = target.resource_binding.clone();
+                let captured_pod = target.pod.clone();
+                match super::k8s_observation::await_builder_verdict(
+                    &sts_api,
+                    &sts_name,
+                    &pods,
+                    &pod_name,
+                    deadline,
+                    tokio_util::sync::CancellationToken::new(),
+                    move |event| {
+                        builder_verdict(
+                            event,
+                            &workload,
+                            &context,
+                            binding.as_ref(),
+                            captured_pod.as_ref(),
+                            restart,
+                            only_start,
+                        )
+                    },
+                )
+                .await
                 {
-                    return Err(Error::Conflict(
-                        "Builder replicas changed while waking".into(),
-                    ));
-                }
-                if !restart && current.spec.as_ref().and_then(|spec| spec.replicas) != Some(0) {
-                    return Err(Error::Conflict(
-                        "Builder replicas changed while stopping".into(),
-                    ));
-                }
-                let name =
-                    self.agent_pod_name(&target.context.app_id, &ServiceType::UserappBuilder)?;
-                match pods.get(&name).await {
-                    Err(kube::Error::Api(error)) if error.code == 404 && !restart => {
-                        return Ok(None);
+                    Ok(super::k8s_observation::Verdict::Complete(outcome)) => outcome,
+                    Ok(super::k8s_observation::Verdict::Rejected(reason)) => {
+                        return Err(Error::Conflict(reason));
                     }
-                    Err(kube::Error::Api(error)) if error.code == 404 => {}
-                    Err(error) => return Err(api_error("Observe controlled builder pod", error)),
-                    Ok(pod) => {
-                        let observed = pod_identity(&pod, workload)?;
-                        if restart {
-                            if !only_start
-                                && target
-                                    .pod
-                                    .as_ref()
-                                    .is_some_and(|old| old.uid == observed.uid)
-                            {
-                                tokio::time::sleep(Duration::from_millis(200)).await;
+                    Ok(super::k8s_observation::Verdict::Pending) => {
+                        return Err(Error::K8sError(
+                            "Builder observation ended while pending".into(),
+                        ));
+                    }
+                    Err(error) => return Err(observation_error(error)),
+                }
+            };
+            match observed {
+                BuilderObservation::Stopped => {
+                    // 复核①：Pod 确已消失。同 UID 重现回到观察（STS 控制器
+                    // 仍在终止窗口），异 UID 视为替换冲突。
+                    match pods.get(&pod_name).await {
+                        Err(kube::Error::Api(error)) if error.code == 404 => {}
+                        Err(error) => {
+                            return Err(api_error("Verify stopped builder pod", error));
+                        }
+                        Ok(pod) => {
+                            let seen = pod_identity(&pod, workload)
+                                .map_err(|error| Error::Conflict(error.to_string()))?;
+                            if target.pod.as_ref().is_some_and(|old| old.uid == seen.uid) {
                                 continue;
                             }
-                            if pod.metadata.deletion_timestamp.is_none()
-                                && pod
-                                    .status
-                                    .as_ref()
-                                    .and_then(|status| status.conditions.as_ref())
-                                    .is_some_and(|conditions| {
-                                        conditions.iter().any(|condition| {
-                                            condition.type_ == "Ready" && condition.status == "True"
-                                        })
-                                    })
-                            {
-                                let endpoint =
-                                    super::k8s_builder_deletion::workspace_endpoint_from_bound_pod(
-                                        &pod,
-                                        workload,
-                                        &target.context,
-                                        target.resource_binding.as_ref(),
-                                    )?;
-                                let created_at = pod
-                                    .metadata
-                                    .creation_timestamp
-                                    .as_ref()
-                                    .ok_or_else(|| {
-                                        Error::ConfigurationError(
-                                            "Builder pod creation time is missing".into(),
-                                        )
-                                    })?
-                                    .0;
-                                let created_at = chrono::DateTime::from_timestamp(
-                                    created_at.as_second(),
-                                    created_at.subsec_nanosecond() as u32,
-                                )
-                                .ok_or_else(|| {
-                                    Error::ConfigurationError(
-                                        "Builder pod creation time is out of range".into(),
-                                    )
-                                })?;
-                                return Ok(Some(ContainerBasicInfo {
-                                    container_id: endpoint.container_id,
-                                    container_name: name,
-                                    container_ip: endpoint.address.to_string(),
-                                    internal_port: shared_types::GRPC_DEFAULT_PORT,
-                                    external_port: 0,
-                                    project_id: target.context.app_id.clone(),
-                                    status: "Running".into(),
-                                    created_at,
-                                    service_url: format!(
-                                        "http://{}:{}",
-                                        endpoint.address,
-                                        shared_types::GRPC_DEFAULT_PORT
-                                    ),
-                                }));
-                            }
-                        } else if target
-                            .pod
-                            .as_ref()
-                            .is_some_and(|old| old.uid != observed.uid)
-                        {
                             return Err(Error::Conflict(
                                 "A replacement builder pod appeared while stopping".into(),
                             ));
                         }
                     }
+                    // 复核②：STS 身份未替换且 replicas 保持 0。
+                    let current = sts_api
+                        .get(&workload.name)
+                        .await
+                        .map_err(|error| api_error("Verify stopped builder workload", error))?;
+                    verify_workload_stable(
+                        &current,
+                        &target.context,
+                        target.resource_binding.as_ref(),
+                        workload,
+                        Some(0),
+                    )
+                    .map_err(rejected_before_write)?;
+                    return Ok(None);
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                BuilderObservation::Ready(boxed) => {
+                    let (info, captured) = *boxed;
+                    // 复核①：完成候选 Pod 仍是同一物理对象（UID 核验）。
+                    let pod = pods
+                        .get(&pod_name)
+                        .await
+                        .map_err(|error| api_error("Verify ready builder pod", error))?;
+                    let seen = pod_identity(&pod, workload)
+                        .map_err(|error| Error::Conflict(error.to_string()))?;
+                    if seen.uid != captured.uid {
+                        return Err(Error::Conflict(
+                            "Builder pod changed between observation and verification".into(),
+                        ));
+                    }
+                    // 复核②：STS 身份未替换（wake 还须 replicas 保持 1）。
+                    let current = sts_api
+                        .get(&workload.name)
+                        .await
+                        .map_err(|error| api_error("Verify ready builder workload", error))?;
+                    verify_workload_stable(
+                        &current,
+                        &target.context,
+                        target.resource_binding.as_ref(),
+                        workload,
+                        only_start.then_some(1),
+                    )
+                    .map_err(rejected_before_write)?;
+                    return Ok(Some(info));
+                }
             }
-        })
-        .await
-        .map_err(|_| {
+        }
+    }
+}
+
+/// 双流观察的业务判定产物（分类闭包的 T）。
+#[derive(Clone)]
+enum BuilderObservation {
+    /// stop 完成：Pod 消失。
+    Stopped,
+    /// Pod 就绪：基本信息 + 观察到它时的物理身份（供最后复核比对）。
+    Ready(Box<(ContainerBasicInfo, BuilderPodIdentity)>),
+}
+
+/// 就绪 Pod → 运行信息（Ready 条件已由调用方核验）。
+fn ready_builder_info(
+    pod: &Pod,
+    workload: &AppResourceIdentity,
+    context: &UserAppExecutionContext,
+    binding: Option<&shared_types::UserAppResourceBinding>,
+) -> std::result::Result<BuilderObservation, String> {
+    let endpoint = super::k8s_builder_deletion::workspace_endpoint_from_bound_pod(
+        pod, workload, context, binding,
+    )
+    .map_err(|error| error.to_string())?;
+    let identity = pod_identity(pod, workload).map_err(|error| error.to_string())?;
+    let created_at = pod
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .ok_or_else(|| "Builder pod creation time is missing".to_string())?
+        .0;
+    let created_at = chrono::DateTime::from_timestamp(
+        created_at.as_second(),
+        created_at.subsec_nanosecond() as u32,
+    )
+    .ok_or_else(|| "Builder pod creation time is out of range".to_string())?;
+    Ok(BuilderObservation::Ready(Box::new((
+        ContainerBasicInfo {
+            container_id: endpoint.container_id,
+            container_name: identity.name.clone(),
+            container_ip: endpoint.address.to_string(),
+            internal_port: shared_types::GRPC_DEFAULT_PORT,
+            external_port: 0,
+            project_id: context.app_id.clone(),
+            status: "Running".into(),
+            created_at,
+            service_url: format!(
+                "http://{}:{}",
+                endpoint.address,
+                shared_types::GRPC_DEFAULT_PORT
+            ),
+        },
+        identity,
+    ))))
+}
+
+/// 双流分类闭包：Err = 身份/配置冲突（Fatal 快速失败）；Ok(Pending) 继续
+/// 观察；Ok(Complete) 给出完成候选（仍需调用方 GET 复核）。
+fn builder_verdict(
+    event: super::k8s_observation::BuilderWatchEvent<'_>,
+    workload: &AppResourceIdentity,
+    context: &UserAppExecutionContext,
+    binding: Option<&shared_types::UserAppResourceBinding>,
+    captured_pod: Option<&BuilderPodIdentity>,
+    restart: bool,
+    only_start: bool,
+) -> std::result::Result<super::k8s_observation::Verdict<BuilderObservation>, String> {
+    match event {
+        super::k8s_observation::BuilderWatchEvent::Sts(current) => {
+            let identity = workload_identity_with_binding(current, context, binding, false)
+                .map_err(|error| error.to_string())?;
+            if identity.uid != workload.uid {
+                return Err("Builder workload replaced during control".into());
+            }
+            if only_start
+                && current
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.replicas)
+                    .unwrap_or(1)
+                    != 1
+            {
+                return Err("Builder replicas changed while waking".into());
+            }
+            if !restart && current.spec.as_ref().and_then(|spec| spec.replicas) != Some(0) {
+                return Err("Builder replicas changed while stopping".into());
+            }
+            Ok(super::k8s_observation::Verdict::Pending)
+        }
+        super::k8s_observation::BuilderWatchEvent::PodAbsent => {
+            if restart {
+                // 旧 Pod 删除是 restart 的前置，等待新 Pod 就绪。
+                Ok(super::k8s_observation::Verdict::Pending)
+            } else {
+                Ok(super::k8s_observation::Verdict::Complete(
+                    BuilderObservation::Stopped,
+                ))
+            }
+        }
+        super::k8s_observation::BuilderWatchEvent::Pod(pod) => {
+            let observed = pod_identity(pod, workload).map_err(|error| error.to_string())?;
+            if restart {
+                if !only_start && captured_pod.is_some_and(|old| old.uid == observed.uid) {
+                    // 旧 Pod 仍在终止窗口——等新 Pod。
+                    return Ok(super::k8s_observation::Verdict::Pending);
+                }
+                if pod.metadata.deletion_timestamp.is_none()
+                    && pod
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.conditions.as_ref())
+                        .is_some_and(|conditions| {
+                            conditions.iter().any(|condition| {
+                                condition.type_ == "Ready" && condition.status == "True"
+                            })
+                        })
+                {
+                    return ready_builder_info(pod, workload, context, binding)
+                        .map(super::k8s_observation::Verdict::Complete);
+                }
+                Ok(super::k8s_observation::Verdict::Pending)
+            } else if captured_pod.is_some_and(|old| old.uid != observed.uid) {
+                Err("A replacement builder pod appeared while stopping".into())
+            } else {
+                Ok(super::k8s_observation::Verdict::Pending)
+            }
+        }
+    }
+}
+
+/// 完成候选后的 STS 复核：身份未替换；`require_replicas` 给出动作方向
+/// （stop=0 / wake=1；restart 不约束 replicas）。
+fn verify_workload_stable(
+    current: &StatefulSet,
+    context: &UserAppExecutionContext,
+    binding: Option<&shared_types::UserAppResourceBinding>,
+    workload: &AppResourceIdentity,
+    require_replicas: Option<i32>,
+) -> std::result::Result<(), String> {
+    let identity = workload_identity_with_binding(current, context, binding, false)
+        .map_err(|error| error.to_string())?;
+    if identity.uid != workload.uid {
+        return Err("Builder workload replaced during control".into());
+    }
+    if let Some(required) = require_replicas
+        && current.spec.as_ref().and_then(|spec| spec.replicas) != Some(required)
+    {
+        return Err("Builder replicas changed after control".into());
+    }
+    Ok(())
+}
+
+/// 观察层结构化错误 → 运行时错误（超时不授权租约释放，仅报告不可确认）。
+fn observation_error(error: super::k8s_observation::ObservationError) -> Error {
+    match error {
+        super::k8s_observation::ObservationError::Deadline { .. } => {
             Error::Timeout("Builder compute confirmation timed out; reconciliation required".into())
-        })?
+        }
+        super::k8s_observation::ObservationError::Cancelled => {
+            Error::Timeout("Builder compute observation cancelled".into())
+        }
+        super::k8s_observation::ObservationError::Fatal { code, message } => {
+            Error::K8sError(format!("Builder observation failed ({code:?}): {message}"))
+        }
+        super::k8s_observation::ObservationError::StreamEnded { message } => {
+            Error::K8sError(format!("Builder observation stream ended: {message}"))
+        }
     }
 }
 
@@ -403,6 +555,236 @@ fn workload_identity(
     context: &UserAppExecutionContext,
 ) -> Result<AppResourceIdentity> {
     workload_identity_with_binding(sts, context, None, false)
+}
+
+/// 语义契约服务器场景：object/ready_pod 为集群状态模板，标志位决定动作
+/// 分支，`patched` 记录成功的 STS PATCH（此后单对象 GET 反映动作后 replicas）。
+#[cfg(test)]
+#[derive(Clone)]
+struct ContractScenario {
+    object: serde_json::Value,
+    ready_pod: serde_json::Value,
+    reject_patch: bool,
+    restart: bool,
+    wake: bool,
+    replaced: bool,
+    patched: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    recorder: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+}
+
+#[cfg(test)]
+impl ContractScenario {
+    fn post_action_replicas(&self) -> i64 {
+        if self.wake { 1 } else { 0 }
+    }
+}
+
+#[cfg(test)]
+async fn handle_contract_connection(mut stream: tokio::net::TcpStream, scenario: ContractScenario) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 4096];
+    let mut headers = String::new();
+    let mut body = Vec::new();
+    loop {
+        let n = stream.read(&mut buffer).await.expect("read");
+        if n == 0 {
+            // 连接池探测/复用半关闭——无请求，丢弃该连接
+            headers.clear();
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..n]);
+        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&bytes[..end]).to_string();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse::<usize>().expect("length"))
+                })
+                .unwrap_or(0);
+            if bytes.len() >= end + 4 + length {
+                headers = head;
+                body = bytes[end + 4..end + 4 + length].to_vec();
+                break;
+            }
+        }
+    }
+    if headers.is_empty() {
+        return;
+    }
+    let first = headers.lines().next().expect("request line");
+    assert!(
+        !first.contains("persistentvolumeclaims") && !first.contains("/services"),
+        "storage/service mutation is fenced: {first}"
+    );
+    scenario.recorder.lock().expect("recorder").push((
+        first.to_string(),
+        headers.clone(),
+        String::from_utf8_lossy(&body).to_string(),
+    ));
+
+    let is_watch = first.contains("watch=true");
+    let (method, path_query) = {
+        let mut parts = first.split_whitespace();
+        (
+            parts.next().expect("method").to_string(),
+            parts.next().expect("path").to_string(),
+        )
+    };
+    let path = path_query.split('?').next().expect("path").to_string();
+
+    // WATCH 流：chunked 开头 + 按场景投递一个触发事件后保持连接
+    if is_watch {
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .await
+            .expect("watch header");
+        let event = if path.ends_with("/statefulsets") {
+            // STS 流：投递当前身份（identity 闸门验证；replicas 已按场景推进）
+            let mut observed = scenario.object.clone();
+            observed["spec"]["replicas"] = serde_json::json!(scenario.post_action_replicas());
+            Some(serde_json::json!({"type":"MODIFIED","object":observed}))
+        } else if scenario.restart || scenario.wake {
+            // restart/wake：新 ready Pod 上线（name=agent_pod_name 派生名——
+            // watcher 按名单投递；uid ready-pod 与旧 pod-original 区分新旧）
+            let mut fresh = scenario.ready_pod.clone();
+            fresh["metadata"]["name"] = serde_json::json!("rcoder-app-builder-app-0");
+            fresh["metadata"]["uid"] = serde_json::json!("ready-pod");
+            Some(serde_json::json!({"type":"ADDED","object":fresh}))
+        } else {
+            // stop：Pod 消失完成（DELETED——kube-runtime ListWatch 只对
+            // 已入册对象投递 Delete，LIST 必须先含旧 Pod）
+            let mut gone = scenario.ready_pod.clone();
+            gone["metadata"]["name"] = serde_json::json!("rcoder-app-builder-app-0");
+            gone["metadata"]["uid"] = serde_json::json!("pod-original");
+            Some(serde_json::json!({"type":"DELETED","object":gone}))
+        };
+        if let Some(event) = event {
+            let payload = format!("{}\n", event);
+            let chunk = format!("{:x}\r\n{}\r\n", payload.len(), payload);
+            stream
+                .write_all(chunk.as_bytes())
+                .await
+                .expect("watch event");
+        }
+        let mut drain = [0u8; 512];
+        loop {
+            if stream.read(&mut drain).await.unwrap_or(0) == 0 {
+                break;
+            }
+        }
+        return;
+    }
+
+    let single_sts = path.ends_with("/statefulsets/builder");
+    let list_sts = path.ends_with("/statefulsets");
+    let single_pod = {
+        let tail = path.rsplit('/').next().unwrap_or("");
+        path.contains("/pods/") && !tail.is_empty()
+    };
+    let list_pods = path.ends_with("/pods");
+    // 动作后状态：成功的 STS PATCH 之后，单对象 GET 反映推进的 replicas
+    let patched = scenario.patched.load(std::sync::atomic::Ordering::SeqCst) > 0;
+
+    let (code, response): (u16, serde_json::Value) = if method == "DELETE" {
+        if scenario.reject_patch {
+            // 写操作整体被拒（restart 的 DELETE 同 PATCH 一道受拒——
+            // 拒绝必须传播为 RequestRejected，绝不静默成功）
+            (
+                403,
+                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Forbidden","message":"Delete denied","code":403}),
+            )
+        } else {
+            (
+                200,
+                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success"}),
+            )
+        }
+    } else if method == "PATCH" {
+        if scenario.reject_patch {
+            (
+                403,
+                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Forbidden","message":"Patch denied","code":403}),
+            )
+        } else {
+            scenario
+                .patched
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut observed = scenario.object.clone();
+            observed["spec"]["replicas"] = serde_json::json!(scenario.post_action_replicas());
+            (200, observed)
+        }
+    } else if scenario.replaced && single_sts && !list_sts {
+        let mut replacement = scenario.object.clone();
+        replacement["metadata"]["uid"] = serde_json::json!("replacement-sts");
+        (200, replacement)
+    } else if single_sts {
+        let mut observed = scenario.object.clone();
+        if patched {
+            observed["spec"]["replicas"] = serde_json::json!(scenario.post_action_replicas());
+        }
+        (200, observed)
+    } else if list_sts {
+        let mut observed = scenario.object.clone();
+        observed["spec"]["replicas"] = serde_json::json!(scenario.post_action_replicas());
+        (
+            200,
+            serde_json::json!({"apiVersion":"v1","kind":"StatefulSetList","metadata":{"resourceVersion":"8"},"items":[observed]}),
+        )
+    } else if single_pod && path.ends_with("/builder-0") {
+        // 旧 Pod（restart 删除前置的身份复核对象：name/uid/rv 必须与捕获一致）
+        let mut old = scenario.ready_pod.clone();
+        old["metadata"]["name"] = serde_json::json!("builder-0");
+        old["metadata"]["uid"] = serde_json::json!("pod-original");
+        old["metadata"]["resourceVersion"] = serde_json::json!("9");
+        (200, old)
+    } else if single_pod {
+        if scenario.restart || scenario.wake {
+            (200, scenario.ready_pod.clone())
+        } else {
+            (
+                404,
+                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"Pod absent","code":404}),
+            )
+        }
+    } else if list_pods {
+        let items = if scenario.restart || scenario.wake {
+            // restart/wake（apply 侧 restart=true）：旧 Pod 已删——空集，
+            // 新 ready Pod 由 watch ADDED 事件驱动（KR07：旧 Pod Ready 不能
+            // 完成新 restart）
+            serde_json::json!([])
+        } else {
+            // stop：旧 Pod 在册（DELETED 事件才能被 ListWatch 识别）
+            let mut current = scenario.ready_pod.clone();
+            current["metadata"]["name"] = serde_json::json!("rcoder-app-builder-app-0");
+            current["metadata"]["uid"] = serde_json::json!("pod-original");
+            serde_json::json!([current])
+        };
+        (
+            200,
+            serde_json::json!({"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"10"},"items":items}),
+        )
+    } else {
+        (
+            200,
+            serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success"}),
+        )
+    };
+    let body = response.to_string();
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 {code} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("respond");
 }
 
 fn workload_identity_with_binding(
@@ -525,7 +907,6 @@ mod tests {
     }
 
     async fn stop_api_contract(reject_patch: bool, restart: bool, wake: bool, replaced: bool) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let context = UserAppExecutionContext {
             app_id: "app".into(),
             lifecycle_id: "life".into(),
@@ -559,98 +940,30 @@ mod tests {
             .await
             .expect("bind");
         let address = listener.local_addr().expect("address");
+        let recorded =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String, String)>::new()));
+        let scenario = ContractScenario {
+            object: object.clone(),
+            ready_pod: ready_pod.clone(),
+            reject_patch,
+            restart,
+            wake,
+            replaced,
+            patched: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            recorder: recorded.clone(),
+        };
+        // 批次 B：语义分类服务器——按 method/path/query 分类应答（单对象 GET /
+        // 集合 LIST / watch 流 / PATCH / DELETE），watch 流按场景投递触发事件
+        //（wake/restart=新 ready Pod ADDED、stop=Pod DELETED）。每连接独立
+        // task——watch 长连接不能阻塞 accept；连接 task detach（语义断言在
+        // 主任务对 recorder 的复核里，服务器由 abort 终止）。
         let server = tokio::spawn(async move {
-            for index in 0..if replaced {
-                1
-            } else if restart {
-                3
-            } else if reject_patch {
-                2
-            } else {
-                4
-            } {
-                let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut bytes = Vec::new();
-                let mut buffer = [0u8; 2048];
-                let (headers, body) = loop {
-                    let n = stream.read(&mut buffer).await.expect("read");
-                    assert!(n > 0);
-                    bytes.extend_from_slice(&buffer[..n]);
-                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&bytes[..end]).to_string();
-                        let length = headers
-                            .lines()
-                            .find_map(|line| {
-                                line.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .map(|value| value.trim().parse::<usize>().expect("length"))
-                            })
-                            .unwrap_or(0);
-                        if bytes.len() >= end + 4 + length {
-                            break (headers, bytes[end + 4..end + 4 + length].to_vec());
-                        }
-                    }
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(_) => return,
                 };
-                let first = headers.lines().next().expect("request");
-                assert!(!first.contains("persistentvolumeclaims") && !first.contains("services"));
-                if restart && index == 2 {
-                    let parts: Vec<_> = first.split_whitespace().collect();
-                    assert_eq!(parts.len(), 3, "unexpected request: {first}");
-                    assert_eq!(parts[0], "DELETE");
-                    assert_eq!(
-                        parts[1].strip_suffix('?').unwrap_or(parts[1]),
-                        "/api/v1/namespaces/review-test/pods/builder-0"
-                    );
-                    assert_eq!(parts[2], "HTTP/1.1");
-                    let params: serde_json::Value =
-                        serde_json::from_slice(&body).expect("delete body");
-                    assert_eq!(params["preconditions"]["uid"], "pod-original");
-                    assert_eq!(params["preconditions"]["resourceVersion"], "9");
-                } else if index == 1 && !restart {
-                    let parts: Vec<_> = first.split_whitespace().collect();
-                    assert_eq!(parts.len(), 3, "unexpected request: {first}");
-                    assert_eq!(parts[0], "PATCH");
-                    // kube includes an empty query delimiter with default PatchParams.
-                    assert_eq!(
-                        parts[1].strip_suffix('?').unwrap_or(parts[1]),
-                        "/apis/apps/v1/namespaces/review-test/statefulsets/builder"
-                    );
-                    assert_eq!(parts[2], "HTTP/1.1");
-                    let patch: serde_json::Value = serde_json::from_slice(&body).expect("patch");
-                    assert_eq!(patch["metadata"]["uid"], "sts-original");
-                    assert_eq!(patch["metadata"]["resourceVersion"], "8");
-                    assert_eq!(patch["spec"]["replicas"], if wake { 1 } else { 0 });
-                } else {
-                    assert!(first.starts_with("GET "));
-                }
-                let (code, response) = if restart && index == 1 {
-                    (
-                        200,
-                        serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"builder-0","uid":"pod-original","resourceVersion":"9","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"builder","uid":"sts-original","controller":true}]}}),
-                    )
-                } else if (restart && index == 2) || (!restart && index == 1 && reject_patch) {
-                    (
-                        403,
-                        serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Forbidden","message":"Patch denied","code":403}),
-                    )
-                } else if index == 3 && wake {
-                    assert!(first.contains("/pods/"));
-                    (200, ready_pod.clone())
-                } else if index == 3 {
-                    assert!(first.contains("/pods/"));
-                    (
-                        404,
-                        serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"Pod absent","code":404}),
-                    )
-                } else {
-                    let mut observed = object.clone();
-                    if index > 0 {
-                        observed["spec"]["replicas"] = serde_json::json!(if wake { 1 } else { 0 });
-                    }
-                    (200, observed)
-                };
-                let body = response.to_string();
-                stream.write_all(format!("HTTP/1.1 {code} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.expect("respond");
+                tokio::spawn(handle_contract_connection(stream, scenario.clone()));
             }
         });
         drop(rustls::crypto::ring::default_provider().install_default());
@@ -698,16 +1011,106 @@ mod tests {
                 .apply_builder_compute_mode(&target, restart || wake, wake)
                 .await;
             if reject_patch || replaced {
-                assert!(matches!(outcome, Err(Error::RequestRejected(_))));
+                assert!(
+                    matches!(outcome, Err(Error::RequestRejected(_))),
+                    "expected rejection, got: {outcome:?}"
+                );
             } else if wake {
                 assert_eq!(
                     outcome.expect("wake").expect("ready").container_id,
                     "ready-pod"
                 );
+            } else if restart {
+                assert_eq!(
+                    outcome.expect("restart").expect("ready").container_id,
+                    "ready-pod"
+                );
             } else {
                 assert!(outcome.expect("stop").is_none());
             }
-            server.await.expect("server");
+            // 语义复核：写操作必须按场景出现且携带物理前置；绝无存储/服务变更
+            let requests = recorded.lock().expect("recorder").clone();
+            assert!(!requests.is_empty(), "no requests were recorded");
+            let mut sts_patch: Option<(String, String, String)> = None;
+            let mut pod_delete: Option<(String, String, String)> = None;
+            for request in &requests {
+                let lower = request.0.to_ascii_lowercase();
+                assert!(
+                    !lower.contains("persistentvolumeclaims") && !lower.contains("/services"),
+                    "storage/service mutation is fenced: {request:?}"
+                );
+                if lower.starts_with("patch ") && lower.contains("/statefulsets/builder") {
+                    assert!(
+                        sts_patch.is_none(),
+                        "workload patched at most once: {requests:?}"
+                    );
+                    sts_patch = Some(request.clone());
+                }
+                if lower.starts_with("delete ") && lower.contains("/pods/") {
+                    assert!(
+                        pod_delete.is_none(),
+                        "pod deleted at most once: {requests:?}"
+                    );
+                    pod_delete = Some(request.clone());
+                }
+            }
+            if replaced {
+                // 替换的 STS 在任何写之前被拒——绝无写操作
+                assert!(
+                    sts_patch.is_none() && pod_delete.is_none(),
+                    "replacement must be fenced before any write: {requests:?}"
+                );
+            } else if wake || !restart {
+                let (first, _, body) = sts_patch.expect("workload patch required").clone();
+                assert!(first.contains("PATCH"), "recorded: {first}");
+                assert!(
+                    body.contains("\"uid\":\"sts-original\""),
+                    "patch carries UID precondition: {body}"
+                );
+                assert!(
+                    body.contains("\"resourceVersion\":\"8\""),
+                    "patch carries version precondition: {body}"
+                );
+                assert!(
+                    body.contains(&format!("\"replicas\":{}", if wake { 1 } else { 0 })),
+                    "patch scales in the action direction: {body}"
+                );
+                assert!(
+                    !body.contains("volumes") && !body.contains("persistentVolumeClaim"),
+                    "patch must not touch storage: {body}"
+                );
+                assert!(
+                    pod_delete.is_none(),
+                    "stop/wake never deletes the pod: {requests:?}"
+                );
+            } else {
+                let (first, _, body) = pod_delete.expect("pod delete required").clone();
+                assert!(first.contains("DELETE"), "recorded: {first}");
+                assert!(
+                    first.contains("/pods/builder-0"),
+                    "delete targets the captured pod: {first}"
+                );
+                let params: serde_json::Value =
+                    serde_json::from_str(&body).expect("delete body json");
+                assert_eq!(
+                    params["preconditions"]["uid"], "pod-original",
+                    "delete carries UID precondition: {body}"
+                );
+                assert_eq!(
+                    params["preconditions"]["resourceVersion"], "9",
+                    "delete carries version precondition: {body}"
+                );
+                assert!(
+                    sts_patch.is_none(),
+                    "restart never patches the workload: {requests:?}"
+                );
+            }
+            // 服务器是常驻 accept 循环——显式中止并确认未 panic
+            server.abort();
+            match server.await {
+                Err(join) if join.is_cancelled() => {}
+                other => panic!("contract server task must end aborted: {other:?}"),
+            }
         })
         .await
         .expect("total contract deadline");
