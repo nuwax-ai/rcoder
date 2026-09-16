@@ -457,8 +457,7 @@ mod tests {
     use async_trait::async_trait;
     use container_runtime_api::{
         AgentContainerRuntime, ContainerCreateParams, ContainerRuntimeError,
-        ContainerRuntimeResult, RuntimeContainerInfo,
-        UserAppDeploymentRuntime, WorkspaceRuntime,
+        ContainerRuntimeResult, RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
     };
     use dashmap::DashMap;
     use shared_types::{ApiKeyAuthConfig, ContainerBasicInfo};

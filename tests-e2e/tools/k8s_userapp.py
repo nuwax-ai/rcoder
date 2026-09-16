@@ -151,10 +151,10 @@ class Run:
             raise AssertionError(f'{path}: HTTP {status}: {data}')
         return data['data']
 
-    def api_retry_conflict(self, path, body=None, timeout=180, attempts=20, interval=5):
+    def api_retry_conflict(self, path, body=None, timeout=180, attempts=40, interval=10):
         """快失败语义的调用方重试模式：锁被进行中操作（如仍在收敛的后台
-        部署协调器）持有时返回 ERR_CONFLICT——等待后重试（有界），其余业务
-        错误立即上抛。"""
+        部署协调器——start 等就绪预算可达 30 分钟）持有时返回 ERR_CONFLICT
+        ——等待后重试（有界），其余业务错误立即上抛。"""
         last = None
         for _ in range(attempts):
             status, envelope = self.request(path, body, timeout=timeout)
