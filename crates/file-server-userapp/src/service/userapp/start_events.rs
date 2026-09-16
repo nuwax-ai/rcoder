@@ -119,9 +119,28 @@ async fn consume(
         };
         match event {
             StartEvent::Event(event) => task.emit(event).await,
-            // Done 是终局判据（可能迟到于 ProducerExited——排空窗内到达即有效；
-            // 已入队的服务事件先于终态，顺序由同队列保证）。
-            StartEvent::Done { failed } => return done_outcome(failed),
+            // Done 是终局判据——但**仅在未先观察到编排进程退出时**（R05：
+            // 退出先于 Done 被观察到 → 迟到的缓存成功 Done 不能证明启动
+            // 成功提交，Plan §阶段一"已观察到编排进程在启动完成提交前退出，
+            // 不能仅凭缓存 Done 成功"；排空窗收集的失败清单保留在诊断里）。
+            // Done 先到、之后才退出 = 成功提交后的运行健康变化，不在此路径。
+            StartEvent::Done { failed } => {
+                if let Some(exit) = exited.as_deref() {
+                    let summary = failed
+                        .into_iter()
+                        .map(|(service, error)| format!("{service}: {error}"))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(exited_failure(
+                        exit,
+                        format!(
+                            "completion event arrived after orchestrator exit was observed \
+                             (cached success is not a completion proof); failed services: {summary}"
+                        ),
+                    ));
+                }
+                return done_outcome(failed);
+            }
             StartEvent::ProducerExited { exit } => {
                 tracing::warn!(%exit, "startup orchestrator exited before completion event");
                 exited = Some(exit);
@@ -234,6 +253,54 @@ mod tests {
                 .to_string()
                 .contains("web: not ready")
         );
+    }
+
+    /// R05：退出先于成功 Done 被观察到 → 迟到的缓存成功不能证明启动成功
+    ///（exit 0 与非零同拒——Plan §阶段一"退出后无有效 Done"）。
+    #[tokio::test]
+    async fn success_done_after_observed_exit_never_succeeds() {
+        for exit in ["0", "1"] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let target = task().await;
+            let consumer = tokio::spawn(consume(target, rx));
+            tx.send(StartEvent::ProducerExited {
+                exit: exit.to_string(),
+            })
+            .unwrap();
+            tx.send(StartEvent::Done { failed: vec![] }).unwrap();
+            let error = consumer.await.unwrap().unwrap_err();
+            assert!(
+                error.to_string().contains("exited before completion"),
+                "exit {exit}: {error}"
+            );
+        }
+    }
+
+    /// R05 对照组：正常 Done 先提交、之后进程退出——成功不追改。
+    #[tokio::test]
+    async fn success_done_before_exit_still_succeeds() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let target = task().await;
+        let consumer = tokio::spawn(consume(target, rx));
+        tx.send(StartEvent::Done { failed: vec![] }).unwrap();
+        consumer.await.unwrap().unwrap();
+    }
+
+    /// R05：退出 → 失败 Done（带失败清单）→ 失败保留清单诊断。
+    #[tokio::test]
+    async fn failed_done_after_observed_exit_keeps_failure_detail() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let target = task().await;
+        let consumer = tokio::spawn(consume(target, rx));
+        tx.send(StartEvent::ProducerExited { exit: "1".into() }).unwrap();
+        tx.send(StartEvent::Done {
+            failed: vec![("web".into(), "probe failed".into())],
+        })
+        .unwrap();
+        let error = consumer.await.unwrap().unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("exited before completion"), "{message}");
+        assert!(message.contains("web: probe failed"), "{message}");
     }
 
     #[tokio::test]

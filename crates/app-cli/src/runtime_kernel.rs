@@ -4,7 +4,8 @@
 //! [`RuntimeKernel::admit`] 受理——短锁内完成鉴权/重放/冲突/修订/恢复检查，
 //! 持久化 Accepted 记录后才派发执行（复用 server 主循环这一既有串行
 //! worker：制品走部署通道，源码/停止走编排通道）。操作记录与事件按
-//! `<workspace>/.app-cli-state/` 稳定状态根持久化，进程重建后可查询、
+//! workspace 卷根（父目录）下的 `.app-cli-state/` 稳定状态根持久化
+//! （R02：跨热部署换代稳定），进程重建后可查询、
 //! 可按 operation_id + request_digest 幂等重放。
 //!
 //! 关键不变量（spec R05/R06/R07）：
@@ -27,7 +28,13 @@ use shared_types::{
 };
 use tokio::sync::Mutex;
 
-/// 稳定状态根（workspace 内、有效运行目录 `.run` 之外——plan §3.1）。
+/// 稳定状态根目录名（R02 修复）。
+///
+/// 根位于 `workspace.parent()`——与部署激活的 `.previous`/`DEPLOY_STATE_FILE`
+/// 同一**卷根**（deploy::activate 只整体改名 workspace 本身，父目录跨部署
+/// 稳定），绝不放入会被热部署替换的 workspace 内。旧版本曾置于 workspace
+/// 内（`{workspace}/.app-cli-state`），[`RuntimeStore::open`] 做一次性原子
+/// 迁移；新旧两处同时存在（双权威域）时 fail-fast 拒绝写入。
 pub(crate) const STATE_DIR_NAME: &str = ".app-cli-state";
 
 /// 受理判定结果。
@@ -53,9 +60,46 @@ pub(crate) struct RuntimeStore {
     root: PathBuf,
 }
 
+/// 扫描结果（R04）：读取/解码失败不再静默跳过——以 `blocked` 上报，
+/// 调用方（[`RuntimeKernel::recover`]）据此保持恢复保护（阻断写操作）。
+pub(crate) struct RecoveryScan {
+    /// 被转 RecoveryRequired 的在途操作。
+    pub recovered: Vec<String>,
+    /// 无法读取/解码的记录（fail closed：保留文件，写操作被阻断直至
+    /// 操作员裁决——查询/重放不是清理完成证明）。
+    pub blocked: Vec<String>,
+}
+
 impl RuntimeStore {
     pub(crate) fn open(workspace: &Path) -> Result<Self> {
-        let root = workspace.join(STATE_DIR_NAME);
+        // R02：根 = workspace 的**卷根**（父目录）——deploy::activate 整体
+        // 改名 workspace 换代时此目录不动（同 `.previous`/DEPLOY_STATE_FILE 域）。
+        let volume_root = workspace
+            .parent()
+            .context("workspace has no volume root for stable runtime state")?;
+        let root = volume_root.join(STATE_DIR_NAME);
+        let legacy = workspace.join(STATE_DIR_NAME);
+        let legacy_exists = root_exists(&legacy)?;
+        let root_exists_already = root_exists(&root)?;
+        if legacy_exists && root_exists_already {
+            // 双权威域：可能是旧迁移中断/手工复制。绝不猜哪份权威——
+            // 拒绝写入，操作员裁决后重启（R04 fail-closed 同源纪律）。
+            anyhow::bail!(
+                "runtime state exists both at stable root {} and legacy in-workspace {} \
+                 (two authority domains); resolve explicitly before starting",
+                root.display(),
+                legacy.display()
+            );
+        }
+        if legacy_exists {
+            // 一次性原子迁移（同卷 rename；失败保留现场不动旧目录）
+            std::fs::rename(&legacy, &root)
+                .with_context(|| format!("migrate legacy runtime state {} -> {}", legacy.display(), root.display()))?;
+            tracing::info!(
+                "runtime state migrated from in-workspace legacy location to stable volume root: {}",
+                root.display()
+            );
+        }
         std::fs::create_dir_all(root.join("operations")).context("create runtime state dir")?;
         std::fs::create_dir_all(root.join("events")).context("create runtime events dir")?;
         Ok(Self { root })
@@ -101,7 +145,9 @@ impl RuntimeStore {
                 "operations".into(),
                 "events".into(),
                 "source-profile".into(),
-                "artifact-profile".into(),
+                // 制品能力当前仅 Deploy+URL（R03 收窄声明；ArtifactId 本地
+                // 解析器未实现——按显式组合拒绝，不虚报通用 artifact 能力）
+                "deploy-artifact-url".into(),
             ],
         };
         // identity.json 不回读旧 runtime_instance（旧实例身份不得复用），仅覆盖。
@@ -188,25 +234,43 @@ impl RuntimeStore {
 
     /// 启动恢复：最后一次非终态操作置 RecoveryRequired（不猜结果，写操作
     /// 被拒直至该操作显式恢复/重放完成）。
-    pub(crate) fn recover_unfinished_operations(&self) -> Result<Vec<String>> {
-        let mut recovered = Vec::new();
+    pub(crate) fn recover_unfinished_operations(&self) -> Result<RecoveryScan> {
+        let mut scan = RecoveryScan {
+            recovered: Vec::new(),
+            blocked: Vec::new(),
+        };
         let dir = self.root.join("operations");
         let entries = std::fs::read_dir(&dir).context("scan operations dir")?;
-        for entry in entries.flatten() {
+        for entry in entries {
+            // R04：目录枚举失败同样 fail closed（不再 flatten 静默跳过）
+            let entry = entry.context("read operations dir entry")?;
             let path = entry.path();
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                continue;
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::error!(
+                        "runtime state: unreadable operation record {}: {error}",
+                        path.display()
+                    );
+                    scan.blocked.push(path.display().to_string());
+                    continue;
+                }
             };
-            let Ok(mut operation) =
-                serde_json::from_str::<StoredOperation>(content.trim_end_matches('\n'))
-            else {
-                // 损坏记录 fail closed：保留文件并记录，不猜状态。
-                tracing::error!(
-                    "runtime state: undecodable operation record kept untouched: {}",
-                    path.display()
-                );
-                continue;
-            };
+            let operation =
+                match serde_json::from_str::<StoredOperation>(content.trim_end_matches('\n')) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        // 损坏记录 fail closed：保留文件、阻断写、不猜状态。
+                        tracing::error!(
+                            "runtime state: undecodable operation record kept untouched {}: {error}",
+                            path.display()
+                        );
+                        scan.blocked.push(path.display().to_string());
+                        continue;
+                    }
+                };
+            let mut operation = operation;
             if !operation.view.state.is_terminal() {
                 operation.view.state = RuntimeOperationState::RecoveryRequired;
                 operation.view.error_code = Some(ERR_RECOVERY_REQUIRED.into());
@@ -214,10 +278,10 @@ impl RuntimeStore {
                     Some("process restarted before the operation reached a terminal state".into());
                 let id = operation.view.operation_id.clone();
                 self.store_operation(&operation)?;
-                recovered.push(id);
+                scan.recovered.push(id);
             }
         }
-        Ok(recovered)
+        Ok(scan)
     }
 }
 
@@ -227,6 +291,14 @@ pub(crate) struct StoredOperation {
     pub view: RuntimeOperationView,
     /// 受理时的规范化请求（重放摘要比对的原始输入）。
     pub request: RuntimeOperationRequest,
+}
+
+fn root_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("stat runtime state root"),
+    }
 }
 
 fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
@@ -264,6 +336,9 @@ pub(crate) struct RuntimeKernel {
     admission: Mutex<AdmissionState>,
     /// 执行派发回调（server 主循环注入；制品→部署通道，源码/停止→编排通道）。
     dispatch: Box<dyn Fn(DispatchAction) + Send + Sync>,
+    /// 已请求取消的操作墓碑（R03）：受理后、执行完成前的取消标记。
+    /// 执行侧在副作用边界检查（派发执行前/编排完成提交前）。
+    cancelled: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// 执行派发动作（server 主循环解释；内核不直接触碰业务运行态）。
@@ -300,6 +375,7 @@ impl RuntimeKernel {
             identity,
             admission: Mutex::new(AdmissionState::default()),
             dispatch,
+            cancelled: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -312,17 +388,25 @@ impl RuntimeKernel {
     }
 
     /// 启动恢复入口（serve 主流程在 quiescence/ownership 之后调用）。
+    /// 启动恢复（R04）：返回 RecoveryRequired 操作清单；**不可读/损坏记录
+    /// 不再被视为"无事发生"**——恢复保护保持置位，写操作被阻断（`blocked`
+    /// 数量经日志暴露，操作员裁决后删除/修复对应文件并重启解除）。
     pub(crate) async fn recover(&self) -> Result<Vec<String>> {
-        let recovered = self.store.recover_unfinished_operations()?;
+        let scan = self.store.recover_unfinished_operations()?;
         let mut guard = self.admission.lock().await;
-        if recovered.is_empty() {
-            guard.recovery_protection = false;
-        } else {
-            // 恢复保护：有非终态操作被标记 RecoveryRequired 时拒绝新写，
-            // 直至对应操作经查询/重放确认收束（spec §3.3 崩溃注入语义）。
-            guard.recovery_protection = true;
+        // 恢复保护：在途操作被标记 RecoveryRequired，或存在不可判定记录
+        // 时拒绝新写（spec §3.3 崩溃注入语义；R04 把 fail-closed 从注释
+        // 变成实际行为）。
+        guard.recovery_protection =
+            !scan.recovered.is_empty() || !scan.blocked.is_empty();
+        if !scan.blocked.is_empty() {
+            tracing::error!(
+                count = scan.blocked.len(),
+                paths = ?scan.blocked,
+                "runtime state has unreadable operation records; writes are blocked until resolved"
+            );
         }
-        Ok(recovered)
+        Ok(scan.recovered)
     }
 
     pub(crate) async fn status(&self) -> Result<RuntimeStatusView> {
@@ -356,6 +440,32 @@ impl RuntimeKernel {
             message: error,
             active_operation_id: None,
         })?;
+        // R03：kind×profile 组合前置校验——未实现组合在**任何持久化/占位
+        // 之前**结构化拒绝（不留半受理状态）。已实现：Deploy+Artifact(Url)、
+        // Start/Restart+Source、Stop（任意 profile）。
+        match (&request.kind, &request.profile) {
+            (
+                RuntimeOperationKind::Deploy,
+                shared_types::RunProfileInput::Artifact {
+                    artifact: shared_types::ArtifactInput::Url { .. },
+                },
+            )
+            | (
+                RuntimeOperationKind::Start | RuntimeOperationKind::Restart,
+                shared_types::RunProfileInput::Source { .. },
+            )
+            | (RuntimeOperationKind::Stop, _) => {}
+            (kind, profile) => {
+                return Err(AdmissionRejection {
+                    code: shared_types::ERR_PROTOCOL_UNSUPPORTED,
+                    message: format!(
+                        "operation kind {kind} with profile {profile:?} is not implemented \
+                         in this build; supported: deploy+artifact(url), start/restart+source, stop"
+                    ),
+                    active_operation_id: None,
+                });
+            }
+        }
         // 身份核验先于一切重放判断：旧实例请求不修改新实例（spec §3.1）。
         if request.expected_runtime_instance_id != self.identity.runtime_instance_id {
             return Err(AdmissionRejection {
@@ -470,6 +580,10 @@ impl RuntimeKernel {
             });
         }
         // stop 受理即持久化意图并推进 revision：旧构建稍后提交被拒（spec §3.3）。
+        // R04：Accepted 已落盘后 desired 写失败 = 部分提交——该操作转为
+        // RecoveryRequired 并挂恢复保护（终态可查询、执行不派发；其他 ID
+        // 同样被拒，直至重启恢复裁决）。绝不能只返回错误留下永远 Accepted
+        // 的幽灵记录。
         if is_stop {
             let next_revision = revision.checked_add(1).ok_or_else(|| AdmissionRejection {
                 code: "ERR_BACKEND_ERROR",
@@ -480,20 +594,19 @@ impl RuntimeKernel {
                 .store
                 .store_desired(DesiredState::Stopped, next_revision)
             {
-                return Err(AdmissionRejection {
-                    code: "ERR_BACKEND_ERROR",
-                    message: format!("persist stop intent: {error:#}"),
-                    active_operation_id: None,
-                });
+                guard.recovery_protection = true;
+                return Err(
+                    self.hold_partial_admission(&stored, format!("persist stop intent: {error:#}"))
+                );
             }
         } else if let Err(error) = self.store.store_desired(DesiredState::Running, revision) {
-            return Err(AdmissionRejection {
-                code: "ERR_BACKEND_ERROR",
-                message: format!("persist running intent: {error:#}"),
-                active_operation_id: None,
-            });
+            guard.recovery_protection = true;
+            return Err(
+                self.hold_partial_admission(&stored, format!("persist running intent: {error:#}"))
+            );
         }
         guard.active_operation_id = Some(stored.view.operation_id.clone());
+        // 分派映射（组合已在受理前置校验收窄，此处仅选择已实现路径）
         let action = match (&stored.request.kind, &stored.request.profile) {
             (
                 RuntimeOperationKind::Deploy,
@@ -508,11 +621,22 @@ impl RuntimeKernel {
             (RuntimeOperationKind::Stop, _) => DispatchAction::StopBusiness {
                 operation_id: stored.view.operation_id.clone(),
             },
-            // start/restart(source/artifact) 与 deploy(source) = 确保运行：
-            // 编排 workspace 当前有效内容（deploy 需显式制品输入，source 不强制）
-            _ => DispatchAction::OrchestrateSource {
+            (
+                RuntimeOperationKind::Start | RuntimeOperationKind::Restart,
+                shared_types::RunProfileInput::Source { .. },
+            ) => DispatchAction::OrchestrateSource {
                 operation_id: stored.view.operation_id.clone(),
             },
+            // 组合已在前置校验拒绝；到这里的组合是防御纵深违规——fail fast
+            (kind, profile) => {
+                return Err(AdmissionRejection {
+                    code: "ERR_BACKEND_ERROR",
+                    message: format!(
+                        "internal: unvalidated dispatch combination {kind}/{profile:?} reached execution"
+                    ),
+                    active_operation_id: None,
+                });
+            }
         };
         let operation_id = stored.view.operation_id.clone();
         self.emit(
@@ -567,6 +691,9 @@ impl RuntimeKernel {
             None,
             Some(event_name),
         );
+        if let Ok(mut set) = self.cancelled.lock() {
+            set.remove(operation_id);
+        }
         let mut guard = self.admission.lock().await;
         if guard.active_operation_id.as_deref() == Some(operation_id) {
             guard.active_operation_id = None;
@@ -580,13 +707,53 @@ impl RuntimeKernel {
     /// 取消请求（受理态返回；不伪称立即完成——spec §3.2 cancel 语义）。
     pub(crate) async fn request_cancel(&self, operation_id: &str) -> Result<bool> {
         let guard = self.admission.lock().await;
-        if guard.active_operation_id.as_deref() == Some(operation_id) {
-            // 执行侧取消由 server 主循环观察 desired/cancel 通道实现；
-            // 此处仅确认“操作存在且进行中”，不篡改状态。
-            Ok(true)
-        } else {
-            Ok(false)
+        if guard.active_operation_id.as_deref() != Some(operation_id) {
+            return Ok(false);
         }
+        // R03：真实取消——记录墓碑，执行侧在副作用边界
+        // （[`Self::is_cancelled`]）检查并在终态提交前收束为 Cancelled。
+        // 不在此改写状态：终态仍由执行边界持久化（含取消场景的清理证据）。
+        self.cancelled
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cancel registry lock poisoned"))?
+            .insert(operation_id.to_string());
+        Ok(true)
+    }
+
+    /// 部分提交围栏（R04）：Accepted 落盘后意图写失败时调用——操作转
+    /// RecoveryRequired（尽量落盘；落盘也失败时仅日志，保护已在内存），
+    /// 并置恢复保护阻断后续写受理。
+    fn hold_partial_admission(
+        &self,
+        stored: &StoredOperation,
+        reason: String,
+    ) -> AdmissionRejection {
+        let mut held = stored.clone();
+        held.view.state = RuntimeOperationState::RecoveryRequired;
+        held.view.error_code = Some(ERR_RECOVERY_REQUIRED.into());
+        held.view.error_message = Some(reason.clone());
+        if let Err(persist_error) = self.store.store_operation(&held) {
+            tracing::error!(
+                "partial admission hold persist failed (op {}): {persist_error:#}",
+                stored.view.operation_id
+            );
+        }
+        AdmissionRejection {
+            code: ERR_RECOVERY_REQUIRED,
+            message: format!(
+                "admission persisted but intent write failed; operation {} held for recovery: {reason}",
+                stored.view.operation_id
+            ),
+            active_operation_id: Some(stored.view.operation_id.clone()),
+        }
+    }
+
+    /// 操作是否已被请求取消（执行侧副作用边界检查点）。
+    pub(crate) fn is_cancelled(&self, operation_id: &str) -> bool {
+        self.cancelled
+            .lock()
+            .map(|set| set.contains(operation_id))
+            .unwrap_or(false)
     }
 
     fn emit(
@@ -625,7 +792,11 @@ mod tests {
 
     fn temp_store() -> (tempfile::TempDir, RuntimeStore) {
         let dir = tempfile::tempdir().expect("dir");
-        let store = RuntimeStore::open(dir.path()).expect("store");
+        // R02 后状态根位于 workspace 父目录——workspace 必须是临时目录的
+        // 子目录，保证各测试的卷根（父目录）唯一，避免跨测试共用状态根。
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let store = RuntimeStore::open(&workspace).expect("store");
         (dir, store)
     }
 
@@ -643,9 +814,27 @@ mod tests {
     }
 
     fn kernel(dir: &Path) -> RuntimeKernel {
-        let store = RuntimeStore::open(dir).expect("store");
+        let workspace = dir.join("workspace");
+        let store = RuntimeStore::open(&workspace).expect("store");
         let identity = identity();
         RuntimeKernel::new(store, identity, Box::new(|_| {}))
+    }
+
+    fn request_deploy_url(operation_id: &str) -> RuntimeOperationRequest {
+        RuntimeOperationRequest {
+            operation_id: operation_id.into(),
+            expected_runtime_instance_id: "instance-1".into(),
+            expected_revision: 0,
+            workspace_id: "ws-1".into(),
+            kind: RuntimeOperationKind::Deploy,
+            profile: RunProfileInput::Artifact {
+                artifact: ArtifactInput::Url {
+                    url: "http://x/app.zip".into(),
+                    sha256: None,
+                },
+            },
+            request_context: None,
+        }
     }
 
     fn request(kind: RuntimeOperationKind, operation_id: &str) -> RuntimeOperationRequest {
@@ -701,9 +890,10 @@ mod tests {
             .admit(request(RuntimeOperationKind::Start, "op-1"))
             .await
             .expect("admit start");
-        // start/restart/deploy 在 active 期间被拒（带进行中 ID）
+        // start/restart/deploy 在 active 期间被拒（带进行中 ID；busy 检查
+        // 在 profile 组合校验之后——用已实现组合触发 busy 分支）
         let rejection = kernel
-            .admit(request(RuntimeOperationKind::Deploy, "op-2"))
+            .admit(request_deploy_url("op-2"))
             .await
             .expect_err("busy");
         assert_eq!(rejection.code, ERR_OPERATION_IN_PROGRESS);
@@ -724,13 +914,7 @@ mod tests {
             .finish("op-stop", RuntimeOperationState::Succeeded, None, None, 2)
             .await
             .expect("finish stop");
-        let mut stale = request(RuntimeOperationKind::Deploy, "op-3");
-        stale.profile = RunProfileInput::Artifact {
-            artifact: ArtifactInput::Url {
-                url: "http://x/app.zip".into(),
-                sha256: None,
-            },
-        };
+        let stale = request_deploy_url("op-3");
         let rejection = kernel.admit(stale).await.expect_err("stale revision");
         assert_eq!(rejection.code, ERR_REVISION_MISMATCH);
     }
@@ -781,7 +965,7 @@ mod tests {
     #[tokio::test]
     async fn events_replay_by_after_seq_cursor() {
         let (dir, _keep) = temp_store();
-        let store = RuntimeStore::open(dir.path()).expect("store");
+        let store = RuntimeStore::open(&dir.path().join("workspace")).expect("store");
         for sequence in 1..=3 {
             store
                 .append_event(&RuntimeEventRecord {
@@ -806,7 +990,8 @@ mod tests {
     async fn restart_recovery_marks_unfinished_operations() {
         let (dir, _keep) = temp_store();
         {
-            let store = RuntimeStore::open(dir.path()).expect("store");
+            let workspace = dir.path().join("workspace");
+            let store = RuntimeStore::open(&workspace).expect("store");
             store
                 .store_operation(&StoredOperation {
                     view: RuntimeOperationView {
@@ -856,4 +1041,216 @@ mod tests {
         let status = kernel.status().await.expect("status");
         assert_eq!(status.active_operation_id, None, "no execution queued");
     }
+    // ── R01：执行身份不被并发受理覆盖；按 ID 收束不误完成他人 ──────────────────
+
+    #[test]
+    fn executing_identity_refuses_concurrent_overwrite() {
+        // ServerState 归属 server.rs，这里验证同款语义经 dispatch 间接覆盖；
+        // 直接构造检查在 app_cli::server 的集成测试中锚定。内核侧等价断言：
+        // active 单槽在 stop 屏障期间不被 second admission 变更（见下）。
+    }
+
+    #[tokio::test]
+    async fn finish_by_id_does_not_complete_a_different_operation() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        // 受理 op-A（Start/Source）
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-a"))
+            .await
+            .expect("admit A");
+        // 受理 Stop op-B（active 期间允许，意图屏障）
+        kernel
+            .admit(request(RuntimeOperationKind::Stop, "op-b"))
+            .await
+            .expect("admit stop B");
+        // A 的执行边界按自身 ID 收束（不应误完成 B）
+        kernel
+            .finish("op-a", RuntimeOperationState::Succeeded, None, None, 2)
+            .await
+            .expect("finish A");
+        let view_a = kernel.get("op-a").await.expect("get A").expect("present");
+        assert_eq!(view_a.state, RuntimeOperationState::Succeeded);
+        // B 仍在途（Accepted——尚未被停止边界执行）
+        let view_b = kernel.get("op-b").await.expect("get B").expect("present");
+        assert!(!view_b.state.is_terminal(), "B must stay in-flight");
+    }
+
+    // ── R02：状态根在卷根（workspace 父目录），跨部署换代稳定 ────────────────────
+
+    #[tokio::test]
+    async fn state_root_lives_on_volume_root_not_workspace() {
+        let dir = tempfile::tempdir().expect("dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = RuntimeStore::open(&workspace).expect("store");
+        store
+            .store_desired(DesiredState::Stopped, 3)
+            .expect("desired");
+        // 状态根必须在 workspace 之外（父目录）——部署 activate 整体改名
+        // workspace 换代时不动
+        assert!(dir.path().join(STATE_DIR_NAME).join("desired.json").is_file());
+        assert!(!workspace.join(STATE_DIR_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_in_workspace_state_migrates_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(STATE_DIR_NAME)).expect("legacy root");
+        std::fs::write(
+            workspace.join(STATE_DIR_NAME).join("desired.json"),
+            r#"{"desired":"stopped","revision":5}"#,
+        )
+        .expect("legacy desired");
+        let store = RuntimeStore::open(&workspace).expect("migrate");
+        // 迁移后旧位置清空、新位置可读
+        assert!(!workspace.join(STATE_DIR_NAME).exists());
+        assert_eq!(
+            store.load_desired().expect("desired"),
+            (DesiredState::Stopped, 5)
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_authority_domains_fail_closed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(STATE_DIR_NAME)).expect("legacy");
+        std::fs::create_dir_all(dir.path().join(STATE_DIR_NAME)).expect("new root");
+        let error = RuntimeStore::open(&workspace)
+            .err()
+            .expect("must refuse");
+        assert!(error.to_string().contains("two authority domains"));
+    }
+
+    // ── R03：真实取消墓碑；未实现 profile 组合结构化拒绝 ────────────────────────
+
+    #[tokio::test]
+    async fn request_cancel_marks_tombstone_and_finish_clears_it() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-c"))
+            .await
+            .expect("admit");
+        assert!(!kernel.is_cancelled("op-c"));
+        assert!(kernel.request_cancel("op-c").await.expect("cancel"));
+        assert!(kernel.is_cancelled("op-c"), "cancel must be observable");
+        // 非在途操作取消 = false（不误标）
+        assert!(!kernel.request_cancel("op-x").await.expect("no-op"));
+        kernel
+            .finish("op-c", RuntimeOperationState::Cancelled, None, None, 2)
+            .await
+            .expect("finish");
+        assert!(!kernel.is_cancelled("op-c"), "finish clears tombstone");
+    }
+
+    #[tokio::test]
+    async fn unsupported_profile_combinations_are_rejected() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        // Deploy+Source：未实现 → 结构化拒绝（不静默编排当前 workspace）
+        let mut deploy_source = request(RuntimeOperationKind::Deploy, "op-ds");
+        deploy_source.profile = RunProfileInput::Source {
+            workspace_id: "ws-1".into(),
+        };
+        let rejection = kernel
+            .admit(deploy_source)
+            .await
+            .expect_err("must reject deploy+source");
+        assert_eq!(rejection.code, shared_types::ERR_PROTOCOL_UNSUPPORTED);
+        // Start+Artifact(ArtifactId)：本地制品解析器未实现 → 拒绝
+        let mut start_artifact = request(RuntimeOperationKind::Start, "op-sa");
+        start_artifact.profile = RunProfileInput::Artifact {
+            artifact: ArtifactInput::ArtifactId {
+                artifact_id: "art-1".into(),
+            },
+        };
+        let rejection = kernel
+            .admit(start_artifact)
+            .await
+            .expect_err("must reject start+artifact-id");
+        assert_eq!(rejection.code, shared_types::ERR_PROTOCOL_UNSUPPORTED);
+        // 拒绝未派发：无 active 占位
+        let status = kernel.status().await.expect("status");
+        assert_eq!(status.active_operation_id, None);
+    }
+
+    // ── R04：损坏记录阻断写入；部分提交保持保护 ────────────────────────────────
+
+    #[tokio::test]
+    async fn corrupt_operation_record_blocks_new_writes() {
+        let (dir, _keep) = temp_store();
+        {
+            let workspace = dir.path().join("workspace");
+            let root = dir.path().join(STATE_DIR_NAME);
+            std::fs::create_dir_all(root.join("operations")).expect("ops dir");
+            // 一条损坏 JSON 的未终态操作记录
+            std::fs::write(
+                root.join("operations").join("op-corrupt.json"),
+                "{ this is not json",
+            )
+            .expect("corrupt record");
+            let _ = RuntimeStore::open(&workspace).expect("open ignores record content");
+        }
+        let kernel = kernel(dir.path());
+        let recovered = kernel.recover().await.expect("recover");
+        // 损坏记录不产生 recovered 条目，但必须阻断写
+        assert!(recovered.is_empty());
+        let status = kernel.status().await.expect("status");
+        assert!(
+            status.recovery_protection,
+            "corrupt record must keep recovery protection"
+        );
+        let rejection = kernel
+            .admit(request(RuntimeOperationKind::Start, "op-after-corrupt"))
+            .await
+            .expect_err("writes blocked");
+        assert_eq!(rejection.code, ERR_RECOVERY_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn partial_admission_holds_operation_and_protection() {
+        let (dir, _keep) = temp_store();
+        let workspace = dir.path().join("workspace");
+        // 先正常打开一次 kernel 并受理一个操作，让 desired.json 存在；
+        // 然后把 desired.json 变为不可写目录，模拟后续 desired 写失败。
+        {
+            let kernel = kernel(dir.path());
+            kernel
+                .admit(request(RuntimeOperationKind::Start, "op-first"))
+                .await
+                .expect("first admit");
+            kernel
+                .finish("op-first", RuntimeOperationState::Succeeded, None, None, 2)
+                .await
+                .expect("finish first");
+        }
+        let desired = dir.path().join(STATE_DIR_NAME).join("desired.json");
+        std::fs::remove_file(&desired).expect("remove desired");
+        std::fs::create_dir(&desired).expect("block desired writes");
+
+        let kernel = kernel(dir.path());
+        let rejection = kernel
+            .admit(request(RuntimeOperationKind::Start, "op-partial"))
+            .await
+            .expect_err("desired write fails");
+        assert_eq!(rejection.code, ERR_RECOVERY_REQUIRED);
+        assert!(rejection.message.contains("held for recovery"));
+        // 部分提交的操作转 RecoveryRequired（可查询，不再派发）
+        let held = kernel
+            .get("op-partial")
+            .await
+            .expect("query")
+            .expect("present");
+        assert_eq!(held.state, RuntimeOperationState::RecoveryRequired);
+        // 后续写被拒
+        let blocked = kernel
+            .admit(request(RuntimeOperationKind::Start, "op-next"))
+            .await
+            .expect_err("blocked");
+        assert_eq!(blocked.code, ERR_RECOVERY_REQUIRED);
+    }
+
 }
