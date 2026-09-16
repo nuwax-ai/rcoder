@@ -21,7 +21,9 @@ use crate::DockerManager;
 pub struct DockerRuntime {
     pub(super) inner: Arc<DockerManager>,
     /// TTL cache for list_containers result (15 seconds)
-    list_cache: Cache<(), Vec<RuntimeContainerInfo>>,
+    /// 列表缓存携带状态代次：命中时与 [`ContainerStateHandle::list_epoch`]
+    /// 比对，变更（创建/删除/更新）后立即可见，不再单靠 TTL。
+    list_cache: Cache<(), (u64, Vec<RuntimeContainerInfo>)>,
 }
 
 impl DockerRuntime {
@@ -429,14 +431,18 @@ impl AgentContainerRuntime for DockerRuntime {
     }
 
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
-        // 尝试从缓存获取
-        if let Some(cached) = self.list_cache.get(&()).await {
+        let epoch = self.inner.containers.list_epoch();
+        // 命中且代次一致才可用；状态已变更（创建/删除/更新）则强制刷新
+        if let Some((cached_epoch, cached)) = self.list_cache.get(&()).await
+            && cached_epoch == epoch
+        {
             return Ok(cached);
         }
 
-        // 缓存未命中或过期，fetch 并写入缓存
         let result = self.fetch_containers().await?;
-        self.list_cache.insert((), result.clone()).await;
+        // 存 fetch 前代次：fetch 期间发生的变更会让下次读取失效重取，
+        // 不会把变更前的快照误标为最新
+        self.list_cache.insert((), (epoch, result.clone())).await;
         Ok(result)
     }
 

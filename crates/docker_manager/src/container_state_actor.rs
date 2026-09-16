@@ -78,18 +78,29 @@ pub enum ContainerStateCommand {
 pub struct ContainerStateActor {
     containers: HashMap<String, DockerContainerInfo>,
     receiver: mpsc::Receiver<ContainerStateCommand>,
+    /// 与 handle 共享的状态代次：仅在实际应用变更**之后**递增——
+    /// 读侧宁可多失效一次，绝不把未落盘的变更标成已可见
+    list_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ContainerStateActor {
     /// 创建新的 Actor 和 Handle
     pub fn new() -> (Self, ContainerStateHandle) {
         let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+        let list_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let actor = Self {
             containers: HashMap::new(),
             receiver,
+            list_epoch: list_epoch.clone(),
         };
-        let handle = ContainerStateHandle { sender };
+        let handle = ContainerStateHandle { sender, list_epoch };
         (actor, handle)
+    }
+
+    /// 变更应用后递增共享代次。
+    fn bump_epoch(&self) {
+        self.list_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// 运行 Actor 事件循环
@@ -124,9 +135,11 @@ impl ContainerStateActor {
             }
             ContainerStateCommand::Insert { key, info } => {
                 self.containers.insert(key, info);
+                self.bump_epoch();
             }
             ContainerStateCommand::Remove { key, reply } => {
                 let result = self.containers.remove(&key);
+                self.bump_epoch();
                 if reply.send(result).is_err() {
                     warn!("[ACTOR] Remove reply channel closed");
                 }
@@ -166,6 +179,7 @@ impl ContainerStateActor {
                 } else {
                     false
                 };
+                self.bump_epoch();
                 if reply.send(existed).is_err() {
                     warn!("[ACTOR] UpdateWith reply channel closed");
                 }
@@ -186,6 +200,7 @@ impl ContainerStateActor {
                 } else {
                     None
                 };
+                self.bump_epoch();
 
                 if reply.send(result).is_err() {
                     warn!("[ACTOR] RemoveIfContainerId reply channel closed");
@@ -206,6 +221,7 @@ impl ContainerStateActor {
                     .into_iter()
                     .filter_map(|k| self.containers.remove(&k))
                     .collect();
+                self.bump_epoch();
                 if reply.send(removed).is_err() {
                     warn!("[ACTOR] RemoveAllByContainerId reply channel closed");
                 }
@@ -216,13 +232,24 @@ impl ContainerStateActor {
 
 /// 容器状态句柄
 ///
-/// 可克隆，用于与 Actor 通信
+/// 可克隆，用于与 Actor 通信。
+///
+/// `list_epoch` 在每次状态变更（insert/remove/update）前递增：供
+/// `DockerRuntime::list_containers` 的 TTL 缓存做代次校验——新建/删除
+/// 容器后列表立即可见，不再受 15s TTL 内的陈旧快照影响（e2e
+/// pod/list 对 ensure 后即时可见性的时序要求）。
 #[derive(Clone)]
 pub struct ContainerStateHandle {
     sender: mpsc::Sender<ContainerStateCommand>,
+    list_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ContainerStateHandle {
+    /// 当前状态代次（每次实际变更后递增；只读观察用）。
+    pub fn list_epoch(&self) -> u64 {
+        self.list_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// 获取容器信息
     pub async fn get(&self, key: &str) -> Option<DockerContainerInfo> {
         let (reply, rx) = oneshot::channel();
@@ -439,5 +466,66 @@ impl std::fmt::Debug for ContainerStateHandle {
     }
 }
 
-// Tests removed intentionally.
-// Integration tests should be implemented in `tests/` directory if needed.
+// 单元测试见下方；跨模块集成验证由 docker_runtime 的 list 缓存代次测试
+// 与 e2e pod/list 即时可见性场景承担。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_info(name: &str) -> DockerContainerInfo {
+        serde_json::from_value(serde_json::json!({
+            "container_id": format!("id-{name}"),
+            "container_name": name,
+            "project_id": name,
+            "image": "fixture",
+            "status": "Running",
+            "created_at": "2026-09-16T00:00:00Z",
+            "host_path": "/tmp",
+            "container_path": "/workspace",
+            "port_bindings": {},
+            "assigned_port": 0,
+            "internal_port": 8086,
+            "network_name": "test"
+        }))
+        .expect("minimal container info")
+    }
+
+    #[tokio::test]
+    async fn list_epoch_bumps_on_every_state_mutation() {
+        // list 缓存代次失效的输入契约：任一状态变更都必须在实际应用后递增
+        // epoch——否则创建/删除后的 list_containers 命中陈旧快照（e2e
+        // pod/list ensure 后即时可见性，2026-09-16 复现）
+        let (actor, handle) = ContainerStateActor::new();
+        tokio::spawn(actor.run());
+        let base = handle.list_epoch();
+
+        // insert 是发后即忘：用同通道 FIFO 的读命令做屏障（get 返回时
+        // insert 必已应用，代次递增已可见——不 sleep、不轮询）
+        handle.insert("k1".into(), minimal_info("k1")).await;
+        assert!(handle.get("k1").await.is_some(), "insert 已应用");
+        let after_insert = handle.list_epoch();
+        assert!(after_insert > base, "insert 必须递增代次");
+
+        handle.update_if_exists("k1", minimal_info("k1")).await;
+        let after_update = handle.list_epoch();
+        assert!(after_update > after_insert, "update 必须递增代次");
+
+        handle.remove("k1").await;
+        let after_remove = handle.list_epoch();
+        assert!(after_remove > after_update, "remove 必须递增代次");
+
+        // 条件/批量移除同样递增（即使未命中条目——宁可早失效；两者均有
+        // 回执，返回即已应用）
+        handle.remove_all_by_container_id("absent").await;
+        let after_batch = handle.list_epoch();
+        assert!(after_batch > after_remove, "批量移除递增代次");
+        handle.remove_if_container_id("missing", "id-none").await;
+        let after_conditional = handle.list_epoch();
+        assert!(after_conditional > after_batch, "条件移除递增代次");
+
+        // 只读操作不递增
+        assert!(handle.get("missing").await.is_none());
+        assert_eq!(handle.list_epoch(), after_conditional, "get 不改变代次");
+    }
+}
