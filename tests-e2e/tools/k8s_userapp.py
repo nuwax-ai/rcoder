@@ -315,14 +315,21 @@ strip_prefix = false
             row = json.loads(self.kube('get', 'deployment', 'rcoder-app-' + self.app, '-o', 'json'))
             return row['metadata']['resourceVersion']
 
+        # 3 次连续不变才算静默——控制器 status 后续写入（readiness 探针
+        # 周期 5s）可能滞后于首次稳定
+        stable = 0
         last = version()
         deadline = time.monotonic() + budget
         while time.monotonic() < deadline:
             time.sleep(interval)
             current = version()
             if current == last:
-                return
-            last = current
+                stable += 1
+                if stable >= 2:
+                    return
+            else:
+                stable = 0
+                last = current
         self.check('lock_holder_deployment_quiesced', False,
                    {'last_resource_version': last, 'budget_s': budget})
 

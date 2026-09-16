@@ -124,20 +124,38 @@ impl AppService {
         wait: bool,
     ) -> AppResult<AppOperationGuard> {
         let runtime = if self.config.access_mode == AppAccessMode::Kubernetes {
-            Some(
-                self.runtime
-                    .acquire_app_operation(app_id)
-                    .await
-                    .map_err(|error| {
-                        crate::utils::map_runtime_error("acquire application operation", error)
-                    })?
-                    .ok_or_else(|| {
-                        AppOperationError::Backend(
-                            "Kubernetes runtime does not support application operation leases"
-                                .into(),
-                        )
-                    })?,
-            )
+            // K8s 租约等待语义对齐 Docker flock 轮询：wait=true 时 409
+            // （OperationInProgress）按间隔重试直至持有者释放——start（无 url）
+            // 与内部回收器的"排队等待"契约在 K8s 模式同样成立；wait=false
+            // 立即 Conflict（外部 stop/restart/delete 快失败）。
+            const LEASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+            let lease = loop {
+                match self.runtime.acquire_app_operation(app_id).await {
+                    Ok(acquired) => {
+                        break acquired.ok_or_else(|| {
+                            AppOperationError::Backend(
+                                "Kubernetes runtime does not support application operation leases"
+                                    .into(),
+                            )
+                        })?;
+                    }
+                    Err(error)
+                        if matches!(
+                            error,
+                            container_runtime_api::ContainerRuntimeError::OperationInProgress(_)
+                        ) && wait =>
+                    {
+                        tokio::time::sleep(LEASE_POLL_INTERVAL).await;
+                    }
+                    Err(error) => {
+                        return Err(crate::utils::map_runtime_error(
+                            "acquire application operation",
+                            error,
+                        ));
+                    }
+                }
+            };
+            Some(lease)
         } else {
             None
         };

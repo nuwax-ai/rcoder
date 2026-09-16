@@ -245,7 +245,15 @@ impl UserAppDeploymentRuntime for MockRuntime {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return Err(ContainerRuntimeError::Conflict("operation owned".into()));
+            // 对齐真实 K8s 运行时：409 → OperationInProgress（等待语义判据）
+            return Err(ContainerRuntimeError::OperationInProgress(Box::new(
+                shared_types::UserAppOperationInProgress {
+                    app_id: _app_id.into(),
+                    service_type: ServiceType::Userapp,
+                    resource_name: format!("rcoder-operation-prod-{_app_id}"),
+                    operation_id: None,
+                },
+            )));
         }
         Ok(Some(Box::new(MockOperationLease(
             self.lease_held.clone(),

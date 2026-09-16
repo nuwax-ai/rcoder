@@ -572,6 +572,48 @@ async fn test_service_with_mode(
 /// OperationInProgress 在 map_runtime_error 同一映射臂）→ 外部 stop 立即
 /// Conflict、不重试不排队、零运行时变更；租约释放后可正常取得。
 #[tokio::test]
+async fn kubernetes_waiting_acquire_polls_until_lease_released() {
+    // K8s 模式等待语义：wait=true 时租约被占轮询直至持有者释放
+    //（131 实测修复前 start 无 url 在忙锁下立即 ERR_CONFLICT）
+    let directory = tempfile::tempdir().expect("directory");
+    let runtime = Arc::new(MockRuntime::default());
+    let service =
+        test_service_with_mode(directory.path(), runtime.clone(), AppAccessMode::Kubernetes).await;
+    service
+        .metadata
+        .store
+        .ensure_identity("k8swait")
+        .await
+        .expect("identity");
+    // 他者持有租约
+    runtime.lease_held.store(true, Ordering::SeqCst);
+    let process = service
+        .release_locks
+        .entry("k8swait".to_owned())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+        .lock_owned()
+        .await;
+    let waiting = service.operation_guard("k8swait", process, true);
+    tokio::pin!(waiting);
+    // 等待者保持排队（不立即失败）
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), &mut waiting)
+            .await
+            .is_err(),
+        "wait=true 必须排队等待而非立即 Conflict"
+    );
+    // 释放租约 → 等待者在有界时间内获得
+    runtime.lease_held.store(false, Ordering::SeqCst);
+    let guard = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .expect("bounded wait")
+        .expect("waiting acquire succeeds");
+    assert!(runtime.lease_held.load(Ordering::SeqCst));
+    drop(guard);
+}
+
+#[tokio::test]
 async fn kubernetes_lease_conflict_fails_fast_without_queueing() {
     let root = tempfile::tempdir().expect("tempdir");
     let runtime = Arc::new(MockRuntime::default());
