@@ -307,33 +307,60 @@ strip_prefix = false
     def lock_window_holder(self, artifact, admitted_check):
         """在副本0发起一个在途持有者（热部署），以操作受理记录为可观察同步点。
 
-        返回 (holder_thread, rid, view_path)；线程结果存 holder_outcome 列表。
-        admitted_check：持有者被受理后需要满足的断言 id（不同窗口分别登记）。
+        返回 (holder_thread, rid, view_path, holder_outcome)。admitted_check：
+        持有者被受理后需要满足的断言 id（不同窗口分别登记）。
+
+        env 收敛以 Deployment resourceVersion 判并发——kube-controller 的
+        status 写入同样推进 resourceVersion，热部署撞上滚动后 status 抖动会
+        误报 "hot deployment or env changed concurrently"（瞬态，非锁语义）。
+        持有者对该冲突有界重试（新 request_id）；受理同步跟随线程当前 rid。
         """
-        rid = 'lock-holder-' + uuid.uuid4().hex[:16]
         holder_outcome = []
+        live = {'rid': None, 'attempts': 0}
 
         def call():
-            holder_outcome.append(self.request('/api/v1/userapp/' + self.app + '/start',
-                                               {'user_id': self.user, 'request_id': rid,
-                                                **artifact, 'deploy_mode': 'hot'},
-                                               self.entries[0], timeout=300))
+            while True:
+                rid = 'lock-holder-' + uuid.uuid4().hex[:16]
+                live['rid'] = rid
+                status, envelope = self.request('/api/v1/userapp/' + self.app + '/start',
+                                                {'user_id': self.user, 'request_id': rid,
+                                                 **artifact, 'deploy_mode': 'hot'},
+                                                self.entries[0], timeout=300)
+                if status == 200 and envelope.get('code') == '0000':
+                    holder_outcome.append((status, envelope, rid))
+                    return
+                if ('changed concurrently' in envelope.get('message', '')
+                        and live['attempts'] < 2):
+                    live['attempts'] += 1
+                    time.sleep(3)
+                    continue
+                holder_outcome.append((status, envelope, rid))
+                return
 
         thread = threading.Thread(target=call, daemon=True)
         thread.start()
-        view_path = '/api/v1/userapp/' + self.app + '/operations/by-request?' + urllib.parse.urlencode(
-            {'user_id': self.user, 'request_id': rid})
 
-        def admitted():
-            status, data = self.request(view_path, base=self.entries[1])
+        def view_path_for(rid):
+            return ('/api/v1/userapp/' + self.app + '/operations/by-request?'
+                    + urllib.parse.urlencode({'user_id': self.user, 'request_id': rid}))
+
+        def current_admitted():
+            # 跟随重试轮换：以线程当前 rid 查受理记录；窗口未开（含重试间隙）
+            # 返回 None 继续等
+            rid = live['rid']
+            if not rid:
+                return None
+            status, data = self.request(view_path_for(rid), base=self.entries[1])
             operation = data.get('data') if isinstance(data, dict) else None
-            return operation if status == 200 and operation and operation.get('operation_id') else None
+            if status == 200 and operation and operation.get('operation_id'):
+                return operation
+            return None
 
-        operation = self.poll(admitted, bool, 90)
+        operation = self.poll(current_admitted, bool, 120)
         self.check(admitted_check,
                    thread.is_alive() and operation.get('state') != 'Succeeded',
                    {'operation': operation, 'holder_http_pending': thread.is_alive()})
-        return thread, rid, view_path, holder_outcome
+        return thread, live['rid'], view_path_for(live['rid'] or ''), holder_outcome
 
     def lock_fail_fast(self, artifact_b):
         """忙锁窗口：外部 stop/restart/delete 立即 ERR_CONFLICT（HTTP 200 信封），
@@ -389,9 +416,10 @@ strip_prefix = false
                        {'operation': operation, 'holder_http_pending': thread.is_alive()})
         finally:
             thread.join(300)
-        status, envelope = holder_outcome[0]
-        self.check('lock_holder_completes', status == 200 and envelope.get('code') == '0000',
-                   {'status': status, 'envelope': envelope})
+        holder_status, holder_envelope, _ = holder_outcome[0] if holder_outcome else (0, {}, '')
+        self.check('lock_holder_completes',
+                   holder_status == 200 and holder_envelope.get('code') == '0000',
+                   {'status': holder_status, 'envelope': holder_envelope})
         # 释放后不自动执行被拒请求：给假想的排队 stop 一个执行窗口后，
         # 应用仍应 1 副本 Running、无 Stop 操作记录、内容不受影响
         time.sleep(2)
@@ -424,10 +452,10 @@ strip_prefix = false
         holder_done = time.monotonic()
         start_thread.join(300)
         start_done = time.monotonic()
-        status, envelope = start_outcome[0]
+        start_status, start_envelope, _ = start_outcome[0] if start_outcome else (0, {}, '')
         self.check('lock_start_waits_for_holder',
-                   status == 200 and envelope.get('code') == '0000' and start_done >= holder_done,
-                   {'status': status, 'envelope': envelope,
+                   start_status == 200 and start_envelope.get('code') == '0000' and start_done >= holder_done,
+                   {'status': start_status, 'envelope': start_envelope,
                     'start_elapsed_ms': int((start_done - started) * 1000),
                     'holder_done_before_start_return': start_done >= holder_done})
 
