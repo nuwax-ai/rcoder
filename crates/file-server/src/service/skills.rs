@@ -80,6 +80,9 @@ pub struct PushToStoreParams<'a> {
     pub zip_path: Option<&'a Path>,
     pub skill_urls: Vec<String>,
     pub downloader: &'a SkillDownloader,
+    /// 共享工作区（normalProject）项目 ID：Some → manifest 并集视图自愈式
+    /// 同步（动态技能不进 manifest，仅补链）；None → 目录级软链 + 跨 agent 防线
+    pub shared_project_id: Option<&'a str>,
 }
 
 /// push-skills to agent-store (对齐 TS pushSkillsToAgentStore)。
@@ -93,6 +96,7 @@ pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppRes
         zip_path,
         skill_urls,
         downloader,
+        shared_project_id,
     } = params;
     let session_workspace = user_root.join(cid);
     fs::create_dir_all(&session_workspace).await?;
@@ -127,13 +131,25 @@ pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppRes
         );
     }
 
-    // 软链会话工作区 → agent-store (确保链接有效)
-    crate::service::agent_store::link_workspace_to_agent_store(
-        &session_workspace,
-        &agent_skills_dir,
-        &agent_agents_dir,
-    )
-    .await?;
+    // 共享工作区 → 自愈式视图同步（动态加技能不改变配置清单——不传清单，
+    // 仅补新装技能的链）；非共享 → 目录级软链
+    if let Some(project_id) = shared_project_id {
+        crate::service::agent_store::sync_shared_skill_view(
+            user_root,
+            &session_workspace,
+            agent_id,
+            project_id,
+            crate::service::agent_store::SharedSkillLists::default(),
+        )
+        .await?;
+    } else {
+        crate::service::agent_store::link_workspace_to_agent_store(
+            &session_workspace,
+            &agent_skills_dir,
+            &agent_agents_dir,
+        )
+        .await?;
+    }
 
     tracing::info!(
         op = "push_skills_to_agent_store",

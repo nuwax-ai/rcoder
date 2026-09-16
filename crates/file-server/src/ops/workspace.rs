@@ -70,6 +70,9 @@ pub struct PushSkillsParams<'a> {
     /// agent-store 根锚定 (项目绑定目录场景, 对齐 TS 1.4.5 `getAgentStorePath`
     /// ——store 锚定配置根不随绑定漂移); `None` 保持 `ws.parent()` 派生
     /// (默认布局, 与历史行为逐字节一致)。
+    /// 共享工作区（normalProject）项目 ID：Some → 直接 store 模式（不做目录级
+    /// 软链探测——共享视图的挂载目录是实体目录，探测必为 false）+ manifest 同步
+    pub shared_project_id: Option<&'a str>,
     pub agent_store_root: Option<&'a Path>,
 }
 
@@ -94,6 +97,7 @@ pub async fn push_skills_core(
             agent_id,
             allow_agent_store,
             agent_store_root: None,
+            shared_project_id: None,
         },
     )
     .await
@@ -112,6 +116,7 @@ pub async fn push_skills_core_with_store(
         agent_id,
         allow_agent_store,
         agent_store_root,
+        shared_project_id,
     } = params;
     if !crate::service::fs_util::path_exists(ws).await? {
         return Err(AppError::resource("workspace does not exist"));
@@ -121,7 +126,9 @@ pub async fn push_skills_core_with_store(
     let agent_id = agent_id.map(|s| s.trim()).filter(|s| !s.is_empty());
     let updated = if allow_agent_store && let Some(agent_id) = agent_id {
         let skills_path = ws.join(".agents").join("skills");
-        if crate::service::agent_store::is_dir_link(&skills_path) {
+        // 共享工作区（TS 同款）：挂载目录为实体目录（条目级链接），不做目录级
+        // 软链探测，直接走 store 模式 + manifest 视图同步
+        if shared_project_id.is_some() || crate::service::agent_store::is_dir_link(&skills_path) {
             let user_root = match agent_store_root {
                 Some(root) => root.to_path_buf(),
                 None => ws.parent().unwrap_or(ws).to_path_buf(),
@@ -133,6 +140,7 @@ pub async fn push_skills_core_with_store(
                 zip_path: zip_data.map(|file| file.path()),
                 skill_urls,
                 downloader: &state.skill_downloader,
+                shared_project_id,
             })
             .await?
         } else {

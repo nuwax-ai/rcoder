@@ -257,6 +257,13 @@ pub(crate) async fn create_workspace_v2(
                 update_skill_names,
                 hook_config: Some(hook_input),
                 downloader: Some(&state.skill_downloader),
+                // 共享工作区（normalProject 且带项目 ID）→ manifest 并集视图；
+                // userapp 消费链现状不可达（直转恒 legacy），保持不激活（有意偏离）
+                shared_project_id: if crate::extract::is_normal_project_request() {
+                    app_id.as_deref()
+                } else {
+                    None
+                },
             },
         )
         .await?

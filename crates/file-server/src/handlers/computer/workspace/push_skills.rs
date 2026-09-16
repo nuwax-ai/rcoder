@@ -116,6 +116,13 @@ async fn push_skills_to_workspace_impl(
             agent_id: agent_id.as_deref(),
             allow_agent_store: true,
             agent_store_root: Some(&store_root),
+            // 共享工作区（normalProject 且带项目 ID）→ 直接 store 模式 +
+            // manifest 视图同步；userapp 消费链不可达，不激活（有意偏离）
+            shared_project_id: if crate::extract::is_normal_project_request() {
+                app_id.as_deref()
+            } else {
+                None
+            },
         },
     )
     .await

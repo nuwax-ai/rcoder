@@ -28,6 +28,9 @@ pub struct CreateAgentStoreParams<'a> {
     pub update_skill_names: Option<Vec<String>>,
     pub hook_config: Option<crate::service::agent_hooks::HookConfigInput>,
     pub downloader: Option<&'a crate::service::skill_download::SkillDownloader>,
+    /// 共享工作区（normalProject）项目 ID：Some → manifest 并集视图替代
+    /// 目录级整链（多智能体并存）；None → 保留旧目录级软链 + 跨 agent 防线
+    pub shared_project_id: Option<&'a str>,
 }
 
 /// create-workspace with agent-store (对齐 TS createWorkspaceWithAgentStore)。
@@ -54,6 +57,7 @@ pub async fn create_workspace_with_agent_store(
         update_skill_names,
         hook_config,
         downloader,
+        shared_project_id,
     } = params;
     let start = std::time::Instant::now();
 
@@ -61,10 +65,12 @@ pub async fn create_workspace_with_agent_store(
     let session_workspace = session_workspace.to_path_buf();
     fs::create_dir_all(&session_workspace).await?;
 
-    // 共享工作区防线：现有 store 链指向其他 agent 时 fail-fast（防目录级重链
-    // 静默覆盖先驻 agent 技能；manifest 并集视图复刻前的过渡防线）
-    crate::service::agent_store::detect_cross_agent_link_conflict(&session_workspace, agent_id)
-        .await?;
+    // 共享工作区（normalProject）走 manifest 并集视图（多智能体并存）；
+    // 目录级整链的跨 agent 冲突防线仅对非共享（taskAgent 每会话独占）生效
+    if shared_project_id.is_none() {
+        crate::service::agent_store::detect_cross_agent_link_conflict(&session_workspace, agent_id)
+            .await?;
+    }
 
     // 1. 确保 agent-store 目录
     let (agent_skills_dir, agent_agents_dir) =
@@ -218,13 +224,37 @@ pub async fn create_workspace_with_agent_store(
         crate::service::agent_store::prune_agent_skills(&agent_skills_dir, skill_names).await?;
     }
 
-    // 6. 软链会话工作区 → agent-store (软链优先, 失败 fallback copy)
-    crate::service::agent_store::link_workspace_to_agent_store(
-        &session_workspace,
-        &agent_skills_dir,
-        &agent_agents_dir,
-    )
-    .await?;
+    // 6. 共享工作区（normalProject）→ manifest 并集视图（多智能体并存、
+    //    增量增删）；其余（taskAgent 每会话独占）保留目录级软链（copy 兜底）。
+    //    TS 同款：skillNames 原始参数未传（旧客户端全量模式）时不更新清单，
+    //    仅做视图校准——空数组会把 manifest 引用清空导致技能被误删。
+    if let Some(project_id) = shared_project_id {
+        // agents 实体可能为文件（.md）或目录（多文件 subagent 包），一并纳入 manifest
+        let mut subagent_names = Vec::new();
+        if let Ok(mut rd) = fs::read_dir(&agent_agents_dir).await {
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                subagent_names.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+        crate::service::agent_store::sync_shared_skill_view(
+            user_root,
+            &session_workspace,
+            agent_id,
+            project_id,
+            crate::service::agent_store::SharedSkillLists {
+                skills: skill_names.clone(),
+                subagents: Some(subagent_names),
+            },
+        )
+        .await?;
+    } else {
+        crate::service::agent_store::link_workspace_to_agent_store(
+            &session_workspace,
+            &agent_skills_dir,
+            &agent_agents_dir,
+        )
+        .await?;
+    }
 
     tracing::info!(
         op = "create_workspace_with_agent_store",
@@ -418,6 +448,7 @@ mod tests {
             update_skill_names: None,
             hook_config: None,
             downloader: None,
+            shared_project_id: None,
         })
         .await
         .unwrap();
@@ -476,6 +507,7 @@ mod tests {
             update_skill_names: None,
             hook_config: None,
             downloader: None,
+            shared_project_id: None,
         })
         .await
         .unwrap();
@@ -507,6 +539,7 @@ mod tests {
             update_skill_names: None,
             hook_config: None,
             downloader: None,
+            shared_project_id: None,
         })
         .await
         .unwrap();
