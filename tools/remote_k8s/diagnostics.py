@@ -39,9 +39,14 @@ def _probe(label, namespace_hint=''):
                         'duration_ms': int((time.monotonic() - started) * 1000),
                         'detail': str(error)[:200]}
             except Exception as error:  # noqa: BLE001 - 分项隔离：单项失败不拖垮其他诊断
-                return {'name': label, 'status': 'fail', 'error_class': type(error).__name__,
+                # K8s RBAC 拒绝（kubectl 403/Forbidden）是"权限不可判定"，不是
+                # 业务失败：记 unknown，绝不当通过也不误报失败（T07）。
+                message = str(error)
+                error_class = 'forbidden' if 'forbidden' in message.lower() or '(403)' in message else type(error).__name__
+                status = 'unknown' if error_class == 'forbidden' else 'fail'
+                return {'name': label, 'status': status, 'error_class': error_class,
                         'duration_ms': int((time.monotonic() - started) * 1000),
-                        'detail': str(error)[:200]}
+                        'detail': message[:200]}
         return run
     return wrapper
 
@@ -81,6 +86,9 @@ def _deployment(c):
     state = _deployment_state(c)
     if state is None:
         raise RuntimeError('rcoder deployment absent (never deployed or scaled down)')
+    # 存在 ≠ 可用：ready 副本不足时明确失败（T07——滚动中/崩溃态必须可见）
+    if not state['ready'] or state['ready'] != state['replicas']:
+        raise RuntimeError(f"rcoder deployment not ready: {state['ready']}/{state['replicas']}")
     return state
 
 
@@ -137,10 +145,18 @@ def _dns(c):
 
 @_probe('ceph-detail')
 def _ceph(c):
-    # 只读尽力探查；无权限/无 Ceph CRD 记 unknown（wrapper 已分类），不当通过
+    # 只读尽力探查；无权限/无 Ceph CRD 记 unknown（wrapper 已分类），不当通过。
+    # 健康值非 HEALTH_OK（含 HEALTH_ERR/WARN）→ 明确失败（T07：异常健康态
+    # 不得在 check 中显示为 pass）。
     rows = c.ssh(['kubectl', '--context', c.context, 'get', 'cephcluster', '-A',
                   '-o', 'jsonpath={.items[*].status.ceph.health}'], timeout=ITEM_TIMEOUT_SECONDS)
-    return rows.strip() or 'no cephcluster CRD reports health'
+    health = rows.strip()
+    if not health:
+        return 'no cephcluster CRD reports health'
+    bad = [value for value in health.split() if value != 'HEALTH_OK']
+    if bad:
+        raise RuntimeError('ceph health not OK: ' + ' '.join(bad))
+    return health
 
 
 def _deployment_receipt(c):
@@ -151,19 +167,36 @@ def _deployment_receipt(c):
 
 
 def check(c):
-    items = [_ssh, _api, _namespace, _deployment, _direct, _gateway,
-             _pvc, _storage, _dns, _ceph]
+    probes = [('ssh-connectivity', _ssh), ('kubectl-api', _api), ('namespace-present', _namespace),
+              ('deployment-runtime', _deployment), ('direct-health', _direct), ('gateway-health', _gateway),
+              ('pvc-bound', _pvc), ('storage-class', _storage), ('coredns-pods', _dns),
+              ('ceph-detail', _ceph)]
+    priority = {label: index for index, (label, _) in enumerate(probes)}
     results = []
+    pending = dict(probes)  # label -> probe；完成即移除
     started = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(item, c): item for item in items}
-        for future in concurrent.futures.as_completed(futures, timeout=CHECK_BUDGET_SECONDS):
-            results.append(future.result())
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    try:
+        futures = {pool.submit(fn, c): label for label, fn in probes}
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=CHECK_BUDGET_SECONDS):
+                results.append(future.result())
+                pending.pop(futures[future], None)
+        except concurrent.futures.TimeoutError:
+            # 总预算耗尽：已完成项保留、未完成项记 unknown，始终落部分报告
+            # （T07——超时不得丢失已收集证据，也不得静默漏报未检项）
+            for future, label in futures.items():
+                if future.done() and not future.cancelled():
+                    results.append(future.result())
+                    pending.pop(label, None)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     elapsed = int((time.monotonic() - started) * 1000)
+    for label in pending:
+        results.append({'name': label, 'status': 'unknown', 'error_class': 'budget-exceeded',
+                        'duration_ms': elapsed,
+                        'detail': f'check budget {CHECK_BUDGET_SECONDS}s exhausted before this item finished'})
     # 稳定排序：按检查项定义序展示
-    priority = {'ssh-connectivity': 0, 'kubectl-api': 1, 'namespace-present': 2,
-                'deployment-runtime': 3, 'direct-health': 4, 'gateway-health': 5,
-                'pvc-bound': 6, 'storage-class': 7, 'coredns-pods': 8, 'ceph-detail': 9}
     results.sort(key=lambda row: priority.get(row['name'], 99))
     destination = c.state / 'checks' / (str(int(time.time())) + '-' + digest(results)[:8])
     atomic_json(destination / 'check.json', {'environment': c.id, 'elapsed_ms': elapsed, 'items': results})

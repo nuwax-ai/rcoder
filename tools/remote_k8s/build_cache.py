@@ -21,15 +21,22 @@ CACHE_SCHEMA = 1
 TARGETS = ['rcoder', 'computer', 'runtime']
 
 
-def cache_key(source_sha256, bases, config):
+def cache_key(source_sha256, bases, config, rust_image=None):
     """整源保守 key：任一输入维度变化即 miss。三目标共用同一 key 空间，
     key 内含目标名（计算机/运行时镜像不可因只改 rcoder 而互相误复用——
-    保守阶段三目标同 key 命中或同 miss，目标级细分属 C 批）。"""
+    保守阶段三目标同 key 命中或同 miss，目标级细分属 C 批）。
+
+    rust_image：调用方解析出的实际工具链镜像 digest（T06）——同 tag 被
+    registry 更新（digest 变化）时 key 必须变化。未传时退回配置 tag 字符串
+    仅用于既有单元测试；真实构建路径必须传解析值或 'unresolved:...' 标记
+    （未解析轮次与已解析轮次 key 恒不同，永不误命中）。
+    """
     return digest({
         'schema': CACHE_SCHEMA,
         'source_sha256': source_sha256,
         'bases': bases,
-        'rust_image': config.get('RUST_IMAGE', 'rust:1.95-trixie'),
+        'rust_image': rust_image if rust_image is not None
+        else config.get('RUST_IMAGE', 'rust:1.95-trixie'),
         'cargo_jobs': config.get('JOBS', '4'),
         'apt_mirror': config.get('APT_MIRROR', 'http://deb.debian.org'),
         'cargo_mirror': config.get('CARGO_MIRROR', ''),

@@ -191,8 +191,22 @@ def build(c, expected_manifest=None):
         receipt['bases'][key] = pinned
         base_args += ['--build-arg', key + '=' + pinned]
     receipt['timings']['base_resolution_ms'] = int((time.monotonic() - bases_started) * 1000)
+    # T06：缓存 key 锁定构建工具链实际 digest——同 tag 被 registry 更新后必须
+    # miss，不得复用旧 tag 名下的产物。解析失败 → 记 'unresolved:...'（与任何
+    # 已解析轮次不同 key，永不误命中）；构建本身继续使用 tag。
+    rust_ref = c.get('RUST_IMAGE', 'rust:1.95-trixie')
+    try:
+        rust_info = c.ssh(['docker', 'buildx', 'imagetools', 'inspect', rust_ref], timeout=180)
+        rust_match = re.search(r'^Digest:\s*(sha256:[a-f0-9]{64})', rust_info, re.M)
+        if not rust_match:
+            raise ValueError('no digest in imagetools output')
+        receipt['rust_image'] = rust_ref.split('@')[0] + '@' + rust_match.group(1)
+    except (RuntimeError, ValueError) as error:
+        receipt['rust_image'] = 'unresolved:' + rust_ref + ':' + type(error).__name__
+        print('Warning: RUST_IMAGE digest unresolved (' + type(error).__name__ +
+              '); reusing cached builds is disabled for this round', flush=True)
     # R2 保守构建复用：同 key 完整成功 receipt + registry 产物核验 → 复用
-    key = build_cache.cache_key(receipt['source_sha256'], receipt['bases'], c)
+    key = build_cache.cache_key(receipt['source_sha256'], receipt['bases'], c, rust_image=receipt['rust_image'])
     receipt['cache_key'] = key
     cached = build_cache.load(c, key)
     if cached:
@@ -392,13 +406,20 @@ def smoke(c, receipt):
 CHAT_CASE_PATTERN = re.compile(r'^(pass|fail): k8s_lb::([a-zA-Z0-9_]+)$', re.M)
 
 
-def registered_chat_cases():
-    catalog = json.loads((ROOT / 'tests-e2e/tools/suite_cases.json').read_text())
+def registered_chat_cases(root=ROOT):
+    """已注册 chat 场景目录。retest 传冻结快照根：活动目录的 catalog 变化
+    不得影响对历史冻结输入的校验（T05）。"""
+    catalog = json.loads((Path(root) / 'tests-e2e/tools/suite_cases.json').read_text())
     return list(catalog.get('k8s_lb', []))
 
 
 def run_chat_suite(c, receipt, context, case=''):
-    """chat 套件经严格启动器执行；case 精确筛选时记录部分覆盖标记。"""
+    """chat 套件经严格启动器执行；case 精确筛选时记录部分覆盖标记。
+
+    启动器非零退出（存在失败场景）时仍解析已完成场景的逐项结果并放入
+    context['cases']——失败报告必须携带失败用例集合（可重跑），无结果可解析
+    的基础设施失败保持空集，不伪造用例。解析完成后原样上抛失败。
+    """
     env = dict(os.environ)
     env.update({k: v for k, v in c.values.items() if k.startswith('LLM_')})
     snapshot_root = context['snapshot_path']
@@ -416,10 +437,18 @@ def run_chat_suite(c, receipt, context, case=''):
             raise ValueError('Missing ' + key + ' (real LLM is required; refusing to mock or skip)')
     launcher = snapshot_root / 'tests-e2e/tools/run.py'
     args = ['python3', str(launcher), '--group', 'k8s', '--suite', 'k8s_lb', '--filter', case, '--ignored', '--remote-k8s']
-    output = run(args, timeout=2400, env=env, log=context['report_dir'] / 'chat.log', guard=lambda: alive(c))
+    failure = None
+    try:
+        output = run(args, timeout=2400, env=env, log=context['report_dir'] / 'chat.log', guard=lambda: alive(c))
+    except RuntimeError as error:
+        failure = error  # 场景失败：先解析已完成结果，再上抛（T04）
+        output = (context['report_dir'] / 'chat.log').read_text()
     (context['report_dir'] / 'chat.log').write_text(output)
     cases = [{'name': name, 'verdict': verdict}
              for verdict, name in CHAT_CASE_PATTERN.findall(output)]
+    context['cases'] = cases
+    if failure is not None:
+        raise failure
     return cases
 
 
@@ -459,7 +488,10 @@ def prepare_test_snapshot(c, manifest_override=None):
 
 
 def execute_suites(c, receipt, context, suite, case=''):
-    """已冻结快照上执行选定套件；运行后校验快照未被篡改。"""
+    """已冻结快照上执行选定套件；运行前后都校验快照未被篡改（T03）。
+
+    运行后校验失败 → 异常 → 调用方 verdict=fail：被篡改输入上的结果不得记 pass。
+    """
     test_snapshot.verify(context['snapshot_record'])
     started = time.monotonic()
     if suite in ['gateway', 'all']:
@@ -475,7 +507,9 @@ def execute_suites(c, receipt, context, suite, case=''):
         run_userapp_suite(c, receipt, context)
     if suite in ['chat', 'all']:
         context['cases'] = run_chat_suite(c, receipt, context, case=case)
-    return int((time.monotonic() - started) * 1000)
+    elapsed = int((time.monotonic() - started) * 1000)
+    test_snapshot.verify(context['snapshot_record'])
+    return elapsed
 
 
 def tests(c, suite, case='', frozen_snapshot=None):
@@ -488,6 +522,7 @@ def tests(c, suite, case='', frozen_snapshot=None):
         result['case_filter'] = case
         result['partial_coverage'] = True
     atomic_json(report / 'summary.json', result)
+    context = None
     try:
         alive(c)
         freeze_started = time.monotonic()
@@ -512,8 +547,6 @@ def tests(c, suite, case='', frozen_snapshot=None):
                   'use verify for same-round acceptance)', flush=True)
         smoke(c, receipt)
         result['timings']['suites_ms'] = execute_suites(c, receipt, context, suite, case=case)
-        if context.get('cases') is not None:
-            result['cases'] = context['cases']
         alive(c)
         identity(c, receipt)
         result['pods_after'] = pod_identities(c, receipt)
@@ -533,6 +566,9 @@ def tests(c, suite, case='', frozen_snapshot=None):
             result['diagnostic_error'] = type(diagnostic_error).__name__
         raise
     finally:
+        # 失败也保留已解析的场景结果（T04）：失败用例集合是 retest 与归因的输入
+        if context is not None and context.get('cases') is not None:
+            result['cases'] = context['cases']
         atomic_json(report / 'summary.json', result)
         print('Test report:', report, flush=True)
 
@@ -561,10 +597,6 @@ def retest_failed(c, parent_id):
     if parent.get('verdict') != 'fail' or not failed:
         raise RuntimeError('Parent has no reliable failed case results '
                            '(infrastructure or aborted failures require rerunning the original entrypoint)')
-    registered = registered_chat_cases()
-    unknown = [name for name in failed if name not in registered]
-    if unknown:
-        raise RuntimeError('Parent failed cases are not registered scenarios: ' + ', '.join(unknown))
     snapshot_dir = c.state / 'test-snapshots' / parent.get('snapshot_id', '')
     record_path = snapshot_dir / 'snapshot.json'
     if not parent.get('snapshot_id') or not record_path.exists() or not (snapshot_dir / 'inputs.json').exists():
@@ -574,6 +606,13 @@ def retest_failed(c, parent_id):
         raise RuntimeError('Parent frozen test snapshot is not sealed for this environment')
     record['path'] = str(snapshot_dir)
     test_snapshot.verify(record)  # 快照被篡改 → 拒绝
+    # 场景注册校验用冻结快照内的 catalog（T05）：活动目录后续增删场景
+    # 不改变父报告冻结输入的合法性边界
+    frozen_root = Path(record['path']) / 'source'
+    registered = registered_chat_cases(frozen_root)
+    unknown = [name for name in failed if name not in registered]
+    if unknown:
+        raise RuntimeError('Parent failed cases are not registered scenarios: ' + ', '.join(unknown))
     print('Retesting failed cases from parent', parent_id, ':', ', '.join(failed), flush=True)
     outcomes = []
     for name in failed:

@@ -127,12 +127,19 @@ def output(*args):
 def source_fingerprint():
     digest = hashlib.sha256()
     if INPUT_MANIFEST:
-        # 冻结快照模式：身份 = 快照清单本体（与冻结时的源码身份一致），
-        # 不触达活动工作目录，也不需要 .git。
+        # 冻结快照模式：身份 = 快照清单条目 + 各文件**实际内容**（T03）——
+        # 只哈希清单 JSON 无法发现"文件名不变、内容被改"的输入漂移；也不
+        # 触达活动工作目录，不需要 .git。
         frozen = json.loads(Path(INPUT_MANIFEST).read_text())
         for name in sorted(frozen):
             digest.update(name.encode() + b'\0')
-            digest.update(json.dumps(frozen[name], sort_keys=True).encode())
+            path = REPO / name
+            if path.is_symlink():
+                digest.update(b'<link>' + os.readlink(path).encode())
+            elif path.is_file():
+                digest.update(path.read_bytes())
+            else:
+                digest.update(b'<missing>')
         return digest.hexdigest()
     paths = subprocess.check_output(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=REPO).split(b'\0')
     for raw in sorted(set(paths)):
