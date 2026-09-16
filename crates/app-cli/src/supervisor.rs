@@ -537,14 +537,14 @@ pub(crate) async fn wait_for_service_ready_within(
 /// `APP_CLI_RUN_PROFILE=dev`。仅影响启动命令选择（[devrun] 优先、[run] 兜底），
 /// 端口注入/pingap/健康检查/拓扑与生产编排完全一致；未注入（生产 serve、
 /// 本地直跑）恒走 [run]——与既有行为逐字节一致。
-fn dev_run_profile() -> bool {
+pub(crate) fn dev_run_profile() -> bool {
     std::env::var("APP_CLI_RUN_PROFILE").as_deref() == Ok("dev")
 }
 
 /// 服务的生效启动命令：dev 形态且配置了 [devrun] 时用 devrun.command（热加载，
 /// 跑源码），否则 [run].command。（[devbuild] 的回落在平台侧 dev 链路执行，
 /// app-cli 不消费该字段。）
-fn effective_run_argv(spec: &ServiceSpec, dev_profile: bool) -> &[String] {
+pub(crate) fn effective_run_argv(spec: &ServiceSpec, dev_profile: bool) -> &[String] {
     if dev_profile && let Some(devrun) = &spec.devrun {
         return &devrun.command;
     }

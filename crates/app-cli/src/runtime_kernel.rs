@@ -14,9 +14,6 @@
 //! - 同 operation_id 同摘要返回原结果；异摘要 409；
 //! - stop 是持久化意图屏障：受理即提升 revision，旧构建提交被拒。
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use shared_types::{
     DesiredState, ERR_OPERATION_ID_CONFLICT, ERR_OPERATION_IN_PROGRESS, ERR_RECOVERY_REQUIRED,
@@ -26,15 +23,15 @@ use shared_types::{
     RuntimeOperationView, RuntimeStatusView, runtime_request_digest,
     validate_runtime_operation_request,
 };
+use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
-/// 稳定状态根目录名（R02 修复）。
+/// 稳定状态根目录名（R02/B04）。
 ///
-/// 根位于 `workspace.parent()`——与部署激活的 `.previous`/`DEPLOY_STATE_FILE`
-/// 同一**卷根**（deploy::activate 只整体改名 workspace 本身，父目录跨部署
-/// 稳定），绝不放入会被热部署替换的 workspace 内。旧版本曾置于 workspace
-/// 内（`{workspace}/.app-cli-state`），[`RuntimeStore::open`] 做一次性原子
-/// 迁移；新旧两处同时存在（双权威域）时 fail-fast 拒绝写入。
+/// 权威根 = env `APP_CLI_STATE_ROOT`（平台注入，source/.run/别名同一目录）；
+/// 缺省 `{workspace 卷根}/.app-cli-state/{application_id}`（按应用隔离）。
+/// 绝不放入会被热部署替换的 workspace 内。旧位置（in-workspace、bare 卷根）
+/// 由 [`RuntimeStore::open_with_root`] 一次性迁移；新旧并存 fail-fast。
 pub(crate) const STATE_DIR_NAME: &str = ".app-cli-state";
 
 /// 受理判定结果。
@@ -44,6 +41,20 @@ pub(crate) enum AdmissionOutcome {
     Replayed(RuntimeOperationView),
     /// 新受理（已持久化 Accepted，等待执行）。
     Accepted(RuntimeOperationView),
+}
+
+/// 提交屏障裁决（B03）。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum CommitBarrierOutcome {
+    /// 屏障通过并已收束 Succeeded。
+    Committed,
+    /// 已被取消——已收束 Cancelled（不报成功）。
+    Cancelled,
+    /// Stop 已受理（revision 推进）：调用方必须停服并让 Stop 执行，
+    /// 本操作保持非 Succeeded（由调用方停服后收束 Cancelled）。
+    Superseded,
+    /// 操作已不是 active 执行者（并发收束/替换）——无操作。
+    NotActive,
 }
 
 /// 受理拒绝（API 层映射 HTTP 409/400 信封）。
@@ -71,32 +82,109 @@ pub(crate) struct RecoveryScan {
 }
 
 impl RuntimeStore {
-    pub(crate) fn open(workspace: &Path) -> Result<Self> {
-        // R02：根 = workspace 的**卷根**（父目录）——deploy::activate 整体
-        // 改名 workspace 换代时此目录不动（同 `.previous`/DEPLOY_STATE_FILE 域）。
+    /// 解析稳定状态根（B04：显式优先，杜绝 parent() 猜测歧义）。
+    ///
+    /// 优先级：
+    /// 1. `APP_CLI_STATE_ROOT` env——平台（rcoder）注入的显式按应用根；
+    ///    source 根、`.run` 别名、任何入口都由平台指向同一目录（唯一锁域）。
+    /// 2. 缺省 `{workspace 卷根}/.app-cli-state/{application_id}`——按应用
+    ///    隔离（多 app 共享卷不互踩）；entry 别名无法归一时以 env 为准。
+    pub(crate) fn resolve_root(workspace: &Path, application_id: &str) -> Result<PathBuf> {
+        if let Some(explicit) =
+            std::env::var_os("APP_CLI_STATE_ROOT").filter(|value| !value.is_empty())
+        {
+            return Ok(PathBuf::from(explicit));
+        }
         let volume_root = workspace
             .parent()
             .context("workspace has no volume root for stable runtime state")?;
-        let root = volume_root.join(STATE_DIR_NAME);
-        let legacy = workspace.join(STATE_DIR_NAME);
-        let legacy_exists = root_exists(&legacy)?;
+        Ok(volume_root.join(STATE_DIR_NAME).join(application_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open(workspace: &Path) -> Result<Self> {
+        // 无身份上下文的缺省打开（测试用）——application_id 未知时退缺省应用段
+        Self::open_with_root(Self::resolve_root(workspace, "_default")?, workspace)
+    }
+
+    /// B04：以显式根打开。旧位置兼容迁移（一次性原子 rename；双权威域
+    /// fail-fast 拒绝写入）：
+    /// - `{workspace}/.app-cli-state`（R02 之前的 in-workspace 布局）
+    /// - `{workspace 卷根}/.app-cli-state`（R02–R08 的 bare 卷根布局——
+    ///   本轮加入 application_id 段后成为 legacy）
+    pub(crate) fn open_with_root(root: PathBuf, workspace: &Path) -> Result<Self> {
+        let volume_root = workspace
+            .parent()
+            .context("workspace has no volume root for stable runtime state")?;
+        let legacy_locations = [
+            workspace.join(STATE_DIR_NAME),
+            volume_root.join(STATE_DIR_NAME),
+        ];
         let root_exists_already = root_exists(&root)?;
-        if legacy_exists && root_exists_already {
-            // 双权威域：可能是旧迁移中断/手工复制。绝不猜哪份权威——
-            // 拒绝写入，操作员裁决后重启（R04 fail-closed 同源纪律）。
-            anyhow::bail!(
-                "runtime state exists both at stable root {} and legacy in-workspace {} \
-                 (two authority domains); resolve explicitly before starting",
-                root.display(),
-                legacy.display()
-            );
+        let mut existing_legacy: Option<PathBuf> = None;
+        for legacy in &legacy_locations {
+            // 按应用根 {bare}/{app} 的 create_dir_all 会隐式创建 bare 祖先
+            // 目录——bare 存在 ≠ bare 是 legacy 状态域。仅当 bare **直接**
+            // 含状态标记（desired/identity/operations/events）才视为 legacy。
+            if !is_legacy_state_domain(legacy)? {
+                continue;
+            }
+            if let Some(first) = &existing_legacy {
+                // 多处 legacy 并存：无法裁决哪份权威——拒绝（操作员处理后重启）
+                anyhow::bail!(
+                    "multiple legacy runtime state locations exist ({} and {}); \
+                     resolve explicitly before starting",
+                    first.display(),
+                    legacy.display()
+                );
+            }
+            existing_legacy = Some(legacy.clone());
         }
-        if legacy_exists {
-            // 一次性原子迁移（同卷 rename；失败保留现场不动旧目录）
-            std::fs::rename(&legacy, &root)
-                .with_context(|| format!("migrate legacy runtime state {} -> {}", legacy.display(), root.display()))?;
+        if let Some(legacy) = &existing_legacy {
+            if root_exists_already {
+                anyhow::bail!(
+                    "runtime state exists both at stable root {} and legacy {} \
+                     (two authority domains); resolve explicitly before starting",
+                    root.display(),
+                    legacy.display()
+                );
+            }
+            if root.starts_with(legacy) {
+                // bare 卷根 legacy → 按应用根嵌套在其子树内（rename 进自身
+                // 子树 EINVAL）——逐条目搬移后拆除 legacy 目录。
+                std::fs::create_dir_all(&root).context("create per-app state root")?;
+                for entry in std::fs::read_dir(legacy).context("read legacy state entries")? {
+                    let entry = entry.context("read legacy entry")?;
+                    // create_dir_all(root) 已在 bare 内建出按应用根（本分支
+                    // root 嵌套于 legacy）——跳过自身，只搬真实状态条目
+                    if entry.path() == root {
+                        continue;
+                    }
+                    let target = root.join(entry.file_name());
+                    std::fs::rename(entry.path(), &target).with_context(|| {
+                        format!(
+                            "migrate legacy entry {} -> {}",
+                            entry.path().display(),
+                            target.display()
+                        )
+                    })?;
+                }
+                // bare 目录此刻只剩按应用根（其子树），保留为容器目录——
+                // 状态条目已全部搬入按应用根，不再构成 legacy 状态域。
+            } else {
+                // 目标父链可能尚不存在（按应用根的中间目录）——先建再搬
+                std::fs::create_dir_all(&root)
+                    .context("create per-app state root for migration")?;
+                std::fs::rename(legacy, &root).with_context(|| {
+                    format!(
+                        "migrate legacy runtime state {} -> {}",
+                        legacy.display(),
+                        root.display()
+                    )
+                })?;
+            }
             tracing::info!(
-                "runtime state migrated from in-workspace legacy location to stable volume root: {}",
+                "runtime state migrated to stable per-application root: {}",
                 root.display()
             );
         }
@@ -257,19 +345,20 @@ impl RuntimeStore {
                     continue;
                 }
             };
-            let operation =
-                match serde_json::from_str::<StoredOperation>(content.trim_end_matches('\n')) {
-                    Ok(operation) => operation,
-                    Err(error) => {
-                        // 损坏记录 fail closed：保留文件、阻断写、不猜状态。
-                        tracing::error!(
-                            "runtime state: undecodable operation record kept untouched {}: {error}",
-                            path.display()
-                        );
-                        scan.blocked.push(path.display().to_string());
-                        continue;
-                    }
-                };
+            let operation = match serde_json::from_str::<StoredOperation>(
+                content.trim_end_matches('\n'),
+            ) {
+                Ok(operation) => operation,
+                Err(error) => {
+                    // 损坏记录 fail closed：保留文件、阻断写、不猜状态。
+                    tracing::error!(
+                        "runtime state: undecodable operation record kept untouched {}: {error}",
+                        path.display()
+                    );
+                    scan.blocked.push(path.display().to_string());
+                    continue;
+                }
+            };
             let mut operation = operation;
             if !operation.view.state.is_terminal() {
                 operation.view.state = RuntimeOperationState::RecoveryRequired;
@@ -291,6 +380,21 @@ pub(crate) struct StoredOperation {
     pub view: RuntimeOperationView,
     /// 受理时的规范化请求（重放摘要比对的原始输入）。
     pub request: RuntimeOperationRequest,
+}
+
+/// legacy 候选是否**直接**承载状态（非仅为按应用根的祖先目录）。
+fn is_legacy_state_domain(path: &Path) -> Result<bool> {
+    if !root_exists(path)? {
+        return Ok(false);
+    }
+    Ok([
+        path.join("desired.json"),
+        path.join("identity.json"),
+        path.join("operations"),
+        path.join("events"),
+    ]
+    .iter()
+    .any(|marker| root_exists(marker).unwrap_or(false)))
 }
 
 fn root_exists(path: &Path) -> Result<bool> {
@@ -397,8 +501,7 @@ impl RuntimeKernel {
         // 恢复保护：在途操作被标记 RecoveryRequired，或存在不可判定记录
         // 时拒绝新写（spec §3.3 崩溃注入语义；R04 把 fail-closed 从注释
         // 变成实际行为）。
-        guard.recovery_protection =
-            !scan.recovered.is_empty() || !scan.blocked.is_empty();
+        guard.recovery_protection = !scan.recovered.is_empty() || !scan.blocked.is_empty();
         if !scan.blocked.is_empty() {
             tracing::error!(
                 count = scan.blocked.len(),
@@ -704,6 +807,64 @@ impl RuntimeKernel {
         Ok(())
     }
 
+    /// 执行提交屏障（B03）：在**同一 admission 锁**下原子裁决启动完成的提交。
+    ///
+    /// 线性化检查（一次加锁内完成）：
+    /// 1. 本操作仍是 active 执行者（未被并发收束/替换）；
+    /// 2. 受理后无取消墓碑（有 → Cancelled，不报成功）；
+    /// 3. 受理 revision 仍是当前 revision（Stop 受理会推进 revision——
+    ///    推进过 → Superseded：调用方必须停服并让 Stop 执行，A 不报 Succeeded）。
+    ///
+    /// 通过 → 原子收束 Succeeded（持久化在锁内，杜绝检查与提交间的受理竞态）。
+    /// 清理未知保持 RecoveryRequired 由调用方经 [`Self::finish`] 表达。
+    pub(crate) async fn commit_execution(
+        &self,
+        operation_id: &str,
+    ) -> Result<CommitBarrierOutcome, anyhow::Error> {
+        let sequence = self
+            .store
+            .replay_events(operation_id, u64::MAX)
+            .map(|events| events.len() as u64 + 1)
+            .unwrap_or(2);
+        // 持久化用的终态在锁内决定并写入——提交线性化点
+        let guard = self.admission.lock().await;
+        if guard.active_operation_id.as_deref() != Some(operation_id) {
+            return Ok(CommitBarrierOutcome::NotActive);
+        }
+        if self.is_cancelled(operation_id) {
+            drop(guard);
+            self.finish(
+                operation_id,
+                RuntimeOperationState::Cancelled,
+                None,
+                None,
+                sequence.max(2),
+            )
+            .await?;
+            return Ok(CommitBarrierOutcome::Cancelled);
+        }
+        let (_, current_revision) = self.store.load_desired()?;
+        let stored = self
+            .store
+            .load_operation(operation_id)?
+            .context("commit unknown operation")?;
+        if current_revision != stored.view.revision {
+            // Stop 已受理（revision 推进）——本启动不得提交成功；
+            // active 保留（Stop 信号在 server 循环执行并按自身 ID 收束后清除）。
+            return Ok(CommitBarrierOutcome::Superseded);
+        }
+        drop(guard);
+        self.finish(
+            operation_id,
+            RuntimeOperationState::Succeeded,
+            None,
+            None,
+            sequence.max(2),
+        )
+        .await?;
+        Ok(CommitBarrierOutcome::Committed)
+    }
+
     /// 取消请求（受理态返回；不伪称立即完成——spec §3.2 cancel 语义）。
     pub(crate) async fn request_cancel(&self, operation_id: &str) -> Result<bool> {
         let guard = self.admission.lock().await;
@@ -748,6 +909,14 @@ impl RuntimeKernel {
         }
     }
 
+    /// 恢复保护是否生效（B05：所有写入口共享——旧部署链/自动启动同样查询）。
+    pub(crate) fn recovery_protection_active(&self) -> bool {
+        self.admission
+            .try_lock()
+            .map(|guard| guard.recovery_protection)
+            .unwrap_or(true) // 锁竞争期间保守视为保护生效（fail-closed）
+    }
+
     /// 操作是否已被请求取消（执行侧副作用边界检查点）。
     pub(crate) fn is_cancelled(&self, operation_id: &str) -> bool {
         self.cancelled
@@ -786,18 +955,28 @@ mod tests {
     use super::*;
     use shared_types::{
         ArtifactInput, ERR_OPERATION_ID_CONFLICT, ERR_OPERATION_IN_PROGRESS, ERR_RECOVERY_REQUIRED,
-        ERR_REVISION_MISMATCH, ERR_RUNTIME_INSTANCE_MISMATCH, ERR_WORKSPACE_MISMATCH,
-        RunProfileInput, RuntimeOperationKind, RuntimeOperationRequest,
+        ERR_REVISION_MISMATCH, ERR_RUNTIME_INSTANCE_MISMATCH, RunProfileInput,
+        RuntimeOperationKind, RuntimeOperationRequest,
     };
 
     fn temp_store() -> (tempfile::TempDir, RuntimeStore) {
         let dir = tempfile::tempdir().expect("dir");
-        // R02 后状态根位于 workspace 父目录——workspace 必须是临时目录的
-        // 子目录，保证各测试的卷根（父目录）唯一，避免跨测试共用状态根。
+        // B04：按应用隔离根——workspace 必须是临时目录的子目录，保证各测试
+        // 的卷根（父目录）唯一。根 = {卷根}/.app-cli-state/{app}。
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let store = RuntimeStore::open(&workspace).expect("store");
-        (dir, store)
+        (dir, open_store(&workspace))
+    }
+
+    /// 测试助手：以测试应用身份解析并打开 store（B04 缺省路径）。
+    fn open_store(workspace: &Path) -> RuntimeStore {
+        let root = RuntimeStore::resolve_root(workspace, "test-app").expect("resolve root");
+        RuntimeStore::open_with_root(root, workspace).expect("store")
+    }
+
+    /// 测试助手：测试应用的稳定根位置（断言/预置用）。
+    fn app_state_root(workspace: &Path) -> std::path::PathBuf {
+        RuntimeStore::resolve_root(workspace, "test-app").expect("resolve root")
     }
 
     fn identity() -> RuntimeIdentityView {
@@ -815,7 +994,7 @@ mod tests {
 
     fn kernel(dir: &Path) -> RuntimeKernel {
         let workspace = dir.join("workspace");
-        let store = RuntimeStore::open(&workspace).expect("store");
+        let store = open_store(&workspace);
         let identity = identity();
         RuntimeKernel::new(store, identity, Box::new(|_| {}))
     }
@@ -965,7 +1144,7 @@ mod tests {
     #[tokio::test]
     async fn events_replay_by_after_seq_cursor() {
         let (dir, _keep) = temp_store();
-        let store = RuntimeStore::open(&dir.path().join("workspace")).expect("store");
+        let store = open_store(&dir.path().join("workspace"));
         for sequence in 1..=3 {
             store
                 .append_event(&RuntimeEventRecord {
@@ -991,7 +1170,7 @@ mod tests {
         let (dir, _keep) = temp_store();
         {
             let workspace = dir.path().join("workspace");
-            let store = RuntimeStore::open(&workspace).expect("store");
+            let store = open_store(&workspace);
             store
                 .store_operation(&StoredOperation {
                     view: RuntimeOperationView {
@@ -1030,7 +1209,7 @@ mod tests {
     async fn persist_failure_rejects_without_dispatch() {
         let (dir, _keep) = temp_store();
         // 目标操作记录路径预置为目录 → 原子写 rename 失败（受理持久化故障注入）
-        let root = dir.path().join(STATE_DIR_NAME);
+        let root = app_state_root(&dir.path().join("workspace"));
         std::fs::create_dir_all(root.join("operations").join("op-1.json")).expect("block path");
         let kernel = kernel(dir.path());
         let rejection = kernel
@@ -1083,14 +1262,41 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
-        let store = RuntimeStore::open(&workspace).expect("store");
+        let store = open_store(&workspace);
         store
             .store_desired(DesiredState::Stopped, 3)
             .expect("desired");
-        // 状态根必须在 workspace 之外（父目录）——部署 activate 整体改名
-        // workspace 换代时不动
-        assert!(dir.path().join(STATE_DIR_NAME).join("desired.json").is_file());
+        // 状态根在 workspace 之外（卷根下按应用隔离）——部署 activate
+        // 整体改名 workspace 换代时不动
+        assert!(app_state_root(&workspace).join("desired.json").is_file());
         assert!(!workspace.join(STATE_DIR_NAME).exists());
+    }
+
+    /// B04：显式 env 根权威——source 与 .run 别名竞争同一目录/同一把锁。
+    #[test]
+    fn explicit_env_root_unifies_source_and_run_entries() {
+        let dir = tempfile::tempdir().expect("dir");
+        let volume = dir.path().join("vol");
+        let explicit = dir.path().join("explicit-state");
+        std::fs::create_dir_all(&volume).expect("volume");
+        // env 变异需要串行；用锁型测试易受并行干扰——catch_unwind + 及时清理
+        // SAFETY: 测试串行持有该 env 变异窗口，结束即恢复
+        unsafe { std::env::set_var("APP_CLI_STATE_ROOT", &explicit) };
+        let result = std::panic::catch_unwind(|| {
+            let source_workspace = volume.join("app-1");
+            let run_workspace = volume.join("app-1").join(".run");
+            std::fs::create_dir_all(&source_workspace).expect("source");
+            std::fs::create_dir_all(&run_workspace).expect("run");
+            let r1 = RuntimeStore::resolve_root(&source_workspace, "app-1").expect("root1");
+            let r2 = RuntimeStore::resolve_root(&run_workspace, "app-1").expect("root2");
+            assert_eq!(r1, r2, "alias entries must resolve the same explicit root");
+            assert_eq!(r1, explicit);
+        });
+        // SAFETY: 同上
+        unsafe { std::env::remove_var("APP_CLI_STATE_ROOT") };
+        let Ok(()) = result else {
+            panic!("explicit root unification failed");
+        };
     }
 
     #[tokio::test]
@@ -1103,7 +1309,7 @@ mod tests {
             r#"{"desired":"stopped","revision":5}"#,
         )
         .expect("legacy desired");
-        let store = RuntimeStore::open(&workspace).expect("migrate");
+        let store = open_store(&workspace);
         // 迁移后旧位置清空、新位置可读
         assert!(!workspace.join(STATE_DIR_NAME).exists());
         assert_eq!(
@@ -1112,16 +1318,72 @@ mod tests {
         );
     }
 
+    /// B04：bare 卷根布局（R02–R08 形态）也迁移到按应用隔离根。
+    #[test]
+    fn legacy_bare_volume_root_migrates_to_per_app_root() {
+        let dir = tempfile::tempdir().expect("dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let bare = dir.path().join(STATE_DIR_NAME);
+        std::fs::create_dir_all(bare.join("operations")).expect("bare root");
+        std::fs::write(
+            bare.join("desired.json"),
+            r#"{"desired":"running","revision":2}"#,
+        )
+        .expect("bare desired");
+        let store = open_store(&workspace);
+        assert_eq!(
+            store.load_desired().expect("desired"),
+            (DesiredState::Running, 2)
+        );
+        // bare 不再直接持有状态条目（已搬入按应用根）；其作为按应用根的
+        // 父容器保留（root 嵌套于其子树——rename 进自身子树不可行）。
+        assert!(!bare.join("desired.json").exists());
+        assert!(!bare.join("operations").exists());
+        assert!(app_state_root(&workspace).join("desired.json").exists());
+    }
+
     #[tokio::test]
     async fn dual_authority_domains_fail_closed() {
         let dir = tempfile::tempdir().expect("dir");
         let workspace = dir.path().join("workspace");
-        std::fs::create_dir_all(workspace.join(STATE_DIR_NAME)).expect("legacy");
-        std::fs::create_dir_all(dir.path().join(STATE_DIR_NAME)).expect("new root");
-        let error = RuntimeStore::open(&workspace)
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let legacy = workspace.join(STATE_DIR_NAME);
+        std::fs::create_dir_all(&legacy).expect("legacy");
+        std::fs::write(
+            legacy.join("desired.json"),
+            r#"{"desired":"stopped","revision":1}"#,
+        )
+        .expect("legacy marker");
+        let root = app_state_root(&workspace);
+        std::fs::create_dir_all(root.join("operations")).expect("new root");
+        let error = RuntimeStore::open_with_root(root, &workspace)
             .err()
             .expect("must refuse");
-        assert!(error.to_string().contains("two authority domains"));
+        assert!(error.to_string().contains("authority domains"));
+        // 多处 legacy 并存（in-workspace + bare 卷根）同样拒绝裁决
+        let dir2 = tempfile::tempdir().expect("dir2");
+        let workspace2 = dir2.path().join("workspace");
+        std::fs::create_dir_all(&workspace2).expect("workspace");
+        let legacy_ws = workspace2.join(STATE_DIR_NAME);
+        std::fs::create_dir_all(&legacy_ws).expect("legacy ws");
+        std::fs::write(
+            legacy_ws.join("desired.json"),
+            r#"{"desired":"stopped","revision":1}"#,
+        )
+        .expect("legacy ws marker");
+        let legacy_bare = dir2.path().join(STATE_DIR_NAME);
+        std::fs::create_dir_all(legacy_bare.join("operations")).expect("legacy bare");
+        std::fs::write(
+            legacy_bare.join("desired.json"),
+            r#"{"desired":"running","revision":1}"#,
+        )
+        .expect("legacy bare marker");
+        let root2 = app_state_root(&workspace2);
+        let error2 = RuntimeStore::open_with_root(root2, &workspace2)
+            .err()
+            .expect("must refuse");
+        assert!(error2.to_string().contains("legacy"));
     }
 
     // ── R03：真实取消墓碑；未实现 profile 组合结构化拒绝 ────────────────────────
@@ -1184,7 +1446,7 @@ mod tests {
         let (dir, _keep) = temp_store();
         {
             let workspace = dir.path().join("workspace");
-            let root = dir.path().join(STATE_DIR_NAME);
+            let root = app_state_root(&workspace);
             std::fs::create_dir_all(root.join("operations")).expect("ops dir");
             // 一条损坏 JSON 的未终态操作记录
             std::fs::write(
@@ -1213,7 +1475,7 @@ mod tests {
     #[tokio::test]
     async fn partial_admission_holds_operation_and_protection() {
         let (dir, _keep) = temp_store();
-        let workspace = dir.path().join("workspace");
+        let _workspace = dir.path().join("workspace");
         // 先正常打开一次 kernel 并受理一个操作，让 desired.json 存在；
         // 然后把 desired.json 变为不可写目录，模拟后续 desired 写失败。
         {
@@ -1227,7 +1489,7 @@ mod tests {
                 .await
                 .expect("finish first");
         }
-        let desired = dir.path().join(STATE_DIR_NAME).join("desired.json");
+        let desired = app_state_root(&dir.path().join("workspace")).join("desired.json");
         std::fs::remove_file(&desired).expect("remove desired");
         std::fs::create_dir(&desired).expect("block desired writes");
 
@@ -1252,5 +1514,4 @@ mod tests {
             .expect_err("blocked");
         assert_eq!(blocked.code, ERR_RECOVERY_REQUIRED);
     }
-
 }

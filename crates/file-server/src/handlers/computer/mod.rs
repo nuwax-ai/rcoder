@@ -570,7 +570,9 @@ mod tests {
     /// + `appId` 必须走 NormalProject 共享工作区定位——此前实现只读 header 通道，
     /// 该请求静默落默认 `{CWS}/{userId}/{cId}`，读写目标与 TS 上游分歧。
     #[tokio::test]
-    async fn explicit_service_type_without_header_resolves_normal_project() {
+    async fn legacy_service_type_body_does_not_select_normal_project() {
+        // B06：body serviceType 是运行时路由概念——不参与目录定位，
+        // 仅带旧字段 + appId 时落缺省 taskAgent 布局（TS 同款）。
         let (state, resolver) = make_state();
         let path = computer_root_for_request(
             &state,
@@ -584,7 +586,34 @@ mod tests {
             },
         )
         .await
-        .expect("explicit normalProject resolves shared workspace");
+        .expect("legacy body field still parses; location falls to default");
+        assert_eq!(
+            path,
+            resolver
+                .root
+                .join("u1")
+                .join("c1")
+                .to_string_lossy()
+                .to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_workspace_type_body_resolves_normal_project() {
+        let (state, resolver) = make_state();
+        let path = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                service_type: None,
+                workspace_type: Some("normalProject"),
+                app_id: Some("proj-7"),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect("explicit workspaceType resolves shared workspace");
         assert_eq!(
             path,
             state
@@ -597,7 +626,9 @@ mod tests {
         // 显式通道同样不触达 resolver（TS 字面规则）
         assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
 
-        // 显式 userapp 通道同理落开发卷（header 缺失不阻断分派）
+        // B06 对照：仅 body serviceType=userapp（无 workspaceType 通道）→
+        // 不参与定位，落缺省 taskAgent 布局（userapp 开发卷需显式
+        // workspace_type）
         let path = computer_root_for_request(
             &state,
             "u1",
@@ -610,7 +641,31 @@ mod tests {
             },
         )
         .await
-        .expect("explicit userapp resolves dev volume");
+        .expect("legacy userapp body field still parses; location falls to default");
+        assert_eq!(
+            path,
+            resolver
+                .root
+                .join("u1")
+                .join("c1")
+                .to_string_lossy()
+                .to_string()
+        );
+
+        // 显式 workspace_type=userapp 落开发卷（B06 正径）
+        let path = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                service_type: None,
+                workspace_type: Some("userapp"),
+                app_id: Some("app-9"),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect("explicit workspaceType userapp resolves dev volume");
         assert_eq!(path, state.config.userapp_workspace_dir.join("app-9"));
     }
 

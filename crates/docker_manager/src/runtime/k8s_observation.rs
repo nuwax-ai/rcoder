@@ -227,26 +227,23 @@ pub(crate) async fn await_pod_verdict<T: Clone>(
             .ok_or_else(|| ObservationError::Deadline {
                 last_transient: last_transient.clone(),
             })?;
-        let event = if let Some(backoff) = pending_backoff.take() {
+        if let Some(backoff) = pending_backoff.take() {
+            // B07：退避窗口内**只等待**——不 poll watcher（kube-runtime 4.2
+            // watcher 恢复发生在 next poll；窗口内 select stream.next() 会
+            // 立即触发重连，退避形同虚设）。等待受取消/deadline 约束。
             let wait = std::cmp::min(backoff, remaining);
             tokio::select! {
                 () = cancel.cancelled() => return Err(ObservationError::Cancelled),
-                // 退避窗耗尽且无新事件 → 直接进入下一轮预算检查（不消费）
-                _ = tokio::time::sleep(wait) => None,
-                event = stream.next() => Some(event),
+                _ = tokio::time::sleep(wait) => {}
             }
-        } else {
-            tokio::select! {
-                () = cancel.cancelled() => return Err(ObservationError::Cancelled),
-                _ = tokio::time::sleep(remaining) => {
-                    return Err(ObservationError::Deadline { last_transient });
-                }
-                event = stream.next() => Some(event),
+            continue;
+        }
+        let event = tokio::select! {
+            () = cancel.cancelled() => return Err(ObservationError::Cancelled),
+            _ = tokio::time::sleep(remaining) => {
+                return Err(ObservationError::Deadline { last_transient });
             }
-        };
-        let event = match event {
-            Some(event) => event,
-            None => continue,
+            event = stream.next() => event,
         };
         let Some(event) = event else {
             // watcher 流意外终止（非正常 EOF——正常 EOF 由 watcher 内部续接）

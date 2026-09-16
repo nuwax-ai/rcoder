@@ -83,5 +83,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
 [workspace.lints]
-# 与主 workspace 同款红线：生产代码禁 unsafe；cfg(test) 的 env 变异豁免见各测试模块
+# 与主 workspace 同款红线：生产代码禁 unsafe。测试模块的 env 变异
+#（set_var/remove_var 在 edition 2024 为 unsafe）经 lib.rs 的 cfg(test)
+# allow 豁免——仅测试代码、仅 env 变异，不含其他 unsafe 操作。
 rust.unsafe_code = "deny"

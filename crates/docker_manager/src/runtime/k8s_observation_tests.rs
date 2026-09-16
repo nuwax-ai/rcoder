@@ -111,6 +111,15 @@ impl ScriptedApiServer {
         let config = kube::Config::new(format!("http://{address}").parse().expect("URI"));
         kube::Client::try_from(config).expect("client")
     }
+
+    /// B07：关闭 kube client 内建 HTTP 重试（Config.default_retry 默认 true，
+    /// RetryLayer 对 429/503/504 自带退避——会掩盖外层退避是否生效）。
+    async fn client_no_retry(address: std::net::SocketAddr) -> kube::Client {
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let mut config = kube::Config::new(format!("http://{address}").parse().expect("URI"));
+        config.default_retry = false;
+        kube::Client::try_from(config).expect("client")
+    }
 }
 
 fn pod_json(ready: bool) -> String {
@@ -145,7 +154,21 @@ async fn observe(
     deadline: Instant,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<Verdict<()>, ObservationError> {
-    let client = ScriptedApiServer::client(address).await;
+    observe_with(
+        address,
+        deadline,
+        cancel,
+        ScriptedApiServer::client(address).await,
+    )
+    .await
+}
+
+async fn observe_with(
+    _address: std::net::SocketAddr,
+    deadline: Instant,
+    cancel: tokio_util::sync::CancellationToken,
+    client: kube::Client,
+) -> Result<Verdict<()>, ObservationError> {
     let api: kube::Api<k8s_openapi::api::core::v1::Pod> = kube::Api::default_namespaced(client);
     await_pod_verdict(&api, "watch-pod", deadline, cancel, classify_pod_readiness).await
 }
@@ -323,10 +346,11 @@ async fn rapid_transient_errors_back_off_between_retries() {
             }
         }
     });
-    let client = ScriptedApiServer::client(address).await;
+    // B07：关闭 client 内建重试——断言的是**外层退避**的真实节奏
+    let client = ScriptedApiServer::client_no_retry(address).await;
     let api: kube::Api<k8s_openapi::api::core::v1::Pod> = kube::Api::default_namespaced(client);
-    // 预算 1.5s：若每错误立即重试（无退避），1.5s 内远超 10 次（含连接建立
-    // 至少几十次）；带 200ms 起步退避则被压到个位数量级。
+    // 预算 1.5s：无退避时每错误立即重连（1.5s 内远超 30 次）；外层
+    // 200ms→400ms→800ms 退避下重试被压到 ≤8 次（1 LIST + ≤7 WATCH）。
     let deadline = Instant::now() + Duration::from_millis(1500);
     let error = await_pod_verdict(
         &api,
@@ -340,9 +364,124 @@ async fn rapid_transient_errors_back_off_between_retries() {
     assert!(matches!(error, ObservationError::Deadline { .. }));
     let total = hits.load(Ordering::SeqCst);
     assert!(
-        total <= 10,
-        "backoff must bound retry cadence (requests={total})"
+        total <= 8,
+        "outer backoff must bound retry cadence (requests={total})"
     );
+    assert!(total >= 2, "at least the initial LIST and one WATCH happen");
+    server.abort();
+}
+
+/// B07：快速 HTTP 500（无 client 重试）同样被外层退避约束——重试次数
+/// 有界且不热循环；deadline 统一收束。
+#[tokio::test]
+async fn fast_500_errors_back_off_between_retries() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut first = true;
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let mut head = String::new();
+            while !head.contains(
+                "
+
+",
+            ) {
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                head.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            let is_watch = head.contains("watch=true");
+            if first && !is_watch {
+                first = false;
+                let body = serde_json::json!({
+                    "apiVersion": "v1", "kind": "PodList",
+                    "metadata": {"resourceVersion": "10"}, "items": []
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.expect("list");
+            } else {
+                // 一切后续请求（含重 LIST）一律 500
+                stream
+                    .write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("500");
+            }
+        }
+    });
+    let client = ScriptedApiServer::client_no_retry(address).await;
+    let api: kube::Api<k8s_openapi::api::core::v1::Pod> = kube::Api::default_namespaced(client);
+    let deadline = Instant::now() + Duration::from_millis(1200);
+    let error = await_pod_verdict(
+        &api,
+        "watch-pod",
+        deadline,
+        tokio_util::sync::CancellationToken::new(),
+        classify_pod_readiness,
+    )
+    .await
+    .expect_err("deadline or fatal expected");
+    assert!(matches!(
+        error,
+        ObservationError::Deadline { .. } | ObservationError::Fatal { .. }
+    ));
+    let total = hits.load(Ordering::SeqCst);
+    assert!(
+        total <= 8,
+        "outer backoff must bound 500 retry cadence (requests={total})"
+    );
+    server.abort();
+}
+
+/// B07：退避等待期间取消立即结束（不等待窗口耗尽）。
+#[tokio::test]
+async fn backoff_window_cancels_immediately() {
+    let (address, server) = ScriptedApiServer::start(list_body(), vec![], 200)
+        .await
+        .expect("server");
+    // 服务器不发任何 watch 事件：首个错误如何来？——关闭 watch 连接制造
+    // 传输断连（服务器 drain 后断开）→ 暂态错误 → 退避窗口；窗口中取消。
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_handle = cancel.clone();
+    let client = ScriptedApiServer::client_no_retry(address).await;
+    let api: kube::Api<k8s_openapi::api::core::v1::Pod> = kube::Api::default_namespaced(client);
+    let observer = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            await_pod_verdict(&api, "watch-pod", deadline, cancel, classify_pod_readiness).await
+        }
+    });
+    // 等 LIST 完成后触发取消（1s 足够让 LIST+首 WATCH 建立并进入退避循环）
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    cancel_handle.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(5), observer)
+        .await
+        .expect("cancelled observer must finish promptly")
+        .expect("observer task");
+    assert!(matches!(
+        result,
+        Err(ObservationError::Cancelled | ObservationError::Deadline { .. })
+    ));
     server.abort();
 }
 

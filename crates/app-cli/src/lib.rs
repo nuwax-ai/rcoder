@@ -11,6 +11,11 @@
 //! - [`log`]：日志系统（轮转写入 + 历史读取 + 实时流）
 //! - [`proxy`]：pingap 配置生成
 
+// 测试构建豁免 unsafe_code deny：edition 2024 的 env 变异（set_var/
+// remove_var）标记为 unsafe，测试模块需要变异 APP_CLI_STATE_ROOT 等环境。
+// 仅 cfg(test)；生产代码禁 unsafe 不变。
+#![cfg_attr(test, allow(unsafe_code))]
+
 pub mod api;
 pub mod build;
 pub mod config;

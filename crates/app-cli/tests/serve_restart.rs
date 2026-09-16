@@ -112,9 +112,19 @@ async fn rejected_native_serve_sigterm_does_not_clear_previous_active_owner() {
     let logs = root.path().join("logs");
     let (mut first, first_url) = start(&workspace, &logs);
     expect_phase(&mut first, &first_url, "idle").await;
+    let owner = root.path().join(".deploy-coordinator.json");
+    // API 先于 ownership 落盘可答（P1-01 预绑定）——断言依赖 coordinator
+    // 已提交，先等它出现再 kill（消除 kill 早于 commit_coordinator 的竞态）。
+    let claim_deadline = Instant::now() + Duration::from_secs(10);
+    while !owner.exists() {
+        assert!(
+            Instant::now() < claim_deadline,
+            "first serve never claimed coordinator ownership"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     first.0.kill().unwrap();
     first.0.wait().unwrap();
-    let owner = root.path().join(".deploy-coordinator.json");
     let before = std::fs::read(&owner).unwrap();
     let (mut rejected, url) = start(&workspace, &logs);
     expect_phase(&mut rejected, &url, "orchestrating").await;

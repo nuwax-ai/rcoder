@@ -173,7 +173,14 @@ impl SupervisordHost {
                     .join(&spec.dir)
                     .to_string_lossy()
                     .into_owned(),
-                argv: spec.run.command.clone(),
+                // B08：与 builtin 引擎同一生效命令选择（共享运行计划）——
+                // dev profile 且配 [devrun] 时 devrun 优先（devrun 优先、
+                // run 兜底），不再恒用 run.command
+                argv: crate::supervisor::effective_run_argv(
+                    spec,
+                    crate::supervisor::dev_run_profile(),
+                )
+                .to_vec(),
                 env: spec.env.clone().into_iter().collect(),
                 port: Some(spec.port),
             };
@@ -212,7 +219,11 @@ impl SupervisordHost {
 
         // 6. 依赖序启动（lock services 顺序即拓扑序；startProcessWait 等 startsecs）
         for spec in &specs {
-            if spec.run.command.is_empty() {
+            // B08：判空用**生效命令**（devrun 可能非空而 run 为空——与 builtin
+            // 的 effective_run_argv 同源判定）
+            if crate::supervisor::effective_run_argv(spec, crate::supervisor::dev_run_profile())
+                .is_empty()
+            {
                 // static 服务无进程（步骤 2.6 已内置托管）——不是配置问题，
                 // 与进程态服务的"未配命令"区分文案
                 if crate::static_hosting::hosts_statically(spec, false) {
@@ -412,6 +423,42 @@ fn safe_program_token(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B08：supervisord 引擎与 builtin 同一生效命令选择——dev profile 且
+    /// 配 [devrun] 时 devrun.command 优先（不再恒用 run.command）。
+    #[test]
+    fn effective_argv_prefers_devrun_in_dev_profile() {
+        let mut spec = spec("web", "web", 30);
+        spec.devrun = Some(workspace_manifest::DevrunSection {
+            command: vec!["pnpm".into(), "dev".into()],
+        });
+        // 非 dev profile：run 兜底
+        assert_eq!(
+            crate::supervisor::effective_run_argv(&spec, false),
+            &spec.run.command
+        );
+        // dev profile：devrun 优先
+        assert_eq!(
+            crate::supervisor::effective_run_argv(&spec, true),
+            &["pnpm".to_string(), "dev".to_string()]
+        );
+    }
+
+    /// B08：devrun-only 服务（run.command 为空）在 dev profile 下可启动；
+    /// 非 dev profile 判空跳过（生效命令选择同源）。
+    #[test]
+    fn devrun_only_service_starts_only_in_dev_profile() {
+        let mut spec = spec("web", "web", 30);
+        spec.run.command = Vec::new();
+        spec.devrun = Some(workspace_manifest::DevrunSection {
+            command: vec!["vite".into(), "--host".into()],
+        });
+        assert!(
+            crate::supervisor::effective_run_argv(&spec, true)
+                == ["vite".to_string(), "--host".to_string()]
+        );
+        assert!(crate::supervisor::effective_run_argv(&spec, false).is_empty());
+    }
 
     fn spec(id: &str, dir: &str, shutdown: u64) -> ServiceSpec {
         let mut s = toml::from_str::<ReleaseLock>(

@@ -67,10 +67,15 @@ impl Drop for Journal {
 }
 impl Journal {
     pub fn open(workspace: &Path) -> Result<Self> {
-        let root = workspace
-            .parent()
-            .context("workspace has no volume root")?
-            .to_path_buf();
+        // B04：平台显式状态根权威（与 runtime_kernel 同 env）——source/.run
+        // 别名经同一目录竞争同一把锁。缺省沿用卷根推导（历史布局兼容）。
+        let root = match std::env::var_os("APP_CLI_STATE_ROOT").filter(|value| !value.is_empty()) {
+            Some(explicit) => PathBuf::from(explicit),
+            None => workspace
+                .parent()
+                .context("workspace has no volume root")?
+                .to_path_buf(),
+        };
         std::fs::create_dir_all(&root)?;
         let lease = OpenOptions::new()
             .read(true)

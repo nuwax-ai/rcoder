@@ -514,6 +514,16 @@ impl ServerState {
                 "server is shutting down; deployment was not accepted".into(),
             ));
         }
+        // B05：恢复保护约束**所有**写入口——旧部署链不得绕过（损坏记录/
+        // 未终态操作/部分提交围栏期间，legacy 受理同样拒绝；显式部署也
+        // 必须等操作员裁决恢复后进行）。
+        if let Some(kernel) = self.runtime_kernel()
+            && kernel.recovery_protection_active()
+        {
+            return Err(AdmissionError::Busy(
+                "runtime state requires recovery; resolve held operations before deploying".into(),
+            ));
+        }
         let phase = self.phase();
         if !phase.accepts_deploy() {
             return Err(AdmissionError::Busy(format!(
@@ -832,8 +842,48 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
         .err();
     }
     let ownership_claimed = startup_error.is_none();
+    // B05：内核装配**先于**启动决策——恢复裁决（损坏记录/未终态操作/desired
+    // 读取）必须先于 initialize_startup，否则 Existing 自动启动在保护生效前
+    // 已进入 first_request。
+    let mut kernel_recovery_hold = false;
+    if ownership_claimed {
+        match assemble_runtime_kernel(&state, args).await {
+            Ok(kernel) => {
+                let recovered = kernel
+                    .recover()
+                    .await
+                    .context("recover runtime operation state")?;
+                if !recovered.is_empty() {
+                    tracing::warn!("runtime operations held for recovery: {:?}", recovered);
+                }
+                if kernel.recovery_protection_active() {
+                    // B05：恢复保护（含损坏记录 blocked）压制自动启动——
+                    // 不撤销已受理的操作记录（可查询），业务保持 Idle 直至
+                    // 操作员裁决。显式 env 部署同样被 try_accept 门控拒绝。
+                    kernel_recovery_hold = true;
+                    tracing::error!(
+                        "runtime state requires recovery; automatic business startup suppressed"
+                    );
+                }
+                state.set_runtime_kernel(kernel);
+            }
+            Err(error) => {
+                // B05：状态根不可用 = 运行态可信状态不可读——不再仅关闭新 API
+                // 放行旧链。fail-closed：压住自动启动；旧部署受理也会因
+                // desired/记录不可读而不可信（deploy admission 检查
+                // runtime_kernel 为 None 时见下述显式阻断）。
+                kernel_recovery_hold = true;
+                tracing::error!(
+                    "runtime kernel unavailable ({error:#}); automatic business startup suppressed"
+                );
+            }
+        }
+    }
     let mut first_request = if let Some(error) = startup_error.as_ref() {
         state.begin_failure(format!("startup shutdown unconfirmed: {error:#}"), true);
+        None
+    } else if kernel_recovery_hold {
+        state.set_phase(ServerPhase::Idle);
         None
     } else {
         match initialize_startup(args, &state).await {
@@ -853,43 +903,34 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
             }
         }
     };
-    // 阶段二运行操作内核：ownership 认领后装配（状态根 + 身份 + 恢复）。
-    // 恢复出的非终态操作置 RecoveryRequired 并挂恢复保护——写操作被拒直至
-    // 显式收束（spec §3.3 崩溃注入语义）。
-    if ownership_claimed {
-        match assemble_runtime_kernel(&state, args).await {
-            Ok(kernel) => {
-                let recovered = kernel
-                    .recover()
-                    .await
-                    .context("recover runtime operation state")?;
-                if !recovered.is_empty() {
-                    tracing::warn!("runtime operations held for recovery: {:?}", recovered);
-                }
-                // R03：持久化的 desired 参与启动恢复决策——用户 stop
-                //（spec §5）压制**自动恢复**（journal resume/卷上 release.lock
-                // 的 Existing 路径），保持 Idle；显式 env 部署（Deploy 路径）
-                // 是新的部署意图，不受 Stopped 压制。
-                let desired_stopped = matches!(
-                    kernel.store().load_desired(),
-                    Ok((shared_types::DesiredState::Stopped, _))
+    // R03/B05：desired 读取先于启动决策；**读取失败同样压制自动启动**
+    //（损坏 desired 等价于不可信状态——不允许"读错当 Running 继续起"）。
+    if ownership_claimed && !kernel_recovery_hold {
+        let desired = match state
+            .runtime_kernel()
+            .map(|kernel| kernel.store().load_desired())
+        {
+            Some(Ok((desired, _))) => Some(desired),
+            Some(Err(error)) => {
+                tracing::error!(
+                    "desired state unreadable ({error:#}); automatic business recovery suppressed"
                 );
-                if desired_stopped
-                    && matches!(first_request, Some(InitialAction::Existing))
-                {
-                    first_request = None;
-                    tracing::info!(
-                        "desired state is Stopped; automatic business recovery suppressed (staying Idle)"
-                    );
-                    state.set_phase(ServerPhase::Idle);
-                }
-                state.set_runtime_kernel(kernel);
+                state.set_phase(ServerPhase::Idle);
+                None
             }
-            Err(error) => {
-                // 状态根不可用 = 持久受理不可承诺：保持 /v1/runtime/* 关闭
-                //（503），既有部署链不受影响——降级可观测，不静默假装支持。
-                tracing::error!("runtime kernel unavailable: {error:#}");
-            }
+            None => None,
+        };
+        if desired == Some(shared_types::DesiredState::Stopped)
+            && matches!(first_request, Some(InitialAction::Existing))
+        {
+            // 用户 stop（spec §5）压制**自动恢复**（journal resume/卷上
+            // release.lock 的 Existing 路径），保持 Idle；显式 env 部署
+            //（Deploy 路径）是新的部署意图，不受 Stopped 压制。
+            first_request = None;
+            tracing::info!(
+                "desired state is Stopped; automatic business recovery suppressed (staying Idle)"
+            );
+            state.set_phase(ServerPhase::Idle);
         }
     }
 
@@ -1015,11 +1056,13 @@ async fn assemble_runtime_kernel(
     args: &crate::config::CliArgs,
 ) -> Result<Arc<crate::runtime_kernel::RuntimeKernel>> {
     use crate::runtime_kernel::{DispatchAction, RuntimeKernel, RuntimeStore};
-    let store = RuntimeStore::open(&args.workspace)?;
     let application_id = std::env::var("PROJECT_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "unknown-app".to_string());
+    // B04：显式状态根（env 权威；缺省按应用隔离）——source/.run/别名同域
+    let root = RuntimeStore::resolve_root(&args.workspace, &application_id)?;
+    let store = RuntimeStore::open_with_root(root, &args.workspace)?;
     let workspace_id = args
         .workspace
         .file_name()
@@ -1053,7 +1096,9 @@ async fn assemble_runtime_kernel(
                 .is_some_and(|kernel| kernel.is_cancelled(&operation_id))
             {
                 tokio::spawn(async move {
-                    settle_state.settle_cancelled_before_execution(&operation_id).await;
+                    settle_state
+                        .settle_cancelled_before_execution(&operation_id)
+                        .await;
                 });
                 return;
             }
@@ -1224,8 +1269,12 @@ enum InitialAction {
     Prepared(crate::deploy::PreparedDeploy),
     /// 卷上既有 release.lock（Pod 重建恢复）：跳过下载直接编排。
     Existing,
-    /// 运行控制 stop：停止业务服务（保持管理面），完成当前运行操作。
-    StopBusiness,
+    /// 运行控制 stop：停止业务服务（保持管理面）。携带受理操作 ID——
+    /// 从受理、排队、执行到终态完整传递（B01：Stop 不设 current，按
+    /// 自身 ID 收束，绝不依赖"最近一次"全局值）。
+    StopBusiness {
+        operation_id: String,
+    },
 }
 
 /// 控制信号在服务已停止后的收束（R01）：Reorchestrate 占据执行身份由外层
@@ -1235,20 +1284,13 @@ async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> In
         ControlSignal::OrchestrateSource { operation_id } => {
             // R03 取消检查点：派发排队期间被取消 → 零副作用收束，不编排
             if state.settle_cancelled_before_execution(&operation_id).await {
-                return InitialAction::StopBusiness;
+                return InitialAction::StopBusiness { operation_id };
             }
             state.set_current_runtime_operation(Some(operation_id));
             InitialAction::Existing
         }
         ControlSignal::StopBusiness { operation_id } => {
-            state
-                .finish_runtime_operation_by_id(
-                    &operation_id,
-                    shared_types::RuntimeOperationState::Succeeded,
-                    None,
-                )
-                .await;
-            InitialAction::StopBusiness
+            InitialAction::StopBusiness { operation_id }
         }
     }
 }
@@ -1362,6 +1404,46 @@ async fn fail_activation(
     None
 }
 
+/// 内核提交屏障结果（B03 收敛形态）。
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum BarrierOutcome {
+    /// 屏障通过（已收束 Succeeded）/ 已取消（已收束 Cancelled）/
+    /// 无在途操作——调用方继续正常流转。
+    Passed,
+    /// Stop 已受理（revision 推进）：调用方必须停服、按 ID 收束 Cancelled。
+    Superseded,
+}
+
+/// Running 入口的统一提交屏障（B03）：无内核/无在途操作时直通。
+/// 屏障失败（持久化错误）→ 按原终态语义收束 RecoveryRequired 并视为 Passed
+/// （fail-closed：不报成功，保护保留在内核）。
+async fn commit_running_barrier(state: &ServerState) -> BarrierOutcome {
+    let Some(kernel) = state.runtime_kernel() else {
+        return BarrierOutcome::Passed;
+    };
+    let Some(operation_id) = state.current_runtime_operation() else {
+        return BarrierOutcome::Passed;
+    };
+    match kernel.commit_execution(&operation_id).await {
+        Ok(crate::runtime_kernel::CommitBarrierOutcome::Superseded) => BarrierOutcome::Superseded,
+        Ok(_) => BarrierOutcome::Passed,
+        Err(error) => {
+            tracing::error!("runtime commit barrier failed (op {operation_id}): {error:#}");
+            state
+                .finish_runtime_operation_by_id(
+                    &operation_id,
+                    shared_types::RuntimeOperationState::RecoveryRequired,
+                    Some((
+                        shared_types::ERR_RECOVERY_REQUIRED.into(),
+                        format!("commit barrier persistence failed: {error:#}"),
+                    )),
+                )
+                .await;
+            BarrierOutcome::Passed
+        }
+    }
+}
+
 async fn server_loop(
     args: &CliArgs,
     state: &Arc<ServerState>,
@@ -1384,23 +1466,25 @@ async fn server_loop(
                 }
                 let mut rx = state.deploy_rx.lock().await;
                 let mut control = state.control_rx.lock().await;
-                tokio::select! {
+                let action = tokio::select! {
                     maybe = rx.recv() => match maybe {
-                        Some(req) => InitialAction::Deploy(req),
+                        Some(req) => Some(InitialAction::Deploy(req)),
                         None => return Ok(()), // api 层全退（不可能，防御）
                     },
                     signal = control.recv() => match signal {
-                        Some(ControlSignal::OrchestrateSource { .. }) => {
-                            InitialAction::Existing
+                        Some(ControlSignal::OrchestrateSource { operation_id }) => {
+                            // B01：ID 必须完整传递——Idle 消费即占据执行身份
+                            //（取消检查点在 settle_control_signal 内）
+                            Some(settle_control_signal(state, ControlSignal::OrchestrateSource { operation_id }).await)
                         }
-                        Some(ControlSignal::StopBusiness { .. }) => {
-                            InitialAction::StopBusiness
+                        Some(ControlSignal::StopBusiness { operation_id }) => {
+                            Some(InitialAction::StopBusiness { operation_id })
                         }
                         None => {
                             // api 层全退（防御）；部署通道仍存活时继续等
                             tokio::select! {
                                 maybe = rx.recv() => match maybe {
-                                    Some(req) => InitialAction::Deploy(req),
+                                    Some(req) => Some(InitialAction::Deploy(req)),
                                     None => return Ok(()),
                                 },
                                 () = state.cancel.cancelled() => return Ok(()),
@@ -1408,15 +1492,20 @@ async fn server_loop(
                         }
                     },
                     () = state.cancel.cancelled() => return Ok(()),
+                };
+                // control/防御分支产出 Option；展开为统一 InitialAction
+                match action {
+                    Some(action) => action,
+                    None => continue,
                 }
             }
         };
 
         let run_migrations = true;
-        if matches!(action, InitialAction::StopBusiness) {
-            // stop：停止业务服务（host.stop_all / builtin cancel 等价路径经
-            // static reconcile 清空 + orchestrator 令牌取消由既有语义承载——
-            // 首版经 stop_all + reconcile 达成，保持管理面可用）。
+        if let InitialAction::StopBusiness { operation_id } = action {
+            // stop：停止业务服务（保持管理面）。B01：按**自身受理 ID**收束——
+            // Stop 从不占据 current 执行槽，禁止 finish_current（它会读
+            // current=None 而静默丢终态，Stop 永远 Accepted）。
             let stopped = async {
                 if let Some(host) = host.as_ref() {
                     host.stop_all().await?;
@@ -1428,7 +1517,8 @@ async fn server_loop(
                 Ok(()) => {
                     state.set_phase(ServerPhase::Idle);
                     state
-                        .finish_current_runtime_operation(
+                        .finish_runtime_operation_by_id(
+                            &operation_id,
                             shared_types::RuntimeOperationState::Succeeded,
                             None,
                         )
@@ -1438,7 +1528,8 @@ async fn server_loop(
                     tracing::error!("runtime stop business failed: {error:#}");
                     state.set_phase(ServerPhase::Failed(format!("stop: {error:#}")));
                     state
-                        .finish_current_runtime_operation(
+                        .finish_runtime_operation_by_id(
+                            &operation_id,
                             shared_types::RuntimeOperationState::RecoveryRequired,
                             Some((
                                 shared_types::ERR_BACKEND_ERROR.into(),
@@ -1455,7 +1546,7 @@ async fn server_loop(
             InitialAction::Deploy(_) | InitialAction::Prepared(_)
         );
         let prepared = match action {
-            InitialAction::StopBusiness => unreachable!("handled above"),
+            InitialAction::StopBusiness { .. } => unreachable!("handled above"),
             InitialAction::Deploy(request) => {
                 state.set_phase(ServerPhase::Deploying);
                 state.set_request_release_id(&request.release_id);
@@ -1571,13 +1662,32 @@ async fn server_loop(
                     )
                     .await;
                 state.set_phase(ServerPhase::Idle);
-            } else {
-                state
-                    .finish_current_runtime_operation(
-                        shared_types::RuntimeOperationState::Succeeded,
-                        None,
+            } else if commit_running_barrier(state).await == BarrierOutcome::Superseded {
+                // B03：Stop 已受理（revision 推进）——停服务、按 ID 收束
+                // Cancelled、回 Idle；不报 Succeeded（Stop 信号随后在
+                // Idle 边界按自身 ID 执行收束）。
+                if let Err(error) = host.stop_all().await {
+                    hold_unconfirmed(
+                        state,
+                        format!("stop after superseded startup failed: {error:#}"),
                     )
                     .await;
+                    return Ok(());
+                }
+                if let Some(operation_id) = state.current_runtime_operation() {
+                    state
+                        .finish_runtime_operation_by_id(
+                            &operation_id,
+                            shared_types::RuntimeOperationState::Cancelled,
+                            Some((
+                                shared_types::ERR_RECOVERY_REQUIRED.into(),
+                                "superseded by an admitted stop operation".into(),
+                            )),
+                        )
+                        .await;
+                }
+                state.set_phase(ServerPhase::Idle);
+                continue;
             }
             // R01：supervisord Running 等待也消费运行控制信号（Stop/重启编排
             // 不再只能等 Idle）。锁序与 Idle 分支一致：deploy 先、control 后。
@@ -1598,16 +1708,10 @@ async fn server_loop(
                             .await;
                             return Ok(());
                         }
-                        match settle_control_signal(state, signal).await {
-                            InitialAction::Existing => Next::Redeploy(InitialAction::Existing),
-                            // 停止已在上方完成并按 ID 收束——回 Idle 等待，
-                            // 不再经 pending 重复执行 StopBusiness 边界。
-                            InitialAction::StopBusiness => {
-                                state.set_phase(ServerPhase::Idle);
-                                Next::Wait
-                            }
-                            _ => unreachable!("settle_control_signal returns Existing/StopBusiness"),
-                        }
+                        // B01：动作整体交回主循环——Existing 重编排、
+                        // StopBusiness{ID} 由 loop-top 唯一收束路径按 ID 完成
+                        //（stop_all 幂等，重复执行无害）。
+                        Next::Redeploy(settle_control_signal(state, signal).await)
                     }
                     None => Next::Wait,
                 },
@@ -1662,7 +1766,9 @@ async fn server_loop(
                         continue;
                 }
                 if result.is_ok() && state.current_operation_cancelled() {
-                    // R03：编排期间被取消 → 停本组服务收束 Cancelled（不报成功）
+                    // R03：编排期间被取消 → 停本组服务收束 Cancelled（不报成功）。
+                    // B02：join 已完成 JoinHandle——后续**不得再 poll** sup（panic 路径）。
+                    // 直接转 Idle 回外层循环，不进入下方终态 select。
                     cancel.cancel();
                     if let Err(error) = join_supervisor(&mut sup, &mut sup_joined).await {
                         hold_unconfirmed(
@@ -1679,18 +1785,41 @@ async fn server_loop(
                         )
                         .await;
                     state.set_phase(ServerPhase::Idle);
+                    continue;
                 }
                 if result.is_ok() {
-                    state
-                        .finish_current_runtime_operation(
-                            shared_types::RuntimeOperationState::Succeeded,
-                            None,
-                        )
-                        .await;
+                    // B03：提交经内核屏障（revision/取消/身份原子检查）——
+                    // Stop 已受理（Superseded）→ 停本组服务、按 ID 收束
+                    // Cancelled、回 Idle；不报 Succeeded。
+                    if commit_running_barrier(state).await == BarrierOutcome::Superseded {
+                        cancel.cancel();
+                        if let Err(error) = join_supervisor(&mut sup, &mut sup_joined).await {
+                            hold_unconfirmed(
+                                state,
+                                format!("stop after superseded startup failed: {error:#}"),
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        if let Some(operation_id) = state.current_runtime_operation() {
+                            state
+                                .finish_runtime_operation_by_id(
+                                    &operation_id,
+                                    shared_types::RuntimeOperationState::Cancelled,
+                                    Some((
+                                        shared_types::ERR_RECOVERY_REQUIRED.into(),
+                                        "superseded by an admitted stop operation".into(),
+                                    )),
+                                )
+                                .await;
+                        }
+                        state.set_phase(ServerPhase::Idle);
+                        continue;
+                    }
                 }
                 let mut builtin_control = state.control_rx.lock().await;
                 tokio::select! {
-                    outcome = &mut sup => { sup_joined = true; match outcome {
+                    outcome = &mut sup, if !sup_joined => { sup_joined = true; match outcome {
                         // 服务退出/信号/cancel 后 supervise 正常返回：内置引擎不自动重编排
                 //（supervisord 引擎下服务崩溃由 supervisord per-service 重启，不走到这）
                 Ok(Ok(())) => {
@@ -1737,14 +1866,8 @@ async fn server_loop(
                         hold_unconfirmed(state, format!("stop before runtime control failed: {error:#}")).await;
                         return Ok(());
                     }
-                    match settle_control_signal(state, signal).await {
-                        InitialAction::Existing => Next::Redeploy(InitialAction::Existing),
-                        InitialAction::StopBusiness => {
-                            state.set_phase(ServerPhase::Idle);
-                            Next::Wait
-                        }
-                        _ => unreachable!("settle_control_signal returns Existing/StopBusiness"),
-                    }
+                    // B01：同 supervisord 分支——动作整体交回主循环唯一收束路径
+                    Next::Redeploy(settle_control_signal(state, signal).await)
                 }
                 None => Next::Wait,
             },

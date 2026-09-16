@@ -49,7 +49,7 @@ fn reject(code: &str, message: &str, status: StatusCode) -> (StatusCode, Json<se
 }
 
 fn require_token(
-    state: &AppState,
+    _state: &AppState,
     token: Option<&str>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let expected = std::env::var("APP_CLI_DEPLOY_TOKEN")
