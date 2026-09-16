@@ -304,6 +304,28 @@ strip_prefix = false
 
     # ===== 锁快失败真实场景（stop/restart/delete 忙锁 ERR_CONFLICT；start 等待） =====
 
+    def wait_deployment_quiesced(self, interval=3, budget=90):
+        """等待应用 Deployment 的 resourceVersion 静默（连续两次读取不变）。
+
+        env 收敛比对 resourceVersion 判并发，kube-controller 的 status 写入
+        同样推进它——滚动刚结束的 status 抖动会让紧随其后的热部署误报
+        "changed concurrently" 并落 RecoveryRequired（不可重试的租约保留）。
+        """
+        def version():
+            row = json.loads(self.kube('get', 'deployment', 'rcoder-app-' + self.app, '-o', 'json'))
+            return row['metadata']['resourceVersion']
+
+        last = version()
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            time.sleep(interval)
+            current = version()
+            if current == last:
+                return
+            last = current
+        self.check('lock_holder_deployment_quiesced', False,
+                   {'last_resource_version': last, 'budget_s': budget})
+
     def lock_window_holder(self, artifact, admitted_check):
         """在副本0发起一个在途持有者（热部署），以操作受理记录为可观察同步点。
 
@@ -311,31 +333,23 @@ strip_prefix = false
         持有者被受理后需要满足的断言 id（不同窗口分别登记）。
 
         env 收敛以 Deployment resourceVersion 判并发——kube-controller 的
-        status 写入同样推进 resourceVersion，热部署撞上滚动后 status 抖动会
-        误报 "hot deployment or env changed concurrently"（瞬态，非锁语义）。
-        持有者对该冲突有界重试（新 request_id）；受理同步跟随线程当前 rid。
+        status 写入同样推进 resourceVersion。持有者紧接 hot_deploy #2 启动会
+        撞上滚动后 status 抖动误报 "changed concurrently"，且该失败落
+        RecoveryRequired + 租约保留（不可重试）。消除竞态源：启动前等待
+        Deployment resourceVersion 静默（连续两次读取不变）。
         """
+        self.wait_deployment_quiesced()
         holder_outcome = []
-        live = {'rid': None, 'attempts': 0}
+        live = {'rid': None}
 
         def call():
-            while True:
-                rid = 'lock-holder-' + uuid.uuid4().hex[:16]
-                live['rid'] = rid
-                status, envelope = self.request('/api/v1/userapp/' + self.app + '/start',
-                                                {'user_id': self.user, 'request_id': rid,
-                                                 **artifact, 'deploy_mode': 'hot'},
-                                                self.entries[0], timeout=300)
-                if status == 200 and envelope.get('code') == '0000':
-                    holder_outcome.append((status, envelope, rid))
-                    return
-                if ('changed concurrently' in envelope.get('message', '')
-                        and live['attempts'] < 2):
-                    live['attempts'] += 1
-                    time.sleep(3)
-                    continue
-                holder_outcome.append((status, envelope, rid))
-                return
+            rid = 'lock-holder-' + uuid.uuid4().hex[:16]
+            live['rid'] = rid
+            status, envelope = self.request('/api/v1/userapp/' + self.app + '/start',
+                                            {'user_id': self.user, 'request_id': rid,
+                                             **artifact, 'deploy_mode': 'hot'},
+                                            self.entries[0], timeout=300)
+            holder_outcome.append((status, envelope, rid))
 
         thread = threading.Thread(target=call, daemon=True)
         thread.start()
@@ -345,8 +359,6 @@ strip_prefix = false
                     + urllib.parse.urlencode({'user_id': self.user, 'request_id': rid}))
 
         def current_admitted():
-            # 跟随重试轮换：以线程当前 rid 查受理记录；窗口未开（含重试间隙）
-            # 返回 None 继续等
             rid = live['rid']
             if not rid:
                 return None
