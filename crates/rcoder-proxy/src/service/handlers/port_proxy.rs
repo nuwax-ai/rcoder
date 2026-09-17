@@ -64,18 +64,18 @@ pub async fn handle_port_proxy_request(
     // 连 127.0.0.1:4000 即 502，Forward 永无执行机会）。此处仅消费决策：
     // 重写为内部入口 + 令牌头（take 一次性消费+token 由 peer 阶段写 ctx，
     // 消除 ArcSwap 二次 load）；无决策走下方既有本机路径（行为与现状一致）。
-    if let Some(token) = ctx.preview_internal_token.take() {
-        if let Some((instance_id, preview_port)) = ctx.preview_rewrite.take() {
-            let internal_path =
-                format!("/internal/preview-forward/{instance_id}/{preview_port}{target_path}");
-            let internal_uri = utils::rewrite_uri(original_uri, internal_path)?;
-            upstream_request.set_uri(internal_uri);
-            // 令牌头覆盖（客户端伪造值被替换为进程持有令牌）
-            upstream_request.insert_header("x-preview-internal-token", &token)?;
-            upstream_request.insert_header("Host", "127.0.0.1")?;
-            utils::set_common_headers(upstream_request)?;
-            return Ok(());
-        }
+    if let Some(token) = ctx.preview_internal_token.take()
+        && let Some((instance_id, preview_port)) = ctx.preview_rewrite.take()
+    {
+        let internal_path =
+            format!("/internal/preview-forward/{instance_id}/{preview_port}{target_path}");
+        let internal_uri = utils::rewrite_uri(original_uri, internal_path)?;
+        upstream_request.set_uri(internal_uri);
+        // 令牌头覆盖（客户端伪造值被替换为进程持有令牌）
+        upstream_request.insert_header("x-preview-internal-token", &token)?;
+        upstream_request.insert_header("Host", "127.0.0.1")?;
+        utils::set_common_headers(upstream_request)?;
+        return Ok(());
     }
 
     // 设置 Host 头
@@ -155,6 +155,11 @@ pub async fn handle_port_proxy_upstream(
         peer.options.total_connection_timeout = Some(Duration::from_secs(15));
         peer.options.idle_timeout = Some(Duration::from_secs(3600));
         ctx.upstream_host = Some(host_ip);
+        // 与 legacy 分支同款指标——response 阶段无条件 dec_active，此处不补
+        // 则 Forward 流量的 dec 会吃掉 legacy 的 inc（active_connections 失真）
+        metrics.record_request();
+        metrics.record_request_port(target_port);
+        metrics.inc_active();
         return Ok(Box::new(peer));
     }
 
