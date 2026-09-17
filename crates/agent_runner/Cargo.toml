@@ -50,6 +50,10 @@ hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 # 叠加 MCP server（127.0.0.1:6771，AI 实时查询性能数据；见 AGENTS.md）
 hotpath-mcp = ["hotpath", "hotpath/hotpath-mcp"]
 
+# dial9 事件级 Tokio tracing（本地开发专用；编译须配 RUSTFLAGS="--cfg tokio_unstable"
+# 才有全量 task 覆盖）。运行期 DIAL9_ENABLED 开关（默认关=纯 passthrough，零开销）。
+dial9 = ["dep:dial9"]
+
 [lints]
 workspace = true
 
@@ -68,6 +72,7 @@ file-server-userapp = { workspace = true }
 file-server-proxy = { workspace = true }
 rcoder-proxy = { workspace = true, optional = true }
 rcoder-telemetry = { workspace = true }
+dial9 = { workspace = true, optional = true }
 
 clap = { workspace = true }
 # ACP Protocol - 官方 SDK（完全 Send-safe，无需 LocalSet）

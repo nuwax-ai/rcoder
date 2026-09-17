@@ -8,18 +8,44 @@ use rcoder::*;
 
 use docker_manager::runtime_selection::RuntimeType;
 
-#[tokio::main]
-#[hotpath::main]
-async fn main() -> anyhow::Result<()> {
-    // Packaging probes must execute the binary without bootstrapping services or storage.
-    if std::env::args_os()
+/// Packaging probes must execute the binary without bootstrapping services or storage.
+fn version_probe() -> bool {
+    std::env::args_os()
         .skip(1)
         .eq([std::ffi::OsString::from("--version")])
-    {
+}
+
+// dial9 变体：手动构建 runtime 才能把 hooks 挂进 Builder（`#[tokio::main]`
+// 做不到）。`#[hotpath::main]` 只在函数体前插 guard、不构建 runtime，可共存。
+// 退出顺序：先 drop(runtime) 停事件流，再 graceful_shutdown 刷盘终段
+// （5s 预算 < docker stop 10s 宽限）。
+#[cfg(feature = "dial9")]
+#[hotpath::main]
+fn main() -> anyhow::Result<()> {
+    if version_probe() {
         println!("rcoder {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    let (recorder, runtime) = dial9_obs::runtime_from_env()
+        .map_err(|e| anyhow::anyhow!("dial9 runtime init failed: {e}"))?;
+    let exit = runtime.block_on(run());
+    drop(runtime);
+    recorder.graceful_shutdown(std::time::Duration::from_secs(5));
+    exit
+}
 
+#[cfg(not(feature = "dial9"))]
+#[tokio::main]
+#[hotpath::main]
+async fn main() -> anyhow::Result<()> {
+    if version_probe() {
+        println!("rcoder {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    run().await
+}
+
+async fn run() -> anyhow::Result<()> {
     // Feature 开关: 启动读一次 env + eprintln 打印状态 (console, tracing 未就绪也可见)
     shared_types::FeatureFlags::init();
 

@@ -353,6 +353,12 @@ pyroscope = { version = "2.1", features = ["backend-pprof-rs"] }
 # 不进 default features → 生产构建（build-agent-docker）完全无感。
 hotpath = { version = "0.25.1", default-features = false }
 
+# dial9 事件级 Tokio tracing（本地开发观测，取代已移除的 tokio-console）。
+# default=[] 必须显式开 `tokio`（runtime hooks + recorder_from_env）；不开
+# cpu/memory-profiling——它们需要 force-frame-pointers，会改 RUSTFLAGS 指纹。
+# 仅经 rcoder/agent_runner 的 `dial9` feature 引入，生产构建不含。
+dial9 = { version = "0.5", default-features = false, features = ["tokio"] }
+
 # 开发调试使用日志，不使用源码断点；workspace 成员不产出 debuginfo（DWARF）。
 [profile.dev]
 debug = false

@@ -6,6 +6,9 @@
 pub mod agent_mgmt;
 pub mod api_key_manager;
 pub mod config;
+/// dial9 事件级 Tokio tracing 装配（`dial9` feature 专用）
+#[cfg(feature = "dial9")]
+pub mod dial9_obs;
 /// 内嵌 file-server（env RCODER_EMBED_FILE_SERVER 运行时开关，编译期无门控）
 pub mod file_server_embed;
 pub mod grpc;
