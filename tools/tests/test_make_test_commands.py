@@ -87,15 +87,6 @@ sys.exit(17 if failed else 0)
             self.assertEqual(code == 0, failure == '')
             self.assertEqual(calls, [['python3', 'tests-e2e/tools/run.py', '--group', 'userapp']])
 
-    def test_docker_failures_cannot_be_reported_as_success(self):
-        for target in ('test-ebpf-install', 'test-ebpf-no-install', 'test-pyroscope-offcpu'):
-            for failure in ('build', 'run'):
-                with self.subTest(target=target, failure=failure):
-                    code, calls = self.run_target(target, failure)
-                    self.assertNotEqual(code, 0)
-                    if failure == 'build':
-                        self.assertEqual(len(calls), 1, 'must not run an old image after build failure')
-
 
 if __name__ == '__main__':
     unittest.main()

@@ -47,7 +47,7 @@ agent_runner (OTLP) ─┘         └─ self-metrics :8888（Prometheus 抓取
 3. 采样：`OTEL_TRACES_SAMPLER_ARG`（rcoder 侧比例采样）或 collector `tail_sampling`
    processor（错误全留+正常抽样）
 4. Tempo 3.x 迁移用官方 `tempo config converter`（3.0 移除 ingester/compactor 配置块）
-5. 可叠加：trace to logs（Loki）、span profiles（与 Pyroscope CPU 火焰按 span 关联）
+5. 可叠加：trace to logs（Loki）
 
 ## trace_id 日志注入（自动）
 

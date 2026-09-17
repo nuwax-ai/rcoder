@@ -25,7 +25,7 @@ cd /app
 
 PORT="${RCODER_PORT:-8290}"
 # FEATURES: 默认只用 kubernetes (存储/PVC/lazy mv 逻辑测试够了)。
-# 需全功能调试(eBPF/pyroscope/otel)时:RCODER_FEATURES=ebpf-debug,pyroscope,otel,debug,kubernetes dev-rcoder.sh restart
+# 需全观测调试(otel/dial9)时:RCODER_FEATURES=otel,debug,hotpath,dial9,kubernetes dev-rcoder.sh restart
 FEATURES="${RCODER_FEATURES:-kubernetes}"
 # line-tables-only: 最小 debuginfo (行号), 避免大 debug binary (666MB→269MB) 导致 OrbStack link 卡死
 export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-line-tables-only}"

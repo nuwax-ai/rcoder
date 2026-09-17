@@ -13,7 +13,7 @@ RCoder is a modern AI-powered development platform built with Rust. It provides 
 - **gRPC Communication** - High-performance internal communication via Tonic with Server Streaming
 - **Configuration System** - Multi-layered priority: CLI args > Environment variables > Config file
 - **API Documentation** - Auto-generated API docs (utoipa + Swagger UI)
-- **Observability** - Tracing + OpenTelemetry distributed tracing + Pyroscope profiling
+- **Observability** - Tracing + OpenTelemetry distributed tracing + dial9 event-level Tokio tracing
 - **Computer Agent** - Containerized AI agent environment with VNC remote desktop, audio streaming, and IME input
 
 ## Architecture
@@ -50,7 +50,7 @@ External Client (SSE)
 | **Containerization** | Docker + Bollard | Container management and orchestration |
 | **Database** | DuckDB + SQLx | Embedded analytical database |
 | **Logging** | Tracing + OpenTelemetry | Structured logging and distributed tracing |
-| **Profiling** | Pyroscope | Continuous performance profiling |
+| **Profiling** | dial9 + hotpath | Event-level Tokio tracing (local dev) + function profiling |
 | **CLI** | clap | Modern command-line argument parsing |
 
 ## Getting Started
@@ -411,18 +411,20 @@ docker-compose -f docker/docker-compose.yml ps
 make dev-down
 ```
 
-### Pyroscope Profiling
+### dial9 Event-level Tokio Tracing
 
 ```bash
-# Start Pyroscope Server
-make pyroscope-up
+# Enable recording (traces land in docker/logs/dial9)
+make dial9-on
 
-# Open Web UI
-open http://localhost:4040
+# Disable (off by default, zero overhead)
+make dial9-off
 
-# Stop service
-make pyroscope-down
+# Single-binary offline viewer
+make dial9-view
 ```
+
+See [docs/observability.md](docs/observability.md).
 
 ## Troubleshooting
 
@@ -458,7 +460,7 @@ docker exec -it <container_id> /bin/bash
 - API Key authentication middleware
 - Automatic container cleanup
 - Multi-image configuration support
-- Pyroscope profiling integration
+- dial9 event-level Tokio tracing integration (local dev)
 
 #### Technical Highlights
 - Rust 2024 Edition

@@ -14,7 +14,7 @@ RCoder 是一个基于 Rust 构建的现代化 AI 驱动开发平台，通过 **
 - ⚡ **gRPC 通信**：基于 Tonic 的高性能内部通信，支持 Server Streaming 实时进度
 - 🖥️ **Computer Agent**：容器化 AI 代理环境，集成 VNC 远程桌面、音频流和 IME 输入
 - 🧩 **可插拔存储**：内存后端（默认）与 PostgreSQL 后端（K8s 变体）feature 切换
-- 📊 **可观测性**：Tracing + OpenTelemetry 链路追踪 + Pyroscope 性能分析
+- 📊 **可观测性**：Tracing + OpenTelemetry 链路追踪 + dial9 事件级 Tokio tracing
 - 🔒 **安全红线**：workspace 级 lint 禁止 `unsafe` 代码、禁止 `unwrap/expect` 进生产路径
 
 ## 🏠 架构概览
@@ -52,7 +52,7 @@ RCoder (转换为 SSE)
 | **容器化** | Docker (Bollard) + Kubernetes (kube-rs) | 双运行时抽象 |
 | **持久化** | PostgreSQL (SQLx, feature-gated) / 内存 | K8s 变体启用 PG，Docker 路径零依赖 |
 | **日志系统** | Tracing + OpenTelemetry | 结构化日志（K8s 下写文件按天滚动） |
-| **性能分析** | Pyroscope | 持续性能剖析 |
+| **性能分析** | dial9 + hotpath | 事件级 Tokio tracing（本地 dev）+ 函数耗时剖析 |
 | **API 文档** | utoipa + Swagger UI + Scalar | 自动生成 OpenAPI |
 
 ## 🚀 快速开始
@@ -238,7 +238,7 @@ crates/
 ├── rcoder-proxy/            # Pingora 反向代理封装
 ├── rcoder-storage/          # 存储层（memory / PostgreSQL 后端）
 ├── rcoder-gateway/          # K8s 无状态网关（header 注入 + Envoy Gateway 路由）
-├── rcoder-telemetry/        # 遥测（Tracing + OTel + Pyroscope）
+├── rcoder-telemetry/        # 遥测（Tracing + OTel）
 ├── rcoder-cli/              # 本地测试 ACP agent 的 CLI 工具
 ├── shared_types/            # 共享类型与常量
 ├── shared_types_grpc/       # gRPC proto 定义（proto/agent.proto）
@@ -393,12 +393,15 @@ make devspace-dev
 # 生产部署（Helm，配置见独立部署仓库）
 ```
 
-### Pyroscope 性能分析
+### dial9 事件级 Tokio tracing
 
 ```bash
-make pyroscope-up     # 启动，访问 http://localhost:4040
-make pyroscope-down
+make dial9-on         # 启用记录（trace 落 docker/logs/dial9）
+make dial9-off        # 关闭（默认关，零开销）
+make dial9-view       # 单二进制离线 viewer
 ```
+
+详见 [docs/observability.md](docs/observability.md)。
 
 ## 🐛 问题排查
 
@@ -437,7 +440,7 @@ cargo run -p rcoder-cli
 - ✅ Computer Agent（VNC/noVNC、音频流、IME）
 - ✅ 模型预检 fail-fast（model_probe）
 - ✅ API Key 鉴权中间件
-- ✅ OpenTelemetry 追踪 + Pyroscope 性能分析
+- ✅ OpenTelemetry 追踪 + dial9 事件级 Tokio tracing（本地 dev）
 - ✅ file-server / app-cli npm 独立分发
 
 ## 🔗 相关链接

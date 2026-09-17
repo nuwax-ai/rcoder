@@ -1,17 +1,17 @@
 # Docker 本地测试配置说明
 
-> 本文档说明如何在本地使用 Docker Compose 启动 RCoder 开发环境，包含完整的监控服务（Pyroscope、Prometheus、Grafana）和 eBPF 诊断工具。
+> 本文档说明如何在本地使用 Docker Compose 启动 RCoder 开发环境，包含完整的观测服务（Tempo/Prometheus/Loki/Grafana）与 dial9 事件级 Tokio tracing（离线分析，零观测容器）。
 
 ## 📑 目录
 
 - [快速开始](#-快速开始)
 - [环境要求](#-环境要求)
 - [架构概览](#-架构概览)
-- [监控服务](#-监控服务)
+- [观测服务](#-观测服务)
 - [配置说明](#-配置说明)
 - [常用命令](#-常用命令)
 - [测试页面](#-测试页面)
-- [eBPF 诊断工具](#-ebpf-诊断工具)
+- [dial9 事件级 tracing](#-dial9-事件级-tokio-tracing)
 - [故障排查](#-故障排查)
 - [常见问题](#-常见问题)
 - [目录结构](#-目录结构)
@@ -37,9 +37,8 @@ make dev-logs
 
 | 服务 | 地址 | 用途 |
 |------|------|------|
-| **Pyroscope** | http://localhost:4040 | CPU 性能分析火焰图 |
-| **Prometheus** | http://localhost:9091 | 时序指标查询 |
 | **Grafana** | http://localhost:3300 | 进程监控 Dashboard (admin/admin) |
+| **Prometheus** | http://localhost:9091 | 时序指标查询 |
 
 ### 创建测试容器
 
@@ -76,7 +75,6 @@ curl -X POST http://127.0.0.1:8088/computer/chat \
 
 ```bash
 # 检查端口占用
-lsof -i :4040   # Pyroscope
 lsof -i :9091   # Prometheus
 lsof -i :3300   # Grafana
 lsof -i :8088   # RCoder API
@@ -99,21 +97,26 @@ flowchart TB
             Runner["AI 代理运行时<br/>gRPC 服务端<br/>镜像: master-rcoder:latest"]
         end
         
-        subgraph Monitoring["📊 监控服务"]
+        subgraph Monitoring["📊 观测服务"]
             direction LR
-            Pyro["Pyroscope<br/>:4040"]
+            Tempo["Tempo<br/>:3200"]
             Prom["Prometheus<br/>:9091"]
+            Loki["Loki<br/>:3100"]
             Graf["Grafana<br/>:3300"]
-            Pyro --> Prom --> Graf
         end
         
         RCoder ==>|"gRPC<br/>内部网络"| Runner
+        RCoder -->|"OTLP"| Tempo
+        Prom --> Graf
+        Tempo --> Graf
+        Loki --> Graf
     end
     
     style RCoder fill:#e1f5fe
     style Runner fill:#fff3e0
-    style Pyro fill:#f3e5f5
+    style Tempo fill:#f3e5f5
     style Prom fill:#e8f5e9
+    style Loki fill:#fffde7
     style Graf fill:#fce4ec
 ```
 
@@ -123,68 +126,51 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    subgraph AgentRunner["Agent Runner 容器"]
-        direction TB
-        Alloy["Grafana Alloy"]
-        
-        subgraph Collectors["数据采集器"]
-            EBPF["eBPF Profiler<br/>97 Hz"]
-            PE["Process Exporter<br/>15s"]
-        end
-        
-        Alloy --> EBPF
-        Alloy --> PE
+    subgraph Apps["rcoder / agent_runner"]
+        OTLP["OTLP traces"]
+        LOGS["JSON 日志"]
+        DIAL9["dial9 事件级 trace<br/>(DIAL9_ENABLED=1)"]
     end
     
-    subgraph Storage["存储与分析"]
-        Pyro["Pyroscope<br/>火焰图 + Top 函数"]
-        Prom["Prometheus<br/>时序数据存储"]
+    subgraph Pipeline["采集与存储"]
+        COLLECTOR["otel-collector<br/>:4317"]
+        TEMPO["Tempo<br/>trace 存储"]
+        FB["fluent-bit"]
+        LOKI["Loki<br/>日志检索"]
+        PROM["Prometheus<br/>指标"]
     end
     
-    subgraph Viz["可视化"]
-        Graf["Grafana<br/>统一 Dashboard"]
+    subgraph Viz["可视化 / 分析"]
+        GRAF["Grafana<br/>:3300"]
+        VIEWER["dial9 serve<br/>离线 viewer"]
     end
     
-    EBPF -->|"CPU 性能数据"| Pyro
-    PE -->|"进程指标"| Prom
-    Pyro --> Graf
-    Prom --> Graf
+    OTLP --> COLLECTOR --> TEMPO --> GRAF
+    LOGS --> FB --> LOKI --> GRAF
+    DIAL9 -->|"磁盘分段文件"| VIEWER
     
-    style AgentRunner fill:#e3f2fd
-    style Pyro fill:#f3e5f5
-    style Prom fill:#e8f5e9
-    style Graf fill:#fce4ec
+    style Apps fill:#e3f2fd
+    style TEMPO fill:#f3e5f5
+    style PROM fill:#e8f5e9
+    style GRAF fill:#fce4ec
+    style VIEWER fill:#fffde7
 ```
 
 ---
 
-## 📊 监控服务
+## 📊 观测服务
 
 ### 服务概览
 
-| 服务 | 端口 | 登录信息 | 数据源 | 用途 |
-|------|------|----------|--------|------|
-| **Pyroscope** | 4040 | 无需登录 | Alloy eBPF (97 Hz) | CPU 性能分析火焰图 |
-| **Prometheus** | 9091 | 无需登录 | Alloy Process Exporter (15s) | 时序指标存储 |
-| **Grafana** | 3300 | admin / admin | Prometheus | 可视化 Dashboard |
+| 服务 | 端口 | 登录信息 | 用途 |
+|------|------|----------|------|
+| **Tempo** | 3200 | — | OTLP 分布式追踪存储（经 otel-collector） |
+| **Prometheus** | 9091 | 无需登录 | 时序指标（rcoder /metrics + collector 自身指标） |
+| **Loki** | 3100 | 无需登录 | 日志检索（fluent-bit 采集） |
+| **Grafana** | 3300 | admin / admin | 统一可视化（Tempo/Prometheus/Loki 数据源） |
 
-### Grafana Dashboard
-
-**Dashboard 名称**: `Agent Runner 进程监控`
-
-**包含面板**:
-- **概览**: RSS/VSZ 内存、CPU 使用率、文件描述符
-- **内存趋势**: RSS 和 VSZ 的时间序列图
-- **I/O 监控**: 读取/写入速率
-- **上下文切换**: 自愿/非自愿切换速率
-- **线程详情**: 线程数量、FD 使用率
-- **缺页错误**: 次要/主要缺页错误速率
-
-**可用变量**:
-- `project_id`: 过滤项目 ID
-- `instance`: 过滤实例
-- `process_name`: 过滤进程名称
-- `resolution`: 查询分辨率 (15s, 30s, 1m, 5m, 15m)
+Tokio 运行时层的深度剖析（poll/wake/task 时间线、调度延迟）由 dial9 离线承担，
+详见 [docs/observability.md](../docs/observability.md) 与下方 dial9 节。
 
 ---
 
@@ -193,14 +179,17 @@ flowchart LR
 ### 核心配置文件
 
 #### `docker-compose.yml`
-监控服务配置，定义所有服务容器。
+观测服务配置，定义所有服务容器。
 
 **服务列表**:
 ```yaml
 services:
   rcoder:          # 主 RCoder 服务
-  pyroscope:       # CPU 性能分析服务器
+  tempo:           # OTLP 分布式追踪存储
+  otel-collector:  # 遥测采集管道
   prometheus:      # 时序指标数据库
+  loki:            # 日志后端
+  fluent-bit:      # 日志采集
   grafana:         # 可视化平台
 ```
 
@@ -231,7 +220,7 @@ image: "master-rcoder:latest"
 | **镜像** | `master-rcoder:latest` | `registry.yichamao.com/rcoder:latest-arm64` |
 | **配置文件** | `docker/config.yml` | `config.yml` |
 | **项目路径** | `/app/project_workspace` | `./project_workspace` |
-| **监控服务** | 完整（Pyroscope + Prometheus + Grafana） | 按需部署 |
+| **观测服务** | 完整（Tempo + Prometheus + Loki + Grafana） | 按需部署 |
 
 ---
 
@@ -300,7 +289,6 @@ curl -X POST http://127.0.0.1:8088/agent/session/cancel \
 
 ```bash
 # 一键检查所有服务状态
-curl -s http://localhost:4040/health  # Pyroscope
 curl -s http://localhost:9091/-/healthy  # Prometheus
 curl -s http://localhost:3300/api/health  # Grafana
 curl -s http://localhost:8088/health  # RCoder
@@ -312,7 +300,6 @@ curl -s http://localhost:8088/health  # RCoder
 # 保存为 check-health.sh
 #!/bin/bash
 services=(
-    "Pyroscope:4040:/health"
     "Prometheus:9091:/-/healthy"
     "Grafana:3300:/api/health"
     "RCoder:8088:/health"
@@ -333,9 +320,6 @@ done
 ```bash
 # 检查 Prometheus 是否接收指标
 curl -s 'http://localhost:9091/api/v1/query?query=up' | jq '.data.result[]'
-
-# 检查 Pyroscope 是否有应用数据
-curl -s 'http://localhost:4040/ingest?name=agent_runner' | jq
 
 # 检查 Grafana 数据源连接
 curl -s 'http://admin:admin@localhost:3300/api/datasources' | jq '.[] | select(.name=="Prometheus") | .isDefault'
@@ -396,57 +380,33 @@ curl -X POST http://127.0.0.1:8088/computer/chat \
 
 ---
 
-## 🔬 eBPF 诊断工具
+## 🔬 dial9 事件级 Tokio tracing
 
 ### 概述
 
-RCoder 集成 eBPF 诊断工具，用于开发环境中快速定位进程阻塞和性能问题。
+dial9 经 Tokio runtime hooks 记录每个 poll/wake/task 事件到磁盘分段文件，
+离线分析定位"这个 task 在等什么 / 这个 poll 为什么长"。已取代 tokio-console
+与 Pyroscope/eBPF 持续剖析链。
 
-> **详细文档**: `/docker/rcoder-agent-runner/ebpf-tools/README.md`
-
-### ⚠️ 安全警告
-
-| 模式 | Feature | 容器特权 | 安全性 | 调试能力 |
-|------|---------|----------|--------|----------|
-| `make dev-restart` | `ebpf-debug` 启用 | 特权 (SYS_ADMIN) | ⚠️ 降低 | ✅ 完整 |
-| 生产模式 | 默认关闭 | 限制 | ✅ 高 | ❌ 无 |
-
-> **仅在受信任的调试环境使用 eBPF 模式！**
-
-### 监控能力
-
-| 工具 | 类型 | 频率 | 输出位置 |
-|------|------|------|----------|
-| **Alloy eBPF** | 持续 CPU 监控 | 97 Hz | Pyroscope Web UI |
-| **Alloy Process Exporter** | 进程指标 | 15 秒 | Grafana Dashboard |
-| **offcpu-monitor** | 阻塞火焰图 | 60 秒 | `/app/container-logs/diag/*.svg` |
-| **syscall-monitor** | 系统调用追踪 | 60 秒 | `/app/container-logs/diag/*.log` |
-
-### 快捷诊断命令
+### 使用方式
 
 ```bash
-# 1. 进入容器
-docker exec -it <container> bash
+make dial9-on         # 启用记录（重建 rcoder 容器注入 DIAL9_ENABLED=1）
+# ...复现场景...
+make dial9-off        # 关闭（默认关，纯 passthrough 零开销）
 
-# 2. 获取 agent_runner 进程 PID
-PID=$(pgrep agent_runner)
-
-# 3. 执行诊断命令
-e-offcpu $PID       # CPU 性能分析（显示耗时函数）
-e-flame $PID 60     # 生成 60 秒火焰图
-e-profile $PID      # 性能分析
-e-all $PID          # 综合诊断（包含所有分析）
+# 离线查看（单二进制 viewer；首次先 cargo binstall dial9）
+make dial9-view       # = dial9 serve --local-dir ./docker/logs/dial9
 ```
 
-### 导出诊断数据
+trace 落宿主 `docker/logs/dial9`（rcoder 主进程）/ `container-logs/dial9`
+（agent 容器，bind 宿主可见）。变量表与行为要点见
+[docs/observability.md](../docs/observability.md)。
 
-```bash
-# 导出所有诊断数据
-docker cp <container>:/app/container-logs/diag ./diag-results
+### 容器内手动诊断
 
-# 导出单个火焰图
-docker cp <container>:/app/container-logs/diag/flame-<pid>.svg ./
-```
+镜像保留 bpftrace/strace/sysstat/jq（需在 config.yml `services.security`
+显式提权后使用）。
 
 ---
 
@@ -478,32 +438,29 @@ docker exec -it <container_id> cat /app/config.yml
 make dev-logs
 ```
 
-#### 症状：监控服务无数据
+#### 症状：观测服务无数据
 
 **诊断步骤**:
 
 ```bash
-# 1. 检查监控服务状态
-docker ps | grep -E "pyroscope|prometheus|grafana"
+# 1. 检查观测服务状态
+docker ps | grep -E "tempo|prometheus|grafana|loki"
 
 # 2. 检查 agent_runner 容器
 docker ps | grep agent_runner
 
 # 3. 检查 Prometheus 指标
 curl -s 'http://localhost:9091/api/v1/query?query=up' | jq
-
-# 4. 检查 Alloy 日志
-docker exec <container> tail -f /app/container-logs/diag/alloy.log
 ```
 
 #### 症状：Grafana 显示 "No Data"
 
-**可能原因**: 没有 agent_runner 容器运行
+**可能原因**: 数据源无流量或查询时间窗不含数据
 
 **解决方案**:
-1. 创建容器（发送聊天请求）
-2. 等待 15-30 秒让数据采集
-3. 刷新 Dashboard
+1. 确认对应后端（Tempo/Prometheus/Loki）容器运行中
+2. 触发业务请求后刷新查询（Explore 选对应数据源）
+3. 检查 otel-collector / fluent-bit 自身健康（:8888 / :2020）
 
 #### 症状：端口冲突
 
@@ -519,7 +476,6 @@ prometheus:
 **检查端口占用**:
 
 ```bash
-lsof -i :4040  # Pyroscope
 lsof -i :9091  # Prometheus
 lsof -i :3300  # Grafana
 lsof -i :8088  # RCoder
@@ -583,7 +539,7 @@ services:
       - ./grafana/data:/var/lib/grafana
 ```
 
-### Q3: 如何禁用某个监控服务？
+### Q3: 如何禁用某个观测服务？
 
 注释掉 `docker-compose.yml` 中对应的服务配置。
 
@@ -670,8 +626,6 @@ docker/
 ├── prometheus/                      # Prometheus 配置
 │   └── prometheus.yml               # 规则文件
 ├── rcoder-agent-runner/             # Agent Runner 配置
-│   └── ebpf-tools/                  # eBPF 工具
-│       └── README.md                # 详细文档
 ├── rcoder-master/                   # 主服务配置
 ├── start-rcoder.sh                  # 启动脚本
 └── test-page/                       # 测试页面
@@ -685,7 +639,7 @@ docker/
 
 - [项目主文档](../README.md)
 - [CLAUDE.md](../CLAUDE.md) - 项目架构和开发指南
-- [eBPF 工具详细文档](./rcoder-agent-runner/ebpf-tools/README.md)
+- [可观测性指南](../docs/observability.md) - OTLP/Loki/dial9 使用说明
 - [Makefile](../Makefile) - 构建命令说明
 
 ---
