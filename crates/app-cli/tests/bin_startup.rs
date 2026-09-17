@@ -65,10 +65,11 @@ fn free_port_address() -> String {
     address
 }
 
-fn base_command(workspace: &Path, logs: &Path, admin_addr: &str) -> Command {
+fn base_command(subcommand: &str, workspace: &Path, logs: &Path, admin_addr: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_app-cli"));
     command
         .args([
+            subcommand,
             "--workspace",
             workspace.to_str().expect("workspace path"),
             "--log-dir",
@@ -136,7 +137,7 @@ fn legacy_admin_port_conflict_fails_fast_before_orchestration() {
     let (_hold, address) = reserve_port();
     let logs = workspace.parent().unwrap().join("logs");
     let output = run_to_exit(
-        base_command(&workspace, &logs, &address),
+        base_command("run", &workspace, &logs, &address),
         Duration::from_secs(30),
     );
     assert!(
@@ -159,8 +160,7 @@ fn serve_admin_port_conflict_fails_fast_before_recovery() {
     write_lock(&workspace, MINIMAL_LOCK);
     let (_hold, address) = reserve_port();
     let logs = workspace.parent().unwrap().join("logs");
-    let mut command = base_command(&workspace, &logs, &address);
-    command.arg("serve");
+    let command = base_command("serve", &workspace, &logs, &address);
     let output = run_to_exit(command, Duration::from_secs(30));
     assert!(
         !output.status.success(),
@@ -179,7 +179,7 @@ fn corrupted_lock_exits_non_zero() {
     let address = free_port_address();
     let logs = workspace.parent().unwrap().join("logs");
     let output = run_to_exit(
-        base_command(&workspace, &logs, &address),
+        base_command("run", &workspace, &logs, &address),
         Duration::from_secs(30),
     );
     assert!(
@@ -201,7 +201,7 @@ fn pingap_failure_emits_single_done_and_exits_non_zero() {
     let address = free_port_address();
     let logs = workspace.parent().unwrap().join("logs");
     let output = run_to_exit(
-        base_command(&workspace, &logs, &address),
+        base_command("run", &workspace, &logs, &address),
         Duration::from_secs(60),
     );
     let combined = String::from_utf8_lossy(&output.stdout);
@@ -242,7 +242,7 @@ fn legacy_deploy_url_with_port_conflict_has_no_deploy_side_effects() {
     write_lock(&workspace, MINIMAL_LOCK);
     let (_hold, address) = reserve_port();
     let logs = workspace.parent().unwrap().join("logs");
-    let mut command = base_command(&workspace, &logs, &address);
+    let mut command = base_command("run", &workspace, &logs, &address);
     // 注入部署三元组：deploy_requested() = true（旧版会进入 deploy_stage）
     command
         .env("APP_DEPLOY_URL", "http://127.0.0.1:1/nonexistent.zip")
@@ -282,8 +282,8 @@ fn serve_attach_without_existing_instance_starts_as_owner() {
     write_lock(&workspace, MINIMAL_LOCK);
     let address = free_port_address();
     let logs = workspace.parent().unwrap().join("logs");
-    let mut command = base_command(&workspace, &logs, &address);
-    command.arg("--attach").arg("serve");
+    let mut command = base_command("serve", &workspace, &logs, &address);
+    command.arg("--attach");
     let mut child = command.spawn().expect("spawn attach serve");
     // 等待足够时间让进程完成 attach 检测（无实例 → serve_without_attach）
     std::thread::sleep(std::time::Duration::from_secs(3));
@@ -327,8 +327,8 @@ fn serve_attach_identity_mismatch_exits_fast() {
     let (_dir, workspace) = temp_workspace();
     write_lock(&workspace, MINIMAL_LOCK);
     let logs = workspace.parent().unwrap().join("logs");
-    let mut command = base_command(&workspace, &logs, &server_addr);
-    command.arg("--attach").arg("serve");
+    let mut command = base_command("serve", &workspace, &logs, &server_addr);
+    command.arg("--attach");
     let output = run_to_exit(command, Duration::from_secs(15));
     assert!(
         !output.status.success(),
@@ -350,10 +350,8 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
     let address = free_port_address();
     let logs = workspace.parent().unwrap().join("logs");
 
-    let mut command_a = base_command(&workspace, &logs, &address);
-    command_a.arg("serve");
-    let mut command_b = base_command(&workspace, &logs, &address);
-    command_b.arg("serve");
+    let mut command_a = base_command("serve", &workspace, &logs, &address);
+    let mut command_b = base_command("serve", &workspace, &logs, &address);
     let mut first = command_a.spawn().expect("spawn first serve");
     let mut second = command_b.spawn().expect("spawn second serve");
 

@@ -7,56 +7,31 @@ use app_cli::CliArgs;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = CliArgs::parse();
-
-    // 本地开发子模式：--gen-lock <workspace> 只生成 release.lock + 预览 Pingap 配置后退出。
-    if let Some(workspace) = args.gen_lock.clone() {
-        app_cli::devtool::gen_lock(&workspace).await?;
-        return Ok(());
-    }
-
-    // 本地编译工具：与 --gen-lock 同类的本地分派。必须先于 init_tracing——
-    // 宿主机裸跑没有 /app/logs（默认 log_dir），tracing-appender 建目录会失败；
-    // build 自身只 println 输出，不依赖 tracing/日志目录。
-    if let Some(app_cli::config::Command::Build {
-        dev,
-        deploy_dir,
-        only,
-    }) = &args.command
-    {
-        app_cli::build::run(
-            &args.workspace,
-            *dev,
-            deploy_dir.as_deref(),
-            only.as_deref(),
-        )?;
-        return Ok(());
-    }
-
-    // legacy 直跑形态（无子命令）：P1-01 修复——API 先于 deploy_stage 绑定3010。
-    // init tracing 必须在子命令分派前（serve/attach 需要日志输出）。
-    // Build 已在 init_tracing 前分派返回（日志目录可能不存在）。
+    let args = match CliArgs::parse().command {
+        app_cli::config::Command::GenLock(args) => {
+            return app_cli::devtool::gen_lock(&args.workspace).await;
+        }
+        app_cli::config::Command::Build(args) => {
+            app_cli::build::run(
+                &args.workspace.workspace,
+                args.dev,
+                args.deploy_dir.as_deref(),
+                args.only.as_deref(),
+            )?;
+            return Ok(());
+        }
+        app_cli::config::Command::Serve(args) => {
+            let runtime = app_cli::RuntimeArgs::from(args);
+            let _guard = init_tracing(&runtime.log_dir);
+            return app_cli::server::serve(&runtime).await;
+        }
+        app_cli::config::Command::RunService(args) => {
+            let _guard = init_tracing(&args.log_dir);
+            return app_cli::run_service::run(&args.release_id, &args.service_id, &args.log_dir);
+        }
+        app_cli::config::Command::Run(args) => app_cli::RuntimeArgs::from(args),
+    };
     let _guard = init_tracing(&args.log_dir);
-
-    match &args.command {
-        Some(app_cli::config::Command::Build { .. }) => {
-            unreachable!("build dispatched before tracing init")
-        }
-        Some(app_cli::config::Command::Serve) => {
-            return app_cli::server::serve(&args).await;
-        }
-        Some(app_cli::config::Command::RunService {
-            release_id,
-            service_id,
-        }) => {
-            if let Err(e) = app_cli::run_service::run(release_id, service_id, &args) {
-                eprintln!("run-service {release_id}/{service_id}: {e:#}");
-                std::process::exit(1);
-            }
-            unreachable!("exec replaced process image");
-        }
-        None => {} // legacy 直跑路径：下方继续
-    }
 
     // ── legacy 直跑路径 ──
     let runtime_status = app_cli::runtime_status::RuntimeStatusService::default();
@@ -193,7 +168,7 @@ fn init_tracing(log_dir: &std::path::Path) -> Arc<tracing_appender::non_blocking
 /// 部署段（**仅 legacy 直跑形态**）：env 有 `APP_DEPLOY_URL` 才执行。
 /// API 已在本函数调用前绑定3010（P1-01），kubelet liveness 由 /health
 /// 覆盖，/ready 在初始化期间503（initializing 门控）。不再需要 LivenessHold。
-async fn deploy_stage(args: &app_cli::CliArgs) -> anyhow::Result<()> {
+async fn deploy_stage(args: &app_cli::RuntimeArgs) -> anyhow::Result<()> {
     if !app_cli::deploy::deploy_requested() {
         return Ok(());
     }

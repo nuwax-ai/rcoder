@@ -9,14 +9,13 @@
 
 use anyhow::Result;
 
-use crate::config::CliArgs;
 use crate::svc_spec::ServiceSpecFile;
 
 /// run-service 入口：成功 = 进程映像被服务本体替换（永不返回）；
 /// Err = 启动失败（main 转非零退出码）。
-pub fn run(release_id: &str, service_id: &str, args: &CliArgs) -> Result<()> {
+pub fn run(release_id: &str, service_id: &str, log_dir: &std::path::Path) -> Result<()> {
     let spec = ServiceSpecFile::load(release_id, service_id)?;
-    exec_spec(&spec, &args.log_dir)
+    exec_spec(&spec, log_dir)
 }
 
 /// 组装并 exec（独立函数便于单测 env 组装逻辑）。
@@ -74,11 +73,7 @@ mod tests {
         let _guard = crate::svc_spec::SPEC_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("APP_CLI_SPEC_DIR", dir.path()) };
-        let args = CliArgs {
-            command: None,
-            ..Default::default()
-        };
-        let err = run("rel-none", "svc-none", &args).unwrap_err();
+        let err = run("rel-none", "svc-none", dir.path()).unwrap_err();
         assert!(format!("{err:#}").contains("read service spec"));
     }
 

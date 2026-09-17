@@ -39,4 +39,4 @@ pub mod win_cmd;
 pub mod workspace_index;
 pub mod xmlrpc;
 
-pub use config::CliArgs;
+pub use config::{CliArgs, RuntimeArgs};

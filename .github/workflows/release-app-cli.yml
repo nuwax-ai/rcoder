@@ -26,7 +26,7 @@ name: release-app-cli
 #   （单一事实源，构造性同步防漂移）→ checkout vicanso/pingap@rev →
 #   `--no-default-features --features tls-rustls`（ring provider，无需 nasm/cmake；
 #   dist/ 占位已提交无需 build-web）。与 app-cli 的 pingap-config 库严格同 rev。
-# - pair-gate：windows 下用 fixture workspace 跑 `app-cli.exe --gen-lock`，
+# - pair-gate：windows 下用 fixture workspace 跑 `app-cli.exe gen-lock --workspace`，
 #   生成配置喂 `pingap.exe -t` —— 分发的二进制对 schema 兼容性 gate。
 
 on:
@@ -260,7 +260,7 @@ jobs:
           ls -lh "$APP" "$PINGAP"
           WS=$(mktemp -d)/ws
           cp -r crates/app-cli/tests/fixtures/minimal-workspace "$WS"
-          "$APP" --gen-lock "$WS" 2>/dev/null \
+          "$APP" gen-lock --workspace "$WS" 2>/dev/null \
             | sed -n '/──── pingap.toml ────/,/──── end ────/p' | sed '1d;$d' \
             > pingap.toml
           head -5 pingap.toml

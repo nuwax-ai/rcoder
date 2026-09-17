@@ -1,4 +1,4 @@
-//! 本地开发工具：`app-cli --gen-lock <workspace>`。
+//! 本地开发工具：`app-cli gen-lock --workspace <workspace>`。
 //!
 //! 复用 workspace-manifest 的纯函数（发现 → 校验 → 锁定）+ app-cli proxy 的纯编译，
 //! 在本地秒级生成 `release.lock.toml` 并预览 Pingap 生效配置 —— 无需 pingap 二进制 / PG / 镜像。
@@ -131,7 +131,7 @@ pub async fn gen_lock(workspace: &Path) -> Result<()> {
         .with_context(|| format!("write {}", lock_path.display()))?;
     println!("\n✅ release.lock.toml 已写入: {}", lock_path.display());
     println!(
-        "   现在可以: APP_CLI_WORKSPACE={} APP_CLI_PINGAP_BIN=<pingap> app-cli",
+        "   现在可以: APP_CLI_WORKSPACE={} APP_CLI_PINGAP_BIN=<pingap> app-cli run",
         workspace.display()
     );
     Ok(())

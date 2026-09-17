@@ -230,7 +230,7 @@ def main():
     container = None
     try:
         builtin = os.environ.get('E2E_APP_CLI_ENGINE') == 'builtin'
-        entry = ['-e', 'APP_CLI_SKIP_PG_WAIT=1', '--entrypoint', '/usr/local/bin/app-cli', RUNTIME_IMAGE, '--workspace', '/review/code', '--log-dir', '/review/logs', 'serve'] if builtin else ['-e', 'USERAPP_WORKSPACE_DIR=/review', '-e', 'APP_ID=app-review', RUNTIME_IMAGE]
+        entry = ['-e', 'APP_CLI_SKIP_PG_WAIT=1', '--entrypoint', '/usr/local/bin/app-cli', RUNTIME_IMAGE, 'serve', '--workspace', '/review/code', '--log-dir', '/review/logs'] if builtin else ['-e', 'USERAPP_WORKSPACE_DIR=/review', '-e', 'APP_ID=app-review', RUNTIME_IMAGE]
         container = run_owned(REPORT, RUN, os.environ['E2E_CASE_ID'], ['-d',
                            '-p', '127.0.0.1::3010', '-p', '127.0.0.1::9080',
                            '-e', 'APP_CLI_DEPLOY_TOKEN=' + TOKEN,

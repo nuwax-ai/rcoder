@@ -24,13 +24,13 @@ fn start(workspace: &Path, logs: &Path) -> (OwnedServer, String) {
     drop(listener);
     let child = Command::new(env!("CARGO_BIN_EXE_app-cli"))
         .args([
+            "serve",
             "--workspace",
             workspace.to_str().expect("workspace path"),
             "--log-dir",
             logs.to_str().expect("log path"),
             "--admin-addr",
             &address.to_string(),
-            "serve",
         ])
         .env_remove("APP_DEPLOY_URL")
         .env_remove("APP_RELEASE_ID")

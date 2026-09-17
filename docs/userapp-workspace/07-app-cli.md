@@ -30,32 +30,31 @@ crash loop）。
 
 ## 命令行参数
 
-```text
-Usage: app-cli [OPTIONS]
-
-      --workspace <WORKSPACE>    workspace 根（含 workspace.manifest.toml + 各子项目）
-                                 [env: APP_CLI_WORKSPACE=] [default: /app/code]
-      --log-dir <LOG_DIR>        日志目录 [env: APP_CLI_LOG_DIR=] [default: /app/logs]
-      --admin-addr <ADMIN_ADDR>  管理 API 监听地址
-                                 [env: APP_CLI_ADMIN_ADDR=] [default: 0.0.0.0:3010]
-      --pingap-bin <PINGAP_BIN>  pingap 二进制路径
-                                 [env: APP_CLI_PINGAP_BIN=] [default: /usr/local/bin/pingap]
-      --gen-lock <WORKSPACE>     本地开发：只生成 release.lock.toml + 预览 Pingap 配置后退出
-                                 [env: APP_CLI_GEN_LOCK=]
-  -h, --help
-  -V, --version
+```bash
+app-cli serve --workspace /app/code --log-dir /app/logs
+app-cli build --workspace ./my-workspace --dev
+app-cli gen-lock --workspace ./my-workspace
+app-cli run --workspace /app/code --log-dir /app/logs
+app-cli run-service RELEASE_ID SERVICE_ID --log-dir /app/logs
 ```
 
-每个参数都可用同名 env 覆盖；命令行值优先于 env。
+命令必须显式指定，参数放在所属子命令后。常驻运行态入口使用 `serve`；`run` 保留平台开发链路的直接前台编排行为。`run-service` 是 supervisord 的内部执行入口。
+
+- `serve` / `run`：`--workspace`、`--log-dir`、`--admin-addr`、`--pingap-bin`；`--attach` 仅属于 `serve`。
+- `build`：`--workspace`、`--dev`、`--deploy-dir`、`--only`。
+- `gen-lock`：`--workspace`。
+- `run-service`：两个位置参数与 `--log-dir`。
+
+使用 `app-cli <子命令> --help` 查看该命令参数。保留 workspace/log/admin/pingap 等已有环境变量，命令行值优先于环境变量。不再支持顶层 `--workspace`、顶层 `--gen-lock`、`APP_CLI_GEN_LOCK` 选择动作或无子命令启动；不提供 `server` 别名。
 
 ## 两种运行模式
 
-### 1. 编排模式（默认，生产用）
+### 1. 直接编排模式 `run`
 
 ```bash
-app-cli --workspace /app/code --log-dir /app/logs
+app-cli run --workspace /app/code --log-dir /app/logs
 # 或纯 env：
-APP_CLI_WORKSPACE=/app/code app-cli
+APP_CLI_WORKSPACE=/app/code app-cli run
 ```
 
 启动流程（`supervisor::run`）：
@@ -103,10 +102,10 @@ service_id 为主标识（日志目录、pingap 路由同按 service_id 命名�
 | `APP_SERVICE_ID` | 服务 ID |
 | `APP_RELEASE_ID` | 当前 release |
 
-### 2. 本地开发模式 `--gen-lock`（不启服务）
+### 2. 本地开发模式 `gen-lock`（不启服务）
 
 ```bash
-app-cli --gen-lock ./my-workspace
+app-cli gen-lock --workspace ./my-workspace
 ```
 
 复用与构建侧同一套纯函数（发现 → 校验 → 锁定 → Pingap 编译），**不需要 pingap 二进制、
@@ -121,7 +120,7 @@ PG 或镜像**，秒级完成：
 Pingap 配置是否如预期。验证通过后可直接：
 
 ```bash
-APP_CLI_WORKSPACE=./my-workspace APP_CLI_PINGAP_BIN=<pingap路径> app-cli
+APP_CLI_WORKSPACE=./my-workspace APP_CLI_PINGAP_BIN=<pingap路径> app-cli run
 ```
 
 ## 环境变量总表
@@ -132,7 +131,6 @@ APP_CLI_WORKSPACE=./my-workspace APP_CLI_PINGAP_BIN=<pingap路径> app-cli
 | `APP_CLI_LOG_DIR` | `/app/logs` | 日志根目录 |
 | `APP_CLI_ADMIN_ADDR` | `0.0.0.0:3010` | 管理 API 监听地址 |
 | `APP_CLI_PINGAP_BIN` | `/usr/local/bin/pingap` | pingap 二进制 |
-| `APP_CLI_GEN_LOCK` | — | 等价 `--gen-lock` |
 | `APP_CLI_PINGAP_RUNTIME_DIR` | `/run/app-cli/pingap` | 生效配置落盘根 |
 | `APP_CLI_PINGAP_ADMIN_PORT` | `3018` | pingap admin 探测端口（仅 loopback 只读） |
 | `APP_CLI_SKIP_PG_WAIT` | 未设 | **dev 逃生**：跳过 60s PG 等待，生产不设 |
@@ -268,7 +266,7 @@ npm i -g @nuwax-ai/app-cli
 
 ```bash
 # ① 生成 release.lock + 预览 pingap 配置（无需 pingap/PG）
-app-cli --gen-lock ./my-workspace
+app-cli gen-lock --workspace ./my-workspace
 
 # ② 本地构建（dev 形态产物组装）
 app-cli build --dev --workspace ./my-workspace --deploy-dir ./deploy-out

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
-use crate::config::CliArgs;
+use crate::config::RuntimeArgs;
 use crate::manifest::{ReleaseLock, ServiceSpec};
 use crate::proxy::admin_probe;
 use crate::proxy::compiler::{CompileOutcome, compile_and_validate};
@@ -98,7 +98,7 @@ impl SupervisordHost {
     ///（崩溃自动重启，与 server 进程生命周期解耦）。
     pub(crate) async fn orchestrate(
         &self,
-        args: &CliArgs,
+        args: &RuntimeArgs,
         release: &ReleaseLock,
         runtime_status: &RuntimeStatusService,
         run_migrations: bool,
@@ -282,7 +282,7 @@ impl SupervisordHost {
 }
 
 /// 编译 pingap 配置（复用 builtin 的编译/校验/原子提交）。
-async fn compile_pingap(args: &CliArgs, release: &ReleaseLock) -> Result<CompileOutcome> {
+async fn compile_pingap(args: &RuntimeArgs, release: &ReleaseLock) -> Result<CompileOutcome> {
     let runtime_root = std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| "/run/app-cli/pingap".into());
@@ -292,7 +292,7 @@ async fn compile_pingap(args: &CliArgs, release: &ReleaseLock) -> Result<Compile
 /// pingap 的 spec（argv = pingap -c {config} --autoreload；admin 凭证只进
 /// tmpfs spec 的 env，不落持久卷/命令行/日志）。
 fn pingap_service_spec(
-    args: &CliArgs,
+    args: &RuntimeArgs,
     release: &ReleaseLock,
     outcome: &CompileOutcome,
     endpoint: &admin_probe::AdminEndpoint,

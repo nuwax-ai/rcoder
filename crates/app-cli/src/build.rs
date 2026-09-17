@@ -3,7 +3,7 @@
 //! 与平台构建链（file-server-userapp）共享 `workspace-manifest` 的三分派决策
 //! （[`workspace_manifest::ProjectManifest::devbuild_argv`]，单一事实源），把
 //! 「逐服务执行编译命令 → 校验 artifact →（可选）组装产物态部署布局」搬到本地：
-//! 无平台环境下与 `--gen-lock` + `serve` 组成三步闭环，验证 workspace 的
+//! 无平台环境下与 `gen-lock` + `serve` 组成三步闭环，验证 workspace 的
 //! 可构建性与可运行性（典型：模板仓库的 docker 本地验证）。
 //!
 //! 边界：**本地工具，不做平台专属**——不打发布 zip、不上传、无任务 SSE /
@@ -49,7 +49,7 @@ pub fn run(
         );
     }
 
-    // 发现 + 校验：宽松发现，全量问题一次呈现（与 --gen-lock 同款体验）。
+    // 发现 + 校验：宽松发现，全量问题一次呈现（与 gen-lock 同款体验）。
     let (projects, issues) = discover_projects_lenient(workspace).context("discover projects")?;
     if !issues.is_empty() {
         println!("❌ manifest 校验发现 {} 个问题:", issues.len());
@@ -162,7 +162,7 @@ pub fn run(
     if let Some(dir) = deploy_dir {
         assemble_deploy_dir(workspace, &tasks, dir)?;
         println!(
-            "\n✅ 部署布局已组装: {}（`app-cli --workspace {} serve` 即可产物态运行）",
+            "\n✅ 部署布局已组装: {}（`app-cli serve --workspace {}` 即可产物态运行）",
             dir.display(),
             dir.display()
         );
@@ -197,7 +197,7 @@ fn assemble_deploy_dir(workspace: &Path, tasks: &[BuildTask], deploy_dir: &Path)
     let lock_src = workspace.join("release.lock.toml");
     if !lock_src.is_file() {
         bail!(
-            "缺少 {} —— 先跑 `app-cli --gen-lock {}` 生成（serve 消费 lock 编排）",
+            "缺少 {} —— 先跑 `app-cli gen-lock --workspace {}` 生成（serve 消费 lock 编排）",
             lock_src.display(),
             workspace.display()
         );
@@ -366,7 +366,7 @@ mod tests {
         assert!(deploy.join("backend/server").is_file());
     }
 
-    /// 缺 release.lock.toml → 明确报错（提示先跑 --gen-lock）。
+    /// 缺 release.lock.toml → 明确报错（提示先跑 gen-lock）。
     #[test]
     fn assemble_deploy_dir_requires_lock() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -375,7 +375,7 @@ mod tests {
             assemble_deploy_dir(ws, &[], &ws.join("deploy")).expect_err("missing lock must fail");
         assert!(
             err.to_string().contains("gen-lock"),
-            "错误应指引先跑 --gen-lock：{err}"
+            "错误应指引先跑 gen-lock：{err}"
         );
     }
 }

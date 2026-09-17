@@ -1,172 +1,177 @@
-//! CLI 参数（clap）。
-//!
-//! 四种形态：
-//! - `app-cli serve`：**容器 server 形态**（supervisord [program:app-cli] 的 command）——
-//!   常驻状态机（Idle→Deploying→Orchestrating→Running），无论是否部署都在，
-//!   管理 API + 探针 + 热部署端点 + 服务编排；
-//! - `app-cli build`：**本地编译工具**——逐服务执行编译命令（--dev 三分派）+
-//!   artifact 校验 +（可选）产物态部署布局组装；与 `--gen-lock`、`serve` 组成
-//!   本地三步闭环（无平台环境的可构建性/可运行性验证）；
-//! - `app-cli run-service <id>`：单服务包装（supervisord 动态 program 的 command）——
-//!   读 server 写下的 spec 文件，组装 env 后 exec 服务本体；
-//! - **无子命令**：legacy 直跑形态（file-server dev 链 spawn 的兼容入口）——
-//!   deploy 段 → idle/api/supervisor 一次性编排，行为与 serve 演化前完全一致。
-
+//! Explicit subcommands own their options. Runtime configuration is independent
+//! of clap so the orchestration kernel does not depend on CLI dispatch.
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
-
-/// Userapp 容器运行时编排器。
-#[derive(Parser, Debug, Clone, Default)]
-#[command(
-    name = "app-cli",
-    version,
-    about = "Userapp 容器运行时编排器（替代 start.sh）"
-)]
+#[derive(Parser, Debug, Clone)]
+#[command(name = "app-cli", version, about = "UserApp 构建与运行管理器")]
 pub struct CliArgs {
-    /// workspace 根（含 workspace.manifest.toml + 各子项目；解压后的 /app/code）。
-    ///
-    /// `global`：全局运行参数既可放顶层（`app-cli --workspace X serve`）也可
-    /// 跟在子命令后（`app-cli serve --workspace X`）——后者是主流 CLI 直觉
-    /// 形态（docker run --name / git commit -m 同构），B01 修复前的
-    /// `serve --workspace` 解析期 exit 2 即因缺 global 声明。
-    #[arg(
-        long,
-        global = true,
-        default_value = "/app/code",
-        env = "APP_CLI_WORKSPACE"
-    )]
-    pub workspace: PathBuf,
-
-    /// 日志目录（按子项目分文件：`<project>.{out,err}.log`）。
-    #[arg(
-        long,
-        global = true,
-        default_value = "/app/logs",
-        env = "APP_CLI_LOG_DIR"
-    )]
-    pub log_dir: PathBuf,
-
-    /// 管理 API 监听地址。
-    #[arg(
-        long,
-        global = true,
-        default_value = "0.0.0.0:3010",
-        env = "APP_CLI_ADMIN_ADDR"
-    )]
-    pub admin_addr: String,
-
-    /// pingap 二进制路径。
-    #[arg(
-        long,
-        global = true,
-        default_value = "/usr/local/bin/pingap",
-        env = "APP_CLI_PINGAP_BIN"
-    )]
-    pub pingap_bin: PathBuf,
-
-    /// 本地开发：只为 <WORKSPACE> 生成 release.lock.toml + 预览 Pingap 生效配置后退出
-    /// （不启动服务、不依赖 pingap 二进制 / PG）。供 manifest/路由设计秒级迭代验证。
-    /// （顶层专属动作开关——不是运行配置，不 global：`serve --gen-lock` 无语义。）
-    #[arg(long, value_name = "WORKSPACE", env = "APP_CLI_GEN_LOCK")]
-    pub gen_lock: Option<PathBuf>,
-
-    /// 子命令（缺省 = legacy 直跑形态，dev 链兼容入口）。
     #[command(subcommand)]
-    pub command: Option<Command>,
-
-    /// 附着模式（仅 `serve` 子命令有效）：已有实例占用管理端口时，核验身份
-    /// 并等待其退出，然后接管为新 owner；身份不符或 API 不可达则立即退出。
-    /// supervisord autorestart 配合 `exit 0`（正常退出不重启）使用。
-    #[arg(long, global = true, env = "APP_CLI_ATTACH")]
-    pub attach: bool,
+    pub command: Command,
 }
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
-    /// 常驻 server：探针 + 管理 API + 热部署端点 + 服务编排（容器形态）。
-    Serve,
+    /// 启动常驻运行态所有者及管理 API。
+    Serve(ServeArgs),
+    /// 直接前台编排服务（平台开发链路入口）。
+    Run(RunArgs),
+    /// 构建 workspace 服务，不启动服务。
+    Build(BuildArgs),
+    /// 校验 manifest 并生成 release.lock.toml，不启动服务。
+    GenLock(WorkspaceArgs),
+    /// 执行 supervisord 管理的服务 spec。
+    RunService(RunServiceArgs),
+}
 
-    /// 本地编译工具：逐服务执行 `[build].command`（`--dev` 走三分派）→ artifact
-    /// 校验 →（可选）组装产物态部署布局。gen-lock 的伴生命令，与 `serve` 组成
-    /// 本地三步闭环（校验 → 编译 → 运行）。不做平台专属（发布 zip/上传/任务
-    /// SSE/静态产物路由一致性检查）。
-    Build {
-        /// dev 三分派：配 `[devbuild]` 执行之；仅配 `[devrun]` 的服务跳过编译
-        /// （devrun 自足）；未配 `[devrun]` 回落 `[build].command`（产物落源码目录）。
-        #[arg(long)]
-        dev: bool,
+#[derive(Args, Debug, Clone)]
+pub struct WorkspaceArgs {
+    /// 包含 workspace.manifest.toml 或 release.lock.toml 的工作区。
+    #[arg(long, default_value = "/app/code", env = "APP_CLI_WORKSPACE")]
+    pub workspace: PathBuf,
+}
 
-        /// 产物态部署布局目录（平台 `.run` 的本地等价）：每服务展开 artifact
-        /// （zip 解压 / static 拷内容目录）+ 拷入 release.lock.toml；随后
-        /// `app-cli --workspace <DIR> serve` 即可产物态运行。要求先跑过 `--gen-lock`。
-        #[arg(long, value_name = "DIR")]
-        deploy_dir: Option<PathBuf>,
+#[derive(Args, Debug, Clone)]
+pub struct RuntimeOptions {
+    /// 运行态及服务日志目录。
+    #[arg(long, default_value = "/app/logs", env = "APP_CLI_LOG_DIR")]
+    pub log_dir: PathBuf,
+    /// 管理 API 监听地址。
+    #[arg(long, default_value = "0.0.0.0:3010", env = "APP_CLI_ADMIN_ADDR")]
+    pub admin_addr: String,
+    /// 匹配版本的 Pingap 可执行文件路径。
+    #[arg(
+        long,
+        default_value = "/usr/local/bin/pingap",
+        env = "APP_CLI_PINGAP_BIN"
+    )]
+    pub pingap_bin: PathBuf,
+}
 
-        /// 只构建指定 service_id（逗号分隔）；缺省 = 全部 enabled 服务。
-        #[arg(long, value_name = "IDS")]
-        only: Option<String>,
-    },
+#[derive(Args, Debug, Clone)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub workspace: WorkspaceArgs,
+    #[command(flatten)]
+    pub runtime: RuntimeOptions,
+}
 
-    /// 单服务进程包装（supervisord 动态 program 的 command）：读 spec → exec 服务本体。
-    RunService {
-        /// 部署代（spec 目录段 = /run/app-cli/specs/{RELEASE_ID}/）。
-        #[arg(value_name = "RELEASE_ID")]
-        release_id: String,
-        /// 服务 ID（对应 release.lock.services[].service_id；pingap 用 "pingap"）。
-        #[arg(value_name = "SERVICE_ID")]
-        service_id: String,
-    },
+#[derive(Args, Debug, Clone)]
+pub struct ServeArgs {
+    #[command(flatten)]
+    pub run: RunArgs,
+    /// 附着到身份匹配的所有者，等待接管。
+    #[arg(long, env = "APP_CLI_ATTACH")]
+    pub attach: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BuildArgs {
+    #[command(flatten)]
+    pub workspace: WorkspaceArgs,
+    /// 按开发模式选择构建步骤（devbuild/devrun）。
+    #[arg(long)]
+    pub dev: bool,
+    /// 构建后组装产物部署目录。
+    #[arg(long, value_name = "DIR")]
+    pub deploy_dir: Option<PathBuf>,
+    /// 只构建指定的已启用服务 ID（逗号分隔）。
+    #[arg(long, value_name = "IDS")]
+    pub only: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RunServiceArgs {
+    #[arg(value_name = "RELEASE_ID")]
+    pub release_id: String,
+    #[arg(value_name = "SERVICE_ID")]
+    pub service_id: String,
+    #[arg(long, default_value = "/app/logs", env = "APP_CLI_LOG_DIR")]
+    pub log_dir: PathBuf,
+}
+
+/// Normalized runtime configuration; never contains CLI actions.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeArgs {
+    pub workspace: PathBuf,
+    pub log_dir: PathBuf,
+    pub admin_addr: String,
+    pub pingap_bin: PathBuf,
+    pub attach: bool,
+}
+
+impl From<RunArgs> for RuntimeArgs {
+    fn from(args: RunArgs) -> Self {
+        Self {
+            workspace: args.workspace.workspace,
+            log_dir: args.runtime.log_dir,
+            admin_addr: args.runtime.admin_addr,
+            pingap_bin: args.runtime.pingap_bin,
+            attach: false,
+        }
+    }
+}
+
+impl From<ServeArgs> for RuntimeArgs {
+    fn from(args: ServeArgs) -> Self {
+        Self {
+            attach: args.attach,
+            ..args.run.into()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser as _;
 
-    /// B01 后续：全局运行参数两种顺序都合法——子命令后置选项是主流 CLI
-    /// 直觉形态（`app-cli serve --workspace X`）；顶层顺序保持兼容
-    /// （`app-cli --workspace X serve`，旧脚本/调用方不变）。
     #[test]
-    fn global_runtime_flags_accepted_in_both_positions() {
-        let after = CliArgs::try_parse_from([
+    fn serve_options_reach_normalized_runtime() {
+        let cli = CliArgs::try_parse_from([
             "app-cli",
             "serve",
             "--workspace",
-            "/ws/after",
+            "project with spaces",
             "--log-dir",
-            "/logs/after",
+            "logs",
             "--admin-addr",
             "127.0.0.1:3999",
             "--pingap-bin",
-            "/bin/pingap",
+            "tools/pingap",
             "--attach",
         ])
-        .expect("flags after subcommand must parse");
-        assert!(matches!(after.command, Some(Command::Serve)));
-        assert_eq!(after.workspace, std::path::PathBuf::from("/ws/after"));
-        assert_eq!(after.log_dir, std::path::PathBuf::from("/logs/after"));
-        assert_eq!(after.admin_addr, "127.0.0.1:3999");
-        assert_eq!(after.pingap_bin, std::path::PathBuf::from("/bin/pingap"));
-        assert!(after.attach);
+        .expect("serve options");
+        let Command::Serve(serve) = cli.command else {
+            panic!("expected serve")
+        };
+        let runtime = RuntimeArgs::from(serve);
+        assert_eq!(runtime.workspace, PathBuf::from("project with spaces"));
+        assert_eq!(runtime.log_dir, PathBuf::from("logs"));
+        assert_eq!(runtime.admin_addr, "127.0.0.1:3999");
+        assert_eq!(runtime.pingap_bin, PathBuf::from("tools/pingap"));
+        assert!(runtime.attach);
+    }
 
-        let before = CliArgs::try_parse_from([
+    #[test]
+    fn build_owns_workspace_and_build_options() {
+        let cli = CliArgs::try_parse_from([
             "app-cli",
+            "build",
             "--workspace",
-            "/ws/before",
-            "--admin-addr",
-            "127.0.0.1:3998",
-            "serve",
+            "project",
+            "--dev",
+            "--deploy-dir",
+            "output",
+            "--only",
+            "web,api",
         ])
-        .expect("top-level order must stay accepted (legacy callers)");
-        assert!(matches!(before.command, Some(Command::Serve)));
-        assert_eq!(before.workspace, std::path::PathBuf::from("/ws/before"));
-
-        // 子命令级参数仍在子命令后（build --dev 不受 global 影响）
-        let build = CliArgs::try_parse_from(["app-cli", "build", "--dev"]).expect("build flags");
-        assert!(matches!(
-            build.command,
-            Some(Command::Build { dev: true, .. })
-        ));
+        .expect("build options");
+        let Command::Build(build) = cli.command else {
+            panic!("expected build")
+        };
+        assert_eq!(build.workspace.workspace, PathBuf::from("project"));
+        assert!(build.dev);
+        assert_eq!(build.deploy_dir, Some(PathBuf::from("output")));
+        assert_eq!(build.only.as_deref(), Some("web,api"));
     }
 }

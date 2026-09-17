@@ -29,7 +29,7 @@ use shared_types::AppCliDeployPhase;
 use shared_types::app_cli_deploy::AppDeploymentStage;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::CliArgs;
+use crate::config::RuntimeArgs;
 use crate::log::service::LogLayout;
 use crate::manifest::ReleaseLock;
 use crate::runtime_status::RuntimeStatusService;
@@ -903,7 +903,7 @@ impl ServerState {
 ///
 /// `--attach` 标志启用附着模式：已有实例占用端口时核验身份并等待退出，
 /// 然后重新执行本二进制成为新 owner。无 `--attach` 时端口冲突立即 fail-fast。
-pub async fn serve(args: &CliArgs) -> Result<()> {
+pub async fn serve(args: &RuntimeArgs) -> Result<()> {
     if args.attach {
         return attach_to_existing_owner(args).await;
     }
@@ -917,7 +917,7 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
 /// 2. GET /v1/runtime/identity 核验 application_id + workspace_id
 /// 3. 身份匹配 → 等待端口释放（轮询 connect）→ 重新执行本二进制（无 --attach）
 /// 4. 身份不匹配 / API 不可达 / 503 → 立即退出（exit 1）
-async fn attach_to_existing_owner(args: &CliArgs) -> Result<()> {
+async fn attach_to_existing_owner(args: &RuntimeArgs) -> Result<()> {
     use std::process::exit;
 
     let mut addr = args.admin_addr.clone();
@@ -1022,7 +1022,7 @@ async fn attach_to_existing_owner(args: &CliArgs) -> Result<()> {
 
 /// 核验已有实例身份，匹配则等待并 re-exec，不匹配则退出。
 async fn verify_identity_and_attach(
-    args: &CliArgs,
+    args: &RuntimeArgs,
     body: &serde_json::Value,
     addr: &str,
 ) -> Result<()> {
@@ -1123,7 +1123,7 @@ fn reexec_without_attach() {
 }
 
 /// serve 核心逻辑（无附着检测）：journal → OwnerGuard → API bind → 状态机主循环。
-async fn serve_without_attach(args: &CliArgs) -> Result<()> {
+async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
     // OwnerGuard：跨进程排他锁（cross-platform.md §3）——在 API bind 前获取，
     // 确保同一项目最多一个 owner。锁文件位于部署替换范围外的稳定状态根。
     let application_id = std::env::var("PROJECT_ID")
@@ -1434,7 +1434,7 @@ async fn serve_without_attach(args: &CliArgs) -> Result<()> {
 }
 
 async fn finish_clean_shutdown(
-    args: &CliArgs,
+    args: &RuntimeArgs,
     state: &ServerState,
     ownership_claimed: bool,
 ) -> Result<()> {
@@ -1485,7 +1485,7 @@ async fn join_supervisor(
 /// 装配运行操作内核（serve 专用；dispatch 把内核动作翻译进既有执行通道）。
 async fn assemble_runtime_kernel(
     state: &Arc<ServerState>,
-    args: &crate::config::CliArgs,
+    args: &crate::config::RuntimeArgs,
 ) -> Result<Arc<crate::runtime_kernel::RuntimeKernel>> {
     use crate::runtime_kernel::{DispatchAction, RuntimeKernel, RuntimeStore};
     let application_id = std::env::var("PROJECT_ID")
@@ -1609,7 +1609,10 @@ async fn establish_startup_quiescence(
     Ok(())
 }
 
-async fn initialize_startup(args: &CliArgs, state: &ServerState) -> Result<Option<InitialAction>> {
+async fn initialize_startup(
+    args: &RuntimeArgs,
+    state: &ServerState,
+) -> Result<Option<InitialAction>> {
     if crate::deploy::deploy_requested() {
         let generation = std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
             .context("APP_DEPLOY_GENERATION_ID is required")?;
@@ -1747,7 +1750,7 @@ async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> In
 /// Prepare while the existing supervisor continues serving. Failed requests do
 /// not leave this wait loop and never reach the stop/activate boundary.
 async fn next_prepared(
-    args: &CliArgs,
+    args: &RuntimeArgs,
     state: &Arc<ServerState>,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<DeployRequest>,
 ) -> Option<InitialAction> {
@@ -1839,7 +1842,7 @@ async fn hold_unconfirmed(state: &ServerState, error: String) {
 }
 
 async fn fail_activation(
-    args: &CliArgs,
+    args: &RuntimeArgs,
     state: &ServerState,
     error: String,
 ) -> Option<InitialAction> {
@@ -1978,7 +1981,7 @@ async fn commit_running_barrier(state: &ServerState) -> BarrierOutcome {
 }
 
 async fn server_loop(
-    args: &CliArgs,
+    args: &RuntimeArgs,
     state: &Arc<ServerState>,
     host: Option<SupervisordHost>,
     first: Option<InitialAction>,
@@ -2590,7 +2593,7 @@ format = "jsonl"
         let mut restarted = state();
         restarted.generation = "generation-a".into();
         *restarted.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
-        let args = CliArgs {
+        let args = RuntimeArgs {
             workspace,
             ..Default::default()
         };
@@ -2629,7 +2632,7 @@ format = "jsonl"
         let mut restarted = state();
         restarted.generation = "cold-generation".into();
         *restarted.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
-        let args = CliArgs {
+        let args = RuntimeArgs {
             workspace,
             ..Default::default()
         };
@@ -2656,7 +2659,7 @@ format = "jsonl"
         let mut first = state();
         first.generation = "existing-generation".into();
         *first.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
-        let args = CliArgs {
+        let args = RuntimeArgs {
             workspace: workspace.clone(),
             ..Default::default()
         };
@@ -2739,7 +2742,7 @@ format = "jsonl"
         let mut restarted = state();
         restarted.generation = "new-generation".into();
         *restarted.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
-        let args = CliArgs {
+        let args = RuntimeArgs {
             workspace,
             ..Default::default()
         };
@@ -2786,7 +2789,7 @@ format = "jsonl"
         let mut restarted = state();
         restarted.generation = "generation-a".into();
         *restarted.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
-        let args = CliArgs {
+        let args = RuntimeArgs {
             workspace,
             ..Default::default()
         };
@@ -2931,7 +2934,7 @@ format = "jsonl"
         let state = state();
         *state.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         state.close_admission();
-        let args = CliArgs {
+        let args = RuntimeArgs {
             workspace,
             ..Default::default()
         };
@@ -2953,7 +2956,7 @@ format = "jsonl"
         let before = std::fs::read(dir.path().join(".deploy-coordinator.json")).unwrap();
         state.begin_failure("child shutdown not confirmed".into(), true);
         state.close_admission();
-        let args = CliArgs {
+        let args = RuntimeArgs {
             workspace,
             ..Default::default()
         };
@@ -3090,7 +3093,7 @@ format = "jsonl"
             .unwrap();
         assert!(
             fail_activation(
-                &CliArgs {
+                &RuntimeArgs {
                     workspace: workspace.clone(),
                     ..Default::default()
                 },

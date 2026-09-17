@@ -12,7 +12,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-use crate::config::CliArgs;
+use crate::config::RuntimeArgs;
 use crate::manifest::{self, ServiceSpec};
 use crate::orchestration_events::{FailedService, OrchestrationEvent, emit as emit_event};
 use crate::platform::process_tree::{ManagedChild, StopOutcome, spawn_managed};
@@ -30,7 +30,7 @@ type ManagedChildren = Vec<(String, ManagedChild)>;
 pub(crate) const ORCHESTRATOR_FAILURE_SERVICE: &str = "orchestrator";
 
 /// 编排主入口（legacy 直跑形态：一次性编排，无外部取消源）。
-pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result<()> {
+pub async fn run(args: &RuntimeArgs, runtime_status: RuntimeStatusService) -> Result<()> {
     // 直跑形态（无操作上下文）：env 兜底（R08 显式 profile/凭据仅经 server 形态）
     run_inner(
         args,
@@ -52,7 +52,7 @@ pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result
 /// 的 POSTGRES_USER/PASSWORD（运行时变量 last-wins 覆盖 spec env 与进程
 /// 透传值）；None 维持既有 env。
 pub async fn run_with_cancel(
-    args: CliArgs,
+    args: RuntimeArgs,
     runtime_status: RuntimeStatusService,
     cancel: tokio_util::sync::CancellationToken,
     on_running: Option<tokio::sync::oneshot::Sender<()>>,
@@ -79,7 +79,7 @@ pub(crate) async fn sigterm_watch() {
 }
 
 async fn run_inner(
-    args: &CliArgs,
+    args: &RuntimeArgs,
     runtime_status: RuntimeStatusService,
     cancel: Option<tokio_util::sync::CancellationToken>,
     on_running: Option<tokio::sync::oneshot::Sender<()>>,

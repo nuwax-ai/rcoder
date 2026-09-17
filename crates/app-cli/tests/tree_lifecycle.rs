@@ -129,6 +129,7 @@ fn spawn_cli(
     let mut command = Command::new(env!("CARGO_BIN_EXE_app-cli"));
     command
         .args([
+            "run",
             "--workspace",
             workspace.to_str().expect("workspace path"),
             "--log-dir",

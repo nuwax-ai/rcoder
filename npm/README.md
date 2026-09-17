@@ -82,8 +82,8 @@ app-cli --help
 典型用法：UserApp workspace 模板的本地验证三步闭环——
 
 ```bash
-app-cli --gen-lock <workspace>          # manifest 校验 + release.lock.toml
-app-cli build --deploy-dir <dir>        # 逐服务编译 + 产物态部署布局（或 --dev 三分派）
+app-cli gen-lock --workspace <workspace>          # manifest 校验 + release.lock.toml
+app-cli build --workspace <workspace> --deploy-dir <dir>        # 逐服务编译 + 产物态部署布局（或 --dev 三分派）
 app-cli serve --workspace <dir>         # 产物态运行（pingap :9080 / admin :3010）
 ```
 

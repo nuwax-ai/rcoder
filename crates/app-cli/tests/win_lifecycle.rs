@@ -1,6 +1,6 @@
 //! Windows 原生生命周期集成测试（XP 生命周期门禁的真机等价物）。
 //!
-//! 场景：空 workspace 的 app-cli（无子命令）→ idle 形态常驻：
+//! 场景：空 workspace 的 app-cli run→ idle 形态常驻：
 //! /health 200 应答 → 强杀（taskkill /F）→ 进程退出、端口释放。
 //! 对照 Unix 侧 serve_restart/bin_startup（#![cfg(unix)]）——本文件补
 //! Windows 侧的最小真实生命周期闭环。
@@ -46,6 +46,7 @@ fn windows_idle_serve_lifecycle() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_app-cli"))
         .args([
+            "run",
             "--workspace",
             workspace.to_str().expect("workspace path"),
             "--log-dir",
@@ -112,13 +113,13 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
     let spawn_serve = || {
         Command::new(env!("CARGO_BIN_EXE_app-cli"))
             .args([
+                "serve",
                 "--workspace",
                 workspace.to_str().expect("workspace path"),
                 "--log-dir",
                 logs.to_str().expect("log path"),
                 "--admin-addr",
                 &address,
-                "serve",
             ])
             .env_remove("APP_DEPLOY_URL")
             .env_remove("APP_RELEASE_ID")

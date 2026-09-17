@@ -262,7 +262,7 @@ impl DevServerManager {
         Ok(StartedDev { pid, port })
     }
 
-    /// Userapp workspace 的 dev 启动（app-cli 引擎）：spawn 常驻 `app-cli
+    /// Userapp workspace 的 dev 启动（app-cli 引擎）：spawn 常驻 `app-cli run
     /// --workspace <ws>` ——按 manifest run.command 拉起全部服务 + pingap
     /// 9080 统一入口（多服务编排/健康检查/失败清理都由 app-cli 负责）。
     ///
@@ -335,6 +335,7 @@ impl DevServerManager {
         let (child, stdout, stderr) = process::spawn_dev(
             program,
             &[
+                "run".to_string(),
                 "--workspace".to_string(),
                 project_path.display().to_string(),
                 "--log-dir".to_string(),
@@ -707,7 +708,7 @@ mod tests {
         let script = dir.join("fake-app-cli.sh");
         std::fs::write(
             &script,
-            format!("#!/bin/sh\nenv | sort > '{}'\nsleep 60\n", dump.display()),
+            format!("#!/bin/sh\n[ \"$1\" = run ] && [ \"$2\" = --workspace ] || exit 2\nenv | sort > '{}'\nsleep 60\n", dump.display()),
         )
         .expect("write fake orchestrator");
         {
