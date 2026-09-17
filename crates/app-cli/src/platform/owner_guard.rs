@@ -85,7 +85,6 @@ mod tests {
     }
 
     /// 跨进程锁互斥（Unix：Python `fcntl.flock` 与 std 的 flock 同一锁域）。
-    /// Windows 无 fcntl 模块——跨进程对端验证需 PowerShell/.NET，暂不覆盖。
     #[cfg(unix)]
     #[test]
     fn cross_process_lock_enforced() {
@@ -122,6 +121,37 @@ except (BlockingIOError, OSError):
             !output.status.success(),
             "child process must fail to acquire lock held by parent; stdout: {}",
             String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// 跨进程锁互斥（Windows：PowerShell/.NET `FileStream.Lock` 与 std 的
+    /// LockFileEx 同一 byte-range 锁域——两者都覆盖文件偏移 0）。
+    #[cfg(windows)]
+    #[test]
+    fn cross_process_lock_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("state");
+        let _guard = OwnerGuard::acquire(&root).unwrap();
+        let lock_path = root.join("owner.lock").display().to_string();
+
+        // .NET Lock(0,1) 锁 [0,1)；std try_lock 锁 [0, MAX)——偏移 0 重叠必冲突。
+        // 路径插入单引号 PS 字符串（字面量语义，反斜杠无需转义）。
+        let script = format!(
+            "$ErrorActionPreference='Stop'; try {{ \
+             $f=[System.IO.File]::Open('{}','Open','ReadWrite','ReadWrite'); \
+             $f.Lock(0,1); Write-Output 'acquired'; exit 0 \
+             }} catch {{ Write-Output 'blocked'; exit 1 }}",
+            lock_path
+        );
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .expect("spawn powershell peer");
+        assert!(
+            !output.status.success(),
+            "powershell peer must fail to lock held by parent; stdout: {}, stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 
