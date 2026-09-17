@@ -34,7 +34,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // legacy 直跑形态（无子命令）：P1-01 修复——API 先于 deploy_stage 绑定3010。
-    // 子命令分派（Build 已在 init_tracing 前分派）。
+    // init tracing 必须在子命令分派前（serve/attach 需要日志输出）。
+    // Build 已在 init_tracing 前分派返回（日志目录可能不存在）。
+    let _guard = init_tracing(&args.log_dir);
+
     match &args.command {
         Some(app_cli::config::Command::Build { .. }) => {
             unreachable!("build dispatched before tracing init")
@@ -57,9 +60,6 @@ async fn main() -> anyhow::Result<()> {
 
     // ── legacy 直跑路径 ──
     let runtime_status = app_cli::runtime_status::RuntimeStatusService::default();
-
-    // init tracing：stderr + 文件（daily 轮转 + non-blocking，_guard 保活到 main 退出）
-    let _guard = init_tracing(&args.log_dir);
 
     tracing::info!(
         "app-cli starting: workspace={} log_dir={} admin={} pingap_bin={}",

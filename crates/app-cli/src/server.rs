@@ -881,7 +881,152 @@ impl ServerState {
 }
 
 /// serve 主入口：api 常驻 + 状态机主循环（阻塞至 SIGTERM）。
+///
+/// `--attach` 标志启用附着模式：已有实例占用端口时核验身份并等待退出，
+/// 然后重新执行本二进制成为新 owner。无 `--attach` 时端口冲突立即 fail-fast。
 pub async fn serve(args: &CliArgs) -> Result<()> {
+    if args.attach {
+        return attach_to_existing_owner(args).await;
+    }
+    serve_without_attach(args).await
+}
+
+/// 附着模式：核验已有实例身份并等待退出，然后重新执行为 owner。
+///
+/// 流程：
+/// 1. 尝试 TCP connect 管理端口——不可达 = 无实例，直接走正常 serve 流程
+/// 2. GET /v1/runtime/identity 核验 application_id + workspace_id
+/// 3. 身份匹配 → 等待端口释放（轮询 connect）→ 重新执行本二进制（无 --attach）
+/// 4. 身份不匹配 / API 不可达 / 503 → 立即退出（exit 1）
+async fn attach_to_existing_owner(args: &CliArgs) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::exit;
+
+    let addr = &args.admin_addr;
+    let url = format!("http://{addr}/v1/runtime/identity");
+
+    // 核验已有实例身份
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("build identity probe client")?;
+
+    tracing::info!("attach mode: checking existing instance at {addr}");
+
+    // 带重试的连接检测（新实例启动需要时间完成 API bind）
+    for attempt in 0..15 {
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                // 解析身份并核验
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .context("parse identity response")?;
+                return verify_identity_and_attach(args, &body, addr).await;
+            }
+            Ok(resp) => {
+                tracing::error!(
+                    "attach mode: existing instance at {addr} returned {} (identity unavailable); \
+                     cannot verify ownership, exiting",
+                    resp.status()
+                );
+                exit(1);
+            }
+            Err(_) if attempt < 14 => {
+                // 连接失败——可能是端口空闲（无实例）或实例正在启动
+                if std::net::TcpListener::bind(addr.as_str()).is_ok() {
+                    // 端口空闲 = 无运行实例
+                    tracing::info!(
+                        "attach mode: no existing instance at {addr}, proceeding as owner"
+                    );
+                    return serve_without_attach(args).await;
+                }
+                // 端口被占但 API 不可达——实例正在启动中，等待
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(e) => {
+                tracing::error!("attach mode: failed to connect to {addr}: {e}");
+                exit(1);
+            }
+        }
+    }
+
+    tracing::error!("attach mode: could not reach existing instance at {addr} after retries");
+    exit(1);
+}
+
+/// 核验已有实例身份，匹配则等待并 re-exec，不匹配则退出。
+async fn verify_identity_and_attach(
+    args: &CliArgs,
+    body: &serde_json::Value,
+    addr: &str,
+) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::exit;
+
+    let identity = body.get("data");
+    let remote_app = identity
+        .and_then(|d| d.get("application_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let remote_ws = identity
+        .and_then(|d| d.get("workspace_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let local_app = std::env::var("PROJECT_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "unknown-app".to_string());
+    let local_ws = args
+        .workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "workspace".to_string());
+
+    if remote_app != local_app || remote_ws != local_ws {
+        tracing::error!(
+            "attach mode: identity mismatch — local {local_app}/{local_ws} \
+             vs remote {remote_app}/{remote_ws}; refusing to attach"
+        );
+        exit(1);
+    }
+
+    tracing::info!(
+        "attach mode: existing instance matches identity {local_app}/{local_ws}; \
+         waiting for it to exit..."
+    );
+
+    // 等待端口释放（已有实例退出后端口变为可绑定）
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::error!("attach mode: timed out waiting for existing instance to exit");
+            exit(1);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        if std::net::TcpListener::bind(addr).is_ok() {
+            tracing::info!("attach mode: port {addr} released, re-executing as owner");
+            break;
+        }
+    }
+
+    // 重新执行本二进制（无 --attach）成为新 owner
+    let current_exe = std::env::current_exe().context("get current executable path")?;
+    let mut cmd = std::process::Command::new(current_exe);
+    for arg in std::env::args().skip(1) {
+        if arg != "--attach" && arg != "attach" {
+            cmd.arg(arg);
+        }
+    }
+    let error = cmd.exec();
+    tracing::error!("attach mode: re-exec failed: {error}");
+    exit(1);
+}
+
+/// serve 核心逻辑（无附着检测）：journal → API bind → 状态机主循环。
+async fn serve_without_attach(args: &CliArgs) -> Result<()> {
     let journal = Journal::open(&args.workspace)?;
     let ready = RuntimeStatusService::default();
     let mut initial_state = ServerState::new(ready.clone());

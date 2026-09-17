@@ -271,6 +271,73 @@ fn legacy_deploy_url_with_port_conflict_has_no_deploy_side_effects() {
     assert_eq!(
         done_event_count(&output.stdout),
         0,
-        "no orchestration must run when API bind fails"
+        "no orchestration must run when API bind fails (deploy URL + port conflict)"
+    );
+}
+
+/// P2-08：serve --attach 无已有实例 → 端口空闲时正常绑定（进程存活 = 进入 serve 流程）。
+#[test]
+fn serve_attach_without_existing_instance_starts_as_owner() {
+    let (_dir, workspace) = temp_workspace();
+    write_lock(&workspace, MINIMAL_LOCK);
+    let address = free_port_address();
+    let logs = workspace.parent().unwrap().join("logs");
+    let mut command = base_command(&workspace, &logs, &address);
+    command.arg("--attach").arg("serve");
+    let mut child = command.spawn().expect("spawn attach serve");
+    // 等待足够时间让进程完成 attach 检测（无实例 → serve_without_attach）
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    // 进程应该仍然存活（进入了 serve 流程，不会立即因 attach 失败退出）
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "attach without existing instance should proceed to serve, not exit immediately"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// P2-08：serve --attach 身份不匹配 → 立即退出（exit 1）。
+/// 使用简单 HTTP 服务器返回不匹配的 identity。
+#[test]
+fn serve_attach_identity_mismatch_exits_fast() {
+    // 启动一个简单 HTTP 服务器模拟已有实例（返回不匹配的 identity）
+    let server_addr = free_port_address();
+    let server_bind = server_addr.clone();
+    let _server_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let app = axum::Router::new().route(
+                "/v1/runtime/identity",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "success": true,
+                        "data": {
+                            "application_id": "remote-app",
+                            "workspace_id": "remote-workspace"
+                        }
+                    }))
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind(&server_bind).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let (_dir, workspace) = temp_workspace();
+    write_lock(&workspace, MINIMAL_LOCK);
+    let logs = workspace.parent().unwrap().join("logs");
+    let mut command = base_command(&workspace, &logs, &server_addr);
+    command.arg("--attach").arg("serve");
+    let output = run_to_exit(command, Duration::from_secs(15));
+    assert!(
+        !output.status.success(),
+        "attach with mismatched identity must exit non-zero; stdout+stderr: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let combined = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        combined.contains("identity mismatch") || combined.contains("refusing to attach"),
+        "error should mention identity mismatch; output: {combined}"
     );
 }

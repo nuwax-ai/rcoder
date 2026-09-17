@@ -52,6 +52,12 @@ pub struct CliArgs {
     /// 子命令（缺省 = legacy 直跑形态，dev 链兼容入口）。
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    /// 附着模式（仅 `serve` 子命令有效）：已有实例占用管理端口时，核验身份
+    /// 并等待其退出，然后接管为新 owner；身份不符或 API 不可达则立即退出。
+    /// supervisord autorestart 配合 `exit 0`（正常退出不重启）使用。
+    #[arg(long, env = "APP_CLI_ATTACH")]
+    pub attach: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
