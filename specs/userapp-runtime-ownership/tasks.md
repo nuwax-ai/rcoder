@@ -197,3 +197,10 @@ make remote-k8s-verify SUITE=gateway
 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
 
 本文件勾选代表有对应本轮证据。禁止根据历史 tasks.md 的绿灯、agent 自述或静态匹配数量勾选真实验收项。
+
+## 8. 2026-09-17 原生宿主机补充
+
+- [ ] 按 [原生 Tasks](../native-desktop-runtime/tasks.md) 完成 app-cli 与 file-server-proxy 的自包含三平台能力（ND01–ND12）。此处不继承此前阶段的完成勾选。
+- [ ] 三平台执行 NT01–NT16 适用场景，分别记录真实进程/包的证据；追加 [原生 verification](../native-desktop-runtime/verification.md)。
+
+本批 Electron 只作为使用背景，客户端、IPC、安装和更新不属于任务。原有 R01–R11/B01–B05 的修复与容器回归继续完成，参见[统一交接提示词](../development-review-2026-09-17/claude-prompt.md)。

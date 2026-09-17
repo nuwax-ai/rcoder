@@ -2,6 +2,8 @@
 
 ## 1. 已核对的源码事实
 
+2026-09-17 原生扩展见 [native-desktop-runtime/plan.md](../native-desktop-runtime/plan.md)：包含 app-cli 与 file-server-proxy 的自包含依赖、原生布局/端口/实例协议和当前缺口。下面源码表仍保留首次方案的历史基线；当前开发同时核对 [R01–R11 审查](../development-review-2026-09-17/review.md)，不能将旧描述当作 HEAD 现状。
+
 基线见 README；下表是定位入口，开发时重新核对符号，不将行号当作固定补丁坐标。
 
 | 路径 / 符号 | 当前事实及影响 |

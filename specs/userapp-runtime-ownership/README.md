@@ -11,6 +11,8 @@
 3. [tasks.md](tasks.md)：执行顺序、完成标准、测试矩阵与交付记录。
 4. [agent-prompt.md](agent-prompt.md)：可复制给另一开发 agent 的完整提示词。
 
+2026-09-17 后续补充：三平台要求见 [cross-platform.md](cross-platform.md)；app-cli 与 file-server-proxy 的无容器、自包含宿主机要求见 [原生运行时文档](../native-desktop-runtime/README.md)。Electron 仅作为后续使用场景，不纳入客户端开发。继续开发采用[统一提示词](../development-review-2026-09-17/claude-prompt.md)，并核对审查发现及实际 verification；本文件开头状态及下面基线保留为首次方案的历史记录。
+
 ## 核心决策
 
 - 阶段一独立修复启动错误传播，不等待架构切换。

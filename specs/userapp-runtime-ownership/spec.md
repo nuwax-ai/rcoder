@@ -10,6 +10,8 @@
 
 ## 2. 范围
 
+2026-09-17 补充：本节原有 UserApp 目标继续有效；两个原生组件在无容器宿主机的支持范围另见 [原生运行时 Spec](../native-desktop-runtime/spec.md)。Electron 仅说明未来用途，不要求本轮开发客户端。
+
 ### 包含
 
 - UserApp `/api/v1/userapp/dev/*` 的启动、重启、停止、列表以及关联任务取消和 SSE。
