@@ -4,8 +4,12 @@
 //! `/web/ttyd/{user_id}/{project_id}/{*path}` 路径的 ttyd WebSocket 代理。
 //!
 //! ttyd 是一个基于 WebSocket 的 Web 终端工具，单端口（7681）同时服务 HTTP 和 WebSocket。
-//! Pingora 默认透传所有 header（含 Connection: Upgrade），
-//! ttyd 端 libwebsockets 根据 Upgrade 头自动分发到 PTY 协议。
+//! pingora ≥0.9 默认剥离 hop-by-hop 头但对**标准 WebSocket 升级**走
+//! H1UpgradePolicy::WebSocketOnly：握手被规范化重写为 Connection: Upgrade /
+//! Upgrade: websocket 后转发（非 WS 升级协议才会被剥——若未来接入需在
+//! peer.options.http_upstream_request_policy 显式 preserve()）。
+//! ttyd 端 libwebsockets 根据 Upgrade 头自动分发到 PTY 协议
+//! （WS 链路已由 compose e2e userapp_dev_terminal_cwd_via_ttyd_ws 实测覆盖）。
 
 use dashmap::DashMap;
 use matchit::Params;
