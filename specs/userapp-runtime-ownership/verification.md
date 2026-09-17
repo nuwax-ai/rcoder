@@ -81,3 +81,10 @@ Windows 环境准备：choco 安装 cmake 4.4.3 + VS2022 BuildTools (VCTools)；
 | Windows x64 MSVC | 192.168.32.53 | cargo test --all-features（tar-over-ssh 同步） | **179 pass / 4 fail——四项全部为既有 N02 平台缺口**（zip symlink 需 Unix 运行时、proxy 路径校验对 Windows 整体跳过、svc_spec `\` 分隔符拼接），本轮未触碰这三文件（git diff 归因为空），与本轮改动无关 |
 
 本轮 R01 树测试/编排链/进程组收束/R09 布局契约在 Linux 全过；Windows 的进程树/生命周期测试（win 专属集合）全过。
+
+### 2026-09-18 Compose 回归（本轮改动后）
+
+报告 `tests-e2e/reports/1011748ae05e450fb05fa2f9226fce7b`（HEAD be83ffe3，干净快照重跑）：
+**22 pass / 2 fail**——失败与基线完全相同（sqlite_compose_recreation、docker_runtime_crash_recovery，均缺 E2E_SQLITE_BINARY_SHA256 冻结二进制前置，环境归因；上轮第三个 ERR_MODEL_UNAVAILABLE 本轮模型端点恢复已通过）。
+本轮改动相关全过：userapp_dev 全套（server_lifecycle、**pg_reset_password（R08 真实改密链路）**、ttyd WS、SSE cursor、registry self-heal）、热部署双引擎、deploy 全链、并发、native crash。
+首次运行因中途提交文档触发 source-drift 作废重跑（干净树）。
