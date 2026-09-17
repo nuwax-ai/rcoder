@@ -297,6 +297,26 @@ impl RuntimeStore {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("chmod 600 token file {}", path.display()))?;
         }
+        #[cfg(windows)]
+        {
+            // std 无 ACL API——经 icacls 移除继承并仅授予当前用户完全控制
+            // （cross-platform.md §3 凭据文件平台保护）。失败如实上抛：
+            // 凭据保护失败不应静默。
+            let username =
+                std::env::var("USERNAME").context("resolve current user for token ACL")?;
+            let status = std::process::Command::new("icacls")
+                .arg(&path)
+                .arg("/inheritance:r")
+                .arg("/grant:r")
+                .arg(format!("{username}:(F)"))
+                .output()
+                .with_context(|| format!("run icacls on token file {}", path.display()))?;
+            anyhow::ensure!(
+                status.status.success(),
+                "restrict token file ACL to current user failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
         Ok(())
     }
 
@@ -1603,6 +1623,19 @@ mod tests {
                 mode & 0o777,
                 0o600,
                 "token file must be owner-only readable"
+            );
+        }
+        #[cfg(windows)]
+        {
+            // icacls 查询 ACL：断言继承已移除（无 inherited 条目残留）
+            let query = std::process::Command::new("icacls")
+                .arg(root.join("token"))
+                .output()
+                .expect("icacls query");
+            let text = String::from_utf8_lossy(&query.stdout);
+            assert!(
+                !text.contains("(I)"),
+                "token ACL must have inheritance removed: {text}"
             );
         }
         // 无 token 文件 → None（owner 未启用写端点）

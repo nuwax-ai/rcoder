@@ -882,45 +882,68 @@ mod owner_reuse_tests {
         );
     }
 
+    /// HttpResult 信封（wire 层格式手拼 OK；data 载荷一律 typed 构造——
+    /// 契约结构体字段偏移时编译器强制 mock 同步，不靠字符串检查）。
+    fn envelope<T: serde::Serialize>(data: &T) -> serde_json::Value {
+        serde_json::json!({"success": true, "code": "OK", "data": data, "message": "ok"})
+    }
+
+    fn operation_view(
+        id: &str,
+        state: shared_types::RuntimeOperationState,
+    ) -> shared_types::RuntimeOperationView {
+        shared_types::RuntimeOperationView {
+            operation_id: id.to_string(),
+            kind: shared_types::RuntimeOperationKind::Restart,
+            state,
+            request_digest: "digest".to_string(),
+            revision: 1,
+            runtime_instance_id: "instance-test".to_string(),
+            error_code: None,
+            error_message: None,
+            failure_detail: None,
+        }
+    }
+
     fn mock_owner_router(ws: &str) -> axum::Router<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+        use shared_types::{
+            DesiredState, ObservedHealth, RuntimeEventRecord, RuntimeIdentityView,
+            RuntimeOperationState, RuntimeStatusView,
+        };
+
+        let identity_of = |workspace: String| RuntimeIdentityView {
+            application_id: "unknown-app".to_string(),
+            service_family: "userapp-dev".to_string(),
+            workspace_id: workspace,
+            source_root: "/ws".to_string(),
+            runtime_instance_id: "instance-test".to_string(),
+            deployment_generation_id: "gen-test".to_string(),
+            protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: Vec::new(),
+        };
+        let status_view = || RuntimeStatusView {
+            desired: DesiredState::Running,
+            observed: ObservedHealth::Ready,
+            active_target: None,
+            revision: 0,
+            active_operation_id: None,
+            recovery_protection: false,
+            runtime_instance_id: "instance-test".to_string(),
+        };
+
         let ws = ws.to_string();
         let identity_ws = ws.clone();
         axum::Router::new()
             .route(
                 "/v1/runtime/identity",
                 axum::routing::get(move || {
-                    let ws = identity_ws.clone();
-                    async move {
-                        axum::Json(serde_json::json!({
-                            "success": true, "code": "OK",
-                            "data": {
-                                "application_id": "unknown-app",
-                                "service_family": "userapp-dev",
-                                "workspace_id": ws,
-                                "source_root": "/ws",
-                                "runtime_instance_id": "instance-test",
-                                "deployment_generation_id": "gen-test",
-                                "protocol_version": shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
-                                "capabilities": []
-                            },
-                            "message": "ok"
-                        }))
-                    }
+                    let identity = identity_of(identity_ws.clone());
+                    async move { axum::Json(envelope(&identity)) }
                 }),
             )
             .route(
                 "/v1/runtime/status",
-                axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({
-                        "success": true, "code": "OK",
-                        "data": {
-                            "desired": "running", "observed": "ready", "revision": 0,
-                            "recovery_protection": false,
-                            "runtime_instance_id": "instance-test"
-                        },
-                        "message": "ok"
-                    }))
-                }),
+                axum::routing::get(move || async move { axum::Json(envelope(&status_view())) }),
             )
             .route(
                 "/v1/runtime/operations",
@@ -928,18 +951,11 @@ mod owner_reuse_tests {
                     |axum::Json(req): axum::Json<serde_json::Value>| async move {
                         let id = req
                             .get("operation_id")
-                            .and_then(|v| v.as_str())
+                            .and_then(|value| value.as_str())
                             .unwrap_or("op")
                             .to_string();
-                        axum::Json(serde_json::json!({
-                            "success": true, "code": "OK",
-                            "data": {
-                                "operation_id": id, "kind": "restart", "state": "succeeded",
-                                "request_digest": "digest", "revision": 1,
-                                "runtime_instance_id": "instance-test"
-                            },
-                            "message": "ok"
-                        }))
+                        let view = operation_view(&id, RuntimeOperationState::Accepted);
+                        axum::Json(envelope(&view))
                     },
                 ),
             )
@@ -952,16 +968,12 @@ mod owner_reuse_tests {
                     >| async move {
                         // 首查 accepted（留事件流消费窗口），其后 succeeded
                         let seen = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let state = if seen == 0 { "accepted" } else { "succeeded" };
-                        axum::Json(serde_json::json!({
-                            "success": true, "code": "OK",
-                            "data": {
-                                "operation_id": id, "kind": "restart", "state": state,
-                                "request_digest": "digest", "revision": 1,
-                                "runtime_instance_id": "instance-test"
-                            },
-                            "message": "ok"
-                        }))
+                        let state = if seen == 0 {
+                            RuntimeOperationState::Accepted
+                        } else {
+                            RuntimeOperationState::Succeeded
+                        };
+                        axum::Json(envelope(&operation_view(&id, state)))
                     },
                 ),
             )
@@ -969,19 +981,37 @@ mod owner_reuse_tests {
                 "/v1/runtime/operations/{id}/events/stream",
                 axum::routing::get(
                     |axum::extract::Path(id): axum::extract::Path<String>| async move {
-                        let body = format!(
-                            "data: {}\n\ndata: {}\n\n",
-                            serde_json::json!({
-                                "operation_id": id, "sequence": 1,
-                                "runtime_instance_id": "instance-test",
-                                "stage": "terminal", "event_name": "Completed"
-                            }),
-                            serde_json::json!({
-                                "operation_id": id, "sequence": 2,
-                                "runtime_instance_id": "instance-test",
-                                "stage": "stage-only-no-event-name"
-                            }),
-                        );
+                        // typed 构造事件记录：带 event_name（转发为旧 EVT）
+                        // + 无 event_name 的纯 stage（适配层跳过）
+                        let records = [
+                            RuntimeEventRecord {
+                                operation_id: id.clone(),
+                                sequence: 1,
+                                runtime_instance_id: "instance-test".to_string(),
+                                stage: "terminal".to_string(),
+                                service: None,
+                                event_name: Some("Completed".to_string()),
+                                payload: None,
+                            },
+                            RuntimeEventRecord {
+                                operation_id: id,
+                                sequence: 2,
+                                runtime_instance_id: "instance-test".to_string(),
+                                stage: "stage-only".to_string(),
+                                service: None,
+                                event_name: None,
+                                payload: None,
+                            },
+                        ];
+                        let body = records
+                            .iter()
+                            .map(|record| {
+                                format!(
+                                    "data: {}\n\n",
+                                    serde_json::to_string(record).expect("serialize event")
+                                )
+                            })
+                            .collect::<String>();
                         axum::response::Response::builder()
                             .header("content-type", "text/event-stream")
                             .body(axum::body::Body::from(body))
