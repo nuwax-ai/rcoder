@@ -509,6 +509,7 @@ NODE_ENV = "production"
     }
 
     #[test]
+    #[cfg(unix)] // supervisord 引擎 Unix-only（xmlrpc 走 Unix socket）；断言含 Unix 路径字符串
     fn renders_service_and_pingap_programs() {
         let specs = vec![spec("web", "web", 45)];
         let release = ReleaseLock {
