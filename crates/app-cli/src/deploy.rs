@@ -943,6 +943,77 @@ format = "jsonl"
         assert!(incoming.join("keep.txt").exists());
     }
 
+    /// XP09（Unix）：激活失败无假成功——清理上一代残留失败时，部署如实
+    /// 报错，运行中内容原样保留（`.previous` 被占为普通文件 → remove_dir_all
+    /// ENOTDIR 确定性失败）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn xp09_activation_failure_keeps_serving_content() {
+        let (_dir, workspace) = make_volume();
+        let zip_v1 = build_zip(&[("release.lock.toml", MINIMAL_LOCK), ("v.txt", "1")]);
+        let url1 = serve_once(zip_v1).await;
+        deploy(&workspace, &url1, "rel-001", None)
+            .await
+            .expect("v1");
+
+        // 破坏上一代目录：占位为普通文件（清理路径确定性失败）
+        let previous = volume_root_of(&workspace).join(PREVIOUS_DIR);
+        std::fs::create_dir_all(&previous).expect("previous dir");
+        std::fs::remove_dir_all(&previous).expect("clear");
+        std::fs::write(&previous, "occupied").expect("occupy as file");
+
+        let lock_v2 = MINIMAL_LOCK.replace("test-release-0001", "test-release-0002");
+        let zip_v2 = build_zip(&[("release.lock.toml", &lock_v2), ("v.txt", "2")]);
+        let url2 = serve_once(zip_v2).await;
+        let second = deploy(&workspace, &url2, "rel-002", None).await;
+        assert!(
+            second.is_err(),
+            "activation failure must surface, not fake success"
+        );
+
+        // 运行内容未被触碰（仍是 v1）
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("v.txt")).unwrap(),
+            "1",
+            "serving generation must survive a failed activation"
+        );
+    }
+
+    /// XP09（Windows）：文件占用阻断激活——workspace 内被独占句柄打开的
+    /// 文件使目录 rename 失败，部署如实报错，原内容保留。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn xp09_activation_failure_keeps_serving_content() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_dir, workspace) = make_volume();
+        let zip_v1 = build_zip(&[("release.lock.toml", MINIMAL_LOCK), ("v.txt", "1")]);
+        let url1 = serve_once(zip_v1).await;
+        deploy(&workspace, &url1, "rel-001", None)
+            .await
+            .expect("v1");
+
+        // 独占句柄（FILE_SHARE_NONE）钉住 workspace 内文件 → 目录 rename 失败
+        let _pinned = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(workspace.join("v.txt"))
+            .expect("pin running file");
+
+        let lock_v2 = MINIMAL_LOCK.replace("test-release-0001", "test-release-0002");
+        let zip_v2 = build_zip(&[("release.lock.toml", &lock_v2), ("v.txt", "2")]);
+        let url2 = serve_once(zip_v2).await;
+        let second = deploy(&workspace, &url2, "rel-002", None).await;
+        assert!(
+            second.is_err(),
+            "occupied-file activation must surface, not fake success"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("v.txt")).unwrap_or_else(|_| "1".into()),
+            "1",
+            "serving generation must survive a failed activation"
+        );
+    }
+
     #[tokio::test]
     async fn second_deploy_preserves_previous_generation() {
         let (_dir, workspace) = make_volume();

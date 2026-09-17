@@ -98,3 +98,69 @@ fn windows_idle_serve_lifecycle() {
         std::thread::sleep(Duration::from_millis(200));
     }
 }
+
+/// XP01（Windows）：两个 CLI 并发首次启动（真实二进制同端口同 workspace）——
+/// 恰好一个 owner 胜出（/health 200 常驻），另一个非零退出。
+#[test]
+fn xp01_two_cli_concurrent_first_start_single_winner() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workspace = dir.path().join("code");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let address = free_port_address();
+    let logs = dir.path().join("logs");
+
+    let spawn_serve = || {
+        Command::new(env!("CARGO_BIN_EXE_app-cli"))
+            .args([
+                "--workspace",
+                workspace.to_str().expect("workspace path"),
+                "--log-dir",
+                logs.to_str().expect("log path"),
+                "--admin-addr",
+                &address,
+                "serve",
+            ])
+            .env_remove("APP_DEPLOY_URL")
+            .env_remove("APP_RELEASE_ID")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn serve")
+    };
+    let mut first = spawn_serve();
+    let mut second = spawn_serve();
+
+    // 收敛判定：胜者 /health 200 且存活；败者已退出非零（OwnerGuard 排他）
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "concurrent start must converge quickly"
+        );
+        let first_alive = first.try_wait().expect("try_wait first").is_none();
+        let second_status = second.try_wait().expect("try_wait second");
+
+        if http_get_health(&address) == Some(200) && first_alive && second_status.is_some() {
+            assert!(
+                !second_status.unwrap().success(),
+                "loser must exit non-zero (owner lock / bind conflict)"
+            );
+            let _ = Command::new("taskkill")
+                .args(["/PID", &first.id().to_string(), "/F", "/T"])
+                .output();
+            let _ = first.wait();
+            return;
+        }
+        if http_get_health(&address) == Some(200) && second_status.is_none() && !first_alive {
+            let status = first.wait().expect("reap first");
+            assert!(!status.success(), "loser must exit non-zero");
+            let _ = Command::new("taskkill")
+                .args(["/PID", &second.id().to_string(), "/F", "/T"])
+                .output();
+            let _ = second.wait();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}

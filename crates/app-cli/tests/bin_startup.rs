@@ -341,3 +341,74 @@ fn serve_attach_identity_mismatch_exits_fast() {
         "error should mention identity mismatch; output: {combined}"
     );
 }
+
+/// XP01（Unix）：两个 CLI 并发首次启动（真实二进制同端口同 workspace）——
+/// 恰好一个 owner 胜出（/health 200 常驻），另一个非零退出，无第二业务树。
+#[test]
+fn xp01_two_cli_concurrent_first_start_single_winner() {
+    let (_dir, workspace) = temp_workspace();
+    let address = free_port_address();
+    let logs = workspace.parent().unwrap().join("logs");
+
+    let mut command_a = base_command(&workspace, &logs, &address);
+    command_a.arg("serve");
+    let mut command_b = base_command(&workspace, &logs, &address);
+    command_b.arg("serve");
+    let mut first = command_a.spawn().expect("spawn first serve");
+    let mut second = command_b.spawn().expect("spawn second serve");
+
+    // 收敛判定（30s 上限）：胜者 /health 200 且存活；败者已退出且非零
+    // （OwnerGuard 排他使后到者在任何运行态副作用前失败）
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "concurrent start must converge quickly"
+        );
+        let first_alive = first.try_wait().unwrap().is_none();
+        let second_status = second.try_wait().unwrap();
+
+        let first_healthy = first_alive && http_status(&address) == Some(200);
+        let second_healthy = second_status.is_none() && http_status(&address) == Some(200);
+        let _ = second_healthy; // 端口单占：健康应答只能来自存活者之一
+
+        if first_healthy && second_status.is_some() {
+            assert!(
+                !second_status.unwrap().success(),
+                "loser must exit non-zero (owner lock / bind conflict)"
+            );
+            let _ = first.kill();
+            let _ = first.wait();
+            return;
+        }
+        if second_healthy && first_alive == false {
+            // 反向胜出：second 存活健康、first 已退出非零
+            let status = first.wait().unwrap();
+            assert!(!status.success(), "loser must exit non-zero");
+            let _ = second.kill();
+            let _ = second.wait();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// 原生 TCP 上的最小 HTTP/1.1 GET /health 状态码探测。
+fn http_status(address: &str) -> Option<u16> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(address).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .write_all(
+            format!("GET /health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+    String::from_utf8_lossy(&response)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+}
