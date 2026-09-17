@@ -88,12 +88,15 @@ impl OwnerClient {
 
     /// 提交源码 Restart（平台 start/restart 复用既有 owner 的执行路径）。
     /// instance_id 来自探测到的 identity——owner 校验后拒绝旧实例请求。
+    /// `pg`（R08）：每操作 PG 凭据——用户改密后的新凭据经 owner 到达服务
+    /// 进程 env（不进摘要/日志；owner 侧持久化时脱敏）。
     pub(super) async fn submit_restart_source(
         &self,
         operation_id: &str,
         workspace_id: &str,
         expected_revision: u64,
         instance_id: &str,
+        pg: Option<&shared_types::StartPgCredential>,
     ) -> Result<RuntimeOperationView> {
         self.submit(
             operation_id,
@@ -101,6 +104,7 @@ impl OwnerClient {
             expected_revision,
             instance_id,
             RuntimeOperationKind::Restart,
+            pg,
         )
         .await
     }
@@ -119,6 +123,7 @@ impl OwnerClient {
             expected_revision,
             instance_id,
             RuntimeOperationKind::Stop,
+            None,
         )
         .await
     }
@@ -130,6 +135,7 @@ impl OwnerClient {
         expected_revision: u64,
         instance_id: &str,
         kind: RuntimeOperationKind,
+        pg: Option<&shared_types::StartPgCredential>,
     ) -> Result<RuntimeOperationView> {
         let request = RuntimeOperationRequest {
             operation_id: operation_id.to_string(),
@@ -140,6 +146,9 @@ impl OwnerClient {
             profile: RunProfileInput::Source {
                 workspace_id: workspace_id.to_string(),
             },
+            run_config: pg.map(|pg| shared_types::OperationRunConfig {
+                pg: Some(pg.clone()),
+            }),
             request_context: None,
         };
         let url = format!("http://{}/v1/runtime/operations", self.address);

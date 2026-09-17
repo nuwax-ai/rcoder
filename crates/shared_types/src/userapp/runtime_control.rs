@@ -85,6 +85,18 @@ pub enum ArtifactInput {
     Url { url: String, sha256: Option<String> },
 }
 
+/// 受控的每操作运行配置（R08）：owner 复用时平台传入的显式覆盖——
+/// 用户更新的 PG 凭据经 Restart 到达编排的服务进程 env，不再沿用 owner
+/// 启动时的旧值。secret 只进内存与进程 env，不进摘要/事件/日志；
+/// 所有者侧持久化请求时须对凭据脱敏。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+pub struct OperationRunConfig {
+    /// PG 连接凭据（POSTGRES_USER/POSTGRES_PASSWORD 注入，运行时变量
+    /// last-wins 覆盖服务 spec env）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pg: Option<crate::userapp::db_admin::StartPgCredential>,
+}
+
 /// 运行操作受理请求（`POST /v1/runtime/operations`）。
 ///
 /// 幂等键 = `operation_id` + `request_digest`：平台生成的 operation_id 在
@@ -101,6 +113,10 @@ pub struct RuntimeOperationRequest {
     pub workspace_id: String,
     pub kind: RuntimeOperationKind,
     pub profile: RunProfileInput,
+    /// 每操作运行配置（R08；不参与幂等摘要——重试可修正配置细节，
+    /// 身份语义仍由 id+digest 锁定）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_config: Option<OperationRunConfig>,
     /// 可选调用方请求标识（诊断/日志关联；不参与幂等摘要）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_context: Option<String>,
@@ -309,6 +325,7 @@ mod tests {
             profile: RunProfileInput::Source {
                 workspace_id: "ws-1".into(),
             },
+            run_config: None,
             request_context: None,
         }
     }

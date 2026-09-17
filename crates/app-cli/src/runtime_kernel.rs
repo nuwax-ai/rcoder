@@ -391,9 +391,17 @@ impl RuntimeStore {
     }
 
     pub(crate) fn store_operation(&self, operation: &StoredOperation) -> Result<()> {
+        // R08：凭据不落盘——持久化副本对 run_config.pg 脱敏（重放只回终态
+        // 视图，恢复不重执行，脱敏不影响语义；诊断可见用户名）
+        let mut redacted = operation.clone();
+        if let Some(config) = redacted.request.run_config.as_mut()
+            && let Some(pg) = config.pg.as_mut()
+        {
+            pg.password = String::new();
+        }
         write_json(
             &self.operation_path(&operation.view.operation_id),
-            operation,
+            &redacted,
         )
     }
 
@@ -608,10 +616,12 @@ pub(crate) enum DispatchAction {
     },
     /// 源码编排（workspace 当前内容 + release lock；start/restart source）。
     /// R08：dev_profile 随操作传递（Source profile = dev 语义）——编排的
-    /// 生效命令选择不再依赖 serve 进程 env 猜测。
+    /// 生效命令选择不再依赖 serve 进程 env 猜测；pg 为每操作运行配置
+    /// （凭据注入服务 env，不落盘——持久化副本在 store_operation 前脱敏）。
     OrchestrateSource {
         operation_id: String,
         dev_profile: bool,
+        pg: Option<shared_types::StartPgCredential>,
     },
     /// 停止业务服务（保持管理面可用）。
     StopBusiness { operation_id: String },
@@ -903,6 +913,11 @@ impl RuntimeKernel {
             ) => DispatchAction::OrchestrateSource {
                 operation_id: stored.view.operation_id.clone(),
                 dev_profile: true,
+                pg: stored
+                    .request
+                    .run_config
+                    .as_ref()
+                    .and_then(|config| config.pg.clone()),
             },
             // 组合已在前置校验拒绝；到这里的组合是防御纵深违规——fail fast
             (kind, profile) => {
@@ -1302,6 +1317,57 @@ mod tests {
         RuntimeKernel::new(store, identity, Box::new(|_| {}))
     }
 
+    /// R08：Restart 携带 run_config.pg → 派发动作拿到真实凭据；持久化副本
+    /// 密码脱敏（重放摘要不含 run_config，脱敏不影响幂等语义）。
+    #[tokio::test]
+    async fn run_config_pg_reaches_dispatch_and_redacts_on_disk() {
+        use std::sync::Mutex;
+        let (dir, _keep) = temp_store();
+        let captured: std::sync::Arc<Mutex<Vec<DispatchAction>>> = Default::default();
+        let sink = captured.clone();
+        let workspace = dir.path().join("workspace");
+        let store = open_store(&workspace);
+        let identity = identity();
+        let kernel = RuntimeKernel::new(
+            store,
+            identity,
+            Box::new(move |action| {
+                sink.lock().unwrap().push(action);
+            }),
+        );
+        let mut request = request(RuntimeOperationKind::Restart, "op-pg");
+        request.run_config = Some(shared_types::OperationRunConfig {
+            pg: Some(shared_types::StartPgCredential {
+                username: "biz_user".into(),
+                password: "s3cret".into(),
+            }),
+        });
+        kernel.admit(request).await.expect("admit");
+        let actions = captured.lock().unwrap();
+        match &actions[..] {
+            [DispatchAction::OrchestrateSource { pg: Some(pg), .. }] => {
+                assert_eq!(pg.username, "biz_user");
+                assert_eq!(pg.password, "s3cret");
+            }
+            other => panic!("expected single orchestrate dispatch with pg, got {other:?}"),
+        }
+        drop(actions);
+        // 持久化副本：密码为空（脱敏），用户名保留诊断
+        let stored = kernel
+            .store()
+            .load_operation("op-pg")
+            .expect("load")
+            .expect("stored");
+        let persisted_pg = stored
+            .request
+            .run_config
+            .as_ref()
+            .and_then(|config| config.pg.as_ref())
+            .expect("run config persisted");
+        assert_eq!(persisted_pg.username, "biz_user");
+        assert_eq!(persisted_pg.password, "", "password must be redacted on disk");
+    }
+
     /// R06：Failed 终态事件携带错误载荷；事件桥把服务级事件追加进活跃操作
     /// journal（复用 owner 的平台侧经运行 API 读事件流）。
     #[tokio::test]
@@ -1395,6 +1461,7 @@ mod tests {
                     sha256: None,
                 },
             },
+            run_config: None,
             request_context: None,
         }
     }
@@ -1409,6 +1476,7 @@ mod tests {
             profile: RunProfileInput::Source {
                 workspace_id: "ws-1".into(),
             },
+            run_config: None,
             request_context: None,
         }
     }

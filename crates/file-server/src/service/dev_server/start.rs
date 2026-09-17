@@ -299,7 +299,7 @@ impl DevServerManager {
         // owner 经运行 API 复用（消除平台/agent 双启动的 3010 冲突）；legacy
         // app-cli / foreign 应答明确拒绝（XP04：不杀对方、不盲 spawn）。
         if let Some(started) = self
-            .reuse_or_refuse_owner(project_id, project_path, hooks.clone())
+            .reuse_or_refuse_owner(project_id, project_path, hooks.clone(), pg)
             .await?
         {
             return Ok(started);
@@ -419,6 +419,7 @@ impl DevServerManager {
         project_id: &str,
         project_path: &Path,
         hooks: Option<super::supervise::DevEventHooks>,
+        pg: Option<&shared_types::StartPgCredential>,
     ) -> AppResult<Option<StartedDev>> {
         let owner_addr = self.config.app_cli_admin_probe_addr.clone();
         let Some(identity) = super::owner_client::probe_owner(&owner_addr).await else {
@@ -474,9 +475,26 @@ impl DevServerManager {
         // P3-03：构建前捕获的期望优先（构建期间 owner 变更 → 提交被拒，
         // 不自动刷新重发）；未捕获（直接 start 无构建段）→ 提交时活取。
         let expected = lock(&self.owner_expectations)?.remove(project_id);
+        // P3-03/R07：观察失败（构建期 owner 在但身份/凭据/状态读不到）→
+        // 明确拒绝——不能用"没捕获到"刷新期望绕过停止屏障（R07 反例：
+        // 预检断连 → 用户 Stop → 网络恢复 → 旧构建迟到提交必须被拒）。
+        if let Some(super::types::OwnerExpectation::ObservationFailed { reason }) = &expected {
+            return Err(AppError::business(format!(
+                "owner observation failed before this build ({reason}); refusing to \
+                 submit without a verified admission context — stop intent must not \
+                 be bypassed by a late build"
+            )));
+        }
+        let captured = match expected {
+            Some(super::types::OwnerExpectation::Captured {
+                runtime_instance_id,
+                revision,
+            }) => Some((runtime_instance_id, revision)),
+            _ => None,
+        };
         let hooks_line_for_drain = hooks.as_ref().map(|hooks| hooks.on_line.clone());
         let route_restart = async {
-            let (expected_instance, expected_revision) = match expected {
+            let (expected_instance, expected_revision) = match captured {
                 Some(captured) => captured,
                 None => {
                     let status = client.status().await?;
@@ -490,6 +508,7 @@ impl DevServerManager {
                     &expected_ws,
                     expected_revision,
                     &expected_instance,
+                    pg,
                 )
                 .await?;
             // R06：事件转发（游标重放轮询，替换 SSE 长连——无总超时/EOF 竞态，
@@ -655,7 +674,7 @@ impl DevServerManager {
 /// legacy app-cli 探测：/v1/deploy/status 是 app-cli 专属路由——200 且
 /// 响应含 protocol_version 即为 app-cli 管理面（legacy 或 serve 形态）；
 /// foreign 服务 404/异构 body → false。
-async fn legacy_app_cli_responds(address: &str) -> bool {
+pub(super) async fn legacy_app_cli_responds(address: &str) -> bool {
     let url = format!("http://{address}/v1/deploy/status");
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -817,7 +836,7 @@ mod owner_reuse_tests {
         let ws_fresh = dir.path().join("ws-fresh");
         std::fs::create_dir_all(&ws_fresh).unwrap();
         assert!(
-            mgr.reuse_or_refuse_owner("userapp:app", &ws_fresh, None)
+            mgr.reuse_or_refuse_owner("userapp:app", &ws_fresh, None, None)
                 .await
                 .expect("probe")
                 .is_none(),
@@ -835,7 +854,7 @@ mod owner_reuse_tests {
         let ws_legacy = dir.path().join("ws-legacy");
         std::fs::create_dir_all(&ws_legacy).unwrap();
         let error = mgr
-            .reuse_or_refuse_owner("userapp:app", &ws_legacy, None)
+            .reuse_or_refuse_owner("userapp:app", &ws_legacy, None, None)
             .await
             .expect_err("legacy responder must be refused");
         let AppError::Business(message) = &error else {
@@ -866,7 +885,7 @@ mod owner_reuse_tests {
             on_end: None,
         };
         let started = mgr
-            .reuse_or_refuse_owner("userapp:app", &ws_reuse, Some(hooks))
+            .reuse_or_refuse_owner("userapp:app", &ws_reuse, Some(hooks), None)
             .await
             .expect("reuse path")
             .expect("must reuse existing owner");
@@ -914,7 +933,7 @@ mod owner_reuse_tests {
         let ws_mine = dir.path().join("ws-mine");
         std::fs::create_dir_all(&ws_mine).unwrap();
         let error = mgr
-            .reuse_or_refuse_owner("userapp:app", &ws_mine, None)
+            .reuse_or_refuse_owner("userapp:app", &ws_mine, None, None)
             .await
             .expect_err("foreign owner must be refused");
         let AppError::Business(message) = &error else {
@@ -1075,6 +1094,138 @@ mod owner_reuse_tests {
                     },
                 ),
             )
+    }
+
+    /// R07/R08 反例：构建期观察失败 → 迟到提交拒绝（不刷新期望绕过停止
+    /// 屏障）；携带 pg 的复用提交在 wire 上包含 run_config.pg。
+    /// 独立自由端口 + 可配置 probe addr（不与 owner_probe_branches 的 3010 竞争）。
+    #[tokio::test]
+    async fn observation_failure_blocks_late_submission_and_pg_travels_on_wire() {
+        use crate::Config;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws-r78");
+        std::fs::create_dir_all(&ws).unwrap();
+        let state_root = dir.path().join(".app-cli-state").join("unknown-app");
+        std::fs::create_dir_all(&state_root).unwrap();
+        // 刻意**先不写 token**：构建期 capture 时 owner 在但凭据缺 →
+        // ObservationFailed（真实分类路径，非手工注入）
+        let submitted: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = submitted.clone();
+        let identity = shared_types::RuntimeIdentityView {
+            application_id: "unknown-app".to_string(),
+            service_family: "userapp-dev".to_string(),
+            workspace_id: "ws-r78".to_string(),
+            source_root: "/ws".to_string(),
+            runtime_instance_id: "instance-r78".to_string(),
+            deployment_generation_id: "gen".to_string(),
+            protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: Vec::new(),
+        };
+        let status_view = shared_types::RuntimeStatusView {
+            desired: shared_types::DesiredState::Running,
+            observed: shared_types::ObservedHealth::Ready,
+            active_target: None,
+            revision: 7,
+            active_operation_id: None,
+            recovery_protection: false,
+            runtime_instance_id: "instance-r78".to_string(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/v1/runtime/identity",
+                axum::routing::get(move || {
+                    let identity = identity.clone();
+                    async move { axum::Json(envelope(&identity)) }
+                }),
+            )
+            .route(
+                "/v1/runtime/status",
+                axum::routing::get(move || async move { axum::Json(envelope(&status_view)) }),
+            )
+            .route(
+                "/v1/runtime/operations",
+                axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(body.0.clone());
+                        axum::Json(envelope(&serde_json::json!({
+                            "operation_id": "op-x",
+                            "state": "accepted",
+                        })))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe_addr = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock serve");
+        });
+
+        let mut config = Config::from_env().expect("test config");
+        config.app_cli_admin_probe_addr = probe_addr.clone();
+        let mgr = DevServerManager::new(Arc::new(config));
+
+        // ── R07：构建期 owner 在但凭据缺 → ObservationFailed 分类
+        mgr.capture_owner_expectation("userapp:r78", &ws).await;
+        {
+            let map = lock(&mgr.owner_expectations).unwrap();
+            match map.get("userapp:r78") {
+                Some(super::super::types::OwnerExpectation::ObservationFailed { .. }) => {}
+                other => panic!("expected ObservationFailed, got {other:?}"),
+            }
+        }
+        // 网络恢复（补 token）+ 用户 Stop 已推进 revision（mock revision=7）：
+        // 旧构建迟到提交必须被拒——不得刷新期望
+        std::fs::write(state_root.join("token"), "test-token").unwrap();
+        let error = mgr
+            .reuse_or_refuse_owner("userapp:r78", &ws, None, None)
+            .await
+            .expect_err("late build submission must be refused");
+        assert!(
+            error.to_string().contains("observation failed"),
+            "diagnostic: {error}"
+        );
+        assert!(
+            submitted.lock().unwrap().is_empty(),
+            "no operation may be submitted when the admission context is unverified"
+        );
+
+        // ── R07 对照：确认无 owner（无人监听端口）→ NoOwner 分类
+        let mut config = Config::from_env().expect("test config");
+        config.app_cli_admin_probe_addr = "127.0.0.1:1".to_string();
+        let mgr2 = DevServerManager::new(Arc::new(config));
+        mgr2.capture_owner_expectation("userapp:none", &ws).await;
+        {
+            let map = lock(&mgr2.owner_expectations).unwrap();
+            assert!(matches!(
+                map.get("userapp:none"),
+                Some(super::super::types::OwnerExpectation::NoOwner)
+            ));
+        }
+
+        // ── R08：清除失败期望（模拟下一轮构建成功捕获后），复用提交在
+        // wire 上携带 run_config.pg（新凭据到达 owner）
+        lock(&mgr.owner_expectations).unwrap().remove("userapp:r78");
+        let pg = shared_types::StartPgCredential {
+            username: "biz_user".to_string(),
+            password: "new-s3cret".to_string(),
+        };
+        // 复用路径会 wait_terminal 轮询到超时——mock 不提供 operation 查询端点，
+        // 这里只需断言**提交 wire**；超时错误可忽略（操作已受理记录在案）
+        let _reuse_result = mgr
+            .reuse_or_refuse_owner("userapp:r78", &ws, None, Some(&pg))
+            .await;
+        let posted = submitted.lock().unwrap();
+        let last = posted
+            .last()
+            .cloned()
+            .unwrap_or_else(|| panic!("restart must be submitted; got {:?}", posted));
+        assert_eq!(
+            last["run_config"]["pg"]["username"], "biz_user",
+            "wire must carry the new pg credential: {last}"
+        );
+        assert_eq!(last["run_config"]["pg"]["password"], "new-s3cret");
+        task.abort();
     }
 
     /// 起 mock 在 3010；返回显式释放句柄（顺序关闭 + 等待端口回收）。

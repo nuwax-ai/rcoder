@@ -78,6 +78,8 @@ pub struct ServerState {
     /// R08：当前运行操作的 dev profile（None = 操作未指定，legacy 直跑/
     /// env 兜底）。编排生效命令选择的显式依据。
     pending_dev_profile: std::sync::Mutex<Option<bool>>,
+    /// R08：每操作 PG 凭据槽（settle 写入，supervisor spawn 取走）。
+    pending_run_config: std::sync::Mutex<Option<shared_types::StartPgCredential>>,
     /// 运行控制信号通道（源码编排/停止业务——api → 主循环；与部署通道并行）。
     control_tx: tokio::sync::mpsc::UnboundedSender<ControlSignal>,
     control_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ControlSignal>>,
@@ -94,6 +96,8 @@ pub(crate) enum ControlSignal {
         /// R08：操作级 dev profile（Source 形态 = dev）——编排生效命令选择
         /// 的显式依据，不再读 serve 进程 env 猜测
         dev_profile: bool,
+        /// R08：每操作 PG 凭据（注入服务 env；不落盘不进日志）
+        pg: Option<shared_types::StartPgCredential>,
     },
     /// 停止业务服务（保持管理面）。
     StopBusiness { operation_id: String },
@@ -214,6 +218,7 @@ impl ServerState {
             kernel_required: std::sync::atomic::AtomicBool::new(false),
             runtime_recovery_hold: std::sync::atomic::AtomicBool::new(false),
             pending_dev_profile: std::sync::Mutex::new(None),
+            pending_run_config: std::sync::Mutex::new(None),
             control_tx,
             control_rx: tokio::sync::Mutex::new(control_rx),
             current_runtime_operation: RwLock::new(None),
@@ -259,6 +264,20 @@ impl ServerState {
 
     pub(crate) fn take_pending_dev_profile(&self) -> Option<bool> {
         self.pending_dev_profile
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    pub(crate) fn set_pending_run_config(&self, pg: Option<shared_types::StartPgCredential>) {
+        *self
+            .pending_run_config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = pg;
+    }
+
+    pub(crate) fn take_pending_run_config(&self) -> Option<shared_types::StartPgCredential> {
+        self.pending_run_config
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
@@ -1531,6 +1550,7 @@ async fn assemble_runtime_kernel(
         DispatchAction::OrchestrateSource {
             operation_id,
             dev_profile,
+            pg,
         } => {
             dispatch_state.set_current_runtime_operation(Some(operation_id.clone()));
             if dispatch_state
@@ -1538,6 +1558,7 @@ async fn assemble_runtime_kernel(
                 .send(ControlSignal::OrchestrateSource {
                     operation_id: operation_id.clone(),
                     dev_profile,
+                    pg,
                 })
                 .is_err()
             {
@@ -1704,6 +1725,7 @@ async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> In
         ControlSignal::OrchestrateSource {
             operation_id,
             dev_profile,
+            pg,
         } => {
             // R03/R04 取消检查点：派发排队期间被取消 → 按自身 ID 收束
             // Cancelled 后零动作返回——不编排、不派发 Stop（取消收束变成
@@ -1713,6 +1735,7 @@ async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> In
             }
             state.set_current_runtime_operation(Some(operation_id));
             state.set_pending_dev_profile(dev_profile);
+            state.set_pending_run_config(pg);
             InitialAction::Existing
         }
         ControlSignal::StopBusiness { operation_id } => {
@@ -1982,12 +2005,12 @@ async fn server_loop(
                         None => return Ok(()), // api 层全退（不可能，防御）
                     },
                     signal = control.recv() => match signal {
-                        Some(ControlSignal::OrchestrateSource { operation_id, dev_profile }) => {
+                        Some(ControlSignal::OrchestrateSource { operation_id, dev_profile, pg }) => {
                             // B01：ID 必须完整传递——Idle 消费即占据执行身份
                             //（取消检查点在 settle_control_signal 内）
                             Some(settle_control_signal(
                                 state,
-                                ControlSignal::OrchestrateSource { operation_id, dev_profile },
+                                ControlSignal::OrchestrateSource { operation_id, dev_profile, pg },
                             ).await)
                         }
                         Some(ControlSignal::StopBusiness { operation_id }) => {
@@ -2148,6 +2171,9 @@ async fn server_loop(
         let run_dev_profile = state
             .take_pending_dev_profile()
             .unwrap_or_else(crate::supervisor::dev_run_profile);
+        // R08：本次操作的 PG 凭据（owner 复用时平台传入的新凭据——注入服务
+        // env 覆盖旧值）。take 一次性消费；未携带 → None（维持进程 env）
+        let run_pg = state.take_pending_run_config();
         let mut hot_rx = state.deploy_rx.lock().await;
         if let Some(host) = &host {
             let runtime_status = state.runtime_status();
@@ -2304,6 +2330,7 @@ async fn server_loop(
             Some(running_tx),
             run_migrations,
             run_dev_profile,
+            run_pg,
         ));
         let mut sup_joined = false;
         // 先等编排就绪（Running）；就绪后递进一轮等终态/热部署/信号。
@@ -3442,6 +3469,7 @@ format = "jsonl"
             profile: shared_types::RunProfileInput::Source {
                 workspace_id: "ws-1".into(),
             },
+            run_config: None,
             request_context: None,
         }
     }
@@ -3469,6 +3497,7 @@ format = "jsonl"
             ControlSignal::OrchestrateSource {
                 operation_id: "op-a".into(),
                 dev_profile: true,
+                pg: None,
             },
         )
         .await;
@@ -3492,6 +3521,7 @@ format = "jsonl"
             ControlSignal::OrchestrateSource {
                 operation_id: "op-b".into(),
                 dev_profile: true,
+                pg: None,
             },
         )
         .await;
@@ -3814,6 +3844,7 @@ format = "jsonl"
             ControlSignal::OrchestrateSource {
                 operation_id: "op-prof".into(),
                 dev_profile: true,
+                pg: None,
             },
         )
         .await;
@@ -3849,6 +3880,7 @@ format = "jsonl"
             ControlSignal::OrchestrateSource {
                 operation_id: "op-queued".into(),
                 dev_profile: true,
+                pg: None,
             },
         )
         .await;

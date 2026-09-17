@@ -137,6 +137,8 @@ async fn main() -> anyhow::Result<()> {
         true,
         // R08：直跑形态无操作上下文——env 兜底（server 形态经操作显式传递）
         app_cli::supervisor::dev_run_profile(),
+        // 直跑形态无每操作凭据（进程 env 透传）
+        None,
     )
     .await;
     match &supervisor_result {

@@ -47,10 +47,10 @@ pub use userapp::runtime_control::{
     ArtifactInput, DesiredState, ERR_OPERATION_ID_CONFLICT, ERR_OPERATION_IN_PROGRESS,
     ERR_PROTOCOL_UNSUPPORTED, ERR_RECOVERY_REQUIRED, ERR_REVISION_MISMATCH,
     ERR_RUNTIME_INSTANCE_MISMATCH, ERR_STOP_PENDING, ERR_WORKSPACE_MISMATCH, ObservedHealth,
-    RUNTIME_CONTROL_PROTOCOL_VERSION, RunProfileInput, RuntimeEventRecord, RuntimeFailureDetail,
-    RuntimeIdentityView, RuntimeOperationAccepted, RuntimeOperationKind, RuntimeOperationRequest,
-    RuntimeOperationState, RuntimeOperationView, RuntimeStatusView, runtime_request_digest,
-    validate_runtime_operation_request,
+    OperationRunConfig, RUNTIME_CONTROL_PROTOCOL_VERSION, RunProfileInput, RuntimeEventRecord,
+    RuntimeFailureDetail, RuntimeIdentityView, RuntimeOperationAccepted, RuntimeOperationKind,
+    RuntimeOperationRequest, RuntimeOperationState, RuntimeOperationView, RuntimeStatusView,
+    runtime_request_digest, validate_runtime_operation_request,
 };
 
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）

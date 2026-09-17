@@ -66,6 +66,21 @@ pub(crate) struct ExternalStopRecord {
     pub submitted_at_ms: u64,
 }
 
+/// 构建前 owner 观察结果（R07 三态：捕获/确认无 owner/观察失败）。
+#[derive(Debug, Clone)]
+pub(crate) enum OwnerExpectation {
+    /// 命中 owner：提交按捕获的 (instance, revision) 校验。
+    Captured {
+        runtime_instance_id: String,
+        revision: u64,
+    },
+    /// 确认无 owner（探测无应答且非 legacy）——spawn 路径提交时活取。
+    NoOwner,
+    /// 观察失败（owner 应答存在但凭据/状态不可读，或 legacy 占位）——
+    /// 提交拒绝：不能用"没捕获到"刷新期望绕过停止屏障。
+    ObservationFailed { reason: String },
+}
+
 /// dev server 进程管理器 (经 Arc 注入 AppState)。
 pub struct DevServerManager {
     pub(super) processes: Mutex<HashMap<String, DevProcess>>,
@@ -77,10 +92,13 @@ pub struct DevServerManager {
     /// 进程停止后未确认清理状态表（P1-05）：并发 dev 操作互斥清理——
     /// 旧 supervised 退出后再次受理 dev/start 前必须确认清理完毕。
     pub(super) cleanup_state: Arc<Mutex<HashMap<String, CleanupStatus>>>,
-    /// 构建前捕获的 owner 期望（P3-03）：key=project_id，
-    /// value=(runtime_instance_id, revision)——构建期间 owner 被
-    /// stop/restart 时，提交按 ERR_REVISION_MISMATCH 拒绝（不自动刷新重发）。
-    pub(super) owner_expectations: Mutex<HashMap<String, (String, u64)>>,
+    /// 构建前捕获的 owner 期望（P3-03/R07）：key=project_id。构建期间 owner
+    /// 被 stop/restart 时，提交按 ERR_REVISION_MISMATCH 拒绝（不自动刷新
+    /// 重发）；观察失败（owner 在但读不到身份/凭据/状态）记录
+    /// [`OwnerExpectation::ObservationFailed`]——提交明确拒绝，不能用
+    /// "没捕获到"绕过停止屏障（R07 反例：预检断连 → 用户 Stop → 网络恢复
+    /// → 旧构建结束 → 旧提交必须被拒）。
+    pub(super) owner_expectations: Mutex<HashMap<String, OwnerExpectation>>,
     /// 在途/最近的外部 owner 停止操作（R05）：确认 Succeeded 前保留——
     /// 重试按原 operation_id 查询（幂等），不重复提交。
     pub(super) external_stops: Mutex<HashMap<String, ExternalStopRecord>>,

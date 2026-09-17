@@ -31,13 +31,17 @@ pub(crate) const ORCHESTRATOR_FAILURE_SERVICE: &str = "orchestrator";
 
 /// 编排主入口（legacy 直跑形态：一次性编排，无外部取消源）。
 pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result<()> {
-    // 直跑形态（无操作上下文）：env 兜底（R08 显式 profile 仅经 server 形态）
-    run_inner(args, runtime_status, None, None, true, dev_run_profile()).await
+    // 直跑形态（无操作上下文）：env 兜底（R08 显式 profile/凭据仅经 server 形态）
+    run_inner(args, runtime_status, None, None, true, dev_run_profile(), None).await
 }
 
 /// 编排主入口（server 形态：`cancel` 触发 = 优雅停全部子服务后 Ok 返回，
 /// 供热部署切换/容器 SIGTERM 级联停服；`on_running` 在编排完成进入 supervise
 /// 时发送一次——server 据此把相位切到 Running）。
+///
+/// `pg`：R08 每操作 PG 凭据（owner 复用时平台传入）——注入服务进程 env
+/// 的 POSTGRES_USER/PASSWORD（运行时变量 last-wins 覆盖 spec env 与进程
+/// 透传值）；None 维持既有 env。
 pub async fn run_with_cancel(
     args: CliArgs,
     runtime_status: RuntimeStatusService,
@@ -45,6 +49,7 @@ pub async fn run_with_cancel(
     on_running: Option<tokio::sync::oneshot::Sender<()>>,
     run_migrations: bool,
     dev_profile: bool,
+    pg: Option<shared_types::StartPgCredential>,
 ) -> Result<()> {
     run_inner(
         &args,
@@ -53,6 +58,7 @@ pub async fn run_with_cancel(
         on_running,
         run_migrations,
         dev_profile,
+        pg,
     )
     .await
 }
@@ -70,6 +76,7 @@ async fn run_inner(
     on_running: Option<tokio::sync::oneshot::Sender<()>>,
     run_migrations: bool,
     dev_profile: bool,
+    pg: Option<shared_types::StartPgCredential>,
 ) -> Result<()> {
     runtime_status.set_ready(false);
     // 1. 自动发现子项目 + 组装服务清单
@@ -170,6 +177,7 @@ async fn run_inner(
                 &args.workspace,
                 &args.log_dir,
                 &release.release_id,
+                pg.as_ref(),
             )
             .await
             {
@@ -567,6 +575,7 @@ async fn start_service(
     ws_root: &Path,
     log_dir: &Path,
     release_id: &str,
+    pg: Option<&shared_types::StartPgCredential>,
 ) -> Result<ManagedChild> {
     let cwd = ws_root.join(&spec.dir);
     let service_log_dir = log_dir.join(&spec.service_id);
@@ -588,9 +597,14 @@ async fn start_service(
         .env("PORT", spec.port.to_string())
         .env("APP_LOG_DIR", &service_log_dir)
         .env("APP_SERVICE_ID", &spec.service_id)
-        .env("APP_RELEASE_ID", release_id)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env("APP_RELEASE_ID", release_id);
+    // R08：每操作 PG 凭据 last-wins（运行时变量语义：覆盖 spec env 与
+    // 进程 env 透传——用户改密后的新凭据必须到达服务进程）
+    if let Some(pg) = pg {
+        cmd.env("POSTGRES_USER", &pg.username)
+            .env("POSTGRES_PASSWORD", &pg.password);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = spawn_managed(cmd)
         .with_context(|| format!("spawn {}: {}", spec.service_id, argv.join(" ")))?;
@@ -971,6 +985,81 @@ mod tests {
         assert!(message.contains("not ready within 1 seconds"), "{message}");
         assert!(message.contains("/ready"), "{message}");
     }
+    /// R08 反例：owner 复用的每操作 PG 凭据必须到达服务进程 env——
+    /// run_with_cancel(pg) → start_service 注入 POSTGRES_USER/PASSWORD
+    /// （last-wins 覆盖 spec.env 与进程透传值）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn per_operation_pg_credential_reaches_service_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        let service_dir = workspace.join("web");
+        std::fs::create_dir_all(&service_dir).unwrap();
+        let log_dir = dir.path().join("logs");
+        let dump = dir.path().join("env.dump");
+        let spec = ServiceSpec {
+            service_id: "web".into(),
+            name: "Web".into(),
+            dir: "web".into(),
+            r#type: workspace_manifest::ProjectType::Node,
+            kind: workspace_manifest::ProjectKind::Web,
+            enabled: true,
+            port: 4578,
+            devbuild: None,
+            run: RunSection {
+                // spec.env 里的旧凭据必须被运行时变量覆盖（last-wins）
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!("env | sort > '{}'; sleep 30", dump.display()),
+                ],
+                migrate: Vec::new(),
+                depends_on: Vec::new(),
+                shutdown_timeout_seconds: 0,
+            },
+            devrun: None,
+            static_content_dir: None,
+            health: Default::default(),
+            proxy: None,
+            logs: Vec::new(),
+            env: [
+                ("POSTGRES_USER".to_string(), "stale-user".to_string()),
+                ("POSTGRES_PASSWORD".to_string(), "stale-pass".to_string()),
+            ]
+            .into(),
+        };
+        let pg = shared_types::StartPgCredential {
+            username: "biz_user".into(),
+            password: "new-s3cret".into(),
+        };
+        let mut child =
+            start_service(&spec, &spec.run.command, &workspace, &log_dir, "rel-1", Some(&pg))
+                .await
+                .unwrap();
+        // 等 env dump 落盘（spawn 异步）
+        let content = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = tokio::fs::read_to_string(&dump).await
+                    && !text.is_empty()
+                {
+                    break text;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            content.lines().any(|l| l == "POSTGRES_USER=biz_user"),
+            "new username must win over spec.env; got:\n{content}"
+        );
+        assert!(
+            content.lines().any(|l| l == "POSTGRES_PASSWORD=new-s3cret"),
+            "new password must win over spec.env; got:\n{content}"
+        );
+        let _ = child.stop(Duration::from_secs(5)).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn forced_shutdown_reaps_real_child_and_confirms_group_absence() {

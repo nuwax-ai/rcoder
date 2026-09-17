@@ -76,34 +76,60 @@ impl DevServerManager {
         ))
     }
 
-    /// P3-03：构建前捕获 owner 期望（runtime_instance_id + revision）。
-    /// 构建期间 owner 被 stop/restart 推进 revision 时，后续提交按
-    /// ERR_REVISION_MISMATCH 拒绝（不自动刷新重发，防绕过用户 stop）。
-    /// 无 owner / 探测失败 → 清除既有期望（spawn 路径提交时活取）。
+    /// P3-03/R07：构建前捕获 owner 期望（三态）。
+    /// - 命中 → [`OwnerExpectation::Captured`]：构建期间 owner 被
+    ///   stop/restart 推进 revision 时，提交按 ERR_REVISION_MISMATCH 拒绝
+    ///   （不自动刷新重发，防绕过用户 stop）；
+    /// - 探测无应答且非 legacy → [`OwnerExpectation::NoOwner`]（spawn 路径
+    ///   提交时活取）；
+    /// - 观察失败（owner 在但身份/凭据/状态读不到、legacy 占位）→
+    ///   [`OwnerExpectation::ObservationFailed`]：提交明确拒绝——不能用
+    ///   "没捕获到"绕过停止屏障（R07 反例）。
     pub async fn capture_owner_expectation(&self, project_id: &str, workspace: &Path) {
-        let expectation = async {
-            let identity = owner_client::probe_owner(&self.config.app_cli_admin_probe_addr).await?;
-            let app_id = std::env::var("PROJECT_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "unknown-app".to_string());
-            let (_root, token) = owner_client::find_owner_token(workspace, &app_id)?;
-            let client =
-                owner_client::OwnerClient::new(&self.config.app_cli_admin_probe_addr, &token)
-                    .ok()?;
-            let status = client.status().await.ok()?;
-            Some((identity.runtime_instance_id, status.revision))
-        }
-        .await;
-        if let Ok(mut map) = lock(&self.owner_expectations) {
-            match expectation {
-                Some(captured) => {
-                    map.insert(project_id.to_string(), captured);
-                }
-                None => {
-                    map.remove(project_id);
+        use types::OwnerExpectation;
+        let owner_addr = self.config.app_cli_admin_probe_addr.clone();
+        let expectation = match owner_client::probe_owner(&owner_addr).await {
+            None => {
+                if start::legacy_app_cli_responds(&owner_addr).await {
+                    OwnerExpectation::ObservationFailed {
+                        reason: "admin port is held by a legacy app-cli without the runtime API"
+                            .to_string(),
+                    }
+                } else {
+                    OwnerExpectation::NoOwner
                 }
             }
+            Some(identity) => {
+                let app_id = std::env::var("PROJECT_ID")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "unknown-app".to_string());
+                match owner_client::find_owner_token(workspace, &app_id) {
+                    None => OwnerExpectation::ObservationFailed {
+                        reason: "owner is running but its runtime API credentials are unavailable"
+                            .to_string(),
+                    },
+                    Some((_root, token)) => {
+                        match owner_client::OwnerClient::new(&owner_addr, &token) {
+                            Err(error) => OwnerExpectation::ObservationFailed {
+                                reason: format!("build owner client: {error:#}"),
+                            },
+                            Ok(client) => match client.status().await {
+                                Ok(status) => OwnerExpectation::Captured {
+                                    runtime_instance_id: identity.runtime_instance_id,
+                                    revision: status.revision,
+                                },
+                                Err(error) => OwnerExpectation::ObservationFailed {
+                                    reason: format!("owner status unreadable: {error:#}"),
+                                },
+                            },
+                        }
+                    }
+                }
+            }
+        };
+        if let Ok(mut map) = lock(&self.owner_expectations) {
+            map.insert(project_id.to_string(), expectation);
         }
     }
 

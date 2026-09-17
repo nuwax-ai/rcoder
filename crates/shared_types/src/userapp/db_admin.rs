@@ -57,7 +57,7 @@ pub struct UserappDbCreateDatabaseRequest {
 ///
 /// 从 app_manager `models/start.rs` 下沉（dev 链 file-server-userapp 与 prod 链
 /// 共用同一契约；serde/ToSchema 形状不变）。
-#[derive(Debug, Deserialize, Serialize, Clone, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, utoipa::ToSchema)]
 pub struct StartPgCredential {
     /// PG 账号名（已存在角色；须过 PG 标识符白名单）
     pub username: String,
