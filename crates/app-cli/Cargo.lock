@@ -257,6 +257,7 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "uuid",
+ "windows-sys 0.59.0",
  "workspace-manifest",
  "zip 8.6.0",
 ]

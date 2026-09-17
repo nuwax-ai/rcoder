@@ -70,13 +70,12 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 infer = { version = "0.22", default-features = false }
 
 tempfile = "3"
-# 跨平台文件锁（Unix fcntl/F_SETLK, Windows LockFileEx）
-fs2 = "0.4"
 
 # Windows 文件锁（LockFileEx）和 Job Objects
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_IO",
     "Win32_System_Threading",

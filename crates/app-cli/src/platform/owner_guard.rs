@@ -3,14 +3,13 @@
 //! OwnerGuard 持有锁文件句柄，生命周期覆盖整个 owner 进程。锁文件位于
 //! 部署替换范围之外的稳定状态根（`.app-cli-state/{app_id}/owner.lock`）。
 //!
-//! 使用 fs2 crate 实现跨平台排他锁：
-//! - Unix: `fcntl(F_SETLK)` — 进程级锁，进程退出自动释放
+//! 使用 Rust 标准库文件锁（1.89 稳定）：
+//! - Unix: `flock(LOCK_EX | LOCK_NB)` — 进程级锁，进程退出自动释放
 //! - Windows: `LockFileEx` — 句柄关闭自动释放
 //!
 //! 不使用 PID 文件、端口检查或锁文件存在性作为排他依据。
 
 use anyhow::{Context, Result};
-use fs2::FileExt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -28,8 +27,9 @@ impl OwnerGuard {
     /// `state_root` 为稳定状态根目录（`.app-cli-state/{app_id}/`）。
     /// 成功返回 Guard（RAII 释放），失败返回错误（锁被占用 / 权限不足）。
     pub fn acquire(state_root: &Path) -> Result<Self> {
-        std::fs::create_dir_all(state_root)
-            .with_context(|| format!("create state root for owner lock: {}", state_root.display()))?;
+        std::fs::create_dir_all(state_root).with_context(|| {
+            format!("create state root for owner lock: {}", state_root.display())
+        })?;
         let lock_path = state_root.join("owner.lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -38,7 +38,7 @@ impl OwnerGuard {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("open owner lock file: {}", lock_path.display()))?;
-        file.try_lock_exclusive().with_context(|| {
+        file.try_lock().with_context(|| {
             format!(
                 "acquire exclusive owner lock: {} (another instance may be running)",
                 lock_path.display()
@@ -84,6 +84,49 @@ mod tests {
         assert!(root.join("owner.lock").exists());
     }
 
+    /// 跨进程锁互斥（Unix：Python `fcntl.flock` 与 std 的 flock 同一锁域）。
+    /// Windows 无 fcntl 模块——跨进程对端验证需 PowerShell/.NET，暂不覆盖。
+    #[cfg(unix)]
+    #[test]
+    fn cross_process_lock_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("state");
+        let _guard = OwnerGuard::acquire(&root).unwrap();
+
+        let root_str = root.to_str().unwrap().to_string();
+        let output = std::process::Command::new("python3")
+            .args([
+                "-c",
+                &format!(
+                    r#"
+import fcntl, sys
+try:
+    f = open('{}/owner.lock', 'r+')
+except FileNotFoundError:
+    print('lock file missing')
+    sys.exit(2)
+try:
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print('acquired')
+    sys.exit(0)
+except (BlockingIOError, OSError):
+    print('blocked')
+    sys.exit(1)
+"#,
+                    root_str
+                ),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child process must fail to acquire lock held by parent; stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// 并发子进程全部被拒（同上：Unix flock 锁域）。
+    #[cfg(unix)]
     #[test]
     fn concurrent_acquire_only_one_succeeds() {
         let dir = tempfile::tempdir().unwrap();
@@ -91,9 +134,6 @@ mod tests {
         // 本进程先获取锁
         let _guard = OwnerGuard::acquire(&root).unwrap();
 
-        // 多个子进程尝试获取同一把锁，应全部失败
-        // 使用 fcntl.lockf()——Python 的跨平台 fcntl 锁封装，
-        // 与 fs2 的 fcntl(F_SETLK) 在同一锁域。
         let root_str = root.to_str().unwrap().to_string();
         let mut children = Vec::new();
         for _ in 0..4 {
@@ -105,10 +145,10 @@ mod tests {
 import fcntl, sys
 try:
     f = open('{}/owner.lock', 'r+')
-    fcntl.lockf(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     print('acquired')
     sys.exit(0)
-except (IOError, OSError):
+except (BlockingIOError, OSError):
     print('blocked')
     sys.exit(1)
 "#,
@@ -128,39 +168,5 @@ except (IOError, OSError):
                 "child process must fail to acquire lock held by parent"
             );
         }
-    }
-
-    #[test]
-    fn cross_process_lock_enforced() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("state");
-        let _guard = OwnerGuard::acquire(&root).unwrap();
-
-        // 子进程尝试获取同一把锁应失败（使用 fcntl.lockf()，与 fs2 同一锁域）
-        let root_str = root.to_str().unwrap().to_string();
-        let output = std::process::Command::new("python3")
-            .args([
-                "-c",
-                &format!(
-                    r#"
-import fcntl, sys
-try:
-    f = open('{}/owner.lock', 'r+')
-    fcntl.lockf(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    print('acquired')
-    sys.exit(0)
-except (IOError, OSError):
-    print('blocked')
-    sys.exit(1)
-"#,
-                    root_str
-                ),
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            !output.status.success(),
-            "child process must fail to acquire lock"
-        );
     }
 }

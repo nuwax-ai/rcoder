@@ -91,9 +91,18 @@ impl RuntimeStore {
     /// 2. 缺省 `{workspace 卷根}/.app-cli-state/{application_id}`——按应用
     ///    隔离（多 app 共享卷不互踩）；entry 别名无法归一时以 env 为准。
     pub(crate) fn resolve_root(workspace: &Path, application_id: &str) -> Result<PathBuf> {
-        if let Some(explicit) =
-            std::env::var_os("APP_CLI_STATE_ROOT").filter(|value| !value.is_empty())
-        {
+        let explicit = std::env::var_os("APP_CLI_STATE_ROOT").filter(|value| !value.is_empty());
+        Self::resolve_root_with_explicit(workspace, application_id, explicit)
+    }
+
+    /// [`Self::resolve_root`] 的可参数化核心——测试以显式 env 值驱动，
+    /// 不经 `std::env::set_var`（进程级 env 变异与并行测试的 resolve 读取竞争）。
+    fn resolve_root_with_explicit(
+        workspace: &Path,
+        application_id: &str,
+        explicit: Option<std::ffi::OsString>,
+    ) -> Result<PathBuf> {
+        if let Some(explicit) = explicit.filter(|value| !value.is_empty()) {
             return Ok(PathBuf::from(explicit));
         }
         let volume_root = workspace
@@ -412,14 +421,46 @@ fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     }
     let temp = path.with_extension("tmp");
     let content = serde_json::to_vec_pretty(value).context("encode state record")?;
-    std::fs::write(&temp, &content)
-        .and_then(|_| {
-            let file = std::fs::File::open(&temp)?;
-            file.sync_all()
-        })
-        .with_context(|| format!("persist state {}", temp.display()))?;
-    std::fs::rename(&temp, path).with_context(|| format!("publish state {}", path.display()))?;
+    // Windows 实测（Defender 实时扫描）：并行状态写入时 .tmp 文件被 AV 短暂
+    // 独占（ACCESS_DENIED / SHARING_VIOLATION）——瞬时锁有界重试吸收，
+    // 重试耗尽仍失败才如实上抛（fail-closed，不静默丢状态）。
+    let mut last_error = None;
+    for attempt in 0..5u32 {
+        match write_json_once(&temp, path, &content) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_transient_windows_lock(&error) => {
+                tracing::warn!(attempt, error = %error, "state persist transiently locked; retrying");
+                last_error = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(u64::from(attempt + 1) * 20));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("state persist retries exhausted")))
+}
+
+/// 单次写入序列：同句柄 create+write+sync，drop 后再 rename——Windows 上
+/// rename 要求目标文件无打开句柄（分离的 File::open 句柄会被 AV 延迟释放）。
+fn write_json_once(temp: &Path, path: &Path, content: &[u8]) -> Result<()> {
+    {
+        let mut file = std::fs::File::create(temp)
+            .with_context(|| format!("create state temp {}", temp.display()))?;
+        std::io::Write::write_all(&mut file, content)
+            .and_then(|_| file.sync_all())
+            .with_context(|| format!("persist state {}", temp.display()))?;
+    }
+    std::fs::rename(temp, path).with_context(|| format!("publish state {}", path.display()))?;
     Ok(())
+}
+
+/// Windows AV/索引器的瞬时文件锁（ERROR_ACCESS_DENIED=5 / ERROR_SHARING_VIOLATION=32）。
+fn is_transient_windows_lock(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io_error| io_error.raw_os_error())
+            .is_some_and(|code| code == 5 || code == 32)
+    })
 }
 
 fn read_json(path: &Path) -> Result<Option<serde_json::Value>> {
@@ -1372,24 +1413,26 @@ mod tests {
         let volume = dir.path().join("vol");
         let explicit = dir.path().join("explicit-state");
         std::fs::create_dir_all(&volume).expect("volume");
-        // env 变异需要串行；用锁型测试易受并行干扰——catch_unwind + 及时清理
-        // SAFETY: 测试串行持有该 env 变异窗口，结束即恢复
-        unsafe { std::env::set_var("APP_CLI_STATE_ROOT", &explicit) };
-        let result = std::panic::catch_unwind(|| {
-            let source_workspace = volume.join("app-1");
-            let run_workspace = volume.join("app-1").join(".run");
-            std::fs::create_dir_all(&source_workspace).expect("source");
-            std::fs::create_dir_all(&run_workspace).expect("run");
-            let r1 = RuntimeStore::resolve_root(&source_workspace, "app-1").expect("root1");
-            let r2 = RuntimeStore::resolve_root(&run_workspace, "app-1").expect("root2");
-            assert_eq!(r1, r2, "alias entries must resolve the same explicit root");
-            assert_eq!(r1, explicit);
-        });
-        // SAFETY: 同上
-        unsafe { std::env::remove_var("APP_CLI_STATE_ROOT") };
-        let Ok(()) = result else {
-            panic!("explicit root unification failed");
-        };
+        // 经参数化核心驱动（不 set_var）——进程级 env 变异会与并行测试的
+        // resolve_root 读取竞争（Windows 实测随机 os error 2/3/183）。
+        let source_workspace = volume.join("app-1");
+        let run_workspace = volume.join("app-1").join(".run");
+        std::fs::create_dir_all(&source_workspace).expect("source");
+        std::fs::create_dir_all(&run_workspace).expect("run");
+        let r1 = RuntimeStore::resolve_root_with_explicit(
+            &source_workspace,
+            "app-1",
+            Some(explicit.clone().into_os_string()),
+        )
+        .expect("root1");
+        let r2 = RuntimeStore::resolve_root_with_explicit(
+            &run_workspace,
+            "app-1",
+            Some(explicit.clone().into_os_string()),
+        )
+        .expect("root2");
+        assert_eq!(r1, r2, "alias entries must resolve the same explicit root");
+        assert_eq!(r1, explicit);
     }
 
     #[tokio::test]
