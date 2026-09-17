@@ -56,7 +56,7 @@ ENV SWAGGER_UI_DOWNLOAD_URL=file:///build/deps/swagger-ui-v5.17.14.zip
 
 # 🔧 支持 CARGO_FLAGS 参数，允许外部传递 feature flags
 ARG CARGO_FLAGS
-# tokio-console 观测模式用（AGENT_CONSOLE=1 时传入 --cfg tokio_unstable）
+# dial9 feature 在列时由 make/docker.mk 传入 --cfg tokio_unstable（全量 task 覆盖）
 ARG RUSTFLAGS=""
 ENV RUSTFLAGS="${RUSTFLAGS}"
 RUN echo "🔧 Cargo flags: ${CARGO_FLAGS}" && \

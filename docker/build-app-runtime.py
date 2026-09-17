@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def prepare_context(root, destination):
     def ignored(directory, names):
-        return [name for name in names if name in {'target', 'target-console', 'node_modules', '.git', 'reports', '__pycache__'} or name.startswith('.env')]
+        return [name for name in names if name in {'target', 'target-console', 'target-unstable', 'node_modules', '.git', 'reports', '__pycache__'} or name.startswith('.env')]
     for filename in ['Cargo.toml', 'Cargo.lock']:
         shutil.copy2(root / filename, destination / filename)
     for directory in ['crates', 'tests-e2e']:

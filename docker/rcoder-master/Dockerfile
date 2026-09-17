@@ -57,8 +57,12 @@ RUN mkdir -p /usr/local/cargo && \
 COPY . .
 
 # 🔧 支持 CARGO_FLAGS 参数，允许外部传递 feature flags
+# RUSTFLAGS：dial9 feature 在 CARGO_FLAGS 中时由 make/docker.mk 传入
+# --cfg tokio_unstable（runtime hooks 全量 task 覆盖必需）
 ARG CARGO_FLAGS=""
-RUN echo "🔧 Cargo flags: ${CARGO_FLAGS}" && \
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS="${RUSTFLAGS}"
+RUN echo "🔧 Cargo flags: ${CARGO_FLAGS} RUSTFLAGS: ${RUSTFLAGS}" && \
     cargo build --release --bin rcoder --bin agent_runner ${CARGO_FLAGS}
 
 # ============================================================================

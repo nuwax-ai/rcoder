@@ -50,17 +50,23 @@ docker-build-master:
 	fi
 	@python3 docker/master-base-contract.py check dev-master-rcoder-base:latest
 	@echo "📦 使用 Dockerfile 多阶段构建（基于基础镜像）..."
-	@# 🔧 根据 CARGO_FEATURES 决定是否启用 eBPF 调试
+	@# 🔧 根据 CARGO_FEATURES 决定调试 feature 集；dial9 在列时附带 tokio_unstable
 	@(if [ "$(CARGO_FEATURES)" != "" ]; then \
 		MASTER_CARGO_FLAGS="$(CARGO_FEATURES)"; \
-		echo "🔧 master-rcoder 将启用 eBPF 调试模式"; \
+		echo "🔧 master-rcoder 将启用调试 features"; \
 	else \
 		MASTER_CARGO_FLAGS=""; \
-		echo "🔒 master-rcoder 生产模式（无 eBPF 调试）"; \
+		echo "🔒 master-rcoder 生产模式（无调试 features）"; \
+	fi; \
+	if echo "$(CARGO_FEATURES)" | grep -q "dial9"; then \
+		DIAL9_RUSTFLAGS="--cfg tokio_unstable"; \
+	else \
+		DIAL9_RUSTFLAGS=""; \
 	fi; \
 	docker build \
 		--build-arg BASE_IMAGE=dev-master-rcoder-base:latest \
 		--build-arg CARGO_FLAGS="$$MASTER_CARGO_FLAGS" \
+		--build-arg RUSTFLAGS="$$DIAL9_RUSTFLAGS" \
 		--build-arg CACHEBUST=$(AGENT_TOOLS_CACHE_KEY) \
 		-f docker/rcoder-master/Dockerfile -t dev-master-rcoder:latest .;)
 	@echo "✅ master-rcoder 镜像构建完成！"
@@ -96,28 +102,32 @@ docker-build-master-base:
 # ⚠️  注意：添加新的调试 feature 时，必须同步更新此列表！
 #
 # 当前启用的调试 features：
-#   - ebpf-debug    (docker_manager, rcoder): eBPF 诊断工具
-#   - pyroscope     (agent_runner):         性能分析 (CPU/Memory)
 #   - otel          (agent_runner):         OpenTelemetry 追踪
 #   - debug         (rcoder):               调试路由
 #   - hotpath       (rcoder, agent_runner): 本地性能剖析（本地 dev 默认开启；见下方说明与 AGENTS.md）
+#   - dial9         (rcoder, agent_runner): 事件级 Tokio tracing（运行期 DIAL9_ENABLED 开关，
+#                                           见 docs/observability.md dial9 节）
 #   - proxy         (agent_runner):         Pingora + 模型密钥代理（可选；见下方说明）
 #   - kubernetes    (rcoder, docker_manager): Kubernetes 运行时支持
 #   - http-server   (agent_runner):         HTTP REST API 服务（默认启用）
 #   - grpc-server   (agent_runner):         gRPC 服务（默认启用）
 #
+# dial9 feature 在 features 列表中时，下方构建步骤自动附带 RUSTFLAGS="--cfg
+# tokio_unstable"（全量 task 覆盖必需；生产 CARGO_FEATURES 为空则不传，零影响）。
+# ebpf-debug/pyroscope 已随 Pyroscope/eBPF 链下线移除（2026-09 批次1）。
+#
 # proxy 默认关闭：子进程会收到真实 MODEL_PROVIDER API key/base_url（如 nuwax-codex-acp 本地鉴权）。
 # 需要密钥经 Pingora 注入时，构建前设置例如：
-#   make dev-restart CARGO_FEATURES='--features ebpf-debug,pyroscope,otel,debug,proxy'
+#   make dev-restart CARGO_FEATURES='--features otel,debug,proxy'
 #
 # hotpath 默认开启基础档（函数耗时/路由剖析/runtime 指标；容器内 6770/6771 绑 127.0.0.1，
 # 观测方式见 AGENTS.md「AI 调试路由」）。按需叠加内存剖析 / MCP 档，构建前设置例如：
-#   make dev-restart CARGO_FEATURES='--features ebpf-debug,pyroscope,otel,debug,hotpath,hotpath-alloc'
-# 生产构建（build-agent-docker）不含 hotpath，零影响。
+#   make dev-restart CARGO_FEATURES='--features otel,debug,hotpath,hotpath-alloc'
+# 生产构建（build-agent-docker）不含 hotpath/dial9，零影响。
 #
 # 本地开发调试默认开启上述功能（http-server / grpc-server 仍由 agent_runner 默认 features 提供）
 # 注意：kubernetes feature 仅用于 K8s 环境，Docker Compose 模式不要启用
-CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug,hotpath
+CARGO_FEATURES ?= --features otel,debug,hotpath,dial9
 # Explicitly bump to refresh external agent tools; routine Rust builds reuse them.
 AGENT_TOOLS_CACHE_KEY ?= 1
 
@@ -150,22 +160,20 @@ docker-build-agent-runner:
 			echo "Builder/runtime toolchain verification failed; inspect the diagnostic above. Rebuild or select compatible images only if a version mismatch is reported"; exit 1; }; \
 	fi
 	@echo "📦 步骤1: 在 debian:12 环境中构建 agent_runner 二进制（确保 GLIBC 版本兼容）..."
-	@# 🔧 调试模式：默认启用 ebpf-debug feature，允许使用 eBPF 诊断工具
 	@echo "🔧 Cargo features: $(CARGO_FEATURES)"
 	@# 计算业务代码哈希，只有代码变化时才重新编译（系统依赖和 Rust 安装保持缓存）
 	$(eval CRATES_HASH := $(shell python3 docker/cargo-source-hash.py))
 	@echo "🔑 业务代码哈希: $(CRATES_HASH)"
-	@# 🔥 关键修改：通过 CARGO_FEATURES 变量控制
-	@# tokio-console 观测模式：AGENT_CONSOLE=1 时传 tokio_unstable RUSTFLAGS +
-	@# console feature（见 docs/console.md；普通构建零开销不传）
-	@if [ "$(AGENT_CONSOLE)" = "1" ]; then \
-		CONSOLE_RUSTFLAGS="--cfg tokio_unstable"; CONSOLE_FEATURES="console"; \
+	@# dial9 在 CARGO_FEATURES 中时传 tokio_unstable RUSTFLAGS（全量 task 覆盖必需；
+	@# feature 本身已在 CARGO_FEATURES 里；普通/生产构建零开销不传）
+	@if echo "$(CARGO_FEATURES)" | grep -q "dial9"; then \
+		DIAL9_RUSTFLAGS="--cfg tokio_unstable"; \
 	else \
-		CONSOLE_RUSTFLAGS=""; CONSOLE_FEATURES=""; \
+		DIAL9_RUSTFLAGS=""; \
 	fi; \
 	docker build --build-arg CRATES_HASH=$(CRATES_HASH) \
-		--build-arg CARGO_FLAGS="$(CARGO_FEATURES) $$CONSOLE_FEATURES" \
-		--build-arg RUSTFLAGS="$$CONSOLE_RUSTFLAGS" \
+		--build-arg CARGO_FLAGS="$(CARGO_FEATURES)" \
+		--build-arg RUSTFLAGS="$$DIAL9_RUSTFLAGS" \
 		-f docker/rcoder-agent-runner/Dockerfile.build -t dev-rcoder-agent-runner-build .
 	@echo "📦 步骤2: 复制二进制文件到 agent-runner 目录..."
 	@# 创建容器并复制 agent_runner 二进制文件

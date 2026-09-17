@@ -40,17 +40,19 @@ fi
 
 # 3. 增量编译 rcoder binary（release；cargo target volume 持久化 → 增量）
 cd "$SRC_DIR"
-# tokio-console 恒编入（独立 target-console 目录——RUSTFLAGS 与普通缓存指纹
-# 不同，隔离避免交替全量重编；恒定后不再切换，无重编代价）。启用与否是
-# 运行期 DEV_CONSOLE env（默认关），经 `make console-on/off` 重建容器切换，
-# 功能切换不再触发重编。宿主机连 localhost:6669。
-# hotpath 同恒编入（本地 dev 默认观测；docker restart 的 SIGTERM → graceful
-# shutdown 自动落报告，见 AGENTS.md「AI 调试路由」）。feature 集首次从
-# console → console,hotpath 变化会触发一次全量重编，之后恒定无重编代价。
-echo "🔨 cargo build --release --bin rcoder --features console,hotpath（tokio-console + hotpath 恒编入；独立 target）..."
+# dial9 恒编入（独立 target-unstable 目录——tokio_unstable RUSTFLAGS 与普通
+# 缓存指纹不同，隔离避免交替全量重编；恒定后不再切换，无重编代价）。
+# 启用与否是运行期 DIAL9_ENABLED env（默认关=纯 passthrough 零开销），经
+# `make dial9-on/off` 重建容器切换，功能切换不触发重编。
+# trace 落 /app/logs/dial9（compose 挂载 → 宿主 docker/logs/dial9），离线
+# `make dial9-view` 查看。hotpath 同恒编入（本地 dev 默认观测；docker
+# restart 的 SIGTERM → graceful shutdown 自动落报告，见 AGENTS.md「AI 调试
+# 路由」）。feature 集首次从 console,hotpath → hotpath,dial9 变化会触发
+# 一次全量重编，之后恒定无重编代价。
+echo "🔨 cargo build --release --bin rcoder --features hotpath,dial9（hotpath + dial9 恒编入；独立 target）..."
 export RUSTFLAGS="--cfg tokio_unstable"
-export CARGO_TARGET_DIR="$SRC_DIR/target-console"
-cargo build --release --bin rcoder --features console,hotpath
+export CARGO_TARGET_DIR="$SRC_DIR/target-unstable"
+cargo build --release --bin rcoder --features hotpath,dial9
 BIN_SRC="$CARGO_TARGET_DIR/release/rcoder"
 # start-rcoder.sh 优先用 /app/src/target/release/rcoder——必须清掉另一模式的
 # 旧产物，否则新二进制（/app/bin/rcoder）被跳过（8/19 陈旧产物事故同款坑）

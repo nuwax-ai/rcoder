@@ -267,6 +267,26 @@ impl<'a> AgentContainerStarter<'a> {
         // 部署模式标识: start-up.sh 据此 source extra (Docker Compose 下 /home/user 是 bind mount, 需修权限)
         builder = builder.env("DEPLOY_MODE", "docker");
 
+        // dial9 事件级 tracing 转发：rcoder 主进程 DIAL9_ENABLED 开启（与 dial9
+        // 布尔解析同集）时透传全部 DIAL9_* 给 agent 容器（agent_runner 恒编入
+        // dial9 feature，关闭时纯 passthrough 零开销）。DIAL9_TRACE_DIR 不透传：
+        // rcoder 的 /app/logs/dial9 在 agent 容器内不可见，agent 侧固定写
+        // /app/container-logs/dial9（bind 宿主，CONTAINER_LOGS_DIR 同源），宿主
+        // 可直接 `dial9 serve --local-dir` 查看。
+        if std::env::var("DIAL9_ENABLED").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "t" | "true" | "1" | "y" | "yes" | "on"
+            )
+        }) {
+            for (key, value) in std::env::vars() {
+                if key.starts_with("DIAL9_") && key != "DIAL9_TRACE_DIR" {
+                    builder = builder.env(key, value);
+                }
+            }
+            builder = builder.env("DIAL9_TRACE_DIR", "/app/container-logs/dial9");
+        }
+
         // UserappBuilder 挂载压平契约 env（与 mounts.rs 三 bind 挂载点绑定, 值为
         // shared_types::paths 单一事实源; 最后设置覆盖 config environment——否则
         // PGDATA 落 overlay, builder 重建丢库）。PGDATA/DBX_DATA_DIR 使 dev 数据

@@ -9,6 +9,7 @@
 tests/sse_e2e/results
 __pycache__/
 /target-console
+/target-unstable
 docker/app-runtime-base/downloads/
 
 .classpath
@@ -51,6 +52,7 @@ tests/userapp_e2e_local/
 tests-e2e/reports/
 target-console/debug/build/ahash-8c244d12b1e0d55d/invoked.timestamp
 target-console/
+target-unstable/
 target-splitcheck/
 target-tssync/
 # UserApp control storage (database, WAL, SHM and instance lock).

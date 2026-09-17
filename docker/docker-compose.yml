@@ -5,7 +5,6 @@ services:
     ports:
       - "${RCODER_PORT:-8090}:${RCODER_PORT:-8090}"
       - "8089:8088" # Pingora 反向代理端口（VNC 代理、健康检查等）
-      - "6669:6669" # tokio-console 观测（make console-on 运行期启用）
       - "8199:80"
       - "60000:60000" # file-server 分流代理入口（all_rust → 主端口; K8s 形态同构缩小版）
       - "7681:7681" # ttyd Web 终端端口
@@ -20,15 +19,13 @@ services:
       # 也要求注入——启用协调器而缺令牌会启动 fail-fast）
       - RCODER_PREVIEW_INTERNAL_TOKEN=${RCODER_PREVIEW_INTERNAL_TOKEN:-local-dev-preview-token-0123456789}
       - RUST_LOG=debug,bollard=info,h2=info,hyper=info,tonic=info # debug 基线 + 收敛三方库噪声（bollard 全量 inspect JSON dump / h2 帧日志）
-      # tokio-console 运行期开关（console feature 恒编入 binary；仅 DEV_CONSOLE=1 时
-      # 注入 ConsoleLayer + EnvFilter 放行 tokio/runtime trace）。默认关：console-
-      # subscriber 对 tokio 微观事件无背压记账，rcoder 后台事件量下 RSS 数十 MB/s
-      # 爬升直至 OOM——用时 `make console-on`，用完 `make console-off`
-      - DEV_CONSOLE=${DEV_CONSOLE:-0}
-      # console 开启时的已完成任务保留窗口（Aggregator 表内存 = 最近 N 分钟记录量；
-      # 库默认 1h 在本进程事件速率下必然 OOM，5 分钟是观测价值与内存的平衡点）
-      - TOKIO_CONSOLE_RETENTION=${TOKIO_CONSOLE_RETENTION:-300}
-      # console layer 是 per-layer filter，但静态 level hint 需要全局放行
+      # dial9 事件级 Tokio tracing 运行期开关（dial9 feature 恒编入 dev binary；
+      # DIAL9_ENABLED=1 时 recorder 落盘分段 trace，默认 0=纯 passthrough 零开销）。
+      # 用 `make dial9-on` 启用 / `make dial9-off` 关闭 / `make dial9-view` 查看；
+      # trace 落 /app/logs/dial9（下方 logs 挂载 → 宿主 docker/logs/dial9）。
+      # 开启时同步透传 DIAL9_* 给新建 agent 容器（agent_container_starter）。
+      - DIAL9_ENABLED=${DIAL9_ENABLED:-0}
+      - DIAL9_TRACE_DIR=/app/logs/dial9
       # 控制台日志 JSON 化（B4）：1=stdout 单行 JSON（root trace_id，复用文件层
       # formatter）+ 拦两种 OTel 噪声拼写；0=ANSI 文本（默认，线上零影响）。
       # B5 起 stdout 重定向进 /app/logs/rcoder.log 时，fluent-bit 即采到结构化日志
@@ -90,8 +87,8 @@ services:
       - rcoder-cargo-git:/root/.cargo/git
       # cargo target 缓存（独立 volume，避免 bind mount 拖慢 target 小文件 IO）
       - rcoder-target:/app/src/target
-      # tokio-console 观测构建的独立 target（RUSTFLAGS 指纹隔离，见 dev-hot-build.sh）
-      - rcoder-target-console:/app/src/target-console
+      # tokio_unstable 构建的独立 target（dial9 hooks 全量覆盖；RUSTFLAGS 指纹隔离，见 dev-hot-build.sh）
+      - rcoder-target-unstable:/app/src/target-unstable
     command: ["/bin/bash", "/app/start-rcoder.sh"]
     healthcheck:
       test:
@@ -257,6 +254,6 @@ volumes:
   rcoder-cargo-registry:
   rcoder-cargo-git:
   rcoder-target:
-  rcoder-target-console:
+  rcoder-target-unstable:
   # TS nuwax-file-server 的 node_modules 缓存（容器重启不重装）
   rcoder-ts-npm:

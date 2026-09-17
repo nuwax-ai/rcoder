@@ -67,6 +67,7 @@ target-console/
 # 其余构建/同步产物（曾致 3GB+ 上下文）
 target-tssync/
 target-console/
+target-unstable/
 fuzz/
 .remote-k8s/
 .devspace/
