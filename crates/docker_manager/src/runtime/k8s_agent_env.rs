@@ -128,6 +128,30 @@ pub(crate) fn build_agent_env_vars(
             merged_env.remove(var);
         }
     }
+    // B03：managed owner 注入链补全。灰度开关=service env 显式
+    // APP_CLI_MANAGED=1（ops 级部署决策，非按请求）——开启时自动补：
+    // - APP_CLI_RUNTIME_WORKSPACE：真实 workspace（解包根 code/），
+    //   取代包装脚本缺省 empty（不再出现 empty owner 抢 3010）；
+    // - APP_CLI_DEPLOY_TOKEN：按创建生成的部署凭据——owner 落盘状态根
+    //   （共享卷），file-server 经 R09 同一解析契约读取提交运行操作；
+    //   token 不入日志/事件/描述。
+    // 关闭（缺省）不注入：包装脚本 no-op，legacy 行为不变。
+    if matches!(service_type, ServiceType::UserappBuilder)
+        && merged_env
+            .get("APP_CLI_MANAGED")
+            .is_some_and(|value| value == "1")
+    {
+        env_vars.push(EnvVar {
+            name: "APP_CLI_RUNTIME_WORKSPACE".to_string(),
+            value: Some(shared_types::paths::app_code_root(&project_id_for_env)),
+            ..Default::default()
+        });
+        env_vars.push(EnvVar {
+            name: "APP_CLI_DEPLOY_TOKEN".to_string(),
+            value: Some(uuid::Uuid::new_v4().simple().to_string()),
+            ..Default::default()
+        });
+    }
     for (k, v) in &merged_env {
         if RESERVED.contains(&k.as_str()) {
             continue;
@@ -193,4 +217,92 @@ pub(crate) fn build_agent_env_vars(
         });
     }
     env_vars
+}
+
+#[cfg(all(test, feature = "kubernetes"))]
+mod b03_tests {
+    use super::*;
+    use container_runtime_api::ContainerCreateParams;
+
+    fn params() -> ContainerCreateParams {
+        ContainerCreateParams::builder()
+            .builder_app_id("app-b03".to_string())
+            .build()
+    }
+
+    fn k8s_service(managed: bool) -> K8sServiceConfig {
+        let mut config = K8sServiceConfig {
+            service_type: ServiceType::UserappBuilder,
+            image: None,
+            arm64_image: None,
+            amd64_image: None,
+            default_image: None,
+            image_tag_prefix: None,
+            enabled: true,
+            environment: std::collections::HashMap::new(),
+            command: vec![],
+            workspace_resolution_path: None,
+            resource_limits: shared_types::ServiceResourceLimits::default(),
+            volumes: vec![],
+            volume_mounts: vec![],
+            sidecars: vec![],
+        };
+        if managed {
+            config
+                .environment
+                .insert("APP_CLI_MANAGED".to_string(), "1".to_string());
+        }
+        config
+    }
+
+    fn value_of(vars: &[EnvVar], name: &str) -> Option<String> {
+        vars.iter()
+            .find(|var| var.name == name)
+            .and_then(|var| var.value.clone())
+    }
+
+    /// B03：service env 显式 APP_CLI_MANAGED=1 → 注入链补全（真实
+    /// workspace + 部署凭据），关闭（缺省）不注入。
+    #[test]
+    fn managed_switch_completes_owner_injection_chain() {
+        let base = params();
+        // 关闭（缺省）：无 workspace/token 注入（包装脚本 no-op）
+        let off = build_agent_env_vars(
+            "app-b03",
+            "u1",
+            "userapp-builder",
+            &ServiceType::UserappBuilder,
+            None,
+            Some(&k8s_service(false)),
+            &base,
+        );
+        assert!(value_of(&off, "APP_CLI_RUNTIME_WORKSPACE").is_none());
+        assert!(value_of(&off, "APP_CLI_DEPLOY_TOKEN").is_none());
+        assert_eq!(
+            value_of(&off, "APP_CLI_STATE_ROOT").as_deref(),
+            Some("/home/user/app-b03/state/app-b03"),
+            "state root注入不受开关影响（R07 既有行为）"
+        );
+
+        // 开启：workspace=解包根 code/，token 生成非空
+        let on = build_agent_env_vars(
+            "app-b03",
+            "u1",
+            "userapp-builder",
+            &ServiceType::UserappBuilder,
+            None,
+            Some(&k8s_service(true)),
+            &base,
+        );
+        assert_eq!(
+            value_of(&on, "APP_CLI_RUNTIME_WORKSPACE").as_deref(),
+            Some("/home/user/app-b03/code"),
+            "managed 开启必须注入真实 workspace（不是包装脚本缺省 empty）"
+        );
+        let token = value_of(&on, "APP_CLI_DEPLOY_TOKEN").expect("token injected");
+        assert!(
+            !token.trim().is_empty() && token.len() >= 32,
+            "token={token}"
+        );
+    }
 }
