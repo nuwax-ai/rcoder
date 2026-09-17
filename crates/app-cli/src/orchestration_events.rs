@@ -41,9 +41,29 @@ pub fn emit(event: &OrchestrationEvent) {
     let Ok(json) = serde_json::to_string(event) else {
         return;
     };
+    // R06 事件桥：owner（serve）形态下同步转发到运行事件 journal——
+    // 复用 owner 的平台侧经运行 API 读事件流，读不到本进程 stdout。
+    // stdout 仍是本地 spawn 路径（file-server 管道）的唯一通道，行为不变。
+    if let Some(bridge) = bridge() {
+        bridge(json.clone());
+    }
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{EVT_PREFIX}{json}");
     let _ = out.flush();
+}
+
+/// 进程内事件桥（server 形态安装；直跑/测试形态为 None）。
+/// 携带 EVT 行的裸 JSON（无前缀）——桥接方自行解析 service/event 字段。
+static EVENT_BRIDGE: std::sync::OnceLock<Box<dyn Fn(String) + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// 安装进程内事件桥（幂等：首次安装生效）。
+pub fn install_bridge(bridge: Box<dyn Fn(String) + Send + Sync>) {
+    let _ = EVENT_BRIDGE.set(bridge);
+}
+
+fn bridge() -> Option<&'static (dyn Fn(String) + Send + Sync)> {
+    EVENT_BRIDGE.get().map(|f| f.as_ref())
 }
 
 #[cfg(test)]

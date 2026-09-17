@@ -42,6 +42,8 @@ use support::lock;
 
 impl DevServerManager {
     /// restart-dev = stop + start（`hooks`/`pg` 语义同 [`Self::start_dev`]）。
+    /// UserApp manifest 域（userapp: 前缀 key）停止走 [`Self::stop_userapp_dev`]
+    /// （R05：managed 域不 ps 扫描）；web 域维持 stop_dev。
     pub async fn restart_dev(
         &self,
         project_id: &str,
@@ -50,7 +52,11 @@ impl DevServerManager {
         hooks: Option<DevEventHooks>,
         pg: Option<&shared_types::StartPgCredential>,
     ) -> AppResult<StartedDev> {
-        self.stop_dev(project_id).await?;
+        if project_id.starts_with("userapp:") {
+            self.stop_userapp_dev(project_id, project_path).await?;
+        } else {
+            self.stop_dev(project_id).await?;
+        }
         self.start_dev(project_id, project_path, base_path, hooks, pg)
             .await
     }

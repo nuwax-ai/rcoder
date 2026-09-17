@@ -474,6 +474,7 @@ impl DevServerManager {
         // P3-03：构建前捕获的期望优先（构建期间 owner 变更 → 提交被拒，
         // 不自动刷新重发）；未捕获（直接 start 无构建段）→ 提交时活取。
         let expected = lock(&self.owner_expectations)?.remove(project_id);
+        let hooks_line_for_drain = hooks.as_ref().map(|hooks| hooks.on_line.clone());
         let route_restart = async {
             let (expected_instance, expected_revision) = match expected {
                 Some(captured) => captured,
@@ -491,46 +492,77 @@ impl DevServerManager {
                     &expected_instance,
                 )
                 .await?;
-            // P3-03：SSE 事件转发（operation 事件 → 旧 EVT 形态 → hooks，
-            // 与 stdout 管道同构）；终态后中止流任务
+            // R06：事件转发（游标重放轮询，替换 SSE 长连——无总超时/EOF 竞态，
+            // 断线续传天然支持）
             let events_client = super::owner_client::OwnerClient::new(&owner_addr, &token)?;
-            let hooks_line = hooks.map(|hooks| hooks.on_line);
+            let hooks_line = hooks.as_ref().map(|hooks| hooks.on_line.clone());
+            let stop_token = tokio_util::sync::CancellationToken::new();
+            let cursor = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let stream_operation_id = operation_id.clone();
-            let stream_task = tokio::spawn(async move {
-                let forward = move |json: String| {
-                    if let Some(on_line) = hooks_line.as_ref() {
-                        on_line(&json);
-                    }
-                };
-                if let Err(error) = super::owner_client::stream_events(
-                    &events_client,
-                    &stream_operation_id,
-                    forward,
-                )
-                .await
-                {
-                    tracing::warn!("owner event stream ended: {error:#}");
+            let stream_task = tokio::spawn({
+                let stop_token = stop_token.clone();
+                let cursor = cursor.clone();
+                async move {
+                    let forward = move |json: String| {
+                        if let Some(on_line) = hooks_line.as_ref() {
+                            on_line(&json);
+                        }
+                    };
+                    super::owner_client::forward_operation_events(
+                        &events_client,
+                        &stream_operation_id,
+                        forward,
+                        &stop_token,
+                        &cursor,
+                        Duration::from_millis(250),
+                    )
+                    .await;
                 }
             });
             let terminal = client
                 .wait_terminal(&operation_id, Duration::from_secs(180))
                 .await;
-            stream_task.abort();
+            // R06：终态先停转发并 join（不 abort——游标一致无重复投递），
+            // 再按游标排空剩余事件——终态事件在状态可见后才落 journal，
+            // 盲目中止会丢平台的 Done 终局。
+            stop_token.cancel();
+            let _joined = stream_task.await;
+            if terminal.is_ok()
+                && let Some(on_line) = hooks_line_for_drain.clone()
+            {
+                let last = cursor.load(std::sync::atomic::Ordering::SeqCst);
+                if let Err(error) = super::owner_client::drain_operation_events(
+                    &client,
+                    &operation_id,
+                    last,
+                    |json| on_line(&json),
+                )
+                .await
+                {
+                    tracing::warn!("owner terminal event drain failed: {error:#}");
+                }
+            }
             terminal
         };
         let view = route_restart
             .await
             .map_err(|error| AppError::business(format!("reuse existing owner: {error:#}")))?;
-        if !matches!(
-            view.state,
-            shared_types::RuntimeOperationState::Succeeded
-                | shared_types::RuntimeOperationState::Cancelled
-        ) {
-            return Err(AppError::business(format!(
-                "owner restart failed: {:?} ({})",
-                view.state,
-                view.error_message.as_deref().unwrap_or("no detail"),
-            )));
+        match view.state {
+            shared_types::RuntimeOperationState::Succeeded => {}
+            // R04：Cancelled 不等价成功——启动被取消既不证明编排成功也无运行
+            // 证据，不登记 external（重试按新操作提交）。
+            shared_types::RuntimeOperationState::Cancelled => {
+                return Err(AppError::business(format!(
+                    "owner restart was cancelled (operation {}); service start not confirmed",
+                    view.operation_id
+                )));
+            }
+            other => {
+                return Err(AppError::business(format!(
+                    "owner restart failed: {other:?} ({})",
+                    view.error_message.as_deref().unwrap_or("no detail"),
+                )));
+            }
         }
 
         // 登记 external DevProcess：停止/后续操作经运行 API 路由
@@ -555,6 +587,8 @@ impl DevServerManager {
                 }),
             },
         );
+        // R05：external 控制关系持久化——file-server 重启后 stop 仍路由同一 owner
+        self.persist_external_state();
         Ok(Some(StartedDev {
             pid: 0,
             port: shared_types::APP_ENTRY_PORT,
@@ -837,17 +871,29 @@ mod owner_reuse_tests {
             .expect("reuse path")
             .expect("must reuse existing owner");
         assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
-        // P3-03：SSE 事件转发为旧 EVT 形态（event_name 记录送达；
-        // 无 event_name 的纯 stage 记录被跳过）
-        let got_completed = {
+        // R06：事件按游标重放转发为旧 EVT 形态——服务级事件透传、纯 stage
+        // 记录跳过、终态 Completed 映射为平台 orchestration_done（真实 owner
+        // 成功也产生 Done 终局）
+        let (got_done, got_service) = {
             let events = received.lock().unwrap();
-            events
-                .iter()
-                .any(|json| json.contains("\"event\":\"Completed\""))
+            (
+                events.iter().any(|json| {
+                    json.contains("\"event\":\"orchestration_done\"")
+                        && json.contains("\"failed\":[]")
+                }),
+                events.iter().any(|json| {
+                    json.contains("\"event\":\"service_starting\"") && json.contains("\"frontend\"")
+                }),
+            )
         };
         assert!(
-            got_completed,
-            "legacy Completed event must be forwarded via hooks; got {:?}",
+            got_done,
+            "terminal Completed must map to orchestration_done with empty failed; got {:?}",
+            received.lock().unwrap()
+        );
+        assert!(
+            got_service,
+            "service events must pass through; got {:?}",
             received.lock().unwrap()
         );
         {
@@ -976,23 +1022,31 @@ mod owner_reuse_tests {
                 ),
             )
             .route(
-                "/v1/runtime/operations/{id}/events/stream",
+                "/v1/runtime/operations/{id}/events",
                 axum::routing::get(
-                    |axum::extract::Path(id): axum::extract::Path<String>| async move {
-                        // typed 构造事件记录：带 event_name（转发为旧 EVT）
-                        // + 无 event_name 的纯 stage（适配层跳过）
-                        let records = [
+                    |axum::extract::Path(id): axum::extract::Path<String>,
+                     axum::extract::Query(query): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move {
+                        // typed 构造事件记录（R06 重放端点契约：after_seq 游标）：
+                        // 服务级事件透传 + 无 event_name 的纯 stage（适配层跳过）
+                        // + 终态 Completed（映射为平台 orchestration_done）
+                        let after: u64 = query
+                            .get("after_seq")
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0);
+                        let all = [
                             RuntimeEventRecord {
                                 operation_id: id.clone(),
                                 sequence: 1,
                                 runtime_instance_id: "instance-test".to_string(),
-                                stage: "terminal".to_string(),
-                                service: None,
-                                event_name: Some("Completed".to_string()),
+                                stage: "service".to_string(),
+                                service: Some("frontend".to_string()),
+                                event_name: Some("service_starting".to_string()),
                                 payload: None,
                             },
                             RuntimeEventRecord {
-                                operation_id: id,
+                                operation_id: id.clone(),
                                 sequence: 2,
                                 runtime_instance_id: "instance-test".to_string(),
                                 stage: "stage-only".to_string(),
@@ -1000,20 +1054,24 @@ mod owner_reuse_tests {
                                 event_name: None,
                                 payload: None,
                             },
+                            RuntimeEventRecord {
+                                operation_id: id.clone(),
+                                sequence: 3,
+                                runtime_instance_id: "instance-test".to_string(),
+                                stage: "terminal".to_string(),
+                                service: None,
+                                event_name: Some("Completed".to_string()),
+                                payload: None,
+                            },
                         ];
-                        let body = records
-                            .iter()
-                            .map(|record| {
-                                format!(
-                                    "data: {}\n\n",
-                                    serde_json::to_string(record).expect("serialize event")
-                                )
-                            })
-                            .collect::<String>();
-                        axum::response::Response::builder()
-                            .header("content-type", "text/event-stream")
-                            .body(axum::body::Body::from(body))
-                            .expect("sse response")
+                        let events: Vec<_> = all
+                            .into_iter()
+                            .filter(|record| record.sequence > after)
+                            .collect();
+                        axum::Json(envelope(&serde_json::json!({
+                            "operation_id": id,
+                            "events": events,
+                        })))
                     },
                 ),
             )

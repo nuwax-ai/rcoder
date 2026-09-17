@@ -199,6 +199,45 @@ impl OwnerClient {
         serde_json::from_value(data).context("decode operation view")
     }
 
+    /// 按 after_seq 游标重放操作事件（R06：端点是有限重放非长连流——
+    /// 轮询 + 游标天然支持断线续传，无 SSE 总超时/EOF 竞态问题）。
+    pub(super) async fn events_after(
+        &self,
+        operation_id: &str,
+        after_seq: u64,
+    ) -> Result<Vec<shared_types::RuntimeEventRecord>> {
+        let url = format!(
+            "http://{}/v1/runtime/operations/{operation_id}/events?after_seq={after_seq}",
+            self.address
+        );
+        let response = self
+            .client
+            .get(&url)
+            .header("X-Deploy-Token", &self.token)
+            .send()
+            .await
+            .with_context(|| format!("replay events for {operation_id} after {after_seq}"))?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.context("parse events response")?;
+        if !status.is_success() {
+            bail!(
+                "owner events replay failed: {}",
+                body.get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
+            );
+        }
+        let data = body
+            .get("data")
+            .cloned()
+            .context("events response missing data")?;
+        let events = data
+            .get("events")
+            .cloned()
+            .context("events response missing events array")?;
+        serde_json::from_value(events).context("decode event records")
+    }
+
     /// 轮询操作至终态（有界）。
     pub(super) async fn wait_terminal(
         &self,
@@ -245,59 +284,89 @@ pub(super) fn find_owner_token(
     None
 }
 
-/// 运行事件 SSE 消费：解析 `data:` 行，适配为旧 EVT 形态（event_name →
-/// {"event": ..., "service": ..., ...payload}）后回调——与 stdout EVT
-/// 管道同构（P3-03：复用路径的事件兼容）。
-pub(super) async fn stream_events(
+/// 运行事件转发（R06）：按 after_seq 游标轮询重放（端点是有限重放非长连
+/// SSE——轮询天然支持断线续传，无总超时/EOF 竞态；UTF-8 由完整记录的
+/// serde 反序列化保证，无跨 chunk 切割问题）。终态判定在调用方
+/// （`wait_terminal`）；`cursor` 记录已消费 sequence（调用方终态后经
+/// [`drain_operation_events`] 按 cursor 排空剩余事件——终态事件在状态
+/// 可见后落 journal，盲目 abort 会丢终局）。
+pub(super) async fn forward_operation_events(
     client: &OwnerClient,
     operation_id: &str,
-    mut on_line: impl FnMut(String) + Send + 'static,
-) -> Result<()> {
-    use futures_util::StreamExt as _;
-    let url = format!(
-        "http://{}/v1/runtime/operations/{operation_id}/events/stream",
-        client.address
-    );
-    let response = client
-        .client
-        .get(&url)
-        .header("X-Deploy-Token", &client.token)
-        .send()
-        .await
-        .with_context(|| format!("open event stream for {operation_id}"))?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "event stream rejected: {}",
-        response.status()
-    );
-    let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("read event stream chunk")?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(newline) = buffer.find('\n') {
-            let line: String = buffer.drain(..=newline).collect();
-            let line = line.trim();
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim();
-                if data.is_empty() {
-                    continue;
-                }
-                if let Ok(record) = serde_json::from_str::<shared_types::RuntimeEventRecord>(data)
-                    && let Some(legacy) = to_legacy_evt(&record)
-                {
-                    on_line(legacy);
+    mut on_line: impl FnMut(String) + Send,
+    stop: &tokio_util::sync::CancellationToken,
+    cursor: &std::sync::atomic::AtomicU64,
+    poll_interval: std::time::Duration,
+) {
+    use std::sync::atomic::Ordering;
+    let mut after_seq = cursor.load(Ordering::SeqCst);
+    loop {
+        match client.events_after(operation_id, after_seq).await {
+            Ok(records) => {
+                for record in &records {
+                    after_seq = after_seq.max(record.sequence);
+                    cursor.store(after_seq, Ordering::SeqCst);
+                    if let Some(legacy) = to_legacy_evt(record) {
+                        on_line(legacy);
+                    }
                 }
             }
+            // 轮询失败不终止转发（owner 短暂不可达时下一轮游标继续）；
+            // 终态与终局由调用方裁决
+            Err(error) => tracing::warn!(%error, "owner event replay poll failed (will retry)"),
+        }
+        if stop.is_cancelled() {
+            return;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(poll_interval) => {}
+            _ = stop.cancelled() => return,
         }
     }
-    Ok(())
+}
+
+/// 终态后的最后一轮排空（R06：终态事件按 sequence 全部送达后再完成；
+/// 至多重放一轮，坏记录不静默丢——解析失败记 warn 保留失败清单）。
+pub(super) async fn drain_operation_events(
+    client: &OwnerClient,
+    operation_id: &str,
+    after_seq: u64,
+    mut on_line: impl FnMut(String) + Send,
+) -> Result<u64> {
+    let records = client.events_after(operation_id, after_seq).await?;
+    let mut last = after_seq;
+    for record in &records {
+        last = last.max(record.sequence);
+        if let Some(legacy) = to_legacy_evt(record) {
+            on_line(legacy);
+        }
+    }
+    Ok(last)
 }
 
 /// RuntimeEventRecord → 旧 EVT 行（map_app_cli_evt 消费的同构 JSON）。
-/// 无 event_name 的纯 stage 记录跳过（旧管道无对应消费者）。
-fn to_legacy_evt(record: &shared_types::RuntimeEventRecord) -> Option<String> {
+/// - 服务级事件（service_starting 等）原样透传；
+/// - 操作终态（Completed/Failed）映射为平台的 `orchestration_done` 终局
+///   （R06：真实 owner 成功也必须产生平台所需 Done，Failed 携带错误明细）；
+/// - 无 event_name 的纯 stage 记录跳过（旧管道无对应消费者）。
+pub(super) fn to_legacy_evt(record: &shared_types::RuntimeEventRecord) -> Option<String> {
     let name = record.event_name.as_deref()?;
+    if name == "Completed" || name == "Failed" {
+        let failed = if name == "Failed" {
+            let error = record
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("runtime operation failed");
+            vec![serde_json::json!({"service": "orchestrator", "error": error})]
+        } else {
+            Vec::new()
+        };
+        return Some(
+            serde_json::json!({"event": "orchestration_done", "failed": failed}).to_string(),
+        );
+    }
     let mut value = serde_json::json!({"event": name});
     if let Some(service) = &record.service {
         value["service"] = serde_json::Value::String(service.clone());

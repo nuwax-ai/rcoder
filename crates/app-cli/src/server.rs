@@ -1221,6 +1221,22 @@ async fn serve_without_attach(args: &CliArgs) -> Result<()> {
                     );
                 }
                 state.set_runtime_kernel(kernel);
+                // R06 事件桥：编排 EVT 同步进入活跃操作的运行事件 journal
+                //（复用 owner 的平台侧经运行 API 读事件流，读不到本进程
+                // stdout）。stdout 通道不变（本地 spawn 路径消费）。
+                {
+                    let kernel = state.runtime_kernel().expect("kernel just set");
+                    crate::orchestration_events::install_bridge(Box::new(move |json| {
+                        if let Some(record) = bridge_event_fields(&json) {
+                            kernel.append_orchestration_event(
+                                &record.stage,
+                                record.service,
+                                &record.event_name,
+                                record.payload,
+                            );
+                        }
+                    }));
+                }
                 // endpoint 发现记录（cross-platform.md §3）：API 已绑定 +
                 // 身份就绪后原子发布——多项目按状态根天然隔离。
                 // 发布失败仅告警（发现能力缺失，不影响已建立的 owner）。
@@ -2417,6 +2433,47 @@ async fn server_loop(
             Next::Redeploy(action) => pending = Some(action),
         }
     }
+}
+
+/// EVT 行 JSON → journal 事件字段（R06 事件桥）。`orchestration_done` 的
+/// failed 清单与 `service_start_fail` 的 error 放 payload——消费侧按事件流
+/// 即可还原终局与失败明细，不需要再读 stdout。
+struct BridgeEvent {
+    stage: String,
+    service: Option<String>,
+    event_name: String,
+    payload: Option<serde_json::Value>,
+}
+
+fn bridge_event_fields(json: &str) -> Option<BridgeEvent> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let event_name = value.get("event")?.as_str()?.to_string();
+    let service = value
+        .get("service")
+        .and_then(|service| service.as_str())
+        .map(str::to_string);
+    let stage = if event_name == "orchestration_done" {
+        "orchestration"
+    } else {
+        "service"
+    };
+    let payload = match event_name.as_str() {
+        "orchestration_done" => value
+            .get("failed")
+            .cloned()
+            .map(|failed| serde_json::json!({ "failed": failed })),
+        "service_start_fail" => value
+            .get("error")
+            .cloned()
+            .map(|error| serde_json::json!({ "error": error })),
+        _ => None,
+    };
+    Some(BridgeEvent {
+        stage: stage.to_string(),
+        service,
+        event_name,
+        payload,
+    })
 }
 
 #[cfg(test)]

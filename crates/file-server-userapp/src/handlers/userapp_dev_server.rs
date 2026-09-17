@@ -191,7 +191,15 @@ pub(crate) async fn dev_stop(
                 super::userapp::cancel_build_task(&task).await;
             }
         }
-        let stopped: StoppedDev = state.fs.dev_server.stop_dev(&key).await?;
+        // R05：managed 域停止不 ps 扫描——external 登记经运行 API 幂等停；
+        // 登记缺失但有 owner 应答时明确拒绝（不抢杀未知进程）
+        let workspace = resolve_userapp_dev(&body.app_id, None, &state.fs.config)
+            .map_err(|e| AppError::business(format!("resolve workspace for stop: {e}")))?;
+        let stopped: StoppedDev = state
+            .fs
+            .dev_server
+            .stop_userapp_dev(&key, &workspace)
+            .await?;
         state.fs.log_cache.delete(&key)?;
         let all_killed = stopped.killed_pids.iter().all(|k| k.killed);
         let message = if stopped.killed_pids.is_empty() {

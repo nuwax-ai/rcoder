@@ -963,12 +963,23 @@ impl RuntimeKernel {
                 RuntimeOperationState::Succeeded => "Completed",
                 _ => "Failed",
             };
-            self.emit(
+            // R06：Failed 终态事件携带错误码/消息（SSE 消费方按事件流即可
+            // 还原失败原因，不需要再回查操作视图）
+            let payload = match (&stored.view.state, &stored.view.error_code) {
+                (RuntimeOperationState::Succeeded, _) => None,
+                (_, Some(code)) => Some(serde_json::json!({
+                    "code": code,
+                    "error": stored.view.error_message.clone().unwrap_or_default(),
+                })),
+                (_, None) => None,
+            };
+            self.emit_with_payload(
                 operation_id,
                 next_sequence,
                 "terminal",
                 None,
                 Some(event_name),
+                payload,
             );
         }
         if let Ok(mut set) = self.cancelled.lock() {
@@ -1177,6 +1188,20 @@ impl RuntimeKernel {
         service: Option<String>,
         event_name: Option<&str>,
     ) {
+        self.emit_with_payload(operation_id, sequence, stage, service, event_name, None)
+    }
+
+    /// 带 payload 的事件落盘（R06：Failed 终态事件携带错误详情，SSE 消费方
+    /// 无需再查操作视图即可还原失败原因）。
+    fn emit_with_payload(
+        &self,
+        operation_id: &str,
+        sequence: u64,
+        stage: &str,
+        service: Option<String>,
+        event_name: Option<&str>,
+        payload: Option<serde_json::Value>,
+    ) {
         let record = RuntimeEventRecord {
             operation_id: operation_id.to_string(),
             sequence,
@@ -1184,13 +1209,47 @@ impl RuntimeKernel {
             stage: stage.to_string(),
             service,
             event_name: event_name.map(str::to_string),
-            payload: None,
+            payload,
         };
         if let Err(error) = self.store.append_event(&record) {
             // 事件落盘失败不阻断受理/执行主链（操作记录是权威），
             // 但必须可见——静默丢事件违反 spec §3.6。
             tracing::error!("runtime event persist failed (op {operation_id}): {error:#}");
         }
+    }
+
+    /// 追加服务级编排事件到**当前活跃操作**的 journal（R06 事件桥：owner 形态
+    /// 下平台经运行 API 读事件流，stdout EVT 只被本地 spawn 路径消费）。
+    /// 无活跃操作时 no-op（idle 期编排事件只有 stdout 消费者）。
+    /// 返回是否已落盘（供桥接方观测丢弃）。
+    pub fn append_orchestration_event(
+        &self,
+        stage: &str,
+        service: Option<String>,
+        event_name: &str,
+        payload: Option<serde_json::Value>,
+    ) -> bool {
+        let Ok(guard) = self.admission.try_lock() else {
+            return false;
+        };
+        let Some(operation_id) = guard.active_operation_id.clone() else {
+            return false;
+        };
+        drop(guard);
+        let next_sequence = self
+            .store
+            .replay_events(&operation_id, 0)
+            .map(|events| events.last().map_or(1, |event| event.sequence + 1))
+            .unwrap_or(1);
+        self.emit_with_payload(
+            &operation_id,
+            next_sequence,
+            stage,
+            service,
+            Some(event_name),
+            payload,
+        );
+        true
     }
 }
 
@@ -1241,6 +1300,86 @@ mod tests {
         let store = open_store(&workspace);
         let identity = identity();
         RuntimeKernel::new(store, identity, Box::new(|_| {}))
+    }
+
+    /// R06：Failed 终态事件携带错误载荷；事件桥把服务级事件追加进活跃操作
+    /// journal（复用 owner 的平台侧经运行 API 读事件流）。
+    #[tokio::test]
+    async fn failed_terminal_event_carries_error_payload() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-fail"))
+            .await
+            .expect("admit");
+        kernel
+            .finish(
+                "op-fail",
+                RuntimeOperationState::Failed,
+                Some(("ERR_SOME".into(), "boom detail".into())),
+                None,
+                2,
+            )
+            .await
+            .expect("finish");
+        let events = kernel.store().replay_events("op-fail", 0).expect("replay");
+        let terminal = events
+            .iter()
+            .find(|event| event.event_name.as_deref() == Some("Failed"))
+            .expect("terminal event");
+        let payload = terminal.payload.as_ref().expect("payload on Failed");
+        assert_eq!(payload["code"], "ERR_SOME");
+        assert_eq!(payload["error"], "boom detail");
+    }
+
+    #[tokio::test]
+    async fn orchestration_bridge_appends_to_active_operation() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        // 无活跃操作：no-op（idle 期只有 stdout 消费者）
+        assert!(!kernel.append_orchestration_event(
+            "service",
+            Some("frontend".into()),
+            "service_starting",
+            None
+        ));
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-bridge"))
+            .await
+            .expect("admit");
+        // admit 已发 accepted 事件（sequence 1）→ 桥接事件从 2 起
+        assert!(kernel.append_orchestration_event(
+            "service",
+            Some("frontend".into()),
+            "service_starting",
+            None
+        ));
+        assert!(kernel.append_orchestration_event(
+            "orchestration",
+            None,
+            "orchestration_done",
+            Some(serde_json::json!({"failed": []}))
+        ));
+        let events = kernel
+            .store()
+            .replay_events("op-bridge", 0)
+            .expect("replay");
+        let names: Vec<(u64, &str)> = events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .event_name
+                    .as_deref()
+                    .map(|name| (event.sequence, name))
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![(1, "start"), (2, "service_starting"), (3, "orchestration_done")],
+            "bridge events must be sequenced after accepted: {names:?}"
+        );
+        let done = events.last().expect("done event");
+        assert_eq!(done.payload.as_ref().expect("payload")["failed"], serde_json::json!([]));
     }
 
     fn request_deploy_url(operation_id: &str) -> RuntimeOperationRequest {
