@@ -2240,6 +2240,7 @@ dependencies = [
  "process_utils",
  "regex",
  "reqwest",
+ "runtime-state-layout",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -7237,6 +7238,16 @@ checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
 dependencies = [
  "rmp",
  "serde",
+]
+
+[[package]]
+name = "runtime-state-layout"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

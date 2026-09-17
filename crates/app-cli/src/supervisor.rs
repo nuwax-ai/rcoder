@@ -32,7 +32,16 @@ pub(crate) const ORCHESTRATOR_FAILURE_SERVICE: &str = "orchestrator";
 /// 编排主入口（legacy 直跑形态：一次性编排，无外部取消源）。
 pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result<()> {
     // 直跑形态（无操作上下文）：env 兜底（R08 显式 profile/凭据仅经 server 形态）
-    run_inner(args, runtime_status, None, None, true, dev_run_profile(), None).await
+    run_inner(
+        args,
+        runtime_status,
+        None,
+        None,
+        true,
+        dev_run_profile(),
+        None,
+    )
+    .await
 }
 
 /// 编排主入口（server 形态：`cancel` 触发 = 优雅停全部子服务后 Ok 返回，
@@ -101,8 +110,15 @@ async fn run_inner(
     let workspace_index_port =
         crate::workspace_index::index_port_if_eligible(&args.workspace, &specs);
 
-    // 2. wait PG（PG 由 supervisor [program:postgresql] 托管，秒级就绪；失败不阻断）
-    wait_for_pg().await?;
+    // 2. wait PG（PG 由 supervisor [program:postgresql] 托管，秒级就绪；失败不阻断）。
+    // N01：数据库前置按运行计划**声明**决定——仅当存在启用服务带 migrate
+    // 命令或显式 APP_CLI_REQUIRE_PG=1 时才探测；纯静态/前端项目不轮询
+    // pg_isready（60s 等待不得阻塞无数据库需求的启动）。
+    if workspace_needs_pg(&specs) {
+        wait_for_pg().await?;
+    } else {
+        info!("⏭  no service declares database usage (migrate); skipping PG readiness wait");
+    }
 
     // 3. 各子项目 migrate → start；4. 编译验证并启动 Pingap。
     // 任一阶段失败统一兜底：先 shutdown_all 优雅停掉已启动的子进程再返回 Err。
@@ -447,6 +463,18 @@ pub(crate) fn validate_runtime_compatibility(
 }
 
 // ── PG 等待 ──────────────────────────────────────────────────────────────────
+
+/// 数据库需求判定（N01：声明式，非环境猜测）。
+/// true = 任一启用服务带 migrate 命令（启动时对 PG 执行迁移），或运维
+/// 显式 APP_CLI_REQUIRE_PG=1（服务不经 migrate 但启动期依赖 PG 的兜底声明）。
+pub(crate) fn workspace_needs_pg(specs: &[ServiceSpec]) -> bool {
+    if std::env::var_os("APP_CLI_REQUIRE_PG").is_some_and(|value| value == "1") {
+        return true;
+    }
+    specs
+        .iter()
+        .any(|spec| spec.enabled && !spec.run.migrate.is_empty())
+}
 
 /// pg_isready 轮询（最多 30 次 × 2s = 60s），失败不阻断（PG 可能晚于 app-cli 启）。
 pub(crate) async fn wait_for_pg() -> Result<()> {
@@ -937,6 +965,17 @@ mod tests {
         }
     }
 
+    /// N01：数据库需求声明式判定——migrate 命令或显式 env 才探测 PG。
+    #[test]
+    fn pg_wait_is_gated_on_declared_need() {
+        let mut with_migrate = spec_with(None);
+        with_migrate.run.migrate = vec!["pnpm".into(), "db:migrate".into()];
+        // 服务声明 migrate → 需要
+        assert!(workspace_needs_pg(&[with_migrate]));
+        // 纯静态/前端服务（无 migrate）→ 不探测（60s 轮询不得阻塞启动）
+        assert!(!workspace_needs_pg(&[spec_with(None)]));
+    }
+
     /// dev 形态 + 有 [devrun] → devrun.command（热加载命令生效）。
     #[test]
     fn dev_profile_prefers_devrun_command() {
@@ -1032,10 +1071,16 @@ mod tests {
             username: "biz_user".into(),
             password: "new-s3cret".into(),
         };
-        let mut child =
-            start_service(&spec, &spec.run.command, &workspace, &log_dir, "rel-1", Some(&pg))
-                .await
-                .unwrap();
+        let mut child = start_service(
+            &spec,
+            &spec.run.command,
+            &workspace,
+            &log_dir,
+            "rel-1",
+            Some(&pg),
+        )
+        .await
+        .unwrap();
         // 等 env dump 落盘（spawn 异步）
         let content = tokio::time::timeout(Duration::from_secs(5), async {
             loop {

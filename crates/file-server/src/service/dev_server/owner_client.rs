@@ -273,13 +273,26 @@ pub(super) fn protocol_compatible(identity: &RuntimeIdentityView) -> bool {
     identity.protocol_version == RUNTIME_CONTROL_PROTOCOL_VERSION
 }
 
-/// 候选状态根（源码态 workspace 与产物态 {ws}/.run 两种入口的落点）：
-/// owner 的状态根可能挂在 {workspace} 下（.run 形态的卷根）或其父目录
-/// （源码形态的卷根）——返回含 token 文件的那个。
+/// owner 凭据文件定位（R09：与 app-cli 同一解析契约——显式 env /
+/// PROJECT_ID 应用段 / standalone 项目登记表；`.run`/symlink 经契约折叠，
+/// 不再父目录/当前目录各猜一次）。契约未命中时回落 legacy 双探测（旧布局
+/// 残留兼容），命中即返回含 token 文件的状态根。
 pub(super) fn find_owner_token(
     workspace: &std::path::Path,
     application_id: &str,
 ) -> Option<(std::path::PathBuf, String)> {
+    let explicit = std::env::var_os("APP_CLI_STATE_ROOT");
+    let project_id =
+        (application_id != "unknown-app").then(|| std::ffi::OsString::from(application_id));
+    if let Ok(Some(root)) = runtime_state_layout::resolve_state_root(
+        workspace,
+        explicit.as_deref(),
+        project_id.as_deref(),
+    ) && let Some(token) = read_owner_token(&root)
+    {
+        return Some((root, token));
+    }
+    // legacy 双探测（旧布局残留；新解析已由契约覆盖 .run/parent 折叠）
     let mut candidates = Vec::new();
     if let Some(parent) = workspace.parent() {
         candidates.push(parent.join(".app-cli-state").join(application_id));
@@ -388,4 +401,39 @@ pub(super) fn to_legacy_evt(record: &shared_types::RuntimeEventRecord) -> Option
         }
     }
     Some(value.to_string())
+}
+
+#[cfg(test)]
+mod r09_tests {
+    use super::*;
+
+    /// R09：standalone（无 PROJECT_ID）凭据查找经项目登记表——兄弟项目
+    /// 各自命中自己的 token；`.run` 入口折叠回源码根（同锁域同凭据）。
+    #[test]
+    fn find_owner_token_uses_project_registry_for_siblings() {
+        let volume = tempfile::tempdir().unwrap();
+        let ws_a = volume.path().join("sibling-a");
+        let ws_b = volume.path().join("sibling-b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+        // 经 app-cli 同源契约登记（ensure 侧）
+        let root_a = runtime_state_layout::ensure_state_root(&ws_a, None, None).unwrap();
+        let root_b = runtime_state_layout::ensure_state_root(&ws_b, None, None).unwrap();
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::write(root_a.join("token"), "token-a\n").unwrap();
+        std::fs::write(root_b.join("token"), "token-b\n").unwrap();
+
+        let (found_a_root, token_a) = find_owner_token(&ws_a, "unknown-app").expect("token a");
+        assert_eq!(token_a, "token-a");
+        assert_eq!(found_a_root, root_a);
+        let (_, token_b) = find_owner_token(&ws_b, "unknown-app").expect("token b");
+        assert_eq!(token_b, "token-b");
+
+        // .run 入口（产物态）折叠回源码项目根 → 同一凭据
+        let run_a = ws_a.join(".run");
+        std::fs::create_dir_all(&run_a).unwrap();
+        let (_, token_run) = find_owner_token(&run_a, "unknown-app").expect("token via .run");
+        assert_eq!(token_run, "token-a");
+    }
 }

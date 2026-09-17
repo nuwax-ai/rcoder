@@ -128,18 +128,29 @@ impl RuntimeStore {
 
     /// [`Self::resolve_root`] 的可参数化核心——测试以显式 env 值驱动，
     /// 不经 `std::env::set_var`（进程级 env 变异与并行测试的 resolve 读取竞争）。
+    ///
+    /// R09：解析委托共享契约 crate（runtime-state-layout）——显式 env 优先；
+    /// 有 PROJECT_ID（application_id 非 unknown-app）按应用段；standalone
+    /// 走本地项目登记表（兄弟项目独立段、source/.run 同段、symlink 折叠）。
+    /// app-cli 与 file-server 凭据查找复用同一规则，不再各自猜目录。
     fn resolve_root_with_explicit(
         workspace: &Path,
         application_id: &str,
         explicit: Option<std::ffi::OsString>,
     ) -> Result<PathBuf> {
-        if let Some(explicit) = explicit.filter(|value| !value.is_empty()) {
-            return Ok(PathBuf::from(explicit));
-        }
-        let volume_root = workspace
-            .parent()
-            .context("workspace has no volume root for stable runtime state")?;
-        Ok(volume_root.join(STATE_DIR_NAME).join(application_id))
+        let project_id =
+            (application_id != "unknown-app").then(|| std::ffi::OsString::from(application_id));
+        runtime_state_layout::ensure_state_root(
+            workspace,
+            explicit.as_deref(),
+            project_id.as_deref(),
+        )
+        .with_context(|| {
+            format!(
+                "resolve runtime state root for workspace {} (app {application_id})",
+                workspace.display()
+            )
+        })
     }
 
     #[cfg(test)]
@@ -190,15 +201,25 @@ impl RuntimeStore {
                     legacy.display()
                 );
             }
-            if root.starts_with(legacy) {
+            // 物理路径比较（R09 解析经 canonicalize 后与 workspace 派生路径
+            // 可能仅差 symlink 前缀——/var vs /private/var；字符串 starts_with
+            // 会把"同一物理目录嵌套"误判成跨目录 rename → EINVAL）
+            let legacy_canonical = std::fs::canonicalize(legacy).unwrap_or_else(|_| legacy.clone());
+            let root_canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            if root_canonical.starts_with(&legacy_canonical) {
                 // bare 卷根 legacy → 按应用根嵌套在其子树内（rename 进自身
                 // 子树 EINVAL）——逐条目搬移后拆除 legacy 目录。
                 std::fs::create_dir_all(&root).context("create per-app state root")?;
                 for entry in std::fs::read_dir(legacy).context("read legacy state entries")? {
                     let entry = entry.context("read legacy entry")?;
                     // create_dir_all(root) 已在 bare 内建出按应用根（本分支
-                    // root 嵌套于 legacy）——跳过自身，只搬真实状态条目
-                    if entry.path() == root {
+                    // root 嵌套于 legacy）——跳过自身，只搬真实状态条目。
+                    // 物理路径比较（/var 与 /private/var 前缀差异下字符串
+                    // 相等会把 root 自身当待搬条目 → rename 进自身 EINVAL）
+                    let entry_path = entry.path();
+                    let entry_canonical =
+                        std::fs::canonicalize(&entry_path).unwrap_or_else(|_| entry_path.clone());
+                    if entry_canonical == root_canonical {
                         continue;
                     }
                     let target = root.join(entry.file_name());
@@ -1365,7 +1386,10 @@ mod tests {
             .and_then(|config| config.pg.as_ref())
             .expect("run config persisted");
         assert_eq!(persisted_pg.username, "biz_user");
-        assert_eq!(persisted_pg.password, "", "password must be redacted on disk");
+        assert_eq!(
+            persisted_pg.password, "",
+            "password must be redacted on disk"
+        );
     }
 
     /// R06：Failed 终态事件携带错误载荷；事件桥把服务级事件追加进活跃操作
@@ -1441,11 +1465,18 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec![(1, "start"), (2, "service_starting"), (3, "orchestration_done")],
+            vec![
+                (1, "start"),
+                (2, "service_starting"),
+                (3, "orchestration_done")
+            ],
             "bridge events must be sequenced after accepted: {names:?}"
         );
         let done = events.last().expect("done event");
-        assert_eq!(done.payload.as_ref().expect("payload")["failed"], serde_json::json!([]));
+        assert_eq!(
+            done.payload.as_ref().expect("payload")["failed"],
+            serde_json::json!([])
+        );
     }
 
     fn request_deploy_url(operation_id: &str) -> RuntimeOperationRequest {

@@ -74,6 +74,8 @@ chrono = { workspace = true }
 download_utils = { workspace = true }
 # 下载取消令牌（download_to_file 签名要求）
 tokio-util = { workspace = true }
+# 运行态状态根解析契约（R09：与 app-cli 同一解析规则）
+runtime-state-layout = { path = "../runtime-state-layout" }
 
 # 编码检测 / content-type 推断
 encoding_rs = { workspace = true }
