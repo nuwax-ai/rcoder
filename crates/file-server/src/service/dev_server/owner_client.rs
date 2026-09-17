@@ -240,3 +240,90 @@ impl OwnerClient {
 pub(super) fn protocol_compatible(identity: &RuntimeIdentityView) -> bool {
     identity.protocol_version == RUNTIME_CONTROL_PROTOCOL_VERSION
 }
+
+/// 候选状态根（源码态 workspace 与产物态 {ws}/.run 两种入口的落点）：
+/// owner 的状态根可能挂在 {workspace} 下（.run 形态的卷根）或其父目录
+/// （源码形态的卷根）——返回含 token 文件的那个。
+pub(super) fn find_owner_token(
+    workspace: &std::path::Path,
+    application_id: &str,
+) -> Option<(std::path::PathBuf, String)> {
+    let mut candidates = Vec::new();
+    if let Some(parent) = workspace.parent() {
+        candidates.push(parent.join(".app-cli-state").join(application_id));
+    }
+    candidates.push(workspace.join(".app-cli-state").join(application_id));
+    for root in candidates {
+        if let Some(token) = read_owner_token(&root) {
+            return Some((root, token));
+        }
+    }
+    None
+}
+
+/// 运行事件 SSE 消费：解析 `data:` 行，适配为旧 EVT 形态（event_name →
+/// {"event": ..., "service": ..., ...payload}）后回调——与 stdout EVT
+/// 管道同构（P3-03：复用路径的事件兼容）。
+pub(super) async fn stream_events(
+    client: &OwnerClient,
+    operation_id: &str,
+    mut on_line: impl FnMut(String) + Send + 'static,
+) -> Result<()> {
+    use futures_util::StreamExt as _;
+    let url = format!(
+        "http://{}/v1/runtime/operations/{operation_id}/events/stream",
+        client.address
+    );
+    let response = client
+        .client
+        .get(&url)
+        .header("X-Deploy-Token", &client.token)
+        .send()
+        .await
+        .with_context(|| format!("open event stream for {operation_id}"))?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "event stream rejected: {}",
+        response.status()
+    );
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read event stream chunk")?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(newline) = buffer.find('\n') {
+            let line: String = buffer.drain(..=newline).collect();
+            let line = line.trim();
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim();
+                if data.is_empty() {
+                    continue;
+                }
+                if let Ok(record) = serde_json::from_str::<shared_types::RuntimeEventRecord>(data)
+                    && let Some(legacy) = to_legacy_evt(&record)
+                {
+                    on_line(legacy);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// RuntimeEventRecord → 旧 EVT 行（map_app_cli_evt 消费的同构 JSON）。
+/// 无 event_name 的纯 stage 记录跳过（旧管道无对应消费者）。
+fn to_legacy_evt(record: &shared_types::RuntimeEventRecord) -> Option<String> {
+    let name = record.event_name.as_deref()?;
+    let mut value = serde_json::json!({"event": name});
+    if let Some(service) = &record.service {
+        value["service"] = serde_json::Value::String(service.clone());
+    }
+    if let Some(payload) = &record.payload
+        && let Some(object) = payload.as_object()
+    {
+        for (key, item) in object {
+            value[key] = item.clone();
+        }
+    }
+    Some(value.to_string())
+}

@@ -332,6 +332,14 @@ async fn spawn_dev_task(
         //   只配 [devrun] 的服务跳过——devrun 自足；其余回落 [build].command
         //   刷新源码目录产物）——不打 zip（热加载命令跑源码，
         //   制品无消费者；可部署性检查走 /api/v1/userapp/build）。
+        // P3-03：构建前捕获 owner 期望（instance/revision）——构建期间
+        // owner 被 stop/restart 时，提交按 ERR_REVISION_MISMATCH 拒绝
+        // （不自动刷新重发，防绕过用户 stop）。无 owner 时无副作用。
+        state
+            .fs
+            .dev_server
+            .capture_owner_expectation(&key, &ws)
+            .await;
         let progress = task_clone.clone();
         let result = if dev_source_mode {
             crate::service::userapp::dev_mode::run_dev_builds(

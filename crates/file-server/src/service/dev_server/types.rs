@@ -66,6 +66,10 @@ pub struct DevServerManager {
     /// 进程停止后未确认清理状态表（P1-05）：并发 dev 操作互斥清理——
     /// 旧 supervised 退出后再次受理 dev/start 前必须确认清理完毕。
     pub(super) cleanup_state: Arc<Mutex<HashMap<String, CleanupStatus>>>,
+    /// 构建前捕获的 owner 期望（P3-03）：key=project_id，
+    /// value=(runtime_instance_id, revision)——构建期间 owner 被
+    /// stop/restart 时，提交按 ERR_REVISION_MISMATCH 拒绝（不自动刷新重发）。
+    pub(super) owner_expectations: Mutex<HashMap<String, (String, u64)>>,
     pub(super) port_pool: PortPool,
     pub(super) config: Arc<Config>,
 }
@@ -83,6 +87,7 @@ impl DevServerManager {
             starting: Mutex::new(HashSet::new()),
             supervised: Mutex::new(HashMap::new()),
             cleanup_state: Arc::new(Mutex::new(HashMap::new())),
+            owner_expectations: Mutex::new(HashMap::new()),
             port_pool: pool,
             config,
         }

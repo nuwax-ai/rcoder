@@ -70,6 +70,37 @@ impl DevServerManager {
         ))
     }
 
+    /// P3-03：构建前捕获 owner 期望（runtime_instance_id + revision）。
+    /// 构建期间 owner 被 stop/restart 推进 revision 时，后续提交按
+    /// ERR_REVISION_MISMATCH 拒绝（不自动刷新重发，防绕过用户 stop）。
+    /// 无 owner / 探测失败 → 清除既有期望（spawn 路径提交时活取）。
+    pub async fn capture_owner_expectation(&self, project_id: &str, workspace: &Path) {
+        let expectation = async {
+            let identity = owner_client::probe_owner(&self.config.app_cli_admin_probe_addr).await?;
+            let app_id = std::env::var("PROJECT_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "unknown-app".to_string());
+            let (_root, token) = owner_client::find_owner_token(workspace, &app_id)?;
+            let client =
+                owner_client::OwnerClient::new(&self.config.app_cli_admin_probe_addr, &token)
+                    .ok()?;
+            let status = client.status().await.ok()?;
+            Some((identity.runtime_instance_id, status.revision))
+        }
+        .await;
+        if let Ok(mut map) = lock(&self.owner_expectations) {
+            match expectation {
+                Some(captured) => {
+                    map.insert(project_id.to_string(), captured);
+                }
+                None => {
+                    map.remove(project_id);
+                }
+            }
+        }
+    }
+
     /// keep-alive (对齐 nuwax: 探活, 不存活则重启)。
     pub async fn keep_alive(
         &self,

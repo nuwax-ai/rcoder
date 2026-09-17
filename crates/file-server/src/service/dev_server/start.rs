@@ -298,7 +298,10 @@ impl DevServerManager {
         // P3-02：owner 感知——spawn 前探测 3010。匹配本 workspace 的 serve
         // owner 经运行 API 复用（消除平台/agent 双启动的 3010 冲突）；legacy
         // app-cli / foreign 应答明确拒绝（XP04：不杀对方、不盲 spawn）。
-        if let Some(started) = self.reuse_or_refuse_owner(project_id, project_path).await? {
+        if let Some(started) = self
+            .reuse_or_refuse_owner(project_id, project_path, hooks.clone())
+            .await?
+        {
             return Ok(started);
         }
 
@@ -415,6 +418,7 @@ impl DevServerManager {
         &self,
         project_id: &str,
         project_path: &Path,
+        hooks: Option<super::supervise::DevEventHooks>,
     ) -> AppResult<Option<StartedDev>> {
         let owner_addr = self.config.app_cli_admin_probe_addr.clone();
         let Some(identity) = super::owner_client::probe_owner(&owner_addr).await else {
@@ -454,10 +458,11 @@ impl DevServerManager {
             )));
         }
 
-        // 匹配 owner：读凭据（owner 未启用写端点 → 无法路由，明确报错）
-        let state_root = super::owner_client::owner_state_root(project_path, &app_id)
-            .map_err(|error| AppError::system(format!("resolve owner state root: {error:#}")))?;
-        let Some(token) = super::owner_client::read_owner_token(&state_root) else {
+        // 匹配 owner：读凭据（源码/产物两种状态根落点都探测；owner 未
+        // 启用写端点 → 无法路由，明确报错）
+        let Some((_state_root, token)) =
+            super::owner_client::find_owner_token(project_path, &app_id)
+        else {
             return Err(AppError::business(
                 "workspace is already managed by an app-cli owner whose runtime API \
                  credentials are unavailable (APP_CLI_DEPLOY_TOKEN not enabled); \
@@ -466,20 +471,54 @@ impl DevServerManager {
         };
         let client = super::owner_client::OwnerClient::new(&owner_addr, &token)
             .map_err(|error| AppError::system(format!("build owner client: {error:#}")))?;
+        // P3-03：构建前捕获的期望优先（构建期间 owner 变更 → 提交被拒，
+        // 不自动刷新重发）；未捕获（直接 start 无构建段）→ 提交时活取。
+        let expected = lock(&self.owner_expectations)?
+            .remove(project_id)
+            .map(|(instance, revision)| (instance, revision));
         let route_restart = async {
-            let status = client.status().await?;
+            let (expected_instance, expected_revision) = match expected {
+                Some(captured) => captured,
+                None => {
+                    let status = client.status().await?;
+                    (identity.runtime_instance_id.clone(), status.revision)
+                }
+            };
             let operation_id = format!("fs-restart-{}", uuid::Uuid::new_v4().simple());
             client
                 .submit_restart_source(
                     &operation_id,
                     &expected_ws,
-                    status.revision,
-                    &identity.runtime_instance_id,
+                    expected_revision,
+                    &expected_instance,
                 )
                 .await?;
-            client
-                .wait_terminal(&operation_id, Duration::from_secs(180))
+            // P3-03：SSE 事件转发（operation 事件 → 旧 EVT 形态 → hooks，
+            // 与 stdout 管道同构）；终态后中止流任务
+            let events_client = super::owner_client::OwnerClient::new(&owner_addr, &token)?;
+            let hooks_line = hooks.map(|hooks| hooks.on_line);
+            let stream_operation_id = operation_id.clone();
+            let stream_task = tokio::spawn(async move {
+                let mut forward = move |json: String| {
+                    if let Some(on_line) = hooks_line.as_ref() {
+                        on_line(&json);
+                    }
+                };
+                if let Err(error) = super::owner_client::stream_events(
+                    &events_client,
+                    &stream_operation_id,
+                    forward,
+                )
                 .await
+                {
+                    tracing::warn!("owner event stream ended: {error:#}");
+                }
+            });
+            let terminal = client
+                .wait_terminal(&operation_id, Duration::from_secs(180))
+                .await;
+            stream_task.abort();
+            terminal
         };
         let view = route_restart
             .await
@@ -746,7 +785,7 @@ mod owner_reuse_tests {
         let ws_fresh = dir.path().join("ws-fresh");
         std::fs::create_dir_all(&ws_fresh).unwrap();
         assert!(
-            mgr.reuse_or_refuse_owner("userapp:app", &ws_fresh)
+            mgr.reuse_or_refuse_owner("userapp:app", &ws_fresh, None)
                 .await
                 .expect("probe")
                 .is_none(),
@@ -764,7 +803,7 @@ mod owner_reuse_tests {
         let ws_legacy = dir.path().join("ws-legacy");
         std::fs::create_dir_all(&ws_legacy).unwrap();
         let error = mgr
-            .reuse_or_refuse_owner("userapp:app", &ws_legacy)
+            .reuse_or_refuse_owner("userapp:app", &ws_legacy, None)
             .await
             .expect_err("legacy responder must be refused");
         let AppError::Business(message) = &error else {
@@ -783,14 +822,36 @@ mod owner_reuse_tests {
         let state_root = dir.path().join(".app-cli-state").join("unknown-app");
         std::fs::create_dir_all(&state_root).unwrap();
         std::fs::write(state_root.join("token"), "test-token").unwrap();
-        let owner = mock_owner_router("ws-reuse");
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = mock_owner_router("ws-reuse").with_state(polls);
         let owner_mock = serve_mock(owner).await;
+        let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let hooks = super::super::supervise::DevEventHooks {
+            on_line: std::sync::Arc::new(move |json: &str| {
+                sink.lock().unwrap().push(json.to_string());
+            }) as process::OnLineCallback,
+            on_end: None,
+        };
         let started = mgr
-            .reuse_or_refuse_owner("userapp:app", &ws_reuse)
+            .reuse_or_refuse_owner("userapp:app", &ws_reuse, Some(hooks))
             .await
             .expect("reuse path")
             .expect("must reuse existing owner");
         assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
+        // P3-03：SSE 事件转发为旧 EVT 形态（event_name 记录送达；
+        // 无 event_name 的纯 stage 记录被跳过）
+        let got_completed = {
+            let events = received.lock().unwrap();
+            events
+                .iter()
+                .any(|json| json.contains("\"event\":\"Completed\""))
+        };
+        assert!(
+            got_completed,
+            "legacy Completed event must be forwarded via hooks; got {:?}",
+            received.lock().unwrap()
+        );
         {
             let registered = lock(&mgr.processes).unwrap();
             let entry = registered.get("userapp:app").expect("registered");
@@ -803,12 +864,13 @@ mod owner_reuse_tests {
         owner_mock.release().await;
 
         // ④ foreign workspace → 拒绝
-        let foreign = mock_owner_router("ws-someone-else");
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let foreign = mock_owner_router("ws-someone-else").with_state(polls);
         let foreign_mock = serve_mock(foreign).await;
         let ws_mine = dir.path().join("ws-mine");
         std::fs::create_dir_all(&ws_mine).unwrap();
         let error = mgr
-            .reuse_or_refuse_owner("userapp:app", &ws_mine)
+            .reuse_or_refuse_owner("userapp:app", &ws_mine, None)
             .await
             .expect_err("foreign owner must be refused");
         let AppError::Business(message) = &error else {
@@ -820,7 +882,7 @@ mod owner_reuse_tests {
         );
     }
 
-    fn mock_owner_router(ws: &str) -> axum::Router {
+    fn mock_owner_router(ws: &str) -> axum::Router<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
         let ws = ws.to_string();
         let identity_ws = ws.clone();
         axum::Router::new()
@@ -884,11 +946,17 @@ mod owner_reuse_tests {
             .route(
                 "/v1/runtime/operations/{id}",
                 axum::routing::get(
-                    |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    |axum::extract::Path(id): axum::extract::Path<String>,
+                     axum::extract::State(polls): axum::extract::State<
+                        Arc<std::sync::atomic::AtomicUsize>,
+                    >| async move {
+                        // 首查 accepted（留事件流消费窗口），其后 succeeded
+                        let seen = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let state = if seen == 0 { "accepted" } else { "succeeded" };
                         axum::Json(serde_json::json!({
                             "success": true, "code": "OK",
                             "data": {
-                                "operation_id": id, "kind": "restart", "state": "succeeded",
+                                "operation_id": id, "kind": "restart", "state": state,
                                 "request_digest": "digest", "revision": 1,
                                 "runtime_instance_id": "instance-test"
                             },
@@ -897,10 +965,34 @@ mod owner_reuse_tests {
                     },
                 ),
             )
+            .route(
+                "/v1/runtime/operations/{id}/events/stream",
+                axum::routing::get(
+                    |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                        let body = format!(
+                            "data: {}\n\ndata: {}\n\n",
+                            serde_json::json!({
+                                "operation_id": id, "sequence": 1,
+                                "runtime_instance_id": "instance-test",
+                                "stage": "terminal", "event_name": "Completed"
+                            }),
+                            serde_json::json!({
+                                "operation_id": id, "sequence": 2,
+                                "runtime_instance_id": "instance-test",
+                                "stage": "stage-only-no-event-name"
+                            }),
+                        );
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(body))
+                            .expect("sse response")
+                    },
+                ),
+            )
     }
 
     /// 起 mock 在 3010；返回显式释放句柄（顺序关闭 + 等待端口回收）。
-    async fn serve_mock(app: axum::Router) -> MockOwner {
+    async fn serve_mock(app: axum::Router<()>) -> MockOwner {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:3010")
             .await
             .expect("bind 3010");
