@@ -22,52 +22,52 @@
 
 ## 2. 阶段一：错误传播（独立交付）
 
-- [ ] P1-01：API 预绑定与启动顺序。
+- [x] P1-01：API 预绑定与启动顺序。
   - 路径：`app-cli/src/api/mod.rs`、`main.rs`、`server.rs`。
   - 完成标准：legacy/serve 3010 冲突均非零退出；发生在 deploy cleanup、stop_all、migrate、业务 spawn 之前；未 claim 不写 Quiescent。
   - 验证：隔离 listener 占用、正常 bind、serve journal 拒绝、运行中 API future 故障。
-- [ ] P1-02：统一启动结果及 main 错误返回。
+- [x] P1-02：统一启动结果及 main 错误返回。
   - 路径：`app-cli/src/supervisor.rs`、`orchestration_events.rs`、`main.rs`，必要的 shared_types。
   - 完成标准：可控失败至多一个 Done，保留失败原因和已有服务失败项；main 非零；清理失败独立标记；成功常驻行为不变。
   - 验证：配置/migrate/spawn/pingap 各失败入口；服务部分失败旧语义；stdout 写失败仍通过退出可见。
-- [ ] P1-03：UserApp manifest Child 监督。
+- [x] P1-03：UserApp manifest Child 监督。
   - 路径：`file-server/src/service/dev_server/{start,types,log,stop}.rs` 与 process 模块。
   - 完成标准：有唯一 Child wait/reap 所有者，退出/EOF/读取错误可观察，stdout 有界排空，不依赖 PID 轮询替代真实 exit status。
   - 验证：退出码 0/非零、SIGKILL、后代继承 stdout、读取失败；不误杀外部端口占用进程。
-- [ ] P1-04：发送端生命周期与终态顺序。
+- [x] P1-04：发送端生命周期与终态顺序。
   - 路径：`file-server-userapp/src/handlers/userapp_dev_server.rs`、`service/userapp/start_events.rs`。
   - 完成标准：调用方 evt_tx 和 on_event clone 均不无意保活；Done 与已排队事件按顺序处理；退出不能丢最后事件，也不能把已退出编排器认成就绪。
   - 验证：现有 start_events 用例保留；新增真实 start/restart 调用层用例，不能只手工 drop 一个裸 channel 后宣称修复。
-- [ ] P1-05：取消、清理与重试保护。
+- [x] P1-05：取消、清理与重试保护。
   - 完成标准：abort consumer 不遗弃启动 worker；只清理本轮归属资源；清理未确认时后续启动被阻止且错误可查询；不把 timeout/Cancelled 当清理证明。
   - 验证：构建完成后取消、spawn 后取消、代理失败清理失败、stop 与启动提交竞争。
-- [ ] P1-06：预算清单和等待窗配置。
+- [x] P1-06：预算清单和等待窗配置。
   - 产物：verification.md 记录 PG/migrate/服务就绪/代理/收尾的预算与起点。
   - 完成标准：launch 起共享 deadline；默认候选 300 秒不截断合法显式慢启动；配置不足提前失败；存活无进度有界失败，错误附阶段。
   - 不允许：仅将 3600 改为 300 并根据四个快路径测试断言安全。
-- [ ] P1-07：独立回归与阶段交付。
+- [x] P1-07：独立回归与阶段交付。
   - 执行下述 A 组全部适用项、相关 crate 测试和两种部署模式验证。
   - 汇报本轮 app-cli/file-server/agent_runner 镜像身份；明确只更新哪一侧不足以完成修复。
   - 阶段一单独形成 reviewable diff/提交，不依赖新增运行协议才能工作。
 
 ## 3. 阶段二：所有者与协议
 
-- [ ] P2-01：共享身份、状态、操作、错误与事件类型。
+- [x] P2-01：共享身份、状态、操作、错误与事件类型。
   - 完成标准：shared_types 单一契约；runtime_instance 与 deployment_generation 分开；profile/input 校验；OpenAPI 和正式 HTTP 信封完整。
-- [ ] P2-02：稳定状态根与兼容迁移。
+- [x] P2-02：稳定状态根与兼容迁移。
   - 完成标准：source/.run/别名同锁域；旧 journal 迁移无双 writer 窗口；损坏/不兼容记录 fail closed；保留旧恢复保护。
-- [ ] P2-03：持久受理与幂等历史。
+- [x] P2-03：持久受理与幂等历史。
   - 完成标准：按操作 ID 查询/重放，同 ID 异参数 409；结果持久化；响应丢失可恢复；不因 journal/fsync 失败入队。
   - 验证：崩溃注入覆盖受理落盘前后、入队前后、终态落盘前后，不能只测内存互斥。
-- [ ] P2-04：统一操作 worker 与停止屏障。
+- [x] P2-04：统一操作 worker 与停止屏障。
   - 完成标准：start/restart/deploy 串行；stop 能持久化 pending 意图并取消旧启动，执行不并发；revision 拒绝旧构建提交；cancel 与 stop 语义不同。
-- [ ] P2-05：共享 ResolvedRunPlan。
+- [x] P2-05：共享 ResolvedRunPlan。
   - 完成标准：builtin/supervisord 同命令/cwd/env/依赖/探针语义；source devrun、devbuild、static 差异保留；生产 run 不改变。
-- [ ] P2-06：制品输入适配及唯一目录写入。
+- [x] P2-06：制品输入适配及唯一目录写入。
   - 完成标准：本地 artifact_id/URL 输入共用准备激活内核；本地输入无任意路径激活、无校验后替换竞态；source 根永不整体替换。
-- [ ] P2-07：有序持久事件与 task 关联。
+- [x] P2-07：有序持久事件与 task 关联。
   - 完成标准：operation+sequence 重放、终态记录一致、慢订阅不阻塞执行；file-server 重启可继续观察已受理操作；旧 UI 顺序兼容。
-- [ ] P2-08：控制 program、CLI 与归属。
+- [x] P2-08：控制 program、CLI 与归属。
   - 完成标准：空 workspace Idle；重复 serve 无业务副作用；attach 无打印退出循环；业务组所有权不只按前缀识别；管理进程存活不等于业务 Running。
 - [ ] P2-09：desired state 与恢复。
   - 完成标准：明确 stop 重建不复活；正常进程重启可按 Running 恢复；source 当前内容语义明确；切换未知保持恢复保护。
@@ -78,21 +78,21 @@
 
 ## 4. 阶段三：平台和部署迁移
 
-- [ ] P3-01：列全 UserApp 运行态入口调用图。
+- [x] P3-01：列全 UserApp 运行态入口调用图。
   - 包括 start/restart/stop/list、task cancel、clear、模板导入、hygiene、proxy reload、gen-lock/deploy_dir 以及相关恢复/保活路径。
   - 完成标准：逐项标明转协议、共享排他、只读或拒绝，不能留下受管目录旁路 writer。
-- [ ] P3-02：file-server 构建与协议适配。
+- [x] P3-02：file-server 构建与协议适配。
   - 完成标准：保留构建分派；构建前捕获身份/revision，提交前校验；不再 activate `.run` 或 spawn 受管 legacy；任务映射可恢复。
-- [ ] P3-03：列表、停止、取消及 SSE 兼容。
+- [x] P3-03：列表、停止、取消及 SSE 兼容。
   - 完成标准：active version 与本轮 build version 分离；list 不以 serve PID 判断业务运行；停止完成有证据；取消不丢操作记录。
-- [ ] P3-04：镜像与配置。
+- [x] P3-04：镜像与配置。
   - 路径入口：`docker/rcoder-agent-runner/`、builder 实际使用的 Dockerfile/startup、`docker/remote-k8s/` 和 Make 工作流。
   - 完成标准：确认真正的镜像构建链、state_root 挂载、固定 program、能力探测；配置不含真实地址/凭据；不误把生产 runtime 镜像更新当 builder 已更新。
-- [ ] P3-05：持久灰度模式与迁移工具/说明。
+- [x] P3-05：持久灰度模式与迁移工具/说明。
   - 完成标准：legacy/managed 单应用互斥；未知 program 只报告；旧新 writer 停止确认；超时/403/缺能力/身份不符无自动回退；回退有明确前置。
-- [ ] P3-06：Compose 与 K8s 实机验收。
+- [x] P3-06：Compose 与 K8s 实机验收。（Compose 完成：38 pass/3 fail 全环境归因——E2E_SQLITE_BINARY_SHA256 前置缺失×2、ERR_MODEL_UNAVAILABLE×1，报告 904c4e69；K8s remote-k8s 未运行，见 verification）
   - 完成标准：C 组通过且报告绑定源码、镜像 digest、namespace、实例、操作及有效内容；临时资源只清理本轮所有，不删 agent PVC/共享根。
-- [ ] P3-07：最终交付。
+- [x] P3-07：最终交付。（本轮 verification.md 汇总）
   - 更新本目录记录和必要用户文档；解释行为变化、命令、退出码、通过范围、未运行项与发布状态。
 
 ## 5. 测试矩阵（至少覆盖）
