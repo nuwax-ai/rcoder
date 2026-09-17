@@ -4,7 +4,7 @@ name = "file-server-proxy"
 # npm/OSS, 与 rcoder 主版本解耦 (与 crates/file-server 同款纪律)。
 # 0.2.2: 独立双文件日志+日志目录本机回退（用户指正：proxy 要有独立日志方便排查）
 # 0.2.1 子项见 git 历史
-version = "0.2.2"
+version = "0.2.3"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
