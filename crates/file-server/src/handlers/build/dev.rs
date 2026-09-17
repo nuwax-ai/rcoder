@@ -264,6 +264,7 @@ pub(crate) async fn list_dev(State(state): State<AppState>) -> Result<Json<DevLi
                     .unwrap_or_default(),
                 instance_id: None,
                 base_path: None,
+                external_owner: None,
                 log_dir: std::path::PathBuf::new(),
                 temp_log_name: String::new(),
             })

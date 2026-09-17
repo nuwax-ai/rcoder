@@ -1238,6 +1238,18 @@ async fn serve_without_attach(args: &CliArgs) -> Result<()> {
                 {
                     tracing::warn!("endpoint discovery record publish failed: {endpoint_error:#}");
                 }
+                // 本地凭据文件（cross-platform.md §3 端口与认证）：token 经
+                // env 启用写端点时同步落盘到状态根（Unix 0600；Windows ACL
+                // 保护为已知缺口）。平台（file-server）读此文件对既有 owner
+                // 提交运行操作——凭据不出现在命令行参数/日志/identity 响应。
+                if let Some(token) = std::env::var("APP_CLI_DEPLOY_TOKEN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    if let Err(token_error) = kernel.store().store_token(&token) {
+                        tracing::warn!("token file publish failed: {token_error:#}");
+                    }
+                }
             }
             Err(error) => {
                 // B05：状态根不可用 = 运行态可信状态不可读——不再仅关闭新 API

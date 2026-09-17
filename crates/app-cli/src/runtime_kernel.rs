@@ -277,6 +277,37 @@ impl RuntimeStore {
         serde_json::from_str(&content).ok()
     }
 
+    /// 本地凭据文件（cross-platform.md §3）：token 落盘状态根，Unix 0600。
+    /// 平台读此文件对既有 owner 提交运行操作；凭据不经命令行/日志外泄。
+    pub(crate) fn store_token(&self, token: &str) -> Result<()> {
+        let path = self.root.join("token");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .with_context(|| format!("open token file {}", path.display()))?;
+        use std::io::Write as _;
+        file.write_all(token.trim().as_bytes())
+            .and_then(|_| file.sync_all())
+            .with_context(|| format!("persist token file {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 600 token file {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    /// 只读凭据（平台侧探测复用；无副作用）。
+    pub(crate) fn read_token(state_root: &Path) -> Option<String> {
+        std::fs::read_to_string(state_root.join("token"))
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+    }
+
     /// 读取/落盘身份（runtime_instance_id 每次进程启动新生成；
     /// deployment_generation_id 延续既有代次）。
     pub(crate) fn load_or_init_identity(
@@ -1543,6 +1574,42 @@ mod tests {
     }
 
     /// XP10 补充：发现记录持久化 roundtrip + 干净关停清除。
+    #[test]
+    /// 本地凭据文件（cross-platform.md §3）：token 落盘 0600 + 平台侧只读。
+    #[test]
+    fn token_file_roundtrip_with_restricted_permissions() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("state-root");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = RuntimeStore::open_with_root(root.clone(), &workspace).expect("store");
+
+        store
+            .store_token("  secret-token  ")
+            .expect("persist token");
+        // 写入 trim；平台侧读到的是裸值
+        assert_eq!(
+            RuntimeStore::read_token(&root).as_deref(),
+            Some("secret-token")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(root.join("token"))
+                .expect("stat token")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "token file must be owner-only readable"
+            );
+        }
+        // 无 token 文件 → None（owner 未启用写端点）
+        let empty = tempfile::tempdir().expect("empty");
+        assert!(RuntimeStore::read_token(empty.path()).is_none());
+    }
+
     #[test]
     fn endpoint_record_roundtrip_and_clean_clear() {
         let dir = tempfile::tempdir().expect("dir");

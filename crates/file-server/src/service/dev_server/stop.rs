@@ -6,7 +6,7 @@ use super::log;
 use super::process;
 use super::support::lock;
 use super::types::{CleanupStatus, DevServerManager, StoppedDev};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::models::KilledPid;
 
 impl DevServerManager {
@@ -14,6 +14,11 @@ impl DevServerManager {
     /// 释放端口 + 清 temp 日志)。候选 pid = 内存 Map pid ∪ `ps` 扫描 pid (去重)。
     pub async fn stop_dev(&self, project_id: &str) -> AppResult<StoppedDev> {
         let proc = lock(&self.processes)?.remove(project_id);
+        // P3-02：外部 owner——经运行 API 提交 Stop（不经进程信号、不扫 ps、
+        // 不杀我们从未 spawn 的进程树）。
+        if let Some(external) = proc.as_ref().and_then(|p| p.external_owner.as_ref()) {
+            return self.stop_external_owner(project_id, external).await;
+        }
         // P1-03：监督句柄同步摘除（进程组终止后句柄的 wait worker 自行收割
         // 退出；此处不等待——停止确认语义在 dev 任务层经 wait_exit 处理）。
         let supervised = lock(&self.supervised)?.remove(project_id);
@@ -74,6 +79,53 @@ impl DevServerManager {
         }
         Ok(StoppedDev {
             killed_pids: killed,
+        })
+    }
+
+    /// 外部 owner 的停止：提交 Stop 操作并等待终态。管理面保持运行
+    /// （owner 语义），业务停止以操作 Succeeded 为证。
+    async fn stop_external_owner(
+        &self,
+        project_id: &str,
+        external: &crate::models::ExternalOwner,
+    ) -> AppResult<StoppedDev> {
+        let workspace_id = project_id
+            .rsplit(':')
+            .next()
+            .unwrap_or(project_id)
+            .to_string();
+        let route = async {
+            let client = super::owner_client::OwnerClient::new(&external.address, &external.token)?;
+            let status = client.status().await?;
+            let operation_id = format!("fs-stop-{}", uuid::Uuid::new_v4().simple());
+            client
+                .submit_stop(
+                    &operation_id,
+                    &workspace_id,
+                    status.revision,
+                    &external.runtime_instance_id,
+                )
+                .await?;
+            client
+                .wait_terminal(&operation_id, std::time::Duration::from_secs(120))
+                .await
+        };
+        let view = route
+            .await
+            .map_err(|error| AppError::business(format!("stop external owner: {error:#}")))?;
+        if !matches!(
+            view.state,
+            shared_types::RuntimeOperationState::Succeeded
+                | shared_types::RuntimeOperationState::Cancelled
+        ) {
+            return Err(AppError::business(format!(
+                "external owner stop failed: {:?} ({})",
+                view.state,
+                view.error_message.as_deref().unwrap_or("no detail"),
+            )));
+        }
+        Ok(StoppedDev {
+            killed_pids: Vec::new(),
         })
     }
 

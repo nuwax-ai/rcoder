@@ -205,6 +205,9 @@ pub struct Config {
     /// UserApp manifest 编排器程序（P1-03 测试注入：受控假编排器路径；
     /// None = PATH 上的 `app-cli`，生产行为不变）。
     pub app_cli_bin: Option<String>,
+    /// app-cli 管理 API 探测地址（P3-02 owner 复用：spawn 前探测既有
+    /// owner；生产默认 127.0.0.1:3010，测试注入空闲端口避免跨测试竞争）。
+    pub app_cli_admin_probe_addr: String,
 }
 
 impl Default for Config {
@@ -275,6 +278,7 @@ impl Default for Config {
             dev_command_timeout_secs: 600,
             max_build_concurrency: 20,
             app_cli_bin: None,
+            app_cli_admin_probe_addr: "127.0.0.1:3010".to_string(),
         }
     }
 }

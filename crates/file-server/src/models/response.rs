@@ -297,6 +297,22 @@ pub struct DevProcess {
     pub log_dir: std::path::PathBuf,
     #[serde(skip)]
     pub temp_log_name: String,
+    /// 外部 owner（P3-02）：workspace 由非本管理器启动的 app-cli serve
+    /// owner 托管——停止/查询经运行 API 路由，不走进程信号。None = 本
+    /// 管理器自有子进程（legacy 语义不变）。
+    #[serde(skip)]
+    pub external_owner: Option<ExternalOwner>,
+}
+
+/// 外部 owner 连接信息（凭据仅存内存，不上 wire/日志）。
+#[derive(Debug, Clone)]
+pub struct ExternalOwner {
+    /// 管理 API 地址（127.0.0.1:3010）
+    pub address: String,
+    /// X-Deploy-Token（状态根 token 文件读取）
+    pub token: String,
+    /// owner 运行实例 ID（操作提交的期望实例）
+    pub runtime_instance_id: String,
 }
 
 /// 端口池分配明细（port-pool-status 内嵌；PortPoolStatus 快照持有同型列表）。

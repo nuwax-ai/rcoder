@@ -14,6 +14,7 @@
 pub mod coordinated;
 pub mod error_classify;
 pub mod log;
+mod owner_client;
 pub mod port_pool;
 pub mod process;
 mod start;
@@ -202,6 +203,7 @@ mod tests {
                     base_path: None,
                     log_dir: std::path::PathBuf::from("/tmp/nonexistent-fs-test"),
                     temp_log_name: "ghost.log".to_string(),
+                    external_owner: None,
                 },
             );
         }

@@ -166,6 +166,8 @@ impl Config {
         parse!(dev_command_timeout_secs, "DEV_COMMAND_TIMEOUT_SECS");
         parse!(max_build_concurrency, "MAX_BUILD_CONCURRENCY");
         self.app_cli_bin = env_opt_string("FILE_SERVER_APP_CLI_BIN")?;
+        self.app_cli_admin_probe_addr = env_opt_string("FILE_SERVER_APP_CLI_ADMIN_PROBE_ADDR")?
+            .unwrap_or_else(|| "127.0.0.1:3010".to_string());
         self.validate()?;
         Ok(self)
     }
@@ -278,6 +280,8 @@ impl Config {
             dev_command_timeout_secs: env_parse("DEV_COMMAND_TIMEOUT_SECS", 600)?,
             max_build_concurrency: env_parse("MAX_BUILD_CONCURRENCY", 20)?,
             app_cli_bin: env_opt_string("FILE_SERVER_APP_CLI_BIN")?,
+            app_cli_admin_probe_addr: env_opt_string("FILE_SERVER_APP_CLI_ADMIN_PROBE_ADDR")?
+                .unwrap_or_else(|| "127.0.0.1:3010".to_string()),
         };
         config.validate()?;
         Ok(config)

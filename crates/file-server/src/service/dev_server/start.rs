@@ -12,7 +12,7 @@ use super::supervise::SupervisedChild;
 use super::support::{early_exit_err, ldrtemp, lock, read_dev_script};
 use super::types::{AliveProbe, DevServerManager, StartedDev};
 use crate::error::{AppError, AppResult};
-use crate::models::DevProcess;
+use crate::models::{DevProcess, ExternalOwner};
 use crate::service::pnpm::{self, InstallOptions, LogFiles};
 use std::path::Path;
 
@@ -255,6 +255,7 @@ impl DevServerManager {
                 base_path: Some(effective_base),
                 log_dir: ldir.clone(),
                 temp_log_name: log::temp_log_name(now),
+                external_owner: None,
             },
         );
 
@@ -292,6 +293,13 @@ impl DevServerManager {
             return Err(AppError::business(
                 "previous orchestrator cleanup unconfirmed; retry after stop completes",
             ));
+        }
+
+        // P3-02：owner 感知——spawn 前探测 3010。匹配本 workspace 的 serve
+        // owner 经运行 API 复用（消除平台/agent 双启动的 3010 冲突）；legacy
+        // app-cli / foreign 应答明确拒绝（XP04：不杀对方、不盲 spawn）。
+        if let Some(started) = self.reuse_or_refuse_owner(project_id, project_path).await? {
+            return Ok(started);
         }
 
         let ldir = log::log_dir(&self.config, project_id);
@@ -386,6 +394,7 @@ impl DevServerManager {
                 started_at: now,
                 log_dir: ldir.clone(),
                 temp_log_name: log::temp_log_name(now),
+                external_owner: None,
             },
         );
         lock(&self.supervised)?.insert(project_id.to_string(), supervised);
@@ -394,6 +403,125 @@ impl DevServerManager {
             pid,
             port: PINGAP_ENTRY_PORT,
         })
+    }
+
+    /// P3-02：探测 3010 的既有 owner——三种结局：
+    /// - `Ok(None)`：无人监听 → 调用方走本地 spawn（legacy 路径不变）；
+    /// - `Ok(Some(started))`：匹配本 workspace 的 serve owner → 经运行 API
+    ///   提交 Restart(source) 复用，登记 external DevProcess；
+    /// - `Err`：legacy app-cli（无 runtime API）、foreign 应答、协议不兼容、
+    ///   凭据缺失——明确诊断拒绝，不杀对方、不盲 spawn（XP04）。
+    async fn reuse_or_refuse_owner(
+        &self,
+        project_id: &str,
+        project_path: &Path,
+    ) -> AppResult<Option<StartedDev>> {
+        let owner_addr = self.config.app_cli_admin_probe_addr.clone();
+        let Some(identity) = super::owner_client::probe_owner(&owner_addr).await else {
+            // 无 runtime identity：区分"legacy app-cli 应答"与"无人监听"——
+            // /v1/deploy/status 是 app-cli 专属路由（foreign 服务 404）
+            if legacy_app_cli_responds(&owner_addr).await {
+                return Err(AppError::business(
+                    "admin port 3010 is held by a legacy app-cli process without the \
+                     runtime API; stop it before starting a managed instance",
+                ));
+            }
+            return Ok(None);
+        };
+
+        if !super::owner_client::protocol_compatible(&identity) {
+            return Err(AppError::business(format!(
+                "app-cli owner at 3010 speaks incompatible protocol v{} (expected v{}); \
+                 upgrade it before reuse",
+                identity.protocol_version,
+                shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+            )));
+        }
+        let expected_ws = project_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let app_id = std::env::var("PROJECT_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "unknown-app".to_string());
+        if identity.workspace_id != expected_ws || identity.application_id != app_id {
+            return Err(AppError::business(format!(
+                "admin port 3010 is held by a different app-cli owner \
+                 (app {}/{}, expected {}/{expected_ws}); refusing to spawn a \
+                 competing orchestrator",
+                identity.application_id, identity.workspace_id, app_id,
+            )));
+        }
+
+        // 匹配 owner：读凭据（owner 未启用写端点 → 无法路由，明确报错）
+        let state_root = super::owner_client::owner_state_root(project_path, &app_id)
+            .map_err(|error| AppError::system(format!("resolve owner state root: {error:#}")))?;
+        let Some(token) = super::owner_client::read_owner_token(&state_root) else {
+            return Err(AppError::business(
+                "workspace is already managed by an app-cli owner whose runtime API \
+                 credentials are unavailable (APP_CLI_DEPLOY_TOKEN not enabled); \
+                 stop it or restart it with the token enabled",
+            ));
+        };
+        let client = super::owner_client::OwnerClient::new(&owner_addr, &token)
+            .map_err(|error| AppError::system(format!("build owner client: {error:#}")))?;
+        let route_restart = async {
+            let status = client.status().await?;
+            let operation_id = format!("fs-restart-{}", uuid::Uuid::new_v4().simple());
+            client
+                .submit_restart_source(
+                    &operation_id,
+                    &expected_ws,
+                    status.revision,
+                    &identity.runtime_instance_id,
+                )
+                .await?;
+            client
+                .wait_terminal(&operation_id, Duration::from_secs(180))
+                .await
+        };
+        let view = route_restart
+            .await
+            .map_err(|error| AppError::business(format!("reuse existing owner: {error:#}")))?;
+        if !matches!(
+            view.state,
+            shared_types::RuntimeOperationState::Succeeded
+                | shared_types::RuntimeOperationState::Cancelled
+        ) {
+            return Err(AppError::business(format!(
+                "owner restart failed: {:?} ({})",
+                view.state,
+                view.error_message.as_deref().unwrap_or("no detail"),
+            )));
+        }
+
+        // 登记 external DevProcess：停止/后续操作经运行 API 路由
+        // （pid 0 哨兵——外部 owner 无本地子进程句柄）。
+        let now = process::now_ms();
+        let ldir = log::log_dir(&self.config, project_id);
+        lock(&self.processes)?.insert(
+            project_id.to_string(),
+            DevProcess {
+                pid: 0,
+                port: shared_types::APP_ENTRY_PORT,
+                project_id: project_id.to_string(),
+                started_at: now,
+                instance_id: None,
+                base_path: None,
+                log_dir: ldir,
+                temp_log_name: log::temp_log_name(now),
+                external_owner: Some(ExternalOwner {
+                    address: owner_addr,
+                    token,
+                    runtime_instance_id: identity.runtime_instance_id.clone(),
+                }),
+            },
+        );
+        Ok(Some(StartedDev {
+            pid: 0,
+            port: shared_types::APP_ENTRY_PORT,
+        }))
     }
 
     /// 就绪轮询: 进程早退 → Err (读 stderr ring 分类成结构化错误); HTTP 就绪 → Ok;
@@ -453,6 +581,30 @@ impl DevServerManager {
     }
 }
 
+/// legacy app-cli 探测：/v1/deploy/status 是 app-cli 专属路由——200 且
+/// 响应含 protocol_version 即为 app-cli 管理面（legacy 或 serve 形态）；
+/// foreign 服务 404/异构 body → false。
+async fn legacy_app_cli_responds(address: &str) -> bool {
+    let url = format!("http://{address}/v1/deploy/status");
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .no_proxy()
+        .build()
+    else {
+        return false;
+    };
+    let Ok(response) = client.get(&url).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    response
+        .json::<serde_json::Value>()
+        .await
+        .is_ok_and(|body| body.get("protocol_version").is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +632,9 @@ mod tests {
         let mut config = crate::Config::from_env().expect("test config");
         config.app_cli_bin = Some(script.display().to_string());
         config.log_base_dir = logs.to_path_buf();
+        // 探测地址指向必然拒绝连接的端口：spawn 前探测恒 fallthrough，
+        // 避免与 owner_probe_branches（占用 3010）跨测试进程竞争
+        config.app_cli_admin_probe_addr = "127.0.0.1:1".to_string();
         // 快速宽松就绪（假编排器不监听 9080，走"进程存活"分支）
         config.dev_alive_max_wait_ms = 300;
         config.dev_alive_check_timeout_ms = 100;
@@ -569,5 +724,232 @@ mod tests {
             .stop_dev("pg-inject-none-test")
             .await
             .expect("stop dev");
+    }
+}
+
+#[cfg(test)]
+mod owner_reuse_tests {
+    use super::*;
+    use crate::Config;
+    use std::sync::Arc;
+
+    /// P3-02 探测分支（串行四阶段——nextest 每测试独立进程，3010 需独占）：
+    /// ① 无监听 → fallthrough spawn；② legacy 应答 → 拒绝；
+    /// ③ 匹配 owner + token → 经运行 API 复用并登记 external；
+    /// ④ foreign workspace → 拒绝。
+    #[tokio::test]
+    async fn owner_probe_branches() {
+        let mgr = DevServerManager::new(Arc::new(Config::from_env().expect("test config")));
+        let dir = tempfile::tempdir().unwrap();
+
+        // ① 无监听（此阶段 3010 必须空闲——串行前提）
+        let ws_fresh = dir.path().join("ws-fresh");
+        std::fs::create_dir_all(&ws_fresh).unwrap();
+        assert!(
+            mgr.reuse_or_refuse_owner("userapp:app", &ws_fresh)
+                .await
+                .expect("probe")
+                .is_none(),
+            "no responder must fall through to spawn"
+        );
+
+        // ② legacy app-cli 应答（仅 /v1/deploy/status）
+        let legacy = axum::Router::new().route(
+            "/v1/deploy/status",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"protocol_version": 4, "phase": "running"}))
+            }),
+        );
+        let legacy_mock = serve_mock(legacy).await;
+        let ws_legacy = dir.path().join("ws-legacy");
+        std::fs::create_dir_all(&ws_legacy).unwrap();
+        let error = mgr
+            .reuse_or_refuse_owner("userapp:app", &ws_legacy)
+            .await
+            .expect_err("legacy responder must be refused");
+        let AppError::Business(message) = &error else {
+            panic!("expected business error, got {error:?}")
+        };
+        assert!(
+            message.contains("legacy app-cli"),
+            "diagnostic should name legacy: {message}"
+        );
+
+        legacy_mock.release().await;
+
+        // ③ 匹配 owner + token 文件 → 复用
+        let ws_reuse = dir.path().join("ws-reuse");
+        std::fs::create_dir_all(&ws_reuse).unwrap();
+        let state_root = dir.path().join(".app-cli-state").join("unknown-app");
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::write(state_root.join("token"), "test-token").unwrap();
+        let owner = mock_owner_router("ws-reuse");
+        let owner_mock = serve_mock(owner).await;
+        let started = mgr
+            .reuse_or_refuse_owner("userapp:app", &ws_reuse)
+            .await
+            .expect("reuse path")
+            .expect("must reuse existing owner");
+        assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
+        {
+            let registered = lock(&mgr.processes).unwrap();
+            let entry = registered.get("userapp:app").expect("registered");
+            assert_eq!(
+                entry.external_owner.as_ref().expect("external").token,
+                "test-token"
+            );
+        }
+
+        owner_mock.release().await;
+
+        // ④ foreign workspace → 拒绝
+        let foreign = mock_owner_router("ws-someone-else");
+        let foreign_mock = serve_mock(foreign).await;
+        let ws_mine = dir.path().join("ws-mine");
+        std::fs::create_dir_all(&ws_mine).unwrap();
+        let error = mgr
+            .reuse_or_refuse_owner("userapp:app", &ws_mine)
+            .await
+            .expect_err("foreign owner must be refused");
+        let AppError::Business(message) = &error else {
+            panic!("expected business error, got {error:?}")
+        };
+        assert!(
+            message.contains("different app-cli owner"),
+            "diagnostic should name the conflict: {message}"
+        );
+    }
+
+    fn mock_owner_router(ws: &str) -> axum::Router {
+        let ws = ws.to_string();
+        let identity_ws = ws.clone();
+        axum::Router::new()
+            .route(
+                "/v1/runtime/identity",
+                axum::routing::get(move || {
+                    let ws = identity_ws.clone();
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "success": true, "code": "OK",
+                            "data": {
+                                "application_id": "unknown-app",
+                                "service_family": "userapp-dev",
+                                "workspace_id": ws,
+                                "source_root": "/ws",
+                                "runtime_instance_id": "instance-test",
+                                "deployment_generation_id": "gen-test",
+                                "protocol_version": shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+                                "capabilities": []
+                            },
+                            "message": "ok"
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/runtime/status",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "success": true, "code": "OK",
+                        "data": {
+                            "desired": "running", "observed": "ready", "revision": 0,
+                            "recovery_protection": false,
+                            "runtime_instance_id": "instance-test"
+                        },
+                        "message": "ok"
+                    }))
+                }),
+            )
+            .route(
+                "/v1/runtime/operations",
+                axum::routing::post(
+                    |axum::Json(req): axum::Json<serde_json::Value>| async move {
+                        let id = req
+                            .get("operation_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("op")
+                            .to_string();
+                        axum::Json(serde_json::json!({
+                            "success": true, "code": "OK",
+                            "data": {
+                                "operation_id": id, "kind": "restart", "state": "succeeded",
+                                "request_digest": "digest", "revision": 1,
+                                "runtime_instance_id": "instance-test"
+                            },
+                            "message": "ok"
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/v1/runtime/operations/{id}",
+                axum::routing::get(
+                    |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                        axum::Json(serde_json::json!({
+                            "success": true, "code": "OK",
+                            "data": {
+                                "operation_id": id, "kind": "restart", "state": "succeeded",
+                                "request_digest": "digest", "revision": 1,
+                                "runtime_instance_id": "instance-test"
+                            },
+                            "message": "ok"
+                        }))
+                    },
+                ),
+            )
+    }
+
+    /// 起 mock 在 3010；返回显式释放句柄（顺序关闭 + 等待端口回收）。
+    async fn serve_mock(app: axum::Router) -> MockOwner {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:3010")
+            .await
+            .expect("bind 3010");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("mock serve");
+        });
+        MockOwner {
+            task: Some(task),
+            tx: Some(tx),
+        }
+    }
+
+    struct MockOwner {
+        task: Option<tokio::task::JoinHandle<()>>,
+        tx: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+    impl MockOwner {
+        /// 显式关闭并等待端口回收（下一阶段绑定的前提）。
+        async fn release(mut self) {
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(task) = self.task.take() {
+                let _ = task.await;
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while tokio::net::TcpListener::bind("127.0.0.1:3010")
+                .await
+                .is_err()
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "mock owner did not release port 3010"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    impl Drop for MockOwner {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+        }
     }
 }
