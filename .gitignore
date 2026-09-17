@@ -6,6 +6,7 @@
 .idea
 /logs
 .zcode
+.claude
 tests/sse_e2e/results
 __pycache__/
 /target-console
