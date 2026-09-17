@@ -1245,10 +1245,9 @@ async fn serve_without_attach(args: &CliArgs) -> Result<()> {
                 if let Some(token) = std::env::var("APP_CLI_DEPLOY_TOKEN")
                     .ok()
                     .filter(|value| !value.trim().is_empty())
+                    && let Err(token_error) = kernel.store().store_token(&token)
                 {
-                    if let Err(token_error) = kernel.store().store_token(&token) {
-                        tracing::warn!("token file publish failed: {token_error:#}");
-                    }
+                    tracing::warn!("token file publish failed: {token_error:#}");
                 }
             }
             Err(error) => {

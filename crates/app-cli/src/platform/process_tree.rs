@@ -19,6 +19,9 @@ use std::time::Duration;
 /// 受管子进程（持有进程组/Job 归属资源）。
 pub(crate) struct ManagedChild {
     inner: Box<dyn process_wrap::tokio::ChildWrapper>,
+    /// spawn 时固化的进程 ID（组信号/组探测目标）。不能事后从 wrapper 取：
+    /// 进程被 reap 后 `Child::id()` 返回 None，会丢组身份。
+    pid: Option<u32>,
 }
 
 /// 停止结果（cross-platform.md §4：区分正常收尾、强制停止、清理未确认）。
@@ -45,41 +48,132 @@ pub(crate) fn spawn_managed(cmd: tokio::process::Command) -> Result<ManagedChild
     let child = wrap
         .spawn()
         .context("spawn managed child in process group/job")?;
-    Ok(ManagedChild { inner: child })
+    let pid = child.id();
+    Ok(ManagedChild { inner: child, pid })
 }
 
 impl ManagedChild {
     /// 进程 ID（诊断用）。
     pub fn id(&self) -> Option<u32> {
-        self.inner.id()
+        self.pid
     }
 
-    /// 优雅停止：发送停止信号 → 等待宽限期 → 强制终止整个进程树。
+    /// 取走子进程 stdout 管道（业务日志转发；wrapper 透传到内层 Child）。
+    pub fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.inner.stdout().take()
+    }
+
+    /// 取走子进程 stderr 管道（业务日志转发；wrapper 透传到内层 Child）。
+    pub fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.inner.stderr().take()
+    }
+
+    /// 优雅停止：发送停止信号 → 宽限期 → 强制终止整个进程树，并确认收束。
     ///
-    /// `grace_period` 为业务进程的正常退出等待时间。
+    /// `grace_period` 为业务进程的正常退出等待时间。收束确认语义：
+    /// - Unix：root 已退出**且进程组内无存活成员**（组信号可达性与父子关系
+    ///   无关——root 先死时孙进程被 reparent 到 init，waitpid 视角 ECHILD
+    ///   不构成收束证据，必须组探测）；
+    /// - Windows：wrapper `kill()`（TerminateJobObject + Job 空仓收束循环）
+    ///   返回即整树收束（Job 归属不随 reparent 改变）。
+    ///
+    /// 宽限期与确认路径都不能调用 wrapper 的树级 `wait()`——它会把 root 状态
+    /// 写入缓存，使后续 `kill()` 内部的收束循环短路。
     pub async fn stop(&mut self, grace_period: Duration) -> StopOutcome {
-        // 第一步：发送优雅停止信号
+        // 第一步：发送优雅停止信号（Windows 无跨树信号，为 no-op）
         self.send_stop_signal();
 
-        // 等待宽限期
-        match tokio::time::timeout(grace_period, self.inner.wait()).await {
-            Ok(Ok(status)) => return StopOutcome::Graceful(status),
-            Ok(Err(_)) => return StopOutcome::Unconfirmed,
-            Err(_) => {} // 超时，继续强制终止
+        // 第二步：宽限期内等整树收束
+        #[cfg(unix)]
+        if let Some(status) = self.await_tree_exit(grace_period).await {
+            return StopOutcome::Graceful(status);
         }
+        #[cfg(windows)]
+        let root_within_grace = tokio::time::timeout(grace_period, self.wait_root()).await;
 
-        // 宽限期后强制终止整个进程树（kill 经 wrapper 派发到组/Job）。
-        // trait 返回未固定的 Box<dyn Future>——into_pin 后才可 await。
-        let kill = Box::into_pin(self.inner.kill());
-        if kill.await.is_err() {
-            return StopOutcome::Unconfirmed;
+        // 第三步：强制终止整个进程树（kill 经 wrapper 派发到组/Job：
+        // Unix SIGKILL 进程组 + 收束 reap；Windows TerminateJobObject + Job 收束）。
+        #[cfg(unix)]
+        {
+            match self.kill_tree_and_confirm().await {
+                Some(status) => StopOutcome::Forced(status),
+                None => StopOutcome::Unconfirmed,
+            }
         }
+        #[cfg(windows)]
+        {
+            let kill = Box::into_pin(self.inner.kill());
+            if kill.await.is_err() {
+                return StopOutcome::Unconfirmed;
+            }
+            match root_within_grace {
+                Ok(Ok(status)) => StopOutcome::Graceful(status),
+                _ => match self.try_wait_root() {
+                    Ok(Some(status)) => StopOutcome::Forced(status),
+                    _ => StopOutcome::Unconfirmed,
+                },
+            }
+        }
+    }
 
-        match tokio::time::timeout(Duration::from_secs(5), self.inner.wait()).await {
-            Ok(Ok(status)) => StopOutcome::Forced(status),
-            Ok(Err(_)) => StopOutcome::Unconfirmed,
-            Err(_) => StopOutcome::Unconfirmed,
+    /// Unix 强杀整树并有界确认（root 已 reap 且进程组 ESRCH）。
+    ///
+    /// macOS 僵尸窗口：TERM 杀死成员后、收尸完成前，对"仅剩僵尸"的组
+    /// `killpg(SIGKILL)` 返回 **EPERM** 而非 Linux 的成功语义，且 start_kill
+    /// 失败使 wrapper kill 不进内部收束 reap——僵尸无人收尸则组探测永真。
+    /// 因此确认循环每轮复调 wrapper kill：start_kill 幂等（ESRCH/EPERM 均无
+    /// 害），内部 wait 的 reap 循环（waitpid(-pgid)）会收掉同组僵尸，收尸后
+    /// 组探测即 ESRCH。真正的 EPERM（无法送达的存活成员）由 deadline 兜底
+    /// 为收束未确认。
+    #[cfg(unix)]
+    async fn kill_tree_and_confirm(&mut self) -> Option<ExitStatus> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut root_status: Option<ExitStatus> = None;
+        loop {
+            let _ = Box::into_pin(self.inner.kill()).await;
+            if root_status.is_none() {
+                root_status = self.try_wait_root().ok().flatten();
+            }
+            if let Some(status) = root_status
+                && !self.process_group_alive()
+            {
+                return Some(status);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// 有界轮询整树收束（Unix）：root 已 reap 且进程组内无存活成员。
+    /// 超时返回 None。等价旧 supervisor 的 wait_for_quiescence 双条件。
+    #[cfg(unix)]
+    async fn await_tree_exit(&mut self, budget: Duration) -> Option<ExitStatus> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut root_status: Option<ExitStatus> = None;
+        loop {
+            if root_status.is_none() {
+                root_status = self.try_wait_root().ok().flatten();
+            }
+            if let Some(status) = root_status
+                && !self.process_group_alive()
+            {
+                return Some(status);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 进程组是否仍有存活成员（观察失败按存活处理——保守不误报收束）。
+    #[cfg(unix)]
+    fn process_group_alive(&self) -> bool {
+        self.pid
+            .and_then(|pid| process_utils::process_group_exists(pid).ok())
+            .unwrap_or(true)
     }
 
     /// 发送优雅停止信号（平台特定）。
@@ -87,7 +181,7 @@ impl ManagedChild {
     fn send_stop_signal(&mut self) {
         // ProcessGroup::leader() 使子进程自成组长（pgid == pid）→ 组信号
         // 可达全部后代
-        if let Some(pid) = self.inner.id() {
+        if let Some(pid) = self.pid {
             process_utils::kill_process_group(pid, process_utils::KillSignal::SIGTERM);
         }
     }
@@ -98,9 +192,23 @@ impl ManagedChild {
     #[cfg(windows)]
     fn send_stop_signal(&mut self) {}
 
-    /// 等待进程退出。
-    pub async fn wait(&mut self) -> Result<ExitStatus> {
-        self.inner.wait().await.context("wait for managed child")
+    /// 只等**根进程**退出，不等整树收束。
+    ///
+    /// 服务退出检测与迁移状态捕获需要旧 `tokio::process::Child` 的 root 语义：
+    /// 根进程退出即触发后续全组清理——若用树级等待，一个挂死的孙进程会掩盖
+    /// 根进程死亡（监督循环不触发重启）。树级收束确认由 [`Self::stop`] 承担
+    /// （信号 → 宽限 → 整树强杀 → 确认）。
+    pub(crate) async fn wait_root(&mut self) -> Result<ExitStatus> {
+        self.inner
+            .inner_mut()
+            .wait()
+            .await
+            .context("wait for managed child root process")
+    }
+
+    /// 非阻塞查询**根进程**退出状态（root 语义，理由同 [`Self::wait_root`]）。
+    pub(crate) fn try_wait_root(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.inner.inner_mut().try_wait()
     }
 }
 
@@ -145,7 +253,7 @@ mod tests {
         let mut cmd = silent(tokio::process::Command::new("/bin/sh"));
         cmd.args(["-c", "exit 0"]);
         let mut child = spawn_managed(cmd).unwrap();
-        let status = child.wait().await.unwrap();
+        let status = child.wait_root().await.unwrap();
         assert!(status.success());
     }
 
@@ -180,7 +288,7 @@ mod tests {
         cmd.current_dir(&workdir);
         cmd.args(["-c", &format!("echo ok > '{}'", marker.display())]);
         let mut child = spawn_managed(cmd).unwrap();
-        let status = child.wait().await.unwrap();
+        let status = child.wait_root().await.unwrap();
         assert!(status.success(), "spawn in unicode+spaces cwd must succeed");
         assert!(
             marker.exists(),
@@ -208,7 +316,7 @@ mod tests {
             cmd.raw_arg(format!("/C echo ok>\"{}\"", marker.display()));
         }
         let mut child = spawn_managed(cmd).unwrap();
-        let status = child.wait().await.unwrap();
+        let status = child.wait_root().await.unwrap();
         assert!(
             status.success(),
             "spawn in unicode+spaces cwd must succeed (status: {status:?})"
@@ -226,7 +334,7 @@ mod tests {
         let mut cmd = silent(tokio::process::Command::new("cmd"));
         cmd.args(["/C", "exit 0"]);
         let mut child = spawn_managed(cmd).unwrap();
-        let status = child.wait().await.unwrap();
+        let status = child.wait_root().await.unwrap();
         assert!(status.success());
     }
 

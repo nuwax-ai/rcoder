@@ -9,16 +9,21 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tracing::{error, info, warn};
 
 use crate::config::CliArgs;
 use crate::manifest::{self, ServiceSpec};
 use crate::orchestration_events::{FailedService, OrchestrationEvent, emit as emit_event};
+use crate::platform::process_tree::{ManagedChild, StopOutcome, spawn_managed};
 use crate::proxy::admin_probe;
 use crate::proxy::compiler::compile_and_validate;
 use crate::proxy::pingap::PINGAP_PORT;
 use crate::runtime_status::RuntimeStatusService;
+
+/// supervisor 全部真实子进程（业务服务 / migrate / pingap）统一走受管进程树：
+/// Unix 进程组 / Windows Job Object（R01——spawn 前归属无逃逸窗口，停止收束整树）。
+type ManagedChildren = Vec<(String, ManagedChild)>;
 
 /// 失败终局 Done 中编排器自身条目的 service 名（区别于用户服务；平台侧
 /// failed 清单按条目映射进任务失败汇总，编排阶段错误不再依赖超时兜底）。
@@ -98,7 +103,7 @@ async fn run_inner(
     // PID1 继续持端口, 外层 supervisor 重启 app-cli 后新实例同名服务 bind 冲突
     // → 永久 crash loop (只能重建容器恢复)。start_pingap 内部 config 确认失败
     // 路径已自行清理, 此处对已 take 空的集合再调 shutdown_all 幂等无害。
-    let mut children: Vec<(String, Child)> = Vec::new();
+    let mut children: ManagedChildren = Vec::new();
     let mut started_user_services = 0usize;
     // 启动失败清单（容错语义：单服务 migrate/spawn/探测失败不阻塞其余服务；
     // pingap 失败仍整体 Err 全组清理——入口必需）
@@ -562,7 +567,7 @@ async fn start_service(
     ws_root: &Path,
     log_dir: &Path,
     release_id: &str,
-) -> Result<Child> {
+) -> Result<ManagedChild> {
     let cwd = ws_root.join(&spec.dir);
     let service_log_dir = log_dir.join(&spec.service_id);
     tokio::fs::create_dir_all(&service_log_dir)
@@ -571,7 +576,9 @@ async fn start_service(
     let out_path = service_log_dir.join("runtime.out.log");
     let err_path = service_log_dir.join("runtime.err.log");
 
-    let mut cmd = process_group_command(crate::win_cmd::resolve_spawn_program(&argv[0]));
+    // R01：真实业务进程统一受管进程树 spawn（Unix 进程组 / Windows Job
+    // Object）——npm/pnpm shell 启动的 node 子孙全部归属，停止收束整树。
+    let mut cmd = Command::new(crate::win_cmd::resolve_spawn_program(&argv[0]));
     cmd.args(&argv[1..])
         .current_dir(&cwd)
         .envs(&spec.env)
@@ -585,18 +592,17 @@ async fn start_service(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
+    let mut child = spawn_managed(cmd)
         .with_context(|| format!("spawn {}: {}", spec.service_id, argv.join(" ")))?;
 
     // pipe → 带轮转的日志文件（append 模式，不 truncate；超 10MB rotate，保留 3 份）
-    if let Some(stdout) = child.stdout.take() {
+    if let Some(stdout) = child.take_stdout() {
         let p = out_path.clone();
         tokio::spawn(crate::log::writer::pipe_to_rotating_file(
             stdout, p, None, None,
         ));
     }
-    if let Some(stderr) = child.stderr.take() {
+    if let Some(stderr) = child.take_stderr() {
         let p = err_path.clone();
         tokio::spawn(crate::log::writer::pipe_to_rotating_file(
             stderr, p, None, None,
@@ -623,18 +629,19 @@ pub(crate) async fn run_transient(argv: &[String], cwd: &Path) -> Result<()> {
 
 async fn run_transient_with_timeout(argv: &[String], cwd: &Path, timeout: Duration) -> Result<()> {
     let program = argv.first().context("migration command is empty")?;
-    let mut child = process_group_command(crate::win_cmd::resolve_spawn_program(program))
-        .args(&argv[1..])
+    // R01：migrate 同样走受管进程树——shell 包装的迁移命令 spawn 的子孙
+    // （工作进程/DB writer）整树归属，超时与收尾均收束确认。
+    let mut cmd = Command::new(crate::win_cmd::resolve_spawn_program(program));
+    cmd.args(&argv[1..])
         .current_dir(cwd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn migrate: {}", argv.join(" ")))?;
+        .stderr(Stdio::piped());
+    let mut child =
+        spawn_managed(cmd).with_context(|| format!("spawn migrate: {}", argv.join(" ")))?;
 
-    let groups = child.id().into_iter().collect();
     // 并发 drain stdout/stderr：防 pipe 被写满阻塞 + 捕获失败原因
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let stdout = child.take_stdout();
+    let stderr = child.take_stderr();
     let out_task = tokio::spawn(async move {
         let mut buf = String::new();
         if let Some(mut s) = stdout {
@@ -650,27 +657,39 @@ async fn run_transient_with_timeout(argv: &[String], cwd: &Path, timeout: Durati
         buf
     });
 
-    let outcome = tokio::time::timeout(timeout, child.wait()).await;
+    // 只等根进程退出（root 语义）：root 正常退出后仍可能有后台孙进程在写
+    // （迁移 shell `cmd &` 后台化），超时与收尾判定不能被树级 wait 阻塞。
+    let outcome = tokio::time::timeout(timeout, child.wait_root()).await;
     // A shell may exit successfully while descendants still execute migrations.
-    // Confirm the original group is gone before allowing recovery or success.
-    if let Err(error) = shutdown_all_with_groups(vec![("migration".into(), child)], groups, 0).await
-    {
-        out_task.abort();
-        err_task.abort();
-        return Err(error);
-    }
+    // Confirm the original tree is stopped (and gone) before allowing recovery
+    // or success — stop(ZERO) 对已退出的 root 直通，对残留孙进程 TERM→KILL
+    // 并整树收束确认。
+    let stop_outcome = child.stop(Duration::ZERO).await;
     let status = match outcome {
         Ok(status) => status.context("wait migrate")?,
         Err(_) => {
             out_task.abort();
             err_task.abort();
             anyhow::bail!(
-                "migrate timed out after {}ms: {}",
+                "migrate timed out after {}ms: {}{}",
                 timeout.as_millis(),
-                argv.join(" ")
+                argv.join(" "),
+                if stop_outcome == StopOutcome::Unconfirmed {
+                    " (tree stop unconfirmed)"
+                } else {
+                    ""
+                }
             );
         }
     };
+    if stop_outcome == StopOutcome::Unconfirmed {
+        out_task.abort();
+        err_task.abort();
+        anyhow::bail!(
+            "migrate tree stop unconfirmed after root exit: {}",
+            argv.join(" ")
+        );
+    }
     let out = out_task.await.unwrap_or_default();
     let err = err_task.await.unwrap_or_default();
 
@@ -694,7 +713,7 @@ async fn start_pingap(
     ws_root: &Path,
     pingap_bin: &Path,
     release: &workspace_manifest::ReleaseLock,
-    children: &mut Vec<(String, Child)>,
+    children: &mut ManagedChildren,
 ) -> Result<()> {
     let runtime_root = std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
@@ -714,7 +733,8 @@ async fn start_pingap(
         uuid::Uuid::new_v4().to_string(),
     );
 
-    let mut cmd = process_group_command(pingap_bin);
+    // R01：pingap 受管进程树 spawn（与业务服务同一停止/收束链）。
+    let mut cmd = Command::new(pingap_bin);
     cmd.arg("-c")
         .arg(&outcome.config_path)
         .arg("--autoreload")
@@ -724,7 +744,7 @@ async fn start_pingap(
         .env("PINGAP_ADMIN_ADDR", &endpoint.addr)
         .env("PINGAP_ADMIN_USER", &endpoint.user)
         .env("PINGAP_ADMIN_PASSWORD", &endpoint.password);
-    let child = cmd.spawn().context("spawn pingap")?;
+    let child = spawn_managed(cmd).context("spawn pingap")?;
     info!(
         "🚀 start pingap on :{} (pid={})",
         PINGAP_PORT,
@@ -759,19 +779,15 @@ async fn start_pingap(
 
 // ── supervise（信号 + 任一退出 → kill all → return）─────────────────────────────
 
-/// 优雅停机宽限期（秒）：先 SIGTERM，超时后 SIGKILL。
-/// 对齐 agent_runner shutdown 惯例，避免 DB/写文件类子进程丢未刷盘数据。
-/// 阻塞直到收到 SIGINT/SIGTERM 或任一子进程退出 → 优雅停止所有子进程 → return。
+/// 优雅停机：所有受管子进程并发停止（信号 → 共享宽限 deadline → 整树强杀），
+/// 任何一个进程树收束未确认即整体失败（R01：停止完成要求整个受管树收束，
+/// 不能只等直接 Child）。
 async fn supervise(
-    mut children: Vec<(String, Child)>,
+    mut children: ManagedChildren,
     shutdown_timeout_seconds: u64,
     cancel: Option<tokio_util::sync::CancellationToken>,
     known_failed: Vec<String>,
 ) -> Result<()> {
-    let groups = children
-        .iter()
-        .filter_map(|(_, child)| child.id())
-        .collect();
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("📡 received SIGINT, shutting down");
@@ -794,7 +810,7 @@ async fn supervise(
             }
         }
     }
-    shutdown_all_with_groups(children, groups, shutdown_timeout_seconds).await
+    shutdown_all(children, shutdown_timeout_seconds).await
 }
 
 /// A deployment cannot publish a terminal status until shutdown is confirmed.
@@ -807,100 +823,44 @@ impl std::fmt::Display for ShutdownUnconfirmed {
 }
 impl std::error::Error for ShutdownUnconfirmed {}
 
-async fn shutdown_all(children: Vec<(String, Child)>, shutdown_timeout_seconds: u64) -> Result<()> {
-    let groups: Vec<_> = children
-        .iter()
-        .filter_map(|(_, child)| child.id())
+async fn shutdown_all(children: ManagedChildren, shutdown_timeout_seconds: u64) -> Result<()> {
+    // 并发停止：每个 stop 的首个 poll 即发出信号，宽限窗口共享同一时刻起算
+    //（与旧实现"先全体 TERM、再并行等宽限、超时全体 KILL"等时序）。
+    let grace = Duration::from_secs(shutdown_timeout_seconds);
+    let results =
+        futures::future::join_all(children.into_iter().map(|(name, mut child)| async move {
+            let outcome = child.stop(grace).await;
+            (name, outcome)
+        }))
+        .await;
+    let unconfirmed: Vec<String> = results
+        .into_iter()
+        .filter_map(|(name, outcome)| match outcome {
+            StopOutcome::Unconfirmed => Some(name),
+            _ => None,
+        })
         .collect();
-    shutdown_all_with_groups(children, groups, shutdown_timeout_seconds).await
-}
-
-async fn shutdown_all_with_groups(
-    mut children: Vec<(String, Child)>,
-    groups: Vec<u32>,
-    shutdown_timeout_seconds: u64,
-) -> Result<()> {
-    for (_, child) in &mut children {
-        send_term(child);
-    }
-    let grace = tokio::time::Instant::now() + Duration::from_secs(shutdown_timeout_seconds);
-    if wait_for_quiescence(&mut children, &groups, grace).await? {
-        return Ok(());
-    }
-    for &pid in &groups {
-        #[cfg(unix)]
-        process_utils::kill_process_group(pid, process_utils::KillSignal::SIGKILL);
-        #[cfg(not(unix))]
-        let _ = pid;
-    }
-    #[cfg(not(unix))]
-    for (_, child) in &mut children {
-        child
-            .start_kill()
-            .map_err(|e| ShutdownUnconfirmed(e.to_string()))?;
-    }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    if wait_for_quiescence(&mut children, &groups, deadline).await? {
-        return Ok(());
-    }
-    Err(ShutdownUnconfirmed("processes remain after termination deadline".into()).into())
-}
-
-async fn wait_for_quiescence(
-    children: &mut [(String, Child)],
-    groups: &[u32],
-    deadline: tokio::time::Instant,
-) -> Result<bool> {
-    loop {
-        let mut exited = true;
-        for (name, child) in children.iter_mut() {
-            exited &= child
-                .try_wait()
-                .map_err(|e| ShutdownUnconfirmed(format!("reap {name}: {e}")))?
-                .is_some();
-        }
-        #[cfg(unix)]
-        for &pid in groups {
-            exited &= !process_utils::process_group_exists(pid)
-                .map_err(|e| ShutdownUnconfirmed(format!("inspect process group {pid}: {e}")))?;
-        }
-        #[cfg(not(unix))]
-        let _ = groups;
-        if exited {
-            return Ok(true);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(false);
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    if unconfirmed.is_empty() {
+        Ok(())
+    } else {
+        Err(ShutdownUnconfirmed(format!(
+            "process tree(s) remain after termination deadline: {}",
+            unconfirmed.join(", ")
+        ))
+        .into())
     }
 }
 
-/// 向子进程发 SIGTERM（unix）；其他平台无 SIGTERM，退化为 SIGKILL。
-#[cfg(unix)]
-fn send_term(child: &mut Child) {
-    if let Some(pid) = child.id()
-        && !process_utils::kill_process_group(pid, process_utils::KillSignal::SIGTERM)
-    {
-        // 信号未送达通常意味进程已退出; 仅 debug 留痕 (PID1 防御见 process_utils)
-        tracing::debug!(pid, "send_term: signal not delivered");
-    }
-}
-
-#[cfg(not(unix))]
-fn send_term(child: &mut Child) {
-    let _ = child.start_kill();
-}
-
-/// Detect an unexpected child exit without discarding handles or process-group
-/// identities: final shutdown still has to confirm every original group stopped.
+/// Detect an unexpected child exit without discarding handles or tree
+/// identities: final shutdown still has to confirm every original tree stopped.
+/// root 语义（孙进程存活不掩盖根进程死亡，见 [`ManagedChild::try_wait_root`]）。
 async fn poll_any_exit(
-    children: &mut [(String, Child)],
+    children: &mut [(String, ManagedChild)],
     known_failed: &[String],
 ) -> Option<String> {
     loop {
         for (name, child) in children.iter_mut() {
-            if matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+            if matches!(child.try_wait_root(), Ok(Some(_)) | Err(_))
                 && !known_failed.iter().any(|failed| failed == name)
             {
                 return Some(name.clone());
@@ -928,21 +888,6 @@ async fn wait_sigterm() {
 #[cfg(not(unix))]
 async fn wait_sigterm() {
     std::future::pending::<()>().await;
-}
-
-#[cfg(unix)]
-fn process_group_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    // 用标准库 process_group(0) 让子进程成为新进程组组长（fork 后 setpgid(0,0)）。
-    // kill_process_group(-pgid) 仍能整组发信号含子孙，与原 `setsid` 方案对信号语义等价，
-    // 但不依赖外部 setsid 二进制 —— Linux/macOS 标准库自带，真正跨平台（原方案 macOS 无 setsid）。
-    let mut command = Command::new(program);
-    command.process_group(0);
-    command
-}
-
-#[cfg(not(unix))]
-fn process_group_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    Command::new(program)
 }
 
 #[cfg(test)]
@@ -1033,11 +978,10 @@ mod tests {
         let mut command = Command::new("sh");
         command
             .args(["-c", "trap '' TERM; echo ready; exec sleep 30"])
-            .process_group(0)
             .stdout(Stdio::piped());
-        let mut child = command.spawn().unwrap();
+        let mut child = spawn_managed(command).unwrap();
         let pid = child.id().unwrap();
-        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut lines = tokio::io::BufReader::new(child.take_stdout().unwrap()).lines();
         assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("ready"));
         shutdown_all(vec![("ignores-term".into(), child)], 0)
             .await
@@ -1045,21 +989,41 @@ mod tests {
         assert!(!process_utils::process_group_exists(pid).unwrap());
     }
 
+    /// R01 反例：服务根进程退出、孙进程仍存活持组时，监督循环的退出检测必须
+    /// 立即触发（root 语义）——树级 try_wait 会把根进程死亡掩盖到孙进程退出，
+    /// 服务该重启时不重启。
     #[cfg(unix)]
     #[tokio::test]
-    async fn quiescence_deadline_does_not_report_a_live_child_as_stopped() {
-        let mut command = Command::new("sleep");
-        command.arg("30").process_group(0);
-        let child = command.spawn().unwrap();
+    async fn exit_detection_fires_on_root_exit_even_with_live_grandchild() {
+        let mut command = Command::new("sh");
+        // root 立即退出，孙进程 sleep 60 继续存活持有进程组
+        command
+            .args(["-c", "sleep 60 & exit 0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_managed(command).unwrap();
         let pid = child.id().unwrap();
-        let mut children = vec![("alive".into(), child)];
+        // 等 root 退出事实落地（孙进程仍在）
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait_root())
+            .await
+            .expect("root wait deadline")
+            .unwrap();
+        assert!(status.success());
         assert!(
-            !wait_for_quiescence(&mut children, &[pid], tokio::time::Instant::now())
-                .await
-                .unwrap()
+            process_utils::process_group_exists(pid).unwrap(),
+            "grandchild must still be alive to set up the regression fixture"
         );
+        // root 语义退出检测必须立刻识别（500ms 轮询周期内）
+        let mut children = vec![("root-exited".into(), child)];
+        let detected =
+            tokio::time::timeout(Duration::from_secs(3), poll_any_exit(&mut children, &[]))
+                .await
+                .expect("poll_any_exit must fire on root exit while grandchild lives");
+        assert_eq!(detected, Some("root-exited".into()));
         shutdown_all(children, 0).await.unwrap();
+        assert!(!process_utils::process_group_exists(pid).unwrap());
     }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn migration_timeout_confirms_original_process_group_stopped() {
@@ -1086,7 +1050,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().to_owned();
         let migration = tokio::spawn(async move {
-            let argv = vec![
+            let argv: Vec<String> = vec![
                 "sh".into(),
                 "-c".into(),
                 "echo $$ > migration.pid; while [ ! -f exit-now ]; do :; done; exit 0".into(),
@@ -1097,6 +1061,8 @@ mod tests {
             loop {
                 if let Ok(text) = tokio::fs::read_to_string(root.path().join("migration.pid")).await
                     && let Ok(pid) = text.trim().parse::<u32>()
+                    // 撕裂读出的 pid 前缀几乎必为死组：join 前确认组确实存在
+                    && matches!(process_utils::process_group_exists(pid), Ok(true))
                 {
                     break pid;
                 }
@@ -1107,15 +1073,36 @@ mod tests {
         .unwrap();
         // Keep a second real process in the migration group, but parent it to the
         // test so it is reaped deterministically instead of depending on PID 1.
-        let mut command = Command::new("sleep");
-        command.arg("30").process_group(i32::try_from(pid).unwrap());
-        let mut member = command.spawn().unwrap();
-        let reaper = tokio::spawn(async move { member.wait().await.unwrap() });
+        let mut member = None;
+        for _ in 0..3 {
+            let mut command = Command::new("sleep");
+            command.arg("30").process_group(i32::try_from(pid).unwrap());
+            match command.spawn() {
+                Ok(child) => {
+                    member = Some(child);
+                    break;
+                }
+                // tokio/std spawn 的瞬时 ECHILD（运行时竞态）：短暂退避重试
+                Err(error) if error.raw_os_error() == Some(10) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("spawn migration group member: {error}"),
+            }
+        }
+        let mut member = member.expect("member spawn after retries");
+        let reaper = tokio::spawn(async move { member.wait().await });
         tokio::fs::write(root.path().join("exit-now"), b"go")
             .await
             .unwrap();
         migration.await.unwrap().unwrap();
-        assert!(!reaper.await.unwrap().success());
+        // 成员死亡证据是下方组探测 ESRCH。成员 wait 可能被树收束确认路径的
+        // waitpid(-pgid) 抢先 reap（tokio 视角 ECHILD）——那是确认收束的正
+        // 常组成，不构成失败；仍可观测到退出码时必须非成功。
+        match reaper.await.expect("reaper join") {
+            Ok(status) => assert!(!status.success()),
+            Err(error) if error.raw_os_error() == Some(10) => {}
+            Err(error) => panic!("member wait: {error}"),
+        }
         assert!(!process_utils::process_group_exists(pid).unwrap());
     }
 }

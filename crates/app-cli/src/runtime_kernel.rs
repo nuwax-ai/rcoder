@@ -1594,7 +1594,7 @@ mod tests {
     }
 
     /// XP10 补充：发现记录持久化 roundtrip + 干净关停清除。
-    #[test]
+    ///
     /// 本地凭据文件（cross-platform.md §3）：token 落盘 0600 + 平台侧只读。
     #[test]
     fn token_file_roundtrip_with_restricted_permissions() {

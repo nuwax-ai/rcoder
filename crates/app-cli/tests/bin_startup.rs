@@ -372,16 +372,16 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
         let second_healthy = second_status.is_none() && http_status(&address) == Some(200);
         let _ = second_healthy; // 端口单占：健康应答只能来自存活者之一
 
-        if first_healthy && second_status.is_some() {
+        if first_healthy && let Some(status) = second_status {
             assert!(
-                !second_status.unwrap().success(),
+                !status.success(),
                 "loser must exit non-zero (owner lock / bind conflict)"
             );
             let _ = first.kill();
             let _ = first.wait();
             return;
         }
-        if second_healthy && first_alive == false {
+        if second_healthy && !first_alive {
             // 反向胜出：second 存活健康、first 已退出非零
             let status = first.wait().unwrap();
             assert!(!status.success(), "loser must exit non-zero");

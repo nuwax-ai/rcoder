@@ -15,6 +15,11 @@ path = "src/lib.rs"
 name = "app-cli"
 path = "src/main.rs"
 
+# R01 验收 fixture：可控进程树（tests/tree_lifecycle.rs 真实编排链反例用）
+[[bin]]
+name = "tree-fixture"
+path = "tests/fixtures/tree_fixture.rs"
+
 [dependencies]
 # 极轻量 manifest 类型（path 到同仓库的独立小 crate）
 workspace-manifest = { path = "../workspace-manifest" }
@@ -70,10 +75,16 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 infer = { version = "0.22", default-features = false }
 
 tempfile = "3"
+
 # 跨平台受管进程组（watchexec 维护；command-group 的官方后继）。
 # Unix ProcessGroup / Windows JobObject；Windows 挂起 spawn → Job 归属 →
 # 恢复执行——进程运行前已入 Job，无后代逃逸窗口（cross-platform.md §4）。
 process-wrap = { version = "10", features = ["tokio1"] }
+
+# 仅测试 fixture（tests/fixtures/tree_fixture.rs）安装 SIGTERM 忽略用；
+# 生产代码不直接依赖（传递依赖树中已存在）
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true
