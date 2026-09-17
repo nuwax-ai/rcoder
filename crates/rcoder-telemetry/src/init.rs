@@ -63,10 +63,6 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
     // 🆕 初始化 tracing subscriber（包括控制台、文件、OpenTelemetry、额外 layer）
     let has_extra_layer = config.extra_layer.is_some(); // take 前记，供下方启动日志使用
     let extra_layer = config.extra_layer.take();
-    // tokio-console 观测层（config.console_layer）——注意与上方 fmt 终端输出层
-    // 变量 console_layer 命名区分；独立于 extra_layer 槽（file-server 嵌入占用）
-    let has_tokio_console = config.console_layer.is_some(); // take 前记，供启动日志使用
-    let tokio_console_layer = config.console_layer.take();
     // span 耗时→直方图规则（SpanMetricsLayer；调用点 #[instrument] 零计时代码）
     let span_metrics = std::mem::take(&mut config.span_metrics);
     subscriber::init_tracing_subscriber(subscriber::SubscriberParams {
@@ -74,7 +70,6 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
         tracer_provider: tracer_provider.as_ref(),
         file_log: config.file_log.as_ref(),
         extra_layer,
-        tokio_console_layer,
         span_metrics,
         console_json: config.console_json,
     })?;
@@ -84,12 +79,11 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
         config.service_name
     );
     info!(
-        "✅ [Telemetry] Telemetry system initialization completed: OTLP={}, Prometheus={}, FileLog={}, ExtraLayer={}, TokioConsole={}, ConsoleJSON={}",
+        "✅ [Telemetry] Telemetry system initialization completed: OTLP={}, Prometheus={}, FileLog={}, ExtraLayer={}, ConsoleJSON={}",
         tracer_provider.is_some(),
         prometheus_handle.is_some(),
         config.file_log.is_some(),
         has_extra_layer,
-        has_tokio_console,
         config.console_json
     );
 

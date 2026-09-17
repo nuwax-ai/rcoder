@@ -23,10 +23,6 @@ pub struct TelemetryConfig {
     pub extra_layer: Option<BoxedLayer>,
     /// 额外 layer 关联的 WorkerGuard（必须存活到进程结束）
     pub extra_layer_guard: Option<WorkerGuard>,
-    /// tokio-console 观测 layer（本地开发 feature；独立于 extra_layer 槽——
-    /// extra_layer 已被 file-server 嵌入场景占用。无 guard：console 服务器
-    /// 任务自管理生命周期）
-    pub console_layer: Option<BoxedLayer>,
     /// span 耗时→直方图指标规则（SpanMetricsLayer；空=不桥接）
     pub span_metrics: Vec<crate::span_metrics::SpanMetricRule>,
     /// 控制台（stdout）日志 JSON 化开关（`TELEMETRY_CONSOLE_JSON`，默认 false）。
@@ -81,7 +77,6 @@ impl std::fmt::Debug for TelemetryConfig {
             .field("file_log", &self.file_log)
             .field("extra_layer", &self.extra_layer.is_some())
             .field("extra_layer_guard", &self.extra_layer_guard.is_some())
-            .field("console_layer", &self.console_layer.is_some())
             .field("console_json", &self.console_json)
             .finish()
     }
@@ -96,7 +91,6 @@ impl Default for TelemetryConfig {
             file_log: None,
             extra_layer: None,
             extra_layer_guard: None,
-            console_layer: None,
             span_metrics: Vec::new(),
             console_json: false,
         }
@@ -228,7 +222,6 @@ impl TelemetryConfig {
             file_log: None,
             extra_layer: None,
             extra_layer_guard: None,
-            console_layer: None,
             span_metrics: Vec::new(),
             console_json,
         }
@@ -295,13 +288,6 @@ impl TelemetryConfig {
     pub fn with_extra_layer(mut self, layer: BoxedLayer, guard: WorkerGuard) -> Self {
         self.extra_layer = Some(layer);
         self.extra_layer_guard = Some(guard);
-        self
-    }
-
-    /// 注入 tokio-console 观测 layer（rcoder/agent_runner 的 `console` feature
-    /// 构造后传入；telemetry 自身不依赖 console-subscriber，经 BoxedLayer 泛化承载）。
-    pub fn with_console_layer(mut self, layer: BoxedLayer) -> Self {
-        self.console_layer = Some(layer);
         self
     }
 

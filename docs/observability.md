@@ -9,7 +9,6 @@
 | **OTLP → Tempo** | 分布式追踪（跨服务全链路 trace） | compose 常开 | 全链路瀑布/火焰图、生产事故排查 |
 | **trace_id 日志注入** | 日志 JSON 顶层 trace_id 字段 | 自动（有 traceparent 继承；无则合成） | 跨服务全链路日志过滤 |
 | **Loki + fluent-bit** | 结构化日志采集检索（生产同链路） | compose 常开（`make logs-*`） | 关键字/trace_id 查日志、Log context |
-| **tokio-console** | 异步任务/锁/waker 运行时观测 | `console` feature | 死锁、锁等待、任务泄漏 |
 | **Pyroscope** | CPU 火焰图持续剖析 | 已部署（compose） | CPU 热点 |
 | **/metrics** | HTTP 请求量/延迟 | 默认开启 | 性能回归 |
 
@@ -90,20 +89,6 @@ OTel 导出噪声拼写（`opentelemetry-otlp` / `opentelemetry_sdk`，B0 基线
 Grafana（http://localhost:3000）→ Explore → Loki：日志行内 trace_id 生成可点击
 **TraceID** 字段跳 Tempo；Tempo trace 视图反向 tracesToLogsV2 跳回日志行。
 
-## tokio-console
-
-```bash
-# 启用（compose 环境，运行期开关默认关——详见 docs/console.md）
-make console-on
-tokio-console http://localhost:6669     # 注意 http:// 前缀
-make console-off                        # 用完关闭（console 无背压记账，开着 RSS 持续涨）
-
-# 本地 cargo run
-make run-console
-```
-
-面板操作：`t` 任务视图 / `r` 资源（锁）视图 / `l` 按锁持有排序 / `w` 唤醒时间 / `f` 过滤。
-
 ## tracing-flame（已移除，勿再引入）
 
 依赖已删除（2026-08-21）。**耗时数据在多任务并发 async 下系统性失真**——它不测
@@ -139,8 +124,8 @@ metrics 直方图 p50=3.1s / p99=10s，folded 里 max 仅 67ms（差 150 倍）�
 请求（有 traceparent 继承；无则合成——本指南）
   ↓
 rcoder 日志 JSON 顶层 trace_id（jq / Loki `| json | log_processed_trace_id=`）
-  ↓                          ↓
-Loki 关键字/字段检索        tokio-console 看锁/任务
+  ↓
+Loki 关键字/字段检索
   ↓ TraceID 字段
 Tempo trace 瀑布/Flame graph（tracesToLogsV2 回跳 Loki）
 ```

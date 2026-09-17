@@ -82,10 +82,6 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
         }
     }
 
-    // tokio-console 观测（console feature；shadowing 绑定——无 feature 时零代码）
-    #[cfg(feature = "console")]
-    let telemetry_config = crate::console_obs::attach(telemetry_config);
-
     // span 耗时→直方图指标规则：调用点只写 #[instrument]，耗时指标由
     // SpanMetricsLayer 自动记录（span 即计时事实源，零 Instant 侵入）
     let telemetry_config = telemetry_config.with_span_metric_rules(vec![

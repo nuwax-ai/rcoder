@@ -12,9 +12,6 @@ pub mod bootstrap;
 pub mod cleanup_task;
 pub mod config;
 pub mod config_watcher;
-/// tokio-console 观测装配（`console` feature 专用）
-#[cfg(feature = "console")]
-pub(crate) mod console_obs;
 pub mod docker_init;
 pub mod file_server_admin;
 pub mod file_server_embed;

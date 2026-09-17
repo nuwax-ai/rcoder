@@ -1,12 +1,11 @@
 //! tracing subscriber 组装：EnvFilter + 终端/文件日志 + OTLP + 外部注入层。
 //!
 //! boxed layer（[`BoxedLayer`]）只能直接挂 Registry 顶层——外部注入层
-//! （file-server 嵌入、tokio-console 观测）经 `stack_boxed_layers` 叠加。
+//! （file-server 嵌入）经 `Option` layer 直接 `.with()` 叠加。
 
 use anyhow::Result;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use serde_json::{Map, Value, json};
-use tracing::info;
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{
     EnvFilter, Layer, filter::filter_fn, fmt, layer::SubscriberExt, registry::Registry,
@@ -234,8 +233,6 @@ pub(crate) struct SubscriberParams<'a> {
     pub file_log: Option<&'a FileLogConfig>,
     /// 额外 boxed layer（如 file-server 独立日志）
     pub extra_layer: Option<BoxedLayer>,
-    /// tokio-console 观测 layer（本地开发 feature 注入）
-    pub tokio_console_layer: Option<BoxedLayer>,
     /// span 耗时→直方图规则（SpanMetricsLayer）
     pub span_metrics: Vec<crate::span_metrics::SpanMetricRule>,
     /// 控制台（stdout）日志 JSON 化（`TELEMETRY_CONSOLE_JSON`；默认 false=ANSI 文本）
@@ -250,33 +247,22 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
         tracer_provider,
         file_log: file_log_config,
         extra_layer,
-        tokio_console_layer,
         span_metrics,
         console_json,
     } = params;
 
     // 创建 EnvFilter（支持 RUST_LOG 环境变量）
-    let mut env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         format!(
             "{}=debug,tower_http=debug,axum=info,hyper=info,tonic=info",
             service_name.replace('-', "_")
         )
         .into()
     });
-    // tokio-console 观测开启时必须放行 tokio/runtime target 的 trace 级事件。
-    // 放行会让 fmt/文件层也收到（海量）——deny 过滤在 console/file layer 处理。
-    if tokio_console_layer.is_some() {
-        for directive in ["tokio=trace", "runtime=trace"] {
-            if let Ok(d) = directive.parse() {
-                env_filter = env_filter.add_directive(d);
-            }
-        }
-    }
-    let deny_tokio = tokio_console_layer.is_some();
 
     // 控制台日志层（JSON 模式复用文件层同款 formatter + OTel 噪声过滤，
     // 文本模式保持原行为；见 build_console_layer）
-    let console_layer = build_console_layer(console_json, deny_tokio, std::io::stdout);
+    let console_layer = build_console_layer(console_json, std::io::stdout);
 
     // 文件日志层
     let file_layer = if let Some(file_config) = file_log_config {
@@ -288,7 +274,7 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
             .filename_prefix(&file_config.filename_prefix)
             .max_log_files(file_config.max_log_files)
             .build(&file_config.directory)?;
-        let deny_fs = filter_fn(make_deny_filter(deny_tokio));
+        let deny_fs = filter_fn(make_deny_filter());
 
         if file_config.json_format {
             // JSON 格式：自定义 formatter + 顶层 trace_id
@@ -317,10 +303,7 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
 
     // OTLP layer：有 exporter 用真实 provider；无 exporter 用全局 no-op
     // （no-op 仍安装 OpenTelemetryLayer——提供 span context 存储基础设施）。
-    // EnvFilter 为 console 放行的 tokio/runtime trace 级 span（每秒上万）必须
-    // 在此 deny：OTel 层漏拦会把 BatchSpanProcessor 队列持续打满强制导出，
-    // 导出 gRPC 本身又 spawn 任务生成新的 runtime span，正反馈下 RSS 以
-    // ~30MB/s 爬升（compose 实测 10 分钟涨至 25GB）
+    // file_server target（独立日志域）在此 deny，不进 OTel 导出。
     let otel_layer = {
         static NOOP_PROVIDER: std::sync::OnceLock<SdkTracerProvider> = std::sync::OnceLock::new();
         let tracer = match tracer_provider {
@@ -332,15 +315,14 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
         };
         tracing_opentelemetry::layer()
             .with_tracer(tracer)
-            .with_filter(filter_fn(make_deny_filter(deny_tokio)))
+            .with_filter(filter_fn(make_deny_filter()))
     };
 
     // 组装 subscriber 链
-    let has_tokio_console = tokio_console_layer.is_some();
-    // 顺序约束：stack_boxed_layers（BoxedLayer 只支持 Registry 顶层）最先；
+    // 顺序约束：boxed 层（BoxedLayer 只支持 Registry 顶层）最先；
     // TraceIdExtractor 是泛型 Layer<S>，可挂任意层之后
     let registry = tracing_subscriber::registry()
-        .with(stack_boxed_layers(extra_layer, tokio_console_layer))
+        .with(extra_layer)
         .with(TraceIdExtractor)
         .with(crate::span_metrics::SpanMetricsLayer::new(span_metrics))
         .with(env_filter)
@@ -348,9 +330,6 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
         .with(file_layer)
         .with(otel_layer);
     registry.init();
-    if has_tokio_console {
-        info!("[Telemetry] tokio-console observation layer enabled");
-    }
 
     Ok(())
 }
@@ -368,7 +347,6 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
 /// writer 参数化仅为测试注入（生产传 `std::io::stdout`）。
 fn build_console_layer<S, W>(
     console_json: bool,
-    deny_tokio: bool,
     writer: W,
 ) -> Box<dyn Layer<S> + Send + Sync + 'static>
 where
@@ -381,7 +359,7 @@ where
             .event_format(TraceIdJsonFormat)
             .with_ansi(false)
             .with_writer(writer)
-            .with_filter(filter_fn(make_json_console_filter(deny_tokio)))
+            .with_filter(filter_fn(make_json_console_filter()))
             .boxed()
     } else {
         fmt::layer()
@@ -391,54 +369,34 @@ where
             .with_file(false)
             .with_line_number(false)
             .with_writer(writer)
-            .with_filter(filter_fn(make_deny_filter(deny_tokio)))
+            .with_filter(filter_fn(make_deny_filter()))
             .boxed()
     }
 }
 
-/// JSON 控制台模式专用 deny 过滤器：[`make_deny_filter`] 的全量语义（file_server /
-/// tokio-console 时的 tokio+runtime）+ 额外拦截 OTel 导出噪声的**两种拼写**
+/// JSON 控制台模式专用 deny 过滤器：[`make_deny_filter`] 的全量语义（file_server）
+/// + 额外拦截 OTel 导出噪声的**两种拼写**
 /// （`opentelemetry-otlp` 连字符 / `opentelemetry_sdk` 下划线——B0 基线两者并存，
 /// 仅拦一种漏 56%，合计占当日日志 20.3%）。
 ///
 /// 仅 JSON 模式启用：JSON 面向采集器的结构化流，噪声行污染 Loki 检索；文本模式
 /// （本地开发）保持原行为，便于排查 OTLP 本身的问题。
-/// 不并入 [`make_deny_filter`]：该函数被 OTel/文件层共用，是 OOM 敏感路径，
+/// 不并入 [`make_deny_filter`]：该函数被 OTel/文件层共用，是导出敏感路径，
 /// 语义任何变化都可能改变生产导出行为。
-fn make_json_console_filter(
-    deny_tokio: bool,
-) -> impl Fn(&tracing::Metadata<'_>) -> bool + Send + Sync + 'static {
+fn make_json_console_filter() -> impl Fn(&tracing::Metadata<'_>) -> bool + Send + Sync + 'static {
     move |meta: &tracing::Metadata<'_>| {
         let target = meta.target();
         let deny = target.starts_with("file_server")
             || target.starts_with("opentelemetry-otlp")
-            || target.starts_with("opentelemetry_sdk")
-            || (deny_tokio && (target.starts_with("tokio") || target.starts_with("runtime")));
+            || target.starts_with("opentelemetry_sdk");
         !deny
     }
 }
 
-/// per-layer deny 过滤器工厂：deny `file_server` target（独立日志域），
-/// `deny_tokio`（console 开启）时额外 deny `tokio`/`runtime` target——
-/// EnvFilter 为 console 放行的这两类 trace 级 span 每秒上万，fmt/文件/OTel
-/// 三个消费层都必须各自拦截（`filter_fn` 要求 `'static`，闭包经参数化工厂生成）。
-fn make_deny_filter(
-    deny_tokio: bool,
-) -> impl Fn(&tracing::Metadata<'_>) -> bool + Send + Sync + 'static {
-    move |meta: &tracing::Metadata<'_>| {
-        let deny = meta.target().starts_with("file_server")
-            || (deny_tokio
-                && (meta.target().starts_with("tokio") || meta.target().starts_with("runtime")));
-        !deny
-    }
-}
-
-/// 两个 boxed layer（Option 包装，None 为 no-op）叠加为单层。
-fn stack_boxed_layers(
-    a: Option<BoxedLayer>,
-    b: Option<BoxedLayer>,
-) -> tracing_subscriber::layer::Layered<Option<BoxedLayer>, Option<BoxedLayer>, Registry> {
-    <Option<BoxedLayer> as Layer<Registry>>::and_then(a, b)
+/// per-layer deny 过滤器工厂：deny `file_server` target（独立日志域，不进
+/// fmt/文件/OTel 三个通用消费层；`filter_fn` 要求 `'static`，闭包经工厂生成）。
+fn make_deny_filter() -> impl Fn(&tracing::Metadata<'_>) -> bool + Send + Sync + 'static {
+    move |meta: &tracing::Metadata<'_>| !meta.target().starts_with("file_server")
 }
 
 /// event 字段的 JSON Visit 收集器（把 event.record() 转为 JSON map）。
@@ -478,53 +436,6 @@ impl tracing::field::Visit for JsonFieldVisitor<'_> {
         self.0.insert(
             field.name().to_string(),
             serde_json::json!(value.to_string()),
-        );
-    }
-}
-
-#[cfg(test)]
-mod otel_deny_tests {
-    use super::*;
-
-    /// 复现生产装配的 OTel 层 deny 行为：EnvFilter 为 tokio-console 放行
-    /// `runtime=trace, tokio=trace` 后，这两类 target 的 span（console 场景
-    /// 每秒上万）不得进入 OTel 导出——漏拦会把 BatchSpanProcessor 队列持续
-    /// 打满强制导出，导出 gRPC 又 spawn 新任务生成 runtime span，正反馈下
-    /// RSS 以 ~30MB/s 爬升（compose 实测 10 分钟涨至 25GB）。
-    #[test]
-    fn otel_layer_excludes_tokio_runtime_spans_under_console_env_filter() {
-        use opentelemetry::trace::TracerProvider as _;
-        use opentelemetry_sdk::testing::trace::new_test_exporter;
-
-        let (exporter, mut rx_export, _rx_shutdown) = new_test_exporter();
-        let provider = SdkTracerProvider::builder()
-            .with_simple_exporter(exporter)
-            .build();
-
-        // 与 init_tracing_subscriber 同构：console 开启 → EnvFilter 放行
-        // trace 级 tokio/runtime，otel 层挂 make_deny_filter(true)
-        let env_filter = EnvFilter::new("debug,runtime=trace,tokio=trace");
-        let otel = tracing_opentelemetry::layer()
-            .with_tracer(provider.tracer("otel-deny-test"))
-            .with_filter(filter_fn(make_deny_filter(true)));
-
-        let subscriber = tracing_subscriber::registry().with(env_filter).with(otel);
-
-        tracing::subscriber::with_default(subscriber, || {
-            let _s1 = tracing::trace_span!(target: "runtime::tokio", "runtime.spawn").entered();
-            let _s2 = tracing::trace_span!(target: "tokio::task", "task.spawn").entered();
-            let _s3 = tracing::info_span!(target: "rcoder::handler", "http_request").entered();
-        });
-        drop(provider.force_flush());
-
-        let mut names = Vec::new();
-        while let Ok(span) = rx_export.try_recv() {
-            names.push(span.name);
-        }
-        assert_eq!(
-            names,
-            ["http_request"],
-            "runtime/tokio target 的 span 漏进了 OTel 导出: {names:?}"
         );
     }
 }
@@ -768,7 +679,7 @@ mod console_layer_tests {
 
     /// 用 build_console_layer 的指定分支装配 registry 并发出事件（含 trace_id）。
     fn emit_events(console_json: bool, writer: &CaptureWriter) {
-        let layer = build_console_layer(console_json, false, writer.clone());
+        let layer = build_console_layer(console_json, writer.clone());
         let subscriber = tracing_subscriber::registry()
             .with(TraceIdExtractor)
             .with(EnvFilter::new("trace"))

@@ -20,11 +20,6 @@ default = ["userapp-sqlite"]
 # 生产环境默认不启用，需要显式添加 --features debug
 debug = []
 
-
-# tokio-console 观测（本地开发专用；编译须配 RUSTFLAGS="--cfg tokio_unstable"，
-# 见 make run-console / DEV_CONSOLE=1 make dev-hot）。release 不启用=零代码零开销。
-console = ["dep:console-subscriber"]
-
 # Hotpath 本地性能剖析（hotpath-rs；仅本地开发，不进 default）。
 # feature 关闭时 hotpath 宏全部 no-op、零依赖编译，代码里宏裸用不配 cfg。
 # axum-0-8 供 router 装配处 hotpath::axum!（关闭时原样返回 router）；
@@ -77,7 +72,6 @@ app_manager = { path = "../app_manager" }
 arc-swap = { workspace = true }
 docker_manager = { workspace = true }
 rcoder-telemetry = { workspace = true }
-console-subscriber = { workspace = true, optional = true }
 
 clap = { workspace = true }
 async-trait = { workspace = true }

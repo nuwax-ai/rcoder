@@ -6,9 +6,6 @@
 pub mod agent_mgmt;
 pub mod api_key_manager;
 pub mod config;
-/// tokio-console 观测（`console` feature 专用装配）
-#[cfg(feature = "console")]
-pub mod console_obs;
 /// 内嵌 file-server（env RCODER_EMBED_FILE_SERVER 运行时开关，编译期无门控）
 pub mod file_server_embed;
 pub mod grpc;
