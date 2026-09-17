@@ -9,7 +9,7 @@
 | **OTLP → Tempo** | 分布式追踪（跨服务全链路 trace） | compose 常开 | 全链路瀑布/火焰图、生产事故排查 |
 | **trace_id 日志注入** | 日志 JSON 顶层 trace_id 字段 | 自动（有 traceparent 继承；无则合成） | 跨服务全链路日志过滤 |
 | **Loki + fluent-bit** | 结构化日志采集检索（生产同链路） | compose 常开（`make logs-*`） | 关键字/trace_id 查日志、Log context |
-| **Pyroscope** | CPU 火焰图持续剖析 | 已部署（compose） | CPU 热点 |
+| **dial9** | 事件级 Tokio tracing（poll/wake/task 时间线） | feature 恒编入 dev；`DIAL9_ENABLED` 运行期开关（默认关） | 长 poll、调度延迟、task 生命周期、off-CPU 根因 |
 | **/metrics** | HTTP 请求量/延迟 | 默认开启 | 性能回归 |
 
 ## OTLP → otel-collector → Tempo 分布式追踪（本地常开，与生产同拓扑）
@@ -89,6 +89,38 @@ OTel 导出噪声拼写（`opentelemetry-otlp` / `opentelemetry_sdk`，B0 基线
 Grafana（http://localhost:3000）→ Explore → Loki：日志行内 trace_id 生成可点击
 **TraceID** 字段跳 Tempo；Tempo trace 视图反向 tracesToLogsV2 跳回日志行。
 
+## dial9 事件级 Tokio tracing
+
+dial9（crates.io 0.5）经 Tokio runtime hooks 记录每个 poll/wake/task 事件到
+磁盘分段文件，离线分析零观测容器——定位"这个 task 在等什么 / 这个 poll 为什么长"，
+这是 OTLP/Tempo（span 粒度）与 /metrics（聚合粒度）覆盖不到的层次。
+取代了已移除的 tokio-console（无背压 OOM）与 Pyroscope/eBPF 持续剖析链。
+
+```bash
+# 启用（重建 rcoder 容器注入 DIAL9_ENABLED=1；binary 恒编入 dial9 feature，
+# 复用 target-unstable volume 产物，不触发重编）
+make dial9-on
+# ...复现场景...
+make dial9-off
+
+# 离线查看（单二进制 viewer；首次先 cargo binstall dial9）
+make dial9-view          # = dial9 serve --local-dir ./docker/logs/dial9
+```
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `DIAL9_ENABLED` | `0` | 主开关；关=纯 passthrough runtime 零开销 |
+| `DIAL9_TRACE_DIR` | `/app/logs/dial9`（rcoder）/ `/app/container-logs/dial9`（agent 容器） | 分段 trace 目录，均 bind 宿主可直取 |
+| `DIAL9_ROTATION_SECS` | `60` | 分段轮转周期 |
+| `DIAL9_MAX_DISK_USAGE_MB` | `1024` | 磁盘预算封顶 |
+
+行为要点：rcoder 主进程开启时新建 agent 容器自动透传 `DIAL9_*`（已有 agent
+容器需重建）；构建链按 "dial9 在 features 列表" 自动附
+`RUSTFLAGS="--cfg tokio_unstable"`（全量 task 覆盖必需，缺它 poll 只覆盖
+`dial9::spawn` 的 task）；生产构建不含该 feature。dial9 的 cpu/memory-profiling
+未启用（需 force-frame-pointers，改 RUSTFLAGS 指纹）。
+AI agent 分析可用 dial9 自带 skills（`dial9 agents skills <目录>` 解包）。
+
 ## tracing-flame（已移除，勿再引入）
 
 依赖已删除（2026-08-21）。**耗时数据在多任务并发 async 下系统性失真**——它不测
@@ -99,7 +131,9 @@ metrics 直方图 p50=3.1s / p99=10s，folded 里 max 仅 67ms（差 150 倍）�
 
 其原有职责的承接：**耗时** → SpanMetricsLayer 直方图（/metrics）；**调用结构 +
 正确耗时的火焰图/瀑布** → OTLP → Tempo（Grafana Explore 自带 Flame graph 视图）；
-**CPU 火焰图** → Pyroscope。eBPF 诊断火焰图（`ebpf-tools/`）与此无关，保留。
+**事件级 async 行为** → dial9（Pyroscope 持续剖析链已随批次1下线；CPU 采样
+可按需开 dial9 cpu-profiling feature，需 frame pointers）。eBPF 诊断火焰图
+（`ebpf-tools/`）与此无关，保留。
 
 ## span 耗时指标（SpanMetricsLayer，精确计时）
 

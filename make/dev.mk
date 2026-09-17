@@ -53,13 +53,7 @@ dev-restart: dev-build
 # 前提：docker-compose.yml 已挂载源码到 /app/src（首次需 make dev-restart 应用）。
 # 流程：容器内 cargo build --release --bin rcoder（增量）→ 替换 /app/bin/rcoder
 #       → docker restart 拉起新 binary。
-# tokio-console 观测模式（本地 cargo run）：feature+RUSTFLAGS+独立 target+DEV_CONSOLE 四件套
-# 连接: cargo install tokio-console && tokio-console localhost:6669
-run-console:
-	@echo "🖥️  本地运行 rcoder（tokio-console 观测模式，端口 6669）..."
-	@RUSTFLAGS="--cfg tokio_unstable" CARGO_TARGET_DIR=target-console \
-	DEV_CONSOLE=1 cargo run -p rcoder --features console
-
+# dial9 恒编入（feature hotpath,dial9 + tokio_unstable，见 dev-hot-build.sh）。
 dev-hot:
 	@echo "🔥 容器内热编译 rcoder..."
 	@DEV_CID=$$(docker-compose -f docker/docker-compose.yml ps -q rcoder); \
@@ -70,24 +64,24 @@ dev-hot:
 	echo "🔄 重启 rcoder 进程（拉起新 binary）..." && \
 	docker restart $$DEV_CID >/dev/null && \
 	echo "✅ 热编译完成（日志: docker logs -f $$DEV_CID）" && \
-	echo "🖥️  tokio-console 恒编入（运行期默认关）：make console-on 启用 / make console-off 关闭 / make console 连接面板"
+	echo "🔬 dial9 恒编入（运行期默认关）：make dial9-on 启用 / make dial9-off 关闭 / make dial9-view 离线查看 trace"
 
-## 启用 tokio-console（重建 rcoder 容器注入 DEV_CONSOLE=1；binary 复用
-## target-console volume 编译产物，不触发重编。console-subscriber 无背压
-## 记账，rcoder 后台事件量下 RSS 会持续爬升——观测完记得 console-off）
-console-on:
-	@DEV_CONSOLE=1 docker-compose -f docker/docker-compose.yml up -d rcoder && \
-	echo "🖥️  tokio-console 已启用：make console 连接面板（localhost:6669）"
+## 启用 dial9 事件级 Tokio tracing（重建 rcoder 容器注入 DIAL9_ENABLED=1；
+## binary 恒编入 dial9 feature，复用 target-unstable volume 编译产物，不触发
+## 重编。trace 落宿主 docker/logs/dial9；agent 容器同步透传（仅新建容器生效，
+## 已有 agent 容器需重建）。
+dial9-on:
+	@DIAL9_ENABLED=1 docker-compose -f docker/docker-compose.yml up -d rcoder && \
+	echo "🔬 dial9 已启用：trace 落 docker/logs/dial9（60s 轮转分段）；make dial9-view 打开 viewer"
 
-## 关闭 tokio-console（重建容器 DEV_CONSOLE=0；EnvFilter 拦截 tokio/runtime
-## trace 事件不进 Registry，内存回到常态水位）
-console-off:
-	@DEV_CONSOLE=0 docker-compose -f docker/docker-compose.yml up -d rcoder && \
-	echo "✅ tokio-console 已关闭（内存回落常态水位）"
+## 关闭 dial9 记录（重建容器 DIAL9_ENABLED=0；recorder 纯 passthrough 零开销）
+dial9-off:
+	@DIAL9_ENABLED=0 docker-compose -f docker/docker-compose.yml up -d rcoder && \
+	echo "✅ dial9 已关闭（纯 passthrough，零开销）"
 
-## 连接本地 dev 容器的 tokio-console TUI 面板（6669 已随 compose 映射宿主）
-console:
-	@tokio-console localhost:6669
+## 启动 dial9 单二进制 viewer 离线查看本地 trace（需本机 `cargo binstall dial9`）
+dial9-view:
+	@dial9 serve --local-dir ./docker/logs/dial9
 
 ## 查看开发模式容器日志（rcoder + 全部关联服务，跟随输出）
 dev-logs:

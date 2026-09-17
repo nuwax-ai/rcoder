@@ -119,20 +119,6 @@ services:
              then npm install nuwax-file-server@1.4.2 --no-fund --no-audit; fi &&
              exec node node_modules/nuwax-file-server/dist/server.js"
 
-  # Pyroscope Server - 持续剖析数据存储和可视化
-  pyroscope:
-    image: grafana/pyroscope:latest
-    container_name: rcoder-pyroscope
-    ports:
-      - "4040:4040" # Web UI
-    environment:
-      - TZ=Asia/Shanghai
-    volumes:
-      - pyroscope-data:/data
-    command:
-      - server
-    restart: unless-stopped
-
   # Tempo - 分布式追踪后端（OTLP traces 存储；配置见 docker/tempo/tempo.yml）
   # 钉 2.9.0：3.x 移除 ingester/compactor 配置块（schema 大改），
   # 生产升级 3.x 时用官方转换器 tempo config converter 迁移
@@ -242,7 +228,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  pyroscope-data:
   tempo-data:
   prometheus-data:
   grafana-data:

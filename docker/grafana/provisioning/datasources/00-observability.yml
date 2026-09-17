@@ -58,7 +58,3 @@ datasources:
         datasourceUid: loki
         customQuery: true
         query: '{job="fluent-bit", ns="nuwax-k8s-test"} |= "$${__trace.traceId}"'
-
-# 注意: Pyroscope 有独立的 Web UI (http://localhost:4040)
-# Grafana 原生不支持 Pyroscope 作为 datasource
-# 请直接访问 Pyroscope Web UI 查看性能剖析数据

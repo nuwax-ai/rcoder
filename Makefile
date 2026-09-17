@@ -1,5 +1,5 @@
 # RCoder Makefile
-# 包含子模块: docker, dev, k8s, test, pyroscope, agent-runner
+# 包含子模块: docker, dev, k8s, test, agent-runner
 
 # Phony targets
 .PHONY: help \
@@ -17,9 +17,8 @@
 	test test-unit test-integration test-all test-blocking \
 	test-ebpf-install test-ebpf-no-install test-ebpf-debug test-pyroscope-offcpu \
 	audit deny geiger quality coverage fuzz \
-	pyroscope-up pyroscope-down pyroscope-logs \
 	agent-runner-up agent-runner-down agent-runner-logs agent-runner-restart agent-runner-status \
-	console-on console-off \
+	dial9-on dial9-off dial9-view \
 	k8s-offline-bundle k8s-offline-import k8s-offline-images-list k8s-offline-clean \
 	logs-help logs-up logs-down logs-query logs-fidelity
 
@@ -32,7 +31,6 @@ include make/k8s.mk
 include make/k8s-offline.mk
 include make/test.mk
 include make/quality.mk
-include make/pyroscope.mk
 include make/agent-runner.mk
 include make/observability.mk
 include make/remote-k8s.mk
@@ -131,10 +129,10 @@ help:
 	@echo "  make k8s-offline-images-list  - 打印所有离线依赖镜像清单"
 	@echo "  make k8s-offline-clean        - 清理构建产物"
 	@echo ""
-	@echo "📊 Pyroscope 持续剖析："
-	@echo "  make pyroscope-up   - 启动 Pyroscope Server"
-	@echo "  make pyroscope-down - 停止 Pyroscope Server"
-	@echo "  make pyroscope-logs - 查看 Pyroscope 日志"
+	@echo "🔬 dial9 事件级 Tokio tracing（compose 运行期开关，默认关）："
+	@echo "  make dial9-on    - 启用 dial9 记录（重建 rcoder 容器注入 DIAL9_ENABLED=1）"
+	@echo "  make dial9-off   - 关闭 dial9 记录"
+	@echo "  make dial9-view  - 启动单二进制 viewer 查看 docker/logs/dial9 trace"
 	@echo ""
 	@echo "🚀 agent_runner 本地服务:"
 	@echo "  make agent-runner-up        - 启动 agent_runner HTTP server（前台运行）"
@@ -172,7 +170,7 @@ help:
 	@echo "  或者手动进入容器："
 	@echo "    1. make devspace-dev     # 启动开发模式"
 	@echo "    2. make devspace-enter   # 进入容器"
-	@echo "    3. cargo run --bin rcoder --features ebpf-debug,pyroscope,otel,debug,kubernetes -- --port 8290"
+	@echo "    3. cargo run --bin rcoder --features otel,debug,dial9,kubernetes -- --port 8290"
 	@echo ""
 	@echo "  传统 Docker 模式："
 	@echo "    1. make dev-build    # 首次：构建所有 Docker 镜像（容器内编译）"
