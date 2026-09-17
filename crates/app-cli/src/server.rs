@@ -2447,7 +2447,7 @@ runtime_image_digest = "registry.example/app-runtime:0.1.140"
 
 [pingap]
 mode = "managed"
-version = "0.14.1"
+version = "0.14.3"
 commit = "abc123"
 
 [[services]]
@@ -3246,7 +3246,7 @@ format = "jsonl"
             pingap: workspace_manifest::LockedPingap {
                 mode: workspace_manifest::PingapMode::Managed,
                 config: None,
-                version: "0.14.1".into(),
+                version: "0.14.3".into(),
                 commit: "abc".into(),
             },
             minimum_app_cli_version: "0.0.0".into(),
@@ -3299,7 +3299,7 @@ format = "jsonl"
             pingap: workspace_manifest::LockedPingap {
                 mode: workspace_manifest::PingapMode::Managed,
                 config: None,
-                version: "0.14.1".into(),
+                version: "0.14.3".into(),
                 commit: "abc".into(),
             },
             minimum_app_cli_version: "0.0.0".into(),

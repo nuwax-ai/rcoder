@@ -15,8 +15,8 @@ use crate::proxy::compiler::compile_effective_config;
 
 /// 本地无环境变量时的 pingap 身份回退值（升级 pingap 时与 Cargo.toml 的
 /// pingap-config git rev、build-agent-docker 16-app-runtime.mk 的 PINGAP_COMMIT 一起改）。
-const DEFAULT_PINGAP_VERSION: &str = "0.14.1";
-const DEFAULT_PINGAP_COMMIT: &str = "c74e4eaa44e64958cffa18c33e8bbf5995b6844f";
+const DEFAULT_PINGAP_VERSION: &str = "0.14.3";
+const DEFAULT_PINGAP_COMMIT: &str = "cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8";
 
 /// pingap 身份优先读 `RCODER_PINGAP_VERSION`/`RCODER_PINGAP_COMMIT`（与 file-server
 /// 真实发布链路同名；容器内由镜像 ENV 注入，见 16-app-runtime.mk 单一版本源），

@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "TinyUFO"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14cc2a7d25b49809b7bf199e443f949c4078ff48a492e8fb4cbc0477bdcf7bc9"
+checksum = "ec216270884504fd1df6bd4fb1cbf5086813883f1de411c4ed0b1df9a791b27b"
 dependencies = [
  "ahash",
  "crossbeam-queue",
@@ -199,7 +199,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -210,7 +210,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1348,9 +1348,9 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "6.0.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
 dependencies = [
  "dirs-sys",
 ]
@@ -1364,7 +1364,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1433,7 +1433,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2423,15 +2423,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2886,7 +2877,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3114,8 +3105,8 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pingap-config"
-version = "0.14.1"
-source = "git+https://github.com/vicanso/pingap?rev=c74e4eaa44e64958cffa18c33e8bbf5995b6844f#c74e4eaa44e64958cffa18c33e8bbf5995b6844f"
+version = "0.14.3"
+source = "git+https://github.com/vicanso/pingap?rev=cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8#cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3126,7 +3117,6 @@ dependencies = [
  "etcd-client",
  "glob",
  "hcl-rs",
- "http",
  "humantime-serde",
  "kdl",
  "pingap-core",
@@ -3139,7 +3129,6 @@ dependencies = [
  "serde_qs",
  "snafu",
  "strum 0.28.0",
- "substring",
  "tempfile",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
@@ -3149,11 +3138,12 @@ dependencies = [
 
 [[package]]
 name = "pingap-core"
-version = "0.14.1"
-source = "git+https://github.com/vicanso/pingap?rev=c74e4eaa44e64958cffa18c33e8bbf5995b6844f#c74e4eaa44e64958cffa18c33e8bbf5995b6844f"
+version = "0.14.3"
+source = "git+https://github.com/vicanso/pingap?rev=cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8#cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8"
 dependencies = [
  "TinyUFO",
  "ahash",
+ "arc-swap",
  "async-trait",
  "bytes",
  "futures",
@@ -3173,8 +3163,8 @@ dependencies = [
 
 [[package]]
 name = "pingap-discovery"
-version = "0.14.1"
-source = "git+https://github.com/vicanso/pingap?rev=c74e4eaa44e64958cffa18c33e8bbf5995b6844f#c74e4eaa44e64958cffa18c33e8bbf5995b6844f"
+version = "0.14.3"
+source = "git+https://github.com/vicanso/pingap?rev=cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8#cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8"
 dependencies = [
  "async-trait",
  "bollard",
@@ -3190,26 +3180,27 @@ dependencies = [
 
 [[package]]
 name = "pingap-util"
-version = "0.14.1"
-source = "git+https://github.com/vicanso/pingap?rev=c74e4eaa44e64958cffa18c33e8bbf5995b6844f#c74e4eaa44e64958cffa18c33e8bbf5995b6844f"
+version = "0.14.3"
+source = "git+https://github.com/vicanso/pingap?rev=cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8#cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8"
 dependencies = [
  "aes-gcm-siv",
  "ahash",
  "base64 0.23.1",
  "dirs",
  "ipnet",
+ "itoa",
  "path-absolutize",
  "pem",
  "rustc_version_runtime",
  "snafu",
- "substring",
  "toml 1.1.6+spec-1.1.0",
 ]
 
 [[package]]
 name = "pingora"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc02712a3847828d6b798ecf31f0ac64e138df26b9513e20d52319cf3cecd11e"
 dependencies = [
  "pingora-cache",
  "pingora-core",
@@ -3221,8 +3212,9 @@ dependencies = [
 
 [[package]]
 name = "pingora-cache"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d2b5ad1877a7e0656d1fbcca0375aae46a7b17b71efe1956203c81f3ad4f013"
 dependencies = [
  "ahash",
  "arrayvec",
@@ -3256,8 +3248,9 @@ dependencies = [
 
 [[package]]
 name = "pingora-core"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fd4d1ddc6d6dbc1a97164ce13c301980c25c35422aab87b512c4c8b5123729b"
 dependencies = [
  "ahash",
  "async-trait",
@@ -3306,13 +3299,15 @@ dependencies = [
 
 [[package]]
 name = "pingora-error"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6399da6e698035093d6b458707df5f3ea5292858816b99d4b2624d96b4f567f"
 
 [[package]]
 name = "pingora-header-serde"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2e824dac9612e4b807e55981c2d6b665b6f936a8b4b75ee0ce1922373e93243"
 dependencies = [
  "bytes",
  "http",
@@ -3326,8 +3321,9 @@ dependencies = [
 
 [[package]]
 name = "pingora-http"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac9876e8775ebeb5d91262be4daaaf26d21a8932f53402106ed280867fe4c4f4"
 dependencies = [
  "bytes",
  "http",
@@ -3336,24 +3332,27 @@ dependencies = [
 
 [[package]]
 name = "pingora-ketama"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21e1baa2fffc859944e0c42d1955412858ac80f1e6ad175c6c3d93693c990d60"
 dependencies = [
  "crc32fast",
 ]
 
 [[package]]
 name = "pingora-limits"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f17248f7a1586c1f1244481f058a70e4d44707d8f936bf0b2323c8c85c40c8c0"
 dependencies = [
  "ahash",
 ]
 
 [[package]]
 name = "pingora-load-balancing"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "377e653ba80b73c1f35c16ade085eb5bc5a58cdd92f8e4ff1f967750f6faa654"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3373,8 +3372,9 @@ dependencies = [
 
 [[package]]
 name = "pingora-lru"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aff106b6d8a53a746a23a6304e25709b3f2e580841ffe3176acc1979095b3806"
 dependencies = [
  "ahash",
  "arrayvec",
@@ -3389,8 +3389,9 @@ dependencies = [
 
 [[package]]
 name = "pingora-pool"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f9276b751bf2f908d24c73b8f23fcf05c2102fe373513457deb8868e17ef238"
 dependencies = [
  "crossbeam-queue",
  "dashmap 5.5.3",
@@ -3404,8 +3405,9 @@ dependencies = [
 
 [[package]]
 name = "pingora-proxy"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2467265ad39b56230b56149f1c03ca510f46c4bf4a25d6d4b7345e0f06cc46e7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3426,8 +3428,9 @@ dependencies = [
 
 [[package]]
 name = "pingora-runtime"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89aed2e58b34196682bdc2370c4293f908dece5741c56f5f5ba1018f55de68f2"
 dependencies = [
  "log",
  "once_cell",
@@ -3439,8 +3442,9 @@ dependencies = [
 
 [[package]]
 name = "pingora-timeout"
-version = "0.8.0"
-source = "git+https://github.com/cloudflare/pingora?rev=09696b51bc59315353d96686355861604d0bb48c#09696b51bc59315353d96686355861604d0bb48c"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a1dac05d3ebf3ec1be4748d7ef391c48baa886181ce0f1b564ef8fa569243e3"
 dependencies = [
  "once_cell",
  "parking_lot",
@@ -3604,7 +3608,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -3625,7 +3629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -3714,7 +3718,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4063,7 +4067,7 @@ dependencies = [
  "arc-swap",
  "base62",
  "globwalk",
- "itertools 0.11.0",
+ "itertools",
  "normpath",
  "serde",
  "serde-saphyr",
@@ -4118,7 +4122,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4176,7 +4180,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4708,7 +4712,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4776,15 +4780,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "substring"
-version = "1.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42ee6433ecef213b2e72f587ef64a2f5943e7cd16fbd82dbe8bc07486c534c86"
-dependencies = [
- "autocfg",
 ]
 
 [[package]]
@@ -4903,7 +4898,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5809,7 +5804,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
