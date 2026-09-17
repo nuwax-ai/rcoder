@@ -104,6 +104,9 @@ pub struct AppManagerConfig {
     /// 工作空间 PVC 名（K8s 模式，app 复用的 RWX PVC；运行时也直接读 env
     /// `RCODER_WORKSPACE_PVC_NAME`，此处仅作可观测/兜底）
     pub workspace_pvc_name: Option<String>,
+
+    /// 部署预算配置（旁路：stage/absolute/SQL/no-progress/failure thresholds）
+    pub deploy_budget: DeployBudgetConfig,
 }
 
 impl Default for AppManagerConfig {
@@ -124,6 +127,7 @@ impl Default for AppManagerConfig {
             access_mode: AppAccessMode::default(),
             http_expose: http_expose_from_env(),
             workspace_pvc_name: std::env::var("RCODER_WORKSPACE_PVC_NAME").ok(),
+            deploy_budget: deploy_budget_from_env(),
         }
     }
 }
@@ -153,5 +157,95 @@ impl AppManagerConfig {
     /// 获取 Gateway NodePort
     pub fn get_gateway_node_port(&self) -> u16 {
         self.gateway_node_port.unwrap_or(DEFAULT_GATEWAY_NODE_PORT)
+    }
+}
+
+/// 部署预算配置。所有值单位为秒。
+/// 环境变量覆盖：`RCODER_USERAPP_DEPLOY_<FIELD>_SECS`（failure_restart_threshold
+/// 和 oom_restart_threshold 使用 `RCODER_USERAPP_DEPLOY_<FIELD>`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeployBudgetConfig {
+    /// progress_v1 活跃且 step=running_sql 时使用此值替代 no-progress timer；
+    /// 同时也是 SQL 阶段预算（活动增长不退出）。
+    pub sql_stage_budget_secs: u64,
+    /// 非 SQL 阶段的 no-progress 超时（仅 progress_v1 声明时生效）。
+    pub no_progress_timeout_secs: u64,
+    /// pre-appcli 阶段预算（app-cli download + 启动前的总时间）。
+    pub pre_appcli_stage_budget_secs: u64,
+    /// 绝对 deadline（从受理起的墙钟总时间上限，epoch ms 绑定到旁记录）。
+    pub absolute_budget_secs: u64,
+    /// 连续 crash restart 次数阈值（触发 CrashLoopBackOff 分类）。
+    pub failure_restart_threshold: u32,
+    /// 连续 OOM restart 次数阈值（触发 OomRestartStorm 分类）。
+    pub oom_restart_threshold: u32,
+    /// 围栏状态多久后触发告警（秒）。
+    pub fenced_alert_after_secs: u64,
+}
+
+impl Default for DeployBudgetConfig {
+    fn default() -> Self {
+        Self {
+            sql_stage_budget_secs: 1800,
+            no_progress_timeout_secs: 600,
+            pre_appcli_stage_budget_secs: 1800,
+            absolute_budget_secs: 3600,
+            failure_restart_threshold: 3,
+            oom_restart_threshold: 2,
+            fenced_alert_after_secs: 900,
+        }
+    }
+}
+
+/// 从环境变量读取部署预算配置，无效值直接 panic（fail-fast）。
+pub fn deploy_budget_from_env() -> DeployBudgetConfig {
+    let d = DeployBudgetConfig::default();
+    let parse_env = |key: &str, default: u64| -> u64 {
+        std::env::var(key)
+            .ok()
+            .map(|v| {
+                v.parse::<u64>()
+                    .unwrap_or_else(|e| panic!("{key}={v}: invalid u64: {e}"))
+            })
+            .unwrap_or(default)
+    };
+    let parse_u32 = |key: &str, default: u32| -> u32 {
+        std::env::var(key)
+            .ok()
+            .map(|v| {
+                v.parse::<u32>()
+                    .unwrap_or_else(|e| panic!("{key}={v}: invalid u32: {e}"))
+            })
+            .unwrap_or(default)
+    };
+    DeployBudgetConfig {
+        sql_stage_budget_secs: parse_env(
+            "RCODER_USERAPP_DEPLOY_SQL_STAGE_BUDGET_SECS",
+            d.sql_stage_budget_secs,
+        ),
+        no_progress_timeout_secs: parse_env(
+            "RCODER_USERAPP_DEPLOY_NO_PROGRESS_TIMEOUT_SECS",
+            d.no_progress_timeout_secs,
+        ),
+        pre_appcli_stage_budget_secs: parse_env(
+            "RCODER_USERAPP_DEPLOY_PRE_APPCLI_STAGE_BUDGET_SECS",
+            d.pre_appcli_stage_budget_secs,
+        ),
+        absolute_budget_secs: parse_env(
+            "RCODER_USERAPP_DEPLOY_ABSOLUTE_BUDGET_SECS",
+            d.absolute_budget_secs,
+        ),
+        failure_restart_threshold: parse_u32(
+            "RCODER_USERAPP_DEPLOY_FAILURE_RESTART_THRESHOLD",
+            d.failure_restart_threshold,
+        ),
+        oom_restart_threshold: parse_u32(
+            "RCODER_USERAPP_DEPLOY_OOM_RESTART_THRESHOLD",
+            d.oom_restart_threshold,
+        ),
+        fenced_alert_after_secs: parse_env(
+            "RCODER_USERAPP_DEPLOY_FENCED_ALERT_AFTER_SECS",
+            d.fenced_alert_after_secs,
+        ),
     }
 }

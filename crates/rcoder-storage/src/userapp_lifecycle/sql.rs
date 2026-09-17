@@ -318,6 +318,30 @@ macro_rules! implement_store {
                 Ok(input)
             }
 
+            async fn bind_operation_deadline(&self, app_id: &str, operation_id: &str, lifecycle_id: &str, deadline_epoch_ms: i64) -> Result<i64, Error> {
+                let mut tx = self.pool.begin_with($begin).await.map_err(storage)?;
+                let encoded: Option<String> = sqlx::query_scalar($locked).bind(app_id).fetch_optional(&mut *tx).await.map_err(storage)?;
+                let app: UserAppLifecycleRecord = serde_json::from_str(&encoded.ok_or(Error::NotFound)?).map_err(storage)?;
+                if app.lifecycle_id != lifecycle_id || app.current_operation_id.as_deref() != Some(operation_id) { return Err(Error::LifecycleConflict); }
+                let encoded: Option<String> = sqlx::query_scalar("SELECT record FROM userapp_operations WHERE app_id=$1 AND operation_id=$2").bind(app_id).bind(operation_id).fetch_optional(&mut *tx).await.map_err(storage)?;
+                let operation: UserAppOperationRecord = serde_json::from_str(&encoded.ok_or(Error::NotFound)?).map_err(storage)?;
+                if operation.lifecycle_id != lifecycle_id || operation.state.is_terminal() { return Err(Error::VersionConflict); }
+                // bind-once：INSERT ON CONFLICT DO NOTHING；已存在 → 返回持久值
+                // （不同副本配置不同也不得各绑各的候选 deadline）
+                sqlx::query("INSERT INTO userapp_operation_deadlines(operation_id,app_id,lifecycle_id,deadline_ms) VALUES($1,$2,$3,$4) ON CONFLICT(operation_id) DO NOTHING")
+                    .bind(operation_id).bind(app_id).bind(lifecycle_id).bind(deadline_epoch_ms).execute(&mut *tx).await.map_err(storage)?;
+                let persisted: i64 = sqlx::query_scalar("SELECT deadline_ms FROM userapp_operation_deadlines WHERE operation_id=$1 AND app_id=$2 AND lifecycle_id=$3")
+                    .bind(operation_id).bind(app_id).bind(lifecycle_id).fetch_one(&mut *tx).await.map_err(storage)?;
+                tx.commit().await.map_err(storage)?;
+                Ok(persisted)
+            }
+
+            async fn operation_deadline(&self, app_id: &str, operation_id: &str) -> Result<Option<i64>, Error> {
+                let row: Option<i64> = sqlx::query_scalar("SELECT deadline_ms FROM userapp_operation_deadlines WHERE app_id=$1 AND operation_id=$2")
+                    .bind(app_id).bind(operation_id).fetch_optional(&self.pool).await.map_err(storage)?;
+                Ok(row)
+            }
+
             async fn bind_operation_lease(&self, context: &shared_types::UserAppExecutionContext, receipt: &shared_types::UserAppOperationLeaseReceipt) -> Result<(), Error> {
                 context.validate_identity(&context.app_id).map_err(Error::InvalidOperation)?;
                 receipt.validate().map_err(Error::InvalidOperation)?;

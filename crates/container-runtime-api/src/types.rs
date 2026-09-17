@@ -694,6 +694,67 @@ pub struct DeploymentStatus {
     pub wake_on_traffic: Option<bool>,
     /// Deployment 创建时间（RFC3339，来自 metadata.creationTimestamp；回收扫描器做 protection 龄期判断）。
     pub created_at: Option<String>,
+    /// K8s Deployment UID（部署故障观察的身份锚点：pod owner 链归属核验）。
+    /// Docker 无此概念，填 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_uid: Option<String>,
+}
+
+/// 部署故障观察的目标身份（本次操作实际写入的模板归属）。
+///
+/// `template_token` = 写入 pod template annotations 的 `rcoder.io/deploy-template-token`
+/// （rcoder 在 create/SSA patch 时写入，取值 = 本次操作的 operation_id——每次变更的
+/// 写入者身份，确定性比较，不使用 generation/revision/pod-template-hash 互比）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AppDeployTarget {
+    /// 目标 Deployment UID（与 pod owner 链解析结果比对）
+    pub deployment_uid: String,
+    /// 本次写入的模板令牌（operation_id）
+    pub template_token: String,
+}
+
+/// 容器最近一次退出的结构化身份（区别于自由文本 message）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ContainerExit {
+    /// 退出码
+    pub code: i32,
+    /// K8s 终止原因（OOMKilled / Error / Completed…）
+    pub reason: Option<String>,
+}
+
+/// 单个应用 Pod 的结构化故障观察（K8s 原生字段，非文本解析）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PodFailureObservation {
+    /// 完整 owner 链解析出的 Deployment UID（pod --controller=true--> RS --controller=true--> Deployment）
+    pub deployment_uid: String,
+    /// owner 链 → 目标 Deployment UID ∧ pod template 携带目标令牌（身份匹配才可参与故障分类）
+    pub matches_target_template: bool,
+    pub pod_uid: String,
+    /// Pod phase：Pending/Running/Succeeded/Failed/Unknown
+    pub pod_phase: String,
+    /// PodScheduled condition（None = 缺失）
+    pub scheduled: Option<bool>,
+    /// 调度拒绝原因（Unschedulable 等；scheduled=false 时有意义）
+    pub scheduling_reason: Option<String>,
+    /// app 容器 waiting reason（K8s 原生：CrashLoopBackOff/ImagePullBackOff/ContainerCreating…）
+    pub container_waiting_reason: Option<String>,
+    /// waiting 诊断文本（镜像永久失败分类仍需匹配：NotFound/Unauthorized/denied）
+    pub container_waiting_message: Option<String>,
+    /// app 容器最近一次退出（含 OOMKilled）
+    pub container_last_exit: Option<ContainerExit>,
+    pub restart_count: u32,
+    pub ready: bool,
+}
+
+/// 应用 Pod 观察结果三态。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub enum PodObservation {
+    /// 观察到一个 Pod
+    Observed(PodFailureObservation),
+    /// 无 Pod（合法状态：尚未调度/已删除——与观察失败严格区分）
+    NoPod,
+    /// 身份不确定（owner 链不完整/多候选无法归因）——只诊断，不参与故障分类
+    UncertainIdentity(String),
 }
 
 /// app 容器当前 `command`/`env` 快照（`update` 部分更新回退用）。

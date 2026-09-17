@@ -204,6 +204,56 @@ impl AppService {
         Ok(true)
     }
 
+    /// Compute the remaining deploy budget for a recovery replay.
+    /// Reads the bound deadline (epoch ms) and converts to monotonic remaining
+    /// duration. For old-version operations without a bound deadline, derives
+    /// from created_at + absolute_budget and bind-once persists the result.
+    async fn recovery_deploy_budget(
+        &self,
+        operation: &OwnedOperation,
+        snapshot: &UserAppOperationRecord,
+    ) -> AppResult<Duration> {
+        let context = operation.execution_context();
+        let absolute_secs = self.config.deploy_budget.absolute_budget_secs as i64;
+        let absolute_ms = absolute_secs * 1000;
+
+        let deadline_ms = match self
+            .metadata
+            .store
+            .operation_deadline(&context.app_id, &context.operation_id)
+            .await
+        {
+            Ok(Some(ms)) => ms,
+            Ok(None) => {
+                // Old version: derive from created_at and bind-once persist.
+                let derived = snapshot
+                    .created_at
+                    .timestamp_millis()
+                    .saturating_add(absolute_ms);
+                self.metadata
+                    .store
+                    .bind_operation_deadline(
+                        &context.app_id,
+                        &context.operation_id,
+                        &context.lifecycle_id,
+                        derived,
+                    )
+                    .await
+                    .map_err(AppOperationError::from)?
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let remaining_ms = deadline_ms.saturating_sub(now_ms);
+        if remaining_ms <= 0 {
+            return Err(AppOperationError::Backend(
+                "Deployment recovery deadline already exceeded".into(),
+            ));
+        }
+        Ok(Duration::from_millis(remaining_ms as u64))
+    }
+
     pub async fn resume_pending_control(
         &self,
         snapshot: &UserAppOperationRecord,
@@ -283,13 +333,21 @@ impl AppService {
         };
         if let Command::Deploy { restart, .. } = &command {
             let guard = std::sync::Arc::new(guard);
+            // Read the bound deadline (if present) and convert wall-clock epoch ms
+            // to a monotonic remaining duration. For old-version operations without
+            // a bound deadline, derive from created_at + absolute_budget and
+            // bind-once persist for consistency.
+            let recovery_budget = self
+                .recovery_deploy_budget(&operation, snapshot)
+                .await
+                .unwrap_or(Duration::from_secs(420));
             let execute = async {
                 let input = operation.execution_input().await?;
                 let input = super::deploy_control::DeployInput::decode(&input, *restart)?;
                 self.execute_deploy_input(&snapshot.app_id, input, &mut operation, guard.clone())
                     .await
             };
-            let result = tokio::time::timeout(Duration::from_secs(420), execute)
+            let result = tokio::time::timeout(recovery_budget, execute)
                 .await
                 .unwrap_or_else(|_| {
                     Err(AppOperationError::Backend(

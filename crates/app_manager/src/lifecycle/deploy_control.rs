@@ -157,6 +157,23 @@ impl AppService {
             Some(&encoded),
         )
         .await?;
+        // Bind absolute deadline as a side-record (bind-once, before any runtime
+        // side-effect). Failure here is fail-closed: if we cannot persist the
+        // deadline, we must not proceed with the deploy.
+        {
+            let context = operation.execution_context();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let absolute_ms = (self.config.deploy_budget.absolute_budget_secs as i64) * 1000;
+            self.metadata
+                .store
+                .bind_operation_deadline(
+                    &context.app_id,
+                    &context.operation_id,
+                    &context.lifecycle_id,
+                    now_ms.saturating_add(absolute_ms),
+                )
+                .await?;
+        }
         let result = self
             .execute_deploy_input(app_id, input, &mut operation, guard.clone())
             .await;

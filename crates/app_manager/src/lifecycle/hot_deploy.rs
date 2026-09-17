@@ -31,6 +31,7 @@ use crate::service::AppService;
 const APP_CLI_ADMIN_PORT: u16 = shared_types::APP_CLI_ADMIN_PORT;
 /// 轮询间隔/预算（对齐冷部署链部署段等待的量级）。
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+#[allow(dead_code)]
 const HOT_DEPLOY_BUDGET: Duration = Duration::from_secs(300);
 const HOT_RECONCILIATION_BUDGET: Duration = Duration::from_secs(30 * 60);
 
@@ -182,9 +183,10 @@ impl AppService {
             operation_id: operation_id.to_owned(),
             operation,
         };
-        // Once the request can be accepted, cancellation of the HTTP caller must
-        // not abandon status observation or configuration convergence.
-        tokio::time::timeout(HOT_DEPLOY_BUDGET, task.execute())
+        // Reconciliation may take up to the full stage budget; the HTTP caller's
+        // 300s response timeout is handled by spawning the task and discarding the
+        // JoinHandle after the caller gives up (see start_hot_deploy).
+        tokio::time::timeout(HOT_RECONCILIATION_BUDGET, task.execute())
             .await
             .map_err(|_| {
                 AppOperationError::Backend("Hot deployment execution deadline exceeded".into())

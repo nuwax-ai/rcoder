@@ -14,6 +14,7 @@ use container_runtime_api::{
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::apps::v1::Deployment;
 #[cfg(feature = "kubernetes")]
+use kube::Api;
 use kube::api::ListParams;
 
 use super::k8s_app_helpers::{
@@ -278,6 +279,7 @@ impl KubernetesRuntime {
             idle_timeout_seconds,
             wake_on_traffic,
             created_at,
+            deployment_uid: deploy.metadata.uid.clone(),
         }
     }
 
@@ -299,11 +301,28 @@ impl KubernetesRuntime {
                 .into_iter()
                 .next()
                 .and_then(|p| {
-                    let st = p.status?;
+                    let st = p.status.as_ref()?;
                     // 按容器名取 "app" 容器状态（防御 sidecar 注入后 pop() 取错容器）
-                    let cs = st
+                    let cs = match st
                         .container_statuses
-                        .and_then(|v| v.into_iter().find(|c| c.name == APP_CONTAINER_NAME))?;
+                        .as_ref()
+                        .and_then(|v| v.iter().find(|c| c.name == APP_CONTAINER_NAME))
+                    {
+                        Some(cs) => cs.clone(),
+                        // 容器状态缺失 = 尚未创建容器（Pending 未调度/拉镜像前）——
+                        // 上浮调度拒绝原因（Unschedulable：资源不足不会自愈但可能
+                        // 被缓解，由上层策略判断持续性，不在此判死）
+                        None => {
+                            let scheduling = unschedulable_message(st);
+                            return Some((
+                                st.pod_ip.clone().unwrap_or_default(),
+                                p.spec.and_then(|s| s.node_name).unwrap_or_default(),
+                                0,
+                                None,
+                                scheduling,
+                            ));
+                        }
+                    };
                     // started_at：从 container state.running 提取实际启动时间
                     let started_at = cs
                         .state
@@ -315,7 +334,7 @@ impl KubernetesRuntime {
                     // （ContainerCreating）不在此列，不会被误判为 Error。
                     let error_message = container_error_message(&cs);
                     Some((
-                        st.pod_ip.unwrap_or_default(),
+                        st.pod_ip.clone().unwrap_or_default(),
                         p.spec.and_then(|s| s.node_name).unwrap_or_default(),
                         cs.restart_count as u32,
                         started_at,
@@ -325,6 +344,188 @@ impl KubernetesRuntime {
                 .unwrap_or_default(),
             Err(_) => (String::new(), String::new(), 0, None, None),
         }
+    }
+
+    /// 结构化应用 Pod 故障观察（部署等待循环的确定性失败信号数据源）。
+    ///
+    /// 身份核验（计划 v3.2 固定实现）：目标 Deployment UID 比对 + pod template
+    /// 令牌比对（`rcoder.io/deploy-template-token` = 本次操作 operation_id）；
+    /// owner 链按 `controller=true` + kind 逐级解析，禁止取 ownerReferences[0]。
+    /// 链不完整/身份不可证 → UncertainIdentity（只诊断）；列表观察失败 → Err
+    /// （与 NoPod 严格区分）。
+    pub(crate) async fn observe_app_pods_structured(
+        &self,
+        app_id: &str,
+        target: &container_runtime_api::AppDeployTarget,
+    ) -> ContainerRuntimeResult<Vec<container_runtime_api::PodObservation>> {
+        use container_runtime_api::{ContainerExit, PodFailureObservation, PodObservation};
+
+        let deployment_name = self.app_deployment_name(app_id);
+        let deployment = match self.deployments_api().get(&deployment_name).await {
+            Ok(deploy) => deploy,
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                return Ok(vec![PodObservation::NoPod]);
+            }
+            Err(error) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "observe application deployment: {error}"
+                )));
+            }
+        };
+        let deployment_uid = deployment.metadata.uid.clone().unwrap_or_default();
+        if deployment_uid.is_empty() || deployment_uid != target.deployment_uid {
+            // 目标 Deployment 已被替换（UID 变化）或身份缺失——本次等待的
+            // 写入已非当前对象，观察只诊断不分类
+            return Ok(vec![PodObservation::UncertainIdentity(format!(
+                "deployment uid changed: target={}, observed={deployment_uid}",
+                target.deployment_uid
+            ))]);
+        }
+
+        let lp = ListParams {
+            label_selector: Some(format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX)),
+            resource_version: Some("0".to_string()),
+            ..Default::default()
+        };
+        let pods = self.pods_api().list(&lp).await.map_err(|error| {
+            ContainerRuntimeError::K8sError(format!("observe application pods: {error}"))
+        })?;
+        if pods.items.is_empty() {
+            return Ok(vec![PodObservation::NoPod]);
+        }
+
+        let replicasets: Api<k8s_openapi::api::apps::v1::ReplicaSet> =
+            Api::namespaced(self.client.clone(), &self.namespace);
+        let mut observations = Vec::with_capacity(pods.items.len());
+        for pod in pods.items {
+            let pod_uid = pod.metadata.uid.clone().unwrap_or_default();
+            let Some(status) = pod.status.clone() else {
+                observations.push(PodObservation::UncertainIdentity(format!(
+                    "pod has no status: {}",
+                    pod.metadata.name.unwrap_or_default()
+                )));
+                continue;
+            };
+            // owner 链：pod --controller=true--> ReplicaSet --controller=true--> Deployment
+            let owner_rs = pod
+                .metadata
+                .owner_references
+                .as_ref()
+                .and_then(|refs| {
+                    refs.iter()
+                        .find(|r| r.controller == Some(true) && r.kind == "ReplicaSet")
+                })
+                .map(|r| r.name.clone());
+            let Some(owner_rs) = owner_rs else {
+                observations.push(PodObservation::UncertainIdentity(format!(
+                    "pod has no controlling ReplicaSet owner: {}",
+                    pod.metadata.name.unwrap_or_default()
+                )));
+                continue;
+            };
+            let rs = match replicasets.get(&owner_rs).await {
+                Ok(rs) => rs,
+                Err(kube::Error::Api(error)) if error.code == 404 => {
+                    observations.push(PodObservation::UncertainIdentity(format!(
+                        "owning ReplicaSet gone: {owner_rs}"
+                    )));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(ContainerRuntimeError::K8sError(format!(
+                        "observe owning ReplicaSet {owner_rs}: {error}"
+                    )));
+                }
+            };
+            let rs_owner = rs
+                .metadata
+                .owner_references
+                .as_ref()
+                .and_then(|refs| {
+                    refs.iter()
+                        .find(|r| r.controller == Some(true) && r.kind == "Deployment")
+                })
+                .map(|r| (r.name.clone(), r.uid.clone()));
+            let chain_matches = matches!(&rs_owner, Some((name, uid))
+                if *name == deployment_name && *uid == deployment_uid);
+            // 模板令牌：pod template annotations 携带本次操作写入的令牌
+            let pod_token = pod
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(super::k8s_app_helpers::DEPLOY_TEMPLATE_TOKEN_ANNOTATION));
+            let token_matches =
+                pod_token.map(String::as_str) == Some(target.template_token.as_str());
+            if !chain_matches {
+                // 旧 ReplicaSet 的 Pod（同 Deployment UID 下换代残留）——保留观察
+                // 作诊断，matches=false 不参与故障分类
+                let uid_for_observation = deployment_uid.clone();
+                observations.push(PodObservation::Observed(PodFailureObservation {
+                    deployment_uid: uid_for_observation,
+                    matches_target_template: false,
+                    pod_uid,
+                    pod_phase: status.phase.clone().unwrap_or_default(),
+                    scheduled: None,
+                    scheduling_reason: None,
+                    container_waiting_reason: None,
+                    container_waiting_message: None,
+                    container_last_exit: None,
+                    restart_count: 0,
+                    ready: false,
+                }));
+                continue;
+            }
+            let scheduled_condition = status
+                .conditions
+                .as_ref()
+                .and_then(|cs| cs.iter().find(|c| c.type_ == "PodScheduled"));
+            let scheduled = scheduled_condition.map(|c| c.status == "True");
+            let scheduling_reason = match scheduled_condition {
+                Some(c) if c.status == "False" => c.reason.clone(),
+                _ => None,
+            };
+            let app_container = status
+                .container_statuses
+                .as_ref()
+                .and_then(|v| v.iter().find(|c| c.name == APP_CONTAINER_NAME));
+            let (waiting_reason, waiting_message, last_exit, restart_count) = match app_container {
+                Some(cs) => {
+                    let waiting = cs.state.as_ref().and_then(|s| s.waiting.as_ref());
+                    let terminated = cs.last_state.as_ref().and_then(|s| s.terminated.as_ref());
+                    (
+                        waiting.and_then(|w| w.reason.clone()),
+                        waiting.and_then(|w| w.message.clone()),
+                        terminated.map(|t| ContainerExit {
+                            code: t.exit_code,
+                            reason: t.reason.clone(),
+                        }),
+                        cs.restart_count as u32,
+                    )
+                }
+                None => (None, None, None, 0),
+            };
+            let ready = status
+                .conditions
+                .as_ref()
+                .and_then(|cs| cs.iter().find(|c| c.type_ == "Ready"))
+                .map(|c| c.status == "True")
+                .unwrap_or(false);
+            let uid_for_observation = deployment_uid.clone();
+            observations.push(PodObservation::Observed(PodFailureObservation {
+                deployment_uid: uid_for_observation,
+                matches_target_template: token_matches,
+                pod_uid,
+                pod_phase: status.phase.clone().unwrap_or_default(),
+                scheduled,
+                scheduling_reason,
+                container_waiting_reason: waiting_reason,
+                container_waiting_message: waiting_message,
+                container_last_exit: last_exit,
+                restart_count,
+                ready,
+            }));
+        }
+        Ok(observations)
     }
 
     /// TCP 端口的 node_port：查 NodePort Service，按 port name 关联（TCP 对外时用）。
@@ -354,4 +555,5 @@ impl KubernetesRuntime {
 // probe_to_health_check）与测试已拆至 k8s_app_status_derive.rs；
 // re-export 保持 k8s_agent_query 的既有引用路径不变
 pub(crate) use super::k8s_app_status_derive::container_error_message;
+use super::k8s_app_status_derive::unschedulable_message;
 use super::k8s_app_status_derive::{derive_phase, derive_port_statuses, probe_to_health_check};

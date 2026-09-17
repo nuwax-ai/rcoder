@@ -589,6 +589,23 @@ pub trait UserAppLifecycleStore: Send + Sync {
             "Private execution inputs are unsupported".into(),
         ))
     }
+    /// 绑定操作执行 deadline（epoch ms，旁记录——不动 DeployInput；bind-once：
+    /// 已存在时返回持久化值不覆盖，不同副本配置不同也不得各绑各的候选值）。
+    /// 与受理原子写入（或至少在任何运行时副作用之前完成；失败 fail-closed）。
+    async fn bind_operation_deadline(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+        lifecycle_id: &str,
+        deadline_epoch_ms: i64,
+    ) -> Result<i64, UserAppStoreError>;
+    /// 读取操作绑定的 deadline（None = 无记录：旧版本受理的操作，由调用方
+    /// 按 created_at + absolute_budget 推导并 bind-once 落盘）。
+    async fn operation_deadline(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<i64>, UserAppStoreError>;
     async fn bind_operation_lease(
         &self,
         context: &UserAppExecutionContext,

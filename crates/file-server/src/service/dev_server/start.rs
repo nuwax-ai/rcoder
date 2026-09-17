@@ -468,10 +468,9 @@ mod tests {
             format!("#!/bin/sh\nenv | sort > '{}'\nsleep 60\n", dump.display()),
         )
         .expect("write fake orchestrator");
-        #[allow(clippy::unnecessary_cast)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755u32))
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod script");
         }
         (dump, script)

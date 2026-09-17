@@ -250,7 +250,20 @@ impl KubernetesRuntime {
                         // env/secrets 改的是 ConfigMap/Secret 数据，env_from 引用名不变 →
                         // 不触发 rollout。此 annotation 让"内容变 → hash 变 → spec 变 → 自动
                         // rollout"，使 env 更新对运行中 Pod 生效（K8s 标准模式）。
-                        annotations: Some(config_hash_annotations(params)),
+                        // deploy-template-token：本次操作的写入者身份（operation_id）——
+                        // 部署故障观察据此核验"观察到的 Pod 属于本次操作实际写入的模板"
+                        // （同 UID 下旧 ReplicaSet 的 Pod 不携带新令牌）。
+                        annotations: Some({
+                            let mut ann = config_hash_annotations(params);
+                            if let Some(context) = &params.execution_context {
+                                ann.insert(
+                                    super::k8s_app_helpers::DEPLOY_TEMPLATE_TOKEN_ANNOTATION
+                                        .to_string(),
+                                    context.operation_id.clone(),
+                                );
+                            }
+                            ann
+                        }),
                         ..Default::default()
                     }),
                     spec: Some(pod_spec),

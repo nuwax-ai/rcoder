@@ -79,6 +79,27 @@ pub(super) fn derive_port_statuses(
         .unwrap_or_default()
 }
 
+/// Pod conditions 的调度拒绝原因（Pending 未调度时容器状态尚未存在）。
+/// 仅在 PodScheduled=False 且 reason=Unschedulable 时返回——资源压力/节点
+/// 暂缺**可能恢复**，上浮为诊断 message 供上层持续策略判断，不在此判死。
+pub(crate) fn unschedulable_message(
+    status: &k8s_openapi::api::core::v1::PodStatus,
+) -> Option<String> {
+    let condition = status
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.type_ == "PodScheduled" && c.status == "False")?;
+    let reason = condition.reason.as_deref().unwrap_or("Unschedulable");
+    let detail = condition
+        .message
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .map(|m| format!(": {m}"))
+        .unwrap_or_default();
+    Some(format!("{reason}{detail}"))
+}
+
 /// 从容器状态提取"启动失败"原因（供 phase=Error 的 message）。
 ///
 /// 命中条件（任一）：
@@ -384,5 +405,38 @@ mod tests {
         );
         let ports = derive_port_statuses(&deploy, &HashMap::new());
         assert!(ports.is_empty());
+    }
+
+    #[test]
+    fn unschedulable_pending_pod_yields_scheduling_message() {
+        use k8s_openapi::api::core::v1::PodCondition;
+        let mut status = k8s_openapi::api::core::v1::PodStatus::default();
+        assert_eq!(unschedulable_message(&status), None, "无 conditions → None");
+        status.conditions = Some(vec![PodCondition {
+            type_: "PodScheduled".into(),
+            status: "False".into(),
+            reason: Some("Unschedulable".into()),
+            message: Some("0/3 nodes are available: 3 Insufficient memory.".into()),
+            ..Default::default()
+        }]);
+        assert_eq!(
+            unschedulable_message(&status),
+            Some("Unschedulable: 0/3 nodes are available: 3 Insufficient memory.".into())
+        );
+        // PodScheduled=True → None（正常调度不是故障）
+        status.conditions = Some(vec![PodCondition {
+            type_: "PodScheduled".into(),
+            status: "True".into(),
+            ..Default::default()
+        }]);
+        assert_eq!(unschedulable_message(&status), None);
+        // 其他 condition 类型为 False → None（只认 PodScheduled）
+        status.conditions = Some(vec![PodCondition {
+            type_: "Initialized".into(),
+            status: "False".into(),
+            reason: Some("Unschedulable".into()),
+            ..Default::default()
+        }]);
+        assert_eq!(unschedulable_message(&status), None);
     }
 }

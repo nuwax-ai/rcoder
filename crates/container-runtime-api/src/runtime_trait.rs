@@ -680,6 +680,21 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// 结构化应用 Pod 故障观察（部署等待循环的确定性失败信号数据源）。
+    ///
+    /// 按 [`AppDeployTarget`] 核验每个 Pod 的归属身份（完整 owner 链 → 目标
+    /// Deployment UID ∧ pod template 携带目标令牌）；列表观察失败返回 Err
+    /// （与"无 Pod"的 NoPod 严格区分）。默认返回空 vec = 该运行时无观察
+    /// 能力（Docker 模式天然 no-op，等待循环只跳过故障分类）。
+    async fn observe_app_pods(
+        &self,
+        app_id: &str,
+        target: &crate::AppDeployTarget,
+    ) -> ContainerRuntimeResult<Vec<crate::PodObservation>> {
+        let _ = (app_id, target);
+        Ok(Vec::new())
+    }
+
     /// 读 app 当前容器的 `command`/`env` 快照（`update` 部分更新回退用，见
     /// [`ContainerSpecSnapshot`]）。
     ///

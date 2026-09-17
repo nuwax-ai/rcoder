@@ -1047,6 +1047,7 @@ async fn postgres_real_transactions_and_restart_contract() {
         control_command_is_durable_and_part_of_deduplication(&store).await;
         private_execution_input_contract(&store).await;
         operation_lease_contract(&store).await;
+        operation_deadline_contract(&store).await;
         physical_binding_is_atomic_and_cannot_cross_lifecycles(&store).await;
         runtime_policy_commits_only_with_success(&store).await;
         configuration_policy_is_transactional(&store).await;
@@ -1875,4 +1876,107 @@ async fn operation_lease_contract(store: &dyn UserAppLifecycleStore) {
 async fn sqlite_operation_lease_contract() {
     let (_directory, store) = database().await;
     operation_lease_contract(&store).await;
+}
+
+/// Deadline bind-once side-record contract:
+/// - identity checks (lifecycle mismatch → LifecycleConflict, terminal → VersionConflict)
+/// - bind-once semantics (second bind returns persisted value, different deadline not accepted)
+/// - read returns None for unknown app/operation
+async fn operation_deadline_contract(store: &dyn UserAppLifecycleStore) {
+    // --- fresh app, no deadline yet ---
+    let mut req = request("dl-fresh", Kind::Update);
+    req.app_id = "dl-app".into();
+    let op = operation(store.admit(&req).await.unwrap());
+    assert!(
+        store
+            .operation_deadline(&req.app_id, &op.operation_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "no deadline before first bind"
+    );
+
+    // --- first bind succeeds, returns the value ---
+    let deadline_a: i64 = 1_000_000;
+    let returned = store
+        .bind_operation_deadline(&req.app_id, &op.operation_id, &op.lifecycle_id, deadline_a)
+        .await
+        .unwrap();
+    assert_eq!(returned, deadline_a);
+
+    // --- bind-once: second bind with different deadline returns persisted value ---
+    let deadline_b: i64 = 9_999_999;
+    let returned = store
+        .bind_operation_deadline(&req.app_id, &op.operation_id, &op.lifecycle_id, deadline_b)
+        .await
+        .unwrap();
+    assert_eq!(returned, deadline_a, "bind-once must return first value");
+    assert_eq!(
+        store
+            .operation_deadline(&req.app_id, &op.operation_id)
+            .await
+            .unwrap(),
+        Some(deadline_a)
+    );
+
+    // --- lifecycle mismatch → LifecycleConflict ---
+    assert!(matches!(
+        store
+            .bind_operation_deadline(&req.app_id, &op.operation_id, "wrong-lifecycle", deadline_a)
+            .await,
+        Err(Error::LifecycleConflict)
+    ));
+
+    // --- wrong app_id → LifecycleConflict (app lifecycle_id won't match) ---
+    assert!(matches!(
+        store
+            .bind_operation_deadline("wrong-app", &op.operation_id, &op.lifecycle_id, deadline_a)
+            .await,
+        Err(Error::NotFound)
+    ));
+
+    // --- unknown operation → LifecycleConflict (identity check fires first) ---
+    assert!(matches!(
+        store
+            .bind_operation_deadline(&req.app_id, "no-such-op", &op.lifecycle_id, deadline_a)
+            .await,
+        Err(Error::LifecycleConflict)
+    ));
+
+    // --- read unknown app → None ---
+    assert!(
+        store
+            .operation_deadline("nonexistent", "nonexistent")
+            .await
+            .unwrap()
+            .is_none(),
+        "unknown app/operation returns None"
+    );
+
+    // --- terminal operation → LifecycleConflict (current_operation_id cleared) ---
+    complete(store, &op, State::Succeeded).await;
+    // After completion, current_operation_id is cleared; identity check fires first
+    let dl_result = store
+        .bind_operation_deadline(&req.app_id, &op.operation_id, &op.lifecycle_id, deadline_a)
+        .await;
+    assert!(
+        matches!(dl_result, Err(Error::LifecycleConflict)),
+        "completed operation no longer matches current_operation_id"
+    );
+
+    // --- read still returns the persisted deadline after terminal ---
+    assert_eq!(
+        store
+            .operation_deadline(&req.app_id, &op.operation_id)
+            .await
+            .unwrap(),
+        Some(deadline_a),
+        "deadline side-record persists after operation completion"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_operation_deadline_contract() {
+    let (_directory, store) = database().await;
+    operation_deadline_contract(&store).await;
 }

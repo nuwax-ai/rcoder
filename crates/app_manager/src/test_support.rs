@@ -46,6 +46,10 @@ pub(crate) struct MockRuntime {
     /// Deterministic read window for lifecycle query races; clone outside the
     /// mutex before awaiting either barrier phase.
     pub status_barrier: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// 结构化 Pod 观察 scripting（部署失败信号测试）：按 app_id 取脚本，
+    /// pop front；只剩末值时复用。未预置 → 空观察（无信号）。
+    pub pod_observations:
+        DashMap<String, std::collections::VecDeque<Vec<container_runtime_api::PodObservation>>>,
     /// start_app（scale>0）后 phase 停在 Error：模拟新版本启动即崩（部署段
     /// 等待器的 Error 态快速失败测试用）。
     pub crash_on_start: AtomicBool,
@@ -305,6 +309,20 @@ impl UserAppDeploymentRuntime for MockRuntime {
             .iter()
             .map(|entry| entry.value().clone())
             .collect())
+    }
+
+    async fn observe_app_pods(
+        &self,
+        app_id: &str,
+        _target: &container_runtime_api::AppDeployTarget,
+    ) -> ContainerRuntimeResult<Vec<container_runtime_api::PodObservation>> {
+        if let Some(mut script) = self.pod_observations.get_mut(app_id) {
+            if script.len() > 1 {
+                return Ok(script.pop_front().expect("scripted observations"));
+            }
+            return Ok(script.front().cloned().unwrap_or_default());
+        }
+        Ok(Vec::new())
     }
 
     async fn get_deployment_status(

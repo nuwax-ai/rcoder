@@ -40,6 +40,14 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await
             .map(Some)
     }
+
+    async fn observe_app_pods(
+        &self,
+        app_id: &str,
+        target: &container_runtime_api::AppDeployTarget,
+    ) -> ContainerRuntimeResult<Vec<container_runtime_api::PodObservation>> {
+        self.observe_app_pods_structured(app_id, target).await
+    }
     async fn capture_app_deletion(
         &self,
         app_id: &str,
