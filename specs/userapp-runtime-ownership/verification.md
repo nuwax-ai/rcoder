@@ -39,6 +39,8 @@
 | XP 三平台验证 | `429144f6` std 文件锁 + env 污染消除 + AV 重试 + Job Object 修正 | 三平台原生 cargo test（见下矩阵） | 0 | macOS 193/193；Linux 193/193；Windows 172/172×3（12 个 Unix 专属测试 cfg 门控） | 三台真机 SSH 执行 | — | Compose/K8s 回归 |
 | XP 质量修复 | `2e1c2ba6` force_kill 树杀修正 + CREATE_SUSPENDED 归属 + Windows 锁对端 | 同矩阵复验 | 0 | macOS 193/193；Linux 193/193；Windows **173/173×3**（+PowerShell/.NET Lock 对端，跨进程互斥实测通过） | 三台真机 | — | Compose/K8s 回归；pingap 0.14.1→0.14.3 协同升级（11 处版本同步点，另行任务） |
 | XP-T02/06/07 | `a217a88a` endpoint 发现 + process-wrap + XP03/06/08/10 测试 + 三平台 CI | 三平台原生 cargo test --all-features | 0 | macOS 197/197；Linux 197/197；Windows 全测试目标 ok×3（含 XP06 owner-kill/XP08 中文路径/win_lifecycle 生命周期） | 三台真机 + 新增 .github/workflows/app-cli-cross-platform.yml | — | CI 首跑待 push 后验证；P3 平台迁移（file-server 入口/灰度/Compose/K8s）未开始 |
+| XP01/XP09 | `2a660ed7` 双 CLI 真实进程竞争 + 激活失败无假成功 | 三平台原生 | 0 | macOS 199/199；Linux 189+10；Windows 全目标（含 XP01 Windows 双进程版） | 三台真机 | — | XP09 跨卷 EXDEV 需真实多卷环境 |
+| P3-02 | `3caebc0b` owner 复用（平台 start 经运行 API 路由既有 serve owner）+ token 凭据契约 | cargo nextest -p file-server -p file-server-userapp + app-cli 三平台 | 0 | file-server 401/401（owner_probe_branches 四分支）；app-cli 200/200（macOS）/191+10（Linux）/全目标（Windows） | 本机 + 两台真机 | — | 复用路径 SSE 事件流（P3-03）；构建前 revision 捕获；Windows token ACL；P3-04~07（镜像/灰度/Compose/K8s） |
 
 ## 跨平台原生验证矩阵（XP-T 基础层，2026-09-17）
 
