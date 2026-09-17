@@ -38,6 +38,7 @@
 | P1-01 强化 | legacy main startup order fix: bind before deploy_stage + remove LivenessHold | cargo nextest run --manifest-path crates/app-cli/Cargo.toml --all-features（188 通过，含新测试 legacy_deploy_url_with_port_conflict_has_no_deploy_side_effects / serve_attach_*） | 0 | API bind 在 deploy_stage 前 fail-fast；APP_DEPLOY_URL + 端口冲突无部署副作用；LivenessHold 退役；--attach 模式（身份核验+等待+re-exec）；clippy 零 warning | targeted tests | — | Compose / remote-k8s / 全量 workspace 门禁 |
 | XP 三平台验证 | `429144f6` std 文件锁 + env 污染消除 + AV 重试 + Job Object 修正 | 三平台原生 cargo test（见下矩阵） | 0 | macOS 193/193；Linux 193/193；Windows 172/172×3（12 个 Unix 专属测试 cfg 门控） | 三台真机 SSH 执行 | — | Compose/K8s 回归 |
 | XP 质量修复 | `2e1c2ba6` force_kill 树杀修正 + CREATE_SUSPENDED 归属 + Windows 锁对端 | 同矩阵复验 | 0 | macOS 193/193；Linux 193/193；Windows **173/173×3**（+PowerShell/.NET Lock 对端，跨进程互斥实测通过） | 三台真机 | — | Compose/K8s 回归；pingap 0.14.1→0.14.3 协同升级（11 处版本同步点，另行任务） |
+| XP-T02/06/07 | `a217a88a` endpoint 发现 + process-wrap + XP03/06/08/10 测试 + 三平台 CI | 三平台原生 cargo test --all-features | 0 | macOS 197/197；Linux 197/197；Windows 全测试目标 ok×3（含 XP06 owner-kill/XP08 中文路径/win_lifecycle 生命周期） | 三台真机 + 新增 .github/workflows/app-cli-cross-platform.yml | — | CI 首跑待 push 后验证；P3 平台迁移（file-server 入口/灰度/Compose/K8s）未开始 |
 
 ## 跨平台原生验证矩阵（XP-T 基础层，2026-09-17）
 
