@@ -92,6 +92,8 @@ mod tests {
         let _guard = OwnerGuard::acquire(&root).unwrap();
 
         // 多个子进程尝试获取同一把锁，应全部失败
+        // 使用 fcntl.lockf()——Python 的跨平台 fcntl 锁封装，
+        // 与 fs2 的 fcntl(F_SETLK) 在同一锁域。
         let root_str = root.to_str().unwrap().to_string();
         let mut children = Vec::new();
         for _ in 0..4 {
@@ -103,10 +105,10 @@ mod tests {
 import fcntl, sys
 try:
     f = open('{}/owner.lock', 'r+')
-    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.lockf(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     print('acquired')
     sys.exit(0)
-except (BlockingIOError, OSError):
+except (IOError, OSError):
     print('blocked')
     sys.exit(1)
 "#,
@@ -134,23 +136,23 @@ except (BlockingIOError, OSError):
         let root = dir.path().join("state");
         let _guard = OwnerGuard::acquire(&root).unwrap();
 
-        // 子进程尝试获取同一把锁应失败
+        // 子进程尝试获取同一把锁应失败（使用 fcntl.lockf()，与 fs2 同一锁域）
         let root_str = root.to_str().unwrap().to_string();
-        let output = std::process::Command::new("sh")
+        let output = std::process::Command::new("python3")
             .args([
                 "-c",
                 &format!(
-                    r#"python3 -c "
-import fcntl, os, sys
-f = open('{}/owner.lock', 'r+')
+                    r#"
+import fcntl, sys
 try:
-    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    f = open('{}/owner.lock', 'r+')
+    fcntl.lockf(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     print('acquired')
     sys.exit(0)
-except BlockingIOError:
+except (IOError, OSError):
     print('blocked')
     sys.exit(1)
-""#,
+"#,
                     root_str
                 ),
             ])

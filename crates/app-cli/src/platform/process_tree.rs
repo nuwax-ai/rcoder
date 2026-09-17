@@ -92,14 +92,12 @@ impl ManagedChild {
                 process_utils::kill_process_group(pid, process_utils::KillSignal::SIGTERM);
             }
         }
+        // Windows：Ctrl+C 不可靠（GenerateConsoleCtrlEvent 需要 CREATE_NEW_PROCESS_GROUP
+        // + 控制台进程）。Job Object 的 force_kill (TerminateJobObject) 是 Windows
+        // 上停止进程树的可靠手段。此处为 no-op，由 force_kill 保证停止。
         #[cfg(windows)]
         {
-            // Windows：先尝试 Ctrl+C（仅对控制台进程有效），然后靠 Job 超时终止
-            if let Some(pid) = self.inner.id() {
-                unsafe {
-                    windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(0, pid);
-                }
-            }
+            let _ = self.inner.id();
         }
     }
 
