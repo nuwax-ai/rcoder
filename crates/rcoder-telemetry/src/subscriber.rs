@@ -376,8 +376,8 @@ where
 
 /// JSON 控制台模式专用 deny 过滤器：[`make_deny_filter`] 的全量语义（file_server）
 /// + 额外拦截 OTel 导出噪声的**两种拼写**
-/// （`opentelemetry-otlp` 连字符 / `opentelemetry_sdk` 下划线——B0 基线两者并存，
-/// 仅拦一种漏 56%，合计占当日日志 20.3%）。
+///   （`opentelemetry-otlp` 连字符 / `opentelemetry_sdk` 下划线——B0 基线两者
+///   并存，仅拦一种漏 56%，合计占当日日志 20.3%）。
 ///
 /// 仅 JSON 模式启用：JSON 面向采集器的结构化流，噪声行污染 Loki 检索；文本模式
 /// （本地开发）保持原行为，便于排查 OTLP 本身的问题。
