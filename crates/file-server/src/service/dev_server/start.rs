@@ -473,9 +473,7 @@ impl DevServerManager {
             .map_err(|error| AppError::system(format!("build owner client: {error:#}")))?;
         // P3-03：构建前捕获的期望优先（构建期间 owner 变更 → 提交被拒，
         // 不自动刷新重发）；未捕获（直接 start 无构建段）→ 提交时活取。
-        let expected = lock(&self.owner_expectations)?
-            .remove(project_id)
-            .map(|(instance, revision)| (instance, revision));
+        let expected = lock(&self.owner_expectations)?.remove(project_id);
         let route_restart = async {
             let (expected_instance, expected_revision) = match expected {
                 Some(captured) => captured,
@@ -499,7 +497,7 @@ impl DevServerManager {
             let hooks_line = hooks.map(|hooks| hooks.on_line);
             let stream_operation_id = operation_id.clone();
             let stream_task = tokio::spawn(async move {
-                let mut forward = move |json: String| {
+                let forward = move |json: String| {
                     if let Some(on_line) = hooks_line.as_ref() {
                         on_line(&json);
                     }
@@ -866,7 +864,7 @@ mod owner_reuse_tests {
         // ④ foreign workspace → 拒绝
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let foreign = mock_owner_router("ws-someone-else").with_state(polls);
-        let foreign_mock = serve_mock(foreign).await;
+        let _foreign_mock = serve_mock(foreign).await;
         let ws_mine = dir.path().join("ws-mine");
         std::fs::create_dir_all(&ws_mine).unwrap();
         let error = mgr
@@ -1052,7 +1050,7 @@ mod owner_reuse_tests {
                 let _ = tx.send(());
             }
             if let Some(task) = self.task.take() {
-                let _ = task.await;
+                let _joined = task.await;
             }
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             while tokio::net::TcpListener::bind("127.0.0.1:3010")

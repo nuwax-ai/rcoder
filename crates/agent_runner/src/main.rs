@@ -222,7 +222,7 @@ async fn agent_runner_run(cli_args: CliArgs) -> anyhow::Result<()> {
             Arc::new(r)
         }
         Err(e) => {
-            tracing::warn!("[MAIN] Failed to load agent management registry, starting empty: {e}");
+            warn!("[MAIN] Failed to load agent management registry, starting empty: {e}");
             Arc::new(agent_runner::agent_mgmt::AgentRegistry::empty(
                 agent_mgmt_path_manager.clone(),
             ))

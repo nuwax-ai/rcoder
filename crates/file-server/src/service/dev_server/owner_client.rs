@@ -43,22 +43,6 @@ pub(super) fn read_owner_token(state_root: &std::path::Path) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-/// 平台侧解析状态根（与 app-cli RuntimeStore::resolve_root 同一规则：
-/// env 权威 → 缺省 {卷根}/.app-cli-state/{application_id}）。
-pub(super) fn owner_state_root(
-    workspace: &std::path::Path,
-    application_id: &str,
-) -> Result<std::path::PathBuf> {
-    if let Some(explicit) = std::env::var_os("APP_CLI_STATE_ROOT").filter(|value| !value.is_empty())
-    {
-        return Ok(std::path::PathBuf::from(explicit));
-    }
-    let volume_root = workspace
-        .parent()
-        .context("workspace has no volume root for owner state")?;
-    Ok(volume_root.join(".app-cli-state").join(application_id))
-}
-
 /// 认证后的运行操作客户端。
 pub(super) struct OwnerClient {
     address: String,
