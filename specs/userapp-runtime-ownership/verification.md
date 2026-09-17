@@ -36,3 +36,16 @@
 | P1-06 | `38d8407b` 启动等待窗与预算 | cargo test -p file-server -p file-server-userapp（296+76 通过） | 0 | 等待窗 3600s→1200s；预算 min(1200, dev_command_timeout_secs+150) | targeted tests | — | — |
 | P1-05 | cleanup-state + stop 确认 + start 拒绝未清理残留 | cargo test -p file-server（stop tests 2/2）；cargo test -p file-server -p file-server-userapp（296+76 通过） | 0 | stop 设置 Cleaning/Cleaned；has_uncleaned_cleanup 守卫；start_dev_manifest 拒绝残留 | targeted tests | — | Compose / remote-k8s / 全量 workspace 门禁 |
 | P1-01 强化 | legacy main startup order fix: bind before deploy_stage + remove LivenessHold | cargo nextest run --manifest-path crates/app-cli/Cargo.toml --all-features（188 通过，含新测试 legacy_deploy_url_with_port_conflict_has_no_deploy_side_effects / serve_attach_*） | 0 | API bind 在 deploy_stage 前 fail-fast；APP_DEPLOY_URL + 端口冲突无部署副作用；LivenessHold 退役；--attach 模式（身份核验+等待+re-exec）；clippy 零 warning | targeted tests | — | Compose / remote-k8s / 全量 workspace 门禁 |
+| XP 三平台验证 | `429144f6` std 文件锁 + env 污染消除 + AV 重试 + Job Object 修正 | 三平台原生 cargo test（见下矩阵） | 0 | macOS 193/193；Linux 193/193；Windows 172/172×3（12 个 Unix 专属测试 cfg 门控） | 三台真机 SSH 执行 | — | Windows 跨进程锁互斥（无 fcntl 对端，需 PowerShell/.NET 补齐）；Compose/K8s 回归 |
+
+## 跨平台原生验证矩阵（XP-T 基础层，2026-09-17）
+
+| 平台 | 机器 | Rust | 命令 | 结果 |
+|---|---|---|---|---|
+| macOS ARM64 | 本地 | 1.98.1 | cargo nextest run --all-features | 193/193 ✅ |
+| Linux x86_64 (Ubuntu 26.04) | 192.168.32.131 | 1.98.1 | cargo test --all-features（lib + bin_startup + serve_restart） | 193/193 ✅（含 flock 跨进程互斥实测） |
+| Windows x64 (MSVC) | 192.168.32.53 | 1.98.1（1.93→1.98 升级） | cargo test --lib ×3 连跑 | 172/172 ×3 ✅（含 Job Object spawn/terminate、std 锁同进程互斥；12 个 Unix 专属测试按设计门控：跨进程锁对端×2、supervisord 渲染、proxy 路径护栏×2 等） |
+
+Windows 环境准备：choco 安装 cmake 4.4.3 + VS2022 BuildTools (VCTools)；rustup 升级 1.93→1.98（kdl/sysinfo 依赖要求 ≥1.95）。
+发现的真机问题与修复：①APP_CLI_STATE_ROOT set_var 与并行测试竞争（os error 2/3/183 随机失败）→ resolve_root 参数化消除 env 变异；②Defender 独占 .tmp（os error 5）→ write_json 有界重试；③fs2 锁域与 Python lockf 在 Linux 不互斥 → 改 std::fs::File::try_lock（flock 语义官方背书）。
+未验证：Windows 跨进程锁互斥（fcntl 对端不存在；需 PowerShell .NET FileStream.Lock 补齐，暂记录为缺口）；Windows 集成测试（bin_startup/serve_restart 为 #![cfg(unix)]）。
