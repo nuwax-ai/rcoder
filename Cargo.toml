@@ -55,7 +55,7 @@ publish = false
 agent-client-protocol = { version = "2" }
 
 # MCP 协议 - rmcp 官方库
-rmcp = { version = "3.3"}
+rmcp = { version = "3.4"}
 # mcp-proxy convert fallback 参数解析与文件重写。
 mcp-proxy-args = { version = "=0.2.3" }
 
@@ -81,7 +81,7 @@ axum = { version = "0.8", features = [
     "macros",
 ] }
 tower = "0.5"
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.5", features = ["fs"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "set-header", "fs"] }
 hyper = { version = "1.11", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
