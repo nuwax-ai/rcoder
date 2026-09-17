@@ -227,7 +227,14 @@ pub struct TrackingCtx {
     pub error_body_buf: Vec<u8>,
     /// 预览路由覆盖上游（跨 Pod 转发=宿主 Pod:peer_api_port；
     /// 宿主侧 internal 路由=127.0.0.1:vite_port）。None=非预览路径。
+    /// 由 upstream_peer 阶段的 resolve_route 决策写入（pingora 阶段序
+    /// upstream_peer 先于 upstream_request_filter——决策必须发生在 peer
+    /// 选择时，否则非宿主副本在连接 127.0.0.1:vite_port 时即失败）。
     pub preview_peer: Option<(String, u16)>,
+    /// 预览跨 Pod 转发的路径重写要素 (instance_id, preview_port)——与
+    /// preview_peer 同点（upstream_peer 阶段）产出，upstream_request_filter
+    /// 阶段消费为 `/internal/preview-forward/{instance}/{port}{path}` + 令牌头。
+    pub preview_rewrite: Option<(String, u16)>,
     /// 预览转发校验已过的 vite 端口（internal/preview-forward 路由用，
     /// request_filter 校验通过后记录，后续阶段免重复校验）。
     pub preview_forward_port: Option<u16>,
@@ -255,6 +262,7 @@ impl TrackingCtx {
             upstream_status: None,
             error_body_buf: Vec::new(),
             preview_peer: None,
+            preview_rewrite: None,
             preview_forward_port: None,
             preview_origin_port: None,
         }

@@ -59,14 +59,14 @@ pub async fn handle_port_proxy_request(
         port, target_path
     );
 
-    // Custom Page 预览解析：命中远端宿主 → 跨 Pod 转发（重写为内部入口 + 令牌）；
-    // 命中本机/未命中/存储不可用 → 走下方既有本机路径（行为与现状一致）。
-    if let Some(deps) = preview_slot.load().as_ref()
-        && let PreviewRouteResolution::Forward {
-            instance_id,
-            port: preview_port,
-            host_ip,
-        } = deps.coordination.resolve_route(port).await
+    // Custom Page 预览转发：决策已在本请求更早的 upstream_peer 阶段完成
+    // （pingora 阶段序 upstream_peer 先于本函数所在的 upstream_request_filter，
+    // peer 选择必须先行——历史上 resolve 放在本地导致非宿主副本在 peer 阶段
+    // 连 127.0.0.1:4000 即 502，Forward 永无执行机会）。此处仅消费决策：
+    // 重写为内部入口 + 令牌头；无决策（未启用/Local/NotPreview/Unavailable）
+    // 走下方既有本机路径（行为与现状一致）。
+    if let Some((instance_id, preview_port)) = ctx.preview_rewrite.clone()
+        && let Some(deps) = preview_slot.load().as_ref()
     {
         let internal_path =
             format!("/internal/preview-forward/{instance_id}/{preview_port}{target_path}");
@@ -76,11 +76,6 @@ pub async fn handle_port_proxy_request(
         upstream_request.insert_header("x-preview-internal-token", &deps.internal_token)?;
         upstream_request.insert_header("Host", "127.0.0.1")?;
         utils::set_common_headers(upstream_request)?;
-        // /internal/preview-forward 注册在宿主的 Pingora 代理面（非 axum 主
-        // API）——转发上游必须用对等副本的 proxy 端口（实测 8086 会 404→502）
-        ctx.preview_peer = Some((host_ip, deps.peer_proxy_port));
-        ctx.preview_origin_port = Some(port);
-        ctx.target_port = Some(deps.peer_proxy_port);
         return Ok(());
     }
 
@@ -120,18 +115,8 @@ pub async fn handle_port_proxy_upstream(
     backends: &Arc<ArcSwap<HashMap<u16, String>>>,
     backend_host: &str,
     metrics: &Arc<ProxyMetrics>,
+    preview_slot: &Arc<ArcSwapOption<Arc<PreviewRouteDeps>>>,
 ) -> PingoraResult<Box<HttpPeer>> {
-    // 预览跨 Pod 覆盖上游：宿主 Pod 的主 API 端口（路径已重写为内部入口）。
-    if let Some((host_ip, peer_port)) = ctx.preview_peer.clone() {
-        let mut peer = HttpPeer::new((host_ip.as_str(), peer_port), false, "".to_string());
-        peer.options.connection_timeout = Some(Duration::from_secs(10));
-        peer.options.read_timeout = None;
-        peer.options.write_timeout = None;
-        peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-        peer.options.idle_timeout = Some(Duration::from_secs(3600));
-        ctx.upstream_host = Some(host_ip);
-        return Ok(Box::new(peer));
-    }
     // 从路径参数中提取端口
     let port_str = params.get("port").ok_or_else(|| {
         error!("port proxy route missing port params");
@@ -142,6 +127,35 @@ pub async fn handle_port_proxy_upstream(
         error!(" parse port failed: {}", port_str);
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
     })?;
+
+    // Custom Page 预览路由决策（必须在 upstream_peer 阶段完成——pingora 先选
+    // 上游再改写请求；决策挪到此地前，非宿主副本在 peer 阶段连 127.0.0.1:4000
+    // 即 ConnectRefused，Forward 重写永无执行机会）。命中远端宿主 → 记
+    // preview_peer/preview_rewrite 并返回宿主 Pingora 面 peer；本机/未命中/
+    // 存储不可用 → 落到下方既有本机路径（行为与现状一致）。
+    if let Some(deps) = preview_slot.load().as_ref()
+        && let PreviewRouteResolution::Forward {
+            instance_id,
+            port: preview_port,
+            host_ip,
+        } = deps.coordination.resolve_route(target_port).await
+    {
+        // /internal/preview-forward 注册在宿主的 Pingora 代理面（非 axum 主
+        // API）——转发上游必须用对等副本的 proxy 端口（实测 8086 会 404→502）
+        let peer_port = deps.peer_proxy_port;
+        ctx.preview_peer = Some((host_ip.clone(), peer_port));
+        ctx.preview_rewrite = Some((instance_id, preview_port));
+        ctx.preview_origin_port = Some(target_port);
+        ctx.target_port = Some(peer_port);
+        let mut peer = HttpPeer::new((host_ip.as_str(), peer_port), false, "".to_string());
+        peer.options.connection_timeout = Some(Duration::from_secs(10));
+        peer.options.read_timeout = None;
+        peer.options.write_timeout = None;
+        peer.options.total_connection_timeout = Some(Duration::from_secs(15));
+        peer.options.idle_timeout = Some(Duration::from_secs(3600));
+        ctx.upstream_host = Some(host_ip);
+        return Ok(Box::new(peer));
+    }
 
     ctx.target_port = Some(target_port);
     metrics.record_request();

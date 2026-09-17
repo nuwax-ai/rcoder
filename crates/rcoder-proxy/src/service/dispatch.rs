@@ -239,6 +239,7 @@ impl PortProxy {
                     &self.backends,
                     &self.backend_host,
                     &self.metrics,
+                    &self.preview_slot,
                 )
                 .await
             }
