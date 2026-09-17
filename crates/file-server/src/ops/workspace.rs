@@ -135,7 +135,8 @@ pub async fn push_skills_core_with_store(
             };
             skills_service::push_skills_to_agent_store(skills_service::PushToStoreParams {
                 user_root: &user_root,
-                cid,
+                // F02：显式传已解析 ws——底层不再按 user_root.join(cid) 反推
+                session_workspace: ws,
                 agent_id,
                 zip_path: zip_data.map(|file| file.path()),
                 skill_urls,

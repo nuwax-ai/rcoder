@@ -73,9 +73,12 @@ pub async fn push_skills_at(
 
 /// push_skills_to_agent_store 参数 (结构化入参, 避免 too_many_arguments)。
 pub struct PushToStoreParams<'a> {
-    /// 会话工作区父目录 (Local={root}/{userId}, Subvolume=subvolume_base)
+    /// agent-store 锚定根 (Local={root}/{userId}, Subvolume=subvolume_base；
+    /// 绑定目录场景=配置根)
     pub user_root: &'a Path,
-    pub cid: &'a str,
+    /// 已解析的会话工作区（F02：显式传入——按 `user_root.join(cid)` 反推在
+    /// normalProject/显式绑定目录下会写错目录）
+    pub session_workspace: &'a Path,
     pub agent_id: &'a str,
     pub zip_path: Option<&'a Path>,
     pub skill_urls: Vec<String>,
@@ -91,19 +94,18 @@ pub struct PushToStoreParams<'a> {
 pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppResult<Vec<String>> {
     let PushToStoreParams {
         user_root,
-        cid,
+        session_workspace,
         agent_id,
         zip_path,
         skill_urls,
         downloader,
         shared_project_id,
     } = params;
-    let session_workspace = user_root.join(cid);
-    fs::create_dir_all(&session_workspace).await?;
+    fs::create_dir_all(session_workspace).await?;
 
     // 共享工作区防线：现有 store 链指向其他 agent 时 fail-fast（重链会静默
     // 覆盖先驻 agent 技能；manifest 并集视图复刻前的过渡防线）
-    crate::service::agent_store::detect_cross_agent_link_conflict(&session_workspace, agent_id)
+    crate::service::agent_store::detect_cross_agent_link_conflict(session_workspace, agent_id)
         .await?;
 
     let (agent_skills_dir, agent_agents_dir) =
@@ -114,7 +116,7 @@ pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppRes
     // 处理上传 zip
     if let Some(zip) = zip_path {
         updated.extend(
-            install_skills_from_zip_dynamic(zip, &agent_skills_dir, &session_workspace).await?,
+            install_skills_from_zip_dynamic(zip, &agent_skills_dir, session_workspace).await?,
         );
     }
 
@@ -125,7 +127,7 @@ pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppRes
             install_skills_from_zip_dynamic(
                 downloaded.path(),
                 &agent_skills_dir,
-                &session_workspace,
+                session_workspace,
             )
             .await?,
         );
@@ -136,7 +138,7 @@ pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppRes
     if let Some(project_id) = shared_project_id {
         crate::service::agent_store::sync_shared_skill_view(
             user_root,
-            &session_workspace,
+            session_workspace,
             agent_id,
             project_id,
             crate::service::agent_store::SharedSkillLists::default(),
@@ -144,7 +146,7 @@ pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppRes
         .await?;
     } else {
         crate::service::agent_store::link_workspace_to_agent_store(
-            &session_workspace,
+            session_workspace,
             &agent_skills_dir,
             &agent_agents_dir,
         )
@@ -487,5 +489,45 @@ mod tests {
             assert!(s.exists(), "{dir}/skills/a.md missing");
             assert!(a.exists(), "{dir}/agents/b.md missing");
         }
+    }
+
+    #[tokio::test]
+    async fn push_to_store_uses_explicit_session_workspace_not_derived() {
+        // F02：PushToStoreParams 显式携带已解析 session_workspace——绝不由
+        // user_root.join(cid) 反推（normalProject/绑定目录下会写错目录）。
+        // 构造 session_workspace 与 user_root.join(cid) **不同**的两个目录，
+        // 断言装配/软链作用于前者且后者不被创建。
+        let tmp = tempfile::tempdir().unwrap();
+        let user_root = tmp.path().join("root").join("u1");
+        let resolved_ws = tmp.path().join("bound").join("projdir"); // 显式解析结果
+        let naive_ws = user_root.join("c-session-1"); // 旧反推路径
+        std::fs::create_dir_all(&resolved_ws).unwrap();
+        #[allow(clippy::field_reassign_with_default)]
+        let downloader = {
+            let mut config = crate::config::Config::default();
+            config.upload_project_dir = tmp.path().join("dl-parent");
+            SkillDownloader::new(&config).expect("downloader")
+        };
+        push_skills_to_agent_store(PushToStoreParams {
+            user_root: &user_root,
+            session_workspace: &resolved_ws,
+            agent_id: "agent-f02",
+            zip_path: None,
+            skill_urls: Vec::new(),
+            downloader: &downloader,
+            shared_project_id: None,
+        })
+        .await
+        .expect("push with explicit workspace");
+        // 软链装配发生在**显式**工作区
+        assert!(
+            resolved_ws.join(".agents").join("skills").exists(),
+            "装配必须作用于显式传入的 session_workspace"
+        );
+        // 旧反推路径不被创建（反推即写错目录的直接证据）
+        assert!(
+            !naive_ws.exists(),
+            "user_root.join(cid) 反推路径不得被创建（F02）"
+        );
     }
 }

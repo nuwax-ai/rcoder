@@ -48,7 +48,8 @@ pub(crate) enum AdmissionOutcome {
 pub(crate) enum CommitBarrierOutcome {
     /// 屏障通过并已收束 Succeeded。
     Committed,
-    /// 已被取消——已收束 Cancelled（不报成功）。
+    /// 已被取消（观察到的取消意图；**未写终态**）——调用方必须先停服并
+    /// 确认清理，再经 finish 收束 Cancelled/RecoveryRequired（V02）。
     Cancelled,
     /// Stop 已受理（revision 推进）：调用方必须停服并让 Stop 执行，
     /// 本操作保持非 Succeeded（由调用方停服后收束 Cancelled）。
@@ -455,16 +456,27 @@ pub(crate) enum DispatchAction {
         sha256: Option<String>,
     },
     /// 源码编排（workspace 当前内容 + release lock；start/restart source）。
-    OrchestrateSource { operation_id: String },
+    /// R08：dev_profile 随操作传递（Source profile = dev 语义）——编排的
+    /// 生效命令选择不再依赖 serve 进程 env 猜测。
+    OrchestrateSource {
+        operation_id: String,
+        dev_profile: bool,
+    },
     /// 停止业务服务（保持管理面可用）。
     StopBusiness { operation_id: String },
 }
 
 #[derive(Default)]
 struct AdmissionState {
-    /// 当前进行中的操作（None = 空闲；单槽即单 worker 串行）。
+    /// 当前执行者（None = 空闲；单槽即单 worker 串行）。V03：只有**执行型**
+    /// 操作（start/restart/deploy）占据此槽——Stop 是待执行意图，绝不抢走
+    /// 在执行者的身份（旧 A 的提交屏障因此不再被误判 NotActive）。
     active_operation_id: Option<String>,
-    /// 恢复保护中（上次结果未知）。
+    /// 已受理待执行的 Stop（V03）：持有者等待 server 主循环停服后按自身 ID
+    /// 收束。pending 期间新操作（含第二个 Stop）一律 ERR_OPERATION_IN_PROGRESS。
+    pending_stop: Option<String>,
+    /// 恢复保护中（上次结果未知）。V03：由**结果未知**决定，不依赖 active
+    /// 恰好匹配——任何操作的 RecoveryRequired 终态都会挂起保护。
     recovery_protection: bool,
 }
 
@@ -629,28 +641,34 @@ impl RuntimeKernel {
                     message: format!("read desired state: {error:#}"),
                     active_operation_id: None,
                 })?;
-        // Stop 屏障例外：active 期间仍可受理持久化停止意图（spec §3.3）。
+        // Stop 屏障例外（spec §3.3）：active 执行期间仍可受理持久化停止意图
+        // ——Stop 只占 pending 槽，绝不抢走执行者身份（V03）。
+        // 待执行 Stop 存在期间：第二个 Stop 与一切新操作均拒绝（停服动作
+        // 尚未完成，受理即排队语义不成立）。
         let is_stop = request.kind == RuntimeOperationKind::Stop;
-        if !is_stop {
-            if let Some(active) = guard.active_operation_id.clone() {
+        if is_stop {
+            if let Some(pending) = guard.pending_stop.clone() {
+                return Err(AdmissionRejection {
+                    code: ERR_OPERATION_IN_PROGRESS,
+                    message: "another runtime operation is in progress".into(),
+                    active_operation_id: Some(pending),
+                });
+            }
+        } else {
+            let busy = guard
+                .active_operation_id
+                .clone()
+                .or_else(|| guard.pending_stop.clone());
+            if let Some(active) = busy {
                 return Err(AdmissionRejection {
                     code: ERR_OPERATION_IN_PROGRESS,
                     message: "another runtime operation is in progress".into(),
                     active_operation_id: Some(active),
                 });
             }
-            if request.expected_revision != revision {
-                return Err(AdmissionRejection {
-                    code: ERR_REVISION_MISMATCH,
-                    message: format!(
-                        "expected revision {} but current revision is {}",
-                        request.expected_revision, revision
-                    ),
-                    active_operation_id: None,
-                });
-            }
-        } else if request.expected_revision != revision {
-            // stop 的 revision 校验同样执行（旧实例的 stop 不复活/不重复推进）。
+        }
+        if request.expected_revision != revision {
+            // 所有 kind 的 revision 校验统一执行（旧实例的 stop 不复活/不重复推进）。
             return Err(AdmissionRejection {
                 code: ERR_REVISION_MISMATCH,
                 message: format!(
@@ -708,7 +726,11 @@ impl RuntimeKernel {
                 self.hold_partial_admission(&stored, format!("persist running intent: {error:#}"))
             );
         }
-        guard.active_operation_id = Some(stored.view.operation_id.clone());
+        if is_stop {
+            guard.pending_stop = Some(stored.view.operation_id.clone());
+        } else {
+            guard.active_operation_id = Some(stored.view.operation_id.clone());
+        }
         // 分派映射（组合已在受理前置校验收窄，此处仅选择已实现路径）
         let action = match (&stored.request.kind, &stored.request.profile) {
             (
@@ -729,6 +751,7 @@ impl RuntimeKernel {
                 shared_types::RunProfileInput::Source { .. },
             ) => DispatchAction::OrchestrateSource {
                 operation_id: stored.view.operation_id.clone(),
+                dev_profile: true,
             },
             // 组合已在前置校验拒绝；到这里的组合是防御纵深违规——fail fast
             (kind, profile) => {
@@ -801,11 +824,17 @@ impl RuntimeKernel {
             set.remove(operation_id);
         }
         let mut guard = self.admission.lock().await;
+        // V03：恢复保护由**结果未知**决定——任何操作以 RecoveryRequired 收束
+        // 都挂起保护，不依赖 active 恰好仍是该操作（Stop 待执行期间，旧执行者
+        // A 的未知结果同样必须锁住写入口）。
+        if stored.view.state == RuntimeOperationState::RecoveryRequired {
+            guard.recovery_protection = true;
+        }
         if guard.active_operation_id.as_deref() == Some(operation_id) {
             guard.active_operation_id = None;
-            if stored.view.state == RuntimeOperationState::RecoveryRequired {
-                guard.recovery_protection = true;
-            }
+        }
+        if guard.pending_stop.as_deref() == Some(operation_id) {
+            guard.pending_stop = None;
         }
         Ok(())
     }
@@ -852,11 +881,15 @@ impl RuntimeKernel {
         if let Ok(mut set) = self.cancelled.lock() {
             set.remove(operation_id);
         }
+        // V03：同 finish——保护由结果未知决定；两槽按身份清理
+        if stored.view.state == RuntimeOperationState::RecoveryRequired {
+            guard.recovery_protection = true;
+        }
         if guard.active_operation_id.as_deref() == Some(operation_id) {
             guard.active_operation_id = None;
-            if stored.view.state == RuntimeOperationState::RecoveryRequired {
-                guard.recovery_protection = true;
-            }
+        }
+        if guard.pending_stop.as_deref() == Some(operation_id) {
+            guard.pending_stop = None;
         }
         Ok(())
     }
@@ -887,15 +920,11 @@ impl RuntimeKernel {
             return Ok(CommitBarrierOutcome::NotActive);
         }
         if self.is_cancelled(operation_id) {
-            self.write_terminal_locked(&mut guard, operation_id, RuntimeOperationState::Cancelled)?;
+            // V02：只观察取消意图，**不预写 Cancelled 终态**——调用方必须先
+            // 确认业务/静态服务停止，再经 finish(Cancelled) 收束；清理未知时
+            // 改走 RecoveryRequired（终态单调下 Cancelled 不可升级，预写会
+            // 把未知结果锁死成已取消）。active/取消墓碑保留至收束。
             drop(guard);
-            self.emit(
-                operation_id,
-                sequence.max(2),
-                "terminal",
-                None,
-                Some("Failed"),
-            );
             return Ok(CommitBarrierOutcome::Cancelled);
         }
         let (_, current_revision) = self.store.load_desired()?;
@@ -1638,8 +1667,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_after_cancel_settles_cancelled_not_succeeded() {
-        // R03：提交屏障在锁内裁决——取消墓碑存在时绝不报成功
+    async fn commit_after_cancel_observes_without_prewriting_terminal() {
+        // V02：屏障只观察取消意图——**不预写 Cancelled 终态**（预写会让清理
+        // 未知时无法升级 RecoveryRequired）；调用方停服确认后 finish 收束
         let (dir, _keep) = temp_store();
         let kernel = kernel(dir.path());
         kernel
@@ -1649,8 +1679,52 @@ mod tests {
         kernel.request_cancel("op-race").await.expect("cancel");
         let outcome = kernel.commit_execution("op-race").await.expect("barrier");
         assert_eq!(outcome, CommitBarrierOutcome::Cancelled);
+        // 终态未写：仍非终态（等待调用方停服后收束）
+        let view = kernel.get("op-race").await.expect("view").expect("exists");
+        assert!(
+            !view.state.is_terminal(),
+            "barrier must not prewrite terminal"
+        );
+        // 调用方停服确认 → finish(Cancelled) 收束；迟到成功不可覆盖
+        kernel
+            .finish("op-race", RuntimeOperationState::Cancelled, None, None, 2)
+            .await
+            .expect("settle cancelled");
+        kernel
+            .finish("op-race", RuntimeOperationState::Succeeded, None, None, 3)
+            .await
+            .expect("late finish must not error");
         let view = kernel.get("op-race").await.expect("view").expect("exists");
         assert_eq!(view.state, RuntimeOperationState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn commit_barrier_cancelled_op_can_settle_recovery_required() {
+        // V02 关键能力：取消窗口后清理未知 → RecoveryRequired（若屏障预写
+        // Cancelled，终态单调会锁死该升级路径）
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-unclean"))
+            .await
+            .expect("admit");
+        kernel.request_cancel("op-unclean").await.expect("cancel");
+        let outcome = kernel
+            .commit_execution("op-unclean")
+            .await
+            .expect("barrier");
+        assert_eq!(outcome, CommitBarrierOutcome::Cancelled);
+        kernel
+            .finish(
+                "op-unclean",
+                RuntimeOperationState::RecoveryRequired,
+                None,
+                None,
+                2,
+            )
+            .await
+            .expect("uncertain cleanup must be expressible");
+        assert!(kernel.recovery_protection_active());
     }
 
     #[tokio::test]

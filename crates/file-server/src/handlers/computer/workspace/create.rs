@@ -257,6 +257,9 @@ pub(crate) async fn create_workspace_v2(
         // 漂移; 默认布局 = ws.parent() (Local={root}/{userId}, Subvolume=per-user PVC)。
         let user_root =
             super::super::agent_store_user_root(&state, &user_id, &ws, workspace_path.as_deref());
+        // F03：合并项目 ID（header > query > body）先落地——借用须活过
+        // CreateAgentStoreParams 构造与消费
+        let merged_project_id = crate::extract::merged_request_app_id(app_id.as_deref());
         crate::service::computer_ws::create_workspace_with_agent_store(
             crate::service::computer_ws::CreateAgentStoreParams {
                 user_root: &user_root,
@@ -271,10 +274,16 @@ pub(crate) async fn create_workspace_v2(
                 downloader: Some(&state.skill_downloader),
                 // 共享工作区（normalProject 且带项目 ID）→ manifest 并集视图；
                 // userapp 消费链现状不可达（直转恒 legacy），保持不激活（有意偏离）
-                shared_project_id: if crate::extract::is_normal_project_request() {
-                    app_id.as_deref()
-                } else {
-                    None
+                // F03：判定/app_id 与 ws_path 同源（merged：header 优先 > body）
+                // ——body-only normalProject 或 header-only appId 不再走错分支
+                shared_project_id: match crate::extract::merged_workspace_kind(
+                    workspace_type.as_deref(),
+                    service_type.as_deref(),
+                ) {
+                    Some(shared_types::ComputerServiceKind::NormalProject) => {
+                        merged_project_id.as_deref()
+                    }
+                    _ => None,
                 },
             },
         )

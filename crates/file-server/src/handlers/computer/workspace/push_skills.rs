@@ -106,6 +106,8 @@ async fn push_skills_to_workspace_impl(
     // None = ws.parent() 派生)
     let store_root =
         super::super::agent_store_user_root(&state, &user_id, &ws, workspace_path.as_deref());
+    // F03：合并项目 ID（header > query > body）先落地——借用须活过参数构造
+    let merged_project_id = crate::extract::merged_request_app_id(app_id.as_deref());
     push_skills_impl(
         &state,
         crate::ops::workspace::PushSkillsParams {
@@ -118,10 +120,15 @@ async fn push_skills_to_workspace_impl(
             agent_store_root: Some(&store_root),
             // 共享工作区（normalProject 且带项目 ID）→ 直接 store 模式 +
             // manifest 视图同步；userapp 消费链不可达，不激活（有意偏离）
-            shared_project_id: if crate::extract::is_normal_project_request() {
-                app_id.as_deref()
-            } else {
-                None
+            // F03：判定/app_id 与 ws_path 同源（merged：header 优先 > body）
+            shared_project_id: match crate::extract::merged_workspace_kind(
+                workspace_type.as_deref(),
+                service_type.as_deref(),
+            ) {
+                Some(shared_types::ComputerServiceKind::NormalProject) => {
+                    merged_project_id.as_deref()
+                }
+                _ => None,
             },
         },
     )

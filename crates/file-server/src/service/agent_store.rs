@@ -54,6 +54,35 @@ pub fn validate_store_segment(kind: &str, value: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// V05：受管 ACP 根身份核验——`.agents/.claude/.opencode/.codex/.grok/.pi`
+/// 全部根在任何 manifest 写入/create/prune **之前**校验：任何根（或将创建
+/// 其子目录的祖先）是指向受管树之外的符号链接时，后续 create_dir_all/
+/// read_dir/递归删除会沿链接作用于目标目录。查询错误不得当不存在
+/// （fail closed：NotFound=尚无根，合法；其他错误=不可判定，拒绝）。
+pub async fn validate_managed_roots(workspace: &Path) -> AppResult<()> {
+    for dir in crate::service::skills::ALL_AGENT_DIRS {
+        let root = workspace.join(dir);
+        match fs::symlink_metadata(&root).await {
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(crate::error::AppError::validation(format!(
+                    "managed agent directory is unreadable: {} ({e})",
+                    root.display()
+                )));
+            }
+            Ok(meta) if meta.is_symlink() => {
+                return Err(crate::error::AppError::validation(format!(
+                    "managed agent directory is a symlink: {} (refusing to operate \
+                     through a replaced root)",
+                    root.display()
+                )));
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// 规范化 + 校验清单（Q01）：先 trim/去重，再校验**实际落盘与使用**的值——
 /// 原串（如 `" .."`）合法不代表 trim 后（`..`）合法；全程只使用校验后的值。
 fn canonicalize_names(kind: &str, names: Vec<String>) -> AppResult<Vec<String>> {
@@ -386,19 +415,8 @@ pub async fn link_workspace_to_agent_store(
 ) -> AppResult<()> {
     let start = std::time::Instant::now();
 
-    // Q02：受管根不得是被替换的链接——remove_if_exists/create 会沿链接作用于
-    // 链接目标（越界删除/写入）
-    for agent_dir in crate::service::skills::ALL_AGENT_DIRS {
-        let root = workspace.join(agent_dir);
-        if let Ok(meta) = fs::symlink_metadata(&root).await
-            && meta.is_symlink()
-        {
-            return Err(crate::error::AppError::validation(format!(
-                "managed agent directory is a symlink: {} (refusing to link through a replaced root)",
-                root.display()
-            )));
-        }
-    }
+    // Q02/V05：全部受管根前置核验（不逐循环检查——前序循环迭代已可能写入）
+    validate_managed_roots(workspace).await?;
 
     // 尝试对所有 agent 目录创建软链
     let mut link_errors = Vec::new();
@@ -644,12 +662,25 @@ fn reverse_refs(
     refs
 }
 
-/// 视图锁（项目级，O_EXCL 创建 + 过期自愈）。持有期间其他同步方自旋等待。
-struct ViewGuard(PathBuf);
+/// 视图锁（项目级，O_EXCL 创建 + 过期自愈 + **所有权保护**）。
+///
+/// Q07 三项修复：
+/// 1. 锁文件内容 = 持有者 token——Drop 只在内容仍是**自己的** token 时删除：
+///    A（被 B 判定过期接管后）的迟到 Drop 不再删掉 B 的锁放 C 进来；
+/// 2. stale 判定只认 mtime 超龄——metadata **读取错误不当 stale**（IO 抖动
+///    不是"无主"证明，按忙等重试）；
+/// 3. 接管 = 校验 token 未变后 write-temp + **rename** 原子替换（同 inode
+///    域内原子；B 接管与 A 迟到释放竞争时，rename 后 A 的 remove 命中的
+///    token 校验必然失败——不再有"删掉别人锁"窗口）。
+struct ViewGuard {
+    path: PathBuf,
+    token: String,
+}
 
 impl ViewGuard {
     async fn acquire(project_store_root: &Path) -> AppResult<Self> {
         let lock = project_store_root.join(VIEW_LOCK_NAME);
+        let token = uuid::Uuid::new_v4().to_string();
         let deadline = std::time::Instant::now() + VIEW_LOCK_WAIT;
         loop {
             match fs::OpenOptions::new()
@@ -658,19 +689,50 @@ impl ViewGuard {
                 .open(&lock)
                 .await
             {
-                Ok(_) => return Ok(ViewGuard(lock)),
+                Ok(mut file) => {
+                    use tokio::io::AsyncWriteExt as _;
+                    file.write_all(token.as_bytes()).await?;
+                    // 锁内容必须在持有者返回前可靠落盘：显式 sync 消除
+                    // 写入延迟可见（接管方读到空 token 的窗口）
+                    file.sync_all().await?;
+                    return Ok(ViewGuard { path: lock, token });
+                }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    // 过期锁自愈（5 分钟），被并发移除则立即重试
+                    // 过期自愈（5 分钟）。Q07：metadata 读取失败 ≠ stale——
+                    // 元数据不可读时按"仍被持有"处理（保守等待），只有明确的
+                    // mtime 超龄才构成接管依据。
                     let stale = match fs::metadata(&lock).await {
                         Ok(meta) => meta
                             .modified()
                             .ok()
                             .and_then(|at| at.elapsed().ok())
                             .is_some_and(|age| age.as_millis() as u64 > VIEW_LOCK_STALE_MS),
-                        Err(_) => true,
+                        Err(e) if e.kind() == ErrorKind::NotFound => true,
+                        Err(_) => false,
                     };
                     if stale {
-                        fs::remove_file(&lock).await.ok();
+                        // 接管：读旧 token → 写临时文件（自己的 token）→
+                        // 校验旧 token 未变 → rename 原子替换。校验失败说明
+                        // 别人刚接管/释放，回锁竞争循环。
+                        let observed = fs::read_to_string(&lock).await.unwrap_or_default();
+                        let candidate = lock.with_extension(format!("takeover-{token}"));
+                        fs::write(&candidate, &token).await?;
+                        let current = fs::read_to_string(&lock).await.unwrap_or_default();
+                        if current == observed {
+                            match fs::rename(&candidate, &lock).await {
+                                Ok(()) => return Ok(ViewGuard { path: lock, token }),
+                                Err(e) if e.kind() == ErrorKind::NotFound => {
+                                    // 锁在接管窗口被持有人正常释放——重试创建
+                                    fs::remove_file(&candidate).await.ok();
+                                }
+                                Err(e) => {
+                                    fs::remove_file(&candidate).await.ok();
+                                    return Err(e.into());
+                                }
+                            }
+                        } else {
+                            fs::remove_file(&candidate).await.ok();
+                        }
                         continue;
                     }
                 }
@@ -688,8 +750,15 @@ impl ViewGuard {
 
 impl Drop for ViewGuard {
     fn drop(&mut self) {
-        // best-effort 释放；过期自愈兜底
-        std::fs::remove_file(&self.0).ok();
+        // Q07：只释放**自己的**锁——内容仍是本持有者 token 才删除；否则
+        // 锁已被接管（或他人持有），迟到 Drop 不得误删
+        let path = &self.path;
+        let token = self.token.clone();
+        if let Ok(content) = std::fs::read_to_string(path)
+            && content == token
+        {
+            std::fs::remove_file(path).ok();
+        }
     }
 }
 
@@ -728,18 +797,9 @@ pub async fn sync_shared_skill_view(
         .subagents
         .map(|names| canonicalize_names("subagent name", names))
         .transpose()?;
-    // Q02：受管根身份核验——`.agents` 本身（及其挂载子目录）不得是链接；
-    // 祖先被替换后 create_dir_all/read_dir 会沿链接作用于目标目录，"无引用
-    // 条目清理"即可越界递归删除。合法 ACP 视图**条目**链接不受影响。
-    let managed_root = workspace.join(".agents");
-    if let Ok(meta) = fs::symlink_metadata(&managed_root).await
-        && meta.is_symlink()
-    {
-        return Err(crate::error::AppError::validation(format!(
-            "managed agent directory is a symlink: {} (refusing to sync through a replaced root)",
-            managed_root.display()
-        )));
-    }
+    // Q02/V05：全部受管 ACP 根在任何写/链接操作前核验（见帮助函数注释）。
+    // 合法 ACP 视图**条目**链接（.agents/skills/<name> → store 实体）不受影响。
+    validate_managed_roots(workspace).await?;
     let store_root = project_store_root(user_root, project_id)?;
     fs::create_dir_all(&store_root).await?;
     let _guard = ViewGuard::acquire(&store_root).await?;
@@ -1678,6 +1738,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn view_lock_takeover_and_late_release_never_delete_successor_lock() {
+        // Q07：A 持锁（伪造超龄 mtime）→ B 接管（token 轮换）→ A 的迟到
+        // Drop 不得删掉 B 的锁（C 不得凭空进入）；B 正常释放有效
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj-store");
+        fs::create_dir_all(&root).await.unwrap();
+        let lock = root.join(VIEW_LOCK_NAME);
+        // A 持锁
+        let a = ViewGuard::acquire(&root).await.expect("A acquires");
+        // 伪造超龄：直接回写 mtime（文件锁内容为 A token）
+        let old =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(VIEW_LOCK_STALE_MS + 60);
+        let f = std::fs::File::options().write(true).open(&lock).unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        // B 接管（stale 检测 → token 轮换 rename）
+        let b = ViewGuard::acquire(&root).await.expect("B takes over");
+        assert_ne!(a.token, b.token, "接管必须轮换所有权 token");
+        // A 迟到 Drop：锁内容是 B 的 token——不得删除
+        drop(a);
+        assert!(lock.exists(), "迟到 Drop 不得删除接管者的锁（Q07）");
+        assert_eq!(
+            fs::read_to_string(&lock).await.unwrap(),
+            b.token,
+            "锁内容必须仍是 B 的所有权 token"
+        );
+        // B 正常释放有效
+        drop(b);
+        assert!(!lock.exists(), "持有者自身释放必须生效");
+    }
+
+    #[tokio::test]
     async fn trimmed_dot_segments_rejected_before_manifest_write() {
         // Q01：原始串（".. "）是合法 Normal 组件，但 trim 后变成 ".."——
         // 规范化后的值必须在写 manifest 前被拒，不能把 ".." 落盘参与视图操作
@@ -1703,6 +1795,79 @@ mod tests {
             manifest.agents.is_empty(),
             "非法清单不得写入 manifest: {manifest:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn replaced_non_agents_acp_roots_are_refused_across_all_variants() {
+        // V05：.agents 之外的 ACP 根（.claude/.opencode/.codex/.grok/.pi 任一）
+        // 被替换为指向 victim 的链接——sync 与 link 两条路径都必须拒绝，
+        // 且 victim、manifest、其余视图零变更
+        for replaced in [".claude", ".opencode", ".codex", ".grok", ".pi"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let user_root = tmp.path().join("u1");
+            let workspace = tmp.path().join("ws");
+            fs::create_dir_all(&workspace).await.unwrap();
+            let victim = tmp.path().join("victim");
+            fs::create_dir_all(victim.join("skills").join("keep"))
+                .await
+                .unwrap();
+            fs::write(victim.join("skills").join("keep").join("SKILL.md"), "keep")
+                .await
+                .unwrap();
+            // 受害目录挂在被替换的根上
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&victim, workspace.join(replaced)).unwrap();
+
+            let sync_result = sync_shared_skill_view(
+                &user_root,
+                &workspace,
+                "agent-a",
+                "proj",
+                SharedSkillLists {
+                    skills: Some(Vec::new()),
+                    subagents: None,
+                },
+            )
+            .await;
+            let link_result = link_workspace_to_agent_store(
+                &workspace,
+                &user_root
+                    .join(".agent-store")
+                    .join("agent-a")
+                    .join("skills"),
+                &user_root
+                    .join(".agent-store")
+                    .join("agent-a")
+                    .join("agents"),
+            )
+            .await;
+            #[cfg(unix)]
+            {
+                assert!(
+                    sync_result.is_err(),
+                    "{replaced} 根被链接替换时 sync 必须拒绝"
+                );
+                assert!(
+                    link_result.is_err(),
+                    "{replaced} 根被链接替换时 link 必须拒绝"
+                );
+                assert_eq!(
+                    fs::read_to_string(victim.join("skills").join("keep").join("SKILL.md"))
+                        .await
+                        .unwrap(),
+                    "keep",
+                    "{replaced}: victim 内容必须原样保留"
+                );
+                let store_root = project_store_root(&user_root, "proj").unwrap();
+                let manifest = read_manifest(&store_root).await.unwrap();
+                assert!(
+                    manifest.agents.is_empty(),
+                    "{replaced}: 非法清单不得写入 manifest"
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = (sync_result, link_result);
+        }
     }
 
     #[tokio::test]

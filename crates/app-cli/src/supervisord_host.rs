@@ -102,6 +102,7 @@ impl SupervisordHost {
         release: &ReleaseLock,
         runtime_status: &RuntimeStatusService,
         run_migrations: bool,
+        dev_profile: bool,
     ) -> Result<()> {
         runtime_status.set_ready(false);
         supervisor::validate_runtime_compatibility(release)?;
@@ -175,12 +176,10 @@ impl SupervisordHost {
                     .into_owned(),
                 // B08：与 builtin 引擎同一生效命令选择（共享运行计划）——
                 // dev profile 且配 [devrun] 时 devrun 优先（devrun 优先、
-                // run 兜底），不再恒用 run.command
-                argv: crate::supervisor::effective_run_argv(
-                    spec,
-                    crate::supervisor::dev_run_profile(),
-                )
-                .to_vec(),
+                // run 兜底），不再恒用 run.command。
+                // R08：profile 来自**本次操作**（请求 Source 形态）显式传递，
+                // env 仅作操作未指定时的兜底
+                argv: crate::supervisor::effective_run_argv(spec, dev_profile).to_vec(),
                 env: spec.env.clone().into_iter().collect(),
                 port: Some(spec.port),
             };
@@ -221,9 +220,7 @@ impl SupervisordHost {
         for spec in &specs {
             // B08：判空用**生效命令**（devrun 可能非空而 run 为空——与 builtin
             // 的 effective_run_argv 同源判定）
-            if crate::supervisor::effective_run_argv(spec, crate::supervisor::dev_run_profile())
-                .is_empty()
-            {
+            if crate::supervisor::effective_run_argv(spec, dev_profile).is_empty() {
                 // static 服务无进程（步骤 2.6 已内置托管）——不是配置问题，
                 // 与进程态服务的"未配命令"区分文案
                 if crate::static_hosting::hosts_statically(spec, false) {

@@ -71,6 +71,13 @@ pub struct ServerState {
     /// None = 状态根打开失败（可信状态不可读）——所有写入口 fail-closed；
     /// false = 从未尝试（测试/无内核上下文）——保持旧语义。
     kernel_required: std::sync::atomic::AtomicBool,
+    /// V04：server 级恢复门禁——运行操作**终态持久化失败**（结果未知）时
+    /// 挂起：保留执行身份、关闭部署受理、压低 ready，直至进程重启由内核
+    /// 恢复裁决。只升不降（解除只经重启）。
+    runtime_recovery_hold: std::sync::atomic::AtomicBool,
+    /// R08：当前运行操作的 dev profile（None = 操作未指定，legacy 直跑/
+    /// env 兜底）。编排生效命令选择的显式依据。
+    pending_dev_profile: std::sync::Mutex<Option<bool>>,
     /// 运行控制信号通道（源码编排/停止业务——api → 主循环；与部署通道并行）。
     control_tx: tokio::sync::mpsc::UnboundedSender<ControlSignal>,
     control_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ControlSignal>>,
@@ -82,7 +89,12 @@ pub struct ServerState {
 #[derive(Debug, Clone)]
 pub(crate) enum ControlSignal {
     /// 源码编排（workspace 当前内容 + release lock）。
-    OrchestrateSource { operation_id: String },
+    OrchestrateSource {
+        operation_id: String,
+        /// R08：操作级 dev profile（Source 形态 = dev）——编排生效命令选择
+        /// 的显式依据，不再读 serve 进程 env 猜测
+        dev_profile: bool,
+    },
     /// 停止业务服务（保持管理面）。
     StopBusiness { operation_id: String },
 }
@@ -194,6 +206,8 @@ impl ServerState {
         Self {
             runtime_kernel: std::sync::OnceLock::new(),
             kernel_required: std::sync::atomic::AtomicBool::new(false),
+            runtime_recovery_hold: std::sync::atomic::AtomicBool::new(false),
+            pending_dev_profile: std::sync::Mutex::new(None),
             control_tx,
             control_rx: tokio::sync::Mutex::new(control_rx),
             current_runtime_operation: RwLock::new(None),
@@ -226,6 +240,33 @@ impl ServerState {
     pub(crate) fn mark_kernel_required(&self) {
         self.kernel_required
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// R08：记录/读取当前操作的 dev profile。
+    pub(crate) fn set_pending_dev_profile(&self, dev_profile: bool) {
+        *self
+            .pending_dev_profile
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dev_profile);
+    }
+
+    pub(crate) fn take_pending_dev_profile(&self) -> Option<bool> {
+        self.pending_dev_profile
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// V04：终态持久化失败（结果未知）——挂起 server 写入口与 ready。
+    pub(crate) fn begin_runtime_recovery_hold(&self) {
+        self.runtime_recovery_hold
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.ready.set_ready(false);
+    }
+
+    pub(crate) fn runtime_recovery_hold_active(&self) -> bool {
+        self.runtime_recovery_hold
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn kernel_unavailable(&self) -> bool {
@@ -276,15 +317,19 @@ impl ServerState {
     }
 
     /// 按显式 ID 收束运行操作（R01）：只收束指定操作，不误完成并发受理的
-    /// 其他操作；在执行槽匹配时一并清除。持久化失败保持现场并记日志。
+    /// 其他操作；在执行槽匹配时一并清除。
+    ///
+    /// V04：终态**持久化失败向上传播**——保留执行身份（不清 current）、
+    /// 挂起 server 恢复门禁（写入口关闭 + ready 压低），调用方必须显式处理；
+    /// 不允许记日志后按成功继续。
     pub(crate) async fn finish_runtime_operation_by_id(
         &self,
         operation_id: &str,
         state: shared_types::RuntimeOperationState,
         error: Option<(String, String)>,
-    ) {
+    ) -> Result<(), String> {
         let Some(kernel) = self.runtime_kernel() else {
-            return;
+            return Ok(());
         };
         let sequence = kernel
             .store()
@@ -295,13 +340,17 @@ impl ServerState {
             .finish(operation_id, state, error, None, sequence.max(2))
             .await
         {
-            tracing::error!(
+            let message = format!(
                 "runtime operation terminal persist failed (op {operation_id}): {persist_error:#}"
             );
+            tracing::error!("{message}");
+            self.begin_runtime_recovery_hold();
+            return Err(message);
         }
         if self.current_runtime_operation().as_deref() == Some(operation_id) {
             self.set_current_runtime_operation(None);
         }
+        Ok(())
     }
 
     /// 当前执行操作是否已被请求取消（编排完成提交边界检查）。
@@ -323,26 +372,32 @@ impl ServerState {
             return false;
         }
         tracing::info!("runtime operation {operation_id} cancelled before execution");
-        self.finish_runtime_operation_by_id(
-            operation_id,
-            shared_types::RuntimeOperationState::Cancelled,
-            None,
-        )
-        .await;
+        if let Err(error) = self
+            .finish_runtime_operation_by_id(
+                operation_id,
+                shared_types::RuntimeOperationState::Cancelled,
+                None,
+            )
+            .await
+        {
+            // V04：零副作用取消的终态都写不进——结果不可记录，写入口挂起
+            tracing::error!("{error}; suppressing further execution");
+        }
         true
     }
 
     /// 主循环边界收束运行操作（成功/失败/恢复保护三态；先持久化终态再清槽）。
+    /// V04：持久化失败向上传播（身份保留 + 门禁已在底层挂起）。
     pub(crate) async fn finish_current_runtime_operation(
         &self,
         state: shared_types::RuntimeOperationState,
         error: Option<(String, String)>,
-    ) {
+    ) -> Result<(), String> {
         let Some(operation_id) = self.current_runtime_operation() else {
-            return;
+            return Ok(());
         };
         self.finish_runtime_operation_by_id(&operation_id, state, error)
-            .await;
+            .await
     }
 
     fn close_admission(&self) {
@@ -546,6 +601,15 @@ impl ServerState {
                 return Err(AdmissionError::Busy(
                     "runtime state unavailable (state root could not be opened); deployment \
                      admission closed until recovery"
+                        .into(),
+                ));
+            }
+            _ if self.runtime_recovery_hold_active() => {
+                // V04：运行操作终态持久化失败（结果未知）——身份保留中，
+                // 新部署不得受理，直至重启恢复
+                return Err(AdmissionError::Busy(
+                    "runtime operation outcome could not be persisted; recovery required \
+                     before deploying"
                         .into(),
                 ));
             }
@@ -1154,12 +1218,16 @@ async fn assemble_runtime_kernel(
                 tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
             }
         }
-        DispatchAction::OrchestrateSource { operation_id } => {
+        DispatchAction::OrchestrateSource {
+            operation_id,
+            dev_profile,
+        } => {
             dispatch_state.set_current_runtime_operation(Some(operation_id.clone()));
             if dispatch_state
                 .control_tx
                 .send(ControlSignal::OrchestrateSource {
                     operation_id: operation_id.clone(),
+                    dev_profile,
                 })
                 .is_err()
             {
@@ -1323,7 +1391,10 @@ enum InitialAction {
 /// 重编排；Stopped 按信号自身 ID 收束（不触碰在执行的其他操作）。
 async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> InitialAction {
     match signal {
-        ControlSignal::OrchestrateSource { operation_id } => {
+        ControlSignal::OrchestrateSource {
+            operation_id,
+            dev_profile,
+        } => {
             // R03/R04 取消检查点：派发排队期间被取消 → 按自身 ID 收束
             // Cancelled 后零动作返回——不编排、不派发 Stop（取消收束变成
             // Stop 执行会用 Succeeded 覆盖 Cancelled 并停止无关运行实例）
@@ -1331,6 +1402,7 @@ async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> In
                 return InitialAction::Settled;
             }
             state.set_current_runtime_operation(Some(operation_id));
+            state.set_pending_dev_profile(dev_profile);
             InitialAction::Existing
         }
         ControlSignal::StopBusiness { operation_id } => {
@@ -1381,12 +1453,17 @@ async fn next_prepared(
 }
 
 async fn fail_preparation(state: &ServerState, error: String) {
-    state
+    if let Err(settle_error) = state
         .finish_current_runtime_operation(
             shared_types::RuntimeOperationState::Failed,
             Some(("ERR_BACKEND_ERROR".to_string(), error.clone())),
         )
-        .await;
+        .await
+    {
+        // V04：失败终态都写不进——结果未知，走恢复保护路径
+        hold_unconfirmed(state, format!("{error}; {settle_error}")).await;
+        return;
+    }
     if state.preparations.is_poisoned() {
         hold_unconfirmed(state, error).await;
         return;
@@ -1403,7 +1480,7 @@ async fn fail_preparation(state: &ServerState, error: String) {
 /// Keep the API alive and admission closed when a writer may still be active.
 /// No recovery directory writes or releasable terminal status follow this point.
 async fn hold_unconfirmed(state: &ServerState, error: String) {
-    state
+    if let Err(settle_error) = state
         .finish_current_runtime_operation(
             shared_types::RuntimeOperationState::RecoveryRequired,
             Some((
@@ -1411,7 +1488,12 @@ async fn hold_unconfirmed(state: &ServerState, error: String) {
                 error.clone(),
             )),
         )
-        .await;
+        .await
+    {
+        // V04：连 RecoveryRequired 都不可持久化——身份保留 + server 门禁
+        // （finish 内已挂起）；此处如实记录后维持保护现场
+        tracing::error!("{settle_error}; holding without durable terminal state");
+    }
     state.ready.set_ready(false);
     state.begin_failure(error.clone(), true);
     tracing::error!(%error, "Deployment remains pending until process shutdown is confirmed; operator recovery required");
@@ -1443,21 +1525,33 @@ async fn fail_activation(
         .await;
         return None;
     }
-    state
+    if let Err(settle_error) = state
         .finish_current_runtime_operation(
             shared_types::RuntimeOperationState::Failed,
             Some(("ERR_BACKEND_ERROR".to_string(), error.clone())),
         )
-        .await;
+        .await
+    {
+        // V04：清理已确认但失败终态写不进——结果未知，保持恢复保护
+        tracing::error!("{settle_error}; operation held for recovery");
+    }
     None
+}
+
+/// 屏障裁决后的取消原因辅助（V02）：仅用于收束记录的 reason 文案；
+/// 权威判定已在屏障内完成。
+fn commit_running_barrier_reason_cancelled(state: &ServerState) -> bool {
+    state.current_operation_cancelled()
 }
 
 /// 内核提交屏障结果（B03 收敛形态）。
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum BarrierOutcome {
-    /// 屏障通过（已收束 Succeeded）/ 已取消（已收束 Cancelled）/
-    /// 无在途操作——调用方继续正常流转。
+    /// 屏障通过（已收束 Succeeded）/ 无在途操作——调用方继续正常流转。
     Passed,
+    /// 观察到取消意图（V02：内核**未写终态**）——调用方必须先停服并确认
+    /// 清理，再按 ID 收束 Cancelled；清理未知走 RecoveryRequired。
+    CancelledByRequest,
     /// Stop 已受理（revision 推进）：调用方必须停服、按 ID 收束 Cancelled。
     Superseded,
 }
@@ -1484,11 +1578,15 @@ async fn commit_running_barrier(state: &ServerState) -> BarrierOutcome {
         }
     };
     match kernel.commit_execution(&operation_id).await {
-        Ok(crate::runtime_kernel::CommitBarrierOutcome::Committed)
-        | Ok(crate::runtime_kernel::CommitBarrierOutcome::Cancelled) => {
-            // R01：内核已收束——同步清理 server 执行身份
+        Ok(crate::runtime_kernel::CommitBarrierOutcome::Committed) => {
+            // R01：内核已收束 Succeeded——同步清理 server 执行身份
             settle_identity();
             BarrierOutcome::Passed
+        }
+        Ok(crate::runtime_kernel::CommitBarrierOutcome::Cancelled) => {
+            // V02：取消意图已观察到但**终态未写**——不清身份；调用方先停服，
+            // 确认后按 ID 收束（清理未知 → RecoveryRequired）
+            BarrierOutcome::CancelledByRequest
         }
         Ok(crate::runtime_kernel::CommitBarrierOutcome::Superseded) => BarrierOutcome::Superseded,
         Ok(crate::runtime_kernel::CommitBarrierOutcome::NotActive) => {
@@ -1504,7 +1602,7 @@ async fn commit_running_barrier(state: &ServerState) -> BarrierOutcome {
                         "runtime commit barrier: operation {operation_id} lost execution \
                          identity before commit; settling RecoveryRequired"
                     );
-                    state
+                    if let Err(settle_error) = state
                         .finish_runtime_operation_by_id(
                             &operation_id,
                             shared_types::RuntimeOperationState::RecoveryRequired,
@@ -1513,14 +1611,17 @@ async fn commit_running_barrier(state: &ServerState) -> BarrierOutcome {
                                 "execution identity lost before commit barrier".into(),
                             )),
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::error!("{settle_error}; recovery hold engaged");
+                    }
                     BarrierOutcome::Passed
                 }
             }
         }
         Err(error) => {
             tracing::error!("runtime commit barrier failed (op {operation_id}): {error:#}");
-            state
+            if let Err(settle_error) = state
                 .finish_runtime_operation_by_id(
                     &operation_id,
                     shared_types::RuntimeOperationState::RecoveryRequired,
@@ -1529,7 +1630,10 @@ async fn commit_running_barrier(state: &ServerState) -> BarrierOutcome {
                         format!("commit barrier persistence failed: {error:#}"),
                     )),
                 )
-                .await;
+                .await
+            {
+                tracing::error!("{settle_error}; recovery hold engaged");
+            }
             BarrierOutcome::Passed
         }
     }
@@ -1563,10 +1667,13 @@ async fn server_loop(
                         None => return Ok(()), // api 层全退（不可能，防御）
                     },
                     signal = control.recv() => match signal {
-                        Some(ControlSignal::OrchestrateSource { operation_id }) => {
+                        Some(ControlSignal::OrchestrateSource { operation_id, dev_profile }) => {
                             // B01：ID 必须完整传递——Idle 消费即占据执行身份
                             //（取消检查点在 settle_control_signal 内）
-                            Some(settle_control_signal(state, ControlSignal::OrchestrateSource { operation_id }).await)
+                            Some(settle_control_signal(
+                                state,
+                                ControlSignal::OrchestrateSource { operation_id, dev_profile },
+                            ).await)
                         }
                         Some(ControlSignal::StopBusiness { operation_id }) => {
                             Some(InitialAction::StopBusiness { operation_id })
@@ -1613,19 +1720,27 @@ async fn server_loop(
             .await;
             match stopped {
                 Ok(()) => {
-                    state.set_phase(ServerPhase::Idle);
-                    state
+                    // V04：先持久化终态再切相位——收束失败（结果未知）不得
+                    // 以 Idle 成功面貌继续
+                    match state
                         .finish_runtime_operation_by_id(
                             &operation_id,
                             shared_types::RuntimeOperationState::Succeeded,
                             None,
                         )
-                        .await;
+                        .await
+                    {
+                        Ok(()) => state.set_phase(ServerPhase::Idle),
+                        Err(settle_error) => {
+                            tracing::error!("{settle_error}");
+                            state.set_phase(ServerPhase::Failed(settle_error));
+                        }
+                    }
                 }
                 Err(error) => {
                     tracing::error!("runtime stop business failed: {error:#}");
                     state.set_phase(ServerPhase::Failed(format!("stop: {error:#}")));
-                    state
+                    if let Err(settle_error) = state
                         .finish_runtime_operation_by_id(
                             &operation_id,
                             shared_types::RuntimeOperationState::RecoveryRequired,
@@ -1634,7 +1749,10 @@ async fn server_loop(
                                 format!("stop business unconfirmed: {error:#}"),
                             )),
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::error!("{settle_error}; recovery hold engaged");
+                    }
                 }
             }
             continue;
@@ -1705,6 +1823,11 @@ async fn server_loop(
         if state.cancel.is_cancelled() {
             return Ok(());
         }
+        // R08：本次操作的 dev profile（Source 形态编排显式传递；未指定 =
+        // legacy/部署路径 → env 兜底）。take 一次性消费——每次编排对应一次取值
+        let run_dev_profile = state
+            .take_pending_dev_profile()
+            .unwrap_or_else(crate::supervisor::dev_run_profile);
         let mut hot_rx = state.deploy_rx.lock().await;
         if let Some(host) = &host {
             let runtime_status = state.runtime_status();
@@ -1715,7 +1838,13 @@ async fn server_loop(
                 continue;
             };
             if let Err(e) = host
-                .orchestrate(args, &release, &runtime_status, run_migrations)
+                .orchestrate(
+                    args,
+                    &release,
+                    &runtime_status,
+                    run_migrations,
+                    run_dev_profile,
+                )
                 .await
             {
                 tracing::error!("server: orchestration failed: {e:#}");
@@ -1745,49 +1874,41 @@ async fn server_loop(
                 pending = fail_activation(args, state, format!("persist running: {error:#}")).await;
                 continue;
             }
-            // R03：编排期间被取消 → 停服务收束 Cancelled（不报成功）
-            if state.current_operation_cancelled() {
-                if let Err(error) = host.stop_all().await {
-                    hold_unconfirmed(
-                        state,
-                        format!("stop after cancelled orchestration failed: {error:#}"),
-                    )
-                    .await;
-                    return Ok(());
-                }
-                state
-                    .finish_current_runtime_operation(
-                        shared_types::RuntimeOperationState::Cancelled,
-                        None,
-                    )
-                    .await;
-                state.set_phase(ServerPhase::Idle);
-            } else if commit_running_barrier(state).await == BarrierOutcome::Superseded {
-                // B03：Stop 已受理（revision 推进）——停服务、按 ID 收束
-                // Cancelled、回 Idle；不报 Succeeded（Stop 信号随后在
-                // Idle 边界按自身 ID 执行收束）。
-                if let Err(error) = host.stop_all().await {
-                    hold_unconfirmed(
-                        state,
-                        format!("stop after superseded startup failed: {error:#}"),
-                    )
-                    .await;
-                    return Ok(());
-                }
-                if let Some(operation_id) = state.current_runtime_operation() {
-                    state
-                        .finish_runtime_operation_by_id(
-                            &operation_id,
-                            shared_types::RuntimeOperationState::Cancelled,
-                            Some((
-                                shared_types::ERR_RECOVERY_REQUIRED.into(),
-                                "superseded by an admitted stop operation".into(),
-                            )),
+            // V02：取消观察并入提交屏障（内核锁内检查，消除外层检查与提交
+            // 之间的竞争窗口）——Cancelled/Superseded 都必须**先停服确认**
+            // 再按 ID 收束 Cancelled；清理未知走 hold_unconfirmed。
+            match commit_running_barrier(state).await {
+                BarrierOutcome::Passed => {}
+                BarrierOutcome::CancelledByRequest | BarrierOutcome::Superseded => {
+                    let reason = if commit_running_barrier_reason_cancelled(state) {
+                        "cancelled during orchestration"
+                    } else {
+                        "superseded by an admitted stop operation"
+                    };
+                    if let Err(error) = host.stop_all().await {
+                        hold_unconfirmed(
+                            state,
+                            format!("stop after cancelled/superseded startup failed: {error:#}"),
                         )
                         .await;
+                        return Ok(());
+                    }
+                    if let Some(operation_id) = state.current_runtime_operation()
+                        && let Err(settle_error) = state
+                            .finish_runtime_operation_by_id(
+                                &operation_id,
+                                shared_types::RuntimeOperationState::Cancelled,
+                                Some((shared_types::ERR_RECOVERY_REQUIRED.into(), reason.into())),
+                            )
+                            .await
+                    {
+                        tracing::error!("{settle_error}; recovery hold engaged");
+                        state.set_phase(ServerPhase::Failed(settle_error));
+                        continue;
+                    }
+                    state.set_phase(ServerPhase::Idle);
+                    continue;
                 }
-                state.set_phase(ServerPhase::Idle);
-                continue;
             }
             // R01：supervisord Running 等待也消费运行控制信号（Stop/重启编排
             // 不再只能等 Idle）。锁序与 Idle 分支一致：deploy 先、control 后。
@@ -1801,7 +1922,7 @@ async fn server_loop(
                     Some(signal) => {
                         // R04：排队期已取消的启动/重启——零副作用收束，不停
                         // 在跑业务（取消收束不得变成 Stop 执行）
-                        if let ControlSignal::OrchestrateSource { operation_id } = &signal
+                        if let ControlSignal::OrchestrateSource { operation_id, .. } = &signal
                             && state
                                 .runtime_kernel()
                                 .is_some_and(|kernel| kernel.is_cancelled(operation_id))
@@ -1862,6 +1983,7 @@ async fn server_loop(
             cancel.clone(),
             Some(running_tx),
             run_migrations,
+            run_dev_profile,
         ));
         let mut sup_joined = false;
         // 先等编排就绪（Running）；就绪后递进一轮等终态/热部署/信号。
@@ -1876,54 +1998,40 @@ async fn server_loop(
                         pending = fail_activation(args, state, format!("persist running: {error:#}")).await;
                         continue;
                 }
-                if result.is_ok() && state.current_operation_cancelled() {
-                    // R03：编排期间被取消 → 停本组服务收束 Cancelled（不报成功）。
-                    // B02：join 已完成 JoinHandle——后续**不得再 poll** sup（panic 路径）。
-                    // 直接转 Idle 回外层循环，不进入下方终态 select。
-                    cancel.cancel();
-                    if let Err(error) = join_supervisor(&mut sup, &mut sup_joined).await {
-                        hold_unconfirmed(
-                            state,
-                            format!("stop after cancelled orchestration failed: {error:#}"),
-                        )
-                        .await;
-                        return Ok(());
-                    }
-                    state
-                        .finish_current_runtime_operation(
-                            shared_types::RuntimeOperationState::Cancelled,
-                            None,
-                        )
-                        .await;
-                    state.set_phase(ServerPhase::Idle);
-                    continue;
-                }
                 if result.is_ok() {
-                    // B03：提交经内核屏障（revision/取消/身份原子检查）——
-                    // Stop 已受理（Superseded）→ 停本组服务、按 ID 收束
-                    // Cancelled、回 Idle；不报 Succeeded。
-                    if commit_running_barrier(state).await == BarrierOutcome::Superseded {
+                    // V02：取消观察并入提交屏障（内核锁内检查，消除外层检查与
+                    // 提交之间的窗口）；Cancelled/Superseded 统一"先停本组服务
+                    // 确认，再按 ID 收束 Cancelled"，清理未知走 hold_unconfirmed。
+                    // B02：join 后 JoinHandle 不得再 poll。
+                    let barrier = commit_running_barrier(state).await;
+                    if barrier != BarrierOutcome::Passed {
+                        let reason = if barrier == BarrierOutcome::CancelledByRequest {
+                            "cancelled during orchestration"
+                        } else {
+                            "superseded by an admitted stop operation"
+                        };
                         cancel.cancel();
                         if let Err(error) = join_supervisor(&mut sup, &mut sup_joined).await {
                             hold_unconfirmed(
                                 state,
-                                format!("stop after superseded startup failed: {error:#}"),
+                                format!("stop after cancelled/superseded startup failed: {error:#}"),
                             )
                             .await;
                             return Ok(());
                         }
-                        if let Some(operation_id) = state.current_runtime_operation() {
-                            state
+                        if let Some(operation_id) = state.current_runtime_operation()
+                            && let Err(settle_error) = state
                                 .finish_runtime_operation_by_id(
                                     &operation_id,
                                     shared_types::RuntimeOperationState::Cancelled,
-                                    Some((
-                                        shared_types::ERR_RECOVERY_REQUIRED.into(),
-                                        "superseded by an admitted stop operation".into(),
-                                    )),
+                                    Some((shared_types::ERR_RECOVERY_REQUIRED.into(), reason.into())),
                                 )
-                                .await;
-                        }
+                                .await
+                            {
+                                tracing::error!("{settle_error}; recovery hold engaged");
+                                state.set_phase(ServerPhase::Failed(settle_error));
+                                continue;
+                            }
                         state.set_phase(ServerPhase::Idle);
                         continue;
                     }
@@ -2999,6 +3107,7 @@ format = "jsonl"
             &state,
             ControlSignal::OrchestrateSource {
                 operation_id: "op-a".into(),
+                dev_profile: true,
             },
         )
         .await;
@@ -3021,6 +3130,7 @@ format = "jsonl"
             &state,
             ControlSignal::OrchestrateSource {
                 operation_id: "op-b".into(),
+                dev_profile: true,
             },
         )
         .await;
@@ -3068,8 +3178,9 @@ format = "jsonl"
 
     #[tokio::test]
     async fn barrier_not_active_on_live_operation_fails_closed() {
-        // R02 fail-closed 分支：active 不在本操作且无终态（受理 Stop 顶掉了
-        // active 槽）——不得当 Passed 报成功，收束 RecoveryRequired
+        // R02 fail-closed 分支保留：active 不在本操作且无终态（执行身份丢失）
+        // ——不得当 Passed 报成功；本例构造终态已存在的幂等场景。身份丢失
+        // 且无终态的 fail-closed 分支由 V03 结构性消除（Stop 不再抢 active）。
         let dir = tempfile::tempdir().unwrap();
         let state = state();
         let kernel = kernel_for(dir.path());
@@ -3082,8 +3193,126 @@ format = "jsonl"
             ))
             .await
             .expect("admit start");
+        // 其他路径已收束（终态存在），server 身份残留——幂等清理放行
+        kernel
+            .finish(
+                "op-x",
+                shared_types::RuntimeOperationState::Succeeded,
+                None,
+                None,
+                2,
+            )
+            .await
+            .unwrap();
         state.set_current_runtime_operation(Some("op-x".into()));
-        // Stop 受理顶掉 active（Stop 屏障例外允许 active 期间受理）
+        assert_eq!(commit_running_barrier(&state).await, BarrierOutcome::Passed);
+        assert_eq!(state.current_runtime_operation(), None);
+        let view = kernel.get("op-x").await.unwrap().expect("record");
+        assert_eq!(view.state, shared_types::RuntimeOperationState::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn barrier_cancelled_by_request_keeps_identity_until_settle() {
+        // V02：屏障观察到取消意图 → CancelledByRequest——内核**未写终态**、
+        // server 身份保留；停服确认后 finish 才收束 Cancelled
+        let dir = tempfile::tempdir().unwrap();
+        let state = state();
+        let kernel = kernel_for(dir.path());
+        state.set_runtime_kernel(kernel.clone());
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Start,
+                "op-cxl",
+                0,
+            ))
+            .await
+            .expect("admit");
+        state.set_current_runtime_operation(Some("op-cxl".into()));
+        kernel.request_cancel("op-cxl").await.unwrap();
+        assert_eq!(
+            commit_running_barrier(&state).await,
+            BarrierOutcome::CancelledByRequest
+        );
+        // 终态未写 + 身份保留（等待停服确认）
+        let view = kernel.get("op-cxl").await.unwrap().expect("record");
+        assert!(!view.state.is_terminal(), "屏障不得预写终态（V02）");
+        assert_eq!(state.current_runtime_operation().as_deref(), Some("op-cxl"));
+        // 停服确认后按 ID 收束 Cancelled（终态单调保住不被迟到成功覆盖）
+        state
+            .finish_runtime_operation_by_id(
+                "op-cxl",
+                shared_types::RuntimeOperationState::Cancelled,
+                None,
+            )
+            .await
+            .unwrap();
+        let view = kernel.get("op-cxl").await.unwrap().expect("record");
+        assert_eq!(view.state, shared_types::RuntimeOperationState::Cancelled);
+        assert_eq!(state.current_runtime_operation(), None);
+    }
+
+    #[tokio::test]
+    async fn terminal_persist_failure_keeps_identity_and_gates_admission() {
+        // V04：终态持久化失败——Err 上抛、身份保留、恢复门禁挂起（部署受理
+        // 拒绝、ready 压低），不允许日志后按成功继续
+        let dir = tempfile::tempdir().unwrap();
+        let state = state();
+        let kernel = kernel_for(dir.path());
+        state.set_runtime_kernel(kernel.clone());
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Start,
+                "op-persist",
+                0,
+            ))
+            .await
+            .expect("admit");
+        state.set_current_runtime_operation(Some("op-persist".into()));
+        // 注入：对不存在记录收束 → kernel.finish 报错（持久化失败替身）
+        let result = state
+            .finish_runtime_operation_by_id(
+                "op-never-recorded",
+                shared_types::RuntimeOperationState::Failed,
+                None,
+            )
+            .await;
+        let error = result.expect_err("persist failure must propagate");
+        assert!(error.contains("persist failed"));
+        // 身份保留 + 门禁挂起
+        assert_eq!(
+            state.current_runtime_operation().as_deref(),
+            Some("op-persist"),
+            "持久化失败不得清除执行身份"
+        );
+        assert!(state.runtime_recovery_hold_active());
+        // 部署受理被门禁拒绝
+        let dir2 = tempfile::tempdir().unwrap();
+        *state.journal.lock().unwrap() = Some(Journal::open(&dir2.path().join("code")).unwrap());
+        state.set_phase(ServerPhase::Running);
+        assert!(matches!(
+            state.try_accept_deploy_with_id(request(), "gated".into()),
+            Err(AdmissionError::Busy(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_admission_does_not_steal_executor_identity() {
+        // V03：Stop 受理（revision 推进）不抢走执行者身份——A 的提交屏障
+        // 得到 Superseded（而非 NotActive），A 停服后按自身 ID 收束 Cancelled，
+        // Stop 执行完成清 pending，此后新操作可受理
+        let dir = tempfile::tempdir().unwrap();
+        let state = state();
+        let kernel = kernel_for(dir.path());
+        state.set_runtime_kernel(kernel.clone());
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Start,
+                "op-a",
+                0,
+            ))
+            .await
+            .expect("admit A");
+        state.set_current_runtime_operation(Some("op-a".into()));
         kernel
             .admit(runtime_request(
                 shared_types::RuntimeOperationKind::Stop,
@@ -3091,15 +3320,89 @@ format = "jsonl"
                 0,
             ))
             .await
-            .expect("admit stop");
-        assert_eq!(commit_running_barrier(&state).await, BarrierOutcome::Passed);
-        let view = kernel.get("op-x").await.unwrap().expect("record");
+            .expect("stop admitted during A");
         assert_eq!(
-            view.state,
-            shared_types::RuntimeOperationState::RecoveryRequired,
-            "执行身份丢失必须 fail-closed，不得默认成功"
+            commit_running_barrier(&state).await,
+            BarrierOutcome::Superseded
         );
-        assert_eq!(state.current_runtime_operation(), None);
+        state
+            .finish_runtime_operation_by_id(
+                "op-a",
+                shared_types::RuntimeOperationState::Cancelled,
+                None,
+            )
+            .await
+            .unwrap();
+        kernel
+            .finish(
+                "op-stop",
+                shared_types::RuntimeOperationState::Succeeded,
+                None,
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Start,
+                "op-c",
+                1,
+            ))
+            .await
+            .expect("C admitted after A/B settled");
+        let a = kernel.get("op-a").await.unwrap().expect("record");
+        assert_eq!(a.state, shared_types::RuntimeOperationState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn uncertain_a_recovery_protection_latches_while_stop_pending() {
+        // V03：恢复保护由结果未知决定——A 以 RecoveryRequired 收束时 Stop 仍
+        // 待执行（pending 占据），保护必须挂起且新操作被拒
+        let dir = tempfile::tempdir().unwrap();
+        let state = state();
+        let kernel = kernel_for(dir.path());
+        state.set_runtime_kernel(kernel.clone());
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Start,
+                "op-a2",
+                0,
+            ))
+            .await
+            .expect("admit A");
+        state.set_current_runtime_operation(Some("op-a2".into()));
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Stop,
+                "op-stop2",
+                0,
+            ))
+            .await
+            .expect("stop admitted");
+        kernel
+            .finish(
+                "op-a2",
+                shared_types::RuntimeOperationState::RecoveryRequired,
+                None,
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        assert!(
+            kernel.recovery_protection_active(),
+            "未知结果必须挂起恢复保护（不依赖 active 匹配）"
+        );
+        let rejected = kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Start,
+                "op-c2",
+                1,
+            ))
+            .await
+            .expect_err("recovery protection rejects");
+        assert_eq!(rejected.code, "ERR_RECOVERY_REQUIRED");
     }
 
     #[tokio::test]
@@ -3129,6 +3432,41 @@ format = "jsonl"
     }
 
     #[tokio::test]
+    async fn orchestrate_source_records_request_dev_profile() {
+        // R08：Source 形态操作的 dev profile 随派发传递并记录——编排引擎
+        // 据此选择生效命令（devrun 优先），不再读 serve 进程 env 猜测
+        let dir = tempfile::tempdir().unwrap();
+        let state = state();
+        let kernel = kernel_for(dir.path());
+        state.set_runtime_kernel(kernel.clone());
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Start,
+                "op-prof",
+                0,
+            ))
+            .await
+            .expect("admit");
+        assert_eq!(state.take_pending_dev_profile(), None, "未编排前无记录");
+        let action = settle_control_signal(
+            &state,
+            ControlSignal::OrchestrateSource {
+                operation_id: "op-prof".into(),
+                dev_profile: true,
+            },
+        )
+        .await;
+        assert!(matches!(action, InitialAction::Existing));
+        assert_eq!(
+            state.take_pending_dev_profile(),
+            Some(true),
+            "Source 形态必须记录 dev profile 供编排消费"
+        );
+        // 一次性消费：取后清空
+        assert_eq!(state.take_pending_dev_profile(), None);
+    }
+
+    #[tokio::test]
     async fn cancelled_queued_orchestration_settles_without_dispatching_stop() {
         // R04：排队期取消的启动/重启——按自身 ID 收束 Cancelled，返回 Settled
         //（不派发 StopBusiness：那会执行无关业务停止并用 Succeeded 覆盖）
@@ -3149,6 +3487,7 @@ format = "jsonl"
             &state,
             ControlSignal::OrchestrateSource {
                 operation_id: "op-queued".into(),
+                dev_profile: true,
             },
         )
         .await;

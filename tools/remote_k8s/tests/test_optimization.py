@@ -359,6 +359,54 @@ class TestExecuteSuitesFailurePathVerify(unittest.TestCase):
         self.assertEqual(state['calls'], 2)
 
 
+class TestRetestCaseVerdict(unittest.TestCase):
+    """V01：整轮失败不得被 case pass 覆盖；run 身份显式传递。"""
+
+    def _run(self, tests_behavior):
+        calls = {}
+        def fake_tests(c, suite, case='', frozen_snapshot=None, receipt_override=None):
+            calls['args'] = (suite, case, frozen_snapshot, receipt_override)
+            return tests_behavior()
+        with patch.object(main, 'tests', fake_tests):
+            return (*main.run_retest_case(None, {'snapshot_id': 's1'}, {'r': 1}, 'chat_alpha'), calls)
+
+    def test_case_pass_with_full_run_pass_is_pass_and_binds_parent_receipt(self):
+        outcome, _tid, _res, calls = self._run(lambda: ('tid1', {
+            'verdict': 'pass', 'cases': [{'name': 'chat_alpha', 'verdict': 'pass'}]}))
+        self.assertEqual(outcome['verdict'], 'pass')
+        self.assertEqual(outcome['test_id'], 'tid1')
+        self.assertIsNone(outcome.get('error'))
+        # receipt 绑定父报告身份（tests 内 smoke/identity 按该身份校验）
+        self.assertEqual(calls['args'][3], {'r': 1})
+        self.assertEqual(calls['args'][1], 'chat_alpha')
+
+    def test_case_pass_but_run_failed_stays_fail(self):
+        # 整轮失败（快照/身份/outside 任一保护失败）不得被 case pass 覆盖
+        def behavior():
+            raise main.TestRunError('tid2', {
+                'verdict': 'fail',
+                'error': 'RuntimeError: deployment identity changed',
+                'cases': [{'name': 'chat_alpha', 'verdict': 'pass'}]})
+        outcome, _tid, _res, _calls = self._run(behavior)
+        self.assertEqual(outcome['verdict'], 'fail')
+        self.assertEqual(outcome['test_id'], 'tid2')
+        self.assertIn('deployment identity changed', outcome['error'])
+
+    def test_run_pass_but_case_failed_stays_fail(self):
+        outcome, _tid, _res, _calls = self._run(lambda: ('tid3', {
+            'verdict': 'pass', 'cases': [{'name': 'chat_alpha', 'verdict': 'fail'}]}))
+        self.assertEqual(outcome['verdict'], 'fail')
+        self.assertEqual(outcome['test_id'], 'tid3')
+
+    def test_unexpected_exception_keeps_explicit_failure_without_test_id(self):
+        def behavior():
+            raise RuntimeError('report creation failed')
+        outcome, _tid, _res, _calls = self._run(behavior)
+        self.assertEqual(outcome['verdict'], 'fail')
+        self.assertIsNone(outcome.get('test_id'))
+        self.assertIn('report creation failed', outcome['error'])
+
+
 class TestFrozenFingerprintContentSensitivity(unittest.TestCase):
     """T03：冻结模式下 launcher 指纹必须覆盖文件实际内容，而非仅清单 JSON。"""
 

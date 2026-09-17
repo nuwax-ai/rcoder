@@ -85,18 +85,20 @@ pub(crate) struct PublisherCounters {
     dropped: AtomicU64,
     send_errors: AtomicU64,
     remaining_after_shutdown: AtomicU64,
+    /// 关停预算耗尽时仍被取消的在途发布（结果未知，K05 计数守恒）。
+    abandoned_in_flight: AtomicU64,
     /// 关停排空完成标记（remaining_after_shutdown 已写入终值）。
     drained: std::sync::atomic::AtomicBool,
 }
 
-/// 计数快照。
-#[cfg(test)]
+/// 计数快照（生产观测面；K05：计数守恒可对外核对）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PublisherSnapshot {
     pub(crate) sent: u64,
     pub(crate) dropped: u64,
     pub(crate) send_errors: u64,
     pub(crate) remaining_after_shutdown: u64,
+    pub(crate) abandoned_in_flight: u64,
     pub(crate) drained: bool,
 }
 
@@ -105,13 +107,26 @@ struct PublisherInner {
     shutdown: tokio_util::sync::CancellationToken,
     counters: Arc<PublisherCounters>,
     last_drop_warning: std::sync::Mutex<Option<std::time::Instant>>,
+    /// 消费者任务句柄（K05：可等待关停——不再丢弃）。
+    consumer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// 生产关停路径：最后一个 runtime clone 释放时取消接纳，消费者按有界预算
-/// 排空后退出（进程退出时任务随运行时终止）。
+/// 排空后退出（进程退出时任务随运行时终止）。Drop 记录最终计数快照
+///（K05：sent/errors/remaining/abandoned 守恒可观测；显式可等待关停用
+/// [`KubernetesEventPublisher::shutdown`]）。
 impl Drop for PublisherInner {
     fn drop(&mut self) {
         self.shutdown.cancel();
+        let snap = self.counters.snapshot();
+        tracing::info!(
+            sent = snap.sent,
+            dropped = snap.dropped,
+            send_errors = snap.send_errors,
+            remaining_after_shutdown = snap.remaining_after_shutdown,
+            abandoned_in_flight = snap.abandoned_in_flight,
+            "k8s event publisher final counters"
+        );
     }
 }
 
@@ -130,7 +145,7 @@ impl KubernetesEventPublisher {
         let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
         let shutdown = tokio_util::sync::CancellationToken::new();
         let counters = Arc::new(PublisherCounters::default());
-        tokio::spawn(run_consumer(
+        let consumer = tokio::spawn(run_consumer(
             receiver,
             kube::runtime::events::Recorder::new(client, "rcoder-runtime".into()),
             counters.clone(),
@@ -143,6 +158,7 @@ impl KubernetesEventPublisher {
                     shutdown,
                     counters: counters.clone(),
                     last_drop_warning: std::sync::Mutex::new(None),
+                    consumer: std::sync::Mutex::new(Some(consumer)),
                 })),
             },
             counters,
@@ -159,17 +175,57 @@ impl KubernetesEventPublisher {
             warn_rate_limited(inner, dropped, &error);
         }
     }
+
+    /// 可等待关停（K05）：取消接纳 → 在**总预算**（在途单次发布 + 排空窗口
+    /// 之和）内等待消费者退出并回填计数；超时返回最终快照（结果如实——
+    /// abandoned/remaining 记录未知项）。幂等：二次调用直接返回快照。
+    ///
+    /// 接线点：生产进程随运行时退出（Drop 已取消+记录快照），显式调用留给
+    /// 未来的 runtime 生命周期收尾 API（当前无持有方主动 shutdown 路径）。
+    #[allow(dead_code)] // K05 观测/关停面：测试消费，metrics 接线前的稳定 API
+    pub(crate) async fn shutdown(&self) -> PublisherSnapshot {
+        let Some(inner) = &self.inner else {
+            return PublisherSnapshot {
+                sent: 0,
+                dropped: 0,
+                send_errors: 0,
+                remaining_after_shutdown: 0,
+                abandoned_in_flight: 0,
+                drained: true,
+            };
+        };
+        inner.shutdown.cancel();
+        let handle = inner
+            .consumer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            // 在途发布上限 + 排空窗口 = 关停总预算上界
+            let budget = SINGLE_PUBLISH_TIMEOUT + SHUTDOWN_DRAIN_TIMEOUT;
+            if tokio::time::timeout(budget, handle).await.is_err() {
+                tracing::warn!("k8s event publisher shutdown budget exhausted; task aborted");
+            }
+        }
+        inner.counters.snapshot()
+    }
+
+    /// 当前计数快照（K05：生产观测/接线面）。
+    #[allow(dead_code)] // 接线点：metrics/诊断接线前的稳定 API（测试消费）
+    pub(crate) fn snapshot(&self) -> Option<PublisherSnapshot> {
+        self.inner.as_ref().map(|inner| inner.counters.snapshot())
+    }
 }
 
-#[cfg(test)]
 impl PublisherCounters {
-    /// 测试观测快照（生产 metrics 接线前的测试面）。
-    fn snapshot(&self) -> PublisherSnapshot {
+    /// 计数快照（测试与运维观测共用；生产 metrics 接线前的观测面）。
+    pub(crate) fn snapshot(&self) -> PublisherSnapshot {
         PublisherSnapshot {
             sent: self.sent.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             send_errors: self.send_errors.load(Ordering::Relaxed),
             remaining_after_shutdown: self.remaining_after_shutdown.load(Ordering::Relaxed),
+            abandoned_in_flight: self.abandoned_in_flight.load(Ordering::Relaxed),
             drained: self.drained.load(Ordering::Relaxed),
         }
     }
@@ -216,24 +272,33 @@ async fn run_consumer(
             }
         }
     }
-    // 有界排空：关停后总预算 5s（含在途单次发布——外层超时一并取消，
-    // 不让逐条 3s 上限突破总预算）；队列提前关闭即早停；剩余数量记录。
+    // K05：取消即锚定**绝对总预算**（5s，含此刻仍在途的单次发布——预算
+    // 不因等待在途发布而顺延）；预算内尽力排空；到期未决事件记 remaining、
+    // 在途被取消的发布记 abandoned_in_flight（结果未知，计数守恒）。
     let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
-    let _ = tokio::time::timeout_at(deadline, async {
+    let drained_clean = tokio::time::timeout_at(deadline, async {
         while let Some(event) = receiver.recv().await {
             publish_one(&recorder, event, &counters).await;
         }
     })
-    .await;
+    .await
+    .is_ok();
     let remaining = receiver.len() as u64;
     counters
         .remaining_after_shutdown
         .store(remaining, Ordering::Relaxed);
+    if !drained_clean {
+        // 预算耗尽时仍有未消费事件；若此刻有单次发布被整体超时取消，
+        // 其结果未知——以 abandoned 计数披露（守恒：sent+errors+abandoned
+        // + remaining+dropped = 提交总量）
+        counters.abandoned_in_flight.fetch_add(1, Ordering::Relaxed);
+    }
     counters.drained.store(true, Ordering::Relaxed);
-    if remaining > 0 {
+    if remaining > 0 || !drained_clean {
         tracing::warn!(
             remaining,
-            "k8s event publisher drained with leftovers (bounded budget exhausted)"
+            exhausted = !drained_clean,
+            "k8s event publisher shutdown bounded budget reached"
         );
     }
 }

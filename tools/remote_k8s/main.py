@@ -566,8 +566,18 @@ def execute_suites(c, receipt, context, suite, case=''):
     return elapsed
 
 
-def tests(c, suite, case='', frozen_snapshot=None):
-    receipt = read_receipt(c, 'deployment.json')
+class TestRunError(RuntimeError):
+    """tests() 整轮失败（V01）：携带本次 run 的显式 test_id 与完整结果，
+    调用方（retest）不得以 mtime 扫描猜测报告，也不得用 case 结果覆盖整轮失败。"""
+
+    def __init__(self, test_id, result):
+        super().__init__(str(result.get('error') or 'test run failed'))
+        self.test_id = test_id
+        self.result = result
+
+
+def tests(c, suite, case='', frozen_snapshot=None, receipt_override=None):
+    receipt = receipt_override or read_receipt(c, 'deployment.json')
     test_id = uuid.uuid4().hex
     report = c.state / 'tests' / test_id
     report.mkdir(parents=True)
@@ -618,13 +628,44 @@ def tests(c, suite, case='', frozen_snapshot=None):
             logs(c, report)
         except Exception as diagnostic_error:
             result['diagnostic_error'] = type(diagnostic_error).__name__
-        raise
+        raise TestRunError(test_id, result) from exc
     finally:
         # 失败也保留已解析的场景结果（T04）：失败用例集合是 retest 与归因的输入
         if context is not None and context.get('cases') is not None:
             result['cases'] = context['cases']
         atomic_json(report / 'summary.json', result)
         print('Test report:', report, flush=True)
+    return test_id, result
+
+
+def run_retest_case(c, record, receipt, name):
+    """单用例重跑（V01）：以 tests() 整轮结果为准——整轮失败不得被 case
+    pass 覆盖；run 身份显式返回/异常携带，禁止 mtime 扫描。"""
+    outcome = {'name': name, 'verdict': 'fail'}
+    try:
+        case_test_id, case_result = tests(c, 'chat', case=name,
+                                          frozen_snapshot=record,
+                                          receipt_override=receipt)
+    except KeyboardInterrupt:
+        raise
+    except TestRunError as run_error:
+        case_test_id = run_error.test_id
+        case_result = run_error.result
+        outcome['error'] = str(case_result.get('error') or run_error)[:300]
+    except BaseException as exc:
+        outcome['error'] = type(exc).__name__ + ': ' + str(exc)[:300]
+        return outcome, None, {}
+    run_passed = case_result.get('verdict') == 'pass'
+    case_passed = any(row.get('name') == name and row.get('verdict') == 'pass'
+                      for row in (case_result.get('cases') or []))
+    if run_passed and case_passed:
+        outcome['verdict'] = 'pass'
+    elif not outcome.get('error'):
+        # case 未过或整轮未过但无异常：如实记录失败原因维度
+        outcome['error'] = ('case failed' if not case_passed else '') + \
+                           ('; run verdict=' + str(case_result.get('verdict')) if not run_passed else '')
+    outcome['test_id'] = case_test_id
+    return outcome, case_test_id, case_result
 
 
 def retest_failed(c, parent_id):
@@ -671,34 +712,24 @@ def retest_failed(c, parent_id):
     if unknown:
         raise RuntimeError('Parent failed cases are not registered scenarios: ' + ', '.join(unknown))
     print('Retesting failed cases from parent', parent_id, ':', ', '.join(failed), flush=True)
-    # Q04：重跑复用普通 tests() 的完整收束路径（同轮冻结、部署身份/外部资源
-    # 复核、所有收束路径的快照校验、结构化失败报告）——不绕过任何保护；
-    # 报告目录由 tests() 以新 test_id 唯一创建，历史不可覆盖；取消立即结束
+    # Q04/V01：重跑复用普通 tests() 的完整收束路径（同轮冻结、部署身份/外部
+    # 资源复核、所有收束路径的快照校验、结构化失败报告）——不绕过任何保护。
+    # V01：本次 run 的 test_id 与完整结果由 tests() 显式返回/异常携带——
+    # 禁止 mtime 扫描猜测；**整轮 verdict=fail 不得被 case pass 覆盖**；
+    # receipt 绑定父报告部署身份（tests() 内 smoke/identity 对照该身份，
+    # 运行期间部署被替换 → 整轮失败）。
     outcomes = []
     for name in failed:
-        case_test_id = None
-        outcome = {'name': name, 'verdict': 'fail'}
-        try:
-            tests(c, 'chat', case=name, frozen_snapshot=record)
-        except KeyboardInterrupt:
-            raise
-        except BaseException as exc:
-            outcome['error'] = type(exc).__name__ + ': ' + str(exc)[:300]
-        newest = max((c.state / 'tests').glob('*/summary.json'),
-                     key=lambda p: p.stat().st_mtime, default=None)
-        if newest is not None:
-            row = json.loads(newest.read_text())
-            case_test_id = row.get('test_id')
-            for case_row in row.get('cases', []):
-                if case_row.get('name') == name:
-                    outcome['verdict'] = case_row.get('verdict', outcome['verdict'])
-        outcome['test_id'] = case_test_id
+        outcome, case_test_id, case_result = run_retest_case(c, record, receipt, name)
         outcomes.append(outcome)
         if case_test_id:
             summary = {'parent_test_id': parent_id, 'retest': True, 'case': name,
                        'verdict': outcome['verdict'], 'snapshot_id': record['snapshot_id'],
                        'test_source_sha256': record['source_sha256'],
                        'server_source_sha256': receipt.get('source_sha256'),
+                       'run_verdict': case_result.get('verdict'),
+                       'case_rows': [row for row in (case_result.get('cases') or [])
+                                     if row.get('name') == name],
                        'error': outcome.get('error', ''),
                        'report': str(c.state / 'tests' / case_test_id)}
             atomic_json((c.state / 'tests' / case_test_id) / 'retest-summary.json', summary)

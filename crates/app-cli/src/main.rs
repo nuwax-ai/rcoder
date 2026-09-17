@@ -149,6 +149,8 @@ async fn main() -> anyhow::Result<()> {
         supervisor_cancel,
         None,
         true,
+        // R08：直跑形态无操作上下文——env 兜底（server 形态经操作显式传递）
+        app_cli::supervisor::dev_run_profile(),
     )
     .await;
     match &supervisor_result {

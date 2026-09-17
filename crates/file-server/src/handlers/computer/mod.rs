@@ -216,7 +216,9 @@ pub(crate) fn agent_store_user_root(
     }
     // normalProject 与用户维度工作目录（非 userapp）同锚点：store 锚定配置根
     // {COMPUTER_WORKSPACE_DIR}/{userId}，不随绑定漂移
-    if crate::extract::is_normal_project_request()
+    // F03：与定位收口同源（merged kind，header 优先 > body）——body-only
+    // normalProject 的 store 根同样锚定配置根，不再依赖 header 通道存在
+    if crate::extract::workspace_kind() == Some(shared_types::ComputerServiceKind::NormalProject)
         || crate::extract::merged_workspace_path(workspace_path).is_some()
     {
         return state.config.computer_workspace_dir.join(user_id);

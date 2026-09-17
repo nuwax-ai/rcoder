@@ -72,6 +72,8 @@ pub struct KubernetesRuntime {
     /// 受管共享 Event publisher（批次 C）：Arc 共享，clone 不重建；非阻塞
     /// 提交，单消费者串行发布；Default = inactive（测试构造用）。
     pub(crate) event_publisher: super::k8s_event_publisher::KubernetesEventPublisher,
+    /// K05：事件 publisher 计数（观测面/metrics 接线点；可等待关停用）。
+    pub(crate) event_counters: Arc<super::k8s_event_publisher::PublisherCounters>,
 }
 
 #[cfg(feature = "kubernetes")]
@@ -147,13 +149,14 @@ impl KubernetesRuntime {
         let pod_ttl_seconds = config.container_ttl_seconds;
 
         // 批次 C：受管 Event publisher 与 runtime 同生命周期（Arc 共享，
-        // clone 不重建）；发布失败绝不影响生命周期路径。计数器句柄为运维
-        // 观测面，metrics 接线前不持有。
-        let (event_publisher, _event_counters) =
+        // clone 不重建）；发布失败绝不影响生命周期路径。K05：计数器句柄由
+        // runtime 持有（观测面，metrics 接线点），不再弃置。
+        let (event_publisher, event_counters) =
             super::k8s_event_publisher::KubernetesEventPublisher::start(client.clone());
 
         Ok(Self {
             client,
+            event_counters,
             namespace: namespace.clone(),
             config: KubernetesRuntimeConfig {
                 namespace: namespace.clone(),
@@ -332,6 +335,7 @@ impl AgentContainerRuntime for KubernetesRuntime {
                 pod_cache: self.pod_cache.clone(),
                 subvolume_path_cache: self.subvolume_path_cache.clone(),
                 event_publisher: self.event_publisher.clone(),
+                event_counters: self.event_counters.clone(),
             };
             return tokio::spawn(async move {
                 let result = if params.resource_binding.is_some() {
@@ -675,6 +679,9 @@ mod create_lease_tests {
             pod_cache: Default::default(),
             subvolume_path_cache: Default::default(),
             event_publisher: Default::default(),
+            event_counters: Arc::new(
+                crate::runtime::k8s_event_publisher::PublisherCounters::default(),
+            ),
         }
     }
 

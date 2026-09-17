@@ -33,7 +33,7 @@ pub(crate) fn build_agent_env_vars(
     let mut env_vars = vec![
         EnvVar {
             name: "PROJECT_ID".to_string(),
-            value: Some(project_id_for_env),
+            value: Some(project_id_for_env.clone()),
             ..Default::default()
         },
         EnvVar {
@@ -53,6 +53,21 @@ pub(crate) fn build_agent_env_vars(
             ..Default::default()
         },
     ];
+    // R07：UserappBuilder 容器注入稳定状态根（app-cli 运行内核的操作记录/
+    // desired 持久化锚点，env 权威——dev 容器内 source/.run 轮换不漂移锁域；
+    // 路径=workspace 卷内专属 state 子目录，跨容器重建稳定）
+    if matches!(service_type, ServiceType::UserappBuilder) {
+        env_vars.push(EnvVar {
+            name: "APP_CLI_STATE_ROOT".to_string(),
+            value: Some(format!(
+                "{}/{}/state/{}",
+                shared_types::paths::USERAPP_DEV_HOME,
+                project_id_for_env,
+                project_id_for_env,
+            )),
+            ..Default::default()
+        });
+    }
     // 多租户环境变量（agent_runner 用于构建工作目录路径）
     if let Some(tid) = &params.tenant_id {
         env_vars.push(EnvVar {

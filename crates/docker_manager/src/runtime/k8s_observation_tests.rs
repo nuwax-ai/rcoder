@@ -559,7 +559,7 @@ async fn spawn_dual_stream_server() -> std::net::SocketAddr {
                         .expect("watch header");
                     // 静默挂起：不发任何事件，连接由测试结束时关闭
                     let mut idle = [0u8; 64];
-                    let _ =
+                    let _read =
                         tokio::time::timeout(Duration::from_secs(30), stream.read(&mut idle)).await;
                 } else {
                     let header = format!(

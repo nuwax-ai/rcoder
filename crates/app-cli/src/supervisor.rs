@@ -26,7 +26,8 @@ pub(crate) const ORCHESTRATOR_FAILURE_SERVICE: &str = "orchestrator";
 
 /// 编排主入口（legacy 直跑形态：一次性编排，无外部取消源）。
 pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result<()> {
-    run_inner(args, runtime_status, None, None, true).await
+    // 直跑形态（无操作上下文）：env 兜底（R08 显式 profile 仅经 server 形态）
+    run_inner(args, runtime_status, None, None, true, dev_run_profile()).await
 }
 
 /// 编排主入口（server 形态：`cancel` 触发 = 优雅停全部子服务后 Ok 返回，
@@ -38,6 +39,7 @@ pub async fn run_with_cancel(
     cancel: tokio_util::sync::CancellationToken,
     on_running: Option<tokio::sync::oneshot::Sender<()>>,
     run_migrations: bool,
+    dev_profile: bool,
 ) -> Result<()> {
     run_inner(
         &args,
@@ -45,6 +47,7 @@ pub async fn run_with_cancel(
         Some(cancel),
         on_running,
         run_migrations,
+        dev_profile,
     )
     .await
 }
@@ -61,6 +64,7 @@ async fn run_inner(
     cancel: Option<tokio_util::sync::CancellationToken>,
     on_running: Option<tokio::sync::oneshot::Sender<()>>,
     run_migrations: bool,
+    dev_profile: bool,
 ) -> Result<()> {
     runtime_status.set_ready(false);
     // 1. 自动发现子项目 + 组装服务清单
@@ -75,7 +79,8 @@ async fn run_inner(
         .cloned()
         .collect();
     // dev 形态编排信号：[devrun].command 优先、[run].command 兜底（源码态 dev 链路）。
-    let dev_profile = dev_run_profile();
+    // R08：dev_profile 由调用方显式传递（server 形态 = 本次操作的 Source
+    // 形态；直跑形态 = env 兜底）——不再在编排内部读 env
     if dev_profile {
         info!("🧪 dev run profile: services with [devrun] start via their dev command");
     }
@@ -537,7 +542,7 @@ pub(crate) async fn wait_for_service_ready_within(
 /// `APP_CLI_RUN_PROFILE=dev`。仅影响启动命令选择（[devrun] 优先、[run] 兜底），
 /// 端口注入/pingap/健康检查/拓扑与生产编排完全一致；未注入（生产 serve、
 /// 本地直跑）恒走 [run]——与既有行为逐字节一致。
-pub(crate) fn dev_run_profile() -> bool {
+pub fn dev_run_profile() -> bool {
     std::env::var("APP_CLI_RUN_PROFILE").as_deref() == Ok("dev")
 }
 

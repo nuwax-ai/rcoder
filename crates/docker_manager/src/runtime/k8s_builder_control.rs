@@ -345,6 +345,14 @@ impl KubernetesRuntime {
             };
             match observed {
                 BuilderObservation::Stopped => {
+                    // K04：最终权威复核共用观察的绝对 deadline——接近截止时
+                    // 出现的候选不得在复核阶段无界等待（GET hang/慢响应由
+                    // 剩余预算截断，超时按未知结果交上层保护，不当作缺席/稳定）。
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::K8sError(
+                            "Builder stop verification budget exhausted".into(),
+                        ));
+                    }
                     // 复核①：Pod 确已消失。同 UID 重现回到观察（STS 控制器
                     // 仍在终止窗口），异 UID 视为替换冲突。
                     match pods.get(&pod_name).await {
@@ -365,7 +373,13 @@ impl KubernetesRuntime {
                     }
                     // 复核②：STS 身份未替换且 replicas 保持 0。STS 整体消失
                     // （被带外删除）显式归类为冲突（K01）——捕获身份已不存在，
-                    // 不当作成功也不混入通用后端错误。
+                    // 不当作成功也不混入通用后端错误。K04：同样受绝对 deadline
+                    // 约束（复核①耗尽剩余预算时不再进入无界 GET）。
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::K8sError(
+                            "Builder stop verification budget exhausted".into(),
+                        ));
+                    }
                     let current = match sts_api.get(&workload.name).await {
                         Ok(current) => current,
                         Err(kube::Error::Api(error)) if error.code == 404 => {
@@ -388,11 +402,17 @@ impl KubernetesRuntime {
                     // RequestRejected 会让上层释放 mutating 并记 Failed，
                     // 丢失未知结果保护。复核冲突 = 不确定 → Conflict（上层
                     // 保留保护，操作转 RecoveryRequired）
-                    .map_err(|reason| Error::Conflict(reason))?;
+                    .map_err(Error::Conflict)?;
                     return Ok(None);
                 }
                 BuilderObservation::Ready(boxed) => {
                     let (info, captured) = *boxed;
+                    // K04：Ready 复核共用绝对 deadline（同上，不无界等待）
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::K8sError(
+                            "Builder readiness verification budget exhausted".into(),
+                        ));
+                    }
                     // 复核①：完成候选 Pod 仍是同一物理对象（UID 核验）。
                     let pod = pods
                         .get(&pod_name)
@@ -406,6 +426,12 @@ impl KubernetesRuntime {
                         ));
                     }
                     // 复核②：STS 身份未替换（wake 还须 replicas 保持 1）。
+                    // K04：预算耗尽时不进入无界 GET。
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::K8sError(
+                            "Builder readiness verification budget exhausted".into(),
+                        ));
+                    }
                     let current = sts_api
                         .get(&workload.name)
                         .await
@@ -419,7 +445,7 @@ impl KubernetesRuntime {
                     )
                     // K02：同上——写后（wake/restart 的 scale 写入已发生）复核
                     // 冲突保持未知结果保护，不当作写前拒绝
-                    .map_err(|reason| Error::Conflict(reason))?;
+                    .map_err(Error::Conflict)?;
                     return Ok(Some(info));
                 }
             }
@@ -1081,6 +1107,9 @@ mod tests {
             pod_cache: Default::default(),
             subvolume_path_cache: Default::default(),
             event_publisher: Default::default(),
+            event_counters: std::sync::Arc::new(
+                crate::runtime::k8s_event_publisher::PublisherCounters::default(),
+            ),
         };
         let target = BuilderControlTarget {
             resource_binding: wake.then(|| shared_types::UserAppResourceBinding {

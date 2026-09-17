@@ -127,6 +127,21 @@ impl KubernetesRuntime {
                 )),
                 ..Default::default()
             },
+            // R07：平台注入稳定状态根——app-cli 运行内核的操作记录/事件/
+            // desired 持久化锚点（env 权威：热部署换代 source/.run 目录被
+            // 轮换时同一锁域不漂移；缺省回退 workspace 卷根推导）。指向
+            // per-app 卷内专属子目录（prod/userapp/state/{app_id}），跨
+            // Pod 重建与热部署稳定。
+            EnvVar {
+                name: "APP_CLI_STATE_ROOT".to_string(),
+                value: Some(format!(
+                    "{}/{}/state/{}",
+                    shared_types::paths::USERAPP_DEV_HOME,
+                    app_id,
+                    app_id
+                )),
+                ..Default::default()
+            },
         ]);
 
         // ── Userapp prod 单卷四 subPath 压平挂载（与 dev builder 完全同构）──────
@@ -706,6 +721,9 @@ mod conditional_tests {
             pod_cache: Default::default(),
             subvolume_path_cache: Default::default(),
             event_publisher: Default::default(),
+            event_counters: Arc::new(
+                crate::runtime::k8s_event_publisher::PublisherCounters::default(),
+            ),
         }
     }
 
