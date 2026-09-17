@@ -1024,8 +1024,21 @@ async fn verify_identity_and_attach(
     exit(1);
 }
 
-/// serve 核心逻辑（无附着检测）：journal → API bind → 状态机主循环。
+/// serve 核心逻辑（无附着检测）：journal → OwnerGuard → API bind → 状态机主循环。
 async fn serve_without_attach(args: &CliArgs) -> Result<()> {
+    // OwnerGuard：跨进程排他锁（cross-platform.md §3）——在 API bind 前获取，
+    // 确保同一项目最多一个 owner。锁文件位于部署替换范围外的稳定状态根。
+    let application_id = std::env::var("PROJECT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "unknown-app".to_string());
+    let state_root = crate::runtime_kernel::RuntimeStore::resolve_root(
+        &args.workspace,
+        &application_id,
+    )?;
+    let _owner_guard = crate::platform::owner_guard::OwnerGuard::acquire(&state_root)
+        .context("acquire exclusive owner lock (another instance may be running)")?;
+
     let journal = Journal::open(&args.workspace)?;
     let ready = RuntimeStatusService::default();
     let mut initial_state = ServerState::new(ready.clone());
