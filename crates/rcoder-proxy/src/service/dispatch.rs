@@ -61,7 +61,6 @@ impl PortProxy {
                     original_uri,
                     params,
                     self.use_round_robin,
-                    &self.preview_slot,
                     ctx,
                 )
                 .await?;

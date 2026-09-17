@@ -30,7 +30,6 @@ pub async fn handle_port_proxy_request(
     original_uri: &http::Uri,
     params: Params<'_, '_>,
     use_round_robin: bool,
-    preview_slot: &Arc<ArcSwapOption<Arc<PreviewRouteDeps>>>,
     ctx: &mut TrackingCtx,
 ) -> PingoraResult<()> {
     // 从路径参数中提取端口
@@ -63,20 +62,20 @@ pub async fn handle_port_proxy_request(
     // （pingora 阶段序 upstream_peer 先于本函数所在的 upstream_request_filter，
     // peer 选择必须先行——历史上 resolve 放在本地导致非宿主副本在 peer 阶段
     // 连 127.0.0.1:4000 即 502，Forward 永无执行机会）。此处仅消费决策：
-    // 重写为内部入口 + 令牌头；无决策（未启用/Local/NotPreview/Unavailable）
-    // 走下方既有本机路径（行为与现状一致）。
-    if let Some((instance_id, preview_port)) = ctx.preview_rewrite.clone()
-        && let Some(deps) = preview_slot.load().as_ref()
-    {
-        let internal_path =
-            format!("/internal/preview-forward/{instance_id}/{preview_port}{target_path}");
-        let internal_uri = utils::rewrite_uri(original_uri, internal_path)?;
-        upstream_request.set_uri(internal_uri);
-        // 令牌头覆盖（客户端伪造值被替换为进程持有令牌）
-        upstream_request.insert_header("x-preview-internal-token", &deps.internal_token)?;
-        upstream_request.insert_header("Host", "127.0.0.1")?;
-        utils::set_common_headers(upstream_request)?;
-        return Ok(());
+    // 重写为内部入口 + 令牌头（take 一次性消费+token 由 peer 阶段写 ctx，
+    // 消除 ArcSwap 二次 load）；无决策走下方既有本机路径（行为与现状一致）。
+    if let Some(token) = ctx.preview_internal_token.take() {
+        if let Some((instance_id, preview_port)) = ctx.preview_rewrite.take() {
+            let internal_path =
+                format!("/internal/preview-forward/{instance_id}/{preview_port}{target_path}");
+            let internal_uri = utils::rewrite_uri(original_uri, internal_path)?;
+            upstream_request.set_uri(internal_uri);
+            // 令牌头覆盖（客户端伪造值被替换为进程持有令牌）
+            upstream_request.insert_header("x-preview-internal-token", &token)?;
+            upstream_request.insert_header("Host", "127.0.0.1")?;
+            utils::set_common_headers(upstream_request)?;
+            return Ok(());
+        }
     }
 
     // 设置 Host 头
@@ -145,6 +144,8 @@ pub async fn handle_port_proxy_upstream(
         let peer_port = deps.peer_proxy_port;
         ctx.preview_peer = Some((host_ip.clone(), peer_port));
         ctx.preview_rewrite = Some((instance_id, preview_port));
+        // token 一并写入 ctx——request 阶段直接消费，免 ArcSwap 二次 load
+        ctx.preview_internal_token = Some(deps.internal_token.clone());
         ctx.preview_origin_port = Some(target_port);
         ctx.target_port = Some(peer_port);
         let mut peer = HttpPeer::new((host_ip.as_str(), peer_port), false, "".to_string());

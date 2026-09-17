@@ -169,13 +169,12 @@ async fn run_upstream_phase(
 /// 跑一遍 upstream_request_filter 阶段（消费决策改写请求）。
 async fn run_request_phase(
     router: &Router<RouteType>,
-    slot: &Arc<arc_swap::ArcSwapOption<Arc<PreviewRouteDeps>>>,
     uri: &str,
     ctx: &mut TrackingCtx,
 ) -> pingora_http::RequestHeader {
     let (mut header, original) = make_request(uri);
     let matched = router.at(uri).expect("route match");
-    handle_port_proxy_request(&mut header, &original, matched.params, true, slot, ctx)
+    handle_port_proxy_request(&mut header, &original, matched.params, true, ctx)
         .await
         .expect("request phase");
     header
@@ -193,7 +192,7 @@ async fn run_both_phases(
     let router = create_router().expect("router");
     let mut ctx = TrackingCtx::new();
     let peer = run_upstream_phase(&router, slot, uri, &mut ctx).await;
-    let header = run_request_phase(&router, slot, uri, &mut ctx).await;
+    let header = run_request_phase(&router, uri, &mut ctx).await;
     (header, ctx, peer)
 }
 
@@ -218,21 +217,45 @@ fn preview_forward_route_registration_matrix() {
 /// 历史缺陷正是决策晚于 peer 选择，非宿主副本连 127.0.0.1:vite_port 即 502。
 #[tokio::test]
 async fn forward_decision_lands_in_upstream_peer_phase() {
+    let router = create_router().expect("router");
     let slot = slot_with(shared_types::PreviewRouteResolution::Forward {
         instance_id: "inst-1".into(),
         port: 4200,
         host_ip: "10.1.2.3".into(),
     });
-    let (_header, ctx, peer) = run_both_phases(&slot, "/proxy/4200/page/index.html?a=1").await;
+    // 仅跑 peer 阶段——验证决策产物在 ctx 中就绪
+    let mut ctx = TrackingCtx::new();
+    let peer =
+        run_upstream_phase(&router, &slot, "/proxy/4200/page/index.html?a=1", &mut ctx).await;
 
-    // 决策产物在 peer 阶段就绪（后续 request 阶段只消费）
     assert_eq!(ctx.preview_peer, Some(("10.1.2.3".to_string(), 8088)));
     assert_eq!(ctx.preview_rewrite, Some(("inst-1".into(), 4200)));
     assert_eq!(ctx.preview_origin_port, Some(4200));
     assert_eq!(ctx.target_port, Some(8088));
     assert_eq!(ctx.upstream_host.as_deref(), Some("10.1.2.3"));
-    // peer 本身指向宿主 Pingora 面（非 127.0.0.1:4200 回环）
+    assert_eq!(
+        ctx.preview_internal_token.as_deref(),
+        Some("unit-test-token"),
+        "token 由 peer 阶段写入 ctx，request 阶段直接消费"
+    );
     assert_eq!(peer.to_string(), "addr: 10.1.2.3:8088, scheme: HTTP");
+
+    // request 阶段消费：take() 一次性清空 ctx 中的 preview 状态
+    let header = run_request_phase(&router, "/proxy/4200/page/index.html?a=1", &mut ctx).await;
+    assert_eq!(
+        header.uri.path(),
+        "/internal/preview-forward/inst-1/4200/page/index.html"
+    );
+    assert_eq!(
+        header
+            .headers
+            .get("x-preview-internal-token")
+            .and_then(|v| v.to_str().ok()),
+        Some("unit-test-token"),
+        "客户端伪造令牌被进程令牌覆盖"
+    );
+    assert!(ctx.preview_rewrite.is_none(), "take() 已消费");
+    assert!(ctx.preview_internal_token.is_none(), "take() 已消费");
 }
 
 #[tokio::test]
@@ -257,6 +280,9 @@ async fn forward_rewrite_consumes_upstream_decision() {
         Some("unit-test-token"),
         "客户端伪造令牌被进程令牌覆盖"
     );
+    // take() 一次性消费：request 阶段后 ctx 应为空（防止重复消费或内存泄漏）
+    assert!(_ctx.preview_rewrite.is_none(), "take() 已消费");
+    assert!(_ctx.preview_internal_token.is_none(), "take() 已消费");
 }
 
 #[tokio::test]
@@ -281,7 +307,7 @@ async fn legacy_path_when_not_forwarded() {
         );
         assert!(ctx.preview_peer.is_none(), "不覆盖上游");
         assert!(ctx.preview_rewrite.is_none(), "不产生重写要素");
-        let header = run_request_phase(&router, &slot, "/proxy/4200/page/", &mut ctx).await;
+        let header = run_request_phase(&router, "/proxy/4200/page/", &mut ctx).await;
         assert_eq!(header.uri.path(), "/page/", "路径照旧剥离端口前缀");
     }
 }
@@ -293,7 +319,7 @@ async fn legacy_path_when_slot_empty() {
     let mut ctx = TrackingCtx::new();
     let peer = run_upstream_phase(&router, &slot, "/proxy/4200/page/", &mut ctx).await;
     assert_eq!(peer.to_string(), "addr: 127.0.0.1:4200, scheme: HTTP");
-    let header = run_request_phase(&router, &slot, "/proxy/4200/page/", &mut ctx).await;
+    let header = run_request_phase(&router, "/proxy/4200/page/", &mut ctx).await;
     assert_eq!(header.uri.path(), "/page/");
     assert!(ctx.preview_peer.is_none());
 }

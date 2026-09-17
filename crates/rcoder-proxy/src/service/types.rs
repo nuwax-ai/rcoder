@@ -234,7 +234,11 @@ pub struct TrackingCtx {
     /// 预览跨 Pod 转发的路径重写要素 (instance_id, preview_port)——与
     /// preview_peer 同点（upstream_peer 阶段）产出，upstream_request_filter
     /// 阶段消费为 `/internal/preview-forward/{instance}/{port}{path}` + 令牌头。
+    /// 用 `take()` 一次性消费（request 阶段不再 load slot 二次读取令牌）。
     pub preview_rewrite: Option<(String, u16)>,
+    /// 预览内部令牌——peer 阶段从 deps 取出写入，request 阶段直接消费
+    /// （避免 ArcSwap 二次 load；token 与决策同批次、同值保证一致性）。
+    pub preview_internal_token: Option<String>,
     /// 预览转发校验已过的 vite 端口（internal/preview-forward 路由用，
     /// request_filter 校验通过后记录，后续阶段免重复校验）。
     pub preview_forward_port: Option<u16>,
@@ -263,6 +267,7 @@ impl TrackingCtx {
             error_body_buf: Vec::new(),
             preview_peer: None,
             preview_rewrite: None,
+            preview_internal_token: None,
             preview_forward_port: None,
             preview_origin_port: None,
         }
