@@ -15,9 +15,6 @@ pub mod grpc;
 pub mod handler;
 pub mod model;
 pub mod otel_tracing; // 🔥 设为 public，供其他模块使用
-/// Pyroscope Profiler（`pyroscope` feature 专用）
-#[cfg(feature = "pyroscope")]
-pub mod profiler;
 pub mod proxy_agent;
 pub mod router;
 pub mod service; // 🔥 设为 public，供测试使用

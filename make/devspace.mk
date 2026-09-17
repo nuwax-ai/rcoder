@@ -67,7 +67,7 @@ devspace-test:
 # Run rcoder service in K8s container (simplified command)
 k8s-run:
 	@echo "Running rcoder service in K8s container..."
-	@devspace enter --namespace=rcoder-dev -- bash -c 'cd /app && CONTAINER_RUNTIME=kubernetes cargo run --bin rcoder --features ebpf-debug,pyroscope,otel,debug,kubernetes -- --port 8290'
+	@devspace enter --namespace=rcoder-dev -- bash -c 'cd /app && CONTAINER_RUNTIME=kubernetes cargo run --bin rcoder --features otel,debug,hotpath,dial9,kubernetes -- --port 8290'
 
 # Run rcoder service in container (execute inside container)
 run-in-container:
@@ -75,7 +75,7 @@ run-in-container:
 	@pkill rcoder 2>/dev/null || true
 	@sleep 2
 	@echo "Starting rcoder service in container..."
-	@cd /app && CONTAINER_RUNTIME=kubernetes cargo run --bin rcoder --features ebpf-debug,pyroscope,otel,debug,kubernetes -- --port 8290
+	@cd /app && CONTAINER_RUNTIME=kubernetes cargo run --bin rcoder --features otel,debug,hotpath,dial9,kubernetes -- --port 8290
 
 # Display DevSpace help
 devspace-help:

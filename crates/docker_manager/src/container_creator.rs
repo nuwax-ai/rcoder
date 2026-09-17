@@ -555,29 +555,10 @@ fn build_mounts(
 ///
 /// 将 HashMap 转换为 Docker 的 "KEY=VALUE" 格式
 fn build_env_vars(env_vars: HashMap<String, String>) -> Vec<String> {
-    #[allow(unused_mut)]
-    let mut vars: Vec<String> = env_vars
+    env_vars
         .into_iter()
         .map(|(k, v)| format!("{}={}", k, v))
-        .collect();
-
-    // eBPF 调试模式：启用自动火焰图和持续剖析
-    #[cfg(feature = "ebpf-debug")]
-    {
-        vars.push("SAMPLE_DURATION=30".to_string());
-        vars.push("GENERATE_INTERVAL=60".to_string());
-        vars.push("MAX_FLAMEFILES=50".to_string());
-        vars.push("MAX_OFFCPU_FILES=50".to_string());
-        vars.push("ENABLE_EBPF_AUTO_FLAMEGRAPH=true".to_string());
-        vars.push("ENABLE_ALLOY=true".to_string());
-        vars.push("PYROSCOPE_URL=http://pyroscope:4040".to_string());
-        vars.push("ENABLE_OFFCPUTIME=true".to_string());
-        vars.push("OFFCPU_DURATION=30".to_string());
-        vars.push("OFFCPU_INTERVAL=60".to_string());
-        vars.push("ENABLE_SYSCALL_MONITOR=true".to_string());
-    }
-
-    vars
+        .collect()
 }
 
 /// 构建端口映射
@@ -612,26 +593,13 @@ fn build_host_config(
         ..Default::default()
     };
 
-    // 应用安全配置：security 块（运维显式配置）优先级最高，覆盖 ebpf-debug feature 与内置默认。
-    // - None：走代码默认（ebpf-debug 时 privileged=true+cap_add=[SYS_ADMIN,NET_ADMIN,SYS_PTRACE]；
-    //   否则 privileged=false+cap_drop=[NET_RAW,NET_ADMIN]），与历史行为完全一致。
+    // 应用安全配置：security 块（运维显式配置）优先级最高，覆盖内置默认。
+    // - None：走代码默认（privileged=false + cap_drop=[NET_RAW,NET_ADMIN]）。
     // - Some(sec)：字段级覆盖——sec 内 Some(x) 用 x，字段未写（None）回退该字段内置默认。运维自负其责。
     match security {
         None => {
-            #[cfg(feature = "ebpf-debug")]
-            {
-                config.privileged = Some(true);
-                config.cap_add = Some(vec![
-                    "SYS_ADMIN".to_string(),
-                    "NET_ADMIN".to_string(),
-                    "SYS_PTRACE".to_string(),
-                ]);
-            }
-            #[cfg(not(feature = "ebpf-debug"))]
-            {
-                config.privileged = Some(false);
-                config.cap_drop = Some(vec!["NET_RAW".to_string(), "NET_ADMIN".to_string()]);
-            }
+            config.privileged = Some(false);
+            config.cap_drop = Some(vec!["NET_RAW".to_string(), "NET_ADMIN".to_string()]);
         }
         Some(sec) => {
             config.privileged = Some(sec.privileged.unwrap_or(false));
@@ -733,9 +701,8 @@ mod tests {
         assert!(validate_builder_reuse(&details, &expected, "builder:one").is_err());
     }
 
-    /// security = None（未配置 security 块）→ 走代码默认（非 ebpf-debug：
-    /// privileged=false + cap_drop=[NET_RAW,NET_ADMIN]，security_opt/cap_add 为 None）
-    #[cfg(not(feature = "ebpf-debug"))]
+    /// security = None（未配置 security 块）→ 走代码默认
+    /// （privileged=false + cap_drop=[NET_RAW,NET_ADMIN]，security_opt/cap_add 为 None）
     #[test]
     fn test_security_none_uses_defaults() {
         let hc = build_host_config(vec![], HashMap::new(), false, None, None);

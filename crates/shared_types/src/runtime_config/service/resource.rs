@@ -35,8 +35,8 @@ pub struct ServiceResourceLimits {
 /// 字段语义与 Docker `HostConfig` / docker-compose.yml 一致，运维可直接照搬 compose 写法。
 /// 合并语义（在 docker_manager 的 `build_host_config` 中应用）：
 /// - `ServiceImageConfig.security = None`（未配置 security 块）→ 完全走代码默认逻辑
-///   （`privileged=false` + `cap_drop=[NET_RAW,NET_ADMIN]`，受 `ebpf-debug` feature 影响）。
-/// - `security = Some`（配置了 security 块）→ 该配置覆盖一切（含 `ebpf-debug`）；
+///   （`privileged=false` + `cap_drop=[NET_RAW,NET_ADMIN]`）。
+/// - `security = Some`（配置了 security 块）→ 该配置覆盖代码默认；
 ///   块内每个字段 `Some(x)` 用 x，字段未写（`None`）回退到该字段的内置默认。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceSecurityConfig {

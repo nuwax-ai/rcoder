@@ -37,10 +37,7 @@ test-blocking = []  # 启用测试用阻塞注入 (用于极端场景测试)
 # OpenTelemetry 追踪 feature
 otel = []  # 启用 OpenTelemetry 追踪功能
 
-# Pyroscope 连续性能分析
-pyroscope = ["dep:pyroscope"]
-
-# Hotpath 本地性能剖析（hotpath-rs；仅本地开发，不进 default，与 pyroscope 可共存）。
+# Hotpath 本地性能剖析（hotpath-rs；仅本地开发，不进 default）。
 # feature 关闭时 hotpath 宏全部 no-op、零依赖编译，代码里宏裸用不配 cfg。
 # axum-0-8 供 http_server/router.rs 装配处 hotpath::axum!（关闭时原样返回 router）；
 # tokio 供 hotpath::tokio_runtime!() runtime 指标线程。
@@ -158,9 +155,6 @@ arc-swap = { workspace = true }
 
 # WebSocket：终端中间层（接浏览器 + 连本地 ttyd）+ noVNC 代理可用性检查
 tokio-tungstenite = { workspace = true }
-
-# Pyroscope Continuous Profiling
-pyroscope = { workspace = true, optional = true }
 
 # 本地性能剖析（hotpath-rs）：非 optional，feature 由上方 hotpath* 打开内部特性
 hotpath = { workspace = true }

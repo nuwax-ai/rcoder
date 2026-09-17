@@ -131,9 +131,9 @@ metrics 直方图 p50=3.1s / p99=10s，folded 里 max 仅 67ms（差 150 倍）�
 
 其原有职责的承接：**耗时** → SpanMetricsLayer 直方图（/metrics）；**调用结构 +
 正确耗时的火焰图/瀑布** → OTLP → Tempo（Grafana Explore 自带 Flame graph 视图）；
-**事件级 async 行为** → dial9（Pyroscope 持续剖析链已随批次1下线；CPU 采样
-可按需开 dial9 cpu-profiling feature，需 frame pointers）。eBPF 诊断火焰图
-（`ebpf-tools/`）与此无关，保留。
+**事件级 async 行为** → dial9（Pyroscope/eBPF 持续剖析链已下线；CPU 采样可按需
+开 dial9 cpu-profiling feature，需 frame pointers）。容器内手动诊断保留
+bpftrace/strace/sysstat/jq（需在 config.yml services.security 显式提权）。
 
 ## span 耗时指标（SpanMetricsLayer，精确计时）
 

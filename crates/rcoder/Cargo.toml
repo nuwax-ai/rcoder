@@ -36,11 +36,6 @@ hotpath-mcp = ["hotpath", "hotpath/hotpath-mcp"]
 # release 不启用=零代码零开销。
 dial9 = ["dep:dial9"]
 
-# 🔧 eBPF 调试模式：启用容器特权，允许使用 eBPF 诊断工具
-# 警告：仅在开发调试时使用，生产环境请勿启用
-# 此 feature 会传递给 docker_manager crate
-ebpf-debug = ["docker_manager/ebpf-debug"]
-
 # Kubernetes 支持：启用 Kubernetes 运行时模式
 # 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
 userapp-sqlite = ["rcoder-storage/sqlite"]

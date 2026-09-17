@@ -123,26 +123,6 @@ async fn agent_runner_run(cli_args: CliArgs) -> anyhow::Result<()> {
         tokio::runtime::Handle::current().metrics().num_workers()
     );
 
-    // 🆕 Pyroscope Profiler 初始化（可选：需要 pyroscope feature）
-    #[cfg(feature = "pyroscope")]
-    let _pyroscope_guard: Option<agent_runner::profiler::ProfilerGuard> = {
-        info!("Pyroscope profiling feature enabled");
-        match agent_runner::profiler::init_pyroscope_profiler_default() {
-            Ok(guard) => {
-                info!("Pyroscope profiler initialized successfully");
-                Some(guard)
-            }
-            Err(e) => {
-                warn!("Failed to initialize Pyroscope profiler: {}", e);
-                warn!("Continuing without Pyroscope profiling");
-                None
-            }
-        }
-    };
-
-    #[cfg(not(feature = "pyroscope"))]
-    let _pyroscope_guard: Option<()> = None;
-
     info!("Starting rcoder - AI-powered development platform");
     info!("agent-runner version: {}", env!("CARGO_PKG_VERSION"));
 

@@ -345,9 +345,6 @@ file-server-userapp = { path = "crates/file-server-userapp" }
 file-server-proxy = { path = "crates/file-server-proxy" }
 model_probe = { path = "crates/model_probe" }
 
-# Pyroscope Continuous Profiling
-pyroscope = { version = "2.1", features = ["backend-pprof-rs"] }
-
 # Hotpath 本地性能剖析（hotpath-rs，本地开发观测；见 AGENTS.md「AI 调试路由」）。
 # 非 optional（官方推荐）：不开 feature 时宏全 no-op、内部依赖零编译；
 # 不进 default features → 生产构建（build-agent-docker）完全无感。
