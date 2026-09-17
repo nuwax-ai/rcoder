@@ -71,3 +71,13 @@ Windows 环境准备：choco 安装 cmake 4.4.3 + VS2022 BuildTools (VCTools)；
 | B03/B04 | `936b8cf6`/`1fcc3860` | docker_manager 85+207（双 feature）；注入链单元反例 | managed E2E（镜像重建后 Compose） |
 | R10 | `3b931eb8` | app_manager 194/195（1 既有环境项） | K8s 部署预算实测 |
 | 全 workspace | `3b931eb8` | 见下方本轮汇总行 | — |
+
+### 2026-09-18 三平台矩阵（本轮改动复验）
+
+| 平台 | 机器 | 命令 | 结果 |
+|---|---|---|---|
+| macOS ARM64 | 本地 | cargo nextest --all-features | 207/207 ✅ |
+| Linux x86_64 | 192.168.32.131 | cargo test --all-features（源码 rsync 同步；首跑为陈旧指纹误报，touch 重建后全绿） | 207/207 ✅ |
+| Windows x64 MSVC | 192.168.32.53 | cargo test --all-features（tar-over-ssh 同步） | **179 pass / 4 fail——四项全部为既有 N02 平台缺口**（zip symlink 需 Unix 运行时、proxy 路径校验对 Windows 整体跳过、svc_spec `\` 分隔符拼接），本轮未触碰这三文件（git diff 归因为空），与本轮改动无关 |
+
+本轮 R01 树测试/编排链/进程组收束/R09 布局契约在 Linux 全过；Windows 的进程树/生命周期测试（win 专属集合）全过。
