@@ -228,3 +228,49 @@ fn pingap_failure_emits_single_done_and_exits_non_zero() {
         "service-level failures must be preserved in the same Done: {done_line}"
     );
 }
+
+/// P1-01 强化：admin 端口被占 + APP_DEPLOY_URL 设置（deploy_requested=true）
+/// → legacy 形态在 deploy_stage 之前 fail-fast：非零退出、无任何部署副作用
+/// （不创建 .incoming/.staging/.deploy-state.toml）。
+///
+/// 旧版 main.rs 的执行顺序是 deploy_stage → bind，导致 deploy_stage 先于
+/// 端口检查执行并可能修改运行目录。修复后 bind → deploy_stage，端口冲突
+/// 在一切副作用前 fail-fast。
+#[test]
+fn legacy_deploy_url_with_port_conflict_has_no_deploy_side_effects() {
+    let (_dir, workspace) = temp_workspace();
+    write_lock(&workspace, MINIMAL_LOCK);
+    let (_hold, address) = reserve_port();
+    let logs = workspace.parent().unwrap().join("logs");
+    let mut command = base_command(&workspace, &logs, &address);
+    // 注入部署三元组：deploy_requested() = true（旧版会进入 deploy_stage）
+    command
+        .env("APP_DEPLOY_URL", "http://127.0.0.1:1/nonexistent.zip")
+        .env("APP_RELEASE_ID", "test-release")
+        .env("APP_DEPLOY_GENERATION_ID", "test-gen");
+    let volume_root = workspace.parent().unwrap();
+    let output = run_to_exit(command, Duration::from_secs(30));
+    assert!(
+        !output.status.success(),
+        "deploy URL + bind conflict must exit non-zero; stdout+stderr: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // 关键断言：无部署副作用——.incoming/.staging/.deploy-state.toml 不应存在
+    assert!(
+        !volume_root.join(".incoming").exists(),
+        "deploy stage must not create .incoming when API bind fails first"
+    );
+    assert!(
+        !volume_root.join(".staging").exists(),
+        "deploy stage must not create .staging when API bind fails first"
+    );
+    assert!(
+        !volume_root.join(".deploy-state.toml").exists(),
+        "deploy stage must not create .deploy-state.toml when API bind fails first"
+    );
+    assert_eq!(
+        done_event_count(&output.stdout),
+        0,
+        "no orchestration must run when API bind fails"
+    );
+}

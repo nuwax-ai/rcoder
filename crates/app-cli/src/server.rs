@@ -493,6 +493,7 @@ impl ServerState {
     }
 
     /// 清除部署进度（部署结束/重启时重置）。
+    #[allow(dead_code)] // 由部署结束/重启路径消费（batch 2b/2c 进度协议）
     pub(crate) fn clear_deploy_progress(&self) {
         let mut status = self
             .deploy_status

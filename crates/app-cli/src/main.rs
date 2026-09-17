@@ -33,35 +33,9 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let runtime_status = app_cli::runtime_status::RuntimeStatusService::default();
-
-    // init tracing：stderr + 文件（daily 轮转 + non-blocking，_guard 保活到 main 退出）
-    let _guard = init_tracing(&args.log_dir);
-
-    tracing::info!(
-        "app-cli starting: workspace={} log_dir={} admin={} pingap_bin={}",
-        args.workspace.display(),
-        args.log_dir.display(),
-        args.admin_addr,
-        args.pingap_bin.display()
-    );
-
-    // 部署段归属：**serve 形态（生产容器）由 server 状态机内执行**——api 先 bind
-    // （Idle 态常驻，/health 恒 200 天然覆盖 kubelet liveness，取代 LivenessHold
-    // 端口托管），随后 InitialAction::Deploy 在 Deploying 相位内下载/校验/解压/换
-    // code：下载期 /v1/deploy/status 可查（rcoder 等待点），失败进 Failed 相位
-    // 常驻可查（进程不退出，supervisord 不重启循环、kubelet 不杀容器，现场保留）。
-    //
-    // **仅 legacy 直跑形态（None 分支）仍前置 deploy_stage**：无 server 状态机，
-    // 失败语义维持进程退出非零 → supervisord 重试。
-    // run-service 是已编排服务的 exec 载体，恒不执行部署段（容器 env 恒带
-    // APP_DEPLOY_URL 三元组——serve 的部署种子，换 Pod 模式每次更新；run-service
-    // 若也执行部署段会二次部署（move code 到 .previous 跨卷 link 失败 exit 1
-    // → supervisord SPAWN_ERROR，全部 app-svc-* 拉不起来）。
-    // build 是本地编译工具，无运行时副作用，不进部署段（已在前置本地分派返回）。
+    // legacy 直跑形态（无子命令）：P1-01 修复——API 先于 deploy_stage 绑定3010。
+    // 子命令分派（Build 已在 init_tracing 前分派）。
     match &args.command {
-        // 结构性不可达（Build 在 init_tracing 前已分派）；与 run-service 的
-        // unreachable 同款：守住 match 穷尽性，防止后续重构把分派挪走后静默走错路径。
         Some(app_cli::config::Command::Build { .. }) => {
             unreachable!("build dispatched before tracing init")
         }
@@ -78,28 +52,38 @@ async fn main() -> anyhow::Result<()> {
             }
             unreachable!("exec replaced process image");
         }
-        None => {
-            deploy_stage(&args).await?;
-        }
+        None => {} // legacy 直跑路径：下方继续
     }
 
-    // idle 判定：未部署（无 release.lock——start 无 url 创建的空容器）→ 最小形态
-    // 常驻应答探针（防 kubelet liveness 杀容器），等 start{url} 部署换 Pod 替换本
-    // 进程。lock 存在但损坏不进 idle——走下方正常链 fail-fast（supervisord 重试
-    // 后 FATAL，损坏 lock 是需人工介入的异常态，静默 idle 会掩盖问题）。
-    if !tokio::fs::try_exists(args.workspace.join("release.lock.toml"))
-        .await
-        .unwrap_or(false)
+    // ── legacy 直跑路径 ──
+    let runtime_status = app_cli::runtime_status::RuntimeStatusService::default();
+
+    // init tracing：stderr + 文件（daily 轮转 + non-blocking，_guard 保活到 main 退出）
+    let _guard = init_tracing(&args.log_dir);
+
+    tracing::info!(
+        "app-cli starting: workspace={} log_dir={} admin={} pingap_bin={}",
+        args.workspace.display(),
+        args.log_dir.display(),
+        args.admin_addr,
+        args.pingap_bin.display()
+    );
+
+    // idle 判定（仅无部署请求且无 release.lock 时进入）——无副作用常驻探针。
+    // deploy_requested() 检查不涉及3010，可在 bind 前安全调用。
+    if !app_cli::deploy::deploy_requested()
+        && !tokio::fs::try_exists(args.workspace.join("release.lock.toml"))
+            .await
+            .unwrap_or(false)
     {
         app_cli::idle::serve_forever(&args.admin_addr).await;
-        return Ok(()); // 仅 SIGTERM（容器终止/被替换）到达
+        return Ok(());
     }
 
-    // 管理 API 预绑定（P1-01）：bind 成功才进入 supervisor 编排——端口冲突等
-    // 失败在一切业务副作用之前 fail-fast（非零退出，不 spawn 任何用户服务）。
-    // legacy 直跑形态无恢复窗口：bind 成功即开放写端点受理。
-    // legacy 形态以静态 ServerState 承载（读 lock 后直接 Running 相位，readiness
-    // 跟随 runtime_status）
+    // 管理 API 预绑定（P1-01）：bind 成功才进入 deploy_stage/supervisor——
+    // 端口冲突在一切业务副作用之前 fail-fast（非零退出，不下载制品、不 spawn
+    // 任何用户服务）。legacy 形态以静态 ServerState 承载（初始化期 /v1/deploy
+    // 等写端点由 initializing 门控拒绝，/health 恒200覆盖 kubelet liveness）。
     let legacy_state =
         std::sync::Arc::new(app_cli::server::ServerState::new(runtime_status.clone()));
     if let Ok(release) = app_cli::manifest::read_release_lock(&args.workspace) {
@@ -119,10 +103,6 @@ async fn main() -> anyhow::Result<()> {
         api_state,
     )
     .await?;
-    legacy_state.mark_initialized();
-    // API serve future 监督：结束（故障或 listener 关闭）→ cancel → supervisor
-    // 与信号同路径优雅收尾 → main 携 API 错误非零退出。正常关停路径 task 被
-    // abort，不产生记录——无管理面的运行态不可静默存活。
     let api_failure = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let api_monitor_failure = api_failure.clone();
     let supervisor_cancel = tokio_util::sync::CancellationToken::new();
@@ -140,9 +120,15 @@ async fn main() -> anyhow::Result<()> {
         api_cancel.cancel();
     });
 
+    // 部署段（仅 env 有 APP_DEPLOY_URL 时执行）：API 已绑定3010，kubelet
+    // liveness 由 /health 覆盖；deploy 期间 /ready 503（initializing 门控）。
+    // bind 失败已在上文 fail-fast，此处无端口冲突风险。
+    deploy_stage(&args).await?;
+    // deploy 成功后开放写端点（supervisor 接管业务前初始化完成）
+    legacy_state.mark_initialized();
+
     // supervisor（前台阻塞，退出 → main 退出 → supervisor [program:app] 重启）。
-    // P1-02：保留原始错误——supervisor Err 决定进程退出码（旧版只记日志并返回
-    // Ok，退出码恒 0，编排器早崩对父进程监督不可见）。
+    // P1-02：保留原始错误——supervisor Err 决定进程退出码。
     let supervisor_result = app_cli::supervisor::run_with_cancel(
         args.clone(),
         runtime_status,
@@ -202,29 +188,14 @@ fn init_tracing(log_dir: &std::path::Path) -> Arc<tracing_appender::non_blocking
     guard
 }
 
-/// 部署段（**仅 legacy 直跑形态**）：env 有 `APP_DEPLOY_URL` 才执行；
-/// liveness 托管占位 3010 防下载窗口 kubelet 误杀，失败上抛（supervisord 重试）。
-/// serve 形态不走本函数——部署段在 server 状态机 Deploying 相位内执行
-/// （见上方 match 注释）。
+/// 部署段（**仅 legacy 直跑形态**）：env 有 `APP_DEPLOY_URL` 才执行。
+/// API 已在本函数调用前绑定3010（P1-01），kubelet liveness 由 /health
+/// 覆盖，/ready 在初始化期间503（initializing 门控）。不再需要 LivenessHold。
 async fn deploy_stage(args: &app_cli::CliArgs) -> anyhow::Result<()> {
     if !app_cli::deploy::deploy_requested() {
         return Ok(());
     }
-    // 占位失败（端口被占等）不阻断部署本身：warn 后裸跑（最坏 liveness 抖动）
-    let hold = match app_cli::deploy::LivenessHold::start(&args.admin_addr) {
-        Ok(hold) => Some(hold),
-        Err(e) => {
-            tracing::warn!(
-                "liveness hold bind {} failed, deploy continues without hold: {e:#}",
-                args.admin_addr
-            );
-            None
-        }
-    };
     let deploy_result = app_cli::deploy::run_from_env(&args.workspace).await;
-    if let Some(hold) = hold {
-        hold.release().await;
-    }
     if let Err(e) = deploy_result {
         tracing::error!("❌ deploy stage failed: {e:#}");
         anyhow::bail!("deploy stage failed");

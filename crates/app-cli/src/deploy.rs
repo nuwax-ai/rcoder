@@ -84,12 +84,11 @@ pub fn request_from_env() -> Result<crate::server::DeployRequest> {
     })
 }
 
-/// 部署期间的 liveness 端口托管。
+/// 部署期间的 liveness 端口托管（已退役——P1-01 修复后 API 先于 deploy_stage
+/// 绑定，/health 恒200天然覆盖 kubelet liveness，不再需要独立占位）。
 ///
-/// 首次部署时 `/app/code` 尚不存在，api::serve（读 release.lock）无法启动，
-/// :3010 无人应答 → kubelet liveness 在大制品下载窗口误杀容器。
-/// 本托管在 deploy 前绑定 :3010：`/health` 200（进程活）、`/ready` 503
-/// （未就绪摘流），deploy 结束（无论成败）后释放端口交还 api::serve。
+/// 保留结构定义作为设计参考。
+#[allow(dead_code)]
 pub struct LivenessHold {
     task: tokio::task::JoinHandle<()>,
 }
