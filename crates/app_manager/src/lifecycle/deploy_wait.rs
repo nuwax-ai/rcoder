@@ -114,7 +114,22 @@ impl AppService {
         let budget = &self.config.deploy_budget;
         let mut client: Option<reqwest::Client> = None;
         let now = tokio::time::Instant::now();
-        let absolute_deadline = now + Duration::from_secs(budget.absolute_budget_secs);
+        // R10：bind-once 持久 deadline 单一预算——首次执行与恢复重放共用
+        // 受理时绑定的同一截止时间（不重开 now+预算 窗口截断/放宽语义）；
+        // 无绑定记录（legacy/防御路径）退配置兜底。
+        let absolute_deadline = match self
+            .metadata
+            .store
+            .operation_deadline(app_id, operation_id)
+            .await
+        {
+            Ok(Some(deadline_ms)) => {
+                let now_epoch_ms = chrono::Utc::now().timestamp_millis();
+                let remaining_ms = (deadline_ms - now_epoch_ms).max(0) as u64;
+                tokio::time::Instant::now() + Duration::from_millis(remaining_ms)
+            }
+            _ => now + Duration::from_secs(budget.absolute_budget_secs),
+        };
         // pre_appcli 阶段预算（app-cli 未响应时的默认超时）
         let pre_appcli_budget = Duration::from_secs(budget.pre_appcli_stage_budget_secs);
         let no_progress_budget = Duration::from_secs(budget.no_progress_timeout_secs);

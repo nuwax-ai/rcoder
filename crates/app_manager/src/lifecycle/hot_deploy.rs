@@ -29,11 +29,16 @@ use crate::service::AppService;
 
 /// 热部署受理/轮询端口（app-cli 管理 API 常量对齐）。
 const APP_CLI_ADMIN_PORT: u16 = shared_types::APP_CLI_ADMIN_PORT;
-/// 轮询间隔/预算（对齐冷部署链部署段等待的量级）。
+/// 轮询间隔（对齐冷部署链部署段等待的量级）。
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 #[allow(dead_code)]
 const HOT_DEPLOY_BUDGET: Duration = Duration::from_secs(300);
-const HOT_RECONCILIATION_BUDGET: Duration = Duration::from_secs(30 * 60);
+
+/// R10：热部署协调预算与冷部署同一配置事实源（deploy_budget.
+/// absolute_budget_secs）——固定 1800s 常量无法兑现配置的预算护栏。
+fn hot_reconciliation_budget(config: &crate::config::DeployBudgetConfig) -> Duration {
+    Duration::from_secs(config.absolute_budget_secs.max(1))
+}
 
 /// Artifact identity passed together so the hot coordinator cannot mix releases.
 pub(crate) struct HotArtifact<'a> {
@@ -169,6 +174,8 @@ impl AppService {
             .ok_or_else(|| {
                 AppOperationError::Backend("hot deployment generation missing".into())
             })?;
+        // R10：预算来自配置（与冷部署同源），不再固定 1800s
+        let budget = hot_reconciliation_budget(&self.config.deploy_budget);
         let task = HotDeploymentTask {
             runtime: self.runtime.clone(),
             access_mode: self.config.access_mode,
@@ -182,11 +189,12 @@ impl AppService {
             generation_id,
             operation_id: operation_id.to_owned(),
             operation,
+            budget,
         };
         // Reconciliation may take up to the full stage budget; the HTTP caller's
         // 300s response timeout is handled by spawning the task and discarding the
         // JoinHandle after the caller gives up (see start_hot_deploy).
-        tokio::time::timeout(HOT_RECONCILIATION_BUDGET, task.execute())
+        tokio::time::timeout(budget, task.execute())
             .await
             .map_err(|_| {
                 AppOperationError::Backend("Hot deployment execution deadline exceeded".into())
@@ -221,6 +229,8 @@ struct HotDeploymentTask {
     generation_id: String,
     operation_id: String,
     operation: Arc<crate::service::AppOperationGuard>,
+    /// R10：协调预算（受理时从 config 解析传入——execute 上下文无 config）
+    budget: Duration,
 }
 
 impl HotDeploymentTask {
@@ -250,6 +260,7 @@ impl HotDeploymentTask {
             generation_id,
             operation_id,
             operation,
+            budget,
         } = self;
         let access_mode = *access_mode;
         let body = serde_json::json!({
@@ -299,7 +310,8 @@ impl HotDeploymentTask {
 
         // Completion requires the matched operation and independent business readiness.
         let client = admin_client()?;
-        let deadline = tokio::time::Instant::now() + HOT_RECONCILIATION_BUDGET;
+        // R10：受理时绑定的同一预算（config 事实源；不再固定 1800s）
+        let deadline = tokio::time::Instant::now() + *budget;
         loop {
             if tokio::time::Instant::now() >= deadline {
                 return Err(AppOperationError::Backend(
@@ -902,6 +914,7 @@ mod tests {
                 generation_id: "generation".into(),
                 operation_id: "operation".into(),
                 operation: Arc::new(guard),
+                budget: std::time::Duration::from_secs(300),
             };
             let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
             let caller = tokio::spawn(async move {
@@ -1021,6 +1034,7 @@ mod tests {
                     .await
                     .expect("lease"),
             ),
+            budget: std::time::Duration::from_secs(300),
         };
         let client = super::admin_client().expect("client");
         assert!(
