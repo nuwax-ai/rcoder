@@ -201,8 +201,6 @@ docker-build-agent-runner:
 				--build-arg PINGAP_COMMIT=$$PINGAP_COMMIT \
 				--build-arg CACHEBUST=$(AGENT_TOOLS_CACHE_KEY) \
 				--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
-				--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
-				--build-arg INSTALL_ALLOY="$${INSTALL_EBPF}" \
 				-f Dockerfile -t dev-rcoder-agent-runner:latest . ; \
 		else \
 			docker build \
@@ -211,8 +209,6 @@ docker-build-agent-runner:
 				--build-arg PINGAP_COMMIT=$$PINGAP_COMMIT \
 				--build-arg CACHEBUST=$(AGENT_TOOLS_CACHE_KEY) \
 				--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
-				--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
-				--build-arg INSTALL_ALLOY="$${INSTALL_EBPF}" \
 				-f Dockerfile -t dev-rcoder-agent-runner:latest . ; \
 		fi;)
 	@echo "✅ dev-rcoder-agent-runner 镜像构建完成！"

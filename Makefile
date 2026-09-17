@@ -15,7 +15,6 @@
 	docker-pre-download-libreoffice docker-clean-libreoffice-downloads \
 	update-image-tag \
 	test test-unit test-integration test-all test-blocking \
-	test-ebpf-install test-ebpf-no-install test-ebpf-debug test-pyroscope-offcpu \
 	audit deny geiger quality coverage fuzz \
 	agent-runner-up agent-runner-down agent-runner-logs agent-runner-restart agent-runner-status \
 	dial9-on dial9-off dial9-view \
