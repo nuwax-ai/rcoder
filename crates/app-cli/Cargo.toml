@@ -70,18 +70,10 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 infer = { version = "0.22", default-features = false }
 
 tempfile = "3"
-
-# Windows 文件锁（LockFileEx）和 Job Objects
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_JobObjects",
-    "Win32_System_IO",
-    "Win32_System_Threading",
-    "Win32_Storage_FileSystem",
-] }
+# 跨平台受管进程组（watchexec 维护；command-group 的官方后继）。
+# Unix ProcessGroup / Windows JobObject；Windows 挂起 spawn → Job 归属 →
+# 恢复执行——进程运行前已入 Job，无后代逃逸窗口（cross-platform.md §4）。
+process-wrap = { version = "10", features = ["tokio1"] }
 
 [lints]
 workspace = true

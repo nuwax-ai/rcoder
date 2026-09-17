@@ -901,29 +901,61 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
 async fn attach_to_existing_owner(args: &CliArgs) -> Result<()> {
     use std::process::exit;
 
-    let addr = &args.admin_addr;
-    let url = format!("http://{addr}/v1/runtime/identity");
+    let mut addr = args.admin_addr.clone();
 
-    // 核验已有实例身份
+    // endpoint 发现线索（cross-platform.md §3）：记录存在时优先探测其地址，
+    // 连接失败回退 CLI 给定地址——发现记录只是线索，身份核验才是权威。
+    let application_id = std::env::var("PROJECT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "unknown-app".to_string());
+    if let Ok(state_root) =
+        crate::runtime_kernel::RuntimeStore::resolve_root(&args.workspace, &application_id)
+        && let Some(record) = crate::runtime_kernel::RuntimeStore::read_endpoint(&state_root)
+    {
+        tracing::info!(
+            "attach mode: endpoint discovery record points to {} (instance {})",
+            record.address,
+            record.runtime_instance_id
+        );
+        addr = record.address.clone();
+    }
+
+    // 核验已有实例身份。no_proxy：本机 owner 探测不得经系统 HTTP 代理
+    // 转发（XP10——代理不劫持本地请求，也不把认证请求带给未知地址）。
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        .no_proxy()
         .build()
         .context("build identity probe client")?;
 
     tracing::info!("attach mode: checking existing instance at {addr}");
 
-    // 带重试的连接检测（新实例启动需要时间完成 API bind）
+    // 带重试的连接检测（新实例启动需要时间完成 API bind；回退换地址时
+    // URL 随 addr 重建）
+    let mut record_used = addr != args.admin_addr;
     for attempt in 0..15 {
+        let url = format!("http://{addr}/v1/runtime/identity");
         match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 // 解析身份并核验
-                let body: serde_json::Value = resp
-                    .json()
-                    .await
-                    .context("parse identity response")?;
-                return verify_identity_and_attach(args, &body, addr).await;
+                let body: serde_json::Value =
+                    resp.json().await.context("parse identity response")?;
+                return verify_identity_and_attach(args, &body, &addr).await;
             }
             Ok(resp) => {
+                // 发现记录指向的地址应答异常——可能是旧记录：回退 CLI 地址重试
+                if record_used {
+                    tracing::warn!(
+                        "attach mode: endpoint record target {addr} returned {}; \
+                         falling back to {}",
+                        resp.status(),
+                        args.admin_addr
+                    );
+                    addr = args.admin_addr.clone();
+                    record_used = false;
+                    continue;
+                }
                 tracing::error!(
                     "attach mode: existing instance at {addr} returned {} (identity unavailable); \
                      cannot verify ownership, exiting",
@@ -932,8 +964,18 @@ async fn attach_to_existing_owner(args: &CliArgs) -> Result<()> {
                 exit(1);
             }
             Err(_) if attempt < 14 => {
-                // 连接失败——可能是端口空闲（无实例）或实例正在启动
                 if std::net::TcpListener::bind(addr.as_str()).is_ok() {
+                    // 当前探测地址空闲：发现记录是旧的——回退 CLI 地址再判断
+                    if record_used {
+                        tracing::warn!(
+                            "attach mode: endpoint record target {addr} is stale; \
+                             falling back to {}",
+                            args.admin_addr
+                        );
+                        addr = args.admin_addr.clone();
+                        record_used = false;
+                        continue;
+                    }
                     // 端口空闲 = 无运行实例
                     tracing::info!(
                         "attach mode: no existing instance at {addr}, proceeding as owner"
@@ -944,6 +986,11 @@ async fn attach_to_existing_owner(args: &CliArgs) -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
             Err(e) => {
+                if record_used {
+                    addr = args.admin_addr.clone();
+                    record_used = false;
+                    continue;
+                }
                 tracing::error!("attach mode: failed to connect to {addr}: {e}");
                 exit(1);
             }
@@ -960,7 +1007,6 @@ async fn verify_identity_and_attach(
     body: &serde_json::Value,
     addr: &str,
 ) -> Result<()> {
-    use std::os::unix::process::CommandExt as _;
     use std::process::exit;
 
     let identity = body.get("data");
@@ -1012,16 +1058,49 @@ async fn verify_identity_and_attach(
     }
 
     // 重新执行本二进制（无 --attach）成为新 owner
-    let current_exe = std::env::current_exe().context("get current executable path")?;
-    let mut cmd = std::process::Command::new(current_exe);
-    for arg in std::env::args().skip(1) {
-        if arg != "--attach" && arg != "attach" {
-            cmd.arg(arg);
+    reexec_without_attach();
+    exit(1);
+}
+
+/// 跨平台重新执行当前二进制（去掉 --attach 参数）。
+///
+/// Unix：exec 替换当前进程映像（成功不返回）。
+/// Windows：spawn 子进程并等待退出（无法原地替换进程映像；supervisord
+/// 不在 Windows 上运行，等待语义可接受）。
+fn reexec_without_attach() {
+    let current_exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            tracing::error!("attach mode: get current executable path failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|arg| arg != "--attach" && arg != "attach")
+        .collect();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let error = std::process::Command::new(current_exe).args(&args).exec();
+        tracing::error!("attach mode: re-exec failed: {error}");
+        std::process::exit(1);
+    }
+
+    #[cfg(not(unix))]
+    {
+        match std::process::Command::new(current_exe).args(&args).spawn() {
+            Ok(mut child) => {
+                let _ = child.wait();
+                std::process::exit(0);
+            }
+            Err(error) => {
+                tracing::error!("attach mode: spawn failed: {error}");
+                std::process::exit(1);
+            }
         }
     }
-    let error = cmd.exec();
-    tracing::error!("attach mode: re-exec failed: {error}");
-    exit(1);
 }
 
 /// serve 核心逻辑（无附着检测）：journal → OwnerGuard → API bind → 状态机主循环。
@@ -1032,10 +1111,8 @@ async fn serve_without_attach(args: &CliArgs) -> Result<()> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "unknown-app".to_string());
-    let state_root = crate::runtime_kernel::RuntimeStore::resolve_root(
-        &args.workspace,
-        &application_id,
-    )?;
+    let state_root =
+        crate::runtime_kernel::RuntimeStore::resolve_root(&args.workspace, &application_id)?;
     let _owner_guard = crate::platform::owner_guard::OwnerGuard::acquire(&state_root)
         .context("acquire exclusive owner lock (another instance may be running)")?;
 
@@ -1144,6 +1221,23 @@ async fn serve_without_attach(args: &CliArgs) -> Result<()> {
                     );
                 }
                 state.set_runtime_kernel(kernel);
+                // endpoint 发现记录（cross-platform.md §3）：API 已绑定 +
+                // 身份就绪后原子发布——多项目按状态根天然隔离。
+                // 发布失败仅告警（发现能力缺失，不影响已建立的 owner）。
+                let kernel = state.runtime_kernel().expect("kernel just set");
+                if let Err(endpoint_error) =
+                    kernel
+                        .store()
+                        .store_endpoint(&crate::runtime_kernel::EndpointRecord {
+                            protocol_version: kernel.identity().protocol_version,
+                            application_id: kernel.identity().application_id.clone(),
+                            workspace_id: kernel.identity().workspace_id.clone(),
+                            runtime_instance_id: kernel.identity().runtime_instance_id.clone(),
+                            address: args.admin_addr.clone(),
+                        })
+                {
+                    tracing::warn!("endpoint discovery record publish failed: {endpoint_error:#}");
+                }
             }
             Err(error) => {
                 // B05：状态根不可用 = 运行态可信状态不可读——不再仅关闭新 API
@@ -1311,6 +1405,10 @@ async fn finish_clean_shutdown(
     );
     state.preparations.drain().await?;
     crate::static_hosting::reconcile(&[], &args.workspace, false).await?;
+    // 干净关停清除 endpoint 发现记录（崩溃残留的旧记录由客户端核验拒绝）
+    if let Some(kernel) = state.runtime_kernel() {
+        kernel.store().clear_endpoint()?;
+    }
     {
         let mut receiver = state.deploy_rx.lock().await;
         receiver.close();

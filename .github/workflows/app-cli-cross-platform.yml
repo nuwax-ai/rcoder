@@ -1,0 +1,71 @@
+# app-cli 三平台原生生命周期门禁（cross-platform.md §7）。
+#
+# 与 release-app-cli.yml（发布构建）互补：本工作流在 ubuntu/macos/windows
+# 三平台原生运行 app-cli 的组件与集成测试——交叉编译不替代原生行为验证。
+# Windows 需 protoc/nasm（aws-lc-sys）与 cmake（libz-ng-sys）。
+name: app-cli cross-platform
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/app-cli/**"
+      - "crates/workspace-manifest/**"
+      - "crates/process_utils/**"
+      - "crates/shared_types/**"
+      - "crates/shared_types_grpc/**"
+      - "crates/shared_types_i18n/**"
+      - ".github/workflows/app-cli-cross-platform.yml"
+  pull_request:
+    paths:
+      - "crates/app-cli/**"
+      - "crates/workspace-manifest/**"
+      - "crates/process_utils/**"
+      - "crates/shared_types/**"
+      - "crates/shared_types_grpc/**"
+      - "crates/shared_types_i18n/**"
+      - ".github/workflows/app-cli-cross-platform.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: app-cli-crossplatform-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} native tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          - os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Windows build prerequisites
+        if: runner.os == 'Windows'
+        shell: bash
+        run: choco install -y protoc nasm cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/app-cli
+
+      - name: Format check
+        run: cargo fmt --manifest-path crates/app-cli/Cargo.toml -- --check
+
+      - name: Clippy
+        run: cargo clippy --manifest-path crates/app-cli/Cargo.toml --all-targets -- -D warnings
+
+      - name: Tests (native lifecycle gate)
+        # --all-features 全功能组合；Windows 上 Unix 专属集成测试
+        # (bin_startup/serve_restart) 按文件级 #![cfg(unix)] 天然跳过，
+        # win_lifecycle.rs 补 Windows 原生生命周期闭环
+        run: cargo test --manifest-path crates/app-cli/Cargo.toml --all-features

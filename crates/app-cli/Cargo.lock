@@ -237,6 +237,7 @@ dependencies = [
  "infer",
  "notify",
  "pingap-config",
+ "process-wrap",
  "process_utils",
  "regex",
  "reqwest",
@@ -257,7 +258,6 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "uuid",
- "windows-sys 0.59.0",
  "workspace-manifest",
  "zip 8.6.0",
 ]
@@ -3564,6 +3564,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "process-wrap"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e3f4237d0e4741eb50bc5584db701f1299c85fa31ff0274dd6445e79dc42d12"
+dependencies = [
+ "futures",
+ "indexmap 2.14.2",
+ "nix",
+ "tokio",
+ "tracing",
+ "windows",
 ]
 
 [[package]]

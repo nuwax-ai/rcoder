@@ -82,6 +82,37 @@ pub(crate) struct RecoveryScan {
     pub blocked: Vec<String>,
 }
 
+/// endpoint 发现记录（cross-platform.md §3）：owner 绑定成功后原子发布。
+///
+/// **是发现线索，不是所有权证明**——客户端连接后必须经
+/// `/v1/runtime/identity` 核验实例身份（[`endpoint_matches_identity`]）。
+/// 崩溃残留的旧记录（实例已换/地址已变）在核验时被拒绝（XP10）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EndpointRecord {
+    pub protocol_version: u32,
+    pub application_id: String,
+    pub workspace_id: String,
+    pub runtime_instance_id: String,
+    pub address: String,
+}
+
+fn endpoint_path(state_root: &Path) -> PathBuf {
+    state_root.join("endpoint.json")
+}
+
+/// 发现记录与远端 identity 的核验：全部身份字段一致才算命中。
+/// 任一不符（旧实例/错应用/协议不兼容）返回 false——调用方按
+/// "旧发现记录"处理：丢弃线索，不据此发认证请求。
+pub(crate) fn endpoint_matches_identity(
+    record: &EndpointRecord,
+    identity: &RuntimeIdentityView,
+) -> bool {
+    record.protocol_version == identity.protocol_version
+        && record.application_id == identity.application_id
+        && record.workspace_id == identity.workspace_id
+        && record.runtime_instance_id == identity.runtime_instance_id
+}
+
 impl RuntimeStore {
     /// 解析稳定状态根（B04：显式优先，杜绝 parent() 猜测歧义）。
     ///
@@ -218,6 +249,32 @@ impl RuntimeStore {
         self.root
             .join("events")
             .join(format!("{operation_id}.jsonl"))
+    }
+
+    /// owner 绑定成功后原子发布 endpoint 发现记录（cross-platform.md §3）。
+    /// 多项目天然隔离：状态根按 application_id 分目录，各项目各一份记录。
+    pub(crate) fn store_endpoint(&self, record: &EndpointRecord) -> Result<()> {
+        write_json(&endpoint_path(&self.root), record)
+    }
+
+    /// 干净关停时清除发现记录（崩溃残留的旧记录由客户端核验拒绝——XP10）。
+    pub(crate) fn clear_endpoint(&self) -> Result<()> {
+        match std::fs::remove_file(endpoint_path(&self.root)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(anyhow::Error::from(error)).with_context(|| {
+                format!(
+                    "clear endpoint record {}",
+                    endpoint_path(&self.root).display()
+                )
+            }),
+        }
+    }
+
+    /// 只读发现记录（attach/客户端侧：无副作用，不建目录不迁移）。
+    pub(crate) fn read_endpoint(state_root: &Path) -> Option<EndpointRecord> {
+        let content = std::fs::read_to_string(endpoint_path(state_root)).ok()?;
+        serde_json::from_str(&content).ok()
     }
 
     /// 读取/落盘身份（runtime_instance_id 每次进程启动新生成；
@@ -431,7 +488,9 @@ fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
             Err(error) if is_transient_windows_lock(&error) => {
                 tracing::warn!(attempt, error = %error, "state persist transiently locked; retrying");
                 last_error = Some(error);
-                std::thread::sleep(std::time::Duration::from_millis(u64::from(attempt + 1) * 20));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    u64::from(attempt + 1) * 20,
+                ));
             }
             Err(error) => return Err(error),
         }
@@ -1404,6 +1463,113 @@ mod tests {
         // 整体改名 workspace 换代时不动
         assert!(app_state_root(&workspace).join("desired.json").is_file());
         assert!(!workspace.join(STATE_DIR_NAME).exists());
+    }
+
+    /// XP03：同项目改端口不分裂锁域——锁以状态根为键，端口只进发现记录。
+    /// 第二实例（不同 admin_addr）仍被 OwnerGuard 拒绝。
+    #[test]
+    fn xp03_port_change_does_not_split_lock_domain() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("state");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let _guard = crate::platform::owner_guard::OwnerGuard::acquire(&root).expect("first owner");
+
+        // 第一 owner 发布了端口 A 的发现记录
+        let record = EndpointRecord {
+            protocol_version: RUNTIME_CONTROL_PROTOCOL_VERSION,
+            application_id: "app-x".into(),
+            workspace_id: "ws".into(),
+            runtime_instance_id: "instance-1".into(),
+            address: "127.0.0.1:3010".into(),
+        };
+        let store = RuntimeStore::open_with_root(root.clone(), &workspace).expect("store");
+        store.store_endpoint(&record).expect("publish endpoint");
+
+        // 第二实例改用端口 B：锁域不变 → 排他失败
+        let second = crate::platform::owner_guard::OwnerGuard::acquire(&root);
+        assert!(
+            second.is_err(),
+            "port change must not bypass the owner lock"
+        );
+
+        // 释放后可接管（记录不阻碍新 owner——它是线索不是凭证）
+        drop(_guard);
+        let _guard2 = crate::platform::owner_guard::OwnerGuard::acquire(&root)
+            .expect("takeover after release");
+    }
+
+    /// XP10：旧发现记录与远端身份不符 → 核验拒绝（不据此发认证请求）。
+    /// 同实例全字段一致才命中；实例换代/协议变化/错应用均拒绝。
+    #[test]
+    fn xp10_stale_endpoint_record_is_rejected() {
+        let identity = || RuntimeIdentityView {
+            application_id: "app-x".into(),
+            service_family: "userapp-dev".into(),
+            workspace_id: "ws".into(),
+            source_root: "/ws".into(),
+            runtime_instance_id: "instance-1".into(),
+            deployment_generation_id: "gen-1".into(),
+            protocol_version: RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: vec![],
+        };
+        let record = EndpointRecord {
+            protocol_version: RUNTIME_CONTROL_PROTOCOL_VERSION,
+            application_id: "app-x".into(),
+            workspace_id: "ws".into(),
+            runtime_instance_id: "instance-1".into(),
+            address: "127.0.0.1:3010".into(),
+        };
+        // 全字段一致 → 命中
+        assert!(endpoint_matches_identity(&record, &identity()));
+        // 实例换代（owner 重启后远端是新实例，记录是旧的）→ 拒绝
+        let restarted = RuntimeIdentityView {
+            runtime_instance_id: "instance-2".into(),
+            ..identity()
+        };
+        assert!(!endpoint_matches_identity(&record, &restarted));
+        // 协议不兼容 → 拒绝
+        let upgraded = RuntimeIdentityView {
+            protocol_version: RUNTIME_CONTROL_PROTOCOL_VERSION + 1,
+            ..identity()
+        };
+        assert!(!endpoint_matches_identity(&record, &upgraded));
+        // 错应用 → 拒绝
+        let foreign = RuntimeIdentityView {
+            application_id: "app-y".into(),
+            ..identity()
+        };
+        assert!(!endpoint_matches_identity(&record, &foreign));
+    }
+
+    /// XP10 补充：发现记录持久化 roundtrip + 干净关停清除。
+    #[test]
+    fn endpoint_record_roundtrip_and_clean_clear() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("state-root");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = RuntimeStore::open_with_root(root.clone(), &workspace).expect("store");
+
+        let record = EndpointRecord {
+            protocol_version: RUNTIME_CONTROL_PROTOCOL_VERSION,
+            application_id: "app-r".into(),
+            workspace_id: "ws".into(),
+            runtime_instance_id: "instance-r".into(),
+            address: "127.0.0.1:39999".into(),
+        };
+        store.store_endpoint(&record).expect("publish");
+        let loaded = RuntimeStore::read_endpoint(&root).expect("record present");
+        assert_eq!(loaded.address, record.address);
+        assert_eq!(loaded.runtime_instance_id, record.runtime_instance_id);
+
+        store.clear_endpoint().expect("clean clear");
+        assert!(
+            RuntimeStore::read_endpoint(&root).is_none(),
+            "cleared record must not be discoverable"
+        );
+        // 幂等清除（不存在不报错）
+        store.clear_endpoint().expect("idempotent clear");
     }
 
     /// B04：显式 env 根权威——source 与 .run 别名竞争同一目录/同一把锁。
