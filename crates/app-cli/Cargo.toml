@@ -69,9 +69,20 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # 关 default 裁掉 cfb 传递依赖——只用 archive::is_zip 纯函数
 infer = { version = "0.22", default-features = false }
 
-# unix 信号已通过 process_utils 封装（仅 unix 启用，不污染 windows 构建）
-
 tempfile = "3"
+# 跨平台文件锁（Unix fcntl/F_SETLK, Windows LockFileEx）
+fs2 = "0.4"
+
+# Windows 文件锁（LockFileEx）和 Job Objects
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_IO",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+] }
 
 [lints]
 workspace = true

@@ -899,7 +899,6 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
 /// 3. 身份匹配 → 等待端口释放（轮询 connect）→ 重新执行本二进制（无 --attach）
 /// 4. 身份不匹配 / API 不可达 / 503 → 立即退出（exit 1）
 async fn attach_to_existing_owner(args: &CliArgs) -> Result<()> {
-    use std::os::unix::process::CommandExt as _;
     use std::process::exit;
 
     let addr = &args.admin_addr;
