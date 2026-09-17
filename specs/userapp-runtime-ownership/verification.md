@@ -58,3 +58,16 @@
 Windows 环境准备：choco 安装 cmake 4.4.3 + VS2022 BuildTools (VCTools)；rustup 升级 1.93→1.98（kdl/sysinfo 依赖要求 ≥1.95）。
 发现的真机问题与修复：①APP_CLI_STATE_ROOT set_var 与并行测试竞争（os error 2/3/183 随机失败）→ resolve_root 参数化消除 env 变异；②Defender 独占 .tmp（os error 5）→ write_json 有界重试；③fs2 锁域与 Python lockf 在 Linux 不互斥 → 改 std::fs::File::try_lock（flock 语义官方背书）；④force_kill Windows 未杀进程树 → TerminateJobObject；⑤spawn→Assign 逃逸窗口 → CREATE_SUSPENDED + ResumeThread。
 未验证：Windows 集成测试（bin_startup/serve_restart 为 #![cfg(unix)]）；Windows 跨进程锁已于 `2e1c2ba6` 以 PowerShell/.NET Lock 对端实测补齐。
+
+## 2026-09-18 轮：development-review R01/R04–R10/B01–B04 修复
+
+| 项 | 提交 | 验证 | 未运行项 |
+|---|---|---|---|
+| R01 | `2574f8c5` | app-cli 202→207（含 tree_lifecycle 真实编排链反例 ×2、supervisor 树测试 12 连跑稳定） | Windows/Linux 真机矩阵本轮复验；Compose/K8s |
+| R04/R05/R06 | `7e74cd0b` | file-server+userapp 405→412（external_stop 4 反例 + owner_probe 新契约 + observation/pg wire）；app-cli kernel 桥 2 反例 | Compose/K8s 真实链路 |
+| R07/R08 | `578ac9f6` | 664/664（三 crate）；supervisor env 注入/kernel 脱敏/wire 三层反例 | 改密后真实 PG 连通（容器态） |
+| R09+N01 | `1fcc3860` | layout crate 5 反例 + fs token 契约；legacy 迁移 EINVAL 修复回归 | Windows junction |
+| B01/B02 | 镜像仓 `59b7a0f` | supervisord 容器态双场景（EXITED 预期/RUNNING+health）；B01 本机二进制复现 | 新镜像实机构建 |
+| B03/B04 | `936b8cf6`/`1fcc3860` | docker_manager 85+207（双 feature）；注入链单元反例 | managed E2E（镜像重建后 Compose） |
+| R10 | `3b931eb8` | app_manager 194/195（1 既有环境项） | K8s 部署预算实测 |
+| 全 workspace | `3b931eb8` | 见下方本轮汇总行 | — |

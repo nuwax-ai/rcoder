@@ -17,3 +17,15 @@
 | 待执行 | 待填 | 待填 | 待填 | 待填 | 待填 |
 
 记录原生包内容及哈希、实际绑定地址、组件/操作身份，但不记录个人机器的账号密码、token 或其他秘密。正常退出、强制停止、未确认清理分别记录；环境失败不能写成逻辑通过。
+
+## 2026-09-18 轮：R/B 合并修复中的原生增量
+
+| 任务/反例 | 源码与产物身份 | OS/arch/执行模式 | 实际命令与退出码 | 结果与证据 | 剩余问题 |
+|---|---|---|---|---|---|
+| N01（ND04 部分） | rcoder `1fcc3860` | macOS ARM64 单元测试 | cargo nextest app-cli（supervisor::tests::pg_wait_is_gated_on_declared_need） | 声明式判定：migrate 命令/显式 APP_CLI_REQUIRE_PG=1 才探测；纯静态项目跳过 60s 轮询 | PG 完整运行计划预检（N 计划的"可完成前置校验"全项）未做 |
+| R09 锁域（ND02 部分） | 同上 + runtime-state-layout crate | macOS（含 symlink/私有路径前缀） | crate 5 测试 + file-server token 契约测试 + app-cli 207 | 兄弟项目独立根/source-.run 同根/symlink 折叠/损坏 fail-fast | Windows junction、跨用户场景真机验证 |
+| NT08 孙进程收束（app-cli 侧） | `2574f8c5` | macOS 真实进程 | tests/tree_lifecycle 2 反例 | TERM 忽略孙进程持端口：停机/失败兜底两路径端口释放 + 二轮可启动 | Windows/Linux 真机；proxy（file-server 侧子进程）未动 |
+| NT12 终态/取消/SSE | `7e74cd0b`/`578ac9f6` | macOS 单元+mock | file-server 406→412 | Cancelled 不当成功、事件游标重放、Failed 带 error、orchestration 桥 | 部署 >10s 真链路时长覆盖随 Compose |
+| ND01 反例对应表 | specs/development-review-2026-09-17/review-status.md | — | 文档 | R/B/N 合并修复映射建立 | R02/R03、N02–N10 大部、B05 未动 |
+
+**未验证/未实施清单**（不以部分通过宣称整体）：N02 路径白名单重构、N03 端口计划、N04 Pingap 随包、N05/N06/N07/N10 proxy 原生形态、N08 file-server 侧硬编码 sh/ps/taskkill、N09 分发安全、ND05–ND12 对应项、NT01–NT16 三平台原生矩阵。
