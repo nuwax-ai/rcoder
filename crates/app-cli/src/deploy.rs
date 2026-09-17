@@ -9,13 +9,18 @@
 //! resources on completion, error, and cancellation, including blocking extraction.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use shared_types::AppDeploymentProgress;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
+
+/// 进度回调类型（prepare 内部按阶段调用，外部按需消费）。
+pub(crate) type ProgressCallback = Arc<dyn Fn(AppDeploymentProgress) + Send + Sync + 'static>;
 
 /// 部署状态 marker 文件名（卷根下，跨 code 换代存续）。
 const DEPLOY_STATE_FILE: &str = ".deploy-state.toml";
@@ -163,7 +168,7 @@ pub(crate) async fn deploy(
     release_id: &str,
     expected_sha: Option<&str>,
 ) -> Result<()> {
-    if let Some(prepared) = prepare(workspace, url, release_id, expected_sha).await? {
+    if let Some(prepared) = prepare(workspace, url, release_id, expected_sha, None).await? {
         activate(workspace, prepared).await?;
     }
     Ok(())
@@ -174,6 +179,7 @@ pub(crate) async fn prepare(
     url: &str,
     release_id: &str,
     expected_sha: Option<&str>,
+    progress: Option<ProgressCallback>,
 ) -> Result<Option<PreparedDeploy>> {
     validate_release_id_fs_safe(release_id)?;
     let root = workspace.parent().context("workspace has no volume root")?;
@@ -214,6 +220,15 @@ pub(crate) async fn prepare(
         .prefix("deploy-")
         .suffix(".part")
         .tempfile_in(&incoming)?;
+    if let Some(ref cb) = progress {
+        cb(AppDeploymentProgress {
+            epoch: release_id.to_owned(),
+            step: "downloading".into(),
+            detail: Some(format!("fetching {url}")),
+            updated_at: Some(chrono::Utc::now().timestamp_millis()),
+            ..Default::default()
+        });
+    }
     let actual_hex = to_hex(&download_to_file(url, part.path()).await?);
     if let Some(expected) = expected_sha
         && !expected.eq_ignore_ascii_case(&actual_hex)
@@ -224,6 +239,15 @@ pub(crate) async fn prepare(
     let staging = tempfile::Builder::new()
         .prefix("deploy-")
         .tempdir_in(staging_root)?;
+    if let Some(ref cb) = progress {
+        cb(AppDeploymentProgress {
+            epoch: release_id.to_owned(),
+            step: "extracting".into(),
+            detail: Some("extracting artifact".into()),
+            updated_at: Some(chrono::Utc::now().timestamp_millis()),
+            ..Default::default()
+        });
+    }
     let (staging, lease) =
         tokio::task::spawn_blocking(move || -> Result<(tempfile::TempDir, PreparationLease)> {
             extract_zip_sync(part.path(), staging.path())?;
@@ -591,7 +615,7 @@ format = "jsonl"
             .await
             .expect("unrelated");
         let url = serve_once(build_zip(&[("release.lock.toml", MINIMAL_LOCK)])).await;
-        let prepared = prepare(&workspace, &url, "prepared", None)
+        let prepared = prepare(&workspace, &url, "prepared", None, None)
             .await
             .expect("prepare")
             .expect("new");
@@ -599,9 +623,15 @@ format = "jsonl"
         assert!(!incoming.join("deploy-stale.part").exists());
         assert!(incoming.join("unrelated").exists());
         assert!(
-            prepare(&workspace, "http://127.0.0.1:1/unused", "contender", None)
-                .await
-                .is_err()
+            prepare(
+                &workspace,
+                "http://127.0.0.1:1/unused",
+                "contender",
+                None,
+                None
+            )
+            .await
+            .is_err()
         );
         assert!(
             cleanup_startup(&workspace).await.is_err(),
@@ -625,7 +655,7 @@ format = "jsonl"
             ("new.txt", "new"),
         ]))
         .await;
-        let prepared = prepare(&workspace, &url, "new-release", None)
+        let prepared = prepare(&workspace, &url, "new-release", None, None)
             .await
             .expect("prepare")
             .expect("prepared");
@@ -653,7 +683,7 @@ format = "jsonl"
         let root = tempfile::tempdir().expect("root");
         let url = serve_once(build_zip(&[("untrusted.txt", "payload")])).await;
         assert!(
-            prepare(&root.path().join("code"), &url, "bad", None)
+            prepare(&root.path().join("code"), &url, "bad", None, None)
                 .await
                 .is_err()
         );

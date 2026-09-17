@@ -128,6 +128,34 @@ pub struct AppEnvSnapshot {
     pub resource_version: Option<String>,
 }
 
+/// progress_v1 部署进度载荷（app-cli → rcoder 轮询消费）。
+///
+/// 计量与展示分离：`step` 是人类可读的阶段标签（未知值容忍），
+/// `activity` 是 epoch 内单调不减的进度计数器（rcoder 只认"严格增长"）。
+/// `epoch` 是执行实例标识（进程重启换 epoch；rcoder 见 epoch 变化不算进展）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct AppDeploymentProgress {
+    /// 执行实例标识（UUID；进程重启换 epoch）。
+    pub epoch: String,
+    /// 当前阶段（human-readable，未知值容忍）。
+    pub step: String,
+    /// epoch 内单调不减的活动计数器（rcoder 只认严格增长）。
+    #[serde(default)]
+    pub activity: u64,
+    /// 当前步骤已完成的单元数（可选，展示用）。
+    #[serde(default)]
+    pub step_completed: Option<u64>,
+    /// 当前步骤总单元数（可选，展示用）。
+    #[serde(default)]
+    pub step_total: Option<u64>,
+    /// 人类可读的阶段细节（可选，展示用）。
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// 最后更新时间（epoch ms）。
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
 /// Actual runtime write precondition. None is supported only by Docker.
 #[derive(Debug, Clone, Default)]
 pub struct AppMutationPrecondition {

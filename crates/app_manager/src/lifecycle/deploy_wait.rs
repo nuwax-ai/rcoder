@@ -13,6 +13,8 @@ use crate::service::AppService;
 
 /// Reconciliation has a hard ceiling; HTTP response waiting remains 300 seconds.
 // HTTP waiting is bounded separately; the owned coordinator retains its lease.
+// Replaced by staged budgets from DeployBudgetConfig; kept for test assertions.
+#[allow(dead_code)]
 const DEPLOY_STAGE_BUDGET: Duration = Duration::from_secs(30 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -24,6 +26,10 @@ const APP_CLI_ADMIN_PORT: u16 = shared_types::APP_CLI_ADMIN_PORT;
 pub(crate) struct DeployStatusProbe {
     pub protocol_version: Option<u32>,
     pub operation: Option<shared_types::AppDeploymentOperation>,
+    /// 能力声明（progress_v1 等）。
+    pub capabilities: Vec<String>,
+    /// 部署进度（progress_v1 能力声明后有值）。
+    pub progress: Option<shared_types::AppDeploymentProgress>,
 }
 
 /// Parse either envelope or bare JSON without weakening the operation contract.
@@ -36,6 +42,13 @@ pub(crate) fn parse_deploy_status(value: &serde_json::Value) -> DeployStatusProb
             .and_then(|v| u32::try_from(v).ok()),
         operation: data
             .get("operation")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        capabilities: data
+            .get("capabilities")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default(),
+        progress: data
+            .get("progress")
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
     }
 }
@@ -98,19 +111,52 @@ impl AppService {
     ) -> AppResult<()> {
         use super::deploy_signals::{FailureSignalThresholds, FailureSignalTracker};
 
+        let budget = &self.config.deploy_budget;
         let mut client: Option<reqwest::Client> = None;
-        let deadline = tokio::time::Instant::now() + DEPLOY_STAGE_BUDGET;
-        // 确定性失败信号跟踪（计划批 1）：结构化 Pod 观察 + 同 pod 防抖。
-        // 阈值默认值（批 2 接配置 env/注解覆盖）。
-        let thresholds = FailureSignalThresholds::default();
+        let now = tokio::time::Instant::now();
+        let absolute_deadline = now + Duration::from_secs(budget.absolute_budget_secs);
+        // pre_appcli 阶段预算（app-cli 未响应时的默认超时）
+        let pre_appcli_budget = Duration::from_secs(budget.pre_appcli_stage_budget_secs);
+        let no_progress_budget = Duration::from_secs(budget.no_progress_timeout_secs);
+        let sql_stage_budget = Duration::from_secs(budget.sql_stage_budget_secs);
+        // 确定性失败信号跟踪：结构化 Pod 观察 + 同 pod 防抖。
+        let thresholds = FailureSignalThresholds {
+            crash_restart: budget.failure_restart_threshold,
+            oom_restart: budget.oom_restart_threshold,
+        };
         let mut failure_tracker = FailureSignalTracker::default();
+
+        // 高水位指纹跟踪
+        let mut capability_fixed = false; // progress_v1 能力是否已固定
+        let mut has_progress_v1 = false; // 能力固定后的值
+        let mut last_progress_at = now; // 最后有效进展时刻
+        let mut in_sql_stage = false; // 当前是否在 SQL 阶段
+        let mut _sql_stage_start: Option<tokio::time::Instant> = None; // SQL 阶段起点
+        let mut last_activity: u64 = 0; // 高水位 activity
+        let mut last_step = String::new(); // 高水位 step
+
+        // 初始预算：pre_appcli（app-cli 未响应前不得短于现状）
+        let mut effective_budget = pre_appcli_budget;
+
         loop {
-            if tokio::time::Instant::now() >= deadline {
+            let now = tokio::time::Instant::now();
+            // 绝对 deadline 始终有效
+            if now >= absolute_deadline {
                 return Err(AppOperationError::Backend(format!(
-                    "deploy stage not confirmed within {}s (app {app_id}, operation {operation_id}); \
+                    "deploy stage not confirmed within absolute budget {}s \
+                     (app {app_id}, operation {operation_id})",
+                    budget.absolute_budget_secs
+                )));
+            }
+            // 阶段预算检查
+            let stage_deadline = last_progress_at + effective_budget;
+            let active_deadline = std::cmp::min(absolute_deadline, stage_deadline);
+            if now >= active_deadline {
+                return Err(AppOperationError::Backend(format!(
+                    "deploy stage no progress for {}s (app {app_id}, operation {operation_id}); \
                      container may still be deploying in background — GET /apps/{app_id} to \
                      check status (or app logs) before retrying",
-                    DEPLOY_STAGE_BUDGET.as_secs()
+                    effective_budget.as_secs()
                 )));
             }
 
@@ -217,7 +263,73 @@ impl AppService {
                     && resp.status().is_success()
                     && let Ok(body) = resp.json::<serde_json::Value>().await
                 {
-                    match judge_stage(&parse_deploy_status(&body), operation_id) {
+                    let probe = parse_deploy_status(&body);
+                    // 能力固定：首次通过 protocol 校验且携带 operation 的有效响应上固定，
+                    // 之后不翻转（解析失败/字段缺失不重新协商）。
+                    // operation_id 校验由 env snapshot 检查 + judge_stage 保证——
+                    // 能力固定不做终态判定，只决定看门狗策略。
+                    if !capability_fixed
+                        && probe.protocol_version
+                            == Some(shared_types::APP_CLI_UNIFIED_DEPLOY_PROTOCOL)
+                        && probe.operation.is_some()
+                    {
+                        capability_fixed = true;
+                        has_progress_v1 = probe.capabilities.iter().any(|c| c == "progress_v1");
+                        if has_progress_v1 {
+                            info!(
+                                app_id,
+                                operation_id,
+                                "progress_v1 capability declared; enabling staged budgets"
+                            );
+                            effective_budget = no_progress_budget;
+                            // 能力首次固定 = 收到有效响应，重置无进展计时起点
+                            last_progress_at = tokio::time::Instant::now();
+                        }
+                    }
+                    // 高水位指纹：同 step/activity 严格增长才算进展
+                    // SQL 阶段内 activity 增长不重置阶段起点、不退出 SQL 预算
+                    // （第二个700s文件不被600s无进展截断）
+                    if let Some(ref progress) = probe.progress {
+                        let new_activity = progress.activity > last_activity;
+                        let new_step = progress.step != last_step;
+                        if new_activity || new_step {
+                            if new_activity {
+                                last_activity = progress.activity;
+                            }
+                            if new_step {
+                                last_step = progress.step.clone();
+                            }
+                            // SQL 阶段内：activity 增长只更新进度，不重置计时
+                            // 只有离开 SQL 阶段的 step 变化才重置 last_progress_at
+                            if !in_sql_stage || new_step {
+                                last_progress_at = tokio::time::Instant::now();
+                            }
+                        }
+                        // SQL 阶段切换：经身份校验进入 running_sql → SQL 预算
+                        if has_progress_v1 && progress.step == "running_sql" && !in_sql_stage {
+                            in_sql_stage = true;
+                            _sql_stage_start = Some(tokio::time::Instant::now());
+                            effective_budget = sql_stage_budget;
+                            info!(
+                                app_id,
+                                operation_id,
+                                "entering SQL stage; switching to {}s budget",
+                                sql_stage_budget.as_secs()
+                            );
+                        }
+                        // 经身份校验明确离开 running_sql → 恢复普通看门狗
+                        if has_progress_v1 && progress.step != "running_sql" && in_sql_stage {
+                            in_sql_stage = false;
+                            _sql_stage_start = None;
+                            effective_budget = no_progress_budget;
+                            last_progress_at = tokio::time::Instant::now();
+                            info!(
+                                app_id,
+                                operation_id, "leaving SQL stage; restoring no-progress budget"
+                            );
+                        }
+                    }
+                    match judge_stage(&probe, operation_id) {
                         StageVerdict::Done => {
                             info!(
                                 "[APP] deploy stage done (orchestration started): \

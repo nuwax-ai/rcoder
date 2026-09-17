@@ -56,6 +56,7 @@ impl Preparations {
         self: &Arc<Self>,
         workspace: std::path::PathBuf,
         request: DeployRequest,
+        progress: Option<crate::deploy::ProgressCallback>,
     ) -> Result<Option<PreparedDeploy>> {
         self.drain().await?;
         let job = tokio::spawn(async move {
@@ -64,6 +65,7 @@ impl Preparations {
                 &request.url,
                 &request.release_id,
                 request.sha256.as_deref(),
+                progress,
             )
             .await
         });

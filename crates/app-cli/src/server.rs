@@ -183,6 +183,12 @@ pub(crate) struct DeployStatus {
     pub request_release_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 能力声明（独立稳定字段；值如 `"progress_v1"`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// 部署进度（progress_v1 能力声明后有值）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<shared_types::AppDeploymentProgress>,
 }
 
 /// 内部状态机 → wire 相位（穷尽：新增 `ServerPhase` 变体时编译错，
@@ -227,6 +233,7 @@ impl ServerState {
             deploy_status: RwLock::new(DeployStatus {
                 phase: AppCliDeployPhase::Idle,
                 protocol_version: DEPLOY_PROTOCOL,
+                capabilities: vec!["progress_v1".into()],
                 ..Default::default()
             }),
             deploy_tx,
@@ -476,6 +483,24 @@ impl ServerState {
         }
     }
 
+    /// 更新部署进度（progress_v1 能力协议）。
+    pub(crate) fn set_deploy_progress(&self, progress: shared_types::AppDeploymentProgress) {
+        let mut status = self
+            .deploy_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.progress = Some(progress);
+    }
+
+    /// 清除部署进度（部署结束/重启时重置）。
+    pub(crate) fn clear_deploy_progress(&self) {
+        let mut status = self
+            .deploy_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.progress = None;
+    }
+
     fn begin_failure(&self, error: String, shutdown_unconfirmed: bool) {
         if shutdown_unconfirmed {
             self.shutdown_unconfirmed
@@ -673,6 +698,8 @@ impl ServerState {
             release_id: previous.release_id.clone(),
             request_release_id: Some(req.release_id.clone()),
             error: None,
+            capabilities: vec!["progress_v1".into()],
+            progress: None,
         };
         *self
             .phase
@@ -1415,14 +1442,19 @@ async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> In
 /// not leave this wait loop and never reach the stop/activate boundary.
 async fn next_prepared(
     args: &CliArgs,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<DeployRequest>,
 ) -> Option<InitialAction> {
     loop {
         let request = rx.recv().await?;
+        let state_clone = state.clone();
+        let progress_cb: crate::deploy::ProgressCallback =
+            std::sync::Arc::new(move |p: shared_types::AppDeploymentProgress| {
+                state_clone.set_deploy_progress(p);
+            });
         match state
             .preparations
-            .run(args.workspace.clone(), request)
+            .run(args.workspace.clone(), request, Some(progress_cb))
             .await
         {
             Ok(Some(prepared)) => {
@@ -1768,9 +1800,14 @@ async fn server_loop(
             InitialAction::Deploy(request) => {
                 state.set_phase(ServerPhase::Deploying);
                 state.set_request_release_id(&request.release_id);
+                let state_ref = state.clone();
+                let progress_cb: crate::deploy::ProgressCallback =
+                    std::sync::Arc::new(move |p: shared_types::AppDeploymentProgress| {
+                        state_ref.set_deploy_progress(p);
+                    });
                 match state
                     .preparations
-                    .run(args.workspace.clone(), request)
+                    .run(args.workspace.clone(), request, Some(progress_cb))
                     .await
                 {
                     Ok(prepared) => prepared,
