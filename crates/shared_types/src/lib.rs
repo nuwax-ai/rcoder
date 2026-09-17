@@ -24,7 +24,7 @@ pub use userapp::activity::{
 pub use userapp::app_stage::{UserappStage, invalid_app_stage_error};
 pub use userapp::build_event::BuildProgressEvent;
 pub use userapp::db_admin::{
-    DbAdminError, DbUserUpsertOutcome, UserappDbCreateDatabaseRequest,
+    DbAdminError, DbUserUpsertOutcome, StartPgCredential, UserappDbCreateDatabaseRequest,
     UserappDbResetPasswordRequest, create_pg_database, upsert_pg_user,
 };
 pub use userapp::db_align::{

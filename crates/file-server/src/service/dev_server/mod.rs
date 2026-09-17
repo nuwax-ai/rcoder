@@ -40,16 +40,17 @@ use crate::error::AppResult;
 use support::lock;
 
 impl DevServerManager {
-    /// restart-dev = stop + start（`hooks` 语义同 [`Self::start_dev`]）。
+    /// restart-dev = stop + start（`hooks`/`pg` 语义同 [`Self::start_dev`]）。
     pub async fn restart_dev(
         &self,
         project_id: &str,
         project_path: &Path,
         base_path: Option<&str>,
         hooks: Option<DevEventHooks>,
+        pg: Option<&shared_types::StartPgCredential>,
     ) -> AppResult<StartedDev> {
         self.stop_dev(project_id).await?;
-        self.start_dev(project_id, project_path, base_path, hooks)
+        self.start_dev(project_id, project_path, base_path, hooks, pg)
             .await
     }
 
@@ -87,9 +88,10 @@ impl DevServerManager {
             });
         }
         // 不存活 → 重启, 返回新 pid/port (对齐 nuwax 透传 startDevServer 返回值)
+        // （无凭据来源——容器 env 透传行为，见 start_dev 的 pg 参数注释）
         self.stop_dev(project_id).await?;
         let started = self
-            .start_dev(project_id, project_path, base_path, None)
+            .start_dev(project_id, project_path, base_path, None, None)
             .await?;
         Ok(KeepAliveResult {
             alive: true,

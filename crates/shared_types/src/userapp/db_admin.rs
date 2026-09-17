@@ -47,6 +47,24 @@ pub struct UserappDbCreateDatabaseRequest {
     pub owner: Option<String>,
 }
 
+/// PG 凭据（跨环境共用的 wire 形状，字段名恒为 `pg`）：
+/// - prod：`POST /api/v1/userapp/{app_id}/start|restart` 的 `pg` 字段——部署后
+///   自动对齐（scram 校验，不一致则重置，结果见响应 `pg_aligned`）；
+/// - dev：`POST /api/v1/userapp/dev/start|restart` 的 `pg` 字段——注入 dev
+///   编排进程 env 的 `POSTGRES_USER`/`POSTGRES_PASSWORD`（覆盖容器默认透传值），
+///   save-db-credential 改密后由调用方带上新凭据，避免编排 env 仍是镜像默认
+///   `dev` 导致服务连不上库。
+///
+/// 从 app_manager `models/start.rs` 下沉（dev 链 file-server-userapp 与 prod 链
+/// 共用同一契约；serde/ToSchema 形状不变）。
+#[derive(Debug, Deserialize, Serialize, Clone, utoipa::ToSchema)]
+pub struct StartPgCredential {
+    /// PG 账号名（已存在角色；须过 PG 标识符白名单）
+    pub username: String,
+    /// 目标密码（与开发环境保持一致的值）
+    pub password: String,
+}
+
 /// 账号 upsert 结果（响应 message 区分"已创建"/"已重置"）。
 #[derive(Debug, PartialEq, Eq, utoipa::ToSchema)]
 pub enum DbUserUpsertOutcome {

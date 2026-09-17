@@ -389,4 +389,26 @@ pub struct DevOpBody {
     /// （manifest/app-cli 引擎）不消费：pingap 路由前缀由各服务的
     /// project.manifest.toml `[proxy].path` 决定，传了无效果。
     pub base_path: Option<String>,
+    #[serde(default)]
+    #[garde(custom(pg_credential))]
+    /// PG 数据库凭据（可选，与 prod `StartAppRequest.pg` 同构 wire）：
+    /// 给出则注入 dev 编排进程 env 的 `POSTGRES_USER`/`POSTGRES_PASSWORD`
+    /// （覆盖容器默认透传值）——save-db-credential 改密后由调用方带上新
+    /// 凭据，避免编排 env 仍是镜像默认 `dev` 导致服务连不上库。
+    /// 仅 start/restart 消费（编排器 spawn 链）；stop 忽略。
+    pub pg: Option<shared_types::StartPgCredential>,
+}
+
+/// [`DevOpBody::pg`] 的 garde 校验：可选；给出时 username 须过 PG 标识符
+/// 白名单、password 非空（与 `/db/reset-password` 同规——受理前 fail-fast，
+/// 不触发 workspace IO）。custom 规则收到的是 `&Option<T>`（garde 不自动解包）。
+fn pg_credential(pg: &Option<shared_types::StartPgCredential>, _: &()) -> garde::Result {
+    let Some(pg) = pg else {
+        return Ok(());
+    };
+    shared_types::pg_utils::validate_pg_identifier(&pg.username).map_err(garde::Error::new)?;
+    if pg.password.is_empty() {
+        return Err(garde::Error::new("pg.password must not be empty"));
+    }
+    Ok(())
 }

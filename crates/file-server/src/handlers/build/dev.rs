@@ -106,9 +106,10 @@ pub(crate) async fn start_dev(
         }));
     }
     let base = q.base_path.as_deref();
+    // web 域 start-dev：无 PG 凭据来源（pg 注入仅 Userapp manifest 引擎消费）
     let started = state
         .dev_server
-        .start_dev(&q.project_id, &path, base, None)
+        .start_dev(&q.project_id, &path, base, None, None)
         .await?;
     Ok(Json(DevStarted {
         success: true,
@@ -223,7 +224,7 @@ pub(crate) async fn restart_dev(
     let base = q.base_path.as_deref();
     let started = state
         .dev_server
-        .restart_dev(&q.project_id, &path, base, None)
+        .restart_dev(&q.project_id, &path, base, None, None)
         .await?;
     Ok(Json(DevStarted {
         success: true,

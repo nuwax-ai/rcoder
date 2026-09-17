@@ -294,3 +294,39 @@ mod tests {
         }
     }
 }
+
+/// DevOpBody 的 pg 字段 wire 契约：带 pg 解析并过校验；缺省 None（向后
+/// 兼容锁定——Java 未升级不传时行为不变）；非法 username（PG 标识符白名单
+/// 外）/空密码在受理校验层拒绝（fail-fast，不触发 workspace IO）。
+#[test]
+fn dev_op_body_pg_credential_wire_contract() {
+    use crate::models::DevOpBody;
+    use garde::Validate as _;
+
+    let with_pg: DevOpBody = serde_json::from_value(serde_json::json!({
+        "app_id": "app-1",
+        "pg": { "username": "biz_user", "password": "s3cret" },
+    }))
+    .expect("pg accept");
+    assert_eq!(
+        with_pg.pg.as_ref().expect("pg present").username,
+        "biz_user"
+    );
+    with_pg.validate().expect("valid pg passes");
+
+    // 缺省 None：向后兼容（旧调用方不带 pg）
+    let without: DevOpBody =
+        serde_json::from_value(serde_json::json!({ "app_id": "app-1" })).expect("no-pg accept");
+    assert!(without.pg.is_none());
+    without.validate().expect("no pg passes");
+
+    for bad in [
+        // username 过不了 PG 标识符白名单（含 '-'）
+        serde_json::json!({ "app_id": "app-1", "pg": { "username": "bad-name", "password": "x" } }),
+        // 密码为空
+        serde_json::json!({ "app_id": "app-1", "pg": { "username": "ok_user", "password": "" } }),
+    ] {
+        let body: DevOpBody = serde_json::from_value(bad).expect("parse ok");
+        assert!(body.validate().is_err(), "invalid pg must fail validation");
+    }
+}

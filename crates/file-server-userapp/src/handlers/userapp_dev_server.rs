@@ -107,6 +107,10 @@ fn map_app_cli_evt(json: &str) -> Option<EvtOutcome> {
 /// 终态后端口经 `GET /api/v1/userapp/dev/list` 查询（Userapp workspace 恒为 pingap 9080）。
 /// 入参 basePath 对 Userapp workspace（manifest/app-cli 引擎）**无效**
 /// ——pingap 路由前缀由各服务 project.manifest.toml `[proxy].path` 决定。
+/// 入参 pg（可选，与 prod start/restart 的 `pg` 同构 wire）：给出则注入
+/// 编排进程 env 的 `POSTGRES_USER`/`POSTGRES_PASSWORD`（覆盖容器默认透传）
+/// ——save-db-credential 改密后由调用方带上新凭据，避免服务连不上库；
+/// 不传维持旧行为（容器 env 透传）。
 #[utoipa::path(
     post,
     path = "/dev/start",
@@ -138,6 +142,7 @@ pub(crate) async fn dev_start(
             state,
             &body.app_id,
             body.base_path.map(|s| s.to_string()),
+            body.pg.clone(),
             DevTaskAction::Start,
             precheck,
         )
@@ -218,6 +223,7 @@ pub(crate) async fn dev_stop(
 /// start_fail，单服务失败不阻塞其余）同 start 的说明。进度/结果查询同 start。
 /// 入参 basePath 对 Userapp
 /// workspace 无效（同 start 的说明）。
+/// 入参 pg（可选）语义同 start 的说明（注入编排 env、覆盖容器默认透传）。
 #[utoipa::path(
     post,
     path = "/dev/restart",
@@ -248,6 +254,7 @@ pub(crate) async fn dev_restart(
             state,
             &body.app_id,
             body.base_path.map(|s| s.to_string()),
+            body.pg.clone(),
             DevTaskAction::Restart,
             precheck,
         )
@@ -274,10 +281,14 @@ pub(crate) enum DevTaskAction {
 /// workspace 就绪性（resolve + 源码态判定）由调用方受理前置校验
 /// （`precheck_dev_workspace`）完成并以 `precheck` 传入——空目录 /
 /// manifest 无可用服务在受理期即同步 4xx 拒绝，不再进入本函数。
+///
+/// `pg`：请求携带的 PG 凭据（可选）——透传给编排器 spawn（注入
+/// POSTGRES_USER/POSTGRES_PASSWORD 覆盖容器默认透传）；None 维持旧行为。
 async fn spawn_dev_task(
     state: UserAppState,
     app_id: &str,
     base_path: Option<String>,
+    pg: Option<shared_types::StartPgCredential>,
     action: DevTaskAction,
     precheck: crate::service::userapp::DevWorkspacePrecheck,
 ) -> Result<String, AppError> {
@@ -422,14 +433,16 @@ async fn spawn_dev_task(
             match action {
                 DevTaskAction::Start => {
                     state
-                        .fs.dev_server
-                        .start_dev(&key, &run_root, base_path.as_deref(), Some(hooks.clone()))
+                        .fs
+                        .dev_server
+                        .start_dev(&key, &run_root, base_path.as_deref(), Some(hooks.clone()), pg.as_ref())
                         .await?;
                 }
                 DevTaskAction::Restart => {
                     state
-                        .fs.dev_server
-                        .restart_dev(&key, &run_root, base_path.as_deref(), Some(hooks.clone()))
+                        .fs
+                        .dev_server
+                        .restart_dev(&key, &run_root, base_path.as_deref(), Some(hooks.clone()), pg.as_ref())
                         .await?;
                 }
             }
@@ -715,6 +728,7 @@ mod precheck_reply_tests {
             Json(DevOpBody {
                 app_id: "app-7".into(),
                 base_path: None,
+                pg: None,
             }),
         )
         .await;

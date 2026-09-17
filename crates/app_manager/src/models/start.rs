@@ -80,14 +80,10 @@ pub enum DeployMode {
     Hot,
 }
 
-/// PG 凭据（start/restart 部署时自动对齐）。
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-pub struct StartPgCredential {
-    /// PG 账号名（已存在角色；须过 PG 标识符白名单）
-    pub username: String,
-    /// 目标密码（与开发环境保持一致的值）
-    pub password: String,
-}
+/// PG 凭据（start/restart 部署时自动对齐）——wire 契约已下沉 `shared_types`
+/// （dev 链 file-server-userapp 与 prod 链共用同一形状），此处再导出保持
+/// `crate::models::StartPgCredential` 公共路径稳定。
+pub use shared_types::StartPgCredential;
 
 /// start/restart 响应（传统启停语义 = runtime 字段；部署增强字段按请求出现）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

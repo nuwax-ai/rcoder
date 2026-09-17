@@ -115,24 +115,47 @@ const DB_CREDENTIAL_ENV_KEYS: [&str; 9] = [
 
 /// 最小化 env (对齐 nuwax: PATH + NODE_ENV=development + extra; 补 HOME 供 pnpm cache;
 /// 透传数据库凭据族——dev 形态与生产形态的取数行为对齐)。
+///
+/// 同键冲突 last-wins：`extra` 追加在透传之后，可覆盖白名单透传值——
+/// dev start/restart 请求的 `pg` 凭据（POSTGRES_USER/POSTGRES_PASSWORD）
+/// 经此通道覆盖容器 env 默认（save-db-credential 改密后的新值）。
 fn minimal_env(extra: &[(String, String)]) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = Vec::new();
-    if let Ok(p) = std::env::var("PATH") {
-        env.push(("PATH".into(), p));
-    }
-    if let Ok(h) = std::env::var("HOME") {
-        env.push(("HOME".into(), h));
-    }
-    for key in DB_CREDENTIAL_ENV_KEYS {
-        if let Ok(v) = std::env::var(key) {
-            env.push((key.into(), v));
+    minimal_env_with_source(extra, |k| std::env::var(k).ok())
+}
+
+/// [`minimal_env`] 的可测试形态：透传源经参数注入（测试不依赖/不修改全局
+/// env——Rust 2024 set_var 为 unsafe，项目禁用）。
+fn minimal_env_with_source(
+    extra: &[(String, String)],
+    passthrough: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    /// 追加键值，同键覆盖（last-wins）：保证 extra 覆盖透传值的契约显式成立，
+    /// 不依赖 `Command::envs` 对重复键的顺序语义。
+    fn push_override(env: &mut Vec<(String, String)>, k: &str, v: String) {
+        if let Some(slot) = env.iter_mut().find(|(ek, _)| ek == k) {
+            slot.1 = v;
+        } else {
+            env.push((k.to_string(), v));
         }
     }
-    env.push(("NODE_ENV".into(), "development".into()));
-    env.push(("ROLLUP_WASM".into(), "1".into()));
-    env.push(("ROLLUP_DISABLE_NATIVE".into(), "1".into()));
+
+    let mut env: Vec<(String, String)> = Vec::new();
+    if let Some(p) = passthrough("PATH") {
+        push_override(&mut env, "PATH", p);
+    }
+    if let Some(h) = passthrough("HOME") {
+        push_override(&mut env, "HOME", h);
+    }
+    for key in DB_CREDENTIAL_ENV_KEYS {
+        if let Some(v) = passthrough(key) {
+            push_override(&mut env, key, v);
+        }
+    }
+    push_override(&mut env, "NODE_ENV", "development".into());
+    push_override(&mut env, "ROLLUP_WASM", "1".into());
+    push_override(&mut env, "ROLLUP_DISABLE_NATIVE", "1".into());
     for (k, v) in extra {
-        env.push((k.clone(), v.clone()));
+        push_override(&mut env, k, v.clone());
     }
     env
 }
@@ -530,6 +553,42 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "APP_CLI_RUN_PROFILE" && v == "dev")
         );
+    }
+
+    /// extra 覆盖白名单透传值（last-wins 契约）：save-db-credential 改密后
+    /// dev start/restart 的 pg 凭据必须能覆盖容器 env 透传的 POSTGRES_*——
+    /// 覆盖失效会让服务进程拿旧密码连新密码库（凭据断链复发）。
+    #[test]
+    fn minimal_env_extra_overrides_passthrough() {
+        use super::minimal_env_with_source;
+
+        let passthrough = |k: &str| match k {
+            "POSTGRES_USER" | "POSTGRES_PASSWORD" | "POSTGRES_DB" => Some("dev".to_string()),
+            _ => None,
+        };
+        let env = minimal_env_with_source(
+            &[
+                ("APP_CLI_RUN_PROFILE".to_string(), "dev".to_string()),
+                ("POSTGRES_USER".to_string(), "biz_user".to_string()),
+                ("POSTGRES_PASSWORD".to_string(), "s3cret".to_string()),
+            ],
+            passthrough,
+        );
+        // 同键恰一项，值为 extra（覆盖透传的 dev/dev）
+        for (key, expect) in [
+            ("POSTGRES_USER", "biz_user"),
+            ("POSTGRES_PASSWORD", "s3cret"),
+        ] {
+            let hits: Vec<&String> = env
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v)
+                .collect();
+            assert_eq!(hits.len(), 1, "{key} 恰一项: {env:?}");
+            assert_eq!(hits[0], expect);
+        }
+        // 未被 extra 覆盖的白名单键维持透传值
+        assert!(env.iter().any(|(k, v)| k == "POSTGRES_DB" && v == "dev"));
     }
 
     #[test]

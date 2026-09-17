@@ -54,12 +54,16 @@ impl DevServerManager {
     ///
     /// `hooks`：app-cli 编排事件钩子（仅 manifest 引擎消费——Userapp dev
     /// 链路转发任务 SSE + 流结束通知；web 域 vite 路径传 None）。
+    /// `pg`：PG 数据库凭据（仅 manifest 引擎消费——注入编排进程 env 的
+    /// POSTGRES_USER/POSTGRES_PASSWORD，覆盖容器默认透传；web 域/keep_alive
+    /// 等无凭据来源的调用方传 None，维持透传行为）。
     pub async fn start_dev(
         &self,
         project_id: &str,
         project_path: &Path,
         base_path: Option<&str>,
         hooks: Option<super::supervise::DevEventHooks>,
+        pg: Option<&shared_types::StartPgCredential>,
     ) -> AppResult<StartedDev> {
         // 启动锁
         {
@@ -75,7 +79,7 @@ impl DevServerManager {
             starting: &self.starting,
             project_id: project_id.to_string(),
         };
-        self.start_dev_inner(project_id, project_path, base_path, hooks)
+        self.start_dev_inner(project_id, project_path, base_path, hooks, pg)
             .await
     }
 
@@ -85,6 +89,7 @@ impl DevServerManager {
         project_path: &Path,
         base_path: Option<&str>,
         hooks: Option<super::supervise::DevEventHooks>,
+        pg: Option<&shared_types::StartPgCredential>,
     ) -> AppResult<StartedDev> {
         // Userapp workspace 分流：workspace.manifest.toml 存在 → app-cli 引擎。
         // manifest 多服务（Java/Go 等）的正确运行态 = app-cli 按 run.command
@@ -95,7 +100,7 @@ impl DevServerManager {
         let manifest = project_path.join("workspace.manifest.toml");
         if tokio::fs::try_exists(&manifest).await.unwrap_or(false) {
             return self
-                .start_dev_manifest(project_id, project_path, hooks)
+                .start_dev_manifest(project_id, project_path, hooks, pg)
                 .await;
         }
         // 幂等: 已运行则返回现有 pid/port
@@ -270,6 +275,7 @@ impl DevServerManager {
         project_id: &str,
         project_path: &Path,
         hooks: Option<super::supervise::DevEventHooks>,
+        pg: Option<&shared_types::StartPgCredential>,
     ) -> AppResult<StartedDev> {
         // 单一来源 shared_types::APP_ENTRY_PORT（release 流程、Pingora 免端口代理同值）
         const PINGAP_ENTRY_PORT: u16 = shared_types::APP_ENTRY_PORT;
@@ -303,9 +309,18 @@ impl DevServerManager {
         // env 注入 APP_CLI_RUN_PROFILE=dev：源码态 dev 链路信号——app-cli 编排
         // 时 [devrun].command 优先、[run].command 兜底（产物态/生产不注入恒走
         // [run]，见 app-cli supervisor::effective_run_argv）。
+        // pg 凭据（可选，与 prod StartAppRequest.pg 同构 wire）：注入
+        // POSTGRES_USER/POSTGRES_PASSWORD 覆盖容器 env 透传值（minimal_env
+        // extra last-wins）——save-db-credential 改密后 dev start/restart 由
+        // 调用方携带新凭据，编排的服务进程才能拿到与容器内 PG 一致的密码。
         // P1-03：编排器程序可经 config.app_cli_bin 覆盖（默认 PATH 的 app-cli；
         // 测试注入受控假编排器，生产行为不变）。
         let program = self.config.app_cli_bin.as_deref().unwrap_or("app-cli");
+        let mut env_extra = vec![("APP_CLI_RUN_PROFILE".to_string(), "dev".to_string())];
+        if let Some(pg) = pg {
+            env_extra.push(("POSTGRES_USER".to_string(), pg.username.clone()));
+            env_extra.push(("POSTGRES_PASSWORD".to_string(), pg.password.clone()));
+        }
         let (child, stdout, stderr) = process::spawn_dev(
             program,
             &[
@@ -317,7 +332,7 @@ impl DevServerManager {
                 "0.0.0.0:3010".to_string(),
             ],
             project_path,
-            &[("APP_CLI_RUN_PROFILE".to_string(), "dev".to_string())],
+            &env_extra,
         )?;
         // P1-03：Child 收编唯一监督 worker（wait/reap 真实 ExitStatus + stdout
         // 管道句柄 + stderr ring）——不再 drop(child)；停止仍走进程组信号路径。
@@ -435,5 +450,125 @@ impl DevServerManager {
         // --config.confirmModulesPurge=false 兜底 (见 pnpm/cli.rs)。
         crate::service::pnpm_config::create_pnpm_npmrc(project_path).await?;
         crate::service::pnpm_config::sanitize_pnpm_built_dependencies_config(project_path).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// 假编排器测试装配：脚本 dump 自身 env 后驻留 60s（宽松就绪——HTTP 探不到
+    /// 但进程存活即过，与 vite 路径同语义）。返回 env dump 文件路径。
+    fn fake_orchestrator(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dump = dir.join("env.txt");
+        let script = dir.join("fake-app-cli.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nenv | sort > '{}'\nsleep 60\n", dump.display()),
+        )
+        .expect("write fake orchestrator");
+        #[allow(clippy::unnecessary_cast)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755u32))
+                .expect("chmod script");
+        }
+        (dump, script)
+    }
+
+    fn manager_with(script: &Path, logs: &Path) -> DevServerManager {
+        let mut config = crate::Config::from_env().expect("test config");
+        config.app_cli_bin = Some(script.display().to_string());
+        config.log_base_dir = logs.to_path_buf();
+        // 快速宽松就绪（假编排器不监听 9080，走"进程存活"分支）
+        config.dev_alive_max_wait_ms = 300;
+        config.dev_alive_check_timeout_ms = 100;
+        config.dev_alive_poll_interval_ms = 50;
+        DevServerManager::new(Arc::new(config))
+    }
+
+    /// 等待假编排器落盘 env dump（spawn 异步于断言）。
+    async fn wait_dump(dump: &Path) -> String {
+        for _ in 0..200 {
+            if let Ok(txt) = std::fs::read_to_string(dump)
+                && !txt.is_empty()
+            {
+                return txt;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("fake orchestrator env dump not written: {}", dump.display());
+    }
+
+    /// pg 凭据注入：start_dev_manifest(Some) 必须把 POSTGRES_USER/PASSWORD
+    /// 写进编排进程 env（覆盖容器默认透传）——save-db-credential 改密后的
+    /// 新凭据经此到达服务进程；None 则维持容器 env 透传行为（父进程无该键
+    /// 时结果里不出现）。
+    #[tokio::test]
+    async fn start_dev_manifest_pg_credential_env_injection() {
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        // manifest 分流标记（内容不消费——分流只看存在性；假编排器不读它）
+        std::fs::write(ws.path().join("workspace.manifest.toml"), "").expect("manifest marker");
+        let dir = tempfile::tempdir().expect("harness tempdir");
+        let (dump, script) = fake_orchestrator(dir.path());
+        let manager = manager_with(&script, &dir.path().join("logs"));
+
+        // Some(pg)：注入覆盖
+        let pg = shared_types::StartPgCredential {
+            username: "biz_user".into(),
+            password: "s3cret".into(),
+        };
+        let started = manager
+            .start_dev("pg-inject-test", ws.path(), None, None, Some(&pg))
+            .await
+            .expect("start manifest dev");
+        assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
+        let env_txt = wait_dump(&dump).await;
+        for expect in [
+            "POSTGRES_USER=biz_user",
+            "POSTGRES_PASSWORD=s3cret",
+            "APP_CLI_RUN_PROFILE=dev",
+        ] {
+            assert!(
+                env_txt.lines().any(|l| l == expect),
+                "expect {expect} in orchestrator env:\n{env_txt}"
+            );
+        }
+        manager.stop_dev("pg-inject-test").await.expect("stop dev");
+
+        // None：不注入——期望值 = 父进程 env 透传结果（无则不出现）
+        std::fs::remove_file(&dump).expect("reset dump");
+        let started = manager
+            .start_dev("pg-inject-none-test", ws.path(), None, None, None)
+            .await
+            .expect("start manifest dev (no pg)");
+        assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
+        let env_txt = wait_dump(&dump).await;
+        for (key, injected) in [
+            ("POSTGRES_USER", "biz_user"),
+            ("POSTGRES_PASSWORD", "s3cret"),
+        ] {
+            let lines: Vec<String> = env_txt
+                .lines()
+                .filter(|l| l.starts_with(&format!("{key}=")))
+                .map(|l| l.to_string())
+                .collect();
+            match std::env::var(key) {
+                Ok(parent) => {
+                    // 白名单透传：值 = 父进程值（绝不能是注入值）
+                    assert_eq!(lines, vec![format!("{key}={parent}")], "passthrough {key}");
+                }
+                Err(_) => assert!(lines.is_empty(), "{key} 不得凭空出现: {lines:?}"),
+            }
+            assert!(
+                !lines.iter().any(|l| l == &format!("{key}={injected}")),
+                "None 时不得注入 {key}"
+            );
+        }
+        manager
+            .stop_dev("pg-inject-none-test")
+            .await
+            .expect("stop dev");
     }
 }
