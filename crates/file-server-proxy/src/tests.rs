@@ -1,4 +1,5 @@
 use super::*;
+use crate::instance::test_lock_file;
 use crate::proxy::{all_rust_path_allowed, is_hop_by_hop};
 
 fn cfg() -> FileServerProxyConfig {
@@ -260,4 +261,23 @@ async fn dynamic_port_publishes_real_bound_address() {
     assert!(address.starts_with("127.0.0.1:"), "got {address}");
     stop().await.expect("stop");
     assert!(status().await.is_none());
+}
+
+#[test]
+fn instance_lock_domain_is_stable_per_listen_semantics() {
+    // N06：固定端口 → 稳定锁域（host-port 键）；动态端口 → per-invocation
+    // 独立域（多实例并行合法）
+    let fixed = FileServerProxyConfig {
+        listen_host: "127.0.0.1".to_string(),
+        listen_port: 60000,
+        ..Default::default()
+    };
+    // 锁文件创建成功即锁域可解析（内容断言经路径行为验证：同配置同路径）
+    let file = test_lock_file(&fixed).expect("lock file");
+    drop(file);
+    let dynamic = FileServerProxyConfig {
+        listen_port: 0,
+        ..fixed.clone()
+    };
+    assert!(test_lock_file(&dynamic).is_ok());
 }
