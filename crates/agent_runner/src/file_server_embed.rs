@@ -58,6 +58,7 @@ pub async fn spawn_file_server_proxy(rust_upstream_port: u16) {
     let listen_port = env_port("FILE_SERVER_PORT", AGENT_FILE_SERVER_PORT);
     let policy = resolve_policy(std::env::var("FILE_SERVER_PROXY_POLICY").ok().as_deref());
     file_server_proxy::init(FileServerProxyConfig {
+        listen_host: "0.0.0.0".to_string(),
         listen_port,
         rust_upstream_port,
         ts_upstream_port: NUWAX_FILE_SERVER_INTERNAL_PORT,
