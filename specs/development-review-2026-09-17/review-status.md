@@ -53,3 +53,18 @@
 | R11(批1) | `62947c6e` | xmlrpc RpcFault typed downcast（faultCode 10 优先+措辞兜底；网络错误文案反例不再误判）；DownloadError::Http 结构化 status（is_retryable 按码；URL 文案反例）；InstallFailed 死变体删除 |
 
 **仍未完成**：R02（CLI 转交/最后受理生效）、R11 剩余三处（cluster_cache not_found / chat timed-out / Vite PortInUse 链）、B05（Secret 轮换 rollout）、N03–N10（proxy 原生形态/端口/随包/分发）、NT 矩阵大部。
+
+### 2026-09-18 第三批：R11 错误类型化全部完成
+
+| 点 | 提交 | 摘要 |
+|---|---|---|
+| xmlrpc RpcFault | `62947c6e` | typed downcast（faultCode 10 BAD_NAME 优先+措辞兜底；网络错误文案反例） |
+| DownloadError::Http | `62947c6e` | 结构化 status（is_retryable 按码；InstallFailed 死变体删除） |
+| EnsurePodResponse.code | `9ac39c6c` | not_found 判定读信封 code 字段（降级策略不变） |
+| AcpError::Timeout | `9ac39c6c` | 类型化（仅等待完成超时；CLI 退出码 downcast） |
+| Vite PortInUse 链 | `2e835975` | AppError::ProcessPortInUse 类型变体（文案改分类不变；旧标记文案反例）+ pnpm 单通道 |
+| pnpm message 通道 | `2e835975` | 只留 typed code（classify 边界解析保留） |
+
+R11 五点全部落地（每点带反例测试）。全 workspace 2334 测试 2333 通过（唯一失败为既有 RCODER_RUNTIME_IMAGE_DIGEST 环境前置项）；fmt/clippy 零告警。
+
+**剩余未完成（后续批次）**：R02（CLI 转交/最后受理生效/attach 语义）、B05（Secret 轮换 rollout 标识）、N03–N10（proxy 原生形态/端口计划/随包 Pingap/分发安全）、R02 相关的期望-构建 task 强绑定、NT 矩阵大部。
