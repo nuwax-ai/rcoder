@@ -10,10 +10,12 @@ repository.workspace = true
 default = []
 
 # PostgreSQL 持久化后端（write-behind + 启动全量加载）。
-# 未选择 pg/sqlite 后端时不编译 sqlx。
+# 未选择 pg 后端时不编译 sqlx。
 # rcoder 侧经 feature `rcoder-pg = ["kubernetes", "rcoder-storage/pg"]` 转发开启。
 pg = ["sqlx", "sqlx/postgres", "moka"]
-sqlite = ["sqlx", "sqlx/sqlite-bundled", "dep:nix"]
+# 本地 Turso 控制存储（specs/userapp-turso-local-storage，替代 SQLx SQLite）。
+# default-features = false 裁掉 FTS/分配器等无需求项；nix 供独占目录锁使用。
+userapp-turso = ["dep:turso", "dep:futures", "dep:sha2", "dep:nix"]
 
 [lints]
 workspace = true
@@ -42,6 +44,9 @@ moka = { workspace = true, optional = true }
 
 uuid = { workspace = true }
 nix = { workspace = true, optional = true }
+turso = { version = "0.8.0-pre.11", default-features = false, optional = true }
+futures = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

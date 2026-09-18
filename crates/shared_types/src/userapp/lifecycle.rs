@@ -701,44 +701,55 @@ pub enum UserAppStoreError {
     Storage(#[source] anyhow::Error),
 }
 
-/// All mutating methods commit atomically and return only after commit. A storage
-/// error is never equivalent to absence. Implementations must not call runtimes.
+/// Transactional UserApp lifecycle storage contract.
+///
+/// - Every mutating method's success response happens strictly after its
+///   transaction commits; a failure response does not claim the transaction
+///   never committed (commit-unknown is retried by the original operation
+///   identity, never by allocating a new one).
+/// - A storage error is never equivalent to absence: parse failures, database
+///   unavailability and corrupted record relationships must be `Err`.
+/// - Database transactions must not run Docker/K8s/HTTP work. External resource
+///   release follows the recoverable "persist evidence/receipt → conditional
+///   release → exact receipt forget" flow instead of one atomic transaction.
+/// - Implementations must not call runtimes. Complete backends implement every
+///   method — there are no optional capabilities on this trait.
 #[async_trait::async_trait]
 pub trait UserAppLifecycleStore: Send + Sync {
-    /// Each page uses a single statement snapshot; rows must not combine a stale
-    /// lifecycle pointer with an operation observed after a concurrent commit.
+    /// Physical ownership fence lookup. A binding is immutable once committed;
+    /// callers must not treat absence as free-for-adoption without CAS via
+    /// [`Self::commit_resource_binding`].
     async fn get_resource_binding(
         &self,
         service_type: &crate::ServiceType,
         physical_uid: &str,
-    ) -> Result<Option<crate::UserAppResourceBinding>, UserAppStoreError> {
-        let _ = (service_type, physical_uid);
-        Err(UserAppStoreError::InvalidOperation(
-            "Physical resource bindings are unsupported".into(),
-        ))
-    }
-    /// Atomically commits the physical binding and successful adoption outcome.
+    ) -> Result<Option<crate::UserAppResourceBinding>, UserAppStoreError>;
+    /// Commits the physical binding and the successful adoption outcome in one
+    /// transaction — never a standalone binding write followed by an advance.
     async fn commit_resource_binding(
         &self,
         binding: &crate::UserAppResourceBinding,
         progress: &UserAppOperationProgress,
-    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
-        let _ = (binding, progress);
-        Err(UserAppStoreError::InvalidOperation(
-            "Physical resource bindings are unsupported".into(),
-        ))
-    }
+    ) -> Result<UserAppOperationRecord, UserAppStoreError>;
 
+    /// Each page's application record and its per-scope operations must come
+    /// from one statement snapshot (or one consistent transaction); pages may
+    /// observe concurrent commits between them, so recovery must re-CAS instead
+    /// of treating the whole scan as one global snapshot.
     async fn list_control_snapshots(
         &self,
         after_app_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<UserAppControlSnapshot>, UserAppStoreError>;
 
+    /// Creates or reads identity in one transaction; repeated calls never
+    /// overwrite an existing identity or tombstone.
     async fn ensure_identity(
         &self,
         app_id: &str,
     ) -> Result<UserAppLifecycleRecord, UserAppStoreError>;
+    /// Returns `Ok(None)` only when no matching row exists; parse failures and
+    /// storage failures are `Err`.
     async fn get_application(
         &self,
         app_id: &str,
@@ -756,37 +767,31 @@ pub trait UserAppLifecycleStore: Send + Sync {
         &self,
         legacy: &crate::AppMetadataRecord,
     ) -> Result<UserAppLifecycleRecord, UserAppStoreError>;
+    /// Validates lifecycle identity and metadata revision, then applies the
+    /// patch atomically without clobbering concurrent changes.
     async fn patch_metadata(
         &self,
         patch: &UserAppMetadataPatch,
     ) -> Result<UserAppLifecycleRecord, UserAppStoreError>;
+    /// Equivalent to `admit_with_input(request, None)`.
     async fn admit(
         &self,
         request: &UserAppAdmission,
     ) -> Result<UserAppAdmissionOutcome, UserAppStoreError>;
-    /// Private execution input is committed in the same transaction as admission.
+    /// Commits identity, request idempotency, scope conflict checks, the
+    /// operation, request mapping, active slot and the private execution input
+    /// in one transaction; every failure rolls back fully.
     async fn admit_with_input(
         &self,
         request: &UserAppAdmission,
         input: Option<&UserAppExecutionInput>,
-    ) -> Result<UserAppAdmissionOutcome, UserAppStoreError> {
-        if input.is_some() {
-            return Err(UserAppStoreError::InvalidOperation(
-                "Private execution inputs are unsupported".into(),
-            ));
-        }
-        self.admit(request).await
-    }
-    /// Available only to the executor that owns the current lifecycle operation.
+    ) -> Result<UserAppAdmissionOutcome, UserAppStoreError>;
+    /// Available only to the executor that owns the current lifecycle operation;
+    /// never exposed through public HTTP surfaces.
     async fn read_execution_input(
         &self,
         context: &UserAppExecutionContext,
-    ) -> Result<UserAppExecutionInput, UserAppStoreError> {
-        let _ = context;
-        Err(UserAppStoreError::InvalidOperation(
-            "Private execution inputs are unsupported".into(),
-        ))
-    }
+    ) -> Result<UserAppExecutionInput, UserAppStoreError>;
     /// 绑定操作执行 deadline（epoch ms，旁记录——不动 DeployInput；bind-once：
     /// 已存在时返回持久化值不覆盖，不同副本配置不同也不得各绑各的候选值）。
     /// 与受理原子写入（或至少在任何运行时副作用之前完成；失败 fail-closed）。
@@ -804,58 +809,41 @@ pub trait UserAppLifecycleStore: Send + Sync {
         app_id: &str,
         operation_id: &str,
     ) -> Result<Option<i64>, UserAppStoreError>;
+    /// Validates executor identity and receipt ownership; must not overwrite a
+    /// different owner's live credential.
     async fn bind_operation_lease(
         &self,
         context: &UserAppExecutionContext,
         receipt: &crate::UserAppOperationLeaseReceipt,
-    ) -> Result<(), UserAppStoreError> {
-        let _ = (context, receipt);
-        Err(UserAppStoreError::InvalidOperation(
-            "Durable operation lease binding is unsupported".into(),
-        ))
-    }
+    ) -> Result<(), UserAppStoreError>;
     async fn get_operation_lease(
         &self,
         app_id: &str,
         operation_id: &str,
-    ) -> Result<Option<crate::UserAppOperationLeaseBinding>, UserAppStoreError> {
-        let _ = (app_id, operation_id);
-        Err(UserAppStoreError::InvalidOperation(
-            "Durable operation lease binding is unsupported".into(),
-        ))
-    }
-    /// Bounded page of terminal operations whose exact mutex receipt still needs cleanup.
+    ) -> Result<Option<crate::UserAppOperationLeaseBinding>, UserAppStoreError>;
+    /// Bounded page of terminal operations whose exact mutex receipt still
+    /// needs cleanup; stable cursor, bounded page size, existing filters only.
     async fn terminal_operation_leases(
         &self,
         after: Option<&str>,
         limit: u32,
-    ) -> Result<Vec<crate::UserAppOperationLeaseBinding>, UserAppStoreError> {
-        let _ = (after, limit);
-        Err(UserAppStoreError::InvalidOperation(
-            "Terminal lease discovery is unsupported".into(),
-        ))
-    }
-    /// Forget a receipt only after conditional runtime release and a terminal SQL result.
+    ) -> Result<Vec<crate::UserAppOperationLeaseBinding>, UserAppStoreError>;
+    /// Forgets a receipt only after conditional runtime release and a terminal
+    /// SQL result; exact-receipt match only, never bulk cleanup by app_id.
     async fn forget_operation_lease(
         &self,
         binding: &crate::UserAppOperationLeaseBinding,
-    ) -> Result<(), UserAppStoreError> {
-        let _ = binding;
-        Err(UserAppStoreError::InvalidOperation(
-            "Terminal lease cleanup is unsupported".into(),
-        ))
-    }
-    /// Reserve only a confirmed final checkpoint. This authorizes mutex cleanup,
-    /// never replay of application writes or adoption of an unfinished executor.
+    ) -> Result<(), UserAppStoreError>;
+    /// Reserves only a confirmed final checkpoint. This authorizes mutex cleanup,
+    /// never replay of application writes or adoption of an unfinished executor;
+    /// not a generic forced-takeover or lock-clearing entry point.
     async fn reserve_completed_operation(
         &self,
         snapshot: &UserAppOperationRecord,
-    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
-        let _ = snapshot;
-        Err(UserAppStoreError::InvalidOperation(
-            "Completed operation recovery is unsupported".into(),
-        ))
-    }
+    ) -> Result<UserAppOperationRecord, UserAppStoreError>;
+    /// Validates app/lifecycle/operation/executor/revision and the correct scope
+    /// slot, then advances record and slot atomically; only ever releases the
+    /// current operation's own slot.
     async fn advance(
         &self,
         progress: &UserAppOperationProgress,
@@ -871,11 +859,15 @@ pub trait UserAppLifecycleStore: Send + Sync {
         app_id: &str,
         operation_id: &str,
     ) -> Result<Option<UserAppOperationRecord>, UserAppStoreError>;
+    /// Stable cursor, bounded page size, existing filters only — must not
+    /// degenerate into an unbounded full-table load.
     async fn unfinished_operations(
         &self,
         after_operation_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<UserAppOperationRecord>, UserAppStoreError>;
+    /// Creates a new lifecycle generation atomically against the expected old
+    /// lifecycle and request id; repeated requests keep the existing idempotency.
     async fn recreate(
         &self,
         app_id: &str,

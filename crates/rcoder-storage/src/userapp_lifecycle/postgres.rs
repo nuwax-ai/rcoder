@@ -46,3 +46,14 @@ implement_store!(
     "SELECT record FROM userapp_lifecycles WHERE app_id=$1 FOR UPDATE",
     "SELECT l.record, d.record, p.record, a.record FROM userapp_lifecycles l LEFT JOIN userapp_operations d ON d.operation_id=(l.record::jsonb -> 'active_operations' ->> 'dev') AND d.app_id=l.app_id LEFT JOIN userapp_operations p ON p.operation_id=(l.record::jsonb -> 'active_operations' ->> 'prod') AND p.app_id=l.app_id LEFT JOIN userapp_operations a ON a.operation_id=(l.record::jsonb -> 'active_operations' ->> 'application') AND a.app_id=l.app_id WHERE l.app_id > $1 ORDER BY l.app_id LIMIT $2"
 );
+
+/// 关机控制（trait-design §6）：关闭 store 持有的池。生产装配只经
+/// [`PgUserAppStore::connect`]（专用池，所有权独占）；外部注入共享池的
+/// 场景不构造本控制句柄——控制方不得关闭其他业务拥有的池。
+#[async_trait::async_trait]
+impl crate::userapp_lifecycle::control::UserAppStoreControl for PgUserAppStore {
+    async fn shutdown(&self) -> Result<(), Error> {
+        self.pool.close().await;
+        Ok(())
+    }
+}

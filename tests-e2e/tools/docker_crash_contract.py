@@ -5,12 +5,12 @@ import os
 import re
 from pathlib import Path
 import signal
-import sqlite3
 import subprocess
 import tempfile
 import time
+import urllib.request
 import uuid
-from sqlite_runtime_contract import REPO, command, http, wait_ready, service_config, isolated_config, remove_private_config
+from turso_runtime_contract import REPO, command, http, wait_ready, service_config, isolated_config, remove_private_config
 
 MODES = ('before_create', 'after_start')
 
@@ -24,12 +24,17 @@ def wait_file(path, deadline, process_id=None):
         time.sleep(0.02)
 
 
-def db_operation(root, app):
-    with sqlite3.connect((root / 'data/userapp.sqlite3').as_uri() + '?mode=ro', uri=True) as database:
-        rows = database.execute('SELECT record FROM userapp_operations WHERE app_id=?', (app,)).fetchall()
-    if len(rows) != 1:
+def db_operation(base, app, user):
+    # T4：运行中观察走 HTTP（SQLite 引擎不读 Turso 活库；跨引擎 mmap 读
+    # 已被容器 SIGBUS 实测排除）。operations/current 返回在途/最近权威操作。
+    request = base + '/api/v1/userapp/' + app + '/operations/current?user_id=' + user
+    with urllib.request.urlopen(request, timeout=10) as response:
+        body = json.load(response)
+    operations = body.get('data') if body.get('code') == '0000' else None
+    # operations/current 返回全部在途槽位；故障窗口内恰一条在途操作
+    if not isinstance(operations, list) or len(operations) != 1:
         raise RuntimeError('expected exactly one original durable operation')
-    return json.loads(rows[0][0])
+    return operations[0]
 
 
 def owned_builder_rows(receipt):
@@ -37,7 +42,9 @@ def owned_builder_rows(receipt):
     rows = json.loads(command('docker', 'inspect', *ids)) if ids else []
     for row in rows:
         labels = row['Config'].get('Labels') or {}
-        if (labels.get('rcoder.io/owner-id') != receipt['user_id'] or labels.get('service-type') != 'user-app-builder'
+        # owner-id 已随用户绑定移除退役；物理身份锚定 application-id（filter）+
+        # service-type + lifecycle-id
+        if (labels.get('service-type') != 'user-app-builder'
                 or not labels.get('rcoder.io/lifecycle-id')):
             raise RuntimeError('fault fixture discovered a foreign resource')
     return rows
@@ -106,8 +113,8 @@ def main():
         (root / 'ownership.json').write_text(json.dumps(receipt, indent=2))
         pool = ThreadPoolExecutor(max_workers=1)
         try:
-            expected = os.environ['E2E_SQLITE_BINARY_SHA256']
-            image_id = command('docker', 'image', 'inspect', '--format', '{{.Id}}', os.environ.get('E2E_SQLITE_RUNTIME_IMAGE', 'dev-master-rcoder:latest'))
+            expected = os.environ['E2E_TURSO_BINARY_SHA256']
+            image_id = command('docker', 'image', 'inspect', '--format', '{{.Id}}', os.environ.get('E2E_TURSO_RUNTIME_IMAGE', 'dev-master-rcoder:latest'))
             private = Path(tempfile.mkdtemp(prefix=receipt['project'] + '-config-')) / 'config.yml'
             private.write_text(isolated_config((REPO / 'docker/config.yml').read_text()))
             private.chmod(0o600)
@@ -149,7 +156,7 @@ def main():
             future = pool.submit(http, base, '/api/v1/userapp/workspace', {'app_id': receipt['app_id'], 'user_id': receipt['user_id']})
             wait_file(control / 'barrier.json', time.monotonic() + 90, cid)
             barrier = json.loads((control / 'barrier.json').read_text())
-            original = db_operation(root, receipt['app_id'])
+            original = db_operation(base, receipt['app_id'], receipt['user_id'])
             receipt['lifecycle_id'] = original['lifecycle_id']
             (root / 'ownership.json').write_text(json.dumps(receipt, indent=2))
             builders = owned_builder_rows(receipt)
@@ -177,7 +184,7 @@ def main():
             # quarantine 终态，不放宽断言本身。
             deadline = time.monotonic() + 20
             while True:
-                restored = db_operation(root, receipt['app_id'])
+                restored = db_operation(base, receipt['app_id'], receipt['user_id'])
                 if restored['state'] == 'RecoveryRequired' or time.monotonic() >= deadline:
                     break
                 time.sleep(0.5)
@@ -188,12 +195,12 @@ def main():
                 raise RuntimeError('restart replayed or misclassified an interrupted runtime mutation')
             # Wait through one real 5-second recovery scan, then inspect again.
             time.sleep(6)
-            if len((control / 'create-attempts.jsonl').read_text().splitlines()) != 1 or db_operation(root, receipt['app_id'])['state'] != 'RecoveryRequired':
+            if len((control / 'create-attempts.jsonl').read_text().splitlines()) != 1 or db_operation(base, receipt['app_id'], receipt['user_id'])['state'] != 'RecoveryRequired':
                 raise RuntimeError('periodic recovery replayed an uncertain command')
             (root / 'recovery.json').write_text(json.dumps({'before': original, 'after': restored,
                 'builder_ids': [row['Id'] for row in after], 'rcoder_id': cid, 'image_id': image_id}, indent=2))
             record('Docker ' + mode + ' restart quarantines without replay', True)
-        except (OSError, ValueError, KeyError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
             detail = type(error).__name__ if isinstance(error, (OSError, subprocess.SubprocessError)) \
                 else type(error).__name__ + ': ' + str(error)
             record('Docker ' + mode + ' execution', False, detail)

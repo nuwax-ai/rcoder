@@ -1,7 +1,7 @@
-//! Native SQLite/real-file-lease worker: unreceipted legacy marker safety only.
+//! Native Turso/real-file-lease worker: unreceipted legacy marker safety only.
 //! Does not prove recovery of the newer receipted terminal release protocol.
 use anyhow::{Context, Result, bail};
-use rcoder_storage::userapp_lifecycle::SqliteUserAppStore;
+use rcoder_storage::userapp_lifecycle::TursoUserAppStore;
 use shared_types::{
     AppFileMutationMarker, AppOperationLease, UserAppAdmission, UserAppAdmissionOutcome,
     UserAppControlCommand, UserAppDeletionCheckpoint, UserAppDeletionStage, UserAppLifecycleStore,
@@ -66,7 +66,7 @@ fn progress(
         error_message: None,
     }
 }
-async fn execute(root: &Path, store: &SqliteUserAppStore) -> Result<()> {
+async fn execute(root: &Path, store: &TursoUserAppStore) -> Result<()> {
     let intent = request();
     let identity = store.ensure_identity(&intent.app_id).await?;
     let UserAppAdmissionOutcome::Accepted(operation) = store.admit(&intent).await? else {
@@ -141,7 +141,7 @@ async fn execute(root: &Path, store: &SqliteUserAppStore) -> Result<()> {
     .await
     .map_err(anyhow::Error::msg)
 }
-async fn verify(root: &Path, store: &SqliteUserAppStore) -> Result<()> {
+async fn verify(root: &Path, store: &TursoUserAppStore) -> Result<()> {
     let UserAppAdmissionOutcome::Existing(operation) = store.admit(&request()).await? else {
         bail!("terminal retry was admitted for execution again");
     };
@@ -170,7 +170,7 @@ async fn verify(root: &Path, store: &SqliteUserAppStore) -> Result<()> {
     println!(
         "{}",
         serde_json::json!({"terminal_not_reexecuted": true, "marker_retained": true,
-        "operation_id": operation.operation_id, "evidence_level": "native_process_sqlite_file_lease"})
+        "operation_id": operation.operation_id, "evidence_level": "native_process_turso_file_lease"})
     );
     Ok(())
 }
@@ -186,7 +186,7 @@ async fn main() -> Result<()> {
     if !root.is_absolute() || arguments.next().is_some() {
         bail!("invalid native worker arguments");
     }
-    let store = SqliteUserAppStore::open_exclusive(&root.join("userapp.sqlite3")).await?;
+    let store = TursoUserAppStore::open_exclusive(&root.join("userapp.turso.db")).await?;
     match mode.as_str() {
         "execute" => execute(&root, &store).await,
         "verify" => verify(&root, &store).await,

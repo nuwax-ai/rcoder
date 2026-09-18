@@ -175,8 +175,8 @@ async fn attach_coordinator(
 ) -> (Arc<crate::service::AppService>, tempfile::TempDir) {
     let directory = tempfile::tempdir().expect("wake database directory");
     let store = Arc::new(
-        rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
-            &directory.path().join("wake.sqlite3"),
+        rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+            &directory.path().join("wake.turso.db"),
         )
         .await
         .expect("wake database"),

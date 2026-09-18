@@ -52,21 +52,21 @@ make test-e2e-k8s-userapp \
 
 ## SQLite Compose configuration contract
 
-After implementation freezes, run `python3 tests-e2e/tools/sqlite_compose_contract.py docker/docker-compose.yml` and repeat for both build-agent-docker deployment Compose files. Repeat each with `--named-volume` and with `--data-directory /absolute/isolated/path` for the bind override. This command only resolves configuration, uses no Docker service mutation, and does not print the full interpolated environment. It does not prove SQLite startup, migrations, image features or persistence across container recreation; those require the isolated runtime acceptance. Tool unit cases join the existing `test_*.py` discovery.
+After implementation freezes, run `python3 tests-e2e/tools/turso_compose_contract.py docker/docker-compose.yml` and repeat for both build-agent-docker deployment Compose files. Repeat each with `--named-volume` and with `--data-directory /absolute/isolated/path` for the bind override. This command only resolves configuration, uses no Docker service mutation, and does not print the full interpolated environment. It does not prove Turso startup, migrations, image features or persistence across container recreation; those require the isolated runtime acceptance. Tool unit cases join the existing `test_*.py` discovery.
 
 ### userApp 持久化严格门禁
 
 `make test-e2e` 的 `userapp` 组现在同时包含：
 
-- `sqlite_storage_contract`：固定清单中的 SQLite 组件契约，使用真实临时数据库，验证事务、CAS、去重、生命周期和数据库重新打开。不会启动或重建日常 Compose。
+- `turso_storage_contract`：固定清单中的 Turso 组件契约，使用真实临时 Turso 数据库，验证事务、CAS、去重、生命周期和数据库重新打开。不会启动或重建日常 Compose。
 - `pg_storage_faults`：原 Agent PG 契约以及 userApp 的真实 PG 事务和重连契约；使用本轮独占的 PostgreSQL 17 Compose 项目。userApp 用例以 `--exact --include-ignored` 显式执行，不接受 ignored 或零用例。
 
-可用 `E2E_SUITE=sqlite_storage_contract make test-e2e` 或 `E2E_SUITE=pg_storage_faults make test-e2e` 聚焦。两者均不要求 LLM key。入口冻结测试二进制、保存哈希及逐项输出；固定用例缺失、实际执行数不为 1、失败、中止或缺少报告均不通过。组件测试清单在 `storage_contract_cases.py`，外层必经断言在 `contracts.py`。
+可用 `E2E_SUITE=turso_storage_contract make test-e2e` 或 `E2E_SUITE=pg_storage_faults make test-e2e` 聚焦。两者均不要求 LLM key。入口冻结测试二进制、保存哈希及逐项输出；固定用例缺失、实际执行数不为 1、失败、中止或缺少报告均不通过。组件测试清单在 `storage_contract_cases.py`，外层必经断言在 `contracts.py`。
 
 这些证据不能证明容器挂载或实际进程强杀恢复。三份 Compose 配置解析、运行中 `/app/data` 挂载、容器重建后 HTTP 查询和资源身份保留仍须单独验收；详见 [持久化回归映射](storage-acceptance.md)。
 
-`sqlite_compose_runtime` 是单独的真实 Compose 重建验收，已纳入严格 userapp 组。它需要最终构建证据中的 `E2E_SQLITE_BINARY_SHA256`（64 位小写 SHA-256）和可选 `E2E_SQLITE_RUNTIME_IMAGE`；不能现场读取任意旧镜像哈希再把它当成本轮构建证据。默认镜像为 `dev-master-rcoder:latest`，实际按解析后的不可变 image ID 启动。
+`turso_compose_runtime` 是单独的真实 Compose 重建验收，已纳入严格 userapp 组。它需要最终构建证据中的 `E2E_TURSO_BINARY_SHA256`（64 位小写 SHA-256）和可选 `E2E_TURSO_RUNTIME_IMAGE`；不能现场读取任意旧镜像哈希再把它当成本轮构建证据。默认镜像为 `dev-master-rcoder:latest`，实际按解析后的不可变 image ID 启动。
 
 该场景顺序验证三份 Compose 的 SQLite 配置，并分别派生仅含 rcoder 的隔离服务：随机项目名、动态 localhost 端口、run 专属数据及工作空间、禁用两层自动回收，使用镜像二进制。私有配置副本不进入报告，结束后精确删除；SQLite 数据和脱敏证据保留在 run 报告目录供核查。它创建真实 builder 后通过 HTTP 和 SQL 内容核对重建持久化，最后验证错误 SQLite 配置非零退出。若创建结果不确定且无法完成定向清理，将失败并保留控制面及数据供恢复；不能假报清理成功。
 
-`userapp_concurrency_contract` 固定运行 23 个确定性组件测试（创建截止时间、取消观察者、晚订阅、恢复执行槽位、旧代次启动阻止、清空实例身份和不确定租约）。它不执行真实进程强杀，也不证明三个崩溃窗口恢复；单副本实际 HTTP 首开扇入由 `sqlite_compose_runtime` 单列覆盖；跨副本首开仍需 K8s 验收；`docker_lifecycle_crash` 实现前两个 SIGKILL 窗口。新增终态 receipt 扫描属于组件证据，不能将 legacy marker 的 native SIGKILL 测试作为新协议第三窗口验收。
+`userapp_concurrency_contract` 固定运行 23 个确定性组件测试（创建截止时间、取消观察者、晚订阅、恢复执行槽位、旧代次启动阻止、清空实例身份和不确定租约）。它不执行真实进程强杀，也不证明三个崩溃窗口恢复；单副本实际 HTTP 首开扇入由 `turso_compose_runtime` 单列覆盖；跨副本首开仍需 K8s 验收；`docker_lifecycle_crash` 实现前两个 SIGKILL 窗口。新增终态 receipt 扫描属于组件证据，不能将 legacy marker 的 native SIGKILL 测试作为新协议第三窗口验收。

@@ -539,11 +539,16 @@ async fn test_service_with_mode(
     tokio::fs::create_dir_all(workspace_root)
         .await
         .expect("test workspace");
-    let store = rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
-        &workspace_root.join(format!("metadata-{}.sqlite3", uuid::Uuid::new_v4())),
+    // Turso 实例独占目录：独立子目录避免同 root 多实例锁冲突
+    let metadata_dir = workspace_root.join(format!("metadata-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&metadata_dir)
+        .await
+        .expect("metadata directory");
+    let store = rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+        &metadata_dir.join("userapp.turso.db"),
     )
     .await
-    .expect("SQLite metadata store");
+    .expect("Turso metadata store");
     let config = AppManagerConfig {
         workspace_root: Some(workspace_root.to_string_lossy().into_owned()),
         operation_lock_root: workspace_root.to_string_lossy().into_owned(),

@@ -130,15 +130,15 @@ REQUIRED['docker_deletion_identity_contract'] |= {
 }
 
 # New userApp persistence contracts are required independently of Agent PG tests.
-from storage_contract_cases import SQLITE_TARGETS
+from storage_contract_cases import TURSO_TARGETS
 REQUIRED['pg_storage_lifecycle_contract'].add('PG userApp transactions and restart')
-REQUIRED['sqlite_storage_lifecycle_contract'] = {
-    'SQLite contract process completed', 'SQLite frozen cases present',
-    *('SQLite ' + case for case in SQLITE_TARGETS),
+REQUIRED['turso_storage_lifecycle_contract'] = {
+    'Turso contract process completed', 'Turso frozen cases present',
+    *('Turso ' + case for case in TURSO_TARGETS),
 }
 
-REQUIRED['sqlite_compose_recreation_contract'] = {'SQLite contract process completed'} | {
-    f'SQLite Compose {index} {step}' for index in range(3) for step in (
+REQUIRED['turso_compose_recreation_contract'] = {'Turso contract process completed'} | {
+    f'Turso Compose {index} {step}' for index in range(3) for step in (
         'configuration', 'first-open convergence', 'one builder identity', 'HTTP persisted', 'recreated identity', 'invalid startup rejected', 'owned cleanup',
     )
 }

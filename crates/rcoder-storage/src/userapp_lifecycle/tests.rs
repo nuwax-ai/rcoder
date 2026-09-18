@@ -37,11 +37,10 @@ fn progress(op: &UserAppOperationRecord, state: State) -> UserAppOperationProgre
         error_message: None,
     }
 }
-async fn database() -> (tempfile::TempDir, SqliteUserAppStore) {
+async fn database() -> (tempfile::TempDir, TursoUserAppStore) {
     let directory = tempfile::tempdir().unwrap();
-    let store = SqliteUserAppStore::open(&directory.path().join("userapp.sqlite3"))
-        .await
-        .unwrap();
+    let path = std::path::absolute(directory.path().join("userapp.turso.db")).unwrap();
+    let store = TursoUserAppStore::open_exclusive(&path).await.unwrap();
     (directory, store)
 }
 
@@ -129,53 +128,8 @@ async fn metadata_changes_commit_with_admission_and_never_before_rejection() {
     admission_metadata_is_atomic(&store).await;
 }
 
-#[tokio::test]
-async fn sqlite_failure_after_operation_insert_rolls_back_entire_admission() {
-    let (directory, store) = database().await;
-    let app = store.ensure_identity("atomic-failure").await.unwrap();
-    let observer = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(directory.path().join("userapp.sqlite3")),
-        )
-        .await
-        .unwrap();
-    sqlx::query("CREATE TRIGGER fail_lifecycle_update BEFORE UPDATE ON userapp_lifecycles BEGIN SELECT RAISE(FAIL, 'injected lifecycle write failure'); END")
-        .execute(&observer).await.unwrap();
-    let mut req = request("atomic-failure-operation", Kind::Update);
-    req.app_id = app.app_id.clone();
-    req.lifecycle_id = Some(app.lifecycle_id.clone());
-    req.metadata = Some(shared_types::UserAppMetadataPatch {
-        app_id: app.app_id.clone(),
-        lifecycle_id: app.lifecycle_id.clone(),
-        expected_revision: app.metadata_revision,
-        name: Some(Some("must-not-commit".into())),
-        tenant_id: None,
-        space_id: None,
-    });
-    assert!(matches!(store.admit(&req).await, Err(Error::Storage(_))));
-    assert_eq!(
-        store.get_application(&app.app_id).await.unwrap().unwrap(),
-        app
-    );
-    assert!(
-        store
-            .get_operation(&app.app_id, &req.operation_id)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    sqlx::query("DROP TRIGGER fail_lifecycle_update")
-        .execute(&observer)
-        .await
-        .unwrap();
-    assert!(matches!(
-        store.admit(&req).await.unwrap(),
-        Outcome::Accepted(_)
-    ));
-    observer.close().await;
-}
+// 原子性反例的中途存储失败注入已由 Turso 后端原位覆盖
+// （`turso::tests::turso_failure_midway_rolls_back_entire_admission`）。
 
 async fn request_identity_spans_recreation_and_control(store: &dyn UserAppLifecycleStore) {
     for (index, bad_request_id) in [" ".to_owned(), "a".repeat(129)].into_iter().enumerate() {
@@ -326,7 +280,7 @@ async fn paginated_scan_and_import_contract(store: &dyn UserAppLifecycleStore) {
 }
 
 #[tokio::test]
-async fn sqlite_paginated_recovery_and_legacy_import() {
+async fn turso_paginated_recovery_and_legacy_import() {
     let (_directory, store) = database().await;
     paginated_scan_and_import_contract(&store).await;
 }
@@ -385,7 +339,7 @@ async fn control_command_is_durable_and_part_of_deduplication(store: &dyn UserAp
 }
 
 #[tokio::test]
-async fn sqlite_control_command_persistence_contract() {
+async fn turso_control_command_persistence_contract() {
     let (_directory, store) = database().await;
     control_command_is_durable_and_part_of_deduplication(&store).await;
 }
@@ -563,33 +517,35 @@ async fn configuration_policy_is_transactional(store: &dyn UserAppLifecycleStore
 }
 
 #[tokio::test]
-async fn sqlite_configuration_policy_contract() {
+async fn turso_configuration_policy_contract() {
     let (_directory, store) = database().await;
     configuration_policy_is_transactional(&store).await;
 }
 
 #[tokio::test]
-async fn sqlite_policy_commit_contract() {
+async fn turso_policy_commit_contract() {
     let (_directory, store) = database().await;
     runtime_policy_commits_only_with_success(&store).await;
 }
 
 #[tokio::test]
-async fn sqlite_instance_directory_is_exclusive_and_restart_preserves_data() {
+async fn turso_instance_directory_is_exclusive_and_restart_preserves_data() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("userapp.sqlite3");
-    let first = SqliteUserAppStore::open_exclusive(&path).await.unwrap();
+    let path = dir.path().join("userapp.turso.db");
+    let first = TursoUserAppStore::open_exclusive(&path).await.unwrap();
     let before = first.ensure_identity("persistent-app").await.unwrap();
-    assert!(SqliteUserAppStore::open_exclusive(&path).await.is_err());
+    assert!(TursoUserAppStore::open_exclusive(&path).await.is_err());
     // A second database filename cannot hide sharing the same instance directory.
     assert!(
-        SqliteUserAppStore::open_exclusive(&dir.path().join("other.sqlite3"))
-            .await
-            .is_err()
+        TursoUserAppStore::open_exclusive(
+            &std::path::absolute(dir.path().join("other.turso.db")).unwrap()
+        )
+        .await
+        .is_err()
     );
-    first.close().await;
+    first.shutdown().await.expect("shutdown");
     drop(first);
-    let restarted = SqliteUserAppStore::open_exclusive(&path).await.unwrap();
+    let restarted = TursoUserAppStore::open_exclusive(&path).await.unwrap();
     assert_eq!(
         before,
         restarted
@@ -598,137 +554,7 @@ async fn sqlite_instance_directory_is_exclusive_and_restart_preserves_data() {
             .unwrap()
             .unwrap()
     );
-    restarted.close().await;
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn sqlite_directory_alias_uses_the_same_instance_lock() {
-    let root = tempfile::tempdir().expect("SQLite test directory");
-    let real = root.path().join("real");
-    let alias = root.path().join("alias");
-    std::fs::create_dir(&real).expect("real directory");
-    std::os::unix::fs::symlink(&real, &alias).expect("directory alias");
-    let first = SqliteUserAppStore::open_exclusive(&real.join("userapp.sqlite3"))
-        .await
-        .expect("first instance");
-    let before = first
-        .ensure_identity("directory-alias")
-        .await
-        .expect("identity");
-    assert!(
-        SqliteUserAppStore::open_exclusive(&alias.join("userapp.sqlite3"))
-            .await
-            .is_err()
-    );
-    first.close().await;
-    drop(first);
-    let reopened = SqliteUserAppStore::open_exclusive(&alias.join("userapp.sqlite3"))
-        .await
-        .expect("reopen through alias");
-    assert_eq!(
-        reopened
-            .get_application("directory-alias")
-            .await
-            .expect("read")
-            .expect("identity"),
-        before
-    );
-    reopened.close().await;
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn sqlite_database_file_alias_cannot_bypass_directory_ownership() {
-    let root = tempfile::tempdir().expect("SQLite test directory");
-    let real = root.path().join("real");
-    std::fs::create_dir(&real).expect("database directory");
-    let path = real.join("userapp.sqlite3");
-    let first = SqliteUserAppStore::open_exclusive(&path)
-        .await
-        .expect("first instance");
-    let identity = first.ensure_identity("file-alias").await.expect("identity");
-    for hard_link in [false, true] {
-        let alias_directory = root
-            .path()
-            .join(if hard_link { "hard" } else { "symbolic" });
-        std::fs::create_dir(&alias_directory).expect("alias directory");
-        let alias = alias_directory.join("userapp.sqlite3");
-        if hard_link {
-            std::fs::hard_link(&path, &alias).expect("hard link");
-        } else {
-            std::os::unix::fs::symlink(&path, &alias).expect("symbolic link");
-        }
-        assert!(SqliteUserAppStore::open_exclusive(&alias).await.is_err());
-        assert!(!alias_directory.join("userapp.sqlite3-wal").exists());
-        assert!(!alias_directory.join("userapp.sqlite3-shm").exists());
-        std::fs::remove_file(&alias).expect("remove test alias");
-    }
-    assert_eq!(
-        first
-            .get_application("file-alias")
-            .await
-            .expect("read")
-            .expect("identity"),
-        identity
-    );
-    first.close().await;
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn sqlite_linked_sidecars_and_lock_fail_before_touching_the_target() {
-    for filename in [
-        "userapp.sqlite3-wal",
-        "userapp.sqlite3-shm",
-        "userapp.sqlite3-journal",
-        ".userapp-instance.lock",
-    ] {
-        for hard_link in [false, true] {
-            let root = tempfile::tempdir().expect("SQLite test directory");
-            let sentinel = root.path().join("sentinel");
-            std::fs::write(&sentinel, b"must remain unchanged").expect("sentinel");
-            let alias = root.path().join(filename);
-            if hard_link {
-                std::fs::hard_link(&sentinel, &alias).expect("hard link");
-            } else {
-                std::os::unix::fs::symlink(&sentinel, &alias).expect("symbolic link");
-            }
-            let database = root.path().join("userapp.sqlite3");
-            assert!(
-                SqliteUserAppStore::open_exclusive(&database).await.is_err(),
-                "{filename}"
-            );
-            assert_eq!(
-                std::fs::read(&sentinel).expect("sentinel bytes"),
-                b"must remain unchanged"
-            );
-            assert!(!database.exists(), "validation precedes database creation");
-        }
-    }
-}
-
-#[tokio::test]
-async fn sqlite_failed_initialization_releases_the_instance_lock() {
-    let root = tempfile::tempdir().expect("SQLite test directory");
-    let database = root.path().join("userapp.sqlite3");
-    std::fs::write(&database, b"not a SQLite database").expect("invalid test database");
-    assert!(SqliteUserAppStore::open_exclusive(&database).await.is_err());
-    assert_eq!(
-        std::fs::read(&database).expect("preserved bytes"),
-        b"not a SQLite database"
-    );
-    // Repair only this test-owned fixture; a failed production startup never
-    // deletes, truncates or silently replaces a database.
-    std::fs::remove_file(&database).expect("remove invalid fixture");
-    let repaired = SqliteUserAppStore::open_exclusive(&database)
-        .await
-        .expect("lock released after initialization error");
-    repaired
-        .ensure_identity("repaired")
-        .await
-        .expect("durable write");
-    repaired.close().await;
+    restarted.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -858,8 +684,9 @@ async fn restart_keeps_operation_and_uncertainty_blocks_new_creators() {
             .unwrap(),
     );
     complete(&store, &op, State::RecoveryRequired).await;
-    store.close().await;
-    let restored = SqliteUserAppStore::open(&directory.path().join("userapp.sqlite3"))
+    store.shutdown().await.expect("shutdown");
+    drop(store); // 目录锁随结构体持有——释放后才能重开
+    let restored = TursoUserAppStore::open_exclusive(&directory.path().join("userapp.turso.db"))
         .await
         .unwrap();
     let unfinished = restored.unfinished_operations(None, 10).await.unwrap();
@@ -872,6 +699,7 @@ async fn restart_keeps_operation_and_uncertainty_blocks_new_creators() {
             .await,
         Err(Error::OperationInProgress(_))
     ));
+    restored.shutdown().await.expect("shutdown");
 }
 
 /// 反例 1（spec §7.1/7.3）：prod 未知结果（RecoveryRequired）不得阻塞 dev 域
@@ -980,13 +808,13 @@ async fn dev_uncertainty_does_not_block_prod(store: &dyn UserAppLifecycleStore) 
 }
 
 #[tokio::test]
-async fn sqlite_cross_scope_admission_is_independent() {
+async fn turso_cross_scope_admission_is_independent() {
     let (_directory, store) = database().await;
     cross_scope_admission_is_independent(&store).await;
 }
 
 #[tokio::test]
-async fn sqlite_dev_uncertainty_does_not_block_prod() {
+async fn turso_dev_uncertainty_does_not_block_prod() {
     let (_directory, store) = database().await;
     dev_uncertainty_does_not_block_prod(&store).await;
 }
@@ -1054,216 +882,10 @@ async fn scoped_terminals_clear_own_slots_and_blocker_is_structured() {
     );
 }
 
-/// §7.8：旧单指针 JSON 经 0007 迁移进槽位；终态指向不占槽；悬空指针/未知
-/// kind 阻断迁移且不半提交；重复打开幂等。
-#[tokio::test]
-async fn sqlite_legacy_pointer_records_migrate_into_scope_slots() {
-    let (directory, store) = database().await;
-    // 旧不变量：每个 app 至多一个在途操作。分别构造 dev/prod 在途、
-    // 终态指向（防御性）与无操作四种旧形态。
-    let mut dev = request("legacy-dev", Kind::RestartBuilder);
-    dev.app_id = "legacy-dev-app".into();
-    let dev_op = operation(store.admit(&dev).await.unwrap());
-    let dev_running = store
-        .advance(&progress(&dev_op, State::Running))
-        .await
-        .unwrap();
-    let mut prod = request("legacy-prod", Kind::Start);
-    prod.app_id = "legacy-prod-app".into();
-    let prod_op = operation(store.admit(&prod).await.unwrap());
-    complete(&store, &prod_op, State::RecoveryRequired).await;
-    let mut terminal = request("legacy-terminal", Kind::Stop);
-    terminal.app_id = "legacy-terminal-app".into();
-    let terminal_op = operation(store.admit(&terminal).await.unwrap());
-    complete(&store, &terminal_op, State::Succeeded).await;
-    store.ensure_identity("legacy-idle-app").await.unwrap();
-    store.close().await;
-
-    // 降级到旧 JSON 形态：去掉 scope、槽位还原为 current_operation_id 单指针
-    let legacy = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(directory.path().join("userapp.sqlite3")),
-        )
-        .await
-        .unwrap();
-    sqlx::query("UPDATE userapp_operations SET record=json_remove(record,'$.scope')")
-        .execute(&legacy)
-        .await
-        .unwrap();
-    for (app_id, pointer) in [
-        ("legacy-dev-app", Some(dev_running.operation_id.clone())),
-        ("legacy-prod-app", Some(prod_op.operation_id.clone())),
-        // 防御性旧数据：终态操作仍被指针引用（终态不得迁移为占槽）
-        (
-            "legacy-terminal-app",
-            Some(terminal_op.operation_id.clone()),
-        ),
-        ("legacy-idle-app", None),
-    ] {
-        sqlx::query("UPDATE userapp_lifecycles SET record=json_set(json_remove(record,'$.active_operations'),'$.current_operation_id',$2) WHERE app_id=$1")
-            .bind(app_id)
-            .bind(pointer)
-            .execute(&legacy)
-            .await
-            .unwrap();
-    }
-    sqlx::query("DELETE FROM _sqlx_userapp_migrations WHERE version=7")
-        .execute(&legacy)
-        .await
-        .unwrap();
-    legacy.close().await;
-
-    let migrated = SqliteUserAppStore::open(&directory.path().join("userapp.sqlite3"))
-        .await
-        .expect("legacy database must migrate");
-    let dev_app = migrated
-        .get_application("legacy-dev-app")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        dev_app.active_operations.dev.as_deref(),
-        Some(dev_running.operation_id.as_str())
-    );
-    assert_eq!(dev_app.active_operations.prod, None);
-    let prod_app = migrated
-        .get_application("legacy-prod-app")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        prod_app.active_operations.prod.as_deref(),
-        Some(prod_op.operation_id.as_str())
-    );
-    assert_eq!(prod_app.active_operations.dev, None);
-    let terminal_app = migrated
-        .get_application("legacy-terminal-app")
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        terminal_app.active_operations.is_empty(),
-        "terminal pointed operation must not occupy a slot"
-    );
-    let idle_app = migrated
-        .get_application("legacy-idle-app")
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(idle_app.active_operations.is_empty());
-    for (app_id, scope, expected) in [
-        (
-            "legacy-dev-app",
-            shared_types::UserAppOperationScope::Dev,
-            dev_running.operation_id.clone(),
-        ),
-        (
-            "legacy-prod-app",
-            shared_types::UserAppOperationScope::Prod,
-            prod_op.operation_id.clone(),
-        ),
-    ] {
-        let record = migrated
-            .get_operation(app_id, &expected)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(record.scope, scope);
-    }
-    migrated.close().await;
-
-    // 幂等：迁移记录后再次打开不重复改写
-    let again = SqliteUserAppStore::open(&directory.path().join("userapp.sqlite3"))
-        .await
-        .expect("idempotent reopen");
-    assert_eq!(
-        again
-            .get_application("legacy-prod-app")
-            .await
-            .unwrap()
-            .unwrap(),
-        prod_app
-    );
-    again.close().await;
-}
-
-/// §7.8 反例：悬空指针与未知 kind 必须阻断迁移（事务回滚，不留半提交）。
-#[tokio::test]
-async fn sqlite_scope_migration_aborts_on_dangling_pointer_and_unknown_kind() {
-    for label in ["dangling", "unknown-kind"] {
-        let (directory, store) = database().await;
-        let mut req = request(&format!("legacy-{label}"), Kind::Start);
-        req.app_id = format!("legacy-{label}-app");
-        let op = operation(store.admit(&req).await.unwrap());
-        let running = store.advance(&progress(&op, State::Running)).await.unwrap();
-        store.close().await;
-        let legacy = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(directory.path().join("userapp.sqlite3")),
-            )
-            .await
-            .unwrap();
-        sqlx::query("UPDATE userapp_operations SET record=json_remove(record,'$.scope')")
-            .execute(&legacy)
-            .await
-            .unwrap();
-        match label {
-            "dangling" => {
-                sqlx::query("UPDATE userapp_lifecycles SET record=json_set(json_remove(record,'$.active_operations'),'$.current_operation_id','ghost-operation') WHERE app_id=$1")
-                    .bind(&req.app_id)
-                    .execute(&legacy)
-                    .await
-                    .unwrap();
-            }
-            _ => {
-                sqlx::query("UPDATE userapp_operations SET record=json_set(record,'$.kind','Nonsense') WHERE operation_id=$1")
-                    .bind(&running.operation_id)
-                    .execute(&legacy)
-                    .await
-                    .unwrap();
-                sqlx::query("UPDATE userapp_lifecycles SET record=json_set(json_remove(record,'$.active_operations'),'$.current_operation_id',$2) WHERE app_id=$1")
-                    .bind(&req.app_id)
-                    .bind(&running.operation_id)
-                    .execute(&legacy)
-                    .await
-                    .unwrap();
-            }
-        }
-        sqlx::query("DELETE FROM _sqlx_userapp_migrations WHERE version=7")
-            .execute(&legacy)
-            .await
-            .unwrap();
-        legacy.close().await;
-        let result = SqliteUserAppStore::open(&directory.path().join("userapp.sqlite3")).await;
-        assert!(result.is_err(), "{label} must block the migration");
-        // 失败不半提交：直连检查旧形态未被改写（scope 仍缺失）
-        let inspect = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(directory.path().join("userapp.sqlite3")),
-            )
-            .await
-            .unwrap();
-        let raw: String =
-            sqlx::query_scalar("SELECT record FROM userapp_operations WHERE operation_id=$1")
-                .bind(&running.operation_id)
-                .fetch_one(&inspect)
-                .await
-                .unwrap();
-        assert!(!raw.contains("\"scope\""), "{label} rolled back fully");
-        inspect.close().await;
-    }
-}
-
 #[tokio::test]
 async fn closed_database_returns_error_not_absence_or_admission() {
     let (_directory, store) = database().await;
-    store.close().await;
+    store.shutdown().await.expect("shutdown");
     assert!(matches!(
         store.get_application("absent").await,
         Err(Error::Storage(_))
@@ -1366,6 +988,7 @@ async fn metadata_cas_preserves_unmentioned_fields_and_noop_revision() {
 
 /// Run explicitly with --ignored and an isolated PG 17 DSN. Missing environment
 /// fails this test; it never turns an explicit integration run into a skip.
+#[cfg(feature = "pg")]
 #[cfg(feature = "pg")]
 #[tokio::test]
 #[ignore = "requires RCODER_USERAPP_PG_TEST_DSN for an isolated PG 17 instance"]
@@ -1588,42 +1211,13 @@ async fn control_snapshot_links_identity_and_operation(store: &dyn UserAppLifecy
 }
 
 #[tokio::test]
-async fn sqlite_control_snapshot_contract() {
+async fn turso_control_snapshot_contract() {
     let (_directory, store) = database().await;
     control_snapshot_links_identity_and_operation(&store).await;
 }
 
-#[tokio::test]
-async fn sqlite_control_snapshot_rejects_broken_operation_link() {
-    let (directory, store) = database().await;
-    let mut identity = store
-        .ensure_identity("snapshot-corrupt")
-        .await
-        .expect("identity");
-    identity.active_operations.prod = Some("missing-operation".into());
-    let connection = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(directory.path().join("userapp.sqlite3")),
-        )
-        .await
-        .expect("fault injection connection");
-    sqlx::query("UPDATE userapp_lifecycles SET record=$1 WHERE app_id=$2")
-        .bind(serde_json::to_string(&identity).expect("record"))
-        .bind("snapshot-corrupt")
-        .execute(&connection)
-        .await
-        .expect("inject broken link");
-    assert!(
-        matches!(
-            store.list_control_snapshots(None, 128).await,
-            Err(Error::InvalidOperation(_))
-        ),
-        "missing operation cannot appear as normal idle state"
-    );
-    connection.close().await;
-}
+// 损坏数据反例（lifecycle 槽位指向不存在的操作）已由 Turso 后端原位
+// 覆盖（`turso::tests::turso_control_snapshot_rejects_broken_operation_link`）。
 
 async fn deletion_success_requires_committed_evidence(store: &dyn UserAppLifecycleStore) {
     use shared_types::{UserAppDeletionCheckpoint, UserAppDeletionStage as Stage};
@@ -1733,7 +1327,7 @@ async fn deletion_success_requires_committed_evidence(store: &dyn UserAppLifecyc
 }
 
 #[tokio::test]
-async fn sqlite_deletion_success_requires_evidence() {
+async fn turso_deletion_success_requires_evidence() {
     let (_directory, store) = database().await;
     deletion_success_requires_committed_evidence(&store).await;
 }
@@ -1883,42 +1477,8 @@ async fn another_executor_cannot_advance_a_running_operation() {
     );
 }
 
-#[tokio::test]
-async fn cancelled_admission_waiting_for_sqlite_writer_does_not_leak_a_transaction() {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        let (directory, store) = database().await;
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(directory.path().join("userapp.sqlite3"));
-        let competitor = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .unwrap();
-        let held = competitor.begin_with("BEGIN IMMEDIATE").await.unwrap();
-        let request = request("cancelled", Kind::EnsureBuilder);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), store.admit(&request))
-                .await
-                .is_err()
-        );
-        held.rollback().await.unwrap();
-        assert!(
-            store
-                .get_application("contract-app")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(matches!(
-            store.admit(&request).await.unwrap(),
-            Outcome::Accepted(_)
-        ));
-        competitor.close().await;
-        store.close().await;
-    })
-    .await
-    .expect("cancelled SQLite transaction must release its connection");
-}
+// 取消不留事务的等价保护已由 Turso worker 架构原位覆盖
+// （`turso::tests::turso_cancelled_caller_and_dangling_transaction_do_not_leak`）。
 
 async fn private_execution_input_contract(store: &dyn UserAppLifecycleStore) {
     let input = shared_types::UserAppExecutionInput::new("{\"password\":\"private-token\"}".into());
@@ -1997,7 +1557,7 @@ async fn private_execution_input_contract(store: &dyn UserAppLifecycleStore) {
 }
 
 #[tokio::test]
-async fn sqlite_private_execution_input_contract() {
+async fn turso_private_execution_input_contract() {
     let (_directory, store) = database().await;
     private_execution_input_contract(&store).await;
 }
@@ -2150,7 +1710,7 @@ async fn physical_binding_is_atomic_and_cannot_cross_lifecycles(store: &dyn User
 }
 
 #[tokio::test]
-async fn sqlite_physical_binding_contract() {
+async fn turso_physical_binding_contract() {
     let (_directory, store) = database().await;
     physical_binding_is_atomic_and_cannot_cross_lifecycles(&store).await;
 }
@@ -2272,7 +1832,7 @@ async fn operation_lease_contract(store: &dyn UserAppLifecycleStore) {
 }
 
 #[tokio::test]
-async fn sqlite_operation_lease_contract() {
+async fn turso_operation_lease_contract() {
     let (_directory, store) = database().await;
     operation_lease_contract(&store).await;
 }
@@ -2375,7 +1935,7 @@ async fn operation_deadline_contract(store: &dyn UserAppLifecycleStore) {
 }
 
 #[tokio::test]
-async fn sqlite_operation_deadline_contract() {
+async fn turso_operation_deadline_contract() {
     let (_directory, store) = database().await;
     operation_deadline_contract(&store).await;
 }

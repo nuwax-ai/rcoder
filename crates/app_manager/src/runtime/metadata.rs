@@ -132,16 +132,21 @@ impl crate::service::AppService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcoder_storage::userapp_lifecycle::SqliteUserAppStore;
+    use rcoder_storage::userapp_lifecycle::TursoUserAppStore;
 
+    /// Turso 单进程独占架构：writer/reader 在同一存储实例上顺序验证
+    /// （提交可见性、noop 保 revision、重开后持久）。
     #[tokio::test]
-    async fn independent_readers_observe_committed_metadata_and_noop_keeps_revision() {
+    async fn readers_observe_committed_metadata_and_noop_keeps_revision() {
         let directory = tempfile::tempdir().expect("directory");
-        let path = directory.path().join("userapp.sqlite3");
-        let first = Arc::new(SqliteUserAppStore::open(&path).await.expect("first store"));
-        let second = Arc::new(SqliteUserAppStore::open(&path).await.expect("second store"));
-        let writer = AppMetadataStore::new(first.clone());
-        let reader = AppMetadataStore::new(second.clone());
+        let path = directory.path().join("userapp.turso.db");
+        let store = Arc::new(
+            TursoUserAppStore::open_exclusive(&path)
+                .await
+                .expect("store"),
+        );
+        let writer = AppMetadataStore::new(store.clone());
+        let reader = AppMetadataStore::new(store.clone());
         writer
             .record("a", Some("alpha".into()), None, None)
             .await
@@ -156,7 +161,7 @@ mod tests {
                 .as_deref(),
             Some("alpha")
         );
-        let before = second
+        let before = store
             .get_application("a")
             .await
             .expect("read")
@@ -165,7 +170,7 @@ mod tests {
             .record("a", Some("alpha".into()), None, None)
             .await
             .expect("noop");
-        let after = second
+        let after = store
             .get_application("a")
             .await
             .expect("read")
@@ -181,9 +186,18 @@ mod tests {
                 .as_deref(),
             Some("beta")
         );
-        first.close().await;
-        second.close().await;
-        let reopened = Arc::new(SqliteUserAppStore::open(&path).await.expect("reopen"));
+        TursoUserAppStore::shutdown(store.as_ref())
+            .await
+            .expect("shutdown");
+        // writer/reader 各持 Arc 克隆——全部释放后目录锁才归还，才能重开
+        drop(writer);
+        drop(reader);
+        drop(store);
+        let reopened = Arc::new(
+            TursoUserAppStore::open_exclusive(&path)
+                .await
+                .expect("reopen"),
+        );
         assert_eq!(
             AppMetadataStore::new(reopened.clone())
                 .lookup("a")
@@ -194,14 +208,16 @@ mod tests {
                 .as_deref(),
             Some("beta")
         );
-        reopened.close().await;
+        TursoUserAppStore::shutdown(reopened.as_ref())
+            .await
+            .expect("shutdown");
     }
 
     #[tokio::test]
     async fn storage_failure_is_neither_absence_nor_successful_registration() {
         let directory = tempfile::tempdir().expect("directory");
         let store = Arc::new(
-            SqliteUserAppStore::open(&directory.path().join("userapp.sqlite3"))
+            TursoUserAppStore::open_exclusive(&directory.path().join("userapp.turso.db"))
                 .await
                 .expect("store"),
         );
@@ -210,7 +226,9 @@ mod tests {
             .record("a", None, None, None)
             .await
             .expect("record");
-        store.close().await;
+        TursoUserAppStore::shutdown(store.as_ref())
+            .await
+            .expect("shutdown");
         assert!(matches!(
             metadata.lookup("a").await,
             Err(AppOperationError::Backend(_))

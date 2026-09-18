@@ -99,10 +99,17 @@ pub async fn graceful_shutdown(
     config: crate::config::AppConfig,
     runtime: Arc<dyn ContainerRuntime>,
     projects: Option<Arc<ProjectStoreBackend>>,
+    userapp_store_control: Arc<dyn rcoder_storage::userapp_lifecycle::UserAppStoreControl>,
 ) {
     let _ = shutdown_rx.recv().await;
 
     info!("starting graceful shutdown...");
+
+    // UserApp 控制存储关机（trait-design §6）：停接单 → 排空已接收事务 →
+    // 关连接 → 释放独占锁。失败不阻断其余清理，但必须显式记录。
+    if let Err(error) = userapp_store_control.shutdown().await {
+        error!(?error, "userApp control store shutdown incomplete");
+    }
 
     // PG 模式：用户容器跨重启存活（多副本目标形态），跳过全量清删；
     // 先 flush write-behind 队列（有界 5s），保证结构性 op 落盘后退出

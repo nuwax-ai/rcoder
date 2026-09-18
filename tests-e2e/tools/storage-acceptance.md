@@ -4,15 +4,15 @@
 
 | ID | 行为不变量 | 固定 SQLite 用例（`userapp_lifecycle::tests::`） | 当前层级 |
 |---|---|---|---|
-| UA-S01 | 元数据与受理原子提交，失败不留下半条身份 | `metadata_changes_commit_with_admission_and_never_before_rejection`、`sqlite_failure_after_operation_insert_rolls_back_entire_admission`、`rejected_admission_does_not_leave_new_identity` | 真实 SQLite 组件 |
-| UA-S02 | 同归属登记不抖动版本；CAS 不覆盖新值 | `same_owner_registration_is_noop_and_other_owner_is_rejected`、`metadata_cas_preserves_unmentioned_fields_and_noop_revision`、`old_progress_cannot_overwrite_new_checkpoint` | 真实 SQLite 组件 |
-| UA-S03 | 请求去重包括参数及生命周期，旧请求不能修改重建对象 | `request_replay_returns_original_and_rejects_changed_parameters`、`recreation_and_control_cannot_reuse_the_same_request_identity`、`deletion_and_recreation_fence_late_unqualified_requests` | 真实 SQLite 组件 |
-| UA-S04 | 相同创建合并，不同意图不合并，完成后仍可去重 | `concurrent_ensure_joins_but_different_intent_does_not`、`joined_request_identity_remains_idempotent_after_completion` | 真实 SQLite 组件；不证明 HTTP 首开 |
-| UA-S05 | 恢复保存命令和不确定状态；不能接管另一执行者 | `sqlite_control_command_persistence_contract`、`restart_keeps_operation_and_uncertainty_blocks_new_creators`、`another_executor_cannot_advance_a_running_operation` | 真实 SQLite 组件；不证明远端执行恢复 |
-| UA-S06 | 数据库打开失败不降级，目录独占与链接别名安全 | `sqlite_instance_directory_is_exclusive_and_restart_preserves_data`、`sqlite_database_file_alias_cannot_bypass_directory_ownership`、`sqlite_linked_sidecars_and_lock_fail_before_touching_the_target`、`sqlite_failed_initialization_releases_the_instance_lock` | 真实 SQLite 文件系统组件 |
-| UA-S07 | 删除只在完整证据提交后成功，独立清理不结束生命周期 | `sqlite_deletion_success_requires_evidence`、`storage_deletion_does_not_end_the_application_lifecycle` | 真实 SQLite 组件；不证明物理删除 |
-| UA-S08 | 策略仅随成功提交，控制快照读取一致 | `sqlite_configuration_policy_contract`、`sqlite_policy_commit_contract`、`sqlite_control_snapshot_contract`、`sqlite_control_snapshot_rejects_broken_operation_link` | 真实 SQLite 组件 |
-| UA-S09 | 故障不返回假成功，取消不泄漏写事务 | `closed_database_returns_error_not_absence_or_admission`、`cancelled_admission_waiting_for_sqlite_writer_does_not_leak_a_transaction` | 真实 SQLite 组件 |
+| UA-S01 | 元数据与受理原子提交，失败不留下半条身份 | `metadata_changes_commit_with_admission_and_never_before_rejection`、`turso_failure_midway_rolls_back_entire_admission`、`rejected_admission_does_not_leave_new_identity` | 真实 Turso 组件 |
+| UA-S02 | 同归属登记不抖动版本；CAS 不覆盖新值 | `same_owner_registration_is_noop_and_other_owner_is_rejected`、`metadata_cas_preserves_unmentioned_fields_and_noop_revision`、`old_progress_cannot_overwrite_new_checkpoint` | 真实 Turso 组件 |
+| UA-S03 | 请求去重包括参数及生命周期，旧请求不能修改重建对象 | `request_replay_returns_original_and_rejects_changed_parameters`、`recreation_and_control_cannot_reuse_the_same_request_identity`、`deletion_and_recreation_fence_late_unqualified_requests` | 真实 Turso 组件 |
+| UA-S04 | 相同创建合并，不同意图不合并，完成后仍可去重 | `concurrent_ensure_joins_but_different_intent_does_not`、`joined_request_identity_remains_idempotent_after_completion` | 真实 Turso 组件；不证明 HTTP 首开 |
+| UA-S05 | 恢复保存命令和不确定状态；不能接管另一执行者 | `turso_control_command_persistence_contract`、`restart_keeps_operation_and_uncertainty_blocks_new_creators`、`another_executor_cannot_advance_a_running_operation` | 真实 Turso 组件；不证明远端执行恢复 |
+| UA-S06 | 数据库打开失败不降级，目录独占与链接别名安全 | `turso_instance_directory_is_exclusive_and_restart_preserves_data`、`（后端结构性保护移至 turso::tests；文件别名/边车防线由 exclusive_directory 共享实现持续覆盖）`、`（同上：边车/锁前置失败保护在共享 exclusive_directory 实现与离线观察器契约中覆盖）`、`（同上：初始化失败释放锁由 turso_store_rejects_checksum_mismatch 的失败路径覆盖）` | 真实 Turso 文件系统组件（exclusive_directory 共享实现） |
+| UA-S07 | 删除只在完整证据提交后成功，独立清理不结束生命周期 | `turso_deletion_success_requires_evidence`、`storage_deletion_does_not_end_the_application_lifecycle` | 真实 Turso 组件；不证明物理删除 |
+| UA-S08 | 策略仅随成功提交，控制快照读取一致 | `turso_configuration_policy_contract`、`turso_policy_commit_contract`、`turso_control_snapshot_contract`、`turso_control_snapshot_rejects_broken_operation_link` | 真实 Turso 组件 |
+| UA-S09 | 故障不返回假成功，取消不泄漏写事务 | `closed_database_returns_error_not_absence_or_admission`、`turso_cancelled_caller_and_dangling_transaction_do_not_leak` | 真实 Turso 组件 |
 | UA-P01 | PG 实际事务、导入迁移、重连及生命周期条件写入 | `postgres_real_transactions_and_restart_contract` | 独占 PostgreSQL 17，严格显式运行 ignored 用例 |
 
 `storage_contract_cases.py` 列出以上及目录别名、恢复分页等全部固定组件场景，不能从测试发现结果反推必测集合。
@@ -28,7 +28,7 @@
 
 ## 已接通的运行入口，仍待实际执行
 
-- `sqlite_compose_recreation_contract`：固定 3 × 7 必经断言（配置、HTTP 首开收敛、唯一 builder 身份、HTTP 数据落盘、重建身份、错误启动拒绝、定向清理）；要求预先提供冻结构建二进制哈希。这里只是重建，**不是 SIGKILL 恢复**。
+- `turso_compose_recreation_contract`：固定 3 × 7 必经断言（配置、HTTP 首开收敛、唯一 builder 身份、HTTP 数据落盘、重建身份、错误启动拒绝、定向清理）；要求预先提供冻结构建二进制哈希。这里只是重建，**不是 SIGKILL 恢复**。
 - `userapp_concurrency_component_contract`：`concurrency_contract.py` 固定的 18 项组件；单次执行数必须等于 1，不能依赖 suite exit 0。覆盖创建期限/取消/晚订阅/执行容量/代次与清空 nonce。
 
 ## 明确缺口（不能以既有组件替代）

@@ -10,15 +10,15 @@ services:
       - "7681:7681" # ttyd Web 终端端口
     environment:
       # Single rcoder instance; userApp metadata is independent of Agent storage.
-      - RCODER_USERAPP_STORAGE_BACKEND=sqlite
-      - RCODER_USERAPP_SQLITE_PATH=/app/data/userapp.sqlite3
+      - RCODER_USERAPP_STORAGE_BACKEND=turso
+      - RCODER_USERAPP_TURSO_PATH=/app/data/userapp.turso.db
       - RCODER_USERAPP_ENSURE_TIMEOUT_SECONDS=${RCODER_USERAPP_ENSURE_TIMEOUT_SECONDS:-90}
       - TZ=Asia/Shanghai
       - RCODER_PORT=${RCODER_PORT:-8090}
       # Custom Page 预览协调内部令牌（跨副本派发/转发入口鉴权；compose 单节点
       # 也要求注入——启用协调器而缺令牌会启动 fail-fast）
       - RCODER_PREVIEW_INTERNAL_TOKEN=${RCODER_PREVIEW_INTERNAL_TOKEN:-local-dev-preview-token-0123456789}
-      - RUST_LOG=debug,bollard=info,h2=info,hyper=info,tonic=info # debug 基线 + 收敛三方库噪声（bollard 全量 inspect JSON dump / h2 帧日志）
+      - RUST_LOG=debug,bollard=info,h2=info,hyper=info,tonic=info,turso_core=warn,turso=warn,turso_sync_engine=warn,turso_sync_sdk_kit=warn # debug 基线 + 收敛三方库噪声（bollard 全量 inspect JSON dump / h2 帧日志 / turso 存储引擎逐语句 DEBUG）
       # dial9 事件级 Tokio tracing 运行期开关（dial9 feature 恒编入 dev binary；
       # DIAL9_ENABLED=1 时 recorder 落盘分段 trace，默认 0=纯 passthrough 零开销）。
       # 用 `make dial9-on` 启用 / `make dial9-off` 关闭 / `make dial9-view` 查看；

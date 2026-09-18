@@ -54,7 +54,7 @@ def main():
             (directory / 'command-failure.log').write_text(detail.replace(password, '[REDACTED]'))
             raise
     try:
-        build = command(['cargo', 'test', '-p', 'rcoder-storage', '--locked', '--features', 'pg,sqlite', '--lib', '--no-run', '--message-format=json'], capture_output=True, text=True)
+        build = command(['cargo', 'test', '-p', 'rcoder-storage', '--locked', '--features', 'pg,userapp-turso', '--lib', '--no-run', '--message-format=json'], capture_output=True, text=True)
         artifacts = [json.loads(line) for line in build.stdout.splitlines()]
         binary = next(row['executable'] for row in artifacts if row.get('reason') == 'compiler-artifact' and row.get('executable'))
         frozen = directory / 'pg-tests'

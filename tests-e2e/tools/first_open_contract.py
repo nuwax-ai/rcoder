@@ -1,7 +1,6 @@
 """Real HTTP first-open fan-in after a durable EnsureBuilder is observable."""
 from concurrent.futures import ThreadPoolExecutor
 import json
-import sqlite3
 import time
 import threading
 import urllib.error
@@ -19,13 +18,19 @@ def multipart(fields):
     return data.encode(), 'multipart/form-data; boundary=' + boundary
 
 
-def operations(database, app):
-    with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=1) as connection:
-        return [json.loads(row[0]) for row in connection.execute(
-            'SELECT record FROM userapp_operations WHERE app_id=?', (app,))]
+def terminal_operation(base, app, user, operation_id):
+    # 终态对账走 HTTP（T4：SQLite 引擎不读 Turso 活库——受理窗口观察与
+    # 终态校验同一约束，跨引擎 mmap 并发读已被 SIGBUS 实测排除）。
+    with urllib.request.urlopen(base + '/api/v1/userapp/' + app + '/operations/'
+                                + urllib.parse.quote(operation_id) + '?user_id=' + urllib.parse.quote(user),
+                                timeout=30) as response:
+        body = json.load(response)
+    if body.get('code') != '0000' or not body.get('data'):
+        raise RuntimeError('terminal operation query failed: ' + str(body.get('code')))
+    return body['data']
 
 
-def exercise(base, app, user, database):
+def exercise(base, app, user):
     followers_ready = threading.Barrier(len(ENTRIES), timeout=10)
 
     def request(entry):
@@ -66,10 +71,12 @@ def exercise(base, app, user, database):
             return None
         if body.get('code') != '0000' or not body.get('data'):
             return None
-        operation = body['data']
-        if operation.get('kind') != 'EnsureBuilder' or operation.get('state') not in ('Pending', 'Running'):
-            return None
-        return operation
+        # operations/current 返回全部在途槽位（application/dev/prod）——筛出
+        # 目标 EnsureBuilder 在途操作
+        for operation in body['data']:
+            if operation.get('kind') == 'EnsureBuilder' and operation.get('state') in ('Pending', 'Running'):
+                return operation
+        return None
 
     # Observe admission before querying a read-only route. A query before any
     # operation exists may legitimately return not-found and must not create it.
@@ -90,11 +97,12 @@ def exercise(base, app, user, database):
             raise RuntimeError('first-open durable acceptance was not observed')
         followers = [pool.submit(request, entry) for entry in ENTRIES]
         results = [leader.result()] + [future.result() for future in followers]
-    # 静默期（全部请求终态、写侧停止）后再直读数据库做终态对账。
+    # 终态对账走 HTTP（存储层内容对账由调用方的离线快照完成）。
     time.sleep(1)
-    completed = [op for op in operations(database, app) if op['kind'] == 'EnsureBuilder']
-    if (len(completed) != 1 or completed[0]['operation_id'] != accepted['operation_id']
-            or completed[0]['state'] != 'Succeeded'):
+    completed = terminal_operation(base, app, user, accepted['operation_id'])
+    if (completed['operation_id'] != accepted['operation_id']
+            or completed['kind'] != 'EnsureBuilder'
+            or completed['state'] != 'Succeeded'):
         raise RuntimeError('first-open requests did not converge on the original builder operation')
     return {'operation_id': accepted['operation_id'], 'lifecycle_id': accepted['lifecycle_id'],
             'entries': results, 'evidence_level': 'single_replica_real_http'}

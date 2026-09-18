@@ -66,4 +66,4 @@ hex = { workspace = true }
 zip = { workspace = true }
 
 [dev-dependencies]
-rcoder-storage = { workspace = true, features = ["sqlite"] }
+rcoder-storage = { workspace = true, features = ["userapp-turso"] }

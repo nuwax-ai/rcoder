@@ -696,8 +696,8 @@ mod tests {
     async fn final_creation_evidence_survives_terminal_failure_and_rejects_wrong_identity() {
         let directory = tempfile::tempdir().expect("directory");
         let store: Arc<dyn UserAppLifecycleStore> = Arc::new(
-            rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
-                &directory.path().join("userapp.sqlite3"),
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &directory.path().join("userapp.turso.db"),
             )
             .await
             .expect("store"),
@@ -848,8 +848,8 @@ mod tests {
     async fn late_subscriber_reads_committed_completion_even_after_signal_removal() {
         let directory = tempfile::tempdir().expect("directory");
         let store: Arc<dyn UserAppLifecycleStore> = Arc::new(
-            rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
-                &directory.path().join("userapp.sqlite3"),
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &directory.path().join("userapp.turso.db"),
             )
             .await
             .expect("store"),
@@ -886,8 +886,8 @@ mod tests {
     async fn timeout_does_not_cancel_or_resubmit_accepted_operation() {
         let directory = tempfile::tempdir().expect("directory");
         let store: Arc<dyn UserAppLifecycleStore> = Arc::new(
-            rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
-                &directory.path().join("userapp.sqlite3"),
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &directory.path().join("userapp.turso.db"),
             )
             .await
             .expect("store"),

@@ -624,11 +624,11 @@ mod tests {
             ..AppManagerConfig::default()
         };
         let metadata_dir = tempfile::tempdir().expect("metadata directory");
-        let metadata_store = rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
-            &metadata_dir.path().join("userapp.sqlite3"),
+        let metadata_store = rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+            &metadata_dir.path().join("userapp.turso.db"),
         )
         .await
-        .expect("SQLite metadata store");
+        .expect("Turso metadata store");
         let metadata_store = Arc::new(metadata_store);
         shared_types::UserAppLifecycleStore::ensure_identity(metadata_store.as_ref(), "testapp")
             .await
@@ -649,7 +649,8 @@ mod tests {
             Arc::new(AgentDownloadManager::new(download_dir.path()).expect("downloads"));
         let (pod_created_tx, _) = broadcast::channel(32);
         let state = Arc::new(AppState {
-            userapp_store: metadata_store,
+            userapp_store: metadata_store.clone(),
+            userapp_store_control: metadata_store,
             config: AppConfig::default(),
             projects: Arc::new(ProjectStoreBackend::Memory(Arc::new(adapter))),
             pingora_service: None,

@@ -94,11 +94,11 @@
   "pg_storage_faults": [
     "pg_storage_lifecycle_contract"
   ],
-  "sqlite_compose_runtime": [
-    "sqlite_compose_recreation_contract"
+  "turso_compose_runtime": [
+    "turso_compose_recreation_contract"
   ],
-  "sqlite_storage_contract": [
-    "sqlite_storage_lifecycle_contract"
+  "turso_storage_contract": [
+    "turso_storage_lifecycle_contract"
   ],
   "userapp_concurrency_contract": [
     "userapp_concurrency_component_contract"

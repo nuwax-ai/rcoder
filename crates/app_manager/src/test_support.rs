@@ -605,11 +605,18 @@ pub(crate) async fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime
     tokio::fs::create_dir_all(workspace_root)
         .await
         .expect("test workspace");
-    let store = rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
-        &workspace_root.join(format!("metadata-{}.sqlite3", uuid::Uuid::new_v4())),
+    // Turso 实例独占目录：同一 workspace_root 下多个 service 测试实例各用
+    // 独立子目录（release 文件锁仍在 workspace_root 共享——见
+    // independent_services_share_application_file_lock）。
+    let metadata_dir = workspace_root.join(format!("metadata-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&metadata_dir)
+        .await
+        .expect("metadata directory");
+    let store = rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+        &metadata_dir.join("userapp.turso.db"),
     )
     .await
-    .expect("SQLite metadata store");
+    .expect("Turso metadata store");
     let config = AppManagerConfig {
         workspace_root: Some(workspace_root.to_string_lossy().into_owned()),
         operation_lock_root: workspace_root.to_string_lossy().into_owned(),

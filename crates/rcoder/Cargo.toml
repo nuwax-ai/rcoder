@@ -14,7 +14,7 @@ name = "rcoder"
 path = "src/lib.rs"
 
 [features]
-default = ["userapp-sqlite"]
+default = ["userapp-turso"]
 
 # 调试功能：启用 /debug/* 路由，用于开发和问题排查
 # 生产环境默认不启用，需要显式添加 --features debug
@@ -38,7 +38,7 @@ dial9 = ["dep:dial9"]
 
 # Kubernetes 支持：启用 Kubernetes 运行时模式
 # 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
-userapp-sqlite = ["rcoder-storage/sqlite"]
+userapp-turso = ["rcoder-storage/userapp-turso"]
 
 kubernetes = ["rcoder-storage/pg", "docker_manager/kubernetes", "shared_types/kubernetes", "app_manager/kubernetes", "file-server/kubernetes", "kube", "k8s-openapi"]
 

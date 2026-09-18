@@ -1,21 +1,28 @@
 import re
 from pathlib import Path
 import unittest
-from storage_contract_cases import PREFIX, SQLITE_CASES, PG_USERAPP_CASE, passed_exactly_one
+from storage_contract_cases import PREFIX, TURSO_CASES, TURSO_EXTRA_CASES, PG_USERAPP_CASE, passed_exactly_one
 from contracts import REQUIRED
 import run
 
 
 class StorageContractCatalogTests(unittest.TestCase):
-    def test_required_sqlite_cases_are_explicit_source_tests(self):
+    def test_required_turso_cases_are_explicit_source_tests(self):
         source = (Path(__file__).resolve().parents[2] /
                   'crates/rcoder-storage/src/userapp_lifecycle/tests.rs').read_text()
+        backend = (Path(__file__).resolve().parents[2] /
+                   'crates/rcoder-storage/src/userapp_lifecycle/turso/mod.rs').read_text()
         tests = set(re.findall(r'#\[tokio::test\]\s*async fn (\w+)\(', source))
-        self.assertEqual(len(SQLITE_CASES), len(set(SQLITE_CASES)))
-        self.assertFalse(set(SQLITE_CASES) - tests)
-        self.assertIn('sqlite_storage_contract', run.GROUPS['userapp'])
-        self.assertTrue({'SQLite ' + case for case in SQLITE_CASES} <=
-                        REQUIRED['sqlite_storage_lifecycle_contract'])
+        backend_tests = set(re.findall(r'#\[tokio::test\]\s*async fn (\w+)\(', backend))
+        self.assertEqual(len(TURSO_CASES), len(set(TURSO_CASES)))
+        self.assertFalse(set(TURSO_CASES) - tests)
+        self.assertTrue(
+            {path.split('::').pop() for path in TURSO_EXTRA_CASES.values()} <= backend_tests)
+        self.assertIn('turso_storage_contract', run.GROUPS['userapp'])
+        self.assertTrue({'Turso ' + case for case in TURSO_CASES} <=
+                        REQUIRED['turso_storage_lifecycle_contract'])
+        self.assertTrue({'Turso ' + case for case in TURSO_EXTRA_CASES} <=
+                        REQUIRED['turso_storage_lifecycle_contract'])
         self.assertEqual(PG_USERAPP_CASE, PREFIX + 'postgres_real_transactions_and_restart_contract')
         self.assertIn('PG userApp transactions and restart', REQUIRED['pg_storage_lifecycle_contract'])
 

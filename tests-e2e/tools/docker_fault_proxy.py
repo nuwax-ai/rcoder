@@ -50,7 +50,9 @@ def container_owned(identifier):
         labels = info['Config'].get('Labels') or {}
         with GATE_LOCK:
             lifecycle = OWNED_CONTAINERS.get(info['Id'])
-        return (labels.get('rcoder.io/application-id') == APP and labels.get('rcoder.io/owner-id') == OWNER
+        # owner-id 标签已随用户绑定移除退役；物理身份锚定 application-id +
+        # lifecycle-id + service-type（与 owned_builder_rows 同一模型）
+        return (labels.get('rcoder.io/application-id') == APP
                 and labels.get('service-type') == 'user-app-builder' and lifecycle is not None
                 and labels.get('rcoder.io/lifecycle-id') == lifecycle)
     finally:
@@ -67,7 +69,7 @@ def allowed(method, path, body):
         labels = json.loads(body).get('Labels') or {}
         return (urllib.parse.parse_qs(urllib.parse.urlsplit(path).query).get('name') == ['rcoder-app-builder-' + APP]
                 and bool(labels.get('rcoder.io/lifecycle-id')) and labels.get('rcoder.io/application-id') == APP
-                and labels.get('rcoder.io/owner-id') == OWNER and labels.get('service-type') == 'user-app-builder')
+                and labels.get('service-type') == 'user-app-builder')
     if len(segments) >= 2 and segments[0] == 'containers':
         return container_owned(segments[1])
     if segments == ['networks', 'create']:

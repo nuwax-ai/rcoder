@@ -31,7 +31,7 @@ pub use shared_types::{
     CLEANUP_CHANNEL_CAPACITY, CleanupRequest, ContainerEntry, IdleContainerInfo, StorageStats,
 };
 
-#[cfg(any(feature = "pg", feature = "sqlite"))]
+#[cfg(any(feature = "pg", feature = "userapp-turso"))]
 pub mod userapp_lifecycle;
 
 // Custom Page 预览权威注册表（PG 实现；Compose 进程内实现在 preview-coordinator crate）。

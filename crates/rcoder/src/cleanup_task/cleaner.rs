@@ -537,8 +537,8 @@ mod scope_fence_tests {
     #[tokio::test]
     async fn builder_reaping_respects_dev_and_application_scope_fences() {
         let directory = tempfile::tempdir().expect("directory");
-        let store = rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
-            &directory.path().join("fence.sqlite3"),
+        let store = rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+            &directory.path().join("fence.turso.db"),
         )
         .await
         .expect("store");
@@ -574,6 +574,8 @@ mod scope_fence_tests {
         assert!(matches!(outcome, UserAppAdmissionOutcome::Accepted(_)));
         assert!(builder_fenced_by_active_operations(&store, "fence-whole").await);
 
-        store.close().await;
+        rcoder_storage::userapp_lifecycle::TursoUserAppStore::shutdown(&store)
+            .await
+            .expect("shutdown");
     }
 }

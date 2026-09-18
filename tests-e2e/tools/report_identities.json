@@ -389,18 +389,6 @@
       "backend": "compose"
     }
   ],
-  "sqlite_storage_lifecycle_contract": [
-    {
-      "scenario": "sqlite_storage_lifecycle_contract",
-      "backend": "sqlite-component"
-    }
-  ],
-  "sqlite_compose_recreation_contract": [
-    {
-      "scenario": "sqlite_compose_recreation_contract",
-      "backend": "sqlite-compose"
-    }
-  ],
   "userapp_concurrency_component_contract": [
     {
       "scenario": "userapp_concurrency_component_contract",
@@ -447,6 +435,18 @@
     {
       "scenario": "userapp_scope_isolation_during_deploy",
       "backend": "compose"
+    }
+  ],
+  "turso_storage_lifecycle_contract": [
+    {
+      "scenario": "turso_storage_lifecycle_contract",
+      "backend": "turso-component"
+    }
+  ],
+  "turso_compose_recreation_contract": [
+    {
+      "scenario": "turso_compose_recreation_contract",
+      "backend": "turso-compose"
     }
   ]
 }

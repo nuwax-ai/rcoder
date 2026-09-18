@@ -6,7 +6,7 @@ import docker_fault_proxy as proxy
 
 class FaultProxyScopeTests(unittest.TestCase):
     def test_creation_requires_exact_name_family_owner_and_lifecycle(self):
-        labels = {'rcoder.io/application-id': 'app', 'rcoder.io/owner-id': 'owner',
+        labels = {'rcoder.io/application-id': 'app',
                   'service-type': 'user-app-builder', 'rcoder.io/lifecycle-id': 'life'}
         with patch.multiple(proxy, APP='app', OWNER='owner'):
             path = '/v1.47/containers/create?name=rcoder-app-builder-app'
@@ -21,7 +21,7 @@ class FaultProxyScopeTests(unittest.TestCase):
 
     def test_container_write_is_bound_to_recorded_physical_id_and_lifecycle(self):
         from types import SimpleNamespace
-        labels = {'rcoder.io/application-id': 'app', 'rcoder.io/owner-id': 'owner',
+        labels = {'rcoder.io/application-id': 'app',
                   'service-type': 'user-app-builder', 'rcoder.io/lifecycle-id': 'life'}
         row = {'Id': 'created-id', 'Config': {'Labels': labels}}
         closed = []

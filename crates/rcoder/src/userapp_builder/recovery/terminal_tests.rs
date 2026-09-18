@@ -79,7 +79,7 @@ async fn fixture() -> (
 ) {
     let directory = tempfile::tempdir().unwrap();
     let store: Arc<dyn UserAppLifecycleStore> = Arc::new(
-        rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
+        rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
             &directory.path().join("state.db"),
         )
         .await

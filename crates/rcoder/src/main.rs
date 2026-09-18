@@ -348,6 +348,8 @@ async fn run() -> anyhow::Result<()> {
     .await?;
 
     let runtime_for_shutdown = state.runtime().clone();
+    // 存储关机控制（trait-design §6）：state 即将 move 进 router，先留出句柄
+    let userapp_store_control = state.userapp_store_control.clone();
     let app = router::create_router(
         state,
         Some(Arc::clone(&bootstrap_result.telemetry)),
@@ -361,6 +363,7 @@ async fn run() -> anyhow::Result<()> {
         bootstrap_result.config.clone(),
         runtime_for_shutdown,
         Some(projects_for_shutdown),
+        userapp_store_control,
     )
     .await;
     server_handle.abort();

@@ -1,12 +1,12 @@
 #!/bin/bash
 set -e
 
-# Fail before starting auxiliary services when the SQLite directory is not writable.
-if [ "${RCODER_USERAPP_STORAGE_BACKEND:-}" = "sqlite" ]; then
-    RCODER_SQLITE_DIRECTORY=$(dirname -- "${RCODER_USERAPP_SQLITE_PATH:?SQLite path is required}")
-    mkdir -p -- "$RCODER_SQLITE_DIRECTORY"
-    if [ ! -w "$RCODER_SQLITE_DIRECTORY" ]; then
-        echo "UserApp SQLite directory is not writable: $RCODER_SQLITE_DIRECTORY" >&2
+# Fail before starting auxiliary services when the database directory is not writable.
+if [ "${RCODER_USERAPP_STORAGE_BACKEND:-}" = "turso" ]; then
+    RCODER_TURSO_DIRECTORY=$(dirname -- "${RCODER_USERAPP_TURSO_PATH:?Turso path is required}")
+    mkdir -p -- "$RCODER_TURSO_DIRECTORY"
+    if [ ! -w "$RCODER_TURSO_DIRECTORY" ]; then
+        echo "UserApp Turso directory is not writable: $RCODER_TURSO_DIRECTORY" >&2
         exit 1
     fi
 fi

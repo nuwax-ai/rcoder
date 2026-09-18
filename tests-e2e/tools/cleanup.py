@@ -120,18 +120,18 @@ def cleanup_case(case_id, run_id, directory, existing_ids=()):
             (receipt_path.parent / 'fallback-cleanup.json').write_text(json.dumps(result, indent=2))
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
             errors.append('Docker crash fixture cleanup failed: ' + type(error).__name__)
-    # A SQLite recreation contract owns an entire isolated control plane. Its
+    # A Turso recreation contract owns an entire isolated control plane. Its
     # application cleanup must use that plane, never the daily RCODER_URL.
-    for receipt_path in (directory / 'sqlite-runtime').glob('*/ownership.json'):
+    for receipt_path in (directory / 'turso-runtime').glob('*/ownership.json'):
         try:
             receipt = json.loads(receipt_path.read_text())
             managed_names.add(receipt['project'] + '-rcoder-1')
             managed_names.add('rcoder-app-builder-' + receipt['app_id'])
-            from sqlite_runtime_contract import cleanup as cleanup_sqlite_runtime
-            result = cleanup_sqlite_runtime(receipt_path.parent, run_id, case_id)
+            from turso_runtime_contract import cleanup as cleanup_turso_runtime
+            result = cleanup_turso_runtime(receipt_path.parent, run_id, case_id)
             (receipt_path.parent / 'fallback-cleanup.json').write_text(json.dumps(result, indent=2))
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
-            errors.append('SQLite isolated runtime cleanup failed: ' + type(error).__name__)
+            errors.append('Turso isolated runtime cleanup failed: ' + type(error).__name__)
     try:
         ids = command('docker', 'ps', '-aq', '--no-trunc').split()
         # Never persist the full inspect result, which includes secrets.

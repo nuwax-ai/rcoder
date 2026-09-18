@@ -38,6 +38,9 @@ pub struct SessionInfo {
 #[derive(Clone)]
 pub struct AppState {
     pub userapp_store: Arc<dyn shared_types::UserAppLifecycleStore>,
+    /// 存储关机控制（trait-design §6）：只供关机协调者使用，业务消费者
+    /// 不得调用 shutdown。
+    pub userapp_store_control: Arc<dyn rcoder_storage::userapp_lifecycle::UserAppStoreControl>,
     /// 应用配置
     pub config: AppConfig,
     /// 项目适配器 - 纯 DashMap 内存存储 + RAII 自动资源回收
@@ -113,10 +116,14 @@ impl AppState {
         // 初始化应用管理服务（Docker / K8s 统一构造，运行时由 access_mode 决定行为）。
         // 保留具体类型 Arc：dev_locator 注入需要在其上调用 inherent setter
         // （发生在下方 Self Arc 包装之后——locator 以 Weak 回指 state）。
-        let userapp_store = config
+        // 存储装配（trait-design §6）：store 注入业务层；control 只交给关机
+        // 协调者（graceful_shutdown），不进入业务消费者。
+        let opened = config
             .userapp_storage
             .open(config.app_manager.access_mode, &config.storage.postgres)
             .await?;
+        let userapp_store = opened.store;
+        let userapp_store_control = opened.control;
         let app_service_arc: Arc<app_manager::service::AppService> = Arc::new(
             app_manager::service::AppService::new(
                 config.app_manager.clone(),
@@ -145,6 +152,7 @@ impl AppState {
 
         let state = Arc::new(Self {
             userapp_store,
+            userapp_store_control,
             config,
             projects,
             pingora_service: pingora,

@@ -25,7 +25,7 @@ INPUT_MANIFEST = os.environ.get('E2E_INPUT_MANIFEST')
 ORIGIN_HEAD = os.environ.get('E2E_ORIGIN_HEAD')
 RUN_ROOT = Path(os.environ['E2E_RUN_ROOT']) if os.environ.get('E2E_RUN_ROOT') else ROOT / 'reports'
 GROUPS = {
-    'userapp': ['compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_userapp_faults', 'compose_userapp_deploy', 'compose_lifecycle', 'pg_storage_faults', 'sqlite_storage_contract', 'sqlite_compose_runtime', 'userapp_concurrency_contract', 'native_lifecycle_crash', 'docker_lifecycle_crash'],
+    'userapp': ['compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_userapp_faults', 'compose_userapp_deploy', 'compose_lifecycle', 'pg_storage_faults', 'turso_storage_contract', 'turso_compose_runtime', 'userapp_concurrency_contract', 'native_lifecycle_crash', 'docker_lifecycle_crash'],
     'compose': ['compose_sse', 'compose_session', 'compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_webchat', 'custom_page_preview'],
     'deploy': ['compose_userapp_deploy'],
     'k8s': ['k8s_lb'],
