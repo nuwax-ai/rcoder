@@ -18,6 +18,11 @@ use crate::{Attachment, ChatAgentConfig, ModelProviderConfig};
 pub enum ChatServiceScope {
     /// userApp 开发对话：路由到该 app 的 UserappBuilder 开发容器
     Userapp,
+    /// 常规项目（normal project）：与 ComputerAgentRunner 复用同一 per-user 容器，
+    /// agent 工作目录缺省推导 `/home/user/normalProject/{project_id}`。
+    /// wire 词与 file-server workspace_type 通道一致（camelCase `normalProject`）。
+    #[serde(rename = "normalProject")]
+    NormalProject,
 }
 
 /// Computer Agent 聊天请求
@@ -470,6 +475,28 @@ pub struct ComputerAgentCancelResponse {
     /// 会话 ID
     #[schema(example = "session_789")]
     pub session_id: String,
+}
+
+#[cfg(test)]
+mod chat_service_scope_tests {
+    use super::ChatServiceScope;
+
+    #[test]
+    fn normal_project_wire_is_camel_case() {
+        // wire 词与 file-server workspace_type 通道一致（camelCase normalProject）
+        assert_eq!(
+            serde_json::to_string(&ChatServiceScope::NormalProject).unwrap(),
+            "\"normalProject\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ChatServiceScope>("\"normalProject\"").unwrap(),
+            ChatServiceScope::NormalProject
+        );
+        assert_eq!(
+            serde_json::to_string(&ChatServiceScope::Userapp).unwrap(),
+            "\"userapp\""
+        );
+    }
 }
 
 #[cfg(test)]

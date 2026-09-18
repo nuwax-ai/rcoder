@@ -255,6 +255,39 @@ mod tests {
     use shared_types::ServiceType;
 
     #[test]
+    fn computer_normal_project_derives_default_and_keeps_absolute() {
+        // 常规项目：显式绝对路径原样透传（Java 常规链路）
+        let dir = resolve_project_dir(
+            &ServiceType::ComputerNormalProject,
+            "p1",
+            None,
+            Some("/home/user/normalProject/p1"),
+            "/tmp/ws",
+        );
+        assert_eq!(dir, std::path::PathBuf::from("/home/user/normalProject/p1"));
+        // 单段/缺省 → 服务端默认推导 normalProject 布局
+        let dir = resolve_project_dir(
+            &ServiceType::ComputerNormalProject,
+            "p1",
+            None,
+            Some("custom-seg"),
+            "/tmp/ws",
+        );
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from("/home/user/normalProject/custom-seg")
+        );
+        let dir = resolve_project_dir(
+            &ServiceType::ComputerNormalProject,
+            "p1",
+            None,
+            None,
+            "/tmp/ws",
+        );
+        assert_eq!(dir, std::path::PathBuf::from("/home/user/normalProject/p1"));
+    }
+
+    #[test]
     fn userapp_builder_uses_app_id_field() {
         // 新契约主路径：定位键=app_id，agent_work_dir（Java 会话 ID 形态）被忽略，
         // 根=注入的 userapp_root（builder 容器内即 /home/user，PVC 挂载点父目录）

@@ -95,11 +95,19 @@ pub async fn handle_ttyd_request(
     upstream_request.insert_header("X-Ttyd-Proxy", "pingora")?;
     upstream_request.insert_header("X-Ttyd-User-Id", user_id)?;
     upstream_request.insert_header("X-Ttyd-Project-Id", project_id)?;
-    // 告知 agent_runner 业务场景（ServiceType 的 Display = kebab-case），用于显式选 cwd 前缀
-    upstream_request.insert_header(
-        "X-Ttyd-Service-Type",
-        shared_types::ServiceType::ComputerAgentRunner.to_string(),
-    )?;
+    // 告知 agent_runner 业务场景（ServiceType 的 Display = kebab-case），用于显式选 cwd 前缀。
+    // 常规项目：客户端已带 X-Ttyd-Service-Type 且解析为 Computer 族时透传本义值
+    // （agent_runner 据此选 /home/user/normalProject 前缀）；未带/解析失败/非
+    // Computer 族一律回落默认 computer-agent-runner——服务端校验防任意类型注入
+    let ttyd_service_type = upstream_request
+        .headers
+        .get("X-Ttyd-Service-Type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse::<shared_types::ServiceType>().ok())
+        .filter(|st| st.container_family() == shared_types::ServiceType::ComputerAgentRunner)
+        .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
+    let ttyd_service_type = ttyd_service_type.to_string();
+    upstream_request.insert_header("X-Ttyd-Service-Type", &ttyd_service_type)?;
 
     Ok(())
 }

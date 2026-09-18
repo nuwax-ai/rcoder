@@ -319,15 +319,16 @@ mod tests {
     }
 
     /// normalProject + appId（projectId 复用 appId 通道）→ 共享工作区
-    /// `{CWS}/{userId}/NormalProject/{projectId}`（body 通道类型，无 header）。
+    /// `{PROJECT_SOURCE_DIR}/normalProject/{projectId}`（沙箱视角，body 通道类型，无 header）。
     #[tokio::test]
     async fn normal_project_resolves_shared_workspace() {
         let mut state = make_state();
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(tmp.path().join("u1").join("NormalProject").join("proj-3"))
+        std::fs::create_dir_all(tmp.path().join("normalProject").join("proj-3"))
             .expect("seed workspace");
         state.config = Arc::new(crate::Config {
             computer_workspace_dir: tmp.path().to_path_buf(),
+            project_source_dir: tmp.path().to_path_buf(),
             ..crate::Config::default()
         });
         let (path, log_id) = scope_context(None, None, async {
@@ -343,10 +344,7 @@ mod tests {
         })
         .await
         .expect("normalProject shared workspace");
-        assert_eq!(
-            path,
-            tmp.path().join("u1").join("NormalProject").join("proj-3")
-        );
+        assert_eq!(path, tmp.path().join("normalProject").join("proj-3"));
         assert_eq!(log_id, "computer:u1:c1");
     }
 

@@ -170,6 +170,24 @@ mod tests {
     }
 
     #[test]
+    fn computer_normal_project_resolves_normal_project_directory() {
+        // 常规项目终端 cwd：/home/user/normalProject/{pid}（沙箱真实目录）。
+        // 与既有 computer_agent_runner 测试同策略：/home/user 在测试机上可能
+        // 不存在——目录存在才断言解析形态，不存在则断言 None（不误落 taskAgent
+        // 单级目录 /home/user/{pid} 的兜底行为）。
+        let result = resolve_project_cwd("computer-normal-project", "p9", "", "");
+        if let Some(cwd) = result.as_ref() {
+            assert_eq!(cwd.to_str().unwrap(), "/home/user/normalProject/p9");
+        }
+    }
+
+    #[test]
+    fn computer_normal_project_missing_dir_falls_back() {
+        // 目录不存在 → None（调用方回退 $HOME），不得错落 taskAgent 单级目录
+        assert!(resolve_project_cwd("computer-normal-project", "no-such-pid", "", "").is_none());
+    }
+
+    #[test]
     fn computer_agent_runner_resolves_user_directory() {
         // ComputerAgentRunner 返回 /home/user/{project_id}（不受 tenant/space 影响）
         // 注意：这个测试在非容器环境中会返回 None，因为 /home/user/{project_id} 可能不存在

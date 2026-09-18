@@ -194,6 +194,14 @@ async fn run_computer_chat_flow(
     let request_for_forward = session::resolve_forward_request(&state, &request, &project_id);
 
     // 8. 转发请求到容器服务（使用 gRPC）
+    // 常规项目走同一 computer 流程（共享容器/ensure/VNC 全复用）；仅转发
+    // service_type 保留本义——agent_runner cwd 链按 ComputerNormalProject 推导
+    let forward_service_type = match request.service_type {
+        Some(shared_types::ChatServiceScope::NormalProject) => {
+            shared_types::ServiceType::ComputerNormalProject
+        }
+        _ => shared_types::ServiceType::ComputerAgentRunner,
+    };
     let forward_params = forward::ComputerForwardParams {
         request: &request_for_forward,
         project_id: &project_id,
@@ -205,7 +213,7 @@ async fn run_computer_chat_flow(
         namespace: &state.config.app_manager.namespace,
         cluster_domain: &state.cluster_domain,
         runtime: state.runtime(),
-        service_type: shared_types::ServiceType::ComputerAgentRunner,
+        service_type: forward_service_type,
         diagnostic_identifier: user_id.clone(),
     };
     let result = forward::forward_computer_request_to_container(forward_params).await;
