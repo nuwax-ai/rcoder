@@ -65,7 +65,7 @@ pub(crate) async fn computer_root_for_request(
         state,
         user_id,
         cid,
-        crate::extract::merged_workspace_kind(scope.workspace_type, scope.service_type),
+        crate::extract::merged_workspace_kind(scope.workspace_type, scope.service_type)?,
         crate::extract::merged_request_app_id(scope.app_id).as_deref(),
         scope.workspace_path,
     )
@@ -669,6 +669,36 @@ mod tests {
         .await
         .expect("explicit workspaceType userapp resolves dev volume");
         assert_eq!(path, state.config.userapp_workspace_dir.join("app-9"));
+    }
+
+    /// 1.4.7 fail-fast（TS a29cbc0）：workspaceType 传了垃圾值（无法归一）→
+    /// 400 拒绝，不再静默回落缺省 `{CWS}/{userId}/{cId}` 布局——文件操作含
+    /// 破坏性，错误类型静默错定位是上游修复的核心缺陷。
+    #[tokio::test]
+    async fn garbage_workspace_type_rejected_instead_of_default_layout() {
+        let (state, resolver) = make_state();
+        let err = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                service_type: None,
+                workspace_type: Some("not-a-type"),
+                app_id: Some("proj-7"),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect_err("garbage workspaceType must fail fast");
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
+        assert!(
+            err.to_string().contains(
+                "workspaceType must be one of userApp, pageApp, normalProject, taskAgent"
+            ),
+            "{err:?}"
+        );
+        // 静默回落形态（定位到默认布局）必须消失：resolver 零调用
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
     }
 
     /// header 通道优先于显式字段（TS 合并序锁）：header=taskAgent 显式传

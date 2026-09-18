@@ -31,6 +31,10 @@ tokio::task_local! {
     /// `X-Workspace-Type` 归一化后的工作空间定位类型（B06：定位单一通道；
     /// header 缺失/未匹配 scope `None`，轮到 body/query 通道）。
     pub(crate) static WORKSPACE_KIND: Option<ComputerServiceKind>;
+    /// `X-Workspace-Type` header 的原始非空值（trim 后存储，`None` = 缺失/空白）。
+    /// 垃圾值与缺失在 [`WORKSPACE_KIND`]（归一产物）里同为 `None`，fail-fast
+    /// 判定（TS a29cbc0/1.4.7：传了但无法归一必须 400）需要原始值区分两者。
+    pub(crate) static WORKSPACE_TYPE_RAW: Option<String>;
     /// 定位的独立 app_id（header `x-app-id` 优先，缺省 query `appId`
     /// 兜底；原始值存储，合法性由定位收口 `resolve_userapp_dev` 校验——与
     /// WORKSPACE_PATH 同款「中间件存原始值、收口 fail-fast」模式）。
@@ -79,10 +83,17 @@ pub async fn scope_service_context(req: Request, next: axum::middleware::Next) -
     // 工作空间定位 header 通道（TS 88a1827 / B06）：x-workspace-type 是
     // 定位**唯一** header 通道；旧 x-service-type 是运行时路由概念，
     // 不解析、不参与目录定位（两级旧字段回退已删除——对齐 TS 契约）。
-    let workspace_kind = req
+    // 原始值另行 scope：归一失败的垃圾值不再静默视为缺失（TS a29cbc0/1.4.7），
+    // 由 merged_workspace_kind 收口 fail-fast。
+    let raw_workspace_type = req
         .headers()
         .get(WORKSPACE_TYPE_HEADER)
         .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let workspace_kind = raw_workspace_type
+        .as_deref()
         .and_then(shared_types::normalize_computer_service_type);
     let app_id = req
         .headers()
@@ -96,7 +107,11 @@ pub async fn scope_service_context(req: Request, next: axum::middleware::Next) -
     async {
         USERAPP_APP_ID
             .scope(app_id, async {
-                WORKSPACE_KIND.scope(workspace_kind, fut).await
+                WORKSPACE_TYPE_RAW
+                    .scope(raw_workspace_type, async {
+                        WORKSPACE_KIND.scope(workspace_kind, fut).await
+                    })
+                    .await
             })
             .await
     }
@@ -157,19 +172,38 @@ pub(crate) fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// 合并工作空间定位类型来源（R06 优先级，对齐 TS `resolveServiceContext`）：
-/// `x-workspace-type` header > body/query 的 `workspaceType` 字段 >
-/// body/query 的旧 `serviceType` 字段（滚动升级）> 旧 `x-service-type`
-/// header（最后档——显式 workspaceType 任何通道都优先于旧运行时 header，
-/// 修复"旧 header 抢占目录类型"）。全通道无有效值 → `None`（缺省
-/// taskAgent 布局）。
+/// 合并工作空间定位类型来源（R06 优先级 + TS a29cbc0/1.4.7 fail-fast）：
+/// `x-workspace-type` header > body/query 的 `workspaceType` 字段。
+///
+/// - 任一通道归一成功 → 该值（header 优先）；「一垃圾一合法」→ 合法值胜出
+///   不报错（TS 同构：`headerNorm || bodyNorm` 链）
+/// - 两通道皆未传（或空白）→ `Ok(None)`（缺省 taskAgent 布局，存量直连兼容）
+/// - 有通道传了非空值但**均**无法归一 → `Err`——文件/git 均含破坏性操作，
+///   垃圾类型静默回落会把操作落到 `{userId}/{cId}` 默认工作区
+///
+/// 文案对齐 TS computer 域 `resolveServiceContext`（git 域 TS 原文多
+/// "is required and"，统一用前者）。旧 `serviceType` 字段不参与定位
+/// （B06 契约），参数仅为消费方形态保留。
 pub(crate) fn merged_workspace_kind(
     workspace_type: Option<&str>,
     // 保留参数形态（消费方仍传旧字段值）；B06 契约下旧值不参与定位
     _service_type: Option<&str>,
-) -> Option<ComputerServiceKind> {
-    workspace_kind()
-        .or_else(|| workspace_type.and_then(shared_types::normalize_computer_service_type))
+) -> Result<Option<ComputerServiceKind>, AppError> {
+    let header_norm = workspace_kind();
+    let body_norm = workspace_type.and_then(shared_types::normalize_computer_service_type);
+    if let Some(kind) = header_norm.or(body_norm) {
+        return Ok(Some(kind));
+    }
+    let header_present = WORKSPACE_TYPE_RAW
+        .try_with(|v| v.is_some())
+        .unwrap_or(false);
+    let body_present = workspace_type.map(str::trim).is_some_and(|v| !v.is_empty());
+    if header_present || body_present {
+        return Err(AppError::validation(
+            "workspaceType must be one of userApp, pageApp, normalProject, taskAgent",
+        ));
+    }
+    Ok(None)
 }
 
 /// 合并 appId 来源（header `x-app-id` > query `appId`（task-local 读取器内
@@ -322,11 +356,14 @@ mod tests {
         WORKSPACE_KIND
             .scope(None, async {
                 // body serviceType 旧字段不回退
-                assert_eq!(super::merged_workspace_kind(None, Some("userapp")), None);
+                assert_eq!(
+                    super::merged_workspace_kind(None, Some("userapp")).ok(),
+                    Some(None)
+                );
                 // 显式 body workspaceType 正常生效（同请求带旧 serviceType 不影响）
                 assert_eq!(
-                    super::merged_workspace_kind(Some("normalProject"), Some("userapp")),
-                    Some(ComputerServiceKind::NormalProject)
+                    super::merged_workspace_kind(Some("normalProject"), Some("userapp")).ok(),
+                    Some(Some(ComputerServiceKind::NormalProject))
                 );
             })
             .await;
@@ -338,8 +375,8 @@ mod tests {
         WORKSPACE_KIND
             .scope(Some(ComputerServiceKind::Userapp), async {
                 assert_eq!(
-                    super::merged_workspace_kind(Some("normalProject"), None),
-                    Some(ComputerServiceKind::Userapp)
+                    super::merged_workspace_kind(Some("normalProject"), None).ok(),
+                    Some(Some(ComputerServiceKind::Userapp))
                 );
             })
             .await;
@@ -370,25 +407,71 @@ mod tests {
                     super::merged_workspace_kind(
                         body.workspace_type.as_deref(),
                         body.service_type.as_deref()
-                    ),
-                    Some(ComputerServiceKind::NormalProject)
+                    )
+                    .ok(),
+                    Some(Some(ComputerServiceKind::NormalProject))
                 );
             })
             .await;
     }
 
-    /// B06 缺省：无 workspaceType 任何通道 → None（缺省 taskAgent 布局）。
-    /// 未知 workspaceType 值同样不回退旧字段（None，非 taskAgent 强选）。
+    /// B06 缺省：无 workspaceType 任何通道 → `Ok(None)`（缺省 taskAgent 布局）。
+    /// 1.4.7 fail-fast：传了非空值但无法归一 → `Err`，不再静默回落旧字段。
     #[tokio::test]
-    async fn absent_or_unknown_workspace_type_falls_to_default() {
+    async fn absent_workspace_type_defaults_garbage_fails_fast() {
         WORKSPACE_KIND
             .scope(None, async {
-                assert_eq!(super::merged_workspace_kind(None, None), None);
+                assert_eq!(super::merged_workspace_kind(None, None).ok(), Some(None));
+                assert!(
+                    super::merged_workspace_kind(Some("not-a-type"), None).is_err(),
+                    "垃圾值必须 fail-fast 而非静默缺省"
+                );
+                // 旧 serviceType 通道仍不参与定位（垃圾 serviceType 不触发 Err）
                 assert_eq!(
-                    super::merged_workspace_kind(Some("not-a-type"), Some("userapp")),
-                    None
+                    super::merged_workspace_kind(None, Some("userapp")).ok(),
+                    Some(None)
                 );
             })
+            .await;
+    }
+
+    /// 1.4.7「一垃圾一合法」：任一通道归一成功即用该值不报错（TS
+    /// `headerNorm || bodyNorm` 链）；双通道皆垃圾 → `Err`。header 垃圾与
+    /// 缺失的区分依赖 `WORKSPACE_TYPE_RAW` 原始值。
+    #[tokio::test]
+    async fn one_garbage_one_valid_channel_uses_valid() {
+        // header 垃圾 + body 合法 → body 值
+        super::WORKSPACE_TYPE_RAW
+            .scope(
+                Some("junk".into()),
+                WORKSPACE_KIND.scope(None, async {
+                    assert_eq!(
+                        super::merged_workspace_kind(Some("userApp"), None).ok(),
+                        Some(Some(ComputerServiceKind::Userapp))
+                    );
+                }),
+            )
+            .await;
+        // header 合法 + body 垃圾 → header 值
+        super::WORKSPACE_TYPE_RAW
+            .scope(
+                Some("userapp".into()),
+                WORKSPACE_KIND.scope(Some(ComputerServiceKind::Userapp), async {
+                    assert_eq!(
+                        super::merged_workspace_kind(Some("garbage"), None).ok(),
+                        Some(Some(ComputerServiceKind::Userapp))
+                    );
+                }),
+            )
+            .await;
+        // 双通道皆垃圾 → Err
+        super::WORKSPACE_TYPE_RAW
+            .scope(
+                Some("junk".into()),
+                WORKSPACE_KIND.scope(None, async {
+                    assert!(super::merged_workspace_kind(Some("also-junk"), None).is_err());
+                }),
+            )
             .await;
     }
 

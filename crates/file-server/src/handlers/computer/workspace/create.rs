@@ -275,11 +275,12 @@ pub(crate) async fn create_workspace_v2(
                 // 共享工作区（normalProject 且带项目 ID）→ manifest 并集视图；
                 // userapp 消费链现状不可达（直转恒 legacy），保持不激活（有意偏离）
                 // F03：判定/app_id 与 ws_path 同源（merged：header 优先 > body）
-                // ——body-only normalProject 或 header-only appId 不再走错分支
+                // ——body-only normalProject 或 header-only appId 不再走错分支；
+                // 垃圾 workspaceType 已在 ws_path 定位收口 400，此处 `?` 防御一致
                 shared_project_id: match crate::extract::merged_workspace_kind(
                     workspace_type.as_deref(),
                     service_type.as_deref(),
-                ) {
+                )? {
                     Some(shared_types::ComputerServiceKind::NormalProject) => {
                         merged_project_id.as_deref()
                     }

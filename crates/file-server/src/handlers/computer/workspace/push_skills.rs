@@ -120,11 +120,12 @@ async fn push_skills_to_workspace_impl(
             agent_store_root: Some(&store_root),
             // 共享工作区（normalProject 且带项目 ID）→ 直接 store 模式 +
             // manifest 视图同步；userapp 消费链不可达，不激活（有意偏离）
-            // F03：判定/app_id 与 ws_path 同源（merged：header 优先 > body）
+            // F03：判定/app_id 与 ws_path 同源（merged：header 优先 > body）；
+            // 垃圾 workspaceType 已在 ws_path 定位收口 400，此处 `?` 防御一致
             shared_project_id: match crate::extract::merged_workspace_kind(
                 workspace_type.as_deref(),
                 service_type.as_deref(),
-            ) {
+            )? {
                 Some(shared_types::ComputerServiceKind::NormalProject) => {
                     merged_project_id.as_deref()
                 }

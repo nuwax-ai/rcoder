@@ -76,8 +76,11 @@ impl GitServiceContext {
     ) -> Option<Self> {
         // R06：定位类型 = workspaceType 通道（git 的 workspaceType wire 字段
         // 与 serviceContext 同源——TS extractGitParams/extractServiceContext
-        // 读同一字段）；旧 serviceType 仅回退档
-        let kind = crate::extract::merged_workspace_kind(body_workspace_type, body_service_type);
+        // 读同一字段）；旧 serviceType 仅回退档。垃圾值 Err 暂折叠为 None——
+        // git 域 fail-fast 随 resolve_target 重构统一收口
+        let kind = crate::extract::merged_workspace_kind(body_workspace_type, body_service_type)
+            .ok()
+            .flatten();
         let app_id = crate::extract::merged_request_app_id(body_app_id);
         let workspace_path = crate::extract::merged_workspace_path(body_workspace_path);
         match kind {
