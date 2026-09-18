@@ -157,6 +157,9 @@ impl DevServerManager {
             .filter(|s| !s.trim().is_empty());
         // dev-inject / design-mode 注入 (业务需要: 让前端可用 design 模式);
         // 失败仅记日志不阻塞 dev server 启动 (对齐 nuwax processManager 的 set +e 宽松语义)。
+        // N08：注入命令是 sh 语法（set +e/; 分隔）——Windows 无 sh，显式跳过
+        // （非阻塞语义下 warn 可见，不假装执行成功）
+        #[cfg(not(windows))]
         if let Err(e) = process::run_command_to_log(
             "sh",
             &[
@@ -173,6 +176,10 @@ impl DevServerManager {
         {
             tracing::warn!(error = %e, "dev-inject/design-mode preCmd failed (non-blocking)");
         }
+        #[cfg(windows)]
+        tracing::warn!(
+            "dev-inject/design-mode preCmd skipped on Windows (shell-script based              injector); design mode unavailable in this environment"
+        );
 
         let (child, stdout, stderr) = match ovr {
             Some(ovr) => {

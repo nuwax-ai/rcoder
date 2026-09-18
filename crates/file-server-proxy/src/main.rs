@@ -216,11 +216,17 @@ async fn main() {
     #[cfg(not(feature = "embed-file-server"))]
     {
         init_tracing_plain();
+        // N05：请求 embed 而产物未编译该能力 → fail-fast（非零退出）。
+        // 旧行为 warn 后继续转发 127.0.0.1:8086 是"假装成功"——原生场景
+        // 上游并不存在，请求只会 502。
         if settings.embed {
-            tracing::warn!(
-                "--embed/EMBED_FILE_SERVER=1 被忽略: 二进制未编译 embed-file-server \
-                 feature (--no-default-features 纯转发形态)"
+            eprintln!(
+                "错误: --embed/EMBED_FILE_SERVER=1 被拒绝——本二进制未编译 \
+                 embed-file-server feature（--no-default-features 纯转发形态）。\
+                 原生标准模式需要 embed 产物；请安装对应平台完整包或去掉 --embed \
+                 使用纯转发形态"
             );
+            std::process::exit(2);
         }
     }
 

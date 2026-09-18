@@ -167,8 +167,20 @@ pub fn spawn_override_shell(
     full_command: &str,
     cwd: &Path,
 ) -> AppResult<(Child, Option<ChildStdout>, Option<ChildStderr>)> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(full_command);
+    // N08：不再硬编码 sh——Unix sh -c / Windows cmd /C（运维 override 命令
+    // 按目标平台 shell 语法书写；Windows 无 sh）
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(full_command);
+        cmd
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(full_command);
+        cmd
+    };
     cmd.current_dir(cwd);
     cmd.env_clear();
     cmd.envs(minimal_env(&[]));
@@ -412,6 +424,8 @@ pub async fn wait_for_stop(pid: u32, interval_ms: u64, max_attempts: u32) {
 
 /// 系统级扫描某 project_id 的所有相关 pid (对齐 nuwax findPidsByProjectId)。
 /// `ps -Ao pid,command -ww` → 只匹配 `/{projectId}` 路径片段。
+/// N08：Unix 工具——Windows 无 ps，spawn 失败走空兜底（调用方内存 Map 兜底，
+/// 不假装扫到）。
 /// 不使用 nuwax 的宽松回退：本地调用时 curl/shell 命令行也含有
 /// `projectId=...`，宽松匹配会把请求发起进程误当成 Vite 并终止。
 /// ps 不存在/失败返回空 (调用方仍可用内存 Map 的 pid 兜底)。
