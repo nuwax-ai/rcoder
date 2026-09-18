@@ -76,6 +76,19 @@ REQUIRED['userapp_devbuild_skip_and_fallback_source_mode'].update({
     'Q10 previous content remains healthy after build failure',
 })
 
+REQUIRED['userapp_devbuild_no_lockfile_pnpm_install'] = {
+    'create-workspace（ensure 开发容器）',
+    'init 模板 zip（manifests + dist fixture 直投源码目录）',
+    'dev/start 受理（task_id）',
+    '无 lockfile dev/start completed（--no-frozen-lockfile 安装成功）',
+    'devbuild 生成 pnpm-lock.yaml（修复前此处 ERR_PNPM_NO_LOCKFILE 失败）',
+    'dev/list → pid>0（devrun 存活）',
+    'devrun 服务内容经代理可达（node server.js）',
+    '事故反例 fixture 写入（frozen + 过期 lockfile）',
+    'frozen + 过期 lockfile → 任务 failed（错误如实传播）',
+    'dev/stop → Stopped',
+}
+
 REQUIRED['lb_entry_rotation'] = {'跨入口上下文延续（CAP/BASE 关键词）'} | {
     f'turn{i} {step}' for i in range(4) for step in (
         '跨入口收到事件', 'seq 全 > 前轮（跨入口 seq 单源连续）', '完整执行（end_turn）',

@@ -371,4 +371,207 @@ mod tests {
         );
         assert!(!fresh_lock(&ws, &lock_path).await);
     }
+
+    // ===== 真实 pnpm devbuild 链路回归（app 110 事故修复）=====
+    //
+    // 走生产路径 run_dev_builds（[devbuild] argv 原样执行，不经 pnpm 封装层）。
+    // fixture 为本地 file: 依赖 + sentinel 检查命令，离线可重复。依赖宿主
+    // PATH 上的真实 pnpm——缺失时跳过并打印原因；验收必须在有 pnpm 的环境
+    // 实跑（见 specs/pnpm-dev-install-recovery/verification.md）。
+
+    fn pnpm_version_on_path() -> Option<String> {
+        std::process::Command::new("pnpm")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    fn local_dep(proj: &Path, name: &str) {
+        let dir = proj.join("vendor").join(name);
+        fs::create_dir_all(&dir).expect("vendor dep dir");
+        fs::write(
+            dir.join("package.json"),
+            format!(r#"{{ "name": "{name}", "version": "1.0.0" }}"#),
+        )
+        .expect("vendor dep package.json");
+    }
+
+    fn write_pkg_json(proj: &Path, deps: &[(&str, &str)]) {
+        let deps = deps
+            .iter()
+            .map(|(name, spec)| format!(r#""{name}": "{spec}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let content = format!(
+            r#"{{ "name": "devbuild-fixture", "version": "1.0.0", "dependencies": {{ {deps} }} }}"#
+        );
+        fs::write(proj.join("package.json"), content).expect("project package.json");
+    }
+
+    /// frontend 工程（vendor/dep-a 本地依赖 + [devbuild] 由 extra 注入）。
+    /// 返回 (workspace, sentinel 路径)；sentinel 存在 = 安装后的检查确实执行。
+    fn pnpm_devbuild_ws(devbuild_extra: &str) -> (PathBuf, PathBuf) {
+        let ws = temp_ws();
+        let proj = ws.join("frontend");
+        local_dep(&proj, "dep-a");
+        write_pkg_json(&proj, &[("dep-a", "file:./vendor/dep-a")]);
+        write_manifest(&proj, "frontend", devbuild_extra);
+        write_manifest(&ws.join("backend"), "backend", "");
+        let sentinel = proj.join("check-ran");
+        (ws, sentinel)
+    }
+
+    async fn run_dev_builds_on(ws: &Path, app_id: &str) -> AppResult<()> {
+        let manager = BuildManager::new(1);
+        run_dev_builds(&manager, app_id, ws, 300, None).await
+    }
+
+    fn devbuild_log_text(ws: &Path) -> String {
+        let mut text = String::new();
+        if let Ok(entries) = fs::read_dir(ws.join("logs").join("frontend")) {
+            for entry in entries.flatten() {
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    text.push_str(&content);
+                }
+            }
+        }
+        text
+    }
+
+    const FROZEN_DEVBUILD: &str =
+        "[devbuild]\ncommand = ['sh', '-c', 'pnpm install --frozen-lockfile && touch check-ran']";
+    const NO_FROZEN_DEVBUILD: &str = "[devbuild]\ncommand = ['sh', '-c', 'pnpm install --no-frozen-lockfile && touch check-ran']";
+
+    /// 反例（app 110 事故形态）：旧模板命令 --frozen-lockfile + 无 lockfile →
+    /// dev build 失败，且 && 后的检查未执行。
+    #[tokio::test]
+    async fn devbuild_frozen_without_lockfile_fails_and_skips_check() {
+        let Some(version) = pnpm_version_on_path() else {
+            eprintln!("SKIP: pnpm not on PATH (real-pnpm devbuild regression)");
+            return;
+        };
+        eprintln!("using pnpm {version}");
+        let (ws, sentinel) = pnpm_devbuild_ws(FROZEN_DEVBUILD);
+        let error = run_dev_builds_on(&ws, "frozen-110")
+            .await
+            .expect_err("frozen install without lockfile must fail");
+        assert!(error.to_string().contains("dev build failed"), "{error}");
+        assert!(
+            !sentinel.exists(),
+            "check must not run after failed install"
+        );
+        assert!(
+            devbuild_log_text(&ws).contains("ERR_PNPM_NO_LOCKFILE"),
+            "failure must be ERR_PNPM_NO_LOCKFILE (incident signature)"
+        );
+    }
+
+    /// 新命令 + 无 lockfile：安装成功、生成 lockfile、后续检查确实执行。
+    #[tokio::test]
+    async fn devbuild_no_frozen_without_lockfile_installs_and_checks() {
+        let Some(version) = pnpm_version_on_path() else {
+            eprintln!("SKIP: pnpm not on PATH (real-pnpm devbuild regression)");
+            return;
+        };
+        eprintln!("using pnpm {version}");
+        let (ws, sentinel) = pnpm_devbuild_ws(NO_FROZEN_DEVBUILD);
+        run_dev_builds_on(&ws, "nofrozen-new")
+            .await
+            .expect("devbuild must succeed");
+        assert!(sentinel.exists(), "subsequent check must run");
+        assert!(
+            ws.join("frontend").join("pnpm-lock.yaml").exists(),
+            "lockfile must be generated"
+        );
+    }
+
+    /// 过期 lockfile（依赖声明真实变更，非无关字段）：--no-frozen-lockfile
+    /// 允许安装并同步更新 lockfile。
+    #[tokio::test]
+    async fn devbuild_no_frozen_updates_stale_lockfile() {
+        let Some(version) = pnpm_version_on_path() else {
+            eprintln!("SKIP: pnpm not on PATH (real-pnpm devbuild regression)");
+            return;
+        };
+        eprintln!("using pnpm {version}");
+        let (ws, sentinel) = pnpm_devbuild_ws(NO_FROZEN_DEVBUILD);
+        let proj = ws.join("frontend");
+        run_dev_builds_on(&ws, "stale-1")
+            .await
+            .expect("initial install");
+        local_dep(&proj, "dep-b");
+        write_pkg_json(
+            &proj,
+            &[
+                ("dep-a", "file:./vendor/dep-a"),
+                ("dep-b", "file:./vendor/dep-b"),
+            ],
+        );
+        fs::remove_file(&sentinel).expect("reset sentinel");
+        run_dev_builds_on(&ws, "stale-2")
+            .await
+            .expect("stale lockfile install must succeed");
+        let lockfile = fs::read_to_string(proj.join("pnpm-lock.yaml")).expect("lockfile");
+        assert!(lockfile.contains("dep-b"), "lockfile must be updated");
+        assert!(sentinel.exists(), "subsequent check must run");
+    }
+
+    /// lockfile 已匹配：重复安装幂等成功，检查照常执行。
+    #[tokio::test]
+    async fn devbuild_repeat_install_with_matching_lockfile_succeeds() {
+        let Some(version) = pnpm_version_on_path() else {
+            eprintln!("SKIP: pnpm not on PATH (real-pnpm devbuild regression)");
+            return;
+        };
+        eprintln!("using pnpm {version}");
+        let (ws, sentinel) = pnpm_devbuild_ws(NO_FROZEN_DEVBUILD);
+        run_dev_builds_on(&ws, "repeat-1").await.expect("first run");
+        fs::remove_file(&sentinel).expect("reset sentinel");
+        run_dev_builds_on(&ws, "repeat-2")
+            .await
+            .expect("second run");
+        assert!(sentinel.exists(), "check must run on repeat install");
+    }
+
+    /// 安装失败（file: 指向不存在的路径）：任务失败且后续检查未执行。
+    #[tokio::test]
+    async fn devbuild_install_failure_propagates_and_skips_check() {
+        let Some(version) = pnpm_version_on_path() else {
+            eprintln!("SKIP: pnpm not on PATH (real-pnpm devbuild regression)");
+            return;
+        };
+        eprintln!("using pnpm {version}");
+        let (ws, sentinel) = pnpm_devbuild_ws(NO_FROZEN_DEVBUILD);
+        write_pkg_json(
+            &ws.join("frontend"),
+            &[("missing-dep", "file:./vendor/missing")],
+        );
+        let error = run_dev_builds_on(&ws, "install-fail")
+            .await
+            .expect_err("unresolvable dep must fail devbuild");
+        assert!(error.to_string().contains("dev build failed"), "{error}");
+        assert!(
+            !sentinel.exists(),
+            "check must not run after failed install"
+        );
+    }
+
+    /// React 形态后续检查失败：安装成功但检查脚本非零 → run_dev_builds 仍
+    /// 失败，不返回假成功。
+    #[tokio::test]
+    async fn devbuild_check_failure_fails_the_task() {
+        let Some(version) = pnpm_version_on_path() else {
+            eprintln!("SKIP: pnpm not on PATH (real-pnpm devbuild regression)");
+            return;
+        };
+        eprintln!("using pnpm {version}");
+        let extra = "[devbuild]\ncommand = ['sh', '-c', 'pnpm install --no-frozen-lockfile && node -e \"process.exit(3)\"']";
+        let (ws, _sentinel) = pnpm_devbuild_ws(extra);
+        let error = run_dev_builds_on(&ws, "check-fail")
+            .await
+            .expect_err("check failure must fail devbuild");
+        assert!(error.to_string().contains("dev build failed"), "{error}");
+    }
 }

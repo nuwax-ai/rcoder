@@ -186,20 +186,7 @@ async fn install_once(
     logs: Option<&LogFiles>,
     timeout_secs: u64,
 ) -> Result<InstallOutcome, InstallError> {
-    let mut args = vec!["--reporter=ndjson".to_string(), "install".to_string()];
-    if options.prefer_offline {
-        args.push("--prefer-offline".to_string());
-    }
-    // file-server 非 TTY (stdin null) spawn pnpm: node_modules 与 lockfile 不一致时, pnpm 要
-    // 交互确认 purge modules 目录, 无 TTY 则 abort (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY)
-    // → install 永久失败、vite 起不来。confirmModulesPurge=false 跳过确认 (对齐 pnpm 源码
-    // deps-installer/.../validateModules.ts:152 + PnpmError hint 推荐; CLI 用 camelCase,
-    // .npmrc 才用 kebab confirm-modules-purge)。兜底所有 install 路径 (dev_server/exec/build)。
-    // 另一解法是 CI=true (源码 index.ts: confirmModulesPurge && !ci), 但 file-server
-    // env_remove(CI), 且 CI 模式会影响 reporter, 故走精确配置。
-    // 不用 --config.dangerously-allow-all-builds: pnpm 10.x 下它与内置 neverBuiltDependencies 冲突。
-    args.push("--config.confirmModulesPurge=false".to_string());
-    args.extend(options.extra_args.iter().cloned());
+    let args = install_args(options);
 
     let mut command = Command::new("pnpm");
     command.args(&args).current_dir(cwd);
@@ -326,6 +313,31 @@ async fn install_once(
     })
 }
 
+/// 构造实际安装参数（install_once 的单一来源，测试同一函数）。
+///
+/// 业务策略：开发安装允许 lockfile 创建/更新——项目无 pnpm-lock.yaml（脚手架新
+/// 建项目）或 package.json 变更后，安装应生成/同步 lockfile 而不是以
+/// ERR_PNPM_NO_LOCKFILE / ERR_PNPM_OUTDATED_LOCKFILE 失败。默认值放在 extra_args
+/// 之前，显式传入的参数仍可覆盖。
+fn install_args(options: &InstallOptions) -> Vec<String> {
+    let mut args = vec!["--reporter=ndjson".to_string(), "install".to_string()];
+    args.push("--no-frozen-lockfile".to_string());
+    if options.prefer_offline {
+        args.push("--prefer-offline".to_string());
+    }
+    // file-server 非 TTY (stdin null) spawn pnpm: node_modules 与 lockfile 不一致时, pnpm 要
+    // 交互确认 purge modules 目录, 无 TTY 则 abort (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY)
+    // → install 永久失败、vite 起不来。confirmModulesPurge=false 跳过确认 (对齐 pnpm 源码
+    // deps-installer/.../validateModules.ts:152 + PnpmError hint 推荐; CLI 用 camelCase,
+    // .npmrc 才用 kebab confirm-modules-purge)。兜底所有 install 路径 (dev_server/exec/build)。
+    // 另一解法是 CI=true (源码 index.ts: confirmModulesPurge && !ci), 但 file-server
+    // env_remove(CI), 且 CI 模式会影响 reporter, 故走精确配置。
+    // 不用 --config.dangerously-allow-all-builds: pnpm 10.x 下它与内置 neverBuiltDependencies 冲突。
+    args.push("--config.confirmModulesPurge=false".to_string());
+    args.extend(options.extra_args.iter().cloned());
+    args
+}
+
 async fn terminate_and_reap(child: &mut tokio::process::Child, pid: Option<u32>) {
     if let Some(pid) = pid {
         process::kill_process_group_force(pid);
@@ -407,5 +419,59 @@ fn push_bounded(buffer: &mut String, line: &str) {
             remove += 1;
         }
         buffer.drain(..remove);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_args_default_allows_lockfile_updates() {
+        let args = install_args(&InstallOptions::default());
+        assert_eq!(
+            args,
+            vec![
+                "--reporter=ndjson",
+                "install",
+                "--no-frozen-lockfile",
+                "--config.confirmModulesPurge=false",
+            ]
+        );
+    }
+
+    #[test]
+    fn install_args_prefer_offline_kept() {
+        let args = install_args(&InstallOptions::prefer_offline());
+        assert_eq!(
+            args,
+            vec![
+                "--reporter=ndjson",
+                "install",
+                "--no-frozen-lockfile",
+                "--prefer-offline",
+                "--config.confirmModulesPurge=false",
+            ]
+        );
+    }
+
+    #[test]
+    fn install_args_extra_args_appended_after_defaults() {
+        let options = InstallOptions {
+            prefer_offline: false,
+            extra_args: vec!["--config.production=false".to_string()],
+        };
+        let args = install_args(&options);
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("--config.production=false")
+        );
+        let no_frozen = args
+            .iter()
+            .position(|a| a == "--no-frozen-lockfile")
+            .expect("default --no-frozen-lockfile present");
+        let first_extra = args.len() - 1;
+        assert!(no_frozen < first_extra, "defaults precede extra_args");
+        assert!(args.iter().all(|a| a != "--frozen-lockfile"));
     }
 }

@@ -329,6 +329,12 @@
       "backend": "compose"
     }
   ],
+  "userapp_devbuild_no_lockfile_pnpm_install": [
+    {
+      "scenario": "userapp_devbuild_rules",
+      "backend": "compose"
+    }
+  ],
   "userapp_hot_deployment_builtin_contract": [
     {
       "scenario": "userapp_hot_deployment_builtin_contract",

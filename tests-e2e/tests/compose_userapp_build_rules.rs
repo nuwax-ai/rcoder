@@ -12,6 +12,9 @@
 //!   含服务名/逃逸指引；对齐形态（strip=true+无前缀布局）→ completed（无误报）
 //! - 源码态 dev/start：只配 [devrun] 的服务跳过编译（build marker 不落盘）、
 //!   未配 [devrun] 的服务回落 [build].command（marker 落盘），编排整体 completed
+//! - pnpm devbuild 无 lockfile（app 110 事故回归）：--no-frozen-lockfile 安装
+//!   成功并生成 lockfile、devrun 可用；--frozen-lockfile + 过期 lockfile →
+//!   任务 failed（错误如实传播）
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -652,6 +655,273 @@ async fn userapp_devbuild_skip_and_fallback_source_mode() {
         "Q10 previous content remains healthy after build failure",
         status.is_success() && content.trim() == "Q10_OLD_GO",
         format!("HTTP {status}, {content}"),
+    );
+
+    // dev/stop → Stopped（收尾，防 builder 残留进程族）
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/dev/stop", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &app)
+        .json(&json!({"app_id": app, "user_id": user}))
+        .send()
+        .await
+        .expect("dev stop");
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "dev/stop → Stopped",
+        body["data"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Stopped")),
+        format!("body 截断: {}", trunc(&body, 120)),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
+// ============================================================
+// 场景 4：pnpm devbuild 无 lockfile（app 110 事故回归）——
+//          [devbuild] `pnpm install --no-frozen-lockfile` 在无 lockfile 的
+//          真实 builder 容器内安装成功并生成 lockfile、devrun 可用；
+//          改回 `--frozen-lockfile` 且 lockfile 过期后 dev build 失败
+//          （事故形态），错误如实传播且不杀已有进程。
+// ============================================================
+/// dev/start 并轮询到终态，返回任务 data 快照（受理失败/超预算 → None + hard 红）。
+async fn dev_start_to_terminal(
+    env: &Env,
+    report: &JsonlReporter,
+    app: &str,
+    user: &str,
+    budget: Duration,
+) -> Option<Value> {
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/dev/start", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", app)
+        .json(&json!({"app_id": app, "user_id": user}))
+        .send()
+        .await
+        .expect("dev start");
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let task_id = body["data"]["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    report.assert_hard(
+        "dev/start 受理（task_id）",
+        status.is_success() && http_ok(&body) && !task_id.is_empty(),
+        format!("HTTP {status}, body 截断: {}", trunc(&body, 150)),
+    );
+    if task_id.is_empty() {
+        return None;
+    }
+    let t0 = Instant::now();
+    while t0.elapsed() < budget {
+        let resp = env
+            .http
+            .get(format!(
+                "{}/api/v1/userapp/tasks/{task_id}?app_id={app}&user_id={user}",
+                env.rcoder
+            ))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await;
+        if let Ok(r) = resp
+            && r.status().is_success()
+            && let Ok(b) = r.json::<Value>().await
+            && let Some(st) = b["data"]["status"].as_str()
+            && matches!(st, "completed" | "failed" | "cancelled")
+        {
+            report.diagnostic(
+                "dev/start 到达终态",
+                &format!("{:.0}s, status={st}", t0.elapsed().as_secs_f64()),
+                b["data"]["error"].as_str().unwrap_or(""),
+            );
+            return Some(b["data"].clone());
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    report.assert_hard(
+        "dev/start 到达终态（预算内不挂死）",
+        false,
+        format!("{:.0}s 未到终态", t0.elapsed().as_secs_f64()),
+    );
+    None
+}
+
+/// generate-file 覆写 workspace 内相对路径文件（Q10 同款）。
+async fn overwrite_file(env: &Env, app: &str, user: &str, file_name: &str, content: &str) -> Value {
+    env.http
+        .post(format!("{}/api/v1/userapp/generate-file", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", app)
+        .json(&json!({
+            "app_id": app,
+            "user_id": user,
+            "file_name": file_name,
+            "content": content,
+        }))
+        .send()
+        .await
+        .expect("generate-file")
+        .json()
+        .await
+        .expect("file write response")
+}
+
+#[tokio::test]
+async fn userapp_devbuild_no_lockfile_pnpm_install() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_devbuild_rules";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "pn");
+    let user = "e2e-br-user";
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 单服务 node 工程：无 pnpm-lock.yaml + 本地 file: 依赖（离线安装，不碰
+    // registry）。运行时镜像预装 node + pnpm@10。devbuild 为修复后命令；devrun
+    // 为最小 node http 服务。
+    let ws_manifest = "schema_version = 1\n\n[workspace]\nname = \"e2e-br-pnpm\"\n";
+    let pnpm_manifest = "schema_version = 1\n\n[project]\nservice_id = \"pnpm-svc\"\nname = \"Pnpm Dev\"\ntype = \"node\"\n\n[build]\ncommand = [\"sh\", \"-c\", \"touch built-pnpm.marker\"]\nartifact = \"artifact.zip\"\n\n[run]\ncommand = [\"sh\", \"-c\", \"exec python3 -m http.server $PORT --bind 0.0.0.0\"]\n\n[health]\nreadiness_path = \"/ready-pnpm\"\n\n[devbuild]\ncommand = [\"sh\", \"-c\", \"pnpm install --no-frozen-lockfile\"]\n\n[devrun]\ncommand = [\"sh\", \"-c\", \"exec node server.js\"]\n\n[proxy]\npath = \"/api/pnpm/\"\nstrip_prefix = true\n";
+    let server_js = "const http = require('http');\nhttp.createServer(function (req, res) { res.writeHead(200, {'Content-Type': 'text/plain'}); res.end('PNPM_DEV_OK'); }).listen(process.env.PORT || 3000, '0.0.0.0');\n";
+    let pkg_json = "{\n  \"name\": \"pnpm-dev-fixture\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": { \"dep-a\": \"file:./vendor/dep-a\" }\n}\n";
+    let dep_pkg = "{ \"name\": \"dep-a\", \"version\": \"1.0.0\" }\n";
+    if !init_zip_workspace(
+        &env,
+        &report,
+        &app,
+        user,
+        &[
+            ("workspace.manifest.toml", ws_manifest),
+            ("pnpm-svc/project.manifest.toml", pnpm_manifest),
+            ("pnpm-svc/server.js", server_js),
+            ("pnpm-svc/package.json", pkg_json),
+            ("pnpm-svc/vendor/dep-a/package.json", dep_pkg),
+        ],
+    )
+    .await
+    {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 修复后链路：无 lockfile → 安装成功 + lockfile 生成 + 编排完成（真实 pnpm）
+    let terminal = dev_start_to_terminal(
+        &env,
+        &report,
+        &app,
+        user,
+        Duration::from_secs(240),
+    )
+    .await;
+    report.assert_hard(
+        "无 lockfile dev/start completed（--no-frozen-lockfile 安装成功）",
+        terminal.as_ref().is_some_and(|d| d["status"] == "completed"),
+        format!("terminal={}", trunc(&terminal.unwrap_or(Value::Null), 200)),
+    );
+
+    let lockfile = file_exists(&env, &app, user, "pnpm-svc/pnpm-lock.yaml").await;
+    report.assert_hard(
+        "devbuild 生成 pnpm-lock.yaml（修复前此处 ERR_PNPM_NO_LOCKFILE 失败）",
+        lockfile == Some(true),
+        format!("resolve-file pnpm-svc/pnpm-lock.yaml → {lockfile:?}"),
+    );
+
+    // 编排存活 + devrun 真实服务内容（经 pingora 代理）
+    let resp = env
+        .http
+        .get(format!(
+            "{}/api/v1/userapp/dev/list?app_id={app}&user_id={user}",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(15))
+        .header("X-App-Id", &app)
+        .send()
+        .await
+        .expect("dev list");
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let listed = body["data"]["list"]
+        .as_array()
+        .is_some_and(|arr| arr.iter().any(|p| p["pid"].as_u64().is_some_and(|pid| pid > 0)));
+    report.assert_hard(
+        "dev/list → pid>0（devrun 存活）",
+        listed,
+        format!("body 截断: {}", trunc(&body, 150)),
+    );
+    let pingora =
+        std::env::var("E2E_PINGORA_URL").unwrap_or_else(|_| "http://127.0.0.1:8089".into());
+    let served = env
+        .http
+        .get(format!(
+            "{pingora}/api/v1/userapp/proxy/app/dev/{user}/{app}/api/pnpm/ready-pnpm"
+        ))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .expect("devrun proxy response");
+    let served_status = served.status();
+    let served_content = served.text().await.expect("devrun content");
+    report.assert_hard(
+        "devrun 服务内容经代理可达（node server.js）",
+        served_status.is_success() && served_content.trim() == "PNPM_DEV_OK",
+        format!("HTTP {served_status}, {served_content}"),
+    );
+
+    // 事故反例：devbuild 改回 --frozen-lockfile 且依赖声明变更使 lockfile 过期
+    // → 安装失败（ERR_PNPM_OUTDATED_LOCKFILE 形态）、任务 failed、旧进程保留
+    let dep_b_pkg = "{ \"name\": \"dep-b\", \"version\": \"1.0.0\" }\n";
+    let pkg_json_stale = "{\n  \"name\": \"pnpm-dev-fixture\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": { \"dep-a\": \"file:./vendor/dep-a\", \"dep-b\": \"file:./vendor/dep-b\" }\n}\n";
+    let pnpm_manifest_frozen = "schema_version = 1\n\n[project]\nservice_id = \"pnpm-svc\"\nname = \"Pnpm Dev\"\ntype = \"node\"\n\n[build]\ncommand = [\"sh\", \"-c\", \"touch built-pnpm.marker\"]\nartifact = \"artifact.zip\"\n\n[run]\ncommand = [\"sh\", \"-c\", \"exec python3 -m http.server $PORT --bind 0.0.0.0\"]\n\n[health]\nreadiness_path = \"/ready-pnpm\"\n\n[devbuild]\ncommand = [\"sh\", \"-c\", \"pnpm install --frozen-lockfile\"]\n\n[devrun]\ncommand = [\"sh\", \"-c\", \"exec node server.js\"]\n\n[proxy]\npath = \"/api/pnpm/\"\nstrip_prefix = true\n";
+    for (file_name, content) in [
+        ("pnpm-svc/vendor/dep-b/package.json", dep_b_pkg),
+        ("pnpm-svc/package.json", pkg_json_stale),
+        ("pnpm-svc/project.manifest.toml", pnpm_manifest_frozen),
+    ] {
+        let changed = overwrite_file(&env, &app, user, file_name, content).await;
+        let installed = changed["success"] == true || http_ok(&changed);
+        report.assert_hard(
+            "事故反例 fixture 写入（frozen + 过期 lockfile）",
+            installed,
+            trunc(&changed, 200),
+        );
+        if !installed {
+            assert_hard_all(report).await;
+            cleanup_builder(&app);
+            return;
+        }
+    }
+    let frozen_terminal = dev_start_to_terminal(
+        &env,
+        &report,
+        &app,
+        user,
+        Duration::from_secs(240),
+    )
+    .await;
+    let frozen_failed = frozen_terminal
+        .as_ref()
+        .is_some_and(|d| d["status"] == "failed");
+    let frozen_error = frozen_terminal
+        .as_ref()
+        .and_then(|d| d["error"].as_str())
+        .unwrap_or("")
+        .to_owned();
+    report.assert_hard(
+        "frozen + 过期 lockfile → 任务 failed（错误如实传播）",
+        frozen_failed && frozen_error.contains("dev build failed"),
+        format!("terminal={}", trunc(&frozen_terminal.unwrap_or(Value::Null), 300)),
     );
 
     // dev/stop → Stopped（收尾，防 builder 残留进程族）
