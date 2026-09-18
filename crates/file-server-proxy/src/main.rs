@@ -235,11 +235,15 @@ async fn main() {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "0.0.0.0".to_string()),
-        // N07：令牌 env（非 loopback 监听必需——start 侧 fail-fast 校验）
+        // N07：令牌 env（非 loopback 监听必需——start 侧 fail-fast 校验）；
+        // 受管声明 env（容器 supervisor 配置显式注入——公开绑定无令牌合法）
         auth_token: std::env::var("FILE_SERVER_PROXY_TOKEN")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+        public_bind_declared: std::env::var("FILE_SERVER_PROXY_PUBLIC_BIND")
+            .ok()
+            .is_some_and(|value| value == "1"),
         listen_port: settings.listen_port,
         rust_upstream_port: settings.rust_upstream_port,
         ts_upstream_port: settings.ts_upstream_port,

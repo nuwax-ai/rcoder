@@ -107,13 +107,15 @@ pub async fn try_start() -> Result<String, String> {
     });
 
     // N07：非 loopback 监听必须有令牌（原生安全默认——对外暴露的入口
-    // 不裸奔；容器形态 0.0.0.0 由编排层网络边界保护 + 平台注入令牌）
+    // 不裸奔）。例外：受管形态显式声明（public_bind_declared——容器内
+    // supervisor env 或嵌入方代码直设；网络边界由编排层承担）。
     let host = config.listen_host.trim();
     let is_loopback = matches!(host, "127.0.0.1" | "::1" | "localhost");
-    if !is_loopback && config.auth_token.is_none() {
+    if !is_loopback && config.auth_token.is_none() && !config.public_bind_declared {
         return Err(format!(
             "refusing to listen on non-loopback {host} without FILE_SERVER_PROXY_TOKEN \
-             (set the token or bind 127.0.0.1)"
+             (set the token, bind 127.0.0.1, or declare managed form via \
+             FILE_SERVER_PROXY_PUBLIC_BIND=1)"
         ));
     }
 

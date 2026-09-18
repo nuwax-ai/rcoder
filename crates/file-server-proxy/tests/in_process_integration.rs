@@ -67,6 +67,7 @@ async fn in_process_router_serves_rust_domain_without_upstream_listener() {
     // TsFirst：userApp 判据（路径前缀或 header）→ rust（直连）；其余 → TS
     file_server_proxy::init(FileServerProxyConfig {
         auth_token: None,
+        public_bind_declared: false,
         listen_host: "127.0.0.1".to_string(),
         listen_port: PROXY_PORT,
         rust_upstream_port: RUST_UPSTREAM_PORT,

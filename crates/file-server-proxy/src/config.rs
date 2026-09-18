@@ -34,6 +34,12 @@ pub struct FileServerProxyConfig {
     /// 启动拒绝（fail-fast，不裸奔对外）。凭据不进日志。
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// N07 受管形态显式声明：容器/编排内运行（supervisor env
+    /// `FILE_SERVER_PROXY_PUBLIC_BIND=1` 或嵌入方代码直设）——0.0.0.0 无
+    /// 令牌合法（网络边界由编排层承担）。原生 standalone 不设此声明，
+    /// 保持"公开绑定必须带令牌"的安全默认。
+    #[serde(default)]
+    pub public_bind_declared: bool,
     /// dev 生命周期路径（start/stop/restart/keep-alive 等 7 端点）在**所有策略**下
     /// 导向 Rust 上游（Custom Page 预览协调收口；与 rcoder `preview_coordinator.enabled`
     /// 同源配置渲染）。默认 false=分流行为与历史完全一致。
@@ -57,6 +63,7 @@ impl Default for FileServerProxyConfig {
             ts_upstream_port: NUWAX_FILE_SERVER_INTERNAL_PORT,
             policy: RoutePolicy::default(),
             auth_token: None,
+            public_bind_declared: false,
             coordinated_dev_lifecycle: false,
         }
     }

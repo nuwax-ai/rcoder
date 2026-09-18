@@ -103,6 +103,7 @@ fn ts_first_policy_routes_by_header_and_path() {
 fn all_rust_policy_routes_everything_to_rust() {
     let c = FileServerProxyConfig {
         auth_token: None,
+        public_bind_declared: false,
         listen_host: "127.0.0.1".to_string(),
         listen_port: 60000,
         rust_upstream_port: 60002,
@@ -132,6 +133,7 @@ fn all_rust_policy_routes_everything_to_rust() {
 fn all_ts_policy_routes_everything_to_ts() {
     let c = FileServerProxyConfig {
         auth_token: None,
+        public_bind_declared: false,
         listen_host: "127.0.0.1".to_string(),
         listen_port: 60000,
         rust_upstream_port: 8086,
@@ -199,6 +201,7 @@ fn parse_route_policy_accepts_wire_vocabulary() {
 fn custom_ports_respected() {
     let c = FileServerProxyConfig {
         auth_token: None,
+        public_bind_declared: false,
         listen_host: "127.0.0.1".to_string(),
         listen_port: 61000,
         rust_upstream_port: 18086,
@@ -253,6 +256,7 @@ async fn dynamic_port_publishes_real_bound_address() {
     // N03：端口 0 = 动态分配——status 返回真实绑定地址（非 ":0"）
     init(FileServerProxyConfig {
         auth_token: None,
+        public_bind_declared: false,
         listen_host: "127.0.0.1".to_string(),
         listen_port: 0,
         ..Default::default()
@@ -273,6 +277,7 @@ fn instance_lock_domain_is_stable_per_listen_semantics() {
     // 独立域（多实例并行合法）
     let fixed = FileServerProxyConfig {
         auth_token: None,
+        public_bind_declared: false,
         listen_host: "127.0.0.1".to_string(),
         listen_port: 60000,
         ..Default::default()
@@ -292,6 +297,7 @@ async fn non_loopback_without_token_is_refused() {
     // N07：对外监听无令牌 → fail-fast（不裸奔）；loopback 无令牌合法
     init(FileServerProxyConfig {
         auth_token: None,
+        public_bind_declared: false,
         listen_host: "0.0.0.0".to_string(),
         listen_port: 0,
         ..Default::default()
@@ -317,6 +323,25 @@ async fn non_loopback_with_token_starts() {
         ..Default::default()
     });
     let address = try_start().await.expect("token + public bind must start");
+    stop().await.expect("stop");
+    assert!(
+        !address.ends_with(":0"),
+        "real bound address, got {address}"
+    );
+}
+
+// N07 反例 3：受管形态显式声明（public_bind_declared）——公开绑定无令牌
+// 合法（容器 supervisor env 通道；网络边界由编排层承担）。
+#[tokio::test]
+async fn managed_declaration_allows_public_bind_without_token() {
+    init(FileServerProxyConfig {
+        auth_token: None,
+        public_bind_declared: true,
+        listen_host: "0.0.0.0".to_string(),
+        listen_port: 0,
+        ..Default::default()
+    });
+    let address = try_start().await.expect("managed public bind must start");
     stop().await.expect("stop");
     assert!(
         !address.ends_with(":0"),
