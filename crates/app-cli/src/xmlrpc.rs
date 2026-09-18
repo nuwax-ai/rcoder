@@ -35,6 +35,24 @@ impl RpcFault {
                 .and_then(serde_json::Value::as_str)
                 .is_some()
     }
+
+    /// 目标组/进程不存在（R11 结构化分类）。
+    ///
+    /// 判据：`faultCode == 10`（supervisord `xmlrpc.Faults.BAD_NAME`——官方
+    /// 客户端同款分类）优先；`faultString` 包含 "no process group"/"BAD_NAME"
+    /// 兜底（版本措辞差异）。**只在 RpcFault 已解析的前提下判定**——普通
+    /// 网络错误的文案恰含这些词不再被误判为"不存在"。
+    fn is_no_such_process(&self) -> bool {
+        let code = self.0.get("faultCode").and_then(serde_json::Value::as_i64);
+        let message = self
+            .0
+            .get("faultString")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        code == Some(10)
+            || message.contains("no process group")
+            || message.contains("BAD_NAME")
+    }
 }
 
 /// supervisord 控制客户端（unix socket）。
@@ -210,11 +228,12 @@ fn child_elem<'a>(node: Node<'a, '_>, name: &str) -> Option<Node<'a, 'a>> {
         .find(|e| e.is_element() && e.has_tag_name(name))
 }
 
+/// [`RpcFault::is_no_such_process`] 的错误链入口（R11：typed downcast 取代
+/// 全链字符串匹配——只有已解析的 supervisord fault 才参与"不存在"分类）。
 fn is_no_such_process(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}");
-    // supervisord 对不存在组的 stop/remove 返回 faultCode 10 ("SHUTDOWN_STATE" 10?
-    // NO: 10=SHUTDOWN_STATE；不存在组= faultString "no process group named 'x'")
-    text.contains("no process group") || text.contains("BAD_NAME")
+    error
+        .downcast_ref::<RpcFault>()
+        .is_some_and(RpcFault::is_no_such_process)
 }
 
 /// 拼 XML-RPC 请求（参数以 JSON 标量承载：string/bool/i64）。
@@ -480,5 +499,38 @@ mod tests {
         let raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         assert_eq!(split_body(raw), Some("hello"));
         assert_eq!(split_body("garbage"), None);
+    }
+}
+
+#[cfg(test)]
+mod r11_tests {
+    use super::*;
+
+    fn fault(code: i64, message: &str) -> anyhow::Error {
+        RpcFault(serde_json::json!({"faultCode": code, "faultString": message})).into()
+    }
+
+    /// R11 反例：typed 分类——网络错误文案恰含 "no process group" 不再被
+    /// 误判为"不存在"；faultCode=10（BAD_NAME）与措辞兜底各自命中；
+    /// malformed fault（缺字段）不判为不存在。
+    #[test]
+    fn no_such_process_classification_is_typed() {
+        // faultCode 10（BAD_NAME）→ 不存在
+        assert!(is_no_such_process(&fault(10, "no process group named 'x'")));
+        // faultCode 10 + 其他措辞 → 仍按官方码分类
+        assert!(is_no_such_process(&fault(10, "whatever")));
+        // 非 10 码但措辞明确 → 兜底命中
+        assert!(is_no_such_process(&fault(1, "BAD_NAME: foo")));
+        // 非 10 码 + 无相关措辞 → 不是"不存在"
+        assert!(!is_no_such_process(&fault(6, "SHUTDOWN_STATE")));
+        // 反例：普通网络错误文案恰含关键词 → 不误判（typed 边界）
+        let network = anyhow::Error::msg("connect failed: no process group left in pool");
+        assert!(!is_no_such_process(&network));
+        // malformed fault（缺 faultCode 且措辞不相关）→ 不判为不存在
+        //（仅 faultString 命中关键词时按措辞兜底——版本差异兼容是有意的）
+        assert!(!is_no_such_process(
+            &RpcFault(serde_json::json!({"faultString": "unknown"})).into()
+        ));
+        assert!(!is_no_such_process(&RpcFault(serde_json::Value::Null).into()));
     }
 }

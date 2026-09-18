@@ -330,8 +330,9 @@ mod tests {
         if cfg!(windows) {
             let error = assemble_deploy_dir(ws, &tasks, &deploy)
                 .expect_err("symlink zip must be rejected on Windows deployment runtime");
+            // 判据在错误链上（to_string 只含顶层 context）
             assert!(
-                error.to_string().contains("symbolic links"),
+                format!("{error:#}").contains("symbolic links"),
                 "structured rejection expected: {error:#}"
             );
             return;

@@ -85,14 +85,20 @@ pub async fn get_filename_from_url(url: &str) -> Result<String, DownloadError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| DownloadError::Http(format!("http client: {}", e)))?;
+        .map_err(|e| DownloadError::Http {
+            message: format!("http client: {e}"),
+            status: None,
+        })?;
 
     // 发送 HEAD 请求获取 Content-Disposition
     let response = client
         .head(parsed.clone())
         .send()
         .await
-        .map_err(|e| DownloadError::Http(format!("HEAD {}: {}", url, e)))?;
+        .map_err(|e| DownloadError::Http {
+            message: format!("HEAD {url}: {e}"),
+            status: e.status().map(|code| code.as_u16()),
+        })?;
 
     // 1. 尝试从 Content-Disposition 获取
     if let Some(cd) = response.headers().get("content-disposition")

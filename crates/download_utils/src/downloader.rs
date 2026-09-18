@@ -94,9 +94,9 @@ impl Downloader {
                 }
                 result = tokio::time::timeout(request_timeout, client_task) => {
                     result
-                        .map_err(|_| DownloadError::Http("http client construction timed out".to_string()))?
-                        .map_err(|error| DownloadError::Http(format!("http client task failed: {error}")))?
-                        .map_err(|error| DownloadError::Http(format!("http client: {error}")))?
+                        .map_err(|_| DownloadError::Http { message: "http client construction timed out".to_string(), status: None })?
+                        .map_err(|error| DownloadError::Http { message: format!("http client task failed: {error}"), status: None })?
+                        .map_err(|error| DownloadError::Http { message: format!("http client: {error}"), status: None })?
                 }
             }
         };
@@ -132,7 +132,10 @@ impl Downloader {
             } {
                 Ok(r) => r,
                 Err(e) => {
-                    let err = DownloadError::Http(format!("GET {}: {}", url, e));
+                    let err = DownloadError::Http {
+                        message: format!("GET {url}: {e}"),
+                        status: e.status().map(|code| code.as_u16()),
+                    };
                     if err.is_retryable() && attempt < max_attempts {
                         warn!(
                             "[download] attempt {} failed: {}, retrying...",
@@ -177,12 +180,18 @@ impl Downloader {
 
             // 4xx (non-416) → no retry
             if status.is_client_error() {
-                return Err(DownloadError::Http(format!("GET {}: HTTP {}", url, status)));
+                return Err(DownloadError::Http {
+                    message: format!("GET {url}: HTTP {status}"),
+                    status: Some(status.as_u16()),
+                });
             }
 
             // 5xx → retryable
             if status.is_server_error() {
-                let err = DownloadError::Http(format!("GET {}: HTTP {}", url, status));
+                let err = DownloadError::Http {
+                    message: format!("GET {url}: HTTP {status}"),
+                    status: Some(status.as_u16()),
+                };
                 if attempt < max_attempts {
                     warn!(
                         "[download] attempt {} failed: {}, retrying...",
@@ -277,7 +286,7 @@ impl Downloader {
                 }
                 result = hash_task => {
                     result
-                        .map_err(|error| DownloadError::Http(format!("hash task failed: {error}")))??
+                        .map_err(|error| DownloadError::Http { message: format!("hash task failed: {error}"), status: None })??
                 }
             };
             if actual != expected {
@@ -348,7 +357,7 @@ impl Downloader {
                             file.write_all(&bytes).await.map_err(DownloadError::Io)?;
                         }
                         Some(Err(e)) => {
-                            return Err(DownloadError::Http(format!("read body: {}", e)));
+                            return Err(DownloadError::Http { message: format!("read body: {e}"), status: None });
                         }
                         None => break, // Download complete
                     }
@@ -391,7 +400,10 @@ impl Downloader {
                 biased;
                 _ = cancel_token.cancelled() => return Err(DownloadError::Cancelled),
                 response = client.get(next_url.clone()).timeout(request_timeout).send() => {
-                    response.map_err(|e| DownloadError::Http(format!("redirect GET {next_url}: {e}")))?
+                    response.map_err(|e| DownloadError::Http {
+                        message: format!("redirect GET {next_url}: {e}"),
+                        status: e.status().map(|code| code.as_u16()),
+                    })?
                 }
             };
         }
