@@ -38,6 +38,10 @@ pub enum AppError {
     File(String),
     /// PROCESS_ERROR (500)
     Process(String),
+    /// PROCESS_ERROR (500) — dev server 启动端口占用（R11 类型化：
+    /// ViteStartupError::PortInUse 的结构化承载——协调器按变体分类，
+    /// 不再匹配中文文案）。
+    ProcessPortInUse { port: u16, detail: String },
 }
 
 impl AppError {
@@ -83,7 +87,7 @@ impl AppError {
             AppError::Network(_) => "NETWORK_ERROR",
             AppError::System(_) => "SYSTEM_ERROR",
             AppError::File(_) => "FILE_ERROR",
-            AppError::Process(_) => "PROCESS_ERROR",
+            AppError::Process(_) | AppError::ProcessPortInUse { .. } => "PROCESS_ERROR",
         }
     }
 
@@ -111,6 +115,7 @@ impl AppError {
             AppError::System(m) => m,
             AppError::File(m) => m,
             AppError::Process(m) => m,
+            AppError::ProcessPortInUse { detail, .. } => detail,
         }
     }
 

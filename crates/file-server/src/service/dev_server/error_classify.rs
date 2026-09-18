@@ -88,9 +88,12 @@ impl ViteStartupError {
     /// 转成可操作的 AppError (system 级, 带定位与建议)。
     pub fn into_app_error(self, pid: u32, port: u16) -> AppError {
         match self {
-            Self::PortInUse { port: p } => AppError::system(format!(
-                "dev server (pid {pid}) 启动失败: 端口 {p} 被占用 (--strictPort 不自动换端口)。建议清理占用或稍后重试 (分配端口 {port})"
-            )),
+            Self::PortInUse { port: p } => AppError::ProcessPortInUse {
+                port: p,
+                detail: format!(
+                    "dev server (pid {pid}) 启动失败: 端口 {p} 被占用 (--strictPort 不自动换端口)。建议清理占用或稍后重试 (分配端口 {port})"
+                ),
+            },
             Self::ConfigError { detail } => AppError::system(format!(
                 "dev server (pid {pid}) 启动失败: vite 配置错误 — {detail}。请检查 vite.config.ts"
             )),

@@ -36,7 +36,8 @@ impl IntoResponse for UserAppError {
             AppError::Permission(_)
             | AppError::System(_)
             | AppError::File(_)
-            | AppError::Process(_) => (
+            | AppError::Process(_)
+            | AppError::ProcessPortInUse { .. } => (
                 ec::ERR_INTERNAL_SERVER_ERROR,
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),

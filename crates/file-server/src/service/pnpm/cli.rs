@@ -44,11 +44,12 @@ async fn install_with_heal(
     if !heal_allowed {
         return result;
     }
+    // R11：只保留 typed code 通道（classify.rs 从原始输出边界提取 code——
+    // "边界解析一次，内部用结构化结果"；message 文案不再参与触发）
     let is_ignored_builds = matches!(
         &result,
-        Err(InstallError::Failed { code, message, .. })
+        Err(InstallError::Failed { code, .. })
             if code.as_deref() == Some("ERR_PNPM_IGNORED_BUILDS")
-                || message.contains("ERR_PNPM_IGNORED_BUILDS")
     );
     if !is_ignored_builds {
         return result;

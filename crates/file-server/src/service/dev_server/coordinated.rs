@@ -158,12 +158,14 @@ impl DevServerExecutor {
 }
 
 fn executor_error(error: AppError) -> PreviewExecutorError {
-    let message = error.to_string();
-    // ViteStartupError::PortInUse 的稳定标记（error_classify 生成文案）。
-    if message.contains("--strictPort 不自动换端口") {
-        return PreviewExecutorError::PortInUse(message);
+    // R11：类型化分类——PortInUse 经 AppError::ProcessPortInUse 变体
+    // 传递（修改中文提示文案不再破坏分类），其余按通用失败。
+    match error {
+        AppError::ProcessPortInUse { port, detail } => {
+            PreviewExecutorError::PortInUse(format!("port {port} in use: {detail}"))
+        }
+        other => PreviewExecutorError::Failed(other.to_string()),
     }
-    PreviewExecutorError::Failed(message)
 }
 
 #[async_trait::async_trait]
@@ -235,5 +237,30 @@ impl PreviewExecutor for DevServerExecutor {
             total_lines: result.total_lines,
             log_file_name: result.log_file_name,
         })
+    }
+}
+
+#[cfg(test)]
+mod r11_tests {
+    use super::*;
+
+    /// R11：PortInUse 分类经类型化变体——修改提示文案（含删除
+    /// "--strictPort 不自动换端口" 标记句）不破坏分类。
+    #[test]
+    fn port_in_use_classification_survives_message_changes() {
+        let err = AppError::ProcessPortInUse {
+            port: 5173,
+            // 文案完全不含旧标记字符串
+            detail: "端口被别人占了，随便说点什么".to_string(),
+        };
+        match executor_error(err) {
+            PreviewExecutorError::PortInUse(_) => {}
+            other => panic!("expected PortInUse, got {other:?}"),
+        }
+        // 非 PortInUse 系统错误即使含旧标记文案也走 Failed（反例方向）
+        match executor_error(AppError::system("boom --strictPort 不自动换端口")) {
+            PreviewExecutorError::Failed(_) => {}
+            other => panic!("system error with marker text must stay Failed, got {other:?}"),
+        }
     }
 }
