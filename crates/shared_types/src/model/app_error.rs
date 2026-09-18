@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+/// `AppError::Structured` 的载荷（clippy result_large_err 根治：Box 承载
+/// 后 AppError 缩到单指针量级——14 个 handler 签名不再触发 128 字节阈值，
+/// 错误值移动也不再复制 ~160 字节载荷）。
 #[derive(Error, Debug)]
 pub enum AppError {
     #[error("anyhow::Error: {0}")]
@@ -8,14 +11,29 @@ pub enum AppError {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
-    #[error("AppError(code={code}, internal={internal_message:?}, i18n_key={i18n_key:?})")]
-    Structured {
-        code: String,
-        internal_message: Option<String>,
-        i18n_key: Option<String>,
-        operation_id: Option<String>,
-        blocker: Option<crate::UserAppOperationBlocker>,
-    },
+    #[error("{}", .0.display())]
+    Structured(Box<StructuredErrorDetail>),
+}
+
+/// 结构化错误详情（原 `AppError::Structured` 变体的内联字段——语义不变，
+/// 仅由 Box 承载）。
+#[derive(Debug)]
+pub struct StructuredErrorDetail {
+    // 字段在前（构造点按名初始化），Display 实现在下方 impl
+    pub code: String,
+    pub internal_message: Option<String>,
+    pub i18n_key: Option<String>,
+    pub operation_id: Option<String>,
+    pub blocker: Option<crate::UserAppOperationBlocker>,
+}
+
+impl StructuredErrorDetail {
+    fn display(&self) -> String {
+        format!(
+            "AppError(code={}, internal={:?}, i18n_key={:?})",
+            self.code, self.internal_message, self.i18n_key
+        )
+    }
 }
 
 impl AppError {
@@ -26,62 +44,63 @@ impl AppError {
 
     /// 通过错误码创建结构化错误
     pub fn from_code(code: &str) -> Self {
-        Self::Structured {
-            code: code.to_string(),
-            internal_message: None,
-            i18n_key: None,
-            operation_id: None,
-            blocker: None,
-        }
+        Self::structured(code, None, None)
     }
 
     /// 通过错误码和内部信息创建结构化错误
     pub fn with_message(code: &str, msg: impl Into<String>) -> Self {
-        Self::Structured {
-            code: code.to_string(),
-            internal_message: Some(msg.into()),
-            i18n_key: None,
-            operation_id: None,
-            blocker: None,
-        }
+        Self::structured(code, Some(msg.into()), None)
     }
 
     /// 通过错误码和 i18n key 创建结构化错误
     pub fn with_i18n_key(code: &str, i18n_key: &str) -> Self {
-        Self::Structured {
+        Self::structured(code, None, Some(i18n_key.to_string()))
+    }
+
+    fn structured(code: &str, internal_message: Option<String>, i18n_key: Option<String>) -> Self {
+        Self::Structured(Box::new(StructuredErrorDetail {
             code: code.to_string(),
-            internal_message: None,
-            i18n_key: Some(i18n_key.to_string()),
+            internal_message,
+            i18n_key,
             operation_id: None,
             blocker: None,
-        }
+        }))
     }
 
     /// Attach the in-flight operation that blocks the request. Only meaningful
     /// alongside a conflict code; ignored for non-structured variants.
     pub fn with_blocker(self, blocker: crate::UserAppOperationBlocker) -> Self {
-        let mut error = match self {
-            structured @ Self::Structured { .. } => structured,
-            Self::AnyhowError(error) => Self::generic(format!("{error:#}")),
-            Self::IoError(error) => Self::generic(error.to_string()),
-        };
-        if let Self::Structured { blocker: slot, .. } = &mut error {
-            *slot = Some(blocker);
-        }
-        error
+        let mut error = self.into_structured();
+        error.blocker = Some(blocker);
+        Self::Structured(error)
     }
 
     /// Attach a verified durable operation identity without changing the error code.
     pub fn with_operation_id(self, id: String) -> Self {
-        let mut error = match self {
-            structured @ Self::Structured { .. } => structured,
-            Self::AnyhowError(error) => Self::generic(format!("{error:#}")),
-            Self::IoError(error) => Self::generic(error.to_string()),
-        };
-        if let Self::Structured { operation_id, .. } = &mut error {
-            *operation_id = Some(id);
+        let mut error = self.into_structured();
+        error.operation_id = Some(id);
+        Self::Structured(error)
+    }
+
+    /// 统一升级为结构化形态（非结构化变体转通用错误，保留 Display 全链）。
+    fn into_structured(self) -> Box<StructuredErrorDetail> {
+        match self {
+            Self::Structured(detail) => detail,
+            Self::AnyhowError(error) => Box::new(StructuredErrorDetail {
+                code: crate::error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
+                internal_message: Some(format!("{error:#}")),
+                i18n_key: None,
+                operation_id: None,
+                blocker: None,
+            }),
+            Self::IoError(error) => Box::new(StructuredErrorDetail {
+                code: crate::error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
+                internal_message: Some(error.to_string()),
+                i18n_key: None,
+                operation_id: None,
+                blocker: None,
+            }),
         }
-        error
     }
 
     /// Create an internal server error
@@ -133,13 +152,16 @@ impl axum::response::IntoResponse for AppError {
                 None,
                 None,
             ),
-            AppError::Structured {
-                code,
-                internal_message,
-                i18n_key,
-                operation_id,
-                blocker,
-            } => (code, internal_message, i18n_key, operation_id, blocker),
+            AppError::Structured(detail) => {
+                let StructuredErrorDetail {
+                    code,
+                    internal_message,
+                    i18n_key,
+                    operation_id,
+                    blocker,
+                } = *detail;
+                (code, internal_message, i18n_key, operation_id, blocker)
+            }
         };
         let status = status_from_code(&code);
 
@@ -262,6 +284,18 @@ mod tests {
         assert_eq!(
             super::status_from_code(crate::error_codes::ERR_PROXY_SERVICE_UNAVAILABLE),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// clippy result_large_err 根治验证：AppError 尺寸须低于 128 字节阈值
+    /// （Box 承载 Structured 载荷后单指针量级）。
+    #[test]
+    fn app_error_size_below_large_err_threshold() {
+        use std::mem::size_of;
+        assert!(
+            size_of::<AppError>() < 128,
+            "AppError is {} bytes (clippy result_large_err threshold 128)",
+            size_of::<AppError>()
         );
     }
 }

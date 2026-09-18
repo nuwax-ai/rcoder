@@ -68,7 +68,7 @@ impl ContainerEntry {
 
     /// 获取服务类型
     pub fn service_type(&self) -> ServiceType {
-        self.service_type.read().clone()
+        *self.service_type.read()
     }
 
     /// 获取逻辑标识（RAII 清理 identifier 用）

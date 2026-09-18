@@ -123,7 +123,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         project_id: project_id.clone(),
         user_id: start_config.user_id.clone(),
         agent_mode: start_config.agent_mode,
-        service_type: start_config.service_type.clone(),
+        service_type: start_config.service_type,
         request_id: None,
         tool_approval_rules: start_config.tool_approval_rules.clone(),
     };

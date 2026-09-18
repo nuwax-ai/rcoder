@@ -190,7 +190,6 @@ impl ProjectAndContainerInfo {
         // 容器信息包装成 Arc<ContainerEntry>（service_type 用入参或现有值）
         let entry = container.map(|c| {
             let st = service_type
-                .clone()
                 .or(self.service_type())
                 .unwrap_or(ServiceType::WebAgentRunner);
             let logical_id = self.container_key().to_string();
@@ -298,7 +297,7 @@ impl ProjectAndContainerInfo {
     }
 
     pub fn service_type(&self) -> Option<ServiceType> {
-        self.state.extended.service_type.clone()
+        self.state.extended.service_type
     }
 
     // ========== 可变访问器（会触发写时复制） ==========

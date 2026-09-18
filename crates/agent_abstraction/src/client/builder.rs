@@ -277,7 +277,7 @@ where
         };
 
         let mut start_config =
-            AgentStartConfig::new(self.service_type.clone()).with_agent_mode(self.agent_mode);
+            AgentStartConfig::new(self.service_type).with_agent_mode(self.agent_mode);
 
         if let Some(sp) = self.system_prompt {
             start_config = start_config.with_system_prompt(sp);

@@ -131,7 +131,7 @@ impl AgentSessionService {
                             e
                         )),
                         request_id: Some(request_id),
-                        service_type: request.prompt_message.service_type.clone(),
+                        service_type: request.prompt_message.service_type,
                     });
                 }
             }

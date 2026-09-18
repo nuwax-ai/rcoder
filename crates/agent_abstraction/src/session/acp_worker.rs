@@ -138,7 +138,7 @@ where
         debug!("MCP servers: {}", mcp_servers.len());
 
         // 构建 AgentStartConfig 并传递 MCP 服务器、service_type
-        let mut start_config = AgentStartConfig::new(request.prompt_message.service_type.clone())
+        let mut start_config = AgentStartConfig::new(request.prompt_message.service_type)
             .with_system_prompt(system_prompt)
             .with_mcp_servers(mcp_servers)
             .with_user_id(request.prompt_message.user_id.clone())
@@ -273,7 +273,7 @@ where
                 project_id,
                 session_entry.session_id().to_string(),
                 Some(request.request_id().to_string()),
-                prompt_message.service_type.clone(),
+                prompt_message.service_type,
                 SessionHandles {
                     prompt_tx: session_entry.prompt_tx().clone(),
                     cancel_tx: session_entry.cancel_tx().clone(),
@@ -285,7 +285,7 @@ where
                 project_id,
                 session_entry.session_id().to_string(),
                 Some(request.request_id().to_string()),
-                prompt_message.service_type.clone(),
+                prompt_message.service_type,
             ))
         }
     }
