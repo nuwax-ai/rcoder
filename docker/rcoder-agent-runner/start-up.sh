@@ -77,6 +77,25 @@ source /usr/local/bin/start-up-common.sh
 
 
 # ============================================================================
+# 🎯 claude(Bun/JSC) 内存感知: 按 cgroup limit 设堆预算
+# JSC 用 sysinfo() 系统调用感知物理内存, 看不见 cgroup limit —— 大物理机小容器时
+# 探测值虚高数十倍(123GB 物理/8Gi 容器=15 倍), GC 毫无提前收缩动力 → claude
+# 棘轮式膨胀顶爆 limit(2026-09-18 双 OOM 实锤, 单进程 6.15GiB)。forceRAMSize
+# 直接覆盖探测值让 JSC 按"小内存机器"规划堆。外部显式设置(如 rcoder service
+# environment)优先, 不覆盖; 无 cgroup v2 限制时静默跳过。
+# ============================================================================
+if [ -z "${BUN_JSC_forceRAMSize:-}" ]; then
+    _CG_LIMIT=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+    if [ "$_CG_LIMIT" != "max" ] && [ "$_CG_LIMIT" -gt 0 ] 2>/dev/null; then
+        # 60%: 余量留给 chromium/桌面/agent_runner 等非 Bun 进程
+        export BUN_JSC_forceRAMSize=$(( _CG_LIMIT * 60 / 100 ))
+        log "BUN_JSC_forceRAMSize=${BUN_JSC_forceRAMSize} (60% of cgroup memory.max=${_CG_LIMIT})"
+    fi
+fi
+unset _CG_LIMIT
+
+
+# ============================================================================
 # 🎯 动态时区设置（支持通过 TZ 环境变量自定义时区）
 # 默认时区为 Asia/Shanghai（在 Dockerfile 中配置）
 # 启动时如果检测到 TZ 环境变量，则更新系统时区
