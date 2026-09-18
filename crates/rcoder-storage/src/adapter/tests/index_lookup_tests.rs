@@ -1096,3 +1096,107 @@ fn test_container_rebuild_with_session_migration() {
     let project = adapter.get(project_id).unwrap();
     assert_eq!(project.session_count(), 3, "project 应包含 3 个 session");
 }
+
+/// 家族归一回归：ComputerNormalProject（常规项目，与 Computer 共享 per-user 容器）
+/// 按 Computer 族查找——请求侧传本义值或家族值均命中同一容器记录；
+/// Web 记录仍被隔离（不因家族归一放宽到跨族）。
+#[test]
+fn test_computer_family_lookup_shared_container() {
+    use shared_types::ContainerLookup;
+    let adapter = make_adapter();
+
+    let mk_container = |cid: &str, ip: &str, pid: &str| ContainerBasicInfo {
+        container_id: cid.to_string(),
+        container_name: format!("container-{}", cid),
+        container_ip: ip.to_string(),
+        internal_port: 8086,
+        external_port: 0,
+        project_id: pid.to_string(),
+        status: "running".to_string(),
+        created_at: Utc::now(),
+        service_url: format!("http://{}", cid),
+    };
+
+    // Computer 容器记录（keepalive/ensure 补建时可能存家族值）
+    let mut comp = ProjectAndContainerInfo::from_parts(
+        "proj-fam-a".to_string(),
+        Some("user-fam".to_string()),
+        None,
+        None,
+        Some(mk_container("cid-comp", "10.0.0.1", "proj-fam-a")),
+        ProjectExtendedFields {
+            service_type: Some(ServiceType::ComputerAgentRunner),
+            ..Default::default()
+        },
+    );
+    comp.set_service_type(Some(ServiceType::ComputerAgentRunner));
+    adapter
+        .insert("proj-fam-a".to_string(), Arc::new(comp))
+        .unwrap();
+
+    // 常规项目记录（同 user 共享容器；记录可能存本义值）
+    let mut normal = ProjectAndContainerInfo::from_parts(
+        "proj-fam-n".to_string(),
+        Some("user-fam".to_string()),
+        None,
+        None,
+        Some(mk_container("cid-comp", "10.0.0.1", "proj-fam-n")),
+        ProjectExtendedFields {
+            service_type: Some(ServiceType::ComputerNormalProject),
+            ..Default::default()
+        },
+    );
+    normal.set_service_type(Some(ServiceType::ComputerNormalProject));
+    adapter
+        .insert("proj-fam-n".to_string(), Arc::new(normal))
+        .unwrap();
+
+    // 同 user 的 Web 记录（家族归一不得放宽到跨族）
+    let mut web = ProjectAndContainerInfo::from_parts(
+        "proj-fam-w".to_string(),
+        Some("user-fam".to_string()),
+        None,
+        None,
+        Some(mk_container("cid-web", "10.0.0.2", "proj-fam-w")),
+        ProjectExtendedFields {
+            service_type: Some(ServiceType::WebAgentRunner),
+            ..Default::default()
+        },
+    );
+    web.set_service_type(Some(ServiceType::WebAgentRunner));
+    adapter
+        .insert("proj-fam-w".to_string(), Arc::new(web))
+        .unwrap();
+
+    // 请求本义值（ComputerNormalProject）→ 命中共享的 Computer 容器
+    assert_eq!(
+        adapter.find_by_user_id("user-fam", &ServiceType::ComputerNormalProject),
+        Some(adapter.resolve_backend_addr(&mk_container("cid-comp", "10.0.0.1", "proj-fam-a"))),
+        "常规项目按本义类型查找应命中共享的 Computer 容器"
+    );
+    // 请求家族值（ComputerAgentRunner）→ 同一容器（含本义值记录也被收录）
+    assert_eq!(
+        adapter.find_by_user_id("user-fam", &ServiceType::ComputerAgentRunner),
+        Some(adapter.resolve_backend_addr(&mk_container("cid-comp", "10.0.0.1", "proj-fam-a"))),
+        "Computer 查找应命中同一共享容器（本义值记录经家族归一收录）"
+    );
+    // 两侧 Computer 族项目集合一致；Web 记录被隔离
+    let normal_projects =
+        adapter.find_projects_by_user_id("user-fam", &ServiceType::ComputerNormalProject);
+    let comp_projects =
+        adapter.find_projects_by_user_id("user-fam", &ServiceType::ComputerAgentRunner);
+    let ids = |v: &Vec<Arc<ProjectAndContainerInfo>>| {
+        v.iter()
+            .map(|p| p.project_id().to_string())
+            .collect::<std::collections::HashSet<_>>()
+    };
+    assert_eq!(ids(&comp_projects), ids(&normal_projects));
+    assert!(
+        ids(&comp_projects).contains("proj-fam-n"),
+        "本义值记录计入 Computer 族集合"
+    );
+    assert!(
+        !ids(&comp_projects).contains("proj-fam-w"),
+        "Web 记录不因家族归一被放宽收录"
+    );
+}

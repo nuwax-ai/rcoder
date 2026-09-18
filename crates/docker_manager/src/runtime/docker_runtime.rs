@@ -244,7 +244,10 @@ impl AgentContainerRuntime for DockerRuntime {
             // 避免 get_user_container_info → get_agent_info → get_container_info 只查缓存
             // 导致服务重启后缓存丢失返回 None。
             // UserappBuilder 复用 agent-runner 镜像(有 gRPC),同样走实时查询。
-            ServiceType::ComputerAgentRunner | ServiceType::UserappBuilder => {
+            // ComputerNormalProject（常规项目）与 Computer 共享容器，同走实时查询。
+            ServiceType::ComputerAgentRunner
+            | ServiceType::ComputerNormalProject
+            | ServiceType::UserappBuilder => {
                 let result = self.find_container(identifier, service_type).await?;
                 Ok(result.map(|pod| ContainerBasicInfo {
                     container_id: pod.container_id,
@@ -392,7 +395,7 @@ impl AgentContainerRuntime for DockerRuntime {
                     .await
                     .map_err(|e| ContainerRuntimeError::ContainerStopError(e.to_string()))
             }
-            ServiceType::ComputerAgentRunner => {
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
                 if let Some(container) = self
                     .inner
                     .find_user_container(identifier, service_type)

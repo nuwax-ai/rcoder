@@ -83,7 +83,9 @@ impl ComputerContainerManager {
                     ServiceType::WebAgentRunner
                     | ServiceType::Userapp
                     | ServiceType::UserappBuilder => &options.project_id,
-                    ServiceType::ComputerAgentRunner => &options.user_id,
+                    ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+                        &options.user_id
+                    }
                 });
 
         info!(
@@ -205,7 +207,7 @@ impl ComputerContainerManager {
             ServiceType::WebAgentRunner | ServiceType::Userapp | ServiceType::UserappBuilder => {
                 options.pod_id.as_deref().unwrap_or(&options.project_id)
             }
-            ServiceType::ComputerAgentRunner => {
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
                 options.pod_id.as_deref().unwrap_or(&options.user_id)
             }
         };
@@ -232,7 +234,7 @@ impl ComputerContainerManager {
             ServiceType::WebAgentRunner | ServiceType::Userapp | ServiceType::UserappBuilder => {
                 options.pod_id.as_deref().unwrap_or(&options.project_id)
             }
-            ServiceType::ComputerAgentRunner => {
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
                 options.pod_id.as_deref().unwrap_or(&options.user_id)
             }
         };

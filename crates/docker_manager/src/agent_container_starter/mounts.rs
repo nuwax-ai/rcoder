@@ -131,10 +131,10 @@ pub(super) async fn apply_auto_mounts(
             } else {
                 // pod_id 无值：根据 service_type 选择挂载策略
                 match service_type {
-                    // ComputerAgentRunner: 一个 user_id 对应一个容器
+                    // Computer 族（含常规项目，共享容器）: 一个 user_id 对应一个容器
                     // 挂载: 宿主机 /computer-project-workspace/{user_id} → 容器 /home/user
                     // config.yml 中 container_path: "/home/user"
-                    ServiceType::ComputerAgentRunner => {
+                    ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
                         let uid = user_id.unwrap_or("default");
                         (
                             uid.to_string(),

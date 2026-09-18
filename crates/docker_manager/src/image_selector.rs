@@ -44,8 +44,8 @@ impl ImageSelector {
         &self,
         service_type: &ServiceType,
     ) -> Option<&shared_types::ServiceImageConfig> {
-        // 1. 先尝试新的服务名称
-        let service_key = service_type.to_string();
+        // 1. 先尝试新的服务名称（家族归一：共享容器的类型读同一份配置）
+        let service_key = service_type.container_family().to_string();
         if let Some(config) = self.config.services.get(&service_key) {
             return Some(config);
         }
@@ -56,8 +56,8 @@ impl ImageSelector {
                 // 兼容老配置中的 "rcoder" key
                 self.config.services.get("rcoder")
             }
-            ServiceType::ComputerAgentRunner => {
-                // ComputerAgentRunner 没有老名称
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+                // Computer 族没有老名称（共享同一容器配置键）
                 None
             }
             ServiceType::Userapp | ServiceType::UserappBuilder => {

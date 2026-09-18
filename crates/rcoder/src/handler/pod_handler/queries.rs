@@ -53,7 +53,10 @@ pub async fn pod_count(
         });
         match identity_service_type {
             Some(ServiceType::WebAgentRunner) => rcoder_count += 1,
-            Some(ServiceType::ComputerAgentRunner) => computer_count += 1,
+            // Computer 族（含常规项目）共享容器计入 computer 统计
+            Some(ServiceType::ComputerAgentRunner) | Some(ServiceType::ComputerNormalProject) => {
+                computer_count += 1
+            }
             // Userapp/UserappBuilder 容器不计入 agent 统计
             Some(ServiceType::Userapp) | Some(ServiceType::UserappBuilder) => {}
             None => {}

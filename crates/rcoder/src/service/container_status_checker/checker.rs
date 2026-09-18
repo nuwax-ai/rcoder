@@ -275,7 +275,9 @@ impl ContainerStatusChecker {
         // - RCoder 模式：使用 project_id 查找
         // - ComputerAgentRunner 模式：使用 user_id 查找
         let exists = match service_type {
-            shared_types::ServiceType::ComputerAgentRunner => {
+            // Computer 族共享容器：常规项目同按 user_id 查找
+            shared_types::ServiceType::ComputerAgentRunner
+            | shared_types::ServiceType::ComputerNormalProject => {
                 // ComputerAgentRunner 模式：使用 user_id 查找容器
                 if let Some(user_id) = container_info.user_id() {
                     match runtime.find_container(user_id, &service_type).await {

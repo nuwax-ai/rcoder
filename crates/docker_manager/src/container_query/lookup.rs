@@ -32,10 +32,11 @@ impl DockerManager {
     ) -> DockerResult<Option<ContainerQueryResult>> {
         // 1. 查 DashMap 缓存 (如果存在且运行中，通过容器名查询 IP)
         if let Some(info) = self.containers.get(project_id).await {
-            // 🎯 验证 service_type 是否匹配
+            // 🎯 验证 service_type 是否匹配（家族归一：Computer 族共享容器，
+            // 缓存侧存家族值/本义值均视为同容器命中）
             // 避免 WebAgentRunner 容器被错误地用于 ComputerAgentRunner 请求
             if let Some(ref container_service_type) = info.service_type {
-                if container_service_type != service_type {
+                if container_service_type.container_family() != service_type.container_family() {
                     debug!(
                         "[FIND_CONTAINER] Service type mismatch: expected={:?}, found={:?}, container={}, skipping",
                         service_type, container_service_type, info.container_name
@@ -270,7 +271,9 @@ impl DockerManager {
             && info
                 .service_type
                 .as_ref()
-                .is_none_or(|container_service_type| container_service_type == service_type)
+                .is_none_or(|container_service_type| {
+                    container_service_type.container_family() == service_type.container_family()
+                })
         {
             return Ok(Some(ContainerQueryResult::new(
                 info.container_id.clone(),

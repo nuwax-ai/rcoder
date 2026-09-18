@@ -24,6 +24,11 @@ use shared_types::paths::WORKSPACE_ROOT;
 /// ComputerAgentRunner 容器内项目目录前缀（per-user 容器，不受隔离模式影响）
 const HOME_PREFIX: &str = "/home/user";
 
+/// ComputerNormalProject（常规项目，与 Computer 共享容器）项目目录前缀：
+/// `/home/user/normalProject/{project_id}`（与 chat 的 resolve_project_dir
+/// 默认推导、file-server normalProject 布局三方同根）
+const NORMAL_PROJECT_PREFIX: &str = "/home/user/normalProject";
+
 // WebAgentRunner 工作区根用 shared_types::paths::WORKSPACE_ROOT (单一事实源, 不再本地定义)
 
 /// project_id 合法字符集：字母数字、`-`、`_`
@@ -64,6 +69,10 @@ pub fn resolve_project_cwd(
         Some(ServiceType::ComputerAgentRunner) => {
             // per-user 容器：项目目录恒为单级 /home/user/{project_id}
             resolve_in_candidates(project_id, &[HOME_PREFIX])
+        }
+        Some(ServiceType::ComputerNormalProject) => {
+            // 常规项目（与 Computer 共享容器）：/home/user/normalProject/{project_id}
+            resolve_in_candidates(project_id, &[NORMAL_PROJECT_PREFIX])
         }
         Some(ServiceType::UserappBuilder) => {
             // userApp 开发容器的终端：workspace = {USERAPP_WORKSPACE_DIR}/{app_id}

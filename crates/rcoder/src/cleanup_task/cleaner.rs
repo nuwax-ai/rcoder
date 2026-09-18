@@ -250,7 +250,10 @@ impl AgentCleaner {
         // 2. 选择策略
         let strategy: &dyn super::strategies::CleanupStrategy = match service_type {
             ServiceType::WebAgentRunner => &self.rcoder_strategy,
-            ServiceType::ComputerAgentRunner => &self.computer_runner_strategy,
+            // Computer 族共享 per-user 容器：常规项目同用 computer 策略（按 user 引用计数）
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+                &self.computer_runner_strategy
+            }
             // Userapp 不注册到 projects 表,cleanup_task 不会处理;UserappBuilder 复用 agent-runner,
             // 闲置清理用 rcoder 策略(检查自身 idle + timeout)。兜底用 rcoder 策略。
             ServiceType::Userapp | ServiceType::UserappBuilder => &self.rcoder_strategy,

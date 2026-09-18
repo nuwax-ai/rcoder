@@ -155,7 +155,9 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<PodSpec> {
         let project_id_val = params.project_id.clone().unwrap_or_default();
         let user_id_val = params.user_id.clone().unwrap_or_default();
-        let service_type_str = service_type.to_string();
+        // 家族归一：容器身份/环境（SERVICE_TYPE env 等）按家族值——agent_runner
+        // 的 cwd 由 gRPC service_type 决定，不消费该 env
+        let service_type_str = service_type.container_family().to_string();
         let image = self.select_image(service_type);
 
         // Build resource requirements if limits are provided
@@ -398,8 +400,11 @@ impl KubernetesRuntime {
                         }
                         // ComputerAgentRunner / Userapp 用镜像自带 ENTRYPOINT/CMD
                         // (Userapp 实际走 create_deployment,不经此路径;
-                        //  ComputerAgentRunner 走 start-up.sh 启 ttyd/VNC + agent_runner)
-                        ServiceType::ComputerAgentRunner | ServiceType::Userapp => None,
+                        //  ComputerAgentRunner 走 start-up.sh 启 ttyd/VNC + agent_runner;
+                        //  常规项目与 Computer 共享容器,同 ENTRYPOINT)
+                        ServiceType::ComputerAgentRunner
+                        | ServiceType::ComputerNormalProject
+                        | ServiceType::Userapp => None,
                         // UserappBuilder 完整开发容器: 默认镜像 ENTRYPOINT/start-up.sh
                         // 起 agent_runner + 内嵌 file-server(60000) + PG 全套——userApp 的
                         // 文件/exec/dev-server/构建/chat 开发对话都在此容器内执行;

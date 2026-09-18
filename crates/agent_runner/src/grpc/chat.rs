@@ -195,8 +195,10 @@ fn validate_userapp_app_id(
 /// - ComputerAgentRunner：work_dir_id（agent_work_dir 优先，原语义）两形态——
 ///   单段目录名 → `/home/user + work_dir_id`；绝对路径（常规项目场景，Java 传
 ///   子容器内 `/home/user/{projectType}/{projectId}`）→ 原样作为工作目录。
-///   绝对形态仅 Computer 支持（入口 `validate_agent_work_dir_for_service`
+///   绝对形态仅 Computer 族支持（入口 `validate_agent_work_dir_for_service`
 ///   已挡其余 service_type）
+/// - ComputerNormalProject（常规项目，与 Computer 共享容器）：绝对路径同上
+///   原样；单段目录名默认推导 `/home/user/normalProject/{project_id}`
 /// - WebAgentRunner/Userapp：./project_workspace + tenant/space 分支（原语义，
 ///   仅单段 work_dir_id）
 fn resolve_project_dir(
@@ -219,6 +221,14 @@ fn resolve_project_dir(
                 std::path::PathBuf::from(work_dir_id)
             } else {
                 std::path::PathBuf::from("/home/user").join(work_dir_id)
+            }
+        }
+        shared_types::ServiceType::ComputerNormalProject => {
+            // 常规项目：显式绝对路径优先；缺省推导 normalProject 布局
+            if shared_types::is_absolute_path_like(work_dir_id) {
+                std::path::PathBuf::from(work_dir_id)
+            } else {
+                std::path::PathBuf::from("/home/user/normalProject").join(work_dir_id)
             }
         }
         shared_types::ServiceType::UserappBuilder => {

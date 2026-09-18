@@ -204,7 +204,9 @@ impl KubernetesRuntime {
             // 此处兜底与 WebAgentRunner 共用，仅为 match 穷尽
             ServiceType::WebAgentRunner | ServiceType::Userapp => "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest".to_string(),
             // UserappBuilder 复用 dev-rcoder-agent-runner 镜像(与 ComputerAgentRunner 同镜像)
-            ServiceType::ComputerAgentRunner | ServiceType::UserappBuilder => {
+            ServiceType::ComputerAgentRunner
+            | ServiceType::ComputerNormalProject
+            | ServiceType::UserappBuilder => {
                 "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest".to_string()
             }
         }

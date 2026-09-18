@@ -171,7 +171,9 @@ impl AgentInstallStrategy for RcoderStrategy {
 /// - `None` - 不支持的 ServiceType
 pub fn create_strategy(service_type: &ServiceType) -> Option<Box<dyn AgentInstallStrategy>> {
     match service_type {
-        ServiceType::ComputerAgentRunner => Some(Box::new(ComputerAgentRunnerStrategy)),
+        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+            Some(Box::new(ComputerAgentRunnerStrategy))
+        }
         ServiceType::WebAgentRunner => Some(Box::new(RcoderStrategy)),
         // Userapp / UserappBuilder 不是 agent(无 ACP chat),无 agent install strategy。
         // UserappBuilder 仅跑 file-server build(本地编译),不需要安装 agent bundle。

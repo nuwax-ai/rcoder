@@ -91,8 +91,8 @@ pub async fn internal_pod_ensure(
 
     // 2. 容器不存在 → 按 service_type 分支处理
     match service_type {
-        ServiceType::ComputerAgentRunner => {
-            // 委托给 pod_handler::pod_ensure（ComputerContainerManager）
+        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+            // 委托给 pod_handler::pod_ensure（ComputerContainerManager；常规项目共享容器）
             let ensure_request = super::pod_handler::EnsurePodRequest {
                 user_id: identifier.clone(),
                 project_id: identifier.clone(),

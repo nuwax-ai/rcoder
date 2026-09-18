@@ -179,6 +179,10 @@ pub(crate) fn build_standard_labels(
     identifier: &str,
     service_type: &ServiceType,
 ) -> BTreeMap<String, String> {
+    // 家族归一：Computer 族共享同一物理容器，label 必须写家族值——
+    // 常规项目（ComputerNormalProject）与 Computer 同 STS/Service/label，
+    // 读取侧 selector（pod_label_selectors）同样按家族值构造
+    let service_type = &service_type.container_family();
     let mut labels = BTreeMap::new();
 
     // K8s 推荐标签
@@ -218,6 +222,8 @@ pub(crate) fn build_standard_labels(
 ///
 /// Selector 只包含必要的标签，用于精确匹配 Pod
 fn build_selector_labels(identifier: &str, service_type: &ServiceType) -> BTreeMap<String, String> {
+    // 家族归一：selector 必须匹配 build_standard_labels 写入的家族值
+    let service_type = &service_type.container_family();
     let mut selector = BTreeMap::new();
 
     // 使用标准标签进行选择

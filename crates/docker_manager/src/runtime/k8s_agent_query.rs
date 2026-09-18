@@ -41,7 +41,8 @@ impl KubernetesRuntime {
         if let Some(entry) = entry
             && entry.cached_at.elapsed() < POD_CACHE_TTL
             && entry.info.status == ContainerRuntimeStatus::Running
-            && entry.service_type == *service_type
+            // 家族归一：Computer 族共享容器，缓存/请求两侧归一后比较
+            && entry.service_type.container_family() == service_type.container_family()
         {
             return Ok(Some(
                 self.build_container_basic_info(identifier, &entry.info)
@@ -167,7 +168,8 @@ impl KubernetesRuntime {
             guard
                 .get(identifier)
                 .filter(|entry| {
-                    entry.cached_at.elapsed() < POD_CACHE_TTL && entry.service_type == *service_type
+                    entry.cached_at.elapsed() < POD_CACHE_TTL
+                        && entry.service_type.container_family() == service_type.container_family()
                 })
                 .map(|entry| entry.info.clone())
         };
@@ -420,12 +422,15 @@ fn pod_label_selectors(identifier: &str, service_type: &ServiceType) -> Vec<Stri
                 super::k8s_deployment::APP_MANAGED_BY
             ),
         ],
-        _ => vec![
-            format!(
-                "app.kubernetes.io/instance={identifier},rcoder.io/service-type={service_type}"
-            ),
-            format!("rcoder.io/identifier={identifier},rcoder.io/service-type={service_type}"),
-        ],
+        _ => {
+            // 家族归一：label 由创建侧写家族值（常规项目与 Computer 同容器同 label），
+            // selector 必须用家族值才能命中既有 STS/Pod，否则会误判不存在而重建
+            let family = service_type.container_family();
+            vec![
+                format!("app.kubernetes.io/instance={identifier},rcoder.io/service-type={family}"),
+                format!("rcoder.io/identifier={identifier},rcoder.io/service-type={family}"),
+            ]
+        }
     }
 }
 

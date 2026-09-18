@@ -498,7 +498,10 @@ pub fn slots_from_identifier(
     let mut slots = ContainerIdentitySlots::default();
     match service_type {
         ServiceType::WebAgentRunner => slots.project_id = Some(identifier.to_string()),
-        ServiceType::ComputerAgentRunner => slots.user_id = Some(identifier.to_string()),
+        // Computer 族共享 per-user 容器：identifier 恒为 user_id 派生
+        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+            slots.user_id = Some(identifier.to_string())
+        }
         ServiceType::Userapp | ServiceType::UserappBuilder => {
             slots.app_id = Some(identifier.to_string())
         }

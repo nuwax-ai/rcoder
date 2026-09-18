@@ -151,7 +151,11 @@ impl<'a> AgentContainerStarter<'a> {
         if let Some(ref uid) = user_id {
             variables.insert("user_id".to_string(), uid.clone());
         }
-        variables.insert("service_type".to_string(), service_type.to_string());
+        // 家族归一：常规项目与 Computer 共享容器，模板变量按家族值渲染
+        variables.insert(
+            "service_type".to_string(),
+            service_type.container_family().to_string(),
+        );
 
         // 添加隔离类型相关变量（用于挂载路径解析）
         if let Some(ref pid) = pod_id {
@@ -178,7 +182,7 @@ impl<'a> AgentContainerStarter<'a> {
             // 结构化身份 label（对齐 K8s build_standard_labels / Docker Userapp
             // 容器的身份载体）：rcoder 重启后 Docker API list 按 label 还原身份
             // （消费侧暂未切换，铺重启窗口的 label 直读）
-            .label("service-type", service_type.to_string())
+            .label("service-type", service_type.container_family().to_string())
             .label("identifier", container_id.clone());
 
         if let Some(context) = &execution_context {

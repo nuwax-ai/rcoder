@@ -328,7 +328,11 @@ impl PingoraProxyService {
         // vnc_backends 混存 user_id/pod_id 键（均 computer 容器），非 computer
         // 查询误用 pod_id 直查会撞 user_id 键空间拿到别人的后端
         if let Some(pid) = pod_id
-            && matches!(service_type, shared_types::ServiceType::ComputerAgentRunner)
+            && matches!(
+                service_type,
+                shared_types::ServiceType::ComputerAgentRunner
+                    | shared_types::ServiceType::ComputerNormalProject
+            )
             && let Some(ip) = self.vnc_backends.get(pid)
         {
             return Some(ip.value().clone());
@@ -336,7 +340,9 @@ impl PingoraProxyService {
 
         // 根据 ServiceType 选择路由键
         match service_type {
-            shared_types::ServiceType::ComputerAgentRunner => {
+            // Computer 族共享 per-user 容器：VNC/ttyd 桌面流量常规项目同样路由
+            shared_types::ServiceType::ComputerAgentRunner
+            | shared_types::ServiceType::ComputerNormalProject => {
                 if let Some(uid) = user_id {
                     self.vnc_backends.get(uid).map(|r| r.value().clone())
                 } else {
