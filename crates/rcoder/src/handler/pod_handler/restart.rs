@@ -157,7 +157,7 @@ pub async fn pod_restart(
         isolation_type: request.isolation_type.clone(),
         tenant_id: request.tenant_id.clone(),
         space_id: request.space_id.clone(),
-        service_type: service_type.clone(),
+        service_type,
     };
     let container_info = ComputerContainerManager::get_or_create_container_for_user_with_type(
         &options,
@@ -186,7 +186,7 @@ pub async fn pod_restart(
             let mut info = ProjectAndContainerInfo::new(request.project_id.clone());
             info.set_user_id(Some(request.user_id.clone()));
             info.set_pod_id(request.pod_id.clone());
-            info.set_service_type(Some(service_type.clone()));
+            info.set_service_type(Some(service_type));
             info.set_scope(
                 request.tenant_id.clone(),
                 request.space_id.clone(),

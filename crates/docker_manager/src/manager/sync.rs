@@ -152,10 +152,7 @@ impl DockerManager {
             container_name: info.container_name.clone(),
             container_ip,
             identifier: project_id.to_string(),
-            service_type: info
-                .service_type
-                .clone()
-                .unwrap_or(ServiceType::WebAgentRunner),
+            service_type: info.service_type.unwrap_or(ServiceType::WebAgentRunner),
         }
     }
 

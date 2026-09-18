@@ -145,7 +145,7 @@ async fn create_container_for_request(
     // 容器命名由 runtime 层通过 pod_id 处理
     let mut params_builder = ContainerCreateParams::builder()
         .project_id(options.project_id)
-        .service_type(options.service_type.clone());
+        .service_type(*options.service_type);
 
     // 只有在有资源限制时才设置
     if let Some(limits) = options.request_resource_limits.clone() {

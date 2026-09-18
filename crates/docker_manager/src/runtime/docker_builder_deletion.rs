@@ -101,7 +101,7 @@ impl DockerRuntime {
             .0
             .take()
             .ok_or_else(|| Error::DockerError("builder lease was already claimed".into()))?;
-        lease.service_type = family.clone();
+        lease.service_type = *family;
         Ok(Box::new(lease))
     }
     pub(super) async fn release_captured_file_lease(
@@ -460,7 +460,7 @@ impl shared_types::AppOperationLease for BuilderFileLease {
                 }
             };
             Some(shared_types::UserAppOperationLeaseReceipt::Docker {
-                service_type: self.service_type.clone(),
+                service_type: self.service_type,
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 token: self.marker.operation_id().to_owned(),

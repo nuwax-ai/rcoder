@@ -471,12 +471,8 @@ mod tests {
             ec::ERR_AGENT_MGMT_NOT_FOUND
         ));
         let err = status_to_app_error(s);
-        if let AppError::Structured {
-            code,
-            internal_message,
-            ..
-        } = &err
-        {
+        if let AppError::Structured(detail) = &err {
+            let (code, internal_message) = (&detail.code, &detail.internal_message);
             assert_eq!(code, ec::ERR_AGENT_MGMT_NOT_FOUND);
             assert_eq!(internal_message.as_deref(), Some("agent x not found"));
         } else {
@@ -489,12 +485,8 @@ mod tests {
     fn status_to_app_error_uses_unavailable_for_unknown_prefix() {
         let s = Status::unavailable("connection refused");
         let err = status_to_app_error(s);
-        if let AppError::Structured {
-            code,
-            internal_message,
-            ..
-        } = &err
-        {
+        if let AppError::Structured(detail) = &err {
+            let (code, internal_message) = (&detail.code, &detail.internal_message);
             assert_eq!(code, ec::ERR_AGENT_RUNNER_UNAVAILABLE);
             assert!(internal_message.is_some());
         } else {
@@ -512,12 +504,8 @@ mod tests {
             ec::ERR_INTERNAL_SERVER_ERROR
         ));
         let err = status_to_app_error(s);
-        if let AppError::Structured {
-            code,
-            internal_message,
-            ..
-        } = &err
-        {
+        if let AppError::Structured(detail) = &err {
+            let (code, internal_message) = (&detail.code, &detail.internal_message);
             assert_eq!(
                 code,
                 ec::ERR_INTERNAL_SERVER_ERROR,
@@ -539,14 +527,13 @@ mod tests {
     fn status_to_app_error_with_bare_code_keeps_no_message() {
         let s = Status::failed_precondition(ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED);
         let err = status_to_app_error(s);
-        if let AppError::Structured {
-            code,
-            internal_message,
-            i18n_key,
-            operation_id,
-            ..
-        } = &err
-        {
+        if let AppError::Structured(detail) = &err {
+            let (code, internal_message, i18n_key, operation_id) = (
+                &detail.code,
+                &detail.internal_message,
+                &detail.i18n_key,
+                &detail.operation_id,
+            );
             assert_eq!(code, ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED);
             assert!(internal_message.is_none());
             assert!(i18n_key.is_none());

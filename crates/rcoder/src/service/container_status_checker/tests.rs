@@ -85,7 +85,7 @@ impl AgentContainerRuntime for ProbeRuntime {
         self.queries
             .lock()
             .unwrap()
-            .push((identifier.to_string(), service_type.clone()));
+            .push((identifier.to_string(), *service_type));
         match self.behavior {
             FindBehavior::Found => Ok(Some(RuntimeContainerInfo {
                 container_id: "stub".to_string(),

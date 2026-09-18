@@ -170,7 +170,7 @@ pub async fn forward_chat(
                         let d = crate::handler::utils::diagnose(
                             dc.runtime,
                             &dc.identifier,
-                            dc.service_type.clone(),
+                            dc.service_type,
                         )
                         .await;
                         if d.is_starting_up() || d.is_oom() {
@@ -181,7 +181,7 @@ pub async fn forward_chat(
                             let ready = crate::handler::utils::wait_agent_ready(
                                 dc.runtime,
                                 &dc.identifier,
-                                dc.service_type.clone(),
+                                dc.service_type,
                                 AGENT_READY_WAIT_TIMEOUT,
                             )
                             .await;
@@ -305,7 +305,7 @@ pub async fn forward_chat(
         let (code, msg) = crate::handler::utils::build_connection_error(
             dc.runtime,
             &dc.identifier,
-            dc.service_type.clone(),
+            dc.service_type,
             locale,
             &raw,
         )

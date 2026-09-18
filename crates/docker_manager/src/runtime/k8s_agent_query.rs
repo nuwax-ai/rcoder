@@ -102,7 +102,7 @@ impl KubernetesRuntime {
                     status,
                     created_at,
                     env_vars: None,
-                    service_type: label_type.or_else(|| Some(service_type.clone())),
+                    service_type: label_type.or(Some(*service_type)),
                     project_id: label_slots.project_id.or(fallback_slots.project_id),
                     user_id: label_slots.user_id.or(fallback_slots.user_id),
                     pod_id: label_slots.pod_id.or(fallback_slots.pod_id),
@@ -115,7 +115,7 @@ impl KubernetesRuntime {
                         identifier.to_string(),
                         CachedPod {
                             info: pod_info.clone(),
-                            service_type: service_type.clone(),
+                            service_type: *service_type,
                             cached_at: std::time::Instant::now(),
                         },
                     );
@@ -262,7 +262,7 @@ impl KubernetesRuntime {
                 identifier.to_string(),
                 CachedPod {
                     info: info.clone(),
-                    service_type: service_type.clone(),
+                    service_type: *service_type,
                     cached_at: std::time::Instant::now(),
                 },
             );

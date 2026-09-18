@@ -246,7 +246,7 @@ pub(crate) async fn make_terminal_error_event(
     let code = shared_types::error_codes::ERR_AGENT_CONTAINER_UNAVAILABLE;
     let message = match diag {
         Some(ctx) => {
-            let d = diagnose(&ctx.runtime, &ctx.identifier, ctx.service_type.clone()).await;
+            let d = diagnose(&ctx.runtime, &ctx.identifier, ctx.service_type).await;
             root_cause_message(&d, locale)
         }
         None => shared_types::error_codes::get_error_message(code, locale),

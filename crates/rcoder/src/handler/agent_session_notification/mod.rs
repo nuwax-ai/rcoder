@@ -219,7 +219,7 @@ pub async fn agent_session_notification(
                     _ => Some(project_id.to_string()),
                 };
                 SseRouteContext {
-                    service_type: service_type.clone(),
+                    service_type,
                     diag_ctx: identifier.map(|identifier| {
                         Arc::new(crate::handler::utils::DiagCtx {
                             runtime: state.runtime().clone(),
@@ -352,7 +352,7 @@ pub async fn computer_agent_progress_notification(
                     _ => Some(project_id.to_string()),
                 };
                 SseRouteContext {
-                    service_type: service_type.clone(),
+                    service_type,
                     diag_ctx: identifier.map(|identifier| {
                         Arc::new(crate::handler::utils::DiagCtx {
                             runtime: state.runtime().clone(),

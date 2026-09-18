@@ -355,7 +355,7 @@ impl<'a> AgentContainerStarter<'a> {
         // 🆕 更新容器映射中的 user_id 和 service_type
         if let Some(mut info) = self.manager.containers.get(&container_id).await {
             info.user_id = user_id.map(|s| s.to_string());
-            info.service_type = Some(service_type.clone());
+            info.service_type = Some(service_type);
             debug!(
                 "[DOCKER_MGR] Updating container metadata: container_id={}, user_id={:?}, service_type={:?}",
                 container_id, info.user_id, info.service_type

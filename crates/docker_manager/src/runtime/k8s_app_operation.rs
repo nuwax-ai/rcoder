@@ -219,7 +219,7 @@ impl KubernetesRuntime {
                 return Err(ContainerRuntimeError::OperationInProgress(Box::new(
                     shared_types::UserAppOperationInProgress {
                         app_id: app_id.into(),
-                        service_type: service_type.clone(),
+                        service_type: *service_type,
                         resource_name: name,
                         operation_id,
                     },
@@ -250,7 +250,7 @@ impl KubernetesRuntime {
                 )
             })?;
         let receipt = shared_types::UserAppOperationLeaseReceipt::Kubernetes {
-            service_type: service_type.clone(),
+            service_type: *service_type,
             namespace: self.namespace.clone(),
             name: name.clone(),
             uid: uid.clone(),

@@ -318,7 +318,7 @@ pub(super) async fn update_session_mappings_after_response(
             Some(container_info.clone()),
             request.model_provider.clone(),
             request.request_id.clone(),
-            Some(container_service_type.clone()),
+            Some(*container_service_type),
         );
 
         // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态。
@@ -360,7 +360,7 @@ pub(super) async fn update_session_mappings_after_response(
             Some(container_info.clone()),
             request.model_provider.clone(),
             request.request_id.clone(),
-            Some(container_service_type.clone()),
+            Some(*container_service_type),
         );
         project_info.set_scope(
             request.tenant_id.clone(),

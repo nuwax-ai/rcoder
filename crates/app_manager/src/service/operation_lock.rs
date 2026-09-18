@@ -31,7 +31,7 @@ impl AppOperationGuard {
                 AppOperationError::Backend(format!("Read operation lock identity: {error}"))
             })?;
             return Ok(shared_types::UserAppOperationLeaseReceipt::Docker {
-                service_type: self.family.clone(),
+                service_type: self.family,
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 token: self.marker.operation_id().into(),

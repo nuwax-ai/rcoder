@@ -235,7 +235,7 @@ pub(super) async fn create_with_retry(
             isolation_type: request.isolation_type.clone(),
             tenant_id: request.tenant_id.clone(),
             space_id: request.space_id.clone(),
-            service_type: service_type.clone(),
+            service_type: *service_type,
         };
         match ComputerContainerManager::get_or_create_container_for_user_with_type(
             &options,
@@ -396,7 +396,7 @@ pub(super) async fn get_existing_with_sync(
                         isolation_type: request.isolation_type.clone(),
                         tenant_id: request.tenant_id.clone(),
                         space_id: request.space_id.clone(),
-                        service_type: service_type.clone(),
+                        service_type: *service_type,
                     };
                     let result =
                         ComputerContainerManager::get_or_create_container_for_user_with_type(

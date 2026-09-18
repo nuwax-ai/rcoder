@@ -445,7 +445,7 @@ pub(super) fn persist_and_respond(
         // 是否参与 user_id 查找由 service_type 在使用方区分（见 adapter 索引门控与 find_projects_by_user_id）。
         pinfo.set_user_id(Some(request.user_id.clone()));
         pinfo.set_pod_id(request.pod_id.clone());
-        pinfo.set_service_type(Some(service_type.clone()));
+        pinfo.set_service_type(Some(*service_type));
         pinfo.set_scope(
             request.tenant_id.clone(),
             request.space_id.clone(),

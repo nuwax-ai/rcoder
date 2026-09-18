@@ -132,7 +132,7 @@ pub(super) async fn forward_computer_request_to_container(
             system_prompt: request.system_prompt.clone(),
             user_prompt: request.user_prompt.clone(),
             agent_config: request.agent_config.clone(),
-            service_type: Some(params.service_type.clone()),
+            service_type: Some(params.service_type),
             user_id: Some(request.user_id.clone()),
             is_devcomputer: params.is_devcomputer,
             agent_work_dir: agent_work_dir.clone(),
@@ -149,7 +149,7 @@ pub(super) async fn forward_computer_request_to_container(
             diagnostic: Some(crate::handler::chat_forward::DiagnosticCtx {
                 runtime: params.runtime,
                 identifier: params.diagnostic_identifier.clone(),
-                service_type: params.service_type.clone(),
+                service_type: params.service_type,
             }),
         },
     )

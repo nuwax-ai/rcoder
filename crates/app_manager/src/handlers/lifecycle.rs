@@ -341,8 +341,11 @@ mod deletion_ownership_tests {
             .expect("operation query")
             .expect("admitted operation");
         match error {
-            AppError::Structured { operation_id, .. } => {
-                assert_eq!(operation_id.as_deref(), Some(record.operation_id.as_str()))
+            AppError::Structured(detail) => {
+                assert_eq!(
+                    detail.operation_id.as_deref(),
+                    Some(record.operation_id.as_str())
+                )
             }
             other => panic!("Expected correlated error: {other:?}"),
         }

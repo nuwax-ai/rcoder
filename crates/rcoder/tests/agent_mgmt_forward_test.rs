@@ -532,7 +532,8 @@ async fn business_code_in_status_propagates_as_app_error() {
         .await
         .expect_err("should fail when mock returns business error");
 
-    if let shared_types::AppError::Structured { code, .. } = &err {
+    if let shared_types::AppError::Structured(detail) = &err {
+        let code = detail.code.as_str();
         assert_eq!(code, ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED);
     } else {
         panic!("expected Structured AppError, got {err:?}");
@@ -544,7 +545,8 @@ async fn business_code_in_status_propagates_as_app_error() {
 fn status_to_app_error_handles_bare_code() {
     let s = Status::failed_precondition(ec::ERR_AGENT_MGMT_NOT_FOUND);
     let err = status_to_app_error(s);
-    if let shared_types::AppError::Structured { code, .. } = &err {
+    if let shared_types::AppError::Structured(detail) = &err {
+        let code = detail.code.as_str();
         assert_eq!(code, ec::ERR_AGENT_MGMT_NOT_FOUND);
     } else {
         panic!("expected Structured, got {err:?}");

@@ -37,7 +37,7 @@ impl KubernetesRuntime {
         // 确定容器标识符（复用 ServiceType::container_identifier 单一事实源，
         // 与 docker 模式 / handler 层保持一致）。identifier 借自 pod_id/user_id/project_id 之一。
         // ⚠️ 不要在此重写优先级逻辑，否则会与 handler 层不一致 → ensure/chat 造出不同名 pod+PVC。
-        let service_type = params.service_type.clone();
+        let service_type = params.service_type;
         let project_id = params.project_id.clone();
         let user_id = params.user_id.clone();
         let pod_id = params.pod_id.clone();

@@ -198,7 +198,7 @@ impl KubernetesRuntime {
             .read()
             .await
             .iter()
-            .map(|(k, v)| (k.clone(), v.info.clone(), v.service_type.clone()))
+            .map(|(k, v)| (k.clone(), v.info.clone(), v.service_type))
             .collect();
 
         let checked_count = cache_snapshot.len() as u32;

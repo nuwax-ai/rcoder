@@ -244,14 +244,14 @@ impl ProxyHttp for GatewayProxy {
                     self.cluster_cache.get_only(&identifier).await
                 } else {
                     self.cluster_cache
-                        .get_or_ensure(&identifier, route.service_type.clone())
+                        .get_or_ensure(&identifier, route.service_type)
                         .await
                 };
 
                 match ensure_result {
                     Ok(_cluster_name) => {
                         // 直接构建 K8s Service FQDN，路由到 agent_runner
-                        let fqdn = self.build_service_fqdn(&identifier, route.service_type.clone());
+                        let fqdn = self.build_service_fqdn(&identifier, route.service_type);
                         debug!("[GATEWAY] {} → {} → agent_svc ({})", path, identifier, fqdn);
                         ctx.target = RouteTarget::AgentService(fqdn);
                     }

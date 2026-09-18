@@ -361,7 +361,7 @@ pub async fn install_from_url(
         })?;
 
     // 构造最小化的 ProjectAndContainerInfo 用于解析安装目录
-    let project = super::helpers::minimal_install_project(&body.routing, service_type.clone());
+    let project = super::helpers::minimal_install_project(&body.routing, service_type);
 
     let install_ctx = strategy.resolve_install_context(&project, &body.routing)?;
 

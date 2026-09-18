@@ -309,7 +309,7 @@ impl AgentContainerRuntime for DockerRuntime {
                 status: map_container_status(&r.status),
                 created_at: r.created_at,
                 env_vars: None, // 不填充环境变量（用于快速查找）
-                service_type: Some(service_type.clone()),
+                service_type: Some(*service_type),
                 project_id: slots.project_id,
                 user_id: slots.user_id,
                 pod_id: slots.pod_id,
@@ -514,7 +514,7 @@ impl DockerRuntime {
                 status: map_container_status(&c.status),
                 created_at: c.created_at,
                 env_vars: Some(env_vars),
-                service_type: c.service_type.clone(),
+                service_type: c.service_type,
                 project_id: slots.project_id,
                 user_id: slots.user_id,
                 pod_id: slots.pod_id,

@@ -193,7 +193,7 @@ struct MockOperationLease(Arc<AtomicBool>, String, ServiceType);
 #[async_trait]
 impl shared_types::AppOperationLease for MockOperationLease {
     fn receipt(&self) -> Option<shared_types::UserAppOperationLeaseReceipt> {
-        let family = self.2.clone();
+        let family = self.2;
         let prefix = if family == ServiceType::UserappBuilder {
             "builder"
         } else {

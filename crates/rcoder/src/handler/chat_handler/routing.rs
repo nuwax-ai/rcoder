@@ -86,7 +86,7 @@ pub(super) fn ensure_project_record(
         let needs_extended_update = existing_info.container_info().is_none()
             || existing_info.model_provider().is_none()
             || existing_info.request_id().is_none()
-            || existing_info.service_type() != Some(service_type.clone())
+            || existing_info.service_type() != Some(*service_type)
             || existing_info.pod_id() != request.pod_id.as_deref();
 
         if needs_extended_update {
@@ -100,7 +100,7 @@ pub(super) fn ensure_project_record(
                 Some(container_info.clone()),
                 request.model_provider.clone(),
                 request.request_id.clone(),
-                Some(service_type.clone()),
+                Some(*service_type),
             );
             mutable_info.update_activity();
 
@@ -134,7 +134,7 @@ pub(super) fn ensure_project_record(
             Some(container_info.clone()),
             request.model_provider.clone(),
             request.request_id.clone(),
-            Some(service_type.clone()),
+            Some(*service_type),
         );
         new_info.set_scope(
             request.tenant_id.clone(),

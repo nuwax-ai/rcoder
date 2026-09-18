@@ -218,18 +218,13 @@ mod tests {
                 .await
                 .expect_err("original failure");
             match error {
-                AppError::Structured {
-                    code,
-                    internal_message,
-                    operation_id,
-                    ..
-                } => {
-                    assert_eq!(code, shared_types::error_codes::ERR_BACKEND_ERROR);
+                AppError::Structured(detail) => {
+                    assert_eq!(detail.code, shared_types::error_codes::ERR_BACKEND_ERROR);
                     assert_eq!(
-                        internal_message.as_deref(),
+                        detail.internal_message.as_deref(),
                         Some("Original runtime failure")
                     );
-                    assert_eq!(operation_id.as_deref(), expected);
+                    assert_eq!(detail.operation_id.as_deref(), expected);
                 }
                 other => panic!("Expected structured error: {other:?}"),
             }

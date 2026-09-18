@@ -292,7 +292,7 @@ mod tests {
             self.stops
                 .lock()
                 .unwrap()
-                .push((identifier.to_string(), service_type.clone()));
+                .push((identifier.to_string(), *service_type));
             Ok(())
         }
         async fn is_container_running(&self, _project_id: &str) -> ContainerRuntimeResult<bool> {

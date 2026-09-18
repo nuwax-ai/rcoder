@@ -47,7 +47,7 @@ pub async fn pod_count(
         }
 
         // 结构化身份字段优先（K8s 标签直读恒有）；缺失（Docker 重启窗口）落名字反解兜底
-        let identity_service_type = container.service_type.clone().or_else(|| {
+        let identity_service_type = container.service_type.or_else(|| {
             container_identity_from_name(&container.container_name, rcoder_prefix, computer_prefix)
                 .map(|(_, service_type)| service_type)
         });
