@@ -217,6 +217,37 @@ impl UserAppOperationState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum UserAppOperationScope {
+    Dev,
+    Prod,
+    Application,
+}
+
+impl UserAppOperationScope {
+    pub const ALL: [Self; 3] = [Self::Dev, Self::Prod, Self::Application];
+
+    /// Slot key of the persisted active_operations projection. Fixed vocabulary;
+    /// unknown string keys must never deserialize into a scope.
+    pub const fn slot_key(self) -> &'static str {
+        match self {
+            Self::Dev => "dev",
+            Self::Prod => "prod",
+            Self::Application => "application",
+        }
+    }
+}
+
+impl std::fmt::Display for UserAppOperationScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Dev => "Dev",
+            Self::Prod => "Prod",
+            Self::Application => "Application",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum UserAppOperationKind {
     EnsureBuilder,
     AdoptBuilder,
@@ -244,18 +275,38 @@ impl UserAppOperationKind {
         matches!(self, Self::DeleteApplication)
     }
 
+    /// Server-derived resource scope the operation occupies while in flight.
+    /// This classification is authoritative: it follows the kind's actual
+    /// resource write set and must never be overridden by client input.
+    pub fn scope(self) -> UserAppOperationScope {
+        match self {
+            Self::EnsureBuilder
+            | Self::AdoptBuilder
+            | Self::StopBuilder
+            | Self::RestartBuilder
+            | Self::DestroyDevStorage
+            | Self::ClearDevStorage => UserAppOperationScope::Dev,
+            Self::Create
+            | Self::Update
+            | Self::StartDeployment
+            | Self::RestartDeployment
+            | Self::Start
+            | Self::Restart
+            | Self::Stop
+            | Self::SetRecyclePolicy
+            | Self::HotDeploy
+            | Self::DeleteCompute
+            | Self::DestroyProdStorage
+            | Self::ClearProdStorage => UserAppOperationScope::Prod,
+            Self::PurgeResources | Self::DeleteApplication => UserAppOperationScope::Application,
+        }
+    }
+
     /// Whether the operation mutates or fences the shared dev builder itself.
     /// Unrelated in-flight operations (e.g. a production deployment) must not
     /// invalidate a verified builder registration for dev forwarding.
     pub fn affects_builder(self) -> bool {
-        matches!(
-            self,
-            Self::EnsureBuilder
-                | Self::AdoptBuilder
-                | Self::StopBuilder
-                | Self::RestartBuilder
-                | Self::DestroyDevStorage
-        )
+        self.scope() == UserAppOperationScope::Dev
     }
 }
 
@@ -483,6 +534,41 @@ where
 #[error("Builder ensure deadline exceeded")]
 pub struct UserAppWaitTimeout {
     pub operation_id: Option<String>,
+}
+
+/// Structured conflict detail about the in-flight operation occupying a scope.
+/// Rendered through Display into the existing English conflict message prefix;
+/// no internal executor or checkpoint information is exposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserAppOperationBlocker {
+    pub scope: UserAppOperationScope,
+    pub operation_id: String,
+    pub kind: UserAppOperationKind,
+    pub state: UserAppOperationState,
+    pub step: String,
+}
+
+impl UserAppOperationBlocker {
+    fn wire_name<T: Serialize>(value: &T) -> String {
+        serde_json::to_string(value)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_owned()
+    }
+}
+
+impl std::fmt::Display for UserAppOperationBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "operation {} ({scope} scope, kind={kind}, state={state}, step={step})",
+            self.operation_id,
+            scope = self.scope,
+            kind = Self::wire_name(&self.kind),
+            state = Self::wire_name(&self.state),
+            step = self.step,
+        )
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -782,5 +868,86 @@ impl UserAppExecutionInput {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod operation_scope_tests {
+    use super::{
+        UserAppOperationBlocker, UserAppOperationKind as Kind, UserAppOperationScope as Scope,
+        UserAppOperationState as State,
+    };
+
+    const DEV: [Kind; 6] = [
+        Kind::EnsureBuilder,
+        Kind::AdoptBuilder,
+        Kind::StopBuilder,
+        Kind::RestartBuilder,
+        Kind::DestroyDevStorage,
+        Kind::ClearDevStorage,
+    ];
+    const PROD: [Kind; 12] = [
+        Kind::Create,
+        Kind::Update,
+        Kind::StartDeployment,
+        Kind::RestartDeployment,
+        Kind::Start,
+        Kind::Restart,
+        Kind::Stop,
+        Kind::SetRecyclePolicy,
+        Kind::HotDeploy,
+        Kind::DeleteCompute,
+        Kind::DestroyProdStorage,
+        Kind::ClearProdStorage,
+    ];
+    const APPLICATION: [Kind; 2] = [Kind::PurgeResources, Kind::DeleteApplication];
+
+    #[test]
+    fn every_kind_maps_to_the_audited_resource_scope() {
+        for kind in DEV {
+            assert_eq!(kind.scope(), Scope::Dev, "{kind:?}");
+        }
+        for kind in PROD {
+            assert_eq!(kind.scope(), Scope::Prod, "{kind:?}");
+        }
+        for kind in APPLICATION {
+            assert_eq!(kind.scope(), Scope::Application, "{kind:?}");
+        }
+        let total = DEV.len() + PROD.len() + APPLICATION.len();
+        assert_eq!(total, 20, "scope matrix must stay exhaustive");
+    }
+
+    #[test]
+    fn affects_builder_delegates_to_dev_scope() {
+        for kind in DEV {
+            assert!(kind.affects_builder(), "{kind:?}");
+        }
+        for kind in PROD.iter().chain(APPLICATION.iter()) {
+            assert!(!kind.affects_builder(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn scope_slot_keys_use_fixed_vocabulary() {
+        assert_eq!(Scope::Dev.slot_key(), "dev");
+        assert_eq!(Scope::Prod.slot_key(), "prod");
+        assert_eq!(Scope::Application.slot_key(), "application");
+    }
+
+    #[test]
+    fn blocker_display_keeps_operation_id_and_english_detail() {
+        let blocker = UserAppOperationBlocker {
+            scope: Scope::Prod,
+            operation_id: "op-42".into(),
+            kind: Kind::Start,
+            state: State::RecoveryRequired,
+            step: "claimed".into(),
+        };
+        let text = blocker.to_string();
+        assert!(text.contains("op-42"), "{text}");
+        assert!(text.contains("Prod"), "{text}");
+        assert!(text.contains("kind=Start"), "{text}");
+        assert!(text.contains("state=RecoveryRequired"), "{text}");
+        assert!(text.contains("step=claimed"), "{text}");
     }
 }
