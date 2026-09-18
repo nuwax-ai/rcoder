@@ -40,7 +40,15 @@ function getTargetTriple(platform, arch, family) {
     throw new Error(`Unsupported Linux arch: ${a}`);
   }
   if (p === "win32") {
-    return a === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+    // N09：发布矩阵只有 x86_64-pc-windows-msvc——ARM64 早拒绝（结构化
+    // 错误，不下载不存在的包），矩阵扩展后放开
+    if (a === "arm64") {
+      throw new Error(
+        `unsupported_target: Windows ARM64 (${a}) has no published artifact; \
+supported: darwin arm64/x64, linux arm64/x64(gnu/musl), windows x64`,
+      );
+    }
+    return "x86_64-pc-windows-msvc";
   }
   throw new Error(`Unsupported platform: ${p}`);
 }

@@ -40,9 +40,10 @@ test("linux arm64 supported (gnu)", () => {
 
 test("win32 maps to msvc triples", () => {
   assert.strictEqual(getTargetTriple("win32", "x64"), "x86_64-pc-windows-msvc");
-  assert.strictEqual(
-    getTargetTriple("win32", "arm64"),
-    "aarch64-pc-windows-msvc",
+  // N09：Windows ARM64 无发布产物——结构化早拒绝（不下载不存在的包）
+  assert.throws(
+    () => getTargetTriple("win32", "arm64"),
+    /unsupported_target: Windows ARM64/,
   );
 });
 
