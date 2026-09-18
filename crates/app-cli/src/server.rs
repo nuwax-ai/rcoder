@@ -144,6 +144,9 @@ pub struct DeployRequest {
     pub url: String,
     pub release_id: String,
     pub sha256: Option<String>,
+    /// R03：登记的本地构建制品（共享卷 `builds/` 目录的 zip）——跳过网络
+    /// 下载，直接校验/解压；legacy `/v1/deploy`（URL）为 None。
+    pub local_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -1514,7 +1517,53 @@ async fn assemble_runtime_kernel(
         state.generation.clone(),
     )?;
     let dispatch_state = state.clone();
+    let dispatch_workspace = args.workspace.clone();
     let dispatch = Box::new(move |action: DispatchAction| match action {
+        DispatchAction::DeployLocalArtifact {
+            operation_id,
+            artifact_id,
+            sha256,
+        } => {
+            // R03：登记的本地构建制品——共享卷 builds/ 目录 zip 由 owner 侧
+            // 部署准备链校验/解压/激活（不经网络下载；artifact_id 已过
+            // identifier 白名单，路径拼接无穿越面）
+            let settle_state = dispatch_state.clone();
+            if settle_state
+                .runtime_kernel()
+                .is_some_and(|kernel| kernel.is_cancelled(&operation_id))
+            {
+                tokio::spawn(async move {
+                    settle_state
+                        .settle_cancelled_before_execution(&operation_id)
+                        .await;
+                });
+                return;
+            }
+            dispatch_state.set_current_runtime_operation(Some(operation_id.clone()));
+            let local_path = dispatch_workspace.parent().map(|volume| {
+                volume
+                    .join("builds")
+                    .join(format!("workspace-package-{artifact_id}.zip"))
+            });
+            if let Some(path) = &local_path
+                && !path.exists()
+            {
+                tracing::error!(
+                    "runtime dispatch: registered artifact {artifact_id} not found at {}",
+                    path.display()
+                );
+            }
+            let marker = format!("runtime-{operation_id}");
+            let request = DeployRequest {
+                url: format!("artifact://{artifact_id}"),
+                release_id: marker,
+                sha256,
+                local_path,
+            };
+            if dispatch_state.deploy_tx.send(request).is_err() {
+                tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
+            }
+        }
         DispatchAction::DeployArtifact {
             operation_id,
             url,
@@ -1542,6 +1591,7 @@ async fn assemble_runtime_kernel(
                 url,
                 release_id: marker,
                 sha256,
+                local_path: None,
             };
             if dispatch_state.deploy_tx.send(request).is_err() {
                 tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
@@ -2517,6 +2567,7 @@ mod tests {
     fn request() -> DeployRequest {
         DeployRequest {
             url: "http://artifact".into(),
+            local_path: None,
             release_id: "caller-token".into(),
             sha256: None,
         }
@@ -3142,6 +3193,7 @@ format = "jsonl"
                             url: "http://127.0.0.1/artifact".into(),
                             release_id: format!("r{n}"),
                             sha256: None,
+                            local_path: None,
                         })
                         .is_ok()
                 })
@@ -3169,6 +3221,7 @@ format = "jsonl"
                     url: "http://x".into(),
                     release_id: "requested".into(),
                     sha256: None,
+                    local_path: None,
                 },
                 "op-a".into(),
             )
@@ -3188,6 +3241,7 @@ format = "jsonl"
             url: "http://x".into(),
             release_id: "requested".into(),
             sha256: None,
+            local_path: None,
         };
         state
             .try_accept_deploy_with_id(request(), "op-a".into())
@@ -3299,6 +3353,7 @@ format = "jsonl"
             url: "http://x/p.zip".into(),
             release_id: "rel-1".into(),
             sha256: None,
+            local_path: None,
         };
         assert!(st.try_accept_deploy(req.clone()).is_ok());
         // 进行中相位拒绝（防双部署竞争）
@@ -3312,6 +3367,7 @@ format = "jsonl"
             url: "http://x/p2.zip".into(),
             release_id: "rel-2".into(),
             sha256: None,
+            local_path: None,
         })
         .unwrap();
         // 受理按序到达（Running 期受理的 rel-1 排在前——主循环串行消费）
@@ -3368,6 +3424,7 @@ format = "jsonl"
             url: "http://unused".into(),
             release_id: "rel-token-b".into(),
             sha256: None,
+            local_path: None,
         })
         .expect("idle accepts deploy");
         let status = st.deploy_status();
@@ -3406,6 +3463,7 @@ format = "jsonl"
                     url: "http://unused".into(),
                     release_id: "new".into(),
                     sha256: None,
+                    local_path: None,
                 },
                 "operation".into(),
             )
@@ -3427,7 +3485,8 @@ format = "jsonl"
                 .try_accept_deploy(DeployRequest {
                     url: "http://unused".into(),
                     release_id: "later".into(),
-                    sha256: None
+                    sha256: None,
+                    local_path: None,
                 })
                 .is_err()
         );

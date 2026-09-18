@@ -60,9 +60,10 @@ impl Preparations {
     ) -> Result<Option<PreparedDeploy>> {
         self.drain().await?;
         let job = tokio::spawn(async move {
-            crate::deploy::prepare(
+            crate::deploy::prepare_with_local(
                 &workspace,
                 &request.url,
+                request.local_path.as_deref(),
                 &request.release_id,
                 request.sha256.as_deref(),
                 progress,

@@ -228,6 +228,7 @@ mod tests {
             url: "http://artifact/b".into(),
             release_id: "b".into(),
             sha256: None,
+            local_path: None,
         };
         Receipt {
             generation: "generation-a".into(),

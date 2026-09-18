@@ -299,7 +299,7 @@ impl DevServerManager {
         // owner 经运行 API 复用（消除平台/agent 双启动的 3010 冲突）；legacy
         // app-cli / foreign 应答明确拒绝（XP04：不杀对方、不盲 spawn）。
         if let Some(started) = self
-            .reuse_or_refuse_owner(project_id, project_path, hooks.clone(), pg)
+            .reuse_or_refuse_owner(project_id, project_path, hooks.clone(), pg, None)
             .await?
         {
             return Ok(started);
@@ -415,12 +415,17 @@ impl DevServerManager {
     ///   提交 Restart(source) 复用，登记 external DevProcess；
     /// - `Err`：legacy app-cli（无 runtime API）、foreign 应答、协议不兼容、
     ///   凭据缺失——明确诊断拒绝，不杀对方、不盲 spawn（XP04）。
+    ///
+    /// 复用提交的运行形态（R03）：Source = 平台已就绪的 workspace 直接编排；
+    /// Artifact = 平台只登记制品（共享卷 builds/ zip），激活由 owner 在
+    /// 身份/revision 核验后执行——提交拒绝不改变 active 运行目录。
     async fn reuse_or_refuse_owner(
         &self,
         project_id: &str,
         project_path: &Path,
         hooks: Option<super::supervise::DevEventHooks>,
         pg: Option<&shared_types::StartPgCredential>,
+        artifact_release_id: Option<&str>,
     ) -> AppResult<Option<StartedDev>> {
         let owner_addr = self.config.app_cli_admin_probe_addr.clone();
         let Some(identity) = super::owner_client::probe_owner(&owner_addr).await else {
@@ -503,15 +508,31 @@ impl DevServerManager {
                 }
             };
             let operation_id = format!("fs-restart-{}", uuid::Uuid::new_v4().simple());
-            client
-                .submit_restart_source(
-                    &operation_id,
-                    &expected_ws,
-                    expected_revision,
-                    &expected_instance,
-                    pg,
-                )
-                .await?;
+            match artifact_release_id {
+                Some(artifact_id) => {
+                    client
+                        .submit_restart_artifact(
+                            &operation_id,
+                            &expected_ws,
+                            expected_revision,
+                            &expected_instance,
+                            pg,
+                            artifact_id,
+                        )
+                        .await?;
+                }
+                None => {
+                    client
+                        .submit_restart_source(
+                            &operation_id,
+                            &expected_ws,
+                            expected_revision,
+                            &expected_instance,
+                            pg,
+                        )
+                        .await?;
+                }
+            }
             // R06：事件转发（游标重放轮询，替换 SSE 长连——无总超时/EOF 竞态，
             // 断线续传天然支持）
             let events_client = super::owner_client::OwnerClient::new(&owner_addr, &token)?;
@@ -613,6 +634,26 @@ impl DevServerManager {
             pid: 0,
             port: shared_types::APP_ENTRY_PORT,
         }))
+    }
+
+    /// R03：制品态的 owner 路由决策——**激活权归属 owner**。
+    /// - `Ok(Some(started))`：匹配 owner 已受理 Restart(ArtifactId) 并确认
+    ///   Succeeded（owner 侧完成校验/解压/激活/编排）；平台**不触碰 .run**。
+    /// - `Ok(None)`：无 owner——调用方走本地激活 + spawn（legacy 路径）。
+    /// - `Err`：owner 拒绝（身份/revision/凭据）——`.run` 保持原样（提交
+    ///   拒绝不改变 active 内容），错误如实上抛。
+    pub async fn route_artifact_restart(
+        &self,
+        project_id: &str,
+        workspace: &Path,
+        release_id: &str,
+        hooks: Option<super::supervise::DevEventHooks>,
+        pg: Option<&shared_types::StartPgCredential>,
+    ) -> AppResult<Option<StartedDev>> {
+        // owner（产物态 serve 绑定 {ws}/.run，workspace_id=".run"）
+        let run_dir = workspace.join(".run");
+        self.reuse_or_refuse_owner(project_id, &run_dir, hooks, pg, Some(release_id))
+            .await
     }
 
     /// 就绪轮询: 进程早退 → Err (读 stderr ring 分类成结构化错误); HTTP 就绪 → Ok;
@@ -837,7 +878,7 @@ mod owner_reuse_tests {
         let ws_fresh = dir.path().join("ws-fresh");
         std::fs::create_dir_all(&ws_fresh).unwrap();
         assert!(
-            mgr.reuse_or_refuse_owner("userapp:app", &ws_fresh, None, None)
+            mgr.reuse_or_refuse_owner("userapp:app", &ws_fresh, None, None, None)
                 .await
                 .expect("probe")
                 .is_none(),
@@ -855,7 +896,7 @@ mod owner_reuse_tests {
         let ws_legacy = dir.path().join("ws-legacy");
         std::fs::create_dir_all(&ws_legacy).unwrap();
         let error = mgr
-            .reuse_or_refuse_owner("userapp:app", &ws_legacy, None, None)
+            .reuse_or_refuse_owner("userapp:app", &ws_legacy, None, None, None)
             .await
             .expect_err("legacy responder must be refused");
         let AppError::Business(message) = &error else {
@@ -886,7 +927,7 @@ mod owner_reuse_tests {
             on_end: None,
         };
         let started = mgr
-            .reuse_or_refuse_owner("userapp:app", &ws_reuse, Some(hooks), None)
+            .reuse_or_refuse_owner("userapp:app", &ws_reuse, Some(hooks), None, None)
             .await
             .expect("reuse path")
             .expect("must reuse existing owner");
@@ -934,7 +975,7 @@ mod owner_reuse_tests {
         let ws_mine = dir.path().join("ws-mine");
         std::fs::create_dir_all(&ws_mine).unwrap();
         let error = mgr
-            .reuse_or_refuse_owner("userapp:app", &ws_mine, None, None)
+            .reuse_or_refuse_owner("userapp:app", &ws_mine, None, None, None)
             .await
             .expect_err("foreign owner must be refused");
         let AppError::Business(message) = &error else {
@@ -1179,7 +1220,7 @@ mod owner_reuse_tests {
         // 旧构建迟到提交必须被拒——不得刷新期望
         std::fs::write(state_root.join("token"), "test-token").unwrap();
         let error = mgr
-            .reuse_or_refuse_owner("userapp:r78", &ws, None, None)
+            .reuse_or_refuse_owner("userapp:r78", &ws, None, None, None)
             .await
             .expect_err("late build submission must be refused");
         assert!(
@@ -1214,7 +1255,7 @@ mod owner_reuse_tests {
         // 复用路径会 wait_terminal 轮询到超时——mock 不提供 operation 查询端点，
         // 这里只需断言**提交 wire**；超时错误可忽略（操作已受理记录在案）
         let _reuse_result = mgr
-            .reuse_or_refuse_owner("userapp:r78", &ws, None, Some(&pg))
+            .reuse_or_refuse_owner("userapp:r78", &ws, None, Some(&pg), None)
             .await;
         let posted = submitted.lock().unwrap();
         let last = posted
@@ -1226,6 +1267,135 @@ mod owner_reuse_tests {
             "wire must carry the new pg credential: {last}"
         );
         assert_eq!(last["run_config"]["pg"]["password"], "new-s3cret");
+        task.abort();
+    }
+
+    /// R03 反例：制品态 owner 路由——owner 拒绝（revision 推进）时 `.run`
+    /// 保持原样（提交拒绝不改变 active 内容）；owner 受理时请求按
+    /// ArtifactId 形态上 wire（不是 Source restart）。
+    #[tokio::test]
+    async fn artifact_owner_route_preserves_run_dir_on_rejection() {
+        use crate::Config;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws-art");
+        std::fs::create_dir_all(&ws).unwrap();
+        // 既有 .run（旧版本运行目录）+ 标记文件——必须原样保留
+        std::fs::create_dir_all(ws.join(".run")).unwrap();
+        std::fs::write(ws.join(".run").join("marker-old"), "v1").unwrap();
+
+        // mock owner：workspace_id=".run"（产物态绑定）、token 文件、
+        // 受理后固定返回 ERR_REVISION_MISMATCH 拒绝
+        let state_root = dir.path().join(".app-cli-state").join("unknown-app");
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::write(state_root.join("token"), "test-token").unwrap();
+        let submitted: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = submitted.clone();
+        let identity = shared_types::RuntimeIdentityView {
+            application_id: "unknown-app".to_string(),
+            service_family: "userapp-dev".to_string(),
+            workspace_id: ".run".to_string(),
+            source_root: "/ws/.run".to_string(),
+            runtime_instance_id: "instance-art".to_string(),
+            deployment_generation_id: "gen".to_string(),
+            protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: Vec::new(),
+        };
+        let identity_ws = identity.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/runtime/identity",
+                axum::routing::get(move || {
+                    let identity = identity_ws.clone();
+                    async move { axum::Json(envelope(&identity)) }
+                }),
+            )
+            .route(
+                "/v1/runtime/status",
+                axum::routing::get(|| async {
+                    let status = shared_types::RuntimeStatusView {
+                        desired: shared_types::DesiredState::Running,
+                        observed: shared_types::ObservedHealth::Ready,
+                        active_target: None,
+                        revision: 9,
+                        active_operation_id: None,
+                        recovery_protection: false,
+                        runtime_instance_id: "instance-art".to_string(),
+                    };
+                    axum::Json(envelope(&status))
+                }),
+            )
+            .route(
+                "/v1/runtime/operations",
+                axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(body.0.clone());
+                        // 模拟构建期间用户 Stop 推进 revision → 受理拒绝
+                        axum::response::Response::builder()
+                            .status(409)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                serde_json::json!({
+                                    "success": false,
+                                    "code": "ERR_REVISION_MISMATCH",
+                                    "message": "expected revision 8 does not match current 9",
+                                })
+                                .to_string(),
+                            ))
+                            .expect("reject response")
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut config = Config::from_env().expect("test config");
+        config.app_cli_admin_probe_addr = addr;
+        let mgr = DevServerManager::new(Arc::new(config));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock serve");
+        });
+
+        // owner 在但拒绝（revision 已推进）
+        let error = mgr
+            .route_artifact_restart("userapp:art", &ws, "rel-new", None, None)
+            .await
+            .expect_err("owner rejection must propagate");
+        assert!(
+            error.to_string().contains("ERR_REVISION_MISMATCH")
+                || error.to_string().contains("reuse"),
+            "diagnostic: {error}"
+        );
+        // R03 核心：`.run` 原样（提交拒绝不改变 active 内容）
+        assert!(
+            ws.join(".run").join("marker-old").is_file(),
+            "active .run must be untouched on owner rejection"
+        );
+        assert!(
+            !ws.join(".previous").exists(),
+            "no rotation may happen on rejection"
+        );
+        // wire：提交按 ArtifactId 形态（artifact_id 上 wire，非 Source）
+        let posted = submitted.lock().unwrap();
+        let last = posted
+            .last()
+            .cloned()
+            .unwrap_or_else(|| panic!("{posted:?}"));
+        // wire 形态跟随 RunProfileInput 的 serde tag（tag="profile"/
+        // content="input" + ArtifactInput 的 tag="source"/content="value"）
+        assert_eq!(
+            last["profile"]["profile"], "artifact",
+            "artifact restart must use Artifact profile: {last}"
+        );
+        assert_eq!(
+            last["profile"]["input"]["artifact"]["source"],
+            "artifact_id"
+        );
+        assert_eq!(
+            last["profile"]["input"]["artifact"]["value"]["artifact_id"],
+            "rel-new"
+        );
+        drop(last);
+        drop(posted);
         task.abort();
     }
 

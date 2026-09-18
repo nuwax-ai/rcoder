@@ -36,6 +36,9 @@ fn start(workspace: &Path, logs: &Path) -> (OwnedServer, String) {
         .env_remove("APP_RELEASE_ID")
         .env_remove("APP_DEPLOY_OPERATION_ID")
         .env_remove("APP_DEPLOY_GENERATION_ID")
+        // N01 后空 workspace 编排不再被 60s PG 等待拖住——显式声明 PG 前置
+        // 恢复确定性"orchestrating"观察窗口（本机无 PG，探测满窗失败）
+        .env("APP_CLI_REQUIRE_PG", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

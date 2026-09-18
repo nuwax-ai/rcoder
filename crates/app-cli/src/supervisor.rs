@@ -275,7 +275,14 @@ async fn run_inner(
             }
         }
         // 编译、完整验证并启动 Pingap；代理失败时 workspace 不得进入 ready。
-        start_pingap(&args.workspace, &args.pingap_bin, &release, &mut children).await?;
+        start_pingap(
+            &args.workspace,
+            &args.log_dir,
+            &args.pingap_bin,
+            &release,
+            &mut children,
+        )
+        .await?;
         // 启动编排终局（pingap 确认后输出——9080 listen 即全部启动判定完成，
         // 下游终态判定无竞态）：failed 空 = 全部成功。
         emit_event(&OrchestrationEvent::OrchestrationDone {
@@ -753,13 +760,17 @@ async fn run_transient_with_timeout(argv: &[String], cwd: &Path, timeout: Durati
 /// 并经 loopback admin 只读通道确认初始配置实际生效。
 async fn start_pingap(
     ws_root: &Path,
+    log_root: &Path,
     pingap_bin: &Path,
     release: &workspace_manifest::ReleaseLock,
     children: &mut ManagedChildren,
 ) -> Result<()> {
+    // N02：运行目录默认不假设容器 /run（原生 Windows/macOS 不可写）——
+    // env 显式优先（平台注入容器布局），缺省挂 log_dir 子目录（用户可写、
+    // 稳定、非系统临时目录；配置每次启动重生成，随日志卷持久无害）。
     let runtime_root = std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "/run/app-cli/pingap".into());
+        .unwrap_or_else(|| log_root.join("pingap"));
     let outcome = compile_and_validate(ws_root, &runtime_root, pingap_bin, release).await?;
     info!(
         "📝 effective pingap config → {}",
@@ -1050,7 +1061,12 @@ mod tests {
                 command: vec![
                     "sh".into(),
                     "-c".into(),
-                    format!("env | sort > '{}'; sleep 30", dump.display()),
+                    // 完成标记防撕裂读（env 逐段写文件，POSTGRES_* 按序靠后）
+                    format!(
+                        "env | sort > '{}'; echo __DUMP_DONE__ >> '{}'; sleep 30",
+                        dump.display(),
+                        dump.display()
+                    ),
                 ],
                 migrate: Vec::new(),
                 depends_on: Vec::new(),
@@ -1085,11 +1101,11 @@ mod tests {
         let content = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(text) = tokio::fs::read_to_string(&dump).await
-                    && !text.is_empty()
+                    && text.contains("__DUMP_DONE__")
                 {
                     break text;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await

@@ -325,6 +325,17 @@ mod tests {
         ];
 
         let deploy = ws.join(".deploy-check");
+        // N02/NT14：symlink 制品是 Unix 部署运行时契约——Windows 原生解压
+        // 结构化拒绝（不 panic、不半解压），Unix 保留 symlink 语义。
+        if cfg!(windows) {
+            let error = assemble_deploy_dir(ws, &tasks, &deploy)
+                .expect_err("symlink zip must be rejected on Windows deployment runtime");
+            assert!(
+                error.to_string().contains("symbolic links"),
+                "structured rejection expected: {error:#}"
+            );
+            return;
+        }
         assemble_deploy_dir(ws, &tasks, &deploy).expect("assemble");
 
         assert!(deploy.join("backend/server").is_file(), "zip 根文件未解压");
@@ -345,6 +356,7 @@ mod tests {
             "workspace 入口页未拷贝"
         );
         // 符号链接条目解压为 symlink（内容 = 目标路径），不是普通文件
+        #[cfg(unix)]
         assert!(
             deploy
                 .join("backend/.next/node_modules/pg-test")

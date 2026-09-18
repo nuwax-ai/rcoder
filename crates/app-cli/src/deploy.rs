@@ -81,6 +81,7 @@ pub fn request_from_env() -> Result<crate::server::DeployRequest> {
         url,
         release_id,
         sha256,
+        local_path: None,
     })
 }
 
@@ -180,6 +181,19 @@ pub(crate) async fn prepare(
     expected_sha: Option<&str>,
     progress: Option<ProgressCallback>,
 ) -> Result<Option<PreparedDeploy>> {
+    prepare_with_local(workspace, url, None, release_id, expected_sha, progress).await
+}
+
+/// [`prepare`] 的可参数化核心（R03）：`local_source` = 共享卷上的登记制品
+/// 路径（Some 时跳过下载，仍走完整校验/解压/激活准备链）。
+pub(crate) async fn prepare_with_local(
+    workspace: &Path,
+    url: &str,
+    local_source: Option<&Path>,
+    release_id: &str,
+    expected_sha: Option<&str>,
+    progress: Option<ProgressCallback>,
+) -> Result<Option<PreparedDeploy>> {
     validate_release_id_fs_safe(release_id)?;
     let root = workspace.parent().context("workspace has no volume root")?;
     if let Some(state) = read_state(root).await
@@ -228,7 +242,25 @@ pub(crate) async fn prepare(
             ..Default::default()
         });
     }
-    let actual_hex = to_hex(&download_to_file(url, part.path()).await?);
+    // R03：本地登记制品（共享卷 builds/）不经网络下载；仍计算 sha256
+    // （expected_sha 提供时校验一致）并走同一 zip 魔数/解压/校验链。
+    let actual_hex = match &local_source {
+        Some(source) => {
+            anyhow::ensure!(
+                tokio::fs::try_exists(source).await?,
+                "registered local artifact is missing on the shared volume: {}",
+                source.display()
+            );
+            let bytes = tokio::fs::read(source)
+                .await
+                .with_context(|| format!("read local artifact {}", source.display()))?;
+            tokio::fs::write(part.path(), &bytes)
+                .await
+                .context("stage local artifact into incoming")?;
+            to_hex(&sha2::Sha256::digest(&bytes))
+        }
+        None => to_hex(&download_to_file(url, part.path()).await?),
+    };
     if let Some(expected) = expected_sha
         && !expected.eq_ignore_ascii_case(&actual_hex)
     {

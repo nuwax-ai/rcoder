@@ -98,6 +98,54 @@ impl OwnerClient {
         instance_id: &str,
         pg: Option<&shared_types::StartPgCredential>,
     ) -> Result<RuntimeOperationView> {
+        self.submit_restart(
+            operation_id,
+            workspace_id,
+            expected_revision,
+            instance_id,
+            pg,
+            RunProfileInput::Source {
+                workspace_id: workspace_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// R03：提交制品 Restart——平台只登记制品（共享卷 builds/ zip），激活由
+    /// owner 在身份/revision 核验通过后执行；拒绝不改变 active 运行目录。
+    pub(super) async fn submit_restart_artifact(
+        &self,
+        operation_id: &str,
+        workspace_id: &str,
+        expected_revision: u64,
+        instance_id: &str,
+        pg: Option<&shared_types::StartPgCredential>,
+        artifact_id: &str,
+    ) -> Result<RuntimeOperationView> {
+        self.submit_restart(
+            operation_id,
+            workspace_id,
+            expected_revision,
+            instance_id,
+            pg,
+            RunProfileInput::Artifact {
+                artifact: shared_types::ArtifactInput::ArtifactId {
+                    artifact_id: artifact_id.to_string(),
+                },
+            },
+        )
+        .await
+    }
+
+    async fn submit_restart(
+        &self,
+        operation_id: &str,
+        workspace_id: &str,
+        expected_revision: u64,
+        instance_id: &str,
+        pg: Option<&shared_types::StartPgCredential>,
+        profile: RunProfileInput,
+    ) -> Result<RuntimeOperationView> {
         self.submit(
             operation_id,
             workspace_id,
@@ -105,6 +153,7 @@ impl OwnerClient {
             instance_id,
             RuntimeOperationKind::Restart,
             pg,
+            profile,
         )
         .await
     }
@@ -124,10 +173,14 @@ impl OwnerClient {
             instance_id,
             RuntimeOperationKind::Stop,
             None,
+            RunProfileInput::Source {
+                workspace_id: workspace_id.to_string(),
+            },
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn submit(
         &self,
         operation_id: &str,
@@ -136,6 +189,7 @@ impl OwnerClient {
         instance_id: &str,
         kind: RuntimeOperationKind,
         pg: Option<&shared_types::StartPgCredential>,
+        profile: RunProfileInput,
     ) -> Result<RuntimeOperationView> {
         let request = RuntimeOperationRequest {
             operation_id: operation_id.to_string(),
@@ -143,9 +197,7 @@ impl OwnerClient {
             expected_revision,
             workspace_id: workspace_id.to_string(),
             kind,
-            profile: RunProfileInput::Source {
-                workspace_id: workspace_id.to_string(),
-            },
+            profile,
             run_config: pg.map(|pg| shared_types::OperationRunConfig {
                 pg: Some(pg.clone()),
             }),
@@ -292,8 +344,14 @@ pub(super) fn find_owner_token(
     {
         return Some((root, token));
     }
-    // legacy 双探测（旧布局残留；新解析已由契约覆盖 .run/parent 折叠）
+    // legacy 双探测（旧布局残留）。以契约的规范化项目根为基准（`.run`
+    // 折叠到源码根后取其卷根——制品态 owner 的状态根挂源码卷，而非 .run
+    // 的字面 parent），避免制品/源码两入口探测到不同目录。
+    let project_root = runtime_state_layout::canonical_project_root(workspace);
     let mut candidates = Vec::new();
+    if let Some(parent) = project_root.parent() {
+        candidates.push(parent.join(".app-cli-state").join(application_id));
+    }
     if let Some(parent) = workspace.parent() {
         candidates.push(parent.join(".app-cli-state").join(application_id));
     }

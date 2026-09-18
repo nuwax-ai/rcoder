@@ -635,6 +635,13 @@ pub(crate) enum DispatchAction {
         url: String,
         sha256: Option<String>,
     },
+    /// 登记的本地构建制品部署（R03：平台 staging 后 owner 受理激活——
+    /// 制品 zip 在共享卷 `builds/` 目录，不经网络下载）。
+    DeployLocalArtifact {
+        operation_id: String,
+        artifact_id: String,
+        sha256: Option<String>,
+    },
     /// 源码编排（workspace 当前内容 + release lock；start/restart source）。
     /// R08：dev_profile 随操作传递（Source profile = dev 语义）——编排的
     /// 生效命令选择不再依赖 serve 进程 env 猜测；pg 为每操作运行配置
@@ -738,14 +745,13 @@ impl RuntimeKernel {
             active_operation_id: None,
         })?;
         // R03：kind×profile 组合前置校验——未实现组合在**任何持久化/占位
-        // 之前**结构化拒绝（不留半受理状态）。已实现：Deploy+Artifact(Url)、
-        // Start/Restart+Source、Stop（任意 profile）。
+        // 之前**结构化拒绝（不留半受理状态）。已实现：Deploy+Artifact(Url
+        // 或 ArtifactId——R03 owner 侧激活的登记本地制品)、Start/Restart+
+        // Source、Stop（任意 profile）。
         match (&request.kind, &request.profile) {
             (
                 RuntimeOperationKind::Deploy,
-                shared_types::RunProfileInput::Artifact {
-                    artifact: shared_types::ArtifactInput::Url { .. },
-                },
+                shared_types::RunProfileInput::Artifact { artifact: _ },
             )
             | (
                 RuntimeOperationKind::Start | RuntimeOperationKind::Restart,
@@ -924,6 +930,16 @@ impl RuntimeKernel {
                 operation_id: stored.view.operation_id.clone(),
                 url: url.clone(),
                 sha256: sha256.clone(),
+            },
+            (
+                RuntimeOperationKind::Deploy,
+                shared_types::RunProfileInput::Artifact {
+                    artifact: shared_types::ArtifactInput::ArtifactId { artifact_id },
+                },
+            ) => DispatchAction::DeployLocalArtifact {
+                operation_id: stored.view.operation_id.clone(),
+                artifact_id: artifact_id.clone(),
+                sha256: None,
             },
             (RuntimeOperationKind::Stop, _) => DispatchAction::StopBusiness {
                 operation_id: stored.view.operation_id.clone(),
@@ -1336,6 +1352,37 @@ mod tests {
         let store = open_store(&workspace);
         let identity = identity();
         RuntimeKernel::new(store, identity, Box::new(|_| {}))
+    }
+
+    /// R03：ArtifactId 制品部署派发（owner 侧激活——不经网络下载）。
+    #[tokio::test]
+    async fn artifact_id_deploy_dispatches_local_artifact() {
+        let (dir, _keep) = temp_store();
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<DispatchAction>>> = Default::default();
+        let sink = captured.clone();
+        let workspace = dir.path().join("workspace");
+        let store = open_store(&workspace);
+        let kernel = RuntimeKernel::new(
+            store,
+            identity(),
+            Box::new(move |action| {
+                sink.lock().unwrap().push(action);
+            }),
+        );
+        let mut request = request_deploy_url("op-art");
+        request.profile = shared_types::RunProfileInput::Artifact {
+            artifact: shared_types::ArtifactInput::ArtifactId {
+                artifact_id: "rel-777".into(),
+            },
+        };
+        kernel.admit(request).await.expect("admit");
+        let actions = captured.lock().unwrap();
+        match &actions[..] {
+            [DispatchAction::DeployLocalArtifact { artifact_id, .. }] => {
+                assert_eq!(artifact_id, "rel-777");
+            }
+            other => panic!("expected DeployLocalArtifact dispatch, got {other:?}"),
+        }
     }
 
     /// R08：Restart 携带 run_config.pg → 派发动作拿到真实凭据；持久化副本

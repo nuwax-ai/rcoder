@@ -432,10 +432,32 @@ async fn spawn_dev_task(
                 return Ok(());
             }
             // 启动 workspace 根（形态分派）：
-            // - 产物态：zip 部署到 {ws}/.run 原子换入（dev 运行编译产物）。
+            // - 产物态（R03）：staging 只解压校验；**激活权归属 owner**——
+            //   匹配 owner 在 → Restart(ArtifactId)（owner 侧身份/revision
+            //   核验后自行解压/激活/编排，拒绝不改变 active 目录）；
+            //   无 owner → 本地 activate + spawn（legacy 路径不变）。
             // - 源码态：ensure 源码目录 release.lock（mtime 检测自动重锁），
             //   app-cli 直接编排源码 workspace（devrun 优先、run 兜底）。
             // 两种形态失败语义一致：旧运行态原样保留，任务 Failed。
+            if !dev_source_mode {
+                match state
+                    .fs
+                    .dev_server
+                    .route_artifact_restart(&key, &ws, &release_id, Some(hooks.clone()), pg.as_ref())
+                    .await
+                {
+                    Ok(Some(started)) => {
+                        // owner 已受理并确认 Succeeded（含事件转发/终态排空/
+                        // external 登记，见 route_artifact_restart）——本地
+                        // .run 未被触碰，无需 commit_start 的本地激活段
+                        let _ = started;
+                        tracing::info!(%app_id, "artifact restart routed through runtime owner");
+                        return Ok(());
+                    }
+                    Ok(None) => { /* 无 owner：走下方本地激活 + spawn */ }
+                    Err(error) => return Err(error),
+                }
+            }
             let prepared = if dev_source_mode {
                 None
             } else {

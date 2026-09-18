@@ -176,9 +176,10 @@ mod tests {
             overrides.get("APP_RELEASE_ID").map(String::as_str),
             Some("rel-x")
         );
+        // 平台无关断言：join 产生的分隔符随平台（Windows 为 ''）
         assert_eq!(
             overrides.get("APP_LOG_DIR").map(String::as_str),
-            Some("/app/logs/api")
+            Some(Path::new("/app/logs").join("api").to_str().expect("utf8"))
         );
     }
 }

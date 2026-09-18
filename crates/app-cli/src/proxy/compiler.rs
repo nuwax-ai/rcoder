@@ -23,7 +23,11 @@ pub async fn compile_and_validate(
     pingap_bin: &Path,
     release: &ReleaseLock,
 ) -> Result<CompileOutcome> {
-    let (content, expected_hash) = compile_effective_config(workspace, release).await?;
+    let runtime_layout_roots: Vec<PathBuf> = std::fs::canonicalize(runtime_root)
+        .map(|root| vec![root])
+        .unwrap_or_default();
+    let (content, expected_hash) =
+        compile_effective_config_with_roots(workspace, release, &runtime_layout_roots).await?;
 
     let target_dir = runtime_root.join(&release.release_id);
     tokio::fs::create_dir_all(&target_dir)
@@ -78,13 +82,29 @@ pub async fn compile_effective_config(
     workspace: &Path,
     release: &ReleaseLock,
 ) -> Result<(String, String)> {
+    compile_effective_config_with_roots(workspace, release, &[]).await
+}
+
+/// [`compile_effective_config`] 的可参数化核心（N02）：`extra_layout_roots`
+/// 为运行时布局根（pingap 运行目录等），与 workspace 规范化根并集做
+/// 路径护栏校验——三平台一致，不再按平台整段跳过。
+pub async fn compile_effective_config_with_roots(
+    workspace: &Path,
+    release: &ReleaseLock,
+    extra_layout_roots: &[PathBuf],
+) -> Result<(String, String)> {
+    let mut layout_roots: Vec<PathBuf> = Vec::new();
+    if let Ok(canonical) = std::fs::canonicalize(workspace) {
+        layout_roots.push(canonical);
+    }
+    layout_roots.extend(extra_layout_roots.iter().cloned());
     let mut config = match release.pingap.mode {
         PingapMode::Managed => managed_config(workspace, release)?,
         PingapMode::Extend => compile_extend(workspace, release).await?,
         PingapMode::Custom => load_user_config(workspace, release).await?,
     };
     resolve_service_addresses(&mut config, release)?;
-    validate_guardrails(&config)?;
+    validate_guardrails(&config, &layout_roots)?;
     config.validate().context("PingapConfig::validate")?;
     // 期望 hash：与 pingap 加载同一 TOML 后 get_current_config().hash() 同算法
     //（descriptions 拼接 CRC32），供 reload 只读确认比对。
@@ -228,7 +248,9 @@ fn resolve_service_addresses(config: &mut PingapConfig, release: &ReleaseLock) -
     Ok(())
 }
 
-fn validate_guardrails(config: &PingapConfig) -> Result<()> {
+/// N02：`layout_roots` = 本次编译的实际布局根（workspace / pingap 运行
+/// 目录的规范化路径）——与容器字面量根并集做路径校验，原生平台不整段跳过。
+fn validate_guardrails(config: &PingapConfig, layout_roots: &[std::path::PathBuf]) -> Result<()> {
     for (category, count) in [
         ("server", config.servers.len()),
         ("location", config.locations.len()),
@@ -276,7 +298,7 @@ fn validate_guardrails(config: &PingapConfig) -> Result<()> {
         }
     }
     for (name, plugin) in &config.plugins {
-        validate_plugin_paths(name, plugin)?;
+        validate_plugin_paths_with_roots(name, plugin, layout_roots)?;
     }
     for (field, value) in [
         ("basic.pid_file", config.basic.pid_file.as_deref()),
@@ -284,7 +306,7 @@ fn validate_guardrails(config: &PingapConfig) -> Result<()> {
         ("basic.upgrade_sock", config.basic.upgrade_sock.as_deref()),
     ] {
         if let Some(value) = value {
-            validate_runtime_path(field, value)?;
+            validate_runtime_path(field, value, layout_roots)?;
         }
     }
     Ok(())
@@ -308,6 +330,17 @@ fn validate_upstream_destination(name: &str, address: &str) -> Result<()> {
 }
 
 fn validate_plugin_paths(name: &str, plugin: &impl serde::Serialize) -> Result<()> {
+    validate_plugin_paths_with_roots(name, plugin, &[])
+}
+
+/// [`validate_plugin_paths`] 的可参数化核心——`extra_roots` 为本次编译的
+/// 实际布局根（workspace、pingap 运行目录的规范化路径），与容器字面量
+/// 根并集校验（N02）。
+fn validate_plugin_paths_with_roots(
+    name: &str,
+    plugin: &impl serde::Serialize,
+    extra_roots: &[std::path::PathBuf],
+) -> Result<()> {
     let value = serde_json::to_value(plugin)
         .with_context(|| format!("serialize Pingap plugin {name} for guardrail validation"))?;
     let object = value
@@ -328,40 +361,48 @@ fn validate_plugin_paths(name: &str, plugin: &impl serde::Serialize) -> Result<(
         .unwrap_or("");
     for (key, value) in object {
         let Some(path) = value.as_str() else { continue };
-        if !path.starts_with('/') {
+        // 绝对样式值才可能是文件路径（相对值/URL 值不在此判定）：
+        // has_root 跨平台（Unix='/' 前缀；Windows=盘符或根相对 '\'/'/'）
+        if !std::path::Path::new(path).has_root() {
             continue;
         }
         let is_file_field =
             key.contains("file") || key.contains("directory") || key.contains("cert");
         let is_path_field = key.contains("path");
         if is_file_field || (is_path_field && FILE_PATH_CATEGORIES.contains(&category)) {
-            validate_runtime_path(&format!("plugins.{name}.{key}"), path)?;
+            validate_runtime_path(&format!("plugins.{name}.{key}"), path, extra_roots)?;
         }
     }
     Ok(())
 }
 
-fn validate_runtime_path(field: &str, value: &str) -> Result<()> {
-    // Windows 本地 dev 没有容器内运行时布局（/app/code 等不存在，路径是 C:\...），
-    // 越界防护防的是容器内 config 逃逸，对非 unix 不适用——直接放行。
-    #[cfg(not(unix))]
-    {
-        let _ = (field, value);
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        let allowed = ["/app/code", "/app/data", "/app/logs", "/run/app-cli"];
-        if !allowed
-            .iter()
-            .any(|root| value == *root || value.starts_with(&format!("{root}/")))
-        {
-            anyhow::bail!(
-                "{field} path is outside the allowed runtime roots (/app/code, /app/data, /app/logs, /run/app-cli): {value}"
-            );
+/// 运行时布局允许根的字面量部分（容器契约根；原生平台为惰性超集——
+/// 目录不存在即无从逃逸，真实布局根由调用方以 extra_roots 追加）。
+const CONTAINER_RUNTIME_ROOTS: [&str; 4] = ["/app/code", "/app/data", "/app/logs", "/run/app-cli"];
+
+fn validate_runtime_path(
+    field: &str,
+    value: &str,
+    extra_roots: &[std::path::PathBuf],
+) -> Result<()> {
+    // N02：路径校验不再按平台整段跳过——Windows 原生同样需要防配置逃逸。
+    // 组件化前缀比较（Path::starts_with）在三个平台语义一致，正确处理
+    // 分隔符差异（"/app/data/x" 与 "C:\app\data\x" 各按本平台规则比较）。
+    let path = std::path::Path::new(value);
+    let matched = CONTAINER_RUNTIME_ROOTS.iter().any(|root| {
+        let root = std::path::Path::new(root);
+        // Windows 上 "/app/..." 无盘符非绝对，但组件比较仍按根相对路径语义匹配
+        path.starts_with(root)
+    }) || extra_roots.iter().any(|root| path.starts_with(root));
+    if !matched {
+        let mut roots_desc = CONTAINER_RUNTIME_ROOTS.join(", ");
+        for root in extra_roots {
+            roots_desc.push_str(", ");
+            roots_desc.push_str(&root.display().to_string());
         }
-        Ok(())
+        anyhow::bail!("{field} path is outside the allowed runtime roots ({roots_desc}): {value}");
     }
+    Ok(())
 }
 
 fn merge_unique<K, V>(
