@@ -68,3 +68,16 @@
 R11 五点全部落地（每点带反例测试）。全 workspace 2334 测试 2333 通过（唯一失败为既有 RCODER_RUNTIME_IMAGE_DIGEST 环境前置项）；fmt/clippy 零告警。
 
 **剩余未完成（后续批次）**：R02（CLI 转交/最后受理生效/attach 语义）、B05（Secret 轮换 rollout 标识）、N03–N10（proxy 原生形态/端口计划/随包 Pingap/分发安全）、R02 相关的期望-构建 task 强绑定、NT 矩阵大部。
+
+### 2026-09-18 第四批：R02/B05/N03/N10 完成
+
+| 项 | 提交（rcoder / build-agent-docker） | 摘要 |
+|---|---|---|
+| R02 | `f2cbff8c` | legacy 无子命令进入身份/锁/客户端分派：OwnerGuard 先于副作用（持锁运行）；锁被占 → 探测身份 → 匹配则运行 API 提交 Start(Source) 等终态（转交唯一 owner）；legacy/身份不符/凭据缺 → 拒绝；mock 反例锁定提交形态与拒绝路径。attach 语义与"最后受理生效"持久化队列为后续 |
+| B05 | 镜像仓 `46fedd0` | Secret rollout annotation + deployment checksum/preview-secret（同一解析值锚定，rand 不漂移）。渲染验证：同值零漂移；轮换 AAA→BBB 两处标识同步变且同源 |
+| N03 | `4a9a73b1` | proxy listen_host 可配（env；容器默认不变）+ 端口 0 动态分配真实地址发布（反例锁定非 :0） |
+| N10 | `4a9a73b1` | standalone 前台永久 pending 废弃——SIGTERM/ctrl_c 真实关停（排空在途请求后确认退出） |
+
+npm 启动器测试 17/17 通过。proxy 17/17 默认 + 16/16 纯转发形态。
+
+**剩余未完成**：N04（随包 Pingap 三平台产物）、N05（原生标准模式 all_rust+embed 启动器显式化）、N06 JS 侧（npm 全局 PID 状态文件替换为 Rust 实例锁客户端）、N07（独立入口令牌认证层）、N08（file-server 硬编码 sh/ps/taskkill 清理）、N09（分发 sha256/安全解压/错误目标映射）、NT 矩阵三平台原生场景、R02 attach 语义与受理队列。
