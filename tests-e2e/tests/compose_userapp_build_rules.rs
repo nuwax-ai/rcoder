@@ -818,17 +818,12 @@ async fn userapp_devbuild_no_lockfile_pnpm_install() {
     }
 
     // 修复后链路：无 lockfile → 安装成功 + lockfile 生成 + 编排完成（真实 pnpm）
-    let terminal = dev_start_to_terminal(
-        &env,
-        &report,
-        &app,
-        user,
-        Duration::from_secs(240),
-    )
-    .await;
+    let terminal = dev_start_to_terminal(&env, &report, &app, user, Duration::from_secs(240)).await;
     report.assert_hard(
         "无 lockfile dev/start completed（--no-frozen-lockfile 安装成功）",
-        terminal.as_ref().is_some_and(|d| d["status"] == "completed"),
+        terminal
+            .as_ref()
+            .is_some_and(|d| d["status"] == "completed"),
         format!("terminal={}", trunc(&terminal.unwrap_or(Value::Null), 200)),
     );
 
@@ -852,9 +847,10 @@ async fn userapp_devbuild_no_lockfile_pnpm_install() {
         .await
         .expect("dev list");
     let body: Value = resp.json().await.unwrap_or(Value::Null);
-    let listed = body["data"]["list"]
-        .as_array()
-        .is_some_and(|arr| arr.iter().any(|p| p["pid"].as_u64().is_some_and(|pid| pid > 0)));
+    let listed = body["data"]["list"].as_array().is_some_and(|arr| {
+        arr.iter()
+            .any(|p| p["pid"].as_u64().is_some_and(|pid| pid > 0))
+    });
     report.assert_hard(
         "dev/list → pid>0（devrun 存活）",
         listed,
@@ -902,14 +898,8 @@ async fn userapp_devbuild_no_lockfile_pnpm_install() {
             return;
         }
     }
-    let frozen_terminal = dev_start_to_terminal(
-        &env,
-        &report,
-        &app,
-        user,
-        Duration::from_secs(240),
-    )
-    .await;
+    let frozen_terminal =
+        dev_start_to_terminal(&env, &report, &app, user, Duration::from_secs(240)).await;
     let frozen_failed = frozen_terminal
         .as_ref()
         .is_some_and(|d| d["status"] == "failed");
@@ -921,7 +911,10 @@ async fn userapp_devbuild_no_lockfile_pnpm_install() {
     report.assert_hard(
         "frozen + 过期 lockfile → 任务 failed（错误如实传播）",
         frozen_failed && frozen_error.contains("dev build failed"),
-        format!("terminal={}", trunc(&frozen_terminal.unwrap_or(Value::Null), 300)),
+        format!(
+            "terminal={}",
+            trunc(&frozen_terminal.unwrap_or(Value::Null), 300)
+        ),
     );
 
     // dev/stop → Stopped（收尾，防 builder 残留进程族）

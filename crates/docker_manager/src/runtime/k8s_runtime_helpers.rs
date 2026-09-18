@@ -54,7 +54,9 @@ impl KubernetesRuntime {
         {
             return Ok(k8s_cfg.container_prefix().to_string());
         }
-        let service_key = service_type.to_string();
+        // 家族归一：共享容器的类型（常规项目）必须读家族配置段——否则配置了
+        // 自定义 image_tag_prefix 时前后缀分裂出第二个 pod/PVC
+        let service_key = service_type.container_family().to_string();
         if let Some(config) = self
             .config
             .docker_manager_config

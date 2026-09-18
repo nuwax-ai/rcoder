@@ -143,6 +143,8 @@ pub struct EnsurePodRequest {
 
     /// 服务类型，决定创建哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
+    /// - "computer-normal-project": 常规项目，与 ComputerAgentRunner 复用同一
+    ///   per-user 容器（标识符同为 user_id），仅 agent 工作目录不同
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
     /// - "userapp" (userApp 场景，大小写不敏感): 与 app_id 搭配传入，
     ///   容器类型由 app_stage 推导；其余值与 app_id 互斥
@@ -238,6 +240,8 @@ pub struct KeepalivePodRequest {
 
     /// 服务类型，决定创建哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
+    /// - "computer-normal-project": 常规项目，与 ComputerAgentRunner 复用同一
+    ///   per-user 容器（标识符同为 user_id），仅 agent 工作目录不同
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
     /// - "userapp" (userApp 场景，大小写不敏感): 与 app_id 搭配传入，
     ///   容器类型由 app_stage 推导；其余值与 app_id 互斥
@@ -351,6 +355,8 @@ pub struct RestartPodRequest {
 
     /// 服务类型，决定创建哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
+    /// - "computer-normal-project": 常规项目，与 ComputerAgentRunner 复用同一
+    ///   per-user 容器（标识符同为 user_id），仅 agent 工作目录不同
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
     /// - "userapp" (userApp 场景，大小写不敏感): 与 app_id 搭配传入，
     ///   容器类型由 app_stage 推导；其余值与 app_id 互斥
@@ -417,6 +423,8 @@ pub struct StopPodRequest {
 
     /// 服务类型，决定销毁哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
+    /// - "computer-normal-project": 常规项目，与 ComputerAgentRunner 复用同一
+    ///   per-user 容器（标识符同为 user_id），仅 agent 工作目录不同
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
     /// - "userapp" (userApp 场景，大小写不敏感): 与 app_id 搭配传入，
     ///   容器类型由 app_stage 推导；其余值与 app_id 互斥
@@ -497,6 +505,8 @@ pub struct PodStatusQuery {
 
     /// 服务类型，决定查询哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
+    /// - "computer-normal-project": 常规项目，与 ComputerAgentRunner 复用同一
+    ///   per-user 容器（标识符同为 user_id），仅 agent 工作目录不同
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
     /// - "userapp" (userApp 场景，大小写不敏感): 与 app_id 搭配传入，查询 Userapp 容器状态
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -594,6 +604,8 @@ pub struct VncStatusQuery {
 
     /// 服务类型，决定查询哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
+    /// - "computer-normal-project": 常规项目，与 ComputerAgentRunner 复用同一
+    ///   per-user 容器（标识符同为 user_id），仅 agent 工作目录不同
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
     /// - "userapp" (userApp 场景，大小写不敏感): 与 app_id 搭配传入，
     ///   查询 Userapp 容器状态（prod 恒 vnc_ready=false——生产容器无 VNC）

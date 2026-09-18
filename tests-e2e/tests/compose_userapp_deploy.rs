@@ -1746,7 +1746,9 @@ async fn userapp_scope_isolation_during_deploy() {
         };
         let seen = s.is_success()
             && http_ok(&b)
-            && (b["data"].as_array().is_some_and(|ops| ops.iter().any(prod_active))
+            && (b["data"]
+                .as_array()
+                .is_some_and(|ops| ops.iter().any(prod_active))
                 || (b["data"].is_object() && prod_active(&b["data"])));
         if seen {
             prod_seen = true;
@@ -1855,9 +1857,7 @@ async fn userapp_scope_isolation_during_deploy() {
     );
 
     // ⑤b 断言：dev restart 与 prod 部署并发 → 独立受理（修复前 ERR_CONFLICT）
-    let (rs, rb) = restart_task
-        .await
-        .expect("restart task join");
+    let (rs, rb) = restart_task.await.expect("restart task join");
     let not_blocked = rs.is_success() && rb["success"].as_bool().unwrap_or(false);
     report.assert_hard(
         "dev restart 与 prod 部署并发 → 独立受理（无 conflicting 409）",
@@ -1883,9 +1883,8 @@ async fn userapp_scope_isolation_during_deploy() {
 
     // ⑤d 部署收敛：并发 dev 操作不破坏 prod 部署
     let (ds, db) = deploy_task.await.expect("deploy task join");
-    let deploy_ok = ds.is_success()
-        && http_ok(&db)
-        && db["data"]["status"].as_str() == Some("running");
+    let deploy_ok =
+        ds.is_success() && http_ok(&db) && db["data"]["status"].as_str() == Some("running");
     report.assert_hard(
         "隔离场景部署终态 running（并发不破坏部署）",
         deploy_ok,
