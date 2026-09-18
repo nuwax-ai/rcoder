@@ -661,6 +661,11 @@ struct AdmissionState {
     /// 已受理待执行的 Stop（V03）：持有者等待 server 主循环停服后按自身 ID
     /// 收束。pending 期间新操作（含第二个 Stop）一律 ERR_OPERATION_IN_PROGRESS。
     pending_stop: Option<String>,
+    /// R02"最后受理生效"：active 执行期间受理的 Start/Restart 排队槽
+    /// （单槽，最新覆盖旧的——被覆盖者收束 Cancelled/ERR_SUPERSEDED）。
+    /// active Succeeded 收束且无 pending_stop 时派发；Stop 受理时清空
+    /// （停止意图胜过排队启动）。
+    pending_restart: Option<String>,
     /// 恢复保护中（上次结果未知）。V03：由**结果未知**决定，不依赖 active
     /// 恰好匹配——任何操作的 RecoveryRequired 终态都会挂起保护。
     recovery_protection: bool,
@@ -839,18 +844,19 @@ impl RuntimeKernel {
                     active_operation_id: Some(pending),
                 });
             }
-        } else {
-            let busy = guard
-                .active_operation_id
-                .clone()
-                .or_else(|| guard.pending_stop.clone());
-            if let Some(active) = busy {
-                return Err(AdmissionRejection {
-                    code: ERR_OPERATION_IN_PROGRESS,
-                    message: "another runtime operation is in progress".into(),
-                    active_operation_id: Some(active),
-                });
-            }
+        } else if guard.pending_stop.is_some() {
+            // Stop 意图已受理（停服未完成）：一切新操作拒绝——受理即排队语义
+            // 不成立（排队启动会在停止后复活业务，绕过停止意图）
+            return Err(AdmissionRejection {
+                code: ERR_OPERATION_IN_PROGRESS,
+                message: "stop intent is pending execution".into(),
+                active_operation_id: guard.pending_stop.clone(),
+            });
+        } else if guard.active_operation_id.is_some() {
+            // R02"最后受理生效"：active 执行期间的新 Start/Restart 进排队槽
+            // （不忙拒）。旧排队者被覆盖收束（Cancelled/ERR_SUPERSEDED）——
+            // 持久化后返回 Accepted，执行由 active Succeeded 收束时派发。
+            // revision 校验仍执行（旧请求不得借排队复活）。
         }
         if request.expected_revision != revision {
             // 所有 kind 的 revision 校验统一执行（旧实例的 stop 不复活/不重复推进）。
@@ -911,59 +917,55 @@ impl RuntimeKernel {
                 self.hold_partial_admission(&stored, format!("persist running intent: {error:#}"))
             );
         }
+        let mut queued = false;
         if is_stop {
+            // R02：Stop 受理时清空排队启动（停止意图胜过排队——不得复活）
+            if let Some(superseded) = guard
+                .pending_restart
+                .replace(stored.view.operation_id.clone())
+                && let Err(error) = self.write_terminal(
+                    &superseded,
+                    RuntimeOperationState::Cancelled,
+                    Some((
+                        "ERR_SUPERSEDED".to_string(),
+                        "superseded by a newer stop intent before execution".to_string(),
+                    )),
+                    None,
+                )
+            {
+                tracing::error!(
+                    operation_id = %superseded,
+                    "persist superseded terminal state failed: {error:#}"
+                );
+            }
             guard.pending_stop = Some(stored.view.operation_id.clone());
+        } else if guard.active_operation_id.is_some() {
+            // R02"最后受理生效"：排队槽单值——旧排队者收束 Superseded 语义
+            // （Cancelled + ERR_SUPERSEDED），新受理者占槽
+            if let Some(superseded) = guard
+                .pending_restart
+                .replace(stored.view.operation_id.clone())
+                && let Err(error) = self.write_terminal(
+                    &superseded,
+                    RuntimeOperationState::Cancelled,
+                    Some((
+                        "ERR_SUPERSEDED".to_string(),
+                        "superseded by a newer start/restart request".to_string(),
+                    )),
+                    None,
+                )
+            {
+                tracing::error!(
+                    operation_id = %superseded,
+                    "persist superseded terminal state failed: {error:#}"
+                );
+            }
+            queued = true;
         } else {
             guard.active_operation_id = Some(stored.view.operation_id.clone());
         }
-        // 分派映射（组合已在受理前置校验收窄，此处仅选择已实现路径）
-        let action = match (&stored.request.kind, &stored.request.profile) {
-            (
-                RuntimeOperationKind::Deploy,
-                shared_types::RunProfileInput::Artifact {
-                    artifact: shared_types::ArtifactInput::Url { url, sha256 },
-                },
-            ) => DispatchAction::DeployArtifact {
-                operation_id: stored.view.operation_id.clone(),
-                url: url.clone(),
-                sha256: sha256.clone(),
-            },
-            (
-                RuntimeOperationKind::Deploy,
-                shared_types::RunProfileInput::Artifact {
-                    artifact: shared_types::ArtifactInput::ArtifactId { artifact_id },
-                },
-            ) => DispatchAction::DeployLocalArtifact {
-                operation_id: stored.view.operation_id.clone(),
-                artifact_id: artifact_id.clone(),
-                sha256: None,
-            },
-            (RuntimeOperationKind::Stop, _) => DispatchAction::StopBusiness {
-                operation_id: stored.view.operation_id.clone(),
-            },
-            (
-                RuntimeOperationKind::Start | RuntimeOperationKind::Restart,
-                shared_types::RunProfileInput::Source { .. },
-            ) => DispatchAction::OrchestrateSource {
-                operation_id: stored.view.operation_id.clone(),
-                dev_profile: true,
-                pg: stored
-                    .request
-                    .run_config
-                    .as_ref()
-                    .and_then(|config| config.pg.clone()),
-            },
-            // 组合已在前置校验拒绝；到这里的组合是防御纵深违规——fail fast
-            (kind, profile) => {
-                return Err(AdmissionRejection {
-                    code: "ERR_BACKEND_ERROR",
-                    message: format!(
-                        "internal: unvalidated dispatch combination {kind}/{profile:?} reached execution"
-                    ),
-                    active_operation_id: None,
-                });
-            }
-        };
+        let action = self.dispatch_action_for(&stored);
+
         let operation_id = stored.view.operation_id.clone();
         self.emit(
             &operation_id,
@@ -972,6 +974,15 @@ impl RuntimeKernel {
             None,
             Some(stored.view.kind.as_str()),
         );
+        if queued {
+            // 排队受理：不立即派发（active 收束时派发）。返回 Accepted——
+            // 调用方知道操作已被受理排队（事件流可观察）。
+            tracing::info!(
+                operation_id,
+                "operation admitted; queued behind active execution (last accepted wins)"
+            );
+            return Ok(AdmissionOutcome::Accepted(stored.view));
+        }
         // 执行派发（server 主循环持有唯一执行权；内核不并发起第二个 worker）。
         (self.dispatch)(action);
         Ok(AdmissionOutcome::Accepted(stored.view))
@@ -1043,6 +1054,26 @@ impl RuntimeKernel {
         }
         if guard.active_operation_id.as_deref() == Some(operation_id) {
             guard.active_operation_id = None;
+            // R02"最后受理生效"：active Succeeded 且无待执行 Stop → 派发
+            // 排队的最新启动请求（失败/取消/未知收束不派发——保护语义优先）
+            if stored.view.state == RuntimeOperationState::Succeeded
+                && guard.pending_stop.is_none()
+                && let Some(queued_id) = guard.pending_restart.take()
+            {
+                match self.store.load_operation(&queued_id) {
+                    Ok(Some(queued)) => {
+                        let action = self.dispatch_action_for(&queued);
+                        self.emit(&queued_id, 1, "dispatched", None, Some("QueuedDispatch"));
+                        (self.dispatch)(action);
+                    }
+                    other => {
+                        tracing::error!(
+                            operation_id = %queued_id,
+                            "load queued operation for dispatch failed: {other:?}"
+                        );
+                    }
+                }
+            }
         }
         if guard.pending_stop.as_deref() == Some(operation_id) {
             guard.pending_stop = None;
@@ -1098,6 +1129,26 @@ impl RuntimeKernel {
         }
         if guard.active_operation_id.as_deref() == Some(operation_id) {
             guard.active_operation_id = None;
+            // R02"最后受理生效"：active Succeeded 且无待执行 Stop → 派发
+            // 排队的最新启动请求（失败/取消/未知收束不派发——保护语义优先）
+            if stored.view.state == RuntimeOperationState::Succeeded
+                && guard.pending_stop.is_none()
+                && let Some(queued_id) = guard.pending_restart.take()
+            {
+                match self.store.load_operation(&queued_id) {
+                    Ok(Some(queued)) => {
+                        let action = self.dispatch_action_for(&queued);
+                        self.emit(&queued_id, 1, "dispatched", None, Some("QueuedDispatch"));
+                        (self.dispatch)(action);
+                    }
+                    other => {
+                        tracing::error!(
+                            operation_id = %queued_id,
+                            "load queued operation for dispatch failed: {other:?}"
+                        );
+                    }
+                }
+            }
         }
         if guard.pending_stop.as_deref() == Some(operation_id) {
             guard.pending_stop = None;
@@ -1229,6 +1280,57 @@ impl RuntimeKernel {
             .unwrap_or(false)
     }
 
+    /// 受理请求 → 执行派发动作映射（admit 与排队派发共用；组合已由
+    /// 受理前置校验收窄，防御臂 fail-fast）。
+    fn dispatch_action_for(&self, stored: &StoredOperation) -> DispatchAction {
+        match (&stored.request.kind, &stored.request.profile) {
+            (
+                RuntimeOperationKind::Deploy,
+                shared_types::RunProfileInput::Artifact {
+                    artifact: shared_types::ArtifactInput::Url { url, sha256 },
+                },
+            ) => DispatchAction::DeployArtifact {
+                operation_id: stored.view.operation_id.clone(),
+                url: url.clone(),
+                sha256: sha256.clone(),
+            },
+            (
+                RuntimeOperationKind::Deploy,
+                shared_types::RunProfileInput::Artifact {
+                    artifact: shared_types::ArtifactInput::ArtifactId { artifact_id },
+                },
+            ) => DispatchAction::DeployLocalArtifact {
+                operation_id: stored.view.operation_id.clone(),
+                artifact_id: artifact_id.clone(),
+                sha256: None,
+            },
+            (RuntimeOperationKind::Stop, _) => DispatchAction::StopBusiness {
+                operation_id: stored.view.operation_id.clone(),
+            },
+            (
+                RuntimeOperationKind::Start | RuntimeOperationKind::Restart,
+                shared_types::RunProfileInput::Source { .. },
+            ) => DispatchAction::OrchestrateSource {
+                operation_id: stored.view.operation_id.clone(),
+                dev_profile: true,
+                pg: stored
+                    .request
+                    .run_config
+                    .as_ref()
+                    .and_then(|config| config.pg.clone()),
+            },
+            (kind, profile) => {
+                // 防御纵深：受理前置校验已拒绝未支持组合
+                tracing::error!(
+                    "internal: dispatch mapping reached for unvalidated combination                      {kind}/{profile:?}"
+                );
+                DispatchAction::StopBusiness {
+                    operation_id: stored.view.operation_id.clone(),
+                }
+            }
+        }
+    }
+
     fn emit(
         &self,
         operation_id: &str,
@@ -1306,7 +1408,7 @@ impl RuntimeKernel {
 mod tests {
     use super::*;
     use shared_types::{
-        ArtifactInput, ERR_OPERATION_ID_CONFLICT, ERR_OPERATION_IN_PROGRESS, ERR_RECOVERY_REQUIRED,
+        ArtifactInput, ERR_OPERATION_ID_CONFLICT, ERR_RECOVERY_REQUIRED,
         ERR_REVISION_MISMATCH, ERR_RUNTIME_INSTANCE_MISMATCH, RunProfileInput,
         RuntimeOperationKind, RuntimeOperationRequest,
     };
@@ -1349,6 +1451,71 @@ mod tests {
         let store = open_store(&workspace);
         let identity = identity();
         RuntimeKernel::new(store, identity, Box::new(|_| {}))
+    }
+
+    /// R02"最后受理生效"：active 执行期间 A→B→C 三连受理——B 被 C 覆盖
+    /// （Cancelled/ERR_SUPERSEDED），active Succeeded 后 C 派发（不重试忙拒）。
+    #[tokio::test]
+    async fn last_accepted_start_wins_and_supersedes_queued() {
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<DispatchAction>>> = Default::default();
+        let sink = captured.clone();
+        let (dir, _keep) = temp_store();
+        let workspace = dir.path().join("workspace");
+        let kernel = RuntimeKernel::new(
+            open_store(&workspace),
+            identity(),
+            Box::new(move |action| {
+                sink.lock().unwrap().push(action);
+            }),
+        );
+        // active 执行中（op-1 占 active 槽）
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-1"))
+            .await
+            .expect("admit op-1");
+        // A 排队
+        kernel
+            .admit(request(RuntimeOperationKind::Restart, "op-a"))
+            .await
+            .expect("admit op-a");
+        // B 排队（覆盖 A——A 收束 Superseded）
+        kernel
+            .admit(request(RuntimeOperationKind::Restart, "op-b"))
+            .await
+            .expect("admit op-b");
+        let superseded = kernel
+            .store
+            .load_operation("op-a")
+            .expect("load")
+            .expect("stored");
+        assert_eq!(superseded.view.state, RuntimeOperationState::Cancelled);
+        assert_eq!(
+            superseded.view.error_code.as_deref(),
+            Some("ERR_SUPERSEDED")
+        );
+        // active Succeeded → 最新排队者（op-b）派发
+        kernel
+            .finish("op-1", RuntimeOperationState::Succeeded, None, None, 2)
+            .await
+            .expect("finish op-1");
+        let actions = captured.lock().unwrap();
+        let dispatched: Vec<&str> = actions
+            .iter()
+            .filter_map(|action| match action {
+                DispatchAction::OrchestrateSource { operation_id, .. } => {
+                    Some(operation_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            dispatched.contains(&"op-b"),
+            "latest queued must dispatch after active success: {dispatched:?}"
+        );
+        assert!(
+            !dispatched.contains(&"op-a"),
+            "superseded must not dispatch: {dispatched:?}"
+        );
     }
 
     /// R03：ArtifactId 制品部署派发（owner 侧激活——不经网络下载）。
@@ -1595,19 +1762,35 @@ mod tests {
             .admit(request(RuntimeOperationKind::Start, "op-1"))
             .await
             .expect("admit start");
-        // start/restart/deploy 在 active 期间被拒（带进行中 ID；busy 检查
-        // 在 profile 组合校验之后——用已实现组合触发 busy 分支）
-        let rejection = kernel
+        // R02"最后受理生效"后：active 期间的 start/restart/deploy 进排队槽
+        // （不再 busy 拒）；旧断言的拒绝语义由 pending_stop 场景与恢复保护
+        // 承担。本测试改锁排队语义（详见 last_accepted_start_wins 测试）。
+        // stop 可受理（意图屏障），且推进 revision；排队者被 stop 覆盖收束
+        kernel
             .admit(request_deploy_url("op-2"))
             .await
-            .expect_err("busy");
-        assert_eq!(rejection.code, ERR_OPERATION_IN_PROGRESS);
-        assert_eq!(rejection.active_operation_id.as_deref(), Some("op-1"));
-        // stop 可受理（意图屏障），且推进 revision
+            .expect("deploy admitted into queue");
+        let queued_view = kernel
+            .store
+            .load_operation("op-2")
+            .expect("load")
+            .expect("stored");
+        assert_eq!(queued_view.view.state, RuntimeOperationState::Accepted);
         kernel
             .admit(request(RuntimeOperationKind::Stop, "op-stop"))
             .await
             .expect("stop admitted during active");
+        // 排队者已被停止意图覆盖（Cancelled/ERR_SUPERSEDED——不复活）
+        let superseded = kernel
+            .store
+            .load_operation("op-2")
+            .expect("load")
+            .expect("stored");
+        assert_eq!(superseded.view.state, RuntimeOperationState::Cancelled);
+        assert_eq!(
+            superseded.view.error_code.as_deref(),
+            Some("ERR_SUPERSEDED")
+        );
         let (_desired, revision) = kernel.store.load_desired().expect("desired");
         assert_eq!(revision, 1);
         // 原操作与 stop 均收束后，stop 推进的 revision 使旧 revision 部署提交被拒
