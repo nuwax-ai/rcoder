@@ -43,9 +43,12 @@ pub struct AppService {
     /// 这是**操作副作用的临时缓存**（非业务元数据）：delete 时需要知道曾注册过哪些端口
     /// 才能清理 Pingora backend。rcoder 重启后丢失可接受（Docker 模式定位为开发环境）。
     pub(crate) pingora_ports: DashMap<String, Vec<u16>>,
-    /// 同一 rcoder 进程内按 app 串行化 release 操作。PVC 文件锁继续负责跨进程互斥；
-    /// 先等异步锁可避免同 app 的并发请求长期占用 Tokio blocking 线程等待 flock。
-    pub(crate) release_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// 进程内 per-(app, scope) 发布锁（create/update/start-deploy/delete 串行化）。
+    /// scope 维度使 dev 存储控制不与 prod 执行互相排队；先等异步锁可避免同 app
+    /// 的并发请求长期占用 Tokio blocking 线程等待 flock；跨进程/跨副本的排他由
+    /// 数据库受理的槽位矩阵保证，这里只是进程内公平性。
+    pub(crate) release_locks:
+        DashMap<(String, shared_types::UserAppOperationScope), Arc<tokio::sync::Mutex<()>>>,
     /// Persistent application identity, lifecycle and metadata; never an
     /// in-memory authority or a best-effort fallback after a storage failure.
     pub(crate) metadata: AppMetadataStore,
@@ -160,7 +163,7 @@ impl AppService {
         app_id: &str,
         scope: shared_types::UserAppOperationScope,
     ) -> AppResult<AppOperationGuard> {
-        let lock = match self.release_locks.entry(app_id.to_owned()) {
+        let lock = match self.release_locks.entry((app_id.to_owned(), scope)) {
             dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 let lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -178,8 +181,8 @@ impl AppService {
     ) -> AppResult<AppOperationGuard> {
         let lock = self
             .release_locks
-            .entry(app_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .entry((app_id.to_owned(), shared_types::UserAppOperationScope::Prod))
+            .or_default()
             .clone();
         let process = lock.try_lock_owned().map_err(|_| {
             AppOperationError::Conflict("application operation is in progress".into())
@@ -188,12 +191,15 @@ impl AppService {
     }
 
     /// 锁条目无人持有（strong_count==1，仅 map 自身）时移除，防 DashMap 无界增长。
+    /// 清理该 app 全部 scope 的条目。
     pub(crate) fn remove_unused_process_release_lock(&self, app_id: &str) {
-        if let dashmap::mapref::entry::Entry::Occupied(entry) =
-            self.release_locks.entry(app_id.to_owned())
-            && Arc::strong_count(entry.get()) == 1
-        {
-            entry.remove();
+        for scope in shared_types::UserAppOperationScope::ALL {
+            if let Some(entry) = self.release_locks.get(&(app_id.to_owned(), scope))
+                && Arc::strong_count(entry.value()) == 1
+            {
+                drop(entry);
+                self.release_locks.remove(&(app_id.to_owned(), scope));
+            }
         }
     }
 }

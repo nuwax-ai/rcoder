@@ -38,7 +38,10 @@ impl AppService {
         // 409 让调用方稍后重试。stop/restart/delete 外部控制路径同为快失败语义；
         // start（无 url）与内部回收器保持排队等待。
         // 无并发发布时锁条目可能不存在 → entry 建立并立刻拿到（try 必成功）。
-        let lock_arc = match self.release_locks.entry(app_id.to_owned()) {
+        let lock_arc = match self
+            .release_locks
+            .entry((app_id.to_owned(), shared_types::UserAppOperationScope::Prod))
+        {
             dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 let lock = Arc::new(tokio::sync::Mutex::new(()));

@@ -589,7 +589,10 @@ async fn kubernetes_waiting_acquire_polls_until_lease_released() {
     runtime.lease_held.store(true, Ordering::SeqCst);
     let process = service
         .release_locks
-        .entry("k8swait".to_owned())
+        .entry((
+            "k8swait".to_owned(),
+            shared_types::UserAppOperationScope::Prod,
+        ))
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
         .lock_owned()

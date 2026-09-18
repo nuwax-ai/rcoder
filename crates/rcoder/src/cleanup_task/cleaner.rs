@@ -233,6 +233,20 @@ impl AgentCleaner {
             .service_type()
             .unwrap_or(ServiceType::WebAgentRunner);
 
+        // 🛡️ scope 围栏：builder 闲置回收不经过生命周期受理，必须显式尊重
+        // 在途 dev/application 操作（Ensure/Restart/StopBuilder、Destroy/ClearDevStorage、
+        // DeleteApplication/PurgeResources）。读失败同样跳过——未知状态不是销毁许可。
+        if service_type == ServiceType::UserappBuilder
+            && builder_fenced_by_active_operations(self.state.userapp_store.as_ref(), project_id)
+                .await
+        {
+            info!(
+                "[cleaner] 🛡️ builder fenced by active userapp operation, skip reaping this round: app_id={}",
+                project_id
+            );
+            return Ok(false);
+        }
+
         // 2. 选择策略
         let strategy: &dyn super::strategies::CleanupStrategy = match service_type {
             ServiceType::WebAgentRunner => &self.rcoder_strategy,
@@ -463,5 +477,100 @@ impl AgentCleaner {
                 }
             }
         }
+    }
+}
+
+/// builder 闲置回收围栏：dev/application 槽位任一在途即不得回收。
+/// 生命周期读取失败按围栏处理——未知操作状态不是销毁许可（fail-closed）。
+pub(crate) async fn builder_fenced_by_active_operations(
+    store: &dyn shared_types::UserAppLifecycleStore,
+    app_id: &str,
+) -> bool {
+    match store.get_application(app_id).await {
+        Ok(Some(app)) => {
+            app.active_operations.dev.is_some() || app.active_operations.application.is_some()
+        }
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(
+                %app_id, %error,
+                "[cleaner] builder lifecycle read failed; treating as fenced"
+            );
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod scope_fence_tests {
+    use super::builder_fenced_by_active_operations;
+    use shared_types::{
+        UserAppAdmission, UserAppAdmissionOutcome, UserAppLifecycleStore as _, UserAppOperationKind,
+    };
+
+    fn request(app_id: &str, kind: UserAppOperationKind) -> UserAppAdmission {
+        UserAppAdmission {
+            runtime_policy_on_success: None,
+            command: None,
+            metadata: None,
+            app_id: app_id.into(),
+            lifecycle_id: None,
+            operation_id: format!("fence-{app_id}-{}", kind_name(kind)),
+            request_id: Some(format!("fence-{app_id}")),
+            request_fingerprint: "a".repeat(64),
+            kind,
+        }
+    }
+
+    fn kind_name(kind: UserAppOperationKind) -> &'static str {
+        match kind {
+            UserAppOperationKind::RestartBuilder => "restart",
+            UserAppOperationKind::Start => "start",
+            UserAppOperationKind::DeleteApplication => "delete",
+            _ => "other",
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_reaping_respects_dev_and_application_scope_fences() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = rcoder_storage::userapp_lifecycle::SqliteUserAppStore::open(
+            &directory.path().join("fence.sqlite3"),
+        )
+        .await
+        .expect("store");
+
+        // 无生命周期记录：不围栏
+        assert!(!builder_fenced_by_active_operations(&store, "fence-unknown").await);
+
+        // 仅有 prod 在途操作：builder 回收不受 prod 域阻塞
+        store.ensure_identity("fence-prod-only").await.unwrap();
+        store
+            .admit(&request("fence-prod-only", UserAppOperationKind::Start))
+            .await
+            .unwrap();
+        assert!(!builder_fenced_by_active_operations(&store, "fence-prod-only").await);
+
+        // dev 在途操作：围栏（cleaner 须跳过本轮）
+        store.ensure_identity("fence-dev").await.unwrap();
+        store
+            .admit(&request("fence-dev", UserAppOperationKind::RestartBuilder))
+            .await
+            .unwrap();
+        assert!(builder_fenced_by_active_operations(&store, "fence-dev").await);
+
+        // application 在途操作：围栏（整体删除优先于回收）
+        store.ensure_identity("fence-whole").await.unwrap();
+        let outcome = store
+            .admit(&request(
+                "fence-whole",
+                UserAppOperationKind::DeleteApplication,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, UserAppAdmissionOutcome::Accepted(_)));
+        assert!(builder_fenced_by_active_operations(&store, "fence-whole").await);
+
+        store.close().await;
     }
 }
