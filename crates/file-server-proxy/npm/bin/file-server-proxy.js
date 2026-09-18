@@ -11,7 +11,10 @@
 //   restart [flags] = stop（容错未运行）+ start（同 flags）
 //
 // start flags：
-//   --policy <userapp_split|all_rust|all_ts>   路由策略（默认 userapp_split）
+//   --policy <all_rust|userapp_split|all_ts|ts_first>
+//                                             路由策略（默认 all_rust——原生
+//                                             标准模式显式 embed；TS 兼容
+//                                             场景显式传值）
 //   --port <N>      代理监听端口（默认 60000）
 //   --rust-port <N> 内嵌 rust file-server 端口（默认 8086）
 //   --ts-port <N>   TS 端口（默认随机分配未占用端口；仅 userapp_split/all_ts 需要 TS）
@@ -59,7 +62,7 @@ function usage() {
   return `file-server-proxy ${VERSION}
 
 Usage:
-  file-server-proxy start [--policy <userapp_split|all_rust|all_ts|ts_first>]
+  file-server-proxy start [--policy <all_rust|userapp_split|all_ts|ts_first>]
                           [--port <60000>] [--rust-port <8086>]
                           [--ts-port <N>] [--detached]
   file-server-proxy stop [--all]
@@ -88,7 +91,14 @@ function fail(message, code = 1) {
 
 // 轻量 argv 解析（与包内其他脚本一致：零运行时依赖）。非法 flag/值直接报错退出。
 function parseArgs(argv) {
-  const out = { command: null, policy: "userapp_split", detached: false, all: false };
+  // N05：原生标准模式 = 显式 all_rust + embed（启动器默认不再是历史容器
+  // 缺省 userapp_split 的巧合）。容器/TS 兼容场景显式传 --policy。
+  const out = {
+    command: null,
+    policy: process.env.FILE_SERVER_PROXY_POLICY || "all_rust",
+    detached: false,
+    all: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const next = () => {

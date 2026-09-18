@@ -81,3 +81,17 @@ R11 五点全部落地（每点带反例测试）。全 workspace 2334 测试 23
 npm 启动器测试 17/17 通过。proxy 17/17 默认 + 16/16 纯转发形态。
 
 **剩余未完成**：N04（随包 Pingap 三平台产物）、N05（原生标准模式 all_rust+embed 启动器显式化）、N06 JS 侧（npm 全局 PID 状态文件替换为 Rust 实例锁客户端）、N07（独立入口令牌认证层）、N08（file-server 硬编码 sh/ps/taskkill 清理）、N09（分发 sha256/安全解压/错误目标映射）、NT 矩阵三平台原生场景、R02 attach 语义与受理队列。
+
+### 2026-09-18 第五批：N04/N05/N06/N08/N09 完成
+
+| 项 | 提交 | 摘要 |
+|---|---|---|
+| N04 | `d6b3f088` | release-app-cli.yml 增 build-pingap-unix matrix（darwin x64/arm64 + linux-x64，同 rev + tls-rustls + 版本断言）；Unix 平台包双件套（app-cli+pingap）。linux-arm64 暂缺（注释明确，不假完整） |
+| N05 | `81231bbe`+`a61a904e` | 二进制侧：请求 embed 缺能力 → 退出码 2 拒绝（端到端验证双形态）；launcher 侧：默认策略改 all_rust（原生标准模式显式化，env 可覆写） |
+| N06 | `7dc301c4` | Rust 侧跨进程实例锁（host:port 锁域/动态端口独立域/stop 释放/崩溃内核释放）；JS PID 文件降级观察线索 |
+| N08 | `81231bbe` | spawn_override_shell 跨平台（sh/cmd）；dev-inject Windows 显式跳过；ps 扫描语义注释 |
+| N09 | `a61a904e` | Windows ARM64 结构化早拒绝（发布矩阵无产物）；解压参数数组 execFileSync（路径不拼命令字符串） |
+
+**N01–N10 全项已处理**（N07 剩独立入口令牌认证层、N06 剩 JS 启动器改状态查询客户端——子项级残留见各提交说明）。
+
+**剩余未完成**：NT01–NT16 三平台原生场景矩阵实机执行、N07 认证层、R02 attach 语义与受理队列、Compose/K8s 对新批次改动的回归。
