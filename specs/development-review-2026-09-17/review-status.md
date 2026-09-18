@@ -43,3 +43,13 @@
 ### 既有 flaky 记录（非本轮引入）
 
 `serve_restart::rejected_native_serve_sigterm_does_not_clear_previous_active_owner`：空 workspace 二次 serve 偶发相位停在 idle（期望 orchestrating）。基线复现（stash 本轮改动后同条件 5 连跑 2 失败/3 通过，2026-09-18）——恢复分支时序敏感，与本轮 R03/N02 无关。归因待深入（怀疑 stale-owner 恢复判定竞态）；不删断言、不放宽期望。
+
+### 2026-09-18 第二批：N02/R03/R11(部分) 完成
+
+| 项 | 提交 | 摘要 |
+|---|---|---|
+| N02 | `8adc8db2` | 路径护栏三平台统一（字面量根+实际布局根并集、组件化比较）；pingap 运行目录默认 `{log_dir}/pingap`（env 优先）；svc_spec 平台无关断言；Windows symlink 制品结构化拒绝。**Windows 186/186 全绿（原 4 失败清零）**；Linux 207/207 |
+| R03 | `8adc8db2` | Deploy+Artifact(ArtifactId) 受支持组合 → owner 侧激活（共享卷 builds/ 直读不经下载）；平台 `route_artifact_restart`：owner 在=Restart(ArtifactId)（owner 核验后激活）；拒绝=`.run` 原样（反例锁定 marker 保留+无 .previous+wire 形态）；无 owner=本地 activate+spawn 不变 |
+| R11(批1) | `62947c6e` | xmlrpc RpcFault typed downcast（faultCode 10 优先+措辞兜底；网络错误文案反例不再误判）；DownloadError::Http 结构化 status（is_retryable 按码；URL 文案反例）；InstallFailed 死变体删除 |
+
+**仍未完成**：R02（CLI 转交/最后受理生效）、R11 剩余三处（cluster_cache not_found / chat timed-out / Vite PortInUse 链）、B05（Secret 轮换 rollout）、N03–N10（proxy 原生形态/端口/随包/分发）、NT 矩阵大部。
