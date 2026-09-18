@@ -356,7 +356,7 @@ mod tests {
             r#"{"workspaceType":"project","projectId":17,"userId":5,"tenantId":9,"message":"m"}"#,
         )
         .expect("flatten + integer ids must deserialize");
-        assert_eq!(body.base.workspace_type, "project");
+        assert_eq!(body.base.workspace_type.as_deref(), Some("project"));
         assert_eq!(body.base.project_id.as_deref(), Some("17"));
         assert_eq!(body.base.user_id.as_deref(), Some("5"));
         assert_eq!(body.base.tenant_id.as_deref(), Some("9"));
@@ -367,7 +367,7 @@ mod tests {
             r#"{"workspaceType":"computer","userId":"u","cId":"c","message":"m"}"#,
         )
         .expect("string ids must still deserialize");
-        assert_eq!(body.base.workspace_type, "computer");
+        assert_eq!(body.base.workspace_type.as_deref(), Some("computer"));
         assert_eq!(body.base.user_id.as_deref(), Some("u"));
         assert_eq!(body.base.c_id.as_deref(), Some("c"));
 

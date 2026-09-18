@@ -371,12 +371,12 @@ async fn userapp_dev_git_service_context() {
         format!("HTTP {}", resp.status()),
     );
 
-    // git 调用统一 body 通道：serviceType=taskAgent + workspacePath 绑定激活
-    // serviceContext；workspaceType 传 pageApp（老规则回落必 400 缺 projectId——
-    // 200 即 serviceContext 覆盖老规则的证明，不依赖 {CWS} 目录存在性）
+    // git 调用统一 body 通道：workspaceType=taskAgent（会话分支）+ workspacePath
+    // 绑定直接定位（v1.4.7：绑定是会话分支内定位最高优先；serviceType 为已
+    // 无效的旧字段，随请求在场验证其不干扰定位）
     let git_body = |extra: Value| -> Value {
         let mut body = json!({
-            "workspaceType": "pageApp",
+            "workspaceType": "taskAgent",
             "serviceType": "taskAgent",
             "workspacePath": bound,
             "userId": user,
@@ -392,7 +392,7 @@ async fn userapp_dev_git_service_context() {
 
     let (si, bi) = post_json(&env, "/api/git/init", git_body(json!({}))).await;
     report.assert_hard(
-        "git init：serviceContext（workspacePath 通道）覆盖 workspaceType 老规则",
+        "git init：会话分支 workspacePath 绑定直接定位绑定目录",
         si.is_success() && bi["success"].as_bool() == Some(true),
         format!("HTTP {si}, {}", trunc(&bi, 120)),
     );
@@ -425,7 +425,7 @@ async fn userapp_dev_git_service_context() {
     let resp = env
         .http
         .get(format!(
-            "{}/api/git/status?workspaceType=pageApp&serviceType=taskAgent&workspacePath={bound}&userId={user}&cId={app}",
+            "{}/api/git/status?workspaceType=taskAgent&serviceType=taskAgent&workspacePath={bound}&userId={user}&cId={app}",
             env.rcoder
         ))
         .timeout(Duration::from_secs(30))
@@ -435,14 +435,36 @@ async fn userapp_dev_git_service_context() {
     let ss = resp.status();
     let bs: Value = resp.json().await.unwrap_or(Value::Null);
     report.assert_hard(
-        "git status：GET query 通道 serviceContext 命中同一定位",
+        "git status：GET query 通道 workspacePath 绑定命中同一定位",
         ss.is_success() && bs["success"].as_bool() == Some(true),
         format!("HTTP {ss}, {}", trunc(&bs, 120)),
     );
 
-    // userapp 默认布局语义锁：主 pod 对 per-app 开发卷无可见性 → serviceContext
-    // 分支 404 "Workspace does not exist"（与 TS 主 pod 进程同构；若误回落老
-    // 规则 taskAgent 则是另一文案 "Computer workspace does not exist"）
+    // v1.4.7 优先级反转锁：workspaceType=pageApp 走项目隔离模型，serviceContext
+    // 定位参数（workspacePath/appId）不再能覆盖 pageApp——pageApp + workspacePath
+    // 缺 projectId 必 400（v1.4.6 形态会激活绑定错报 200，破坏性操作落错目录）
+    let (sp, bp) = post_json(
+        &env,
+        "/api/git/init",
+        json!({
+            "workspaceType": "pageApp",
+            "workspacePath": bound,
+            "userId": user, "cId": app,
+        }),
+    )
+    .await;
+    let pageapp_requires_project = sp.as_u16() == 400
+        && bp["error"]["type"].as_str() == Some("VALIDATION_ERROR")
+        && bp["error"]["message"].as_str() == Some("pageApp mode requires projectId");
+    report.assert_hard(
+        "v1.4.7 锁：pageApp 优先于 serviceContext 定位参数（缺 projectId 必 400）",
+        pageapp_requires_project,
+        format!("HTTP {sp}, {}", trunc(&bp, 120)),
+    );
+
+    // taskAgent 会话分支定位默认 {CWS}/{userId}/{cId}：主 pod 对该目录无可见性
+    // → 404 "Workspace does not exist"（appId 在场不改变 taskAgent 定位——
+    // 与 TS 主 pod 进程同构行为锁）
     let (su, bu) = post_json(
         &env,
         "/api/git/init",
@@ -455,12 +477,12 @@ async fn userapp_dev_git_service_context() {
     let userapp_no_volume =
         su.as_u16() == 404 && bu["error"]["message"].as_str() == Some("Workspace does not exist");
     report.assert_hard(
-        "userapp 默认布局在主 pod 不可达 → 404 Workspace does not exist（TS 同构锁）",
+        "taskAgent 默认布局在主 pod 不可达 → 404 Workspace does not exist（TS 同构锁）",
         userapp_no_volume,
         format!("HTTP {su}, {}", trunc(&bu, 120)),
     );
 
-    // 负例：serviceContext 激活但缺 userId/cId → 400 分支专属文案
+    // 负例：会话分支缺 userId/cId → 400 分支专属文案
     let resp = env
         .http
         .get(format!(
@@ -475,9 +497,10 @@ async fn userapp_dev_git_service_context() {
     let bn: Value = resp.json().await.unwrap_or(Value::Null);
     let rejected = sn.as_u16() == 400
         && bn["error"]["type"].as_str() == Some("VALIDATION_ERROR")
-        && bn["error"]["message"].as_str() == Some("serviceContext mode requires userId and cId");
+        && bn["error"]["message"].as_str()
+            == Some("conversation workspace mode requires userId and cId");
     report.assert_hard(
-        "负例：serviceContext 激活但缺 userId/cId → 400 + 分支专属文案",
+        "负例：会话分支缺 userId/cId → 400 + 分支专属文案（v1.4.7 文案）",
         rejected,
         format!("HTTP {sn}, {}", trunc(&bn, 120)),
     );
@@ -531,8 +554,8 @@ async fn userapp_dev_git_service_context() {
     );
 
     // ── header 通道：X-Service-Type/X-App-Id 拦截转发 → dev 容器内嵌
-    // file-server 的 git 域 serviceContext 落开发卷（agent-runner 镜像须含
-    // 本分支；dev-hot 只更主 pod 时此段撞容器旧代码 404——环境前置说明）
+    // file-server 的 git 域定位（agent-runner 镜像须含本分支；dev-hot 只更
+    // 主 pod 时此段撞容器旧代码 404——环境前置说明）
     if !create_workspace(&env, &report, &app, user).await {
         assert_hard_all(report).await;
         cleanup_builder(user, &app);
@@ -589,11 +612,11 @@ async fn userapp_dev_git_service_context() {
 /// Java 完整出站形态的 git 全链：`applyUserAppHeaders` 三件套（x-service-type/
 /// x-workspace-type/x-app-id）与 `applyServiceParams` 双份定位参数（body/query 的
 /// workspaceType=userApp/serviceType/appId/workspacePath）并存 → init/add/commit/
-/// status/log 全通。锁三点：①多源并存下 serviceContext 分支覆盖 workspaceType
-/// 老规则（userApp 不在 pageApp|taskAgent 白名单，回落必 400，200 即覆盖证明）；
+/// status/log 全通。锁三点：①v1.4.7 四值词表 + workspacePath 绑定：userApp 是
+/// 合法会话类型、绑定直接定位（v1.4.6"白名单外必 400"论证已随上游修复作废）；
 /// ②`/api/git/log` 走统一收口（TS 侧 6321f7e 唯独漏传 serviceContext 的端点，
 /// 同形态在 TS 上 400——Rust 全端点收口的回归锁）；③commit 数据面回读：log 读回
-/// 刚提交的 message（git 操作真实作用于 app 开发卷，非仅 HTTP 200）。
+/// 刚提交的 message（git 操作真实作用于 workspacePath 指向工作区，非仅 HTTP 200）。
 #[tokio::test]
 async fn userapp_dev_git_full_outbound_shape() {
     rcoder_e2e::common::cross_bin_lock::acquire();
@@ -659,7 +682,8 @@ async fn userapp_dev_git_full_outbound_shape() {
         format!("HTTP {sg}, {}", trunc(&bg, 120)),
     );
 
-    // git init：老规则白名单不含 userApp（回落必 400）——200 即 serviceContext 覆盖证明
+    // git init：userApp 会话类型 + workspacePath 绑定（v1.4.7 四值词表；
+    // workspaceType 已放宽可选，本形态显式携带——多源并存以 header 优先）
     let resp = java_headers(
         env.http
             .post(format!("{}/api/git/init", env.rcoder))
@@ -672,7 +696,7 @@ async fn userapp_dev_git_full_outbound_shape() {
     let si = resp.status();
     let bi: Value = resp.json().await.unwrap_or(Value::Null);
     report.assert_hard(
-        "git init：多源并存 serviceContext 覆盖 workspaceType=userApp 老规则",
+        "git init：userApp 会话分支 + workspacePath 绑定定位（v1.4.7 四值词表）",
         si.is_success()
             && bi["success"].as_bool() == Some(true)
             && bi["logId"].as_str() == Some(&log_id),
@@ -765,6 +789,30 @@ async fn userapp_dev_git_full_outbound_shape() {
         "git log：统一收口命中（TS /log 漏 serviceContext 端点锁）+ commits 读回刚提交 message",
         log_hit,
         format!("HTTP {sl}, {}", trunc(&bl, 160)),
+    );
+
+    // v1.4.7 fail-fast 锁：workspaceType 垃圾值（header 通道）且 body 不带
+    // workspaceType（可选参数形态，顺带锁放宽后反序列化正常）→ 400 拒绝，
+    // 不静默回落缺省 taskAgent 布局（破坏性 git 操作不得因类型打错字落错工作区）
+    let resp = env
+        .http
+        .post(format!("{}/api/git/init", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-Workspace-Type", "not-a-type")
+        .json(&json!({ "userId": user, "cId": cid }))
+        .send()
+        .await
+        .expect("garbage workspace type");
+    let sx = resp.status();
+    let bx: Value = resp.json().await.unwrap_or(Value::Null);
+    let garbage_rejected = sx.as_u16() == 400
+        && bx["error"]["type"].as_str() == Some("VALIDATION_ERROR")
+        && bx["error"]["message"].as_str()
+            == Some("workspaceType must be one of userApp, pageApp, normalProject, taskAgent");
+    report.assert_hard(
+        "v1.4.7 锁：垃圾 workspaceType 400（body 可选形态 + 定位 fail-fast）",
+        garbage_rejected,
+        format!("HTTP {sx}, {}", trunc(&bx, 120)),
     );
 
     assert_hard_all(report).await;

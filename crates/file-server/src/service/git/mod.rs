@@ -23,7 +23,7 @@ use gix::refs::{FullName, Target};
 use gix::{Repository, init, open};
 
 use crate::error::{AppError, AppResult};
-use crate::workspace::{ComputerContext, ProjectContext, WorkspaceResolver};
+use crate::workspace::{ProjectContext, WorkspaceResolver};
 
 /// `.gitignore` 默认条目 (对齐 nuwax appConfig GIT_GITIGNORE_ENTRIES)。
 pub const DEFAULT_GITIGNORE_ENTRIES: &[&str] = &[
@@ -54,78 +54,22 @@ pub const DEFAULT_GITIGNORE_ENTRIES: &[&str] = &[
     "package-lock.json",
 ];
 
-/// workspaceType 分发目标 (对齐 nuwax resolveAndCheck)。
-pub enum GitTarget {
-    PageApp {
-        project_id: String,
-        path: PathBuf,
-    },
-    TaskAgent {
-        user_id: String,
-        cid: String,
-        path: PathBuf,
-    },
-}
-
-impl GitTarget {
-    pub fn path(&self) -> &Path {
-        match self {
-            GitTarget::PageApp { path, .. } | GitTarget::TaskAgent { path, .. } => path,
-        }
-    }
-    pub fn log_id(&self) -> String {
-        match self {
-            GitTarget::PageApp { project_id, .. } => project_id.clone(),
-            GitTarget::TaskAgent { user_id, cid, .. } => format!("computer:{user_id}:{cid}"),
-        }
-    }
-}
-
-/// 解析 workspaceType + 路径 (对齐 nuwax resolveAndCheck)。
-pub async fn resolve_target(
+/// pageApp 项目隔离模型解析（对齐 nuwax a29cbc0/1.4.7 `resolveAndCheck`
+/// pageApp 分支——归一类型为 pageApp 时项目模型优先，serviceContext 定位
+/// 参数不再能覆盖）：projectId 必填 → `resolver.resolve_project` → 目录
+/// 必须已存在（git 操作只面向已存在工作区，不创建）。
+pub async fn resolve_page_project(
     resolver: &dyn WorkspaceResolver,
-    workspace_type: &str,
-    project_ctx: Option<&ProjectContext>,
-    computer_ctx: Option<&ComputerContext>,
-) -> AppResult<GitTarget> {
-    match workspace_type {
-        "taskAgent" => {
-            let ctx = computer_ctx
-                .ok_or_else(|| AppError::validation("taskAgent mode requires userId and cId"))?;
-            if ctx.user_id.trim().is_empty() || ctx.cid.trim().is_empty() {
-                return Err(AppError::validation(
-                    "taskAgent mode requires userId and cId",
-                ));
-            }
-            let path = resolver.resolve_computer(ctx).await?;
-            if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-                return Err(AppError::resource("Computer workspace does not exist"));
-            }
-            Ok(GitTarget::TaskAgent {
-                user_id: ctx.user_id.clone(),
-                cid: ctx.cid.clone(),
-                path,
-            })
-        }
-        "pageApp" => {
-            let ctx = project_ctx
-                .ok_or_else(|| AppError::validation("pageApp mode requires projectId"))?;
-            if ctx.project_id.trim().is_empty() {
-                return Err(AppError::validation("pageApp mode requires projectId"));
-            }
-            let path = resolver.resolve_project(ctx).await?;
-            if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-                return Err(AppError::resource("Project does not exist"));
-            }
-            Ok(GitTarget::PageApp {
-                project_id: ctx.project_id.clone(),
-                path,
-            })
-        }
-        _ => Err(AppError::validation(
-            "workspaceType is required and must be pageApp or taskAgent",
-        )),
+    ctx: &ProjectContext,
+) -> AppResult<PathBuf> {
+    if ctx.project_id.trim().is_empty() {
+        return Err(AppError::validation("pageApp mode requires projectId"));
     }
+    let path = resolver.resolve_project(ctx).await?;
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Err(AppError::resource("Project does not exist"));
+    }
+    Ok(path)
 }
 
 /// 是否已是 git 仓库 (对齐 nuwax isGitRepo)。
@@ -261,7 +205,7 @@ mod tests {
     use crate::workspace::LocalWorkspaceResolver;
 
     #[tokio::test]
-    async fn resolve_target_rejects_missing_workspace_without_creating_it() {
+    async fn resolve_page_project_rejects_missing_workspace_without_creating_it() {
         let root =
             std::env::temp_dir().join(format!("file-server-git-resolve-{}", std::process::id()));
         let project_root = root.join("projects");
@@ -274,7 +218,7 @@ mod tests {
             isolation_type: None,
         };
 
-        let error = match resolve_target(&resolver, "pageApp", Some(&context), None).await {
+        let error = match resolve_page_project(&resolver, &context).await {
             Ok(_) => panic!("missing workspace must be rejected"),
             Err(error) => error,
         };

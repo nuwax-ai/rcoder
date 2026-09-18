@@ -345,12 +345,13 @@
   ],
   "userapp_dev_git_service_context": [
     "前置：generate-file 经 workspacePath 绑定目录造 git 工作区文件",
-    "git init：serviceContext（workspacePath 通道）覆盖 workspaceType 老规则",
+    "git init：会话分支 workspacePath 绑定直接定位绑定目录",
     "git add：serviceContext 定位下暂存文件",
     "git commit：serviceContext 定位下提交",
-    "git status：GET query 通道 serviceContext 命中同一定位",
-    "userapp 默认布局在主 pod 不可达 → 404 Workspace does not exist（TS 同构锁）",
-    "负例：serviceContext 激活但缺 userId/cId → 400 + 分支专属文案",
+    "git status：GET query 通道 workspacePath 绑定命中同一定位",
+    "v1.4.7 锁：pageApp 优先于 serviceContext 定位参数（缺 projectId 必 400）",
+    "taskAgent 默认布局在主 pod 不可达 → 404 Workspace does not exist（TS 同构锁）",
+    "负例：会话分支缺 userId/cId → 400 + 分支专属文案（v1.4.7 文案）",
     "computer body 通道：serviceType=normalProject 无 header 仍按共享工作区定位",
     "computer query 通道：同一定位读回（get-file-list 见 np-ctx.txt）",
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
@@ -360,11 +361,12 @@
   "userapp_dev_git_full_outbound_shape": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
     "前置：generate-file Java 形态（三 header+双份参数）落 app 开发卷",
-    "git init：多源并存 serviceContext 覆盖 workspaceType=userApp 老规则",
+    "git init：userApp 会话分支 + workspacePath 绑定定位（v1.4.7 四值词表）",
     "git add：同定位暂存 app 开发卷文件",
     "git commit：同定位提交",
     "git status：GET query 双份参数命中同一定位",
-    "git log：统一收口命中（TS /log 漏 serviceContext 端点锁）+ commits 读回刚提交 message"
+    "git log：统一收口命中（TS /log 漏 serviceContext 端点锁）+ commits 读回刚提交 message",
+    "v1.4.7 锁：垃圾 workspaceType 400（body 可选形态 + 定位 fail-fast）"
   ],
   "userapp_dev_new_endpoint_body_query_locate": [
     "A0：空 workspace dev/restart 快速失败 ERR_WORKSPACE_EMPTY",
