@@ -189,14 +189,20 @@ impl WorkspaceRuntime for MockRuntime {
     }
 }
 
-struct MockOperationLease(Arc<AtomicBool>, String);
+struct MockOperationLease(Arc<AtomicBool>, String, ServiceType);
 #[async_trait]
 impl shared_types::AppOperationLease for MockOperationLease {
     fn receipt(&self) -> Option<shared_types::UserAppOperationLeaseReceipt> {
+        let family = self.2.clone();
+        let prefix = if family == ServiceType::UserappBuilder {
+            "builder"
+        } else {
+            "prod"
+        };
         Some(shared_types::UserAppOperationLeaseReceipt::Kubernetes {
-            service_type: ServiceType::Userapp,
+            service_type: family,
             namespace: "test".into(),
-            name: format!("rcoder-operation-prod-{}", self.1),
+            name: format!("rcoder-operation-{prefix}-{}", self.1),
             uid: format!("lease-{}", self.1),
             resource_version: "1".into(),
             token: "test-operation".into(),
@@ -240,6 +246,31 @@ impl UserAppDeploymentRuntime for MockRuntime {
         }
     }
 
+    async fn acquire_builder_family_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        if self
+            .lease_held
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(ContainerRuntimeError::OperationInProgress(Box::new(
+                shared_types::UserAppOperationInProgress {
+                    app_id: app_id.into(),
+                    service_type: ServiceType::UserappBuilder,
+                    resource_name: format!("rcoder-operation-builder-{app_id}"),
+                    operation_id: None,
+                },
+            )));
+        }
+        Ok(Box::new(MockOperationLease(
+            self.lease_held.clone(),
+            app_id.into(),
+            ServiceType::UserappBuilder,
+        )))
+    }
+
     async fn acquire_app_operation(
         &self,
         _app_id: &str,
@@ -262,6 +293,7 @@ impl UserAppDeploymentRuntime for MockRuntime {
         Ok(Some(Box::new(MockOperationLease(
             self.lease_held.clone(),
             _app_id.into(),
+            ServiceType::Userapp,
         ))))
     }
 

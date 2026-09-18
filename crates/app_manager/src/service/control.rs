@@ -298,7 +298,18 @@ impl super::AppService {
         operation_id: Option<&str>,
     ) -> AppResult<Option<shared_types::UserAppOperationView>> {
         let app = self.get_lifecycle(app_id).await?;
-        let Some(id) = operation_id.or(app.current_operation_id.as_deref()) else {
+        // No explicit id: fall back to the first occupied scope slot in a fixed
+        // order (application, then dev, then prod). Reads are never blocked by
+        // another environment's busy slot.
+        let id: Option<&str> = match operation_id {
+            Some(id) => Some(id),
+            None => app
+                .active_operations
+                .occupied_scopes()
+                .find_map(|scope| app.active_operations.slot(scope))
+                .map(String::as_str),
+        };
+        let Some(id) = id else {
             return Ok(None);
         };
         let operation = self

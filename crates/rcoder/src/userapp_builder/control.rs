@@ -84,7 +84,7 @@ pub(crate) async fn execute(
                 record
             }
             UserAppAdmissionOutcome::Existing(record) => {
-                return Err(UserAppStoreError::OperationInProgress(record.operation_id).into());
+                return Err(UserAppStoreError::OperationInProgress(record.blocker()).into());
             }
         };
         execute_pending(&owned, record, &instance, restart).await

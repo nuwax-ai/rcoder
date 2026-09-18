@@ -1661,7 +1661,7 @@ async fn update_commits_a_durable_operation_matching_runtime_context() {
         .expect("read identity")
         .expect("identity");
     assert_eq!(app.name.as_deref(), Some("updated-name"));
-    assert!(app.current_operation_id.is_none());
+    assert!(app.active_operations.is_empty());
 }
 
 #[tokio::test]
@@ -2279,8 +2279,9 @@ async fn failed_purge_retains_both_runtime_and_registry_deletion_receipts() {
         .get_operation(
             app_id,
             identity
-                .current_operation_id
-                .as_deref()
+                .active_operations
+                .slot(shared_types::UserAppOperationScope::Application)
+                .map(String::as_str)
                 .expect("unfinished purge"),
         )
         .await
@@ -3275,7 +3276,10 @@ async fn pending_full_delete_recovery_owns_deleting_lifecycle_until_completion()
             shared_types::UserAppLifecycleState::Deleting
         );
         assert_eq!(
-            identity.current_operation_id.as_deref(),
+            identity
+                .active_operations
+                .slot(pending.scope)
+                .map(String::as_str),
             Some(pending.operation_id.as_str())
         );
 
@@ -3325,7 +3329,7 @@ async fn pending_full_delete_recovery_owns_deleting_lifecycle_until_completion()
                 checkpoint.stage,
                 shared_types::UserAppDeletionStage::DevelopmentRemoved
             );
-            assert!(identity.current_operation_id.is_none());
+            assert!(identity.active_operations.is_empty());
         }
         let repeated = service.resume_pending_control(&pending).await;
         if cleanup_fails {

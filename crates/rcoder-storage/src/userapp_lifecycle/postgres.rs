@@ -44,5 +44,5 @@ implement_store!(
     PgUserAppStore,
     "BEGIN",
     "SELECT record FROM userapp_lifecycles WHERE app_id=$1 FOR UPDATE",
-    "SELECT l.record, o.record FROM userapp_lifecycles l LEFT JOIN userapp_operations o ON o.operation_id=(l.record::jsonb ->> 'current_operation_id') AND o.app_id=l.app_id WHERE l.app_id > $1 ORDER BY l.app_id LIMIT $2"
+    "SELECT l.record, d.record, p.record, a.record FROM userapp_lifecycles l LEFT JOIN userapp_operations d ON d.operation_id=(l.record::jsonb -> 'active_operations' ->> 'dev') AND d.app_id=l.app_id LEFT JOIN userapp_operations p ON p.operation_id=(l.record::jsonb -> 'active_operations' ->> 'prod') AND p.app_id=l.app_id LEFT JOIN userapp_operations a ON a.operation_id=(l.record::jsonb -> 'active_operations' ->> 'application') AND a.app_id=l.app_id WHERE l.app_id > $1 ORDER BY l.app_id LIMIT $2"
 );

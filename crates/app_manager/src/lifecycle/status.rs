@@ -185,7 +185,7 @@ impl AppService {
             for snapshot in page {
                 let identity = snapshot.application;
                 if identity.state != UserAppLifecycleState::Active
-                    || snapshot.operation.is_some_and(|operation| {
+                    || snapshot.operations.iter().any(|operation| {
                         matches!(
                             operation.kind,
                             UserAppOperationKind::DeleteCompute

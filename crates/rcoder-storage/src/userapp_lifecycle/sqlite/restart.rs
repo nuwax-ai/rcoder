@@ -129,7 +129,8 @@ mod tests {
                 .await
                 .expect("application")
                 .expect("identity")
-                .current_operation_id,
+                .active_operations
+                .prod,
             Some(running.operation_id.clone())
         );
         for original in [&pending, &completed] {

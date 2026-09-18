@@ -1,8 +1,9 @@
 //! Pure transitions shared by both SQL backends. No database or runtime I/O.
 use shared_types::{
-    UserAppAdmission, UserAppAdmissionOutcome, UserAppLifecycleRecord,
-    UserAppLifecycleState as AppState, UserAppOperationKind, UserAppOperationProgress,
-    UserAppOperationRecord, UserAppOperationState as OpState, UserAppStoreError as Error,
+    UserAppActiveOperationRecords, UserAppAdmission, UserAppAdmissionOutcome,
+    UserAppLifecycleRecord, UserAppLifecycleState as AppState, UserAppOperationKind,
+    UserAppOperationProgress, UserAppOperationRecord, UserAppOperationScope,
+    UserAppOperationState as OpState, UserAppStoreError as Error,
 };
 
 pub(super) fn identity(app_id: &str) -> Result<UserAppLifecycleRecord, Error> {
@@ -18,7 +19,7 @@ pub(super) fn identity(app_id: &str) -> Result<UserAppLifecycleRecord, Error> {
         tenant_id: None,
         space_id: None,
         created_at: chrono::Utc::now(),
-        current_operation_id: None,
+        active_operations: Default::default(),
     })
 }
 
@@ -29,11 +30,39 @@ pub(super) fn validate_active(app: &UserAppLifecycleRecord) -> Result<(), Error>
     Ok(())
 }
 
+/// Whether the operation id currently occupies any scope slot. Used before the
+/// operation record itself is loaded, preserving the historic error ordering
+/// where an unknown id reports a lifecycle conflict instead of absence.
+pub(super) fn operation_owns_any_slot(app: &UserAppLifecycleRecord, operation_id: &str) -> bool {
+    [
+        UserAppOperationScope::Application,
+        UserAppOperationScope::Dev,
+        UserAppOperationScope::Prod,
+    ]
+    .into_iter()
+    .any(|scope| {
+        app.active_operations
+            .slot(scope)
+            .is_some_and(|slot| slot.as_str() == operation_id)
+    })
+}
+
+/// Whether the operation owns exactly its own scope's slot. A record parked in
+/// the wrong slot fails this check instead of being trusted.
+pub(super) fn slot_matches_operation(
+    app: &UserAppLifecycleRecord,
+    operation: &UserAppOperationRecord,
+) -> bool {
+    app.active_operations
+        .slot(operation.scope)
+        .is_some_and(|slot| slot.as_str() == operation.operation_id.as_str())
+}
+
 pub(super) fn admission(
     app: &mut UserAppLifecycleRecord,
     request: &UserAppAdmission,
     duplicate: Option<UserAppOperationRecord>,
-    active: Option<UserAppOperationRecord>,
+    active: &UserAppActiveOperationRecords,
 ) -> Result<UserAppAdmissionOutcome, Error> {
     if request.runtime_policy_on_success.is_some()
         && !matches!(
@@ -92,6 +121,7 @@ pub(super) fn admission(
             return Err(Error::LifecycleConflict);
         }
         if duplicate.kind != request.kind
+            || duplicate.scope != request.kind.scope()
             || duplicate.command != request.command
             || duplicate.runtime_policy_on_success != request.runtime_policy_on_success
             || duplicate.request_fingerprint != request.request_fingerprint
@@ -104,20 +134,51 @@ pub(super) fn admission(
         return Ok(UserAppAdmissionOutcome::Existing(duplicate));
     }
     validate_active(app)?;
-    if let Some(active) = active {
-        if !active.state.is_terminal()
-            && active.state != OpState::RecoveryRequired
-            && active.kind == UserAppOperationKind::EnsureBuilder
-            && request.kind == active.kind
-            && active.lifecycle_id == app.lifecycle_id
-            && active.request_fingerprint == request.request_fingerprint
-            && active.command == request.command
-            && active.runtime_policy_on_success == request.runtime_policy_on_success
-            && active.admitted_metadata == request.metadata
-        {
-            return Ok(UserAppAdmissionOutcome::Existing(active));
-        }
-        return Err(Error::OperationInProgress(active.operation_id));
+    // Scope is derived from the kind here and nowhere else: clients never
+    // supply it, so no request parameter can bypass the conflict matrix.
+    let scope = request.kind.scope();
+    // Same-kind EnsureBuilder idempotent join exists only inside the dev slot,
+    // and never for an unresolved outcome (RecoveryRequired keeps fencing).
+    if scope == UserAppOperationScope::Dev
+        && let Some(joined) = active.dev.as_ref()
+        && !joined.state.is_terminal()
+        && joined.state != OpState::RecoveryRequired
+        && joined.kind == UserAppOperationKind::EnsureBuilder
+        && request.kind == joined.kind
+        && joined.lifecycle_id == app.lifecycle_id
+        && joined.request_fingerprint == request.request_fingerprint
+        && joined.command == request.command
+        && joined.runtime_policy_on_success == request.runtime_policy_on_success
+        && joined.admitted_metadata == request.metadata
+    {
+        return Ok(UserAppAdmissionOutcome::Existing(joined.clone()));
+    }
+    // Conflict matrix: dev blocks on dev+application, prod on prod+application,
+    // application requires every slot idle. Application-scope blockers surface
+    // first so diagnostics name the operation that fences both environments.
+    let blocks_request = |blocker: UserAppOperationScope| match scope {
+        UserAppOperationScope::Application => true,
+        UserAppOperationScope::Dev => matches!(
+            blocker,
+            UserAppOperationScope::Dev | UserAppOperationScope::Application
+        ),
+        UserAppOperationScope::Prod => matches!(
+            blocker,
+            UserAppOperationScope::Prod | UserAppOperationScope::Application
+        ),
+    };
+    let blocker = [
+        UserAppOperationScope::Application,
+        UserAppOperationScope::Dev,
+        UserAppOperationScope::Prod,
+    ]
+    .into_iter()
+    .filter(|blocker| blocks_request(*blocker))
+    .find_map(|blocker| active.slot(blocker).map(|operation| (blocker, operation)));
+    if let Some((blocker_scope, operation)) = blocker {
+        let mut detail = operation.blocker();
+        detail.scope = blocker_scope;
+        return Err(Error::OperationInProgress(detail));
     }
     if let Some(patch) = &request.metadata {
         patch_metadata(app, patch)?;
@@ -132,6 +193,7 @@ pub(super) fn admission(
         request_id: request.request_id.clone(),
         request_fingerprint: request.request_fingerprint.clone(),
         kind: request.kind,
+        scope,
         state: OpState::Pending,
         revision: 1,
         executor_id: None,
@@ -141,7 +203,8 @@ pub(super) fn admission(
         error_message: None,
         created_at: chrono::Utc::now(),
     };
-    app.current_operation_id = Some(operation.operation_id.clone());
+    app.active_operations
+        .set(scope, Some(operation.operation_id.clone()));
     if operation.kind.ends_lifecycle() {
         app.state = AppState::Deleting;
     }
@@ -157,7 +220,14 @@ pub(super) fn advance(
     {
         return Err(Error::LifecycleConflict);
     }
-    if app.current_operation_id.as_deref() != Some(&operation.operation_id)
+    // The operation must own its own scope's slot. Other scopes' slots are
+    // irrelevant: a concurrent terminal commit elsewhere must not invalidate
+    // this progress.
+    if app
+        .active_operations
+        .slot(operation.scope)
+        .map(String::as_str)
+        != Some(operation.operation_id.as_str())
         || operation.revision != progress.expected_revision
     {
         return Err(Error::VersionConflict);
@@ -239,7 +309,9 @@ pub(super) fn advance(
                 app.runtime_policy = applied;
             }
         }
-        app.current_operation_id = None;
+        // Terminal commits clear only the operation's own slot; the other
+        // environments' in-flight identities stay intact in the same record.
+        app.active_operations.set(operation.scope, None);
         if operation.kind.ends_lifecycle() {
             app.state = if progress.state == OpState::Succeeded {
                 AppState::Deleted

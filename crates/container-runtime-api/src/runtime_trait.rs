@@ -652,6 +652,19 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         Ok(None)
     }
 
+    /// Builder-family runtime mutex for dev-scope operations. Durable receipts
+    /// must carry the UserappBuilder service family. Named distinctly from
+    /// AgentContainerRuntime::acquire_builder_operation so `dyn ContainerRuntime`
+    /// call sites stay unambiguous.
+    async fn acquire_builder_family_operation(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "builder-family operation lease unsupported".into(),
+        ))
+    }
+
     /// Delete only the captured compute identities, never newly discovered resources.
     async fn delete_app_snapshot(
         &self,

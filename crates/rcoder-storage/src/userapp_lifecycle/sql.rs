@@ -48,22 +48,30 @@ macro_rules! implement_store {
                 if limit == 0 {
                     return Err(Error::InvalidOperation("page limit must be positive".into()));
                 }
-                let rows: Vec<(String, Option<String>)> = sqlx::query_as($control_snapshot)
+                let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as($control_snapshot)
                     .bind(after_app_id.unwrap_or(""))
                     .bind(i64::from(limit))
                     .fetch_all(&self.pool).await.map_err(storage)?;
-                rows.into_iter().map(|(application, operation)| {
-                    let application: UserAppLifecycleRecord = serde_json::from_str(&application).map_err(storage)?;
-                    let operation: Option<UserAppOperationRecord> = operation.map(|encoded| serde_json::from_str(&encoded).map_err(storage)).transpose()?;
-                    match (application.current_operation_id.as_deref(), operation.as_ref()) {
-                        (None, None) => {},
-                        (Some(id), Some(operation)) if operation.operation_id == id
-                            && operation.app_id == application.app_id
-                            && operation.lifecycle_id == application.lifecycle_id
-                            && !operation.state.is_terminal() => {},
-                        _ => return Err(Error::InvalidOperation("Lifecycle current-operation linkage is inconsistent".into())),
+                rows.into_iter().map(|(application_record, dev, prod, application_slot)| {
+                    let application: UserAppLifecycleRecord = serde_json::from_str(&application_record).map_err(storage)?;
+                    let mut operations = shared_types::UserAppActiveOperationRecords::default();
+                    for (encoded, scope) in [
+                        (dev, shared_types::UserAppOperationScope::Dev),
+                        (prod, shared_types::UserAppOperationScope::Prod),
+                        (application_slot, shared_types::UserAppOperationScope::Application),
+                    ] {
+                        let operation: Option<UserAppOperationRecord> = encoded.map(|encoded| serde_json::from_str(&encoded).map_err(storage)).transpose()?;
+                        match (application.active_operations.slot(scope), operation.as_ref()) {
+                            (None, None) => {},
+                            (Some(id), Some(operation)) if operation.operation_id == *id
+                                && operation.app_id == application.app_id
+                                && operation.lifecycle_id == application.lifecycle_id
+                                && !operation.state.is_terminal() => {},
+                            _ => return Err(Error::InvalidOperation("Lifecycle active-operation linkage is inconsistent".into())),
+                        }
+                        operations.set(scope, operation);
                     }
-                    Ok(shared_types::UserAppControlSnapshot { application, operation })
+                    Ok(shared_types::UserAppControlSnapshot { application, operations })
                 }).collect()
             }
 
@@ -227,23 +235,28 @@ macro_rules! implement_store {
                     .first()
                     .map(|value| serde_json::from_str(value).map_err(storage))
                     .transpose()?;
-                let active: Option<String> = sqlx::query_scalar(
-                    "SELECT record FROM userapp_operations WHERE app_id=$1 AND operation_id=$2",
-                )
-                .bind(&request.app_id)
-                .bind(&app.current_operation_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(storage)?;
-                if app.current_operation_id.is_some() && active.is_none() {
-                    return Err(Error::InvalidOperation(
-                        "current operation record is missing".into(),
-                    ));
+                let mut active = shared_types::UserAppActiveOperationRecords::default();
+                for scope in shared_types::UserAppOperationScope::ALL {
+                    let Some(slot_id) = app.active_operations.slot(scope).cloned() else {
+                        continue;
+                    };
+                    let encoded: Option<String> = sqlx::query_scalar(
+                        "SELECT record FROM userapp_operations WHERE app_id=$1 AND operation_id=$2",
+                    )
+                    .bind(&request.app_id)
+                    .bind(&slot_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(storage)?;
+                    let record = encoded.ok_or_else(|| {
+                        Error::InvalidOperation("active operation record is missing".into())
+                    })?;
+                    active.set(
+                        scope,
+                        Some(serde_json::from_str(&record).map_err(storage)?),
+                    );
                 }
-                let active = active
-                    .map(|value| serde_json::from_str(&value).map_err(storage))
-                    .transpose()?;
-                let result = domain::admission(&mut app, request, duplicate, active)?;
+                let result = domain::admission(&mut app, request, duplicate, &active)?;
                 if let shared_types::UserAppAdmissionOutcome::Accepted(operation) = &result {
                     sqlx::query("INSERT INTO userapp_operations(operation_id,app_id,request_id,terminal,record) VALUES($1,$2,$3,0,$4)")
                         .bind(&operation.operation_id).bind(&operation.app_id).bind(&operation.request_id)
@@ -295,12 +308,15 @@ macro_rules! implement_store {
                 let mut tx = self.pool.begin_with($begin).await.map_err(storage)?;
                 let encoded: Option<String> = sqlx::query_scalar($locked).bind(&context.app_id).fetch_optional(&mut *tx).await.map_err(storage)?;
                 let app: UserAppLifecycleRecord = serde_json::from_str(&encoded.ok_or(Error::NotFound)?).map_err(storage)?;
-                if app.lifecycle_id != context.lifecycle_id || app.current_operation_id.as_deref() != Some(context.operation_id.as_str()) {
+                if app.lifecycle_id != context.lifecycle_id || !domain::operation_owns_any_slot(&app, &context.operation_id) {
                     return Err(Error::LifecycleConflict);
                 }
                 let encoded: Option<String> = sqlx::query_scalar("SELECT record FROM userapp_operations WHERE app_id=$1 AND operation_id=$2")
                     .bind(&context.app_id).bind(&context.operation_id).fetch_optional(&mut *tx).await.map_err(storage)?;
                 let operation: UserAppOperationRecord = serde_json::from_str(&encoded.ok_or(Error::NotFound)?).map_err(storage)?;
+                if !domain::slot_matches_operation(&app, &operation) {
+                    return Err(Error::LifecycleConflict);
+                }
                 if operation.executor_id.as_deref() != Some(context.executor_id.as_str())
                     || operation.lifecycle_id != context.lifecycle_id || operation.request_fingerprint != context.request_fingerprint
                     || operation.state != shared_types::UserAppOperationState::Running {
@@ -322,9 +338,10 @@ macro_rules! implement_store {
                 let mut tx = self.pool.begin_with($begin).await.map_err(storage)?;
                 let encoded: Option<String> = sqlx::query_scalar($locked).bind(app_id).fetch_optional(&mut *tx).await.map_err(storage)?;
                 let app: UserAppLifecycleRecord = serde_json::from_str(&encoded.ok_or(Error::NotFound)?).map_err(storage)?;
-                if app.lifecycle_id != lifecycle_id || app.current_operation_id.as_deref() != Some(operation_id) { return Err(Error::LifecycleConflict); }
+                if app.lifecycle_id != lifecycle_id || !domain::operation_owns_any_slot(&app, operation_id) { return Err(Error::LifecycleConflict); }
                 let encoded: Option<String> = sqlx::query_scalar("SELECT record FROM userapp_operations WHERE app_id=$1 AND operation_id=$2").bind(app_id).bind(operation_id).fetch_optional(&mut *tx).await.map_err(storage)?;
                 let operation: UserAppOperationRecord = serde_json::from_str(&encoded.ok_or(Error::NotFound)?).map_err(storage)?;
+                if !domain::slot_matches_operation(&app, &operation) { return Err(Error::LifecycleConflict); }
                 if operation.lifecycle_id != lifecycle_id || operation.state.is_terminal() { return Err(Error::VersionConflict); }
                 // bind-once：INSERT ON CONFLICT DO NOTHING；已存在 → 返回持久值
                 // （不同副本配置不同也不得各绑各的候选 deadline）
@@ -348,10 +365,14 @@ macro_rules! implement_store {
                 let mut tx = self.pool.begin_with($begin).await.map_err(storage)?;
                 let encoded: Option<String> = sqlx::query_scalar($locked).bind(&context.app_id).fetch_optional(&mut *tx).await.map_err(storage)?;
                 let app: UserAppLifecycleRecord = serde_json::from_str(&encoded.ok_or(Error::NotFound)?).map_err(storage)?;
-                if app.lifecycle_id != context.lifecycle_id || app.current_operation_id.as_deref() != Some(context.operation_id.as_str()) { return Err(Error::LifecycleConflict); }
+                if app.lifecycle_id != context.lifecycle_id || !domain::operation_owns_any_slot(&app, &context.operation_id) { return Err(Error::LifecycleConflict); }
                 let encoded: Option<String> = sqlx::query_scalar("SELECT record FROM userapp_operations WHERE app_id=$1 AND operation_id=$2").bind(&context.app_id).bind(&context.operation_id).fetch_optional(&mut *tx).await.map_err(storage)?;
                 let operation: UserAppOperationRecord = serde_json::from_str(&encoded.ok_or(Error::NotFound)?).map_err(storage)?;
-                let builder = matches!(operation.kind, shared_types::UserAppOperationKind::EnsureBuilder | shared_types::UserAppOperationKind::StopBuilder | shared_types::UserAppOperationKind::RestartBuilder | shared_types::UserAppOperationKind::AdoptBuilder);
+                if !domain::slot_matches_operation(&app, &operation) { return Err(Error::LifecycleConflict); }
+                // Lease family follows the operation's derived scope: every dev
+                // operation (including dev-storage kinds) requires a builder-
+                // family runtime receipt, prod/application require the app family.
+                let builder = operation.scope == shared_types::UserAppOperationScope::Dev;
                 if operation.state != shared_types::UserAppOperationState::Running || operation.executor_id.as_deref() != Some(context.executor_id.as_str()) || operation.lifecycle_id != context.lifecycle_id || operation.request_fingerprint != context.request_fingerprint
                     || builder != (*receipt.service_type() == shared_types::ServiceType::UserappBuilder) { return Err(Error::VersionConflict); }
                 let binding = shared_types::UserAppOperationLeaseBinding { context: context.clone(), receipt: receipt.clone() };
@@ -409,9 +430,10 @@ macro_rules! implement_store {
                 let mut tx = self.pool.begin_with($begin).await.map_err(storage)?;
                 let encoded: Option<String> = sqlx::query_scalar($locked).bind(&snapshot.app_id).fetch_optional(&mut *tx).await.map_err(storage)?;
                 let app: UserAppLifecycleRecord = serde_json::from_str(&encoded.ok_or(Error::NotFound)?).map_err(storage)?;
-                if app.lifecycle_id != snapshot.lifecycle_id || app.current_operation_id.as_deref() != Some(snapshot.operation_id.as_str()) { return Err(Error::LifecycleConflict); }
+                if app.lifecycle_id != snapshot.lifecycle_id || !domain::operation_owns_any_slot(&app, &snapshot.operation_id) { return Err(Error::LifecycleConflict); }
                 let encoded: Option<String> = sqlx::query_scalar("SELECT record FROM userapp_operations WHERE app_id=$1 AND operation_id=$2").bind(&snapshot.app_id).bind(&snapshot.operation_id).fetch_optional(&mut *tx).await.map_err(storage)?;
                 let mut operation: UserAppOperationRecord = serde_json::from_str(&encoded.ok_or(Error::NotFound)?).map_err(storage)?;
+                if !domain::slot_matches_operation(&app, &operation) { return Err(Error::LifecycleConflict); }
                 if &operation != snapshot || !matches!(operation.state, shared_types::UserAppOperationState::Running | shared_types::UserAppOperationState::RecoveryRequired) || !shared_types::userapp_operation_has_final_evidence(&operation) { return Err(Error::VersionConflict); }
                 // EnsureBuilder's typed final evidence follows successful runtime
                 // completion, which has already released its creation mutex.
@@ -575,7 +597,7 @@ macro_rules! implement_store {
                 }
                 if app.lifecycle_id != expected_lifecycle_id
                     || app.state != shared_types::UserAppLifecycleState::Deleted
-                    || app.current_operation_id.is_some()
+                    || !app.active_operations.is_empty()
                 {
                     return Err(Error::LifecycleConflict);
                 }

@@ -149,6 +149,20 @@ impl AppService {
         &self,
         app_id: &str,
     ) -> AppResult<AppOperationGuard> {
+        self.acquire_process_release_lock_scoped(
+            app_id,
+            shared_types::UserAppOperationScope::Prod,
+        )
+        .await
+    }
+
+    /// Scope-aware variant: dev-scope operations take the builder-family
+    /// runtime mutex so dev storage control never contends with prod execution.
+    pub(crate) async fn acquire_process_release_lock_scoped(
+        &self,
+        app_id: &str,
+        scope: shared_types::UserAppOperationScope,
+    ) -> AppResult<AppOperationGuard> {
         let lock = match self.release_locks.entry(app_id.to_owned()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
             dashmap::mapref::entry::Entry::Vacant(entry) => {
@@ -157,7 +171,7 @@ impl AppService {
                 lock
             }
         };
-        self.operation_guard(app_id, lock.lock_owned().await, true)
+        self.operation_guard_scoped(app_id, scope, lock.lock_owned().await, true)
             .await
     }
 

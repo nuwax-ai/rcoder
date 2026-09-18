@@ -147,23 +147,17 @@ async fn ensure_builder_target_until(
     creation::ensure(state, app_id, instance, _lifecycle, deadline).await
 }
 
-/// 当前操作是否围栏 builder：仅 builder 变更族（Ensure/Adopt/Stop/Restart/
-/// DestroyDevStorage）跳过注册快路径——生产部署等无关操作进行中，已验证的
-/// 注册继续服务（部署期 app-cli 经 rcoder static 转发下载制品依赖此路径，
-/// 否则新受理会与在途部署操作自冲突）。
+/// 当前操作是否围栏 builder：dev 槽（Ensure/Adopt/Stop/Restart/DestroyDev/
+/// ClearDevStorage）或 application 槽（DeleteApplication/PurgeResources）在途
+/// 即围栏——生产部署等 prod 槽操作进行中，已验证的注册继续服务（部署期
+/// app-cli 经 rcoder static 转发下载制品依赖此路径，否则新受理会与在途部署
+/// 操作自冲突）。槽位即语义：无需再按 kind 查询判定。
 async fn builder_fenced_by_current_operation(
-    state: &AppState,
+    _state: &AppState,
     identity: &shared_types::UserAppLifecycleRecord,
 ) -> Result<bool> {
-    let Some(operation_id) = identity.current_operation_id.as_deref() else {
-        return Ok(false);
-    };
-    let operation = state
-        .userapp_store
-        .get_operation(&identity.app_id, operation_id)
-        .await?
-        .ok_or_else(|| anyhow!("Current operation record is missing: {operation_id}"))?;
-    Ok(operation.kind.affects_builder())
+    Ok(identity.active_operations.dev.is_some()
+        || identity.active_operations.application.is_some())
 }
 
 pub(crate) async fn ensure_userapp_builder_probed(
@@ -285,14 +279,14 @@ pub(crate) fn control_error(error: &anyhow::Error) -> shared_types::AppError {
             None => response,
         };
     }
-    if let Some(shared_types::UserAppStoreError::OperationInProgress(id)) =
+    if let Some(shared_types::UserAppStoreError::OperationInProgress(blocker)) =
         error.downcast_ref::<shared_types::UserAppStoreError>()
     {
         return shared_types::AppError::with_message(
             shared_types::error_codes::ERR_CONFLICT,
             "A conflicting application operation is in progress",
         )
-        .with_operation_id(id.clone());
+        .with_operation_id(blocker.operation_id.clone());
     }
     shared_types::AppError::with_message(
         shared_types::error_codes::ERR_BACKEND_ERROR,
@@ -670,10 +664,16 @@ mod control_error_tests {
 
     #[tokio::test]
     async fn conflict_classification_requires_a_typed_cause() {
-        let error = anyhow::Error::new(shared_types::UserAppStoreError::OperationInProgress(
-            "owner-operation".into(),
-        ))
-        .context("admission");
+        let blocker = shared_types::UserAppOperationBlocker {
+            scope: shared_types::UserAppOperationScope::Dev,
+            operation_id: "owner-operation".into(),
+            kind: shared_types::UserAppOperationKind::RestartBuilder,
+            state: shared_types::UserAppOperationState::RecoveryRequired,
+            step: "claimed".into(),
+        };
+        let error =
+            anyhow::Error::new(shared_types::UserAppStoreError::OperationInProgress(blocker))
+                .context("admission");
         let response = control_error(&error).into_response();
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
         let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");

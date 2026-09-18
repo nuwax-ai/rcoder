@@ -31,6 +31,13 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             .map(Some)
     }
 
+    async fn acquire_builder_family_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        self.acquire_builder_lease(app_id).await
+    }
+
     async fn release_app_operation_receipt(
         &self,
         context: &shared_types::UserAppExecutionContext,

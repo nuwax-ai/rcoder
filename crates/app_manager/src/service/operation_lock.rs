@@ -10,6 +10,9 @@ pub(crate) struct AppOperationGuard {
     runtime: Option<Box<dyn shared_types::AppOperationLease>>,
     marker: shared_types::AppFileMutationMarker,
     side_effect_started: std::sync::atomic::AtomicBool,
+    /// Lease family this guard was acquired under (UserappBuilder for dev
+    /// operations, Userapp otherwise); durable receipts must match it.
+    family: shared_types::ServiceType,
     _file: Option<File>,
     _process: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -28,7 +31,7 @@ impl AppOperationGuard {
                 AppOperationError::Backend(format!("Read operation lock identity: {error}"))
             })?;
             return Ok(shared_types::UserAppOperationLeaseReceipt::Docker {
-                service_type: shared_types::ServiceType::Userapp,
+                service_type: self.family.clone(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 token: self.marker.operation_id().into(),
@@ -123,6 +126,26 @@ impl AppService {
         process: tokio::sync::OwnedMutexGuard<()>,
         wait: bool,
     ) -> AppResult<AppOperationGuard> {
+        self.operation_guard_scoped(
+            app_id,
+            shared_types::UserAppOperationScope::Prod,
+            process,
+            wait,
+        )
+        .await
+    }
+
+    /// Dev-scope operations acquire the builder-family runtime mutex
+    /// (`builder-{app_id}.lock` / builder K8s lease) instead of the prod one,
+    /// so a dev storage operation never contends with prod execution.
+    pub(crate) async fn operation_guard_scoped(
+        &self,
+        app_id: &str,
+        scope: shared_types::UserAppOperationScope,
+        process: tokio::sync::OwnedMutexGuard<()>,
+        wait: bool,
+    ) -> AppResult<AppOperationGuard> {
+        let builder_family = scope == shared_types::UserAppOperationScope::Dev;
         let runtime = if self.config.access_mode == AppAccessMode::Kubernetes {
             // K8s 租约等待语义对齐 Docker flock 轮询：wait=true 时 409
             // （OperationInProgress）按间隔重试直至持有者释放——start（无 url）
@@ -130,7 +153,15 @@ impl AppService {
             // 立即 Conflict（外部 stop/restart/delete 快失败）。
             const LEASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
             let lease = loop {
-                match self.runtime.acquire_app_operation(app_id).await {
+                let attempt = if builder_family {
+                    self.runtime
+                        .acquire_builder_family_operation(app_id)
+                        .await
+                        .map(Some)
+                } else {
+                    self.runtime.acquire_app_operation(app_id).await
+                };
+                match attempt {
                     Ok(acquired) => {
                         break acquired.ok_or_else(|| {
                             AppOperationError::Backend(
@@ -171,12 +202,17 @@ impl AppService {
             tokio::fs::create_dir_all(&directory).await.map_err(|e| {
                 AppOperationError::Backend(format!("create application lock directory: {e}"))
             })?;
+            let lock_name = if builder_family {
+                format!("builder-{app_id}.lock")
+            } else {
+                format!("prod-{app_id}.lock")
+            };
             let file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .read(true)
                 .write(true)
-                .open(directory.join(format!("prod-{app_id}.lock")))
+                .open(directory.join(lock_name))
                 .await
                 .map_err(|e| {
                     AppOperationError::Backend(format!("open application operation lock: {e}"))
@@ -211,6 +247,11 @@ impl AppService {
             runtime,
             marker: shared_types::AppFileMutationMarker::new(),
             side_effect_started: std::sync::atomic::AtomicBool::new(false),
+            family: if builder_family {
+                shared_types::ServiceType::UserappBuilder
+            } else {
+                shared_types::ServiceType::Userapp
+            },
             _file: file,
             _process: process,
         })
@@ -237,6 +278,7 @@ mod tests {
             runtime: Some(Box::new(Lease(releases))),
             marker: shared_types::AppFileMutationMarker::new(),
             side_effect_started: std::sync::atomic::AtomicBool::new(false),
+            family: shared_types::ServiceType::Userapp,
             _file: None,
             _process: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
         }

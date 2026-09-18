@@ -428,7 +428,13 @@ mod control_response_tests {
             ),
             (
                 anyhow::Error::from(shared_types::UserAppStoreError::OperationInProgress(
-                    "conflicting-operation".into(),
+                    shared_types::UserAppOperationBlocker {
+                        scope: shared_types::UserAppOperationScope::Prod,
+                        operation_id: "conflicting-operation".into(),
+                        kind: shared_types::UserAppOperationKind::Start,
+                        state: shared_types::UserAppOperationState::Running,
+                        step: "claimed".into(),
+                    },
                 )),
                 shared_types::error_codes::ERR_CONFLICT,
                 "conflicting-operation",

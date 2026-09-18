@@ -387,7 +387,16 @@ impl crate::service::AppService {
         request
             .validate()
             .map_err(|error| AppOperationError::Validation(error.to_string()))?;
-        let guard = self.acquire_process_release_lock(app_id).await?;
+        let guard = self
+            .acquire_process_release_lock_scoped(
+                app_id,
+                if app_stage == UserappStage::Prod {
+                    shared_types::UserAppOperationScope::Prod
+                } else {
+                    shared_types::UserAppOperationScope::Dev
+                },
+            )
+            .await?;
         let result = async {
             self.metadata
                 .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
@@ -515,7 +524,16 @@ impl crate::service::AppService {
                 "confirm must equal app_id for destroy".into(),
             ));
         }
-        let guard = self.acquire_process_release_lock(app_id).await?;
+        let guard = self
+            .acquire_process_release_lock_scoped(
+                app_id,
+                if app_stage == UserappStage::Prod {
+                    shared_types::UserAppOperationScope::Prod
+                } else {
+                    shared_types::UserAppOperationScope::Dev
+                },
+            )
+            .await?;
         let result = async {
             self.metadata
                 .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())

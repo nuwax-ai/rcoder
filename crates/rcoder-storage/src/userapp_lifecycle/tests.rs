@@ -55,7 +55,7 @@ async fn storage_deletion_preserves_lifecycle(store: &dyn UserAppLifecycleStore)
     let after = store.get_application(&req.app_id).await.unwrap().unwrap();
     assert_eq!(after.lifecycle_id, before.lifecycle_id);
     assert_eq!(after.state, UserAppLifecycleState::Active);
-    assert!(after.current_operation_id.is_none());
+    assert!(after.active_operations.is_empty());
 }
 
 async fn admission_metadata_is_atomic(store: &dyn UserAppLifecycleStore) {
@@ -93,7 +93,7 @@ async fn admission_metadata_is_atomic(store: &dyn UserAppLifecycleStore) {
     assert_eq!(committed.name.as_deref(), Some("admitted-name"));
     assert_eq!(committed.metadata_revision, app.metadata_revision + 1);
     assert_eq!(
-        committed.current_operation_id.as_deref(),
+        committed.active_operations.slot(op.scope).map(String::as_str),
         Some(op.operation_id.as_str())
     );
     assert_eq!(op.admitted_metadata, req.metadata);
@@ -871,6 +871,396 @@ async fn restart_keeps_operation_and_uncertainty_blocks_new_creators() {
     ));
 }
 
+/// 反例 1（spec §7.1/7.3）：prod 未知结果（RecoveryRequired）不得阻塞 dev 域
+/// 受理；同域排他与整体操作保护保留；prod 记录原样不动。
+async fn cross_scope_admission_is_independent(store: &dyn UserAppLifecycleStore) {
+    let app = store
+        .ensure_identity("scope-cross-app")
+        .await
+        .expect("identity");
+    let mut prod = request("scope-prod-wake", Kind::Start);
+    prod.app_id = app.app_id.clone();
+    prod.lifecycle_id = Some(app.lifecycle_id.clone());
+    let prod_op = operation(store.admit(&prod).await.expect("prod admission"));
+    complete(store, &prod_op, State::RecoveryRequired).await;
+    let uncertain = store
+        .get_operation(&app.app_id, &prod_op.operation_id)
+        .await
+        .expect("read")
+        .expect("prod record");
+
+    let mut dev = request("scope-dev-restart", Kind::RestartBuilder);
+    dev.app_id = app.app_id.clone();
+    dev.lifecycle_id = Some(app.lifecycle_id.clone());
+    let dev_op = operation(
+        store
+            .admit(&dev)
+            .await
+            .expect("dev restart must be admitted while prod outcome is unknown"),
+    );
+    assert_eq!(dev_op.kind, Kind::RestartBuilder);
+
+    let mut same_scope = request("scope-dev-stop", Kind::StopBuilder);
+    same_scope.app_id = app.app_id.clone();
+    same_scope.lifecycle_id = Some(app.lifecycle_id.clone());
+    assert!(
+        matches!(
+            store.admit(&same_scope).await,
+            Err(Error::OperationInProgress(_))
+        ),
+        "same-scope exclusivity must survive scope isolation"
+    );
+
+    let mut prod_again = request("scope-prod-stop", Kind::Stop);
+    prod_again.app_id = app.app_id.clone();
+    prod_again.lifecycle_id = Some(app.lifecycle_id.clone());
+    assert!(
+        matches!(
+            store.admit(&prod_again).await,
+            Err(Error::OperationInProgress(_))
+        ),
+        "prod slot stays occupied by its unresolved operation"
+    );
+
+    let mut whole = request("scope-delete", Kind::DeleteApplication);
+    whole.app_id = app.app_id.clone();
+    whole.lifecycle_id = Some(app.lifecycle_id.clone());
+    assert!(
+        matches!(
+            store.admit(&whole).await,
+            Err(Error::OperationInProgress(_))
+        ),
+        "application-wide operations require both environments idle"
+    );
+
+    assert_eq!(
+        store
+            .get_operation(&app.app_id, &prod_op.operation_id)
+            .await
+            .expect("read")
+            .expect("prod record"),
+        uncertain,
+        "dev admission must not disturb the unresolved prod operation"
+    );
+}
+
+/// 反例 2（spec §7.3）：dev 未知结果不得阻塞 prod 域受理。
+async fn dev_uncertainty_does_not_block_prod(store: &dyn UserAppLifecycleStore) {
+    let app = store
+        .ensure_identity("scope-reverse-app")
+        .await
+        .expect("identity");
+    let mut dev = request("reverse-dev-ensure", Kind::EnsureBuilder);
+    dev.app_id = app.app_id.clone();
+    dev.lifecycle_id = Some(app.lifecycle_id.clone());
+    let dev_op = operation(store.admit(&dev).await.expect("dev admission"));
+    complete(store, &dev_op, State::RecoveryRequired).await;
+
+    let mut prod = request("reverse-prod-start", Kind::Start);
+    prod.app_id = app.app_id.clone();
+    prod.lifecycle_id = Some(app.lifecycle_id.clone());
+    let prod_op = operation(
+        store
+            .admit(&prod)
+            .await
+            .expect("prod start must be admitted while dev outcome is unknown"),
+    );
+    assert_eq!(prod_op.kind, Kind::Start);
+
+    let mut dev_again = request("reverse-dev-second", Kind::RestartBuilder);
+    dev_again.app_id = app.app_id.clone();
+    dev_again.lifecycle_id = Some(app.lifecycle_id.clone());
+    assert!(matches!(
+        store.admit(&dev_again).await,
+        Err(Error::OperationInProgress(_))
+    ));
+}
+
+#[tokio::test]
+async fn sqlite_cross_scope_admission_is_independent() {
+    let (_directory, store) = database().await;
+    cross_scope_admission_is_independent(&store).await;
+}
+
+#[tokio::test]
+async fn sqlite_dev_uncertainty_does_not_block_prod() {
+    let (_directory, store) = database().await;
+    dev_uncertainty_does_not_block_prod(&store).await;
+}
+
+/// §7.5/7.6：双域在途各自终态只清己槽；全部收束后整体操作才可受理且
+/// Deleting 同事务生效；冲突错误携带结构化 blocker。
+#[tokio::test]
+async fn scoped_terminals_clear_own_slots_and_blocker_is_structured() {
+    let (_directory, store) = database().await;
+    let app = store.ensure_identity("scope-terminal-app").await.unwrap();
+    let mut dev = request("terminal-dev", Kind::RestartBuilder);
+    dev.app_id = app.app_id.clone();
+    dev.lifecycle_id = Some(app.lifecycle_id.clone());
+    let dev_op = operation(store.admit(&dev).await.unwrap());
+    let mut prod = request("terminal-prod", Kind::Start);
+    prod.app_id = app.app_id.clone();
+    prod.lifecycle_id = Some(app.lifecycle_id.clone());
+    prod.command = Some(shared_types::UserAppControlCommand::Start { traffic: true });
+    prod.request_fingerprint = "b".repeat(64);
+    let prod_op = operation(store.admit(&prod).await.unwrap());
+
+    // prod 已受理未认领即占槽：同域第二个操作被拦，且 blocker 指名 prod 域
+    let mut prod_again = request("terminal-prod-2", Kind::Stop);
+    prod_again.app_id = app.app_id.clone();
+    prod_again.lifecycle_id = Some(app.lifecycle_id.clone());
+    match store.admit(&prod_again).await {
+        Err(Error::OperationInProgress(blocker)) => {
+            assert_eq!(blocker.scope, shared_types::UserAppOperationScope::Prod);
+            assert_eq!(blocker.operation_id, prod_op.operation_id);
+            assert_eq!(blocker.kind, Kind::Start);
+            assert_eq!(blocker.state, State::Pending);
+            assert_eq!(blocker.step, "admitted");
+        }
+        other => panic!("expected structured conflict, got {other:?}"),
+    }
+
+    // dev 先终态：prod 槽不受影响
+    complete(&store, &dev_op, State::Succeeded).await;
+    let after_dev = store.get_application(&app.app_id).await.unwrap().unwrap();
+    assert_eq!(after_dev.active_operations.dev, None);
+    assert_eq!(
+        after_dev.active_operations.prod.as_deref(),
+        Some(prod_op.operation_id.as_str())
+    );
+
+    // prod 终态后全槽清空
+    complete(&store, &prod_op, State::Succeeded).await;
+    let cleared = store.get_application(&app.app_id).await.unwrap().unwrap();
+    assert!(cleared.active_operations.is_empty());
+    assert_eq!(
+        cleared.state,
+        UserAppLifecycleState::Active,
+        "Deleting only flips in the whole operation's own admission"
+    );
+
+    // 整体操作可受理：占 application 槽，Deleting 同事务生效
+    let mut whole = request("terminal-delete", Kind::DeleteApplication);
+    whole.app_id = app.app_id.clone();
+    let whole_op = operation(store.admit(&whole).await.unwrap());
+    let deleting = store.get_application(&app.app_id).await.unwrap().unwrap();
+    assert_eq!(deleting.state, UserAppLifecycleState::Deleting);
+    assert_eq!(
+        deleting.active_operations.application.as_deref(),
+        Some(whole_op.operation_id.as_str())
+    );
+}
+
+/// §7.8：旧单指针 JSON 经 0007 迁移进槽位；终态指向不占槽；悬空指针/未知
+/// kind 阻断迁移且不半提交；重复打开幂等。
+#[tokio::test]
+async fn sqlite_legacy_pointer_records_migrate_into_scope_slots() {
+    let (directory, store) = database().await;
+    // 旧不变量：每个 app 至多一个在途操作。分别构造 dev/prod 在途、
+    // 终态指向（防御性）与无操作四种旧形态。
+    let mut dev = request("legacy-dev", Kind::RestartBuilder);
+    dev.app_id = "legacy-dev-app".into();
+    let dev_op = operation(store.admit(&dev).await.unwrap());
+    let dev_running = store
+        .advance(&progress(&dev_op, State::Running))
+        .await
+        .unwrap();
+    let mut prod = request("legacy-prod", Kind::Start);
+    prod.app_id = "legacy-prod-app".into();
+    let prod_op = operation(store.admit(&prod).await.unwrap());
+    complete(&store, &prod_op, State::RecoveryRequired).await;
+    let mut terminal = request("legacy-terminal", Kind::Stop);
+    terminal.app_id = "legacy-terminal-app".into();
+    let terminal_op = operation(store.admit(&terminal).await.unwrap());
+    complete(&store, &terminal_op, State::Succeeded).await;
+    store
+        .ensure_identity("legacy-idle-app")
+        .await
+        .unwrap();
+    store.close().await;
+
+    // 降级到旧 JSON 形态：去掉 scope、槽位还原为 current_operation_id 单指针
+    let legacy = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(directory.path().join("userapp.sqlite3")),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE userapp_operations SET record=json_remove(record,'$.scope')")
+        .execute(&legacy)
+        .await
+        .unwrap();
+    for (app_id, pointer) in [
+        ("legacy-dev-app", Some(dev_running.operation_id.clone())),
+        ("legacy-prod-app", Some(prod_op.operation_id.clone())),
+        // 防御性旧数据：终态操作仍被指针引用（终态不得迁移为占槽）
+        ("legacy-terminal-app", Some(terminal_op.operation_id.clone())),
+        ("legacy-idle-app", None),
+    ] {
+        sqlx::query("UPDATE userapp_lifecycles SET record=json_set(json_remove(record,'$.active_operations'),'$.current_operation_id',$2) WHERE app_id=$1")
+            .bind(app_id)
+            .bind(pointer)
+            .execute(&legacy)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM _sqlx_userapp_migrations WHERE version=7")
+        .execute(&legacy)
+        .await
+        .unwrap();
+    legacy.close().await;
+
+    let migrated = SqliteUserAppStore::open(&directory.path().join("userapp.sqlite3"))
+        .await
+        .expect("legacy database must migrate");
+    let dev_app = migrated
+        .get_application("legacy-dev-app")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        dev_app.active_operations.dev.as_deref(),
+        Some(dev_running.operation_id.as_str())
+    );
+    assert_eq!(dev_app.active_operations.prod, None);
+    let prod_app = migrated
+        .get_application("legacy-prod-app")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        prod_app.active_operations.prod.as_deref(),
+        Some(prod_op.operation_id.as_str())
+    );
+    assert_eq!(prod_app.active_operations.dev, None);
+    let terminal_app = migrated
+        .get_application("legacy-terminal-app")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        terminal_app.active_operations.is_empty(),
+        "terminal pointed operation must not occupy a slot"
+    );
+    let idle_app = migrated
+        .get_application("legacy-idle-app")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(idle_app.active_operations.is_empty());
+    for (app_id, scope, expected) in [
+        (
+            "legacy-dev-app",
+            shared_types::UserAppOperationScope::Dev,
+            dev_running.operation_id.clone(),
+        ),
+        (
+            "legacy-prod-app",
+            shared_types::UserAppOperationScope::Prod,
+            prod_op.operation_id.clone(),
+        ),
+    ] {
+        let record = migrated
+            .get_operation(app_id, &expected)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.scope, scope);
+    }
+    migrated.close().await;
+
+    // 幂等：迁移记录后再次打开不重复改写
+    let again = SqliteUserAppStore::open(&directory.path().join("userapp.sqlite3"))
+        .await
+        .expect("idempotent reopen");
+    assert_eq!(
+        again
+            .get_application("legacy-prod-app")
+            .await
+            .unwrap()
+            .unwrap(),
+        prod_app
+    );
+    again.close().await;
+}
+
+/// §7.8 反例：悬空指针与未知 kind 必须阻断迁移（事务回滚，不留半提交）。
+#[tokio::test]
+async fn sqlite_scope_migration_aborts_on_dangling_pointer_and_unknown_kind() {
+    for label in ["dangling", "unknown-kind"] {
+        let (directory, store) = database().await;
+        let mut req = request(&format!("legacy-{label}"), Kind::Start);
+        req.app_id = format!("legacy-{label}-app");
+        let op = operation(store.admit(&req).await.unwrap());
+        let running = store
+            .advance(&progress(&op, State::Running))
+            .await
+            .unwrap();
+        store.close().await;
+        let legacy = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(directory.path().join("userapp.sqlite3")),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE userapp_operations SET record=json_remove(record,'$.scope')")
+            .execute(&legacy)
+            .await
+            .unwrap();
+        match label {
+            "dangling" => {
+                sqlx::query("UPDATE userapp_lifecycles SET record=json_set(json_remove(record,'$.active_operations'),'$.current_operation_id','ghost-operation') WHERE app_id=$1")
+                    .bind(&req.app_id)
+                    .execute(&legacy)
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                sqlx::query("UPDATE userapp_operations SET record=json_set(record,'$.kind','Nonsense') WHERE operation_id=$1")
+                    .bind(&running.operation_id)
+                    .execute(&legacy)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE userapp_lifecycles SET record=json_set(json_remove(record,'$.active_operations'),'$.current_operation_id',$2) WHERE app_id=$1")
+                    .bind(&req.app_id)
+                    .bind(&running.operation_id)
+                    .execute(&legacy)
+                    .await
+                    .unwrap();
+            }
+        }
+        sqlx::query("DELETE FROM _sqlx_userapp_migrations WHERE version=7")
+            .execute(&legacy)
+            .await
+            .unwrap();
+        legacy.close().await;
+        let result =
+            SqliteUserAppStore::open(&directory.path().join("userapp.sqlite3")).await;
+        assert!(result.is_err(), "{label} must block the migration");
+        // 失败不半提交：直连检查旧形态未被改写（scope 仍缺失）
+        let inspect = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(directory.path().join("userapp.sqlite3")),
+            )
+            .await
+            .unwrap();
+        let raw: String =
+            sqlx::query_scalar("SELECT record FROM userapp_operations WHERE operation_id=$1")
+                .bind(&running.operation_id)
+                .fetch_one(&inspect)
+                .await
+                .unwrap();
+        assert!(!raw.contains("\"scope\""), "{label} rolled back fully");
+        inspect.close().await;
+    }
+}
+
 #[tokio::test]
 async fn closed_database_returns_error_not_absence_or_admission() {
     let (_directory, store) = database().await;
@@ -1156,7 +1546,7 @@ async fn control_snapshot_links_identity_and_operation(store: &dyn UserAppLifecy
         .expect("first page");
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].application.app_id, "snapshot-contract-a");
-    assert!(before[0].operation.is_none());
+    assert!(before[0].operations.iter().next().is_none());
     let second = store
         .list_control_snapshots(Some(&before[0].application.app_id), 1)
         .await
@@ -1171,20 +1561,28 @@ async fn control_snapshot_links_identity_and_operation(store: &dyn UserAppLifecy
         .expect("pending snapshot")
         .remove(0);
     assert_eq!(
-        snapshot.application.current_operation_id.as_deref(),
+        snapshot
+            .application
+            .active_operations
+            .slot(pending.scope)
+            .map(String::as_str),
         Some(pending.operation_id.as_str())
     );
-    assert_eq!(snapshot.operation, Some(pending.clone()));
+    assert_eq!(
+        snapshot.operations.slot(pending.scope),
+        Some(&pending.clone())
+    );
+    assert!(snapshot.operations.iter().count() == 1);
     complete(store, &pending, State::Succeeded).await;
     let snapshot = store
         .list_control_snapshots(Some("snapshot-contract-"), 1)
         .await
         .expect("committed snapshot")
         .remove(0);
-    assert!(snapshot.application.current_operation_id.is_none());
+    assert!(snapshot.application.active_operations.is_empty());
     assert!(
-        snapshot.operation.is_none(),
-        "historical completed operation is not the current operation"
+        snapshot.operations.iter().next().is_none(),
+        "historical completed operation is not an active operation"
     );
 }
 
@@ -1201,7 +1599,7 @@ async fn sqlite_control_snapshot_rejects_broken_operation_link() {
         .ensure_identity("snapshot-corrupt")
         .await
         .expect("identity");
-    identity.current_operation_id = Some("missing-operation".into());
+    identity.active_operations.prod = Some("missing-operation".into());
     let connection = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
@@ -1683,8 +2081,8 @@ async fn physical_binding_is_atomic_and_cannot_cross_lifecycles(store: &dyn User
             .await
             .expect("read")
             .expect("identity")
-            .current_operation_id
-            .is_none()
+            .active_operations
+            .is_empty()
     );
 
     let mut deletion = request("binding-delete", Kind::DeleteApplication);

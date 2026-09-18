@@ -41,6 +41,14 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .map(Some)
     }
 
+    async fn acquire_builder_family_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        self.acquire_application_operation(app_id, &ServiceType::UserappBuilder)
+            .await
+    }
+
     async fn observe_app_pods(
         &self,
         app_id: &str,

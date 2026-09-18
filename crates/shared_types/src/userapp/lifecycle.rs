@@ -198,7 +198,56 @@ pub struct UserAppLifecycleRecord {
     pub tenant_id: Option<String>,
     pub space_id: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
-    pub current_operation_id: Option<String>,
+    /// Per-scope in-flight operation slots. A slot is written by admission of
+    /// its scope and cleared only by that operation's terminal commit, so
+    /// dev/prod operations never overwrite each other's identity.
+    pub active_operations: UserAppActiveOperations,
+}
+
+/// Operation-id slots keyed by resource scope. Fixed three-field shape on
+/// purpose: extensible string maps would silently accept unknown scopes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UserAppActiveOperations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prod: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application: Option<String>,
+}
+
+impl UserAppActiveOperations {
+    pub fn slot(&self, scope: UserAppOperationScope) -> Option<&String> {
+        match scope {
+            UserAppOperationScope::Dev => self.dev.as_ref(),
+            UserAppOperationScope::Prod => self.prod.as_ref(),
+            UserAppOperationScope::Application => self.application.as_ref(),
+        }
+    }
+    pub fn slot_mut(&mut self, scope: UserAppOperationScope) -> &mut Option<String> {
+        match scope {
+            UserAppOperationScope::Dev => &mut self.dev,
+            UserAppOperationScope::Prod => &mut self.prod,
+            UserAppOperationScope::Application => &mut self.application,
+        }
+    }
+    pub fn set(&mut self, scope: UserAppOperationScope, value: Option<String>) {
+        *self.slot_mut(scope) = value;
+    }
+    pub fn is_empty(&self) -> bool {
+        self.dev.is_none() && self.prod.is_none() && self.application.is_none()
+    }
+    /// Occupied scopes, application first: it fences both environments, so
+    /// callers checking blockers observe it before any own-scope slot.
+    pub fn occupied_scopes(&self) -> impl Iterator<Item = UserAppOperationScope> + '_ {
+        [
+            UserAppOperationScope::Application,
+            UserAppOperationScope::Dev,
+            UserAppOperationScope::Prod,
+        ]
+        .into_iter()
+        .filter(move |scope| self.slot(*scope).is_some())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -337,6 +386,10 @@ pub struct UserAppOperationRecord {
     /// SetRecyclePolicy, HotDeploy, DeleteCompute, PurgeResources, DestroyDevStorage,
     /// DestroyProdStorage, ClearDevStorage, ClearProdStorage, or DeleteApplication.
     pub kind: UserAppOperationKind,
+    /// Resource scope this operation occupies. Server-derived from the kind at
+    /// admission; never client-supplied, and never defaulted when decoding
+    /// persisted records (legacy rows must be migrated, not guessed).
+    pub scope: UserAppOperationScope,
     /// Operation state: Pending is unclaimed; Running has an executor;
     /// WaitingRetry awaits a safe retry; RecoveryRequired needs outcome verification;
     /// Succeeded confirms completion; Failed is a terminal failure.
@@ -353,12 +406,58 @@ pub struct UserAppOperationRecord {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Identity and its linked current operation read from one database snapshot.
-/// Useful for reconstruction; it is observational evidence, not a mutation lease.
+impl UserAppOperationRecord {
+    /// Structured conflict detail naming this operation as the blocker of an
+    /// admission or replay attempt.
+    pub fn blocker(&self) -> UserAppOperationBlocker {
+        UserAppOperationBlocker {
+            scope: self.scope,
+            operation_id: self.operation_id.clone(),
+            kind: self.kind,
+            state: self.state,
+            step: self.step.clone(),
+        }
+    }
+}
+
+/// Identity and its linked in-flight operations read from one database
+/// snapshot. Useful for reconstruction; it is observational evidence, not a
+/// mutation lease.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserAppControlSnapshot {
     pub application: UserAppLifecycleRecord,
-    pub operation: Option<UserAppOperationRecord>,
+    pub operations: UserAppActiveOperationRecords,
+}
+
+/// Per-scope in-flight operation records aligned with the application's
+/// active_operations slots. Slots are never populated with terminal records.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserAppActiveOperationRecords {
+    pub dev: Option<UserAppOperationRecord>,
+    pub prod: Option<UserAppOperationRecord>,
+    pub application: Option<UserAppOperationRecord>,
+}
+
+impl UserAppActiveOperationRecords {
+    pub fn slot(&self, scope: UserAppOperationScope) -> Option<&UserAppOperationRecord> {
+        match scope {
+            UserAppOperationScope::Dev => self.dev.as_ref(),
+            UserAppOperationScope::Prod => self.prod.as_ref(),
+            UserAppOperationScope::Application => self.application.as_ref(),
+        }
+    }
+    pub fn set(&mut self, scope: UserAppOperationScope, record: Option<UserAppOperationRecord>) {
+        match scope {
+            UserAppOperationScope::Dev => self.dev = record,
+            UserAppOperationScope::Prod => self.prod = record,
+            UserAppOperationScope::Application => self.application = record,
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &UserAppOperationRecord> {
+        [self.dev.as_ref(), self.prod.as_ref(), self.application.as_ref()]
+            .into_iter()
+            .flatten()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -578,7 +677,7 @@ pub enum UserAppStoreError {
     #[error("Application lifecycle conflict")]
     LifecycleConflict,
     #[error("Application operation in progress: {0}")]
-    OperationInProgress(String),
+    OperationInProgress(UserAppOperationBlocker),
     #[error("Application state version conflict")]
     VersionConflict,
     #[error("Application not found")]
@@ -802,6 +901,9 @@ pub struct UserAppOperationView {
     /// SetRecyclePolicy, HotDeploy, DeleteCompute, PurgeResources, DestroyDevStorage,
     /// DestroyProdStorage, ClearDevStorage, ClearProdStorage, or DeleteApplication.
     pub kind: UserAppOperationKind,
+    /// Resource scope this operation occupies: Dev (builder), Prod (production
+    /// runtime) or Application (both environments plus shared authority).
+    pub scope: UserAppOperationScope,
     /// Operation state: Pending is unclaimed; Running has an executor;
     /// WaitingRetry awaits a safe retry; RecoveryRequired needs outcome verification;
     /// Succeeded confirms completion; Failed is a terminal failure.
@@ -820,6 +922,7 @@ impl From<UserAppOperationRecord> for UserAppOperationView {
             lifecycle_id: record.lifecycle_id,
             request_id: record.request_id,
             kind: record.kind,
+            scope: record.scope,
             state: record.state,
             revision: record.revision,
             step: record.step,
