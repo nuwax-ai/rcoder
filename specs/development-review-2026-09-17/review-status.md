@@ -108,3 +108,11 @@ npm 启动器测试 17/17 通过。proxy 17/17 默认 + 16/16 纯转发形态。
 
 **累计完成**：R01–R11 全部、B01–B05 全部、N01–N10 全部（N07 认证层、N06 JS 启动器客户端化为子项级残留）。
 **剩余未完成**：NT 矩阵的完整 16 场景三平台实机执行（本轮已覆盖 NT02/NT05/NT08/NT12 关键项）、N07 独立入口令牌认证、R02 attach/队列语义、新批次 Compose/K8s 回归。
+
+### 2026-09-18 第七批：Compose 失败归因修复 + dev 镜像更新
+
+- `userapp_hot_deployment_builtin_contract` 失败归因：fixture（`hot_contract.py`，d1d41372 改直觉参数序）要求 `serve --workspace`，本地 `dev-app-runtime:latest`（2 天前）内是旧 app-cli（无 clap global）→ exit 2。**修复**：`docker/build-app-runtime.py` pingap pin 0.14.1→0.14.3（`54ab0c12`，版本同步点补齐）；下载 0.14.3 双架构 tarball 入 cache；`make docker-build-app-runtime` 重建——新镜像实测 `serve --workspace --help` exit 0 + pingap 0.14.3。单场景干净报告 PASS（`reports/a1383b7f`）
+- 前两轮 Compose 作废均为运行期间提交/并行写入触发 source-drift（指纹机制核对 run.py:406——静态未提交文件不触发）
+- 用户 M1–M5/nuwax 对齐提交（`079df176`..`27fb03ef`）叠加后：app-cli 218/218、e2e 编译通过；全量 Compose 在合并 HEAD 上重跑中
+
+**stash@{0} 说明**：上轮被中断的干净运行持有并行会话 WIP（22 文件，基于 d0c89ebb）；用户已提交 M1–M5 演进版。stash 非本轮产物，保留未动——由用户决定是否还需要。
