@@ -156,8 +156,10 @@ async fn builder_fenced_by_current_operation(
     _state: &AppState,
     identity: &shared_types::UserAppLifecycleRecord,
 ) -> Result<bool> {
-    Ok(identity.active_operations.dev.is_some()
-        || identity.active_operations.application.is_some())
+    Ok(
+        identity.active_operations.dev.is_some()
+            || identity.active_operations.application.is_some(),
+    )
 }
 
 pub(crate) async fn ensure_userapp_builder_probed(
@@ -671,9 +673,10 @@ mod control_error_tests {
             state: shared_types::UserAppOperationState::RecoveryRequired,
             step: "claimed".into(),
         };
-        let error =
-            anyhow::Error::new(shared_types::UserAppStoreError::OperationInProgress(blocker))
-                .context("admission");
+        let error = anyhow::Error::new(shared_types::UserAppStoreError::OperationInProgress(
+            blocker,
+        ))
+        .context("admission");
         let response = control_error(&error).into_response();
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
         let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");

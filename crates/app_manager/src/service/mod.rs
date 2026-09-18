@@ -149,11 +149,8 @@ impl AppService {
         &self,
         app_id: &str,
     ) -> AppResult<AppOperationGuard> {
-        self.acquire_process_release_lock_scoped(
-            app_id,
-            shared_types::UserAppOperationScope::Prod,
-        )
-        .await
+        self.acquire_process_release_lock_scoped(app_id, shared_types::UserAppOperationScope::Prod)
+            .await
     }
 
     /// Scope-aware variant: dev-scope operations take the builder-family

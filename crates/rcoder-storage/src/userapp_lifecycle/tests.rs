@@ -93,7 +93,10 @@ async fn admission_metadata_is_atomic(store: &dyn UserAppLifecycleStore) {
     assert_eq!(committed.name.as_deref(), Some("admitted-name"));
     assert_eq!(committed.metadata_revision, app.metadata_revision + 1);
     assert_eq!(
-        committed.active_operations.slot(op.scope).map(String::as_str),
+        committed
+            .active_operations
+            .slot(op.scope)
+            .map(String::as_str),
         Some(op.operation_id.as_str())
     );
     assert_eq!(op.admitted_metadata, req.metadata);
@@ -1073,10 +1076,7 @@ async fn sqlite_legacy_pointer_records_migrate_into_scope_slots() {
     terminal.app_id = "legacy-terminal-app".into();
     let terminal_op = operation(store.admit(&terminal).await.unwrap());
     complete(&store, &terminal_op, State::Succeeded).await;
-    store
-        .ensure_identity("legacy-idle-app")
-        .await
-        .unwrap();
+    store.ensure_identity("legacy-idle-app").await.unwrap();
     store.close().await;
 
     // 降级到旧 JSON 形态：去掉 scope、槽位还原为 current_operation_id 单指针
@@ -1096,7 +1096,10 @@ async fn sqlite_legacy_pointer_records_migrate_into_scope_slots() {
         ("legacy-dev-app", Some(dev_running.operation_id.clone())),
         ("legacy-prod-app", Some(prod_op.operation_id.clone())),
         // 防御性旧数据：终态操作仍被指针引用（终态不得迁移为占槽）
-        ("legacy-terminal-app", Some(terminal_op.operation_id.clone())),
+        (
+            "legacy-terminal-app",
+            Some(terminal_op.operation_id.clone()),
+        ),
         ("legacy-idle-app", None),
     ] {
         sqlx::query("UPDATE userapp_lifecycles SET record=json_set(json_remove(record,'$.active_operations'),'$.current_operation_id',$2) WHERE app_id=$1")
@@ -1194,10 +1197,7 @@ async fn sqlite_scope_migration_aborts_on_dangling_pointer_and_unknown_kind() {
         let mut req = request(&format!("legacy-{label}"), Kind::Start);
         req.app_id = format!("legacy-{label}-app");
         let op = operation(store.admit(&req).await.unwrap());
-        let running = store
-            .advance(&progress(&op, State::Running))
-            .await
-            .unwrap();
+        let running = store.advance(&progress(&op, State::Running)).await.unwrap();
         store.close().await;
         let legacy = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -1238,8 +1238,7 @@ async fn sqlite_scope_migration_aborts_on_dangling_pointer_and_unknown_kind() {
             .await
             .unwrap();
         legacy.close().await;
-        let result =
-            SqliteUserAppStore::open(&directory.path().join("userapp.sqlite3")).await;
+        let result = SqliteUserAppStore::open(&directory.path().join("userapp.sqlite3")).await;
         assert!(result.is_err(), "{label} must block the migration");
         // 失败不半提交：直连检查旧形态未被改写（scope 仍缺失）
         let inspect = sqlx::sqlite::SqlitePoolOptions::new()

@@ -307,7 +307,10 @@ impl AppService {
             if identity.lifecycle_id != current.lifecycle_id || identity.state != expected_state {
                 return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
             }
-            if identity.active_operations.slot(current.scope).map(String::as_str)
+            if identity
+                .active_operations
+                .slot(current.scope)
+                .map(String::as_str)
                 != Some(current.operation_id.as_str())
             {
                 return Err(AppOperationError::Conflict(

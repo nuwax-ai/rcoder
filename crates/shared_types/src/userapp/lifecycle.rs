@@ -454,9 +454,13 @@ impl UserAppActiveOperationRecords {
         }
     }
     pub fn iter(&self) -> impl Iterator<Item = &UserAppOperationRecord> {
-        [self.dev.as_ref(), self.prod.as_ref(), self.application.as_ref()]
-            .into_iter()
-            .flatten()
+        [
+            self.dev.as_ref(),
+            self.prod.as_ref(),
+            self.application.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
     }
 }
 
