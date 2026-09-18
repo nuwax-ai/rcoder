@@ -42,3 +42,25 @@ nonzero expected test count and remove only the container/database it created.
 
 Without strict mode these integration cases remain environment-gated for ordinary
 workspace test runs. That skip behavior is not E2E acceptance evidence.
+
+## Operation scopes and active-operation slots (2026-09)
+
+Each operation persists a server-derived `scope` (`Dev` builder resources,
+`Prod` production runtime, `Application` both environments). The lifecycle
+record carries `active_operations {dev, prod, application}` instead of the
+former single `current_operation_id`: admission occupies only the request
+kind's scope slot, a terminal commit clears only that slot, and advance
+validates ownership through the operation's own slot. Cross-scope operations
+never fence each other; an application-scope operation requires every slot to
+be idle and itself occupies the application slot in the same transaction that
+flips the lifecycle to `Deleting`.
+
+Migration 0007 backfills `scope` from the kind and rewrites the single
+pointer into its scope slot; terminal pointed operations leave all slots
+empty. A dangling pointer or an unknown kind aborts the whole migration
+transaction (SQLite raises through temporary triggers; PostgreSQL through a
+DO block) so no half-migrated state is accepted. Migration must run under the
+same rollout rule above: stop old writers first; new readers fail closed on
+unmigrated rows instead of guessing a scope. Operation leases follow the same
+scope: dev operations require builder-family runtime receipts
+(`acquire_builder_family_operation`), prod/application the app family.

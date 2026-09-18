@@ -35,6 +35,28 @@ REQUIRED = {
     },
 }
 
+REQUIRED['userapp_scope_isolation_during_deploy'] = {
+    'builder/runtime artifact toolchains are compatible',
+    'create-workspace（ensure builder + owner 注册）',
+    'template-cli 全量模板初始化（init --next + 6×add）',
+    'workspace 根含 workspace.manifest.toml + 7 个子项目目录',
+    'build 受理（200 + task_id + artifact_path 预生成）',
+    'build 终态 = completed（7 服务全量构建成功）',
+    'completed 快照含 release_id/sha256/size_bytes/file_name',
+    'tasks cancel 幂等（已终态 → already_terminal=true）',
+    'tasks SSE 回放（终态后连流 → 全量事件 + completed + 自然关流）',
+    'static 取包 + sha256 与任务快照一致',
+    '部署在途窗口捕获（current 数组含非终态 StartDeployment）',
+    'dev restart 与 prod 部署并发 → 独立受理（无 conflicting 409）',
+    'current 数组双 scope 同现（Dev RestartBuilder + Prod 部署族）',
+    '隔离场景部署终态 running（并发不破坏部署）',
+    '同域并发 restart → 恰一胜者 + 败者 409 带 blocker.scope=Dev',
+    'prod image and container identity recorded before cleanup',
+    'prod diagnostics captured before deletion',
+    'prod delete purge 回收',
+    '删除后流量转 502（backend 已注销）',
+}
+
 REQUIRED['userapp_deploy_full_chain'] |= {
     f'流量七路[{name}]就绪' for name in (
         'next /', 'react /react/', 'vue /vue/', 'go /api/go/ready',

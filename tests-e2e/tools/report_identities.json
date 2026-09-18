@@ -442,5 +442,11 @@
       "scenario": "userapp_dev_two_users_share_app",
       "backend": "compose"
     }
+  ],
+  "userapp_scope_isolation_during_deploy": [
+    {
+      "scenario": "userapp_scope_isolation_during_deploy",
+      "backend": "compose"
+    }
   ]
 }

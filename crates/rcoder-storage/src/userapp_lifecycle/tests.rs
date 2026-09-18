@@ -1442,6 +1442,8 @@ async fn postgres_real_transactions_and_restart_contract() {
         configuration_policy_is_transactional(&store).await;
         deletion_success_requires_committed_evidence(&store).await;
         control_snapshot_links_identity_and_operation(&store).await;
+        cross_scope_admission_is_independent(&store).await;
+        dev_uncertainty_does_not_block_prod(&store).await;
         let a = store.ensure_identity("contract-app").await.unwrap();
         assert_eq!(a, store.ensure_identity("contract-app").await.unwrap());
         let first = request("first", Kind::EnsureBuilder);

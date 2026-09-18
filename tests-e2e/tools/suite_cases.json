@@ -38,7 +38,8 @@
     "userapp_static_proxy_escape_build_fails"
   ],
   "compose_userapp_deploy": [
-    "userapp_deploy_full_chain"
+    "userapp_deploy_full_chain",
+    "userapp_scope_isolation_during_deploy"
   ],
   "compose_userapp_dev": [
     "userapp_agent_dispatch_anthropic",

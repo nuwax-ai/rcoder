@@ -1634,3 +1634,268 @@ async fn userapp_deploy_full_chain() {
     let path = report.path.display().to_string();
     assert!(report.finish(), "场景失败：断言明细见 {path}");
 }
+
+/// §7.1/7.4/7.6 compose 场景：prod 部署在途期间 dev 域操作独立受理；
+/// current 数组双 scope 同现；同域并发 409 携带结构化 blocker；部署不受
+/// 并发影响到达 running。修复前：dev restart 在 prod StartDeployment 在途时
+/// 收 ERR_CONFLICT（单槽互斥），本场景在该窗口内必须成功。
+#[tokio::test]
+async fn userapp_scope_isolation_during_deploy() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_scope_isolation_during_deploy";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    if preflight(&report).await.is_none() {
+        report.skip("镜像前置不满足（见 diagnostic 行）");
+        return;
+    }
+
+    let app = format!(
+        "aiso{}p{}",
+        &env.run_tag.replace('_', "")[..10],
+        std::process::id() % 1000
+    );
+    let user = "e2e-iso-user";
+
+    // ①-④ 与 full_chain 相同的 workspace/模板/构建/取包准备
+    let (ws_s, ws_b) = post_json(
+        &env,
+        "/api/v1/userapp/workspace",
+        json!({"app_id": app, "user_id": user}),
+    )
+    .await;
+    let ws_ok = ws_s.is_success() && http_ok(&ws_b);
+    report.assert_hard(
+        "create-workspace（ensure builder + owner 注册）",
+        ws_ok,
+        format!("HTTP {ws_s}, body 截断: {}", trunc(&ws_b, 150)),
+    );
+    if !ws_ok {
+        cleanup_builder(&app);
+        let path = report.path.display().to_string();
+        assert!(report.finish(), "场景失败：断言明细见 {path}");
+        return;
+    }
+    if init_full_template(&env, &report, &app, user).await {
+        assert_template_files(&env, &report, &app, user).await;
+    }
+    let Some((release_id, sha256)) = build_to_completion(&env, &report, &app, user).await else {
+        cleanup_builder(&app);
+        let path = report.path.display().to_string();
+        assert!(report.finish(), "场景失败：断言明细见 {path}");
+        return;
+    };
+    if fetch_and_verify_artifact(&env, &report, &app, user, &release_id, &sha256)
+        .await
+        .is_none()
+    {
+        cleanup_builder(&app);
+        let path = report.path.display().to_string();
+        assert!(report.finish(), "场景失败：断言明细见 {path}");
+        return;
+    }
+
+    let artifact_url = format!(
+        "{}/api/v1/userapp/static/{app}?release_id={release_id}&user_id={user}",
+        rcoder_internal()
+    );
+    let deploy_body = json!({
+        "user_id": user, "url": artifact_url, "release_id": release_id,
+        "sha256": sha256, "request_id": format!("iso-deploy-{app}")
+    });
+    let deploy_path = format!("/api/v1/userapp/{app}/start");
+
+    // ⑤ 并发窗口：部署请求在后台任务真实发出；轮询 current 直到 prod 槽可见
+    let deploy_http = env.http.clone();
+    let deploy_base = env.rcoder.clone();
+    let deploy_task_path = deploy_path.clone();
+    let deploy_task = tokio::spawn(async move {
+        let resp = deploy_http
+            .post(format!("{deploy_base}{deploy_task_path}"))
+            .timeout(Duration::from_secs(120))
+            .json(&deploy_body)
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                let s = r.status();
+                let b = r.json().await.unwrap_or(Value::Null);
+                (s, b)
+            }
+            Err(e) => (
+                reqwest::StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": e.to_string()}),
+            ),
+        }
+    });
+
+    let mut prod_seen = false;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(60) && !prod_seen {
+        let (s, b) = get_json(
+            &env,
+            &format!("/api/v1/userapp/{app}/operations/current?user_id={user}"),
+        )
+        .await;
+        // 兼容新旧形状：新=数组（含 scope），旧=单对象（修复前反例取证用）
+        let prod_active = |op: &Value| {
+            op["kind"].as_str() == Some("StartDeployment")
+                && matches!(op["state"].as_str(), Some("Pending") | Some("Running"))
+        };
+        let seen = s.is_success()
+            && http_ok(&b)
+            && (b["data"].as_array().is_some_and(|ops| ops.iter().any(prod_active))
+                || (b["data"].is_object() && prod_active(&b["data"])));
+        if seen {
+            prod_seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    report.assert_hard(
+        "部署在途窗口捕获（current 数组含非终态 StartDeployment）",
+        prod_seen,
+        format!("{:.1}s 轮询结果", t0.elapsed().as_secs_f64()),
+    );
+    if !prod_seen {
+        deploy_task.abort();
+        cleanup_builder(&app);
+        let path = report.path.display().to_string();
+        assert!(report.finish(), "场景失败：断言明细见 {path}");
+        return;
+    }
+
+    // ⑤b 窗口内并发两路（后台任务真实在飞）：dev restart（修复前 409 反例）
+    // + 同域第二 prod start（冲突反例）；同时轮询 current 观察双 scope 同现。
+    let restart_http = env.http.clone();
+    let restart_base = env.rcoder.clone();
+    let restart_app = app.clone();
+    let restart_user = user.to_owned();
+    let restart_task = tokio::spawn(async move {
+        let resp = restart_http
+            .post(format!("{restart_base}/computer/pod/restart"))
+            .timeout(Duration::from_secs(120))
+            .json(&json!({"user_id": restart_user, "project_id": format!("iso-{restart_app}"), "app_id": restart_app, "app_stage": "dev", "service_type": "userapp"}))
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                let s = r.status();
+                let b = r.json().await.unwrap_or(Value::Null);
+                (s, b)
+            }
+            Err(e) => (
+                reqwest::StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": e.to_string()}),
+            ),
+        }
+    });
+    let second_http = env.http.clone();
+    let second_base = env.rcoder.clone();
+    let second_path = deploy_path.clone();
+    let second_body = json!({
+        "user_id": user, "url": artifact_url, "release_id": release_id,
+        "sha256": sha256, "request_id": format!("iso-deploy-b-{app}")
+    });
+    let second_task = tokio::spawn(async move {
+        let resp = second_http
+            .post(format!("{second_base}{second_path}"))
+            .timeout(Duration::from_secs(120))
+            .json(&second_body)
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                let s = r.status();
+                let b = r.json().await.unwrap_or(Value::Null);
+                (s, b)
+            }
+            Err(e) => (
+                reqwest::StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": e.to_string()}),
+            ),
+        }
+    });
+
+    // ⑤c current 数组双 scope 同现（Dev RestartBuilder + Prod 部署族）
+    let mut both_scopes = false;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(20) {
+        let (s, b) = get_json(
+            &env,
+            &format!("/api/v1/userapp/{app}/operations/current?user_id={user}"),
+        )
+        .await;
+        let dev_active = |op: &Value| {
+            op["scope"].as_str() == Some("Dev") && op["kind"].as_str() == Some("RestartBuilder")
+        };
+        let prod_active_any = |op: &Value| {
+            op["scope"].as_str() == Some("Prod")
+                && !op["state"]
+                    .as_str()
+                    .is_some_and(|st| st == "Succeeded" || st == "Failed")
+        };
+        if s.is_success()
+            && http_ok(&b)
+            && let Some(ops) = b["data"].as_array()
+            && ops.iter().any(dev_active)
+            && ops.iter().any(prod_active_any)
+        {
+            both_scopes = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    report.assert_hard(
+        "current 数组双 scope 同现（Dev RestartBuilder + Prod 部署族）",
+        both_scopes,
+        "20s 内未同时观察到两 scope 的活动操作".to_owned(),
+    );
+
+    // ⑤b 断言：dev restart 与 prod 部署并发 → 独立受理（修复前 ERR_CONFLICT）
+    let (rs, rb) = restart_task
+        .await
+        .expect("restart task join");
+    let not_blocked = rs.is_success() && rb["success"].as_bool().unwrap_or(false);
+    report.assert_hard(
+        "dev restart 与 prod 部署并发 → 独立受理（无 conflicting 409）",
+        not_blocked,
+        format!("HTTP {rs}, body 截断: {}", trunc(&rb, 200)),
+    );
+
+    // ⑤e 同域并发反例：窗口内第二个 prod start（不同 request_id）→
+    // 信封 ERR_CONFLICT + 结构化 blocker.scope=Prod。修复前：冲突但无 blocker 字段。
+    let (cs, cb) = second_task.await.expect("second start task join");
+    let same_scope_conflict = cs.is_success()
+        && cb["code"].as_str() == Some("ERR_CONFLICT")
+        && cb["blocker"]["scope"].as_str() == Some("Prod")
+        && cb["blocker"]["kind"].as_str() == Some("StartDeployment")
+        && cb["blocker"]["operation_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty());
+    report.assert_hard(
+        "同域并发 prod start → 信封 ERR_CONFLICT + blocker.scope=Prod",
+        same_scope_conflict,
+        format!("HTTP {cs}, body 截断: {}", trunc(&cb, 240)),
+    );
+
+    // ⑤d 部署收敛：并发 dev 操作不破坏 prod 部署
+    let (ds, db) = deploy_task.await.expect("deploy task join");
+    let deploy_ok = ds.is_success()
+        && http_ok(&db)
+        && db["data"]["status"].as_str() == Some("running");
+    report.assert_hard(
+        "隔离场景部署终态 running（并发不破坏部署）",
+        deploy_ok,
+        format!("HTTP {ds}, body 截断: {}", trunc(&db, 200)),
+    );
+
+    // ⑥ 回收（复用 full_chain 清理链）
+    cleanup_prod(&env, &report, &app, user).await;
+    cleanup_builder(&app);
+
+    let path = report.path.display().to_string();
+    assert!(report.finish(), "场景失败：断言明细见 {path}");
+}

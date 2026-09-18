@@ -37,6 +37,11 @@ SQLITE_CASES = (
     'sqlite_deletion_success_requires_evidence',
     'another_executor_cannot_advance_a_running_operation',
     'cancelled_admission_waiting_for_sqlite_writer_does_not_leak_a_transaction',
+    'sqlite_cross_scope_admission_is_independent',
+    'sqlite_dev_uncertainty_does_not_block_prod',
+    'scoped_terminals_clear_own_slots_and_blocker_is_structured',
+    'sqlite_legacy_pointer_records_migrate_into_scope_slots',
+    'sqlite_scope_migration_aborts_on_dangling_pointer_and_unknown_kind',
 )
 
 SQLITE_EXTRA_CASES = {
