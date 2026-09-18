@@ -10,6 +10,6 @@
 - [x] 完成受影响 Rust 检查与 Compose 业务验证；不可用时记录准确阻塞项。（nextest 417/417 默认+全 feature、clippy/fmt 干净；Compose 新场景 13 断言全绿 + build_rules 套件；dev-hot 环境刷新受操作约束跳过，已记录）
 - [x] 修正原事故文档，写存量应用定点处置和分发步骤。（.zcode 分析文档 + legacy-app-fix.md）
 - [x] 创建 verification.md，记录每仓库基线、命令/退出码、证据、未运行项。
-- [ ] 按仓库精确暂存并提交本任务文件或改动块；不 git add -A，不 push、不发布、不部署。
+- [x] 按仓库精确暂存并提交本任务文件或改动块；不 git add -A，不 push、不发布、不部署。（rcoder：5bafc354 代码 + 79272b5f 文档 + 本收尾提交；模板仓库：3adbcfd）
 
 未完成或受阻的项目保持未勾选。源码修复不等于存量 app 110 已恢复，也不等于预装模板 CLI 已升级。

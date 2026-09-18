@@ -77,7 +77,11 @@ shim：`/tmp/pnpm-10.34.5-shim/pnpm` → `exec node ~/.npm/_npx/381139ee5d646d31
 | 命令 | 退出码 | 结果 |
 |---|---|---|
 | `python3 tests-e2e/tools/run.py --suite compose_userapp_build_rules --filter userapp_devbuild_no_lockfile_pnpm_install` | 0 | pass；报告 `tests-e2e/reports/fd0c730c116b4fc2831f53a321f0d7bd/`，13 hard 断言全绿 |
-| `python3 tests-e2e/tools/run.py --suite compose_userapp_build_rules` | （见下） | |
+| `python3 tests-e2e/tools/run.py --suite compose_userapp_build_rules` | 0 | 4/4 pass（含新场景）；报告 `tests-e2e/reports/92150e75b515420a89c8d9590b0d6f6d/` |
+
+注：套件首轮全量运行（报告 `599655e3464a4005ada2df32f56ffb3d`）4 场景虽全部
+pass，但启动器判定 source changed during run（运行期间编辑了本 specs 文档），
+按漂移检查规则作废；随后在无源码改动下重跑得上述有效结果。
 
 新场景证据（JSONL 断言名）：`无 lockfile dev/start completed（--no-frozen-lockfile 安装成功）`、`devbuild 生成 pnpm-lock.yaml（修复前此处 ERR_PNPM_NO_LOCKFILE 失败）`、`dev/list → pid>0（devrun 存活）`、`devrun 服务内容经代理可达（node server.js）`、`frozen + 过期 lockfile → 任务 failed（错误如实传播）`、`dev/stop → Stopped` 全部 OK；verdict=pass。
 
