@@ -56,9 +56,12 @@ fn computer_ctx(q: &GitQuery) -> Option<ComputerContext> {
 /// 4. 目标目录不存在 → `Resource` 错（"Workspace does not exist"，TS 同款——
 ///    git 操作只面向已存在工作区，不创建）
 ///
-/// 有意偏离：header userApp 无 appId 且无 body 定位字段时，TS 因 serviceContext
-/// 构造失败被置 null 报 "workspaceType is required…"，此处统一报
-/// "appId(projectId) is required…"——均 400，不复刻 serviceContext-null 概念。
+/// 有意偏离：header 为 userApp/normalProject 且缺 appId 时，TS 的
+/// `resolveServiceContext` throw（缺 appId）被 `extractServiceContext` catch
+/// 置 null，类型回退 body 显式 workspaceType——body 为 taskAgent/pageApp 时
+/// 按回退值定位甚至 200（静默错定位的残留形态）；此处按 header 归一类型
+/// fail-fast 400 "appId(projectId) is required…"（方向更严），不复刻
+/// throw-catch-null 回退链。
 async fn resolve_target(
     state: &AppState,
     body_workspace_type: Option<&str>,

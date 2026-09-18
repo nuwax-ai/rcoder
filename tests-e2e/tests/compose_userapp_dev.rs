@@ -614,8 +614,8 @@ async fn userapp_dev_git_service_context() {
 /// workspaceType=userApp/serviceType/appId/workspacePath）并存 → init/add/commit/
 /// status/log 全通。锁三点：①v1.4.7 四值词表 + workspacePath 绑定：userApp 是
 /// 合法会话类型、绑定直接定位（v1.4.6"白名单外必 400"论证已随上游修复作废）；
-/// ②`/api/git/log` 走统一收口（TS 侧 6321f7e 唯独漏传 serviceContext 的端点，
-/// 同形态在 TS 上 400——Rust 全端点收口的回归锁）；③commit 数据面回读：log 读回
+/// ②`/api/git/log` 走统一收口（TS 6321f7e 曾唯独漏传该端点、a29cbc0/1.4.7
+/// 已补齐——Rust 自移植起即全端点收口的回归锁）；③commit 数据面回读：log 读回
 /// 刚提交的 message（git 操作真实作用于 workspacePath 指向工作区，非仅 HTTP 200）。
 #[tokio::test]
 async fn userapp_dev_git_full_outbound_shape() {
