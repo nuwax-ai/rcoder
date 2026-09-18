@@ -106,6 +106,17 @@ pub async fn try_start() -> Result<String, String> {
         FileServerProxyConfig::default()
     });
 
+    // N07：非 loopback 监听必须有令牌（原生安全默认——对外暴露的入口
+    // 不裸奔；容器形态 0.0.0.0 由编排层网络边界保护 + 平台注入令牌）
+    let host = config.listen_host.trim();
+    let is_loopback = matches!(host, "127.0.0.1" | "::1" | "localhost");
+    if !is_loopback && config.auth_token.is_none() {
+        return Err(format!(
+            "refusing to listen on non-loopback {host} without FILE_SERVER_PROXY_TOKEN \
+             (set the token or bind 127.0.0.1)"
+        ));
+    }
+
     // N03：host 可配（原生 loopback / 容器 0.0.0.0）；端口 0 = 动态分配，
     // 绑定后以 local_addr 真实地址为准（不返回 ":0"）
     let requested = format!("{}:{}", config.listen_host, config.listen_port);

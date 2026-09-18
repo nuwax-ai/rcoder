@@ -134,6 +134,19 @@ async fn proxy_request(
 ) -> Result<hyper::Response<ProxyBody>, std::convert::Infallible> {
     let (parts, body) = req.into_parts();
 
+    // N07：令牌校验最先（401 早返——凭据不进日志；常量时间比较不必要，
+    // 令牌非密钥协商而是准入配对）
+    if let Some(expected) = config.auth_token.as_deref() {
+        let provided = parts
+            .headers
+            .get("X-Proxy-Token")
+            .and_then(|value| value.to_str().ok());
+        if provided != Some(expected) {
+            warn!("request rejected: missing or invalid proxy token");
+            return Ok(unauthorized());
+        }
+    }
+
     let path = parts.uri.path();
     let service_type = parts
         .headers
@@ -257,6 +270,17 @@ fn bad_request(msg: &str) -> hyper::Response<ProxyBody> {
 }
 
 /// 404：AllRust 白名单外的路径（此入口不服务该路径——不放行 8086 全量路由面）。
+fn error_body(msg: &str) -> ProxyBody {
+    Box::pin(http_body_util::Full::new(Bytes::from(msg.to_string())).map_err(|e| match e {}))
+}
+
+fn unauthorized() -> hyper::Response<ProxyBody> {
+    hyper::Response::builder()
+        .status(hyper::StatusCode::UNAUTHORIZED)
+        .body(error_body("unauthorized"))
+        .unwrap_or_else(|_| unreachable!("static 401 response"))
+}
+
 fn not_found(msg: &str) -> hyper::Response<ProxyBody> {
     error_response(hyper::StatusCode::NOT_FOUND, msg)
 }

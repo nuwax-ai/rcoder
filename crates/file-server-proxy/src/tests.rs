@@ -102,6 +102,7 @@ fn ts_first_policy_routes_by_header_and_path() {
 #[test]
 fn all_rust_policy_routes_everything_to_rust() {
     let c = FileServerProxyConfig {
+        auth_token: None,
         listen_host: "127.0.0.1".to_string(),
         listen_port: 60000,
         rust_upstream_port: 60002,
@@ -130,6 +131,7 @@ fn all_rust_policy_routes_everything_to_rust() {
 #[test]
 fn all_ts_policy_routes_everything_to_ts() {
     let c = FileServerProxyConfig {
+        auth_token: None,
         listen_host: "127.0.0.1".to_string(),
         listen_port: 60000,
         rust_upstream_port: 8086,
@@ -196,6 +198,7 @@ fn parse_route_policy_accepts_wire_vocabulary() {
 #[test]
 fn custom_ports_respected() {
     let c = FileServerProxyConfig {
+        auth_token: None,
         listen_host: "127.0.0.1".to_string(),
         listen_port: 61000,
         rust_upstream_port: 18086,
@@ -249,6 +252,7 @@ fn all_rust_whitelist_gates_rust_upstream_surface() {
 async fn dynamic_port_publishes_real_bound_address() {
     // N03：端口 0 = 动态分配——status 返回真实绑定地址（非 ":0"）
     init(FileServerProxyConfig {
+        auth_token: None,
         listen_host: "127.0.0.1".to_string(),
         listen_port: 0,
         ..Default::default()
@@ -268,6 +272,7 @@ fn instance_lock_domain_is_stable_per_listen_semantics() {
     // N06：固定端口 → 稳定锁域（host-port 键）；动态端口 → per-invocation
     // 独立域（多实例并行合法）
     let fixed = FileServerProxyConfig {
+        auth_token: None,
         listen_host: "127.0.0.1".to_string(),
         listen_port: 60000,
         ..Default::default()
@@ -280,4 +285,41 @@ fn instance_lock_domain_is_stable_per_listen_semantics() {
         ..fixed.clone()
     };
     assert!(test_lock_file(&dynamic).is_ok());
+}
+
+#[tokio::test]
+async fn non_loopback_without_token_is_refused() {
+    // N07：对外监听无令牌 → fail-fast（不裸奔）；loopback 无令牌合法
+    init(FileServerProxyConfig {
+        auth_token: None,
+        listen_host: "0.0.0.0".to_string(),
+        listen_port: 0,
+        ..Default::default()
+    });
+    let error = try_start()
+        .await
+        .expect_err("must refuse non-loopback without token");
+    assert!(
+        error.contains("without FILE_SERVER_PROXY_TOKEN"),
+        "got: {error}"
+    );
+}
+
+// N07 反例 2：带 token 的非 loopback 可启动（bind + 锁正常）。
+// init 是 OnceLock 幂等注册（首次生效）——nextest 每测试独立进程，
+// 本进程首次注册即 token 形态。
+#[tokio::test]
+async fn non_loopback_with_token_starts() {
+    init(FileServerProxyConfig {
+        auth_token: Some("secret".to_string()),
+        listen_host: "0.0.0.0".to_string(),
+        listen_port: 0,
+        ..Default::default()
+    });
+    let address = try_start().await.expect("token + public bind must start");
+    stop().await.expect("stop");
+    assert!(
+        !address.ends_with(":0"),
+        "real bound address, got {address}"
+    );
 }

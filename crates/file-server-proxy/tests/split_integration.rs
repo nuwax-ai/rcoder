@@ -69,6 +69,7 @@ async fn service_type_header_decides_upstream_and_lifecycle() {
     spawn_marker_upstream(TS_UPSTREAM_PORT, "upstream-ts").await;
 
     file_server_proxy::init(FileServerProxyConfig {
+        auth_token: None,
         listen_host: "127.0.0.1".to_string(),
         listen_port: PROXY_PORT,
         rust_upstream_port: RUST_UPSTREAM_PORT,

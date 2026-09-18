@@ -29,6 +29,11 @@ pub struct FileServerProxyConfig {
     /// 路由策略（两种部署形态）
     #[serde(default)]
     pub policy: RoutePolicy,
+    /// N07：独立入口令牌（env `FILE_SERVER_PROXY_TOKEN`）。Some = 所有请求
+    /// 须带 `X-Proxy-Token` 头（缺失/不符 401）；None 且监听非 loopback →
+    /// 启动拒绝（fail-fast，不裸奔对外）。凭据不进日志。
+    #[serde(default)]
+    pub auth_token: Option<String>,
     /// dev 生命周期路径（start/stop/restart/keep-alive 等 7 端点）在**所有策略**下
     /// 导向 Rust 上游（Custom Page 预览协调收口；与 rcoder `preview_coordinator.enabled`
     /// 同源配置渲染）。默认 false=分流行为与历史完全一致。
@@ -51,6 +56,7 @@ impl Default for FileServerProxyConfig {
             rust_upstream_port: 8086,
             ts_upstream_port: NUWAX_FILE_SERVER_INTERNAL_PORT,
             policy: RoutePolicy::default(),
+            auth_token: None,
             coordinated_dev_lifecycle: false,
         }
     }
