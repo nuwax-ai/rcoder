@@ -25,6 +25,7 @@ pub mod idle;
 pub mod log;
 pub mod manifest;
 pub mod orchestration_events;
+pub mod owner_dispatch;
 pub mod platform;
 pub mod proxy;
 pub mod run_service;

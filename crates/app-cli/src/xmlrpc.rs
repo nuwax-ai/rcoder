@@ -49,9 +49,7 @@ impl RpcFault {
             .get("faultString")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        code == Some(10)
-            || message.contains("no process group")
-            || message.contains("BAD_NAME")
+        code == Some(10) || message.contains("no process group") || message.contains("BAD_NAME")
     }
 }
 
@@ -531,6 +529,8 @@ mod r11_tests {
         assert!(!is_no_such_process(
             &RpcFault(serde_json::json!({"faultString": "unknown"})).into()
         ));
-        assert!(!is_no_such_process(&RpcFault(serde_json::Value::Null).into()));
+        assert!(!is_no_such_process(
+            &RpcFault(serde_json::Value::Null).into()
+        ));
     }
 }

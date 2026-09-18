@@ -329,6 +329,9 @@ fn validate_upstream_destination(name: &str, address: &str) -> Result<()> {
     Ok(())
 }
 
+/// 便捷入口（容器字面量根；生产路径走 [`validate_plugin_paths_with_roots`]
+/// 带实际布局根）——测试与文档用途保留。
+#[cfg(test)]
 fn validate_plugin_paths(name: &str, plugin: &impl serde::Serialize) -> Result<()> {
     validate_plugin_paths_with_roots(name, plugin, &[])
 }

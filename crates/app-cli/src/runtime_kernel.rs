@@ -68,7 +68,7 @@ pub(crate) struct AdmissionRejection {
 }
 
 /// 持久状态根布局（identity/desired/operations/events 单一根）。
-pub(crate) struct RuntimeStore {
+pub struct RuntimeStore {
     root: PathBuf,
 }
 
@@ -88,7 +88,7 @@ pub(crate) struct RecoveryScan {
 /// `/v1/runtime/identity` 核验实例身份（[`endpoint_matches_identity`]）。
 /// 崩溃残留的旧记录（实例已换/地址已变）在核验时被拒绝（XP10）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct EndpointRecord {
+pub struct EndpointRecord {
     pub protocol_version: u32,
     pub application_id: String,
     pub workspace_id: String,
@@ -103,10 +103,7 @@ fn endpoint_path(state_root: &Path) -> PathBuf {
 /// 发现记录与远端 identity 的核验：全部身份字段一致才算命中。
 /// 任一不符（旧实例/错应用/协议不兼容）返回 false——调用方按
 /// "旧发现记录"处理：丢弃线索，不据此发认证请求。
-pub(crate) fn endpoint_matches_identity(
-    record: &EndpointRecord,
-    identity: &RuntimeIdentityView,
-) -> bool {
+pub fn endpoint_matches_identity(record: &EndpointRecord, identity: &RuntimeIdentityView) -> bool {
     record.protocol_version == identity.protocol_version
         && record.application_id == identity.application_id
         && record.workspace_id == identity.workspace_id
@@ -121,7 +118,7 @@ impl RuntimeStore {
     ///    source 根、`.run` 别名、任何入口都由平台指向同一目录（唯一锁域）。
     /// 2. 缺省 `{workspace 卷根}/.app-cli-state/{application_id}`——按应用
     ///    隔离（多 app 共享卷不互踩）；entry 别名无法归一时以 env 为准。
-    pub(crate) fn resolve_root(workspace: &Path, application_id: &str) -> Result<PathBuf> {
+    pub fn resolve_root(workspace: &Path, application_id: &str) -> Result<PathBuf> {
         let explicit = std::env::var_os("APP_CLI_STATE_ROOT").filter(|value| !value.is_empty());
         Self::resolve_root_with_explicit(workspace, application_id, explicit)
     }

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 /// 运行态排他锁（持有期间本机同项目唯一 owner）。
 ///
 /// Drop 释放锁文件句柄（平台自动释放排他锁），不删除锁文件。
-pub(crate) struct OwnerGuard {
+pub struct OwnerGuard {
     _file: File,
     /// 锁文件路径（诊断用；生产路径经 acquire 错误上下文携带）。
     #[allow(dead_code)]
