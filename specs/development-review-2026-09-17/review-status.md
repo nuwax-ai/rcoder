@@ -39,3 +39,7 @@
 - **CLI global**（`6aa01c1e`）：用户反馈 `app-cli --workspace X serve` 反直觉——运行参数（workspace/log-dir/admin-addr/pingap-bin/attach）声明 clap `global = true`，`app-cli serve --workspace X` 与顶层顺序均合法（解析测试锁定双顺序等价；app-cli 208/208）。包装脚本改回直觉形态 `serve --workspace`（镜像仓 `b398cbb`）。
 - **镜像发版**：build-agent-docker 全量 0.1.272（补齐 test 命名空间复制源：agent-platform-front/backend、mcp-proxy、mysql-migrate + 四核心镜像，双架构）+ 快速发版 0.1.273（重建 rcoder-k8s/agent-runner/app-runtime-base/app-runtime 含全部本轮修复与新 CLI；辅助镜像从 0.1.272 复制）。Helm Chart 0.1.272/0.1.273 均已推 ACR（nuwax-k8s-test，pingap=0.14.3 commit cd74a46）。
 - 部署入口（用户执行）：`./k8s/deploy.sh deploy k8s-test --storage-backend ceph`。
+
+### 既有 flaky 记录（非本轮引入）
+
+`serve_restart::rejected_native_serve_sigterm_does_not_clear_previous_active_owner`：空 workspace 二次 serve 偶发相位停在 idle（期望 orchestrating）。基线复现（stash 本轮改动后同条件 5 连跑 2 失败/3 通过，2026-09-18）——恢复分支时序敏感，与本轮 R03/N02 无关。归因待深入（怀疑 stale-owner 恢复判定竞态）；不删断言、不放宽期望。
