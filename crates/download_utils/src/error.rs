@@ -69,7 +69,6 @@ impl DownloadError {
     }
 }
 
-
 #[cfg(test)]
 mod r11_tests {
     use super::*;
