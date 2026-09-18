@@ -213,7 +213,9 @@ impl K8sServiceConfig {
     fn default_workspace_resolution_path(service_type: &ServiceType) -> String {
         match service_type {
             ServiceType::WebAgentRunner => crate::paths::WORKSPACE_ROOT.to_string(),
-            ServiceType::ComputerAgentRunner => crate::paths::COMPUTER_WORKSPACE_ROOT.to_string(),
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+                crate::paths::COMPUTER_WORKSPACE_ROOT.to_string()
+            }
             ServiceType::Userapp => "/app/app-workspace".to_string(),
             // UserappBuilder: per-app PVC 挂载点
             ServiceType::UserappBuilder => "/app/userapp-workspace".to_string(),
@@ -299,18 +301,18 @@ pub struct KubernetesConfig {
 impl KubernetesConfig {
     /// 获取指定服务类型的配置
     ///
-    /// 先按 `service_type.to_string()` 查;找不到再按旧名 "rcoder"(仅 WebAgentRunner)兼容。
-    /// 镜像 `MultiImageConfig::get_service_config` 的查找逻辑。
+    /// 先按家族归一键 `container_family().to_string()` 查;找不到再按旧名 "rcoder"
+    /// (仅 WebAgentRunner)兼容。镜像 `MultiImageConfig::get_service_config` 的查找逻辑。
     pub fn get_service_config(&self, service_type: &ServiceType) -> Option<&K8sServiceConfig> {
-        // 1. 按规范名查
-        let key = service_type.to_string();
+        // 1. 按规范名查（家族归一：共享容器的类型读同一份配置）
+        let key = service_type.container_family().to_string();
         if let Some(cfg) = self.services.get(&key) {
             return Some(cfg);
         }
         // 2. 旧名兼容(WebAgentRunner ↔ "rcoder")
         match service_type {
             ServiceType::WebAgentRunner => self.services.get("rcoder"),
-            ServiceType::ComputerAgentRunner => None,
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => None,
             ServiceType::Userapp | ServiceType::UserappBuilder => None,
         }
     }

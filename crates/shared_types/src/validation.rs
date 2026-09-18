@@ -285,15 +285,19 @@ pub fn validate_agent_work_dir(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 按 service_type 校验 `agent_work_dir`：绝对路径形态仅 ComputerAgentRunner
-/// 支持（Web 链路 work_dir 会流入容器挂载配置、UserappBuilder 定位键恒为
-/// app_id，均不可混入绝对路径——fail-fast 显式拒绝而非静默忽略）。
+/// 按 service_type 校验 `agent_work_dir`：绝对路径形态仅 Computer 族
+/// （ComputerAgentRunner 及共享容器的 ComputerNormalProject）支持——Web 链路
+/// work_dir 会流入容器挂载配置、UserappBuilder 定位键恒为 app_id，均不可混入
+/// 绝对路径（fail-fast 显式拒绝而非静默忽略）。
 pub fn validate_agent_work_dir_for_service(
     service_type: &crate::ServiceType,
     value: &str,
 ) -> Result<(), String> {
     match service_type {
-        crate::ServiceType::ComputerAgentRunner => validate_agent_work_dir(value),
+        // Computer 族（共享 per-user 容器）均支持绝对路径 work_dir
+        crate::ServiceType::ComputerAgentRunner | crate::ServiceType::ComputerNormalProject => {
+            validate_agent_work_dir(value)
+        }
         _ => {
             if is_absolute_path_like(value) {
                 Err("absolute agent_work_dir is only supported for ComputerAgentRunner".to_string())
@@ -598,6 +602,18 @@ mod tests {
         );
         assert!(
             validate_agent_work_dir_for_service(&ServiceType::ComputerAgentRunner, "custom_dir")
+                .is_ok()
+        );
+        // ComputerNormalProject（常规项目）：与 Computer 同臂放行绝对路径
+        assert!(
+            validate_agent_work_dir_for_service(
+                &ServiceType::ComputerNormalProject,
+                "/home/user/normalProject/p1"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_agent_work_dir_for_service(&ServiceType::ComputerNormalProject, "custom_dir")
                 .is_ok()
         );
         // Web/Userapp/UserappBuilder：单段现行语义，绝对路径显式拒绝

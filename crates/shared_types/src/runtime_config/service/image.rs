@@ -269,11 +269,10 @@ impl ServiceImageConfig {
     /// 优先使用显式配置的 workspace_resolution_path，
     /// 未配置时根据 service_type 使用默认值。
     pub fn effective_workspace_resolution_path(&self) -> String {
-        self.workspace_resolution_path
-            .clone()
-            .unwrap_or_else(|| match self.service_type {
+        self.workspace_resolution_path.clone().unwrap_or_else(|| {
+            match self.service_type {
                 ServiceType::WebAgentRunner => crate::paths::WORKSPACE_ROOT.to_string(),
-                ServiceType::ComputerAgentRunner => {
+                ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
                     crate::paths::COMPUTER_WORKSPACE_ROOT.to_string()
                 }
                 // Userapp 复用 rcoder-workspace PVC 的 apps subPath（部署侧挂到 /app/app-workspace）
@@ -281,7 +280,8 @@ impl ServiceImageConfig {
                 // UserappBuilder 完整开发容器: per-app RWO PVC 整卷挂载（与镜像
                 // start-up.sh 导出的 USERAPP_WORKSPACE_DIR 一致）
                 ServiceType::UserappBuilder => crate::paths::USERAPP_WORKSPACE_ROOT.to_string(),
-            })
+            }
+        })
     }
 
     /// 获取 workspace 在 sub-container 内的挂载路径

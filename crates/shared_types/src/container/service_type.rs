@@ -15,7 +15,7 @@ use utoipa::ToSchema;
 /// - 中划线格式（kebab-case）：web-agent-runner, computer-agent-runner
 /// - 大驼峰格式（PascalCase）：WebAgentRunner, ComputerAgentRunner
 /// - 旧枚举名（向后兼容）：RCoder, rcoder
-#[derive(Debug, Clone, PartialEq, Eq, Hash, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ToSchema)]
 pub enum ServiceType {
     /// Web Agent Runner 服务
     /// 提供完整的 AI 开发功能，包括项目管理、代码生成、文件操作等
@@ -25,6 +25,11 @@ pub enum ServiceType {
     /// 专注于代理运行和执行，提供轻量级的代理执行环境
     /// 容器标识为 user_id，用于桌面应用开发场景
     ComputerAgentRunner,
+    /// 常规项目（normal project）
+    /// 与 ComputerAgentRunner 复用同一 per-user 容器（identifier=user_id、同镜像、
+    /// 同容器名/PVC/挂载——见 `container_family()`），仅 agent 工作目录不同：
+    /// `/home/user/normalProject/{project_id}`。
+    ComputerNormalProject,
     /// 用户应用（Userapp）
     /// 由 app_manager 托管的用户业务应用（Java/Python/Go/前端等），区别于 agent。
     /// 容器标识为 app_id；镜像/命令/端口由调用方提供，不走 select_image。
@@ -61,6 +66,7 @@ impl std::fmt::Display for ServiceType {
         match self {
             ServiceType::WebAgentRunner => write!(f, "web-agent-runner"),
             ServiceType::ComputerAgentRunner => write!(f, "computer-agent-runner"),
+            ServiceType::ComputerNormalProject => write!(f, "computer-normal-project"),
             ServiceType::Userapp => write!(f, "user-app"),
             ServiceType::UserappBuilder => write!(f, "user-app-builder"),
         }
@@ -87,9 +93,11 @@ impl std::str::FromStr for ServiceType {
             "user-app-builder" => Ok(ServiceType::UserappBuilder),
             "web-agent-runner" => Ok(ServiceType::WebAgentRunner),
             "computer-agent-runner" => Ok(ServiceType::ComputerAgentRunner),
+            "computer-normal-project" => Ok(ServiceType::ComputerNormalProject),
             // 大驼峰格式（兼容旧配置）
             "WebAgentRunner" => Ok(ServiceType::WebAgentRunner),
             "ComputerAgentRunner" => Ok(ServiceType::ComputerAgentRunner),
+            "ComputerNormalProject" => Ok(ServiceType::ComputerNormalProject),
             "UserApp" | "Userapp" => Ok(ServiceType::Userapp),
             "UserAppBuilder" | "UserappBuilder" => Ok(ServiceType::UserappBuilder),
             // 旧枚举名（向后兼容）
@@ -124,6 +132,9 @@ impl ServiceType {
             ServiceType::ComputerAgentRunner => {
                 "Computer Agent Runner service, focused on agent execution for desktop applications"
             }
+            ServiceType::ComputerNormalProject => {
+                "Normal project service, sharing the ComputerAgentRunner per-user container with a dedicated agent workdir (/home/user/normalProject/{project_id})"
+            }
             ServiceType::Userapp => {
                 "User application managed by app_manager (long-running service owned by the user, not an agent)"
             }
@@ -140,17 +151,34 @@ impl ServiceType {
     /// `image_tag_prefix` 字段。本方法仅在配置获取失败时作为安全回退使用。
     /// 直接调用本方法构造容器名可能导致与实际创建的容器名称不一致。
     pub fn container_prefix(&self) -> &str {
+        // 归一：常规项目与 Computer 复用同一容器，降级兜底前缀也必须一致，
+        // 否则兜底构造的容器名会分裂出第二个容器。
         match self {
             ServiceType::WebAgentRunner => "web-agent-runner",
-            ServiceType::ComputerAgentRunner => "computer-agent-runner",
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+                "computer-agent-runner"
+            }
             ServiceType::Userapp => "rcoder-app",
             ServiceType::UserappBuilder => "rcoder-app-builder",
         }
     }
 
+    /// 容器家族归一：同一物理容器资源的类型收敛到家族代表值。
+    ///
+    /// ComputerNormalProject 与 ComputerAgentRunner 复用同一 per-user 容器
+    /// （同镜像/容器名/label/PVC/挂载），全部容器基建（配置取键、查找比较、
+    /// label 写入、命名前缀）必须经本方法归一后使用；新类型仅在 agent
+    /// 工作目录链保留本义。其余类型恒等返回。
+    pub fn container_family(self) -> ServiceType {
+        match self {
+            ServiceType::ComputerNormalProject => ServiceType::ComputerAgentRunner,
+            other => other,
+        }
+    }
+
     /// 检查服务是否在给定的多镜像配置中启用
     pub fn is_enabled(&self, config: &crate::MultiImageConfig) -> bool {
-        let service_key = self.to_string();
+        let service_key = self.container_family().to_string();
         if let Some(service_config) = config.services.get(&service_key) {
             service_config.enabled
         } else {
@@ -182,7 +210,9 @@ impl ServiceType {
             return Ok(pid);
         }
         match self {
-            ServiceType::ComputerAgentRunner => user_id.ok_or(MissingIdentifier::UserId),
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+                user_id.ok_or(MissingIdentifier::UserId)
+            }
             ServiceType::WebAgentRunner | ServiceType::Userapp | ServiceType::UserappBuilder => {
                 project_id.ok_or(MissingIdentifier::ProjectId)
             }
@@ -196,7 +226,7 @@ pub enum ServiceTypeError {
     #[error("service type cannot be empty")]
     EmptyServiceType,
     #[error(
-        "unsupported service type '{0}', please use 'web-agent-runner'/'WebAgentRunner'/'RCoder', 'computer-agent-runner'/'ComputerAgentRunner', 'user-app'/'Userapp'/'application', or 'user-app-builder'/'UserappBuilder'"
+        "unsupported service type '{0}', please use 'web-agent-runner'/'WebAgentRunner'/'RCoder', 'computer-agent-runner'/'ComputerAgentRunner', 'computer-normal-project'/'ComputerNormalProject', 'user-app'/'Userapp'/'application', or 'user-app-builder'/'UserappBuilder'"
     )]
     InvalidServiceType(String),
     #[error("service type '{0}' is disabled")]
@@ -208,6 +238,7 @@ pub fn get_supported_service_types() -> Vec<String> {
     vec![
         "web-agent-runner".to_string(),
         "computer-agent-runner".to_string(),
+        "computer-normal-project".to_string(),
         "user-app".to_string(),
         "user-app-builder".to_string(),
     ]
@@ -308,6 +339,68 @@ mod tests {
             st.container_identifier(None, None, Some("p1")),
             Err(MissingIdentifier::UserId)
         );
+    }
+
+    #[test]
+    fn normal_project_shares_the_computer_container_identity() {
+        // 家族归一：同一物理容器（identifier/prefix/配置键全按 ComputerAgentRunner）
+        let st = ServiceType::ComputerNormalProject;
+        assert_eq!(st.container_family(), ServiceType::ComputerAgentRunner);
+        assert_eq!(
+            st.container_identifier(None, Some("u7"), Some("p1")),
+            Ok("u7")
+        );
+        assert_eq!(
+            st.container_identifier(None, None, Some("p1")),
+            Err(MissingIdentifier::UserId)
+        );
+        assert_eq!(st.container_prefix(), "computer-agent-runner");
+        // wire 词保留本义
+        assert_eq!(st.to_string(), "computer-normal-project");
+        assert_eq!(
+            "computer-normal-project".parse::<ServiceType>().unwrap(),
+            ServiceType::ComputerNormalProject
+        );
+        assert_eq!(
+            "ComputerNormalProject".parse::<ServiceType>().unwrap(),
+            ServiceType::ComputerNormalProject
+        );
+        // 其余类型家族恒等
+        for other in [
+            ServiceType::WebAgentRunner,
+            ServiceType::ComputerAgentRunner,
+            ServiceType::Userapp,
+            ServiceType::UserappBuilder,
+        ] {
+            assert_eq!(other.container_family(), other);
+        }
+    }
+
+    #[test]
+    fn normal_project_is_enabled_through_computer_config() {
+        use crate::ServiceImageConfig;
+        let mut config = create_test_config();
+        let computer = config
+            .services
+            .get("computer-agent-runner")
+            .cloned()
+            .unwrap();
+        config.services.insert(
+            "computer-agent-runner".to_string(),
+            ServiceImageConfig {
+                enabled: true,
+                ..computer.clone()
+            },
+        );
+        assert!(ServiceType::ComputerNormalProject.is_enabled(&config));
+        config.services.insert(
+            "computer-agent-runner".to_string(),
+            ServiceImageConfig {
+                enabled: false,
+                ..computer
+            },
+        );
+        assert!(!ServiceType::ComputerNormalProject.is_enabled(&config));
     }
 
     #[test]
@@ -494,9 +587,10 @@ mod tests {
     #[test]
     fn test_get_supported_service_types() {
         let types = get_supported_service_types();
-        assert_eq!(types.len(), 4);
+        assert_eq!(types.len(), 5);
         assert!(types.contains(&"web-agent-runner".to_string()));
         assert!(types.contains(&"computer-agent-runner".to_string()));
+        assert!(types.contains(&"computer-normal-project".to_string()));
         assert!(types.contains(&"user-app".to_string()));
         assert!(types.contains(&"user-app-builder".to_string()));
     }

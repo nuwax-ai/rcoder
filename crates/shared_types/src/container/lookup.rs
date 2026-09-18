@@ -109,9 +109,9 @@ pub trait ContainerLookup: Send + Sync {
             }
         }
 
-        // 2. 根据 ServiceType 选择路由键
+        // 2. 根据 ServiceType 选择路由键（Computer 族共享 per-user 容器，同走 user_id）
         match service_type {
-            ServiceType::ComputerAgentRunner => {
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
                 if let Some(uid) = user_id {
                     let result = self.find_by_user_id(uid, service_type);
                     if result.is_some() {

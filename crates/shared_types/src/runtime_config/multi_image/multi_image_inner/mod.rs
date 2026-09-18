@@ -18,8 +18,8 @@ fn is_compatible_service_key(service_key: &str, service_type: &ServiceType) -> b
             // 兼容旧的服务名称 "rcoder"
             service_key == "rcoder"
         }
-        ServiceType::ComputerAgentRunner => {
-            // ComputerAgentRunner 没有旧名称
+        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+            // Computer 族没有旧名称（共享同一容器配置键）
             false
         }
         ServiceType::Userapp | ServiceType::UserappBuilder => {
@@ -198,10 +198,12 @@ impl MultiImageConfig {
 
     /// 获取指定服务类型的配置
     ///
-    /// 支持通过新的服务名称（如 "web-agent-runner"）或旧的服务名称（如 "rcoder"）查找配置
+    /// 支持通过新的服务名称（如 "web-agent-runner"）或旧的服务名称（如 "rcoder"）查找配置。
+    /// 查找键经 `container_family()` 归一：共享物理容器的类型（如
+    /// ComputerNormalProject）读取同一份容器配置，避免配置漂移出第二个容器。
     pub fn get_service_config(&self, service_type: &ServiceType) -> Option<&ServiceImageConfig> {
-        // 1. 先尝试通过新的服务名称查找
-        let service_key = service_type.to_string();
+        // 1. 先尝试通过新的服务名称查找（家族归一键）
+        let service_key = service_type.container_family().to_string();
         if let Some(config) = self.services.get(&service_key) {
             return Some(config);
         }
@@ -212,8 +214,8 @@ impl MultiImageConfig {
                 // 兼容旧的服务名称 "rcoder"
                 self.services.get("rcoder")
             }
-            ServiceType::ComputerAgentRunner => {
-                // ComputerAgentRunner 没有旧名称
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+                // Computer 族没有旧名称（共享同一容器配置键）
                 None
             }
             ServiceType::Userapp | ServiceType::UserappBuilder => {
@@ -228,13 +230,13 @@ impl MultiImageConfig {
         &mut self,
         service_type: &ServiceType,
     ) -> Option<&mut ServiceImageConfig> {
-        let service_key = service_type.to_string();
+        let service_key = service_type.container_family().to_string();
         self.services.get_mut(&service_key)
     }
 
     /// 添加或更新服务配置
     pub fn set_service_config(&mut self, service_type: ServiceType, config: ServiceImageConfig) {
-        let service_key = service_type.to_string();
+        let service_key = service_type.container_family().to_string();
         self.services.insert(service_key, config);
     }
 
