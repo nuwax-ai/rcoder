@@ -26,8 +26,8 @@ def main():
         size = sum(path.stat().st_size for path in source.rglob('*') if path.is_file())
         print(f'Cargo source context: {size / 1024 / 1024:.1f} MiB', flush=True)
         return subprocess.call(['docker', 'build', '--build-context', f'rcoder={source}',
-                                '--build-arg', 'PINGAP_VERSION=0.14.1',
-                                '--build-arg', 'PINGAP_COMMIT=c74e4eaa44e64958cffa18c33e8bbf5995b6844f',
+                                '--build-arg', 'PINGAP_VERSION=0.14.3',
+                                '--build-arg', 'PINGAP_COMMIT=cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8',
                                 '-t', 'dev-app-runtime-base:latest', '-f', str(runtime / 'Dockerfile'), str(runtime)], cwd=ROOT)
 
 
