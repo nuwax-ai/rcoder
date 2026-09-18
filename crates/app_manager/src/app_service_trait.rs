@@ -35,6 +35,12 @@ pub trait AppServiceTrait: Send + Sync {
         app_id: &str,
         request_id: &str,
     ) -> AppResult<Option<shared_types::UserAppOperationView>>;
+    /// All in-flight operations across scopes (application, dev, prod), fixed
+    /// order. Read-only: never blocked by any environment's busy slot.
+    async fn get_current_operations(
+        &self,
+        app_id: &str,
+    ) -> AppResult<Vec<shared_types::UserAppOperationView>>;
     async fn recreate_identity(
         &self,
         app_id: &str,

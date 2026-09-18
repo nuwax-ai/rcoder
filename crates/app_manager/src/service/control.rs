@@ -345,6 +345,34 @@ impl super::AppService {
         Ok(operation.map(Into::into))
     }
 
+    /// All in-flight operations across scopes, in fixed order (application,
+    /// dev, prod). Read-only: never blocked by any environment's busy slot.
+    pub async fn get_current_operations(
+        &self,
+        app_id: &str,
+    ) -> AppResult<Vec<shared_types::UserAppOperationView>> {
+        let app = self.get_lifecycle(app_id).await?;
+        let mut operations = Vec::new();
+        for scope in app.active_operations.occupied_scopes() {
+            let Some(id) = app.active_operations.slot(scope) else {
+                continue;
+            };
+            let operation = self
+                .metadata
+                .store
+                .get_operation(app_id, id)
+                .await?
+                .ok_or_else(|| {
+                    AppOperationError::Conflict(format!("Active operation record is missing: {id}"))
+                })?;
+            if operation.lifecycle_id != app.lifecycle_id {
+                return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+            }
+            operations.push(operation.into());
+        }
+        Ok(operations)
+    }
+
     pub async fn recreate_identity(
         &self,
         app_id: &str,

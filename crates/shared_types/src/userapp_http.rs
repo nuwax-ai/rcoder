@@ -69,6 +69,17 @@ pub async fn envelope_errors(request: Request, next: Next) -> Response {
     {
         envelope = envelope.with_operation_id(operation_id.to_owned());
     }
+    // Structured conflict detail travels verbatim; callers branch on the
+    // blocking scope without parsing the English message.
+    if let Some(blocker) = parsed
+        .as_ref()
+        .and_then(|value| value.get("blocker"))
+        .and_then(|value| {
+            serde_json::from_value::<crate::UserAppOperationBlocker>(value.clone()).ok()
+        })
+    {
+        envelope = envelope.with_blocker(blocker);
+    }
     let normalized = axum::Json(envelope).into_response();
     parts.status = StatusCode::OK;
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
@@ -114,6 +125,54 @@ mod tests {
         assert_eq!(envelope["operation_id"], "operation-original");
         assert_eq!(envelope["message"], "Operation requires recovery");
         assert_eq!(envelope["success"], false);
+        assert!(envelope.get("blocker").is_none());
+    }
+
+    #[tokio::test]
+    async fn formal_conflict_envelope_carries_structured_blocker() {
+        use tower::ServiceExt as _;
+        let blocker = crate::UserAppOperationBlocker {
+            scope: crate::UserAppOperationScope::Prod,
+            operation_id: "blocking-operation".into(),
+            kind: crate::UserAppOperationKind::Start,
+            state: crate::UserAppOperationState::RecoveryRequired,
+            step: "claimed".into(),
+        };
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/userapp/example/restart",
+                axum::routing::post(move || async move {
+                    crate::AppError::conflict("Application operation in progress: prod operation")
+                        .with_operation_id("blocking-operation".into())
+                        .with_blocker(blocker)
+                }),
+            )
+            .layer(axum::middleware::from_fn(envelope_errors));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/userapp/example/restart")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("response body");
+        let envelope: serde_json::Value = serde_json::from_slice(&body).expect("envelope");
+        assert_eq!(envelope["code"], crate::error_codes::ERR_CONFLICT);
+        assert_eq!(envelope["blocker"]["scope"], "Prod");
+        assert_eq!(envelope["blocker"]["operation_id"], "blocking-operation");
+        assert_eq!(envelope["blocker"]["kind"], "Start");
+        assert_eq!(envelope["blocker"]["state"], "RecoveryRequired");
+        assert_eq!(envelope["blocker"]["step"], "claimed");
+        assert!(
+            envelope["message"].as_str().expect("message").is_ascii(),
+            "message stays English"
+        );
     }
     #[test]
     fn legacy_and_stream_contracts_are_explicit() {

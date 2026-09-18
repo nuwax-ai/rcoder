@@ -640,13 +640,22 @@ pub struct UserAppWaitTimeout {
 }
 
 /// Structured conflict detail about the in-flight operation occupying a scope.
-/// Rendered through Display into the existing English conflict message prefix;
-/// no internal executor or checkpoint information is exposed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Rendered through Display into the existing English conflict message prefix,
+/// and carried verbatim on error envelopes so callers can branch on the
+/// blocking scope without parsing message text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct UserAppOperationBlocker {
+    /// Blocking scope: Dev, Prod, or Application.
     pub scope: UserAppOperationScope,
     pub operation_id: String,
+    /// Blocking operation kind: EnsureBuilder, AdoptBuilder, StopBuilder,
+    /// RestartBuilder, Create, StartDeployment, RestartDeployment, Update, Start,
+    /// Restart, Stop, SetRecyclePolicy, HotDeploy, DeleteCompute, PurgeResources,
+    /// DestroyDevStorage, DestroyProdStorage, ClearDevStorage, ClearProdStorage,
+    /// or DeleteApplication.
     pub kind: UserAppOperationKind,
+    /// Blocking operation state: Pending, Running, WaitingRetry,
+    /// RecoveryRequired, Succeeded, or Failed.
     pub state: UserAppOperationState,
     pub step: String,
 }

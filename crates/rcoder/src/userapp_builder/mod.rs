@@ -288,7 +288,8 @@ pub(crate) fn control_error(error: &anyhow::Error) -> shared_types::AppError {
             shared_types::error_codes::ERR_CONFLICT,
             "A conflicting application operation is in progress",
         )
-        .with_operation_id(blocker.operation_id.clone());
+        .with_operation_id(blocker.operation_id.clone())
+        .with_blocker(blocker.clone());
     }
     shared_types::AppError::with_message(
         shared_types::error_codes::ERR_BACKEND_ERROR,

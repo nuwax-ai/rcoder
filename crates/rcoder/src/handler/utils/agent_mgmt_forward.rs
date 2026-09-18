@@ -544,6 +544,7 @@ mod tests {
             internal_message,
             i18n_key,
             operation_id,
+            ..
         } = &err
         {
             assert_eq!(code, ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED);

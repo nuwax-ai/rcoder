@@ -40,6 +40,12 @@ pub enum AppOperationError {
     RuntimeRejected(shared_types::RuntimeRequestRejection),
     /// 乐观锁冲突（409 ERR_CONFLICT）—— expected_resource_version 不匹配
     Conflict(String),
+    /// 受理被在途操作阻塞（409 ERR_CONFLICT）——携带结构化 blocker，
+    /// 指名阻塞 scope/kind/state，随错误信封透出供调用方分支
+    ConflictBlocked {
+        message: String,
+        blocker: shared_types::UserAppOperationBlocker,
+    },
     HotDeployEnvChange(String),
 }
 
@@ -57,6 +63,7 @@ impl AppOperationError {
             Self::RuntimeRejected(rejection) if rejection.status == 409 => ERR_CONFLICT,
             Self::RuntimeRejected(_) => ERR_BACKEND_ERROR,
             Self::Conflict(_) => ERR_CONFLICT,
+            Self::ConflictBlocked { .. } => ERR_CONFLICT,
             Self::HotDeployEnvChange(_) => shared_types::error_codes::ERR_HOT_DEPLOY_ENV_CHANGE,
         }
     }
@@ -65,6 +72,7 @@ impl AppOperationError {
     pub fn message(&self) -> &str {
         match self {
             Self::RuntimeRejected(rejection) => &rejection.message,
+            Self::ConflictBlocked { message, .. } => message,
             Self::NotFound(m)
             | Self::AlreadyExists(m)
             | Self::InvalidState(m)
@@ -89,15 +97,17 @@ impl std::error::Error for AppOperationError {}
 impl From<shared_types::UserAppStoreError> for AppOperationError {
     fn from(error: shared_types::UserAppStoreError) -> Self {
         use shared_types::UserAppStoreError;
-        let message = error.to_string();
         match error {
+            UserAppStoreError::OperationInProgress(blocker) => Self::ConflictBlocked {
+                message: format!("Application operation in progress: {blocker}"),
+                blocker,
+            },
             UserAppStoreError::OwnershipConflict
             | UserAppStoreError::LifecycleConflict
-            | UserAppStoreError::OperationInProgress(_)
-            | UserAppStoreError::VersionConflict => Self::Conflict(message),
-            UserAppStoreError::NotFound => Self::NotFound(message),
-            UserAppStoreError::InvalidOperation(_) => Self::InvalidState(message),
-            UserAppStoreError::Storage(_) => Self::Backend(message),
+            | UserAppStoreError::VersionConflict => Self::Conflict(error.to_string()),
+            UserAppStoreError::NotFound => Self::NotFound(error.to_string()),
+            UserAppStoreError::InvalidOperation(_) => Self::InvalidState(error.to_string()),
+            UserAppStoreError::Storage(_) => Self::Backend(error.to_string()),
         }
     }
 }

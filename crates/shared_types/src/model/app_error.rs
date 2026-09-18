@@ -14,6 +14,7 @@ pub enum AppError {
         internal_message: Option<String>,
         i18n_key: Option<String>,
         operation_id: Option<String>,
+        blocker: Option<crate::UserAppOperationBlocker>,
     },
 }
 
@@ -30,6 +31,7 @@ impl AppError {
             internal_message: None,
             i18n_key: None,
             operation_id: None,
+            blocker: None,
         }
     }
 
@@ -40,6 +42,7 @@ impl AppError {
             internal_message: Some(msg.into()),
             i18n_key: None,
             operation_id: None,
+            blocker: None,
         }
     }
 
@@ -50,7 +53,22 @@ impl AppError {
             internal_message: None,
             i18n_key: Some(i18n_key.to_string()),
             operation_id: None,
+            blocker: None,
         }
+    }
+
+    /// Attach the in-flight operation that blocks the request. Only meaningful
+    /// alongside a conflict code; ignored for non-structured variants.
+    pub fn with_blocker(self, blocker: crate::UserAppOperationBlocker) -> Self {
+        let mut error = match self {
+            structured @ Self::Structured { .. } => structured,
+            Self::AnyhowError(error) => Self::generic(format!("{error:#}")),
+            Self::IoError(error) => Self::generic(error.to_string()),
+        };
+        if let Self::Structured { blocker: slot, .. } = &mut error {
+            *slot = Some(blocker);
+        }
+        error
     }
 
     /// Attach a verified durable operation identity without changing the error code.
@@ -97,7 +115,7 @@ impl axum::response::IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let locale = crate::current_request_locale();
 
-        let (code, internal_message, i18n_key, operation_id) = match self {
+        let (code, internal_message, i18n_key, operation_id, blocker) = match self {
             AppError::AnyhowError(e) => (
                 crate::error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
                 // {e:#} = anyhow alternate Display，展开完整因果链（顶层 context → 底层根因）。
@@ -106,10 +124,12 @@ impl axum::response::IntoResponse for AppError {
                 Some(format!("{e:#}")),
                 None,
                 None,
+                None,
             ),
             AppError::IoError(e) => (
                 crate::error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
                 Some(e.to_string()),
+                None,
                 None,
                 None,
             ),
@@ -118,7 +138,8 @@ impl axum::response::IntoResponse for AppError {
                 internal_message,
                 i18n_key,
                 operation_id,
-            } => (code, internal_message, i18n_key, operation_id),
+                blocker,
+            } => (code, internal_message, i18n_key, operation_id, blocker),
         };
         let status = status_from_code(&code);
 
@@ -146,6 +167,10 @@ impl axum::response::IntoResponse for AppError {
 
         let response = match operation_id {
             Some(id) => response.with_operation_id(id),
+            None => response,
+        };
+        let response = match blocker {
+            Some(blocker) => response.with_blocker(blocker),
             None => response,
         };
         (status, axum::Json(response)).into_response()

@@ -235,6 +235,12 @@ impl super::AppServiceTrait for AppService {
         self.get_control_operation_by_request(app_id, request_id)
             .await
     }
+    async fn get_current_operations(
+        &self,
+        app_id: &str,
+    ) -> AppResult<Vec<shared_types::UserAppOperationView>> {
+        self.get_current_operations(app_id).await
+    }
     async fn recreate_identity(
         &self,
         app_id: &str,

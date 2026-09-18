@@ -51,6 +51,12 @@ pub use storage::*;
 /// 直接转换——错误码在 service 抛出点确定（Fail Fast），无需 downcast / 字符串匹配。
 impl From<crate::error::AppOperationError> for shared_types::AppError {
     fn from(e: crate::error::AppOperationError) -> Self {
-        shared_types::AppError::with_message(e.code(), e.message().to_string())
+        let error = shared_types::AppError::with_message(e.code(), e.message().to_string());
+        match e {
+            crate::error::AppOperationError::ConflictBlocked { blocker, .. } => {
+                error.with_blocker(blocker)
+            }
+            _ => error,
+        }
     }
 }

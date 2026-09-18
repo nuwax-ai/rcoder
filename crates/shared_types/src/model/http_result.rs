@@ -30,6 +30,10 @@ pub struct HttpResult<T> {
     /// Durable control operation associated with this response, when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
+    /// In-flight operation that blocked a rejected control request. Conflict
+    /// envelopes only; names the blocking scope without message parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<crate::UserAppOperationBlocker>,
     /// 业务状态码。`"0000"` 表示成功,其他码对应 `error_codes` 模块中常量(前缀如 `ERR_*`)。
     #[schema(example = "0000")]
     pub code: String,
@@ -52,9 +56,14 @@ impl<T> HttpResult<T> {
         self.operation_id = Some(operation_id);
         self
     }
+    pub fn with_blocker(mut self, blocker: crate::UserAppOperationBlocker) -> Self {
+        self.blocker = Some(blocker);
+        self
+    }
     pub fn success(data: T) -> Self {
         HttpResult {
             operation_id: None,
+            blocker: None,
             code: SUCCESS.to_string(),
             message: get_error_message(SUCCESS, DEFAULT_LOCALE),
             data: Some(data),
@@ -66,6 +75,7 @@ impl<T> HttpResult<T> {
     pub fn error(code: &str, message: &str) -> Self {
         HttpResult {
             operation_id: None,
+            blocker: None,
             code: code.to_string(),
             message: message.to_string(),
             data: None,
@@ -83,6 +93,7 @@ impl<T> HttpResult<T> {
         let message = get_error_message(code, locale);
         HttpResult {
             operation_id: None,
+            blocker: None,
             code: code.to_string(),
             message,
             data: None,
@@ -100,6 +111,7 @@ impl<T> HttpResult<T> {
     pub fn error_with_message(code: &str, _locale: &str, custom_message: &str) -> Self {
         HttpResult {
             operation_id: None,
+            blocker: None,
             code: code.to_string(),
             message: custom_message.to_string(),
             data: None,
@@ -112,6 +124,7 @@ impl<T> HttpResult<T> {
     pub fn success_with_locale(data: T, locale: &str) -> Self {
         HttpResult {
             operation_id: None,
+            blocker: None,
             code: SUCCESS.to_string(),
             message: get_error_message(SUCCESS, locale),
             data: Some(data),
@@ -135,10 +148,15 @@ impl<T: Serialize> Serialize for HttpResult<T> {
     where
         S: Serializer,
     {
-        let mut state = serializer
-            .serialize_struct("HttpResult", 5 + usize::from(self.operation_id.is_some()))?;
+        let mut state = serializer.serialize_struct(
+            "HttpResult",
+            5 + usize::from(self.operation_id.is_some()) + usize::from(self.blocker.is_some()),
+        )?;
         if let Some(operation_id) = &self.operation_id {
             state.serialize_field("operation_id", operation_id)?;
+        }
+        if let Some(blocker) = &self.blocker {
+            state.serialize_field("blocker", blocker)?;
         }
         state.serialize_field("code", &self.code)?;
         state.serialize_field("message", &self.message)?;

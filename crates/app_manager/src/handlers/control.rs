@@ -93,19 +93,19 @@ pub async fn get_lifecycle(
     )))
 }
 
-/// Read the current application operation.
+/// Read all in-flight userapp operations.
+///
+/// All scopes in fixed order (application, dev, prod); each view carries its
+/// derived scope. Read-only: never blocked by any environment's busy slot.
 #[utoipa::path(get, path="/api/v1/userapp/{app_id}/operations/current",
     params(("app_id"=String, Path, description="Application identifier")),
-    responses((status=200, description="HttpResult envelope with the durable state or business error code", body=HttpResult<Option<UserAppOperationView>>)), tag="Userapp · 双态 · 生命周期")]
+    responses((status=200, description="HttpResult envelope with the durable state or business error code", body=HttpResult<Vec<UserAppOperationView>>)), tag="Userapp · 双态 · 生命周期")]
 pub async fn get_current_operation(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-) -> Result<Json<HttpResult<Option<UserAppOperationView>>>, AppError> {
+) -> Result<Json<HttpResult<Vec<UserAppOperationView>>>, AppError> {
     Ok(Json(HttpResult::success(
-        state
-            .app_service
-            .get_control_operation(&app_id, None)
-            .await?,
+        state.app_service.get_current_operations(&app_id).await?,
     )))
 }
 
