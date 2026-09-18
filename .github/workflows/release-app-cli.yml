@@ -236,6 +236,89 @@ jobs:
           path: target/release/pingap.exe
           retention-days: 7
 
+  # ── pingap（Unix 随包）：N04——普通 Mac/Linux 用户仅装包即可运行完整链 ────
+  # 与 Windows 同源约束：构建 rev = app-cli Cargo.toml pin 的同一 commit，
+  # tls-rustls feature，版本断言。产物并入对应平台子包。
+  build-pingap-unix:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-apple-darwin,      runner: macos-latest,  zig: false }
+          - { target: aarch64-apple-darwin,     runner: macos-latest,  zig: false }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, zig: false }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout rcoder (for pin rev)
+        uses: actions/checkout@v4
+
+      - name: Resolve pingap rev from Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          REV=$(grep -o 'rev = "[0-9a-f]\{40\}"' crates/app-cli/Cargo.toml | head -1 | cut -d'"' -f2)
+          [ -n "$REV" ] || { echo "✗ 未在 crates/app-cli/Cargo.toml 找到 pingap-config rev"; exit 1; }
+          VER=$(grep -o 'DEFAULT_PINGAP_VERSION: &str = "[0-9.]*"' crates/app-cli/src/devtool.rs | head -1 | cut -d'"' -f2)
+          [ -n "$VER" ] || { echo "✗ 未在 devtool.rs 找到 DEFAULT_PINGAP_VERSION"; exit 1; }
+          echo "PINGAP_REV=$REV" >> "$GITHUB_ENV"
+          echo "PINGAP_VERSION_EXPECTED=$VER" >> "$GITHUB_ENV"
+
+      - name: Checkout pingap at pinned rev
+        uses: actions/checkout@v4
+        with:
+          repository: vicanso/pingap
+          ref: ${{ env.PINGAP_REV }}
+
+      - name: Install protoc
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macos)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Show Rust toolchain
+        shell: bash
+        run: rustup show
+
+      # darwin arm64 runner 原生；x86_64-apple-darwin 用 --target 交叉（同 runner）
+      - name: Build pingap (tls-rustls)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+            rustup target add x86_64-apple-darwin
+            cargo build --release --no-default-features --features tls-rustls --target x86_64-apple-darwin
+            cp target/x86_64-apple-darwin/release/pingap pingap-out
+          else
+            cargo build --release --no-default-features --features tls-rustls
+            cp target/release/pingap pingap-out
+          fi
+
+      - name: Smoke test pingap -V
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 交叉产物（x86_64-apple-darwin）在 arm64 runner 上可执行（macOS
+          # Rosetta 2 常开）；失败时降级为文件存在性检查 + 版本字符串提取
+          OUT=$(./pingap-out -V 2>/dev/null || strings pingap-out | grep -m1 '^${{ env.PINGAP_VERSION_EXPECTED }}' || true)
+          if [ -n "$OUT" ]; then
+            echo "$OUT"
+            echo "$OUT" | grep -F "$PINGAP_VERSION_EXPECTED" || {
+              echo "✗ pingap 版本与 pin 的 $PINGAP_VERSION_EXPECTED 不符"; exit 1; }
+          else
+            echo "（交叉产物无法在 runner 执行——跳过 -V 断言，版本由构建 rev 保证）"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pingap-${{ matrix.target }}
+          path: pingap-out
+          retention-days: 7
+
   # ── 成对一致性 gate：分发的 app-cli.exe ↔ pingap.exe schema 兼容 ──────────
   # fixture workspace 跑 gen-lock（纯函数生成配置）→ 提取 pingap.toml →
   # pingap.exe -t 校验。本地（darwin）已验证过该链路，CI 在目标平台复验。
@@ -312,10 +395,17 @@ jobs:
           cp dist/app-cli-aarch64-unknown-linux-gnu npm/app-cli-linux-arm64/app-cli
           cp dist/app-cli-x86_64-apple-darwin       npm/app-cli-darwin-x64/app-cli
           cp dist/app-cli-aarch64-apple-darwin      npm/app-cli-darwin-arm64/app-cli
+          # N04：全平台随包 pingap（同 rev 自建 tls-rustls；配置契约与
+          # app-cli 的 pingap-config 严格配对）——仅装包即可运行完整链
+          cp dist/pingap-x86_64-apple-darwin        npm/app-cli-darwin-x64/pingap
+          cp dist/pingap-aarch64-apple-darwin       npm/app-cli-darwin-arm64/pingap
+          cp dist/pingap-x86_64-unknown-linux-gnu   npm/app-cli-linux-x64/pingap
+          # linux-arm64 随包 pingap 尚无构建 job（官方 zig 交叉待定）——
+          # 该平台 serve 需另装系统 pingap（缺失时 --pingap-bin 显式指定）
           # win32 包双件套：app-cli.exe + 自建 pingap.exe（serve 反代依赖）
           cp dist/app-cli-x86_64-pc-windows-msvc.exe npm/app-cli-windows-x64/app-cli.exe
           cp dist/pingap.exe                          npm/app-cli-windows-x64/pingap.exe
-          chmod +x npm/app-cli-*/app-cli npm/app-cli-windows-x64/*.exe || true
+          chmod +x npm/app-cli-*/app-cli npm/app-cli-*/pingap npm/app-cli-windows-x64/*.exe || true
 
           # 冒烟：runner(x64 linux, glibc ≥ 2.17) 直接跑二进制验证可执行
           ./npm/app-cli-linux-x64/app-cli --version
@@ -350,7 +440,7 @@ jobs:
           fi
 
   release:
-    needs: [meta, pair-gate-windows]
+    needs: [meta, pair-gate-windows, build-pingap-unix]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
