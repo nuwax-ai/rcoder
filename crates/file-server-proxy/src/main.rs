@@ -225,6 +225,10 @@ async fn main() {
     }
 
     file_server_proxy::init(FileServerProxyConfig {
+        listen_host: std::env::var("FILE_SERVER_PROXY_HOST")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "0.0.0.0".to_string()),
         listen_port: settings.listen_port,
         rust_upstream_port: settings.rust_upstream_port,
         ts_upstream_port: settings.ts_upstream_port,
@@ -253,9 +257,35 @@ async fn main() {
         }
         Err(e) => fail(e),
     }
-    // 前台挂起：serve task 在后台持有监听口；supervisord/守护 CLI SIGTERM 杀进程
-    // 即整体退出。直连形态无独立上游进程（router 在本进程内）。
-    std::future::pending::<()>().await;
+    // N10：真实关停——SIGTERM/ctrl_c 触发 proxy 停止（关 listener/等在途
+    // 请求排空），内嵌 file-server 的构建/dev 子进程由 file-server 自身的
+    // 生命周期钩子收束；不再永久 pending（SIGKILL 才退的旧行为废弃）。
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    tracing::warn!("install SIGTERM handler failed: {error} — 退化为 ctrl_c");
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("收到 ctrl_c，开始关停"),
+            _ = sigterm.recv() => tracing::info!("收到 SIGTERM，开始关停"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|e| format!("install ctrl_c handler: {e}"))?;
+        tracing::info!("收到 ctrl_c，开始关停");
+    }
+    match file_server_proxy::stop().await {
+        Ok(()) => tracing::info!("file-server-proxy 已关停（在途请求排空完成）"),
+        Err(e) => tracing::warn!("file-server-proxy 关停未完全确认: {e}"),
+    }
 }
 
 /// 直连装配：加载 file-server 配置（工作目录/日志）+ 一次组装全局 subscriber

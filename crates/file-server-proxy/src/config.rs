@@ -13,7 +13,14 @@ pub use shared_types::{AGENT_FILE_SERVER_PORT, NUWAX_FILE_SERVER_INTERNAL_PORT};
 /// 分流代理配置（config.yml 顶层 `file_server_proxy:` 段 / agent_runner env 构造）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileServerProxyConfig {
-    /// 对外监听端口（Java/外部入口；K8s NodePort 30779 → 此端口）
+    /// 对外监听主机（N03：容器形态 0.0.0.0（K8s NodePort 入口）；原生
+    /// standalone 经 env `FILE_SERVER_PROXY_HOST` 收敛到 127.0.0.1——
+    /// 默认保持容器行为，原生按需收紧）。旧 config.yml 无此字段 → 0.0.0.0。
+    #[serde(default = "default_listen_host")]
+    pub listen_host: String,
+    /// 对外监听端口（Java/外部入口；K8s NodePort 30779 → 此端口）。
+    /// N03：0 = 请求动态分配——绑定后发布 listener.local_addr 真实地址
+    /// （状态/日志携带，不返回 ":0"）。
     pub listen_port: u16,
     /// rcoder 主服务端口（userApp 业务上游；容器形态=内嵌 Rust file-server 端口）
     pub rust_upstream_port: u16,
@@ -29,9 +36,17 @@ pub struct FileServerProxyConfig {
     pub coordinated_dev_lifecycle: bool,
 }
 
+fn default_listen_host() -> String {
+    "0.0.0.0".to_string()
+}
+
 impl Default for FileServerProxyConfig {
     fn default() -> Self {
         Self {
+            listen_host: std::env::var("FILE_SERVER_PROXY_HOST")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "0.0.0.0".to_string()),
             listen_port: AGENT_FILE_SERVER_PORT,
             rust_upstream_port: 8086,
             ts_upstream_port: NUWAX_FILE_SERVER_INTERNAL_PORT,

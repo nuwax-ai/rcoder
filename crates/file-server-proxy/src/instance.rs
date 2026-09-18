@@ -64,10 +64,16 @@ pub async fn try_start() -> Result<String, String> {
         FileServerProxyConfig::default()
     });
 
-    let address = format!("0.0.0.0:{}", config.listen_port);
-    let listener = tokio::net::TcpListener::bind(&address)
+    // N03：host 可配（原生 loopback / 容器 0.0.0.0）；端口 0 = 动态分配，
+    // 绑定后以 local_addr 真实地址为准（不返回 ":0"）
+    let requested = format!("{}:{}", config.listen_host, config.listen_port);
+    let listener = tokio::net::TcpListener::bind(&requested)
         .await
-        .map_err(|e| format!("bind {address} 失败（端口被占用?）: {e}"))?;
+        .map_err(|e| format!("bind {requested} 失败（端口被占用?）: {e}"))?;
+    let address = listener
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or(requested);
 
     // 上游 hang 防堆积: 连接 5s 建立超时; 整请求超时在 proxy_request 内包装
     let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();

@@ -101,6 +101,7 @@ fn ts_first_policy_routes_by_header_and_path() {
 #[test]
 fn all_rust_policy_routes_everything_to_rust() {
     let c = FileServerProxyConfig {
+        listen_host: "127.0.0.1".to_string(),
         listen_port: 60000,
         rust_upstream_port: 60002,
         ts_upstream_port: 60001,
@@ -128,6 +129,7 @@ fn all_rust_policy_routes_everything_to_rust() {
 #[test]
 fn all_ts_policy_routes_everything_to_ts() {
     let c = FileServerProxyConfig {
+        listen_host: "127.0.0.1".to_string(),
         listen_port: 60000,
         rust_upstream_port: 8086,
         ts_upstream_port: 41234,
@@ -193,6 +195,7 @@ fn parse_route_policy_accepts_wire_vocabulary() {
 #[test]
 fn custom_ports_respected() {
     let c = FileServerProxyConfig {
+        listen_host: "127.0.0.1".to_string(),
         listen_port: 61000,
         rust_upstream_port: 18086,
         ts_upstream_port: 6001,
@@ -239,4 +242,22 @@ fn all_rust_whitelist_gates_rust_upstream_surface() {
     ] {
         assert!(!all_rust_path_allowed(path), "{path} 应拒绝(白名单外)");
     }
+}
+
+#[tokio::test]
+async fn dynamic_port_publishes_real_bound_address() {
+    // N03：端口 0 = 动态分配——status 返回真实绑定地址（非 ":0"）
+    init(FileServerProxyConfig {
+        listen_host: "127.0.0.1".to_string(),
+        listen_port: 0,
+        ..Default::default()
+    });
+    let address = try_start().await.expect("start");
+    assert!(
+        !address.ends_with(":0"),
+        "must publish the real bound address, got {address}"
+    );
+    assert!(address.starts_with("127.0.0.1:"), "got {address}");
+    stop().await.expect("stop");
+    assert!(status().await.is_none());
 }
