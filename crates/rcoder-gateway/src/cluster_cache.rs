@@ -54,8 +54,10 @@ impl ClusterCache {
 
         if !resp.success {
             let msg = resp.message.unwrap_or_else(|| "unknown error".to_string());
-            // RCoder 返回 not_found 时不应创建，回退到控制面
-            if msg.contains("not_found") {
+            // RCoder 返回 not_found 时不应创建，回退到控制面（R11：读服务端
+            // 信封 code 字段——message 文案不参与分类；本次只修正分类与诊断，
+            // 不改变"所有 ensure 错误都回退控制面"的既有降级策略）
+            if resp.code.as_deref() == Some("not_found") {
                 debug!(
                     "[CACHE] pod not found for {} (RCoder?), will route through control plane",
                     identifier

@@ -15,6 +15,10 @@ pub struct ControlPlaneClient {
 #[derive(Debug, serde::Deserialize)]
 pub struct EnsurePodResponse {
     pub success: bool,
+    /// 服务端信封 code（R11：结构化分类用真实字段——`not_found` 判定不再
+    /// 匹配 message 文案；缺失/未知 code 不默认解释为 not_found）
+    #[serde(default)]
+    pub code: Option<String>,
     pub data: Option<EnsurePodData>,
     pub message: Option<String>,
 }

@@ -132,10 +132,14 @@ where
                 Ok(())
             }
             _ = tokio::time::sleep(self.timeout) => {
-                anyhow::bail!(
-                    "Prompt timed out after {:?}: project_id={}, session_id={}",
-                    self.timeout, self.project_id, self.session_id
+                // R11：类型化超时（CLI 侧 downcast 分类）；标识上下文进日志
+                tracing::warn!(
+                    "[AcpClient] Prompt timed out: project_id={}, session_id={}",
+                    self.project_id, self.session_id
                 );
+                Err(crate::acp::AcpError::Timeout {
+                    timeout: self.timeout,
+                })?
             }
         }
     }
