@@ -34,11 +34,15 @@ pub struct FileServerProxyConfig {
     /// 启动拒绝（fail-fast，不裸奔对外）。凭据不进日志。
     #[serde(default)]
     pub auth_token: Option<String>,
-    /// N07 受管形态显式声明：容器/编排内运行（supervisor env
-    /// `FILE_SERVER_PROXY_PUBLIC_BIND=1` 或嵌入方代码直设）——0.0.0.0 无
-    /// 令牌合法（网络边界由编排层承担）。原生 standalone 不设此声明，
-    /// 保持"公开绑定必须带令牌"的安全默认。
-    #[serde(default)]
+    /// N07（修订）：受管形态声明，**默认 true**。本服务的部署形态以受管
+    /// 容器为绝对主流（K8s chart / compose / supervisor——0.0.0.0:60000 是
+    /// NodePort/端口映射的文件入口前提，网络边界由编排层承担），原"默认
+    /// false + 各处显式声明"的门在实战中只挡自己人（09-19 事故：漏配一处
+    /// 即 60000 全断）。使用方需要严格模式时显式配 `false` 收紧（无令牌 +
+    /// 非 loopback 即拒启）；原生 standalone 的安全收紧走
+    /// `FILE_SERVER_PROXY_HOST=127.0.0.1`（地址即声明，优于布尔门）。
+    /// env `FILE_SERVER_PROXY_PUBLIC_BIND=1`/`true` 声明通道保留（冗余无害）。
+    #[serde(default = "default_public_bind_declared")]
     pub public_bind_declared: bool,
     /// dev 生命周期路径（start/stop/restart/keep-alive 等 7 端点）在**所有策略**下
     /// 导向 Rust 上游（Custom Page 预览协调收口；与 rcoder `preview_coordinator.enabled`
@@ -49,6 +53,10 @@ pub struct FileServerProxyConfig {
 
 fn default_listen_host() -> String {
     "0.0.0.0".to_string()
+}
+
+fn default_public_bind_declared() -> bool {
+    true
 }
 
 impl Default for FileServerProxyConfig {
@@ -63,7 +71,7 @@ impl Default for FileServerProxyConfig {
             ts_upstream_port: NUWAX_FILE_SERVER_INTERNAL_PORT,
             policy: RoutePolicy::default(),
             auth_token: None,
-            public_bind_declared: false,
+            public_bind_declared: default_public_bind_declared(),
             coordinated_dev_lifecycle: false,
         }
     }
@@ -163,26 +171,30 @@ pub fn is_coordinated_dev_path(path: &str) -> bool {
 }
 
 impl FileServerProxyConfig {
-    /// N07 受管声明 env 词表（独立进程形态与 rcoder 内嵌形态共用）：
-    /// `"1"` / `"true"`（trim、大小写不敏感）→ 声明；其余（含 `"0"`、
-    /// `"false"`、空串、未设）→ 不声明。
-    pub fn env_declares_public_bind(value: Option<&str>) -> bool {
-        value.is_some_and(|raw| {
-            let trimmed = raw.trim();
-            trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
-        })
+    /// N07（修订）受管声明 env **三态**解析（独立进程形态与 rcoder 内嵌
+    /// 形态共用）：`"1"`/`"true"`（trim、大小写不敏感）→ `Some(true)` 放行；
+    /// `"0"`/`"false"` → `Some(false)` 显式收紧；未设/空串/其它值 → `None`
+    /// （用形态默认——受管放行 true）。
+    pub fn env_public_bind_setting(value: Option<&str>) -> Option<bool> {
+        let raw = value?.trim();
+        if raw == "1" || raw.eq_ignore_ascii_case("true") {
+            Some(true)
+        } else if raw == "0" || raw.eq_ignore_ascii_case("false") {
+            Some(false)
+        } else {
+            None
+        }
     }
 
-    /// 叠加 env 声明（OR 语义）：`FILE_SERVER_PROXY_PUBLIC_BIND` 声明即
-    /// 置 true；未声明保持原值（config.yml 显式 true 不被 env 缺席覆盖）。
+    /// 叠加 env 声明（env 优先）：`FILE_SERVER_PROXY_PUBLIC_BIND` 显式值
+    /// （true/false）覆盖 config 值；未设保持 config 值不变（含默认 true）。
     pub fn apply_public_bind_env(&mut self) {
-        let declared = Self::env_declares_public_bind(
+        if let Some(declared) = Self::env_public_bind_setting(
             std::env::var("FILE_SERVER_PROXY_PUBLIC_BIND")
                 .ok()
                 .as_deref(),
-        );
-        if declared {
-            self.public_bind_declared = true;
+        ) {
+            self.public_bind_declared = declared;
         }
     }
 

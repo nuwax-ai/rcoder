@@ -106,16 +106,17 @@ pub async fn try_start() -> Result<String, String> {
         FileServerProxyConfig::default()
     });
 
-    // N07：非 loopback 监听必须有令牌（原生安全默认——对外暴露的入口
-    // 不裸奔）。例外：受管形态显式声明（public_bind_declared——容器内
-    // supervisor env 或嵌入方代码直设；网络边界由编排层承担）。
+    // N07（修订）：非 loopback + 无令牌 + **显式 public_bind_declared:false**
+    // 才拒启——默认受管放行（09-19 实战结论：本服务部署形态以容器/编排为
+    // 主流，网络边界由使用方在编排层控制；原"默认严格+各处声明"的门只挡
+    // 自己人）。使用方收紧通道：config 显式 false、HOST=127.0.0.1 或令牌。
     let host = config.listen_host.trim();
     let is_loopback = matches!(host, "127.0.0.1" | "::1" | "localhost");
     if !is_loopback && config.auth_token.is_none() && !config.public_bind_declared {
         return Err(format!(
             "refusing to listen on non-loopback {host} without FILE_SERVER_PROXY_TOKEN \
-             (set the token, bind 127.0.0.1, or declare managed form via \
-             FILE_SERVER_PROXY_PUBLIC_BIND=1)"
+             (public_bind_declared is explicitly false — set the token, bind 127.0.0.1, \
+             or remove the explicit false to allow managed public bind)"
         ));
     }
 

@@ -314,15 +314,35 @@ mod embedded_config_tests {
         drop(guard);
     }
 
-    /// env 未设 + config 无键 → false（N07 安全默认不变）。
+    /// env 未设 + config 无键 → 默认放行（N07 修订：受管容器为主流形态，
+    /// 默认 true；09-19 前"默认严格+各处声明"的门只挡自己人）。
     #[test]
-    fn embedded_config_without_env_keeps_n07_default() {
+    fn embedded_config_defaults_to_managed_public_bind() {
         let guard = ENV_LOCK.lock().unwrap();
         set_env(None);
         let config = embedded_proxy_config(None, false, 8086);
         assert!(
+            config.public_bind_declared,
+            "无显式配置时默认受管放行（使用方收紧需显式 false）"
+        );
+        drop(config);
+        drop(guard);
+    }
+
+    /// 显式收紧通道：config 段显式 public_bind_declared:false + env 未设
+    /// → 保持 false（使用方的严格模式约束不被默认值翻转）。
+    #[test]
+    fn embedded_config_explicit_false_not_flipped_by_default() {
+        let guard = ENV_LOCK.lock().unwrap();
+        set_env(None);
+        let section = file_server_proxy::FileServerProxyConfig {
+            public_bind_declared: false,
+            ..file_server_proxy::FileServerProxyConfig::default()
+        };
+        let config = embedded_proxy_config(Some(section), false, 8086);
+        assert!(
             !config.public_bind_declared,
-            "无声明时保持 N07 默认（原生 standalone 安全语义不变）"
+            "config 显式 false 是使用方收紧指令，默认值不得翻转"
         );
         drop(config);
         drop(guard);
@@ -343,25 +363,44 @@ mod embedded_config_tests {
         drop(guard);
     }
 
-    /// 词表边界："true"/"1" 放行；"0"/"false"/空串/其它不放行。
+    /// env 三态词表边界："true"/"1" → Some(true)；"0"/"false" → Some(false)
+    /// （显式收紧通道）；空串/其它/未设 → None（用形态默认 true）。
     #[test]
     fn embedded_config_env_word_list_boundaries() {
         for (value, expect) in [
-            ("1", true),
-            ("true", true),
-            ("TRUE", true),
-            (" 1 ", true),
-            ("0", false),
-            ("false", false),
-            ("", false),
-            ("yes", false),
+            ("1", Some(true)),
+            ("true", Some(true)),
+            ("TRUE", Some(true)),
+            (" 1 ", Some(true)),
+            ("0", Some(false)),
+            ("false", Some(false)),
+            ("FALSE", Some(false)),
+            ("", None),
+            ("yes", None),
         ] {
             assert_eq!(
-                file_server_proxy::FileServerProxyConfig::env_declares_public_bind(Some(value)),
+                file_server_proxy::FileServerProxyConfig::env_public_bind_setting(Some(value)),
                 expect,
                 "value={value:?}"
             );
         }
-        assert!(!file_server_proxy::FileServerProxyConfig::env_declares_public_bind(None));
+        assert_eq!(
+            file_server_proxy::FileServerProxyConfig::env_public_bind_setting(None),
+            None
+        );
+    }
+
+    /// env 显式收紧（优先级最高）：config 默认 true + env=false → false。
+    #[test]
+    fn embedded_config_env_false_overrides_default() {
+        let guard = ENV_LOCK.lock().unwrap();
+        set_env(Some("false"));
+        let config = embedded_proxy_config(None, false, 8086);
+        assert!(
+            !config.public_bind_declared,
+            "env 显式 false 是使用方收紧指令，优先于默认 true"
+        );
+        drop(config);
+        drop(guard);
     }
 }

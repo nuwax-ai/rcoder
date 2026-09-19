@@ -241,11 +241,16 @@ async fn main() {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
-        public_bind_declared: FileServerProxyConfig::env_declares_public_bind(
+        // N07（修订）：env 优先三态（1/true 放行、0/false 收紧）、未设默认
+        // 受管放行 true（本服务部署形态以容器/supervisor 为主流，09-19 前
+        // "默认严格+各处声明"的门只挡自己人）。独立进程形态无 config.yml
+        // 载体，env 是唯一显式收紧通道；亦可用 HOST=127.0.0.1+令牌双保险。
+        public_bind_declared: FileServerProxyConfig::env_public_bind_setting(
             std::env::var("FILE_SERVER_PROXY_PUBLIC_BIND")
                 .ok()
                 .as_deref(),
-        ),
+        )
+        .unwrap_or(true),
         listen_port: settings.listen_port,
         rust_upstream_port: settings.rust_upstream_port,
         ts_upstream_port: settings.ts_upstream_port,
