@@ -82,3 +82,30 @@ Compose 场景（容器内 dev-hot 重编全部修复后的二进制）：
 
 - compose_userapp_dev 4 处 `ChatServiceScope` 残留（11c66e07 并行删除该类型）→ 机械替换 ServiceType（独立提交），全量 e2e 编译恢复
 - build-agent-docker 工作树：R06 四项 + 用户指令两项（缓存 200Gi / 默认 B 态）——全部门禁过，未提交（与 RBD 桥接改动并存）
+
+
+## 八、交接快照（2026-09-19 批 9 收尾，基线 166c3579 → 19403704，23 笔提交未 push）
+
+### 已闭环（含验证证据）
+- **R01-R05 Turso 生命周期**：全修（`7b24be95`，6 个修复前失败反例全绿）
+- **R02 关机顺序**：恢复扫描器有界收束 + 协调门闸 + 最后关库（单元级）
+- **R03 并发 shutdown 共享结果 + panic 传播**：全修
+- **R04 显式回滚 + 队列有界**：全修
+- **R05 旧库目录保护**：全修
+- **app-cli 排队槽终局 + 失败重试**：全修（修复前失败实证）
+- **compose_regression**：**已修复转绿**（`2786632a` flock 同进程重入——外层守卫交棒内层标记租约；场景复跑 PASS）
+- **scope_isolation**：PASS（`abe2e2e3` + `fdf1f486`）
+- **two_users**：PASS（环境残留清理）
+- **N07 env 通道**：`c46a2b94` 治本；`97915c47` 按用户后续决策改为默认 true+env 三态
+- **Pingap 版本门禁**：`bded6fc4`
+- **完整 test-e2e 41/43**（compose_regression 修复在该轮之后——修复后单场景已复跑 PASS）
+
+### 待 codex 继续（按优先级）
+1. **deploy_full_chain 最后确认**：就绪等待修复已提交（`19403704`），容器内需重编（dev-hot-build）后复跑该场景确认；若仍失败按批 9 报告第三节分层取证（重点：app-cli 编排完成时间 vs 测试等待）
+2. **完整 make test-e2e 终轮**：全修复后全量（预期 43/43 或 deploy_full_chain 单项）
+3. **remote-k8s 回归**（131，.env.local 就绪）：共享关机/内核/结构化 blocker 改动按 AGENTS 需 PG/K8s 验证——`make remote-k8s-verify SUITE=smoke` 起步
+4. **端到端 SIGTERM 反例**：R02 关机顺序的 Compose 级验证（单元门闸已过）
+5. **NT01-NT16 三平台完整矩阵**（现覆盖 NT02/05/08/12）；Windows 机器 192.168.32.53、Linux 131
+6. **N07 独立入口令牌认证层**（子项级残留）
+7. **R02 attach 语义**（受理队列/最后受理生效已完成，attach 未做）
+8. **build-agent-docker 提交**：R06 四项同步 + 缓存 200Gi + 默认 B 态（工作树未提交，与 RBD 桥接改动并存——渲染矩阵 74/74 已过）
