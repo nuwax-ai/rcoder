@@ -92,6 +92,12 @@ impl KubernetesRuntime {
     /// (完全分家后的主数据源)> `multi_image_config`(docker_config,过渡期安全兜底,
     /// 避免旧 chart 未带 kubernetes_config 时选不到镜像)> 硬编码默认值。
     pub(super) fn select_image(&self, service_type: &ServiceType) -> String {
+        // 容器基建契约（ServiceType::container_family）：ComputerNormalProject 与
+        // ComputerAgentRunner 同镜像/命名/label/PVC——先归一再 match，防新家族
+        // 成员漏臂落 `_` 读到 RCODER_DOCKER_IMAGE（rcoder-k8s 主镜像，无
+        // ENTRYPOINT）→ 容器落入交互 bash、8086 无监听被 liveness 杀
+        // （09-19 NormalProject CrashLoop 事故即此漏接）。
+        let service_type = service_type.container_family();
         // 1. 优先使用环境变量（允许运行时覆盖;deployment.yaml 注入）
         // 注意：ComputerAgentRunner 必须优先检查 RCODER_DOCKER_IMAGE_COMPUTER
         match service_type {
