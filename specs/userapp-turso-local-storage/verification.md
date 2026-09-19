@@ -84,6 +84,21 @@ Turso 关键行为证据（T0 探针，源码级）：
 - dev compose 数据目录旧 userapp.sqlite3（5.7MB）按 spec 保留未迁移；Turso 新库独立生成。
 - 旧容器曾以旧二进制 + 新 env 崩溃循环（"must be auto, sqlite or postgres"）——dev-hot 产物优先于镜像二进制所致，容器内重编后恢复；属 dev 流程已知形态，非缺陷。
 
+## 远端 K8s 回归（131，2026-09-19 追加）
+
+`make remote-k8s-verify SUITE=smoke`（源码快照 531330e9 / head dee80dc3 远端原生构建）→ 同快照追加 test：
+
+| 套件 | 结果 | 说明 |
+|---|---|---|
+| smoke | **pass** | 部署身份、双副本就绪、PVC Bound、直连健康（131:31290 / Gateway :31536） |
+| userapp | **pass**（51 场景零缺失） | ensure/builder 身份/生命周期/跨副本文件/构建/制品/cold+hot deploy/hot_env_rejected/hot_failure/hot_pod_preserved/锁冲突全景（busy×4、cross_replica、stale_version、version_keeps_resources、holder 系列）/tombstone/recreate/stop 幂等/SSE 终态/wake——**PG 后端 + 收紧后 trait + 新控制接口/关机接线在真实 K8s 全链路验证** |
+| gateway | **pass** | Gateway/HTTPRoute 条件 + 健康接口实际请求 |
+| chat | **pass** | 真实 AI 会话链路 |
+
+### 归因记录
+- 首轮 userapp 失败（部署应用 502，readiness :3010 拒连）：`.env.local` 基础镜像钉在 **0.1.265**，app-runtime 内旧 app-cli 与 HEAD 源码的 lock/编排契约漂移（已知"改 lock 必须重建 app-runtime 镜像"模式）。将基础镜像切到当日同源码构建的 **0.1.274**（build-agent-docker `make k8s-helm-rcoder-version-publish ENV=test AMD64_ONLY=1` 产物：rcoder-k8s/computer-agent-runner/app-runtime-base/app-runtime + chart 0.1.274 OCI）后全套通过——与 Turso 切换无关。
+- `.env.local` 基础镜像已更新为 0.1.274（本地未提交配置，含陈旧 digest 回写行已清除）。
+
 ## 未完成项 / 后续
 - app-cli config_hash 往返差异（6 例 e2e 失败根因）与 M4 锁信封（1 例）：移交对应子系统工作流；不阻塞 Turso 交付。
 - build-agent-docker K8s 镜像构建（`make setup k8s-helm-rcoder-version-publish ENV=test`）与 131 K8s 业务测试：按用户收尾指令执行。
