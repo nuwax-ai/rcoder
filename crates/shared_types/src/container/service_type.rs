@@ -94,6 +94,10 @@ impl std::str::FromStr for ServiceType {
             "web-agent-runner" => Ok(ServiceType::WebAgentRunner),
             "computer-agent-runner" => Ok(ServiceType::ComputerAgentRunner),
             "computer-normal-project" => Ok(ServiceType::ComputerNormalProject),
+            // ChatServiceScope（chat 契约旧枚举，已统一并入本枚举）曾接受的
+            // camelCase wire 词——保留使输入面零收缩（file-server
+            // workspace_type 通道同词）
+            "normalProject" => Ok(ServiceType::ComputerNormalProject),
             // 大驼峰格式（兼容旧配置）
             "WebAgentRunner" => Ok(ServiceType::WebAgentRunner),
             "ComputerAgentRunner" => Ok(ServiceType::ComputerAgentRunner),

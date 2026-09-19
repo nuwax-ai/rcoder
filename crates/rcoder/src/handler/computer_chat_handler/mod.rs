@@ -145,7 +145,7 @@ async fn run_computer_chat_flow(
         .as_deref()
         .map(str::trim)
         .is_some_and(|s| !s.is_empty());
-    if has_app_id && request.service_type != Some(shared_types::ChatServiceScope::Userapp) {
+    if has_app_id && request.service_type != Some(shared_types::ServiceType::Userapp) {
         return Err(ChatFlowExit::response(
             super::pod_handler::invalid_app_target_response(
                 locale,
@@ -157,8 +157,33 @@ async fn run_computer_chat_flow(
     // userApp 开发对话分支：service_type=Userapp → 该 app 的 UserappBuilder 开发容器
     // （ACP agent 直接在开发卷 workspace 工作，代码生成直接落卷）。
     // 枚举穷尽：未来加业务域变体时此处编译期提醒补分支。
-    if request.service_type == Some(shared_types::ChatServiceScope::Userapp) {
+    if request.service_type == Some(shared_types::ServiceType::Userapp) {
         return run_userapp_dev_chat_flow(state, locale, request, is_devcomputer).await;
+    }
+
+    // chat 域路由收窄（fail-fast，不静默回落）：service_type 复用容器族词表
+    // （与 pod 族同输入面），但仅 userapp 业务域 + computer 族两形态有 chat
+    // 路由。userapp 在 chat 域是业务域标记（非容器形态）——目标容器由
+    // app_stage 推导（dev→UserappBuilder），直接传容器形态 userapp-builder
+    // 属双头语义，与 pod 族/agent 族"勿传 user-app-builder"同语义拒绝。
+    if let Some(st) = request.service_type
+        && !matches!(
+            st,
+            shared_types::ServiceType::ComputerAgentRunner
+                | shared_types::ServiceType::ComputerNormalProject
+        )
+    {
+        let hint = if matches!(st, shared_types::ServiceType::UserappBuilder) {
+            "use service_type=userapp with app_stage (container form is derived from stage)"
+        } else {
+            "expected userapp / computer-agent-runner / computer-normal-project"
+        };
+        return Err(ChatFlowExit::response(
+            super::pod_handler::invalid_app_target_response(
+                locale,
+                &format!("service_type {st} has no chat route ({hint})"),
+            ),
+        ));
     }
 
     // 1~3. 请求校验与路由解析（user_id / 隔离参数 / project_id / work_dir_id / 资源限制）
@@ -194,10 +219,11 @@ async fn run_computer_chat_flow(
     let request_for_forward = session::resolve_forward_request(&state, &request, &project_id);
 
     // 8. 转发请求到容器服务（使用 gRPC）
-    // 常规项目走同一 computer 流程（共享容器/ensure/VNC 全复用）；仅转发
-    // service_type 保留本义——agent_runner cwd 链按 ComputerNormalProject 推导
+    // 常规项目走同一 computer 流程（共享容器/ensure/VNC 全复用）；service_type
+    // 已是容器族 ServiceType——显式 ComputerAgentRunner 归一（缺省与显式同值），
+    // agent_runner cwd 链按 ComputerNormalProject 推导
     let forward_service_type = match request.service_type {
-        Some(shared_types::ChatServiceScope::NormalProject) => {
+        Some(shared_types::ServiceType::ComputerNormalProject) => {
             shared_types::ServiceType::ComputerNormalProject
         }
         _ => shared_types::ServiceType::ComputerAgentRunner,

@@ -106,15 +106,18 @@ pub const APP_STAGE_PROD: &str = "prod";
 mod tests {
     use super::*;
 
-    /// chat body 的 service_type 枚举 wire 值必须与 X-Service-Type header 值同词表
-    /// （chat 分支与转发分流共用 `userapp` 标记）——一处改名另一处漂移即在此报红。
+    /// chat body 的 service_type 词表必须覆盖 X-Service-Type header 规范词
+    /// （chat 分支与转发分流共用 `userapp` 标记）——header 契约词必须能解析为
+    /// `ServiceType::Userapp`（chat body 字段复用容器族 ServiceType，单一词表），
+    /// 一处改名另一处漂移即在此报红。
     #[test]
     fn chat_scope_wire_matches_header_value() {
-        let wire = serde_json::to_value(crate::ChatServiceScope::Userapp).expect("serialize");
         assert_eq!(
-            wire.as_str().expect("string variant"),
-            SERVICE_TYPE_USERAPP,
-            "ChatServiceScope::Userapp wire 值与 SERVICE_TYPE_USERAPP 漂移"
+            SERVICE_TYPE_USERAPP
+                .parse::<crate::ServiceType>()
+                .expect("header 词须在词表内"),
+            crate::ServiceType::Userapp,
+            "SERVICE_TYPE_USERAPP 与 ServiceType::Userapp 词表归属漂移"
         );
     }
 

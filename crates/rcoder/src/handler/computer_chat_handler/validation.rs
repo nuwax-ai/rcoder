@@ -56,11 +56,11 @@ pub(super) fn validate_and_prepare_request(
         )));
     }
 
-    // 常规项目（service_type=normalProject）且未显式指定 agent_work_dir：
+    // 常规项目（service_type=computer-normal-project 族）且未显式指定 agent_work_dir：
     // 在此物化为绝对路径缺省 `/home/user/normalProject/{project_id}`——
     // 下游（校验/主容器预创建映射/gRPC 透传/agent_runner cwd）全部复用既有
     // 绝对路径通道，一处注入覆盖全链。显式 agent_work_dir（绝对或单段）不覆盖。
-    if request.service_type == Some(shared_types::ChatServiceScope::NormalProject)
+    if request.service_type == Some(shared_types::ServiceType::ComputerNormalProject)
         && request
             .agent_work_dir
             .as_deref()
@@ -80,13 +80,12 @@ pub(super) fn validate_and_prepare_request(
 
     // 校验 work_dir_id（无论来源，用于路径拼接的标识符都应校验）。
     // 两形态：单段目录名（原语义）或绝对路径（常规项目场景，Java 传子容器内
-    // /home/user/{projectType}/{projectId}）——Computer 族（含 NormalProject）放行
-    let scope_service_type = match request.service_type {
-        Some(shared_types::ChatServiceScope::NormalProject) => {
-            shared_types::ServiceType::ComputerNormalProject
-        }
-        _ => shared_types::ServiceType::ComputerAgentRunner,
-    };
+    // /home/user/{projectType}/{projectId}）——Computer 族（含 NormalProject）放行；
+    // service_type 已是容器族 ServiceType（userapp/无路由变体在受理层先行分派
+    // 或拒绝，此处仅 computer 族到达），缺省按 ComputerAgentRunner 校验
+    let scope_service_type = request
+        .service_type
+        .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
     if let Err(e) =
         shared_types::validate_agent_work_dir_for_service(&scope_service_type, &work_dir_id)
     {

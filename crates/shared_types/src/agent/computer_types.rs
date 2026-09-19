@@ -7,23 +7,7 @@ use garde::Validate;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::{Attachment, ChatAgentConfig, ModelProviderConfig};
-
-/// `/computer/chat` 的业务域路由标记（枚举而非自由字符串——匹配处穷尽，
-/// 词表单一事实源；值与 `X-Service-Type` header 同为 `userapp`）。
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ChatServiceScope {
-    /// userApp 开发对话：路由到该 app 的 UserappBuilder 开发容器
-    Userapp,
-    /// 常规项目（normal project）：与 ComputerAgentRunner 复用同一 per-user 容器，
-    /// agent 工作目录缺省推导 `/home/user/normalProject/{project_id}`。
-    /// wire 词与 file-server workspace_type 通道一致（camelCase `normalProject`）。
-    #[serde(rename = "normalProject")]
-    NormalProject,
-}
+use crate::{Attachment, ChatAgentConfig, ModelProviderConfig, ServiceType};
 
 /// Computer Agent 聊天请求
 ///
@@ -43,16 +27,22 @@ pub struct ComputerChatRequest {
     #[schema(example = "proj_456")]
     pub project_id: Option<String>,
 
-    /// 业务域路由标记（枚举）。可选值：**仅 `userapp`**（wire 词表
-    /// snake_case）——本请求路由到该 app（app_id 定位）的
-    /// UserappBuilder 开发容器，ACP agent 直接在开发卷 workspace
-    /// （`{USERAPP_WORKSPACE_DIR}/{app_id}`）上工作，生成的代码直接落卷。
-    /// 仅开发阶段传；部署后无对话。缺省（不传）= 普通 computer 沙箱对话；
-    /// 未知值反序列化即拒（fail-fast，不静默回落 computer——路由错容器
-    /// 比 400 更难排查）。
+    /// 业务域路由标记——**复用容器族 [`ServiceType`]**（单一词表单一事实源：
+    /// 手写宽容反序列化走 `ServiceType::from_str`，与 pod 族接口同一输入面，
+    /// Java 出站统一词表，杜绝两族词表漂移）。chat 域合法路由（受理层
+    /// fail-fast 收窄，词表外的容器形态显式拒绝——路由错容器比 400 更难排查）：
+    ///
+    /// - `Userapp`（含 `userapp`/`user-app`/`application`/`app` 同义词）→
+    ///   userApp 开发对话：路由到该 app（app_id 定位）的 UserappBuilder
+    ///   开发容器，ACP agent 直接在开发卷 workspace（`{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    ///   上工作，生成的代码直接落卷。仅开发阶段传；部署后无对话
+    /// - `ComputerNormalProject` → 常规项目：与 ComputerAgentRunner 复用同一
+    ///   per-user 容器，agent 工作目录缺省推导 `/home/user/normalProject/{project_id}`
+    /// - 缺省（不传）/ `ComputerAgentRunner` → 普通 computer 沙箱对话
+    /// - `WebAgentRunner` / `UserappBuilder` → chat 域无此路由，受理层显式拒绝
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(inline)] // 枚举描述直读字段列表（否则 $ref 藏进组件库不直观）
-    pub service_type: Option<ChatServiceScope>,
+    pub service_type: Option<ServiceType>,
 
     /// userApp 应用 ID——userApp 开发对话场景（service_type=userapp）必填，
     /// 定位该 app 的 UserappBuilder 开发容器（标识 = app_id）
@@ -478,24 +468,66 @@ pub struct ComputerAgentCancelResponse {
 }
 
 #[cfg(test)]
-mod chat_service_scope_tests {
-    use super::ChatServiceScope;
+mod chat_service_type_tests {
+    use super::ComputerChatRequest;
+    use crate::ServiceType;
 
+    /// chat `service_type` 复用容器族 `ServiceType`（单一词表）：反序列化走
+    /// `ServiceType::from_str` 宽容词表，与 pod 族接口同一输入面；序列化输出
+    /// 为 ServiceType 规范词（kebab-case，gRPC 转发链同词表）。
+    ///
+    /// 历史：曾独立 `ChatServiceScope` 枚举（serde 严格词表 userapp/normalProject），
+    /// Java 出站统一取 ServiceType 词（pod 族一直放行），09-19 NormalProject
+    /// 会话传 `computer-normal-project` 在 chat 反序列化即拒 → axum 层 400
+    /// INVALID_PARAMS（请求不进 handler）。统一后单一词表杜绝此类漂移。
     #[test]
-    fn normal_project_wire_is_camel_case() {
-        // wire 词与 file-server workspace_type 通道一致（camelCase normalProject）
+    fn chat_service_type_uses_service_type_vocabulary() {
+        // Userapp 同义词 → Userapp（含 header 契约规范词 "userapp"）
+        for word in [
+            "userapp",
+            "user-app",
+            "UserApp",
+            "Userapp",
+            "application",
+            "app",
+        ] {
+            assert_eq!(
+                serde_json::from_str::<ServiceType>(&format!("\"{word}\""))
+                    .unwrap_or_else(|e| panic!("{word} 应可反序列化: {e}")),
+                ServiceType::Userapp
+            );
+        }
+        // NormalProject 词族 → ComputerNormalProject（含 ChatServiceScope 旧
+        // 契约的 camelCase 词 normalProject——ServiceType FromStr 保留）
+        for word in [
+            "computer-normal-project",
+            "ComputerNormalProject",
+            "normalProject",
+        ] {
+            assert!(
+                serde_json::from_str::<ServiceType>(&format!("\"{word}\"")).is_ok(),
+                "{word} 应可反序列化"
+            );
+        }
         assert_eq!(
-            serde_json::to_string(&ChatServiceScope::NormalProject).unwrap(),
-            "\"normalProject\""
+            serde_json::from_str::<ServiceType>("\"computer-normal-project\"").unwrap(),
+            ServiceType::ComputerNormalProject
         );
-        assert_eq!(
-            serde_json::from_str::<ChatServiceScope>("\"normalProject\"").unwrap(),
-            ChatServiceScope::NormalProject
-        );
-        assert_eq!(
-            serde_json::to_string(&ChatServiceScope::Userapp).unwrap(),
-            "\"userapp\""
-        );
+
+        // 词表外的值仍然反序列化即拒（fail-fast 不静默回落）
+        assert!(serde_json::from_str::<ServiceType>("\"unknown-type\"").is_err());
+    }
+
+    /// 事故现场形态回归：Java 新版 NormalProject 会话的真实 body——
+    /// `service_type:"computer-normal-project"` 必须完整反序列化通过。
+    #[test]
+    fn chat_request_accepts_normal_project_kebab_wire() {
+        let chat: ComputerChatRequest = serde_json::from_str(
+            r#"{"user_id":"6","project_id":"1693664","service_type":"computer-normal-project",
+                "agent_work_dir":"262","prompt":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(chat.service_type, Some(ServiceType::ComputerNormalProject));
     }
 }
 

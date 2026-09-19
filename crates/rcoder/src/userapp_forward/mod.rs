@@ -26,7 +26,8 @@ use crate::router::AppState;
 
 // 分流 header 常量（X-Service-Type / X-App-Id）定义在 shared_types（与容器内
 // file-server 共用单一事实源）；本模块转发 computer_intercept 拦截层给主 Router
-// 装配。chat body 的 service_type 词表由 shared_types::ChatServiceScope 枚举承载。
+// 装配。chat body 的 service_type 词表由容器族 shared_types::ServiceType 承载
+// （与 pod 族接口单一词表；userapp 业务域在受理层结合 app_stage 推导容器形态）。
 pub(crate) use forward::computer_intercept;
 pub(crate) use upstream::invalidate_probe_cache;
 
