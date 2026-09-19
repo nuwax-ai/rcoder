@@ -26,6 +26,8 @@ pub(super) struct OwnerRecord {
     pub port: u16,
     pub project_id: String,
     pub owner: OwnerIdentity,
+    #[serde(default)]
+    pub registration_operation_id: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct OwnerIdentity {
@@ -123,6 +125,11 @@ impl DevServerManager {
             candidate.expected_runtime_instance_id == owner.runtime_instance_id,
             "captured runtime instance no longer matches owner"
         );
+        // One local publication boundary; short disk transactions never span HTTP/await.
+        let mut processes = self
+            .processes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("external process registry poisoned"))?;
         let intent = self.external_transaction(|state| {
             let root = runtime_state_layout::canonical_project_root(workspace);
             let slot = key(project, candidate.kind);
@@ -164,6 +171,7 @@ impl DevServerManager {
                     pid: 0,
                     port: shared_types::APP_ENTRY_PORT,
                     project_id: project.to_string(),
+                    registration_operation_id: Some(candidate.operation_id.clone()),
                     owner: OwnerIdentity {
                         address: owner.address.clone(),
                         runtime_instance_id: owner.runtime_instance_id.clone(),
@@ -173,10 +181,6 @@ impl DevServerManager {
             state.intents.insert(slot, intent.clone());
             Ok(intent)
         })?;
-        let mut processes = self
-            .processes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("external process registry poisoned"))?;
         processes.insert(
             project.to_string(),
             crate::models::DevProcess {
@@ -250,7 +254,11 @@ impl DevServerManager {
         request: &RuntimeOperationRequest,
         remove_owner: bool,
     ) -> Result<()> {
-        self.external_transaction(|state| {
+        let mut processes = self
+            .processes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("external process registry poisoned"))?;
+        let removed = self.external_transaction(|state| {
             let slot = key(project, request.kind);
             let completed_key = format!("{project}|{}", request.operation_id);
             if !state.intents.contains_key(&slot)
@@ -258,7 +266,7 @@ impl DevServerManager {
                     old.request.expected_runtime_instance_id == request.expected_runtime_instance_id
                 })
             {
-                return Ok(());
+                return Ok(false);
             }
             let current = state
                 .intents
@@ -273,17 +281,21 @@ impl DevServerManager {
             let completed = current.clone();
             state.intents.remove(&slot);
             state.completed.insert(completed_key, completed);
-            if remove_owner {
-                if !state.intents.values().any(|intent| {
-                    intent.request.expected_runtime_instance_id
-                        == request.expected_runtime_instance_id
-                }) {
-                    state.owners.remove(project);
-                }
-                state.stops.remove(project);
+            let remove_registration = remove_owner
+                && state.owners.get(project).is_some_and(|owner| {
+                    owner.registration_operation_id.as_deref()
+                        == Some(request.operation_id.as_str())
+                        && owner.owner.runtime_instance_id == request.expected_runtime_instance_id
+                });
+            if remove_registration {
+                state.owners.remove(project);
             }
-            Ok(())
-        })
+            Ok(remove_registration)
+        })?;
+        if removed {
+            processes.remove(project);
+        }
+        Ok(())
     }
 }
 
@@ -298,6 +310,206 @@ pub(super) fn verify_view(
         "runtime operation identity mismatch; recovery required"
     );
     Ok(())
+}
+
+impl DevServerManager {
+    pub fn ensure_new_build_admissible(&self, project: &str) -> crate::error::AppResult<()> {
+        let state = self.read_external_state().map_err(|e| {
+            crate::error::AppError::business(format!("external recovery required: {e:#}"))
+        })?;
+        if let Some(intent) = state
+            .intents
+            .get(&key(project, RuntimeOperationKind::Restart))
+            .or_else(|| state.intents.get(&key(project, RuntimeOperationKind::Stop)))
+        {
+            return Err(crate::error::AppError::Conflict(format!(
+                "pending runtime operation {}; recover this operation before creating another build task",
+                intent.request.operation_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// A local child must still be owned, and the management API must confirm the same release is Ready.
+    /// External registration alone never enables this fast path.
+    pub async fn confirmed_local_manifest_ready(
+        &self,
+        project: &str,
+        workspace: &Path,
+    ) -> crate::error::AppResult<bool> {
+        use crate::error::AppError;
+        let state = self
+            .read_external_state()
+            .map_err(|e| AppError::business(format!("external recovery required: {e:#}")))?;
+        if state
+            .intents
+            .contains_key(&key(project, RuntimeOperationKind::Restart))
+            || state
+                .intents
+                .contains_key(&key(project, RuntimeOperationKind::Stop))
+        {
+            return Ok(false);
+        }
+        let process = super::support::lock(&self.processes)?.get(project).cloned();
+        let Some(process) = process.filter(|p| p.external_owner.is_none()) else {
+            return Ok(false);
+        };
+        let child = super::support::lock(&self.supervised)?
+            .get(project)
+            .cloned();
+        let Some(child) = child.filter(|c| c.pid() == process.pid && c.exited().is_none()) else {
+            return Ok(false);
+        };
+        let Some(release_id) = tokio::fs::read_to_string(workspace.join("release.lock.toml"))
+            .await
+            .ok()
+            .and_then(|text| text.parse::<toml::Value>().ok())
+            .and_then(|value| {
+                value
+                    .get("release_id")
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_owned)
+            })
+        else {
+            return Ok(false);
+        };
+        let probe = async {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()?;
+            let base = format!("http://{}", self.config.app_cli_admin_probe_addr);
+            let status: serde_json::Value = client
+                .get(format!("{base}/v1/deploy/status"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let ready: serde_json::Value = client
+                .get(format!("{base}/ready"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            Ok::<_, reqwest::Error>(
+                status["data"]["release_id"].as_str() == Some(release_id.as_str())
+                    && status["data"]["phase"] == "running"
+                    && ready["phase"] == "running"
+                    && ready["status"] == "ready",
+            )
+        }
+        .await;
+        Ok(probe.unwrap_or(false) && child.exited().is_none())
+    }
+
+    pub fn external_operation_for_task(
+        &self,
+        project: &str,
+        task_id: &str,
+    ) -> crate::error::AppResult<Option<String>> {
+        let state = self.read_external_state().map_err(|e| {
+            crate::error::AppError::business(format!("external recovery required: {e:#}"))
+        })?;
+        Ok(state
+            .intents
+            .iter()
+            .chain(state.completed.iter())
+            .find(|(slot, intent)| {
+                slot.starts_with(&format!("{project}|"))
+                    && intent.request.request_context.as_deref() == Some(task_id)
+            })
+            .map(|(_, intent)| intent.request.operation_id.clone()))
+    }
+
+    /// Explicit recovery never rebuilds source or changes the captured operation/version.
+    pub async fn recover_external_operation(
+        &self,
+        project: &str,
+        workspace: &Path,
+        operation_id: &str,
+        pg: Option<&shared_types::StartPgCredential>,
+    ) -> crate::error::AppResult<(Option<String>, RuntimeOperationView)> {
+        let recover = async {
+            let state = self.read_external_state()?;
+            let intent = state
+                .intents
+                .iter()
+                .chain(state.completed.iter())
+                .find(|(slot, intent)| {
+                    slot.starts_with(&format!("{project}|"))
+                        && intent.request.operation_id == operation_id
+                })
+                .map(|(_, intent)| intent.clone())
+                .context("runtime operation not found for this application")?;
+            ensure!(
+                intent.project_root.as_ref()
+                    == Some(&runtime_state_layout::canonical_project_root(workspace)),
+                "recovery workspace differs from captured project"
+            );
+            let completed = state
+                .completed
+                .contains_key(&format!("{project}|{operation_id}"));
+            let identity = super::owner_client::probe_owner(&intent.address)
+                .await
+                .context("runtime owner unavailable; recovery remains protected")?;
+            let app = std::env::var("PROJECT_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "unknown-app".into());
+            super::owner_client::verify_project_identity(&identity, workspace, &app)?;
+            ensure!(
+                identity.runtime_instance_id == intent.request.expected_runtime_instance_id
+                    && identity.workspace_id == intent.request.workspace_id,
+                "runtime owner changed; cannot resume old operation"
+            );
+            let (_, token) = super::owner_client::find_owner_token(workspace, &app)
+                .context("runtime owner credentials unavailable")?;
+            let client = OwnerClient::new(&intent.address, &token)?;
+            let mut supplied = intent.request.clone();
+            supplied.run_config = pg.map(|pg| shared_types::OperationRunConfig {
+                pg: Some(pg.clone()),
+            });
+            // A completed receipt is query-only: pruning owner history must never replay old side effects.
+            let view = if completed {
+                if supplied.run_config.is_some() {
+                    ensure!(
+                        digest(&supplied)? == intent.digest,
+                        "runtime intent configuration differs"
+                    );
+                }
+                let view = client.operation_if_exists(operation_id).await?.context(
+                    "completed operation no longer retained by owner; replay prohibited",
+                )?;
+                verify_view(&view, &intent.request)?;
+                view
+            } else {
+                self.resume_external_intent(project, &client, &intent, &supplied)
+                    .await?
+            };
+            if !completed
+                && matches!(
+                    view.state,
+                    shared_types::RuntimeOperationState::Succeeded
+                        | shared_types::RuntimeOperationState::Failed
+                        | shared_types::RuntimeOperationState::Cancelled
+                )
+            {
+                self.finish_external_intent(
+                    project,
+                    &intent.request,
+                    view.kind == RuntimeOperationKind::Stop
+                        && view.state == shared_types::RuntimeOperationState::Succeeded,
+                )?;
+            }
+            Ok::<_, anyhow::Error>((intent.request.request_context, view))
+        }
+        .await;
+        recover.map_err(|error| {
+            crate::error::AppError::business(format!("runtime operation recovery: {error:#}"))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +544,120 @@ mod tests {
             runtime_instance_id: "instance".into(),
         }
     }
+    #[test]
+    fn pending_task_context_cannot_be_replaced_by_new_or_anonymous_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path());
+        let original = request();
+        let owner = owner("127.0.0.1:1");
+        manager
+            .prepare_external_intent("project", dir.path(), &owner, &original)
+            .unwrap();
+        for context in [Some("another-task".to_owned()), None] {
+            let mut candidate = original.clone();
+            candidate.request_context = context;
+            candidate.operation_id = "replacement-operation".into();
+            let error = manager
+                .prepare_external_intent("project", dir.path(), &owner, &candidate)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains(&original.operation_id));
+            let state = manager.read_external_state().unwrap();
+            assert_eq!(
+                state.intents[&key("project", original.kind)]
+                    .request
+                    .operation_id,
+                original.operation_id
+            );
+        }
+        let mut same_task = original.clone();
+        same_task.operation_id = "discarded-new-id".into();
+        same_task.expected_revision = 100;
+        let resumed = manager
+            .prepare_external_intent("project", dir.path(), &owner, &same_task)
+            .unwrap();
+        assert_eq!(resumed.request.operation_id, original.operation_id);
+        assert_eq!(
+            resumed.request.expected_revision,
+            original.expected_revision
+        );
+    }
+
+    #[test]
+    fn anonymous_retry_requires_original_operation_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path());
+        let mut original = request();
+        original.request_context = None;
+        let owner = owner("127.0.0.1:1");
+        manager
+            .prepare_external_intent("project", dir.path(), &owner, &original)
+            .unwrap();
+        assert!(
+            manager
+                .prepare_external_intent("project", dir.path(), &owner, &original)
+                .is_ok()
+        );
+        let mut candidate = original.clone();
+        candidate.operation_id = "another-operation".into();
+        assert!(
+            manager
+                .prepare_external_intent("project", dir.path(), &owner, &candidate)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_stop_completion_preserves_new_registration_on_same_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path());
+        let owner = owner("127.0.0.1:1");
+        let mut stop = request();
+        stop.kind = RuntimeOperationKind::Stop;
+        stop.operation_id = "old-stop".into();
+        manager
+            .prepare_external_intent("project", dir.path(), &owner, &stop)
+            .unwrap();
+        let mut restart = request();
+        restart.operation_id = "new-restart".into();
+        manager
+            .prepare_external_intent("project", dir.path(), &owner, &restart)
+            .unwrap();
+        manager
+            .finish_external_intent("project", &restart, false)
+            .unwrap();
+        manager
+            .finish_external_intent("project", &stop, true)
+            .unwrap();
+        assert_eq!(
+            manager.read_external_state().unwrap().owners["project"]
+                .registration_operation_id
+                .as_deref(),
+            Some("new-restart")
+        );
+        assert!(manager.processes.lock().unwrap().contains_key("project"));
+        // Re-observing old completion also cannot clear newer registry state.
+        manager
+            .finish_external_intent("project", &stop, true)
+            .unwrap();
+        assert!(manager.processes.lock().unwrap().contains_key("project"));
+        stop.operation_id = "current-stop".into();
+        manager
+            .prepare_external_intent("project", dir.path(), &owner, &stop)
+            .unwrap();
+        manager
+            .finish_external_intent("project", &stop, true)
+            .unwrap();
+        assert!(
+            !manager
+                .read_external_state()
+                .unwrap()
+                .owners
+                .contains_key("project")
+        );
+        assert!(!manager.processes.lock().unwrap().contains_key("project"));
+    }
+
     #[derive(Default)]
     struct Wire {
         posts: Vec<RuntimeOperationRequest>,
@@ -605,185 +931,5 @@ mod tests {
                 .is_err()
         );
         assert_eq!(a.read_external_state().unwrap().intents.len(), 2);
-    }
-}
-
-impl DevServerManager {
-    pub fn ensure_new_build_admissible(&self, project: &str) -> crate::error::AppResult<()> {
-        let state = self.read_external_state().map_err(|e| {
-            crate::error::AppError::business(format!("external recovery required: {e:#}"))
-        })?;
-        if let Some(intent) = state
-            .intents
-            .get(&key(project, RuntimeOperationKind::Restart))
-        {
-            return Err(crate::error::AppError::Conflict(format!(
-                "pending runtime operation {}; recover this operation before creating another build task",
-                intent.request.operation_id
-            )));
-        }
-        Ok(())
-    }
-
-    /// A local child must still be owned, and the management API must confirm the same release is Ready.
-    /// External registration alone never enables this fast path.
-    pub async fn confirmed_local_manifest_ready(
-        &self,
-        project: &str,
-        workspace: &Path,
-    ) -> crate::error::AppResult<bool> {
-        use crate::error::AppError;
-        let state = self
-            .read_external_state()
-            .map_err(|e| AppError::business(format!("external recovery required: {e:#}")))?;
-        if state
-            .intents
-            .contains_key(&key(project, RuntimeOperationKind::Restart))
-            || state
-                .intents
-                .contains_key(&key(project, RuntimeOperationKind::Stop))
-        {
-            return Ok(false);
-        }
-        let process = super::support::lock(&self.processes)?.get(project).cloned();
-        let Some(process) = process.filter(|p| p.external_owner.is_none()) else {
-            return Ok(false);
-        };
-        let child = super::support::lock(&self.supervised)?
-            .get(project)
-            .cloned();
-        let Some(child) = child.filter(|c| c.pid() == process.pid && c.exited().is_none()) else {
-            return Ok(false);
-        };
-        let Some(release_id) = tokio::fs::read_to_string(workspace.join("release.lock.toml"))
-            .await
-            .ok()
-            .and_then(|text| text.parse::<toml::Value>().ok())
-            .and_then(|value| {
-                value
-                    .get("release_id")
-                    .and_then(toml::Value::as_str)
-                    .map(str::to_owned)
-            })
-        else {
-            return Ok(false);
-        };
-        let probe = async {
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .timeout(std::time::Duration::from_secs(3))
-                .build()?;
-            let base = format!("http://{}", self.config.app_cli_admin_probe_addr);
-            let status: serde_json::Value = client
-                .get(format!("{base}/v1/deploy/status"))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            let ready: serde_json::Value = client
-                .get(format!("{base}/ready"))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            Ok::<_, reqwest::Error>(
-                status["data"]["release_id"].as_str() == Some(release_id.as_str())
-                    && status["data"]["phase"] == "running"
-                    && ready["phase"] == "running"
-                    && ready["status"] == "ready",
-            )
-        }
-        .await;
-        Ok(probe.unwrap_or(false) && child.exited().is_none())
-    }
-
-    pub fn external_operation_for_task(
-        &self,
-        project: &str,
-        task_id: &str,
-    ) -> crate::error::AppResult<Option<String>> {
-        let state = self.read_external_state().map_err(|e| {
-            crate::error::AppError::business(format!("external recovery required: {e:#}"))
-        })?;
-        Ok(state
-            .intents
-            .iter()
-            .chain(state.completed.iter())
-            .find(|(slot, intent)| {
-                slot.starts_with(&format!("{project}|"))
-                    && intent.request.request_context.as_deref() == Some(task_id)
-            })
-            .map(|(_, intent)| intent.request.operation_id.clone()))
-    }
-
-    /// Explicit recovery never rebuilds source or changes the captured operation/version.
-    pub async fn recover_external_operation(
-        &self,
-        project: &str,
-        workspace: &Path,
-        operation_id: &str,
-        pg: Option<&shared_types::StartPgCredential>,
-    ) -> crate::error::AppResult<(Option<String>, RuntimeOperationView)> {
-        let recover = async {
-            let state = self.read_external_state()?;
-            let intent = state
-                .intents
-                .iter()
-                .chain(state.completed.iter())
-                .find(|(slot, intent)| {
-                    slot.starts_with(&format!("{project}|"))
-                        && intent.request.operation_id == operation_id
-                })
-                .map(|(_, intent)| intent.clone())
-                .context("runtime operation not found for this application")?;
-            ensure!(
-                intent.project_root.as_ref()
-                    == Some(&runtime_state_layout::canonical_project_root(workspace)),
-                "recovery workspace differs from captured project"
-            );
-            let identity = super::owner_client::probe_owner(&intent.address)
-                .await
-                .context("runtime owner unavailable; recovery remains protected")?;
-            let app = std::env::var("PROJECT_ID")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "unknown-app".into());
-            super::owner_client::verify_project_identity(&identity, workspace, &app)?;
-            ensure!(
-                identity.runtime_instance_id == intent.request.expected_runtime_instance_id
-                    && identity.workspace_id == intent.request.workspace_id,
-                "runtime owner changed; cannot resume old operation"
-            );
-            let (_, token) = super::owner_client::find_owner_token(workspace, &app)
-                .context("runtime owner credentials unavailable")?;
-            let client = OwnerClient::new(&intent.address, &token)?;
-            let mut supplied = intent.request.clone();
-            supplied.run_config = pg.map(|pg| shared_types::OperationRunConfig {
-                pg: Some(pg.clone()),
-            });
-            let view = self
-                .resume_external_intent(project, &client, &intent, &supplied)
-                .await?;
-            if matches!(
-                view.state,
-                shared_types::RuntimeOperationState::Succeeded
-                    | shared_types::RuntimeOperationState::Failed
-                    | shared_types::RuntimeOperationState::Cancelled
-            ) {
-                self.finish_external_intent(
-                    project,
-                    &intent.request,
-                    view.kind == RuntimeOperationKind::Stop
-                        && view.state == shared_types::RuntimeOperationState::Succeeded,
-                )?;
-            }
-            Ok::<_, anyhow::Error>((intent.request.request_context, view))
-        }
-        .await;
-        recover.map_err(|error| {
-            crate::error::AppError::business(format!("runtime operation recovery: {error:#}"))
-        })
     }
 }

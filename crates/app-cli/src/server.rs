@@ -3139,6 +3139,9 @@ mod tests {
             let source = dir.path().join("workspace");
             let run = source.join(".run");
             std::fs::create_dir_all(&run).unwrap();
+            // Runtime targets are canonical; macOS temp paths may alias /private/var.
+            let source = source.canonicalize().unwrap();
+            let run = run.canonicalize().unwrap();
             std::fs::write(source.join("source-sentinel"), "never replace source").unwrap();
             let args = RuntimeArgs {
                 workspace: if run_owner {

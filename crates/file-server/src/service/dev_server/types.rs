@@ -185,6 +185,7 @@ impl DevServerManager {
                             pid: process.pid,
                             port: process.port,
                             project_id: process.project_id.clone(),
+                            registration_operation_id: None,
                             owner: super::external_store::OwnerIdentity {
                                 address: owner.address.clone(),
                                 runtime_instance_id: owner.runtime_instance_id.clone(),

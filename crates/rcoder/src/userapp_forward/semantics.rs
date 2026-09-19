@@ -34,6 +34,10 @@ pub(super) enum SkipKind {
 }
 
 pub(super) fn classify_dev_absent(path: &str) -> DevAbsentAction {
+    // Recovery cannot create another physical instance and replay old intent there.
+    if super::forward::is_dev_operation_recovery(path) {
+        return DevAbsentAction::Unavailable;
+    }
     let rest = path.strip_prefix(USERAPP_API_PREFIX).unwrap_or(path);
     if let Some(tail) = rest.strip_prefix("/tasks/") {
         let segs: Vec<&str> = tail.split('/').collect();

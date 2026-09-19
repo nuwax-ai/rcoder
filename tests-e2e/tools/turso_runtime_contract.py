@@ -21,10 +21,13 @@ from turso_compose_contract import inspect as inspect_contract
 from first_open_contract import exercise as exercise_first_open
 
 REPO = Path(__file__).resolve().parents[2]
+# Frozen RCoder snapshots need not share a parent with the paired repository.
+# An explicit root can point at a separately frozen copy of its Compose inputs.
+PAIRED_REPO = Path(os.environ.get('E2E_BUILD_AGENT_DOCKER_ROOT', str(REPO.parent / 'build-agent-docker'))).resolve()
 CONFIGURATIONS = (
     REPO / 'docker/docker-compose.yml',
-    REPO.parent / 'build-agent-docker/docker-userapp-computer/docker-compose.yml',
-    REPO.parent / 'build-agent-docker/docker/docker-compose.yml',
+    PAIRED_REPO / 'docker-userapp-computer/docker-compose.yml',
+    PAIRED_REPO / 'docker/docker-compose.yml',
 )
 OBSERVER_CASE_DIR = 'observer'
 

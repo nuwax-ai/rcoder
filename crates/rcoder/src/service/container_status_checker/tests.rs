@@ -446,3 +446,56 @@ async fn cleanup_stale_health_states_removes_unknown_or_expired_only() {
     );
     assert!(c.health_states.get("stale").is_none(), "超期条目应被清理");
 }
+
+/// Exercise the actual primary routing table and forwarding handler, not just its path whitelist.
+#[tokio::test]
+async fn dev_operation_recovery_route_uses_body_app_and_never_provisions_or_routes_prod() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let runtime = Arc::new(ProbeRuntime::new(FindBehavior::Missing));
+    let (state, _metadata_dir) = test_state(runtime.clone()).await;
+    let router = crate::userapp_forward::routes().with_state(state);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/userapp/dev/operations/original-operation/recover")
+        .header("content-type", "application/json")
+        .header("x-app-stage", "prod")
+        .body(Body::from(r#"{"app_id":"123"}"#))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 8192)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["code"],
+        shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+        "{body}"
+    );
+    assert_eq!(body["success"], false);
+    assert_eq!(
+        *runtime.queries.lock().unwrap(),
+        vec![("123".into(), ServiceType::UserappBuilder)]
+    );
+    // Conflicting header/body identity must fail before any container lookup.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/userapp/dev/operations/original-operation/recover")
+        .header("content-type", "application/json")
+        .header("x-app-id", "456")
+        .body(Body::from(r#"{"app_id":"123"}"#))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 8192)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["success"], false);
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("matching X-App-Id")
+    );
+    assert_eq!(runtime.queries.lock().unwrap().len(), 1);
+}

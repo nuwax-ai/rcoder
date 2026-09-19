@@ -871,7 +871,7 @@ mod runtime_configuration_tests {
                 .map(|command| command.last().unwrap().as_str())
                 .collect();
             assert!(scripts[4].contains("ALTER USER"));
-            assert!(scripts[5].starts_with("PGPASSWORD="));
+            assert!(scripts[5].starts_with("env -u PGHOSTADDR -u PGSERVICE PGPASSWORD="));
             assert!(scripts[6].contains("/configuration/activate"));
             assert!(
                 !scripts

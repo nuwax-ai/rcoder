@@ -649,30 +649,8 @@ impl DevServerManager {
             }
         }
 
-        // 登记 external DevProcess：停止/后续操作经运行 API 路由
-        // （pid 0 哨兵——外部 owner 无本地子进程句柄）。
-        let now = process::now_ms();
-        let ldir = log::log_dir(&self.config, project_id);
-        lock(&self.processes)?.insert(
-            project_id.to_string(),
-            DevProcess {
-                pid: 0,
-                port: shared_types::APP_ENTRY_PORT,
-                project_id: project_id.to_string(),
-                started_at: now,
-                instance_id: None,
-                base_path: None,
-                log_dir: ldir,
-                temp_log_name: log::temp_log_name(now),
-                external_owner: Some(ExternalOwner {
-                    address: owner_addr,
-                    token,
-                    runtime_instance_id: identity.runtime_instance_id.clone(),
-                }),
-            },
-        );
-        // R05：external 控制关系持久化——file-server 重启后 stop 仍路由同一 owner
-        // Owner registration was committed atomically with the intent before HTTP.
+        // Registration was published atomically before submission. Never republish it
+        // after awaiting a response: a newer Stop may already have removed that registration.
         Ok(Some(StartedDev {
             pid: 0,
             port: shared_types::APP_ENTRY_PORT,

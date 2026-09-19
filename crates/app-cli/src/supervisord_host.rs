@@ -123,7 +123,7 @@ impl SupervisordHost {
             bail!("release has no enabled services");
         }
         if supervisor::workspace_needs_pg(&specs) {
-            supervisor::wait_for_pg(pg.as_ref()).await?;
+            supervisor::wait_for_pg(&specs, pg.as_ref(), None).await?;
         }
 
         // 记录旧代组（换代码前——reload 后按新集合差量摘除）

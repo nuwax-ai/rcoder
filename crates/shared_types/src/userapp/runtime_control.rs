@@ -221,16 +221,23 @@ impl RuntimeOperationState {
 /// 操作记录视图（`GET /v1/runtime/operations/{id}`）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RuntimeOperationView {
+    /// 原操作的稳定 ID；恢复和重试不得替换。
     pub operation_id: String,
+    /// 操作种类：`start`、`restart`、`deploy`、`stop`。
     pub kind: RuntimeOperationKind,
+    /// 执行状态：`accepted`、`preparing`、`stopping`、`activating`、`starting`、`succeeded`、`failed`、`cancelled`、`recovery_required`。
     pub state: RuntimeOperationState,
     /// 受理时刻记录的请求摘要（幂等重放比对）。
     pub request_digest: String,
+    /// 操作记录的当前 revision。
     pub revision: u64,
+    /// 受理此操作的唯一运行实例。
     pub runtime_instance_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 结构化错误码；成功时为空。
     pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 脱敏错误描述；不得包含运行凭据。
     pub error_message: Option<String>,
     /// 终态证据（阶段、最后进度、清理结果——启动失败诊断，spec §4）。
     #[serde(default, skip_serializing_if = "Option::is_none")]

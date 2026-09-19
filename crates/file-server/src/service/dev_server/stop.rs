@@ -262,7 +262,9 @@ impl DevServerManager {
                         | shared_types::RuntimeOperationState::Failed
                         | shared_types::RuntimeOperationState::Cancelled
                 ) {
-                    self.external_transaction(|state| {
+                    let mut processes =
+                        lock(&self.processes).map_err(|error| anyhow::anyhow!("{error}"))?;
+                    let removed = self.external_transaction(|state| {
                         let original = state
                             .stops
                             .get(project_id)
@@ -272,11 +274,22 @@ impl DevServerManager {
                             "legacy stop changed"
                         );
                         state.stops.remove(project_id);
-                        if view.state == shared_types::RuntimeOperationState::Succeeded {
+                        // A newer durable registration cannot be erased by an old legacy stop.
+                        let removed = view.state == shared_types::RuntimeOperationState::Succeeded
+                            && state.owners.get(project_id).is_some_and(|owner| {
+                                owner.registration_operation_id.is_none()
+                                    && owner.owner.runtime_instance_id
+                                        == external.runtime_instance_id
+                            });
+                        if removed {
                             state.owners.remove(project_id);
                         }
-                        Ok(())
+                        Ok(removed)
                     })?;
+                    if removed {
+                        processes.remove(project_id);
+                    }
+                    drop(processes);
                     lock(&self.external_stops)
                         .map_err(|error| anyhow::anyhow!("{error}"))?
                         .remove(project_id);
@@ -328,10 +341,7 @@ impl DevServerManager {
             .map_err(|error| AppError::business(format!("stop external owner: {error:#}")))?;
         match view.state {
             shared_types::RuntimeOperationState::Succeeded => {
-                // 确认终态后才移除登记与在途记录（R05）
-                lock(&self.processes)?.remove(project_id);
-                lock(&self.external_stops)?.remove(project_id);
-
+                // Registry cleanup already committed with operation identity CAS above.
                 Ok(StoppedDev {
                     killed_pids: Vec::new(),
                 })

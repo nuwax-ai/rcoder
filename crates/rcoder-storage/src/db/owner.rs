@@ -38,7 +38,7 @@ impl std::error::Error for OutcomeUnknown {}
 impl DatabaseOwner {
     /// A terminal execution boundary for queue/drain failure tests; it cannot
     /// admit work or fabricate a successfully executed transaction.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "pg"))]
     pub(crate) fn closed_for_test() -> Self {
         let (queue, receiver) = mpsc::channel(1);
         drop(receiver);

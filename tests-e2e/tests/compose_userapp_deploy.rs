@@ -711,8 +711,12 @@ async fn deploy_and_verify_traffic(
                     .ok()
                     .map(|body| body["data"].clone())
             });
+        // The top-level phase may stay orchestrating while an uncertain
+        // migration is fenced for recovery. Its matching operation already
+        // records failure; do not spend the full traffic budget on that attempt.
         if let Some(status) = status
-            && status["phase"] == "failed"
+            && status["operation"]["request_release_id"].as_str() == Some(release_id)
+            && (status["phase"] == "failed" || status["operation"]["phase"] == "failed")
         {
             report.assert_hard(
                 "cold deployment has no terminal orchestration failure",

@@ -70,3 +70,5 @@ After implementation freezes, run `python3 tests-e2e/tools/turso_compose_contrac
 该场景顺序验证三份 Compose 的 Turso 配置，并分别派生仅含 rcoder 的隔离服务：随机项目名、动态 localhost 端口、run 专属数据及工作空间、禁用两层自动回收，使用镜像二进制。私有配置副本不进入报告，结束后精确删除；Turso 数据和脱敏证据保留在 run 报告目录供核查。它创建真实 builder 后通过 HTTP 和 SQL 内容核对重建持久化，最后验证错误 Turso 配置非零退出。若创建结果不确定且无法完成定向清理，将失败并保留控制面及数据供恢复；不能假报清理成功。
 
 `userapp_concurrency_contract` 固定运行 23 个确定性组件测试（创建截止时间、取消观察者、晚订阅、恢复执行槽位、旧代次启动阻止、清空实例身份和不确定租约）。它不执行真实进程强杀，也不证明三个崩溃窗口恢复；单副本实际 HTTP 首开扇入由 `turso_compose_runtime` 单列覆盖；跨副本首开仍需 K8s 验收；`docker_lifecycle_crash` 实现前两个 SIGKILL 窗口。新增终态 receipt 扫描属于组件证据，不能将 legacy marker 的 native SIGKILL 测试作为新协议第三窗口验收。
+
+冻结RCoder源码快照运行三份Compose配置验收时，可用 `E2E_BUILD_AGENT_DOCKER_ROOT` 指定另行冻结的镜像仓库配置目录，默认仍为RCoder相邻的build-agent-docker。该目录必须含两份原始Compose配置；应将其内容纳入本轮输入清单与指纹，不指向运行中会被修改的工作树。

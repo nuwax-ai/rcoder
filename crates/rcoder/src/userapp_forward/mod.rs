@@ -79,6 +79,7 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
     "/api/v1/userapp/dev/start",
     "/api/v1/userapp/dev/stop",
     "/api/v1/userapp/dev/restart",
+    "/api/v1/userapp/dev/operations/{operation_id}/recover",
     "/api/v1/userapp/dev/list",
     "/api/v1/userapp/dev/framework-info",
     // 静态资源（按 releaseId 取包；注解侧另挂 OPTIONS，any 已覆盖）

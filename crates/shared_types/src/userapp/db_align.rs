@@ -280,7 +280,7 @@ mod tests {
         }
 
         fn kind_of(cmd: &str) -> &'static str {
-            if cmd.starts_with("PGPASSWORD=") {
+            if cmd.starts_with("env -u PGHOSTADDR -u PGSERVICE PGPASSWORD=") {
                 "verify"
             } else if cmd.contains("pg_roles") {
                 "role_exists"
@@ -326,7 +326,7 @@ mod tests {
         assert!(commands[2].contains("CREATE ROLE"));
         assert!(commands[2].contains("initialadmin"));
         assert!(!commands[2].contains("$POSTGRES_USER"));
-        assert!(commands[3].starts_with("PGPASSWORD="));
+        assert!(commands[3].starts_with("env -u PGHOSTADDR -u PGSERVICE PGPASSWORD="));
     }
 
     #[tokio::test]

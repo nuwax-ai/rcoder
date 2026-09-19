@@ -17,9 +17,9 @@ use super::userapp::{UserAppReply, reply};
 use crate::UserAppState;
 use crate::extract::{AppJson as Json, AppQuery as Query};
 use crate::models::{
-    BuildTaskStatus, DevOpBody, UserappDevList, UserappDevListQuery, UserappDevProcess,
-    UserappDevStopped, UserappDevTaskCreated, UserappFrameworkDetection, UserappFrameworkInfo,
-    UserappFrameworkInfoQuery, UserappServiceFrameworkInfo,
+    BuildTaskStatus, DevOpBody, DevOperationRecovery, UserappDevList, UserappDevListQuery,
+    UserappDevProcess, UserappDevStopped, UserappDevTaskCreated, UserappFrameworkDetection,
+    UserappFrameworkInfo, UserappFrameworkInfoQuery, UserappServiceFrameworkInfo,
 };
 use file_server::error::AppError;
 use file_server::models::DevProcess;
@@ -45,10 +45,6 @@ fn app_id_of_key(key: &str) -> Option<&str> {
 ///
 /// 最终值按 P1-06 `launch_budget()` 动态计算，此常量仅为后备默认。
 const START_DONE_WAIT_MAX_SECS: u64 = 1200;
-
-/// 任务级日志行（快速路径说明等）的事件 service 标识——对齐编排日志源
-/// `service_id=app-cli` 的既有命名。
-const ORCHESTRATOR_LOG_SERVICE: &str = "app-cli";
 
 use crate::service::userapp::start_events::{StartEvent as EvtOutcome, StartEventPipe};
 
@@ -109,8 +105,9 @@ fn map_app_cli_evt(json: &str) -> Option<EvtOutcome> {
 /// ——pingap 路由前缀由各服务 project.manifest.toml `[proxy].path` 决定。
 /// 入参 pg（可选，与 prod start/restart 的 `pg` 同构 wire）：给出则注入
 /// 编排进程 env 的 `POSTGRES_USER`/`POSTGRES_PASSWORD`（覆盖容器默认透传）
-/// ——save-db-credential 改密后由调用方带上新凭据，避免服务连不上库；
-/// 不传维持旧行为（容器 env 透传）。
+/// ——这是本次显式启动捕获的运行配置，不表示保存配置已即时修改数据库密码。
+/// prod 受管账号遵守版本化配置保存/显式生效流程；本 dev 接口不能替代该流程。
+/// 不传则使用当前容器运行配置；未知结果恢复必须保留原操作及原配置。
 #[utoipa::path(
     post,
     path = "/dev/start",
@@ -819,13 +816,9 @@ mod precheck_reply_tests {
     }
 }
 
-#[derive(serde::Serialize, utoipa::ToSchema)]
-pub(crate) struct DevOperationRecovery {
-    /// Original build task identity; recovery does not create another build task.
-    pub task_id: Option<String>,
-    pub operation: shared_types::RuntimeOperationView,
-}
-
+/// 恢复原开发服务操作
+///
+/// 查询或重放已持久化的原操作，不重新编译源码、不创建新操作身份。
 #[utoipa::path(
     post,
     path = "/dev/operations/{operation_id}/recover",
@@ -1042,6 +1035,14 @@ mod operation_recovery_tests {
                     serde_json::to_value(&request).unwrap()
                 );
             }
+            // Receipt replay is query-only after completion, even if owner history was pruned.
+            committed.store(false, std::sync::atomic::Ordering::SeqCst);
+            let missing_receipt = http_recover(restarted.clone(), "original-op", "app123").await;
+            assert_eq!(missing_receipt["success"], false);
+            assert_eq!(
+                posts.lock().unwrap().len(),
+                if accepted_before_loss { 1 } else { 2 }
+            );
             let wrong_app = http_recover(restarted, "original-op", "anotherapp").await;
             assert_eq!(wrong_app["success"], false);
             server.abort();

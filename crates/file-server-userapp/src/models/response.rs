@@ -201,3 +201,12 @@ pub struct UserappDevTaskCreated {
     /// BuildTaskStatus 状态机：`pending` / `running` / `completed` / `failed` / `cancelled`）
     pub status: BuildTaskStatus,
 }
+
+/// 显式恢复开发服务操作的响应；查询成功不代表操作已成功。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct DevOperationRecovery {
+    /// 原构建任务 ID；直接控制请求未关联构建任务时为空。不会新建任务。
+    pub task_id: Option<String>,
+    /// 原操作的当前状态；调用方必须检查 state，凭据不会出现在此视图中。
+    pub operation: shared_types::RuntimeOperationView,
+}

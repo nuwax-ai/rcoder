@@ -400,8 +400,14 @@ pub(super) const NEW_ENDPOINT_QUERY_PATHS: [&str; 2] = [
     "/api/v1/userapp/dev/framework-info",
 ];
 
+pub(super) fn is_dev_operation_recovery(path: &str) -> bool {
+    path.strip_prefix("/api/v1/userapp/dev/operations/")
+        .and_then(|tail| tail.strip_suffix("/recover"))
+        .is_some_and(|id| shared_types::validate_identifier(id, "operation_id").is_ok())
+}
+
 fn new_endpoint_locator(path: &str) -> Option<NewEndpointLocate> {
-    if NEW_ENDPOINT_BODY_PATHS.contains(&path) {
+    if NEW_ENDPOINT_BODY_PATHS.contains(&path) || is_dev_operation_recovery(path) {
         Some(NewEndpointLocate::Body)
     } else if NEW_ENDPOINT_QUERY_PATHS.contains(&path) {
         Some(NewEndpointLocate::Query)
@@ -448,7 +454,22 @@ async fn forward_new_endpoint(
                         .into_response();
                 }
             };
-            let app_id = match header_app.or_else(|| extract_body_ids(&bytes)) {
+            // Recovery is tied to the persisted application's body identity. A stale
+            // header must not redirect its operation/token to another dev container.
+            let body_app = extract_body_ids(&bytes);
+            if is_dev_operation_recovery(&path)
+                && (body_app.is_none()
+                    || header_app
+                        .as_ref()
+                        .zip(body_app.as_ref())
+                        .is_some_and(|(header, body)| header != body))
+            {
+                return HttpResultError::bad_request(
+                    "recovery requires body app_id matching X-App-Id when supplied",
+                )
+                .into_response();
+            }
+            let app_id = match header_app.or(body_app) {
                 Some(app_id) => app_id,
                 None => {
                     return HttpResultError::bad_request(

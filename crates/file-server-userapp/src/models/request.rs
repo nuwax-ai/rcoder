@@ -393,9 +393,9 @@ pub struct DevOpBody {
     #[garde(custom(pg_credential))]
     /// PG 数据库凭据（可选，与 prod `StartAppRequest.pg` 同构 wire）：
     /// 给出则注入 dev 编排进程 env 的 `POSTGRES_USER`/`POSTGRES_PASSWORD`
-    /// （覆盖容器默认透传值）——save-db-credential 改密后由调用方带上新
-    /// 凭据，避免编排 env 仍是镜像默认 `dev` 导致服务连不上库。
-    /// 仅 start/restart 消费（编排器 spawn 链）；stop 忽略。
+    /// （覆盖容器默认透传值）。这是本次操作捕获的配置，不表示保存已即时改密。
+    /// prod 受管账号使用版本化保存/显式生效流程。
+    /// start/restart 捕获此输入；recover 只接受原请求一致的凭据；stop 忽略。
     pub pg: Option<shared_types::StartPgCredential>,
 }
 

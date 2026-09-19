@@ -358,7 +358,7 @@ fn cleanup_inner(name: &str, delete: bool) -> Result<(), String> {
                 .output()
                 .map_err(|e| e.to_string())?;
             let runtime_logs = Command::new("docker")
-                .args(["exec", &id, "sh", "-c", "tail -n 100 /home/user/logs/app-cli.err.log /home/user/logs/app-cli.out.log /home/user/logs/app-cli.log.* /home/user/logs/services/*.log 2>/dev/null; wget -qO- http://127.0.0.1:3010/v1/deploy/status"])
+                .args(["exec", &id, "sh", "-c", "tail -n 100 /home/user/logs/app-cli.err.log /home/user/logs/app-cli.out.log /home/user/logs/app-cli.log.* /home/user/logs/pg.out.log /home/user/logs/pg.err.log /home/user/logs/services/*.log 2>/dev/null; wget -qO- http://127.0.0.1:3010/v1/deploy/status"])
                 .output().map_err(|e| e.to_string())?;
             let environment = Command::new("docker")
                 .args(["inspect", "--format", "{{json .Config.Env}}", &id])

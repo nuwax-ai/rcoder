@@ -790,3 +790,48 @@ dev 改密场景报告 `tests-e2e/reports/a0d46771f24d481fb6e19df7a3e3f928` 未�
 仍需补外层Start仅凭登记快成功的问题和稳定调用方请求身份；348通过不证明该尚未修改的外层链已完成。Windows读侧junction入口也在继续核查，不能把写入修复称为全部路径访问已验收。
 
 `make dev-build`及`make docker-build-app-runtime`串行任务退出0；本轮app-runtime镜像`sha256:0b963b611bcf65876c233905bfa294a269cad7427444f49d2897192e5cc7d1bf`。之后继续固定4e51f476快照的userapp_deploy_full_chain场景，结果待收取；镜像未含后续持久意图/目标目录修复，最终仍须统一更新。`make remote-k8s-doctor`退出0，仅证明SSH/集群/CRD/存储/registry前置可达，没有执行本轮K8s部署。npm launcher本地包内容回归8/8通过，未做npm发布。
+
+### 2026-09-20 固定快照部署链失败：PG 接受连接早于业务库创建
+
+固定4e51f476快照的 `userapp_deploy_full_chain` 退出1，报告 `tests-e2e/reports/6baf36d8f0f948a2ac90273079518546`。制品构建、部署受理、操作重放断言通过，但七路业务服务就绪全部失败。归档容器日志显示22:02:23.486 app-cli报告PG ready，22:02:23.563迁移报数据库dev不存在。`pg_isready`只确认服务接受连接；容器PG与建库任务并行运行，建库轮询存在1秒间隔，不能作为迁移前置就绪证明。该缺陷正在修复，不能将部署API成功记为业务成功。
+
+E2E资源清理前日志采集追加PG stdout/stderr，仍沿用环境凭据脱敏；避免失败清理后丢失初始化证据。最新恢复接口与请求身份改动已以4a34eb93保存，尚待集中组件验证；未push或发布。
+
+### 恢复接口与 app-cli 集中组件回归
+
+- file-server/file-server-userapp 首轮编译发现 AppError→anyhow 的错误转换缺口，已修；第二轮437/439，两个失败为新增ToSchema类型未集中在models、OpenAPI缺少summary，已按原工程契约修复而非降低断言。最终 `cargo nextest run -p file-server -p file-server-userapp --no-fail-fast --all-features`：439/439，0skip，退出0，日志 `/tmp/rcoder-recovery-handlers-pass.log`。Clippy的测试模块布局与无用常量告警已清理，等待workspace最终核验。
+- app-cli首轮260项中259通过，唯一失败是新目标恢复测试在macOS比较了/var与/private/var两种同目录写法；测试改为与生产契约一致的canonical目标，未改生产路径保护。修正后260/260，0skip，Clippy退出0；日志 `/tmp/rcoder-app-cli-pg-ready-final.log`、`/tmp/rcoder-app-cli-pg-ready-clippy.log`。随后PG URI凭据优先级/环境继承补充修正尚需追加验证，不能将此结果套用到后续未测试源码。
+- 镜像内真实psql证明 `PGDATABASE=postgresql://...` 不解析URI，仍连接默认socket；已改为解析后传libpq环境，密码不进入argv。PG延迟建库真实反例正由独立Linux测试运行。
+- 恢复接口的Completed记录仅能查询；原操作404不得重新发送历史Stop/Restart。Stop清登记新增原operation ID与owner instance核对，旧Stop迟到不得删除同实例新Restart的登记。真实handler及对应时序反例已包括在439项中。
+
+本轮未更新运行中Compose镜像，完整Compose/K8s与发布仍未完成。
+
+### 实际 PostgreSQL 延迟建库反例与全仓接线复核
+
+`tools/test_pg_readiness_real.py` 已纳入仓库，可对已有PG16镜像执行。Linux隔离fixture：先确认PG能登录postgres库，目标delayeddb尚不存在，首次探测后延迟4秒建库；显式执行ignored的真实数据库测试，4.244秒后通过。nextest run ID `ec50b29a-b23f-4138-8f6d-2816a402bb6f`，1项选中且通过，其他261项为本次筛选排除，不能计入通过。日志 `/tmp/rcoder-native-linux-followup/native-linux-pg-real-reproducible.log`。fixture容器已清理，未操作K8s或现有数据库。普通组件套件不自动运行该真实环境测试；脚本缺Docker/镜像/工具会明确失败。
+
+PG探测还统一TLS/session配置继承、managed凭据覆盖URI所有user/password查询项、成功出口取消复查。Linux聚焦4/4通过，日志 `/tmp/rcoder-native-linux-followup/native-linux-pg-probe-final.log`。该证据是实际PG探测，不等同整个业务Compose部署链通过。
+
+完整workspace全features回归2476项：2470通过、6失败、16环境门控跳过，退出100。四项PG失败是已批准`env -u PGHOSTADDR -u PGSERVICE`修正后的旧前缀夹具不匹配，修正断言保留真实验证命令和执行次序保护。另两项揭示新recover路由未接主服务转发与runtime枚举描述缺项，正在补齐；不归为基线失败，不降低原路由/OpenAPI断言。日志 `/tmp/rcoder-workspace-final-allfeatures.log`。
+
+### 主服务接线修正后的集中回归通过
+
+新恢复API已实际注册到RCoder转发路由，使用body app_id定位dev builder；header/body身份冲突拒绝，prod header不改变固定dev语义，缺失原容器不自动创建。新增真实Router→forward handler→runtime反例，补全RuntimeOperationView枚举文档。
+
+- `cargo nextest run --workspace --no-fail-fast --all-features`：2477/2477通过，16环境门控跳过，退出0；`/tmp/rcoder-workspace-recovery-allfeatures.log`。
+- `cargo clippy --workspace --all-targets --all-features`：退出0，无warning；`/tmp/rcoder-workspace-recovery-clippy.log`。
+- `cargo nextest run --workspace --no-fail-fast`：2313/2313通过，12环境门控跳过，退出0；`/tmp/rcoder-workspace-recovery-default.log`。发现PG专用测试夹具在默认features无消费者，已把closed_for_test限定test+pg；不影响生产行为，默认Clippy追加核验。
+- app-cli独立全features：261/261通过，1项真实PG测试ignored（已由专用工具显式通过）；Clippy退出0；`/tmp/rcoder-app-cli-final-allfeatures.log`、`/tmp/rcoder-app-cli-final-clippy.log`。
+- 两个Cargo项目fmt检查及git diff --check均退出0。
+
+开始`make dev-hot`→`make docker-build-agent-runner`→`make docker-build-app-runtime`更新Compose二进制与镜像；本段记录时构建尚未结束。新的完整Compose、remote K8s与发布均未验收。
+
+默认workspace Clippy追加核验退出0，无warning：`/tmp/rcoder-workspace-recovery-default-clippy.log`。PG专用closed_for_test的feature限定已生效。
+
+### Compose 更新与固定输入准备
+
+`make dev-hot`退出0，Linux容器内release构建6分10秒，重启后健康。为隔离Turso场景使用实际新二进制，将该次`/app/bin/rcoder`单独COPY到原镜像基础上（没有docker commit、没有打包运行数据或环境）。测试镜像 `dev-master-rcoder:toasty-4de23bcbd6fc`，ID `sha256:87e53899e9e0a8a53a2af07856f137b5e5c76838db69f2853babd50f5c3f8728`，二进制SHA256 `4de23bcbd6fc73c9b053677bf7015bd51a93165d8a7455bfe992762983d6c426`。日常Compose的rcoder已按该镜像重建并健康，保留原Turso数据目录。
+
+E2E独立快照基于4a34eb93及本轮未提交源码，测试程序预编译退出0。为固定三个Compose输入，Turso测试工具新增可选`E2E_BUILD_AGENT_DOCKER_ROOT`；两份配套仓库Compose被复制到快照内部并纳入输入指纹。三份配置解析全部退出0，配套仓库基线fb12fa6。最终测试输入指纹 `a41f64a459f8688879fdcdf088616558fe24d12b924d87fab991d898576f03ae`（包含本次测试工具与配套配置）；主服务镜像构建时快照指纹为 `d896a659b2e34c165313bc302e2a5fe29c5ef465946c4a143bf7ed2d327fe6d9`，两者生产Rust/Cargo输入逐文件一致，差别是之后补齐的测试目录参数、说明和配套配置。镜像证明与测试输入证明分别记录，不混称同一全仓快照。
+
+本段记录时`docker-build-agent-runner`仍执行，之后串行构建app-runtime；没有开始最终完整Compose，K8s未部署、未push/发布。运行句柄及临时元数据留在当前任务，不能以本段准备工作宣称验收完成。

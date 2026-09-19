@@ -119,9 +119,9 @@ async fn run_inner(
     // 2. Wait for the declared PostgreSQL dependency before starting services.
     // N01：数据库前置按运行计划**声明**决定——仅当存在启用服务带 migrate
     // 命令或显式 APP_CLI_REQUIRE_PG=1 时才探测；纯静态/前端项目不轮询
-    // pg_isready（60s 等待不得阻塞无数据库需求的启动）。
+    // 数据库探测（60s 等待不得阻塞无数据库需求的启动）。
     if workspace_needs_pg(&specs) {
-        wait_for_pg(pg.as_ref()).await?;
+        wait_for_pg(&specs, pg.as_ref(), cancel.as_ref()).await?;
     } else {
         info!("⏭  no service declares database usage (migrate); skipping PG readiness wait");
     }
@@ -538,6 +538,20 @@ fn database_url_with_credentials(
         .map_err(|_| anyhow::anyhow!("Cannot set DATABASE_URL username"))?;
     url.set_password(Some(&pg.password.replace('%', "%25")))
         .map_err(|_| anyhow::anyhow!("Cannot set DATABASE_URL password"))?;
+    // libpq/node-postgres URI query fields can override authority credentials.
+    // Remove every encoded or repeated user/password override, preserving all
+    // unrelated query bytes (not form-decoding literal '+' into a space).
+    if let Some(query) = url.query() {
+        let mut retained = Vec::new();
+        for pair in query.split('&') {
+            let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+            if !matches!(decode_pg_uri_component(key)?.as_str(), "user" | "password") {
+                retained.push(pair);
+            }
+        }
+        let query = retained.join("&");
+        url.set_query((!query.is_empty()).then_some(query.as_str()));
+    }
     Ok(url.into())
 }
 
@@ -555,40 +569,298 @@ pub(crate) fn workspace_needs_pg(specs: &[ServiceSpec]) -> bool {
         .any(|spec| spec.enabled && !spec.run.migrate.is_empty())
 }
 
-/// Probe server availability before startup; failure prevents orchestration.
-/// pg_isready does not authenticate the supplied password. Credential application
-/// must separately verify a real TCP login before marking a version applied.
-pub(crate) async fn wait_for_pg(pg: Option<&shared_types::StartPgCredential>) -> Result<()> {
-    // 本地开发逃生开关：前端服务不依赖 PG 时跳过 60s pg_isready 轮询（生产环境不设）。
+/// Probe the same database and credentials that migration commands consume.
+/// A listening PostgreSQL server can still be creating POSTGRES_DB asynchronously;
+/// pg_isready cannot establish database existence or successful authentication.
+pub(crate) async fn wait_for_pg(
+    specs: &[ServiceSpec],
+    pg: Option<&shared_types::StartPgCredential>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<()> {
     if std::env::var_os("APP_CLI_SKIP_PG_WAIT").is_some() {
-        warn!("⏭  APP_CLI_SKIP_PG_WAIT set; skipping PostgreSQL readiness check (dev only)");
+        warn!("APP_CLI_SKIP_PG_WAIT set; skipping PostgreSQL readiness check (dev only)");
         return Ok(());
     }
-    let host = std::env::var("PGHOST").unwrap_or_else(|_| "localhost".into());
-    let port = std::env::var("PGPORT").unwrap_or_else(|_| "5432".into());
-    let user = pg.map_or("dev", |pg| pg.username.as_str());
-    let pwd = pg.map_or("dev", |pg| pg.password.as_str());
-
-    for i in 1..=30u8 {
-        let result = Command::new("pg_isready")
-            .arg("-h")
-            .arg(&host)
-            .arg("-p")
-            .arg(&port)
-            .arg("-U")
-            .arg(user)
-            .env("PGPASSWORD", pwd)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-        if matches!(result, Ok(s) if s.success()) {
-            info!("✅ PG ready (after {i} attempt(s))");
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut targets = Vec::new();
+    let forced = std::env::var_os("APP_CLI_REQUIRE_PG").is_some_and(|value| value == "1");
+    for spec in specs
+        .iter()
+        .filter(|spec| spec.enabled && (forced || !spec.run.migrate.is_empty()))
+    {
+        targets.push(pg_probe_environment(service_environment(spec, pg)?)?);
     }
-    anyhow::bail!("PostgreSQL not ready after 60 seconds");
+    // Explicit APP_CLI_REQUIRE_PG without migrations uses the same runtime defaults.
+    if targets.is_empty() {
+        let mut environment = std::collections::BTreeMap::new();
+        if let Some(pg) = pg {
+            environment.insert("POSTGRES_USER".into(), pg.username.clone());
+            environment.insert("POSTGRES_PASSWORD".into(), pg.password.clone());
+            if let Ok(url) = std::env::var("DATABASE_URL") {
+                environment.insert(
+                    "DATABASE_URL".into(),
+                    database_url_with_credentials(&url, pg)?,
+                );
+            }
+        }
+        targets.push(pg_probe_environment(environment)?);
+    }
+    wait_for_pg_targets(
+        "psql",
+        &targets,
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        cancel,
+    )
+    .await
+}
+
+fn pg_probe_environment(
+    overrides: std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let value = |name: &str, default: &str| -> Result<String> {
+        if let Some(value) = overrides.get(name) {
+            return Ok(if value.is_empty() {
+                default.into()
+            } else {
+                value.clone()
+            });
+        }
+        match std::env::var(name) {
+            Ok(value) if !value.is_empty() => Ok(value),
+            Ok(_) | Err(std::env::VarError::NotPresent) => Ok(default.into()),
+            Err(_) => anyhow::bail!("PostgreSQL runtime environment must be valid Unicode"),
+        }
+    };
+    let url = value("DATABASE_URL", "")?;
+    let mut target = std::collections::BTreeMap::new();
+    // Match child command inheritance plus per-service overrides for libpq TLS
+    // and session settings; URI fields below have higher precedence.
+    for name in [
+        "PGSSLMODE",
+        "PGSSLCERT",
+        "PGSSLKEY",
+        "PGSSLROOTCERT",
+        "PGSSLCRL",
+        "PGSSLCRLDIR",
+        "PGSSLSNI",
+        "PGSSLMINPROTOCOLVERSION",
+        "PGSSLMAXPROTOCOLVERSION",
+        "PGCHANNELBINDING",
+        "PGGSSENCMODE",
+        "PGKRBSRVNAME",
+        "PGGSSLIB",
+        "PGTARGETSESSIONATTRS",
+        "PGOPTIONS",
+        "PGAPPNAME",
+        "PGCLIENTENCODING",
+    ] {
+        let configured = value(name, "")?;
+        if !configured.is_empty() {
+            target.insert(name.into(), configured);
+        }
+    }
+    if !url.is_empty() {
+        let parsed = reqwest::Url::parse(&url)
+            .map_err(|_| anyhow::anyhow!("Runtime DATABASE_URL is invalid"))?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "postgres" | "postgresql"),
+            "Runtime DATABASE_URL must use PostgreSQL"
+        );
+        // PGDATABASE is a literal database name, not libpq's expandable `dbname`
+        // argument. Decode the URI into libpq environment settings so credentials
+        // never enter argv. Reject unsupported options instead of probing another
+        // target silently.
+        if let Some(host) = parsed.host_str() {
+            target.insert(
+                "PGHOST".into(),
+                host.trim_start_matches('[').trim_end_matches(']').into(),
+            );
+        }
+        if let Some(port) = parsed.port() {
+            target.insert("PGPORT".into(), port.to_string());
+        }
+        if !parsed.username().is_empty() {
+            target.insert("PGUSER".into(), decode_pg_uri_component(parsed.username())?);
+        }
+        if let Some(password) = parsed.password() {
+            target.insert("PGPASSWORD".into(), decode_pg_uri_component(password)?);
+        }
+        if let Some(database) = parsed
+            .path()
+            .strip_prefix('/')
+            .filter(|value| !value.is_empty())
+        {
+            target.insert("PGDATABASE".into(), decode_pg_uri_component(database)?);
+        }
+        if let Some(query) = parsed.query() {
+            for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+                let (name, value) = pair
+                    .split_once('=')
+                    .context("Invalid PostgreSQL URI option")?;
+                let name = decode_pg_uri_component(name)?;
+                let value = decode_pg_uri_component(value)?;
+                let variable = match name.as_str() {
+                    "host" => "PGHOST",
+                    "hostaddr" => "PGHOSTADDR",
+                    "port" => "PGPORT",
+                    "user" => "PGUSER",
+                    "password" => "PGPASSWORD",
+                    "dbname" => "PGDATABASE",
+                    "sslmode" => "PGSSLMODE",
+                    "sslcert" => "PGSSLCERT",
+                    "sslkey" => "PGSSLKEY",
+                    "sslrootcert" => "PGSSLROOTCERT",
+                    "sslcrl" => "PGSSLCRL",
+                    "sslcrldir" => "PGSSLCRLDIR",
+                    "sslsni" => "PGSSLSNI",
+                    "ssl_min_protocol_version" => "PGSSLMINPROTOCOLVERSION",
+                    "ssl_max_protocol_version" => "PGSSLMAXPROTOCOLVERSION",
+                    "channel_binding" => "PGCHANNELBINDING",
+                    "gssencmode" => "PGGSSENCMODE",
+                    "krbsrvname" => "PGKRBSRVNAME",
+                    "gsslib" => "PGGSSLIB",
+                    "target_session_attrs" => "PGTARGETSESSIONATTRS",
+                    "options" => "PGOPTIONS",
+                    "application_name" => "PGAPPNAME",
+                    "client_encoding" => "PGCLIENTENCODING",
+                    "connect_timeout" => "PGCONNECT_TIMEOUT",
+                    // Older PostgreSQL URI clients accept ssl=true as require.
+                    "ssl" if value == "true" => {
+                        target.insert("PGSSLMODE".into(), "require".into());
+                        continue;
+                    }
+                    _ => anyhow::bail!("Unsupported PostgreSQL URI option for startup probe"),
+                };
+                target.insert(variable.into(), value);
+            }
+        }
+    } else {
+        target.insert("PGHOST".into(), value("PGHOST", "localhost")?);
+        target.insert("PGPORT".into(), value("PGPORT", "5432")?);
+        target.insert("PGUSER".into(), value("POSTGRES_USER", "dev")?);
+        target.insert("PGPASSWORD".into(), value("POSTGRES_PASSWORD", "dev")?);
+        target.insert("PGDATABASE".into(), value("POSTGRES_DB", "dev")?);
+    }
+    Ok(target)
+}
+
+fn decode_pg_uri_component(value: &str) -> Result<String> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = bytes
+                .next()
+                .and_then(|value| char::from(value).to_digit(16));
+            let low = bytes
+                .next()
+                .and_then(|value| char::from(value).to_digit(16));
+            let (Some(high), Some(low)) = (high, low) else {
+                anyhow::bail!("Invalid PostgreSQL URI percent encoding");
+            };
+            decoded.push((high * 16 + low) as u8);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    anyhow::ensure!(!decoded.contains(&0), "PostgreSQL URI contains a null byte");
+    String::from_utf8(decoded).map_err(|_| anyhow::anyhow!("PostgreSQL URI must be valid Unicode"))
+}
+
+async fn wait_for_pg_targets(
+    program: &str,
+    targets: &[std::collections::BTreeMap<String, String>],
+    budget: Duration,
+    interval: Duration,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let never_cancelled = tokio_util::sync::CancellationToken::new();
+    let cancel = cancel.unwrap_or(&never_cancelled);
+    for target in targets {
+        loop {
+            anyhow::ensure!(
+                !cancel.is_cancelled(),
+                "PostgreSQL readiness wait cancelled"
+            );
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "PostgreSQL target database is not accessible within the startup budget"
+            );
+            let mut command = Command::new(program);
+            command
+                .args([
+                    "-X",
+                    "--no-password",
+                    "-qAt",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-c",
+                    "SELECT 1",
+                ])
+                .env_remove("PGHOSTADDR")
+                .env_remove("PGSERVICE")
+                .envs(target)
+                .env("PGCONNECT_TIMEOUT", "2")
+                .env(
+                    "PGOPTIONS",
+                    format!(
+                        "{} -c statement_timeout=2000",
+                        target.get("PGOPTIONS").map(String::as_str).unwrap_or("")
+                    ),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                // Both engines may be dropped by their owning control future.
+                // psql is invoked directly (no shell or background descendants).
+                .kill_on_drop(true);
+            let mut child = command
+                .spawn()
+                .context("spawn PostgreSQL target database probe")?;
+            let attempt_deadline =
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(3));
+            let outcome = tokio::select! {
+                _ = cancel.cancelled() => None,
+                result = tokio::time::timeout_at(attempt_deadline, child.wait()) => Some(result),
+            };
+            match outcome {
+                Some(Ok(Ok(status))) if status.success() => {
+                    anyhow::ensure!(
+                        !cancel.is_cancelled(),
+                        "PostgreSQL readiness wait cancelled"
+                    );
+                    break;
+                }
+                Some(Ok(Ok(_))) => {}
+                Some(Ok(Err(error))) => {
+                    return Err(error).context("wait PostgreSQL target database probe");
+                }
+                _ => {
+                    // kill() waits/reaps as well. Never start a migration after
+                    // cancellation or an unconfirmed child cleanup.
+                    tokio::time::timeout(Duration::from_secs(2), child.kill())
+                        .await
+                        .context("PostgreSQL probe cleanup timed out")?
+                        .context("stop PostgreSQL target database probe")?;
+                    anyhow::ensure!(
+                        !cancel.is_cancelled(),
+                        "PostgreSQL readiness wait cancelled"
+                    );
+                }
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => anyhow::bail!("PostgreSQL readiness wait cancelled"),
+                _ = tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + interval)) => {},
+            }
+        }
+    }
+    anyhow::ensure!(
+        !cancel.is_cancelled(),
+        "PostgreSQL readiness wait cancelled"
+    );
+    info!("PostgreSQL target database login and SELECT 1 confirmed");
+    Ok(())
 }
 
 /// 轮询单个桥接后端的 readiness_path 直至就绪(120s 超时)。
@@ -1104,6 +1376,36 @@ mod tests {
     }
 
     #[test]
+    fn managed_credentials_remove_query_overrides_in_actual_service_environment() {
+        let mut spec = spec_with(None);
+        spec.env.insert("DATABASE_URL".into(),
+            "postgresql://old:old@localhost/db?user=old&password=old&user=again&%70assword=again&sslmode=disable&options=-c%20search_path%3Dpublic".into());
+        spec.env
+            .insert("PGSSLROOTCERT".into(), "/fixture/root.crt".into());
+        spec.env
+            .insert("PGOPTIONS".into(), "-c application_name=fixture".into());
+        let pg = shared_types::StartPgCredential {
+            username: "managed".into(),
+            password: "managedsecret".into(),
+        };
+        let environment = service_environment(&spec, Some(&pg)).unwrap();
+        let url = reqwest::Url::parse(&environment["DATABASE_URL"]).unwrap();
+        assert!(
+            !url.query_pairs()
+                .any(|(key, _)| key == "user" || key == "password")
+        );
+        let target = pg_probe_environment(environment).unwrap();
+        assert_eq!(target["PGUSER"], "managed");
+        assert_eq!(target["PGPASSWORD"], "managedsecret");
+        assert_eq!(target["PGSSLROOTCERT"], "/fixture/root.crt");
+        assert_eq!(target["PGOPTIONS"], "-c search_path=public");
+        spec.env.remove("DATABASE_URL");
+        spec.env.insert("DATABASE_URL".into(), String::new());
+        let target = pg_probe_environment(service_environment(&spec, Some(&pg)).unwrap()).unwrap();
+        assert_eq!(target["PGOPTIONS"], "-c application_name=fixture");
+    }
+
+    #[test]
     fn operation_credentials_override_artifact_defaults_and_survive_spec_roundtrip() {
         let pg = resolve_run_pg(Some(shared_types::StartPgCredential {
             username: "runtimeuser".into(),
@@ -1455,5 +1757,167 @@ mod tests {
             Err(error) => panic!("member wait: {error}"),
         }
         assert!(!process_utils::process_group_exists(pid).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod pg_readiness_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn pg_probe_uses_migration_database_and_managed_credentials() {
+        let environment = BTreeMap::from([
+            ("DATABASE_URL".into(), "".into()),
+            ("PGHOST".into(), "127.0.0.2".into()),
+            ("PGPORT".into(), "5439".into()),
+            ("POSTGRES_USER".into(), "runtimeuser".into()),
+            ("POSTGRES_PASSWORD".into(), "fixturepassword".into()),
+            ("POSTGRES_DB".into(), "applicationdb".into()),
+        ]);
+        let target = pg_probe_environment(environment).unwrap();
+        assert_eq!(target["PGDATABASE"], "applicationdb");
+        assert_eq!(target["PGUSER"], "runtimeuser");
+        assert_eq!(target["PGHOST"], "127.0.0.2");
+        assert_eq!(target["PGPORT"], "5439");
+        assert_eq!(target["PGPASSWORD"], "fixturepassword");
+        let url = "postgresql://fixture:secret@localhost:5440/otherdb?sslmode=disable";
+        let target = pg_probe_environment(BTreeMap::from([
+            ("DATABASE_URL".into(), url.into()),
+            ("POSTGRES_DB".into(), "ignored".into()),
+        ]))
+        .unwrap();
+        assert_eq!(target["PGDATABASE"], "otherdb");
+        assert_eq!(target["PGUSER"], "fixture");
+        assert_eq!(target["PGPASSWORD"], "secret");
+        assert_eq!(target["PGHOST"], "localhost");
+        assert_eq!(target["PGPORT"], "5440");
+        assert_eq!(target["PGSSLMODE"], "disable");
+        let target = pg_probe_environment(BTreeMap::from([("DATABASE_URL".into(),
+            "postgresql://user:p%40ss%2Bword@[::1]:5442/db%20name?host=%2Ftmp&dbname=overridden&options=-c%20search_path%3Dpublic".into())])).unwrap();
+        assert_eq!(target["PGHOST"], "/tmp");
+        assert_eq!(target["PGPASSWORD"], "p@ss+word");
+        assert_eq!(target["PGDATABASE"], "overridden");
+        assert_eq!(target["PGOPTIONS"], "-c search_path=public");
+        assert!(
+            pg_probe_environment(BTreeMap::from([(
+                "DATABASE_URL".into(),
+                "postgresql://localhost/db?unrecognized=hidden".into()
+            )]))
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    fn probe_fixture(directory: &Path, script: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let program = directory.join("psql-fixture");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        program.to_str().unwrap().to_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pg_probe_waits_for_database_creation_before_allowing_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = probe_fixture(
+            directory.path(),
+            r#"#!/bin/sh
+[ "$PGDATABASE" = "delayeddb" ] || exit 99
+[ "$PGUSER" = "manageduser" ] || exit 99
+[ "$7" = "SELECT 1" ] || exit 99
+if [ ! -f "$PROBE_STATE/attempted" ]; then
+  touch "$PROBE_STATE/attempted"
+  exit 2
+fi
+touch "$PROBE_STATE/database-login-confirmed"
+"#,
+        );
+        let target = BTreeMap::from([
+            ("PGDATABASE".into(), "delayeddb".into()),
+            ("PGUSER".into(), "manageduser".into()),
+            (
+                "PROBE_STATE".into(),
+                directory.path().to_str().unwrap().into(),
+            ),
+        ]);
+        wait_for_pg_targets(
+            &program,
+            &[target],
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(directory.path().join("attempted").exists());
+        assert!(directory.path().join("database-login-confirmed").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pg_probe_deadline_kills_and_reaps_hung_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = probe_fixture(
+            directory.path(),
+            r#"#!/bin/sh
+printf '%s' "$$" > "$PROBE_STATE/pid"
+exec sleep 30
+"#,
+        );
+        let target = BTreeMap::from([(
+            "PROBE_STATE".into(),
+            directory.path().to_str().unwrap().into(),
+        )]);
+        let result = wait_for_pg_targets(
+            &program,
+            &[target],
+            Duration::from_millis(150),
+            Duration::from_millis(10),
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+        let pid = std::fs::read_to_string(directory.path().join("pid")).unwrap();
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "probe client survived deadline");
+    }
+}
+
+/// Executed only by tools/test_pg_readiness_real.py against its isolated PG16.
+#[cfg(test)]
+mod real_pg_readiness_fixture {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires tools/test_pg_readiness_real.py isolated PostgreSQL fixture"]
+    async fn actual_pg_delayed_database_uri() {
+        let program = std::env::var("PG_READINESS_FIXTURE_PROGRAM")
+            .expect("use tools/test_pg_readiness_real.py");
+        let target = pg_probe_environment(std::collections::BTreeMap::from([(
+            "DATABASE_URL".into(),
+            "postgresql://fixture@127.0.0.1:5549/delayeddb".into(),
+        )]))
+        .unwrap();
+        let started = std::time::Instant::now();
+        wait_for_pg_targets(
+            &program,
+            &[target],
+            Duration::from_secs(15),
+            Duration::from_millis(200),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "migration released before delayed database existed"
+        );
     }
 }
