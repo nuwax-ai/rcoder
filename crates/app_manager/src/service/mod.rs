@@ -184,10 +184,63 @@ impl AppService {
             .entry((app_id.to_owned(), shared_types::UserAppOperationScope::Prod))
             .or_default()
             .clone();
-        let process = lock.try_lock_owned().map_err(|_| {
-            AppOperationError::Conflict("application operation is in progress".into())
-        })?;
+        let Ok(process) = lock.try_lock_owned() else {
+            // M3 结构化 blocker 透传：进程锁被占时从权威持久状态取真实
+            // 阻塞者（不伪造 operation_id）；持锁但尚未 durable admission
+            // 的窗口以 scope 哨兵表达（见 prod_lock_conflict）。
+            return Err(self.prod_lock_conflict(app_id).await);
+        };
         self.operation_guard(app_id, process, false).await
+    }
+
+    /// 进程锁冲突的结构化错误：优先取 durable 当前操作（同 app 同
+    /// Prod/Application scope）；查询竞态或 admission 窗口期取不到时，
+    /// 以 scope 哨兵 blocker 表达（operation_id 为空——诚实标记"持锁
+    /// 但持久身份尚未可见"）。不等待锁、不旁路互斥。
+    async fn prod_lock_conflict(&self, app_id: &str) -> AppOperationError {
+        match self.get_current_operations(app_id).await {
+            Ok(operations) => {
+                // Prod 槽优先；无则 Application 槽（它同样持有该执行权）
+                if let Some(blocker) = operations
+                    .iter()
+                    .find(|view| view.scope == shared_types::UserAppOperationScope::Prod)
+                    .or_else(|| {
+                        operations.iter().find(|view| {
+                            view.scope == shared_types::UserAppOperationScope::Application
+                        })
+                    })
+                {
+                    return AppOperationError::ConflictBlocked {
+                        message: "application operation is in progress".into(),
+                        blocker: shared_types::UserAppOperationBlocker {
+                            scope: blocker.scope,
+                            operation_id: blocker.operation_id.clone(),
+                            kind: blocker.kind,
+                            state: blocker.state,
+                            step: blocker.step.clone(),
+                        },
+                    };
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    app_id,
+                    "query durable blocker for prod lock conflict failed: {error}"
+                );
+            }
+        }
+        // admission 窗口（持锁但 durable 记录尚未提交）或查询失败：
+        // scope 哨兵——identity 留空，不虚构
+        AppOperationError::ConflictBlocked {
+            message: "application operation is in progress (admission in flight)".into(),
+            blocker: shared_types::UserAppOperationBlocker {
+                scope: shared_types::UserAppOperationScope::Prod,
+                operation_id: String::new(),
+                kind: shared_types::UserAppOperationKind::Start,
+                state: shared_types::UserAppOperationState::Pending,
+                step: "acquiring".into(),
+            },
+        }
     }
 
     /// 锁条目无人持有（strong_count==1，仅 map 自身）时移除，防 DashMap 无界增长。

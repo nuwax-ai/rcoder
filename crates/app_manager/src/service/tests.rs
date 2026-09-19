@@ -125,8 +125,16 @@ async fn busy_delete_fails_fast_and_stale_version_conflicts_after_release() {
     .await
     .expect("busy delete must not queue behind the held lock")
     .expect_err("held lock must reject delete");
+    // M3 结构化 blocker：裸持锁（无 durable admission）窗口 → ConflictBlocked
+    // 携带 scope=Prod 哨兵 blocker（operation_id 空——不伪造身份）
     assert!(
-        matches!(&error, AppOperationError::Conflict(message) if message.contains("in progress")),
+        matches!(
+            &error,
+            AppOperationError::ConflictBlocked { message, blocker }
+                if message.contains("in progress")
+                    && blocker.scope == shared_types::UserAppOperationScope::Prod
+                    && blocker.operation_id.is_empty()
+        ),
         "got: {error}"
     );
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
@@ -198,8 +206,16 @@ async fn stop_conflicts_immediately_while_release_lock_held() {
     .await
     .expect("stop must not queue behind the held lock")
     .expect_err("held lock must reject stop");
+    // M3 结构化 blocker：裸持锁（无 durable admission）窗口 → ConflictBlocked
+    // 携带 scope=Prod 哨兵 blocker（operation_id 空——不伪造身份）
     assert!(
-        matches!(&error, AppOperationError::Conflict(message) if message.contains("in progress")),
+        matches!(
+            &error,
+            AppOperationError::ConflictBlocked { message, blocker }
+                if message.contains("in progress")
+                    && blocker.scope == shared_types::UserAppOperationScope::Prod
+                    && blocker.operation_id.is_empty()
+        ),
         "got: {error}"
     );
     // 拒绝后零副作用
@@ -276,8 +292,16 @@ async fn restart_conflicts_immediately_while_restart_lock_held() {
     .await
     .expect("restart must not queue behind the held lock")
     .expect_err("held lock must reject restart");
+    // M3 结构化 blocker：裸持锁（无 durable admission）窗口 → ConflictBlocked
+    // 携带 scope=Prod 哨兵 blocker（operation_id 空——不伪造身份）
     assert!(
-        matches!(&error, AppOperationError::Conflict(message) if message.contains("in progress")),
+        matches!(
+            &error,
+            AppOperationError::ConflictBlocked { message, blocker }
+                if message.contains("in progress")
+                    && blocker.scope == shared_types::UserAppOperationScope::Prod
+                    && blocker.operation_id.is_empty()
+        ),
         "got: {error}"
     );
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
@@ -344,8 +368,16 @@ async fn delete_conflicts_immediately_while_release_lock_held() {
     .await
     .expect("delete must not queue behind the held lock")
     .expect_err("held lock must reject delete");
+    // M3 结构化 blocker：裸持锁（无 durable admission）窗口 → ConflictBlocked
+    // 携带 scope=Prod 哨兵 blocker（operation_id 空——不伪造身份）
     assert!(
-        matches!(&error, AppOperationError::Conflict(message) if message.contains("in progress")),
+        matches!(
+            &error,
+            AppOperationError::ConflictBlocked { message, blocker }
+                if message.contains("in progress")
+                    && blocker.scope == shared_types::UserAppOperationScope::Prod
+                    && blocker.operation_id.is_empty()
+        ),
         "got: {error}"
     );
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
