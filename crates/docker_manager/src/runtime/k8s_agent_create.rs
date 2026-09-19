@@ -234,14 +234,15 @@ impl KubernetesRuntime {
                 ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
                     "/home/user".to_string()
                 }
-                // UserappBuilder 开发容器: 挂载压平（四 subPath 分支在 volume_mounts
-                // 构造处短路），此兜底值不生效，仅为 match 完备性保留
-                ServiceType::UserappBuilder => {
+                // Userapp 域 per-app 工作区定位 {USERAPP_WORKSPACE_ROOT}/{app_id}
+                // （容器内 userapp 共享卷根，builder 与生产容器同源）。UserappBuilder
+                // 挂载压平（四 subPath 分支在 volume_mounts 构造处短路）；Userapp
+                // 实际走 create_deployment 不经此路径——此兜底值均为 match
+                // 完备性保留，但语义须正确（勿落 web 的 /app/project_workspace）
+                ServiceType::Userapp | ServiceType::UserappBuilder => {
                     shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string()
                 }
-                ServiceType::WebAgentRunner | ServiceType::Userapp => {
-                    "/app/project_workspace".to_string()
-                }
+                ServiceType::WebAgentRunner => "/app/project_workspace".to_string(),
             });
 
         // 构建 volumes: 硬编码 workspace PVC(保留) + 翻译 kubernetes_config 额外卷
