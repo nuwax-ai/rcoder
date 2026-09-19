@@ -37,6 +37,17 @@ pub const WORKSPACE_ROOT: &str = "/app/project_workspace";
 /// ```
 pub const COMPUTER_WORKSPACE_ROOT: &str = "/app/computer-project-workspace";
 
+/// computer agent 沙箱容器内 workspace 卷挂载点（**agent 容器视角**）。
+///
+/// 与 [`COMPUTER_WORKSPACE_ROOT`]（rcoder 主容器视角，共享 PVC 根）对应：
+/// 主容器 `{COMPUTER_WORKSPACE_ROOT}/{user_id}` ↔ 沙箱容器此挂载点
+/// （共享 PVC subPath=user_id）。Computer 族（含常规项目）挂载点兜底的
+/// 单一事实源。
+///
+/// 值与 [`USERAPP_DEV_HOME`] 相同但语义不同（userapp dev 容器 home 目录），
+/// 勿互相替代。
+pub const COMPUTER_AGENT_MOUNT_ROOT: &str = "/home/user";
+
 /// Userapp 开发卷根目录 (**沙箱容器视角**)。
 ///
 /// 独立共享卷: 沙箱 (ComputerAgentRunner) 挂载点为 `/home/user/userapp-workspace`

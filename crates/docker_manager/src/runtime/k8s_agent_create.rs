@@ -230,9 +230,10 @@ impl KubernetesRuntime {
                 }
             })
             .unwrap_or_else(|| match service_type {
-                // 常规项目与 Computer 共容器，容器内挂载点同 /home/user
+                // 常规项目与 Computer 共容器，挂载点同源常量（见 paths.rs
+                // COMPUTER_AGENT_MOUNT_ROOT 与 WORKSPACE_ROOT 的视角说明）
                 ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
-                    "/home/user".to_string()
+                    shared_types::paths::COMPUTER_AGENT_MOUNT_ROOT.to_string()
                 }
                 // Userapp 域 per-app 工作区定位 {USERAPP_WORKSPACE_ROOT}/{app_id}
                 // （容器内 userapp 共享卷根，builder 与生产容器同源）。UserappBuilder
@@ -242,7 +243,7 @@ impl KubernetesRuntime {
                 ServiceType::Userapp | ServiceType::UserappBuilder => {
                     shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string()
                 }
-                ServiceType::WebAgentRunner => "/app/project_workspace".to_string(),
+                ServiceType::WebAgentRunner => shared_types::paths::WORKSPACE_ROOT.to_string(),
             });
 
         // 构建 volumes: 硬编码 workspace PVC(保留) + 翻译 kubernetes_config 额外卷
