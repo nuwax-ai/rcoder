@@ -116,3 +116,40 @@ npm 启动器测试 17/17 通过。proxy 17/17 默认 + 16/16 纯转发形态。
 - 用户 M1–M5/nuwax 对齐提交（`079df176`..`27fb03ef`）叠加后：app-cli 218/218、e2e 编译通过；全量 Compose 在合并 HEAD 上重跑中
 
 **stash@{0} 说明**：上轮被中断的干净运行持有并行会话 WIP（22 文件，基于 d0c89ebb）；用户已提交 M1–M5 演进版。stash 非本轮产物，保留未动——由用户决定是否还需要。
+
+### 2026-09-19 第八批：Compose config_hash 根因闭环 + 修复（本会话追加）
+
+**背景**：Turso 轮完整 Compose 的 8 个失败（dev_server_lifecycle、app_proxy_lazy、devbuild×2、compose_regression、two_users、deploy_full_chain、scope_isolation）此前归因为"app-cli config_hash 链（疑为序列化往返差异）"。本轮独立复核（见 `../userapp-turso-local-storage/reviews/2026-09-19-claude-verification.md`）后实机根因定位并修复。
+
+**根因链（逐环实证）**：
+1. dev Compose 的 UserApp builder 容器跑在 `dev-rcoder-agent-runner:latest`（非 dev-app-runtime）——`docker inspect` 证实（镜像 sha 9770b617）。
+2. 该镜像内 `/usr/local/bin/pingap` = **0.14.1 (c74e4ea)**，而镜像内 app-cli（当日源码构建）链接 `pingap-config` rev **cd74a46（0.14.3）** 并以 `devtool.rs DEFAULT_PINGAP_VERSION=0.14.3` 计算 expected hash——两个 pingap-config 实现对同一配置的 pretty-TOML 序列化不同 → `config_hash` 恒不等（含多元素数组字段的配置必失败；确定性：expected 90755485 / observed 373F3032 跨应用跨轮次不变）。
+3. 排除过程（全部实测）：同二进制+同文件在干净容器 → 90755485（匹配）；活实例 env 原样重放（含空 env）→ 373F3032 → 非 env 因素；tag 源码自建 pingap（其自带 lock）→ 90755485 → 非构建差异；活例 admin 全量 JSON 与文件解析逐字段 diff = 0 差异 → 内容相同。最终 `sha256sum` 揭示 builder 内二进制 ≠ 镜像 tag 当前二进制。
+4. 漏改点：第七批（54ab0c12）只更新了 `docker/build-app-runtime.py` 的 pin（0.14.1→0.14.3），`make/docker.mk:195` 的 agent-runner 镜像 pin（注释明言与 devtool.rs"两处同步改"）仍为 0.14.1。
+
+**修复**：
+- `make/docker.mk`：agent-runner PINGAP pin 0.14.1(c74e4ea) → 0.14.3(cd74a46)。
+- `docker/rcoder-agent-runner/downloads/` 补 0.14.3 双架构 tarball（自 app-runtime-base/cache 复制；downloads 为 gitignore 本地缓存）。
+- `make docker-build-agent-runner` 重建 → 镜像内 pingap 0.14.3 实测确认。
+
+**验证**：
+- 手工链：新 app dev/start → `✅ pingap initial config confirmed (config_hash matched)` → 任务 completed → 经代理 `/api/go/ready` 200。
+- 套件复跑（修复镜像后，同日）：
+
+| 场景（Turso 轮失败） | 结果 | 归因 |
+|---|---|---|
+| userapp_dev_server_lifecycle | **pass** | config_hash 根因修复生效（报告 dbe930bcd3） |
+| userapp_devbuild_no_lockfile_pnpm_install | **pass** | 同上 |
+| userapp_devbuild_skip_and_fallback_source_mode | **pass** | 同上 |
+| userapp_dev_app_proxy_lazy_start | **pass** | 同上 |
+| userapp_hot_deployment_builtin_contract | **pass** | 同上 |
+| userapp_hot_deployment_supervisord_contract | **pass** | 同上 |
+| userapp_deploy_full_chain | fail | 部署/热部署断言全过；失败收窄为"app-files 转发到 prod 容器 file-server 连接失败"——独立缺陷（prod 容器 file-server 不可达），待查 |
+| userapp_scope_isolation_during_deploy | fail | **确认非测试预期问题**：`service/mod.rs:188 try_acquire_prod_operation` 的进程锁 Conflict 只给 "application operation is in progress" 无结构化 blocker（data=null），先于 storage 层 OperationInProgress(blocker) 返回——违反 M3 结构化 blocker 透传契约。修复方向：锁层 Conflict 附带 blocker（scope=Prod）或统一走 storage 冲突路径；不降测试预期 |
+| userapp_compose_regression | fail | destroy 仍失败："builder operation lease unavailable: lock would block"——**同进程 flock 自冲突**（flock 按打开文件描述符隔离，同进程两个 fd 互相冲突）：ensure 路径获取的 builder lease fd 未释放，destroy 的 try_lock 拒绝。独立缺陷（lease 生命周期泄漏），Turso 轮同类失败曾被误归因为 config_hash 级联 |
+| userapp_dev_two_users_share_app | fail | "Builder resource identity conflicts at rcoder.io/lifecycle-id"——**环境残留**：此前多轮失败运行留下的旧 lifecycle builder 容器未清（e2eud5be1b60974p701z 无新容器但 store 侧有历史；另有 2 天旧 builder 若干）。清理残留 builder 后复跑可判；非本轮修复引入 |
+- remote-k8s 全绿旁证：K8s runtime 基础镜像 = build-agent-docker 0.1.273/0.1.274（PINGAP_VERSION=0.14.3）配对一致，故 K8s 侧从未出现该缺陷——与根因自洽。
+
+**调查中新发现（未修，待专项）**：dev/start 失败后的重试会瞬时返回 completed（新 release_id、created=updated、无 app-cli 日志、服务未起）——疑似 R02 持久化排队槽/Superseded 语义在失败态重试时短路为假成功。修复 config_hash 后难以自然复现，需专用反例（人为注入启动失败后重试）。影响：调用方收到成功但服务未运行。
+
+**剩余未完成（不变）**：NT 矩阵完整三平台实机、N07 独立入口令牌认证层、R02 attach 语义、（新增）R02 失败重试短路反例与修复。

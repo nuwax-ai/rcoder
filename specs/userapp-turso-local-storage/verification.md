@@ -74,7 +74,8 @@ Turso 关键行为证据（T0 探针，源码级）：
 | 其余 userapp compose 用例 | 26/34 通过 | 失败 8 例见下 |
 
 ### e2e 失败归因（8 例，均非 Turso 引入）
-1. **app-cli 编排 config_hash 链（6 例：dev_server_lifecycle、dev_app_proxy_lazy_start、devbuild×2、compose_regression、two_users_share_app）**：builder 容器内 app-cli 报 "confirm initial Pingap config via loopback admin probe: config_hash mismatch (expected 90755485, observed 373F3032)"；dev 服务起不来 → 在途操作持 builder 文件锁 → destroy/ensure 连锁 Conflict。镜像内 pingap 0.14.3 与 pin 一致、app-cli 版本号与源一致（源码自镜像构建后无新 commit）、比对大小写不敏感——疑为 config.hash()（序列化前内存态）与 pingap 加载重解析后 hash 的往返差异，属 app-cli 子系统待归因；compose_regression/two_users 的 lease Conflict 为其级联。本轮 diff 不含 app-cli 与 pingap 配置生成路径。
+1. **app-cli 编排 config_hash 链（6 例：dev_server_lifecycle、dev_app_proxy_lazy_start、devbuild×2、compose_regression、two_users_share_app）**：builder 容器内 app-cli 报 "confirm initial Pingap config via loopback admin probe: config_hash mismatch (expected 90755485, observed 373F3032)"；dev 服务起不来 → 在途操作持 builder 文件锁 → destroy/ensure 连锁 Conflict。
+   **2026-09-19 勘误与闭环**：原"疑为往返差异"归因不准确。实机根因 = dev builder 容器（dev-rcoder-agent-runner 镜像）内 pingap 二进制 0.14.1 与 app-cli 链接的 pingap-config 0.14.3-rev 序列化不一致（make/docker.mk agent-runner pin 漏改）；已修复（pin 对齐 0.14.3 + 镜像重建），userapp_dev_server_lifecycle 复跑 PASS，其余场景复跑结果见 development-review-2026-09-17/review-status.md 第八批。原记录中"镜像内 pingap 0.14.3 与 pin 一致"的核对只查了 dev-app-runtime:latest，未查 builder 实际使用的 agent-runner 镜像——教训记录。compose_regression/two_users 的 lease Conflict 为其级联。本轮 Turso diff 不含该路径（归因维持成立）。
 2. **M4 进程锁信封（1 例：scope_isolation_during_deploy）**：并发 start 的 409 由进程锁层先发出（"application operation is in progress"，data=null），无 storage 层的 blocker.scope=Prod 结构化数据——M4（07a0b261 进程锁 scope 化）行为迁移后测试预期未同步，属该工作流。
 3. **同 1 级联（1 例：deploy_full_chain 的 app-files 转发）**：部署服务不可达（config_hash 链）。
 

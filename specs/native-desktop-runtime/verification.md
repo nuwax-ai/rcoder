@@ -29,3 +29,7 @@
 | ND01 反例对应表 | specs/development-review-2026-09-17/review-status.md | — | 文档 | R/B/N 合并修复映射建立 | R02/R03、N02–N10 大部、B05 未动 |
 
 **未验证/未实施清单**（不以部分通过宣称整体）：N02 路径白名单重构、N03 端口计划、N04 Pingap 随包、N05/N06/N07/N10 proxy 原生形态、N08 file-server 侧硬编码 sh/ps/taskkill、N09 分发安全、ND05–ND12 对应项、NT01–NT16 三平台原生矩阵。
+
+## 2026-09-19 追加：Compose config_hash 缺陷闭环（转引）
+
+N04"随包版本锁定 Pingap"的一个同步点漏改（dev agent-runner 镜像 pin 0.14.1 vs app-cli 默认 0.14.3）导致 dev Compose 全部含代理配置的 dev/start 恒定 config_hash 确认失败。根因链、修复与验证证据完整记录于 [development-review-2026-09-17/review-status.md 第八批](../development-review-2026-09-17/review-status.md)。该缺陷同时是 Turso 轮 Compose 8 失败中 6 例的确认根因（另 2 例为其级联与 M4 锁信封）。NT 矩阵完整三平台实机、N07 认证层、R02 attach 语义仍未完成，状态见同文件。

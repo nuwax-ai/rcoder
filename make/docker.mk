@@ -192,7 +192,7 @@ docker-build-agent-runner:
 		INSTALL_EBPF="false"; \
 		echo "🔒 跳过 eBPF 工具安装（生产模式）"; \
 	fi; \
-	PINGAP_VERSION=0.14.1 PINGAP_COMMIT=c74e4eaa44e64958cffa18c33e8bbf5995b6844f; \
+	PINGAP_VERSION=0.14.3 PINGAP_COMMIT=cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8; \
 	cd docker/rcoder-agent-runner && \
 		if [ -n "$(BUILDX_BUILDER)" ]; then \
 			docker buildx build --builder $(BUILDX_BUILDER) --platform linux/$(DOCKER_HOST_ARCH) --load \
