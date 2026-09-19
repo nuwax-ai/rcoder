@@ -915,7 +915,7 @@ async fn scenario_userapp_chat_full_turn(backend: Backend) {
         &format!("{}-udc", env.run_tag),
         user,
     );
-    req.service_type = Some(shared_types::ChatServiceScope::Userapp);
+    req.service_type = Some(shared_types::ServiceType::Userapp);
     req.app_id = Some(app.clone());
 
     let Ok(data) = chat_reported(&env, &report, "turn1", &env.rcoder, &req).await else {
@@ -1024,7 +1024,7 @@ async fn scenario_userapp_chat_workdir_agent_work_dir(backend: Backend) {
         &format!("{}-udw", env.run_tag),
         user,
     );
-    req.service_type = Some(shared_types::ChatServiceScope::Userapp);
+    req.service_type = Some(shared_types::ServiceType::Userapp);
     req.app_id = Some(app.clone());
     req.agent_work_dir = Some("1561845".to_string());
 
@@ -1127,7 +1127,7 @@ async fn scenario_userapp_two_turn_isolation(backend: Backend) {
 
     let mk_req = |prompt: &str, tag: &str| {
         let mut r = env.base_payload(backend, prompt, &format!("{}-{tag}", env.run_tag), user);
-        r.service_type = Some(shared_types::ChatServiceScope::Userapp);
+        r.service_type = Some(shared_types::ServiceType::Userapp);
         r.app_id = Some(app.clone());
         r
     };
@@ -2023,7 +2023,7 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
 
     // dev chat 建会话（分派的目标会话；短 prompt 控制时长）
     let mut req = env.base_payload(backend, "只回复 ok", &format!("{}-adp", env.run_tag), user);
-    req.service_type = Some(shared_types::ChatServiceScope::Userapp);
+    req.service_type = Some(shared_types::ServiceType::Userapp);
     req.app_id = Some(app.clone());
     let sid = match chat_reported(&env, &report, "dispatch_chat", &env.rcoder, &req).await {
         Ok(d) if !d.session_id.is_empty() => d.session_id,
