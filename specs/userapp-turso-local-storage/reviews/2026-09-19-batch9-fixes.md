@@ -62,11 +62,23 @@ Compose 场景（容器内 dev-hot 重编全部修复后的二进制）：
 - **build-agent-docker**（工作树，未提交）：R06 四项同步（start-services.sh turso 分支/docker/TURSO.md/.env.turso.example/turso-volume）；用户指令两项（缓存 200Gi 默认 + 不兼容旧卷默认 B 态）——渲染矩阵 74/74、YAML 解析、bash -n、Compose 契约门禁全过；k8s-test overlay 实渲染确认 StatefulSet + storage:"200Gi"
 - **two_users 残留清理**：仅删除证据确认属测试的 bad-app-id builder（2026-09-16 创建、application-id=bad-app-id 与测试固定复用名一致）；2 天旧的 e2eud* builder 未动（不属本测试）
 
-## 五、仍未完成
+## 五、完整 make test-e2e 结果（本轮全部修复后的二进制）
+
+**41/43 通过**（含此前失败的 scope_isolation、two_users、dev_server_lifecycle、devbuild×2、app_proxy_lazy、hot_deployment×2、native/docker crash、pg 契约、turso 契约、并发契约全绿）。
+
+剩余 2 失败（均已根因诊断，见第三节与上表）：
+- compose_regression：flock 同进程重入（外层守卫弱锁 × 内层强锁同文件两 fd）
+- deploy_full_chain：prod file-server :60000 在 deploy_wait 返回后的就绪窗口不可达（连接层，非认证）
+
+## 六、仍未完成
 
 1. **compose_regression flock 重入修复**（根因已诊断，方向已定，实现待下一批）
-2. **deploy_full_chain**（复跑进行中；此前失败=prod file-server 转发连接失败，需分层定位）
-3. **完整 make test-e2e**（本轮改动后的全量回归）
-4. **端到端 SIGTERM 反例**（R02 关机顺序的真实进程验证——单元门闸已过，Compose 级待跑）
-5. **remote-k8s 回归**（共享关机/内核改动按 AGENTS 需补 PG/K8s 验证——131 + .env.local 已就绪）
-6. NT 三平台完整矩阵、N07 独立入口令牌认证层、R02 attach 语义（前轮遗留，不变）
+2. **deploy_full_chain** 就绪窗口定位（需 prod 容器 app-cli 日志取证）
+3. **端到端 SIGTERM 反例**（R02 关机顺序的真实进程验证——单元门闸已过，Compose 级待跑）
+4. **remote-k8s 回归**（共享关机/内核改动按 AGENTS 需补 PG/K8s 验证——131 + .env.local 已就绪）
+5. NT 三平台完整矩阵、N07 独立入口令牌认证层、R02 attach 语义（前轮遗留，不变）
+
+## 七、本会话并行改动处置
+
+- compose_userapp_dev 4 处 `ChatServiceScope` 残留（11c66e07 并行删除该类型）→ 机械替换 ServiceType（独立提交），全量 e2e 编译恢复
+- build-agent-docker 工作树：R06 四项 + 用户指令两项（缓存 200Gi / 默认 B 态）——全部门禁过，未提交（与 RBD 桥接改动并存）
