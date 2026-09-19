@@ -174,3 +174,156 @@ async fn independent_pg_owners_enforce_scope_cas_and_bound_lock_waits() {
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }
+
+/// Two real connection owners observe the same uncertain physical startup.
+/// Only its original snapshot may be confirmed, exactly once; confirmation is
+/// not terminal cleanup and must retain the original slot and physical lease.
+#[cfg(feature = "pg")]
+#[tokio::test]
+#[ignore = "requires explicit disposable PostgreSQL test database"]
+async fn independent_pg_preparation_recovery_has_one_winner_and_retains_fence() {
+    let config = crate::config::PostgresConfig {
+        url: Some(std::env::var("RCODER_USERAPP_PG_TEST_DSN").expect("disposable PG DSN required")),
+        statement_timeout_secs: Some(5),
+        max_connections: Some(1),
+        min_connections: Some(1),
+        ..Default::default()
+    };
+    let a = ToastyUserAppStore::connect(&config).await.unwrap();
+    let b = ToastyUserAppStore::connect(&config).await.unwrap();
+    let app = a
+        .ensure_identity(&format!("prepare{}", uuid::Uuid::new_v4().simple()))
+        .await
+        .unwrap();
+    let mut admission = request(&app, UserAppOperationKind::PrepareProdDatabase);
+    admission.command = Some(UserAppControlCommand::PrepareProdDatabase);
+    let mut op = accepted(a.admit(&admission).await.unwrap());
+    let mut progress = UserAppOperationProgress {
+        app_id: app.app_id.clone(),
+        lifecycle_id: app.lifecycle_id.clone(),
+        operation_id: op.operation_id.clone(),
+        expected_revision: op.revision,
+        executor_id: "originalexecutor".into(),
+        state: UserAppOperationState::Running,
+        step: "claimed".into(),
+        checkpoint: serde_json::Value::Null,
+        error_code: None,
+        error_message: None,
+    };
+    op = a.advance(&progress).await.unwrap();
+    let context = UserAppExecutionContext {
+        app_id: app.app_id.clone(),
+        lifecycle_id: app.lifecycle_id.clone(),
+        operation_id: op.operation_id.clone(),
+        executor_id: "originalexecutor".into(),
+        request_fingerprint: op.request_fingerprint.clone(),
+    };
+    let receipt = UserAppOperationLeaseReceipt::Kubernetes {
+        service_type: ServiceType::Userapp,
+        namespace: "isolatedfixture".into(),
+        name: "originallease".into(),
+        uid: "originalleaseuid".into(),
+        resource_version: "1".into(),
+        token: "originaltoken".into(),
+    };
+    a.bind_operation_lease(&context, &receipt).await.unwrap();
+    let mut evidence = DatabasePreparationEvidence {
+        target: UserAppMutationTarget {
+            context: context.clone(),
+            resource: AppResourceIdentity {
+                kind: AppResourceKind::Deployment,
+                name: "originalworkload".into(),
+                uid: "originalworkloaduid".into(),
+                resource_version: Some("1".into()),
+            },
+        },
+        deployment_generation: "originalgeneration".into(),
+        stage: DatabasePreparationStage::Captured,
+        management: None,
+    };
+    for stage in [
+        DatabasePreparationStage::Captured,
+        DatabasePreparationStage::StartSubmitted,
+    ] {
+        evidence.stage = stage;
+        progress.expected_revision = op.revision;
+        progress.checkpoint = serde_json::to_value(&evidence).unwrap();
+        op = a.advance(&progress).await.unwrap();
+    }
+    let before_uncertainty = op.clone();
+    progress.expected_revision = op.revision;
+    progress.state = UserAppOperationState::RecoveryRequired;
+    op = a.advance(&progress).await.unwrap();
+    let original_binding = b
+        .get_operation_lease(&app.app_id, &op.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    evidence.stage = DatabasePreparationStage::ManagementReady;
+    evidence.management = Some(RuntimeConfigurationTarget {
+        physical_uid: "originalpoduid".into(),
+        deployment_generation: "originalgeneration".into(),
+    });
+    assert!(matches!(
+        b.confirm_database_preparation_recovery(&before_uncertainty, &evidence)
+            .await,
+        Err(UserAppStoreError::VersionConflict)
+    ));
+    assert_eq!(
+        b.get_operation(&app.app_id, &op.operation_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        op
+    );
+    // Each call enters a different owner and a separate physical PG connection.
+    let (left, right) = tokio::join!(
+        a.confirm_database_preparation_recovery(&op, &evidence),
+        b.confirm_database_preparation_recovery(&op, &evidence),
+    );
+    let winner = match (left, right) {
+        (Ok(winner), Err(UserAppStoreError::VersionConflict))
+        | (Err(UserAppStoreError::VersionConflict), Ok(winner)) => winner,
+        results => panic!("expected one CAS winner and one stale snapshot: {results:?}"),
+    };
+    assert_eq!(winner.operation_id, op.operation_id);
+    assert_eq!(winner.executor_id, op.executor_id);
+    assert_eq!(winner.lifecycle_id, op.lifecycle_id);
+    assert_eq!(winner.request_id, op.request_id);
+    assert_eq!(winner.state, UserAppOperationState::Running);
+    assert!(winner.revision > op.revision);
+    assert!(userapp_operation_has_final_evidence(&winner));
+    for store in [&a, &b] {
+        assert_eq!(
+            store
+                .get_operation(&app.app_id, &op.operation_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            winner
+        );
+        let current = store.get_application(&app.app_id).await.unwrap().unwrap();
+        assert_eq!(
+            current.active_operations.prod.as_deref(),
+            Some(op.operation_id.as_str())
+        );
+        assert_eq!(current.runtime_policy, app.runtime_policy);
+        assert_eq!(
+            store
+                .get_operation_lease(&app.app_id, &op.operation_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            original_binding
+        );
+        assert!(matches!(
+            store
+                .confirm_database_preparation_recovery(&op, &evidence)
+                .await,
+            Err(UserAppStoreError::VersionConflict)
+        ));
+    }
+    assert_eq!(original_binding.receipt, receipt);
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}

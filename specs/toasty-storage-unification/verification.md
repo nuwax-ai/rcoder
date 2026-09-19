@@ -835,3 +835,40 @@ PG探测还统一TLS/session配置继承、managed凭据覆盖URI所有user/pass
 E2E独立快照基于4a34eb93及本轮未提交源码，测试程序预编译退出0。为固定三个Compose输入，Turso测试工具新增可选`E2E_BUILD_AGENT_DOCKER_ROOT`；两份配套仓库Compose被复制到快照内部并纳入输入指纹。三份配置解析全部退出0，配套仓库基线fb12fa6。最终测试输入指纹 `a41f64a459f8688879fdcdf088616558fe24d12b924d87fab991d898576f03ae`（包含本次测试工具与配套配置）；主服务镜像构建时快照指纹为 `d896a659b2e34c165313bc302e2a5fe29c5ef465946c4a143bf7ed2d327fe6d9`，两者生产Rust/Cargo输入逐文件一致，差别是之后补齐的测试目录参数、说明和配套配置。镜像证明与测试输入证明分别记录，不混称同一全仓快照。
 
 本段记录时`docker-build-agent-runner`仍执行，之后串行构建app-runtime；没有开始最终完整Compose，K8s未部署、未push/发布。运行句柄及临时元数据留在当前任务，不能以本段准备工作宣称验收完成。
+
+### e3959112 阶段保存后的继续修复
+
+RCoder 阶段提交 `e3959112` 已创建，未 push。builder 镜像构建退出0，实际镜像 `sha256:037f7637bf3be042291ee346375e8f6927f32bce97b70d24f95c652253fb8d95` 的命令验证退出0：app-cli 0.3.6、Pingap 0.14.3。app-runtime 构建仍在执行，尚不能据此启动新镜像验收。
+
+新增确认的恢复缺口分别处理：
+
+1. app-cli 进程重启后，file-server 旧 pending 意图即使在 owner 磁盘上已有终态，也被 instance 检查挡在查询之前。已新增新 owner 身份核验后的只读原回执查询、终态与摘要校验以及旧登记 CAS 收束；10组 HTTP 场景已写入，尚未运行本轮组件验证。404、未知与身份错误不重放旧请求。
+2. PrepareProdDatabase 在 StartSubmitted 后观察失联、但尚未持久化 ManagementReady 时，原槽位缺少显式安全核验恢复路径。已具有 ManagementReady 的旧操作可用既有最终证据恢复，不属于该缺口；正在补原身份与原物理代次下的只读核验及专用存储 CAS。
+
+此前默认/全feature检查绑定 e3959112 基线，不能作为上述后续修改的通过证明。固定快照 Compose 仍验证其原始输入；后续修改需要补对应组件及部署验证。
+
+### 两项恢复补丁的组件验证
+
+`cargo nextest run -p app_manager -p rcoder-storage -p file-server --all-features --no-fail-fast` 退出0：721/721通过，4项环境门控跳过，日志 `/tmp/rcoder-recovery-followup-tests.log`。覆盖新 owner 原终态只读收束的10场景，以及管理准备迟到成功、断连、代次/UID替换与本地存储完整snapshot CAS。此时新CAS的独立真实PG竞争证据仍需补充，不能由Turso用例代替。
+
+`cargo clippy -p app_manager -p rcoder-storage -p file-server --all-targets --all-features -- -D warnings` 退出0，日志 `/tmp/rcoder-recovery-followup-clippy.log`。根fmt检查与diff检查退出0。两项补丁仍未纳入正在构建的固定Compose镜像，因此不能声称此组件结果代表部署验证。
+
+### 真实 PG 恢复竞争与镜像构建完成
+
+本轮 `tests-e2e/tools/pg_contract.py` 独立PG17测试退出0，24/24必需断言通过，新增 `PG preparation recovery independent owner CAS and retained fence` 包含真实独立连接同snapshot单胜者、原槽位/lease保留及旧revision拒绝。证据 `/tmp/rcoder-preparation38281297824e4ed5/pg-contract/assertions.json`；启动日志 `/tmp/rcoder-preparation-pg-contract.log`，测试自身已执行所属资源清理。这是存储组件实际PG验证，不是remote K8s验收。
+
+`make docker-build-app-runtime` 退出0，runtime镜像ID `sha256:53d3078f8034f161cc378c7af161ab443910c5100250e3293e0778b1b353619b`。与builder配对工具退出0，两者Python ABI均为cpython-313-aarch64-linux-gnu，Java major均25；证据 `/tmp/rcoder-compose-final-toolchains.json`。固定快照的 `userapp_deploy_full_chain` 已启动，日志 `/tmp/rcoder-compose-final-focused.log`，结果待定，未更换为包含后续恢复补丁的镜像。
+
+### 原生恢复后的显式 Restart 衔接
+
+Mac真实链已发现并修复“恢复时清旧登记后，Restart先Stop被无登记保护拒绝”的问题。UserApp Restart现在先通过既有同项目身份核验与认证入口，提交单个Restart；不先Stop，也不扫描进程接管。无owner时保留原本本地路径。新增反例核对单次POST、原revision和新请求context，异项目请求零POST。
+
+聚焦两项反例2/2通过（其余352为筛选排除），日志 `/tmp/rcoder-native-restart-followup-tests.log`。追加 file-server 完整回归354/354、0skip、退出0，日志 `/tmp/rcoder-native-restart-regression.log`。原生Mac完整Restart链仍在实测，不能用组件结果或Start通过代替。
+
+### 固定快照部署链：PG建库修复闭环，CR10代次交接缺口暴露
+
+报告 `tests-e2e/reports/750d8ede9d7a4bd3a0c973251bf0ab51`，退出1，63个硬断言通过、3个失败。七服务构建（270秒）、全部真实代理就绪、热部署与制品身份断言通过，原PG建库早报ready故障未复现。失败根节点是CR10显式凭据Restart操作 `5967fc71-0870-4daa-b855-9afd581e9210`，随后Stop与Delete被RecoveryRequired保护拒绝，两者是后果而非独立根因。
+
+归档prod日志明确：新owner报告 `deployment journal generation does not match this owner; explicit deployment required`。控制面在没有制品的配置Restart中注入新operation/generation并移除旧URL，但保留旧卷/journal；没有可信旧→新代次交接，且PG修改先于业务激活确认。不可删除journal、放宽所有代次检查或清锁绕过。正在实现受控交接和改PG前的管理准备屏障，同时覆盖已停止容器的显式Start，不用普通wake先拉起业务。
+
+现场资源已由严格E2E按所属身份归档与清理，Turso仍保留操作保护；不把测试清理当操作恢复。完整Compose/K8s验收仍未通过。

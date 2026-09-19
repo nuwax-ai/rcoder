@@ -49,6 +49,7 @@ use envelope::ApiJson;
         submit_deploy,
         deploy_status,
         activate_runtime_configuration,
+        prepared_runtime_configuration,
         proxy::validate,
         proxy::reload,
         proxy::status,
@@ -166,6 +167,10 @@ fn api_router(state: AppState) -> Router {
         .route("/v1/proxy/upstreams", get(proxy::upstreams))
         .route("/v1/deploy", post(submit_deploy))
         .route("/v1/deploy/status", get(deploy_status))
+        .route(
+            "/v1/runtime/configuration/prepared",
+            get(prepared_runtime_configuration),
+        )
         .route(
             "/v1/runtime/configuration/activate",
             post(activate_runtime_configuration),
@@ -387,6 +392,48 @@ fn authorize_deploy(state: &AppState, headers: &axum::http::HeaderMap) -> Result
         Ok(())
     } else {
         Err("deploy token mismatch".to_string())
+    }
+}
+
+#[utoipa::path(
+    get, path = "/v1/runtime/configuration/prepared",
+    responses(
+        (status = 200, description = "Confirmed generation handoff", body = shared_types::RuntimeGenerationPrepared),
+        (status = 202, description = "Preparation pending"),
+        (status = 403, description = "Invalid deployment token"),
+        (status = 409, description = "Runtime is protected")
+    ), tag = "Runtime Control"
+)]
+async fn prepared_runtime_configuration(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(message) = authorize_deploy(&state, &headers) {
+        return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
+    }
+    if state.server.runtime_recovery_hold_active()
+        || state
+            .server
+            .runtime_kernel()
+            .is_some_and(|kernel| kernel.recovery_protection_active())
+    {
+        return envelope::error(
+            StatusCode::CONFLICT,
+            "HANDOFF_NOT_PREPARED",
+            "Runtime requires recovery",
+        );
+    }
+    match state
+        .server
+        .configuration_gate()
+        .and_then(|gate| gate.prepared().cloned())
+    {
+        Some(prepared) => envelope::ok(StatusCode::OK, json!(prepared)),
+        None => envelope::error(
+            StatusCode::ACCEPTED,
+            "HANDOFF_PENDING",
+            "Generation handoff is not prepared",
+        ),
     }
 }
 

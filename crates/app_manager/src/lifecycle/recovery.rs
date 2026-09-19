@@ -70,6 +70,21 @@ impl AppService {
         if operation.revision != request.expected_revision {
             return Err(shared_types::UserAppStoreError::VersionConflict.into());
         }
+        if operation.kind == shared_types::UserAppOperationKind::PrepareProdDatabase
+            && matches!(
+                operation.state,
+                UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
+            )
+            && !shared_types::userapp_operation_has_final_evidence(&operation)
+        {
+            self.reconcile_database_preparation(&operation).await?;
+            return self
+                .get_control_operation(app_id, Some(operation_id))
+                .await?
+                .ok_or_else(|| {
+                    AppOperationError::NotFound("Management operation disappeared".into())
+                });
+        }
         let recoverable_final = matches!(
             operation.state,
             UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
@@ -142,7 +157,7 @@ impl AppService {
     }
 
     /// Reconcile a durable final checkpoint without replaying any resource write.
-    async fn reconcile_completed_control(
+    pub(crate) async fn reconcile_completed_control(
         &self,
         snapshot: &UserAppOperationRecord,
     ) -> AppResult<bool> {

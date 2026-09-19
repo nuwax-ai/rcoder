@@ -331,6 +331,20 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         })
         .await
     }
+    async fn confirm_database_preparation_recovery(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &DatabasePreparationEvidence,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let evidence = evidence.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                ops::confirm_database_preparation_recovery(tx, backend, &snapshot, &evidence).await
+            })
+        })
+        .await
+    }
     async fn advance(
         &self,
         progress: &UserAppOperationProgress,

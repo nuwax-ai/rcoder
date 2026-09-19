@@ -36,6 +36,8 @@ pub(crate) struct Receipt {
     pub request: DeployRequest,
     pub boundary: Boundary,
     pub active: Option<ActiveVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_handoff: Option<shared_types::RuntimeGenerationPrepared>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
@@ -387,6 +389,7 @@ mod tests {
         };
         Receipt {
             generation: "generation-a".into(),
+            generation_handoff: None,
             operation: AppDeploymentOperation {
                 operation_id: "hot-b".into(),
                 deployment_generation_id: "generation-a".into(),

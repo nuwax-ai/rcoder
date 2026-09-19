@@ -48,6 +48,7 @@ pub(crate) const PLATFORM_ENV_KEYS: &[&str] = &[
     shared_types::APP_DEPLOY_OPERATION_ID,
     shared_types::APP_DEPLOY_GENERATION_ID,
     shared_types::APP_RUNTIME_CONFIGURATION_VERSION,
+    shared_types::APP_RUNTIME_GENERATION_HANDOFF,
     "RCODER_PHYSICAL_POD_UID",
     "APP_ID",
     "PGDATA",

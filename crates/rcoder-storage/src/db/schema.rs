@@ -156,6 +156,7 @@ pub(crate) async fn initialize(
 }
 
 /// Verify the existing baseline without executing DDL or changing the ledger.
+#[cfg(feature = "userapp-turso")]
 pub(crate) async fn verify_existing(
     db: &mut toasty::Db,
     backend: Backend,

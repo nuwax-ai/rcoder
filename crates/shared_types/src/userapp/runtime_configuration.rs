@@ -9,6 +9,60 @@ use utoipa::ToSchema;
 
 pub const APP_RUNTIME_CONFIGURATION_VERSION: &str = "APP_RUNTIME_CONFIGURATION_VERSION";
 
+/// Trusted controller authorization, bound to the old physical replacement target.
+/// The artifact is read only after the new owner has acquired exclusive ownership.
+pub const APP_RUNTIME_GENERATION_HANDOFF: &str = "APP_RUNTIME_GENERATION_HANDOFF";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeGenerationHandoff {
+    pub protocol_version: u32,
+    pub app_id: String,
+    pub lifecycle_id: String,
+    pub previous_generation: String,
+    pub previous_resource_uid: String,
+    pub previous_resource_name: String,
+    pub activation: RuntimeConfigurationActivation,
+}
+
+impl RuntimeGenerationHandoff {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.protocol_version != 1
+            || self.activation.config_version <= 0
+            || [
+                &self.app_id,
+                &self.lifecycle_id,
+                &self.previous_generation,
+                &self.previous_resource_uid,
+                &self.previous_resource_name,
+                &self.activation.operation_id,
+                &self.activation.deployment_generation,
+            ]
+            .iter()
+            .any(|value| value.trim().is_empty())
+            || self.previous_generation == self.activation.deployment_generation
+            || self.activation.operation_id != self.activation.deployment_generation
+        {
+            return Err("Invalid runtime generation handoff authorization".into());
+        }
+        Ok(())
+    }
+}
+
+/// Durable evidence produced under the new owner's exclusive workspace lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeGenerationPrepared {
+    pub authorization: RuntimeGenerationHandoff,
+    pub artifact_release_id: String,
+    pub release_manifest_sha256: String,
+    pub previous_journal_sha256: String,
+    pub execution_workspace: String,
+    /// Desired revision when the fresh explicit operation was accepted. Later
+    /// Stop revisions invalidate this intent even when container env is unchanged.
+    pub desired_revision: u64,
+}
+
 /// Platform acknowledgement after durable credential application. Contains no
 /// credentials. It only opens the captured generation's business startup gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

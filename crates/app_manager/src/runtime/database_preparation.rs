@@ -130,6 +130,153 @@ impl AppService {
             .await
     }
 
+    /// Observe a previously submitted startup, never submit a second startup.
+    /// Failure leaves the original operation, scope slot and lease untouched.
+    pub(crate) async fn reconcile_database_preparation(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> AppResult<bool> {
+        let mut evidence: DatabasePreparationEvidence =
+            serde_json::from_value(snapshot.checkpoint.clone()).map_err(|_| {
+                AppOperationError::Conflict("Invalid management recovery evidence".into())
+            })?;
+        evidence
+            .validate_operation(snapshot)
+            .map_err(AppOperationError::Conflict)?;
+        if evidence.stage != DatabasePreparationStage::StartSubmitted {
+            return Err(AppOperationError::Conflict(
+                "Management startup was not submitted".into(),
+            ));
+        }
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let observed = timeout_at(deadline, async {
+            let app = self
+                .metadata
+                .store
+                .get_application(&snapshot.app_id)
+                .await?
+                .ok_or(UserAppStoreError::NotFound)?;
+            if app.lifecycle_id != snapshot.lifecycle_id
+                || app.active_operations.slot(snapshot.scope) != Some(&snapshot.operation_id)
+            {
+                return Err(AppOperationError::Conflict(
+                    "Management recovery lost its original scope".into(),
+                ));
+            }
+            let binding = self
+                .metadata
+                .store
+                .get_operation_lease(&snapshot.app_id, &snapshot.operation_id)
+                .await?
+                .ok_or(UserAppStoreError::NotFound)?;
+            if binding.context != evidence.target.context {
+                return Err(AppOperationError::Conflict(
+                    "Management recovery lease identity changed".into(),
+                ));
+            }
+            self.check_preparation_workload(&evidence).await?;
+            let context = &evidence.target.context;
+            let management = self
+                .runtime
+                .capture_app_configuration_target(context, &evidence.deployment_generation)
+                .await
+                .map_err(|error| map_runtime_error("Observe original management target", error))?;
+            let marker = self
+                .runtime
+                .exec_app_configuration_target(
+                    context,
+                    &management,
+                    vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "test -n \"${PGDATA:-}\" && cat \"$PGDATA/.rcoder-admin-user\"".into(),
+                    ],
+                )
+                .await
+                .map_err(|error| map_runtime_error("Observe original administrator", error))?;
+            if marker.exit_code != 0 {
+                return Err(AppOperationError::Backend(
+                    "Original administrator is unavailable".into(),
+                ));
+            }
+            let admin = pg_utils::PgAdministrationTarget::new(
+                marker.stdout.trim().into(),
+                "/var/run/postgresql".into(),
+            )
+            .map_err(AppOperationError::Validation)?;
+            let ready = self
+                .runtime
+                .exec_app_configuration_target(
+                    context,
+                    &management,
+                    vec!["sh".into(), "-c".into(), admin.ready_command()],
+                )
+                .await
+                .map_err(|error| map_runtime_error("Observe original database readiness", error))?;
+            if ready.exit_code != 0 {
+                return Err(AppOperationError::Backend(
+                    "Original database is not management ready".into(),
+                ));
+            }
+            self.check_preparation_workload(&evidence).await?;
+            evidence.management = Some(management);
+            evidence.stage = DatabasePreparationStage::ManagementReady;
+            evidence
+                .validate_operation(snapshot)
+                .map_err(AppOperationError::Conflict)?;
+            Ok::<_, AppOperationError>(evidence)
+        })
+        .await
+        .map_err(|_| expired())??;
+        // The owned storage transaction must finish even if its HTTP observer
+        // goes away. Its CAS preserves the original identity and holds the slot.
+        let confirmed = self
+            .metadata
+            .store
+            .confirm_database_preparation_recovery(snapshot, &observed)
+            .await?;
+        self.reconcile_completed_control(&confirmed).await
+    }
+
+    async fn check_preparation_workload(
+        &self,
+        evidence: &DatabasePreparationEvidence,
+    ) -> AppResult<()> {
+        let current = self
+            .runtime
+            .capture_app_mutation_target(&evidence.target.context, None)
+            .await
+            .map_err(|error| map_runtime_error("Observe captured management workload", error))?;
+        let expected = &evidence.target.resource;
+        // Resource version changes when our original scale write completes;
+        // physical UID, name, kind and deployment generation must not change.
+        if current.context != evidence.target.context
+            || current.resource.uid != expected.uid
+            || current.resource.name != expected.name
+            || current.resource.kind != expected.kind
+        {
+            return Err(AppOperationError::Conflict(
+                "Management workload physical identity changed".into(),
+            ));
+        }
+        let spec = self
+            .runtime
+            .get_app_container_spec(&evidence.target.context.app_id)
+            .await
+            .map_err(|error| map_runtime_error("Observe management generation", error))?;
+        if spec
+            .env
+            .as_ref()
+            .and_then(|env| env.get(APP_DEPLOY_GENERATION_ID))
+            != Some(&evidence.deployment_generation)
+        {
+            return Err(AppOperationError::Conflict(
+                "Management deployment generation changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn execute_database_preparation(
         &self,
         mut operation: OwnedOperation,
@@ -557,6 +704,194 @@ mod tests {
             if blocker.operation_id == "uncertainrequest")
         );
         assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.management_start_calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn management_recovery_observes_late_success_without_restarting() {
+        let (_directory, service, runtime, app) = fixture().await;
+        assert!(
+            service
+                .prepare_prod_database(
+                    &app.app_id,
+                    &app.lifecycle_id,
+                    "lostobserve",
+                    &"a".repeat(64),
+                    Instant::now() + Duration::from_secs(5)
+                )
+                .await
+                .is_err()
+        );
+        let op = service
+            .metadata
+            .store
+            .get_operation(&app.app_id, "lostobserve")
+            .await
+            .unwrap()
+            .unwrap();
+        let retry = || UserAppRetryRequest {
+            lifecycle_id: app.lifecycle_id.clone(),
+            expected_revision: op.revision,
+        };
+        // An unavailable observation neither releases the fence nor starts again.
+        assert!(
+            service
+                .retry_control_operation(&app.app_id, &op.operation_id, retry())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .metadata
+                .store
+                .get_operation(&app.app_id, &op.operation_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            op
+        );
+        assert!(runtime.lease_held.load(Ordering::SeqCst));
+        runtime.configuration_replies.lock().unwrap().extend([
+            container_runtime_api::ExecResult {
+                exit_code: 0,
+                stdout: "originaladmin\n".into(),
+                stderr: String::new(),
+            },
+            container_runtime_api::ExecResult {
+                exit_code: 0,
+                stdout: "1\n".into(),
+                stderr: String::new(),
+            },
+        ]);
+        service
+            .retry_control_operation(&app.app_id, &op.operation_id, retry())
+            .await
+            .unwrap();
+        let done = service
+            .metadata
+            .store
+            .get_operation(&app.app_id, &op.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.state, UserAppOperationState::Succeeded);
+        assert_eq!(done.executor_id, op.executor_id);
+        assert_eq!(runtime.management_start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+        assert!(!runtime.lease_held.load(Ordering::SeqCst));
+        let current = service
+            .metadata
+            .store
+            .get_application(&app.app_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(current.active_operations.prod.is_none());
+        assert_eq!(current.runtime_policy, app.runtime_policy);
+    }
+
+    #[tokio::test]
+    async fn management_recovery_rejects_replaced_generation_without_releasing() {
+        let (_directory, service, runtime, app) = fixture().await;
+        assert!(
+            service
+                .prepare_prod_database(
+                    &app.app_id,
+                    &app.lifecycle_id,
+                    "lostobserve",
+                    &"a".repeat(64),
+                    Instant::now() + Duration::from_secs(5)
+                )
+                .await
+                .is_err()
+        );
+        let op = service
+            .metadata
+            .store
+            .get_operation(&app.app_id, "lostobserve")
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .specs
+            .get_mut(&app.app_id)
+            .unwrap()
+            .env
+            .as_mut()
+            .unwrap()
+            .insert(APP_DEPLOY_GENERATION_ID.into(), "replacement".into());
+        assert!(
+            service
+                .retry_control_operation(
+                    &app.app_id,
+                    &op.operation_id,
+                    UserAppRetryRequest {
+                        lifecycle_id: app.lifecycle_id.clone(),
+                        expected_revision: op.revision
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .metadata
+                .store
+                .get_operation(&app.app_id, &op.operation_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            op
+        );
+        assert!(runtime.lease_held.load(Ordering::SeqCst));
+        assert_eq!(runtime.management_start_calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn management_recovery_rejects_replacement_workload_uid() {
+        let (_directory, service, runtime, app) = fixture().await;
+        assert!(
+            service
+                .prepare_prod_database(
+                    &app.app_id,
+                    &app.lifecycle_id,
+                    "lostobserve",
+                    &"a".repeat(64),
+                    Instant::now() + Duration::from_secs(5)
+                )
+                .await
+                .is_err()
+        );
+        let op = service
+            .metadata
+            .store
+            .get_operation(&app.app_id, "lostobserve")
+            .await
+            .unwrap()
+            .unwrap();
+        *runtime.mutation_uid_override.lock().unwrap() = Some("replacementuid".into());
+        assert!(
+            service
+                .retry_control_operation(
+                    &app.app_id,
+                    &op.operation_id,
+                    UserAppRetryRequest {
+                        lifecycle_id: app.lifecycle_id.clone(),
+                        expected_revision: op.revision
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .metadata
+                .store
+                .get_operation(&app.app_id, &op.operation_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            op
+        );
+        assert!(runtime.lease_held.load(Ordering::SeqCst));
         assert_eq!(runtime.management_start_calls.load(Ordering::SeqCst), 1);
     }
 }

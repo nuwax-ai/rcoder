@@ -42,9 +42,8 @@ use crate::error::AppResult;
 use support::lock;
 
 impl DevServerManager {
-    /// restart-dev = stop + start（`hooks`/`pg` 语义同 [`Self::start_dev`]）。
-    /// UserApp manifest 域（userapp: 前缀 key）停止走 [`Self::stop_userapp_dev`]
-    /// （R05：managed 域不 ps 扫描）；web 域维持 stop_dev。
+    /// UserApp owner 用单一 Restart 操作完成停止和启动；本地子进程才 stop + start。
+    /// 无本地登记的新 owner 也必须先核验同项目身份和认证，不能扫描进程接管。
     pub async fn restart_dev(
         &self,
         project_id: &str,
@@ -55,6 +54,19 @@ impl DevServerManager {
         request_context: Option<&str>,
     ) -> AppResult<StartedDev> {
         if project_id.starts_with("userapp:") {
+            if let Some(started) = self
+                .reuse_or_refuse_owner(
+                    project_id,
+                    project_path,
+                    hooks.clone(),
+                    pg,
+                    None,
+                    request_context,
+                )
+                .await?
+            {
+                return Ok(started);
+            }
             self.stop_userapp_dev(project_id, project_path).await?;
         } else {
             self.stop_dev(project_id).await?;

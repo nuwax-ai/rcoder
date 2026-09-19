@@ -18,7 +18,7 @@ class StorageContractCatalogTests(unittest.TestCase):
 
     def test_extra_pg_cases_are_real_tests_and_required(self):
         root = Path(__file__).resolve().parents[2] / 'crates/rcoder-storage/src'
-        self.assertEqual(len(PG_EXTRA_TARGETS), 11)
+        self.assertEqual(len(PG_EXTRA_TARGETS), 12)
         self.assertTrue(set(PG_EXTRA_TARGETS) <= REQUIRED['pg_storage_lifecycle_contract'])
         for target in PG_EXTRA_TARGETS.values():
             module, name = target.rsplit('::', 1)

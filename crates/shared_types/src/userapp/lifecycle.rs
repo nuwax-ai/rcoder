@@ -889,6 +889,19 @@ pub trait UserAppLifecycleStore: Send + Sync {
             "Password recovery is unsupported by this store".into(),
         ))
     }
+    /// Persist positive, identity-bound management readiness after an uncertain
+    /// preparation. Exact snapshot CAS and the original lease are required;
+    /// this does not release its slot or authorize another physical startup.
+    async fn confirm_database_preparation_recovery(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &crate::DatabasePreparationEvidence,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let _ = (snapshot, evidence);
+        Err(UserAppStoreError::InvalidOperation(
+            "Database preparation recovery is unsupported by this store".into(),
+        ))
+    }
     /// Validates app/lifecycle/operation/executor/revision and the correct scope
     /// slot, then advances record and slot atomically; only ever releases the
     /// current operation's own slot.

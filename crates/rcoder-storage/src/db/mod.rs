@@ -8,3 +8,6 @@ pub(crate) mod schema;
 
 #[cfg(all(test, feature = "userapp-turso"))]
 mod tests;
+
+#[cfg(all(test, feature = "pg"))]
+mod pg_tls_tests;

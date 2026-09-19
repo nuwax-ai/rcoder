@@ -1071,6 +1071,101 @@ async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str
     );
 }
 
+/// Query only whitelisted public operation fields; never retain checkpoint or request payload.
+async fn cr10_failure_diagnostic(
+    env: &Env,
+    report: &JsonlReporter,
+    app: &str,
+    lifecycle: &str,
+    request_id: &str,
+) {
+    let (_, operation) = get_json(
+        env,
+        &format!("/api/v1/userapp/{app}/operations/by-request?request_id={request_id}"),
+    )
+    .await;
+    let (_, configuration) = get_json(
+        env,
+        &format!("/api/v1/userapp/{app}/prod/runtime-configuration?lifecycle_id={lifecycle}"),
+    )
+    .await;
+    let op = &operation["data"];
+    let config = &configuration["data"];
+    let selected = json!({"operation_id": op["operation_id"], "state": op["state"], "step": op["step"],
+        "error_code": op["error_code"], "error_message": op["error_message"],
+        "configuration_revision": config["revision"], "applied_version": config["applied_version"],
+        "saved_version": config["saved_version"], "applying_version": config["applying_version"], "pending": config["pending"]});
+    let text = selected
+        .to_string()
+        .replace("e2e_cr10_pending_password", "[REDACTED]")
+        .replace("e2e_cr10_stopped_password", "[REDACTED]");
+    report.diagnostic("CR10 操作失败阶段", request_id, &text);
+}
+
+fn cr10_tcp_login(id: &str, username: &str, password: &str) -> bool {
+    let output = std::process::Command::new("docker")
+        .args([
+            "exec",
+            id,
+            "env",
+            &format!("PGPASSWORD={password}"),
+            "psql",
+            "-X",
+            "-w",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            username,
+            "-d",
+            "postgres",
+            "-Atc",
+            "SELECT 1",
+        ])
+        .output()
+        .unwrap();
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
+}
+
+fn docker_inspect_running(container: &str) -> Option<bool> {
+    let output = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{.State.Running}}", container])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+async fn cr10_proxy_ready(env: &Env, app: &str, user: &str) -> bool {
+    let pingora = std::env::var("E2E_PINGORA_URL").expect("E2E_PINGORA_URL");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while Instant::now() < deadline {
+        if let Ok(response) = env
+            .http
+            .get(format!(
+                "{pingora}/api/v1/userapp/proxy/app/prod/{user}/{app}/react/"
+            ))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            && response.status().is_success()
+            && response
+                .text()
+                .await
+                .is_ok_and(|body| body.to_ascii_lowercase().contains("<!doctype html"))
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    false
+}
+
 /// CR10: configuration save has no runtime effect; explicit restart applies it.
 async fn verify_saved_runtime_credentials(
     env: &Env,
@@ -1165,29 +1260,7 @@ async fn verify_saved_runtime_credentials(
         docker_inspect_id(&prod_name) == before && old_login(uid),
         "Original physical UID and TCP login retained".into(),
     );
-    let new_login = |id: &str| {
-        let output = std::process::Command::new("docker")
-            .args([
-                "exec",
-                id,
-                "env",
-                &format!("PGPASSWORD={password}"),
-                "psql",
-                "-X",
-                "-w",
-                "-h",
-                "127.0.0.1",
-                "-U",
-                &username,
-                "-d",
-                "postgres",
-                "-Atc",
-                "SELECT 1",
-            ])
-            .output()
-            .unwrap();
-        output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
-    };
+    let new_login = |id: &str| cr10_tcp_login(id, &username, password);
     report.assert_hard(
         "CR10 待生效密码尚不能登录",
         !new_login(uid),
@@ -1213,6 +1286,7 @@ async fn verify_saved_runtime_credentials(
         ),
     );
     if !http_ok(&restarted) {
+        cr10_failure_diagnostic(env, report, app, lifecycle, "runtimeconfigrestart").await;
         return;
     }
     let after = docker_inspect_id(&prod_name);
@@ -1231,34 +1305,133 @@ async fn verify_saved_runtime_credentials(
         docker_inspect_id(&dev_name) == dev_before && dev_before.as_deref().is_some_and(old_login),
         "Development physical UID and original TCP login retained".into(),
     );
-    let pingora = std::env::var("E2E_PINGORA_URL").expect("E2E_PINGORA_URL");
-    let deadline = Instant::now() + Duration::from_secs(180);
-    let mut ready = false;
-    while Instant::now() < deadline {
-        if let Ok(response) = env
-            .http
-            .get(format!(
-                "{pingora}/api/v1/userapp/proxy/app/prod/{user}/{app}/react/"
-            ))
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-            && response.status().is_success()
-            && response
-                .text()
-                .await
-                .is_ok_and(|body| body.to_ascii_lowercase().contains("<!doctype html"))
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    let ready = cr10_proxy_ready(env, app, user).await;
     report.assert_hard(
         "CR10 配置换代后真实业务可访问",
         ready,
         "React HTML checked through production proxy".into(),
     );
+    if !ready {
+        cr10_failure_diagnostic(env, report, app, lifecycle, "runtimeconfigrestart").await;
+        return;
+    }
+
+    // Reuse the latest hot-deployed seven-service artifact. No health/proxy request
+    // is allowed between Stop and explicit Start: it would silently wake the container.
+    let (stop_status, stopped) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/stop"),
+        json!({"lifecycle_id": lifecycle, "request_id": "runtimeconfigstop"}),
+    )
+    .await;
+    let stopped_uid = docker_inspect_id(&prod_name);
+    let stopped_ok = stop_status.is_success()
+        && http_ok(&stopped)
+        && stopped["data"]["status"] == "stopped"
+        && stopped_uid == after
+        && docker_inspect_running(&prod_name) == Some(false);
+    report.assert_hard(
+        "CR10 第二次保存前 prod 已停止",
+        stopped_ok,
+        "Stop acknowledged; physical UID retained and Docker Running=false".into(),
+    );
+    if !stopped_ok {
+        cr10_failure_diagnostic(env, report, app, lifecycle, "runtimeconfigstop").await;
+        return;
+    }
+    let (_, prior_second) = get_json(env, &format!("{path}?lifecycle_id={lifecycle}")).await;
+    let second_password = "e2e_cr10_stopped_password";
+    let second_saved: Value = env
+        .http
+        .put(format!("{}{path}", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .json(
+            &json!({"lifecycle_id": lifecycle, "request_id": "runtimeconfigsavewhileStopped",
+            "expected_revision": prior_second["data"]["revision"],
+            "pg": {"username": username, "password": second_password}}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second_version = second_saved["data"]["config_version"].as_i64();
+    let second_ok = http_ok(&second_saved)
+        && second_version.is_some()
+        && second_version > version
+        && second_saved["data"]["status"]["pending"] == true
+        && second_saved["data"]["status"]["applied_version"].as_i64() == version
+        && !second_saved.to_string().contains(second_password);
+    report.assert_hard(
+        "CR10 停止态保存第二版本仅待生效",
+        second_ok,
+        "Second version pending; applied version unchanged; response excludes secret".into(),
+    );
+    report.assert_hard(
+        "CR10 停止态保存不唤醒且 UID 不变",
+        docker_inspect_id(&prod_name) == stopped_uid
+            && docker_inspect_running(&prod_name) == Some(false),
+        "Configuration save leaves stopped physical container unchanged".into(),
+    );
+    if !second_ok {
+        return;
+    }
+    let started: Value = env
+        .http
+        .post(format!("{}/api/v1/userapp/{app}/start", env.rcoder))
+        .timeout(Duration::from_secs(310))
+        .json(&json!({"lifecycle_id": lifecycle, "request_id": "runtimeconfigstartStopped"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    report.assert_hard(
+        "CR10 停止态显式无 URL Start 成功",
+        http_ok(&started),
+        format!("code={}", started["code"]),
+    );
+    if !http_ok(&started) {
+        cr10_failure_diagnostic(env, report, app, lifecycle, "runtimeconfigstartStopped").await;
+        return;
+    }
+    let started_uid = docker_inspect_id(&prod_name);
+    let (_, final_config) = get_json(env, &format!("{path}?lifecycle_id={lifecycle}")).await;
+    report.assert_hard(
+        "CR10 停止态 Start 换代并应用第二版本",
+        started_uid.is_some()
+            && started_uid != stopped_uid
+            && docker_inspect_running(&prod_name) == Some(true)
+            && final_config["data"]["applied_version"].as_i64() == second_version
+            && final_config["data"]["pending"] == false
+            && started_uid
+                .as_deref()
+                .is_some_and(|id| cr10_tcp_login(id, &username, second_password)),
+        "New physical UID, second applied version and actual TCP login checked".into(),
+    );
+    report.assert_hard(
+        "CR10 第二版本拒绝旧 prod 密码",
+        started_uid
+            .as_deref()
+            .is_some_and(|id| !cr10_tcp_login(id, &username, password)),
+        "Prior applied password no longer authenticates via TCP".into(),
+    );
+    report.assert_hard(
+        "CR10 停止态配置切换不改变 dev",
+        docker_inspect_id(&dev_name) == dev_before && dev_before.as_deref().is_some_and(old_login),
+        "Development UID and original TCP credentials retained through both rotations".into(),
+    );
+    let ready = cr10_proxy_ready(env, app, user).await;
+    report.assert_hard(
+        "CR10 停止态 Start 后真实业务可访问",
+        ready,
+        "Existing artifact serves React HTML through production proxy".into(),
+    );
+    if !ready {
+        cr10_failure_diagnostic(env, report, app, lifecycle, "runtimeconfigstartStopped").await;
+    }
 }
 
 /// C4 app-files prod：upload → files → delete + upload-from-url（制品回灌）。

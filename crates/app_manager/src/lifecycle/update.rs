@@ -238,6 +238,57 @@ impl AppService {
             None
         };
         let mut checkpoint = serde_json::json!({"target":target,"storage_target":storage_target,"requested_storage_size":params.storage_size});
+        // Only captured-configuration replacements without a new artifact may
+        // inherit the confirmed volume. Capture the old generation while its
+        // physical target is still fenced by this operation's runtime lease.
+        if let Some(env) = params.env.as_mut()
+            && env.contains_key(shared_types::APP_RUNTIME_CONFIGURATION_VERSION)
+            && !env.contains_key("APP_DEPLOY_URL")
+        {
+            let old = self
+                .runtime
+                .get_app_container_spec(app_id)
+                .await
+                .map_err(|error| map_runtime_error("Capture handoff generation", error))?;
+            let previous_generation = old
+                .env
+                .as_ref()
+                .and_then(|env| env.get(shared_types::APP_DEPLOY_GENERATION_ID))
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .ok_or_else(|| {
+                    AppOperationError::InvalidState(
+                        "Replacement has no previous deployment generation".into(),
+                    )
+                })?;
+            let config_version = env
+                .get(shared_types::APP_RUNTIME_CONFIGURATION_VERSION)
+                .and_then(|value| value.parse::<i64>().ok())
+                .ok_or_else(|| {
+                    AppOperationError::InvalidState("Invalid captured configuration version".into())
+                })?;
+            let handoff = shared_types::RuntimeGenerationHandoff {
+                protocol_version: 1,
+                app_id: context.app_id.clone(),
+                lifecycle_id: context.lifecycle_id.clone(),
+                previous_generation,
+                previous_resource_uid: target.resource.uid.clone(),
+                previous_resource_name: target.resource.name.clone(),
+                activation: shared_types::RuntimeConfigurationActivation {
+                    operation_id: context.operation_id.clone(),
+                    deployment_generation: context.operation_id.clone(),
+                    config_version,
+                },
+            };
+            handoff.validate().map_err(AppOperationError::Validation)?;
+            let encoded = serde_json::to_string(&handoff).map_err(|error| {
+                AppOperationError::Backend(format!("Encode generation handoff: {error}"))
+            })?;
+            checkpoint["generation_handoff"] = serde_json::to_value(&handoff).map_err(|error| {
+                AppOperationError::Backend(format!("Encode generation handoff checkpoint: {error}"))
+            })?;
+            env.insert(shared_types::APP_RUNTIME_GENERATION_HANDOFF.into(), encoded);
+        }
         operation
             .checkpoint("updating_runtime", checkpoint.clone())
             .await?;

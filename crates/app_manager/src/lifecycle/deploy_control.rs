@@ -673,6 +673,7 @@ fn inject_captured_configuration(
     has_artifact: bool,
 ) {
     let env = params.env.get_or_insert_with(Default::default);
+    env.remove(shared_types::APP_RUNTIME_GENERATION_HANDOFF);
     // The immutable generation's Secret wins over old manifest/image defaults.
     env.remove("POSTGRES_USER");
     env.remove("POSTGRES_PASSWORD");
@@ -697,6 +698,7 @@ fn inject_captured_configuration(
     let secrets = params.secrets.get_or_insert_with(Default::default);
     for key in [
         shared_types::APP_RUNTIME_CONFIGURATION_VERSION,
+        shared_types::APP_RUNTIME_GENERATION_HANDOFF,
         shared_types::APP_DEPLOY_OPERATION_ID,
         shared_types::APP_DEPLOY_GENERATION_ID,
         "APP_DEPLOY_URL",

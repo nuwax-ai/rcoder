@@ -1159,3 +1159,100 @@ async fn inline_deployment_credential_conflict_rolls_back_admission() {
         1
     );
 }
+
+#[tokio::test]
+async fn preparation_recovery_requires_exact_snapshot_and_retains_original_lease() {
+    let (_directory, store, app) = database().await;
+    let (mut op, context) = claim(
+        &store,
+        &admission(
+            &app,
+            "preparerecover",
+            UserAppControlCommand::PrepareProdDatabase,
+        ),
+    )
+    .await;
+    let receipt = UserAppOperationLeaseReceipt::Docker {
+        service_type: ServiceType::Userapp,
+        device: 1,
+        inode: 42,
+        token: "originallease".into(),
+    };
+    store
+        .bind_operation_lease(&context, &receipt)
+        .await
+        .unwrap();
+    let mut evidence = DatabasePreparationEvidence {
+        target: UserAppMutationTarget {
+            context,
+            resource: AppResourceIdentity {
+                kind: AppResourceKind::Container,
+                name: "captured".into(),
+                uid: "physicalone".into(),
+                resource_version: None,
+            },
+        },
+        deployment_generation: "generationone".into(),
+        stage: DatabasePreparationStage::Captured,
+        management: None,
+    };
+    let mut update = progress(&op, UserAppOperationState::Running);
+    update.checkpoint = serde_json::to_value(&evidence).unwrap();
+    op = store.advance(&update).await.unwrap();
+    let mut ready = evidence.clone();
+    ready.stage = DatabasePreparationStage::ManagementReady;
+    ready.management = Some(target());
+    assert!(
+        store
+            .confirm_database_preparation_recovery(&op, &ready)
+            .await
+            .is_err()
+    );
+    evidence.stage = DatabasePreparationStage::StartSubmitted;
+    update = progress(&op, UserAppOperationState::Running);
+    update.checkpoint = serde_json::to_value(&evidence).unwrap();
+    op = store.advance(&update).await.unwrap();
+    let stale = op.clone();
+    update = progress(&op, UserAppOperationState::RecoveryRequired);
+    update.checkpoint = op.checkpoint.clone();
+    op = store.advance(&update).await.unwrap();
+    assert!(
+        store
+            .confirm_database_preparation_recovery(&stale, &ready)
+            .await
+            .is_err()
+    );
+    let mut wrong = ready.clone();
+    wrong.target.resource.uid = "other".into();
+    assert!(
+        store
+            .confirm_database_preparation_recovery(&op, &wrong)
+            .await
+            .is_err()
+    );
+    let confirmed = store
+        .confirm_database_preparation_recovery(&op, &ready)
+        .await
+        .unwrap();
+    assert_eq!(confirmed.executor_id, op.executor_id);
+    assert!(userapp_operation_has_final_evidence(&confirmed));
+    assert_eq!(confirmed.state, UserAppOperationState::Running);
+    assert!(
+        store
+            .confirm_database_preparation_recovery(&op, &ready)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_operation_lease(&app.app_id, &op.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .receipt,
+        receipt
+    );
+    let current = store.get_application(&app.app_id).await.unwrap().unwrap();
+    assert_eq!(current.active_operations.prod, Some(op.operation_id));
+    assert_eq!(current.runtime_policy, app.runtime_policy);
+}

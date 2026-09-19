@@ -266,7 +266,17 @@ impl DevServerManager {
                     old.request.expected_runtime_instance_id == request.expected_runtime_instance_id
                 })
             {
-                return Ok(false);
+                let remove_registration = remove_owner
+                    && state.owners.get(project).is_some_and(|owner| {
+                        owner.registration_operation_id.as_deref()
+                            == Some(request.operation_id.as_str())
+                            && owner.owner.runtime_instance_id
+                                == request.expected_runtime_instance_id
+                    });
+                if remove_registration {
+                    state.owners.remove(project);
+                }
+                return Ok(remove_registration);
             }
             let current = state
                 .intents
@@ -460,9 +470,8 @@ impl DevServerManager {
                 .unwrap_or_else(|| "unknown-app".into());
             super::owner_client::verify_project_identity(&identity, workspace, &app)?;
             ensure!(
-                identity.runtime_instance_id == intent.request.expected_runtime_instance_id
-                    && identity.workspace_id == intent.request.workspace_id,
-                "runtime owner changed; cannot resume old operation"
+                identity.workspace_id == intent.request.workspace_id,
+                "runtime workspace changed; cannot recover old operation"
             );
             let (_, token) = super::owner_client::find_owner_token(workspace, &app)
                 .context("runtime owner credentials unavailable")?;
@@ -471,8 +480,11 @@ impl DevServerManager {
             supplied.run_config = pg.map(|pg| shared_types::OperationRunConfig {
                 pg: Some(pg.clone()),
             });
-            // A completed receipt is query-only: pruning owner history must never replay old side effects.
-            let view = if completed {
+            let owner_changed =
+                identity.runtime_instance_id != intent.request.expected_runtime_instance_id;
+            // A new process may serve the old process's durable terminal history.
+            // Neither owner replacement nor completed receipts authorize replaying old writes.
+            let view = if completed || owner_changed {
                 if supplied.run_config.is_some() {
                     ensure!(
                         digest(&supplied)? == intent.digest,
@@ -483,12 +495,24 @@ impl DevServerManager {
                     "completed operation no longer retained by owner; replay prohibited",
                 )?;
                 verify_view(&view, &intent.request)?;
+                if owner_changed {
+                    ensure!(
+                        view.state.is_terminal(),
+                        "old owner operation is not confirmed terminal; recovery remains protected"
+                    );
+                    let expected_digest = shared_types::runtime_request_digest(&intent.request)
+                        .map_err(anyhow::Error::msg)?;
+                    ensure!(
+                        view.request_digest == expected_digest,
+                        "old owner operation digest mismatch; recovery remains protected"
+                    );
+                }
                 view
             } else {
                 self.resume_external_intent(project, &client, &intent, &supplied)
                     .await?
             };
-            if !completed
+            if (!completed || owner_changed)
                 && matches!(
                     view.state,
                     shared_types::RuntimeOperationState::Succeeded
@@ -499,8 +523,9 @@ impl DevServerManager {
                 self.finish_external_intent(
                     project,
                     &intent.request,
-                    view.kind == RuntimeOperationKind::Stop
-                        && view.state == shared_types::RuntimeOperationState::Succeeded,
+                    owner_changed
+                        || (view.kind == RuntimeOperationKind::Stop
+                            && view.state == shared_types::RuntimeOperationState::Succeeded),
                 )?;
             }
             Ok::<_, anyhow::Error>((intent.request.request_context, view))
@@ -656,6 +681,180 @@ mod tests {
                 .contains_key("project")
         );
         assert!(!manager.processes.lock().unwrap().contains_key("project"));
+    }
+
+    #[tokio::test]
+    async fn restarted_owner_only_closes_matching_terminal_history_without_replaying() {
+        for scenario in [
+            "succeeded",
+            "failed",
+            "cancelled",
+            "missing",
+            "unknown",
+            "wrong_instance",
+            "wrong_kind",
+            "wrong_digest",
+            "wrong_workspace",
+            "new_registration",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let application = std::env::var("PROJECT_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "unknown-app".into());
+            let token_root = dir.path().join(".app-cli-state").join(&application);
+            std::fs::create_dir_all(&token_root).unwrap();
+            std::fs::write(token_root.join("token"), "receipt-token").unwrap();
+            let original = request();
+            let mut receipt = RuntimeOperationView {
+                operation_id: original.operation_id.clone(),
+                kind: original.kind,
+                state: RuntimeOperationState::Succeeded,
+                request_digest: shared_types::runtime_request_digest(&original).unwrap(),
+                revision: 8,
+                runtime_instance_id: original.expected_runtime_instance_id.clone(),
+                error_code: None,
+                error_message: None,
+                failure_detail: None,
+            };
+            match scenario {
+                "failed" => receipt.state = RuntimeOperationState::Failed,
+                "cancelled" => receipt.state = RuntimeOperationState::Cancelled,
+                "unknown" => receipt.state = RuntimeOperationState::RecoveryRequired,
+                "wrong_instance" => receipt.runtime_instance_id = "unrelated-owner".into(),
+                "wrong_kind" => receipt.kind = RuntimeOperationKind::Stop,
+                "wrong_digest" => receipt.request_digest = "wrong".into(),
+                _ => {}
+            }
+            let identity = shared_types::RuntimeIdentityView {
+                application_id: application,
+                service_family: "userapp-dev".into(),
+                workspace_id: if scenario == "wrong_workspace" {
+                    "other-workspace"
+                } else {
+                    "workspace"
+                }
+                .into(),
+                source_root: workspace.to_string_lossy().into(),
+                runtime_instance_id: "replacement-owner".into(),
+                deployment_generation_id: "generation".into(),
+                protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+                capabilities: vec![],
+            };
+            let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let posted = posts.clone();
+            let server = axum::Router::new()
+                .route(
+                    "/v1/runtime/identity",
+                    axum::routing::get(move || {
+                        let identity = identity.clone();
+                        async move { axum::Json(serde_json::json!({"data":identity})) }
+                    }),
+                )
+                .route(
+                    "/v1/runtime/operations/{id}",
+                    axum::routing::get(move |headers: axum::http::HeaderMap| {
+                        let receipt = receipt.clone();
+                        async move {
+                            assert_eq!(headers["x-deploy-token"], "receipt-token");
+                            if scenario == "missing" {
+                                return (
+                                    axum::http::StatusCode::NOT_FOUND,
+                                    axum::Json(serde_json::json!({})),
+                                );
+                            }
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({"data": receipt})),
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/v1/runtime/operations",
+                    axum::routing::post(move || {
+                        let posted = posted.clone();
+                        async move {
+                            posted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, server).await.unwrap();
+            });
+            let manager = manager(dir.path());
+            manager
+                .prepare_external_intent("project", &workspace, &owner(&address), &original)
+                .unwrap();
+            if scenario == "new_registration" {
+                // Another admitted operation has already registered the replacement instance.
+                let mut stop = original.clone();
+                stop.operation_id = "new-stop".into();
+                stop.kind = RuntimeOperationKind::Stop;
+                stop.expected_runtime_instance_id = "replacement-owner".into();
+                let mut replacement = owner(&address);
+                replacement.runtime_instance_id = "replacement-owner".into();
+                manager
+                    .prepare_external_intent("project", &workspace, &replacement, &stop)
+                    .unwrap();
+            }
+            let result = manager
+                .recover_external_operation("project", &workspace, &original.operation_id, None)
+                .await;
+            let success = matches!(
+                scenario,
+                "succeeded" | "failed" | "cancelled" | "new_registration"
+            );
+            assert_eq!(result.is_ok(), success, "scenario {scenario}: {result:?}");
+            assert_eq!(
+                posts.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "old writes must never be replayed"
+            );
+            let state = manager.read_external_state().unwrap();
+            assert_eq!(
+                state.intents.contains_key(&key("project", original.kind)),
+                !success
+            );
+            if scenario == "new_registration" {
+                assert_eq!(
+                    state.owners["project"].registration_operation_id.as_deref(),
+                    Some("new-stop")
+                );
+                assert_eq!(
+                    manager.processes.lock().unwrap()["project"]
+                        .external_owner
+                        .as_ref()
+                        .unwrap()
+                        .runtime_instance_id,
+                    "replacement-owner"
+                );
+            } else if success {
+                assert!(!state.owners.contains_key("project"));
+                assert!(!manager.processes.lock().unwrap().contains_key("project"));
+                manager.ensure_new_build_admissible("project").unwrap();
+                // Re-querying the completed receipt remains read-only and idempotent.
+                assert!(
+                    manager
+                        .recover_external_operation(
+                            "project",
+                            &workspace,
+                            &original.operation_id,
+                            None
+                        )
+                        .await
+                        .is_ok()
+                );
+            } else {
+                assert!(manager.ensure_new_build_admissible("project").is_err());
+            }
+            server.abort();
+        }
     }
 
     #[derive(Default)]

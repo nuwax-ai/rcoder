@@ -443,7 +443,7 @@ impl DevServerManager {
     /// 复用提交的运行形态（R03）：Source = 平台已就绪的 workspace 直接编排；
     /// Artifact = 平台只登记制品（共享卷 builds/ zip），激活由 owner 在
     /// 身份/revision 核验后执行——提交拒绝不改变 active 运行目录。
-    async fn reuse_or_refuse_owner(
+    pub(super) async fn reuse_or_refuse_owner(
         &self,
         project_id: &str,
         project_path: &Path,
@@ -1018,6 +1018,101 @@ mod owner_reuse_tests {
             message.contains("different app-cli owner"),
             "diagnostic should name the conflict: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_restart_attaches_verified_owner_without_prior_registration_or_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root = dir.path().join(".app-cli-state/unknown-app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("token"), "test-token").unwrap();
+        let requests = Arc::new(Mutex::new(
+            Vec::<shared_types::RuntimeOperationRequest>::new(),
+        ));
+        let captured = requests.clone();
+        let router = mock_owner_router("hashed-workspace", &workspace)
+            .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let captured = captured.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST {
+                            assert_eq!(request.headers()["x-deploy-token"], "test-token");
+                            let (parts, body) = request.into_parts();
+                            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::from_slice(&bytes).unwrap());
+                            next.run(axum::extract::Request::from_parts(
+                                parts,
+                                axum::body::Body::from(bytes),
+                            ))
+                            .await
+                        } else {
+                            next.run(request).await
+                        }
+                    }
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.log_base_dir = dir.path().join("logs");
+        config.app_cli_admin_probe_addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let manager = DevServerManager::new(Arc::new(config));
+        assert!(manager.list_dev().unwrap().is_empty());
+        manager
+            .restart_dev(
+                "userapp:123",
+                &workspace,
+                None,
+                None,
+                None,
+                Some("new-explicit-task"),
+            )
+            .await
+            .unwrap();
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                1,
+                "Restart must not issue a preliminary Stop"
+            );
+            assert_eq!(
+                requests[0].kind,
+                shared_types::RuntimeOperationKind::Restart
+            );
+            assert_eq!(requests[0].expected_runtime_instance_id, "instance-test");
+            assert_eq!(
+                requests[0].request_context.as_deref(),
+                Some("new-explicit-task")
+            );
+            assert_eq!(requests[0].expected_revision, 0);
+        }
+        // A different canonical project must not use the same authenticated control endpoint.
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(
+            manager
+                .restart_dev(
+                    "userapp:456",
+                    &other,
+                    None,
+                    None,
+                    None,
+                    Some("foreign-task")
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
     }
 
     /// HttpResult 信封（wire 层格式手拼 OK；data 载荷一律 typed 构造——

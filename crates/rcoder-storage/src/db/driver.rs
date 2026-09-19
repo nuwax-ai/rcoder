@@ -16,11 +16,10 @@ use toasty_core::{
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ConnectionPolicy {
+    #[cfg(feature = "userapp-turso")]
     Turso,
     #[cfg(feature = "pg")]
-    Postgres {
-        statement_timeout_ms: u32,
-    },
+    Postgres { statement_timeout_ms: u32 },
 }
 
 pub(crate) struct PolicyDriver {
@@ -89,6 +88,7 @@ impl PolicyConnection {
         }
         let result: Result<()> = async {
             match self.policy {
+                #[cfg(feature = "userapp-turso")]
                 ConnectionPolicy::Turso => {
                     self.check_pragma(schema, "PRAGMA journal_mode=wal", "wal")
                         .await?;
@@ -148,6 +148,7 @@ impl PolicyConnection {
             .await?;
         Ok(())
     }
+    #[cfg(feature = "userapp-turso")]
     async fn check_pragma(
         &mut self,
         schema: &Arc<Schema>,

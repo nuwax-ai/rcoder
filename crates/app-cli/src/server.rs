@@ -798,6 +798,7 @@ impl ServerState {
             journal
                 .write(Receipt {
                     generation: self.generation.clone(),
+                    generation_handoff: None,
                     operation: operation.clone(),
                     request: req.clone(),
                     boundary: Boundary::Preparing,
@@ -906,6 +907,7 @@ impl ServerState {
         };
         journal.write(Receipt {
             generation: self.generation.clone(),
+            generation_handoff: None,
             operation: operation.clone(),
             request: request.clone(),
             boundary: Boundary::Preparing,
@@ -1558,7 +1560,15 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
             Err(error) => {
                 tracing::error!(%error, "Deployment startup reconciliation failed");
                 state.ready.set_ready(false);
-                if let Err(persist_error) =
+                if state
+                    .configuration_gate()
+                    .is_some_and(|gate| gate.handoff().is_some() && gate.prepared().is_none())
+                {
+                    // A rejected handoff must not rewrite the prior generation's
+                    // confirmed journal as a failure of this unauthorized owner.
+                    state.begin_runtime_recovery_hold();
+                    state.begin_failure(format!("generation handoff: {error:#}"), true);
+                } else if let Err(persist_error) =
                     state.fail_operation(format!("deployment startup: {error:#}"), Boundary::Failed)
                 {
                     state.begin_failure(
@@ -1941,6 +1951,145 @@ fn execution_workspace(
     }
 }
 
+/// Called only after lock acquisition, API binding, prior owner quiescence and
+/// kernel recovery. The trusted replacement authorization does not authorize an
+/// unknown journal boundary, migration, or runtime operation.
+fn prepare_generation_handoff(args: &RuntimeArgs, state: &ServerState) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let Some(gate) = state.configuration_gate() else {
+        return Ok(());
+    };
+    let Some(authorization) = gate.handoff() else {
+        return Ok(());
+    };
+    authorization.validate().map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        authorization.activation.deployment_generation == state.generation,
+        "handoff destination generation mismatch"
+    );
+    let kernel = state
+        .runtime_kernel()
+        .context("handoff requires runtime kernel")?;
+    anyhow::ensure!(
+        !kernel.recovery_protection_active(),
+        "handoff blocked by runtime recovery"
+    );
+    let (desired, revision) = kernel.store().load_desired()?;
+    let mut guard = state
+        .journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?;
+    let journal = guard
+        .as_mut()
+        .context("handoff requires deployment journal")?;
+    let mut receipt = journal
+        .receipt
+        .clone()
+        .context("handoff requires confirmed active artifact")?;
+    let replay = receipt.generation == state.generation;
+    let prior = receipt.generation_handoff.clone();
+    if replay {
+        anyhow::ensure!(
+            prior
+                .as_ref()
+                .is_some_and(|value| value.authorization == *authorization),
+            "destination generation has no matching handoff receipt"
+        );
+    } else {
+        anyhow::ensure!(
+            receipt.generation == authorization.previous_generation,
+            "handoff source generation mismatch"
+        );
+    }
+    anyhow::ensure!(
+        matches!(receipt.boundary, Boundary::Active | Boundary::StartupFailed),
+        "handoff requires confirmed active or startup-failed boundary"
+    );
+    let active = receipt
+        .active
+        .as_ref()
+        .context("handoff has no active artifact")?;
+    let request = active
+        .request
+        .as_ref()
+        .context("handoff active artifact has no execution target receipt")?;
+    anyhow::ensure!(
+        request.local_path.is_none() || request.execution_target.is_some(),
+        "handoff local artifact has no execution target"
+    );
+    let workspace = execution_workspace(&args.workspace, request.execution_target);
+    // Check both possible historical roots. Never use a changed execution target
+    // to evade an unresolved SQL receipt left under the owner workspace.
+    crate::migration_journal::require_confirmed_migrations(&args.workspace)?;
+    crate::migration_journal::require_confirmed_migrations(&workspace)?;
+    let release = crate::manifest::read_release_lock(&workspace)?;
+    anyhow::ensure!(
+        release.release_id == active.artifact_release_id,
+        "handoff active artifact differs from release lock"
+    );
+    let release_hash = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(workspace.join("release.lock.toml"))?)
+    );
+    let workspace_name = workspace
+        .to_str()
+        .context("handoff workspace is not UTF-8")?
+        .to_owned();
+    let prepared = if let Some(prepared) = prior.filter(|_| replay) {
+        anyhow::ensure!(
+            prepared.release_manifest_sha256 == release_hash
+                && prepared.artifact_release_id == release.release_id
+                && prepared.execution_workspace == workspace_name,
+            "handoff artifact changed after preparation"
+        );
+        prepared
+    } else {
+        shared_types::RuntimeGenerationPrepared {
+            authorization: authorization.clone(),
+            artifact_release_id: release.release_id.clone(),
+            release_manifest_sha256: release_hash,
+            previous_journal_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(&receipt)?)),
+            execution_workspace: workspace_name,
+            desired_revision: revision,
+        }
+    };
+    let authorized_revision = prepared
+        .desired_revision
+        .checked_add(1)
+        .context("handoff desired revision exhausted")?;
+    if replay && revision > authorized_revision {
+        // A later explicit operation consumed/superseded this startup intent.
+        // Normal recovery follows desired state; do not publish old authorization
+        // as a fresh prepared response and do not change desired again.
+        return Ok(());
+    }
+    // Once a later Stop has advanced desired, persistent container env is no
+    // longer a fresh Start request. It cannot revive business on Pod recreation.
+    anyhow::ensure!(
+        revision == prepared.desired_revision
+            || (revision == authorized_revision && desired == shared_types::DesiredState::Running),
+        "handoff startup intent was superseded by another desired-state operation"
+    );
+    if !replay {
+        receipt.generation = state.generation.clone();
+        receipt.operation.operation_id = authorization.activation.operation_id.clone();
+        receipt.operation.deployment_generation_id = state.generation.clone();
+        receipt.operation.error = None;
+        receipt.boundary = Boundary::Active;
+        receipt.generation_handoff = Some(prepared.clone());
+        journal.write(receipt)?;
+    }
+    if revision == prepared.desired_revision {
+        kernel
+            .store()
+            .store_desired(shared_types::DesiredState::Running, authorized_revision)?;
+    }
+    // The management API cannot acknowledge preparation until both durable
+    // transitions have completed; a crash between them replays the same intent.
+    gate.publish_prepared(prepared)?;
+    Ok(())
+}
+
 fn restored_runtime_args(args: &RuntimeArgs, state: &ServerState) -> Result<RuntimeArgs> {
     let receipt = state
         .journal
@@ -1987,11 +2136,24 @@ async fn initialize_startup(
     args: &RuntimeArgs,
     state: &ServerState,
 ) -> Result<Option<InitialAction>> {
+    prepare_generation_handoff(args, state)?;
     let restored = restored_runtime_args(args, state)?;
     let args = &restored;
     if let Err(error) = crate::migration_journal::require_confirmed_migrations(&args.workspace) {
         state.begin_runtime_recovery_hold();
         return Err(error).context("database migration requires reconciliation");
+    }
+    // Decide automatic recovery before generating Switching. Stopped must not
+    // leave a false interrupted-switch journal when no business was started.
+    if !crate::deploy::deploy_requested()
+        && state
+            .runtime_kernel()
+            .map(|kernel| kernel.store().load_desired())
+            .transpose()?
+            .is_some_and(|(desired, _)| desired == shared_types::DesiredState::Stopped)
+    {
+        state.set_phase(ServerPhase::Idle);
+        return Ok(None);
     }
     if let Some(gate) = state.configuration_gate() {
         tracing::info!("Management ready; waiting for captured runtime configuration activation");
@@ -3387,6 +3549,259 @@ format = "jsonl"
                 assert_eq!(id, runtime_workspace_id(&alias));
             }
         }
+    }
+
+    fn handoff_fixture(dir: &std::path::Path, stopped: bool) -> (RuntimeArgs, ServerState) {
+        let workspace = dir.join("code");
+        let run = workspace.join(".run");
+        std::fs::create_dir_all(&run).unwrap();
+        let artifact = release("hot-artifact-b");
+        std::fs::write(
+            run.join("release.lock.toml"),
+            toml::to_string(&artifact).unwrap(),
+        )
+        .unwrap();
+        let mut first = state();
+        first.generation = "generation-a".into();
+        *first.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
+        let mut deploy = request();
+        deploy.execution_target = Some(ExecutionTarget::ProjectRun);
+        first
+            .try_accept_deploy_with_id(deploy, "hot-b".into())
+            .unwrap();
+        first.set_release(artifact);
+        first.complete_stage().unwrap();
+        first.complete_running().unwrap();
+        drop(first);
+        let mut next = state();
+        next.generation = "configuration-c".into();
+        let authorization = shared_types::RuntimeGenerationHandoff {
+            protocol_version: 1,
+            app_id: "app1".into(),
+            lifecycle_id: "life1".into(),
+            previous_generation: "generation-a".into(),
+            previous_resource_uid: "old-physical-uid".into(),
+            previous_resource_name: "old-container".into(),
+            activation: shared_types::RuntimeConfigurationActivation {
+                operation_id: next.generation.clone(),
+                deployment_generation: next.generation.clone(),
+                config_version: 2,
+            },
+        };
+        next.configuration_gate = Some(Arc::new(
+            crate::configuration_gate::ConfigurationGate::for_handoff(
+                dir.to_path_buf(),
+                authorization,
+            ),
+        ));
+        *next.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
+        let kernel = kernel_for(dir);
+        kernel
+            .store()
+            .store_desired(
+                if stopped {
+                    shared_types::DesiredState::Stopped
+                } else {
+                    shared_types::DesiredState::Running
+                },
+                7,
+            )
+            .unwrap();
+        next.set_runtime_kernel(kernel);
+        (
+            RuntimeArgs {
+                workspace,
+                ..Default::default()
+            },
+            next,
+        )
+    }
+
+    #[test]
+    fn configuration_handoff_preserves_hot_artifact_and_explicitly_starts_stopped_owner() {
+        for stopped in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (args, state) = handoff_fixture(root.path(), stopped);
+            let bytes = std::fs::read(args.workspace.join(".run/release.lock.toml")).unwrap();
+            prepare_generation_handoff(&args, &state).unwrap();
+            let gate = state.configuration_gate().unwrap();
+            let prepared = gate.prepared().unwrap();
+            assert_eq!(prepared.artifact_release_id, "hot-artifact-b");
+            assert_eq!(prepared.desired_revision, 7);
+            assert_eq!(
+                state
+                    .runtime_kernel()
+                    .unwrap()
+                    .store()
+                    .load_desired()
+                    .unwrap(),
+                (shared_types::DesiredState::Running, 8)
+            );
+            assert_eq!(
+                restored_runtime_args(&args, &state).unwrap().workspace,
+                args.workspace.join(".run")
+            );
+            assert_eq!(
+                std::fs::read(args.workspace.join(".run/release.lock.toml")).unwrap(),
+                bytes
+            );
+            prepare_generation_handoff(&args, &state).unwrap();
+            assert_eq!(gate.prepared(), Some(prepared));
+            let journal = state.journal.lock().unwrap();
+            let receipt = journal.as_ref().unwrap().receipt.as_ref().unwrap();
+            assert_eq!(receipt.generation, "configuration-c");
+            assert_eq!(receipt.operation.operation_id, "configuration-c");
+            assert_eq!(
+                receipt
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .request
+                    .as_ref()
+                    .unwrap()
+                    .url,
+                "http://artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_handoff_refuses_unknown_boundary_wrong_generation_or_changed_manifest() {
+        for fault in ["switching", "generation", "artifact", "migration"] {
+            let root = tempfile::tempdir().unwrap();
+            let (args, state) = handoff_fixture(root.path(), false);
+            {
+                let mut guard = state.journal.lock().unwrap();
+                let journal = guard.as_mut().unwrap();
+                let mut receipt = journal.receipt.clone().unwrap();
+                match fault {
+                    "switching" => receipt.boundary = Boundary::Switching,
+                    "generation" => receipt.generation = "wrong-generation".into(),
+                    "artifact" => {
+                        receipt.active.as_mut().unwrap().artifact_release_id =
+                            "wrong-release".into()
+                    }
+                    "migration" => {
+                        let receipts = args.workspace.join("migration-receipts");
+                        std::fs::create_dir_all(&receipts).unwrap();
+                        std::fs::write(
+                            receipts.join("unknown.json"),
+                            r#"{"identity":"sql","completed":false}"#,
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                journal.write(receipt).unwrap();
+            }
+            let before = serde_json::to_value(
+                state
+                    .journal
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .receipt
+                    .as_ref(),
+            )
+            .unwrap();
+            assert!(
+                prepare_generation_handoff(&args, &state).is_err(),
+                "{fault}"
+            );
+            assert!(state.configuration_gate().unwrap().prepared().is_none());
+            assert_eq!(
+                serde_json::to_value(
+                    state
+                        .journal
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .receipt
+                        .as_ref()
+                )
+                .unwrap(),
+                before
+            );
+            assert_eq!(
+                state
+                    .runtime_kernel()
+                    .unwrap()
+                    .store()
+                    .load_desired()
+                    .unwrap()
+                    .1,
+                7
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configuration_handoff_replay_cannot_revive_later_stop_or_write_switching() {
+        let root = tempfile::tempdir().unwrap();
+        let (args, state) = handoff_fixture(root.path(), true);
+        prepare_generation_handoff(&args, &state).unwrap();
+        state
+            .runtime_kernel()
+            .unwrap()
+            .store()
+            .store_desired(shared_types::DesiredState::Stopped, 9)
+            .unwrap();
+        assert!(initialize_startup(&args, &state).await.unwrap().is_none());
+        assert_eq!(
+            state
+                .runtime_kernel()
+                .unwrap()
+                .store()
+                .load_desired()
+                .unwrap(),
+            (shared_types::DesiredState::Stopped, 9)
+        );
+        assert_eq!(
+            state
+                .journal
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .receipt
+                .as_ref()
+                .unwrap()
+                .boundary,
+            Boundary::Active
+        );
+    }
+
+    #[test]
+    fn configuration_handoff_resume_between_journal_and_desired_commit_uses_original_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let (args, state) = handoff_fixture(root.path(), true);
+        prepare_generation_handoff(&args, &state).unwrap();
+        // Reproduce the durable state visible if the process disappeared after
+        // the atomic journal write but before desired committed.
+        state
+            .runtime_kernel()
+            .unwrap()
+            .store()
+            .store_desired(shared_types::DesiredState::Stopped, 7)
+            .unwrap();
+        prepare_generation_handoff(&args, &state).unwrap();
+        assert_eq!(
+            state
+                .runtime_kernel()
+                .unwrap()
+                .store()
+                .load_desired()
+                .unwrap(),
+            (shared_types::DesiredState::Running, 8)
+        );
+        std::fs::write(
+            args.workspace.join(".run/release.lock.toml"),
+            toml::to_string(&release("other-artifact")).unwrap(),
+        )
+        .unwrap();
+        assert!(prepare_generation_handoff(&args, &state).is_err());
     }
 
     #[tokio::test]

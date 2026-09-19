@@ -33,6 +33,7 @@ pub(crate) struct MockRuntime {
         std::sync::Mutex<std::collections::VecDeque<container_runtime_api::ExecResult>>,
     pub configuration_commands: std::sync::Mutex<Vec<Vec<String>>>,
     pub configuration_targets: std::sync::Mutex<Vec<shared_types::RuntimeConfigurationTarget>>,
+    pub mutation_uid_override: std::sync::Mutex<Option<String>>,
     pub scale_calls: AtomicUsize,
     pub management_start_calls: AtomicUsize,
     pub lease_held: Arc<AtomicBool>,
@@ -292,6 +293,25 @@ impl UserAppDeploymentRuntime for MockRuntime {
         }
     }
 
+    async fn release_app_operation_receipt(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<()> {
+        let expected = MockOperationLease(
+            self.lease_held.clone(),
+            context.app_id.clone(),
+            ServiceType::Userapp,
+        );
+        if shared_types::AppOperationLease::receipt(&expected).as_ref() != Some(receipt) {
+            return Err(ContainerRuntimeError::Conflict(
+                "Lease receipt changed".into(),
+            ));
+        }
+        self.lease_held.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
     async fn acquire_builder_family_operation(
         &self,
         app_id: &str,
@@ -452,7 +472,12 @@ impl UserAppDeploymentRuntime for MockRuntime {
             resource: shared_types::AppResourceIdentity {
                 kind: shared_types::AppResourceKind::Deployment,
                 name: context.app_id.clone(),
-                uid: format!("test-{}", context.lifecycle_id),
+                uid: self
+                    .mutation_uid_override
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| format!("test-{}", context.lifecycle_id)),
                 resource_version: status.resource_version,
             },
         })

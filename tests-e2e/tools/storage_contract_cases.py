@@ -21,6 +21,8 @@ PG_EXTRA_TARGETS = {
 } | {
     'PG independent owner scope CAS and bounded waits':
         'userapp_lifecycle::common::concurrency_tests::independent_pg_owners_enforce_scope_cas_and_bound_lock_waits',
+    'PG preparation recovery independent owner CAS and retained fence':
+        'userapp_lifecycle::common::concurrency_tests::independent_pg_preparation_recovery_has_one_winner_and_retains_fence',
     'PG lifecycle-bound activity':
         'userapp_lifecycle::common::activity_tests::pg_activity_is_monotonic_and_lifecycle_bound',
     'PG Preview contract': 'preview_lifecycle::pg_tests::pg_preview_store_satisfies_contract',

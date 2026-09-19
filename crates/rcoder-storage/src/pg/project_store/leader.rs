@@ -21,6 +21,10 @@ use tracing::{info, warn};
 /// 抢锁/保活轮询间隔（故障切换时延上限 ≈ 本间隔 + 连接超时）
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
+#[path = "leader_fault_tests.rs"]
+mod fault_tests;
+
 /// 全集群 leader 锁 key（"rcoder" ASCII 常量，跨版本稳定——改它会让滚动升级期间双主）
 pub const LEADER_LOCK_KEY: i64 = 0x7263_6f64_6572;
 

@@ -687,6 +687,80 @@ pub(super) async fn finalize_password_recovery(
     Ok(op)
 }
 
+pub(super) async fn confirm_database_preparation_recovery(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &UserAppOperationRecord,
+    evidence: &DatabasePreparationEvidence,
+) -> Result<UserAppOperationRecord, Error> {
+    let (mut app, mut op) = current(
+        tx,
+        backend,
+        &snapshot.app_id,
+        &snapshot.operation_id,
+        &snapshot.lifecycle_id,
+    )
+    .await?;
+    if op != *snapshot
+        || !matches!(
+            op.state,
+            UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
+        )
+    {
+        return Err(Error::VersionConflict);
+    }
+    domain::validate_active(&app)?;
+    let before: DatabasePreparationEvidence =
+        serde_json::from_value(op.checkpoint.clone()).map_err(storage)?;
+    before
+        .validate_operation(&op)
+        .map_err(Error::InvalidOperation)?;
+    evidence
+        .validate_operation(&op)
+        .map_err(Error::InvalidOperation)?;
+    if before.stage != DatabasePreparationStage::StartSubmitted
+        || evidence.stage != DatabasePreparationStage::ManagementReady
+        || before.target != evidence.target
+        || before.deployment_generation != evidence.deployment_generation
+    {
+        return Err(Error::InvalidOperation(
+            "Management recovery evidence changed identity or stage".into(),
+        ));
+    }
+    let lease = get_operation_lease(tx, backend, &op.app_id, &op.operation_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if lease.context != evidence.target.context || !owns(&lease.context, &op) {
+        return Err(Error::VersionConflict);
+    }
+    let before_app = app.clone();
+    op.state = UserAppOperationState::Running;
+    let progress = UserAppOperationProgress {
+        app_id: op.app_id.clone(),
+        lifecycle_id: op.lifecycle_id.clone(),
+        operation_id: op.operation_id.clone(),
+        expected_revision: op.revision,
+        executor_id: evidence.target.context.executor_id.clone(),
+        state: UserAppOperationState::Running,
+        step: "database_management".into(),
+        checkpoint: serde_json::to_value(evidence).map_err(storage)?,
+        error_code: None,
+        error_message: None,
+    };
+    domain::advance(&mut app, &mut op, &progress)?;
+    repo::save_operation(tx, backend, &op, snapshot).await?;
+    repo::save_app(
+        tx,
+        backend,
+        &app,
+        &before_app.lifecycle_id,
+        before_app.metadata_revision,
+    )
+    .await?;
+    repo::save_slots(tx, backend, &app, &before_app).await?;
+    Ok(op)
+}
+
 pub(super) async fn reserve_completed_operation(
     tx: &mut dyn Executor,
     backend: Backend,
@@ -889,6 +963,7 @@ pub(super) async fn recreate(
     Ok(app)
 }
 
+#[cfg(feature = "userapp-turso")]
 pub(super) async fn quarantine_local_restart(
     tx: &mut dyn Executor,
     backend: Backend,

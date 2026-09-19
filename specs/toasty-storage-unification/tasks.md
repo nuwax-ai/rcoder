@@ -33,9 +33,9 @@ UserApp、Preview、ProjectStore 与 Activity 的 Toasty 实现及 SQLx 移除�
 ## T5：验证与交付
 
 - [ ] 聚焦 nextest：存储与消费方，默认、PG 与全 features；保留实际测试数、命令和退出码。
-- [ ] `cargo fmt --all -- --check`、受影响 feature 的 clippy。
-- [ ] `cargo nextest run --workspace --no-fail-fast --all-features`；额外检查默认 features。Cargo 任务串行，不共用 target 并发运行。
-- [ ] app-cli 只有在共享依赖或代码受影响时执行独立项目检查，根测试不能代替它。
+- [x] `cargo fmt --all -- --check`、受影响 feature 的 clippy。 基线 `e3959112` 已通过，见 verification 的集中回归记录；后续修改仍须补受影响检查。
+- [x] `cargo nextest run --workspace --no-fail-fast --all-features`；额外检查默认 features。Cargo 任务串行，不共用 target 并发运行。 基线 `e3959112` 已通过，见 verification 的集中回归记录；后续修改仍须补受影响检查。
+- [x] app-cli 只有在共享依赖或代码受影响时执行独立项目检查，根测试不能代替它。 基线 `e3959112` 已通过，见 verification 的集中回归记录；后续修改仍须补受影响检查。
 - [ ] 本地 Compose：完整 test-e2e，含 UserApp 开发/生产、并发作用域、失败重试、重启恢复与文件代理。
 - [ ] 对已授权的个人测试 PG 执行一次性重建：读取私有配置核验目标、停止旧写入者、记录并处理旧运行资源归属、重建目标 database、启动新双副本。记录非敏感对象清单与结果，不在报告写凭据。
 - [ ] remote K8s：重建完成后 verify 部署当前快照，再对同一快照运行 UserApp、Chat 和受影响 Preview/Gateway 场景；补 PG 双副本争用、数据库断连恢复、关机期间写入等缺失覆盖。

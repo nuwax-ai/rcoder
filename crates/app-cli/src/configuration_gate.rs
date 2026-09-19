@@ -8,6 +8,8 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct ConfigurationGate {
     expected: RuntimeConfigurationActivation,
     path: PathBuf,
+    handoff: Option<shared_types::RuntimeGenerationHandoff>,
+    prepared: std::sync::OnceLock<shared_types::RuntimeGenerationPrepared>,
 }
 
 impl ConfigurationGate {
@@ -33,7 +35,28 @@ impl ConfigurationGate {
             deployment_generation: std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
                 .context("managed configuration requires deployment generation")?,
         };
-        Self::new(root, expected).map(Some)
+        let mut gate = Self::new(root, expected)?;
+        gate.handoff = std::env::var(shared_types::APP_RUNTIME_GENERATION_HANDOFF)
+            .map(Some)
+            .or_else(|error| match error {
+                std::env::VarError::NotPresent => Ok(None),
+                other => Err(other),
+            })?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .context("decode generation handoff authorization")?;
+        if let Some(handoff) = &gate.handoff {
+            handoff.validate().map_err(anyhow::Error::msg)?;
+            ensure!(
+                std::env::var("APP_ID").ok().as_deref() == Some(handoff.app_id.as_str()),
+                "handoff application identity mismatch"
+            );
+            ensure!(
+                handoff.activation == gate.expected,
+                "handoff activation identity mismatch"
+            );
+        }
+        Ok(Some(gate))
     }
 
     fn new(root: PathBuf, expected: RuntimeConfigurationActivation) -> Result<Self> {
@@ -46,7 +69,44 @@ impl ConfigurationGate {
         Ok(Self {
             expected,
             path: root.join("runtime-configuration-activation.json"),
+            handoff: None,
+            prepared: std::sync::OnceLock::new(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_handoff(
+        root: PathBuf,
+        handoff: shared_types::RuntimeGenerationHandoff,
+    ) -> Self {
+        let mut gate = Self::new(root, handoff.activation.clone()).unwrap();
+        gate.handoff = Some(handoff);
+        gate
+    }
+
+    pub fn handoff(&self) -> Option<&shared_types::RuntimeGenerationHandoff> {
+        self.handoff.as_ref()
+    }
+
+    pub fn publish_prepared(
+        &self,
+        prepared: shared_types::RuntimeGenerationPrepared,
+    ) -> Result<()> {
+        ensure!(
+            self.handoff.as_ref() == Some(&prepared.authorization),
+            "prepared handoff identity mismatch"
+        );
+        if let Some(existing) = self.prepared.get() {
+            ensure!(existing == &prepared, "prepared handoff changed");
+            return Ok(());
+        }
+        self.prepared
+            .set(prepared)
+            .map_err(|_| anyhow::anyhow!("prepared handoff already published"))
+    }
+
+    pub fn prepared(&self) -> Option<&shared_types::RuntimeGenerationPrepared> {
+        self.prepared.get()
     }
 
     fn receipt(&self) -> Result<Option<RuntimeConfigurationActivation>> {
@@ -74,6 +134,10 @@ impl ConfigurationGate {
         ensure!(
             *receipt == self.expected,
             "configuration activation identity does not match this generation"
+        );
+        ensure!(
+            self.handoff.is_none() || self.prepared.get().is_some(),
+            "generation handoff has not been prepared"
         );
         // Corrupt or unreadable prior state is not silently replaced.
         if self.receipt()?.as_ref() == Some(receipt) {

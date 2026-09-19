@@ -193,6 +193,8 @@ impl AppService {
             .bind_runtime_configuration_target(context, captured.config_version, &target)
             .await?;
         let activation = async {
+            self.verify_generation_handoff(context, &target, captured.config_version, deadline)
+                .await?;
             let admin = self
                 .wait_for_configuration_postgres(context, &target, deadline)
                 .await?;
@@ -207,6 +209,118 @@ impl AppService {
         })??;
         self.wait_configuration_business(context, &target, captured.config_version, deadline)
             .await
+    }
+
+    /// Read-only barrier before any credential command. Its expected value comes
+    /// from the original durable update checkpoint, never from container env.
+    async fn verify_generation_handoff(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        target: &shared_types::RuntimeConfigurationTarget,
+        config_version: i64,
+        deadline: tokio::time::Instant,
+    ) -> AppResult<()> {
+        use shared_types::PgCommandRunner as _;
+        let operation = self
+            .metadata
+            .store
+            .get_operation(&context.app_id, &context.operation_id)
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::InvalidState("Configuration operation is missing".into())
+            })?;
+        let Some(value) = operation.checkpoint.get("generation_handoff") else {
+            return Ok(());
+        };
+        let expected: shared_types::RuntimeGenerationHandoff =
+            serde_json::from_value(value.clone()).map_err(|_| {
+                AppOperationError::InvalidState("Generation handoff checkpoint is invalid".into())
+            })?;
+        expected.validate().map_err(AppOperationError::Validation)?;
+        if expected.app_id != context.app_id
+            || expected.lifecycle_id != context.lifecycle_id
+            || expected.activation.operation_id != context.operation_id
+            || expected.activation.deployment_generation != target.deployment_generation
+            || expected.activation.config_version != config_version
+        {
+            return Err(AppOperationError::InvalidState(
+                "Generation handoff checkpoint identity mismatch".into(),
+            ));
+        }
+        let runner = BoundManagementRunner {
+            service: self,
+            context,
+            target,
+        };
+        let command = "curl --silent --show-error --fail-with-body --connect-timeout 3 --max-time 5 --noproxy '*' -H \"x-deploy-token: $APP_CLI_DEPLOY_TOKEN\" http://127.0.0.1:3010/v1/runtime/configuration/prepared";
+        loop {
+            let reply = tokio::time::timeout_at(deadline, runner.run(command)).await;
+            if let Ok(Ok(reply)) = reply {
+                if reply.exit_code == 22 {
+                    return Err(AppOperationError::InvalidState("Generation handoff rejected by management owner before credential mutation".into()));
+                }
+                if reply.exit_code != 0 {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep_until(std::cmp::min(
+                        deadline,
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(250),
+                    ))
+                    .await;
+                    continue;
+                }
+                let envelope: serde_json::Value =
+                    serde_json::from_str(&reply.stdout).map_err(|_| {
+                        AppOperationError::InvalidState(
+                            "Malformed handoff preparation response".into(),
+                        )
+                    })?;
+                if envelope["code"] == "HANDOFF_PENDING" && envelope["success"] == false {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep_until(std::cmp::min(
+                        deadline,
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(250),
+                    ))
+                    .await;
+                    continue;
+                }
+                let prepared: shared_types::RuntimeGenerationPrepared =
+                    serde_json::from_value(envelope["data"].clone()).map_err(|_| {
+                        AppOperationError::InvalidState(
+                            "Invalid handoff preparation receipt".into(),
+                        )
+                    })?;
+                let digest = |value: &str| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                };
+                if envelope["success"] != true
+                    || prepared.authorization != expected
+                    || prepared.artifact_release_id.trim().is_empty()
+                    || prepared.execution_workspace.trim().is_empty()
+                    || !digest(&prepared.release_manifest_sha256)
+                    || !digest(&prepared.previous_journal_sha256)
+                {
+                    return Err(AppOperationError::InvalidState(
+                        "Generation handoff preparation evidence mismatch".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AppOperationError::InvalidState("Generation handoff did not confirm before credential mutation; original operation remains protected".into()));
+            }
+            tokio::time::sleep_until(std::cmp::min(
+                deadline,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(250),
+            ))
+            .await;
+        }
+        Err(AppOperationError::InvalidState(
+            "Generation handoff did not confirm before credential mutation".into(),
+        ))
     }
 
     async fn wait_configuration_business(
