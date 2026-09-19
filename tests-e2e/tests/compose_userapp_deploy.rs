@@ -1069,6 +1069,42 @@ async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str
 
 /// C4 app-files prod：upload → files → delete + upload-from-url（制品回灌）。
 async fn verify_app_files_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
+    // 部署 API 的同步等待边界 = 部署段完成（服务启动结果异步可见，start.rs
+    // 模块文档明示）；app-cli 业务编排（7 服务 PG migrate → 静态托管 →
+    // 60000 分流代理）在部署返回后继续进行（实测 60-90s）。文件操作打
+    // 60000——有界等待可达后再断言（超时则断言自然带最后错误失败）。
+    {
+        let deadline = Instant::now() + Duration::from_secs(150);
+        loop {
+            let reached = match env
+                .http
+                .get(format!(
+                    "{}/api/v1/userapp/{app}/prod/files?user_id={user}&path=probe-upload",
+                    env.rcoder
+                ))
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+            {
+                // 连接层失败（error sending request）或 200+ERR_BACKEND_ERROR
+                // 转发失败信封 = 容器 60000 分流代理未就绪——继续等
+                Err(_) => false,
+                Ok(response) if response.status().as_u16() == 502 => false,
+                Ok(response) => {
+                    let body: Value = response.json().await.unwrap_or(Value::Null);
+                    let forward_pending = body["code"].as_str() == Some("ERR_BACKEND_ERROR")
+                        && body["message"]
+                            .as_str()
+                            .is_some_and(|m| m.contains("error sending request"));
+                    !forward_pending
+                }
+            };
+            if reached || Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
     // upload（multipart）
     let part = reqwest::multipart::Part::bytes(b"prod-files-probe").file_name("probe.txt");
     let form = reqwest::multipart::Form::new()
