@@ -237,7 +237,7 @@ pub fn map_container_work_dir_to_host(
     work_dir_id: &str,
     user_id: &str,
 ) -> Result<Option<PathBuf>, PathValidationError> {
-    let suffix = if work_dir_id == "/home/user" {
+    let suffix = if work_dir_id == shared_types::paths::COMPUTER_AGENT_MOUNT_ROOT {
         ""
     } else {
         // 精确到 `/` 边界：`/home/userX` 不视为用户根内路径（容器内是另一目录）

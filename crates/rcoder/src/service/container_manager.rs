@@ -243,14 +243,14 @@ pub fn generate_project_id() -> String {
 
 /// 获取 project_id 的 workspace_path
 pub async fn get_project_workspace(project_id: &str) -> Result<std::path::PathBuf, AppError> {
-    let workspace_dir = std::path::PathBuf::from("/app/project_workspace");
+    let workspace_dir = std::path::PathBuf::from(shared_types::paths::WORKSPACE_ROOT);
     let project_dir = workspace_dir.join(project_id);
     Ok(project_dir)
 }
 
 /// 创建项目工作目录
 pub async fn create_project_workspace(project_id: &str) -> Result<std::path::PathBuf, AppError> {
-    let workspace_dir = std::path::PathBuf::from("/app/project_workspace");
+    let workspace_dir = std::path::PathBuf::from(shared_types::paths::WORKSPACE_ROOT);
 
     tokio::fs::create_dir_all(&workspace_dir)
         .await

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use shared_types::paths::WORKSPACE_ROOT;
 
 /// ComputerAgentRunner 容器内项目目录前缀（per-user 容器，不受隔离模式影响）
-const HOME_PREFIX: &str = "/home/user";
+const HOME_PREFIX: &str = shared_types::paths::AGENT_CONTAINER_HOME;
 
 /// ComputerNormalProject（常规项目，与 Computer 共享容器）项目目录前缀：
 /// `/home/user/normalProject/{project_id}`（与 chat 的 resolve_project_dir
@@ -207,7 +207,7 @@ mod tests {
             p,
             vec![
                 "/app/project_workspace/1/1184".to_string(),
-                "/app/project_workspace".to_string()
+                WORKSPACE_ROOT.to_string()
             ]
         );
     }
@@ -217,7 +217,7 @@ mod tests {
         // 任一缺失 → 仅单级
         assert_eq!(
             build_web_prefixes(None, Some("1184")),
-            vec!["/app/project_workspace".to_string()]
+            vec![WORKSPACE_ROOT.to_string()]
         );
         assert_eq!(
             build_web_prefixes(Some("1"), None),

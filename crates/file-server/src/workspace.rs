@@ -318,8 +318,8 @@ mod tests {
 
     fn resolver() -> LocalWorkspaceResolver {
         LocalWorkspaceResolver::new(
-            PathBuf::from("/app/project_workspace"),
-            PathBuf::from("/app/computer-project-workspace"),
+            PathBuf::from(WORKSPACE_ROOT),
+            PathBuf::from(COMPUTER_WORKSPACE_ROOT),
         )
     }
 

@@ -48,6 +48,12 @@ pub const COMPUTER_WORKSPACE_ROOT: &str = "/app/computer-project-workspace";
 /// 勿互相替代。
 pub const COMPUTER_AGENT_MOUNT_ROOT: &str = "/home/user";
 
+/// agent 容器内用户 home 根（会话转录/配置等用户级文件的基准）。
+///
+/// 值与 [`COMPUTER_AGENT_MOUNT_ROOT`] 相同（workspace 挂载点选在 home 上），
+/// 但语义不同（用户 home vs 卷挂载点），勿互相替代。
+pub const AGENT_CONTAINER_HOME: &str = "/home/user";
+
 /// Userapp 开发卷根目录 (**沙箱容器视角**)。
 ///
 /// 独立共享卷: 沙箱 (ComputerAgentRunner) 挂载点为 `/home/user/userapp-workspace`

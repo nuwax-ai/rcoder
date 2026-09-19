@@ -220,7 +220,8 @@ fn resolve_project_dir(
             if shared_types::is_absolute_path_like(work_dir_id) {
                 std::path::PathBuf::from(work_dir_id)
             } else {
-                std::path::PathBuf::from("/home/user").join(work_dir_id)
+                std::path::PathBuf::from(shared_types::paths::COMPUTER_AGENT_MOUNT_ROOT)
+                    .join(work_dir_id)
             }
         }
         shared_types::ServiceType::ComputerNormalProject => {

@@ -193,7 +193,7 @@ pub(crate) fn render_model_template(value: &mut String, resolved: &ResolvedModel
 
 /// `{PREFIX_WORKSPACE_DIR}` 变量的目标路径
 const WORKSPACE_DIR_LOG_PATH: &str = "/app/container-logs";
-const WORKSPACE_DIR_HOME_PATH: &str = "/home/user";
+const WORKSPACE_DIR_HOME_PATH: &str = shared_types::paths::AGENT_CONTAINER_HOME;
 
 /// 使用 Path 规范化路径，去除多余的分隔符和 `.` 组件
 ///

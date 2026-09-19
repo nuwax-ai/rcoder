@@ -47,7 +47,7 @@ fn get_claude_config_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/home/user"))
+                .unwrap_or_else(|| PathBuf::from(shared_types::paths::AGENT_CONTAINER_HOME))
                 .join(".claude")
         })
 }

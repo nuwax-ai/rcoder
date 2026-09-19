@@ -88,7 +88,7 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
     environment.insert("AGENT_PORT".to_string(), "8086".to_string());
     environment.insert(
         "PROJECT_WORKSPACE_BASE".to_string(),
-        "/home/user".to_string(),
+        crate::paths::COMPUTER_AGENT_MOUNT_ROOT.to_string(),
     );
 
     // 🔥 Agent 清理配置（通过环境变量控制）
