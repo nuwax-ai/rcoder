@@ -837,52 +837,104 @@ async fn userapp_dev_pg_reset_password() {
         return;
     }
 
-    // 全新容器的 PG initdb 需要时间（镜像全套启动）；连接类失败重试收敛
-    let mut first: Option<Value> = None;
-    let t0 = Instant::now();
-    let deadline = Duration::from_secs(120);
-    while t0.elapsed() < deadline {
-        let (s, b) = post_json(
-            &env,
-            "/api/v1/userapp/db/dev/reset-password",
-            json!({"app_id": app, "user_id": user, "username": "dev", "password": pw}),
-        )
-        .await;
-        if s.is_success() && http_ok(&b) {
-            first = Some(b["data"].clone());
-            break;
-        }
-        report.diagnostic(
-            "pg reset retry（PG initdb 就绪窗口）",
-            &s.to_string(),
-            &trunc(&b, 120),
-        );
-        tokio::time::sleep(Duration::from_secs(10)).await;
-    }
-    let ok_first = first.is_some();
+    let path = "/api/v1/userapp/db/dev/reset-password";
+    // The coordinator owns PG readiness and a 180s total budget. One caller
+    // identity survives transport retries; never manufacture a new mutation.
+    let env = &env;
+    let send = |body: Value| async move {
+        let response = env
+            .http
+            .post(format!("{}{path}", env.rcoder))
+            .timeout(Duration::from_secs(195))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.json::<Value>().await.unwrap()
+    };
+    let managed = send(json!({
+        "app_id": app, "request_id": "managedaccount",
+        "username": "dev", "password": pw
+    }))
+    .await;
+    report.assert_hard(
+        "受管理运行账号拒绝直接改密",
+        managed["code"] == "ERR_VALIDATION",
+        trunc(&managed, 120),
+    );
+
+    let original = json!({
+        "app_id": app, "request_id": "independentfirst",
+        "username": "e2e_independent", "password": pw
+    });
+    let first = send(original.clone()).await;
     report.assert_hard(
         "首次改密成功（username upsert 建号/改密）",
-        ok_first,
-        format!("data: {:?}", first.as_ref().map(|d| trunc(d, 80))),
+        http_ok(&first),
+        trunc(&first, 120),
     );
-    if !ok_first {
+    if !http_ok(&first) {
         assert_hard_all(report).await;
         cleanup_builder(user, &app);
         return;
     }
-
-    // 同密码复调：upsert 幂等执行（ALTER 同密码再次成功，无状态翻转）
-    let (_, b2) = post_json(
-        &env,
-        "/api/v1/userapp/db/dev/reset-password",
-        json!({"app_id": app, "user_id": user, "username": "dev", "password": pw}),
-    )
-    .await;
-    let ok_second = http_ok(&b2);
+    let second = send(original.clone()).await;
     report.assert_hard(
         "同密码复调仍成功（upsert 幂等执行）",
-        ok_second,
-        trunc(&b2, 120),
+        http_ok(&second),
+        trunc(&second, 120),
+    );
+    let changed = send(json!({
+        "app_id": app, "request_id": "independentfirst",
+        "username": "e2e_independent", "password": "changed_input"
+    }))
+    .await;
+    report.assert_hard(
+        "同请求身份改参拒绝",
+        changed["code"] == "ERR_CONFLICT",
+        trunc(&changed, 120),
+    );
+    let newer = send(json!({
+        "app_id": app, "request_id": "independentsecond",
+        "username": "e2e_independent", "password": "e2e_new_password"
+    }))
+    .await;
+    report.assert_hard(
+        "新操作修改独立账号成功",
+        http_ok(&newer),
+        trunc(&newer, 120),
+    );
+    let late = send(original).await;
+    report.assert_hard(
+        "旧请求迟到重放返回原结果",
+        http_ok(&late),
+        trunc(&late, 120),
+    );
+    let verify = std::process::Command::new("docker")
+        .args([
+            "exec",
+            &format!("rcoder-app-builder-{app}"),
+            "env",
+            "PGPASSWORD=e2e_new_password",
+            "psql",
+            "-X",
+            "-w",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            "e2e_independent",
+            "-d",
+            "postgres",
+            "-Atc",
+            "SELECT 1",
+        ])
+        .output()
+        .unwrap();
+    report.assert_hard(
+        "迟到重放未覆盖新密码（真实TCP）",
+        verify.status.success() && String::from_utf8_lossy(&verify.stdout).trim() == "1",
+        "TCP authentication checked; private SQL output omitted".into(),
     );
 
     assert_hard_all(report).await;

@@ -197,14 +197,20 @@ impl PreviewCoordinator {
     ) -> Result<PreviewStartEnvelope, PreviewCoordinationError> {
         let key = compute_key(identity);
         // 预读：幂等快路径 + Unknown 证据准备
-        let mut recovery: Option<String> = None;
+        let mut recovery = None;
         if let Ok(Some(row)) = self.store.get(&key).await {
             match row.state {
                 PreviewInstanceState::Ready if self.heartbeat_fresh(&row) => {
                     return Ok(Self::start_envelope(&row, "Development server started"));
                 }
                 PreviewInstanceState::Unknown => match self.recovery_evidence(&row).await {
-                    Some(evidence) => recovery = Some(evidence),
+                    Some(evidence) => {
+                        recovery = Some(shared_types::PreviewRecoveryEvidence {
+                            instance_id: row.instance_id.clone(),
+                            revision: row.revision,
+                            detail: evidence,
+                        })
+                    }
                     None => {
                         return Err(conflict(
                             "preview instance state unknown and host pod still exists; takeover refused",

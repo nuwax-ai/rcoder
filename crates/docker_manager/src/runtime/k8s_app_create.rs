@@ -104,6 +104,17 @@ impl KubernetesRuntime {
         // 镜像缺省回退 /app 仅本地直跑语义）。
         let env = Some(vec![
             EnvVar {
+                name: "RCODER_PHYSICAL_POD_UID".into(),
+                value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                    field_ref: Some(k8s_openapi::api::core::v1::ObjectFieldSelector {
+                        api_version: Some("v1".into()),
+                        field_path: "metadata.uid".into(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            EnvVar {
                 name: "APP_ID".to_string(),
                 value: Some(app_id.to_string()),
                 ..Default::default()

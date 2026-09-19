@@ -127,11 +127,11 @@ fn symlink_target_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().into_owned().into_bytes()
 }
 
-fn regular_file_mode(metadata: &std::fs::Metadata) -> EntryMode {
+fn regular_file_mode(_metadata: &std::fs::Metadata) -> EntryMode {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 != 0 {
+        if _metadata.permissions().mode() & 0o111 != 0 {
             return EntryKind::BlobExecutable.into();
         }
     }

@@ -351,7 +351,7 @@ jobs:
           echo "✓ pair gate passed: app-cli 生成的配置被同 rev pingap.exe 接受"
 
   publish-npm:
-    needs: [meta, pair-gate-windows]
+    needs: [meta, pair-gate-windows, build-pingap-unix]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -366,6 +366,9 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Check launcher and platform package contents
+        run: node --test npm/app-cli/test/launcher.test.cjs
 
       - name: Stamp versions + place binaries
         env:

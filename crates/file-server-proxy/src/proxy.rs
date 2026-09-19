@@ -79,22 +79,28 @@ async fn call_in_process(
     }
 }
 
-/// accept 循环 + 每连接 hyper 服务（shutdown 只停 accept，活跃连接随 task 结束断开）。
+/// Stop accepting, gracefully drain tracked connections, then cancel and join stragglers.
 pub(crate) async fn serve(
     listener: tokio::net::TcpListener,
     client: ProxyClient,
     config: FileServerProxyConfig,
     shutdown: CancellationToken,
-) {
+) -> Result<(), String> {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
+            biased;
             _ = shutdown.cancelled() => break,
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result { tracing::warn!("proxy connection task failed: {error}"); }
+            },
             accepted = listener.accept() => {
                 match accepted {
                     Ok((io, _peer)) => {
                         let client = client.clone();
                         let config = config.clone();
-                        tokio::spawn(async move {
+                        let closing = shutdown.clone();
+                        connections.spawn(async move {
                             let service = hyper::service::service_fn(move |req| {
                                 let client = client.clone();
                                 let config = config.clone();
@@ -106,9 +112,17 @@ pub(crate) async fn serve(
                             // 避免 h1 客户端带 upgrade 头时连接被硬断
                             let conn = hyper::server::conn::http1::Builder::new()
                                 .serve_connection(io, service);
-                            if let Err(e) = conn.with_upgrades().await {
-                                // 客户端中断/半关闭常见, debug 级即可
-                                tracing::debug!("proxy connection ended: {e}");
+                            let conn = conn.with_upgrades();
+                            tokio::pin!(conn);
+                            let result = tokio::select! {
+                                result = &mut conn => result,
+                                _ = closing.cancelled() => {
+                                    conn.as_mut().graceful_shutdown();
+                                    conn.await
+                                }
+                            };
+                            if let Err(error) = result {
+                                tracing::debug!("proxy connection ended: {error}");
                             }
                         });
                     }
@@ -121,6 +135,19 @@ pub(crate) async fn serve(
             }
         }
     }
+    drop(listener);
+    let drain = async { while connections.join_next().await.is_some() {} };
+    if tokio::time::timeout(std::time::Duration::from_secs(10), drain)
+        .await
+        .is_err()
+    {
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+        return Err(
+            "proxy stopped after forcibly closing connections beyond the drain deadline".into(),
+        );
+    }
+    Ok(())
 }
 
 /// 单请求转发：按 `/api/v1/userapp*` 前缀或 `x-service-type` header 选上游，

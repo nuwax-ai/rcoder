@@ -1,0 +1,33 @@
+warning: unused import: `crate::userapp_lifecycle::UserAppStoreControl`
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/concurrency_tests.rs:69:9
+   |
+69 |     use crate::userapp_lifecycle::UserAppStoreControl;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `OpenedUserAppStore` is never constructed
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/control.rs:21:12
+   |
+21 | pub struct OpenedUserAppStore {
+   |            ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `closed_for_test` is never used
+  --> src/../../../crates/rcoder-storage/src/db/owner.rs:41:19
+   |
+37 | impl DatabaseOwner {
+   | ------------------ associated function in this implementation
+...
+41 |     pub(crate) fn closed_for_test() -> Self {
+   |                   ^^^^^^^^^^^^^^^
+
+warning: `rcoder-toasty-t0` (bin "rcoder-toasty-t0" test) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.65s
+────────────
+ Nextest run ID 5efa8477-a22d-4270-8f40-531c42b3ef44 with nextest profile: default
+    Starting 1 test across 1 binary (60 tests skipped)
+        PASS [   3.062s] (1/1) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::concurrency_tests::independent_pg_owners_enforce_scope_cas_and_bound_lock_waits
+────────────
+     Summary [   3.062s] 1 test run: 1 passed, 60 skipped

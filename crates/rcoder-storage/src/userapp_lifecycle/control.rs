@@ -20,5 +20,7 @@ pub trait UserAppStoreControl: Send + Sync {
 /// 配置工厂的装配结果：`store` 注入业务层，`control` 留给关机协调者。
 pub struct OpenedUserAppStore {
     pub store: std::sync::Arc<dyn shared_types::UserAppLifecycleStore>,
+    pub activity: std::sync::Arc<dyn shared_types::ActivityPersistence>,
+    pub configuration: std::sync::Arc<dyn shared_types::UserAppRuntimeConfigurationStore>,
     pub control: std::sync::Arc<dyn UserAppStoreControl>,
 }

@@ -216,7 +216,10 @@ impl SupervisorClient {
 
     #[cfg(not(unix))]
     async fn transport(&self, _request: &str) -> Result<Vec<u8>> {
-        anyhow::bail!("supervisord unix-socket transport is unavailable on this platform")
+        anyhow::bail!(
+            "supervisord unix-socket transport is unavailable on this platform: {}",
+            self.socket.display()
+        )
     }
 }
 

@@ -35,6 +35,27 @@ pub(super) async fn probe_owner(address: &str) -> Option<RuntimeIdentityView> {
     serde_json::from_value(body.get("data")?.clone()).ok()
 }
 
+/// Verify physical project identity before loading or transmitting owner credentials.
+pub(super) fn verify_project_identity(
+    identity: &RuntimeIdentityView,
+    workspace: &std::path::Path,
+    application_id: &str,
+) -> Result<()> {
+    let source = std::path::Path::new(&identity.source_root);
+    anyhow::ensure!(protocol_compatible(identity), "incompatible owner protocol");
+    anyhow::ensure!(
+        !identity.source_root.trim().is_empty()
+            && source.is_absolute()
+            && !identity.workspace_id.trim().is_empty()
+            && !identity.runtime_instance_id.trim().is_empty()
+            && identity.application_id == application_id
+            && runtime_state_layout::canonical_project_root(source)
+                == runtime_state_layout::canonical_project_root(workspace),
+        "different app-cli owner: project or application identity mismatch"
+    );
+    Ok(())
+}
+
 /// 读取状态根的 owner 凭据文件（owner 未启用写端点时不存在）。
 pub(super) fn read_owner_token(state_root: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(state_root.join("token"))
@@ -227,7 +248,21 @@ impl OwnerClient {
             .get("data")
             .cloned()
             .context("submit response missing data")?;
-        serde_json::from_value(data).context("decode accepted operation")
+        let accepted: shared_types::RuntimeOperationAccepted =
+            serde_json::from_value(data).context("decode accepted operation")?;
+        anyhow::ensure!(
+            accepted.operation_id == operation_id
+                && accepted.poll == format!("/v1/runtime/operations/{operation_id}"),
+            "owner returned a mismatched operation receipt"
+        );
+        let view = self.operation(operation_id).await?;
+        anyhow::ensure!(
+            view.operation_id == operation_id
+                && view.runtime_instance_id == instance_id
+                && view.kind == kind,
+            "owner returned a mismatched operation identity"
+        );
+        Ok(view)
     }
 
     /// 查询操作状态。
@@ -464,6 +499,33 @@ pub(super) fn to_legacy_evt(record: &shared_types::RuntimeEventRecord) -> Option
 #[cfg(test)]
 mod r09_tests {
     use super::*;
+
+    #[test]
+    fn identity_uses_canonical_project_not_workspace_leaf() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("中文 project");
+        let run = project.join(".run");
+        std::fs::create_dir_all(&run).unwrap();
+        let mut identity = RuntimeIdentityView {
+            application_id: "app".into(),
+            service_family: "userapp-dev".into(),
+            workspace_id: "ws-stable-hash".into(),
+            source_root: project.to_string_lossy().into(),
+            runtime_instance_id: "instance".into(),
+            deployment_generation_id: "generation".into(),
+            protocol_version: RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: vec![],
+        };
+        assert!(verify_project_identity(&identity, &run, "app").is_ok());
+        assert!(verify_project_identity(&identity, &project, "other-app").is_err());
+        let different = root.path().join("other").join("中文 project");
+        std::fs::create_dir_all(&different).unwrap();
+        assert!(verify_project_identity(&identity, &different, "app").is_err());
+        identity.source_root.clear();
+        assert!(verify_project_identity(&identity, &project, "app").is_err());
+        identity.source_root = "relative".into();
+        assert!(verify_project_identity(&identity, &project, "app").is_err());
+    }
 
     /// R09：standalone（无 PROJECT_ID）凭据查找经项目登记表——兄弟项目
     /// 各自命中自己的 token；`.run` 入口折叠回源码根（同锁域同凭据）。

@@ -29,6 +29,7 @@ use super::utils::*;
 
 /// 应用管理服务（Docker / K8s 统一）
 pub struct AppService {
+    pub(crate) operation_flight: Arc<shared_types::OperationFlightGate>,
     pub(crate) config: AppManagerConfig,
     /// ISP 收紧 (阶段3): app_manager 只需 workspace (B) + Userapp Deployment (C) 能力,
     /// 不依赖 agent 容器生命周期 (A) —— 类型声明即编译期约束 (调用 agent 方法会编译错).
@@ -52,6 +53,7 @@ pub struct AppService {
     /// Persistent application identity, lifecycle and metadata; never an
     /// in-memory authority or a best-effort fallback after a storage failure.
     pub(crate) metadata: AppMetadataStore,
+    pub(crate) runtime_configuration: Arc<dyn shared_types::UserAppRuntimeConfigurationStore>,
     /// Userapp 开发资源回收回调（宿主注入；purge 时回收 UserappBuilder 开发容器
     /// 与 per-app PVC——app_manager 的 runtime 视图无 agent 能力，经契约委托宿主）。
     pub(crate) dev_cleanup: std::sync::RwLock<Option<Arc<dyn shared_types::UserappDevCleanup>>>,
@@ -75,6 +77,10 @@ pub(crate) struct DeployListCacheEntry {
 }
 
 impl AppService {
+    pub fn operation_flight(&self) -> Arc<shared_types::OperationFlightGate> {
+        self.operation_flight.clone()
+    }
+
     /// Attach after constructing the owning Arc; the registry must not own us.
     pub fn attach_activity_coordinator(self: &Arc<Self>) -> AppResult<()> {
         self.activity.set_coordinator(Arc::downgrade(self))
@@ -87,6 +93,7 @@ impl AppService {
         activity: Arc<AppActivityRegistry>,
         pingora: Option<Arc<PingoraProxyService>>,
         store: Arc<dyn shared_types::UserAppLifecycleStore>,
+        runtime_configuration: Arc<dyn shared_types::UserAppRuntimeConfigurationStore>,
     ) -> AppResult<Self> {
         if config.access_mode == AppAccessMode::Docker
             && config.operation_lock_root != shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT
@@ -117,6 +124,7 @@ impl AppService {
         }
 
         let svc = Self {
+            operation_flight: Arc::default(),
             config,
             runtime,
             activity,
@@ -125,6 +133,7 @@ impl AppService {
             deploy_list_cache: tokio::sync::Mutex::new(None),
             release_locks: DashMap::new(),
             metadata: AppMetadataStore::new(store),
+            runtime_configuration,
             dev_cleanup: std::sync::RwLock::new(None),
             dev_locator: std::sync::RwLock::new(None),
             builder_recovery: std::sync::RwLock::new(None),
@@ -260,6 +269,24 @@ impl AppService {
 // list/query/get/update/delete 编排实现拆至 lifecycle/{query,update}.rs（extension-impl）。
 #[async_trait::async_trait]
 impl super::AppServiceTrait for AppService {
+    async fn prepare_prod_database(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+        deadline: tokio::time::Instant,
+    ) -> AppResult<()> {
+        AppService::prepare_prod_database(
+            self,
+            app_id,
+            lifecycle_id,
+            request_id,
+            fingerprint,
+            deadline,
+        )
+        .await
+    }
     async fn retry_control_operation(
         &self,
         app_id: &str,

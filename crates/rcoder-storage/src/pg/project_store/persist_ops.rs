@@ -16,8 +16,12 @@ use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType};
 use crate::adapter::container_entry_key;
 
 /// 单个 project 的持久化快照（whole-row upsert）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ProjectSnapshot {
+    pub sessions: std::collections::BTreeMap<String, String>,
+    pub retired_sessions: std::collections::BTreeMap<String, String>,
+    pub expected_revision: i64,
+    pub container_generation: Option<String>,
     pub project_id: String,
     pub generation: String,
     pub predecessor: Option<String>,
@@ -57,6 +61,19 @@ impl ProjectSnapshot {
                 )
             })?;
         Ok(Self {
+            sessions: info.persistence_identity().sessions.clone(),
+            retired_sessions: info.persistence_identity().retired_sessions.clone(),
+            expected_revision: info
+                .persistence_identity()
+                .revision
+                .checked_sub(1)
+                .filter(|r| *r >= 0)
+                .ok_or_else(|| anyhow::anyhow!("Project snapshot has no registered revision"))?,
+            container_generation: info
+                .persistence_identity()
+                .container
+                .as_ref()
+                .map(|c| c.generation.clone()),
             project_id: info.project_id().to_string(),
             generation: info.persistence_identity().generation.clone(),
             predecessor: info.persistence_identity().predecessor.clone(),
@@ -83,8 +100,12 @@ impl ProjectSnapshot {
 }
 
 /// 单个容器条目的持久化快照（whole-row upsert）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ContainerSnapshot {
+    pub generation: String,
+    pub predecessor: Option<String>,
+    pub predecessor_revision: Option<i64>,
+    pub expected_revision: i64,
     pub container_name: String,
     pub container_id: Option<String>,
     pub logical_id: String,
@@ -105,13 +126,30 @@ impl ContainerSnapshot {
     /// `key` 为 containers 表键（container_name 优先，占位时为 logical_id，
     /// 与内存镜像的键完全一致）；`service_type` 由调用方提供（project 的
     /// service_type 与容器的同源）。
-    pub fn from_info(key: &str, info: &ContainerBasicInfo, service_type: &ServiceType) -> Self {
+    pub fn from_info(
+        key: &str,
+        info: &ContainerBasicInfo,
+        service_type: &ServiceType,
+        identity: &shared_types::persistence::ContainerPersistenceIdentity,
+    ) -> anyhow::Result<Self> {
         let container_id = if info.container_id.is_empty() {
             None
         } else {
             Some(info.container_id.clone())
         };
-        Self {
+        anyhow::ensure!(
+            identity.physical_uid == container_id,
+            "Container snapshot physical identity differs from registration"
+        );
+        Ok(Self {
+            generation: identity.generation.clone(),
+            predecessor: identity.predecessor.clone(),
+            predecessor_revision: identity.predecessor_revision,
+            expected_revision: identity
+                .revision
+                .checked_sub(1)
+                .filter(|r| *r >= 0)
+                .ok_or_else(|| anyhow::anyhow!("Container snapshot has no registered revision"))?,
             container_name: key.to_string(),
             container_id,
             // ContainerBasicInfo.project_id 即容器归属的 project/logical 标识
@@ -126,7 +164,7 @@ impl ContainerSnapshot {
             // 创建时刻为基准（活跃刷新走 touch_container）
             last_activity: info.created_at,
             created_at: info.created_at,
-        }
+        })
     }
 }
 
@@ -137,11 +175,16 @@ impl ContainerSnapshot {
 #[derive(Debug, Clone)]
 pub enum PersistOp {
     // ===== 结构性（永不丢弃） =====
-    /// project 整行 upsert（含容器关联）。容器行须先于本 op 入队（FK 顺序）。
-    UpsertProject(Box<ProjectSnapshot>),
-    /// 容器整行 upsert
+    /// One queue item and one rollback boundary for the entire registration.
+    RegisterProject {
+        request_id: String,
+        container: Option<Box<ContainerSnapshot>>,
+        project: Box<ProjectSnapshot>,
+    },
+    /// Fault-injection helper; production registrations are indivisible.
+    #[cfg(test)]
     UpsertContainer(Box<ContainerSnapshot>),
-    /// 删除 project（sessions 经 FK ON DELETE CASCADE 级联）
+    /// 删除指定项目代次及其会话；显式退休，不使用级联删除。
     RemoveProject {
         project_id: String,
         generation: String,
@@ -152,15 +195,15 @@ pub enum PersistOp {
         generation: String,
         container_id: String,
         container_name: String,
+        container_generation: String,
     },
-    /// 登记 session（含冗余 container_name，resolve 单查直达）
+    /// 登记 session；容器关联由其 project 的代次化外键解析。
     AddSession {
         project_id: String,
         session_id: String,
         project_generation: String,
         generation: String,
         predecessor: Option<String>,
-        container_name: Option<String>,
     },
     /// 移除单个 session
     RemoveSession {
@@ -177,6 +220,8 @@ pub enum PersistOp {
     /// SQL 侧 DELETE projects WHERE container_name IN (...) + DELETE containers）
     DeleteContainerWithProjects {
         container_id: String,
+        /// Container-name/registration-generation pairs captured at admission.
+        containers: Vec<(String, String)>,
         projects: Vec<(String, String)>,
     },
 
@@ -184,21 +229,28 @@ pub enum PersistOp {
     /// 刷新 project 活跃时间（节流入队）
     TouchProject {
         project_id: String,
+        generation: String,
         last_activity: DateTime<Utc>,
     },
     /// 刷新容器活跃时间（节流入队）
     TouchContainer {
         container_name: String,
+        generation: String,
         last_activity: DateTime<Utc>,
     },
     /// 刷新 session 活跃时间（update_session_activity 节流入队）
     TouchSession {
         session_id: String,
+        generation: String,
+        project_id: String,
+        project_generation: String,
         last_seen_at: DateTime<Utc>,
     },
     /// 更新 agent 状态快照
     UpdateAgentStatus {
         project_id: String,
+        generation: String,
+        expected_revision: i64,
         agent_status: Value,
     },
 }
@@ -218,7 +270,8 @@ impl PersistOp {
     /// 日志用的简短标签
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::UpsertProject(_) => "upsert_project",
+            Self::RegisterProject { .. } => "register_project",
+            #[cfg(test)]
             Self::UpsertContainer(_) => "upsert_container",
             Self::RemoveProject { .. } => "remove_project",
             Self::RemoveProjectForContainer { .. } => "remove_project_for_container",
@@ -234,43 +287,43 @@ impl PersistOp {
     }
 }
 
-/// 会话创建的结构性 op 集（container + project + session）——单一构造点。
-///
-/// 此前"与 XX 完全一致"的注释散布 5 处靠人肉同步（入队路径/降级路径/
-/// durable 事务体），加字段必漏。所有消费方从这里取：
-/// - store_impl::insert_with_session → 逐个入队
-/// - durable::insert_with_session_durable → 事务内执行 + 降级入队
+/// Session creation uses one indivisible registration command. The project
+/// snapshot includes all session identities; no separately queued session write.
 pub(in crate::pg) fn structural_ops_for_insert(
     info: &ProjectAndContainerInfo,
     session_id: &str,
 ) -> anyhow::Result<Vec<PersistOp>> {
-    let mut ops = Vec::with_capacity(3);
-    if let (Some(basic), Some(st)) = (info.container_info(), info.service_type()) {
-        ops.push(PersistOp::UpsertContainer(Box::new(
-            ContainerSnapshot::from_info(&container_entry_key(info), &basic, &st),
-        )));
-    }
-    ops.push(PersistOp::UpsertProject(Box::new(
-        ProjectSnapshot::from_info(info)?,
-    )));
-    ops.push(PersistOp::AddSession {
-        project_id: info.project_id().to_string(),
-        session_id: session_id.to_string(),
-        project_generation: info.persistence_identity().generation.clone(),
-        predecessor: info
-            .persistence_identity()
-            .retired_sessions
-            .get(session_id)
-            .cloned(),
-        generation: info
-            .persistence_identity()
+    anyhow::ensure!(
+        info.persistence_identity()
             .sessions
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Session identity missing: {session_id}"))?,
-        container_name: info.container_info().map(|_| container_entry_key(info)),
-    });
-    Ok(ops)
+            .contains_key(session_id),
+        "Session identity missing: {session_id}"
+    );
+    Ok(vec![registration_for_info(info)?])
+}
+
+pub(in crate::pg) fn registration_for_info(
+    info: &ProjectAndContainerInfo,
+) -> anyhow::Result<PersistOp> {
+    let project = Box::new(ProjectSnapshot::from_info(info)?);
+    let container = if let (Some(basic), Some(st)) = (info.container_info(), info.service_type()) {
+        Some(Box::new(ContainerSnapshot::from_info(
+            &container_entry_key(info),
+            &basic,
+            &st,
+            info.persistence_identity()
+                .container
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Container registration identity missing"))?,
+        )?))
+    } else {
+        None
+    };
+    Ok(PersistOp::RegisterProject {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        container,
+        project,
+    })
 }
 
 #[cfg(test)]
@@ -293,6 +346,16 @@ mod tests {
             created_at: Utc::now(),
             service_url: "http://container-1".into(),
         }));
+        let mut identity = info.persistence_identity().clone();
+        identity.revision = 1;
+        identity.container = Some(shared_types::persistence::ContainerPersistenceIdentity {
+            generation: "cg1".into(),
+            revision: 1,
+            physical_uid: Some("cid-1".into()),
+            predecessor: None,
+            predecessor_revision: None,
+        });
+        info.set_persistence_identity(identity);
         info
     }
 
@@ -314,23 +377,91 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_reject_unregistered_or_mismatched_identity() {
+        let mut info = info_with_container();
+        let mut identity = info.persistence_identity().clone();
+        identity.revision = 0;
+        info.set_persistence_identity(identity.clone());
+        assert!(ProjectSnapshot::from_info(&info).is_err());
+        let basic = info.container_info().unwrap();
+        let container = identity.container.as_mut().unwrap();
+        container.physical_uid = Some("replacement".into());
+        assert!(
+            ContainerSnapshot::from_info(
+                "container-1",
+                &basic,
+                &ServiceType::WebAgentRunner,
+                container
+            )
+            .is_err()
+        );
+        container.physical_uid = Some("cid-1".into());
+        container.revision = 0;
+        assert!(
+            ContainerSnapshot::from_info(
+                "container-1",
+                &basic,
+                &ServiceType::WebAgentRunner,
+                container
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cloned_snapshot_preserves_captured_compare_and_swap_revision() {
+        let mut info = info_with_container();
+        let mut identity = info.persistence_identity().clone();
+        identity.revision = 9;
+        info.set_persistence_identity(identity);
+        let snapshot = ProjectSnapshot::from_info(&info).unwrap();
+        assert_eq!(snapshot.expected_revision, 8);
+        assert_eq!(snapshot.clone().expected_revision, 8);
+    }
+
+    #[test]
     fn container_snapshot_maps_basic_info() {
         let info = info_with_container();
         let basic = info.container_info().expect("container");
-        let snapshot =
-            ContainerSnapshot::from_info("container-1", &basic, &ServiceType::WebAgentRunner);
+        let snapshot = ContainerSnapshot::from_info(
+            "container-1",
+            &basic,
+            &ServiceType::WebAgentRunner,
+            info.persistence_identity().container.as_ref().unwrap(),
+        )
+        .unwrap();
         assert_eq!(snapshot.container_id.as_deref(), Some("cid-1"));
         assert_eq!(snapshot.internal_port, 50051);
         assert_eq!(snapshot.service_type, "web-agent-runner");
     }
 
     #[test]
+    fn registration_is_one_structural_queue_item() {
+        let mut info = info_with_container();
+        info.add_session("session1");
+        let ops = structural_ops_for_insert(&info, "session1").unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(ops[0].is_structural());
+        let PersistOp::RegisterProject {
+            container, project, ..
+        } = &ops[0]
+        else {
+            panic!("registration must not be split into independent commands");
+        };
+        assert!(container.is_some());
+        assert_eq!(
+            project.sessions["session1"],
+            info.persistence_identity().sessions["session1"]
+        );
+        assert!(structural_ops_for_insert(&info, "missing").is_err());
+    }
+
+    #[test]
     fn structural_classification() {
         assert!(
-            PersistOp::UpsertProject(Box::new(
-                ProjectSnapshot::from_info(&info_with_container()).unwrap()
-            ))
-            .is_structural()
+            registration_for_info(&info_with_container())
+                .unwrap()
+                .is_structural()
         );
         assert!(
             PersistOp::AddSession {
@@ -339,13 +470,13 @@ mod tests {
                 project_generation: "pg".into(),
                 predecessor: None,
                 generation: "sg".into(),
-                container_name: None
             }
             .is_structural()
         );
         assert!(
             !PersistOp::TouchProject {
                 project_id: "p".into(),
+                generation: "pg".into(),
                 last_activity: Utc::now()
             }
             .is_structural()

@@ -16,13 +16,13 @@ pub const DEFAULT_PG_MIN_CONNECTIONS: u32 = 2;
 pub const DEFAULT_PG_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// 默认语句超时（秒，防拖死请求）
 pub const DEFAULT_PG_STATEMENT_TIMEOUT_SECS: u64 = 5;
-/// 默认连接最大寿命（秒）。短于 sqlx 默认 30min：CNPG failover 后指向旧 primary 的
+/// 默认连接最大寿命（秒）。CNPG failover 后指向旧 primary 的
 /// 长寿命连接会变僵尸，到期（release/recycle 时）关闭重建即自愈——10min 是
 /// "failover 恢复上界"与"重建频率"的折中（建连 ms 级，重建开销可忽略）。
 pub const DEFAULT_PG_MAX_LIFETIME_SECS: u64 = 600;
 
 /// `[storage.postgres]` 配置段
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PostgresConfig {
     /// 主机名（K8s 内通常是 `<release>-pg.<namespace>.svc.cluster.local`）
@@ -40,7 +40,7 @@ pub struct PostgresConfig {
     pub url: Option<String>,
     /// 连接池大小（默认 10）
     pub max_connections: Option<u32>,
-    /// 预热连接数（默认 2；池维持的最少空闲连接，冷启动首批查询免建连）
+    /// 启动预热连接数（默认 2；不承诺持续维持最少空闲连接）
     pub min_connections: Option<u32>,
     /// 连接超时秒数（默认 10）
     pub connect_timeout_secs: Option<u64>,
@@ -48,6 +48,15 @@ pub struct PostgresConfig {
     pub statement_timeout_secs: Option<u64>,
     /// 连接最大寿命秒数（默认 600；CNPG failover 僵尸连接自愈上界）
     pub max_lifetime_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for PostgresConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresConfig")
+            .field("connection", &self.describe())
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl Default for PostgresConfig {
@@ -102,6 +111,13 @@ impl PostgresConfig {
         // 缺失项已在上方逐项报错返回；此处防御性兜底（不 panic）
         let (Some(host), Some(username), Some(database)) = (host, username, database) else {
             return Err("storage.postgres 内部错误：字段校验与组装不一致".to_string());
+        };
+        let username = encode_uri_component(username);
+        let database = encode_uri_component(database);
+        let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
         };
         let auth = match self.password.as_deref().filter(|p| !p.is_empty()) {
             Some(password) => format!("{}:{}@", username, encode_uri_component(password)),
@@ -173,6 +189,34 @@ fn non_empty_field(v: &Option<String>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_uri_encodes_identity_and_brackets_ipv6() {
+        let config = PostgresConfig {
+            host: Some("::1".into()),
+            username: Some("user/name@domain".into()),
+            password: Some("password?#".into()),
+            database: Some("database/name?sslmode=disable".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.to_dsn().unwrap(),
+            "postgres://user%2Fname%40domain:password%3F%23@[::1]:5432/database%2Fname%3Fsslmode%3Ddisable"
+        );
+    }
+
+    #[test]
+    fn debug_never_exposes_password_or_dsn() {
+        let config = PostgresConfig {
+            password: Some("private-password".into()),
+            url: Some("postgres://user:private-dsn-password@localhost/database".into()),
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("private-password"));
+        assert!(!debug.contains("private-dsn-password"));
+        assert!(debug.contains("REDACTED"));
+    }
 
     #[test]
     fn dsn_from_discrete_fields() {

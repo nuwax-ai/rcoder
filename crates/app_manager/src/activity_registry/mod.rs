@@ -57,11 +57,17 @@ impl Drop for RecycleTransition {
 ///
 /// M5 起支持影子持久化：注入 [`shared_types::ActivityPersistence`] 后，
 /// 状态变更标脏，由 rcoder 侧 flusher 周期批量落 PG；启动时 `apply_loaded`
-/// 恢复跨重启的 last_accessed/stopped/wake_blocked（wake single-flight 等进程内
+/// 恢复跨重启的 last_accessed；stopped/wake_blocked 从运行态与生命周期策略重建（wake single-flight 等进程内
 /// 协调机制不持久化）。`last_accessed` 用 wall-clock（`DateTime<Utc>`）而非
 /// `Instant`（单调钟不可序列化）；节流与 epoch 复核语义不变。
 pub struct AppActivityRegistry {
     /// app_id → 最近一次真实 HTTP 访问时刻(节流更新;wall-clock,可持久化)
+    pub(super) identities: std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
+    /// Versioned cache keys make in-flight lookups from before a local delete
+    /// unreachable. Access this map only while holding `identities` first.
+    identity_versions: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    access_identities:
+        moka::future::Cache<(String, u64), Arc<shared_types::UserAppLifecycleRecord>>,
     pub(super) last_accessed: DashMap<String, DateTime<Utc>>,
     /// app_id → 已 stopped(scale0)标记;stop/start/wake/重启重建 共同维护
     pub(super) stopped: DashSet<String>,
@@ -70,7 +76,7 @@ pub struct AppActivityRegistry {
     /// app_id → 待持久化脏行(flusher 周期 collect_dirty 落库)
     pub(super) dirty: DashSet<String>,
     /// app_id → 待删除行(forget_app 后由 flusher 清 PG)
-    pub(super) deleted: DashSet<String>,
+    pub(super) deleted: DashSet<(String, String)>,
     /// 影子持久化(延迟注入;PG 模式 main 设置,内存模式保持 None)
     ///
     /// 字段 `pub(super)`：供 `persistence_ops.rs` 子模块（同类型 extension-impl）访问。
@@ -103,6 +109,12 @@ impl AppActivityRegistry {
     /// 创建注册表(指定 throttle,测试用)
     fn new_with(wake_timeout: Duration, throttle: Duration) -> Self {
         Self {
+            identities: std::sync::Mutex::new(Default::default()),
+            identity_versions: std::sync::Mutex::new(Default::default()),
+            access_identities: moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(5))
+                .build(),
             last_accessed: DashMap::new(),
             stopped: DashSet::new(),
             wake_blocked: DashSet::new(),
@@ -178,11 +190,34 @@ impl AppActivityRegistry {
 
     /// 应用删除后清理所有内存态。正在等待的唤醒/回收请求会立即收到终止信号；
     /// RAII 守卫使用指针比对移除条目，不会误删同 ID 重建后的新状态。
+    #[cfg(test)]
     pub fn forget_app(&self, app_id: &str) {
+        self.forget_matching_lifecycle(app_id, None);
+    }
+
+    pub fn forget_lifecycle(&self, app_id: &str, lifecycle_id: &str) -> bool {
+        self.forget_matching_lifecycle(app_id, Some(lifecycle_id))
+    }
+
+    fn forget_matching_lifecycle(&self, app_id: &str, expected: Option<&str>) -> bool {
+        let mut identities = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(expected) = expected {
+            if identities
+                .get(app_id)
+                .is_some_and(|(current, _)| current != expected)
+            {
+                return false;
+            }
+            self.deleted
+                .insert((app_id.to_owned(), expected.to_owned()));
+        }
+        self.invalidate_access_identity(app_id);
+        if let Some((lifecycle, _)) = identities.remove(app_id) {
+            self.deleted.insert((app_id.to_owned(), lifecycle));
+        }
         self.last_accessed.remove(app_id);
         self.stopped.remove(app_id);
         self.dirty.remove(app_id);
-        self.deleted.insert(app_id.to_string());
         self.wake_blocked.remove(app_id);
         self.remote_state.invalidate(app_id);
         if let dashmap::mapref::entry::Entry::Occupied(entry) =
@@ -198,6 +233,7 @@ impl AppActivityRegistry {
         {
             entry.remove().notify_waiters();
         }
+        true
     }
 
     /// 仅当最近访问时间仍等于扫描器观测值时，原子登记回收过渡。
@@ -264,13 +300,14 @@ impl AppActivityRegistry {
     /// 覆盖内存是必须的：`try_begin_recycle` 按"内存值 == 判定时观测值"做
     /// epoch 复核——不回写则 PG 较新时复核恒失败，app 永远无法回收。
     pub fn merge_accessed(&self, app_id: &str, t: DateTime<Utc>) -> DateTime<Utc> {
-        // guard 物化到独立语句（scrutinee 临时值存活到 match 结束——match 内
-        // insert 会与持存的 read guard 抢同 shard 写锁，自死锁）
-        let cur = self.last_accessed.get(app_id).map(|r| *r);
-        match cur {
-            Some(c) if c >= t => c,
-            _ => {
-                self.last_accessed.insert(app_id.to_string(), t);
+        match self.last_accessed.entry(app_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let newest = (*entry.get()).max(t);
+                entry.insert(newest);
+                newest
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(t);
                 t
             }
         }
@@ -287,8 +324,8 @@ impl AppActivityRegistry {
     }
 }
 
-impl AppAccessTracker for AppActivityRegistry {
-    fn touch(&self, app_id: &str) {
+impl AppActivityRegistry {
+    fn record_local_access(&self, app_id: &str) {
         let now = Utc::now();
         // entry API:同一 shard 一次锁;Vacant 直接插,Occupied 仅超节流窗口才写
         match self.last_accessed.entry(app_id.to_string()) {
@@ -306,5 +343,91 @@ impl AppAccessTracker for AppActivityRegistry {
                 self.note_dirty(app_id);
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl AppAccessTracker for AppActivityRegistry {
+    async fn touch(&self, app_id: &str) -> Option<DateTime<Utc>> {
+        let service = self.coordinator.get().and_then(std::sync::Weak::upgrade)?;
+        // A cache hit performs no database I/O. Concurrent misses for the same
+        // app/version share one query; errors are observable and not cached.
+        let version = {
+            let _identities = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+            self.access_identity_version(app_id)
+        };
+        if version == u64::MAX {
+            return None;
+        }
+        let identity = match self
+            .access_identities
+            .try_get_with((app_id.to_owned(), version), async {
+                tracing::debug!(%app_id, "Refreshing activity lifecycle identity");
+                service
+                    .metadata
+                    .store
+                    .get_application(app_id)
+                    .await?
+                    .filter(|row| row.state == shared_types::UserAppLifecycleState::Active)
+                    .map(Arc::new)
+                    .ok_or(shared_types::UserAppStoreError::NotFound)
+            })
+            .await
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::warn!(%app_id, %error, "Activity identity unavailable; access was not rebound");
+                return None;
+            }
+        };
+        self.record_verified_access(app_id, version, &identity)
+    }
+}
+
+impl AppActivityRegistry {
+    fn access_identity_version(&self, app_id: &str) -> u64 {
+        self.identity_versions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(app_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    // Caller holds identities, so changing the cache namespace and registration
+    // is atomic relative to recording a touch. Retain tombstones to avoid ABA.
+    fn invalidate_access_identity(&self, app_id: &str) {
+        let mut versions = self
+            .identity_versions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let revision = versions.entry(app_id.to_owned()).or_default();
+        *revision = revision.checked_add(1).unwrap_or(u64::MAX);
+    }
+
+    fn record_verified_access(
+        &self,
+        app_id: &str,
+        version: u64,
+        identity: &shared_types::UserAppLifecycleRecord,
+    ) -> Option<DateTime<Utc>> {
+        let mut identities = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+        if identity.app_id != app_id
+            || identity.state != shared_types::UserAppLifecycleState::Active
+            || self.access_identity_version(app_id) != version
+            || version == u64::MAX
+        {
+            return None;
+        }
+        if !self.bind_lifecycle_locked(
+            &mut identities,
+            app_id,
+            &identity.lifecycle_id,
+            identity.lifecycle_epoch,
+        ) {
+            return None;
+        }
+        self.record_local_access(app_id);
+        self.last_accessed_at(app_id)
     }
 }

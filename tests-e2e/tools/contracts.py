@@ -85,7 +85,9 @@ REQUIRED['pg_storage_lifecycle_contract'] = {
         'delayed_clear_and_remove_preserve_reused_session',
         'reload_and_cross_replica_sync_preserve_identity',
         'container_delete_preserves_changed_association',
-        'legacy_schema_backfill_is_stable',
+        'unversioned_schema_is_rejected_without_adoption',
+        'registration_receipt_replays_without_reapplying',
+        'registration_rejects_session_conflict_atomically',
         'flush_failure_shared_between_concurrent_callers',
         'cancelled_durable_write_is_queued_and_shutdown_waits',
     )),
@@ -130,8 +132,9 @@ REQUIRED['docker_deletion_identity_contract'] |= {
 }
 
 # New userApp persistence contracts are required independently of Agent PG tests.
-from storage_contract_cases import TURSO_TARGETS
+from storage_contract_cases import TURSO_TARGETS, PG_EXTRA_TARGETS
 REQUIRED['pg_storage_lifecycle_contract'].add('PG userApp transactions and restart')
+REQUIRED['pg_storage_lifecycle_contract'].update(PG_EXTRA_TARGETS)
 REQUIRED['turso_storage_lifecycle_contract'] = {
     'Turso contract process completed', 'Turso frozen cases present',
     *('Turso ' + case for case in TURSO_TARGETS),

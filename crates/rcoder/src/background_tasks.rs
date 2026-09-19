@@ -17,7 +17,6 @@ use crate::service::{
 };
 use crate::userapp_recycle;
 
-#[allow(dead_code)]
 pub struct BackgroundTaskHandles {
     /// 以下四个单实例语义句柄：memory 模式为本层直接拉起的任务；
     /// PG 模式恒为 None，实际句柄由 leader 监督任务按 leadership 代际持有（见 pg_leader_handle）。
@@ -32,6 +31,31 @@ pub struct BackgroundTaskHandles {
     /// P2-M3：单实例后台任务的 leader 监督任务（PG 模式；
     /// cleanup/status_checker/container_sync/userapp_recycle 由它按 leadership 拉起/停止）
     pub pg_leader_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl BackgroundTaskHandles {
+    /// All tasks already received the broadcast. Join before closing storage;
+    /// dropping a JoinHandle would only detach the producer.
+    pub async fn drain(self, deadline: tokio::time::Instant) -> anyhow::Result<()> {
+        for (name, handle) in [
+            ("cleanup", self.cleanup_handle),
+            ("status checker", self.status_checker_handle),
+            ("container sync", self.container_sync_handle),
+            ("userapp recycle", self.userapp_recycle_handle),
+            ("activity flush", self.pg_shadow_handle),
+            ("PG sync", self.pg_sync_handle),
+            ("PG leader supervisor", self.pg_leader_handle),
+        ] {
+            if let Some(handle) = handle {
+                tokio::time::timeout_at(deadline, handle)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("{name} drain timed out; storage remains owned")
+                    })??;
+            }
+        }
+        Ok(())
+    }
 }
 
 async fn spawn_single_instance_tasks(
@@ -154,7 +178,7 @@ pub async fn start_all_background_tasks(
                 let leader_store = state.projects.postgres().expect("is_postgres 为真");
                 let election = Arc::new(
                     rcoder_storage::pg::leader_selection::PgLeaderElection::spawn(
-                        leader_store.pool().clone(),
+                        leader_store.postgres_config().clone(),
                         shutdown_tx.subscribe(),
                     ),
                 );
@@ -206,7 +230,7 @@ pub async fn start_all_background_tasks(
     } else {
         None
     };
-    let pg_shadow_handle = if state.projects.is_postgres() {
+    let pg_shadow_handle = if state.activity.persistence().is_some() {
         let state = Arc::clone(&state);
         let mut shutdown_rx = shutdown_tx.subscribe();
         Some(tokio::spawn(async move {
@@ -217,27 +241,8 @@ pub async fn start_all_background_tasks(
                     biased;
                     _ = shutdown_rx.recv() => break,
                     _ = flush_tick.tick() => {
-                        let Some(persistence) = state.activity.persistence() else {
-                            continue;
-                        };
-                        // 删除先行（forget_app 后同 id 重建不被旧行复活）；失败重登队列
-                        let deleted = state.activity.drain_deleted();
-                        for app_id in &deleted {
-                            if let Err(e) = persistence.delete(app_id).await {
-                                tracing::error!("[STORAGE_PG] activity delete {app_id} failed: {e:#}");
-                                state.activity.re_delete(&deleted);
-                                break;
-                            }
-                        }
-                        // flush 失败重标脏（否则该批数据在下次变更前不会再落盘）
-                        let rows = state.activity.collect_dirty();
-                        if !rows.is_empty()
-                            && let Err(e) = persistence.flush_batch(rows.clone()).await
-                        {
-                            tracing::error!("[STORAGE_PG] activity flush failed: {e:#}");
-                            let ids: Vec<String> =
-                                rows.iter().map(|r| r.app_id.clone()).collect();
-                            state.activity.re_dirty(&ids);
+                        if let Err(error) = state.activity.flush_pending().await {
+                            tracing::error!(%error, "Activity flush incomplete; batch remains pending");
                         }
                     },
                 }
@@ -272,15 +277,21 @@ async fn run_leader_supervisor(
 ) {
     let mut root_shutdown = shutdown_tx.subscribe();
     let mut current_gen: Option<tokio::sync::broadcast::Sender<()>> = None;
+    let mut generations = tokio::task::JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     tick.tick().await; // 首个立即返回
     loop {
         tokio::select! {
             biased;
             _ = root_shutdown.recv() => break,
+            Some(result) = generations.join_next(), if !generations.is_empty() => {
+                if let Err(error) = result {
+                    tracing::error!(%error, "leader generation task failed");
+                }
+            }
             _ = tick.tick() => {
                 let is_leader = election.is_leader();
-                if is_leader && current_gen.is_none() {
+                if is_leader && current_gen.is_none() && generations.is_empty() {
                     // 获主：拉起代际
                     let (gen_tx, _) = tokio::sync::broadcast::channel(1);
                     let cleanup_config = cleanup_task::CleanupConfig {
@@ -302,7 +313,7 @@ async fn run_leader_supervisor(
                             let (c, s1, s2, u) = handles;
                             // 保活句柄防止任务被提前回收（JoinHandle 被 drop 不取消
                             // task，但保持引用便于调试器/控制台观察）
-                            tokio::spawn(async move {
+                            generations.spawn(async move {
                                 // 显式消费 JoinHandle（带 Drop 语义，避免 let _ 静默丢弃）
                                 if let Some(h) = c { let _r = h.await; }
                                 let _r1 = s1.await;
@@ -326,6 +337,14 @@ async fn run_leader_supervisor(
     }
     if let Some(gen_tx) = current_gen.take() {
         drop(gen_tx);
+    }
+    while let Some(result) = generations.join_next().await {
+        if let Err(error) = result {
+            tracing::error!(%error, "leader generation drain failed");
+        }
+    }
+    if let Err(error) = election.shutdown().await {
+        tracing::error!(%error, "leader election shutdown failed");
     }
     info!("[STORAGE_PG] leader supervisor stopped");
 }

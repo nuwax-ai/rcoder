@@ -10,12 +10,12 @@ repository.workspace = true
 default = []
 
 # PostgreSQL 持久化后端（write-behind + 启动全量加载）。
-# 未选择 pg 后端时不编译 sqlx。
+# 未选择 pg 后端时不编译 PostgreSQL 驱动。
 # rcoder 侧经 feature `rcoder-pg = ["kubernetes", "rcoder-storage/pg"]` 转发开启。
-pg = ["sqlx", "sqlx/postgres", "moka"]
+pg = ["dep:tokio-postgres", "moka", "dep:toasty", "toasty/postgresql", "dep:toasty-core", "dep:futures", "dep:sha2"]
 # 本地 Turso 控制存储（specs/userapp-turso-local-storage，替代 SQLx SQLite）。
 # default-features = false 裁掉 FTS/分配器等无需求项；nix 供独占目录锁使用。
-userapp-turso = ["dep:turso", "dep:futures", "dep:sha2", "dep:nix"]
+userapp-turso = ["dep:toasty", "toasty/turso", "dep:toasty-core", "dep:toasty-driver-turso", "dep:futures", "dep:sha2", "dep:nix"]
 
 [lints]
 workspace = true
@@ -38,13 +38,15 @@ async-trait = { workspace = true }
 tokio-util = { workspace = true }
 
 # SQL 后端（feature-gated）
-sqlx = { workspace = true, optional = true }
+tokio-postgres = { version = "0.7", optional = true }
 # Touch 节流表（pg 模式：TTI 过期防 key 泄漏）
 moka = { workspace = true, optional = true }
 
 uuid = { workspace = true }
 nix = { workspace = true, optional = true }
-turso = { version = "0.8.0-pre.11", default-features = false, optional = true }
+toasty = { workspace = true, optional = true }
+toasty-core = { workspace = true, optional = true }
+toasty-driver-turso = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 

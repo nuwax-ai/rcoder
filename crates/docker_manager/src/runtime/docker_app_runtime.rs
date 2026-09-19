@@ -190,6 +190,13 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         self.restart_captured_target(target).await
     }
 
+    async fn start_app_management_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.start_captured_target(target).await
+    }
+
     async fn start_app_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
@@ -481,77 +488,82 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         app_id: &str,
         command: Vec<String>,
     ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
-        use bollard::container::LogOutput;
-        use bollard::exec::{CreateExecOptions, StartExecResults};
-        use futures_util::StreamExt;
+        execute_container_command(
+            self.inner.get_docker_client(),
+            &app_deployment_name(app_id),
+            command,
+        )
+        .await
+    }
 
-        let name = app_deployment_name(app_id);
-        let client = self.inner.get_docker_client();
-
-        // 1. create exec(容器不存在 → ContainerNotFound,与 get_deployment_status 404 处理一致)
-        let exec = client
-            .create_exec(
-                &name,
-                CreateExecOptions {
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    cmd: Some(command),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| match e {
-                bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404, ..
-                } => ContainerRuntimeError::ContainerNotFound(name.clone()),
-                _ => ContainerRuntimeError::ContainerExecError(format!("create_exec: {e}")),
-            })?;
-
-        // 2. start exec + 读输出流(LogOutput 分桶 stdout/stderr,同 get_app_logs)
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        match client
-            .start_exec(&exec.id, None)
-            .await
-            .map_err(|e| ContainerRuntimeError::ContainerExecError(format!("start_exec: {e}")))?
-        {
-            StartExecResults::Attached { mut output, .. } => {
-                while let Some(item) = output.next().await {
-                    match item {
-                        Ok(LogOutput::StdOut { message }) | Ok(LogOutput::Console { message }) => {
-                            stdout.push_str(&String::from_utf8_lossy(&message));
-                        }
-                        Ok(LogOutput::StdErr { message }) => {
-                            stderr.push_str(&String::from_utf8_lossy(&message));
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            return Err(ContainerRuntimeError::ContainerExecError(format!(
-                                "stream: {e}"
-                            )));
-                        }
-                    }
-                }
-            }
-            StartExecResults::Detached => {
-                return Err(ContainerRuntimeError::ContainerExecError(
-                    "unexpected Detached".into(),
-                ));
-            }
+    async fn exec_app_configuration_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        target: &shared_types::RuntimeConfigurationTarget,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if target.physical_uid.is_empty() || target.deployment_generation.is_empty() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Configuration exec requires a complete physical identity".into(),
+            ));
         }
-
-        // 3. exit code(stream 结束后 inspect 单独取)
-        let inspect = client
-            .inspect_exec(&exec.id)
+        let client = self.inner.get_docker_client();
+        let inspected = client
+            .inspect_container(&target.physical_uid, None)
             .await
-            .map_err(|e| ContainerRuntimeError::ContainerExecError(format!("inspect_exec: {e}")))?;
-        let exit_code = inspect.exit_code.unwrap_or(-1);
+            .map_err(|error| {
+                ContainerRuntimeError::ContainerExecError(format!(
+                    "Inspect configuration exec target: {error}"
+                ))
+            })?;
+        validate_configuration_exec_target(context, target, &inspected)?;
+        // Immutable ID also fences replacement between inspect and create_exec.
+        execute_container_command(client, &target.physical_uid, command).await
+    }
 
-        Ok(container_runtime_api::ExecResult {
-            stdout,
-            stderr,
-            exit_code,
-        })
+    async fn capture_app_configuration_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        generation: &str,
+    ) -> ContainerRuntimeResult<shared_types::RuntimeConfigurationTarget> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if generation.is_empty() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Configuration generation is required".into(),
+            ));
+        }
+        let inspected = self
+            .inner
+            .get_docker_client()
+            .inspect_container(&app_deployment_name(&context.app_id), None)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::ContainerExecError(format!(
+                    "Capture configuration container: {error}"
+                ))
+            })?;
+        let target = shared_types::RuntimeConfigurationTarget {
+            physical_uid: inspected
+                .id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    ContainerRuntimeError::Conflict(
+                        "Configuration container identity is missing".into(),
+                    )
+                })?,
+            deployment_generation: generation.into(),
+        };
+        validate_configuration_exec_target(context, &target, &inspected)?;
+        if inspected.state.as_ref().and_then(|state| state.running) != Some(true) {
+            return Err(ContainerRuntimeError::ManagementNotRunning);
+        }
+        Ok(target)
     }
 
     async fn stream_app_logs(
@@ -619,5 +631,204 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             }
         });
         Ok(rx)
+    }
+}
+
+pub(super) async fn execute_container_command(
+    client: &bollard::Docker,
+    name: &str,
+    command: Vec<String>,
+) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+    use bollard::container::LogOutput;
+    use bollard::exec::{CreateExecOptions, StartExecResults};
+    use futures_util::StreamExt;
+
+    // 1. create exec(容器不存在 → ContainerNotFound,与 get_deployment_status 404 处理一致)
+    let exec = client
+        .create_exec(
+            name,
+            CreateExecOptions {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                cmd: Some(command),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| match e {
+            bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            } => ContainerRuntimeError::ContainerNotFound(name.to_owned()),
+            _ => ContainerRuntimeError::ContainerExecError(format!("create_exec: {e}")),
+        })?;
+
+    // 2. start exec + 读输出流(LogOutput 分桶 stdout/stderr,同 get_app_logs)
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    match client
+        .start_exec(&exec.id, None)
+        .await
+        .map_err(|e| ContainerRuntimeError::ContainerExecError(format!("start_exec: {e}")))?
+    {
+        StartExecResults::Attached { mut output, .. } => {
+            while let Some(item) = output.next().await {
+                match item {
+                    Ok(LogOutput::StdOut { message }) | Ok(LogOutput::Console { message }) => {
+                        stdout.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    Ok(LogOutput::StdErr { message }) => {
+                        stderr.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(ContainerRuntimeError::ContainerExecError(format!(
+                            "stream: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+        StartExecResults::Detached => {
+            return Err(ContainerRuntimeError::ContainerExecError(
+                "unexpected Detached".into(),
+            ));
+        }
+    }
+
+    // 3. exit code(stream 结束后 inspect 单独取)
+    let inspect = client
+        .inspect_exec(&exec.id)
+        .await
+        .map_err(|e| ContainerRuntimeError::ContainerExecError(format!("inspect_exec: {e}")))?;
+    if inspect.running != Some(false) {
+        return Err(ContainerRuntimeError::ContainerExecError(
+            "Exec has no confirmed stopped state; outcome is unknown".into(),
+        ));
+    }
+    let exit_code = inspect.exit_code.filter(|code| *code >= 0).ok_or_else(|| {
+        ContainerRuntimeError::ContainerExecError(
+            "Exec has no exit code; outcome is unknown".into(),
+        )
+    })?;
+
+    Ok(container_runtime_api::ExecResult {
+        stdout,
+        stderr,
+        exit_code,
+    })
+}
+
+fn validate_configuration_exec_target(
+    context: &shared_types::UserAppExecutionContext,
+    target: &shared_types::RuntimeConfigurationTarget,
+    container: &bollard::models::ContainerInspectResponse,
+) -> ContainerRuntimeResult<()> {
+    let mismatch =
+        || ContainerRuntimeError::Conflict("Configuration exec target identity changed".into());
+    if container.id.as_deref() != Some(target.physical_uid.as_str()) {
+        return Err(mismatch());
+    }
+    let config = container.config.as_ref().ok_or_else(mismatch)?;
+    let labels = config.labels.as_ref().ok_or_else(mismatch)?;
+    if labels.get("managed-by").map(String::as_str) != Some("rcoder-app-manager")
+        || labels.get("service-type").map(String::as_str)
+            != Some(shared_types::ServiceType::Userapp.to_string().as_str())
+        || labels.get(shared_types::USERAPP_DOCKER_APP_ID_LABEL) != Some(&context.app_id)
+    {
+        return Err(mismatch());
+    }
+    context
+        .validate_application_metadata(
+            &labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        )
+        .map_err(ContainerRuntimeError::Conflict)?;
+    let expected = format!(
+        "{}={}",
+        shared_types::APP_DEPLOY_GENERATION_ID,
+        target.deployment_generation
+    );
+    let generations: Vec<_> = config
+        .env
+        .iter()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .split_once('=')
+                .is_some_and(|(key, _)| key == shared_types::APP_DEPLOY_GENERATION_ID)
+        })
+        .collect();
+    if generations.len() != 1 || generations[0] != &expected {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod configuration_exec_tests {
+    use super::*;
+
+    #[test]
+    fn configuration_exec_requires_physical_lifecycle_and_generation_match() {
+        let context = shared_types::UserAppExecutionContext {
+            app_id: "app1".into(),
+            lifecycle_id: "life1".into(),
+            operation_id: "operation1".into(),
+            executor_id: "executor1".into(),
+            request_fingerprint: "a".repeat(64),
+        };
+        let target = shared_types::RuntimeConfigurationTarget {
+            physical_uid: "container1".into(),
+            deployment_generation: "generation1".into(),
+        };
+        let mut labels = context.resource_metadata();
+        labels.insert("managed-by".into(), "rcoder-app-manager".into());
+        labels.insert(
+            "service-type".into(),
+            shared_types::ServiceType::Userapp.to_string(),
+        );
+        labels.insert(
+            shared_types::USERAPP_DOCKER_APP_ID_LABEL.into(),
+            "app1".into(),
+        );
+        let fixture = serde_json::json!({
+            "Id":"container1", "Config":{"Labels": labels,
+            "Env":[format!("{}=generation1",shared_types::APP_DEPLOY_GENERATION_ID)]}
+        });
+        let inspected = serde_json::from_value(fixture.clone()).unwrap();
+        validate_configuration_exec_target(&context, &target, &inspected).unwrap();
+        for (pointer, replacement) in [
+            ("/Id", serde_json::json!("container2")),
+            (
+                "/Config/Labels/rcoder.io~1lifecycle-id",
+                serde_json::json!("life2"),
+            ),
+            (
+                "/Config/Labels/service-type",
+                serde_json::json!(shared_types::ServiceType::UserappBuilder.to_string()),
+            ),
+            ("/Config/Env", serde_json::json!([])),
+            (
+                "/Config/Env",
+                serde_json::json!([format!(
+                    "{}=generation2",
+                    shared_types::APP_DEPLOY_GENERATION_ID
+                )]),
+            ),
+            (
+                "/Config/Env",
+                serde_json::json!([
+                    format!("{}=generation1", shared_types::APP_DEPLOY_GENERATION_ID),
+                    format!("{}=generation2", shared_types::APP_DEPLOY_GENERATION_ID)
+                ]),
+            ),
+        ] {
+            let mut changed = fixture.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement;
+            let inspected = serde_json::from_value(changed).unwrap();
+            assert!(
+                validate_configuration_exec_target(&context, &target, &inspected).is_err(),
+                "{pointer}"
+            );
+        }
     }
 }

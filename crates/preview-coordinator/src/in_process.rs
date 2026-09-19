@@ -86,27 +86,40 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
                     return Ok(AcceptStartOutcome::Blocked(record.clone()));
                 }
                 PreviewInstanceState::Unknown => {
-                    let Some(evidence) = input.recover_unknown_evidence.as_deref() else {
+                    let Some(evidence) = input.recover_unknown_evidence.as_ref() else {
                         return Ok(AcceptStartOutcome::Blocked(record.clone()));
                     };
-                    let target = record.clone();
-                    let record = state
-                        .instances
-                        .get_mut(&input.preview_key)
-                        .expect("row observed under lock");
-                    record.state = PreviewInstanceState::Stopped;
-                    record.pid = None;
-                    record.detail = Some(evidence.to_string());
-                    record.updated_at = now();
-                    next_revision = target.revision + 1;
+                    if evidence.instance_id != record.instance_id
+                        || evidence.revision != record.revision
+                        || evidence.detail.is_empty()
+                    {
+                        return Err(conflict(
+                            "Unknown recovery evidence belongs to another instance",
+                            record,
+                        ));
+                    }
+                    // Do not mutate Unknown before port allocation succeeds.
+                    // The final insert below replaces it under this same lock.
+                    next_revision = record
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Unavailable("Preview revision exhausted".into()))?;
                 }
                 PreviewInstanceState::Stopped | PreviewInstanceState::Failed => {
-                    next_revision = record.revision + 1;
+                    next_revision = record
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Unavailable("Preview revision exhausted".into()))?;
                 }
             }
         }
 
-        let occupied = Self::occupied_ports(&state);
+        let occupied: Vec<u16> = state
+            .instances
+            .values()
+            .filter(|row| row.state.is_active() && row.preview_key != input.preview_key)
+            .filter_map(|row| row.port)
+            .collect();
         let port = match input.requested_port {
             Some(requested) => {
                 if !is_preview_port(requested) {
@@ -147,7 +160,10 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
             state: PreviewInstanceState::Starting,
             last_heartbeat_at: None,
             last_activity_at: timestamp,
-            detail: input.recover_unknown_evidence.clone(),
+            detail: input
+                .recover_unknown_evidence
+                .as_ref()
+                .map(|e| e.detail.clone()),
             updated_at: timestamp,
         };
         state.operations.insert(
@@ -186,6 +202,8 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
             if record.operation_id != operation_id
                 || record.revision != revision
                 || record.state != PreviewInstanceState::Starting
+                || record.port != Some(port)
+                || pid <= 0
             {
                 return Err(conflict("publish_running lost the race", record));
             }
@@ -220,8 +238,23 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
                 "preview {preview_key} has no instance to stop"
             )));
         };
+        if let Some(operation) = state.operations.get(operation_id) {
+            if operation.kind != PreviewOperationKind::Stop
+                || operation.preview_key != preview_key
+                || record.operation_id != operation_id
+            {
+                return Err(conflict(
+                    "Stop operation belongs to another request or instance",
+                    record,
+                ));
+            }
+            return Ok(record.clone());
+        }
         if !record.state.is_active() {
             return Ok(record.clone());
+        }
+        if record.state == PreviewInstanceState::Stopping {
+            return Err(conflict("Another stop operation is in progress", record));
         }
         let (host_id, port) = (record.host_id.clone(), record.port);
         let record = state
@@ -230,7 +263,10 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
             .expect("row observed under lock");
         record.state = PreviewInstanceState::Stopping;
         record.operation_id = operation_id.to_string();
-        record.revision += 1;
+        record.revision = record
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::Unavailable("Preview revision exhausted".into()))?;
         record.updated_at = now();
         let timestamp = now();
         state.operations.insert(
@@ -273,7 +309,10 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
                 record.state = PreviewInstanceState::Stopped;
                 record.pid = None;
                 record.updated_at = now();
-            } else if record.state == PreviewInstanceState::Stopped {
+            } else if record.state == PreviewInstanceState::Stopped
+                && record.operation_id == operation_id
+                && record.revision == revision
+            {
                 // 并发 stop 已完成 → 幂等成功。
             } else {
                 return Err(conflict("mark_stopped lost the race", record));

@@ -1,0 +1,32 @@
+[package]
+name = "rcoder-toasty-t0"
+version = "0.1.0"
+edition = "2024"
+[features]
+common-contract = ["dep:shared_types", "dep:chrono", "dep:serde_json", "dep:uuid", "dep:tracing", "dep:tempfile", "dep:nix", "dep:serde", "dep:percent-encoding"]
+userapp-turso = ["common-contract"]
+pg = ["common-contract"]
+
+[dependencies]
+toasty = { version = "=0.10.0", features = ["turso", "postgresql"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+futures = "0.3"
+sha2 = "0.10"
+async-trait = "0.1"
+toasty-core = "=0.10.0"
+toasty-driver-postgresql = "=0.10.0"
+toasty-driver-turso = "=0.10.0"
+tokio-postgres = "0.7"
+
+serde = { version = "1", features = ["derive"], optional = true }
+percent-encoding = { version = "2", optional = true }
+shared_types = { path = "../../crates/shared_types", optional = true }
+chrono = { version = "0.4", optional = true }
+serde_json = { version = "1", optional = true }
+uuid = { version = "1.26", features = ["v4"], optional = true }
+tracing = { version = "0.1", optional = true }
+tempfile = { version = "3", optional = true }
+nix = { version = "0.31.3", features = ["fs"], optional = true }
+
+[workspace]

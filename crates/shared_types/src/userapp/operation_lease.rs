@@ -168,6 +168,20 @@ pub fn userapp_operation_has_final_evidence(operation: &crate::UserAppOperationR
                             == Some(evidence.context.executor_id.as_str())
                 })
         }
+        Kind::PrepareProdDatabase => serde_json::from_value::<crate::DatabasePreparationEvidence>(
+            operation.checkpoint.clone(),
+        )
+        .is_ok_and(|evidence| {
+            evidence.stage == crate::DatabasePreparationStage::ManagementReady
+                && evidence.validate_operation(operation).is_ok()
+        }),
+        Kind::ResetDevDatabasePassword | Kind::ResetProdDatabasePassword => {
+            serde_json::from_value::<crate::DatabasePasswordEvidence>(operation.checkpoint.clone())
+                .is_ok_and(|evidence| {
+                    evidence.stage == crate::DatabasePasswordStage::Verified
+                        && evidence.validate_operation(operation).is_ok()
+                })
+        }
         _ => false,
     }
 }

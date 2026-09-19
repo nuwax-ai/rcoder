@@ -74,7 +74,7 @@ impl UserAppRecycleScanner {
         // 跨副本合并经 PG 影子行——各副本 5s flusher 落库，leader 每轮扫描
         // 读一次最新值取 max（防活跃流量全落其他副本时误回收）。非 PG 模式
         // 退化为纯内存判定（单副本部署，无跨副本问题）。
-        let pg_accessed: std::collections::HashMap<String, DateTime<Utc>> = match self
+        let pg_accessed: std::collections::HashMap<(String, String), DateTime<Utc>> = match self
             .state
             .activity
             .persistence()
@@ -82,13 +82,10 @@ impl UserAppRecycleScanner {
             Some(p) => match p.load_all().await {
                 Ok(rows) => rows
                     .into_iter()
-                    .filter_map(|r| r.last_accessed.map(|t| (r.app_id, t)))
+                    .filter_map(|r| r.last_accessed.map(|t| ((r.app_id, r.lifecycle_id), t)))
                     .collect(),
                 Err(e) => {
-                    warn!(
-                        "[USERAPP_RECYCLE] load activity rows failed, fallback to memory-only view: {e}"
-                    );
-                    Default::default()
+                    return Err(e.context("Activity snapshot unavailable; skip recycling instead of ignoring peer traffic"));
                 }
             },
             None => Default::default(),
@@ -99,12 +96,36 @@ impl UserAppRecycleScanner {
         let mut recycled = 0usize;
 
         for app in apps {
+            let Some(identity) = self
+                .state
+                .userapp_store
+                .get_application(&app.app_id)
+                .await?
+            else {
+                continue;
+            };
+            if identity.state != shared_types::UserAppLifecycleState::Active {
+                continue;
+            }
+            if !self.state.activity.bind_lifecycle(
+                &app.app_id,
+                &identity.lifecycle_id,
+                identity.lifecycle_epoch,
+            ) {
+                continue;
+            }
             let age = app.created_at.as_deref().and_then(age_of);
             // PG 较新时 merge_accessed 会回写内存（保 try_begin_recycle 的 epoch 复核）
-            let last_accessed = match pg_accessed.get(&app.app_id) {
-                Some(pg_t) => Some(self.state.activity.merge_accessed(&app.app_id, *pg_t)),
-                None => self.state.activity.last_accessed_at(&app.app_id),
-            };
+            let last_accessed =
+                match pg_accessed.get(&(app.app_id.clone(), identity.lifecycle_id.clone())) {
+                    Some(pg_t) => self.state.activity.merge_lifecycle_accessed(
+                        &app.app_id,
+                        &identity.lifecycle_id,
+                        identity.lifecycle_epoch,
+                        *pg_t,
+                    ),
+                    None => self.state.activity.last_accessed_at(&app.app_id),
+                };
             let idle =
                 last_accessed.map(|t| now.signed_duration_since(t).to_std().unwrap_or_default());
             let decision = decide_recycle(

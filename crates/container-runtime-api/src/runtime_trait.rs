@@ -130,6 +130,18 @@ pub trait AgentContainerRuntime: Send + Sync {
         ))
     }
 
+    /// Execute only in the captured builder. Callers retain the durable operation
+    /// and runtime lease; no name-based fallback is permitted on target mismatch.
+    async fn exec_builder_control_target(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+        _command: Vec<String>,
+    ) -> ContainerRuntimeResult<ExecResult> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound builder execution is unsupported".into(),
+        ))
+    }
+
     async fn apply_builder_control(
         &self,
         _target: &shared_types::BuilderControlTarget,
@@ -544,6 +556,17 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// Start the captured compute solely for management; preserve wake policy.
+    /// Never substitute ordinary start, which may enable automatic traffic wake.
+    async fn start_app_management_target(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound management startup is unsupported by this runtime".into(),
+        ))
+    }
+
     async fn start_app_target(
         &self,
         _target: &shared_types::UserAppMutationTarget,
@@ -776,6 +799,30 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     ) -> ContainerRuntimeResult<ExecResult> {
         Err(ContainerRuntimeError::ConfigurationError(
             "exec not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// Execute against a captured physical container/pod and deployment generation.
+    /// Caller must own the durable operation and retain its runtime lease. Never
+    /// fall back to name-based exec when identity-bound execution is unavailable.
+    async fn capture_app_configuration_target(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _generation: &str,
+    ) -> ContainerRuntimeResult<shared_types::RuntimeConfigurationTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound configuration target capture is unsupported by this runtime".into(),
+        ))
+    }
+
+    async fn exec_app_configuration_target(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _target: &shared_types::RuntimeConfigurationTarget,
+        _command: Vec<String>,
+    ) -> ContainerRuntimeResult<ExecResult> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound configuration execution is unsupported by this runtime".into(),
         ))
     }
 

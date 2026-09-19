@@ -22,22 +22,36 @@ pub async fn start_http_server(
 
     info!(" config HTTP max_buf_size = 128KB (to prevent HTTP 431 error)");
 
-    let app = app.into_make_service();
-    let mut shutdown_rx_clone = shutdown_tx.subscribe();
+    Ok(spawn_http_listener(listener, app, shutdown_tx.subscribe()))
+}
 
-    let handle = tokio::spawn(async move {
+fn spawn_http_listener(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    mut shutdown_rx_clone: tokio::sync::broadcast::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    let app = app.into_make_service();
+    tokio::spawn(async move {
+        let closing = tokio_util::sync::CancellationToken::new();
+        let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                biased;
                 _ = shutdown_rx_clone.recv() => {
+                    closing.cancel();
                     info!(" HTTP server closed");
                     break;
+                }
+                Some(result) = connections.join_next(), if !connections.is_empty() => {
+                    if let Err(error) = result { tracing::warn!("HTTP connection task failed: {error}"); }
                 }
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
                             let mut app_clone = app.clone();
 
-                            tokio::spawn(async move {
+                            let closing = closing.clone();
+                            connections.spawn(async move {
                                 let mut http_builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
                                 http_builder
                                     .http1()
@@ -55,7 +69,16 @@ pub async fn start_http_server(
                                         match Service::<std::net::SocketAddr>::call(&mut app_clone, addr).await {
                                             Ok(service) => {
                                                 let hyper_service = TowerToHyperService::new(service);
-                                                if let Err(e) = http_builder.serve_connection(io, hyper_service).await
+                                                let connection = http_builder.serve_connection(io, hyper_service);
+                                                tokio::pin!(connection);
+                                                let result = tokio::select! {
+                                                    result = &mut connection => result,
+                                                    _ = closing.cancelled() => {
+                                                        connection.as_mut().graceful_shutdown();
+                                                        connection.await
+                                                    }
+                                                };
+                                                if let Err(e) = result
                                                     && !is_benign_client_disconnect(&*e) {
                                                     tracing::debug!("HTTP connection error ({}): {}", addr, e);
                                                 }
@@ -78,9 +101,9 @@ pub async fn start_http_server(
                 }
             }
         }
-    });
-
-    Ok(handle)
+        drop(listener);
+        while connections.join_next().await.is_some() {}
+    })
 }
 
 /// 判断 `serve_connection` 的错误是否属于"客户端正常断开"这类噪音。
@@ -113,6 +136,80 @@ fn is_benign_client_disconnect(err: &(dyn std::error::Error + Send + Sync + 'sta
 #[cfg(test)]
 mod tests {
     use super::is_benign_client_disconnect;
+
+    #[tokio::test]
+    async fn shutdown_waits_for_admitted_handler_and_closes_keep_alive() {
+        use http_body_util::{BodyExt, Empty};
+        use std::{sync::Arc, time::Duration};
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let route = axum::Router::new().route(
+            "/write",
+            axum::routing::post({
+                let entered = entered.clone();
+                let release = release.clone();
+                move || {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        "committed"
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let mut server = super::spawn_http_listener(listener, route, rx);
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .unwrap();
+        let client = tokio::spawn(connection);
+        let request = || {
+            hyper::Request::builder()
+                .method("POST")
+                .uri("/write")
+                .body(Empty::<bytes::Bytes>::new())
+                .unwrap()
+        };
+        let response = sender.send_request(request());
+        tokio::pin!(response);
+        // Poll the request while waiting for the controlled write to start.
+        tokio::select! {
+            _ = entered.notified() => {},
+            result = &mut response => panic!("write completed before release: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("handler not entered"),
+        }
+        shutdown.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut server)
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "committed"
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(sender.send_request(request()).await.is_err());
+    }
 
     /// 模拟 hyper `Kind::Io`：自身文案不含任何关键字，真因在 cause 链里。
     /// 字符串匹配版对这种错误恒不命中，正是升级 hyper 1.x 后静默失效的形态。

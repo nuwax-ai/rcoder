@@ -9,7 +9,7 @@ use super::*;
     request_body(content = KeepalivePodRequest, description = "容器保活请求"),
     responses(
         (status = 200, description = "成功刷新活动时间", body = HttpResult<KeepalivePodResponse>),
-        (status = 200, description = "参数无效错误信封（code=ERR_VALIDATION；异常统一 200 信封风格）", body = HttpResult<String>),
+        (status = 200, description = "业务错误信封（ERR_VALIDATION 或 ERR_BACKEND_ERROR；活动身份无法核验时不报告保活成功）", body = HttpResult<String>),
         (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
@@ -299,13 +299,16 @@ async fn keepalive_userapp_prod(
     app_id: String,
 ) -> Result<HttpResult<KeepalivePodResponse>, AppError> {
     use shared_types::AppAccessTracker;
-    state.activity.touch(&app_id);
-    // 真值时间戳（节流窗口内为上次 touch 时间——语义正确）
-    let current = state
-        .activity
-        .last_accessed_at(&app_id)
-        .map(|t| t.timestamp_millis().max(0) as u64)
-        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis().max(0) as u64);
+    let Some(observed_at) = state.activity.touch(&app_id).await else {
+        return Ok(HttpResult::error_with_message(
+            shared_types::error_codes::ERR_BACKEND_ERROR,
+            shared_types::current_request_locale(),
+            "Application activity identity is unavailable; activity was not recorded",
+        ));
+    };
+    // Timestamp and lifecycle were captured atomically. Do not fabricate `now`
+    // or read the registry again after another request may have recreated it.
+    let current = observed_at.timestamp_millis().max(0) as u64;
     info!("[POD_KEEPALIVE] userapp prod app touched: app_id={app_id}");
     Ok(HttpResult::success(KeepalivePodResponse {
         existed: true,

@@ -25,12 +25,15 @@ pub use userapp::app_stage::{UserappStage, invalid_app_stage_error};
 pub use userapp::build_event::BuildProgressEvent;
 pub use userapp::db_admin::{
     DbAdminError, DbUserUpsertOutcome, StartPgCredential, UserappDbCreateDatabaseRequest,
+    UserappDbPasswordRecoveryRequest, UserappDbPasswordRecoveryResponse,
     UserappDbResetPasswordRequest, create_pg_database, upsert_pg_user,
 };
 pub use userapp::db_align::{
-    AlignCredentialsOutcome, AlignCredentialsRequest, AlignError, CommandOutcome, PgCommandRunner,
-    align_pg_credentials,
+    AlignCredentialsOutcome, AlignCredentialsRequest, AlignError, CommandOutcome,
+    CredentialMutationEvidence, PgCommandRunner, align_pg_credentials,
+    align_pg_credentials_with_admin,
 };
+pub use userapp::db_password::*;
 pub use userapp::dev_cleanup::{
     BuilderDeletionSnapshot, BuilderRegistryIdentity, UserappDevCleanup, UserappDevDeletion,
     UserappDevDeletionReceipt,
@@ -42,7 +45,8 @@ pub use userapp::forward_contract::{
     SERVICE_TYPE_TASK_AGENT, SERVICE_TYPE_USERAPP, WORKSPACE_PATH_HEADER, WORKSPACE_TYPE_HEADER,
     is_userapp_service_type_value, normalize_computer_service_type,
 };
-pub use userapp::metadata::{AppMetadataPersistence, AppMetadataRecord};
+pub use userapp::metadata::AppMetadataRecord;
+pub use userapp::runtime_configuration::*;
 pub use userapp::runtime_control::{
     ArtifactInput, DesiredState, ERR_OPERATION_ID_CONFLICT, ERR_OPERATION_IN_PROGRESS,
     ERR_PROTOCOL_UNSUPPORTED, ERR_RECOVERY_REQUIRED, ERR_REVISION_MISMATCH,
@@ -78,9 +82,9 @@ pub use preview::{
     PreviewHostIdentity, PreviewInstanceRecord, PreviewInstanceState, PreviewKeepAliveEnvelope,
     PreviewKeepAliveRequest, PreviewKeyInput, PreviewLifecycleStore, PreviewListEntry,
     PreviewOperationKind, PreviewOperationRecord, PreviewOperationState, PreviewProjectIdentity,
-    PreviewRestartEnvelope, PreviewRestartRequest, PreviewRouteResolution, PreviewStartEnvelope,
-    PreviewStartRequest, PreviewStopEnvelope, PreviewStopRequest, PreviewStoreError,
-    is_preview_port, preview_key,
+    PreviewRecoveryEvidence, PreviewRestartEnvelope, PreviewRestartRequest, PreviewRouteResolution,
+    PreviewStartEnvelope, PreviewStartRequest, PreviewStopEnvelope, PreviewStopRequest,
+    PreviewStoreError, is_preview_port, preview_key,
 };
 pub use preview::{PreviewPortAllocation, PreviewPortPoolStatus};
 
@@ -298,3 +302,6 @@ pub use userapp::resource_binding::{
 pub use userapp::operation_lease::*;
 
 pub use userapp::builder_recovery::UserAppBuilderRecovery;
+
+mod operation_flight;
+pub use operation_flight::{FlightAdmissionClosed, FlightGuard, OperationFlightGate};

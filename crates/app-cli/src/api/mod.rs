@@ -48,6 +48,7 @@ use envelope::ApiJson;
         stream_logs,
         submit_deploy,
         deploy_status,
+        activate_runtime_configuration,
         proxy::validate,
         proxy::reload,
         proxy::status,
@@ -165,6 +166,10 @@ fn api_router(state: AppState) -> Router {
         .route("/v1/proxy/upstreams", get(proxy::upstreams))
         .route("/v1/deploy", post(submit_deploy))
         .route("/v1/deploy/status", get(deploy_status))
+        .route(
+            "/v1/runtime/configuration/activate",
+            post(activate_runtime_configuration),
+        )
         .route("/v1/runtime/identity", get(runtime::identity))
         .route("/v1/runtime/status", get(runtime::status))
         .route("/v1/runtime/operations", post(runtime::submit_operation))
@@ -259,7 +264,7 @@ pub(super) struct DeployAcceptedData {
     post,
     path = "/v1/deploy",
     request_body = DeployBody,
-    params(("X-Deploy-Token" = String, Header, description = "Deploy token (container env APP_CLI_DEPLOY_TOKEN)")),
+    params(("X-Deploy-Token" = String, Header, description = "Owner control token (APP_CLI_DEPLOY_TOKEN or owner state file)")),
     responses(
         (status = 202, body = envelope::HttpResult<DeployAcceptedData>, description = "Deploy accepted; poll /v1/deploy/status"),
         (status = 403, body = envelope::HttpResult<String>, description = "Token missing/mismatch or endpoint disabled"),
@@ -274,7 +279,7 @@ async fn submit_deploy(
     headers: axum::http::HeaderMap,
     ApiJson(body): ApiJson<DeployBody>,
 ) -> Response {
-    if let Err(message) = authorize_deploy(&headers) {
+    if let Err(message) = authorize_deploy(&state, &headers) {
         return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
     }
     // 初始化恢复期拒绝运行态变更（P1-01：API 先 bind，恢复完成前写端点门控；
@@ -325,6 +330,7 @@ async fn submit_deploy(
     let admission = tokio::task::spawn_blocking(move || {
         server.try_accept_deploy_with_id(
             DeployRequest {
+                runtime_operation_id: None,
                 url: body.url,
                 release_id: body.release_id,
                 sha256: body.sha256.map(|value| value.to_ascii_lowercase()),
@@ -365,10 +371,10 @@ async fn submit_deploy(
 }
 
 /// 校验部署令牌：env 未配置 = 端点禁用（安全默认——:3010 在 pod 网络内可达）。
-fn authorize_deploy(headers: &axum::http::HeaderMap) -> Result<(), String> {
-    let expected = std::env::var("APP_CLI_DEPLOY_TOKEN")
-        .ok()
-        .filter(|token| !token.trim().is_empty())
+fn authorize_deploy(state: &AppState, headers: &axum::http::HeaderMap) -> Result<(), String> {
+    let expected = state
+        .server
+        .control_token()
         .ok_or_else(|| "deploy endpoint disabled (APP_CLI_DEPLOY_TOKEN not set)".to_string())?;
     let provided = headers
         .get("x-deploy-token")
@@ -378,6 +384,59 @@ fn authorize_deploy(headers: &axum::http::HeaderMap) -> Result<(), String> {
         Ok(())
     } else {
         Err("deploy token mismatch".to_string())
+    }
+}
+
+/// The only startup write accepted before business initialization: acknowledge
+/// credentials already verified by the platform for this exact cold generation.
+#[utoipa::path(
+    post,
+    path = "/v1/runtime/configuration/activate",
+    request_body = shared_types::RuntimeConfigurationActivation,
+    responses(
+        (status = 200, description = "Activation durably recorded; business readiness is separate"),
+        (status = 403, description = "Invalid deployment token"),
+        (status = 409, description = "Runtime is not awaiting managed configuration or identity differs"),
+        (status = 500, description = "Activation commit could not be confirmed")
+    ),
+    tag = "Runtime Control"
+)]
+async fn activate_runtime_configuration(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    ApiJson(body): ApiJson<shared_types::RuntimeConfigurationActivation>,
+) -> Response {
+    if let Err(message) = authorize_deploy(&state, &headers) {
+        return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
+    }
+    let Some(gate) = state.server.configuration_gate() else {
+        return envelope::error(
+            StatusCode::CONFLICT,
+            "CONFIGURATION_NOT_MANAGED",
+            "This runtime has no managed configuration startup gate",
+        );
+    };
+    if !gate.matches(&body) {
+        return envelope::error(
+            StatusCode::CONFLICT,
+            "CONFIGURATION_IDENTITY_MISMATCH",
+            "Configuration activation identity does not match this generation",
+        );
+    }
+    match tokio::task::spawn_blocking(move || state.server.activate_runtime_configuration(&body))
+        .await
+    {
+        Ok(Ok(())) => envelope::ok(StatusCode::OK, json!({"activated": true})),
+        Ok(Err(error)) => envelope::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CONFIGURATION_ACTIVATION_UNCONFIRMED",
+            error.to_string(),
+        ),
+        Err(_) => envelope::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CONFIGURATION_ACTIVATION_UNCONFIRMED",
+            "Configuration activation worker did not return a confirmed result",
+        ),
     }
 }
 

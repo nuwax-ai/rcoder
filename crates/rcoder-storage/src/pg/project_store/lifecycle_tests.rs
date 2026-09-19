@@ -3,40 +3,13 @@ use super::{
     persist_ops::{PersistOp, structural_ops_for_insert},
     writer::{execute_op, lock_ops},
 };
+use crate::db::owner::DatabaseOwner;
 use shared_types::{ProjectAndContainerInfo, ProjectStore, ServiceType};
-use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::{sync::Arc, time::Duration};
 
-async fn pool() -> Option<PgPool> {
-    let dsn = std::env::var("RCODER_PG_TEST_DSN")
-        .ok()
-        .filter(|v| !v.is_empty());
-    if dsn.is_none() {
-        assert_ne!(
-            std::env::var("RCODER_PG_TEST_STRICT").as_deref(),
-            Ok("1"),
-            "strict PG contracts require RCODER_PG_TEST_DSN"
-        );
-        return None;
-    }
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&dsn.unwrap())
-        .await
-        .expect("isolated PostgreSQL");
-    let version: String = sqlx::query_scalar("SHOW server_version")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert!(
-        version.starts_with("17."),
-        "contract environment must use PostgreSQL 17: {version}"
-    );
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("all migrations");
-    Some(pool)
+async fn pool() -> Option<DatabaseOwner> {
+    let dsn = crate::pg::test_support::test_dsn().await?;
+    Some(crate::pg::test_support::database(&dsn).await)
 }
 fn info(id: &str, sid: &str) -> ProjectAndContainerInfo {
     let mut p = ProjectAndContainerInfo::new(id.into());
@@ -44,33 +17,41 @@ fn info(id: &str, sid: &str) -> ProjectAndContainerInfo {
     p.add_session(sid);
     p
 }
+fn snapshot_ops(p: &ProjectAndContainerInfo, sid: &str) -> anyhow::Result<Vec<PersistOp>> {
+    let mut p = p.clone();
+    let mut identity = p.persistence_identity().clone();
+    if identity.revision == 0 {
+        identity.revision = 1;
+    }
+    p.set_persistence_identity(identity);
+    structural_ops_for_insert(&p, sid)
+}
 async fn commit(
-    pool: &PgPool,
+    owner: &DatabaseOwner,
     ops: &[PersistOp],
 ) -> Vec<shared_types::persistence::PersistenceOperationOutcome> {
-    let mut tx = pool.begin().await.unwrap();
-    lock_ops(&mut tx, ops).await.unwrap();
-    let mut outcomes = Vec::new();
-    for op in ops {
-        outcomes.push(execute_op(&mut tx, op).await.unwrap());
-    }
-    tx.commit().await.unwrap();
-    outcomes
+    let ops = ops.to_vec();
+    owner
+        .execute(move |mut db| async move {
+            let mut tx = db.transaction().await?;
+            lock_ops(&mut tx, &ops).await?;
+            let mut outcomes = Vec::new();
+            for op in &ops {
+                outcomes.push(execute_op(&mut tx, op).await?);
+            }
+            tx.commit().await?;
+            Ok(outcomes)
+        })
+        .await
+        .unwrap()
 }
-async fn generation(pool: &PgPool, table: &str, id: &str) -> Option<String> {
-    match table {
-        "projects" => sqlx::query_scalar("SELECT generation FROM projects WHERE project_id=$1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await
-            .unwrap(),
-        "sessions" => sqlx::query_scalar("SELECT generation FROM sessions WHERE session_id=$1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await
-            .unwrap(),
+async fn generation(pool: &DatabaseOwner, table: &str, id: &str) -> Option<String> {
+    let sql = match table {
+        "projects" => "SELECT generation FROM projects WHERE project_id=$1",
+        "sessions" => "SELECT generation FROM sessions WHERE session_id=$1",
         _ => panic!("unsupported test table"),
-    }
+    };
+    crate::pg::test_support::optional_text(pool, sql, id).await
 }
 
 #[tokio::test]
@@ -78,17 +59,13 @@ async fn lifecycle_contract_old_remove_preserves_replacement_and_no_resurrection
     let Some(pool) = pool().await else { return };
     let id = format!("generation-{}", crate::pg::test_support::uuid_suffix());
     let old = info(&id, &format!("{id}-old"));
-    let old_ops = structural_ops_for_insert(&old, &format!("{id}-old")).unwrap();
+    let old_ops = snapshot_ops(&old, &format!("{id}-old")).unwrap();
     commit(&pool, &old_ops).await;
     let mut new = info(&id, &format!("{id}-new"));
     let mut identity = new.persistence_identity().clone();
     identity.predecessor = Some(old.persistence_identity().generation.clone());
     new.set_persistence_identity(identity);
-    commit(
-        &pool,
-        &structural_ops_for_insert(&new, &format!("{id}-new")).unwrap(),
-    )
-    .await;
+    commit(&pool, &snapshot_ops(&new, &format!("{id}-new")).unwrap()).await;
     let delayed = PersistOp::RemoveProject {
         project_id: id.clone(),
         generation: old.persistence_identity().generation.clone(),
@@ -118,7 +95,7 @@ async fn lifecycle_contract_old_remove_preserves_replacement_and_no_resurrection
         commit(&pool, &old_ops)
             .await
             .iter()
-            .all(|o| *o == shared_types::persistence::PersistenceOperationOutcome::Superseded)
+            .all(|o| *o == shared_types::persistence::PersistenceOperationOutcome::Committed)
     );
     assert!(
         generation(&pool, "projects", &id).await.is_none(),
@@ -132,12 +109,65 @@ async fn lifecycle_contract_old_remove_preserves_replacement_and_no_resurrection
 }
 
 #[tokio::test]
+async fn lifecycle_contract_registration_receipt_replays_without_reapplying() {
+    use shared_types::persistence::PersistenceOperationOutcome as Outcome;
+    let Some(pool) = pool().await else { return };
+    let id = format!("receipt{}", crate::pg::test_support::uuid_suffix());
+    let sid = format!("{id}session");
+    let project = info(&id, &sid);
+    let operations = snapshot_ops(&project, &sid).unwrap();
+    assert_eq!(commit(&pool, &operations).await, vec![Outcome::Committed]);
+    // Model a lost COMMIT response: replay the exact queue command, not a newly
+    // admitted write. Revision must not advance again.
+    assert_eq!(commit(&pool, &operations).await, vec![Outcome::Committed]);
+    assert_eq!(
+        crate::pg::test_support::optional_text(
+            &pool,
+            "SELECT row_revision::text FROM projects WHERE project_id=$1",
+            &id
+        )
+        .await
+        .as_deref(),
+        Some("1")
+    );
+    let mut changed = operations.clone();
+    if let PersistOp::RegisterProject { project, .. } = &mut changed[0] {
+        project.request_id = Some("different-input".into());
+    }
+    let rejected = pool
+        .execute(move |mut db| async move {
+            let mut tx = db.transaction().await?;
+            lock_ops(&mut tx, &changed).await?;
+            let result = execute_op(&mut tx, &changed[0]).await;
+            tx.rollback().await?;
+            Ok(result.is_err())
+        })
+        .await
+        .unwrap();
+    assert!(
+        rejected,
+        "same request identity must not accept different inputs"
+    );
+    commit(
+        &pool,
+        &[PersistOp::RemoveProject {
+            project_id: id.clone(),
+            generation: project.persistence_identity().generation.clone(),
+        }],
+    )
+    .await;
+    assert_eq!(commit(&pool, &operations).await, vec![Outcome::Committed]);
+    assert!(generation(&pool, "projects", &id).await.is_none());
+    assert!(generation(&pool, "sessions", &sid).await.is_none());
+}
+
+#[tokio::test]
 async fn lifecycle_contract_delayed_clear_and_remove_preserve_reused_session() {
     let Some(pool) = pool().await else { return };
     let id = format!("sessions-{}", crate::pg::test_support::uuid_suffix());
     let sid = format!("{id}-same");
     let mut p = info(&id, &sid);
-    commit(&pool, &structural_ops_for_insert(&p, &sid).unwrap()).await;
+    commit(&pool, &snapshot_ops(&p, &sid).unwrap()).await;
     let old = p.persistence_identity().sessions[&sid].clone();
     let clear = PersistOp::ClearSessions {
         project_id: id.clone(),
@@ -146,8 +176,11 @@ async fn lifecycle_contract_delayed_clear_and_remove_preserve_reused_session() {
     };
     p.remove_session(&sid);
     p.add_session(&sid);
+    let mut identity = p.persistence_identity().clone();
+    identity.revision = 2;
+    p.set_persistence_identity(identity);
     let new = p.persistence_identity().sessions[&sid].clone();
-    commit(&pool, &structural_ops_for_insert(&p, &sid).unwrap()).await;
+    commit(&pool, &snapshot_ops(&p, &sid).unwrap()).await;
     commit(
         &pool,
         &[
@@ -168,7 +201,6 @@ async fn lifecycle_contract_delayed_clear_and_remove_preserve_reused_session() {
             project_generation: p.persistence_identity().generation.clone(),
             generation: old,
             predecessor: None,
-            container_name: None,
         }],
     )
     .await;
@@ -178,6 +210,43 @@ async fn lifecycle_contract_delayed_clear_and_remove_preserve_reused_session() {
         &[PersistOp::RemoveProject {
             project_id: id,
             generation: p.persistence_identity().generation.clone(),
+        }],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn lifecycle_contract_registration_rejects_session_conflict_atomically() {
+    let Some(pool) = pool().await else { return };
+    let id = format!(
+        "atomicregistration{}",
+        crate::pg::test_support::uuid_suffix()
+    );
+    let sid = format!("{id}session");
+    let owner = info(&id, &sid);
+    assert_eq!(
+        commit(&pool, &snapshot_ops(&owner, &sid).unwrap()).await,
+        vec![shared_types::persistence::PersistenceOperationOutcome::Committed]
+    );
+    let contender_id = format!("{id}contender");
+    let contender = info(&contender_id, &sid);
+    assert_eq!(
+        commit(&pool, &snapshot_ops(&contender, &sid).unwrap()).await,
+        vec![shared_types::persistence::PersistenceOperationOutcome::Superseded]
+    );
+    assert!(
+        generation(&pool, "projects", &contender_id).await.is_none(),
+        "session ownership rejection must roll back the new project"
+    );
+    assert_eq!(
+        generation(&pool, "sessions", &sid).await,
+        Some(owner.persistence_identity().sessions[&sid].clone())
+    );
+    commit(
+        &pool,
+        &[PersistOp::RemoveProject {
+            project_id: id,
+            generation: owner.persistence_identity().generation.clone(),
         }],
     )
     .await;
@@ -239,22 +308,224 @@ async fn lifecycle_contract_container_delete_preserves_changed_association() {
         created_at: chrono::Utc::now(),
         service_url: "http://old".into(),
     };
+    let mut identity = p.persistence_identity().clone();
+    identity.container = Some(shared_types::persistence::ContainerPersistenceIdentity {
+        generation: "registeredold".into(),
+        revision: 1,
+        physical_uid: Some(container.container_id.clone()),
+        predecessor: None,
+        predecessor_revision: None,
+    });
+    p.set_persistence_identity(identity);
     p.set_container(Some(container.clone()));
-    commit(&pool, &structural_ops_for_insert(&p, &sid).unwrap()).await;
+    commit(&pool, &snapshot_ops(&p, &sid).unwrap()).await;
+    // A matching physical UID alone does not authorize deletion: a queued
+    // command must also own the exact registration generation and name.
+    for wrong_target in [
+        (
+            container.container_name.clone(),
+            "stalegeneration".to_owned(),
+        ),
+        (
+            format!("{}other", container.container_name),
+            "registeredold".to_owned(),
+        ),
+    ] {
+        let stale_bulk = PersistOp::DeleteContainerWithProjects {
+            container_id: container.container_id.clone(),
+            containers: vec![wrong_target.clone()],
+            projects: vec![(id.clone(), p.persistence_identity().generation.clone())],
+        };
+        let stale_project = PersistOp::RemoveProjectForContainer {
+            project_id: id.clone(),
+            generation: p.persistence_identity().generation.clone(),
+            container_id: container.container_id.clone(),
+            container_name: wrong_target.0,
+            container_generation: wrong_target.1,
+        };
+        assert_eq!(
+            commit(&pool, &[stale_bulk, stale_project]).await,
+            vec![shared_types::persistence::PersistenceOperationOutcome::Superseded; 2]
+        );
+        assert_eq!(
+            generation(&pool, "projects", &id).await,
+            Some(p.persistence_identity().generation.clone()),
+            "stale deletion must preserve the project and its container association"
+        );
+        assert_eq!(
+            crate::pg::test_support::optional_text(
+                &pool,
+                "SELECT container_generation FROM containers WHERE container_name=$1",
+                &container.container_name,
+            )
+            .await
+            .as_deref(),
+            Some("registeredold")
+        );
+        assert!(
+            crate::pg::test_support::optional_text(
+                &pool,
+                "SELECT container_generation FROM container_tombstones WHERE container_name=$1",
+                &container.container_name,
+            )
+            .await
+            .is_none(),
+            "rejected deletion must not retire the live registration"
+        );
+    }
+    // A second replica loads the predecessor before the first replica replaces it.
+    let config = crate::config::PostgresConfig {
+        url: Some(std::env::var("RCODER_PG_TEST_DSN").unwrap()),
+        ..Default::default()
+    };
+    let (peer, _) = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        peer.container_registration
+            .lock()
+            .unwrap()
+            .get(&container.container_name)
+            .unwrap()
+            .generation,
+        "registeredold"
+    );
     let delayed = PersistOp::DeleteContainerWithProjects {
         container_id: container.container_id.clone(),
+        containers: vec![(container.container_name.clone(), "registeredold".into())],
         projects: vec![(id.clone(), p.persistence_identity().generation.clone())],
     };
+    // Another writer advances the predecessor while this replica still holds
+    // revision 1. A replacement captured from that stale view must not retire it.
+    let original_ops = snapshot_ops(&p, &sid).unwrap();
+    let mut updated_container = original_ops
+        .iter()
+        .find_map(|op| match op {
+            PersistOp::RegisterProject {
+                container: Some(snapshot),
+                ..
+            } => Some(snapshot.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let mut stale_registration = original_ops.clone();
+    if let PersistOp::RegisterProject {
+        request_id,
+        container: Some(c),
+        project,
+    } = &mut stale_registration[0]
+    {
+        *request_id = uuid::Uuid::new_v4().to_string();
+        c.expected_revision = 1;
+        c.service_url = "http://must-rollback".into();
+        project.expected_revision = 99;
+    } else {
+        panic!("expected complete registration");
+    }
+    assert_eq!(
+        commit(&pool, &stale_registration).await,
+        vec![shared_types::persistence::PersistenceOperationOutcome::Superseded]
+    );
+    assert_eq!(
+        crate::pg::test_support::optional_text(
+            &pool,
+            "SELECT service_url FROM containers WHERE container_name=$1",
+            &container.container_name
+        )
+        .await
+        .as_deref(),
+        Some("http://old"),
+        "project CAS rejection must roll back the preceding container update"
+    );
+    updated_container.expected_revision = 1;
+    updated_container.service_url = "http://updated-predecessor".into();
+    assert_eq!(
+        commit(&pool, &[PersistOp::UpsertContainer(updated_container)]).await,
+        vec![shared_types::persistence::PersistenceOperationOutcome::Committed]
+    );
     container.container_id = format!("{id}-new");
     container.container_ip = "10.0.0.2".into();
     container.created_at = chrono::Utc::now();
+    let mut identity = p.persistence_identity().clone();
+    identity.revision = 2;
+    identity.container = Some(shared_types::persistence::ContainerPersistenceIdentity {
+        generation: "registerednew".into(),
+        revision: 1,
+        physical_uid: Some(container.container_id.clone()),
+        predecessor: Some("registeredold".into()),
+        predecessor_revision: Some(1),
+    });
+    p.set_persistence_identity(identity);
     p.set_container(Some(container.clone()));
-    commit(&pool, &structural_ops_for_insert(&p, &sid).unwrap()).await;
+    let stale_replacement = snapshot_ops(&p, &sid)
+        .unwrap()
+        .into_iter()
+        .find_map(|op| match op {
+            PersistOp::RegisterProject {
+                container: Some(snapshot),
+                ..
+            } => Some(PersistOp::UpsertContainer(snapshot)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        commit(&pool, &[stale_replacement]).await,
+        vec![shared_types::persistence::PersistenceOperationOutcome::Superseded]
+    );
+    assert_eq!(
+        crate::pg::test_support::optional_text(
+            &pool,
+            "SELECT service_url FROM containers WHERE container_name=$1",
+            &container.container_name
+        )
+        .await
+        .as_deref(),
+        Some("http://updated-predecessor")
+    );
+    assert!(
+        crate::pg::test_support::optional_text(
+            &pool,
+            "SELECT container_generation FROM container_tombstones WHERE container_name=$1",
+            &container.container_name
+        )
+        .await
+        .is_none()
+    );
+    let mut identity = p.persistence_identity().clone();
+    identity.container.as_mut().unwrap().predecessor_revision = Some(2);
+    p.set_persistence_identity(identity);
+    commit(&pool, &snapshot_ops(&p, &sid).unwrap()).await;
+    super::sync::sync_once(&peer, peer.inner(), &pool)
+        .await
+        .unwrap();
+    let mirrored = peer.get(&id).unwrap();
+    let registration = peer
+        .container_registration
+        .lock()
+        .unwrap()
+        .get(&container.container_name)
+        .unwrap()
+        .clone();
+    assert_eq!(registration.generation, "registerednew");
+    assert_eq!(
+        registration.physical_uid.as_deref(),
+        Some(container.container_id.as_str())
+    );
+    assert_eq!(
+        mirrored.persistence_identity().container.as_ref(),
+        Some(&registration),
+        "peer hydration must publish the project and registration from the same generation"
+    );
+    assert_eq!(
+        mirrored.container_info().unwrap().container_id,
+        container.container_id
+    );
     let owned_delete = PersistOp::RemoveProjectForContainer {
         project_id: id.clone(),
         generation: p.persistence_identity().generation.clone(),
         container_id: format!("{id}-old"),
         container_name: container.container_name.clone(),
+        container_generation: "registeredold".into(),
     };
     assert_eq!(
         commit(&pool, &[owned_delete]).await,
@@ -268,87 +539,82 @@ async fn lifecycle_contract_container_delete_preserves_changed_association() {
         generation(&pool, "projects", &id).await,
         Some(p.persistence_identity().generation.clone())
     );
-    let cid: String =
-        sqlx::query_scalar("SELECT container_id FROM containers WHERE container_name=$1")
-            .bind(&container.container_name)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let cid = crate::pg::test_support::optional_text(
+        &pool,
+        "SELECT container_id FROM containers WHERE container_name=$1",
+        &container.container_name,
+    )
+    .await
+    .unwrap();
     assert_eq!(cid, container.container_id);
     commit(
         &pool,
         &[PersistOp::DeleteContainerWithProjects {
             container_id: container.container_id,
+            containers: vec![(container.container_name.clone(), "registerednew".into())],
             projects: vec![(id, p.persistence_identity().generation.clone())],
         }],
     )
     .await;
+    assert!(peer.writer().flush_and_stop(Duration::from_secs(5)).await);
 }
 
 #[tokio::test]
-async fn lifecycle_contract_legacy_schema_backfill_is_stable() {
-    let Some(pool) = pool().await else { return };
-    let mut tx = pool.begin().await.unwrap();
-    // A transaction-local private schema is rolled back even if an assertion fails.
-    let schema = format!("backfill_{}", crate::pg::test_support::uuid_suffix());
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&mut *tx)
+async fn lifecycle_contract_unversioned_schema_is_rejected_without_adoption() {
+    let Some(dsn) = crate::pg::test_support::test_dsn().await else {
+        return;
+    };
+    let owner = crate::pg::test_support::database(&dsn).await;
+    let schema = format!("legacy_{}", uuid::Uuid::new_v4().simple());
+    let namespace = schema.clone();
+    owner
+        .execute(move |mut db| async move {
+            let mut tx = db.transaction().await?;
+            toasty::sql::statement(format!("CREATE SCHEMA {namespace}"))
+                .exec(&mut tx)
+                .await?;
+            toasty::sql::statement(format!(
+                "CREATE TABLE {namespace}.projects(project_id TEXT PRIMARY KEY)"
+            ))
+            .exec(&mut tx)
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        })
         .await
         .unwrap();
-    sqlx::query("SELECT set_config('search_path',$1,true)")
-        .bind(&schema)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    sqlx::raw_sql(include_str!("../../../migrations/0001_init.sql"))
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO projects(project_id,service_type) VALUES('legacy','web-agent-runner')",
+    let separator = if dsn.contains('?') { "&" } else { "?" };
+    let url = format!("{dsn}{separator}options=-csearch_path%3D{schema}");
+    let rejected = crate::db::postgres::open(
+        &crate::config::PostgresConfig {
+            url: Some(url),
+            ..Default::default()
+        },
+        vec![crate::db::schema::Component::Project],
     )
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO sessions(session_id,project_id) VALUES('legacy-session','legacy')")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    sqlx::raw_sql(include_str!(
-        "../../../migrations/0004_lifecycle_identity.sql"
-    ))
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    let project: String =
-        sqlx::query_scalar("SELECT generation FROM projects WHERE project_id='legacy'")
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-    let session_project: String = sqlx::query_scalar(
-        "SELECT project_generation FROM sessions WHERE session_id='legacy-session'",
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    assert_eq!(project, session_project);
-    assert!(!project.is_empty());
-    let repeated: String =
-        sqlx::query_scalar("SELECT generation FROM projects WHERE project_id='legacy'")
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-    assert_eq!(project, repeated);
-    tx.rollback().await.unwrap();
+    .await;
+    let namespace = schema.clone();
+    let columns = owner.execute(move |mut db| async move {
+        let columns = toasty::sql::query("SELECT column_name::text FROM information_schema.columns WHERE table_schema=$1 AND table_name='projects'")
+            .bind(&namespace).exec(&mut db).await?;
+        toasty::sql::statement(format!("DROP SCHEMA {namespace} CASCADE")).exec(&mut db).await?;
+        Ok(columns.len())
+    }).await.unwrap();
+    assert!(
+        rejected.is_err(),
+        "An old unversioned schema must not be silently adopted"
+    );
+    assert_eq!(
+        columns, 1,
+        "Rejected initialization must not add columns to the old table"
+    );
+    owner.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn lifecycle_contract_flush_failure_shared_between_concurrent_callers() {
     use std::sync::atomic::AtomicI64;
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
-        .unwrap();
-    pool.close().await;
+    let pool = DatabaseOwner::closed_for_test();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tx.send(PersistOp::RemoveProject {
         project_id: "flush-contract".into(),
@@ -382,12 +648,28 @@ async fn lifecycle_contract_cancelled_durable_write_is_queued_and_shutdown_waits
     let store = Arc::new(store);
     let id = format!("cancel-write-{}", crate::pg::test_support::uuid_suffix());
     let sid = format!("{id}-sid");
-    let mut barrier = pool.begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,719324))")
-        .bind(format!("project:{id}"))
-        .execute(&mut *barrier)
-        .await
-        .unwrap();
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let barrier_owner = pool.clone();
+    let key = format!("project:{id}");
+    let barrier = tokio::spawn(async move {
+        barrier_owner
+            .execute(move |mut db| async move {
+                let mut tx = db.transaction().await?;
+                toasty::sql::query(
+                    "SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($1,719324))",
+                )
+                .bind(key)
+                .exec(&mut tx)
+                .await?;
+                let _ = locked_tx.send(());
+                let _ = release_rx.await;
+                tx.rollback().await?;
+                Ok(())
+            })
+            .await
+    });
+    locked_rx.await.unwrap();
     let worker = {
         let store = store.clone();
         let id = id.clone();
@@ -430,7 +712,8 @@ async fn lifecycle_contract_cancelled_durable_write_is_queued_and_shutdown_waits
             .await
             .is_err()
     );
-    barrier.rollback().await.unwrap();
+    release_tx.send(()).unwrap();
+    barrier.await.unwrap().unwrap();
     assert!(
         store
             .shutdown_flush_outcome(Duration::from_secs(5))

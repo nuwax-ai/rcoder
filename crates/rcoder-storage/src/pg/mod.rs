@@ -14,12 +14,10 @@
 // 两业务域目录化(开闭原则:改一个域不碰另一个域的文件):
 // - project_store/  主服务域(ProjectStore 契约的 PG 后端实现全部)
 // - userapp/        Userapp 业务域(activity/metadata)
-pub(crate) mod connection;
 mod project_store;
 
 #[cfg(test)]
 pub(crate) mod test_support;
-pub mod userapp;
 
 // 对外面保持原路径不变(rcoder 消费 pg::sync / pg::leader_selection / PersistWriter):
 pub use project_store::sync;
@@ -38,7 +36,7 @@ use tracing::info;
 
 use shared_types::{ContainerLookup, ProjectAndContainerInfo, ServiceType};
 
-use self::project_store::persist_ops::{ContainerSnapshot, PersistOp, ProjectSnapshot};
+use self::project_store::persist_ops::PersistOp;
 use crate::adapter::{ProjectAdapter, container_entry_key};
 use crate::config::PostgresConfig;
 
@@ -52,6 +50,9 @@ const TOUCH_THROTTLE_TTI: Duration = Duration::from_secs(3600);
 pub struct PgStore {
     /// Serializes local mirror mutation and immutable operation registration; never spans await.
     registration: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    container_registration: std::sync::Mutex<
+        std::collections::HashMap<String, shared_types::persistence::ContainerPersistenceIdentity>,
+    >,
     closing: std::sync::atomic::AtomicBool,
     active_writes: std::sync::atomic::AtomicUsize,
     write_finished: tokio::sync::Notify,
@@ -67,8 +68,8 @@ pub struct PgStore {
     /// 在途 op 计数（enqueue 自增 / writer 提交后自减）。
     /// sync 任务用它做排空屏障：归零后读 PG 即包含本副本全部已提交写。
     pending_ops: Arc<AtomicI64>,
-    /// 连接池（activity 等兄弟持久化组件共用）
-    pool: sqlx::PgPool,
+    database: crate::db::owner::DatabaseOwner,
+    postgres_config: PostgresConfig,
 }
 
 impl PgStore {
@@ -90,9 +91,21 @@ impl PgStore {
                 };
             }
         }
-        self.writer
+        let outcome = self
+            .writer
             .flush_outcome(deadline.saturating_duration_since(tokio::time::Instant::now()))
-            .await
+            .await;
+        if !outcome.is_complete() {
+            return outcome;
+        }
+        match tokio::time::timeout_at(deadline, self.database.shutdown()).await {
+            Ok(Ok(())) => outcome,
+            Ok(Err(error)) => shared_types::FlushOutcome::Incomplete {
+                pending: 0,
+                reason: error.to_string(),
+            },
+            Err(_) => shared_types::FlushOutcome::TimedOut { pending: 0 },
+        }
     }
 
     /// 连接 + 迁移 + 全量加载，构造 PG 后端。
@@ -107,21 +120,18 @@ impl PgStore {
         namespace: String,
         cluster_domain: String,
     ) -> anyhow::Result<(Self, mpsc::Receiver<shared_types::CleanupRequest>)> {
-        let pool = connection::connect_pool(config).await?;
-
-        // 迁移：sqlx migrate 自带 advisory lock，多副本并发启动安全
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(|e| anyhow::anyhow!("PG migrate failed: {e}"))?;
+        let database =
+            crate::db::postgres::open(config, vec![crate::db::schema::Component::Project]).await?;
 
         let (inner, cleanup_rx) = ProjectAdapter::new(namespace, cluster_domain);
+        let container_registration = project_store::load::load_all(&database, &inner).await?;
         let (ops_tx, ops_rx) = mpsc::unbounded_channel();
         let pending_ops = Arc::new(AtomicI64::new(0));
-        let writer = PersistWriter::spawn(pool.clone(), ops_rx, Arc::clone(&pending_ops));
+        let writer = PersistWriter::spawn(database.clone(), ops_rx, Arc::clone(&pending_ops));
 
         let store = Self {
             registration: std::sync::Mutex::new(std::collections::HashMap::new()),
+            container_registration: std::sync::Mutex::new(container_registration),
             closing: std::sync::atomic::AtomicBool::new(false),
             active_writes: std::sync::atomic::AtomicUsize::new(0),
             write_finished: tokio::sync::Notify::new(),
@@ -130,9 +140,9 @@ impl PgStore {
             touch_throttled: Cache::builder().time_to_idle(TOUCH_THROTTLE_TTI).build(),
             writer,
             pending_ops,
-            pool: pool.clone(),
+            database,
+            postgres_config: config.clone(),
         };
-        project_store::load::load_all(&pool, &store.inner).await?;
         let stats = store.inner.get_stats();
         info!(
             "[STORAGE_PG] boot load complete: projects={} containers={} sessions={}",
@@ -151,9 +161,8 @@ impl PgStore {
         &self.writer
     }
 
-    /// 连接池（activity 等兄弟持久化组件构造用）
-    pub fn pool(&self) -> &sqlx::PgPool {
-        &self.pool
+    pub fn postgres_config(&self) -> &PostgresConfig {
+        &self.postgres_config
     }
 
     /// 等待在途 op 全部落库（sync 任务的排空屏障；二次确认防批处理间隙误判）
@@ -176,6 +185,7 @@ impl PgStore {
 
     /// 非阻塞 enqueue（结构性 op）。队列无界，写入即返回。
     fn enqueue_structural(&self, op: PersistOp) {
+        self.register_container_intent(&op);
         self.pending_ops.fetch_add(1, Ordering::AcqRel);
         if let Err(op) = self.ops_tx.send(op) {
             // Retain the pending count: a closed queue is not durable success.
@@ -209,32 +219,142 @@ impl PgStore {
         &self,
         mut info: Arc<ProjectAndContainerInfo>,
         retired: &std::collections::HashMap<String, String>,
-    ) -> Arc<ProjectAndContainerInfo> {
-        if let Some(existing) = self.inner.get(info.project_id()) {
-            Arc::make_mut(&mut info)
-                .set_persistence_identity(existing.persistence_identity().clone());
+    ) -> anyhow::Result<Arc<ProjectAndContainerInfo>> {
+        let supplied = info.persistence_identity().clone();
+        let mut identity = if let Some(existing) = self.inner.get(info.project_id()) {
+            let current = existing.persistence_identity();
+            anyhow::ensure!(
+                supplied.revision == 0
+                    || (supplied.generation == current.generation
+                        && supplied.revision == current.revision),
+                "Project registration changed; stale snapshot cannot be rebased"
+            );
+            current.clone()
         } else if let Some(previous) = retired.get(info.project_id()) {
             let mut identity = shared_types::persistence::ProjectPersistenceIdentity::default();
             for sid in info.sessions() {
                 identity.sessions.insert(sid.clone(), uuid_generation());
             }
             identity.predecessor = Some(previous.clone());
-            Arc::make_mut(&mut info).set_persistence_identity(identity);
+            identity
+        } else {
+            supplied.clone()
+        };
+        identity.revision = identity
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Project registration revision exhausted"))?;
+        identity.container = if let Some(basic) = info.container_info() {
+            let key = container_entry_key(&info);
+            let registrations = self
+                .container_registration
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let current = registrations
+                .get(&key)
+                .cloned()
+                .or_else(|| identity.container.clone());
+            let physical_uid = (!basic.container_id.is_empty()).then(|| basic.container_id.clone());
+            if let (Some(previous), Some(supplied)) = (&current, &supplied.container) {
+                anyhow::ensure!(
+                    supplied.generation == previous.generation
+                        && supplied.revision == previous.revision,
+                    "Container registration changed; stale snapshot cannot be rebased"
+                );
+            }
+            let next = match current {
+                Some(mut previous)
+                    if previous.physical_uid == physical_uid || previous.physical_uid.is_none() =>
+                {
+                    previous.revision = previous.revision.checked_add(1).ok_or_else(|| {
+                        anyhow::anyhow!("Container registration revision exhausted")
+                    })?;
+                    previous.physical_uid = physical_uid;
+                    previous
+                }
+                Some(previous) => {
+                    anyhow::ensure!(
+                        physical_uid.is_some(),
+                        "A placeholder cannot clear a bound container identity"
+                    );
+                    shared_types::persistence::ContainerPersistenceIdentity {
+                        generation: uuid_generation(),
+                        revision: 1,
+                        physical_uid,
+                        predecessor: Some(previous.generation),
+                        predecessor_revision: Some(previous.revision),
+                    }
+                }
+                None => shared_types::persistence::ContainerPersistenceIdentity {
+                    generation: uuid_generation(),
+                    revision: 1,
+                    physical_uid,
+                    predecessor: None,
+                    predecessor_revision: None,
+                },
+            };
+            Some(next)
+        } else {
+            None
+        };
+        Arc::make_mut(&mut info).set_persistence_identity(identity);
+        Ok(info)
+    }
+
+    /// Caller holds registration, matching the prepare/sync lock order.
+    fn container_deletion_targets(&self, uid: &str) -> Vec<(String, String)> {
+        let rows = self
+            .container_registration
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut targets: Vec<_> = rows
+            .iter()
+            .filter(|(_, identity)| identity.physical_uid.as_deref() == Some(uid))
+            .map(|(name, identity)| (name.clone(), identity.generation.clone()))
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    /// Register accepted immutable intents. A retry of an old queued batch must
+    /// never roll the local registration cursor back to an older generation.
+    fn register_container_intent(&self, op: &PersistOp) {
+        let snapshot = match op {
+            #[cfg(test)]
+            PersistOp::UpsertContainer(snapshot) => snapshot,
+            PersistOp::RegisterProject {
+                container: Some(snapshot),
+                ..
+            } => snapshot,
+            _ => return,
+        };
+        let mut rows = self
+            .container_registration
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let replace = rows.get(&snapshot.container_name).is_none_or(|current| {
+            (current.generation == snapshot.generation
+                && current.revision <= snapshot.expected_revision)
+                || (snapshot.predecessor.as_ref() == Some(&current.generation)
+                    && snapshot.predecessor_revision == Some(current.revision))
+        });
+        if replace {
+            rows.insert(
+                snapshot.container_name.clone(),
+                shared_types::persistence::ContainerPersistenceIdentity {
+                    generation: snapshot.generation.clone(),
+                    revision: snapshot.expected_revision.saturating_add(1),
+                    physical_uid: snapshot.container_id.clone(),
+                    predecessor: snapshot.predecessor.clone(),
+                    predecessor_revision: snapshot.predecessor_revision,
+                },
+            );
         }
-        info
     }
 
     /// 从 info 构造并按 FK 顺序（先容器后 project）入队快照。
     fn persist_upsert(&self, info: &ProjectAndContainerInfo) -> anyhow::Result<()> {
-        if let Some(basic) = info.container_info()
-            && let Some(st) = info.service_type()
-        {
-            let snapshot = ContainerSnapshot::from_info(&container_entry_key(info), &basic, &st);
-            self.enqueue_structural(PersistOp::UpsertContainer(Box::new(snapshot)));
-        }
-        self.enqueue_structural(PersistOp::UpsertProject(Box::new(
-            ProjectSnapshot::from_info(info)?,
-        )));
+        self.enqueue_structural(project_store::persist_ops::registration_for_info(info)?);
         Ok(())
     }
 }

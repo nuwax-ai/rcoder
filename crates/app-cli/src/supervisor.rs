@@ -88,6 +88,7 @@ async fn run_inner(
     pg: Option<shared_types::StartPgCredential>,
 ) -> Result<()> {
     runtime_status.set_ready(false);
+    let pg = resolve_run_pg(pg)?;
     // 1. 自动发现子项目 + 组装服务清单
     let release = manifest::read_release_lock(&args.workspace).context("load release lock")?;
     validate_runtime_compatibility(&release)?;
@@ -99,6 +100,11 @@ async fn run_inner(
         .filter(|service| service.enabled)
         .cloned()
         .collect();
+    // Validate every service before migrations or process launch can mutate runtime.
+    for spec in &specs {
+        service_environment(spec, pg.as_ref())?;
+    }
+
     // dev 形态编排信号：[devrun].command 优先、[run].command 兜底（源码态 dev 链路）。
     // R08：dev_profile 由调用方显式传递（server 形态 = 本次操作的 Source
     // 形态；直跑形态 = env 兜底）——不再在编排内部读 env
@@ -110,12 +116,12 @@ async fn run_inner(
     let workspace_index_port =
         crate::workspace_index::index_port_if_eligible(&args.workspace, &specs);
 
-    // 2. wait PG（PG 由 supervisor [program:postgresql] 托管，秒级就绪；失败不阻断）。
+    // 2. Wait for the declared PostgreSQL dependency before starting services.
     // N01：数据库前置按运行计划**声明**决定——仅当存在启用服务带 migrate
     // 命令或显式 APP_CLI_REQUIRE_PG=1 时才探测；纯静态/前端项目不轮询
     // pg_isready（60s 等待不得阻塞无数据库需求的启动）。
     if workspace_needs_pg(&specs) {
-        wait_for_pg().await?;
+        wait_for_pg(pg.as_ref()).await?;
     } else {
         info!("⏭  no service declares database usage (migrate); skipping PG readiness wait");
     }
@@ -158,7 +164,7 @@ async fn run_inner(
             if run_migrations && !spec.run.migrate.is_empty() {
                 info!("🛠️  migrate {}", spec.service_id);
                 if let Err(e) =
-                    run_transient(&spec.run.migrate, &args.workspace.join(&spec.dir)).await
+                    run_migration_with_receipt(spec, &release, &args.workspace, pg.as_ref()).await
                 {
                     let error = format!("migrate {}: {e:#}", spec.service_id);
                     warn!("⚠️  {error} — 跳过该服务，继续启动其余服务");
@@ -469,6 +475,72 @@ pub(crate) fn validate_runtime_compatibility(
     Ok(())
 }
 
+/// Capture credentials once per orchestration, before launching any command.
+/// Managed container env overrides artifact defaults; request credentials win.
+pub(crate) fn resolve_run_pg(
+    supplied: Option<shared_types::StartPgCredential>,
+) -> Result<Option<shared_types::StartPgCredential>> {
+    if supplied.is_some() {
+        return Ok(supplied);
+    }
+    let user = std::env::var("POSTGRES_USER");
+    let password = std::env::var("POSTGRES_PASSWORD");
+    match (user, password) {
+        (Ok(username), Ok(password)) => {
+            Ok(Some(shared_types::StartPgCredential { username, password }))
+        }
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => Ok(None),
+        _ => anyhow::bail!(
+            "Runtime PostgreSQL credentials must provide both POSTGRES_USER and POSTGRES_PASSWORD as Unicode"
+        ),
+    }
+}
+
+pub(crate) fn service_environment(
+    spec: &ServiceSpec,
+    pg: Option<&shared_types::StartPgCredential>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut env: std::collections::BTreeMap<_, _> = spec.env.clone().into_iter().collect();
+    if let Some(pg) = pg {
+        env.insert("POSTGRES_USER".into(), pg.username.clone());
+        env.insert("POSTGRES_PASSWORD".into(), pg.password.clone());
+        let database_url = match env.get("DATABASE_URL") {
+            Some(value) => Some(value.clone()),
+            None => match std::env::var("DATABASE_URL") {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(_) => anyhow::bail!("DATABASE_URL must be valid Unicode"),
+            },
+        };
+        if let Some(database_url) = database_url.filter(|value| !value.is_empty()) {
+            env.insert(
+                "DATABASE_URL".into(),
+                database_url_with_credentials(&database_url, pg)?,
+            );
+        }
+    }
+    Ok(env)
+}
+
+fn database_url_with_credentials(
+    value: &str,
+    pg: &shared_types::StartPgCredential,
+) -> Result<String> {
+    // Parse errors deliberately exclude the original URL, which may contain secrets.
+    let mut url = reqwest::Url::parse(value)
+        .map_err(|_| anyhow::anyhow!("Runtime DATABASE_URL is invalid"))?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") || url.host_str().is_none() {
+        anyhow::bail!("Runtime DATABASE_URL must be a PostgreSQL connection URL");
+    }
+    // URL userinfo setters preserve percent signs; encode literal percent first
+    // so a password such as "%40" does not become "@" at the database driver.
+    url.set_username(&pg.username.replace('%', "%25"))
+        .map_err(|_| anyhow::anyhow!("Cannot set DATABASE_URL username"))?;
+    url.set_password(Some(&pg.password.replace('%', "%25")))
+        .map_err(|_| anyhow::anyhow!("Cannot set DATABASE_URL password"))?;
+    Ok(url.into())
+}
+
 // ── PG 等待 ──────────────────────────────────────────────────────────────────
 
 /// 数据库需求判定（N01：声明式，非环境猜测）。
@@ -483,8 +555,10 @@ pub(crate) fn workspace_needs_pg(specs: &[ServiceSpec]) -> bool {
         .any(|spec| spec.enabled && !spec.run.migrate.is_empty())
 }
 
-/// pg_isready 轮询（最多 30 次 × 2s = 60s），失败不阻断（PG 可能晚于 app-cli 启）。
-pub(crate) async fn wait_for_pg() -> Result<()> {
+/// Probe server availability before startup; failure prevents orchestration.
+/// pg_isready does not authenticate the supplied password. Credential application
+/// must separately verify a real TCP login before marking a version applied.
+pub(crate) async fn wait_for_pg(pg: Option<&shared_types::StartPgCredential>) -> Result<()> {
     // 本地开发逃生开关：前端服务不依赖 PG 时跳过 60s pg_isready 轮询（生产环境不设）。
     if std::env::var_os("APP_CLI_SKIP_PG_WAIT").is_some() {
         warn!("⏭  APP_CLI_SKIP_PG_WAIT set; skipping PostgreSQL readiness check (dev only)");
@@ -492,8 +566,8 @@ pub(crate) async fn wait_for_pg() -> Result<()> {
     }
     let host = std::env::var("PGHOST").unwrap_or_else(|_| "localhost".into());
     let port = std::env::var("PGPORT").unwrap_or_else(|_| "5432".into());
-    let user = std::env::var("POSTGRES_USER").unwrap_or_else(|_| "dev".into());
-    let pwd = std::env::var("POSTGRES_PASSWORD").unwrap_or_else(|_| "dev".into());
+    let user = pg.map_or("dev", |pg| pg.username.as_str());
+    let pwd = pg.map_or("dev", |pg| pg.password.as_str());
 
     for i in 1..=30u8 {
         let result = Command::new("pg_isready")
@@ -502,8 +576,8 @@ pub(crate) async fn wait_for_pg() -> Result<()> {
             .arg("-p")
             .arg(&port)
             .arg("-U")
-            .arg(&user)
-            .env("PGPASSWORD", &pwd)
+            .arg(user)
+            .env("PGPASSWORD", pwd)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -625,7 +699,7 @@ async fn start_service(
     let mut cmd = Command::new(crate::win_cmd::resolve_spawn_program(&argv[0]));
     cmd.args(&argv[1..])
         .current_dir(&cwd)
-        .envs(&spec.env)
+        .envs(service_environment(spec, pg)?)
         // Runtime-owned variables are applied last so even a hand-crafted
         // release lock cannot override service identity, paths, or ports.
         .env("HOSTNAME", "0.0.0.0")
@@ -633,12 +707,6 @@ async fn start_service(
         .env("APP_LOG_DIR", &service_log_dir)
         .env("APP_SERVICE_ID", &spec.service_id)
         .env("APP_RELEASE_ID", release_id);
-    // R08：每操作 PG 凭据 last-wins（运行时变量语义：覆盖 spec env 与
-    // 进程 env 透传——用户改密后的新凭据必须到达服务进程）
-    if let Some(pg) = pg {
-        cmd.env("POSTGRES_USER", &pg.username)
-            .env("POSTGRES_PASSWORD", &pg.password);
-    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = spawn_managed(cmd)
@@ -672,17 +740,51 @@ async fn start_service(
 ///
 /// 捕获 stdout/stderr（不 `Stdio::null()` 丢弃）：成功走 `info!`，失败带 stderr 返回错误，
 /// 便于排障（Fail Fast：暴露而非吞掉）。
-pub(crate) async fn run_transient(argv: &[String], cwd: &Path) -> Result<()> {
-    run_transient_with_timeout(argv, cwd, Duration::from_secs(300)).await
+pub(crate) async fn run_migration_with_receipt(
+    spec: &ServiceSpec,
+    release: &manifest::ReleaseLock,
+    workspace: &Path,
+    pg: Option<&shared_types::StartPgCredential>,
+) -> Result<()> {
+    let environment = service_environment(spec, pg)?;
+    let identity = crate::migration_journal::identity(release, &spec.service_id)?;
+    let Some(receipt) = crate::migration_journal::MigrationJournal::begin(workspace, identity)?
+    else {
+        info!(service = %spec.service_id, "Migration already confirmed for this artifact");
+        return Ok(());
+    };
+    run_transient_with_env(&spec.run.migrate, &workspace.join(&spec.dir), &environment).await?;
+    receipt
+        .complete()
+        .context("persist confirmed database migration")
 }
 
+pub(crate) async fn run_transient_with_env(
+    argv: &[String],
+    cwd: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    run_transient_with_environment_and_timeout(argv, cwd, env, Duration::from_secs(300)).await
+}
+
+#[cfg(test)]
 async fn run_transient_with_timeout(argv: &[String], cwd: &Path, timeout: Duration) -> Result<()> {
+    run_transient_with_environment_and_timeout(argv, cwd, &Default::default(), timeout).await
+}
+
+async fn run_transient_with_environment_and_timeout(
+    argv: &[String],
+    cwd: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+    timeout: Duration,
+) -> Result<()> {
     let program = argv.first().context("migration command is empty")?;
     // R01：migrate 同样走受管进程树——shell 包装的迁移命令 spawn 的子孙
     // （工作进程/DB writer）整树归属，超时与收尾均收束确认。
     let mut cmd = Command::new(crate::win_cmd::resolve_spawn_program(program));
     cmd.args(&argv[1..])
         .current_dir(cwd)
+        .envs(env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child =
@@ -974,6 +1076,105 @@ mod tests {
             logs: Vec::new(),
             env: Default::default(),
         }
+    }
+
+    #[test]
+    fn runtime_url_replaces_credentials_without_losing_database_options() {
+        let pg = shared_types::StartPgCredential {
+            username: "runtimeuser".into(),
+            password: "new@:/#?%40password".into(),
+        };
+        let value = database_url_with_credentials(
+            "postgresql://old:stale@localhost:5433/business?sslmode=disable",
+            &pg,
+        )
+        .unwrap();
+        let url = reqwest::Url::parse(&value).unwrap();
+        assert_eq!(url.username(), "runtimeuser");
+        assert_eq!(url.host_str(), Some("localhost"));
+        assert_eq!(url.port(), Some(5433));
+        assert_eq!(url.path(), "/business");
+        assert_eq!(url.query(), Some("sslmode=disable"));
+        assert!(!value.contains("stale"));
+        assert!(value.contains("%40"));
+        assert!(value.contains("%2540password"));
+        assert_eq!(url.fragment(), None);
+        let error = database_url_with_credentials("not a url privatepassword", &pg).unwrap_err();
+        assert!(!error.to_string().contains("privatepassword"));
+    }
+
+    #[test]
+    fn operation_credentials_override_artifact_defaults_and_survive_spec_roundtrip() {
+        let pg = resolve_run_pg(Some(shared_types::StartPgCredential {
+            username: "runtimeuser".into(),
+            password: "runtimepassword".into(),
+        }))
+        .unwrap()
+        .unwrap();
+        let mut spec = spec_with(None);
+        spec.env
+            .insert("POSTGRES_USER".into(), "artifactuser".into());
+        spec.env
+            .insert("POSTGRES_PASSWORD".into(), "artifactpassword".into());
+        spec.env.insert("OTHER_SETTING".into(), "retained".into());
+        spec.env.insert(
+            "DATABASE_URL".into(),
+            "postgresql://artifactuser:artifactpassword@localhost/dev".into(),
+        );
+        let env = service_environment(&spec, Some(&pg)).unwrap();
+        assert_eq!(env["POSTGRES_USER"], "runtimeuser");
+        assert_eq!(env["POSTGRES_PASSWORD"], "runtimepassword");
+        assert_eq!(env["OTHER_SETTING"], "retained");
+        assert_eq!(
+            env["DATABASE_URL"],
+            "postgresql://runtimeuser:runtimepassword@localhost/dev"
+        );
+        let file = crate::svc_spec::ServiceSpecFile {
+            release_id: "release1".into(),
+            service_id: "service1".into(),
+            cwd: ".".into(),
+            argv: vec!["node".into()],
+            env,
+            port: Some(4200),
+        };
+        let decoded: crate::svc_spec::ServiceSpecFile =
+            toml::from_str(&toml::to_string(&file).unwrap()).unwrap();
+        assert_eq!(decoded.env["POSTGRES_PASSWORD"], "runtimepassword");
+        assert!(
+            !decoded
+                .runtime_env_overrides(Path::new("logs"))
+                .contains_key("POSTGRES_PASSWORD")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn migration_process_receives_captured_runtime_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = spec_with(None);
+        spec.env.insert("POSTGRES_USER".into(), "staleuser".into());
+        spec.env
+            .insert("POSTGRES_PASSWORD".into(), "stalepassword".into());
+        let pg = shared_types::StartPgCredential {
+            username: "operationuser".into(),
+            password: "operationpassword".into(),
+        };
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf '%s\n%s\n' \"$POSTGRES_USER\" \"$POSTGRES_PASSWORD\" > credentials".into(),
+        ];
+        run_transient_with_env(
+            &argv,
+            root.path(),
+            &service_environment(&spec, Some(&pg)).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("credentials")).unwrap(),
+            "operationuser\noperationpassword\n"
+        );
     }
 
     /// N01：数据库需求声明式判定——migrate 命令或显式 env 才探测 PG。

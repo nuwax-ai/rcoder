@@ -1,45 +1,38 @@
-//! PG 契约测试：与进程内实现复跑同一断言全集（`preview_coordinator::contract_suite`）。
-//!
-//! 运行条件与既有 PG 测试一致：`RCODER_PG_TEST_DSN` 指向可破坏的测试库；
-//! 用例自建独立临时数据库（`preview_ct_<pid><nanos>`），跑完即删，不污染、
-//! 不依赖既有表。未设 DSN 静默跳过（CI 无 PG 不红）。
+//! Run the same coordinator contract against the actual Toasty backend. This
+//! explicit integration target requires a disposable PostgreSQL DSN.
 #![cfg(all(test, feature = "pg"))]
 
-use preview_coordinator::contract_suite;
-
 #[tokio::test]
+#[ignore = "requires RCODER_PG_TEST_DSN for a disposable PostgreSQL instance"]
 async fn pg_preview_store_satisfies_contract() {
-    let Some(dsn) = crate::pg::test_support::test_dsn().await else {
-        eprintln!("skipping: RCODER_PG_TEST_DSN not set");
-        return;
+    let dsn = std::env::var("RCODER_PG_TEST_DSN").expect("explicit PostgreSQL test DSN required");
+    let mut admin = toasty::Db::builder()
+        .connect(&dsn)
+        .await
+        .expect("connect admin");
+    let schema = format!("preview_ct_{}", uuid::Uuid::new_v4().simple());
+    toasty::sql::statement(format!("CREATE SCHEMA {schema}"))
+        .exec(&mut admin)
+        .await
+        .unwrap();
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    let config = crate::config::PostgresConfig {
+        url: Some(format!("{dsn}{separator}options=-csearch_path%3D{schema}")),
+        ..Default::default()
     };
-    let admin = sqlx::PgPool::connect(&dsn).await.expect("connect admin");
-    let db_name = format!("preview_ct_{}", crate::pg::test_support::uuid_suffix());
-    // 动态库名仅测试内生成（hex 安全字符）；SqlSafeStr 逃生口与 test_support 同源。
-    let create = format!(r#"CREATE DATABASE "{db_name}""#);
-    sqlx::query(sqlx::AssertSqlSafe(create))
-        .execute(&admin)
+    let store = std::sync::Arc::new(super::PgPreviewStore::connect(&config).await.unwrap());
+    let tested = store.clone();
+    let result =
+        tokio::spawn(
+            async move { preview_coordinator::contract_suite::run(tested.as_ref()).await },
+        )
+        .await;
+    store.close().await.expect("drain preview database owner");
+    // Only the schema just created by this test is ever removed. Cleanup also
+    // runs when a contract assertion panics in the spawned test task.
+    toasty::sql::statement(format!("DROP SCHEMA {schema} CASCADE"))
+        .exec(&mut admin)
         .await
-        .expect("create test database");
-    // DSN 形如 postgres://user:pass@host:port/db[?params]，替换路径库段。
-    let db_dsn = rewrite_dsn_database(&dsn, &db_name);
-    let pool = sqlx::PgPool::connect(&db_dsn)
-        .await
-        .expect("connect test database");
-    let store = super::PgPreviewStore::open(pool.clone())
-        .await
-        .expect("open preview store");
-    contract_suite::run(&store).await;
-    store.close().await;
-    let drop = format!(r#"DROP DATABASE "{db_name}" WITH (FORCE)"#);
-    let dropped = sqlx::query(sqlx::AssertSqlSafe(drop)).execute(&admin).await;
-    admin.close().await;
-    dropped.expect("drop test database");
-}
-
-fn rewrite_dsn_database(dsn: &str, db_name: &str) -> String {
-    let (head, _tail) = dsn
-        .rsplit_once('/')
-        .expect("DSN must be postgres://user:pass@host:port/db");
-    format!("{head}/{db_name}")
+        .unwrap();
+    result.expect("Preview PostgreSQL contract failed");
 }

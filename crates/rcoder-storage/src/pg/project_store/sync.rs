@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::PgPool;
+use crate::db::owner::DatabaseOwner;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -43,7 +43,7 @@ pub async fn run_sync_loop(store: Arc<PgStore>, mut shutdown_rx: broadcast::Rece
             biased;
             _ = shutdown_rx.recv() => break,
             _ = tokio::time::sleep(SYNC_INTERVAL) => {
-                if let Err(e) = sync_once(&store, store.inner(), store.pool()).await {
+                if let Err(e) = sync_once(&store, store.inner(), &store.database).await {
                     warn!("[STORAGE_PG] cross-replica sync failed (will retry): {e:#}");
                 }
             }
@@ -56,7 +56,7 @@ pub async fn run_sync_loop(store: Arc<PgStore>, mut shutdown_rx: broadcast::Rece
 pub(crate) async fn sync_once(
     store: &PgStore,
     inner: &crate::adapter::ProjectAdapter,
-    pool: &PgPool,
+    pool: &DatabaseOwner,
 ) -> anyhow::Result<()> {
     // 排空屏障：本副本写全部落库后，PG 快照才可作为 diff 基准。
     // 超时（PG 故障重试中）跳过本轮，避免用旧快照误删镜像条目。
@@ -65,18 +65,22 @@ pub(crate) async fn sync_once(
         return Ok(());
     }
 
-    let baseline: HashMap<_, _> = inner.iter().into_iter().collect();
+    let (baseline, baseline_containers): (HashMap<_, _>, _) = {
+        let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            inner.iter().into_iter().collect(),
+            store
+                .container_registration
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
+        )
+    };
 
     // 三表读入单事务（REPEATABLE READ）：三次独立 pool acquire 会拿到三个
     // 不同语句快照，跨快照可产生瞬态"孤儿 session"（project 在快照 1 有、
     // 快照 2 无）触发误判。单事务保证三表同一一致性视图。
-    let mut snap_tx = pool
-        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
-        .await?;
-    let containers = repo::fetch_all_containers(&mut *snap_tx).await?;
-    let projects = repo::fetch_all_projects(&mut *snap_tx).await?;
-    let sessions = repo::fetch_all_sessions(&mut *snap_tx).await?;
-    drop(snap_tx); // 只读快照，即可释放
+    let (containers, projects, sessions) = super::database::snapshot(pool).await?;
 
     // PG 侧索引
     let pg_project_ids: std::collections::HashSet<&str> =
@@ -121,6 +125,8 @@ pub(crate) async fn sync_once(
             let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
             if let (Some(expected), Some(current)) =
                 (baseline.get(&project_id), inner.get(&project_id))
+                && expected.persistence_identity().generation
+                    == current.persistence_identity().generation
                 && expected.persistence_identity().sessions.get(&sid)
                     == current.persistence_identity().sessions.get(&sid)
             {
@@ -133,13 +139,6 @@ pub(crate) async fn sync_once(
     let container_by_name = container_rows_to_map(containers);
     let mut changed = 0usize;
     let mut added = 0usize;
-    let mut sessions_by_project: HashMap<String, Vec<String>> = HashMap::new();
-    for row in &sessions {
-        sessions_by_project
-            .entry(row.project_id.clone())
-            .or_default()
-            .push(row.session_id.clone());
-    }
     for row in projects {
         let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
         let existing = inner.get(&row.project_id);
@@ -153,32 +152,38 @@ pub(crate) async fn sync_once(
         } else if baseline.contains_key(&row.project_id) {
             continue;
         }
-        if let Some(current) = &existing
-            && project_signature(current) == row_signature(&row)
-        {
-            continue; // 无变化
-        }
-        let Some(mut info) = hydrate_project(&row, &container_by_name) else {
-            continue; // hydrate 内已告警（service_type 未知等）
-        };
-        // merge 语义：整条 insert 会把快照后本地新增的 session 抛掉（hydrate
-        // 出的 info 无 session 集合）——先保留镜像现有 sessions 再替换
-        //（restore：重建不刷 last_activity，活跃历史以持久化行为准）
-        if let Some(current) = &existing
-            && current.persistence_identity().generation == row.generation
-        {
-            for sid in current.sessions().iter() {
-                if let Some(generation) = current.persistence_identity().sessions.get(sid) {
-                    info.restore_session_identity(sid, generation.clone());
-                }
+        let info = hydrate_project(&row, &container_by_name)?;
+        // A peer replacement must update registration and hydrated project
+        // together. A local container intent after snapshot admission prevents
+        // applying the entire associated project, not just its registry entry.
+        let registration_update = if let Some(name) = &row.container_name {
+            let container = container_by_name
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("Project references missing container snapshot"))?;
+            let target = container.persistence_identity();
+            let registrations = store
+                .container_registration
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let current = registrations.get(name);
+            if current != baseline_containers.get(name) && current != Some(&target) {
+                continue;
             }
-        }
-        if let Err(e) = inner.insert(row.project_id.clone(), Arc::new(info)) {
-            warn!(
-                "[STORAGE_PG] sync insert failed for {}: {e:#}（跳过）",
-                row.project_id
-            );
-            continue;
+            // Equality with target permits another project in this same snapshot
+            // to hydrate after the first project already refreshed this registry.
+            Some((name.clone(), target))
+        } else {
+            None
+        };
+        inner.insert(row.project_id.clone(), Arc::new(info))?;
+        // Publish only after mirror insertion succeeds. The outer registration
+        // guard still excludes local writes and other snapshot application.
+        if let Some((name, target)) = registration_update {
+            store
+                .container_registration
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(name, target);
         }
         if existing.is_some() {
             changed += 1;
@@ -187,148 +192,27 @@ pub(crate) async fn sync_once(
         }
     }
 
-    // 3) session 补入：PG 有而镜像无（project 刚补入时其 session 由 add 补齐；
-    //    project 已存在的新 session 单独补）
-    let mut added_sessions = 0usize;
-    for row in &sessions {
-        let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(info) = inner.get(&row.project_id) else {
-            continue; // 孤儿 session（project 行缺失，FK 下不应出现）
-        };
-        if !info.sessions().contains(row.session_id.as_str()) {
-            if info.persistence_identity().generation != row.project_generation {
-                continue;
-            }
-            inner.restore_session_with_identity(
-                &row.project_id,
-                &row.session_id,
-                row.generation.clone(),
-            );
-            added_sessions += 1;
-        }
-    }
-
-    if added + changed + added_sessions > 0 {
-        info!(
-            "[STORAGE_PG] cross-replica sync applied: +{added} projects, {changed} changed, +{added_sessions} sessions"
-        );
+    if added + changed > 0 {
+        info!("[STORAGE_PG] cross-replica sync applied: +{added} projects, {changed} changed");
     }
     Ok(())
 }
 
-/// 镜像/行侧统一签名（字段拼接；volatile 的 last_activity/created_at/version 不参与）。
-/// 覆盖全部业务可变字段：漏字段 = 远端变更永不感知（镜像长期陈旧）——
-/// agent_status（状态同步）、租户三元组、service_type、model_provider 全量 JSON
-/// （base_url/api_key 变更不只看 id）都参与比对。
-fn project_signature(info: &shared_types::ProjectAndContainerInfo) -> String {
-    let mut sig = String::with_capacity(128);
-    sig.push_str(&info.persistence_identity().generation);
-    sig.push_str("u:");
-    sig.push_str(info.user_id().unwrap_or(""));
-    sig.push_str("|p:");
-    sig.push_str(info.pod_id().unwrap_or(""));
-    sig.push_str("|c:");
-    sig.push_str(
-        &info
-            .container_info()
-            .map(|c| c.container_name)
-            .unwrap_or_default(),
-    );
-    sig.push_str("|s:");
-    sig.push_str(
-        info.latest_session()
-            .map(str::to_string)
-            .unwrap_or_default()
-            .as_str(),
-    );
-    sig.push_str("|r:");
-    sig.push_str(
-        info.request_id()
-            .map(str::to_string)
-            .unwrap_or_default()
-            .as_str(),
-    );
-    sig.push_str("|a:");
-    sig.push_str(&serde_json::to_string(&info.status()).unwrap_or_default());
-    sig.push_str("|t:");
-    sig.push_str(info.tenant_id().unwrap_or(""));
-    sig.push('/');
-    sig.push_str(info.space_id().unwrap_or(""));
-    sig.push('/');
-    sig.push_str(info.isolation_type().unwrap_or(""));
-    sig.push_str("|v:");
-    sig.push_str(&serde_json::to_string(&info.service_type()).unwrap_or_default());
-    sig.push_str("|m:");
-    // model_provider 须走 Value 归一：结构体直接序列化是字段声明序，jsonb 行解码
-    // 的 Value::to_string 是字典序（serde_json Map 默认 BTreeMap）——不归一则
-    // 凡带 model_provider 的 project 恒判 changed，每轮 sync 全量误重建
-    sig.push_str(
-        &serde_json::to_value(info.model_provider())
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-    );
-    sig
-}
-
-fn row_signature(row: &repo::ProjectRow) -> String {
-    let mut sig = String::with_capacity(128);
-    sig.push_str(&row.generation);
-    sig.push_str("u:");
-    sig.push_str(row.user_id.as_deref().unwrap_or(""));
-    sig.push_str("|p:");
-    sig.push_str(row.pod_id.as_deref().unwrap_or(""));
-    sig.push_str("|c:");
-    sig.push_str(row.container_name.as_deref().unwrap_or(""));
-    sig.push_str("|s:");
-    sig.push_str(row.latest_session.as_deref().unwrap_or(""));
-    sig.push_str("|r:");
-    sig.push_str(row.request_id.as_deref().unwrap_or(""));
-    sig.push_str("|a:");
-    sig.push_str(
-        &row.agent_status
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-    );
-    sig.push_str("|t:");
-    sig.push_str(row.tenant_id.as_deref().unwrap_or(""));
-    sig.push('/');
-    sig.push_str(row.space_id.as_deref().unwrap_or(""));
-    sig.push('/');
-    sig.push_str(row.isolation_type.as_deref().unwrap_or(""));
-    sig.push_str("|v:");
-    // 签名按族代表值域比较（镜像侧 hydrate 已归一；存量行可能仍是本义串
-    // 如 computer-normal-project——不归一则每轮 sync 判"变更"空重建，直到
-    // 该行被真实 upsert 覆盖才收敛）
-    sig.push_str(
-        &row.service_type
-            .as_deref()
-            .and_then(|v| v.parse::<shared_types::ServiceType>().ok())
-            .map(|st| st.family_representative().to_string())
-            .unwrap_or_else(|| row.service_type.clone().unwrap_or_default()),
-    );
-    sig.push_str("|m:");
-    sig.push_str(
-        &row.model_provider
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-    );
-    sig
-}
-
 /// remove 候选的二次确认：短排空后直查该行是否已落库（屏障后新写防误删）。
 /// PG 故障时返回 true（宁可不删也不误删——下轮 sync 再收敛）。
-async fn self_confirm_project_alive(store: &PgStore, pool: &PgPool, project_id: &str) -> bool {
+async fn self_confirm_project_alive(
+    store: &PgStore,
+    pool: &DatabaseOwner,
+    project_id: &str,
+) -> bool {
     if store.wait_drained(Duration::from_millis(200)).await {
-        let sql = "SELECT 1 FROM projects WHERE project_id = $1";
-        match sqlx::query_scalar::<_, i32>(sql)
-            .bind(project_id)
-            .fetch_optional(pool)
-            .await
+        let id = project_id.to_owned();
+        match super::database::read(pool, move |tx| {
+            Box::pin(async move { repo::project_exists(tx, &id).await })
+        })
+        .await
         {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
+            Ok(alive) => alive,
             Err(e) => {
                 debug!("[STORAGE_PG] sync remove-confirm query failed (keeping): {e}");
                 true
@@ -340,16 +224,19 @@ async fn self_confirm_project_alive(store: &PgStore, pool: &PgPool, project_id: 
 }
 
 /// session 版二次确认（sessions 表 PK 直查）
-async fn self_confirm_session_alive(store: &PgStore, pool: &PgPool, session_id: &str) -> bool {
+async fn self_confirm_session_alive(
+    store: &PgStore,
+    pool: &DatabaseOwner,
+    session_id: &str,
+) -> bool {
     if store.wait_drained(Duration::from_millis(200)).await {
-        let sql = "SELECT 1 FROM sessions WHERE session_id = $1";
-        match sqlx::query_scalar::<_, i32>(sql)
-            .bind(session_id)
-            .fetch_optional(pool)
-            .await
+        let id = session_id.to_owned();
+        match super::database::read(pool, move |tx| {
+            Box::pin(async move { repo::session_exists(tx, &id).await })
+        })
+        .await
         {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
+            Ok(alive) => alive,
             Err(e) => {
                 debug!("[STORAGE_PG] sync remove-confirm query failed (keeping): {e}");
                 true

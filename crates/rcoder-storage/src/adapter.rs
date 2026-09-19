@@ -223,7 +223,24 @@ impl ProjectAdapter {
         // 写入主存储和索引
         self.project_to_container
             .insert(project_id.clone(), key.clone());
-        self.projects.insert(project_id.clone(), info.clone());
+        let previous = self.projects.insert(project_id.clone(), info.clone());
+        // Hydrated snapshots already contain session identities. Publish their
+        // reverse index without add_session(), which would change timestamps,
+        // the selected session and persistence generations.
+        if let Some(previous) = previous {
+            for sid in previous.sessions() {
+                if !info.sessions().contains(&sid)
+                    && let Entry::Occupied(entry) = self.session_index.entry(sid)
+                    && entry.get().1 == project_id
+                {
+                    entry.remove();
+                }
+            }
+        }
+        for sid in info.sessions() {
+            self.session_index
+                .insert(sid, (key.clone(), project_id.clone()));
+        }
 
         // 维护反向索引：container_id → 容器键
         if let Some(c) = info.container_info() {

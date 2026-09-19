@@ -29,7 +29,12 @@ use crate::service::AppService;
 /// 历史用途 wait_app_ready 已退役，现有消费者见 purge 链不缺席测试）。
 #[derive(Default)]
 pub(crate) struct MockRuntime {
+    pub configuration_replies:
+        std::sync::Mutex<std::collections::VecDeque<container_runtime_api::ExecResult>>,
+    pub configuration_commands: std::sync::Mutex<Vec<Vec<String>>>,
+    pub configuration_targets: std::sync::Mutex<Vec<shared_types::RuntimeConfigurationTarget>>,
     pub scale_calls: AtomicUsize,
+    pub management_start_calls: AtomicUsize,
     pub lease_held: Arc<AtomicBool>,
     pub env_commit_failure: AtomicUsize,
     pub patch_preparation_fails: AtomicBool,
@@ -216,6 +221,47 @@ impl shared_types::AppOperationLease for MockOperationLease {
 
 #[async_trait]
 impl UserAppDeploymentRuntime for MockRuntime {
+    async fn capture_app_configuration_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        generation: &str,
+    ) -> ContainerRuntimeResult<shared_types::RuntimeConfigurationTarget> {
+        assert!(self.lease_held.load(Ordering::SeqCst));
+        let target = shared_types::RuntimeConfigurationTarget {
+            physical_uid: format!("test-{}", context.lifecycle_id),
+            deployment_generation: generation.into(),
+        };
+        self.configuration_targets
+            .lock()
+            .unwrap()
+            .push(target.clone());
+        Ok(target)
+    }
+
+    async fn exec_app_configuration_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        target: &shared_types::RuntimeConfigurationTarget,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        assert!(self.lease_held.load(Ordering::SeqCst));
+        assert_eq!(
+            target.physical_uid,
+            format!("test-{}", context.lifecycle_id)
+        );
+        assert!(self.configuration_targets.lock().unwrap().contains(target));
+        self.configuration_commands.lock().unwrap().push(command);
+        self.configuration_replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError(
+                    "No scripted configuration response".into(),
+                )
+            })
+    }
+
     async fn patch_app_policy_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
@@ -416,6 +462,14 @@ impl UserAppDeploymentRuntime for MockRuntime {
         &self,
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<()> {
+        self.start_app_target(target).await
+    }
+
+    async fn start_app_management_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.management_start_calls.fetch_add(1, Ordering::SeqCst);
         self.start_app_target(target).await
     }
 
@@ -623,14 +677,17 @@ pub(crate) async fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime
         access_mode: AppAccessMode::Docker,
         ..AppManagerConfig::default()
     };
+    let store = Arc::new(store);
     AppService {
+        operation_flight: Arc::default(),
         config,
         runtime: runtime as Arc<dyn UserAppRuntime>,
         activity: Arc::new(AppActivityRegistry::new(Duration::from_secs(300))),
         pingora: None,
         pingora_ports: DashMap::new(),
         release_locks: DashMap::new(),
-        metadata: crate::runtime::metadata::AppMetadataStore::new(Arc::new(store)),
+        metadata: crate::runtime::metadata::AppMetadataStore::new(store.clone()),
+        runtime_configuration: store,
         dev_cleanup: std::sync::RwLock::new(None),
         dev_locator: std::sync::RwLock::new(None),
         builder_recovery: std::sync::RwLock::new(None),
@@ -692,6 +749,16 @@ pub(crate) struct StubDevCleanup {
 
 #[async_trait]
 impl shared_types::UserappDevCleanup for StubDevCleanup {
+    async fn capture_with_lease(
+        &self,
+        app_id: &str,
+        lease: Box<dyn shared_types::AppOperationLease>,
+    ) -> Result<Box<dyn shared_types::UserappDevDeletion>, String> {
+        let captured = self.capture(app_id).await;
+        lease.release().await?;
+        captured
+    }
+
     async fn capture(
         &self,
         app_id: &str,

@@ -17,7 +17,7 @@ use crate::pg_utils::{
 
 /// start 部署链 PG 凭据对齐请求体（`pg.username`/`pg.password` 装配而来，
 /// app_manager 函数级消费；原独立 HTTP 入口 align-credentials 已下线）。
-#[derive(Debug, Deserialize, Serialize, Clone, utoipa::ToSchema)]
+#[derive(Deserialize, Serialize, Clone, utoipa::ToSchema)]
 pub struct AlignCredentialsRequest {
     /// 应用 ID（定位 dev=开发容器 / prod=运行容器）
     pub app_id: String,
@@ -25,6 +25,27 @@ pub struct AlignCredentialsRequest {
     pub username: String,
     /// 目标密码（开发与部署环境对齐后的值）
     pub password: String,
+}
+
+impl std::fmt::Debug for AlignCredentialsRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlignCredentialsRequest")
+            .field("app_id", &self.app_id)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Mutation evidence, independent of whether business services became Ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialMutationEvidence {
+    /// This attempt never dispatched a password-changing command.
+    NotAttempted,
+    /// A changing command was dispatched, but its result is not proven.
+    Unknown,
+    /// PostgreSQL acknowledged ALTER, but subsequent TCP verification failed.
+    AppliedButUnverified,
 }
 
 /// 对齐结果。
@@ -61,7 +82,11 @@ pub enum AlignError {
     /// 目标 PG 角色不存在（对齐只重置密码，不建号）→ 400 语义
     RoleMissing(String),
     /// 容器侧执行失败（通道断/PG 未就绪/SQL 失败）→ 502/500 语义
-    Command { stage: &'static str, detail: String },
+    Command {
+        stage: &'static str,
+        detail: String,
+        mutation: CredentialMutationEvidence,
+    },
 }
 
 impl std::fmt::Display for AlignError {
@@ -69,7 +94,18 @@ impl std::fmt::Display for AlignError {
         match self {
             Self::InvalidInput(m) => write!(f, "{m}"),
             Self::RoleMissing(m) => write!(f, "{m}"),
-            Self::Command { stage, detail } => write!(f, "{stage}: {detail}"),
+            Self::Command { stage, detail, .. } => write!(f, "{stage}: {detail}"),
+        }
+    }
+}
+
+impl AlignError {
+    pub fn mutation_evidence(&self) -> CredentialMutationEvidence {
+        match self {
+            Self::InvalidInput(_) | Self::RoleMissing(_) => {
+                CredentialMutationEvidence::NotAttempted
+            }
+            Self::Command { mutation, .. } => *mutation,
         }
     }
 }
@@ -84,6 +120,25 @@ pub async fn align_pg_credentials(
     username: &str,
     password: &str,
 ) -> Result<AlignCredentialsOutcome, AlignError> {
+    align_pg_credentials_inner(runner, username, password, None).await
+}
+
+/// Versioned execution uses a captured administrator, never the business env.
+pub async fn align_pg_credentials_with_admin(
+    runner: &dyn PgCommandRunner,
+    admin: &crate::pg_utils::PgAdministrationTarget,
+    username: &str,
+    password: &str,
+) -> Result<AlignCredentialsOutcome, AlignError> {
+    align_pg_credentials_inner(runner, username, password, Some(admin)).await
+}
+
+async fn align_pg_credentials_inner(
+    runner: &dyn PgCommandRunner,
+    username: &str,
+    password: &str,
+    admin: Option<&crate::pg_utils::PgAdministrationTarget>,
+) -> Result<AlignCredentialsOutcome, AlignError> {
     validate_pg_identifier(username).map_err(AlignError::InvalidInput)?;
     if password.is_empty() {
         return Err(AlignError::InvalidInput(
@@ -95,9 +150,12 @@ pub async fn align_pg_credentials(
     let verify = runner
         .run(&pg_verify_credentials_cmd(username, password))
         .await
-        .map_err(|e| AlignError::Command {
+        .map_err(|_| AlignError::Command {
             stage: "verify credentials",
-            detail: e,
+            mutation: CredentialMutationEvidence::NotAttempted,
+            // Exec transports may echo argv, including shell-escaped passwords.
+            // Replacing the raw password cannot reliably redact those encodings.
+            detail: "Credential verification transport failed".into(),
         })?;
     if verify.exit_code == 0 {
         return Ok(AlignCredentialsOutcome {
@@ -108,36 +166,53 @@ pub async fn align_pg_credentials(
 
     // 2. 不一致 → 角色存在检查（区分"密码不同"与"账号不存在"，后者明确报错）
     let exists = runner
-        .run(&pg_role_exists_cmd(username))
+        .run(&match admin {
+            Some(admin) => admin
+                .role_exists_command(username)
+                .map_err(AlignError::InvalidInput)?,
+            None => pg_role_exists_cmd(username),
+        })
         .await
         .map_err(|e| AlignError::Command {
             stage: "role-exists check",
+            mutation: CredentialMutationEvidence::NotAttempted,
             detail: e,
         })?;
     if exists.exit_code != 0 {
         return Err(AlignError::Command {
             stage: "role-exists check",
+            mutation: CredentialMutationEvidence::NotAttempted,
             detail: exists.stderr.trim().to_string(),
         });
     }
-    if exists.stdout.trim() != "1" {
+    let missing = exists.stdout.trim() != "1";
+    if missing && admin.is_none() {
         return Err(AlignError::RoleMissing(format!(
             "PG role `{username}` does not exist; create it first (align only resets passwords)"
         )));
     }
 
-    // 3. 重置（trust ALTER USER）
+    // Versioned execution can provision a missing role through its captured
+    // administrator. The legacy entry point deliberately keeps reset-only semantics.
+    let mutation_command = match admin {
+        Some(admin) if missing => admin.create_role_command(username, password),
+        Some(admin) => admin.alter_password_command(username, password),
+        None => Ok(pg_alter_password_cmd(username, password)),
+    }
+    .map_err(AlignError::InvalidInput)?;
     let alter = runner
-        .run(&pg_alter_password_cmd(username, password))
+        .run(&mutation_command)
         .await
-        .map_err(|e| AlignError::Command {
-            stage: "alter password",
-            detail: e,
+        .map_err(|_| AlignError::Command {
+            stage: "apply credentials",
+            mutation: CredentialMutationEvidence::Unknown,
+            detail: "Credential write completion was not confirmed".into(),
         })?;
     if alter.exit_code != 0 {
         return Err(AlignError::Command {
-            stage: "alter password",
-            detail: alter.stderr.trim().to_string(),
+            stage: "apply credentials",
+            mutation: CredentialMutationEvidence::Unknown,
+            detail: format!("Credential write exited with status {}", alter.exit_code),
         });
     }
 
@@ -145,14 +220,19 @@ pub async fn align_pg_credentials(
     let reverify = runner
         .run(&pg_verify_credentials_cmd(username, password))
         .await
-        .map_err(|e| AlignError::Command {
+        .map_err(|_| AlignError::Command {
             stage: "re-verify after reset",
-            detail: e,
+            mutation: CredentialMutationEvidence::AppliedButUnverified,
+            detail: "Password update completed but verification transport failed".into(),
         })?;
     if reverify.exit_code != 0 {
         return Err(AlignError::Command {
             stage: "re-verify after reset",
-            detail: reverify.stderr.trim().to_string(),
+            mutation: CredentialMutationEvidence::AppliedButUnverified,
+            detail: format!(
+                "Credential verification exited with status {}",
+                reverify.exit_code
+            ),
         });
     }
 
@@ -229,6 +309,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn captured_admin_provisions_missing_role_before_tcp_verification() {
+        let runner =
+            ScriptedRunner::new(vec![ok(2, ""), ok(0, ""), ok(0, "CREATE ROLE"), ok(0, "1")]);
+        let admin = crate::pg_utils::PgAdministrationTarget::new(
+            "initialadmin".into(),
+            "/var/run/postgresql".into(),
+        )
+        .unwrap();
+        let result = align_pg_credentials_with_admin(&runner, &admin, "business", "pa'ss")
+            .await
+            .unwrap();
+        assert!(result.aligned && result.reset_performed);
+        let commands = runner.seen.lock().unwrap();
+        assert_eq!(commands.len(), 4);
+        assert!(commands[2].contains("CREATE ROLE"));
+        assert!(commands[2].contains("initialadmin"));
+        assert!(!commands[2].contains("$POSTGRES_USER"));
+        assert!(commands[3].starts_with("PGPASSWORD="));
+    }
+
+    #[tokio::test]
+    async fn unknown_role_creation_keeps_mutation_evidence_without_password() {
+        let runner = ScriptedRunner::new(vec![
+            ok(2, ""),
+            ok(0, ""),
+            Err("transport echoed privatepassword".into()),
+        ]);
+        let admin = crate::pg_utils::PgAdministrationTarget::new(
+            "initialadmin".into(),
+            "/var/run/postgresql".into(),
+        )
+        .unwrap();
+        let error = align_pg_credentials_with_admin(&runner, &admin, "business", "privatepassword")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.mutation_evidence(),
+            CredentialMutationEvidence::Unknown
+        );
+        assert!(!error.to_string().contains("privatepassword"));
+        assert_eq!(runner.seen.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn already_aligned_skips_reset() {
         let runner = ScriptedRunner::new(vec![ok(0, "1")]);
         let out = align_pg_credentials(&runner, "app", "pw").await.unwrap();
@@ -258,6 +382,115 @@ mod tests {
             .map(|c| ScriptedRunner::kind_of(c))
             .collect();
         assert_eq!(kinds, vec!["verify", "role_exists", "alter", "verify"]);
+    }
+
+    #[tokio::test]
+    async fn explicit_administrator_is_used_only_for_management_commands() {
+        let runner =
+            ScriptedRunner::new(vec![ok(2, ""), ok(0, "1"), ok(0, "ALTER USER"), ok(0, "1")]);
+        let admin = crate::pg_utils::PgAdministrationTarget::new(
+            "initialadmin".into(),
+            "/var/run/postgresql".into(),
+        )
+        .unwrap();
+        let outcome = align_pg_credentials_with_admin(&runner, &admin, "business", "newpassword")
+            .await
+            .unwrap();
+        assert!(outcome.aligned && outcome.reset_performed);
+        let commands = runner.seen.lock().unwrap();
+        assert_eq!(commands.len(), 4);
+        for index in [0, 3] {
+            assert!(commands[index].contains("-h 127.0.0.1"));
+            assert!(commands[index].contains("-U \"business\""));
+        }
+        for index in [1, 2] {
+            assert!(commands[index].contains("-U 'initialadmin'"));
+            assert!(!commands[index].contains("$POSTGRES_USER"));
+        }
+    }
+
+    #[tokio::test]
+    async fn failures_preserve_password_mutation_evidence() {
+        for (results, expected) in [
+            (
+                vec![Err("disconnected before verification".into())],
+                CredentialMutationEvidence::NotAttempted,
+            ),
+            (
+                vec![ok(2, ""), Err("role query disconnected".into())],
+                CredentialMutationEvidence::NotAttempted,
+            ),
+            (
+                vec![ok(2, ""), ok(0, "1"), Err("ALTER reply lost".into())],
+                CredentialMutationEvidence::Unknown,
+            ),
+            (
+                vec![ok(2, ""), ok(0, "1"), ok(1, "")],
+                CredentialMutationEvidence::Unknown,
+            ),
+            (
+                vec![
+                    ok(2, ""),
+                    ok(0, "1"),
+                    ok(0, "ALTER USER"),
+                    Err("verification disconnected".into()),
+                ],
+                CredentialMutationEvidence::AppliedButUnverified,
+            ),
+            (
+                vec![ok(2, ""), ok(0, "1"), ok(0, "ALTER USER"), ok(2, "")],
+                CredentialMutationEvidence::AppliedButUnverified,
+            ),
+        ] {
+            let runner = ScriptedRunner::new(results);
+            let error = align_pg_credentials(&runner, "app", "pw")
+                .await
+                .unwrap_err();
+            assert_eq!(error.mutation_evidence(), expected);
+            assert!(runner.results.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn request_debug_never_contains_password() {
+        let request = AlignCredentialsRequest {
+            app_id: "app1".into(),
+            username: "runtimeuser".into(),
+            password: "privatepassword".into(),
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("privatepassword"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn credential_command_errors_do_not_expose_escaped_passwords() {
+        let password = "s'ecret";
+        let leaked_command = "ALTER USER business PASSWORD 's''ecret'; shell 's'\\''ecret'";
+        for replies in [
+            vec![Err(leaked_command.into())],
+            vec![ok(2, ""), ok(0, "1"), Err(leaked_command.into())],
+            vec![
+                ok(2, ""),
+                ok(0, "1"),
+                Ok(CommandOutcome {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: leaked_command.into(),
+                }),
+            ],
+            vec![ok(2, ""), ok(0, "1"), ok(0, ""), Err(leaked_command.into())],
+        ] {
+            let runner = ScriptedRunner::new(replies);
+            let error = align_pg_credentials(&runner, "business", password)
+                .await
+                .unwrap_err();
+            let public = format!("{error} {error:?}");
+            assert!(
+                !public.contains("ecret"),
+                "credential fragment leaked: {public}"
+            );
+        }
     }
 
     #[tokio::test]

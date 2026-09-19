@@ -455,22 +455,13 @@ impl DevServerManager {
                 shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
             )));
         }
-        let expected_ws = project_path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
         let app_id = std::env::var("PROJECT_ID")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "unknown-app".to_string());
-        if identity.workspace_id != expected_ws || identity.application_id != app_id {
-            return Err(AppError::business(format!(
-                "admin port 3010 is held by a different app-cli owner \
-                 (app {}/{}, expected {}/{expected_ws}); refusing to spawn a \
-                 competing orchestrator",
-                identity.application_id, identity.workspace_id, app_id,
-            )));
-        }
+        super::owner_client::verify_project_identity(&identity, project_path, &app_id)
+            .map_err(|error| AppError::business(format!("owner identity rejected: {error:#}")))?;
+        let expected_ws = identity.workspace_id.clone();
 
         // 匹配 owner：读凭据（源码/产物两种状态根落点都探测；owner 未
         // 启用写端点 → 无法路由，明确报错）
@@ -923,7 +914,7 @@ mod owner_reuse_tests {
         std::fs::create_dir_all(&state_root).unwrap();
         std::fs::write(state_root.join("token"), "test-token").unwrap();
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let owner = mock_owner_router("ws-reuse").with_state(polls);
+        let owner = mock_owner_router("hashed-workspace", &ws_reuse).with_state(polls);
         let owner_mock = serve_mock(owner).await;
         let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = received.clone();
@@ -977,7 +968,8 @@ mod owner_reuse_tests {
 
         // ④ foreign workspace → 拒绝
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let foreign = mock_owner_router("ws-someone-else").with_state(polls);
+        let foreign = mock_owner_router("ws-someone-else", &dir.path().join("someone-else"))
+            .with_state(polls);
         let _foreign_mock = serve_mock(foreign).await;
         let ws_mine = dir.path().join("ws-mine");
         std::fs::create_dir_all(&ws_mine).unwrap();
@@ -1017,17 +1009,21 @@ mod owner_reuse_tests {
         }
     }
 
-    fn mock_owner_router(ws: &str) -> axum::Router<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+    fn mock_owner_router(
+        ws: &str,
+        root: &Path,
+    ) -> axum::Router<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
         use shared_types::{
             DesiredState, ObservedHealth, RuntimeEventRecord, RuntimeIdentityView,
             RuntimeOperationState, RuntimeStatusView,
         };
 
-        let identity_of = |workspace: String| RuntimeIdentityView {
+        let source_root = root.to_string_lossy().into_owned();
+        let identity_of = move |workspace: String| RuntimeIdentityView {
             application_id: "unknown-app".to_string(),
             service_family: "userapp-dev".to_string(),
             workspace_id: workspace,
-            source_root: "/ws".to_string(),
+            source_root: source_root.clone(),
             runtime_instance_id: "instance-test".to_string(),
             deployment_generation_id: "gen-test".to_string(),
             protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
@@ -1066,8 +1062,15 @@ mod owner_reuse_tests {
                             .and_then(|value| value.as_str())
                             .unwrap_or("op")
                             .to_string();
-                        let view = operation_view(&id, RuntimeOperationState::Accepted);
-                        axum::Json(envelope(&view))
+                        let receipt = shared_types::RuntimeOperationAccepted {
+                            operation_id: id.clone(),
+                            state: RuntimeOperationState::Accepted,
+                            poll: format!("/v1/runtime/operations/{id}"),
+                        };
+                        (
+                            axum::http::StatusCode::ACCEPTED,
+                            axum::Json(envelope(&receipt)),
+                        )
                     },
                 ),
             )
@@ -1164,7 +1167,7 @@ mod owner_reuse_tests {
             application_id: "unknown-app".to_string(),
             service_family: "userapp-dev".to_string(),
             workspace_id: "ws-r78".to_string(),
-            source_root: "/ws".to_string(),
+            source_root: ws.to_string_lossy().into_owned(),
             runtime_instance_id: "instance-r78".to_string(),
             deployment_generation_id: "gen".to_string(),
             protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
@@ -1301,7 +1304,7 @@ mod owner_reuse_tests {
             application_id: "unknown-app".to_string(),
             service_family: "userapp-dev".to_string(),
             workspace_id: ".run".to_string(),
-            source_root: "/ws/.run".to_string(),
+            source_root: ws.join(".run").to_string_lossy().into_owned(),
             runtime_instance_id: "instance-art".to_string(),
             deployment_generation_id: "gen".to_string(),
             protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,

@@ -348,3 +348,62 @@ async fn managed_declaration_allows_public_bind_without_token() {
         "real bound address, got {address}"
     );
 }
+
+#[tokio::test]
+async fn shutdown_closes_existing_keep_alive_connections() {
+    use http_body_util::{BodyExt, Empty};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream =
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let serve = tokio::spawn(proxy::serve(
+        listener,
+        upstream,
+        FileServerProxyConfig {
+            auth_token: Some("test-proxy-token".into()),
+            ..Default::default()
+        },
+        shutdown.clone(),
+    ));
+    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .unwrap();
+    let client = tokio::spawn(connection);
+    let response = sender
+        .send_request(
+            hyper::Request::builder()
+                .uri("/health")
+                .body(Empty::<bytes::Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), hyper::StatusCode::UNAUTHORIZED);
+    response.into_body().collect().await.unwrap();
+    shutdown.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), serve)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), client)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        sender
+            .send_request(
+                hyper::Request::builder()
+                    .uri("/health")
+                    .body(Empty::<bytes::Bytes>::new())
+                    .unwrap()
+            )
+            .await
+            .is_err()
+    );
+}

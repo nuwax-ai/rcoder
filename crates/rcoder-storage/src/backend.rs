@@ -38,7 +38,7 @@ impl ProjectStoreBackend {
         }
     }
 
-    /// 会话创建的结构性 op **durable 直写**（PG 模式：内存 + sqlx 事务提交，
+    /// 会话创建的结构性 op **durable 直写**（PG 模式：内存 + Toasty 事务提交，
     /// 方法返回即主库已提交；超时/失败降级 write-behind 队列，chat 不失败）。
     /// Memory 模式等价普通内存写。chat 完成点调用——保证 session_id 返回给
     /// 前端时任何副本回源直查必命中（跨副本可见性契约）。

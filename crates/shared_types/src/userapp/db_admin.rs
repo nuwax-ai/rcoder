@@ -16,13 +16,16 @@ use crate::pg_utils::{
 };
 
 /// `POST /api/v1/userapp/db/{app_stage}/reset-password` 请求体。
-#[derive(Debug, Deserialize, Serialize, Clone, utoipa::ToSchema)]
+#[derive(Deserialize, Serialize, Clone, utoipa::ToSchema)]
 pub struct UserappDbResetPasswordRequest {
+    /// Original caller identity for retries. Omission creates a new operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Reject requests targeting a replaced application lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_id: Option<String>,
     /// 应用 ID（定位 dev=开发容器 / prod=运行容器）
     pub app_id: String,
-    /// 归属用户 ID（dev 容器懒创建时宿主树 `dev/{user_id}/{app_id}` 分区依据；
-    /// 必填，白名单校验）
-    pub user_id: String,
     /// 新密码（非空；允许任意字符含特殊符号）
     pub password: String,
     /// 目标账号名（可选，须过 PG 标识符白名单）：
@@ -32,19 +35,107 @@ pub struct UserappDbResetPasswordRequest {
     pub username: Option<String>,
 }
 
+/// Explicitly reconcile an uncertain password write; never issues ALTER again.
+/// The original private input is required to verify the admission fingerprint.
+#[derive(Debug, Deserialize, Serialize, Clone, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UserappDbPasswordRecoveryRequest {
+    pub lifecycle_id: String,
+    pub operation_id: String,
+    pub expected_revision: i64,
+    pub original: UserappDbResetPasswordRequest,
+}
+
+impl UserappDbPasswordRecoveryRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        self.original.validate()?;
+        crate::validate_identifier(&self.lifecycle_id, "lifecycle_id")?;
+        crate::validate_identifier(&self.operation_id, "operation_id")?;
+        if self.expected_revision < 0 {
+            return Err("Expected revision must be nonnegative".into());
+        }
+        if self.original.request_id.is_none() {
+            return Err("Recovery requires the original request_id".into());
+        }
+        if self
+            .original
+            .lifecycle_id
+            .as_ref()
+            .is_some_and(|id| id != &self.lifecycle_id)
+        {
+            return Err("Original and recovery lifecycle differ".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Clone, utoipa::ToSchema)]
+pub struct UserappDbPasswordRecoveryResponse {
+    pub operation_id: String,
+    pub lifecycle_id: String,
+    pub revision: i64,
+    /// Operation state: Pending, Running, WaitingRetry, RecoveryRequired,
+    /// Succeeded, Failed. A successful recovery response is terminal:
+    /// Succeeded means verified commit; Failed means confirmed cancellation.
+    pub state: crate::UserAppOperationState,
+    /// Durable terminal outcome is confirmed; only exact physical lease cleanup remains.
+    pub lease_cleanup_pending: bool,
+}
+
 /// `POST /api/v1/userapp/db/{app_stage}/create-database` 请求体。
 #[derive(Debug, Deserialize, Serialize, Clone, utoipa::ToSchema)]
 pub struct UserappDbCreateDatabaseRequest {
     /// 应用 ID（定位 dev=开发容器 / prod=运行容器）
     pub app_id: String,
-    /// 归属用户 ID（dev 容器懒创建时宿主树 `dev/{user_id}/{app_id}` 分区依据；
-    /// 必填，白名单校验）
-    pub user_id: String,
     /// 新建数据库名（PG 标识符白名单校验）
     pub database: String,
     /// 库 owner（可选，PG 标识符白名单校验；缺省 = 执行者 superuser）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+}
+
+impl std::fmt::Debug for UserappDbResetPasswordRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserappDbResetPasswordRequest")
+            .field("app_id", &self.app_id)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl UserappDbResetPasswordRequest {
+    /// Validate before resolving or waking any physical resource.
+    pub fn validate(&self) -> Result<(), String> {
+        crate::validate_identifier(&self.app_id, "app_id")?;
+        for value in [&self.request_id, &self.lifecycle_id].into_iter().flatten() {
+            crate::validate_identifier(value, "request/lifecycle identity")?;
+        }
+        validate_password(&self.password)?;
+        if let Some(username) = &self.username {
+            validate_pg_identifier(username)?;
+        }
+        Ok(())
+    }
+}
+
+impl UserappDbCreateDatabaseRequest {
+    /// Validate before resolving or waking any physical resource.
+    pub fn validate(&self) -> Result<(), String> {
+        crate::validate_identifier(&self.app_id, "app_id")?;
+        validate_pg_identifier(&self.database)?;
+        if let Some(owner) = &self.owner {
+            validate_pg_identifier(owner)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_password(password: &str) -> Result<(), String> {
+    if password.is_empty() || password.contains('\0') {
+        return Err("password must be nonempty and contain no NUL bytes".into());
+    }
+    Ok(())
 }
 
 /// PG 凭据（跨环境共用的 wire 形状，字段名恒为 `pg`）：
@@ -57,12 +148,21 @@ pub struct UserappDbCreateDatabaseRequest {
 ///
 /// 从 app_manager `models/start.rs` 下沉（dev 链 file-server-userapp 与 prod 链
 /// 共用同一契约；serde/ToSchema 形状不变）。
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, utoipa::ToSchema)]
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq, utoipa::ToSchema)]
 pub struct StartPgCredential {
     /// PG 账号名（已存在角色；须过 PG 标识符白名单）
     pub username: String,
     /// 目标密码（与开发环境保持一致的值）
     pub password: String,
+}
+
+impl std::fmt::Debug for StartPgCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartPgCredential")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// 账号 upsert 结果（响应 message 区分"已创建"/"已重置"）。
@@ -106,11 +206,7 @@ pub async fn upsert_pg_user(
     password: &str,
 ) -> Result<DbUserUpsertOutcome, DbAdminError> {
     validate_pg_identifier(username).map_err(DbAdminError::InvalidInput)?;
-    if password.is_empty() {
-        return Err(DbAdminError::InvalidInput(
-            "password must not be empty".to_string(),
-        ));
-    }
+    validate_password(password).map_err(DbAdminError::InvalidInput)?;
 
     // 1. 角色存在检查（`-tAc`：命中输出 1、未命中输出空）
     let exists = runner
@@ -139,14 +235,16 @@ pub async fn upsert_pg_user(
             DbUserUpsertOutcome::Created,
         )
     };
-    let applied = runner.run(&cmd).await.map_err(|e| DbAdminError::Command {
+    // A transport error or stderr can echo the SQL command and its password.
+    // Keep this diagnostic independent of remote output and credential escaping.
+    let applied = runner.run(&cmd).await.map_err(|_| DbAdminError::Command {
         stage: "apply user upsert",
-        detail: e,
+        detail: "Command transport failed; password update outcome is unknown".into(),
     })?;
     if applied.exit_code != 0 {
         return Err(DbAdminError::Command {
             stage: "apply user upsert",
-            detail: applied.stderr.trim().to_string(),
+            detail: format!("Password command exited with status {}", applied.exit_code),
         });
     }
     Ok(outcome)
@@ -219,32 +317,95 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// wire 契约：user_id 必填——缺字段即拒（reset-password / create-database 两 body）。
     #[test]
-    fn db_admin_requests_require_user_id() {
+    fn db_admin_requests_use_app_and_stage_without_user_identity() {
         let reset: UserappDbResetPasswordRequest = serde_json::from_value(serde_json::json!({
-            "app_id": "app-1", "user_id": "u1", "password": "p",
+            "app_id": "app1", "password": "private_reset_marker", "username": "business"
         }))
-        .expect("full reset body");
-        assert_eq!(reset.user_id, "u1");
+        .unwrap();
+        assert_eq!(reset.app_id, "app1");
         assert!(
-            serde_json::from_value::<UserappDbResetPasswordRequest>(serde_json::json!({
-                "app_id": "app-1", "password": "p",
-            }))
-            .is_err()
+            serde_json::to_value(&reset)
+                .unwrap()
+                .get("user_id")
+                .is_none()
         );
-
+        assert!(!format!("{reset:?}").contains("private_reset_marker"));
         let create: UserappDbCreateDatabaseRequest = serde_json::from_value(serde_json::json!({
-            "app_id": "app-1", "user_id": "u1", "database": "db1",
+            "app_id": "app1", "database": "db1"
         }))
-        .expect("full create body");
-        assert_eq!(create.user_id, "u1");
+        .unwrap();
+        assert_eq!(create.app_id, "app1");
         assert!(
-            serde_json::from_value::<UserappDbCreateDatabaseRequest>(serde_json::json!({
-                "app_id": "app-1", "database": "db1",
-            }))
-            .is_err()
+            serde_json::to_value(&create)
+                .unwrap()
+                .get("user_id")
+                .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_rejects_nul_password_before_any_command() {
+        let runner = ScriptedRunner::new(vec![]);
+        assert!(matches!(
+            upsert_pg_user(&runner, "biz", "bad\0password").await,
+            Err(DbAdminError::InvalidInput(_))
+        ));
+        assert!(runner.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn db_admin_input_validation_covers_all_resource_fields() {
+        let mut reset = UserappDbResetPasswordRequest {
+            request_id: None,
+            lifecycle_id: None,
+            app_id: "app1".into(),
+            username: Some("business".into()),
+            password: "password".into(),
+        };
+        assert!(reset.validate().is_ok());
+        reset.username = Some("bad-name".into());
+        assert!(reset.validate().is_err());
+        reset.username = None;
+        reset.password = "bad\0password".into();
+        assert!(reset.validate().is_err());
+        let mut create = UserappDbCreateDatabaseRequest {
+            app_id: "app1".into(),
+            database: "db1".into(),
+            owner: None,
+        };
+        assert!(create.validate().is_ok());
+        create.owner = Some("bad-name".into());
+        assert!(create.validate().is_err());
+        create.owner = None;
+        create.database = "bad-name".into();
+        assert!(create.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn password_command_errors_never_expose_remote_sql() {
+        for result in [
+            Err("transport echoed SQL with private_error_marker".into()),
+            Ok(CommandOutcome {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "SQL error: ALTER USER biz PASSWORD 'private_error_marker'".into(),
+            }),
+        ] {
+            let runner = ScriptedRunner::new(vec![ok(0, "1"), result]);
+            let error = upsert_pg_user(&runner, "biz", "private_error_marker")
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                DbAdminError::Command {
+                    stage: "apply user upsert",
+                    ..
+                }
+            ));
+            assert!(!format!("{error:?} {error}").contains("private_error_marker"));
+            assert_eq!(runner.seen.lock().unwrap().len(), 2);
+        }
     }
 
     /// 脚本化 runner：按命令内容返回预设结果（与 db_align 的 ScriptedRunner 同款）。
@@ -371,5 +532,23 @@ mod tests {
         let runner = ScriptedRunner::new(vec![ok(0, ""), ok(1, "already exists"), ok(0, "1")]);
         let err = create_pg_database(&runner, "mydb", None).await.unwrap_err();
         assert!(matches!(err, DbAdminError::AlreadyExists(_)));
+    }
+    #[test]
+    fn runtime_credentials_debug_is_redacted_through_nested_run_config() {
+        let config = crate::userapp::runtime_control::OperationRunConfig {
+            pg: Some(StartPgCredential {
+                username: "runtime".into(),
+                password: "private-password-test-marker".into(),
+            }),
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("private-password-test-marker"));
+        assert!(debug.contains("[REDACTED]"));
+        // Redaction changes only diagnostic formatting, not the private wire
+        // used to transfer operation configuration to its execution owner.
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["pg"]["password"],
+            "private-password-test-marker"
+        );
     }
 }

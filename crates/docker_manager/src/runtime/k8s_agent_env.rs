@@ -216,6 +216,20 @@ pub(crate) fn build_agent_env_vars(
             ..Default::default()
         });
     }
+    if matches!(service_type, ServiceType::UserappBuilder) {
+        env_vars.retain(|entry| entry.name != "RCODER_PHYSICAL_POD_UID");
+        env_vars.push(EnvVar {
+            name: "RCODER_PHYSICAL_POD_UID".into(),
+            value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                field_ref: Some(k8s_openapi::api::core::v1::ObjectFieldSelector {
+                    api_version: Some("v1".into()),
+                    field_path: "metadata.uid".into(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
     env_vars
 }
 

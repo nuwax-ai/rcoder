@@ -63,15 +63,7 @@ impl AppService {
         };
         let outcome = shared_types::align_pg_credentials(&runner, &req.username, &req.password)
             .await
-            .map_err(|e| match e {
-                // 调用方输入问题（非法标识符/角色不存在）→ Validation（400 语义）；
-                // 容器侧执行失败 → Backend
-                shared_types::AlignError::InvalidInput(m)
-                | shared_types::AlignError::RoleMissing(m) => AppOperationError::Validation(m),
-                shared_types::AlignError::Command { .. } => {
-                    AppOperationError::Backend(e.to_string())
-                }
-            })?;
+            .map_err(|error| AppOperationError::credential_failure(error, &req.password))?;
         info!(
             "[APP] PG credentials aligned (prod): app_id={}, username={}, reset_performed={}",
             app_id, req.username, outcome.reset_performed

@@ -126,6 +126,14 @@ impl AgentContainerRuntime for DockerRuntime {
         self.capture_builder_compute(context).await
     }
 
+    async fn exec_builder_control_target(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        self.exec_bound_builder(target, command).await
+    }
+
     async fn apply_builder_control(
         &self,
         target: &shared_types::BuilderControlTarget,

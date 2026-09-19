@@ -78,6 +78,7 @@ pub fn request_from_env() -> Result<crate::server::DeployRequest> {
         bail!("APP_DEPLOY_SHA256 must be 64 hex characters, got '{sha}'");
     }
     Ok(crate::server::DeployRequest {
+        runtime_operation_id: None,
         url,
         release_id,
         sha256,

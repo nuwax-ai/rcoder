@@ -1,0 +1,148 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling shared_types v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/shared_types)
+   Compiling rcoder-toasty-t0 v0.1.0 (/Users/soddy/Documents/git-workspace/rcoder/tools/toasty-probe)
+warning: unused import: `common::ToastyUserAppStore as PgUserAppStore`
+  --> src/userapp_lifecycle.rs:12:9
+   |
+12 | pub use common::ToastyUserAppStore as PgUserAppStore;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `open_exclusive` is never used
+   --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/mod.rs:370:18
+    |
+364 | impl ToastyUserAppStore {
+    | ----------------------- associated function in this implementation
+...
+370 |     pub async fn open_exclusive(path: &std::path::Path) -> Result<Self, UserAppStoreError> {
+    |                  ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `connect` is never used
+   --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/mod.rs:425:18
+    |
+424 | impl ToastyUserAppStore {
+    | ----------------------- associated function in this implementation
+425 |     pub async fn connect(
+    |                  ^^^^^^^
+
+warning: struct `FormatMarker` is never constructed
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/local_format.rs:13:8
+   |
+13 | struct FormatMarker {
+   |        ^^^^^^^^^^^^
+
+warning: constant `FORMAT` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/local_format.rs:18:7
+   |
+18 | const FORMAT: &str = "rcoder-toasty-0.10-turso-0.7-baseline-v1";
+   |       ^^^^^^
+
+warning: function `marker_path` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/local_format.rs:19:4
+   |
+19 | fn marker_path(path: &Path) -> PathBuf {
+   |    ^^^^^^^^^^^
+
+warning: function `filename` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/local_format.rs:24:4
+   |
+24 | fn filename(path: &Path) -> Result<String> {
+   |    ^^^^^^^^
+
+warning: function `require_regular` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/local_format.rs:33:4
+   |
+33 | fn require_regular(path: &Path) -> Result<()> {
+   |    ^^^^^^^^^^^^^^^
+
+warning: function `sync_directory` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/local_format.rs:49:4
+   |
+49 | fn sync_directory(path: &Path) -> Result<()> {
+   |    ^^^^^^^^^^^^^^
+
+warning: function `write_new` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/local_format.rs:56:4
+   |
+56 | fn write_new(path: &Path, marker: &FormatMarker) -> Result<()> {
+   |    ^^^^^^^^^
+
+warning: function `prepare` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/local_format.rs:70:15
+   |
+70 | pub(super) fn prepare(path: &Path) -> Result<()> {
+   |               ^^^^^^^
+
+warning: function `mark_ready` is never used
+   --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/local_format.rs:105:15
+    |
+105 | pub(super) fn mark_ready(path: &Path) -> Result<()> {
+    |               ^^^^^^^^^^
+
+warning: function `quarantine_local_restart` is never used
+   --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/common/ops.rs:790:21
+    |
+790 | pub(super) async fn quarantine_local_restart(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: trait `UserAppStoreControl` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/control.rs:16:11
+   |
+16 | pub trait UserAppStoreControl: Send + Sync {
+   |           ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `OpenedUserAppStore` is never constructed
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/control.rs:21:12
+   |
+21 | pub struct OpenedUserAppStore {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: constant `LOCK_NAME` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/exclusive_directory.rs:11:7
+   |
+11 | const LOCK_NAME: &str = ".userapp-instance.lock";
+   |       ^^^^^^^^^
+
+warning: function `acquire` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/exclusive_directory.rs:13:15
+   |
+13 | pub(super) fn acquire(path: &Path) -> Result<(PathBuf, File), Error> {
+   |               ^^^^^^^
+
+warning: function `require_unaliased_file` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/exclusive_directory.rs:60:4
+   |
+60 | fn require_unaliased_file(path: &Path) -> Result<(), Error> {
+   |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `require_single_link` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/exclusive_directory.rs:75:4
+   |
+75 | fn require_single_link(metadata: &std::fs::Metadata) -> Result<(), Error> {
+   |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `require_local_filesystem` is never used
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/exclusive_directory.rs:88:4
+   |
+88 | fn require_local_filesystem(directory: &Path) -> Result<(), Error> {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `Turso` is never constructed
+  --> src/../../../crates/rcoder-storage/src/db/driver.rs:19:5
+   |
+18 | pub(crate) enum ConnectionPolicy {
+   |                 ---------------- variant in this enum
+19 |     Turso,
+   |     ^^^^^
+   |
+   = note: `ConnectionPolicy` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: `rcoder-toasty-t0` (bin "rcoder-toasty-t0") generated 21 warnings (run `cargo fix --bin "rcoder-toasty-t0" -p rcoder-toasty-t0` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.57s
+     Running `/var/folders/y6/g5lk3d750833hz_rn5h3y6nh0000gn/T/rcoder-toasty-t0-8n9hb5y5/target/debug/rcoder-toasty-t0`
+PASS Toasty PostgreSQL preview: complete shared contract, concurrent same-key creation, different-key port race

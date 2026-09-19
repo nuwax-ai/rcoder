@@ -7,7 +7,9 @@ use std::fs::{File, TryLockError};
 
 /// File descriptor remains open for the complete create/delete/purge transaction.
 pub(crate) struct AppOperationGuard {
+    _flight: shared_types::FlightGuard,
     runtime: Option<Box<dyn shared_types::AppOperationLease>>,
+    builder_lease: Option<std::sync::Arc<SharedBuilderLease>>,
     marker: shared_types::AppFileMutationMarker,
     side_effect_started: std::sync::atomic::AtomicBool,
     /// Lease family this guard was acquired under (UserappBuilder for dev
@@ -15,6 +17,41 @@ pub(crate) struct AppOperationGuard {
     family: shared_types::ServiceType,
     _file: Option<File>,
     _process: tokio::sync::OwnedMutexGuard<()>,
+}
+
+struct SharedBuilderLease {
+    lease: std::sync::Mutex<Option<Box<dyn shared_types::AppOperationLease>>>,
+}
+struct SharedBuilderLeaseHandle {
+    shared: std::sync::Arc<SharedBuilderLease>,
+    owner: bool,
+}
+#[async_trait::async_trait]
+impl shared_types::AppOperationLease for SharedBuilderLeaseHandle {
+    fn receipt(&self) -> Option<shared_types::UserAppOperationLeaseReceipt> {
+        self.shared
+            .lease
+            .lock()
+            .ok()
+            .and_then(|lease| lease.as_ref().and_then(|lease| lease.receipt()))
+    }
+    async fn release(self: Box<Self>) -> Result<(), String> {
+        // Borrow completion drops only its reference. The owning guard releases
+        // after terminal persistence, never inside physical deletion.
+        if !self.owner {
+            return Ok(());
+        }
+        let lease = self
+            .shared
+            .lease
+            .lock()
+            .map_err(|_| "builder lease lock poisoned".to_owned())?
+            .take();
+        if let Some(lease) = lease {
+            lease.release().await?;
+        }
+        Ok(())
+    }
 }
 
 impl AppOperationGuard {
@@ -75,20 +112,16 @@ impl AppOperationGuard {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Dev 清理接管文件锁（2026-09-19 flock 同进程重入修复）。
-    ///
-    /// Dev 域 destroy 的执行体内，`UserappDevResourcesCleanup::capture`
-    /// 会在**同一文件**上获取更强的带标记租约（marker + 身份）。flock
-    /// 按打开文件描述符隔离——本守卫的无标记 flock（另一 fd）在执行体
-    /// 期间持有会让内层获取必然 WouldBlock（同进程自死锁，容器内实测）。
-    ///
-    /// 调用时机：持久租约回执（bind_lease）已绑定之后、内层清理获取
-    /// 之前。进程内互斥与 side_effect 簿记保持；变更期间的文件级互斥
-    /// 由内层标记租约承担。
-    pub(crate) fn hand_over_to_inner_builder_lease(&mut self) {
-        if self.family == shared_types::ServiceType::UserappBuilder {
-            self._file = None;
-        }
+    /// Lend the actual lease to the deletion ticket; outer guard remains the
+    /// sole release authority through durable operation completion.
+    pub(crate) fn builder_lease(&self) -> AppResult<Box<dyn shared_types::AppOperationLease>> {
+        let lease = self.builder_lease.as_ref().ok_or_else(|| {
+            AppOperationError::Backend("builder operation lease is unavailable".into())
+        })?;
+        Ok(Box::new(SharedBuilderLeaseHandle {
+            shared: lease.clone(),
+            owner: false,
+        }))
     }
 
     pub(crate) async fn finish(mut self) -> AppResult<()> {
@@ -161,8 +194,12 @@ impl AppService {
         process: tokio::sync::OwnedMutexGuard<()>,
         wait: bool,
     ) -> AppResult<AppOperationGuard> {
+        let flight = self
+            .operation_flight
+            .guard()
+            .map_err(|error| AppOperationError::Conflict(error.to_string()))?;
         let builder_family = scope == shared_types::UserAppOperationScope::Dev;
-        let runtime = if self.config.access_mode == AppAccessMode::Kubernetes {
+        let runtime = if builder_family || self.config.access_mode == AppAccessMode::Kubernetes {
             // K8s 租约等待语义对齐 Docker flock 轮询：wait=true 时 409
             // （OperationInProgress）按间隔重试直至持有者释放——start（无 url）
             // 与内部回收器的"排队等待"契约在 K8s 模式同样成立；wait=false
@@ -206,7 +243,7 @@ impl AppService {
         } else {
             None
         };
-        let file = if self.config.access_mode == AppAccessMode::Docker {
+        let file = if !builder_family && self.config.access_mode == AppAccessMode::Docker {
             crate::utils::validate_app_id(app_id)?;
             let root = &self.config.operation_lock_root;
             if !std::path::Path::new(root).is_absolute() {
@@ -259,7 +296,24 @@ impl AppService {
         } else {
             None
         };
+        let (runtime, builder_lease) = if builder_family {
+            let shared = std::sync::Arc::new(SharedBuilderLease {
+                lease: std::sync::Mutex::new(runtime),
+            });
+            (
+                Some(Box::new(SharedBuilderLeaseHandle {
+                    shared: shared.clone(),
+                    owner: true,
+                })
+                    as Box<dyn shared_types::AppOperationLease>),
+                Some(shared),
+            )
+        } else {
+            (runtime, None)
+        };
         Ok(AppOperationGuard {
+            builder_lease,
+            _flight: flight,
             runtime,
             marker: shared_types::AppFileMutationMarker::new(),
             side_effect_started: std::sync::atomic::AtomicBool::new(false),
@@ -289,9 +343,37 @@ mod tests {
             Ok(())
         }
     }
+    #[tokio::test]
+    async fn borrowed_builder_lease_keeps_one_owner_until_terminal_release() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(SharedBuilderLease {
+            lease: std::sync::Mutex::new(Some(Box::new(Lease(releases.clone())))),
+        });
+        let owner = Box::new(SharedBuilderLeaseHandle {
+            shared: shared.clone(),
+            owner: true,
+        });
+        let borrowed = Box::new(SharedBuilderLeaseHandle {
+            shared,
+            owner: false,
+        });
+        shared_types::AppOperationLease::release(borrowed)
+            .await
+            .unwrap();
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        shared_types::AppOperationLease::release(owner)
+            .await
+            .unwrap();
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+    }
+
     async fn guard(releases: Arc<AtomicUsize>) -> AppOperationGuard {
         AppOperationGuard {
+            _flight: Arc::new(shared_types::OperationFlightGate::default())
+                .guard()
+                .unwrap(),
             runtime: Some(Box::new(Lease(releases))),
+            builder_lease: None,
             marker: shared_types::AppFileMutationMarker::new(),
             side_effect_started: std::sync::atomic::AtomicBool::new(false),
             family: shared_types::ServiceType::Userapp,

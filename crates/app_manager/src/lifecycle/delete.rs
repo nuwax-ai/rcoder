@@ -104,9 +104,10 @@ impl AppService {
                 .await;
             match mutation {
                 Ok(()) => {
+                    let completed_lifecycle = durable.execution_context().lifecycle_id;
                     durable.succeed().await?;
                     release_lock.mark_completed();
-                    self.activity.forget_app(app_id);
+                    self.activity.forget_lifecycle(app_id, &completed_lifecycle);
                 }
                 Err(error) => {
                     if release_lock.has_unfinished_mutation() {

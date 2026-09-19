@@ -1,0 +1,373 @@
+   Compiling yoke v0.8.3
+   Compiling regex-automata v0.4.18
+   Compiling tokio-rustls v0.26.5
+   Compiling uuid v1.26.1
+   Compiling deranged v0.5.8
+   Compiling tower v0.5.3
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling objc2-core-foundation v0.3.2
+   Compiling prost-build v0.14.4
+   Compiling triomphe v0.1.16
+   Compiling rust-i18n-macro v4.2.2
+   Compiling utoipa-gen v5.5.0
+   Compiling zerovec v0.11.8
+   Compiling zerotrie v0.2.5
+   Compiling hyper-rustls v0.27.9
+   Compiling zstd-safe v7.3.0
+   Compiling rust-i18n-support v4.2.2
+   Compiling zstd v0.13.3
+   Compiling rust-embed v8.12.0
+   Compiling objc2-io-kit v0.3.2
+   Compiling time v0.3.55
+   Compiling tonic-prost-build v0.14.6
+   Compiling async-process v2.5.0
+   Compiling ownedbytes v0.9.0
+   Compiling tinystr v0.8.4
+   Compiling potential_utf v0.1.6
+   Compiling axum v0.8.9
+   Compiling sysinfo v0.39.6
+   Compiling bitpacking v0.9.3
+   Compiling icu_locale_core v2.3.0
+   Compiling icu_collections v2.3.0
+   Compiling agent-client-protocol v2.1.0
+   Compiling utf8-ranges v1.0.5
+   Compiling shared_types_grpc v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/shared_types_grpc)
+   Compiling tantivy-bitpacker v0.10.0
+   Compiling rust-i18n v4.2.2
+   Compiling tantivy-fst v0.5.0
+   Compiling shared_types_i18n v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/shared_types_i18n)
+   Compiling murmurhash32 v0.3.1
+   Compiling rayon-core v1.13.0
+   Compiling erased-serde v0.4.10
+   Compiling ordered-float v5.5.0
+   Compiling icu_provider v2.3.1
+   Compiling regex v1.13.1
+   Compiling matchers v0.2.0
+   Compiling turso_macros v0.7.2
+   Compiling tracing-subscriber v0.3.23
+   Compiling fastdivide v0.4.2
+   Compiling icu_normalizer v2.3.0
+   Compiling icu_properties v2.3.0
+   Compiling garde v0.23.0
+   Compiling tantivy-common v0.11.0
+   Compiling icu_locale_fallback v2.3.0
+   Compiling downcast-rs v2.0.2
+   Compiling tantivy-sstable v0.7.0
+   Compiling tantivy-stacker v0.7.0
+   Compiling inventory v0.3.24
+   Compiling tantivy-query-grammar v0.26.0
+   Compiling rayon v1.12.0
+   Compiling typetag v0.2.23
+   Compiling pest_generator v2.9.1
+   Compiling fs4 v0.13.1
+   Compiling tantivy-tokenizer-api v0.7.0
+   Compiling tracing-opentelemetry v0.33.0
+   Compiling tantivy-columnar v0.7.0
+   Compiling idna_adapter v1.2.2
+   Compiling rust-stemmers v1.2.0
+   Compiling idna v1.1.0
+   Compiling sketches-ddsketch v0.4.1
+   Compiling measure_time v0.9.0
+   Compiling htmlescape v0.3.1
+   Compiling datasketches v0.2.0
+   Compiling tracing-opentelemetry-instrumentation-sdk v0.38.3
+   Compiling url v2.5.8
+   Compiling levenshtein_automata v0.2.1
+   Compiling census v0.4.2
+   Compiling oneshot v0.1.13
+   Compiling lz4_flex v0.13.1
+   Compiling utoipa v5.5.0
+   Compiling tower-http v0.6.11
+   Compiling tonic v0.14.6
+   Compiling axum-tracing-opentelemetry v0.38.0
+   Compiling asn1-rs v0.6.2
+   Compiling pest_derive v2.9.1
+   Compiling icu_collator v2.3.1
+   Compiling tantivy v0.26.2
+   Compiling turso_ext v0.7.2
+   Compiling turso_parser v0.7.2
+   Compiling icu_locale v2.3.1
+   Compiling k8s-openapi v0.28.0
+   Compiling granit-parser v0.0.7
+   Compiling reqwest v0.13.5
+   Compiling moka v0.12.16
+   Compiling jsonpath-rust v1.0.11
+   Compiling turso_sdk_kit v0.7.2
+   Compiling serde-saphyr v0.0.29
+   Compiling md-5 v0.11.0
+   Compiling utoipa-swagger-ui v9.0.2
+   Compiling async-stream-impl v0.3.6
+   Compiling tonic-prost v0.14.6
+   Compiling der_derive v0.7.3
+   Compiling fallible-iterator v0.2.0
+   Compiling const-oid v0.9.6
+   Compiling flagset v0.4.7
+   Compiling bit-vec v0.10.1
+   Compiling tracing-appender v0.2.5
+   Compiling bit-set v0.11.1
+   Compiling postgres-protocol v0.6.12
+   Compiling flurry v0.5.2
+   Compiling async-stream v0.3.6
+   Compiling educe v0.6.0
+   Compiling der v0.7.10
+   Compiling oid-registry v0.7.1
+   Compiling zstd-safe v8.0.0
+   Compiling der-parser v9.0.0
+   Compiling objc2-system-configuration v0.3.2
+   Compiling phf_shared v0.13.1
+   Compiling backon v1.6.0
+   Compiling turso_sdk_kit_macros v0.7.2
+   Compiling array-init v2.1.0
+   Compiling phf v0.13.1
+   Compiling whoami v2.1.3
+   Compiling pingora-rustls v0.9.0
+   Compiling postgres-types v0.2.14
+   Compiling shared_types v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/shared_types)
+   Compiling zstd v0.14.0
+   Compiling toasty-core v0.10.0
+   Compiling bstr v1.13.1
+   Compiling x509-parser v0.16.0
+   Compiling tracing v0.1.44
+   Compiling spki v0.7.3
+   Compiling bollard v0.21.1
+   Compiling tokio-postgres v0.7.18
+   Compiling pingora-header-serde v0.9.0
+   Compiling pingora-lru v0.9.0
+   Compiling x509-cert v0.2.5
+   Compiling deadpool-runtime v0.3.1
+   Compiling index_vec v0.1.4
+   Compiling by_address v1.2.1
+   Compiling deadpool v0.13.1
+   Compiling download_utils v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/download_utils)
+   Compiling pingora-core v0.9.0
+   Compiling toasty-sql v0.10.0
+   Compiling tokio-postgres-rustls v0.14.0
+   Compiling toasty-driver-postgresql v0.10.0
+   Compiling turso_core v0.7.2
+   Compiling toasty-macros v0.10.0
+   Compiling kube-core v4.2.0
+   Compiling pingora-cache v0.9.0
+   Compiling pingora-load-balancing v0.9.0
+   Compiling kube-client v4.2.0
+   Compiling pingora-proxy v0.9.0
+   Compiling container-runtime-api v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/container-runtime-api)
+   Compiling preview-coordinator v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/preview-coordinator)
+   Compiling kube-runtime v4.2.0
+   Compiling pingora v0.9.0
+   Compiling rcoder-proxy v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/rcoder-proxy)
+   Compiling kube v4.2.0
+   Compiling docker_manager v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/docker_manager)
+   Compiling turso_sync_engine v0.7.2
+   Compiling app_manager v0.1.0 (/Users/soddy/Documents/git-workspace/rcoder/crates/app_manager)
+   Compiling turso_sync_sdk_kit v0.7.2
+   Compiling turso v0.7.2
+   Compiling toasty-driver-turso v0.10.0 (/Users/soddy/Documents/git-workspace/rcoder/vendor/toasty-driver-turso)
+   Compiling toasty v0.10.0
+   Compiling rcoder-storage v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/rcoder-storage)
+warning: type `DatabaseOwner` is more private than the item `PersistWriter::spawn`
+  --> crates/rcoder-storage/src/pg/project_store/writer.rs:50:5
+   |
+50 | /     pub fn spawn(
+51 | |         pool: DatabaseOwner,
+52 | |         rx: mpsc::UnboundedReceiver<PersistOp>,
+53 | |         pending: Arc<AtomicI64>,
+54 | |     ) -> Self {
+   | |_____________^ associated function `PersistWriter::spawn` is reachable at visibility `pub`
+   |
+note: but type `DatabaseOwner` is only usable at visibility `pub(crate)`
+  --> crates/rcoder-storage/src/db/owner.rs:19:1
+   |
+19 | pub(crate) struct DatabaseOwner {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: `#[warn(private_interfaces)]` on by default
+
+warning: method `restore_session_with_identity` is never used
+  --> crates/rcoder-storage/src/adapter/session_ops.rs:17:19
+   |
+14 | impl ProjectAdapter {
+   | ------------------- method in this implementation
+...
+17 |     pub(crate) fn restore_session_with_identity(
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `service_type` and `last_activity` are never read
+  --> crates/rcoder-storage/src/pg/project_store/repo/rows.rs:12:9
+   |
+ 6 | pub(in crate::pg) struct ContainerRow {
+   |                          ------------ fields in this struct
+...
+12 |     pub service_type: String,
+   |         ^^^^^^^^^^^^
+...
+18 |     pub last_activity: chrono::DateTime<chrono::Utc>,
+   |         ^^^^^^^^^^^^^
+
+warning: non-binding let on a type that has a destructor
+  --> crates/rcoder-storage/src/db/owner.rs:90:33
+   |
+90 | ...                   let _ = ready.send(Err(message.clone()));
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: requested on the command line with `-W let-underscore-drop`
+help: consider binding to an unused variable to avoid immediately dropping the value
+   |
+90 |                                 let _unused = ready.send(Err(message.clone()));
+   |                                      ++++++
+help: consider immediately dropping the value
+   |
+90 -                                 let _ = ready.send(Err(message.clone()));
+90 +                                 drop(ready.send(Err(message.clone())));
+   |
+
+warning: non-binding let on a type that has a destructor
+   --> crates/rcoder-storage/src/db/owner.rs:132:13
+    |
+132 |             let _ = wait_for_completion(completion).await;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: consider binding to an unused variable to avoid immediately dropping the value
+    |
+132 |             let _unused = wait_for_completion(completion).await;
+    |                  ++++++
+help: consider immediately dropping the value
+    |
+132 -             let _ = wait_for_completion(completion).await;
+132 +             drop(wait_for_completion(completion).await);
+    |
+
+warning: non-binding let on a type that has a destructor
+   --> crates/rcoder-storage/src/db/owner.rs:168:17
+    |
+168 |                 let _ = reply.send(outcome.unwrap_or_else(|_| Err(OutcomeUnknown.into())));
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: consider binding to an unused variable to avoid immediately dropping the value
+    |
+168 |                 let _unused = reply.send(outcome.unwrap_or_else(|_| Err(OutcomeUnknown.into())));
+    |                      ++++++
+help: consider immediately dropping the value
+    |
+168 -                 let _ = reply.send(outcome.unwrap_or_else(|_| Err(OutcomeUnknown.into())));
+168 +                 drop(reply.send(outcome.unwrap_or_else(|_| Err(OutcomeUnknown.into()))));
+    |
+
+warning: non-binding let on a type that has a destructor
+   --> crates/rcoder-storage/src/pg/project_store/leader.rs:147:60
+    |
+147 |             _ = cancel.cancelled() => { stop_job.cancel(); let _ = job.as_mut().await; }
+    |                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: consider binding to an unused variable to avoid immediately dropping the value
+    |
+147 |             _ = cancel.cancelled() => { stop_job.cancel(); let _unused = job.as_mut().await; }
+    |                                                                 ++++++
+help: consider immediately dropping the value
+    |
+147 -             _ = cancel.cancelled() => { stop_job.cancel(); let _ = job.as_mut().await; }
+147 +             _ = cancel.cancelled() => { stop_job.cancel(); drop(job.as_mut().await); }
+    |
+
+warning: non-binding let on a type that has a destructor
+   --> crates/rcoder-storage/src/pg/project_store/leader.rs:148:77
+    |
+148 |             _ = shutdown_rx.recv() => { cancel.cancel(); stop_job.cancel(); let _ = job.as_mut().await; }
+    |                                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: consider binding to an unused variable to avoid immediately dropping the value
+    |
+148 |             _ = shutdown_rx.recv() => { cancel.cancel(); stop_job.cancel(); let _unused = job.as_mut().await; }
+    |                                                                                  ++++++
+help: consider immediately dropping the value
+    |
+148 -             _ = shutdown_rx.recv() => { cancel.cancel(); stop_job.cancel(); let _ = job.as_mut().await; }
+148 +             _ = shutdown_rx.recv() => { cancel.cancel(); stop_job.cancel(); drop(job.as_mut().await); }
+    |
+
+warning: non-binding let on a type that has a destructor
+   --> crates/rcoder-storage/src/userapp_lifecycle/common/ops.rs:598:9
+    |
+598 | /         let _: BuilderCreationEvidence =
+599 | |             serde_json::from_value(op.checkpoint.clone()).map_err(storage)?;
+    | |____________________________________________________________________________^
+    |
+help: consider binding to an unused variable to avoid immediately dropping the value
+    |
+598 |         let _unused: BuilderCreationEvidence =
+    |              ++++++
+help: consider immediately dropping the value
+    |
+598 -         let _: BuilderCreationEvidence =
+599 -             serde_json::from_value(op.checkpoint.clone()).map_err(storage)?;
+598 +         drop(serde_json::from_value(op.checkpoint.clone()).map_err(storage)?);
+    |
+
+warning: non-binding let on a type that has a destructor
+   --> crates/rcoder-storage/src/db/tests.rs:130:5
+    |
+130 |     let _ = request.await;
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: consider binding to an unused variable to avoid immediately dropping the value
+    |
+130 |     let _unused = request.await;
+    |          ++++++
+help: consider immediately dropping the value
+    |
+130 -     let _ = request.await;
+130 +     drop(request.await);
+    |
+
+warning: `rcoder-storage` (lib) generated 9 warnings (run `cargo fix --lib -p rcoder-storage` to apply 6 suggestions)
+warning: `rcoder-storage` (lib test) generated 10 warnings (9 duplicates) (run `cargo fix --lib -p rcoder-storage --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized] target(s) in 2m 18s
+────────────
+ Nextest run ID 3f01abbc-2443-4a6b-a175-3aae7d48c615 with nextest profile: default
+    Starting 24 tests across 6 binaries (829 tests skipped)
+        PASS [   0.074s] ( 1/24) docker_manager runtime::k8s_app_query::secret_environment_tests::secret_wire_encoding_is_removed_exactly_once
+        PASS [   0.073s] ( 2/24) docker_manager runtime::k8s_app_query::secret_environment_tests::invalid_utf8_is_an_error_instead_of_discarding_all_secrets
+        PASS [   0.093s] ( 3/24) docker_manager runtime::k8s_statefulset::tests::builder_reuse_requires_lifecycle_configuration_and_template_identity
+        PASS [   0.105s] ( 4/24) docker_manager runtime::docker_app_runtime::configuration_exec_tests::configuration_exec_requires_physical_lifecycle_and_generation_match
+        PASS [   0.121s] ( 5/24) docker_manager agent_container_starter::preflight_tests::missing_builder_configuration_fails_before_operation_lease_or_docker_api
+        PASS [   0.570s] ( 6/24) app_manager lifecycle::deploy_control::runtime_configuration_tests::start_deployment_hot_gate_uses_admission_capture
+        FAIL [   0.576s] ( 7/24) app_manager lifecycle::deploy_control::runtime_configuration_tests::cold_deployment_uses_captured_secret_and_activates_only_after_pg_verification
+  stdout ───
+
+    running 1 test
+    test lifecycle::deploy_control::runtime_configuration_tests::cold_deployment_uses_captured_secret_and_activates_only_after_pg_verification ... FAILED
+
+    failures:
+
+    failures:
+        lifecycle::deploy_control::runtime_configuration_tests::cold_deployment_uses_captured_secret_and_activates_only_after_pg_verification
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 205 filtered out; finished in 0.53s
+
+  stderr ───
+
+    thread 'lifecycle::deploy_control::runtime_configuration_tests::cold_deployment_uses_captured_secret_and_activates_only_after_pg_verification' (38481635) panicked at crates/app_manager/src/test_support.rs:228:9:
+    assertion failed: __self.lease_held.load(Ordering::SeqCst)
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        PASS [   0.053s] ( 8/24) rcoder-storage userapp_lifecycle::common::local_tests::offline_observer_never_creates_missing_database
+        PASS [   0.771s] ( 9/24) rcoder-storage userapp_lifecycle::common::configuration_tests::concurrent_saves_at_one_revision_have_one_winner
+        PASS [   0.688s] (10/24) rcoder-storage userapp_lifecycle::common::configuration_tests::hot_deploy_with_pending_credentials_is_rejected_before_admission_commits
+        PASS [   0.704s] (11/24) rcoder-storage userapp_lifecycle::common::configuration_tests::save_after_admission_does_not_turn_original_absence_into_new_credentials
+        PASS [   0.699s] (12/24) rcoder-storage userapp_lifecycle::common::configuration_tests::save_is_configuration_only_and_replay_cannot_promote_an_old_version
+        PASS [   0.052s] (13/24) shared_types pg_utils::tests::business_database_readiness_uses_captured_admin_and_business_database
+        PASS [   0.052s] (14/24) shared_types userapp::db_align::tests::captured_admin_provisions_missing_role_before_tcp_verification
+        PASS [   0.752s] (15/24) rcoder-storage userapp_lifecycle::common::configuration_tests::confirmed_preflight_failure_closes_intent_without_promoting_credentials
+        PASS [   0.030s] (16/24) shared_types userapp::db_align::tests::unknown_role_creation_keeps_mutation_evidence_without_password
+        PASS [   0.037s] (17/24) shared_types userapp::lifecycle::execution_context_tests::control_identity_does_not_reuse_creation_configuration_digest
+        PASS [   0.849s] (18/24) rcoder-storage userapp_lifecycle::common::configuration_tests::configuration_and_capture_are_isolated_between_dev_and_prod
+        PASS [   0.869s] (19/24) app_manager service::tests::configuration_update_commits_new_policy_and_releases_operation_marker
+        PASS [   0.891s] (20/24) rcoder-storage userapp_lifecycle::common::configuration_tests::capture_is_atomic_and_concurrent_save_does_not_change_execution_or_applied_result
+        PASS [   0.310s] (21/24) rcoder-storage userapp_lifecycle::common::local_tests::offline_observer_preserves_running_operation_and_requires_exclusive_instance
+        PASS [   0.779s] (22/24) rcoder-storage userapp_lifecycle::common::configuration_tests::unknown_pg_write_cannot_be_finalized_or_rebound_and_business_failure_keeps_applied_version
+        PASS [   1.021s] (23/24) app_manager service::tests::pending_configuration_recovery_uses_private_resolved_input_once
+        PASS [   0.538s] (24/24) rcoder-storage userapp_lifecycle::tests::turso_configuration_policy_contract
+────────────
+     Summary [   1.179s] 24 tests run: 23 passed, 1 failed, 829 skipped
+        FAIL [   0.576s] ( 7/24) app_manager lifecycle::deploy_control::runtime_configuration_tests::cold_deployment_uses_captured_secret_and_activates_only_after_pg_verification
+error: test run failed

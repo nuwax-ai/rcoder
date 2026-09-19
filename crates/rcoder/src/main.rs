@@ -147,34 +147,6 @@ async fn run() -> anyhow::Result<()> {
     let access_tracker: Arc<dyn shared_types::AppAccessTracker> = activity_registry.clone();
     let wake_control: Arc<dyn shared_types::AppWakeControl> = activity_registry.clone();
 
-    // M5：PG 模式的 activity 影子持久化——加载必须早于 AppState::new（内部的
-    // AppService::new/rebuild_stopped_apps 仅对未加载到的 Running app seed_accessed）
-    if projects.is_postgres() {
-        #[cfg(feature = "rcoder-pg")]
-        {
-            let ProjectStoreBackend::Postgres(store) = &*projects else {
-                unreachable!("is_postgres 为真的分支");
-            };
-            let activity_persistence: Arc<dyn shared_types::ActivityPersistence> = Arc::new(
-                rcoder_storage::pg::userapp::activity::PgActivityPersistence::new(
-                    store.pool().clone(),
-                ),
-            );
-            match activity_persistence.load_all().await {
-                Ok(rows) => {
-                    let count = rows.len();
-                    activity_registry.apply_loaded(rows);
-                    tracing::info!("[STORAGE_PG] userapp_activity loaded: {count} rows");
-                }
-                Err(e) => {
-                    eprintln!("[STORAGE_PG] userapp_activity load failed: {e:#}");
-                    std::process::exit(1);
-                }
-            }
-            activity_registry.set_persistence(activity_persistence);
-        }
-    }
-
     let proxy_result = proxy_init::init_proxy(
         &bootstrap_result.config,
         Arc::clone(&bootstrap_result.api_key_config),
@@ -189,6 +161,8 @@ async fn run() -> anyhow::Result<()> {
     // 位置原本只在默认 hook 的 stderr——两路日志，排障对不上代码行）
     shutdown::set_panic_hook();
     let shutdown_tx = shutdown::setup_signal_handlers();
+    // Retain signals during asynchronous AppState/background initialization.
+    let mut shutdown_rx = shutdown_tx.subscribe();
 
     let _config_watcher = if bootstrap_result.config_watcher_enabled {
         match config_watcher::ConfigWatcher::new(
@@ -333,7 +307,7 @@ async fn run() -> anyhow::Result<()> {
         )));
     }
 
-    let _bg_handles = background_tasks::start_all_background_tasks(
+    let bg_handles = background_tasks::start_all_background_tasks(
         &bootstrap_result.config,
         state.clone(),
         shutdown_tx.clone(),
@@ -343,6 +317,7 @@ async fn run() -> anyhow::Result<()> {
     let runtime_for_shutdown = state.runtime().clone();
     // 存储关机控制（trait-design §6）：state 即将 move 进 router，先留出句柄
     let userapp_store_control = state.userapp_store_control.clone();
+    let activity_for_shutdown = state.activity.clone();
     // R02：在途协调门闸 + 恢复扫描器句柄（take——扫描器随关机退出）
     let userapp_op_flight = state.userapp_op_flight.clone();
     let userapp_recovery = state
@@ -359,26 +334,42 @@ async fn run() -> anyhow::Result<()> {
     let server_handle =
         server::start_http_server(app, bootstrap_result.config.port, shutdown_tx.clone()).await?;
 
+    let _ = shutdown_rx.recv().await;
+    let deadline = tokio::time::Instant::now() + shutdown::SHUTDOWN_BUDGET;
+    userapp_op_flight.close();
+    // Tasks created after the first signal still need the shutdown notification.
+    let _ = shutdown_tx.send(());
+    if let Some(tx) = proxy_result.pingora_shutdown_tx {
+        let _ = tx.send(());
+    }
+    // Both producers receive shutdown before either is awaited. Detached business
+    // tasks keep their admission guards through durable terminal publication.
+    tokio::time::timeout_at(deadline, server_handle)
+        .await
+        .map_err(|_| anyhow::anyhow!("HTTP drain timed out; storage remains owned"))??;
+    if let Some(handle) = proxy_result.proxy_handle {
+        tokio::time::timeout_at(deadline, handle)
+            .await
+            .map_err(|_| anyhow::anyhow!("proxy drain timed out; storage remains owned"))??;
+    }
+    tokio::time::timeout_at(deadline, file_server_proxy::stop())
+        .await
+        .map_err(|_| anyhow::anyhow!("file-server proxy drain timed out; storage remains owned"))?
+        .map_err(anyhow::Error::msg)?;
+    bg_handles.drain(deadline).await?;
     shutdown::graceful_shutdown(
-        shutdown_tx.subscribe(),
+        deadline,
         bootstrap_result.config.clone(),
         runtime_for_shutdown,
         Some(projects_for_shutdown),
-        userapp_store_control,
-        Some(userapp_op_flight),
-        userapp_recovery,
+        activity_for_shutdown,
+        shutdown::UserAppShutdown {
+            store: userapp_store_control,
+            operations: Some(userapp_op_flight),
+            recovery: userapp_recovery,
+        },
     )
-    .await;
-    server_handle.abort();
-
-    if let Some(pingora_shutdown_tx) = proxy_result.pingora_shutdown_tx {
-        let _ = pingora_shutdown_tx.send(());
-    }
-    if let Some(proxy_handle) = proxy_result.proxy_handle
-        && let Err(e) = proxy_handle.await
-    {
-        warn!("proxy task join failed during shutdown: {}", e);
-    }
+    .await?;
 
     Ok(())
 }

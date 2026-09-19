@@ -41,19 +41,15 @@ else
 fi
 
 # 启动 rcoder 服务
-# 优先用 dev-hot 编译产物 (target volume 持久, docker compose up 后不丢); 回退镜像 binary
-# target-unstable 是 dev-hot 恒定编译目录（tokio_unstable：dial9 hooks 全量覆盖）；
-# 两目录互斥（dev-hot-build.sh 每次清另一侧产物防陈旧），取存在的那个即可。
+# dev-hot-build.sh atomically replaces this container-local executable.
+# A restart keeps that replacement; recreating the container selects its image.
+# Never execute target-volume artifacts: they can belong to an older image/source.
 RCODER_BIN="/app/bin/rcoder"
-if [ -x "/app/src/target/release/rcoder" ]; then
-    RCODER_BIN="/app/src/target/release/rcoder"
-    echo "📡 使用 dev-hot 编译产物: $RCODER_BIN"
-elif [ -x "/app/src/target-unstable/release/rcoder" ]; then
-    RCODER_BIN="/app/src/target-unstable/release/rcoder"
-    echo "📡 使用 dev-hot 编译产物: $RCODER_BIN"
-else
-    echo "📡 使用镜像 binary: $RCODER_BIN"
+if [ ! -x "$RCODER_BIN" ]; then
+    echo "RCoder executable is missing or not executable: $RCODER_BIN" >&2
+    exit 1
 fi
+echo "📡 使用容器 binary: $RCODER_BIN"
 echo "📡 启动 rcoder 服务 (端口: $RCODER_PORT)..."
 
 # RCODER_LOG_TO_FILE=1：stdout/stderr 合流重定向进 /app/logs/rcoder.log——生产

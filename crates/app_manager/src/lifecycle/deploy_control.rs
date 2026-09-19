@@ -79,6 +79,73 @@ fn decode_stored_deploy_result(
 }
 
 impl AppService {
+    pub(crate) async fn replace_captured_runtime_configuration(
+        &self,
+        current: container_runtime_api::DeploymentStatus,
+        operation: &mut OwnedOperation,
+        guard: &AppOperationGuard,
+    ) -> AppResult<()> {
+        let context = operation.execution_context();
+        let captured = self
+            .runtime_configuration
+            .operation_runtime_configuration(&context)
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::InvalidState(
+                    "Runtime configuration was not captured at admission".into(),
+                )
+            })?;
+        if self
+            .metadata
+            .store
+            .operation_deadline(&context.app_id, &context.operation_id)
+            .await?
+            .is_none()
+        {
+            let budget = i64::try_from(self.config.deploy_budget.absolute_budget_secs)
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(1000))
+                .ok_or_else(|| {
+                    AppOperationError::Validation(
+                        "Deployment deadline exceeds supported range".into(),
+                    )
+                })?;
+            self.metadata
+                .store
+                .bind_operation_deadline(
+                    &context.app_id,
+                    &context.operation_id,
+                    &context.lifecycle_id,
+                    chrono::Utc::now().timestamp_millis().saturating_add(budget),
+                )
+                .await?;
+        }
+        let mut params = self
+            .build_container_params_from_update(
+                &context.app_id,
+                &UpdateAppRequest {
+                    request_id: None,
+                    lifecycle_id: Some(context.lifecycle_id.clone()),
+                    name: None,
+                    image: None,
+                    env: None,
+                    secrets: None,
+                    resources: None,
+                    tenant_id: None,
+                    space_id: None,
+                    expected_resource_version: current.resource_version.clone(),
+                    recycle_enabled: None,
+                    idle_timeout_seconds: None,
+                },
+                &current,
+            )
+            .await?;
+        inject_captured_configuration(&mut params, &captured, &context, false);
+        self.execute_update(&context.app_id, params, current, operation, guard)
+            .await?;
+        self.complete_cold_runtime_configuration(&context).await
+    }
+
     pub(super) async fn deploy_controlled(
         &self,
         app_id: &str,
@@ -128,7 +195,7 @@ impl AppService {
             idle_timeout_seconds: input.request.idle_timeout_seconds,
             wake_on_traffic: Some(true),
         };
-        let mut operation = OwnedOperation::admit_with_input(
+        let mut operation = OwnedOperation::admit_with_configuration(
             self.metadata.store.clone(),
             shared_types::UserAppAdmission {
                 runtime_policy_on_success: Some(policy),
@@ -155,6 +222,7 @@ impl AppService {
                 kind,
             },
             Some(&encoded),
+            input.request.pg.as_ref(),
         )
         .await?;
         // Bind absolute deadline as a side-record (bind-once, before any runtime
@@ -313,6 +381,32 @@ impl AppService {
         })
     }
 
+    async fn validate_hot_runtime_configuration(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> AppResult<()> {
+        let Some(captured) = self
+            .runtime_configuration
+            .operation_runtime_configuration(context)
+            .await?
+        else {
+            return Ok(());
+        };
+        let status = self
+            .runtime_configuration
+            .runtime_configuration_status(&context.app_id, &context.lifecycle_id, captured.scope)
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::Backend("Captured runtime configuration has no status".into())
+            })?;
+        if status.applied_version != Some(captured.config_version) {
+            return Err(AppOperationError::HotDeployEnvChange(
+                "Captured runtime credentials require a cold deployment before they can take effect".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn execute_deploy_input(
         &self,
         app_id: &str,
@@ -322,7 +416,7 @@ impl AppService {
     ) -> AppResult<StartAppResult> {
         let DeployInput {
             request,
-            params,
+            mut params,
             previous,
             restart,
             ..
@@ -330,6 +424,62 @@ impl AppService {
         operation.bind_lease(&guard).await?;
         let context = operation.execution_context();
         super::start::validate_start_request(app_id, &request)?;
+        // StartDeployment can contain deploy_mode=hot, so checking only the
+        // HotDeploy admission kind does not cover this public entrypoint.
+        if request.deploy_mode == Some(DeployMode::Hot) {
+            self.validate_hot_runtime_configuration(&context).await?;
+        }
+        let captured_configuration = self
+            .runtime_configuration
+            .operation_runtime_configuration(&context)
+            .await?;
+        if request.pg.is_some() && captured_configuration.is_none() {
+            return Err(AppOperationError::InvalidState(
+                "Deployment credentials require an admission configuration capture".into(),
+            ));
+        }
+        if let Some(captured) = &captured_configuration
+            && request.pg.as_ref().is_some_and(|pg| pg != &captured.pg)
+        {
+            return Err(AppOperationError::Validation("Request credentials differ from the captured configuration; save the desired configuration before starting the operation".into()));
+        }
+        let managed_cold =
+            captured_configuration.is_some() && request.deploy_mode != Some(DeployMode::Hot);
+        if managed_cold {
+            if params.is_none() {
+                let current = previous.as_ref().ok_or_else(|| {
+                    AppOperationError::NotFound(
+                        "Managed runtime replacement target is missing".into(),
+                    )
+                })?;
+                params = Some(
+                    self.build_container_params_from_update(
+                        app_id,
+                        &UpdateAppRequest {
+                            request_id: None,
+                            lifecycle_id: Some(context.lifecycle_id.clone()),
+                            name: None,
+                            image: None,
+                            env: None,
+                            secrets: None,
+                            resources: None,
+                            tenant_id: None,
+                            space_id: None,
+                            expected_resource_version: current.resource_version.clone(),
+                            recycle_enabled: request.idle_timeout_seconds.map(|idle| idle > 0),
+                            idle_timeout_seconds: request.idle_timeout_seconds,
+                        },
+                        current,
+                    )
+                    .await?,
+                );
+            }
+            if let (Some(params), Some(captured)) =
+                (params.as_mut(), captured_configuration.as_ref())
+            {
+                inject_captured_configuration(params, captured, &context, request.url.is_some());
+            }
+        }
         let url = request
             .url
             .as_deref()
@@ -359,6 +509,39 @@ impl AppService {
                 .is_some();
         }
         let configuration_applied = !hot && params.is_some();
+        if captured_configuration.is_some() && request.deploy_mode == Some(DeployMode::Hot) {
+            if !hot {
+                return Err(AppOperationError::HotDeployEnvChange(
+                    "Managed hot deployment is unavailable; explicitly request a cold deployment"
+                        .into(),
+                ));
+            }
+            let deadline_ms = self
+                .metadata
+                .store
+                .operation_deadline(app_id, &context.operation_id)
+                .await?
+                .ok_or_else(|| {
+                    AppOperationError::InvalidState(
+                        "Managed hot deployment has no durable deadline".into(),
+                    )
+                })?;
+            let remaining = deadline_ms
+                .saturating_sub(chrono::Utc::now().timestamp_millis())
+                .max(0) as u64;
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(remaining);
+            tokio::time::timeout_at(
+                deadline,
+                self.observe_applied_runtime_configuration(&context, deadline),
+            )
+            .await
+            .map_err(|_| {
+                AppOperationError::Backend(
+                    "Managed hot deployment observation exceeded the operation deadline".into(),
+                )
+            })??;
+        }
         if !hot {
             if let Some(params) = params {
                 if let Some(previous) = previous {
@@ -395,7 +578,9 @@ impl AppService {
                 }
                 .map_err(|error| map_runtime_error("Start captured deployment", error))?;
             }
-            if url.is_some() {
+            if managed_cold {
+                self.complete_cold_runtime_configuration(&context).await?;
+            } else if url.is_some() {
                 self.wait_deploy_stage(app_id, &context.operation_id, &guard)
                     .await?;
             }
@@ -440,21 +625,16 @@ impl AppService {
         } else {
             None
         };
-        let (pg_aligned, pg_error) = match &request.pg {
-            Some(credentials) => match self.align_start_pg(app_id, credentials).await {
-                Ok(()) => (Some(true), None),
-                Err(error) => {
-                    let message = error.to_string();
-                    let message = if credentials.password.is_empty() {
-                        message
-                    } else {
-                        message.replace(&credentials.password, "[REDACTED]")
-                    };
-                    (Some(false), Some(message))
-                }
-            },
-            None => (None, None),
+        let pg_aligned = if captured_configuration.is_some() {
+            Some(true)
+        } else if request.pg.is_some() {
+            return Err(AppOperationError::InvalidState(
+                "Deployment credentials were not captured at admission".into(),
+            ));
+        } else {
+            None
         };
+        let pg_error = None;
         self.invalidate_deploy_cache().await;
         let mut runtime = self.get_app(app_id).await?;
         runtime.wake_on_traffic = Some(true);
@@ -483,5 +663,377 @@ impl AppService {
             )
             .await?;
         Ok(result)
+    }
+}
+
+fn inject_captured_configuration(
+    params: &mut container_runtime_api::ContainerCreateParams,
+    captured: &shared_types::RuntimeConfigurationCapture,
+    context: &shared_types::UserAppExecutionContext,
+    has_artifact: bool,
+) {
+    let env = params.env.get_or_insert_with(Default::default);
+    // The immutable generation's Secret wins over old manifest/image defaults.
+    env.remove("POSTGRES_USER");
+    env.remove("POSTGRES_PASSWORD");
+    env.insert(
+        shared_types::APP_RUNTIME_CONFIGURATION_VERSION.into(),
+        captured.config_version.to_string(),
+    );
+    env.insert(
+        shared_types::APP_DEPLOY_OPERATION_ID.into(),
+        context.operation_id.clone(),
+    );
+    env.insert(
+        shared_types::APP_DEPLOY_GENERATION_ID.into(),
+        context.operation_id.clone(),
+    );
+    if !has_artifact {
+        // Restart the confirmed workspace; do not replay an old download URL.
+        for key in ["APP_DEPLOY_URL", "APP_RELEASE_ID", "APP_DEPLOY_SHA256"] {
+            env.remove(key);
+        }
+    }
+    let secrets = params.secrets.get_or_insert_with(Default::default);
+    for key in [
+        shared_types::APP_RUNTIME_CONFIGURATION_VERSION,
+        shared_types::APP_DEPLOY_OPERATION_ID,
+        shared_types::APP_DEPLOY_GENERATION_ID,
+        "APP_DEPLOY_URL",
+        "APP_RELEASE_ID",
+        "APP_DEPLOY_SHA256",
+    ] {
+        secrets.remove(key);
+    }
+    let token = secrets
+        .remove("APP_CLI_DEPLOY_TOKEN")
+        .or_else(|| env.remove("APP_CLI_DEPLOY_TOKEN"))
+        .filter(|token| !token.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    env.remove("APP_CLI_DEPLOY_TOKEN");
+    // Existing hot-deploy and status clients read the platform token from the
+    // generation env snapshot. Keep that contract while PG credentials live in Secret.
+    env.insert("APP_CLI_DEPLOY_TOKEN".into(), token);
+    secrets.insert("POSTGRES_USER".into(), captured.pg.username.clone());
+    secrets.insert("POSTGRES_PASSWORD".into(), captured.pg.password.clone());
+}
+
+#[cfg(test)]
+mod runtime_configuration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cold_deployment_uses_captured_secret_and_activates_only_after_pg_verification() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::test_support::MockRuntime::default());
+        let mut service = crate::test_support::test_service(root.path(), runtime.clone()).await;
+        // This fixture asserts the runtime lease at every management call.
+        // Docker uses a filesystem lease instead, so exercise the K8s lease
+        // path explicitly rather than accidentally mixing both models.
+        service.config.access_mode = crate::config::AppAccessMode::Kubernetes;
+        let app_id = "coldcredentials";
+        let identity = service
+            .metadata
+            .store
+            .ensure_identity(app_id)
+            .await
+            .unwrap();
+        let save =
+            |id: &str, revision, password: &str| shared_types::SaveRuntimeConfigurationRequest {
+                lifecycle_id: identity.lifecycle_id.clone(),
+                request_id: id.into(),
+                expected_revision: revision,
+                pg: StartPgCredential {
+                    username: "business".into(),
+                    password: password.into(),
+                },
+            };
+        service
+            .runtime_configuration
+            .save_runtime_configuration(
+                app_id,
+                shared_types::UserAppOperationScope::Prod,
+                &save("save1", 0, "capturedpassword"),
+            )
+            .await
+            .unwrap();
+        let guard = Arc::new(
+            service
+                .try_acquire_process_release_lock(app_id)
+                .await
+                .unwrap(),
+        );
+        let mut operation = OwnedOperation::admit(
+            service.metadata.store.clone(),
+            shared_types::UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: None,
+                metadata: None,
+                app_id: app_id.into(),
+                lifecycle_id: Some(identity.lifecycle_id.clone()),
+                operation_id: "coldoperation".into(),
+                request_id: None,
+                request_fingerprint: "a".repeat(64),
+                kind: UserAppOperationKind::StartDeployment,
+            },
+        )
+        .await
+        .unwrap();
+        let context = operation.execution_context();
+        service
+            .metadata
+            .store
+            .bind_operation_deadline(
+                app_id,
+                &context.operation_id,
+                &context.lifecycle_id,
+                chrono::Utc::now().timestamp_millis() + 30_000,
+            )
+            .await
+            .unwrap();
+        // A later save cannot change the version already owned by this operation.
+        service
+            .runtime_configuration
+            .save_runtime_configuration(
+                app_id,
+                shared_types::UserAppOperationScope::Prod,
+                &save("save2", 1, "pendingpassword"),
+            )
+            .await
+            .unwrap();
+        *runtime.configuration_replies.lock().unwrap() = [
+            (0, "initialadmin\n"),
+            (0, "1\n"),
+            (2, ""),
+            (0, "1\n"),
+            (0, "ALTER ROLE"),
+            (0, "1\n"),
+            (0, r#"{"success":true,"data":{"activated":true}}"#),
+            (0, r#"{"status":"ready","phase":"running"}"#),
+        ]
+        .into_iter()
+        .map(|(exit_code, stdout)| container_runtime_api::ExecResult {
+            exit_code,
+            stdout: stdout.into(),
+            stderr: String::new(),
+        })
+        .collect();
+        let mut params = container_runtime_api::ContainerCreateParams::builder()
+            .project_id(app_id)
+            .service_type(shared_types::ServiceType::Userapp)
+            .build();
+        params.env = Some(std::collections::HashMap::from([
+            ("POSTGRES_USER".into(), "olduser".into()),
+            ("POSTGRES_PASSWORD".into(), "oldpassword".into()),
+            ("APP_DEPLOY_URL".into(), "http://obsolete/artifact".into()),
+        ]));
+        let result = service
+            .execute_deploy_input(
+                app_id,
+                DeployInput {
+                    version: 1,
+                    request: StartAppRequest::default(),
+                    params: Some(params),
+                    previous: None,
+                    restart: false,
+                },
+                &mut operation,
+                guard.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.pg_aligned, Some(true));
+        let history = runtime.create_params_history.get(app_id).unwrap();
+        let actual = &history[0];
+        assert!(
+            !actual
+                .env
+                .as_ref()
+                .unwrap()
+                .contains_key("POSTGRES_PASSWORD")
+        );
+        assert!(!actual.env.as_ref().unwrap().contains_key("APP_DEPLOY_URL"));
+        assert_eq!(
+            actual
+                .secrets
+                .as_ref()
+                .unwrap()
+                .get("POSTGRES_PASSWORD")
+                .unwrap(),
+            "capturedpassword"
+        );
+        let applied_environment = actual.env.clone();
+        drop(history);
+        {
+            let commands = runtime.configuration_commands.lock().unwrap();
+            let scripts: Vec<_> = commands
+                .iter()
+                .map(|command| command.last().unwrap().as_str())
+                .collect();
+            assert!(scripts[4].contains("ALTER USER"));
+            assert!(scripts[5].starts_with("PGPASSWORD="));
+            assert!(scripts[6].contains("/configuration/activate"));
+            assert!(
+                !scripts
+                    .iter()
+                    .any(|script| script.contains("pendingpassword"))
+            );
+        }
+        assert!(runtime.configuration_replies.lock().unwrap().is_empty());
+        operation.succeed().await.unwrap();
+        guard.mark_completed();
+        Arc::try_unwrap(guard).ok().unwrap().finish().await.unwrap();
+        let status = service
+            .runtime_configuration
+            .runtime_configuration_status(
+                app_id,
+                &identity.lifecycle_id,
+                shared_types::UserAppOperationScope::Prod,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.applied_version, Some(1));
+        assert_eq!(status.saved_version, 2);
+        assert!(status.pending);
+
+        // Traffic is a new operation against the existing deployment generation.
+        // It verifies version 1 without applying the subsequently saved version 2.
+        runtime.specs.insert(
+            app_id.into(),
+            container_runtime_api::ContainerSpecSnapshot {
+                env: applied_environment,
+                ..Default::default()
+            },
+        );
+        runtime.configuration_commands.lock().unwrap().clear();
+        *runtime.configuration_replies.lock().unwrap() =
+            ["1\n", r#"{"status":"ready","phase":"running"}"#]
+                .into_iter()
+                .map(|stdout| container_runtime_api::ExecResult {
+                    exit_code: 0,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                })
+                .collect();
+        assert!(matches!(
+            service
+                .wake_app_on_traffic(app_id, std::time::Duration::from_secs(10))
+                .await
+                .unwrap(),
+            shared_types::WakeOutcome::AlreadyRunning
+        ));
+        {
+            let commands = runtime.configuration_commands.lock().unwrap();
+            assert_eq!(commands.len(), 2);
+            let targets = runtime.configuration_targets.lock().unwrap();
+            assert_eq!(targets.len(), 2);
+            assert_eq!(
+                targets[0], targets[1],
+                "wake must use the existing generation"
+            );
+
+            let verify = commands[0].last().unwrap();
+            assert!(verify.contains("capturedpassword"));
+            assert!(!verify.contains("pendingpassword"));
+            assert!(commands.iter().all(|command| {
+                let script = command.last().unwrap();
+                !script.contains("ALTER USER") && !script.contains("/configuration/activate")
+            }));
+        }
+        let status = service
+            .runtime_configuration
+            .runtime_configuration_status(
+                app_id,
+                &identity.lifecycle_id,
+                shared_types::UserAppOperationScope::Prod,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.applied_version, Some(1));
+        assert_eq!(status.saved_version, 2);
+        assert!(status.pending);
+    }
+
+    #[tokio::test]
+    async fn start_deployment_hot_gate_uses_admission_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let service = crate::test_support::test_service(
+            root.path(),
+            Arc::new(crate::test_support::MockRuntime::default()),
+        )
+        .await;
+        let app_id = "hotcredentials";
+        let identity = service
+            .metadata
+            .store
+            .ensure_identity(app_id)
+            .await
+            .unwrap();
+        let scope = shared_types::UserAppOperationScope::Prod;
+        let save = |revision, request: &str, password: &str| {
+            shared_types::SaveRuntimeConfigurationRequest {
+                lifecycle_id: identity.lifecycle_id.clone(),
+                request_id: request.into(),
+                expected_revision: revision,
+                pg: StartPgCredential {
+                    username: "business".into(),
+                    password: password.into(),
+                },
+            }
+        };
+        service
+            .runtime_configuration
+            .save_runtime_configuration(app_id, scope, &save(0, "save1", "password1"))
+            .await
+            .unwrap();
+        let operation = OwnedOperation::admit(
+            service.metadata.store.clone(),
+            shared_types::UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: None,
+                metadata: None,
+                app_id: app_id.into(),
+                lifecycle_id: Some(identity.lifecycle_id.clone()),
+                operation_id: "hotoperation".into(),
+                request_id: None,
+                request_fingerprint: "a".repeat(64),
+                kind: UserAppOperationKind::StartDeployment,
+            },
+        )
+        .await
+        .unwrap();
+        let context = operation.execution_context();
+        service
+            .runtime_configuration
+            .save_runtime_configuration(app_id, scope, &save(1, "save2", "password2"))
+            .await
+            .unwrap();
+        let capture = service
+            .runtime_configuration
+            .operation_runtime_configuration(&context)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(capture.config_version, 1);
+        assert_eq!(capture.pg.password, "password1");
+        let error = service
+            .validate_hot_runtime_configuration(&context)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppOperationError::HotDeployEnvChange(_)));
+        let after = service
+            .runtime_configuration
+            .operation_runtime_configuration(&context)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.target.is_none());
+        assert_eq!(
+            after.credentials,
+            shared_types::CredentialApplicationState::Captured
+        );
+        operation.reject_without_mutation(&error).await.unwrap();
     }
 }

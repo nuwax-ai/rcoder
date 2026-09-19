@@ -1,8 +1,8 @@
 //! Userapp 活动追踪与流量唤醒接口（trait）
 //!
 //! 支撑「闲置自动回收 + 流量唤醒」特性：
-//! - [`AppAccessTracker`]（同步）由 Pingora 代理热路径调用，记录每个 Userapp 的最近 HTTP 访问时间，
-//!   作为闲置回收的唯一信号源。镜像 [`crate::ContainerLookup`] 的同步 trait 风格（DashMap 读写，无 runtime 依赖）。
+//! - [`AppAccessTracker`]（短期身份缓存，miss 异步刷新）由 Pingora 代理热路径调用，记录每个 Userapp 的最近 HTTP 访问时间，
+//!   作为闲置回收的活动信号。缓存命中不查库；并发 miss 合流并重新核验 lifecycle。
 //! - [`AppWakeControl`]（异步）由 Pingora 在请求过滤阶段调用：当目标 app 处于 stopped（scale0）时，
 //!   hold-and-wait 拉起（scale→1）并轮询 Ready，超时返回 [`WakeOutcome::Timeout`]。
 //!
@@ -10,13 +10,15 @@
 //! 其余同 crate 调用者（AppService / 回收扫描器）持具体 `AppActivityRegistry` 类型，直接用其 pub 方法
 //! （`last_accessed_at` / `mark_running` / `mark_stopped` / `is_waking` / `seed_accessed`）。
 
-/// Userapp HTTP 访问追踪（同步，无 runtime 依赖）
+/// Userapp HTTP 访问追踪；使用已核验并可失效的 lifecycle 缓存登记该代次活动。
 ///
 /// 由 Pingora `request_filter` 对 `/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}/...` 路由调用。
-/// `touch` 内部应做节流（实现自行决定粒度），避免高 QPS 下的 DashMap 锁竞争。
+/// 存储查证失败不得将旧活动时间重新绑定到新的 lifecycle。
+#[async_trait::async_trait]
 pub trait AppAccessTracker: Send + Sync {
     /// 记录 app 的最近一次真实 HTTP 访问（实现内部节流）。
-    fn touch(&self, app_id: &str);
+    /// 返回该次登记使用的实际时间；None 表示身份未确认或已换代，不能报告保活成功。
+    async fn touch(&self, app_id: &str) -> Option<chrono::DateTime<chrono::Utc>>;
 }
 
 /// 唤醒结果
@@ -61,12 +63,11 @@ pub trait AppWakeControl: Send + Sync {
 pub struct ActivityRow {
     /// Userapp 应用 ID
     pub app_id: String,
+    /// Captured lifecycle identity; delayed activity must never follow app_id reuse.
+    pub lifecycle_id: String,
+    pub lifecycle_epoch: i64,
     /// 最近真实 HTTP 访问时间（wall-clock；None=从未访问）
     pub last_accessed: Option<chrono::DateTime<chrono::Utc>>,
-    /// 已 scale-to-zero，可被流量唤醒
-    pub stopped: bool,
-    /// 用户主动停止/发布切换中，禁止流量自动唤醒
-    pub wake_blocked: bool,
 }
 
 /// AppActivityRegistry 的影子持久化契约（跨 crate：app_manager 产出/消费，rcoder-storage 实现）
@@ -83,5 +84,5 @@ pub trait ActivityPersistence: Send + Sync {
     async fn load_all(&self) -> anyhow::Result<Vec<ActivityRow>>;
 
     /// 删除单行（forget_app/delete_app 后调用）
-    async fn delete(&self, app_id: &str) -> anyhow::Result<()>;
+    async fn delete(&self, app_id: &str, lifecycle_id: &str) -> anyhow::Result<()>;
 }

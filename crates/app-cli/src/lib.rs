@@ -19,11 +19,13 @@
 pub mod api;
 pub mod build;
 pub mod config;
+mod configuration_gate;
 pub mod deploy;
 pub mod devtool;
 pub mod idle;
 pub mod log;
 pub mod manifest;
+mod migration_journal;
 pub mod orchestration_events;
 pub mod owner_dispatch;
 pub mod platform;

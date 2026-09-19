@@ -1,0 +1,458 @@
+    Checking tower v0.5.3
+    Checking hyper-rustls v0.27.9
+    Checking objc2-core-foundation v0.3.2
+   Compiling serde-saphyr v1.3.0
+   Compiling url v2.5.8
+    Checking rust-embed v8.12.0
+    Checking agent-client-protocol v2.1.0
+    Checking gix-features v0.49.1
+    Checking moka v0.12.16
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+    Checking md-5 v0.11.0
+   Compiling der_derive v0.7.3
+    Checking fallible-iterator v0.2.0
+    Checking flagset v0.4.7
+    Checking const-oid v0.9.6
+    Checking gix-hash v0.26.2
+    Checking gix-fs v0.22.1
+    Checking gix-glob v0.27.1
+    Checking postgres-protocol v0.6.12
+    Checking objc2-io-kit v0.3.2
+    Checking gix-hashtable v0.16.0
+    Checking gix-tempfile v24.0.0
+    Checking gix-commitgraph v0.39.0
+   Compiling utoipa-swagger-ui v9.0.2
+    Checking objc2-system-configuration v0.3.2
+    Checking phf_shared v0.13.1
+    Checking sysinfo v0.39.6
+    Checking axum v0.8.9
+    Checking tower-http v0.6.11
+    Checking gix-object v0.64.1
+    Checking gix-lock v24.0.0
+    Checking array-init v2.1.0
+    Checking phf v0.13.1
+    Checking whoami v2.1.3
+    Checking der v0.7.10
+    Checking postgres-types v0.2.14
+    Checking gix-attributes v0.35.0
+   Compiling toml v1.1.6+spec-1.1.0
+   Compiling toasty v0.10.0
+    Checking gix-ignore v0.22.1
+    Checking gix-revwalk v0.35.0
+    Checking gix-ref v0.67.1
+   Compiling rust-i18n-support v4.2.2
+    Checking tokio-postgres v0.7.18
+    Checking gix-filter v0.34.0
+    Checking reqwest v0.13.5
+    Checking gix-traverse v0.61.0
+    Checking spki v0.7.3
+    Checking gix-pathspec v0.20.0
+    Checking x509-cert v0.2.5
+   Compiling toasty-core v0.10.0
+    Checking gix-index v0.55.0
+    Checking tokio-tungstenite v0.30.0
+    Checking gix-discover v0.55.0
+    Checking gix-pack v0.74.2
+    Checking gix-config v0.60.0
+    Checking gix-transport v0.59.2
+    Checking gix-worktree-stream v0.36.1
+    Checking gix-revision v0.49.1
+    Checking gix-prompt v0.17.0
+    Checking download_utils v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/download_utils)
+    Checking gix-worktree v0.56.0
+    Checking gix-shallow v0.13.0
+    Checking gix-refspec v0.45.1
+    Checking tokio-postgres-rustls v0.14.0
+    Checking gix-credentials v0.40.0
+    Checking gix-archive v0.36.1
+    Checking gix-protocol v0.65.1
+    Checking gix-diff v0.67.1
+    Checking gix-dir v0.29.1
+    Checking gix-worktree-state v0.34.1
+    Checking gix-odb v0.84.0
+    Checking toasty-driver-postgresql v0.10.0
+    Checking pingora-lru v0.9.0
+    Checking gix-submodule v0.34.0
+    Checking gix-negotiate v0.35.1
+   Compiling rust-i18n-macro v4.2.2
+    Checking gix-note v0.1.1
+   Compiling file-server v0.1.1 (/Users/soddy/Documents/git-workspace/rcoder/crates/file-server)
+    Checking metrics-util v0.20.4
+    Checking tonic v0.14.6
+    Checking axum-tracing-opentelemetry v0.38.0
+    Checking gix-status v0.34.1
+    Checking gix-blame v0.17.1
+    Checking gix-merge v0.20.1
+    Checking pingora-cache v0.9.0
+    Checking utoipa-axum v0.2.0
+    Checking metrique-writer-core v0.1.21
+   Compiling toml_edit v0.25.15+spec-1.1.0
+    Checking granit-parser v0.0.7
+    Checking opentelemetry-http v0.32.0
+    Checking metrics-exporter-prometheus v0.18.3
+   Compiling rmcp-macros v1.8.0
+    Checking gix v0.87.1
+    Checking metrique-core v0.1.22
+    Checking rust-i18n v4.2.2
+    Checking backon v1.6.0
+    Checking metrique-writer v0.1.27
+    Checking shared_types_i18n v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/shared_types_i18n)
+   Compiling proc-macro-crate v3.5.0
+    Checking serde-saphyr v0.0.29
+    Checking tonic-prost v0.14.6
+   Compiling metrique-macro v0.1.22
+    Checking tonic-types v0.14.6
+    Checking genai v0.6.5
+   Compiling rcoder v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/rcoder)
+    Checking shared_types_grpc v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/shared_types_grpc)
+    Checking opentelemetry-proto v0.32.0
+   Compiling dial9-trace-format-derive v0.5.0
+    Checking rmcp v1.8.0
+    Checking pingora-proxy v0.9.0
+    Checking utoipa-scalar v0.3.0
+    Checking metrique-service-metrics v0.1.23
+    Checking dial9-trace-format v0.5.0
+    Checking opentelemetry-otlp v0.32.0
+    Checking kube-client v4.2.0
+    Checking shared_types v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/shared_types)
+    Checking rcoder-telemetry v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/rcoder-telemetry)
+   Compiling toasty-macros v0.10.0
+    Checking metrique v0.1.31
+    Checking dial9-core v0.5.0
+    Checking pingora v0.9.0
+    Checking kube-runtime v4.2.0
+    Checking dial9-tokio-telemetry v0.5.0
+    Checking dial9 v0.5.0
+    Checking kube v4.2.0
+    Checking hotpath v0.25.1
+    Checking rcoder-storage v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/rcoder-storage)
+    Checking rcoder-proxy v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/rcoder-proxy)
+    Checking agent_provisioning v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/agent_provisioning)
+    Checking container-runtime-api v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/container-runtime-api)
+    Checking agent_config v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/agent_config)
+    Checking preview-coordinator v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/preview-coordinator)
+    Checking model_probe v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/model_probe)
+    Checking rcoder-gateway v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/rcoder-gateway)
+error: unnecessary qualification
+   --> crates/rcoder-storage/src/userapp_lifecycle/common/configuration.rs:195:5
+    |
+195 |     shared_types::pg_utils::validate_pg_identifier(&pg.username)
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: requested on the command line with `-D unused-qualifications`
+help: remove the unnecessary path segments
+    |
+195 -     shared_types::pg_utils::validate_pg_identifier(&pg.username)
+195 +     pg_utils::validate_pg_identifier(&pg.username)
+    |
+
+error: unnecessary qualification
+   --> crates/rcoder-storage/src/userapp_lifecycle/common/ops.rs:804:34
+    |
+804 |             op.error_code = Some(shared_types::error_codes::ERR_BACKEND_ERROR.into());
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+804 -             op.error_code = Some(shared_types::error_codes::ERR_BACKEND_ERROR.into());
+804 +             op.error_code = Some(ERR_BACKEND_ERROR.into());
+    |
+
+error: unnecessary qualification
+   --> crates/rcoder-storage/src/preview_lifecycle/postgres.rs:108:19
+    |
+108 |     let request = shared_types::encode_userapp_intent(&input).map_err(unavailable)?;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+108 -     let request = shared_types::encode_userapp_intent(&input).map_err(unavailable)?;
+108 +     let request = encode_userapp_intent(&input).map_err(unavailable)?;
+    |
+
+error: unnecessary qualification
+   --> crates/rcoder-storage/src/preview_lifecycle/postgres.rs:228:17
+    |
+228 |                 shared_types::encode_userapp_intent(&start_input(&input)).map_err(unavailable)?
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+228 -                 shared_types::encode_userapp_intent(&start_input(&input)).map_err(unavailable)?
+228 +                 encode_userapp_intent(&start_input(&input)).map_err(unavailable)?
+    |
+
+    Checking agent_abstraction v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/agent_abstraction)
+    Checking docker_manager v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/docker_manager)
+warning: variable does not need to be mutable
+   --> crates/rcoder-storage/src/pg/project_store/leader.rs:108:52
+    |
+108 |         let mut job = Box::pin(owner.execute(move |mut db| async move {
+    |                                                    ----^^
+    |                                                    |
+    |                                                    help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+error: unnecessary qualification
+   --> crates/rcoder-storage/src/pg/project_store/tests.rs:357:9
+    |
+357 |         crate::config::PostgresConfig {
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: requested on the command line with `-D unused-qualifications`
+help: remove the unnecessary path segments
+    |
+357 -         crate::config::PostgresConfig {
+357 +         PostgresConfig {
+    |
+
+error: unnecessary qualification
+   --> crates/rcoder-storage/src/pg/project_store/tests.rs:379:9
+    |
+379 |         crate::config::PostgresConfig {
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+379 -         crate::config::PostgresConfig {
+379 +         PostgresConfig {
+    |
+
+error: unnecessary qualification
+   --> crates/rcoder-storage/src/pg/project_store/lifecycle_tests.rs:617:16
+    |
+617 |     let pool = crate::db::owner::DatabaseOwner::closed_for_test();
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+617 -     let pool = crate::db::owner::DatabaseOwner::closed_for_test();
+617 +     let pool = DatabaseOwner::closed_for_test();
+    |
+
+error: unnecessary qualification
+   --> crates/rcoder-storage/src/userapp_lifecycle/common/configuration.rs:195:5
+    |
+195 |     shared_types::pg_utils::validate_pg_identifier(&pg.username)
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+195 -     shared_types::pg_utils::validate_pg_identifier(&pg.username)
+195 +     pg_utils::validate_pg_identifier(&pg.username)
+    |
+
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>>: LowerHex` is not satisfied
+   --> crates/rcoder-storage/src/pg/project_store/writer.rs:506:17
+    |
+505 |                 "{:x}",
+    |                  ---- required by this formatting parameter
+506 |                 Sha256::digest(serde_json::to_vec(&(container, project))?)
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>, ...>>`
+    |
+    = help: the following other types implement trait `LowerHex`:
+              &T
+              &mut T
+              AccessFlags
+              AtFlags
+              Braced
+              BytesMut
+              ControlFlags
+              FdFlag
+            and 222 others
+    = note: the full name for the type has been written to '/Users/soddy/Documents/git-workspace/rcoder/target/debug/deps/rcoder_storage-f15ebdb93739887e.long-type-14085235905888480202.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>>: LowerHex` is not satisfied
+   --> crates/rcoder-storage/src/preview_lifecycle/postgres.rs:109:39
+    |
+109 |     let fingerprint = format!("{:x}", Sha256::digest(&request));
+    |                                ----   ^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>, ...>>`
+    |                                |
+    |                                required by this formatting parameter
+    |
+    = help: the following other types implement trait `LowerHex`:
+              &T
+              &mut T
+              AccessFlags
+              AtFlags
+              Braced
+              BytesMut
+              ControlFlags
+              FdFlag
+            and 222 others
+    = note: the full name for the type has been written to '/Users/soddy/Documents/git-workspace/rcoder/target/debug/deps/rcoder_storage-f15ebdb93739887e.long-type-14085235905888480202.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>>: LowerHex` is not satisfied
+   --> crates/rcoder-storage/src/preview_lifecycle/postgres.rs:227:13
+    |
+226 |               "{:x}",
+    |                ---- required by this formatting parameter
+227 | /             Sha256::digest(
+228 | |                 shared_types::encode_userapp_intent(&start_input(&input)).map_err(unavailable)?
+229 | |             )
+    | |_____________^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>, ...>>`
+    |
+    = help: the following other types implement trait `LowerHex`:
+              &T
+              &mut T
+              AccessFlags
+              AtFlags
+              Braced
+              BytesMut
+              ControlFlags
+              FdFlag
+            and 222 others
+    = note: the full name for the type has been written to '/Users/soddy/Documents/git-workspace/rcoder/target/debug/deps/rcoder_storage-f15ebdb93739887e.long-type-14085235905888480202.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+    Checking rcoder-cli v0.1.5 (/Users/soddy/Documents/git-workspace/rcoder/crates/rcoder-cli)
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>>: LowerHex` is not satisfied
+  --> crates/rcoder-storage/src/db/schema.rs:97:21
+   |
+97 |     format!("{:x}", Sha256::digest(input.as_bytes()))
+   |              ----   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>, ...>>`
+   |              |
+   |              required by this formatting parameter
+   |
+   = help: the following other types implement trait `LowerHex`:
+             &T
+             &mut T
+             AccessFlags
+             AtFlags
+             Braced
+             BytesMut
+             ControlFlags
+             FdFlag
+           and 222 others
+   = note: the full name for the type has been written to '/Users/soddy/Documents/git-workspace/rcoder/target/debug/deps/rcoder_storage-f15ebdb93739887e.long-type-14085235905888480202.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>>: LowerHex` is not satisfied
+   --> crates/rcoder-storage/src/pg/project_store/writer.rs:506:17
+    |
+505 |                 "{:x}",
+    |                  ---- required by this formatting parameter
+506 |                 Sha256::digest(serde_json::to_vec(&(container, project))?)
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>, ...>>`
+    |
+    = help: the following other types implement trait `LowerHex`:
+              &T
+              &mut T
+              AccessFlags
+              AtFlags
+              Braced
+              BytesMut
+              ControlFlags
+              FdFlag
+            and 222 others
+    = note: the full name for the type has been written to '/Users/soddy/Documents/git-workspace/rcoder/target/debug/deps/rcoder_storage-e64cf47d0afe2e3f.long-type-1386743570603517784.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>>: LowerHex` is not satisfied
+   --> crates/rcoder-storage/src/preview_lifecycle/postgres.rs:109:39
+    |
+109 |     let fingerprint = format!("{:x}", Sha256::digest(&request));
+    |                                ----   ^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>, ...>>`
+    |                                |
+    |                                required by this formatting parameter
+    |
+    = help: the following other types implement trait `LowerHex`:
+              &T
+              &mut T
+              AccessFlags
+              AtFlags
+              Braced
+              BytesMut
+              ControlFlags
+              FdFlag
+            and 222 others
+    = note: the full name for the type has been written to '/Users/soddy/Documents/git-workspace/rcoder/target/debug/deps/rcoder_storage-e64cf47d0afe2e3f.long-type-1386743570603517784.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>>: LowerHex` is not satisfied
+   --> crates/rcoder-storage/src/preview_lifecycle/postgres.rs:227:13
+    |
+226 |               "{:x}",
+    |                ---- required by this formatting parameter
+227 | /             Sha256::digest(
+228 | |                 shared_types::encode_userapp_intent(&start_input(&input)).map_err(unavailable)?
+229 | |             )
+    | |_____________^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>, ...>>`
+    |
+    = help: the following other types implement trait `LowerHex`:
+              &T
+              &mut T
+              AccessFlags
+              AtFlags
+              Braced
+              BytesMut
+              ControlFlags
+              FdFlag
+            and 222 others
+    = note: the full name for the type has been written to '/Users/soddy/Documents/git-workspace/rcoder/target/debug/deps/rcoder_storage-e64cf47d0afe2e3f.long-type-1386743570603517784.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>>: LowerHex` is not satisfied
+  --> crates/rcoder-storage/src/db/schema.rs:97:21
+   |
+97 |     format!("{:x}", Sha256::digest(input.as_bytes()))
+   |              ----   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>, ...>>`
+   |              |
+   |              required by this formatting parameter
+   |
+   = help: the following other types implement trait `LowerHex`:
+             &T
+             &mut T
+             AccessFlags
+             AtFlags
+             Braced
+             BytesMut
+             ControlFlags
+             FdFlag
+           and 222 others
+   = note: the full name for the type has been written to '/Users/soddy/Documents/git-workspace/rcoder/target/debug/deps/rcoder_storage-e64cf47d0afe2e3f.long-type-1386743570603517784.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+
+For more information about this error, try `rustc --explain E0277`.
+warning: `rcoder-storage` (lib) generated 1 warning
+error: could not compile `rcoder-storage` (lib) due to 8 previous errors; 1 warning emitted
+warning: build failed, waiting for other jobs to finish...
+error[E0308]: mismatched types
+   --> crates/rcoder-storage/src/pg/project_store/tests.rs:420:57
+    |
+420 |     let fetched = super::repo::fetch_project_by_session(&pool, &session_id)
+    |                   ------------------------------------- ^^^^^ types differ in mutability
+    |                   |
+    |                   arguments to this function are incorrect
+    |
+    = note: expected mutable reference `&mut dyn Executor`
+                       found reference `&DatabaseOwner`
+note: function defined here
+   --> crates/rcoder-storage/src/pg/project_store/repo/read.rs:48:28
+    |
+ 48 | pub(in crate::pg) async fn fetch_project_by_session(
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^
+ 49 |     tx: &mut dyn Executor,
+    |     ---------------------
+
+warning: unused variable: `pool`
+   --> crates/rcoder-storage/src/pg/project_store/tests.rs:353:9
+    |
+353 |     let pool = crate::pg::test_support::database(&dsn).await;
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_pool`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `pool`
+   --> crates/rcoder-storage/src/pg/project_store/tests.rs:437:9
+    |
+437 |     let pool = crate::pg::test_support::database(&dsn).await;
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_pool`
+
+Some errors have detailed explanations: E0277, E0308.
+For more information about an error, try `rustc --explain E0277`.
+warning: `rcoder-storage` (lib test) generated 3 warnings (1 duplicate)
+error: could not compile `rcoder-storage` (lib test) due to 12 previous errors; 3 warnings emitted

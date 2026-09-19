@@ -49,12 +49,10 @@ fn reject(code: &str, message: &str, status: StatusCode) -> (StatusCode, Json<se
 }
 
 fn require_token(
-    _state: &AppState,
+    state: &AppState,
     token: Option<&str>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let expected = std::env::var("APP_CLI_DEPLOY_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
+    let expected = state.server.control_token();
     let Some(expected) = expected else {
         return Err(reject(
             "ERR_FORBIDDEN",
@@ -149,7 +147,7 @@ pub(super) async fn status(
     post,
     path = "/v1/runtime/operations",
     request_body = RuntimeOperationBody,
-    params(("X-Deploy-Token" = String, Header, description = "Deploy token (container env APP_CLI_DEPLOY_TOKEN)")),
+    params(("X-Deploy-Token" = String, Header, description = "Owner control token (APP_CLI_DEPLOY_TOKEN or owner state file)")),
     responses(
         (status = 202, description = "Operation accepted or idempotent replay", body = serde_json::Value),
         (status = 409, description = "Conflict: id/replay/busy/revision/instance/recovery", body = serde_json::Value),

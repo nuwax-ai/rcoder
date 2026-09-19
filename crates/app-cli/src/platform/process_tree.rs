@@ -43,7 +43,13 @@ pub(crate) fn spawn_managed(cmd: tokio::process::Command) -> Result<ManagedChild
     #[cfg(unix)]
     wrap.wrap(process_wrap::tokio::ProcessGroup::leader());
     #[cfg(windows)]
-    wrap.wrap(process_wrap::tokio::JobObject);
+    {
+        // JobObject alone tracks descendants but does not set KILL_ON_JOB_CLOSE.
+        // KillOnDrop opts the job into OS cleanup even when the owner crashes
+        // and Rust destructors never run (TerminateProcess / process abort).
+        wrap.wrap(process_wrap::tokio::KillOnDrop);
+        wrap.wrap(process_wrap::tokio::JobObject);
+    }
 
     let child = wrap
         .spawn()

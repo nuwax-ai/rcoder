@@ -130,6 +130,8 @@ impl UserAppStorageConfig {
                         Arc::new(store);
                     Ok(rcoder_storage::userapp_lifecycle::OpenedUserAppStore {
                         store: store.clone(),
+                        configuration: store.clone(),
+                        activity: store.clone(),
                         control: store,
                     })
                 }
@@ -151,6 +153,8 @@ impl UserAppStorageConfig {
                         Arc::new(store);
                     Ok(rcoder_storage::userapp_lifecycle::OpenedUserAppStore {
                         store: store.clone(),
+                        configuration: store.clone(),
+                        activity: store.clone(),
                         control: store,
                     })
                 }
@@ -180,10 +184,7 @@ mod tests {
             .open(app_manager::AppAccessMode::Docker, &pg)
             .await
             .unwrap();
-        let store = opened.store;
-        // control 与 store 同源 Arc：两个引用都释放后目录锁才归还
-        drop(opened.control);
-        let before = store.ensure_identity("config-app").await.unwrap();
+        let before = opened.store.ensure_identity("config-app").await.unwrap();
         assert!(path.is_file());
         assert!(
             config
@@ -192,26 +193,28 @@ mod tests {
                 .is_err(),
             "second instance must be rejected while the directory lock is held"
         );
-        drop(store);
+        // All four interfaces share the owner; dropping only store/control
+        // leaves configuration/activity alive and must not release its lock.
+        drop(opened);
         // R01 修正后的不变量：目录锁在 worker 线程内、随线程退出释放——
         // Drop 只发信号不 join，锁释放是"线程退出后"而非"结构体 Drop 后"
         // 同步完成。立即重开需容忍短暂的异步收束窗口（有界轮询）。
-        let restored = loop {
-            match config.open(app_manager::AppAccessMode::Docker, &pg).await {
-                Ok(opened) => break opened,
-                Err(error) if format!("{error:#}").contains("lock acquisition failed") => {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue;
+        let restored = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match config.open(app_manager::AppAccessMode::Docker, &pg).await {
+                    Ok(opened) => break opened,
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
                 }
-                Err(error) => panic!("reopen after drop must succeed: {error:#}"),
             }
-        };
+        })
+        .await
+        .expect("database owner must release the directory lock after all interfaces drop");
         assert_eq!(
             restored.store.get_application("config-app").await.unwrap(),
             Some(before)
         );
-        drop(restored.store);
-        drop(restored.control);
+        restored.control.shutdown().await.unwrap();
+        drop(restored);
         let invalid = UserAppStorageConfig {
             turso_path: path.join("cannot-be-created.turso.db"),
             ..config

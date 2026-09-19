@@ -51,7 +51,7 @@ impl StorageDirectoryLease {
             })?;
         #[cfg(not(unix))]
         {
-            let _ = path;
+            drop(path);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Identity-bound storage clearing requires Unix directory handles",

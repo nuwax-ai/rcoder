@@ -298,21 +298,14 @@ impl RuntimeStore {
     /// 本地凭据文件（cross-platform.md §3）：token 落盘状态根，Unix 0600。
     /// 平台读此文件对既有 owner 提交运行操作；凭据不经命令行/日志外泄。
     pub(crate) fn store_token(&self, token: &str) -> Result<()> {
-        let path = self.root.join("token");
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .with_context(|| format!("open token file {}", path.display()))?;
-        use std::io::Write as _;
-        file.write_all(token.trim().as_bytes())
-            .and_then(|_| file.sync_all())
-            .with_context(|| format!("persist token file {}", path.display()))?;
+        let destination = self.root.join("token");
+        let mut file = tempfile::NamedTempFile::new_in(&self.root)
+            .context("create private owner credential file")?;
+        let path = file.path();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("chmod 600 token file {}", path.display()))?;
         }
         #[cfg(windows)]
@@ -335,6 +328,15 @@ impl RuntimeStore {
                 String::from_utf8_lossy(&status.stderr)
             );
         }
+        // Protect the empty temporary file before writing credentials, then
+        // publish atomically so a concurrent CLI never reads a partial token.
+        use std::io::Write as _;
+        file.write_all(token.trim().as_bytes())
+            .and_then(|_| file.as_file().sync_all())
+            .context("persist owner credential")?;
+        file.persist(&destination)
+            .map_err(|error| error.error)
+            .context("publish owner credential file")?;
         Ok(())
     }
 
@@ -621,6 +623,8 @@ pub(crate) struct RuntimeKernel {
     /// 已请求取消的操作墓碑（R03）：受理后、执行完成前的取消标记。
     /// 执行侧在副作用边界检查（派发执行前/编排完成提交前）。
     cancelled: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Serialize sequence allocation and append across every event producer.
+    event_write: std::sync::Mutex<()>,
 }
 
 /// 执行派发动作（server 主循环解释；内核不直接触碰业务运行态）。
@@ -666,6 +670,8 @@ struct AdmissionState {
     /// active Succeeded 收束且无 pending_stop 时派发；Stop 受理时清空
     /// （停止意图胜过排队启动）。
     pending_restart: Option<String>,
+    /// Original execution inputs never reconstructed from redacted disk records.
+    queued_input: Option<StoredOperation>,
     /// 恢复保护中（上次结果未知）。V03：由**结果未知**决定，不依赖 active
     /// 恰好匹配——任何操作的 RecoveryRequired 终态都会挂起保护。
     recovery_protection: bool,
@@ -683,6 +689,7 @@ impl RuntimeKernel {
             admission: Mutex::new(AdmissionState::default()),
             dispatch,
             cancelled: std::sync::Mutex::new(std::collections::HashSet::new()),
+            event_write: std::sync::Mutex::new(()),
         }
     }
 
@@ -869,6 +876,15 @@ impl RuntimeKernel {
                 active_operation_id: None,
             });
         }
+        let next_revision = if is_stop {
+            revision.checked_add(1).ok_or_else(|| AdmissionRejection {
+                code: "ERR_BACKEND_ERROR",
+                message: "revision overflow".into(),
+                active_operation_id: None,
+            })?
+        } else {
+            revision
+        };
         // 持久化受理（落盘失败不入执行队列——spec §3.3）。
         let stored = StoredOperation {
             view: RuntimeOperationView {
@@ -897,11 +913,6 @@ impl RuntimeKernel {
         // 同样被拒，直至重启恢复裁决）。绝不能只返回错误留下永远 Accepted
         // 的幽灵记录。
         if is_stop {
-            let next_revision = revision.checked_add(1).ok_or_else(|| AdmissionRejection {
-                code: "ERR_BACKEND_ERROR",
-                message: "revision overflow".into(),
-                active_operation_id: None,
-            })?;
             if let Err(error) = self
                 .store
                 .store_desired(DesiredState::Stopped, next_revision)
@@ -920,9 +931,7 @@ impl RuntimeKernel {
         let mut queued = false;
         if is_stop {
             // R02：Stop 受理时清空排队启动（停止意图胜过排队——不得复活）
-            if let Some(superseded) = guard
-                .pending_restart
-                .replace(stored.view.operation_id.clone())
+            if let Some(superseded) = guard.pending_restart.take()
                 && let Err(error) = self.write_terminal(
                     &superseded,
                     RuntimeOperationState::Cancelled,
@@ -935,12 +944,13 @@ impl RuntimeKernel {
             {
                 // 终态落盘失败不得只打日志继续成功：恢复槽位并拒绝本次受理
                 guard.pending_restart = Some(superseded);
-                return Err(AdmissionRejection {
-                    code: "ERR_BACKEND_ERROR",
-                    message: format!("persist superseded terminal state failed: {error:#}"),
-                    active_operation_id: None,
-                });
+                guard.recovery_protection = true;
+                return Err(self.hold_partial_admission(
+                    &stored,
+                    format!("persist superseded terminal state: {error:#}"),
+                ));
             }
+            guard.queued_input = None;
             guard.pending_stop = Some(stored.view.operation_id.clone());
         } else if guard.active_operation_id.is_some() {
             // R02"最后受理生效"：排队槽单值——旧排队者收束 Superseded 语义
@@ -960,17 +970,23 @@ impl RuntimeKernel {
             {
                 // 终态落盘失败不得只打日志继续成功：恢复槽位并拒绝本次受理
                 guard.pending_restart = Some(superseded);
-                return Err(AdmissionRejection {
-                    code: "ERR_BACKEND_ERROR",
-                    message: format!("persist superseded terminal state failed: {error:#}"),
-                    active_operation_id: None,
-                });
+                guard.recovery_protection = true;
+                return Err(self.hold_partial_admission(
+                    &stored,
+                    format!("persist superseded terminal state: {error:#}"),
+                ));
             }
+            guard.queued_input = Some(stored.clone());
             queued = true;
         } else {
             // R02 补漏：无 active 时受理——先沉降滞留的旧排队者（失败/崩溃
             // 路径可能未清槽），绝不让更旧请求在本请求成功后被派发
-            self.settle_queued_restart_on_terminal_failure_for_admission(&mut guard)?;
+            if let Err(error) =
+                self.settle_queued_restart_on_terminal_failure_for_admission(&mut guard)
+            {
+                guard.recovery_protection = true;
+                return Err(self.hold_partial_admission(&stored, error.message));
+            }
             guard.active_operation_id = Some(stored.view.operation_id.clone());
         }
         let action = self.dispatch_action_for(&stored);
@@ -1016,8 +1032,9 @@ impl RuntimeKernel {
         state: RuntimeOperationState,
         error: Option<(String, String)>,
         failure_detail: Option<RuntimeFailureDetail>,
-        next_sequence: u64,
+        _next_sequence: u64,
     ) -> Result<()> {
+        let mut guard = self.admission.lock().await;
         let stored = self.write_terminal(operation_id, state, error, failure_detail)?;
         if stored.view.state != state {
             // 已有终态未被覆盖（R04）：仅做簿记清理，不重复发终态事件
@@ -1027,34 +1044,10 @@ impl RuntimeKernel {
                 refused = ?state,
                 "runtime operation already terminal; refusing overwrite (R04)"
             );
-        } else {
-            let event_name = match stored.view.state {
-                RuntimeOperationState::Succeeded => "Completed",
-                _ => "Failed",
-            };
-            // R06：Failed 终态事件携带错误码/消息（SSE 消费方按事件流即可
-            // 还原失败原因，不需要再回查操作视图）
-            let payload = match (&stored.view.state, &stored.view.error_code) {
-                (RuntimeOperationState::Succeeded, _) => None,
-                (_, Some(code)) => Some(serde_json::json!({
-                    "code": code,
-                    "error": stored.view.error_message.clone().unwrap_or_default(),
-                })),
-                (_, None) => None,
-            };
-            self.emit_with_payload(
-                operation_id,
-                next_sequence,
-                "terminal",
-                None,
-                Some(event_name),
-                payload,
-            );
         }
         if let Ok(mut set) = self.cancelled.lock() {
             set.remove(operation_id);
         }
-        let mut guard = self.admission.lock().await;
         // V03：恢复保护由**结果未知**决定——任何操作以 RecoveryRequired 收束
         // 都挂起保护，不依赖 active 恰好仍是该操作（Stop 待执行期间，旧执行者
         // A 的未知结果同样必须锁住写入口）。
@@ -1066,23 +1059,9 @@ impl RuntimeKernel {
             // R02"最后受理生效"：active Succeeded 且无待执行 Stop → 派发
             // 排队的最新启动请求；失败/取消/未知收束不派发——排队者持久
             // 沉降为 Superseded（不留永远 Accepted 的滞留者）。
-            if stored.view.state == RuntimeOperationState::Succeeded
-                && guard.pending_stop.is_none()
-                && let Some(queued_id) = guard.pending_restart.take()
+            if stored.view.state == RuntimeOperationState::Succeeded && guard.pending_stop.is_none()
             {
-                match self.store.load_operation(&queued_id) {
-                    Ok(Some(queued)) => {
-                        let action = self.dispatch_action_for(&queued);
-                        self.emit(&queued_id, 1, "dispatched", None, Some("QueuedDispatch"));
-                        (self.dispatch)(action);
-                    }
-                    other => {
-                        // 派发装载失败：放回槽位并传播（下一次收束/受理重试），
-                        // 不静默丢弃排队者
-                        guard.pending_restart = Some(queued_id.clone());
-                        anyhow::bail!("load queued operation {queued_id} for dispatch: {other:?}");
-                    }
-                }
+                self.promote_queued(&mut guard)?;
             } else if stored.view.state != RuntimeOperationState::Succeeded {
                 self.settle_queued_restart_on_terminal_failure(
                     &mut guard,
@@ -1114,6 +1093,7 @@ impl RuntimeKernel {
         if stored.view.state.is_terminal()
             || stored.view.state == RuntimeOperationState::RecoveryRequired
         {
+            self.emit_terminal_record(&stored);
             return Ok(stored);
         }
         stored.view.state = state;
@@ -1123,7 +1103,62 @@ impl RuntimeKernel {
         }
         stored.view.failure_detail = failure_detail;
         self.store.store_operation(&stored)?;
+        self.emit_terminal_record(&stored);
         Ok(stored)
+    }
+
+    fn emit_terminal_record(&self, stored: &StoredOperation) {
+        let event_name = if stored.view.state == RuntimeOperationState::Succeeded {
+            "Completed"
+        } else {
+            "Failed"
+        };
+        let payload = stored.view.error_code.as_ref().map(|code| {
+            serde_json::json!({
+                "code": code,
+                "error": stored.view.error_message.clone().unwrap_or_default(),
+            })
+        });
+        self.emit_with_payload(
+            &stored.view.operation_id,
+            0,
+            "terminal",
+            None,
+            Some(event_name),
+            payload,
+        );
+    }
+
+    fn promote_queued(&self, guard: &mut AdmissionState) -> Result<()> {
+        let Some(id) = guard.pending_restart.clone() else {
+            return Ok(());
+        };
+        if guard.recovery_protection {
+            return Ok(());
+        }
+        let loaded = self.store.load_operation(&id);
+        let valid = matches!(&loaded, Ok(Some(op)) if
+            op.view.state == RuntimeOperationState::Accepted && op.view.kind != RuntimeOperationKind::Stop);
+        let input = guard
+            .queued_input
+            .as_ref()
+            .filter(|op| op.view.operation_id == id);
+        if !valid || input.is_none() {
+            guard.recovery_protection = true;
+            anyhow::bail!(
+                "queued operation {id} lacks confirmed execution input; recovery required"
+            );
+        }
+        let input = guard
+            .queued_input
+            .take()
+            .context("queued execution input disappeared")?;
+        let action = self.dispatch_action_for(&input);
+        guard.pending_restart = None;
+        guard.active_operation_id = Some(id.clone());
+        self.emit(&id, 0, "dispatched", None, Some("QueuedDispatch"));
+        (self.dispatch)(action);
+        Ok(())
     }
 
     /// R02 排队槽终局：active 已确认失败/取消/未知收束时，滞留的排队
@@ -1154,7 +1189,7 @@ impl RuntimeKernel {
                 "settle superseded queued operation: {error:#}"
             ));
         }
-        self.emit(&queued_id, 1, "superseded", None, Some("QueuedSuperseded"));
+        guard.queued_input = None;
         Ok(())
     }
 
@@ -1183,7 +1218,7 @@ impl RuntimeKernel {
             });
         }
         guard.pending_restart = None;
-        self.emit(&queued_id, 1, "superseded", None, Some("QueuedSuperseded"));
+        guard.queued_input = None;
         Ok(())
     }
 
@@ -1208,21 +1243,9 @@ impl RuntimeKernel {
             // R02"最后受理生效"：active Succeeded 且无待执行 Stop → 派发
             // 排队的最新启动请求；失败/取消/未知收束不派发——排队者持久
             // 沉降为 Superseded（不留永远 Accepted 的滞留者）。
-            if stored.view.state == RuntimeOperationState::Succeeded
-                && guard.pending_stop.is_none()
-                && let Some(queued_id) = guard.pending_restart.take()
+            if stored.view.state == RuntimeOperationState::Succeeded && guard.pending_stop.is_none()
             {
-                match self.store.load_operation(&queued_id) {
-                    Ok(Some(queued)) => {
-                        let action = self.dispatch_action_for(&queued);
-                        self.emit(&queued_id, 1, "dispatched", None, Some("QueuedDispatch"));
-                        (self.dispatch)(action);
-                    }
-                    other => {
-                        guard.pending_restart = Some(queued_id.clone());
-                        anyhow::bail!("load queued operation {queued_id} for dispatch: {other:?}");
-                    }
-                }
+                self.promote_queued(guard)?;
             } else if stored.view.state != RuntimeOperationState::Succeeded {
                 self.settle_queued_restart_on_terminal_failure(
                     guard,
@@ -1251,11 +1274,6 @@ impl RuntimeKernel {
         &self,
         operation_id: &str,
     ) -> Result<CommitBarrierOutcome, anyhow::Error> {
-        let sequence = self
-            .store
-            .replay_events(operation_id, u64::MAX)
-            .map(|events| events.len() as u64 + 1)
-            .unwrap_or(2);
         // 持久化用的终态在锁内决定并写入——提交线性化点
         let mut guard = self.admission.lock().await;
         if guard.active_operation_id.as_deref() != Some(operation_id) {
@@ -1284,13 +1302,6 @@ impl RuntimeKernel {
         match outcome {
             Ok(()) => {
                 drop(guard);
-                self.emit(
-                    operation_id,
-                    sequence.max(2),
-                    "terminal",
-                    None,
-                    Some("Completed"),
-                );
                 Ok(CommitBarrierOutcome::Committed)
             }
             Err(error) => {
@@ -1333,6 +1344,8 @@ impl RuntimeKernel {
                 "partial admission hold persist failed (op {}): {persist_error:#}",
                 stored.view.operation_id
             );
+        } else {
+            self.emit_terminal_record(&held);
         }
         AdmissionRejection {
             code: ERR_RECOVERY_REQUIRED,
@@ -1419,7 +1432,7 @@ impl RuntimeKernel {
         service: Option<String>,
         event_name: Option<&str>,
     ) {
-        self.emit_with_payload(operation_id, sequence, stage, service, event_name, None)
+        self.emit_with_payload(operation_id, sequence, stage, service, event_name, None);
     }
 
     /// 带 payload 的事件落盘（R06：Failed 终态事件携带错误详情，SSE 消费方
@@ -1427,12 +1440,34 @@ impl RuntimeKernel {
     fn emit_with_payload(
         &self,
         operation_id: &str,
-        sequence: u64,
+        _sequence: u64,
         stage: &str,
         service: Option<String>,
         event_name: Option<&str>,
         payload: Option<serde_json::Value>,
-    ) {
+    ) -> bool {
+        let _writer = self
+            .event_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let history = match self.store.replay_events(operation_id, 0) {
+            Ok(history) => history,
+            Err(error) => {
+                tracing::error!(operation_id, "read runtime event cursor: {error:#}");
+                return false;
+            }
+        };
+        // Terminal publication is idempotent and closes the operation stream.
+        if history.iter().any(|event| event.stage == "terminal") {
+            return false;
+        }
+        let Some(sequence) = history
+            .last()
+            .map_or(Some(1), |event| event.sequence.checked_add(1))
+        else {
+            tracing::error!(operation_id, "runtime event sequence exhausted");
+            return false;
+        };
         let record = RuntimeEventRecord {
             operation_id: operation_id.to_string(),
             sequence,
@@ -1446,7 +1481,9 @@ impl RuntimeKernel {
             // 事件落盘失败不阻断受理/执行主链（操作记录是权威），
             // 但必须可见——静默丢事件违反 spec §3.6。
             tracing::error!("runtime event persist failed (op {operation_id}): {error:#}");
+            return false;
         }
+        true
     }
 
     /// 追加服务级编排事件到**当前活跃操作**的 journal（R06 事件桥：owner 形态
@@ -1467,20 +1504,7 @@ impl RuntimeKernel {
             return false;
         };
         drop(guard);
-        let next_sequence = self
-            .store
-            .replay_events(&operation_id, 0)
-            .map(|events| events.last().map_or(1, |event| event.sequence + 1))
-            .unwrap_or(1);
-        self.emit_with_payload(
-            &operation_id,
-            next_sequence,
-            stage,
-            service,
-            Some(event_name),
-            payload,
-        );
-        true
+        self.emit_with_payload(&operation_id, 0, stage, service, Some(event_name), payload)
     }
 }
 
@@ -1531,6 +1555,257 @@ mod tests {
         let store = open_store(&workspace);
         let identity = identity();
         RuntimeKernel::new(store, identity, Box::new(|_| {}))
+    }
+
+    #[tokio::test]
+    async fn queued_input_keeps_credentials_and_promotes_execution_identity() {
+        for kind in [RuntimeOperationKind::Restart, RuntimeOperationKind::Deploy] {
+            let (dir, _) = temp_store();
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = captured.clone();
+            let kernel = RuntimeKernel::new(
+                open_store(&dir.path().join("workspace")),
+                identity(),
+                Box::new(move |action| sink.lock().unwrap().push(action)),
+            );
+            kernel
+                .admit(request(RuntimeOperationKind::Start, "a"))
+                .await
+                .unwrap();
+            let mut queued = if kind == RuntimeOperationKind::Deploy {
+                request_deploy_url("b")
+            } else {
+                request(kind, "b")
+            };
+            if kind == RuntimeOperationKind::Restart {
+                queued.run_config = Some(shared_types::OperationRunConfig {
+                    pg: Some(shared_types::StartPgCredential {
+                        username: "dev".into(),
+                        password: "probe-secret".into(),
+                    }),
+                });
+            }
+            kernel.admit(queued).await.unwrap();
+            assert!(
+                !std::fs::read_to_string(kernel.store.operation_path("b"))
+                    .unwrap()
+                    .contains("probe-secret")
+            );
+            assert_eq!(
+                kernel.commit_execution("a").await.unwrap(),
+                CommitBarrierOutcome::Committed
+            );
+            assert_eq!(
+                kernel.admission.lock().await.active_operation_id.as_deref(),
+                Some("b")
+            );
+            if kind == RuntimeOperationKind::Restart {
+                let actions = captured.lock().unwrap();
+                let DispatchAction::OrchestrateSource { pg: Some(pg), .. } =
+                    actions.last().unwrap()
+                else {
+                    panic!("missing source action")
+                };
+                assert_eq!(pg.password, "probe-secret");
+            }
+            kernel
+                .admit(request(RuntimeOperationKind::Start, "c"))
+                .await
+                .unwrap();
+            assert_eq!(
+                kernel.admission.lock().await.pending_restart.as_deref(),
+                Some("c")
+            );
+            assert_eq!(
+                kernel.commit_execution("b").await.unwrap(),
+                CommitBarrierOutcome::Committed
+            );
+            assert_eq!(
+                kernel.commit_execution("c").await.unwrap(),
+                CommitBarrierOutcome::Committed
+            );
+            assert_eq!(
+                kernel.get("b").await.unwrap().unwrap().state,
+                RuntimeOperationState::Succeeded
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_terminal_depends_only_on_its_own_cleanup() {
+        for active_result in [
+            RuntimeOperationState::Failed,
+            RuntimeOperationState::Cancelled,
+            RuntimeOperationState::RecoveryRequired,
+        ] {
+            let (dir, _) = temp_store();
+            let kernel = kernel(dir.path());
+            kernel
+                .admit(request(RuntimeOperationKind::Start, "a"))
+                .await
+                .unwrap();
+            kernel
+                .admit(request(RuntimeOperationKind::Stop, "s"))
+                .await
+                .unwrap();
+            kernel
+                .finish("a", active_result, None, None, 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                kernel.get("s").await.unwrap().unwrap().state,
+                RuntimeOperationState::Accepted
+            );
+            kernel
+                .finish("s", RuntimeOperationState::RecoveryRequired, None, None, 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                kernel.get("s").await.unwrap().unwrap().state,
+                RuntimeOperationState::RecoveryRequired
+            );
+            assert!(kernel.recovery_protection_active());
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_supersede_holds_new_admission_for_recovery() {
+        for kind in [RuntimeOperationKind::Restart, RuntimeOperationKind::Stop] {
+            let (dir, _) = temp_store();
+            let kernel = kernel(dir.path());
+            kernel
+                .admit(request(RuntimeOperationKind::Start, "a"))
+                .await
+                .unwrap();
+            kernel
+                .admit(request(RuntimeOperationKind::Restart, "b"))
+                .await
+                .unwrap();
+            let path = kernel.store.operation_path("b");
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let rejected = kernel.admit(request(kind, "c")).await.unwrap_err();
+            assert_eq!(rejected.code, ERR_RECOVERY_REQUIRED);
+            assert_eq!(
+                kernel.get("c").await.unwrap().unwrap().state,
+                RuntimeOperationState::RecoveryRequired
+            );
+            assert!(kernel.recovery_protection_active());
+            assert!(
+                matches!(kernel.admit(request(kind, "c")).await.unwrap(), AdmissionOutcome::Replayed(view) if view.state == RuntimeOperationState::RecoveryRequired)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_event_follows_progress_cursor_once() {
+        let (dir, _) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "a"))
+            .await
+            .unwrap();
+        assert!(kernel.append_orchestration_event("build", None, "Building", None));
+        assert!(kernel.append_orchestration_event("ready", None, "Ready", None));
+        assert_eq!(
+            kernel.commit_execution("a").await.unwrap(),
+            CommitBarrierOutcome::Committed
+        );
+        kernel
+            .finish("a", RuntimeOperationState::Succeeded, None, None, 2)
+            .await
+            .unwrap();
+        let events = kernel.store.replay_events("a", 3).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 4);
+        assert_eq!(events[0].stage, "terminal");
+    }
+
+    #[tokio::test]
+    async fn concurrent_events_allocate_unique_durable_cursors() {
+        let (dir, _) = temp_store();
+        let runtime = kernel(dir.path());
+        runtime
+            .admit(request(RuntimeOperationKind::Start, "a"))
+            .await
+            .unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let runtime = &runtime;
+                scope.spawn(move || {
+                    assert!(runtime.emit_with_payload(
+                        "a",
+                        0,
+                        "progress",
+                        None,
+                        Some("Step"),
+                        None
+                    ));
+                });
+            }
+        });
+        let events = runtime.store.replay_events("a", 0).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=17).collect::<Vec<_>>()
+        );
+        runtime
+            .finish("a", RuntimeOperationState::Succeeded, None, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.store.replay_events("a", 17).unwrap()[0].stage,
+            "terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_event_append_does_not_report_persisted() {
+        let (dir, _) = temp_store();
+        let runtime = kernel(dir.path());
+        runtime
+            .admit(request(RuntimeOperationKind::Start, "a"))
+            .await
+            .unwrap();
+        let path = runtime.store.events_path("a");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(!runtime.append_orchestration_event("progress", None, "Step", None));
+    }
+
+    #[tokio::test]
+    async fn superseded_queue_publishes_terminal_after_its_cursor() {
+        let (dir, _) = temp_store();
+        let runtime = kernel(dir.path());
+        runtime
+            .admit(request(RuntimeOperationKind::Start, "a"))
+            .await
+            .unwrap();
+        runtime
+            .admit(request(RuntimeOperationKind::Restart, "b"))
+            .await
+            .unwrap();
+        let cursor = runtime
+            .store
+            .replay_events("b", 0)
+            .unwrap()
+            .last()
+            .unwrap()
+            .sequence;
+        runtime
+            .admit(request(RuntimeOperationKind::Restart, "c"))
+            .await
+            .unwrap();
+        let events = runtime.store.replay_events("b", cursor).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, "terminal");
+        assert_eq!(
+            events[0].payload.as_ref().unwrap()["code"],
+            "ERR_SUPERSEDED"
+        );
     }
 
     /// R02"最后受理生效"：active 执行期间 A→B→C 三连受理——B 被 C 覆盖

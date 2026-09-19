@@ -186,6 +186,8 @@ COPY start-app.sh /usr/local/bin/start-app.sh
 RUN chmod +x /usr/local/bin/start-app.sh
 
 # PG 首次 initdb wrapper(异步, 由 supervisor [program:postgresql] 托管)
+COPY pg-admin-identity.sh /usr/local/bin/pg-admin-identity.sh
+COPY pg-supervise.py /usr/local/bin/pg-supervise.py
 COPY pg-supervisor-entry.sh /usr/local/bin/pg-supervisor-entry.sh
 RUN chmod +x /usr/local/bin/pg-supervisor-entry.sh
 

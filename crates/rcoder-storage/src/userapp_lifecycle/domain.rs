@@ -264,6 +264,8 @@ pub(super) fn advance(
     validate_deletion_progress(app, operation, progress)?;
     validate_storage_destruction_progress(app, operation, progress)?;
     validate_storage_clear_progress(app, operation, progress)?;
+    validate_database_password_progress(operation, progress)?;
+    validate_database_preparation_progress(operation, progress)?;
     if progress.state.is_terminal() {
         let applied_policy = match &operation.command {
             Some(shared_types::UserAppControlCommand::SetRecyclePolicy { policy }) => {
@@ -287,6 +289,8 @@ pub(super) fn advance(
                 | shared_types::UserAppControlCommand::DeleteApplication
                 | shared_types::UserAppControlCommand::DestroyStorage { .. }
                 | shared_types::UserAppControlCommand::ClearStorage { .. }
+                | shared_types::UserAppControlCommand::ResetDatabasePassword { .. }
+                | shared_types::UserAppControlCommand::PrepareProdDatabase
                 | shared_types::UserAppControlCommand::StopBuilder
                 | shared_types::UserAppControlCommand::RestartBuilder,
             ) => None,
@@ -615,4 +619,147 @@ fn validate_storage_clear_progress(
             "Storage clear cannot succeed before confirmed completion".into(),
         ))
     }
+}
+
+fn validate_database_password_progress(
+    operation: &UserAppOperationRecord,
+    progress: &UserAppOperationProgress,
+) -> Result<(), Error> {
+    use shared_types::{DatabasePasswordEvidence as Evidence, DatabasePasswordStage as Stage};
+    if !matches!(
+        operation.kind,
+        UserAppOperationKind::ResetDevDatabasePassword
+            | UserAppOperationKind::ResetProdDatabasePassword
+    ) {
+        return Ok(());
+    }
+    let invalid = || {
+        Error::InvalidOperation("Database password writes require ordered physical evidence; uncertain writes remain protected".into())
+    };
+    if operation.checkpoint.is_null() {
+        if progress.checkpoint.is_null() {
+            return if matches!(progress.state, OpState::Failed | OpState::RecoveryRequired)
+                || (progress.state == OpState::Running && progress.step == "claimed")
+            {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
+        let evidence: Evidence =
+            serde_json::from_value(progress.checkpoint.clone()).map_err(|_| invalid())?;
+        evidence
+            .validate_operation(operation)
+            .map_err(Error::InvalidOperation)?;
+        return if progress.state == OpState::Running && evidence.stage == Stage::Captured {
+            Ok(())
+        } else {
+            Err(invalid())
+        };
+    }
+    let before: Evidence =
+        serde_json::from_value(operation.checkpoint.clone()).map_err(|_| invalid())?;
+    let after: Evidence =
+        serde_json::from_value(progress.checkpoint.clone()).map_err(|_| invalid())?;
+    before
+        .validate_operation(operation)
+        .map_err(Error::InvalidOperation)?;
+    after
+        .validate_operation(operation)
+        .map_err(Error::InvalidOperation)?;
+    if before.receipt_protocol != after.receipt_protocol
+        || before.context != after.context
+        || before.username != after.username
+        || before.target != after.target
+    {
+        return Err(invalid());
+    }
+    if progress.state == OpState::RecoveryRequired && before == after {
+        return Ok(());
+    }
+    if progress.state == OpState::Failed
+        && before == after
+        && matches!(before.stage, Stage::Captured | Stage::Cancelled)
+    {
+        return Ok(());
+    }
+    if progress.state == OpState::Succeeded && before == after && before.stage == Stage::Verified {
+        return Ok(());
+    }
+    if progress.state == OpState::Running
+        && (before == after
+            || matches!(
+                (&before.stage, &after.stage),
+                (Stage::Captured, Stage::WriteSubmitted)
+                    | (Stage::WriteSubmitted, Stage::Verified | Stage::Cancelled)
+            ))
+    {
+        return Ok(());
+    }
+    Err(invalid())
+}
+
+fn validate_database_preparation_progress(
+    operation: &UserAppOperationRecord,
+    progress: &UserAppOperationProgress,
+) -> Result<(), Error> {
+    use shared_types::{
+        DatabasePreparationEvidence as Evidence, DatabasePreparationStage as Stage,
+    };
+    if operation.kind != UserAppOperationKind::PrepareProdDatabase {
+        return Ok(());
+    }
+    let invalid = || {
+        Error::InvalidOperation(
+            "Database management preparation requires ordered identity-bound evidence".into(),
+        )
+    };
+    if operation.checkpoint.is_null() && progress.checkpoint.is_null() {
+        return if matches!(progress.state, OpState::Failed | OpState::RecoveryRequired)
+            || (progress.state == OpState::Running && progress.step == "claimed")
+        {
+            Ok(())
+        } else {
+            Err(invalid())
+        };
+    }
+    let after: Evidence =
+        serde_json::from_value(progress.checkpoint.clone()).map_err(|_| invalid())?;
+    after
+        .validate_operation(operation)
+        .map_err(Error::InvalidOperation)?;
+    if operation.checkpoint.is_null() {
+        return if progress.state == OpState::Running && after.stage == Stage::Captured {
+            Ok(())
+        } else {
+            Err(invalid())
+        };
+    }
+    let before: Evidence =
+        serde_json::from_value(operation.checkpoint.clone()).map_err(|_| invalid())?;
+    before
+        .validate_operation(operation)
+        .map_err(Error::InvalidOperation)?;
+    if before.target != after.target || before.deployment_generation != after.deployment_generation
+    {
+        return Err(invalid());
+    }
+    if before == after
+        && (progress.state == OpState::RecoveryRequired
+            || (progress.state == OpState::Failed && before.stage == Stage::Captured)
+            || (progress.state == OpState::Succeeded && before.stage == Stage::ManagementReady))
+    {
+        return Ok(());
+    }
+    if progress.state == OpState::Running
+        && (before == after
+            || matches!(
+                (before.stage, after.stage),
+                (Stage::Captured, Stage::StartSubmitted)
+                    | (Stage::StartSubmitted, Stage::ManagementReady)
+            ))
+    {
+        return Ok(());
+    }
+    Err(invalid())
 }

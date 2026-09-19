@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("observer requires exactly one absolute database path");
     }
     let (lifecycles, operations) =
-        rcoder_storage::userapp_lifecycle::turso::offline_snapshot(&path).await?;
+        rcoder_storage::userapp_lifecycle::offline_snapshot(&path).await?;
     println!("{}", serde_json::json!({"section": "lifecycles"}));
     for record in lifecycles {
         println!("{record}");

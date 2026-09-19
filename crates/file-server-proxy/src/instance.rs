@@ -14,11 +14,8 @@ use crate::proxy::{ProxyClient, serve};
 /// 运行中的代理实例（shutdown 信号 + serve task + 监听地址）。
 struct RunningInstance {
     shutdown: CancellationToken,
-    task: tokio::task::JoinHandle<()>,
+    finished: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
     address: String,
-    /// N06：跨进程实例锁句柄——随实例停止 drop 释放（同进程 stop+restart
-    /// 可重新获锁；进程崩溃由内核自动释放）。
-    _lock: std::fs::File,
 }
 
 /// 配置注册（main 无条件调用，段缺失时用 Default——本地 dev 也可经 admin API 拉起）。
@@ -49,7 +46,10 @@ pub async fn status() -> Option<String> {
 
 /// map 内实例的 task 已结束则清掉（幂等；serve panic 跳过 spawn 内 cleanup 的兜底）。
 fn reap_dead_instance(guard: &mut tokio::sync::MutexGuard<'_, Option<RunningInstance>>) {
-    if guard.as_ref().is_some_and(|i| i.task.is_finished()) {
+    if guard
+        .as_ref()
+        .is_some_and(|i| i.finished.borrow().is_some())
+    {
         guard.take();
         warn!("file-server 分流代理 serve 已退出, 死实例状态自愈为已停止");
     }
@@ -57,21 +57,50 @@ fn reap_dead_instance(guard: &mut tokio::sync::MutexGuard<'_, Option<RunningInst
 
 /// 实例锁文件路径：用户稳定目录下按「监听语义」分锁域——固定端口一个
 /// 锁域；动态端口（0）每实例独立域（多实例并行合法）。
-fn instance_lock_path(config: &FileServerProxyConfig) -> Result<std::fs::File, String> {
-    let dir = std::env::var_os("FILE_SERVER_PROXY_STATE_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(".file-server-proxy"))
+fn state_directory(
+    explicit: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    profile: Option<std::ffi::OsString>,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(path) = explicit.filter(|value| !value.is_empty()) {
+        return Ok(path.into());
+    }
+    home.filter(|value| !value.is_empty())
+        .or_else(|| profile.filter(|value| !value.is_empty()))
+        .map(|path| std::path::PathBuf::from(path).join(".file-server-proxy"))
+        .ok_or_else(|| {
+            "set FILE_SERVER_PROXY_STATE_DIR when HOME and USERPROFILE are unavailable".into()
         })
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+}
+
+fn listener_address(host: &str, port: u16) -> String {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{host}:{port}"),
+    }
+}
+
+fn instance_lock_path(config: &FileServerProxyConfig) -> Result<std::fs::File, String> {
+    let dir = state_directory(
+        std::env::var_os("FILE_SERVER_PROXY_STATE_DIR"),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+    )?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("create state dir {}: {e}", dir.display()))?;
     let port_key = if config.listen_port == 0 {
         // 动态端口：per-invocation 独立锁（uuid 后缀），不互斥
         format!("dynamic-{}", std::process::id())
     } else {
-        format!("{}-{}", config.listen_host, config.listen_port)
+        // Encode configuration bytes, rather than placing IPv6 colons or path
+        // separators in a Windows filename.
+        let host_key: String = config
+            .listen_host
+            .trim()
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("{host_key}-{}", config.listen_port)
     };
     let path = dir.join(format!("instance-{port_key}.lock"));
     std::fs::OpenOptions::new()
@@ -94,6 +123,9 @@ pub async fn try_start() -> Result<String, String> {
     let mut guard = INSTANCE.lock().await;
     reap_dead_instance(&mut guard);
     if let Some(instance) = guard.as_ref() {
+        if instance.shutdown.is_cancelled() {
+            return Err("file-server proxy is still stopping".into());
+        }
         return Ok(instance.address.clone());
     }
     // N06：跨进程实例锁——同配置空间（listen host:port 语义）单实例；
@@ -122,14 +154,14 @@ pub async fn try_start() -> Result<String, String> {
 
     // N03：host 可配（原生 loopback / 容器 0.0.0.0）；端口 0 = 动态分配，
     // 绑定后以 local_addr 真实地址为准（不返回 ":0"）
-    let requested = format!("{}:{}", config.listen_host, config.listen_port);
+    let requested = listener_address(host, config.listen_port);
     let listener = tokio::net::TcpListener::bind(&requested)
         .await
         .map_err(|e| format!("bind {requested} 失败（端口被占用?）: {e}"))?;
     let address = listener
         .local_addr()
-        .map(|addr| addr.to_string())
-        .unwrap_or(requested);
+        .map_err(|error| format!("read bound proxy listener address: {error}"))?
+        .to_string();
     // 持锁（bind 已成功——锁与端口双占有）：句柄存进 RunningInstance，
     // stop 时 drop 释放（同进程 stop+restart 可重新获锁）；进程崩溃内核释放
     lock_file
@@ -146,60 +178,77 @@ pub async fn try_start() -> Result<String, String> {
     let shutdown = CancellationToken::new();
     let token = shutdown.clone();
     let listening_addr = address.clone();
+    let (finished_tx, finished) = tokio::sync::watch::channel(None);
     let task = tokio::spawn(async move {
+        // The task, not a stop caller, owns the lock through connection drain.
+        let _lock = lock_file;
         info!(
             "file-server 分流代理运行中 ({listening_addr}; {USERAPP_PATH_PREFIX}* 或 \
              {SERVICE_TYPE_HEADER}: {SERVICE_TYPE_USERAPP} → 127.0.0.1:{}, 其余 → 127.0.0.1:{})",
             config.rust_upstream_port, config.ts_upstream_port
         );
-        serve(listener, client, config, token).await;
-        // serve 意外退出（accept 错误等）: 清理 INSTANCE, 避免 status 误报 running
-        cleanup_dead_instance().await;
+        serve(listener, client, config, token).await
     });
 
+    tokio::spawn(async move {
+        let result = task
+            .await
+            .map_err(|error| format!("proxy serve task failed: {error}"))
+            .and_then(std::convert::identity);
+        finished_tx.send_replace(Some(result));
+    });
     info!("file-server 分流代理启动: {address}");
     *guard = Some(RunningInstance {
         shutdown,
-        task,
+        finished,
         address: address.clone(),
-        _lock: lock_file,
     });
     Ok(address)
 }
 
-/// serve task 结束后的 INSTANCE 清理（正常 stop 已 take，此处只兜底意外退出）。
-async fn cleanup_dead_instance() {
-    let mut guard = INSTANCE.lock().await;
-    if guard.as_ref().is_some_and(|i| i.task.is_finished()) {
-        guard.take();
-        warn!("file-server 分流代理实例已随 serve 退出清理（意外退出）");
+/// Stop is shared and cancellation-safe. New starts cannot bypass the draining instance.
+pub async fn stop() -> Result<(), String> {
+    let mut finished = {
+        let guard = INSTANCE.lock().await;
+        let Some(instance) = guard.as_ref() else {
+            return Ok(());
+        };
+        instance.shutdown.cancel();
+        instance.finished.clone()
+    };
+    loop {
+        if let Some(result) = finished.borrow_and_update().clone() {
+            return result;
+        }
+        finished
+            .changed()
+            .await
+            .map_err(|_| "proxy shutdown result channel closed".to_owned())?;
     }
 }
 
-/// 停止分流代理（幂等）。
-///
-/// cancel → 等 serve task 结束（**10s 超时 abort + 再 await**，确保 listener drop
-/// 端口释放）；返回时 60000 已可用（外部服务如 TS nuwax-file-server 可立即 bind）。
-pub async fn stop() -> Result<(), String> {
-    let instance = INSTANCE.lock().await.take();
-    let Some(mut instance) = instance else {
-        return Ok(());
-    };
-    // 锁已随 guard drop 释放，等 task 期间不阻塞 status/start
-    instance.shutdown.cancel();
-    let timeout = std::time::Duration::from_secs(10);
-    if tokio::time::timeout(timeout, &mut instance.task)
-        .await
-        .is_err()
-    {
-        warn!("file-server 分流代理优雅停机超时, abort");
-        instance.task.abort();
-        // abort 仅调度取消, 再 await 确保 listener 已 drop（端口真正释放）;
-        // 随后的 JoinError 是预期取消路径
-        if let Err(join_err) = (&mut instance.task).await {
-            tracing::debug!("proxy task join after abort: {join_err}");
-        }
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_state_uses_windows_profile_without_home() {
+        let profile = std::ffi::OsString::from("profile");
+        assert_eq!(
+            state_directory(None, None, Some(profile.clone())).unwrap(),
+            std::path::Path::new("profile").join(".file-server-proxy")
+        );
+        assert_eq!(
+            state_directory(Some("explicit".into()), Some("home".into()), Some(profile)).unwrap(),
+            std::path::PathBuf::from("explicit")
+        );
+        assert!(state_directory(None, Some("".into()), None).is_err());
     }
-    info!("file-server 分流代理已停止, 60000 端口已释放");
-    Ok(())
+
+    #[test]
+    fn ipv6_listener_uses_socket_address_syntax() {
+        assert_eq!(listener_address("::1", 0), "[::1]:0");
+        assert_eq!(listener_address("127.0.0.1", 60000), "127.0.0.1:60000");
+        assert_eq!(listener_address("localhost", 60000), "localhost:60000");
+    }
 }

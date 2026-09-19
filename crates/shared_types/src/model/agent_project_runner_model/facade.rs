@@ -40,6 +40,18 @@ impl ProjectAndContainerInfo {
             .insert(session_id.to_string(), generation);
     }
 
+    /// Restore the persisted selection after membership, without marking user
+    /// activity. None is meaningful even when older sessions still exist.
+    pub fn restore_latest_session(&mut self, session_id: Option<&str>) -> bool {
+        if session_id.is_some_and(|id| !self.sessions().contains(id)) {
+            return false;
+        }
+        self.state.update_core(|core| {
+            core.latest_session = session_id.map(str::to_owned);
+        });
+        true
+    }
+
     pub fn new(project_id: String) -> Self {
         Self {
             state: ProjectState::new(project_id),

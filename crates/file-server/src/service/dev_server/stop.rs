@@ -196,14 +196,26 @@ impl DevServerManager {
         project_id: &str,
         external: &crate::models::ExternalOwner,
     ) -> AppResult<StoppedDev> {
-        let workspace_id = project_id
-            .rsplit(':')
-            .next()
-            .unwrap_or(project_id)
-            .to_string();
         // R05 幂等恢复：在途停止操作按原 ID 续查，不产生新 ID
         let pending = lock(&self.external_stops)?.get(project_id).cloned();
         let route = async {
+            let identity = super::owner_client::probe_owner(&external.address)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("external owner identity unavailable"))?;
+            anyhow::ensure!(
+                super::owner_client::protocol_compatible(&identity)
+                    && identity.runtime_instance_id == external.runtime_instance_id
+                    && !identity.workspace_id.trim().is_empty(),
+                "external owner identity changed; refusing to transmit credentials"
+            );
+            let workspace_id = identity.workspace_id.clone();
+            if let Some(record) = &pending {
+                anyhow::ensure!(
+                    record.workspace_id == workspace_id,
+                    "pending stop workspace does not match the registered owner"
+                );
+            }
+
             let client = super::owner_client::OwnerClient::new(&external.address, &external.token)?;
             let operation_id = match pending {
                 Some(record) => record.operation_id,
@@ -451,6 +463,21 @@ mod external_stop_tests {
         let addr = listener.local_addr().expect("addr").to_string();
         let app = axum::Router::new()
             .route(
+                "/v1/runtime/identity",
+                axum::routing::get(|| async {
+                    axum::Json(envelope(&shared_types::RuntimeIdentityView {
+                        application_id: "app-r05".into(),
+                        service_family: "userapp-dev".into(),
+                        workspace_id: "ws-stable-hash".into(),
+                        source_root: "/workspace".into(),
+                        runtime_instance_id: "instance-test".into(),
+                        deployment_generation_id: "gen-test".into(),
+                        protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+                        capabilities: vec![],
+                    }))
+                }),
+            )
+            .route(
                 "/v1/runtime/status",
                 axum::routing::get(|| async {
                     let status = shared_types::RuntimeStatusView {
@@ -476,8 +503,16 @@ mod external_stop_tests {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("op")
                                 .to_string();
+                            assert_eq!(req["workspace_id"], "ws-stable-hash");
                             state.submitted.lock().unwrap().push(id.clone());
-                            axum::Json(envelope(&view(&id, RuntimeOperationState::Accepted)))
+                            (
+                                axum::http::StatusCode::ACCEPTED,
+                                axum::Json(envelope(&shared_types::RuntimeOperationAccepted {
+                                    operation_id: id.clone(),
+                                    state: RuntimeOperationState::Accepted,
+                                    poll: format!("/v1/runtime/operations/{id}"),
+                                })),
+                            )
                         }
                     },
                 ),

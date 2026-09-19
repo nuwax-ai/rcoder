@@ -125,8 +125,8 @@ docker-build-master-base:
 #   make dev-restart CARGO_FEATURES='--features otel,debug,proxy'
 #
 # hotpath 默认开启基础档（函数耗时/路由剖析/runtime 指标；容器内 6770/6771 绑 127.0.0.1，
-# 观测方式见 AGENTS.md「AI 调试路由」）。按需叠加内存剖析 / MCP 档，构建前设置例如：
-#   make dev-restart CARGO_FEATURES='--features otel,debug,hotpath,hotpath-alloc'
+# 观测方式见 AGENTS.md「AI 调试路由」）。按需叠加 MCP 档，构建前设置例如：
+#   make dev-restart CARGO_FEATURES='--features otel,debug,hotpath,hotpath-mcp'
 # 生产构建（build-agent-docker）不含 hotpath/dial9，零影响。
 #
 # 本地开发调试默认开启上述功能（http-server / grpc-server 仍由 agent_runner 默认 features 提供）

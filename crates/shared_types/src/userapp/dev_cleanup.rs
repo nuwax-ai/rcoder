@@ -53,6 +53,16 @@ pub trait UserappDevDeletion: Send {
 
 #[async_trait]
 pub trait UserappDevCleanup: Send + Sync {
+    /// Consume a borrowed handle to the caller's existing builder lease. Receipt
+    /// data alone is not authorization; unsupported adapters must not reacquire.
+    async fn capture_with_lease(
+        &self,
+        _app_id: &str,
+        _lease: Box<dyn crate::AppOperationLease>,
+    ) -> Result<Box<dyn UserappDevDeletion>, String> {
+        Err("capturing under an existing builder lease is unsupported".into())
+    }
+
     async fn capture(&self, _app_id: &str) -> Result<Box<dyn UserappDevDeletion>, String> {
         Err("identity-bound builder deletion is unsupported".into())
     }

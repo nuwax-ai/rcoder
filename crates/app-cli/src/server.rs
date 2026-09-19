@@ -44,12 +44,18 @@ const DEPLOY_PROTOCOL: u32 = shared_types::app_cli_deploy::APP_CLI_OPERATION_ID_
 
 /// server 全局状态（api 层与主循环共享；读多写少，std RwLock 短临界区不跨 await）。
 pub struct ServerState {
+    control_token: std::sync::OnceLock<String>,
     admission: std::sync::Mutex<()>,
     accepting: std::sync::atomic::AtomicBool,
     shutdown_unconfirmed: std::sync::atomic::AtomicBool,
+    // High-water marks retain the previous generation's stop requirements while
+    // a replacement release is being prepared/published.
+    shutdown_grace_seconds: std::sync::atomic::AtomicU64,
+    shutdown_group_count: std::sync::atomic::AtomicU64,
     /// 启动恢复未完成（P1-01）：API 先 bind 后、恢复完成前，写端点与 /ready
     /// 就绪判定被门控——恢复期不受理运行态变更、不以 Idle 语义应答探针。
     initializing: std::sync::atomic::AtomicBool,
+    configuration_gate: Option<Arc<crate::configuration_gate::ConfigurationGate>>,
     preparations: Arc<preparation::Preparations>,
     journal: std::sync::Mutex<Option<Journal>>,
     generation: String,
@@ -141,6 +147,8 @@ impl ServerPhase {
 /// /v1/deploy 受理请求（api 端点反序列化后转发主循环）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeployRequest {
+    #[serde(skip)]
+    pub(crate) runtime_operation_id: Option<String>,
     pub url: String,
     pub release_id: String,
     pub sha256: Option<String>,
@@ -217,6 +225,7 @@ impl ServerState {
         let (deploy_tx, deploy_rx) = tokio::sync::mpsc::unbounded_channel();
         let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
+            control_token: std::sync::OnceLock::new(),
             runtime_kernel: std::sync::OnceLock::new(),
             kernel_required: std::sync::atomic::AtomicBool::new(false),
             runtime_recovery_hold: std::sync::atomic::AtomicBool::new(false),
@@ -228,7 +237,10 @@ impl ServerState {
             admission: std::sync::Mutex::new(()),
             accepting: std::sync::atomic::AtomicBool::new(true),
             shutdown_unconfirmed: std::sync::atomic::AtomicBool::new(false),
+            shutdown_grace_seconds: std::sync::atomic::AtomicU64::new(30),
+            shutdown_group_count: std::sync::atomic::AtomicU64::new(1),
             initializing: std::sync::atomic::AtomicBool::new(true),
+            configuration_gate: None,
             preparations: Arc::new(preparation::Preparations::default()),
             journal: std::sync::Mutex::new(None),
             generation: std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
@@ -360,15 +372,7 @@ impl ServerState {
         let Some(kernel) = self.runtime_kernel() else {
             return Ok(());
         };
-        let sequence = kernel
-            .store()
-            .replay_events(operation_id, u64::MAX)
-            .map(|events| events.len() as u64 + 1)
-            .unwrap_or(2);
-        if let Err(persist_error) = kernel
-            .finish(operation_id, state, error, None, sequence.max(2))
-            .await
-        {
+        if let Err(persist_error) = kernel.finish(operation_id, state, error, None, 0).await {
             let message = format!(
                 "runtime operation terminal persist failed (op {operation_id}): {persist_error:#}"
             );
@@ -442,6 +446,44 @@ impl ServerState {
     /// 启动恢复是否仍在进行（P1-01：API bind 先于恢复，写端点/ready 门控依据）。
     pub fn initializing(&self) -> bool {
         self.initializing.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn configuration_gate(
+        &self,
+    ) -> Option<Arc<crate::configuration_gate::ConfigurationGate>> {
+        self.configuration_gate.clone()
+    }
+
+    pub(crate) fn activate_runtime_configuration(
+        &self,
+        receipt: &shared_types::RuntimeConfigurationActivation,
+    ) -> Result<()> {
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime admission lock poisoned"))?;
+        anyhow::ensure!(
+            self.accepting.load(std::sync::atomic::Ordering::Acquire)
+                && !self.cancel.is_cancelled(),
+            "runtime admission is closed"
+        );
+        anyhow::ensure!(
+            !self
+                .runtime_recovery_hold
+                .load(std::sync::atomic::Ordering::Acquire),
+            "runtime requires recovery before configuration activation"
+        );
+        let kernel = self
+            .runtime_kernel()
+            .context("runtime kernel not initialized")?;
+        anyhow::ensure!(
+            !kernel.recovery_protection_active(),
+            "runtime requires recovery before configuration activation"
+        );
+        self.configuration_gate
+            .as_ref()
+            .context("runtime configuration is not managed")?
+            .activate(receipt)
     }
 
     /// 标记启动恢复完成：开放写端点受理与 ready 判定。
@@ -573,7 +615,37 @@ impl ServerState {
             .clone()
     }
 
+    pub(crate) fn control_token(&self) -> Option<String> {
+        self.control_token.get().cloned().or_else(|| {
+            std::env::var("APP_CLI_DEPLOY_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+    }
+
+    fn initialize_owner_token(&self) -> Result<()> {
+        let token = self
+            .control_token()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        self.control_token
+            .set(token)
+            .map_err(|_| anyhow::anyhow!("owner control token already initialized"))
+    }
+
     pub fn set_release(&self, release: ReleaseLock) {
+        let enabled = release.services.iter().filter(|service| service.enabled);
+        self.shutdown_grace_seconds.fetch_max(
+            enabled
+                .clone()
+                .map(|service| service.run.shutdown_timeout_seconds)
+                .max()
+                .unwrap_or(30),
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        self.shutdown_group_count.fetch_max(
+            (enabled.count() as u64).saturating_add(1),
+            std::sync::atomic::Ordering::AcqRel,
+        );
         let rid = release.release_id.clone();
         *self
             .release
@@ -589,6 +661,25 @@ impl ServerState {
         {
             op.artifact_release_id = Some(rid);
         }
+    }
+
+    fn shutdown_budget(&self, supervised: bool) -> std::time::Duration {
+        let seconds = if supervised {
+            // stop/remove are sequential RPCs (each bounded at 60 seconds),
+            // bracketed by two process-group queries.
+            self.shutdown_group_count
+                .load(std::sync::atomic::Ordering::Acquire)
+                .saturating_mul(2)
+                .saturating_add(2)
+                .saturating_mul(60)
+        } else {
+            // Parallel business grace + process tree force/reap confirmation.
+            self.shutdown_grace_seconds
+                .load(std::sync::atomic::Ordering::Acquire)
+                .saturating_add(5)
+        };
+        // Remaining preparation/static writers and durable journal confirmation.
+        std::time::Duration::from_secs(seconds.saturating_add(30))
     }
 
     /// 令牌回显登记（见 [`DeployStatus::request_release_id`]）：env 启动部署在进入
@@ -822,6 +913,23 @@ impl ServerState {
                     && receipt.operation.operation_id == operation.operation_id,
                 "failure receipt does not belong to the current operation"
             );
+            if boundary == Boundary::StartupFailed {
+                anyhow::ensure!(
+                    matches!(
+                        receipt.boundary,
+                        Boundary::Activated | Boundary::Active | Boundary::StartupFailed
+                    ),
+                    "Startup failure requires a confirmed activation boundary"
+                );
+                receipt.active = Some(ActiveVersion {
+                    request: Some(receipt.request.clone()),
+                    artifact_release_id: receipt
+                        .operation
+                        .artifact_release_id
+                        .clone()
+                        .context("confirmed startup failure has no artifact identity")?,
+                });
+            }
             if boundary == Boundary::Failed {
                 // Previous artifacts remain on disk, but are not a serving version
                 // eligible for automatic restoration after activation has started.
@@ -1031,37 +1139,21 @@ async fn verify_identity_and_attach(
 ) -> Result<()> {
     use std::process::exit;
 
-    let identity = body.get("data");
-    let remote_app = identity
-        .and_then(|d| d.get("application_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let remote_ws = identity
-        .and_then(|d| d.get("workspace_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
+    let identity: shared_types::RuntimeIdentityView = serde_json::from_value(
+        body.get("data")
+            .cloned()
+            .context("attach mode: identity mismatch; refusing to attach")?,
+    )
+    .context("attach mode: incomplete identity; refusing to attach")?;
     let local_app = std::env::var("PROJECT_ID")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "unknown-app".to_string());
-    let local_ws = args
-        .workspace
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "workspace".to_string());
-
-    if remote_app != local_app || remote_ws != local_ws {
-        tracing::error!(
-            "attach mode: identity mismatch — local {local_app}/{local_ws} \
-             vs remote {remote_app}/{remote_ws}; refusing to attach"
-        );
-        exit(1);
-    }
-
+    validate_attach_identity(&args.workspace, &local_app, &identity)?;
     tracing::info!(
-        "attach mode: existing instance matches identity {local_app}/{local_ws}; \
-         waiting for it to exit..."
+        application_id = %local_app,
+        workspace_id = %identity.workspace_id,
+        "attach mode: existing instance matches project identity; waiting for it to exit"
     );
 
     // 等待端口释放（已有实例退出后端口变为可绑定）
@@ -1084,6 +1176,29 @@ async fn verify_identity_and_attach(
     exit(1);
 }
 
+/// A workspace leaf name is not an identity: two sibling trees may use it.
+fn validate_attach_identity(
+    workspace: &std::path::Path,
+    application_id: &str,
+    identity: &shared_types::RuntimeIdentityView,
+) -> Result<()> {
+    let local = workspace
+        .canonicalize()
+        .context("resolve attach workspace")?;
+    let remote = std::path::Path::new(&identity.source_root)
+        .canonicalize()
+        .context("resolve attached owner workspace")?;
+    anyhow::ensure!(
+        identity.application_id == application_id
+            && !identity.workspace_id.is_empty()
+            && identity.protocol_version == shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION
+            && runtime_state_layout::canonical_project_root(&local)
+                == runtime_state_layout::canonical_project_root(&remote),
+        "attach mode: identity mismatch; refusing to attach"
+    );
+    Ok(())
+}
+
 /// 跨平台重新执行当前二进制（去掉 --attach 参数）。
 ///
 /// Unix：exec 替换当前进程映像（成功不返回）。
@@ -1099,7 +1214,7 @@ fn reexec_without_attach() {
     };
     let args: Vec<String> = std::env::args()
         .skip(1)
-        .filter(|arg| arg != "--attach" && arg != "attach")
+        .filter(|arg| arg != "--attach")
         .collect();
 
     #[cfg(unix)]
@@ -1135,12 +1250,37 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         .unwrap_or_else(|| "unknown-app".to_string());
     let state_root =
         crate::runtime_kernel::RuntimeStore::resolve_root(&args.workspace, &application_id)?;
-    let _owner_guard = crate::platform::owner_guard::OwnerGuard::acquire(&state_root)
-        .context("acquire exclusive owner lock (another instance may be running)")?;
+    let _owner_guard = match crate::platform::owner_guard::OwnerGuard::try_acquire(&state_root)? {
+        Some(guard) => guard,
+        None => {
+            anyhow::ensure!(
+                !crate::deploy::deploy_requested(),
+                "workspace already has an owner; submit artifact deployment through its deployment API"
+            );
+            return match crate::owner_dispatch::dispatch_to_owner(
+                &args.admin_addr,
+                &args.workspace,
+                &state_root,
+                &application_id,
+            )
+            .await?
+            {
+                crate::owner_dispatch::OwnerDispatch::Terminal(view) => {
+                    crate::owner_dispatch::describe_terminal(&view)
+                }
+                crate::owner_dispatch::OwnerDispatch::NoOwner => {
+                    anyhow::bail!("owner disappeared during dispatch; no operation was submitted")
+                }
+            };
+        }
+    };
 
     let journal = Journal::open(&args.workspace)?;
     let ready = RuntimeStatusService::default();
     let mut initial_state = ServerState::new(ready.clone());
+    initial_state.initialize_owner_token()?;
+    initial_state.configuration_gate =
+        crate::configuration_gate::ConfigurationGate::from_env(state_root.clone())?.map(Arc::new);
     if std::env::var(shared_types::APP_DEPLOY_GENERATION_ID).is_err()
         && let Some(receipt) = journal.receipt.as_ref()
     {
@@ -1171,6 +1311,10 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         api_state,
     )
     .await?;
+    let bound_api_addr = api_listener
+        .local_addr()
+        .context("read bound app-cli management address")?
+        .to_string();
     let api_failure = Arc::new(std::sync::Mutex::new(None::<String>));
     let api_monitor_failure = api_failure.clone();
     let api_monitor_state = state.clone();
@@ -1242,12 +1386,23 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
                         "runtime state requires recovery; automatic business startup suppressed"
                     );
                 }
-                state.set_runtime_kernel(kernel);
+                let credential_result = state
+                    .control_token()
+                    .context("owner control token missing")
+                    .and_then(|token| kernel.store().store_token(&token))
+                    .context("publish owner control credential");
+                if let Err(error) = credential_result {
+                    state.close_admission();
+                    api_handle.abort();
+                    signal_task.abort();
+                    return Err(error);
+                }
+                state.set_runtime_kernel(kernel.clone());
                 // R06 事件桥：编排 EVT 同步进入活跃操作的运行事件 journal
                 //（复用 owner 的平台侧经运行 API 读事件流，读不到本进程
                 // stdout）。stdout 通道不变（本地 spawn 路径消费）。
                 {
-                    let kernel = state.runtime_kernel().expect("kernel just set");
+                    let kernel = kernel.clone();
                     crate::orchestration_events::install_bridge(Box::new(move |json| {
                         if let Some(record) = bridge_event_fields(&json) {
                             kernel.append_orchestration_event(
@@ -1262,7 +1417,6 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
                 // endpoint 发现记录（cross-platform.md §3）：API 已绑定 +
                 // 身份就绪后原子发布——多项目按状态根天然隔离。
                 // 发布失败仅告警（发现能力缺失，不影响已建立的 owner）。
-                let kernel = state.runtime_kernel().expect("kernel just set");
                 if let Err(endpoint_error) =
                     kernel
                         .store()
@@ -1271,21 +1425,10 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
                             application_id: kernel.identity().application_id.clone(),
                             workspace_id: kernel.identity().workspace_id.clone(),
                             runtime_instance_id: kernel.identity().runtime_instance_id.clone(),
-                            address: args.admin_addr.clone(),
+                            address: bound_api_addr.clone(),
                         })
                 {
                     tracing::warn!("endpoint discovery record publish failed: {endpoint_error:#}");
-                }
-                // 本地凭据文件（cross-platform.md §3 端口与认证）：token 经
-                // env 启用写端点时同步落盘到状态根（Unix 0600；Windows ACL
-                // 保护为已知缺口）。平台（file-server）读此文件对既有 owner
-                // 提交运行操作——凭据不出现在命令行参数/日志/identity 响应。
-                if let Some(token) = std::env::var("APP_CLI_DEPLOY_TOKEN")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    && let Err(token_error) = kernel.store().store_token(&token)
-                {
-                    tracing::warn!("token file publish failed: {token_error:#}");
                 }
             }
             Err(error) => {
@@ -1383,6 +1526,7 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         state.cancel.cancelled().await;
         Err(error).context("startup ownership was not claimed")
     } else {
+        let supervised = host.is_some();
         let driver_args = args.clone();
         let driver_state = state.clone();
         let mut driver = tokio::spawn(async move {
@@ -1393,10 +1537,10 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
             result = &mut driver => {
                 joined = true;
                 state.close_admission();
-                (result.context("server driver panicked").and_then(|result| result), tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+                (result.context("server driver panicked").and_then(|result| result), tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?)
             },
             () = state.cancel.cancelled() => {
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                let deadline = tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?;
                 let result = match tokio::time::timeout_at(deadline, &mut driver).await {
                     Ok(result) => { joined = true; result.context("server driver panicked").and_then(|result| result) },
                     Err(error) => Err(error).context("server shutdown confirmation timed out"),
@@ -1485,6 +1629,26 @@ async fn join_supervisor(
     result.context("supervisor task panicked")?
 }
 
+/// Control identifiers are opaque keys, not filesystem path components. Keep
+/// existing valid project names stable; native names outside the wire grammar
+/// use a deterministic digest. Source, .run and filesystem aliases share a key.
+fn runtime_workspace_id(workspace: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let project_root = runtime_state_layout::canonical_project_root(workspace);
+    if let Some(name) = project_root.file_name().and_then(|name| name.to_str())
+        && shared_types::validate_identifier(name, "workspace_id").is_ok()
+    {
+        return name.to_owned();
+    }
+    // Hash the platform's lossless path encoding, not a lossy display string.
+    // A full SHA-256 hex digest fits the protocol's 64-byte identifier limit.
+    format!(
+        "{:x}",
+        Sha256::digest(project_root.as_os_str().as_encoded_bytes())
+    )
+}
+
 /// 装配运行操作内核（serve 专用；dispatch 把内核动作翻译进既有执行通道）。
 async fn assemble_runtime_kernel(
     state: &Arc<ServerState>,
@@ -1498,11 +1662,7 @@ async fn assemble_runtime_kernel(
     // B04：显式状态根（env 权威；缺省按应用隔离）——source/.run/别名同域
     let root = RuntimeStore::resolve_root(&args.workspace, &application_id)?;
     let store = RuntimeStore::open_with_root(root, &args.workspace)?;
-    let workspace_id = args
-        .workspace
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "workspace".to_string());
+    let workspace_id = runtime_workspace_id(&args.workspace);
     let source_root = args
         .workspace
         .canonicalize()
@@ -1539,7 +1699,6 @@ async fn assemble_runtime_kernel(
                 });
                 return;
             }
-            dispatch_state.set_current_runtime_operation(Some(operation_id.clone()));
             let local_path = dispatch_workspace.parent().map(|volume| {
                 volume
                     .join("builds")
@@ -1555,6 +1714,7 @@ async fn assemble_runtime_kernel(
             }
             let marker = format!("runtime-{operation_id}");
             let request = DeployRequest {
+                runtime_operation_id: Some(operation_id.clone()),
                 url: format!("artifact://{artifact_id}"),
                 release_id: marker,
                 sha256,
@@ -1583,11 +1743,11 @@ async fn assemble_runtime_kernel(
                 });
                 return;
             }
-            dispatch_state.set_current_runtime_operation(Some(operation_id.clone()));
             // release_id 语义 = 调用方请求标识（request_release_id 驱动等待方
             // 确认）；以 runtime 操作 ID 承载，形成 API 侧可观察的关联。
             let marker = format!("runtime-{operation_id}");
             let request = DeployRequest {
+                runtime_operation_id: Some(operation_id.clone()),
                 url,
                 release_id: marker,
                 sha256,
@@ -1602,7 +1762,6 @@ async fn assemble_runtime_kernel(
             dev_profile,
             pg,
         } => {
-            dispatch_state.set_current_runtime_operation(Some(operation_id.clone()));
             if dispatch_state
                 .control_tx
                 .send(ControlSignal::OrchestrateSource {
@@ -1663,6 +1822,14 @@ async fn initialize_startup(
     args: &RuntimeArgs,
     state: &ServerState,
 ) -> Result<Option<InitialAction>> {
+    if let Err(error) = crate::migration_journal::require_confirmed_migrations(&args.workspace) {
+        state.begin_runtime_recovery_hold();
+        return Err(error).context("database migration requires reconciliation");
+    }
+    if let Some(gate) = state.configuration_gate() {
+        tracing::info!("Management ready; waiting for captured runtime configuration activation");
+        gate.wait(&state.cancel).await?;
+    }
     if crate::deploy::deploy_requested() {
         let generation = std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
             .context("APP_DEPLOY_GENERATION_ID is required")?;
@@ -1706,6 +1873,15 @@ async fn initialize_startup(
                 == Some(release.release_id.as_str()),
             "active artifact does not match deployment journal"
         );
+        if receipt.boundary == Boundary::StartupFailed {
+            state.set_release(release);
+            state.set_phase(ServerPhase::Failed(
+                receipt.operation.error.clone().unwrap_or_else(|| {
+                    "Business startup failed; explicit start or redeployment is required".into()
+                }),
+            ));
+            return Ok(None);
+        }
         if receipt.boundary == Boundary::Preparing
             && receipt.operation.phase != AppCliDeployPhase::Failed
         {
@@ -1797,6 +1973,25 @@ async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> In
     }
 }
 
+async fn record_uncertain_control(state: &ServerState, signal: &ControlSignal, error: &str) {
+    let operation_id = match signal {
+        ControlSignal::OrchestrateSource { operation_id, .. }
+        | ControlSignal::StopBusiness { operation_id } => operation_id,
+    };
+    // A successfully running predecessor has already cleared current_runtime_operation.
+    // Bind a stop failure to the consumed request explicitly, before the global hold.
+    if let Err(persist_error) = state
+        .finish_runtime_operation_by_id(
+            operation_id,
+            shared_types::RuntimeOperationState::RecoveryRequired,
+            Some((shared_types::ERR_RECOVERY_REQUIRED.into(), error.into())),
+        )
+        .await
+    {
+        tracing::error!(%persist_error, "persist uncertain control failed; recovery hold retained");
+    }
+}
+
 /// Prepare while the existing supervisor continues serving. Failed requests do
 /// not leave this wait loop and never reach the stop/activate boundary.
 async fn next_prepared(
@@ -1806,6 +2001,9 @@ async fn next_prepared(
 ) -> Option<InitialAction> {
     loop {
         let request = rx.recv().await?;
+        if let Some(id) = &request.runtime_operation_id {
+            state.set_current_runtime_operation(Some(id.clone()));
+        }
         let state_clone = state.clone();
         let progress_cb: crate::deploy::ProgressCallback =
             std::sync::Arc::new(move |p: shared_types::AppDeploymentProgress| {
@@ -1908,7 +2106,48 @@ async fn fail_activation(
         hold_unconfirmed(state, format!("{error}; static shutdown: {stop_error:#}")).await;
         return None;
     }
-    if let Err(persist_error) = state.fail_operation(error.clone(), Boundary::Failed) {
+    if let Err(migration_error) =
+        crate::migration_journal::require_confirmed_migrations(&args.workspace)
+    {
+        state.begin_runtime_recovery_hold();
+        hold_unconfirmed(
+            state,
+            format!("{error}; migration outcome: {migration_error:#}"),
+        )
+        .await;
+        return None;
+    }
+    let artifact = crate::manifest::read_release_lock(&args.workspace)
+        .ok()
+        .map(|release| release.release_id);
+    let boundary = state
+        .journal
+        .lock()
+        .map(|journal| {
+            let receipt = journal
+                .as_ref()
+                .and_then(|journal| journal.receipt.as_ref());
+            if receipt.is_some_and(|receipt| {
+                matches!(
+                    receipt.boundary,
+                    Boundary::Activated | Boundary::Active | Boundary::StartupFailed
+                ) && artifact.is_some()
+                    && receipt.operation.artifact_release_id == artifact
+            }) {
+                Boundary::StartupFailed
+            } else {
+                Boundary::Failed
+            }
+        })
+        .map_err(|_| ());
+    let boundary = match boundary {
+        Ok(boundary) => boundary,
+        Err(()) => {
+            hold_unconfirmed(state, format!("{error}; deployment journal lock poisoned")).await;
+            return None;
+        }
+    };
+    if let Err(persist_error) = state.fail_operation(error.clone(), boundary) {
         hold_unconfirmed(
             state,
             format!("{error}; persist failure: {persist_error:#}"),
@@ -2157,6 +2396,9 @@ async fn server_loop(
                 unreachable!("handled above")
             }
             InitialAction::Deploy(request) => {
+                if let Some(id) = &request.runtime_operation_id {
+                    state.set_current_runtime_operation(Some(id.clone()));
+                }
                 state.set_phase(ServerPhase::Deploying);
                 state.set_request_release_id(&request.release_id);
                 let state_ref = state.clone();
@@ -2243,6 +2485,7 @@ async fn server_loop(
                     &runtime_status,
                     run_migrations,
                     run_dev_profile,
+                    run_pg,
                 )
                 .await
             {
@@ -2331,6 +2574,7 @@ async fn server_loop(
                         } else {
                             state.ready.set_ready(false);
                             if let Err(error) = host.stop_all().await {
+                                record_uncertain_control(state, &signal, &format!("stop before runtime control failed: {error:#}")).await;
                                 hold_unconfirmed(
                                     state,
                                     format!("stop before runtime control failed: {error:#}"),
@@ -2389,6 +2633,26 @@ async fn server_loop(
         // 先等编排就绪（Running）；就绪后递进一轮等终态/热部署/信号。
         let next = tokio::select! {
             result = &mut running_rx => {
+                if result.is_err() {
+                    // The supervisor exited before readiness. Consume its
+                    // outcome before reading the next request: otherwise a
+                    // queued Start can win the select and a confirmed startup
+                    // failure is mistaken for an unconfirmed stop of that Start.
+                    match join_supervisor(&mut sup, &mut sup_joined).await {
+                        Err(error) if error.downcast_ref::<supervisor::ShutdownUnconfirmed>().is_some()
+                            || error.downcast_ref::<tokio::task::JoinError>().is_some() => {
+                            hold_unconfirmed(state, format!("startup shutdown unconfirmed: {error:#}")).await;
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            pending = fail_activation(args, state, format!("orchestrate: {error:#}")).await;
+                        }
+                        Ok(()) => {
+                            pending = fail_activation(args, state, "supervisor ended before readiness".into()).await;
+                        }
+                    }
+                    continue;
+                }
                 if result.is_ok() && let Err(error) = state.complete_running() {
                         cancel.cancel();
                         if join_supervisor(&mut sup, &mut sup_joined).await.is_err() {
@@ -2437,7 +2701,8 @@ async fn server_loop(
                     }
                 }
                 let mut builtin_control = state.control_rx.lock().await;
-                tokio::select! {
+                loop {
+                let next = tokio::select! {
                     outcome = &mut sup, if !sup_joined => { sup_joined = true; match outcome {
                         // 服务退出/信号/cancel 后 supervise 正常返回：内置引擎不自动重编排
                 //（supervisord 引擎下服务崩溃由 supervisord per-service 重启，不走到这）
@@ -2479,9 +2744,14 @@ async fn server_loop(
             // R01：builtin Running 等待也消费运行控制信号（先停本组服务再收束）
             signal = builtin_control.recv() => match signal {
                 Some(signal) => {
+                    if let ControlSignal::OrchestrateSource { operation_id, .. } = &signal
+                        && state.settle_cancelled_before_execution(operation_id).await {
+                        continue;
+                    }
                     state.ready.set_ready(false);
                     cancel.cancel();
                     if let Err(error) = join_supervisor(&mut sup, &mut sup_joined).await {
+                        record_uncertain_control(state, &signal, &format!("stop before runtime control failed: {error:#}")).await;
                         hold_unconfirmed(state, format!("stop before runtime control failed: {error:#}")).await;
                         return Ok(());
                     }
@@ -2495,6 +2765,8 @@ async fn server_loop(
                         join_supervisor(&mut sup, &mut sup_joined).await?;
                         Next::Exit
                     }
+                };
+                break next;
                 }
             }
             () = state.cancel.cancelled() => {
@@ -2560,12 +2832,80 @@ fn bridge_event_fields(json: &str) -> Option<BridgeEvent> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn attach_requires_canonical_project_and_compatible_protocol() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("a/workspace");
+        let other = temp.path().join("b/workspace");
+        std::fs::create_dir_all(local.join(".run")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let mut identity = shared_types::RuntimeIdentityView {
+            application_id: "native".into(),
+            service_family: "userapp-dev".into(),
+            workspace_id: "workspace".into(),
+            source_root: other.to_string_lossy().into_owned(),
+            runtime_instance_id: "owner".into(),
+            deployment_generation_id: "generation".into(),
+            protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: Vec::new(),
+        };
+        assert!(validate_attach_identity(&local, "native", &identity).is_err());
+        identity.source_root = local.to_string_lossy().into_owned();
+        validate_attach_identity(&local.join(".run"), "native", &identity).unwrap();
+        identity.protocol_version += 1;
+        assert!(validate_attach_identity(&local, "native", &identity).is_err());
+    }
+
     fn state() -> ServerState {
         ServerState::new(RuntimeStatusService::default())
     }
 
+    #[test]
+    fn owner_token_is_stable_per_instance_and_not_exported_to_env() {
+        let before = std::env::var_os("APP_CLI_DEPLOY_TOKEN");
+        let first = state();
+        let second = state();
+        first.initialize_owner_token().unwrap();
+        second.initialize_owner_token().unwrap();
+        let token = first.control_token().unwrap();
+        assert_eq!(first.control_token().as_deref(), Some(token.as_str()));
+        match before
+            .as_ref()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(configured) => assert_eq!(token, configured),
+            None => assert_ne!(Some(token), second.control_token()),
+        }
+        assert_eq!(std::env::var_os("APP_CLI_DEPLOY_TOKEN"), before);
+        assert!(first.initialize_owner_token().is_err());
+    }
+
+    #[test]
+    fn shutdown_budget_covers_grace_force_and_previous_generation() {
+        let state = state();
+        assert_eq!(state.shutdown_budget(false).as_secs(), 65);
+        let mut old = release("old");
+        old.services[0].run.shutdown_timeout_seconds = 90;
+        state.set_release(old);
+        assert_eq!(state.shutdown_budget(false).as_secs(), 125);
+        let mut new = release("new");
+        new.services[0].run.shutdown_timeout_seconds = 1;
+        state.set_release(new);
+        assert_eq!(
+            state.shutdown_budget(false).as_secs(),
+            125,
+            "new release must not shorten a still-stopping generation's budget"
+        );
+        assert!(
+            state.shutdown_budget(true).as_secs() >= 390,
+            "supervisord requires sequential stop/remove RPC budgets plus cleanup"
+        );
+    }
+
     fn request() -> DeployRequest {
         DeployRequest {
+            runtime_operation_id: None,
             url: "http://artifact".into(),
             local_path: None,
             release_id: "caller-token".into(),
@@ -2618,6 +2958,39 @@ format = "jsonl"
         .unwrap();
         release.release_id = rid.into();
         release
+    }
+
+    #[test]
+    fn native_workspace_id_handles_path_names_and_run_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        for leaf in [
+            "valid_workspace",
+            "project.with spaces",
+            "中文项目",
+            &"x".repeat(80),
+        ] {
+            let source = temp.path().join(leaf);
+            let run = source.join(".run");
+            std::fs::create_dir_all(&run).unwrap();
+            let id = runtime_workspace_id(&source);
+            shared_types::validate_identifier(&id, "workspace_id").unwrap();
+            assert_eq!(id, runtime_workspace_id(&run));
+            assert_eq!(id, runtime_workspace_id(&source));
+            if leaf == "valid_workspace" {
+                assert_eq!(id, leaf, "preserve existing legal project identity");
+            } else {
+                assert_eq!(id.len(), 64);
+                let other = temp.path().join("other").join(leaf);
+                std::fs::create_dir_all(&other).unwrap();
+                assert_ne!(id, runtime_workspace_id(&other));
+            }
+            #[cfg(unix)]
+            {
+                let alias = temp.path().join(format!("alias_{}", id));
+                std::os::unix::fs::symlink(&source, &alias).unwrap();
+                assert_eq!(id, runtime_workspace_id(&alias));
+            }
+        }
     }
 
     #[tokio::test]
@@ -3190,6 +3563,7 @@ format = "jsonl"
                     barrier.wait();
                     state
                         .try_accept_deploy(DeployRequest {
+                            runtime_operation_id: None,
                             url: "http://127.0.0.1/artifact".into(),
                             release_id: format!("r{n}"),
                             sha256: None,
@@ -3218,6 +3592,7 @@ format = "jsonl"
         state
             .try_accept_deploy_with_id(
                 DeployRequest {
+                    runtime_operation_id: None,
                     url: "http://x".into(),
                     release_id: "requested".into(),
                     sha256: None,
@@ -3238,6 +3613,7 @@ format = "jsonl"
     fn runtime_phase_changes_cannot_clear_unconfirmed_shutdown() {
         let state = state();
         let request = || DeployRequest {
+            runtime_operation_id: None,
             url: "http://x".into(),
             release_id: "requested".into(),
             sha256: None,
@@ -3350,6 +3726,7 @@ format = "jsonl"
         let st = state();
         st.set_phase(ServerPhase::Running);
         let req = DeployRequest {
+            runtime_operation_id: None,
             url: "http://x/p.zip".into(),
             release_id: "rel-1".into(),
             sha256: None,
@@ -3364,6 +3741,7 @@ format = "jsonl"
         // 受理的请求能被主循环收到
         st.set_phase(ServerPhase::Idle);
         st.try_accept_deploy(DeployRequest {
+            runtime_operation_id: None,
             url: "http://x/p2.zip".into(),
             release_id: "rel-2".into(),
             sha256: None,
@@ -3421,6 +3799,7 @@ format = "jsonl"
 
         // 热部署受理：回显与 operation.request_release_id 同步登记
         st.try_accept_deploy(DeployRequest {
+            runtime_operation_id: None,
             url: "http://unused".into(),
             release_id: "rel-token-b".into(),
             sha256: None,
@@ -3460,6 +3839,7 @@ format = "jsonl"
         state
             .try_accept_deploy_with_id(
                 DeployRequest {
+                    runtime_operation_id: None,
                     url: "http://unused".into(),
                     release_id: "new".into(),
                     sha256: None,
@@ -3483,6 +3863,7 @@ format = "jsonl"
         assert!(
             state
                 .try_accept_deploy(DeployRequest {
+                    runtime_operation_id: None,
                     url: "http://unused".into(),
                     release_id: "later".into(),
                     sha256: None,
@@ -3806,6 +4187,50 @@ format = "jsonl"
             .expect("C admitted after A/B settled");
         let a = kernel.get("op-a").await.unwrap().expect("record");
         assert_eq!(a.state, shared_types::RuntimeOperationState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn stop_failure_after_running_retains_its_own_recovery_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state();
+        let kernel = kernel_for(dir.path());
+        state.set_runtime_kernel(kernel.clone());
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Start,
+                "running",
+                0,
+            ))
+            .await
+            .unwrap();
+        state.set_current_runtime_operation(Some("running".into()));
+        assert_eq!(commit_running_barrier(&state).await, BarrierOutcome::Passed);
+        assert!(state.current_runtime_operation().is_none());
+        kernel
+            .admit(runtime_request(
+                shared_types::RuntimeOperationKind::Stop,
+                "stopunknown",
+                0,
+            ))
+            .await
+            .unwrap();
+        record_uncertain_control(
+            &state,
+            &ControlSignal::StopBusiness {
+                operation_id: "stopunknown".into(),
+            },
+            "controlled stop failure",
+        )
+        .await;
+        assert_eq!(
+            kernel.get("stopunknown").await.unwrap().unwrap().state,
+            shared_types::RuntimeOperationState::RecoveryRequired
+        );
+        assert!(kernel.recovery_protection_active());
+        assert_eq!(
+            kernel.get("running").await.unwrap().unwrap().state,
+            shared_types::RuntimeOperationState::Succeeded
+        );
     }
 
     #[tokio::test]

@@ -177,7 +177,16 @@ pub struct AcceptStartInput {
     /// Unknown 行恢复证据说明。None = 协调器未核实证据，存储遇 Unknown 行必须
     /// 返回 [`AcceptStartOutcome::Blocked`]；Some = 已核实（K8s 查 Pod UID 不存在/
     /// 单机非本 host 即前代进程），事务内先落 Stopped 再受理。
-    pub recover_unknown_evidence: Option<String>,
+    pub recover_unknown_evidence: Option<PreviewRecoveryEvidence>,
+}
+
+/// Evidence applies only to the exact Unknown instance observed before the
+/// host lookup. A newer instance under the same preview key cannot inherit it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewRecoveryEvidence {
+    pub instance_id: String,
+    pub revision: i64,
+    pub detail: String,
 }
 
 /// 受理结果。

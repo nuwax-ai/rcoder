@@ -72,6 +72,7 @@ impl AppService {
             Err(_) => return Ok(WakeOutcome::Timeout),
         };
         let activation = async {
+            operation.bind_lease(&guard).await?;
             let context = operation.execution_context();
             let target = self
                 .runtime
@@ -85,15 +86,29 @@ impl AppService {
             // deletion/manual-stop flag cannot override another replica's committed
             // explicit start or policy change. A new stop still serializes on guard.
             self.activity.prepare_traffic_wake(app_id);
-            if previous.phase == "Running" {
-                return Ok(WakeOutcome::AlreadyRunning);
+            let outcome = if previous.phase == "Running" {
+                WakeOutcome::AlreadyRunning
+            } else {
+                guard.mark_mutating()?;
+                self.runtime
+                    .start_app_target(&target)
+                    .await
+                    .map_err(|error| {
+                        map_runtime_error("Start captured traffic wake target", error)
+                    })?;
+                self.wait_for_captured_wake(&target).await?
+            };
+            if self
+                .runtime_configuration
+                .operation_runtime_configuration(&context)
+                .await?
+                .is_some()
+            {
+                guard.mark_mutating()?;
+                self.observe_applied_runtime_configuration(&context, deadline)
+                    .await?;
             }
-            guard.mark_mutating()?;
-            self.runtime
-                .start_app_target(&target)
-                .await
-                .map_err(|error| map_runtime_error("Start captured traffic wake target", error))?;
-            self.wait_for_captured_wake(&target).await
+            Ok(outcome)
         };
         let observation = timeout_at(deadline, activation).await;
         let timed_out = observation.is_err();

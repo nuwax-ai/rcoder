@@ -275,7 +275,16 @@
     "deploy.lightweight.generated-request-identity",
     "deploy.lightweight.confirmation-under-90s",
     "轻量重部署后流量恢复（/react/）",
-    "deploy.lightweight.exact-operation-and-artifact"
+    "deploy.lightweight.exact-operation-and-artifact",
+    "CR10 保存前身份可用",
+    "CR10 保存前旧凭据可用",
+    "CR10 保存仅产生待生效版本",
+    "CR10 保存不换容器且旧密码继续可用",
+    "CR10 待生效密码尚不能登录",
+    "CR10 显式重启操作成功",
+    "CR10 换代后新凭据版本生效",
+    "CR10 prod 配置不改变 dev",
+    "CR10 配置换代后真实业务可访问"
   ],
   "userapp_dev_app_proxy_lazy_start": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
@@ -384,7 +393,12 @@
   "userapp_dev_pg_reset_password": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
     "同密码复调仍成功（upsert 幂等执行）",
-    "首次改密成功（username upsert 建号/改密）"
+    "首次改密成功（username upsert 建号/改密）",
+    "受管理运行账号拒绝直接改密",
+    "同请求身份改参拒绝",
+    "新操作修改独立账号成功",
+    "旧请求迟到重放返回原结果",
+    "迟到重放未覆盖新密码（真实TCP）"
   ],
   "userapp_dev_pod_identity_list_and_status": [
     "agent/status userapp 分支经 cross_verify 链返回幂等信封",

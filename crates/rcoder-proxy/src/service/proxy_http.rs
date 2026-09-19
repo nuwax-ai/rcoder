@@ -74,7 +74,7 @@ impl ProxyHttp for PortProxy {
         if let Some((app_id, touch)) = classify_wake_target(&self.router, path) {
             // ① 访问追踪（仅业务流量）
             if touch && let Some(ref tracker) = self.access_tracker {
-                tracker.touch(&app_id);
+                let _ = tracker.touch(&app_id).await;
             }
             // ② 流量唤醒（stopped app 才触发；手动 stop 与闲置回收统一——
             //    有请求即唤醒，见 AppWakeControl::ensure_running 语义）。

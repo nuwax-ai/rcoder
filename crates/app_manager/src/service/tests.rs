@@ -587,7 +587,10 @@ async fn test_service_with_mode(
         access_mode,
         ..AppManagerConfig::default()
     };
+    let store = Arc::new(store);
     AppService {
+        runtime_configuration: store.clone(),
+        operation_flight: Arc::default(),
         config,
         runtime: runtime as Arc<dyn UserAppRuntime>,
         activity: Arc::new(AppActivityRegistry::new(std::time::Duration::from_secs(
@@ -596,7 +599,7 @@ async fn test_service_with_mode(
         pingora: None,
         pingora_ports: DashMap::new(),
         release_locks: DashMap::new(),
-        metadata: AppMetadataStore::new(Arc::new(store)),
+        metadata: AppMetadataStore::new(store),
         dev_cleanup: std::sync::RwLock::new(None),
         dev_locator: std::sync::RwLock::new(None),
         builder_recovery: std::sync::RwLock::new(None),
@@ -2068,7 +2071,6 @@ pub(crate) async fn production_storage_destroy_preserves_application_identity() 
 #[tokio::test]
 pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
     use container_runtime_api::DeploymentStatus;
-    use shared_types::AppMetadataRecord;
 
     let root = tempfile::tempdir().expect("tempdir");
     let runtime = Arc::new(MockRuntime::default());
@@ -2095,39 +2097,42 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
         sort_order: None,
     };
 
-    let legacy = vec![
-        AppMetadataRecord {
-            generation: uuid::Uuid::new_v4().to_string(),
-            app_id: "appalpha".into(),
-            name: Some("alpha".into()),
-            tenant_id: None,
-            space_id: None,
-            created_at: chrono::Utc::now() - chrono::Duration::hours(2),
-        },
-        AppMetadataRecord {
-            generation: uuid::Uuid::new_v4().to_string(),
-            app_id: "appbeta".into(),
-            name: Some("beta".into()),
-            tenant_id: None,
-            space_id: None,
-            created_at: chrono::Utc::now(),
-        },
-    ];
-    for row in legacy {
+    let alpha = service
+        .metadata
+        .store
+        .ensure_identity("appalpha")
+        .await
+        .unwrap();
+    // Distinct actual registration times, without an import-only backdoor.
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let beta = service
+        .metadata
+        .store
+        .ensure_identity("appbeta")
+        .await
+        .unwrap();
+    assert!(beta.created_at > alpha.created_at);
+    for (row, name) in [(&alpha, "alpha"), (&beta, "beta")] {
         service
             .metadata
             .store
-            .import_application(&row)
+            .patch_metadata(&shared_types::UserAppMetadataPatch {
+                app_id: row.app_id.clone(),
+                lifecycle_id: row.lifecycle_id.clone(),
+                expected_revision: row.metadata_revision,
+                name: Some(Some(name.into())),
+                tenant_id: None,
+                space_id: None,
+            })
             .await
-            .expect("import metadata");
+            .unwrap();
     }
 
     let response = service.query_apps(by_name("alpha")).await.expect("query");
     assert_eq!(response.items.len(), 1, "name filter now effective");
     assert_eq!(response.items[0].app_id, "appalpha");
 
-    // created_at range:只含 2 小时前创建的 alpha
-    let now = chrono::Utc::now();
+    // Use the first actual registration timestamp; beta lies outside the range.
     let response = service
         .query_apps(QueryAppsRequest {
             page: None,
@@ -2137,8 +2142,8 @@ pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
                 name: None,
                 app_ids: None,
                 created_at: Some(DateRange {
-                    start: (now - chrono::Duration::hours(3)).to_rfc3339(),
-                    end: (now - chrono::Duration::hours(1)).to_rfc3339(),
+                    start: (alpha.created_at - chrono::Duration::seconds(1)).to_rfc3339(),
+                    end: alpha.created_at.to_rfc3339(),
                 }),
             }),
             sort_by: None,
@@ -2683,6 +2688,16 @@ mod purge_http_cancellation {
     }
     #[async_trait::async_trait]
     impl shared_types::UserappDevCleanup for ControlledCleanup {
+        async fn capture_with_lease(
+            &self,
+            app_id: &str,
+            lease: Box<dyn shared_types::AppOperationLease>,
+        ) -> Result<Box<dyn shared_types::UserappDevDeletion>, String> {
+            let captured = self.capture(app_id).await;
+            lease.release().await?;
+            captured
+        }
+
         async fn capture(
             &self,
             app_id: &str,
@@ -2950,7 +2965,8 @@ async fn storage_expansion_receipt_is_bound_to_the_update_operation() {
     let root = tempfile::tempdir().expect("directory");
     let (service, runtime) = created_app_service(root.path(), "resizereceipt").await;
     let request: UpdateAppRequest = serde_json::from_value(serde_json::json!({
-        "user_id":"u-test", "request_id":"resize-operation", "resources":{"storage":"200Gi"}
+        "user_id":"u-test", "request_id":"resize-operation", "resources":{"storage":"200Gi"},
+        "image":"registry.example/app-runtime:v2"
     }))
     .expect("request");
     service

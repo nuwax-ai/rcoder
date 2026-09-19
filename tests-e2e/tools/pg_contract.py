@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import signal
 import uuid
-from storage_contract_cases import PG_USERAPP_CASE, passed_exactly_one
+from storage_contract_cases import PG_USERAPP_CASE, PG_EXTRA_TARGETS, passed_exactly_one
 from cleanup import cleanup_pg_project
 
 REPO = Path(__file__).resolve().parents[2]
@@ -16,7 +16,9 @@ CASES = (
     'delayed_clear_and_remove_preserve_reused_session',
     'reload_and_cross_replica_sync_preserve_identity',
     'container_delete_preserves_changed_association',
-    'legacy_schema_backfill_is_stable',
+    'unversioned_schema_is_rejected_without_adoption',
+        'registration_receipt_replays_without_reapplying',
+        'registration_rejects_session_conflict_atomically',
     'flush_failure_shared_between_concurrent_callers',
     'cancelled_durable_write_is_queued_and_shutdown_waits',
 )
@@ -64,7 +66,7 @@ def main():
         listing = command([str(frozen), '--list', '--format=terse'], capture_output=True, text=True).stdout
         names = {line.removesuffix(': test') for line in listing.splitlines() if line.endswith(': test')}
         expected = ['pg::project_store::lifecycle_tests::lifecycle_contract_' + case for case in CASES]
-        if not set(expected + [PG_USERAPP_CASE]) <= names:
+        if not set(expected + [PG_USERAPP_CASE] + list(PG_EXTRA_TARGETS.values())) <= names:
             raise RuntimeError('required PG lifecycle test missing from executable')
         receipt['creation_state'] = 'pending'
         receipt_path.write_text(json.dumps(receipt))
@@ -92,6 +94,11 @@ def main():
         log = (result.stdout + result.stderr).replace(password, '[REDACTED]')
         (directory / 'userapp-transactions.log').write_text(log)
         record('PG userApp transactions and restart', passed_exactly_one(result.returncode, log))
+        for label, target in PG_EXTRA_TARGETS.items():
+            result = subprocess.run([str(frozen), target, '--exact', '--include-ignored', '--nocapture'], cwd=REPO, env=env, capture_output=True, text=True, timeout=180)
+            log = (result.stdout + result.stderr).replace(password, '[REDACTED]')
+            (directory / (target.rsplit('::', 1)[-1] + '.log')).write_text(log)
+            record(label, passed_exactly_one(result.returncode, log))
     except Exception as error:
         record('PG contract execution', False, str(error).replace(password, '[REDACTED]'))
     finally:

@@ -147,6 +147,21 @@ impl KubernetesRuntime {
         &self,
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<()> {
+        self.start_captured_with_policy(target, true).await
+    }
+
+    pub(super) async fn start_captured_management_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.start_captured_with_policy(target, false).await
+    }
+
+    async fn start_captured_with_policy(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        enable_traffic_wake: bool,
+    ) -> ContainerRuntimeResult<()> {
         target
             .context
             .validate_identity(&target.context.app_id)
@@ -166,9 +181,15 @@ impl KubernetesRuntime {
         }
         self.claim_app_storage_with_context(&target.context.app_id, Some(&target.context))
             .await?;
-        self.patch_captured_app(&target.resource, serde_json::json!({
-            "metadata":{"annotations":{(WAKE_ON_TRAFFIC_ANNOTATION):"true"}}, "spec":{"replicas":1}
-        })).await
+        let patch = if enable_traffic_wake {
+            serde_json::json!({
+                "metadata":{"annotations":{(WAKE_ON_TRAFFIC_ANNOTATION):"true"}},
+                "spec":{"replicas":1}
+            })
+        } else {
+            serde_json::json!({"spec":{"replicas":1}})
+        };
+        self.patch_captured_app(&target.resource, patch).await
     }
 
     pub(super) async fn stop_captured_target(

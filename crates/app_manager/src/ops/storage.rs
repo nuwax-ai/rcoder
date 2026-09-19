@@ -612,16 +612,20 @@ impl crate::service::AppService {
         guard: &mut crate::service::AppOperationGuard,
     ) -> AppResult<()> {
         operation.bind_lease(guard).await?;
-        if !production {
-            // flock 同进程重入修复：Dev 清理在同文件上获取带标记租约——
-            // 外层无标记 flock（另一 fd）必须先交棒（回执已绑定）。
-            guard.hand_over_to_inner_builder_lease();
-        }
         if production {
             self.ensure_app_deleted(app_id, "destroying captured storage")
                 .await?;
         }
-        let development = self.capture_dev_deletion(app_id).await?;
+        let development = self
+            .capture_dev_deletion_with_lease(
+                app_id,
+                if production {
+                    None
+                } else {
+                    Some(guard.builder_lease()?)
+                },
+            )
+            .await?;
         let snapshot = if production {
             Some(
                 self.runtime
@@ -669,13 +673,25 @@ impl crate::service::AppService {
         &self,
         app_id: &str,
     ) -> AppResult<Box<dyn shared_types::UserappDevDeletion>> {
+        self.capture_dev_deletion_with_lease(app_id, None).await
+    }
+
+    async fn capture_dev_deletion_with_lease(
+        &self,
+        app_id: &str,
+        lease: Option<Box<dyn shared_types::AppOperationLease>>,
+    ) -> AppResult<Box<dyn shared_types::UserappDevDeletion>> {
         let cleanup = self
             .dev_cleanup
             .read()
             .map_err(|_| AppOperationError::Backend("dev cleanup lock poisoned".into()))?
             .clone()
             .ok_or_else(|| AppOperationError::Backend("userapp dev cleanup not injected".into()))?;
-        let deletion = cleanup.capture(app_id).await.map_err(|error| {
+        let deletion = match lease {
+            Some(lease) => cleanup.capture_with_lease(app_id, lease).await,
+            None => cleanup.capture(app_id).await,
+        }
+        .map_err(|error| {
             AppOperationError::Backend(format!("capture userapp dev deletion: {error}"))
         })?;
         let receipt = deletion.receipt();
@@ -787,9 +803,10 @@ impl crate::service::AppService {
             .await
         {
             Ok(()) => {
+                let completed_lifecycle = operation.execution_context().lifecycle_id;
                 operation.succeed().await?;
                 release_lock.mark_completed();
-                self.activity.forget_app(app_id);
+                self.activity.forget_lifecycle(app_id, &completed_lifecycle);
                 self.invalidate_deploy_cache().await;
                 Ok(())
             }

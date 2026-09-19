@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::db::owner::DatabaseOwner;
 use shared_types::{FlushOutcome, persistence::PersistenceOperationOutcome};
-use sqlx::{PgPool, Transaction};
+use toasty::Executor;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -46,8 +47,8 @@ pub struct PersistWriter {
 
 impl PersistWriter {
     /// 启动后台 writer task（pending：在途计数，提交后自减——sync 排空屏障用）
-    pub fn spawn(
-        pool: PgPool,
+    pub(crate) fn spawn(
+        pool: DatabaseOwner,
         rx: mpsc::UnboundedReceiver<PersistOp>,
         pending: Arc<AtomicI64>,
     ) -> Self {
@@ -127,7 +128,7 @@ impl PersistWriter {
 
 /// writer 主循环
 async fn run(
-    pool: PgPool,
+    pool: DatabaseOwner,
     mut rx: mpsc::UnboundedReceiver<PersistOp>,
     cancel: CancellationToken,
     depth: Arc<AtomicUsize>,
@@ -291,21 +292,41 @@ async fn run(
 }
 
 /// 单事务执行一批 op
-async fn execute_batch(pool: &PgPool, batch: &[PersistOp]) -> anyhow::Result<usize> {
-    let mut tx: Transaction<'_, sqlx::Postgres> = pool.begin().await?;
-    lock_ops(&mut tx, batch).await?;
-    let mut superseded = 0usize;
-    for op in batch {
-        if execute_op(&mut tx, op).await? == PersistenceOperationOutcome::Superseded {
-            superseded += 1;
-        }
-    }
-    tx.commit().await?;
+async fn execute_batch(owner: &DatabaseOwner, batch: &[PersistOp]) -> anyhow::Result<usize> {
+    let superseded = execute_registered(owner, batch.to_vec()).await?;
     info!(
         committed = batch.len() - superseded,
         superseded, "[STORAGE_PG] persistence batch resolved"
     );
     Ok(batch.len())
+}
+
+/// One accepted owner job encloses BEGIN through COMMIT/ROLLBACK. Caller
+/// cancellation drops only its reply; the transaction cannot escape its owner.
+pub(in crate::pg) async fn execute_registered(
+    owner: &DatabaseOwner,
+    ops: Vec<PersistOp>,
+) -> anyhow::Result<usize> {
+    owner.execute(move |mut db| async move {
+        let mut tx = db.transaction().await?;
+        let result = async {
+            lock_ops(&mut tx, &ops).await?;
+            let mut superseded = 0;
+            for op in &ops {
+                if execute_op(&mut tx, op).await? == PersistenceOperationOutcome::Superseded {
+                    superseded += 1;
+                }
+            }
+            Ok::<_, anyhow::Error>(superseded)
+        }.await;
+        match result {
+            Ok(value) => { tx.commit().await?; Ok(value) }
+            Err(error) => {
+                tx.rollback().await.map_err(|rollback| anyhow::anyhow!("Project transaction rollback failed: {rollback}; original error: {error}"))?;
+                Err(error)
+            }
+        }
+    }).await
 }
 
 /// 拆单定位坏 op：逐条独立事务执行。
@@ -319,7 +340,7 @@ async fn execute_batch(pool: &PgPool, batch: &[PersistOp]) -> anyhow::Result<usi
 ///
 /// cancel 时剩余 op 同样进 remaining（关停排空 flush_and_stop 会再尝试）。
 async fn isolate_poison_ops(
-    pool: &PgPool,
+    pool: &DatabaseOwner,
     batch: &[PersistOp],
     cancel: &CancellationToken,
 ) -> (usize, Vec<(PersistOp, anyhow::Error)>, Vec<PersistOp>) {
@@ -351,27 +372,45 @@ async fn isolate_poison_ops(
 /// 由持续 error 日志暴露人工介入。
 fn is_deterministic_pg_error(e: &anyhow::Error) -> bool {
     for cause in e.chain() {
-        if let Some(db_err) = cause.downcast_ref::<sqlx::Error>()
-            && let sqlx::Error::Database(db) = db_err
-            && let Some(code) = db.code()
+        if let Some(error) = cause.downcast_ref::<tokio_postgres::Error>()
+            && let Some(code) = error.code()
         {
-            return code.to_string().starts_with("23");
+            return code.code().starts_with("23");
         }
-        // 连接池/IO 类 sqlx 错误 → 瞬态
     }
     false
 }
 
 /// Acquire a stable sorted key set once per transaction, preventing lock-order cycles.
 pub(in crate::pg) async fn lock_ops(
-    tx: &mut Transaction<'_, sqlx::Postgres>,
+    tx: &mut dyn Executor,
     ops: &[PersistOp],
 ) -> anyhow::Result<()> {
     let mut keys = std::collections::BTreeSet::new();
     for op in ops {
         match op {
-            PersistOp::UpsertProject(p) => {
+            PersistOp::RegisterProject {
+                project: p,
+                request_id,
+                ..
+            } => {
+                keys.insert(format!("project-write:{request_id}"));
+                if let PersistOp::RegisterProject {
+                    container: Some(c), ..
+                } = op
+                {
+                    keys.insert(format!("container-name:{}", c.container_name));
+                    if let Some(id) = &c.container_id {
+                        keys.insert(format!("container:{id}"));
+                    }
+                }
                 keys.insert(format!("project:{}", p.project_id));
+                for id in p.sessions.keys() {
+                    keys.insert(format!("session:{id}"));
+                }
+                if let Some(name) = &p.container_name {
+                    keys.insert(format!("container-name:{name}"));
+                }
             }
             PersistOp::RemoveProject { project_id, .. }
             | PersistOp::TouchProject { project_id, .. }
@@ -412,13 +451,18 @@ pub(in crate::pg) async fn lock_ops(
             }
             PersistOp::DeleteContainerWithProjects {
                 container_id,
+                containers,
                 projects,
             } => {
                 keys.insert(format!("container:{container_id}"));
+                for (name, _) in containers {
+                    keys.insert(format!("container-name:{name}"));
+                }
                 for (id, _) in projects {
                     keys.insert(format!("project:{id}"));
                 }
             }
+            #[cfg(test)]
             PersistOp::UpsertContainer(c) => {
                 keys.insert(format!("container-name:{}", c.container_name));
                 if let Some(id) = &c.container_id {
@@ -429,9 +473,9 @@ pub(in crate::pg) async fn lock_ops(
         }
     }
     for key in keys {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 719324))")
+        toasty::sql::query("SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($1, 719324))")
             .bind(key)
-            .execute(&mut **tx)
+            .exec(tx)
             .await?;
     }
     Ok(())
@@ -440,14 +484,76 @@ pub(in crate::pg) async fn lock_ops(
 /// Single operation result: Committed and Superseded are distinct successful SQL outcomes.
 /// 事务内执行器解引用传参（官方 transaction 示例范式）。
 pub(in crate::pg) async fn execute_op(
-    tx: &mut Transaction<'_, sqlx::Postgres>,
+    tx: &mut dyn Executor,
     op: &PersistOp,
 ) -> anyhow::Result<PersistenceOperationOutcome> {
     use PersistOp as Op;
-    let db = &mut **tx;
+    let db = tx;
     let outcome = match op {
+        Op::RegisterProject {
+            request_id,
+            container,
+            project,
+        } => {
+            use crate::db::models::ProjectWriteReceipt;
+            use sha2::{Digest, Sha256};
+            anyhow::ensure!(
+                !request_id.is_empty(),
+                "Project registration requires a request identity"
+            );
+            let fingerprint = Sha256::digest(serde_json::to_vec(&(container, project))?)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if let Some(receipt) = ProjectWriteReceipt::filter_by_request_id(request_id)
+                .first()
+                .exec(db)
+                .await?
+            {
+                anyhow::ensure!(
+                    receipt.fingerprint == fingerprint,
+                    "Project registration identity was reused with different inputs"
+                );
+                return match receipt.outcome.as_str() {
+                    "committed" => Ok(PersistenceOperationOutcome::Committed),
+                    "superseded" => Ok(PersistenceOperationOutcome::Superseded),
+                    _ => anyhow::bail!("Invalid persisted project registration outcome"),
+                };
+            }
+            // Batch splitting/quarantine keeps this command indivisible. A
+            // conditional rejection rolls back only this registration, while
+            // independent commands in the batch may still commit.
+            toasty::sql::statement("SAVEPOINT project_registration")
+                .exec(db)
+                .await?;
+            let mut outcome = PersistenceOperationOutcome::Committed;
+            if let Some(container) = container {
+                outcome = repo::upsert_container(db, container).await?;
+            }
+            if outcome == PersistenceOperationOutcome::Committed {
+                outcome = repo::upsert_project(db, project).await?;
+            }
+            if outcome == PersistenceOperationOutcome::Superseded {
+                toasty::sql::statement("ROLLBACK TO SAVEPOINT project_registration")
+                    .exec(db)
+                    .await?;
+            }
+            toasty::sql::statement("RELEASE SAVEPOINT project_registration")
+                .exec(db)
+                .await?;
+            // This is outside the savepoint but inside the same transaction.
+            // Unknown COMMIT results can replay the receipt without reapplying
+            // an obsolete snapshot or reporting our own revision as a conflict.
+            toasty::sql::statement("INSERT INTO project_write_receipts(request_id,fingerprint,outcome,recorded_at_us) VALUES($1,$2,$3,$4)")
+                .bind(request_id).bind(fingerprint)
+                .bind(match outcome {
+                    PersistenceOperationOutcome::Committed => "committed",
+                    PersistenceOperationOutcome::Superseded => "superseded",
+                }).bind(chrono::Utc::now().timestamp_micros()).exec(db).await?;
+            outcome
+        }
+        #[cfg(test)]
         Op::UpsertContainer(c) => repo::upsert_container(db, c).await?,
-        Op::UpsertProject(p) => repo::upsert_project(db, p).await?,
         Op::RemoveProject {
             project_id,
             generation,
@@ -456,12 +562,22 @@ pub(in crate::pg) async fn execute_op(
             project_id,
             generation,
             container_id,
-            ..
-        } => repo::remove_project_for_container(db, project_id, generation, container_id).await?,
+            container_name,
+            container_generation,
+        } => {
+            repo::remove_project_for_container(
+                db,
+                project_id,
+                generation,
+                container_id,
+                container_name,
+                container_generation,
+            )
+            .await?
+        }
         Op::AddSession {
             project_id,
             session_id,
-            container_name,
             project_generation,
             generation,
             predecessor,
@@ -470,7 +586,6 @@ pub(in crate::pg) async fn execute_op(
                 db,
                 project_id,
                 session_id,
-                container_name.as_deref(),
                 project_generation,
                 generation,
                 predecessor.as_deref(),
@@ -488,35 +603,44 @@ pub(in crate::pg) async fn execute_op(
         } => repo::clear_sessions(db, project_id, generation, sessions).await?,
         Op::DeleteContainerWithProjects {
             container_id,
+            containers,
             projects,
-        } => repo::delete_container_with_projects(db, container_id, projects).await?,
+        } => repo::delete_container_with_projects(db, container_id, containers, projects).await?,
         Op::TouchProject {
             project_id,
+            generation,
             last_activity,
-        } => {
-            repo::touch_project(db, project_id, *last_activity).await?;
-            PersistenceOperationOutcome::Committed
-        }
+        } => repo::touch_project(db, project_id, generation, *last_activity).await?,
         Op::TouchContainer {
             container_name,
+            generation,
             last_activity,
-        } => {
-            repo::touch_container(db, container_name, *last_activity).await?;
-            PersistenceOperationOutcome::Committed
-        }
+        } => repo::touch_container(db, container_name, generation, *last_activity).await?,
         Op::TouchSession {
             session_id,
+            generation,
+            project_id,
+            project_generation,
             last_seen_at,
         } => {
-            repo::touch_session(db, session_id, *last_seen_at).await?;
-            PersistenceOperationOutcome::Committed
+            repo::touch_session(
+                db,
+                session_id,
+                generation,
+                project_id,
+                project_generation,
+                *last_seen_at,
+            )
+            .await?
         }
         Op::UpdateAgentStatus {
             project_id,
+            generation,
+            expected_revision,
             agent_status,
         } => {
-            repo::update_agent_status(db, project_id, agent_status).await?;
-            PersistenceOperationOutcome::Committed
+            repo::update_agent_status(db, project_id, generation, *expected_revision, agent_status)
+                .await?
         }
     };
     Ok(outcome)

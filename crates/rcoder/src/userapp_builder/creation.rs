@@ -26,6 +26,7 @@ pub(super) async fn ensure(
     lease: OwnedMutexGuard<()>,
     deadline: Instant,
 ) -> Result<ContainerBasicInfo> {
+    let flight = state.userapp_op_flight.guard()?;
     let app = state.userapp_store.ensure_identity(app_id).await?;
     let fingerprint = instance_fingerprint(state, app_id)?;
     let admission = state
@@ -46,7 +47,7 @@ pub(super) async fn ensure(
         UserAppAdmissionOutcome::Accepted(record) => {
             // Detach only the HTTP waiter. The worker retains its lease and
             // commits its outcome even when this request is cancelled.
-            drop(spawn_operation(state, &record, instance, lease)?);
+            drop(spawn_operation(state, &record, instance, lease, flight)?);
             record
         }
         UserAppAdmissionOutcome::Existing(record) => {
@@ -79,6 +80,7 @@ fn spawn_operation(
     record: &UserAppOperationRecord,
     instance: &str,
     lease: OwnedMutexGuard<()>,
+    flight: shared_types::FlightGuard,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let (signal, _) = watch::channel(0);
     SIGNALS
@@ -88,16 +90,20 @@ fn spawn_operation(
     let worker_state = state.clone();
     let worker_record = record.clone();
     let instance = instance.to_string();
-    let flight_gate = state.userapp_op_flight.clone();
     let worker = tokio::spawn(async move {
         // R02：在途协调任务门闸——关机时等待本任务收束后再关闭存储
-        let _flight = flight_gate.guard();
+        // Both the observer and the actual execution retain admission. A panic
+        // in the observer must not make a detached execution invisible to drain.
+        let flight = Arc::new(flight);
+        let execution_flight = flight.clone();
+        let _flight = flight;
         let executor = uuid::Uuid::new_v4().to_string();
         let owned = worker_state.clone();
         let claimed_id = executor.clone();
         let initial = worker_record.clone();
         let execution_signal = signal.clone();
         let execution = tokio::spawn(async move {
+            let _flight = execution_flight;
             let _lease = lease;
             let claimed = progress(
                 &owned.userapp_store,
@@ -353,9 +359,15 @@ pub(super) async fn resume_pending(
     // Occupy the recovery scheduler slot until the actual worker finishes,
     // including its final checkpoint and notification cleanup. Dropping this
     // observer still detaches rather than aborting the admitted operation.
-    spawn_operation(state, &current, &instance, lease)?
-        .await
-        .context("Observe recovered builder worker")??;
+    spawn_operation(
+        state,
+        &current,
+        &instance,
+        lease,
+        state.userapp_op_flight.guard()?,
+    )?
+    .await
+    .context("Observe recovered builder worker")??;
     Ok(true)
 }
 

@@ -13,6 +13,78 @@ use shared_types::{
 use std::time::Duration;
 
 impl KubernetesRuntime {
+    pub(super) async fn exec_bound_builder(
+        &self,
+        target: &BuilderControlTarget,
+        command: Vec<String>,
+    ) -> Result<container_runtime_api::ExecResult> {
+        target.validate().map_err(Error::Conflict)?;
+        let expected = target
+            .pod
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("Captured builder Pod is absent".into()))?;
+        if command.is_empty() {
+            return Err(Error::ConfigurationError(
+                "Builder exec command is empty".into(),
+            ));
+        }
+        let actual = self
+            .capture_builder_compute_with_binding(
+                &target.context,
+                target.resource_binding.as_ref(),
+                false,
+            )
+            .await?;
+        if actual.workload.as_ref().map(|v| (&v.uid, &v.name))
+            != target.workload.as_ref().map(|v| (&v.uid, &v.name))
+            || actual.pod.as_ref().map(|v| (&v.uid, &v.name))
+                != Some((&expected.uid, &expected.name))
+        {
+            return Err(Error::Conflict(
+                "Captured builder exec identity changed".into(),
+            ));
+        }
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let pod = pods
+            .get(&expected.name)
+            .await
+            .map_err(|error| api_error("Inspect builder exec Pod", error))?;
+        if pod.metadata.uid.as_deref() != Some(expected.uid.as_str())
+            || pod.metadata.deletion_timestamp.is_some()
+        {
+            return Err(Error::Conflict("Builder Pod changed before exec".into()));
+        }
+        let container = pod
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.containers.iter().find(|v| v.name == "agent"))
+            .ok_or_else(|| Error::Conflict("Builder agent container is missing".into()))?;
+        let identities: Vec<_> = container
+            .env
+            .iter()
+            .flatten()
+            .filter(|v| v.name == "RCODER_PHYSICAL_POD_UID")
+            .collect();
+        if identities.len() != 1
+            || identities[0].value.is_some()
+            || !identities[0]
+                .value_from
+                .as_ref()
+                .and_then(|v| v.field_ref.as_ref())
+                .is_some_and(|v| v.field_path == "metadata.uid")
+        {
+            return Err(Error::Conflict(
+                "Builder lacks its physical Pod identity; recreate before management writes".into(),
+            ));
+        }
+        self.exec_pod_container(
+            &expected.name,
+            "agent",
+            builder_exec_guard(&expected.uid, command),
+        )
+        .await
+    }
+
     pub(super) async fn resume_bound_builder(
         &self,
         params: &container_runtime_api::ContainerCreateParams,
@@ -1277,5 +1349,49 @@ mod tests {
         let preconditions = params.preconditions.expect("preconditions");
         assert_eq!(preconditions.uid.as_deref(), Some("original-pod"));
         assert_eq!(preconditions.resource_version.as_deref(), Some("24"));
+    }
+}
+
+fn builder_exec_guard(uid: &str, command: Vec<String>) -> Vec<String> {
+    let mut guarded = vec!["sh".into(), "-c".into(),
+        "if [ \"${RCODER_PHYSICAL_POD_UID:-}\" != \"$1\" ]; then printf '%s\\n' 'Builder physical identity changed' >&2; exit 125; fi; shift; exec \"$@\"".into(),
+        "rcoder-builder-exec".into(), uid.into()];
+    guarded.extend(command);
+    guarded
+}
+
+#[cfg(all(test, unix))]
+mod database_exec_tests {
+    use super::builder_exec_guard;
+    use std::process::Command;
+
+    #[test]
+    fn builder_exec_guard_fences_replacement_and_preserves_arguments() {
+        let literal = "spaces ' quote $HOME $(touch must_not_execute)";
+        let args = builder_exec_guard(
+            "original",
+            vec!["printf".into(), "%s".into(), literal.into()],
+        );
+        for (uid, success) in [
+            (Some("original"), true),
+            (Some("replacement"), false),
+            (None, false),
+        ] {
+            let mut command = Command::new(&args[0]);
+            command
+                .args(&args[1..])
+                .env_remove("RCODER_PHYSICAL_POD_UID");
+            if let Some(uid) = uid {
+                command.env("RCODER_PHYSICAL_POD_UID", uid);
+            }
+            let result = command.output().unwrap();
+            assert_eq!(result.status.success(), success);
+            if success {
+                assert_eq!(result.stdout, literal.as_bytes());
+            } else {
+                assert_eq!(result.status.code(), Some(125));
+                assert!(result.stdout.is_empty());
+            }
+        }
     }
 }

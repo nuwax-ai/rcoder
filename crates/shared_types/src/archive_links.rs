@@ -173,6 +173,8 @@ impl ArchiveSymlinks {
     /// Validate the graph, install links, then verify filesystem resolution.
     /// Optional dangling dependencies remain supported within the artifact root.
     pub fn install(self, root: &Path) -> Result<()> {
+        #[cfg(not(unix))]
+        let _root = root;
         if self.links.is_empty() {
             return Ok(());
         }

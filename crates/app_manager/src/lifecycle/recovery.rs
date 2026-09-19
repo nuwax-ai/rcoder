@@ -330,12 +330,23 @@ impl AppService {
             guard.finish().await?;
             return Ok(false);
         };
+        // Database password writes require the private original request and
+        // physical-target verification; generic lifecycle recovery cannot replay them.
+        if matches!(command, Command::ResetDatabasePassword { .. }) {
+            guard.finish().await?;
+            return Ok(false);
+        }
         let Some(mut operation) =
             OwnedOperation::claim_pending(self.metadata.store.clone(), current).await?
         else {
             guard.finish().await?;
             return Ok(false);
         };
+        if command == Command::PrepareProdDatabase {
+            self.execute_database_preparation(operation, guard, deadline)
+                .await?;
+            return Ok(true);
+        }
         if let Command::Deploy { restart, .. } = &command {
             let guard = std::sync::Arc::new(guard);
             // Read the bound deadline (if present) and convert wall-clock epoch ms
@@ -463,6 +474,23 @@ impl AppService {
                 ));
             }
             let context = operation.execution_context();
+            if matches!(
+                command,
+                Command::Start { traffic: false } | Command::Restart
+            ) && self
+                .runtime_configuration
+                .operation_runtime_configuration(&context)
+                .await?
+                .is_some()
+            {
+                self.replace_captured_runtime_configuration(
+                    previous.clone(),
+                    &mut operation,
+                    &guard,
+                )
+                .await?;
+                return Ok(previous);
+            }
             let target = self
                 .runtime
                 .capture_app_mutation_target(&context, previous.resource_version.as_deref())
@@ -486,7 +514,9 @@ impl AppService {
                 | Command::DeleteResources { .. }
                 | Command::DeleteApplication
                 | Command::DestroyStorage { .. }
-                | Command::ClearStorage { .. } => {
+                | Command::ClearStorage { .. }
+                | Command::ResetDatabasePassword { .. }
+                | Command::PrepareProdDatabase => {
                     return Err(AppOperationError::InvalidState(
                         "Deletion must use its captured-resource executor".into(),
                     ));
@@ -531,6 +561,8 @@ impl AppService {
                     }
                     if *traffic {
                         self.wait_for_captured_wake(&target).await?;
+                        self.observe_applied_runtime_configuration(&context, deadline)
+                            .await?;
                     }
                 }
             }
@@ -559,12 +591,15 @@ impl AppService {
                     | Command::ClearStorage { .. }
                     | Command::Update { .. }
                     | Command::StopBuilder
-                    | Command::RestartBuilder => {}
+                    | Command::RestartBuilder
+                    | Command::ResetDatabasePassword { .. }
+                    | Command::PrepareProdDatabase => {}
                     Command::Create { .. } | Command::Deploy { .. } => {
                         self.activity.mark_running(&snapshot.app_id)
                     }
                     Command::DeleteResources { .. } | Command::DeleteApplication => {
-                        self.activity.forget_app(&snapshot.app_id)
+                        self.activity
+                            .forget_lifecycle(&snapshot.app_id, &snapshot.lifecycle_id);
                     }
                     Command::Start { traffic: true } => {
                         if !self.activity.try_mark_woken(&snapshot.app_id) {

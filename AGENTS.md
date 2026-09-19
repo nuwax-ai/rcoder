@@ -176,7 +176,7 @@ make remote-k8s-logs
 
 - 使用 `tracing`，RCoder 文件日志为 `logs/` 下按天滚动的 JSON。K8s 排查须检查容器内 `/app/logs/`，不能因 `kubectl logs` 为空就认定无错误；agent_runner 日志在 stdout。
 - 远端故障优先 `make remote-k8s-logs`，结合 RCoder 文件日志、agent stdout、Pod 状态与事件。操作步骤见远端使用说明。
-- 本地性能诊断可用 `hotpath` feature；按需叠加 `hotpath-alloc`/`hotpath-mcp`。Docker dev 的启用方式检查当前 Makefile/Dockerfile；容器内仅绑定 loopback 的诊断端点需从容器内访问，不假定端口映射有效。
+- 本地性能诊断可用 `hotpath` feature，按需叠加 `hotpath-mcp`。不启用 `hotpath-alloc`，避免与 Turso 的全局分配器冲突。Docker dev 的启用方式检查当前 Makefile/Dockerfile；容器内仅绑定 loopback 的诊断端点需从容器内访问，不假定端口映射有效。
 - app-cli 版本源为 `crates/app-cli/Cargo.toml`；发布规则见 [release-app-cli.yml](.github/workflows/release-app-cli.yml)。发布时版本、提交及 `app-cli-v<VERSION>` tag 一致，核验主包及平台子包实际发布结果。npm 发布和容器镜像更新分别验证，不把源码修改称为已发布。
 
 ## 8. 交付说明

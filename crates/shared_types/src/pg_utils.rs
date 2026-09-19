@@ -42,6 +42,27 @@ pub fn pg_escape_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+// Explicit E strings remain correct even if standard_conforming_strings is off.
+fn pg_explicit_literal(value: &str) -> String {
+    format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+fn validate_password_operation(
+    context: &crate::UserAppExecutionContext,
+    scope: crate::UserAppOperationScope,
+    username: &str,
+) -> Result<&'static str, String> {
+    context.validate_identity(&context.app_id)?;
+    validate_pg_identifier(username)?;
+    match scope {
+        crate::UserAppOperationScope::Dev => Ok("dev"),
+        crate::UserAppOperationScope::Prod => Ok("prod"),
+        crate::UserAppOperationScope::Application => {
+            Err("Database writes require dev or prod scope".into())
+        }
+    }
+}
+
 /// PG 标识符转义 — 标识符里 `"` → `""` (配合双引号引用)
 pub fn pg_quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -77,10 +98,185 @@ pub fn pg_shell_quote(value: &str) -> String {
 /// 不落 trust 通道；`username` 须先过 [`validate_pg_identifier`] 白名单。
 pub fn pg_verify_credentials_cmd(username: &str, password: &str) -> String {
     format!(
-        "PGPASSWORD={} psql -h 127.0.0.1 -U {} -d postgres -tAc 'SELECT 1'",
+        "env -u PGHOSTADDR -u PGSERVICE PGPASSWORD={} PGCONNECT_TIMEOUT=5 PGOPTIONS='-c statement_timeout=5000' psql -X -w -h 127.0.0.1 -U {} -d postgres -v ON_ERROR_STOP=1 -tAc 'SELECT 1'",
         pg_shell_quote(password),
         pg_quote_ident(username)
     )
+}
+
+/// Explicit local administration channel, independent from business POSTGRES_USER.
+/// Its username must come from the captured PG initialization identity.
+#[derive(Debug, Clone)]
+pub struct PgAdministrationTarget {
+    username: String,
+    socket_directory: String,
+}
+
+impl PgAdministrationTarget {
+    pub fn new(username: String, socket_directory: String) -> Result<Self, String> {
+        validate_pg_identifier(&username)?;
+        if !socket_directory.starts_with('/') || socket_directory.contains('\0') {
+            return Err("PostgreSQL management socket must be an absolute path".into());
+        }
+        Ok(Self {
+            username,
+            socket_directory,
+        })
+    }
+
+    fn command(&self, sql: &str) -> String {
+        self.command_with_options(sql, "-c statement_timeout=5000")
+    }
+
+    fn command_with_options(&self, sql: &str, options: &str) -> String {
+        format!(
+            "env -u PGHOSTADDR -u PGSERVICE PGCONNECT_TIMEOUT=5 PGOPTIONS={} psql -X -w -h {} -U {} -d postgres -v ON_ERROR_STOP=1 -qAtc {}",
+            pg_shell_quote(options),
+            pg_shell_quote(&self.socket_directory),
+            pg_shell_quote(&self.username),
+            pg_shell_quote(sql)
+        )
+    }
+
+    pub fn ready_command(&self) -> String {
+        self.command("SELECT 1")
+    }
+
+    /// Database bootstrap is asynchronous in the image. Verify the business
+    /// database through the management socket before applying credentials.
+    /// Neither business authentication nor application readiness is required.
+    pub fn business_database_ready_command(&self) -> String {
+        format!(
+            "test -n \"${{POSTGRES_DB:-}}\" && env -u PGHOSTADDR -u PGSERVICE PGCONNECT_TIMEOUT=5 PGOPTIONS='-c statement_timeout=5000' psql -X -w -h {} -U {} -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -tAc 'SELECT 1'",
+            pg_shell_quote(&self.socket_directory),
+            pg_shell_quote(&self.username)
+        )
+    }
+
+    /// Password mutation and its immutable receipt commit in the same PG
+    /// transaction. A late duplicate observes the original writer transaction
+    /// and cannot overwrite a later operation's password.
+    pub fn password_operation_command(
+        &self,
+        context: &crate::UserAppExecutionContext,
+        scope: crate::UserAppOperationScope,
+        username: &str,
+        password: &str,
+        create: bool,
+    ) -> Result<String, String> {
+        let scope = validate_password_operation(context, scope, username)?;
+        if password.is_empty() || password.contains('\0') {
+            return Err("Password must be nonempty and contain no NUL".into());
+        }
+        let mut sql = String::from(include_str!("pg_password_receipt_schema.sql"));
+        sql.push_str("\nBEGIN ISOLATION LEVEL READ COMMITTED;\n");
+        for (key, value) in [
+            ("app_id", context.app_id.as_str()),
+            ("lifecycle_id", context.lifecycle_id.as_str()),
+            ("operation_id", context.operation_id.as_str()),
+            ("fingerprint", context.request_fingerprint.as_str()),
+            ("scope", scope),
+            ("username", username),
+            ("private_password", password),
+            ("create_role", if create { "true" } else { "false" }),
+        ] {
+            sql.push_str(&format!(
+                "SET LOCAL rcoder.{key} = {};\n",
+                pg_explicit_literal(value)
+            ));
+        }
+        sql.push_str(include_str!("pg_password_receipt.sql"));
+        sql.push_str("\nCOMMIT;");
+        // Session-local log settings prevent a failed compound statement from
+        // echoing its private input to the default PostgreSQL error log. The
+        // captured initialization administrator has permission to set these.
+        Ok(self.command_with_options(&sql,
+            "-c statement_timeout=5000 -c idle_in_transaction_session_timeout=5000 -c log_statement=none -c log_min_error_statement=panic -c log_parameter_max_length_on_error=0"))
+    }
+
+    /// A missing/failed query is not evidence of rollback. Recovery may only use
+    /// a matching committed row; the table deliberately stores no password.
+    pub fn password_operation_receipt_command(
+        &self,
+        context: &crate::UserAppExecutionContext,
+        scope: crate::UserAppOperationScope,
+        username: &str,
+    ) -> Result<String, String> {
+        let scope = validate_password_operation(context, scope, username)?;
+        Ok(self.command(&format!(
+            "SELECT 1 FROM rcoder_management.password_receipts WHERE app_id={} AND lifecycle_id={} AND scope={} AND operation_id={} AND request_fingerprint={} AND target_username={} AND outcome='committed'",
+            pg_explicit_literal(&context.app_id), pg_explicit_literal(&context.lifecycle_id),
+            pg_explicit_literal(scope), pg_explicit_literal(&context.operation_id),
+            pg_explicit_literal(&context.request_fingerprint), pg_explicit_literal(username),
+        )))
+    }
+
+    /// Fence a delayed writer using the original identity. Callers must retain
+    /// the control-plane lease until the transaction has committed and the
+    /// returned outcome has been verified. Empty output is an identity conflict.
+    pub fn password_operation_cancel_command(
+        &self,
+        context: &crate::UserAppExecutionContext,
+        scope: crate::UserAppOperationScope,
+        username: &str,
+    ) -> Result<String, String> {
+        let scope = validate_password_operation(context, scope, username)?;
+        let mut sql = String::from(include_str!("pg_password_receipt_schema.sql"));
+        sql.push_str("\nBEGIN ISOLATION LEVEL READ COMMITTED;\n");
+        for (key, value) in [
+            ("app_id", context.app_id.as_str()),
+            ("lifecycle_id", context.lifecycle_id.as_str()),
+            ("operation_id", context.operation_id.as_str()),
+            ("fingerprint", context.request_fingerprint.as_str()),
+            ("scope", scope),
+            ("username", username),
+        ] {
+            sql.push_str(&format!(
+                "SET LOCAL rcoder.{key} = {};\n",
+                pg_explicit_literal(value)
+            ));
+        }
+        sql.push_str(include_str!("pg_password_cancel.sql"));
+        sql.push_str("\nCOMMIT;");
+        Ok(self.command_with_options(
+            &sql,
+            "-c statement_timeout=5000 -c idle_in_transaction_session_timeout=5000",
+        ))
+    }
+
+    pub fn role_exists_command(&self, username: &str) -> Result<String, String> {
+        validate_pg_identifier(username)?;
+        Ok(self.command(&format!(
+            "SELECT 1 FROM pg_roles WHERE rolname='{}'",
+            pg_escape_literal(username)
+        )))
+    }
+
+    /// Provision a missing business role through the captured initialization identity.
+    /// Callers must hold the lifecycle mutation fence before dispatching this command.
+    pub fn create_role_command(&self, username: &str, password: &str) -> Result<String, String> {
+        validate_pg_identifier(username)?;
+        if password.is_empty() {
+            return Err("password must not be empty".into());
+        }
+        Ok(self.command(&format!(
+            "CREATE ROLE {} LOGIN PASSWORD '{}'",
+            pg_quote_ident(username),
+            pg_escape_literal(password)
+        )))
+    }
+
+    pub fn alter_password_command(&self, username: &str, password: &str) -> Result<String, String> {
+        validate_pg_identifier(username)?;
+        if password.is_empty() {
+            return Err("password must not be empty".into());
+        }
+        Ok(self.command(&format!(
+            "ALTER USER {} WITH PASSWORD '{}'",
+            pg_quote_ident(username),
+            pg_escape_literal(password)
+        )))
+    }
 }
 
 /// 角色存在检查命令（本地 trust 免密，`$POSTGRES_USER` 为镜像 ENV）。
@@ -180,6 +376,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn business_database_readiness_uses_captured_admin_and_business_database() {
+        let admin =
+            PgAdministrationTarget::new("initialadmin".into(), "/var/run/postgresql".into())
+                .unwrap();
+        let command = admin.business_database_ready_command();
+        assert!(command.contains("-U 'initialadmin'"));
+        assert!(command.contains("-d \"$POSTGRES_DB\""));
+        assert!(command.contains("test -n \"${POSTGRES_DB:-}\""));
+        assert!(!command.contains("$POSTGRES_USER"));
+        assert!(!command.contains("127.0.0.1"));
+    }
+
+    #[test]
     fn validate_ok() {
         assert!(validate_pg_identifier("my_db").is_ok());
         assert!(validate_pg_identifier("_hidden").is_ok());
@@ -243,8 +452,162 @@ mod tests {
     #[test]
     fn verify_cmd_forces_tcp_scram() {
         let cmd = pg_verify_credentials_cmd("app", "s3cret");
-        assert!(cmd.starts_with("PGPASSWORD='s3cret' psql -h 127.0.0.1"));
+        assert!(
+            cmd.starts_with(
+                "env -u PGHOSTADDR -u PGSERVICE PGPASSWORD='s3cret' PGCONNECT_TIMEOUT=5"
+            )
+        );
+        assert!(cmd.contains("psql -X -w -h 127.0.0.1"));
+        assert!(cmd.contains("statement_timeout=5000"));
+        assert!(cmd.contains("ON_ERROR_STOP=1"));
         assert!(cmd.contains(r#"-U "app""#));
+    }
+
+    fn receipt_context() -> crate::UserAppExecutionContext {
+        crate::UserAppExecutionContext {
+            app_id: "receiptapp".into(),
+            lifecycle_id: "receiptlife".into(),
+            operation_id: "receiptop".into(),
+            executor_id: "receiptworker".into(),
+            request_fingerprint: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn password_receipt_rejects_invalid_input_before_execution() {
+        let admin =
+            PgAdministrationTarget::new("admin".into(), "/var/run/postgresql".into()).unwrap();
+        let context = receipt_context();
+        for password in ["", "bad\0password"] {
+            assert!(
+                admin
+                    .password_operation_command(
+                        &context,
+                        crate::UserAppOperationScope::Prod,
+                        "business",
+                        password,
+                        false
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            admin
+                .password_operation_command(
+                    &context,
+                    crate::UserAppOperationScope::Application,
+                    "business",
+                    "fixture",
+                    false
+                )
+                .is_err()
+        );
+        assert!(
+            admin
+                .password_operation_receipt_command(
+                    &context,
+                    crate::UserAppOperationScope::Prod,
+                    "bad-account"
+                )
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn password_receipt_shell_preserves_sql_and_private_literal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let psql = directory.path().join("psql");
+        std::fs::write(
+            &psql,
+            "#!/bin/sh\nfor arg; do last=$arg; done\nprintf '%s' \"$last\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&psql, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let password = "fixture'\\$rcoder_password_operation$; $(touch unwanted)";
+        let admin =
+            PgAdministrationTarget::new("admin".into(), "/var/run/postgresql".into()).unwrap();
+        let command = admin
+            .password_operation_command(
+                &receipt_context(),
+                crate::UserAppOperationScope::Prod,
+                "business",
+                password,
+                false,
+            )
+            .unwrap();
+        let result = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(directory.path())
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", directory.path().display()),
+            )
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        let sql = String::from_utf8(result.stdout).unwrap();
+        assert!(sql.starts_with(include_str!("pg_password_receipt_schema.sql")));
+        assert!(sql.contains("BEGIN ISOLATION LEVEL READ COMMITTED;"));
+        assert!(sql.ends_with("COMMIT;"));
+        assert!(sql.contains(&format!(
+            "SET LOCAL rcoder.private_password = {};",
+            pg_explicit_literal(password)
+        )));
+        assert!(sql.contains(include_str!("pg_password_receipt.sql")));
+        assert!(!directory.path().join("unwanted").exists());
+        assert!(!include_str!("pg_password_receipt.sql").contains("FOR UPDATE"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_commands_unset_service_instead_of_selecting_empty_service() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("psql");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\ntest -z \"${PGSERVICE+x}\" && test -z \"${PGHOSTADDR+x}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let admin =
+            PgAdministrationTarget::new("admin".into(), "/var/run/postgresql".into()).unwrap();
+        for command in [
+            admin.ready_command(),
+            admin.business_database_ready_command(),
+            pg_verify_credentials_cmd("business", "password"),
+        ] {
+            let result = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env("POSTGRES_DB", "business")
+                .env("PGSERVICE", "unrelated-service")
+                .env("PGHOSTADDR", "192.0.2.1")
+                .status()
+                .unwrap();
+            assert!(result.success());
+        }
+    }
+
+    #[test]
+    fn explicit_admin_never_uses_business_identity() {
+        let admin =
+            PgAdministrationTarget::new("initialadmin".into(), "/var/run/postgresql".into())
+                .unwrap();
+        for command in [
+            admin.ready_command(),
+            admin.role_exists_command("business").unwrap(),
+            admin.alter_password_command("business", "pa'ss").unwrap(),
+        ] {
+            assert!(command.contains("-h '/var/run/postgresql' -U 'initialadmin'"));
+            assert!(!command.contains("$POSTGRES_USER"));
+            assert!(command.contains("-X -w"));
+        }
+        assert!(admin.alter_password_command("bad-role", "pw").is_err());
+        assert!(PgAdministrationTarget::new("admin".into(), "localhost".into()).is_err());
     }
 
     #[test]

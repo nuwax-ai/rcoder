@@ -52,6 +52,7 @@ pub async fn run(store: &dyn PreviewLifecycleStore) {
     host_reboot_reconciliation(store).await;
     failure_then_reaccept(store).await;
     lookup_views(store).await;
+    generation_bound_recovery_and_stop(store).await;
 }
 
 async fn admitted_and_publish(store: &dyn PreviewLifecycleStore) {
@@ -321,7 +322,12 @@ async fn unknown_requires_evidence(store: &dyn PreviewLifecycleStore) {
         .await
         .expect("unknown again");
     let mut with_evidence = start_input("k6", "p6", "op-6d", "inst-6d");
-    with_evidence.recover_unknown_evidence = Some("pod gone (kube verified)".into());
+    let current = store.get("k6").await.unwrap().unwrap();
+    with_evidence.recover_unknown_evidence = Some(shared_types::PreviewRecoveryEvidence {
+        instance_id: current.instance_id,
+        revision: current.revision,
+        detail: "pod gone (kube verified)".into(),
+    });
     let admitted = store
         .accept_start(with_evidence)
         .await
@@ -592,4 +598,96 @@ async fn lookup_views(store: &dyn PreviewLifecycleStore) {
         .expect("stopped");
     // 停止后端口释放（不再出现在 active 集合）。
     assert!(!store.active_ports().await.expect("ports").contains(&port));
+}
+
+/// Late completion cannot succeed merely because a newer generation is stopped;
+/// recovery evidence cannot be transplanted to a different unknown instance.
+async fn generation_bound_recovery_and_stop(store: &dyn PreviewLifecycleStore) {
+    let input = start_input(
+        "generationproof",
+        "generationproject",
+        "generationstart",
+        "generationone",
+    );
+    let AcceptStartOutcome::Admitted(first) = store.accept_start(input).await.unwrap() else {
+        panic!("fresh admission expected");
+    };
+    store
+        .mark_unknown(&first.preview_key, &first.instance_id, "host unreachable")
+        .await
+        .unwrap();
+    let mut replacement = start_input(
+        "generationproof",
+        "generationproject",
+        "generationnext",
+        "generationtwo",
+    );
+    replacement.recover_unknown_evidence = Some(shared_types::PreviewRecoveryEvidence {
+        instance_id: "wronginstance".into(),
+        revision: first.revision,
+        detail: "host gone".into(),
+    });
+    assert_conflict(&store.accept_start(replacement.clone()).await);
+    assert_eq!(
+        store
+            .get(&first.preview_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .instance_id,
+        first.instance_id
+    );
+    replacement
+        .recover_unknown_evidence
+        .as_mut()
+        .unwrap()
+        .instance_id = first.instance_id.clone();
+    let AcceptStartOutcome::Admitted(second) = store.accept_start(replacement).await.unwrap()
+    else {
+        panic!("identity-bound recovery expected");
+    };
+    // Startup publication cannot silently change the port already reserved.
+    assert_conflict(
+        &store
+            .publish_running(
+                &second.preview_key,
+                &second.operation_id,
+                second.revision,
+                123,
+                second.port.unwrap() + 1,
+                None,
+            )
+            .await,
+    );
+    let stopping = store
+        .accept_stop(&second.preview_key, "generationstop")
+        .await
+        .unwrap();
+    let replay = store
+        .accept_stop(&second.preview_key, "generationstop")
+        .await
+        .unwrap();
+    assert_eq!(stopping.revision, replay.revision);
+    assert_conflict(
+        &store
+            .accept_stop(&second.preview_key, "differentstop")
+            .await,
+    );
+    let stopped = store
+        .mark_stopped(
+            &second.preview_key,
+            &stopping.operation_id,
+            stopping.revision,
+        )
+        .await
+        .unwrap();
+    assert_conflict(
+        &store
+            .mark_stopped(&second.preview_key, "wrongstop", stopping.revision)
+            .await,
+    );
+    assert_eq!(
+        store.get(&second.preview_key).await.unwrap().unwrap(),
+        stopped
+    );
 }

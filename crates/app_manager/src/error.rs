@@ -35,6 +35,12 @@ pub enum AppOperationError {
     DevNotRunning(String),
     /// 后端运行时错误（500 ERR_BACKEND_ERROR，兜底）
     Backend(String),
+    /// Keep mutation evidence across service/HTTP error mapping. A failed TCP
+    /// verification after ALTER must not be treated as a pre-mutation rejection.
+    CredentialApplication {
+        message: String,
+        mutation: shared_types::CredentialMutationEvidence,
+    },
     /// One remote HTTP request was explicitly rejected. This does not prove a
     /// multi-request operation had no earlier effects; callers retain that boundary.
     RuntimeRejected(shared_types::RuntimeRequestRejection),
@@ -50,6 +56,33 @@ pub enum AppOperationError {
 }
 
 impl AppOperationError {
+    pub(crate) fn requires_recovery(&self) -> bool {
+        matches!(
+            self,
+            Self::CredentialApplication {
+                mutation: shared_types::CredentialMutationEvidence::Unknown
+                    | shared_types::CredentialMutationEvidence::AppliedButUnverified,
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn credential_failure(error: shared_types::AlignError, password: &str) -> Self {
+        let mutation = error.mutation_evidence();
+        let message = if password.is_empty() {
+            error.to_string()
+        } else {
+            error.to_string().replace(password, "[REDACTED]")
+        };
+        match error {
+            shared_types::AlignError::InvalidInput(_)
+            | shared_types::AlignError::RoleMissing(_) => Self::Validation(message),
+            shared_types::AlignError::Command { .. } => {
+                Self::CredentialApplication { message, mutation }
+            }
+        }
+    }
+
     /// 业务错误码（ERR_* 常量）
     pub fn code(&self) -> &'static str {
         match self {
@@ -60,6 +93,10 @@ impl AppOperationError {
             Self::Validation(_) => ERR_VALIDATION,
             Self::DevNotRunning(_) => ERR_DEV_NOT_RUNNING,
             Self::Backend(_) => ERR_BACKEND_ERROR,
+            Self::CredentialApplication { .. } if self.requires_recovery() => {
+                shared_types::ERR_RECOVERY_REQUIRED
+            }
+            Self::CredentialApplication { .. } => ERR_BACKEND_ERROR,
             Self::RuntimeRejected(rejection) if rejection.status == 409 => ERR_CONFLICT,
             Self::RuntimeRejected(_) => ERR_BACKEND_ERROR,
             Self::Conflict(_) => ERR_CONFLICT,
@@ -72,7 +109,9 @@ impl AppOperationError {
     pub fn message(&self) -> &str {
         match self {
             Self::RuntimeRejected(rejection) => &rejection.message,
-            Self::ConflictBlocked { message, .. } => message,
+            Self::ConflictBlocked { message, .. } | Self::CredentialApplication { message, .. } => {
+                message
+            }
             Self::NotFound(m)
             | Self::AlreadyExists(m)
             | Self::InvalidState(m)
@@ -114,3 +153,37 @@ impl From<shared_types::UserAppStoreError> for AppOperationError {
 
 /// app service 操作返回类型
 pub type AppResult<T> = Result<T, AppOperationError>;
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn credential_error_keeps_evidence_and_redacts_password() {
+        for mutation in [
+            shared_types::CredentialMutationEvidence::NotAttempted,
+            shared_types::CredentialMutationEvidence::Unknown,
+            shared_types::CredentialMutationEvidence::AppliedButUnverified,
+        ] {
+            let error = AppOperationError::credential_failure(
+                shared_types::AlignError::Command {
+                    stage: "credential step",
+                    detail: "failed with privatepassword".into(),
+                    mutation,
+                },
+                "privatepassword",
+            );
+            assert!(!error.to_string().contains("privatepassword"));
+            assert_eq!(
+                error.requires_recovery(),
+                mutation != shared_types::CredentialMutationEvidence::NotAttempted
+            );
+            if error.requires_recovery() {
+                assert_eq!(error.code(), shared_types::ERR_RECOVERY_REQUIRED);
+            }
+            assert!(
+                matches!(error, AppOperationError::CredentialApplication { mutation: actual, .. } if actual == mutation)
+            );
+        }
+    }
+}

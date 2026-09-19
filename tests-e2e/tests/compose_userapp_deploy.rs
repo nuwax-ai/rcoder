@@ -1008,7 +1008,7 @@ async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str
     let (s, b) = post_json(
         env,
         "/api/v1/userapp/db/prod/reset-password",
-        json!({"app_id": app, "user_id": user, "password": "e2e-reset-pw-456"}),
+        json!({"app_id": app, "request_id": "prodindependent", "username": "e2e_independent", "password": "e2e-reset-pw-456"}),
     )
     .await;
     report.assert_hard(
@@ -1055,7 +1055,7 @@ async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str
     let (s, b) = post_json(
         env,
         "/api/v1/userapp/db/prod/reset-password",
-        json!({"app_id": "ae2gho-db", "user_id": user, "password": "x"}),
+        json!({"app_id": "e2emissingdatabase", "user_id": user, "password": "x"}),
     )
     .await;
     report.assert_hard(
@@ -1064,6 +1064,196 @@ async fn verify_db_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str
             && b["code"].as_str() == Some("ERR_APP_NOT_FOUND")
             && b["message"].as_str().is_some_and(str::is_ascii),
         format!("HTTP {s}, body 截断: {}", trunc(&b, 100)),
+    );
+}
+
+/// CR10: configuration save has no runtime effect; explicit restart applies it.
+async fn verify_saved_runtime_credentials(
+    env: &Env,
+    report: &JsonlReporter,
+    app: &str,
+    user: &str,
+) {
+    let prod_name = format!("rcoder-app-{app}");
+    let dev_name = format!("rcoder-app-builder-{app}");
+    let before = docker_inspect_id(&prod_name);
+    let dev_before = docker_inspect_id(&dev_name);
+    let (_, identity) = get_json(env, &format!("/api/v1/userapp/{app}/lifecycle")).await;
+    let Some(lifecycle) = identity["data"]["lifecycle_id"].as_str() else {
+        report.assert_hard("CR10 保存前身份可用", false, "Missing lifecycle".into());
+        return;
+    };
+    let Some(uid) = before.as_deref() else {
+        report.assert_hard("CR10 保存前身份可用", false, "Missing physical UID".into());
+        return;
+    };
+    report.assert_hard(
+        "CR10 保存前身份可用",
+        dev_before.is_some(),
+        "Physical identities captured".into(),
+    );
+    let old_login = |id: &str| {
+        let output = std::process::Command::new("docker").args([
+            "exec", id, "sh", "-c",
+            "PGPASSWORD=\"$POSTGRES_PASSWORD\" psql -X -w -h 127.0.0.1 -U \"$POSTGRES_USER\" -d postgres -Atc 'SELECT 1'"
+        ]).output().unwrap();
+        output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
+    };
+    let username = std::process::Command::new("docker")
+        .args(["exec", uid, "printenv", "POSTGRES_USER"])
+        .output()
+        .unwrap();
+    let username = String::from_utf8(username.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    report.assert_hard(
+        "CR10 保存前旧凭据可用",
+        !username.is_empty() && old_login(uid),
+        "Original TCP login checked".into(),
+    );
+    let path = format!("/api/v1/userapp/{app}/prod/runtime-configuration");
+    let (_, prior) = get_json(env, &format!("{path}?lifecycle_id={lifecycle}")).await;
+    if !http_ok(&prior) {
+        report.assert_hard(
+            "CR10 保存仅产生待生效版本",
+            false,
+            "Configuration read failed".into(),
+        );
+        return;
+    }
+    let revision = if prior["data"].is_null() {
+        0
+    } else {
+        prior["data"]["revision"]
+            .as_i64()
+            .expect("configuration revision")
+    };
+    let password = "e2e_cr10_pending_password";
+    let request = json!({
+        "lifecycle_id": lifecycle, "request_id": "runtimeconfigsave",
+        "expected_revision": revision, "pg": {"username": username, "password": password}
+    });
+    let response = env
+        .http
+        .put(format!("{}{path}", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    let saved: Value = response.json().await.unwrap();
+    let version = saved["data"]["config_version"].as_i64();
+    report.assert_hard(
+        "CR10 保存仅产生待生效版本",
+        http_ok(&saved)
+            && version.is_some()
+            && saved["data"]["status"]["pending"] == true
+            && saved["data"]["status"]["applied_version"] == prior["data"]["applied_version"]
+            && !saved.to_string().contains(password),
+        "Save status checked without retaining private input".into(),
+    );
+    if !http_ok(&saved) {
+        return;
+    }
+    report.assert_hard(
+        "CR10 保存不换容器且旧密码继续可用",
+        docker_inspect_id(&prod_name) == before && old_login(uid),
+        "Original physical UID and TCP login retained".into(),
+    );
+    let new_login = |id: &str| {
+        let output = std::process::Command::new("docker")
+            .args([
+                "exec",
+                id,
+                "env",
+                &format!("PGPASSWORD={password}"),
+                "psql",
+                "-X",
+                "-w",
+                "-h",
+                "127.0.0.1",
+                "-U",
+                &username,
+                "-d",
+                "postgres",
+                "-Atc",
+                "SELECT 1",
+            ])
+            .output()
+            .unwrap();
+        output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
+    };
+    report.assert_hard(
+        "CR10 待生效密码尚不能登录",
+        !new_login(uid),
+        "Pending password rejected by TCP before explicit restart".into(),
+    );
+    let restarted = env
+        .http
+        .post(format!("{}/api/v1/userapp/{app}/restart", env.rcoder))
+        .timeout(Duration::from_secs(310))
+        .json(&json!({"lifecycle_id": lifecycle, "request_id": "runtimeconfigrestart"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    report.assert_hard(
+        "CR10 显式重启操作成功",
+        http_ok(&restarted),
+        format!(
+            "code={}, operation_id={}",
+            restarted["code"], restarted["operation_id"]
+        ),
+    );
+    if !http_ok(&restarted) {
+        return;
+    }
+    let after = docker_inspect_id(&prod_name);
+    let (_, status) = get_json(env, &format!("{path}?lifecycle_id={lifecycle}")).await;
+    report.assert_hard(
+        "CR10 换代后新凭据版本生效",
+        after.is_some()
+            && after != before
+            && status["data"]["applied_version"].as_i64() == version
+            && status["data"]["pending"] == false
+            && after.as_deref().is_some_and(new_login),
+        "New physical UID, configuration version and TCP login checked".into(),
+    );
+    report.assert_hard(
+        "CR10 prod 配置不改变 dev",
+        docker_inspect_id(&dev_name) == dev_before && dev_before.as_deref().is_some_and(old_login),
+        "Development physical UID and original TCP login retained".into(),
+    );
+    let pingora = std::env::var("E2E_PINGORA_URL").expect("E2E_PINGORA_URL");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if let Ok(response) = env
+            .http
+            .get(format!(
+                "{pingora}/api/v1/userapp/proxy/app/prod/{user}/{app}/react/"
+            ))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            && response.status().is_success()
+            && response
+                .text()
+                .await
+                .is_ok_and(|body| body.to_ascii_lowercase().contains("<!doctype html"))
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    report.assert_hard(
+        "CR10 配置换代后真实业务可访问",
+        ready,
+        "React HTML checked through production proxy".into(),
     );
 }
 
@@ -1640,15 +1830,13 @@ async fn userapp_deploy_full_chain() {
             return;
         }
         verify_prod_observability(&env, &report, &app, user).await;
-        // 运行态扩展。顺序敏感：热部署（C5）须在 db prod 改密（C3）之前——
-        // 实测抓到产品缺陷 28P01 auth_failed：reset-password 改 PG 密码后
-        // 热部署重新编排的 migrate 用旧凭据连 PG 被拒（db 管理与部署链
-        // 凭据不同步，待产品层修复；测试顺序规避并锁现状）
+        // Independent account administration must not invalidate the runtime
+        // credentials used by subsequent hot deployment and migrations.
+        verify_db_prod(&env, &report, &app, user).await;
         verify_app_files_prod(&env, &report, &app, user).await;
         verify_failed_image_update_preserves_runtime(&env, &report, &app, user).await;
         verify_hot_redeploy(&env, &report, &app, user, &release_id, &sha256).await;
-        // 轻量部署（无 release_id，独立操作身份确认）——须在 db prod 改密前（同为
-        // 重新编排链，复用热部署的凭据时序约束）
+        // 轻量部署（无 release_id，独立操作身份确认），同样在独立账号改密后验证。
         verify_url_lightweight_deploy_without_release_id(
             &env,
             &report,
@@ -1658,7 +1846,7 @@ async fn userapp_deploy_full_chain() {
             &sha256,
         )
         .await;
-        verify_db_prod(&env, &report, &app, user).await;
+        verify_saved_runtime_credentials(&env, &report, &app, user).await;
         verify_stop_and_wake(&env, &report, &app, user).await;
         cleanup_prod(&env, &report, &app, user).await;
     }

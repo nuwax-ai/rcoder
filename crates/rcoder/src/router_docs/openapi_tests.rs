@@ -243,18 +243,13 @@ fn primary_document_groups_userapp_by_business_domain() {
     );
 }
 
-/// userApp 全接口 app_id + user_id 文档可见性防回归（用户铁律：
-/// 所有 userApp 业务接口都要有 app_id 和 user_id 入参，方便获取使用）。
-///
-/// 遍历主文档全部 /api/v1/userapp op，断言两字段在 path 模板 / query 参数 /
-/// request body schema 属性任一处可见。豁免清单显式枚举（列表跨 app 查询
-/// 天然无单 app 归属——user_id 仍必须）：
-/// - `query` / `runtime` / `storage/{app_stage}/query` 三条的 app_id
+/// UserApp 接口必须显式携带 app_id；允许恢复请求将原输入放在必填
+/// original 对象内。不要求已退役的 user_id，也不把任意可选嵌套字段当作身份。
 #[test]
 fn userapp_params_app_id_visible() {
     let document = primary_document();
     let schemas = &document.components.as_ref().map(|c| c.schemas.clone());
-    /// 豁免：列表跨 app 查询类（无单 app 归属，user_id 仍必须）
+    /// 列表跨 app 查询类没有单 app 归属。
     const APP_ID_EXEMPT: [&str; 3] = [
         "/api/v1/userapp/query",
         "/api/v1/userapp/runtime",
@@ -299,6 +294,51 @@ fn userapp_params_app_id_visible() {
                         }
                     }
                 }
+            }
+            if !has_app_id
+                && let Some(schema) = op
+                    .request_body
+                    .as_ref()
+                    .and_then(|body| body.content.values().next())
+                    .and_then(|content| content.schema.as_ref())
+            {
+                fn nested_required_app_id(
+                    schema: &serde_json::Value,
+                    schemas: &serde_json::Value,
+                    depth: usize,
+                ) -> bool {
+                    if depth == 0 {
+                        return false;
+                    }
+                    if let Some(reference) = schema.get("$ref").and_then(|value| value.as_str()) {
+                        return reference
+                            .strip_prefix("#/components/schemas/")
+                            .and_then(|name| schemas.get(name))
+                            .is_some_and(|schema| {
+                                nested_required_app_id(schema, schemas, depth - 1)
+                            });
+                    }
+                    schema
+                        .get("required")
+                        .and_then(|value| value.as_array())
+                        .is_some_and(|required| {
+                            required.iter().filter_map(|key| key.as_str()).any(|key| {
+                                schema
+                                    .get("properties")
+                                    .and_then(|props| props.get(key))
+                                    .is_some_and(|child| {
+                                        key == "app_id"
+                                            || key == "appId"
+                                            || nested_required_app_id(child, schemas, depth - 1)
+                                    })
+                            })
+                        })
+                }
+                has_app_id = nested_required_app_id(
+                    &serde_json::to_value(schema).unwrap(),
+                    &serde_json::to_value(schemas).unwrap(),
+                    8,
+                );
             }
             assert!(
                 has_app_id,

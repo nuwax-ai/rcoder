@@ -1,7 +1,7 @@
 //! Durable writes and queued fallbacks execute identical, identity-fenced operations.
 //! SQL transaction order is not business order; retired identities fence delayed retries.
 use super::persist_ops::{PersistOp, structural_ops_for_insert};
-use super::writer::execute_op;
+use super::writer::execute_registered;
 use crate::adapter::container_entry_key;
 use crate::pg::PgStore;
 use shared_types::{ProjectAndContainerInfo, persistence::PersistenceWriteOutcome};
@@ -33,6 +33,9 @@ impl Drop for PendingWrite<'_> {
 
 impl PgStore {
     fn register_durable(&self, ops: Vec<PersistOp>) -> PendingWrite<'_> {
+        for op in &ops {
+            self.register_container_intent(op);
+        }
         self.pending_ops
             .fetch_add(ops.len() as i64, std::sync::atomic::Ordering::AcqRel);
         self.active_writes
@@ -57,7 +60,7 @@ impl PgStore {
                 !self.closing.load(std::sync::atomic::Ordering::Acquire),
                 "Persistence is shutting down"
             );
-            let mut info = self.prepare_info(info, &registration);
+            let mut info = self.prepare_info(info, &registration)?;
             Arc::make_mut(&mut info).add_session(session_id);
             let ops = structural_ops_for_insert(&info, session_id)?;
             self.inner
@@ -100,7 +103,6 @@ impl PgStore {
                     .get(session_id)
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("Session identity missing: {session_id}"))?,
-                container_name: info.container_info().map(|_| container_entry_key(&info)),
             };
             self.register_durable(vec![op])
         };
@@ -178,21 +180,30 @@ impl PgStore {
                 !self.closing.load(std::sync::atomic::Ordering::Acquire),
                 "Persistence is shutting down"
             );
-            let Some(removed) =
+            let Some(current) = self.inner.get(project_id) else {
+                return Ok(false);
+            };
+            let container_generation = current
+                .persistence_identity()
+                .container
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Container registration identity is missing"))?
+                .generation
+                .clone();
+            let container_name = container_entry_key(&current);
+            let Some(_removed) =
                 self.inner
                     .remove_if_container_identity(project_id, generation, container_id)
             else {
                 return Ok(false);
             };
-            let container = removed.container_info().ok_or_else(|| {
-                anyhow::anyhow!("Container identity disappeared during conditional removal")
-            })?;
             registration.insert(project_id.to_string(), generation.to_string());
             self.register_durable(vec![PersistOp::RemoveProjectForContainer {
                 project_id: project_id.to_string(),
                 generation: generation.to_string(),
                 container_id: container_id.to_string(),
-                container_name: container.container_name,
+                container_name,
+                container_generation,
             }])
         };
         match self
@@ -282,6 +293,7 @@ impl PgStore {
                     )
                 })
                 .collect();
+            let containers = self.container_deletion_targets(container_id);
             let result = self.inner.delete_container_with_projects(container_id);
             if !result.0 {
                 return result;
@@ -293,6 +305,7 @@ impl PgStore {
                 result,
                 self.register_durable(vec![PersistOp::DeleteContainerWithProjects {
                     container_id: container_id.to_string(),
+                    containers,
                     projects,
                 }]),
             )
@@ -306,22 +319,8 @@ impl PgStore {
         mut registered: PendingWrite<'_>,
         name: &str,
     ) -> PersistenceWriteOutcome {
-        let durable = async {
-            let mut tx = self.pool.begin().await?;
-            let mut superseded = 0usize;
-            if let Some(ops) = &registered.ops {
-                super::writer::lock_ops(&mut tx, ops).await?;
-                for op in ops {
-                    if execute_op(&mut tx, op).await?
-                        == shared_types::persistence::PersistenceOperationOutcome::Superseded
-                    {
-                        superseded += 1;
-                    }
-                }
-            }
-            tx.commit().await?;
-            Ok::<_, anyhow::Error>(superseded)
-        };
+        let durable =
+            execute_registered(&self.database, registered.ops.clone().unwrap_or_default());
         match tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, durable).await {
             Ok(Ok(superseded)) => {
                 if let Some(ops) = registered.ops.take() {

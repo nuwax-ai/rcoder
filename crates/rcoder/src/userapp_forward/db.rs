@@ -34,7 +34,7 @@ use crate::{AppError, HttpResult};
 ///   前缀致 404，不能用于 dev
 /// - prod：`ContainerRuntime::exec`（app_id → Userapp 运行容器，与
 ///   app_manager 的 RuntimeExecRunner 同款）
-enum ExecChannel<'a> {
+pub(super) enum ExecChannel<'a> {
     DevHttp {
         /// dev 容器 file-server 基址（`dev_file_server_addr` 产出）
         base: String,
@@ -106,7 +106,7 @@ impl shared_types::PgCommandRunner for ExecChannel<'_> {
 /// - prod：`get_app` 前置（防 ensure_running 对不存在 app 的 AlreadyRunning
 ///   幻报）→ `activity.ensure_running` 自动唤醒（single-flight scale-up，
 ///   hold-and-wait ≤ wake_timeout 默认 60s；与文件透传/pod ensure prod 同款）
-async fn resolve_exec_target<'a>(
+pub(super) async fn resolve_exec_target<'a>(
     state: &'a AppState,
     app_stage: UserappStage,
     app_id: &str,
@@ -222,7 +222,7 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）内的 PG；`prod`=运行容器（Userapp）内的 PG")
     ),
     responses(
-        (status = 200, description = "密码已设置（message 区分\"账号已创建并设置密码\"/\"密码已重置\"）", body = HttpResult<String>)
+        (status = 200, description = "HttpResult：成功表示密码已设置且 TCP 验证成功；失败检查 code/message/operation_id，非法输入 ERR_VALIDATION、身份或操作冲突 ERR_CONFLICT、后端失败 ERR_BACKEND_ERROR。未知结果保持保护", body = HttpResult<String>)
     ),
     tag = "Userapp · 双态 · 数据库",
     operation_id = "userapp_db_reset_password",
@@ -230,15 +230,17 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
     description = r#"
 设置目标容器内 PG 的账号密码，两种语义：
 
-- **不带 username**：重置 superuser（SQL CURRENT_USER 语义，绕过"需要当前密码"
-  死锁——用户忘记数据库密码时的正解）；
+- **不带 username**：目标为 PGDATA 中持久化的初始化管理员；如果也是受管理运行账号，拒绝直接改密；
 - **带 username**：账号 upsert——角色存在则 ALTER USER 改密，不存在则 CREATE ROLE
   建号后再设密。
 
 dbx 预置连接为容器内 local-pg socket 免密（与改密链解耦——改密不影响 dbx 访问）。
 prod 环境目标容器 stopped 会自动唤醒并等待 PG 就绪。
 
-**密码只出现在 exec 命令内，日志零落盘**（仅记 app_id/app_stage/username/结果）。
+运行账号（已生效、待生效、正在应用的配置，或容器当前运行账号）必须使用运行配置保存接口。
+request_id 用于原请求重放，lifecycle_id 用于拒绝已换代应用；建议调用方始终传入两者。
+受理后的协调任务不会因 HTTP 断连而取消。写结果未知时保留操作与租约，不能换 request_id 重试绕过。
+成功表示数据库已确认写入且 TCP 凭据验证通过；密码不进入操作记录或错误响应。
 "#,
 )]
 pub(crate) async fn reset_password(
@@ -248,55 +250,37 @@ pub(crate) async fn reset_password(
 ) -> Result<HttpResult<String>, AppError> {
     let app_stage = UserappStage::parse(&app_stage)
         .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
-    shared_types::validate_identifier(&body.app_id, "app_id")
-        .map_err(|e| AppError::bad_request(&e))?;
-    shared_types::validate_identifier(&body.user_id, "user_id")
-        .map_err(|e| AppError::bad_request(&e))?;
-    if body.password.is_empty() {
-        return Err(AppError::bad_request("password must not be empty"));
-    }
+    body.validate().map_err(|e| AppError::bad_request(&e))?;
 
-    let runner = resolve_exec_target(&state, app_stage, &body.app_id).await?;
+    super::db_password::execute(state, app_stage, body)
+        .await
+        .map(HttpResult::success)
+}
 
-    // username 缺省 → 重置 superuser（CURRENT_USER 语义，与 computer 版/app_manager
-    // 版同源）；指定 → 账号 upsert（存在 ALTER / 不存在 CREATE ROLE 建号）
-    let message = match body.username.as_deref() {
-        None => {
-            let cmd = shared_types::pg_utils::pg_alter_current_user_password_cmd(&body.password);
-            let r = runner.run(&cmd).await.map_err(|e| {
-                AppError::with_message(shared_types::error_codes::ERR_CONTAINER_ERROR, e)
-            })?;
-            if r.exit_code != 0 {
-                return Err(AppError::with_message(
-                    shared_types::error_codes::ERR_CONTAINER_ERROR,
-                    format!(
-                        "reset superuser password failed: exit {} {}",
-                        r.exit_code,
-                        r.stderr.trim()
-                    ),
-                ));
-            }
-            "密码已重置".to_string()
-        }
-        Some(username) => {
-            let outcome = shared_types::upsert_pg_user(&runner, username, &body.password)
-                .await
-                .map_err(|e| AppError::with_message(db_admin_error_code(&e), e.to_string()))?;
-            match outcome {
-                shared_types::DbUserUpsertOutcome::Created => "账号已创建并设置密码".to_string(),
-                shared_types::DbUserUpsertOutcome::Reset => "密码已重置".to_string(),
-            }
-        }
-    };
-    // 密码不落日志（只记 app_id/app_stage/username/结果）
-    info!(
-        "[USERAPP_DB_ADMIN] password set: app_stage={}, app_id={}, username={}, result={}",
-        app_stage.as_str(),
-        body.app_id,
-        body.username.as_deref().unwrap_or("<superuser>"),
-        message
-    );
-    Ok(HttpResult::success(message))
+/// Reconcile or cancel the original uncertain password write on its captured target.
+#[utoipa::path(
+    post,
+    path = "/api/v1/userapp/db/{app_stage}/reset-password/recover",
+    request_body = shared_types::UserappDbPasswordRecoveryRequest,
+    params(("app_stage" = String, Path, description = "Original environment: dev or prod")),
+    responses(
+        (status = 200, description = "HttpResult：成功时检查 data.state 和 lease_cleanup_pending；失败时检查 ERR_VALIDATION、ERR_CONFLICT 或 ERR_BACKEND_ERROR。身份、回执或 TCP 验证未确认时保持保护", body = HttpResult<shared_types::UserappDbPasswordRecoveryResponse>)
+    ),
+    tag = "Userapp · 双态 · 数据库",
+    operation_id = "userapp_db_recover_password",
+    summary = "确认或取消原改密操作",
+    description = "显式恢复：携带原请求（包括原 request_id 和密码）、lifecycle_id、operation_id、expected_revision。已提交的 PG 事务经 TCP 验证后记 Succeeded；未提交的请求通过事务墓碑阻止迟到写入，记 Failed。不会重新改密、启动或替换容器。旧版本无事务回执协议的操作拒绝自动恢复。终态重放返回同一结果；lease_cleanup_pending 表示仅原租约清理待完成。"
+)]
+pub(crate) async fn recover_password(
+    State(state): State<Arc<AppState>>,
+    Path(app_stage): Path<String>,
+    Json(body): Json<shared_types::UserappDbPasswordRecoveryRequest>,
+) -> Result<HttpResult<shared_types::UserappDbPasswordRecoveryResponse>, AppError> {
+    let stage = UserappStage::parse(&app_stage)
+        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    super::db_password::recover(state, stage, body)
+        .await
+        .map(HttpResult::success)
 }
 
 /// `POST /api/v1/userapp/db/{app_stage}/create-database`
@@ -308,7 +292,7 @@ pub(crate) async fn reset_password(
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）内的 PG；`prod`=运行容器（Userapp）内的 PG")
     ),
     responses(
-        (status = 200, description = "数据库已创建", body = HttpResult<String>)
+        (status = 200, description = "HttpResult：成功表示数据库已创建；非法输入 ERR_VALIDATION、已有数据库 ERR_CONFLICT、执行失败 ERR_CONTAINER_ERROR。错误通过 code/message 返回", body = HttpResult<String>)
     ),
     tag = "Userapp · 双态 · 数据库",
     operation_id = "userapp_db_create_database",
@@ -332,10 +316,7 @@ pub(crate) async fn create_database(
 ) -> Result<HttpResult<String>, AppError> {
     let app_stage = UserappStage::parse(&app_stage)
         .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
-    shared_types::validate_identifier(&body.app_id, "app_id")
-        .map_err(|e| AppError::bad_request(&e))?;
-    shared_types::validate_identifier(&body.user_id, "user_id")
-        .map_err(|e| AppError::bad_request(&e))?;
+    body.validate().map_err(|e| AppError::bad_request(&e))?;
 
     let runner = resolve_exec_target(&state, app_stage, &body.app_id).await?;
     shared_types::create_pg_database(&runner, &body.database, body.owner.as_deref())

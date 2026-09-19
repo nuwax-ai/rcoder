@@ -29,44 +29,49 @@ impl AppActivityRegistry {
     /// 使 rebuild 仅对未加载到的 app `seed_accessed`（保住历史活跃时间）。
     pub fn apply_loaded(&self, rows: Vec<ActivityRow>) {
         for row in rows {
+            let mut identities = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+            let existing = identities.get(&row.app_id);
+            if existing.is_some_and(|(id, epoch)| {
+                *epoch > row.lifecycle_epoch
+                    || (*epoch == row.lifecycle_epoch && id != &row.lifecycle_id)
+            }) {
+                continue;
+            }
+            if existing.is_some_and(|(id, _)| id != &row.lifecycle_id) {
+                self.last_accessed.remove(&row.app_id);
+            }
+            identities.insert(row.app_id.clone(), (row.lifecycle_id, row.lifecycle_epoch));
             if let Some(at) = row.last_accessed {
-                self.last_accessed.insert(row.app_id.clone(), at);
-            }
-            if row.stopped {
-                self.stopped.insert(row.app_id.clone());
-            }
-            if row.wake_blocked {
-                self.wake_blocked.insert(row.app_id.clone());
+                self.merge_accessed(&row.app_id, at);
             }
         }
     }
 
-    /// 收集脏行快照并清脏（flusher 周期调用；行值取 collect 时刻的当前状态）。
+    /// Capture generation and timestamp under the same registration lock.
     pub fn collect_dirty(&self) -> Vec<ActivityRow> {
+        let identities = self.identities.lock().unwrap_or_else(|p| p.into_inner());
         let app_ids: Vec<String> = self.dirty.iter().map(|k| k.key().clone()).collect();
-        let mut rows = Vec::with_capacity(app_ids.len());
+        let mut rows = Vec::new();
         for app_id in app_ids {
-            self.dirty.remove(&app_id);
-            // app 可能已被 forget：若内存无任何痕迹则跳过（删除走 drain_deleted）
-            let last = self.last_accessed.get(&app_id).map(|r| *r);
-            let stopped = self.stopped.contains(&app_id);
-            let wake_blocked = self.wake_blocked.contains(&app_id);
-            if last.is_none() && !stopped && !wake_blocked {
+            let Some((lifecycle_id, lifecycle_epoch)) = identities.get(&app_id) else {
                 continue;
+            };
+            self.dirty.remove(&app_id);
+            let last_accessed = self.last_accessed.get(&app_id).map(|r| *r);
+            if last_accessed.is_some() {
+                rows.push(ActivityRow {
+                    app_id,
+                    lifecycle_id: lifecycle_id.clone(),
+                    lifecycle_epoch: *lifecycle_epoch,
+                    last_accessed,
+                });
             }
-            rows.push(ActivityRow {
-                app_id,
-                last_accessed: last,
-                stopped,
-                wake_blocked,
-            });
         }
         rows
     }
 
-    /// 取出待删除的 app_id 列表（flusher 在 upsert 前先执行删除）
-    pub fn drain_deleted(&self) -> Vec<String> {
-        let ids: Vec<String> = self.deleted.iter().map(|k| k.key().clone()).collect();
+    pub fn drain_deleted(&self) -> Vec<(String, String)> {
+        let ids: Vec<_> = self.deleted.iter().map(|key| key.key().clone()).collect();
         for id in &ids {
             self.deleted.remove(id);
         }
@@ -80,21 +85,104 @@ impl AppActivityRegistry {
 }
 
 impl AppActivityRegistry {
-    /// flush 失败后重标脏（下轮 flusher 重试）。
-    ///
-    /// collect_dirty 取走标记到 flush 落库之间存在失败窗口：不重标则该批
-    /// 数据在下次变更前不会再持久化。期间若有新 touch 已自行标脏，
-    /// 幂等 insert 无害。
-    pub fn re_dirty(&self, app_ids: &[String]) {
-        for id in app_ids {
-            self.dirty.insert(id.clone());
-        }
-    }
-
     /// delete 失败后重登删除队列（forget_app 的行不被遗漏）
-    pub fn re_delete(&self, app_ids: &[String]) {
+    pub fn re_delete(&self, app_ids: &[(String, String)]) {
         for id in app_ids {
             self.deleted.insert(id.clone());
         }
+    }
+}
+
+impl AppActivityRegistry {
+    /// Caller supplies the durable root it observed. Epoch ordering prevents an
+    /// older lookup completing late from rebinding a recreated app backwards.
+    pub fn bind_lifecycle(&self, app_id: &str, lifecycle_id: &str, epoch: i64) -> bool {
+        if lifecycle_id.is_empty() || epoch < 1 {
+            return false;
+        }
+        let mut identities = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+        self.bind_lifecycle_locked(&mut identities, app_id, lifecycle_id, epoch)
+    }
+
+    pub(super) fn bind_lifecycle_locked(
+        &self,
+        identities: &mut std::collections::HashMap<String, (String, i64)>,
+        app_id: &str,
+        lifecycle_id: &str,
+        epoch: i64,
+    ) -> bool {
+        if lifecycle_id.is_empty() || epoch < 1 {
+            return false;
+        }
+        if let Some((previous, old_epoch)) = identities.get(app_id) {
+            if *old_epoch > epoch || (*old_epoch == epoch && previous != lifecycle_id) {
+                return false;
+            }
+            if previous == lifecycle_id {
+                return *old_epoch == epoch;
+            }
+            self.last_accessed.remove(app_id);
+            self.dirty.remove(app_id);
+        }
+        self.invalidate_access_identity(app_id);
+        identities.insert(app_id.to_owned(), (lifecycle_id.to_owned(), epoch));
+        true
+    }
+
+    pub fn lifecycle_identity(&self, app_id: &str) -> Option<(String, i64)> {
+        self.identities
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(app_id)
+            .cloned()
+    }
+}
+
+impl AppActivityRegistry {
+    /// Flush captured lifecycle rows. Never lose a failed batch or report an
+    /// incomplete final flush as a successful shutdown.
+    pub async fn flush_pending(&self) -> anyhow::Result<()> {
+        let Some(persistence) = self.persistence() else {
+            return Ok(());
+        };
+        let deleted = self.drain_deleted();
+        for (index, (app_id, lifecycle_id)) in deleted.iter().enumerate() {
+            if let Err(error) = persistence.delete(app_id, lifecycle_id).await {
+                self.re_delete(&deleted[index..]);
+                return Err(error.context("Failed to flush activity deletions"));
+            }
+        }
+        let rows = self.collect_dirty();
+        if !rows.is_empty()
+            && let Err(error) = persistence.flush_batch(rows.clone()).await
+        {
+            self.re_dirty_rows(&rows);
+            return Err(error.context("Failed to flush activity timestamps"));
+        }
+        Ok(())
+    }
+
+    fn re_dirty_rows(&self, rows: &[ActivityRow]) {
+        let identities = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+        for row in rows {
+            if identities.get(&row.app_id) == Some(&(row.lifecycle_id.clone(), row.lifecycle_epoch))
+            {
+                self.dirty.insert(row.app_id.clone());
+            }
+        }
+    }
+
+    pub fn merge_lifecycle_accessed(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        epoch: i64,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        let identities = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+        if identities.get(app_id) != Some(&(lifecycle_id.to_owned(), epoch)) {
+            return None;
+        }
+        Some(self.merge_accessed(app_id, at))
     }
 }

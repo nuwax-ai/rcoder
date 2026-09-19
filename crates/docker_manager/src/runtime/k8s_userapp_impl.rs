@@ -324,6 +324,13 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         self.restart_captured_target(target).await
     }
 
+    async fn start_app_management_target(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.start_captured_management_target(target).await
+    }
+
     async fn start_app_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
@@ -444,6 +451,23 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         command: Vec<String>,
     ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
         self.app_exec(app_id, command).await
+    }
+
+    async fn exec_app_configuration_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        target: &shared_types::RuntimeConfigurationTarget,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        self.app_configuration_exec(context, target, command).await
+    }
+
+    async fn capture_app_configuration_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        generation: &str,
+    ) -> ContainerRuntimeResult<shared_types::RuntimeConfigurationTarget> {
+        self.capture_configuration_pod(context, generation).await
     }
 
     async fn validate_app_prerequisites(&self) -> ContainerRuntimeResult<()> {

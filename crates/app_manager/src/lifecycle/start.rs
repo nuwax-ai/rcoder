@@ -68,24 +68,6 @@ impl AppService {
         }
         Ok(request)
     }
-
-    /// PG 对齐（start 语境：仅对结果分级，不阻断部署——与 db/align 接口同一核心）。
-    pub(super) async fn align_start_pg(
-        &self,
-        app_id: &str,
-        cred: &StartPgCredential,
-    ) -> AppResult<()> {
-        self.align_db_credentials(
-            app_id,
-            shared_types::AlignCredentialsRequest {
-                app_id: app_id.to_string(),
-                username: cred.username.clone(),
-                password: cred.password.clone(),
-            },
-        )
-        .await
-        .map(|_| ())
-    }
 }
 
 /// Validate both public entrypoints before stop, metadata writes or lease acquisition.

@@ -34,7 +34,7 @@ fn failing_workspace(root: &Path) -> std::path::PathBuf {
     .expect("ws manifest");
     std::fs::write(
         workspace.join("svc/project.manifest.toml"),
-        "schema_version = 1\n\n[project]\nservice_id = \"svc\"\nname = \"Failing\"\ntype = \"node\"\nkind = \"web\"\nenabled = true\n\n[build]\ncommand = [\"true\"]\nartifact = \"out.txt\"\n\n[run]\ncommand = [\"/bin/sh\", \"-c\", \"exit 7\"]\n\n[health]\nreadiness_path = \"/ready\"\n\n[proxy]\npath = \"/api/svc/\"\nstrip_prefix = true\n",
+        "schema_version = 1\n\n[project]\nservice_id = \"svc\"\nname = \"Failing\"\ntype = \"node\"\nkind = \"web\"\nenabled = true\n\n[build]\ncommand = [\"true\"]\nartifact = \"out.txt\"\n\n[run]\ncommand = [\"/bin/sh\", \"-c\", \"exit 7\"]\n\n[health]\nstartup_timeout_seconds = 1\nreadiness_path = \"/ready\"\n\n[proxy]\npath = \"/api/svc/\"\nstrip_prefix = true\n",
     )
     .expect("svc manifest");
     workspace
@@ -44,6 +44,14 @@ fn spawn_owner(workspace: &Path, logs: &Path, token: &str) -> (OwnedServer, Stri
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve admin");
     let address = listener.local_addr().expect("test address");
     drop(listener);
+    let pingap = logs.join("fake-pingap");
+    std::fs::write(
+        &pingap,
+        "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = -t ] && exit 0; done\nexec sleep 300\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&pingap, std::fs::Permissions::from_mode(0o755)).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_app-cli"))
         .args([
             "serve",
@@ -54,6 +62,10 @@ fn spawn_owner(workspace: &Path, logs: &Path, token: &str) -> (OwnedServer, Stri
             "--admin-addr",
             &address.to_string(),
         ])
+        .arg("--pingap-bin")
+        .arg(&pingap)
+        .env("APP_CLI_PINGAP_RUNTIME_DIR", logs.join("pingap-runtime"))
+        .env("APP_CLI_SKIP_PINGAP_CONFIRM", "1")
         .env("APP_CLI_DEPLOY_TOKEN", token)
         .env("RUST_LOG", "info")
         .stderr(Stdio::from(
@@ -65,7 +77,6 @@ fn spawn_owner(workspace: &Path, logs: &Path, token: &str) -> (OwnedServer, Stri
         .env_remove("APP_DEPLOY_GENERATION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .spawn()
         .expect("spawn owned app-cli");
     (OwnedServer(child), format!("http://{address}"))

@@ -90,9 +90,7 @@ pub fn ensure_state_root(
         .write(true)
         .open(&lock_path)
         .context("open registry lock")?;
-    lock_file
-        .try_lock()
-        .context("lock runtime state registry for first registration")?;
+    lock_registry(&lock_file, std::time::Duration::from_secs(2))?;
     // 持锁重读（并发首登都走同一段临界区）
     let registry = state_base.join("registry.json");
     let mut map = if registry.exists() {
@@ -110,6 +108,27 @@ pub fn ensure_state_root(
         map_insert(&mut map, project_root, segment.clone()),
     )?;
     Ok(state_base.join(segment))
+}
+
+// Registration is short local filesystem work. Contention is expected during
+// simultaneous first launches; retry only WouldBlock, with a bounded deadline.
+fn lock_registry(file: &std::fs::File, budget: std::time::Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    bail!("runtime state registry registration deadline exceeded");
+                }
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("lock runtime state registry for first registration");
+            }
+        }
+    }
 }
 
 fn map_insert(
@@ -167,6 +186,47 @@ pub fn registered_roots(workspace: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_registration_converges_and_contention_is_bounded() {
+        let volume = tempfile::tempdir().unwrap();
+        let workspace = volume.path().join("project");
+        std::fs::create_dir(&workspace).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
+        let workers: Vec<_> = (0..12)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let workspace = workspace.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_state_root(&workspace, None, None).unwrap()
+                })
+            })
+            .collect();
+        let roots: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(roots.iter().all(|root| root == &roots[0]));
+        let registry = volume.path().join(STATE_DIR_NAME).join("registry.json");
+        assert_eq!(read_registry(&registry).unwrap().len(), 1);
+
+        let lock_path = volume.path().join(STATE_DIR_NAME).join("registry.lock");
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        held.try_lock().unwrap();
+        let waiting = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(lock_registry(&waiting, std::time::Duration::from_millis(30)).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(held);
+        lock_registry(&waiting, std::time::Duration::from_millis(30)).unwrap();
+    }
 
     /// R09 反例：兄弟项目（无 PROJECT_ID）各自独立状态段——不再共用
     /// unknown-app 互相阻塞。

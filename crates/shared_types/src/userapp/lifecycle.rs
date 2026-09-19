@@ -317,6 +317,9 @@ pub enum UserAppOperationKind {
     DestroyProdStorage,
     ClearDevStorage,
     ClearProdStorage,
+    ResetDevDatabasePassword,
+    ResetProdDatabasePassword,
+    PrepareProdDatabase,
     DeleteApplication,
 }
 impl UserAppOperationKind {
@@ -334,7 +337,8 @@ impl UserAppOperationKind {
             | Self::StopBuilder
             | Self::RestartBuilder
             | Self::DestroyDevStorage
-            | Self::ClearDevStorage => UserAppOperationScope::Dev,
+            | Self::ClearDevStorage
+            | Self::ResetDevDatabasePassword => UserAppOperationScope::Dev,
             Self::Create
             | Self::Update
             | Self::StartDeployment
@@ -346,7 +350,9 @@ impl UserAppOperationKind {
             | Self::HotDeploy
             | Self::DeleteCompute
             | Self::DestroyProdStorage
-            | Self::ClearProdStorage => UserAppOperationScope::Prod,
+            | Self::ClearProdStorage
+            | Self::ResetProdDatabasePassword
+            | Self::PrepareProdDatabase => UserAppOperationScope::Prod,
             Self::PurgeResources | Self::DeleteApplication => UserAppOperationScope::Application,
         }
     }
@@ -384,7 +390,8 @@ pub struct UserAppOperationRecord {
     /// Operation kind: EnsureBuilder, AdoptBuilder, StopBuilder, RestartBuilder,
     /// Create, StartDeployment, RestartDeployment, Update, Start, Restart, Stop,
     /// SetRecyclePolicy, HotDeploy, DeleteCompute, PurgeResources, DestroyDevStorage,
-    /// DestroyProdStorage, ClearDevStorage, ClearProdStorage, or DeleteApplication.
+    /// DestroyProdStorage, ClearDevStorage, ClearProdStorage, ResetDevDatabasePassword,
+    /// ResetProdDatabasePassword, PrepareProdDatabase, or DeleteApplication.
     pub kind: UserAppOperationKind,
     /// Resource scope this operation occupies. Server-derived from the kind at
     /// admission; never client-supplied, and never defaulted when decoding
@@ -482,7 +489,8 @@ pub struct UserAppAdmission {
     /// Operation kind: EnsureBuilder, AdoptBuilder, StopBuilder, RestartBuilder,
     /// Create, StartDeployment, RestartDeployment, Update, Start, Restart, Stop,
     /// SetRecyclePolicy, HotDeploy, DeleteCompute, PurgeResources, DestroyDevStorage,
-    /// DestroyProdStorage, ClearDevStorage, ClearProdStorage, or DeleteApplication.
+    /// DestroyProdStorage, ClearDevStorage, ClearProdStorage, ResetDevDatabasePassword,
+    /// ResetProdDatabasePassword, PrepareProdDatabase, or DeleteApplication.
     pub kind: UserAppOperationKind,
 }
 
@@ -506,6 +514,8 @@ pub enum UserAppControlCommand {
         traffic: bool,
     },
     Restart,
+    /// Start only the captured database management container; not business Ready.
+    PrepareProdDatabase,
     Stop {
         wake_on_traffic: bool,
     },
@@ -519,6 +529,13 @@ pub enum UserAppControlCommand {
     DeleteApplication,
     DestroyStorage {
         production: bool,
+    },
+    /// Explicit database administration. Passwords are never part of the public
+    /// command. The executor must retain the original private request and may
+    /// not automatically replay an uncertain remote write.
+    ResetDatabasePassword {
+        production: bool,
+        username: String,
     },
     /// Clear only the selected storage scope; replay is permitted before claim.
     ClearStorage {
@@ -537,6 +554,7 @@ impl UserAppControlCommand {
             Self::Update { .. } => UserAppOperationKind::Update,
             Self::Start { .. } => UserAppOperationKind::Start,
             Self::Restart => UserAppOperationKind::Restart,
+            Self::PrepareProdDatabase => UserAppOperationKind::PrepareProdDatabase,
             Self::Stop { .. } => UserAppOperationKind::Stop,
             Self::SetRecyclePolicy { .. } => UserAppOperationKind::SetRecyclePolicy,
             Self::DeleteResources { purge: false, .. } => UserAppOperationKind::DeleteCompute,
@@ -544,6 +562,12 @@ impl UserAppControlCommand {
             Self::DeleteApplication => UserAppOperationKind::DeleteApplication,
             Self::DestroyStorage { production: false } => UserAppOperationKind::DestroyDevStorage,
             Self::DestroyStorage { production: true } => UserAppOperationKind::DestroyProdStorage,
+            Self::ResetDatabasePassword {
+                production: false, ..
+            } => UserAppOperationKind::ResetDevDatabasePassword,
+            Self::ResetDatabasePassword {
+                production: true, ..
+            } => UserAppOperationKind::ResetProdDatabasePassword,
             Self::ClearStorage { production: false } => UserAppOperationKind::ClearDevStorage,
             Self::ClearStorage { production: true } => UserAppOperationKind::ClearProdStorage,
         }
@@ -652,7 +676,7 @@ pub struct UserAppOperationBlocker {
     /// RestartBuilder, Create, StartDeployment, RestartDeployment, Update, Start,
     /// Restart, Stop, SetRecyclePolicy, HotDeploy, DeleteCompute, PurgeResources,
     /// DestroyDevStorage, DestroyProdStorage, ClearDevStorage, ClearProdStorage,
-    /// or DeleteApplication.
+    /// ResetDevDatabasePassword, ResetProdDatabasePassword, PrepareProdDatabase, or DeleteApplication.
     pub kind: UserAppOperationKind,
     /// Blocking operation state: Pending, Running, WaitingRetry,
     /// RecoveryRequired, Succeeded, or Failed.
@@ -761,12 +785,6 @@ pub trait UserAppLifecycleStore: Send + Sync {
         after_app_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<UserAppLifecycleRecord>, UserAppStoreError>;
-    /// Import legacy metadata only when no lifecycle exists. Never overwrites a
-    /// current lifecycle (including a tombstone), even after a repeated startup.
-    async fn import_application(
-        &self,
-        legacy: &crate::AppMetadataRecord,
-    ) -> Result<UserAppLifecycleRecord, UserAppStoreError>;
     /// Validates lifecycle identity and metadata revision, then applies the
     /// patch atomically without clobbering concurrent changes.
     async fn patch_metadata(
@@ -786,6 +804,22 @@ pub trait UserAppLifecycleStore: Send + Sync {
         request: &UserAppAdmission,
         input: Option<&UserAppExecutionInput>,
     ) -> Result<UserAppAdmissionOutcome, UserAppStoreError>;
+    /// Deployment credentials join the same admission transaction. First use
+    /// seeds a versioned configuration; an existing configuration must match.
+    /// The caller's private input and request fingerprint must cover these credentials.
+    async fn admit_with_configuration(
+        &self,
+        request: &UserAppAdmission,
+        input: &UserAppExecutionInput,
+        pg: Option<&crate::StartPgCredential>,
+    ) -> Result<UserAppAdmissionOutcome, UserAppStoreError> {
+        if pg.is_some() {
+            return Err(UserAppStoreError::InvalidOperation(
+                "Atomic deployment configuration admission is unsupported".into(),
+            ));
+        }
+        self.admit_with_input(request, Some(input)).await
+    }
     /// Available only to the executor that owns the current lifecycle operation;
     /// never exposed through public HTTP surfaces.
     async fn read_execution_input(
@@ -841,6 +875,20 @@ pub trait UserAppLifecycleStore: Send + Sync {
         &self,
         snapshot: &UserAppOperationRecord,
     ) -> Result<UserAppOperationRecord, UserAppStoreError>;
+    /// Finalize an uncertain password operation after identity-bound remote
+    /// receipt verification (and TCP verification for Verified). Exact snapshot
+    /// CAS, original lease and physical target are mandatory. Does not release
+    /// the physical lease; terminal receipt cleanup remains separately fenced.
+    async fn finalize_password_recovery(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &crate::DatabasePasswordEvidence,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let _ = (snapshot, evidence);
+        Err(UserAppStoreError::InvalidOperation(
+            "Password recovery is unsupported by this store".into(),
+        ))
+    }
     /// Validates app/lifecycle/operation/executor/revision and the correct scope
     /// slot, then advances record and slot atomically; only ever releases the
     /// current operation's own slot.
@@ -904,7 +952,8 @@ pub struct UserAppOperationView {
     /// Operation kind: EnsureBuilder, AdoptBuilder, StopBuilder, RestartBuilder,
     /// Create, StartDeployment, RestartDeployment, Update, Start, Restart, Stop,
     /// SetRecyclePolicy, HotDeploy, DeleteCompute, PurgeResources, DestroyDevStorage,
-    /// DestroyProdStorage, ClearDevStorage, ClearProdStorage, or DeleteApplication.
+    /// DestroyProdStorage, ClearDevStorage, ClearProdStorage, ResetDevDatabasePassword,
+    /// ResetProdDatabasePassword, PrepareProdDatabase, or DeleteApplication.
     pub kind: UserAppOperationKind,
     /// Resource scope this operation occupies: Dev (builder), Prod (production
     /// runtime) or Application (both environments plus shared authority).

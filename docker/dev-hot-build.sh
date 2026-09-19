@@ -54,9 +54,8 @@ export RUSTFLAGS="--cfg tokio_unstable"
 export CARGO_TARGET_DIR="$SRC_DIR/target-unstable"
 cargo build --release --bin rcoder --features hotpath,dial9
 BIN_SRC="$CARGO_TARGET_DIR/release/rcoder"
-# start-rcoder.sh 优先用 /app/src/target/release/rcoder——必须清掉另一模式的
-# 旧产物，否则新二进制（/app/bin/rcoder）被跳过（8/19 陈旧产物事故同款坑）
-rm -f "$SRC_DIR/target/release/rcoder"
+# target directories are compilation caches only; start-rcoder.sh always uses
+# the container-local executable atomically installed below.
 
 # 4. 替换运行 binary
 if [ ! -f "$BIN_SRC" ]; then

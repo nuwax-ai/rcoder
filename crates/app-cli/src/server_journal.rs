@@ -16,6 +16,8 @@ pub(crate) enum Boundary {
     Switching,
     Activated,
     Active,
+    /// Artifact and shutdown confirmed; migrations confirmed, only startup failed.
+    StartupFailed,
     Failed,
 }
 
@@ -225,6 +227,7 @@ mod tests {
     use shared_types::{AppCliDeployPhase, app_cli_deploy::AppDeploymentStage};
     fn receipt(boundary: Boundary) -> Receipt {
         let request = DeployRequest {
+            runtime_operation_id: None,
             url: "http://artifact/b".into(),
             release_id: "b".into(),
             sha256: None,
@@ -251,6 +254,18 @@ mod tests {
             }),
         }
     }
+    #[test]
+    fn confirmed_startup_failure_keeps_artifact_but_legacy_failure_stays_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&dir.path().join("code")).unwrap();
+        journal.write(receipt(Boundary::StartupFailed)).unwrap();
+        let saved = journal.resume("generation-a").unwrap().unwrap();
+        assert_eq!(saved.boundary, Boundary::StartupFailed);
+        assert_eq!(saved.active.unwrap().artifact_release_id, "manifest-b");
+        journal.write(receipt(Boundary::Failed)).unwrap();
+        assert!(journal.resume("generation-a").is_err());
+    }
+
     #[test]
     fn durable_hot_receipt_overrides_same_generation_stale_seed() {
         let dir = tempfile::tempdir().unwrap();

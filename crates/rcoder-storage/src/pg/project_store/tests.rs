@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore};
-use sqlx::postgres::PgPoolOptions;
 
 use crate::config::PostgresConfig;
 use crate::pg::test_support::{DSN_ENV, test_dsn, uuid_suffix, wait_for};
@@ -54,15 +53,7 @@ async fn roundtrip_persists_and_reload_recovers() {
         eprintln!("[skip] {DSN_ENV} not set");
         return;
     };
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&dsn)
-        .await
-        .expect("test pool");
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("migrate");
+    let pool = crate::pg::test_support::database(&dsn).await;
 
     let project_id = format!("pgtest-{}", uuid_suffix());
     let session_id = format!("sess-{project_id}");
@@ -99,7 +90,7 @@ async fn roundtrip_persists_and_reload_recovers() {
                 &pool,
                 &format!(
                     "SELECT count(*) FROM projects WHERE project_id='{project_id}' \
-                     AND agent_status IS NOT NULL AND container_name IS NOT NULL"
+                     AND agent_status_json IS NOT NULL AND container_name IS NOT NULL"
                 ),
                 1
             )
@@ -171,15 +162,7 @@ async fn clear_sessions_and_delete_container() {
         eprintln!("[skip] {DSN_ENV} not set");
         return;
     };
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&dsn)
-        .await
-        .expect("test pool");
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("migrate");
+    let pool = crate::pg::test_support::database(&dsn).await;
     let project_id = format!("pgdel-{}", uuid_suffix());
 
     let (store, _rx) = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
@@ -249,7 +232,7 @@ async fn cross_replica_sync_visibility_and_removal() {
         PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
             .await
             .expect("connect B");
-    let pool_b = store_b.pool().clone();
+    let pool_b = store_b.database.clone();
 
     // 副本 A 连接并写入
     let project_id = format!("xrep-{}", uuid_suffix());
@@ -269,6 +252,11 @@ async fn cross_replica_sync_visibility_and_removal() {
     // B 尚未同步 → 不可见（模拟 ClientIP affinity 下的另一副本）
     assert!(store_b.get_by_session_id(&session_id).is_none());
 
+    // insert_with_session is write-behind; B's drain barrier cannot wait for A.
+    assert!(
+        store_a.wait_drained(Duration::from_secs(5)).await,
+        "A insert drain"
+    );
     // B 同步 → 可见（session resolve + 容器反查）
     sync::sync_once(&store_b, store_b.inner(), &pool_b)
         .await
@@ -326,7 +314,7 @@ async fn cross_replica_sync_is_idempotent_for_own_entries() {
     )
     .await
     .expect("connect");
-    let pool = store.pool().clone();
+    let pool = store.database.clone();
     let project_id = format!("synco-{}", uuid_suffix());
     let session_id = format!("sess-{project_id}");
     store
@@ -367,19 +355,14 @@ async fn leader_election_mutual_exclusion() {
         eprintln!("[skip] {DSN_ENV} not set");
         return;
     };
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&dsn)
-        .await
-        .expect("pool");
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("migrate");
+    let _pool = crate::pg::test_support::database(&dsn).await;
 
     let (tx_a, _) = tokio::sync::broadcast::channel(1);
     let a = Arc::new(crate::pg::leader_selection::PgLeaderElection::spawn(
-        pool.clone(),
+        PostgresConfig {
+            url: Some(dsn.clone()),
+            ..Default::default()
+        },
         tx_a.subscribe(),
     ));
     // 等抢锁窗口（poll 5s → 最多等 12s）
@@ -398,7 +381,10 @@ async fn leader_election_mutual_exclusion() {
 
     let (tx_b, _) = tokio::sync::broadcast::channel(1);
     let b = Arc::new(crate::pg::leader_selection::PgLeaderElection::spawn(
-        pool.clone(),
+        PostgresConfig {
+            url: Some(dsn.clone()),
+            ..Default::default()
+        },
         tx_b.subscribe(),
     ));
     // B 观察一个完整窗口：不得成为 leader
@@ -418,15 +404,7 @@ async fn durable_commit_returns_after_pg_visible() {
         eprintln!("[skip] {DSN_ENV} not set");
         return;
     };
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&dsn)
-        .await
-        .expect("test pool");
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("migrate");
+    let pool = crate::pg::test_support::database(&dsn).await;
 
     let project_id = format!("pgdur-{}", uuid_suffix());
     let session_id = format!("sess-{project_id}");
@@ -444,10 +422,13 @@ async fn durable_commit_returns_after_pg_visible() {
         .expect("durable insert");
 
     // 另起连接直查（不经本 store 的内存/队列）——durable 返回即已提交
-    let fetched = super::repo::fetch_project_by_session(&pool, &session_id)
-        .await
-        .expect("durable query ok")
-        .expect("durable committed row must be visible immediately");
+    let lookup_session = session_id.clone();
+    let fetched = super::database::read(&pool, move |tx| {
+        Box::pin(async move { super::repo::fetch_project_by_session(tx, &lookup_session).await })
+    })
+    .await
+    .expect("durable query ok")
+    .expect("durable committed row must be visible immediately");
     assert_eq!(fetched.0.project_id, project_id);
 
     // 内存镜像同步可见
@@ -461,15 +442,7 @@ async fn session_miss_backfills_from_pg_into_mirror() {
         eprintln!("[skip] {DSN_ENV} not set");
         return;
     };
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&dsn)
-        .await
-        .expect("test pool");
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("migrate");
+    let _pool = crate::pg::test_support::database(&dsn).await;
 
     let project_id = format!("pgfetch-{}", uuid_suffix());
     let session_id = format!("sess-{project_id}");
@@ -520,10 +493,7 @@ async fn session_miss_backfills_from_pg_into_mirror() {
 async fn shutdown_failure_is_not_success_on_first_or_repeated_call() {
     use super::{persist_ops::PersistOp, writer::PersistWriter};
     use std::sync::atomic::AtomicI64;
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
-        .expect("lazy pool");
-    pool.close().await;
+    let pool = crate::db::owner::DatabaseOwner::closed_for_test();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tx.send(PersistOp::RemoveProject {
         project_id: "shutdown-contract".into(),

@@ -11,7 +11,257 @@ use tracing::{debug, warn};
 use super::KubernetesRuntime;
 use super::k8s_deployment::{APP_CONTAINER_NAME, RCODER_LABEL_PREFIX};
 
+fn exec_exit_code(
+    status: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>,
+) -> ContainerRuntimeResult<i64> {
+    let unknown = || {
+        ContainerRuntimeError::ContainerExecError(
+            "Exec completion was not confirmed; command outcome is unknown".into(),
+        )
+    };
+    let status = status.ok_or_else(unknown)?;
+    if status.status.as_deref() == Some("Success") && status.reason.is_none() {
+        return Ok(0);
+    }
+    if status.status.as_deref() == Some("Failure")
+        && status.reason.as_deref() == Some("NonZeroExitCode")
+        && let Some(details) = status.details
+        && let Some(causes) = details.causes
+    {
+        let codes: Vec<_> = causes
+            .into_iter()
+            .filter(|cause| cause.reason.as_deref() == Some("ExitCode"))
+            .map(|cause| cause.message)
+            .collect();
+        if codes.len() == 1
+            && let Some(message) = &codes[0]
+            && let Ok(code) = message.parse::<i64>()
+            && (1..=255).contains(&code)
+        {
+            return Ok(code);
+        }
+    }
+    Err(unknown())
+}
+
+async fn read_exec_output<R: tokio::io::AsyncRead + Unpin>(
+    stream: Option<R>,
+) -> ContainerRuntimeResult<String> {
+    use tokio::io::AsyncReadExt;
+    let mut stream = stream.ok_or_else(|| {
+        ContainerRuntimeError::ContainerExecError(
+            "Requested exec output stream is missing; command outcome is unknown".into(),
+        )
+    })?;
+    let mut output = String::new();
+    stream.read_to_string(&mut output).await.map_err(|error| {
+        ContainerRuntimeError::ContainerExecError(format!(
+            "Read exec output: {error}; command outcome is unknown"
+        ))
+    })?;
+    Ok(output)
+}
+
 impl KubernetesRuntime {
+    pub(super) async fn capture_configuration_pod(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        generation: &str,
+    ) -> ContainerRuntimeResult<shared_types::RuntimeConfigurationTarget> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if generation.is_empty() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Configuration generation is required".into(),
+            ));
+        }
+        // Confirm the current lifecycle owns the workload even when no Pod is
+        // running. Absence must not mask a foreign/replaced workload.
+        self.capture_owned_app_identity(context, None).await?;
+        let pods = self
+            .pods_api()
+            .list(
+                &ListParams::default()
+                    .labels(&format!("{RCODER_LABEL_PREFIX}/app-id={}", context.app_id)),
+            )
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("Capture configuration Pod: {error}"))
+            })?;
+        let candidates: Vec<_> = pods
+            .items
+            .into_iter()
+            .filter(|pod| {
+                pod.metadata.deletion_timestamp.is_none()
+                    && pod
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|values| {
+                            values.get(super::k8s_app_helpers::DEPLOY_TEMPLATE_TOKEN_ANNOTATION)
+                        })
+                        .is_some_and(|token| token == generation)
+                    && pod
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.container_statuses.as_ref())
+                        .is_some_and(|statuses| {
+                            statuses.iter().any(|status| {
+                                status.name == APP_CONTAINER_NAME
+                                    && status
+                                        .state
+                                        .as_ref()
+                                        .is_some_and(|state| state.running.is_some())
+                            })
+                        })
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Err(ContainerRuntimeError::ManagementNotRunning);
+        }
+        if candidates.len() != 1 {
+            return Err(ContainerRuntimeError::Conflict(
+                "Expected one running management container for the captured deployment operation"
+                    .into(),
+            ));
+        }
+        let target = shared_types::RuntimeConfigurationTarget {
+            physical_uid: candidates[0]
+                .metadata
+                .uid
+                .clone()
+                .filter(|uid| !uid.is_empty())
+                .ok_or_else(|| {
+                    ContainerRuntimeError::Conflict("Configuration Pod UID is missing".into())
+                })?,
+            deployment_generation: generation.into(),
+        };
+        // Read-only in-container check validates both the owner chain and the
+        // frozen generation. It deliberately does not wait for business Ready.
+        let probe = self
+            .app_configuration_exec(context, &target, vec!["true".into()])
+            .await?;
+        if probe.exit_code != 0 {
+            return Err(ContainerRuntimeError::Conflict(
+                "Configuration Pod generation check failed".into(),
+            ));
+        }
+        Ok(target)
+    }
+
+    /// Management exec may run before business Ready. The API resolves exec by
+    /// name, so check the captured UID again inside the destination container.
+    pub(super) async fn app_configuration_exec(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        target: &shared_types::RuntimeConfigurationTarget,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        if target.physical_uid.is_empty()
+            || target.deployment_generation.is_empty()
+            || command.is_empty()
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Configuration exec requires a physical UID, generation and command".into(),
+            ));
+        }
+        let deployment = self.capture_owned_app_identity(context, None).await?;
+        let pods = self
+            .pods_api()
+            .list(
+                &ListParams::default()
+                    .labels(&format!("{RCODER_LABEL_PREFIX}/app-id={}", context.app_id)),
+            )
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("List configuration target: {error}"))
+            })?;
+        let pod = pods
+            .items
+            .into_iter()
+            .find(|pod| pod.metadata.uid.as_deref() == Some(target.physical_uid.as_str()))
+            .ok_or_else(|| {
+                ContainerRuntimeError::Conflict(
+                    "Captured configuration Pod no longer exists".into(),
+                )
+            })?;
+        let conflict = || {
+            ContainerRuntimeError::Conflict(
+                "Configuration Pod ownership or management identity changed".into(),
+            )
+        };
+        let pod_name = pod.metadata.name.as_deref().ok_or_else(conflict)?;
+        if pod.metadata.deletion_timestamp.is_some() {
+            return Err(conflict());
+        }
+        let owner = pod
+            .metadata
+            .owner_references
+            .as_ref()
+            .and_then(|owners| {
+                owners.iter().find(|owner| {
+                    owner.controller == Some(true)
+                        && owner.kind == "ReplicaSet"
+                        && owner.api_version == "apps/v1"
+                })
+            })
+            .ok_or_else(conflict)?;
+        let replicasets: Api<k8s_openapi::api::apps::v1::ReplicaSet> =
+            Api::namespaced(self.client.clone(), &self.namespace);
+        let replicaset = replicasets.get(&owner.name).await.map_err(|error| {
+            ContainerRuntimeError::K8sError(format!("Read configuration Pod owner: {error}"))
+        })?;
+        if replicaset.metadata.uid.as_deref() != Some(owner.uid.as_str())
+            || !replicaset
+                .metadata
+                .owner_references
+                .as_ref()
+                .is_some_and(|owners| {
+                    owners.iter().any(|owner| {
+                        owner.controller == Some(true)
+                            && owner.kind == "Deployment"
+                            && owner.api_version == "apps/v1"
+                            && owner.name == deployment.name
+                            && owner.uid == deployment.uid
+                    })
+                })
+        {
+            return Err(conflict());
+        }
+        let container = pod
+            .spec
+            .as_ref()
+            .and_then(|spec| {
+                spec.containers
+                    .iter()
+                    .find(|container| container.name == APP_CONTAINER_NAME)
+            })
+            .ok_or_else(conflict)?;
+        let uid_fields: Vec<_> = container
+            .env
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|env| env.name == "RCODER_PHYSICAL_POD_UID")
+            .collect();
+        if uid_fields.len() != 1
+            || uid_fields[0].value.is_some()
+            || !uid_fields[0]
+                .value_from
+                .as_ref()
+                .and_then(|source| source.field_ref.as_ref())
+                .is_some_and(|field| field.field_path == "metadata.uid")
+        {
+            return Err(conflict());
+        }
+        // Positional arguments preserve arbitrary command arguments without shell
+        // interpolation. Frozen Pod environment checks also cover a replacement
+        // occurring after the API reads above and before the exec connection.
+        self.exec_app_pod(pod_name, configuration_guard_command(target, command))
+            .await
+    }
+
     /// 拉取 app Pod 的 stdout/stderr 日志（最近 `tail` 行）。
     /// 按 `rcoder.io/app-id` label 定位 Pod；`timestamps=true` 时 K8s 在每行前缀 RFC3339。
     /// K8s logs API 合并 stdout/stderr 返回，stream 统一记 "stdout"。
@@ -64,37 +314,12 @@ impl KubernetesRuntime {
 
     /// 在 app Pod 内执行命令(kubectl exec 等价):Pod 定位(label)→ Api::exec → AttachedProcess。
     /// 用于数据库管理(reset-password / create-database 跑 psql)。
-    /// stdout/stderr 借 &mut self 顺序读(各自独立 DuplexStream,顺序不丢);exit code 从 Status 取。
+    /// 并发排空 stdout/stderr，只有明确的远端 Status 才能确认退出码。
     pub async fn app_exec(
         &self,
         app_id: &str,
         command: Vec<String>,
     ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
-        use kube::api::AttachParams;
-        use tokio::io::AsyncReadExt;
-
-        // 解析 exec 退出码:Status.reason == "NonZeroExitCode" 且 details.causes[] 有
-        // reason == "ExitCode"(message 是退出码字符串)。无 NonZeroExitCode → 0。
-        // 不用 status.code(那是 HTTP 状态码,非命令退出码)。
-        fn parse_exit(status: k8s_openapi::apimachinery::pkg::apis::meta::v1::Status) -> i64 {
-            // Status.reason == "NonZeroExitCode" 且 details.causes[] 有 reason == "ExitCode"
-            // (其 message 是退出码字符串)。无 NonZeroExitCode → 0。
-            if status.reason.as_deref() == Some("NonZeroExitCode")
-                && let Some(details) = &status.details
-                && let Some(causes) = &details.causes
-            {
-                for cause in causes {
-                    if cause.reason.as_deref() == Some("ExitCode")
-                        && let Some(msg) = &cause.message
-                        && let Ok(code) = msg.parse::<i64>()
-                    {
-                        return code;
-                    }
-                }
-            }
-            0
-        }
-
         // 1. Pod 定位(复用 app_logs 的 label selector)
         let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
         let pods = self
@@ -114,9 +339,28 @@ impl KubernetesRuntime {
             )));
         };
 
-        // 2. exec(指定 app 容器,stdout+stderr,非 tty;调大 buffer 防 psql 输出反压)
+        self.exec_app_pod(&pod_name, command).await
+    }
+
+    async fn exec_app_pod(
+        &self,
+        pod_name: &str,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        self.exec_pod_container(pod_name, APP_CONTAINER_NAME, command)
+            .await
+    }
+
+    pub(super) async fn exec_pod_container(
+        &self,
+        pod_name: &str,
+        container_name: &str,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        use kube::api::AttachParams;
+        // Drain both streams even for management commands with large diagnostics.
         let ap = AttachParams::default()
-            .container(APP_CONTAINER_NAME)
+            .container(container_name)
             .stdout(true)
             .stderr(true)
             .stdin(false)
@@ -125,39 +369,28 @@ impl KubernetesRuntime {
             .max_stderr_buf_size(1024 * 1024);
         let mut attached = self
             .pods_api()
-            .exec(&pod_name, command, &ap)
+            .exec(pod_name, command, &ap)
             .await
             .map_err(|e| ContainerRuntimeError::ContainerExecError(format!("exec: {e}")))?;
 
-        // 3. take_status 先移出(免后续 stdout/stderr 借用 &mut self 冲突)
-        let mut status_fut = attached.take_status();
-
-        // 4. 顺序读 stdout → stderr(借 &mut self,不能并发;各自独立 DuplexStream,顺序不丢)
-        let mut stdout = String::new();
-        if let Some(mut r) = attached.stdout()
-            && let Err(e) = r.read_to_string(&mut stdout).await
-        {
-            warn!("[K8S-APP] exec drain stdout 失败 (输出可能不完整): {e}");
-        }
-        let mut stderr = String::new();
-        if let Some(mut r) = attached.stderr()
-            && let Err(e) = r.read_to_string(&mut stderr).await
-        {
-            warn!("[K8S-APP] exec drain stderr 失败 (输出可能不完整): {e}");
-        }
-        // readers 出作用域 drop(join 前 drop,防 DuplexStream 满死锁)
-
-        // 5. exit code
-        let exit_code = if let Some(fut) = status_fut.as_mut() {
-            fut.await.map(parse_exit).unwrap_or(0)
-        } else {
-            0
-        };
-
-        // 6. join 收尾(reader 已 drop)
-        if let Err(e) = attached.join().await {
-            tracing::debug!("[K8S-APP] exec join: {e}");
-        }
+        // Readers returned by kube 4.2 own their pipes. Drain both concurrently:
+        // sequential reads can deadlock when the remote process fills stderr
+        // while we are waiting for stdout EOF.
+        let status = attached.take_status();
+        let stdout = attached.stdout();
+        let stderr = attached.stderr();
+        let (stdout, stderr, exit_code) =
+            tokio::try_join!(read_exec_output(stdout), read_exec_output(stderr), async {
+                match status {
+                    Some(status) => exec_exit_code(status.await),
+                    None => exec_exit_code(None),
+                }
+            })?;
+        attached.join().await.map_err(|error| {
+            ContainerRuntimeError::ContainerExecError(format!(
+                "Join exec transport: {error}; command outcome is unknown"
+            ))
+        })?;
 
         Ok(container_runtime_api::ExecResult {
             stdout,
@@ -437,6 +670,19 @@ impl KubernetesRuntime {
     }
 }
 
+fn configuration_guard_command(
+    target: &shared_types::RuntimeConfigurationTarget,
+    command: Vec<String>,
+) -> Vec<String> {
+    let mut guarded = vec![
+        "sh".into(), "-c".into(),
+        "if [ \"${RCODER_PHYSICAL_POD_UID:-}\" != \"$1\" ] || [ \"${APP_DEPLOY_GENERATION_ID:-}\" != \"$2\" ]; then printf '%s\\n' 'Configuration target identity changed' >&2; exit 125; fi; shift 2; exec \"$@\"".into(),
+        "rcoder-configuration-exec".into(), target.physical_uid.clone(), target.deployment_generation.clone(),
+    ];
+    guarded.extend(command);
+    guarded
+}
+
 /// 事件关联对象名是否属于该 app（等值白名单匹配，纯函数）。
 fn event_belongs_to_app(name: &str, object_names: &std::collections::HashSet<String>) -> bool {
     object_names.contains(name)
@@ -482,5 +728,104 @@ mod app_event_tests {
         }
         // builder pod（STS 名形态）也不在 app 名单内
         assert!(!event_belongs_to_app("rcoder-app-builder-3-0", &names));
+    }
+}
+
+#[cfg(test)]
+mod exec_completion_tests {
+    use super::*;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_pod_cannot_execute_a_captured_credential_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("executed");
+        let target = shared_types::RuntimeConfigurationTarget {
+            physical_uid: "original-pod".into(),
+            deployment_generation: "generation-one".into(),
+        };
+        // The payload intentionally contains shell metacharacters. It remains a
+        // positional argument and is evaluated only by the intended inner shell.
+        let arguments = configuration_guard_command(
+            &target,
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "printf '%s' \"$2\" > \"$1\"".into(),
+                "payload".into(),
+                marker.to_string_lossy().into_owned(),
+                "literal;$(false)".into(),
+            ],
+        );
+        for (uid, generation, allowed) in [
+            ("replacement-pod", "generation-one", false),
+            ("original-pod", "generation-two", false),
+            ("", "generation-one", false),
+            ("original-pod", "generation-one", true),
+        ] {
+            let output = std::process::Command::new(&arguments[0])
+                .args(&arguments[1..])
+                .env("RCODER_PHYSICAL_POD_UID", uid)
+                .env("APP_DEPLOY_GENERATION_ID", generation)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), allowed);
+            assert_eq!(marker.exists(), allowed);
+            if allowed {
+                assert_eq!(
+                    std::fs::read_to_string(&marker).unwrap(),
+                    "literal;$(false)"
+                );
+            } else {
+                assert_eq!(output.status.code(), Some(125));
+            }
+        }
+    }
+
+    #[test]
+    fn only_explicit_exec_status_confirms_exit() {
+        let success: Status =
+            serde_json::from_value(serde_json::json!({"status":"Success"})).unwrap();
+        assert_eq!(exec_exit_code(Some(success)).unwrap(), 0);
+        let nonzero: Status = serde_json::from_value(serde_json::json!({
+            "status":"Failure", "reason":"NonZeroExitCode",
+            "details":{"causes":[{"reason":"ExitCode","message":"137"}]}
+        }))
+        .unwrap();
+        assert_eq!(exec_exit_code(Some(nonzero)).unwrap(), 137);
+        assert!(exec_exit_code(None).is_err());
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"status":"Failure","reason":"InternalError"}),
+            serde_json::json!({"status":"Failure","reason":"NonZeroExitCode"}),
+            serde_json::json!({"status":"Success","reason":"NonZeroExitCode"}),
+            serde_json::json!({"status":"Failure","reason":"NonZeroExitCode",
+                "details":{"causes":[{"reason":"ExitCode"},{"reason":"ExitCode","message":"1"}]}}),
+        ] {
+            assert!(exec_exit_code(Some(serde_json::from_value(value).unwrap())).is_err());
+        }
+        for code in ["0", "-1", "256", "invalid"] {
+            let status = serde_json::from_value(serde_json::json!({
+                "status":"Failure", "reason":"NonZeroExitCode",
+                "details":{"causes":[{"reason":"ExitCode","message":code}]}
+            }))
+            .unwrap();
+            assert!(exec_exit_code(Some(status)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_truncated_output_cannot_report_success() {
+        assert!(
+            read_exec_output::<std::io::Cursor<Vec<u8>>>(None)
+                .await
+                .is_err()
+        );
+        assert!(
+            read_exec_output(Some(std::io::Cursor::new(vec![0xff])))
+                .await
+                .is_err()
+        );
     }
 }

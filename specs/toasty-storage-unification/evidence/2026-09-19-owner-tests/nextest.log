@@ -1,0 +1,98 @@
+   Compiling shared_types v0.1.3 (/Users/soddy/Documents/git-workspace/rcoder/crates/shared_types)
+   Compiling rcoder-toasty-t0 v0.1.0 (/Users/soddy/Documents/git-workspace/rcoder/tools/toasty-probe)
+warning: struct `OpenedUserAppStore` is never constructed
+  --> src/../../../crates/rcoder-storage/src/userapp_lifecycle/control.rs:21:12
+   |
+21 | pub struct OpenedUserAppStore {
+   |            ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `closed_for_test` is never used
+  --> src/../../../crates/rcoder-storage/src/db/owner.rs:42:19
+   |
+38 | impl DatabaseOwner {
+   | ------------------ associated function in this implementation
+...
+42 |     pub(crate) fn closed_for_test() -> Self {
+   |                   ^^^^^^^^^^^^^^^
+
+warning: `rcoder-toasty-t0` (bin "rcoder-toasty-t0" test) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.04s
+────────────
+ Nextest run ID ef810245-5ca9-44e3-98a2-c85ce4cd96e2 with nextest profile: default
+    Starting 72 tests across 1 binary (3 tests skipped)
+        PASS [   0.023s] ( 1/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 config::tests::missing_fields_listed_in_error
+        PASS [   0.024s] ( 2/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 config::tests::debug_never_exposes_password_or_dsn
+        PASS [   0.027s] ( 3/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 config::tests::dsn_from_discrete_fields
+        PASS [   0.027s] ( 4/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 config::tests::dsn_escapes_password_special_chars
+        PASS [   0.029s] ( 5/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 config::tests::dsn_url_overrides_discrete_fields
+        PASS [   0.029s] ( 6/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 config::tests::password_skipped_in_serialize_output
+        PASS [   0.029s] ( 7/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 config::tests::no_password_yields_username_only_auth
+        PASS [   0.033s] ( 8/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 config::tests::describe_hides_password
+        PASS [   0.033s] ( 9/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 config::tests::connection_uri_encodes_identity_and_brackets_ipv6
+        PASS [   0.035s] (10/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 config::tests::pool_defaults_and_min_capped_by_max
+        PASS [   0.036s] (11/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::failed_initialization_joins_before_returning_error
+        PASS [   0.031s] (12/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::old_database_bytes_are_never_opened_by_downgraded_engine
+        PASS [   0.046s] (13/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::full_queue_rejects_without_waiting_for_the_running_transaction
+        PASS [   0.052s] (14/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::policy_enforces_foreign_keys_on_fresh_connection
+        PASS [   0.058s] (15/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::old_unversioned_database_is_preserved_and_rejected
+        PASS [   0.060s] (16/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::last_owner_drop_drains_accepted_job_and_releases_resource
+        PASS [   0.056s] (17/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::shutdown_waiter_cancellation_keeps_lock_until_jobs_and_runtime_end
+        PASS [   0.056s] (18/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::task_panic_is_unknown_and_every_shutdown_reports_failure
+        PASS [   0.091s] (19/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::abandoned_transaction_rolls_back_before_connection_reuse
+        PASS [   0.067s] (20/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::cancelled_caller_does_not_cancel_admitted_transaction
+        PASS [   0.032s] (21/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 policy_driver::tests::failed_begin_commit_rollback_and_savepoint_are_quarantined
+        PASS [   0.043s] (22/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::worker_thread_panic_is_replayed_to_all_shutdown_waiters
+        PASS [   0.088s] (23/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::normalized_schema_roundtrip_and_identity_constraints
+        PASS [   0.058s] (24/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::toasty_turso_rows_affected_preserves_cas_and_conflict_semantics
+        PASS [   0.087s] (25/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 preview_lifecycle::in_process_preview_uses_the_same_identity_contract
+        PASS [   0.337s] (26/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 owner_tests::baseline_is_repeatable_and_rejects_checksum_future_and_catalog_drift
+        PASS [   0.275s] (27/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::concurrency_tests::stale_slot_snapshot_cannot_release_another_operation
+        PASS [   0.250s] (28/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::local_tests::broken_slot_is_rejected_instead_of_reported_idle
+        PASS [   0.296s] (29/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::configuration_tests::hot_deploy_with_pending_credentials_is_rejected_before_admission_commits
+        PASS [   0.301s] (30/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::activity_tests::turso_activity_is_monotonic_and_lifecycle_bound
+        PASS [   0.299s] (31/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::configuration_tests::concurrent_saves_at_one_revision_have_one_winner
+        PASS [   0.290s] (32/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::configuration_tests::save_after_admission_does_not_turn_original_absence_into_new_credentials
+        PASS [   0.322s] (33/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::configuration_tests::save_is_configuration_only_and_replay_cannot_promote_an_old_version
+        PASS [   0.399s] (34/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::configuration_tests::configuration_and_capture_are_isolated_between_dev_and_prod
+        PASS [   0.439s] (35/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::configuration_tests::capture_is_atomic_and_concurrent_save_does_not_change_execution_or_applied_result
+        PASS [   0.229s] (36/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::local_tests::failed_admission_rolls_back_every_row_and_same_request_can_retry
+        PASS [   0.446s] (37/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::configuration_tests::unknown_pg_write_cannot_be_finalized_or_rebound_and_business_failure_keeps_applied_version
+        PASS [   0.237s] (38/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::local_tests::operation_id_collision_does_not_leave_an_unrelated_application
+        PASS [   0.256s] (39/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::local_tests::turso_store_exclusive_directory_rejects_second_instance
+        PASS [   0.277s] (40/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::local_tests::turso_legacy_sqlite_directory_is_rejected
+        PASS [   0.232s] (41/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::another_executor_cannot_advance_a_running_operation
+        PASS [   0.288s] (42/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::local_tests::turso_store_basic_lifecycle
+        PASS [   0.512s] (43/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::local_tests::damaged_recovery_rolls_back_prior_rows_and_releases_directory_lock
+        PASS [   0.349s] (44/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::local_tests::turso_existing_new_db_with_legacy_sibling_opens
+        PASS [   0.275s] (45/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::closed_database_returns_error_not_absence_or_admission
+        PASS [   0.319s] (46/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::concurrent_ensure_joins_but_different_intent_does_not
+        PASS [   0.301s] (47/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::joined_request_identity_remains_idempotent_after_completion
+        PASS [   0.505s] (48/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::common::local_tests::turso_restart_quarantines_only_interrupted_claims_without_replaying
+        PASS [   0.248s] (49/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::rejected_admission_does_not_leave_new_identity
+        PASS [   0.327s] (50/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::metadata_cas_preserves_unmentioned_fields_and_noop_revision
+        PASS [   0.298s] (51/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::repeated_registration_is_an_idempotent_noop
+        PASS [   0.322s] (52/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::old_progress_cannot_overwrite_new_checkpoint
+        PASS [   0.403s] (53/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::deletion_and_recreation_fence_late_unqualified_requests
+        PASS [   0.341s] (54/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::metadata_changes_commit_with_admission_and_never_before_rejection
+        PASS [   0.350s] (55/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::recreation_and_control_cannot_reuse_the_same_request_identity
+        PASS [   0.294s] (56/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::request_replay_returns_original_and_rejects_changed_parameters
+        PASS [   0.373s] (57/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::restart_keeps_operation_and_uncertainty_blocks_new_creators
+        PASS [   0.284s] (58/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_control_command_persistence_contract
+        PASS [   0.284s] (59/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_control_snapshot_contract
+        PASS [   0.379s] (60/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::scoped_terminals_clear_own_slots_and_blocker_is_structured
+        PASS [   0.347s] (61/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::storage_deletion_does_not_end_the_application_lifecycle
+        PASS [   0.306s] (62/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_dev_uncertainty_does_not_block_prod
+        PASS [   0.326s] (63/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_instance_directory_is_exclusive_and_restart_preserves_data
+        PASS [   0.307s] (64/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_operation_deadline_contract
+        PASS [   0.339s] (65/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_deletion_success_requires_evidence
+        PASS [   0.341s] (66/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_cross_scope_admission_is_independent
+        PASS [   0.282s] (67/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_paginated_recovery_and_identity
+        PASS [   0.239s] (68/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_policy_commit_contract
+        PASS [   0.579s] (69/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_configuration_policy_contract
+        PASS [   0.264s] (70/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_physical_binding_contract
+        PASS [   0.252s] (71/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_private_execution_input_contract
+        PASS [   0.646s] (72/72) rcoder-toasty-t0::bin/rcoder-toasty-t0 userapp_lifecycle::tests::turso_operation_lease_contract
+────────────
+     Summary [   1.676s] 72 tests run: 72 passed, 3 skipped

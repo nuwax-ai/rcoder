@@ -28,6 +28,7 @@ struct BuildTask {
     argv: Vec<String>,
     artifact: String,
     is_static: bool,
+    requires_artifact: bool,
 }
 
 /// 执行本地编译。
@@ -105,6 +106,7 @@ pub fn run(
             argv,
             artifact: project.manifest.build.artifact.clone(),
             is_static: project.manifest.project.r#type == ProjectType::Static,
+            requires_artifact: !dev || project.manifest.devbuild.is_none(),
         });
     }
 
@@ -135,7 +137,12 @@ pub fn run(
             continue;
         }
         let artifact_path = task.project_path.join(&task.artifact);
-        if !artifact_present(&artifact_path, task.is_static) {
+        if !task.requires_artifact {
+            println!(
+                "✅ [{}] dev preparation completed（{:.1}s）",
+                task.service_id, elapsed
+            );
+        } else if !artifact_present(&artifact_path, task.is_static) {
             println!(
                 "❌ [{}] artifact 缺失或为空: {}",
                 task.service_id,
@@ -255,6 +262,55 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
+    #[test]
+    fn dev_preparation_does_not_require_production_artifact() {
+        let tmp = tempfile::tempdir().expect("workspace");
+        fs::write(
+            tmp.path().join("workspace.manifest.toml"),
+            "schema_version = 1\n[workspace]\nname = 'frontend'\n",
+        )
+        .expect("workspace manifest");
+        let project = tmp.path().join("frontend");
+        fs::create_dir(&project).expect("project");
+        fs::write(
+            project.join("project.manifest.toml"),
+            r#"
+schema_version = 1
+[project]
+service_id = "frontend"
+name = "Frontend"
+type = "static"
+[build]
+command = ["rustc", "--version"]
+artifact = "dist"
+[devbuild]
+command = ["rustc", "--version"]
+[devrun]
+command = ["rustc", "--version"]
+[proxy]
+path = "/frontend"
+strip_prefix = true
+"#,
+        )
+        .expect("project manifest");
+        run(tmp.path(), true, None, None).expect("dev preparation needs no dist");
+        assert!(!project.join("dist").exists());
+        assert!(
+            run(tmp.path(), false, None, None).is_err(),
+            "production must still require dist"
+        );
+        let manifest =
+            fs::read_to_string(project.join("project.manifest.toml")).expect("read manifest");
+        let manifest = manifest
+            .replace("[devbuild]\ncommand = [\"rustc\", \"--version\"]\n", "")
+            .replace("[devrun]\ncommand = [\"rustc\", \"--version\"]\n", "");
+        fs::write(project.join("project.manifest.toml"), manifest).expect("fallback manifest");
+        assert!(
+            run(tmp.path(), true, None, None).is_err(),
+            "dev fallback build must still require dist"
+        );
+    }
+
     /// fixture：zip 服务（含可执行 server + 子目录文件）+ static 服务（dist/）+
     /// 根 release.lock.toml + index.html → 组装后布局与可执行位完整。
     #[test]
@@ -313,6 +369,7 @@ mod tests {
                 argv: vec!["true".into()],
                 artifact: "artifact.zip".into(),
                 is_static: false,
+                requires_artifact: true,
             },
             BuildTask {
                 service_id: "frontend".into(),
@@ -321,6 +378,7 @@ mod tests {
                 argv: vec!["true".into()],
                 artifact: "dist".into(),
                 is_static: true,
+                requires_artifact: true,
             },
         ];
 

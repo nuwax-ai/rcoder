@@ -6,6 +6,41 @@ use shared_types::{
 };
 
 impl DockerRuntime {
+    pub(super) async fn exec_bound_builder(
+        &self,
+        target: &BuilderControlTarget,
+        command: Vec<String>,
+    ) -> Result<container_runtime_api::ExecResult> {
+        target.validate().map_err(Error::Conflict)?;
+        let resource = target
+            .workload
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("Captured builder is absent".into()))?;
+        if resource.kind != shared_types::AppResourceKind::Container || command.is_empty() {
+            return Err(Error::ConfigurationError(
+                "Builder exec requires a container and command".into(),
+            ));
+        }
+        let client = self.inner.get_docker_client();
+        let before = client
+            .inspect_container(&resource.uid, None)
+            .await
+            .map_err(|error| Error::DockerError(format!("Inspect builder exec target: {error}")))?;
+        let actual = control_identity_with_binding(
+            &before,
+            &resource.name,
+            &target.context,
+            target.resource_binding.as_ref(),
+            false,
+        )?;
+        if actual != *resource {
+            return Err(Error::Conflict(
+                "Captured builder exec identity changed".into(),
+            ));
+        }
+        super::docker_app_runtime::execute_container_command(client, &resource.uid, command).await
+    }
+
     /// Resume the captured adopted container; Docker labels/config are immutable.
     /// This never runs create, removes storage, or restarts an already-running app.
     pub(super) async fn resume_bound_builder(

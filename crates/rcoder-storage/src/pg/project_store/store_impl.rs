@@ -83,7 +83,7 @@ impl ProjectStore for PgStore {
             !self.closing.load(std::sync::atomic::Ordering::Acquire),
             "Persistence is shutting down"
         );
-        let info = self.prepare_info(info, &registration);
+        let info = self.prepare_info(info, &registration)?;
         self.inner.insert(project_id, Arc::clone(&info))?;
         self.persist_upsert(&info)
     }
@@ -99,7 +99,7 @@ impl ProjectStore for PgStore {
             !self.closing.load(std::sync::atomic::Ordering::Acquire),
             "Persistence is shutting down"
         );
-        let mut info = self.prepare_info(info, &registration);
+        let mut info = self.prepare_info(info, &registration)?;
         if let Some(sid) = session_id {
             Arc::make_mut(&mut info).add_session(sid);
         }
@@ -145,7 +145,6 @@ impl ProjectStore for PgStore {
                 .get(session_id)
                 .cloned(),
             generation,
-            container_name: info.container_info().map(|_| container_entry_key(&info)),
         });
         true
     }
@@ -221,23 +220,22 @@ impl ProjectStore for PgStore {
             return None;
         }
         let result = self.inner.update_activity(project_id);
-        if let Some(at) = result {
+        if let (Some(at), Some(info)) = (result, self.inner.get(project_id)) {
             self.enqueue_throttled(
                 &format!("p:{project_id}"),
                 PersistOp::TouchProject {
                     project_id: project_id.to_string(),
+                    generation: info.persistence_identity().generation.clone(),
                     last_activity: at,
                 },
             );
-            if let Some(name) = self
-                .inner
-                .get(project_id)
-                .map(|info| container_entry_key(&info))
-            {
+            if let Some(container) = &info.persistence_identity().container {
+                let name = container_entry_key(&info);
                 self.enqueue_throttled(
                     &format!("c:{name}"),
                     PersistOp::TouchContainer {
                         container_name: name,
+                        generation: container.generation.clone(),
                         last_activity: at,
                     },
                 );
@@ -251,18 +249,31 @@ impl ProjectStore for PgStore {
         if self.closing.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
-        if self.inner.update_session_activity(session_id) {
-            self.enqueue_throttled(
-                &format!("s:{session_id}"),
-                PersistOp::TouchSession {
-                    session_id: session_id.to_string(),
-                    last_seen_at: chrono::Utc::now(),
-                },
-            );
-            true
-        } else {
-            false
+        let Some(info) = self.inner.get_by_session_id(session_id) else {
+            return false;
+        };
+        let Some(generation) = info
+            .persistence_identity()
+            .sessions
+            .get(session_id)
+            .cloned()
+        else {
+            return false;
+        };
+        if !self.inner.update_session_activity(session_id) {
+            return false;
         }
+        self.enqueue_throttled(
+            &format!("s:{session_id}"),
+            PersistOp::TouchSession {
+                session_id: session_id.to_string(),
+                generation,
+                project_id: info.project_id().to_string(),
+                project_generation: info.persistence_identity().generation.clone(),
+                last_seen_at: chrono::Utc::now(),
+            },
+        );
+        true
     }
 
     fn update_agent_status(&self, project_id: &str, status: i32, message: &str) -> bool {
@@ -270,6 +281,9 @@ impl ProjectStore for PgStore {
         if self.closing.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
+        let Some(info) = self.inner.get(project_id) else {
+            return false;
+        };
         if self.inner.update_agent_status(project_id, status, message) {
             let agent_status = code_to_agent_status(status, message);
             match serde_json::to_value(agent_status) {
@@ -278,6 +292,8 @@ impl ProjectStore for PgStore {
                         &format!("a:{project_id}"),
                         PersistOp::UpdateAgentStatus {
                             project_id: project_id.to_string(),
+                            generation: info.persistence_identity().generation.clone(),
+                            expected_revision: info.persistence_identity().revision,
                             agent_status: value,
                         },
                     );
@@ -313,6 +329,7 @@ impl ProjectStore for PgStore {
                 )
             })
             .collect();
+        let containers = self.container_deletion_targets(container_id);
         let result = self.inner.delete_container_with_projects(container_id);
         if result.0 {
             for (id, generation) in &projects {
@@ -320,6 +337,7 @@ impl ProjectStore for PgStore {
             }
             self.enqueue_structural(PersistOp::DeleteContainerWithProjects {
                 container_id: container_id.to_string(),
+                containers,
                 projects,
             });
         }

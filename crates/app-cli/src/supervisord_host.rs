@@ -103,8 +103,10 @@ impl SupervisordHost {
         runtime_status: &RuntimeStatusService,
         run_migrations: bool,
         dev_profile: bool,
+        pg: Option<shared_types::StartPgCredential>,
     ) -> Result<()> {
         runtime_status.set_ready(false);
+        let pg = supervisor::resolve_run_pg(pg)?;
         supervisor::validate_runtime_compatibility(release)?;
         let specs: Vec<ServiceSpec> = release
             .services
@@ -112,10 +114,17 @@ impl SupervisordHost {
             .filter(|service| service.enabled)
             .cloned()
             .collect();
+        // Validate every service before migrations or process launch can mutate runtime.
+        for spec in &specs {
+            supervisor::service_environment(spec, pg.as_ref())?;
+        }
+
         if specs.is_empty() {
             bail!("release has no enabled services");
         }
-        supervisor::wait_for_pg().await?;
+        if supervisor::workspace_needs_pg(&specs) {
+            supervisor::wait_for_pg(pg.as_ref()).await?;
+        }
 
         // 记录旧代组（换代码前——reload 后按新集合差量摘除）
         let previous_groups = self.dynamic_groups().await?;
@@ -124,8 +133,7 @@ impl SupervisordHost {
         for spec in &specs {
             if run_migrations && !spec.run.migrate.is_empty() {
                 info!("🛠️  migrate {}", spec.service_id);
-                let cwd = args.workspace.join(&spec.dir);
-                supervisor::run_transient(&spec.run.migrate, &cwd)
+                supervisor::run_migration_with_receipt(spec, release, &args.workspace, pg.as_ref())
                     .await
                     .with_context(|| format!("migrate {}", spec.service_id))?;
             }
@@ -180,7 +188,7 @@ impl SupervisordHost {
                 // R08：profile 来自**本次操作**（请求 Source 形态）显式传递，
                 // env 仅作操作未指定时的兜底
                 argv: crate::supervisor::effective_run_argv(spec, dev_profile).to_vec(),
-                env: spec.env.clone().into_iter().collect(),
+                env: supervisor::service_environment(spec, pg.as_ref())?,
                 port: Some(spec.port),
             };
             svc_spec

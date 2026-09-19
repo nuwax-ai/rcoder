@@ -158,6 +158,23 @@ pub fn create_router(
             )
             .merge(file_server_routes_with_intercept(&state, merged_fs)),
     ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.userapp_op_flight.clone(),
+        admission_during_shutdown,
+    ))
+}
+
+async fn admission_during_shutdown(
+    axum::extract::State(gate): axum::extract::State<Arc<shared_types::OperationFlightGate>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(_flight) = gate.guard() else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"code": "ERR_SHUTTING_DOWN", "message": "Service is shutting down"}))).into_response();
+    };
+    next.run(request).await
 }
 
 #[cfg(test)]

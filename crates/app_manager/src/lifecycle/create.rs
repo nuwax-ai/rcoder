@@ -92,6 +92,8 @@ impl AppService {
         // The first registration is read-only with respect to runtime resources.
         // Metadata changes and operation admission below commit atomically.
         let identity = self.metadata.store.ensure_identity(app_id).await?;
+        self.activity
+            .bind_lifecycle(app_id, &identity.lifecycle_id, identity.lifecycle_epoch);
         if self
             .replay_control(
                 app_id,

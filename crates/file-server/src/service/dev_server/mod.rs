@@ -104,6 +104,19 @@ impl DevServerManager {
                     .ok()
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| "unknown-app".to_string());
+                if let Err(error) =
+                    owner_client::verify_project_identity(&identity, workspace, &app_id)
+                {
+                    if let Ok(mut map) = lock(&self.owner_expectations) {
+                        map.insert(
+                            project_id.to_string(),
+                            OwnerExpectation::ObservationFailed {
+                                reason: format!("owner identity rejected: {error:#}"),
+                            },
+                        );
+                    }
+                    return;
+                }
                 match owner_client::find_owner_token(workspace, &app_id) {
                     None => OwnerExpectation::ObservationFailed {
                         reason: "owner is running but its runtime API credentials are unavailable"

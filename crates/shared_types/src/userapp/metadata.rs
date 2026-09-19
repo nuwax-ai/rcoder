@@ -27,28 +27,3 @@ pub struct AppMetadataRecord {
     /// 业务首次创建时间（upsert 不更新；集群 creationTimestamp 同 app_id 重建会刷新，此列不会）
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
-
-/// 应用元数据的持久化契约（跨 crate：app_manager 产出/消费，rcoder-storage 实现）
-///
-/// create_app/update_app 成功后 upsert（低频同步写，失败仅 warn 不阻塞业务）；
-/// 启动时全量加载回内存缓存供 query_apps join。实现须保证幂等（upsert）。
-#[async_trait::async_trait]
-pub trait AppMetadataPersistence: Send + Sync {
-    /// upsert 元数据行（ON CONFLICT 不更新 created_at——业务首次创建时间不可变）
-    async fn upsert(&self, record: &AppMetadataRecord) -> anyhow::Result<()>;
-
-    /// 全量加载（启动时调用；空表返回空 Vec）
-    async fn load_all(&self) -> anyhow::Result<Vec<AppMetadataRecord>>;
-
-    /// Delete only the captured generation. False means absent or superseded;
-    /// callers must never retry an unconditional delete.
-    async fn delete_if_current(&self, app_id: &str, generation: &str) -> anyhow::Result<bool>;
-
-    async fn get(&self, app_id: &str) -> anyhow::Result<Option<AppMetadataRecord>> {
-        Ok(self
-            .load_all()
-            .await?
-            .into_iter()
-            .find(|row| row.app_id == app_id))
-    }
-}

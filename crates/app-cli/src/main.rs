@@ -48,19 +48,20 @@ async fn main() -> anyhow::Result<()> {
     // 已有 serve owner（锁被活进程持有）→ 转交唯一 owner（运行 API 提交
     // Start 并等终态）；身份不符/协议不兼容/凭据缺失 → 明确拒绝；无人持锁
     // → 本地 legacy 编排（持锁运行，后续 CLI 同样被分派或拒绝）。
-    {
+    let _owner_guard = {
         let application_id = std::env::var("PROJECT_ID")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "unknown-app".to_string());
         let state_root =
             app_cli::runtime_kernel::RuntimeStore::resolve_root(&args.workspace, &application_id)?;
-        match app_cli::platform::owner_guard::OwnerGuard::acquire(&state_root) {
-            Ok(guard) => {
-                // 持锁运行：guard 存活到进程退出（后续 CLI 的 acquire 失败进分派）
-                std::mem::forget(guard);
-            }
-            Err(_) => {
+        match app_cli::platform::owner_guard::OwnerGuard::try_acquire(&state_root)? {
+            Some(guard) => guard,
+            None => {
+                anyhow::ensure!(
+                    !app_cli::deploy::deploy_requested(),
+                    "workspace already has an owner; submit artifact deployment through its deployment API"
+                );
                 tracing::info!(
                     "owner lock held; dispatching to the running owner at {}",
                     args.admin_addr
@@ -77,14 +78,14 @@ async fn main() -> anyhow::Result<()> {
                         return app_cli::owner_dispatch::describe_terminal(&view);
                     }
                     app_cli::owner_dispatch::OwnerDispatch::NoOwner => {
-                        // 锁被持有但探测无果——dispatch_to_owner 已在 None 路径
-                        // 明确报错；此分支不可达，防御性走本地（保持旧行为）
-                        tracing::warn!("owner dispatch returned NoOwner unexpectedly");
+                        anyhow::bail!(
+                            "owner disappeared during dispatch; no operation was submitted"
+                        );
                     }
                 }
             }
         }
-    }
+    };
 
     // idle 判定（仅无部署请求且无 release.lock 时进入）——无副作用常驻探针。
     // deploy_requested() 检查不涉及3010，可在 bind 前安全调用。

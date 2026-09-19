@@ -1,20 +1,17 @@
 //! Transactional userApp control storage, independent of the Agent write-behind store.
+mod common;
 mod domain;
 
 pub mod control;
 
 #[cfg(feature = "pg")]
-mod postgres;
-#[cfg(feature = "pg")]
-mod sql;
-#[cfg(feature = "pg")]
-pub use postgres::PgUserAppStore;
+pub use common::ToastyUserAppStore as PgUserAppStore;
 #[cfg(feature = "userapp-turso")]
 mod exclusive_directory;
 #[cfg(feature = "userapp-turso")]
-pub mod turso;
+pub use common::ToastyUserAppStore as TursoUserAppStore;
 #[cfg(feature = "userapp-turso")]
-pub use turso::TursoUserAppStore;
+pub use common::offline_snapshot;
 
 pub use control::{OpenedUserAppStore, UserAppStoreControl};
 

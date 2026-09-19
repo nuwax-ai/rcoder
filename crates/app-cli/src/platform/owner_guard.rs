@@ -29,6 +29,17 @@ impl OwnerGuard {
     /// `state_root` 为稳定状态根目录（`.app-cli-state/{app_id}/`）。
     /// 成功返回 Guard（RAII 释放），失败返回错误（锁被占用 / 权限不足）。
     pub fn acquire(state_root: &Path) -> Result<Self> {
+        Self::try_acquire(state_root)?.with_context(|| {
+            format!(
+                "acquire exclusive owner lock: {} (another instance may be running)",
+                state_root.join("owner.lock").display()
+            )
+        })
+    }
+
+    /// Only lock contention returns None. Filesystem and locking failures must
+    /// propagate instead of authorizing a request to an unrelated process.
+    pub fn try_acquire(state_root: &Path) -> Result<Option<Self>> {
         std::fs::create_dir_all(state_root).with_context(|| {
             format!("create state root for owner lock: {}", state_root.display())
         })?;
@@ -40,16 +51,18 @@ impl OwnerGuard {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("open owner lock file: {}", lock_path.display()))?;
-        file.try_lock().with_context(|| {
-            format!(
-                "acquire exclusive owner lock: {} (another instance may be running)",
-                lock_path.display()
-            )
-        })?;
-        Ok(Self {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error)
+                    .with_context(|| format!("lock owner file: {}", lock_path.display()));
+            }
+        }
+        Ok(Some(Self {
             _file: file,
             lock_path,
-        })
+        }))
     }
 
     /// 锁文件路径（诊断用）。
@@ -62,6 +75,18 @@ impl OwnerGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinguishes_contention_from_filesystem_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = OwnerGuard::try_acquire(dir.path()).unwrap().unwrap();
+        assert!(OwnerGuard::try_acquire(dir.path()).unwrap().is_none());
+        drop(guard);
+        assert!(OwnerGuard::try_acquire(dir.path()).unwrap().is_some());
+        let invalid = dir.path().join("not-a-directory");
+        std::fs::write(&invalid, "file").unwrap();
+        assert!(OwnerGuard::try_acquire(&invalid).is_err());
+    }
 
     #[test]
     fn acquire_and_hold_lock() {

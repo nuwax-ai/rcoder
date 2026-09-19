@@ -1,562 +1,748 @@
-//! 预览权威注册表 PG 实现。
-//!
-//! 事务与 CAS 策略：
-//! - `accept_start` / `accept_stop` 用 `SELECT ... FOR UPDATE` + 事务内端口分配，
-//!   保证「受理 + 端口占用」原子成立（端口全局唯一的前提）；
-//! - 其余变更全部条件更新（WHERE instance_id/operation_id/revision + state 前置），
-//!   受影响行数为 0 即 CAS 失败，返回当前行供协调器判定；
-//! - 存储错误原样 `Unavailable`（含 SQL 串号），绝不映射为"不存在"。
-//!
-//! 全部语句为字面量 SQL（sqlx SqlSafeStr 约束：动态字符串需显式审计标记）；
-//! 行读取用 `SELECT *` + FromRow 按列名取值，与表结构演进解耦。
-use shared_types::{
-    AcceptStartInput, AcceptStartOutcome, PREVIEW_PORT_MAX, PREVIEW_PORT_MIN,
-    PREVIEW_PORT_RESERVED_MAX, PREVIEW_PORT_RESERVED_MIN, PreviewInstanceRecord,
-    PreviewLifecycleStore, PreviewStoreError as Error, is_preview_port,
+//! Preview persistence through the official Toasty PostgreSQL driver. The fixed
+//! allocation lock covers missing rows as well as different keys sharing a port.
+use super::domain::{self, unavailable};
+use crate::db::{
+    models::{PreviewInstance, PreviewOperation},
+    owner::DatabaseOwner,
+    schema::Component,
 };
-
-use super::domain::{self, PreviewRow};
-
-/// 活跃实例的端口占用记账查询（与部分索引同词汇）。
-const SELECT_ACTIVE_PORTS: &str =
-    "SELECT port FROM preview_instances WHERE state IN ('starting','ready','stopping','unknown')";
+use chrono::SubsecRound as _;
+use futures::future::BoxFuture;
+use sha2::{Digest, Sha256};
+use shared_types::*;
+use toasty::Executor;
+use toasty_core::schema::db::Type;
+type Error = PreviewStoreError;
 
 pub struct PgPreviewStore {
-    pool: sqlx::PgPool,
+    owner: DatabaseOwner,
 }
-
 impl PgPreviewStore {
-    /// 独立连接（复用共享连接策略；rcoder 装配入口）。
     pub async fn connect(config: &crate::config::PostgresConfig) -> Result<Self, Error> {
-        let pool = crate::pg::connection::connect_pool(config)
-            .await
-            .map_err(unavailable)?;
-        Self::open(pool).await
+        Ok(Self {
+            owner: crate::db::postgres::open(config, vec![Component::Preview])
+                .await
+                .map_err(unavailable)?,
+        })
     }
-
-    /// 复用已有连接池；迁移写独立表 `_sqlx_preview_migrations`。
-    pub async fn open(pool: sqlx::PgPool) -> Result<Self, Error> {
-        let mut migrator = sqlx::migrate!("./migrations-preview-pg");
-        migrator.table_name = "_sqlx_preview_migrations".into();
-        migrator.run(&pool).await.map_err(unavailable)?;
-        Ok(Self { pool })
+    pub async fn close(&self) -> Result<(), Error> {
+        self.owner.shutdown().await.map_err(unavailable)
     }
-
-    pub async fn close(&self) {
-        self.pool.close().await;
-    }
-}
-
-fn unavailable(error: impl std::fmt::Display) -> Error {
-    Error::Unavailable(error.to_string())
-}
-
-fn conflict(context: &str, current: Option<&PreviewInstanceRecord>) -> Error {
-    Error::Conflict(match current {
-        Some(record) => format!(
-            "{context}: state={}, revision={}",
-            domain::state_str(record.state),
-            record.revision
-        ),
-        None => context.to_string(),
-    })
-}
-
-async fn fetch_current(
-    tx: &mut sqlx::PgConnection,
-    preview_key: &str,
-) -> Result<Option<PreviewInstanceRecord>, Error> {
-    let row: Option<PreviewRow> =
-        sqlx::query_as::<_, PreviewRow>("SELECT * FROM preview_instances WHERE preview_key=$1")
-            .bind(preview_key)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(unavailable)?;
-    row.map(|r| r.to_record()).transpose()
-}
-
-fn allocate_port(occupied: &[u16], requested: Option<u16>) -> Result<u16, Error> {
-    match requested {
-        Some(requested) => {
-            if !is_preview_port(requested) {
-                return Err(Error::Invalid(format!(
-                    "requested preview port {requested} outside pool or reserved"
-                )));
+    async fn run<T, F>(&self, body: F) -> Result<T, Error>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(&'a mut dyn Executor) -> BoxFuture<'a, Result<T, Error>> + Send + 'static,
+    {
+        self.owner.execute(move |mut db| async move {
+            let mut tx = db.transaction().await?;
+            match body(&mut tx).await {
+                Ok(value) => { tx.commit().await?; Ok(Ok(value)) }
+                Err(error) => {
+                    tx.rollback().await.map_err(|rollback| anyhow::anyhow!("Preview transaction failed ({error}); rollback failed ({rollback}); outcome requires verification"))?;
+                    Ok(Err(error))
+                }
             }
-            if occupied.contains(&requested) {
-                return Err(Error::Invalid(format!(
-                    "requested preview port {requested} occupied by an active instance"
-                )));
-            }
-            Ok(requested)
+        }).await.map_err(unavailable)?
+    }
+}
+fn conflict(context: &str) -> Error {
+    Error::Conflict(context.into())
+}
+fn now() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now().trunc_subsecs(6)
+}
+async fn lock_key(tx: &mut dyn Executor, key: &str) -> Result<(), Error> {
+    toasty::sql::query("SELECT preview_key FROM preview_instances WHERE preview_key=$1 FOR UPDATE")
+        .bind(key)
+        .exec(tx)
+        .await
+        .map_err(unavailable)?;
+    Ok(())
+}
+async fn get(tx: &mut dyn Executor, key: &str) -> Result<Option<PreviewInstanceRecord>, Error> {
+    PreviewInstance::filter_by_preview_key(key)
+        .first()
+        .exec(tx)
+        .await
+        .map_err(unavailable)?
+        .map(domain::record)
+        .transpose()
+}
+async fn current(tx: &mut dyn Executor, key: &str) -> Result<PreviewInstanceRecord, Error> {
+    lock_key(tx, key).await?;
+    get(tx, key)
+        .await?
+        .ok_or_else(|| Error::Invalid("Preview has no current instance".into()))
+}
+async fn save(
+    tx: &mut dyn Executor,
+    before: &PreviewInstanceRecord,
+    row: &PreviewInstanceRecord,
+) -> Result<(), Error> {
+    let count = toasty::sql::statement("UPDATE preview_instances SET revision=$1,operation_id=$2,pid=$3,port=$4,base_path=$5,state=$6,last_heartbeat_at_us=$7,last_activity_at_us=$8,detail=$9,updated_at_us=$10 WHERE preview_key=$11 AND instance_id=$12 AND revision=$13 AND operation_id=$14 AND state=$15")
+        .bind(row.revision).bind(&row.operation_id).bind_typed(row.pid, Type::Integer(8))
+        .bind_typed(row.port.map(i64::from), Type::Integer(8)).bind_typed(row.base_path.as_deref(), Type::Text)
+        .bind(domain::state_str(row.state)).bind_typed(row.last_heartbeat_at.map(|t| t.timestamp_micros()), Type::Integer(8))
+        .bind(row.last_activity_at.timestamp_micros()).bind_typed(row.detail.as_deref(), Type::Text).bind(row.updated_at.timestamp_micros())
+        .bind(&before.preview_key).bind(&before.instance_id).bind(before.revision).bind(&before.operation_id).bind(domain::state_str(before.state))
+        .exec(tx).await.map_err(unavailable)?;
+    if count != 1 {
+        return Err(conflict("Preview instance CAS failed"));
+    }
+    Ok(())
+}
+async fn operation(tx: &mut dyn Executor, id: &str) -> Result<Option<PreviewOperation>, Error> {
+    PreviewOperation::filter_by_operation_id(id)
+        .first()
+        .exec(tx)
+        .await
+        .map_err(unavailable)
+}
+async fn insert_operation(
+    tx: &mut dyn Executor,
+    row: &PreviewInstanceRecord,
+    kind: &str,
+    requested: Option<u16>,
+    input: serde_json::Value,
+) -> Result<(), Error> {
+    let request = encode_userapp_intent(&input).map_err(unavailable)?;
+    let fingerprint = Sha256::digest(&request)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let request = String::from_utf8(request).map_err(unavailable)?;
+    PreviewOperation::create()
+        .operation_id(&row.operation_id)
+        .preview_key(&row.preview_key)
+        .instance_id(&row.instance_id)
+        .request_fingerprint(fingerprint)
+        .kind(kind)
+        .state("accepted")
+        .host_id(&row.host_id)
+        .requested_port(requested.map(i64::from))
+        .allocated_port(row.port.map(i64::from))
+        .payload_version(1)
+        .request_json(request)
+        .result_json(None::<String>)
+        .created_at_us(row.updated_at.timestamp_micros())
+        .updated_at_us(row.updated_at.timestamp_micros())
+        .exec(tx)
+        .await
+        .map_err(unavailable)?;
+    Ok(())
+}
+async fn finish(
+    tx: &mut dyn Executor,
+    row: &PreviewInstanceRecord,
+    state: &str,
+    result: serde_json::Value,
+) -> Result<(), Error> {
+    let op = operation(tx, &row.operation_id)
+        .await?
+        .ok_or_else(|| unavailable("Preview operation record missing"))?;
+    if op.preview_key != row.preview_key
+        || op.instance_id != row.instance_id
+        || op.payload_version != 1
+    {
+        return Err(conflict(
+            "Preview operation belongs to a different instance",
+        ));
+    }
+    if matches!(op.state.as_str(), "accepted" | "running" | "uncertain") {
+        let count = toasty::sql::statement("UPDATE preview_operations SET state=$1,result_json=$2,updated_at_us=$3 WHERE operation_id=$4 AND instance_id=$5 AND state=$6")
+            .bind(state).bind(serde_json::to_string(&result).map_err(unavailable)?).bind(row.updated_at.timestamp_micros())
+            .bind(&row.operation_id).bind(&row.instance_id).bind(&op.state).exec(tx).await.map_err(unavailable)?;
+        if count != 1 {
+            return Err(conflict("Preview operation CAS failed"));
         }
-        None => (PREVIEW_PORT_MIN..=PREVIEW_PORT_MAX)
-            .filter(|p| {
-                !(PREVIEW_PORT_RESERVED_MIN..=PREVIEW_PORT_RESERVED_MAX).contains(p)
-                    && !occupied.contains(p)
-            })
-            .min()
-            .ok_or_else(|| Error::Invalid("preview port pool exhausted".into())),
     }
+    Ok(())
+}
+async fn active(tx: &mut dyn Executor) -> Result<Vec<PreviewInstanceRecord>, Error> {
+    PreviewInstance::filter(
+        PreviewInstance::fields()
+            .state()
+            .in_list(["starting", "ready", "stopping", "unknown"]),
+    )
+    .order_by(PreviewInstance::fields().preview_key().asc())
+    .exec(tx)
+    .await
+    .map_err(unavailable)?
+    .into_iter()
+    .map(domain::record)
+    .collect()
+}
+async fn ports(tx: &mut dyn Executor) -> Result<Vec<u16>, Error> {
+    active(tx)
+        .await?
+        .into_iter()
+        .map(|row| {
+            row.port
+                .ok_or_else(|| unavailable("Active preview port is missing"))
+        })
+        .collect()
+}
+fn allocate(occupied: &[u16], requested: Option<u16>) -> Result<u16, Error> {
+    if let Some(port) = requested {
+        if !is_preview_port(port) || occupied.contains(&port) {
+            return Err(Error::Invalid(
+                "Requested preview port is outside the pool, reserved, or occupied".into(),
+            ));
+        }
+        return Ok(port);
+    }
+    (PREVIEW_PORT_MIN..=PREVIEW_PORT_MAX)
+        .find(|port| is_preview_port(*port) && !occupied.contains(port))
+        .ok_or_else(|| Error::Invalid("Preview port pool exhausted".into()))
+}
+fn start_input(input: &AcceptStartInput) -> serde_json::Value {
+    serde_json::json!({"preview_key":input.preview_key,"project_id":input.project_id,"project_path":input.project_path,
+        "instance_id":input.instance_id,"host_id":input.host.host_id,"pod_name":input.host.pod_name,
+        "pod_ip":input.host.pod_ip,"requested_port":input.requested_port,"recovery":input.recover_unknown_evidence})
+}
+async fn accept_start(
+    tx: &mut dyn Executor,
+    input: AcceptStartInput,
+) -> Result<AcceptStartOutcome, Error> {
+    if [
+        &input.preview_key,
+        &input.project_id,
+        &input.instance_id,
+        &input.operation_id,
+        &input.host.host_id,
+    ]
+    .iter()
+    .any(|s| s.is_empty())
+    {
+        return Err(Error::Invalid("Preview start identity is empty".into()));
+    }
+    // Independent namespace from schema and leader locks; transaction-scoped,
+    // released before returning and never held while spawning or probing a host.
+    toasty::sql::query("SELECT 1 FROM pg_advisory_xact_lock(72430591234122)")
+        .exec(tx)
+        .await
+        .map_err(unavailable)?;
+    lock_key(tx, &input.preview_key).await?;
+    let existing = get(tx, &input.preview_key).await?;
+    if let Some(previous) = operation(tx, &input.operation_id).await? {
+        let fingerprint =
+            Sha256::digest(encode_userapp_intent(&start_input(&input)).map_err(unavailable)?)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+        if previous.kind != "start"
+            || previous.preview_key != input.preview_key
+            || previous.instance_id != input.instance_id
+            || previous.request_fingerprint != fingerprint
+            || previous.payload_version != 1
+        {
+            return Err(conflict(
+                "Preview start identity was reused with different input",
+            ));
+        }
+        let row = existing.ok_or_else(|| unavailable("Preview request lost its instance"))?;
+        if row.instance_id != input.instance_id || row.operation_id != input.operation_id {
+            return Err(conflict("Preview request belongs to an older instance"));
+        }
+        return Ok(if row.state == PreviewInstanceState::Ready {
+            AcceptStartOutcome::ExistingReady(row)
+        } else {
+            AcceptStartOutcome::Blocked(row)
+        });
+    }
+    let revision = if let Some(row) = &existing {
+        match row.state {
+            PreviewInstanceState::Ready => {
+                return Ok(AcceptStartOutcome::ExistingReady(row.clone()));
+            }
+            PreviewInstanceState::Starting | PreviewInstanceState::Stopping => {
+                return Ok(AcceptStartOutcome::Blocked(row.clone()));
+            }
+            PreviewInstanceState::Unknown => {
+                let Some(evidence) = input.recover_unknown_evidence.as_ref() else {
+                    return Ok(AcceptStartOutcome::Blocked(row.clone()));
+                };
+                if evidence.instance_id != row.instance_id
+                    || evidence.revision != row.revision
+                    || evidence.detail.is_empty()
+                {
+                    return Err(conflict(
+                        "Unknown recovery evidence belongs to another preview generation",
+                    ));
+                }
+                let mut stopped = row.clone();
+                stopped.state = PreviewInstanceState::Stopped;
+                stopped.pid = None;
+                stopped.detail = Some(evidence.detail.clone());
+                stopped.updated_at = now();
+                save(tx, row, &stopped).await?;
+                finish(
+                    tx,
+                    &stopped,
+                    "failed",
+                    serde_json::json!({"recovery":evidence}),
+                )
+                .await?;
+            }
+            PreviewInstanceState::Stopped | PreviewInstanceState::Failed => {}
+        }
+        row.revision
+            .checked_add(1)
+            .ok_or_else(|| unavailable("Preview revision exhausted"))?
+    } else {
+        1
+    };
+    let port = allocate(&ports(tx).await?, input.requested_port)?;
+    let at = now();
+    if let Some(previous) = &existing {
+        // Allocation lock covers creation; row lock/CAS also excludes concurrent
+        // host callbacks that do not need the global allocator lock.
+        lock_key(tx, &input.preview_key).await?;
+        let observed = get(tx, &input.preview_key)
+            .await?
+            .ok_or_else(|| conflict("Preview disappeared"))?;
+        if observed.instance_id != previous.instance_id
+            || observed.revision != previous.revision
+            || observed.state.is_active()
+        {
+            return Err(conflict("Preview changed during start admission"));
+        }
+        let count = toasty::sql::statement("UPDATE preview_instances SET project_id=$1,project_path=$2,instance_id=$3,revision=$4,operation_id=$5,host_id=$6,pod_name=$7,pod_ip=$8,pid=NULL,port=$9,base_path=NULL,state='starting',last_heartbeat_at_us=NULL,last_activity_at_us=$10,detail=$11,updated_at_us=$10 WHERE preview_key=$12 AND instance_id=$13 AND revision=$14")
+            .bind(&input.project_id).bind(&input.project_path).bind(&input.instance_id).bind(revision).bind(&input.operation_id).bind(&input.host.host_id)
+            .bind_typed(input.host.pod_name.as_deref(), Type::Text).bind_typed(input.host.pod_ip.as_deref(), Type::Text).bind(i64::from(port))
+            .bind(at.timestamp_micros()).bind_typed(input.recover_unknown_evidence.as_ref().map(|e| e.detail.clone()), Type::Text).bind(&input.preview_key)
+            .bind(&previous.instance_id).bind(previous.revision).exec(tx).await.map_err(unavailable)?;
+        if count != 1 {
+            return Err(conflict("Preview changed during start admission"));
+        }
+    } else {
+        PreviewInstance::create()
+            .preview_key(&input.preview_key)
+            .project_id(&input.project_id)
+            .project_path(&input.project_path)
+            .instance_id(&input.instance_id)
+            .revision(revision)
+            .operation_id(Some(input.operation_id.clone()))
+            .host_id(&input.host.host_id)
+            .pod_name(input.host.pod_name.clone())
+            .pod_ip(input.host.pod_ip.clone())
+            .pid(None::<i64>)
+            .port(Some(i64::from(port)))
+            .base_path(None::<String>)
+            .state("starting")
+            .last_heartbeat_at_us(None::<i64>)
+            .last_activity_at_us(at.timestamp_micros())
+            .detail(
+                input
+                    .recover_unknown_evidence
+                    .as_ref()
+                    .map(|e| e.detail.clone()),
+            )
+            .updated_at_us(at.timestamp_micros())
+            .exec(tx)
+            .await
+            .map_err(unavailable)?;
+    }
+    let row = get(tx, &input.preview_key)
+        .await?
+        .ok_or_else(|| unavailable("Admitted preview is missing"))?;
+    insert_operation(tx, &row, "start", input.requested_port, start_input(&input)).await?;
+    Ok(AcceptStartOutcome::Admitted(row))
 }
 
 #[async_trait::async_trait]
 impl PreviewLifecycleStore for PgPreviewStore {
     async fn accept_start(&self, input: AcceptStartInput) -> Result<AcceptStartOutcome, Error> {
-        let mut tx = self.pool.begin().await.map_err(unavailable)?;
-
-        // 1. 锁定现行行并做前置判定（只读路径直接返回，事务无写即回滚）。
-        let existing: Option<PreviewRow> = sqlx::query_as::<_, PreviewRow>(
-            "SELECT * FROM preview_instances WHERE preview_key=$1 FOR UPDATE",
-        )
-        .bind(&input.preview_key)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(unavailable)?;
-
-        let mut next_revision = 1_i64;
-        if let Some(row) = &existing {
-            let record = row.to_record()?;
-            match record.state {
-                shared_types::PreviewInstanceState::Ready => {
-                    return Ok(AcceptStartOutcome::ExistingReady(record));
-                }
-                shared_types::PreviewInstanceState::Starting
-                | shared_types::PreviewInstanceState::Stopping => {
-                    return Ok(AcceptStartOutcome::Blocked(record));
-                }
-                shared_types::PreviewInstanceState::Unknown => {
-                    let Some(evidence) = input.recover_unknown_evidence.as_deref() else {
-                        return Ok(AcceptStartOutcome::Blocked(record));
-                    };
-                    // 证据已由协调器核实：先落 Stopped 再受理新实例（同事务）。
-                    let updated = sqlx::query(
-                        "UPDATE preview_instances SET state='stopped', pid=NULL, detail=$1, \
-                         updated_at=now() \
-                         WHERE preview_key=$2 AND instance_id=$3 AND state='unknown'",
-                    )
-                    .bind(evidence)
-                    .bind(&input.preview_key)
-                    .bind(&record.instance_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(unavailable)?;
-                    if updated.rows_affected() == 0 {
-                        return Err(conflict(
-                            "unknown instance changed during recovery",
-                            Some(&record),
-                        ));
-                    }
-                    next_revision = record.revision + 1;
-                }
-                shared_types::PreviewInstanceState::Stopped
-                | shared_types::PreviewInstanceState::Failed => {
-                    next_revision = record.revision + 1;
-                }
-            }
-        }
-
-        // 2. 端口占用集合（与受理同事务，构成全局唯一分配）。
-        let occupied: Vec<i32> = sqlx::query_scalar::<_, i32>(SELECT_ACTIVE_PORTS)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(unavailable)?;
-        let occupied: Vec<u16> = occupied
-            .into_iter()
-            .filter_map(|p| u16::try_from(p).ok())
-            .collect();
-        let port = allocate_port(&occupied, input.requested_port)?;
-
-        // 3. 受理落库（starting）。
-        let upserted: PreviewRow = sqlx::query_as::<_, PreviewRow>(
-            "INSERT INTO preview_instances (preview_key, project_id, project_path, instance_id, \
-             revision, operation_id, host_id, pod_name, pod_ip, pid, port, base_path, state, \
-             last_heartbeat_at, last_activity_at, detail, updated_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,NULL,'starting',NULL,now(),$11,now()) \
-             ON CONFLICT (preview_key) DO UPDATE SET \
-             instance_id=$4, revision=$5, operation_id=$6, host_id=$7, pod_name=$8, pod_ip=$9, \
-             pid=NULL, port=$10, base_path=NULL, state='starting', last_heartbeat_at=NULL, \
-             last_activity_at=now(), detail=$11, updated_at=now() \
-             RETURNING *",
-        )
-        .bind(&input.preview_key)
-        .bind(&input.project_id)
-        .bind(&input.project_path)
-        .bind(&input.instance_id)
-        .bind(next_revision)
-        .bind(&input.operation_id)
-        .bind(&input.host.host_id)
-        .bind(&input.host.pod_name)
-        .bind(&input.host.pod_ip)
-        .bind(i32::from(port))
-        .bind(input.recover_unknown_evidence.as_deref())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(unavailable)?;
-
-        sqlx::query(
-            "INSERT INTO preview_operations (operation_id, preview_key, kind, state, host_id, \
-             requested_port, allocated_port, result, created_at, updated_at) \
-             VALUES ($1,$2,'start','accepted',$3,$4,$5,NULL,now(),now())",
-        )
-        .bind(&input.operation_id)
-        .bind(&input.preview_key)
-        .bind(&input.host.host_id)
-        .bind(input.requested_port.map(i32::from))
-        .bind(i32::from(port))
-        .execute(&mut *tx)
-        .await
-        .map_err(unavailable)?;
-
-        tx.commit().await.map_err(unavailable)?;
-        Ok(AcceptStartOutcome::Admitted(upserted.to_record()?))
+        self.run(move |tx| Box::pin(accept_start(tx, input))).await
     }
-
     async fn publish_running(
         &self,
-        preview_key: &str,
+        key: &str,
         operation_id: &str,
         revision: i64,
         pid: i64,
         port: u16,
         base_path: Option<&str>,
     ) -> Result<PreviewInstanceRecord, Error> {
-        let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        let row: Option<PreviewRow> = sqlx::query_as::<_, PreviewRow>(
-            "UPDATE preview_instances SET state='ready', pid=$4, port=$5, base_path=$6, \
-             last_heartbeat_at=now(), last_activity_at=now(), updated_at=now() \
-             WHERE preview_key=$1 AND operation_id=$2 AND revision=$3 AND state='starting' \
-             RETURNING *",
-        )
-        .bind(preview_key)
-        .bind(operation_id)
-        .bind(revision)
-        .bind(pid)
-        .bind(i32::from(port))
-        .bind(base_path)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(unavailable)?;
-        let Some(row) = row else {
-            let current = fetch_current(&mut tx, preview_key).await?;
-            return Err(conflict("publish_running lost the race", current.as_ref()));
-        };
-        sqlx::query(
-            "UPDATE preview_operations SET state='succeeded', result=$3, updated_at=now() \
-             WHERE operation_id=$1 AND preview_key=$2",
-        )
-        .bind(operation_id)
-        .bind(preview_key)
-        .bind(format!("pid={pid} port={port}"))
-        .execute(&mut *tx)
-        .await
-        .map_err(unavailable)?;
-        tx.commit().await.map_err(unavailable)?;
-        row.to_record()
+        let key = key.to_owned();
+        let operation_id = operation_id.to_owned();
+        let base_path = base_path.map(str::to_owned);
+        self.run(move |tx| Box::pin(async move {
+            let before = current(tx, &key).await?;
+            if pid <= 0 || before.operation_id != operation_id || before.revision != revision || before.state != PreviewInstanceState::Starting || before.port != Some(port) {
+                return Err(conflict("Publish running requires the original starting operation and allocated port"));
+            }
+            let mut row = before.clone(); row.state = PreviewInstanceState::Ready; row.pid = Some(pid); row.base_path = base_path;
+            row.updated_at = now(); row.last_heartbeat_at = Some(row.updated_at); row.last_activity_at = row.last_activity_at.max(row.updated_at);
+            save(tx, &before, &row).await?;
+            finish(tx, &row, "succeeded", serde_json::json!({"pid":pid,"port":port})).await?;
+            Ok(row)
+        })).await
     }
-
     async fn accept_stop(
         &self,
-        preview_key: &str,
+        key: &str,
         operation_id: &str,
     ) -> Result<PreviewInstanceRecord, Error> {
-        let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        let existing: Option<PreviewRow> = sqlx::query_as::<_, PreviewRow>(
-            "SELECT * FROM preview_instances WHERE preview_key=$1 FOR UPDATE",
-        )
-        .bind(preview_key)
-        .fetch_optional(&mut *tx)
+        let key = key.to_owned();
+        let operation_id = operation_id.to_owned();
+        self.run(move |tx| {
+            Box::pin(async move {
+                if operation_id.is_empty() {
+                    return Err(Error::Invalid("Stop operation identity is empty".into()));
+                }
+                let before = current(tx, &key).await?;
+                if let Some(op) = operation(tx, &operation_id).await? {
+                    if op.kind != "stop"
+                        || op.preview_key != key
+                        || op.instance_id != before.instance_id
+                        || before.operation_id != operation_id
+                    {
+                        return Err(conflict(
+                            "Stop operation belongs to another instance or request",
+                        ));
+                    }
+                    return Ok(before);
+                }
+                if !before.state.is_active() {
+                    return Ok(before);
+                }
+                if before.state == PreviewInstanceState::Stopping {
+                    return Err(conflict("Another stop operation is in progress"));
+                }
+                let mut row = before.clone();
+                row.state = PreviewInstanceState::Stopping;
+                row.operation_id = operation_id;
+                row.revision = row
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| unavailable("Preview revision exhausted"))?;
+                row.updated_at = now();
+                // A stop supersedes the startup authority but cannot turn it into a
+                // success. The original receipt remains attached to its instance.
+                finish(
+                    tx,
+                    &before,
+                    "failed",
+                    serde_json::json!({"superseded_by":row.operation_id}),
+                )
+                .await?;
+                save(tx, &before, &row).await?;
+                insert_operation(
+                    tx,
+                    &row,
+                    "stop",
+                    None,
+                    serde_json::json!({"preview_key":key,"instance_id":row.instance_id}),
+                )
+                .await?;
+                Ok(row)
+            })
+        })
         .await
-        .map_err(unavailable)?;
-        let Some(row) = existing else {
-            return Err(Error::Invalid(format!(
-                "preview {preview_key} has no instance to stop"
-            )));
-        };
-        let record = row.to_record()?;
-        if !record.state.is_active() {
-            // Stopped/Failed：无进程可停，幂等返回（协调器按"已停止"回信封）。
-            return Ok(record);
-        }
-        let updated: PreviewRow = sqlx::query_as::<_, PreviewRow>(
-            "UPDATE preview_instances SET state='stopping', operation_id=$2, \
-             revision=revision+1, updated_at=now() \
-             WHERE preview_key=$1 AND instance_id=$3 AND revision=$4 \
-             RETURNING *",
-        )
-        .bind(preview_key)
-        .bind(operation_id)
-        .bind(&record.instance_id)
-        .bind(record.revision)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(unavailable)?;
-        sqlx::query(
-            "INSERT INTO preview_operations (operation_id, preview_key, kind, state, host_id, \
-             requested_port, allocated_port, result, created_at, updated_at) \
-             VALUES ($1,$2,'stop','accepted',$3,NULL,$4,NULL,now(),now())",
-        )
-        .bind(operation_id)
-        .bind(preview_key)
-        .bind(&record.host_id)
-        .bind(record.port.map(i32::from))
-        .execute(&mut *tx)
-        .await
-        .map_err(unavailable)?;
-        tx.commit().await.map_err(unavailable)?;
-        updated.to_record()
     }
-
     async fn mark_stopped(
         &self,
-        preview_key: &str,
+        key: &str,
         operation_id: &str,
         revision: i64,
     ) -> Result<PreviewInstanceRecord, Error> {
-        let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        let row: Option<PreviewRow> = sqlx::query_as::<_, PreviewRow>(
-            "UPDATE preview_instances SET state='stopped', pid=NULL, updated_at=now() \
-             WHERE preview_key=$1 AND operation_id=$2 AND revision=$3 AND state='stopping' \
-             RETURNING *",
-        )
-        .bind(preview_key)
-        .bind(operation_id)
-        .bind(revision)
-        .fetch_optional(&mut *tx)
+        let key = key.to_owned();
+        let operation_id = operation_id.to_owned();
+        self.run(move |tx| {
+            Box::pin(async move {
+                let before = current(tx, &key).await?;
+                if before.operation_id != operation_id || before.revision != revision {
+                    return Err(conflict("Stop completion belongs to another generation"));
+                }
+                if before.state == PreviewInstanceState::Stopped {
+                    return Ok(before);
+                }
+                if before.state != PreviewInstanceState::Stopping {
+                    return Err(conflict("Preview is not stopping"));
+                }
+                let mut row = before.clone();
+                row.state = PreviewInstanceState::Stopped;
+                row.pid = None;
+                row.updated_at = now();
+                save(tx, &before, &row).await?;
+                finish(tx, &row, "succeeded", serde_json::json!({"stopped":true})).await?;
+                Ok(row)
+            })
+        })
         .await
-        .map_err(unavailable)?;
-        let Some(row) = row else {
-            let current = fetch_current(&mut tx, preview_key).await?;
-            // 并发 stop 已完成 → 幂等成功；否则才是真冲突。
-            if let Some(record) = &current
-                && record.state == shared_types::PreviewInstanceState::Stopped
-            {
-                return Ok(current.expect("checked Some"));
-            }
-            return Err(conflict("mark_stopped lost the race", current.as_ref()));
-        };
-        sqlx::query(
-            "UPDATE preview_operations SET state='succeeded', result='stopped', updated_at=now() \
-             WHERE operation_id=$1 AND preview_key=$2",
-        )
-        .bind(operation_id)
-        .bind(preview_key)
-        .execute(&mut *tx)
-        .await
-        .map_err(unavailable)?;
-        tx.commit().await.map_err(unavailable)?;
-        row.to_record()
     }
-
     async fn mark_failed(
         &self,
-        preview_key: &str,
+        key: &str,
         instance_id: &str,
         revision: i64,
         detail: &str,
     ) -> Result<PreviewInstanceRecord, Error> {
-        let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        let row: Option<PreviewRow> = sqlx::query_as::<_, PreviewRow>(
-            "UPDATE preview_instances SET state='failed', pid=NULL, detail=$4, updated_at=now() \
-             WHERE preview_key=$1 AND instance_id=$2 AND revision=$3 \
-             AND state IN ('starting','ready') \
-             RETURNING *",
-        )
-        .bind(preview_key)
-        .bind(instance_id)
-        .bind(revision)
-        .bind(detail)
-        .fetch_optional(&mut *tx)
+        let key = key.to_owned();
+        let instance_id = instance_id.to_owned();
+        let detail = detail.to_owned();
+        self.run(move |tx| {
+            Box::pin(async move {
+                let before = current(tx, &key).await?;
+                if before.instance_id != instance_id
+                    || before.revision != revision
+                    || !matches!(
+                        before.state,
+                        PreviewInstanceState::Starting | PreviewInstanceState::Ready
+                    )
+                {
+                    return Err(conflict("Failure belongs to another preview generation"));
+                }
+                let mut row = before.clone();
+                row.state = PreviewInstanceState::Failed;
+                row.pid = None;
+                row.detail = Some(detail.clone());
+                row.updated_at = now();
+                save(tx, &before, &row).await?;
+                finish(tx, &row, "failed", serde_json::json!({"detail":detail})).await?;
+                Ok(row)
+            })
+        })
         .await
-        .map_err(unavailable)?;
-        let Some(row) = row else {
-            let current = fetch_current(&mut tx, preview_key).await?;
-            return Err(conflict("mark_failed lost the race", current.as_ref()));
-        };
-        sqlx::query(
-            "UPDATE preview_operations SET state='failed', result=$2, updated_at=now() \
-             WHERE preview_key=$1 AND state IN ('accepted','running')",
-        )
-        .bind(preview_key)
-        .bind(detail)
-        .execute(&mut *tx)
-        .await
-        .map_err(unavailable)?;
-        tx.commit().await.map_err(unavailable)?;
-        row.to_record()
     }
-
     async fn mark_unknown(
         &self,
-        preview_key: &str,
+        key: &str,
         instance_id: &str,
         detail: &str,
     ) -> Result<PreviewInstanceRecord, Error> {
-        let row: Option<PreviewRow> = sqlx::query_as::<_, PreviewRow>(
-            "UPDATE preview_instances SET state='unknown', detail=$3, updated_at=now() \
-             WHERE preview_key=$1 AND instance_id=$2 \
-             AND state IN ('starting','ready','stopping','unknown') \
-             RETURNING *",
-        )
-        .bind(preview_key)
-        .bind(instance_id)
-        .bind(detail)
-        .fetch_optional(&self.pool)
+        let key = key.to_owned();
+        let instance_id = instance_id.to_owned();
+        let detail = detail.to_owned();
+        self.run(move |tx| {
+            Box::pin(async move {
+                let before = current(tx, &key).await?;
+                if before.instance_id != instance_id || !before.state.is_active() {
+                    return Err(conflict(
+                        "Unknown observation belongs to another preview generation",
+                    ));
+                }
+                let mut row = before.clone();
+                row.state = PreviewInstanceState::Unknown;
+                row.detail = Some(detail.clone());
+                row.updated_at = now();
+                save(tx, &before, &row).await?;
+                finish(tx, &row, "uncertain", serde_json::json!({"detail":detail})).await?;
+                Ok(row)
+            })
+        })
         .await
-        .map_err(unavailable)?;
-        row.map(|r| r.to_record())
-            .transpose()?
-            .ok_or_else(|| Error::Conflict(format!("instance {instance_id} not in active state")))
     }
-
     async fn resolve_unknown_stopped(
         &self,
-        preview_key: &str,
+        key: &str,
         instance_id: &str,
         evidence: &str,
     ) -> Result<PreviewInstanceRecord, Error> {
-        let row: Option<PreviewRow> = sqlx::query_as::<_, PreviewRow>(
-            "UPDATE preview_instances SET state='stopped', pid=NULL, detail=$3, updated_at=now() \
-             WHERE preview_key=$1 AND instance_id=$2 AND state='unknown' \
-             RETURNING *",
-        )
-        .bind(preview_key)
-        .bind(instance_id)
-        .bind(evidence)
-        .fetch_optional(&self.pool)
+        let key = key.to_owned();
+        let instance_id = instance_id.to_owned();
+        let evidence = evidence.to_owned();
+        self.run(move |tx| {
+            Box::pin(async move {
+                let before = current(tx, &key).await?;
+                if evidence.is_empty()
+                    || before.instance_id != instance_id
+                    || before.state != PreviewInstanceState::Unknown
+                {
+                    return Err(conflict(
+                        "Unknown recovery evidence belongs to another preview generation",
+                    ));
+                }
+                let mut row = before.clone();
+                row.state = PreviewInstanceState::Stopped;
+                row.pid = None;
+                row.detail = Some(evidence.clone());
+                row.updated_at = now();
+                save(tx, &before, &row).await?;
+                let op = operation(tx, &row.operation_id)
+                    .await?
+                    .ok_or_else(|| unavailable("Missing preview operation"))?;
+                finish(
+                    tx,
+                    &row,
+                    if op.kind == "stop" {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    },
+                    serde_json::json!({"recovery":evidence}),
+                )
+                .await?;
+                Ok(row)
+            })
+        })
         .await
-        .map_err(unavailable)?;
-        row.map(|r| r.to_record())
-            .transpose()?
-            .ok_or_else(|| Error::Conflict(format!("instance {instance_id} is not unknown")))
     }
-
     async fn refresh_heartbeat(
         &self,
-        preview_key: &str,
+        key: &str,
         instance_id: &str,
     ) -> Result<Option<PreviewInstanceRecord>, Error> {
-        let row: Option<PreviewRow> = sqlx::query_as::<_, PreviewRow>(
-            "UPDATE preview_instances SET last_heartbeat_at=now() \
-             WHERE preview_key=$1 AND instance_id=$2 AND state IN ('ready','unknown') \
-             RETURNING *",
-        )
-        .bind(preview_key)
-        .bind(instance_id)
-        .fetch_optional(&self.pool)
+        let key = key.to_owned();
+        let instance_id = instance_id.to_owned();
+        self.run(move |tx| {
+            Box::pin(async move {
+                lock_key(tx, &key).await?;
+                let Some(before) = get(tx, &key).await? else {
+                    return Ok(None);
+                };
+                if before.instance_id != instance_id
+                    || !matches!(
+                        before.state,
+                        PreviewInstanceState::Ready | PreviewInstanceState::Unknown
+                    )
+                {
+                    return Ok(None);
+                }
+                let mut row = before.clone();
+                row.last_heartbeat_at = Some(
+                    before
+                        .last_heartbeat_at
+                        .map_or_else(now, |at| at.max(now())),
+                );
+                save(tx, &before, &row).await?;
+                Ok(Some(row))
+            })
+        })
         .await
-        .map_err(unavailable)?;
-        row.map(|r| r.to_record()).transpose()
     }
-
-    async fn flush_activity(
-        &self,
-        entries: &[shared_types::ActivityFlushEntry],
-    ) -> Result<usize, Error> {
-        let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        let mut updated = 0_usize;
-        for entry in entries {
-            let rows = sqlx::query(
-                "UPDATE preview_instances SET last_activity_at=GREATEST(last_activity_at,$3) \
-                 WHERE preview_key=$1 AND instance_id=$2 \
-                 AND state IN ('starting','ready','stopping','unknown')",
-            )
-            .bind(&entry.preview_key)
-            .bind(&entry.instance_id)
-            .bind(entry.at)
-            .execute(&mut *tx)
+    async fn flush_activity(&self, entries: &[ActivityFlushEntry]) -> Result<usize, Error> {
+        let mut entries = entries.to_vec();
+        entries.sort_by(|a, b| {
+            (&a.preview_key, &a.instance_id).cmp(&(&b.preview_key, &b.instance_id))
+        });
+        self.run(move |tx| Box::pin(async move {
+            let mut updated = 0usize;
+            for entry in entries {
+                let count = toasty::sql::statement("UPDATE preview_instances SET last_activity_at_us=GREATEST(last_activity_at_us,$1) WHERE preview_key=$2 AND instance_id=$3 AND last_activity_at_us<$1 AND state IN ('starting','ready','stopping','unknown')")
+                    .bind(entry.at.timestamp_micros()).bind(&entry.preview_key).bind(&entry.instance_id).exec(tx).await.map_err(unavailable)?;
+                updated = updated.checked_add(usize::try_from(count).map_err(unavailable)?).ok_or_else(|| unavailable("Preview activity count overflow"))?;
+            }
+            Ok(updated)
+        })).await
+    }
+    async fn get(&self, key: &str) -> Result<Option<PreviewInstanceRecord>, Error> {
+        let key = key.to_owned();
+        self.run(move |tx| Box::pin(async move { get(tx, &key).await }))
             .await
-            .map_err(unavailable)?;
-            updated += usize::try_from(rows.rows_affected()).unwrap_or(0);
-        }
-        tx.commit().await.map_err(unavailable)?;
-        Ok(updated)
     }
-
-    async fn get(&self, preview_key: &str) -> Result<Option<PreviewInstanceRecord>, Error> {
-        let row: Option<PreviewRow> =
-            sqlx::query_as::<_, PreviewRow>("SELECT * FROM preview_instances WHERE preview_key=$1")
-                .bind(preview_key)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(unavailable)?;
-        row.map(|r| r.to_record()).transpose()
-    }
-
     async fn find_active_by_port(&self, port: u16) -> Result<Option<PreviewInstanceRecord>, Error> {
-        let row: Option<PreviewRow> = sqlx::query_as::<_, PreviewRow>(
-            "SELECT * FROM preview_instances \
-             WHERE port=$1 AND state IN ('starting','ready','stopping','unknown') \
-             ORDER BY revision DESC LIMIT 1",
-        )
-        .bind(i32::from(port))
-        .fetch_optional(&self.pool)
+        self.run(move |tx| {
+            Box::pin(async move {
+                let fields = PreviewInstance::fields();
+                PreviewInstance::filter(
+                    fields.port().eq(Some(i64::from(port))).and(
+                        fields
+                            .state()
+                            .in_list(["starting", "ready", "stopping", "unknown"]),
+                    ),
+                )
+                .first()
+                .exec(tx)
+                .await
+                .map_err(unavailable)?
+                .map(domain::record)
+                .transpose()
+            })
+        })
         .await
-        .map_err(unavailable)?;
-        row.map(|r| r.to_record()).transpose()
     }
-
     async fn active_ports(&self) -> Result<Vec<u16>, Error> {
-        let ports: Vec<i32> = sqlx::query_scalar::<_, i32>(SELECT_ACTIVE_PORTS)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(unavailable)?;
-        Ok(ports
-            .into_iter()
-            .filter_map(|p| u16::try_from(p).ok())
-            .collect())
+        self.run(|tx| Box::pin(ports(tx))).await
     }
-
     async fn list_by_host(
         &self,
         host_id: &str,
         active_only: bool,
     ) -> Result<Vec<PreviewInstanceRecord>, Error> {
-        let sql = if active_only {
-            "SELECT * FROM preview_instances WHERE host_id=$1 \
-             AND state IN ('starting','ready','stopping','unknown') ORDER BY preview_key"
-        } else {
-            "SELECT * FROM preview_instances WHERE host_id=$1 ORDER BY preview_key"
-        };
-        let rows: Vec<PreviewRow> = sqlx::query_as::<_, PreviewRow>(sql)
-            .bind(host_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(unavailable)?;
-        rows.into_iter().map(|r| r.to_record()).collect()
-    }
-
-    async fn list_active(&self) -> Result<Vec<PreviewInstanceRecord>, Error> {
-        let rows: Vec<PreviewRow> = sqlx::query_as::<_, PreviewRow>(
-            "SELECT * FROM preview_instances \
-             WHERE state IN ('starting','ready','stopping','unknown') ORDER BY preview_key",
-        )
-        .fetch_all(&self.pool)
+        let host_id = host_id.to_owned();
+        self.run(move |tx| {
+            Box::pin(async move {
+                let rows =
+                    PreviewInstance::filter(PreviewInstance::fields().host_id().eq(&host_id))
+                        .order_by(PreviewInstance::fields().preview_key().asc())
+                        .exec(tx)
+                        .await
+                        .map_err(unavailable)?
+                        .into_iter()
+                        .map(domain::record)
+                        .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows
+                    .into_iter()
+                    .filter(|r| !active_only || r.state.is_active())
+                    .collect())
+            })
+        })
         .await
-        .map_err(unavailable)?;
-        rows.into_iter().map(|r| r.to_record()).collect()
     }
-
+    async fn list_active(&self) -> Result<Vec<PreviewInstanceRecord>, Error> {
+        self.run(|tx| Box::pin(active(tx))).await
+    }
     async fn reconcile_host_reboot(
         &self,
         pod_uid: &str,
         boot_id: &str,
     ) -> Result<Vec<PreviewInstanceRecord>, Error> {
-        let current_host = format!("{pod_uid}:{boot_id}");
-        // pod_uid 为 UUID（无 LIKE 通配字符），前缀经参数绑定安全匹配。
-        let prefix = format!("{pod_uid}:%");
-        let rows: Vec<PreviewRow> = sqlx::query_as::<_, PreviewRow>(
-            "UPDATE preview_instances SET state='stopped', pid=NULL, detail=$1, updated_at=now() \
-             WHERE host_id LIKE $2 AND host_id <> $3 \
-             AND state IN ('starting','ready','stopping','unknown') \
-             RETURNING *",
-        )
-        .bind(format!("host reboot reconciled by {current_host}"))
-        .bind(&prefix)
-        .bind(&current_host)
-        .fetch_all(&self.pool)
+        let pod_uid = pod_uid.to_owned();
+        let boot_id = boot_id.to_owned();
+        self.run(move |tx| {
+            Box::pin(async move {
+                if pod_uid.is_empty()
+                    || boot_id.is_empty()
+                    || pod_uid.contains(':')
+                    || boot_id.contains(':')
+                {
+                    return Err(Error::Invalid("Invalid preview host identity".into()));
+                }
+                let current_host = format!("{pod_uid}:{boot_id}");
+                let candidates = active(tx).await?;
+                let mut changed = Vec::new();
+                // Stable key order prevents deadlocks with batch activity writes.
+                for candidate in candidates {
+                    if candidate.host_id.split_once(':').map(|(pod, _)| pod)
+                        != Some(pod_uid.as_str())
+                        || candidate.host_id == current_host
+                    {
+                        continue;
+                    }
+                    let before = current(tx, &candidate.preview_key).await?;
+                    if before.instance_id != candidate.instance_id
+                        || before.host_id != candidate.host_id
+                        || !before.state.is_active()
+                    {
+                        continue;
+                    }
+                    let mut row = before.clone();
+                    row.state = PreviewInstanceState::Stopped;
+                    row.pid = None;
+                    row.detail = Some(format!("Host reboot reconciled by {current_host}"));
+                    row.updated_at = now();
+                    save(tx, &before, &row).await?;
+                    let op = operation(tx, &row.operation_id)
+                        .await?
+                        .ok_or_else(|| unavailable("Missing preview operation"))?;
+                    finish(
+                        tx,
+                        &row,
+                        if op.kind == "stop" {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        },
+                        serde_json::json!({"recovery":row.detail}),
+                    )
+                    .await?;
+                    changed.push(row);
+                }
+                Ok(changed)
+            })
+        })
         .await
-        .map_err(unavailable)?;
-        rows.into_iter().map(|r| r.to_record()).collect()
     }
 }

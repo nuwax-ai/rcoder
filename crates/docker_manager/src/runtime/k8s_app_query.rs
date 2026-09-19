@@ -128,19 +128,7 @@ impl KubernetesRuntime {
         // secrets：Secret `.data` base64 解码还原（写入走 string_data，API 侧自动转 data；
         // 值类型是 ByteString，直接取内部字节，无需再按文本 base64 解码字符串）
         let secrets = match self.secrets_api().get(&secret_name).await {
-            Ok(secret) => secret.data.and_then(|data| {
-                data.into_iter()
-                    .map(|(key, value)| {
-                        use base64::Engine as _;
-                        base64::engine::general_purpose::STANDARD
-                            .decode(&value.0)
-                            .map(|decoded| (key, String::from_utf8_lossy(&decoded).into_owned()))
-                            .map_err(|e| e.to_string())
-                    })
-                    .collect::<Result<HashMap<String, String>, String>>()
-                    .ok()
-                    .filter(|m| !m.is_empty())
-            }),
+            Ok(secret) => decode_secret_environment(secret.data)?,
             Err(kube::Error::Api(ae)) if ae.code == 404 => None,
             Err(e) => {
                 return Err(ContainerRuntimeError::K8sError(format!(
@@ -557,3 +545,52 @@ impl KubernetesRuntime {
 pub(crate) use super::k8s_app_status_derive::container_error_message;
 use super::k8s_app_status_derive::unschedulable_message;
 use super::k8s_app_status_derive::{derive_phase, derive_port_statuses, probe_to_health_check};
+
+// Kubernetes ByteString deserialization already removes the wire base64 layer.
+fn decode_secret_environment(
+    data: Option<std::collections::BTreeMap<String, k8s_openapi::ByteString>>,
+) -> ContainerRuntimeResult<Option<HashMap<String, String>>> {
+    data.map(|data| {
+        data.into_iter()
+            .map(|(key, value)| {
+                String::from_utf8(value.0)
+                    .map(|decoded| (key, decoded))
+                    .map_err(|_| {
+                        ContainerRuntimeError::ConfigurationError(
+                            "Application Secret contains a non-UTF-8 environment value".into(),
+                        )
+                    })
+            })
+            .collect::<ContainerRuntimeResult<HashMap<String, String>>>()
+    })
+    .transpose()
+    .map(|values| values.filter(|values| !values.is_empty()))
+}
+
+#[cfg(test)]
+mod secret_environment_tests {
+    use super::*;
+    use k8s_openapi::api::core::v1::Secret;
+
+    #[test]
+    fn secret_wire_encoding_is_removed_exactly_once() {
+        let secret: Secret = serde_json::from_value(serde_json::json!({
+            "data": {"POSTGRES_PASSWORD": "WVdKag=="}
+        }))
+        .unwrap();
+        let values = decode_secret_environment(secret.data).unwrap().unwrap();
+        assert_eq!(values["POSTGRES_PASSWORD"], "YWJj");
+    }
+
+    #[test]
+    fn invalid_utf8_is_an_error_instead_of_discarding_all_secrets() {
+        let secret: Secret = serde_json::from_value(serde_json::json!({
+            "data": {"POSTGRES_PASSWORD": "/w==", "OTHER": "b2s="}
+        }))
+        .unwrap();
+        assert!(matches!(
+            decode_secret_environment(secret.data),
+            Err(ContainerRuntimeError::ConfigurationError(_))
+        ));
+    }
+}

@@ -65,9 +65,19 @@ impl MockRuntime {
     }
 }
 
-struct TestWakeLease(Arc<AtomicBool>);
+struct TestWakeLease(Arc<AtomicBool>, String);
 #[async_trait::async_trait]
 impl shared_types::AppOperationLease for TestWakeLease {
+    fn receipt(&self) -> Option<shared_types::UserAppOperationLeaseReceipt> {
+        Some(shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+            service_type: shared_types::ServiceType::Userapp,
+            namespace: "test".into(),
+            name: format!("rcoder-operation-prod-{}", self.1),
+            uid: format!("lease-{}", self.1),
+            resource_version: "1".into(),
+            token: "test-wake-operation".into(),
+        })
+    }
     async fn release(self: Box<Self>) -> Result<(), String> {
         self.0.store(false, Ordering::SeqCst);
         Ok(())
@@ -79,14 +89,17 @@ impl WorkspaceRuntime for MockRuntime {}
 impl UserAppDeploymentRuntime for MockRuntime {
     async fn acquire_app_operation(
         &self,
-        _app_id: &str,
+        app_id: &str,
     ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
         if self.lease_held.swap(true, Ordering::SeqCst) {
             return Err(ContainerRuntimeError::Conflict(
                 "operation still owned".into(),
             ));
         }
-        Ok(Some(Box::new(TestWakeLease(self.lease_held.clone()))))
+        Ok(Some(Box::new(TestWakeLease(
+            self.lease_held.clone(),
+            app_id.to_owned(),
+        ))))
     }
 
     async fn capture_app_mutation_target(
@@ -187,6 +200,7 @@ async fn attach_coordinator(
         .await
         .expect("application identity");
     let service = Arc::new(crate::service::AppService {
+        operation_flight: Arc::default(),
         config: crate::config::AppManagerConfig {
             access_mode: crate::config::AppAccessMode::Kubernetes,
             ..Default::default()
@@ -196,7 +210,8 @@ async fn attach_coordinator(
         pingora: None,
         pingora_ports: DashMap::new(),
         release_locks: DashMap::new(),
-        metadata: crate::runtime::metadata::AppMetadataStore::new(store),
+        metadata: crate::runtime::metadata::AppMetadataStore::new(store.clone()),
+        runtime_configuration: store,
         dev_cleanup: std::sync::RwLock::new(None),
         dev_locator: std::sync::RwLock::new(None),
         builder_recovery: std::sync::RwLock::new(None),
@@ -213,19 +228,19 @@ async fn touch_throttle_collapses_writes_within_window() {
     // 窗口取 500ms（循环名义 50ms 留 10 倍余量）：此前 100ms 窗口下负载漂移
     // 可使循环实际超窗（实测 ~110ms），第一段断言高频 flaky
     let reg = AppActivityRegistry::new_with(Duration::from_secs(1), Duration::from_millis(500));
-    reg.touch("appa");
+    reg.record_local_access("appa");
     let t0 = reg.last_accessed_at("appa").expect("first touch recorded");
 
     // 窗口内多次 touch 不更新
     for _ in 0..10 {
-        reg.touch("appa");
+        reg.record_local_access("appa");
         sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(reg.last_accessed_at("appa"), Some(t0), "throttled");
 
     // 超过窗口后更新
     sleep(Duration::from_millis(600)).await;
-    reg.touch("appa");
+    reg.record_local_access("appa");
     assert!(
         reg.last_accessed_at("appa").unwrap() > t0,
         "updated after window"
@@ -343,7 +358,7 @@ async fn recycle_transition_rejects_stale_access_observation() {
         .last_accessed_at("appr")
         .expect("seeded access timestamp");
     sleep(Duration::from_millis(1)).await;
-    registry.touch("appr");
+    registry.record_local_access("appr");
 
     assert!(registry.try_begin_recycle("appr", observed).is_none());
     assert!(!registry.is_stopped("appr"));
@@ -540,6 +555,47 @@ fn merge_accessed_takes_max_and_backfills_memory() {
     let stale_t = old_t - chrono::Duration::hours(1);
     assert_eq!(reg.merge_accessed("appg", stale_t), new_t);
     assert_eq!(reg.last_accessed_at("appg"), Some(new_t), "旧值不覆盖");
+}
+
+#[test]
+fn activity_collection_and_deletion_keep_captured_lifecycle() {
+    let registry = AppActivityRegistry::new(Duration::from_secs(5));
+    assert!(registry.bind_lifecycle("activityapp", "old", 1));
+    registry.record_local_access("activityapp");
+    let captured = registry.collect_dirty();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].lifecycle_id, "old");
+    registry.forget_app("activityapp");
+    assert!(registry.bind_lifecycle("activityapp", "new", 2));
+    registry.record_local_access("activityapp");
+    assert!(!registry.bind_lifecycle("activityapp", "old", 1));
+    assert_eq!(
+        registry.drain_deleted(),
+        vec![("activityapp".into(), "old".into())]
+    );
+    let current = registry.collect_dirty();
+    assert_eq!(current[0].lifecycle_id, "new");
+    assert_eq!(
+        captured[0].lifecycle_id, "old",
+        "In-flight batch cannot be rebound by recreation"
+    );
+}
+
+#[test]
+fn loaded_activity_never_restores_wake_policy_or_regresses_epoch() {
+    let registry = AppActivityRegistry::new(Duration::from_secs(5));
+    assert!(registry.bind_lifecycle("activityapp", "new", 2));
+    registry.record_local_access("activityapp");
+    let before = registry.last_accessed_at("activityapp");
+    registry.apply_loaded(vec![shared_types::ActivityRow {
+        app_id: "activityapp".into(),
+        lifecycle_id: "old".into(),
+        lifecycle_epoch: 1,
+        last_accessed: Some(Utc::now() + chrono::Duration::days(1)),
+    }]);
+    assert_eq!(registry.last_accessed_at("activityapp"), before);
+    assert!(!registry.is_stopped("activityapp"));
+    assert!(!registry.is_wake_blocked("activityapp"));
 }
 
 /// 验证 Fix3:leader 中途 panic(result 未写入)时,`WakeGuard` drop 必须广播 `Failed`,
@@ -814,4 +870,140 @@ async fn traffic_wake_retains_confirmation_gate_while_start_is_in_flight() {
         WakeOutcome::Failed(_)
     ));
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn late_identity_lookup_cannot_restore_deleted_activity() {
+    let registry = Arc::new(AppActivityRegistry::new(Duration::from_secs(5)));
+    let (service, _directory) =
+        attach_coordinator(&registry, Arc::new(MockRuntime::new(true)), "lateactivity").await;
+    let identity = service
+        .metadata
+        .store
+        .get_application("lateactivity")
+        .await
+        .unwrap()
+        .unwrap();
+    let before = registry.access_identity_version("lateactivity");
+    // The request read an Active root, then local deletion invalidated it before
+    // its async lookup completed. Even the previously unregistered case is fenced.
+    registry.forget_app("lateactivity");
+    assert!(
+        registry
+            .record_verified_access("lateactivity", before, &identity)
+            .is_none()
+    );
+    assert!(registry.last_accessed_at("lateactivity").is_none());
+    assert!(registry.collect_dirty().is_empty());
+}
+
+#[test]
+fn old_peer_activity_cannot_merge_into_new_lifecycle() {
+    let registry = AppActivityRegistry::new(Duration::from_secs(5));
+    registry.bind_lifecycle("peeractivity", "old", 1);
+    registry.bind_lifecycle("peeractivity", "new", 2);
+    registry.record_local_access("peeractivity");
+    let before = registry.last_accessed_at("peeractivity");
+    assert!(
+        registry
+            .merge_lifecycle_accessed(
+                "peeractivity",
+                "old",
+                1,
+                Utc::now() + chrono::Duration::hours(1)
+            )
+            .is_none()
+    );
+    assert_eq!(registry.last_accessed_at("peeractivity"), before);
+}
+
+#[derive(Default)]
+struct ActivityFlushStub {
+    fail_write: AtomicBool,
+    fail_delete: AtomicBool,
+    writes: StdMutex<Vec<shared_types::ActivityRow>>,
+    deletes: StdMutex<Vec<(String, String)>>,
+}
+#[async_trait::async_trait]
+impl shared_types::ActivityPersistence for ActivityFlushStub {
+    async fn flush_batch(&self, rows: Vec<shared_types::ActivityRow>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.fail_write.load(Ordering::SeqCst),
+            "injected activity write failure"
+        );
+        self.writes.lock().unwrap().extend(rows);
+        Ok(())
+    }
+    async fn delete(&self, app: &str, lifecycle: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.fail_delete.load(Ordering::SeqCst),
+            "injected activity delete failure"
+        );
+        self.deletes
+            .lock()
+            .unwrap()
+            .push((app.into(), lifecycle.into()));
+        Ok(())
+    }
+    async fn load_all(&self) -> anyhow::Result<Vec<shared_types::ActivityRow>> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn failed_final_activity_flush_retains_rows_and_deletion_identity() {
+    let registry = AppActivityRegistry::new(Duration::from_secs(5));
+    let persistence = Arc::new(ActivityFlushStub::default());
+    registry.set_persistence(persistence.clone());
+    registry.bind_lifecycle("flushactivity", "old", 1);
+    registry.record_local_access("flushactivity");
+    persistence.fail_write.store(true, Ordering::SeqCst);
+    assert!(registry.flush_pending().await.is_err());
+    persistence.fail_write.store(false, Ordering::SeqCst);
+    registry.flush_pending().await.unwrap();
+    assert_eq!(persistence.writes.lock().unwrap().len(), 1);
+    assert_eq!(persistence.writes.lock().unwrap()[0].lifecycle_id, "old");
+
+    registry.forget_app("flushactivity");
+    registry.bind_lifecycle("flushactivity", "new", 2);
+    registry.record_local_access("flushactivity");
+    persistence.fail_delete.store(true, Ordering::SeqCst);
+    assert!(registry.flush_pending().await.is_err());
+    persistence.fail_delete.store(false, Ordering::SeqCst);
+    registry.flush_pending().await.unwrap();
+    assert_eq!(
+        *persistence.deletes.lock().unwrap(),
+        vec![("flushactivity".into(), "old".into())]
+    );
+    assert_eq!(
+        persistence
+            .writes
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .lifecycle_id,
+        "new"
+    );
+    registry.flush_pending().await.unwrap();
+    assert_eq!(
+        persistence.writes.lock().unwrap().len(),
+        2,
+        "Successful final flush drains the batch"
+    );
+}
+
+#[test]
+fn late_deletion_completion_cannot_clear_recreated_activity() {
+    let registry = AppActivityRegistry::new(Duration::from_secs(5));
+    registry.bind_lifecycle("recreatedactivity", "new", 2);
+    registry.record_local_access("recreatedactivity");
+    let before = registry.last_accessed_at("recreatedactivity");
+    assert!(!registry.forget_lifecycle("recreatedactivity", "old"));
+    assert_eq!(registry.last_accessed_at("recreatedactivity"), before);
+    assert_eq!(
+        registry.lifecycle_identity("recreatedactivity"),
+        Some(("new".into(), 2))
+    );
+    assert!(registry.drain_deleted().is_empty());
 }

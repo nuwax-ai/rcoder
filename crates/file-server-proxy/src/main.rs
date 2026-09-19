@@ -279,34 +279,34 @@ async fn main() {
         }
         Err(e) => fail(e),
     }
-    // N10：真实关停——SIGTERM/ctrl_c 触发 proxy 停止（关 listener/等在途
-    // 请求排空），内嵌 file-server 的构建/dev 子进程由 file-server 自身的
-    // 生命周期钩子收束；不再永久 pending（SIGKILL 才退的旧行为废弃）。
+    // Always close the listener and drain connections, even if installing the
+    // host signal handler failed. Failure cannot be reported as successful stop.
+    let signal_result = shutdown_signal().await;
+    let stop_result = file_server_proxy::stop().await;
+    if let Err(error) = stop_result {
+        fail(format!("proxy shutdown could not be confirmed: {error}"));
+    }
+    if let Err(error) = signal_result {
+        fail(error);
+    }
+    tracing::info!("file-server-proxy stopped after draining active requests");
+}
+
+async fn shutdown_signal() -> Result<(), String> {
     #[cfg(unix)]
     {
-        let mut sigterm =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(signal) => signal,
-                Err(error) => {
-                    tracing::warn!("install SIGTERM handler failed: {error} — 退化为 ctrl_c");
-                    return;
-                }
-            };
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|error| format!("install SIGTERM handler: {error}"))?;
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => tracing::info!("收到 ctrl_c，开始关停"),
-            _ = sigterm.recv() => tracing::info!("收到 SIGTERM，开始关停"),
+            result = tokio::signal::ctrl_c() => result.map_err(|error| format!("wait for Ctrl-C: {error}")),
+            signal = sigterm.recv() => signal.ok_or_else(|| "SIGTERM signal stream closed".to_owned()),
         }
     }
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c()
             .await
-            .map_err(|e| format!("install ctrl_c handler: {e}"))?;
-        tracing::info!("收到 ctrl_c，开始关停");
-    }
-    match file_server_proxy::stop().await {
-        Ok(()) => tracing::info!("file-server-proxy 已关停（在途请求排空完成）"),
-        Err(e) => tracing::warn!("file-server-proxy 关停未完全确认: {e}"),
+            .map_err(|error| format!("wait for Ctrl-C: {error}"))
     }
 }
 

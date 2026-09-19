@@ -217,6 +217,13 @@ impl AppService {
         let mut stopped = 0u32;
         let mut running = 0u32;
         for s in deploys {
+            if let Some(identity) = self.metadata.store.get_application(&s.app_id).await? {
+                self.activity.bind_lifecycle(
+                    &s.app_id,
+                    &identity.lifecycle_id,
+                    identity.lifecycle_epoch,
+                );
+            }
             if deletion_fences.contains(&s.app_id) {
                 continue;
             }

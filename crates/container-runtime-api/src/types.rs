@@ -33,6 +33,11 @@ pub enum ContainerRuntimeError {
     #[error("Container stop failed: {0}")]
     ContainerStopError(String),
 
+    /// The owned workload exists, but no running management container is available.
+    /// Not an ownership/transport error and never permission to bypass admission.
+    #[error("Owned management container is not running")]
+    ManagementNotRunning,
+
     #[error("Container not found: {0}")]
     ContainerNotFound(String),
 

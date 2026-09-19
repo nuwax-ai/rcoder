@@ -256,7 +256,7 @@ async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<Builder
     }
 }
 
-pub(super) async fn capture_bound_target(
+pub(crate) async fn capture_bound_target(
     state: &AppState,
     context: &UserAppExecutionContext,
 ) -> Result<shared_types::BuilderControlTarget> {

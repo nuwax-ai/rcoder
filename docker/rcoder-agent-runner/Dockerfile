@@ -182,7 +182,9 @@ RUN chmod +x /usr/local/bin/ime_server.py
 # 复制 ttyd 启动脚本和自定义前端页面
 COPY ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
 
-# 复制 PostgreSQL supervisor 入口脚本（幂等 initdb + exec postgres，异步于 agent_runner）
+# 复制 PostgreSQL supervisor 入口脚本（幂等 initdb + owned postgres/bootstrap，异步于 agent_runner）
+COPY pg-admin-identity.sh /usr/local/bin/pg-admin-identity.sh
+COPY pg-supervise.py /usr/local/bin/pg-supervise.py
 COPY pg-supervisor-entry.sh /usr/local/bin/pg-supervisor-entry.sh
 RUN chmod +x /usr/local/bin/pg-supervisor-entry.sh
 

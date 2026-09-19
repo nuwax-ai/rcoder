@@ -18,6 +18,9 @@
 //! - pg（cfg feature="pg"）: PgStore + writer + 启动加载 + write-behind op 模型
 //!   （persist_ops）——feature 门控的代码全部收在本子树
 
+#[cfg(any(feature = "pg", feature = "userapp-turso"))]
+mod db;
+
 mod adapter;
 mod backend;
 pub mod config;

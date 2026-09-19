@@ -109,12 +109,17 @@ use crate::handler;
         crate::userapp_forward::forward::flat_dev_projects_confirm,
         crate::userapp_forward::forward::flat_dev_install_project,
         crate::userapp_forward::db::reset_password,
+        crate::userapp_forward::db::recover_password,
         crate::userapp_forward::db::create_database,
+        crate::userapp_forward::runtime_configuration::save,
+        crate::userapp_forward::runtime_configuration::status,
     ),
     components(
         schemas(
             // userApp 转发层（PG 账号/库管理；create-workspace 为内部接口不入文档）
             shared_types::UserappDbResetPasswordRequest,
+            shared_types::UserappDbPasswordRecoveryRequest,
+            shared_types::UserappDbPasswordRecoveryResponse,
             shared_types::UserappDbCreateDatabaseRequest,
             // 日志域 wire DTO（与容器内 app-cli 同源；logs/sources/query + logs/query 响应面）
             shared_types::LogQueryRequest,

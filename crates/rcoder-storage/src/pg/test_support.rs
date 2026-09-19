@@ -9,29 +9,64 @@
 
 use std::time::Duration;
 
-use sqlx::{PgPool, Row};
-
+use crate::db::{owner::DatabaseOwner, schema::Component};
 pub(crate) const DSN_ENV: &str = "RCODER_PG_TEST_DSN";
 
-/// 测试库连接（未设 DSN → None → 用例跳过）
 pub(crate) async fn test_dsn() -> Option<String> {
-    std::env::var(DSN_ENV).ok().filter(|s| !s.is_empty())
+    let dsn = std::env::var(DSN_ENV).ok().filter(|s| !s.is_empty());
+    assert!(
+        dsn.is_some() || std::env::var("RCODER_PG_TEST_STRICT").as_deref() != Ok("1"),
+        "Strict PG tests require a disposable DSN"
+    );
+    dsn
+}
+pub(crate) async fn database(dsn: &str) -> DatabaseOwner {
+    crate::db::postgres::open(
+        &crate::config::PostgresConfig {
+            url: Some(dsn.into()),
+            ..Default::default()
+        },
+        vec![Component::Project],
+    )
+    .await
+    .expect("disposable PG database")
 }
 
-/// 等待 write-behind 落盘（轮询直到断言查询有行/无行，上限 5s）
-pub(crate) async fn wait_for(pool: &PgPool, sql: &str, expect_rows: i64) -> bool {
+pub(crate) async fn wait_for(owner: &DatabaseOwner, sql: &str, expect_rows: i64) -> bool {
     for _ in 0..100 {
-        // 动态 count 查询由测试方 format! 拼接（仅测试内常量标识符，无外部输入），
-        // 经 AssertSqlSafe 显式声明已审计（SqlSafeStr 的官方逃生口）
-        if let Ok(row) = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch_one(pool).await {
-            let count: i64 = row.get(0);
-            if count == expect_rows {
-                return true;
-            }
+        let sql = sql.to_owned();
+        let rows = owner
+            .execute(move |mut db| async move { Ok(toasty::sql::query(sql).exec(&mut db).await?) })
+            .await;
+        if let Ok(rows) = rows
+            && let [toasty_core::stmt::Value::Record(record)] = rows.as_slice()
+            && let [toasty_core::stmt::Value::I64(count)] = record.fields.as_slice()
+            && *count == expect_rows
+        {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     false
+}
+
+pub(crate) async fn optional_text(owner: &DatabaseOwner, sql: &str, id: &str) -> Option<String> {
+    let sql = sql.to_owned();
+    let id = id.to_owned();
+    let rows = owner
+        .execute(
+            move |mut db| async move { Ok(toasty::sql::query(sql).bind(id).exec(&mut db).await?) },
+        )
+        .await
+        .unwrap();
+    match rows.as_slice() {
+        [] => None,
+        [toasty_core::stmt::Value::Record(record)] => match record.fields.as_slice() {
+            [toasty_core::stmt::Value::String(value)] => Some(value.clone()),
+            _ => panic!("Unexpected text column type"),
+        },
+        _ => panic!("Unexpected scalar query shape"),
+    }
 }
 
 pub(crate) fn uuid_suffix() -> String {

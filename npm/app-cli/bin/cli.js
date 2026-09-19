@@ -41,12 +41,12 @@ try {
   process.exit(1);
 }
 
-// win32：serve 需要 pingap 反代，把包内 pingap.exe 经 env 注入（app-cli 的
-// 默认值 /usr/local/bin/pingap 在 Windows 不存在）。仅用户未显式设置时注入——
+// All bundled platforms use their paired Pingap instead of a possibly stale
+// system installation. Only inject when the caller has not configured it:
 // 显式 APP_CLI_PINGAP_BIN / --pingap-bin 优先。
 let childEnv;
-if (platform === "win32") {
-  const pingapPath = path.join(path.dirname(binPath), "pingap.exe");
+{
+  const pingapPath = path.join(path.dirname(binPath), platform === "win32" ? "pingap.exe" : "pingap");
   if (!process.env.APP_CLI_PINGAP_BIN && fs.existsSync(pingapPath)) {
     childEnv = { ...process.env, APP_CLI_PINGAP_BIN: pingapPath };
   }

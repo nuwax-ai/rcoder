@@ -143,6 +143,7 @@ fn spawn_cli(
         .env_remove("APP_RELEASE_ID")
         .env_remove("APP_DEPLOY_OPERATION_ID")
         .env_remove("APP_DEPLOY_GENERATION_ID")
+        .env("RUST_LOG", "app_cli=info")
         .env("APP_CLI_SKIP_PG_WAIT", "1");
     if skip_pingap_confirm {
         // fake pingap 无 admin 通道：跳过初始配置确认（配置正确性由 -t 兜底）
@@ -218,21 +219,29 @@ fn wait_port_released(port: u16, deadline: Instant, what: &str) {
 fn wait_log_marker(child: &mut Child, marker: &str, budget: Duration) {
     use std::io::{BufRead, BufReader};
     let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
     let deadline = Instant::now() + budget;
     let mut seen = String::new();
-    for line in BufReader::new(stderr).lines() {
-        let line = line.expect("read stderr line");
+    loop {
+        let line = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|error| {
+                panic!("app-cli never logged {marker:?}: {error}; output:\n{seen}")
+            })
+            .expect("read stderr line");
         seen.push_str(&line);
         seen.push('\n');
         if line.contains(marker) {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "app-cli never logged {marker:?}; output so far:\n{seen}"
-        );
     }
-    panic!("app-cli stderr closed before {marker:?}; output:\n{seen}");
 }
 
 /// 等进程退出并返回退出码（有界，不读管道）。

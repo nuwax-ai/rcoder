@@ -18,6 +18,7 @@ pub mod build_event;
 pub mod builder_instance;
 pub mod db_admin;
 pub mod db_align;
+pub mod db_password;
 pub mod dev_cleanup;
 pub mod dev_locator;
 pub mod forward_contract;
@@ -31,6 +32,7 @@ pub mod builder_control;
 pub mod resource_binding;
 
 pub mod operation_lease;
+pub mod runtime_configuration;
 pub mod runtime_control;
 
 pub mod builder_recovery;

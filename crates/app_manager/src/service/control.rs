@@ -67,7 +67,26 @@ impl OwnedOperation {
         request: UserAppAdmission,
         input: Option<&shared_types::UserAppExecutionInput>,
     ) -> AppResult<Self> {
-        let record = match store.admit_with_input(&request, input).await? {
+        Self::admit_with_configuration(store, request, input, None).await
+    }
+
+    pub(crate) async fn admit_with_configuration(
+        store: Arc<dyn UserAppLifecycleStore>,
+        request: UserAppAdmission,
+        input: Option<&shared_types::UserAppExecutionInput>,
+        pg: Option<&shared_types::StartPgCredential>,
+    ) -> AppResult<Self> {
+        let outcome = if let Some(input) = input {
+            store.admit_with_configuration(&request, input, pg).await?
+        } else {
+            if pg.is_some() {
+                return Err(AppOperationError::Validation(
+                    "Deployment credentials require private input".into(),
+                ));
+            }
+            store.admit_with_input(&request, None).await?
+        };
+        let record = match outcome {
             UserAppAdmissionOutcome::Accepted(record) => record,
             UserAppAdmissionOutcome::Existing(record) => {
                 return Err(AppOperationError::Conflict(format!(
@@ -165,7 +184,10 @@ impl OwnedOperation {
         .await
     }
     pub(crate) async fn fail(mut self, error: &AppOperationError) -> AppResult<()> {
-        let state = if self.record.step == "claimed" && self.record.checkpoint.is_null() {
+        let state = if !error.requires_recovery()
+            && self.record.step == "claimed"
+            && self.record.checkpoint.is_null()
+        {
             UserAppOperationState::Failed
         } else {
             UserAppOperationState::RecoveryRequired
@@ -184,6 +206,9 @@ impl OwnedOperation {
         mut self,
         error: &AppOperationError,
     ) -> AppResult<()> {
+        if error.requires_recovery() {
+            return self.fail(error).await;
+        }
         if self.record.kind.ends_lifecycle() {
             return Err(AppOperationError::Conflict(
                 "Deletion requires checkpoint-specific failure handling".into(),
@@ -446,6 +471,63 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn credential_uncertainty_cannot_use_no_mutation_terminal_path() {
+        for (suffix, mutation) in [
+            ("unknown", shared_types::CredentialMutationEvidence::Unknown),
+            (
+                "unverified",
+                shared_types::CredentialMutationEvidence::AppliedButUnverified,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = test_service(directory.path(), Arc::new(MockRuntime::default())).await;
+            let app_id = format!("credential{suffix}");
+            let identity = service
+                .metadata
+                .store
+                .ensure_identity(&app_id)
+                .await
+                .unwrap();
+            let operation_id = format!("operation{suffix}");
+            let operation = OwnedOperation::admit(
+                service.metadata.store.clone(),
+                UserAppAdmission {
+                    runtime_policy_on_success: None,
+                    command: None,
+                    metadata: None,
+                    app_id: app_id.clone(),
+                    lifecycle_id: Some(identity.lifecycle_id),
+                    operation_id: operation_id.clone(),
+                    request_id: None,
+                    request_fingerprint: "a".repeat(64),
+                    kind: shared_types::UserAppOperationKind::Start,
+                },
+            )
+            .await
+            .unwrap();
+            let error = AppOperationError::CredentialApplication {
+                message: "Credential result requires recovery".into(),
+                mutation,
+            };
+            operation.reject_without_mutation(&error).await.unwrap();
+            let current = service
+                .get_control_operation(&app_id, Some(&operation_id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.state, UserAppOperationState::RecoveryRequired);
+            assert!(
+                service
+                    .get_control_operation(&app_id, None)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "uncertain credentials must retain the operation slot"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn operation_queries_validate_owner_and_hide_internal_checkpoints() {
         let directory = tempfile::tempdir().expect("directory");
         let service = test_service(directory.path(), Arc::new(MockRuntime::default())).await;
@@ -465,7 +547,7 @@ mod tests {
                 lifecycle_id: Some(identity.lifecycle_id),
                 operation_id: "operation-query".into(),
                 request_id: Some("request".into()),
-                request_fingerprint: "fingerprint".into(),
+                request_fingerprint: "a".repeat(64),
                 kind: shared_types::UserAppOperationKind::Start,
             },
         )

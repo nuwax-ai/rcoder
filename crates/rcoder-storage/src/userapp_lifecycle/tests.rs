@@ -129,7 +129,7 @@ async fn metadata_changes_commit_with_admission_and_never_before_rejection() {
 }
 
 // 原子性反例的中途存储失败注入已由 Turso 后端原位覆盖
-// （`turso::tests::turso_failure_midway_rolls_back_entire_admission`）。
+// （`common::local_tests::failed_admission_rolls_back_every_row_and_same_request_can_retry`）。
 
 async fn request_identity_spans_recreation_and_control(store: &dyn UserAppLifecycleStore) {
     for (index, bad_request_id) in [" ".to_owned(), "a".repeat(129)].into_iter().enumerate() {
@@ -213,26 +213,39 @@ async fn storage_deletion_does_not_end_the_application_lifecycle() {
     storage_deletion_preserves_lifecycle(&store).await;
 }
 
-async fn paginated_scan_and_import_contract(store: &dyn UserAppLifecycleStore) {
-    let old = shared_types::AppMetadataRecord {
-        app_id: "import-contract".into(),
-        generation: "legacy-generation".into(),
-        name: Some("original".into()),
-        tenant_id: Some("tenant".into()),
-        space_id: None,
-        created_at: chrono::Utc::now() - chrono::Duration::days(1),
-    };
-    let imported = store.import_application(&old).await.unwrap();
-    assert_eq!(imported.created_at, old.created_at);
-    assert_eq!(imported.name, old.name);
-    assert_eq!(imported, store.import_application(&old).await.unwrap());
-    let mut delete = request("import-delete", Kind::DeleteApplication);
-    delete.app_id = old.app_id.clone();
+async fn paginated_scan_and_identity_contract(store: &dyn UserAppLifecycleStore) {
+    let original = store.ensure_identity("scanidentity").await.unwrap();
+    let patched = store
+        .patch_metadata(&shared_types::UserAppMetadataPatch {
+            app_id: original.app_id.clone(),
+            lifecycle_id: original.lifecycle_id.clone(),
+            expected_revision: original.metadata_revision,
+            name: Some(Some("original".into())),
+            tenant_id: Some(Some("tenant".into())),
+            space_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(patched.created_at, original.created_at);
+    assert_eq!(
+        patched,
+        store.ensure_identity(&original.app_id).await.unwrap()
+    );
+    let mut delete = request("scandelete", Kind::DeleteApplication);
+    delete.app_id = original.app_id.clone();
     let op = operation(store.admit(&delete).await.unwrap());
     complete(store, &op, State::Succeeded).await;
-    let tombstone = store.import_application(&old).await.unwrap();
+    assert!(matches!(
+        store.ensure_identity(&original.app_id).await,
+        Err(Error::LifecycleConflict)
+    ));
+    let tombstone = store
+        .get_application(&original.app_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(tombstone.state, UserAppLifecycleState::Deleted);
-    assert_eq!(tombstone.lifecycle_id, imported.lifecycle_id);
+    assert_eq!(tombstone.lifecycle_id, original.lifecycle_id);
 
     let mut expected = Vec::new();
     for i in 0..5 {
@@ -269,7 +282,7 @@ async fn paginated_scan_and_import_contract(store: &dyn UserAppLifecycleStore) {
         cursor = page.last().map(|app| app.app_id.clone());
         apps.extend(page.into_iter().map(|app| app.app_id));
     }
-    assert!(apps.contains(&old.app_id));
+    assert!(apps.contains(&original.app_id));
     assert!(apps.windows(2).all(|pair| pair[0] < pair[1]));
     assert_eq!(
         apps.iter().filter(|id| id.starts_with("scan-app-")).count(),
@@ -280,9 +293,9 @@ async fn paginated_scan_and_import_contract(store: &dyn UserAppLifecycleStore) {
 }
 
 #[tokio::test]
-async fn turso_paginated_recovery_and_legacy_import() {
+async fn turso_paginated_recovery_and_identity() {
     let (_directory, store) = database().await;
-    paginated_scan_and_import_contract(&store).await;
+    paginated_scan_and_identity_contract(&store).await;
 }
 
 async fn control_command_is_durable_and_part_of_deduplication(store: &dyn UserAppLifecycleStore) {
@@ -986,87 +999,44 @@ async fn metadata_cas_preserves_unmentioned_fields_and_noop_revision() {
     assert_eq!(renamed.created_at, changed.created_at);
 }
 
-/// Run explicitly with --ignored and an isolated PG 17 DSN. Missing environment
+/// Run explicitly with --ignored and an isolated PostgreSQL DSN. Missing environment
 /// fails this test; it never turns an explicit integration run into a skip.
 #[cfg(feature = "pg")]
-#[cfg(feature = "pg")]
 #[tokio::test]
-#[ignore = "requires RCODER_USERAPP_PG_TEST_DSN for an isolated PG 17 instance"]
+#[ignore = "requires RCODER_USERAPP_PG_TEST_DSN for an isolated PostgreSQL instance"]
 async fn postgres_real_transactions_and_restart_contract() {
-    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-    use std::str::FromStr;
     let dsn =
         std::env::var("RCODER_USERAPP_PG_TEST_DSN").expect("explicit PG integration DSN required");
-    let admin = sqlx::PgPool::connect(&dsn).await.unwrap();
+    let mut admin = toasty::Db::builder().connect(&dsn).await.unwrap();
     let schema = format!("userapp_test_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&admin)
+    toasty::sql::statement(format!("CREATE SCHEMA {schema}"))
+        .exec(&mut admin)
         .await
         .unwrap();
-    let options = PgConnectOptions::from_str(&dsn)
-        .unwrap()
-        .options([("search_path", schema.as_str())]);
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect_with(options.clone())
-        .await
-        .unwrap();
-    let store = PgUserAppStore::open(pool.clone()).await.unwrap();
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    let config = crate::config::PostgresConfig {
+        url: Some(format!("{dsn}{separator}options=-csearch_path%3D{schema}")),
+        ..Default::default()
+    };
+    let store = std::sync::Arc::new(PgUserAppStore::connect(&config).await.unwrap());
+    let tested = store.clone();
     let result = tokio::spawn(async move {
-        use shared_types::AppMetadataPersistence as _;
-        // Exercise the actual legacy schema/migrations and importer, not just a
-        // newly constructed record passed directly to the new storage contract.
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        let legacy = crate::pg::userapp::metadata::PgAppMetadataPersistence::new(pool.clone());
-        let old = shared_types::AppMetadataRecord {
-            app_id: "legacy-pg-app".into(),
-            generation: "legacy-pg-generation".into(),
-            name: Some("original name".into()),
-            tenant_id: None,
-            space_id: None,
-            created_at: chrono::Utc::now() - chrono::Duration::days(2),
-        };
-        legacy.upsert(&old).await.unwrap();
-        store.import_legacy_metadata().await.unwrap();
-        let imported = store.get_application(&old.app_id).await.unwrap().unwrap();
-        assert_eq!(imported.name, old.name);
-        assert_eq!(
-            imported.created_at.timestamp_micros(),
-            old.created_at.timestamp_micros()
-        );
-        let mut deletion = request("legacy-pg-delete", Kind::DeleteApplication);
-        deletion.app_id = old.app_id.clone();
-        complete(
-            &store,
-            &operation(store.admit(&deletion).await.unwrap()),
-            State::Succeeded,
-        )
-        .await;
-        store.import_legacy_metadata().await.unwrap();
-        assert_eq!(
-            store
-                .get_application(&old.app_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            UserAppLifecycleState::Deleted
-        );
-        storage_deletion_preserves_lifecycle(&store).await;
-        admission_metadata_is_atomic(&store).await;
-        request_identity_spans_recreation_and_control(&store).await;
-        paginated_scan_and_import_contract(&store).await;
-        control_command_is_durable_and_part_of_deduplication(&store).await;
-        private_execution_input_contract(&store).await;
-        operation_lease_contract(&store).await;
-        operation_deadline_contract(&store).await;
-        physical_binding_is_atomic_and_cannot_cross_lifecycles(&store).await;
-        runtime_policy_commits_only_with_success(&store).await;
-        configuration_policy_is_transactional(&store).await;
-        deletion_success_requires_committed_evidence(&store).await;
-        control_snapshot_links_identity_and_operation(&store).await;
-        cross_scope_admission_is_independent(&store).await;
-        dev_uncertainty_does_not_block_prod(&store).await;
+        let store = tested.as_ref();
+        storage_deletion_preserves_lifecycle(store).await;
+        admission_metadata_is_atomic(store).await;
+        request_identity_spans_recreation_and_control(store).await;
+        paginated_scan_and_identity_contract(store).await;
+        control_command_is_durable_and_part_of_deduplication(store).await;
+        private_execution_input_contract(store).await;
+        operation_lease_contract(store).await;
+        operation_deadline_contract(store).await;
+        physical_binding_is_atomic_and_cannot_cross_lifecycles(store).await;
+        runtime_policy_commits_only_with_success(store).await;
+        configuration_policy_is_transactional(store).await;
+        deletion_success_requires_committed_evidence(store).await;
+        control_snapshot_links_identity_and_operation(store).await;
+        cross_scope_admission_is_independent(store).await;
+        dev_uncertainty_does_not_block_prod(store).await;
         let a = store.ensure_identity("contract-app").await.unwrap();
         assert_eq!(a, store.ensure_identity("contract-app").await.unwrap());
         let first = request("first", Kind::EnsureBuilder);
@@ -1101,7 +1071,7 @@ async fn postgres_real_transactions_and_restart_contract() {
                 .await
                 .unwrap(),
         );
-        complete(&store, &deletion, State::Succeeded).await;
+        complete(store, &deletion, State::Succeeded).await;
         let next = store
             .recreate("contract-app", &op.lifecycle_id, "recreation")
             .await
@@ -1131,13 +1101,8 @@ async fn postgres_real_transactions_and_restart_contract() {
                 .unwrap()
                 .is_none()
         );
-        pool.close().await;
-        let reopened = PgPoolOptions::new()
-            .max_connections(2)
-            .connect_with(options)
-            .await
-            .unwrap();
-        let restored = PgUserAppStore::open(reopened.clone()).await.unwrap();
+        store.shutdown().await.unwrap();
+        let restored = PgUserAppStore::connect(&config).await.unwrap();
         assert_eq!(
             restored
                 .get_application("contract-app")
@@ -1146,16 +1111,16 @@ async fn postgres_real_transactions_and_restart_contract() {
                 .unwrap(),
             next
         );
-        reopened.close().await;
+        restored.shutdown().await.unwrap();
     })
     .await;
-    // The schema is generated exclusively by this test; cleanup also runs if an
-    // assertion in the isolated worker panics.
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&admin)
+    store.shutdown().await.unwrap();
+    // Only the generated schema owned by this test is removed, including when
+    // its contract task panics. Production initialization never resets a schema.
+    toasty::sql::statement(format!("DROP SCHEMA {schema} CASCADE"))
+        .exec(&mut admin)
         .await
         .unwrap();
-    admin.close().await;
     result.expect("PG lifecycle contract failed");
 }
 
@@ -1217,7 +1182,7 @@ async fn turso_control_snapshot_contract() {
 }
 
 // 损坏数据反例（lifecycle 槽位指向不存在的操作）已由 Turso 后端原位
-// 覆盖（`turso::tests::turso_control_snapshot_rejects_broken_operation_link`）。
+// 覆盖（`common::local_tests::broken_slot_is_rejected_instead_of_reported_idle`）。
 
 async fn deletion_success_requires_committed_evidence(store: &dyn UserAppLifecycleStore) {
     use shared_types::{UserAppDeletionCheckpoint, UserAppDeletionStage as Stage};
@@ -1478,7 +1443,7 @@ async fn another_executor_cannot_advance_a_running_operation() {
 }
 
 // 取消不留事务的等价保护已由 Turso worker 架构原位覆盖
-// （`turso::tests::turso_cancelled_caller_and_dangling_transaction_do_not_leak`）。
+// （`db::tests::cancelled_caller_does_not_cancel_admitted_transaction / abandoned_transaction_rolls_back_before_connection_reuse`）。
 
 async fn private_execution_input_contract(store: &dyn UserAppLifecycleStore) {
     let input = shared_types::UserAppExecutionInput::new("{\"password\":\"private-token\"}".into());

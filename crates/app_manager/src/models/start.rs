@@ -14,7 +14,7 @@ use utoipa::ToSchema;
 /// 不破坏（旧制品 URL 重发即回滚）。
 ///
 /// start 无 `url` 且 app 不存在时**创建空容器**（基础设施形态：PG/ttyd/dbx
-/// 常驻 + app-cli idle 等部署，此形态 `user_id` 必填）；restart 无 `url` 对
+/// 常驻 + app-cli idle 等部署，按 app_id 定位）；restart 无 `url` 对
 /// 不存在的 app 仍 404（重启语义不创建）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct StartAppRequest {
@@ -29,11 +29,6 @@ pub struct StartAppRequest {
     /// 制品包下载 URL（workspace 整体包 zip）。给出即触发轻量部署链。
     #[garde(skip)]
     pub url: Option<String>,
-    /// owner 用户 ID（必填；标识符白名单校验）。start/restart 显式传值直接落
-    /// 容器 create params——Docker compose 数据卷 bind 源
-    /// `prod/{user_id}/data/{app_id}` 分区依据；同批注册 `userapp_metadata`，
-    /// 供 `/api/v1/userapp/proxy/app/prod/{user_id}/...` URL 拼接与"我的应用"归属过滤。
-    /// （metadata 回退→runtime 兜底 app_id 的孤儿目录路径已随必填化退役。）
     /// 请求版本标记。缺省自动生成并在响应返回；与制品 manifest 身份和内部部署操作 ID 分离。
     #[garde(skip)]
     pub release_id: Option<String>,
@@ -49,8 +44,9 @@ pub struct StartAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[garde(skip)]
     pub idle_timeout_seconds: Option<u64>,
-    /// PG 凭据对齐：给出则部署完成后自动连接测试（scram），不一致自动重置为该值
-    /// （对齐失败不阻断部署，结果见响应 `pg_aligned` 字段，可重试）。
+    /// 显式 PG 凭据。已有版本化配置时必须与本操作捕获的版本一致；
+    /// 首次使用时与部署受理同事务创建配置版本；已保存配置不允许被此字段覆盖。
+    /// 配置在迁移/业务启动前应用；失败返回操作失败，不返回带 pg_error 的成功结果。
     #[serde(skip_serializing_if = "Option::is_none")]
     #[garde(skip)]
     pub pg: Option<StartPgCredential>,

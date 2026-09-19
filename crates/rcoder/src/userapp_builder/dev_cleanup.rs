@@ -32,7 +32,7 @@ struct CapturedDeletion {
     /// 协作者实例的 operation 锁（capture 时获取，cleanup 完成后释放——
     /// 防清扫期间并发 ensure 重建实例）。
     extra_leases: Vec<Box<dyn AppOperationLease>>,
-    _local: tokio::sync::OwnedMutexGuard<()>,
+    _local: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 // Read-only capture may be abandoned safely. Once deletion starts, an uncertain
 // Kubernetes operation retains its lease instead of admitting a competing writer.
@@ -111,9 +111,34 @@ impl Drop for BuilderOperation {
 #[async_trait::async_trait]
 impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
     async fn capture(&self, app_id: &str) -> Result<Box<dyn UserappDevDeletion>, String> {
-        // app 级进程内互斥（destroy 语义覆盖全部实例；实例级 ensure 用复合键
-        // 锁，键空间不冲突）。
         let local = super::lifecycle::acquire(app_id).await;
+        let lease = self
+            .runtime
+            .acquire_builder_operation(app_id)
+            .await
+            .map_err(|error| format!("acquire builder deletion: {error}"))?;
+        self.capture_owned(app_id, lease, Some(local)).await
+    }
+    async fn capture_with_lease(
+        &self,
+        app_id: &str,
+        lease: Box<dyn AppOperationLease>,
+    ) -> Result<Box<dyn UserappDevDeletion>, String> {
+        // The caller already holds the lifecycle admission and physical lease.
+        // Do not invert ensure's local -> physical lock order by taking local now.
+        self.capture_owned(app_id, lease, None).await
+    }
+}
+impl UserappDevResourcesCleanup {
+    async fn capture_owned(
+        &self,
+        app_id: &str,
+        lease: Box<dyn AppOperationLease>,
+        local: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<Box<dyn UserappDevDeletion>, String> {
+        // Install read-only cleanup before any fallible observation so failed
+        // capture releases its own lease; a borrowed lease leaves its owner intact.
+        let operation = BuilderOperation::new(lease);
         let app = self
             .store
             .get_application(app_id)
@@ -123,15 +148,6 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
         // 应用共享：instance == 纯 app_id（正式 evidence 链覆盖 lifecycle
         // 持有的唯一 builder；协作者实例模型已随用户绑定移除）。
         let owner_instance = app_id.to_string();
-        let operation = self
-            .runtime
-            .acquire_builder_operation(&owner_instance)
-            .await
-            .map_err(|e| format!("acquire builder deletion: {e}"))?;
-        let operation = BuilderOperation {
-            lease: Some(operation),
-            mutating: false,
-        };
         let mut snapshot = self
             .runtime
             .capture_builder_deletion(&owner_instance)

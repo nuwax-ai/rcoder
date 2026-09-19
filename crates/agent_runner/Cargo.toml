@@ -42,8 +42,7 @@ otel = []  # 启用 OpenTelemetry 追踪功能
 # axum-0-8 供 http_server/router.rs 装配处 hotpath::axum!（关闭时原样返回 router）；
 # tokio 供 hotpath::tokio_runtime!() runtime 指标线程。
 hotpath = ["hotpath/hotpath", "hotpath/threads", "hotpath/tokio", "hotpath/axum-0-8"]
-# 叠加内存分配剖析（依赖本 crate hotpath；开启后 #[hotpath::main] 安装计数全局分配器）
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+# 不启用 hotpath-alloc：Turso 使用自己的全局分配器；保留耗时分析与 MCP。
 # 叠加 MCP server（127.0.0.1:6771，AI 实时查询性能数据；见 AGENTS.md）
 hotpath-mcp = ["hotpath", "hotpath/hotpath-mcp"]
 
