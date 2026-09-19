@@ -297,7 +297,17 @@ fn row_signature(row: &repo::ProjectRow) -> String {
     sig.push('/');
     sig.push_str(row.isolation_type.as_deref().unwrap_or(""));
     sig.push_str("|v:");
-    sig.push_str(row.service_type.as_deref().unwrap_or(""));
+    // 签名按族代表值域比较（镜像侧 hydrate 已归一；存量行可能仍是本义串
+    // 如 computer-normal-project——不归一则每轮 sync 判"变更"空重建，直到
+    // 该行被真实 upsert 覆盖才收敛）
+    sig.push_str(
+        &row
+            .service_type
+            .as_deref()
+            .and_then(|v| v.parse::<shared_types::ServiceType>().ok())
+            .map(|st| st.family_representative().to_string())
+            .unwrap_or_else(|| row.service_type.clone().unwrap_or_default()),
+    );
     sig.push_str("|m:");
     sig.push_str(
         &row.model_provider
