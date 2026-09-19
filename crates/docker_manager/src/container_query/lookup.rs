@@ -36,7 +36,7 @@ impl DockerManager {
             // 缓存侧存家族值/本义值均视为同容器命中）
             // 避免 WebAgentRunner 容器被错误地用于 ComputerAgentRunner 请求
             if let Some(ref container_service_type) = info.service_type {
-                if container_service_type.container_family() != service_type.container_family() {
+                if !container_service_type.same_container_family(*service_type) {
                     debug!(
                         "[FIND_CONTAINER] Service type mismatch: expected={:?}, found={:?}, container={}, skipping",
                         service_type, container_service_type, info.container_name
@@ -272,7 +272,7 @@ impl DockerManager {
                 .service_type
                 .as_ref()
                 .is_none_or(|container_service_type| {
-                    container_service_type.container_family() == service_type.container_family()
+                    container_service_type.same_container_family(*service_type)
                 })
         {
             return Ok(Some(ContainerQueryResult::new(

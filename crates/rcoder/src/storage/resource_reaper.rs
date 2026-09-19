@@ -204,8 +204,9 @@ impl ResourceReaper {
             }
         }
 
-        // 4. 清理 Pingora VNC backend（ComputerAgentRunner）
-        if req.service_type == ServiceType::ComputerAgentRunner
+        // 4. 清理 Pingora VNC backend（Computer 族含常规项目——注册侧对
+        // NormalProject 同样注册，清理须家族归一对称，否则 VNC 路由残留）
+        if req.service_type.is_computer_family()
             && let Some(ref pingora) = self.pingora
         {
             pingora.remove_vnc_backend(&req.identifier);

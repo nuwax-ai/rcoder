@@ -104,7 +104,7 @@ pub async fn handle_ttyd_request(
         .get("X-Ttyd-Service-Type")
         .and_then(|value| value.to_str().ok())
         .and_then(|text| text.parse::<shared_types::ServiceType>().ok())
-        .filter(|st| st.container_family() == shared_types::ServiceType::ComputerAgentRunner)
+        .filter(|st| st.is_computer_family())
         .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
     let ttyd_service_type = ttyd_service_type.to_string();
     upstream_request.insert_header("X-Ttyd-Service-Type", &ttyd_service_type)?;

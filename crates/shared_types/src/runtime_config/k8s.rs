@@ -305,7 +305,7 @@ impl KubernetesConfig {
     /// (仅 WebAgentRunner)兼容。镜像 `MultiImageConfig::get_service_config` 的查找逻辑。
     pub fn get_service_config(&self, service_type: &ServiceType) -> Option<&K8sServiceConfig> {
         // 1. 按规范名查（家族归一：共享容器的类型读同一份配置）
-        let key = service_type.container_family().to_string();
+        let key = service_type.container_family_key().to_string();
         if let Some(cfg) = self.services.get(&key) {
             return Some(cfg);
         }

@@ -167,22 +167,44 @@ impl ServiceType {
         }
     }
 
-    /// 容器家族归一：同一物理容器资源的类型收敛到家族代表值。
+    /// 容器路由组判定：两类型是否复用同一物理容器资源。
     ///
     /// ComputerNormalProject 与 ComputerAgentRunner 复用同一 per-user 容器
-    /// （同镜像/容器名/label/PVC/挂载），全部容器基建（配置取键、查找比较、
-    /// label 写入、命名前缀）必须经本方法归一后使用；新类型仅在 agent
-    /// 工作目录链保留本义。其余类型恒等返回。
-    pub fn container_family(self) -> ServiceType {
+    /// （同镜像/容器名/label/PVC/挂载）。**谓词判断而非值转换**——各自业务
+    /// 语义保留（日志/注册表里的类型值不再有"归一而来"的歧义）；容器基建
+    /// 的等值比较统一走本方法。新类型仅在 agent 工作目录链保留本义。
+    pub fn same_container_family(self, other: ServiceType) -> bool {
+        self.container_family_key() == other.container_family_key()
+    }
+
+    /// 是否属 Computer 容器路由组（常规项目与 Computer 沙箱共容器）。
+    pub fn is_computer_family(self) -> bool {
+        matches!(
+            self,
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
+        )
+    }
+
+    /// 容器基建字符串键（家族代表词：配置取键 / label / 命名前缀）。
+    ///
+    /// 穷尽 match（无通配臂）——新增 ServiceType 变体时此处编译期报错，
+    /// 强制声明其路由组归属。仅容器基建使用；业务语义（agent 工作目录链
+    /// 等）用原始值。
+    pub fn container_family_key(self) -> &'static str {
         match self {
-            ServiceType::ComputerNormalProject => ServiceType::ComputerAgentRunner,
-            other => other,
+            // Computer 容器路由组：常规项目与 Computer 沙箱共容器，键取族代表词
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+                "computer-agent-runner"
+            }
+            ServiceType::WebAgentRunner => "web-agent-runner",
+            ServiceType::Userapp => "user-app",
+            ServiceType::UserappBuilder => "user-app-builder",
         }
     }
 
     /// 检查服务是否在给定的多镜像配置中启用
     pub fn is_enabled(&self, config: &crate::MultiImageConfig) -> bool {
-        let service_key = self.container_family().to_string();
+        let service_key = self.container_family_key().to_string();
         if let Some(service_config) = config.services.get(&service_key) {
             service_config.enabled
         } else {
@@ -347,9 +369,13 @@ mod tests {
 
     #[test]
     fn normal_project_shares_the_computer_container_identity() {
-        // 家族归一：同一物理容器（identifier/prefix/配置键全按 ComputerAgentRunner）
+        // 路由组判定：同一物理容器（identifier/prefix/配置键全按 ComputerAgentRunner）
         let st = ServiceType::ComputerNormalProject;
-        assert_eq!(st.container_family(), ServiceType::ComputerAgentRunner);
+        assert_eq!(st.container_family_key(), "computer-agent-runner");
+        assert!(st.is_computer_family());
+        assert!(st.same_container_family(ServiceType::ComputerAgentRunner));
+        assert!(ServiceType::ComputerAgentRunner.same_container_family(st));
+        assert!(!st.same_container_family(ServiceType::WebAgentRunner));
         assert_eq!(
             st.container_identifier(None, Some("u7"), Some("p1")),
             Ok("u7")
@@ -376,7 +402,7 @@ mod tests {
             ServiceType::Userapp,
             ServiceType::UserappBuilder,
         ] {
-            assert_eq!(other.container_family(), other);
+            assert_eq!(other.container_family_key(), other.to_string().as_str());
         }
     }
 

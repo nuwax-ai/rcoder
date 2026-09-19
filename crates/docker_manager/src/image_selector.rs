@@ -45,7 +45,7 @@ impl ImageSelector {
         service_type: &ServiceType,
     ) -> Option<&shared_types::ServiceImageConfig> {
         // 1. 先尝试新的服务名称（家族归一：共享容器的类型读同一份配置）
-        let service_key = service_type.container_family().to_string();
+        let service_key = service_type.container_family_key().to_string();
         if let Some(config) = self.config.services.get(&service_key) {
             return Some(config);
         }

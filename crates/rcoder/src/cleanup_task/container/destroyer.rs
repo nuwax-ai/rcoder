@@ -132,7 +132,9 @@ impl ContainerDestroyer {
         }
 
         if let Some(ref pingora_service) = self.pingora_service {
-            if *service_type == ServiceType::ComputerAgentRunner {
+            // 家族归一：NormalProject 与 ComputerAgentRunner 共容器同 VNC 形态
+            // （注册侧不分家，清理侧须对称，否则 VNC 路由残留）
+            if service_type.is_computer_family() {
                 // 清理 Pingora VNC 后端
                 let _unused: Option<String> =
                     pingora_service.remove_vnc_backend(container_identifier);

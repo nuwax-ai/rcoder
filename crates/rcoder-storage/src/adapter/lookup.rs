@@ -101,9 +101,9 @@ impl shared_types::ContainerLookup for ProjectAdapter {
         let project_id = self.pod_id_to_project_id.get(pod_id)?.value().clone();
         let container_key = self.project_to_container.get(&project_id)?.value().clone();
         let entry = self.containers.get(&container_key)?;
-        // 校验 service_type，防止串用（家族归一：Computer 族共享容器，
+        // 校验 service_type，防止串用（路由组判定：Computer 族共享容器，
         // 记录存本义值/家族值均视为同容器命中）
-        if entry.service_type().container_family() != service_type.container_family() {
+        if !entry.service_type().same_container_family(*service_type) {
             debug!(
                 "[CONTAINER_LOOKUP] service_type mismatch: expected={:?}, found={:?}, pod_id={}",
                 service_type,
@@ -126,9 +126,11 @@ impl shared_types::ContainerLookup for ProjectAdapter {
         service_type: &ServiceType,
     ) -> Option<shared_types::ProjectScope> {
         let info = self.projects.get(project_id)?;
-        // 校验 service_type，防止跨 ServiceType 串用（家族归一，同 find_by_pod_id）
-        if info.service_type().as_ref().map(|t| t.container_family())
-            != Some(service_type.container_family())
+        // 校验 service_type，防止跨 ServiceType 串用（路由组判定，同 find_by_pod_id）
+        if info
+            .service_type()
+            .as_ref()
+            .is_none_or(|t| !t.same_container_family(*service_type))
         {
             debug!(
                 "[CONTAINER_LOOKUP] find_project_scope service_type mismatch: expected={:?}, found={:?}, project_id={}",

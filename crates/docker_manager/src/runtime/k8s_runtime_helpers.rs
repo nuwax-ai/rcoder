@@ -56,7 +56,7 @@ impl KubernetesRuntime {
         }
         // 家族归一：共享容器的类型（常规项目）必须读家族配置段——否则配置了
         // 自定义 image_tag_prefix 时前后缀分裂出第二个 pod/PVC
-        let service_key = service_type.container_family().to_string();
+        let service_key = service_type.container_family_key().to_string();
         if let Some(config) = self
             .config
             .docker_manager_config
@@ -92,19 +92,17 @@ impl KubernetesRuntime {
     /// (完全分家后的主数据源)> `multi_image_config`(docker_config,过渡期安全兜底,
     /// 避免旧 chart 未带 kubernetes_config 时选不到镜像)> 硬编码默认值。
     pub(super) fn select_image(&self, service_type: &ServiceType) -> String {
-        // 容器基建契约（ServiceType::container_family）：ComputerNormalProject 与
-        // ComputerAgentRunner 同镜像/命名/label/PVC——先归一再 match，防新家族
-        // 成员漏臂落错分支（09-19 NormalProject CrashLoop 事故即漏接：读到
-        // rcoder-k8s 主镜像，无 ENTRYPOINT → 交互 bash → liveness 杀循环）。
-        let service_type = service_type.container_family();
+        // 路由组契约（same_container_family / container_family_key）：
+        // ComputerNormalProject 与 ComputerAgentRunner 同镜像/命名/label/PVC，
+        // 同臂处理（09-19 NormalProject CrashLoop 事故即此前漏臂落错分支：
+        // 读到 rcoder-k8s 主镜像，无 ENTRYPOINT → 交互 bash → liveness 杀循环）。
+        //
         // 1. 优先使用环境变量（允许运行时覆盖;deployment.yaml 注入）
         // 注意：ComputerAgentRunner 必须优先检查 RCODER_DOCKER_IMAGE_COMPUTER
         //
         // 穷尽列出全部变体、不用 `_`/other 通配（09-19 事故教训）：新增
         // ServiceType 变体时此处编译期报错，强制补齐镜像选择分支，杜绝
-        // 静默漏接。ComputerNormalProject 已被上方归一吸收（实际到不了），
-        // 仍与 ComputerAgentRunner 同臂显式列出——即使将来归一被移除，
-        // 行为依旧正确（双保险）。
+        // 静默漏接。
         match service_type {
             ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
                 if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE_COMPUTER")

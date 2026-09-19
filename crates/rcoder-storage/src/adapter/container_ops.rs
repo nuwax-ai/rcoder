@@ -232,17 +232,17 @@ impl ProjectAdapter {
             Some(set_ref) => set_ref.iter().map(|e| e.key().clone()).collect(),
             None => return vec![],
         };
-        // 逐个解析 project，按 service_type 过滤——请求侧先家族归一：
+        // 逐个解析 project，按 service_type 过滤——路由组判定：
         // ComputerNormalProject（常规项目）与 ComputerAgentRunner 共享容器，
-        // 补建 project 记录可能存本义值也可能存家族值，两侧归一后比较均能命中。
-        let family = service_type.container_family();
+        // 补建 project 记录可能存本义值也可能存家族值，按路由组比较均能命中。
+        let family_key = service_type.container_family_key();
         project_ids
             .into_iter()
             .filter_map(|pid| self.projects.view(&pid, |_, v| v.clone()))
             .filter(|p| {
                 p.service_type()
                     .as_ref()
-                    .is_some_and(|stored| stored.container_family() == family)
+                    .is_some_and(|stored| stored.container_family_key() == family_key)
             })
             .collect()
     }

@@ -157,7 +157,7 @@ impl KubernetesRuntime {
         let user_id_val = params.user_id.clone().unwrap_or_default();
         // 家族归一：容器身份/环境（SERVICE_TYPE env 等）按家族值——agent_runner
         // 的 cwd 由 gRPC service_type 决定，不消费该 env
-        let service_type_str = service_type.container_family().to_string();
+        let service_type_str = service_type.container_family_key().to_string();
         let image = self.select_image(service_type);
 
         // Build resource requirements if limits are provided
@@ -350,7 +350,7 @@ impl KubernetesRuntime {
             | ServiceType::ComputerNormalProject
             | ServiceType::WebAgentRunner
             | ServiceType::UserappBuilder => Some(vec![build_hostname_spread_constraint(
-                &service_type.container_family().to_string(),
+                &service_type.container_family_key(),
             )]),
             // Userapp 实际走 create_deployment（k8s_app_create），不经此路径（防御性兜底）；
             // 其均衡在 build_app_deployment 用共享 label user-app 注入。
