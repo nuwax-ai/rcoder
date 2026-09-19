@@ -301,8 +301,7 @@ fn row_signature(row: &repo::ProjectRow) -> String {
     // 如 computer-normal-project——不归一则每轮 sync 判"变更"空重建，直到
     // 该行被真实 upsert 覆盖才收敛）
     sig.push_str(
-        &row
-            .service_type
+        &row.service_type
             .as_deref()
             .and_then(|v| v.parse::<shared_types::ServiceType>().ok())
             .map(|st| st.family_representative().to_string())

@@ -88,7 +88,8 @@ impl KubernetesRuntime {
             let entry = self.pod_cache.read().await.get(identifier).cloned();
             entry.is_some_and(|entry| {
                 entry.cached_at.elapsed() < POD_CACHE_TTL
-                    && entry.service_type == service_type
+                    // cache 恒存族代表值，查询侧归一后字面比较（本义查询同命中）
+                    && entry.service_type == service_type.family_representative()
                     && entry.info.status == ContainerRuntimeStatus::Running
             })
         };
