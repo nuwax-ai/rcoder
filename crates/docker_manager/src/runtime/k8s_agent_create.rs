@@ -184,13 +184,17 @@ impl KubernetesRuntime {
                             .unwrap_or_else(|| "workspace".to_string()),
                     ),
                 ),
-                ServiceType::ComputerAgentRunner => (
+                ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => (
                     std::env::var("RCODER_COMPUTER_WORKSPACE_PVC_NAME").unwrap_or_else(|_| {
                         format!("{}-rcoder-computer-workspace", self.namespace)
                     }),
                     Some(user_id_val.clone()),
                 ),
-                _ => (self.workspace_pvc_name(identifier, service_type)?, None),
+                // Userapp 实际走 create_deployment（k8s_app_create），不经此路径
+                // （防御性兜底）；UserappBuilder 显式列出防漏臂
+                ServiceType::Userapp | ServiceType::UserappBuilder => {
+                    (self.workspace_pvc_name(identifier, service_type)?, None)
+                }
             }
         };
 
@@ -226,13 +230,18 @@ impl KubernetesRuntime {
                 }
             })
             .unwrap_or_else(|| match service_type {
-                ServiceType::ComputerAgentRunner => "/home/user".to_string(),
+                // 常规项目与 Computer 共容器，容器内挂载点同 /home/user
+                ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+                    "/home/user".to_string()
+                }
                 // UserappBuilder 开发容器: 挂载压平（四 subPath 分支在 volume_mounts
                 // 构造处短路），此兜底值不生效，仅为 match 完备性保留
                 ServiceType::UserappBuilder => {
                     shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string()
                 }
-                _ => "/app/project_workspace".to_string(),
+                ServiceType::WebAgentRunner | ServiceType::Userapp => {
+                    "/app/project_workspace".to_string()
+                }
             });
 
         // 构建 volumes: 硬编码 workspace PVC(保留) + 翻译 kubernetes_config 额外卷
@@ -331,17 +340,20 @@ impl KubernetesRuntime {
         // topologySpreadConstraints：动态 agent-runner 跨节点均衡，修复"全部堆在一个节点"的
         // 调度失衡（根因：requests 50m 极低，调度器按 requests 以为节点很轻，反复选最闲节点）。
         // 策略与参数理由见 build_hostname_spread_constraint 和
-        // docs/agent-runner-scheduling-balance.md。label 用 service_type.to_string()（与
-        // build_standard_labels 写入的 app.kubernetes.io/name 一致），三类各自独立分组统计。
+        // docs/agent-runner-scheduling-balance.md。label 值必须用家族值
+        // （build_standard_labels 写入的 app.kubernetes.io/name 是 container_family
+        // 归一值——原始值 computer-normal-project 永远匹配不到自己的 Pod，约束失效）；
+        // 常规项目与 Computer 同容器同 label，归入同臂。
         let topology_spread_constraints = match service_type {
             ServiceType::ComputerAgentRunner
+            | ServiceType::ComputerNormalProject
             | ServiceType::WebAgentRunner
             | ServiceType::UserappBuilder => Some(vec![build_hostname_spread_constraint(
-                &service_type.to_string(),
+                &service_type.container_family().to_string(),
             )]),
             // Userapp 实际走 create_deployment（k8s_app_create），不经此路径（防御性兜底）；
             // 其均衡在 build_app_deployment 用共享 label user-app 注入。
-            _ => None,
+            ServiceType::Userapp => None,
         };
 
         Ok(PodSpec {

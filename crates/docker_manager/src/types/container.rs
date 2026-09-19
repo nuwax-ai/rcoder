@@ -302,17 +302,19 @@ impl DockerContainerInfo {
     /// # Returns
     /// 容器的业务标识符
     pub fn container_key(&self) -> &str {
+        // 穷尽列举；ComputerNormalProject 与 ComputerAgentRunner 同容器族
+        // （container_family 契约），标识语义一致（user_id 优先）
         match self.service_type {
-            Some(shared_types::ServiceType::ComputerAgentRunner) => {
+            Some(shared_types::ServiceType::ComputerAgentRunner)
+            | Some(shared_types::ServiceType::ComputerNormalProject) => {
                 // ComputerAgentRunner 模式优先使用 user_id
                 self.user_id.as_deref().unwrap_or(&self.project_id)
             }
-            Some(shared_types::ServiceType::WebAgentRunner) => {
-                // RCoder 模式使用 project_id
-                &self.project_id
-            }
-            _ => {
-                // 未知类型使用 project_id
+            Some(shared_types::ServiceType::WebAgentRunner)
+            | Some(shared_types::ServiceType::Userapp)
+            | Some(shared_types::ServiceType::UserappBuilder)
+            | None => {
+                // 其余类型与缺省使用 project_id
                 &self.project_id
             }
         }
@@ -323,6 +325,7 @@ impl DockerContainerInfo {
         matches!(
             self.service_type,
             Some(shared_types::ServiceType::ComputerAgentRunner)
+                | Some(shared_types::ServiceType::ComputerNormalProject)
         )
     }
 }

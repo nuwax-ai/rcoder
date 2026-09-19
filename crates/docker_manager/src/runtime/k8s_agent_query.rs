@@ -411,6 +411,8 @@ impl KubernetesRuntime {
 ///
 /// 第二候选取各族的 rcoder.io 专属键（identifier vs app-id），同样带类型维度。
 fn pod_label_selectors(identifier: &str, service_type: &ServiceType) -> Vec<String> {
+    // 穷尽列举（09-19 教训：_ 通配臂关闭编译器穷尽检查，新增变体静默漏接）；
+    // STS 族四变体同臂（家族归一在臂内执行），Userapp 专属标签集单臂
     match service_type {
         ServiceType::Userapp => vec![
             format!(
@@ -422,7 +424,10 @@ fn pod_label_selectors(identifier: &str, service_type: &ServiceType) -> Vec<Stri
                 super::k8s_deployment::APP_MANAGED_BY
             ),
         ],
-        _ => {
+        ServiceType::WebAgentRunner
+        | ServiceType::ComputerAgentRunner
+        | ServiceType::ComputerNormalProject
+        | ServiceType::UserappBuilder => {
             // 家族归一：label 由创建侧写家族值（常规项目与 Computer 同容器同 label），
             // selector 必须用家族值才能命中既有 STS/Pod，否则会误判不存在而重建
             let family = service_type.container_family();

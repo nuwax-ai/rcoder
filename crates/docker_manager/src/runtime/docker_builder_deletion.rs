@@ -113,10 +113,14 @@ impl DockerRuntime {
             .validate_identity(&context.app_id)
             .map_err(Error::ConfigurationError)?;
         receipt.validate().map_err(Error::ConfigurationError)?;
+        // 穷尽列举：UserApp 租约域仅两形态合法，其余 ServiceType 显式拒绝
+        // （fail-fast 收窄域——新增变体时编译期提醒本域是否要接）
         let prefix = match receipt.service_type() {
             ServiceType::Userapp => "prod",
             ServiceType::UserappBuilder => "builder",
-            _ => {
+            ServiceType::WebAgentRunner
+            | ServiceType::ComputerAgentRunner
+            | ServiceType::ComputerNormalProject => {
                 return Err(Error::ConfigurationError(
                     "Invalid application lease family".into(),
                 ));
