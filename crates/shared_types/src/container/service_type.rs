@@ -185,6 +185,24 @@ impl ServiceType {
         )
     }
 
+    /// 族代表值归一——**仅注册表/缓存的写入与查询边界使用**：
+    /// projects/containers 注册表、Docker 容器表、K8s pod_cache 恒存族代表值
+    /// （物理容器身份视角，与 K8s label `rcoder.io/service-type` 同值域）。
+    ///
+    /// 业务语义层（chat 受理、gRPC forward、ttyd header）**禁止调用**——
+    /// 业务本义（ComputerNormalProject）以请求瞬态传递，不落注册表。
+    /// 穷尽 match（无通配臂）：新增 ServiceType 变体时编译期报错，
+    /// 强制声明其路由组归属。
+    pub fn family_representative(self) -> ServiceType {
+        match self {
+            ServiceType::ComputerNormalProject => ServiceType::ComputerAgentRunner,
+            ServiceType::ComputerAgentRunner
+            | ServiceType::WebAgentRunner
+            | ServiceType::Userapp
+            | ServiceType::UserappBuilder => self,
+        }
+    }
+
     /// 容器基建字符串键（家族代表词：配置取键 / label / 命名前缀）。
     ///
     /// 穷尽 match（无通配臂）——新增 ServiceType 变体时此处编译期报错，
@@ -374,6 +392,12 @@ mod tests {
         assert_eq!(st.container_family_key(), "computer-agent-runner");
         assert!(st.is_computer_family());
         assert!(st.same_container_family(ServiceType::ComputerAgentRunner));
+        // 族代表值归一（仅注册表写入/查询边界用）：NormalProject → Computer
+        assert_eq!(st.family_representative(), ServiceType::ComputerAgentRunner);
+        assert_eq!(
+            ServiceType::ComputerAgentRunner.family_representative(),
+            ServiceType::ComputerAgentRunner
+        );
         assert!(ServiceType::ComputerAgentRunner.same_container_family(st));
         assert!(!st.same_container_family(ServiceType::WebAgentRunner));
         assert_eq!(

@@ -1168,6 +1168,20 @@ fn test_computer_family_lookup_shared_container() {
         .insert("proj-fam-w".to_string(), Arc::new(web))
         .unwrap();
 
+    // 归一存储契约：两条路径写入的 Computer 族记录（家族值/本义值）在
+    // 注册表内均以族代表值 ComputerAgentRunner 落库（物理身份视角）——
+    // project 字段与 ContainerEntry 双层锁定
+    let stored_normal = adapter
+        .projects
+        .get("proj-fam-n")
+        .map(|e| e.value().service_type())
+        .unwrap_or(None);
+    assert_eq!(
+        stored_normal,
+        Some(ServiceType::ComputerAgentRunner),
+        "NormalProject 写入（setter 与 from_parts 构造）注册表内必须归一为族代表值"
+    );
+
     // 请求本义值（ComputerNormalProject）→ 命中共享的 Computer 容器
     assert_eq!(
         adapter.find_by_user_id("user-fam", &ServiceType::ComputerNormalProject),

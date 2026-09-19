@@ -207,7 +207,9 @@ impl ProjectAdapter {
                     let old_cid = existing_ref.info().container_id;
                     let new_cid = temp_entry.info().container_id;
                     if old_cid != new_cid {
-                        existing_ref.update(temp_entry.info(), st);
+                        // 注册表恒存族代表值（防御归一——st 虽经 facade setter
+                        // 已归一，此权威 Arc 刷新点保持同一约定）
+                        existing_ref.update(temp_entry.info(), st.family_representative());
                     }
                     drop(existing_ref); // 释放读锁后再操作其他 map
                     if old_cid != new_cid {

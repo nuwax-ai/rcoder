@@ -42,7 +42,7 @@ impl KubernetesRuntime {
             && entry.cached_at.elapsed() < POD_CACHE_TTL
             && entry.info.status == ContainerRuntimeStatus::Running
             // 家族归一：Computer 族共享容器，缓存/请求两侧归一后比较
-            && entry.service_type.same_container_family(*service_type)
+            && entry.service_type.family_representative() == service_type.family_representative()
         {
             return Ok(Some(
                 self.build_container_basic_info(identifier, &entry.info)
@@ -115,7 +115,7 @@ impl KubernetesRuntime {
                         identifier.to_string(),
                         CachedPod {
                             info: pod_info.clone(),
-                            service_type: *service_type,
+                            service_type: service_type.family_representative(),
                             cached_at: std::time::Instant::now(),
                         },
                     );
@@ -169,7 +169,8 @@ impl KubernetesRuntime {
                 .get(identifier)
                 .filter(|entry| {
                     entry.cached_at.elapsed() < POD_CACHE_TTL
-                        && entry.service_type.same_container_family(*service_type)
+                        && entry.service_type.family_representative()
+                            == service_type.family_representative()
                 })
                 .map(|entry| entry.info.clone())
         };
@@ -262,7 +263,7 @@ impl KubernetesRuntime {
                 identifier.to_string(),
                 CachedPod {
                     info: info.clone(),
-                    service_type: *service_type,
+                    service_type: service_type.family_representative(),
                     cached_at: std::time::Instant::now(),
                 },
             );
@@ -484,6 +485,25 @@ mod label_selector_tests {
             );
             assert!(selectors[0].contains("app.kubernetes.io/instance=42"));
             assert!(selectors[1].contains("rcoder.io/identifier=42"));
+        }
+    }
+
+    /// 常规项目（ComputerNormalProject）查询的 selector 恒用族代表词——
+    /// label 写入侧（build_standard_labels）就是族值，本义查询必须归一命中，
+    /// 否则 NormalProject 会话会误判容器不存在而重建。
+    #[test]
+    fn normal_project_selectors_use_family_key() {
+        for st in [
+            ServiceType::ComputerNormalProject,
+            ServiceType::ComputerAgentRunner,
+        ] {
+            let selectors = pod_label_selectors("42", &st);
+            assert!(
+                selectors
+                    .iter()
+                    .all(|s| s.contains("rcoder.io/service-type=computer-agent-runner")),
+                "{st} selector 必须用族代表词"
+            );
         }
     }
 }

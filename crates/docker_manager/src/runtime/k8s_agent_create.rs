@@ -351,7 +351,7 @@ impl KubernetesRuntime {
             | ServiceType::ComputerNormalProject
             | ServiceType::WebAgentRunner
             | ServiceType::UserappBuilder => Some(vec![build_hostname_spread_constraint(
-                &service_type.container_family_key(),
+                service_type.container_family_key(),
             )]),
             // Userapp 实际走 create_deployment（k8s_app_create），不经此路径（防御性兜底）；
             // 其均衡在 build_app_deployment 用共享 label user-app 注入。

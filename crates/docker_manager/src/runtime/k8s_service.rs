@@ -207,8 +207,9 @@ pub(crate) fn build_standard_labels(
         identifier.to_string(),
     );
     // builder 的 app 维度聚合标签（identifier 应用共享后即纯 app_id；存量
-    // 复合键残留右切还原，保按 app 聚合的查询/清理可用）。
-    if matches!(service_type, ServiceType::UserappBuilder) {
+    // 复合键残留右切还原，保按 app 聚合的查询/清理可用）。service_type
+    // 此处已是族代表词（&str），按词比较。
+    if service_type == ServiceType::UserappBuilder.container_family_key() {
         labels.insert(
             format!("{}/app-id", RCODER_LABEL_PREFIX),
             shared_types::legacy_composite_app_segment(identifier).to_string(),

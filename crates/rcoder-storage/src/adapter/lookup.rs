@@ -56,8 +56,9 @@ impl shared_types::ContainerLookup for ProjectAdapter {
         // clone 出 container_key 后立即释放 project_to_container 读锁
         let container_key = self.project_to_container.get(project_id)?.value().clone();
         let entry = self.containers.get(&container_key)?;
-        // 校验 service_type，防止串用
-        if entry.service_type() != *service_type {
+        // 校验 service_type，防止串用（注册表与查询值均按族代表值比较——
+        // 存储恒存族代表值，查询侧归一后字面相等即路由组命中）
+        if entry.service_type() != service_type.family_representative() {
             debug!(
                 "[CONTAINER_LOOKUP] service_type mismatch: expected={:?}, found={:?}, project_id={}",
                 service_type,
@@ -101,9 +102,9 @@ impl shared_types::ContainerLookup for ProjectAdapter {
         let project_id = self.pod_id_to_project_id.get(pod_id)?.value().clone();
         let container_key = self.project_to_container.get(&project_id)?.value().clone();
         let entry = self.containers.get(&container_key)?;
-        // 校验 service_type，防止串用（路由组判定：Computer 族共享容器，
-        // 记录存本义值/家族值均视为同容器命中）
-        if !entry.service_type().same_container_family(*service_type) {
+        // 校验 service_type，防止串用（注册表恒存族代表值，查询侧归一后
+        // 字面相等——Computer 族共享容器，本义查询（常规项目）同样命中）
+        if entry.service_type() != service_type.family_representative() {
             debug!(
                 "[CONTAINER_LOOKUP] service_type mismatch: expected={:?}, found={:?}, pod_id={}",
                 service_type,
@@ -126,11 +127,12 @@ impl shared_types::ContainerLookup for ProjectAdapter {
         service_type: &ServiceType,
     ) -> Option<shared_types::ProjectScope> {
         let info = self.projects.get(project_id)?;
-        // 校验 service_type，防止跨 ServiceType 串用（路由组判定，同 find_by_pod_id）
+        // 校验 service_type，防止跨 ServiceType 串用（注册表恒存族代表值，
+        // 查询侧归一后字面相等，同 find_by_pod_id；None 视为不匹配）
         if info
             .service_type()
             .as_ref()
-            .is_none_or(|t| !t.same_container_family(*service_type))
+            .is_none_or(|t| *t != service_type.family_representative())
         {
             debug!(
                 "[CONTAINER_LOOKUP] find_project_scope service_type mismatch: expected={:?}, found={:?}, project_id={}",

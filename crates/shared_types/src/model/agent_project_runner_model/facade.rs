@@ -77,7 +77,9 @@ impl ProjectAndContainerInfo {
         };
         let mut extended = ProjectExtendedState::new();
         extended.request_id = fields.request_id;
-        extended.service_type = fields.service_type;
+        // 注册表恒存族代表值（构造器旁路 setter，此处显式归一封口——
+        // 与 set_service_type 同一约定）
+        extended.service_type = fields.service_type.map(|st| st.family_representative());
         let mut info = Self {
             persistence: Arc::new(Default::default()),
             state: ProjectState {
@@ -187,16 +189,20 @@ impl ProjectAndContainerInfo {
         request_id: Option<String>,
         service_type: Option<ServiceType>,
     ) {
-        // 容器信息包装成 Arc<ContainerEntry>（service_type 用入参或现有值）
+        // 容器信息包装成 Arc<ContainerEntry>（service_type 用入参或现有值；
+        // 入参先归一注册表族代表值——project st 字段写入 update_from_request
+        // 前同样归一，与 set_service_type 收口一致）
+        let normalized_st = service_type.map(|st| st.family_representative());
         let entry = container.map(|c| {
-            let st = service_type
+            let st = normalized_st
                 .or(self.service_type())
-                .unwrap_or(ServiceType::WebAgentRunner);
+                .unwrap_or(ServiceType::WebAgentRunner)
+                .family_representative();
             let logical_id = self.container_key().to_string();
             Arc::new(ContainerEntry::new(c, st, logical_id))
         });
         self.state.update_extended(|extended| {
-            extended.update_from_request(entry, model_provider, request_id, service_type);
+            extended.update_from_request(entry, model_provider, request_id, normalized_st);
         });
     }
 }
@@ -367,7 +373,12 @@ impl ProjectAndContainerInfo {
     /// Arc 在 insert 时与 `ProjectAdapter.containers[name]` 共享同一实例。
     pub fn set_container(&mut self, container: Option<ContainerBasicInfo>) {
         let entry = container.map(|c| {
-            let st = self.service_type().unwrap_or(ServiceType::WebAgentRunner);
+            // project 的 st 已在 set_service_type 归一；防御性再归一
+            // （project st 可能经反序列化等旁路进入）
+            let st = self
+                .service_type()
+                .unwrap_or(ServiceType::WebAgentRunner)
+                .family_representative();
             let logical_id = self.container_key().to_string();
             Arc::new(ContainerEntry::new(c, st, logical_id))
         });
@@ -398,7 +409,10 @@ impl ProjectAndContainerInfo {
     pub fn set_service_type(&mut self, service_type: Option<ServiceType>) {
         self.state.update_extended(|extended| {
             if let Some(st) = service_type {
-                extended.service_type = Some(st);
+                // 注册表恒存族代表值（物理容器身份；业务本义瞬态传递不落库，
+                // 见 ServiceType::family_representative 契约）——所有写入路径
+                // （pod ensure/keepalive/restart/chat/session/PG hydrate）经此收口
+                extended.service_type = Some(st.family_representative());
             }
         });
     }
