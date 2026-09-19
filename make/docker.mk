@@ -16,6 +16,10 @@ BUILDX_BUILDER ?=
 # Docker 镜像构建（仅构建镜像，不编译）
 # 串行构建镜像，避免资源竞争
 docker-build:
+	@# Pingap 版本一致性门禁（batch8-followup §5）：镜像内 pingap 二进制与
+	@# app-cli 链接的 pingap-config 序列化不一致 → config_hash 确认恒失败
+	@#（2026-09-19 第八批根因）。四个构建入口对齐 devtool.rs 单一事实源。
+	@python3 k8s/scripts/pingap_version_gate.py || exit 1
 	@echo "🔨 依次构建 agent-runner 和主镜像..."
 	@$(MAKE) docker-build-agent-runner
 	@$(MAKE) docker-build-master
