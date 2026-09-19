@@ -67,10 +67,6 @@ pub(super) fn apply_security_headers(router: Router) -> Router {
             axum::http::HeaderValue::from_static("nosniff"),
         ))
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            axum::http::header::HeaderName::from_static("strict-transport-security"),
-            axum::http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             axum::http::header::HeaderName::from_static("referrer-policy"),
             axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
         ))
