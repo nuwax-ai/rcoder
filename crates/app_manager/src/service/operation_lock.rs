@@ -75,6 +75,22 @@ impl AppOperationGuard {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Dev 清理接管文件锁（2026-09-19 flock 同进程重入修复）。
+    ///
+    /// Dev 域 destroy 的执行体内，`UserappDevResourcesCleanup::capture`
+    /// 会在**同一文件**上获取更强的带标记租约（marker + 身份）。flock
+    /// 按打开文件描述符隔离——本守卫的无标记 flock（另一 fd）在执行体
+    /// 期间持有会让内层获取必然 WouldBlock（同进程自死锁，容器内实测）。
+    ///
+    /// 调用时机：持久租约回执（bind_lease）已绑定之后、内层清理获取
+    /// 之前。进程内互斥与 side_effect 簿记保持；变更期间的文件级互斥
+    /// 由内层标记租约承担。
+    pub(crate) fn hand_over_to_inner_builder_lease(&mut self) {
+        if self.family == shared_types::ServiceType::UserappBuilder {
+            self._file = None;
+        }
+    }
+
     pub(crate) async fn finish(mut self) -> AppResult<()> {
         if let Some(lease) = self.runtime.take() {
             lease.release().await.map_err(AppOperationError::Backend)?;

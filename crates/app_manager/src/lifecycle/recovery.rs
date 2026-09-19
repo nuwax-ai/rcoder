@@ -319,7 +319,7 @@ impl AppService {
             }
             Ok::<_, AppOperationError>(Some((guard, identity, current)))
         };
-        let Some((guard, _identity, current)) =
+        let Some((mut guard, _identity, current)) =
             timeout_at(deadline, preflight).await.map_err(|_| {
                 AppOperationError::Backend("Control recovery preflight deadline exceeded".into())
             })??
@@ -427,7 +427,7 @@ impl AppService {
                     &snapshot.app_id,
                     *production,
                     &mut operation,
-                    &guard,
+                    &mut guard,
                 )
                 .await?;
                 return Ok(container_runtime_api::DeploymentStatus::default());
