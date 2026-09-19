@@ -94,14 +94,19 @@ impl KubernetesRuntime {
     pub(super) fn select_image(&self, service_type: &ServiceType) -> String {
         // 容器基建契约（ServiceType::container_family）：ComputerNormalProject 与
         // ComputerAgentRunner 同镜像/命名/label/PVC——先归一再 match，防新家族
-        // 成员漏臂落 `_` 读到 RCODER_DOCKER_IMAGE（rcoder-k8s 主镜像，无
-        // ENTRYPOINT）→ 容器落入交互 bash、8086 无监听被 liveness 杀
-        // （09-19 NormalProject CrashLoop 事故即此漏接）。
+        // 成员漏臂落错分支（09-19 NormalProject CrashLoop 事故即漏接：读到
+        // rcoder-k8s 主镜像，无 ENTRYPOINT → 交互 bash → liveness 杀循环）。
         let service_type = service_type.container_family();
         // 1. 优先使用环境变量（允许运行时覆盖;deployment.yaml 注入）
         // 注意：ComputerAgentRunner 必须优先检查 RCODER_DOCKER_IMAGE_COMPUTER
+        //
+        // 穷尽列出全部变体、不用 `_`/other 通配（09-19 事故教训）：新增
+        // ServiceType 变体时此处编译期报错，强制补齐镜像选择分支，杜绝
+        // 静默漏接。ComputerNormalProject 已被上方归一吸收（实际到不了），
+        // 仍与 ComputerAgentRunner 同臂显式列出——即使将来归一被移除，
+        // 行为依旧正确（双保险）。
         match service_type {
-            ServiceType::ComputerAgentRunner => {
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
                 if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE_COMPUTER")
                     && !env_image.is_empty()
                 {
@@ -137,7 +142,11 @@ impl KubernetesRuntime {
                 }
                 // COMPUTER env 未设 → 落到 step 2 读 kubernetes_config.user-app-builder.image
             }
-            _ => {
+            // WebAgentRunner 有意读主镜像：其容器带显式 command
+            // （agent-runner-start.sh wrapper，见 k8s_agent_create command 臂），
+            // 不依赖镜像 ENTRYPOINT；Userapp 为防御性兜底（实际走
+            // create_deployment/k8s_app_create，不经此路径）。
+            ServiceType::WebAgentRunner | ServiceType::Userapp => {
                 if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE")
                     && !env_image.is_empty()
                 {
