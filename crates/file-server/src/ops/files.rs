@@ -17,6 +17,7 @@ use crate::service::temp_file::TemporaryFile;
 pub async fn files_update_core(ws: &Path, mut files: Vec<FileOp>) -> Result<usize, AppError> {
     // 工作区不存在 → 创建 (对齐 nuwax computerFileUtils.updateFiles: !existsSync → mkdirSync recursive)。
     // 首次向全新 user/cId 工作区写入不应失败。
+    code_service::preflight_file_ops(ws, &files).await?;
     tokio::fs::create_dir_all(ws).await?;
     // decodeURIComponent 文本内容 (对齐 nuwax safeDecodePath)
     for op in files.iter_mut() {
@@ -44,7 +45,7 @@ pub async fn upload_file_core(
     file_path: &str,
     data: TemporaryFile,
 ) -> Result<UploadedFile, AppError> {
-    let target = path_safety::ensure_within(ws, file_path)?;
+    let target = path_safety::ensure_resolved_within(ws, file_path).await?;
     // copy_file 内部已 create_dir_all(parent), 无需重复
     let file_size = data.size();
     crate::service::temp_file::copy_file(data.path(), &target).await?;
@@ -96,7 +97,7 @@ pub async fn upload_files_core(
     let mut success_count = 0usize;
     let mut results: Vec<BatchUploadItem> = Vec::new();
     for (fp, (original, data)) in file_paths.iter().zip(files_vec) {
-        let target = match path_safety::ensure_within(ws, fp) {
+        let target = match path_safety::ensure_resolved_within(ws, fp).await {
             Ok(t) => t,
             Err(_) => {
                 results.push(BatchUploadItem::Err {
@@ -198,7 +199,8 @@ pub async fn generate_file_core(
 ) -> Result<GeneratedFile, AppError> {
     // 对齐 TS uploadFile.normalizeFilePath: 路径拼接时剥离前导 `/`
     // (允许 "src/foo.txt" 这类相对子路径;绝对路径会被 ensure_within 拒)。
-    let target = path_safety::ensure_within(&ws, file_name.trim_start_matches('/'))?;
+    let target =
+        path_safety::ensure_resolved_within(&ws, file_name.trim_start_matches('/')).await?;
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }

@@ -335,6 +335,9 @@ async fn submit_deploy(
                 release_id: body.release_id,
                 sha256: body.sha256.map(|value| value.to_ascii_lowercase()),
                 local_path: None,
+                execution_target: None,
+                requires_configuration_activation: false,
+                run_pg: None,
             },
             accepted_id,
         )

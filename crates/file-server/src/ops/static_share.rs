@@ -38,7 +38,7 @@ pub async fn serve_from_root(root: &Path, rest: &str, cors: &CorsConfig, req: Re
         return cors_404(&req, cors);
     }
     // 路径安全: 仅防穿越 (dotfiles allow, 不拦隐藏名)
-    let full = match crate::path_safety::ensure_within(root, &decoded) {
+    let full = match crate::path_safety::ensure_resolved_within(root, &decoded).await {
         Ok(p) => p,
         Err(_) => return cors_404(&req, cors),
     };
@@ -194,5 +194,64 @@ mod tests {
                 .get("access-control-allow-credentials")
                 .is_none()
         );
+    }
+    #[tokio::test]
+    async fn native_path_link_reads_reject_outside_and_preserve_inside() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("workspace");
+        let inside = base.join("inside");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(inside.join("sentinel.txt"), "inside").unwrap();
+        std::fs::write(outside.join("sentinel.txt"), "outside").unwrap();
+        let mut outcomes = Vec::new();
+        for (name, target) in [("internal", &inside), ("external", &outside)] {
+            let link = base.join(name);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            #[cfg(windows)]
+            assert!(
+                std::process::Command::new("cmd.exe")
+                    .args(["/d", "/c", "mklink", "/J"])
+                    .arg(&link)
+                    .arg(target)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            let relative = format!("{name}/sentinel.txt");
+            let resolved =
+                crate::service::tree::resolve::resolve_existing_file(&base, &relative, None)
+                    .await
+                    .unwrap()
+                    .is_some();
+            let response = serve_from_root(
+                &base,
+                &relative,
+                &COMPUTER_CORS,
+                Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            #[cfg(unix)]
+            std::fs::remove_file(&link).unwrap();
+            #[cfg(windows)]
+            std::fs::remove_dir(&link).unwrap();
+            outcomes.push((resolved, status, body));
+        }
+        assert!(outcomes[0].0, "internal link remains readable");
+        assert_eq!(outcomes[0].1, StatusCode::OK);
+        assert_eq!(outcomes[0].2.as_ref(), b"inside");
+        assert!(!outcomes[1].0, "external link resolves to exists:false");
+        assert_eq!(outcomes[1].1, StatusCode::NOT_FOUND);
+        assert_ne!(outcomes[1].2.as_ref(), b"outside");
     }
 }

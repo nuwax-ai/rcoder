@@ -115,7 +115,9 @@ async fn rejected_native_serve_sigterm_does_not_clear_previous_active_owner() {
     let logs = root.path().join("logs");
     let (mut first, first_url) = start(&workspace, &logs);
     expect_phase(&mut first, &first_url, "idle").await;
-    let owner = root.path().join(".deploy-coordinator.json");
+    let owner = runtime_state_layout::ensure_state_root(&workspace, None, None)
+        .unwrap()
+        .join(".deploy-coordinator.json");
     // API 先于 ownership 落盘可答（P1-01 预绑定）——断言依赖 coordinator
     // 已提交，先等它出现再 kill（消除 kill 早于 commit_coordinator 的竞态）。
     let claim_deadline = Instant::now() + Duration::from_secs(10);

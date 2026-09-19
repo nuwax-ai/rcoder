@@ -774,3 +774,19 @@ dev 改密场景报告 `tests-e2e/reports/a0d46771f24d481fb6e19df7a3e3f928` 未�
 追加实机反例：Linux 空格/中文 workspace 的 Stop 修复前返回 409，修复后两个测试及真实 Vue devbuild/devrun、重复 serve、Stop 全链通过。Windows owner 强杀的进程树反例修复前失败（run 66857e08-9218-49e3-aea6-3291af9b5e26），添加 KillOnDrop 后同反例通过（run 399d0599-17ac-41d0-ab61-316daf1b5ebe）；不会据此声称整个三平台矩阵通过。file-server 的 canonical 项目身份、opaque workspace_id 消费和真实 202 回执解析已完成代码及格式检查，组件检查待补。
 
 检查点明确未完成：file-server 外部操作的 durable intent/响应丢失重放保护；本地 ArtifactId 在源目录 owner 下的路径核对及能力声明；本轮追加改动的统一组件回归；最终镜像更新及完整 Compose、remote K8s、三平台矩阵。现有构建仍运行，不能将此前组件通过或旧镜像结果视为该检查点全量验收。尚未 push、npm 发布或 K8s 镜像发布。
+
+### PG 改密 Compose 反例复验通过
+
+固定4e51f476源码快照执行 `E2E_SUITE=compose_userapp_dev E2E_FILTER=userapp_dev_pg_reset_password` 严格启动器，退出0、1/1通过，无skip。报告 `tests-e2e/reports/571616cd72a64a1fb1b45180f8c7277f/summary.json`，前后源码摘要均为 `ef1a124c984e7075bb6ace03a2691e800c7d06f6a6acbdd169407ce7e903785e`。测试程序从独立快照编译，不使用活动工作树的漂移豁免。被测master镜像 `sha256:a28b82ac1e7e2f822f82538cce85349216564aa824ab8e9bce4ae8e94df73c2f`，builder镜像 `sha256:1574125121c618308789ba8fd22e58d98651cbc562d2f452b47341f41cef9a6c`。
+
+验证包含：开发容器注册与数据库初始化、受管理运行账号拒绝直接改密、独立账号创建/改密、同请求改参拒绝、新操作改密、旧请求迟到重放及真实TCP验证未覆盖新密码。修复前对应场景PG接受连接但dev库未创建；本轮该链通过。不代表prod待生效配置/冷切换或完整Compose组通过。后续file-server持久意图和ArtifactId目标修复不在本轮被测镜像内。
+
+默认存储feature新增PG专用枚举分支条件编译后，`cargo clippy -p rcoder-storage --all-targets`退出0、无warning；日志 `/tmp/rcoder-storage-default-clippy-checkpoint.log`。
+
+### 外部 owner 持久意图与路径回归集中检查
+
+首次file-server编译发现测试变量与sha2摘要格式化不兼容，修正后342例中341通过；唯一制品拒绝测试仍共用默认日志目录，未发预期请求。隔离测试状态目录并保留严格提交/拒绝/目录未改变断言后，合并native路径写入修复的 `cargo nextest run -p file-server --no-fail-fast --all-features` 348/348通过、0skip，日志 `/tmp/rcoder-file-server-intent-path-tests.log`。Clippy首次有collapsible_if提示，等价修正后 `cargo clippy -p file-server --all-targets --all-features` 退出0、无warning，日志 `/tmp/rcoder-file-server-intent-path-clippy-clean.log`。
+
+仍需补外层Start仅凭登记快成功的问题和稳定调用方请求身份；348通过不证明该尚未修改的外层链已完成。Windows读侧junction入口也在继续核查，不能把写入修复称为全部路径访问已验收。
+
+`make dev-build`及`make docker-build-app-runtime`串行任务退出0；本轮app-runtime镜像`sha256:0b963b611bcf65876c233905bfa294a269cad7427444f49d2897192e5cc7d1bf`。之后继续固定4e51f476快照的userapp_deploy_full_chain场景，结果待收取；镜像未含后续持久意图/目标目录修复，最终仍须统一更新。`make remote-k8s-doctor`退出0，仅证明SSH/集群/CRD/存储/registry前置可达，没有执行本轮K8s部署。npm launcher本地包内容回归8/8通过，未做npm发布。

@@ -64,6 +64,7 @@ impl DevServerManager {
         base_path: Option<&str>,
         hooks: Option<super::supervise::DevEventHooks>,
         pg: Option<&shared_types::StartPgCredential>,
+        request_context: Option<&str>,
     ) -> AppResult<StartedDev> {
         // 启动锁
         {
@@ -79,8 +80,15 @@ impl DevServerManager {
             starting: &self.starting,
             project_id: project_id.to_string(),
         };
-        self.start_dev_inner(project_id, project_path, base_path, hooks, pg)
-            .await
+        self.start_dev_inner(
+            project_id,
+            project_path,
+            base_path,
+            hooks,
+            pg,
+            request_context,
+        )
+        .await
     }
 
     pub(super) async fn start_dev_inner(
@@ -90,6 +98,7 @@ impl DevServerManager {
         base_path: Option<&str>,
         hooks: Option<super::supervise::DevEventHooks>,
         pg: Option<&shared_types::StartPgCredential>,
+        request_context: Option<&str>,
     ) -> AppResult<StartedDev> {
         // Userapp workspace 分流：workspace.manifest.toml 存在 → app-cli 引擎。
         // manifest 多服务（Java/Go 等）的正确运行态 = app-cli 按 run.command
@@ -100,7 +109,7 @@ impl DevServerManager {
         let manifest = project_path.join("workspace.manifest.toml");
         if tokio::fs::try_exists(&manifest).await.unwrap_or(false) {
             return self
-                .start_dev_manifest(project_id, project_path, hooks, pg)
+                .start_dev_manifest(project_id, project_path, hooks, pg, request_context)
                 .await;
         }
         // 幂等: 已运行则返回现有 pid/port
@@ -284,15 +293,16 @@ impl DevServerManager {
         project_path: &Path,
         hooks: Option<super::supervise::DevEventHooks>,
         pg: Option<&shared_types::StartPgCredential>,
+        request_context: Option<&str>,
     ) -> AppResult<StartedDev> {
         // 单一来源 shared_types::APP_ENTRY_PORT（release 流程、Pingora 免端口代理同值）
         const PINGAP_ENTRY_PORT: u16 = shared_types::APP_ENTRY_PORT;
-        // 幂等: 已运行则返回现有 pid/port（app-cli 路径与 vite 路径同表登记）
-        if let Some(p) = lock(&self.processes)?.get(project_id).cloned() {
-            return Ok(StartedDev {
-                pid: p.pid,
-                port: p.port,
-            });
+        if let Some(process) = lock(&self.processes)?.get(project_id).cloned()
+            && process.external_owner.is_none()
+        {
+            return Err(AppError::business(
+                "local orchestrator is already registered; readiness must be confirmed or an explicit restart requested",
+            ));
         }
         // P1-05：旧 supervised 停止后未确认清理（如进程组残留或 stdout 排空未完成）——
         // 拒绝新 manifest 启动，直到后台清理确认完成。避免并发 dev 操作撞端口或误用残留状态。
@@ -306,7 +316,14 @@ impl DevServerManager {
         // owner 经运行 API 复用（消除平台/agent 双启动的 3010 冲突）；legacy
         // app-cli / foreign 应答明确拒绝（XP04：不杀对方、不盲 spawn）。
         if let Some(started) = self
-            .reuse_or_refuse_owner(project_id, project_path, hooks.clone(), pg, None)
+            .reuse_or_refuse_owner(
+                project_id,
+                project_path,
+                hooks.clone(),
+                pg,
+                None,
+                request_context,
+            )
             .await?
         {
             return Ok(started);
@@ -433,9 +450,22 @@ impl DevServerManager {
         hooks: Option<super::supervise::DevEventHooks>,
         pg: Option<&shared_types::StartPgCredential>,
         artifact_release_id: Option<&str>,
+        request_context: Option<&str>,
     ) -> AppResult<Option<StartedDev>> {
+        self.check_external_store().map_err(|error| {
+            AppError::business(format!("external owner recovery required: {error:#}"))
+        })?;
         let owner_addr = self.config.app_cli_admin_probe_addr.clone();
         let Some(identity) = super::owner_client::probe_owner(&owner_addr).await else {
+            let persisted = self.read_external_state().map_err(|error| {
+                AppError::business(format!("external recovery required: {error:#}"))
+            })?;
+            if persisted.owners.contains_key(project_id) {
+                return Err(AppError::business(
+                    "registered owner is unavailable; recovery required before spawning another owner",
+                ));
+            }
+
             // 无 runtime identity：区分"legacy app-cli 应答"与"无人监听"——
             // /v1/deploy/status 是 app-cli 专属路由（foreign 服务 404）
             if legacy_app_cli_responds(&owner_addr).await {
@@ -505,32 +535,37 @@ impl DevServerManager {
                     (identity.runtime_instance_id.clone(), status.revision)
                 }
             };
-            let operation_id = format!("fs-restart-{}", uuid::Uuid::new_v4().simple());
-            match artifact_release_id {
-                Some(artifact_id) => {
-                    client
-                        .submit_restart_artifact(
-                            &operation_id,
-                            &expected_ws,
-                            expected_revision,
-                            &expected_instance,
-                            pg,
-                            artifact_id,
-                        )
-                        .await?;
-                }
-                None => {
-                    client
-                        .submit_restart_source(
-                            &operation_id,
-                            &expected_ws,
-                            expected_revision,
-                            &expected_instance,
-                            pg,
-                        )
-                        .await?;
-                }
-            }
+            let request = shared_types::RuntimeOperationRequest {
+                operation_id: format!("fs-restart-{}", uuid::Uuid::new_v4().simple()),
+                expected_runtime_instance_id: expected_instance,
+                expected_revision,
+                workspace_id: expected_ws.clone(),
+                kind: shared_types::RuntimeOperationKind::Restart,
+                profile: match artifact_release_id {
+                    Some(id) => shared_types::RunProfileInput::Artifact {
+                        artifact: shared_types::ArtifactInput::ArtifactId {
+                            artifact_id: id.to_string(),
+                        },
+                    },
+                    None => shared_types::RunProfileInput::Source {
+                        workspace_id: expected_ws.clone(),
+                    },
+                },
+                run_config: pg.map(|pg| shared_types::OperationRunConfig {
+                    pg: Some(pg.clone()),
+                }),
+                request_context: request_context.map(str::to_owned),
+            };
+            let external = ExternalOwner {
+                address: owner_addr.clone(),
+                token: token.clone(),
+                runtime_instance_id: identity.runtime_instance_id.clone(),
+            };
+            let intent =
+                self.prepare_external_intent(project_id, project_path, &external, &request)?;
+            let operation_id = intent.request.operation_id.clone();
+            self.resume_external_intent(project_id, &client, &intent, &request)
+                .await?;
             // R06：事件转发（游标重放轮询，替换 SSE 长连——无总超时/EOF 竞态，
             // 断线续传天然支持）
             let events_client = super::owner_client::OwnerClient::new(&owner_addr, &token)?;
@@ -581,7 +616,17 @@ impl DevServerManager {
                     tracing::warn!("owner terminal event drain failed: {error:#}");
                 }
             }
-            terminal
+            let view = terminal?;
+            super::external_store::verify_view(&view, &intent.request)?;
+            if matches!(
+                view.state,
+                shared_types::RuntimeOperationState::Succeeded
+                    | shared_types::RuntimeOperationState::Failed
+                    | shared_types::RuntimeOperationState::Cancelled
+            ) {
+                self.finish_external_intent(project_id, &intent.request, false)?;
+            }
+            Ok::<_, anyhow::Error>(view)
         };
         let view = route_restart
             .await
@@ -627,7 +672,7 @@ impl DevServerManager {
             },
         );
         // R05：external 控制关系持久化——file-server 重启后 stop 仍路由同一 owner
-        self.persist_external_state();
+        // Owner registration was committed atomically with the intent before HTTP.
         Ok(Some(StartedDev {
             pid: 0,
             port: shared_types::APP_ENTRY_PORT,
@@ -647,11 +692,19 @@ impl DevServerManager {
         release_id: &str,
         hooks: Option<super::supervise::DevEventHooks>,
         pg: Option<&shared_types::StartPgCredential>,
+        request_context: Option<&str>,
     ) -> AppResult<Option<StartedDev>> {
         // owner（产物态 serve 绑定 {ws}/.run，workspace_id=".run"）
         let run_dir = workspace.join(".run");
-        self.reuse_or_refuse_owner(project_id, &run_dir, hooks, pg, Some(release_id))
-            .await
+        self.reuse_or_refuse_owner(
+            project_id,
+            &run_dir,
+            hooks,
+            pg,
+            Some(release_id),
+            request_context,
+        )
+        .await
     }
 
     /// 就绪轮询: 进程早退 → Err (读 stderr ring 分类成结构化错误); HTTP 就绪 → Ok;
@@ -735,7 +788,8 @@ pub(super) async fn legacy_app_cli_responds(address: &str) -> bool {
         .is_ok_and(|body| body.get("protocol_version").is_some())
 }
 
-#[cfg(test)]
+// These two environment-injection tests execute a POSIX shell fixture.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -804,7 +858,7 @@ mod tests {
             password: "s3cret".into(),
         };
         let started = manager
-            .start_dev("pg-inject-test", ws.path(), None, None, Some(&pg))
+            .start_dev("pg-inject-test", ws.path(), None, None, Some(&pg), None)
             .await
             .expect("start manifest dev");
         assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
@@ -824,7 +878,7 @@ mod tests {
         // None：不注入——期望值 = 父进程 env 透传结果（无则不出现）
         std::fs::remove_file(&dump).expect("reset dump");
         let started = manager
-            .start_dev("pg-inject-none-test", ws.path(), None, None, None)
+            .start_dev("pg-inject-none-test", ws.path(), None, None, None, None)
             .await
             .expect("start manifest dev (no pg)");
         assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
@@ -869,14 +923,16 @@ mod owner_reuse_tests {
     /// ④ foreign workspace → 拒绝。
     #[tokio::test]
     async fn owner_probe_branches() {
-        let mgr = DevServerManager::new(Arc::new(Config::from_env().expect("test config")));
         let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::from_env().expect("test config");
+        config.log_base_dir = dir.path().join("logs");
+        let mgr = DevServerManager::new(Arc::new(config));
 
         // ① 无监听（此阶段 3010 必须空闲——串行前提）
         let ws_fresh = dir.path().join("ws-fresh");
         std::fs::create_dir_all(&ws_fresh).unwrap();
         assert!(
-            mgr.reuse_or_refuse_owner("userapp:app", &ws_fresh, None, None, None)
+            mgr.reuse_or_refuse_owner("userapp:app", &ws_fresh, None, None, None, None)
                 .await
                 .expect("probe")
                 .is_none(),
@@ -894,7 +950,7 @@ mod owner_reuse_tests {
         let ws_legacy = dir.path().join("ws-legacy");
         std::fs::create_dir_all(&ws_legacy).unwrap();
         let error = mgr
-            .reuse_or_refuse_owner("userapp:app", &ws_legacy, None, None, None)
+            .reuse_or_refuse_owner("userapp:app", &ws_legacy, None, None, None, None)
             .await
             .expect_err("legacy responder must be refused");
         let AppError::Business(message) = &error else {
@@ -925,7 +981,7 @@ mod owner_reuse_tests {
             on_end: None,
         };
         let started = mgr
-            .reuse_or_refuse_owner("userapp:app", &ws_reuse, Some(hooks), None, None)
+            .reuse_or_refuse_owner("userapp:app", &ws_reuse, Some(hooks), None, None, None)
             .await
             .expect("reuse path")
             .expect("must reuse existing owner");
@@ -974,7 +1030,7 @@ mod owner_reuse_tests {
         let ws_mine = dir.path().join("ws-mine");
         std::fs::create_dir_all(&ws_mine).unwrap();
         let error = mgr
-            .reuse_or_refuse_owner("userapp:app", &ws_mine, None, None, None)
+            .reuse_or_refuse_owner("userapp:app", &ws_mine, None, None, None, None)
             .await
             .expect_err("foreign owner must be refused");
         let AppError::Business(message) = &error else {
@@ -1056,7 +1112,12 @@ mod owner_reuse_tests {
             .route(
                 "/v1/runtime/operations",
                 axum::routing::post(
-                    |axum::Json(req): axum::Json<serde_json::Value>| async move {
+                    |axum::extract::State(polls): axum::extract::State<
+                        Arc<std::sync::atomic::AtomicUsize>,
+                    >,
+                     axum::Json(req): axum::Json<serde_json::Value>| async move {
+                        assert_eq!(req["workspace_id"], "hashed-workspace");
+                        polls.store(1, std::sync::atomic::Ordering::SeqCst);
                         let id = req
                             .get("operation_id")
                             .and_then(|value| value.as_str())
@@ -1081,14 +1142,23 @@ mod owner_reuse_tests {
                      axum::extract::State(polls): axum::extract::State<
                         Arc<std::sync::atomic::AtomicUsize>,
                     >| async move {
+                        if polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                            return (
+                                axum::http::StatusCode::NOT_FOUND,
+                                axum::Json(serde_json::json!({"message": "not found"})),
+                            );
+                        }
                         // 首查 accepted（留事件流消费窗口），其后 succeeded
                         let seen = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let state = if seen == 0 {
+                        let state = if seen == 1 {
                             RuntimeOperationState::Accepted
                         } else {
                             RuntimeOperationState::Succeeded
                         };
-                        axum::Json(envelope(&operation_view(&id, state)))
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(envelope(&operation_view(&id, state))),
+                        )
                     },
                 ),
             )
@@ -1214,6 +1284,7 @@ mod owner_reuse_tests {
         });
 
         let mut config = Config::from_env().expect("test config");
+        config.log_base_dir = dir.path().join("logs");
         config.app_cli_admin_probe_addr = probe_addr.clone();
         let mgr = DevServerManager::new(Arc::new(config));
 
@@ -1230,7 +1301,7 @@ mod owner_reuse_tests {
         // 旧构建迟到提交必须被拒——不得刷新期望
         std::fs::write(state_root.join("token"), "test-token").unwrap();
         let error = mgr
-            .reuse_or_refuse_owner("userapp:r78", &ws, None, None, None)
+            .reuse_or_refuse_owner("userapp:r78", &ws, None, None, None, None)
             .await
             .expect_err("late build submission must be refused");
         assert!(
@@ -1244,6 +1315,7 @@ mod owner_reuse_tests {
 
         // ── R07 对照：确认无 owner（无人监听端口）→ NoOwner 分类
         let mut config = Config::from_env().expect("test config");
+        config.log_base_dir = dir.path().join("other-logs");
         config.app_cli_admin_probe_addr = "127.0.0.1:1".to_string();
         let mgr2 = DevServerManager::new(Arc::new(config));
         mgr2.capture_owner_expectation("userapp:none", &ws).await;
@@ -1265,7 +1337,7 @@ mod owner_reuse_tests {
         // 复用路径会 wait_terminal 轮询到超时——mock 不提供 operation 查询端点，
         // 这里只需断言**提交 wire**；超时错误可忽略（操作已受理记录在案）
         let _reuse_result = mgr
-            .reuse_or_refuse_owner("userapp:r78", &ws, None, Some(&pg), None)
+            .reuse_or_refuse_owner("userapp:r78", &ws, None, Some(&pg), None, None)
             .await;
         let posted = submitted.lock().unwrap();
         let last = posted
@@ -1359,6 +1431,7 @@ mod owner_reuse_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let mut config = Config::from_env().expect("test config");
+        config.log_base_dir = dir.path().join("logs");
         config.app_cli_admin_probe_addr = addr;
         let mgr = DevServerManager::new(Arc::new(config));
         let task = tokio::spawn(async move {
@@ -1367,12 +1440,11 @@ mod owner_reuse_tests {
 
         // owner 在但拒绝（revision 已推进）
         let error = mgr
-            .route_artifact_restart("userapp:art", &ws, "rel-new", None, None)
+            .route_artifact_restart("userapp:art", &ws, "rel-new", None, None, None)
             .await
             .expect_err("owner rejection must propagate");
         assert!(
-            error.to_string().contains("ERR_REVISION_MISMATCH")
-                || error.to_string().contains("reuse"),
+            error.to_string().contains("ERR_REVISION_MISMATCH"),
             "diagnostic: {error}"
         );
         // R03 核心：`.run` 原样（提交拒绝不改变 active 内容）

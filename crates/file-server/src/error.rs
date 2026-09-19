@@ -26,6 +26,8 @@ pub enum AppError {
     ValidationI18n(String, &'static str),
     /// BUSINESS_ERROR (400)
     Business(String),
+    /// CONFLICT (409): an existing identified operation must be resolved first.
+    Conflict(String),
     /// PERMISSION_ERROR (403)
     Permission(String),
     /// RESOURCE_ERROR (404)
@@ -82,6 +84,7 @@ impl AppError {
         match self {
             AppError::Validation(..) | AppError::ValidationI18n(..) => "VALIDATION_ERROR",
             AppError::Business(_) => "BUSINESS_ERROR",
+            AppError::Conflict(_) => "CONFLICT",
             AppError::Permission(_) => "PERMISSION_ERROR",
             AppError::Resource(_) => "RESOURCE_ERROR",
             AppError::Network(_) => "NETWORK_ERROR",
@@ -97,6 +100,7 @@ impl AppError {
                 StatusCode::BAD_REQUEST
             }
             AppError::Permission(_) => StatusCode::FORBIDDEN,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::Resource(_) => StatusCode::NOT_FOUND,
             AppError::Network(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -108,7 +112,7 @@ impl AppError {
             AppError::Validation(m, _) => m,
             // 返回英文 fallback; 实际翻译在 into_response 里按 locale 做。
             AppError::ValidationI18n(fallback, _) => fallback,
-            AppError::Business(m) => m,
+            AppError::Business(m) | AppError::Conflict(m) => m,
             AppError::Permission(m) => m,
             AppError::Resource(m) => m,
             AppError::Network(m) => m,

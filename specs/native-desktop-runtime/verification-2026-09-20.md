@@ -239,3 +239,21 @@ file-server-proxy Linux / Windows 实测补充：
 两台远端报告各自在本轮个人测试目录 `proxy-cases/<case>/result.json`。这些结果继续仅限上述 smoke 范围，未冒称完整原生矩阵。
 
 本轮 native 修复合并后，独立 app-cli 完整 nextest：`CARGO_TARGET_DIR=crates/app-cli/target cargo nextest run --manifest-path crates/app-cli/Cargo.toml --all-features --no-fail-fast` 退出 0，248/248 通过、0 skipped；日志 `/tmp/rcoder-app-cli-native-final-tests.log`。仍非完整三平台矩阵。
+
+## Checkpoint 后三平台追加实测
+
+本段记录并行任务的实际结果，不能替代尚未完成的 NT01–NT16 全矩阵或 npm 发布验证。三台宿主机均使用独立测试目录，未操作 K8s 资源。
+
+- macOS：当前独立快照83f5ab52对应二进制cb03859a；真实Vue源码devbuild/Vite、重复serve同owner更新、Stop保持idle、SIGTERM正常退出及端口释放通过；生产build与产物serve链通过；伪造health占管理口11ms非零退出且工作区未变；原生针对性回归9/9通过。详细报告 `/tmp/rcoder-native-macos-followup.md`。
+- Linux：含最新PG环境修复二进制cacc162e，Vue生产build、源码devrun、重复serve、失败后显式重试实际恢复、未知管理口占用保护通过。随后空格/中文workspace反例修复前Stop409，修复后2/2及真实Vue链通过（binary1f664359，case nativepath4713045378e3）。报告 `/tmp/rcoder-native-linux-followup.md`。
+- Windows：实际目录含空格、无Git Bash PATH的Vue源码启动/重复serve同owner/Stop/再次serve通过，最终进程与5756/3010/3018/9080监听全部清理。Job强杀反例修复前失败，增加KillOnDrop后通过；既有process_tree三例通过；workspace身份+owner崩溃两集成目标2/2通过、0skip。组合binary beaa33d29e99165f5bd04057ce5c596ae954790bdb2773ce3f1c486fa12a23ff，case nativeownerad74266b6b36。报告 `/tmp/rcoder-native-windows-followup.md`。
+
+原生测试发现并修复的目录身份和Job关闭问题已包含在4e51f476检查点。之后的本地ArtifactId部署目标和file-server持久意图仍在修改，以上结果不是这些后续改动的验收。Windows Ctrl+C优雅关闭、完整离线/打包环境及全部原生矩阵仍未完成。
+
+### Windows file-server-proxy 路径读写追加验证
+
+checkpoint原生HTTP复现两个缺陷：../写被跳过却返回成功；junction指向同测试目录之外时可真实读写外部哨兵。修复为整个写入批次在备份/创建目录前预检实际祖先、执行前复检；文件解析与静态读取也核验解析后的归属。调用方仍可选择合法workspace根，不增加根目录白名单。边界为路径预检，并非对恶意本机进程并发置换链接提供句柄级隔离。
+
+Windows新增5条路径组件测试5/5通过（run07d0cb0b-5d08-419a-bbbd-8d8c55759d50），最终真实HTTP12项通过（case proxye28d5c2f5318，binary72d5a3ca27c93168be7dbb3a059f7601b4a38e675162bde752a8c47eeb4aa905）。含中文空格根、二进制上传下载、搜索、Git、../拒绝、junction外写拒绝、resolve外部链接exists=false、static外链404、ZIP不泄漏；内部链接读取仍通过。报告 `/tmp/rcoder-native-windows-proxy-followup.md`，测试资源已清理。并不替代npm发行包或完整桌面矩阵验收。
+
+Mac/Linux proxy追加核心套件的委派任务在执行前被平台自动安全拦截终止，未取得这两平台的新结果；不把Windows结果或此前基础smoke替代该追加套件。该任务未自行提交/发布，其他Compose与源码修复继续。

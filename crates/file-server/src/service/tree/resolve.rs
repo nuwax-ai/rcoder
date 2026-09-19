@@ -48,7 +48,15 @@ pub async fn resolve_existing_file(
     let Some(ResolvedPath { abs_path, name }) = resolved else {
         return Ok(None);
     };
-    // 与静态文件 sendFile 一致: 跟随符号链接, 只要最终是文件即可 (TS 用 fs.stat)
+    // Preserve exists:false for an inaccessible/outside link target. A caller's
+    // chosen root may itself be a link; links resolving inside it remain valid.
+    if crate::path_safety::ensure_resolved_within(root, &name)
+        .await
+        .is_err()
+    {
+        return Ok(None);
+    }
+    // Like static serving, follow only links contained by the selected root.
     let meta = match fs::metadata(&abs_path).await {
         Ok(m) => m,
         Err(_) => return Ok(None),

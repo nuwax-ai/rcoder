@@ -55,19 +55,31 @@ struct CoordinatorOwner {
 
 pub(crate) struct Journal {
     root: PathBuf,
-    lease: File,
+    lease: Option<File>,
     pub receipt: Option<Receipt>,
     pub process_scope: Option<String>,
     previous_owner: Option<CoordinatorOwner>,
+    // Retain the old lock domain for the entire owner lifetime: an old binary
+    // must not start against now-empty legacy record paths during migration.
+    legacy_leases: Vec<File>,
+    legacy_root: Option<PathBuf>,
 }
 impl Drop for Journal {
     fn drop(&mut self) {
-        if let Err(error) = self.lease.unlock() {
+        for lease in &self.legacy_leases {
+            if let Err(error) = lease.unlock() {
+                tracing::error!(%error, "Failed to release legacy journal lease");
+            }
+        }
+        if let Some(lease) = &self.lease
+            && let Err(error) = lease.unlock()
+        {
             tracing::error!(%error, "Failed to release deployment journal lease");
         }
     }
 }
 impl Journal {
+    #[cfg(test)]
     pub fn open(workspace: &Path) -> Result<Self> {
         // B04：平台显式状态根权威（与 runtime_kernel 同 env）——source/.run
         // 别名经同一目录竞争同一把锁。缺省沿用卷根推导（历史布局兼容）。
@@ -78,6 +90,72 @@ impl Journal {
                 .context("workspace has no volume root")?
                 .to_path_buf(),
         };
+        Self::open_root(root)
+    }
+
+    /// Caller already holds the common OwnerGuard. Merely opening never moves
+    /// records: migration waits until the management listener has bound.
+    pub fn open_with_root(workspace: &Path, root: PathBuf) -> Result<Self> {
+        let mut journal = Self::open_root(root)?;
+        let project = runtime_state_layout::canonical_project_root(workspace);
+        let mut candidates = vec![project.clone()];
+        if let Some(parent) = project.parent() {
+            candidates.push(parent.to_path_buf());
+        }
+        let root_identity = std::fs::canonicalize(&journal.root)?;
+        for legacy in candidates {
+            if std::fs::canonicalize(&legacy).is_ok_and(|path| path == root_identity) {
+                continue;
+            }
+            let has_records = legacy.join(".deploy-operation.json").try_exists()?
+                || legacy.join(".deploy-coordinator.json").try_exists()?;
+            if !has_records {
+                continue;
+            }
+            anyhow::ensure!(
+                journal.receipt.is_none()
+                    && journal.previous_owner.is_none()
+                    && journal.legacy_root.is_none(),
+                "deployment journal exists in multiple authority domains; explicit recovery required"
+            );
+            let mut old = Self::open_root(legacy.clone())?;
+            journal.receipt = old.receipt.take();
+            journal.previous_owner = old.previous_owner.take();
+            let lease = old
+                .lease
+                .take()
+                .context("legacy deployment lease missing")?;
+            journal.legacy_leases.push(lease);
+            journal.legacy_root = Some(legacy);
+        }
+        Ok(journal)
+    }
+
+    pub fn migrate_after_bind(&mut self) -> Result<()> {
+        let Some(legacy) = self.legacy_root.as_ref() else {
+            return Ok(());
+        };
+        for name in [".deploy-operation.json", ".deploy-coordinator.json"] {
+            let source = legacy.join(name);
+            if source.try_exists()? {
+                anyhow::ensure!(
+                    !self.root.join(name).try_exists()?,
+                    "migration destination already exists"
+                );
+                std::fs::rename(&source, self.root.join(name))
+                    .with_context(|| format!("migrate deployment journal {name}"))?;
+            }
+        }
+        #[cfg(unix)]
+        {
+            File::open(&self.root)?.sync_all()?;
+            File::open(legacy)?.sync_all()?;
+        }
+        self.legacy_root = None;
+        Ok(())
+    }
+
+    fn open_root(root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&root)?;
         let lease = OpenOptions::new()
             .read(true)
@@ -104,10 +182,12 @@ impl Journal {
         };
         Ok(Self {
             root,
-            lease,
+            lease: Some(lease),
             receipt,
             process_scope: process_scope(),
             previous_owner,
+            legacy_leases: Vec::new(),
+            legacy_root: None,
         })
     }
     fn write_verified<T: Serialize + serde::de::DeserializeOwned>(
@@ -225,6 +305,75 @@ fn process_scope() -> Option<String> {
 mod tests {
     use super::*;
     use shared_types::{AppCliDeployPhase, app_cli_deploy::AppDeploymentStage};
+    #[test]
+    fn source_and_run_alias_use_one_resolved_journal_without_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("project");
+        let run = source.join(".run");
+        std::fs::create_dir_all(&run).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
+        let alias_root = runtime_state_layout::ensure_state_root(&run, None, None).unwrap();
+        assert_eq!(root, alias_root);
+        let mut first = Journal::open_with_root(&source, root.clone()).unwrap();
+        first.commit_coordinator().unwrap();
+        first.write(receipt(Boundary::Active)).unwrap();
+        first.commit_quiescent().unwrap();
+        assert!(Journal::open_with_root(&run, alias_root.clone()).is_err());
+        drop(first);
+        let second = Journal::open_with_root(&run, alias_root).unwrap();
+        second.require_fresh_process_scope().unwrap();
+        assert_eq!(
+            second.receipt.as_ref().unwrap().operation.operation_id,
+            "hot-b"
+        );
+        assert!(!source.join(".deploy-operation.json").exists());
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+        assert!(root.join(".deploy-operation.json").exists());
+    }
+
+    #[test]
+    fn legacy_journal_migrates_only_after_bind_and_retains_old_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("project");
+        std::fs::create_dir_all(&source).unwrap();
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        legacy.commit_quiescent().unwrap();
+        drop(legacy);
+        let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
+        let mut migrated = Journal::open_with_root(&source, root.clone()).unwrap();
+        assert!(dir.path().join(".deploy-operation.json").exists());
+        assert!(!root.join(".deploy-operation.json").exists());
+        migrated.migrate_after_bind().unwrap();
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+        assert!(root.join(".deploy-operation.json").exists());
+        assert!(Journal::open_root(dir.path().to_path_buf()).is_err());
+        assert_eq!(
+            migrated.receipt.as_ref().unwrap().operation.operation_id,
+            "hot-b"
+        );
+    }
+
+    #[test]
+    fn dual_journal_authority_is_rejected_without_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("project");
+        std::fs::create_dir_all(&source).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
+        for path in [dir.path(), root.as_path()] {
+            let mut journal = Journal::open_root(path.to_path_buf()).unwrap();
+            journal.write(receipt(Boundary::Active)).unwrap();
+        }
+        let before = std::fs::read(root.join(".deploy-operation.json")).unwrap();
+        assert!(Journal::open_with_root(&source, root.clone()).is_err());
+        assert_eq!(
+            before,
+            std::fs::read(root.join(".deploy-operation.json")).unwrap()
+        );
+        assert!(dir.path().join(".deploy-operation.json").exists());
+    }
+
     fn receipt(boundary: Boundary) -> Receipt {
         let request = DeployRequest {
             runtime_operation_id: None,
@@ -232,6 +381,9 @@ mod tests {
             release_id: "b".into(),
             sha256: None,
             local_path: None,
+            execution_target: None,
+            requires_configuration_activation: false,
+            run_pg: None,
         };
         Receipt {
             generation: "generation-a".into(),

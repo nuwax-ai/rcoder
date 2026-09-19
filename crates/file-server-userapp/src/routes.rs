@@ -44,6 +44,7 @@ fn userapp_router() -> OpenApiRouter<UserAppState> {
         .routes(routes!(userapp_dev_server::dev_start))
         .routes(routes!(userapp_dev_server::dev_stop))
         .routes(routes!(userapp_dev_server::dev_restart))
+        .routes(routes!(userapp_dev_server::recover_dev_operation))
         .routes(routes!(userapp_dev_server::dev_list))
         .routes(routes!(userapp_dev_server::framework_info))
         .routes(routes!(static_files::serve_userapp))
@@ -125,6 +126,7 @@ mod tests {
             "/api/v1/userapp/dev/start",
             "/api/v1/userapp/dev/stop",
             "/api/v1/userapp/dev/restart",
+            "/api/v1/userapp/dev/operations/{operation_id}/recover",
             "/api/v1/userapp/dev/list",
             "/api/v1/userapp/dev/framework-info",
             "/api/v1/userapp/static/{app_id}",
@@ -134,7 +136,7 @@ mod tests {
                 "userapp path missing: {path}"
             );
         }
-        assert_eq!(document.paths.paths.len(), 34);
+        assert_eq!(document.paths.paths.len(), 35);
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 

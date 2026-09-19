@@ -144,6 +144,14 @@ impl ServerPhase {
     }
 }
 
+/// A persisted internal execution target, never an arbitrary client path.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecutionTarget {
+    Source,
+    ProjectRun,
+}
+
 /// /v1/deploy 受理请求（api 端点反序列化后转发主循环）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeployRequest {
@@ -155,6 +163,14 @@ pub struct DeployRequest {
     /// R03：登记的本地构建制品（共享卷 `builds/` 目录的 zip）——跳过网络
     /// 下载，直接校验/解压；legacy `/v1/deploy`（URL）为 None。
     pub local_path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub(crate) execution_target: Option<ExecutionTarget>,
+    /// Secrets are never journaled; a restart must use the managed configuration
+    /// gate instead of silently falling back to inherited/default credentials.
+    #[serde(default)]
+    pub(crate) requires_configuration_activation: bool,
+    #[serde(skip)]
+    pub(crate) run_pg: Option<shared_types::StartPgCredential>,
 }
 
 #[derive(Debug)]
@@ -837,6 +853,80 @@ impl ServerState {
         Ok(())
     }
 
+    /// Runtime admission already owns the operation slot. Persist its execution
+    /// receipt before preparation, source switching, or any business mutation.
+    fn record_runtime_deployment(&self, request: &DeployRequest) -> Result<()> {
+        let Some(operation_id) = request.runtime_operation_id.as_ref() else {
+            return Ok(()); // legacy admission already wrote this receipt
+        };
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment admission lock poisoned"))?;
+        let mut journal = self
+            .journal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?;
+        let Some(journal) = journal.as_mut() else {
+            return Ok(());
+        };
+        if let Some(receipt) = &journal.receipt
+            && receipt.operation.operation_id == *operation_id
+        {
+            anyhow::ensure!(
+                receipt.request.execution_target == request.execution_target
+                    && receipt.request.local_path == request.local_path
+                    && receipt.request.release_id == request.release_id,
+                "runtime execution receipt target changed for the same operation"
+            );
+            return Ok(());
+        }
+        let previous = self.deploy_status();
+        let active = journal
+            .receipt
+            .as_ref()
+            .filter(|receipt| receipt.generation == self.generation)
+            .and_then(|receipt| receipt.active.clone())
+            .or_else(|| {
+                self.release().map(|release| ActiveVersion {
+                    artifact_release_id: release.release_id,
+                    request: None,
+                })
+            });
+        let operation = shared_types::AppDeploymentOperation {
+            operation_id: operation_id.clone(),
+            deployment_generation_id: self.generation.clone(),
+            deploy_stage: AppDeploymentStage::Pending,
+            persisted: false,
+            request_release_id: request.release_id.clone(),
+            artifact_release_id: None,
+            recovery: None,
+            phase: AppCliDeployPhase::Deploying,
+            error: None,
+        };
+        journal.write(Receipt {
+            generation: self.generation.clone(),
+            operation: operation.clone(),
+            request: request.clone(),
+            boundary: Boundary::Preparing,
+            active,
+        })?;
+        *self
+            .deploy_status
+            .write()
+            .map_err(|_| anyhow::anyhow!("deployment status lock poisoned"))? = DeployStatus {
+            protocol_version: DEPLOY_PROTOCOL,
+            operation: Some(operation),
+            phase: AppCliDeployPhase::Deploying,
+            release_id: previous.release_id,
+            request_release_id: Some(request.release_id.clone()),
+            error: None,
+            capabilities: vec!["progress_v1".into()],
+            progress: None,
+        };
+        Ok(())
+    }
+
     pub(crate) fn matches_generation(&self, generation: &str) -> bool {
         generation == self.generation
     }
@@ -869,7 +959,7 @@ impl ServerState {
             receipt.operation.deploy_stage = AppDeploymentStage::Succeeded;
             receipt.operation.persisted = true;
         }
-        if boundary == Boundary::Active {
+        if matches!(boundary, Boundary::Activated | Boundary::Active) {
             receipt.active = Some(ActiveVersion {
                 request: Some(receipt.request.clone()),
                 artifact_release_id: receipt
@@ -878,7 +968,9 @@ impl ServerState {
                     .clone()
                     .context("activated operation has no artifact identity")?,
             });
-            receipt.operation.phase = AppCliDeployPhase::Running;
+            if boundary == Boundary::Active {
+                receipt.operation.phase = AppCliDeployPhase::Running;
+            }
         }
         journal.write(receipt)
     }
@@ -1275,7 +1367,7 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         }
     };
 
-    let journal = Journal::open(&args.workspace)?;
+    let journal = Journal::open_with_root(&args.workspace, state_root.clone())?;
     let ready = RuntimeStatusService::default();
     let mut initial_state = ServerState::new(ready.clone());
     initial_state.initialize_owner_token()?;
@@ -1331,6 +1423,17 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         }
     });
 
+    let migrate = state
+        .journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+        .as_mut()
+        .context("deployment journal missing")?
+        .migrate_after_bind();
+    if let Err(error) = migrate {
+        api_handle.abort();
+        return Err(error).context("migrate deployment journal after management bind");
+    }
     crate::deploy::cleanup_startup(&args.workspace).await?;
 
     let signal_state = state.clone();
@@ -1663,12 +1766,9 @@ async fn assemble_runtime_kernel(
     let root = RuntimeStore::resolve_root(&args.workspace, &application_id)?;
     let store = RuntimeStore::open_with_root(root, &args.workspace)?;
     let workspace_id = runtime_workspace_id(&args.workspace);
-    let source_root = args
-        .workspace
-        .canonicalize()
-        .unwrap_or_else(|_| args.workspace.clone())
+    let source_root = runtime_state_layout::canonical_project_root(&args.workspace)
         .to_string_lossy()
-        .to_string();
+        .into_owned();
     let identity = store.load_or_init_identity(
         application_id,
         "userapp-dev".to_string(),
@@ -1683,6 +1783,7 @@ async fn assemble_runtime_kernel(
             operation_id,
             artifact_id,
             sha256,
+            pg,
         } => {
             // R03：登记的本地构建制品——共享卷 builds/ 目录 zip 由 owner 侧
             // 部署准备链校验/解压/激活（不经网络下载；artifact_id 已过
@@ -1699,11 +1800,11 @@ async fn assemble_runtime_kernel(
                 });
                 return;
             }
-            let local_path = dispatch_workspace.parent().map(|volume| {
-                volume
+            let local_path = Some(
+                runtime_state_layout::canonical_project_root(&dispatch_workspace)
                     .join("builds")
-                    .join(format!("workspace-package-{artifact_id}.zip"))
-            });
+                    .join(format!("workspace-package-{artifact_id}.zip")),
+            );
             if let Some(path) = &local_path
                 && !path.exists()
             {
@@ -1719,6 +1820,9 @@ async fn assemble_runtime_kernel(
                 release_id: marker,
                 sha256,
                 local_path,
+                execution_target: Some(ExecutionTarget::ProjectRun),
+                requires_configuration_activation: pg.is_some(),
+                run_pg: pg,
             };
             if dispatch_state.deploy_tx.send(request).is_err() {
                 tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
@@ -1728,6 +1832,7 @@ async fn assemble_runtime_kernel(
             operation_id,
             url,
             sha256,
+            pg,
         } => {
             // R03 取消检查点：排队期间被取消 → 不进部署链（dispatch 是同步
             // 闭包，终态收束经 spawn 落盘）
@@ -1752,6 +1857,9 @@ async fn assemble_runtime_kernel(
                 release_id: marker,
                 sha256,
                 local_path: None,
+                execution_target: None,
+                requires_configuration_activation: pg.is_some(),
+                run_pg: pg,
             };
             if dispatch_state.deploy_tx.send(request).is_err() {
                 tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
@@ -1818,10 +1926,69 @@ async fn establish_startup_quiescence(
     Ok(())
 }
 
+/// Resolve only owner-relative targets; persisted records cannot redirect writes
+/// to an arbitrary path. The owner identity remains the original project root.
+fn execution_workspace(
+    owner: &std::path::Path,
+    target: Option<ExecutionTarget>,
+) -> std::path::PathBuf {
+    match target {
+        Some(ExecutionTarget::Source) => runtime_state_layout::canonical_project_root(owner),
+        Some(ExecutionTarget::ProjectRun) => {
+            runtime_state_layout::canonical_project_root(owner).join(".run")
+        }
+        None => owner.to_path_buf(),
+    }
+}
+
+fn restored_runtime_args(args: &RuntimeArgs, state: &ServerState) -> Result<RuntimeArgs> {
+    let receipt = state
+        .journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+        .as_ref()
+        .and_then(|journal| journal.receipt.clone());
+    let mut restored = args.clone();
+    if let Some(receipt) = receipt {
+        if receipt.generation != state.generation {
+            anyhow::ensure!(
+                crate::deploy::deploy_requested(),
+                "deployment journal generation does not match this owner; explicit deployment required"
+            );
+            // Only an explicit new env deployment may replace a prior generation;
+            // initialize_startup must still validate/admit that deployment.
+            return Ok(restored);
+        }
+        if let Some(request) = receipt
+            .active
+            .as_ref()
+            .and_then(|active| active.request.as_ref())
+        {
+            // Old local-artifact receipts without a target cannot establish that
+            // source/.run was selected safely. Keep recovery protection.
+            anyhow::ensure!(
+                request.local_path.is_none() || request.execution_target.is_some(),
+                "local artifact journal has no confirmed execution target; explicit recovery required"
+            );
+            anyhow::ensure!(
+                !request.requires_configuration_activation || state.configuration_gate().is_some(),
+                "runtime credentials require explicit configuration activation after owner restart"
+            );
+            restored.workspace = execution_workspace(&args.workspace, request.execution_target);
+            if let Some(target) = request.execution_target {
+                state.set_pending_dev_profile(target == ExecutionTarget::Source);
+            }
+        }
+    }
+    Ok(restored)
+}
+
 async fn initialize_startup(
     args: &RuntimeArgs,
     state: &ServerState,
 ) -> Result<Option<InitialAction>> {
+    let restored = restored_runtime_args(args, state)?;
+    let args = &restored;
     if let Err(error) = crate::migration_journal::require_confirmed_migrations(&args.workspace) {
         state.begin_runtime_recovery_hold();
         return Err(error).context("database migration requires reconciliation");
@@ -1928,12 +2095,21 @@ enum Next {
     Exit,
 }
 
+struct PreparedActivation {
+    prepared: crate::deploy::PreparedDeploy,
+    workspace: std::path::PathBuf,
+    target: Option<ExecutionTarget>,
+    pg: Option<shared_types::StartPgCredential>,
+}
+
 /// 状态机主循环：初始动作（env 部署 / 卷上既有版本直接编排 / 空容器挂 Idle）→
 /// 编排 supervise；期间可被新部署请求打断（停旧服务 → 换 code → 重新编排）。
 enum InitialAction {
     /// env/热部署触发：下载制品后编排。
     Deploy(DeployRequest),
-    Prepared(crate::deploy::PreparedDeploy),
+    Prepared(PreparedActivation),
+    /// Explicit Source switches back from .run to the canonical source root.
+    Source,
     /// 卷上既有 release.lock（Pod 重建恢复）：跳过下载直接编排。
     Existing,
     /// 运行控制 stop：停止业务服务（保持管理面）。携带受理操作 ID——
@@ -1962,10 +2138,24 @@ async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> In
             if state.settle_cancelled_before_execution(&operation_id).await {
                 return InitialAction::Settled;
             }
-            state.set_current_runtime_operation(Some(operation_id));
+            state.set_current_runtime_operation(Some(operation_id.clone()));
+            let request = DeployRequest {
+                runtime_operation_id: Some(operation_id.clone()),
+                url: "source://workspace".into(),
+                release_id: format!("runtime-{operation_id}"),
+                sha256: None,
+                local_path: None,
+                execution_target: Some(ExecutionTarget::Source),
+                requires_configuration_activation: pg.is_some(),
+                run_pg: None,
+            };
+            if let Err(error) = state.record_runtime_deployment(&request) {
+                hold_unconfirmed(state, format!("persist source execution: {error:#}")).await;
+                return InitialAction::Settled;
+            }
             state.set_pending_dev_profile(dev_profile);
             state.set_pending_run_config(pg);
-            InitialAction::Existing
+            InitialAction::Source
         }
         ControlSignal::StopBusiness { operation_id } => {
             InitialAction::StopBusiness { operation_id }
@@ -2004,6 +2194,13 @@ async fn next_prepared(
         if let Some(id) = &request.runtime_operation_id {
             state.set_current_runtime_operation(Some(id.clone()));
         }
+        if let Err(error) = state.record_runtime_deployment(&request) {
+            hold_unconfirmed(state, format!("persist deployment execution: {error:#}")).await;
+            return None;
+        }
+        let workspace = execution_workspace(&args.workspace, request.execution_target);
+        let target = request.execution_target;
+        let pg = request.run_pg.clone();
         let state_clone = state.clone();
         let progress_cb: crate::deploy::ProgressCallback =
             std::sync::Arc::new(move |p: shared_types::AppDeploymentProgress| {
@@ -2011,15 +2208,34 @@ async fn next_prepared(
             });
         match state
             .preparations
-            .run(args.workspace.clone(), request, Some(progress_cb))
+            .run(workspace.clone(), request, Some(progress_cb))
             .await
         {
             Ok(Some(prepared)) => {
+                if state.current_operation_cancelled() {
+                    drop(prepared);
+                    if let Err(error) = state.fail_operation(
+                        "deployment cancelled before activation".into(),
+                        Boundary::Preparing,
+                    ) {
+                        hold_unconfirmed(state, format!("persist cancellation: {error:#}")).await;
+                        return None;
+                    }
+                    if let Some(id) = state.current_runtime_operation() {
+                        state.settle_cancelled_before_execution(&id).await;
+                    }
+                    continue;
+                }
                 if let Err(error) = state.persist_boundary(Boundary::Switching) {
                     fail_preparation(state, format!("persist switch: {error:#}")).await;
                     continue;
                 }
-                return Some(InitialAction::Prepared(prepared));
+                return Some(InitialAction::Prepared(PreparedActivation {
+                    prepared,
+                    workspace,
+                    target,
+                    pg,
+                }));
             }
             Ok(None) => match crate::manifest::read_release_lock(&args.workspace) {
                 Ok(release) => {
@@ -2270,11 +2486,24 @@ async fn commit_running_barrier(state: &ServerState) -> BarrierOutcome {
 }
 
 async fn server_loop(
-    args: &RuntimeArgs,
+    owner_args: &RuntimeArgs,
     state: &Arc<ServerState>,
     host: Option<SupervisordHost>,
     first: Option<InitialAction>,
 ) -> Result<()> {
+    let mut active_args = match restored_runtime_args(owner_args, state) {
+        Ok(args) => args,
+        Err(error) => {
+            state.begin_runtime_recovery_hold();
+            state.begin_failure(
+                format!("runtime execution target recovery failed: {error:#}"),
+                true,
+            );
+            state.cancel.cancelled().await;
+            return Ok(());
+        }
+    };
+    let args = &mut active_args;
     let mut pending: Option<InitialAction> = first;
     loop {
         if state.cancel.is_cancelled() {
@@ -2389,7 +2618,7 @@ async fn server_loop(
         }
         let deployment_attempt = matches!(
             action,
-            InitialAction::Deploy(_) | InitialAction::Prepared(_)
+            InitialAction::Deploy(_) | InitialAction::Prepared(_) | InitialAction::Source
         );
         let prepared = match action {
             InitialAction::StopBusiness { .. } | InitialAction::Settled => {
@@ -2399,6 +2628,15 @@ async fn server_loop(
                 if let Some(id) = &request.runtime_operation_id {
                     state.set_current_runtime_operation(Some(id.clone()));
                 }
+                if let Err(error) = state.record_runtime_deployment(&request) {
+                    hold_unconfirmed(state, format!("persist deployment execution: {error:#}"))
+                        .await;
+                    continue;
+                }
+                let workspace =
+                    execution_workspace(&owner_args.workspace, request.execution_target);
+                let target = request.execution_target;
+                let pg = request.run_pg.clone();
                 state.set_phase(ServerPhase::Deploying);
                 state.set_request_release_id(&request.release_id);
                 let state_ref = state.clone();
@@ -2408,10 +2646,15 @@ async fn server_loop(
                     });
                 match state
                     .preparations
-                    .run(args.workspace.clone(), request, Some(progress_cb))
+                    .run(workspace.clone(), request, Some(progress_cb))
                     .await
                 {
-                    Ok(prepared) => prepared,
+                    Ok(prepared) => prepared.map(|prepared| PreparedActivation {
+                        prepared,
+                        workspace,
+                        target,
+                        pg,
+                    }),
                     Err(error) => {
                         fail_preparation(state, format!("prepare: {error:#}")).await;
                         continue;
@@ -2419,10 +2662,34 @@ async fn server_loop(
                 }
             }
             InitialAction::Prepared(prepared) => Some(prepared),
+            InitialAction::Source => {
+                args.workspace =
+                    execution_workspace(&owner_args.workspace, Some(ExecutionTarget::Source));
+                // Old services are already confirmed stopped before this action.
+                if let Err(error) = state.persist_boundary(Boundary::Switching) {
+                    hold_unconfirmed(state, format!("persist source switch: {error:#}")).await;
+                    continue;
+                }
+                None
+            }
             InitialAction::Existing => None,
         };
         if state.cancel.is_cancelled() {
             return Ok(());
+        }
+        if state.current_operation_cancelled() {
+            drop(prepared);
+            if let Err(error) = state.fail_operation(
+                "deployment cancelled before activation".into(),
+                Boundary::Preparing,
+            ) {
+                hold_unconfirmed(state, format!("persist cancellation: {error:#}")).await;
+                continue;
+            }
+            if let Some(id) = state.current_runtime_operation() {
+                state.settle_cancelled_before_execution(&id).await;
+            }
+            continue;
         }
         if prepared.is_some()
             && let Err(error) = state.persist_boundary(Boundary::Switching)
@@ -2430,11 +2697,16 @@ async fn server_loop(
             pending = fail_activation(args, state, format!("persist switch: {error:#}")).await;
             continue;
         }
-        if let Some(prepared) = prepared
-            && let Err(error) = crate::deploy::activate(&args.workspace, prepared).await
-        {
-            pending = fail_activation(args, state, format!("activate: {error:#}")).await;
-            continue;
+        if let Some(prepared) = prepared {
+            // Preparation binds the target before shutdown. A late request cannot
+            // redirect this activation or inject its credentials into this epoch.
+            args.workspace = prepared.workspace;
+            state.set_pending_dev_profile(prepared.target == Some(ExecutionTarget::Source));
+            state.set_pending_run_config(prepared.pg);
+            if let Err(error) = crate::deploy::activate(&args.workspace, prepared.prepared).await {
+                pending = fail_activation(args, state, format!("activate: {error:#}")).await;
+                continue;
+            }
         }
 
         // ── Orchestrating：读 lock → 编排（migrate → services → pingap → readiness）──
@@ -2556,7 +2828,7 @@ async fn server_loop(
             // 不再只能等 Idle）。锁序与 Idle 分支一致：deploy 先、control 后。
             let mut control_rx = state.control_rx.lock().await;
             let next = tokio::select! {
-                maybe = next_prepared(args, state, &mut hot_rx) => match maybe {
+                maybe = next_prepared(owner_args, state, &mut hot_rx) => match maybe {
                     Some(action) => Next::Redeploy(action),
                     None => Next::Exit,
                 },
@@ -2725,7 +2997,7 @@ async fn server_loop(
                     return Ok(());
                 }
             }},
-            maybe = next_prepared(args, state, &mut hot_rx) => match maybe {
+            maybe = next_prepared(owner_args, state, &mut hot_rx) => match maybe {
                 Some(action) => {
                     tracing::info!("server: hot deploy received, stopping current services");
                     state.ready.set_ready(false);
@@ -2861,6 +3133,124 @@ mod tests {
     }
 
     #[test]
+    fn local_artifact_target_and_source_profile_survive_confirmed_receipts() {
+        for run_owner in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("workspace");
+            let run = source.join(".run");
+            std::fs::create_dir_all(&run).unwrap();
+            std::fs::write(source.join("source-sentinel"), "never replace source").unwrap();
+            let args = RuntimeArgs {
+                workspace: if run_owner {
+                    run.clone()
+                } else {
+                    source.clone()
+                },
+                ..Default::default()
+            };
+            let state = state();
+            *state.journal.lock().unwrap() = Some(Journal::open(&args.workspace).unwrap());
+            let mut deploy = request();
+            deploy.runtime_operation_id = Some("localartifact".into());
+            deploy.execution_target = Some(ExecutionTarget::ProjectRun);
+            deploy.local_path = Some(source.join("builds/workspace-package-b.zip"));
+            state.record_runtime_deployment(&deploy).unwrap();
+            let receipt = state
+                .journal
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .receipt
+                .clone()
+                .unwrap();
+            assert_eq!(receipt.operation.operation_id, "localartifact");
+            assert_eq!(receipt.boundary, Boundary::Preparing);
+            assert_eq!(
+                receipt.request.execution_target,
+                Some(ExecutionTarget::ProjectRun)
+            );
+            assert_eq!(
+                execution_workspace(&args.workspace, deploy.execution_target),
+                run
+            );
+            let mut changed = deploy.clone();
+            changed.execution_target = Some(ExecutionTarget::Source);
+            assert!(
+                state.record_runtime_deployment(&changed).is_err(),
+                "same operation cannot change target"
+            );
+            state.persist_boundary(Boundary::Switching).unwrap();
+            state.set_release(release("artifact-b"));
+            state.complete_stage().unwrap();
+            state.complete_running().unwrap();
+            assert_eq!(restored_runtime_args(&args, &state).unwrap().workspace, run);
+            let mut source_request = request();
+            source_request.runtime_operation_id = Some("sourceagain".into());
+            source_request.execution_target = Some(ExecutionTarget::Source);
+            state.record_runtime_deployment(&source_request).unwrap();
+            state.persist_boundary(Boundary::Switching).unwrap();
+            state.set_release(release("source-a"));
+            state.complete_stage().unwrap();
+            state.complete_running().unwrap();
+            assert_eq!(
+                restored_runtime_args(&args, &state).unwrap().workspace,
+                source
+            );
+            assert_eq!(
+                std::fs::read_to_string(source.join("source-sentinel")).unwrap(),
+                "never replace source"
+            );
+        }
+    }
+
+    #[test]
+    fn local_artifact_recovery_refuses_unknown_target_or_lost_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = RuntimeArgs {
+            workspace: dir.path().join("workspace"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&args.workspace).unwrap();
+        let state = state();
+        *state.journal.lock().unwrap() = Some(Journal::open(&args.workspace).unwrap());
+        let mut deploy = request();
+        deploy.runtime_operation_id = Some("localartifact".into());
+        deploy.local_path = Some(args.workspace.join("builds/workspace-package-b.zip"));
+        deploy.execution_target = Some(ExecutionTarget::ProjectRun);
+        deploy.requires_configuration_activation = true;
+        state.record_runtime_deployment(&deploy).unwrap();
+        state.set_release(release("artifact-b"));
+        state.complete_stage().unwrap();
+        state.complete_running().unwrap();
+        assert!(
+            restored_runtime_args(&args, &state).is_err(),
+            "do not restore with default credentials"
+        );
+        {
+            let mut journal = state.journal.lock().unwrap();
+            let active_request = journal
+                .as_mut()
+                .unwrap()
+                .receipt
+                .as_mut()
+                .unwrap()
+                .active
+                .as_mut()
+                .unwrap()
+                .request
+                .as_mut()
+                .unwrap();
+            active_request.requires_configuration_activation = false;
+            active_request.execution_target = None;
+        }
+        assert!(
+            restored_runtime_args(&args, &state).is_err(),
+            "old local receipt has no trusted target"
+        );
+    }
+
+    #[test]
     fn owner_token_is_stable_per_instance_and_not_exported_to_env() {
         let before = std::env::var_os("APP_CLI_DEPLOY_TOKEN");
         let first = state();
@@ -2908,6 +3298,9 @@ mod tests {
             runtime_operation_id: None,
             url: "http://artifact".into(),
             local_path: None,
+            execution_target: None,
+            requires_configuration_activation: false,
+            run_pg: None,
             release_id: "caller-token".into(),
             sha256: None,
         }
@@ -3170,32 +3563,15 @@ format = "jsonl"
             workspace,
             ..Default::default()
         };
-        assert!(matches!(
-            initialize_startup(&args, &restarted).await.unwrap(),
-            Some(InitialAction::Existing)
-        ));
-        restarted.set_release(artifact);
-        restarted.complete_running().unwrap();
+        assert!(
+            initialize_startup(&args, &restarted).await.is_err(),
+            "a foreign generation must not automatically start existing code"
+        );
         assert!(restarted.deploy_status().operation.is_none());
         assert_eq!(
             std::fs::read(dir.path().join(".deploy-operation.json")).unwrap(),
             before
         );
-        restarted
-            .try_accept_deploy_with_id(request(), "new-attempt".into())
-            .unwrap();
-        let receipt = restarted
-            .journal
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .receipt
-            .clone()
-            .unwrap();
-        assert_eq!(receipt.generation, "new-generation");
-        assert_eq!(receipt.operation.operation_id, "new-attempt");
-        assert_eq!(receipt.active.unwrap().artifact_release_id, "existing-a");
     }
 
     #[tokio::test]
@@ -3463,6 +3839,7 @@ format = "jsonl"
             .try_accept_deploy_with_id(request(), "operation-a".into())
             .unwrap();
         state.persist_boundary(Boundary::Switching).unwrap();
+        state.set_release(release("activated-b"));
         state.complete_stage().unwrap();
         let operation = state.deploy_status().operation.unwrap();
         assert!(operation.persisted);
@@ -3568,6 +3945,9 @@ format = "jsonl"
                             release_id: format!("r{n}"),
                             sha256: None,
                             local_path: None,
+                            execution_target: None,
+                            requires_configuration_activation: false,
+                            run_pg: None,
                         })
                         .is_ok()
                 })
@@ -3597,6 +3977,9 @@ format = "jsonl"
                     release_id: "requested".into(),
                     sha256: None,
                     local_path: None,
+                    execution_target: None,
+                    requires_configuration_activation: false,
+                    run_pg: None,
                 },
                 "op-a".into(),
             )
@@ -3618,6 +4001,9 @@ format = "jsonl"
             release_id: "requested".into(),
             sha256: None,
             local_path: None,
+            execution_target: None,
+            requires_configuration_activation: false,
+            run_pg: None,
         };
         state
             .try_accept_deploy_with_id(request(), "op-a".into())
@@ -3731,6 +4117,9 @@ format = "jsonl"
             release_id: "rel-1".into(),
             sha256: None,
             local_path: None,
+            execution_target: None,
+            requires_configuration_activation: false,
+            run_pg: None,
         };
         assert!(st.try_accept_deploy(req.clone()).is_ok());
         // 进行中相位拒绝（防双部署竞争）
@@ -3746,6 +4135,9 @@ format = "jsonl"
             release_id: "rel-2".into(),
             sha256: None,
             local_path: None,
+            execution_target: None,
+            requires_configuration_activation: false,
+            run_pg: None,
         })
         .unwrap();
         // 受理按序到达（Running 期受理的 rel-1 排在前——主循环串行消费）
@@ -3804,6 +4196,9 @@ format = "jsonl"
             release_id: "rel-token-b".into(),
             sha256: None,
             local_path: None,
+            execution_target: None,
+            requires_configuration_activation: false,
+            run_pg: None,
         })
         .expect("idle accepts deploy");
         let status = st.deploy_status();
@@ -3844,6 +4239,9 @@ format = "jsonl"
                     release_id: "new".into(),
                     sha256: None,
                     local_path: None,
+                    execution_target: None,
+                    requires_configuration_activation: false,
+                    run_pg: None,
                 },
                 "operation".into(),
             )
@@ -3868,6 +4266,9 @@ format = "jsonl"
                     release_id: "later".into(),
                     sha256: None,
                     local_path: None,
+                    execution_target: None,
+                    requires_configuration_activation: false,
+                    run_pg: None,
                 })
                 .is_err()
         );
@@ -3944,7 +4345,7 @@ format = "jsonl"
             },
         )
         .await;
-        assert!(matches!(action, InitialAction::Existing));
+        assert!(matches!(action, InitialAction::Source));
         assert_eq!(state.current_runtime_operation().as_deref(), Some("op-a"));
         assert_eq!(commit_running_barrier(&state).await, BarrierOutcome::Passed);
         // R01 核心：屏障通过后 server 身份必须清理（修复前残留 op-a）
@@ -3968,7 +4369,7 @@ format = "jsonl"
             },
         )
         .await;
-        assert!(matches!(action, InitialAction::Existing));
+        assert!(matches!(action, InitialAction::Source));
         assert_eq!(state.current_runtime_operation().as_deref(), Some("op-b"));
         assert_eq!(commit_running_barrier(&state).await, BarrierOutcome::Passed);
         for operation in ["op-a", "op-b"] {
@@ -4335,7 +4736,7 @@ format = "jsonl"
             },
         )
         .await;
-        assert!(matches!(action, InitialAction::Existing));
+        assert!(matches!(action, InitialAction::Source));
         assert_eq!(
             state.take_pending_dev_profile(),
             Some(true),

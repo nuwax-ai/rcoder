@@ -9,7 +9,7 @@ use tokio::fs;
 
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
-use crate::path_safety::safe_within_or_skip;
+use crate::path_safety::ensure_resolved_within;
 use crate::service::version;
 use crate::workspace::{ProjectContext, WorkspaceResolver};
 
@@ -30,7 +30,7 @@ pub struct SpecifiedResult {
 }
 
 /// 增量文件操作 (create/delete/rename/modify)。modify 用 diffContentByLines, changes=0 跳写。
-/// 路径越界跳过 (对齐 nuwax specifiedFilesUpdate)。非 GIT 先备份。
+/// 整批路径预检先于备份与写入；非法路径明确拒绝，不计为成功。
 pub async fn specified_files_update(
     resolver: &dyn WorkspaceResolver,
     config: &Config,
@@ -52,6 +52,7 @@ pub async fn specified_files_update(
     if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
+    validate_resolved_paths(&project_path, &validated_ops).await?;
     version::backup_project(config, project_id, &project_path, code_version).await?;
 
     apply_validated_file_ops(&project_path, &validated_ops, ModifyStrategy::Diff).await?;
@@ -120,7 +121,26 @@ pub async fn apply_file_ops(
     strategy: ModifyStrategy,
 ) -> AppResult<()> {
     let validated_ops = validate_file_ops(files)?;
+    validate_resolved_paths(base, &validated_ops).await?;
     apply_validated_file_ops(base, &validated_ops, strategy).await
+}
+
+/// Preflight an entire file batch before callers create a workspace or backup.
+pub async fn preflight_file_ops(base: &Path, files: &[FileOp]) -> AppResult<()> {
+    let validated = validate_file_ops(files)?;
+    validate_resolved_paths(base, &validated).await
+}
+
+async fn validate_resolved_paths(base: &Path, files: &[ValidatedFileOp<'_>]) -> AppResult<()> {
+    for validated in files {
+        ensure_resolved_within(base, &validated.input.name).await?;
+        if validated.operation == FileOperation::Rename
+            && let Some(from) = validated.input.rename_from.as_deref()
+        {
+            ensure_resolved_within(base, from).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn apply_validated_file_ops(
@@ -130,10 +150,8 @@ async fn apply_validated_file_ops(
 ) -> AppResult<()> {
     for validated in files {
         let op = validated.input;
-        let Some(target) = safe_within_or_skip(base, &op.name) else {
-            tracing::warn!(path = %op.name, "unsafe path, skipping");
-            continue;
-        };
+        // Recheck after earlier operations may have moved directories or links.
+        let target = ensure_resolved_within(base, &op.name).await?;
         match validated.operation {
             FileOperation::Create => {
                 if op.is_dir == Some(true) {
@@ -174,10 +192,7 @@ async fn apply_validated_file_ops(
                 let Some(from) = op.rename_from.as_deref() else {
                     continue;
                 };
-                let Some(old) = safe_within_or_skip(base, from) else {
-                    tracing::warn!(path = %from, "unsafe rename source, skipping");
-                    continue;
-                };
+                let old = ensure_resolved_within(base, from).await?;
                 if crate::service::fs_util::path_exists(&old).await? {
                     if let Some(parent) = target.parent() {
                         fs::create_dir_all(parent).await?;
@@ -302,5 +317,105 @@ mod tests {
     fn diff_inherits_crlf_from_existing() {
         let (out, _) = diff_content_by_lines("a\r\nb", "x\ny");
         assert_eq!(out, "x\r\ny");
+    }
+    fn file_op(value: serde_json::Value) -> FileOp {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_path_batch_preflight_rejects_late_escape_without_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("workspace");
+        std::fs::create_dir(&base).unwrap();
+        let files = vec![
+            file_op(json!({"operation":"create","name":"valid.txt","contents":"new"})),
+            file_op(json!({"operation":"create","name":"../outside.txt","contents":"bad"})),
+        ];
+        let result = apply_file_ops(&base, &files, ModifyStrategy::ByteCompare).await;
+        assert!(result.is_err(), "invalid batch must be rejected");
+        assert!(
+            !base.join("valid.txt").exists(),
+            "preflight precedes the first write"
+        );
+        assert!(!root.path().join("outside.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn native_path_rename_source_preflight_precedes_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("workspace");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(root.path().join("outside.txt"), "old").unwrap();
+        let files = vec![
+            file_op(json!({"operation":"create","name":"valid.txt","contents":"new"})),
+            file_op(
+                json!({"operation":"rename","name":"renamed.txt","renameFrom":"../outside.txt"}),
+            ),
+        ];
+        assert!(
+            apply_file_ops(&base, &files, ModifyStrategy::ByteCompare)
+                .await
+                .is_err()
+        );
+        assert!(!base.join("valid.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("outside.txt")).unwrap(),
+            "old"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_path_invalid_batch_does_not_create_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("newworkspace");
+        let files = vec![file_op(
+            json!({"operation":"create","name":"../outside.txt","contents":"bad"}),
+        )];
+        assert!(
+            crate::ops::files::files_update_core(&base, files)
+                .await
+                .is_err()
+        );
+        assert!(
+            !base.exists(),
+            "invalid input must fail before creating workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_path_junction_or_symlink_preflight_rejects_external_write() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel.txt"), "old").unwrap();
+        let link = base.join("jump");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        #[cfg(windows)]
+        assert!(
+            std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(&outside)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let files = vec![
+            file_op(json!({"operation":"create","name":"valid.txt","contents":"new"})),
+            file_op(json!({"operation":"modify","name":"jump/sentinel.txt","contents":"bad"})),
+        ];
+        let result = apply_file_ops(&base, &files, ModifyStrategy::ByteCompare).await;
+        let content = std::fs::read_to_string(outside.join("sentinel.txt")).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(&link).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(&link).unwrap();
+        assert!(result.is_err(), "external link target must be rejected");
+        assert_eq!(content, "old");
+        assert!(!base.join("valid.txt").exists());
     }
 }

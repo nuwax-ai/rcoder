@@ -300,6 +300,10 @@ async fn spawn_dev_task(
     action: DevTaskAction,
     precheck: crate::service::userapp::DevWorkspacePrecheck,
 ) -> Result<String, AppError> {
+    state
+        .fs
+        .dev_server
+        .ensure_new_build_admissible(&dev_key(app_id))?;
     let workspace_activity = state
         .build_tasks
         .workspace_activity(app_id)
@@ -402,26 +406,16 @@ async fn spawn_dev_task(
             if task_clone.is_cancelled() {
                 return Ok::<(), AppError>(());
             }
-            // Start 快速路径：服务已在跑 → 跳过启停直接完成（廉价幂等）。
-            // 注意：此处编译已在上方 await 完（产物态产出新 zip 但不部署不重启
-            // ——已运行进程不加载新代码，要上新代码用 restart；源码态同理——
-            // dev 编译刷新源码目录产物，热加载服务自身决定是否热更）。
-            // 快速路径仅省去解压换入/锁 ensure 与启停。
+            // A registry entry only establishes ownership, not successful startup.
+            // External owners always follow the identity-bound control operation.
             if matches!(action, DevTaskAction::Start)
+                && pg.is_none()
                 && state
                     .fs
                     .dev_server
-                    .list_dev()?
-                    .iter()
-                    .any(|p| p.project_id == key)
+                    .confirmed_local_manifest_ready(&key, &ws)
+                    .await?
             {
-                tracing::info!(%app_id, "dev already running; start task completes without deploy/restart");
-                task_clone
-                    .emit(shared_types::BuildProgressEvent::Log {
-                        service: ORCHESTRATOR_LOG_SERVICE.into(),
-                        line: "dev already running; start task completes without deploy/restart".into(),
-                    })
-                    .await;
                 return Ok::<(), AppError>(());
             }
             // 编译成功但任务已被取消（cancel 落在编译完成后的打包/探活窗口
@@ -443,7 +437,14 @@ async fn spawn_dev_task(
                 match state
                     .fs
                     .dev_server
-                    .route_artifact_restart(&key, &ws, &release_id, Some(hooks.clone()), pg.as_ref())
+                    .route_artifact_restart(
+                        &key,
+                        &ws,
+                        &release_id,
+                        Some(hooks.clone()),
+                        pg.as_ref(),
+                        Some(&task_clone.id),
+                    )
                     .await
                 {
                     Ok(Some(started)) => {
@@ -463,29 +464,46 @@ async fn spawn_dev_task(
             } else {
                 Some(crate::service::userapp::run_dir::prepare_run_dir(&ws, &release_id).await?)
             };
-            if !task_clone.commit_start(&lifecycle, generation, async {
-            let run_root = match prepared {
-                Some(prepared) => prepared.activate()?,
-                None => crate::service::userapp::dev_mode::ensure_dev_lock(&ws).await?,
-            };
-            match action {
-                DevTaskAction::Start => {
-                    state
-                        .fs
-                        .dev_server
-                        .start_dev(&key, &run_root, base_path.as_deref(), Some(hooks.clone()), pg.as_ref())
-                        .await?;
-                }
-                DevTaskAction::Restart => {
-                    state
-                        .fs
-                        .dev_server
-                        .restart_dev(&key, &run_root, base_path.as_deref(), Some(hooks.clone()), pg.as_ref())
-                        .await?;
-                }
-            }
-                Ok::<(), AppError>(())
-            }).await? {
+            if !task_clone
+                .commit_start(&lifecycle, generation, async {
+                    let run_root = match prepared {
+                        Some(prepared) => prepared.activate()?,
+                        None => crate::service::userapp::dev_mode::ensure_dev_lock(&ws).await?,
+                    };
+                    match action {
+                        DevTaskAction::Start => {
+                            state
+                                .fs
+                                .dev_server
+                                .start_dev(
+                                    &key,
+                                    &run_root,
+                                    base_path.as_deref(),
+                                    Some(hooks.clone()),
+                                    pg.as_ref(),
+                                    Some(&task_clone.id),
+                                )
+                                .await?;
+                        }
+                        DevTaskAction::Restart => {
+                            state
+                                .fs
+                                .dev_server
+                                .restart_dev(
+                                    &key,
+                                    &run_root,
+                                    base_path.as_deref(),
+                                    Some(hooks.clone()),
+                                    pg.as_ref(),
+                                    Some(&task_clone.id),
+                                )
+                                .await?;
+                        }
+                    }
+                    Ok::<(), AppError>(())
+                })
+                .await?
+            {
                 return Ok(());
             }
             if let Some(supervised) = state.fs.dev_server.supervised_child(&key) {
@@ -494,15 +512,22 @@ async fn spawn_dev_task(
                 tokio::spawn({
                     let supervised = supervised.clone();
                     async move {
-                        if let Some(exit) = supervised.wait_exit(std::time::Duration::from_secs(launch_budget_secs)).await {
+                        if let Some(exit) = supervised
+                            .wait_exit(std::time::Duration::from_secs(launch_budget_secs))
+                            .await
+                        {
                             let _guard = span.enter();
-                            drop(exit_tx.send(EvtOutcome::ProducerExited { exit: exit.describe() }));
+                            drop(exit_tx.send(EvtOutcome::ProducerExited {
+                                exit: exit.describe(),
+                            }));
                         }
                     }
                 });
             }
             drop(evt_tx);
-            event_pipe.finish(std::time::Duration::from_secs(launch_budget_secs)).await
+            event_pipe
+                .finish(std::time::Duration::from_secs(launch_budget_secs))
+                .await
         }
         .await;
         match outcome {
@@ -791,5 +816,235 @@ mod precheck_reply_tests {
                 .is_empty(),
             "no task should be created"
         );
+    }
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct DevOperationRecovery {
+    /// Original build task identity; recovery does not create another build task.
+    pub task_id: Option<String>,
+    pub operation: shared_types::RuntimeOperationView,
+}
+
+#[utoipa::path(
+    post,
+    path = "/dev/operations/{operation_id}/recover",
+    params(("operation_id" = String, Path, description = "Original runtime operation ID")),
+    request_body = DevOpBody,
+    responses(
+        (status = 200, body = HttpResult<DevOperationRecovery>, description = "Original operation observed or replayed; inspect state, this is not a promise of success"),
+        (status = 400, description = "Invalid app, original credential mismatch, owner changed or recovery protected")
+    ),
+    description = "Explicitly resume the original operation after lost response or file-server restart. No source rebuild, no new operation ID. app_id identifies the application; optional pg must match the originally captured credentials. base_path is unused. Return state may still be running or RecoveryRequired.",
+    tag = "Userapp · dev · 进程管理"
+)]
+pub(crate) async fn recover_dev_operation(
+    State(state): State<UserAppState>,
+    crate::extract::AppPath(operation_id): crate::extract::AppPath<String>,
+    Json(body): Json<DevOpBody>,
+) -> UserAppReply<DevOperationRecovery> {
+    let result = async {
+        body.validate().map_err(file_server::error::from_garde)?;
+        shared_types::validate_identifier(&body.app_id, "app_id").map_err(AppError::validation)?;
+        shared_types::validate_identifier(&operation_id, "operation_id")
+            .map_err(AppError::validation)?;
+        let workspace = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
+        let (task_id, operation) = state
+            .fs
+            .dev_server
+            .recover_external_operation(
+                &dev_key(&body.app_id),
+                &workspace,
+                &operation_id,
+                body.pg.as_ref(),
+            )
+            .await?;
+        Ok(DevOperationRecovery { task_id, operation })
+    };
+    reply(result.await)
+}
+
+#[cfg(test)]
+mod operation_recovery_tests {
+    use super::*;
+    use axum::{Router, body::Body, http::Request};
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    fn make_state(config: file_server::Config) -> UserAppState {
+        UserAppState::new(
+            file_server::FileServer::builder(config)
+                .build()
+                .unwrap()
+                .state(),
+        )
+    }
+    async fn http_recover(state: UserAppState, operation: &str, app_id: &str) -> serde_json::Value {
+        let router = Router::new()
+            .route(
+                "/recover/{operation_id}",
+                axum::routing::post(recover_dev_operation),
+            )
+            .with_state(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/recover/{operation}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"app_id": app_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recover_handler_preserves_operation_after_lost_reply_and_process_restart() {
+        for accepted_before_loss in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = root.path().join("workspaces/app123");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let mut config = file_server::Config::from_env().unwrap();
+            config.userapp_single_app_id = None;
+            config.userapp_workspace_dir = root.path().join("workspaces");
+            config.log_base_dir = root.path().join("logs");
+            std::fs::create_dir_all(&config.log_base_dir).unwrap();
+            let application_id = std::env::var("PROJECT_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "unknown-app".into());
+            let token_root = workspace
+                .parent()
+                .unwrap()
+                .join(".app-cli-state")
+                .join(&application_id);
+            std::fs::create_dir_all(&token_root).unwrap();
+            std::fs::write(token_root.join("token"), "fixture-token").unwrap();
+            let identity = shared_types::RuntimeIdentityView {
+                application_id,
+                service_family: "userapp-dev".into(),
+                workspace_id: "workspace".into(),
+                source_root: workspace.to_string_lossy().into(),
+                runtime_instance_id: "original-instance".into(),
+                deployment_generation_id: "generation".into(),
+                protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+                capabilities: vec![],
+            };
+            let posts = Arc::new(Mutex::new(
+                Vec::<shared_types::RuntimeOperationRequest>::new(),
+            ));
+            let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let post_sink = posts.clone();
+            let post_committed = committed.clone();
+            let get_committed = committed.clone();
+            let owner = Router::new()
+                .route("/v1/runtime/identity", axum::routing::get(move || { let identity = identity.clone(); async move { axum::Json(serde_json::json!({"data": identity})) } }))
+                .route("/v1/runtime/operations", axum::routing::post(move |axum::Json(request): axum::Json<shared_types::RuntimeOperationRequest>| {
+                    let posts = post_sink.clone(); let committed = post_committed.clone();
+                    async move {
+                        let mut posts = posts.lock().unwrap(); posts.push(request.clone());
+                        if posts.len() == 1 {
+                            committed.store(accepted_before_loss, std::sync::atomic::Ordering::SeqCst);
+                            return (axum::http::StatusCode::OK, "lost-response".to_string());
+                        }
+                        committed.store(true, std::sync::atomic::Ordering::SeqCst);
+                        (axum::http::StatusCode::ACCEPTED, serde_json::json!({"data": shared_types::RuntimeOperationAccepted {
+                            operation_id: request.operation_id.clone(), state: shared_types::RuntimeOperationState::Accepted,
+                            poll: format!("/v1/runtime/operations/{}", request.operation_id),
+                        }}).to_string())
+                    }
+                }))
+                .route("/v1/runtime/operations/{id}", axum::routing::get(move |axum::extract::Path(id): axum::extract::Path<String>| {
+                    let committed = get_committed.clone(); async move {
+                        if !committed.load(std::sync::atomic::Ordering::SeqCst) { return (axum::http::StatusCode::NOT_FOUND, axum::Json(serde_json::json!({}))); }
+                        (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"data": shared_types::RuntimeOperationView {
+                            operation_id: id, kind: shared_types::RuntimeOperationKind::Restart, state: shared_types::RuntimeOperationState::Succeeded,
+                            request_digest: "digest".into(), revision: 8, runtime_instance_id: "original-instance".into(), error_code: None, error_message: None, failure_detail: None,
+                        }})))
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, owner).await.unwrap();
+            });
+            let request = shared_types::RuntimeOperationRequest {
+                operation_id: "original-op".into(),
+                expected_runtime_instance_id: "original-instance".into(),
+                expected_revision: 7,
+                workspace_id: "workspace".into(),
+                kind: shared_types::RuntimeOperationKind::Restart,
+                profile: shared_types::RunProfileInput::Source {
+                    workspace_id: "workspace".into(),
+                },
+                run_config: None,
+                request_context: Some("original-task".into()),
+            };
+            let digest: String = Sha256::digest(serde_json::to_vec(&request).unwrap())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let disk = serde_json::json!({
+                "owners": {"userapp:app123": {"pid":0,"port":9080,"project_id":"userapp:app123","owner":{"address":address,"runtime_instance_id":"original-instance"}}},
+                "stops": {}, "intents": {"userapp:app123|Restart": {"request":request,"digest":digest,"has_private_config":false,"address":address,"project_root":workspace.canonicalize().unwrap()}}
+            });
+            std::fs::write(
+                config.log_base_dir.join("dev-server-external.json"),
+                disk.to_string(),
+            )
+            .unwrap();
+            let state = make_state(config.clone());
+            assert_eq!(state.fs.dev_server.list_dev().unwrap().len(), 1);
+            // Real outer coordinator must not accept another task or claim this registration is started.
+            let error = spawn_dev_task(
+                state.clone(),
+                "app123",
+                None,
+                None,
+                DevTaskAction::Start,
+                crate::service::userapp::DevWorkspacePrecheck {
+                    ws: workspace.clone(),
+                    dev_source_mode: true,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, AppError::Conflict(_)));
+            assert!(error.to_string().contains("original-op"));
+            assert!(posts.lock().unwrap().is_empty());
+            let first = http_recover(state, "original-op", "app123").await;
+            assert_eq!(first["success"], false);
+            let restarted = make_state(config);
+            let success = http_recover(restarted.clone(), "original-op", "app123").await;
+            assert_eq!(success["success"], true, "{success}");
+            assert_eq!(success["data"]["task_id"], "original-task");
+            assert_eq!(success["data"]["operation"]["operation_id"], "original-op");
+            assert_eq!(success["data"]["operation"]["state"], "succeeded");
+            let replay = http_recover(restarted.clone(), "original-op", "app123").await;
+            assert_eq!(replay["success"], true);
+            assert_eq!(
+                posts.lock().unwrap().len(),
+                if accepted_before_loss { 1 } else { 2 }
+            );
+            for posted in posts.lock().unwrap().iter() {
+                assert_eq!(
+                    serde_json::to_value(posted).unwrap(),
+                    serde_json::to_value(&request).unwrap()
+                );
+            }
+            let wrong_app = http_recover(restarted, "original-op", "anotherapp").await;
+            assert_eq!(wrong_app["success"], false);
+            server.abort();
+        }
     }
 }

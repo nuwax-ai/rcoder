@@ -17,9 +17,22 @@ impl DevServerManager {
     /// R05：external owner 停止未确认终态前**不移除登记**（先取快照；
     /// Succeeded 确认后由 [`Self::stop_external_owner`] 摘除）。
     pub async fn stop_dev(&self, project_id: &str) -> AppResult<StoppedDev> {
+        self.check_external_store().map_err(|error| {
+            AppError::business(format!("external owner recovery required: {error:#}"))
+        })?;
         let snapshot = lock(&self.processes)?.get(project_id).cloned();
         if let Some(external) = snapshot.as_ref().and_then(|p| p.external_owner.as_ref()) {
             return self.stop_external_owner(project_id, external).await;
+        }
+        if self
+            .read_external_state()
+            .map_err(|error| AppError::business(format!("external recovery required: {error:#}")))?
+            .owners
+            .contains_key(project_id)
+        {
+            return Err(AppError::business(
+                "persisted owner registration is not loaded; refusing process-name cleanup",
+            ));
         }
         let proc = lock(&self.processes)?.remove(project_id);
         // P1-03：监督句柄同步摘除（进程组终止后句柄的 wait worker 自行收割
@@ -97,6 +110,9 @@ impl DevServerManager {
         project_id: &str,
         project_path: &Path,
     ) -> AppResult<StoppedDev> {
+        self.check_external_store().map_err(|error| {
+            AppError::business(format!("external owner recovery required: {error:#}"))
+        })?;
         let snapshot = lock(&self.processes)?.get(project_id).cloned();
         if let Some(mut external) = snapshot
             .as_ref()
@@ -216,38 +232,96 @@ impl DevServerManager {
                 );
             }
 
-            let client = super::owner_client::OwnerClient::new(&external.address, &external.token)?;
-            let operation_id = match pending {
-                Some(record) => record.operation_id,
-                None => {
-                    let status = client.status().await?;
-                    let operation_id = format!("fs-stop-{}", uuid::Uuid::new_v4().simple());
-                    client
-                        .submit_stop(
-                            &operation_id,
-                            &workspace_id,
-                            status.revision,
-                            &external.runtime_instance_id,
-                        )
-                        .await?;
-                    // 受理即记录（响应丢失也可按原 ID 查询）+ 持久化
-                    if let Ok(mut stops) = lock(&self.external_stops) {
-                        stops.insert(
-                            project_id.to_string(),
-                            super::types::ExternalStopRecord {
-                                operation_id: operation_id.clone(),
-                                workspace_id: workspace_id.clone(),
-                                submitted_at_ms: process::now_ms().max(0) as u64,
-                            },
-                        );
-                    }
-                    self.persist_external_state();
-                    operation_id
-                }
+            let token = if external.token.is_empty() {
+                let source = Path::new(&identity.source_root);
+                anyhow::ensure!(
+                    source.is_absolute() && !identity.source_root.trim().is_empty(),
+                    "registered owner source root is invalid"
+                );
+                super::owner_client::find_owner_token(source, &identity.application_id)
+                    .map(|(_, token)| token)
+                    .ok_or_else(|| anyhow::anyhow!("registered owner credentials unavailable"))?
+            } else {
+                external.token.clone()
             };
-            client
-                .wait_terminal(&operation_id, std::time::Duration::from_secs(120))
-                .await
+            let client = super::owner_client::OwnerClient::new(&external.address, &token)?;
+            if let Some(record) = pending {
+                // Legacy files only have an ID: never invent an original revision for replay.
+                let view = client
+                    .wait_terminal(&record.operation_id, std::time::Duration::from_secs(120))
+                    .await?;
+                anyhow::ensure!(
+                    view.operation_id == record.operation_id
+                        && view.runtime_instance_id == external.runtime_instance_id
+                        && view.kind == shared_types::RuntimeOperationKind::Stop,
+                    "legacy stop identity mismatch"
+                );
+                if matches!(
+                    view.state,
+                    shared_types::RuntimeOperationState::Succeeded
+                        | shared_types::RuntimeOperationState::Failed
+                        | shared_types::RuntimeOperationState::Cancelled
+                ) {
+                    self.external_transaction(|state| {
+                        let original = state
+                            .stops
+                            .get(project_id)
+                            .ok_or_else(|| anyhow::anyhow!("legacy stop record missing"))?;
+                        anyhow::ensure!(
+                            original.operation_id == record.operation_id,
+                            "legacy stop changed"
+                        );
+                        state.stops.remove(project_id);
+                        if view.state == shared_types::RuntimeOperationState::Succeeded {
+                            state.owners.remove(project_id);
+                        }
+                        Ok(())
+                    })?;
+                    lock(&self.external_stops)
+                        .map_err(|error| anyhow::anyhow!("{error}"))?
+                        .remove(project_id);
+                }
+                return Ok::<_, anyhow::Error>(view);
+            }
+            let status = client.status().await?;
+            let request = shared_types::RuntimeOperationRequest {
+                operation_id: format!("fs-stop-{}", uuid::Uuid::new_v4().simple()),
+                expected_runtime_instance_id: external.runtime_instance_id.clone(),
+                expected_revision: status.revision,
+                workspace_id: workspace_id.clone(),
+                kind: shared_types::RuntimeOperationKind::Stop,
+                profile: shared_types::RunProfileInput::Source { workspace_id },
+                run_config: None,
+                request_context: None,
+            };
+            let intent = self.prepare_external_intent(
+                project_id,
+                Path::new(&identity.source_root),
+                external,
+                &request,
+            )?;
+            self.resume_external_intent(project_id, &client, &intent, &request)
+                .await?;
+            let view = client
+                .wait_terminal(
+                    &intent.request.operation_id,
+                    std::time::Duration::from_secs(120),
+                )
+                .await?;
+            super::external_store::verify_view(&view, &intent.request)?;
+            if matches!(
+                view.state,
+                shared_types::RuntimeOperationState::Succeeded
+                    | shared_types::RuntimeOperationState::Failed
+                    | shared_types::RuntimeOperationState::Cancelled
+            ) {
+                self.finish_external_intent(
+                    project_id,
+                    &intent.request,
+                    view.state == shared_types::RuntimeOperationState::Succeeded,
+                )?;
+            }
+            Ok(view)
         };
         let view = route
             .await
@@ -257,14 +331,14 @@ impl DevServerManager {
                 // 确认终态后才移除登记与在途记录（R05）
                 lock(&self.processes)?.remove(project_id);
                 lock(&self.external_stops)?.remove(project_id);
-                self.persist_external_state();
+
                 Ok(StoppedDev {
                     killed_pids: Vec::new(),
                 })
             }
             shared_types::RuntimeOperationState::Cancelled => Err(AppError::business(format!(
                 "external owner stop was cancelled (operation {}); registration kept — \
-                 retry continues the same operation",
+                 a new explicit stop may be requested",
                 view.operation_id
             ))),
             other => Err(AppError::business(format!(
@@ -523,6 +597,12 @@ mod external_stop_tests {
                     |axum::extract::State(state): axum::extract::State<StopMockState>,
                      axum::extract::Path(id): axum::extract::Path<String>| {
                         async move {
+                            if !state.submitted.lock().unwrap().contains(&id) {
+                                return (
+                                    axum::http::StatusCode::NOT_FOUND,
+                                    axum::Json(serde_json::json!({"message": "not found"})),
+                                );
+                            }
                             // 精确 id 优先，"*" 通配（测试预置所有操作的目标终态）
                             let view_state = {
                                 let states = state.states.lock().unwrap();
@@ -532,7 +612,10 @@ mod external_stop_tests {
                                     .cloned()
                                     .unwrap_or(RuntimeOperationState::Stopping)
                             };
-                            axum::Json(envelope(&view(&id, view_state)))
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(envelope(&view(&id, view_state))),
+                            )
                         }
                     },
                 ),
@@ -572,7 +655,7 @@ mod external_stop_tests {
     /// R05 反例：Stop 未确认（Failed 终态）→ 登记保留；重试按**原
     /// operation_id** 查询（受理数不变）直至 Succeeded 才移除登记。
     #[tokio::test]
-    async fn failed_stop_keeps_registration_and_retry_reuses_operation_id() {
+    async fn confirmed_failed_stop_keeps_owner_and_next_explicit_request_gets_new_id() {
         let logs = tempfile::tempdir().expect("logs");
         let state = StopMockState::default();
         // 预置：所有操作受理后即 Failed 终态（owner 侧失败）
@@ -599,27 +682,88 @@ mod external_stop_tests {
         );
         let first_op = state.submitted.lock().unwrap()[0].clone();
 
-        // 重试：同一操作改为 Succeeded → 成功且不产生新 operation_id
+        // Confirmed terminal failure is immutable. A new explicit Stop executes a new operation.
         state
             .states
             .lock()
             .unwrap()
-            .insert(first_op.clone(), RuntimeOperationState::Succeeded);
+            .insert("*".to_string(), RuntimeOperationState::Succeeded);
         manager
             .stop_dev("userapp:app-r05")
             .await
             .expect("retry stop must succeed once owner confirms");
         assert_eq!(
             state.submitted.lock().unwrap().len(),
-            1,
-            "retry must reuse the original operation id, got {:?}",
+            2,
+            "explicit retry after confirmed terminal failure must submit a new operation, got {:?}",
             state.submitted.lock().unwrap()
         );
+        assert_ne!(state.submitted.lock().unwrap()[1], first_op);
         assert!(
             !lock(&manager.processes)
                 .unwrap()
                 .contains_key("userapp:app-r05"),
             "registration removed only after Succeeded"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn confirmed_legacy_failure_clears_disk_and_cache_only_after_commit() {
+        let logs = tempfile::tempdir().unwrap();
+        let state = StopMockState::default();
+        state.submitted.lock().unwrap().push("legacy-stop".into());
+        state
+            .states
+            .lock()
+            .unwrap()
+            .insert("legacy-stop".into(), RuntimeOperationState::Failed);
+        let (addr, task) = serve_stop_mock(state.clone()).await;
+        let manager = manager_with_external(logs.path(), &addr);
+        manager.persist_external_state().unwrap();
+        let record = super::super::types::ExternalStopRecord {
+            operation_id: "legacy-stop".into(),
+            workspace_id: "ws-stable-hash".into(),
+            submitted_at_ms: 0,
+        };
+        manager
+            .external_transaction(|disk| {
+                disk.stops.insert("userapp:app-r05".into(), record.clone());
+                Ok(())
+            })
+            .unwrap();
+        lock(&manager.external_stops)
+            .unwrap()
+            .insert("userapp:app-r05".into(), record);
+        assert!(manager.stop_dev("userapp:app-r05").await.is_err());
+        assert!(lock(&manager.external_stops).unwrap().is_empty());
+        let disk = manager.read_external_state().unwrap();
+        assert!(disk.stops.is_empty());
+        assert!(disk.owners.contains_key("userapp:app-r05"));
+        state
+            .states
+            .lock()
+            .unwrap()
+            .insert("*".into(), RuntimeOperationState::Succeeded);
+        manager.stop_dev("userapp:app-r05").await.unwrap();
+        assert_eq!(state.submitted.lock().unwrap().len(), 2);
+        assert_ne!(state.submitted.lock().unwrap()[1], "legacy-stop");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn broken_durable_state_stops_before_any_http_submission() {
+        let logs = tempfile::tempdir().unwrap();
+        let state = StopMockState::default();
+        let (addr, task) = serve_stop_mock(state.clone()).await;
+        let manager = manager_with_external(logs.path(), &addr);
+        std::fs::create_dir(manager.external_state_path()).unwrap();
+        assert!(manager.stop_dev("userapp:app-r05").await.is_err());
+        assert!(state.submitted.lock().unwrap().is_empty());
+        assert!(
+            lock(&manager.processes)
+                .unwrap()
+                .contains_key("userapp:app-r05")
         );
         task.abort();
     }
@@ -663,7 +807,9 @@ mod external_stop_tests {
         let (addr, task) = serve_stop_mock(state.clone()).await;
         {
             let manager = manager_with_external(logs.path(), &addr);
-            manager.persist_external_state();
+            manager
+                .persist_external_state()
+                .expect("persist external registration");
         }
         // token 不得出现在状态文件里
         let content =

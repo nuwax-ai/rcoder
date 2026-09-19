@@ -5,7 +5,8 @@
 //! - `path-clean` 按成熟的词法规约规则消除 `.`/`..`，不访问文件系统;
 //! - 规范化后用 `starts_with` 比较 → 确保落在 base 下。
 //!
-//! 全程不依赖文件系统存在性 (不 `canonicalize`), 不做字符串 `replace` / 手动 `split`。
+//! 基础 helper 仅做词法检查，不依赖文件系统存在性；`ensure_resolved_within`
+//! 另解析最近存在的祖先，拒绝经 symlink/junction 逃出所选根目录。
 //!
 //! 注: 本模块**不做根目录白名单限制** (`customTargetDir` 等根路径完全信任调用方):
 //! 产品运行于容器内、内网私有化部署, 且用户客户端复用本模块逻辑,
@@ -68,6 +69,63 @@ pub fn safe_zip_entry(extract_path: &Path, entry_name: &str) -> AppResult<PathBu
         Err(AppError::file(format!(
             "Unsafe zip entry path: {entry_name}"
         )))
+    }
+}
+
+/// Validate both lexical containment and the actual existing ancestor chain.
+/// The caller may freely select a workspace root, including a root that is a link.
+/// Links below that root must not resolve outside it. Missing suffixes are kept so
+/// new directories/files can be validated before any filesystem mutation.
+/// This is a preflight/recheck, not a handle-relative defense against a concurrent
+/// hostile OS process replacing links between this check and the subsequent I/O.
+pub async fn ensure_resolved_within(base: &Path, relative: &str) -> AppResult<PathBuf> {
+    let target = ensure_within(base, relative)?;
+    let resolved_base = resolve_existing_ancestor(base).await?;
+    let resolved_target = resolve_existing_ancestor(&target).await?;
+    if !resolved_target.starts_with(&resolved_base) {
+        return Err(AppError::validation(
+            "File path resolves outside the workspace directory",
+        ));
+    }
+    Ok(target)
+}
+
+async fn resolve_existing_ancestor(path: &Path) -> AppResult<PathBuf> {
+    let mut probe = std::path::absolute(path)
+        .map_err(|error| AppError::validation(format!("Resolve file path: {error}")))?
+        .clean();
+    let mut suffix = Vec::new();
+    loop {
+        match tokio::fs::symlink_metadata(&probe).await {
+            Ok(_) => {
+                let mut resolved = tokio::fs::canonicalize(&probe).await.map_err(|error| {
+                    AppError::validation(format!("Resolve workspace path ancestor: {error}"))
+                })?;
+                for component in suffix.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = probe
+                    .file_name()
+                    .ok_or_else(|| {
+                        AppError::validation("No accessible ancestor for workspace path")
+                    })?
+                    .to_os_string();
+                suffix.push(component);
+                if !probe.pop() {
+                    return Err(AppError::validation(
+                        "No accessible ancestor for workspace path",
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(AppError::validation(format!(
+                    "Inspect workspace path ancestor: {error}"
+                )));
+            }
+        }
     }
 }
 

@@ -13,6 +13,7 @@
 
 pub mod coordinated;
 pub mod error_classify;
+mod external_store;
 pub mod log;
 mod owner_client;
 pub mod port_pool;
@@ -51,14 +52,22 @@ impl DevServerManager {
         base_path: Option<&str>,
         hooks: Option<DevEventHooks>,
         pg: Option<&shared_types::StartPgCredential>,
+        request_context: Option<&str>,
     ) -> AppResult<StartedDev> {
         if project_id.starts_with("userapp:") {
             self.stop_userapp_dev(project_id, project_path).await?;
         } else {
             self.stop_dev(project_id).await?;
         }
-        self.start_dev(project_id, project_path, base_path, hooks, pg)
-            .await
+        self.start_dev(
+            project_id,
+            project_path,
+            base_path,
+            hooks,
+            pg,
+            request_context,
+        )
+        .await
     }
 
     /// 取 UserApp manifest 编排进程的监督句柄（P1-03/P1-04：调用方经此
@@ -168,7 +177,7 @@ impl DevServerManager {
         // （无凭据来源——容器 env 透传行为，见 start_dev 的 pg 参数注释）
         self.stop_dev(project_id).await?;
         let started = self
-            .start_dev(project_id, project_path, base_path, None, None)
+            .start_dev(project_id, project_path, base_path, None, None, None)
             .await?;
         Ok(KeepAliveResult {
             alive: true,

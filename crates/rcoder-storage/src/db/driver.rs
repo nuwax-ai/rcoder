@@ -17,7 +17,10 @@ use toasty_core::{
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ConnectionPolicy {
     Turso,
-    Postgres { statement_timeout_ms: u32 },
+    #[cfg(feature = "pg")]
+    Postgres {
+        statement_timeout_ms: u32,
+    },
 }
 
 pub(crate) struct PolicyDriver {
@@ -97,6 +100,7 @@ impl PolicyConnection {
                         .await?;
                     self.check_pragma(schema, "PRAGMA synchronous", "2").await?;
                 }
+                #[cfg(feature = "pg")]
                 ConnectionPolicy::Postgres {
                     statement_timeout_ms,
                 } => {

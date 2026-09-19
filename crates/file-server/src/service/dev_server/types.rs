@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use super::port_pool::PortPool;
+#[cfg(test)]
 use super::support::lock;
 use crate::Config;
 use crate::models::{DevProcess, KilledPid};
@@ -134,7 +135,7 @@ impl DevServerManager {
         let Ok(content) = std::fs::read_to_string(self.external_state_path()) else {
             return;
         };
-        let Ok(state) = serde_json::from_str::<ExternalStateFile>(&content) else {
+        let Ok(state) = serde_json::from_str::<super::external_store::State>(&content) else {
             tracing::warn!(
                 path = %self.external_state_path().display(),
                 "external owner state file unreadable; starting with no persisted owner relations"
@@ -172,80 +173,27 @@ impl DevServerManager {
         tracing::info!("restored persisted external owner state");
     }
 
-    /// 原子持久化 external 登记与在途停止（tmp + rename；只写 external 条目，
-    /// 本地 spawn 的进程表不落盘）。**token 绝不落盘**——恢复时从 owner
-    /// 状态根重读（凭据只在内存与 owner 侧受保护文件中）。
-    pub(super) fn persist_external_state(&self) {
-        let owners = match lock(&self.processes) {
-            Ok(processes) => processes
-                .iter()
-                .filter_map(|(key, process)| {
-                    let external = process.external_owner.as_ref()?;
-                    Some((
-                        key.clone(),
-                        PersistedDevProcess {
+    /// Test/legacy registration import. Never overwrite newer disk intents from cache snapshots.
+    #[cfg(test)]
+    pub(super) fn persist_external_state(&self) -> anyhow::Result<()> {
+        let processes = lock(&self.processes).map_err(|error| anyhow::anyhow!("{error}"))?;
+        self.external_transaction(|state| {
+            for (key, process) in processes.iter() {
+                if let Some(owner) = &process.external_owner {
+                    state.owners.entry(key.clone()).or_insert_with(|| {
+                        super::external_store::OwnerRecord {
                             pid: process.pid,
                             port: process.port,
                             project_id: process.project_id.clone(),
-                            owner: PersistedOwner {
-                                address: external.address.clone(),
-                                runtime_instance_id: external.runtime_instance_id.clone(),
+                            owner: super::external_store::OwnerIdentity {
+                                address: owner.address.clone(),
+                                runtime_instance_id: owner.runtime_instance_id.clone(),
                             },
-                        },
-                    ))
-                })
-                .collect(),
-            Err(_) => HashMap::new(),
-        };
-        let stops = match lock(&self.external_stops) {
-            Ok(stops) => stops.clone(),
-            Err(_) => HashMap::new(),
-        };
-        let state = ExternalStateFile { owners, stops };
-        let path = self.external_state_path();
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-        let Ok(json) = serde_json::to_string_pretty(&state) else {
-            return;
-        };
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json)
-            .and_then(|_| std::fs::rename(&tmp, &path))
-            .is_err()
-        {
-            tracing::warn!(path = %path.display(), "persist external owner state failed");
-        }
+                        }
+                    });
+                }
+            }
+            Ok(())
+        })
     }
-
-    /// external 状态文件位置：日志根下的专用文件（稳定可写目录，不依赖
-    /// 系统临时目录）。
-    fn external_state_path(&self) -> std::path::PathBuf {
-        self.config.log_base_dir.join("dev-server-external.json")
-    }
-}
-
-/// 持久化文件结构（仅 external 条目；token 不落盘）。
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct ExternalStateFile {
-    owners: HashMap<String, PersistedDevProcess>,
-    stops: HashMap<String, ExternalStopRecord>,
-}
-
-/// 恢复 external 控制关系所需的最小登记（token 恢复时从 owner 状态根重读）。
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedDevProcess {
-    pid: u32,
-    port: u16,
-    project_id: String,
-    owner: PersistedOwner,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedOwner {
-    address: String,
-    runtime_instance_id: String,
 }

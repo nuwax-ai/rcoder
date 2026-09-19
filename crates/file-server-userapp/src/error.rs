@@ -31,6 +31,7 @@ impl IntoResponse for UserAppError {
             AppError::Validation(..) | AppError::ValidationI18n(..) | AppError::Business(_) => {
                 (ec::ERR_VALIDATION, StatusCode::BAD_REQUEST)
             }
+            AppError::Conflict(_) => (ec::ERR_CONFLICT, StatusCode::CONFLICT),
             AppError::Resource(_) => (ec::ERR_NOT_FOUND, StatusCode::NOT_FOUND),
             AppError::Network(_) => (ec::ERR_SERVICE_UNAVAILABLE, StatusCode::BAD_GATEWAY),
             AppError::Permission(_)

@@ -70,6 +70,8 @@ pub(crate) struct AdmissionRejection {
 /// 持久状态根布局（identity/desired/operations/events 单一根）。
 pub struct RuntimeStore {
     root: PathBuf,
+    // Keep the legacy lock domain fenced while the migrated owner is alive.
+    _legacy_owner: Option<crate::platform::owner_guard::OwnerGuard>,
 }
 
 /// 扫描结果（R04）：读取/解码失败不再静默跳过——以 `blocked` 上报，
@@ -156,100 +158,93 @@ impl RuntimeStore {
         Self::open_with_root(Self::resolve_root(workspace, "_default")?, workspace)
     }
 
-    /// B04：以显式根打开。旧位置兼容迁移（一次性原子 rename；双权威域
-    /// fail-fast 拒绝写入）：
+    /// B04：以显式根打开。旧位置在新旧锁域保护下逐项迁移；中断导致
+    /// 双持久权威域时 fail-fast，不覆盖或猜测残留内容：
     /// - `{workspace}/.app-cli-state`（R02 之前的 in-workspace 布局）
     /// - `{workspace 卷根}/.app-cli-state`（R02–R08 的 bare 卷根布局——
     ///   本轮加入 application_id 段后成为 legacy）
     pub(crate) fn open_with_root(root: PathBuf, workspace: &Path) -> Result<Self> {
-        let volume_root = workspace
+        let project = runtime_state_layout::canonical_project_root(workspace);
+        let volume = project
             .parent()
             .context("workspace has no volume root for stable runtime state")?;
         let legacy_locations = [
             workspace.join(STATE_DIR_NAME),
-            volume_root.join(STATE_DIR_NAME),
+            project.join(STATE_DIR_NAME),
+            volume.join(STATE_DIR_NAME),
         ];
-        let root_exists_already = root_exists(&root)?;
+        let root_identity = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let mut checked = std::collections::BTreeSet::new();
         let mut existing_legacy: Option<PathBuf> = None;
-        for legacy in &legacy_locations {
-            // 按应用根 {bare}/{app} 的 create_dir_all 会隐式创建 bare 祖先
-            // 目录——bare 存在 ≠ bare 是 legacy 状态域。仅当 bare **直接**
-            // 含状态标记（desired/identity/operations/events）才视为 legacy。
-            if !is_legacy_state_domain(legacy)? {
+        for legacy in legacy_locations {
+            let physical = std::fs::canonicalize(&legacy).unwrap_or_else(|_| legacy.clone());
+            if physical == root_identity
+                || !checked.insert(physical)
+                || !is_legacy_state_domain(&legacy)?
+            {
                 continue;
             }
-            if let Some(first) = &existing_legacy {
-                // 多处 legacy 并存：无法裁决哪份权威——拒绝（操作员处理后重启）
-                anyhow::bail!(
-                    "multiple legacy runtime state locations exist ({} and {}); \
-                     resolve explicitly before starting",
-                    first.display(),
-                    legacy.display()
-                );
-            }
-            existing_legacy = Some(legacy.clone());
+            anyhow::ensure!(
+                existing_legacy.is_none(),
+                "multiple legacy runtime state locations exist; resolve explicitly before starting"
+            );
+            existing_legacy = Some(legacy);
         }
-        if let Some(legacy) = &existing_legacy {
-            if root_exists_already {
-                anyhow::bail!(
-                    "runtime state exists both at stable root {} and legacy {} \
-                     (two authority domains); resolve explicitly before starting",
-                    root.display(),
-                    legacy.display()
+        let mut legacy_owner = None;
+        if let Some(legacy) = existing_legacy {
+            // OwnerGuard has normally already created root/owner.lock. Those
+            // bootstrap files are not persisted runtime authority. Never ignore
+            // existing desired/identity/operations/events/token/endpoint data.
+            anyhow::ensure!(
+                !is_legacy_state_domain(&root)?,
+                "runtime state exists at stable and legacy roots (two authority domains); resolve explicitly before starting"
+            );
+            let guard = crate::platform::owner_guard::OwnerGuard::acquire(&legacy)
+                .context("legacy runtime owner prevents state migration")?;
+            std::fs::create_dir_all(&root).context("create migrated runtime root")?;
+            // Preflight every destination before the first rename. Move only
+            // runtime-owned entries, not sibling registries, journal locks or
+            // another project's directory under a legacy bare root.
+            let entries: Vec<_> = RUNTIME_STATE_ENTRIES
+                .iter()
+                .map(|name| (legacy.join(name), root.join(name)))
+                .filter_map(|(source, target)| match root_exists(&source) {
+                    Ok(true) => Some(Ok((source, target))),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<Result<_>>()?;
+            for (_, target) in &entries {
+                anyhow::ensure!(
+                    !root_exists(target)?,
+                    "runtime migration would overwrite existing persisted state"
                 );
             }
-            // 物理路径比较（R09 解析经 canonicalize 后与 workspace 派生路径
-            // 可能仅差 symlink 前缀——/var vs /private/var；字符串 starts_with
-            // 会把"同一物理目录嵌套"误判成跨目录 rename → EINVAL）
-            let legacy_canonical = std::fs::canonicalize(legacy).unwrap_or_else(|_| legacy.clone());
-            let root_canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-            if root_canonical.starts_with(&legacy_canonical) {
-                // bare 卷根 legacy → 按应用根嵌套在其子树内（rename 进自身
-                // 子树 EINVAL）——逐条目搬移后拆除 legacy 目录。
-                std::fs::create_dir_all(&root).context("create per-app state root")?;
-                for entry in std::fs::read_dir(legacy).context("read legacy state entries")? {
-                    let entry = entry.context("read legacy entry")?;
-                    // create_dir_all(root) 已在 bare 内建出按应用根（本分支
-                    // root 嵌套于 legacy）——跳过自身，只搬真实状态条目。
-                    // 物理路径比较（/var 与 /private/var 前缀差异下字符串
-                    // 相等会把 root 自身当待搬条目 → rename 进自身 EINVAL）
-                    let entry_path = entry.path();
-                    let entry_canonical =
-                        std::fs::canonicalize(&entry_path).unwrap_or_else(|_| entry_path.clone());
-                    if entry_canonical == root_canonical {
-                        continue;
-                    }
-                    let target = root.join(entry.file_name());
-                    std::fs::rename(entry.path(), &target).with_context(|| {
-                        format!(
-                            "migrate legacy entry {} -> {}",
-                            entry.path().display(),
-                            target.display()
-                        )
-                    })?;
-                }
-                // bare 目录此刻只剩按应用根（其子树），保留为容器目录——
-                // 状态条目已全部搬入按应用根，不再构成 legacy 状态域。
-            } else {
-                // 目标父链可能尚不存在（按应用根的中间目录）——先建再搬
-                std::fs::create_dir_all(&root)
-                    .context("create per-app state root for migration")?;
-                std::fs::rename(legacy, &root).with_context(|| {
+            for (source, target) in entries {
+                std::fs::rename(&source, &target).with_context(|| {
                     format!(
-                        "migrate legacy runtime state {} -> {}",
-                        legacy.display(),
-                        root.display()
+                        "migrate runtime state {} -> {}",
+                        source.display(),
+                        target.display()
                     )
                 })?;
             }
-            tracing::info!(
-                "runtime state migrated to stable per-application root: {}",
-                root.display()
-            );
+            #[cfg(unix)]
+            {
+                std::fs::File::open(&root)?.sync_all()?;
+                std::fs::File::open(&legacy)?.sync_all()?;
+            }
+            // Never unlink the old lockfile/directory. Partial moves fail closed
+            // next time because both roots contain authority; no guessing or overwrite.
+            legacy_owner = Some(guard);
+            tracing::info!("runtime state migrated to stable root: {}", root.display());
         }
         std::fs::create_dir_all(root.join("operations")).context("create runtime state dir")?;
         std::fs::create_dir_all(root.join("events")).context("create runtime events dir")?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            _legacy_owner: legacy_owner,
+        })
     }
 
     fn identity_path(&self) -> PathBuf {
@@ -371,9 +366,9 @@ impl RuntimeStore {
                 "operations".into(),
                 "events".into(),
                 "source-profile".into(),
-                // 制品能力当前仅 Deploy+URL（R03 收窄声明；ArtifactId 本地
-                // 解析器未实现——按显式组合拒绝，不虚报通用 artifact 能力）
+                // Both routes use owner-controlled preparation and activation.
                 "deploy-artifact-url".into(),
+                "deploy-artifact-id".into(),
             ],
         };
         // identity.json 不回读旧 runtime_instance（旧实例身份不得复用），仅覆盖。
@@ -528,19 +523,23 @@ pub(crate) struct StoredOperation {
     pub request: RuntimeOperationRequest,
 }
 
-/// legacy 候选是否**直接**承载状态（非仅为按应用根的祖先目录）。
+/// Persisted runtime authority, including credentials and discovery records.
+/// A directory or owner.lock alone is only bootstrap, never a second authority.
+const RUNTIME_STATE_ENTRIES: &[&str] = &[
+    "desired.json",
+    "identity.json",
+    "operations",
+    "events",
+    "token",
+    "endpoint.json",
+];
 fn is_legacy_state_domain(path: &Path) -> Result<bool> {
-    if !root_exists(path)? {
-        return Ok(false);
+    for name in RUNTIME_STATE_ENTRIES {
+        if root_exists(&path.join(name))? {
+            return Ok(true);
+        }
     }
-    Ok([
-        path.join("desired.json"),
-        path.join("identity.json"),
-        path.join("operations"),
-        path.join("events"),
-    ]
-    .iter()
-    .any(|marker| root_exists(marker).unwrap_or(false)))
+    Ok(false)
 }
 
 fn root_exists(path: &Path) -> Result<bool> {
@@ -635,6 +634,7 @@ pub(crate) enum DispatchAction {
         operation_id: String,
         url: String,
         sha256: Option<String>,
+        pg: Option<shared_types::StartPgCredential>,
     },
     /// 登记的本地构建制品部署（R03：平台 staging 后 owner 受理激活——
     /// 制品 zip 在共享卷 `builds/` 目录，不经网络下载）。
@@ -642,6 +642,7 @@ pub(crate) enum DispatchAction {
         operation_id: String,
         artifact_id: String,
         sha256: Option<String>,
+        pg: Option<shared_types::StartPgCredential>,
     },
     /// 源码编排（workspace 当前内容 + release lock；start/restart source）。
     /// R08：dev_profile 随操作传递（Source profile = dev 语义）——编排的
@@ -772,7 +773,7 @@ impl RuntimeKernel {
                     code: shared_types::ERR_PROTOCOL_UNSUPPORTED,
                     message: format!(
                         "operation kind {kind} with profile {profile:?} is not implemented \
-                         in this build; supported: deploy+artifact(url), start/restart+source, stop"
+                         in this build; supported: deploy+artifact(url or artifact_id), start/restart+source, stop"
                     ),
                     active_operation_id: None,
                 });
@@ -1386,6 +1387,11 @@ impl RuntimeKernel {
                 operation_id: stored.view.operation_id.clone(),
                 url: url.clone(),
                 sha256: sha256.clone(),
+                pg: stored
+                    .request
+                    .run_config
+                    .as_ref()
+                    .and_then(|config| config.pg.clone()),
             },
             (
                 RuntimeOperationKind::Deploy,
@@ -1396,6 +1402,11 @@ impl RuntimeKernel {
                 operation_id: stored.view.operation_id.clone(),
                 artifact_id: artifact_id.clone(),
                 sha256: None,
+                pg: stored
+                    .request
+                    .run_config
+                    .as_ref()
+                    .and_then(|config| config.pg.clone()),
             },
             (RuntimeOperationKind::Stop, _) => DispatchAction::StopBusiness {
                 operation_id: stored.view.operation_id.clone(),
@@ -2731,8 +2742,9 @@ mod tests {
         )
         .expect("legacy desired");
         let store = open_store(&workspace);
-        // 迁移后旧位置清空、新位置可读
-        assert!(!workspace.join(STATE_DIR_NAME).exists());
+        // 运行记录迁移到新位置；保留旧锁文件与守卫，避免迁移期间锁域分裂。
+        assert!(!workspace.join(STATE_DIR_NAME).join("desired.json").exists());
+        assert!(workspace.join(STATE_DIR_NAME).join("owner.lock").exists());
         assert_eq!(
             store.load_desired().expect("desired"),
             (DesiredState::Stopped, 5)
@@ -2762,6 +2774,65 @@ mod tests {
         assert!(!bare.join("desired.json").exists());
         assert!(!bare.join("operations").exists());
         assert!(app_state_root(&workspace).join("desired.json").exists());
+    }
+
+    #[test]
+    fn owner_bootstrap_root_does_not_block_legacy_runtime_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let legacy = workspace.join(STATE_DIR_NAME);
+        std::fs::create_dir_all(legacy.join("operations")).unwrap();
+        std::fs::write(
+            legacy.join("desired.json"),
+            r#"{"desired":"stopped","revision":7}"#,
+        )
+        .unwrap();
+        std::fs::write(legacy.join("token"), "legacy-test-token").unwrap();
+        std::fs::write(legacy.join("operations/op.json"), "retained-operation").unwrap();
+        let root = app_state_root(&workspace);
+        let _owner = crate::platform::owner_guard::OwnerGuard::acquire(&root).unwrap();
+        std::fs::write(root.join(".deploy-coordinator.json"), "journal-bootstrap").unwrap();
+        let store = RuntimeStore::open_with_root(root.clone(), &workspace).unwrap();
+        assert_eq!(store.load_desired().unwrap(), (DesiredState::Stopped, 7));
+        assert_eq!(
+            std::fs::read_to_string(root.join("token")).unwrap(),
+            "legacy-test-token"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("operations/op.json")).unwrap(),
+            "retained-operation"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".deploy-coordinator.json")).unwrap(),
+            "journal-bootstrap"
+        );
+        assert!(
+            crate::platform::owner_guard::OwnerGuard::try_acquire(&legacy)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_runtime_migration_never_overwrites_stable_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let legacy = workspace.join(STATE_DIR_NAME);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("desired.json"),
+            r#"{"desired":"stopped","revision":7}"#,
+        )
+        .unwrap();
+        let root = app_state_root(&workspace);
+        let _owner = crate::platform::owner_guard::OwnerGuard::acquire(&root).unwrap();
+        std::fs::write(root.join("token"), "current-token").unwrap();
+        assert!(RuntimeStore::open_with_root(root.clone(), &workspace).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("token")).unwrap(),
+            "current-token"
+        );
+        assert!(legacy.join("desired.json").exists());
     }
 
     #[tokio::test]
@@ -2843,7 +2914,7 @@ mod tests {
             .await
             .expect_err("must reject deploy+source");
         assert_eq!(rejection.code, shared_types::ERR_PROTOCOL_UNSUPPORTED);
-        // Start+Artifact(ArtifactId)：本地制品解析器未实现 → 拒绝
+        // Start+Artifact is unsupported; local artifacts require Deploy.
         let mut start_artifact = request(RuntimeOperationKind::Start, "op-sa");
         start_artifact.profile = RunProfileInput::Artifact {
             artifact: ArtifactInput::ArtifactId {

@@ -11,8 +11,8 @@
 
 use anyhow::{Context, Result, bail};
 use shared_types::{
-    RUNTIME_CONTROL_PROTOCOL_VERSION, RunProfileInput, RuntimeIdentityView, RuntimeOperationKind,
-    RuntimeOperationRequest, RuntimeOperationView, RuntimeStatusView,
+    RUNTIME_CONTROL_PROTOCOL_VERSION, RuntimeIdentityView, RuntimeOperationRequest,
+    RuntimeOperationView, RuntimeStatusView,
 };
 
 /// 探测既有 owner（无认证；任何 HTTP 层失败视为无 owner，不区分原因——
@@ -64,6 +64,25 @@ pub(super) fn read_owner_token(state_root: &std::path::Path) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("owner rejected operation: {message} ({code})")]
+pub(super) struct SubmissionRejected {
+    pub code: String,
+    pub message: String,
+    pub status: reqwest::StatusCode,
+}
+impl SubmissionRejected {
+    pub(super) fn proves_not_admitted(&self) -> bool {
+        // runtime_kernel::admit checks durable operation history before these branches.
+        // Identity/protocol/backend/recovery/id-conflict errors do not provide that proof.
+        self.status == reqwest::StatusCode::CONFLICT
+            && matches!(
+                self.code.as_str(),
+                shared_types::ERR_REVISION_MISMATCH | shared_types::ERR_OPERATION_IN_PROGRESS
+            )
+    }
+}
+
 /// 认证后的运行操作客户端。
 pub(super) struct OwnerClient {
     address: String,
@@ -107,142 +126,39 @@ impl OwnerClient {
         serde_json::from_value(data).context("decode status view")
     }
 
-    /// 提交源码 Restart（平台 start/restart 复用既有 owner 的执行路径）。
-    /// instance_id 来自探测到的 identity——owner 校验后拒绝旧实例请求。
-    /// `pg`（R08）：每操作 PG 凭据——用户改密后的新凭据经 owner 到达服务
-    /// 进程 env（不进摘要/日志；owner 侧持久化时脱敏）。
-    pub(super) async fn submit_restart_source(
+    pub(super) async fn submit_request(
         &self,
-        operation_id: &str,
-        workspace_id: &str,
-        expected_revision: u64,
-        instance_id: &str,
-        pg: Option<&shared_types::StartPgCredential>,
+        request: &RuntimeOperationRequest,
     ) -> Result<RuntimeOperationView> {
-        self.submit_restart(
-            operation_id,
-            workspace_id,
-            expected_revision,
-            instance_id,
-            pg,
-            RunProfileInput::Source {
-                workspace_id: workspace_id.to_string(),
-            },
-        )
-        .await
-    }
-
-    /// R03：提交制品 Restart——平台只登记制品（共享卷 builds/ zip），激活由
-    /// owner 在身份/revision 核验通过后执行；拒绝不改变 active 运行目录。
-    pub(super) async fn submit_restart_artifact(
-        &self,
-        operation_id: &str,
-        workspace_id: &str,
-        expected_revision: u64,
-        instance_id: &str,
-        pg: Option<&shared_types::StartPgCredential>,
-        artifact_id: &str,
-    ) -> Result<RuntimeOperationView> {
-        self.submit_restart(
-            operation_id,
-            workspace_id,
-            expected_revision,
-            instance_id,
-            pg,
-            RunProfileInput::Artifact {
-                artifact: shared_types::ArtifactInput::ArtifactId {
-                    artifact_id: artifact_id.to_string(),
-                },
-            },
-        )
-        .await
-    }
-
-    async fn submit_restart(
-        &self,
-        operation_id: &str,
-        workspace_id: &str,
-        expected_revision: u64,
-        instance_id: &str,
-        pg: Option<&shared_types::StartPgCredential>,
-        profile: RunProfileInput,
-    ) -> Result<RuntimeOperationView> {
-        self.submit(
-            operation_id,
-            workspace_id,
-            expected_revision,
-            instance_id,
-            RuntimeOperationKind::Restart,
-            pg,
-            profile,
-        )
-        .await
-    }
-
-    /// 提交 Stop（external owner 的停止路径——不经进程信号）。
-    pub(super) async fn submit_stop(
-        &self,
-        operation_id: &str,
-        workspace_id: &str,
-        expected_revision: u64,
-        instance_id: &str,
-    ) -> Result<RuntimeOperationView> {
-        self.submit(
-            operation_id,
-            workspace_id,
-            expected_revision,
-            instance_id,
-            RuntimeOperationKind::Stop,
-            None,
-            RunProfileInput::Source {
-                workspace_id: workspace_id.to_string(),
-            },
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn submit(
-        &self,
-        operation_id: &str,
-        workspace_id: &str,
-        expected_revision: u64,
-        instance_id: &str,
-        kind: RuntimeOperationKind,
-        pg: Option<&shared_types::StartPgCredential>,
-        profile: RunProfileInput,
-    ) -> Result<RuntimeOperationView> {
-        let request = RuntimeOperationRequest {
-            operation_id: operation_id.to_string(),
-            expected_runtime_instance_id: instance_id.to_string(),
-            expected_revision,
-            workspace_id: workspace_id.to_string(),
-            kind,
-            profile,
-            run_config: pg.map(|pg| shared_types::OperationRunConfig {
-                pg: Some(pg.clone()),
-            }),
-            request_context: None,
-        };
+        let operation_id = request.operation_id.as_str();
+        let instance_id = request.expected_runtime_instance_id.as_str();
+        let kind = request.kind;
         let url = format!("http://{}/v1/runtime/operations", self.address);
         let response = self
             .client
             .post(&url)
             .header("X-Deploy-Token", &self.token)
-            .json(&request)
+            .json(request)
             .send()
             .await
             .with_context(|| format!("submit runtime operation to {}", self.address))?;
         let status = response.status();
         let body: serde_json::Value = response.json().await.context("parse submit response")?;
         if !status.is_success() {
-            bail!(
-                "owner rejected operation: {} ({})",
-                body.get("message")
+            return Err(SubmissionRejected {
+                code: body
+                    .get("code")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown"),
-                body.get("code").and_then(|v| v.as_str()).unwrap_or("ERR"),
-            );
+                    .unwrap_or("ERR")
+                    .to_string(),
+                message: body
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                status,
+            }
+            .into());
         }
         let data = body
             .get("data")
@@ -267,6 +183,15 @@ impl OwnerClient {
 
     /// 查询操作状态。
     pub(super) async fn operation(&self, operation_id: &str) -> Result<RuntimeOperationView> {
+        self.operation_if_exists(operation_id)
+            .await?
+            .context("owner operation not found")
+    }
+
+    pub(super) async fn operation_if_exists(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<RuntimeOperationView>> {
         let url = format!(
             "http://{}/v1/runtime/operations/{operation_id}",
             self.address
@@ -279,6 +204,9 @@ impl OwnerClient {
             .await
             .with_context(|| format!("query operation {operation_id}"))?;
         let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         let body: serde_json::Value = response.json().await.context("parse operation response")?;
         if !status.is_success() {
             bail!(
@@ -292,7 +220,9 @@ impl OwnerClient {
             .get("data")
             .cloned()
             .context("operation response missing data")?;
-        serde_json::from_value(data).context("decode operation view")
+        serde_json::from_value(data)
+            .map(Some)
+            .context("decode operation view")
     }
 
     /// 按 after_seq 游标重放操作事件（R06：端点是有限重放非长连流——

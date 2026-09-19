@@ -202,11 +202,22 @@ pub(crate) async fn get_task(
 ) -> UserAppReply<BuildTaskSnapshot> {
     let result = async {
         validate_task_scope(&scope, &task_id)?;
-        let task = state
-            .build_tasks
-            .get(&task_id)
-            .await
-            .ok_or_else(|| AppError::resource(format!("build task not found: {task_id}")))?;
+        let task = match state.build_tasks.get(&task_id).await {
+            Some(task) => task,
+            None => {
+                if let Some(operation) = state.fs.dev_server.external_operation_for_task(
+                    &super::userapp_dev_server::dev_key(&scope.app_id),
+                    &task_id,
+                )? {
+                    return Err(AppError::resource(format!(
+                        "build task {task_id} is not retained; original runtime operation {operation} can be recovered through POST /api/v1/userapp/dev/operations/{operation}/recover with the same app_id"
+                    )));
+                }
+                return Err(AppError::resource(format!(
+                    "build task not found: {task_id}"
+                )));
+            }
+        };
         Ok(task.snapshot().await)
     };
     reply(result.await)
