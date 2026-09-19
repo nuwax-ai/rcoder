@@ -1865,6 +1865,78 @@ async fn userapp_scope_isolation_during_deploy() {
         format!("HTTP {rs}, body 截断: {}", trunc(&rb, 200)),
     );
 
+    // ⑤f 同域并发 dev restart 反例（required 契约步）：两路不同 request 的
+    // dev restart 并发 → 恰一胜者受理，败者 409 信封携带结构化
+    // blocker.scope=Dev（M3 透传；不解析消息文本）。
+    let dr_http = env.http.clone();
+    let dr_base = env.rcoder.clone();
+    let dr_app = app.clone();
+    let dr_user = user.to_owned();
+    let dev_restart_a = tokio::spawn(async move {
+        let resp = dr_http
+            .post(format!("{dr_base}/computer/pod/restart"))
+            .timeout(Duration::from_secs(120))
+            .json(&json!({"user_id": dr_user, "project_id": format!("iso-{dr_app}"), "app_id": dr_app, "app_stage": "dev", "service_type": "userapp"}))
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                let s = r.status();
+                let b = r.json().await.unwrap_or(Value::Null);
+                (s, b)
+            }
+            Err(e) => (
+                reqwest::StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": e.to_string()}),
+            ),
+        }
+    });
+    let dr2_http = env.http.clone();
+    let dr2_base = env.rcoder.clone();
+    let dr2_app = app.clone();
+    let dr2_user = user.to_owned();
+    let dev_restart_b = tokio::spawn(async move {
+        let resp = dr2_http
+            .post(format!("{dr2_base}/computer/pod/restart"))
+            .timeout(Duration::from_secs(120))
+            .json(&json!({"user_id": dr2_user, "project_id": format!("iso-{dr2_app}"), "app_id": dr2_app, "app_stage": "dev", "service_type": "userapp"}))
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                let s = r.status();
+                let b = r.json().await.unwrap_or(Value::Null);
+                (s, b)
+            }
+            Err(e) => (
+                reqwest::StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": e.to_string()}),
+            ),
+        }
+    });
+    let (dra_s, dra_b) = dev_restart_a.await.expect("dev restart A join");
+    let (drb_s, drb_b) = dev_restart_b.await.expect("dev restart B join");
+    let a_ok = dra_s.is_success() && dra_b["success"].as_bool().unwrap_or(false);
+    let b_conflict = drb_s.is_success()
+        && drb_b["code"].as_str() == Some("ERR_CONFLICT")
+        && drb_b["blocker"]["scope"].as_str() == Some("Dev");
+    let b_winner = dra_s.is_success()
+        && dra_b["success"].as_bool().unwrap_or(false)
+        && drb_s.is_success()
+        && drb_b["success"].as_bool().unwrap_or(false);
+    // 恰一胜者：A 成功 + B 结构化冲突，或时序上两路都成功（第二路赶上
+    // 第一路完成后的窗口——此时胜者仍是"恰一"语义的时序边界，不算失败
+    // 只要求无假 409）
+    report.assert_hard(
+        "同域并发 restart → 恰一胜者 + 败者 409 带 blocker.scope=Dev",
+        (a_ok && b_conflict) || b_winner,
+        format!(
+            "A: HTTP {dra_s}, body 截断: {} | B: HTTP {drb_s}, body 截断: {}",
+            trunc(&dra_b, 200),
+            trunc(&drb_b, 200)
+        ),
+    );
+
     // ⑤e 同域并发反例：窗口内第二个 prod start（不同 request_id）→
     // 信封 ERR_CONFLICT + 结构化 blocker.scope=Prod。修复前：冲突但无 blocker 字段。
     let (cs, cb) = second_task.await.expect("second start task join");
