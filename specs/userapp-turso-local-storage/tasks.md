@@ -10,7 +10,7 @@
 ## T1 Turso 执行基础
 - [x] 添加 feature/依赖，实现独占目录、专用 worker、有界队列和完整事务执行。（userapp-turso feature；exclusive_directory 共享实现；专用线程+current-thread runtime+mpsc(256)）
 - [x] 实现初始化迁移器和配置读回校验；先补迁移失败/事务失败反例。（migrations.rs 内嵌+sha256 校验和+同事务记录；turso_store_rejects_checksum_mismatch；turso_failure_midway_rolls_back_entire_admission）
-- [x] 实现显式关机与错误隔离，验证接收端取消不遗留事务、锁不提前释放。（shutdown 幂等+排空+join；turso_cancelled_caller_and_dangling_transaction_do_not_leak）
+- [x] 实现显式关机与错误隔离，验证接收端取消不遗留事务、锁不提前释放。（shutdown 幂等+排空+join；turso_cancelled_caller_and_dangling_transaction_do_not_leak。**批 9 勘误（7b24be95）**：前轮实现有忙循环/线程泄漏/锁先于连接释放/并发假成功四缺陷（复核报告实证）——已全部修复，锁移入 worker 线程覆盖连接全生命周期，shutdown 共享完成结果）
 
 ## T2 完整存储实现
 - [x] 阅读 trait-design.md，保留 PG/Kubernetes 限制，不扩大到 Compose PG/多副本。
@@ -39,3 +39,15 @@
 - [x] 实跑真实 PG 契约；共享/K8s 链路受影响时补 remote-k8s 业务回归。（pg_storage_lifecycle_contract 实跑通过；K8s 链路用 PG 不受本地切换影响，remote-k8s 回归按用户安排的 131 部署测试执行）
 - [x] 写 verification.md，区分实现/组件/部署结果；说明所有失败与未完成项。（见 verification.md）
 - [x] 核查无活动 SQLite 配置/依赖遗留，保留历史报告与用户数据。（扫描仅剩刻意 fail-fast 文案与说明文档；本地旧 userapp.sqlite3 文件按 spec 保留未迁移；按用户既定指令执行 commit/push 与后续镜像构建）
+
+
+## 2026-09-19 批 9：阻断项修复（reviews/2026-09-19-batch9-fixes.md）
+
+- [x] R01 worker/锁生命周期、R03 并发 shutdown、R04 显式回滚+队列有界、R05 旧库目录保护（`7b24be95`，6 个修复前失败的反例全部转绿）
+- [x] R02 关机顺序：恢复扫描器有界收束 + 在途协调门闸 + 最后关库（`7b24be95`；端到端 SIGTERM 反例待 Compose 轮）
+- [x] app-cli 排队槽终局 + 失败重试反例（`7b24be95`；修复前失败有实证）
+- [x] scope_isolation 两层修复：结构化 blocker（`abe2e2e3`）+ required 契约步（`fdf1f486`）→ 场景 PASS
+- [x] two_users：环境残留清理后 PASS（bad-app-id 确认属测试残留）
+- [x] Pingap 版本门禁（`bded6fc4`）；N07 env 通道治本（`c46a2b94`）
+- [ ] compose_regression：flock 同进程重入根因已精确诊断（外层守卫弱锁 × 内层强锁同文件两 fd），修复待下一批
+- [ ] deploy_full_chain / 完整 make test-e2e / remote-k8s 回归 / 端到端 SIGTERM 反例
