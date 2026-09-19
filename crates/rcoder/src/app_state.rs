@@ -41,6 +41,10 @@ pub struct AppState {
     /// 存储关机控制（trait-design §6）：只供关机协调者使用，业务消费者
     /// 不得调用 shutdown。
     pub userapp_store_control: Arc<dyn rcoder_storage::userapp_lifecycle::UserAppStoreControl>,
+    /// 在途协调任务门闸（R02 关机顺序）：等待业务任务收束后再关库。
+    pub userapp_op_flight: Arc<crate::userapp_builder::shutdown_gate::OperationFlightGate>,
+    /// 恢复扫描器任务句柄（R02）：关机时停止接单并有界等待退出。
+    pub userapp_recovery_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// 应用配置
     pub config: AppConfig,
     /// 项目适配器 - 纯 DashMap 内存存储 + RAII 自动资源回收
@@ -97,6 +101,7 @@ impl AppState {
         projects: Arc<ProjectStoreBackend>,
         cleanup_rx: tokio::sync::mpsc::Receiver<crate::storage::CleanupRequest>,
         activity: Arc<app_manager::AppActivityRegistry>,
+        shutdown_tx: broadcast::Sender<()>,
     ) -> anyhow::Result<Arc<Self>> {
         // 存储后端（Memory/Postgres 枚举）由调用方（main.rs）按配置构造并注入，
         // 以便同一 Arc 实例可同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层。
@@ -153,6 +158,10 @@ impl AppState {
         let state = Arc::new(Self {
             userapp_store,
             userapp_store_control,
+            userapp_op_flight: Arc::new(
+                crate::userapp_builder::shutdown_gate::OperationFlightGate::default(),
+            ),
+            userapp_recovery_handle: Arc::new(std::sync::Mutex::new(None)),
             config,
             projects,
             pingora_service: pingora,
@@ -181,7 +190,12 @@ impl AppState {
         app_service_arc.set_builder_recovery(Arc::new(
             crate::userapp_builder::retry::PendingBuilderRecovery::new(Arc::downgrade(&state)),
         ))?;
-        crate::userapp_builder::start_recovery(Arc::downgrade(&state));
+        let recovery_handle =
+            crate::userapp_builder::start_recovery(Arc::downgrade(&state), shutdown_tx.subscribe());
+        *state
+            .userapp_recovery_handle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recovery handle lock poisoned"))? = Some(recovery_handle);
         Ok(state)
     }
 

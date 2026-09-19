@@ -60,7 +60,16 @@ impl RecoveryTasks {
     }
 }
 
-pub(crate) fn start_recovery(state: Weak<AppState>) {
+/// 恢复扫描器退出时对在途恢复任务的有界收束预算（R02：预算耗尽记录
+/// 未完成项，不无限等待也不强行清理不确定资源）。
+const RECOVERY_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+
+/// 启动恢复扫描器；返回任务句柄供关机协调者等待退出（R02）。
+/// `shutdown_rx` 触发后停止发现新工作，等待在途恢复任务有界收束。
+pub(crate) fn start_recovery(
+    state: Weak<AppState>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -68,13 +77,14 @@ pub(crate) fn start_recovery(state: Weak<AppState>) {
         let mut cursor = None;
         let mut terminal_cursor = None;
         let mut terminal_first = false;
-        loop {
+        let reason = loop {
             tokio::select! {
                 result = tasks.next(), if !tasks.active.is_empty() => {
                     if let Some((operation_id, Err(error))) = result {
                         tracing::warn!(%error, %operation_id, "Pending userApp operation was not resumed");
                     }
                 }
+                _ = shutdown_rx.recv() => break "shutdown",
                 _ = interval.tick() => {
                     let Some(state) = state.upgrade() else { return; };
                     terminal_first = !terminal_first;
@@ -91,8 +101,26 @@ pub(crate) fn start_recovery(state: Weak<AppState>) {
                     }
                 }
             }
+        };
+        // R02：停止接单后有界收束在途恢复任务；预算耗尽记录未完成项
+        // （任务持有 AppState Weak，不因扫描器退出而被中止）。
+        let deadline = tokio::time::Instant::now() + RECOVERY_DRAIN_BUDGET;
+        while !tasks.active.is_empty() && tokio::time::Instant::now() < deadline {
+            if let Some((operation_id, Err(error))) = tasks.next().await {
+                tracing::warn!(%error, %operation_id, "UserApp recovery task failed during drain");
+            }
         }
-    });
+        if !tasks.active.is_empty() {
+            tracing::error!(
+                remaining = tasks.active.len(),
+                budget_secs = RECOVERY_DRAIN_BUDGET.as_secs(),
+                reason,
+                "UserApp recovery drain budget exhausted; in-flight recovery tasks continue but store will close"
+            );
+        } else {
+            tracing::info!(reason, "UserApp recovery scanner drained and exited");
+        }
+    })
 }
 
 /// Terminal operations are absent from unfinished_operations. Keep a separate

@@ -112,9 +112,13 @@ pub(super) async fn q_rows(
 /// `maybe_handle_dangling_tx` 发出 ROLLBACK 再运行语句
 /// （src/connection.rs:101；`transaction_with_behavior` 在
 /// src/transaction.rs:289 同样先处理）。本 worker 独占单连接且串行执行，
-/// 因此 `?` 错误路径 Drop 事务 = 懒但必然的回滚——下一个方法先回滚遗留
-/// 事务再执行，不毒化连接；回滚失败以存储错误在下一个方法上暴露（隔离
-/// 不变）。成功响应只可能来自 [`Tx::commit`] 之后。
+/// 因此 `?` 错误路径 Drop 事务 = 必然的回滚。
+///
+/// R04 显式清理：`?` 错误路径的回滚**不再推迟到下一个业务请求**——
+/// worker 的 [`execute_task`](super::execute_task) 在 body 返回 Err 后
+/// 立即发出一条轻量语句触发挂起的 ROLLBACK；清理失败则隔离连接（后续
+/// 任务全部快速拒绝，报"connection isolated"）。成功响应只可能来自
+/// [`Tx::commit`] 之后。
 pub(super) struct Tx<'a> {
     tx: Option<turso::transaction::Transaction<'a>>,
 }

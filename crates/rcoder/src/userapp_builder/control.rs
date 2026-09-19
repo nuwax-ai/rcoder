@@ -22,8 +22,11 @@ pub(crate) async fn execute(
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
     let owned = state.clone();
+    let flight_gate = state.userapp_op_flight.clone();
     let app_id = app_id.to_owned();
     tokio::spawn(async move {
+        // R02：在途协调任务门闸——关机时等待本任务收束后再关闭存储
+        let _flight = flight_gate.guard();
         let _local = super::lifecycle::acquire(&app_id).await;
         let app = owned
             .userapp_store
@@ -651,6 +654,10 @@ mod tests {
         let state = Arc::new(AppState {
             userapp_store: metadata_store.clone(),
             userapp_store_control: metadata_store,
+            userapp_op_flight: Arc::new(
+                crate::userapp_builder::shutdown_gate::OperationFlightGate::default(),
+            ),
+            userapp_recovery_handle: Arc::new(Mutex::new(None)),
             config: AppConfig::default(),
             projects: Arc::new(ProjectStoreBackend::Memory(Arc::new(adapter))),
             pingora_service: None,

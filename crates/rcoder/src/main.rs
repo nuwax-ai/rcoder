@@ -327,6 +327,7 @@ async fn run() -> anyhow::Result<()> {
         projects,
         cleanup_rx,
         activity_registry.clone(),
+        shutdown_tx.clone(),
     )
     .await?;
 
@@ -350,6 +351,14 @@ async fn run() -> anyhow::Result<()> {
     let runtime_for_shutdown = state.runtime().clone();
     // 存储关机控制（trait-design §6）：state 即将 move 进 router，先留出句柄
     let userapp_store_control = state.userapp_store_control.clone();
+    // R02：在途协调门闸 + 恢复扫描器句柄（take——扫描器随关机退出）
+    let userapp_op_flight = state.userapp_op_flight.clone();
+    let userapp_recovery = state
+        .userapp_recovery_handle
+        .lock()
+        .map(|mut guard| guard.take())
+        .ok()
+        .flatten();
     let app = router::create_router(
         state,
         Some(Arc::clone(&bootstrap_result.telemetry)),
@@ -364,6 +373,8 @@ async fn run() -> anyhow::Result<()> {
         runtime_for_shutdown,
         Some(projects_for_shutdown),
         userapp_store_control,
+        Some(userapp_op_flight),
+        userapp_recovery,
     )
     .await;
     server_handle.abort();

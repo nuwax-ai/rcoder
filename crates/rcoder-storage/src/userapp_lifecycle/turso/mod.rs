@@ -6,10 +6,17 @@
 //! 不同请求的事务不会在同一连接上交错。调用方丢弃 future 不中止已开始
 //! 的事务（oneshot 发送失败即丢弃回包，事务照常完成——可能已提交但
 //! 回包丢失，调用方按原 request_id/operation_id 幂等查询）。
+//!
+//! 生命周期不变量（R01/R03）：目录锁在线程启动前获取、随线程闭包移动，
+//! 仅在线程退出（连接 Drop 之后）才释放——任何错误/取消/Drop 路径都
+//! 不能让锁先于连接销毁。shutdown 的完成结果由所有调用方共享。
 
 mod exec;
 mod migrations;
 mod ops;
+mod restart;
+
+use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use shared_types::{UserAppLifecycleRecord, UserAppOperationRecord, UserAppStoreError as Error};
@@ -17,14 +24,26 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::userapp_lifecycle::storage;
 
-/// 队列深度（有界——满时明确报错，不静默丢写）。
+/// 队列深度（有界——满时有界等待后明确拒绝，不静默丢写）。
 const QUEUE_DEPTH: usize = 256;
+
+/// 队列满时的容量等待预算（plan §3：入队等待必须有界；超时即拒绝，
+/// 拒绝语义保证任务**从未入队**＝未执行）。
+const QUEUE_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const QUEUE_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// 队列满/关机时的明确错误（plan §3 取消与 deadline）。
 fn unavailable(reason: &str) -> Error {
     Error::Storage(anyhow::anyhow!(
         "userapp store worker unavailable: {reason}"
     ))
+}
+
+/// 旧 SQLite 库同目录残留检测（R05）：默认旧库文件名存在即视为旧库。
+fn legacy_sqlite_sibling(db_path: &std::path::Path) -> bool {
+    db_path
+        .parent()
+        .is_some_and(|dir| dir.join("userapp.sqlite3").exists())
 }
 
 /// 一个排队任务：对独占连接的完整方法体 + 回包通道。
@@ -43,31 +62,49 @@ struct TaskOut(Box<dyn std::any::Any + Send>);
 /// 业务门面：句柄轻量可克隆（mpsc sender）；Connection 只存在于 worker。
 pub struct TursoUserAppStore {
     tx: mpsc::Sender<Task>,
-    /// 关机协调句柄（装配层持有；Drop 只作兜底）。
-    worker: std::sync::Mutex<Option<WorkerHandle>>,
-    /// 进程独占目录锁（连接随 worker 生命周期；锁同样随本结构体持有——
-    /// `let _ = lock` 会在语句末 drop，第二实例将不被拒绝）。
-    _instance_lock: Option<std::fs::File>,
+    /// 关机协调句柄（装配层持有；Drop 只发信号作兜底，不 join）。
+    worker: std::sync::Mutex<Option<Arc<WorkerHandle>>>,
 }
 
+/// 关机协调：所有调用共享同一完成结果（trait-design §6）。
+///
+/// 第一个调用者发送停止信号并在独立 spawn 的 blocking 任务里 join；
+/// join 结果写入 `outcome` 并经 `finished` 唤醒全部等待者。等待者
+/// future 被取消不影响关闭动作（join 不依赖任何调用方存活）。
 struct WorkerHandle {
     shutdown: tokio::sync::watch::Sender<bool>,
-    join: Option<std::thread::JoinHandle<()>>,
+    /// 第一次 shutdown 时取走 join 句柄并启动收束任务。
+    join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    outcome: std::sync::Mutex<Option<Result<(), Error>>>,
+    finished: tokio::sync::Notify,
 }
 
 impl TursoUserAppStore {
-    /// 独占打开：目录锁 → worker/连接 → PRAGMA 校验 → 迁移 → 重启隔离。
-    /// 整个期间锁归 worker 生命周期持有（plan §3 启动顺序）。
+    /// 独占打开：目录锁 → 旧库目录保护 → worker/连接 → PRAGMA 校验 →
+    /// 迁移 → 重启隔离。锁移动进 worker 线程，覆盖连接全部生命周期
+    /// （plan §3 启动顺序）；启动失败路径显式关停并 join 后才返回 Err。
     pub async fn open_exclusive(path: &std::path::Path) -> Result<Self, Error> {
         let path = path.to_path_buf();
-        // 独占目录校验复用后端中性实现（与原 SQLite 相同的别名/远程 fs 保护）
+        // 独占目录校验复用后端中性实现（别名/远程 fs 保护）
         let (db_path, lock) =
             tokio::task::spawn_blocking(move || super::exclusive_directory::acquire(&path))
                 .await
                 .map_err(storage)??;
-        let (mut store, handle) = Self::spawn_worker(&db_path).await?;
-        // 重启隔离（在 worker 侧、对外 ready 前执行）
-        let _isolated: () = store
+        // R05：旧库目录保护（spec 行为要求 7）——新库不存在而目录已有
+        // 旧 userapp.sqlite3 时拒绝启动，指引用独立目录；不删除、不迁移。
+        if !db_path.exists() && legacy_sqlite_sibling(&db_path) {
+            return Err(Error::InvalidOperation(
+                "data directory contains a legacy userapp.sqlite3 without userapp.turso.db; \
+                 refusing to silently initialize a second application identity — \
+                 use a fresh data directory (spec 行为要求 7)"
+                    .into(),
+            ));
+        }
+        let (store, handle) = Self::spawn_worker(&db_path, lock).await?;
+        *store.worker.lock().map_err(|_| unavailable("poisoned"))? = Some(Arc::new(handle));
+        // 重启隔离（在 worker 侧、对外 ready 前执行）。失败路径必须先
+        // 关停 worker（排空 + join + 释放锁）再返回错误。
+        let isolated: Result<(), Error> = store
             .run(|conn: &mut turso::Connection| {
                 Box::pin(async move {
                     restart::quarantine(conn)
@@ -75,13 +112,22 @@ impl TursoUserAppStore {
                         .map(|r| TaskOut(Box::new(r)))
                 })
             })
-            .await?;
-        store._instance_lock = Some(lock);
-        *store.worker.lock().map_err(|_| unavailable("poisoned"))? = Some(handle);
+            .await;
+        if let Err(error) = isolated {
+            drop(store.shutdown().await);
+            return Err(error);
+        }
         Ok(store)
     }
+
     /// 内部：起 worker 线程并就绪（连接+PRAGMA+迁移已完成）。
-    async fn spawn_worker(db_path: &std::path::Path) -> Result<(Self, WorkerHandle), Error> {
+    ///
+    /// `lock`（目录独占锁）随闭包移动进线程：线程退出前 Drop 连接、
+    /// 最后 Drop 锁——锁始终覆盖连接及在途事务生命周期。
+    async fn spawn_worker(
+        db_path: &std::path::Path,
+        lock: std::fs::File,
+    ) -> Result<(Self, WorkerHandle), Error> {
         let (ready_tx, ready_rx) = oneshot::channel::<
             Result<(mpsc::Sender<Task>, tokio::sync::watch::Sender<bool>), Error>,
         >();
@@ -89,17 +135,32 @@ impl TursoUserAppStore {
         let join = std::thread::Builder::new()
             .name("userapp-turso-store".into())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                // 锁在本线程持有至退出（连接 Drop 之后才释放）
+                let _directory_lock = lock;
+                let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("build turso store runtime");
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        // ready 接收方消失（调用方取消）同样走此路径：发送
+                        // 失败即丢弃，线程返回，锁随闭包释放。
+                        drop(ready_tx.send(Err(storage(anyhow::anyhow!(
+                            "build turso store runtime: {error}"
+                        )))));
+                        return;
+                    }
+                };
                 runtime.block_on(async move {
                     let (tx, mut rx) = mpsc::channel::<Task>(QUEUE_DEPTH);
                     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
                     // 连接 + PRAGMA + 迁移（worker 内完成——连接不跨线程）
                     let mut conn = match init_connection(&db_path).await {
                         Ok(conn) => {
-                            drop(ready_tx.send(Ok((tx.clone(), shutdown_tx))));
+                            if ready_tx.send(Ok((tx.clone(), shutdown_tx))).is_err() {
+                                // 调用方取消：立即终止，不进入主循环
+                                return;
+                            }
                             conn
                         }
                         Err(error) => {
@@ -107,28 +168,39 @@ impl TursoUserAppStore {
                             return;
                         }
                     };
-                    // 主循环：顺序处理完整方法；shutdown 信号先排空已接收任务
-                    loop {
+                    // 连接隔离标志：错误路径的显式回滚失败后置位，后续
+                    // 任务全部快速拒绝（R04：回滚失败 ⇒ 后端不可写）。
+                    let mut isolated = false;
+                    // 主循环：顺序处理完整方法。终止条件：shutdown 信号、
+                    // shutdown sender 全部消失（Err）、任务通道关闭。
+                    // 终止前先排空已接收任务再退出。
+                    let mut stopping = false;
+                    while !stopping {
                         tokio::select! {
                             biased;
-                            _ = shutdown_rx.changed() => {
-                                if *shutdown_rx.borrow() {
-                                    rx.close();
-                                    while let Some(task) = rx.recv().await {
-                                        execute_task(&mut conn, task).await;
+                            changed = shutdown_rx.changed() => {
+                                match changed {
+                                    Err(_) => stopping = true, // sender 消失：终止
+                                    Ok(()) => {
+                                        if *shutdown_rx.borrow() {
+                                            stopping = true;
+                                        }
                                     }
-                                    break;
                                 }
                             }
                             task = rx.recv() => {
                                 match task {
-                                    Some(task) => execute_task(&mut conn, task).await,
-                                    None => break,
+                                    Some(task) => execute_task(&mut conn, &mut isolated, task).await,
+                                    None => stopping = true,
                                 }
                             }
                         }
                     }
-                    // 连接随线程结束销毁（无跨线程 Send 声明需求）
+                    rx.close();
+                    while let Some(task) = rx.recv().await {
+                        execute_task(&mut conn, &mut isolated, task).await;
+                    }
+                    // 连接先于锁销毁（lock 是闭包局部变量，最后 Drop）
                 });
             })
             .map_err(|e| storage(anyhow::anyhow!("spawn turso store worker: {e}")))?;
@@ -137,20 +209,23 @@ impl TursoUserAppStore {
                 Self {
                     tx,
                     worker: std::sync::Mutex::new(None),
-                    _instance_lock: None,
                 },
                 WorkerHandle {
                     shutdown,
-                    join: Some(join),
+                    join: std::sync::Mutex::new(Some(join)),
+                    outcome: std::sync::Mutex::new(None),
+                    finished: tokio::sync::Notify::new(),
                 },
             )),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(unavailable("worker died during init")),
         }
     }
+
     /// 在 worker 上执行一个完整方法体。
     ///
-    /// 入队前取消安全（try_send/send 满或关机 → 未执行 + 明确错误）；
+    /// 入队使用 try_send + 有界容量等待：任何返回错误的路径都保证任务
+    /// **从未入队**（＝未执行），不存在"已入队却报未执行"的竞态；
     /// 入队后调用方丢弃 future 不中止事务（oneshot drop → 结果丢弃）。
     async fn run<R: Send + 'static>(
         &self,
@@ -159,13 +234,29 @@ impl TursoUserAppStore {
         + 'static,
     ) -> Result<R, Error> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(Task {
-                body: Box::new(body),
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| unavailable("worker stopped"))?;
+        let mut pending = Task {
+            body: Box::new(body),
+            reply: reply_tx,
+        };
+        let deadline = tokio::time::Instant::now() + QUEUE_WAIT_BUDGET;
+        loop {
+            match self.tx.try_send(pending) {
+                Ok(()) => break,
+                Err(mpsc::error::TrySendError::Full(task)) => {
+                    pending = task;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(unavailable(&format!(
+                            "queue full after {}s (depth {QUEUE_DEPTH}); task never enqueued",
+                            QUEUE_WAIT_BUDGET.as_secs()
+                        )));
+                    }
+                    tokio::time::sleep(QUEUE_WAIT_POLL).await;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(unavailable("worker stopped"));
+                }
+            }
+        }
         match reply_rx.await {
             Ok(result) => result.and_then(|out| {
                 out.0
@@ -176,41 +267,99 @@ impl TursoUserAppStore {
             Err(_) => Err(unavailable("worker dropped reply without executing")),
         }
     }
-    /// 显式关机（装配层）：停生产者 → 排空队列 → 关连接 → join。
-    /// 重复调用安全（幂等）。
+
+    /// 显式关机（装配层）：停生产者 → 发送停止信号 → 排空队列 → 关连接
+    /// → join → 释放目录锁。所有调用方等待同一完成结果；join panic 与
+    /// 线程错误显式传播；关闭动作独立于任何调用方 future 存活。
     pub async fn shutdown(&self) -> Result<(), Error> {
         let handle = {
             self.worker
                 .lock()
                 .map_err(|_| unavailable("poisoned"))?
-                .take()
+                .clone()
         };
         let Some(handle) = handle else {
-            return Ok(()); // 已关机（幂等）
+            return Ok(()); // 从未安装（启动失败路径已自行 join）
         };
-        handle
-            .shutdown
-            .send(true)
-            .map_err(|_| unavailable("shutdown channel closed"))?;
-        // join 在阻塞线程上完成（不在 async 上下文同步阻塞——spawn_blocking）
-        let join = handle.join;
-        tokio::task::spawn_blocking(move || {
-            if let Some(join) = join {
-                drop(join.join());
+        // 启动收束（仅一次）：发送信号 + detached join，结果写入共享槽
+        {
+            let mut guard = handle.join.lock().map_err(|_| unavailable("poisoned"))?;
+            if let Some(join) = guard.take() {
+                handle
+                    .shutdown
+                    .send(true)
+                    .map_err(|_| unavailable("shutdown channel closed"))?;
+                let waiter = Arc::clone(&handle);
+                // detached：不依赖任何 shutdown 调用方存活
+                tokio::task::spawn_blocking(move || {
+                    let outcome = match join.join() {
+                        Ok(()) => Ok(()),
+                        Err(panic) => Err(storage(anyhow::anyhow!(
+                            "userapp store worker thread failed during shutdown: {panic:?}"
+                        ))),
+                    };
+                    if let Ok(mut slot) = waiter.outcome.lock() {
+                        *slot = Some(outcome);
+                    }
+                    waiter.finished.notify_waiters();
+                });
             }
-        })
-        .await
-        .map_err(|e| storage(anyhow::anyhow!("join worker: {e}")))?;
-        Ok(())
+        }
+        // 等待共享完成结果
+        loop {
+            {
+                let guard = handle.outcome.lock().map_err(|_| unavailable("poisoned"))?;
+                if let Some(outcome) = guard.as_ref() {
+                    return match outcome {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(storage(anyhow::anyhow!("{error:#}"))),
+                    };
+                }
+            }
+            handle.finished.notified().await;
+        }
     }
 }
 
-async fn execute_task(conn: &mut turso::Connection, task: Task) {
+impl Drop for TursoUserAppStore {
+    fn drop(&mut self) {
+        // Drop 只作兜底（不构成 flush 完成证据）：发送停止信号，不 join
+        // （同步 Drop 不能阻塞等待线程）。worker 持有目录锁，即便本
+        // 结构体先消失，第二实例在 worker 退出（连接销毁、锁释放）
+        // 之前仍会被独占锁拒绝——不变量不被破坏。
+        if let Ok(mut guard) = self.worker.lock()
+            && let Some(handle) = guard.take()
+        {
+            let _ = handle.shutdown.send(true);
+        }
+    }
+}
+
+async fn execute_task(conn: &mut turso::Connection, isolated: &mut bool, task: Task) {
+    if *isolated {
+        // R04：回滚清理失败后连接被隔离——后续任务快速失败，不静默复用
+        drop(task.reply.send(Err(unavailable(
+            "connection isolated after rollback failure; store requires restart",
+        ))));
+        return;
+    }
     let body = task.body;
     let reply = task.reply;
     let result = body(conn).await;
-    // 回包丢失（调用方取消）→ 结果丢弃；事务已在 body 内 commit 或由
-    // dangling_tx 机制回滚（见 exec.rs 文档）
+    if result.is_err() {
+        // R04：错误路径的显式清理——立即以一条轻量语句触发
+        // maybe_handle_dangling_tx（连接上任何语句前先执行挂起的
+        // ROLLBACK），不把清理推迟到下一个业务请求；清理失败则隔离
+        // 连接（后续任务全部拒绝），原错误照常返回给原调用方。
+        if let Err(cleanup_error) = conn.query("SELECT 1", ()).await {
+            *isolated = true;
+            tracing::error!(
+                error = %cleanup_error,
+                "userapp store rollback cleanup failed; connection isolated"
+            );
+        }
+    }
+    // 回包丢失（调用方取消）→ 结果丢弃
     drop(reply.send(result));
 }
 
@@ -308,57 +457,8 @@ async fn verify_pragmas(conn: &turso::Connection) -> Result<(), Error> {
     Ok(())
 }
 
-/// 重启隔离（Turso 版 restart::quarantine——同业务规则：不确定转
-/// RecoveryRequired，不清租约、不重放写）。
-mod restart {
-    use super::exec::{begin, text};
-    use crate::userapp_lifecycle::storage;
-    use shared_types::{
-        UserAppOperationRecord, UserAppOperationState as State, UserAppStoreError as Error,
-    };
-
-    pub(super) async fn quarantine(conn: &mut turso::Connection) -> Result<(), Error> {
-        let mut tx = begin(conn).await?;
-        let records = tx
-            .all_string(
-                "SELECT record FROM userapp_operations WHERE terminal=0 \
-                 AND json_extract(record, '$.state') IN ('Running','WaitingRetry')",
-                vec![],
-            )
-            .await?;
-        let count = records.len();
-        for original in records {
-            let mut record: UserAppOperationRecord =
-                serde_json::from_str(&original).map_err(storage)?;
-            record.state = State::RecoveryRequired;
-            record.revision = record.revision.checked_add(1).ok_or_else(|| {
-                Error::InvalidOperation("Operation revision exhausted during restart".into())
-            })?;
-            record.error_code = Some(shared_types::error_codes::ERR_BACKEND_ERROR.into());
-            record.error_message = Some(
-                "Previous local executor stopped; remote outcome requires verification".into(),
-            );
-            let encoded = serde_json::to_string(&record).map_err(storage)?;
-            let updated = tx
-                .exec(
-                    "UPDATE userapp_operations SET record=?1 WHERE operation_id=?2 AND record=?3 AND terminal=0",
-                    vec![text(encoded), text(&record.operation_id), text(original)],
-                )
-                .await?;
-            if updated != 1 {
-                return Err(Error::VersionConflict);
-            }
-        }
-        tx.commit().await?;
-        if count != 0 {
-            tracing::warn!(
-                operations = count,
-                "Interrupted local operations require remote outcome verification"
-            );
-        }
-        Ok(())
-    }
-}
+#[cfg(test)]
+mod tests;
 
 // ── trait 实现（克隆参数 → worker 队列 → 解包） ────────────────────────
 
@@ -726,734 +826,12 @@ impl shared_types::UserAppLifecycleStore for TursoUserAppStore {
     }
 }
 
-impl Drop for TursoUserAppStore {
-    fn drop(&mut self) {
-        // Drop 只作兜底（不构成 flush 完成证据）：信号关机，不 join
-        // （异步上下文不能同步阻塞 join）。
-        if let Ok(mut guard) = self.worker.lock()
-            && let Some(handle) = guard.take()
-        {
-            let _ = handle.shutdown.send(true);
-        }
-    }
-}
-
 /// 关机控制（trait-design §6）：与业务门面同一 Arc，装配层单独持有
 /// `Arc<dyn UserAppStoreControl>`；停生产者 → 排空队列 → 关连接 → join
-/// 线程 → 释放目录锁（锁随结构体 Drop 释放）。
+/// 线程 → 释放目录锁（锁在 worker 线程内，随线程退出释放）。
 #[async_trait::async_trait]
 impl crate::userapp_lifecycle::control::UserAppStoreControl for TursoUserAppStore {
     async fn shutdown(&self) -> Result<(), Error> {
         TursoUserAppStore::shutdown(self).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use shared_types::UserAppLifecycleStore as _;
-
-    /// 冒烟：worker + 迁移 + 基本 identity/admit/advance 链。
-    #[tokio::test]
-    async fn turso_store_basic_lifecycle() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = dir.path().join("userapp.turso.db");
-        let path = std::path::absolute(&path).expect("abs");
-        let store = TursoUserAppStore::open_exclusive(&path)
-            .await
-            .expect("open");
-
-        let app = store.ensure_identity("app-smoke").await.expect("identity");
-        assert_eq!(app.app_id, "app-smoke");
-
-        let fetched = store.get_application("app-smoke").await.expect("get");
-        assert_eq!(fetched.expect("present").lifecycle_id, app.lifecycle_id);
-
-        let missing = store.get_application("no-such").await.expect("get missing");
-        assert!(missing.is_none(), "无行 = None（存储失败 ≠ 不存在）");
-
-        // admit 一个 Stop 操作（Dev scope）
-        let outcome = store
-            .admit(&shared_types::UserAppAdmission {
-                app_id: "app-smoke".into(),
-                lifecycle_id: None,
-                operation_id: "op-stop-1".into(),
-                request_id: Some("req-1".into()),
-                request_fingerprint: "a".repeat(64),
-                kind: shared_types::UserAppOperationKind::Stop,
-                command: None,
-                metadata: None,
-                runtime_policy_on_success: None,
-            })
-            .await
-            .expect("admit");
-        match outcome {
-            shared_types::UserAppAdmissionOutcome::Accepted(op) => {
-                assert_eq!(op.operation_id, "op-stop-1");
-            }
-            other => panic!("expected Accepted, got {other:?}"),
-        }
-
-        // 幂等重放：同 request_id → Existing
-        let replay = store
-            .admit(&shared_types::UserAppAdmission {
-                app_id: "app-smoke".into(),
-                lifecycle_id: None,
-                operation_id: "op-stop-1".into(),
-                request_id: Some("req-1".into()),
-                request_fingerprint: "a".repeat(64),
-                kind: shared_types::UserAppOperationKind::Stop,
-                command: None,
-                metadata: None,
-                runtime_policy_on_success: None,
-            })
-            .await
-            .expect("replay");
-        match replay {
-            shared_types::UserAppAdmissionOutcome::Existing(op) => {
-                assert_eq!(op.operation_id, "op-stop-1");
-            }
-            other => panic!("expected Existing, got {other:?}"),
-        }
-
-        store.shutdown().await.expect("shutdown");
-    }
-
-    /// 双进程目录排他：第二个实例被拒（不能先写库再发现锁冲突）。
-    #[tokio::test]
-    async fn turso_store_exclusive_directory_rejects_second_instance() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = std::path::absolute(dir.path().join("userapp.turso.db")).expect("abs");
-        let _first = TursoUserAppStore::open_exclusive(&path)
-            .await
-            .expect("first");
-        let second = TursoUserAppStore::open_exclusive(&path).await;
-        assert!(
-            second.is_err(),
-            "second instance must be rejected by directory lock"
-        );
-    }
-
-    /// 损坏迁移拒绝：篡改版本表校验和 → 启动失败。
-    #[tokio::test]
-    async fn turso_store_rejects_checksum_mismatch() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = std::path::absolute(dir.path().join("userapp.turso.db")).expect("abs");
-        let store = TursoUserAppStore::open_exclusive(&path)
-            .await
-            .expect("open");
-        store.shutdown().await.expect("shutdown initial");
-        drop(store); // 结构体持有目录锁——释放后才能以同版本引擎观察/重开
-        // 篡改版本记录校验和（直接 Turso 引擎打开同版本文件——主进程已
-        // 停止并持锁释放后）
-        let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-            .build()
-            .await
-            .expect("reopen");
-        let conn = db.connect().expect("connect");
-        conn.execute(
-            "UPDATE _turso_userapp_migrations SET checksum='tampered' WHERE version=1",
-            (),
-        )
-        .await
-        .expect("tamper");
-        drop(conn);
-        drop(db);
-        let result = TursoUserAppStore::open_exclusive(&path).await;
-        let Err(error) = result else {
-            panic!("checksum mismatch must block startup")
-        };
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("checksum mismatch")
-                || message.contains("modified after being applied"),
-            "diagnostic: {message}"
-        );
-    }
-
-    /// 原子性反例（对应 sqlite 时代的 trigger 注入）：事务中途存储失败 →
-    /// 整个受理回滚。注入方式 = 经 worker 自己的连接预插一行占用目标
-    /// operation_id（同引擎同连接，无跨引擎锁问题），使 admit 的事务内
-    /// INSERT 在 lifecycle 写入之后撞 PRIMARY KEY。
-    #[tokio::test]
-    async fn turso_failure_midway_rolls_back_entire_admission() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = std::path::absolute(dir.path().join("rollback.turso.db")).expect("abs");
-        let store = TursoUserAppStore::open_exclusive(&path)
-            .await
-            .expect("open");
-        let app_id = "atomic-failure".to_string();
-        let op_id = "atomic-failure-operation".to_string();
-
-        let inject: Result<(), Error> = store
-            .run(|conn: &mut turso::Connection| {
-                Box::pin(async move {
-                    use super::exec::text;
-                    conn.execute(
-                        "INSERT INTO userapp_lifecycles(app_id,record) VALUES(?1,'{\"stub\":true}')",
-                        vec![text("atomic-carrier")],
-                    )
-                    .await
-                    .map_err(storage)?;
-                    conn.execute(
-                        "INSERT INTO userapp_operations(operation_id,app_id,request_id,terminal,record) \
-                         VALUES(?1,'atomic-carrier',NULL,0,'{\"stub\":true}')",
-                        vec![text("atomic-failure-operation")],
-                    )
-                    .await
-                    .map_err(storage)?;
-                    Ok(TaskOut(Box::new(())))
-                })
-            })
-            .await;
-        inject.expect("seed collision carrier");
-
-        let mut req = shared_types::UserAppAdmission {
-            runtime_policy_on_success: None,
-            command: None,
-            metadata: None,
-            app_id: app_id.clone(),
-            lifecycle_id: None,
-            operation_id: op_id.clone(),
-            request_id: Some("atomic-failure-request".into()),
-            request_fingerprint: "a".repeat(64),
-            kind: shared_types::UserAppOperationKind::Update,
-        };
-        req.app_id = app_id.clone();
-        assert!(
-            matches!(store.admit(&req).await, Err(Error::Storage(_))),
-            "in-transaction PK collision must surface as a storage failure"
-        );
-        assert!(
-            store.get_application(&app_id).await.unwrap().is_none(),
-            "fresh lifecycle insert must roll back with the failed admission"
-        );
-        assert!(
-            store
-                .get_operation(&app_id, &op_id)
-                .await
-                .unwrap()
-                .is_none(),
-            "no operation row may survive for this app"
-        );
-
-        // 清除碰撞源后重试成功（连接未被失败事务毒化）
-        let cleanup: Result<(), Error> = store
-            .run(|conn: &mut turso::Connection| {
-                Box::pin(async move {
-                    conn.execute(
-                        "DELETE FROM userapp_operations WHERE app_id='atomic-carrier'",
-                        (),
-                    )
-                    .await
-                    .map_err(storage)?;
-                    conn.execute(
-                        "DELETE FROM userapp_lifecycles WHERE app_id='atomic-carrier'",
-                        (),
-                    )
-                    .await
-                    .map_err(storage)?;
-                    Ok(TaskOut(Box::new(())))
-                })
-            })
-            .await;
-        cleanup.expect("remove carrier");
-        assert!(matches!(
-            store.admit(&req).await.expect("retry admission"),
-            shared_types::UserAppAdmissionOutcome::Accepted(_)
-        ));
-        store.shutdown().await.expect("shutdown");
-    }
-
-    /// 损坏数据反例：lifecycle 槽位指向不存在的操作 → 控制面快照必须
-    /// 报 InvalidOperation，不得把断链当成正常空闲状态展示。
-    #[tokio::test]
-    async fn turso_control_snapshot_rejects_broken_operation_link() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = std::path::absolute(dir.path().join("snap.turso.db")).expect("abs");
-        let store = TursoUserAppStore::open_exclusive(&path)
-            .await
-            .expect("open");
-        let mut identity = store
-            .ensure_identity("snapshot-corrupt")
-            .await
-            .expect("identity");
-        identity.active_operations.prod = Some("missing-operation".into());
-        let corrupt = serde_json::to_string(&identity).expect("record");
-        let inject: Result<(), Error> = store
-            .run(|conn: &mut turso::Connection| {
-                Box::pin(async move {
-                    use super::exec::text;
-                    conn.execute(
-                        "UPDATE userapp_lifecycles SET record=?2 WHERE app_id=?1",
-                        vec![text("snapshot-corrupt"), text(corrupt)],
-                    )
-                    .await
-                    .map_err(storage)?;
-                    Ok(TaskOut(Box::new(())))
-                })
-            })
-            .await;
-        inject.expect("inject broken link");
-        assert!(
-            matches!(
-                store.list_control_snapshots(None, 128).await,
-                Err(Error::InvalidOperation(_))
-            ),
-            "missing operation cannot appear as normal idle state"
-        );
-        store.shutdown().await.expect("shutdown");
-    }
-
-    /// 取消与遗留事务反例（worker 架构）：
-    /// ① 调用方在 body 执行中丢弃 future —— 任务已在队列，body 照常完成，
-    ///    结果丢弃，队列不卡死；
-    /// ② body 内开事务写入后返回错误（未终结）—— dangling 事务必须在
-    ///    下一条语句前回滚，半写状态不可见；
-    /// ③ 之后受理照常成功。
-    #[tokio::test]
-    async fn turso_cancelled_caller_and_dangling_transaction_do_not_leak() {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let dir = tempfile::tempdir().expect("dir");
-            let path = std::path::absolute(dir.path().join("cancel.turso.db")).expect("abs");
-            let store = TursoUserAppStore::open_exclusive(&path).await.expect("open");
-
-            let slow = store.run::<String>(|_conn: &mut turso::Connection| {
-                Box::pin(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                    Ok(TaskOut(Box::new("slow-done".to_string())))
-                })
-            });
-            // 任务已入队（body 睡眠中），调用方超时取消 —— 只取消等待，不中止 worker
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(50), slow)
-                    .await
-                    .is_err()
-            );
-
-            let dangling: Result<String, Error> = store
-                .run(|conn: &mut turso::Connection| {
-                    Box::pin(async move {
-                        use super::exec::{begin, text};
-                        let mut tx = begin(conn).await?;
-                        tx.exec(
-                            "INSERT INTO userapp_lifecycles(app_id,record) VALUES(?1,'{\"stub\":true}')",
-                            vec![text("dangling-app")],
-                        )
-                        .await?;
-                        Err(Error::InvalidOperation("injected dangling transaction".into()))
-                    })
-                })
-                .await;
-            assert!(dangling.is_err());
-            assert!(
-                store.get_application("dangling-app").await.unwrap().is_none(),
-                "dangling transaction must roll back before the next statement"
-            );
-
-            let request = shared_types::UserAppAdmission {
-                runtime_policy_on_success: None,
-                command: None,
-                metadata: None,
-                app_id: "contract-app".into(),
-                lifecycle_id: None,
-                operation_id: "cancelled".into(),
-                request_id: Some("cancelled".into()),
-                request_fingerprint: "a".repeat(64),
-                kind: shared_types::UserAppOperationKind::EnsureBuilder,
-            };
-            assert!(
-                store.get_application("contract-app").await.unwrap().is_none(),
-                "cancelled caller must leave no application state behind"
-            );
-            assert!(matches!(
-                store.admit(&request).await.expect("admission after cancel"),
-                shared_types::UserAppAdmissionOutcome::Accepted(_)
-            ));
-            store.shutdown().await.expect("shutdown");
-        })
-        .await
-        .expect("cancelled caller and dangling transaction must not leak");
-    }
-
-    /// 隔离只针对 Running/WaitingRetry：转 RecoveryRequired（revision+1 +
-    /// ERR_BACKEND_ERROR）；Pending 与终态不动；租约记录不清（不 steal
-    /// lease、不重放写）。
-    #[tokio::test]
-    async fn turso_restart_quarantines_only_interrupted_claims_without_replaying() {
-        use shared_types::UserAppLifecycleStore as _;
-        let dir = tempfile::tempdir().expect("dir");
-        let path = std::path::absolute(dir.path().join("quarantine.turso.db")).expect("abs");
-        let store = TursoUserAppStore::open_exclusive(&path)
-            .await
-            .expect("open");
-        let progress = |op: &UserAppOperationRecord, state: shared_types::UserAppOperationState| {
-            shared_types::UserAppOperationProgress {
-                app_id: op.app_id.clone(),
-                operation_id: op.operation_id.clone(),
-                lifecycle_id: op.lifecycle_id.clone(),
-                expected_revision: op.revision,
-                executor_id: "worker-A".into(),
-                state,
-                step: "quarantine-probe".into(),
-                checkpoint: serde_json::Value::Null,
-                error_code: None,
-                error_message: None,
-            }
-        };
-        async fn admit(store: &TursoUserAppStore, app: &str, op: &str) -> UserAppOperationRecord {
-            use shared_types::UserAppLifecycleStore as _;
-            let request = shared_types::UserAppAdmission {
-                runtime_policy_on_success: None,
-                command: None,
-                metadata: None,
-                app_id: app.into(),
-                lifecycle_id: None,
-                operation_id: op.into(),
-                request_id: Some(format!("req-{op}")),
-                request_fingerprint: "a".repeat(64),
-                kind: shared_types::UserAppOperationKind::Update,
-            };
-            match store.admit(&request).await.expect("admission") {
-                shared_types::UserAppAdmissionOutcome::Accepted(op) => op,
-                shared_types::UserAppAdmissionOutcome::Existing(op) => op,
-            }
-        }
-        let running = admit(&store, "quarantine-running", "op-running").await;
-        let running = store
-            .advance(&progress(
-                &running,
-                shared_types::UserAppOperationState::Running,
-            ))
-            .await
-            .expect("claim running");
-        let waiting = admit(&store, "quarantine-waiting", "op-waiting").await;
-        let waiting = store
-            .advance(&progress(
-                &waiting,
-                shared_types::UserAppOperationState::Running,
-            ))
-            .await
-            .expect("claim waiting");
-        let waiting = store
-            .advance(&progress(
-                &waiting,
-                shared_types::UserAppOperationState::WaitingRetry,
-            ))
-            .await
-            .expect("waiting retry");
-        let pending = admit(&store, "quarantine-pending", "op-pending").await;
-        let succeeded = admit(&store, "quarantine-done", "op-done").await;
-        let succeeded = store
-            .advance(&progress(
-                &succeeded,
-                shared_types::UserAppOperationState::Running,
-            ))
-            .await
-            .expect("claim done");
-        let succeeded = store
-            .advance(&progress(
-                &succeeded,
-                shared_types::UserAppOperationState::Succeeded,
-            ))
-            .await
-            .expect("done");
-        let before_pending = pending.clone();
-        let before_succeeded = succeeded.clone();
-        store.shutdown().await.expect("shutdown");
-        drop(store);
-
-        let reopened = TursoUserAppStore::open_exclusive(&path)
-            .await
-            .expect("reopen");
-        async fn quarantined(
-            store: &TursoUserAppStore,
-            app: &str,
-            op: &str,
-            before: UserAppOperationRecord,
-        ) {
-            use shared_types::UserAppLifecycleStore as _;
-            let record = store
-                .get_operation(app, op)
-                .await
-                .expect("read")
-                .expect("record");
-            assert_eq!(
-                record.state,
-                shared_types::UserAppOperationState::RecoveryRequired
-            );
-            assert_eq!(record.revision, before.revision + 1);
-            assert_eq!(
-                record.error_code.as_deref(),
-                Some(shared_types::error_codes::ERR_BACKEND_ERROR)
-            );
-        }
-        quarantined(&reopened, "quarantine-running", "op-running", running).await;
-        quarantined(&reopened, "quarantine-waiting", "op-waiting", waiting).await;
-        assert_eq!(
-            reopened
-                .get_operation("quarantine-pending", "op-pending")
-                .await
-                .expect("read pending")
-                .expect("pending record"),
-            before_pending,
-            "unclaimed pending operations must not be quarantined"
-        );
-        assert_eq!(
-            reopened
-                .get_operation("quarantine-done", "op-done")
-                .await
-                .expect("read done")
-                .expect("done record"),
-            before_succeeded,
-            "terminal operations must not be rewritten"
-        );
-        reopened.shutdown().await.expect("shutdown");
-    }
-
-    /// 反例：隔离扫描选中的在途记录损坏（serde 解析失败）→ 启动整体失败，
-    /// 不留部分隔离（其余可隔离记录原样保留）。
-    #[tokio::test]
-    async fn turso_invalid_interrupted_record_blocks_startup_without_partial_quarantine() {
-        use shared_types::UserAppLifecycleStore as _;
-        let dir = tempfile::tempdir().expect("dir");
-        let path = std::path::absolute(dir.path().join("corrupt.turso.db")).expect("abs");
-        let store = TursoUserAppStore::open_exclusive(&path)
-            .await
-            .expect("open");
-        let progress = |op: &UserAppOperationRecord| shared_types::UserAppOperationProgress {
-            app_id: op.app_id.clone(),
-            operation_id: op.operation_id.clone(),
-            lifecycle_id: op.lifecycle_id.clone(),
-            expected_revision: op.revision,
-            executor_id: "worker-A".into(),
-            state: shared_types::UserAppOperationState::Running,
-            step: "corrupt-probe".into(),
-            checkpoint: serde_json::Value::Null,
-            error_code: None,
-            error_message: None,
-        };
-        async fn admit(store: &TursoUserAppStore, app: &str, op: &str) -> UserAppOperationRecord {
-            use shared_types::UserAppLifecycleStore as _;
-            let request = shared_types::UserAppAdmission {
-                runtime_policy_on_success: None,
-                command: None,
-                metadata: None,
-                app_id: app.into(),
-                lifecycle_id: None,
-                operation_id: op.into(),
-                request_id: Some(format!("req-{op}")),
-                request_fingerprint: "a".repeat(64),
-                kind: shared_types::UserAppOperationKind::Update,
-            };
-            match store.admit(&request).await.expect("admission") {
-                shared_types::UserAppAdmissionOutcome::Accepted(op) => op,
-                shared_types::UserAppAdmissionOutcome::Existing(op) => op,
-            }
-        }
-        let victim = admit(&store, "corrupt-victim", "op-corrupt").await;
-        let _victim = store
-            .advance(&progress(&victim))
-            .await
-            .expect("claim victim");
-        let healthy = admit(&store, "corrupt-healthy", "op-healthy").await;
-        let healthy = store
-            .advance(&progress(&healthy))
-            .await
-            .expect("claim healthy");
-        let healthy_before = healthy.clone();
-        store.shutdown().await.expect("shutdown");
-        drop(store);
-
-        // 损坏 victim 记录：json_extract 仍选中（$.state=Running），serde 解析失败
-        let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-            .build()
-            .await
-            .expect("reopen engine");
-        let conn = db.connect().expect("connect");
-        conn.execute(
-            "UPDATE userapp_operations SET record='{\"state\":\"Running\",\"broken\":true}' \
-             WHERE operation_id='op-corrupt'",
-            (),
-        )
-        .await
-        .expect("corrupt");
-        drop(conn);
-        drop(db);
-
-        let result = TursoUserAppStore::open_exclusive(&path).await;
-        assert!(
-            result.is_err(),
-            "corrupted interrupted record must block startup"
-        );
-
-        // 无部分隔离：healthy 记录原样（直连引擎读——主实例已失败退出）
-        let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-            .build()
-            .await
-            .expect("inspect engine");
-        let conn = db.connect().expect("connect");
-        let stored: String = conn
-            .query(
-                "SELECT record FROM userapp_operations WHERE operation_id='op-healthy'",
-                (),
-            )
-            .await
-            .expect("select")
-            .next()
-            .await
-            .expect("row")
-            .expect("read")
-            .get_value(0)
-            .expect("column")
-            .as_text()
-            .expect("text")
-            .to_string();
-        let parsed: UserAppOperationRecord =
-            serde_json::from_str(&stored).expect("healthy record parses");
-        assert_eq!(
-            parsed, healthy_before,
-            "startup failure must not leave a partial quarantine"
-        );
-    }
-}
-#[cfg(test)]
-mod rows_affected_probe {
-    /// T0 探针：Turso execute 返回值语义（INSERT / ON CONFLICT DO NOTHING /
-    /// UPDATE / DELETE）——plan §4 要求实测，不能假定与 sqlx 等价。
-    #[tokio::test]
-    async fn turso_execute_rows_affected_semantics() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = std::path::absolute(dir.path().join("probe.turso.db")).expect("abs");
-        let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-            .build()
-            .await
-            .expect("db");
-        let conn = db.connect().expect("conn");
-        conn.execute_batch(
-            "CREATE TABLE t(id TEXT PRIMARY KEY, v INTEGER); INSERT INTO t VALUES('a',1);",
-        )
-        .await
-        .expect("schema");
-
-        // 普通 INSERT：应为 1
-        let inserted = conn
-            .execute("INSERT INTO t VALUES('b',2)", ())
-            .await
-            .expect("insert");
-        assert_eq!(inserted, 1, "plain INSERT rows_affected");
-
-        // ON CONFLICT DO NOTHING 且无冲突：应为 1（插入生效）
-        let inserted = conn
-            .execute("INSERT INTO t VALUES('c',3) ON CONFLICT(id) DO NOTHING", ())
-            .await
-            .expect("insert noc");
-        assert_eq!(
-            inserted, 1,
-            "ON CONFLICT DO NOTHING (no conflict) rows_affected"
-        );
-
-        // ON CONFLICT DO NOTHING 且有冲突：应为 0（未生效）
-        let skipped = conn
-            .execute("INSERT INTO t VALUES('a',9) ON CONFLICT(id) DO NOTHING", ())
-            .await
-            .expect("insert conflict");
-        assert_eq!(
-            skipped, 0,
-            "ON CONFLICT DO NOTHING (conflict) rows_affected"
-        );
-
-        // UPDATE 命中：应为 1
-        let updated = conn
-            .execute("UPDATE t SET v=10 WHERE id='a'", ())
-            .await
-            .expect("update");
-        assert_eq!(updated, 1, "UPDATE hit rows_affected");
-
-        // UPDATE 零命中：应为 0
-        let missed = conn
-            .execute("UPDATE t SET v=11 WHERE id='zzz'", ())
-            .await
-            .expect("update miss");
-        assert_eq!(missed, 0, "UPDATE miss rows_affected");
-
-        // DELETE 命中 / 零命中
-        let deleted = conn
-            .execute("DELETE FROM t WHERE id='b'", ())
-            .await
-            .expect("del");
-        assert_eq!(deleted, 1, "DELETE hit rows_affected");
-        let deleted = conn
-            .execute("DELETE FROM t WHERE id='zzz'", ())
-            .await
-            .expect("del miss");
-        assert_eq!(deleted, 0, "DELETE miss rows_affected");
-    }
-}
-
-#[cfg(test)]
-mod admit_isolation_probe {
-    use super::*;
-
-    /// 隔离 admit 的 VersionConflict 来源：手动执行完整 SQL 序列
-    /// （fresh app / Stop / 无重复请求）逐段检查 rows_affected。
-    #[tokio::test]
-    async fn turso_admit_manual_sql_sequence() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = std::path::absolute(dir.path().join("iso.turso.db")).expect("abs");
-        let (store, handle) = TursoUserAppStore::spawn_worker(&path).await.expect("spawn");
-        let detail: Result<String, Error> = store
-            .run(|conn: &mut turso::Connection| {
-                Box::pin(async move {
-                    use super::exec::{begin, text};
-                    let mut tx = begin(conn).await?;
-                    // ① INSERT lifecycle ON CONFLICT DO NOTHING（fresh）
-                    let inserted = tx
-                        .exec(
-                            "INSERT INTO userapp_lifecycles(app_id,record) VALUES(?1,?2) ON CONFLICT(app_id) DO NOTHING",
-                            vec![text("iso-app"), text("{}")],
-                        )
-                        .await?;
-                    assert_eq!(inserted, 1, "lifecycle insert");
-                    // ② 读回 locked
-                    let encoded = tx
-                        .opt_string(
-                            "SELECT record FROM userapp_lifecycles WHERE app_id=?1",
-                            vec![text("iso-app")],
-                        )
-                        .await?;
-                    assert!(encoded.is_some(), "locked readback");
-                    // ③ INSERT operation（terminal=0）
-                    let inserted = tx
-                        .exec(
-                            "INSERT INTO userapp_operations(operation_id,app_id,request_id,terminal,record) VALUES(?1,?2,?3,0,?4)",
-                            vec![text("iso-op"), text("iso-app"), text("iso-req"), text("{}")],
-                        )
-                        .await?;
-                    assert_eq!(inserted, 1, "operation insert");
-                    // ④ UPDATE lifecycle SET record（admit 的 CAS 段）
-                    let updated = tx
-                        .exec(
-                            "UPDATE userapp_lifecycles SET record=?2 WHERE app_id=?1",
-                            vec![text("iso-app"), text(r#"{"rev":1}"#)],
-                        )
-                        .await?;
-                    assert_eq!(updated, 1, "lifecycle update inside tx, got {updated}");
-                    // ⑤ INSERT alias ON CONFLICT DO NOTHING
-                    let aliased = tx
-                        .exec(
-                            "INSERT INTO userapp_operation_requests(app_id,request_id,operation_id) VALUES(?1,?2,?3) ON CONFLICT(app_id,request_id) DO NOTHING",
-                            vec![text("iso-app"), text("iso-req"), text("iso-op")],
-                        )
-                        .await?;
-                    assert_eq!(aliased, 1, "alias insert");
-                    tx.commit().await?;
-                    Ok(TaskOut(Box::new("manual sequence all ok".to_string())))
-                })
-            })
-            .await;
-        handle.shutdown.send(true).ok();
-        let message = detail.expect("manual admit SQL sequence");
-        assert_eq!(&*message, "manual sequence all ok");
     }
 }

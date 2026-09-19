@@ -94,19 +94,56 @@ pub fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
     shutdown_tx
 }
 
+/// R02：在途协调任务收束预算。预算耗尽时记录未完成数量后继续关库
+/// （不无限等待，也不强行清理不确定资源——留待重启恢复兜底）。
+const COORDINATION_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// 恢复扫描器自身的收束预算（recovery.rs RECOVERY_DRAIN_BUDGET）加余量。
+const RECOVERY_EXIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(35);
+
 pub async fn graceful_shutdown(
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     config: crate::config::AppConfig,
     runtime: Arc<dyn ContainerRuntime>,
     projects: Option<Arc<ProjectStoreBackend>>,
     userapp_store_control: Arc<dyn rcoder_storage::userapp_lifecycle::UserAppStoreControl>,
+    userapp_op_flight: Option<Arc<crate::userapp_builder::shutdown_gate::OperationFlightGate>>,
+    userapp_recovery: Option<tokio::task::JoinHandle<()>>,
 ) {
     let _ = shutdown_rx.recv().await;
 
     info!("starting graceful shutdown...");
 
-    // UserApp 控制存储关机（trait-design §6）：停接单 → 排空已接收事务 →
-    // 关连接 → 释放独占锁。失败不阻断其余清理，但必须显式记录。
+    // R02 关机顺序：先停业务生产者，等在途协调任务有界收束，最后关库。
+    // 排空数据库队列 ≠ 业务已结束——协调任务可能正在容器操作之间，
+    // 稍后要提交终态；先关库会把可提交的终态变成失败。
+
+    // 1) 恢复扫描器：停止发现新工作，等待其有界收束并退出
+    if let Some(recovery) = userapp_recovery {
+        match tokio::time::timeout(RECOVERY_EXIT_BUDGET, recovery).await {
+            Ok(_) => info!("[USERAPP_SHUTDOWN] recovery scanner exited"),
+            Err(_) => error!(
+                budget_secs = RECOVERY_EXIT_BUDGET.as_secs(),
+                "recovery scanner did not exit within budget; proceeding to close store"
+            ),
+        }
+    }
+
+    // 2) 在途协调任务（builder 创建/停止/重启等 spawn 工作器）有界收束
+    if let Some(gate) = userapp_op_flight {
+        let remaining = gate.wait_idle(COORDINATION_DRAIN_BUDGET).await;
+        if remaining > 0 {
+            error!(
+                remaining,
+                budget_secs = COORDINATION_DRAIN_BUDGET.as_secs(),
+                "userApp coordination tasks still in flight; closing store anyway (uncertain outcomes protected by restart quarantine)"
+            );
+        } else {
+            info!("[USERAPP_SHUTDOWN] coordination tasks drained");
+        }
+    }
+
+    // 3) UserApp 控制存储关机（trait-design §6）：停接单 → 排空已接收
+    // 事务 → 关连接 → 释放独占锁。失败不阻断其余清理，但必须显式记录。
     if let Err(error) = userapp_store_control.shutdown().await {
         error!(?error, "userApp control store shutdown incomplete");
     }

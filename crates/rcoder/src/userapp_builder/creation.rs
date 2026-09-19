@@ -88,7 +88,10 @@ fn spawn_operation(
     let worker_state = state.clone();
     let worker_record = record.clone();
     let instance = instance.to_string();
+    let flight_gate = state.userapp_op_flight.clone();
     let worker = tokio::spawn(async move {
+        // R02：在途协调任务门闸——关机时等待本任务收束后再关闭存储
+        let _flight = flight_gate.guard();
         let executor = uuid::Uuid::new_v4().to_string();
         let owned = worker_state.clone();
         let claimed_id = executor.clone();

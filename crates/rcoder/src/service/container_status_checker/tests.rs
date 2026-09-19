@@ -175,6 +175,10 @@ async fn test_state(runtime: Arc<ProbeRuntime>) -> (Arc<AppState>, tempfile::Tem
     let state = Arc::new(AppState {
         userapp_store: metadata_store.clone(),
         userapp_store_control: metadata_store,
+        userapp_op_flight: Arc::new(
+            crate::userapp_builder::shutdown_gate::OperationFlightGate::default(),
+        ),
+        userapp_recovery_handle: Arc::new(Mutex::new(None)),
         config: AppConfig::default(),
         projects: Arc::new(ProjectStoreBackend::Memory(Arc::new(adapter))),
         pingora_service: None,

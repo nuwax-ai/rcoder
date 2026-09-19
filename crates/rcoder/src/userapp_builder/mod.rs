@@ -14,6 +14,7 @@ mod dev_locator;
 mod lifecycle;
 mod recovery;
 pub(crate) mod retry;
+pub mod shutdown_gate;
 
 pub use dev_cleanup::UserappDevResourcesCleanup;
 pub use dev_locator::UserappDevLocator;
