@@ -292,23 +292,15 @@ async fn run() -> anyhow::Result<()> {
     // 则不监听 60000）。运行时启停经
     // /api/system/file-server/*（`rcoder file-server {start,stop,restart,status}`）。
     // 预览协调启用时：dev 生命周期 7 端点在所有策略下改路 Rust 上游（coordinated_dev_lifecycle）。
-    file_server_proxy::init(
-        bootstrap_result
-            .config
-            .file_server_proxy
-            .clone()
-            .map(|mut c| {
-                if preview_enabled {
-                    c.coordinated_dev_lifecycle = true;
-                }
-                c
-            })
-            .unwrap_or_else(|| file_server_proxy::FileServerProxyConfig {
-                rust_upstream_port: bootstrap_result.config.port,
-                coordinated_dev_lifecycle: preview_enabled,
-                ..file_server_proxy::FileServerProxyConfig::default()
-            }),
-    );
+    // N07 内嵌形态 env 通道（2026-09-19 线上事故治本）：config.yml 两条
+    // 构造路径此前都不读 FILE_SERVER_PROXY_PUBLIC_BIND——env 只对独立进程
+    // 形态生效，内嵌形态"env 设了却没用"。此处收口统一叠加（OR 语义，
+    // 与独立进程形态同词表"1"/"true"）。
+    file_server_proxy::init(file_server_embed::embedded_proxy_config(
+        bootstrap_result.config.file_server_proxy.clone(),
+        preview_enabled,
+        bootstrap_result.config.port,
+    ));
     if bootstrap_result.config.file_server_proxy.is_some() {
         // 同步 bind 语义：启动失败（如端口被占）此刻即报，不留到首个请求
         if let Err(e) = file_server_proxy::try_start().await {

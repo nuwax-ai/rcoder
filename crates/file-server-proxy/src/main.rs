@@ -241,9 +241,11 @@ async fn main() {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
-        public_bind_declared: std::env::var("FILE_SERVER_PROXY_PUBLIC_BIND")
-            .ok()
-            .is_some_and(|value| value == "1"),
+        public_bind_declared: FileServerProxyConfig::env_declares_public_bind(
+            std::env::var("FILE_SERVER_PROXY_PUBLIC_BIND")
+                .ok()
+                .as_deref(),
+        ),
         listen_port: settings.listen_port,
         rust_upstream_port: settings.rust_upstream_port,
         ts_upstream_port: settings.ts_upstream_port,

@@ -252,3 +252,116 @@ pub fn merged_router(
         coordinator,
     })
 }
+
+/// 60000 分流代理的内嵌配置构造（main.rs 收口点；2026-09-19 事故治本）。
+///
+/// 两条路径（config.yml 有段 map 分支 / 无段 default 兜底分支）统一在此
+/// 叠加 N07 受管声明 env `FILE_SERVER_PROXY_PUBLIC_BIND`（OR 语义：env 或
+/// config.yml 任一声明即放行，词表与独立进程形态共用 `"1"`/`"true"`）。
+/// 修复前内嵌形态只有 config.yml 一条声明通道——env 设了却没用。
+pub fn embedded_proxy_config(
+    section: Option<file_server_proxy::FileServerProxyConfig>,
+    preview_enabled: bool,
+    rcoder_port: u16,
+) -> file_server_proxy::FileServerProxyConfig {
+    let mut config = section
+        .map(|mut c| {
+            if preview_enabled {
+                c.coordinated_dev_lifecycle = true;
+            }
+            c
+        })
+        .unwrap_or_else(|| file_server_proxy::FileServerProxyConfig {
+            rust_upstream_port: rcoder_port,
+            coordinated_dev_lifecycle: preview_enabled,
+            ..file_server_proxy::FileServerProxyConfig::default()
+        });
+    config.apply_public_bind_env();
+    config
+}
+
+#[cfg(test)]
+mod embedded_config_tests {
+    use super::*;
+
+    /// env 变更测试串行锁（env 是进程全局——避免并行测试互踩）。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 测试专用 env 写入：Rust 2024 将 set_var/remove_var 标记 unsafe
+    /// （进程全局可变状态）。仅在串行锁内使用——豁免通道仅限测试模块
+    /// （workspace lint 注释明示；生产代码保持 deny unsafe）。
+    #[allow(unsafe_code)]
+    fn set_env(value: Option<&str>) {
+        // SAFETY: ENV_LOCK 保证同一时刻仅一个测试线程操作该 env；
+        // 被测构造函数在此期间同步读取，无并发读者窗口。
+        match value {
+            Some(v) => unsafe { std::env::set_var("FILE_SERVER_PROXY_PUBLIC_BIND", v) },
+            None => unsafe { std::env::remove_var("FILE_SERVER_PROXY_PUBLIC_BIND") },
+        }
+    }
+
+    /// 反例（修复前缺失）：内嵌构造路径 + env=1 → public_bind_declared==true。
+    #[test]
+    fn embedded_config_env_channel_declares_public_bind() {
+        let guard = ENV_LOCK.lock().unwrap();
+        set_env(Some("1"));
+        let config = embedded_proxy_config(None, false, 8086);
+        assert!(
+            config.public_bind_declared,
+            "env FILE_SERVER_PROXY_PUBLIC_BIND=1 必须对内嵌形态生效（修复前只有独立进程形态消费）"
+        );
+        drop(config);
+        drop(guard);
+    }
+
+    /// env 未设 + config 无键 → false（N07 安全默认不变）。
+    #[test]
+    fn embedded_config_without_env_keeps_n07_default() {
+        let guard = ENV_LOCK.lock().unwrap();
+        set_env(None);
+        let config = embedded_proxy_config(None, false, 8086);
+        assert!(
+            !config.public_bind_declared,
+            "无声明时保持 N07 默认（原生 standalone 安全语义不变）"
+        );
+        drop(config);
+        drop(guard);
+    }
+
+    /// config.yml 显式 true + env 未设 → true（OR 语义的 config 侧）。
+    #[test]
+    fn embedded_config_section_declaration_preserved_without_env() {
+        let guard = ENV_LOCK.lock().unwrap();
+        set_env(None);
+        let section = file_server_proxy::FileServerProxyConfig {
+            public_bind_declared: true,
+            ..file_server_proxy::FileServerProxyConfig::default()
+        };
+        let config = embedded_proxy_config(Some(section), false, 8086);
+        assert!(config.public_bind_declared);
+        drop(config);
+        drop(guard);
+    }
+
+    /// 词表边界："true"/"1" 放行；"0"/"false"/空串/其它不放行。
+    #[test]
+    fn embedded_config_env_word_list_boundaries() {
+        for (value, expect) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            (" 1 ", true),
+            ("0", false),
+            ("false", false),
+            ("", false),
+            ("yes", false),
+        ] {
+            assert_eq!(
+                file_server_proxy::FileServerProxyConfig::env_declares_public_bind(Some(value)),
+                expect,
+                "value={value:?}"
+            );
+        }
+        assert!(!file_server_proxy::FileServerProxyConfig::env_declares_public_bind(None));
+    }
+}

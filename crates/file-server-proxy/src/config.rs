@@ -163,6 +163,29 @@ pub fn is_coordinated_dev_path(path: &str) -> bool {
 }
 
 impl FileServerProxyConfig {
+    /// N07 受管声明 env 词表（独立进程形态与 rcoder 内嵌形态共用）：
+    /// `"1"` / `"true"`（trim、大小写不敏感）→ 声明；其余（含 `"0"`、
+    /// `"false"`、空串、未设）→ 不声明。
+    pub fn env_declares_public_bind(value: Option<&str>) -> bool {
+        value.is_some_and(|raw| {
+            let trimmed = raw.trim();
+            trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+        })
+    }
+
+    /// 叠加 env 声明（OR 语义）：`FILE_SERVER_PROXY_PUBLIC_BIND` 声明即
+    /// 置 true；未声明保持原值（config.yml 显式 true 不被 env 缺席覆盖）。
+    pub fn apply_public_bind_env(&mut self) {
+        let declared = Self::env_declares_public_bind(
+            std::env::var("FILE_SERVER_PROXY_PUBLIC_BIND")
+                .ok()
+                .as_deref(),
+        );
+        if declared {
+            self.public_bind_declared = true;
+        }
+    }
+
     /// 分流规则纯函数（按 [`RoutePolicy`] 分派）：
     /// - [`RoutePolicy::TsFirst`]：`/api/v1/userapp*` 前缀或
     ///   `x-service-type: userapp` header（任一命中）→ Rust 上游，其余 → TS 上游

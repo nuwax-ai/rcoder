@@ -193,10 +193,19 @@ mod tests {
             "second instance must be rejected while the directory lock is held"
         );
         drop(store);
-        let restored = config
-            .open(app_manager::AppAccessMode::Docker, &pg)
-            .await
-            .unwrap();
+        // R01 修正后的不变量：目录锁在 worker 线程内、随线程退出释放——
+        // Drop 只发信号不 join，锁释放是"线程退出后"而非"结构体 Drop 后"
+        // 同步完成。立即重开需容忍短暂的异步收束窗口（有界轮询）。
+        let restored = loop {
+            match config.open(app_manager::AppAccessMode::Docker, &pg).await {
+                Ok(opened) => break opened,
+                Err(error) if format!("{error:#}").contains("lock acquisition failed") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(error) => panic!("reopen after drop must succeed: {error:#}"),
+            }
+        };
         assert_eq!(
             restored.store.get_application("config-app").await.unwrap(),
             Some(before)
