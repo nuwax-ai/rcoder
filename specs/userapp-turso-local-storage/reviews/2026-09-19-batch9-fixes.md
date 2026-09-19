@@ -42,7 +42,7 @@ Compose 场景（容器内 dev-hot 重编全部修复后的二进制）：
 | scope_isolation_during_deploy | **PASS** | 两层修复：进程锁结构化 blocker（abe2e2e3）+ required 契约步补实现（fdf1f486） |
 | two_users_share_app | **PASS** | 根因=环境残留：2026-09-16 的 bad-app-id builder 容器（lifecycle 标签冲突）。清理该确认属测试的残留容器后通过 |
 | compose_regression | **FAIL（根因已精确诊断，修复待下一批）** | 见下 |
-| deploy_full_chain | 复跑中 | 结果追加 |
+| deploy_full_chain | **FAIL（分层定位中）** | 分层证据：容器已创建 ✓；07:57:41 首次部署"orchestration started"后 pingap :9080 ConnectRefused（启动中正常）；07:58:12（31s 后）测试 upload 成功但 list/delete 打 file-server :60000 仍"error sending request"（连接层失败，非 N07 认证 401/403）；07:59:06 热部署"pod kept"完成。疑点：deploy_wait 在应用编排未就绪窗口返回，或 prod app-cli 启动慢于测试步进——待容器 app-cli 日志取证 |
 
 ## 三、compose_regression flock 根因（同进程重入，非泄漏）
 
