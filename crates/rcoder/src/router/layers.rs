@@ -53,13 +53,15 @@ pub(super) fn apply_global_middleware(
         .layer(axum::middleware::from_fn(locale_context_middleware))
 }
 
-/// 安全响应头五连（覆盖全部路由面，包括 internal / file-server）。
+/// Axum 安全响应头（包括 internal / file-server，不作用于独立 Pingora 入口）。
 pub(super) fn apply_security_headers(router: Router) -> Router {
     router
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            axum::http::header::HeaderName::from_static("x-frame-options"),
-            axum::http::HeaderValue::from_static("DENY"),
-        ))
+        // RCoder 经 Java 服务对外提供访问，iframe 嵌入策略由对外服务统一控制。
+        // 暂停全局注入 DENY，避免该响应头随转发阻止业务页面嵌入。
+        // .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+        //     axum::http::header::HeaderName::from_static("x-frame-options"),
+        //     axum::http::HeaderValue::from_static("DENY"),
+        // ))
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             axum::http::header::HeaderName::from_static("x-content-type-options"),
             axum::http::HeaderValue::from_static("nosniff"),
