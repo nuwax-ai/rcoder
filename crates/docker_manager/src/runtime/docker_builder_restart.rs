@@ -487,10 +487,27 @@ impl DockerRuntime {
                 name: Some(original.name.clone()),
                 platform: self.inner.config.default_platform.clone(),
             };
-            let created = client
-                .create_container(Some(options), body)
-                .await
-                .map_err(|error| fail(format!("Create replacement builder: {error}")))?;
+            // A container mid-removal still owns its name: creation 409s with
+            // "name already in use". The daemon finishes auto-remove quickly;
+            // wait it out bounded instead of failing the whole restart.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let created = loop {
+                match client
+                    .create_container(Some(options.clone()), body.clone())
+                    .await
+                {
+                    Ok(created) => break created,
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 409,
+                        message,
+                    }) if message.contains("already in use")
+                        && std::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
+                    Err(error) => return Err(fail(format!("Create replacement builder: {error}"))),
+                }
+            };
             if created.id.is_empty() {
                 return Err(fail("Replacement builder create returned no physical ID"));
             }
