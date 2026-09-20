@@ -2368,12 +2368,20 @@ async fn userapp_scope_isolation_during_deploy() {
         && dra_b["success"].as_bool().unwrap_or(false)
         && drb_s.is_success()
         && drb_b["success"].as_bool().unwrap_or(false);
-    // 恰一胜者：A 成功 + B 结构化冲突，或时序上两路都成功（第二路赶上
-    // 第一路完成后的窗口——此时胜者仍是"恰一"语义的时序边界，不算失败
-    // 只要求无假 409）
+    // 两路并发自 tokio::spawn，受理顺序不保证——对称接受任一侧胜出：
+    // a_conflict = A 409 + blocker.scope=Dev（B 先落地）。
+    let a_conflict = dra_s.is_success()
+        && dra_b["code"].as_str() == Some("ERR_CONFLICT")
+        && dra_b["blocker"]["scope"].as_str() == Some("Dev");
+    // 恰一胜者：一侧成功 + 另一侧结构化冲突，或时序上两路都成功（第二路
+    // 赶上第一路完成后的窗口——此时胜者仍是"恰一"语义的时序边界，不算
+    // 失败只要求无假 409）
     report.assert_hard(
         "同域并发 restart → 恰一胜者 + 败者 409 带 blocker.scope=Dev",
-        (a_ok && b_conflict) || b_winner,
+        (a_ok && b_conflict) || (a_conflict
+            && drb_s.is_success()
+            && drb_b["success"].as_bool().unwrap_or(false))
+            || b_winner,
         format!(
             "A: HTTP {dra_s}, body 截断: {} | B: HTTP {drb_s}, body 截断: {}",
             trunc(&dra_b, 200),
