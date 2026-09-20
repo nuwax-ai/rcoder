@@ -249,13 +249,52 @@ impl DockerRuntime {
         }
         let config = config_of(&inspect)?;
         let host = inspect.host_config.as_ref();
+        let host = inspect.host_config.as_ref();
+        // Bind specifications live either in the legacy `Binds` strings or as
+        // structured `Mounts` entries (the ContainerConfigBuilder path). Replay
+        // needs one canonical form; both describe the same host bind sources.
+        let mut binds = host.and_then(|h| h.binds.clone()).unwrap_or_default();
+        if binds.is_empty() {
+            binds = host
+                .and_then(|h| h.mounts.as_ref())
+                .into_iter()
+                .flatten()
+                .filter(|mount| mount.typ == Some(bollard::models::MountType::BIND))
+                .map(|mount| {
+                    let source = mount.source.clone().unwrap_or_default();
+                    let target = mount.target.clone().unwrap_or_default();
+                    match mount.read_only {
+                        Some(true) => format!("{source}:{target}:ro"),
+                        _ => format!("{source}:{target}"),
+                    }
+                })
+                .collect();
+        }
+        if binds.is_empty() {
+            // Last resort: the daemon-resolved mount table. It carries no
+            // option flags, but the resolved host sources are authoritative.
+            binds = inspect
+                .mounts
+                .iter()
+                .flatten()
+                .filter(|mount| mount.typ.as_deref() == Some("bind"))
+                .filter_map(|mount| {
+                    let source = mount.source.as_deref()?;
+                    let target = mount.destination.as_deref()?;
+                    if source.is_empty() || target.is_empty() {
+                        return None;
+                    }
+                    Some(format!("{source}:{target}"))
+                })
+                .collect();
+        }
         let archive = Archive {
             source: target.clone(),
             image: config
                 .image
                 .clone()
                 .ok_or_else(|| conflict("Builder image is missing from inspect"))?,
-            binds: host.and_then(|h| h.binds.clone()).unwrap_or_default(),
+            binds,
             network_mode: host
                 .and_then(|h| h.network_mode.clone())
                 .unwrap_or_default(),
