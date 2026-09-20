@@ -2731,17 +2731,30 @@ async fn initialize_startup(
             // proves the previous orchestration processes are gone, so this is
             // a new explicit attempt, not an in-process retry loop. The failed
             // operation itself stays failed in deploy status — recovery here
-            // never rewrites that historical outcome.
-            state
+            // never rewrites that historical outcome. A same-scope restart
+            // (app-cli crashed and the supervisor restarted it while the
+            // container lived) cannot prove the old processes stopped: park in
+            // Failed like before instead of erroring into a recovery hold.
+            let fresh = state
                 .journal
                 .lock()
                 .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
                 .as_ref()
                 .context("deployment journal missing")?
-                .require_fresh_process_scope()?;
+                .require_fresh_process_scope()
+                .is_ok();
+            if fresh {
+                state.set_release(release);
+                state.set_phase(ServerPhase::Orchestrating);
+                return Ok(Some(InitialAction::Existing));
+            }
             state.set_release(release);
-            state.set_phase(ServerPhase::Orchestrating);
-            return Ok(Some(InitialAction::Existing));
+            state.set_phase(ServerPhase::Failed(
+                receipt.operation.error.clone().unwrap_or_else(|| {
+                    "Business startup failed; restart the container for an explicit start".into()
+                }),
+            ));
+            return Ok(None);
         }
         if receipt.boundary == Boundary::Preparing
             && receipt.operation.phase != AppCliDeployPhase::Failed

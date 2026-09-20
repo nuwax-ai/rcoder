@@ -494,3 +494,17 @@ supervisord 启动阶段的控制消费尚未补齐；历史未知写核验等�
 - K8s dev Restart 在停止前私有归档原模板与卷身份；公开操作只持有引用。
 - 停止后控制器丢失时，普通执行与 stopped 恢复入口可重建零副本控制器，检查 PVC、按原控制操作 CAS 继续启动。
 - 尚缺：请求前已缺控制器且无历史归档、Docker 与 prod 对等路径、归档回收。未新增或执行测试。
+
+## 2026-09-21：R1–R6 收束（Claude 会话，编译级验证）
+
+按 next-round-handoff 审计顺序完成的实现（详见 verification.md 2026-09-20/21 各批；测试按用户阶段约束统一延后）：
+
+- [x] R1 Restart 缺控制器重建：Docker dev（归档/停态重建/卷见证/save_stop 修复）+ K8s prod（Deployment 归档/零副本恢复/内联 GC）；Docker prod 维持 fail-closed（凭据不落盘，错误指向再部署/接管）。
+- [x] R2a prod 创建已提交未记账：操作身份五元组核验采纳（两后端）。
+- [x] R2b/N1 回执族 GC：创建/取消回执终态清扫 + stop/start 回执文件挂租约释放。
+- [x] R5 旧版本 wake 锁：runtime 启动回执证据收束（legacy 终结），未确认保持保护。
+- [x] R3 prod 物理接管：/prod/adopt 全链（K8s 注解盖章 / Docker store binding）；binding 感知捕获覆盖 compute_control 7 处 + app_manager 12 处。
+- [x] R4 hot_execution 成功侧收束 + converging 终结链（双证据序）。
+- [x] R6 java-compute-control.md 补 Docker 分支与四项新恢复入口。
+- [x] Qoder 遗留：StartupFailed 显式恢复已确认制品（Stop 后 Start 拉起业务，fresh-scope 护栏）。
+- [ ] T7/T8/T9（测试/部署/发布验收）：等用户统一测试阶段——Compose test-e2e、remote-k8s 套件、app129 恢复入口实测均未执行。
