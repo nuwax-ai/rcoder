@@ -209,7 +209,27 @@ fn inspect_absent(
     what: &str,
 ) -> Result<Option<bollard::models::ContainerInspectResponse>> {
     match result {
-        Ok(inspect) => Ok(Some(inspect)),
+        Ok(inspect) => {
+            // Auto-remove deletion is asynchronous: a container answering
+            // inspect while removing/dead can never be started again and its
+            // UID can never come back — it is already absent for every
+            // restart/restore decision.
+            let removing = inspect.state.as_ref().is_some_and(|state| {
+                state.dead == Some(true)
+                    || state.status.as_ref().is_some_and(|status| {
+                        matches!(
+                            status,
+                            bollard::models::ContainerStateStatusEnum::REMOVING
+                                | bollard::models::ContainerStateStatusEnum::DEAD
+                        )
+                    })
+            });
+            if removing {
+                Ok(None)
+            } else {
+                Ok(Some(inspect))
+            }
+        }
         Err(bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
         }) => Ok(None),
