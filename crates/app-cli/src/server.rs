@@ -1971,7 +1971,7 @@ fn prepare_generation_handoff(args: &RuntimeArgs, state: &ServerState) -> Result
         .runtime_kernel()
         .context("handoff requires runtime kernel")?;
     anyhow::ensure!(
-        !kernel.recovery_protection_active(),
+        !kernel.recovery_protection_active() && !state.runtime_recovery_hold_active(),
         "handoff blocked by runtime recovery"
     );
     let (desired, revision) = kernel.store().load_desired()?;
@@ -1987,6 +1987,12 @@ fn prepare_generation_handoff(args: &RuntimeArgs, state: &ServerState) -> Result
         .clone()
         .context("handoff requires confirmed active artifact")?;
     let replay = receipt.generation == state.generation;
+    if replay && gate.activated()? {
+        // Same-generation recovery still passes restored_runtime_args, migration
+        // and journal boundary checks below. This only consumes the historical
+        // handoff; it grants neither a new generation nor a new start intent.
+        return Ok(());
+    }
     let prior = receipt.generation_handoff.clone();
     if replay {
         anyhow::ensure!(
@@ -3639,7 +3645,7 @@ format = "jsonl"
             );
             assert_eq!(
                 restored_runtime_args(&args, &state).unwrap().workspace,
-                args.workspace.join(".run")
+                args.workspace.join(".run").canonicalize().unwrap()
             );
             assert_eq!(
                 std::fs::read(args.workspace.join(".run/release.lock.toml")).unwrap(),
@@ -3665,9 +3671,186 @@ format = "jsonl"
         }
     }
 
+    #[tokio::test]
+    async fn activated_handoff_is_consumed_after_hot_deploy_and_later_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let (args, state) = handoff_fixture(root.path(), false);
+        prepare_generation_handoff(&args, &state).unwrap();
+        let gate = state.configuration_gate().unwrap();
+        gate.activate(&gate.handoff().unwrap().activation).unwrap();
+        // A later hot deployment replaces the operation receipt but preserves the
+        // physical generation. Its startup must not demand the old artifact hash.
+        {
+            let mut guard = state.journal.lock().unwrap();
+            let journal = guard.as_mut().unwrap();
+            let mut receipt = journal.receipt.clone().unwrap();
+            receipt.generation_handoff = None;
+            receipt.operation.operation_id = "later-hot-operation".into();
+            receipt.active.as_mut().unwrap().artifact_release_id = "later-hot-artifact".into();
+            journal.write(receipt).unwrap();
+        }
+        std::fs::write(
+            args.workspace.join(".run/release.lock.toml"),
+            toml::to_string(&release("later-hot-artifact")).unwrap(),
+        )
+        .unwrap();
+        state
+            .runtime_kernel()
+            .unwrap()
+            .store()
+            .store_desired(shared_types::DesiredState::Stopped, 9)
+            .unwrap();
+        assert!(initialize_startup(&args, &state).await.unwrap().is_none());
+        assert_eq!(
+            state
+                .journal
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .receipt
+                .as_ref()
+                .unwrap()
+                .boundary,
+            Boundary::Active
+        );
+        assert_eq!(
+            state
+                .runtime_kernel()
+                .unwrap()
+                .store()
+                .load_desired()
+                .unwrap(),
+            (shared_types::DesiredState::Stopped, 9)
+        );
+    }
+
+    #[tokio::test]
+    async fn consumed_handoff_reopened_owner_exposes_readonly_ack_and_idempotent_activation() {
+        let root = tempfile::tempdir().unwrap();
+        let (args, first) = handoff_fixture(root.path(), false);
+        prepare_generation_handoff(&args, &first).unwrap();
+        let authorization = first
+            .configuration_gate()
+            .unwrap()
+            .handoff()
+            .unwrap()
+            .clone();
+        first
+            .configuration_gate()
+            .unwrap()
+            .activate(&authorization.activation)
+            .unwrap();
+        first
+            .runtime_kernel()
+            .unwrap()
+            .store()
+            .store_desired(shared_types::DesiredState::Stopped, 9)
+            .unwrap();
+        drop(first);
+        // New process-local caches; only journal/activation/desired survive.
+        let mut reopened = state();
+        reopened.generation = authorization.activation.deployment_generation.clone();
+        reopened.configuration_gate = Some(Arc::new(
+            crate::configuration_gate::ConfigurationGate::for_handoff(
+                root.path().into(),
+                authorization.clone(),
+            ),
+        ));
+        *reopened.journal.lock().unwrap() = Some(Journal::open(&args.workspace).unwrap());
+        reopened.set_runtime_kernel(kernel_for(root.path()));
+        reopened
+            .control_token
+            .set("handoff-test-token".into())
+            .unwrap();
+        assert!(
+            initialize_startup(&args, &reopened)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(reopened.configuration_gate().unwrap().prepared().is_none());
+        let reopened = Arc::new(reopened);
+        let (listener, router) = crate::api::bind(
+            "127.0.0.1:0",
+            args.workspace.clone(),
+            root.path().join("logs"),
+            "unused".into(),
+            reopened.clone(),
+        )
+        .await
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let client = reqwest::Client::new();
+        let observation: serde_json::Value = client
+            .get(format!(
+                "http://{address}/v1/runtime/configuration/prepared"
+            ))
+            .header("x-deploy-token", "handoff-test-token")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(observation["data"]["activated"], true);
+        assert_eq!(
+            observation["data"]["authorization"],
+            serde_json::to_value(&authorization).unwrap()
+        );
+        let ack: serde_json::Value = client
+            .post(format!(
+                "http://{address}/v1/runtime/configuration/activate"
+            ))
+            .header("x-deploy-token", "handoff-test-token")
+            .json(&authorization.activation)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(ack["data"]["activated"], true);
+        assert_eq!(
+            reopened
+                .runtime_kernel()
+                .unwrap()
+                .store()
+                .load_desired()
+                .unwrap(),
+            (shared_types::DesiredState::Stopped, 9)
+        );
+        assert_eq!(
+            reopened
+                .journal
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .receipt
+                .as_ref()
+                .unwrap()
+                .boundary,
+            Boundary::Active
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
     fn configuration_handoff_refuses_unknown_boundary_wrong_generation_or_changed_manifest() {
-        for fault in ["switching", "generation", "artifact", "migration"] {
+        for fault in [
+            "switching",
+            "generation",
+            "artifact",
+            "migration",
+            "recovery",
+        ] {
             let root = tempfile::tempdir().unwrap();
             let (args, state) = handoff_fixture(root.path(), false);
             {
@@ -3681,6 +3864,7 @@ format = "jsonl"
                         receipt.active.as_mut().unwrap().artifact_release_id =
                             "wrong-release".into()
                     }
+                    "recovery" => state.begin_runtime_recovery_hold(),
                     "migration" => {
                         let receipts = args.workspace.join("migration-receipts");
                         std::fs::create_dir_all(&receipts).unwrap();

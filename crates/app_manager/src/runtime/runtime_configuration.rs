@@ -193,8 +193,20 @@ impl AppService {
             .bind_runtime_configuration_target(context, captured.config_version, &target)
             .await?;
         let activation = async {
-            self.verify_generation_handoff(context, &target, captured.config_version, deadline)
+            let already_activated = self
+                .verify_generation_handoff(context, &target, captured.config_version, deadline)
                 .await?;
+            if already_activated {
+                if captured.credentials != CredentialApplicationState::Applied {
+                    return Err(AppOperationError::InvalidState(
+                        "Durable activation conflicts with captured credential evidence".into(),
+                    ));
+                }
+                // Same original operation and physical target, after an owner
+                // restart: only observe readiness. Never repeat credential writes
+                // or issue another startup request using consumed authorization.
+                return Ok(());
+            }
             let admin = self
                 .wait_for_configuration_postgres(context, &target, deadline)
                 .await?;
@@ -219,7 +231,7 @@ impl AppService {
         target: &shared_types::RuntimeConfigurationTarget,
         config_version: i64,
         deadline: tokio::time::Instant,
-    ) -> AppResult<()> {
+    ) -> AppResult<bool> {
         use shared_types::PgCommandRunner as _;
         let operation = self
             .metadata
@@ -230,7 +242,7 @@ impl AppService {
                 AppOperationError::InvalidState("Configuration operation is missing".into())
             })?;
         let Some(value) = operation.checkpoint.get("generation_handoff") else {
-            return Ok(());
+            return Ok(false);
         };
         let expected: shared_types::RuntimeGenerationHandoff =
             serde_json::from_value(value.clone()).map_err(|_| {
@@ -287,6 +299,22 @@ impl AppService {
                     .await;
                     continue;
                 }
+                if envelope["success"] == true && envelope["data"]["activated"] == true {
+                    let acknowledged: shared_types::RuntimeGenerationHandoff =
+                        serde_json::from_value(envelope["data"]["authorization"].clone()).map_err(
+                            |_| {
+                                AppOperationError::InvalidState(
+                                    "Malformed consumed handoff identity".into(),
+                                )
+                            },
+                        )?;
+                    if acknowledged != expected {
+                        return Err(AppOperationError::InvalidState(
+                            "Consumed handoff identity mismatch".into(),
+                        ));
+                    }
+                    return Ok(true);
+                }
                 let prepared: shared_types::RuntimeGenerationPrepared =
                     serde_json::from_value(envelope["data"].clone()).map_err(|_| {
                         AppOperationError::InvalidState(
@@ -307,7 +335,7 @@ impl AppService {
                         "Generation handoff preparation evidence mismatch".into(),
                     ));
                 }
-                return Ok(());
+                return Ok(false);
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(AppOperationError::InvalidState("Generation handoff did not confirm before credential mutation; original operation remains protected".into()));
@@ -647,5 +675,236 @@ fn configuration_commit_unknown(error: shared_types::UserAppStoreError) -> AppOp
     AppOperationError::CredentialApplication {
         message: format!("Credential application state could not be confirmed: {error}"),
         mutation: CredentialMutationEvidence::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn handoff_identity_failure_or_disconnect_never_reaches_pg() {
+        for fault in [
+            "wrong-operation",
+            "wrong-physical-source",
+            "rejected",
+            "disconnect",
+            "consumed",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = Arc::new(crate::test_support::MockRuntime::default());
+            let mut service = crate::test_support::test_service(root.path(), runtime.clone()).await;
+            service.config.access_mode = crate::config::AppAccessMode::Kubernetes;
+            let app_id = "handofftest";
+            let identity = service
+                .metadata
+                .store
+                .ensure_identity(app_id)
+                .await
+                .unwrap();
+            service
+                .runtime_configuration
+                .save_runtime_configuration(
+                    app_id,
+                    shared_types::UserAppOperationScope::Prod,
+                    &shared_types::SaveRuntimeConfigurationRequest {
+                        lifecycle_id: identity.lifecycle_id.clone(),
+                        request_id: "save".into(),
+                        expected_revision: 0,
+                        pg: StartPgCredential {
+                            username: "business".into(),
+                            password: "test-password".into(),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            let guard = service
+                .try_acquire_process_release_lock(app_id)
+                .await
+                .unwrap();
+            let mut operation = crate::service::OwnedOperation::admit(
+                service.metadata.store.clone(),
+                shared_types::UserAppAdmission {
+                    app_id: app_id.into(),
+                    lifecycle_id: Some(identity.lifecycle_id.clone()),
+                    operation_id: "handoff-operation".into(),
+                    request_id: None,
+                    request_fingerprint: "a".repeat(64),
+                    kind: shared_types::UserAppOperationKind::StartDeployment,
+                    command: None,
+                    metadata: None,
+                    runtime_policy_on_success: None,
+                },
+            )
+            .await
+            .unwrap();
+            operation.bind_lease(&guard).await.unwrap();
+            let context = operation.execution_context();
+            let authorization = shared_types::RuntimeGenerationHandoff {
+                protocol_version: 1,
+                app_id: app_id.into(),
+                lifecycle_id: identity.lifecycle_id.clone(),
+                previous_generation: "old-generation".into(),
+                previous_resource_uid: "old-physical-uid".into(),
+                previous_resource_name: "old-workload".into(),
+                activation: shared_types::RuntimeConfigurationActivation {
+                    operation_id: context.operation_id.clone(),
+                    deployment_generation: context.operation_id.clone(),
+                    config_version: 1,
+                },
+            };
+            operation
+                .checkpoint(
+                    "runtime_updated",
+                    serde_json::json!({"generation_handoff":authorization}),
+                )
+                .await
+                .unwrap();
+            service
+                .metadata
+                .store
+                .bind_operation_deadline(
+                    app_id,
+                    &context.operation_id,
+                    &context.lifecycle_id,
+                    chrono::Utc::now().timestamp_millis() + 1_000,
+                )
+                .await
+                .unwrap();
+            if fault == "consumed" {
+                let target = service
+                    .runtime
+                    .capture_app_configuration_target(&context, &context.operation_id)
+                    .await
+                    .unwrap();
+                service
+                    .runtime_configuration
+                    .bind_runtime_configuration_target(&context, 1, &target)
+                    .await
+                    .unwrap();
+                service
+                    .runtime_configuration
+                    .record_runtime_configuration_result(
+                        &context,
+                        1,
+                        &target,
+                        CredentialApplicationState::Applying,
+                        BusinessStartupState::NotStarted,
+                    )
+                    .await
+                    .unwrap();
+                service
+                    .runtime_configuration
+                    .record_runtime_configuration_result(
+                        &context,
+                        1,
+                        &target,
+                        CredentialApplicationState::Applied,
+                        BusinessStartupState::Starting,
+                    )
+                    .await
+                    .unwrap();
+                service
+                    .runtime_configuration
+                    .record_runtime_configuration_result(
+                        &context,
+                        1,
+                        &target,
+                        CredentialApplicationState::Applied,
+                        BusinessStartupState::Unknown,
+                    )
+                    .await
+                    .unwrap();
+                runtime.configuration_replies.lock().unwrap().extend([
+                    serde_json::json!({"success":true,"data":{"activated":true,"authorization":authorization}}).to_string(),
+                    serde_json::json!({"status":"ready","phase":"running"}).to_string(),
+                ].into_iter().map(|stdout| container_runtime_api::ExecResult { exit_code: 0, stdout, stderr: String::new() }));
+                service
+                    .complete_cold_runtime_configuration(&context)
+                    .await
+                    .unwrap();
+                let commands = runtime.configuration_commands.lock().unwrap().clone();
+                assert_eq!(commands.len(), 2);
+                assert!(
+                    commands[0]
+                        .last()
+                        .unwrap()
+                        .contains("/configuration/prepared")
+                );
+                assert!(commands[1].last().unwrap().ends_with("/ready"));
+                drop(commands);
+                let capture = service
+                    .runtime_configuration
+                    .operation_runtime_configuration(&context)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(capture.credentials, CredentialApplicationState::Applied);
+                assert_eq!(capture.business, BusinessStartupState::Ready);
+                continue;
+            }
+            let mut prepared = shared_types::RuntimeGenerationPrepared {
+                authorization,
+                artifact_release_id: "hot-b".into(),
+                release_manifest_sha256: "a".repeat(64),
+                previous_journal_sha256: "b".repeat(64),
+                execution_workspace: "/app/code/.run".into(),
+                desired_revision: 2,
+            };
+            match fault {
+                "wrong-operation" => {
+                    prepared.authorization.activation.operation_id = "other".into()
+                }
+                "wrong-physical-source" => {
+                    prepared.authorization.previous_resource_uid = "replacement-impostor".into()
+                }
+                _ => {}
+            }
+            runtime.configuration_replies.lock().unwrap().push_back(
+                container_runtime_api::ExecResult {
+                    exit_code: match fault {
+                        "rejected" => 22,
+                        "disconnect" => 7,
+                        _ => 0,
+                    },
+                    stdout: serde_json::json!({"success":true,"data":prepared}).to_string(),
+                    stderr: String::new(),
+                },
+            );
+            assert!(
+                service
+                    .complete_cold_runtime_configuration(&context)
+                    .await
+                    .is_err(),
+                "{fault}"
+            );
+            let commands = runtime.configuration_commands.lock().unwrap().clone();
+            assert!(!commands.is_empty());
+            assert!(
+                commands
+                    .iter()
+                    .all(|command| command.last().unwrap().contains("/configuration/prepared")),
+                "{fault}"
+            );
+            drop(commands);
+            let capture = service
+                .runtime_configuration
+                .operation_runtime_configuration(&context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                capture.credentials,
+                CredentialApplicationState::Captured,
+                "{fault}"
+            );
+            assert_eq!(
+                capture.business,
+                BusinessStartupState::NotStarted,
+                "{fault}"
+            );
+        }
     }
 }

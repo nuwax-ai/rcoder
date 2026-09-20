@@ -57,7 +57,11 @@ impl Relay {
                 }
             }
         });
-        Self { port: listen_port, discard_responses: discard, task }
+        Self {
+            port: listen_port,
+            discard_responses: discard,
+            task,
+        }
     }
 }
 
@@ -66,13 +70,17 @@ async fn await_flag(election: &PgLeaderElection, expected: bool) {
         while election.is_leader() != expected {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }).await.expect("leadership must converge within real heartbeat budget");
+    })
+    .await
+    .expect("leadership must converge within real heartbeat budget");
 }
 
 #[tokio::test]
 #[ignore = "requires the run-owned PostgreSQL fault fixture"]
 async fn dedicated_leader_session_closes_after_shutdown_cancel_disconnect_and_timeout() {
-    let dsn = crate::pg::test_support::test_dsn().await.expect("disposable PG DSN required");
+    let dsn = crate::pg::test_support::test_dsn()
+        .await
+        .expect("disposable PG DSN required");
     let parsed: tokio_postgres::Config = dsn.parse().unwrap();
     let [tokio_postgres::config::Host::Tcp(host)] = parsed.get_hosts() else {
         panic!("fault fixture must use exactly one TCP host");
@@ -83,19 +91,29 @@ async fn dedicated_leader_session_closes_after_shutdown_cancel_disconnect_and_ti
     let initialized = crate::pg::test_support::database(&dsn).await;
     initialized.shutdown().await.unwrap();
 
-    for mode in ["shutdown", "cancel_waiter", "disconnect", "response_timeout"] {
+    for mode in [
+        "shutdown",
+        "cancel_waiter",
+        "disconnect",
+        "response_timeout",
+    ] {
         let relay = Relay::start(host.clone(), port).await;
         let application_name = format!("leaderfault{}", uuid::Uuid::new_v4().simple());
         let mut config = PostgresConfig {
             host: Some("127.0.0.1".into()),
             port: Some(relay.port),
             username: parsed.get_user().map(str::to_owned),
-            password: parsed.get_password().map(|bytes| String::from_utf8(bytes.to_vec()).unwrap()),
+            password: parsed
+                .get_password()
+                .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap()),
             database: parsed.get_dbname().map(str::to_owned),
             connect_timeout_secs: Some(2),
             ..Default::default()
         };
-        config.url = Some(format!("{}?application_name={application_name}&sslmode=disable", config.to_dsn().unwrap()));
+        config.url = Some(format!(
+            "{}?application_name={application_name}&sslmode=disable",
+            config.to_dsn().unwrap()
+        ));
         let (shutdown, _) = broadcast::channel(1);
         let a = Arc::new(PgLeaderElection::spawn(config, shutdown.subscribe()));
         await_flag(&a, true).await;
@@ -110,11 +128,13 @@ async fn dedicated_leader_session_closes_after_shutdown_cancel_disconnect_and_ti
             "cancel_waiter" => {
                 let waiter_owner = a.clone();
                 let waiter = tokio::spawn(async move { waiter_owner.shutdown().await });
-                while !a._cancel.is_cancelled() { tokio::task::yield_now().await; }
+                while !a._cancel.is_cancelled() {
+                    tokio::task::yield_now().await;
+                }
                 waiter.abort();
-                let _ = waiter.await;
+                drop(waiter.await);
                 a.shutdown().await.unwrap();
-            },
+            }
             "disconnect" => {
                 let killed = observer.query(
                     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid=$1 AND application_name=$2 AND datname=current_database()",
@@ -124,12 +144,12 @@ async fn dedicated_leader_session_closes_after_shutdown_cancel_disconnect_and_ti
                 assert!(killed[0].get::<_, bool>(0));
                 await_flag(&a, false).await;
                 a.shutdown().await.unwrap();
-            },
+            }
             "response_timeout" => {
                 relay.discard_responses.store(true, Ordering::Release);
                 await_flag(&a, false).await;
                 a.shutdown().await.unwrap();
-            },
+            }
             _ => unreachable!(),
         }
         assert!(!a.is_leader());
@@ -139,16 +159,26 @@ async fn dedicated_leader_session_closes_after_shutdown_cancel_disconnect_and_ti
                     "SELECT count(*) FROM pg_stat_activity WHERE pid=$1 AND application_name=$2",
                     &[&old_pid, &application_name],
                 ).await.unwrap().get(0);
-                if count == 0 { break; }
+                if count == 0 {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        }).await.expect("old dedicated backend must actually disappear");
+        })
+        .await
+        .expect("old dedicated backend must actually disappear");
         let b = PgLeaderElection::spawn(
-            PostgresConfig { url: Some(dsn.clone()), ..Default::default() },
+            PostgresConfig {
+                url: Some(dsn.clone()),
+                ..Default::default()
+            },
             shutdown.subscribe(),
         );
         await_flag(&b, true).await;
-        assert!(!a.is_leader(), "old owner cannot regain leadership after close");
+        assert!(
+            !a.is_leader(),
+            "old owner cannot regain leadership after close"
+        );
         b.shutdown().await.unwrap();
         drop(relay);
     }

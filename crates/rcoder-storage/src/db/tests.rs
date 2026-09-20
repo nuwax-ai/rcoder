@@ -236,6 +236,7 @@ async fn baseline_is_repeatable_and_rejects_checksum_future_and_catalog_drift() 
         "UPDATE rcoder_schema_migrations SET checksum='changed'",
         "UPDATE rcoder_schema_migrations SET version=2",
         "DROP INDEX userapp_operations_history",
+        "DROP INDEX userapp_operations_unfinished",
         "DROP TABLE userapp_activity",
     ] {
         let owner = schema_owner().await;
@@ -508,5 +509,43 @@ async fn toasty_turso_rows_affected_preserves_cas_and_conflict_semantics() {
         })
         .await
         .unwrap();
+    owner.shutdown().await.unwrap();
+}
+
+/// A large terminal history must not be scanned to find the small unfinished
+/// set. This checks the actual Turso planner and result, not an index-name list.
+#[tokio::test]
+async fn unfinished_recovery_scan_uses_partial_index_and_catalog_rejects_wrong_predicate() {
+    let owner = schema_owner().await;
+    owner.execute(|mut db| async move {
+        super::schema::initialize(&mut db, super::schema::Backend::Turso, &[super::schema::Component::Userapp]).await?;
+        for statement in [
+            "INSERT INTO userapps(app_id,lifecycle_id,lifecycle_epoch,lifecycle_state,metadata_revision,created_at_us,updated_at_us) VALUES('scale','life',1,'active',1,1,1)",
+            "INSERT INTO userapp_operations(operation_id,app_id,lifecycle_id,kind,scope,state,revision,request_fingerprint,step,payload_version,checkpoint_json,created_at_us,updated_at_us) VALUES('remaining','scale','life','start','prod','pending',1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','admitted',1,'{}',10001,10001)",
+        ] {
+            toasty::sql::statement(statement).exec(&mut db).await?;
+        }
+        // Turso 0.7.2 does not support recursive CTEs. Keep all 10,000
+        // historical rows, using bounded multi-row INSERT batches instead.
+        for batch in 0..40 {
+            let values = (1..=250).map(|offset| {
+                let n = batch * 250 + offset;
+                format!("('history{n}','scale','life','start','prod','succeeded',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','done',1,'{{}}',{n},{n},{n})")
+            }).collect::<Vec<_>>().join(",");
+            toasty::sql::statement(format!("INSERT INTO userapp_operations(operation_id,app_id,lifecycle_id,kind,scope,state,revision,request_fingerprint,step,payload_version,checkpoint_json,created_at_us,updated_at_us,terminal_at_us) VALUES {values}"))
+                .exec(&mut db).await?;
+        }
+        let plan = toasty::sql::query("EXPLAIN QUERY PLAN SELECT * FROM userapp_operations WHERE operation_id > '' AND terminal_at_us IS NULL ORDER BY operation_id LIMIT 100")
+            .exec(&mut db).await?;
+        assert!(format!("{plan:?}").contains("userapp_operations_unfinished"), "{plan:?}");
+        let rows = toasty::sql::query("SELECT operation_id FROM userapp_operations WHERE operation_id > '' AND terminal_at_us IS NULL ORDER BY operation_id LIMIT 100")
+            .exec(&mut db).await?;
+        assert_eq!(rows.len(), 1);
+        assert!(format!("{rows:?}").contains("remaining"));
+        toasty::sql::statement("DROP INDEX userapp_operations_unfinished").exec(&mut db).await?;
+        toasty::sql::statement("CREATE INDEX userapp_operations_unfinished ON userapp_operations(operation_id) WHERE terminal_at_us IS NOT NULL").exec(&mut db).await?;
+        assert!(super::schema::initialize(&mut db, super::schema::Backend::Turso, &[super::schema::Component::Userapp]).await.is_err());
+        Ok(())
+    }).await.unwrap();
     owner.shutdown().await.unwrap();
 }

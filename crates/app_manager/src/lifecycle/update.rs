@@ -243,6 +243,8 @@ impl AppService {
         // physical target is still fenced by this operation's runtime lease.
         if let Some(env) = params.env.as_mut()
             && env.contains_key(shared_types::APP_RUNTIME_CONFIGURATION_VERSION)
+            && env.get(shared_types::APP_DEPLOY_GENERATION_ID) == Some(&context.operation_id)
+            && env.get(shared_types::APP_DEPLOY_OPERATION_ID) == Some(&context.operation_id)
             && !env.contains_key("APP_DEPLOY_URL")
         {
             let old = self

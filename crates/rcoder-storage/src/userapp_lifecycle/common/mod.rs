@@ -14,6 +14,8 @@ mod local_format;
 #[cfg(all(test, feature = "userapp-turso"))]
 mod local_tests;
 mod ops;
+#[cfg(all(test, feature = "pg"))]
+mod pg_commit_reply_tests;
 mod repo;
 
 use super::storage;

@@ -71,6 +71,8 @@ use envelope::ApiJson;
         crate::log::model::SourceError,
         DeployBody,
         DeployAcceptedData,
+        ConfigurationPreparationData,
+        ConsumedConfigurationActivation,
         crate::server::DeployStatus,
     )),
     tags(
@@ -395,13 +397,32 @@ fn authorize_deploy(state: &AppState, headers: &axum::http::HeaderMap) -> Result
     }
 }
 
+/// Mutually exclusive observations from the configuration preparation endpoint.
+/// Prepared authorizes the platform's first credential application; Activated
+/// only confirms a consumed original operation and permits read-only recovery.
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(untagged)]
+enum ConfigurationPreparationData {
+    Prepared(shared_types::RuntimeGenerationPrepared),
+    Activated(ConsumedConfigurationActivation),
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct ConsumedConfigurationActivation {
+    /// Always true: the exact activation was durably acknowledged previously.
+    #[schema(example = true)]
+    activated: bool,
+    /// Original, fully matched authorization; this is not a new startup intent.
+    authorization: shared_types::RuntimeGenerationHandoff,
+}
+
 #[utoipa::path(
     get, path = "/v1/runtime/configuration/prepared",
     responses(
-        (status = 200, description = "Confirmed generation handoff", body = shared_types::RuntimeGenerationPrepared),
-        (status = 202, description = "Preparation pending"),
-        (status = 403, description = "Invalid deployment token"),
-        (status = 409, description = "Runtime is protected")
+        (status = 200, description = "Prepared handoff or durable consumed activation observation", body = envelope::HttpResult<ConfigurationPreparationData>),
+        (status = 202, description = "Preparation pending; HANDOFF_PENDING, success=false and data=null", body = envelope::HttpResult<String>),
+        (status = 403, description = "Invalid deployment token; DEPLOY_FORBIDDEN, success=false and data=null", body = envelope::HttpResult<String>),
+        (status = 409, description = "Runtime is protected or durable activation is invalid; success=false and data=null", body = envelope::HttpResult<String>)
     ), tag = "Runtime Control"
 )]
 async fn prepared_runtime_configuration(
@@ -423,12 +444,40 @@ async fn prepared_runtime_configuration(
             "Runtime requires recovery",
         );
     }
+    if let Some(gate) = state.server.configuration_gate() {
+        match gate.activated() {
+            Ok(true) => {
+                if let Some(authorization) = gate.handoff() {
+                    // Completion observation, never another authorization to
+                    // mutate PG or advance desired state.
+                    return envelope::ok(
+                        StatusCode::OK,
+                        ConfigurationPreparationData::Activated(ConsumedConfigurationActivation {
+                            activated: true,
+                            authorization: authorization.clone(),
+                        }),
+                    );
+                }
+            }
+            Err(error) => {
+                return envelope::error(
+                    StatusCode::CONFLICT,
+                    "HANDOFF_ACTIVATION_INVALID",
+                    format!("Activation receipt cannot be verified: {error:#}"),
+                );
+            }
+            _ => {}
+        }
+    }
     match state
         .server
         .configuration_gate()
         .and_then(|gate| gate.prepared().cloned())
     {
-        Some(prepared) => envelope::ok(StatusCode::OK, json!(prepared)),
+        Some(prepared) => envelope::ok(
+            StatusCode::OK,
+            ConfigurationPreparationData::Prepared(prepared),
+        ),
         None => envelope::error(
             StatusCode::ACCEPTED,
             "HANDOFF_PENDING",

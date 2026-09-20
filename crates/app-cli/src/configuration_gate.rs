@@ -126,6 +126,13 @@ impl ConfigurationGate {
         }
     }
 
+    /// A durable acknowledgement consumes the one-time replacement authority.
+    /// Later hot deployment or Stop may replace the journal/desired revision;
+    /// ordinary owner recovery must not replay the original startup intent.
+    pub fn activated(&self) -> Result<bool> {
+        Ok(self.receipt()?.as_ref() == Some(&self.expected))
+    }
+
     pub fn matches(&self, receipt: &RuntimeConfigurationActivation) -> bool {
         *receipt == self.expected
     }
@@ -135,14 +142,15 @@ impl ConfigurationGate {
             *receipt == self.expected,
             "configuration activation identity does not match this generation"
         );
+        // An already durable acknowledgement is idempotent after owner restart;
+        // it neither reauthorizes startup nor needs the process-local prepared cache.
+        if self.receipt()?.as_ref() == Some(receipt) {
+            return Ok(());
+        }
         ensure!(
             self.handoff.is_none() || self.prepared.get().is_some(),
             "generation handoff has not been prepared"
         );
-        // Corrupt or unreadable prior state is not silently replaced.
-        if self.receipt()?.as_ref() == Some(receipt) {
-            return Ok(());
-        }
         let root = self
             .path
             .parent()

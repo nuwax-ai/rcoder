@@ -19,6 +19,10 @@ PG_EXTRA_TARGETS = {
         'shutdown_failure_is_not_success_on_first_or_repeated_call',
     )
 } | {
+    'PG dedicated leader session closes under cancellation and transport faults':
+        'pg::project_store::leader::fault_tests::dedicated_leader_session_closes_after_shutdown_cancel_disconnect_and_timeout',
+    'PG committed admission reply loss preserves original request and fence':
+        'userapp_lifecycle::common::pg_commit_reply_tests::committed_admission_reply_loss_preserves_original_identity_and_fence',
     'PG independent owner scope CAS and bounded waits':
         'userapp_lifecycle::common::concurrency_tests::independent_pg_owners_enforce_scope_cas_and_bound_lock_waits',
     'PG preparation recovery independent owner CAS and retained fence':

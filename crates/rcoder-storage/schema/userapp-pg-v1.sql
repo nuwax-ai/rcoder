@@ -36,6 +36,7 @@ CREATE TABLE userapp_operations (
  CONSTRAINT operation_executor CHECK(state<>'running' OR (executor_id IS NOT NULL AND length(executor_id)>0))
 );
 CREATE INDEX userapp_operations_recovery ON userapp_operations(state,app_id,operation_id);
+CREATE INDEX userapp_operations_unfinished ON userapp_operations(operation_id) WHERE terminal_at_us IS NULL;
 CREATE INDEX userapp_operations_history ON userapp_operations(app_id,lifecycle_id,created_at_us);
 CREATE TABLE userapp_active_operations (
  app_id TEXT NOT NULL PRIMARY KEY, lifecycle_id TEXT NOT NULL,

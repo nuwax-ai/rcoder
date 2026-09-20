@@ -872,3 +872,51 @@ Mac真实链已发现并修复“恢复时清旧登记后，Restart先Stop被无
 归档prod日志明确：新owner报告 `deployment journal generation does not match this owner; explicit deployment required`。控制面在没有制品的配置Restart中注入新operation/generation并移除旧URL，但保留旧卷/journal；没有可信旧→新代次交接，且PG修改先于业务激活确认。不可删除journal、放宽所有代次检查或清锁绕过。正在实现受控交接和改PG前的管理准备屏障，同时覆盖已停止容器的显式Start，不用普通wake先拉起业务。
 
 现场资源已由严格E2E按所属身份归档与清理，Turso仍保留操作保护；不把测试清理当操作恢复。完整Compose/K8s验收仍未通过。
+
+### 432fe129 阶段保存与追加 PG 选主故障验证
+
+阶段提交 `432fe129` 保存恢复补丁、CR10代次交接WIP及测试，未push。CR10尚未统一编译或部署验证，不能视为验收完成。
+
+新增真实PG选主专用连接反例：正常shutdown、取消首个shutdown等待者、精确终止测试拥有的backend、代理丢弃服务端响应触发超时。每种情形检查原backend实际消失，并由独立新选举实例取得同一advisory lock；不仅断言内存leader标志。测试使用独立run-owned PG fixture，未操作个人集群数据库。
+
+该用例已加入冻结PG验收清单；`python3 -m unittest discover -s tests-e2e/tools -p test_storage_contract_cases.py` 4/4通过，退出0。此段记录时Rust用例尚未运行，后续追加真实结果。
+
+追加真实结果：`tests-e2e/tools/pg_contract.py` 退出0，25/25断言通过；新增选主测试实际运行正常关闭、取消等待、断连和响应超时四个分支，并核对原PG backend消失与独立后继获锁。证据 `/tmp/rcoder-leader62e7bdabb7174e77/pg-contract/assertions.json`，执行日志 `/tmp/rcoder-leader-pg-contract.log`。本轮所属数据库资源清理断言通过；不代表个人K8s部署验收。
+
+PG-only严格Clippy：首次新增测试触发 let_underscore_drop，将被取消等待的结果显式drop后，`cargo clippy -p rcoder-storage --features pg --all-targets -- -D warnings` 退出0，无warning；日志 `/tmp/rcoder-storage-pg-only-clippy.log`。该语法调整不改变故障测试行为。TLS验证中发现的PG-only feature告警已闭环。
+
+### CR10 交接集中组件回归
+
+补齐已消费activation后owner重启的只读回执恢复，原操作仅观察Ready、不重复改密或启动。prepared API以具体OpenAPI成功/错误信封描述两种返回形态，线协议不变。
+
+`cargo nextest run -p app_manager -p shared_types --all-features --no-fail-fast` 最终退出0，497/497通过，零跳过；日志 `/tmp/rcoder-handoff-components.log`。初次编译修正三处测试冗余类型限定；首轮496/497，新增consumed夹具错误地从NotStarted直跳Unknown，存储正确拒绝。夹具补齐真实Starting→Unknown顺序后通过，未放宽生产状态机。app-cli及部署验证仍待完成。
+
+app-cli独立全features回归最终267/267通过、1项专用真实PG测试未在普通套件执行，退出0；日志 `/tmp/rcoder-handoff-app-cli.log`。首轮新测试比较macOS临时路径别名失败，预期改为canonicalize后通过，未放宽生产路径核验。
+
+严格Clippy与fmt集中检查全部退出0：app_manager/shared_types全features全targets、app-cli独立全targets均加`-D warnings`；根与app-cli fmt检查通过。新测试两处同步MutexGuard已改为读取快照，后续await不保留guard。日志 `/tmp/rcoder-handoff-clippy.log`。
+
+已启动`make dev-hot`→`make docker-build-agent-runner`→`make docker-build-app-runtime`的本轮镜像更新，日志 `/tmp/rcoder-handoff-compose-build.log`。本段记录时构建仍在运行，尚未执行最新镜像Compose验收；没有push或发布。
+
+### 本轮完整 workspace 回归与 Mac 原生证据
+
+`cargo nextest run --workspace --all-features --no-fail-fast` 退出0，2484/2484通过、19项环境门控未执行；日志 `/tmp/rcoder-handoff-workspace-allfeatures.log`。macOS链接器报告libtest unwind table过大的warning，测试执行未失败，未把此warning写成源码Clippy通过证据。
+
+`cargo nextest run --workspace --no-fail-fast` 退出0，2320/2320通过、12项环境门控未执行；日志 `/tmp/rcoder-handoff-workspace-default.log`。两套组件均不替代E2E。
+
+Mac Mini实际当前快照构建、Vue源码链、重复owner、Stop清理、响应丢失后的原操作恢复与显式Restart、中文空格目录通过。证据详见 `../native-desktop-runtime/macos-handoff-verification-2026-09-20.md`；Linux/Windows历史源码不同，不计为当前快照通过。
+
+### S12 查询计划补齐与最终基线
+
+独立PG17规模验证 `python3 tools/test_storage_recovery_scan.py --run` 退出0；30万终态、200活跃、300租约保留真实FK/CHECK。首屏中位19.077ms→0.073ms、尾游标15.471ms→0.076ms，返回集合等价且实际使用部分索引；索引32768字节。终态租约沿用原合理计划。证据 `/var/folders/y6/g5lk3d750833hz_rn5h3y6nh0000gn/T/rcoder-s12-j_f6lxx1/summary.json`，所属容器及匿名卷已清理。
+
+PG/Turso两份未发布基线已加入`userapp_operations_unfinished`。旧开发库继续被checksum保护拒绝，保留旧数据，不静默接受新定义；新的Compose将使用独立空测试目录。agent-runner/app-cli不依赖此存储模块，其当前业务镜像源码有效性不受该SQL变化影响；主服务已追加独立增量编译。
+
+存储nextest最终157/157通过，8项环境用例未在普通套件运行，退出0，日志 `/tmp/rcoder-storage-final-gaps-nextest.log`。首轮新规模夹具使用未支持的递归CTE，已换40批×250条INSERT，保留1万历史规模、EXPLAIN及错误谓词拒绝断言。新增真实PG提交确认丢失测试单独执行中，不能以普通套件通过替代。
+
+### 真正提交后确认丢失反例通过
+
+最终独立PG契约执行退出0，26/26必需断言通过，证据 `/tmp/rcoder-commit60d8ea505dc64ab5/pg-contract/assertions.json`，日志 `/tmp/rcoder-final-commit-pg-contract.log`。新增真实协议relay在PG发出CommandComplete(COMMIT)后、不向客户端交付确认即关闭连接；客户端报错且未自动重试，独立store观察到完整原operation/request/input/prod slot。不同控制请求仍被原槽位拒绝；原store用同请求重连返回原操作，数据库仅有一条操作，旧backend实际退出。没有模拟已提交终态，没有用事务提交前断连替代。
+
+组件测试模块仅按rustfmt调整声明排序，`cfg(test)`模块在生产构建中排除；对应输入差异明确记录于后续镜像元数据，不影响生产逻辑。
+
+最终存储 `cargo clippy -p rcoder-storage --all-features --all-targets -- -D warnings` 退出0，日志 `/tmp/rcoder-storage-final-gaps-clippy.log`。三平台同一app-cli生产源码快照的普通模板/单owner/显式Restart/Stop均有实机通过证据；Windows仅普通app-cli链，未将TerminateProcess清理当Ctrl+C优雅退出。Mac/Linux另有真实旧回执恢复+新Restart通过。分别见native-desktop-runtime目录的macos/windows/linux-handoff-verification-2026-09-20.md；完整NT矩阵与发布包仍未全验收。

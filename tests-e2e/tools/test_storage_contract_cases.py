@@ -18,11 +18,14 @@ class StorageContractCatalogTests(unittest.TestCase):
 
     def test_extra_pg_cases_are_real_tests_and_required(self):
         root = Path(__file__).resolve().parents[2] / 'crates/rcoder-storage/src'
-        self.assertEqual(len(PG_EXTRA_TARGETS), 12)
+        self.assertEqual(len(PG_EXTRA_TARGETS), 14)
         self.assertTrue(set(PG_EXTRA_TARGETS) <= REQUIRED['pg_storage_lifecycle_contract'])
         for target in PG_EXTRA_TARGETS.values():
             module, name = target.rsplit('::', 1)
-            source = (root / (module.replace('::', '/') + '.rs')).read_text()
+            path = {'pg::project_store::leader::fault_tests':
+                    'pg/project_store/leader_fault_tests.rs'}.get(
+                        module, module.replace('::', '/') + '.rs')
+            source = (root / path).read_text()
             self.assertRegex(source, r'async fn ' + re.escape(name) + r'\(')
 
     def test_required_turso_cases_are_explicit_source_tests(self):
