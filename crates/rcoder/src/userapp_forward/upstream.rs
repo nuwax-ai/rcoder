@@ -119,12 +119,35 @@ async fn resolve_dev_addr_inner(
     app_id: &str,
     deadline: tokio::time::Instant,
 ) -> Result<String, Box<Response>> {
-    let mut info = ensure_userapp_builder_until(state, app_id, deadline)
-        .await
-        .map_err(|e| {
-            warn!("[USERAPP_FORWARD] ensure dev container failed: app_id={app_id}: {e:#}");
-            builder_control_response(&e)
-        })?;
+    // A dev-scope control operation (Stop/Restart) fences new business ensure
+    // attempts by admission design. Business reads routed here — notably the
+    // prod deploy's artifact fetch through /static — must converge, not fail:
+    // the control op finishes (a Restart recreates the builder), so wait it
+    // out within the caller's deadline instead of surfacing an immediate 502.
+    let mut info = loop {
+        match ensure_userapp_builder_until(state, app_id, deadline).await {
+            Ok(info) => break info,
+            Err(error) => {
+                let blocked = error
+                    .chain()
+                    .filter_map(|cause| cause.downcast_ref::<shared_types::UserAppStoreError>())
+                    .any(|store_error| {
+                        matches!(
+                            store_error,
+                            shared_types::UserAppStoreError::OperationInProgress(blocker)
+                                if blocker.scope == shared_types::UserAppOperationScope::Dev
+                        )
+                    });
+                if !blocked || tokio::time::Instant::now() >= deadline {
+                    warn!(
+                        "[USERAPP_FORWARD] ensure dev container failed: app_id={app_id}: {error:#}"
+                    );
+                    return Err(builder_control_response(&error));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    };
     let mut addr = dev_file_server_addr(state, &info);
     // 探活正缓存(30s): 每次转发都探活会给高频文件操作(批量列表/读写)平添一个
     // RTT; 成功后窗口内免探。失败路径(自愈重建)不受缓存影响; 窗口内死容器漏检
