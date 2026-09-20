@@ -208,9 +208,29 @@ impl DockerRuntime {
             .inspect_container(&name, None)
             .await
         {
-            Ok(info) => Some(control_identity_with_binding(
-                &info, &name, context, binding, adoption,
-            )?),
+            Ok(info) => {
+                // Auto-remove deletion is asynchronous: a stopped builder can
+                // still answer inspect while "marked for removal". Such a
+                // container can never be started again — treating it as
+                // present would route restart straight into a 409 at start.
+                let removing = info.state.as_ref().is_some_and(|state| {
+                    state.dead == Some(true)
+                        || state.status.as_ref().is_some_and(|status| {
+                            matches!(
+                                status,
+                                bollard::models::ContainerStateStatusEnum::REMOVING
+                                    | bollard::models::ContainerStateStatusEnum::DEAD
+                            )
+                        })
+                });
+                if removing {
+                    None
+                } else {
+                    Some(control_identity_with_binding(
+                        &info, &name, context, binding, adoption,
+                    )?)
+                }
+            }
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => None,
