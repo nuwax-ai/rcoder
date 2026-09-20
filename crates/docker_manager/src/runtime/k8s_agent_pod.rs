@@ -215,10 +215,7 @@ impl KubernetesRuntime {
                     // 候选 pod 名仍存活则保留；确认全消失才移除缓存。
                     let pods = self.pods();
                     let mut alive = false;
-                    for candidate in [
-                        workload_name.clone(),
-                        format!("{workload_name}-0"),
-                    ] {
+                    for candidate in [workload_name.clone(), format!("{workload_name}-0")] {
                         match pods.get_opt(&candidate).await {
                             Ok(Some(pod)) if pod.metadata.deletion_timestamp.is_none() => {
                                 alive = true;
@@ -226,9 +223,7 @@ impl KubernetesRuntime {
                             }
                             Ok(_) => {}
                             Err(e) => {
-                                warn!(
-                                    "[K8S_SYNC] Pod existence probe {candidate} failed: {e}"
-                                );
+                                warn!("[K8S_SYNC] Pod existence probe {candidate} failed: {e}");
                                 alive = true;
                                 break;
                             }
@@ -255,7 +250,10 @@ impl KubernetesRuntime {
                     // STS 存在（replicas>0 pod 运行/重建中；replicas=0 已停）→ 不动缓存
                 }
                 Err(e) => {
-                    warn!("[K8S_SYNC] Failed to check StatefulSet {}: {}", workload_name, e);
+                    warn!(
+                        "[K8S_SYNC] Failed to check StatefulSet {}: {}",
+                        workload_name, e
+                    );
                 }
             }
         }

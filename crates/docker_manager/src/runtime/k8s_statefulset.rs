@@ -124,9 +124,9 @@ impl KubernetesRuntime {
             .owner_references
             .as_ref()
             .and_then(|owners| {
-                owners.iter().find(|owner| {
-                    owner.controller == Some(true) && owner.kind == "StatefulSet"
-                })
+                owners
+                    .iter()
+                    .find(|owner| owner.controller == Some(true) && owner.kind == "StatefulSet")
             })
             .map(|owner| owner.name.clone())
             .unwrap_or_else(|| pod_meta.name.clone().unwrap_or_default())

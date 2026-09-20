@@ -2378,9 +2378,8 @@ async fn userapp_scope_isolation_during_deploy() {
     // 失败只要求无假 409）
     report.assert_hard(
         "同域并发 restart → 恰一胜者 + 败者 409 带 blocker.scope=Dev",
-        (a_ok && b_conflict) || (a_conflict
-            && drb_s.is_success()
-            && drb_b["success"].as_bool().unwrap_or(false))
+        (a_ok && b_conflict)
+            || (a_conflict && drb_s.is_success() && drb_b["success"].as_bool().unwrap_or(false))
             || b_winner,
         format!(
             "A: HTTP {dra_s}, body 截断: {} | B: HTTP {drb_s}, body 截断: {}",
