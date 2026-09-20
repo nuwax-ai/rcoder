@@ -204,6 +204,32 @@ async fn read_archive(path: PathBuf) -> Result<Option<Vec<u8>>> {
     .map_err(|error| fail(format!("Archive reader worker: {error}")))?
 }
 
+/// Bind witnesses record the daemon-reported HOST path, but this process may
+/// itself run in a container where that path is mounted elsewhere. Rewrite
+/// through the stable `userapp-workspace` anchor onto this process's own
+/// workspace root; fall back to the raw path (host-side rcoder).
+fn bind_source_exists(host_path: &str) -> Result<bool> {
+    let raw = std::path::Path::new(host_path);
+    if raw.is_dir() {
+        return Ok(true);
+    }
+    let components: Vec<std::ffi::OsString> = raw
+        .components()
+        .map(|component| component.as_os_str().to_os_string())
+        .collect();
+    let Some(anchor) = components
+        .iter()
+        .position(|component| component == "userapp-workspace")
+    else {
+        return Ok(false);
+    };
+    let mut visible = PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
+    for component in &components[anchor + 1..] {
+        visible.push(component);
+    }
+    Ok(visible.is_dir())
+}
+
 fn inspect_absent(
     result: std::result::Result<bollard::models::ContainerInspectResponse, bollard::errors::Error>,
     what: &str,
@@ -443,7 +469,7 @@ impl DockerRuntime {
         }
         if !resumed {
             for volume in &template.volumes {
-                if !std::path::Path::new(&volume.uid).is_dir() {
+                if !bind_source_exists(&volume.uid)? {
                     return Err(conflict(format!(
                         "Restart bind source is missing: {}",
                         volume.uid
