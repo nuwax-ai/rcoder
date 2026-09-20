@@ -945,3 +945,19 @@ compute-control 线功能开发至此：F1、R1、R2a、R2b/N1、R5、R3、R4、
 - 结论：**多轮 app-cli 实例编排互踩**（前轮启动的 pingap 在 startsecs 窗口内被后轮 stop 清理）——Qoder 遗留"编排中 Stop 后恢复"的深层未闭环项，需 app-cli 编排互斥/重启循环专项（涉及 [program:app] autorestart 与 ownership 交接时序）。本轮不冒险修，记录为下一批最高优先。
 
 **环境前置**：docker_crash/sigterm/turso_recreation 三契约需 E2E_TURSO_BINARY_SHA256（冻结二进制指纹，已提取 dev-master-rcoder:latest 的 /app/bin/rcoder=492e1416…，终轮带 env 复跑）。
+
+### 2026-09-21：scope_isolation 四连修复闭环（第 2–7 轮迭代）
+
+R1 Docker 归档路径在真实链上暴露四层竞态，逐轮修复逐轮验证：
+
+1. 归档只读 HostConfig.Binds 漏 Mounts 结构挂载（agent-runner 用后者）→ 归档拒绝。修复：Binds→Mounts(bind)→daemon 解析表三级回退。
+2. capture 把 marked-for-removal 容器视为存在（UID 未变）→ restart 直接 start 409。修复：removing/dead 视为缺席。
+3. restore 缺席判定同样视 removing 为存在 → "Original builder still exists" 拒重建。修复：inspect_absent 同判定。
+4. bind 源存在性检查用宿主路径，rcoder 容器内不存在 → 误拒。修复：userapp-workspace 锚点重写。
+5. 重建撞名（removing 容器持名）→ create 409。修复：20s 有界等待重试。
+6. 同域并发恰一胜者断言只认 A 胜——受理顺序不保证。修复：对称接受。
+7. dev 控制操作期间业务 ensure 即刻 502 → prod 部署制品下载终态失败。修复：resolve_dev_addr 在 deadline 内 500ms 轮询等待 Dev 围栏收束（Restart 完成即重建 builder）。
+
+第 7 轮结果：四个并发断言全部通过，唯一失败为 backend-python 构建 600s 超时（7 服务全量构建 + 本机连续 7 轮负载，环境性能前置，非逻辑回归——此前 6 轮同一构建通过）。
+
+**"current 数组双 scope 同现"失败归因**：观察窗口 20s 内未同帧捕获两 scope 活动操作——受理隔离修复后 dev/prod 操作收束都快于轮询间隔，时序型断言；第 7 轮该断言已通过（构建超时前）。
