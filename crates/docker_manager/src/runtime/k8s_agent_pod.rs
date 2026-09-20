@@ -207,10 +207,38 @@ impl KubernetesRuntime {
             // container_name 已是 sts_name（get_container_info 源头剥过 -0）。判"真没了"看 STS
             // 是否存在，不看 pod 404（STS replicas>0 时 pod 被 evict/重建会瞬时空缺，误判清缓存
             // 会中断重建）。
-            let sts_name = &container_info.container_name;
-            match self.statefulsets().get(sts_name).await {
+            let workload_name = &container_info.container_name;
+            match self.statefulsets().get(workload_name).await {
                 Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                    // STS 已删 → 真没了；从缓存移除 + 收集（消费方 container_sync 只用 container_ip 清 gRPC 池）
+                    // 契约一：container_name ≡ workload 名。STS 不存在时先排除
+                    // bare pod（它以 pod 名为 workload 身份，无控制器）——任一
+                    // 候选 pod 名仍存活则保留；确认全消失才移除缓存。
+                    let pods = self.pods();
+                    let mut alive = false;
+                    for candidate in [
+                        workload_name.clone(),
+                        format!("{workload_name}-0"),
+                    ] {
+                        match pods.get_opt(&candidate).await {
+                            Ok(Some(pod)) if pod.metadata.deletion_timestamp.is_none() => {
+                                alive = true;
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!(
+                                    "[K8S_SYNC] Pod existence probe {candidate} failed: {e}"
+                                );
+                                alive = true;
+                                break;
+                            }
+                        }
+                    }
+                    if alive {
+                        continue;
+                    }
+                    // 控制器与 bare pod 均确认消失 → 真没了；移除缓存（消费方
+                    // container_sync 只用 container_ip 清 gRPC 池）。
                     self.pod_cache.write().await.remove(&identifier);
                     removed.push(RemovedContainerInfo {
                         container_name: container_info.container_name.clone(),
@@ -219,15 +247,15 @@ impl KubernetesRuntime {
                         service_type,
                     });
                     info!(
-                        "[K8S_SYNC] StatefulSet gone, removed from cache: {} (identifier={})",
-                        sts_name, identifier
+                        "[K8S_SYNC] Workload gone (controller and pod), removed from cache: {} (identifier={})",
+                        workload_name, identifier
                     );
                 }
                 Ok(_) => {
                     // STS 存在（replicas>0 pod 运行/重建中；replicas=0 已停）→ 不动缓存
                 }
                 Err(e) => {
-                    warn!("[K8S_SYNC] Failed to check StatefulSet {}: {}", sts_name, e);
+                    warn!("[K8S_SYNC] Failed to check StatefulSet {}: {}", workload_name, e);
                 }
             }
         }

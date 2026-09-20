@@ -115,11 +115,21 @@ impl KubernetesRuntime {
         Ok(format!("{}-0", self.pod_name(identifier, service_type)?))
     }
 
-    /// STS pod 名(`{sts_name}-0`)→ sts_name。从缓存的 container_name(pod 名)反推 STS 名
-    /// (查 STS 存在性 / 拼 Service FQDN 用)。agent-runner 单副本,ordinal 恒为 0,
-    /// 故剥末尾 "-0" 安全(不与业务 id 冲突:id 末位为 0 时 sts 名自身不含 -0 后缀)。
-    pub(crate) fn sts_name_from_pod_name(pod_name: &str) -> &str {
-        pod_name.strip_suffix("-0").unwrap_or(pod_name)
+    /// Workload 名的权威派生：controller ownerReference（agent-runner 族为
+    /// StatefulSet）；无 controller 的 bare pod 以 pod 名自身为 workload 身份。
+    /// 不再从 pod 名剥序号后缀——同名重建的控制器/漂移标签无法用后缀规则
+    /// 区分，ownerReference 是 API server 维护的归属事实。
+    pub(crate) fn workload_name_from_pod(pod_meta: &ObjectMeta) -> String {
+        pod_meta
+            .owner_references
+            .as_ref()
+            .and_then(|owners| {
+                owners.iter().find(|owner| {
+                    owner.controller == Some(true) && owner.kind == "StatefulSet"
+                })
+            })
+            .map(|owner| owner.name.clone())
+            .unwrap_or_else(|| pod_meta.name.clone().unwrap_or_default())
     }
 
     /// 确保 headless Service 存在（STS 必需，clusterIP=None）。selector 与 pod labels 一致。

@@ -8,6 +8,7 @@ pub(in crate::pg) struct ContainerRow {
     pub container_generation: String,
     pub row_revision: i64,
     pub container_id: Option<String>,
+    pub workload_uid: Option<String>,
     pub logical_id: String,
     pub container_ip: String,
     pub internal_port: u16,
@@ -73,6 +74,7 @@ impl TryFrom<models::Container> for ContainerRow {
             container_generation: row.container_generation,
             row_revision: row.row_revision,
             container_id: row.container_id,
+            workload_uid: row.workload_uid,
             logical_id: row.logical_id,
             container_ip: row.container_ip,
             internal_port: u16::try_from(row.internal_port)

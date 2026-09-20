@@ -93,11 +93,10 @@ impl KubernetesRuntime {
                     container_runtime_api::slots_from_identifier(service_type, identifier);
                 let pod_info = RuntimeContainerInfo {
                     container_id: uid,
-                    // agent-runner 走 STS：pod 名 = {sts_name}-0，但 container_name 用作寻址基名
-                    // （Service FQDN/grpc_addr/backend_addr 都从它派生 `{name}-svc`），故剥 -0 还原
-                    // sts_name，否则所有 gRPC/VNC 地址会指向不存在的 {...}-0-svc。bare-pod 残留无
-                    // -0 后缀，strip 安全（identity）。实际 pod 名由 agent_pod_name() 按需取。
-                    container_name: Self::sts_name_from_pod_name(&name).to_string(),
+                    // container_name ≡ 稳定 workload 名（契约一）：ownerReference 权威派生
+                    // 的 STS 名即寻址基名（FQDN/grpc_addr 从它派生 `{name}-svc`）；bare
+                    // pod 以 pod 名为 workload 身份。实际 pod 名由 agent_pod_name() 按需取。
+                    container_name: Self::workload_name_from_pod(metadata),
                     container_ip: pod_ip,
                     status,
                     created_at,
@@ -321,11 +320,8 @@ impl KubernetesRuntime {
 
             let pod_info = RuntimeContainerInfo {
                 container_id: metadata.uid.clone().unwrap_or_default(),
-                // 同 get 路径：剥 STS ordinal -0，container_name 作寻址基名（见上方注释）。
-                container_name: Self::sts_name_from_pod_name(
-                    &metadata.name.clone().unwrap_or_default(),
-                )
-                .to_string(),
+                // 同 get 路径：ownerReference 权威派生 workload 名（契约一）。
+                container_name: Self::workload_name_from_pod(&metadata),
                 container_ip: pod
                     .status
                     .as_ref()

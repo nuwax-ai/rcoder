@@ -70,16 +70,17 @@ pub(in crate::pg) async fn upsert_container(
     }
 
     let changed = toasty::sql::statement(
-        "INSERT INTO containers(container_name,container_generation,container_id,logical_id,service_type,container_ip,internal_port,external_port,status,service_url,last_activity_at_us,created_at_us,row_revision)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        "INSERT INTO containers(container_name,container_generation,container_id,workload_uid,logical_id,service_type,container_ip,internal_port,external_port,status,service_url,last_activity_at_us,created_at_us,row_revision)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
          ON CONFLICT(container_name) DO UPDATE SET container_id=EXCLUDED.container_id,
-           logical_id=EXCLUDED.logical_id,service_type=EXCLUDED.service_type,container_ip=EXCLUDED.container_ip,
+           workload_uid=EXCLUDED.workload_uid,logical_id=EXCLUDED.logical_id,service_type=EXCLUDED.service_type,container_ip=EXCLUDED.container_ip,
            internal_port=EXCLUDED.internal_port,external_port=EXCLUDED.external_port,status=EXCLUDED.status,
            service_url=EXCLUDED.service_url,last_activity_at_us=GREATEST(containers.last_activity_at_us,EXCLUDED.last_activity_at_us),
            row_revision=EXCLUDED.row_revision
-         WHERE containers.container_generation=EXCLUDED.container_generation AND containers.row_revision=$14
+         WHERE containers.container_generation=EXCLUDED.container_generation AND containers.row_revision=$15
            AND (containers.container_id IS NULL OR containers.container_id=EXCLUDED.container_id)"
     ).bind(&c.container_name).bind(&c.generation).bind_typed(c.container_id.as_deref(), Type::Text)
+        .bind_typed(c.workload_uid.as_deref(), Type::Text)
         .bind(&c.logical_id).bind(&c.service_type).bind(&c.container_ip)
         .bind(i64::from(c.internal_port)).bind(i64::from(c.external_port)).bind(&c.status).bind(&c.service_url)
         .bind(c.last_activity.timestamp_micros()).bind(c.created_at.timestamp_micros()).bind(revision)

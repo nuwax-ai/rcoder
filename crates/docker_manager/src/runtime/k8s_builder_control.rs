@@ -1190,7 +1190,9 @@ fn ready_builder_info(
     Ok(BuilderObservation::Ready(Box::new((
         ContainerBasicInfo {
             container_id: endpoint.container_id,
-            container_name: identity.name.clone(),
+            // 契约一：container_name ≡ 稳定 workload 名（寻址基名）；物理
+            // Pod 名保留在 BuilderPodIdentity，不再泄漏进注册表名。
+            container_name: workload.name.clone(),
             container_ip: endpoint.address.to_string(),
             internal_port: shared_types::GRPC_DEFAULT_PORT,
             external_port: 0,

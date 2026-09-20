@@ -3,6 +3,10 @@ CREATE TABLE containers (
  container_name TEXT NOT NULL PRIMARY KEY CHECK(length(container_name)>0),
  container_generation TEXT NOT NULL CHECK(length(container_generation)>0),
  container_id TEXT CHECK(length(container_id)>0),
+ -- §1.1 零包袱窗口冻结：持久 workload 身份（K8s=STS/Deployment metadata.uid；
+ -- Docker 无 workload 对象，容器名即 workload 身份，恒 NULL）。创建/换代时与
+ -- Pod UID 一同捕获；对账按此判"同 workload"（同名删除重建=不同对象）。
+ workload_uid TEXT CHECK(length(workload_uid)>0),
  logical_id TEXT NOT NULL CHECK(length(logical_id)>0), service_type TEXT NOT NULL,
  container_ip TEXT NOT NULL, internal_port BIGINT NOT NULL CHECK(internal_port BETWEEN 0 AND 65535),
  external_port BIGINT NOT NULL CHECK(external_port BETWEEN 0 AND 65535),
@@ -13,6 +17,7 @@ CREATE TABLE containers (
 );
 CREATE INDEX containers_logical ON containers(service_type,logical_id);
 CREATE INDEX containers_physical ON containers(container_id) WHERE container_id IS NOT NULL;
+CREATE INDEX containers_workload ON containers(workload_uid) WHERE workload_uid IS NOT NULL;
 CREATE TABLE projects (
  project_id TEXT NOT NULL PRIMARY KEY CHECK(length(project_id)>0),
  generation TEXT NOT NULL CHECK(length(generation)>0),

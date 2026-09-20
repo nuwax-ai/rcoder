@@ -275,6 +275,8 @@ pub(crate) struct Container {
     pub container_name: String,
     pub container_generation: String,
     pub container_id: Option<String>,
+    /// §1.1 持久 workload 身份（K8s 控制器 UID；Docker 恒 NULL）。
+    pub workload_uid: Option<String>,
     pub logical_id: String,
     pub service_type: String,
     pub container_ip: String,

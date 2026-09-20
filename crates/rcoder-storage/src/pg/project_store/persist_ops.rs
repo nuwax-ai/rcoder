@@ -108,6 +108,9 @@ pub struct ContainerSnapshot {
     pub expected_revision: i64,
     pub container_name: String,
     pub container_id: Option<String>,
+    /// 持久 workload 身份（K8s 控制器 UID；Docker 恒 None）。与 container_id
+    /// （Pod UID）一同捕获；换代事务按"同 workload_uid"条件更新。
+    pub workload_uid: Option<String>,
     pub logical_id: String,
     /// ServiceType 字符串
     pub service_type: String,
@@ -131,6 +134,7 @@ impl ContainerSnapshot {
         info: &ContainerBasicInfo,
         service_type: &ServiceType,
         identity: &shared_types::persistence::ContainerPersistenceIdentity,
+        workload_uid: Option<&str>,
     ) -> anyhow::Result<Self> {
         let container_id = if info.container_id.is_empty() {
             None
@@ -152,6 +156,9 @@ impl ContainerSnapshot {
                 .ok_or_else(|| anyhow::anyhow!("Container snapshot has no registered revision"))?,
             container_name: key.to_string(),
             container_id,
+            workload_uid: workload_uid
+                .filter(|uid| !uid.is_empty())
+                .map(str::to_string),
             // ContainerBasicInfo.project_id 即容器归属的 project/logical 标识
             logical_id: info.project_id.clone(),
             service_type: service_type.to_string(),
@@ -307,6 +314,8 @@ pub(in crate::pg) fn registration_for_info(
 ) -> anyhow::Result<PersistOp> {
     let project = Box::new(ProjectSnapshot::from_info(info)?);
     let container = if let (Some(basic), Some(st)) = (info.container_info(), info.service_type()) {
+        // workload_uid：注册链捕获侧（K8s ownerReference UID）随契约四解析器
+        // 分层接入；Docker 无 workload 对象恒 None。schema 已冻结本列。
         Some(Box::new(ContainerSnapshot::from_info(
             &container_entry_key(info),
             &basic,
@@ -315,6 +324,7 @@ pub(in crate::pg) fn registration_for_info(
                 .container
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Container registration identity missing"))?,
+            None,
         )?))
     } else {
         None
