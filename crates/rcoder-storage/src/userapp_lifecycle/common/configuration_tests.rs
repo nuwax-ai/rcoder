@@ -1054,6 +1054,155 @@ async fn password_recovery_finalization_cas_preserves_identity_and_lease() {
 }
 
 #[tokio::test]
+async fn deploy_pg_recovery_finalization_is_cas_identity_and_outcome_bound() {
+    for (final_stage, fragment) in [
+        (
+            DatabasePasswordStage::Verified,
+            "committed and verified; deployment completion was not recorded",
+        ),
+        (
+            DatabasePasswordStage::Cancelled,
+            "write was cancelled; deployment did not complete",
+        ),
+    ] {
+        let (_directory, store, app) = database().await;
+        let input = UserAppExecutionInput::new("{}".into());
+        let request = admission(
+            &app,
+            "recoverdeploypg",
+            UserAppControlCommand::Deploy {
+                restart: false,
+                input_digest: input.digest(),
+            },
+        );
+        let (mut op, context) = claim_admitted(
+            &store,
+            match store
+                .admit_with_configuration(&request, &input, None)
+                .await
+                .unwrap()
+            {
+                UserAppAdmissionOutcome::Accepted(op) | UserAppAdmissionOutcome::Existing(op) => op,
+            },
+        )
+        .await;
+        let mut evidence = ExplicitDeploymentPasswordEvidence {
+            receipt_protocol: Some(1),
+            context: context.clone(),
+            username: "business".into(),
+            explicit_pg_target: target(),
+            stage: DatabasePasswordStage::WriteSubmitted,
+        };
+        let mut p = progress(&op, UserAppOperationState::Running);
+        p.checkpoint = serde_json::to_value(&evidence).unwrap();
+        op = store.advance(&p).await.unwrap();
+        evidence.stage = final_stage.clone();
+        assert!(
+            store
+                .finalize_deploy_pg_recovery(&op, &evidence)
+                .await
+                .is_err(),
+            "missing lease must not authorize finalization"
+        );
+        let receipt = UserAppOperationLeaseReceipt::Docker {
+            service_type: ServiceType::Userapp,
+            device: 1,
+            inode: 42,
+            token: "originallease".into(),
+        };
+        store
+            .bind_operation_lease(&context, &receipt)
+            .await
+            .unwrap();
+        let mut p = progress(&op, UserAppOperationState::RecoveryRequired);
+        p.checkpoint = op.checkpoint.clone();
+        op = store.advance(&p).await.unwrap();
+        let mut legacy = evidence.clone();
+        legacy.receipt_protocol = None;
+        assert!(
+            store
+                .finalize_deploy_pg_recovery(&op, &legacy)
+                .await
+                .is_err()
+        );
+        let mut wrong = evidence.clone();
+        wrong.explicit_pg_target = RuntimeConfigurationTarget {
+            physical_uid: "replacement".into(),
+            deployment_generation: "replacement".into(),
+        };
+        assert!(
+            store
+                .finalize_deploy_pg_recovery(&op, &wrong)
+                .await
+                .is_err()
+        );
+        let mut stale = op.clone();
+        stale.revision -= 1;
+        assert!(
+            store
+                .finalize_deploy_pg_recovery(&stale, &evidence)
+                .await
+                .is_err()
+        );
+        // The original admission stays fenced until its own recovery finalizes.
+        assert!(
+            store
+                .admit(&admission(
+                    &app,
+                    "seconddeploy",
+                    UserAppControlCommand::Deploy {
+                        restart: false,
+                        input_digest: "c".repeat(64),
+                    },
+                ))
+                .await
+                .is_err()
+        );
+        let done = store
+            .finalize_deploy_pg_recovery(&op, &evidence)
+            .await
+            .unwrap();
+        assert_eq!(done.state, UserAppOperationState::Failed);
+        assert!(
+            done.error_message
+                .as_deref()
+                .is_some_and(|message| message.contains(fragment))
+        );
+        let stored: ExplicitDeploymentPasswordEvidence =
+            serde_json::from_value(done.checkpoint.clone()).unwrap();
+        assert_eq!(stored.stage, final_stage);
+        assert!(
+            store
+                .finalize_deploy_pg_recovery(&op, &evidence)
+                .await
+                .is_err()
+        );
+        assert_eq!(done.operation_id, op.operation_id);
+        assert_eq!(done.executor_id, op.executor_id);
+        assert!(
+            store
+                .get_application(&app.app_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .active_operations
+                .slot(Prod)
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_operation_lease(&app.app_id, &op.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .receipt,
+            receipt,
+            "physical lease persists until exact cleanup"
+        );
+    }
+}
+
+#[tokio::test]
 async fn inline_deployment_credentials_are_atomic_captured_and_replay_stable() {
     let (_directory, store, app) = database().await;
     let pg = StartPgCredential {

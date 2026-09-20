@@ -110,6 +110,7 @@ use crate::handler;
         crate::userapp_forward::forward::flat_dev_install_project,
         crate::userapp_forward::db::reset_password,
         crate::userapp_forward::db::recover_password,
+        crate::userapp_forward::db::recover_deploy_pg,
         crate::userapp_forward::db::create_database,
     ),
     components(
@@ -118,6 +119,8 @@ use crate::handler;
             shared_types::UserappDbResetPasswordRequest,
             shared_types::UserappDbPasswordRecoveryRequest,
             shared_types::UserappDbPasswordRecoveryResponse,
+            shared_types::UserappDeployPgRecoveryRequest,
+            shared_types::UserappDeployPgRecoveryResponse,
             shared_types::UserappDbCreateDatabaseRequest,
             // 日志域 wire DTO（与容器内 app-cli 同源；logs/sources/query + logs/query 响应面）
             shared_types::LogQueryRequest,

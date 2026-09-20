@@ -5,7 +5,9 @@ use shared_types::*;
 use std::{sync::Arc, time::Duration};
 use tokio::time::{Instant, timeout_at};
 
+mod deploy_recovery;
 mod recovery;
+pub(crate) use deploy_recovery::recover_deploy_pg;
 pub(super) use recovery::recover;
 #[cfg(test)]
 use recovery::validate_recovery_snapshot;

@@ -284,6 +284,28 @@ pub(crate) async fn recover_password(
         .map(HttpResult::success)
 }
 
+/// Reconcile an uncertain explicit deployment password write under its original operation.
+#[utoipa::path(
+    post,
+    path = "/api/v1/userapp/deploy-pg/recover",
+    request_body = shared_types::UserappDeployPgRecoveryRequest,
+    responses(
+        (status = 200, description = "HttpResult：成功时检查 data.state/data.stage；失败时检查 ERR_VALIDATION、ERR_CONFLICT 或 ERR_BACKEND_ERROR。回执未确认、物理目标被替换或 TCP 验证失败时保持保护", body = HttpResult<shared_types::UserappDeployPgRecoveryResponse>)
+    ),
+    tag = "Userapp · 双态 · 数据库",
+    operation_id = "userapp_deploy_pg_recover",
+    summary = "确认或取消原显式部署改密写入",
+    description = "显式部署携带 `pg` 输入的改密写结果未知（断连/协调器中断/checkpoint 提交失败）时，沿原部署操作身份恢复：携带 app_id/lifecycle_id/operation_id/expected_revision 与原 pg 的 username/password。已提交的事务经回执+TCP 验证确认；未提交的通过取消墓碑阻止迟到写入。两种结果都终局为 Failed——部署本身未记录完成证据，需重发部署（已确认的密码不会再次改写）。不会重新执行密码写、重新部署、启动或替换容器；旧版本无事务回执协议的操作拒绝自动恢复。终态重放返回同一结果；lease_cleanup_pending 表示仅原租约清理待完成。"
+)]
+pub(crate) async fn recover_deploy_pg(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<shared_types::UserappDeployPgRecoveryRequest>,
+) -> Result<HttpResult<shared_types::UserappDeployPgRecoveryResponse>, AppError> {
+    super::db_password::recover_deploy_pg(state, body)
+        .await
+        .map(HttpResult::success)
+}
+
 /// `POST /api/v1/userapp/db/{app_stage}/create-database`
 #[utoipa::path(
     post,

@@ -26,7 +26,8 @@ pub use userapp::build_event::BuildProgressEvent;
 pub use userapp::db_admin::{
     DbAdminError, DbUserUpsertOutcome, StartPgCredential, UserappDbCreateDatabaseRequest,
     UserappDbPasswordRecoveryRequest, UserappDbPasswordRecoveryResponse,
-    UserappDbResetPasswordRequest, create_pg_database, upsert_pg_user,
+    UserappDbResetPasswordRequest, UserappDeployPgRecoveryRequest, UserappDeployPgRecoveryResponse,
+    create_pg_database, upsert_pg_user,
 };
 pub use userapp::db_align::{
     AlignCredentialsOutcome, AlignCredentialsRequest, AlignError, CommandOutcome,

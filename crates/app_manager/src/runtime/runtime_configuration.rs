@@ -85,12 +85,18 @@ impl AppService {
 
     /// Explicit deployment PG input updates the current database only. It is
     /// never saved as desired startup configuration or injected into business env.
+    ///
+    /// The write uses the receipt transaction: the password change and its
+    /// immutable receipt commit together, so an unknown outcome is later
+    /// provable under the original operation identity.
     pub(crate) async fn apply_explicit_deployment_credentials(
         &self,
         operation: &mut crate::service::OwnedOperation,
         guard: &crate::service::AppOperationGuard,
         pg: &StartPgCredential,
     ) -> AppResult<()> {
+        use shared_types::PgCommandRunner as _;
+
         let context = operation.execution_context();
         let deadline_ms = self
             .metadata
@@ -135,26 +141,125 @@ impl AppService {
             let admin = self
                 .wait_for_configuration_postgres(&context, &target, deadline)
                 .await?;
-            let evidence = serde_json::json!({"explicit_pg_target":target});
-            guard.mark_mutating()?;
-            operation
-                .checkpoint("explicit_pg_applying", evidence.clone())
-                .await?;
             let runner = BoundManagementRunner {
                 service: self,
                 context: &context,
                 target: &target,
             };
-            shared_types::align_pg_credentials_with_admin(
-                &runner,
-                &admin,
-                &pg.username,
-                &pg.password,
-            )
-            .await
-            .map_err(|error| AppOperationError::credential_failure(error, &pg.password))?;
+            let exists = runner
+                .run(
+                    &admin
+                        .role_exists_command(&pg.username)
+                        .map_err(AppOperationError::Validation)?,
+                )
+                .await
+                .map_err(|_| AppOperationError::CredentialApplication {
+                    message: "Explicit database account preflight transport failed".into(),
+                    mutation: CredentialMutationEvidence::NotAttempted,
+                })?;
+            if exists.exit_code != 0 {
+                return Err(AppOperationError::CredentialApplication {
+                    message: "Explicit database account preflight failed".into(),
+                    mutation: CredentialMutationEvidence::NotAttempted,
+                });
+            }
+            let create = match exists.stdout.trim() {
+                "1" => false,
+                "" => true,
+                _ => {
+                    return Err(AppOperationError::CredentialApplication {
+                        message: "Explicit database account preflight returned invalid data".into(),
+                        mutation: CredentialMutationEvidence::NotAttempted,
+                    });
+                }
+            };
+            let sql = admin
+                .password_operation_command(
+                    &context,
+                    shared_types::UserAppOperationScope::Prod,
+                    &pg.username,
+                    &pg.password,
+                    create,
+                )
+                .map_err(AppOperationError::Validation)?;
+            let mut evidence = shared_types::ExplicitDeploymentPasswordEvidence {
+                receipt_protocol: Some(1),
+                context: context.clone(),
+                username: pg.username.clone(),
+                explicit_pg_target: target.clone(),
+                stage: shared_types::DatabasePasswordStage::WriteSubmitted,
+            };
+            guard.mark_mutating()?;
             operation
-                .checkpoint("explicit_pg_applied", evidence)
+                .checkpoint(
+                    "explicit_pg_applying",
+                    serde_json::to_value(&evidence).map_err(|_| {
+                        AppOperationError::Backend("Encode explicit database intent".into())
+                    })?,
+                )
+                .await?;
+            let applied =
+                runner
+                    .run(&sql)
+                    .await
+                    .map_err(|_| AppOperationError::CredentialApplication {
+                        message: "Explicit database write outcome is unknown".into(),
+                        mutation: CredentialMutationEvidence::Unknown,
+                    })?;
+            if applied.exit_code != 0 {
+                return Err(AppOperationError::CredentialApplication {
+                    message: "Explicit database write did not confirm success".into(),
+                    mutation: CredentialMutationEvidence::Unknown,
+                });
+            }
+            let receipt = runner
+                .run(
+                    &admin
+                        .password_operation_receipt_command(
+                            &context,
+                            shared_types::UserAppOperationScope::Prod,
+                            &pg.username,
+                        )
+                        .map_err(AppOperationError::Validation)?,
+                )
+                .await
+                .map_err(|_| AppOperationError::CredentialApplication {
+                    message: "Explicit database transaction receipt is unavailable".into(),
+                    mutation: CredentialMutationEvidence::Unknown,
+                })?;
+            if receipt.exit_code != 0 || receipt.stdout.trim() != "1" {
+                return Err(AppOperationError::CredentialApplication {
+                    message: "Explicit database transaction commit could not be confirmed".into(),
+                    mutation: CredentialMutationEvidence::Unknown,
+                });
+            }
+            let verified = runner
+                .run(&shared_types::pg_utils::pg_verify_credentials_cmd(
+                    &pg.username,
+                    &pg.password,
+                ))
+                .await
+                .map_err(|_| AppOperationError::CredentialApplication {
+                    message:
+                        "Explicit database password changed but TCP verification is unavailable"
+                            .into(),
+                    mutation: CredentialMutationEvidence::AppliedButUnverified,
+                })?;
+            if verified.exit_code != 0 {
+                return Err(AppOperationError::CredentialApplication {
+                    message: "Explicit database password changed but TCP verification failed"
+                        .into(),
+                    mutation: CredentialMutationEvidence::AppliedButUnverified,
+                });
+            }
+            evidence.stage = shared_types::DatabasePasswordStage::Verified;
+            operation
+                .checkpoint(
+                    "explicit_pg_applied",
+                    serde_json::to_value(&evidence).map_err(|_| {
+                        AppOperationError::Backend("Encode explicit database completion".into())
+                    })?,
+                )
                 .await?;
             Ok(())
         };
@@ -225,9 +330,9 @@ mod tests {
         for (stdout, exit_code) in [
             ("administrator", 0),
             ("1", 0),
-            ("", 1),
-            ("t", 0),
+            ("1", 0),
             ("", 0),
+            ("1", 0),
             ("1", 0),
         ] {
             runtime.configuration_replies.lock().unwrap().push_back(
@@ -260,6 +365,12 @@ mod tests {
                 && !command.join(" ").contains("/configuration/")
                 && !command.join(" ").contains("restart")
         ));
+        // The write itself is the receipt transaction: password change and its
+        // immutable receipt commit together under the captured administrator.
+        let receipt_command = commands[3].join(" ");
+        assert!(receipt_command.contains("BEGIN ISOLATION LEVEL READ COMMITTED;"));
+        assert!(receipt_command.contains("COMMIT;"));
+        assert!(receipt_command.contains("-U 'administrator'"));
         let targets = runtime.configuration_targets.lock().unwrap().clone();
         assert!(
             targets
@@ -277,6 +388,9 @@ mod tests {
             record.checkpoint["explicit_pg_target"]["deployment_generation"],
             "existinggeneration"
         );
+        assert_eq!(record.checkpoint["stage"], "verified");
+        assert_eq!(record.checkpoint["receipt_protocol"], 1);
+        assert_eq!(record.step, "explicit_pg_applied");
         assert!(!record.checkpoint.to_string().contains("newprivate"));
         assert!(
             store
@@ -289,5 +403,311 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// 反例：写命令失败（断连/超时同类的未知结果）时，证据停留在
+    /// write_submitted 且错误按 Unknown 分类，操作进 RecoveryRequired。
+    #[tokio::test]
+    async fn explicit_deployment_write_failure_keeps_write_submitted_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::test_support::MockRuntime::default());
+        let (mut service, _store) =
+            crate::test_support::test_service_with_store(root.path(), runtime.clone()).await;
+        service.config.access_mode = crate::config::AppAccessMode::Kubernetes;
+        let app = "explicitunknown";
+        let identity = service.metadata.store.ensure_identity(app).await.unwrap();
+        runtime.specs.insert(
+            app.into(),
+            container_runtime_api::ContainerSpecSnapshot {
+                env: Some(
+                    [(
+                        shared_types::APP_DEPLOY_GENERATION_ID.into(),
+                        "existinggeneration".into(),
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let guard = service.try_acquire_process_release_lock(app).await.unwrap();
+        let input = shared_types::UserAppExecutionInput::new("{}".into());
+        let mut operation = crate::service::OwnedOperation::admit_with_input(
+            service.metadata.store.clone(),
+            shared_types::UserAppAdmission {
+                app_id: app.into(),
+                lifecycle_id: Some(identity.lifecycle_id.clone()),
+                operation_id: "explicitunknownop".into(),
+                request_id: None,
+                request_fingerprint: "a".repeat(64),
+                kind: shared_types::UserAppOperationKind::StartDeployment,
+                command: Some(shared_types::UserAppControlCommand::Deploy {
+                    restart: false,
+                    input_digest: input.digest(),
+                }),
+                metadata: None,
+                runtime_policy_on_success: None,
+            },
+            Some(&input),
+        )
+        .await
+        .unwrap();
+        operation.bind_lease(&guard).await.unwrap();
+        let context = operation.execution_context();
+        service
+            .metadata
+            .store
+            .bind_operation_deadline(
+                app,
+                &context.operation_id,
+                &context.lifecycle_id,
+                chrono::Utc::now().timestamp_millis() + 3000,
+            )
+            .await
+            .unwrap();
+        for (stdout, exit_code) in [("administrator", 0), ("1", 0), ("1", 0), ("", 1)] {
+            runtime.configuration_replies.lock().unwrap().push_back(
+                container_runtime_api::ExecResult {
+                    stdout: stdout.into(),
+                    exit_code,
+                    stderr: String::new(),
+                },
+            );
+        }
+        let error = service
+            .apply_explicit_deployment_credentials(
+                &mut operation,
+                &guard,
+                &StartPgCredential {
+                    username: "business".into(),
+                    password: "newprivate".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AppOperationError::CredentialApplication {
+                    mutation: CredentialMutationEvidence::Unknown,
+                    ..
+                }
+            ),
+            "got: {error:?}"
+        );
+        assert!(error.requires_recovery());
+        let record = service
+            .metadata
+            .store
+            .get_operation(app, &context.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.checkpoint["stage"], "write_submitted");
+        assert!(record.checkpoint["explicit_pg_target"].is_object());
+        assert!(!record.checkpoint.to_string().contains("newprivate"));
+    }
+
+    /// 反例：回执查询缺失（exit 0 但无 committed 行）不能当成功，仍属 Unknown。
+    #[tokio::test]
+    async fn explicit_deployment_missing_receipt_stays_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::test_support::MockRuntime::default());
+        let (mut service, _store) =
+            crate::test_support::test_service_with_store(root.path(), runtime.clone()).await;
+        service.config.access_mode = crate::config::AppAccessMode::Kubernetes;
+        let app = "explicitreceipt";
+        let identity = service.metadata.store.ensure_identity(app).await.unwrap();
+        runtime.specs.insert(
+            app.into(),
+            container_runtime_api::ContainerSpecSnapshot {
+                env: Some(
+                    [(
+                        shared_types::APP_DEPLOY_GENERATION_ID.into(),
+                        "existinggeneration".into(),
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let guard = service.try_acquire_process_release_lock(app).await.unwrap();
+        let input = shared_types::UserAppExecutionInput::new("{}".into());
+        let mut operation = crate::service::OwnedOperation::admit_with_input(
+            service.metadata.store.clone(),
+            shared_types::UserAppAdmission {
+                app_id: app.into(),
+                lifecycle_id: Some(identity.lifecycle_id.clone()),
+                operation_id: "explicitreceiptop".into(),
+                request_id: None,
+                request_fingerprint: "a".repeat(64),
+                kind: shared_types::UserAppOperationKind::StartDeployment,
+                command: Some(shared_types::UserAppControlCommand::Deploy {
+                    restart: false,
+                    input_digest: input.digest(),
+                }),
+                metadata: None,
+                runtime_policy_on_success: None,
+            },
+            Some(&input),
+        )
+        .await
+        .unwrap();
+        operation.bind_lease(&guard).await.unwrap();
+        let context = operation.execution_context();
+        service
+            .metadata
+            .store
+            .bind_operation_deadline(
+                app,
+                &context.operation_id,
+                &context.lifecycle_id,
+                chrono::Utc::now().timestamp_millis() + 3000,
+            )
+            .await
+            .unwrap();
+        for (stdout, exit_code) in [("administrator", 0), ("1", 0), ("1", 0), ("", 0), ("", 0)] {
+            runtime.configuration_replies.lock().unwrap().push_back(
+                container_runtime_api::ExecResult {
+                    stdout: stdout.into(),
+                    exit_code,
+                    stderr: String::new(),
+                },
+            );
+        }
+        let error = service
+            .apply_explicit_deployment_credentials(
+                &mut operation,
+                &guard,
+                &StartPgCredential {
+                    username: "business".into(),
+                    password: "newprivate".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AppOperationError::CredentialApplication {
+                    mutation: CredentialMutationEvidence::Unknown,
+                    ..
+                }
+            ),
+            "got: {error:?}"
+        );
+        let record = service
+            .metadata
+            .store
+            .get_operation(app, &context.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.checkpoint["stage"], "write_submitted");
+    }
+
+    /// 反例：回执 committed 但 TCP 复验失败 → AppliedButUnverified（仍需恢复）。
+    #[tokio::test]
+    async fn explicit_deployment_tcp_failure_is_applied_but_unverified() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::test_support::MockRuntime::default());
+        let (mut service, _store) =
+            crate::test_support::test_service_with_store(root.path(), runtime.clone()).await;
+        service.config.access_mode = crate::config::AppAccessMode::Kubernetes;
+        let app = "explicitunverified";
+        let identity = service.metadata.store.ensure_identity(app).await.unwrap();
+        runtime.specs.insert(
+            app.into(),
+            container_runtime_api::ContainerSpecSnapshot {
+                env: Some(
+                    [(
+                        shared_types::APP_DEPLOY_GENERATION_ID.into(),
+                        "existinggeneration".into(),
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let guard = service.try_acquire_process_release_lock(app).await.unwrap();
+        let input = shared_types::UserAppExecutionInput::new("{}".into());
+        let mut operation = crate::service::OwnedOperation::admit_with_input(
+            service.metadata.store.clone(),
+            shared_types::UserAppAdmission {
+                app_id: app.into(),
+                lifecycle_id: Some(identity.lifecycle_id.clone()),
+                operation_id: "explicitunverifiedop".into(),
+                request_id: None,
+                request_fingerprint: "a".repeat(64),
+                kind: shared_types::UserAppOperationKind::StartDeployment,
+                command: Some(shared_types::UserAppControlCommand::Deploy {
+                    restart: false,
+                    input_digest: input.digest(),
+                }),
+                metadata: None,
+                runtime_policy_on_success: None,
+            },
+            Some(&input),
+        )
+        .await
+        .unwrap();
+        operation.bind_lease(&guard).await.unwrap();
+        let context = operation.execution_context();
+        service
+            .metadata
+            .store
+            .bind_operation_deadline(
+                app,
+                &context.operation_id,
+                &context.lifecycle_id,
+                chrono::Utc::now().timestamp_millis() + 3000,
+            )
+            .await
+            .unwrap();
+        for (stdout, exit_code) in [
+            ("administrator", 0),
+            ("1", 0),
+            ("1", 0),
+            ("", 0),
+            ("1", 0),
+            ("", 2),
+        ] {
+            runtime.configuration_replies.lock().unwrap().push_back(
+                container_runtime_api::ExecResult {
+                    stdout: stdout.into(),
+                    exit_code,
+                    stderr: String::new(),
+                },
+            );
+        }
+        let error = service
+            .apply_explicit_deployment_credentials(
+                &mut operation,
+                &guard,
+                &StartPgCredential {
+                    username: "business".into(),
+                    password: "newprivate".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AppOperationError::CredentialApplication {
+                    mutation: CredentialMutationEvidence::AppliedButUnverified,
+                    ..
+                }
+            ),
+            "got: {error:?}"
+        );
+        assert!(error.requires_recovery());
+        let record = service
+            .metadata
+            .store
+            .get_operation(app, &context.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.checkpoint["stage"], "write_submitted");
     }
 }

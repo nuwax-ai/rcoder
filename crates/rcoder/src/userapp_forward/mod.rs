@@ -91,11 +91,12 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
 pub(crate) mod guard_tables {
     /// rcoder 本地实现的 userapp 路径快照（`routes()` 显式入口部分；
     /// 守卫闭包比对用——改动路由须同步）。
-    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 17] = [
+    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 18] = [
         "/api/v1/userapp/{app_id}/builder/adopt",
         "/api/v1/userapp/workspace",
         "/api/v1/userapp/db/{app_stage}/reset-password",
         "/api/v1/userapp/db/{app_stage}/reset-password/recover",
+        "/api/v1/userapp/deploy-pg/recover",
         "/api/v1/userapp/db/{app_stage}/create-database",
         // `{app_stage}` 门面折叠路由（dev-only 构建链；URI 还原容器平铺契约转发）
         "/api/v1/userapp/{app_id}/{app_stage}/projects/detect",
@@ -182,6 +183,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/v1/userapp/db/{app_stage}/reset-password/recover",
             post(db::recover_password),
+        )
+        .route(
+            "/api/v1/userapp/deploy-pg/recover",
+            post(db::recover_deploy_pg),
         )
         .route(
             "/api/v1/userapp/db/{app_stage}/create-database",

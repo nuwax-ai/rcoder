@@ -409,10 +409,20 @@ impl AppService {
                 }
                 .map_err(|error| map_runtime_error("Start captured deployment", error))?;
             }
-            if url.is_some() {
-                self.wait_deploy_stage(app_id, &context.operation_id, &guard)
-                    .await?;
-            }
+        }
+        // Explicit pg input aligns before the business wait: the management
+        // channel and PG readiness never depend on business Service Ready,
+        // while the business may need the new password before it can be Ready.
+        let pg_aligned = if let Some(pg) = &request.pg {
+            self.apply_explicit_deployment_credentials(operation, &guard, pg)
+                .await?;
+            Some(true)
+        } else {
+            None
+        };
+        if !hot && url.is_some() {
+            self.wait_deploy_stage(app_id, &context.operation_id, &guard)
+                .await?;
         }
         // Hot and control-only paths do not rebuild configuration, so apply the
         // policy under the same operation and physical target fence.
@@ -451,13 +461,6 @@ impl AppService {
                     None
                 }
             }
-        } else {
-            None
-        };
-        let pg_aligned = if let Some(pg) = &request.pg {
-            self.apply_explicit_deployment_credentials(operation, &guard, pg)
-                .await?;
-            Some(true)
         } else {
             None
         };

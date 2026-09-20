@@ -1,7 +1,7 @@
 //! Durable evidence for explicit database password writes. Never includes a password.
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DatabasePasswordStage {
     Captured,
@@ -93,6 +93,67 @@ impl DatabasePasswordEvidence {
                 }
             }
             _ => return Err("Database password target scope differs from admission".into()),
+        }
+        Ok(())
+    }
+}
+
+/// Explicit deployment `pg` input write evidence. The deployment operation owns
+/// the receipt transaction, so recovery confirms the original SQL result under
+/// the original operation identity without reissuing a password write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExplicitDeploymentPasswordEvidence {
+    /// Missing means the write predates transactional receipts and cannot be
+    /// fenced by a cancellation tombstone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_protocol: Option<u32>,
+    pub context: crate::UserAppExecutionContext,
+    pub username: String,
+    pub explicit_pg_target: crate::RuntimeConfigurationTarget,
+    pub stage: DatabasePasswordStage,
+}
+
+impl ExplicitDeploymentPasswordEvidence {
+    pub fn validate_operation(
+        &self,
+        operation: &crate::UserAppOperationRecord,
+    ) -> Result<(), String> {
+        self.context.validate_identity(&operation.app_id)?;
+        if self.receipt_protocol.is_some_and(|version| version != 1) {
+            return Err("Unknown deployment password receipt protocol".into());
+        }
+        if self.context.lifecycle_id != operation.lifecycle_id
+            || self.context.operation_id != operation.operation_id
+            || self.context.request_fingerprint != operation.request_fingerprint
+            || operation.executor_id.as_deref() != Some(&self.context.executor_id)
+        {
+            return Err("Deployment password evidence has a different execution identity".into());
+        }
+        crate::pg_utils::validate_pg_identifier(&self.username)?;
+        let Some(crate::UserAppControlCommand::Deploy { .. }) = &operation.command else {
+            return Err("Deployment password evidence requires its original command".into());
+        };
+        if !matches!(
+            operation.kind,
+            crate::UserAppOperationKind::StartDeployment
+                | crate::UserAppOperationKind::RestartDeployment
+        ) || operation.kind
+            != operation
+                .command
+                .as_ref()
+                .map(|command| command.kind())
+                .ok_or("Missing deployment command")?
+            || operation.scope != crate::UserAppOperationScope::Prod
+        {
+            return Err("Deployment password evidence differs from admission".into());
+        }
+        if self.explicit_pg_target.physical_uid.is_empty()
+            || self.explicit_pg_target.deployment_generation.is_empty()
+        {
+            return Err(
+                "Deployment password target requires a physical identity and generation".into(),
+            );
         }
         Ok(())
     }

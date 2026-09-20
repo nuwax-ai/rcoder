@@ -351,6 +351,20 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         })
         .await
     }
+    async fn finalize_deploy_pg_recovery(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &ExplicitDeploymentPasswordEvidence,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let evidence = evidence.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                ops::finalize_deploy_pg_recovery(tx, backend, &snapshot, &evidence).await
+            })
+        })
+        .await
+    }
     async fn confirm_database_preparation_recovery(
         &self,
         snapshot: &UserAppOperationRecord,

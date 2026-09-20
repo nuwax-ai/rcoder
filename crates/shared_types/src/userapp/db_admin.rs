@@ -82,6 +82,62 @@ pub struct UserappDbPasswordRecoveryResponse {
     pub lease_cleanup_pending: bool,
 }
 
+/// Reconcile an uncertain explicit deployment password write under its
+/// original operation identity. Never reissues the password write; the
+/// original private input is required for TCP verification of a commit.
+#[derive(Deserialize, Serialize, Clone, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UserappDeployPgRecoveryRequest {
+    pub app_id: String,
+    pub lifecycle_id: String,
+    pub operation_id: String,
+    pub expected_revision: i64,
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for UserappDeployPgRecoveryRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserappDeployPgRecoveryRequest")
+            .field("app_id", &self.app_id)
+            .field("lifecycle_id", &self.lifecycle_id)
+            .field("operation_id", &self.operation_id)
+            .field("username", &self.username)
+            .field("password", &"<REDACTED>")
+            .finish()
+    }
+}
+
+impl UserappDeployPgRecoveryRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        crate::validate_identifier(&self.app_id, "app_id")?;
+        crate::validate_identifier(&self.lifecycle_id, "lifecycle_id")?;
+        crate::validate_identifier(&self.operation_id, "operation_id")?;
+        if self.expected_revision < 0 {
+            return Err("Expected revision must be nonnegative".into());
+        }
+        validate_pg_identifier(&self.username)?;
+        validate_password(&self.password)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Clone, utoipa::ToSchema)]
+pub struct UserappDeployPgRecoveryResponse {
+    pub operation_id: String,
+    pub lifecycle_id: String,
+    pub revision: i64,
+    /// Operation state: Pending, Running, WaitingRetry, RecoveryRequired,
+    /// Succeeded, Failed. After successful reconciliation the state is terminal
+    /// Failed: the deployment itself never durably recorded completion.
+    pub state: crate::UserAppOperationState,
+    /// Receipt-proven outcome of the original password write:
+    /// `captured`, `write_submitted`, `verified`, or `cancelled`.
+    pub stage: crate::DatabasePasswordStage,
+    /// Durable terminal outcome is confirmed; only exact physical lease cleanup remains.
+    pub lease_cleanup_pending: bool,
+}
+
 /// `POST /api/v1/userapp/db/{app_stage}/create-database` 请求体。
 #[derive(Debug, Deserialize, Serialize, Clone, utoipa::ToSchema)]
 pub struct UserappDbCreateDatabaseRequest {

@@ -889,6 +889,21 @@ pub trait UserAppLifecycleStore: Send + Sync {
             "Password recovery is unsupported by this store".into(),
         ))
     }
+    /// Finalize an uncertain explicit deployment password write after
+    /// identity-bound remote receipt verification. The deployment operation
+    /// itself did not record completion, so both outcomes are terminal Failed
+    /// with the receipt result kept in its checkpoint; exact snapshot CAS, the
+    /// original lease and physical target are mandatory.
+    async fn finalize_deploy_pg_recovery(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &crate::ExplicitDeploymentPasswordEvidence,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let _ = (snapshot, evidence);
+        Err(UserAppStoreError::InvalidOperation(
+            "Deployment password recovery is unsupported by this store".into(),
+        ))
+    }
     /// Persist positive, identity-bound management readiness after an uncertain
     /// preparation. Exact snapshot CAS and the original lease are required;
     /// this does not release its slot or authorize another physical startup.

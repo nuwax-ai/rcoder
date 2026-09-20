@@ -700,6 +700,102 @@ pub(super) async fn finalize_password_recovery(
     Ok(op)
 }
 
+pub(super) async fn finalize_deploy_pg_recovery(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &UserAppOperationRecord,
+    evidence: &ExplicitDeploymentPasswordEvidence,
+) -> Result<UserAppOperationRecord, Error> {
+    use DatabasePasswordStage as Stage;
+    let (mut app, mut op) = current(
+        tx,
+        backend,
+        &snapshot.app_id,
+        &snapshot.operation_id,
+        &snapshot.lifecycle_id,
+    )
+    .await?;
+    if op != *snapshot
+        || !matches!(
+            op.state,
+            UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
+        )
+    {
+        return Err(Error::VersionConflict);
+    }
+    evidence
+        .validate_operation(&op)
+        .map_err(Error::InvalidOperation)?;
+    let before: ExplicitDeploymentPasswordEvidence =
+        serde_json::from_value(op.checkpoint.clone()).map_err(storage)?;
+    before
+        .validate_operation(&op)
+        .map_err(Error::InvalidOperation)?;
+    if before.receipt_protocol != Some(1)
+        || evidence.receipt_protocol != Some(1)
+        || before.context != evidence.context
+        || before.explicit_pg_target != evidence.explicit_pg_target
+        || before.username != evidence.username
+        || !matches!(
+            before.stage,
+            Stage::WriteSubmitted | Stage::Verified | Stage::Cancelled
+        )
+        || !matches!(evidence.stage, Stage::Verified | Stage::Cancelled)
+        || (before.stage != Stage::WriteSubmitted && before.stage != evidence.stage)
+    {
+        return Err(Error::InvalidOperation(
+            "Deployment password recovery evidence changed identity or outcome".into(),
+        ));
+    }
+    let lease = get_operation_lease(tx, backend, &op.app_id, &op.operation_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if lease.context != evidence.context || !owns(&lease.context, &op) {
+        return Err(Error::VersionConflict);
+    }
+    // The deployment never durably recorded completion, so both outcomes are
+    // terminal Failed; the receipt result stays queryable in the checkpoint.
+    // The same root CAS used by admission/deletion protects this transaction.
+    let before_app = app.clone();
+    let failure_message = if evidence.stage == Stage::Verified {
+        "Explicit deployment password committed and verified; deployment completion was not recorded; re-issue the deployment"
+    } else {
+        "Explicit deployment password write was cancelled; deployment did not complete"
+    };
+    op.state = UserAppOperationState::Running;
+    let mut progress = UserAppOperationProgress {
+        app_id: op.app_id.clone(),
+        lifecycle_id: op.lifecycle_id.clone(),
+        operation_id: op.operation_id.clone(),
+        expected_revision: op.revision,
+        executor_id: evidence.context.executor_id.clone(),
+        state: UserAppOperationState::Running,
+        step: op.step.clone(),
+        checkpoint: serde_json::to_value(evidence).map_err(storage)?,
+        error_code: None,
+        error_message: None,
+    };
+    domain::advance(&mut app, &mut op, &progress)?;
+    progress.expected_revision = op.revision;
+    progress.state = UserAppOperationState::Failed;
+    progress.step = "deploy_pg_reconciled".into();
+    progress.error_code = Some("ERR_BACKEND_ERROR".into());
+    progress.error_message = Some(failure_message.into());
+    domain::advance(&mut app, &mut op, &progress)?;
+    configuration::validate_terminal(tx, &op, progress.state).await?;
+    repo::save_operation(tx, backend, &op, snapshot).await?;
+    repo::save_app(
+        tx,
+        backend,
+        &app,
+        &before_app.lifecycle_id,
+        before_app.metadata_revision,
+    )
+    .await?;
+    repo::save_slots(tx, backend, &app, &before_app).await?;
+    Ok(op)
+}
+
 pub(super) async fn confirm_database_preparation_recovery(
     tx: &mut dyn Executor,
     backend: Backend,
