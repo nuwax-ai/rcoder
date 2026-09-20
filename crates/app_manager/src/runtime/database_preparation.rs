@@ -243,10 +243,8 @@ impl AppService {
         evidence: &DatabasePreparationEvidence,
     ) -> AppResult<()> {
         let current = self
-            .runtime
-            .capture_app_mutation_target(&evidence.target.context, None)
-            .await
-            .map_err(|error| map_runtime_error("Observe captured management workload", error))?;
+            .capture_bound_app_target(&evidence.target.context, None)
+            .await?;
         let expected = &evidence.target.resource;
         // Resource version changes when our original scale write completes;
         // physical UID, name, kind and deployment generation must not change.
@@ -303,11 +301,7 @@ impl AppService {
                 .ok_or_else(|| {
                     AppOperationError::InvalidState("Management generation is missing".into())
                 })?;
-            let target = self
-                .runtime
-                .capture_app_mutation_target(&context, None)
-                .await
-                .map_err(|error| map_runtime_error("Capture management workload", error))?;
+            let target = self.capture_bound_app_target(&context, None).await?;
             let mut evidence = DatabasePreparationEvidence {
                 target,
                 deployment_generation: generation,

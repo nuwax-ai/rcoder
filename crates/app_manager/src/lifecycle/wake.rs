@@ -82,10 +82,8 @@ impl AppService {
             operation.bind_lease(&guard).await?;
             let context = operation.execution_context();
             let target = self
-                .runtime
-                .capture_app_mutation_target(&context, previous.resource_version.as_deref())
-                .await
-                .map_err(|error| map_runtime_error("Capture traffic wake target", error))?;
+                .capture_bound_app_target(&context, previous.resource_version.as_deref())
+                .await?;
             operation
                 .checkpoint("traffic_wake_target", serde_json::json!({"target":target}))
                 .await?;
@@ -176,11 +174,7 @@ impl AppService {
                     "Application was stopped during traffic wake".into(),
                 ));
             }
-            let current = self
-                .runtime
-                .capture_app_mutation_target(context, None)
-                .await
-                .map_err(|error| map_runtime_error("Verify traffic wake identity", error))?;
+            let current = self.capture_bound_app_target(context, None).await?;
             if current.resource.uid != target.resource.uid
                 || current.resource.name != target.resource.name
             {
@@ -196,11 +190,7 @@ impl AppService {
             }
             if status.phase == "Running" {
                 // Bind the status observation on both sides to the captured UID.
-                let after = self
-                    .runtime
-                    .capture_app_mutation_target(context, None)
-                    .await
-                    .map_err(|error| map_runtime_error("Confirm traffic wake identity", error))?;
+                let after = self.capture_bound_app_target(context, None).await?;
                 if after.resource.uid != target.resource.uid
                     || after.resource.name != target.resource.name
                 {
@@ -287,11 +277,7 @@ impl AppService {
         else {
             return Ok(None);
         };
-        let current = self
-            .runtime
-            .capture_app_mutation_target(&target.context, None)
-            .await
-            .map_err(|error| map_runtime_error("Confirm failed wake owner", error))?;
+        let current = self.capture_bound_app_target(&target.context, None).await?;
         if current.resource.uid != target.resource.uid
             || current.resource.name != target.resource.name
         {

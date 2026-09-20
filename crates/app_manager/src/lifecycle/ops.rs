@@ -121,12 +121,8 @@ impl AppService {
                 operation.bind_lease(&guard).await?;
                 let context = operation.execution_context();
                 let target = self
-                    .runtime
-                    .capture_app_mutation_target(&context, previous.resource_version.as_deref())
-                    .await
-                    .map_err(|error| {
-                        map_runtime_error("Capture runtime activation target", error)
-                    })?;
+                    .capture_bound_app_target(&context, previous.resource_version.as_deref())
+                    .await?;
                 operation
                     .checkpoint(
                         if restart {
@@ -277,10 +273,8 @@ impl AppService {
                 durable.bind_lease(&operation).await?;
                 let context = durable.execution_context();
                 let target = self
-                    .runtime
-                    .capture_app_mutation_target(&context, previous.resource_version.as_deref())
-                    .await
-                    .map_err(|error| map_runtime_error("Capture application stop target", error))?;
+                    .capture_bound_app_target(&context, previous.resource_version.as_deref())
+                    .await?;
                 durable
                     .checkpoint(
                         "stopping_runtime",

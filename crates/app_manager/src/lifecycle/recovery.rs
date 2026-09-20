@@ -11,6 +11,66 @@ use crate::service::{AppService, OwnedOperation};
 use crate::utils::map_runtime_error;
 
 impl AppService {
+    /// Capture the prod mutation target, falling back to the durable physical
+    /// binding when the resource's native identity predates the current
+    /// lifecycle (adopted Docker containers keep immutable labels). The
+    /// expected-version precondition is re-applied on the bound path.
+    pub(crate) async fn capture_bound_app_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        expected_version: Option<&str>,
+    ) -> AppResult<shared_types::UserAppMutationTarget> {
+        match self
+            .runtime
+            .capture_app_mutation_target(context, expected_version)
+            .await
+        {
+            Ok(target) => Ok(target),
+            Err(error) => {
+                let container_runtime_api::ContainerRuntimeError::Conflict(_) = &error else {
+                    return Err(map_runtime_error("Capture application target", error));
+                };
+                // Only the identity rejection is binding-recoverable.
+                let uid = match self
+                    .runtime
+                    .adopted_app_physical_uid(context)
+                    .await
+                    .map_err(|error| map_runtime_error("Probe application physical UID", error))?
+                {
+                    Some(uid) => uid,
+                    None => {
+                        return Err(map_runtime_error("Capture application target", error));
+                    }
+                };
+                let binding = self
+                    .metadata
+                    .store
+                    .get_resource_binding(&shared_types::ServiceType::Userapp, &uid)
+                    .await?;
+                let Some(binding) =
+                    binding.filter(|binding| binding.validate(context, &uid).is_ok())
+                else {
+                    return Err(map_runtime_error("Capture application target", error));
+                };
+                let target = self
+                    .runtime
+                    .capture_bound_app_control(context, &binding)
+                    .await
+                    .map_err(|error| {
+                        map_runtime_error("Capture bound application target", error)
+                    })?;
+                if let Some(expected) = expected_version
+                    && target.resource.resource_version.as_deref() != Some(expected)
+                {
+                    return Err(AppOperationError::Conflict(
+                        "Application mutation target version changed".into(),
+                    ));
+                }
+                Ok(target)
+            }
+        }
+    }
+
     pub async fn verify_recovered_storage(
         &self,
         app_id: &str,
@@ -949,10 +1009,8 @@ impl AppService {
             }
             let context = operation.execution_context();
             let target = self
-                .runtime
-                .capture_app_mutation_target(&context, previous.resource_version.as_deref())
-                .await
-                .map_err(|error| map_runtime_error("Capture recovery control target", error))?;
+                .capture_bound_app_target(&context, previous.resource_version.as_deref())
+                .await?;
             operation
                 .checkpoint(
                     "recovery_control_target",

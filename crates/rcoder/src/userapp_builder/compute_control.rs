@@ -829,10 +829,17 @@ async fn execute_claimed(
                 // Scale-down (or external deletion) replaced the controller.
                 // Restore a zero-replica replacement from the operation-bound
                 // archive; the Starting CAS below must win before it starts.
+                // Docker prod archives nothing (inline env secrets must never
+                // reach disk); its recovery path is explicit redeployment or
+                // the adoption endpoint, not a template replay.
                 let template: AppRestartTemplate = serde_json::from_value(
                     target
                         .get("app_restart_template")
-                        .context("Original restart template is unavailable")?
+                        .context(
+                            "Original restart template is unavailable; this backend does not \
+                             archive application restarts — redeploy explicitly or adopt the \
+                             replacement controller",
+                        )?
                         .clone(),
                 )?;
                 ensure!(template.source == old, "Restart archive source differs");
@@ -1004,7 +1011,11 @@ pub(crate) async fn resume_restart_start(
                 snapshot
                     .checkpoint
                     .get("app_restart_template")
-                    .context("Original restart template is unavailable")?
+                    .context(
+                        "Original restart template is unavailable; this backend does not \
+                         archive application restarts — redeploy explicitly or adopt the \
+                         replacement controller",
+                    )?
                     .clone(),
             )?;
             ensure!(

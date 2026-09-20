@@ -442,17 +442,13 @@ impl AppService {
                 }
             } else {
                 let target = self
-                    .runtime
-                    .capture_app_mutation_target(
+                    .capture_bound_app_target(
                         &context,
                         previous
                             .as_ref()
                             .and_then(|value| value.resource_version.as_deref()),
                     )
-                    .await
-                    .map_err(|error| {
-                        map_runtime_error("Capture deployment control target", error)
-                    })?;
+                    .await?;
                 operation
                     .checkpoint(
                         "deployment_control_target",
@@ -486,11 +482,7 @@ impl AppService {
         if let Some(idle) = request.idle_timeout_seconds
             && !configuration_applied
         {
-            let target = self
-                .runtime
-                .capture_app_mutation_target(&context, None)
-                .await
-                .map_err(|error| map_runtime_error("Capture deployment policy target", error))?;
+            let target = self.capture_bound_app_target(&context, None).await?;
             operation
                 .checkpoint(
                     "deployment_policy_target",
