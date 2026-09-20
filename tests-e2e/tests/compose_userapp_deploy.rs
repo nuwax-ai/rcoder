@@ -1264,6 +1264,195 @@ async fn verify_immediate_runtime_password(
     );
 }
 
+fn docker_container_running(name: &str) -> bool {
+    std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{.State.Running}}", name])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+        .unwrap_or(false)
+}
+
+/// CR10 治理族：同请求重放幂等、停止态改密拒绝且不隐式启动、显式重启后
+/// 新密码保留（不回写历史保存值）、完成部署不冒充未决改密接受恢复。
+async fn verify_password_governance_after_change(
+    env: &Env,
+    report: &JsonlReporter,
+    app: &str,
+    user: &str,
+) {
+    let prod_name = format!("rcoder-app-{app}");
+    let (_, identity) = get_json(env, &format!("/api/v1/userapp/{app}/lifecycle")).await;
+    let Some(lifecycle) = identity["data"]["lifecycle_id"].as_str() else {
+        report.assert_hard(
+            "CR10 governance lifecycle readable",
+            false,
+            format!("lifecycle body 截断: {}", trunc(&identity, 120)),
+        );
+        return;
+    };
+    let password = "e2e_immediate_new_password";
+    let username = || {
+        let uid = docker_inspect_id(&prod_name)?;
+        let output = std::process::Command::new("docker")
+            .args(["exec", &uid, "printenv", "POSTGRES_USER"])
+            .output()
+            .ok()?;
+        Some(String::from_utf8(output.stdout).ok()?.trim().to_owned())
+    };
+    let Some(username) = username().filter(|value| !value.is_empty()) else {
+        report.assert_hard(
+            "CR10 governance account readable",
+            false,
+            "POSTGRES_USER unavailable before replay".into(),
+        );
+        return;
+    };
+
+    // A. 同 request_id 重放：原身份幂等，不产生新操作。
+    let (status, body) = post_json(
+        env,
+        "/api/v1/userapp/db/prod/reset-password",
+        json!({"app_id":app,"lifecycle_id":lifecycle,"request_id":"immediateprodpassword","username":username,"password":password}),
+    )
+    .await;
+    report.assert_hard(
+        "CR10 same-request replay is idempotent",
+        status.is_success() && http_ok(&body),
+        format!("HTTP {status}; code={:?}", body["code"].as_str()),
+    );
+
+    // B. 停止态改密明确拒绝，且不隐式启动业务。
+    let (stop_s, stop_b) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/stop?user_id={user}"),
+        json!({}),
+    )
+    .await;
+    let stopped = stop_s.is_success()
+        && http_ok(&stop_b)
+        && stop_b["data"]["status"].as_str() == Some("stopped");
+    report.assert_hard(
+        "CR10 governance stop before rejected write",
+        stopped,
+        format!("HTTP {stop_s}, body 截断: {}", trunc(&stop_b, 120)),
+    );
+    if !stopped {
+        return;
+    }
+    let mut settled = false;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(90) {
+        if !docker_container_running(&prod_name) {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    report.assert_hard(
+        "CR10 governance container stopped",
+        settled,
+        format!("{:.0}s 内停止", t0.elapsed().as_secs_f64()),
+    );
+    if !settled {
+        return;
+    }
+    let (status, body) = post_json(
+        env,
+        "/api/v1/userapp/db/prod/reset-password",
+        json!({"app_id":app,"lifecycle_id":lifecycle,"request_id":"governancestopped","username":username,"password":password}),
+    )
+    .await;
+    report.assert_hard(
+        "CR10 stopped prod rejects password change",
+        !status.is_success() || !http_ok(&body),
+        format!("HTTP {status}; code={:?}", body["code"].as_str()),
+    );
+    report.assert_hard(
+        "CR10 rejected change does not wake the container",
+        !docker_container_running(&prod_name),
+        "No implicit business startup from a refused password write".into(),
+    );
+
+    // C. 用户显式重启后新密码保留：启动、重启均不回写历史保存值。
+    let (start_s, start_b) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/start?user_id={user}"),
+        json!({}),
+    )
+    .await;
+    report.assert_hard(
+        "CR10 explicit start after stop",
+        start_s.is_success() && http_ok(&start_b),
+        format!("HTTP {start_s}, body 截断: {}", trunc(&start_b, 120)),
+    );
+    let mut running = false;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(150) {
+        if docker_container_running(&prod_name) {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    report.assert_hard(
+        "CR10 explicit start container running",
+        running,
+        format!("{:.0}s 内运行", t0.elapsed().as_secs_f64()),
+    );
+    if !running {
+        return;
+    }
+    // PG 在容器启动窗口内异步初始化，重试窗口内以新密码 TCP 认证。
+    let mut retained = false;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(150) {
+        if let Some(uid) = docker_inspect_id(&prod_name)
+            && cr10_tcp_login(&uid, &username, password)
+        {
+            retained = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    report.assert_hard(
+        "CR10 explicit restart retains the new password",
+        retained,
+        "Neither start nor wake replays a historically saved password".into(),
+    );
+
+    // D. 已完成部署不接受显式改密恢复（无未决回执证据）。
+    let (restart_s, restart_b) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/restart?user_id={user}"),
+        json!({"pg":{"username":username,"password":password}}),
+    )
+    .await;
+    let operation_id = restart_b["data"]["operation_id"]
+        .as_str()
+        .map(str::to_owned);
+    report.assert_hard(
+        "CR10 restart with explicit pg aligns",
+        restart_s.is_success() && http_ok(&restart_b) && operation_id.is_some(),
+        format!("HTTP {restart_s}, body 截断: {}", trunc(&restart_b, 150)),
+    );
+    let Some(operation_id) = operation_id else {
+        return;
+    };
+    let (recover_s, recover_b) = post_json(
+        env,
+        "/api/v1/userapp/deploy-pg/recover",
+        json!({"app_id":app,"lifecycle_id":lifecycle,"operation_id":operation_id,"expected_revision":0,"username":username,"password":password}),
+    )
+    .await;
+    report.assert_hard(
+        "CR10 completed deployment refuses deploy-pg recovery",
+        !recover_s.is_success() || !http_ok(&recover_b),
+        format!("HTTP {recover_s}; code={:?}", recover_b["code"].as_str()),
+    );
+}
+
 /// C4 app-files prod：upload → files → delete + upload-from-url（制品回灌）。
 async fn verify_app_files_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
     // 部署 API 的同步等待边界 = 部署段完成（服务启动结果异步可见，start.rs
@@ -1857,6 +2046,7 @@ async fn userapp_deploy_full_chain() {
         // Last business mutation: later explicit restart requires caller-owned
         // application credential configuration, not automatic platform injection.
         verify_immediate_runtime_password(&env, &report, &app, user).await;
+        verify_password_governance_after_change(&env, &report, &app, user).await;
         cleanup_prod(&env, &report, &app, user).await;
     }
     // No production request was sent when build/artifact preparation failed.

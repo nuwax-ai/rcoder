@@ -46,6 +46,18 @@ REQUIRED['userapp_deploy_full_chain'] |= {
     'CR10 password change preserves production UID and owner',
     'CR10 password change leaves development unchanged',
     'CR10 business remains available after password change',
+    'CR10 governance lifecycle readable',
+    'CR10 governance account readable',
+    'CR10 same-request replay is idempotent',
+    'CR10 governance stop before rejected write',
+    'CR10 governance container stopped',
+    'CR10 stopped prod rejects password change',
+    'CR10 rejected change does not wake the container',
+    'CR10 explicit start after stop',
+    'CR10 explicit start container running',
+    'CR10 explicit restart retains the new password',
+    'CR10 restart with explicit pg aligns',
+    'CR10 completed deployment refuses deploy-pg recovery',
 }
 
 REQUIRED['userapp_scope_isolation_during_deploy'] = {
