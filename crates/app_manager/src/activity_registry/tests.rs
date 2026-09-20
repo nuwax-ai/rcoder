@@ -825,7 +825,12 @@ async fn traffic_wake_does_not_confirm_a_replacement_running_resource() {
         "{outcome:?}"
     );
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
-    assert!(runtime.lease_held.load(Ordering::SeqCst));
+    // 确认启动写之后的观察失败按证据精确终结（codex wake 批次语义）：
+    // 操作终态 Failed@traffic_wake_observation_failed，checkpoint 携带
+    // start_write_acknowledged 与原捕获目标；确认写+终态成立后原租约
+    // 随终态释放（N1"确认终态+释放原租约"同序），不再是未收束的
+    // RecoveryRequired 保护。
+    assert!(!runtime.lease_held.load(Ordering::SeqCst));
     let operations = fixture
         .0
         .metadata
@@ -833,15 +838,7 @@ async fn traffic_wake_does_not_confirm_a_replacement_running_resource() {
         .unfinished_operations(None, 10)
         .await
         .expect("persisted operations");
-    assert_eq!(operations.len(), 1);
-    assert_eq!(
-        operations[0].state,
-        shared_types::UserAppOperationState::RecoveryRequired
-    );
-    assert_eq!(
-        operations[0].checkpoint["target"]["resource"]["uid"],
-        "uid-replacedwake"
-    );
+    assert!(operations.is_empty(), "operation closed terminally");
     assert!(registry.is_stopped("replacedwake"));
 }
 
