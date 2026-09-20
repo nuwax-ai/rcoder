@@ -36,6 +36,10 @@ pub(super) async fn probe_owner(address: &str) -> Option<RuntimeIdentityView> {
 }
 
 /// Stop must distinguish an absent listener from an unhealthy/foreign listener.
+/// A responding app-cli whose runtime-control kernel is inactive (the local
+/// spawn path starts `app-cli run`, which supervises but has no runtime API)
+/// is not a runtime owner for stop purposes: the caller falls back to its own
+/// registered local pid, which only ever stops a process this server spawned.
 pub(super) async fn probe_owner_for_stop(address: &str) -> Result<Option<RuntimeIdentityView>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -61,6 +65,13 @@ pub(super) async fn probe_owner_for_stop(address: &str) -> Result<Option<Runtime
             return Err(error).context("owner observation failed; stop is not confirmed");
         }
     };
+    if response.status().as_u16() == 503 {
+        // ERR_PROTOCOL_UNSUPPORTED: an app-cli is listening without the
+        // runtime kernel (run mode). It is not a runtime owner; absence is
+        // the correct classification and the registered-local-pid path —
+        // which never kills an unregistered process — decides what stops.
+        return Ok(None);
+    }
     let body: serde_json::Value = response
         .error_for_status()
         .context("owner identity rejected")?
