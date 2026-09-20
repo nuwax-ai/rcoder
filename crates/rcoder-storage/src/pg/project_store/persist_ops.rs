@@ -401,7 +401,8 @@ mod tests {
                 "container-1",
                 &basic,
                 &ServiceType::WebAgentRunner,
-                container
+                container,
+                None
             )
             .is_err()
         );
@@ -412,7 +413,8 @@ mod tests {
                 "container-1",
                 &basic,
                 &ServiceType::WebAgentRunner,
-                container
+                container,
+                None
             )
             .is_err()
         );
@@ -438,6 +440,7 @@ mod tests {
             &basic,
             &ServiceType::WebAgentRunner,
             info.persistence_identity().container.as_ref().unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(snapshot.container_id.as_deref(), Some("cid-1"));
