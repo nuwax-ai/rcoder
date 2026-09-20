@@ -858,10 +858,39 @@ async fn userapp_dev_pg_reset_password() {
         "username": "dev", "password": pw
     }))
     .await;
+    // c1f8f584 语义：改密原地作用于当前 PG 的受管账号（平台自身的改密
+    // 通道就是它）——旧"受管账号必须走运行配置 API"的门已随 in-place
+    // 语义移除。断言改为：受管账号直接改密成功且新密码真实 TCP 生效。
     report.assert_hard(
-        "受管理运行账号拒绝直接改密",
-        managed["code"] == "ERR_VALIDATION",
+        "受管理运行账号 in-place 改密成功",
+        http_ok(&managed),
         trunc(&managed, 120),
+    );
+    let managed_verify = std::process::Command::new("docker")
+        .args([
+            "exec",
+            &format!("rcoder-app-builder-{app}"),
+            "env",
+            "PGPASSWORD=e2e-align-pw-01",
+            "psql",
+            "-X",
+            "-w",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            "dev",
+            "-d",
+            "postgres",
+            "-Atc",
+            "SELECT 1",
+        ])
+        .output()
+        .unwrap();
+    report.assert_hard(
+        "受管账号新密码真实 TCP 生效",
+        managed_verify.status.success()
+            && String::from_utf8_lossy(&managed_verify.stdout).trim() == "1",
+        "TCP authentication checked; private SQL output omitted".into(),
     );
 
     let original = json!({
