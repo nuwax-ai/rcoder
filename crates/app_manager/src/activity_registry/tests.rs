@@ -294,13 +294,22 @@ async fn wake_timeout_when_never_ready() {
 
     let outcome = reg.ensure_running("appt").await;
     assert_eq!(outcome, WakeOutcome::Timeout);
-    // Timeout retains the durable mutation; another request cannot start again.
+    // Timeout closes the attempt with evidence (confirmed start write +
+    // observation deadline) instead of leaving an un-reconciled operation.
+    // The stopped mark is retained, so a later traffic wake is a fresh,
+    // legitimate retry — not a bypass of the stop semantics (single-flight
+    // still serializes concurrent wakeups).
     assert!(reg.is_stopped("appt"));
-    assert!(matches!(
+    assert_eq!(
         reg.ensure_running("appt").await,
-        WakeOutcome::Failed(_)
-    ));
-    assert_eq!(rt.scale_calls.load(Ordering::SeqCst), 1);
+        WakeOutcome::Timeout,
+        "a retry after an observed-timeout wakes again and times out again"
+    );
+    assert_eq!(
+        rt.scale_calls.load(Ordering::SeqCst),
+        2,
+        "each wake attempt scales once"
+    );
 }
 
 #[tokio::test]
