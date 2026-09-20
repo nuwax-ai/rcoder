@@ -84,7 +84,7 @@ pub fn request_from_env() -> Result<crate::server::DeployRequest> {
         sha256,
         local_path: None,
         execution_target: None,
-        requires_configuration_activation: false,
+
         run_pg: None,
     })
 }

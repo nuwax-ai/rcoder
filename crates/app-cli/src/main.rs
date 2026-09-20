@@ -8,26 +8,6 @@ use app_cli::CliArgs;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = match CliArgs::parse().command {
-        app_cli::config::Command::SealSource(args) => {
-            use std::io::{Read, Write};
-            let mut input = Vec::new();
-            std::io::stdin()
-                .take(65_537)
-                .read_to_end(&mut input)
-                .context("read source seal authorization")?;
-            anyhow::ensure!(
-                input.len() <= 65_536,
-                "source seal authorization exceeds limit"
-            );
-            let authorization =
-                serde_json::from_slice(&input).context("decode source seal authorization")?;
-            let seal =
-                app_cli::server::seal_stopped_source(&args.workspace, &authorization).await?;
-            let mut output = std::io::stdout().lock();
-            serde_json::to_writer(&mut output, &seal).context("write source seal response")?;
-            writeln!(output).context("finish source seal response")?;
-            return Ok(());
-        }
         app_cli::config::Command::GenLock(args) => {
             return app_cli::devtool::gen_lock(&args.workspace).await;
         }
@@ -76,10 +56,7 @@ async fn main() -> anyhow::Result<()> {
         let state_root =
             app_cli::runtime_kernel::RuntimeStore::resolve_root(&args.workspace, &application_id)?;
         match app_cli::platform::owner_guard::OwnerGuard::try_acquire(&state_root)? {
-            Some(guard) => {
-                app_cli::server::require_unsealed_legacy_source(&state_root)?;
-                guard
-            }
+            Some(guard) => guard,
             None => {
                 anyhow::ensure!(
                     !app_cli::deploy::deploy_requested(),

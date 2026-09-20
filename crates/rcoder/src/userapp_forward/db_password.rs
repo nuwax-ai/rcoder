@@ -68,7 +68,29 @@ fn replay_result(
 }
 
 fn store_error(error: UserAppStoreError) -> AppError {
-    super::runtime_configuration::error(error)
+    match error {
+        UserAppStoreError::NotFound => AppError::not_found("Application was not found"),
+        UserAppStoreError::LifecycleConflict | UserAppStoreError::OwnershipConflict => {
+            AppError::conflict(
+                "Application lifecycle changed; refresh its identity before changing the password",
+            )
+        }
+        UserAppStoreError::VersionConflict => AppError::conflict(
+            "Application operation revision changed; reload the original operation",
+        ),
+        UserAppStoreError::OperationInProgress(blocker) => {
+            AppError::conflict("A conflicting application operation is in progress")
+                .with_operation_id(blocker.operation_id.clone())
+                .with_blocker(blocker)
+        }
+        UserAppStoreError::InvalidOperation(message) => AppError::bad_request(&message),
+        // Driver diagnostics can include a failed row. Never return or log private
+        // credential-table values; original request identity permits safe replay.
+        UserAppStoreError::Storage(_) => AppError::with_message(
+            ERR_BACKEND_ERROR,
+            "Application operation storage is unavailable; retry using the original request identity",
+        ),
+    }
 }
 
 fn classify_lease_error(error: &container_runtime_api::ContainerRuntimeError) -> AppError {
@@ -340,43 +362,12 @@ async fn coordinated(
             .await
             .map_err(|_| backend("Database management observation timed out"))??;
         if !available {
-            let request_id = body
-                .request_id
-                .as_deref()
-                .ok_or_else(|| backend("Database request identity is missing"))?;
-            let child_input = serde_json::to_vec(&(
-                "database_management",
-                &body.app_id,
-                &app.lifecycle_id,
-                request_id,
-            ))
-            .map_err(|_| backend("Encode database preparation identity"))?;
-            let preparation_id: String = Sha256::digest(child_input)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            state
-                .app_service
-                .prepare_prod_database(
-                    &body.app_id,
-                    &app.lifecycle_id,
-                    &preparation_id,
-                    &context.request_fingerprint,
-                    deadline,
-                )
-                .await
-                .map_err(|error| {
-                    let result = AppError::with_message(error.code(), error.to_string())
-                        .with_operation_id(preparation_id.clone());
-                    match error {
-                        app_manager::AppOperationError::ConflictBlocked { blocker, .. } => result
-                            .with_operation_id(blocker.operation_id.clone())
-                            .with_blocker(blocker),
-                        _ => result,
-                    }
-                })?;
+            return Err(AppError::conflict(
+                "Production database is not running; start the container explicitly before changing its password",
+            ));
         }
     }
+
     let lease_result = timeout_at(deadline, async {
         match stage {
             UserappStage::Dev => state
@@ -530,19 +521,6 @@ async fn coordinated(
                 .map_err(|_| backend("Encode database target failed"))?,
         )
         .await?;
-        // Container env represents accounts already running without a saved head.
-        let active = runner
-            .run("printf '%s' \"${POSTGRES_USER:-}\"")
-            .await
-            .map_err(|_| backend("Read active database account failed"))?;
-        if active.exit_code != 0 || active.stdout.is_empty() {
-            return Err(backend("Active database account is unavailable"));
-        }
-        if active.stdout == username {
-            return Err(AppError::bad_request(
-                "Managed runtime accounts must use the runtime configuration API",
-            ));
-        }
         loop {
             let ready = runner
                 .run(&admin.ready_command())

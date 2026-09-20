@@ -207,7 +207,7 @@ pub(super) async fn save(
 /// Invoked in the admission transaction after its root CAS, before any slot or
 /// operation is committed. Never holds a database transaction during remote SQL.
 pub(super) async fn guard_database_admin(
-    tx: &mut dyn Executor,
+    _tx: &mut dyn Executor,
     operation: &UserAppOperationRecord,
 ) -> Result<(), Error> {
     if !matches!(
@@ -224,50 +224,9 @@ pub(super) async fn guard_database_admin(
         ));
     };
     pg_utils::validate_pg_identifier(username).map_err(Error::InvalidOperation)?;
-    let Some(row) = head(
-        tx,
-        &operation.app_id,
-        &operation.lifecycle_id,
-        operation.scope,
-    )
-    .await?
-    else {
-        return Ok(());
-    };
-    status(&row)?;
-    // Saved, applied and uncertain-in-flight versions can reference distinct
-    // accounts. Checking only the newest save would expose the running account.
-    for version in [
-        Some(row.saved_version),
-        row.applied_version,
-        row.applying_version,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let configuration =
-            models::RuntimeConfigVersion::filter_by_app_id_and_lifecycle_id_and_scope_and_version(
-                &operation.app_id,
-                &operation.lifecycle_id,
-                &row.scope,
-                version,
-            )
-            .first()
-            .exec(tx)
-            .await
-            .map_err(storage)?
-            .ok_or_else(|| invalid("Managed configuration version is missing"))?;
-        if configuration.payload_version != 1 {
-            return Err(invalid("Unknown runtime configuration payload version"));
-        }
-        if configuration.pg_username == *username {
-            return Err(invalid(
-                "Managed runtime accounts must use the runtime configuration API",
-            ));
-        }
-    }
     Ok(())
 }
+
 fn crate_validate_pg(pg: &StartPgCredential) -> Result<(), Error> {
     pg_utils::validate_pg_identifier(&pg.username).map_err(Error::InvalidOperation)?;
     if pg.password.is_empty() || pg.password.contains('\0') {

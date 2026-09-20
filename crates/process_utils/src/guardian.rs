@@ -226,7 +226,10 @@ pub async fn spawn_guarded(
         instance_id,
         phase: "Pending".into(),
         command_record: command_record.map(Path::to_path_buf),
-        command_digest: format!("{:x}", Sha256::digest(serde_json::to_vec(&spec)?)),
+        command_digest: Sha256::digest(serde_json::to_vec(&spec)?)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
     };
     save(&root, &receipt)?;
     let mut guardian = tokio::process::Command::new(std::env::current_exe()?);
@@ -327,7 +330,11 @@ async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
     );
     let spec: Spec = serde_json::from_slice(&bytes)?;
     ensure!(
-        format!("{:x}", Sha256::digest(serde_json::to_vec(&spec)?)) == receipt.command_digest,
+        Sha256::digest(serde_json::to_vec(&spec)?)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+            == receipt.command_digest,
         "guardian command differs from original authorized specification"
     );
     let mut command = tokio::process::Command::new(spec.program);

@@ -211,7 +211,6 @@ async fn attach_coordinator(
         pingora_ports: DashMap::new(),
         release_locks: DashMap::new(),
         metadata: crate::runtime::metadata::AppMetadataStore::new(store.clone()),
-        runtime_configuration: store,
         dev_cleanup: std::sync::RwLock::new(None),
         dev_locator: std::sync::RwLock::new(None),
         builder_recovery: std::sync::RwLock::new(None),

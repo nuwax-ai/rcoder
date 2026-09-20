@@ -643,7 +643,6 @@ mod tests {
                 activity.clone(),
                 None,
                 metadata_store.clone(),
-                metadata_store.clone(),
             )
             .await
             .expect("AppService"),
@@ -654,7 +653,6 @@ mod tests {
         let (pod_created_tx, _) = broadcast::channel(32);
         let state = Arc::new(AppState {
             userapp_store: metadata_store.clone(),
-            userapp_runtime_configuration: metadata_store.clone(),
             userapp_store_control: metadata_store,
             userapp_op_flight: Arc::new(
                 crate::userapp_builder::shutdown_gate::OperationFlightGate::default(),

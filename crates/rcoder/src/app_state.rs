@@ -38,7 +38,6 @@ pub struct SessionInfo {
 #[derive(Clone)]
 pub struct AppState {
     pub userapp_store: Arc<dyn shared_types::UserAppLifecycleStore>,
-    pub userapp_runtime_configuration: Arc<dyn shared_types::UserAppRuntimeConfigurationStore>,
     /// 存储关机控制（trait-design §6）：只供关机协调者使用，业务消费者
     /// 不得调用 shutdown。
     pub userapp_store_control: Arc<dyn rcoder_storage::userapp_lifecycle::UserAppStoreControl>,
@@ -139,7 +138,6 @@ impl AppState {
             activity.set_persistence(opened.activity);
         }
         let userapp_store = opened.store;
-        let userapp_runtime_configuration = opened.configuration;
         let userapp_store_control = opened.control;
         let app_service_arc: Arc<app_manager::service::AppService> = Arc::new(
             app_manager::service::AppService::new(
@@ -148,7 +146,6 @@ impl AppState {
                 activity.clone(),
                 pingora.clone(),
                 userapp_store.clone(),
-                userapp_runtime_configuration.clone(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?,
@@ -170,7 +167,6 @@ impl AppState {
 
         let state = Arc::new(Self {
             userapp_store,
-            userapp_runtime_configuration,
             userapp_store_control,
             userapp_op_flight: app_service_arc.operation_flight(),
             userapp_recovery_handle: Arc::new(std::sync::Mutex::new(None)),

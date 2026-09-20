@@ -15,7 +15,6 @@ pub(crate) mod db;
 mod db_password;
 mod error_body;
 pub(crate) mod forward;
-pub(crate) mod runtime_configuration;
 pub(crate) mod semantics;
 pub(crate) mod upstream;
 pub(crate) mod workspace;
@@ -92,8 +91,7 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
 pub(crate) mod guard_tables {
     /// rcoder 本地实现的 userapp 路径快照（`routes()` 显式入口部分；
     /// 守卫闭包比对用——改动路由须同步）。
-    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 18] = [
-        "/api/v1/userapp/{app_id}/prod/runtime-configuration",
+    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 17] = [
         "/api/v1/userapp/{app_id}/builder/adopt",
         "/api/v1/userapp/workspace",
         "/api/v1/userapp/db/{app_stage}/reset-password",
@@ -184,10 +182,6 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/v1/userapp/db/{app_stage}/reset-password/recover",
             post(db::recover_password),
-        )
-        .route(
-            "/api/v1/userapp/{app_id}/prod/runtime-configuration",
-            axum::routing::get(runtime_configuration::status).put(runtime_configuration::save),
         )
         .route(
             "/api/v1/userapp/db/{app_stage}/create-database",

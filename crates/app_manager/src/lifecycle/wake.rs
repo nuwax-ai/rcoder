@@ -98,16 +98,6 @@ impl AppService {
                     })?;
                 self.wait_for_captured_wake(&target).await?
             };
-            if self
-                .runtime_configuration
-                .operation_runtime_configuration(&context)
-                .await?
-                .is_some()
-            {
-                guard.mark_mutating()?;
-                self.observe_applied_runtime_configuration(&context, deadline)
-                    .await?;
-            }
             Ok(outcome)
         };
         let observation = timeout_at(deadline, activation).await;

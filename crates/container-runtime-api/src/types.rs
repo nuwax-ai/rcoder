@@ -893,15 +893,3 @@ mod identity_tests {
         assert_eq!(info.identity_key(), None);
     }
 }
-
-/// Durable identity of a one-shot offline source seal, never a business workload.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OfflineSourceSealTarget {
-    pub source: shared_types::UserAppMutationTarget,
-    pub helper_name: String,
-    pub helper_uid: String,
-    pub authorization: shared_types::RuntimeGenerationHandoff,
-    /// Minimal immutable helper configuration; excludes PG credentials.
-    pub specification: serde_json::Value,
-}

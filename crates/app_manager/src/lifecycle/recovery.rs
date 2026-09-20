@@ -489,23 +489,6 @@ impl AppService {
                 ));
             }
             let context = operation.execution_context();
-            if matches!(
-                command,
-                Command::Start { traffic: false } | Command::Restart
-            ) && self
-                .runtime_configuration
-                .operation_runtime_configuration(&context)
-                .await?
-                .is_some()
-            {
-                self.replace_captured_runtime_configuration(
-                    previous.clone(),
-                    &mut operation,
-                    &guard,
-                )
-                .await?;
-                return Ok(previous);
-            }
             let target = self
                 .runtime
                 .capture_app_mutation_target(&context, previous.resource_version.as_deref())
@@ -576,8 +559,6 @@ impl AppService {
                     }
                     if *traffic {
                         self.wait_for_captured_wake(&target).await?;
-                        self.observe_applied_runtime_configuration(&context, deadline)
-                            .await?;
                     }
                 }
             }

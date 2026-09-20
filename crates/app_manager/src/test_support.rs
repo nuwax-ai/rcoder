@@ -31,9 +31,6 @@ use crate::service::AppService;
 pub(crate) struct MockRuntime {
     pub configuration_replies:
         std::sync::Mutex<std::collections::VecDeque<container_runtime_api::ExecResult>>,
-    pub offline_source_calls: std::sync::Mutex<Vec<&'static str>>,
-    pub offline_source_run_fails: AtomicBool,
-    pub offline_source_cleanup_fails: AtomicBool,
     pub configuration_commands: std::sync::Mutex<Vec<Vec<String>>>,
     pub configuration_targets: std::sync::Mutex<Vec<shared_types::RuntimeConfigurationTarget>>,
     pub mutation_uid_override: std::sync::Mutex<Option<String>>,
@@ -231,13 +228,6 @@ impl UserAppDeploymentRuntime for MockRuntime {
         generation: &str,
     ) -> ContainerRuntimeResult<shared_types::RuntimeConfigurationTarget> {
         assert!(self.lease_held.load(Ordering::SeqCst));
-        if self
-            .deployments
-            .get(&context.app_id)
-            .is_some_and(|status| status.replicas == 0)
-        {
-            return Err(ContainerRuntimeError::ManagementNotRunning);
-        }
         let target = shared_types::RuntimeConfigurationTarget {
             physical_uid: format!("test-{}", context.lifecycle_id),
             deployment_generation: generation.into(),
@@ -500,61 +490,6 @@ impl UserAppDeploymentRuntime for MockRuntime {
         self.start_app_target(target).await
     }
 
-    async fn prepare_stopped_source_seal(
-        &self,
-        source: &shared_types::UserAppMutationTarget,
-        authorization: &shared_types::RuntimeGenerationHandoff,
-    ) -> ContainerRuntimeResult<container_runtime_api::OfflineSourceSealTarget> {
-        assert!(self.lease_held.load(Ordering::SeqCst));
-        assert_eq!(
-            self.deployments
-                .get(&source.context.app_id)
-                .unwrap()
-                .replicas,
-            0
-        );
-        self.offline_source_calls.lock().unwrap().push("prepare");
-        Ok(container_runtime_api::OfflineSourceSealTarget {
-            source: source.clone(),
-            helper_name: "originalhelper".into(),
-            helper_uid: "originalhelperuid".into(),
-            authorization: authorization.clone(),
-            specification: serde_json::json!({}),
-        })
-    }
-    async fn run_stopped_source_seal(
-        &self,
-        target: &container_runtime_api::OfflineSourceSealTarget,
-    ) -> ContainerRuntimeResult<shared_types::RuntimeGenerationSourceSeal> {
-        assert!(self.lease_held.load(Ordering::SeqCst));
-        assert_eq!(target.helper_uid, "originalhelperuid");
-        self.offline_source_calls.lock().unwrap().push("run");
-        if self.offline_source_run_fails.load(Ordering::SeqCst) {
-            return Err(ContainerRuntimeError::Conflict(
-                "Helper result unknown".into(),
-            ));
-        }
-        Ok(shared_types::RuntimeGenerationSourceSeal {
-            authorization: target.authorization.clone(),
-            artifact_release_id: "latesthotrelease".into(),
-            source_journal_sha256: "b".repeat(64),
-            desired_revision: 4,
-        })
-    }
-    async fn cleanup_stopped_source_seal(
-        &self,
-        target: &container_runtime_api::OfflineSourceSealTarget,
-    ) -> ContainerRuntimeResult<()> {
-        assert_eq!(target.helper_uid, "originalhelperuid");
-        self.offline_source_calls.lock().unwrap().push("cleanup");
-        if self.offline_source_cleanup_fails.load(Ordering::SeqCst) {
-            return Err(ContainerRuntimeError::Conflict(
-                "Helper cleanup unknown".into(),
-            ));
-        }
-        Ok(())
-    }
-
     async fn start_app_management_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
@@ -746,6 +681,16 @@ impl UserAppDeploymentRuntime for MockRuntime {
 /// 直构造 AppService（绕过 `new` 的 HostPathResolver/K8s 前置校验副作用），
 /// Docker 模式 + 指定 workspace_root（测试 tempdir）。
 pub(crate) async fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime>) -> AppService {
+    test_service_with_store(workspace_root, runtime).await.0
+}
+
+pub(crate) async fn test_service_with_store(
+    workspace_root: &Path,
+    runtime: Arc<MockRuntime>,
+) -> (
+    AppService,
+    Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
+) {
     tokio::fs::create_dir_all(workspace_root)
         .await
         .expect("test workspace");
@@ -768,7 +713,7 @@ pub(crate) async fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime
         ..AppManagerConfig::default()
     };
     let store = Arc::new(store);
-    AppService {
+    let service = AppService {
         operation_flight: Arc::default(),
         config,
         runtime: runtime as Arc<dyn UserAppRuntime>,
@@ -777,12 +722,12 @@ pub(crate) async fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime
         pingora_ports: DashMap::new(),
         release_locks: DashMap::new(),
         metadata: crate::runtime::metadata::AppMetadataStore::new(store.clone()),
-        runtime_configuration: store,
         dev_cleanup: std::sync::RwLock::new(None),
         dev_locator: std::sync::RwLock::new(None),
         builder_recovery: std::sync::RwLock::new(None),
         deploy_list_cache: tokio::sync::Mutex::new(None),
-    }
+    };
+    (service, store)
 }
 
 /// 合法 schema_version=1 release lock（build_container_params 的 inject_release_identity

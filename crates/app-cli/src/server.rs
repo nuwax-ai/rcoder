@@ -56,7 +56,6 @@ pub struct ServerState {
     /// 启动恢复未完成（P1-01）：API 先 bind 后、恢复完成前，写端点与 /ready
     /// 就绪判定被门控——恢复期不受理运行态变更、不以 Idle 语义应答探针。
     initializing: std::sync::atomic::AtomicBool,
-    configuration_gate: Option<Arc<crate::configuration_gate::ConfigurationGate>>,
     preparations: Arc<preparation::Preparations>,
     journal: std::sync::Mutex<Option<Journal>>,
     generation: String,
@@ -188,10 +187,6 @@ pub struct DeployRequest {
     pub local_path: Option<std::path::PathBuf>,
     #[serde(default)]
     pub(crate) execution_target: Option<ExecutionTarget>,
-    /// Secrets are never journaled; a restart must use the managed configuration
-    /// gate instead of silently falling back to inherited/default credentials.
-    #[serde(default)]
-    pub(crate) requires_configuration_activation: bool,
     #[serde(skip)]
     pub(crate) run_pg: Option<shared_types::StartPgCredential>,
 }
@@ -280,7 +275,6 @@ impl ServerState {
             shutdown_grace_seconds: std::sync::atomic::AtomicU64::new(30),
             shutdown_group_count: std::sync::atomic::AtomicU64::new(1),
             initializing: std::sync::atomic::AtomicBool::new(true),
-            configuration_gate: None,
             preparations: Arc::new(preparation::Preparations::default()),
             journal: std::sync::Mutex::new(None),
             generation: std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
@@ -488,12 +482,6 @@ impl ServerState {
         self.initializing.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub(crate) fn configuration_gate(
-        &self,
-    ) -> Option<Arc<crate::configuration_gate::ConfigurationGate>> {
-        self.configuration_gate.clone()
-    }
-
     pub(crate) fn begin_auxiliary_write(&self) -> Result<AuxiliaryWriter<'_>> {
         let _admission = self
             .admission
@@ -504,10 +492,6 @@ impl ServerState {
                 && !self.initializing()
                 && !self.runtime_recovery_hold_active(),
             "runtime write admission is closed"
-        );
-        anyhow::ensure!(
-            !self.source_generation_sealed()?,
-            "source generation is reserved for replacement"
         );
         anyhow::ensure!(
             self.auxiliary_writers
@@ -521,153 +505,6 @@ impl ServerState {
             state: self,
             confirmed: false,
         })
-    }
-
-    pub(crate) fn seal_generation_source(
-        &self,
-        workspace: &std::path::Path,
-        authorization: &shared_types::RuntimeGenerationHandoff,
-    ) -> Result<Option<shared_types::RuntimeGenerationSourceSeal>> {
-        use sha2::{Digest, Sha256};
-        authorization.validate().map_err(anyhow::Error::msg)?;
-        let _admission = self
-            .admission
-            .lock()
-            .map_err(|_| anyhow::anyhow!("source handoff admission lock poisoned"))?;
-        anyhow::ensure!(
-            authorization.previous_generation == self.generation,
-            "source handoff generation mismatch"
-        );
-        anyhow::ensure!(
-            !self.runtime_recovery_hold_active()
-                && !self
-                    .shutdown_unconfirmed
-                    .load(std::sync::atomic::Ordering::Acquire),
-            "source runtime requires recovery"
-        );
-        if self
-            .auxiliary_writers
-            .load(std::sync::atomic::Ordering::Acquire)
-            != 0
-            || !matches!(
-                self.phase(),
-                ServerPhase::Running | ServerPhase::Idle | ServerPhase::Failed(_)
-            )
-        {
-            return Ok(None);
-        }
-        let kernel = self
-            .runtime_kernel()
-            .context("source runtime kernel unavailable")?;
-        kernel.try_seal_source(|write_started| {
-            let guard = self
-                .journal
-                .lock()
-                .map_err(|_| anyhow::anyhow!("source journal lock poisoned"))?;
-            let journal = guard.as_ref().context("source journal unavailable")?;
-            let receipt = journal
-                .receipt
-                .as_ref()
-                .context("source artifact is unconfirmed")?;
-            anyhow::ensure!(
-                matches!(
-                    receipt.boundary,
-                    Boundary::Active | Boundary::RestoredActive | Boundary::StartupFailed
-                ),
-                "source journal has an unconfirmed mutation boundary"
-            );
-            anyhow::ensure!(
-                receipt.generation == self.generation,
-                "source journal generation mismatch"
-            );
-            let active = receipt
-                .active
-                .as_ref()
-                .context("source active artifact missing")?;
-            let request = active
-                .request
-                .as_ref()
-                .context("source execution target missing")?;
-            let target = execution_workspace(workspace, request.execution_target);
-            crate::migration_journal::require_confirmed_migrations(workspace)?;
-            crate::migration_journal::require_confirmed_migrations(&target)?;
-            let release = crate::manifest::read_release_lock(&target)?;
-            anyhow::ensure!(
-                release.release_id == active.artifact_release_id,
-                "source release differs from confirmed artifact"
-            );
-            let (_, desired_revision) = kernel.store().load_desired()?;
-            let seal = shared_types::RuntimeGenerationSourceSeal {
-                authorization: authorization.clone(),
-                artifact_release_id: active.artifact_release_id.clone(),
-                source_journal_sha256: format!(
-                    "{:x}",
-                    Sha256::digest(serde_json::to_vec(receipt)?)
-                ),
-                desired_revision,
-            };
-            if let Some(previous) = journal.source_seal()?
-                && previous.authorization.previous_generation == self.generation
-            {
-                anyhow::ensure!(
-                    previous == seal,
-                    "source is reserved for a different handoff or changed state"
-                );
-                return Ok(previous);
-            }
-            *write_started = true;
-            if let Err(error) = journal.write_source_seal(&seal) {
-                self.runtime_recovery_hold
-                    .store(true, std::sync::atomic::Ordering::Release);
-                return Err(error);
-            }
-            Ok(seal)
-        })
-    }
-
-    fn source_generation_sealed(&self) -> Result<bool> {
-        let guard = self
-            .journal
-            .lock()
-            .map_err(|_| anyhow::anyhow!("source journal lock poisoned"))?;
-        Ok(guard
-            .as_ref()
-            .map(Journal::source_seal)
-            .transpose()?
-            .flatten()
-            .is_some_and(|seal| seal.authorization.previous_generation == self.generation))
-    }
-
-    pub(crate) fn activate_runtime_configuration(
-        &self,
-        receipt: &shared_types::RuntimeConfigurationActivation,
-    ) -> Result<()> {
-        let _admission = self
-            .admission
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime admission lock poisoned"))?;
-        anyhow::ensure!(
-            self.accepting.load(std::sync::atomic::Ordering::Acquire)
-                && !self.cancel.is_cancelled(),
-            "runtime admission is closed"
-        );
-        anyhow::ensure!(
-            !self
-                .runtime_recovery_hold
-                .load(std::sync::atomic::Ordering::Acquire),
-            "runtime requires recovery before configuration activation"
-        );
-        let kernel = self
-            .runtime_kernel()
-            .context("runtime kernel not initialized")?;
-        anyhow::ensure!(
-            !kernel.recovery_protection_active(),
-            "runtime requires recovery before configuration activation"
-        );
-        self.configuration_gate
-            .as_ref()
-            .context("runtime configuration is not managed")?
-            .activate(receipt)
     }
 
     /// 标记启动恢复完成：开放写端点受理与 ready 判定。
@@ -908,14 +745,6 @@ impl ServerState {
                 "server is shutting down; deployment was not accepted".into(),
             ));
         }
-        if self
-            .source_generation_sealed()
-            .map_err(|e| AdmissionError::Busy(e.to_string()))?
-        {
-            return Err(AdmissionError::Busy(
-                "source generation is reserved for replacement".into(),
-            ));
-        }
         // B05：恢复保护约束**所有**写入口——旧部署链不得绕过（损坏记录/
         // 未终态操作/部分提交围栏期间，legacy 受理同样拒绝；显式部署也
         // 必须等操作员裁决恢复后进行）。
@@ -974,7 +803,7 @@ impl ServerState {
             journal
                 .write(Receipt {
                     generation: self.generation.clone(),
-                    generation_handoff: None,
+
                     operation: operation.clone(),
                     request: req.clone(),
                     boundary: Boundary::Preparing,
@@ -1083,7 +912,7 @@ impl ServerState {
         };
         journal.write(Receipt {
             generation: self.generation.clone(),
-            generation_handoff: None,
+
             operation: operation.clone(),
             request: request.clone(),
             boundary: Boundary::Preparing,
@@ -1565,8 +1394,6 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
     let ready = RuntimeStatusService::default();
     let mut initial_state = ServerState::new(ready.clone());
     initial_state.initialize_owner_token()?;
-    initial_state.configuration_gate =
-        crate::configuration_gate::ConfigurationGate::from_env(state_root.clone())?.map(Arc::new);
     if std::env::var(shared_types::APP_DEPLOY_GENERATION_ID).is_err()
         && let Some(receipt) = journal.receipt.as_ref()
     {
@@ -1752,14 +1579,10 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
             Err(error) => {
                 tracing::error!(%error, "Deployment startup reconciliation failed");
                 state.ready.set_ready(false);
-                if state
-                    .configuration_gate()
-                    .is_some_and(|gate| gate.handoff().is_some() && gate.prepared().is_none())
-                {
-                    // A rejected handoff must not rewrite the prior generation's
-                    // confirmed journal as a failure of this unauthorized owner.
-                    state.begin_runtime_recovery_hold();
-                    state.begin_failure(format!("generation handoff: {error:#}"), true);
+                if state.runtime_recovery_hold_active() {
+                    // Unknown identity/boundary is not a failed operation of
+                    // this owner; preserve its original durable evidence.
+                    state.begin_failure(format!("startup recovery required: {error:#}"), true);
                 } else if let Err(persist_error) =
                     state.fail_operation(format!("deployment startup: {error:#}"), Boundary::Failed)
                 {
@@ -2023,7 +1846,7 @@ async fn assemble_runtime_kernel(
                 sha256,
                 local_path,
                 execution_target: Some(ExecutionTarget::ProjectRun),
-                requires_configuration_activation: pg.is_some(),
+
                 run_pg: pg,
             };
             if dispatch_state.deploy_tx.send(request).is_err() {
@@ -2060,7 +1883,7 @@ async fn assemble_runtime_kernel(
                 sha256,
                 local_path: None,
                 execution_target: None,
-                requires_configuration_activation: pg.is_some(),
+
                 run_pg: pg,
             };
             if dispatch_state.deploy_tx.send(request).is_err() {
@@ -2128,91 +1951,6 @@ async fn establish_startup_quiescence(
     Ok(())
 }
 
-/// Legacy `run` must honor the same durable source reservation as `serve`.
-/// The caller holds OwnerGuard; read the journal generation rather than trusting
-/// a caller-provided environment override to bypass a reservation.
-pub fn require_unsealed_legacy_source(state_root: &std::path::Path) -> Result<()> {
-    let bytes = match std::fs::read(state_root.join(".generation-source-seal.json")) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("read source reservation before legacy startup"),
-    };
-    let seal: shared_types::RuntimeGenerationSourceSeal = serde_json::from_slice(&bytes)
-        .context("decode source reservation before legacy startup")?;
-    seal.authorization.validate().map_err(anyhow::Error::msg)?;
-    let receipt: Receipt = serde_json::from_slice(
-        &std::fs::read(state_root.join(".deploy-operation.json"))
-            .context("read reserved source journal")?,
-    )
-    .context("decode reserved source journal")?;
-    anyhow::ensure!(
-        receipt.generation == seal.authorization.activation.deployment_generation
-            && receipt.generation != seal.authorization.previous_generation,
-        "runtime generation is reserved for replacement; legacy startup is not permitted"
-    );
-    Ok(())
-}
-
-/// Offline counterpart of the source-owner API. The runtime caller must prove
-/// the captured container is stopped and mount exactly its original volume.
-/// This function independently holds the ordinary owner/journal locks and never
-/// calls startup recovery, a service supervisor, or a network listener.
-pub async fn seal_stopped_source(
-    workspace: &std::path::Path,
-    authorization: &shared_types::RuntimeGenerationHandoff,
-) -> Result<shared_types::RuntimeGenerationSourceSeal> {
-    use crate::runtime_kernel::RuntimeStore;
-    authorization.validate().map_err(anyhow::Error::msg)?;
-    anyhow::ensure!(
-        std::env::var("PROJECT_ID").ok().as_deref() == Some(authorization.app_id.as_str())
-            && std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
-                .ok()
-                .as_deref()
-                == Some(authorization.previous_generation.as_str()),
-        "offline source environment does not match authorization"
-    );
-    let root = RuntimeStore::resolve_root(workspace, &authorization.app_id)?;
-    seal_stopped_source_at_root(workspace, authorization, root).await
-}
-
-async fn seal_stopped_source_at_root(
-    workspace: &std::path::Path,
-    authorization: &shared_types::RuntimeGenerationHandoff,
-    root: std::path::PathBuf,
-) -> Result<shared_types::RuntimeGenerationSourceSeal> {
-    use crate::runtime_kernel::{RuntimeKernel, RuntimeStore};
-    let _owner = crate::platform::owner_guard::OwnerGuard::try_acquire(&root)?
-        .context("source runtime still owns workspace")?;
-    let mut journal = Journal::open_with_root(workspace, root.clone())?;
-    journal.require_fresh_process_scope()?;
-    let store = RuntimeStore::open_with_root(root, workspace)?;
-    let identity = store.existing_identity()?;
-    anyhow::ensure!(
-        identity.application_id == authorization.app_id
-            && identity.deployment_generation_id == authorization.previous_generation
-            && identity.source_root
-                == runtime_state_layout::canonical_project_root(workspace).to_string_lossy(),
-        "offline source identity does not match authorization or workspace"
-    );
-    // Unlike serve, this command has no listener. Exclusive owner admission and
-    // the stopped-process/identity checks above precede any journal migration.
-    journal.migrate_after_bind()?;
-    let kernel = Arc::new(RuntimeKernel::new(store, identity, Box::new(|_| {})));
-    kernel.recover().await?;
-    let mut state = ServerState::new(RuntimeStatusService::default());
-    state.generation = authorization.previous_generation.clone();
-    *state
-        .journal
-        .lock()
-        .map_err(|_| anyhow::anyhow!("source journal lock poisoned"))? = Some(journal);
-    state.set_runtime_kernel(kernel);
-    state
-        .seal_generation_source(workspace, authorization)?
-        .context("offline source has an active runtime operation")
-}
-
-/// Resolve only owner-relative targets; persisted records cannot redirect writes
-/// to an arbitrary path. The owner identity remains the original project root.
 fn execution_workspace(
     owner: &std::path::Path,
     target: Option<ExecutionTarget>,
@@ -2226,178 +1964,9 @@ fn execution_workspace(
     }
 }
 
-/// Called only after lock acquisition, API binding, prior owner quiescence and
-/// kernel recovery. The trusted replacement authorization does not authorize an
-/// unknown journal boundary, migration, or runtime operation.
-fn prepare_generation_handoff(args: &RuntimeArgs, state: &ServerState) -> Result<()> {
-    use sha2::{Digest, Sha256};
-    let Some(gate) = state.configuration_gate() else {
-        return Ok(());
-    };
-    let Some(authorization) = gate.handoff() else {
-        return Ok(());
-    };
-    authorization.validate().map_err(anyhow::Error::msg)?;
-    anyhow::ensure!(
-        authorization.activation.deployment_generation == state.generation,
-        "handoff destination generation mismatch"
-    );
-    let kernel = state
-        .runtime_kernel()
-        .context("handoff requires runtime kernel")?;
-    anyhow::ensure!(
-        !kernel.recovery_protection_active() && !state.runtime_recovery_hold_active(),
-        "handoff blocked by runtime recovery"
-    );
-    let (desired, revision) = kernel.store().load_desired()?;
-    let mut guard = state
-        .journal
-        .lock()
-        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?;
-    let journal = guard
-        .as_mut()
-        .context("handoff requires deployment journal")?;
-    let mut receipt = journal
-        .receipt
-        .clone()
-        .context("handoff requires confirmed active artifact")?;
-    let replay = receipt.generation == state.generation;
-    if replay && gate.activated()? {
-        // Same-generation recovery still passes restored_runtime_args, migration
-        // and journal boundary checks below. This only consumes the historical
-        // handoff; it grants neither a new generation nor a new start intent.
-        return Ok(());
-    }
-    let source_seal = journal
-        .source_seal()?
-        .context("handoff requires source reservation")?;
-    anyhow::ensure!(
-        source_seal.authorization == *authorization,
-        "handoff source reservation identity mismatch"
-    );
-    if !replay {
-        anyhow::ensure!(
-            source_seal.source_journal_sha256
-                == format!("{:x}", Sha256::digest(serde_json::to_vec(&receipt)?)),
-            "source journal changed after reservation"
-        );
-        anyhow::ensure!(
-            source_seal.desired_revision == revision,
-            "source desired state changed after reservation"
-        );
-    }
-    let prior = receipt.generation_handoff.clone();
-    if replay {
-        anyhow::ensure!(
-            prior
-                .as_ref()
-                .is_some_and(|value| value.authorization == *authorization),
-            "destination generation has no matching handoff receipt"
-        );
-    } else {
-        anyhow::ensure!(
-            receipt.generation == authorization.previous_generation,
-            "handoff source generation mismatch"
-        );
-    }
-    anyhow::ensure!(
-        matches!(
-            receipt.boundary,
-            Boundary::Active | Boundary::RestoredActive | Boundary::StartupFailed
-        ),
-        "handoff requires confirmed active or startup-failed boundary"
-    );
-    let active = receipt
-        .active
-        .as_ref()
-        .context("handoff has no active artifact")?;
-    let request = active
-        .request
-        .as_ref()
-        .context("handoff active artifact has no execution target receipt")?;
-    anyhow::ensure!(
-        request.local_path.is_none() || request.execution_target.is_some(),
-        "handoff local artifact has no execution target"
-    );
-    let workspace = execution_workspace(&args.workspace, request.execution_target);
-    // Check both possible historical roots. Never use a changed execution target
-    // to evade an unresolved SQL receipt left under the owner workspace.
-    crate::migration_journal::require_confirmed_migrations(&args.workspace)?;
-    crate::migration_journal::require_confirmed_migrations(&workspace)?;
-    let release = crate::manifest::read_release_lock(&workspace)?;
-    anyhow::ensure!(
-        release.release_id == active.artifact_release_id,
-        "handoff active artifact differs from release lock"
-    );
-    let release_hash = format!(
-        "{:x}",
-        Sha256::digest(std::fs::read(workspace.join("release.lock.toml"))?)
-    );
-    let workspace_name = workspace
-        .to_str()
-        .context("handoff workspace is not UTF-8")?
-        .to_owned();
-    let prepared = if let Some(prepared) = prior.filter(|_| replay) {
-        anyhow::ensure!(
-            prepared.release_manifest_sha256 == release_hash
-                && prepared.artifact_release_id == release.release_id
-                && prepared.execution_workspace == workspace_name,
-            "handoff artifact changed after preparation"
-        );
-        prepared
-    } else {
-        shared_types::RuntimeGenerationPrepared {
-            authorization: authorization.clone(),
-            artifact_release_id: release.release_id.clone(),
-            release_manifest_sha256: release_hash,
-            previous_journal_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(&receipt)?)),
-            execution_workspace: workspace_name,
-            desired_revision: revision,
-        }
-    };
-    anyhow::ensure!(
-        prepared.previous_journal_sha256 == source_seal.source_journal_sha256
-            && prepared.artifact_release_id == source_seal.artifact_release_id
-            && prepared.desired_revision == source_seal.desired_revision,
-        "prepared handoff differs from source reservation"
-    );
-    let authorized_revision = prepared
-        .desired_revision
-        .checked_add(1)
-        .context("handoff desired revision exhausted")?;
-    if replay && revision > authorized_revision {
-        // A later explicit operation consumed/superseded this startup intent.
-        // Normal recovery follows desired state; do not publish old authorization
-        // as a fresh prepared response and do not change desired again.
-        return Ok(());
-    }
-    // Once a later Stop has advanced desired, persistent container env is no
-    // longer a fresh Start request. It cannot revive business on Pod recreation.
-    anyhow::ensure!(
-        revision == prepared.desired_revision
-            || (revision == authorized_revision && desired == shared_types::DesiredState::Running),
-        "handoff startup intent was superseded by another desired-state operation"
-    );
-    if !replay {
-        receipt.generation = state.generation.clone();
-        receipt.operation.operation_id = authorization.activation.operation_id.clone();
-        receipt.operation.deployment_generation_id = state.generation.clone();
-        receipt.operation.error = None;
-        receipt.boundary = Boundary::Active;
-        receipt.generation_handoff = Some(prepared.clone());
-        journal.write(receipt)?;
-    }
-    if revision == prepared.desired_revision {
-        kernel
-            .store()
-            .store_desired(shared_types::DesiredState::Running, authorized_revision)?;
-    }
-    // The management API cannot acknowledge preparation until both durable
-    // transitions have completed; a crash between them replays the same intent.
-    gate.publish_prepared(prepared)?;
-    Ok(())
-}
-
+/// Restore the confirmed execution directory under the existing owner identity.
+/// Unknown journal identity or target remains protected; credential updates do
+/// not create a new owner or authorize replacement of this journal.
 fn restored_runtime_args(args: &RuntimeArgs, state: &ServerState) -> Result<RuntimeArgs> {
     let receipt = state
         .journal
@@ -2408,10 +1977,12 @@ fn restored_runtime_args(args: &RuntimeArgs, state: &ServerState) -> Result<Runt
     let mut restored = args.clone();
     if let Some(receipt) = receipt {
         if receipt.generation != state.generation {
-            anyhow::ensure!(
-                crate::deploy::deploy_requested(),
-                "deployment journal generation does not match this owner; explicit deployment required"
-            );
+            if !crate::deploy::deploy_requested() {
+                state.begin_runtime_recovery_hold();
+                anyhow::bail!(
+                    "deployment journal generation does not match this owner; explicit deployment required"
+                );
+            }
             // Only an explicit new env deployment may replace a prior generation;
             // initialize_startup must still validate/admit that deployment.
             return Ok(restored);
@@ -2423,14 +1994,12 @@ fn restored_runtime_args(args: &RuntimeArgs, state: &ServerState) -> Result<Runt
         {
             // Old local-artifact receipts without a target cannot establish that
             // source/.run was selected safely. Keep recovery protection.
-            anyhow::ensure!(
-                request.local_path.is_none() || request.execution_target.is_some(),
-                "local artifact journal has no confirmed execution target; explicit recovery required"
-            );
-            anyhow::ensure!(
-                !request.requires_configuration_activation || state.configuration_gate().is_some(),
-                "runtime credentials require explicit configuration activation after owner restart"
-            );
+            if request.local_path.is_some() && request.execution_target.is_none() {
+                state.begin_runtime_recovery_hold();
+                anyhow::bail!(
+                    "local artifact journal has no confirmed execution target; explicit recovery required"
+                );
+            }
             restored.workspace = execution_workspace(&args.workspace, request.execution_target);
             if let Some(target) = request.execution_target {
                 state.set_pending_dev_profile(target == ExecutionTarget::Source);
@@ -2444,28 +2013,6 @@ async fn initialize_startup(
     args: &RuntimeArgs,
     state: &ServerState,
 ) -> Result<Option<InitialAction>> {
-    if state.source_generation_sealed()? {
-        let authorization = state
-            .journal
-            .lock()
-            .map_err(|_| anyhow::anyhow!("source journal lock poisoned"))?
-            .as_ref()
-            .context("source journal missing")?
-            .source_seal()?
-            .context("source seal missing")?
-            .authorization;
-        // Restore the admission fence without resuming business or changing the
-        // journal snapshot reserved for the destination generation.
-        state.set_phase(ServerPhase::Idle);
-        anyhow::ensure!(
-            state
-                .seal_generation_source(&args.workspace, &authorization)?
-                .is_some(),
-            "source reservation recovery is busy"
-        );
-        return Ok(None);
-    }
-    prepare_generation_handoff(args, state)?;
     let restored = restored_runtime_args(args, state)?;
     let args = &restored;
     if let Err(error) = crate::migration_journal::require_confirmed_migrations(&args.workspace) {
@@ -2483,10 +2030,6 @@ async fn initialize_startup(
     {
         state.set_phase(ServerPhase::Idle);
         return Ok(None);
-    }
-    if let Some(gate) = state.configuration_gate() {
-        tracing::info!("Management ready; waiting for captured runtime configuration activation");
-        gate.wait(&state.cancel).await?;
     }
     if crate::deploy::deploy_requested() {
         let generation = std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
@@ -2637,7 +2180,7 @@ async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> In
                 sha256: None,
                 local_path: None,
                 execution_target: Some(ExecutionTarget::Source),
-                requires_configuration_activation: pg.is_some(),
+
                 run_pg: None,
             };
             if let Err(error) = state.record_runtime_deployment(&request) {
@@ -3699,7 +3242,7 @@ mod tests {
     }
 
     #[test]
-    fn local_artifact_recovery_refuses_unknown_target_or_lost_credentials() {
+    fn local_artifact_recovery_refuses_unknown_target() {
         let dir = tempfile::tempdir().unwrap();
         let args = RuntimeArgs {
             workspace: dir.path().join("workspace"),
@@ -3712,14 +3255,14 @@ mod tests {
         deploy.runtime_operation_id = Some("localartifact".into());
         deploy.local_path = Some(args.workspace.join("builds/workspace-package-b.zip"));
         deploy.execution_target = Some(ExecutionTarget::ProjectRun);
-        deploy.requires_configuration_activation = true;
         state.record_runtime_deployment(&deploy).unwrap();
         state.set_release(release("artifact-b"));
         state.complete_stage().unwrap();
         state.complete_running().unwrap();
-        assert!(
-            restored_runtime_args(&args, &state).is_err(),
-            "do not restore with default credentials"
+        assert_eq!(
+            restored_runtime_args(&args, &state).unwrap().workspace,
+            std::fs::canonicalize(&args.workspace).unwrap().join(".run"),
+            "confirmed local artifact recovers without a credential activation gate"
         );
         {
             let mut journal = state.journal.lock().unwrap();
@@ -3735,13 +3278,13 @@ mod tests {
                 .request
                 .as_mut()
                 .unwrap();
-            active_request.requires_configuration_activation = false;
             active_request.execution_target = None;
         }
         assert!(
             restored_runtime_args(&args, &state).is_err(),
             "old local receipt has no trusted target"
         );
+        assert!(state.runtime_recovery_hold_active());
     }
 
     #[test]
@@ -3793,7 +3336,7 @@ mod tests {
             url: "http://artifact".into(),
             local_path: None,
             execution_target: None,
-            requires_configuration_activation: false,
+
             run_pg: None,
             release_id: "caller-token".into(),
             sha256: None,
@@ -3880,147 +3423,8 @@ format = "jsonl"
         }
     }
 
-    fn handoff_fixture(dir: &std::path::Path, stopped: bool) -> (RuntimeArgs, ServerState) {
-        let workspace = dir.join("code");
-        let run = workspace.join(".run");
-        std::fs::create_dir_all(&run).unwrap();
-        let artifact = release("hot-artifact-b");
-        std::fs::write(
-            run.join("release.lock.toml"),
-            toml::to_string(&artifact).unwrap(),
-        )
-        .unwrap();
-        let mut first = state();
-        first.generation = "generation-a".into();
-        *first.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
-        let mut deploy = request();
-        deploy.execution_target = Some(ExecutionTarget::ProjectRun);
-        first
-            .try_accept_deploy_with_id(deploy, "hot-b".into())
-            .unwrap();
-        first.set_release(artifact);
-        first.complete_stage().unwrap();
-        first.complete_running().unwrap();
-        drop(first);
-        let mut next = state();
-        next.generation = "configuration-c".into();
-        let authorization = shared_types::RuntimeGenerationHandoff {
-            protocol_version: 1,
-            app_id: "app1".into(),
-            lifecycle_id: "life1".into(),
-            previous_generation: "generation-a".into(),
-            previous_resource_uid: "old-physical-uid".into(),
-            previous_resource_name: "old-container".into(),
-            activation: shared_types::RuntimeConfigurationActivation {
-                operation_id: next.generation.clone(),
-                deployment_generation: next.generation.clone(),
-                config_version: 2,
-            },
-        };
-        next.configuration_gate = Some(Arc::new(
-            crate::configuration_gate::ConfigurationGate::for_handoff(
-                dir.to_path_buf(),
-                authorization,
-            ),
-        ));
-        *next.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
-        let kernel = kernel_for(dir);
-        kernel
-            .store()
-            .store_desired(
-                if stopped {
-                    shared_types::DesiredState::Stopped
-                } else {
-                    shared_types::DesiredState::Running
-                },
-                7,
-            )
-            .unwrap();
-        next.set_runtime_kernel(kernel);
-        {
-            use sha2::{Digest, Sha256};
-            let guard = next.journal.lock().unwrap();
-            let journal = guard.as_ref().unwrap();
-            let receipt = journal.receipt.as_ref().unwrap();
-            let authorization = next
-                .configuration_gate()
-                .unwrap()
-                .handoff()
-                .unwrap()
-                .clone();
-            journal
-                .write_source_seal(&shared_types::RuntimeGenerationSourceSeal {
-                    authorization,
-                    artifact_release_id: receipt
-                        .active
-                        .as_ref()
-                        .unwrap()
-                        .artifact_release_id
-                        .clone(),
-                    source_journal_sha256: format!(
-                        "{:x}",
-                        Sha256::digest(serde_json::to_vec(receipt).unwrap())
-                    ),
-                    desired_revision: 7,
-                })
-                .unwrap();
-        }
-        (
-            RuntimeArgs {
-                workspace,
-                ..Default::default()
-            },
-            next,
-        )
-    }
-
-    #[tokio::test]
-    async fn source_seal_replays_and_survives_owner_initialization_without_starting_business() {
-        let dir = tempfile::tempdir().unwrap();
-        let (args, mut source) = handoff_fixture(dir.path(), false);
-        let authorization = source
-            .configuration_gate()
-            .unwrap()
-            .handoff()
-            .unwrap()
-            .clone();
-        source.generation = authorization.previous_generation.clone();
-        source.configuration_gate = None;
-        let first = source
-            .seal_generation_source(&args.workspace, &authorization)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            source
-                .seal_generation_source(&args.workspace, &authorization)
-                .unwrap(),
-            Some(first)
-        );
-        assert!(
-            source
-                .try_accept_deploy_with_id(request(), "late-deploy".into())
-                .is_err()
-        );
-        let mut different = authorization.clone();
-        different.activation.operation_id = "another-generation".into();
-        different.activation.deployment_generation = "another-generation".into();
-        assert!(
-            source
-                .seal_generation_source(&args.workspace, &different)
-                .is_err()
-        );
-        assert!(initialize_startup(&args, &source).await.unwrap().is_none());
-        assert!(matches!(source.phase(), ServerPhase::Idle));
-        assert!(source.deploy_rx.lock().await.try_recv().is_err());
-        assert!(
-            source
-                .try_accept_deploy_with_id(request(), "late-after-recovery".into())
-                .is_err()
-        );
-    }
-
     #[test]
-    fn auxiliary_writer_cancellation_keeps_handoff_protected() {
+    fn auxiliary_writer_cancellation_keeps_runtime_protected() {
         let state = state();
         state
             .initializing
@@ -4046,503 +3450,39 @@ format = "jsonl"
         assert!(state.begin_auxiliary_write().is_err());
     }
 
-    #[test]
-    fn source_seal_busy_does_not_change_existing_receipt() {
+    #[tokio::test]
+    async fn stopped_normal_owner_recovery_preserves_active_journal_without_switching() {
         let dir = tempfile::tempdir().unwrap();
-        let (args, mut source) = handoff_fixture(dir.path(), false);
-        let authorization = source
-            .configuration_gate()
-            .unwrap()
-            .handoff()
-            .unwrap()
-            .clone();
-        source.generation = authorization.previous_generation.clone();
-        source.configuration_gate = None;
-        let before = source
-            .journal
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .source_seal()
-            .unwrap();
-        source.set_phase(ServerPhase::Orchestrating);
-        assert!(
-            source
-                .seal_generation_source(&args.workspace, &authorization)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            source
-                .journal
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .source_seal()
-                .unwrap(),
-            before
-        );
-    }
-
-    #[test]
-    fn legacy_start_cannot_bypass_source_seal_before_destination_is_prepared() {
-        let dir = tempfile::tempdir().unwrap();
-        let (args, state) = handoff_fixture(dir.path(), false);
-        // This fixture uses the historical volume journal root.
-        assert!(require_unsealed_legacy_source(dir.path()).is_err());
-        prepare_generation_handoff(&args, &state).unwrap();
-        assert!(require_unsealed_legacy_source(dir.path()).is_ok());
-    }
-
-    #[tokio::test]
-    async fn offline_source_seal_replays_without_changing_owner_identity_or_desired() {
-        for presealed in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let (args, state) = handoff_fixture(dir.path(), true);
-            let authorization = state
-                .configuration_gate()
-                .unwrap()
-                .handoff()
-                .unwrap()
-                .clone();
-            let root = dir.path().join("state-root");
-            let mut identity = state.runtime_kernel().unwrap().identity().clone();
-            identity.application_id = authorization.app_id.clone();
-            identity.deployment_generation_id = authorization.previous_generation.clone();
-            identity.source_root = runtime_state_layout::canonical_project_root(&args.workspace)
-                .to_string_lossy()
-                .into_owned();
-            let identity_bytes = serde_json::to_vec(&identity).unwrap();
-            std::fs::write(root.join("identity.json"), &identity_bytes).unwrap();
-            let desired = state
-                .runtime_kernel()
-                .unwrap()
-                .store()
-                .load_desired()
-                .unwrap();
-            {
-                let mut guard = state.journal.lock().unwrap();
-                let journal = guard.as_mut().unwrap();
-                journal.commit_coordinator().unwrap();
-                journal.commit_quiescent().unwrap();
-            }
-            drop(state);
-            if !presealed {
-                std::fs::remove_file(dir.path().join(".generation-source-seal.json")).unwrap();
-            }
-            let first = seal_stopped_source_at_root(&args.workspace, &authorization, root.clone())
-                .await
-                .unwrap();
-            let second = seal_stopped_source_at_root(&args.workspace, &authorization, root.clone())
-                .await
-                .unwrap();
-            assert_eq!(first, second);
-            assert!(!dir.path().join(".generation-source-seal.json").exists());
-            assert!(!dir.path().join(".deploy-operation.json").exists());
-            assert!(root.join(".deploy-operation.json").is_file());
-            assert_eq!(
-                std::fs::read(root.join("identity.json")).unwrap(),
-                identity_bytes
-            );
-            let store =
-                crate::runtime_kernel::RuntimeStore::open_with_root(root, &args.workspace).unwrap();
-            assert_eq!(store.load_desired().unwrap(), desired);
-        }
-    }
-
-    #[test]
-    fn handoff_replay_rejects_changed_source_evidence_before_desired_write() {
-        for field in ["journal", "artifact", "revision"] {
-            let dir = tempfile::tempdir().unwrap();
-            let (args, state) = handoff_fixture(dir.path(), false);
-            prepare_generation_handoff(&args, &state).unwrap();
-            let kernel = state.runtime_kernel().unwrap();
-            let desired_before = kernel.store().load_desired().unwrap();
-            {
-                let mut guard = state.journal.lock().unwrap();
-                let journal = guard.as_mut().unwrap();
-                let mut receipt = journal.receipt.clone().unwrap();
-                let prepared = receipt.generation_handoff.as_mut().unwrap();
-                match field {
-                    "journal" => prepared.previous_journal_sha256 = "f".repeat(64),
-                    "artifact" => prepared.artifact_release_id = "different-artifact".into(),
-                    _ => prepared.desired_revision += 1,
-                }
-                journal.write(receipt).unwrap();
-            }
-            assert!(
-                prepare_generation_handoff(&args, &state).is_err(),
-                "{field}"
-            );
-            assert_eq!(kernel.store().load_desired().unwrap(), desired_before);
-        }
-    }
-
-    #[test]
-    fn configuration_handoff_preserves_hot_artifact_and_explicitly_starts_stopped_owner() {
-        for stopped in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let (args, state) = handoff_fixture(root.path(), stopped);
-            let bytes = std::fs::read(args.workspace.join(".run/release.lock.toml")).unwrap();
-            prepare_generation_handoff(&args, &state).unwrap();
-            let gate = state.configuration_gate().unwrap();
-            let prepared = gate.prepared().unwrap();
-            assert_eq!(prepared.artifact_release_id, "hot-artifact-b");
-            assert_eq!(prepared.desired_revision, 7);
-            assert_eq!(
-                state
-                    .runtime_kernel()
-                    .unwrap()
-                    .store()
-                    .load_desired()
-                    .unwrap(),
-                (shared_types::DesiredState::Running, 8)
-            );
-            assert_eq!(
-                restored_runtime_args(&args, &state).unwrap().workspace,
-                args.workspace.join(".run").canonicalize().unwrap()
-            );
-            assert_eq!(
-                std::fs::read(args.workspace.join(".run/release.lock.toml")).unwrap(),
-                bytes
-            );
-            prepare_generation_handoff(&args, &state).unwrap();
-            assert_eq!(gate.prepared(), Some(prepared));
-            let journal = state.journal.lock().unwrap();
-            let receipt = journal.as_ref().unwrap().receipt.as_ref().unwrap();
-            assert_eq!(receipt.generation, "configuration-c");
-            assert_eq!(receipt.operation.operation_id, "configuration-c");
-            assert_eq!(
-                receipt
-                    .active
-                    .as_ref()
-                    .unwrap()
-                    .request
-                    .as_ref()
-                    .unwrap()
-                    .url,
-                "http://artifact"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn activated_handoff_is_consumed_after_hot_deploy_and_later_stop() {
-        let root = tempfile::tempdir().unwrap();
-        let (args, state) = handoff_fixture(root.path(), false);
-        prepare_generation_handoff(&args, &state).unwrap();
-        let gate = state.configuration_gate().unwrap();
-        gate.activate(&gate.handoff().unwrap().activation).unwrap();
-        // A later hot deployment replaces the operation receipt but preserves the
-        // physical generation. Its startup must not demand the old artifact hash.
-        {
-            let mut guard = state.journal.lock().unwrap();
-            let journal = guard.as_mut().unwrap();
-            let mut receipt = journal.receipt.clone().unwrap();
-            receipt.generation_handoff = None;
-            receipt.operation.operation_id = "later-hot-operation".into();
-            receipt.active.as_mut().unwrap().artifact_release_id = "later-hot-artifact".into();
-            journal.write(receipt).unwrap();
-        }
-        std::fs::write(
-            args.workspace.join(".run/release.lock.toml"),
-            toml::to_string(&release("later-hot-artifact")).unwrap(),
-        )
-        .unwrap();
-        state
-            .runtime_kernel()
-            .unwrap()
-            .store()
-            .store_desired(shared_types::DesiredState::Stopped, 9)
-            .unwrap();
-        assert!(initialize_startup(&args, &state).await.unwrap().is_none());
-        assert_eq!(
-            state
-                .journal
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .receipt
-                .as_ref()
-                .unwrap()
-                .boundary,
-            Boundary::Active
-        );
-        assert_eq!(
-            state
-                .runtime_kernel()
-                .unwrap()
-                .store()
-                .load_desired()
-                .unwrap(),
-            (shared_types::DesiredState::Stopped, 9)
-        );
-    }
-
-    #[tokio::test]
-    async fn consumed_handoff_reopened_owner_exposes_readonly_ack_and_idempotent_activation() {
-        let root = tempfile::tempdir().unwrap();
-        let (args, first) = handoff_fixture(root.path(), false);
-        prepare_generation_handoff(&args, &first).unwrap();
-        let authorization = first
-            .configuration_gate()
-            .unwrap()
-            .handoff()
-            .unwrap()
-            .clone();
-        first
-            .configuration_gate()
-            .unwrap()
-            .activate(&authorization.activation)
-            .unwrap();
-        first
-            .runtime_kernel()
-            .unwrap()
-            .store()
-            .store_desired(shared_types::DesiredState::Stopped, 9)
-            .unwrap();
-        drop(first);
-        // New process-local caches; only journal/activation/desired survive.
-        let mut reopened = state();
-        reopened.generation = authorization.activation.deployment_generation.clone();
-        reopened.configuration_gate = Some(Arc::new(
-            crate::configuration_gate::ConfigurationGate::for_handoff(
-                root.path().into(),
-                authorization.clone(),
-            ),
-        ));
-        *reopened.journal.lock().unwrap() = Some(Journal::open(&args.workspace).unwrap());
-        reopened.set_runtime_kernel(kernel_for(root.path()));
-        reopened
-            .control_token
-            .set("handoff-test-token".into())
-            .unwrap();
-        assert!(
-            initialize_startup(&args, &reopened)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(reopened.configuration_gate().unwrap().prepared().is_none());
-        let reopened = Arc::new(reopened);
-        let (listener, router) = crate::api::bind(
-            "127.0.0.1:0",
-            args.workspace.clone(),
-            root.path().join("logs"),
-            "unused".into(),
-            reopened.clone(),
-        )
-        .await
-        .unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await });
-        let client = reqwest::Client::new();
-        let observation: serde_json::Value = client
-            .get(format!(
-                "http://{address}/v1/runtime/configuration/prepared"
-            ))
-            .header("x-deploy-token", "handoff-test-token")
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(observation["data"]["activated"], true);
-        assert_eq!(
-            observation["data"]["authorization"],
-            serde_json::to_value(&authorization).unwrap()
-        );
-        let ack: serde_json::Value = client
-            .post(format!(
-                "http://{address}/v1/runtime/configuration/activate"
-            ))
-            .header("x-deploy-token", "handoff-test-token")
-            .json(&authorization.activation)
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(ack["data"]["activated"], true);
-        assert_eq!(
-            reopened
-                .runtime_kernel()
-                .unwrap()
-                .store()
-                .load_desired()
-                .unwrap(),
-            (shared_types::DesiredState::Stopped, 9)
-        );
-        assert_eq!(
-            reopened
-                .journal
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .receipt
-                .as_ref()
-                .unwrap()
-                .boundary,
-            Boundary::Active
-        );
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[test]
-    fn configuration_handoff_refuses_unknown_boundary_wrong_generation_or_changed_manifest() {
-        for fault in [
-            "switching",
-            "generation",
-            "artifact",
-            "migration",
-            "recovery",
-        ] {
-            let root = tempfile::tempdir().unwrap();
-            let (args, state) = handoff_fixture(root.path(), false);
-            {
-                let mut guard = state.journal.lock().unwrap();
-                let journal = guard.as_mut().unwrap();
-                let mut receipt = journal.receipt.clone().unwrap();
-                match fault {
-                    "switching" => receipt.boundary = Boundary::Switching,
-                    "generation" => receipt.generation = "wrong-generation".into(),
-                    "artifact" => {
-                        receipt.active.as_mut().unwrap().artifact_release_id =
-                            "wrong-release".into()
-                    }
-                    "recovery" => state.begin_runtime_recovery_hold(),
-                    "migration" => {
-                        let receipts = args.workspace.join("migration-receipts");
-                        std::fs::create_dir_all(&receipts).unwrap();
-                        std::fs::write(
-                            receipts.join("unknown.json"),
-                            r#"{"identity":"sql","completed":false}"#,
-                        )
-                        .unwrap();
-                    }
-                    _ => unreachable!(),
-                }
-                journal.write(receipt).unwrap();
-            }
-            let before = serde_json::to_value(
-                state
-                    .journal
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .receipt
-                    .as_ref(),
-            )
-            .unwrap();
-            assert!(
-                prepare_generation_handoff(&args, &state).is_err(),
-                "{fault}"
-            );
-            assert!(state.configuration_gate().unwrap().prepared().is_none());
-            assert_eq!(
-                serde_json::to_value(
-                    state
-                        .journal
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .unwrap()
-                        .receipt
-                        .as_ref()
-                )
-                .unwrap(),
-                before
-            );
-            assert_eq!(
-                state
-                    .runtime_kernel()
-                    .unwrap()
-                    .store()
-                    .load_desired()
-                    .unwrap()
-                    .1,
-                7
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn configuration_handoff_replay_cannot_revive_later_stop_or_write_switching() {
-        let root = tempfile::tempdir().unwrap();
-        let (args, state) = handoff_fixture(root.path(), true);
-        prepare_generation_handoff(&args, &state).unwrap();
-        state
-            .runtime_kernel()
-            .unwrap()
-            .store()
-            .store_desired(shared_types::DesiredState::Stopped, 9)
-            .unwrap();
-        assert!(initialize_startup(&args, &state).await.unwrap().is_none());
-        assert_eq!(
-            state
-                .runtime_kernel()
-                .unwrap()
-                .store()
-                .load_desired()
-                .unwrap(),
-            (shared_types::DesiredState::Stopped, 9)
-        );
-        assert_eq!(
-            state
-                .journal
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .receipt
-                .as_ref()
-                .unwrap()
-                .boundary,
-            Boundary::Active
-        );
-    }
-
-    #[test]
-    fn configuration_handoff_resume_between_journal_and_desired_commit_uses_original_revision() {
-        let root = tempfile::tempdir().unwrap();
-        let (args, state) = handoff_fixture(root.path(), true);
-        prepare_generation_handoff(&args, &state).unwrap();
-        // Reproduce the durable state visible if the process disappeared after
-        // the atomic journal write but before desired committed.
-        state
-            .runtime_kernel()
-            .unwrap()
+        let workspace = dir.path().join("code");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let state = state();
+        *state.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
+        state.record_runtime_deployment(&request()).unwrap();
+        state.set_release(release("hot-b"));
+        state.complete_stage().unwrap();
+        state.complete_running().unwrap();
+        let kernel = kernel_for(dir.path());
+        kernel
             .store()
             .store_desired(shared_types::DesiredState::Stopped, 7)
             .unwrap();
-        prepare_generation_handoff(&args, &state).unwrap();
+        state.set_runtime_kernel(kernel.clone());
+        let before =
+            serde_json::to_value(&state.journal.lock().unwrap().as_ref().unwrap().receipt).unwrap();
+        let args = RuntimeArgs {
+            workspace,
+            ..Default::default()
+        };
+        assert!(initialize_startup(&args, &state).await.unwrap().is_none());
+        assert_eq!(state.phase(), ServerPhase::Idle);
         assert_eq!(
-            state
-                .runtime_kernel()
-                .unwrap()
-                .store()
-                .load_desired()
-                .unwrap(),
-            (shared_types::DesiredState::Running, 8)
+            kernel.store().load_desired().unwrap(),
+            (shared_types::DesiredState::Stopped, 7)
         );
-        std::fs::write(
-            args.workspace.join(".run/release.lock.toml"),
-            toml::to_string(&release("other-artifact")).unwrap(),
-        )
-        .unwrap();
-        assert!(prepare_generation_handoff(&args, &state).is_err());
+        assert_eq!(
+            serde_json::to_value(&state.journal.lock().unwrap().as_ref().unwrap().receipt).unwrap(),
+            before
+        );
     }
 
     #[tokio::test]
@@ -5105,7 +4045,7 @@ format = "jsonl"
                             sha256: None,
                             local_path: None,
                             execution_target: None,
-                            requires_configuration_activation: false,
+
                             run_pg: None,
                         })
                         .is_ok()
@@ -5137,7 +4077,7 @@ format = "jsonl"
                     sha256: None,
                     local_path: None,
                     execution_target: None,
-                    requires_configuration_activation: false,
+
                     run_pg: None,
                 },
                 "op-a".into(),
@@ -5161,7 +4101,7 @@ format = "jsonl"
             sha256: None,
             local_path: None,
             execution_target: None,
-            requires_configuration_activation: false,
+
             run_pg: None,
         };
         state
@@ -5277,7 +4217,7 @@ format = "jsonl"
             sha256: None,
             local_path: None,
             execution_target: None,
-            requires_configuration_activation: false,
+
             run_pg: None,
         };
         assert!(st.try_accept_deploy(req.clone()).is_ok());
@@ -5295,7 +4235,7 @@ format = "jsonl"
             sha256: None,
             local_path: None,
             execution_target: None,
-            requires_configuration_activation: false,
+
             run_pg: None,
         })
         .unwrap();
@@ -5356,7 +4296,7 @@ format = "jsonl"
             sha256: None,
             local_path: None,
             execution_target: None,
-            requires_configuration_activation: false,
+
             run_pg: None,
         })
         .expect("idle accepts deploy");
@@ -5399,7 +4339,7 @@ format = "jsonl"
                     sha256: None,
                     local_path: None,
                     execution_target: None,
-                    requires_configuration_activation: false,
+
                     run_pg: None,
                 },
                 "operation".into(),
@@ -5426,7 +4366,7 @@ format = "jsonl"
                     sha256: None,
                     local_path: None,
                     execution_target: None,
-                    requires_configuration_activation: false,
+
                     run_pg: None,
                 })
                 .is_err()

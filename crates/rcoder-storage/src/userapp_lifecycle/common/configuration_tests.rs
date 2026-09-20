@@ -70,6 +70,12 @@ async fn claim(
     let op = match store.admit(request).await.unwrap() {
         UserAppAdmissionOutcome::Accepted(op) | UserAppAdmissionOutcome::Existing(op) => op,
     };
+    claim_admitted(store, op).await
+}
+async fn claim_admitted(
+    store: &ToastyUserAppStore,
+    op: UserAppOperationRecord,
+) -> (UserAppOperationRecord, UserAppExecutionContext) {
     let op = store
         .advance(&progress(&op, UserAppOperationState::Running))
         .await
@@ -82,6 +88,36 @@ async fn claim(
         request_fingerprint: op.request_fingerprint.clone(),
     };
     (op, context)
+}
+// Historical inline deployment capture remains available to exercise persisted
+// unknown-write recovery. Ordinary lifecycle admission must never use it.
+async fn claim_inline(
+    store: &ToastyUserAppStore,
+    app: &UserAppLifecycleRecord,
+    id: &str,
+    password: &str,
+) -> (UserAppOperationRecord, UserAppExecutionContext) {
+    let pg = StartPgCredential {
+        username: "business".into(),
+        password: password.into(),
+    };
+    let input = UserAppExecutionInput::new(serde_json::json!({"request": {"pg": pg}}).to_string());
+    let request = admission(
+        app,
+        id,
+        UserAppControlCommand::Deploy {
+            restart: false,
+            input_digest: input.digest(),
+        },
+    );
+    let op = match store
+        .admit_with_configuration(&request, &input, Some(&pg))
+        .await
+        .unwrap()
+    {
+        UserAppAdmissionOutcome::Accepted(op) | UserAppAdmissionOutcome::Existing(op) => op,
+    };
+    claim_admitted(store, op).await
 }
 fn target() -> RuntimeConfigurationTarget {
     RuntimeConfigurationTarget {
@@ -125,15 +161,7 @@ async fn confirmed_preflight_failure_closes_intent_without_promoting_credentials
         )
         .await
         .unwrap();
-    let (op, context) = claim(
-        &store,
-        &admission(
-            &app,
-            "preflight",
-            UserAppControlCommand::Start { traffic: false },
-        ),
-    )
-    .await;
+    let (op, context) = claim_inline(&store, &app, "preflight", "newpassword").await;
     store
         .bind_runtime_configuration_target(&context, 1, &target())
         .await
@@ -159,15 +187,7 @@ async fn confirmed_preflight_failure_closes_intent_without_promoting_credentials
     assert_eq!(status.applied_version, None);
     assert_eq!(status.applying_operation_id, None);
     assert!(status.pending);
-    let (_retry, capture) = claim(
-        &store,
-        &admission(
-            &app,
-            "retry",
-            UserAppControlCommand::Start { traffic: false },
-        ),
-    )
-    .await;
+    let (_retry, capture) = claim_inline(&store, &app, "retry", "newpassword").await;
     assert_eq!(
         store
             .operation_runtime_configuration(&capture)
@@ -236,26 +256,17 @@ async fn save_is_configuration_only_and_replay_cannot_promote_an_old_version() {
     store.shutdown().await.unwrap();
 }
 #[tokio::test]
-async fn capture_is_atomic_and_concurrent_save_does_not_change_execution_or_applied_result() {
+async fn explicit_capture_is_stable_but_ordinary_wake_and_restart_do_not_capture() {
     let (_dir, store, app) = database().await;
     store
         .save_runtime_configuration(&app.app_id, Prod, &save_request(&app, "first", 0, "one"))
         .await
         .unwrap();
-    let request = admission(
-        &app,
-        "startone",
-        UserAppControlCommand::Start { traffic: false },
-    );
-    let (op, context) = claim(&store, &request).await;
+    let (op, context) = claim_inline(&store, &app, "startone", "one").await;
     store
         .save_runtime_configuration(&app.app_id, Prod, &save_request(&app, "second", 1, "two"))
         .await
         .unwrap();
-    assert!(matches!(
-        store.admit(&request).await.unwrap(),
-        UserAppAdmissionOutcome::Existing(_)
-    ));
     let capture = store
         .operation_runtime_configuration(&context)
         .await
@@ -285,13 +296,13 @@ async fn capture_is_atomic_and_concurrent_save_does_not_change_execution_or_appl
         ),
     )
     .await;
-    let capture = store
-        .operation_runtime_configuration(&context)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(capture.config_version, 1);
-    assert_eq!(capture.pg.password, "one");
+    assert!(
+        store
+            .operation_runtime_configuration(&context)
+            .await
+            .unwrap()
+            .is_none()
+    );
     // No side effects yet: a confirmed failure does not activate version two.
     store
         .advance(&progress(&wake, UserAppOperationState::Failed))
@@ -302,13 +313,21 @@ async fn capture_is_atomic_and_concurrent_save_does_not_change_execution_or_appl
         &admission(&app, "explicitrestart", UserAppControlCommand::Restart),
     )
     .await;
-    let capture = store
-        .operation_runtime_configuration(&context)
+    assert!(
+        store
+            .operation_runtime_configuration(&context)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let unchanged = store
+        .runtime_configuration_status(&app.app_id, &app.lifecycle_id, Prod)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(capture.config_version, 2);
-    assert_eq!(capture.pg.password, "two");
+    assert_eq!(unchanged.saved_version, 2);
+    assert_eq!(unchanged.applied_version, Some(1));
+    assert!(unchanged.pending);
     store.shutdown().await.unwrap();
 }
 #[tokio::test]
@@ -335,7 +354,7 @@ async fn save_after_admission_does_not_turn_original_absence_into_new_credential
     store.shutdown().await.unwrap();
 }
 #[tokio::test]
-async fn configuration_and_capture_are_isolated_between_dev_and_prod() {
+async fn saved_configuration_is_isolated_and_neither_scope_implicitly_captures() {
     let (_dir, store, app) = database().await;
     store
         .save_runtime_configuration(&app.app_id, Prod, &save_request(&app, "sameid", 0, "prod"))
@@ -359,36 +378,26 @@ async fn configuration_and_capture_are_isolated_between_dev_and_prod() {
         &admission(&app, "devrestart", UserAppControlCommand::RestartBuilder),
     )
     .await;
-    assert_eq!(
-        store
-            .operation_runtime_configuration(&prod)
+    for context in [&prod, &dev] {
+        assert!(
+            store
+                .operation_runtime_configuration(context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    for scope in [Prod, Dev] {
+        let status = store
+            .runtime_configuration_status(&app.app_id, &app.lifecycle_id, scope)
             .await
             .unwrap()
-            .unwrap()
-            .pg
-            .password,
-        "prod"
-    );
-    assert_eq!(
-        store
-            .operation_runtime_configuration(&dev)
-            .await
-            .unwrap()
-            .unwrap()
-            .pg
-            .password,
-        "dev"
-    );
-    ready(&store, &prod, 1).await;
-    assert_eq!(
-        store
-            .runtime_configuration_status(&app.app_id, &app.lifecycle_id, Dev)
-            .await
-            .unwrap()
-            .unwrap()
-            .applied_version,
-        None
-    );
+            .unwrap();
+        assert_eq!(status.saved_version, 1);
+        assert_eq!(status.applied_version, None);
+        assert_eq!(status.applying_operation_id, None);
+        assert!(status.pending);
+    }
     let mut stale = save_request(&app, "stale", 1, "bad");
     stale.lifecycle_id = "otherlife".into();
     assert!(matches!(
@@ -407,15 +416,7 @@ async fn unknown_pg_write_cannot_be_finalized_or_rebound_and_business_failure_ke
         .save_runtime_configuration(&app.app_id, Prod, &save_request(&app, "first", 0, "secret"))
         .await
         .unwrap();
-    let (op, context) = claim(
-        &store,
-        &admission(
-            &app,
-            "startup",
-            UserAppControlCommand::Start { traffic: false },
-        ),
-    )
-    .await;
+    let (op, context) = claim_inline(&store, &app, "startup", "secret").await;
     assert!(
         store
             .advance(&progress(&op, UserAppOperationState::Succeeded))
@@ -501,7 +502,7 @@ async fn unknown_pg_write_cannot_be_finalized_or_rebound_and_business_failure_ke
     store.shutdown().await.unwrap();
 }
 #[tokio::test]
-async fn hot_deploy_with_pending_credentials_is_rejected_before_admission_commits() {
+async fn hot_deploy_ignores_pending_historical_credentials() {
     let (_dir, store, app) = database().await;
     store
         .save_runtime_configuration(&app.app_id, Prod, &save_request(&app, "first", 0, "secret"))
@@ -514,15 +515,32 @@ async fn hot_deploy_with_pending_credentials_is_rejected_before_admission_commit
     );
     request.kind = UserAppOperationKind::HotDeploy;
     request.command = None;
-    let error = store.admit(&request).await.unwrap_err();
-    assert!(error.to_string().contains("cold deployment"));
+    let (op, context) = claim(&store, &request).await;
     assert!(
         store
-            .get_operation(&app.app_id, &request.operation_id)
+            .operation_runtime_configuration(&context)
             .await
             .unwrap()
             .is_none()
     );
+    let current = store.get_application(&app.app_id).await.unwrap().unwrap();
+    assert_eq!(
+        current.active_operations.slot(Prod).unwrap(),
+        &op.operation_id
+    );
+    let status = store
+        .runtime_configuration_status(&app.app_id, &app.lifecycle_id, Prod)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.saved_version, 1);
+    assert_eq!(status.applied_version, None);
+    assert_eq!(status.applying_operation_id, None);
+    assert!(status.pending);
+    store
+        .advance(&progress(&op, UserAppOperationState::Failed))
+        .await
+        .unwrap();
     assert!(
         store
             .get_application(&app.app_id)
@@ -552,7 +570,7 @@ async fn concurrent_saves_at_one_revision_have_one_winner() {
 }
 
 #[tokio::test]
-async fn database_admin_admission_rejects_managed_credentials_without_claiming_slot() {
+async fn database_admin_accepts_managed_credentials_with_same_scope_isolation() {
     let (_directory, store, app) = database().await;
     store
         .save_runtime_configuration(&app.app_id, Prod, &save_request(&app, "saved", 0, "secret"))
@@ -566,15 +584,40 @@ async fn database_admin_admission_rejects_managed_credentials_without_claiming_s
             username: "business".into(),
         },
     );
-    assert!(matches!(
-        store.admit(&request).await,
-        Err(UserAppStoreError::InvalidOperation(_))
-    ));
-    let current = store.get_application(&app.app_id).await.unwrap().unwrap();
-    assert!(current.active_operations.slot(Prod).is_none());
+    let (op, context) = claim(&store, &request).await;
     assert!(
         store
-            .get_operation(&app.app_id, "admin")
+            .operation_runtime_configuration(&context)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let current = store.get_application(&app.app_id).await.unwrap().unwrap();
+    assert_eq!(
+        current.active_operations.slot(Prod).unwrap(),
+        &op.operation_id
+    );
+    let mut concurrent = request.clone();
+    concurrent.operation_id = "concurrent".into();
+    concurrent.request_id = Some("concurrent".into());
+    assert!(
+        matches!(store.admit(&concurrent).await, Err(UserAppStoreError::OperationInProgress(blocker)) if blocker.operation_id == op.operation_id)
+    );
+    let (_, dev) = claim(
+        &store,
+        &admission(
+            &app,
+            "devadmin",
+            UserAppControlCommand::ResetDatabasePassword {
+                production: false,
+                username: "business".into(),
+            },
+        ),
+    )
+    .await;
+    assert!(
+        store
+            .operation_runtime_configuration(&dev)
             .await
             .unwrap()
             .is_none()
@@ -617,22 +660,14 @@ async fn database_admin_blocks_same_scope_configuration_until_confirmed_terminal
 }
 
 #[tokio::test]
-async fn database_admin_protects_applied_account_after_new_account_is_saved() {
+async fn database_admin_allows_saved_and_applied_accounts_without_losing_slot_protection() {
     let (_directory, store, app) = database().await;
     let first = save_request(&app, "savedone", 0, "secret");
     store
         .save_runtime_configuration(&app.app_id, Prod, &first)
         .await
         .unwrap();
-    let (op, context) = claim(
-        &store,
-        &admission(
-            &app,
-            "startone",
-            UserAppControlCommand::Start { traffic: false },
-        ),
-    )
-    .await;
+    let (op, context) = claim_inline(&store, &app, "startone", "secret").await;
     ready(&store, &context, 1).await;
     store
         .advance(&progress(&op, UserAppOperationState::Succeeded))
@@ -645,20 +680,38 @@ async fn database_admin_protects_applied_account_after_new_account_is_saved() {
         .await
         .unwrap();
     for (id, username) in [("oldadmin", "business"), ("newadmin", "nextbusiness")] {
-        let result = store
-            .admit(&admission(
-                &app,
-                id,
-                UserAppControlCommand::ResetDatabasePassword {
-                    production: true,
-                    username: username.into(),
-                },
-            ))
-            .await;
-        assert!(matches!(
-            result,
-            Err(UserAppStoreError::InvalidOperation(_))
-        ));
+        let request = admission(
+            &app,
+            id,
+            UserAppControlCommand::ResetDatabasePassword {
+                production: true,
+                username: username.into(),
+            },
+        );
+        let (admin, context) = claim(&store, &request).await;
+        assert!(
+            store
+                .operation_runtime_configuration(&context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let blocked = admission(
+            &app,
+            "competingadmin",
+            UserAppControlCommand::ResetDatabasePassword {
+                production: true,
+                username: "other".into(),
+            },
+        );
+        assert!(
+            matches!(store.admit(&blocked).await, Err(UserAppStoreError::OperationInProgress(blocker)) if blocker.operation_id == admin.operation_id)
+        );
+        // Confirmed pre-write failure releases this identity, not the next request.
+        store
+            .advance(&progress(&admin, UserAppOperationState::Failed))
+            .await
+            .unwrap();
     }
     let (admin, _) = claim(
         &store,

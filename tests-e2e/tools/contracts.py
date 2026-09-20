@@ -36,23 +36,16 @@ REQUIRED = {
 }
 
 REQUIRED['userapp_deploy_full_chain'] |= {
-    'CR10 prod 配置不改变 dev',
-    'CR10 保存不换容器且旧密码继续可用',
-    'CR10 保存仅产生待生效版本',
-    'CR10 保存前旧凭据可用',
-    'CR10 保存前身份可用',
-    'CR10 停止态 Start 后真实业务可访问',
-    'CR10 停止态 Start 换代并应用第二版本',
-    'CR10 停止态保存不唤醒且 UID 不变',
-    'CR10 停止态保存第二版本仅待生效',
-    'CR10 停止态显式无 URL Start 成功',
-    'CR10 停止态配置切换不改变 dev',
-    'CR10 待生效密码尚不能登录',
-    'CR10 换代后新凭据版本生效',
-    'CR10 显式重启操作成功',
-    'CR10 第二次保存前 prod 已停止',
-    'CR10 第二版本拒绝旧 prod 密码',
-    'CR10 配置换代后真实业务可访问',
+    'CR10 immediate password preconditions',
+    'CR10 original TCP credentials valid',
+    'CR10 persistent session authenticated before password change',
+    'CR10 reset password applies immediately',
+    'CR10 new password accepts new TCP connection',
+    'CR10 old password rejects new TCP connection',
+    'CR10 authenticated session survives password change',
+    'CR10 password change preserves production UID and owner',
+    'CR10 password change leaves development unchanged',
+    'CR10 business remains available after password change',
 }
 
 REQUIRED['userapp_scope_isolation_during_deploy'] = {

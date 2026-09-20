@@ -455,7 +455,7 @@ impl AppService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{MockRuntime, test_service};
+    use crate::test_support::{MockRuntime, test_service_with_store};
     use std::sync::{Arc, atomic::Ordering};
 
     async fn fixture() -> (
@@ -463,10 +463,11 @@ mod tests {
         AppService,
         Arc<MockRuntime>,
         UserAppLifecycleRecord,
+        Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
     ) {
         let directory = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MockRuntime::default());
-        let mut service = test_service(directory.path(), runtime.clone()).await;
+        let (mut service, store) = test_service_with_store(directory.path(), runtime.clone()).await;
         service.config.access_mode = crate::config::AppAccessMode::Kubernetes;
         let app = service
             .metadata
@@ -494,12 +495,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        (directory, service, runtime, app)
+        (directory, service, runtime, app, store)
     }
 
     #[tokio::test]
     async fn database_preparation_pending_recovery_keeps_original_identity() {
-        let (_directory, service, runtime, app) = fixture().await;
+        let (_directory, service, runtime, app, _store) = fixture().await;
         let pending = match service
             .metadata
             .store
@@ -553,10 +554,9 @@ mod tests {
 
     #[tokio::test]
     async fn database_preparation_completes_with_failed_business_and_replays_without_start() {
-        let (_directory, service, runtime, app) = fixture().await;
+        let (_directory, service, runtime, app, _store) = fixture().await;
         runtime.crash_on_start.store(true, Ordering::SeqCst);
-        service
-            .runtime_configuration
+        _store
             .save_runtime_configuration(
                 &app.app_id,
                 UserAppOperationScope::Prod,
@@ -614,8 +614,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(current.runtime_policy, app.runtime_policy);
-        let config = service
-            .runtime_configuration
+        let config = _store
             .runtime_configuration_status(
                 &app.app_id,
                 &app.lifecycle_id,
@@ -657,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn database_preparation_failure_after_start_keeps_operation_and_lease() {
-        let (_directory, service, runtime, app) = fixture().await;
+        let (_directory, service, runtime, app, _store) = fixture().await;
         // No scripted management reply: physical start succeeds, subsequent
         // bound observation fails. That is not proof that startup was undone.
         let result = service
@@ -708,7 +707,7 @@ mod tests {
     }
     #[tokio::test]
     async fn management_recovery_observes_late_success_without_restarting() {
-        let (_directory, service, runtime, app) = fixture().await;
+        let (_directory, service, runtime, app, _store) = fixture().await;
         assert!(
             service
                 .prepare_prod_database(
@@ -791,7 +790,7 @@ mod tests {
 
     #[tokio::test]
     async fn management_recovery_rejects_replaced_generation_without_releasing() {
-        let (_directory, service, runtime, app) = fixture().await;
+        let (_directory, service, runtime, app, _store) = fixture().await;
         assert!(
             service
                 .prepare_prod_database(
@@ -847,7 +846,7 @@ mod tests {
     }
     #[tokio::test]
     async fn management_recovery_rejects_replacement_workload_uid() {
-        let (_directory, service, runtime, app) = fixture().await;
+        let (_directory, service, runtime, app, _store) = fixture().await;
         assert!(
             service
                 .prepare_prod_database(

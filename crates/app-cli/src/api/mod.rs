@@ -48,9 +48,7 @@ use envelope::ApiJson;
         stream_logs,
         submit_deploy,
         deploy_status,
-        activate_runtime_configuration,
-        prepared_runtime_configuration,
-        seal_runtime_configuration_source,
+
         proxy::validate,
         proxy::reload,
         proxy::status,
@@ -72,8 +70,7 @@ use envelope::ApiJson;
         crate::log::model::SourceError,
         DeployBody,
         DeployAcceptedData,
-        ConfigurationPreparationData,
-        ConsumedConfigurationActivation,
+
         crate::server::DeployStatus,
     )),
     tags(
@@ -170,18 +167,6 @@ fn api_router(state: AppState) -> Router {
         .route("/v1/proxy/upstreams", get(proxy::upstreams))
         .route("/v1/deploy", post(submit_deploy))
         .route("/v1/deploy/status", get(deploy_status))
-        .route(
-            "/v1/runtime/configuration/source-seal",
-            post(seal_runtime_configuration_source),
-        )
-        .route(
-            "/v1/runtime/configuration/prepared",
-            get(prepared_runtime_configuration),
-        )
-        .route(
-            "/v1/runtime/configuration/activate",
-            post(activate_runtime_configuration),
-        )
         .route("/v1/runtime/identity", get(runtime::identity))
         .route("/v1/runtime/status", get(runtime::status))
         .route("/v1/runtime/operations", post(runtime::submit_operation))
@@ -348,7 +333,7 @@ async fn submit_deploy(
                 sha256: body.sha256.map(|value| value.to_ascii_lowercase()),
                 local_path: None,
                 execution_target: None,
-                requires_configuration_activation: false,
+
                 run_pg: None,
             },
             accepted_id,
@@ -399,197 +384,6 @@ fn authorize_deploy(state: &AppState, headers: &axum::http::HeaderMap) -> Result
         Ok(())
     } else {
         Err("deploy token mismatch".to_string())
-    }
-}
-
-#[utoipa::path(
-    post, path = "/v1/runtime/configuration/source-seal",
-    request_body = shared_types::RuntimeGenerationHandoff,
-    responses(
-        (status = 200, description = "Source reserved for this exact replacement", body = envelope::HttpResult<shared_types::RuntimeGenerationSourceSeal>),
-        (status = 202, description = "HANDOFF_SOURCE_BUSY; no reservation was written"),
-        (status = 403, description = "Invalid deployment token"),
-        (status = 409, description = "Source state is protected or mismatched")
-    ), tag = "Runtime Control"
-)]
-async fn seal_runtime_configuration_source(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(body): Json<shared_types::RuntimeGenerationHandoff>,
-) -> Response {
-    if let Err(message) = authorize_deploy(&state, &headers) {
-        return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
-    }
-    if state.server.initializing() {
-        return envelope::error(
-            StatusCode::ACCEPTED,
-            "HANDOFF_SOURCE_BUSY",
-            "Source initialization is in progress",
-        );
-    }
-    match tokio::task::spawn_blocking(move || {
-        state.server.seal_generation_source(&state.workspace, &body)
-    })
-    .await
-    {
-        Ok(Ok(Some(seal))) => envelope::ok(StatusCode::OK, seal),
-        Ok(Ok(None)) => envelope::error(
-            StatusCode::ACCEPTED,
-            "HANDOFF_SOURCE_BUSY",
-            "Source orchestration is still in progress",
-        ),
-        Ok(Err(error)) => envelope::error(
-            StatusCode::CONFLICT,
-            "HANDOFF_SOURCE_NOT_PREPARED",
-            error.to_string(),
-        ),
-        Err(error) => envelope::error(
-            StatusCode::CONFLICT,
-            "HANDOFF_SOURCE_UNKNOWN",
-            error.to_string(),
-        ),
-    }
-}
-
-/// Mutually exclusive observations from the configuration preparation endpoint.
-/// Prepared authorizes the platform's first credential application; Activated
-/// only confirms a consumed original operation and permits read-only recovery.
-#[derive(Serialize, utoipa::ToSchema)]
-#[serde(untagged)]
-enum ConfigurationPreparationData {
-    Prepared(shared_types::RuntimeGenerationPrepared),
-    Activated(ConsumedConfigurationActivation),
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
-struct ConsumedConfigurationActivation {
-    /// Always true: the exact activation was durably acknowledged previously.
-    #[schema(example = true)]
-    activated: bool,
-    /// Original, fully matched authorization; this is not a new startup intent.
-    authorization: shared_types::RuntimeGenerationHandoff,
-}
-
-#[utoipa::path(
-    get, path = "/v1/runtime/configuration/prepared",
-    responses(
-        (status = 200, description = "Prepared handoff or durable consumed activation observation", body = envelope::HttpResult<ConfigurationPreparationData>),
-        (status = 202, description = "Preparation pending; HANDOFF_PENDING, success=false and data=null", body = envelope::HttpResult<String>),
-        (status = 403, description = "Invalid deployment token; DEPLOY_FORBIDDEN, success=false and data=null", body = envelope::HttpResult<String>),
-        (status = 409, description = "Runtime is protected or durable activation is invalid; success=false and data=null", body = envelope::HttpResult<String>)
-    ), tag = "Runtime Control"
-)]
-async fn prepared_runtime_configuration(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-) -> Response {
-    if let Err(message) = authorize_deploy(&state, &headers) {
-        return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
-    }
-    if state.server.runtime_recovery_hold_active()
-        || state
-            .server
-            .runtime_kernel()
-            .is_some_and(|kernel| kernel.recovery_protection_active())
-    {
-        return envelope::error(
-            StatusCode::CONFLICT,
-            "HANDOFF_NOT_PREPARED",
-            "Runtime requires recovery",
-        );
-    }
-    if let Some(gate) = state.server.configuration_gate() {
-        match gate.activated() {
-            Ok(true) => {
-                if let Some(authorization) = gate.handoff() {
-                    // Completion observation, never another authorization to
-                    // mutate PG or advance desired state.
-                    return envelope::ok(
-                        StatusCode::OK,
-                        ConfigurationPreparationData::Activated(ConsumedConfigurationActivation {
-                            activated: true,
-                            authorization: authorization.clone(),
-                        }),
-                    );
-                }
-            }
-            Err(error) => {
-                return envelope::error(
-                    StatusCode::CONFLICT,
-                    "HANDOFF_ACTIVATION_INVALID",
-                    format!("Activation receipt cannot be verified: {error:#}"),
-                );
-            }
-            _ => {}
-        }
-    }
-    match state
-        .server
-        .configuration_gate()
-        .and_then(|gate| gate.prepared().cloned())
-    {
-        Some(prepared) => envelope::ok(
-            StatusCode::OK,
-            ConfigurationPreparationData::Prepared(prepared),
-        ),
-        None => envelope::error(
-            StatusCode::ACCEPTED,
-            "HANDOFF_PENDING",
-            "Generation handoff is not prepared",
-        ),
-    }
-}
-
-/// The only startup write accepted before business initialization: acknowledge
-/// credentials already verified by the platform for this exact cold generation.
-#[utoipa::path(
-    post,
-    path = "/v1/runtime/configuration/activate",
-    request_body = shared_types::RuntimeConfigurationActivation,
-    responses(
-        (status = 200, description = "Activation durably recorded; business readiness is separate"),
-        (status = 403, description = "Invalid deployment token"),
-        (status = 409, description = "Runtime is not awaiting managed configuration or identity differs"),
-        (status = 500, description = "Activation commit could not be confirmed")
-    ),
-    tag = "Runtime Control"
-)]
-async fn activate_runtime_configuration(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    ApiJson(body): ApiJson<shared_types::RuntimeConfigurationActivation>,
-) -> Response {
-    if let Err(message) = authorize_deploy(&state, &headers) {
-        return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
-    }
-    let Some(gate) = state.server.configuration_gate() else {
-        return envelope::error(
-            StatusCode::CONFLICT,
-            "CONFIGURATION_NOT_MANAGED",
-            "This runtime has no managed configuration startup gate",
-        );
-    };
-    if !gate.matches(&body) {
-        return envelope::error(
-            StatusCode::CONFLICT,
-            "CONFIGURATION_IDENTITY_MISMATCH",
-            "Configuration activation identity does not match this generation",
-        );
-    }
-    match tokio::task::spawn_blocking(move || state.server.activate_runtime_configuration(&body))
-        .await
-    {
-        Ok(Ok(())) => envelope::ok(StatusCode::OK, json!({"activated": true})),
-        Ok(Err(error)) => envelope::error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "CONFIGURATION_ACTIVATION_UNCONFIRMED",
-            error.to_string(),
-        ),
-        Err(_) => envelope::error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "CONFIGURATION_ACTIVATION_UNCONFIRMED",
-            "Configuration activation worker did not return a confirmed result",
-        ),
     }
 }
 
@@ -798,6 +592,32 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let value = serde_json::from_slice(&bytes).expect("response body is JSON");
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn credential_replacement_endpoints_are_retired_without_removing_runtime_control() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for (method, path) in [
+            ("POST", "/v1/runtime/configuration/source-seal"),
+            ("GET", "/v1/runtime/configuration/prepared"),
+            ("POST", "/v1/runtime/configuration/activate"),
+        ] {
+            assert!(document["paths"].get(path).is_none());
+            let response = api_router(test_state())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        assert!(document["paths"].get("/v1/runtime/identity").is_some());
+        assert!(document["paths"].get("/v1/deploy").is_some());
+        assert!(document["paths"].get("/v1/proxy/reload").is_some());
     }
 
     /// 成功信封：恒 5 键、data 载荷透出（idle 空 selector → 空日志快照）。

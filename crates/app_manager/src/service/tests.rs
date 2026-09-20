@@ -589,7 +589,6 @@ async fn test_service_with_mode(
     };
     let store = Arc::new(store);
     AppService {
-        runtime_configuration: store.clone(),
         operation_flight: Arc::default(),
         config,
         runtime: runtime as Arc<dyn UserAppRuntime>,
@@ -3898,4 +3897,73 @@ async fn pending_composite_deployment_recovers_original_control_and_completion()
     assert_eq!(replay.runtime.idle_timeout_seconds, Some(714));
     assert_eq!(runtime.policy_calls.load(Ordering::SeqCst), 1);
     assert!(!service.resume_pending_control(&pending).await.unwrap());
+}
+
+#[tokio::test]
+async fn controlled_start_ignores_historical_saved_database_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    use shared_types::UserAppRuntimeConfigurationStore as _;
+    let runtime = Arc::new(MockRuntime::default());
+    let (service, store) =
+        crate::test_support::test_service_with_store(root.path(), runtime.clone()).await;
+    let code = root.path().join("historicalpassword/code");
+    tokio::fs::create_dir_all(&code).await.unwrap();
+    tokio::fs::write(code.join("release.lock.toml"), release_lock())
+        .await
+        .unwrap();
+    service
+        .create_app(create_request("historicalpassword"))
+        .await
+        .unwrap();
+    let identity = service
+        .metadata
+        .store
+        .ensure_identity("historicalpassword")
+        .await
+        .unwrap();
+    store
+        .save_runtime_configuration(
+            "historicalpassword",
+            shared_types::UserAppOperationScope::Prod,
+            &shared_types::SaveRuntimeConfigurationRequest {
+                lifecycle_id: identity.lifecycle_id,
+                request_id: "oldsave".into(),
+                expected_revision: 0,
+                pg: StartPgCredential {
+                    username: "olduser".into(),
+                    password: "oldprivate".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    service.stop_app("historicalpassword").await.unwrap();
+    let creates = runtime.create_calls.load(Ordering::SeqCst);
+    let deletes = runtime.delete_calls.load(Ordering::SeqCst);
+    service
+        .start_app_controlled(
+            "historicalpassword",
+            shared_types::UserAppControlRequest {
+                lifecycle_id: None,
+                request_id: Some("newstart".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), creates);
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), deletes);
+    assert!(runtime.configuration_commands.lock().unwrap().is_empty());
+    service
+        .restart_app_controlled(
+            "historicalpassword",
+            shared_types::UserAppControlRequest {
+                lifecycle_id: None,
+                request_id: Some("newrestart".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), creates);
+    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), deletes);
+    assert!(runtime.configuration_commands.lock().unwrap().is_empty());
 }

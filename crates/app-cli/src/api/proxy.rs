@@ -88,7 +88,7 @@ pub(super) struct ProxyUpstreamsData {
 )]
 pub(super) async fn validate(State(state): State<AppState>) -> Response {
     // The existing compiler publishes the validated config atomically, so this
-    // endpoint is also a writer and must participate in the handoff barrier.
+    // endpoint is also a writer and must participate in runtime admission and unknown-result protection.
     let mut writer = match state.server.begin_auxiliary_write() {
         Ok(writer) => writer,
         Err(error) => return proxy_error(error),

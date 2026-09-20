@@ -53,7 +53,6 @@ pub struct AppService {
     /// Persistent application identity, lifecycle and metadata; never an
     /// in-memory authority or a best-effort fallback after a storage failure.
     pub(crate) metadata: AppMetadataStore,
-    pub(crate) runtime_configuration: Arc<dyn shared_types::UserAppRuntimeConfigurationStore>,
     /// Userapp 开发资源回收回调（宿主注入；purge 时回收 UserappBuilder 开发容器
     /// 与 per-app PVC——app_manager 的 runtime 视图无 agent 能力，经契约委托宿主）。
     pub(crate) dev_cleanup: std::sync::RwLock<Option<Arc<dyn shared_types::UserappDevCleanup>>>,
@@ -93,7 +92,6 @@ impl AppService {
         activity: Arc<AppActivityRegistry>,
         pingora: Option<Arc<PingoraProxyService>>,
         store: Arc<dyn shared_types::UserAppLifecycleStore>,
-        runtime_configuration: Arc<dyn shared_types::UserAppRuntimeConfigurationStore>,
     ) -> AppResult<Self> {
         if config.access_mode == AppAccessMode::Docker
             && config.operation_lock_root != shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT
@@ -133,7 +131,6 @@ impl AppService {
             deploy_list_cache: tokio::sync::Mutex::new(None),
             release_locks: DashMap::new(),
             metadata: AppMetadataStore::new(store),
-            runtime_configuration,
             dev_cleanup: std::sync::RwLock::new(None),
             dev_locator: std::sync::RwLock::new(None),
             builder_recovery: std::sync::RwLock::new(None),

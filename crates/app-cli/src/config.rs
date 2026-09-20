@@ -14,9 +14,6 @@ pub struct CliArgs {
 pub enum Command {
     /// 启动常驻运行态所有者及管理 API。
     Serve(ServeArgs),
-    /// Seal a stopped runtime generation using authorization JSON on stdin.
-    /// Does not start listeners, databases, or application services.
-    SealSource(WorkspaceArgs),
     /// 直接前台编排服务（平台开发链路入口）。
     Run(RunArgs),
     /// 构建 workspace 服务，不启动服务。
@@ -127,6 +124,19 @@ impl From<ServeArgs> for RuntimeArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_seal_command_is_rejected_while_normal_run_remains_available() {
+        assert!(
+            CliArgs::try_parse_from(["app-cli", "seal-source", "--workspace", "project"]).is_err()
+        );
+        assert!(matches!(
+            CliArgs::try_parse_from(["app-cli", "run", "--workspace", "project"])
+                .unwrap()
+                .command,
+            Command::Run(_)
+        ));
+    }
 
     #[test]
     fn serve_options_reach_normalized_runtime() {

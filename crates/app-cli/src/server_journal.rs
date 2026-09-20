@@ -38,8 +38,6 @@ pub(crate) struct Receipt {
     pub request: DeployRequest,
     pub boundary: Boundary,
     pub active: Option<ActiveVersion>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation_handoff: Option<shared_types::RuntimeGenerationPrepared>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
@@ -112,8 +110,7 @@ impl Journal {
                 continue;
             }
             let has_records = legacy.join(".deploy-operation.json").try_exists()?
-                || legacy.join(".deploy-coordinator.json").try_exists()?
-                || legacy.join(".generation-source-seal.json").try_exists()?;
+                || legacy.join(".deploy-coordinator.json").try_exists()?;
             if !has_records {
                 continue;
             }
@@ -140,11 +137,7 @@ impl Journal {
         let Some(legacy) = self.legacy_root.as_ref() else {
             return Ok(());
         };
-        for name in [
-            ".deploy-operation.json",
-            ".deploy-coordinator.json",
-            ".generation-source-seal.json",
-        ] {
+        for name in [".deploy-operation.json", ".deploy-coordinator.json"] {
             let source = legacy.join(name);
             if source.try_exists()? {
                 anyhow::ensure!(
@@ -199,24 +192,6 @@ impl Journal {
             legacy_root: None,
         })
     }
-    pub(crate) fn source_seal(&self) -> Result<Option<shared_types::RuntimeGenerationSourceSeal>> {
-        match std::fs::read(self.root.join(".generation-source-seal.json")) {
-            Ok(bytes) => Ok(Some(
-                serde_json::from_slice(&bytes).context("invalid generation source seal")?,
-            )),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).context("read generation source seal"),
-        }
-    }
-
-    pub(crate) fn write_source_seal(
-        &self,
-        seal: &shared_types::RuntimeGenerationSourceSeal,
-    ) -> Result<()> {
-        self.write_verified(".generation-source-seal.json", seal)?;
-        Ok(())
-    }
-
     fn write_verified<T: Serialize + serde::de::DeserializeOwned>(
         &self,
         name: &str,
@@ -409,12 +384,11 @@ mod tests {
             sha256: None,
             local_path: None,
             execution_target: None,
-            requires_configuration_activation: false,
             run_pg: None,
         };
         Receipt {
             generation: "generation-a".into(),
-            generation_handoff: None,
+
             operation: AppDeploymentOperation {
                 operation_id: "hot-b".into(),
                 deployment_generation_id: "generation-a".into(),
@@ -434,6 +408,29 @@ mod tests {
             }),
         }
     }
+    #[test]
+    fn retired_configuration_fields_do_not_change_deployment_identity_or_boundary() {
+        let mut legacy = serde_json::to_value(receipt(Boundary::RestoredActive)).unwrap();
+        legacy["generation_handoff"] = serde_json::json!({"retired": true});
+        legacy["request"]["requires_configuration_activation"] = true.into();
+        legacy["active"]["request"]["requires_configuration_activation"] = true.into();
+        let restored: Receipt = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.generation, "generation-a");
+        assert_eq!(restored.boundary, Boundary::RestoredActive);
+        assert_eq!(restored.operation.operation_id, "hot-b");
+        assert_eq!(
+            restored.active.as_ref().unwrap().artifact_release_id,
+            "manifest-b"
+        );
+        let saved = serde_json::to_value(restored).unwrap();
+        assert!(saved.get("generation_handoff").is_none());
+        assert!(
+            saved["request"]
+                .get("requires_configuration_activation")
+                .is_none()
+        );
+    }
+
     #[test]
     fn confirmed_startup_failure_keeps_artifact_but_legacy_failure_stays_protected() {
         let dir = tempfile::tempdir().unwrap();

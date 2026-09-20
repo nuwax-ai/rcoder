@@ -108,16 +108,6 @@ impl AppService {
             let mutation = async {
                 operation.bind_lease(&guard).await?;
                 let context = operation.execution_context();
-                if self
-                    .runtime_configuration
-                    .operation_runtime_configuration(&context)
-                    .await?
-                    .is_some()
-                {
-                    return self
-                        .replace_captured_runtime_configuration(previous, &mut operation, &guard)
-                        .await;
-                }
                 let target = self
                     .runtime
                     .capture_app_mutation_target(&context, previous.resource_version.as_deref())

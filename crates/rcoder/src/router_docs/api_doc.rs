@@ -111,8 +111,6 @@ use crate::handler;
         crate::userapp_forward::db::reset_password,
         crate::userapp_forward::db::recover_password,
         crate::userapp_forward::db::create_database,
-        crate::userapp_forward::runtime_configuration::save,
-        crate::userapp_forward::runtime_configuration::status,
     ),
     components(
         schemas(

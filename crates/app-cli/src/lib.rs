@@ -19,7 +19,6 @@
 pub mod api;
 pub mod build;
 pub mod config;
-mod configuration_gate;
 pub mod deploy;
 pub mod devtool;
 pub mod idle;

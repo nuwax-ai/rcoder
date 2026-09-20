@@ -4,7 +4,7 @@
 //! 统一前缀 `/api/v1/userapp/db/*`（路径段区分环境，可滤镜、可扩展）：
 //! - `dev` → 该 app 的 UserappBuilder 开发容器（exec 直达 builder 容器，
 //!   含 PG 就绪等待）
-//! - `prod` → Userapp 运行容器（app_manager runtime exec 通道，stopped 自动唤醒）
+//! - `prod` → Userapp 运行容器（app_manager runtime exec 通道）；改密不自动唤醒。
 //!
 //! 流程单头 [`shared_types::upsert_pg_user`]/[`create_pg_database`]；密码不落日志。
 //! （PG 凭据对齐不在此面——start 部署链内嵌（请求 `pg.username`/`pg.password`
@@ -230,14 +230,15 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
     description = r#"
 设置目标容器内 PG 的账号密码，两种语义：
 
-- **不带 username**：目标为 PGDATA 中持久化的初始化管理员；如果也是受管理运行账号，拒绝直接改密；
+- **不带 username**：目标为 PGDATA 中持久化的初始化管理员；
 - **带 username**：账号 upsert——角色存在则 ALTER USER 改密，不存在则 CREATE ROLE
   建号后再设密。
 
 dbx 预置连接为容器内 local-pg socket 免密（与改密链解耦——改密不影响 dbx 访问）。
-prod 环境目标容器 stopped 会自动唤醒并等待 PG 就绪。
+prod 环境需要目标容器已运行；未运行时明确返回错误，由用户先启动容器。
 
-运行账号（已生效、待生效、正在应用的配置，或容器当前运行账号）必须使用运行配置保存接口。
+运行账号也可直接改密。此接口不重启应用或容器，不主动断开现有数据库会话。
+已认证会话继续使用；后续采用密码认证的新连接必须使用新密码。应用连接配置更新及重启由用户决定。
 request_id 用于原请求重放，lifecycle_id 用于拒绝已换代应用；建议调用方始终传入两者。
 受理后的协调任务不会因 HTTP 断连而取消。写结果未知时保留操作与租约，不能换 request_id 重试绕过。
 成功表示数据库已确认写入且 TCP 凭据验证通过；密码不进入操作记录或错误响应。

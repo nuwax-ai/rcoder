@@ -197,8 +197,8 @@ pub(super) async fn admit_with_configuration(
         super::transaction_fault_tests::check("admission_operation")?;
         if let Some(pg) = pg {
             configuration::seed_deployment_credentials(tx, backend, operation, pg).await?;
+            configuration::capture(tx, operation).await?;
         }
-        configuration::capture(tx, operation).await?;
         if let Some(input) = input {
             models::OperationInput::create()
                 .operation_id(&operation.operation_id)
