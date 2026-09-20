@@ -923,3 +923,9 @@ compute-control 线功能开发至此：F1、R1、R2a、R2b/N1、R5、R3、R4、
 **修复**（server.rs initialize_startup）：StartupFailed 且制品身份与迁移确认（上游既有核验）时，经 `require_fresh_process_scope` 护栏（前编排进程组确已退出=容器重启后的显式新尝试，非进程内重试循环）→ 按已确认制品走 Existing 编排恢复业务。历史操作结果保持 Failed 不改写。防循环：进程存活期内不再重试（init 一次）；容器重启频率由平台重启策略约束。
 
 **验证**：app-cli 独立 `cargo check --all-features` 退出 0；fmt 通过。未运行测试（阶段约束）。Qoder 报告的另两个失败断言（改密前后业务可用）预计随业务可恢复而闭环，e2e 阶段验证。
+
+### 2026-09-21：测试前检查（用例时效评估，未新增场景）
+
+- 过期断言扫描：tests-e2e 无对 "Original restart template"/"Production identity changed"/"Restart target changed" 的字符串断言——R1/R3 改动的报错文案无测试耦合。
+- 新行为覆盖评估：Docker 每次 dev restart 即走 R1 归档路径（auto-remove 语义），现有 dev restart 场景隐式全覆盖；deploy_full_chain 的 3 个历史失败断言（Qoder R1）即 app-cli 修复的验收；R2a/R4/R5 属故障注入窗口，宜工具脚本（manual_owner_stop.py 模式）在测试阶段按需补。按用户"高价值不滥加"约束，本轮不新增默认套件场景。
+- e2e 前置：dev-hot 重建 rcoder 容器 + docker-build-agent-runner + docker-build-app-runtime（app-cli 修复在这两个镜像内，qoder 报告已证明旧 app-runtime 镜像会掩盖此类修复）。
