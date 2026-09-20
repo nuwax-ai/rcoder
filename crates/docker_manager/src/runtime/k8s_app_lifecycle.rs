@@ -780,7 +780,7 @@ impl KubernetesRuntime {
         app_mutation_identity(name, &deployment.metadata)
     }
 
-    async fn patch_captured_app(
+    pub(super) async fn patch_captured_app(
         &self,
         identity: &shared_types::AppResourceIdentity,
         patch: serde_json::Value,

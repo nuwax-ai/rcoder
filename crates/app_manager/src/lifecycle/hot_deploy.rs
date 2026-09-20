@@ -442,11 +442,9 @@ impl HotDeploymentTask {
             }
         }
 
-        if let Some(owned) = owned {
-            owned.begin_hot_convergence().await?;
-            owned.authorize_mutation().await?;
-        }
-        // 收敛 env 三元组进 ConfigMap（不触发 Recreate）：Pod 重建恢复最新版本
+        // 收敛 env 三元组进 ConfigMap（不触发 Recreate）：Pod 重建恢复最新版本。
+        // 目标先入检查点：begin_hot_convergence 与 ConfigMap 写之间崩溃时，
+        // 恢复观察者有可比对的期望值。
         let mut env = env_snapshot.env.clone();
         crate::release_flow::identity::strip_release_identity(&mut env);
         env.insert("APP_DEPLOY_URL".into(), url.clone());
@@ -456,6 +454,10 @@ impl HotDeploymentTask {
             shared_types::APP_DEPLOY_OPERATION_ID.into(),
             operation_id.clone(),
         );
+        if let Some(owned) = owned {
+            owned.begin_hot_convergence(&env).await?;
+            owned.authorize_mutation().await?;
+        }
         converge_deploy_env_after_hot(
             runtime.as_ref(),
             access_mode,

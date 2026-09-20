@@ -1,15 +1,15 @@
 //! Explicit adoption of an existing physical resource into one application lifecycle.
 //! Bindings outlive deletion so an old physical UID cannot be adopted by a new life.
-use crate::{ServiceType, UserAppExecutionContext};
+use crate::{AppResourceIdentity, ServiceType, UserAppExecutionContext};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UserAppResourceBinding {
     pub app_id: String,
     pub lifecycle_id: String,
-    /// Bound resource family: user-app-builder (UserappBuilder). The shared family
-    /// type also represents web-agent-runner (WebAgentRunner), computer-agent-runner
-    /// (ComputerAgentRunner), and user-app (Userapp), which this binding rejects.
+    /// Bound resource family: user-app-builder (UserappBuilder) or user-app
+    /// (Userapp). Callers fetch bindings by (service_type, uid), so the two
+    /// families can never cross-wire.
     pub service_type: ServiceType,
     pub physical_uid: String,
     pub adopted_by_operation: String,
@@ -54,15 +54,19 @@ impl UserAppResourceBinding {
         physical_uid: &str,
     ) -> Result<(), String> {
         context.validate_identity(&self.app_id)?;
+        // The binding family matches whatever resource key stored it; callers
+        // fetch bindings by (service_type, uid), so accepting both families
+        // here cannot cross-wire a prod binding into a builder capture.
         if self.lifecycle_id != context.lifecycle_id
-            || self.service_type != ServiceType::UserappBuilder
+            || !matches!(
+                self.service_type,
+                ServiceType::UserappBuilder | ServiceType::Userapp
+            )
             || self.physical_uid.is_empty()
             || self.physical_uid != physical_uid
             || self.adopted_by_operation.is_empty()
         {
-            return Err(
-                "Physical resource binding does not match the current builder lifecycle".into(),
-            );
+            return Err("Physical resource binding does not match the current lifecycle".into());
         }
         Ok(())
     }
@@ -76,6 +80,27 @@ pub struct AdoptBuilderRequest {
     pub request_id: String,
     /// Actual Docker container ID or current Kubernetes Pod UID, never a name.
     pub expected_container_id: String,
+}
+
+/// Explicit adoption of an existing production controller. The expected UID
+/// is the operator's authorization; matching is name+UID, never name alone.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct AdoptApplicationRequest {
+    /// Current lifecycle returned by the platform; always explicit for adoption.
+    pub lifecycle_id: String,
+    /// Stable request identity for exact retries.
+    pub request_id: String,
+    /// Actual controller identity: Deployment UID (K8s) or container ID (Docker).
+    pub expected_resource_uid: String,
+}
+
+/// Live-verified adoption candidate for production compute. The volume
+/// witnesses pin the workspace the adopted controller must keep using.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppAdoptionTarget {
+    pub context: UserAppExecutionContext,
+    pub resource: AppResourceIdentity,
+    pub volumes: Vec<AppResourceIdentity>,
 }
 
 /// Validate physical ownership before deciding whether an explicit adoption is

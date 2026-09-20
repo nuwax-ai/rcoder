@@ -279,10 +279,7 @@ pub(crate) async fn recover_confirmed(
                 "Original start receipt or current generation readiness is not confirmed"
             );
         }
-        let before = state
-            .runtime()
-            .capture_app_mutation_target(&context, None)
-            .await?;
+        let before = super::app_adoption::capture_bound_app_target(state, &context).await?;
         ensure!(
             before.resource.uid == expected.resource.uid,
             "Production identity changed during recovery"
@@ -296,10 +293,7 @@ pub(crate) async fn recover_confirmed(
             status.ready_replicas > 0,
             "Production compute is still not ready"
         );
-        let after = state
-            .runtime()
-            .capture_app_mutation_target(&context, None)
-            .await?;
+        let after = super::app_adoption::capture_bound_app_target(state, &context).await?;
         ensure!(
             after.resource == before.resource,
             "Production changed while reading readiness"
@@ -747,12 +741,14 @@ async fn execute_claimed(
         )
         .await?
     } else {
-        let target = state
-            .runtime()
-            .capture_app_mutation_target(&context, None)
-            .await?;
+        let target = super::app_adoption::capture_bound_app_target(state, &context).await?;
         if record.action == ComputeControlAction::Restart {
-            serde_json::to_value(state.runtime().prepare_app_compute_start(&target).await?)?
+            let mut prepared =
+                serde_json::to_value(state.runtime().prepare_app_compute_start(&target).await?)?;
+            if let Some(template) = state.runtime().archive_app_restart(&target).await? {
+                prepared["app_restart_template"] = serde_json::to_value(template)?;
+            }
+            prepared
         } else {
             serde_json::to_value(target)?
         }
@@ -828,20 +824,35 @@ async fn execute_claimed(
             prepared
         } else {
             let old: UserAppMutationTarget = serde_json::from_value(target.clone())?;
-            let fresh = state
-                .runtime()
-                .capture_app_mutation_target(&context, None)
-                .await?;
-            ensure!(
-                old.resource.uid == fresh.resource.uid,
-                "Production identity changed during restart"
-            );
+            let mut fresh = super::app_adoption::capture_bound_app_target(state, &context).await?;
+            if old.resource.uid != fresh.resource.uid {
+                // Scale-down (or external deletion) replaced the controller.
+                // Restore a zero-replica replacement from the operation-bound
+                // archive; the Starting CAS below must win before it starts.
+                let template: AppRestartTemplate = serde_json::from_value(
+                    target
+                        .get("app_restart_template")
+                        .context("Original restart template is unavailable")?
+                        .clone(),
+                )?;
+                ensure!(template.source == old, "Restart archive source differs");
+                state.userapp_store.check_compute_executor(identity).await?;
+                *settled = false;
+                fresh = state.runtime().restore_app_restart(&template).await?;
+                *settled = true;
+            }
             let prepared = state.runtime().prepare_app_compute_start(&fresh).await?;
             let prior: UserAppComputeStartTarget = serde_json::from_value(target.clone())?;
             prior
                 .verify_same_volumes(&prepared)
                 .map_err(anyhow::Error::msg)?;
-            serde_json::to_value(prepared)?
+            let mut fresh = serde_json::to_value(prepared)?;
+            // Keep the restart archive reachable from every later stage: an
+            // interrupted Starting resume still needs its recovery source.
+            if let Some(template) = target.get("app_restart_template") {
+                fresh["app_restart_template"] = template.clone();
+            }
+            fresh
         };
         progress(
             state,
@@ -893,10 +904,7 @@ async fn execute_claimed(
                 state.userapp_store.check_compute_executor(identity).await?;
                 let expected: UserAppMutationTarget =
                     serde_json::from_value(record.checkpoint.clone())?;
-                let actual = state
-                    .runtime()
-                    .capture_app_mutation_target(&context, None)
-                    .await?;
+                let actual = super::app_adoption::capture_bound_app_target(state, &context).await?;
                 ensure!(
                     actual.resource.uid == expected.resource.uid,
                     "Production identity changed during verification"
@@ -909,10 +917,8 @@ async fn execute_claimed(
                 if status.ready_replicas > 0 {
                     // The status endpoint is keyed by application, not workload
                     // UID. Fence its observation with another live identity read.
-                    let after = state
-                        .runtime()
-                        .capture_app_mutation_target(&context, None)
-                        .await?;
+                    let after =
+                        super::app_adoption::capture_bound_app_target(state, &context).await?;
                     ensure!(
                         after.resource == actual.resource,
                         "Production changed while reading restart readiness"
@@ -992,14 +998,24 @@ pub(crate) async fn resume_restart_start(
                 .await?,
             "Original stopped boundary is not confirmed"
         );
-        let target = state
-            .runtime()
-            .capture_app_mutation_target(&context, None)
-            .await?;
-        ensure!(
-            target.resource.uid == prior.target.resource.uid,
-            "Restart target changed after stop"
-        );
+        let mut target = super::app_adoption::capture_bound_app_target(state, &context).await?;
+        if target.resource.uid != prior.target.resource.uid {
+            let template: AppRestartTemplate = serde_json::from_value(
+                snapshot
+                    .checkpoint
+                    .get("app_restart_template")
+                    .context("Original restart template is unavailable")?
+                    .clone(),
+            )?;
+            ensure!(
+                template.source == prior.target,
+                "Restart archive source differs"
+            );
+            // The durable stopped boundary already confirmed old compute exited.
+            // Restore only a zero-replica controller; the CAS below must
+            // succeed before any new business instance can start.
+            target = state.runtime().restore_app_restart(&template).await?;
+        }
         let prepared = state.runtime().prepare_app_compute_start(&target).await?;
         prior
             .verify_same_volumes(&prepared)
@@ -1032,7 +1048,14 @@ async fn run_restart_continuation(
 ) -> Result<()> {
     let context = record.execution_context().map_err(anyhow::Error::msg)?;
     let checkpoint = match &prepared {
-        RestartContinuation::Prod(target) => serde_json::to_value(target)?,
+        RestartContinuation::Prod(target) => {
+            let mut value = serde_json::to_value(target)?;
+            // Preserve the restart archive reference through later stages.
+            if let Some(template) = record.checkpoint.get("app_restart_template") {
+                value["app_restart_template"] = template.clone();
+            }
+            value
+        }
         RestartContinuation::Dev(_) => record.checkpoint.clone(),
     };
     let identity = ComputeExecutorIdentity {
@@ -1085,6 +1108,47 @@ async fn run_restart_continuation(
         // Readiness may still be pending. Persisted Verifying lets the existing
         // scanner finish later without launching a second startup.
         recover_confirmed(state, &record).await?;
+        // The restart reached its terminal boundary; the private archive has
+        // no remaining recovery value. Records that crash before this point
+        // stay covered by the scan-based GC instead.
+        if record.action == ComputeControlAction::Restart {
+            let cleanup = match record.scope {
+                UserAppOperationScope::Dev => {
+                    match record.checkpoint.get("builder_restart_template") {
+                        Some(value) => {
+                            let template: BuilderRestartTemplate =
+                                serde_json::from_value(value.clone()).map_err(|error| {
+                                    anyhow::anyhow!("Decode builder restart archive: {error}")
+                                })?;
+                            Some(
+                                state
+                                    .runtime()
+                                    .cleanup_builder_restart_archive(&template)
+                                    .await,
+                            )
+                        }
+                        None => None,
+                    }
+                }
+                UserAppOperationScope::Prod => match record.checkpoint.get("app_restart_template")
+                {
+                    Some(value) => {
+                        let template: AppRestartTemplate =
+                            serde_json::from_value(value.clone()).map_err(|error| {
+                                anyhow::anyhow!("Decode application restart archive: {error}")
+                            })?;
+                        Some(state.runtime().cleanup_app_restart_archive(&template).await)
+                    }
+                    None => None,
+                },
+                UserAppOperationScope::Application => None,
+            };
+            if let Some(result) = cleanup
+                && let Err(error) = result
+            {
+                tracing::warn!(%error, operation_id = %record.operation_id, "Restart archive awaits scan cleanup");
+            }
+        }
         Ok(())
     }
     .await;

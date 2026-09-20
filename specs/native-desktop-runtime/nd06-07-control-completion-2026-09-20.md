@@ -88,3 +88,5 @@ Pending 启动与停止竞态已经补齐：原 owner 已停止受理导致 guar
 Guardian 授权同时新增命令 spec SHA-256：父进程在 Pending 落盘摘要，guardian 对收到的完整 spec 重算，匹配后才进入 Running/spawn；只持久摘要，不保存命令参数或环境中的凭据。错摘要在未消费阶段持锁撤销，不能执行替换命令。
 
 retire 与摘要校验当前已实现但尚未编译/实测；独立真实脚本已增加对应反例，等待集中验证。
+
+> 2026-09-20 深夜补记：retire 与摘要校验已完成集中验证（四组件 nextest 488/488 默认与 all-features、两形态 Clippy、真实二进制脚本 10 项断言全过，macOS），证据见 `verification-2026-09-20.md` 尾部"retire/摘要校验集中验证"段。Linux/Windows 宿主机执行仍待验证。

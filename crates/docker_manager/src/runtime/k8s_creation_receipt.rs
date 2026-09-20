@@ -259,6 +259,150 @@ impl KubernetesRuntime {
 }
 
 impl KubernetesRuntime {
+    /// List operation contexts behind still-present creation/cancellation
+    /// receipts. Payload identity is validated; unreadable entries surface as
+    /// errors instead of being silently skipped or deleted.
+    pub(super) async fn list_creation_receipt_contexts_impl(
+        &self,
+    ) -> Result<Vec<UserAppExecutionContext>> {
+        let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
+        let list = api
+            .list(&kube::api::ListParams::default().labels(
+                "rcoder.io/resource-type in (builder-creation-receipt, builder-cancellation-receipt)",
+            ))
+            .await
+            .map_err(|error| Error::K8sError(format!("List creation receipts: {error}")))?;
+        let mut contexts = Vec::new();
+        for object in list.items {
+            if object.immutable != Some(true) || object.metadata.deletion_timestamp.is_some() {
+                return Err(Error::Conflict(
+                    "Invalid builder creation receipt object".into(),
+                ));
+            }
+            let kind = object
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("rcoder.io/resource-type"))
+                .cloned();
+            let payload = object
+                .data
+                .as_ref()
+                .and_then(|data| data.get("receipt"))
+                .ok_or_else(|| Error::Conflict("Receipt payload missing".into()))?;
+            if payload.len() > 65536 {
+                return Err(Error::Conflict("Creation receipt exceeds limit".into()));
+            }
+            let context = match kind.as_deref() {
+                Some("builder-creation-receipt") => {
+                    let receipt: BuilderCreationReceipt =
+                        serde_json::from_str(payload).map_err(|error| {
+                            Error::Conflict(format!("Decode creation receipt: {error}"))
+                        })?;
+                    receipt.validate()?;
+                    receipt.target.context
+                }
+                Some("builder-cancellation-receipt") => {
+                    let receipt: super::builder_creation_receipt::BuilderCancellationReceipt =
+                        serde_json::from_str(payload).map_err(|error| {
+                            Error::Conflict(format!("Decode cancellation receipt: {error}"))
+                        })?;
+                    receipt.validate()?;
+                    receipt.context
+                }
+                _ => {
+                    return Err(Error::Conflict(
+                        "Unknown builder creation receipt kind".into(),
+                    ));
+                }
+            };
+            if !contexts.contains(&context) {
+                contexts.push(context);
+            }
+        }
+        Ok(contexts)
+    }
+
+    /// Delete both receipt objects for one operation, preconditioned on their
+    /// current UIDs. Payloads are re-read first so a foreign object under a
+    /// derived name is never deleted.
+    pub(super) async fn cleanup_builder_creation_receipt_objects(
+        &self,
+        context: &UserAppExecutionContext,
+    ) -> Result<()> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(Error::ConfigurationError)?;
+        let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
+        for object_name in [name(context)?, format!("cancel.{}", name(context)?)] {
+            let Some(existing) = api
+                .get_opt(&object_name)
+                .await
+                .map_err(|error| Error::K8sError(format!("Read receipt for cleanup: {error}")))?
+            else {
+                continue;
+            };
+            let uid = existing
+                .metadata
+                .uid
+                .clone()
+                .filter(|uid| !uid.is_empty())
+                .ok_or_else(|| Error::Conflict("Receipt UID missing".into()))?;
+            // Identity re-check: the payload must still belong to this exact
+            // operation before its object may be removed.
+            let belongs = match existing
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("rcoder.io/resource-type"))
+                .map(String::as_str)
+            {
+                Some("builder-creation-receipt") => serde_json::from_str::<BuilderCreationReceipt>(
+                    existing
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("receipt"))
+                        .ok_or_else(|| Error::Conflict("Receipt payload missing".into()))?,
+                )
+                .map(|receipt| receipt.validate().is_ok() && receipt.target.context == *context),
+                Some("builder-cancellation-receipt") => serde_json::from_str::<
+                    super::builder_creation_receipt::BuilderCancellationReceipt,
+                >(
+                    existing
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("receipt"))
+                        .ok_or_else(|| Error::Conflict("Receipt payload missing".into()))?,
+                )
+                .map(|receipt| receipt.validate().is_ok() && receipt.context == *context),
+                _ => Ok(false),
+            }
+            .map_err(|error| Error::Conflict(format!("Decode receipt for cleanup: {error}")))?;
+            if !belongs {
+                return Err(Error::Conflict(
+                    "Creation receipt belongs to another execution".into(),
+                ));
+            }
+            let parameters = kube::api::DeleteParams {
+                preconditions: Some(kube::api::Preconditions {
+                    uid: Some(uid),
+                    resource_version: existing.metadata.resource_version,
+                }),
+                ..Default::default()
+            };
+            match api.delete(&object_name, &parameters).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(error)) if error.code == 404 => {}
+                Err(error) => {
+                    return Err(Error::K8sError(format!("Delete creation receipt: {error}")));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl KubernetesRuntime {
     pub(super) async fn save_builder_cancellation(
         &self,
         receipt: &super::builder_creation_receipt::BuilderCancellationReceipt,

@@ -78,6 +78,7 @@ pub(crate) fn start_recovery(
         let mut compute_cursor = None;
         let mut pending_compute_cursor = None;
         let mut terminal_first = false;
+        let mut sweep_ticks: u32 = 0;
         let mut discovery = discovery::Discovery::default();
         let reason = loop {
             tokio::select! {
@@ -96,6 +97,13 @@ pub(crate) fn start_recovery(
                     }
                     if let Err(error) = compute::discover_compute_leases(state.userapp_store.clone(), state.runtime.clone(), &mut tasks, &mut compute_cursor).await {
                         tracing::error!(%error, "Compute control lease scan failed");
+                    }
+                    // Receipt listing touches cluster objects or the receipt
+                    // directory; run it on a slow cadence instead of per tick.
+                    sweep_ticks = sweep_ticks.wrapping_add(1);
+                    if sweep_ticks % 72 == 0
+                        && let Err(error) = compute::sweep_builder_creation_receipts(state.userapp_store.clone(), state.runtime.clone(), &mut tasks).await {
+                        tracing::warn!(%error, "Builder creation receipt sweep failed");
                     }
                     if terminal_first
                         && let Err(error) = discover_terminal_leases(state.userapp_store.clone(), state.runtime.clone(), &mut tasks, &mut terminal_cursor).await {
@@ -284,7 +292,9 @@ async fn discover(
                 || (operation.command.is_none()
                     && !matches!(
                         operation.kind,
-                        UserAppOperationKind::EnsureBuilder | UserAppOperationKind::AdoptBuilder
+                        UserAppOperationKind::EnsureBuilder
+                            | UserAppOperationKind::AdoptBuilder
+                            | UserAppOperationKind::AdoptApplication
                     ))
             {
                 continue;
@@ -298,6 +308,8 @@ async fn discover(
                     let _resumed = super::control::resume_pending(&state, &operation).await?;
                 } else if operation.kind == UserAppOperationKind::AdoptBuilder {
                     let _resumed = super::adoption::resume_pending(&state, &operation).await?;
+                } else if operation.kind == UserAppOperationKind::AdoptApplication {
+                    let _resumed = super::app_adoption::resume_pending(&state, &operation).await?;
                 } else if operation.command.is_some() {
                     state.app_service.resume_pending_control(&operation).await?;
                 } else {

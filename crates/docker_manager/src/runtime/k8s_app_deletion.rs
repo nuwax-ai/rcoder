@@ -25,6 +25,11 @@ impl KubernetesRuntime {
                     "Docker identity passed to Kubernetes".into(),
                 ));
             }
+            Kind::HostPath | Kind::File => {
+                return Err(Error::ConfigurationError(
+                    "Docker-local identity passed to Kubernetes".into(),
+                ));
+            }
         };
         let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(group, version, name));
         Ok(Api::namespaced_with(

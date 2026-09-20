@@ -174,6 +174,24 @@ pub struct HotDeploymentFailureEvidence {
 
 impl HotDeploymentFailureEvidence {
     pub fn validate(&self, record: &crate::UserAppOperationRecord) -> Result<(), String> {
+        self.validate_outcome(record, "submit", AppCliDeployPhase::Failed)
+    }
+
+    /// Success variant: the owner reported a terminal Running outcome for
+    /// exactly this operation. The checkpoint phase may be submit (crash
+    /// before convergence began) or converging (crash during convergence);
+    /// both retain the same identity chain.
+    pub fn validate_success(&self, record: &crate::UserAppOperationRecord) -> Result<(), String> {
+        self.validate_outcome(record, "converging", AppCliDeployPhase::Running)
+            .or_else(|_| self.validate_outcome(record, "submit", AppCliDeployPhase::Running))
+    }
+
+    fn validate_outcome(
+        &self,
+        record: &crate::UserAppOperationRecord,
+        checkpoint_phase: &str,
+        owner_phase: AppCliDeployPhase,
+    ) -> Result<(), String> {
         let hot = record
             .checkpoint
             .get("hot_execution")
@@ -194,7 +212,7 @@ impl HotDeploymentFailureEvidence {
             .get("receipt_protocol")
             .and_then(serde_json::Value::as_u64)
             != Some(1)
-            || hot.get("phase").and_then(serde_json::Value::as_str) != Some("submit")
+            || hot.get("phase").and_then(serde_json::Value::as_str) != Some(checkpoint_phase)
             || hot.get("release_id").and_then(serde_json::Value::as_str)
                 != Some(self.operation.request_release_id.as_str())
             || record.scope != crate::UserAppOperationScope::Prod
@@ -209,7 +227,7 @@ impl HotDeploymentFailureEvidence {
             || self.protocol_version != APP_CLI_UNIFIED_DEPLOY_PROTOCOL
             || self.operation.operation_id != record.operation_id
             || self.operation.deployment_generation_id != target.deployment_generation
-            || self.operation.phase != AppCliDeployPhase::Failed
+            || self.operation.phase != owner_phase
             || !self.operation.persisted
             || !matches!(
                 self.server_phase,
@@ -221,9 +239,7 @@ impl HotDeploymentFailureEvidence {
                 .as_ref()
                 .is_some_and(|recovery| !matches!(recovery.status.as_str(), "restored" | "failed"))
         {
-            return Err(
-                "Hot deployment failure evidence does not confirm the original write".into(),
-            );
+            return Err("Hot deployment evidence does not confirm the original write".into());
         }
         Ok(())
     }

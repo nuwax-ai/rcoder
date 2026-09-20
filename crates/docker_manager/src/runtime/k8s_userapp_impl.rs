@@ -30,6 +30,118 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         self.remove_builder_restart_archive(template).await
     }
 
+    async fn archive_app_restart(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::AppRestartTemplate>> {
+        self.archive_app_template(target).await
+    }
+
+    async fn restore_app_restart(
+        &self,
+        template: &shared_types::AppRestartTemplate,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        self.restore_app_template(template).await
+    }
+
+    async fn cleanup_app_restart_archive(
+        &self,
+        template: &shared_types::AppRestartTemplate,
+    ) -> ContainerRuntimeResult<()> {
+        self.remove_app_restart_archive(template).await
+    }
+
+    async fn list_builder_creation_receipt_contexts(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<shared_types::UserAppExecutionContext>> {
+        self.list_creation_receipt_contexts_impl().await
+    }
+
+    async fn cleanup_builder_creation_receipts(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<()> {
+        self.cleanup_builder_creation_receipt_objects(context).await
+    }
+
+    async fn capture_app_adoption(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        expected_uid: &str,
+    ) -> ContainerRuntimeResult<Option<shared_types::AppAdoptionTarget>> {
+        self.capture_app_adoption_impl(context, expected_uid).await
+    }
+
+    async fn bind_app_adoption(
+        &self,
+        target: &shared_types::AppAdoptionTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.bind_app_adoption_impl(target).await
+    }
+
+    async fn adopted_app_physical_uid(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        self.adopted_app_physical_uid_impl(context).await
+    }
+
+    async fn capture_bound_app_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        binding: &shared_types::UserAppResourceBinding,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        self.capture_bound_app_control_impl(context, binding).await
+    }
+
+    async fn verify_committed_creation(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let name = self.app_deployment_name(&context.app_id);
+        let Some(deployment) = self.deployments_api().get_opt(&name).await.map_err(|e| {
+            ContainerRuntimeError::K8sError(format!("Inspect committed creation: {e}"))
+        })?
+        else {
+            return Ok(None);
+        };
+        if deployment.metadata.deletion_timestamp.is_some()
+            || !deployment
+                .metadata
+                .annotations
+                .as_ref()
+                .is_some_and(|annotations| context.validate_operation_metadata(annotations).is_ok())
+        {
+            return Ok(None);
+        }
+        if deployment.metadata.uid.as_deref().is_none_or(str::is_empty) {
+            return Err(ContainerRuntimeError::Conflict(
+                "Committed deployment UID missing".into(),
+            ));
+        }
+        Ok(Some(ContainerBasicInfo {
+            container_id: name.clone(),
+            container_name: name.clone(),
+            container_ip: String::new(),
+            internal_port: 0,
+            external_port: 0,
+            project_id: context.app_id.clone(),
+            status: "Starting".to_string(),
+            created_at: Utc::now(),
+            service_url: format!(
+                "http://{}",
+                shared_types::build_k8s_service_fqdn(
+                    &name,
+                    &self.namespace,
+                    &self.config.cluster_domain,
+                ),
+            ),
+        }))
+    }
+
     async fn verify_recovered_volumes(
         &self,
         context: &shared_types::UserAppExecutionContext,

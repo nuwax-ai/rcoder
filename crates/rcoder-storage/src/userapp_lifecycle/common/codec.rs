@@ -28,6 +28,7 @@ codec!(state_name, state, UserAppOperationState, {
 });
 codec!(kind_name, kind, UserAppOperationKind, {
     EnsureBuilder => "ensure_builder", AdoptBuilder => "adopt_builder",
+    AdoptApplication => "adopt_application",
     StopBuilder => "stop_builder", RestartBuilder => "restart_builder",
     Create => "create", StartDeployment => "start_deployment", RestartDeployment => "restart_deployment",
     Update => "update", Start => "start", Restart => "restart", Stop => "stop",

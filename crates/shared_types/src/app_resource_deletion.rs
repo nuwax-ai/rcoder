@@ -22,6 +22,12 @@ pub enum AppResourceKind {
     Secret,
     HttpRoute,
     PersistentVolumeClaim,
+    /// Host filesystem location (Docker bind-mount source). The identity is
+    /// the resolved source path, not a cluster-scoped object.
+    HostPath,
+    /// Content-addressed local artifact file (for example a Docker restart
+    /// archive). `uid` carries the payload digest.
+    File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +51,15 @@ pub struct AppDeletionSnapshot {
 pub struct UserAppMutationTarget {
     pub context: crate::UserAppExecutionContext,
     pub resource: AppResourceIdentity,
+}
+
+/// Operation-bound restart archive for application (prod) compute. Restoring
+/// always begins at zero replicas; the volume witnesses pin the workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppRestartTemplate {
+    pub source: UserAppMutationTarget,
+    pub archive: AppResourceIdentity,
+    pub volumes: Vec<AppResourceIdentity>,
 }
 
 /// Restart startup witness. Flattening retains the original mutation target

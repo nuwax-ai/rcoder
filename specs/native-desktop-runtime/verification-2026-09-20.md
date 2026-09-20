@@ -257,3 +257,17 @@ checkpoint原生HTTP复现两个缺陷：../写被跳过却返回成功；juncti
 Windows新增5条路径组件测试5/5通过（run07d0cb0b-5d08-419a-bbbd-8d8c55759d50），最终真实HTTP12项通过（case proxye28d5c2f5318，binary72d5a3ca27c93168be7dbb3a059f7601b4a38e675162bde752a8c47eeb4aa905）。含中文空格根、二进制上传下载、搜索、Git、../拒绝、junction外写拒绝、resolve外部链接exists=false、static外链404、ZIP不泄漏；内部链接读取仍通过。报告 `/tmp/rcoder-native-windows-proxy-followup.md`，测试资源已清理。并不替代npm发行包或完整桌面矩阵验收。
 
 Mac/Linux proxy追加核心套件的委派任务在执行前被平台自动安全拦截终止，未取得这两平台的新结果；不把Windows结果或此前基础smoke替代该追加套件。该任务未自行提交/发布，其他Compose与源码修复继续。
+
+### retire/摘要校验集中验证（2026-09-20 深夜补跑）
+
+ND06/07 收尾文档标注"retire 与摘要校验已实现但尚未编译/实测，等待集中验证"，本段补齐该验证。基线：HEAD `604fd2b6` 工作树（仅存在未跟踪交接文档），全部在本机 macOS 串行执行。
+
+- 四组件（process_utils/file-server/file-server-userapp/file-server-proxy）nextest 默认 features：488/488 通过、0 skipped，退出 0。
+- 同四组件 nextest all-features：488/488 通过、0 skipped，退出 0。
+- 同四组件 clippy `--all-targets -- -D warnings`：退出 0。
+- proxy 纯转发形态 clippy（`--no-default-features --all-targets -- -D warnings`）：退出 0。
+- `cargo build -p file-server-proxy --bin file-server-proxy`：退出 0。
+- 真实二进制脚本 `python3 crates/file-server-proxy/tools/test_native_guardian.py --binary target/debug/file-server-proxy --report /tmp/rcoder-native-retire-guardian-20260920.json`：**10 项断言全部通过，退出 0**；二进制 SHA-256 `4380ab53d455e46c3f2e68177bf83dd4578df006d4eafe27bbfde64d4135bd63`。覆盖：真实 owner SIGKILL 的父进程 wait 见证；pipe EOF 收束真实 TS 树后才 Quiescent；同 boot recover 需原实例+真实退出/清理见证；旧实例迟到 stop 不误停后继；存活 owner 授权拒绝变更命令 spec（无副作用）；未消费 guardian 拒绝并持久 Revoked；Pending 撤销后真实迟到 guardian 二进制被拒；内嵌 execute-command 在途崩溃恢复命令与中断 worker 且不冒充 HTTP 成功；显式 retire 关闭长连接 owner 后 recover 消费其退出见证、重试不误伤后继；guardian+owner 双崩溃后即使 fixture 自行结束仍保持未知保护。
+- npm 启动器测试：24/24 通过，退出 0。根 workspace `cargo fmt --all -- --check`：退出 0。
+
+边界：以上为 macOS 本机组件与真实二进制验证。guardian/retire 链的 Linux/Windows 宿主机执行、NT13–16（离线只读包、跨 ABI 拒绝、活动文件升级、TS 兼容模式）、Mac/Linux proxy 追加核心套件（此前委派任务被拦截未取得结果）仍未验证，不以此段替代。

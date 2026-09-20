@@ -794,3 +794,124 @@ Restart 在停止前捕获原 StatefulSet（UID/resourceVersion/Pod 绑定不变
 - 若之前已执行显式 PG 对齐，要求数据库目标与热部署目标一致；执行前后重新核对目标，不把替换实例状态当原操作完成。
 - 此处观察并非跨远端写原子事务，仍不能凭资源暂时不存在解锁；HTTP 提交的不确定结果继续保持恢复。
 - CARGO_BUILD_JOBS=2 cargo check -p app_manager --all-features 退出 0（/tmp/app-manager-hot-physical-target-check.log）。未新增/运行测试。后续仍需接入原 hot_execution 的状态核验、配置收敛和存储 CAS 终结；本批只补可靠恢复输入，不宣称完整恢复已交付。
+
+### 2026-09-20 深夜：R1 Restart 缺失控制器重建（Docker dev + K8s prod），本会话
+
+按《下一轮交接》顺序 F1→R1 开发。只补生产逻辑；按用户指示不新增/不运行测试，仅编译与 fmt 检查。未提交、未推送、未部署。
+
+**F1**：`cargo fmt --manifest-path crates/app-cli/Cargo.toml` 修复 server.rs:2988 单点违规，`--check` 退出 0。
+
+**R1-Docker-dev**（新文件 `crates/docker_manager/src/runtime/docker_builder_restart.rs`）：
+
+- 根因确认：动态 builder 容器 `auto_remove(true)`（agent_container_starter），stop 即被 daemon 删除——Restart 缩容后容器必然消失，此前断在 `Original restart template is unavailable`。
+- `archive_builder_restart`（Docker 实现）：归档前双捕获防漂移；从 inspect 归档镜像/env/binds/网络/资源限制（builder env 不含凭据——凭据走 runtime 操作通道，已核实组装链）；bind 见证（HostPath 身份=容器目标+宿主源路径）；确定性内容寻址文件名（sha256），`.app-operation-receipts/<app_id>/builder-restart-<digest>.json`，0600、原子 hard_link 发布、O_NOFOLLOW 读、96KiB 上限。
+- `restore_builder_restart`（Docker 实现）：内容哈希==检查点 UID 核验；旧 UID 必须已 404；同名占用仅接受本归档 RESTORE 标记且非运行态（中断重入幂等）；bind 源目录必须存在；镜像 ensure 后**停态重建**（不启动——Starting CAS 先于新业务实例启动的不变量与 K8s 零副本对齐）；身份 label 从当前 context 重推导（不重放旧 label）+ `rcoder.io/restart-archive-uid` 标记；重建后卷见证比对。
+- `capture_builder_compute_volumes`（Docker）+ `verify_recovered_volumes`（Docker：HostPath 源目录存在性；防 shared 恢复路径因非空见证踩默认拒绝）。
+- `cleanup_builder_restart_archive`（Docker）：仅内容匹配时删除，幂等。
+- 顺带修复真实缺陷：`apply_builder_compute_mode` stop 后 inspect 404 的提前返回跳过了 `save_stop` 回执（auto-remove 场景恢复观察者无法确认停止）——现 404 分支先持久化回执再返回。
+- AppResourceKind 新增 `HostPath`/`File` 变体（serde 加法兼容；k8s_app_deletion 的 exhaustive match 补拒绝臂）。
+
+**R1-K8s-prod**（新文件 `crates/docker_manager/src/runtime/k8s_app_restart.rs`）：
+
+- trait 新增 `archive_app_restart`/`restore_app_restart`/`cleanup_app_restart_archive`（UserAppDeploymentRuntime，默认 None/Unsupported，fail-closed）；shared_types 新增 `AppRestartTemplate`。
+- 归档：Deployment uid+resourceVersion+无删除时间戳核验 → 复用 `prepare_captured_compute_start`（完整身份链+PVC 见证）→ 漂移复查 → 不可变 Secret（label `app-restart-template`，确定性摘要名，900KiB 上限）。
+- 恢复：同名 Deployment 存在则必须持本归档 RESTORE 注解；不存在则 `app_compute_absent` + `verify_recovered_volumes(Prod)` 后按归档 spec **零副本**重建（剥 stop/start 回执注解 + RESTORE 标记 + context 元数据）；重建后 PVC 见证比对。
+- 接线（compute_control.rs）：prod Restart prepare 后归档入检查点 `app_restart_template`；执行路径与 resume 路径的 UID 变化分支从硬失败改为按归档恢复（含 `Restart target changed after stop` 处）；模板引用贯穿 Starting/Verifying 检查点（中断后续行仍有恢复源）；成功终态后内联清理归档（dev builder 同步受益；崩溃窗口由既有扫描 GC 覆盖，app 模板的扫描集成留给 R2/N1 批）。
+
+**明确延后**：Docker prod 应用容器缺失重建——其 env 内联 secrets（params.secrets 合并），归档重放会把凭据落盘，违反"归档不含明文密码"；需凭据重注入通道（与 R2 凭据恢复重叠），且 Docker prod 容器非 auto_remove、仅在人为删除场景触发，维持原 fail-closed。
+
+**验证**：`CARGO_TARGET_DIR=target-check CARGO_BUILD_JOBS=4 cargo check -p rcoder -p docker_manager --all-features` 退出 0；`-p docker_manager`/`-p rcoder` 默认 features 退出 0；`cargo fmt --all -- --check` 退出 0。未运行任何测试、未部署。R1 剩余：Docker prod（如上延后）与全部实测验收（测试阶段统一执行）。
+
+### 2026-09-20 深夜二批：R2a prod 创建"已提交未记账"崩溃窗口——身份回执采纳
+
+**窗口精确定位**：恢复扫描对在途 `Command::Create` 会重跑 `execute_creation`（lifecycle/recovery.rs:678-690）；其入口 `get_deployment_status(...).is_some()` 即盲拒 `AlreadyExists`——包括"本操作崩溃前已提交复合写、但 `runtime_created` 检查点未落"的情形，操作从此无法自收束。中途崩溃（部分资源）由 K8s ensure 幂等性自然收敛，无需新机制。
+
+**方案**：创建时 Deployment 注解/Docker 容器 label 已带完整操作身份五元组（application/lifecycle/operation/executor-id + request-fingerprint，`resource_metadata()` 单一事实源）——**存活资源即持久回执**，不新增集群对象。
+
+- shared_types 新增 `validate_operation_metadata`（五键严格相等；同生命周期他操作不匹配——重创建是新承诺）。
+- trait 新增 `verify_committed_creation(context) -> Option<ContainerBasicInfo>`（UserAppDeploymentRuntime，默认 None=fail-closed 走原 AlreadyExists）。
+- K8s：Deployment 按名取，删除中/身份不符→None；匹配→返回与 create_deployment 同形的资源视图（Service FQDN）。
+- Docker：容器按 `app_deployment_name` 取，404→None；label 五元组匹配→返回带真实 IP 的视图。
+- `execute_creation`：status 存在时先验承诺——本操作身份精确匹配→采纳（跳过 create，直接 register_pingora + `runtime_created` 检查点）；无身份上下文/身份不符/未盖戳→维持原 `AlreadyExists` 拒绝。采纳路径同样 `mark_mutating`（操作确已改资源）。
+
+**修正记录**：Docker 首版误把"运行中"当排除条件（混淆 restart-restore 语义）——创建采纳恰恰要接纳运行中容器，已改回仅以身份为准。
+
+**明确剩余**（下批）：N1 既有回执族 GC（builder 创建回执 ConfigMap/文件在终态确认后的清理与 CAS 标记）、R5 旧 wake 锁收束（消费本批的旧写核验能力）、Docker prod 重启归档（凭据重注入通道）。
+
+**验证**：`CARGO_TARGET_DIR=target-check CARGO_BUILD_JOBS=4 cargo check -p app_manager -p docker_manager -p rcoder -p shared_types -p container-runtime-api --all-features` 退出 0；`cargo fmt --all -- --check` 退出 0。未运行测试（阶段约束），未提交未推送。
+
+### 2026-09-20 深夜三批：R2b/N1 回执族 GC（创建/取消回执 + compute stop/start 回执文件）
+
+**设计**：GC 的迭代对象是回执本身（K8s ConfigMap / Docker 文件）——删除即自清，无需 CAS 标记（对比 restart 归档扫描按记录迭代才需要 `mark_cleaned` 标记）。前置条件遵守"终态确认"：
+
+- trait 新增 `list_builder_creation_receipt_contexts` / `cleanup_builder_creation_receipts` / `cleanup_compute_receipt_files`（UserAppDeploymentRuntime）。
+- K8s（k8s_creation_receipt.rs）：label `in (builder-creation-receipt, builder-cancellation-receipt)` 列举，载荷逐个解码+validate 出 context；删除前重读载荷核对归属（同名外来对象绝不删），UID+resourceVersion 前置条件 DELETE，404 容忍。
+- Docker（docker_compute_receipt.rs）：回执根目录扫描 `builder-{create,cancel}-*.json`；损坏文件显式报错（不静默跳过、不删除）；删除前内容核对归属；同步补 `cleanup_compute_receipt_files`（builder/prod × stop/start 四文件，内容核对后删）。
+- rcoder：恢复扫描器新增 `sweep_builder_creation_receipts`（慢周期 72 tick ≈ 6min：列 context → store 查操作记录 → 终态才清理；记录缺失或非终态保留证据）；`discover_compute_leases` 终态任务的租约释放后顺带清理该操作的 stop/start 回执文件（保持租约门控——无租约终态记录本不应有这些文件，且避免每 5s 空转任务）。
+- 途中修正：曾把无租约终态记录也排队清理——会造成扫描器永久空转，已回退为租约门控。
+
+**验证**：`cargo check -p rcoder -p docker_manager --all-features` 与默认 features 均退出 0；`cargo fmt --all -- --check` 退出 0。未运行测试（阶段约束），未提交未推送。剩余：R5（旧 wake 锁）、R3（prod 接管）、R4（converging 终结链）、R6（文档）。
+
+### 2026-09-20 深夜四批：R5 旧版本 wake 锁——运行时回执证据收束
+
+**窗口**：新代码在启动写入全链返回后才持久化 `traffic_wake_observing` + `start_write_acknowledged=true`；旧版本记录（升级前产生）处于同 step 但无该字段——`finalize_observed_wake` 的全记录 CAS 前置（ops.rs:1285）永远拒绝，wake 锁永久占位阻塞新业务。
+
+**方案**（区分"已确认启动但观察未完成"与"未确认写入"）：
+
+- 存储新增 `finalize_legacy_observed_wake(snapshot, evidence)`（trait + Turso/PG 共用 common 实现）：前置条件与常规版相同的身份链/step/kind/state，但要求 `start_write_acknowledged` **不存在**（legacy 判别）；证据（调用方已核验的 runtime start 回执上下文）写入 checkpoint `legacy_start_write_verified` 留审计痕迹后，走与常规版相同的诚实 Failed 终结（"写入已确认+观察未完成"不伪造成功），随后既有路径释放原租约解除阻塞。
+- recovery 接线（recovery.rs retry 的 wake 分支）：有 flag → 原路径；无 flag → 从 checkpoint 取原 target → `reconcile_app_compute_start`（K8s=Deployment UID+`rcoder.io/compute-start-receipt` 注解==本操作 context+replicas=1；Docker=prod-start 回执文件内容匹配+容器运行）→ 确认→ legacy 终结；**不确认→保持保护**，错误信息明示恢复路径（人工核验或显式 Stop——Stop 优先级可接管）。不按租约超时/业务 Failed 自动释放，不手工标成功。
+
+**验证**：`cargo check -p rcoder-storage -p app_manager -p rcoder --all-features` 退出 0；`cargo fmt --all -- --check` 退出 0。未运行测试（阶段约束），未提交未推送。
+
+**R5 完成边界说明**：本批覆盖交接定义的核心场景（`traffic_wake_observing` 无 flag 的旧记录）；旧记录若停在更早 step（如 `traffic_wake_target`，崩溃于写入前后）属未知写窗口，维持保护语义不变——若现场存在此类记录需按 R2 同款证据路径逐案核验，部署后重读现场再定。
+
+### 2026-09-20 深夜五批：R3 设计定案（实现于下批）
+
+本批只读代码定设计，未改代码。R3=prod 物理接管入口，镜像 builder adoption（adoption.rs：操作受理→运行时捕获核验→读栏栅释放→SQL 原子绑定）。
+
+**关键设计约束（从代码实证）**：
+
+1. **Docker 容器 label 创建后不可变**——接管"旧生命周期标签的存活容器"无法靠补 label 完成。而 prod 捕获两侧都做 `validate_application_metadata`（K8s=capture_owned_app_identity 注解校验，"requires lifecycle adoption" 报错点；Docker=capture_stop_target label 校验）。⇒ **Docker 接管必须走 binding 感知捕获**（照 builder 的 `capture_bound_builder_control(context, binding)` 模式：rcoder 层先按名取 UID→查 store binding→传给捕获方法，label 校验失败时以 binding 兜底）。
+2. **K8s 注解可变**——接管可在 UID+resourceVersion 前置条件下把当前 context 的身份注解（rcoder.io/application-id/lifecycle-id 等）盖到被接管 Deployment 上（接管即登记动作），随后全部既有 prod 路径无需改动即可通过。
+3. 接管核验内容（提交前实时）：名字==app_deployment_name、UID==请求 expected_uid、非删除中、rcoder 家族身份存在（label/注解带 application-id 或 managed-by，旧生命周期值允许不匹配——正是要接管的）、K8s PVC 链（模板 volumes 引用的 PVC 存在且 UID 记为见证）/Docker bind 见证。多候选/墓碑/身份冲突→拒绝。
+4. 交付面：shared_types `AdoptApplicationRequest{lifecycle_id,request_id,expected_resource_uid}` + 操作 kind `AdoptApplication`；trait `capture_app_adoption` / `bind_app_adoption`（Docker bind=仅 store 绑定+显式语义）；rcoder 层 `capture_bound_app_target`（binding 感知，替换 compute_control 三处/wake/app_manager 控制流的 prod 捕获入口）+ HTTP `POST /api/v1/userapp/{app_id}/prod/adopt` + resume + OpenAPI。
+
+**顺序依据**：R4（converging 终结链）不依赖 R3，若需要可先做 R4 再回 R3。
+
+### 2026-09-21 凌晨：R3 prod 物理接管入口（按五批设计实施）
+
+**入口**：`POST /api/v1/userapp/{app_id}/prod/adopt`（`AdoptApplicationRequest{lifecycle_id,request_id,expected_resource_uid}`，操作 kind `AdoptApplication`/wire `adopt_application`，scope=Prod）。受理/幂等重试/claim/失败收束镜像 builder adoption（app_adoption.rs）：Succeeded 重放返回原结果、Pending 由恢复扫描/retry 分派续行（recovery.rs+retry.rs 已接）、SQL 提交未知→RecoveryRequired。
+
+**核验链（提交前实时）**：K8s=k8s_app_adoption.rs——Deployment 名字==派生名、UID==请求 expected、非删除中、家族身份（managed-by label 或 rcoder.io/application-id 注解；**旧生命周期值允许不匹配**——重绑正是目的；**异应用拒绝**）、模板引用 PVC 存在且非删除中且无冲突应用注解（UID 记为见证，必须非空）。Docker=docker_app_runtime.rs——容器名/ID/家族 label 同构 + bind 见证。缺席或不可接管→None→干净拒绝，绝不按名接管。
+
+**登记**：K8s `bind_app_adoption` 在已核验 UID+resourceVersion 前置条件下把当前 context 身份注解（+adopted-by-operation）盖到 Deployment——接管即登记，随后**全部既有 prod 路径零改动即通过**（盖章后用严格捕获复核验证）。Docker label 创建后不可变→登记=store binding（`UserAppResourceBinding`，service_type=Userapp）。
+
+**binding 感知捕获**：`binding.validate` 放宽为家族参数化（调用方按 (service_type,uid) 查 key，不可能交叉）；新 trait `adopted_app_physical_uid`（名字→UID 探针，无生命周期校验）+ `capture_bound_app_control`（binding 匹配观测 UID 即授权捕获）；rcoder 层 `capture_bound_app_target`（严格捕获 Conflict 时按 binding 兜底，其他错误原样传播）。compute_control 全部 7 处 prod 捕获点已切换（recover_confirmed before/after、执行捕获、重启再捕获、就绪观察 actual/after、resume 路径）。
+
+**明确剩余**：app_manager 侧 12 处 `capture_app_mutation_target` 调用点（wake/policy/ops/deploy_control/database_preparation/recovery）未切 binding 感知——K8s 接管资源不受影响（注解已盖章）；Docker 接管资源的这些旧路径仍会拒绝，属下批收尾项。
+
+**验证**：`cargo check -p rcoder -p docker_manager -p rcoder-storage --all-features` 与默认 features 退出 0；`cargo fmt --all -- --check` 退出 0。未运行测试（阶段约束），未提交未推送。
+
+### 2026-09-21 凌晨二批：R4 hot_execution 成功侧收束 + converging 终结链（codex 断点续写）
+
+**成功侧收束**（reconcile_hot_failure 原 `phase != Failed → return Ok(None)` 锁死）：
+
+- 观察逻辑抽取为 `observe_hot_owner`（租约身份核验+回执校验+物理目标 exec 读 owner `/v1/deploy/status`+证据构造），仅过滤非终态相位（Deploying/Orchestrating/Idle → None 继续观察）。
+- 证据校验按结局参数化：`validate`（checkpoint phase=submit + owner phase=Failed，原语义不动）+ 新 `validate_success`（phase∈{submit,converging} + owner phase=Running，身份链/协议/release_id/持久化等其余条件全同）。
+- 分支：owner Failed → 原 `finalize_observed_hot_failure`；owner Running（本操作精确身份）→ 新存储 `finalize_observed_hot_success`（全记录 CAS，step∈{hot_execution,hot_converging}，step=hot_execution_succeeded，证据入 checkpoint `hot_success_observed`）→ 既有租约释放路径收束。"平台侧响应丢失但 owner 已成功"不再锁死。
+
+**converging 终结链**（begin_hot_convergence 与 ConfigMap 写之间的崩溃窗口）：
+
+- `begin_hot_convergence(&converge_env)`：收敛目标 env 先入检查点（`hot_execution.converge_env`）再进 converging 相位——恢复观察者有可比对期望；调用点同步重排（env 构建提前）。
+- 新 `reconcile_hot_convergence`（恢复入口已接 retry_control_operation 与 resume_pending_control）：证据序=① `app_env_snapshot` 读回与收敛目标全等（K8s ConfigMap 收敛完成证明）→ 成功终结；② owner 终态 Running（`validate_success`，Docker 唯一来源——env 不可变）→ 成功终结；③ owner 报 Failed（converging 已开始后矛盾证据）→ Conflict 人工核验；④ 未收敛+owner 在途 → 保持保护。
+
+**验证**：`cargo check -p app_manager -p rcoder-storage -p shared_types -p rcoder --all-features` 与默认 features 退出 0；`cargo fmt --all -- --check` 退出 0。未运行测试（阶段约束），未提交未推送。R4 两侧（失败侧既有+成功侧本批+converging 链本批）至此齐；Qoder 复核遗留的"编排中 Stop 后 Start 报 explicit redeployment required"（server_journal resume 保护）不在本批范围，属 app-cli 侧恢复协议，已在前交接记录。
+
+### 2026-09-21 凌晨三批：R6 文档对齐（java-compute-control.md 补 Docker 分支与新恢复能力）
+
+- 原清单只列 K8s 分支（审计确认的文档落后于实现）：补 Docker dev Restart 归档重建（auto-remove 语义）/Docker Stop 回执/Docker prod 边界（重启归档暂不支持的理由）/两后端的创建承诺采纳。
+- 补四项新恢复入口：旧版本 wake 锁证据收束、hot_execution 成功侧、hot_converging 终结链、prod 物理接管端点（含 K8s 盖章与 Docker binding 两种登记语义）。
+- 保留"没有匹配回执的旧版本操作仍要求进一步核验"的边界声明与未联调声明；历史条目未改写。
+- tasks.md 勾选状态同步未在本批完成（追加式历史文档，需按实现逐项核对后更新，防止照抄过早结论）——R6 剩余小项。
+
+compute-control 线功能开发至此：F1、R1、R2a、R2b/N1、R5、R3、R4、R6(主体) 全部落地（编译+fmt 验证）；明确剩余：R6 尾（tasks.md 同步）、R3 尾（app_manager 12 处捕获点 binding 感知）、Docker prod 重启归档（凭据重注入通道）、全部测试/部署验收。

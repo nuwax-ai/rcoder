@@ -7,6 +7,7 @@
 //! rcoder 不再做发布任务编排（旧 publish 任务体系已随 `/api/v1/userapp/publish` 接口族删除）。
 
 pub(crate) mod adoption;
+pub(crate) mod app_adoption;
 pub(crate) mod compute_control;
 pub(crate) mod control;
 mod creation;

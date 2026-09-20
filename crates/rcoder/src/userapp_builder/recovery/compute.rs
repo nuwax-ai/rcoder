@@ -92,11 +92,15 @@ pub(super) async fn discover_compute_leases(
                     "Archive cleanup checkpoint changed"
                 );
                 store.mark_restart_archive_cleaned(&current).await?;
+                runtime.cleanup_compute_receipt_files(&context).await?;
                 Ok(())
             });
             continue;
         }
         let Some(receipt) = record.lease.clone() else {
+            // A terminal record without a lease has no live compute receipt to
+            // release; its stop/start files (if any) were cleaned by the pass
+            // that released the lease.
             continue;
         };
         let context = record.execution_context().map_err(anyhow::Error::msg)?;
@@ -115,8 +119,49 @@ pub(super) async fn discover_compute_leases(
                 .release_app_operation_receipt(&context, &receipt)
                 .await?;
             store.forget_compute_lease(&identity, &receipt).await?;
+            // The record is terminal: its durable outcome no longer depends on
+            // the per-operation stop/start receipt files.
+            runtime.cleanup_compute_receipt_files(&context).await?;
             Ok(())
         });
+    }
+    Ok(())
+}
+
+/// Reclaim builder creation/cancellation receipts whose operation record is
+/// terminal. The receipts themselves drive the iteration, so a completed
+/// cleanup never reappears; missing or unfinished records keep their evidence.
+pub(super) async fn sweep_builder_creation_receipts(
+    store: std::sync::Arc<dyn shared_types::UserAppLifecycleStore>,
+    runtime: std::sync::Arc<dyn container_runtime_api::UserAppDeploymentRuntime>,
+    tasks: &mut RecoveryTasks,
+) -> anyhow::Result<()> {
+    if tasks.is_full() {
+        return Ok(());
+    }
+    let contexts = runtime.list_builder_creation_receipt_contexts().await?;
+    for context in contexts {
+        if tasks.is_full() {
+            break;
+        }
+        let Some(record) = store
+            .get_operation(&context.app_id, &context.operation_id)
+            .await?
+        else {
+            // No record to confirm a terminal outcome — retain the receipts.
+            continue;
+        };
+        if !record.state.is_terminal() {
+            continue;
+        }
+        let runtime = runtime.clone();
+        tasks.push(
+            format!("creation-receipts:{}", context.operation_id),
+            async move {
+                runtime.cleanup_builder_creation_receipts(&context).await?;
+                anyhow::Ok(())
+            },
+        );
     }
     Ok(())
 }

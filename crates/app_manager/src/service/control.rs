@@ -135,7 +135,10 @@ impl OwnedOperation {
         self.checkpoint("control_confirmed", self.record.checkpoint.clone())
             .await
     }
-    pub(crate) async fn begin_hot_convergence(&mut self) -> AppResult<()> {
+    pub(crate) async fn begin_hot_convergence(
+        &mut self,
+        converge_env: &std::collections::HashMap<String, String>,
+    ) -> AppResult<()> {
         if self.record.step != "hot_execution"
             || self
                 .record
@@ -150,6 +153,12 @@ impl OwnedOperation {
         }
         let mut checkpoint = self.record.checkpoint.clone();
         checkpoint["hot_execution"]["phase"] = serde_json::json!("converging");
+        // Persist the convergence target so a crash between this CAS and the
+        // ConfigMap write leaves a recovery observer a comparable expectation.
+        checkpoint["hot_execution"]["converge_env"] =
+            serde_json::to_value(converge_env).map_err(|error| {
+                AppOperationError::Backend(format!("Encode hot convergence target: {error}"))
+            })?;
         // CAS must win before any ConfigMap write. A recovery observer that
         // already finalized this snapshot prevents a late coordinator write.
         self.checkpoint("hot_converging", checkpoint).await

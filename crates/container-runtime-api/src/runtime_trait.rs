@@ -608,6 +608,132 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// Capture private original configuration before an application (prod)
+    /// compute-only restart. None means the backend cannot archive; the
+    /// restart then fails closed when the controller disappears.
+    async fn archive_app_restart(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::AppRestartTemplate>> {
+        Ok(None)
+    }
+
+    /// Recreate a lost application controller from an operation-bound archive,
+    /// retaining the original volumes. The replacement starts at zero
+    /// replicas; never infer this authority from a resource name.
+    async fn restore_app_restart(
+        &self,
+        _template: &shared_types::AppRestartTemplate,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Application compute restoration is unsupported".into(),
+        ))
+    }
+
+    /// Verify that the existing application controller was committed by
+    /// exactly this operation's identity, returning the live resource view.
+    /// The stamped identity is the durable receipt for a creation whose
+    /// checkpoint was lost to a crash. None means the controller is absent or
+    /// belongs to a different operation; callers keep their conflict.
+    async fn verify_committed_creation(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        Ok(None)
+    }
+
+    /// Remove a successful application restart's private archive under the
+    /// same terminal-committed preconditions as the builder variant.
+    async fn cleanup_app_restart_archive(
+        &self,
+        _template: &shared_types::AppRestartTemplate,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Application restart archive cleanup is unsupported".into(),
+        ))
+    }
+
+    /// List operation contexts that still hold durable builder creation or
+    /// cancellation receipts. Receipt sweeps use this to find reclaimable
+    /// recovery evidence; an empty list skips the pass entirely.
+    async fn list_builder_creation_receipt_contexts(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<shared_types::UserAppExecutionContext>> {
+        Ok(Vec::new())
+    }
+
+    /// Remove one operation's builder creation and cancellation receipts.
+    /// Callers must first confirm the operation record is terminal — the
+    /// record itself then carries the durable outcome.
+    async fn cleanup_builder_creation_receipts(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Builder creation receipt cleanup is unsupported".into(),
+        ))
+    }
+
+    /// Remove a terminal compute operation's durable stop/start receipt files.
+    /// Backends without file receipts are a no-op; callers must have confirmed
+    /// the operation's terminal state before invoking this.
+    async fn cleanup_compute_receipt_files(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<()> {
+        Ok(())
+    }
+
+    /// Live-verify an existing production controller as an adoption candidate:
+    /// name matches, UID equals the operator's expectation, the resource is
+    /// not deleting, and rcoder family identity is present (an older
+    /// lifecycle's values are acceptable — rebinding is the point). Volume
+    /// witnesses pin the workspace. None means absent or not adoptable.
+    async fn capture_app_adoption(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _expected_uid: &str,
+    ) -> ContainerRuntimeResult<Option<shared_types::AppAdoptionTarget>> {
+        Ok(None)
+    }
+
+    /// Register the adopted controller under the current operation identity.
+    /// K8s stamps the lifecycle annotations on the Deployment (preconditioned
+    /// on the verified UID and resource version); Docker labels are immutable,
+    /// so registration is the caller's durable store binding alone.
+    async fn bind_app_adoption(
+        &self,
+        _target: &shared_types::AppAdoptionTarget,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Application adoption is unsupported".into(),
+        ))
+    }
+
+    /// Read the application controller's physical UID by its derived name
+    /// without any lifecycle validation. Binding lookups use this; absence
+    /// yields None. This grants no authority by itself.
+    async fn adopted_app_physical_uid(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        Ok(None)
+    }
+
+    /// Capture the application mutation target for a resource whose native
+    /// identity does not validate against the current lifecycle: a durable
+    /// binding that matches the observed physical UID authorizes the capture
+    /// instead. Mirrors the builder's bound control capture.
+    async fn capture_bound_app_control(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _binding: &shared_types::UserAppResourceBinding,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Bound application capture is unsupported".into(),
+        ))
+    }
+
     /// Verify preserved physical storage before a recovered workspace is used.
     /// This is read-only and is deliberately not a prerequisite for Stop.
     async fn verify_recovered_volumes(

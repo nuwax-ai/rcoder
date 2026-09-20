@@ -337,7 +337,13 @@ impl DockerRuntime {
             Ok(info) => info,
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
-            }) if !restart => return Ok(None),
+            }) if !restart => {
+                // Auto-remove already deleted the stopped builder. The Docker
+                // stop acknowledgement is still the causal evidence recovery
+                // observers match on; persist it before reporting success.
+                super::docker_compute_receipt::save_stop(target).await?;
+                return Ok(None);
+            }
             Err(error) => {
                 return Err(Error::DockerError(format!(
                     "Confirm builder control: {error}"

@@ -163,9 +163,9 @@ pub mod app_resource_deletion;
 pub mod runtime_request_failure;
 pub use app_resource_deletion::{
     AppDeletionSnapshot, AppFileMutationMarker, AppOperationLease, AppPreparationFailure,
-    AppResourceIdentity, AppResourceKind, USERAPP_DOCKER_APP_ID_LABEL, UserAppDeletionCheckpoint,
-    UserAppDeletionStage, UserAppMutationTarget, UserAppStorageDestruction,
-    UserAppStorageResizeTarget,
+    AppResourceIdentity, AppResourceKind, AppRestartTemplate, USERAPP_DOCKER_APP_ID_LABEL,
+    UserAppDeletionCheckpoint, UserAppDeletionStage, UserAppMutationTarget,
+    UserAppStorageDestruction, UserAppStorageResizeTarget,
 };
 pub use runtime_request_failure::RuntimeRequestRejection;
 
@@ -298,7 +298,8 @@ pub use userapp::workspace_clear::*;
 pub use userapp::builder_control::*;
 
 pub use userapp::resource_binding::{
-    AdoptBuilderRequest, UserAppResourceBinding, builder_identity_is_bound,
+    AdoptApplicationRequest, AdoptBuilderRequest, AppAdoptionTarget, UserAppResourceBinding,
+    builder_identity_is_bound,
 };
 
 pub use userapp::operation_lease::*;

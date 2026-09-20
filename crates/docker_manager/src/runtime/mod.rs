@@ -9,6 +9,7 @@ pub(crate) mod docker_app_create;
 pub(crate) mod docker_app_mounts;
 mod docker_app_runtime;
 mod docker_builder_control;
+mod docker_builder_restart;
 mod docker_compute_receipt;
 pub mod docker_runtime;
 pub(crate) mod docker_workspace;
@@ -31,6 +32,8 @@ pub(crate) mod k8s_agent_pod;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_agent_query;
 #[cfg(feature = "kubernetes")]
+mod k8s_app_adoption;
+#[cfg(feature = "kubernetes")]
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_app_create;
 #[cfg(feature = "kubernetes")]
@@ -47,6 +50,8 @@ pub(crate) mod k8s_app_observation;
 mod k8s_app_operation;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_app_query;
+#[cfg(feature = "kubernetes")]
+mod k8s_app_restart;
 #[cfg(feature = "kubernetes")]
 mod k8s_app_status_derive;
 #[cfg(feature = "kubernetes")]

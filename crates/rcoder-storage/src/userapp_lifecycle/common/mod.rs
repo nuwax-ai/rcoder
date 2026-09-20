@@ -690,6 +690,20 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         })
         .await
     }
+    async fn finalize_legacy_observed_wake(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &serde_json::Value,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let evidence = evidence.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                ops::finalize_legacy_observed_wake(tx, backend, &snapshot, &evidence).await
+            })
+        })
+        .await
+    }
     async fn finalize_observed_hot_failure(
         &self,
         snapshot: &UserAppOperationRecord,
@@ -700,6 +714,20 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         self.run(false, move |tx, backend| {
             Box::pin(async move {
                 ops::finalize_observed_hot_failure(tx, backend, &snapshot, &evidence).await
+            })
+        })
+        .await
+    }
+    async fn finalize_observed_hot_success(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &serde_json::Value,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let evidence = evidence.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                ops::finalize_observed_hot_success(tx, backend, &snapshot, &evidence).await
             })
         })
         .await

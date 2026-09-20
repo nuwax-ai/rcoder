@@ -322,6 +322,27 @@ impl AgentContainerRuntime for DockerRuntime {
         Ok(result)
     }
 
+    async fn archive_builder_restart(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderRestartTemplate>> {
+        self.archive_builder_template(target).await
+    }
+
+    async fn restore_builder_restart(
+        &self,
+        template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.restore_builder_template(template).await
+    }
+
+    async fn capture_builder_compute_volumes(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Vec<shared_types::AppResourceIdentity>> {
+        self.capture_builder_volume_witness(target).await
+    }
+
     async fn create_container(
         &self,
         params: ContainerCreateParams,

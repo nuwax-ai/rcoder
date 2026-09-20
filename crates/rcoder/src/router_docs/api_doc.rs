@@ -77,6 +77,7 @@ use crate::handler;
         handler::devcomputer_agent_progress_notification,
         // 应用管理接口
         crate::userapp_builder::adoption::adopt_builder,
+        crate::userapp_builder::app_adoption::adopt_application,
         app_manager::handlers::get_lifecycle,
         app_manager::handlers::get_current_operation,
         app_manager::handlers::retry_operation,

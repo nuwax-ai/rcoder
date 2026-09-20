@@ -27,6 +27,20 @@ POST `/computer/pod/operations/{app_id}/{operation_id}/recover`，JSON 为 `{"ex
 - K8s prod Restart/starting：原启动回执匹配且当前代次已就绪时补交终态；已提交但尚未就绪时只观察，不再次启动。新协议记录带单写能力及 PVC UID 见证时，可核验原租约、停止回执、卷身份与控制器条件版本，再以原操作身份认领一次条件启动重试；旧记录不进入该分支。
 - Stop 收束被替代的 Restart 时，若旧操作已持久化 stopped/verifying 完成边界，可按精确 revision 和检查点收束旧执行、释放其原租约。新协议 K8s dev/prod 的 starting/stopping 还可通过原条件版本隔离旧计算写后收束；随后继续真正的缩容与退出确认。该行为不将旧 Restart 标为成功，也不把没有隔离证明的未知结果当作完成。
 
+**Docker 后端对等支持**（此前文档只列 K8s 分支，Java 按旧文档接会漏掉 Docker）：
+
+- Docker dev Restart：动态 builder 容器 auto-remove，stop 即消失。重启前归档 inspect 检查点（内容寻址文件），停止后容器消失时从归档**停态重建**（身份 label 按当前 context 重导出+恢复标记，bind 见证比对），检查点 CAS 成功后才启动。Restart/stopped 的续行语义与 K8s 相同。
+- Docker dev Stop：缩容回执持久化（含 auto-remove 场景），恢复核验路径与 K8s 相同。
+- Docker prod Stop/Restart：容器非 auto-remove，常规回执路径适用；prod Restart 的归档重建暂不支持（env 内联凭据不能落盘），控制器缺失时维持显式拒绝。
+- prod 创建"已提交未记账"崩溃窗口（两后端）：恢复重跑创建时先按操作身份五元组核验存活控制器（Deployment 注解/容器 label），精确匹配→采纳补记账；外来身份→维持 AlreadyExists 拒绝。
+
+**新恢复能力**（2026-09-20/21 批次）：
+
+- 旧版本 wake 锁：`traffic_wake_observing` 无 `start_write_acknowledged` 的旧记录，经 runtime 启动回执核验（K8s 注解/Docker 回执文件）后按证据收束；未确认保持保护。
+- hot_execution 成功侧：owner 终态 Running 且身份链匹配 → 平台侧响应丢失不再锁死，按成功证据 CAS 终结并释放原租约。
+- hot_converging：收敛 CAS 与 ConfigMap 写之间崩溃 → 读回收敛目标全等（K8s）或 owner 终态 Running（Docker）→ 成功终结；矛盾证据人工核验，未收敛保持保护。
+- prod 物理接管：`POST /api/v1/userapp/{app_id}/prod/adopt`（`expected_resource_uid`=操作员授权）。K8s 盖身份注解后全部常规路径可用；Docker 经 store binding + compute-control 的 binding 感知捕获控制。
+
 没有匹配回执的旧版本操作、其他后端或其他未知阶段仍要求进一步核验，不能将本入口当作通用清锁接口。恢复响应中的 state 可能已经为 succeeded，调用方按实际 state 展示。
 
 ## 未完成联调

@@ -2988,8 +2988,11 @@ async fn next_prepared(
                     // configuration that the serving processes never received.
                     if pg.is_some() {
                         if let Err(error) = state.complete_stage() {
-                            fail_preparation(state, format!("persist unchanged artifact: {error:#}"))
-                                .await;
+                            fail_preparation(
+                                state,
+                                format!("persist unchanged artifact: {error:#}"),
+                            )
+                            .await;
                             continue;
                         }
                         state.set_pending_dev_profile(target == Some(ExecutionTarget::Source));

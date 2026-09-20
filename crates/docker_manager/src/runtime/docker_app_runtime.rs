@@ -22,6 +22,235 @@ use super::docker_runtime::{
 
 #[async_trait]
 impl UserAppDeploymentRuntime for DockerRuntime {
+    async fn cleanup_builder_restart_archive(
+        &self,
+        template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<()> {
+        self.remove_builder_restart_archive(template).await
+    }
+
+    async fn list_builder_creation_receipt_contexts(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<shared_types::UserAppExecutionContext>> {
+        super::docker_compute_receipt::list_builder_creation_receipt_contexts().await
+    }
+
+    async fn cleanup_builder_creation_receipts(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<()> {
+        super::docker_compute_receipt::cleanup_builder_creation_receipt_files(context).await
+    }
+
+    async fn cleanup_compute_receipt_files(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<()> {
+        super::docker_compute_receipt::cleanup_compute_receipt_files(context).await
+    }
+
+    async fn capture_app_adoption(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        expected_uid: &str,
+    ) -> ContainerRuntimeResult<Option<shared_types::AppAdoptionTarget>> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if expected_uid.is_empty() || expected_uid.len() > 128 {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Expected resource UID is required".into(),
+            ));
+        }
+        let name = app_deployment_name(&context.app_id);
+        let inspect = match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&name, None)
+            .await
+        {
+            Ok(inspect) => inspect,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(error) => {
+                return Err(ContainerRuntimeError::DockerError(format!(
+                    "Inspect adoption candidate: {error}"
+                )));
+            }
+        };
+        let uid = inspect.id.clone().unwrap_or_default();
+        if uid.is_empty() || uid != expected_uid {
+            return Ok(None);
+        }
+        let labels = inspect
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.clone())
+            .unwrap_or_default();
+        // Family identity: the platform app label or a previous rcoder.io
+        // identity label. A foreign container is never adopted; an OLDER
+        // lifecycle's values are acceptable — rebinding is the point.
+        let family = labels.get("managed-by").map(String::as_str) == Some("rcoder-app-manager")
+            || labels.contains_key("rcoder.io/application-id");
+        if !family {
+            return Ok(None);
+        }
+        if let Some(application) = labels.get("rcoder.io/application-id")
+            && application != &context.app_id
+        {
+            return Ok(None);
+        }
+        let volumes = super::docker_builder_restart::bind_witness(&inspect)?;
+        Ok(Some(shared_types::AppAdoptionTarget {
+            context: context.clone(),
+            resource: shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::Container,
+                name,
+                uid,
+                resource_version: None,
+            },
+            volumes,
+        }))
+    }
+
+    async fn bind_app_adoption(
+        &self,
+        _target: &shared_types::AppAdoptionTarget,
+    ) -> ContainerRuntimeResult<()> {
+        // Docker container labels are immutable after creation. Registration
+        // for an adopted application container is the caller's durable store
+        // binding; no container is recreated or restarted here.
+        Ok(())
+    }
+
+    async fn adopted_app_physical_uid(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let name = app_deployment_name(&context.app_id);
+        match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&name, None)
+            .await
+        {
+            Ok(inspect) => Ok(inspect.id.filter(|id| !id.is_empty())),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(error) => Err(ContainerRuntimeError::DockerError(format!(
+                "Inspect application physical UID: {error}"
+            ))),
+        }
+    }
+
+    async fn capture_bound_app_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        binding: &shared_types::UserAppResourceBinding,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        binding
+            .validate(context, &binding.physical_uid)
+            .map_err(ContainerRuntimeError::Conflict)?;
+        let name = app_deployment_name(&context.app_id);
+        let inspect = self
+            .inner
+            .get_docker_client()
+            .inspect_container(&name, None)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::DockerError(format!(
+                    "Inspect bound application target: {error}"
+                ))
+            })?;
+        let uid = inspect.id.clone().unwrap_or_default();
+        if uid.is_empty() || uid != binding.physical_uid {
+            return Err(ContainerRuntimeError::Conflict(
+                "Bound application container was replaced".into(),
+            ));
+        }
+        Ok(shared_types::UserAppMutationTarget {
+            context: context.clone(),
+            resource: shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::Container,
+                name,
+                uid,
+                resource_version: None,
+            },
+        })
+    }
+
+    async fn verify_recovered_volumes(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        volumes: &[shared_types::AppResourceIdentity],
+    ) -> ContainerRuntimeResult<()> {
+        Self::verify_recovered_host_volumes(volumes)
+    }
+
+    async fn verify_committed_creation(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let name = app_deployment_name(&context.app_id);
+        let inspect = match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&name, None)
+            .await
+        {
+            Ok(inspect) => inspect,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(error) => {
+                return Err(ContainerRuntimeError::DockerError(format!(
+                    "Inspect committed creation: {error}"
+                )));
+            }
+        };
+        if !inspect
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .is_some_and(|labels| {
+                let metadata = labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                context.validate_operation_metadata(&metadata).is_ok()
+            })
+        {
+            // A foreign or unstamped identity is never adopted here; callers
+            // keep their AlreadyExists conflict.
+            return Ok(None);
+        }
+        let preferred = inspect
+            .host_config
+            .as_ref()
+            .and_then(|config| config.network_mode.as_deref());
+        let address = extract_container_ip(&inspect, preferred);
+        Ok(Some(ContainerBasicInfo {
+            container_id: inspect.id.clone().unwrap_or_default(),
+            container_name: name.clone(),
+            container_ip: address,
+            internal_port: 0,
+            external_port: 0,
+            project_id: context.app_id.clone(),
+            status: "Starting".to_string(),
+            created_at: chrono::Utc::now(),
+            service_url: String::new(),
+        }))
+    }
+
     async fn discover_application_identity(
         &self,
         app_id: &str,

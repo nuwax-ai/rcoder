@@ -124,83 +124,36 @@ impl AppService {
                     "Hot recovery has no original physical lease receipt".into(),
                 )
             })?;
-            if binding.context.app_id != snapshot.app_id
-                || binding.context.lifecycle_id != snapshot.lifecycle_id
-                || binding.context.operation_id != snapshot.operation_id
-                || Some(&binding.context.executor_id) != snapshot.executor_id.as_ref()
-                || binding.context.request_fingerprint != snapshot.request_fingerprint
-            {
-                return Err(AppOperationError::Conflict(
-                    "Hot recovery lease identity changed".into(),
-                ));
-            }
-            if !self
-                .runtime
-                .validate_app_operation_receipt(&binding.context, &binding.receipt)
-                .await
-                .map_err(|error| map_runtime_error("Validate hot recovery lease", error))?
-            {
-                return Err(AppOperationError::Conflict(
-                    "Hot recovery lease is no longer held".into(),
-                ));
-            }
-            let hot = snapshot.checkpoint.get("hot_execution").ok_or_else(|| {
-                AppOperationError::Conflict("Hot recovery checkpoint missing".into())
-            })?;
-            let target: shared_types::RuntimeConfigurationTarget =
-                serde_json::from_value(hot.get("target").cloned().ok_or_else(|| {
-                    AppOperationError::Conflict(
-                        "Legacy hot operation has no physical recovery target".into(),
-                    )
-                })?)
-                .map_err(|_| AppOperationError::Conflict("Invalid hot recovery target".into()))?;
-            let observed = timeout_at(Instant::now() + Duration::from_secs(15),
-                self.runtime.exec_app_configuration_target(&binding.context, &target, vec![
-                    "sh".into(), "-c".into(),
-                    "curl --silent --show-error --fail --noproxy '*' --connect-timeout 2 --max-time 5 http://127.0.0.1:3010/v1/deploy/status".into(),
-                ])).await.map_err(|_| AppOperationError::Backend("Hot recovery observation timed out".into()))?
-                .map_err(|error| map_runtime_error("Observe original hot owner", error))?;
-            if observed.exit_code != 0 {
-                return Err(AppOperationError::Backend(
-                    "Original hot owner status is unavailable".into(),
-                ));
-            }
-            let body: serde_json::Value = serde_json::from_str(&observed.stdout).map_err(|_| {
-                AppOperationError::Backend("Invalid hot owner status response".into())
-            })?;
-            let data = body.get("data").ok_or_else(|| {
-                AppOperationError::Backend("Hot owner response envelope missing".into())
-            })?;
-            let operation: shared_types::AppDeploymentOperation =
-                serde_json::from_value(data.get("operation").cloned().ok_or_else(|| {
-                    AppOperationError::Conflict("Original hot operation status missing".into())
-                })?)
-                .map_err(|_| AppOperationError::Conflict("Invalid hot operation status".into()))?;
-            if operation.phase != shared_types::AppCliDeployPhase::Failed {
+            let evidence = self.observe_hot_owner(snapshot, binding).await?;
+            let Some(evidence) = evidence else {
                 return Ok(None);
-            }
-            let evidence = shared_types::HotDeploymentFailureEvidence {
-                target,
-                protocol_version: data
-                    .get("protocol_version")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|version| u32::try_from(version).ok())
-                    .ok_or_else(|| {
-                        AppOperationError::Conflict("Hot recovery protocol missing".into())
-                    })?,
-                server_phase: serde_json::from_value(data.get("phase").cloned().ok_or_else(
-                    || AppOperationError::Conflict("Hot owner phase missing".into()),
-                )?)
-                .map_err(|_| AppOperationError::Conflict("Invalid hot owner phase".into()))?,
-                operation,
             };
-            evidence
-                .validate(snapshot)
-                .map_err(AppOperationError::Conflict)?;
-            self.metadata
-                .store
-                .finalize_observed_hot_failure(snapshot, &evidence)
-                .await?
+            match evidence.operation.phase {
+                shared_types::AppCliDeployPhase::Failed => {
+                    evidence
+                        .validate(snapshot)
+                        .map_err(AppOperationError::Conflict)?;
+                    self.metadata
+                        .store
+                        .finalize_observed_hot_failure(snapshot, &evidence)
+                        .await?
+                }
+                shared_types::AppCliDeployPhase::Running => {
+                    // The owner confirmed success for exactly this operation;
+                    // a lost platform-side response no longer locks recovery.
+                    evidence
+                        .validate_success(snapshot)
+                        .map_err(AppOperationError::Conflict)?;
+                    let encoded = serde_json::to_value(&evidence).map_err(|error| {
+                        AppOperationError::Backend(format!("Encode hot success evidence: {error}"))
+                    })?;
+                    self.metadata
+                        .store
+                        .finalize_observed_hot_success(snapshot, &encoded)
+                        .await?
+                }
+                _ => return Ok(None),
+            }
         };
         if let Some(binding) = binding {
             if binding.context.app_id != terminal.app_id
@@ -217,6 +170,188 @@ impl AppService {
                 .release_app_operation_receipt(&binding.context, &binding.receipt)
                 .await
                 .map_err(|error| map_runtime_error("Release confirmed hot failure lease", error))?;
+            self.metadata.store.forget_operation_lease(&binding).await?;
+        }
+        Ok(Some(terminal.into()))
+    }
+
+    /// Read the original hot owner's deployment status through the captured
+    /// physical target. Returns validated evidence for a terminal owner
+    /// outcome (Failed or Running); None while the owner is still deploying.
+    async fn observe_hot_owner(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        binding: &shared_types::UserAppOperationLeaseBinding,
+    ) -> AppResult<Option<shared_types::HotDeploymentFailureEvidence>> {
+        if binding.context.app_id != snapshot.app_id
+            || binding.context.lifecycle_id != snapshot.lifecycle_id
+            || binding.context.operation_id != snapshot.operation_id
+            || Some(&binding.context.executor_id) != snapshot.executor_id.as_ref()
+            || binding.context.request_fingerprint != snapshot.request_fingerprint
+        {
+            return Err(AppOperationError::Conflict(
+                "Hot recovery lease identity changed".into(),
+            ));
+        }
+        if !self
+            .runtime
+            .validate_app_operation_receipt(&binding.context, &binding.receipt)
+            .await
+            .map_err(|error| map_runtime_error("Validate hot recovery lease", error))?
+        {
+            return Err(AppOperationError::Conflict(
+                "Hot recovery lease is no longer held".into(),
+            ));
+        }
+        let hot = snapshot
+            .checkpoint
+            .get("hot_execution")
+            .ok_or_else(|| AppOperationError::Conflict("Hot recovery checkpoint missing".into()))?;
+        let target: shared_types::RuntimeConfigurationTarget =
+            serde_json::from_value(hot.get("target").cloned().ok_or_else(|| {
+                AppOperationError::Conflict(
+                    "Legacy hot operation has no physical recovery target".into(),
+                )
+            })?)
+            .map_err(|_| AppOperationError::Conflict("Invalid hot recovery target".into()))?;
+        let observed = timeout_at(
+            Instant::now() + Duration::from_secs(15),
+            self.runtime.exec_app_configuration_target(
+                &binding.context,
+                &target,
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "curl --silent --show-error --fail --noproxy '*' --connect-timeout 2 --max-time 5 http://127.0.0.1:3010/v1/deploy/status"
+                        .into(),
+                ],
+            ),
+        )
+        .await
+        .map_err(|_| AppOperationError::Backend("Hot recovery observation timed out".into()))?
+        .map_err(|error| map_runtime_error("Observe original hot owner", error))?;
+        if observed.exit_code != 0 {
+            return Err(AppOperationError::Backend(
+                "Original hot owner status is unavailable".into(),
+            ));
+        }
+        let body: serde_json::Value = serde_json::from_str(&observed.stdout)
+            .map_err(|_| AppOperationError::Backend("Invalid hot owner status response".into()))?;
+        let data = body.get("data").ok_or_else(|| {
+            AppOperationError::Backend("Hot owner response envelope missing".into())
+        })?;
+        let operation: shared_types::AppDeploymentOperation =
+            serde_json::from_value(data.get("operation").cloned().ok_or_else(|| {
+                AppOperationError::Conflict("Original hot operation status missing".into())
+            })?)
+            .map_err(|_| AppOperationError::Conflict("Invalid hot operation status".into()))?;
+        if !matches!(
+            operation.phase,
+            shared_types::AppCliDeployPhase::Failed | shared_types::AppCliDeployPhase::Running
+        ) {
+            return Ok(None);
+        }
+        let evidence =
+            shared_types::HotDeploymentFailureEvidence {
+                target,
+                protocol_version: data
+                    .get("protocol_version")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|version| u32::try_from(version).ok())
+                    .ok_or_else(|| {
+                        AppOperationError::Conflict("Hot recovery protocol missing".into())
+                    })?,
+                server_phase: serde_json::from_value(data.get("phase").cloned().ok_or_else(
+                    || AppOperationError::Conflict("Hot owner phase missing".into()),
+                )?)
+                .map_err(|_| AppOperationError::Conflict("Invalid hot owner phase".into()))?,
+                operation,
+            };
+        Ok(Some(evidence))
+    }
+
+    /// Recover a crash between the hot convergence CAS and the env write.
+    /// Evidence order: the converged environment matches the persisted target
+    /// (K8s ConfigMap readback), else the original owner's terminal Running
+    /// outcome through its captured physical target (Docker's only source —
+    /// its environment is immutable). Anything else keeps the protection.
+    async fn reconcile_hot_convergence(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> AppResult<Option<shared_types::UserAppOperationView>> {
+        let binding = self
+            .metadata
+            .store
+            .get_operation_lease(&snapshot.app_id, &snapshot.operation_id)
+            .await?;
+        let mut evidence = None;
+        if let Some(expected) = snapshot
+            .checkpoint
+            .pointer("/hot_execution/converge_env")
+            .cloned()
+        {
+            let expected: std::collections::HashMap<String, String> =
+                serde_json::from_value(expected).map_err(|error| {
+                    AppOperationError::Conflict(format!("Invalid hot convergence target: {error}"))
+                })?;
+            let current = self
+                .runtime
+                .app_env_snapshot(&snapshot.app_id)
+                .await
+                .map_err(|error| map_runtime_error("Read converged environment", error))?;
+            if current.env == expected {
+                evidence = Some(serde_json::to_value(&expected).map_err(|error| {
+                    AppOperationError::Backend(format!("Encode convergence evidence: {error}"))
+                })?);
+            }
+        }
+        if evidence.is_none() {
+            let Some(binding) = binding.as_ref() else {
+                return Err(AppOperationError::Conflict(
+                    "Hot convergence recovery has no original lease receipt".into(),
+                ));
+            };
+            if let Some(owner) = self.observe_hot_owner(snapshot, binding).await? {
+                if owner.operation.phase == shared_types::AppCliDeployPhase::Running {
+                    owner
+                        .validate_success(snapshot)
+                        .map_err(AppOperationError::Conflict)?;
+                    evidence = Some(serde_json::to_value(&owner).map_err(|error| {
+                        AppOperationError::Backend(format!("Encode hot success evidence: {error}"))
+                    })?);
+                } else {
+                    return Err(AppOperationError::Conflict(
+                        "Hot owner reports failure after convergence began; manual reconciliation required"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        let Some(evidence) = evidence else {
+            // Convergence target not reached and owner outcome still unknown:
+            // the original protection stays.
+            return Ok(None);
+        };
+        let terminal = self
+            .metadata
+            .store
+            .finalize_observed_hot_success(snapshot, &evidence)
+            .await?;
+        if let Some(binding) = binding {
+            if binding.context.app_id != terminal.app_id
+                || binding.context.lifecycle_id != terminal.lifecycle_id
+                || binding.context.operation_id != terminal.operation_id
+                || Some(&binding.context.executor_id) != terminal.executor_id.as_ref()
+                || binding.context.request_fingerprint != terminal.request_fingerprint
+            {
+                return Err(AppOperationError::Conflict(
+                    "Hot terminal lease identity changed".into(),
+                ));
+            }
+            self.runtime
+                .release_app_operation_receipt(&binding.context, &binding.receipt)
+                .await
+                .map_err(|error| map_runtime_error("Release confirmed hot success lease", error))?;
             self.metadata.store.forget_operation_lease(&binding).await?;
         }
         Ok(Some(terminal.into()))
@@ -289,6 +424,12 @@ impl AppService {
         {
             return Ok(view);
         }
+        if operation.state == UserAppOperationState::RecoveryRequired
+            && operation.step == "hot_converging"
+            && let Some(view) = self.reconcile_hot_convergence(&operation).await?
+        {
+            return Ok(view);
+        }
         if operation.kind == shared_types::UserAppOperationKind::Start
             && ((operation.state == UserAppOperationState::RecoveryRequired
                 && operation.step == "traffic_wake_observing")
@@ -298,10 +439,59 @@ impl AppService {
             // Reconcile the original observation, never issue another start.
             // Full-record CAS in the store validates acknowledged write evidence.
             let terminal = if operation.state == UserAppOperationState::RecoveryRequired {
-                self.metadata
-                    .store
-                    .finalize_observed_wake(&operation)
-                    .await?
+                if operation.checkpoint.get("start_write_acknowledged")
+                    == Some(&serde_json::Value::Bool(true))
+                {
+                    self.metadata
+                        .store
+                        .finalize_observed_wake(&operation)
+                        .await?
+                } else {
+                    // Legacy record predating the acknowledged-write flag. The
+                    // independent durable evidence is the operation-bound
+                    // compute start receipt: a confirmed receipt observes the
+                    // same terminal boundary; anything else keeps protection
+                    // and leaves an explicit Stop as the recovery path.
+                    let target: shared_types::UserAppMutationTarget = serde_json::from_value(
+                        operation
+                            .checkpoint
+                            .get("target")
+                            .ok_or_else(|| {
+                                AppOperationError::Conflict(
+                                    "Legacy wake checkpoint lost its captured target".into(),
+                                )
+                            })?
+                            .clone(),
+                    )
+                    .map_err(|_| {
+                        AppOperationError::Conflict(
+                            "Legacy wake checkpoint target is invalid".into(),
+                        )
+                    })?;
+                    let confirmed = self
+                        .runtime
+                        .reconcile_app_compute_start(&target)
+                        .await
+                        .map_err(|error| {
+                            map_runtime_error("Verify legacy wake start receipt", error)
+                        })?;
+                    if !confirmed {
+                        return Err(AppOperationError::Conflict(
+                            "Legacy wake start write is not confirmed by its runtime receipt; \
+                             verify the deployment manually or stop the application explicitly"
+                                .into(),
+                        ));
+                    }
+                    self.metadata
+                        .store
+                        .finalize_legacy_observed_wake(
+                            &operation,
+                            &serde_json::json!({
+                                "runtime_start_receipt": target.context,
+                            }),
+                        )
+                        .await?
+                }
             } else {
                 operation
             };
@@ -536,6 +726,11 @@ impl AppService {
             && snapshot.step == "hot_execution"
         {
             return Ok(self.reconcile_hot_failure(snapshot).await?.is_some());
+        }
+        if snapshot.state == UserAppOperationState::RecoveryRequired
+            && snapshot.step == "hot_converging"
+        {
+            return Ok(self.reconcile_hot_convergence(snapshot).await?.is_some());
         }
         if self.reconcile_completed_control(snapshot).await? {
             return Ok(true);

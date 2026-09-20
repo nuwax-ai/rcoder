@@ -77,6 +77,26 @@ impl UserAppExecutionContext {
         Ok(())
     }
 
+    /// Creation-commitment proof: every identity key the creator stamps must
+    /// be present and equal. A same-lifecycle resource written by another
+    /// operation must not match — re-creation is a new commitment.
+    pub fn validate_operation_metadata(
+        &self,
+        metadata: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        self.validate_application_metadata(metadata)?;
+        for (key, expected) in [
+            ("rcoder.io/operation-id", &self.operation_id),
+            ("rcoder.io/executor-id", &self.executor_id),
+            ("rcoder.io/request-fingerprint", &self.request_fingerprint),
+        ] {
+            if metadata.get(key) != Some(expected) {
+                return Err(format!("Operation resource identity mismatch: {key}"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_identity(&self, app_id: &str) -> Result<(), String> {
         if self.app_id != app_id {
             return Err("Application execution identity mismatch".into());
@@ -300,6 +320,7 @@ impl std::fmt::Display for UserAppOperationScope {
 pub enum UserAppOperationKind {
     EnsureBuilder,
     AdoptBuilder,
+    AdoptApplication,
     StopBuilder,
     RestartBuilder,
     Create,
@@ -352,7 +373,8 @@ impl UserAppOperationKind {
             | Self::DestroyProdStorage
             | Self::ClearProdStorage
             | Self::ResetProdDatabasePassword
-            | Self::PrepareProdDatabase => UserAppOperationScope::Prod,
+            | Self::PrepareProdDatabase
+            | Self::AdoptApplication => UserAppOperationScope::Prod,
             Self::PurgeResources | Self::DeleteApplication => UserAppOperationScope::Application,
         }
     }
@@ -1102,6 +1124,20 @@ pub trait UserAppLifecycleStore: Send + Sync {
         ))
     }
 
+    /// Close a legacy wake's recovery phase. For records predating the
+    /// `start_write_acknowledged` checkpoint: the caller must have verified
+    /// the operation-bound runtime start receipt first and passes the audit
+    /// evidence here; it is persisted with the same honest Failed finalization.
+    async fn finalize_legacy_observed_wake(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+        _evidence: &serde_json::Value,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Legacy wake observation recovery is unsupported".into(),
+        ))
+    }
+
     /// Close an observed terminal hot failure by full snapshot CAS. The caller
     /// must still conditionally release the original physical lease receipt.
     async fn finalize_observed_hot_failure(
@@ -1111,6 +1147,20 @@ pub trait UserAppLifecycleStore: Send + Sync {
     ) -> Result<UserAppOperationRecord, UserAppStoreError> {
         Err(UserAppStoreError::InvalidOperation(
             "Hot failure recovery is unsupported".into(),
+        ))
+    }
+
+    /// Close an observed hot-deployment SUCCESS: the original owner reported a
+    /// terminal Running outcome for exactly this operation, or the converged
+    /// environment matches the persisted target. Caller-side evidence checks
+    /// precede this CAS; it never grants another runtime write.
+    async fn finalize_observed_hot_success(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+        _evidence: &serde_json::Value,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Hot success recovery is unsupported".into(),
         ))
     }
 

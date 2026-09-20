@@ -27,6 +27,7 @@ impl shared_types::UserAppBuilderRecovery for PendingBuilderRecovery {
                 super::control::resume_pending(&state, operation).await
             }
             Kind::AdoptBuilder => super::adoption::resume_pending(&state, operation).await,
+            Kind::AdoptApplication => super::app_adoption::resume_pending(&state, operation).await,
             _ => return Err("Operation is not a Pending builder command".into()),
         };
         result.map_err(|error| format!("Resume original builder operation: {error:#}"))
