@@ -104,6 +104,14 @@ pub struct Config {
     pub listen_host: String,
     pub port: u16,
     pub project_source_dir: PathBuf,
+    /// [`Config::project_source_dir`] 是否经 env `PROJECT_SOURCE_DIR` 显式注入——
+    /// **部署形态判据**（非配置开关）：沙箱（agent 容器）形态 start-up.sh 恒
+    /// `export PROJECT_SOURCE_DIR=/home/user`；主容器（rcoder 主 Pod / cutover
+    /// 接管 TS 存量域）形态不注入。normalProject 定位与 agent-store 锚点据此
+    /// 分流视角（computer::computer_root_for_context：显式注入=沙箱视角，
+    /// 未注入=主容器视角 `{COMPUTER_WORKSPACE_DIR}/{userId}/...`，对齐 TS 1.4.8）。
+    /// 配置文件直接给 `project_source_dir` 赋值不置位（部署契约只认 env 注入）。
+    pub project_source_dir_explicit: bool,
     pub computer_workspace_dir: PathBuf,
     /// Userapp 开发卷根 (env `USERAPP_WORKSPACE_DIR`; 沙箱挂载点, 见 paths::USERAPP_WORKSPACE_ROOT)。
     pub userapp_workspace_dir: PathBuf,
@@ -216,6 +224,7 @@ impl Default for Config {
             listen_host: "0.0.0.0".to_string(),
             port: AGENT_FILE_SERVER_PORT,
             project_source_dir: PathBuf::from(WORKSPACE_ROOT),
+            project_source_dir_explicit: false,
             computer_workspace_dir: PathBuf::from(COMPUTER_WORKSPACE_ROOT),
             userapp_workspace_dir: PathBuf::from(USERAPP_WORKSPACE_ROOT),
             userapp_single_app_id: None,

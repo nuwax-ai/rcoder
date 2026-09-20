@@ -89,6 +89,9 @@ impl Config {
             Err(error) => return Err(anyhow!(error)).context("read FILE_SERVER_PORT/PORT"),
         };
         path!(project_source_dir, "PROJECT_SOURCE_DIR");
+        // 部署形态判据：env 显式注入（沙箱形态）才置位——path! 宏无法区分
+        // "env 提供"与"默认回退"，独立探测（trim 后非空才算注入）。
+        self.project_source_dir_explicit = env_opt_string("PROJECT_SOURCE_DIR")?.is_some();
         path!(computer_workspace_dir, "COMPUTER_WORKSPACE_DIR");
         path!(userapp_workspace_dir, "USERAPP_WORKSPACE_DIR");
         self.userapp_single_app_id = env_opt_string("USERAPP_SINGLE_APP_ID")?;
@@ -184,6 +187,7 @@ impl Config {
                 Err(error) => return Err(anyhow!(error)).context("read FILE_SERVER_PORT/PORT"),
             },
             project_source_dir: PathBuf::from(env_str("PROJECT_SOURCE_DIR", WORKSPACE_ROOT)?),
+            project_source_dir_explicit: env_opt_string("PROJECT_SOURCE_DIR")?.is_some(),
             computer_workspace_dir: PathBuf::from(env_str(
                 "COMPUTER_WORKSPACE_DIR",
                 COMPUTER_WORKSPACE_ROOT,

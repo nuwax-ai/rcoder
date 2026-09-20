@@ -93,12 +93,15 @@ pub(crate) async fn computer_root_for_request(
 ///    workspace 切到开发卷 `{USERAPP_WORKSPACE_DIR}/{app_id}`。**app_id 是独立
 ///    字段**（header `x-app-id` > query `appId`，见 [`crate::extract::userapp_app_id`]），
 ///    cId 是会话字段**不参与** userapp 定位（勿兼任）；缺失 fail-fast。
-/// 3. normalProject 分流（kind=normalProject，常规项目主容器共享工作区）：
-///    `{COMPUTER_WORKSPACE_DIR}/{userId}/NormalProject/{projectId}`
-///    （projectId 复用 app_id 通道传递，TS 字面规则不走 WorkspaceResolver）；
+/// 3. normalProject 分流（kind=normalProject，常规项目共享工作区，同一物理
+///    布局的两种部署视角，对齐 TS 1.4.8 `resolveWorkspaceDir`）：沙箱形态
+///    （`PROJECT_SOURCE_DIR` env 注入）`{PROJECT_SOURCE_DIR}/normalProject/{projectId}`
+///    （userId 层被 computer 挂载吸收）；主容器形态（未注入，rcoder 主 Pod /
+///    cutover 接管 TS 存量域）`{COMPUTER_WORKSPACE_DIR}/{userId}/normalProject/{projectId}`。
+///    projectId 复用 app_id 通道传递，TS 字面规则不走 WorkspaceResolver；
 ///    app_id 缺失 fail-fast（文案对齐 TS）。⚠️ TS 侧 projectId 不过路径段校验，
 ///    此处过 [`crate::workspace`] identifier 校验为有意加固（进宿主树路径拼接，
-///    与 resolve_userapp_dev 同源纪律）。
+///    与 resolve_userapp_dev 同源纪律；主容器形态 userId 同理）。
 /// 4. 默认 resolver（pageApp/taskAgent/缺省：Local `{root}/{userId}/{cId}` /
 ///    Subvolume per-agent PVC）。
 pub(crate) async fn computer_root_for_context(
@@ -145,18 +148,32 @@ pub(crate) async fn computer_root_for_context(
                 AppError::validation("appId(projectId) is required for normalProject workspace")
             })?;
             shared_types::validate_identifier(app_id, "appId").map_err(AppError::validation)?;
-            // 沙箱视角：PROJECT_SOURCE_DIR=/home/user（start-up.sh 注入，即 computer
-            // 挂载点 /home/user ⇔ 主容器 {COMPUTER_WORKSPACE_ROOT}/{userId}，userId
-            // 层被挂载吸收）。与 agent cwd（chat resolve_project_dir / ttyd cwd）
-            // 三方同根：{PROJECT_SOURCE_DIR}/normalProject/{projectId}。
-            // 旧公式 {COMPUTER_WORKSPACE_DIR}/{userId}/NormalProject/{appId} 是主容器
-            // 视角且沙箱未注入该 env（默认值不可用），已废弃；目录段统一小写
-            // normalProject（存量大写 NormalProject 目录不迁移，新旧不互通）。
-            Ok(state
-                .config
-                .project_source_dir
-                .join("normalProject")
-                .join(app_id))
+            // 同一物理布局的两种部署视角（对齐 TS 1.4.8 resolveWorkspaceDir）：
+            // - 沙箱形态（PROJECT_SOURCE_DIR=/home/user 由 start-up.sh 注入，
+            //   userId 层被 computer 挂载吸收）：{PROJECT_SOURCE_DIR}/normalProject/
+            //   {projectId}，与 agent cwd（chat resolve_project_dir / ttyd cwd）
+            //   三方同根；
+            // - 主容器形态（rcoder 主 Pod / cutover 接管 TS 存量域，未注入该
+            //   env）：{COMPUTER_WORKSPACE_DIR}/{userId}/normalProject/{projectId}，
+            //   userId 层主容器视角显式存在。
+            // 目录段统一小写 normalProject（存量大写 NormalProject 目录不迁移，
+            // 新旧不互通）；旧公式大写段已废弃。
+            if state.config.project_source_dir_explicit {
+                Ok(state
+                    .config
+                    .project_source_dir
+                    .join("normalProject")
+                    .join(app_id))
+            } else {
+                shared_types::validate_identifier(user_id, "userId")
+                    .map_err(AppError::validation)?;
+                Ok(state
+                    .config
+                    .computer_workspace_dir
+                    .join(user_id)
+                    .join("normalProject")
+                    .join(app_id))
+            }
         }
         // pageApp / taskAgent / 缺省：默认 resolver
         _ => {
@@ -198,9 +215,10 @@ async fn resolve_computer_target(
 /// 不随会话绑定目录漂移，防 `.agent-store` 写进绑定目录的任意父目录）：
 ///
 /// - userapp 分流 → `{USERAPP_WORKSPACE_DIR}`（开发卷自身，无 userId 段）
-/// - normalProject 分流 → `{COMPUTER_WORKSPACE_DIR}/{userId}`（与 taskAgent 同一
-///   实体子树——同一智能体全局一份实体，对齐 TS 1.4.5）
-/// - 用户维度工作目录（非 userapp）→ `{COMPUTER_WORKSPACE_DIR}/{userId}`
+/// - normalProject 分流 → 用户根（与 taskAgent 同一实体子树——同一智能体
+///   全局一份实体，对齐 TS 1.4.8；两部署视角：主容器 `{COMPUTER_WORKSPACE_DIR}/{userId}` /
+///   沙箱 `PROJECT_SOURCE_DIR`，与定位收口同源分流）
+/// - 用户维度工作目录（非 userapp）→ 用户根（同上两视角）
 /// - 默认 → `ws.parent()`（Local=`{root}/{userId}` 与 TS 等价；
 ///   Subvolume=per-user PVC 稳定根，既有阶段 2 语义不动）
 ///
@@ -210,7 +228,7 @@ async fn resolve_computer_target(
 /// `computer_ws::create_workspace_with_agent_store` 的显式 session_workspace 参数）。
 pub(crate) fn agent_store_user_root(
     state: &AppState,
-    _user_id: &str,
+    user_id: &str,
     ws: &Path,
     workspace_path: Option<&str>,
 ) -> PathBuf {
@@ -218,14 +236,18 @@ pub(crate) fn agent_store_user_root(
         return state.config.userapp_workspace_dir.clone();
     }
     // normalProject 与用户维度工作目录（非 userapp）同锚点：store 锚定用户根
-    // 不随绑定漂移——沙箱视角即 PROJECT_SOURCE_DIR（/home/user，userId 层被
-    // computer 挂载吸收；等价主容器视图的 {COMPUTER_WORKSPACE_DIR}/{userId}）
+    // 不随绑定漂移——用户根的两种部署视角（与 NormalProject 定位分流同源）：
+    // 沙箱形态=PROJECT_SOURCE_DIR（/home/user，userId 层被 computer 挂载吸收）；
+    // 主容器形态={COMPUTER_WORKSPACE_DIR}/{userId}（对齐 TS 1.4.8）。
     // F03：与定位收口同源（merged kind，header 优先 > body）——body-only
     // normalProject 的 store 根同样锚定用户根，不再依赖 header 通道存在
     if crate::extract::workspace_kind() == Some(shared_types::ComputerServiceKind::NormalProject)
         || crate::extract::merged_workspace_path(workspace_path).is_some()
     {
-        return state.config.project_source_dir.clone();
+        if state.config.project_source_dir_explicit {
+            return state.config.project_source_dir.clone();
+        }
+        return state.config.computer_workspace_dir.join(user_id);
     }
     ws.parent().unwrap_or(ws).to_path_buf()
 }
@@ -388,9 +410,9 @@ mod tests {
 
     #[tokio::test]
     async fn normal_project_resolves_shared_workspace_by_project_id() {
-        let (state, resolver) = make_state();
-        // 常规项目共享工作区（沙箱视角）{PROJECT_SOURCE_DIR}/normalProject/{projectId}
-        // （projectId 复用 app_id 通道；cId 会话字段不参与；userId 层被挂载吸收）
+        let (mut state, resolver) = make_state();
+        // 常规项目共享工作区（projectId 复用 app_id 通道；cId 会话字段不参与）。
+        // 主容器形态（默认：PROJECT_SOURCE_DIR 未注入）= {CWS}/{userId}/normalProject/{id}
         let path = scope_kind(
             shared_types::ComputerServiceKind::NormalProject,
             Some("proj-7"),
@@ -400,6 +422,30 @@ mod tests {
         )
         .await
         .expect("normalProject workspace");
+        assert_eq!(
+            path,
+            state
+                .config
+                .computer_workspace_dir
+                .join("u1")
+                .join("normalProject")
+                .join("proj-7")
+        );
+        // 沙箱形态（env 注入标记）= {PROJECT_SOURCE_DIR}/normalProject/{id}
+        // （userId 层被挂载吸收）
+        state.config = Arc::new(crate::Config {
+            project_source_dir_explicit: true,
+            ..(*state.config).clone()
+        });
+        let path = scope_kind(
+            shared_types::ComputerServiceKind::NormalProject,
+            Some("proj-7"),
+            async {
+                computer_root_for_request(&state, "u1", "1561913", ServiceScope::default()).await
+            },
+        )
+        .await
+        .expect("normalProject workspace (sandbox form)");
         assert_eq!(
             path,
             state
@@ -539,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_store_user_root_anchors_per_layout() {
-        let (state, _resolver) = make_state();
+        let (mut state, _resolver) = make_state();
 
         // 默认布局: ws.parent() (Local={root}/{userId} 与 TS 等价)
         let ws = state.config.computer_workspace_dir.join("u1").join("c1");
@@ -548,11 +594,11 @@ mod tests {
             state.config.computer_workspace_dir.join("u1")
         );
 
-        // 用户维度工作目录布局: store 锚定用户根（沙箱视角 PROJECT_SOURCE_DIR,
-        // userId 层被 computer 挂载吸收）, 不随绑定漂移
+        // 用户维度工作目录布局: store 锚定用户根, 不随绑定漂移——主容器形态
+        // （默认：PROJECT_SOURCE_DIR 未注入）= {CWS}/{userId}（对齐 TS 1.4.8）
         assert_eq!(
             agent_store_user_root(&state, "u1", Path::new("/tmp/bound"), Some("/tmp/bound")),
-            state.config.project_source_dir
+            state.config.computer_workspace_dir.join("u1")
         );
 
         // userapp 分流: 开发卷自身 (无 userId 段)
@@ -562,8 +608,25 @@ mod tests {
         .await;
         assert_eq!(root, state.config.userapp_workspace_dir);
 
-        // normalProject 分流: 与 taskAgent 同一实体子树锚点（沙箱视角用户根
-        // PROJECT_SOURCE_DIR, 等价主容器 {CWS}/{userId}）
+        // normalProject 分流: 与 taskAgent 同一实体子树锚点（主容器形态={CWS}/{userId}）
+        let root = scope_kind(
+            shared_types::ComputerServiceKind::NormalProject,
+            Some("proj-7"),
+            async { agent_store_user_root(&state, "u1", Path::new("/any/ws"), None) },
+        )
+        .await;
+        assert_eq!(root, state.config.computer_workspace_dir.join("u1"));
+
+        // 沙箱形态（PROJECT_SOURCE_DIR env 注入标记）: 用户根=PROJECT_SOURCE_DIR
+        // （/home/user，userId 层被挂载吸收）——绑定与 normalProject 两臂同锚
+        state.config = Arc::new(crate::Config {
+            project_source_dir_explicit: true,
+            ..(*state.config).clone()
+        });
+        assert_eq!(
+            agent_store_user_root(&state, "u1", Path::new("/tmp/bound"), Some("/tmp/bound")),
+            state.config.project_source_dir
+        );
         let root = scope_kind(
             shared_types::ComputerServiceKind::NormalProject,
             Some("proj-7"),
@@ -607,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_workspace_type_body_resolves_normal_project() {
-        let (state, resolver) = make_state();
+        let (mut state, resolver) = make_state();
         let path = computer_root_for_request(
             &state,
             "u1",
@@ -621,6 +684,36 @@ mod tests {
         )
         .await
         .expect("explicit workspaceType resolves shared workspace");
+        // 主容器形态（默认：PROJECT_SOURCE_DIR 未注入）= {CWS}/{userId}/normalProject/{id}
+        assert_eq!(
+            path,
+            state
+                .config
+                .computer_workspace_dir
+                .join("u1")
+                .join("normalProject")
+                .join("proj-7")
+        );
+
+        // 沙箱形态（env 注入标记）= {PROJECT_SOURCE_DIR}/normalProject/{id}
+        // （userId 层被 computer 挂载吸收）
+        state.config = Arc::new(crate::Config {
+            project_source_dir_explicit: true,
+            ..(*state.config).clone()
+        });
+        let path = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                service_type: None,
+                workspace_type: Some("normalProject"),
+                app_id: Some("proj-7"),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect("sandbox form resolves shared workspace");
         assert_eq!(
             path,
             state
@@ -629,7 +722,7 @@ mod tests {
                 .join("normalProject")
                 .join("proj-7")
         );
-        // 显式通道同样不触达 resolver（TS 字面规则）
+        // 两形态同为 TS 字面规则，均不触达 resolver
         assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
 
         // B06 对照：仅 body serviceType=userapp（无 workspaceType 通道）→

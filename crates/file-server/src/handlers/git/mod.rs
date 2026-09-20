@@ -52,7 +52,8 @@ fn computer_ctx(q: &GitQuery) -> Option<ComputerContext> {
 ///    userApp/normalProject 无 workspacePath 时必须 appId(projectId)（校验
 ///    前置于定位收口，文案对齐 TS）；定位复用 computer 域
 ///    [`crate::handlers::computer::computer_root_for_context`]（workspacePath
-///    绑定 > userapp 开发卷 > normalProject 共享区 > 默认 resolver）
+///    绑定 > userapp 开发卷 > normalProject 共享区（两部署视角见该收口文档）
+///    > 默认 resolver）
 /// 4. 目标目录不存在 → `Resource` 错（"Workspace does not exist"，TS 同款——
 ///    git 操作只面向已存在工作区，不创建）
 ///
@@ -318,17 +319,21 @@ mod tests {
         assert_eq!(log_id, "computer:u1:c1");
     }
 
-    /// normalProject + appId（projectId 复用 appId 通道）→ 共享工作区
-    /// `{PROJECT_SOURCE_DIR}/normalProject/{projectId}`（沙箱视角，body 通道类型，无 header）。
+    /// normalProject + appId（projectId 复用 appId 通道）→ 共享工作区。两部署
+    /// 视角（body 通道类型，无 header）：
+    /// - 沙箱形态（PROJECT_SOURCE_DIR 注入）`{PROJECT_SOURCE_DIR}/normalProject/{projectId}`
+    /// - 主容器形态（未注入）`{COMPUTER_WORKSPACE_DIR}/{userId}/normalProject/{projectId}`
+    ///   （对齐 TS 1.4.8 resolveWorkspaceDir）
     #[tokio::test]
     async fn normal_project_resolves_shared_workspace() {
         let mut state = make_state();
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join("normalProject").join("proj-3"))
-            .expect("seed workspace");
+            .expect("seed sandbox-layout workspace");
         state.config = Arc::new(crate::Config {
             computer_workspace_dir: tmp.path().to_path_buf(),
             project_source_dir: tmp.path().to_path_buf(),
+            project_source_dir_explicit: true,
             ..crate::Config::default()
         });
         let (path, log_id) = scope_context(None, None, async {
@@ -346,6 +351,32 @@ mod tests {
         .expect("normalProject shared workspace");
         assert_eq!(path, tmp.path().join("normalProject").join("proj-3"));
         assert_eq!(log_id, "computer:u1:c1");
+
+        // 主容器形态（标记未置位）：userId 层显式落 {CWS}/{userId} 段
+        std::fs::create_dir_all(tmp.path().join("u1").join("normalProject").join("proj-3"))
+            .expect("seed main-container-layout workspace");
+        state.config = Arc::new(crate::Config {
+            computer_workspace_dir: tmp.path().to_path_buf(),
+            project_source_dir: tmp.path().to_path_buf(),
+            ..crate::Config::default()
+        });
+        let (path, _) = scope_context(None, None, async {
+            resolve_target(
+                &state,
+                Some("normalProject"),
+                Some("proj-3"),
+                None,
+                None,
+                computer_ctx("u1", "c1").as_ref(),
+            )
+            .await
+        })
+        .await
+        .expect("normalProject shared workspace (main-container form)");
+        assert_eq!(
+            path,
+            tmp.path().join("u1").join("normalProject").join("proj-3")
+        );
     }
 
     /// 会话分支缺 userId/cId → 400（文案对齐 TS v1.4.7
