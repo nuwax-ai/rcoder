@@ -58,7 +58,7 @@ target-splitcheck/
 target-tssync/
 # UserApp control storage (database, WAL, SHM and instance lock).
 /data/rcoder/
-/docker/data/rcoder/
+/docker/data/
 
 # Isolated remote build receipts, tools, locks, and source manifests.
 /.remote-k8s/

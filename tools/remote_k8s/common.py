@@ -14,7 +14,7 @@ VERSION = '0.18.1'
 LABEL = 'rcoder.dev/environment'
 EXCLUDES = ['.git', '.env*', '*.env.local', '*.pem', '*.key', 'id_rsa*', 'id_ed25519*',
             '.ssh', '.aws', '.kube', '.codex', 'target', 'target-*', 'node_modules',
-            '__pycache__', '*.log', '/logs', 'tests-e2e/reports', '.remote-k8s']
+            '__pycache__', '*.log', '/logs', 'tests-e2e/reports', '.remote-k8s', '/docker/data']
 
 
 def run(args, *, data=None, timeout=120, env=None, log=None, guard=None):

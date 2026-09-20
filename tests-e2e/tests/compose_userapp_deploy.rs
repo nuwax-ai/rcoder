@@ -1142,7 +1142,7 @@ fn docker_inspect_running(container: &str) -> Option<bool> {
 }
 
 async fn cr10_proxy_ready(env: &Env, app: &str, user: &str) -> bool {
-    let pingora = std::env::var("E2E_PINGORA_URL").expect("E2E_PINGORA_URL");
+    let pingora = pingora_base();
     let deadline = Instant::now() + Duration::from_secs(180);
     while Instant::now() < deadline {
         if let Ok(response) = env

@@ -110,6 +110,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(snapshot.excluded('crates/rcoder/src/main.rs'))
         self.assertFalse(snapshot.excluded('crates/rcoder/src/cleanup_task/logs/mod.rs'))
         self.assertTrue(snapshot.excluded('logs/runtime.json'))
+        self.assertTrue(snapshot.excluded('docker/data/rcoder-toasty-case/userapp.turso.db'))
+        self.assertTrue(snapshot.excluded('docker/data/rcoder-toasty-case/userapp.turso.db-wal'))
+        self.assertFalse(snapshot.excluded('crates/rcoder-storage/schema/userapp-pg-v1.sql'))
 
     def test_tracked_ignored_outputs_are_not_build_inputs(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -11,3 +11,6 @@ mod tests;
 
 #[cfg(all(test, feature = "pg"))]
 mod pg_tls_tests;
+
+#[cfg(all(test, feature = "pg"))]
+mod pg_schema_tests;

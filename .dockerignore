@@ -34,7 +34,7 @@ docker/userapp-workspace/
 docker/app-workspace/
 # SQLite databases, WAL/SHM and instance locks must never enter image layers.
 data/rcoder/
-docker/data/rcoder/
+docker/data/
 
 # 测试文件
 tests/

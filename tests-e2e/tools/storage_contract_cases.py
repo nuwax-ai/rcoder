@@ -27,6 +27,12 @@ PG_EXTRA_TARGETS = {
         'userapp_lifecycle::common::concurrency_tests::independent_pg_owners_enforce_scope_cas_and_bound_lock_waits',
     'PG preparation recovery independent owner CAS and retained fence':
         'userapp_lifecycle::common::concurrency_tests::independent_pg_preparation_recovery_has_one_winner_and_retains_fence',
+    'PG cancelled admission retains complete original request':
+        'userapp_lifecycle::common::admission_cancellation_tests::pg_cancelled_admission_commits_complete_original_request',
+    'PG baseline tampering rejection and partial DDL rollback':
+        'db::pg_schema_tests::pg_baseline_rejects_tampering_and_rolls_back_partial_ddl',
+    'PG every admission and recreate write fault rolls back':
+        'userapp_lifecycle::common::transaction_fault_tests::pg_each_admission_and_recreate_write_fault_rolls_back',
     'PG lifecycle-bound activity':
         'userapp_lifecycle::common::activity_tests::pg_activity_is_monotonic_and_lifecycle_bound',
     'PG Preview contract': 'preview_lifecycle::pg_tests::pg_preview_store_satisfies_contract',
@@ -94,6 +100,12 @@ TURSO_EXTRA_CASES = {
         'toasty_turso_rows_affected_preserves_cas_and_conflict_semantics',
     )
 }
+TURSO_EXTRA_CASES['turso_cancelled_admission_commits_complete_original_request'] = (
+    'userapp_lifecycle::common::admission_cancellation_tests::turso_cancelled_admission_commits_complete_original_request'
+)
+TURSO_EXTRA_CASES['turso_each_admission_and_recreate_write_fault_rolls_back'] = (
+    'userapp_lifecycle::common::transaction_fault_tests::turso_each_admission_and_recreate_write_fault_rolls_back'
+)
 TURSO_TARGETS = {case: PREFIX + case for case in TURSO_CASES} | TURSO_EXTRA_CASES
 
 

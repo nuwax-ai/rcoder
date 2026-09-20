@@ -110,7 +110,11 @@ def cleanup_case(case_id, run_id, directory, existing_ids=()):
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
             errors.append('PG ownership cleanup failed: ' + type(error).__name__)
             (root / 'pg-project-fallback-cleanup.json').write_text(json.dumps({'run_id': run_id, 'case_id': case_id, 'ok': False, 'detail': errors[-1]}))
-    for receipt_path in (directory / 'docker-crash').glob('*/ownership.json'):
+    crash_receipts = list((directory / 'docker-crash').glob('*/ownership.json'))
+    shutdown_receipt = directory / 'docker-shutdown' / 'ownership.json'
+    if shutdown_receipt.exists():
+        crash_receipts.append(shutdown_receipt)
+    for receipt_path in crash_receipts:
         try:
             receipt = json.loads(receipt_path.read_text())
             managed_names.update({receipt['project'] + '-rcoder-1', receipt['project'] + '-docker-proxy-1',

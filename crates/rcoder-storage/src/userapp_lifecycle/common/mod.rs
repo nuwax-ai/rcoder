@@ -3,6 +3,8 @@
 mod activity;
 #[cfg(test)]
 mod activity_tests;
+#[cfg(test)]
+mod admission_cancellation_tests;
 mod codec;
 #[cfg(test)]
 mod concurrency_tests;
@@ -17,6 +19,8 @@ mod ops;
 #[cfg(all(test, feature = "pg"))]
 mod pg_commit_reply_tests;
 mod repo;
+#[cfg(test)]
+mod transaction_fault_tests;
 
 use super::storage;
 use crate::db::{owner::DatabaseOwner, schema::Backend};
@@ -27,10 +31,17 @@ use toasty_core::driver::{IsolationLevel, operation::TransactionMode};
 pub struct ToastyUserAppStore {
     owner: DatabaseOwner,
     backend: Backend,
+    #[cfg(test)]
+    admission_gate: Option<std::sync::Arc<admission_cancellation_tests::AdmissionGate>>,
 }
 impl ToastyUserAppStore {
     pub(crate) fn from_owner(owner: DatabaseOwner, backend: Backend) -> Self {
-        Self { owner, backend }
+        Self {
+            owner,
+            backend,
+            #[cfg(test)]
+            admission_gate: None,
+        }
     }
 
     async fn run<T, F>(&self, read_only: bool, body: F) -> Result<T, UserAppStoreError>
@@ -185,10 +196,17 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
     ) -> Result<UserAppAdmissionOutcome, UserAppStoreError> {
         let request = request.clone();
         let input = input.cloned();
+        #[cfg(test)]
+        let admission_gate = self.admission_gate.clone();
         self.run(false, move |tx, backend| {
-            Box::pin(
-                async move { ops::admit_with_input(tx, backend, &request, input.as_ref()).await },
-            )
+            Box::pin(async move {
+                let outcome = ops::admit_with_input(tx, backend, &request, input.as_ref()).await?;
+                #[cfg(test)]
+                if let Some(gate) = admission_gate {
+                    gate.pause_before_commit().await;
+                }
+                Ok(outcome)
+            })
         })
         .await
     }

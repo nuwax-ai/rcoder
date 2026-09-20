@@ -920,3 +920,29 @@ PG/Turso两份未发布基线已加入`userapp_operations_unfinished`。旧开�
 组件测试模块仅按rustfmt调整声明排序，`cfg(test)`模块在生产构建中排除；对应输入差异明确记录于后续镜像元数据，不影响生产逻辑。
 
 最终存储 `cargo clippy -p rcoder-storage --all-features --all-targets -- -D warnings` 退出0，日志 `/tmp/rcoder-storage-final-gaps-clippy.log`。三平台同一app-cli生产源码快照的普通模板/单owner/显式Restart/Stop均有实机通过证据；Windows仅普通app-cli链，未将TerminateProcess清理当Ctrl+C优雅退出。Mac/Linux另有真实旧回执恢复+新Restart通过。分别见native-desktop-runtime目录的macos/windows/linux-handoff-verification-2026-09-20.md；完整NT矩阵与发布包仍未全验收。
+
+### 完整受理取消、PG迁移失败与真实关机补验
+
+阶段提交 `3ce5694a` 后，仅增加测试/验收脚本与测试专用门闩。UserApp真实四表受理进入事务后取消调用future，再放行并排空：Turso和独立真实PG17各1/1通过、nextest退出0；原operation/request/input/prod slot完整且原请求重放同ID。日志 `/tmp/rcoder-userapp-cancel-nextest.log`、`/tmp/rcoder-userapp-cancel-pg.log`。不能用筛选排除的166项作为本轮执行数量。
+
+PG baseline补验1/1通过、退出0：独立schema的checksum/未来版本篡改被拒且账本不变；服务端event trigger确认ledger/userapps真实创建后，在userapp_operations DDL中抛错，初始化整体回滚至零表，去除故障后完整重试。日志 `/tmp/rcoder-pg-schema-gaps.log`；测试fixture与匿名卷清理完成。严格验收目录同步注册，两轮Python目录检查均4/4通过。
+
+真实Docker/Turso SIGTERM完整夹具15/15通过、退出0：原keep-alive不能受理新合法请求；等待在途操作；退出前原操作已落盘RecoveryRequired且存储目录锁释放；同库重启无未知命令重放。详见 `cr06-sigterm-deployment-2026-09-20.md`，不把此前旧schema observer的失败报告改写为成功。
+
+本轮镜像构建全部退出0，builder/runtime Python ABI同为cpython-313-aarch64-linux-gnu、Java25，工具核验通过。完整发布链正使用固定源码快照运行，报告 `tests-e2e/reports/bd1ad9c4afc44b12bf46640bbb2fbd66/`，尚未得出整轮通过结论。
+
+发布链本轮 `bd1ad9c4afc44b12bf46640bbb2fbd66` 未通过：63项硬断言通过、0项硬断言失败，但CR10显式重启及新版本生效后，新增页面检查在读取未设置的E2E_PINGORA_URL时panic，报告aborted。套件原约定该值默认127.0.0.1:8089；新helper遗漏复用pingora_base()。已修测试配置读取，不改变页面可达断言或生产逻辑；原报告保留，待重新完整运行，不能把63项通过当场景完成。
+
+### S10/S11写点矩阵及审计收束
+
+仅cfg(test)任务局部故障点补齐受理5处、重建4处。PG/Turso分别1/1专项通过（每项含9分支），验证每个错误确实命中、整体回滚、旧生命周期/历史/槽位保留、同请求重试。日志 `/tmp/rcoder-write-fault-turso.log`、`/tmp/rcoder-write-fault-pg.log`。随后存储完整nextest159/159通过、11项环境用例未在普通套件执行；本次新增3条PG测试已各自在真实独立fixture执行。全features与PG-only严格Clippy退出0，Python验收目录4/4；日志 `/tmp/rcoder-storage-audit-final-{clippy,nextest,pg-clippy,catalog}.log`。
+
+CR06进入docker_lifecycle_crash套件。登记审查另修正了冻结run/bin下observer的定位，以及中断后docker-shutdown/ownership.json精确清理登记；原身份核验保留。Rust路径夹具4/4、Python清理16/16、启动器24/24通过，最终Rust包装器在完整套件中验证。
+
+完整Compose新快照：`94f0b3daf0d10b6f8058afc3cf77460a891d35ac4967b5151d81e5aec0c76a1c`，HEAD锚点`3ce5694a`加测试/文档改动，目录`/var/folders/y6/g5lk3d750833hz_rn5h3y6nh0000gn/T/rcoder-e2e-audit-final-ssnjvylu`。生产主镜像继续使用已核验`57035645d26a`二进制；相对其源码仅新增cfg(test)钩子、测试及语义等价受理返回包装，没有修改生产行为。元数据记录二进制原始源码及测试overlay，未将新快照称作二进制重建。完整套件已启动，日志`/tmp/rcoder-audit-compose-full.log`，尚待结果。
+
+### 远端准备及运行数据排除
+
+完整Compose套件仍运行（报告`6b0904fb0cf745f095b0e39952fdc006`，44个注册场景）；summary中的尚未完成项为启动器预填aborted占位，必须结合活进程及最终结果判断，不能提前称44项失败。
+
+远端doctor退出0，SSH/集群/CRD/存储/registry可达，尚未构建部署或重建PG。检查发现本轮隔离Compose数据目录不同于旧固定docker/data/rcoder路径；已将gitignore/dockerignore/远端EXCLUDES统一排除docker/data整棵运行数据目录，保留源码schema文件。实际manifest确认无数据文件；remote workflow单测9/9通过（含动态目录与WAL排除断言），日志`/tmp/rcoder-audit-remote-workflow.log`。不会将本地DB加入同步/镜像；此前已冻结的Compose测试快照同样未包含该数据目录。

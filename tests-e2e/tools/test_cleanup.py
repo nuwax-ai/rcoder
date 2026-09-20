@@ -7,6 +7,35 @@ from unittest.mock import patch
 from cleanup import owned, cleanup_case
 
 class OwnershipTests(unittest.TestCase):
+    def test_shutdown_exact_receipt_reuses_creation_aware_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutdown = root / 'docker-shutdown'
+            shutdown.mkdir()
+            receipt = {'project': 'rcoder-crash-0123456789abcdef', 'app_id': 'cr-case-term'}
+            (shutdown / 'ownership.json').write_text(json.dumps(receipt))
+            unrelated = root / 'unrelated'
+            unrelated.mkdir()
+            (unrelated / 'ownership.json').write_text(json.dumps(receipt))
+            with patch('cleanup.command', return_value=''), patch('docker_crash_contract.cleanup', return_value={'ok': True}) as reclaim:
+                self.assertEqual(cleanup_case('case', 'run', root), [])
+                reclaim.assert_called_once_with(shutdown, 'run', 'case')
+            self.assertTrue((shutdown / 'fallback-cleanup.json').exists())
+            self.assertFalse((unrelated / 'fallback-cleanup.json').exists())
+
+    def test_shutdown_foreign_receipt_refused_before_docker_mutation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutdown = root / 'docker-shutdown'
+            shutdown.mkdir()
+            (shutdown / 'ownership.json').write_text(json.dumps({
+                'project': 'rcoder-crash-0123456789abcdef', 'app_id': 'cr-case-term',
+                'run_id': 'foreign', 'case_id': 'case', 'root': str(shutdown)}))
+            with patch('cleanup.command', return_value=''), patch('docker_crash_contract.command') as api:
+                errors = cleanup_case('case', 'run', root)
+                self.assertTrue(any('fixture cleanup failed' in error for error in errors))
+                api.assert_not_called()
+
     def container(self, name, cid='new', labels=None):
         return {'Id': cid, 'Name': '/' + name, 'Config': {'Labels': labels}}
 

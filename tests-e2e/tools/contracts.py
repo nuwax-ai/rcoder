@@ -187,3 +187,23 @@ REQUIRED['userapp_dev_app_proxy_lazy_start'].update({
     'lazy recreation removes only captured builder',
     'lazy recreation records same-lifecycle replacement',
 })
+
+
+REQUIRED['docker_runtime_sigterm_drain_contract'] = {
+    'Docker SIGTERM contract process completed',
+    'Frozen master binary identity',
+    'Existing HTTP connection permits keep-alive before shutdown',
+    'Durable Running original operation held before remote create',
+    'Late request identifier is valid and initially absent',
+    'Process handled real SIGTERM',
+    'Old keep-alive cannot admit new UserApp operation',
+    'Shutdown waits for accepted operation before store close',
+    'Store drain and graceful process exit confirmed',
+    'Offline same-engine observer acquires released store lock',
+    'Original protection persisted before any restart recovery',
+    'Offline snapshot has no rejected application identity',
+    'Restart retains original uncertain identity and protection',
+    'Rejected keep-alive left no durable application identity or operations',
+    'No physical create or replay after signal',
+    'Owned SIGTERM fixture cleanup',
+}

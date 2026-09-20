@@ -81,7 +81,8 @@
     "webchat_two_turn_seq"
   ],
   "docker_lifecycle_crash": [
-    "docker_runtime_crash_recovery_contract"
+    "docker_runtime_crash_recovery_contract",
+    "docker_runtime_sigterm_drain_contract"
   ],
   "k8s_lb": [
     "lb_cross_entry_cursor_reconnect",

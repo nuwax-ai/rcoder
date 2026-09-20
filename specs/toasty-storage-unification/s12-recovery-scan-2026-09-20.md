@@ -41,3 +41,7 @@ python3 tools/test_storage_recovery_scan.py --run
 ## 验证状态
 
 原始 PG17 比较探针已执行并通过，数据见上表。正式仓库工具、两份 SQL 和新增 Turso/catalog 回归已写入；Python AST、定向 rustfmt、`git diff --check` 通过。按统一验证安排，本次尚未运行 Cargo，也未执行新仓库工具；待集中记录实际 nextest 与工具结果，不沿用旧 schema 的组件结果宣称本轮通过。
+
+### 后续集中验证结果（2026-09-20）
+
+上述待执行状态保留为当时记录。本轮正式工具已经执行，退出码0：30万历史下首屏19.077ms→0.073ms，尾游标15.471ms→0.076ms，结果等价且使用预期部分索引；证据目录 `/var/folders/y6/g5lk3d750833hz_rn5h3y6nh0000gn/T/rcoder-s12-j_f6lxx1/`。存储 nextest 157/157通过，8项环境用例未在普通套件执行；真实PG契约另行26/26通过。严格Clippy退出0。完整命令及日志定位见同目录 `verification.md`，这些结果不替代尚待完成的Compose/K8s整体验收。

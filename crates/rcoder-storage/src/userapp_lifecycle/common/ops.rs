@@ -193,6 +193,8 @@ pub(super) async fn admit_with_configuration(
         configuration::guard_database_admin(tx, operation).await?;
         operation.created_at = operation.created_at.trunc_subsecs(6);
         repo::insert_operation(tx, operation).await?;
+        #[cfg(test)]
+        super::transaction_fault_tests::check("admission_operation")?;
         if let Some(pg) = pg {
             configuration::seed_deployment_credentials(tx, backend, operation, pg).await?;
         }
@@ -210,6 +212,9 @@ pub(super) async fn admit_with_configuration(
                 .await
                 .map_err(storage)?;
         }
+
+        #[cfg(test)]
+        super::transaction_fault_tests::check("admission_input")?;
         repo::save_app(
             tx,
             backend,
@@ -218,7 +223,12 @@ pub(super) async fn admit_with_configuration(
             previous.metadata_revision,
         )
         .await?;
+
+        #[cfg(test)]
+        super::transaction_fault_tests::check("admission_application")?;
         repo::save_slots(tx, backend, &app, &previous).await?;
+        #[cfg(test)]
+        super::transaction_fault_tests::check("admission_slots")?;
     }
     if let (Some(pg), UserAppAdmissionOutcome::Existing(operation)) = (pg, &result) {
         configuration::verify_captured_credentials(tx, operation, pg).await?;
@@ -244,6 +254,9 @@ pub(super) async fn admit_with_configuration(
                 .map_err(storage)?;
         }
     }
+
+    #[cfg(test)]
+    super::transaction_fault_tests::check("admission_request")?;
     Ok(result)
 }
 pub(super) async fn current(
@@ -934,6 +947,9 @@ pub(super) async fn recreate(
     models::ActiveOperations::delete_by_app_id(tx, app_id)
         .await
         .map_err(storage)?;
+
+    #[cfg(test)]
+    super::transaction_fault_tests::check("recreate_deleted_slots")?;
     toasty::sql::statement(repo::sql(
         backend,
         "DELETE FROM userapp_activity WHERE app_id=$1 AND lifecycle_id=$2",
@@ -944,12 +960,18 @@ pub(super) async fn recreate(
     .await
     .map_err(storage)?;
     repo::save_app(tx, backend, &app, expected_lifecycle_id, old_revision).await?;
+
+    #[cfg(test)]
+    super::transaction_fault_tests::check("recreate_application")?;
     models::ActiveOperations::create()
         .app_id(app_id)
         .lifecycle_id(&app.lifecycle_id)
         .exec(tx)
         .await
         .map_err(storage)?;
+
+    #[cfg(test)]
+    super::transaction_fault_tests::check("recreate_slots")?;
     models::Request::create()
         .app_id(app_id)
         .request_id(request_id)
@@ -960,6 +982,9 @@ pub(super) async fn recreate(
         .exec(tx)
         .await
         .map_err(storage)?;
+
+    #[cfg(test)]
+    super::transaction_fault_tests::check("recreate_request")?;
     Ok(app)
 }
 

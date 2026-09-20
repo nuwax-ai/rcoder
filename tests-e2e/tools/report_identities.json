@@ -448,5 +448,11 @@
       "scenario": "turso_compose_recreation_contract",
       "backend": "turso-compose"
     }
+  ],
+  "docker_runtime_sigterm_drain_contract": [
+    {
+      "scenario": "docker_runtime_sigterm_drain_contract",
+      "backend": "docker-shutdown"
+    }
   ]
 }
