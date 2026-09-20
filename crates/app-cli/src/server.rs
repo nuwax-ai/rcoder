@@ -2724,13 +2724,24 @@ async fn initialize_startup(
             "active artifact does not match deployment journal"
         );
         if receipt.boundary == Boundary::StartupFailed {
+            // Explicit recovery of the confirmed artifact. Spec semantics: a
+            // completed stop is not a permanent disable — a deliberate restart
+            // must bring the business back. The artifact identity and confirmed
+            // migrations were verified before resume; a fresh process scope
+            // proves the previous orchestration processes are gone, so this is
+            // a new explicit attempt, not an in-process retry loop. The failed
+            // operation itself stays failed in deploy status — recovery here
+            // never rewrites that historical outcome.
+            state
+                .journal
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+                .as_ref()
+                .context("deployment journal missing")?
+                .require_fresh_process_scope()?;
             state.set_release(release);
-            state.set_phase(ServerPhase::Failed(
-                receipt.operation.error.clone().unwrap_or_else(|| {
-                    "Business startup failed; explicit start or redeployment is required".into()
-                }),
-            ));
-            return Ok(None);
+            state.set_phase(ServerPhase::Orchestrating);
+            return Ok(Some(InitialAction::Existing));
         }
         if receipt.boundary == Boundary::Preparing
             && receipt.operation.phase != AppCliDeployPhase::Failed

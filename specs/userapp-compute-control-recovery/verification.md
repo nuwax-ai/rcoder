@@ -915,3 +915,11 @@ Restart 在停止前捕获原 StatefulSet（UID/resourceVersion/Pod 绑定不变
 - tasks.md 勾选状态同步未在本批完成（追加式历史文档，需按实现逐项核对后更新，防止照抄过早结论）——R6 剩余小项。
 
 compute-control 线功能开发至此：F1、R1、R2a、R2b/N1、R5、R3、R4、R6(主体) 全部落地（编译+fmt 验证）；明确剩余：R6 尾（tasks.md 同步）、R3 尾（app_manager 12 处捕获点 binding 感知）、Docker prod 重启归档（凭据重注入通道）、全部测试/部署验收。
+
+### 2026-09-21：Qoder 遗留——编排中 Stop 后 Start 无法恢复业务（app-cli）
+
+**缺口**：切换已确认的部署被打断后，journal 归和链最终落到 `StartupFailed`（含已确认 active 制品身份）；启动路径对 StartupFailed 一律停在 ServerPhase::Failed，而平台对 Failed 相位的 app-cli 没有任何"启动业务"命令通道——只有整轮再部署能拉起业务。spec 明确"Stop 完成后用户重新发起的新 Start 正常受理"。
+
+**修复**（server.rs initialize_startup）：StartupFailed 且制品身份与迁移确认（上游既有核验）时，经 `require_fresh_process_scope` 护栏（前编排进程组确已退出=容器重启后的显式新尝试，非进程内重试循环）→ 按已确认制品走 Existing 编排恢复业务。历史操作结果保持 Failed 不改写。防循环：进程存活期内不再重试（init 一次）；容器重启频率由平台重启策略约束。
+
+**验证**：app-cli 独立 `cargo check --all-features` 退出 0；fmt 通过。未运行测试（阶段约束）。Qoder 报告的另两个失败断言（改密前后业务可用）预计随业务可恢复而闭环，e2e 阶段验证。
