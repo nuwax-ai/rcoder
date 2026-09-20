@@ -929,3 +929,19 @@ compute-control 线功能开发至此：F1、R1、R2a、R2b/N1、R5、R3、R4、
 - 过期断言扫描：tests-e2e 无对 "Original restart template"/"Production identity changed"/"Restart target changed" 的字符串断言——R1/R3 改动的报错文案无测试耦合。
 - 新行为覆盖评估：Docker 每次 dev restart 即走 R1 归档路径（auto-remove 语义），现有 dev restart 场景隐式全覆盖；deploy_full_chain 的 3 个历史失败断言（Qoder R1）即 app-cli 修复的验收；R2a/R4/R5 属故障注入窗口，宜工具脚本（manual_owner_stop.py 模式）在测试阶段按需补。按用户"高价值不滥加"约束，本轮不新增默认套件场景。
 - e2e 前置：dev-hot 重建 rcoder 容器 + docker-build-agent-runner + docker-build-app-runtime（app-cli 修复在这两个镜像内，qoder 报告已证明旧 app-runtime 镜像会掩盖此类修复）。
+
+### 2026-09-21 深夜：e2e 复跑三轮修复 + deploy_full_chain 残留诊断
+
+**已修复**（重跑验证）：
+- R1 归档读 Binds 漏 Mounts（agent-runner 容器用 HostConfig.Mounts 结构挂载）→ 归档被拒 → dev restart 卡 RecoveryRequired@draining（scope_isolation 4 断言连锁）。修复=binds 空→Mounts(bind)→daemon 解析表三级回退。
+- dev stop 探测 503：run 模式 owner（无 runtime kernel）恒 503 → stop 报错（11 场景连锁）。修复=503 归类无 runtime owner→本地登记 pid 路径。
+- pg+userapp-turso 组合编译（测试调用点参数）。
+- wake 超时语义测试 ×2 随 codex 证据收束语义更新。
+- 受管账号改密断言随 in-place 语义更新（补真实 TCP 验证）。
+
+**deploy_full_chain 残留 3 断言**（stop→start 业务恢复 / CR10 前置 / CR10 改密后业务）——精确取证（容器 adep174c4d7cc9p378）：
+- 编排中断后 start：app-cli 恢复编排**成功启动 pingap**（20:35:31 Server starting——StartupFailed 修复生效）；
+- 随后 20:36:07 另一实例/轮次再 exec pingap，2.1s（<startsecs 3s）内被 TERM → supervisord 判 ABNORMAL_TERMINATION(faultCode 40) → 编排失败清理遇 SHUTDOWN_STATE(faultCode 6) → app-cli 退出报 "Deployment remains pending until process shutdown is confirmed; operator recovery required" → supervisord autorestart 12s 循环。
+- 结论：**多轮 app-cli 实例编排互踩**（前轮启动的 pingap 在 startsecs 窗口内被后轮 stop 清理）——Qoder 遗留"编排中 Stop 后恢复"的深层未闭环项，需 app-cli 编排互斥/重启循环专项（涉及 [program:app] autorestart 与 ownership 交接时序）。本轮不冒险修，记录为下一批最高优先。
+
+**环境前置**：docker_crash/sigterm/turso_recreation 三契约需 E2E_TURSO_BINARY_SHA256（冻结二进制指纹，已提取 dev-master-rcoder:latest 的 /app/bin/rcoder=492e1416…，终轮带 env 复跑）。
