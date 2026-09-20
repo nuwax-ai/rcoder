@@ -496,7 +496,7 @@ impl DevServerManager {
         // 匹配 owner：读凭据（源码/产物两种状态根落点都探测；owner 未
         // 启用写端点 → 无法路由，明确报错）
         let Some((_state_root, token)) =
-            super::owner_client::find_owner_token(project_path, &app_id)
+            super::owner_client::find_owner_token(Path::new(&identity.source_root), &app_id)
         else {
             return Err(AppError::business(
                 "workspace is already managed by an app-cli owner whose runtime API \

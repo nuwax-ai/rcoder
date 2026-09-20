@@ -256,6 +256,47 @@ async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<Builder
     }
 }
 
+pub(super) async fn capture_bound_orphan_stop(
+    state: &AppState,
+    context: &UserAppExecutionContext,
+) -> Result<Option<shared_types::BuilderOrphanStopTarget>> {
+    let Some(candidate) = state.runtime().inspect_builder_orphan_stop(context).await? else {
+        return Ok(None);
+    };
+    candidate.validate().map_err(anyhow::Error::msg)?;
+    let binding = state
+        .userapp_store
+        .get_resource_binding(
+            &shared_types::ServiceType::UserappBuilder,
+            &candidate.controller_uid,
+        )
+        .await?;
+    if let Some(binding) = &binding {
+        binding
+            .validate(context, &candidate.controller_uid)
+            .map_err(anyhow::Error::msg)?;
+    }
+    let captured = state
+        .runtime()
+        .capture_bound_builder_orphan_stop(context, binding.as_ref())
+        .await?
+        .ok_or_else(|| {
+            anyhow!("Orphan builder disappeared or its controller changed during binding lookup")
+        })?;
+    {
+        let target = &captured;
+        if target.context != *context
+            || target.controller_name != candidate.controller_name
+            || target.controller_uid != candidate.controller_uid
+            || target.orphan_pod.uid != candidate.orphan_pod.uid
+            || target.orphan_pod.name != candidate.orphan_pod.name
+        {
+            return Err(anyhow!("Orphan builder changed during binding lookup"));
+        }
+    }
+    Ok(Some(captured))
+}
+
 pub(crate) async fn capture_bound_target(
     state: &AppState,
     context: &UserAppExecutionContext,
@@ -379,4 +420,14 @@ mod tests {
         invalid.expected_container_id = "../replacement".into();
         assert!(validate_request("app", &invalid).is_err());
     }
+}
+
+/// Recover the original annotated lifecycle before an ensure can allocate a new
+/// identity. Discovery contains no runtime writes; ordinary capture remains the
+/// authority for every subsequent resource operation.
+pub(crate) async fn discover_missing_identity(
+    state: &AppState,
+    app_id: &str,
+) -> Result<Option<shared_types::UserAppLifecycleRecord>> {
+    Ok(state.app_service.discover_missing_identity(app_id).await?)
 }

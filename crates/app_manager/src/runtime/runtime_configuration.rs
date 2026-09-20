@@ -189,6 +189,7 @@ impl AppService {
                 explicit_pg_target: target.clone(),
                 stage: shared_types::DatabasePasswordStage::WriteSubmitted,
             };
+            operation.authorize_mutation().await?;
             guard.mark_mutating()?;
             operation
                 .checkpoint(

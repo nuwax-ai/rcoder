@@ -83,6 +83,7 @@ impl AppService {
                         serde_json::json!({"target":target,"policy":policy}),
                     )
                     .await?;
+                operation.authorize_mutation().await?;
                 if self.config.access_mode == crate::config::AppAccessMode::Kubernetes {
                     guard.mark_mutating()?;
                 }

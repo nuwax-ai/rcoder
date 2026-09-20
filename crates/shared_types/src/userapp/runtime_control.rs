@@ -284,6 +284,39 @@ pub struct RuntimeOperationAccepted {
     pub poll: String,
 }
 
+/// Read-only recovery evidence. These observations never authorize a retry or
+/// clear a hold; a recovery write must validate the same instance and revision.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RuntimeRecoveryView {
+    pub runtime_instance_id: String,
+    pub deployment_generation_id: String,
+    pub revision: u64,
+    pub kernel_protected: bool,
+    pub owner_protected: bool,
+    /// Original deployment operation, distinct from a later Stop or wake.
+    pub operation_id: Option<String>,
+    /// Diagnostic journal boundary; clients must tolerate new values.
+    pub boundary: Option<String>,
+    /// None means no journal exists, not that the generation was verified.
+    pub generation_matches: Option<bool>,
+    /// The confirmed active request requires credentials that were redacted.
+    /// This flag alone does not prove that supplying credentials is sufficient.
+    pub credentials_required: bool,
+    /// Observation only; execution must recheck under migration ownership.
+    #[serde(default)]
+    pub migrations: RuntimeMigrationRecoveryState,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeMigrationRecoveryState {
+    #[default]
+    NotInspected,
+    Confirmed,
+    Unconfirmed,
+    Unreadable,
+}
+
 /// 请求摘要（服务端规范化后计算；同 ID 异摘要 → 409 OPERATION_ID_CONFLICT）。
 ///
 /// 规范化规则：kind/profile/expected_revision/workspace_id 参与摘要；

@@ -179,6 +179,14 @@ pub(super) async fn ensure(
     backend: Backend,
     proposed: &UserAppLifecycleRecord,
 ) -> Result<UserAppLifecycleRecord, Error> {
+    Ok(ensure_with_created(tx, backend, proposed).await?.0)
+}
+
+pub(super) async fn ensure_with_created(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    proposed: &UserAppLifecycleRecord,
+) -> Result<(UserAppLifecycleRecord, bool), Error> {
     let row =
         codec::application_row(proposed, chrono::Utc::now().timestamp_micros()).map_err(storage)?;
     let inserted = toasty::sql::statement(sql(backend, "INSERT INTO userapps(app_id,lifecycle_id,lifecycle_epoch,lifecycle_state,metadata_revision,name,tenant_id,space_id,recycle_enabled,wake_on_traffic,idle_timeout_seconds,created_at_us,updated_at_us) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(app_id) DO NOTHING"))
@@ -195,7 +203,10 @@ pub(super) async fn ensure(
             .await
             .map_err(storage)?;
     }
-    app(tx, &row.app_id).await?.ok_or(Error::NotFound)
+    Ok((
+        app(tx, &row.app_id).await?.ok_or(Error::NotFound)?,
+        inserted == 1,
+    ))
 }
 pub(super) async fn save_app(
     tx: &mut dyn Executor,

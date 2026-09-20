@@ -256,7 +256,7 @@ pub(crate) async fn create_workspace_v2(
         // (userapp→开发卷 / 绑定→{COMPUTER_WORKSPACE_DIR}/{userId}), 不随会话绑定目录
         // 漂移; 默认布局 = ws.parent() (Local={root}/{userId}, Subvolume=per-user PVC)。
         let user_root =
-            super::super::agent_store_user_root(&state, &user_id, &ws, workspace_path.as_deref());
+            super::super::agent_store_user_root(&state, &user_id, &ws, workspace_path.as_deref())?;
         // F03：合并项目 ID（header > query > body）先落地——借用须活过
         // CreateAgentStoreParams 构造与消费
         let merged_project_id = crate::extract::merged_request_app_id(app_id.as_deref());

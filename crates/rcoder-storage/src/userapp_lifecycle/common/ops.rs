@@ -190,6 +190,7 @@ pub(super) async fn admit_with_configuration(
     let active = repo::active(tx, &app).await?;
     let mut result = domain::admission(&mut app, request, by_id.or(by_request), &active)?;
     if let UserAppAdmissionOutcome::Accepted(operation) = &mut result {
+        super::compute::guard_admission(tx, &app, operation.scope).await?;
         configuration::guard_database_admin(tx, operation).await?;
         operation.created_at = operation.created_at.trunc_subsecs(6);
         repo::insert_operation(tx, operation).await?;
@@ -305,6 +306,7 @@ pub(super) async fn read_execution_input(
     if !owns(context, &op) || op.state != UserAppOperationState::Running {
         return Err(Error::VersionConflict);
     }
+    super::compute::check_business_authority(tx, &op).await?;
     let row = models::OperationInput::get_by_operation_id(tx, &context.operation_id)
         .await
         .map_err(storage)?;
@@ -444,6 +446,19 @@ pub(super) async fn advance(
         .await?
         .ok_or(Error::NotFound)?;
     let before = operation.clone();
+    // A draining executor must still persist evidence about an already-sent
+    // write. Block success, retries and new claims, not evidence checkpoints.
+    if matches!(
+        progress.state,
+        UserAppOperationState::Succeeded | UserAppOperationState::WaitingRetry
+    ) || (progress.state == UserAppOperationState::Running
+        && matches!(
+            operation.state,
+            UserAppOperationState::Pending | UserAppOperationState::WaitingRetry
+        ))
+    {
+        super::compute::check_business_authority(tx, &operation).await?;
+    }
     domain::advance(&mut app, &mut operation, progress)?;
     configuration::validate_terminal(tx, &operation, progress.state).await?;
     repo::save_operation(tx, backend, &operation, &before).await?;
@@ -525,6 +540,7 @@ pub(super) async fn bind_operation_lease(
     {
         return Err(Error::VersionConflict);
     }
+    super::compute::check_business_authority(tx, &op).await?;
     let desired = UserAppOperationLeaseBinding {
         context: context.clone(),
         receipt: receipt.clone(),
@@ -715,12 +731,7 @@ pub(super) async fn finalize_deploy_pg_recovery(
         &snapshot.lifecycle_id,
     )
     .await?;
-    if op != *snapshot
-        || !matches!(
-            op.state,
-            UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
-        )
-    {
+    if op != *snapshot || op.state != UserAppOperationState::RecoveryRequired {
         return Err(Error::VersionConflict);
     }
     evidence
@@ -870,6 +881,131 @@ pub(super) async fn confirm_database_preparation_recovery(
     Ok(op)
 }
 
+pub(super) async fn finalize_builder_creation_rejection(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &UserAppOperationRecord,
+    rejection: Option<&RuntimeRequestRejection>,
+) -> Result<UserAppOperationRecord, Error> {
+    let (mut app, mut op) = current(
+        tx,
+        backend,
+        &snapshot.app_id,
+        &snapshot.operation_id,
+        &snapshot.lifecycle_id,
+    )
+    .await?;
+    if op != *snapshot
+        || op.kind != UserAppOperationKind::EnsureBuilder
+        || if rejection.is_some() {
+            op.state != UserAppOperationState::RecoveryRequired
+                || op.step != "creation_confirmation_timed_out"
+        } else {
+            !userapp_builder_creation_needs_runtime_receipt(&op)
+        }
+        || !op.checkpoint.is_null()
+        || rejection.is_some_and(|rejection| {
+            RuntimeRequestRejection::from_status(rejection.status, String::new()).is_none()
+        })
+    {
+        return Err(Error::VersionConflict);
+    }
+    let before_app = app.clone();
+    // Internal, transactional transition only; this never grants runtime work.
+    op.state = UserAppOperationState::Running;
+    let progress = UserAppOperationProgress {
+        app_id: op.app_id.clone(),
+        lifecycle_id: op.lifecycle_id.clone(),
+        operation_id: op.operation_id.clone(),
+        expected_revision: op.revision,
+        executor_id: op.executor_id.clone().ok_or(Error::VersionConflict)?,
+        state: UserAppOperationState::Failed,
+        step: "creation_result".into(),
+        checkpoint: if rejection.is_none() {
+            serde_json::json!({"creation_cancelled": true})
+        } else {
+            serde_json::Value::Null
+        },
+        error_code: Some("ERR_BACKEND_ERROR".into()),
+        error_message: Some(rejection.map_or_else(
+            || "Builder creation cancelled after acknowledged writes".into(),
+            ToString::to_string,
+        )),
+    };
+    domain::advance(&mut app, &mut op, &progress)?;
+    repo::save_operation(tx, backend, &op, snapshot).await?;
+    repo::save_app(
+        tx,
+        backend,
+        &app,
+        &before_app.lifecycle_id,
+        before_app.metadata_revision,
+    )
+    .await?;
+    repo::save_slots(tx, backend, &app, &before_app).await?;
+    models::OperationInput::delete_by_operation_id(tx, &op.operation_id)
+        .await
+        .map_err(storage)?;
+    Ok(op)
+}
+
+pub(super) async fn confirm_builder_creation_recovery(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &UserAppOperationRecord,
+    evidence: &BuilderCreationEvidence,
+    management_ready: bool,
+) -> Result<UserAppOperationRecord, Error> {
+    let (app, mut op) = current(
+        tx,
+        backend,
+        &snapshot.app_id,
+        &snapshot.operation_id,
+        &snapshot.lifecycle_id,
+    )
+    .await?;
+    domain::validate_active(&app)?;
+    if op != *snapshot {
+        return Err(Error::VersionConflict);
+    }
+    evidence
+        .validate_operation(&op)
+        .map_err(Error::InvalidOperation)?;
+    if management_ready {
+        if op.state != UserAppOperationState::RecoveryRequired
+            || op.step != "builder_created_observed"
+        {
+            return Err(Error::VersionConflict);
+        }
+        let before: BuilderCreationEvidence =
+            serde_json::from_value(op.checkpoint.clone()).map_err(storage)?;
+        before
+            .validate_operation(&op)
+            .map_err(Error::InvalidOperation)?;
+        if before.target != evidence.target {
+            return Err(Error::VersionConflict);
+        }
+    } else if !userapp_builder_creation_needs_runtime_receipt(&op) {
+        return Err(Error::VersionConflict);
+    }
+    // Evidence is permitted while Stop drains this executor. It grants no
+    // business authority; reserve_completed_operation checks that separately.
+    op.revision = op
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidOperation("Operation revision exhausted".into()))?;
+    op.state = UserAppOperationState::RecoveryRequired;
+    op.step = if management_ready {
+        "builder_ready_confirmed"
+    } else {
+        "builder_created_observed"
+    }
+    .into();
+    op.checkpoint = serde_json::to_value(evidence).map_err(storage)?;
+    repo::save_operation(tx, backend, &op, snapshot).await?;
+    Ok(op)
+}
+
 pub(super) async fn reserve_completed_operation(
     tx: &mut dyn Executor,
     backend: Backend,
@@ -883,6 +1019,7 @@ pub(super) async fn reserve_completed_operation(
         &snapshot.lifecycle_id,
     )
     .await?;
+    super::compute::check_business_authority(tx, &op).await?;
     if op != *snapshot
         || !matches!(
             op.state,
@@ -1121,4 +1258,142 @@ pub(super) async fn quarantine_local_restart(
         }
     }
     Ok(())
+}
+
+pub(super) async fn finalize_observed_wake(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &UserAppOperationRecord,
+) -> Result<UserAppOperationRecord, Error> {
+    let (mut app, mut op) = current(
+        tx,
+        backend,
+        &snapshot.app_id,
+        &snapshot.operation_id,
+        &snapshot.lifecycle_id,
+    )
+    .await?;
+    let target = op
+        .checkpoint
+        .get("target")
+        .and_then(|value| serde_json::from_value::<UserAppMutationTarget>(value.clone()).ok())
+        .ok_or(Error::VersionConflict)?;
+    if op != *snapshot
+        || op.kind != UserAppOperationKind::Start
+        || op.state != UserAppOperationState::RecoveryRequired
+        || op.step != "traffic_wake_observing"
+        || op.checkpoint.get("start_write_acknowledged") != Some(&serde_json::Value::Bool(true))
+        || target.context.app_id != op.app_id
+        || target.context.lifecycle_id != op.lifecycle_id
+        || target.context.operation_id != op.operation_id
+        || Some(&target.context.executor_id) != op.executor_id.as_ref()
+        || target.context.request_fingerprint != op.request_fingerprint
+    {
+        return Err(Error::VersionConflict);
+    }
+    let before_app = app.clone();
+    // Internal, transactional transition only; this never grants runtime work.
+    op.state = UserAppOperationState::Running;
+    let progress = UserAppOperationProgress {
+        app_id: op.app_id.clone(),
+        lifecycle_id: op.lifecycle_id.clone(),
+        operation_id: op.operation_id.clone(),
+        expected_revision: op.revision,
+        executor_id: op.executor_id.clone().ok_or(Error::VersionConflict)?,
+        state: UserAppOperationState::Failed,
+        step: "traffic_wake_observation_failed".into(),
+        checkpoint: op.checkpoint.clone(),
+        error_code: op
+            .error_code
+            .clone()
+            .or_else(|| Some("ERR_BACKEND_ERROR".into())),
+        error_message: op
+            .error_message
+            .clone()
+            .or_else(|| Some("Wake readiness observation did not complete".into())),
+    };
+    domain::advance(&mut app, &mut op, &progress)?;
+    repo::save_operation(tx, backend, &op, snapshot).await?;
+    repo::save_app(
+        tx,
+        backend,
+        &app,
+        &before_app.lifecycle_id,
+        before_app.metadata_revision,
+    )
+    .await?;
+    repo::save_slots(tx, backend, &app, &before_app).await?;
+    models::OperationInput::delete_by_operation_id(tx, &op.operation_id)
+        .await
+        .map_err(storage)?;
+    Ok(op)
+}
+
+/// No runtime writes inside this transaction: the physical owner has already
+/// confirmed the failed operation. Compare the entire original recovery record.
+pub(super) async fn finalize_observed_hot_failure(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &UserAppOperationRecord,
+    evidence: &HotDeploymentFailureEvidence,
+) -> Result<UserAppOperationRecord, Error> {
+    let (mut app, mut op) = current(
+        tx,
+        backend,
+        &snapshot.app_id,
+        &snapshot.operation_id,
+        &snapshot.lifecycle_id,
+    )
+    .await?;
+    if op != *snapshot
+        || op.state != UserAppOperationState::RecoveryRequired
+        || op.step != "hot_execution"
+        || !matches!(
+            op.kind,
+            UserAppOperationKind::HotDeploy
+                | UserAppOperationKind::StartDeployment
+                | UserAppOperationKind::RestartDeployment
+        )
+    {
+        return Err(Error::VersionConflict);
+    }
+    evidence.validate(&op).map_err(Error::InvalidOperation)?;
+    let before_app = app.clone();
+    let mut checkpoint = op.checkpoint.clone();
+    checkpoint["hot_failure_observed"] = serde_json::to_value(evidence).map_err(storage)?;
+    // Internal transition only, under this transaction. Never returns a Running
+    // claim or permits the recovering observer to dispatch another write.
+    op.state = UserAppOperationState::Running;
+    let progress =
+        UserAppOperationProgress {
+            app_id: op.app_id.clone(),
+            lifecycle_id: op.lifecycle_id.clone(),
+            operation_id: op.operation_id.clone(),
+            expected_revision: op.revision,
+            executor_id: op.executor_id.clone().ok_or(Error::VersionConflict)?,
+            state: UserAppOperationState::Failed,
+            step: "hot_execution_failed".into(),
+            checkpoint,
+            error_code: Some("ERR_BACKEND_ERROR".into()),
+            error_message: Some(
+                evidence.operation.error.clone().unwrap_or_else(|| {
+                    "Hot deployment failed on the original runtime owner".into()
+                }),
+            ),
+        };
+    domain::advance(&mut app, &mut op, &progress)?;
+    repo::save_operation(tx, backend, &op, snapshot).await?;
+    repo::save_app(
+        tx,
+        backend,
+        &app,
+        &before_app.lifecycle_id,
+        before_app.metadata_revision,
+    )
+    .await?;
+    repo::save_slots(tx, backend, &app, &before_app).await?;
+    models::OperationInput::delete_by_operation_id(tx, &op.operation_id)
+        .await
+        .map_err(storage)?;
+    Ok(op)
 }

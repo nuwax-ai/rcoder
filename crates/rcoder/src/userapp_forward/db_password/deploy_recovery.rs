@@ -43,10 +43,7 @@ pub(super) fn validate_deploy_pg_snapshot(
             ));
         }
     } else if record.revision != request.expected_revision
-        || !matches!(
-            record.state,
-            UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
-        )
+        || record.state != UserAppOperationState::RecoveryRequired
         || !matches!(
             evidence.stage,
             DatabasePasswordStage::WriteSubmitted
@@ -369,6 +366,17 @@ mod tests {
                 &request
             )
             .is_ok()
+        );
+        assert!(
+            validate_deploy_pg_snapshot(
+                &deploy_record(
+                    DatabasePasswordStage::WriteSubmitted,
+                    UserAppOperationState::Running
+                ),
+                &request,
+            )
+            .is_err(),
+            "an active deployment may still execute policy or SQL after password verification"
         );
         // Terminal replay of an already reconciled outcome is idempotent.
         for stage in [

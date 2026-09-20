@@ -243,6 +243,7 @@ impl AppService {
             .await?;
         params.mutation_target = Some(target);
         let mut storage_changed = false;
+        operation.authorize_mutation().await?;
         _update_lock.mark_mutating()?;
         if let Some(new_size) = params.storage_size.as_deref() {
             let resize = match &storage_target {

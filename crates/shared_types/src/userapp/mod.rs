@@ -36,3 +36,7 @@ pub mod runtime_configuration;
 pub mod runtime_control;
 
 pub mod builder_recovery;
+
+pub mod compute_control;
+
+pub mod discovery;

@@ -231,6 +231,19 @@ impl AppService {
                     {
                         tokio::time::sleep(LEASE_POLL_INTERVAL).await;
                     }
+                    Err(container_runtime_api::ContainerRuntimeError::OperationInProgress(
+                        detail,
+                    )) if !builder_family => {
+                        let mut conflict = self.prod_lock_conflict(app_id).await;
+                        // A legacy runtime lease may have no durable operation.
+                        // Preserve its identity in the message instead of claiming
+                        // that admission is necessarily still in flight.
+                        if let AppOperationError::ConflictBlocked { message, .. } = &mut conflict {
+                            *message =
+                                format!("Application runtime operation is occupied: {detail}");
+                        }
+                        return Err(conflict);
+                    }
                     Err(error) => {
                         return Err(crate::utils::map_runtime_error(
                             "acquire application operation",

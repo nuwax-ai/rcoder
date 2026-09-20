@@ -32,6 +32,11 @@ pub enum WakeOutcome {
     Timeout,
     /// 唤醒失败（scale 失败、runtime 未就绪、app 进入 Error 相等）
     Failed(String),
+    /// Another durable or runtime operation owns the prod execution slot.
+    Blocked {
+        message: String,
+        blocker: crate::UserAppOperationBlocker,
+    },
 }
 
 /// Userapp 流量唤醒控制（异步）

@@ -56,6 +56,7 @@ use envelope::ApiJson;
         proxy::upstreams,
         runtime::identity,
         runtime::status,
+        runtime::recovery,
         runtime::submit_operation,
         runtime::get_operation,
         runtime::operation_events,
@@ -169,6 +170,7 @@ fn api_router(state: AppState) -> Router {
         .route("/v1/deploy/status", get(deploy_status))
         .route("/v1/runtime/identity", get(runtime::identity))
         .route("/v1/runtime/status", get(runtime::status))
+        .route("/v1/runtime/recovery", get(runtime::recovery))
         .route("/v1/runtime/operations", post(runtime::submit_operation))
         .route(
             "/v1/runtime/operations/{operation_id}",
@@ -228,6 +230,9 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
 /// `POST /v1/deploy` 请求体（热部署）。
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub(super) struct DeployBody {
+    /// Operation credentials applied by the caller; used by migration and service processes.
+    #[serde(default)]
+    pub pg: Option<shared_types::StartPgCredential>,
     #[serde(default)]
     pub operation_id: Option<String>,
     /// Expected cold deployment generation; stale callers cannot mutate a replacement.
@@ -257,6 +262,8 @@ pub(super) struct DeployAcceptedData {
 /// 鉴权：请求头 `X-Deploy-Token` 必须等于容器 env `APP_CLI_DEPLOY_TOKEN`
 ///（未设置该 env = 端点禁用，403——安全默认）。进行中相位（deploying/
 /// orchestrating）拒绝 409；受理后由 server 主循环执行（下载成功才停旧服务）。
+/// 若旧操作已收束，唯一恢复原因是缺少脱敏后的运行凭据，携带 pg 的显式部署
+/// 可在确认原制品和迁移回执后受理；未知操作或迁移不会因此解除保护。
 #[utoipa::path(
     post,
     path = "/v1/deploy",
@@ -265,7 +272,7 @@ pub(super) struct DeployAcceptedData {
     responses(
         (status = 202, body = envelope::HttpResult<DeployAcceptedData>, description = "Deploy accepted; poll /v1/deploy/status"),
         (status = 403, body = envelope::HttpResult<String>, description = "Token missing/mismatch or endpoint disabled"),
-        (status = 409, body = envelope::HttpResult<String>, description = "Deploy already in progress"),
+        (status = 409, body = envelope::HttpResult<String>, description = "Deployment busy, generation mismatch, or unresolved recovery; credentials only resolve a verified missing-credentials hold"),
         (status = 400, body = envelope::HttpResult<String>, description = "Invalid body (sha256 shape etc.)"),
         (status = 500, body = envelope::HttpResult<String>, description = "Deployment admission task failed; inspect operation status before retrying")
     ),
@@ -286,6 +293,17 @@ async fn submit_deploy(
             StatusCode::CONFLICT,
             "SERVER_INITIALIZING",
             "runtime state changes are rejected until startup recovery completes",
+        );
+    }
+    if let Some(pg) = body.pg.as_ref()
+        && (shared_types::pg_utils::validate_pg_identifier(&pg.username).is_err()
+            || pg.password.is_empty()
+            || pg.password.contains('\0'))
+    {
+        return envelope::error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_PG_CREDENTIALS",
+            "PostgreSQL credentials require a valid role and a nonempty password without NUL",
         );
     }
     if let Some(sha) = body.sha256.as_deref()
@@ -334,7 +352,7 @@ async fn submit_deploy(
                 local_path: None,
                 execution_target: None,
 
-                run_pg: None,
+                run_pg: body.pg,
             },
             accepted_id,
         )

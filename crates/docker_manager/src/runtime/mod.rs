@@ -4,14 +4,20 @@
 //! Docker and Kubernetes backends.
 
 pub(crate) mod builder_completion;
+mod builder_creation_receipt;
 pub(crate) mod docker_app_create;
 pub(crate) mod docker_app_mounts;
 mod docker_app_runtime;
 mod docker_builder_control;
+mod docker_compute_receipt;
 pub mod docker_runtime;
 pub(crate) mod docker_workspace;
 #[cfg(feature = "kubernetes")]
 mod k8s_builder_control;
+#[cfg(feature = "kubernetes")]
+mod k8s_builder_restart;
+#[cfg(feature = "kubernetes")]
+mod k8s_creation_receipt;
 pub(crate) mod k8s_runtime_helpers;
 pub mod kubernetes_runtime;
 pub mod manager;
@@ -68,3 +74,5 @@ pub use manager::RuntimeManager;
 mod docker_builder_deletion;
 #[cfg(feature = "kubernetes")]
 mod k8s_builder_deletion;
+
+mod lifecycle_discovery;

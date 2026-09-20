@@ -450,7 +450,11 @@ impl<'a> ContainerCreator<'a> {
             .docker
             .start_container(&container_id, None::<StartContainerOptions>)
             .await
-            .map_err(DockerError::BollardError)?;
+            .map_err(|source| DockerError::ContainerCreationIncomplete {
+                container_id: container_id.clone(),
+                phase: crate::ContainerCreationPhase::Start,
+                source: Box::new(DockerError::BollardError(source)),
+            })?;
 
         Ok(container_id)
     }

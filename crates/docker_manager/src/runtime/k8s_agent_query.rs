@@ -1,6 +1,6 @@
 //! agent-runner 查询/读取（从 k8s_agent_pod.rs 拆出）：cache + K8s API 按 label 查 + 列举。
 //!
-//! - `get_container_info_inner` / `get_container_info_by_identifier_inner`：按 identifier 查（后者带 svc self-heal）。
+//! - `get_container_info_inner` / `get_container_info_by_identifier_inner`：按 identifier 查（仅普通 agent 保留 svc self-heal）。
 //! - `find_container_inner`：cache → pod 名 → 标准 label → 旧 label 三级查。
 //! - `list_containers_inner`：列举 rcoder-runtime managed pods。
 //!
@@ -139,7 +139,29 @@ impl KubernetesRuntime {
         let info = self
             .get_container_info_inner(identifier, service_type)
             .await?;
-        if info.is_some() {
+        if info.is_some() && *service_type == ServiceType::UserappBuilder {
+            let name = self.agent_service_name(identifier, service_type)?;
+            let api: kube::Api<k8s_openapi::api::core::v1::Service> =
+                kube::Api::namespaced(self.client.clone(), &self.namespace);
+            let Some(service) = api.get_opt(&name).await.map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("Inspect builder Service: {error}"))
+            })?
+            else {
+                // Incomplete routing is not a missing Pod. The admitted ensure
+                // path will reuse its bound workload and repair the Service.
+                return Ok(None);
+            };
+            super::k8s_service::validate_builder_service(&service, identifier, false)?;
+        }
+        // Managed UserApp reads must not issue writes outside the operation
+        // lease. Service repair belongs to admitted creation/resume, where its
+        // acknowledged result is persisted before releasing the writer.
+        if info.is_some()
+            && !matches!(
+                service_type,
+                ServiceType::UserappBuilder | ServiceType::Userapp
+            )
+        {
             // Self-heal：异常创建（如 OrbStack sandbox 超时）可能留下"pod 在、svc 丢"
             // 的不一致状态——pod 重试后起来了，但 create_agent_service 那步没跑完。
             // 后续 Chat 走 svc FQDN `{pod}-svc:50051` 会 transport error → GRPC_ERROR。

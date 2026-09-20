@@ -184,6 +184,10 @@ async fn execute_pending(
         )
         .await?;
         let container = if target.workload.is_some() {
+            state
+                .userapp_store
+                .check_business_execution(&context)
+                .await?;
             lease
                 .as_mut()
                 .ok_or_else(|| anyhow!("Builder operation lease missing"))?
@@ -476,6 +480,12 @@ mod tests {
     struct FakeLease(Arc<Mutex<LeaseState>>);
     struct LeaseState {
         releases: u32,
+        mutations: u32,
+    }
+    #[derive(Default)]
+    struct CaptureGate {
+        captured: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
@@ -497,6 +507,7 @@ mod tests {
     }
 
     struct ControlRuntime {
+        gate: Option<Arc<CaptureGate>>,
         outcome: ApplyOutcome,
         lease_state: Arc<Mutex<LeaseState>>,
     }
@@ -564,6 +575,10 @@ mod tests {
             context: &UserAppExecutionContext,
             _binding: Option<&shared_types::UserAppResourceBinding>,
         ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+            if let Some(gate) = &self.gate {
+                gate.captured.notify_one();
+                gate.resume.notified().await;
+            }
             Ok(shared_types::BuilderControlTarget {
                 resource_binding: None,
                 context: context.clone(),
@@ -581,6 +596,7 @@ mod tests {
             _target: &shared_types::BuilderControlTarget,
             _restart: bool,
         ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+            self.lease_state.lock().expect("lease state").mutations += 1;
             match self.outcome {
                 // 写已发生（patch 落盘），最终复核发现身份被替换 → K02 修复后
                 // 的错误类别（docker_manager 写后复核不再映射 RequestRejected）
@@ -612,8 +628,19 @@ mod tests {
     async fn test_state(
         outcome: ApplyOutcome,
     ) -> (Arc<AppState>, Arc<Mutex<LeaseState>>, tempfile::TempDir) {
-        let lease_state = Arc::new(Mutex::new(LeaseState { releases: 0 }));
+        test_state_with_gate(outcome, None).await
+    }
+
+    async fn test_state_with_gate(
+        outcome: ApplyOutcome,
+        gate: Option<Arc<CaptureGate>>,
+    ) -> (Arc<AppState>, Arc<Mutex<LeaseState>>, tempfile::TempDir) {
+        let lease_state = Arc::new(Mutex::new(LeaseState {
+            releases: 0,
+            mutations: 0,
+        }));
         let runtime: Arc<dyn container_runtime_api::ContainerRuntime> = Arc::new(ControlRuntime {
+            gate,
             outcome,
             lease_state: lease_state.clone(),
         });
@@ -676,6 +703,70 @@ mod tests {
             cluster_domain: "cluster.local".to_string(),
         });
         (state, lease_state, metadata_dir)
+    }
+
+    #[tokio::test]
+    async fn priority_stop_after_capture_prevents_old_builder_mutation() {
+        let gate = Arc::new(CaptureGate::default());
+        let (state, lease, _dir) =
+            test_state_with_gate(ApplyOutcome::PostWriteConflict, Some(gate.clone())).await;
+        let owned = state.clone();
+        let old = tokio::spawn(async move {
+            execute(
+                &owned,
+                "testapp",
+                UserAppControlRequest {
+                    lifecycle_id: None,
+                    request_id: Some("oldrestart".into()),
+                },
+                true,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.captured.notified())
+            .await
+            .expect("capture reached");
+        let app = state
+            .userapp_store
+            .get_application("testapp")
+            .await
+            .unwrap()
+            .unwrap();
+        let stop = state
+            .userapp_store
+            .admit_compute_control(&shared_types::ComputeControlRequest {
+                app_id: "testapp".into(),
+                lifecycle_id: app.lifecycle_id,
+                scope: shared_types::UserAppOperationScope::Dev,
+                operation_id: "prioritystop".into(),
+                request_id: "prioritystop".into(),
+                request_fingerprint: "a".repeat(64),
+                action: shared_types::ComputeControlAction::Stop,
+            })
+            .await
+            .unwrap();
+        gate.resume.notify_one();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), old)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(lease.lock().unwrap().mutations, 0);
+        assert_eq!(lease.lock().unwrap().releases, 1);
+        assert_eq!(
+            operation_state(&state, "oldrestart").await.state,
+            UserAppOperationState::Failed
+        );
+        let current = state
+            .userapp_store
+            .get_compute_control("testapp", &stop.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.state, shared_types::ComputeControlState::Pending);
+        assert_eq!(current.generation, stop.generation);
     }
 
     async fn operation_state(state: &AppState, request_id: &str) -> UserAppOperationRecord {

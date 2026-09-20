@@ -118,6 +118,13 @@ impl OwnedOperation {
             .await?)
     }
 
+    pub(crate) async fn authorize_mutation(&self) -> AppResult<()> {
+        self.store
+            .check_business_execution(&self.execution_context())
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn bind_lease(&self, guard: &super::AppOperationGuard) -> AppResult<()> {
         self.store
             .bind_operation_lease(&self.execution_context(), &guard.lease_receipt()?)
@@ -127,6 +134,25 @@ impl OwnedOperation {
     pub(crate) async fn confirm_effects(&mut self) -> AppResult<()> {
         self.checkpoint("control_confirmed", self.record.checkpoint.clone())
             .await
+    }
+    pub(crate) async fn begin_hot_convergence(&mut self) -> AppResult<()> {
+        if self.record.step != "hot_execution"
+            || self
+                .record
+                .checkpoint
+                .pointer("/hot_execution/phase")
+                .and_then(serde_json::Value::as_str)
+                != Some("submit")
+        {
+            return Err(AppOperationError::InvalidState(
+                "Hot convergence checkpoint changed".into(),
+            ));
+        }
+        let mut checkpoint = self.record.checkpoint.clone();
+        checkpoint["hot_execution"]["phase"] = serde_json::json!("converging");
+        // CAS must win before any ConfigMap write. A recovery observer that
+        // already finalized this snapshot prevents a late coordinator write.
+        self.checkpoint("hot_converging", checkpoint).await
     }
     pub(crate) async fn checkpoint(
         &mut self,
@@ -199,6 +225,45 @@ impl OwnedOperation {
         };
         self.advance(state, &step, self.record.checkpoint.clone(), Some(error))
             .await
+    }
+
+    /// Evidence for this executor's completed wake write, not business readiness.
+    pub(crate) fn has_confirmed_wake_write(&self) -> bool {
+        if self.record.kind != shared_types::UserAppOperationKind::Start
+            || self.record.step != "traffic_wake_observing"
+            || self.record.checkpoint.get("start_write_acknowledged")
+                != Some(&serde_json::Value::Bool(true))
+        {
+            return false;
+        }
+        self.record
+            .checkpoint
+            .get("target")
+            .and_then(|value| {
+                serde_json::from_value::<shared_types::UserAppMutationTarget>(value.clone()).ok()
+            })
+            .is_some_and(|target| target.context == self.execution_context())
+    }
+
+    /// Only the read-only observation failed. Terminal persistence retains the
+    /// acknowledged write evidence; it does not assert that the application stopped.
+    /// Callers release their exact lease only after this CAS succeeds.
+    pub(crate) async fn fail_confirmed_wake_observation(
+        mut self,
+        error: &AppOperationError,
+    ) -> AppResult<()> {
+        if !self.has_confirmed_wake_write() {
+            return Err(AppOperationError::Conflict(
+                "Wake write acknowledgement is missing or belongs to another executor".into(),
+            ));
+        }
+        self.advance(
+            UserAppOperationState::Failed,
+            "traffic_wake_observation_failed",
+            self.record.checkpoint.clone(),
+            Some(error),
+        )
+        .await
     }
     /// Only use when the runtime explicitly proves that no application mutation
     /// remains in flight. A timeout or transport failure is not such evidence.

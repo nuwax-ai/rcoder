@@ -39,6 +39,119 @@ impl DockerRuntime {
     }
 }
 
+// Only the final write's explicit rejection, or a read after successful writes,
+// proves that no daemon mutation remains outstanding. Never inspect-and-guess
+// after a transport failure, timeout, or server error from start.
+fn acknowledged_partial_creation(error: &crate::DockerError) -> Option<&str> {
+    let crate::DockerError::ContainerCreationIncomplete {
+        container_id,
+        phase,
+        source,
+    } = error
+    else {
+        return None;
+    };
+    match phase {
+        crate::ContainerCreationPhase::Observe => Some(container_id),
+        crate::ContainerCreationPhase::Start => {
+            if let crate::DockerError::BollardError(
+                bollard::errors::Error::DockerResponseServerError { status_code, .. },
+            ) = source.as_ref()
+                && shared_types::RuntimeRequestRejection::from_status(*status_code, String::new())
+                    .is_some()
+            {
+                Some(container_id)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl DockerRuntime {
+    async fn record_partial_creation(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        physical_id: &str,
+        lease: Option<shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<()> {
+        let target = self
+            .capture_builder_compute_with_binding(context, None, false)
+            .await?;
+        let resource = target
+            .workload
+            .as_ref()
+            .filter(|resource| resource.uid == physical_id)
+            .ok_or_else(|| {
+                ContainerRuntimeError::Conflict("Partial builder creation identity differs".into())
+            })?;
+        let inspected = self
+            .inner
+            .get_docker_client()
+            .inspect_container(physical_id, None)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::DockerError(format!(
+                    "Inspect partial builder creation: {error}"
+                ))
+            })?;
+        if inspected.id.as_deref() != Some(physical_id) {
+            return Err(ContainerRuntimeError::Conflict(
+                "Partial builder physical ID differs".into(),
+            ));
+        }
+        let created = inspected.created.as_deref().ok_or_else(|| {
+            ContainerRuntimeError::Conflict("Partial builder creation timestamp missing".into())
+        })?;
+        let created_at = chrono::DateTime::parse_from_rfc3339(created)
+            .map_err(|error| ContainerRuntimeError::ConfigurationError(error.to_string()))?
+            .with_timezone(&chrono::Utc);
+        let running = inspected
+            .state
+            .as_ref()
+            .and_then(|state| state.running)
+            .ok_or_else(|| {
+                ContainerRuntimeError::Conflict("Partial builder running state missing".into())
+            })?;
+        let network = inspected
+            .host_config
+            .as_ref()
+            .and_then(|config| config.network_mode.as_deref());
+        let address = extract_container_ip(&inspected, network);
+        let container = ContainerBasicInfo {
+            container_id: physical_id.into(),
+            container_name: resource.name.clone(),
+            container_ip: address.clone(),
+            internal_port: shared_types::GRPC_DEFAULT_PORT,
+            external_port: 0,
+            project_id: context.app_id.clone(),
+            status: if running { "Running" } else { "Stopped" }.into(),
+            created_at,
+            service_url: if address.is_empty() {
+                String::new()
+            } else {
+                format!("http://{address}:{}", shared_types::GRPC_DEFAULT_PORT)
+            },
+        };
+        let after = self
+            .capture_builder_compute_with_binding(context, None, false)
+            .await?;
+        if target != after {
+            return Err(ContainerRuntimeError::Conflict(
+                "Partial builder changed during observation".into(),
+            ));
+        }
+        let receipt = super::builder_creation_receipt::BuilderCreationReceipt {
+            target,
+            container,
+            lease: lease.ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError("Partial builder lease missing".into())
+            })?,
+        };
+        super::docker_compute_receipt::save_creation(&receipt).await
+    }
+}
+
 #[async_trait]
 impl AgentContainerRuntime for DockerRuntime {
     async fn acquire_builder_operation(
@@ -119,6 +232,29 @@ impl AgentContainerRuntime for DockerRuntime {
             .await
     }
 
+    async fn recover_builder_creation(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderCreationEvidence>> {
+        if let Some(receipt) = super::docker_compute_receipt::read_cancellation(context).await? {
+            self.release_captured_file_lease(context, &receipt.lease)
+                .await?;
+            return Err(ContainerRuntimeError::CreationCancelled);
+        }
+        let Some(receipt) = super::docker_compute_receipt::read_creation(context).await? else {
+            return Ok(None);
+        };
+        // Active local writers retain their flock; release checks original
+        // inode/token and refuses a live writer or any replacement lock.
+        self.release_captured_file_lease(context, &receipt.lease)
+            .await?;
+        Ok(Some(shared_types::BuilderCreationEvidence {
+            creation_lease_released: true,
+            target: receipt.target,
+            container: receipt.container,
+        }))
+    }
+
     async fn capture_builder_control(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -132,6 +268,39 @@ impl AgentContainerRuntime for DockerRuntime {
         command: Vec<String>,
     ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
         self.exec_bound_builder(target, command).await
+    }
+
+    async fn start_builder_control(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        self.start_builder_compute(target).await
+    }
+
+    async fn reconcile_builder_compute_stop(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.reconcile_builder_stop(target).await
+    }
+
+    async fn reconcile_builder_compute_start(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        self.reconcile_builder_start(target).await
+    }
+
+    async fn builder_compute_write_acknowledged(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        starting: bool,
+    ) -> ContainerRuntimeResult<bool> {
+        if starting {
+            super::docker_compute_receipt::matches_start(target).await
+        } else {
+            super::docker_compute_receipt::matches_stop(target).await
+        }
     }
 
     async fn apply_builder_control(
@@ -200,16 +369,82 @@ impl AgentContainerRuntime for DockerRuntime {
                 ContainerRuntimeError::ConfigurationError("builder preflight result missing".into())
             })?;
             let inner = self.inner.clone();
+            let context = params.execution_context.clone();
+            let binding = params.resource_binding.clone();
             return tokio::spawn(async move {
                 let result = if params.resource_binding.is_some() {
                     Self::new(inner.clone())
                         .resume_bound_builder(&params, prepared.image())
                         .await
                 } else {
-                    crate::agent_container_starter::AgentContainerStarter::new(&inner)
+                    let result = crate::agent_container_starter::AgentContainerStarter::new(&inner)
                         .start_prepared(params, prepared)
-                        .await
-                        .map_err(super::builder_completion::docker_error)
+                        .await;
+                    if let (Err(error), Some(context)) = (&result, context.as_ref()) {
+                        if let Some(physical_id) = acknowledged_partial_creation(error) {
+                            // Save known-complete writes before returning the original
+                            // failure. Recovery can drain this exact created resource;
+                            // it must still separately observe management readiness.
+                            if let Err(record_error) = Self::new(inner.clone())
+                                .record_partial_creation(context, physical_id, lease.receipt())
+                                .await
+                            {
+                                return super::builder_completion::finish(
+                                    lease,
+                                    Err(ContainerRuntimeError::ContainerCreationError(format!(
+                                        "{error}; persist partial creation evidence: {record_error}"
+                                    ))),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    result.map_err(super::builder_completion::docker_error)
+                };
+                let result = match (result, context.as_ref()) {
+                    (Ok(info), Some(context)) => {
+                        let recorded = async {
+                            let target = Self::new(inner.clone())
+                                .capture_builder_compute_with_binding(
+                                    context,
+                                    binding.as_ref(),
+                                    false,
+                                )
+                                .await?;
+                            let receipt = super::builder_creation_receipt::BuilderCreationReceipt {
+                                target,
+                                container: info.clone(),
+                                lease: lease.receipt().ok_or_else(|| {
+                                    ContainerRuntimeError::ConfigurationError(
+                                        "Builder creation lease receipt missing".into(),
+                                    )
+                                })?,
+                            };
+                            super::docker_compute_receipt::save_creation(&receipt).await
+                        }
+                        .await;
+                        recorded.map(|()| info)
+                    }
+                    (Err(ContainerRuntimeError::CreationCancelled), Some(context)) => {
+                        let recorded = async {
+                            let receipt =
+                                super::builder_creation_receipt::BuilderCancellationReceipt {
+                                    context: context.clone(),
+                                    lease: lease.receipt().ok_or_else(|| {
+                                        ContainerRuntimeError::ConfigurationError(
+                                            "Builder cancellation lease receipt missing".into(),
+                                        )
+                                    })?,
+                                };
+                            super::docker_compute_receipt::save_cancellation(&receipt).await
+                        }
+                        .await;
+                        match recorded {
+                            Ok(()) => Err(ContainerRuntimeError::CreationCancelled),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    (result, _) => result,
                 };
                 super::builder_completion::finish(lease, result).await
             })

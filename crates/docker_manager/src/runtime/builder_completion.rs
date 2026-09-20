@@ -14,6 +14,9 @@ pub(crate) fn k8s_error(message: String, error: kube::Error) -> Error {
 }
 
 pub(crate) fn docker_error(error: crate::DockerError) -> Error {
+    if matches!(error, crate::DockerError::BuilderCreationCancelled) {
+        return Error::CreationCancelled;
+    }
     if let crate::DockerError::BollardError(bollard::errors::Error::DockerResponseServerError {
         status_code,
         ..
@@ -30,12 +33,25 @@ pub(crate) async fn finish<T>(
     lease: Box<dyn AppOperationLease>,
     result: ContainerRuntimeResult<T>,
 ) -> ContainerRuntimeResult<T> {
-    if result.is_ok() || matches!(&result, Err(Error::RequestRejected(_))) {
+    if result.is_ok()
+        || matches!(
+            &result,
+            Err(Error::RequestRejected(_) | Error::CreationCancelled)
+        )
+    {
         if let Err(release_error) = lease.release().await {
             if result.is_ok() {
                 return Err(Error::ConnectionError(release_error));
             }
-            tracing::error!(error = %release_error, "Failed to release rejected builder operation; recovery required");
+            let original = match &result {
+                Err(error) => error.to_string(),
+                Ok(_) => "Builder creation completed".into(),
+            };
+            // A rejection describes the request, not successful lease cleanup.
+            // Do not let the caller finalize and hide the retained runtime lock.
+            return Err(Error::ConnectionError(format!(
+                "{original}; release builder operation lease failed: {release_error}"
+            )));
         }
     } else {
         if let Err(error) = &result {

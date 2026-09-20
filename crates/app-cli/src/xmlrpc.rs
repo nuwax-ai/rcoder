@@ -23,6 +23,10 @@ impl std::fmt::Display for RpcFault {
 
 impl std::error::Error for RpcFault {}
 
+pub(crate) fn is_confirmed_fault(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RpcFault>().is_some()
+}
+
 impl RpcFault {
     fn is_complete(&self) -> bool {
         self.0

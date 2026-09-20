@@ -172,8 +172,11 @@ impl AppService {
 
         // RBD 卷形态：rcoder 不读卷上 release.lock 注入身份变量——只做保留键治理
         // （用户显式提交 → 400 防伪造；调用方需自行先 strip live 读回值）。
-        let env = env.unwrap_or_default();
+        let mut env = env.unwrap_or_default();
         ensure_no_reserved_env(&env)?;
+        // Managed UserApp runtimes include PostgreSQL; standalone app-cli does not.
+        env.entry("APP_CLI_REQUIRE_PG".into())
+            .or_insert_with(|| "1".into());
 
         // 端口：models::PortConfig → container_runtime_api::AppPortSpec
         let app_ports: Vec<AppPortSpec> = ports

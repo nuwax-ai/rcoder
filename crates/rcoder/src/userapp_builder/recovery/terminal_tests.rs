@@ -237,3 +237,114 @@ async fn terminal_scan_preserves_replacement_owner_and_durable_receipt_on_releas
         terminal
     );
 }
+
+#[tokio::test]
+async fn compute_terminal_scan_preserves_uncertain_then_releases_confirmed_receipt() {
+    use shared_types::{
+        ComputeControlAction, ComputeControlProgress, ComputeControlRequest, ComputeControlStage,
+        ComputeControlState, ComputeExecutorIdentity, UserAppOperationScope,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let store: Arc<dyn UserAppLifecycleStore> = Arc::new(
+        rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+            &directory.path().join("compute.db"),
+        )
+        .await
+        .unwrap(),
+    );
+    let app = store.ensure_identity("computeapp").await.unwrap();
+    let pending = store
+        .admit_compute_control(&ComputeControlRequest {
+            app_id: app.app_id.clone(),
+            lifecycle_id: app.lifecycle_id.clone(),
+            scope: UserAppOperationScope::Dev,
+            operation_id: "computestop".into(),
+            request_id: "stoprequest".into(),
+            request_fingerprint: "a".repeat(64),
+            action: ComputeControlAction::Stop,
+        })
+        .await
+        .unwrap();
+    let identity = ComputeExecutorIdentity {
+        app_id: app.app_id.clone(),
+        lifecycle_id: app.lifecycle_id.clone(),
+        scope: UserAppOperationScope::Dev,
+        operation_id: pending.operation_id.clone(),
+        generation: pending.generation,
+        executor_id: "worker".into(),
+    };
+    store
+        .claim_compute_control(&identity, pending.revision)
+        .await
+        .unwrap();
+    let path = directory.path().join("lease");
+    let file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.lock().unwrap();
+    AppFileMutationMarker::for_operation(&pending.operation_id)
+        .unwrap()
+        .begin(&file)
+        .unwrap();
+    let metadata = file.metadata().unwrap();
+    let receipt = UserAppOperationLeaseReceipt::Docker {
+        service_type: ServiceType::UserappBuilder,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        token: pending.operation_id.clone(),
+    };
+    let mut record = store.bind_compute_lease(&identity, &receipt).await.unwrap();
+    drop(file);
+    let runtime = Arc::new(FileLeaseAdapter { path });
+    let mut tasks = RecoveryTasks::default();
+    compute::discover_compute_leases(store.clone(), runtime.clone(), &mut tasks, &mut None)
+        .await
+        .unwrap();
+    assert!(
+        tasks.active.is_empty(),
+        "Running is not permission to release"
+    );
+    assert!(!std::fs::read(&runtime.path).unwrap().is_empty());
+    for stage in [
+        ComputeControlStage::Stopping,
+        ComputeControlStage::Stopped,
+        ComputeControlStage::Completed,
+    ] {
+        record = store
+            .advance_compute_control(&ComputeControlProgress {
+                identity: identity.clone(),
+                expected_revision: record.revision,
+                state: if stage == ComputeControlStage::Completed {
+                    ComputeControlState::Succeeded
+                } else {
+                    ComputeControlState::Running
+                },
+                stage,
+                checkpoint: serde_json::json!({"fixture":"confirmed runtime evidence"}),
+                error_code: None,
+                error_message: None,
+            })
+            .await
+            .unwrap();
+    }
+    compute::discover_compute_leases(store.clone(), runtime.clone(), &mut tasks, &mut None)
+        .await
+        .unwrap();
+    let (id, result) = tokio::time::timeout(Duration::from_secs(2), tasks.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, "compute:computestop");
+    result.unwrap();
+    assert!(std::fs::read(&runtime.path).unwrap().is_empty());
+    let after = store
+        .get_compute_control(&app.app_id, &pending.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, ComputeControlState::Succeeded);
+    assert!(after.lease.is_none());
+}

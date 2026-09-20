@@ -481,8 +481,9 @@ impl DevServerManager {
                 identity.workspace_id == intent.request.workspace_id,
                 "runtime workspace changed; cannot recover old operation"
             );
-            let (_, token) = super::owner_client::find_owner_token(workspace, &app)
-                .context("runtime owner credentials unavailable")?;
+            let (_, token) =
+                super::owner_client::find_owner_token(Path::new(&identity.source_root), &app)
+                    .context("runtime owner credentials unavailable")?;
             let client = OwnerClient::new(&intent.address, &token)?;
             let mut supplied = intent.request.clone();
             supplied.run_config = pg.map(|pg| shared_types::OperationRunConfig {

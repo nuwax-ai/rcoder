@@ -119,6 +119,9 @@ pub(crate) fn build_agent_env_vars(
     // environment 覆盖造成数据面分裂（PGDATA 落 overlay = builder
     // 重建丢库）。
     if matches!(service_type, ServiceType::UserappBuilder) {
+        merged_env
+            .entry("APP_CLI_REQUIRE_PG".into())
+            .or_insert_with(|| "1".into());
         for var in [
             "USERAPP_WORKSPACE_DIR",
             "USERAPP_LOG_DIR",

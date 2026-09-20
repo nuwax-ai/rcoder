@@ -1,4 +1,6 @@
 //! Restart discovery. Automatic replay is limited to unclaimed, matching inputs.
+mod compute;
+mod discovery;
 use crate::app_state::AppState;
 use futures::{FutureExt as _, StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
 use shared_types::{UserAppOperationKind, UserAppOperationState};
@@ -73,7 +75,10 @@ pub(crate) fn start_recovery(
         let mut tasks = RecoveryTasks::default();
         let mut cursor = None;
         let mut terminal_cursor = None;
+        let mut compute_cursor = None;
+        let mut pending_compute_cursor = None;
         let mut terminal_first = false;
+        let mut discovery = discovery::Discovery::default();
         let reason = loop {
             tokio::select! {
                 result = tasks.next(), if !tasks.active.is_empty() => {
@@ -85,6 +90,13 @@ pub(crate) fn start_recovery(
                 _ = interval.tick() => {
                     let Some(state) = state.upgrade() else { return; };
                     terminal_first = !terminal_first;
+
+                    if let Err(error) = compute::discover_pending(&state, &mut tasks, &mut pending_compute_cursor).await {
+                        tracing::error!(%error, "Pending compute scan failed");
+                    }
+                    if let Err(error) = compute::discover_compute_leases(state.userapp_store.clone(), state.runtime.clone(), &mut tasks, &mut compute_cursor).await {
+                        tracing::error!(%error, "Compute control lease scan failed");
+                    }
                     if terminal_first
                         && let Err(error) = discover_terminal_leases(state.userapp_store.clone(), state.runtime.clone(), &mut tasks, &mut terminal_cursor).await {
                         tracing::error!(%error, "UserApp terminal lease scan failed");
@@ -95,6 +107,9 @@ pub(crate) fn start_recovery(
                     if !terminal_first
                         && let Err(error) = discover_terminal_leases(state.userapp_store.clone(), state.runtime.clone(), &mut tasks, &mut terminal_cursor).await {
                         tracing::error!(%error, "UserApp terminal lease scan failed");
+                    }
+                    if let Err(error) = discovery.poll(&state, &mut tasks).await {
+                        tracing::warn!(%error, "Managed lifecycle discovery requires inspection");
                     }
                 }
             }
@@ -197,6 +212,53 @@ async fn discover(
                 return Ok(());
             }
             *cursor = Some(operation.operation_id.clone());
+            if operation.state == UserAppOperationState::RecoveryRequired
+                && operation.step == "hot_execution"
+                && operation
+                    .checkpoint
+                    .pointer("/hot_execution/receipt_protocol")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(1)
+            {
+                let state = state.clone();
+                tasks.push(operation.operation_id.clone(), async move {
+                    state.app_service.resume_pending_control(&operation).await?;
+                    Ok(())
+                });
+                continue;
+            }
+            if operation.kind == UserAppOperationKind::Start
+                && operation.state == UserAppOperationState::RecoveryRequired
+                && operation.step == "traffic_wake_observing"
+            {
+                let store = state.userapp_store.clone();
+                tasks.push(operation.operation_id.clone(), async move {
+                    store.finalize_observed_wake(&operation).await?;
+                    // The existing terminal receipt scanner releases only this
+                    // operation's recorded lease after the terminal CAS.
+                    Ok(())
+                });
+                continue;
+            }
+            if shared_types::userapp_builder_creation_needs_runtime_receipt(&operation) {
+                let state = state.clone();
+                tasks.push(operation.operation_id.clone(), async move {
+                    super::creation::reconcile_runtime_receipt(&state, &operation).await?;
+                    Ok(())
+                });
+                continue;
+            }
+            if operation.kind == UserAppOperationKind::EnsureBuilder
+                && operation.state == UserAppOperationState::RecoveryRequired
+                && operation.step == "builder_created_observed"
+            {
+                let state = state.clone();
+                tasks.push(operation.operation_id.clone(), async move {
+                    super::creation::reconcile_created(&state, &operation).await?;
+                    Ok(())
+                });
+                continue;
+            }
             if matches!(
                 operation.state,
                 UserAppOperationState::Running | UserAppOperationState::RecoveryRequired

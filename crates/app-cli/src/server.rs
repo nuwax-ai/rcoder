@@ -21,7 +21,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 #[path = "server_journal.rs"]
-mod journal;
+pub(crate) mod journal;
 #[path = "server_preparation.rs"]
 mod preparation;
 use journal::{ActiveVersion, Boundary, Journal, Receipt};
@@ -45,6 +45,9 @@ const DEPLOY_PROTOCOL: u32 = shared_types::app_cli_deploy::APP_CLI_OPERATION_ID_
 /// server 全局状态（api 层与主循环共享；读多写少，std RwLock 短临界区不跨 await）。
 pub struct ServerState {
     control_token: std::sync::OnceLock<String>,
+    execution_project: std::sync::OnceLock<std::path::PathBuf>,
+    /// Immutable startup workspace for legacy URL receipts without a target tag.
+    owner_execution_workspace: std::sync::OnceLock<std::path::PathBuf>,
     admission: std::sync::Mutex<()>,
     accepting: std::sync::atomic::AtomicBool,
     auxiliary_writers: std::sync::atomic::AtomicUsize,
@@ -79,8 +82,12 @@ pub struct ServerState {
     kernel_required: std::sync::atomic::AtomicBool,
     /// V04：server 级恢复门禁——运行操作**终态持久化失败**（结果未知）时
     /// 挂起：保留执行身份、关闭部署受理、压低 ready，直至进程重启由内核
-    /// 恢复裁决。只升不降（解除只经重启）。
-    runtime_recovery_hold: std::sync::atomic::AtomicBool,
+    /// 恢复裁决。未知结果标记只升不降；缺少脱敏凭据的独立标记可经
+    /// 已确认 Source 操作的显式凭据受理清除。
+    // Bit 0: missing redacted credentials; bit 1: other uncertain state.
+    runtime_recovery_hold: std::sync::atomic::AtomicU8,
+    /// Identity of the request temporarily consuming a credentials-only hold.
+    credential_recovery_operation: std::sync::Mutex<Option<String>>,
     /// R08：当前运行操作的 dev profile（None = 操作未指定，legacy 直跑/
     /// env 兜底）。编排生效命令选择的显式依据。
     pending_dev_profile: std::sync::Mutex<Option<bool>>,
@@ -97,6 +104,21 @@ pub(crate) struct AuxiliaryWriter<'a> {
     state: &'a ServerState,
     confirmed: bool,
 }
+
+/// Restores the credential fence unless a replacement request was handed to
+/// the execution loop. Unknown-state bits are never cleared or overwritten.
+struct CredentialAdmission<'a> {
+    state: &'a ServerState,
+    operation_id: Option<String>,
+}
+
+impl Drop for CredentialAdmission<'_> {
+    fn drop(&mut self) {
+        if let Some(operation_id) = &self.operation_id {
+            self.state.settle_credential_recovery(operation_id, false);
+        }
+    }
+}
 impl AuxiliaryWriter<'_> {
     pub(crate) fn confirm(&mut self) {
         self.confirmed = true;
@@ -107,7 +129,7 @@ impl Drop for AuxiliaryWriter<'_> {
         if !self.confirmed {
             self.state
                 .runtime_recovery_hold
-                .store(true, std::sync::atomic::Ordering::Release);
+                .fetch_or(2, std::sync::atomic::Ordering::AcqRel);
         }
         self.state
             .auxiliary_writers
@@ -187,8 +209,22 @@ pub struct DeployRequest {
     pub local_path: Option<std::path::PathBuf>,
     #[serde(default)]
     pub(crate) execution_target: Option<ExecutionTarget>,
-    #[serde(skip)]
+    #[serde(default, serialize_with = "serialize_redacted_run_pg")]
     pub(crate) run_pg: Option<shared_types::StartPgCredential>,
+}
+
+// Retain only the fact that explicit credentials were required. Recovery must
+// never confuse a redacted request with an environment-only request.
+fn serialize_redacted_run_pg<S: serde::Serializer>(
+    pg: &Option<shared_types::StartPgCredential>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use serde::Serialize as _;
+    let redacted = pg.as_ref().map(|pg| shared_types::StartPgCredential {
+        username: pg.username.clone(),
+        password: String::new(),
+    });
+    redacted.serialize(serializer)
 }
 
 #[derive(Debug)]
@@ -260,9 +296,12 @@ impl ServerState {
         let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             control_token: std::sync::OnceLock::new(),
+            execution_project: std::sync::OnceLock::new(),
+            owner_execution_workspace: std::sync::OnceLock::new(),
             runtime_kernel: std::sync::OnceLock::new(),
             kernel_required: std::sync::atomic::AtomicBool::new(false),
-            runtime_recovery_hold: std::sync::atomic::AtomicBool::new(false),
+            runtime_recovery_hold: std::sync::atomic::AtomicU8::new(0),
+            credential_recovery_operation: std::sync::Mutex::new(None),
             pending_dev_profile: std::sync::Mutex::new(None),
             pending_run_config: std::sync::Mutex::new(None),
             control_tx,
@@ -287,7 +326,7 @@ impl ServerState {
             deploy_status: RwLock::new(DeployStatus {
                 phase: AppCliDeployPhase::Idle,
                 protocol_version: DEPLOY_PROTOCOL,
-                capabilities: vec!["progress_v1".into()],
+                capabilities: vec!["progress_v1".into(), "deployment_run_pg".into()],
                 ..Default::default()
             }),
             deploy_tx,
@@ -335,13 +374,196 @@ impl ServerState {
     /// V04：终态持久化失败（结果未知）——挂起 server 写入口与 ready。
     pub(crate) fn begin_runtime_recovery_hold(&self) {
         self.runtime_recovery_hold
-            .store(true, std::sync::atomic::Ordering::Release);
+            .fetch_or(2, std::sync::atomic::Ordering::AcqRel);
         self.ready.set_ready(false);
     }
 
     pub(crate) fn runtime_recovery_hold_active(&self) -> bool {
         self.runtime_recovery_hold
             .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    }
+
+    fn credentials_only_hold(&self) -> bool {
+        self.runtime_recovery_hold
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 1
+    }
+
+    fn begin_credentials_hold(&self) {
+        self.runtime_recovery_hold
+            .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+        self.ready.set_ready(false);
+    }
+
+    fn consume_credentials_hold(&self, operation_id: &str) -> Result<()> {
+        let mut owner = self
+            .credential_recovery_operation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("credential recovery identity lock poisoned"))?;
+        anyhow::ensure!(owner.is_none(), "credential recovery is already executing");
+        self.runtime_recovery_hold
+            .compare_exchange(
+                1,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| anyhow::anyhow!("runtime recovery changed during credential admission"))?;
+        *owner = Some(operation_id.to_owned());
+        Ok(())
+    }
+
+    /// A failure restores only this request's credential fence. Stop and late
+    /// callbacks belonging to other operations cannot consume its identity.
+    fn settle_credential_recovery(&self, operation_id: &str, running: bool) {
+        let Ok(mut owner) = self.credential_recovery_operation.lock() else {
+            self.begin_runtime_recovery_hold();
+            tracing::error!("credential recovery identity lock poisoned");
+            return;
+        };
+        if owner.as_deref() == Some(operation_id) {
+            if !running {
+                self.begin_credentials_hold();
+            }
+            *owner = None;
+        }
+    }
+
+    /// Called only by the execution loop after all business processes stopped.
+    /// A legacy deployment has no kernel terminal callback to restore its fence.
+    fn restore_credentials_after_stop(&self) {
+        let Ok(mut owner) = self.credential_recovery_operation.lock() else {
+            self.begin_runtime_recovery_hold();
+            tracing::error!("credential recovery identity lock poisoned during stop");
+            return;
+        };
+        if owner.take().is_some() {
+            self.begin_credentials_hold();
+        }
+    }
+
+    /// A fresh explicit operation may supply missing startup credentials
+    /// only after verifying the previously confirmed artifact. This is not reconciliation
+    /// of an interrupted operation (the kernel retains that separate fence).
+    pub(crate) fn can_supply_run_credentials(
+        &self,
+        pg: Option<&shared_types::StartPgCredential>,
+        source_only: bool,
+    ) -> Result<bool> {
+        if !self.credentials_only_hold()
+            || self
+                .shutdown_unconfirmed
+                .load(std::sync::atomic::Ordering::Acquire)
+            || !pg.is_some_and(|pg| !pg.username.trim().is_empty() && !pg.password.is_empty())
+        {
+            return Ok(false);
+        }
+        let receipt = self
+            .journal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+            .as_ref()
+            .and_then(|journal| journal.receipt.clone())
+            .context("confirmed deployment journal missing")?;
+        let confirmed_boundary = matches!(
+            receipt.boundary,
+            Boundary::Active | Boundary::RestoredActive | Boundary::StartupFailed
+        ) || (receipt.boundary == Boundary::Preparing
+            && receipt.operation.phase == AppCliDeployPhase::Failed);
+        if receipt.generation != self.generation || !confirmed_boundary {
+            return Ok(false);
+        }
+        let active = receipt
+            .active
+            .context("confirmed active artifact missing")?;
+        let Some(request) = active.request.as_ref() else {
+            return Ok(false);
+        };
+        if source_only && request.execution_target != Some(ExecutionTarget::Source) {
+            return Ok(false);
+        }
+        let workspace = if let Some(target) = request.execution_target {
+            let project = self
+                .execution_project
+                .get()
+                .context("owner project missing")?;
+            resolved_execution_workspace(project, Some(target), self)?
+        } else {
+            // Legacy URL deployment used the owner's configured directory.
+            // Never infer missing local-artifact provenance from this fallback.
+            if request.local_path.is_some()
+                || !(request.url.starts_with("https://") || request.url.starts_with("http://"))
+            {
+                return Ok(false);
+            }
+            self.owner_execution_workspace
+                .get()
+                .context("owner execution workspace missing")?
+                .clone()
+        };
+        crate::migration_journal::require_confirmed_migrations(&workspace)?;
+        let release = crate::manifest::read_release_lock(&workspace)?;
+        Ok(release.release_id == active.artifact_release_id)
+    }
+
+    pub(crate) async fn recovery_view(&self) -> Result<shared_types::RuntimeRecoveryView> {
+        let kernel = self
+            .runtime_kernel()
+            .context("runtime kernel is unavailable")?;
+        let status = kernel.status().await?;
+        let journal = self
+            .journal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?;
+        let saved_receipt = journal.as_ref().and_then(|journal| journal.receipt.clone());
+        drop(journal);
+        let receipt = saved_receipt.as_ref();
+        let boundary = receipt.map(|receipt| {
+            match receipt.boundary {
+                Boundary::Preparing => "preparing",
+                Boundary::Switching => "switching",
+                Boundary::Activated => "activated",
+                Boundary::Active => "active",
+                Boundary::RestoredActive => "restored_active",
+                Boundary::StartupFailed => "startup_failed",
+                Boundary::Failed => "failed",
+            }
+            .to_owned()
+        });
+        let migrations = receipt
+            .filter(|receipt| receipt.generation == self.generation)
+            .and_then(|receipt| receipt.active.as_ref())
+            .and_then(|active| active.request.as_ref())
+            .and_then(|request| request.execution_target)
+            .map(|target| {
+                let workspace = execution_workspace(
+                    std::path::Path::new(&kernel.identity().source_root),
+                    Some(target),
+                );
+                match crate::migration_journal::inspect_migrations(&workspace) {
+                    Ok(true) => shared_types::RuntimeMigrationRecoveryState::Confirmed,
+                    Ok(false) => shared_types::RuntimeMigrationRecoveryState::Unconfirmed,
+                    Err(_) => shared_types::RuntimeMigrationRecoveryState::Unreadable,
+                }
+            })
+            .unwrap_or_default();
+        Ok(shared_types::RuntimeRecoveryView {
+            runtime_instance_id: status.runtime_instance_id,
+            deployment_generation_id: self.generation.clone(),
+            revision: status.revision,
+            kernel_protected: status.recovery_protection,
+            owner_protected: self.runtime_recovery_hold_active(),
+            operation_id: receipt.map(|receipt| receipt.operation.operation_id.clone()),
+            boundary,
+            generation_matches: receipt.map(|receipt| receipt.generation == self.generation),
+            credentials_required: receipt
+                .and_then(|receipt| receipt.active.as_ref())
+                .and_then(|active| active.request.as_ref())
+                .and_then(|request| request.run_pg.as_ref())
+                .is_some_and(|pg| pg.password.is_empty()),
+            migrations,
+        })
     }
 
     pub(crate) fn kernel_unavailable(&self) -> bool {
@@ -406,6 +628,10 @@ impl ServerState {
         let Some(kernel) = self.runtime_kernel() else {
             return Ok(());
         };
+        if state != shared_types::RuntimeOperationState::Succeeded {
+            // Restore before kernel.finish can release admission to another request.
+            self.settle_credential_recovery(operation_id, false);
+        }
         if let Err(persist_error) = kernel.finish(operation_id, state, error, None, 0).await {
             let message = format!(
                 "runtime operation terminal persist failed (op {operation_id}): {persist_error:#}"
@@ -745,6 +971,11 @@ impl ServerState {
                 "server is shutting down; deployment was not accepted".into(),
             ));
         }
+        let supplying_credentials = self
+            .can_supply_run_credentials(req.run_pg.as_ref(), false)
+            .map_err(|error| {
+                AdmissionError::Busy(format!("verify deployment credential recovery: {error:#}"))
+            })?;
         // B05：恢复保护约束**所有**写入口——旧部署链不得绕过（损坏记录/
         // 未终态操作/部分提交围栏期间，legacy 受理同样拒绝；显式部署也
         // 必须等操作员裁决恢复后进行）。
@@ -764,7 +995,7 @@ impl ServerState {
                         .into(),
                 ));
             }
-            _ if self.runtime_recovery_hold_active() => {
+            _ if self.runtime_recovery_hold_active() && !supplying_credentials => {
                 // V04：运行操作终态持久化失败（结果未知）——身份保留中，
                 // 新部署不得受理，直至重启恢复
                 return Err(AdmissionError::Busy(
@@ -782,6 +1013,17 @@ impl ServerState {
                 phase.as_str()
             )));
         }
+        // Keep the shared admission lock throughout journal persistence and
+        // dispatch. Only the exact credentials-only state can be consumed;
+        // a concurrent uncertain writer must continue to block admission.
+        if supplying_credentials {
+            self.consume_credentials_hold(&operation_id)
+                .map_err(|error| AdmissionError::Busy(format!("{error:#}")))?;
+        }
+        let mut credentials = CredentialAdmission {
+            state: self,
+            operation_id: supplying_credentials.then(|| operation_id.clone()),
+        };
         let previous = self.deploy_status();
         let operation = shared_types::AppDeploymentOperation {
             operation_id,
@@ -834,7 +1076,7 @@ impl ServerState {
             release_id: previous.release_id.clone(),
             request_release_id: Some(req.release_id.clone()),
             error: None,
-            capabilities: vec!["progress_v1".into()],
+            capabilities: vec!["progress_v1".into(), "deployment_run_pg".into()],
             progress: None,
         };
         *self
@@ -856,6 +1098,7 @@ impl ServerState {
             }
             return Err("server loop exited".into());
         }
+        credentials.operation_id = None;
         Ok(())
     }
 
@@ -928,7 +1171,7 @@ impl ServerState {
             release_id: previous.release_id,
             request_release_id: Some(request.release_id.clone()),
             error: None,
-            capabilities: vec!["progress_v1".into()],
+            capabilities: vec!["progress_v1".into(), "deployment_run_pg".into()],
             progress: None,
         };
         Ok(())
@@ -1004,6 +1247,9 @@ impl ServerState {
             .lock()
             .map_err(|_| anyhow::anyhow!("deployment admission lock poisoned"))?;
         let mut snapshot = self.deploy_status();
+        if let Some(operation) = snapshot.operation.as_ref() {
+            self.settle_credential_recovery(&operation.operation_id, false);
+        }
         snapshot.phase = AppCliDeployPhase::Failed;
         snapshot.error = Some(error.clone());
         if let Some(operation) = snapshot.operation.as_mut() {
@@ -1081,6 +1327,28 @@ impl ServerState {
         Ok(())
     }
 
+    fn record_prepared_artifact(&self, artifact_release_id: String) -> Result<()> {
+        anyhow::ensure!(
+            !artifact_release_id.is_empty(),
+            "prepared artifact identity is empty"
+        );
+        let mut status = self
+            .deploy_status
+            .write()
+            .map_err(|_| anyhow::anyhow!("deployment status lock poisoned"))?;
+        let operation = status
+            .operation
+            .as_mut()
+            .context("prepared operation missing")?;
+        anyhow::ensure!(
+            operation.phase != AppCliDeployPhase::Failed,
+            "cannot prepare an already failed operation"
+        );
+        // Do not replace self.release or journal.active before activation.
+        operation.artifact_release_id = Some(artifact_release_id);
+        Ok(())
+    }
+
     fn complete_running(&self) -> Result<()> {
         // An earlier prepare failure is still the result of that attempt; merely
         // restoring service health cannot turn it into a successful deployment.
@@ -1093,6 +1361,9 @@ impl ServerState {
             self.persist_boundary(Boundary::Active)?;
         } else {
             self.persist_boundary(Boundary::RestoredActive)?;
+        }
+        if !failed && let Some(operation) = self.deploy_status().operation {
+            self.settle_credential_recovery(&operation.operation_id, true);
         }
         self.set_phase(ServerPhase::Running);
         Ok(())
@@ -1501,6 +1772,141 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
                 if !recovered.is_empty() {
                     tracing::warn!("runtime operations held for recovery: {:?}", recovered);
                 }
+                let mut saved = state
+                    .journal
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+                    .as_ref()
+                    .and_then(|journal| journal.receipt.clone());
+                if let Some(receipt) = saved
+                    .as_ref()
+                    .filter(|receipt| receipt.boundary == Boundary::Switching)
+                {
+                    let reconciled = (|| -> Result<Receipt> {
+                        anyhow::ensure!(
+                            receipt.generation == state.generation,
+                            "switch generation mismatch"
+                        );
+                        let expected = receipt
+                            .operation
+                            .artifact_release_id
+                            .as_deref()
+                            .context("switch intent has no target artifact identity")?;
+                        let workspace = resolved_execution_workspace(
+                            &args.workspace,
+                            receipt.request.execution_target,
+                            &state,
+                        )?;
+                        if !workspace.try_exists()? {
+                            let active = receipt
+                                .active
+                                .as_ref()
+                                .context("previous active version missing")?;
+                            anyhow::ensure!(
+                                receipt.operation.recovery.is_none()
+                                    && active
+                                        .request
+                                        .as_ref()
+                                        .is_some_and(|request| request.execution_target
+                                            == receipt.request.execution_target),
+                                "previous execution binding is not confirmed for restoration"
+                            );
+                            crate::deploy::restore_previous_generation(
+                                &workspace,
+                                &active.artifact_release_id,
+                            )?;
+                        }
+                        let release = crate::manifest::read_release_lock(&workspace)?;
+                        crate::migration_journal::require_confirmed_migrations(&workspace)?;
+                        let mut journal = state
+                            .journal
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?;
+                        let journal = journal.as_mut().context("switch journal missing")?;
+                        if release.release_id == expected {
+                            journal.confirm_switched_artifact(receipt, expected)
+                        } else {
+                            journal.confirm_preserved_active(receipt, &release.release_id)
+                        }
+                    })();
+                    match reconciled {
+                        Ok(receipt) => saved = Some(receipt),
+                        Err(error) => {
+                            state.begin_runtime_recovery_hold();
+                            tracing::error!(%error, "Switch outcome remains unconfirmed");
+                        }
+                    }
+                }
+                if let Some(mut receipt) = saved
+                    && matches!(
+                        receipt.boundary,
+                        Boundary::StartupFailed
+                            | Boundary::Active
+                            | Boundary::Preparing
+                            | Boundary::Activated
+                    )
+                {
+                    let evidence = (|| -> Result<()> {
+                        // Preparing is persisted before any activation. First
+                        // deployment may legitimately have no old active code.
+                        if receipt.boundary == Boundary::Preparing && receipt.active.is_none() {
+                            return Ok(());
+                        }
+                        let active = receipt.active.as_ref().context("active artifact missing")?;
+                        let target = active
+                            .request
+                            .as_ref()
+                            .and_then(|request| request.execution_target);
+                        let workspace =
+                            resolved_execution_workspace(&args.workspace, target, &state)?;
+                        crate::migration_journal::require_confirmed_migrations(&workspace)?;
+                        let release = crate::manifest::read_release_lock(&workspace)?;
+                        anyhow::ensure!(
+                            release.release_id == active.artifact_release_id,
+                            "startup recovery artifact changed"
+                        );
+                        Ok(())
+                    })();
+                    match evidence {
+                        Ok(()) => {
+                            if receipt.boundary == Boundary::Activated {
+                                let eligible = match receipt.request.runtime_operation_id.as_ref() {
+                                    Some(id) => kernel.get(id).await?.is_some_and(|operation|
+                                        operation.state == shared_types::RuntimeOperationState::RecoveryRequired),
+                                    None => true,
+                                };
+                                if eligible && receipt.generation == state.generation {
+                                    let normalized = state
+                                        .journal
+                                        .lock()
+                                        .map_err(|_| {
+                                            anyhow::anyhow!("deployment journal lock poisoned")
+                                        })?
+                                        .as_mut()
+                                        .context("activation journal missing")?
+                                        .confirm_interrupted_activation(&receipt);
+                                    match normalized {
+                                        Ok(updated) => receipt = updated,
+                                        Err(error) => {
+                                            state.begin_runtime_recovery_hold();
+                                            tracing::error!(%error, "Activation reconciliation could not be persisted");
+                                        }
+                                    }
+                                }
+                            }
+                            if let Err(error) = kernel.reconcile_quiesced_operation(&receipt).await
+                            {
+                                tracing::error!(%error, "Quiesced operation reconciliation remains blocked");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "Quiesced operation evidence is incomplete")
+                        }
+                    }
+                }
+                if let Err(error) = kernel.reconcile_quiesced_stop().await {
+                    tracing::error!(%error, "Persisted stop reconciliation remains blocked");
+                }
                 if kernel.recovery_protection_active() {
                     // B05：恢复保护（含损坏记录 blocked）压制自动启动——
                     // 不撤销已受理的操作记录（可查询），业务保持 Idle 直至
@@ -1582,7 +1988,10 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
                 if state.runtime_recovery_hold_active() {
                     // Unknown identity/boundary is not a failed operation of
                     // this owner; preserve its original durable evidence.
-                    state.begin_failure(format!("startup recovery required: {error:#}"), true);
+                    state.begin_failure(
+                        format!("startup recovery required: {error:#}"),
+                        !state.credentials_only_hold(),
+                    );
                 } else if let Err(persist_error) =
                     state.fail_operation(format!("deployment startup: {error:#}"), Boundary::Failed)
                 {
@@ -1802,122 +2211,234 @@ async fn assemble_runtime_kernel(
         state.generation.clone(),
     )?;
     let dispatch_state = state.clone();
-    let dispatch_workspace = args.workspace.clone();
-    let dispatch = Box::new(move |action: DispatchAction| match action {
-        DispatchAction::DeployLocalArtifact {
-            operation_id,
-            artifact_id,
-            sha256,
-            pg,
-        } => {
-            // R03：登记的本地构建制品——共享卷 builds/ 目录 zip 由 owner 侧
-            // 部署准备链校验/解压/激活（不经网络下载；artifact_id 已过
-            // identifier 白名单，路径拼接无穿越面）
-            let settle_state = dispatch_state.clone();
-            if settle_state
+    let dispatch_workspace = runtime_state_layout::resolve_project_origin(&args.workspace)
+        .context("resolve owner execution project")?;
+    state
+        .execution_project
+        .set(dispatch_workspace.clone())
+        .map_err(|_| anyhow::anyhow!("owner execution project was already initialized"))?;
+    let owner_workspace = args.workspace.clone();
+    state
+        .owner_execution_workspace
+        .set(owner_workspace.clone())
+        .map_err(|_| anyhow::anyhow!("owner execution workspace was already initialized"))?;
+    let dispatch = Box::new(move |action: DispatchAction| {
+        let executing_id = match &action {
+            DispatchAction::OrchestrateSource { operation_id, .. }
+            | DispatchAction::DeployLocalArtifact { operation_id, .. }
+            | DispatchAction::DeployArtifact { operation_id, .. } => Some(operation_id),
+            _ => None,
+        };
+        if let Some(id) = executing_id
+            && dispatch_state
                 .runtime_kernel()
-                .is_some_and(|kernel| kernel.is_cancelled(&operation_id))
-            {
-                tokio::spawn(async move {
-                    settle_state
-                        .settle_cancelled_before_execution(&operation_id)
-                        .await;
-                });
-                return;
+                .is_some_and(|kernel| kernel.is_cancelled(id))
+        {
+            let state = dispatch_state.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                state.settle_cancelled_before_execution(&id).await;
+            });
+            return;
+        }
+        let credential_recovery = match &action {
+            DispatchAction::OrchestrateSource { pg, .. } => {
+                dispatch_state.can_supply_run_credentials(pg.as_ref(), true)
             }
-            let local_path = Some(
-                runtime_state_layout::canonical_project_root(&dispatch_workspace)
-                    .join("builds")
-                    .join(format!("workspace-package-{artifact_id}.zip")),
-            );
-            if let Some(path) = &local_path
-                && !path.exists()
-            {
-                tracing::error!(
-                    "runtime dispatch: registered artifact {artifact_id} not found at {}",
-                    path.display()
+            DispatchAction::DeployArtifact { pg, .. }
+            | DispatchAction::DeployLocalArtifact { pg, .. } => {
+                dispatch_state.can_supply_run_credentials(pg.as_ref(), false)
+            }
+            DispatchAction::StopBusiness { .. } => Ok(false),
+        };
+        let supplied_credentials = match credential_recovery {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                tracing::warn!(%error, "Credential recovery validation failed at dispatch");
+                false
+            }
+        };
+        if supplied_credentials && let Some(operation_id) = executing_id {
+            // Kernel admission checked instance/revision and its separate
+            // recovery fence. Never clear a concurrent unknown-state hold.
+            if let Err(error) = dispatch_state.consume_credentials_hold(operation_id) {
+                dispatch_state.begin_runtime_recovery_hold();
+                tracing::warn!(%error, "Credential recovery handoff failed");
+            }
+        }
+        if let Some(id) = executing_id
+            && dispatch_state.runtime_recovery_hold_active()
+        {
+            // The loop remains alive for Stop, but must not turn missing
+            // startup credentials or an uncertain journal into permission to
+            // run a different request with environment defaults.
+            let state = dispatch_state.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = state
+                    .finish_runtime_operation_by_id(
+                        &id,
+                        shared_types::RuntimeOperationState::RecoveryRequired,
+                        Some((
+                            shared_types::ERR_RECOVERY_REQUIRED.into(),
+                            "runtime recovery must be resolved before starting business".into(),
+                        )),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "Preserve blocked runtime dispatch");
+                }
+            });
+            return;
+        }
+        // Validate before sending a control signal that may stop the old services.
+        let source_operation = match &action {
+            DispatchAction::OrchestrateSource { operation_id, .. }
+            | DispatchAction::DeployLocalArtifact { operation_id, .. } => Some(operation_id),
+            _ => None,
+        };
+        if let Some(operation_id) = source_operation
+            && let Err(error) = resolved_execution_workspace(
+                &owner_workspace,
+                Some(ExecutionTarget::Source),
+                &dispatch_state,
+            )
+        {
+            let state = dispatch_state.clone();
+            let id = operation_id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = state
+                    .finish_runtime_operation_by_id(
+                        &id,
+                        shared_types::RuntimeOperationState::Failed,
+                        Some((
+                            shared_types::ERR_BACKEND_ERROR.into(),
+                            format!("resolve execution project: {error:#}"),
+                        )),
+                    )
+                    .await
+                {
+                    hold_unconfirmed(&state, format!("persist project rejection: {error:#}")).await;
+                }
+            });
+            return;
+        }
+        match action {
+            DispatchAction::DeployLocalArtifact {
+                operation_id,
+                artifact_id,
+                sha256,
+                pg,
+            } => {
+                // R03：登记的本地构建制品——共享卷 builds/ 目录 zip 由 owner 侧
+                // 部署准备链校验/解压/激活（不经网络下载；artifact_id 已过
+                // identifier 白名单，路径拼接无穿越面）
+                let settle_state = dispatch_state.clone();
+                if settle_state
+                    .runtime_kernel()
+                    .is_some_and(|kernel| kernel.is_cancelled(&operation_id))
+                {
+                    tokio::spawn(async move {
+                        settle_state
+                            .settle_cancelled_before_execution(&operation_id)
+                            .await;
+                    });
+                    return;
+                }
+                let local_path = Some(
+                    dispatch_workspace
+                        .join("builds")
+                        .join(format!("workspace-package-{artifact_id}.zip")),
                 );
-            }
-            let marker = format!("runtime-{operation_id}");
-            let request = DeployRequest {
-                runtime_operation_id: Some(operation_id.clone()),
-                url: format!("artifact://{artifact_id}"),
-                release_id: marker,
-                sha256,
-                local_path,
-                execution_target: Some(ExecutionTarget::ProjectRun),
+                if let Some(path) = &local_path
+                    && !path.exists()
+                {
+                    tracing::error!(
+                        "runtime dispatch: registered artifact {artifact_id} not found at {}",
+                        path.display()
+                    );
+                }
+                let marker = format!("runtime-{operation_id}");
+                let request = DeployRequest {
+                    runtime_operation_id: Some(operation_id.clone()),
+                    url: format!("artifact://{artifact_id}"),
+                    release_id: marker,
+                    sha256,
+                    local_path,
+                    execution_target: Some(ExecutionTarget::ProjectRun),
 
-                run_pg: pg,
-            };
-            if dispatch_state.deploy_tx.send(request).is_err() {
-                tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
+                    run_pg: pg,
+                };
+                if dispatch_state.deploy_tx.send(request).is_err() {
+                    tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
+                }
             }
-        }
-        DispatchAction::DeployArtifact {
-            operation_id,
-            url,
-            sha256,
-            pg,
-        } => {
-            // R03 取消检查点：排队期间被取消 → 不进部署链（dispatch 是同步
-            // 闭包，终态收束经 spawn 落盘）
-            let settle_state = dispatch_state.clone();
-            if settle_state
-                .runtime_kernel()
-                .is_some_and(|kernel| kernel.is_cancelled(&operation_id))
-            {
-                tokio::spawn(async move {
-                    settle_state
-                        .settle_cancelled_before_execution(&operation_id)
-                        .await;
-                });
-                return;
-            }
-            // release_id 语义 = 调用方请求标识（request_release_id 驱动等待方
-            // 确认）；以 runtime 操作 ID 承载，形成 API 侧可观察的关联。
-            let marker = format!("runtime-{operation_id}");
-            let request = DeployRequest {
-                runtime_operation_id: Some(operation_id.clone()),
+            DispatchAction::DeployArtifact {
+                operation_id,
                 url,
-                release_id: marker,
                 sha256,
-                local_path: None,
-                execution_target: None,
+                pg,
+            } => {
+                // R03 取消检查点：排队期间被取消 → 不进部署链（dispatch 是同步
+                // 闭包，终态收束经 spawn 落盘）
+                let settle_state = dispatch_state.clone();
+                if settle_state
+                    .runtime_kernel()
+                    .is_some_and(|kernel| kernel.is_cancelled(&operation_id))
+                {
+                    tokio::spawn(async move {
+                        settle_state
+                            .settle_cancelled_before_execution(&operation_id)
+                            .await;
+                    });
+                    return;
+                }
+                // release_id 语义 = 调用方请求标识（request_release_id 驱动等待方
+                // 确认）；以 runtime 操作 ID 承载，形成 API 侧可观察的关联。
+                let marker = format!("runtime-{operation_id}");
+                let request = DeployRequest {
+                    runtime_operation_id: Some(operation_id.clone()),
+                    url,
+                    release_id: marker,
+                    sha256,
+                    local_path: None,
+                    execution_target: None,
 
-                run_pg: pg,
-            };
-            if dispatch_state.deploy_tx.send(request).is_err() {
-                tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
+                    run_pg: pg,
+                };
+                if dispatch_state.deploy_tx.send(request).is_err() {
+                    tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
+                }
             }
-        }
-        DispatchAction::OrchestrateSource {
-            operation_id,
-            dev_profile,
-            pg,
-        } => {
-            if dispatch_state
-                .control_tx
-                .send(ControlSignal::OrchestrateSource {
-                    operation_id: operation_id.clone(),
-                    dev_profile,
-                    pg,
-                })
-                .is_err()
-            {
-                tracing::error!("runtime dispatch: control channel closed ({operation_id})");
+            DispatchAction::OrchestrateSource {
+                operation_id,
+                dev_profile,
+                pg,
+            } => {
+                if dispatch_state
+                    .control_tx
+                    .send(ControlSignal::OrchestrateSource {
+                        operation_id: operation_id.clone(),
+                        dev_profile,
+                        pg,
+                    })
+                    .is_err()
+                {
+                    tracing::error!("runtime dispatch: control channel closed ({operation_id})");
+                }
             }
-        }
-        DispatchAction::StopBusiness { operation_id } => {
-            // R01：Stop 在 active 期间受理（意图屏障），但**不抢占执行身份**——
-            // 主循环在下一个边界消费本信号并按此 ID 显式执行/收束停止操作。
-            if dispatch_state
-                .control_tx
-                .send(ControlSignal::StopBusiness {
-                    operation_id: operation_id.clone(),
-                })
-                .is_err()
-            {
-                tracing::error!("runtime dispatch: control channel closed ({operation_id})");
+            DispatchAction::StopBusiness { operation_id } => {
+                // R01：Stop 在 active 期间受理（意图屏障），但**不抢占执行身份**——
+                // 主循环在下一个边界消费本信号并按此 ID 显式执行/收束停止操作。
+                if dispatch_state
+                    .control_tx
+                    .send(ControlSignal::StopBusiness {
+                        operation_id: operation_id.clone(),
+                    })
+                    .is_err()
+                {
+                    tracing::error!("runtime dispatch: control channel closed ({operation_id})");
+                }
             }
         }
     });
@@ -1964,10 +2485,119 @@ fn execution_workspace(
     }
 }
 
+/// Resolve recorded local build provenance without relocating the owner's
+/// journal, lock or token. A corrupt marker must never select another workspace.
+fn resolved_execution_workspace(
+    owner: &std::path::Path,
+    target: Option<ExecutionTarget>,
+    state: &ServerState,
+) -> Result<std::path::PathBuf> {
+    if target.is_none() {
+        return Ok(owner.to_path_buf());
+    }
+    let project = runtime_state_layout::resolve_project_origin(owner)
+        .context("resolve execution project origin")?;
+    if let Some(expected) = state.execution_project.get() {
+        anyhow::ensure!(
+            &project == expected,
+            "owner project origin changed after initialization"
+        );
+    }
+    Ok(execution_workspace(&project, target))
+}
+
 /// Restore the confirmed execution directory under the existing owner identity.
 /// Unknown journal identity or target remains protected; credential updates do
 /// not create a new owner or authorize replacement of this journal.
 fn restored_runtime_args(args: &RuntimeArgs, state: &ServerState) -> Result<RuntimeArgs> {
+    restored_runtime_args_inner(args, state, true)
+}
+
+/// Upgrade a legacy directory binding only under the existing owner journal
+/// lease and only when a unique directory contains the confirmed artifact.
+fn recover_legacy_execution_target(owner: &std::path::Path, state: &ServerState) -> Result<()> {
+    let mut guard = state
+        .journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?;
+    let Some(journal) = guard.as_mut() else {
+        return Ok(());
+    };
+    let Some(mut receipt) = journal.receipt.clone() else {
+        return Ok(());
+    };
+    if receipt.generation != state.generation
+        || !matches!(
+            receipt.boundary,
+            Boundary::Active
+                | Boundary::RestoredActive
+                | Boundary::StartupFailed
+                | Boundary::Preparing
+        )
+    {
+        return Ok(());
+    }
+    let Some(active) = receipt.active.as_mut() else {
+        return Ok(());
+    };
+    let Some(request) = active.request.as_mut() else {
+        return Ok(());
+    };
+    if request.execution_target.is_some() || request.local_path.is_none() {
+        return Ok(());
+    }
+    let project = runtime_state_layout::resolve_project_origin(owner)?;
+    if let Some(expected) = state.execution_project.get() {
+        anyhow::ensure!(
+            &project == expected,
+            "owner project changed during legacy recovery"
+        );
+    }
+    let mut selected = None;
+    for target in [ExecutionTarget::Source, ExecutionTarget::ProjectRun] {
+        let workspace = execution_workspace(&project, Some(target));
+        if !workspace.join("release.lock.toml").try_exists()? {
+            continue;
+        }
+        let release = crate::manifest::read_release_lock(&workspace)?;
+        if release.release_id != active.artifact_release_id {
+            continue;
+        }
+        anyhow::ensure!(
+            selected.is_none(),
+            "multiple directories contain the legacy active artifact; explicit directory reconciliation required"
+        );
+        selected = Some(target);
+    }
+    let target = selected.context("legacy active artifact directory is missing")?;
+    request.execution_target = Some(target);
+    // Preparing/RestoredActive may point to a different failed attempt. Only
+    // update its request when it is actually the same active request.
+    if receipt.request.runtime_operation_id == request.runtime_operation_id
+        && receipt.request.release_id == request.release_id
+        && receipt.request.url == request.url
+        && receipt.request.local_path == request.local_path
+    {
+        receipt.request.execution_target = Some(target);
+    }
+    journal
+        .write(receipt)
+        .context("persist recovered execution directory")
+}
+
+/// Resolving a confirmed directory is also needed by the idle control loop.
+/// Missing redacted credentials must suppress automatic business startup, not
+/// prevent the owner from consuming Stop. This does not clear recovery holds
+/// or authorize deployment; admission retains its existing checks.
+fn restored_runtime_args_inner(
+    args: &RuntimeArgs,
+    state: &ServerState,
+    require_run_credentials: bool,
+) -> Result<RuntimeArgs> {
+    if let Err(error) = recover_legacy_execution_target(&args.workspace, state) {
+        state.begin_runtime_recovery_hold();
+        return Err(error);
+    }
     let receipt = state
         .journal
         .lock()
@@ -1992,6 +2622,18 @@ fn restored_runtime_args(args: &RuntimeArgs, state: &ServerState) -> Result<Runt
             .as_ref()
             .and_then(|active| active.request.as_ref())
         {
+            if require_run_credentials
+                && request
+                    .run_pg
+                    .as_ref()
+                    .is_some_and(|pg| pg.password.is_empty())
+                && !crate::deploy::deploy_requested()
+            {
+                state.begin_credentials_hold();
+                anyhow::bail!(
+                    "confirmed runtime requires explicit PostgreSQL credentials before restarting business"
+                );
+            }
             // Old local-artifact receipts without a target cannot establish that
             // source/.run was selected safely. Keep recovery protection.
             if request.local_path.is_some() && request.execution_target.is_none() {
@@ -2000,7 +2642,8 @@ fn restored_runtime_args(args: &RuntimeArgs, state: &ServerState) -> Result<Runt
                     "local artifact journal has no confirmed execution target; explicit recovery required"
                 );
             }
-            restored.workspace = execution_workspace(&args.workspace, request.execution_target);
+            restored.workspace =
+                resolved_execution_workspace(&args.workspace, request.execution_target, state)?;
             if let Some(target) = request.execution_target {
                 state.set_pending_dev_profile(target == ExecutionTarget::Source);
             }
@@ -2013,12 +2656,11 @@ async fn initialize_startup(
     args: &RuntimeArgs,
     state: &ServerState,
 ) -> Result<Option<InitialAction>> {
-    let restored = restored_runtime_args(args, state)?;
-    let args = &restored;
-    if let Err(error) = crate::migration_journal::require_confirmed_migrations(&args.workspace) {
-        state.begin_runtime_recovery_hold();
-        return Err(error).context("database migration requires reconciliation");
-    }
+    // Resolve the owner directory without demanding redacted startup secrets.
+    // An explicitly stopped owner does not execute migrations or business code;
+    // missing old credentials must not latch a hold that rejects the next
+    // explicit operation carrying fresh credentials.
+    let stopped_args = restored_runtime_args_inner(args, state, false)?;
     // Decide automatic recovery before generating Switching. Stopped must not
     // leave a false interrupted-switch journal when no business was started.
     if !crate::deploy::deploy_requested()
@@ -2030,6 +2672,12 @@ async fn initialize_startup(
     {
         state.set_phase(ServerPhase::Idle);
         return Ok(None);
+    }
+    let restored = restored_runtime_args(&stopped_args, state)?;
+    let args = &restored;
+    if let Err(error) = crate::migration_journal::require_confirmed_migrations(&args.workspace) {
+        state.begin_runtime_recovery_hold();
+        return Err(error).context("database migration requires reconciliation");
     }
     if crate::deploy::deploy_requested() {
         let generation = std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
@@ -2063,7 +2711,8 @@ async fn initialize_startup(
         .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
         .as_ref()
         .context("deployment journal missing")?
-        .resume(&state.generation)?;
+        .resume(&state.generation)
+        .inspect_err(|_| state.begin_runtime_recovery_hold())?;
     if let Some(receipt) = resume {
         let release = crate::manifest::read_release_lock(&args.workspace)?;
         anyhow::ensure!(
@@ -2092,7 +2741,9 @@ async fn initialize_startup(
             )?;
         }
         state.set_release(release);
-        state.persist_boundary(Boundary::Switching)?;
+        // Reusing the confirmed artifact does not exchange directories. Keep
+        // its existing boundary so a process stop cannot invent an interrupted
+        // activation. MigrationJournal independently fences unknown SQL work.
         state.set_phase(ServerPhase::Orchestrating);
         return Ok(Some(InitialAction::Existing));
     }
@@ -2180,8 +2831,10 @@ async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> In
                 sha256: None,
                 local_path: None,
                 execution_target: Some(ExecutionTarget::Source),
-
-                run_pg: None,
+                // The journal redacts the password but must retain that this
+                // execution used explicit credentials. Otherwise owner recovery
+                // could silently restart it using stale process environment.
+                run_pg: pg.clone(),
             };
             if let Err(error) = state.record_runtime_deployment(&request) {
                 hold_unconfirmed(state, format!("persist source execution: {error:#}")).await;
@@ -2195,6 +2848,55 @@ async fn settle_control_signal(state: &ServerState, signal: ControlSignal) -> In
             InitialAction::StopBusiness { operation_id }
         }
     }
+}
+
+async fn settle_stopped_startup(
+    args: &RuntimeArgs,
+    state: &ServerState,
+    signal: ControlSignal,
+    reason: String,
+) -> InitialAction {
+    if let Err(error) = crate::migration_journal::require_confirmed_migrations(&args.workspace) {
+        // The process group is stopped, but the database outcome
+        // remains unknown. Preserve startup recovery independently
+        // of the Stop request, which can still confirm compute stop.
+        if let Err(cleanup) = crate::static_hosting::reconcile(&[], &args.workspace, false).await {
+            hold_unconfirmed(state, format!("startup static cleanup: {cleanup:#}")).await;
+            return InitialAction::Settled;
+        }
+        if let Err(persist) = state
+            .finish_current_runtime_operation(
+                shared_types::RuntimeOperationState::RecoveryRequired,
+                Some((
+                    shared_types::ERR_RECOVERY_REQUIRED.into(),
+                    format!("{reason}; migration: {error:#}"),
+                )),
+            )
+            .await
+        {
+            hold_unconfirmed(state, persist).await;
+            return InitialAction::Settled;
+        }
+        state.begin_runtime_recovery_hold();
+        if matches!(&signal, ControlSignal::OrchestrateSource { .. }) {
+            record_uncertain_control(
+                state,
+                &signal,
+                "Migration outcome requires recovery before startup",
+            )
+            .await;
+            return InitialAction::Settled;
+        }
+    } else {
+        finish_interrupted_activation(
+            args,
+            state,
+            reason,
+            shared_types::RuntimeOperationState::Cancelled,
+        )
+        .await;
+    }
+    settle_control_signal(state, signal).await
 }
 
 async fn record_uncertain_control(state: &ServerState, signal: &ControlSignal, error: &str) {
@@ -2232,7 +2934,15 @@ async fn next_prepared(
             hold_unconfirmed(state, format!("persist deployment execution: {error:#}")).await;
             return None;
         }
-        let workspace = execution_workspace(&args.workspace, request.execution_target);
+        let workspace =
+            match resolved_execution_workspace(&args.workspace, request.execution_target, state) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    fail_preparation(state, format!("resolve deployment workspace: {error:#}"))
+                        .await;
+                    continue;
+                }
+            };
         let target = request.execution_target;
         let pg = request.run_pg.clone();
         let state_clone = state.clone();
@@ -2260,10 +2970,8 @@ async fn next_prepared(
                     }
                     continue;
                 }
-                if let Err(error) = state.persist_boundary(Boundary::Switching) {
-                    fail_preparation(state, format!("persist switch: {error:#}")).await;
-                    continue;
-                }
+                // Prepared content is not activated yet. The execution loop
+                // persists Switching after shutdown, immediately before activate.
                 return Some(InitialAction::Prepared(PreparedActivation {
                     prepared,
                     workspace,
@@ -2274,6 +2982,20 @@ async fn next_prepared(
             Ok(None) => match crate::manifest::read_release_lock(&args.workspace) {
                 Ok(release) => {
                     state.set_release(release);
+                    // The artifact cache only proves that files are unchanged.
+                    // Explicit operation credentials still require a business
+                    // restart; publishing Running here would acknowledge a
+                    // configuration that the serving processes never received.
+                    if pg.is_some() {
+                        if let Err(error) = state.complete_stage() {
+                            fail_preparation(state, format!("persist unchanged artifact: {error:#}"))
+                                .await;
+                            continue;
+                        }
+                        state.set_pending_dev_profile(target == Some(ExecutionTarget::Source));
+                        state.set_pending_run_config(pg);
+                        return Some(InitialAction::Existing);
+                    }
                     if let Err(error) = state
                         .complete_stage()
                         .and_then(|()| state.complete_running())
@@ -2344,6 +3066,23 @@ async fn fail_activation(
     state: &ServerState,
     error: String,
 ) -> Option<InitialAction> {
+    finish_interrupted_activation(
+        args,
+        state,
+        error,
+        shared_types::RuntimeOperationState::Failed,
+    )
+    .await
+}
+
+/// The caller has joined the orchestration task and confirmed process cleanup.
+/// Unknown migration or cleanup evidence still takes the recovery branch below.
+async fn finish_interrupted_activation(
+    args: &RuntimeArgs,
+    state: &ServerState,
+    error: String,
+    terminal: shared_types::RuntimeOperationState,
+) -> Option<InitialAction> {
     // R06：先清理、确认后才发布终态——原顺序先记 Failed 再清理，清理未知
     // 时操作身份已被清除，恢复保护无从挂起。清理失败路径经 hold_unconfirmed
     // 以 RecoveryRequired 收束（身份保留至该点），成功路径最后记 Failed。
@@ -2407,7 +3146,7 @@ async fn fail_activation(
     }
     if let Err(settle_error) = state
         .finish_current_runtime_operation(
-            shared_types::RuntimeOperationState::Failed,
+            terminal,
             Some(("ERR_BACKEND_ERROR".to_string(), error.clone())),
         )
         .await
@@ -2525,7 +3264,7 @@ async fn server_loop(
     host: Option<SupervisordHost>,
     first: Option<InitialAction>,
 ) -> Result<()> {
-    let mut active_args = match restored_runtime_args(owner_args, state) {
+    let mut active_args = match restored_runtime_args_inner(owner_args, state, false) {
         Ok(args) => args,
         Err(error) => {
             state.begin_runtime_recovery_hold();
@@ -2613,6 +3352,7 @@ async fn server_loop(
             .await;
             match stopped {
                 Ok(()) => {
+                    state.restore_credentials_after_stop();
                     // V04：先持久化终态再切相位——收束失败（结果未知）不得
                     // 以 Idle 成功面貌继续
                     match state
@@ -2667,8 +3407,18 @@ async fn server_loop(
                         .await;
                     continue;
                 }
-                let workspace =
-                    execution_workspace(&owner_args.workspace, request.execution_target);
+                let workspace = match resolved_execution_workspace(
+                    &owner_args.workspace,
+                    request.execution_target,
+                    state,
+                ) {
+                    Ok(workspace) => workspace,
+                    Err(error) => {
+                        fail_preparation(state, format!("resolve deployment workspace: {error:#}"))
+                            .await;
+                        continue;
+                    }
+                };
                 let target = request.execution_target;
                 let pg = request.run_pg.clone();
                 state.set_phase(ServerPhase::Deploying);
@@ -2683,12 +3433,20 @@ async fn server_loop(
                     .run(workspace.clone(), request, Some(progress_cb))
                     .await
                 {
-                    Ok(prepared) => prepared.map(|prepared| PreparedActivation {
+                    Ok(Some(prepared)) => Some(PreparedActivation {
                         prepared,
                         workspace,
                         target,
                         pg,
                     }),
+                    Ok(None) => {
+                        // A release/hash cache hit skips file activation, not
+                        // this operation's runtime configuration.
+                        args.workspace = workspace;
+                        state.set_pending_dev_profile(target == Some(ExecutionTarget::Source));
+                        state.set_pending_run_config(pg);
+                        None
+                    }
                     Err(error) => {
                         fail_preparation(state, format!("prepare: {error:#}")).await;
                         continue;
@@ -2697,8 +3455,24 @@ async fn server_loop(
             }
             InitialAction::Prepared(prepared) => Some(prepared),
             InitialAction::Source => {
-                args.workspace =
-                    execution_workspace(&owner_args.workspace, Some(ExecutionTarget::Source));
+                args.workspace = match resolved_execution_workspace(
+                    &owner_args.workspace,
+                    Some(ExecutionTarget::Source),
+                    state,
+                ) {
+                    Ok(workspace) => workspace,
+                    Err(error) => {
+                        fail_preparation(state, format!("resolve source workspace: {error:#}"))
+                            .await;
+                        continue;
+                    }
+                };
+                if let Err(error) = crate::manifest::read_release_lock(&args.workspace)
+                    .and_then(|release| state.record_prepared_artifact(release.release_id))
+                {
+                    fail_preparation(state, format!("record source identity: {error:#}")).await;
+                    continue;
+                }
                 // Old services are already confirmed stopped before this action.
                 if let Err(error) = state.persist_boundary(Boundary::Switching) {
                     hold_unconfirmed(state, format!("persist source switch: {error:#}")).await;
@@ -2723,6 +3497,16 @@ async fn server_loop(
             if let Some(id) = state.current_runtime_operation() {
                 state.settle_cancelled_before_execution(&id).await;
             }
+            continue;
+        }
+        if let Some(prepared) = prepared.as_ref()
+            && let Err(error) = prepared
+                .prepared
+                .artifact_release_id()
+                .and_then(|id| state.record_prepared_artifact(id))
+        {
+            pending =
+                fail_activation(args, state, format!("record prepared identity: {error:#}")).await;
             continue;
         }
         if prepared.is_some()
@@ -2784,17 +3568,73 @@ async fn server_loop(
                 ));
                 continue;
             };
-            if let Err(e) = host
-                .orchestrate(
-                    args,
-                    &release,
-                    &runtime_status,
-                    run_migrations,
-                    run_dev_profile,
-                    run_pg,
-                )
-                .await
-            {
+            let orchestration_cancel = state.cancel.child_token();
+            let orchestration = host.orchestrate(
+                args,
+                &release,
+                &runtime_status,
+                run_migrations,
+                run_dev_profile,
+                run_pg,
+                &orchestration_cancel,
+            );
+            tokio::pin!(orchestration);
+            let mut startup_control = state.control_rx.lock().await;
+            let mut startup_signal = None;
+            let outcome = tokio::select! {
+                result = &mut orchestration => result,
+                signal = startup_control.recv() => {
+                    startup_signal = signal;
+                    orchestration_cancel.cancel();
+                    (&mut orchestration).await
+                }
+                () = state.cancel.cancelled() => {
+                    orchestration_cancel.cancel();
+                    (&mut orchestration).await
+                }
+            };
+            drop(startup_control);
+            if let Some(signal) = startup_signal {
+                if let Err(error) = host.stop_all().await {
+                    record_uncertain_control(state, &signal, &format!("startup stop: {error:#}"))
+                        .await;
+                    hold_unconfirmed(state, format!("startup stop: {error:#}")).await;
+                    return Ok(());
+                }
+                if let Err(error) = &outcome
+                    && error
+                        .downcast_ref::<supervisor::ShutdownUnconfirmed>()
+                        .is_some()
+                {
+                    record_uncertain_control(
+                        state,
+                        &signal,
+                        &format!("startup outcome: {error:#}"),
+                    )
+                    .await;
+                    hold_unconfirmed(state, format!("startup outcome: {error:#}")).await;
+                    return Ok(());
+                }
+                let reason = outcome
+                    .err()
+                    .map(|error| format!("startup interrupted: {error:#}"))
+                    .unwrap_or_else(|| "startup interrupted by runtime control".into());
+                pending = Some(settle_stopped_startup(args, state, signal, reason).await);
+                continue;
+            }
+            if state.cancel.is_cancelled() {
+                host.stop_all().await?;
+                if let Err(error) = outcome
+                    && error
+                        .downcast_ref::<supervisor::ShutdownUnconfirmed>()
+                        .is_some()
+                {
+                    state.begin_failure(format!("shutdown RPC outcome: {error:#}"), true);
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            if let Err(e) = outcome {
                 tracing::error!("server: orchestration failed: {e:#}");
                 if let Err(stop_error) = host.stop_all().await {
                     hold_unconfirmed(state, format!("orchestrate: {e:#}; stop: {stop_error:#}"))
@@ -2936,9 +3776,12 @@ async fn server_loop(
             run_pg,
         ));
         let mut sup_joined = false;
-        // 先等编排就绪（Running）；就绪后递进一轮等终态/热部署/信号。
+        // Startup must consume Stop too; waiting only for readiness can leave
+        // an admitted Stop blocked behind a failing service indefinitely.
+        let mut startup_control = state.control_rx.lock().await;
         let next = tokio::select! {
             result = &mut running_rx => {
+                drop(startup_control);
                 if result.is_err() {
                     // The supervisor exited before readiness. Consume its
                     // outcome before reading the next request: otherwise a
@@ -3075,6 +3918,31 @@ async fn server_loop(
                 break next;
                 }
             }
+            signal = startup_control.recv() => {
+                drop(startup_control);
+                state.ready.set_ready(false);
+                cancel.cancel();
+                let stopped = join_supervisor(&mut sup, &mut sup_joined).await;
+                if let Err(error) = &stopped
+                    && (error.downcast_ref::<supervisor::ShutdownUnconfirmed>().is_some()
+                        || error.downcast_ref::<tokio::task::JoinError>().is_some())
+                {
+                    if let Some(signal) = &signal {
+                        record_uncertain_control(state, signal, &format!("startup stop unconfirmed: {error:#}")).await;
+                    }
+                    hold_unconfirmed(state, format!("startup stop unconfirmed: {error:#}")).await;
+                    return Ok(());
+                }
+                // A normal startup error has already reaped its children. Keep
+                // that diagnostic, but never complete the newly received Stop
+                // using the old startup's identity.
+                let reason = stopped.err().map(|error| format!("startup interrupted: {error:#}"))
+                    .unwrap_or_else(|| "startup interrupted by runtime control".into());
+                match signal {
+                    Some(signal) => Next::Redeploy(settle_stopped_startup(args, state, signal, reason).await),
+                    None => Next::Exit,
+                }
+            },
             () = state.cancel.cancelled() => {
                 cancel.cancel();
                 join_supervisor(&mut sup, &mut sup_joined).await?;

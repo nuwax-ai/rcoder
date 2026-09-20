@@ -11,7 +11,7 @@ use super::*;
     path = "/computer/pod/ensure",
     request_body(content = EnsurePodRequest, description = "启动容器请求"),
     responses(
-        (status = 200, description = "成功启动/获取容器", body = HttpResult<EnsurePodResponse>),
+        (status = 200, description = "成功启动/获取容器；UserApp prod 操作占用返回 ERR_CONFLICT 信封，包含 blocker 及已知的 operation_id", body = HttpResult<EnsurePodResponse>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
         (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
@@ -222,6 +222,17 @@ async fn ensure_userapp_prod(
                 locale,
                 "userapp prod ensure failed: wake timeout",
             ))
+        }
+        shared_types::WakeOutcome::Blocked { message, blocker } => {
+            let mut response = HttpResult::error_with_message(
+                shared_types::error_codes::ERR_CONFLICT,
+                locale,
+                &message,
+            );
+            if !blocker.operation_id.is_empty() {
+                response = response.with_operation_id(blocker.operation_id.clone());
+            }
+            Ok(response.with_blocker(blocker))
         }
         shared_types::WakeOutcome::Failed(e) => {
             error!("[POD_ENSURE] userapp prod wake failed: app_id={app_id}: {e}");

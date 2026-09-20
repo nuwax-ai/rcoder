@@ -163,6 +163,14 @@ pub(super) async fn resolve_exec_target<'a>(
             use shared_types::AppWakeControl;
             match state.activity.ensure_running(app_id).await {
                 shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
+                shared_types::WakeOutcome::Blocked { message, blocker } => {
+                    let mut error =
+                        AppError::with_message(shared_types::error_codes::ERR_CONFLICT, message);
+                    if !blocker.operation_id.is_empty() {
+                        error = error.with_operation_id(blocker.operation_id.clone());
+                    }
+                    return Err(error.with_blocker(blocker));
+                }
                 shared_types::WakeOutcome::Timeout | shared_types::WakeOutcome::Failed(_) => {
                     tracing::error!("[USERAPP_DB_ADMIN] prod app wake failed: app_id={app_id}");
                     return Err(AppError::with_message(
@@ -295,7 +303,7 @@ pub(crate) async fn recover_password(
     tag = "Userapp · 双态 · 数据库",
     operation_id = "userapp_deploy_pg_recover",
     summary = "确认或取消原显式部署改密写入",
-    description = "显式部署携带 `pg` 输入的改密写结果未知（断连/协调器中断/checkpoint 提交失败）时，沿原部署操作身份恢复：携带 app_id/lifecycle_id/operation_id/expected_revision 与原 pg 的 username/password。已提交的事务经回执+TCP 验证确认；未提交的通过取消墓碑阻止迟到写入。两种结果都终局为 Failed——部署本身未记录完成证据，需重发部署（已确认的密码不会再次改写）。不会重新执行密码写、重新部署、启动或替换容器；旧版本无事务回执协议的操作拒绝自动恢复。终态重放返回同一结果；lease_cleanup_pending 表示仅原租约清理待完成。"
+    description = "仅当原操作已进入 RecoveryRequired，沿原部署操作身份恢复；Running 操作仍可能执行后续步骤，拒绝取消回执和释放租约。显式部署携带 `pg` 输入的改密写结果未知（断连/协调器中断/checkpoint 提交失败）时：携带 app_id/lifecycle_id/operation_id/expected_revision 与原 pg 的 username/password。已提交的事务经回执+TCP 验证确认；未提交的通过取消墓碑阻止迟到写入。两种结果都终局为 Failed——部署本身未记录完成证据，需重发部署（已确认的密码不会再次改写）。不会重新执行密码写、重新部署、启动或替换容器；旧版本无事务回执协议的操作拒绝自动恢复。终态重放返回同一结果；lease_cleanup_pending 表示仅原租约清理待完成。"
 )]
 pub(crate) async fn recover_deploy_pg(
     State(state): State<Arc<AppState>>,

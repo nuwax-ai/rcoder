@@ -105,7 +105,7 @@ async fn push_skills_to_workspace_impl(
     // agent-store 根锚定 (绑定目录场景 store 锚定配置根, 对齐 TS 1.4.5; 默认
     // None = ws.parent() 派生)
     let store_root =
-        super::super::agent_store_user_root(&state, &user_id, &ws, workspace_path.as_deref());
+        super::super::agent_store_user_root(&state, &user_id, &ws, workspace_path.as_deref())?;
     // F03：合并项目 ID（header > query > body）先落地——借用须活过参数构造
     let merged_project_id = crate::extract::merged_request_app_id(app_id.as_deref());
     push_skills_impl(

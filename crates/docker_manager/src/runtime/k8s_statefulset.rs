@@ -130,8 +130,20 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         let svc_name = self.agent_headless_svc_name(identifier, service_type)?;
         let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
-        if services.get(&svc_name).await.is_ok() {
-            return Ok(()); // 已存在
+        match services.get(&svc_name).await {
+            Ok(existing) => {
+                if *service_type == ServiceType::UserappBuilder {
+                    super::k8s_service::validate_builder_service(&existing, identifier, true)?;
+                }
+                return Ok(());
+            }
+            Err(kube::Error::Api(error)) if error.code == 404 => {}
+            Err(error) => {
+                return Err(super::builder_completion::k8s_error(
+                    format!("Inspect headless Service '{svc_name}': {error}"),
+                    error,
+                ));
+            }
         }
         let labels = build_standard_labels(identifier, service_type);
         let svc = Service {

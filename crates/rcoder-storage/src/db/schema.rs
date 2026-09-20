@@ -47,6 +47,38 @@ impl Component {
     }
 }
 
+/// Additive migrations own new tables; baseline tables and their fingerprints
+/// remain unchanged. Altering existing tables requires an explicit migration
+/// strategy, not rewriting a released baseline.
+fn migration_ddl(component: Component, backend: Backend, version: i64) -> Result<&'static str> {
+    if version == 1 {
+        return component.ddl(backend);
+    }
+    if component == Component::Userapp && version == 2 {
+        return Ok(include_str!("../../schema/userapp-compute-control-v2.sql"));
+    }
+    if component == Component::Userapp && version == 3 {
+        return Ok(include_str!("../../schema/userapp-recovery-witness-v3.sql"));
+    }
+    bail!("unsupported/future database schema version")
+}
+fn latest_version(component: Component) -> i64 {
+    if component == Component::Userapp {
+        3
+    } else {
+        1
+    }
+}
+fn migration_name(version: i64) -> &'static str {
+    if version == 1 {
+        "baseline-v1"
+    } else if version == 2 {
+        "compute-control-v2"
+    } else {
+        "recovery-witness-v3"
+    }
+}
+
 // Only our four fixed DDL files use this splitter. Their grammar excludes SQL
 // function bodies and semicolons in literals; reject those instead of guessing.
 fn statements(ddl: &str) -> Result<Vec<String>> {
@@ -213,9 +245,10 @@ async fn initialize_component(
             "preview" => Component::Preview,
             _ => bail!("unknown database schema component"),
         };
-        let ddl = known.ddl(backend)?;
+        let version: i64 = version.parse().context("invalid schema version")?;
+        let ddl = migration_ddl(known, backend, version)?;
         ensure!(
-            version == "1" && migration_name == "baseline-v1",
+            migration_name == self::migration_name(version),
             "unsupported/future database schema version"
         );
         ensure!(
@@ -233,8 +266,10 @@ async fn initialize_component(
         );
         expected_tables.extend(component_tables);
         ensure!(
-            recorded.insert(known, fingerprint.clone()).is_none(),
-            "duplicate baseline component"
+            recorded
+                .insert((known, version), fingerprint.clone())
+                .is_none(),
+            "duplicate component migration"
         );
     }
     // Unknown and partly initialized tables are not silently adopted.
@@ -242,35 +277,51 @@ async fn initialize_component(
         existing.is_subset(&expected_tables),
         "unexpected tables in RCoder schema"
     );
-    if recorded.contains_key(&component) {
-        return Ok(());
-    }
-    ensure!(
-        allow_create,
-        "Offline observer requires an installed component baseline"
-    );
-    let ddl = component.ddl(backend)?;
-    for statement in statements(ddl)? {
-        toasty::sql::statement(statement).exec(&mut *tx).await?;
-    }
-    let fingerprint = catalog_fingerprint(tx, backend, &tables(ddl)?).await?;
-    let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())
-        .context("schema timestamp overflow")?;
-    let sql = match backend {
-        Backend::Postgres => {
-            "INSERT INTO rcoder_schema_migrations VALUES ($1,1,'baseline-v1',$2,$3,$4)"
+    for known in [Component::Userapp, Component::Project, Component::Preview] {
+        let mut missing = false;
+        for version in 1..=latest_version(known) {
+            if recorded.contains_key(&(known, version)) {
+                ensure!(!missing, "database migration history has a gap");
+            } else {
+                missing = true;
+            }
         }
-        Backend::Turso => {
-            "INSERT INTO rcoder_schema_migrations VALUES (?1,1,'baseline-v1',?2,?3,?4)"
+    }
+    for version in 1..=latest_version(component) {
+        if recorded.contains_key(&(component, version)) {
+            continue;
         }
-    };
-    toasty::sql::statement(sql)
-        .bind(component.name())
-        .bind(digest(ddl))
-        .bind(fingerprint)
-        .bind(now)
-        .exec(&mut *tx)
-        .await?;
+        ensure!(
+            allow_create,
+            "Offline observer requires all component migrations"
+        );
+        let ddl = migration_ddl(component, backend, version)?;
+        let new_tables = tables(ddl)?;
+        ensure!(
+            new_tables.is_disjoint(&expected_tables),
+            "additive migration overlaps existing tables"
+        );
+        for statement in statements(ddl)? {
+            toasty::sql::statement(statement).exec(&mut *tx).await?;
+        }
+        let fingerprint = catalog_fingerprint(tx, backend, &new_tables).await?;
+        let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())
+            .context("schema timestamp overflow")?;
+        let sql = match backend {
+            Backend::Postgres => "INSERT INTO rcoder_schema_migrations VALUES ($1,$2,$3,$4,$5,$6)",
+            Backend::Turso => "INSERT INTO rcoder_schema_migrations VALUES (?1,?2,?3,?4,?5,?6)",
+        };
+        toasty::sql::statement(sql)
+            .bind(component.name())
+            .bind(version)
+            .bind(migration_name(version))
+            .bind(digest(ddl))
+            .bind(fingerprint)
+            .bind(now)
+            .exec(&mut *tx)
+            .await?;
+        expected_tables.extend(new_tables);
+    }
     Ok(())
 }
 

@@ -209,6 +209,7 @@ impl AppService {
                 serde_json::json!({"context":params.execution_context}),
             )
             .await?;
+        operation.authorize_mutation().await?;
         guard.mark_mutating()?;
         let resource = match self.runtime.create_deployment(params).await {
             Ok(resource) => resource,

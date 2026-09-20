@@ -13,6 +13,10 @@ use crate::ContainerRuntime;
 /// Container runtime errors
 #[derive(Error, Debug)]
 pub enum ContainerRuntimeError {
+    /// All issued writes have returned; retained resources are for Stop to clean.
+    /// Never produced by dropping an in-flight mutation future.
+    #[error("Builder creation cancelled after acknowledged writes")]
+    CreationCancelled,
     #[error(transparent)]
     OperationInProgress(Box<shared_types::UserAppOperationInProgress>),
     #[error("Runtime request rejected: {0}")]

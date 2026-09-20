@@ -84,6 +84,9 @@ impl AppService {
                     "app {app_id} wake timed out; retry later"
                 )));
             }
+            shared_types::WakeOutcome::Blocked { message, blocker } => {
+                return Err(AppOperationError::ConflictBlocked { message, blocker });
+            }
             shared_types::WakeOutcome::Failed(e) => {
                 return Err(AppOperationError::InvalidState(format!(
                     "app {app_id} wake failed: {e}"

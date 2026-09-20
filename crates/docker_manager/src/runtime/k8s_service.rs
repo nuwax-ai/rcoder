@@ -88,7 +88,7 @@ fn agent_service_ports(service_type: &ServiceType) -> Vec<ServicePort> {
 }
 
 /// 组装 agent per-pod Service 的期望全量 spec（缺失创建与存量 SSA 收敛同源）
-fn agent_service_object(
+pub(super) fn agent_service_object(
     namespace: &str,
     svc_name: &str,
     identifier: &str,
@@ -244,6 +244,46 @@ fn build_selector_labels(identifier: &str, service_type: &ServiceType) -> BTreeM
     selector
 }
 
+/// Verify ownership before reusing or patching a builder Service. A name alone
+/// does not authorize updates, including the read-side port repair path.
+#[cfg(feature = "kubernetes")]
+pub(super) fn validate_builder_service(
+    service: &Service,
+    identifier: &str,
+    headless: bool,
+) -> ContainerRuntimeResult<()> {
+    let family = ServiceType::UserappBuilder;
+    let labels = service.metadata.labels.as_ref();
+    let spec = service
+        .spec
+        .as_ref()
+        .ok_or_else(|| ContainerRuntimeError::Conflict("Builder Service spec missing".into()))?;
+    if service.metadata.deletion_timestamp.is_some()
+        || labels
+            .and_then(|labels| labels.get("rcoder.io/identifier"))
+            .map(String::as_str)
+            != Some(identifier)
+        || labels
+            .and_then(|labels| labels.get("rcoder.io/service-type"))
+            .map(String::as_str)
+            != Some(family.container_family_key())
+        || build_selector_labels(identifier, &family)
+            .iter()
+            .any(|(key, value)| {
+                spec.selector
+                    .as_ref()
+                    .and_then(|selector| selector.get(key))
+                    != Some(value)
+            })
+        || (spec.cluster_ip.as_deref() == Some("None")) != headless
+    {
+        return Err(ContainerRuntimeError::Conflict(
+            "Builder Service ownership or routing differs".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// K8s Service 生命周期管理 trait extension
 ///
 /// 为 `KubernetesRuntime` 添加 per-pod K8s Service 管理方法：
@@ -313,9 +353,12 @@ impl K8sServiceOps for KubernetesRuntime {
         // 检查是否已存在
         match services.get(&svc_name).await {
             Ok(existing) => {
+                if *service_type == ServiceType::UserappBuilder {
+                    validate_builder_service(&existing, identifier, false)?;
+                }
                 // 定向收敛：存量 builder Service 缺任一期望端口（历史上两次
                 // 犯同款——3010 日志链路、9080 dev 应用流量代理，均按
-                // `{svc}:{port}` 拨上游必超时）——SSA patch 写入全量期望 spec
+                // `{svc}:{port}` 拨上游必超时）——条件 patch 写入期望端口
                 // 补齐（范式对齐 apply_app_service）。条件按期望清单逐端口
                 // 比对而非点名端口：后续清单再加端口，存量 svc 访问即自愈。
                 // 仅 UserappBuilder 触发：读路径自愈（get_container_info 每次
@@ -325,11 +368,36 @@ impl K8sServiceOps for KubernetesRuntime {
                 {
                     let desired =
                         agent_service_object(&self.namespace, &svc_name, identifier, service_type);
-                    let body = serde_json::to_value(&desired).map_err(|e| {
-                        ContainerRuntimeError::K8sError(format!("serialize service: {e}"))
+                    let uid = existing
+                        .metadata
+                        .uid
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            ContainerRuntimeError::Conflict("Builder Service UID missing".into())
+                        })?;
+                    let version = existing
+                        .metadata
+                        .resource_version
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            ContainerRuntimeError::Conflict(
+                                "Builder Service version missing".into(),
+                            )
+                        })?;
+                    let ports = desired.spec.and_then(|spec| spec.ports).ok_or_else(|| {
+                        ContainerRuntimeError::ConfigurationError(
+                            "Builder Service desired ports missing".into(),
+                        )
                     })?;
+                    let body = serde_json::json!({"metadata": {"uid": uid, "resourceVersion": version}, "spec": {"ports": ports}});
                     services
-                        .patch(&svc_name, &Self::ssa_patch_params(), &Patch::Apply(body))
+                        .patch(
+                            &svc_name,
+                            &kube::api::PatchParams::default(),
+                            &Patch::Merge(body),
+                        )
                         .await
                         .map_err(|e| {
                             crate::runtime::builder_completion::k8s_error(

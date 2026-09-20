@@ -129,6 +129,23 @@ fn spawn_operation(
                     request_fingerprint: claimed.request_fingerprint.clone(),
                 },
             );
+            let creation = async {
+                let result = creation.await;
+                if Instant::now() >= ready_deadline {
+                    // Only readonly observation after expiry; never register
+                    // the instance or replay creation from this old executor.
+                    match tokio::time::timeout(Duration::from_secs(30),
+                        record_late_creation_result(&owned, &claimed, &result)).await
+                    {
+                        Ok(Ok(())) => {},
+                        Ok(Err(error)) => tracing::warn!(%error,
+                            operation_id = %claimed.operation_id, "Late builder evidence could not be saved"),
+                        Err(error) => tracing::warn!(%error,
+                            operation_id = %claimed.operation_id, "Late builder evidence observation timed out"),
+                    }
+                }
+                result
+            };
             let observed = observe_creation_budget(tokio::time::sleep_until(ready_deadline), creation, async {
                 progress(
                     &owned.userapp_store,
@@ -151,11 +168,12 @@ fn spawn_operation(
             };
             let result = match created {
                 Ok(info) => {
-                    super::confirm_builder_ready(
+                    super::confirm_builder_ready_inner(
                         &owned,
                         &claimed.app_id,
                         &instance,
                         info,
+                        Some(&claimed),
                         ready_deadline,
                     )
                     .await
@@ -181,7 +199,6 @@ fn spawn_operation(
                     completion = progress(&owned.userapp_store, &claimed, &claimed_id,
                         UserAppOperationState::Running, "builder_ready_confirmed",
                         serde_json::to_value(&evidence)?, None).await?;
-                    super::register_builder(&owned, &instance, &info)?;
                     (
                         UserAppOperationState::Succeeded,
                         serde_json::to_value(info)?,
@@ -189,6 +206,8 @@ fn spawn_operation(
                     )
                 },
                 Err(error) => {
+                    let cancelled = matches!(error.downcast_ref::<container_runtime_api::ContainerRuntimeError>(),
+                        Some(container_runtime_api::ContainerRuntimeError::CreationCancelled));
                     let rejected = error
                         .downcast_ref::<container_runtime_api::ContainerRuntimeError>()
                         .is_some_and(|e| {
@@ -198,12 +217,12 @@ fn spawn_operation(
                             )
                         });
                     (
-                        if rejected {
+                        if rejected || cancelled {
                             UserAppOperationState::Failed
                         } else {
                             UserAppOperationState::RecoveryRequired
                         },
-                        serde_json::Value::Null,
+                        if cancelled { serde_json::json!({"creation_cancelled": true}) } else { serde_json::Value::Null },
                         Some(format!("{error:#}")),
                     )
                 }
@@ -291,6 +310,241 @@ async fn observe_creation_budget<T>(
         }
         result = &mut observed => Ok(Some(result)),
     }
+}
+
+async fn record_late_creation_result(
+    state: &AppState,
+    claimed: &UserAppOperationRecord,
+    result: &Result<ContainerBasicInfo>,
+) -> Result<()> {
+    match result {
+        Ok(info) => record_late_creation(state, claimed, info).await,
+        Err(error) => {
+            if matches!(
+                error.downcast_ref::<container_runtime_api::ContainerRuntimeError>(),
+                Some(container_runtime_api::ContainerRuntimeError::CreationCancelled)
+            ) {
+                let snapshot = state
+                    .userapp_store
+                    .get_operation(&claimed.app_id, &claimed.operation_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Cancelled builder operation disappeared"))?;
+                if snapshot.lifecycle_id != claimed.lifecycle_id
+                    || snapshot.executor_id != claimed.executor_id
+                    || snapshot.request_fingerprint != claimed.request_fingerprint
+                {
+                    return Err(anyhow!("Builder cancellation belongs to a stale executor"));
+                }
+                state
+                    .userapp_store
+                    .finalize_builder_creation_cancellation(&snapshot)
+                    .await?;
+                return Ok(());
+            }
+            let Some(container_runtime_api::ContainerRuntimeError::RequestRejected(rejection)) =
+                error.downcast_ref::<container_runtime_api::ContainerRuntimeError>()
+            else {
+                // A timeout/transport/cleanup failure remains uncertain.
+                tracing::warn!(operation_id = %claimed.operation_id, error = %error,
+                    "Late builder failure still requires runtime reconciliation");
+                return Ok(());
+            };
+            let snapshot = state
+                .userapp_store
+                .get_operation(&claimed.app_id, &claimed.operation_id)
+                .await?
+                .ok_or_else(|| anyhow!("Late rejected builder operation disappeared"))?;
+            if snapshot.lifecycle_id != claimed.lifecycle_id
+                || snapshot.executor_id != claimed.executor_id
+                || snapshot.request_fingerprint != claimed.request_fingerprint
+            {
+                return Err(anyhow!(
+                    "Late builder rejection belongs to a stale executor"
+                ));
+            }
+            state
+                .userapp_store
+                .finalize_builder_creation_rejection(&snapshot, rejection)
+                .await?;
+            Ok(())
+        }
+    }
+}
+
+/// Persist a late create response after physical identity verification, before
+/// waiting for management readiness. The scanner completes that observation.
+async fn record_late_creation(
+    state: &AppState,
+    claimed: &UserAppOperationRecord,
+    info: &ContainerBasicInfo,
+) -> Result<()> {
+    let snapshot = state
+        .userapp_store
+        .get_operation(&claimed.app_id, &claimed.operation_id)
+        .await?
+        .ok_or_else(|| anyhow!("Late builder operation disappeared"))?;
+    if snapshot.state != UserAppOperationState::RecoveryRequired
+        || snapshot.step != "creation_confirmation_timed_out"
+        || snapshot.executor_id != claimed.executor_id
+        || snapshot.lifecycle_id != claimed.lifecycle_id
+        || snapshot.request_fingerprint != claimed.request_fingerprint
+    {
+        return Ok(());
+    }
+    let context = shared_types::UserAppExecutionContext {
+        app_id: claimed.app_id.clone(),
+        lifecycle_id: claimed.lifecycle_id.clone(),
+        operation_id: claimed.operation_id.clone(),
+        executor_id: claimed
+            .executor_id
+            .clone()
+            .ok_or_else(|| anyhow!("Late builder executor missing"))?,
+        request_fingerprint: claimed.request_fingerprint.clone(),
+    };
+    let target = super::adoption::capture_bound_target(state, &context).await?;
+    let evidence = shared_types::BuilderCreationEvidence {
+        creation_lease_released: true,
+        target,
+        container: info.clone(),
+    };
+    evidence
+        .validate_operation(&snapshot)
+        .map_err(anyhow::Error::msg)?;
+    state
+        .userapp_store
+        .confirm_builder_creation_recovery(&snapshot, &evidence, false)
+        .await?;
+    Ok(())
+}
+
+/// Bridge runtime completion to the database after the worker or connection
+/// disappeared. The runtime releases only an acknowledged original lease.
+pub(super) async fn reconcile_runtime_receipt(
+    state: &AppState,
+    snapshot: &UserAppOperationRecord,
+) -> Result<bool> {
+    if !shared_types::userapp_builder_creation_needs_runtime_receipt(snapshot) {
+        return Ok(false);
+    }
+    let Some(_local) = super::lifecycle::try_acquire(&snapshot.app_id).await else {
+        return Ok(false);
+    };
+    if state
+        .userapp_store
+        .get_operation(&snapshot.app_id, &snapshot.operation_id)
+        .await?
+        .as_ref()
+        != Some(snapshot)
+    {
+        return Ok(false);
+    }
+    let context = shared_types::UserAppExecutionContext {
+        app_id: snapshot.app_id.clone(),
+        lifecycle_id: snapshot.lifecycle_id.clone(),
+        operation_id: snapshot.operation_id.clone(),
+        executor_id: snapshot
+            .executor_id
+            .clone()
+            .ok_or_else(|| anyhow!("Builder recovery executor missing"))?,
+        request_fingerprint: snapshot.request_fingerprint.clone(),
+    };
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(30),
+        state.runtime().recover_builder_creation(&context),
+    )
+    .await
+    .context("Builder runtime receipt recovery deadline exceeded")?;
+    let evidence = match recovered {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) => return Ok(false),
+        Err(container_runtime_api::ContainerRuntimeError::CreationCancelled) => {
+            state
+                .userapp_store
+                .finalize_builder_creation_cancellation(snapshot)
+                .await?;
+            return Ok(true);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    evidence
+        .validate_operation(snapshot)
+        .map_err(anyhow::Error::msg)?;
+    state
+        .userapp_store
+        .confirm_builder_creation_recovery(snapshot, &evidence, false)
+        .await?;
+    Ok(true)
+}
+
+/// A persisted create response is not a readiness result. Observe once per
+/// recovery scan; never reissue creation or publish a project registration.
+pub(super) async fn reconcile_created(
+    state: &AppState,
+    snapshot: &UserAppOperationRecord,
+) -> Result<bool> {
+    if snapshot.kind != UserAppOperationKind::EnsureBuilder
+        || snapshot.state != UserAppOperationState::RecoveryRequired
+        || snapshot.step != "builder_created_observed"
+    {
+        return Ok(false);
+    }
+    let Some(_local) = super::lifecycle::try_acquire(&snapshot.app_id).await else {
+        return Ok(false);
+    };
+    let mut evidence: shared_types::BuilderCreationEvidence =
+        serde_json::from_value(snapshot.checkpoint.clone())?;
+    evidence
+        .validate_operation(snapshot)
+        .map_err(anyhow::Error::msg)?;
+    let Some(info) = tokio::time::timeout(
+        Duration::from_secs(30),
+        observe_created_ready(state, &evidence),
+    )
+    .await
+    .context("Builder recovery observation deadline exceeded")??
+    else {
+        return Ok(false);
+    };
+    evidence.container = info;
+    state
+        .userapp_store
+        .confirm_builder_creation_recovery(snapshot, &evidence, true)
+        .await?;
+    Ok(true)
+}
+
+async fn observe_created_ready(
+    state: &AppState,
+    evidence: &shared_types::BuilderCreationEvidence,
+) -> Result<Option<ContainerBasicInfo>> {
+    let context = &evidence.target.context;
+    let before = super::adoption::capture_bound_target(state, context).await?;
+    validate_completed_resource(evidence, &before, Some(evidence.container.clone()))?;
+    let Some(runtime) = state
+        .runtime()
+        .find_container(&context.app_id, &shared_types::ServiceType::UserappBuilder)
+        .await?
+    else {
+        return Ok(None);
+    };
+    super::validate_builder_identity(&context.app_id, &runtime)?;
+    if runtime.container_id != evidence.container.container_id {
+        return Err(anyhow!("Builder physical identity changed during recovery"));
+    }
+    if runtime.status != container_runtime_api::ContainerRuntimeStatus::Running {
+        return Ok(None);
+    }
+    let info = super::refreshed_registration(&evidence.container, &runtime)
+        .unwrap_or_else(|| evidence.container.clone());
+    if !super::probe_file_server(&super::dev_file_server_addr(state, &info)).await {
+        return Ok(None);
+    }
+    let after = super::adoption::capture_bound_target(state, context).await?;
+    Ok(Some(validate_completed_resource(
+        evidence,
+        &after,
+        Some(info),
+    )?))
 }
 
 pub(super) async fn resume_pending(
@@ -417,12 +671,24 @@ async fn wait(
     }
     let info: ContainerBasicInfo = serde_json::from_value(operation.checkpoint)
         .context("decode completed builder resource identity")?;
-    let verified = super::cross_verify_registration(state, &accepted.app_id, instance, &info)
+    let verified = super::verify_registration(state, &accepted.app_id, instance, &info, false)
         .await?
         .ok_or_else(|| anyhow!("Completed builder is no longer running"))?;
     if verified.container_id != info.container_id {
         return Err(anyhow!("Completed builder resource was replaced"));
     }
+    // A successful historical result does not authorize publishing an address
+    // after a later Stop/Restart has taken control. Cache readers still recheck
+    // runtime identity; this registration is never a new execution authority.
+    state
+        .userapp_store
+        .check_compute_access(
+            &accepted.app_id,
+            shared_types::UserAppOperationScope::Dev,
+            false,
+        )
+        .await?;
+    super::register_builder(state, instance, &verified)?;
     Ok(verified)
 }
 
@@ -502,24 +768,14 @@ pub(super) async fn reconcile_completed(
         .userapp_store
         .reserve_completed_operation(snapshot)
         .await?;
-    let result = async {
-        let context = &evidence.target.context;
-        // evidence 持有的是创建时实例上下文（app_id 槽=复合 identifier）——
-        // 按其恢复定位/注册，不从纯 app_id 重派生。
-        let current =
-            super::adoption::capture_bound_target(state, &evidence.target.context).await?;
-        let info = super::cross_verify_registration(
-            state,
-            &snapshot.app_id,
-            &context.app_id,
-            &evidence.container,
-        )
-        .await?;
-        let info = validate_completed_resource(&evidence, &current, info)?;
-        super::register_builder(state, &context.app_id, &info)?;
-        Ok::<_, anyhow::Error>(info)
-    }
-    .await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        observe_created_ready(state, &evidence),
+    )
+    .await
+    .context("Builder completion observation deadline exceeded")
+    .and_then(|result| result)
+    .and_then(|info| info.ok_or_else(|| anyhow!("Builder management endpoint is not ready")));
     match result {
         Ok(info) => {
             progress(

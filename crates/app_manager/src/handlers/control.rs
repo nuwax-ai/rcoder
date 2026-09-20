@@ -50,6 +50,9 @@ pub(super) async fn control_result<T>(
 ///
 /// Pending commands retain their original input and identity. Running or uncertain
 /// operations require durable final evidence; unknown remote effects are not replayed.
+/// A wake with a persisted acknowledged start may finalize its failed read-only
+/// observation and release its original lease. This returns the original Failed
+/// operation, not a new application start; fetch the current revision before retry.
 #[utoipa::path(post, path="/api/v1/userapp/{app_id}/operations/{operation_id}/retry",
     params(("app_id"=String, Path, description="Application identifier"), ("operation_id"=String, Path, description="Durable operation identifier")),
     request_body=shared_types::UserAppRetryRequest,

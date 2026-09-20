@@ -166,6 +166,13 @@ pub(crate) struct PreparedDeploy {
     state: DeployState,
 }
 
+impl PreparedDeploy {
+    /// Identity from the already validated, operation-owned staging directory.
+    pub(crate) fn artifact_release_id(&self) -> Result<String> {
+        Ok(crate::manifest::read_release_lock(self.staging.path())?.release_id)
+    }
+}
+
 pub(crate) async fn deploy(
     workspace: &Path,
     url: &str,
@@ -338,6 +345,59 @@ async fn clean_owned_temporary(directory: &Path) -> Result<()> {
             tokio::fs::remove_file(entry.path()).await?;
         }
     }
+    Ok(())
+}
+
+/// Restore the confirmed old directory after a interrupted promotion. The caller
+/// must hold owner authority and have confirmed previous process quiescence.
+pub(crate) fn restore_previous_generation(workspace: &Path, expected: &str) -> Result<()> {
+    let root = workspace.parent().context("workspace has no volume root")?;
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".deploy-prepare.lock"))?;
+    lease
+        .try_lock()
+        .context("preparation is active during directory recovery")?;
+    let _lease = PreparationLease(lease);
+    match std::fs::symlink_metadata(workspace) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => bail!("recovery destination already exists"),
+        Err(error) => return Err(error).context("inspect recovery destination"),
+    }
+    let previous = root.join(PREVIOUS_DIR);
+    let metadata = std::fs::symlink_metadata(&previous)?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "previous generation must be a real directory"
+    );
+    anyhow::ensure!(
+        crate::manifest::read_release_lock(&previous)?.release_id == expected,
+        "previous generation artifact mismatch"
+    );
+    crate::migration_journal::require_confirmed_migrations(workspace)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &previous,
+        rustix::fs::CWD,
+        workspace,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .context("restore previous generation without replacement")?;
+    // Windows directory rename fails if the destination already exists.
+    #[cfg(windows)]
+    std::fs::rename(&previous, workspace).context("restore previous generation")?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    bail!("exclusive directory recovery is unsupported on this platform");
+    #[cfg(unix)]
+    std::fs::File::open(root)?.sync_all()?;
+    anyhow::ensure!(
+        crate::manifest::read_release_lock(workspace)?.release_id == expected,
+        "restored generation artifact mismatch"
+    );
     Ok(())
 }
 

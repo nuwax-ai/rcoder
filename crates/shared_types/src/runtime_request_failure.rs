@@ -1,5 +1,5 @@
 //! Evidence that a runtime request was explicitly rejected, not a transport timeout.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("{message} (HTTP {status})")]
 pub struct RuntimeRequestRejection {
     pub status: u16,

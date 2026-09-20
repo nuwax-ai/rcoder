@@ -23,6 +23,214 @@ use super::kubernetes_runtime::{KubernetesRuntime, read_app_expose_env};
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 impl UserAppDeploymentRuntime for KubernetesRuntime {
+    async fn cleanup_builder_restart_archive(
+        &self,
+        template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<()> {
+        self.remove_builder_restart_archive(template).await
+    }
+
+    async fn verify_recovered_volumes(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+        volumes: &[shared_types::AppResourceIdentity],
+    ) -> ContainerRuntimeResult<()> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let api: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+            kube::Api::namespaced(self.client.clone(), &self.namespace);
+        for expected in volumes {
+            if expected.kind != shared_types::AppResourceKind::PersistentVolumeClaim
+                || expected.uid.is_empty()
+                || expected.name.is_empty()
+            {
+                return Err(ContainerRuntimeError::ConfigurationError(
+                    "Invalid recovered volume witness".into(),
+                ));
+            }
+            let current = api.get(&expected.name).await.map_err(|error| {
+                ContainerRuntimeError::K8sError(format!(
+                    "Verify recovered volume {}: {error}",
+                    expected.name
+                ))
+            })?;
+            if current.metadata.uid.as_deref() != Some(expected.uid.as_str())
+                || current.metadata.deletion_timestamp.is_some()
+            {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Recovered workspace volume was replaced or is deleting".into(),
+                ));
+            }
+            let metadata = current.metadata.annotations.as_ref().ok_or_else(|| {
+                ContainerRuntimeError::Conflict("Recovered volume lifecycle missing".into())
+            })?;
+            context
+                .validate_application_metadata(metadata)
+                .map_err(ContainerRuntimeError::Conflict)?;
+        }
+        self.verify_recovered_mounts(context, scope, volumes)
+            .await?;
+        Ok(())
+    }
+    async fn discover_application_identity(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppDiscoveredIdentity>> {
+        use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
+        use kube::{Api, api::ListParams};
+        shared_types::validate_identifier(app_id, "app_id")
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let mut found = None;
+        let builders: Api<StatefulSet> = Api::namespaced(self.client.clone(), &self.namespace);
+        let list = builders
+            .list(&ListParams::default().labels(&format!(
+                "rcoder.io/identifier={app_id},rcoder.io/service-type={}",
+                ServiceType::UserappBuilder
+            )))
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("Discover builders: {e}")))?;
+        for resource in list.items {
+            if resource.metadata.deletion_timestamp.is_some() {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Existing builder is deleting".into(),
+                ));
+            }
+            let uid = resource
+                .metadata
+                .uid
+                .clone()
+                .ok_or_else(|| ContainerRuntimeError::Conflict("Builder UID missing".into()))?;
+            let context = super::lifecycle_discovery::include(
+                &mut found,
+                app_id,
+                shared_types::UserAppOperationScope::Dev,
+                &resource.metadata.annotations.unwrap_or_default(),
+                uid.clone(),
+                resource
+                    .spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.replicas == Some(0)),
+            )?;
+            let spec = resource.spec.as_ref().ok_or_else(|| {
+                ContainerRuntimeError::Conflict("Discovered builder spec missing".into())
+            })?;
+            let pod = spec.template.spec.as_ref().ok_or_else(|| {
+                ContainerRuntimeError::Conflict("Discovered builder pod spec missing".into())
+            })?;
+            let workload_name = resource.metadata.name.as_deref().ok_or_else(|| {
+                ContainerRuntimeError::Conflict("Discovered builder name missing".into())
+            })?;
+            // RCoder builders are single-workspace StatefulSets. Never guess
+            // which ordinal owns data for an unexpected multi-replica controller.
+            if spec.replicas.is_some_and(|replicas| replicas > 1) {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Multiple builder ordinals require explicit recovery".into(),
+                ));
+            }
+            let ordinal = spec
+                .ordinals
+                .as_ref()
+                .and_then(|ordinals| ordinals.start)
+                .unwrap_or(0);
+            let claims = spec
+                .volume_claim_templates
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|claim| {
+                    claim
+                        .metadata
+                        .name
+                        .as_deref()
+                        .filter(|name| !name.is_empty())
+                        .map(|name| format!("{name}-{workload_name}-{ordinal}"))
+                        .ok_or_else(|| {
+                            ContainerRuntimeError::Conflict(
+                                "Builder volume template name missing".into(),
+                            )
+                        })
+                })
+                .collect::<ContainerRuntimeResult<Vec<_>>>()?;
+            let volumes = self
+                .discover_volume_identities(&context, pod, claims)
+                .await?;
+            if let Some(identity) = &mut found {
+                identity.dev_volumes = volumes;
+            }
+            let captured = self.capture_builder_compute(&context).await?;
+            if captured.workload.as_ref().map(|r| &r.uid) != Some(&uid) {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Builder changed during discovery".into(),
+                ));
+            }
+        }
+        let deployments: Api<Deployment> = self.deployments_api();
+        let selector = self
+            .build_app_labels(app_id, None, None)
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let list = deployments
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("Discover production compute: {e}"))
+            })?;
+        for resource in list.items {
+            if resource.metadata.deletion_timestamp.is_some() {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Production compute is deleting".into(),
+                ));
+            }
+            let uid =
+                resource.metadata.uid.clone().ok_or_else(|| {
+                    ContainerRuntimeError::Conflict("Production UID missing".into())
+                })?;
+            let context = super::lifecycle_discovery::include(
+                &mut found,
+                app_id,
+                shared_types::UserAppOperationScope::Prod,
+                &resource.metadata.annotations.unwrap_or_default(),
+                uid.clone(),
+                resource
+                    .spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.replicas == Some(0)),
+            )?;
+            let pod = resource
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.spec.as_ref())
+                .ok_or_else(|| {
+                    ContainerRuntimeError::Conflict("Discovered production pod spec missing".into())
+                })?;
+            let volumes = self
+                .discover_volume_identities(&context, pod, Vec::new())
+                .await?;
+            if let Some(identity) = &mut found {
+                identity.prod_volumes = volumes;
+            }
+            if self.capture_owned_app_identity(&context, None).await?.uid != uid {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Production changed during discovery".into(),
+                ));
+            }
+        }
+        Ok(found)
+    }
+
+    async fn validate_app_operation_receipt(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<bool> {
+        self.validate_captured_application_operation(context, receipt)
+            .await
+    }
+
     async fn release_app_operation_receipt(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -336,6 +544,123 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<()> {
         self.start_captured_target(target).await
+    }
+
+    async fn app_compute_absent(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        use k8s_openapi::api::{apps::v1::ReplicaSet, core::v1::Pod};
+        use kube::{Api, api::ListParams};
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let deployments = self.deployments_api();
+        let name = self.app_deployment_name(&context.app_id);
+        if deployments
+            .get_opt(&name)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("Observe absent deployment: {error}"))
+            })?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let selector = format!(
+            "app.kubernetes.io/instance={},app.kubernetes.io/managed-by=rcoder-app-manager",
+            context.app_id
+        );
+        let params = ListParams::default().labels(&selector);
+        let replicas: Api<ReplicaSet> = Api::namespaced(self.client.clone(), &self.namespace);
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        // A removed Deployment may leave a ReplicaSet or terminating Pods.
+        // Neither condition is a completed stop, even if the endpoint is gone.
+        if !replicas
+            .list(&params)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("Observe remaining replica sets: {error}"))
+            })?
+            .items
+            .is_empty()
+            || !pods
+                .list(&params)
+                .await
+                .map_err(|error| {
+                    ContainerRuntimeError::K8sError(format!(
+                        "Observe remaining compute pods: {error}"
+                    ))
+                })?
+                .items
+                .is_empty()
+        {
+            return Ok(false);
+        }
+        Ok(deployments
+            .list(&params)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("Recheck absent deployment: {error}"))
+            })?
+            .items
+            .is_empty())
+    }
+
+    async fn prepare_app_compute_start(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<shared_types::UserAppComputeStartTarget> {
+        self.prepare_captured_compute_start(target).await
+    }
+
+    async fn prepare_app_compute_start_retry(
+        &self,
+        target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppComputeStartTarget>> {
+        self.prepare_captured_compute_retry(target).await
+    }
+
+    async fn fence_app_compute_start(
+        &self,
+        target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.fence_captured_compute_write(target).await
+    }
+
+    async fn fence_app_compute_stop(
+        &self,
+        target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.fence_captured_compute_write(target).await
+    }
+
+    async fn start_app_compute(
+        &self,
+        target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.start_captured_compute(target).await
+    }
+
+    async fn reconcile_app_compute_start(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.reconcile_captured_compute_start(target).await
+    }
+
+    async fn reconcile_app_compute_stop(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.reconcile_captured_compute_stop(target).await
+    }
+
+    async fn confirm_app_compute_stopped(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.confirm_captured_compute_stopped(target).await
     }
 
     async fn stop_app_target(

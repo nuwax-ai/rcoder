@@ -38,6 +38,8 @@ use crate::handler;
         handler::pod_keepalive,
         handler::pod_restart,
         handler::pod_stop,
+        handler::pod_compute_operation,
+        handler::pod_compute_recover,
         handler::pod_status,
         handler::computer_cache_clean,
         handler::pod_vnc_status,

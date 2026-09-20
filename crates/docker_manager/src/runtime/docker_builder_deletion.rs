@@ -4,6 +4,36 @@ use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResu
 use shared_types::{AppResourceIdentity, AppResourceKind, BuilderDeletionSnapshot, ServiceType};
 
 impl DockerRuntime {
+    pub(super) async fn validate_captured_file_lease(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> Result<bool> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(Error::ConfigurationError)?;
+        receipt.validate().map_err(Error::ConfigurationError)?;
+        let prefix = match receipt.service_type() {
+            ServiceType::Userapp => "prod",
+            ServiceType::UserappBuilder => "builder",
+            _ => {
+                return Err(Error::ConfigurationError(
+                    "Invalid application lease family".into(),
+                ));
+            }
+        };
+        let path = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+            .join(".app-operation-locks")
+            .join(format!("{prefix}-{}.lock", context.app_id));
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || validate_file_receipt(&path, &receipt))
+            .await
+            .map_err(|error| {
+                Error::DockerError(format!(
+                    "Operation lease verification worker failed: {error}"
+                ))
+            })?
+    }
     pub(super) async fn captured_builder_workspace(
         &self,
         snapshot: &BuilderDeletionSnapshot,
@@ -358,18 +388,12 @@ fn lock_builder_file_with_marker(
 }
 
 #[cfg(unix)]
-fn release_file_receipt(
+fn open_inactive_file_receipt(
     path: &std::path::Path,
     receipt: &shared_types::UserAppOperationLeaseReceipt,
-) -> Result<()> {
+) -> Result<std::fs::File> {
     use std::os::unix::fs::MetadataExt as _;
-    let shared_types::UserAppOperationLeaseReceipt::Docker {
-        device,
-        inode,
-        token,
-        ..
-    } = receipt
-    else {
+    let shared_types::UserAppOperationLeaseReceipt::Docker { device, inode, .. } = receipt else {
         return Err(Error::Conflict("Operation lease runtime mismatch".into()));
     };
     let before = std::fs::symlink_metadata(path)
@@ -403,6 +427,46 @@ fn release_file_receipt(
             "Operation lease file identity changed".into(),
         ));
     }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn validate_file_receipt(
+    path: &std::path::Path,
+    receipt: &shared_types::UserAppOperationLeaseReceipt,
+) -> Result<bool> {
+    use std::io::Read as _;
+    let file = open_inactive_file_receipt(path, receipt)?;
+    let shared_types::UserAppOperationLeaseReceipt::Docker { token, .. } = receipt else {
+        return Err(Error::Conflict("Operation lease runtime mismatch".into()));
+    };
+    let mut owner = Vec::new();
+    (&file)
+        .take(token.len() as u64 + 1)
+        .read_to_end(&mut owner)
+        .map_err(|error| Error::DockerError(format!("Read operation lease owner: {error}")))?;
+    // Empty markers are already released, not authority to resume this operation.
+    // Dropping this temporary fd unlocks without clearing or rewriting the marker.
+    Ok(owner == token.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn validate_file_receipt(
+    _: &std::path::Path,
+    _: &shared_types::UserAppOperationLeaseReceipt,
+) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn release_file_receipt(
+    path: &std::path::Path,
+    receipt: &shared_types::UserAppOperationLeaseReceipt,
+) -> Result<()> {
+    let file = open_inactive_file_receipt(path, receipt)?;
+    let shared_types::UserAppOperationLeaseReceipt::Docker { token, .. } = receipt else {
+        return Err(Error::Conflict("Operation lease runtime mismatch".into()));
+    };
     let marker = shared_types::AppFileMutationMarker::for_operation(token)
         .map_err(|error| Error::ConfigurationError(error.to_string()))?;
     marker

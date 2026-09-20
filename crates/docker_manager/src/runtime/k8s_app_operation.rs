@@ -66,6 +66,68 @@ impl Drop for OperationLease {
 }
 
 impl KubernetesRuntime {
+    pub(super) async fn validate_captured_application_operation(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<bool> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        receipt
+            .validate()
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+            service_type,
+            namespace,
+            name,
+            uid,
+            resource_version,
+            token,
+        } = receipt
+        else {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Kubernetes lease receipt is required".into(),
+            ));
+        };
+        if namespace != &self.namespace || name != &operation_name(&context.app_id, service_type)? {
+            return Err(ContainerRuntimeError::Conflict(
+                "Operation lease scope changed".into(),
+            ));
+        }
+        let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+        let Some(current) = api.get_opt(name).await.map_err(|error| {
+            ContainerRuntimeError::K8sError(format!("Observe captured operation lease: {error}"))
+        })?
+        else {
+            return Ok(false);
+        };
+        let annotations = current.metadata.annotations.as_ref();
+        let labels = current.metadata.labels.as_ref();
+        let observed_token = annotations.and_then(|values| {
+            values
+                .get("rcoder.io/operation-id")
+                .or_else(|| values.get("rcoder.io/legacy-operation-id"))
+        });
+        if current.metadata.uid.as_deref() != Some(uid.as_str())
+            || current.metadata.resource_version.as_deref() != Some(resource_version.as_str())
+            || observed_token != Some(token)
+            || labels
+                .and_then(|values| values.get("rcoder.io/operation-app"))
+                .map(String::as_str)
+                != Some(context.app_id.as_str())
+            || labels
+                .and_then(|values| values.get("rcoder.io/operation-family"))
+                .map(String::as_str)
+                != Some(service_type.to_string().as_str())
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Captured operation lease identity changed".into(),
+            ));
+        }
+        Ok(true)
+    }
+
     pub(super) async fn release_captured_application_operation(
         &self,
         context: &shared_types::UserAppExecutionContext,

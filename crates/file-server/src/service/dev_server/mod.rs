@@ -138,7 +138,7 @@ impl DevServerManager {
                     }
                     return;
                 }
-                match owner_client::find_owner_token(workspace, &app_id) {
+                match owner_client::find_owner_token(Path::new(&identity.source_root), &app_id) {
                     None => OwnerExpectation::ObservationFailed {
                         reason: "owner is running but its runtime API credentials are unavailable"
                             .to_string(),

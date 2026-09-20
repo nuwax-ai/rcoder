@@ -60,6 +60,18 @@ impl AppService {
             shared_types::UserAppOperationKind::Start
         };
         validate_app_id(app_id)?;
+        self.discover_missing_identity(app_id).await?;
+        self.verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Prod)
+            .await?;
+        self.metadata
+            .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
+            .await?;
+        // Check priority intent before waiting on the local process guard. A
+        // completed Stop permits an explicit start, an active Stop never queues it.
+        self.metadata
+            .store
+            .check_compute_access(app_id, shared_types::UserAppOperationScope::Prod, true)
+            .await?;
         // restart 与带 url 的 deploy_controlled 一致：锁被占立即 Conflict；
         // start 保持排队——本身是等待型操作（等就绪数分钟），调用方宽超时
         // 预算覆盖排队。
@@ -125,6 +137,7 @@ impl AppService {
                         serde_json::json!({"target":target}),
                     )
                     .await?;
+                operation.authorize_mutation().await?;
                 guard.mark_mutating()?;
                 let result = if restart {
                     self.runtime.restart_app_target(&target).await
@@ -274,6 +287,7 @@ impl AppService {
                         serde_json::json!({"target":target,"wake_on_traffic":wake_on_traffic}),
                     )
                     .await?;
+                durable.authorize_mutation().await?;
                 self.apply_scale_zero(&target, wake_on_traffic, &previous, &operation)
                     .await
             }
@@ -510,6 +524,9 @@ impl AppService {
                     return Err(AppOperationError::InvalidState(format!(
                         "app {app_id} wake timed out; retry later"
                     )));
+                }
+                shared_types::WakeOutcome::Blocked { message, blocker } => {
+                    return Err(AppOperationError::ConflictBlocked { message, blocker });
                 }
                 shared_types::WakeOutcome::Failed(e) => {
                     return Err(AppOperationError::InvalidState(format!(

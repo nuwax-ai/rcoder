@@ -110,6 +110,7 @@ impl<'a> AgentContainerStarter<'a> {
         } = prepared;
         let ContainerCreateParams {
             execution_context,
+            creation_cancelled,
             project_id,
             user_id,
             service_type,
@@ -123,6 +124,14 @@ impl<'a> AgentContainerStarter<'a> {
             // agent 路径一并忽略。
             ..
         } = params;
+
+        let is_cancelled = || {
+            execution_context.is_some()
+                && creation_cancelled.load(std::sync::atomic::Ordering::Acquire)
+        };
+        if is_cancelled() {
+            return Err(DockerError::BuilderCreationCancelled);
+        }
 
         let start_phase = Instant::now();
 
@@ -296,6 +305,14 @@ impl<'a> AgentContainerStarter<'a> {
         // PGDATA 落 overlay, builder 重建丢库）。PGDATA/DBX_DATA_DIR 使 dev 数据
         // 落卷持久（镜像 start-up.sh 均为 ${VAR:-...} 覆盖模式）。
         if matches!(service_type, ServiceType::UserappBuilder) {
+            builder = builder.env(
+                "APP_CLI_REQUIRE_PG",
+                service_config
+                    .environment
+                    .get("APP_CLI_REQUIRE_PG")
+                    .map(String::as_str)
+                    .unwrap_or("1"),
+            );
             builder = builder
                 .env(
                     "USERAPP_WORKSPACE_DIR",
@@ -344,7 +361,15 @@ impl<'a> AgentContainerStarter<'a> {
         );
 
         let docker_create_started = Instant::now();
-        self.manager.create_container(config).await?;
+        if is_cancelled() {
+            return Err(DockerError::BuilderCreationCancelled);
+        }
+        // Never cancel this future: Docker may still be creating or starting
+        // the container. Only acknowledged writes permit handing over the lease.
+        let created = self.manager.create_container(config).await?;
+        if is_cancelled() {
+            return Err(DockerError::BuilderCreationCancelled);
+        }
         info!(
             "[DOCKER_MGR] Docker create_container finished in {:?} (total {:?}): container_id={}",
             docker_create_started.elapsed(),
@@ -383,7 +408,12 @@ impl<'a> AgentContainerStarter<'a> {
         let info = self
             .manager
             .get_agent_info(lookup_key)
-            .await?
+            .await
+            .map_err(|source| DockerError::ContainerCreationIncomplete {
+                container_id: created.container_id.clone(),
+                phase: crate::ContainerCreationPhase::Observe,
+                source: Box::new(source),
+            })?
             .ok_or_else(|| {
                 DockerError::ContainerStartError(
                     "unable to get info after container started".to_string(),
@@ -398,7 +428,19 @@ impl<'a> AgentContainerStarter<'a> {
             start_phase.elapsed()
         );
         let health_started = Instant::now();
-        match crate::health::wait_for_service_ready(&info.service_url).await {
+        let health = tokio::select! {
+            biased;
+            () = async {
+                if execution_context.is_none() {
+                    std::future::pending::<()>().await;
+                }
+                while !is_cancelled() {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            } => return Err(DockerError::BuilderCreationCancelled),
+            result = crate::health::wait_for_service_ready(&info.service_url) => result,
+        };
+        match health {
             Ok(_) => {
                 info!(
                     "Agent container started: {} (health {:?}, total {:?})",

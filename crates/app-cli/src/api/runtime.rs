@@ -82,6 +82,47 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Read-only recovery evidence; never modifies journal, credentials or admission.
+#[utoipa::path(
+    get,
+    path = "/v1/runtime/recovery",
+    params(("X-Deploy-Token" = String, Header, description = "Owner control token")),
+    responses(
+        (status = 200, description = "Recovery evidence in data; not permission to resume", body = serde_json::Value),
+        (status = 403, description = "Invalid owner token"),
+        (status = 503, description = "Recovery evidence unavailable")
+    ),
+    tag = "Runtime Control"
+)]
+pub(super) async fn recovery(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_token(
+        &state,
+        headers
+            .get("x-deploy-token")
+            .and_then(|value| value.to_str().ok()),
+    )?;
+    if state.server.initializing() {
+        return Err(reject(
+            "ERR_INVALID_STATE",
+            "startup recovery has not completed",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ));
+    }
+    let view = state.server.recovery_view().await.map_err(|error| {
+        reject(
+            "ERR_RECOVERY_REQUIRED",
+            &format!("read recovery evidence: {error:#}"),
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    })?;
+    Ok(Json(
+        json!({ "success": true, "code": "OK", "data": view, "message": "ok" }),
+    ))
+}
+
 /// `GET /v1/runtime/identity` — 所有者身份与能力（无 secrets）。
 #[utoipa::path(
     get,
@@ -149,8 +190,8 @@ pub(super) async fn status(
     request_body = RuntimeOperationBody,
     params(("X-Deploy-Token" = String, Header, description = "Owner control token (APP_CLI_DEPLOY_TOKEN or owner state file)")),
     responses(
-        (status = 202, description = "Operation accepted or idempotent replay", body = serde_json::Value),
-        (status = 409, description = "Conflict: id/replay/busy/revision/instance/recovery", body = serde_json::Value),
+        (status = 202, description = "Operation accepted or idempotent replay. Explicit Source start/restart or Artifact deployment with PG credentials can resolve a credentials-only owner hold for the confirmed artifact; uncertain operations remain protected.", body = serde_json::Value),
+        (status = 409, description = "Conflict: id/replay/busy/revision/instance/recovery. Owner startup recovery blocks new business operations before persistence; Stop retains kernel safety checks.", body = serde_json::Value),
     ),
     tag = "Runtime Control"
 )]
@@ -178,7 +219,43 @@ pub(super) async fn submit_operation(
             StatusCode::BAD_REQUEST,
         )
     })?;
-    match kernel.admit(body.request).await {
+    let credential_mode = match (&body.request.kind, &body.request.profile) {
+        (
+            shared_types::RuntimeOperationKind::Start | shared_types::RuntimeOperationKind::Restart,
+            shared_types::RunProfileInput::Source { .. },
+        ) => Some(true),
+        (
+            shared_types::RuntimeOperationKind::Deploy,
+            shared_types::RunProfileInput::Artifact { .. },
+        ) => Some(false),
+        _ => None,
+    };
+    let supplying_credentials = if let Some(source_only) = credential_mode {
+        state
+            .server
+            .can_supply_run_credentials(
+                body.request
+                    .run_config
+                    .as_ref()
+                    .and_then(|config| config.pg.as_ref()),
+                source_only,
+            )
+            .map_err(|error| {
+                reject(
+                    "ERR_RECOVERY_REQUIRED",
+                    &format!("verify credential recovery: {error:#}"),
+                    StatusCode::CONFLICT,
+                )
+            })?
+    } else {
+        false
+    };
+    let admission = if state.server.runtime_recovery_hold_active() && !supplying_credentials {
+        kernel.admit_with_owner_hold(body.request, true).await
+    } else {
+        kernel.admit(body.request).await
+    };
+    match admission {
         Ok(outcome) => {
             let view = match outcome {
                 crate::runtime_kernel::AdmissionOutcome::Accepted(view) => view,

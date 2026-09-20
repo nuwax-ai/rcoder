@@ -211,6 +211,8 @@ fn assemble_deploy_dir(workspace: &Path, tasks: &[BuildTask], deploy_dir: &Path)
     }
     fs::create_dir_all(deploy_dir).with_context(|| format!("create {}", deploy_dir.display()))?;
 
+    runtime_state_layout::record_project_origin(workspace, deploy_dir)?;
+
     for task in tasks {
         let dst = deploy_dir.join(&task.dir_label);
         if dst.exists() {
@@ -396,6 +398,10 @@ strip_prefix = true
             return;
         }
         assemble_deploy_dir(ws, &tasks, &deploy).expect("assemble");
+        assert_eq!(
+            runtime_state_layout::resolve_project_origin(&deploy).expect("runtime origin"),
+            fs::canonicalize(ws).expect("source root"),
+        );
 
         assert!(deploy.join("backend/server").is_file(), "zip 根文件未解压");
         assert!(

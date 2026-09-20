@@ -454,5 +454,11 @@
       "scenario": "docker_runtime_sigterm_drain_contract",
       "backend": "docker-shutdown"
     }
+  ],
+  "userapp_manual_owner_multi_process_control": [
+    {
+      "scenario": "userapp_manual_owner_multi_process_control",
+      "backend": "compose"
+    }
   ]
 }

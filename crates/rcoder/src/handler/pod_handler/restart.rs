@@ -1,27 +1,72 @@
 use super::helpers::*;
 use super::*;
 
-/// 重启容器（销毁后重建）
-///
-/// 根据 user_id 和 project_id 重启容器。
-/// 如果容器存在，先销毁再创建新容器；如果不存在，直接创建。
+/// 重启计算资源，先确认旧实例退出，再启动同一工作区的新运行实例。
+/// UserApp 返回 202 和原操作身份；普通 agent 保留既有同步重启路径。
 #[utoipa::path(
     post,
     path = "/computer/pod/restart",
     request_body(content = RestartPodRequest, description = "重启容器请求"),
     responses(
+        (status = 202, description = "UserApp compute intent accepted; poll status_url. No internal request queue.", body = HttpResult<crate::userapp_builder::compute_control::ComputeOperationView>),
         (status = 200, description = "成功重启容器", body = HttpResult<RestartPodResponse>),
+        (status = 409, description = "Another compute control is in progress; no internal queue"),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
         (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
     operation_id = "pod_restart",
-    summary = "重启容器（销毁后重建）",
-    description = "Agent requests restart or recreate their container. UserApp dev requests carry user_id, lifecycle_id and request_id into durable admission, restart captured compute identity, retain workspace storage, and never recreate after an uncertain restart error. UserApp prod requests use the production lifecycle coordinator."
+    summary = "重启计算资源并保留数据",
+    description = "UserApp dev/prod requests use app_id and app_stage, with optional lifecycle_id and request_id. Returns HTTP 202 with operation_id and status_url. Stop has priority over Restart; new Start/Restart during Stop is rejected without queuing. Ordinary business slots do not block admission. The coordinator drains old writes, stops the captured physical instance, and starts it with the original PVC. Unknown writes remain visible as recovery_required. Ordinary agent restart behavior is unchanged."
 )]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_restart(
+    State(state): State<Arc<AppState>>,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<RestartPodRequest>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse;
+    let target = parse_app_target(
+        request.app_id.as_deref(),
+        request.app_stage.as_deref(),
+        request.service_type.as_deref(),
+    );
+    let (app_id, scope) = match target {
+        Ok(AppTarget::Dev(id)) => (id, shared_types::UserAppOperationScope::Dev),
+        Ok(AppTarget::Prod(id)) => (id, shared_types::UserAppOperationScope::Prod),
+        Ok(AppTarget::NotApp) => {
+            return legacy_pod_restart(State(state), I18nJsonOrQuery(request))
+                .await
+                .map(IntoResponse::into_response);
+        }
+        Err(error) => {
+            return Err(AppError::with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                error,
+            ));
+        }
+    };
+    let operation = crate::userapp_builder::compute_control::submit(
+        &state,
+        app_id,
+        scope,
+        shared_types::ComputeControlAction::Restart,
+        shared_types::UserAppControlRequest {
+            lifecycle_id: request.lifecycle_id,
+            request_id: request.request_id,
+        },
+    )
+    .await
+    .map_err(|error| crate::userapp_builder::control_error(&error))?;
+    let operation_id = operation.operation_id.clone();
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        HttpResult::success(operation).with_operation_id(operation_id),
+    )
+        .into_response())
+}
+
+async fn legacy_pod_restart(
     State(state): State<Arc<AppState>>,
     I18nJsonOrQuery(request): I18nJsonOrQuery<RestartPodRequest>,
 ) -> Result<HttpResult<RestartPodResponse>, AppError> {

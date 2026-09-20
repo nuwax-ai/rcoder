@@ -359,6 +359,16 @@ async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box
                     .into_response(),
                 ));
             }
+            shared_types::WakeOutcome::Blocked { message, blocker } => {
+                let mut error = shared_types::AppError::with_message(
+                    shared_types::error_codes::ERR_CONFLICT,
+                    message,
+                );
+                if !blocker.operation_id.is_empty() {
+                    error = error.with_operation_id(blocker.operation_id.clone());
+                }
+                return Err(Box::new(error.with_blocker(blocker).into_response()));
+            }
             shared_types::WakeOutcome::Failed(e) => {
                 warn!("[USERAPP_FORWARD] prod wake failed: app_id={app_id}: {e}");
                 return Err(Box::new(

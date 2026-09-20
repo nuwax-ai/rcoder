@@ -6,6 +6,10 @@ mod activity_tests;
 #[cfg(test)]
 mod admission_cancellation_tests;
 mod codec;
+mod compute;
+mod compute_execution;
+#[cfg(all(test, feature = "userapp-turso"))]
+mod compute_tests;
 #[cfg(test)]
 mod concurrency_tests;
 mod configuration;
@@ -95,6 +99,288 @@ impl super::control::UserAppStoreControl for ToastyUserAppStore {
 
 #[async_trait::async_trait]
 impl UserAppLifecycleStore for ToastyUserAppStore {
+    async fn get_recovery_witness(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> Result<Option<UserAppDiscoveredIdentity>, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let lifecycle_id = lifecycle_id.to_owned();
+        self.run(true, move |tx, _backend| {
+            Box::pin(async move {
+                let Some(row) =
+                    crate::db::models::RecoveryWitness::filter_by_app_id_and_lifecycle_id(
+                        &app_id,
+                        &lifecycle_id,
+                    )
+                    .first()
+                    .exec(tx)
+                    .await
+                    .map_err(storage)?
+                else {
+                    return Ok(None);
+                };
+                let witness: UserAppDiscoveredIdentity =
+                    serde_json::from_str(&row.witness_json).map_err(storage)?;
+                witness
+                    .validate()
+                    .map_err(UserAppStoreError::InvalidOperation)?;
+                if witness.app_id != app_id || witness.lifecycle_id != lifecycle_id {
+                    return Err(UserAppStoreError::LifecycleConflict);
+                }
+                Ok(Some(witness))
+            })
+        })
+        .await
+    }
+    async fn restore_discovered_identity(
+        &self,
+        discovered: &UserAppDiscoveredIdentity,
+    ) -> Result<UserAppLifecycleRecord, UserAppStoreError> {
+        let discovered = discovered.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { compute::restore_identity(tx, backend, &discovered).await })
+        })
+        .await
+    }
+
+    async fn admit_compute_control(
+        &self,
+        request: &ComputeControlRequest,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let request = request.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { compute::admit(tx, backend, &request).await })
+        })
+        .await
+    }
+    async fn get_compute_control(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<ComputeControlRecord>, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        self.run(true, move |tx, _| {
+            Box::pin(async move { compute::get(tx, &app_id, &operation_id).await })
+        })
+        .await
+    }
+
+    async fn check_compute_access(
+        &self,
+        app_id: &str,
+        scope: UserAppOperationScope,
+        explicit_start: bool,
+    ) -> Result<(), UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute::check_access(tx, backend, &app_id, scope, explicit_start).await
+            })
+        })
+        .await
+    }
+
+    async fn finalize_compute_interrupted_operation(
+        &self,
+        identity: &ComputeExecutorIdentity,
+        snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let identity = identity.clone();
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::finalize_interrupted(tx, backend, &identity, &snapshot).await
+            })
+        })
+        .await
+    }
+
+    async fn resume_compute_drain(
+        &self,
+        snapshot: &ComputeControlRecord,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { compute_execution::resume_drain(tx, backend, &snapshot).await })
+        })
+        .await
+    }
+
+    async fn finalize_confirmed_compute(
+        &self,
+        snapshot: &ComputeControlRecord,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(
+                async move { compute_execution::finalize_confirmed(tx, backend, &snapshot).await },
+            )
+        })
+        .await
+    }
+
+    async fn finalize_observed_compute_stop(
+        &self,
+        snapshot: &ComputeControlRecord,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::finalize_observed_stop(tx, backend, &snapshot).await
+            })
+        })
+        .await
+    }
+
+    async fn finalize_observed_compute_restart(
+        &self,
+        snapshot: &ComputeControlRecord,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::finalize_observed_restart(tx, backend, &snapshot).await
+            })
+        })
+        .await
+    }
+
+    async fn resume_compute_restart_start(
+        &self,
+        snapshot: &ComputeControlRecord,
+        target: &UserAppMutationTarget,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let target = target.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::resume_stopped_restart(tx, backend, &snapshot, &target).await
+            })
+        })
+        .await
+    }
+
+    async fn resume_builder_restart_start(
+        &self,
+        snapshot: &ComputeControlRecord,
+        target: &BuilderControlTarget,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let target = target.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::resume_builder_restart(tx, backend, &snapshot, &target).await
+            })
+        })
+        .await
+    }
+
+    async fn claim_compute_control(
+        &self,
+        identity: &ComputeExecutorIdentity,
+        expected_revision: i64,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let identity = identity.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { compute::claim(tx, backend, &identity, expected_revision).await })
+        })
+        .await
+    }
+    async fn check_compute_executor(
+        &self,
+        identity: &ComputeExecutorIdentity,
+    ) -> Result<(), UserAppStoreError> {
+        let identity = identity.clone();
+        self.run(true, move |tx, _| {
+            Box::pin(async move { compute::check(tx, &identity).await })
+        })
+        .await
+    }
+    async fn bind_compute_lease(
+        &self,
+        identity: &ComputeExecutorIdentity,
+        receipt: &UserAppOperationLeaseReceipt,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let identity = identity.clone();
+        let receipt = receipt.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { compute_execution::bind(tx, backend, &identity, &receipt).await })
+        })
+        .await
+    }
+    async fn advance_compute_control(
+        &self,
+        progress: &ComputeControlProgress,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let progress = progress.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { compute_execution::advance(tx, backend, &progress).await })
+        })
+        .await
+    }
+    async fn forget_compute_lease(
+        &self,
+        identity: &ComputeExecutorIdentity,
+        receipt: &UserAppOperationLeaseReceipt,
+    ) -> Result<(), UserAppStoreError> {
+        let identity = identity.clone();
+        let receipt = receipt.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(
+                async move { compute_execution::forget(tx, backend, &identity, &receipt).await },
+            )
+        })
+        .await
+    }
+    async fn acknowledge_compute_drain(
+        &self,
+        acknowledgement: &ComputeControlDrainAcknowledgement,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let acknowledgement = acknowledgement.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::acknowledge_drain(tx, backend, &acknowledgement).await
+            })
+        })
+        .await
+    }
+    async fn mark_restart_archive_cleaned(
+        &self,
+        snapshot: &ComputeControlRecord,
+    ) -> Result<(), UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::mark_archive_cleaned(tx, backend, &snapshot).await
+            })
+        })
+        .await
+    }
+    async fn scan_compute_controls(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<ComputeControlRecord>, UserAppStoreError> {
+        let after = after.map(str::to_owned);
+        self.run(true, move |tx, backend| {
+            Box::pin(
+                async move { compute_execution::scan(tx, backend, after.as_deref(), limit).await },
+            )
+        })
+        .await
+    }
+    async fn check_business_execution(
+        &self,
+        context: &UserAppExecutionContext,
+    ) -> Result<(), UserAppStoreError> {
+        let context = context.clone();
+        self.run(true, move |tx, _| {
+            Box::pin(async move { compute::check_business_execution(tx, &context).await })
+        })
+        .await
+    }
     async fn get_resource_binding(
         &self,
         service_type: &ServiceType,
@@ -375,6 +661,79 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         self.run(false, move |tx, backend| {
             Box::pin(async move {
                 ops::confirm_database_preparation_recovery(tx, backend, &snapshot, &evidence).await
+            })
+        })
+        .await
+    }
+    async fn finalize_builder_creation_rejection(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        rejection: &RuntimeRequestRejection,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let rejection = rejection.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                ops::finalize_builder_creation_rejection(tx, backend, &snapshot, Some(&rejection))
+                    .await
+            })
+        })
+        .await
+    }
+    async fn finalize_observed_wake(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { ops::finalize_observed_wake(tx, backend, &snapshot).await })
+        })
+        .await
+    }
+    async fn finalize_observed_hot_failure(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &HotDeploymentFailureEvidence,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let evidence = evidence.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                ops::finalize_observed_hot_failure(tx, backend, &snapshot, &evidence).await
+            })
+        })
+        .await
+    }
+    async fn finalize_builder_creation_cancellation(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                ops::finalize_builder_creation_rejection(tx, backend, &snapshot, None).await
+            })
+        })
+        .await
+    }
+    async fn confirm_builder_creation_recovery(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &BuilderCreationEvidence,
+        management_ready: bool,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let evidence = evidence.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                ops::confirm_builder_creation_recovery(
+                    tx,
+                    backend,
+                    &snapshot,
+                    &evidence,
+                    management_ready,
+                )
+                .await
             })
         })
         .await

@@ -34,6 +34,20 @@ pub struct StartedDev {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StoppedDev {
     pub killed_pids: Vec<KilledPid>,
+    /// The owner acknowledged stopping its services; its coordinator stays alive.
+    #[serde(skip)]
+    pub owner_stopped: bool,
+}
+impl StoppedDev {
+    pub fn message(&self) -> &'static str {
+        if self.killed_pids.iter().any(|pid| !pid.killed) {
+            "Partially stopped but continue execution"
+        } else if self.owner_stopped || !self.killed_pids.is_empty() {
+            "Stopped"
+        } else {
+            "No running process found"
+        }
+    }
 }
 
 /// keep-alive 结果。

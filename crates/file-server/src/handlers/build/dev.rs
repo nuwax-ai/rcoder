@@ -168,14 +168,7 @@ pub(crate) async fn stop_dev(
     let stopped = state.dev_server.stop_dev(&q.project_id).await?;
     state.log_cache.delete(&q.project_id)?;
     // message 对齐 nuwax stopDevUtils: 全杀 "Stopped" / 部分杀 "Partially stopped..." / 无候选 "No running process found"
-    let all_killed = stopped.killed_pids.iter().all(|k| k.killed);
-    let message = if stopped.killed_pids.is_empty() {
-        "No running process found"
-    } else if all_killed {
-        "Stopped"
-    } else {
-        "Partially stopped but continue execution"
-    };
+    let message = stopped.message();
     Ok(Json(DevStopped {
         success: true,
         message: message.to_string(),

@@ -272,6 +272,63 @@ impl AgentContainerRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn recover_builder_creation(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderCreationEvidence>> {
+        if let Some(receipt) = self.read_builder_cancellation(context).await? {
+            self.release_captured_application_operation(context, &receipt.lease)
+                .await?;
+            return Err(ContainerRuntimeError::CreationCancelled);
+        }
+        let receipt = match self.read_builder_creation_receipt(context).await? {
+            Some(receipt) => Some(receipt),
+            None => self.read_builder_service_creation(context).await?,
+        };
+        let Some(receipt) = receipt else {
+            return Ok(None);
+        };
+        self.release_captured_application_operation(context, &receipt.lease)
+            .await?;
+        Ok(Some(shared_types::BuilderCreationEvidence {
+            creation_lease_released: true,
+            target: receipt.target,
+            container: receipt.container,
+        }))
+    }
+
+    async fn capture_builder_orphan_stop(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderOrphanStopTarget>> {
+        self.capture_orphan_stop(context, None, false).await
+    }
+    async fn inspect_builder_orphan_stop(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderOrphanStopTarget>> {
+        self.capture_orphan_stop(context, None, true).await
+    }
+    async fn capture_bound_builder_orphan_stop(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderOrphanStopTarget>> {
+        self.capture_orphan_stop(context, binding, false).await
+    }
+    async fn stop_builder_orphan(
+        &self,
+        target: &shared_types::BuilderOrphanStopTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.apply_orphan_stop(target).await
+    }
+    async fn confirm_builder_orphan_stopped(
+        &self,
+        target: &shared_types::BuilderOrphanStopTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.observe_orphan_stopped(target).await
+    }
+
     async fn capture_builder_control(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -285,6 +342,13 @@ impl AgentContainerRuntime for KubernetesRuntime {
         command: Vec<String>,
     ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
         self.exec_bound_builder(target, command).await
+    }
+
+    async fn start_builder_control(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        self.start_builder_compute(target).await
     }
 
     async fn apply_builder_control(
@@ -303,6 +367,57 @@ impl AgentContainerRuntime for KubernetesRuntime {
             }
         }
         Ok(result)
+    }
+
+    async fn reconcile_builder_compute_stop(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.reconcile_builder_stop_receipt(target).await
+    }
+
+    fn supports_builder_compute_fencing(&self) -> bool {
+        true
+    }
+
+    async fn archive_builder_restart(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderRestartTemplate>> {
+        self.archive_builder_template(target).await.map(Some)
+    }
+    async fn restore_builder_restart(
+        &self,
+        template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.restore_builder_template(template).await
+    }
+    async fn capture_builder_compute_volumes(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Vec<shared_types::AppResourceIdentity>> {
+        self.capture_builder_volume_witness(target).await
+    }
+
+    async fn fence_builder_compute_write(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.fence_builder_conditional_write(target).await
+    }
+
+    async fn reconcile_builder_compute_start(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        self.reconcile_builder_start_receipt(target).await
+    }
+
+    async fn prepare_builder_compute_retry(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderControlTarget>> {
+        self.prepare_builder_conditional_retry(target).await
     }
 
     async fn create_container(
@@ -345,11 +460,67 @@ impl AgentContainerRuntime for KubernetesRuntime {
                 event_publisher: self.event_publisher.clone(),
                 event_counters: self.event_counters.clone(),
             };
+            let context = params.execution_context.clone();
+            let binding = params.resource_binding.clone();
             return tokio::spawn(async move {
                 let result = if params.resource_binding.is_some() {
                     runtime.resume_bound_builder(&params).await
                 } else {
-                    runtime.create_agent_container(params).await
+                    runtime
+                        .create_agent_container_with_creation_receipt(params, lease.receipt())
+                        .await
+                };
+                let result = match (result, context.as_ref()) {
+                    (Ok(info), Some(context)) => {
+                        let recorded = async {
+                            let target = runtime
+                                .capture_builder_compute_with_binding(
+                                    context,
+                                    binding.as_ref(),
+                                    false,
+                                )
+                                .await?;
+                            let receipt = super::builder_creation_receipt::BuilderCreationReceipt {
+                                target,
+                                container: info.clone(),
+                                lease: lease.receipt().ok_or_else(|| {
+                                    ContainerRuntimeError::ConfigurationError(
+                                        "Builder creation lease receipt missing".into(),
+                                    )
+                                })?,
+                            };
+                            if binding.is_some() {
+                                // A resumed builder needs the same final Service
+                                // commit as a newly created one. Keep its proof
+                                // in that mutation so a crash before the archive
+                                // write can still be recovered without replay.
+                                runtime.commit_builder_service_creation(&receipt).await?;
+                            }
+                            runtime.save_builder_creation_receipt(&receipt).await
+                        }
+                        .await;
+                        recorded.map(|()| info)
+                    }
+                    (Err(ContainerRuntimeError::CreationCancelled), Some(context)) => {
+                        let recorded = async {
+                            let receipt =
+                                super::builder_creation_receipt::BuilderCancellationReceipt {
+                                    context: context.clone(),
+                                    lease: lease.receipt().ok_or_else(|| {
+                                        ContainerRuntimeError::ConfigurationError(
+                                            "Builder cancellation lease receipt missing".into(),
+                                        )
+                                    })?,
+                                };
+                            runtime.save_builder_cancellation(&receipt).await
+                        }
+                        .await;
+                        match recorded {
+                            Ok(()) => Err(ContainerRuntimeError::CreationCancelled),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    (result, _) => result,
                 };
                 super::builder_completion::finish(lease, result).await
             })

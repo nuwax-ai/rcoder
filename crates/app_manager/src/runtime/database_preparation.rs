@@ -322,6 +322,7 @@ impl AppService {
                     })?,
                 )
                 .await?;
+            operation.authorize_mutation().await?;
             submitted = true; // before durable intent: its commit can become unknown
             evidence.stage = DatabasePreparationStage::StartSubmitted;
             operation

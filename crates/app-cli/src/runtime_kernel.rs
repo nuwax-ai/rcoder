@@ -84,6 +84,13 @@ pub(crate) struct RecoveryScan {
     pub blocked: Vec<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancellationReceipt {
+    operation_id: String,
+    request_digest: String,
+}
+
 /// endpoint 发现记录（cross-platform.md §3）：owner 绑定成功后原子发布。
 ///
 /// **是发现线索，不是所有权证明**——客户端连接后必须经
@@ -264,6 +271,36 @@ impl RuntimeStore {
             .join(format!("{operation_id}.jsonl"))
     }
 
+    fn cancellation_path(&self, operation_id: &str) -> PathBuf {
+        self.root
+            .join("cancellations")
+            .join(format!("{operation_id}.json"))
+    }
+
+    fn store_cancellation(&self, operation: &StoredOperation) -> Result<()> {
+        write_json(
+            &self.cancellation_path(&operation.view.operation_id),
+            &CancellationReceipt {
+                operation_id: operation.view.operation_id.clone(),
+                request_digest: operation.view.request_digest.clone(),
+            },
+        )
+    }
+
+    fn cancellation_recorded(&self, operation: &StoredOperation) -> Result<bool> {
+        let Some(value) = read_json(&self.cancellation_path(&operation.view.operation_id))? else {
+            return Ok(false);
+        };
+        let receipt: CancellationReceipt =
+            serde_json::from_value(value).context("decode cancellation receipt")?;
+        anyhow::ensure!(
+            receipt.operation_id == operation.view.operation_id
+                && receipt.request_digest == operation.view.request_digest,
+            "cancellation receipt identity mismatch"
+        );
+        Ok(true)
+    }
+
     /// owner 绑定成功后原子发布 endpoint 发现记录（cross-platform.md §3）。
     /// 多项目天然隔离：状态根按 application_id 分目录，各项目各一份记录。
     pub(crate) fn store_endpoint(&self, record: &EndpointRecord) -> Result<()> {
@@ -293,7 +330,11 @@ impl RuntimeStore {
     /// 本地凭据文件（cross-platform.md §3）：token 落盘状态根，Unix 0600。
     /// 平台读此文件对既有 owner 提交运行操作；凭据不经命令行/日志外泄。
     pub(crate) fn store_token(&self, token: &str) -> Result<()> {
-        let destination = self.root.join("token");
+        self.store_private_bytes("token", token.trim().as_bytes())
+    }
+
+    fn store_private_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let destination = self.root.join(name);
         let mut file = tempfile::NamedTempFile::new_in(&self.root)
             .context("create private owner credential file")?;
         let path = file.path();
@@ -326,12 +367,16 @@ impl RuntimeStore {
         // Protect the empty temporary file before writing credentials, then
         // publish atomically so a concurrent CLI never reads a partial token.
         use std::io::Write as _;
-        file.write_all(token.trim().as_bytes())
+        file.write_all(bytes)
             .and_then(|_| file.as_file().sync_all())
             .context("persist owner credential")?;
         file.persist(&destination)
             .map_err(|error| error.error)
             .context("publish owner credential file")?;
+        #[cfg(unix)]
+        std::fs::File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .context("sync private credential directory")?;
         Ok(())
     }
 
@@ -366,6 +411,7 @@ impl RuntimeStore {
                 "operations".into(),
                 "events".into(),
                 "source-profile".into(),
+                "project-origin-execution".into(),
                 // Both routes use owner-controlled preparation and activation.
                 "deploy-artifact-url".into(),
                 "deploy-artifact-id".into(),
@@ -530,6 +576,7 @@ const RUNTIME_STATE_ENTRIES: &[&str] = &[
     "identity.json",
     "operations",
     "events",
+    "cancellations",
     "token",
     "endpoint.json",
 ];
@@ -707,12 +754,35 @@ impl RuntimeKernel {
     /// 不再被视为"无事发生"**——恢复保护保持置位，写操作被阻断（`blocked`
     /// 数量经日志暴露，操作员裁决后删除/修复对应文件并重启解除）。
     pub(crate) async fn recover(&self) -> Result<Vec<String>> {
-        let scan = self.store.recover_unfinished_operations()?;
+        let mut scan = self.store.recover_unfinished_operations()?;
         let mut guard = self.admission.lock().await;
         // 恢复保护：在途操作被标记 RecoveryRequired，或存在不可判定记录
         // 时拒绝新写（spec §3.3 崩溃注入语义；R04 把 fail-closed 从注释
         // 变成实际行为）。
         guard.recovery_protection = !scan.recovered.is_empty() || !scan.blocked.is_empty();
+        for id in &scan.recovered {
+            let recorded = self
+                .store
+                .load_operation(id)
+                .and_then(|operation| operation.context("recovered operation disappeared"))
+                .and_then(|operation| self.store.cancellation_recorded(&operation));
+            let requested = match recorded {
+                Ok(requested) => requested,
+                Err(error) => {
+                    tracing::error!(operation_id = %id, %error, "Cancellation recovery requires reconciliation");
+                    scan.blocked
+                        .push(self.store.cancellation_path(id).display().to_string());
+                    guard.recovery_protection = true;
+                    true
+                }
+            };
+            if requested {
+                self.cancelled
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("cancel registry lock poisoned"))?
+                    .insert(id.clone());
+            }
+        }
         if !scan.blocked.is_empty() {
             tracing::error!(
                 count = scan.blocked.len(),
@@ -737,10 +807,195 @@ impl RuntimeKernel {
         })
     }
 
+    /// Startup-only reconciliation after the previous owner was quiesced.
+    /// Active/StartupFailed confirms the artifact, while the caller verifies
+    /// current process quiescence and migrations. An uncommitted terminal result
+    /// becomes Failed (or Cancelled), never an invented success.
+    pub(crate) async fn reconcile_quiesced_operation(
+        &self,
+        receipt: &crate::server::journal::Receipt,
+    ) -> Result<bool> {
+        use crate::server::journal::Boundary;
+        let preparation_only = receipt.boundary == Boundary::Preparing
+            && matches!(
+                receipt.operation.phase,
+                shared_types::AppCliDeployPhase::Deploying
+                    | shared_types::AppCliDeployPhase::Failed
+            )
+            && matches!(
+                receipt.operation.deploy_stage,
+                shared_types::app_cli_deploy::AppDeploymentStage::Pending
+                    | shared_types::app_cli_deploy::AppDeploymentStage::Failed
+            );
+        let confirmed_boundary = matches!(
+            (&receipt.boundary, receipt.operation.phase),
+            (
+                Boundary::StartupFailed,
+                shared_types::AppCliDeployPhase::Failed
+            ) | (Boundary::Active, shared_types::AppCliDeployPhase::Running)
+        ) && receipt.operation.persisted
+            && receipt.operation.deploy_stage
+                == shared_types::app_cli_deploy::AppDeploymentStage::Succeeded;
+        if !(preparation_only || confirmed_boundary)
+            || receipt.generation != self.identity.deployment_generation_id
+            || receipt.operation.recovery.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(id) = receipt.request.runtime_operation_id.as_ref() else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            id == &receipt.operation.operation_id,
+            "startup failure journal operation mismatch"
+        );
+        let mut guard = self.admission.lock().await;
+        anyhow::ensure!(
+            guard.active_operation_id.is_none()
+                && guard.pending_stop.is_none()
+                && guard.pending_restart.is_none(),
+            "runtime execution is active during recovery"
+        );
+        let Some(mut operation) = self.store.load_operation(id)? else {
+            return Ok(false);
+        };
+        if operation.view.state != RuntimeOperationState::RecoveryRequired {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            operation.view.kind != RuntimeOperationKind::Stop
+                && operation.request.workspace_id == self.identity.workspace_id
+                && operation.request.operation_id == *id
+                && operation.view.request_digest
+                    == runtime_request_digest(&operation.request).map_err(anyhow::Error::msg)?,
+            "startup failure runtime identity mismatch"
+        );
+        let cancelled = self.store.cancellation_recorded(&operation)?;
+        operation.view.state = if cancelled {
+            RuntimeOperationState::Cancelled
+        } else {
+            RuntimeOperationState::Failed
+        };
+        operation.view.error_code = Some(
+            if cancelled {
+                "ERR_CANCELLED"
+            } else if receipt.boundary == Boundary::Active || preparation_only {
+                "ERR_OPERATION_INTERRUPTED"
+            } else {
+                "ERR_STARTUP_FAILED"
+            }
+            .into(),
+        );
+        operation.view.error_message = if preparation_only {
+            receipt.operation.error.clone().or_else(|| {
+                Some("Previous owner stopped during preparation before directory activation".into())
+            })
+        } else if receipt.boundary == Boundary::Active {
+            Some(
+                "Previous owner was stopped before the operation terminal result was committed"
+                    .into(),
+            )
+        } else {
+            receipt.operation.error.clone()
+        };
+        operation.view.failure_detail = Some(RuntimeFailureDetail {
+            stage: "startup_reconciled".into(),
+            exit_code: None,
+            stderr_tail: None,
+            cleanup_confirmed: true,
+        });
+        self.store.store_operation(&operation)?;
+        self.emit_terminal_record(&operation);
+        self.refresh_recovery_protection(&mut guard);
+        Ok(true)
+    }
+
+    fn refresh_recovery_protection(&self, guard: &mut AdmissionState) {
+        let unresolved = (|| -> Result<bool> {
+            for entry in std::fs::read_dir(self.store.root.join("operations"))? {
+                let bytes = std::fs::read(entry?.path())?;
+                let other: StoredOperation = serde_json::from_slice(&bytes)?;
+                if !other.view.state.is_terminal() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })();
+        guard.recovery_protection = match unresolved {
+            Ok(unresolved) => unresolved,
+            Err(error) => {
+                tracing::error!(%error, "Remaining runtime recovery records could not be verified");
+                true
+            }
+        };
+    }
+
+    /// Called only during startup after all previous business processes have
+    /// been confirmed stopped. Complete the exact persisted stop intent; do not
+    /// execute a new stop or modify desired/revision.
+    pub(crate) async fn reconcile_quiesced_stop(&self) -> Result<bool> {
+        let mut guard = self.admission.lock().await;
+        anyhow::ensure!(
+            guard.active_operation_id.is_none()
+                && guard.pending_stop.is_none()
+                && guard.pending_restart.is_none(),
+            "runtime execution is active during stop recovery"
+        );
+        let (desired, revision) = self.store.load_desired()?;
+        if desired != DesiredState::Stopped {
+            return Ok(false);
+        }
+        let mut candidate = None;
+        for entry in std::fs::read_dir(self.store.root.join("operations"))? {
+            let operation: StoredOperation =
+                serde_json::from_slice(&std::fs::read(entry?.path())?)?;
+            if operation.view.state != RuntimeOperationState::RecoveryRequired
+                || operation.view.kind != RuntimeOperationKind::Stop
+                || operation.view.revision != revision
+            {
+                continue;
+            }
+            anyhow::ensure!(
+                operation.request.kind == RuntimeOperationKind::Stop
+                    && operation.request.workspace_id == self.identity.workspace_id
+                    && operation.view.operation_id == operation.request.operation_id
+                    && operation.request.expected_revision.checked_add(1) == Some(revision)
+                    && operation.view.request_digest
+                        == runtime_request_digest(&operation.request)
+                            .map_err(anyhow::Error::msg)?,
+                "persisted stop identity mismatch"
+            );
+            anyhow::ensure!(
+                candidate.is_none(),
+                "multiple operations claim the same stop revision"
+            );
+            candidate = Some(operation);
+        }
+        let Some(mut operation) = candidate else {
+            return Ok(false);
+        };
+        operation.view.state = RuntimeOperationState::Succeeded;
+        operation.view.error_code = None;
+        operation.view.error_message = None;
+        operation.view.failure_detail = None;
+        self.store.store_operation(&operation)?;
+        self.emit_terminal_record(&operation);
+        self.refresh_recovery_protection(&mut guard);
+        Ok(true)
+    }
+
     /// 受理（spec §3.3）：短锁内完成全部检查与持久化，执行派发在锁外。
     pub(crate) async fn admit(
         &self,
         request: RuntimeOperationRequest,
+    ) -> std::result::Result<AdmissionOutcome, AdmissionRejection> {
+        self.admit_with_owner_hold(request, false).await
+    }
+
+    pub(crate) async fn admit_with_owner_hold(
+        &self,
+        request: RuntimeOperationRequest,
+        owner_recovery_hold: bool,
     ) -> std::result::Result<AdmissionOutcome, AdmissionRejection> {
         if let Err(error) = validate_runtime_operation_request(&request) {
             return Err(AdmissionRejection {
@@ -822,6 +1077,13 @@ impl RuntimeKernel {
                 });
             }
             return Ok(AdmissionOutcome::Replayed(existing.view));
+        }
+        if owner_recovery_hold && request.kind != RuntimeOperationKind::Stop {
+            return Err(AdmissionRejection {
+                code: ERR_RECOVERY_REQUIRED,
+                message: "owner recovery must be resolved before starting business".into(),
+                active_operation_id: None,
+            });
         }
         if guard.recovery_protection {
             return Err(AdmissionRejection {
@@ -1314,17 +1576,30 @@ impl RuntimeKernel {
 
     /// 取消请求（受理态返回；不伪称立即完成——spec §3.2 cancel 语义）。
     pub(crate) async fn request_cancel(&self, operation_id: &str) -> Result<bool> {
-        let guard = self.admission.lock().await;
+        let mut guard = self.admission.lock().await;
         if guard.active_operation_id.as_deref() != Some(operation_id) {
             return Ok(false);
         }
         // R03：真实取消——记录墓碑，执行侧在副作用边界
         // （[`Self::is_cancelled`]）检查并在终态提交前收束为 Cancelled。
         // 不在此改写状态：终态仍由执行边界持久化（含取消场景的清理证据）。
-        self.cancelled
+        let operation = self
+            .store
+            .load_operation(operation_id)?
+            .context("active operation missing")?;
+        let mut cancelled = self
+            .cancelled
             .lock()
-            .map_err(|_| anyhow::anyhow!("cancel registry lock poisoned"))?
-            .insert(operation_id.to_string());
+            .map_err(|_| anyhow::anyhow!("cancel registry lock poisoned"))?;
+        // A successful cancel response means the intent survives owner restart.
+        // A failed durable write is uncertain: still prevent success in this
+        // process, and retain the operation's recovery fence.
+        if let Err(error) = self.store.store_cancellation(&operation) {
+            cancelled.insert(operation_id.to_string());
+            guard.recovery_protection = true;
+            return Err(error).context("persist cancellation intent");
+        }
+        cancelled.insert(operation_id.to_string());
         Ok(true)
     }
 

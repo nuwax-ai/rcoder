@@ -63,6 +63,39 @@ pub struct UserAppOperationLeaseBinding {
     pub receipt: UserAppOperationLeaseReceipt,
 }
 
+/// Creation may have returned before the control-store checkpoint was saved.
+/// Only a runtime receipt for this exact executor can resolve these stages.
+pub fn userapp_builder_creation_needs_runtime_receipt(op: &crate::UserAppOperationRecord) -> bool {
+    op.kind == crate::UserAppOperationKind::EnsureBuilder
+        && matches!(
+            op.state,
+            crate::UserAppOperationState::Running | crate::UserAppOperationState::RecoveryRequired
+        )
+        && op.executor_id.is_some()
+        && op.checkpoint.is_null()
+        && matches!(
+            op.step.as_str(),
+            "claimed"
+                | "creation_confirmation_timed_out"
+                | "worker_interrupted"
+                | "creation_result"
+        )
+}
+
+/// Evidence sufficient to drain an interrupted writer. A returned creation
+/// request with its runtime lease released need not have a healthy application
+/// endpoint: Stop must still be able to stop that confirmed physical instance.
+/// This predicate must never authorize a successful business result.
+pub fn userapp_operation_has_drain_evidence(operation: &crate::UserAppOperationRecord) -> bool {
+    userapp_operation_has_final_evidence(operation)
+        || (operation.kind == crate::UserAppOperationKind::EnsureBuilder
+            && operation.step == "builder_created_observed"
+            && serde_json::from_value::<crate::BuilderCreationEvidence>(
+                operation.checkpoint.clone(),
+            )
+            .is_ok_and(|evidence| evidence.validate_operation(operation).is_ok()))
+}
+
 /// A final durable checkpoint is proof of completed effects, never a license to
 /// repeat earlier I/O. Recovery may only release its original mutex and commit.
 pub fn userapp_operation_has_final_evidence(operation: &crate::UserAppOperationRecord) -> bool {

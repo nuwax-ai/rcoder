@@ -72,3 +72,13 @@ After implementation freezes, run `python3 tests-e2e/tools/turso_compose_contrac
 `userapp_concurrency_contract` 固定运行 23 个确定性组件测试（创建截止时间、取消观察者、晚订阅、恢复执行槽位、旧代次启动阻止、清空实例身份和不确定租约）。它不执行真实进程强杀，也不证明三个崩溃窗口恢复；单副本实际 HTTP 首开扇入由 `turso_compose_runtime` 单列覆盖；跨副本首开仍需 K8s 验收；`docker_lifecycle_crash` 实现前两个 SIGKILL 窗口。新增终态 receipt 扫描属于组件证据，不能将 legacy marker 的 native SIGKILL 测试作为新协议第三窗口验收。
 
 冻结RCoder源码快照运行三份Compose配置验收时，可用 `E2E_BUILD_AGENT_DOCKER_ROOT` 指定另行冻结的镜像仓库配置目录，默认仍为RCoder相邻的build-agent-docker。该目录必须含两份原始Compose配置；应将其内容纳入本轮输入清单与指纹，不指向运行中会被修改的工作树。
+
+### 手动 app-cli 与平台交替控制
+
+```bash
+CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userapp_manual_owner_multi_process_control
+```
+
+一个场景复用同一临时 builder 和轻量 Python HTTP 服务：独立进程启动 app-cli owner → RCoder 停服务 → 新 HTTP 客户端重复停止 → 新 app-cli run 客户端转交启动，两轮后最终停止。核查真实 HTTP、同一 owner、只剩一个 app-cli、容器与工作区保留，并清理本次捕获的容器 ID。无 LLM、无七语言模板构建。详细阶段及镜像身份在场景目录 `manual-owner.json`。
+
+本场景验证同一项目运行目录上的多客户端顺序控制，不代表多 RCoder 副本并发、源码/制品目录切换、控制器 Stop/Restart 或 K8s 验收。

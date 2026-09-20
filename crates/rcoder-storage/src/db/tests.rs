@@ -235,7 +235,7 @@ async fn baseline_is_repeatable_and_rejects_checksum_future_and_catalog_drift() 
     use super::schema::{self as storage_schema, Backend, Component};
     for tamper in [
         "UPDATE rcoder_schema_migrations SET checksum='changed'",
-        "UPDATE rcoder_schema_migrations SET version=2",
+        "UPDATE rcoder_schema_migrations SET version=version+100",
         "DROP INDEX userapp_operations_history",
         "DROP INDEX userapp_operations_unfinished",
         "DROP TABLE userapp_activity",
@@ -546,6 +546,32 @@ async fn unfinished_recovery_scan_uses_partial_index_and_catalog_rejects_wrong_p
         toasty::sql::statement("DROP INDEX userapp_operations_unfinished").exec(&mut db).await?;
         toasty::sql::statement("CREATE INDEX userapp_operations_unfinished ON userapp_operations(operation_id) WHERE terminal_at_us IS NOT NULL").exec(&mut db).await?;
         assert!(super::schema::initialize(&mut db, super::schema::Backend::Turso, &[super::schema::Component::Userapp]).await.is_err());
+        Ok(())
+    }).await.unwrap();
+    owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn compute_control_upgrade_preserves_v1_data_and_baseline_checksum() {
+    use super::schema::{self as schema, Backend, Component};
+    let owner = schema_owner().await;
+    owner.execute(|mut db| async move {
+        schema::initialize(&mut db, Backend::Turso, &[Component::Userapp]).await?;
+        // Reconstruct the exact released v1 catalog, retaining its original ledger.
+        toasty::sql::statement("DROP TABLE userapp_compute_controls").exec(&mut db).await?;
+        toasty::sql::statement("DROP TABLE userapp_compute_intents").exec(&mut db).await?;
+        toasty::sql::statement("DELETE FROM rcoder_schema_migrations WHERE component='userapp' AND version=2").exec(&mut db).await?;
+        toasty::sql::statement("INSERT INTO userapps(app_id,lifecycle_id,lifecycle_epoch,lifecycle_state,metadata_revision,created_at_us,updated_at_us) VALUES('keptapp','keptlife',1,'active',1,1,1)").exec(&mut db).await?;
+        let before = toasty::sql::query("SELECT checksum,schema_fingerprint FROM rcoder_schema_migrations WHERE component='userapp' AND version=1").exec(&mut db).await?;
+        schema::initialize(&mut db, Backend::Turso, &[Component::Userapp]).await?;
+        schema::initialize(&mut db, Backend::Turso, &[Component::Userapp]).await?;
+        let after = toasty::sql::query("SELECT checksum,schema_fingerprint FROM rcoder_schema_migrations WHERE component='userapp' AND version=1").exec(&mut db).await?;
+        assert_eq!(before, after, "released baseline must not be rewritten");
+        let kept = super::models::Application::filter_by_app_id("keptapp").first().exec(&mut db).await?.expect("application survives upgrade");
+        assert_eq!(kept.lifecycle_id, "keptlife");
+        let migrations = toasty::sql::query("SELECT version FROM rcoder_schema_migrations WHERE component='userapp' ORDER BY version").exec(&mut db).await?;
+        assert_eq!(migrations.len(), 2);
+        assert!(toasty::sql::statement("INSERT INTO userapp_compute_intents VALUES('keptapp','keptlife','dev',0,1,'stopped',NULL,1)").exec(&mut db).await.is_err());
         Ok(())
     }).await.unwrap();
     owner.shutdown().await.unwrap();

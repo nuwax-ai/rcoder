@@ -123,6 +123,16 @@ pub(crate) struct ResourceBinding {
 }
 
 #[derive(toasty::Model)]
+#[table = "userapp_recovery_witnesses"]
+#[key(app_id, lifecycle_id)]
+pub(crate) struct RecoveryWitness {
+    pub app_id: String,
+    pub lifecycle_id: String,
+    pub witness_json: String,
+    pub created_at_us: i64,
+}
+
+#[derive(toasty::Model)]
 #[table = "userapp_activity"]
 #[key(app_id, lifecycle_id, scope)]
 pub(crate) struct Activity {
@@ -189,6 +199,8 @@ pub(crate) struct OperationConfig {
 pub(crate) fn storage_models() -> toasty::ModelSet {
     toasty::models!(
         Application,
+        ComputeIntent,
+        ComputeControl,
         Operation,
         ActiveOperations,
         Request,
@@ -196,6 +208,7 @@ pub(crate) fn storage_models() -> toasty::ModelSet {
         OperationLease,
         OperationDeadline,
         ResourceBinding,
+        RecoveryWitness,
         Activity,
         RuntimeConfigVersion,
         RuntimeConfig,
@@ -346,4 +359,43 @@ pub(crate) struct ProjectWriteReceipt {
     pub fingerprint: String,
     pub outcome: String,
     pub recorded_at_us: i64,
+}
+
+#[derive(toasty::Model)]
+#[table = "userapp_compute_intents"]
+#[key(app_id, scope)]
+pub(crate) struct ComputeIntent {
+    pub app_id: String,
+    pub scope: String,
+    pub lifecycle_id: String,
+    pub generation: i64,
+    pub revision: i64,
+    pub desired_state: String,
+    pub control_operation_id: Option<String>,
+    pub updated_at_us: i64,
+}
+#[derive(toasty::Model)]
+#[table = "userapp_compute_controls"]
+pub(crate) struct ComputeControl {
+    #[key]
+    pub operation_id: String,
+    pub app_id: String,
+    pub lifecycle_id: String,
+    pub scope: String,
+    pub generation: i64,
+    pub revision: i64,
+    pub action: String,
+    pub state: String,
+    pub request_id: String,
+    pub request_fingerprint: String,
+    pub executor_id: Option<String>,
+    pub stage: String,
+    pub evidence_json: String,
+    pub checkpoint_json: String,
+    pub lease_json: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at_us: i64,
+    pub updated_at_us: i64,
+    pub terminal_at_us: Option<i64>,
 }

@@ -2,6 +2,16 @@
 //! stop/restart cannot accidentally delegate to full builder/PVC deletion.
 use serde::{Deserialize, Serialize};
 
+/// Public checkpoint references private runtime configuration; it never embeds
+/// container environment variables or credentials in an operation response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderRestartTemplate {
+    pub source: BuilderControlTarget,
+    pub archive: crate::AppResourceIdentity,
+    pub volumes: Vec<crate::AppResourceIdentity>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuilderPodIdentity {
     pub name: String,
@@ -9,14 +19,74 @@ pub struct BuilderPodIdentity {
     pub resource_version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Compute-only deletion of a Pod whose original StatefulSet no longer exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct BuilderOrphanStopTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_binding: Option<crate::UserAppResourceBinding>,
+    pub context: crate::UserAppExecutionContext,
+    pub orphan_pod: BuilderPodIdentity,
+    pub controller_name: String,
+    pub controller_uid: String,
+}
+impl BuilderOrphanStopTarget {
+    pub fn validate(&self) -> Result<(), String> {
+        self.context.validate_identity(&self.context.app_id)?;
+        if let Some(binding) = &self.resource_binding {
+            binding.validate(&self.context, &self.controller_uid)?;
+        }
+        if self.controller_name.is_empty()
+            || self.controller_uid.is_empty()
+            || self.orphan_pod.name.is_empty()
+            || self.orphan_pod.uid.is_empty()
+            || self.orphan_pod.resource_version.is_empty()
+        {
+            return Err("Orphan builder physical identity missing".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BuilderControlTarget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_binding: Option<crate::UserAppResourceBinding>,
     pub context: crate::UserAppExecutionContext,
     pub workload: Option<crate::AppResourceIdentity>,
     pub pod: Option<BuilderPodIdentity>,
+}
+
+// The compute ledger adds protocol and volume witnesses alongside the target.
+// Accept those explicit fields without weakening rejection of unrelated input.
+impl<'de> Deserialize<'de> for BuilderControlTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(default)]
+            resource_binding: Option<crate::UserAppResourceBinding>,
+            context: crate::UserAppExecutionContext,
+            workload: Option<crate::AppResourceIdentity>,
+            pod: Option<BuilderPodIdentity>,
+            #[serde(default)]
+            #[allow(dead_code)]
+            builder_compute_single_write: bool,
+            #[serde(default)]
+            #[allow(dead_code)]
+            builder_volumes: Vec<crate::AppResourceIdentity>,
+            #[serde(default)]
+            #[allow(dead_code)]
+            builder_restart_template: Option<BuilderRestartTemplate>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            resource_binding: wire.resource_binding,
+            context: wire.context,
+            workload: wire.workload,
+            pod: wire.pod,
+        })
+    }
 }
 
 impl BuilderControlTarget {
@@ -120,8 +190,10 @@ mod tests {
     }
 }
 
-/// Written only after create returned successfully (including mutex release) and
-/// readiness plus physical ownership were independently confirmed.
+/// Written after create returned successfully (including mutex release) and
+/// physical ownership was confirmed. The operation step distinguishes
+/// builder_created_observed from builder_ready_confirmed; only the latter
+/// includes independently verified management readiness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuilderCreationEvidence {

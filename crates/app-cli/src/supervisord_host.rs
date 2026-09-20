@@ -104,7 +104,9 @@ impl SupervisordHost {
         run_migrations: bool,
         dev_profile: bool,
         pg: Option<shared_types::StartPgCredential>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
+        anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         runtime_status.set_ready(false);
         let pg = supervisor::resolve_run_pg(pg)?;
         supervisor::validate_runtime_compatibility(release)?;
@@ -123,23 +125,31 @@ impl SupervisordHost {
             bail!("release has no enabled services");
         }
         if supervisor::workspace_needs_pg(&specs) {
-            supervisor::wait_for_pg(&specs, pg.as_ref(), None).await?;
+            supervisor::wait_for_pg(&specs, pg.as_ref(), Some(cancel)).await?;
         }
 
         // 记录旧代组（换代码前——reload 后按新集合差量摘除）
+        anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         let previous_groups = self.dynamic_groups().await?;
 
         // 1. migrate（Fail Fast，与 builtin 同语义）
         for spec in &specs {
             if run_migrations && !spec.run.migrate.is_empty() {
                 info!("🛠️  migrate {}", spec.service_id);
-                supervisor::run_migration_with_receipt(spec, release, &args.workspace, pg.as_ref())
-                    .await
-                    .with_context(|| format!("migrate {}", spec.service_id))?;
+                supervisor::run_migration_with_receipt_cancel(
+                    spec,
+                    release,
+                    &args.workspace,
+                    pg.as_ref(),
+                    Some(cancel),
+                )
+                .await
+                .with_context(|| format!("migrate {}", spec.service_id))?;
             }
         }
 
         // 2. pingap 配置编译（生成/校验/原子提交；未就绪前不启动）
+        anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         let pingap_outcome = compile_pingap(args, release).await?;
         let endpoint = admin_probe::ensure_admin_endpoint();
 
@@ -195,6 +205,7 @@ impl SupervisordHost {
                 .write()
                 .with_context(|| format!("write spec {}", spec.service_id))?;
         }
+        anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         let pingap_spec = pingap_service_spec(args, release, &pingap_outcome, endpoint);
         pingap_spec.write().context("write pingap spec")?;
         ServiceSpecFile::prune_other_generations(&release.release_id);
@@ -204,11 +215,10 @@ impl SupervisordHost {
         tokio::fs::create_dir_all(&services_log_dir)
             .await
             .with_context(|| format!("create {}", services_log_dir.display()))?;
+        anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         let conf = render_programs_conf(release, &specs, &args.log_dir, &args.workspace);
         write_conf(&self.conf_path, &conf).await?;
-        if let Err(e) = self.client.reload_config().await {
-            bail!("supervisord reloadConfig: {e:#}");
-        }
+        mutation_result(self.client.reload_config().await).context("supervisord reloadConfig")?;
 
         // 5. 旧代差量摘除（不在新集合的组）
         let new_names: Vec<String> = specs
@@ -217,8 +227,9 @@ impl SupervisordHost {
             .chain([PINGAP_PROGRAM.to_string()])
             .collect();
         for old in &previous_groups {
+            anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
             if !new_names.contains(old)
-                && let Err(e) = self.client.stop_remove_group(old).await
+                && let Err(e) = mutation_result(self.client.stop_remove_group(old).await)
             {
                 return Err(e).with_context(|| format!("stop stale group {old}"));
             }
@@ -241,29 +252,30 @@ impl SupervisordHost {
                 }
                 continue;
             }
+            anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
             let name = format!("{SVC_PROGRAM_PREFIX}{}", spec.service_id);
-            self.client.add_process_group(&name).await?;
-            self.client
-                .start_process_wait(&name)
-                .await
+            mutation_result(self.client.add_process_group(&name).await)?;
+            anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
+            mutation_result(self.client.start_process_wait(&name).await)
                 .with_context(|| format!("start {name}"))?;
             started.push(name);
         }
 
         // 7. pingap 启动 + 配置 hash 确认（与 builtin 的 start_pingap 确认语义一致）
-        self.client.add_process_group(PINGAP_PROGRAM).await?;
-        self.client
-            .start_process_wait(PINGAP_PROGRAM)
-            .await
+        anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
+        mutation_result(self.client.add_process_group(PINGAP_PROGRAM).await)?;
+        anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
+        mutation_result(self.client.start_process_wait(PINGAP_PROGRAM).await)
             .context("start app-pingap")?;
         started.push(PINGAP_PROGRAM.to_string());
-        admin_probe::wait_for_config_hash(
+        tokio::select! {
+            result = admin_probe::wait_for_config_hash(
             endpoint,
             &pingap_outcome.expected_hash,
             admin_probe::CONFIRM_BUDGET,
-        )
-        .await
-        .context("pingap config hash confirm")?;
+        ) => result.context("pingap config hash confirm")?,
+            () = cancel.cancelled() => bail!("Orchestration cancelled"),
+        }
 
         // 8. bridge readiness（语义与 builtin 一致：无 bridge=编排完成即 ready；
         //    有 bridge 只等指定后端，失败 NotReady 摘流不失败）
@@ -274,7 +286,10 @@ impl SupervisordHost {
                     warn!("bridge_service '{bridge_id}' not in services; defaulting to ready");
                     true
                 }
-                Some(spec) => match supervisor::wait_for_service_ready(spec).await {
+                Some(spec) => match tokio::select! {
+                    result = supervisor::wait_for_service_ready(spec) => result,
+                    () = cancel.cancelled() => bail!("Orchestration cancelled"),
+                } {
                     Ok(()) => true,
                     Err(e) => {
                         warn!("bridge '{bridge_id}' not ready: {e}; staying NotReady");
@@ -283,6 +298,7 @@ impl SupervisordHost {
                 },
             },
         };
+        anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         runtime_status.set_ready(ready);
         let _ = started; // 全部成功；失败路径由外层 stop_all 清理
         Ok(())
@@ -595,4 +611,18 @@ NODE_ENV = "production"
         );
         server.await.unwrap();
     }
+}
+
+// A lost reply to a mutation is not proof that supervisord stopped executing it.
+fn mutation_result<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if crate::xmlrpc::is_confirmed_fault(&error) {
+            error
+        } else {
+            supervisor::ShutdownUnconfirmed(format!(
+                "Supervisord mutation response is unconfirmed: {error:#}"
+            ))
+            .into()
+        }
+    })
 }

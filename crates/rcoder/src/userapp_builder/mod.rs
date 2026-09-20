@@ -7,6 +7,7 @@
 //! rcoder 不再做发布任务编排（旧 publish 任务体系已随 `/api/v1/userapp/publish` 接口族删除）。
 
 pub(crate) mod adoption;
+pub(crate) mod compute_control;
 pub(crate) mod control;
 mod creation;
 mod dev_cleanup;
@@ -99,7 +100,7 @@ pub(crate) async fn ensure_userapp_builder(
         + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
     within_builder_deadline(
         deadline,
-        ensure_userapp_builder_until(state, app_id, deadline),
+        ensure_builder_target_until(state, app_id, deadline, true),
     )
     .await
 }
@@ -111,7 +112,7 @@ pub(crate) async fn ensure_userapp_builder_until(
 ) -> Result<ContainerBasicInfo> {
     // deadline 包裹由调用方负责（ensure_userapp_builder 包装/upstream 自带
     // timeout_at）——此处只透传，保持既有错误形态。
-    ensure_builder_target_until(state, app_id, deadline).await
+    ensure_builder_target_until(state, app_id, deadline, false).await
 }
 
 /// ensure 体：应用共享模型——builder identifier == 纯 app_id，恒走
@@ -120,7 +121,21 @@ async fn ensure_builder_target_until(
     state: &AppState,
     app_id: &str,
     deadline: tokio::time::Instant,
+    explicit_start: bool,
 ) -> Result<ContainerBasicInfo> {
+    let recovered = adoption::discover_missing_identity(state, app_id).await?;
+    state
+        .app_service
+        .verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Dev)
+        .await?;
+    state
+        .userapp_store
+        .check_compute_access(
+            app_id,
+            shared_types::UserAppOperationScope::Dev,
+            explicit_start,
+        )
+        .await?;
     let instance = app_id;
     let _lifecycle = lifecycle::acquire(instance).await;
     // app_id 长度 Fail Fast（仅新建路径——注册命中说明历史上已建成，不受限）：
@@ -138,7 +153,10 @@ async fn ensure_builder_target_until(
             shared_types::USERAPP_APP_ID_MAX_LEN
         ));
     }
-    let identity = state.userapp_store.ensure_identity(app_id).await?;
+    let identity = match recovered {
+        Some(identity) => identity,
+        None => state.userapp_store.ensure_identity(app_id).await?,
+    };
     if !builder_fenced_by_current_operation(state, &identity).await?
         && let Some(info) = registered_or_discovered_builder(state, instance).await?
         && let Some(verified) = cross_verify_registration(state, app_id, instance, &info).await?
@@ -181,6 +199,15 @@ async fn ensure_userapp_builder_probed_until(
     app_id: &str,
     deadline: tokio::time::Instant,
 ) -> Result<(ContainerBasicInfo, bool)> {
+    let recovered = adoption::discover_missing_identity(state, app_id).await?;
+    state
+        .app_service
+        .verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Dev)
+        .await?;
+    state
+        .userapp_store
+        .check_compute_access(app_id, shared_types::UserAppOperationScope::Dev, false)
+        .await?;
     let instance = app_id;
     let _lifecycle = lifecycle::acquire(instance).await;
     if instance.chars().count() > shared_types::USERAPP_APP_ID_MAX_LEN
@@ -193,7 +220,10 @@ async fn ensure_userapp_builder_probed_until(
             shared_types::USERAPP_APP_ID_MAX_LEN
         ));
     }
-    let identity = state.userapp_store.ensure_identity(app_id).await?;
+    let identity = match recovered {
+        Some(identity) => identity,
+        None => state.userapp_store.ensure_identity(app_id).await?,
+    };
     let fenced = builder_fenced_by_current_operation(state, &identity).await?;
 
     /// 就绪裁决后创建（lifecycle admit 路径）。`lease`：进程内互斥，
@@ -319,6 +349,16 @@ pub(crate) async fn cross_verify_registration(
     instance: &str,
     registered: &ContainerBasicInfo,
 ) -> Result<Option<ContainerBasicInfo>> {
+    verify_registration(state, app_id, instance, registered, true).await
+}
+
+async fn verify_registration(
+    state: &AppState,
+    app_id: &str,
+    instance: &str,
+    registered: &ContainerBasicInfo,
+    publish: bool,
+) -> Result<Option<ContainerBasicInfo>> {
     let Some(rc) = state
         .runtime()
         .find_container(instance, &ServiceType::UserappBuilder)
@@ -336,9 +376,23 @@ pub(crate) async fn cross_verify_registration(
     // 物理身份校验由 verify_live_builder 的运行时 capture 执行（应用共享，
     // 无归属注解可比对）。
     adoption::verify_live_builder(state, app_id, instance, &rc.container_id).await?;
+    // A live Pod alone is insufficient when its management Service is absent.
+    // Read-side discovery never repairs it; return to admitted creation/resume
+    // so repair shares the same durable operation and runtime lease as Stop.
+    if state
+        .runtime()
+        .get_container_info_by_identifier(instance, &ServiceType::UserappBuilder)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
     let Some(updated) = refreshed_registration(registered, &rc) else {
         return Ok(Some(registered.clone()));
     };
+    if !publish {
+        return Ok(Some(updated));
+    }
     if let Some(mut project) = state.get_project(instance).map(|p| (*p).clone()) {
         project.set_service_type(Some(ServiceType::UserappBuilder));
         project.set_container(Some(updated.clone()));
@@ -449,9 +503,39 @@ async fn confirm_builder_ready(
     info: ContainerBasicInfo,
     deadline: tokio::time::Instant,
 ) -> Result<ContainerBasicInfo> {
+    confirm_builder_ready_inner(state, app_id, instance, info, None, deadline).await
+}
+
+async fn confirm_builder_ready_inner(
+    state: &AppState,
+    app_id: &str,
+    instance: &str,
+    info: ContainerBasicInfo,
+    operation: Option<&shared_types::UserAppOperationRecord>,
+    deadline: tokio::time::Instant,
+) -> Result<ContainerBasicInfo> {
     tokio::time::timeout_at(deadline, async {
         loop {
-            if let Some(actual) = cross_verify_registration(state, app_id, instance, &info).await? {
+            if let Some(operation) = operation
+                && let Err(shared_types::UserAppStoreError::OperationInProgress(blocker)) = state
+                    .userapp_store
+                    .check_compute_access(app_id, shared_types::UserAppOperationScope::Dev, false)
+                    .await
+                && let Some(control) = state
+                    .userapp_store
+                    .get_compute_control(app_id, &blocker.operation_id)
+                    .await?
+                && control.lifecycle_id == operation.lifecycle_id
+                && control
+                    .interrupted_operations
+                    .contains(&operation.operation_id)
+            {
+                // Creation already returned and released its runtime lease.
+                // This loop performs only reads, so no mutation is abandoned.
+                return Err(container_runtime_api::ContainerRuntimeError::CreationCancelled.into());
+            }
+            if let Some(actual) = verify_registration(state, app_id, instance, &info, false).await?
+            {
                 if actual.container_id != info.container_id {
                     return Err(anyhow!("Builder resource replaced before readiness"));
                 }
@@ -479,8 +563,12 @@ async fn create_builder_inner(
     execution_context: shared_types::UserAppExecutionContext,
 ) -> Result<ContainerBasicInfo> {
     let bound_target = adoption::capture_bound_target(state, &execution_context).await?;
+    state
+        .userapp_store
+        .check_business_execution(&execution_context)
+        .await?;
     let mut params = ContainerCreateParams::builder()
-        .execution_context(execution_context)
+        .execution_context(execution_context.clone())
         .project_id(instance.to_string())
         // 容器内契约（env/profiler）的纯 app_id 显式直传——消费方不再从
         // project_id 复合槽右切（字段语义不重载）
@@ -491,11 +579,25 @@ async fn create_builder_inner(
 
     params.resource_binding = bound_target.resource_binding;
 
-    let container_info = state
-        .runtime()
-        .create_container(params)
-        .await
-        .context("ensure UserappBuilder failed")?;
+    let cancelled = params.creation_cancelled.clone();
+    let creation = state.runtime().create_container(params);
+    tokio::pin!(creation);
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
+    let container_info = loop {
+        tokio::select! {
+            result = &mut creation => break result.context("ensure UserappBuilder failed")?,
+            _ = poll.tick(), if !cancelled.load(std::sync::atomic::Ordering::Acquire) => {
+                if let Err(shared_types::UserAppStoreError::OperationInProgress(blocker)) = state.userapp_store
+                    .check_compute_access(app_id, shared_types::UserAppOperationScope::Dev, false).await
+                    && let Ok(Some(control)) = state.userapp_store.get_compute_control(app_id, &blocker.operation_id).await
+                    && control.lifecycle_id == execution_context.lifecycle_id
+                    && control.interrupted_operations.contains(&execution_context.operation_id)
+                {
+                    cancelled.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+    };
 
     info!(
         "[USERAPP_BUILDER] UserappBuilder ensured: app_id={}, instance={}, container={}, ip={}",

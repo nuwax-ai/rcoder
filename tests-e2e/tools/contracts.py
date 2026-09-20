@@ -31,7 +31,7 @@ REQUIRED = {
         'prod logs/sources/query 声明源非空', 'prod logs/stream SSE 通道（200 + text/event-stream）',
         '热部署受理（deploy_mode=hot + 新 release_id → 200）', '热部署后流量仍可达',
         'prod resource registered at creation', 'prod diagnostics captured before deletion',
-        'stop → stopped', 'stop 后 health 探测自动唤醒 → running', 'prod delete purge 回收',
+        'stop → stopped', '手动 stop 后 health 查询保持停止', 'stop 后显式 start 恢复真实业务', 'prod delete purge 回收',
     },
 }
 

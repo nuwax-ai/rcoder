@@ -195,6 +195,7 @@ impl AppService {
                 })?,
             )
             .await?;
+        durable.authorize_mutation().await?;
         release_lock.mark_mutating()?;
         // 1. 删除计算面（防护序列与失败对称恢复见 tear_down_compute_plane）
         self.tear_down_compute_plane(app_id, &previous, &snapshot)

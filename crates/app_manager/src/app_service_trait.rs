@@ -12,6 +12,16 @@ use super::models::*;
 ///   业务元数据由调用方（Java）持久化。
 #[async_trait]
 pub trait AppServiceTrait: Send + Sync {
+    async fn verify_recovered_storage(
+        &self,
+        app_id: &str,
+        scope: shared_types::UserAppOperationScope,
+    ) -> AppResult<()>;
+    async fn discover_missing_identity(
+        &self,
+        app_id: &str,
+    ) -> AppResult<Option<shared_types::UserAppLifecycleRecord>>;
+
     /// Prepare only the captured prod management container and PostgreSQL.
     /// Does not promote pending configuration or assert application readiness.
     async fn prepare_prod_database(

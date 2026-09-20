@@ -231,9 +231,9 @@ pub(crate) fn agent_store_user_root(
     user_id: &str,
     ws: &Path,
     workspace_path: Option<&str>,
-) -> PathBuf {
+) -> Result<PathBuf, AppError> {
     if crate::extract::is_userapp_request() {
-        return state.config.userapp_workspace_dir.clone();
+        return Ok(state.config.userapp_workspace_dir.clone());
     }
     // normalProject 与用户维度工作目录（非 userapp）同锚点：store 锚定用户根
     // 不随绑定漂移——用户根的两种部署视角（与 NormalProject 定位分流同源）：
@@ -245,11 +245,12 @@ pub(crate) fn agent_store_user_root(
         || crate::extract::merged_workspace_path(workspace_path).is_some()
     {
         if state.config.project_source_dir_explicit {
-            return state.config.project_source_dir.clone();
+            return Ok(state.config.project_source_dir.clone());
         }
-        return state.config.computer_workspace_dir.join(user_id);
+        shared_types::validate_identifier(user_id, "userId").map_err(AppError::validation)?;
+        return Ok(state.config.computer_workspace_dir.join(user_id));
     }
-    ws.parent().unwrap_or(ws).to_path_buf()
+    Ok(ws.parent().unwrap_or(ws).to_path_buf())
 }
 
 #[cfg(test)]
@@ -590,20 +591,22 @@ mod tests {
         // 默认布局: ws.parent() (Local={root}/{userId} 与 TS 等价)
         let ws = state.config.computer_workspace_dir.join("u1").join("c1");
         assert_eq!(
-            agent_store_user_root(&state, "u1", &ws, None),
+            agent_store_user_root(&state, "u1", &ws, None).expect("valid store root"),
             state.config.computer_workspace_dir.join("u1")
         );
 
         // 用户维度工作目录布局: store 锚定用户根, 不随绑定漂移——主容器形态
         // （默认：PROJECT_SOURCE_DIR 未注入）= {CWS}/{userId}（对齐 TS 1.4.8）
         assert_eq!(
-            agent_store_user_root(&state, "u1", Path::new("/tmp/bound"), Some("/tmp/bound")),
+            agent_store_user_root(&state, "u1", Path::new("/tmp/bound"), Some("/tmp/bound"))
+                .expect("valid store root"),
             state.config.computer_workspace_dir.join("u1")
         );
 
         // userapp 分流: 开发卷自身 (无 userId 段)
         let root = scope_kind(shared_types::ComputerServiceKind::Userapp, None, async {
             agent_store_user_root(&state, "u1", Path::new("/any/ws"), None)
+                .expect("valid store root")
         })
         .await;
         assert_eq!(root, state.config.userapp_workspace_dir);
@@ -612,7 +615,10 @@ mod tests {
         let root = scope_kind(
             shared_types::ComputerServiceKind::NormalProject,
             Some("proj-7"),
-            async { agent_store_user_root(&state, "u1", Path::new("/any/ws"), None) },
+            async {
+                agent_store_user_root(&state, "u1", Path::new("/any/ws"), None)
+                    .expect("valid store root")
+            },
         )
         .await;
         assert_eq!(root, state.config.computer_workspace_dir.join("u1"));
@@ -624,13 +630,17 @@ mod tests {
             ..(*state.config).clone()
         });
         assert_eq!(
-            agent_store_user_root(&state, "u1", Path::new("/tmp/bound"), Some("/tmp/bound")),
+            agent_store_user_root(&state, "u1", Path::new("/tmp/bound"), Some("/tmp/bound"))
+                .expect("valid store root"),
             state.config.project_source_dir
         );
         let root = scope_kind(
             shared_types::ComputerServiceKind::NormalProject,
             Some("proj-7"),
-            async { agent_store_user_root(&state, "u1", Path::new("/any/ws"), None) },
+            async {
+                agent_store_user_root(&state, "u1", Path::new("/any/ws"), None)
+                    .expect("valid store root")
+            },
         )
         .await;
         assert_eq!(root, state.config.project_source_dir);

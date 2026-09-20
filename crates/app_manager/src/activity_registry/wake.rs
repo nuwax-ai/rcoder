@@ -163,6 +163,9 @@ impl AppActivityRegistry {
         };
         match service.wake_app_on_traffic(app_id, self.wake_timeout).await {
             Ok(outcome) => outcome,
+            Err(crate::models::AppOperationError::ConflictBlocked { message, blocker }) => {
+                WakeOutcome::Blocked { message, blocker }
+            }
             Err(error) => WakeOutcome::Failed(error.to_string()),
         }
     }

@@ -1114,6 +1114,21 @@ async fn deploy_pg_recovery_finalization_is_cas_identity_and_outcome_bound() {
             .bind_operation_lease(&context, &receipt)
             .await
             .unwrap();
+        assert!(
+            store
+                .finalize_deploy_pg_recovery(&op, &evidence)
+                .await
+                .is_err(),
+            "a matching lease and password receipt do not prove the running coordinator exited"
+        );
+        assert_eq!(
+            store
+                .get_operation(&app.app_id, &op.operation_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            op
+        );
         let mut p = progress(&op, UserAppOperationState::RecoveryRequired);
         p.checkpoint = op.checkpoint.clone();
         op = store.advance(&p).await.unwrap();

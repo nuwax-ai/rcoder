@@ -83,7 +83,7 @@ async fn pg_baseline_rejects_tampering_and_rolls_back_partial_ddl() {
             let change = if mode == "checksum" {
                 "checksum='tampered'"
             } else {
-                "version=2"
+                "version=version+100"
             };
             client
                 .batch_execute(&format!(
@@ -122,6 +122,69 @@ async fn pg_baseline_rejects_tampering_and_rolls_back_partial_ddl() {
             .await
             .unwrap();
     }
+    drop(client);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable superuser PostgreSQL fixture"]
+async fn compute_pg_v1_upgrade_preserves_existing_lifecycle_and_baseline() {
+    let dsn = crate::pg::test_support::test_dsn()
+        .await
+        .expect("disposable PostgreSQL required");
+    let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let task = tokio::spawn(connection);
+    let schema = format!("computeupgrade{}", uuid::Uuid::new_v4().simple());
+    client
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    let config = PostgresConfig {
+        url: Some(format!("{dsn}{separator}options=-csearch_path%3D{schema}")),
+        ..Default::default()
+    };
+    let owner = postgres::open(&config, vec![Component::Userapp])
+        .await
+        .unwrap();
+    owner.shutdown().await.unwrap();
+    client.batch_execute(&format!("SET search_path TO {schema}; DROP TABLE userapp_compute_controls; DROP TABLE userapp_compute_intents; DELETE FROM rcoder_schema_migrations WHERE component='userapp' AND version=2; INSERT INTO userapps(app_id,lifecycle_id,lifecycle_epoch,lifecycle_state,metadata_revision,created_at_us,updated_at_us) VALUES('keptapp','keptlife',1,'active',1,1,1); INSERT INTO userapp_active_operations(app_id,lifecycle_id) VALUES('keptapp','keptlife');")).await.unwrap();
+    let query = "SELECT checksum,schema_fingerprint FROM rcoder_schema_migrations WHERE component='userapp' AND version=1";
+    let before = client.query_one(query, &[]).await.unwrap();
+    let before: (String, String) = (before.get(0), before.get(1));
+    for _ in 0..2 {
+        let owner = postgres::open(&config, vec![Component::Userapp])
+            .await
+            .unwrap();
+        owner.shutdown().await.unwrap();
+    }
+    let after = client.query_one(query, &[]).await.unwrap();
+    assert_eq!(before, (after.get(0), after.get(1)));
+    let app = client
+        .query_one(
+            "SELECT lifecycle_id FROM userapps WHERE app_id='keptapp'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(app.get::<_, String>(0), "keptlife");
+    let count: i64 = client
+        .query_one(
+            "SELECT count(*) FROM rcoder_schema_migrations WHERE component='userapp'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 2);
+    client
+        .batch_execute(&format!(
+            "SET search_path TO public; DROP SCHEMA {schema} CASCADE"
+        ))
+        .await
+        .unwrap();
     drop(client);
     task.await.unwrap().unwrap();
 }

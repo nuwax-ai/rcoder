@@ -6,6 +6,80 @@ use shared_types::{
 };
 
 impl DockerRuntime {
+    pub(super) async fn reconcile_builder_start(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<Option<ContainerBasicInfo>> {
+        if !super::docker_compute_receipt::matches_start(target).await? {
+            return Ok(None);
+        }
+        let Some(resource) = &target.workload else {
+            return Ok(None);
+        };
+        let info = self
+            .inner
+            .get_docker_client()
+            .inspect_container(&resource.uid, None)
+            .await
+            .map_err(|error| {
+                Error::DockerError(format!("Observe acknowledged builder start: {error}"))
+            })?;
+        if control_identity_with_binding(
+            &info,
+            &resource.name,
+            &target.context,
+            target.resource_binding.as_ref(),
+            false,
+        )? != *resource
+        {
+            return Err(Error::Conflict(
+                "Acknowledged builder identity changed".into(),
+            ));
+        }
+        if !info
+            .state
+            .as_ref()
+            .is_some_and(|state| state.running == Some(true) && state.restarting != Some(true))
+        {
+            return Ok(None);
+        }
+        running_builder_info(&info, target)
+    }
+    pub(super) async fn reconcile_builder_stop(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<bool> {
+        if !super::docker_compute_receipt::matches_stop(target).await? {
+            return Ok(false);
+        }
+        let Some(resource) = &target.workload else {
+            return Ok(false);
+        };
+        if resource.kind != shared_types::AppResourceKind::Container {
+            return Ok(false);
+        }
+        match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&resource.uid, None)
+            .await
+        {
+            Ok(info) => Ok(control_identity_with_binding(
+                &info,
+                &resource.name,
+                &target.context,
+                target.resource_binding.as_ref(),
+                false,
+            )? == *resource
+                && info.state.as_ref().and_then(|state| state.running) == Some(false)),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(true),
+            Err(error) => Err(Error::DockerError(format!(
+                "Reconcile Docker builder stop: {error}"
+            ))),
+        }
+    }
     pub(super) async fn exec_bound_builder(
         &self,
         target: &BuilderControlTarget,
@@ -48,6 +122,17 @@ impl DockerRuntime {
         params: &container_runtime_api::ContainerCreateParams,
         expected_image: &str,
     ) -> Result<ContainerBasicInfo> {
+        let check_cancelled = || {
+            if params
+                .creation_cancelled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                Err(Error::CreationCancelled)
+            } else {
+                Ok(())
+            }
+        };
+        check_cancelled()?;
         let target = async {
             let context = params.execution_context.as_ref().ok_or_else(|| {
                 Error::ConfigurationError("Bound builder requires execution context".into())
@@ -85,11 +170,14 @@ impl DockerRuntime {
         }
         .await
         .map_err(|error| rejected_before_write(error.to_string()))?;
-        self.apply_builder_compute_mode(&target, true, true)
-            .await?
-            .ok_or_else(|| {
-                Error::Conflict("Bound builder did not return a running container".into())
-            })
+        check_cancelled()?;
+        // Await the start and its receipt before acknowledging cancellation.
+        // Dropping a Docker mutation future does not cancel the daemon's write.
+        let result = self.apply_builder_compute_mode(&target, true, true).await?;
+        check_cancelled()?;
+        result.ok_or_else(|| {
+            Error::Conflict("Bound builder did not return a running container".into())
+        })
     }
 
     pub(super) async fn capture_builder_compute(
@@ -138,6 +226,15 @@ impl DockerRuntime {
             workload,
             pod: None,
         })
+    }
+
+    /// Continue a compute restart after its stop boundary. Starting an already
+    /// running captured container is idempotent; it must not restart it again.
+    pub(super) async fn start_builder_compute(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<Option<ContainerBasicInfo>> {
+        self.apply_builder_compute_mode(target, true, true).await
     }
 
     pub(super) async fn apply_builder_compute(
@@ -259,50 +356,67 @@ impl DockerRuntime {
                 "Builder control identity changed after mutation".into(),
             ));
         }
-        let running = after.state.as_ref().and_then(|state| state.running) == Some(true);
+        let running = after
+            .state
+            .as_ref()
+            .and_then(|state| state.running)
+            .ok_or_else(|| Error::Conflict("Builder running state is unavailable".into()))?;
         if running != restart {
             return Err(Error::Conflict(
                 "Builder control result does not match requested state".into(),
             ));
         }
         if !restart {
+            super::docker_compute_receipt::save_stop(target).await?;
             return Ok(None);
         }
-        let preferred = after
-            .host_config
-            .as_ref()
-            .and_then(|config| config.network_mode.as_deref());
-        let address = super::docker_runtime::extract_container_ip(&after, preferred)
-            .parse::<std::net::IpAddr>()
-            .map_err(|error| {
-                Error::ConfigurationError(format!("Builder IP is invalid: {error}"))
-            })?;
-        if address.is_unspecified() {
-            return Err(Error::ConfigurationError(
-                "Builder IP is unspecified".into(),
-            ));
+        if only_start {
+            super::docker_compute_receipt::save_start(target).await?;
         }
-        let created = after
-            .created
-            .as_deref()
-            .ok_or_else(|| Error::ConfigurationError("Builder creation time is missing".into()))?;
-        let created_at = chrono::DateTime::parse_from_rfc3339(created)
-            .map_err(|error| {
-                Error::ConfigurationError(format!("Builder creation time is invalid: {error}"))
-            })?
-            .with_timezone(&chrono::Utc);
-        Ok(Some(ContainerBasicInfo {
-            container_id: resource.uid.clone(),
-            container_name: resource.name.clone(),
-            container_ip: address.to_string(),
-            internal_port: shared_types::GRPC_DEFAULT_PORT,
-            external_port: 0,
-            project_id: target.context.app_id.clone(),
-            status: "Running".into(),
-            created_at,
-            service_url: format!("http://{address}:{}", shared_types::GRPC_DEFAULT_PORT),
-        }))
+        running_builder_info(&after, target)
     }
+}
+
+fn running_builder_info(
+    after: &bollard::models::ContainerInspectResponse,
+    target: &BuilderControlTarget,
+) -> Result<Option<ContainerBasicInfo>> {
+    let resource = target
+        .workload
+        .as_ref()
+        .ok_or_else(|| Error::Conflict("Builder identity missing".into()))?;
+    let preferred = after
+        .host_config
+        .as_ref()
+        .and_then(|config| config.network_mode.as_deref());
+    let address = super::docker_runtime::extract_container_ip(&after, preferred)
+        .parse::<std::net::IpAddr>()
+        .map_err(|error| Error::ConfigurationError(format!("Builder IP is invalid: {error}")))?;
+    if address.is_unspecified() {
+        return Err(Error::ConfigurationError(
+            "Builder IP is unspecified".into(),
+        ));
+    }
+    let created = after
+        .created
+        .as_deref()
+        .ok_or_else(|| Error::ConfigurationError("Builder creation time is missing".into()))?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(created)
+        .map_err(|error| {
+            Error::ConfigurationError(format!("Builder creation time is invalid: {error}"))
+        })?
+        .with_timezone(&chrono::Utc);
+    Ok(Some(ContainerBasicInfo {
+        container_id: resource.uid.clone(),
+        container_name: resource.name.clone(),
+        container_ip: address.to_string(),
+        internal_port: shared_types::GRPC_DEFAULT_PORT,
+        external_port: 0,
+        project_id: target.context.app_id.clone(),
+        status: "Running".into(),
+        created_at,
+        service_url: format!("http://{address}:{}", shared_types::GRPC_DEFAULT_PORT),
+    }))
 }
 
 fn rejected_before_write(message: String) -> Error {

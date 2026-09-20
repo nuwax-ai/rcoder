@@ -287,6 +287,7 @@ impl crate::service::AppService {
         operation
             .checkpoint("clear_target_captured", checkpoint.clone())
             .await?;
+        operation.authorize_mutation().await?;
         match &evidence.target {
             shared_types::UserAppStorageClearTarget::Development {
                 base_url,
@@ -648,6 +649,7 @@ impl crate::service::AppService {
         operation
             .checkpoint("storage_captured", checkpoint.clone())
             .await?;
+        operation.authorize_mutation().await?;
         guard.mark_mutating()?;
         if let Some(snapshot) = &evidence.production {
             self.ensure_app_deleted(app_id, "destroying captured storage")

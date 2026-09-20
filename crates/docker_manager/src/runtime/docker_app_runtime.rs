@@ -22,6 +22,82 @@ use super::docker_runtime::{
 
 #[async_trait]
 impl UserAppDeploymentRuntime for DockerRuntime {
+    async fn discover_application_identity(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppDiscoveredIdentity>> {
+        use shared_types::{ServiceType, UserAppOperationScope};
+        shared_types::validate_identifier(app_id, "app_id")
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let builder_name = crate::utils::DockerUtils::generate_container_name(
+            ServiceType::UserappBuilder.container_prefix(),
+            app_id,
+        )
+        .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let mut found = None;
+        for (scope, name) in [
+            (UserAppOperationScope::Dev, builder_name),
+            (UserAppOperationScope::Prod, app_deployment_name(app_id)),
+        ] {
+            let info = match self
+                .inner
+                .get_docker_client()
+                .inspect_container(&name, None)
+                .await
+            {
+                Ok(info) => info,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => continue,
+                Err(e) => {
+                    return Err(ContainerRuntimeError::DockerError(format!(
+                        "Discover application container: {e}"
+                    )));
+                }
+            };
+            let uid = info.id.clone().ok_or_else(|| {
+                ContainerRuntimeError::Conflict("Discovered container ID missing".into())
+            })?;
+            let metadata = info
+                .config
+                .as_ref()
+                .and_then(|c| c.labels.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let stopped = info
+                .state
+                .as_ref()
+                .is_some_and(|s| s.running == Some(false) && s.restarting != Some(true));
+            let context = super::lifecycle_discovery::include(
+                &mut found,
+                app_id,
+                scope,
+                &metadata,
+                uid.clone(),
+                stopped,
+            )?;
+            let actual = if scope == UserAppOperationScope::Dev {
+                container_runtime_api::AgentContainerRuntime::capture_builder_control(
+                    self, &context,
+                )
+                .await?
+                .workload
+                .ok_or_else(|| {
+                    ContainerRuntimeError::Conflict("Builder disappeared during discovery".into())
+                })?
+            } else {
+                self.capture_stop_target(&context).await?.resource
+            };
+            if actual.uid != uid {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Container changed during discovery".into(),
+                ));
+            }
+        }
+        Ok(found)
+    }
+
     async fn acquire_app_operation(
         &self,
         app_id: &str,
@@ -36,6 +112,14 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         app_id: &str,
     ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
         self.acquire_builder_lease(app_id).await
+    }
+
+    async fn validate_app_operation_receipt(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<bool> {
+        self.validate_captured_file_lease(context, receipt).await
     }
 
     async fn release_app_operation_receipt(
@@ -204,6 +288,95 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         self.start_captured_target(target).await
     }
 
+    async fn start_app_compute(
+        &self,
+        target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.start_captured_target(&target.target).await?;
+        if !self.captured_start_is_running(&target.target).await? {
+            return Err(ContainerRuntimeError::Conflict(
+                "Application start is not yet confirmed".into(),
+            ));
+        }
+        super::docker_compute_receipt::save_app_start(&target.target).await
+    }
+
+    async fn reconcile_app_compute_start(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        if !super::docker_compute_receipt::matches_app_start(target).await? {
+            return Ok(false);
+        }
+        self.captured_start_is_running(target).await
+    }
+
+    async fn app_compute_absent(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&app_deployment_name(&context.app_id), None)
+            .await
+        {
+            Ok(_) => Ok(false),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(true),
+            Err(error) => Err(ContainerRuntimeError::DockerError(format!(
+                "Observe absent application compute: {error}"
+            ))),
+        }
+    }
+
+    async fn confirm_app_compute_stopped(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        target
+            .context
+            .validate_identity(&target.context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if target.resource.kind != shared_types::AppResourceKind::Container
+            || target.resource.uid.is_empty()
+            || target.resource.name != app_deployment_name(&target.context.app_id)
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Invalid captured stop confirmation target".into(),
+            ));
+        }
+
+        match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&target.resource.uid, None)
+            .await
+        {
+            Ok(info)
+                if info.id.as_deref() == Some(target.resource.uid.as_str())
+                    && info.state.as_ref().is_some_and(|s| {
+                        s.running == Some(false) && s.restarting != Some(true)
+                    }) =>
+            {
+                Ok(())
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Ok(_) => Err(ContainerRuntimeError::Conflict(
+                "Captured container has not stopped".into(),
+            )),
+            Err(e) => Err(ContainerRuntimeError::DockerError(format!(
+                "Confirm captured container stopped: {e}"
+            ))),
+        }
+    }
+
     async fn stop_app_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
@@ -211,7 +384,32 @@ impl UserAppDeploymentRuntime for DockerRuntime {
     ) -> ContainerRuntimeResult<()> {
         // Docker wake policy is represented by the durable Stop intent and the
         // service activity state; there is no mutable container annotation API.
-        self.stop_captured_target(target).await
+        self.stop_captured_target(target).await?;
+        self.confirm_app_compute_stopped(target).await?;
+        super::docker_compute_receipt::save_app_stop(target).await
+    }
+
+    async fn reconcile_app_compute_stop(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        if !super::docker_compute_receipt::matches_app_stop(target).await? {
+            return Ok(false);
+        }
+        self.confirm_app_compute_stopped(target).await?;
+        Ok(true)
+    }
+
+    async fn app_compute_write_acknowledged(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        starting: bool,
+    ) -> ContainerRuntimeResult<bool> {
+        if starting {
+            super::docker_compute_receipt::matches_app_start(target).await
+        } else {
+            super::docker_compute_receipt::matches_app_stop(target).await
+        }
     }
 
     async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {

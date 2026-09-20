@@ -117,13 +117,11 @@ async fn run_inner(
         crate::workspace_index::index_port_if_eligible(&args.workspace, &specs);
 
     // 2. Wait for the declared PostgreSQL dependency before starting services.
-    // N01：数据库前置按运行计划**声明**决定——仅当存在启用服务带 migrate
-    // 命令或显式 APP_CLI_REQUIRE_PG=1 时才探测；纯静态/前端项目不轮询
-    // 数据库探测（60s 等待不得阻塞无数据库需求的启动）。
+    // RCoder 容器通过 APP_CLI_REQUIRE_PG=1 启用；宿主机独立运行默认不探测。
     if workspace_needs_pg(&specs) {
         wait_for_pg(&specs, pg.as_ref(), cancel.as_ref()).await?;
     } else {
-        info!("⏭  no service declares database usage (migrate); skipping PG readiness wait");
+        info!("⏭  PostgreSQL preflight is not enabled by the runtime environment");
     }
 
     // 3. 各子项目 migrate → start；4. 编译验证并启动 Pingap。
@@ -557,16 +555,10 @@ fn database_url_with_credentials(
 
 // ── PG 等待 ──────────────────────────────────────────────────────────────────
 
-/// 数据库需求判定（N01：声明式，非环境猜测）。
-/// true = 任一启用服务带 migrate 命令（启动时对 PG 执行迁移），或运维
-/// 显式 APP_CLI_REQUIRE_PG=1（服务不经 migrate 但启动期依赖 PG 的兜底声明）。
-pub(crate) fn workspace_needs_pg(specs: &[ServiceSpec]) -> bool {
-    if std::env::var_os("APP_CLI_REQUIRE_PG").is_some_and(|value| value == "1") {
-        return true;
-    }
-    specs
-        .iter()
-        .any(|spec| spec.enabled && !spec.run.migrate.is_empty())
+/// PostgreSQL preflight is an execution-environment policy supplied by RCoder.
+/// Standalone app-cli does not infer a local database from migrations or templates.
+pub(crate) fn workspace_needs_pg(_specs: &[ServiceSpec]) -> bool {
+    std::env::var_os("APP_CLI_REQUIRE_PG").is_some_and(|value| value == "1")
 }
 
 /// Probe the same database and credentials that migration commands consume.
@@ -1018,14 +1010,41 @@ pub(crate) async fn run_migration_with_receipt(
     workspace: &Path,
     pg: Option<&shared_types::StartPgCredential>,
 ) -> Result<()> {
+    run_migration_with_receipt_cancel(spec, release, workspace, pg, None).await
+}
+
+pub(crate) async fn run_migration_with_receipt_cancel(
+    spec: &ServiceSpec,
+    release: &manifest::ReleaseLock,
+    workspace: &Path,
+    pg: Option<&shared_types::StartPgCredential>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !cancel.is_some_and(|token| token.is_cancelled()),
+        "Migration cancelled before dispatch"
+    );
     let environment = service_environment(spec, pg)?;
+    let directory = workspace.join(&spec.dir);
+    validate_transient_input(&spec.run.migrate, &directory)?;
     let identity = crate::migration_journal::identity(release, &spec.service_id)?;
     let Some(receipt) = crate::migration_journal::MigrationJournal::begin(workspace, identity)?
     else {
         info!(service = %spec.service_id, "Migration already confirmed for this artifact");
         return Ok(());
     };
-    run_transient_with_env(&spec.run.migrate, &workspace.join(&spec.dir), &environment).await?;
+    if let Some(cancel) = cancel {
+        run_transient_cancellable(
+            &spec.run.migrate,
+            &directory,
+            &environment,
+            Duration::from_secs(300),
+            Some(cancel),
+        )
+        .await?;
+    } else {
+        run_transient_with_env(&spec.run.migrate, &directory, &environment).await?;
+    }
     receipt
         .complete()
         .context("persist confirmed database migration")
@@ -1050,6 +1069,35 @@ async fn run_transient_with_environment_and_timeout(
     env: &std::collections::BTreeMap<String, String>,
     timeout: Duration,
 ) -> Result<()> {
+    run_transient_cancellable(argv, cwd, env, timeout, None).await
+}
+
+/// Reject local input failures before creating an uncertain migration receipt.
+/// This does not prove spawn will succeed; failures after dispatch remain fenced.
+fn validate_transient_input(argv: &[String], cwd: &Path) -> Result<()> {
+    let program = argv.first().context("migration command is empty")?;
+    anyhow::ensure!(!program.trim().is_empty(), "migration executable is empty");
+    anyhow::ensure!(
+        argv.iter().all(|argument| !argument.contains('\0')),
+        "migration command contains a NUL byte"
+    );
+    let metadata = std::fs::metadata(cwd)
+        .with_context(|| format!("inspect migration working directory {}", cwd.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "migration working directory is not a directory"
+    );
+    Ok(())
+}
+
+async fn run_transient_cancellable(
+    argv: &[String],
+    cwd: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+    timeout: Duration,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    validate_transient_input(argv, cwd)?;
     let program = argv.first().context("migration command is empty")?;
     // R01：migrate 同样走受管进程树——shell 包装的迁移命令 spawn 的子孙
     // （工作进程/DB writer）整树归属，超时与收尾均收束确认。
@@ -1082,37 +1130,45 @@ async fn run_transient_with_environment_and_timeout(
 
     // 只等根进程退出（root 语义）：root 正常退出后仍可能有后台孙进程在写
     // （迁移 shell `cmd &` 后台化），超时与收尾判定不能被树级 wait 阻塞。
-    let outcome = tokio::time::timeout(timeout, child.wait_root()).await;
+    let outcome = tokio::select! {
+        result = tokio::time::timeout(timeout, child.wait_root()) => Some(result),
+        () = async {
+            match cancel {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        } => None,
+    };
     // A shell may exit successfully while descendants still execute migrations.
     // Confirm the original tree is stopped (and gone) before allowing recovery
     // or success — stop(ZERO) 对已退出的 root 直通，对残留孙进程 TERM→KILL
     // 并整树收束确认。
     let stop_outcome = child.stop(Duration::ZERO).await;
-    let status = match outcome {
-        Ok(status) => status.context("wait migrate")?,
-        Err(_) => {
-            out_task.abort();
-            err_task.abort();
-            anyhow::bail!(
-                "migrate timed out after {}ms: {}{}",
-                timeout.as_millis(),
-                argv.join(" "),
-                if stop_outcome == StopOutcome::Unconfirmed {
-                    " (tree stop unconfirmed)"
-                } else {
-                    ""
-                }
-            );
-        }
-    };
     if stop_outcome == StopOutcome::Unconfirmed {
         out_task.abort();
         err_task.abort();
-        anyhow::bail!(
-            "migrate tree stop unconfirmed after root exit: {}",
-            argv.join(" ")
-        );
+        return Err(ShutdownUnconfirmed(
+            "Migration process tree shutdown was not confirmed".into(),
+        )
+        .into());
     }
+    let status = match outcome {
+        Some(Ok(status)) => status.context("wait migrate")?,
+        None => {
+            out_task.abort();
+            err_task.abort();
+            anyhow::bail!("Migration cancelled; database outcome requires reconciliation");
+        }
+        Some(Err(_)) => {
+            out_task.abort();
+            err_task.abort();
+            anyhow::bail!(
+                "migrate timed out after {}ms: {}",
+                timeout.as_millis(),
+                argv.join(" ")
+            );
+        }
+    };
     let out = out_task.await.unwrap_or_default();
     let err = err_task.await.unwrap_or_default();
 

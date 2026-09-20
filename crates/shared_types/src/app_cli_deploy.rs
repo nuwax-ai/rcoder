@@ -162,6 +162,73 @@ pub struct AppMutationPrecondition {
     pub resource_version: Option<String>,
 }
 
+/// Read from the captured physical owner, never a Service or cached pod address.
+/// This evidence closes a failed hot write; it cannot authorize another deploy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotDeploymentFailureEvidence {
+    pub target: crate::RuntimeConfigurationTarget,
+    pub protocol_version: u32,
+    pub server_phase: AppCliDeployPhase,
+    pub operation: AppDeploymentOperation,
+}
+
+impl HotDeploymentFailureEvidence {
+    pub fn validate(&self, record: &crate::UserAppOperationRecord) -> Result<(), String> {
+        let hot = record
+            .checkpoint
+            .get("hot_execution")
+            .ok_or("Hot deployment checkpoint missing")?;
+        let context: crate::UserAppExecutionContext = serde_json::from_value(
+            hot.get("context")
+                .cloned()
+                .ok_or("Hot execution context missing")?,
+        )
+        .map_err(|_| "Invalid hot execution context")?;
+        let target: crate::RuntimeConfigurationTarget = serde_json::from_value(
+            hot.get("target")
+                .cloned()
+                .ok_or("Hot physical target missing")?,
+        )
+        .map_err(|_| "Invalid hot physical target")?;
+        if hot
+            .get("receipt_protocol")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+            || hot.get("phase").and_then(serde_json::Value::as_str) != Some("submit")
+            || hot.get("release_id").and_then(serde_json::Value::as_str)
+                != Some(self.operation.request_release_id.as_str())
+            || record.scope != crate::UserAppOperationScope::Prod
+            || context.app_id != record.app_id
+            || context.lifecycle_id != record.lifecycle_id
+            || context.operation_id != record.operation_id
+            || Some(&context.executor_id) != record.executor_id.as_ref()
+            || context.request_fingerprint != record.request_fingerprint
+            || target != self.target
+            || target.physical_uid.is_empty()
+            || target.deployment_generation.is_empty()
+            || self.protocol_version != APP_CLI_UNIFIED_DEPLOY_PROTOCOL
+            || self.operation.operation_id != record.operation_id
+            || self.operation.deployment_generation_id != target.deployment_generation
+            || self.operation.phase != AppCliDeployPhase::Failed
+            || !self.operation.persisted
+            || !matches!(
+                self.server_phase,
+                AppCliDeployPhase::Failed | AppCliDeployPhase::Running
+            )
+            || self
+                .operation
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| !matches!(recovery.status.as_str(), "restored" | "failed"))
+        {
+            return Err(
+                "Hot deployment failure evidence does not confirm the original write".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

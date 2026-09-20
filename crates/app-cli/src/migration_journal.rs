@@ -35,10 +35,10 @@ fn state_root(workspace: &Path) -> Result<PathBuf> {
     )
 }
 
-fn require_confirmed(root: &Path) -> Result<()> {
+fn inspect_confirmed(root: &Path) -> Result<bool> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error).context("read migration receipts"),
     };
     for entry in entries {
@@ -49,13 +49,25 @@ fn require_confirmed(root: &Path) -> Result<()> {
         {
             let receipt: Receipt = serde_json::from_slice(&std::fs::read(&path)?)
                 .context("decode migration receipt")?;
-            ensure!(
-                receipt.completed,
-                "Migration outcome is unconfirmed; explicit database reconciliation is required"
-            );
+            if !receipt.completed {
+                return Ok(false);
+            }
         }
     }
+    Ok(true)
+}
+
+fn require_confirmed(root: &Path) -> Result<()> {
+    ensure!(
+        inspect_confirmed(root)?,
+        "Migration outcome is unconfirmed; explicit database reconciliation is required"
+    );
     Ok(())
+}
+
+/// Observation is not execution permission; begin() rechecks under its lease.
+pub(crate) fn inspect_migrations(workspace: &Path) -> Result<bool> {
+    inspect_confirmed(&state_root(workspace)?)
 }
 
 pub(crate) fn require_confirmed_migrations(workspace: &Path) -> Result<()> {

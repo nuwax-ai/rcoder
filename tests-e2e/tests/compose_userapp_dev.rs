@@ -3665,3 +3665,50 @@ async fn userapp_dev_two_users_share_app() {
     let _gate = scenario_gate().await;
     scenario_two_users_share_app().await;
 }
+
+/// One real lifecycle sequence with independent CLI/HTTP caller processes.
+#[tokio::test]
+async fn userapp_manual_owner_multi_process_control() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let Some((env, report)) =
+        Env::compose_or_skip("userapp_manual_owner_multi_process_control", "compose").await
+    else {
+        return;
+    };
+    let path = report
+        .path
+        .parent()
+        .expect("report directory")
+        .join("manual-owner.json");
+    let result = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tools/manual_owner_stop.py"
+        ))
+        .arg("--rcoder")
+        .arg(&env.rcoder)
+        .arg("--report")
+        .arg(&path)
+        .status();
+    report.assert_hard(
+        "multi-process scenario completed",
+        result.is_ok_and(|s| s.success()),
+        "See manual-owner.json for runtime identities and subprocess evidence".into(),
+    );
+    let evidence: Value = serde_json::from_slice(&std::fs::read(&path).expect("scenario evidence"))
+        .expect("valid scenario evidence");
+    for check in evidence["checks"].as_array().expect("scenario checks") {
+        report.assert_hard(
+            check["name"].as_str().expect("check name"),
+            check["ok"] == true,
+            check["detail"].to_string(),
+        );
+    }
+    report.assert_hard(
+        "temporary builder cleanup confirmed",
+        evidence["cleanup_ok"] == true,
+        "Only the captured test container is removed; workspace data retained".into(),
+    );
+    assert!(report.finish(), "multi-process owner control failed");
+}

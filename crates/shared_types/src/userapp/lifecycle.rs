@@ -740,6 +740,164 @@ pub enum UserAppStoreError {
 ///   method — there are no optional capabilities on this trait.
 #[async_trait::async_trait]
 pub trait UserAppLifecycleStore: Send + Sync {
+    /// Immutable storage identities captured when missing registration was restored.
+    async fn get_recovery_witness(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> Result<Option<crate::UserAppDiscoveredIdentity>, UserAppStoreError>;
+    /// Restore only a missing root. An existing different lifecycle or tombstone
+    /// is never overwritten; resource discovery is revalidated by the caller.
+    async fn restore_discovered_identity(
+        &self,
+        discovered: &crate::UserAppDiscoveredIdentity,
+    ) -> Result<UserAppLifecycleRecord, UserAppStoreError>;
+
+    /// Persists priority intent and the originating request without releasing the old
+    /// business slot. The runtime coordinator must separately drain old writes.
+    async fn admit_compute_control(
+        &self,
+        request: &crate::ComputeControlRequest,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
+    async fn get_compute_control(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<crate::ComputeControlRecord>, UserAppStoreError>;
+
+    /// Read-only access cannot wake a manually stopped scope. Explicit user
+    /// startup may clear a completed stop intent, under the same root CAS.
+    async fn check_compute_access(
+        &self,
+        app_id: &str,
+        scope: UserAppOperationScope,
+        explicit_start: bool,
+    ) -> Result<(), UserAppStoreError>;
+
+    /// Close an interrupted business operation only from its exact, durable final
+    /// effects receipt. Unknown or incomplete effects must remain recoverable.
+    async fn finalize_compute_interrupted_operation(
+        &self,
+        identity: &crate::ComputeExecutorIdentity,
+        snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError>;
+
+    /// Resume the same control only before it obtained a physical lease or issued
+    /// compute writes. Other recovery stages require runtime-specific evidence.
+    async fn resume_compute_drain(
+        &self,
+        snapshot: &crate::ComputeControlRecord,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
+
+    /// Finalize a compute control whose durable stage proves that all physical
+    /// writes have returned. The caller verifies any outstanding readiness read;
+    /// this method never authorizes replay of the runtime mutation.
+    async fn finalize_confirmed_compute(
+        &self,
+        snapshot: &crate::ComputeControlRecord,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
+
+    /// Caller has verified the original stop's atomic runtime receipt and absence
+    /// of old compute. Commit only the exact snapshot; never authorize another write.
+    async fn finalize_observed_compute_stop(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Observed stop recovery is unsupported".into(),
+        ))
+    }
+
+    /// Same snapshot contract, after verifying the original start receipt and readiness.
+    async fn finalize_observed_compute_restart(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Observed restart recovery is unsupported".into(),
+        ))
+    }
+
+    /// Claim the remaining startup or a proven single-write retry of a restart.
+    /// The caller verifies the retained lease, original volumes and conditional
+    /// target before this exact CAS; committed startups are observation-only.
+    async fn resume_compute_restart_start(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _target: &crate::UserAppMutationTarget,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Restart continuation is unsupported".into(),
+        ))
+    }
+
+    async fn resume_builder_restart_start(
+        &self,
+        snapshot: &crate::ComputeControlRecord,
+        target: &crate::BuilderControlTarget,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
+
+    /// Claims a pending control using its exact revision and current intent.
+    /// A different executor cannot take over Running merely because time passed.
+    async fn claim_compute_control(
+        &self,
+        identity: &crate::ComputeExecutorIdentity,
+        expected_revision: i64,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
+    async fn check_compute_executor(
+        &self,
+        identity: &crate::ComputeExecutorIdentity,
+    ) -> Result<(), UserAppStoreError>;
+
+    /// Persist the exact compute lease in the independent control ledger.
+    async fn bind_compute_lease(
+        &self,
+        identity: &crate::ComputeExecutorIdentity,
+        receipt: &crate::UserAppOperationLeaseReceipt,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
+    async fn advance_compute_control(
+        &self,
+        progress: &crate::ComputeControlProgress,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
+    /// Only a terminal record's identical receipt can be forgotten, after release.
+    /// Superseded is not evidence that runtime writes ended.
+    async fn forget_compute_lease(
+        &self,
+        identity: &crate::ComputeExecutorIdentity,
+        receipt: &crate::UserAppOperationLeaseReceipt,
+    ) -> Result<(), UserAppStoreError>;
+
+    /// The superseded executor may acknowledge its own confirmed quiescence.
+    /// This never authorizes further writes or promotes its outcome to success.
+    async fn acknowledge_compute_drain(
+        &self,
+        acknowledgement: &crate::ComputeControlDrainAcknowledgement,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
+    /// Cursor scan includes pending/uncertain controls and terminal receipts.
+    /// Mark a successful restart archive removed after runtime UID-conditional
+    /// deletion. Exact record CAS; does not change lifecycle or compute intent.
+    async fn mark_restart_archive_cleaned(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+    ) -> Result<(), UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Archive cleanup recording is unsupported".into(),
+        ))
+    }
+    async fn scan_compute_controls(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::ComputeControlRecord>, UserAppStoreError>;
+
+    /// Checks the ordinary executor against the latest durable compute intent.
+    /// Call before starting runtime mutations. This is not evidence that an
+    /// already-submitted remote write has finished or may release its lease.
+    async fn check_business_execution(
+        &self,
+        context: &UserAppExecutionContext,
+    ) -> Result<(), UserAppStoreError>;
+
     /// Physical ownership fence lookup. A binding is immutable once committed;
     /// callers must not treat absence as free-for-adoption without CAS via
     /// [`Self::commit_resource_binding`].
@@ -915,6 +1073,68 @@ pub trait UserAppLifecycleStore: Send + Sync {
         let _ = (snapshot, evidence);
         Err(UserAppStoreError::InvalidOperation(
             "Database preparation recovery is unsupported by this store".into(),
+        ))
+    }
+    /// Close a timed-out creation after the original runtime call returned an
+    /// explicit rejection and released its lease. Never inferred from age or
+    /// error text. Requires the original executor and complete snapshot CAS.
+    async fn finalize_builder_creation_rejection(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        rejection: &crate::RuntimeRequestRejection,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let _ = (snapshot, rejection);
+        Err(UserAppStoreError::InvalidOperation(
+            "Builder rejection recovery is unsupported by this store".into(),
+        ))
+    }
+    /// The original runtime has acknowledged cancellation at a write-free
+    /// boundary and released its lease. Keep cancellation history, close only
+    /// the original timed-out creation and its own slot via full snapshot CAS.
+    /// Close only an acknowledged wake's read-only recovery phase using a full
+    /// record CAS. Never authorizes another runtime write or releases a lease.
+    async fn finalize_observed_wake(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Wake observation recovery is unsupported".into(),
+        ))
+    }
+
+    /// Close an observed terminal hot failure by full snapshot CAS. The caller
+    /// must still conditionally release the original physical lease receipt.
+    async fn finalize_observed_hot_failure(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+        _evidence: &crate::HotDeploymentFailureEvidence,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Hot failure recovery is unsupported".into(),
+        ))
+    }
+
+    async fn finalize_builder_creation_cancellation(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let _ = snapshot;
+        Err(UserAppStoreError::InvalidOperation(
+            "Builder cancellation recovery is unsupported".into(),
+        ))
+    }
+    /// Save a late builder response, or promote its existing witness after
+    /// management readiness is observed. Exact snapshot CAS; neither phase
+    /// publishes success nor releases the operation slot.
+    async fn confirm_builder_creation_recovery(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &crate::BuilderCreationEvidence,
+        management_ready: bool,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let _ = (snapshot, evidence, management_ready);
+        Err(UserAppStoreError::InvalidOperation(
+            "Builder creation recovery is unsupported by this store".into(),
         ))
     }
     /// Validates app/lifecycle/operation/executor/revision and the correct scope

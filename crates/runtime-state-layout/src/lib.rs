@@ -37,6 +37,83 @@ pub fn canonical_project_root(workspace: &Path) -> PathBuf {
     canonical
 }
 
+const PROJECT_ORIGIN: &str = ".app-cli-project-origin.json";
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectOrigin {
+    version: u32,
+    project_root: PathBuf,
+    runtime_root: PathBuf,
+}
+
+/// Explicit local build provenance. Arbitrary child directories are not aliases.
+/// Corrupt, copied or relocated markers fail identity verification. This metadata
+/// does not relocate an existing owner lock, token or journal.
+pub fn resolve_project_origin(workspace: &Path) -> Result<PathBuf> {
+    let canonical = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let marker = canonical.join(PROJECT_ORIGIN);
+    match std::fs::read(&marker) {
+        Ok(bytes) => {
+            let origin: ProjectOrigin =
+                serde_json::from_slice(&bytes).context("decode project origin")?;
+            anyhow::ensure!(
+                origin.version == 1
+                    && origin.project_root.is_absolute()
+                    && origin.runtime_root.is_absolute(),
+                "invalid project origin"
+            );
+            let runtime =
+                std::fs::canonicalize(&origin.runtime_root).context("resolve origin runtime")?;
+            anyhow::ensure!(
+                runtime == canonical,
+                "project origin was copied to another runtime directory"
+            );
+            return std::fs::canonicalize(&origin.project_root).context("resolve origin project");
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("read project origin"),
+    }
+    if canonical.file_name().is_some_and(|name| name == ".run")
+        && let Some(parent) = canonical.parent()
+    {
+        return Ok(parent.to_path_buf());
+    }
+    Ok(canonical)
+}
+
+/// Called only by local --deploy-dir assembly, not included in release archives.
+pub fn record_project_origin(project: &Path, runtime: &Path) -> Result<()> {
+    let project_root = resolve_project_origin(project)?;
+    let project_root =
+        std::fs::canonicalize(project_root).context("canonicalize origin project")?;
+    let runtime_root = std::fs::canonicalize(runtime).context("canonicalize origin runtime")?;
+    if project_root == runtime_root {
+        return Ok(());
+    }
+    let guard = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(runtime_root.join(".app-cli-project-origin.lock"))
+        .context("open project origin lock")?;
+    lock_registry(&guard, std::time::Duration::from_secs(2))?;
+    let path = runtime_root.join(PROJECT_ORIGIN);
+    if path.exists() {
+        anyhow::ensure!(
+            resolve_project_origin(&runtime_root)? == project_root,
+            "runtime directory belongs to another project"
+        );
+    }
+    write_json_atomic(
+        &path,
+        &ProjectOrigin {
+            version: 1,
+            project_root,
+            runtime_root,
+        },
+    )
+}
+
 /// 卷根（状态根的父目录）：项目根的父目录。
 fn volume_root(project_root: &Path) -> Result<&Path> {
     project_root
@@ -147,7 +224,7 @@ fn read_registry(path: &Path) -> Result<std::collections::BTreeMap<String, Strin
         .with_context(|| format!("decode runtime state registry {} (corrupt file must be resolved by an operator, not silently re-keyed)", path.display()))
 }
 
-fn write_json_atomic(path: &Path, map: &std::collections::BTreeMap<String, String>) -> Result<()> {
+fn write_json_atomic(path: &Path, map: &impl serde::Serialize) -> Result<()> {
     let json = serde_json::to_string_pretty(map).context("encode registry")?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json)
@@ -310,5 +387,34 @@ mod tests {
             error.to_string().contains("registry"),
             "diagnostic: {error:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod project_origin_tests {
+    use super::*;
+    #[test]
+    fn custom_deploy_directory_records_origin_without_relocating_owner_state() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let runtime = project.join(".local-deploy");
+        std::fs::create_dir_all(&runtime).unwrap();
+        assert_ne!(
+            resolve_project_origin(&runtime).unwrap(),
+            resolve_project_origin(&project).unwrap()
+        );
+        let before = ensure_state_root(&runtime, None, None).unwrap();
+        record_project_origin(&project, &runtime).unwrap();
+        assert_eq!(
+            resolve_project_origin(&runtime).unwrap(),
+            canonical_project_root(&project)
+        );
+        assert_eq!(before, ensure_state_root(&runtime, None, None).unwrap());
+        let moved = project.join("copied");
+        std::fs::create_dir_all(&moved).unwrap();
+        std::fs::copy(runtime.join(PROJECT_ORIGIN), moved.join(PROJECT_ORIGIN)).unwrap();
+        assert!(resolve_project_origin(&moved).is_err());
+        std::fs::write(runtime.join(PROJECT_ORIGIN), "broken").unwrap();
+        assert!(resolve_project_origin(&runtime).is_err());
     }
 }

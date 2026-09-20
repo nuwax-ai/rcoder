@@ -91,8 +91,10 @@ impl ProxyHttp for PortProxy {
                 match wc.ensure_running(&app_id).await {
                     shared_types::WakeOutcome::Ready
                     | shared_types::WakeOutcome::AlreadyRunning => { /* 放行到 upstream */ }
-                    shared_types::WakeOutcome::Timeout | shared_types::WakeOutcome::Failed(_) => {
-                        // hold-and-wait 超时/失败：app 仍在后台启动，返 503 + Retry-After
+                    shared_types::WakeOutcome::Timeout
+                    | shared_types::WakeOutcome::Failed(_)
+                    | shared_types::WakeOutcome::Blocked { .. } => {
+                        // 未获得可用上游（包括操作占用）；返回 503，不宣称仍在启动。
                         let mut resp = ResponseHeader::build(503, None)?;
                         resp.insert_header("Retry-After", WAKE_503_RETRY_AFTER_SECS)?;
                         session.write_response_header(Box::new(resp), true).await?;

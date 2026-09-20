@@ -121,6 +121,62 @@ pub trait AgentContainerRuntime: Send + Sync {
         self.capture_builder_control(context).await
     }
 
+    /// Recover an original successful create response from a durable runtime
+    /// receipt. May release only that receipt's original inactive lease; never
+    /// create/start resources or infer success from a same-named container.
+    /// A durable cancellation acknowledgement returns `CreationCancelled`
+    /// only after its original lease was released. It does not imply resource
+    /// absence and must never be converted into a successful creation.
+    async fn recover_builder_creation(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderCreationEvidence>> {
+        Ok(None)
+    }
+
+    /// Inspect an identity-bound orphan Pod for compute-only Stop. No adoption,
+    /// storage mutation or controller creation is authorized by this witness.
+    async fn capture_builder_orphan_stop(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderOrphanStopTarget>> {
+        Ok(None)
+    }
+    /// Read-only candidate discovery; missing native metadata still requires
+    /// revalidation with a durable physical binding before a stop is allowed.
+    async fn inspect_builder_orphan_stop(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderOrphanStopTarget>> {
+        self.capture_builder_orphan_stop(context).await
+    }
+    async fn capture_bound_builder_orphan_stop(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderOrphanStopTarget>> {
+        if binding.is_some() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Orphan physical bindings are unsupported".into(),
+            ));
+        }
+        self.capture_builder_orphan_stop(context).await
+    }
+    async fn stop_builder_orphan(
+        &self,
+        _target: &shared_types::BuilderOrphanStopTarget,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Orphan builder stop is unsupported".into(),
+        ))
+    }
+    async fn confirm_builder_orphan_stopped(
+        &self,
+        _target: &shared_types::BuilderOrphanStopTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
     async fn capture_builder_control(
         &self,
         _context: &shared_types::UserAppExecutionContext,
@@ -149,6 +205,89 @@ pub trait AgentContainerRuntime: Send + Sync {
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
         Err(ContainerRuntimeError::ConfigurationError(
             "Identity-bound builder controls are unsupported".into(),
+        ))
+    }
+
+    /// Observe an atomic stop receipt and absence of the captured builder's Pods.
+    /// Unsupported backends cannot infer completion from a stopped-looking state.
+    async fn reconcile_builder_compute_stop(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    fn supports_builder_compute_fencing(&self) -> bool {
+        false
+    }
+
+    /// Causal acknowledgement of a completed Docker API call. This is for
+    /// draining superseded work, not for claiming current service readiness.
+    async fn builder_compute_write_acknowledged(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+        _starting: bool,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Capture private original configuration before a compute-only restart.
+    async fn archive_builder_restart(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderRestartTemplate>> {
+        Ok(None)
+    }
+
+    /// Recreate a lost controller from an operation-bound archive, retaining
+    /// original volumes. Never infer this authority from a resource name.
+    async fn restore_builder_restart(
+        &self,
+        _template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Builder controller restoration is unsupported".into(),
+        ))
+    }
+
+    async fn capture_builder_compute_volumes(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Vec<shared_types::AppResourceIdentity>> {
+        Ok(Vec::new())
+    }
+
+    async fn fence_builder_compute_write(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    async fn reconcile_builder_compute_start(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        Ok(None)
+    }
+
+    /// None means the original start committed and must only be observed.
+    async fn prepare_builder_compute_retry(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderControlTarget>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Conditional builder retry is unsupported".into(),
+        ))
+    }
+
+    /// Start a captured, stopped builder without deleting its controller or data.
+    async fn start_builder_control(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured builder startup is unsupported".into(),
         ))
     }
 
@@ -458,6 +597,43 @@ pub trait WorkspaceRuntime: Send + Sync {
 /// Docker 由 `DockerRuntime` 做等价语义映射（容器 create/stop/start）。
 #[async_trait]
 pub trait UserAppDeploymentRuntime: Send + Sync {
+    /// Remove only a successful restart's private archive. Caller must have
+    /// committed its terminal result and released the original operation lease.
+    async fn cleanup_builder_restart_archive(
+        &self,
+        _template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Restart archive cleanup is unsupported".into(),
+        ))
+    }
+
+    /// Verify preserved physical storage before a recovered workspace is used.
+    /// This is read-only and is deliberately not a prerequisite for Stop.
+    async fn verify_recovered_volumes(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        volumes: &[shared_types::AppResourceIdentity],
+    ) -> ContainerRuntimeResult<()> {
+        if volumes.is_empty() {
+            return Ok(());
+        }
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Recovered volume verification is unsupported".into(),
+        ))
+    }
+    /// Inspect both scopes before creating a replacement SQL lifecycle. Never
+    /// repairs resource labels or starts workloads. Conflicting owners are errors.
+    async fn discover_application_identity(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppDiscoveredIdentity>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Lifecycle discovery is unsupported".into(),
+        ))
+    }
+
     /// 创建并启动一个 Deployment（K8s）或等价容器（Docker）
     async fn create_deployment(
         &self,
@@ -588,6 +764,98 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// Capture restart-only startup witnesses without changing storage ownership.
+    async fn prepare_app_compute_start(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<shared_types::UserAppComputeStartTarget> {
+        Ok(shared_types::UserAppComputeStartTarget {
+            target: target.clone(),
+            compute_start_single_write: false,
+            volumes: Vec::new(),
+        })
+    }
+
+    /// Refresh only a single-write restart target after proving its original
+    /// write has not committed. None means observe the original result instead.
+    async fn prepare_app_compute_start_retry(
+        &self,
+        _target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppComputeStartTarget>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Conditional compute retry is unsupported".into(),
+        ))
+    }
+
+    /// Fence the exact conditional startup write of a superseded compute
+    /// operation. True proves it cannot commit later, not that compute is stopped.
+    async fn fence_app_compute_start(
+        &self,
+        _target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Fence the captured single-write scale-down of a superseded Restart.
+    /// The successor must still perform and confirm its own Stop.
+    async fn fence_app_compute_stop(
+        &self,
+        _target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    async fn start_app_compute(
+        &self,
+        target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.start_app_target(&target.target).await
+    }
+
+    /// Live absence observation under the caller's drained operation lease.
+    /// False means absence is not proven; errors must never be treated as absence.
+    async fn app_compute_absent(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Reconcile a lost stop response using an atomic runtime receipt, not age
+    /// or readiness alone. Implementations that cannot prove it return false.
+    async fn reconcile_app_compute_stop(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    async fn app_compute_write_acknowledged(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+        _starting: bool,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Verify the exact atomic start receipt after a lost restart response.
+    async fn reconcile_app_compute_start(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Confirm no old compute remains before reusing its workspace volume.
+    async fn confirm_app_compute_stopped(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Compute stop confirmation is unsupported".into(),
+        ))
+    }
+
     /// 伸缩 Deployment 副本数（K8s scale；Docker: 0=stop, >=1=start）
     async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
         let _ = (app_id, replicas);
@@ -655,9 +923,18 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
-    /// Distributed runtime operation lease; Docker uses the service's shared file lock.
-    /// Release only a captured application operation mutex. The coordinator must
-    /// first reserve a confirmed final checkpoint with a SQL revision claim.
+    /// Read-only verification of the retained physical operation lease.
+    /// Absence or an unsupported backend never grants continuation authority.
+    async fn validate_app_operation_receipt(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Release only the captured mutex after the coordinator has reserved a
+    /// confirmed final checkpoint with a database revision claim.
     async fn release_app_operation_receipt(
         &self,
         _context: &shared_types::UserAppExecutionContext,

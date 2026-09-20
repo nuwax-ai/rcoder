@@ -35,6 +35,47 @@ pub(super) async fn probe_owner(address: &str) -> Option<RuntimeIdentityView> {
     serde_json::from_value(body.get("data")?.clone()).ok()
 }
 
+/// Stop must distinguish an absent listener from an unhealthy/foreign listener.
+pub(super) async fn probe_owner_for_stop(address: &str) -> Result<Option<RuntimeIdentityView>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .no_proxy()
+        .build()?;
+    let response = match client
+        .get(format!("http://{address}/v1/runtime/identity"))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+            while let Some(current) = cause {
+                if current
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+                {
+                    return Ok(None);
+                }
+                cause = current.source();
+            }
+            return Err(error).context("owner observation failed; stop is not confirmed");
+        }
+    };
+    let body: serde_json::Value = response
+        .error_for_status()
+        .context("owner identity rejected")?
+        .json()
+        .await
+        .context("invalid owner response")?;
+    let identity = serde_json::from_value(
+        body.get("data")
+            .cloned()
+            .context("owner identity missing")?,
+    )
+    .context("invalid owner identity")?;
+    Ok(Some(identity))
+}
+
 /// Verify physical project identity before loading or transmitting owner credentials.
 pub(super) fn verify_project_identity(
     identity: &RuntimeIdentityView,
@@ -48,10 +89,57 @@ pub(super) fn verify_project_identity(
             && source.is_absolute()
             && !identity.workspace_id.trim().is_empty()
             && !identity.runtime_instance_id.trim().is_empty()
-            && identity.application_id == application_id
-            && runtime_state_layout::canonical_project_root(source)
-                == runtime_state_layout::canonical_project_root(workspace),
+            && identity.application_id == application_id,
         "different app-cli owner: project or application identity mismatch"
+    );
+    let source_origin = runtime_state_layout::resolve_project_origin(source)?;
+    let requested_origin = runtime_state_layout::resolve_project_origin(workspace)?;
+    anyhow::ensure!(
+        source_origin == requested_origin,
+        "different app-cli owner: project origin mismatch"
+    );
+    if runtime_state_layout::canonical_project_root(source)
+        != runtime_state_layout::canonical_project_root(workspace)
+    {
+        anyhow::ensure!(
+            identity
+                .capabilities
+                .iter()
+                .any(|capability| capability == "project-origin-execution"),
+            "app-cli owner must be upgraded before reusing a local build directory for source execution"
+        );
+    }
+    Ok(())
+}
+
+/// Stop has authority over this application's workspace tree, including a
+/// manually assembled legacy deploy directory. Canonicalize both paths so a
+/// symlink to another application's directory cannot grant that authority.
+/// This does not authorize deploy/start to reinterpret that directory as source.
+pub(super) fn verify_stop_identity(
+    identity: &RuntimeIdentityView,
+    workspace: &std::path::Path,
+    application_id: &str,
+) -> Result<()> {
+    let source = std::path::Path::new(&identity.source_root);
+    anyhow::ensure!(
+        protocol_compatible(identity)
+            && identity.application_id == application_id
+            && identity.service_family == "userapp-dev"
+            && !identity.workspace_id.trim().is_empty()
+            && !identity.runtime_instance_id.trim().is_empty()
+            && source.is_absolute(),
+        "different app-cli owner: application or protocol identity mismatch"
+    );
+    // Decode origin even for contained paths: corrupted provenance is not bypassed.
+    let origin = runtime_state_layout::resolve_project_origin(source)?;
+    let expected = runtime_state_layout::resolve_project_origin(workspace)?;
+    let physical_source = std::fs::canonicalize(source).context("resolve owner workspace")?;
+    let physical_workspace =
+        std::fs::canonicalize(workspace).context("resolve requested workspace")?;
+    anyhow::ensure!(
+        origin == expected || physical_source.starts_with(&physical_workspace),
+        "different app-cli owner: workspace is outside the application's project"
     );
     Ok(())
 }
@@ -451,6 +539,26 @@ mod r09_tests {
         let different = root.path().join("other").join("中文 project");
         std::fs::create_dir_all(&different).unwrap();
         assert!(verify_project_identity(&identity, &different, "app").is_err());
+        let local_deploy = project.join(".local-deploy");
+        std::fs::create_dir_all(&local_deploy).unwrap();
+        identity.source_root = local_deploy.to_string_lossy().into();
+        assert!(verify_stop_identity(&identity, &project, "app").is_ok());
+        assert!(
+            verify_project_identity(&identity, &project, "app").is_err(),
+            "stopping a descendant does not authorize treating it as the source workspace"
+        );
+        identity.source_root = different.to_string_lossy().into();
+        assert!(verify_stop_identity(&identity, &project, "app").is_err());
+        #[cfg(unix)]
+        {
+            let link = project.join("external-link");
+            std::os::unix::fs::symlink(&different, &link).unwrap();
+            identity.source_root = link.to_string_lossy().into();
+            assert!(verify_stop_identity(&identity, &project, "app").is_err());
+        }
+        runtime_state_layout::record_project_origin(&project, &different).unwrap();
+        identity.source_root = different.to_string_lossy().into();
+        assert!(verify_stop_identity(&identity, &project, "app").is_ok());
         identity.source_root.clear();
         assert!(verify_project_identity(&identity, &project, "app").is_err());
         identity.source_root = "relative".into();

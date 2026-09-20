@@ -181,13 +181,16 @@ impl KubernetesRuntime {
         }
         self.claim_app_storage_with_context(&target.context.app_id, Some(&target.context))
             .await?;
+        let receipt = serde_json::to_string(&target.context).map_err(|error| {
+            ContainerRuntimeError::ConfigurationError(format!("Encode start receipt: {error}"))
+        })?;
         let patch = if enable_traffic_wake {
             serde_json::json!({
-                "metadata":{"annotations":{(WAKE_ON_TRAFFIC_ANNOTATION):"true"}},
+                "metadata":{"annotations":{(WAKE_ON_TRAFFIC_ANNOTATION):"true", "rcoder.io/compute-start-receipt":receipt}},
                 "spec":{"replicas":1}
             })
         } else {
-            serde_json::json!({"spec":{"replicas":1}})
+            serde_json::json!({"metadata":{"annotations":{"rcoder.io/compute-start-receipt":receipt}},"spec":{"replicas":1}})
         };
         self.patch_captured_app(&target.resource, patch).await
     }
@@ -206,10 +209,471 @@ impl KubernetesRuntime {
                 "Application stop target name changed".into(),
             ));
         }
+        let receipt = serde_json::to_string(&target.context).map_err(|error| {
+            ContainerRuntimeError::ConfigurationError(format!("Encode stop receipt: {error}"))
+        })?;
         self.patch_captured_app(&target.resource, serde_json::json!({
-            "metadata":{"annotations":{(WAKE_ON_TRAFFIC_ANNOTATION):wake_on_traffic.to_string()}},
+            "metadata":{"annotations":{(WAKE_ON_TRAFFIC_ANNOTATION):wake_on_traffic.to_string(), "rcoder.io/compute-stop-receipt":receipt}},
             "spec":{"replicas":0}
         })).await
+    }
+
+    pub(super) async fn prepare_captured_compute_start(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<shared_types::UserAppComputeStartTarget> {
+        use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+        target
+            .context
+            .validate_identity(&target.context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let deployment = self
+            .deployments_api()
+            .get(&target.resource.name)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("Read restart workload: {e}")))?;
+        if target.resource.kind != shared_types::AppResourceKind::Deployment
+            || target.resource.name != self.app_deployment_name(&target.context.app_id)
+            || deployment.metadata.uid.as_deref() != Some(target.resource.uid.as_str())
+            || deployment.metadata.resource_version != target.resource.resource_version
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Restart workload changed before volume capture".into(),
+            ));
+        }
+        let annotations = deployment.metadata.annotations.as_ref().ok_or_else(|| {
+            ContainerRuntimeError::Conflict("Restart workload identity missing".into())
+        })?;
+        target
+            .context
+            .validate_application_metadata(annotations)
+            .map_err(ContainerRuntimeError::Conflict)?;
+        let spec = deployment.spec.as_ref().ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError("Restart workload spec missing".into())
+        })?;
+        let pvc_api: kube::Api<PersistentVolumeClaim> =
+            kube::Api::namespaced(self.client.clone(), &self.namespace);
+        let mut volumes = Vec::new();
+        for volume in spec
+            .template
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.volumes.as_ref())
+            .into_iter()
+            .flatten()
+        {
+            let Some(claim) = volume.persistent_volume_claim.as_ref() else {
+                continue;
+            };
+            let pvc = pvc_api.get(&claim.claim_name).await.map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("Read restart volume: {e}"))
+            })?;
+            if pvc.metadata.deletion_timestamp.is_some() {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Restart volume is deleting".into(),
+                ));
+            }
+            let annotations = pvc.metadata.annotations.as_ref().ok_or_else(|| {
+                ContainerRuntimeError::Conflict("Restart volume lifecycle is missing".into())
+            })?;
+            target
+                .context
+                .validate_application_metadata(annotations)
+                .map_err(ContainerRuntimeError::Conflict)?;
+            volumes.push(shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+                name: claim.claim_name.clone(),
+                uid: pvc.metadata.uid.ok_or_else(|| {
+                    ContainerRuntimeError::ConfigurationError("Restart volume UID missing".into())
+                })?,
+                resource_version: pvc.metadata.resource_version,
+            });
+        }
+        if volumes.is_empty() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Restart has no captured workspace volume".into(),
+            ));
+        }
+        Ok(shared_types::UserAppComputeStartTarget {
+            target: target.clone(),
+            compute_start_single_write: true,
+            volumes,
+        })
+    }
+
+    pub(super) async fn prepare_captured_compute_retry(
+        &self,
+        captured: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppComputeStartTarget>> {
+        if !captured.compute_start_single_write {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Original single-write witness is required".into(),
+            ));
+        }
+        let target = &captured.target;
+        let deployment = self
+            .deployments_api()
+            .get(&target.resource.name)
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("Observe original compute start: {e}"))
+            })?;
+        if deployment.metadata.uid.as_deref() != Some(target.resource.uid.as_str()) {
+            return Err(ContainerRuntimeError::Conflict(
+                "Original restart workload was replaced".into(),
+            ));
+        }
+        let applied = deployment
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("rcoder.io/compute-start-receipt"))
+            .map(|value| serde_json::from_str::<shared_types::UserAppExecutionContext>(value))
+            .transpose()
+            .map_err(|_| {
+                ContainerRuntimeError::ConfigurationError("Invalid compute start receipt".into())
+            })?;
+        if applied.as_ref() == Some(&target.context) {
+            return Ok(None);
+        }
+        if !self.reconcile_captured_compute_stop(target).await? {
+            return Err(ContainerRuntimeError::Conflict(
+                "Original restart stop is not confirmed".into(),
+            ));
+        }
+        // Use the version from before the stop observation. If a start raced
+        // with those reads, preparation rejects that version instead of rebasing.
+        let mut refreshed = target.clone();
+        refreshed.resource.resource_version = deployment.metadata.resource_version;
+        if refreshed
+            .resource
+            .resource_version
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Restart workload version missing".into(),
+            ));
+        }
+        let prepared = self.prepare_captured_compute_start(&refreshed).await?;
+        captured
+            .verify_same_volumes(&prepared)
+            .map_err(ContainerRuntimeError::Conflict)?;
+        Ok(Some(prepared))
+    }
+
+    pub(super) async fn fence_captured_compute_write(
+        &self,
+        captured: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        let target = &captured.target;
+        target
+            .context
+            .validate_identity(&target.context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if !captured.compute_start_single_write
+            || captured.volumes.is_empty()
+            || target.resource.kind != shared_types::AppResourceKind::Deployment
+            || target.resource.name != self.app_deployment_name(&target.context.app_id)
+            || target
+                .resource
+                .resource_version
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Conditional compute fencing requires the original single-write witness".into(),
+            ));
+        }
+        let deployment = self
+            .deployments_api()
+            .get(&target.resource.name)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("Read compute fence target: {error}"))
+            })?;
+        if deployment.metadata.uid.as_deref() != Some(target.resource.uid.as_str()) {
+            return Err(ContainerRuntimeError::Conflict(
+                "Compute fence workload was replaced".into(),
+            ));
+        }
+        let annotations = deployment.metadata.annotations.as_ref().ok_or_else(|| {
+            ContainerRuntimeError::Conflict("Compute fence lifecycle missing".into())
+        })?;
+        target
+            .context
+            .validate_application_metadata(annotations)
+            .map_err(ContainerRuntimeError::Conflict)?;
+        if deployment
+            .metadata
+            .resource_version
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Compute fence version missing".into(),
+            ));
+        }
+        if deployment.metadata.resource_version != target.resource.resource_version {
+            // The original write either committed already or lost its exact
+            // precondition. No rebase is allowed after the operation is superseded.
+            return Ok(true);
+        }
+        // Consume the old version without touching replicas, Pod template or PVC.
+        // A racing original compute and this fence cannot both win the same RV.
+        let marker = serde_json::to_string(&target.context).map_err(|error| {
+            ContainerRuntimeError::ConfigurationError(format!("Encode compute fence: {error}"))
+        })?;
+        self.patch_captured_app(
+            &target.resource,
+            serde_json::json!({
+                "metadata":{"annotations":{"rcoder.io/compute-start-fence":marker}}
+            }),
+        )
+        .await?;
+        // Verify a changed version even if the API considered the patch a no-op.
+        let after = self
+            .deployments_api()
+            .get(&target.resource.name)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("Verify compute fence: {error}"))
+            })?;
+        Ok(
+            after.metadata.uid.as_deref() == Some(target.resource.uid.as_str())
+                && after
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .is_some_and(|v| !v.is_empty())
+                && after.metadata.resource_version != target.resource.resource_version,
+        )
+    }
+
+    pub(super) async fn start_captured_compute(
+        &self,
+        captured: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<()> {
+        if !captured.compute_start_single_write {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Single-write restart witness required".into(),
+            ));
+        }
+        self.confirm_captured_compute_stopped(&captured.target)
+            .await?;
+        let fresh = self
+            .prepare_captured_compute_start(&captured.target)
+            .await?;
+        if fresh.volumes.len() != captured.volumes.len()
+            || fresh
+                .volumes
+                .iter()
+                .zip(&captured.volumes)
+                .any(|(a, b)| a.kind != b.kind || a.name != b.name || a.uid != b.uid)
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Restart volume identity changed".into(),
+            ));
+        }
+        let receipt = serde_json::to_string(&captured.target.context).map_err(|e| {
+            ContainerRuntimeError::ConfigurationError(format!("Encode compute start receipt: {e}"))
+        })?;
+        // The caller already drained prior writers and owns the operation lease.
+        // No PVC mutation, create, or second runtime write follows this patch.
+        self.patch_captured_app(&captured.target.resource, serde_json::json!({
+            "metadata":{"annotations":{(WAKE_ON_TRAFFIC_ANNOTATION):"true", "rcoder.io/compute-start-receipt":receipt}},
+            "spec":{"replicas":1}
+        })).await
+    }
+
+    pub(super) async fn reconcile_captured_compute_start(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        target
+            .context
+            .validate_identity(&target.context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if target.resource.kind != shared_types::AppResourceKind::Deployment
+            || target.resource.uid.is_empty()
+            || target.resource.name != self.app_deployment_name(&target.context.app_id)
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Invalid start recovery target".into(),
+            ));
+        }
+        let Some(deployment) = self
+            .deployments_api()
+            .get_opt(&target.resource.name)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("Read start receipt: {error}"))
+            })?
+        else {
+            return Ok(false);
+        };
+        let receipt = deployment
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|values| values.get("rcoder.io/compute-start-receipt"))
+            .and_then(|value| {
+                serde_json::from_str::<shared_types::UserAppExecutionContext>(value).ok()
+            });
+        Ok(
+            deployment.metadata.uid.as_deref() == Some(target.resource.uid.as_str())
+                && receipt.as_ref() == Some(&target.context)
+                && deployment
+                    .spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.replicas == Some(1))
+                && deployment.status.as_ref().is_some_and(|status| {
+                    status.ready_replicas.unwrap_or(0) > 0
+                        && status.updated_replicas.unwrap_or(0) > 0
+                        && deployment.metadata.generation.is_some_and(|generation| {
+                            status
+                                .observed_generation
+                                .is_some_and(|observed| observed >= generation)
+                        })
+                }),
+        )
+    }
+
+    pub(super) async fn reconcile_captured_compute_stop(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        target
+            .context
+            .validate_identity(&target.context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if target.resource.kind != shared_types::AppResourceKind::Deployment
+            || target.resource.name != self.app_deployment_name(&target.context.app_id)
+            || target.resource.uid.is_empty()
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Invalid stop recovery target".into(),
+            ));
+        }
+        let matches = |deployment: &k8s_openapi::api::apps::v1::Deployment| {
+            deployment.metadata.uid.as_deref() == Some(target.resource.uid.as_str())
+                && deployment
+                    .spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.replicas == Some(0))
+                && deployment
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get("rcoder.io/compute-stop-receipt"))
+                    .and_then(|s| {
+                        serde_json::from_str::<shared_types::UserAppExecutionContext>(s).ok()
+                    })
+                    .is_some_and(|context| context == target.context)
+        };
+        let deployments = self.deployments_api();
+        let before = deployments
+            .get_opt(&target.resource.name)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("Read stop receipt: {e}")))?;
+        if !before.as_ref().is_some_and(&matches) {
+            return Ok(false);
+        }
+        self.confirm_captured_compute_stopped(target).await?;
+        let after = deployments
+            .get_opt(&target.resource.name)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("Recheck stop receipt: {e}")))?;
+        Ok(after.as_ref().is_some_and(matches))
+    }
+
+    pub(super) async fn confirm_captured_compute_stopped(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        target
+            .context
+            .validate_identity(&target.context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if target.resource.kind != shared_types::AppResourceKind::Deployment
+            || target.resource.uid.is_empty()
+            || target.resource.name != self.app_deployment_name(&target.context.app_id)
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Invalid captured stop confirmation target".into(),
+            ));
+        }
+
+        use k8s_openapi::api::{apps::v1::Deployment, core::v1::Pod};
+        let deployments: kube::Api<Deployment> =
+            kube::Api::namespaced(self.client.clone(), &self.namespace);
+        let pods: kube::Api<Pod> = kube::Api::namespaced(self.client.clone(), &self.namespace);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let deployment = deployments.get(&target.resource.name).await.map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("Confirm stopped deployment: {e}"))
+            })?;
+            if deployment.metadata.uid.as_deref() != Some(target.resource.uid.as_str()) {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Stopped deployment identity changed".into(),
+                ));
+            }
+            let spec = deployment.spec.as_ref().ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError("Deployment spec missing".into())
+            })?;
+            if spec.replicas != Some(0) {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Deployment no longer has a stop intent".into(),
+                ));
+            }
+            // Generated application selectors are exact matchLabels. Refuse an
+            // unsupported selector rather than accidentally overlooking old Pods.
+            if spec
+                .selector
+                .match_expressions
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
+            {
+                return Err(ContainerRuntimeError::ConfigurationError(
+                    "Unsupported application selector".into(),
+                ));
+            }
+            let labels = spec
+                .selector
+                .match_labels
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    ContainerRuntimeError::ConfigurationError("Application selector missing".into())
+                })?;
+            let selector = labels
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let remaining = pods
+                .list(&kube::api::ListParams::default().labels(&selector))
+                .await
+                .map_err(|e| {
+                    ContainerRuntimeError::K8sError(format!("Confirm old Pods exited: {e}"))
+                })?;
+            if remaining.items.is_empty() {
+                let confirmed = deployments.get(&target.resource.name).await.map_err(|e| {
+                    ContainerRuntimeError::K8sError(format!("Recheck stopped deployment: {e}"))
+                })?;
+                if confirmed.metadata.uid == deployment.metadata.uid
+                    && confirmed.metadata.resource_version == deployment.metadata.resource_version
+                {
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Old compute exit remains unconfirmed".into(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     }
 
     /// scale Deployment replicas

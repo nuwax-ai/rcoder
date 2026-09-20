@@ -1259,7 +1259,7 @@ async fn verify_immediate_runtime_password(
     );
     report.assert_hard(
         "CR10 business remains available after password change",
-        cr10_proxy_ready(env, app, user).await,
+        ready && cr10_proxy_ready(env, app, user).await,
         "Actual React proxy remains available without automatic business restart".into(),
     );
 }
@@ -1284,12 +1284,13 @@ async fn verify_password_governance_after_change(
 ) {
     let prod_name = format!("rcoder-app-{app}");
     let (_, identity) = get_json(env, &format!("/api/v1/userapp/{app}/lifecycle")).await;
-    let Some(lifecycle) = identity["data"]["lifecycle_id"].as_str() else {
-        report.assert_hard(
-            "CR10 governance lifecycle readable",
-            false,
-            format!("lifecycle body 截断: {}", trunc(&identity, 120)),
-        );
+    let lifecycle = identity["data"]["lifecycle_id"].as_str();
+    report.assert_hard(
+        "CR10 governance lifecycle readable",
+        lifecycle.is_some(),
+        format!("lifecycle body 截断: {}", trunc(&identity, 120)),
+    );
+    let Some(lifecycle) = lifecycle else {
         return;
     };
     let password = "e2e_immediate_new_password";
@@ -1301,12 +1302,13 @@ async fn verify_password_governance_after_change(
             .ok()?;
         Some(String::from_utf8(output.stdout).ok()?.trim().to_owned())
     };
-    let Some(username) = username().filter(|value| !value.is_empty()) else {
-        report.assert_hard(
-            "CR10 governance account readable",
-            false,
-            "POSTGRES_USER unavailable before replay".into(),
-        );
+    let username = username().filter(|value| !value.is_empty());
+    report.assert_hard(
+        "CR10 governance account readable",
+        username.is_some(),
+        "Runtime account checked before replay".into(),
+    );
+    let Some(username) = username else {
         return;
     };
 
@@ -1440,15 +1442,28 @@ async fn verify_password_governance_after_change(
     let Some(operation_id) = operation_id else {
         return;
     };
+    // Use the current revision, so stale-revision rejection cannot masquerade
+    // as evidence that a completed operation refuses recovery.
+    let (query_s, query_b) = get_json(
+        env,
+        &format!("/api/v1/userapp/{app}/operations/{operation_id}"),
+    )
+    .await;
+    let revision = query_b["data"]["revision"].as_i64();
+    let completed = query_s.is_success()
+        && http_ok(&query_b)
+        && query_b["data"]["state"] == "Succeeded"
+        && query_b["data"]["operation_id"] == operation_id
+        && revision.is_some();
     let (recover_s, recover_b) = post_json(
         env,
         "/api/v1/userapp/deploy-pg/recover",
-        json!({"app_id":app,"lifecycle_id":lifecycle,"operation_id":operation_id,"expected_revision":0,"username":username,"password":password}),
+        json!({"app_id":app,"lifecycle_id":lifecycle,"operation_id":operation_id,"expected_revision":revision,"username":username,"password":password}),
     )
     .await;
     report.assert_hard(
         "CR10 completed deployment refuses deploy-pg recovery",
-        !recover_s.is_success() || !http_ok(&recover_b),
+        completed && (!recover_s.is_success() || !http_ok(&recover_b)),
         format!("HTTP {recover_s}; code={:?}", recover_b["code"].as_str()),
     );
 }
@@ -1870,8 +1885,8 @@ async fn verify_hot_redeploy(
     );
 }
 
-/// C6 stop → 自动唤醒（health 探测触发）。
-async fn verify_stop_and_wake(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
+/// C6 手动停止保持停止，显式启动恢复真实业务。
+async fn verify_stop_and_explicit_start(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
     let (s, b) = post_json(
         env,
         &format!("/api/v1/userapp/{app}/stop?user_id={user}"),
@@ -1888,25 +1903,31 @@ async fn verify_stop_and_wake(env: &Env, report: &JsonlReporter, app: &str, user
         return;
     }
 
-    // health 探测触发自动唤醒（60s 窗口）
-    let mut woke = false;
-    let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(90) {
-        let (s, b) = get_json(
-            env,
-            &format!("/api/v1/userapp/{app}/prod/health?user_id={user}"),
-        )
-        .await;
-        if s.is_success() && http_ok(&b) {
-            woke = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
+    // Health is observation only. A successful query must not wake manual Stop.
+    let (health_status, health) = get_json(
+        env,
+        &format!("/api/v1/userapp/{app}/prod/health?user_id={user}"),
+    )
+    .await;
     report.assert_hard(
-        "stop 后 health 探测自动唤醒 → running",
-        woke,
-        format!("{:.0}s 内唤醒", t0.elapsed().as_secs_f64()),
+        "手动 stop 后 health 查询保持停止",
+        health_status.is_success()
+            && http_ok(&health)
+            && !docker_container_running(&format!("rcoder-app-{app}")),
+        format!("health: {}", trunc(&health, 180)),
+    );
+    let (start_status, start) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/start?user_id={user}"),
+        json!({}),
+    )
+    .await;
+    let ready =
+        start_status.is_success() && http_ok(&start) && cr10_proxy_ready(env, app, user).await;
+    report.assert_hard(
+        "stop 后显式 start 恢复真实业务",
+        ready && docker_container_running(&format!("rcoder-app-{app}")),
+        format!("start: {}", trunc(&start, 180)),
     );
 }
 
@@ -2042,7 +2063,7 @@ async fn userapp_deploy_full_chain() {
             &sha256,
         )
         .await;
-        verify_stop_and_wake(&env, &report, &app, user).await;
+        verify_stop_and_explicit_start(&env, &report, &app, user).await;
         // Last business mutation: later explicit restart requires caller-owned
         // application credential configuration, not automatic platform injection.
         verify_immediate_runtime_password(&env, &report, &app, user).await;

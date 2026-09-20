@@ -11,6 +11,10 @@ use super::types::{AppHealthCheck, AppPortSpec, AppResourceRequirements};
 /// long parameter lists that hurt code readability and maintainability.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ContainerCreateParams {
+    /// Local signal derived from durable priority control; never serialized.
+    /// Runtimes consume it only between acknowledged writes or in readonly waits.
+    #[serde(skip)]
+    pub creation_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Durable userApp operation identity; absent for Agent operations.
     pub execution_context: Option<shared_types::UserAppExecutionContext>,
     /// Physical update target captured before any application mutation.
@@ -265,6 +269,7 @@ impl ContainerCreateParamsBuilder {
 
     pub fn build(self) -> ContainerCreateParams {
         ContainerCreateParams {
+            creation_cancelled: Default::default(),
             execution_context: self.execution_context,
             mutation_target: None,
             resource_binding: self.resource_binding,

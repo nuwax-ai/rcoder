@@ -497,6 +497,33 @@ impl DockerRuntime {
         }
     }
 
+    pub(super) async fn captured_start_is_running(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        let current = self.capture_stop_target(&target.context).await?;
+        if current != *target {
+            return Err(ContainerRuntimeError::Conflict(
+                "Acknowledged application start identity changed".into(),
+            ));
+        }
+        let info = self
+            .inner
+            .get_docker_client()
+            .inspect_container(&target.resource.uid, None)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::DockerError(format!(
+                    "Confirm captured application start: {error}"
+                ))
+            })?;
+        Ok(info.id.as_deref() == Some(target.resource.uid.as_str())
+            && info
+                .state
+                .as_ref()
+                .is_some_and(|state| state.running == Some(true) && state.restarting != Some(true)))
+    }
+
     pub(super) async fn stop_captured_target(
         &self,
         target: &shared_types::UserAppMutationTarget,

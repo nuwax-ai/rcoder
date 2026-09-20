@@ -94,6 +94,7 @@ impl DevServerManager {
             });
         }
         Ok(StoppedDev {
+            owner_stopped: false,
             killed_pids: killed,
         })
     }
@@ -102,9 +103,9 @@ impl DevServerManager {
     /// 下登记缺失不授权 legacy 清理。
     /// - 有 external 登记 → 经运行 API 停止（[`Self::stop_external_owner`]，
     ///   幂等按原 operation_id 恢复）；
-    /// - 无登记但 3010 有 owner 应答 → 拒绝（诊断明确：owner 仍持有运行态，
-    ///   不得按进程名/端口抢杀）；
-    /// - 无登记且无应答 → 幂等成功（无运行态）。
+    /// - 无登记但有 owner 应答 → 核验项目归属、读取控制凭据，持久化停止
+    ///   意图后通过 owner API 停止；身份不符则拒绝；
+    /// - 连接被拒绝 → 无 owner；超时或协议错误不能当作已停止。
     pub async fn stop_userapp_dev(
         &self,
         project_id: &str,
@@ -118,15 +119,29 @@ impl DevServerManager {
             .as_ref()
             .and_then(|p| p.external_owner.as_ref().cloned())
         {
-            // 恢复的登记 token 为空哨兵（凭据不落盘）——从 owner 状态根重读；
-            // 读不到时保持空值（owner 拒绝认证，错误可诊断）
+            // 恢复登记不存 token。先重新核验原实例，再从它的实际运行目录
+            // 查找凭据；自定义 deploy-dir 的状态根可能不同于源码目录。
             if external.token.is_empty() {
-                let app_id = std::env::var("PROJECT_ID")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "unknown-app".to_string());
+                let app_id = project_id.strip_prefix("userapp:").unwrap_or(project_id);
+                let identity = super::owner_client::probe_owner_for_stop(&external.address)
+                    .await
+                    .map_err(|error| {
+                        AppError::business(format!("observe registered owner: {error:#}"))
+                    })?
+                    .ok_or_else(|| {
+                        AppError::business("registered owner is unavailable; stop is not confirmed")
+                    })?;
+                super::owner_client::verify_stop_identity(&identity, project_path, app_id)
+                    .map_err(|error| {
+                        AppError::business(format!("owner identity rejected: {error:#}"))
+                    })?;
+                if identity.runtime_instance_id != external.runtime_instance_id {
+                    return Err(AppError::business(
+                        "registered owner instance changed; stop is not confirmed",
+                    ));
+                }
                 if let Some((_root, token)) =
-                    super::owner_client::find_owner_token(project_path, &app_id)
+                    super::owner_client::find_owner_token(Path::new(&identity.source_root), app_id)
                 {
                     external.token = token;
                     if let Ok(mut processes) = lock(&self.processes)
@@ -140,15 +155,27 @@ impl DevServerManager {
             return self.stop_external_owner(project_id, &external).await;
         }
         let owner_addr = self.config.app_cli_admin_probe_addr.clone();
-        if super::owner_client::probe_owner(&owner_addr)
+        if let Some(identity) = super::owner_client::probe_owner_for_stop(&owner_addr)
             .await
-            .is_some()
+            .map_err(|error| AppError::business(format!("observe owner for stop: {error:#}")))?
         {
-            return Err(AppError::business(format!(
-                "admin port {owner_addr} is held by a running app-cli owner but this \
-                 server has no registration for it (restarted?); stop must be routed \
-                 through the runtime owner API — refusing process-name based cleanup"
-            )));
+            let app_id = project_id.strip_prefix("userapp:").unwrap_or(project_id);
+            super::owner_client::verify_stop_identity(&identity, project_path, app_id).map_err(
+                |error| AppError::business(format!("owner identity rejected: {error:#}")),
+            )?;
+            let (_, token) =
+                super::owner_client::find_owner_token(Path::new(&identity.source_root), app_id)
+                    .ok_or_else(|| {
+                        AppError::business("verified owner control credentials unavailable")
+                    })?;
+            let external = crate::models::ExternalOwner {
+                address: owner_addr,
+                token,
+                runtime_instance_id: identity.runtime_instance_id,
+            };
+            // stop_external_owner persists registration AND the operation intent
+            // before POST; unknown replies retain the same operation for recovery.
+            return self.stop_external_owner(project_id, &external).await;
         }
         // 无 owner 应答：本地 spawn 登记（supervised）或无运行态都收束为无 external
         // 停止；本地登记存在时仍走 stop_dev 的登记 pid 路径（ps 扫描跳过——
@@ -157,6 +184,7 @@ impl DevServerManager {
             self.stop_registered_only(project_id).await
         } else {
             Ok(StoppedDev {
+                owner_stopped: false,
                 killed_pids: Vec::new(),
             })
         }
@@ -166,6 +194,7 @@ impl DevServerManager {
     async fn stop_registered_only(&self, project_id: &str) -> AppResult<StoppedDev> {
         let Some(proc) = lock(&self.processes)?.remove(project_id) else {
             return Ok(StoppedDev {
+                owner_stopped: false,
                 killed_pids: Vec::new(),
             });
         };
@@ -195,6 +224,7 @@ impl DevServerManager {
             }
         }
         Ok(StoppedDev {
+            owner_stopped: false,
             killed_pids: killed,
         })
     }
@@ -343,6 +373,7 @@ impl DevServerManager {
             shared_types::RuntimeOperationState::Succeeded => {
                 // Registry cleanup already committed with operation identity CAS above.
                 Ok(StoppedDev {
+                    owner_stopped: true,
                     killed_pids: Vec::new(),
                 })
             }
@@ -518,6 +549,8 @@ mod external_stop_tests {
     /// - `states`：op id → 终态（未登记 = Running 非终态）。
     #[derive(Clone, Default)]
     struct StopMockState {
+        identity: Arc<Mutex<Option<shared_types::RuntimeIdentityView>>>,
+        tokens: Arc<Mutex<Vec<String>>>,
         submitted: Arc<Mutex<Vec<String>>>,
         states: Arc<Mutex<HashMap<String, RuntimeOperationState>>>,
     }
@@ -548,18 +581,23 @@ mod external_stop_tests {
         let app = axum::Router::new()
             .route(
                 "/v1/runtime/identity",
-                axum::routing::get(|| async {
-                    axum::Json(envelope(&shared_types::RuntimeIdentityView {
-                        application_id: "app-r05".into(),
-                        service_family: "userapp-dev".into(),
-                        workspace_id: "ws-stable-hash".into(),
-                        source_root: "/workspace".into(),
-                        runtime_instance_id: "instance-test".into(),
-                        deployment_generation_id: "gen-test".into(),
-                        protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
-                        capabilities: vec![],
-                    }))
-                }),
+                axum::routing::get(
+                    |axum::extract::State(state): axum::extract::State<StopMockState>| async move {
+                        let identity = state.identity.lock().unwrap().clone().unwrap_or(
+                            shared_types::RuntimeIdentityView {
+                                application_id: "app-r05".into(),
+                                service_family: "userapp-dev".into(),
+                                workspace_id: "ws-stable-hash".into(),
+                                source_root: "/workspace".into(),
+                                runtime_instance_id: "instance-test".into(),
+                                deployment_generation_id: "gen-test".into(),
+                                protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+                                capabilities: vec![],
+                            },
+                        );
+                        axum::Json(envelope(&identity))
+                    },
+                ),
             )
             .route(
                 "/v1/runtime/status",
@@ -580,8 +618,16 @@ mod external_stop_tests {
                 "/v1/runtime/operations",
                 axum::routing::post(
                     |axum::extract::State(state): axum::extract::State<StopMockState>,
+                     headers: axum::http::HeaderMap,
                      axum::Json(req): axum::Json<serde_json::Value>| {
                         async move {
+                            state.tokens.lock().unwrap().push(
+                                headers
+                                    .get("X-Deploy-Token")
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            );
                             let id = req
                                 .get("operation_id")
                                 .and_then(|v| v.as_str())
@@ -846,6 +892,102 @@ mod external_stop_tests {
         task.abort();
     }
 
+    #[tokio::test]
+    async fn unregistered_custom_deploy_owner_is_stopped_through_api() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        let runtime = workspace.join(".local-deploy");
+        std::fs::create_dir_all(&runtime).unwrap();
+        // Legacy manual deployment has no origin marker; containment is verified.
+        let state_root = runtime_state_layout::ensure_state_root(
+            &runtime,
+            None,
+            Some(std::ffi::OsStr::new("discoveryapp")),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::write(state_root.join("token"), "test-token").unwrap();
+        let state = StopMockState::default();
+        *state.identity.lock().unwrap() = Some(shared_types::RuntimeIdentityView {
+            application_id: "discoveryapp".into(),
+            service_family: "userapp-dev".into(),
+            workspace_id: "ws-stable-hash".into(),
+            source_root: runtime.to_string_lossy().into_owned(),
+            runtime_instance_id: "instance-test".into(),
+            deployment_generation_id: "generation".into(),
+            protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: vec![],
+        });
+        state
+            .states
+            .lock()
+            .unwrap()
+            .insert("*".into(), RuntimeOperationState::Succeeded);
+        let (address, server) = serve_stop_mock(state.clone()).await;
+        let mut config = crate::Config::from_env().unwrap();
+        config.log_base_dir = root.path().join("logs");
+        config.app_cli_admin_probe_addr = address;
+        let config = Arc::new(config);
+        let manager = DevServerManager::new(config.clone());
+        state
+            .states
+            .lock()
+            .unwrap()
+            .insert("*".into(), RuntimeOperationState::Failed);
+        assert!(
+            manager
+                .stop_userapp_dev("userapp:discoveryapp", &workspace)
+                .await
+                .is_err()
+        );
+        // Restart file-server: token is not persisted, and the runtime root is
+        // different from the source root. Rediscovery must recover the right token.
+        drop(manager);
+        let manager = DevServerManager::new(config);
+        state
+            .states
+            .lock()
+            .unwrap()
+            .insert("*".into(), RuntimeOperationState::Succeeded);
+        let stopped = manager
+            .stop_userapp_dev("userapp:discoveryapp", &workspace)
+            .await
+            .unwrap();
+        assert_eq!(stopped.message(), "Stopped");
+        assert!(stopped.killed_pids.is_empty(), "owner process stays alive");
+        assert_eq!(state.submitted.lock().unwrap().len(), 2);
+        assert_eq!(
+            *state.tokens.lock().unwrap(),
+            vec!["test-token", "test-token"]
+        );
+        assert!(lock(&manager.processes).unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn owner_http_error_does_not_report_stop_success() {
+        let root = tempfile::tempdir().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/runtime/identity",
+            axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = crate::Config::from_env().unwrap();
+        config.log_base_dir = root.path().join("logs");
+        config.app_cli_admin_probe_addr = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let manager = DevServerManager::new(Arc::new(config));
+        assert!(
+            manager
+                .stop_userapp_dev("userapp:absent", root.path())
+                .await
+                .is_err()
+        );
+        task.abort();
+    }
+
     /// R05 反例：managed 域登记缺失 + 3010 有 owner 应答 → 拒绝（不 ps 扫杀）；
     /// 无应答 → 幂等成功。
     #[tokio::test]
@@ -886,7 +1028,7 @@ mod external_stop_tests {
             .await
             .expect_err("owner listening without registration must be refused");
         assert!(
-            error.to_string().contains("no registration"),
+            error.to_string().contains("owner identity rejected"),
             "diagnostic should explain refusal: {error}"
         );
         task.abort();

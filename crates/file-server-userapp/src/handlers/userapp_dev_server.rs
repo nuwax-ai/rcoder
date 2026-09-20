@@ -189,7 +189,7 @@ pub(crate) async fn dev_stop(
             }
         }
         // R05：managed 域停止不 ps 扫描——external 登记经运行 API 幂等停；
-        // 登记缺失但有 owner 应答时明确拒绝（不抢杀未知进程）
+        // 登记缺失时核验项目与 owner 身份，再恢复控制通道
         let workspace = resolve_userapp_dev(&body.app_id, None, &state.fs.config)
             .map_err(|e| AppError::business(format!("resolve workspace for stop: {e}")))?;
         let stopped: StoppedDev = state
@@ -198,14 +198,7 @@ pub(crate) async fn dev_stop(
             .stop_userapp_dev(&key, &workspace)
             .await?;
         state.fs.log_cache.delete(&key)?;
-        let all_killed = stopped.killed_pids.iter().all(|k| k.killed);
-        let message = if stopped.killed_pids.is_empty() {
-            "No running process found"
-        } else if all_killed {
-            "Stopped"
-        } else {
-            "Partially stopped but continue execution"
-        };
+        let message = stopped.message();
         Ok(UserappDevStopped {
             message: message.to_string(),
             app_id: body.app_id,

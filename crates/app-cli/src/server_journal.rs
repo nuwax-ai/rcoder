@@ -216,6 +216,109 @@ impl Journal {
         self.receipt = Some(self.write_verified(".deploy-operation.json", &receipt)?);
         Ok(())
     }
+
+    /// Caller verified the target directory against the persisted switch intent
+    /// after old writers stopped. No directory mutation is performed here.
+    pub(crate) fn confirm_switched_artifact(
+        &mut self,
+        expected: &Receipt,
+        artifact: &str,
+    ) -> Result<Receipt> {
+        let current = self.receipt.as_ref().context("switch journal missing")?;
+        anyhow::ensure!(
+            serde_json::to_value(current)? == serde_json::to_value(expected)?,
+            "switch journal changed during reconciliation"
+        );
+        anyhow::ensure!(
+            current.boundary == Boundary::Switching
+                && current.operation.artifact_release_id.as_deref() == Some(artifact)
+                && !artifact.is_empty()
+                && current.operation.recovery.is_none(),
+            "switch intent does not confirm the observed artifact"
+        );
+        let mut resolved = current.clone();
+        resolved.boundary = Boundary::Activated;
+        resolved.operation.deploy_stage =
+            shared_types::app_cli_deploy::AppDeploymentStage::Succeeded;
+        resolved.operation.persisted = true;
+        resolved.operation.phase = shared_types::AppCliDeployPhase::Orchestrating;
+        resolved.active = Some(ActiveVersion {
+            artifact_release_id: artifact.into(),
+            request: Some(resolved.request.clone()),
+        });
+        self.write(resolved)?;
+        self.receipt
+            .clone()
+            .context("reconciled switch journal missing")
+    }
+
+    /// The old artifact remains at the original execution path after quiescence.
+    /// Preserve it as active; the attempted deployment remains a failed attempt.
+    pub(crate) fn confirm_preserved_active(
+        &mut self,
+        expected: &Receipt,
+        artifact: &str,
+    ) -> Result<Receipt> {
+        let current = self.receipt.as_ref().context("switch journal missing")?;
+        anyhow::ensure!(
+            serde_json::to_value(current)? == serde_json::to_value(expected)?,
+            "switch journal changed during reconciliation"
+        );
+        let active = current
+            .active
+            .as_ref()
+            .context("previous active artifact missing")?;
+        anyhow::ensure!(
+            current.boundary == Boundary::Switching
+                && current.operation.recovery.is_none()
+                && active.artifact_release_id == artifact
+                && active.request.as_ref().is_some_and(
+                    |request| request.execution_target == current.request.execution_target
+                ),
+            "previous artifact execution binding does not match"
+        );
+        let mut resolved = current.clone();
+        resolved.boundary = Boundary::Preparing;
+        resolved.operation.deploy_stage = shared_types::app_cli_deploy::AppDeploymentStage::Failed;
+        resolved.operation.phase = shared_types::AppCliDeployPhase::Failed;
+        resolved.operation.error =
+            Some("Activation interrupted; the confirmed previous artifact remains in place".into());
+        self.write(resolved)?;
+        self.receipt
+            .clone()
+            .context("preserved active journal missing")
+    }
+
+    /// Caller proved process quiescence, current artifact identity and no
+    /// unconfirmed migrations. This records startup interruption, not rollback.
+    pub(crate) fn confirm_interrupted_activation(&mut self, expected: &Receipt) -> Result<Receipt> {
+        let current = self
+            .receipt
+            .as_ref()
+            .context("activation journal missing")?;
+        anyhow::ensure!(
+            serde_json::to_value(current)? == serde_json::to_value(expected)?,
+            "activation journal changed during reconciliation"
+        );
+        anyhow::ensure!(
+            current.boundary == Boundary::Activated
+                && current.operation.persisted
+                && current.operation.deploy_stage
+                    == shared_types::app_cli_deploy::AppDeploymentStage::Succeeded
+                && current.operation.recovery.is_none()
+                && current.active.is_some(),
+            "activation is not eligible for confirmed startup interruption"
+        );
+        let mut resolved = current.clone();
+        resolved.boundary = Boundary::StartupFailed;
+        resolved.operation.phase = shared_types::AppCliDeployPhase::Failed;
+        resolved.operation.error =
+            Some("Owner restarted after activation before startup completed".into());
+        self.write(resolved)?;
+        self.receipt
+            .clone()
+            .context("reconciled activation journal missing")
+    }
     pub fn require_fresh_process_scope(&self) -> Result<()> {
         if self
             .previous_owner

@@ -86,6 +86,9 @@ impl AppService {
         restart: bool,
     ) -> AppResult<StartAppResult> {
         super::start::validate_start_request(app_id, &request)?;
+        self.discover_missing_identity(app_id).await?;
+        self.verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Prod)
+            .await?;
         let guard = Arc::new(self.try_acquire_process_release_lock(app_id).await?);
         let result = self
             .deploy_admitted(app_id, request, restart, guard.clone())
@@ -334,11 +337,14 @@ impl AppService {
             .store
             .get_operation(app_id, &context.operation_id)
             .await?
-            .is_some_and(|record| record.checkpoint.get("explicit_pg_target").is_some())
+            .is_some_and(|record| {
+                record.checkpoint.get("explicit_pg_target").is_some()
+                    || record.checkpoint.get("hot_execution").is_some()
+            })
         {
             guard.mark_mutating()?;
             return Err(AppOperationError::InvalidState(
-                "Original explicit database write requires reconciliation before deployment replay"
+                "Original database or hot deployment write requires reconciliation before deployment replay"
                     .into(),
             ));
         }
@@ -349,14 +355,15 @@ impl AppService {
             .as_deref()
             .filter(|value| !value.trim().is_empty());
         let mut hot = false;
+        let mut pg_aligned = None;
         if let Some(url) = url
             && request.deploy_mode == Some(DeployMode::Hot)
         {
             operation
                 .checkpoint("hot_preflight", serde_json::json!({"context":context}))
                 .await?;
-            hot = self
-                .try_deploy_via_container_api_with_guard(
+            let prepared_hot = self
+                .prepare_hot_deployment(
                     app_id,
                     super::hot_deploy::HotArtifact {
                         url,
@@ -369,8 +376,59 @@ impl AppService {
                     guard.clone(),
                     &context.operation_id,
                 )
-                .await?
-                .is_some();
+                .await?;
+            if let Some(task) = prepared_hot {
+                if let Some(pg) = &request.pg {
+                    self.apply_explicit_deployment_credentials(operation, &guard, pg)
+                        .await?;
+                    pg_aligned = Some(true);
+                }
+                let previous_evidence = self
+                    .metadata
+                    .store
+                    .get_operation(app_id, &context.operation_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppOperationError::InvalidState("Hot operation disappeared".into())
+                    })?
+                    .checkpoint;
+                // From this boundary password-only recovery must not release the
+                // lease: a separate deployment write may have reached the owner.
+                let target = task.capture_recovery_target(&context).await?;
+                if let Some(password_target) = previous_evidence.get("explicit_pg_target") {
+                    let password_target: shared_types::RuntimeConfigurationTarget =
+                        serde_json::from_value(password_target.clone()).map_err(|error| {
+                            AppOperationError::InvalidState(format!(
+                                "Read deployment password target before hot execution: {error}"
+                            ))
+                        })?;
+                    if password_target != target {
+                        return Err(AppOperationError::Conflict(
+                            "Hot deployment target differs from the verified database target"
+                                .into(),
+                        ));
+                    }
+                }
+                operation
+                    .checkpoint(
+                        "hot_execution",
+                        serde_json::json!({
+                            "hot_execution": {
+                                "context": context,
+                                "phase": "submit",
+                                "receipt_protocol": 1,
+                                "target": target,
+                                "release_id": request.release_id,
+                                "previous_evidence": previous_evidence
+                            }
+                        }),
+                    )
+                    .await?;
+                operation.authorize_mutation().await?;
+                task.execute_captured(&context, &target, request.pg.as_ref(), operation)
+                    .await?;
+                hot = true;
+            }
         }
         let configuration_applied = !hot && params.is_some();
         if !hot {
@@ -401,6 +459,7 @@ impl AppService {
                         serde_json::json!({"target":target}),
                     )
                     .await?;
+                operation.authorize_mutation().await?;
                 guard.mark_mutating()?;
                 if restart {
                     self.runtime.restart_app_target(&target).await
@@ -413,13 +472,11 @@ impl AppService {
         // Explicit pg input aligns before the business wait: the management
         // channel and PG readiness never depend on business Service Ready,
         // while the business may need the new password before it can be Ready.
-        let pg_aligned = if let Some(pg) = &request.pg {
+        if !hot && let Some(pg) = &request.pg {
             self.apply_explicit_deployment_credentials(operation, &guard, pg)
                 .await?;
-            Some(true)
-        } else {
-            None
-        };
+            pg_aligned = Some(true);
+        }
         if !hot && url.is_some() {
             self.wait_deploy_stage(app_id, &context.operation_id, &guard)
                 .await?;
@@ -440,6 +497,7 @@ impl AppService {
                     serde_json::json!({"target":target}),
                 )
                 .await?;
+            operation.authorize_mutation().await?;
             guard.mark_mutating()?;
             self.runtime
                 .patch_app_policy_target(

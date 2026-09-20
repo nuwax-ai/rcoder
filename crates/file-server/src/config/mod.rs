@@ -111,6 +111,7 @@ pub struct Config {
     /// 分流视角（computer::computer_root_for_context：显式注入=沙箱视角，
     /// 未注入=主容器视角 `{COMPUTER_WORKSPACE_DIR}/{userId}/...`，对齐 TS 1.4.8）。
     /// 配置文件直接给 `project_source_dir` 赋值不置位（部署契约只认 env 注入）。
+    #[serde(skip)]
     pub project_source_dir_explicit: bool,
     pub computer_workspace_dir: PathBuf,
     /// Userapp 开发卷根 (env `USERAPP_WORKSPACE_DIR`; 沙箱挂载点, 见 paths::USERAPP_WORKSPACE_ROOT)。

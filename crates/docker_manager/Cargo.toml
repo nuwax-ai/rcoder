@@ -47,6 +47,7 @@ moka = { workspace = true, features = ["future"] }
 
 # Shared types
 shared_types = { workspace = true }
+sha2 = { workspace = true }
 
 # gRPC client (for health checks)
 tonic = { workspace = true }

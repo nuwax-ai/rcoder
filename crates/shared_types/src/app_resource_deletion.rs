@@ -47,6 +47,36 @@ pub struct UserAppMutationTarget {
     pub resource: AppResourceIdentity,
 }
 
+/// Restart startup witness. Flattening retains the original mutation target
+/// shape while adding volume identities and an explicit single-write capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserAppComputeStartTarget {
+    #[serde(flatten)]
+    pub target: UserAppMutationTarget,
+    #[serde(default)]
+    pub compute_start_single_write: bool,
+    #[serde(default)]
+    pub volumes: Vec<AppResourceIdentity>,
+}
+
+impl UserAppComputeStartTarget {
+    pub fn verify_same_volumes(&self, other: &Self) -> Result<(), String> {
+        if self.compute_start_single_write != other.compute_start_single_write
+            || self.volumes.len() != other.volumes.len()
+            || self
+                .volumes
+                .iter()
+                .zip(&other.volumes)
+                .any(|(a, b)| a.kind != b.kind || a.name != b.name || a.uid != b.uid)
+        {
+            return Err(
+                "Restart volume identity changed or the original witness is missing".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Confirmed deletion boundaries. A remote acknowledgement without confirmed
 /// disappearance must never advance these stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,18 +1,17 @@
 use super::helpers::*;
 use super::*;
 
-/// 停止并销毁容器（保留数据卷）
-///
-/// 根据 user_id / project_id / service_type 定位容器并销毁。
-/// 物理销毁走 runtime 层：K8s 删 STS + Service（PVC 保留，下次 ensure 重建挂回），
-/// Docker 删容器。对话状态在 agent 内存，停止即断会话。
-/// 容器不存在时幂等返回成功（was_existing=false）。
+/// 停止计算资源，保留 PVC 和工作区数据。
+/// UserApp dev/prod 独立受理，返回 202 与操作查询地址；正在停止时不排队新启动。
+/// 普通 agent 沿用删除控制器和 Service 的同步流程。
 #[utoipa::path(
     post,
     path = "/computer/pod/stop",
     request_body(content = StopPodRequest, description = "停止容器请求"),
     responses(
+        (status = 202, description = "UserApp compute intent accepted; poll status_url. No internal request queue.", body = HttpResult<crate::userapp_builder::compute_control::ComputeOperationView>),
         (status = 200, description = "成功停止容器", body = HttpResult<StopPodResponse>),
+        (status = 409, description = "Another compute control is in progress; retry after completion"),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
         (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
@@ -24,6 +23,51 @@ use super::*;
 )]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_stop(
+    State(state): State<Arc<AppState>>,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<StopPodRequest>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse;
+    let target = parse_app_target(
+        request.app_id.as_deref(),
+        request.app_stage.as_deref(),
+        request.service_type.as_deref(),
+    );
+    let (app_id, scope) = match target {
+        Ok(AppTarget::Dev(id)) => (id, shared_types::UserAppOperationScope::Dev),
+        Ok(AppTarget::Prod(id)) => (id, shared_types::UserAppOperationScope::Prod),
+        Ok(AppTarget::NotApp) => {
+            return legacy_pod_stop(State(state), I18nJsonOrQuery(request))
+                .await
+                .map(IntoResponse::into_response);
+        }
+        Err(error) => {
+            return Err(AppError::with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                error,
+            ));
+        }
+    };
+    let operation = crate::userapp_builder::compute_control::submit(
+        &state,
+        app_id,
+        scope,
+        shared_types::ComputeControlAction::Stop,
+        shared_types::UserAppControlRequest {
+            lifecycle_id: request.lifecycle_id,
+            request_id: request.request_id,
+        },
+    )
+    .await
+    .map_err(|error| crate::userapp_builder::control_error(&error))?;
+    let operation_id = operation.operation_id.clone();
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        HttpResult::success(operation).with_operation_id(operation_id),
+    )
+        .into_response())
+}
+
+async fn legacy_pod_stop(
     State(state): State<Arc<AppState>>,
     I18nJsonOrQuery(request): I18nJsonOrQuery<StopPodRequest>,
 ) -> Result<HttpResult<StopPodResponse>, AppError> {

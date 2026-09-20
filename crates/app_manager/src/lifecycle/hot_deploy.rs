@@ -78,6 +78,7 @@ impl AppService {
         finish_hot_operation(guard, result).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn try_deploy_via_container_api_with_guard(
         &self,
         app_id: &str,
@@ -86,6 +87,23 @@ impl AppService {
         operation: Arc<crate::service::AppOperationGuard>,
         operation_id: &str,
     ) -> AppResult<Option<()>> {
+        let Some(task) = self
+            .prepare_hot_deployment(app_id, artifact, request, operation, operation_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        task.execute_with_credentials(request.pg.as_ref()).await
+    }
+
+    pub(crate) async fn prepare_hot_deployment(
+        &self,
+        app_id: &str,
+        artifact: HotArtifact<'_>,
+        request: &StartAppRequest,
+        operation: Arc<crate::service::AppOperationGuard>,
+        operation_id: &str,
+    ) -> AppResult<Option<HotDeploymentTask>> {
         let HotArtifact {
             url,
             release_id,
@@ -166,6 +184,20 @@ impl AppService {
         if !supports_hot_protocol(&capability) {
             return Ok(None);
         }
+        if request.pg.is_some()
+            && !capability
+                .pointer("/data/capabilities")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|value| value.as_str() == Some("deployment_run_pg"))
+                })
+        {
+            return Err(AppOperationError::Validation(
+                "Hot deployment credentials require an app-cli supporting deployment_run_pg".into(),
+            ));
+        }
         let generation_id = env_snapshot
             .env
             .get(shared_types::APP_DEPLOY_GENERATION_ID)
@@ -194,11 +226,7 @@ impl AppService {
         // Reconciliation may take up to the full stage budget; the HTTP caller's
         // 300s response timeout is handled by spawning the task and discarding the
         // JoinHandle after the caller gives up (see start_hot_deploy).
-        tokio::time::timeout(budget, task.execute())
-            .await
-            .map_err(|_| {
-                AppOperationError::Backend("Hot deployment execution deadline exceeded".into())
-            })?
+        Ok(Some(task))
     }
 }
 
@@ -216,7 +244,7 @@ async fn await_hot_coordinator(
     })?
 }
 
-struct HotDeploymentTask {
+pub(crate) struct HotDeploymentTask {
     runtime: Arc<dyn UserAppRuntime>,
     access_mode: AppAccessMode,
     app_id: String,
@@ -234,6 +262,53 @@ struct HotDeploymentTask {
 }
 
 impl HotDeploymentTask {
+    /// Persist this identity before submitting the owner write. An IP and a
+    /// deployment generation alone do not identify the pod/container that ran it.
+    pub(crate) async fn capture_recovery_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> AppResult<shared_types::RuntimeConfigurationTarget> {
+        if context.app_id != self.app_id || context.operation_id != self.operation_id {
+            return Err(AppOperationError::Conflict(
+                "Hot deployment recovery identity differs from its execution".into(),
+            ));
+        }
+        self.runtime
+            .capture_app_configuration_target(context, &self.generation_id)
+            .await
+            .map_err(|error| {
+                AppOperationError::Backend(format!(
+                    "Capture hot deployment physical target: {error}"
+                ))
+            })
+    }
+
+    pub(crate) async fn execute_captured(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        target: &shared_types::RuntimeConfigurationTarget,
+        pg: Option<&shared_types::StartPgCredential>,
+        owned: &mut crate::service::OwnedOperation,
+    ) -> AppResult<Option<()>> {
+        if self.capture_recovery_target(context).await? != *target {
+            return Err(AppOperationError::Conflict(
+                "Hot deployment physical target changed before submission".into(),
+            ));
+        }
+        let result = tokio::time::timeout(self.budget, self.execute_inner(pg, Some(owned)))
+            .await
+            .map_err(|_| {
+                AppOperationError::Backend("Hot deployment execution deadline exceeded".into())
+            })??;
+        if self.capture_recovery_target(context).await? != *target {
+            return Err(AppOperationError::Conflict(
+                "Hot deployment physical target changed before completion; reconcile original operation"
+                    .into(),
+            ));
+        }
+        Ok(result)
+    }
+
     #[cfg(test)]
     async fn run(self) -> AppResult<Option<()>> {
         let result = self.execute().await;
@@ -246,7 +321,28 @@ impl HotDeploymentTask {
         finish_hot_operation(operation, result).await
     }
 
+    #[cfg(test)]
     async fn execute(&self) -> AppResult<Option<()>> {
+        self.execute_with_credentials(None).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_with_credentials(
+        &self,
+        pg: Option<&shared_types::StartPgCredential>,
+    ) -> AppResult<Option<()>> {
+        tokio::time::timeout(self.budget, self.execute_inner(pg, None))
+            .await
+            .map_err(|_| {
+                AppOperationError::Backend("Hot deployment execution deadline exceeded".into())
+            })?
+    }
+
+    async fn execute_inner(
+        &self,
+        pg: Option<&shared_types::StartPgCredential>,
+        owned: Option<&mut crate::service::OwnedOperation>,
+    ) -> AppResult<Option<()>> {
         let Self {
             runtime,
             access_mode,
@@ -269,6 +365,7 @@ impl HotDeploymentTask {
             "url": url,
             "release_id": release_id,
             "sha256": if sha256.is_empty() { None } else { Some(sha256) },
+            "pg": pg,
         });
         operation.mark_mutating()?;
         let resp = admin_client()?
@@ -345,6 +442,10 @@ impl HotDeploymentTask {
             }
         }
 
+        if let Some(owned) = owned {
+            owned.begin_hot_convergence().await?;
+            owned.authorize_mutation().await?;
+        }
         // 收敛 env 三元组进 ConfigMap（不触发 Recreate）：Pod 重建恢复最新版本
         let mut env = env_snapshot.env.clone();
         crate::release_flow::identity::strip_release_identity(&mut env);

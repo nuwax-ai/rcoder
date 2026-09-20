@@ -34,6 +34,29 @@ impl KubernetesRuntime {
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        self.create_agent_container_with_creation_receipt(params, None)
+            .await
+    }
+
+    pub(super) async fn create_agent_container_with_creation_receipt(
+        &self,
+        params: ContainerCreateParams,
+        creation_lease: Option<shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        if params.execution_context.is_some() && creation_lease.is_none() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Managed builder creation requires its original lease receipt".into(),
+            ));
+        }
+        let cancelled = params.creation_cancelled.clone();
+        let check_cancelled = || {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                Err(ContainerRuntimeError::CreationCancelled)
+            } else {
+                Ok(())
+            }
+        };
+        check_cancelled()?;
         // 确定容器标识符（复用 ServiceType::container_identifier 单一事实源，
         // 与 docker 模式 / handler 层保持一致）。identifier 借自 pod_id/user_id/project_id 之一。
         // ⚠️ 不要在此重写优先级逻辑，否则会与 handler 层不一致 → ensure/chat 造出不同名 pod+PVC。
@@ -74,6 +97,7 @@ impl KubernetesRuntime {
             }
         }
 
+        check_cancelled()?;
         if service_type == ServiceType::UserappBuilder {
             self.claim_builder_storage_with_context(identifier, params.execution_context.as_ref())
                 .await?;
@@ -104,6 +128,7 @@ impl KubernetesRuntime {
                 .ok_or_else(|| ContainerRuntimeError::ContainerNotFound(identifier.to_string()));
         }
 
+        check_cancelled()?;
         // 构造 PodSpec（纯计算，无 K8s API 副作用）。
         // Pod 的 ObjectMeta（name/labels）不传给 STS——STS 模板的 labels 由
         // build_agent_statefulset 经 build_standard_labels 自行设置，故此处只返回 PodSpec。
@@ -115,6 +140,7 @@ impl KubernetesRuntime {
         // service_type 重名/不匹配由 ensure_agent_statefulset 内部删旧重建处理。
         self.ensure_agent_headless_service(identifier, &service_type)
             .await?;
+        check_cancelled()?;
         if let Some(context) = params.execution_context.as_ref() {
             if service_type != ServiceType::UserappBuilder {
                 return Err(ContainerRuntimeError::ConfigurationError(
@@ -128,19 +154,50 @@ impl KubernetesRuntime {
         }
 
         // Wait for pod to be ready
-        self.wait_for_pod_ready(identifier, &service_type).await?;
+        check_cancelled()?;
+        tokio::select! {
+            result = self.wait_for_pod_ready(identifier, &service_type) => result?,
+            _ = async {
+                loop {
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire) { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            } => return Err(ContainerRuntimeError::CreationCancelled),
+        }
+        check_cancelled()?;
 
-        // Create K8s Service for Envoy Gateway routing
-        self.create_agent_service(identifier, &service_type).await?;
-
-        // Get pod info
-        self.get_container_info_inner(identifier, &service_type)
+        // Preserve the ordinary agent creation order. Managed builders attach
+        // their receipt atomically to the final Service mutation below.
+        if params.execution_context.is_none() {
+            self.create_agent_service(identifier, &service_type).await?;
+        }
+        let info = self
+            .get_container_info_inner(identifier, &service_type)
             .await?
             .ok_or_else(|| {
                 ContainerRuntimeError::ContainerCreationError(
-                    "Pod created but info not found".to_string(),
+                    "Pod created but info not found".into(),
                 )
-            })
+            })?;
+        if let (Some(context), Some(lease)) = (&params.execution_context, creation_lease) {
+            let target = self
+                .capture_builder_compute_with_binding(
+                    context,
+                    params.resource_binding.as_ref(),
+                    false,
+                )
+                .await?;
+            let receipt = super::builder_creation_receipt::BuilderCreationReceipt {
+                target,
+                container: info.clone(),
+                lease,
+            };
+            // The final resource mutation carries its own acknowledgement.
+            // Nothing after this call creates, scales or patches compute.
+            check_cancelled()?;
+            self.commit_builder_service_creation(&receipt).await?;
+        }
+        Ok(info)
     }
 
     /// 纯构造 agent-runner 的 PodSpec（image 选择、PVC 名、volumes/mounts 翻译、env 合并、

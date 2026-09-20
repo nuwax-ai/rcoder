@@ -266,6 +266,20 @@ impl AppService {
 // list/query/get/update/delete 编排实现拆至 lifecycle/{query,update}.rs（extension-impl）。
 #[async_trait::async_trait]
 impl super::AppServiceTrait for AppService {
+    async fn verify_recovered_storage(
+        &self,
+        app_id: &str,
+        scope: shared_types::UserAppOperationScope,
+    ) -> AppResult<()> {
+        AppService::verify_recovered_storage(self, app_id, scope).await
+    }
+    async fn discover_missing_identity(
+        &self,
+        app_id: &str,
+    ) -> AppResult<Option<shared_types::UserAppLifecycleRecord>> {
+        AppService::discover_missing_identity(self, app_id).await
+    }
+
     async fn prepare_prod_database(
         &self,
         app_id: &str,
