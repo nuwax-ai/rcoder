@@ -192,6 +192,24 @@ impl Journal {
             legacy_root: None,
         })
     }
+    pub(crate) fn source_seal(&self) -> Result<Option<shared_types::RuntimeGenerationSourceSeal>> {
+        match std::fs::read(self.root.join(".generation-source-seal.json")) {
+            Ok(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).context("invalid generation source seal")?,
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("read generation source seal"),
+        }
+    }
+
+    pub(crate) fn write_source_seal(
+        &self,
+        seal: &shared_types::RuntimeGenerationSourceSeal,
+    ) -> Result<()> {
+        self.write_verified(".generation-source-seal.json", seal)?;
+        Ok(())
+    }
+
     fn write_verified<T: Serialize + serde::de::DeserializeOwned>(
         &self,
         name: &str,

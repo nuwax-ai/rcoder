@@ -28,8 +28,7 @@ pub use state::UserAppState;
 /// 独立全量形态：file-server 全量 router（TS 对齐 + swagger + fallback）+
 /// `/api/v1/userapp` 子树（同款公共中间件栈）。file-server-proxy embed 消费。
 pub fn full_router(server: &file_server::FileServer) -> Result<Router> {
-    let base = server.router()?;
-    Ok(base.merge(userapp_subrouter(server)?))
+    full_router_with_lifecycle(server, None).map(|(router, _handle)| router)
 }
 
 /// 开发容器形态：file-server container 路由集 + `/api/v1/userapp` 子树。
@@ -47,4 +46,69 @@ fn userapp_subrouter(server: &file_server::FileServer) -> Result<Router> {
     let (router, _openapi) = routes::userapp_top_router().split_for_parts();
     let state = UserAppState::new(server.state());
     Ok(file_server::server::apply_common_layers(router, body_limit).with_state(state))
+}
+
+/// Lifecycle handle for the exact state assembled into a standalone router.
+#[derive(Clone)]
+pub struct EmbeddedRuntimeHandle {
+    workers: std::sync::Arc<process_utils::workers::WorkerRegistry>,
+}
+impl EmbeddedRuntimeHandle {
+    pub fn close(&self) -> std::result::Result<(), String> {
+        self.workers.close()
+    }
+    pub async fn shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<(), String> {
+        self.workers.drain(deadline).await
+    }
+}
+
+/// Keep the host's workers alive through client disconnect and process shutdown.
+/// This does not stop independently owned app-cli business services.
+pub fn full_router_with_lifecycle(
+    server: &file_server::FileServer,
+    journal_root: Option<std::path::PathBuf>,
+) -> Result<(Router, EmbeddedRuntimeHandle)> {
+    let workers = process_utils::workers::WorkerRegistry::new(journal_root);
+    let state = UserAppState {
+        fs: server.state(),
+        build_tasks: std::sync::Arc::new(service::userapp::tasks::BuildTaskStore::with_workers(
+            workers.clone(),
+        )),
+    };
+    let body_limit = usize::try_from(server.state().config.request_body_max_bytes)?;
+    let (userapp, _) = routes::userapp_top_router().split_for_parts();
+    let userapp = file_server::server::apply_common_layers(userapp, body_limit).with_state(state);
+    let router = server
+        .router()?
+        .merge(userapp)
+        .layer(axum::middleware::from_fn_with_state(
+            workers.clone(),
+            track_embedded_request,
+        ));
+    Ok((router, EmbeddedRuntimeHandle { workers }))
+}
+async fn track_embedded_request(
+    axum::extract::State(workers): axum::extract::State<
+        std::sync::Arc<process_utils::workers::WorkerRegistry>,
+    >,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let task = match workers.spawn(async move { next.run(request).await }) {
+        Ok(task) => task,
+        Err(error) => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    };
+    match task.await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("embedded request worker failed: {error}"),
+        )
+            .into_response(),
+    }
 }

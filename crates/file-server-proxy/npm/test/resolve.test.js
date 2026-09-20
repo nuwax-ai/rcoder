@@ -76,3 +76,17 @@ test("unsupported platform/arch throws", () => {
   assert.throws(() => getTargetTriple("aix", "x64"), /Unsupported platform/);
   assert.throws(() => getTargetTriple("linux", "riscv64"), /Unsupported Linux arch/);
 });
+
+test("Linux ARM64 musl is unsupported rather than silently selecting GNU", () => {
+  assert.throws(() => getTargetTriple("linux", "arm64", "musl"), /unsupported_target.*ARM64 musl/);
+  assert.strictEqual(getTargetTriple("linux", "arm64", "glibc"), "aarch64-unknown-linux-gnu");
+});
+
+test("cross-target archive extension follows target rather than packaging host", () => {
+  try {
+    process.env.FILE_SERVER_PROXY_TARGET = "x86_64-pc-windows-msvc";
+    assert.match(downloadUrl("1.2.3", "darwin", "arm64"), /x86_64-pc-windows-msvc\.zip$/);
+    process.env.FILE_SERVER_PROXY_TARGET = "aarch64-apple-darwin";
+    assert.match(downloadUrl("1.2.3", "win32", "x64"), /aarch64-apple-darwin\.tar\.gz$/);
+  } finally { clearOverride(); }
+});

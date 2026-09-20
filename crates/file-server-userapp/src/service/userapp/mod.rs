@@ -457,42 +457,50 @@ pub async fn start_build_task(
     task.set_workspace_root(ws).await;
     let task_spawn = task.clone();
     let config = Arc::clone(config);
-    tokio::spawn(async move {
-        let _workspace_activity = workspace_activity;
-        let result = build_workspace_package(
-            &config,
-            build_manager.as_ref(),
-            &app_id,
-            &release_id,
-            timeout_secs,
-            Some(task_spawn.clone()),
-        )
-        .await;
-        // 终态统一由此 emit：build_workspace_package 只发非终态进度（Building/BuildOk/BuildFail）。
-        // Ok → Completed；Err 且非 cancel → Failed（cancel 的 Cancelled 已由 cancel handler emit）。
-        match result {
-            Ok(artifact) => {
-                task_spawn
-                    .emit(BuildProgressEvent::Completed {
-                        release_id: artifact.release_id.clone(),
-                        sha256: artifact.sha256.clone(),
-                        size_bytes: artifact.size_bytes,
-                        file_name: artifact.file_name.clone(),
-                        artifact_path: artifact.rel_path.clone(),
-                    })
-                    .await;
-            }
-            Err(e) => {
-                if !task_spawn.is_cancelled() && !task_spawn.is_terminal().await {
-                    task_spawn
-                        .emit(BuildProgressEvent::Failed {
-                            error: e.to_string(),
-                        })
-                        .await;
+    let context = task.command_context();
+    store
+        .workers
+        .spawn_identified(
+            context.identity.clone(),
+            context.scope(async move {
+                let _workspace_activity = workspace_activity;
+                let result = build_workspace_package(
+                    &config,
+                    build_manager.as_ref(),
+                    &app_id,
+                    &release_id,
+                    timeout_secs,
+                    Some(task_spawn.clone()),
+                )
+                .await;
+                // 终态统一由此 emit：build_workspace_package 只发非终态进度（Building/BuildOk/BuildFail）。
+                // Ok → Completed；Err 且非 cancel → Failed（cancel 的 Cancelled 已由 cancel handler emit）。
+                match result {
+                    Ok(artifact) => {
+                        task_spawn
+                            .emit(BuildProgressEvent::Completed {
+                                release_id: artifact.release_id.clone(),
+                                sha256: artifact.sha256.clone(),
+                                size_bytes: artifact.size_bytes,
+                                file_name: artifact.file_name.clone(),
+                                artifact_path: artifact.rel_path.clone(),
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        if !task_spawn.is_cancelled() && !task_spawn.is_terminal().await {
+                            task_spawn
+                                .emit(BuildProgressEvent::Failed {
+                                    error: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
                 }
-            }
-        }
-    });
+            }),
+        )
+        .map_err(AppError::system)?;
+
     Ok((task.id.clone(), artifact_path))
 }
 

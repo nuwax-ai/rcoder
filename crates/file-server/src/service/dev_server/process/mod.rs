@@ -240,7 +240,7 @@ pub type OnLineCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 /// 一次性命令的过程回调集合（pid 回写供 cancel；行回调供 SSE 实时日志）。
 #[derive(Default)]
 pub struct CommandObservers<'a> {
-    /// spawn 后回调 child pid（供外部 cancel kill 进程组）；None 不回调。
+    /// Spawn PID callback for diagnostics; cancellation uses the scoped token.
     pub on_pid: Option<&'a (dyn Fn(u32) + Send + Sync)>,
     /// 每行输出回调（见 [`OnLineCallback`]）；None 不回调。
     pub on_line: Option<OnLineCallback>,
@@ -275,22 +275,44 @@ pub async fn run_command_to_log(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let mut child = cmd.spawn().map_err(|e| {
-        AppError::system(format!(
-            "spawn command failed (program={program}, cwd={}): {e}",
-            cwd.display()
-        ))
-    })?;
-    // 回调 pid 供外部 cancel (kill_process_group); child drop 前 pid 恒有效。
+    let context = process_utils::command_context::CommandContext::current();
+    let cancellation = context
+        .as_ref()
+        .map(|c| c.cancellation.clone())
+        .unwrap_or_default();
+    if cancellation.is_cancelled() {
+        return Err(AppError::business("command cancelled before spawn"));
+    }
+    let record = process_utils::command_context::CommandRecord::prepare()
+        .map_err(|e| AppError::system(format!("persist command intent: {e}")))?;
+    let mut child = match process_utils::guardian::spawn_owned(cmd, record.as_ref()).await {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(record) = &record {
+                record
+                    .quiescent()
+                    .map_err(|e| AppError::system(format!("persist spawn failure: {e}")))?;
+            }
+            return Err(AppError::system(format!(
+                "spawn command failed (program={program}, cwd={}): {error}",
+                cwd.display()
+            )));
+        }
+    };
+    if let Some(receipt) = &record
+        && let Err(error) = receipt.running(child.id())
+    {
+        process_utils::command_context::retain_cleanup(Some(child), record);
+        return Err(AppError::system(format!("persist owned child: {error}")));
+    }
+    // PID is diagnostic only; cancellation reaches the retained child owner.
     if let Some(cb) = observers.on_pid
         && let Some(pid) = child.id()
     {
         cb(pid);
     }
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let stdout = child.take_stdout();
+    let stderr = child.take_stderr();
     let main = main_log.to_path_buf();
     let temp = temp_log.to_path_buf();
     // 收集日志管道 JoinHandle:child.wait() 后 drain 尾部日志,避免主流程在日志未写完时返回(#17)。
@@ -306,38 +328,39 @@ pub async fn run_command_to_log(
         let on_line = observers.on_line.clone();
         tokio::spawn(async move { pipe_stream(err, main, temp, on_line).await })
     });
-    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
-    let outcome = match result {
-        Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => Err(AppError::system(format!(
-            "command exited non-zero: {status}"
-        ))),
-        Ok(Err(e)) => Err(AppError::system(format!("command wait failed: {e}"))),
-        Err(_) => {
-            // 超时: 杀整个进程组,避免 pnpm/vite 子进程遗留。
-            if let Some(pid) = child.id() {
-                if !kill_process_group_force(pid) {
-                    tracing::warn!(
-                        "kill_process_group_force reported failure for pid={pid}; \
-                         falling back to orphan reaper"
-                    );
-                }
-            } else {
-                if let Err(e) = child.start_kill() {
-                    tracing::warn!(error = %e, "start_kill failed (child may already be dead)");
-                }
+    let result = tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_root()) => {
+            match result {
+                Ok(Ok(status)) if status.success() => Ok(()),
+                Ok(Ok(status)) => Err(AppError::system(format!("command exited non-zero: {status}"))),
+                Ok(Err(error)) => Err(AppError::system(format!("command wait failed: {error}"))),
+                Err(_) => Err(AppError::system(format!("command timed out after {timeout_secs}s"))),
             }
-            // 超时分支补一次 wait() reap 子进程(#1):不依赖 tokio orphan reaper 时序,
-            // 短超时(5s)放弃,避免 kill 失败时永久阻塞。
-            match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => tracing::warn!(error = %e, "wait to reap child failed (skipping)"),
-                Err(_) => tracing::warn!("timed wait (5s) to reap child elapsed (skipping)"),
-            }
-            Err(AppError::system(format!(
-                "command timed out after {timeout_secs}s"
-            )))
         }
+        () = cancellation.cancelled() => Err(AppError::business("owned command cancelled")),
+    };
+    // Root exit alone cannot release the workspace while descendants still run.
+    let cleanup = child.stop(Duration::from_secs(1)).await;
+    let outcome = if matches!(
+        cleanup,
+        process_utils::managed_tree::StopOutcome::Unconfirmed
+    ) {
+        process_utils::command_context::retain_cleanup(Some(child), record);
+        Err(AppError::system(
+            "owned command process-tree cleanup unconfirmed",
+        ))
+    } else if let Some(record) = record {
+        match record.quiescent() {
+            Ok(()) => result,
+            Err(error) => {
+                process_utils::command_context::retain_cleanup(None, Some(record));
+                Err(AppError::system(format!(
+                    "persist command cleanup: {error}"
+                )))
+            }
+        }
+    } else {
+        result
     };
 
     // 等日志管道 drain(超时放弃,不阻塞返回;尾部日志可能截断但会告警)。

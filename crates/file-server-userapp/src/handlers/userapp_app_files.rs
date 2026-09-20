@@ -428,11 +428,13 @@ pub(crate) async fn clear(
     let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
     // Dropping the HTTP observer must not release a lease while filesystem
     // operations accepted by the worker are still running.
-    tokio::spawn(reset_workspace(state, body.app_id, root))
+    let workers = state.build_tasks.workers.clone();
+    workers
+        .spawn(reset_workspace(state, body.app_id, root))
+        .map_err(AppError::system)?
         .await
-        .map_err(|error| {
-            AppError::system(format!("Workspace reset worker interrupted: {error}"))
-        })??;
+        .map_err(|error| AppError::system(format!("Workspace reset worker interrupted: {error}")))?
+        .map_err(AppError::system)??;
     Ok(Json(shared_types::UserAppWorkspaceClearResult {
         success: true,
         instance_id: CLEAR_INSTANCE.clone(),

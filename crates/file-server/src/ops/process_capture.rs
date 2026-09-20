@@ -17,46 +17,67 @@ pub struct CaptureResult {
 }
 
 pub async fn capture_command(
-    command: &mut Command,
+    mut command: Command,
     label: &str,
     timeout_secs: u64,
 ) -> AppResult<CaptureResult> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
-    command.kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|error| AppError::system(format!("spawn {label} failed: {error}")))?;
-    let child_pid = child.id();
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::system(format!("{label} stdout pipe is unavailable")))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::system(format!("{label} stderr pipe is unavailable")))?;
+    let cancellation = process_utils::command_context::CommandContext::current()
+        .map(|c| c.cancellation)
+        .unwrap_or_default();
+    if cancellation.is_cancelled() {
+        return Err(AppError::business("command cancelled before spawn"));
+    }
+    let record = process_utils::command_context::CommandRecord::prepare()
+        .map_err(|e| AppError::system(format!("persist capture intent: {e}")))?;
+    let mut child = match process_utils::guardian::spawn_owned(command, record.as_ref()).await {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(record) = record {
+                record
+                    .quiescent()
+                    .map_err(|e| AppError::system(format!("persist spawn failure: {e}")))?;
+            }
+            return Err(AppError::system(format!("spawn {label} failed: {error}")));
+        }
+    };
+    if let Some(receipt) = &record
+        && let Err(error) = receipt.running(child.id())
+    {
+        process_utils::command_context::retain_cleanup(Some(child), record);
+        return Err(AppError::system(format!("persist capture owner: {error}")));
+    }
+    let (Some(stdout), Some(stderr)) = (child.take_stdout(), child.take_stderr()) else {
+        process_utils::command_context::retain_cleanup(Some(child), record);
+        return Err(AppError::system(format!("{label} output pipe unavailable")));
+    };
     let stdout_task = tokio::spawn(read_bounded(stdout));
     let stderr_task = tokio::spawn(read_bounded(stderr));
 
-    let status = match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-        Ok(result) => Some(
-            result.map_err(|error| AppError::system(format!("{label} wait failed: {error}")))?,
-        ),
-        Err(_) => {
-            if let Some(pid) = child_pid {
-                crate::service::dev_server::process::kill_process_group_force(pid);
-            }
-            if let Err(e) = child.kill().await {
-                tracing::warn!(error = %e, "kill child on capture timeout failed (skipping)");
-            }
-            if let Err(e) = child.wait().await {
-                tracing::warn!(error = %e, "wait to reap child on capture timeout failed (skipping)");
-            }
-            None
-        }
+    let outcome = tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_root()) => match result {
+            Ok(result) => result.map(Some).map_err(|e| AppError::system(format!("{label} wait failed: {e}"))),
+            Err(_) => Ok(None),
+        },
+        () = cancellation.cancelled() => Err(AppError::business("owned capture command cancelled")),
     };
+    let cleanup = child.stop(Duration::from_secs(1)).await;
+    if matches!(
+        cleanup,
+        process_utils::managed_tree::StopOutcome::Unconfirmed
+    ) {
+        process_utils::command_context::retain_cleanup(Some(child), record);
+        return Err(AppError::system("capture process-tree cleanup unconfirmed"));
+    }
+    if let Some(record) = record
+        && let Err(error) = record.quiescent()
+    {
+        process_utils::command_context::retain_cleanup(None, Some(record));
+        return Err(AppError::system(format!(
+            "persist capture cleanup: {error}"
+        )));
+    }
+    let status = outcome?;
 
     let stdout = join_reader(stdout_task, label, "stdout").await?;
     let mut stderr = join_reader(stderr_task, label, "stderr").await?;
@@ -95,7 +116,7 @@ pub async fn run_capture(
         .env_remove("CI")
         .env_remove("NPM_CONFIG_PRODUCTION")
         .env("NODE_ENV", "development");
-    let result = capture_command(&mut command, program, timeout_secs).await?;
+    let result = capture_command(command, program, timeout_secs).await?;
     Ok((result.stdout, result.stderr, result.exit_code))
 }
 

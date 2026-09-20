@@ -331,74 +331,85 @@ async fn spawn_dev_task(
     task.set_workspace_root(ws.clone()).await;
     let app_id = app_id.to_string();
     let task_clone = task.clone();
-    tokio::spawn(async move {
-        let _workspace_activity = workspace_activity;
-        let key = dev_key(&app_id);
-        // 编译（形态分派）：
-        // - 产物态（现状）：manifest 同核编译（单一编译事实源）——discover →
-        //   逐子项目 [build].command → 组 workspace zip（dev 编译通过 = 可部署）。
-        // - 源码态（[devrun] 触发）：逐服务三分派（[devbuild] 显式配置则执行；
-        //   只配 [devrun] 的服务跳过——devrun 自足；其余回落 [build].command
-        //   刷新源码目录产物）——不打 zip（热加载命令跑源码，
-        //   制品无消费者；可部署性检查走 /api/v1/userapp/build）。
-        // P3-03：构建前捕获 owner 期望（instance/revision）——构建期间
-        // owner 被 stop/restart 时，提交按 ERR_REVISION_MISMATCH 拒绝
-        // （不自动刷新重发，防绕过用户 stop）。无 owner 时无副作用。
-        state
-            .fs
-            .dev_server
-            .capture_owner_expectation(&key, &ws)
-            .await;
-        let progress = task_clone.clone();
-        let result = if dev_source_mode {
-            crate::service::userapp::dev_mode::run_dev_builds(
-                &state.fs.build_manager,
-                &app_id,
-                &ws,
-                state.fs.config.dev_command_timeout_secs,
-                Some(progress),
-            )
-            .await
-            .map(|()| None)
-        } else {
-            crate::service::userapp::build_workspace_package(
-                &state.fs.config,
-                &state.fs.build_manager,
-                &app_id,
-                &release_id,
-                state.fs.config.dev_command_timeout_secs,
-                Some(progress),
-            )
-            .await
-            .map(Some)
-        };
-        let (evt_tx, event_pipe) = StartEventPipe::new(task_clone.clone());
-        // P1-06：启动预算取配置兜底——不能用硬编码 3600s 掩盖通道语义缺陷，
-        // 也不能截断合法慢启动。此处以 dev_command_timeout_secs 为基线加
-        // pingap 确认余量（30s）与调度余量（120s），再取上限 1200s 兜底。
-        let launch_budget_secs = std::cmp::min(
-            START_DONE_WAIT_MAX_SECS,
-            state.fs.config.dev_command_timeout_secs.saturating_add(150),
-        );
-        let hook_tx = evt_tx.clone();
-        let runtime_hooks_tx = evt_tx.clone();
-        let hooks = file_server::service::dev_server::DevEventHooks {
-            on_line: {
-                let tx = hook_tx;
-                std::sync::Arc::new(move |json: &str| match map_app_cli_evt(json) {
-                    Some(event) => {
-                        drop(tx.send(event));
-                    }
-                    None => tracing::warn!(json, "[DEV_START] unparsed app-cli EVT line dropped"),
-                }) as file_server::service::dev_server::process::OnLineCallback
-            },
-            on_end: Some(std::sync::Arc::new(move |end| {
-                drop(runtime_hooks_tx.send(EvtOutcome::StreamEnded {
-                    reason: end.to_string(),
-                }));
-            })),
-        };
-        let outcome = async {
+    let workers = state.build_tasks.workers.clone();
+    let context = task.command_context();
+    workers
+        .spawn_identified(
+            context.identity.clone(),
+            context.scope(async move {
+                let _workspace_activity = workspace_activity;
+                let key = dev_key(&app_id);
+                // 编译（形态分派）：
+                // - 产物态（现状）：manifest 同核编译（单一编译事实源）——discover →
+                //   逐子项目 [build].command → 组 workspace zip（dev 编译通过 = 可部署）。
+                // - 源码态（[devrun] 触发）：逐服务三分派（[devbuild] 显式配置则执行；
+                //   只配 [devrun] 的服务跳过——devrun 自足；其余回落 [build].command
+                //   刷新源码目录产物）——不打 zip（热加载命令跑源码，
+                //   制品无消费者；可部署性检查走 /api/v1/userapp/build）。
+                // P3-03：构建前捕获 owner 期望（instance/revision）——构建期间
+                // owner 被 stop/restart 时，提交按 ERR_REVISION_MISMATCH 拒绝
+                // （不自动刷新重发，防绕过用户 stop）。无 owner 时无副作用。
+                state
+                    .fs
+                    .dev_server
+                    .capture_owner_expectation(&key, &ws)
+                    .await;
+                let progress = task_clone.clone();
+                let result = if dev_source_mode {
+                    crate::service::userapp::dev_mode::run_dev_builds(
+                        &state.fs.build_manager,
+                        &app_id,
+                        &ws,
+                        state.fs.config.dev_command_timeout_secs,
+                        Some(progress),
+                    )
+                    .await
+                    .map(|()| None)
+                } else {
+                    crate::service::userapp::build_workspace_package(
+                        &state.fs.config,
+                        &state.fs.build_manager,
+                        &app_id,
+                        &release_id,
+                        state.fs.config.dev_command_timeout_secs,
+                        Some(progress),
+                    )
+                    .await
+                    .map(Some)
+                };
+                let (evt_tx, event_pipe) = StartEventPipe::new(task_clone.clone());
+                // P1-06：启动预算取配置兜底——不能用硬编码 3600s 掩盖通道语义缺陷，
+                // 也不能截断合法慢启动。此处以 dev_command_timeout_secs 为基线加
+                // pingap 确认余量（30s）与调度余量（120s），再取上限 1200s 兜底。
+                let launch_budget_secs = std::cmp::min(
+                    START_DONE_WAIT_MAX_SECS,
+                    state.fs.config.dev_command_timeout_secs.saturating_add(150),
+                );
+                let hook_tx = evt_tx.clone();
+                let runtime_hooks_tx = evt_tx.clone();
+                let hooks = file_server::service::dev_server::DevEventHooks {
+                    on_line: {
+                        let tx = hook_tx;
+                        std::sync::Arc::new(move |json: &str| match map_app_cli_evt(json) {
+                            Some(event) => {
+                                drop(tx.send(event));
+                            }
+                            None => {
+                                tracing::warn!(
+                                    json,
+                                    "[DEV_START] unparsed app-cli EVT line dropped"
+                                )
+                            }
+                        })
+                            as file_server::service::dev_server::process::OnLineCallback
+                    },
+                    on_end: Some(std::sync::Arc::new(move |end| {
+                        drop(runtime_hooks_tx.send(EvtOutcome::StreamEnded {
+                            reason: end.to_string(),
+                        }));
+                    })),
+                };
+                let outcome = async {
             result?;
             if task_clone.is_cancelled() {
                 return Ok::<(), AppError>(());
@@ -527,36 +538,39 @@ async fn spawn_dev_task(
                 .await
         }
         .await;
-        match outcome {
-            Ok(()) => {
-                task_clone
-                    .emit(shared_types::BuildProgressEvent::Completed {
-                        // dev 任务消费方按 status/端口（dev/list）取结果；制品字段
-                        // 仍带真实值（同核编译产出制品 zip，artifact_path 可用于
-                        // 手动取包校验）。快速路径（跳过部署）时制品为本次
-                        // 编译产出，存在但未部署。
-                        release_id: release_id.clone(),
-                        sha256: String::new(),
-                        size_bytes: 0,
-                        file_name: String::new(),
-                        artifact_path: artifact_rel_path.clone(),
-                    })
-                    .await;
-            }
-            Err(e) => {
-                // 守卫对齐兄弟实现（start_build_task）：cancel 已置终态时不再
-                // emit Failed（防"cancel 接口返回 cancelled 但终态是 Failed"
-                // 的竞态不一致）
-                if !task_clone.is_cancelled() && !task_clone.is_terminal().await {
-                    task_clone
-                        .emit(shared_types::BuildProgressEvent::Failed {
-                            error: e.to_string(),
-                        })
-                        .await;
+                match outcome {
+                    Ok(()) => {
+                        task_clone
+                            .emit(shared_types::BuildProgressEvent::Completed {
+                                // dev 任务消费方按 status/端口（dev/list）取结果；制品字段
+                                // 仍带真实值（同核编译产出制品 zip，artifact_path 可用于
+                                // 手动取包校验）。快速路径（跳过部署）时制品为本次
+                                // 编译产出，存在但未部署。
+                                release_id: release_id.clone(),
+                                sha256: String::new(),
+                                size_bytes: 0,
+                                file_name: String::new(),
+                                artifact_path: artifact_rel_path.clone(),
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        // 守卫对齐兄弟实现（start_build_task）：cancel 已置终态时不再
+                        // emit Failed（防"cancel 接口返回 cancelled 但终态是 Failed"
+                        // 的竞态不一致）
+                        if !task_clone.is_cancelled() && !task_clone.is_terminal().await {
+                            task_clone
+                                .emit(shared_types::BuildProgressEvent::Failed {
+                                    error: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
                 }
-            }
-        }
-    });
+            }),
+        )
+        .map_err(AppError::system)?;
+
     Ok(task.id.clone())
 }
 

@@ -3571,11 +3571,14 @@ async fn scenario_two_users_share_app() {
     );
 
     // 正例：app_id 内部 '-' 合法（复合键禁令解除；DNS-1123 label 内部连字符）
+    // 与本次 case 绑定，不能复用历史测试容器；共 17 字符，满足 <=19 限制。
+    let case_id = std::env::var("E2E_CASE_ID").expect("strict case identity");
+    let hyphen_app = format!("hy-{}-app", case_id.get(..10).expect("case prefix"));
     match env
         .http
         .post(format!("{}/api/v1/userapp/workspace", env.rcoder))
         .timeout(Duration::from_secs(30))
-        .json(&json!({"app_id": "bad-app-id", "user_id": u1}))
+        .json(&json!({"app_id": hyphen_app, "user_id": u1}))
         .send()
         .await
     {
@@ -3585,6 +3588,8 @@ async fn scenario_two_users_share_app() {
             // 共享模型：内部 '-' 合法（DNS-1123；复合键禁令解除），
             // 非法档改锚定路径逃逸形态（'..' 段与首尾 '-' 仍拒）
             let accepted = status.is_success() && b["success"].as_bool().unwrap_or(false);
+            rcoder_e2e::common::resources::register_builder_attempt(&hyphen_app, accepted)
+                .expect("register hyphen app builder identity");
             report.assert_hard(
                 "正例：app_id 含内部 '-' 受理（DNS-1123 label）",
                 accepted,
@@ -3592,6 +3597,8 @@ async fn scenario_two_users_share_app() {
             );
         }
         Err(e) => {
+            rcoder_e2e::common::resources::register_builder_attempt(&hyphen_app, false)
+                .expect("register uncertain hyphen app builder identity");
             report.assert_hard(
                 "正例：app_id 含内部 '-' 受理",
                 false,
@@ -3599,6 +3606,8 @@ async fn scenario_two_users_share_app() {
             );
         }
     }
+
+    cleanup_builder(u1, &hyphen_app);
 
     // purge：owner 删除 app（连协作者实例一起清——capture 排除法全清语义）
     let del = post_json(

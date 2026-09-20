@@ -5,9 +5,9 @@ const { mkdirSync, writeFileSync } = require("node:fs");
 const { dirname } = require("node:path");
 
 // 流式下载归档到磁盘。返回字节数。
-async function downloadArchive(url, outPath) {
+async function downloadArchive(url, outPath, signal = AbortSignal.timeout(300000)) {
   mkdirSync(dirname(outPath), { recursive: true });
-  const res = await fetch(url, { redirect: "follow" });
+  const res = await fetch(url, { redirect: "follow", signal });
   if (!res.ok) {
     throw new Error(
       `file-server-proxy download failed: HTTP ${res.status} ${res.statusText}\nURL: ${url}`,

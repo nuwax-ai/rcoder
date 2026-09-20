@@ -238,7 +238,7 @@ dependencies = [
  "libc",
  "notify",
  "pingap-config",
- "process-wrap",
+ "process-wrap 10.0.0",
  "process_utils",
  "regex",
  "reqwest",
@@ -3574,6 +3574,20 @@ dependencies = [
 
 [[package]]
 name = "process-wrap"
+version = "9.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e842efad9119158434d193c6682e2ebee4b44d6ad801d7b349623b3f57cdf55"
+dependencies = [
+ "futures",
+ "indexmap 2.14.2",
+ "nix",
+ "tokio",
+ "tracing",
+ "windows",
+]
+
+[[package]]
+name = "process-wrap"
 version = "10.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e3f4237d0e4741eb50bc5584db701f1299c85fa31ff0274dd6445e79dc42d12"
@@ -3590,7 +3604,14 @@ dependencies = [
 name = "process_utils"
 version = "0.1.3"
 dependencies = [
+ "anyhow",
  "nix",
+ "process-wrap 9.1.0",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

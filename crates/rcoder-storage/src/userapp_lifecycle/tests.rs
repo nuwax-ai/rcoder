@@ -969,7 +969,11 @@ async fn joined_request_identity_remains_idempotent_after_completion() {
 #[tokio::test]
 async fn metadata_cas_preserves_unmentioned_fields_and_noop_revision() {
     let (_directory, store) = database().await;
-    let app = store.ensure_identity("contract-app").await.unwrap();
+    metadata_cas_contract(&store).await;
+}
+
+async fn metadata_cas_contract(store: &dyn UserAppLifecycleStore) {
+    let app = store.ensure_identity("metadatacasapp").await.unwrap();
     let patch = shared_types::UserAppMetadataPatch {
         app_id: app.app_id,
         lifecycle_id: app.lifecycle_id,
@@ -1022,6 +1026,8 @@ async fn postgres_real_transactions_and_restart_contract() {
     let tested = store.clone();
     let result = tokio::spawn(async move {
         let store = tested.as_ref();
+        metadata_cas_contract(store).await;
+        old_lease_cleanup_and_retry_preserve_recreated_lifecycle(store).await;
         storage_deletion_preserves_lifecycle(store).await;
         admission_metadata_is_atomic(store).await;
         request_identity_spans_recreation_and_control(store).await;
@@ -1903,4 +1909,152 @@ async fn operation_deadline_contract(store: &dyn UserAppLifecycleStore) {
 async fn turso_operation_deadline_contract() {
     let (_directory, store) = database().await;
     operation_deadline_contract(&store).await;
+}
+
+async fn old_lease_cleanup_and_retry_preserve_recreated_lifecycle(
+    store: &dyn UserAppLifecycleStore,
+) {
+    let mut old_request = request("oldleaseoperation", Kind::Stop);
+    old_request.app_id = "recreatedleaseapp".into();
+    let old_pending = operation(store.admit(&old_request).await.unwrap());
+    let old_running = store
+        .advance(&progress(&old_pending, State::Running))
+        .await
+        .unwrap();
+    let context = |op: &UserAppOperationRecord| shared_types::UserAppExecutionContext {
+        app_id: op.app_id.clone(),
+        lifecycle_id: op.lifecycle_id.clone(),
+        operation_id: op.operation_id.clone(),
+        executor_id: "worker-A".into(),
+        request_fingerprint: op.request_fingerprint.clone(),
+    };
+    let receipt = |inode| shared_types::UserAppOperationLeaseReceipt::Docker {
+        service_type: shared_types::ServiceType::Userapp,
+        device: 1,
+        inode,
+        token: format!("fixturelease{inode}"),
+    };
+    store
+        .bind_operation_lease(&context(&old_running), &receipt(1))
+        .await
+        .unwrap();
+    let old_binding = store
+        .get_operation_lease(&old_request.app_id, &old_running.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let old_terminal = store
+        .advance(&progress(&old_running, State::Succeeded))
+        .await
+        .unwrap();
+    let mut deletion = request("recreatedleasedeletion", Kind::DeleteApplication);
+    deletion.app_id = old_request.app_id.clone();
+    deletion.lifecycle_id = Some(old_running.lifecycle_id.clone());
+    let deletion = operation(store.admit(&deletion).await.unwrap());
+    complete(store, &deletion, State::Succeeded).await;
+    let new_app = store
+        .recreate(
+            &old_request.app_id,
+            &old_running.lifecycle_id,
+            "recreatedleaserequest",
+        )
+        .await
+        .unwrap();
+    let mut new_request = request("newleaseoperation", Kind::Start);
+    new_request.app_id = old_request.app_id.clone();
+    new_request.lifecycle_id = Some(new_app.lifecycle_id.clone());
+    let new_pending = operation(store.admit(&new_request).await.unwrap());
+    let new_running = store
+        .advance(&progress(&new_pending, State::Running))
+        .await
+        .unwrap();
+    store
+        .bind_operation_lease(&context(&new_running), &receipt(2))
+        .await
+        .unwrap();
+    let new_binding = store
+        .get_operation_lease(&new_request.app_id, &new_running.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let app_before = store
+        .get_application(&new_request.app_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Terminal history cleanup is legal; it must delete only the old receipt.
+    store.forget_operation_lease(&old_binding).await.unwrap();
+    store.forget_operation_lease(&old_binding).await.unwrap();
+    let mut forged = old_binding.clone();
+    forged.context.operation_id = new_running.operation_id.clone();
+    assert!(store.forget_operation_lease(&forged).await.is_err());
+    assert!(
+        store
+            .advance(&progress(&old_running, State::Running))
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .reserve_completed_operation(&old_running)
+            .await
+            .is_err()
+    );
+    match store.admit(&old_request).await {
+        Ok(Outcome::Existing(replayed)) => assert_eq!(replayed, old_terminal),
+        Err(Error::LifecycleConflict) => {}
+        other => panic!("old retry must be historical or lifecycle-rejected: {other:?}"),
+    }
+    assert_eq!(
+        store
+            .get_application(&new_request.app_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        app_before
+    );
+    assert_eq!(
+        store
+            .get_operation(&new_request.app_id, &new_running.operation_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        new_running
+    );
+    assert_eq!(
+        store
+            .get_operation_lease(&new_request.app_id, &new_running.operation_id)
+            .await
+            .unwrap(),
+        Some(new_binding.clone())
+    );
+    assert_eq!(
+        store
+            .get_operation(&old_request.app_id, &old_terminal.operation_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        old_terminal
+    );
+    assert!(
+        store
+            .get_operation_lease(&old_request.app_id, &old_terminal.operation_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // This contract shares the PG fixture with pagination tests. After proving
+    // the replacement remains untouched, settle only this fixture's new owner.
+    store
+        .advance(&progress(&new_running, State::Succeeded))
+        .await
+        .unwrap();
+    store.forget_operation_lease(&new_binding).await.unwrap();
+}
+
+#[tokio::test]
+async fn turso_old_lease_cleanup_and_retry_preserve_recreated_lifecycle() {
+    let (_directory, store) = database().await;
+    old_lease_cleanup_and_retry_preserve_recreated_lifecycle(&store).await;
 }

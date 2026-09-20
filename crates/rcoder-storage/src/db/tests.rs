@@ -181,11 +181,12 @@ async fn normalized_schema_roundtrip_and_identity_constraints() {
     .await
     .unwrap();
     owner.execute(|mut db| async move {
+        super::schema::initialize(
+            &mut db,
+            super::schema::Backend::Turso,
+            &[super::schema::Component::Userapp],
+        ).await?;
         let mut tx = db.transaction().await?;
-        let ddl = include_str!("../../schema/userapp-turso-v1.sql").lines().filter(|line| !line.trim_start().starts_with("--")).collect::<Vec<_>>().join("\n");
-        for sql in ddl.split(';') {
-            if !sql.trim().is_empty() { toasty::sql::statement(sql).exec(&mut tx).await?; }
-        }
         models::Application::create().app_id("app").lifecycle_id("life").lifecycle_epoch(1)
             .lifecycle_state("active").metadata_revision(1).created_at_us(1).updated_at_us(1)
             .exec(&mut tx).await?;

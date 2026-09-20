@@ -27,6 +27,8 @@
 
 use file_server_proxy::{FileServerProxyConfig, RoutePolicy};
 use shared_types::{AGENT_FILE_SERVER_PORT, NUWAX_FILE_SERVER_INTERNAL_PORT};
+mod native_control;
+mod native_supervisor;
 
 /// CLI 参数覆盖项（未指定的项为 None，交给 env/默认兜底）。
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -187,7 +189,42 @@ fn init_tracing_plain() {
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--native-command-guardian"))
+    {
+        let Some(root) = std::env::args_os().nth(2) else {
+            fail("guardian root missing".into());
+        };
+        match process_utils::guardian::run(std::path::Path::new(&root)).await {
+            Ok(code) => std::process::exit(code),
+            Err(error) => fail(format!("guardian failed: {error:#}")),
+        }
+    }
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let expected_instance = if let Some(index) = args.iter().position(|arg| arg == "--instance-id")
+    {
+        args.remove(index);
+        if index >= args.len() {
+            fail("missing --instance-id value".into());
+        }
+        Some(args.remove(index))
+    } else {
+        None
+    };
+    let native = args.iter().any(|a| a == "--native-owner");
+    args.retain(|a| a != "--native-owner");
+    let action = args
+        .first()
+        .filter(|a| {
+            matches!(
+                a.as_str(),
+                "start" | "stop" | "status" | "restart" | "recover"
+            )
+        })
+        .cloned();
+    if action.is_some() {
+        args.remove(0);
+    }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("file-server-proxy {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -196,18 +233,68 @@ async fn main() {
         eprintln!("{}", usage());
         return;
     }
-    let settings = match parse_cli_args(&args).and_then(resolve_settings) {
+    let mut settings = match parse_cli_args(&args).and_then(resolve_settings) {
         Ok(settings) => settings,
         Err(e) => fail(e),
+    };
+    let host = std::env::var("FILE_SERVER_PROXY_HOST")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "0.0.0.0".into());
+    let owner_root = if native || action.is_some() {
+        Some(native_control::directory(&host, settings.listen_port).unwrap_or_else(|e| fail(e)))
+    } else {
+        None
+    };
+    if let (Some(root), Some(action)) = (&owner_root, action.as_deref())
+        && matches!(action, "stop" | "status" | "restart" | "recover")
+    {
+        match native_control::control(
+            root,
+            if action == "restart" { "stop" } else { action },
+            expected_instance.as_deref(),
+        )
+        .await
+        {
+            Ok(result) => {
+                if action != "restart" {
+                    println!("{result}");
+                    return;
+                }
+            }
+            Err(error) => fail(error),
+        }
+    }
+    if let Some(root) = &owner_root
+        && std::env::var_os("FILE_SERVER_PROXY_OWNER_SUPERVISOR").is_none()
+    {
+        match native_supervisor::run(root, &args).await {
+            Ok(code) => std::process::exit(code),
+            Err(error) => fail(error),
+        }
+    }
+    let mut owner = if let Some(root) = owner_root {
+        Some(
+            native_control::Owner::acquire(root)
+                .await
+                .unwrap_or_else(|e| fail(e)),
+        )
+    } else {
+        None
     };
 
     // 内嵌直连装配（feature 编译 + 显式启用）。日志与 file-server 的 file layer
     // 必须一次组装（全局 subscriber 只能 init 一次）。
     #[cfg(feature = "embed-file-server")]
     let _log_guard = if settings.embed {
-        match prepare_embed() {
+        match prepare_embed(owner.as_ref().map(native_control::Owner::work_root)) {
             Ok(guard) => guard,
-            Err(e) => fail(e),
+            Err(e) => {
+                if let Some(owner) = &mut owner {
+                    let _cleanup = owner.stop().await;
+                }
+                fail(e);
+            }
         }
     } else {
         init_tracing_plain();
@@ -227,6 +314,36 @@ async fn main() {
                  使用纯转发形态"
             );
             std::process::exit(2);
+        }
+    }
+
+    #[cfg(feature = "embed-file-server")]
+    if let (Some(owner), Some((_, _, handle))) = (&mut owner, &_log_guard) {
+        owner.set_embedded(handle.clone());
+    }
+    // Register signal observation before any managed child is launched.
+    let mut signal_task = tokio::spawn(shutdown_signal());
+    tokio::task::yield_now().await;
+    if let Some(entry) = std::env::var_os("FILE_SERVER_PROXY_TS_ENTRY") {
+        let node = std::env::var_os("FILE_SERVER_PROXY_TS_NODE")
+            .unwrap_or_else(|| fail("managed TS requires FILE_SERVER_PROXY_TS_NODE".into()));
+        let native_owner = owner
+            .as_mut()
+            .unwrap_or_else(|| fail("managed TS requires native owner mode".into()));
+        let launch = tokio::select! {
+            result = native_owner.start_ts(std::path::Path::new(&node), std::path::Path::new(&entry)) => result,
+            signal = &mut signal_task => {
+                Err(format!("managed TS startup interrupted: {signal:?}"))
+            }
+        };
+        match launch {
+            Ok(port) => settings.ts_upstream_port = port,
+            Err(error) => {
+                if let Err(cleanup) = native_owner.stop().await {
+                    fail(format!("{error}; {cleanup}"));
+                }
+                fail(error);
+            }
         }
     }
 
@@ -261,6 +378,12 @@ async fn main() {
     });
     match file_server_proxy::try_start().await {
         Ok(address) => {
+            if let Some(owner) = &mut owner
+                && let Err(error) = owner.started(address.clone())
+            {
+                let _cleanup = owner.stop().await;
+                fail(error);
+            }
             #[cfg(feature = "embed-file-server")]
             let embed_note = if settings.embed {
                 "直连内嵌"
@@ -277,11 +400,34 @@ async fn main() {
                 settings.policy.as_str()
             );
         }
-        Err(e) => fail(e),
+        Err(e) => {
+            if let Some(owner) = &mut owner
+                && let Err(cleanup) = owner.stop().await
+            {
+                fail(format!("{e}; owner cleanup unconfirmed: {cleanup}"));
+            }
+            fail(e);
+        }
     }
     // Always close the listener and drain connections, even if installing the
     // host signal handler failed. Failure cannot be reported as successful stop.
-    let signal_result = shutdown_signal().await;
+    let signal_result = if let Some(owner) = owner {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut task = tokio::spawn(owner.run(shutdown.clone()));
+        tokio::select! {
+            result = &mut task => result.map_err(|e| format!("native owner task failed: {e}")).and_then(std::convert::identity),
+            signal = &mut signal_task => {
+                shutdown.cancel();
+                let drained = task.await.map_err(|e| format!("native owner task failed: {e}")).and_then(std::convert::identity);
+                signal.map_err(|e| format!("signal task failed: {e}")).and_then(std::convert::identity).and(drained)
+            }
+        }
+    } else {
+        signal_task
+            .await
+            .map_err(|e| format!("signal task failed: {e}"))
+            .and_then(std::convert::identity)
+    };
     let stop_result = file_server_proxy::stop().await;
     if let Err(error) = stop_result {
         fail(format!("proxy shutdown could not be confirmed: {error}"));
@@ -323,10 +469,13 @@ async fn shutdown_signal() -> Result<(), String> {
 /// 返回的 (file-server guard, proxy guard) 必须持有到 main 结束（文件日志完整
 /// 刷盘——guard 仅 Drop 语义，tuple 解构成 `_` 绑定持有，与 file-server bin 同款）。
 #[cfg(feature = "embed-file-server")]
-fn prepare_embed() -> Result<
+fn prepare_embed(
+    journal_root: Option<std::path::PathBuf>,
+) -> Result<
     Option<(
         file_server::logging::WorkerGuard,
         file_server::logging::WorkerGuard,
+        file_server_userapp::EmbeddedRuntimeHandle,
     )>,
     String,
 > {
@@ -390,11 +539,11 @@ fn prepare_embed() -> Result<
     // 独立全量集（含 /、/health、swagger 与完整中间件栈 + /api/v1/userapp 子树——
     // userApp 域拆至 file-server-userapp crate，组装经其 full_router）——直连行为
     // 与原独立 file-server bin 完全同构
-    let router = file_server_userapp::full_router(&server)
+    let (router, embedded) = file_server_userapp::full_router_with_lifecycle(&server, journal_root)
         .map_err(|e| format!("build embedded file-server router: {e:#}"))?;
     file_server_proxy::set_in_process_router(router);
     tracing::info!("内嵌 file-server 直连已装配（进程内 router，无内部监听端口）");
-    Ok(Some((fs_guard, proxy_guard)))
+    Ok(Some((fs_guard, proxy_guard, embedded)))
 }
 
 #[cfg(test)]

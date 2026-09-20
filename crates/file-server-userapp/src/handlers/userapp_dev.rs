@@ -78,14 +78,18 @@ pub(crate) async fn execute_command(
         .read_owned()
         .await;
     let cwd = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
-    let r = tokio::spawn(async move {
-        let _activity = activity;
-        execute_command_core(&state.fs, cwd, &body.command).await
-    })
-    .await
-    .map_err(|error| {
-        AppError::system(format!("Workspace command worker interrupted: {error}"))
-    })??;
+    let workers = state.build_tasks.workers.clone();
+    let r = workers
+        .spawn(async move {
+            let _activity = activity;
+            execute_command_core(&state.fs, cwd, &body.command).await
+        })
+        .map_err(AppError::system)?
+        .await
+        .map_err(|error| {
+            AppError::system(format!("Workspace command worker interrupted: {error}"))
+        })?
+        .map_err(AppError::system)??;
     // 外层恒 success=true，命令结果由 exit_code 表达（语义同 computer 域 TS 契约）
     Ok(Json(json!({
         "success": true,

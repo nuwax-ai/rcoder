@@ -1,76 +1,99 @@
 "use strict";
 
-const { existsSync, mkdirSync, chmodSync, unlinkSync } = require("node:fs");
-const { join } = require("node:path");
-const {
-  NAME,
-  VERSION,
-  cacheDir,
-  cachedBinaryPath,
-  downloadUrl,
-  getArchiveExt,
-} = require("./resolve");
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { createHash } = require("node:crypto");
+const { NAME, VERSION, cacheDir, getTargetTriple, hostTarget, OSS_CDN_BASE } = require("./resolve");
 const { downloadArchive, extractArchive } = require("./fetch");
+const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const receiptPath = (binary) => `${binary}.receipt.json`;
+const binaryName = (target) => target.includes("windows") ? `${NAME}.exe` : NAME;
 
-// 用户可用环境变量指向自带/自定义二进制，跳过下载（调试或离线分发；
-// 本地开发冒烟也用它指向 cargo build 产物）。
-function overrideBinary() {
-  return process.env.FILE_SERVER_PROXY_BINARY || "";
+function validateBinary(binary, version, target) {
+  const receipt = JSON.parse(fs.readFileSync(receiptPath(binary), "utf8"));
+  if (receipt.schema !== 1 || receipt.name !== NAME || receipt.version !== version || receipt.target !== target) {
+    throw new Error("incompatible_artifact: binary receipt does not match requested version/target");
+  }
+  if (!/^[a-f0-9]{64}$/.test(receipt.archive_sha256) ||
+      !/^[a-f0-9]{64}$/.test(receipt.binary_sha256) ||
+      digest(fs.readFileSync(binary)) !== receipt.binary_sha256) {
+    throw new Error("invalid_artifact: binary checksum mismatch");
+  }
+  return binary;
 }
 
-// 同步：若二进制已就绪（环境变量覆盖或已缓存）返回路径，否则返回 null。不触网。
-function resolveBinaryPath() {
-  const override = overrideBinary();
-  if (override) return override;
-  const cached = cachedBinaryPath();
-  return existsSync(cached) ? cached : null;
-}
-
-// 异步：确保二进制存在（缺失则从 OSS 下载解压），返回其路径。
-async function ensureBinary() {
-  const override = overrideBinary();
-  if (override) return override;
-
-  const cached = cachedBinaryPath();
-  if (existsSync(cached)) return cached;
-
-  const url = downloadUrl();
-  const dir = cacheDir();
-  mkdirSync(dir, { recursive: true });
-
-  const ext = getArchiveExt();
-  const archivePath = join(dir, `${NAME}.${ext}`);
-
-  process.stderr.write(
-    `Downloading file-server-proxy ${VERSION} for ${process.platform}/${process.arch} …\n  ${url}\n`,
-  );
-  await downloadArchive(url, archivePath);
-
-  process.stderr.write("  Extracting …\n");
-  extractArchive(archivePath, dir, ext);
-
+// Startup is strictly read-only/offline. A user-selected local build is probed,
+// but is not claimed to be a checksum-verified official distribution.
+function resolveBinaryPath(options = {}) {
+  const version = options.version || VERSION;
+  const target = getTargetTriple();
+  if (target !== hostTarget()) throw new Error("incompatible_artifact: target override differs from host");
+  const override = process.env.FILE_SERVER_PROXY_BINARY;
+  if (override) {
+    const probe = spawnSync(override, ["--version"], { encoding: "utf8", timeout: 10000, windowsHide: true });
+    if (probe.error || probe.status !== 0 || !/^file-server-proxy \d+\.\d+\.\d+(?:[-+][\w.-]+)?\s*$/.test(probe.stdout || "")) {
+      throw new Error("incompatible_artifact: explicit development binary failed its native version probe");
+    }
+    return override;
+  }
+  const binary = path.join(options.directory || cacheDir(version, target), binaryName(target));
   try {
-    unlinkSync(archivePath);
-  } catch {
-    /* best-effort */
+    return validateBinary(binary, version, target);
+  } catch (error) {
+    throw new Error(`file-server-proxy package unavailable or invalid; run the explicit prepare step before startup: ${error.message}`, { cause: error });
   }
-
-  const out = cachedBinaryPath();
-  if (!existsSync(out)) {
-    throw new Error(
-      `file-server-proxy extraction finished but binary not found at ${out}`,
-    );
-  }
-  if (process.platform !== "win32") {
-    chmodSync(out, 0o755);
-  }
-  return out;
 }
+async function ensureBinary(options = {}) { return resolveBinaryPath(options); }
 
-module.exports = {
-  ensureBinary,
-  resolveBinaryPath,
-  getTargetTriple: require("./resolve").getTargetTriple,
-  downloadUrl: require("./resolve").downloadUrl,
-  VERSION,
-};
+// Installation/packaging only. Never overwrite an existing version directory:
+// concurrent prepares publish one complete directory; losers validate the winner.
+async function prepareBinary(options = {}) {
+  const version = options.version || VERSION;
+  const target = getTargetTriple();
+  const dir = options.directory || cacheDir(version, target);
+  const binary = path.join(dir, binaryName(target));
+  if (fs.existsSync(dir)) return validateBinary(binary, version, target);
+  // One network deadline covers both metadata and archive/body reads.
+  const signal = AbortSignal.timeout(options.timeoutMs ?? 300000);
+  const response = await fetch(`${OSS_CDN_BASE}/manifest/${encodeURIComponent(version)}.json`, { signal });
+  if (!response.ok) throw new Error(`manifest download failed: HTTP ${response.status}`);
+  const manifest = await response.json();
+  const assets = Object.values(manifest.targets || {}).filter((entry) => entry.rustTarget === target);
+  if (manifest.name !== NAME || manifest.version !== version || assets.length !== 1) {
+    throw new Error("invalid_manifest: name/version/target mismatch");
+  }
+  const asset = assets[0];
+  const ext = target.includes("windows") ? "zip" : "tar.gz";
+  const expectedArchive = `${NAME}-${version}-${target}.${ext}`;
+  const expectedUrl = `${OSS_CDN_BASE}/v${version}/${expectedArchive}`;
+  if (asset.archive !== expectedArchive || asset.url !== expectedUrl ||
+      !/^[a-f0-9]{64}$/.test(asset.sha256) || !Number.isSafeInteger(asset.size) || asset.size <= 0) {
+    throw new Error("invalid_manifest: archive metadata mismatch");
+  }
+  fs.mkdirSync(path.dirname(dir), { recursive: true });
+  const staging = fs.mkdtempSync(path.join(path.dirname(dir), ".prepare-"));
+  try {
+    const archive = path.join(staging, `download.${ext}`);
+    await downloadArchive(asset.url, archive, signal);
+    const bytes = fs.readFileSync(archive);
+    if (bytes.length !== asset.size || digest(bytes) !== asset.sha256) throw new Error("invalid_artifact: archive checksum mismatch");
+    const unpacked = path.join(staging, "unpacked");
+    extractArchive(archive, unpacked, ext);
+    const prepared = path.join(unpacked, binaryName(target));
+    if (!fs.statSync(prepared).isFile()) throw new Error("invalid_artifact: missing executable");
+    const receipt = { schema: 1, name: NAME, version, target,
+      archive_sha256: asset.sha256, binary_sha256: digest(fs.readFileSync(prepared)) };
+    fs.writeFileSync(receiptPath(prepared), JSON.stringify(receipt));
+    if (!target.includes("windows")) fs.chmodSync(prepared, 0o755);
+    try { fs.renameSync(unpacked, dir); }
+    catch (error) {
+      if (!fs.existsSync(dir)) throw error;
+      // A published destination is immutable, including when it is corrupt.
+      validateBinary(binary, version, target);
+    }
+    return validateBinary(binary, version, target);
+  } finally { fs.rmSync(staging, { recursive: true, force: true }); }
+}
+module.exports = { ensureBinary, resolveBinaryPath, prepareBinary,
+  getTargetTriple, downloadUrl: require("./resolve").downloadUrl, VERSION };

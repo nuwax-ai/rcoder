@@ -33,6 +33,123 @@ impl shared_types::PgCommandRunner for BoundManagementRunner<'_> {
 }
 
 impl AppService {
+    /// Freeze the source owner before any physical replacement. A seal is itself
+    /// a durable mutation: an unknown reply must retain this operation's fence.
+    pub(crate) async fn seal_runtime_generation_source(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        authorization: &shared_types::RuntimeGenerationHandoff,
+        operation: &mut crate::service::OwnedOperation,
+        checkpoint: &mut serde_json::Value,
+        guard: &crate::service::AppOperationGuard,
+    ) -> AppResult<shared_types::RuntimeGenerationSourceSeal> {
+        use shared_types::PgCommandRunner as _;
+        let deadline_ms = self
+            .metadata
+            .store
+            .operation_deadline(&context.app_id, &context.operation_id)
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::InvalidState(
+                    "Source sealing requires the original operation deadline".into(),
+                )
+            })?;
+        let remaining = deadline_ms
+            .saturating_sub(chrono::Utc::now().timestamp_millis())
+            .max(0) as u64;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(remaining);
+        let workload = tokio::time::timeout_at(
+            deadline,
+            self.runtime.capture_app_mutation_target(context, None),
+        )
+        .await
+        .map_err(|_| {
+            AppOperationError::Conflict("Source workload capture deadline exceeded".into())
+        })?
+        .map_err(|error| {
+            crate::utils::map_runtime_error("Capture source workload identity", error)
+        })?;
+        if workload.resource.uid != authorization.previous_resource_uid
+            || workload.resource.name != authorization.previous_resource_name
+        {
+            return Err(AppOperationError::Conflict(
+                "Source workload identity changed before sealing".into(),
+            ));
+        }
+        let target = tokio::time::timeout_at(
+            deadline,
+            self.runtime
+                .capture_app_configuration_target(context, &authorization.previous_generation),
+        )
+        .await
+        .map_err(|_| {
+            AppOperationError::Conflict(
+                "Source owner capture deadline exceeded before replacement".into(),
+            )
+        })?
+        .map_err(|error| {
+            crate::utils::map_runtime_error(
+                "Capture source management identity before replacement",
+                error,
+            )
+        })?;
+        if target.deployment_generation != authorization.previous_generation {
+            return Err(AppOperationError::Conflict(
+                "Source physical identity changed before sealing".into(),
+            ));
+        }
+        // K8s workload UID and management Pod UID are different identities.
+        // Persist both before the bound exec; retries cannot silently select a new Pod.
+        checkpoint["source_management_target"] =
+            serde_json::to_value(&target).map_err(|error| {
+                AppOperationError::Backend(format!("Encode source management identity: {error}"))
+            })?;
+        operation
+            .checkpoint("source_seal_requested", checkpoint.clone())
+            .await?;
+        let body = serde_json::to_string(authorization).map_err(|_| {
+            AppOperationError::InvalidState("Invalid source handoff authorization".into())
+        })?;
+        let command = format!(
+            "curl --silent --show-error --connect-timeout 3 --max-time 5 --noproxy '*' -H \"x-deploy-token: $APP_CLI_DEPLOY_TOKEN\" -H 'content-type: application/json' --data-binary {} http://127.0.0.1:3010/v1/runtime/configuration/source-seal",
+            shared_types::pg_utils::pg_shell_quote(&body)
+        );
+        let runner = BoundManagementRunner {
+            service: self,
+            context,
+            target: &target,
+        };
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AppOperationError::Conflict("Source owner is still preparing; physical runtime and credentials were not changed".into()));
+            }
+            guard.mark_mutating()?;
+            let result = tokio::time::timeout_at(deadline, runner.run(&command)).await;
+            let outcome = match result {
+                Ok(Ok(reply)) if reply.exit_code == 0 => {
+                    source_seal_reply(&reply.stdout, authorization)?
+                }
+                _ => {
+                    return Err(AppOperationError::InvalidState(
+                        "Source seal result is unknown; original operation remains protected"
+                            .into(),
+                    ));
+                }
+            };
+            match outcome {
+                Some(seal) => return Ok(seal),
+                None => {
+                    // Exact no-admission response. No seal or runtime mutation occurred.
+                    guard.mark_rejected_before_mutation();
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + std::time::Duration::from_millis(200))
+                            .min(deadline),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
     /// Wake/hot deployment may verify only the previously applied version. This
     /// path never changes PG passwords or opens a different generation's gate.
     pub(crate) async fn observe_applied_runtime_configuration(
@@ -678,10 +795,235 @@ fn configuration_commit_unknown(error: shared_types::UserAppStoreError) -> AppOp
     }
 }
 
+fn source_seal_reply(
+    text: &str,
+    authorization: &shared_types::RuntimeGenerationHandoff,
+) -> AppResult<Option<shared_types::RuntimeGenerationSourceSeal>> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
+        AppOperationError::InvalidState(
+            "Malformed source seal response; original operation remains protected".into(),
+        )
+    })?;
+    if value.get("success").and_then(serde_json::Value::as_bool) == Some(false)
+        && value.get("code").and_then(serde_json::Value::as_str) == Some("HANDOFF_SOURCE_BUSY")
+    {
+        return Ok(None);
+    }
+    if value.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(AppOperationError::InvalidState(
+            "Source generation cannot be sealed; original operation remains protected".into(),
+        ));
+    }
+    let seal: shared_types::RuntimeGenerationSourceSeal =
+        serde_json::from_value(value.get("data").cloned().unwrap_or_default()).map_err(|_| {
+            AppOperationError::InvalidState(
+                "Invalid source seal receipt; original operation remains protected".into(),
+            )
+        })?;
+    if seal.authorization != *authorization
+        || seal.artifact_release_id.trim().is_empty()
+        || seal.source_journal_sha256.len() != 64
+        || !seal
+            .source_journal_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(AppOperationError::InvalidState(
+            "Source seal identity or evidence mismatch; original operation remains protected"
+                .into(),
+        ));
+    }
+    Ok(Some(seal))
+}
+
 #[cfg(test)]
 mod handoff_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn source_seal_precedes_replacement_and_unknown_ack_preserves_fence() {
+        use std::sync::atomic::Ordering;
+        for fault in [
+            "busy-then-sealed",
+            "busy-deadline",
+            "disconnect",
+            "wrong-receipt",
+            "preparation-failed",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = Arc::new(crate::test_support::MockRuntime::default());
+            let service = crate::test_support::test_service(root.path(), runtime.clone()).await;
+            let app_id = "sourcesealtest";
+            let identity = service
+                .metadata
+                .store
+                .ensure_identity(app_id)
+                .await
+                .unwrap();
+            // Deliberately different workload and Pod identities, as in K8s.
+            *runtime.mutation_uid_override.lock().unwrap() = Some("workloaduid".into());
+            let current = container_runtime_api::DeploymentStatus {
+                app_id: app_id.into(),
+                replicas: 1,
+                ready_replicas: 1,
+                phase: "Running".into(),
+                ..Default::default()
+            };
+            runtime.deployments.insert(app_id.into(), current.clone());
+            runtime.specs.insert(
+                app_id.into(),
+                container_runtime_api::ContainerSpecSnapshot {
+                    env: Some(
+                        [(
+                            shared_types::APP_DEPLOY_GENERATION_ID.into(),
+                            "oldgeneration".into(),
+                        )]
+                        .into(),
+                    ),
+                    ..Default::default()
+                },
+            );
+            let guard = service
+                .try_acquire_process_release_lock(app_id)
+                .await
+                .unwrap();
+            let mut operation = crate::service::OwnedOperation::admit(
+                service.metadata.store.clone(),
+                shared_types::UserAppAdmission {
+                    app_id: app_id.into(),
+                    lifecycle_id: Some(identity.lifecycle_id.clone()),
+                    operation_id: "sealoperation".into(),
+                    request_id: None,
+                    request_fingerprint: "a".repeat(64),
+                    kind: shared_types::UserAppOperationKind::StartDeployment,
+                    command: None,
+                    metadata: None,
+                    runtime_policy_on_success: None,
+                },
+            )
+            .await
+            .unwrap();
+            let context = operation.execution_context();
+            service
+                .metadata
+                .store
+                .bind_operation_deadline(
+                    app_id,
+                    &context.operation_id,
+                    &context.lifecycle_id,
+                    chrono::Utc::now().timestamp_millis()
+                        + if fault == "busy-deadline" { 150 } else { 3_000 },
+                )
+                .await
+                .unwrap();
+            let mut authorization = shared_types::RuntimeGenerationHandoff {
+                protocol_version: 1,
+                app_id: app_id.into(),
+                lifecycle_id: identity.lifecycle_id,
+                previous_generation: "oldgeneration".into(),
+                previous_resource_uid: "workloaduid".into(),
+                previous_resource_name: app_id.into(),
+                activation: shared_types::RuntimeConfigurationActivation {
+                    operation_id: context.operation_id.clone(),
+                    deployment_generation: context.operation_id.clone(),
+                    config_version: 1,
+                },
+            };
+            if fault == "wrong-receipt" {
+                authorization.activation.operation_id = "otheroperation".into();
+            }
+            let reply = |stdout: String, exit_code| container_runtime_api::ExecResult {
+                stdout,
+                exit_code,
+                stderr: String::new(),
+            };
+            if fault.starts_with("busy") {
+                runtime
+                    .configuration_replies
+                    .lock()
+                    .unwrap()
+                    .push_back(reply(
+                        serde_json::json!({"success":false,"code":"HANDOFF_SOURCE_BUSY"})
+                            .to_string(),
+                        0,
+                    ));
+            }
+            if fault != "busy-deadline" {
+                runtime.configuration_replies.lock().unwrap().push_back(reply(serde_json::json!({"success":true,"data":shared_types::RuntimeGenerationSourceSeal {
+                    authorization, artifact_release_id: "latesthotrelease".into(), source_journal_sha256: "b".repeat(64), desired_revision: 4,
+                }}).to_string(), if fault == "disconnect" { 7 } else { 0 }));
+            }
+            runtime
+                .patch_preparation_fails
+                .store(fault == "preparation-failed", Ordering::SeqCst);
+            let params = container_runtime_api::ContainerCreateParams::builder()
+                .project_id(app_id)
+                .service_type(shared_types::ServiceType::Userapp)
+                .env(
+                    [
+                        (
+                            shared_types::APP_RUNTIME_CONFIGURATION_VERSION.into(),
+                            "1".into(),
+                        ),
+                        (
+                            shared_types::APP_DEPLOY_GENERATION_ID.into(),
+                            context.operation_id.clone(),
+                        ),
+                        (
+                            shared_types::APP_DEPLOY_OPERATION_ID.into(),
+                            context.operation_id.clone(),
+                        ),
+                    ]
+                    .into(),
+                )
+                .build();
+            let result = service
+                .execute_update(app_id, params, current, &mut operation, &guard)
+                .await;
+            let commands = runtime.configuration_commands.lock().unwrap().clone();
+            assert!(!commands.is_empty(), "must reach source owner: {fault}");
+            assert!(commands.iter().all(|command| {
+                command
+                    .last()
+                    .unwrap()
+                    .contains("/configuration/source-seal")
+            }));
+            let record = service
+                .metadata
+                .store
+                .get_operation(app_id, &context.operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                record.checkpoint["source_management_target"]["physical_uid"],
+                format!("test-{}", context.lifecycle_id)
+            );
+            if fault == "busy-then-sealed" {
+                result.unwrap();
+                assert_eq!(commands.len(), 2);
+                assert_eq!(
+                    commands[0], commands[1],
+                    "retry must preserve original request"
+                );
+                assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    record.checkpoint["source_seal"]["artifact_release_id"],
+                    "latesthotrelease"
+                );
+            } else {
+                assert!(result.is_err(), "{fault}");
+                assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0, "{fault}");
+                assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0, "{fault}");
+                assert_eq!(
+                    guard.has_unfinished_mutation(),
+                    fault != "busy-deadline",
+                    "{fault}"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn handoff_identity_failure_or_disconnect_never_reaches_pg() {

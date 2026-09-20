@@ -676,6 +676,7 @@ struct AdmissionState {
     /// 恢复保护中（上次结果未知）。V03：由**结果未知**决定，不依赖 active
     /// 恰好匹配——任何操作的 RecoveryRequired 终态都会挂起保护。
     recovery_protection: bool,
+    source_sealed: bool,
 }
 
 impl RuntimeKernel {
@@ -692,6 +693,30 @@ impl RuntimeKernel {
             cancelled: std::sync::Mutex::new(std::collections::HashSet::new()),
             event_write: std::sync::Mutex::new(()),
         }
+    }
+
+    /// Serialize durable source reservation with all runtime admissions. The
+    /// caller also holds the legacy deployment admission lock.
+    pub(crate) fn try_seal_source<T>(
+        &self,
+        persist: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let Ok(mut guard) = self.admission.try_lock() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            !guard.recovery_protection,
+            "runtime requires recovery before handoff"
+        );
+        if guard.active_operation_id.is_some()
+            || guard.pending_stop.is_some()
+            || guard.pending_restart.is_some()
+        {
+            return Ok(None);
+        }
+        let result = persist()?;
+        guard.source_sealed = true;
+        Ok(Some(result))
     }
 
     pub(crate) fn identity(&self) -> &RuntimeIdentityView {
@@ -822,6 +847,13 @@ impl RuntimeKernel {
                 });
             }
             return Ok(AdmissionOutcome::Replayed(existing.view));
+        }
+        if guard.source_sealed {
+            return Err(AdmissionRejection {
+                code: "HANDOFF_SOURCE_SEALED",
+                message: "runtime generation is reserved for replacement".into(),
+                active_operation_id: None,
+            });
         }
         if guard.recovery_protection {
             return Err(AdmissionRejection {

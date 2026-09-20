@@ -35,6 +35,10 @@ PG_EXTRA_TARGETS = {
         'userapp_lifecycle::common::transaction_fault_tests::pg_each_admission_and_recreate_write_fault_rolls_back',
     'PG lifecycle-bound activity':
         'userapp_lifecycle::common::activity_tests::pg_activity_is_monotonic_and_lifecycle_bound',
+    'PG Preview independent owners serialize first creation and port allocation':
+        'preview_lifecycle::pg_tests::independent_pg_preview_owners_serialize_creation_and_port_allocation',
+    'PG schema rejects cross-identity input lease and slot references':
+        'db::identity_constraint_tests::pg_rejects_cross_identity_input_lease_and_slot_references',
     'PG Preview contract': 'preview_lifecycle::pg_tests::pg_preview_store_satisfies_contract',
 }
 
@@ -62,6 +66,7 @@ TURSO_CASES = (
     'rejected_admission_does_not_leave_new_identity',
     'joined_request_identity_remains_idempotent_after_completion',
     'metadata_cas_preserves_unmentioned_fields_and_noop_revision',
+    'turso_old_lease_cleanup_and_retry_preserve_recreated_lifecycle',
     'turso_control_snapshot_contract',
     'turso_deletion_success_requires_evidence',
     'another_executor_cannot_advance_a_running_operation',
@@ -105,6 +110,9 @@ TURSO_EXTRA_CASES['turso_cancelled_admission_commits_complete_original_request']
 )
 TURSO_EXTRA_CASES['turso_each_admission_and_recreate_write_fault_rolls_back'] = (
     'userapp_lifecycle::common::transaction_fault_tests::turso_each_admission_and_recreate_write_fault_rolls_back'
+)
+TURSO_EXTRA_CASES['turso_rejects_cross_identity_input_lease_and_slot_references'] = (
+    'db::identity_constraint_tests::turso_rejects_cross_identity_input_lease_and_slot_references'
 )
 TURSO_TARGETS = {case: PREFIX + case for case in TURSO_CASES} | TURSO_EXTRA_CASES
 

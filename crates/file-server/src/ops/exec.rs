@@ -35,7 +35,7 @@ pub async fn execute_command_core(
     cmd.env("NODE_ENV", "development");
     cmd.env_remove("CI");
     cmd.env_remove("NPM_CONFIG_PRODUCTION");
-    capture_command(&mut cmd, "execute-command", timeout_secs).await
+    capture_command(cmd, "execute-command", timeout_secs).await
 }
 
 /// execute-command 的 workspace 无关实现 (computer 域 TS 响应拼装)。

@@ -87,15 +87,41 @@ pub(super) struct ProxyUpstreamsData {
     tag = "Runtime Proxy"
 )]
 pub(super) async fn validate(State(state): State<AppState>) -> Response {
+    // The existing compiler publishes the validated config atomically, so this
+    // endpoint is also a writer and must participate in the handoff barrier.
+    let mut writer = match state.server.begin_auxiliary_write() {
+        Ok(writer) => writer,
+        Err(error) => return proxy_error(error),
+    };
+    let target = effective_path(&state);
+    let previous_bytes = match read_effective_snapshot(&target).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            // No compiler or write has run yet.
+            writer.confirm();
+            return proxy_error(error);
+        }
+    };
     match compile(&state).await {
-        Ok(outcome) => envelope::ok(
-            StatusCode::OK,
-            ProxyValidateData {
-                valid: true,
-                effective_config_path: outcome.config_path.to_string_lossy().to_string(),
-            },
-        ),
-        Err(error) => proxy_error(error),
+        Ok(outcome) => {
+            writer.confirm();
+            envelope::ok(
+                StatusCode::OK,
+                ProxyValidateData {
+                    valid: true,
+                    effective_config_path: outcome.config_path.to_string_lossy().to_string(),
+                },
+            )
+        }
+        Err(error) => {
+            if read_effective_snapshot(&target)
+                .await
+                .is_ok_and(|current| current == previous_bytes)
+            {
+                writer.confirm();
+            }
+            proxy_error(error)
+        }
     }
 }
 
@@ -122,13 +148,33 @@ pub(super) async fn reload(State(state): State<AppState>) -> Response {
         ));
     };
 
+    let mut writer = match state.server.begin_auxiliary_write() {
+        Ok(writer) => writer,
+        Err(error) => return proxy_error(error),
+    };
     let target = effective_path(&state);
+    let previous_bytes = match read_effective_snapshot(&target).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            // No compiler or write has run yet.
+            writer.confirm();
+            return proxy_error(error);
+        }
+    };
     // 先读旧生效配置 hash：超时回切后用于 best-effort 二次确认。
     let previous_hash = read_effective_hash(&target).await;
 
     let outcome = match compile(&state).await {
         Ok(outcome) => outcome,
-        Err(error) => return proxy_error(error),
+        Err(error) => {
+            if read_effective_snapshot(&target)
+                .await
+                .is_ok_and(|current| current == previous_bytes)
+            {
+                writer.confirm();
+            }
+            return proxy_error(error);
+        }
     };
     match admin_probe::wait_for_config_hash(
         endpoint,
@@ -137,16 +183,19 @@ pub(super) async fn reload(State(state): State<AppState>) -> Response {
     )
     .await
     {
-        Ok(()) => envelope::ok(
-            StatusCode::OK,
-            ProxyReloadData {
-                reloaded: true,
-                verified: true,
-                config_hash: outcome.expected_hash,
-                release_id: state.server.boot_id(),
-                effective_config_path: outcome.config_path.to_string_lossy().to_string(),
-            },
-        ),
+        Ok(()) => {
+            writer.confirm();
+            envelope::ok(
+                StatusCode::OK,
+                ProxyReloadData {
+                    reloaded: true,
+                    verified: true,
+                    config_hash: outcome.expected_hash,
+                    release_id: state.server.boot_id(),
+                    effective_config_path: outcome.config_path.to_string_lossy().to_string(),
+                },
+            )
+        }
         Err(error) => {
             // 超时/不匹配 → 回切 pingap.toml.prev。语义说明：basic/storages/server addr
             // 类变更在 --autoreload 下本就热更不生效 → hash 永不匹配 → 超时+回切是
@@ -169,7 +218,10 @@ pub(super) async fn reload(State(state): State<AppState>) -> Response {
                 )
                 .await
                 {
-                    Ok(()) => info!("✅ rollback confirmed: previous config_hash live again"),
+                    Ok(()) => {
+                        writer.confirm();
+                        info!("✅ rollback confirmed: previous config_hash live again");
+                    }
                     Err(verify_error) => {
                         warn!("⚠️  rollback verification failed (non-fatal): {verify_error:#}")
                     }
@@ -281,6 +333,14 @@ async fn compile(state: &AppState) -> anyhow::Result<CompileOutcome> {
         &release,
     )
     .await
+}
+
+async fn read_effective_snapshot(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("read effective proxy configuration before mutation"),
+    }
 }
 
 /// 读当前生效 TOML 并计算其 config_hash（best-effort，失败返 None）。

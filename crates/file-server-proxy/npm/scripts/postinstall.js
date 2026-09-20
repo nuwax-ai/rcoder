@@ -2,9 +2,9 @@
 "use strict";
 
 // postinstall：npm install 时按宿主平台预下载二进制到 node_modules/.cache/...，
-// 便于 electron-builder 随包打包、终端用户离线运行。永不阻断安装——下载失败则留待首次运行再下。
+// 便于 electron-builder 随包打包、终端用户离线运行。下载失败明确失败；运行阶段禁止补下载。
 
-const { ensureBinary } = require("../lib/index");
+const { prepareBinary } = require("../lib/index");
 
 if (
   process.env.FILE_SERVER_PROXY_SKIP_DOWNLOAD === "1" ||
@@ -13,7 +13,7 @@ if (
   process.exit(0);
 }
 
-ensureBinary()
+prepareBinary()
   .then(() => {
     process.stderr.write(
       `✓ file-server-proxy ${require("../package.json").version} ready.\n`,
@@ -21,9 +21,10 @@ ensureBinary()
   })
   .catch((err) => {
     process.stderr.write(
-      `⚠ file-server-proxy pre-download skipped: ${err.message}\n`,
+      `⚠ file-server-proxy prepare failed: ${err.message}\n`,
     );
     process.stderr.write(
-      `  The binary will be downloaded on first use instead.\n`,
+      `  Run the explicit prepare step before packaging or startup.\n`,
     );
+    process.exitCode = 1;
   });

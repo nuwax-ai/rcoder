@@ -8,6 +8,16 @@ description = "Unix 进程信号工具: 带 PID 1 防御的进程组 kill (file-
 [lints]
 workspace = true
 
+[dependencies]
+serde = { workspace = true }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tempfile = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+process-wrap = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 

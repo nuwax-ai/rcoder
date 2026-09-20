@@ -50,6 +50,7 @@ use envelope::ApiJson;
         deploy_status,
         activate_runtime_configuration,
         prepared_runtime_configuration,
+        seal_runtime_configuration_source,
         proxy::validate,
         proxy::reload,
         proxy::status,
@@ -169,6 +170,10 @@ fn api_router(state: AppState) -> Router {
         .route("/v1/proxy/upstreams", get(proxy::upstreams))
         .route("/v1/deploy", post(submit_deploy))
         .route("/v1/deploy/status", get(deploy_status))
+        .route(
+            "/v1/runtime/configuration/source-seal",
+            post(seal_runtime_configuration_source),
+        )
         .route(
             "/v1/runtime/configuration/prepared",
             get(prepared_runtime_configuration),
@@ -394,6 +399,55 @@ fn authorize_deploy(state: &AppState, headers: &axum::http::HeaderMap) -> Result
         Ok(())
     } else {
         Err("deploy token mismatch".to_string())
+    }
+}
+
+#[utoipa::path(
+    post, path = "/v1/runtime/configuration/source-seal",
+    request_body = shared_types::RuntimeGenerationHandoff,
+    responses(
+        (status = 200, description = "Source reserved for this exact replacement", body = envelope::HttpResult<shared_types::RuntimeGenerationSourceSeal>),
+        (status = 202, description = "HANDOFF_SOURCE_BUSY; no reservation was written"),
+        (status = 403, description = "Invalid deployment token"),
+        (status = 409, description = "Source state is protected or mismatched")
+    ), tag = "Runtime Control"
+)]
+async fn seal_runtime_configuration_source(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<shared_types::RuntimeGenerationHandoff>,
+) -> Response {
+    if let Err(message) = authorize_deploy(&state, &headers) {
+        return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
+    }
+    if state.server.initializing() {
+        return envelope::error(
+            StatusCode::ACCEPTED,
+            "HANDOFF_SOURCE_BUSY",
+            "Source initialization is in progress",
+        );
+    }
+    match tokio::task::spawn_blocking(move || {
+        state.server.seal_generation_source(&state.workspace, &body)
+    })
+    .await
+    {
+        Ok(Ok(Some(seal))) => envelope::ok(StatusCode::OK, seal),
+        Ok(Ok(None)) => envelope::error(
+            StatusCode::ACCEPTED,
+            "HANDOFF_SOURCE_BUSY",
+            "Source orchestration is still in progress",
+        ),
+        Ok(Err(error)) => envelope::error(
+            StatusCode::CONFLICT,
+            "HANDOFF_SOURCE_NOT_PREPARED",
+            error.to_string(),
+        ),
+        Err(error) => envelope::error(
+            StatusCode::CONFLICT,
+            "HANDOFF_SOURCE_UNKNOWN",
+            error.to_string(),
+        ),
     }
 }
 

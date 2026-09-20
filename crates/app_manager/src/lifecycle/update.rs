@@ -238,6 +238,7 @@ impl AppService {
             None
         };
         let mut checkpoint = serde_json::json!({"target":target,"storage_target":storage_target,"requested_storage_size":params.storage_size});
+        let mut source_sealed = false;
         // Only captured-configuration replacements without a new artifact may
         // inherit the confirmed volume. Capture the old generation while its
         // physical target is still fenced by this operation's runtime lease.
@@ -290,6 +291,22 @@ impl AppService {
                 AppOperationError::Backend(format!("Encode generation handoff checkpoint: {error}"))
             })?;
             env.insert(shared_types::APP_RUNTIME_GENERATION_HANDOFF.into(), encoded);
+            let seal = self
+                .seal_runtime_generation_source(
+                    &context,
+                    &handoff,
+                    operation,
+                    &mut checkpoint,
+                    _update_lock,
+                )
+                .await?;
+            source_sealed = true;
+            checkpoint["source_seal"] = serde_json::to_value(&seal).map_err(|error| {
+                AppOperationError::Backend(format!("Encode source seal checkpoint: {error}"))
+            })?;
+            operation
+                .checkpoint("source_sealed", checkpoint.clone())
+                .await?;
         }
         operation
             .checkpoint("updating_runtime", checkpoint.clone())
@@ -327,7 +344,9 @@ impl AppService {
                     current: cur,
                     requested,
                 }) => {
-                    _update_lock.mark_completed();
+                    if !source_sealed {
+                        _update_lock.mark_completed();
+                    }
                     return Err(AppOperationError::Validation(format!(
                         "K8s PVC supports expansion only: app {app_id} requested {requested} < current {cur}"
                     )));
@@ -377,7 +396,8 @@ impl AppService {
                 let previous_host = current.pod_ip.clone().unwrap_or_default();
                 self.register_pingora_backends(app_id, &registered_http_ports, &previous_host)
                     .await;
-                if !storage_changed
+                if !source_sealed
+                    && !storage_changed
                     && self.config.access_mode == crate::config::AppAccessMode::Docker
                     && matches!(
                         &e,

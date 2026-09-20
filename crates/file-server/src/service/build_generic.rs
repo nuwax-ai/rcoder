@@ -25,7 +25,7 @@ pub struct GenericBuildRequest<'a> {
     pub log_dir: &'a Path,
     /// 单命令超时秒数。
     pub timeout_secs: u64,
-    /// spawn 后回调 child pid（供外部 cancel kill 进程组）；None 则不回调。
+    /// Spawn PID callback for diagnostics; cancellation uses the scoped owner token.
     pub on_pid: Option<&'a (dyn Fn(u32) + Send + Sync)>,
     /// 每行输出回调（原始行，时间戳前缀之前；供上层实时推送 SSE `log` 事件）；
     /// None 则不回调。与文件写入同源（vite 噪音行同样被过滤）。

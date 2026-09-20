@@ -47,6 +47,7 @@ pub struct ServerState {
     control_token: std::sync::OnceLock<String>,
     admission: std::sync::Mutex<()>,
     accepting: std::sync::atomic::AtomicBool,
+    auxiliary_writers: std::sync::atomic::AtomicUsize,
     shutdown_unconfirmed: std::sync::atomic::AtomicBool,
     // High-water marks retain the previous generation's stop requirements while
     // a replacement release is being prepared/published.
@@ -91,6 +92,28 @@ pub struct ServerState {
     control_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ControlSignal>>,
     /// 当前执行中的运行操作 ID（dispatch 写入，主循环边界收束）。
     current_runtime_operation: RwLock<Option<String>>,
+}
+
+pub(crate) struct AuxiliaryWriter<'a> {
+    state: &'a ServerState,
+    confirmed: bool,
+}
+impl AuxiliaryWriter<'_> {
+    pub(crate) fn confirm(&mut self) {
+        self.confirmed = true;
+    }
+}
+impl Drop for AuxiliaryWriter<'_> {
+    fn drop(&mut self) {
+        if !self.confirmed {
+            self.state
+                .runtime_recovery_hold
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.state
+            .auxiliary_writers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// 运行控制信号（阶段二 dispatch 目标；server_loop 解释执行）。
@@ -252,6 +275,7 @@ impl ServerState {
             current_runtime_operation: RwLock::new(None),
             admission: std::sync::Mutex::new(()),
             accepting: std::sync::atomic::AtomicBool::new(true),
+            auxiliary_writers: std::sync::atomic::AtomicUsize::new(0),
             shutdown_unconfirmed: std::sync::atomic::AtomicBool::new(false),
             shutdown_grace_seconds: std::sync::atomic::AtomicU64::new(30),
             shutdown_group_count: std::sync::atomic::AtomicU64::new(1),
@@ -468,6 +492,142 @@ impl ServerState {
         &self,
     ) -> Option<Arc<crate::configuration_gate::ConfigurationGate>> {
         self.configuration_gate.clone()
+    }
+
+    pub(crate) fn begin_auxiliary_write(&self) -> Result<AuxiliaryWriter<'_>> {
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime admission lock poisoned"))?;
+        anyhow::ensure!(
+            self.accepting.load(std::sync::atomic::Ordering::Acquire)
+                && !self.initializing()
+                && !self.runtime_recovery_hold_active(),
+            "runtime write admission is closed"
+        );
+        anyhow::ensure!(
+            !self.source_generation_sealed()?,
+            "source generation is reserved for replacement"
+        );
+        anyhow::ensure!(
+            self.auxiliary_writers
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0,
+            "another runtime configuration writer is active"
+        );
+        self.auxiliary_writers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(AuxiliaryWriter {
+            state: self,
+            confirmed: false,
+        })
+    }
+
+    pub(crate) fn seal_generation_source(
+        &self,
+        workspace: &std::path::Path,
+        authorization: &shared_types::RuntimeGenerationHandoff,
+    ) -> Result<Option<shared_types::RuntimeGenerationSourceSeal>> {
+        use sha2::{Digest, Sha256};
+        authorization.validate().map_err(anyhow::Error::msg)?;
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source handoff admission lock poisoned"))?;
+        anyhow::ensure!(
+            authorization.previous_generation == self.generation,
+            "source handoff generation mismatch"
+        );
+        anyhow::ensure!(
+            !self.runtime_recovery_hold_active()
+                && !self
+                    .shutdown_unconfirmed
+                    .load(std::sync::atomic::Ordering::Acquire),
+            "source runtime requires recovery"
+        );
+        if self
+            .auxiliary_writers
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+            || !matches!(
+                self.phase(),
+                ServerPhase::Running | ServerPhase::Idle | ServerPhase::Failed(_)
+            )
+        {
+            return Ok(None);
+        }
+        let kernel = self
+            .runtime_kernel()
+            .context("source runtime kernel unavailable")?;
+        kernel.try_seal_source(|| {
+            let guard = self
+                .journal
+                .lock()
+                .map_err(|_| anyhow::anyhow!("source journal lock poisoned"))?;
+            let journal = guard.as_ref().context("source journal unavailable")?;
+            let receipt = journal
+                .receipt
+                .as_ref()
+                .context("source artifact is unconfirmed")?;
+            anyhow::ensure!(
+                matches!(receipt.boundary, Boundary::Active | Boundary::StartupFailed),
+                "source journal has an unconfirmed mutation boundary"
+            );
+            anyhow::ensure!(
+                receipt.generation == self.generation,
+                "source journal generation mismatch"
+            );
+            let active = receipt
+                .active
+                .as_ref()
+                .context("source active artifact missing")?;
+            let request = active
+                .request
+                .as_ref()
+                .context("source execution target missing")?;
+            let target = execution_workspace(workspace, request.execution_target);
+            crate::migration_journal::require_confirmed_migrations(workspace)?;
+            crate::migration_journal::require_confirmed_migrations(&target)?;
+            let release = crate::manifest::read_release_lock(&target)?;
+            anyhow::ensure!(
+                release.release_id == active.artifact_release_id,
+                "source release differs from confirmed artifact"
+            );
+            let (_, desired_revision) = kernel.store().load_desired()?;
+            let seal = shared_types::RuntimeGenerationSourceSeal {
+                authorization: authorization.clone(),
+                artifact_release_id: active.artifact_release_id.clone(),
+                source_journal_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(receipt)?)
+                ),
+                desired_revision,
+            };
+            if let Some(previous) = journal.source_seal()? {
+                if previous.authorization.previous_generation == self.generation {
+                    anyhow::ensure!(
+                        previous == seal,
+                        "source is reserved for a different handoff or changed state"
+                    );
+                    return Ok(previous);
+                }
+            }
+            journal.write_source_seal(&seal)?;
+            Ok(seal)
+        })
+    }
+
+    fn source_generation_sealed(&self) -> Result<bool> {
+        let guard = self
+            .journal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source journal lock poisoned"))?;
+        Ok(guard
+            .as_ref()
+            .map(Journal::source_seal)
+            .transpose()?
+            .flatten()
+            .is_some_and(|seal| seal.authorization.previous_generation == self.generation))
     }
 
     pub(crate) fn activate_runtime_configuration(
@@ -738,6 +898,14 @@ impl ServerState {
         if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
             return Err(AdmissionError::Busy(
                 "server is shutting down; deployment was not accepted".into(),
+            ));
+        }
+        if self
+            .source_generation_sealed()
+            .map_err(|e| AdmissionError::Busy(e.to_string()))?
+        {
+            return Err(AdmissionError::Busy(
+                "source generation is reserved for replacement".into(),
             ));
         }
         // B05：恢复保护约束**所有**写入口——旧部署链不得绕过（损坏记录/
@@ -1993,6 +2161,24 @@ fn prepare_generation_handoff(args: &RuntimeArgs, state: &ServerState) -> Result
         // handoff; it grants neither a new generation nor a new start intent.
         return Ok(());
     }
+    let source_seal = journal
+        .source_seal()?
+        .context("handoff requires source reservation")?;
+    anyhow::ensure!(
+        source_seal.authorization == *authorization,
+        "handoff source reservation identity mismatch"
+    );
+    if !replay {
+        anyhow::ensure!(
+            source_seal.source_journal_sha256
+                == format!("{:x}", Sha256::digest(serde_json::to_vec(&receipt)?)),
+            "source journal changed after reservation"
+        );
+        anyhow::ensure!(
+            source_seal.desired_revision == revision,
+            "source desired state changed after reservation"
+        );
+    }
     let prior = receipt.generation_handoff.clone();
     if replay {
         anyhow::ensure!(
@@ -2142,6 +2328,27 @@ async fn initialize_startup(
     args: &RuntimeArgs,
     state: &ServerState,
 ) -> Result<Option<InitialAction>> {
+    if state.source_generation_sealed()? {
+        let authorization = state
+            .journal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source journal lock poisoned"))?
+            .as_ref()
+            .context("source journal missing")?
+            .source_seal()?
+            .context("source seal missing")?
+            .authorization;
+        // Restore the admission fence without resuming business or changing the
+        // journal snapshot reserved for the destination generation.
+        state.set_phase(ServerPhase::Idle);
+        anyhow::ensure!(
+            state
+                .seal_generation_source(&args.workspace, &authorization)?
+                .is_some(),
+            "source reservation recovery is busy"
+        );
+        return Ok(None);
+    }
     prepare_generation_handoff(args, state)?;
     let restored = restored_runtime_args(args, state)?;
     let args = &restored;
@@ -3614,6 +3821,34 @@ format = "jsonl"
             )
             .unwrap();
         next.set_runtime_kernel(kernel);
+        {
+            use sha2::{Digest, Sha256};
+            let guard = next.journal.lock().unwrap();
+            let journal = guard.as_ref().unwrap();
+            let receipt = journal.receipt.as_ref().unwrap();
+            let authorization = next
+                .configuration_gate()
+                .unwrap()
+                .handoff()
+                .unwrap()
+                .clone();
+            journal
+                .write_source_seal(&shared_types::RuntimeGenerationSourceSeal {
+                    authorization,
+                    artifact_release_id: receipt
+                        .active
+                        .as_ref()
+                        .unwrap()
+                        .artifact_release_id
+                        .clone(),
+                    source_journal_sha256: format!(
+                        "{:x}",
+                        Sha256::digest(serde_json::to_vec(receipt).unwrap())
+                    ),
+                    desired_revision: 7,
+                })
+                .unwrap();
+        }
         (
             RuntimeArgs {
                 workspace,
@@ -3621,6 +3856,118 @@ format = "jsonl"
             },
             next,
         )
+    }
+
+    #[tokio::test]
+    async fn source_seal_replays_and_survives_owner_initialization_without_starting_business() {
+        let dir = tempfile::tempdir().unwrap();
+        let (args, mut source) = handoff_fixture(dir.path(), false);
+        let authorization = source
+            .configuration_gate()
+            .unwrap()
+            .handoff()
+            .unwrap()
+            .clone();
+        source.generation = authorization.previous_generation.clone();
+        source.configuration_gate = None;
+        let first = source
+            .seal_generation_source(&args.workspace, &authorization)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source
+                .seal_generation_source(&args.workspace, &authorization)
+                .unwrap(),
+            Some(first)
+        );
+        assert!(
+            source
+                .try_accept_deploy_with_id(request(), "late-deploy".into())
+                .is_err()
+        );
+        let mut different = authorization.clone();
+        different.activation.operation_id = "another-generation".into();
+        different.activation.deployment_generation = "another-generation".into();
+        assert!(
+            source
+                .seal_generation_source(&args.workspace, &different)
+                .is_err()
+        );
+        assert!(initialize_startup(&args, &source).await.unwrap().is_none());
+        assert!(matches!(source.phase(), ServerPhase::Idle));
+        assert!(source.deploy_rx.lock().await.try_recv().is_err());
+        assert!(
+            source
+                .try_accept_deploy_with_id(request(), "late-after-recovery".into())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn auxiliary_writer_cancellation_keeps_handoff_protected() {
+        let state = state();
+        state
+            .initializing
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut writer = state.begin_auxiliary_write().unwrap();
+        assert_eq!(
+            state
+                .auxiliary_writers
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        writer.confirm();
+        drop(writer);
+        assert!(!state.runtime_recovery_hold_active());
+        assert_eq!(
+            state
+                .auxiliary_writers
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        drop(state.begin_auxiliary_write().unwrap());
+        assert!(state.runtime_recovery_hold_active());
+        assert!(state.begin_auxiliary_write().is_err());
+    }
+
+    #[test]
+    fn source_seal_busy_does_not_change_existing_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (args, mut source) = handoff_fixture(dir.path(), false);
+        let authorization = source
+            .configuration_gate()
+            .unwrap()
+            .handoff()
+            .unwrap()
+            .clone();
+        source.generation = authorization.previous_generation.clone();
+        source.configuration_gate = None;
+        let before = source
+            .journal
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .source_seal()
+            .unwrap();
+        source.set_phase(ServerPhase::Orchestrating);
+        assert!(
+            source
+                .seal_generation_source(&args.workspace, &authorization)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            source
+                .journal
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .source_seal()
+                .unwrap(),
+            before
+        );
     }
 
     #[test]

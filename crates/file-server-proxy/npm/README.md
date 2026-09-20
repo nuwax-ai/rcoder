@@ -112,7 +112,7 @@ stdout 重定向）；`file-server-proxy status` 不读日志，排障直接看�
 
 | 变量 | 说明 |
 |---|---|
-| `FILE_SERVER_PROXY_BINARY` | 使用自定义 proxy 二进制，跳过 OSS 下载（调试/离线分发/本地冒烟） |
+| `FILE_SERVER_PROXY_BINARY` | 使用本地开发二进制；启动执行原生 `--version` 探针，不下载，不宣称官方包摘要已验证 |
 | `FILE_SERVER_PROXY_TARGET` | 覆盖 Rust target triple（交叉打包用） |
 | `FILE_SERVER_PROXY_SKIP_DOWNLOAD=1` | postinstall 跳过预下载 |
 
@@ -127,7 +127,7 @@ stdout 重定向）；`file-server-proxy status` 不读日志，排障直接看�
 
 ## 排错
 
-- **postinstall 下载失败**：不阻断安装，首次 `start` 时重试；也可手动 `FILE_SERVER_PROXY_BINARY=<path>` 指定二进制；
+- **postinstall 下载失败**：安装准备步骤明确失败，首次 `start` 不补下载。可重新执行 `node scripts/postinstall.js`，或显式使用本地开发二进制覆盖；
 - **`start` 报 already running**：先 `stop`；`status` 看 pid；
 - **60000 端口被占**：本机 rcoder 本地开发也可能占 60000——用 `--port` 换口，或先停占用方；
 - **TS start 报 stale lock**：见上文 120 秒自愈窗口；
@@ -137,3 +137,22 @@ stdout 重定向）；`file-server-proxy status` 不读日志，排障直接看�
 
 - npm 包版本由 rcoder 仓库 git tag `file-server-proxy-v*` 驱动 CI 注入；`nuwax-file-server` 精确 pin，升级 TS 时随本包发版手动 bump 并回归；
 - 二进制内嵌 Rust file-server（cargo feature `embed-file-server`），与 `@nuwax-ai/file-server` npm 包产物同源。
+
+
+## 原生包准备与离线启动
+
+安装/打包阶段执行 `node scripts/postinstall.js`，或调用 `require("./lib").prepareBinary()`。
+准备阶段读取发布 manifest，核对版本、目标、归档大小及 SHA-256；元数据与归档下载共用 5 分钟网络预算；在独立 staging
+目录解包后生成二进制摘要回执，再一次性发布到 `版本/target` 目录。
+已有目录不可原地覆盖；损坏产物明确失败，应由安装维护流程在组件停机后处理。
+`FILE_SERVER_PROXY_TARGET` 可用于跨目标准备，但启动不允许使用与本机不同的目标。
+
+`ensureBinary()` 和 `resolveBinaryPath()` 只读本地二进制与 `.receipt.json`，
+不下载、不创建目录、不修复缓存。发布打包必须同时携带二进制和回执；资源目录可只读。
+旧版只有可执行文件、没有回执的缓存不自动信任，需要重新准备。
+显式 `FILE_SERVER_PROXY_BINARY` 仍支持本地 Cargo 产物：用 `--version` 验证可执行及组件名称，
+不要求额外回执，也不把开发覆盖称为已验证的官方完整包。
+
+聚焦验证：`node --test test/package.test.js test/resolve.test.js`。
+包测试包含真实 tar/zip 归档准备、只读目录断网解析、摘要损坏、跨 ABI 缓存及不可覆盖的已有产物；
+这些测试使用协议夹具，不替代完整原生应用包的业务实机验收。

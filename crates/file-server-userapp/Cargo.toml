@@ -18,6 +18,7 @@ name = "file_server_userapp"
 path = "src/lib.rs"
 
 [dependencies]
+process_utils = { workspace = true }
 # 宿主 crate：TS 对齐路由 + 共享设施（error/extract/AppState/computer impl/dev_server 等）
 file-server = { workspace = true }
 # 共享类型（HttpResult 信封 / manifest / BuildProgressEvent / userapp 常量）

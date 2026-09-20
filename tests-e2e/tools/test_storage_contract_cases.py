@@ -18,7 +18,7 @@ class StorageContractCatalogTests(unittest.TestCase):
 
     def test_extra_pg_cases_are_real_tests_and_required(self):
         root = Path(__file__).resolve().parents[2] / 'crates/rcoder-storage/src'
-        self.assertEqual(len(PG_EXTRA_TARGETS), 17)
+        self.assertEqual(len(PG_EXTRA_TARGETS), 19)
         self.assertTrue(set(PG_EXTRA_TARGETS) <= REQUIRED['pg_storage_lifecycle_contract'])
         for target in PG_EXTRA_TARGETS.values():
             module, name = target.rsplit('::', 1)
@@ -36,6 +36,7 @@ class StorageContractCatalogTests(unittest.TestCase):
             'userapp_lifecycle::common::local_tests': (source_root / 'userapp_lifecycle/common/local_tests.rs').read_text(),
             'userapp_lifecycle::common::admission_cancellation_tests': (source_root / 'userapp_lifecycle/common/admission_cancellation_tests.rs').read_text(),
             'userapp_lifecycle::common::transaction_fault_tests': (source_root / 'userapp_lifecycle/common/transaction_fault_tests.rs').read_text(),
+            'db::identity_constraint_tests': (source_root / 'db/identity_constraint_tests.rs').read_text(),
             'db::tests': (source_root / 'db/tests.rs').read_text(),
         }
         tests = set(re.findall(r'#\[tokio::test\]\s*async fn (\w+)\(', source))

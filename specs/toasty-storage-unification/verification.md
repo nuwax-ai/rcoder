@@ -946,3 +946,36 @@ CR06进入docker_lifecycle_crash套件。登记审查另修正了冻结run/bin�
 完整Compose套件仍运行（报告`6b0904fb0cf745f095b0e39952fdc006`，44个注册场景）；summary中的尚未完成项为启动器预填aborted占位，必须结合活进程及最终结果判断，不能提前称44项失败。
 
 远端doctor退出0，SSH/集群/CRD/存储/registry可达，尚未构建部署或重建PG。检查发现本轮隔离Compose数据目录不同于旧固定docker/data/rcoder路径；已将gitignore/dockerignore/远端EXCLUDES统一排除docker/data整棵运行数据目录，保留源码schema文件。实际manifest确认无数据文件；remote workflow单测9/9通过（含动态目录与WAL排除断言），日志`/tmp/rcoder-audit-remote-workflow.log`。不会将本地DB加入同步/镜像；此前已冻结的Compose测试快照同样未包含该数据目录。
+
+### 远端镜像脚本与冻结套件环境补漏
+
+远端Dockerfile原先只覆盖app-cli/proxy/start-app，未覆盖本轮两种镜像的PG管理身份及进程保护三件套。已补computer/runtime各自的pg-admin-identity.sh、pg-supervise.py、pg-supervisor-entry.sh和入口权限。当前进行中的旧快照构建不含该修改，不能用于CR10最终验收；完成后需新快照重建，不改写旧构建身份。两种entry的bash语法检查通过，实际镜像待核验。
+
+Compose完整轮中AI场景因冻结源码没有.env.local且临时启动脚本遗漏LLM环境注入而快速失败；这不是已证实的生产逻辑失败，也不记为通过。启动脚本已按明确LLM键清单从本机私有配置传入子进程环境，不拷贝凭据进快照或报告。普通业务场景继续执行，失败AI场景需补跑，最终仍须满足全部注册场景。
+
+### 2026-09-20 远端源快照镜像构建补验
+
+- `make remote-k8s-build` 返回 0，build ID：`20260920T002721Z-798ba6d3`；收据见 `.remote-k8s/c188d7e8de407557/build.json`（环境目录以实际收据为准）。
+- 本轮 Dockerfile 显式覆盖 computer/runtime 的 PG 管理身份、监督脚本与入口，避免只覆盖二进制而沿用旧基础镜像脚本。
+- 构建成功不代表部署验收；镜像内脚本 SHA、Python ABI、Java 版本核验及个人 K8s 部署仍在进行。Compose 完整回归亦未完成，不能据此宣布全链通过。
+
+#### 同轮后续结果
+
+- Compose 报告 `6b0904fb0cf745f095b0e39952fdc006` 的 `userapp_scope_isolation_during_deploy` 已通过，真实运行 902.64 秒；这只证明该场景，整轮仍在继续。
+- 远端构建后的 computer 镜像按 digest 拉取失败，明确错误为 `failed to copy: local error: tls: bad record MAC`。仓库 `/v2/` 入口可达（未认证返回 401）；尚不能把错误归因到代码或证明镜像可部署。继续同 digest 重试，未关闭 TLS 或完整性校验。
+- ND06/07 修复后的 npm 测试 24/24，通过且无跳过；Rust 与三平台验收仍未完成。
+
+### Compose 完整轮结果（报告 6b0904fb0cf745f095b0e39952fdc006）
+
+整轮退出码 1，44 场景中 34 pass / 10 fail；没有把失败改写为通过。PG/Turso 存储、Turso 重建、并发组件、native/Docker 崩溃恢复及 Docker SIGTERM 契约均 pass。
+
+失败明细：8 项 AI 场景因本轮启动器未注入私有 LLM 配置；two_users_share_app 撞旧固定测试 ID；deploy_full_chain 在 runtime 工具链探测容器启动 30 秒预算超时。后两项分别已有唯一 ID 测试修复及空闲资源时重试安排，不能预先算 pass。
+
+独立复跑源码摘要 `95448be4bc4747033cce578bfad3563713ab85fce0385dcdb07c1d6036dffff3`，仅覆盖测试隔离修复，未混入后续 native 生产实现。LLM 配置只注入进程环境，不写入源码快照。fullchain 复跑已启动，结果待定。
+
+### 新增存储契约正式入口复验
+
+- Turso 聚焦四例退出 0：正式 schema 初始化、跨身份 input/lease/slot 约束、metadata CAS、重建后旧租约清理与重试；日志 `/tmp/rcoder-storage-extra-contracts.log`。
+- 第一轮真实 PG 30/31；新旧租约反例留下新Running操作污染后续全局分页测试。修复仅在所有隔离断言之后，用新操作本身的身份收束并清理其租约，不改变生产逻辑或断言。
+- 第二轮真实 PG **31/31，退出 0**；报告目录由 `/tmp/rcoder-storage-new-pg-recheck-report.txt` 指向，日志 `/tmp/rcoder-storage-new-pg-recheck.log`。正式目录已包含 Preview 双独立owner竞争及跨身份约束矩阵。
+- app-cli source-seal首轮独立nextest **269/269通过，1环境项未执行**，日志 `/tmp/rcoder-appcli-source-seal-nextest.log`。后续配置写入屏障修改尚待新一轮验证，本记录不覆盖未测增量。

@@ -362,13 +362,8 @@ pub(crate) async fn cancel_task(
 pub(crate) async fn cancel_build_task(task: &Arc<UserappBuildTask>) {
     let _commit = task.commit_guard().await;
     task.cancel();
-    // 硬 cancel：kill 当前 build 子进程组（run_command_to_log 用 process_group(0)，pid==pgid）。
-    if let Some(pid) = task.pid() {
-        let killed = file_server::service::dev_server::process::kill_process_group(pid);
-        tracing::info!(task_id = %task.id, pid, killed, "build task cancelled, process group signalled");
-    } else {
-        tracing::info!(task_id = %task.id, "build task cancelled (no active pid; soft cancel via loop check)");
-    }
+    // The worker that owns the ManagedChild performs tree cleanup; a cached
+    // numeric PID is diagnostic only and cannot authorize cancellation.
     // 主动 emit Cancelled：若 build 在循环间隙（非 build_generic 内），靠此置终态；
     // 若在 build_generic 内被 kill，错误分支的 is_cancelled 分支会 emit Cancelled
     //（终态保护丢弃这里的重复）。

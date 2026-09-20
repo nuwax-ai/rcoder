@@ -13,6 +13,10 @@
 //!
 //! 非 unix 平台无进程组信号语义, 本 crate 不提供任何符号 (调用方自行 cfg 分支)。
 
+pub mod command_context;
+pub mod managed_tree;
+pub mod workers;
+
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
@@ -172,3 +176,5 @@ mod tests {
         assert!(!kill_process_group(4_000_000, Signal::SIGTERM));
     }
 }
+
+pub mod guardian;

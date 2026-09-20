@@ -206,6 +206,14 @@ impl DevServerManager {
         intent: &Intent,
         supplied: &RuntimeOperationRequest,
     ) -> Result<RuntimeOperationView> {
+        process_utils::command_context::CommandContext::record_external_operation(
+            &intent.request.operation_id,
+            &intent.request.expected_runtime_instance_id,
+            &intent.request.workspace_id,
+        )
+        .context(
+            "persist local task to external operation identity before observation/submission",
+        )?;
         if supplied.run_config.is_some() {
             let mut supplied_original = intent.request.clone();
             supplied_original.run_config = supplied.run_config.clone();

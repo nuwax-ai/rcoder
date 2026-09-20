@@ -49,6 +49,18 @@ impl RuntimeGenerationHandoff {
     }
 }
 
+/// Durable reservation produced by the source owner before physical replacement.
+/// It freezes new runtime mutations but does not authorize credential changes.
+/// The destination must still establish its own RuntimeGenerationPrepared receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeGenerationSourceSeal {
+    pub authorization: RuntimeGenerationHandoff,
+    pub artifact_release_id: String,
+    pub source_journal_sha256: String,
+    pub desired_revision: u64,
+}
+
 /// Durable evidence produced under the new owner's exclusive workspace lock.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]

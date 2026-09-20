@@ -31,11 +31,16 @@ COPY --link --from=build /out/agent_runner /usr/local/bin/agent_runner
 COPY --link docker/rcoder-master/agent-runner-start.sh /app/agent-runner-start.sh
 RUN chmod +x /app/agent-runner-start.sh
 FROM ${COMPUTER_BASE} AS computer
+# Credential identity and PG shutdown helpers belong to this source snapshot,
+# not the potentially older published base image.
 COPY --link --from=build /out/agent_runner /out/app-cli /usr/local/bin/
+COPY --link docker/rcoder-agent-runner/pg-admin-identity.sh docker/rcoder-agent-runner/pg-supervise.py docker/rcoder-agent-runner/pg-supervisor-entry.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/pg-supervisor-entry.sh
 FROM ${RUNTIME_BASE} AS runtime
 COPY --link --from=build /out/app-cli /out/file-server-proxy /usr/local/bin/
 COPY --link docker/app-runtime-base/start-app.sh /usr/local/bin/start-app.sh
+COPY --link docker/app-runtime-base/pg-admin-identity.sh docker/app-runtime-base/pg-supervise.py docker/app-runtime-base/pg-supervisor-entry.sh /usr/local/bin/
 # git 模式为 100644，COPY 保留源权限——不 chmod 则容器启动即
 # "exec: /usr/local/bin/start-app.sh: permission denied"（CrashLoop）。
 # 对齐 rcoder-master / app-runtime-base Dockerfile 的既有惯例。
-RUN chmod +x /usr/local/bin/start-app.sh
+RUN chmod +x /usr/local/bin/start-app.sh /usr/local/bin/pg-supervisor-entry.sh

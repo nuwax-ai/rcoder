@@ -68,16 +68,32 @@ pub struct BuildTask {
     state: Mutex<TaskState>,
     tx: broadcast::Sender<(u64, BuildProgressEvent)>,
     cancelled: AtomicBool,
+    cancellation: tokio_util::sync::CancellationToken,
+    cleanup_pending: Arc<std::sync::atomic::AtomicUsize>,
     terminal_at: AtomicI64,
     created_at: i64,
-    /// 当前 build 子进程 pid (cancel 时 kill_process_group 用)。
+    /// 当前 build 子进程 PID，仅诊断；取消必须使用 CancellationToken。
     /// AtomicU32 (0 = 未设置) 而非 Mutex: build_generic 的 on_pid 回调是同步的, 需同步写。
     pid: AtomicU32,
     commit: Mutex<()>,
 }
 
 impl BuildTask {
+    #[cfg(test)]
     fn new(app_id: String, kind: BuildTaskKind) -> Arc<Self> {
+        Self::with_cancellation(
+            app_id,
+            kind,
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+    }
+    fn with_cancellation(
+        app_id: String,
+        kind: BuildTaskKind,
+        cancellation: tokio_util::sync::CancellationToken,
+        cleanup_pending: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAP);
         let now = Utc::now().timestamp();
         Arc::new(Self {
@@ -103,6 +119,8 @@ impl BuildTask {
             }),
             tx,
             cancelled: AtomicBool::new(false),
+            cancellation,
+            cleanup_pending,
             terminal_at: AtomicI64::new(0),
             created_at: now,
             pid: AtomicU32::new(0),
@@ -110,6 +128,18 @@ impl BuildTask {
         })
     }
 
+    pub fn command_context(&self) -> process_utils::command_context::CommandContext {
+        process_utils::command_context::CommandContext {
+            identity: process_utils::command_context::WorkIdentity {
+                task_id: Some(self.id.clone()),
+                app_id: Some(self.app_id.clone()),
+            },
+            cancellation: self.cancellation.clone(),
+            cleanup_pending: self.cleanup_pending.clone(),
+            journal_root: process_utils::command_context::CommandContext::current()
+                .and_then(|c| c.journal_root),
+        }
+    }
     /// Serializes process creation with cancellation's commit boundary.
     pub async fn commit_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.commit.lock().await
@@ -271,12 +301,13 @@ impl BuildTask {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.cancelled.load(Ordering::Relaxed) || self.cancellation.is_cancelled()
     }
 
     /// 标记取消(外部再 kill 进程组);build 循环可检 is_cancelled 主动退出。
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
+        self.cancellation.cancel();
     }
 }
 
@@ -362,6 +393,7 @@ fn apply_event(state: &mut TaskState, event: &BuildProgressEvent) {
 /// 全局任务表(`Mutex<HashMap>`,内存;build 短期不需持久化,发布产物由 app_manager release index 持久)。
 /// 用 tokio::sync::Mutex(无 poison,符合禁止 unwrap/expect);并发度低(任务数有限)。
 pub struct BuildTaskStore {
+    pub workers: Arc<process_utils::workers::WorkerRegistry>,
     map: Mutex<HashMap<BuildTaskId, Arc<BuildTask>>>,
     max_retained_tasks: usize,
     dev_lifecycles: Mutex<HashMap<String, std::sync::Weak<Mutex<u64>>>>,
@@ -408,6 +440,7 @@ impl BuildTaskStore {
 
     pub fn new() -> Self {
         Self {
+            workers: process_utils::workers::WorkerRegistry::new(None),
             map: Mutex::new(HashMap::new()),
             dev_lifecycles: Mutex::new(HashMap::new()),
             workspace_activity: Mutex::new(HashMap::new()),
@@ -418,6 +451,7 @@ impl BuildTaskStore {
     #[cfg(test)]
     fn with_max_retained_tasks(max_retained_tasks: usize) -> Self {
         Self {
+            workers: process_utils::workers::WorkerRegistry::new(None),
             map: Mutex::new(HashMap::new()),
             dev_lifecycles: Mutex::new(HashMap::new()),
             workspace_activity: Mutex::new(HashMap::new()),
@@ -425,12 +459,22 @@ impl BuildTaskStore {
         }
     }
 
+    pub fn with_workers(workers: Arc<process_utils::workers::WorkerRegistry>) -> Self {
+        let mut store = Self::new();
+        store.workers = workers;
+        store
+    }
     pub async fn create(
         &self,
         app_id: String,
         kind: BuildTaskKind,
     ) -> Result<Arc<BuildTask>, BuildTaskStoreError> {
-        let task = BuildTask::new(app_id, kind);
+        let task = BuildTask::with_cancellation(
+            app_id,
+            kind,
+            self.workers.cancellation(),
+            self.workers.cleanup_pending(),
+        );
         let now = Utc::now().timestamp();
         let mut map = self.map.lock().await;
         map.retain(|_, existing| {
