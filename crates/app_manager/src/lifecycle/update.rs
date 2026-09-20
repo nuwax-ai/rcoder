@@ -224,6 +224,92 @@ impl AppService {
         params
             .validate_execution_context()
             .map_err(|error| map_runtime_error("Validate update execution", error))?;
+        let persisted = self
+            .metadata
+            .store
+            .get_operation(app_id, &context.operation_id)
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::InvalidState("Update operation disappeared".into())
+            })?;
+        let prior_handoff = if let Some(value) = persisted.checkpoint.get("generation_handoff") {
+            // A previous submission may already have sealed or replaced the source.
+            // Preserve its fence even when subsequent evidence cannot be decoded.
+            _update_lock.mark_mutating()?;
+            let handoff: shared_types::RuntimeGenerationHandoff =
+                serde_json::from_value(value.clone()).map_err(|_| {
+                    AppOperationError::InvalidState("Stored generation handoff is invalid".into())
+                })?;
+            handoff.validate().map_err(AppOperationError::Validation)?;
+            let requested_version = params
+                .env
+                .as_ref()
+                .and_then(|env| env.get(shared_types::APP_RUNTIME_CONFIGURATION_VERSION))
+                .and_then(|version| version.parse::<i64>().ok());
+            if handoff.app_id != context.app_id
+                || handoff.lifecycle_id != context.lifecycle_id
+                || handoff.activation.operation_id != context.operation_id
+                || handoff.activation.deployment_generation != context.operation_id
+                || requested_version != Some(handoff.activation.config_version)
+            {
+                return Err(AppOperationError::InvalidState(
+                    "Stored handoff does not match original configuration operation".into(),
+                ));
+            }
+            let spec = self
+                .runtime
+                .get_app_container_spec(app_id)
+                .await
+                .map_err(|error| map_runtime_error("Read handoff recovery generation", error))?;
+            let active_env = spec.env.as_ref().ok_or_else(|| {
+                AppOperationError::InvalidState("Recovery generation environment is missing".into())
+            })?;
+            match active_env.get(shared_types::APP_DEPLOY_GENERATION_ID) {
+                Some(generation) if generation == &handoff.activation.deployment_generation => {
+                    let installed: shared_types::RuntimeGenerationHandoff = active_env
+                        .get(shared_types::APP_RUNTIME_GENERATION_HANDOFF)
+                        .and_then(|value| serde_json::from_str(value).ok())
+                        .ok_or_else(|| {
+                            AppOperationError::InvalidState(
+                                "Replacement handoff identity is missing".into(),
+                            )
+                        })?;
+                    let seal: shared_types::RuntimeGenerationSourceSeal = persisted
+                        .checkpoint
+                        .get("source_seal")
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                        .ok_or_else(|| {
+                            AppOperationError::InvalidState(
+                                "Replacement has no durable source seal".into(),
+                            )
+                        })?;
+                    if installed != handoff
+                        || seal.authorization != handoff
+                        || active_env.get(shared_types::APP_DEPLOY_OPERATION_ID)
+                            != Some(&context.operation_id)
+                        || active_env
+                            .get(shared_types::APP_RUNTIME_CONFIGURATION_VERSION)
+                            .and_then(|value| value.parse::<i64>().ok())
+                            != requested_version
+                    {
+                        return Err(AppOperationError::InvalidState(
+                            "Replacement configuration identity mismatch".into(),
+                        ));
+                    }
+                    // The caller continues the original prepared/credential protocol.
+                    // Never replace the already-installed generation a second time.
+                    return Ok(());
+                }
+                Some(generation) if generation == &handoff.previous_generation => Some(handoff),
+                _ => {
+                    return Err(AppOperationError::InvalidState(
+                        "A different generation prevents handoff recovery".into(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let target = self
             .runtime
             .capture_app_mutation_target(&context, current.resource_version.as_deref())
@@ -237,7 +323,18 @@ impl AppService {
         } else {
             None
         };
-        let mut checkpoint = serde_json::json!({"target":target,"storage_target":storage_target,"requested_storage_size":params.storage_size});
+        let mut checkpoint = if prior_handoff.is_some() {
+            persisted.checkpoint.clone()
+        } else {
+            serde_json::json!({})
+        };
+        checkpoint["target"] = serde_json::to_value(&target).map_err(|error| {
+            AppOperationError::Backend(format!("Encode update target: {error}"))
+        })?;
+        checkpoint["storage_target"] = serde_json::to_value(&storage_target).map_err(|error| {
+            AppOperationError::Backend(format!("Encode storage target: {error}"))
+        })?;
+        checkpoint["requested_storage_size"] = serde_json::json!(params.storage_size);
         let mut source_sealed = false;
         // Only captured-configuration replacements without a new artifact may
         // inherit the confirmed volume. Capture the old generation while its
@@ -284,6 +381,14 @@ impl AppService {
                 },
             };
             handoff.validate().map_err(AppOperationError::Validation)?;
+            if prior_handoff
+                .as_ref()
+                .is_some_and(|original| original != &handoff)
+            {
+                return Err(AppOperationError::InvalidState(
+                    "Original handoff source changed before replay".into(),
+                ));
+            }
             let encoded = serde_json::to_string(&handoff).map_err(|error| {
                 AppOperationError::Backend(format!("Encode generation handoff: {error}"))
             })?;

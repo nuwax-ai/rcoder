@@ -63,3 +63,28 @@ worker panic、目录读取失败、持久写失败或命令清理未确认均�
 3. 显式 `recover --instance-id <原实例>` 必须先取得 scope 锁，匹配真实 `OwnerExited` 证据，再逐项核验 guardian。未消费 Pending 在原 guardian 锁内改 Revoked，迟到的 guardian 不能再 spawn；Running 且无确认回执仍拒绝。全部命令收束后，原本进程 worker 可登记 `OwnerExitedInterrupted`，不把外部 app-cli 操作宣称成功、不停止其业务。
 
 该实现节点尚未编译或进行真实子进程故障验收；前文 482/482 仅属于 guardian 加入前的阶段基线。guardian 自身也崩溃而缺少清理证据属于剩余未知状态，不能凭 PID、端口、超时或文件锁空闲解锁。
+
+### 同 boot 恢复实际验证
+
+- 四组件 `cargo check ... --all-targets`：退出 0，`/tmp/rcoder-native-guardian-check2.log`。
+- 四组件 nextest：**484/484，0 skip，退出 0**，`/tmp/rcoder-native-guardian-nextest.log`。新增实际 TS 退出叠加持久化失败保留 owner 锁、task/外部身份冲突反例。
+- `cargo build -p file-server-proxy --bin file-server-proxy`：退出 0，`/tmp/rcoder-native-guardian-build.log`。
+- `python3 crates/file-server-proxy/tools/test_native_guardian.py --binary target/debug/file-server-proxy --report /tmp/rcoder-native-guardian-contract3.json`：**7 项真实链路断言通过，退出 0**，报告含二进制 SHA-256 及独立 fixture 路径。该脚本限 Unix；本轮在 macOS 执行，不代替 Linux/Windows 验收。
+
+真实二进制覆盖：实际 owner SIGKILL 的 Child wait 见证；TS 根及后代随 pipe EOF 清理；错误原实例 recover 拒绝、正确原实例恢复；旧实例迟到 stop 不停止新实例；实际内嵌 execute-command 在途崩溃后命令收束与 worker 中断登记；Pending 撤销后实际迟到 guardian binary 拒绝；guardian 和 owner 双崩溃后保持未知保护，即使本轮 fixture 自行结束也不凭观察信号放行。测试仅操作本轮 Popen 子树，原回执与日志保留，未删除未知状态。
+
+恢复命令：`file-server-proxy recover --port <原请求端口> --instance-id <受保护原实例 UUID>`，使用原 host 与 `FILE_SERVER_PROXY_STATE_DIR`。原实例 UUID 来自原启动结果或 `owner.json` 的 `instance_id` 字段；不要输出该文件中的管理令牌。无真实 `OwnerExited`、guardian 自身清理未知、损坏/不兼容记录均明确失败，不能删除记录重试。
+
+本轮 guardian 加入后的 Clippy、完整 feature 组合、Linux/Windows 宿主机验证仍待完成；此前 Clippy 结果只属于 guardian 加入前的阶段。
+
+### 后续组件节点及显式退出接口
+
+Pending 启动与停止竞态已经补齐：原 owner 已停止受理导致 guardian 在尚未跨 Running 时拒绝，须在原授权锁内写 Revoked，证明未 spawn。Running 未知不能走该撤销路径。execute-command 的工作/命令记录现关联 app_id。
+
+该节点组件验证：default **486/486**（`/tmp/rcoder-native-guardian-nextest2.log`）、all-features **486/486**（`/tmp/rcoder-native-guardian-allfeatures.log`），均 0 skip、退出 0；all-features Clippy `-D warnings` 与 proxy no-default-features Clippy 均退出 0。这些结果发生在下面 retire/spec 摘要加入之前，不能用作新增接口的验证结果。
+
+新增待验证接口：`retire --port <原端口> --instance-id <原实例>`。它要求原管理令牌与 instance 匹配、真实 supervisor 尚在，关闭受理后持久 `Stopping + retirement_requested`，尝试写出并冲刷 `RetirementAccepted` 后退出原 owner（退出码 75）。Accepted 不表示退出完成；CLI 必须看到同一 supervisor 对同一 owner 的实际 wait 见证，才返回 `OwnerExited`。响应丢失可用同一实例重试观察。它不写 Stopped、不把 worker 或外部业务操作改成功。随后显式 `recover` 才依据原 guardian 与退出见证收束。这为仍存活但本地工作结果未知的 owner 提供可执行通路，避免要求用户手动按 PID 杀进程。
+
+Guardian 授权同时新增命令 spec SHA-256：父进程在 Pending 落盘摘要，guardian 对收到的完整 spec 重算，匹配后才进入 Running/spawn；只持久摘要，不保存命令参数或环境中的凭据。错摘要在未消费阶段持锁撤销，不能执行替换命令。
+
+retire 与摘要校验当前已实现但尚未编译/实测；独立真实脚本已增加对应反例，等待集中验证。

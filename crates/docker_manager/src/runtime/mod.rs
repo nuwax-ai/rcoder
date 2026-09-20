@@ -9,12 +9,16 @@ pub(crate) mod docker_app_mounts;
 mod docker_app_runtime;
 mod docker_builder_control;
 pub mod docker_runtime;
+mod docker_source_seal;
 pub(crate) mod docker_workspace;
 #[cfg(feature = "kubernetes")]
 mod k8s_builder_control;
 pub(crate) mod k8s_runtime_helpers;
+#[cfg(feature = "kubernetes")]
+mod k8s_source_seal;
 pub mod kubernetes_runtime;
 pub mod manager;
+mod source_seal;
 
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_agent_create;

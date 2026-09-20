@@ -61,11 +61,19 @@ async fn expect_phase(server: &mut OwnedServer, base: &str, phase: &str) {
         if let Ok(response) = client.get(format!("{base}/v1/deploy/status")).send().await {
             assert!(response.status().is_success());
             let body: serde_json::Value = response.json().await.unwrap();
+            if body["data"]["phase"] == phase {
+                return;
+            }
+            // The management listener is bound before startup recovery begins.
+            // Its initial Idle response is not the completed startup result.
             assert_eq!(
-                body["data"]["phase"], phase,
-                "normal repeated serve must not be blocked by stale active owner: {body}"
+                body["data"]["phase"], "idle",
+                "unexpected startup state: {body}"
             );
-            return;
+            assert!(
+                Instant::now() < deadline,
+                "server never reached {phase}: {body}"
+            );
         }
         assert!(Instant::now() < deadline, "owned server API did not start");
         tokio::time::sleep(Duration::from_millis(20)).await;

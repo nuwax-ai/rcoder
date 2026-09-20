@@ -324,6 +324,26 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         self.restart_captured_target(target).await
     }
 
+    async fn prepare_stopped_source_seal(
+        &self,
+        source: &shared_types::UserAppMutationTarget,
+        authorization: &shared_types::RuntimeGenerationHandoff,
+    ) -> ContainerRuntimeResult<container_runtime_api::OfflineSourceSealTarget> {
+        self.prepare_offline_seal(source, authorization).await
+    }
+    async fn run_stopped_source_seal(
+        &self,
+        target: &container_runtime_api::OfflineSourceSealTarget,
+    ) -> ContainerRuntimeResult<shared_types::RuntimeGenerationSourceSeal> {
+        self.run_offline_seal(target).await
+    }
+    async fn cleanup_stopped_source_seal(
+        &self,
+        target: &container_runtime_api::OfflineSourceSealTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.cleanup_offline_seal(target).await
+    }
+
     async fn start_app_management_target(
         &self,
         target: &shared_types::UserAppMutationTarget,

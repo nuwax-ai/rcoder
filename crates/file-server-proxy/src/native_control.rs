@@ -21,6 +21,8 @@ pub struct Receipt {
     pub phase: String,
     #[serde(default)]
     supervisor_id: Option<String>,
+    #[serde(default)]
+    retirement_requested: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -168,6 +170,7 @@ impl Owner {
             address: String::new(),
             phase: "Starting".into(),
             supervisor_id: std::env::var("FILE_SERVER_PROXY_OWNER_SUPERVISOR").ok(),
+            retirement_requested: false,
         };
         if let Some(id) = &receipt.supervisor_id {
             crate::native_supervisor::verify_live(&root, id, &receipt.instance_id)?;
@@ -313,18 +316,42 @@ impl Owner {
                     let result = match request.action.as_str() {
                         "status" => Ok(()),
                         "stop" => self.stop().await,
+                        "retire" => self.prepare_retirement(),
                         _ => Err("unsupported owner command".into()),
                     };
                     let stopped = request.action == "stop" && result.is_ok();
+                    let retiring = request.action == "retire" && result.is_ok();
                     let reply = Reply { version: VERSION, instance_id: self.receipt.instance_id.clone(),
-                        phase: self.receipt.phase.clone(), address: self.receipt.address.clone(), error: result.err() };
+                        phase: if retiring { "RetirementAccepted".into() } else { self.receipt.phase.clone() }, address: self.receipt.address.clone(), error: result.err() };
                     // A lost response does not undo the durable completion receipt.
                     let _delivery = send(&mut stream, &reply).await;
+                    if retiring {
+                        let _flushed = tokio::time::timeout(Duration::from_secs(5), stream.shutdown()).await;
+                        // Intentionally no Stopped/worker completion write. Only
+                        // the outer supervisor's actual wait proves this exit.
+                        std::process::exit(75);
+                    }
                     if stopped { return Ok(()); }
                 }
             }
         }
     }
+    fn prepare_retirement(&mut self) -> Result<(), String> {
+        let supervisor = self
+            .receipt
+            .supervisor_id
+            .as_deref()
+            .ok_or("retirement requires a real owner supervisor")?;
+        crate::native_supervisor::verify_live(&self.root, supervisor, &self.receipt.instance_id)?;
+        #[cfg(feature = "embed-file-server")]
+        if let Some(handle) = &self.embedded {
+            handle.close()?;
+        }
+        self.receipt.phase = "Stopping".into();
+        self.receipt.retirement_requested = true;
+        write(&self.root, &self.receipt)
+    }
+
     pub async fn stop(&mut self) -> Result<(), String> {
         self.receipt.phase = "Stopping".into();
         let persistence = write(&self.root, &self.receipt);
@@ -495,6 +522,74 @@ fn recover(root: &Path, expected_instance: Option<&str>) -> Result<String, Strin
     .map_err(|e| e.to_string())
 }
 
+async fn retire_control(root: &Path, expected: Option<&str>) -> Result<String, String> {
+    let expected = expected.ok_or("retire requires --instance-id of the original owner")?;
+    let original = read(root)?.ok_or("original owner receipt missing")?;
+    if original.instance_id != expected {
+        return Err("retire identity differs from original owner".into());
+    }
+    let supervisor = original
+        .supervisor_id
+        .as_deref()
+        .ok_or("original owner has no exit witness")?;
+    let observe = || crate::native_supervisor::verify_exited(root, supervisor, expected);
+    let already_exited = original.retirement_requested && observe().is_ok();
+    if !already_exited {
+        let request = async {
+            let mut stream = tokio::net::TcpStream::connect(&original.control_address)
+                .await
+                .map_err(|e| e.to_string())?;
+            send(
+                &mut stream,
+                &Request {
+                    version: VERSION,
+                    instance_id: expected.into(),
+                    token: original.token.clone(),
+                    action: "retire".into(),
+                },
+            )
+            .await?;
+            let reply: Reply =
+                serde_json::from_slice(&frame(&mut stream).await?).map_err(|e| e.to_string())?;
+            if reply.version != VERSION || reply.instance_id != expected {
+                return Err("retire reply identity mismatch".into());
+            }
+            if let Some(error) = reply.error {
+                return Err(error);
+            }
+            if reply.phase != "RetirementAccepted" {
+                return Err("unexpected retire response".into());
+            }
+            Ok::<(), String>(())
+        };
+        // Delivery may be lost after durable acceptance. Inspect only the same
+        // original retirement receipt and actual exit witness in that case.
+        let delivery = tokio::time::timeout(Duration::from_secs(10), request).await;
+        let current = read(root)?.ok_or("original retirement receipt missing")?;
+        if current.instance_id != expected || !current.retirement_requested {
+            return Err(format!("retirement not durably accepted: {delivery:?}"));
+        }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        if observe().is_ok() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("original owner exit unknown; retirement preserved".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    serde_json::to_string(&Reply {
+        version: VERSION,
+        instance_id: expected.into(),
+        phase: "OwnerExited".into(),
+        address: original.address,
+        error: None,
+    })
+    .map_err(|e| e.to_string())
+}
+
 pub async fn control(
     root: &Path,
     action: &str,
@@ -502,6 +597,9 @@ pub async fn control(
 ) -> Result<String, String> {
     if action == "recover" {
         return recover(root, expected_instance);
+    }
+    if action == "retire" {
+        return retire_control(root, expected_instance).await;
     }
 
     if !matches!(action, "status" | "stop") {

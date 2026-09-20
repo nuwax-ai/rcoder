@@ -31,6 +31,9 @@ use crate::service::AppService;
 pub(crate) struct MockRuntime {
     pub configuration_replies:
         std::sync::Mutex<std::collections::VecDeque<container_runtime_api::ExecResult>>,
+    pub offline_source_calls: std::sync::Mutex<Vec<&'static str>>,
+    pub offline_source_run_fails: AtomicBool,
+    pub offline_source_cleanup_fails: AtomicBool,
     pub configuration_commands: std::sync::Mutex<Vec<Vec<String>>>,
     pub configuration_targets: std::sync::Mutex<Vec<shared_types::RuntimeConfigurationTarget>>,
     pub mutation_uid_override: std::sync::Mutex<Option<String>>,
@@ -228,6 +231,13 @@ impl UserAppDeploymentRuntime for MockRuntime {
         generation: &str,
     ) -> ContainerRuntimeResult<shared_types::RuntimeConfigurationTarget> {
         assert!(self.lease_held.load(Ordering::SeqCst));
+        if self
+            .deployments
+            .get(&context.app_id)
+            .is_some_and(|status| status.replicas == 0)
+        {
+            return Err(ContainerRuntimeError::ManagementNotRunning);
+        }
         let target = shared_types::RuntimeConfigurationTarget {
             physical_uid: format!("test-{}", context.lifecycle_id),
             deployment_generation: generation.into(),
@@ -488,6 +498,61 @@ impl UserAppDeploymentRuntime for MockRuntime {
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<()> {
         self.start_app_target(target).await
+    }
+
+    async fn prepare_stopped_source_seal(
+        &self,
+        source: &shared_types::UserAppMutationTarget,
+        authorization: &shared_types::RuntimeGenerationHandoff,
+    ) -> ContainerRuntimeResult<container_runtime_api::OfflineSourceSealTarget> {
+        assert!(self.lease_held.load(Ordering::SeqCst));
+        assert_eq!(
+            self.deployments
+                .get(&source.context.app_id)
+                .unwrap()
+                .replicas,
+            0
+        );
+        self.offline_source_calls.lock().unwrap().push("prepare");
+        Ok(container_runtime_api::OfflineSourceSealTarget {
+            source: source.clone(),
+            helper_name: "originalhelper".into(),
+            helper_uid: "originalhelperuid".into(),
+            authorization: authorization.clone(),
+            specification: serde_json::json!({}),
+        })
+    }
+    async fn run_stopped_source_seal(
+        &self,
+        target: &container_runtime_api::OfflineSourceSealTarget,
+    ) -> ContainerRuntimeResult<shared_types::RuntimeGenerationSourceSeal> {
+        assert!(self.lease_held.load(Ordering::SeqCst));
+        assert_eq!(target.helper_uid, "originalhelperuid");
+        self.offline_source_calls.lock().unwrap().push("run");
+        if self.offline_source_run_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::Conflict(
+                "Helper result unknown".into(),
+            ));
+        }
+        Ok(shared_types::RuntimeGenerationSourceSeal {
+            authorization: target.authorization.clone(),
+            artifact_release_id: "latesthotrelease".into(),
+            source_journal_sha256: "b".repeat(64),
+            desired_revision: 4,
+        })
+    }
+    async fn cleanup_stopped_source_seal(
+        &self,
+        target: &container_runtime_api::OfflineSourceSealTarget,
+    ) -> ContainerRuntimeResult<()> {
+        assert_eq!(target.helper_uid, "originalhelperuid");
+        self.offline_source_calls.lock().unwrap().push("cleanup");
+        if self.offline_source_cleanup_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::Conflict(
+                "Helper cleanup unknown".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn start_app_management_target(

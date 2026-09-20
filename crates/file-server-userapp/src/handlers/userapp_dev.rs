@@ -79,8 +79,12 @@ pub(crate) async fn execute_command(
         .await;
     let cwd = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
     let workers = state.build_tasks.workers.clone();
+    let identity = process_utils::command_context::WorkIdentity {
+        task_id: None,
+        app_id: Some(body.app_id.clone()),
+    };
     let r = workers
-        .spawn(async move {
+        .spawn_identified(identity, async move {
             let _activity = activity;
             execute_command_core(&state.fs, cwd, &body.command).await
         })

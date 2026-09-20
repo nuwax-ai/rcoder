@@ -258,3 +258,7 @@ pub(super) fn operation_row(
             .then(|| previous_terminal_us.unwrap_or(now_us)),
     })
 }
+
+#[cfg(test)]
+#[path = "codec_tests.rs"]
+mod tests;

@@ -62,3 +62,12 @@
 - S09：原 Turso 测试提取 `metadata_cas_contract`，使用独立 app；已接入 `postgres_real_transactions_and_restart_contract`，原 Turso 入口保持全部断言。
 - S04：新增共享 `old_lease_cleanup_and_retry_preserve_recreated_lifecycle`；Turso 入口为 `turso_old_lease_cleanup_and_retry_preserve_recreated_lifecycle`，PG 同样接入既有主契约。真实应用删除完整阶段后重建，在新 Running 操作持有新租约期间执行旧租约 forget/重放、伪混合身份 forget、旧执行者 advance/reserve 和旧请求重试；检查新 app/slot/op/lease及旧历史不被修改。合法的旧终态租约清理允许执行，不错误要求历史清理永远禁止。
 - 精确 catalog 新增 Turso 入口，PG沿原fixture无需额外目标。仅测试重构/新增；rustfmt和diff检查通过。未编译/运行，不能据此新增通过勾选。
+
+## 后续实测补充：2026-09-20 阶段提交前后
+
+本节补充后续证据，前文“未运行”保留其审查时点。
+
+- 独立 PG 正式合约复跑 **31/31**，退出 0。报告目录：`/var/folders/y6/g5lk3d750833hz_rn5h3y6nh0000gn/T/rcoder-storage-new-pg-recheck-rihq24jy/pg-contract`；执行日志 `/tmp/rcoder-storage-new-pg-recheck.log`。
+- S01 两后端跨身份 input/lease/slot 非法行矩阵、S04 旧租约清理和重建后的重试、S09 PG metadata CAS、正式 Preview 两独立连接竞争均已接入并运行。Turso 聚焦四项 4/4，日志 `/tmp/rcoder-storage-extra-contracts.log`。
+- PG 首轮 30/31 失败来自新增测试留下 Running 操作，污染后续分页断言；已在测试断言完成后将该操作正常收束并清理绑定，未降低断言或修改生产行为。
+- 以上不替代仍未完成的 T0 类型边界、完整 Compose/K8s 与发布验收。

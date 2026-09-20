@@ -37,6 +37,7 @@ tracing = { workspace = true }
 
 # UUID
 uuid = { workspace = true }
+sha2 = { workspace = true }
 
 # Date/time
 chrono = { workspace = true }

@@ -218,7 +218,7 @@ async fn main() {
         .filter(|a| {
             matches!(
                 a.as_str(),
-                "start" | "stop" | "status" | "restart" | "recover"
+                "start" | "stop" | "status" | "restart" | "recover" | "retire"
             )
         })
         .cloned();
@@ -247,7 +247,7 @@ async fn main() {
         None
     };
     if let (Some(root), Some(action)) = (&owner_root, action.as_deref())
-        && matches!(action, "stop" | "status" | "restart" | "recover")
+        && matches!(action, "stop" | "status" | "restart" | "recover" | "retire")
     {
         match native_control::control(
             root,

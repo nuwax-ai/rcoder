@@ -44,6 +44,7 @@ impl AppService {
         guard: &crate::service::AppOperationGuard,
     ) -> AppResult<shared_types::RuntimeGenerationSourceSeal> {
         use shared_types::PgCommandRunner as _;
+        let previous_mutation = guard.has_unfinished_mutation();
         let deadline_ms = self
             .metadata
             .store
@@ -76,23 +77,48 @@ impl AppService {
                 "Source workload identity changed before sealing".into(),
             ));
         }
-        let target = tokio::time::timeout_at(
+        let captured = tokio::time::timeout_at(
             deadline,
             self.runtime
                 .capture_app_configuration_target(context, &authorization.previous_generation),
         )
         .await
         .map_err(|_| {
-            AppOperationError::Conflict(
-                "Source owner capture deadline exceeded before replacement".into(),
-            )
-        })?
-        .map_err(|error| {
-            crate::utils::map_runtime_error(
-                "Capture source management identity before replacement",
-                error,
-            )
+            AppOperationError::Conflict("Source management capture deadline exceeded".into())
         })?;
+        let target = match captured {
+            Err(container_runtime_api::ContainerRuntimeError::ManagementNotRunning) => {
+                guard.mark_mutating()?;
+                return tokio::time::timeout_at(
+                    deadline,
+                    self.seal_stopped_runtime_source(
+                        &workload,
+                        authorization,
+                        operation,
+                        checkpoint,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    AppOperationError::InvalidState(
+                        "Offline source seal outcome unknown; recover the original helper".into(),
+                    )
+                })?;
+            }
+            Ok(target) => {
+                if checkpoint.get("offline_source_helper").is_some() {
+                    guard.mark_mutating()?;
+                    return Err(AppOperationError::Conflict("Source became active during offline handoff; original helper remains protected".into()));
+                }
+                target
+            }
+            Err(error) => {
+                return Err(crate::utils::map_runtime_error(
+                    "Capture source management identity before replacement",
+                    error,
+                ));
+            }
+        };
         if target.deployment_generation != authorization.previous_generation {
             return Err(AppOperationError::Conflict(
                 "Source physical identity changed before sealing".into(),
@@ -100,6 +126,19 @@ impl AppService {
         }
         // K8s workload UID and management Pod UID are different identities.
         // Persist both before the bound exec; retries cannot silently select a new Pod.
+        if let Some(original) = checkpoint.get("source_management_target") {
+            let original: shared_types::RuntimeConfigurationTarget =
+                serde_json::from_value(original.clone()).map_err(|_| {
+                    AppOperationError::InvalidState(
+                        "Stored source management identity is invalid".into(),
+                    )
+                })?;
+            if original != target {
+                return Err(AppOperationError::Conflict(
+                    "Original source management identity changed; handoff remains protected".into(),
+                ));
+            }
+        }
         checkpoint["source_management_target"] =
             serde_json::to_value(&target).map_err(|error| {
                 AppOperationError::Backend(format!("Encode source management identity: {error}"))
@@ -140,7 +179,9 @@ impl AppService {
                 Some(seal) => return Ok(seal),
                 None => {
                     // Exact no-admission response. No seal or runtime mutation occurred.
-                    guard.mark_rejected_before_mutation();
+                    if !previous_mutation {
+                        guard.mark_rejected_before_mutation();
+                    }
                     tokio::time::sleep_until(
                         (tokio::time::Instant::now() + std::time::Duration::from_millis(200))
                             .min(deadline),
@@ -150,6 +191,93 @@ impl AppService {
             }
         }
     }
+    async fn seal_stopped_runtime_source(
+        &self,
+        source: &shared_types::UserAppMutationTarget,
+        authorization: &shared_types::RuntimeGenerationHandoff,
+        operation: &mut crate::service::OwnedOperation,
+        checkpoint: &mut serde_json::Value,
+    ) -> AppResult<shared_types::RuntimeGenerationSourceSeal> {
+        operation
+            .checkpoint("offline_source_seal_requested", checkpoint.clone())
+            .await?;
+        let helper: container_runtime_api::OfflineSourceSealTarget = match checkpoint
+            .get("offline_source_helper")
+        {
+            Some(value) => serde_json::from_value(value.clone()).map_err(|_| {
+                AppOperationError::InvalidState("Stored offline helper identity is invalid".into())
+            })?,
+            None => {
+                let helper = self
+                    .runtime
+                    .prepare_stopped_source_seal(source, authorization)
+                    .await
+                    .map_err(|error| {
+                        crate::utils::map_runtime_error("Prepare offline source helper", error)
+                    })?;
+                checkpoint["offline_source_helper"] =
+                    serde_json::to_value(&helper).map_err(|_| {
+                        AppOperationError::InvalidState(
+                            "Cannot encode offline helper identity".into(),
+                        )
+                    })?;
+                operation
+                    .checkpoint("offline_source_helper_prepared", checkpoint.clone())
+                    .await?;
+                helper
+            }
+        };
+        if helper.authorization != *authorization
+            || helper.source.context != source.context
+            || helper.source.resource.uid != source.resource.uid
+        {
+            return Err(AppOperationError::Conflict(
+                "Original offline helper source identity mismatch".into(),
+            ));
+        }
+        let seal: shared_types::RuntimeGenerationSourceSeal =
+            if let Some(value) = checkpoint.get("source_seal") {
+                serde_json::from_value(value.clone()).map_err(|_| {
+                    AppOperationError::InvalidState("Stored offline seal receipt is invalid".into())
+                })?
+            } else {
+                let seal = self
+                    .runtime
+                    .run_stopped_source_seal(&helper)
+                    .await
+                    .map_err(|error| {
+                        crate::utils::map_runtime_error("Run original offline source helper", error)
+                    })?;
+                if seal.authorization != *authorization {
+                    return Err(AppOperationError::InvalidState(
+                        "Offline source seal identity mismatch".into(),
+                    ));
+                }
+                checkpoint["source_seal"] = serde_json::to_value(&seal).map_err(|_| {
+                    AppOperationError::InvalidState("Cannot encode offline source seal".into())
+                })?;
+                operation
+                    .checkpoint("source_sealed", checkpoint.clone())
+                    .await?;
+                seal
+            };
+        if seal.authorization != *authorization {
+            return Err(AppOperationError::InvalidState(
+                "Stored offline source seal identity mismatch".into(),
+            ));
+        }
+        self.runtime
+            .cleanup_stopped_source_seal(&helper)
+            .await
+            .map_err(|error| {
+                crate::utils::map_runtime_error("Clean original offline helper", error)
+            })?;
+        operation
+            .checkpoint("offline_source_helper_cleaned", checkpoint.clone())
+            .await?;
+        Ok(seal)
+    }
+
     /// Wake/hot deployment may verify only the previously applied version. This
     /// path never changes PG passwords or opens a different generation's gate.
     pub(crate) async fn observe_applied_runtime_configuration(
@@ -376,6 +504,27 @@ impl AppService {
                 "Generation handoff checkpoint identity mismatch".into(),
             ));
         }
+        let source_seal: shared_types::RuntimeGenerationSourceSeal = operation
+            .checkpoint
+            .get("source_seal")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .ok_or_else(|| {
+                AppOperationError::InvalidState(
+                    "Generation handoff has no valid source seal".into(),
+                )
+            })?;
+        if source_seal.authorization != expected
+            || source_seal.artifact_release_id.trim().is_empty()
+            || source_seal.source_journal_sha256.len() != 64
+            || !source_seal
+                .source_journal_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(AppOperationError::InvalidState(
+                "Generation source seal identity or evidence mismatch".into(),
+            ));
+        }
         let runner = BoundManagementRunner {
             service: self,
             context,
@@ -443,6 +592,9 @@ impl AppService {
                 };
                 if envelope["success"] != true
                     || prepared.authorization != expected
+                    || prepared.artifact_release_id != source_seal.artifact_release_id
+                    || prepared.previous_journal_sha256 != source_seal.source_journal_sha256
+                    || prepared.desired_revision != source_seal.desired_revision
                     || prepared.artifact_release_id.trim().is_empty()
                     || prepared.execution_workspace.trim().is_empty()
                     || !digest(&prepared.release_manifest_sha256)
@@ -850,6 +1002,12 @@ mod handoff_tests {
             "disconnect",
             "wrong-receipt",
             "preparation-failed",
+            "recovery-old",
+            "recovery-new",
+            "recovery-third",
+            "offline",
+            "offline-run-unknown",
+            "offline-cleanup-unknown",
         ] {
             let root = tempfile::tempdir().unwrap();
             let runtime = Arc::new(crate::test_support::MockRuntime::default());
@@ -865,9 +1023,14 @@ mod handoff_tests {
             *runtime.mutation_uid_override.lock().unwrap() = Some("workloaduid".into());
             let current = container_runtime_api::DeploymentStatus {
                 app_id: app_id.into(),
-                replicas: 1,
-                ready_replicas: 1,
-                phase: "Running".into(),
+                replicas: if fault.starts_with("offline") { 0 } else { 1 },
+                ready_replicas: if fault.starts_with("offline") { 0 } else { 1 },
+                phase: if fault.starts_with("offline") {
+                    "Stopped"
+                } else {
+                    "Running"
+                }
+                .into(),
                 ..Default::default()
             };
             runtime.deployments.insert(app_id.into(), current.clone());
@@ -887,6 +1050,15 @@ mod handoff_tests {
             let guard = service
                 .try_acquire_process_release_lock(app_id)
                 .await
+                .unwrap();
+            // Docker uses the real file guard above. This runtime fixture also
+            // requires an explicit management lease (its Pod exec contract), so
+            // acquire it normally instead of faking its lease_held assertion.
+            let _management_lease = service
+                .runtime
+                .acquire_app_operation(app_id)
+                .await
+                .unwrap()
                 .unwrap();
             let mut operation = crate::service::OwnedOperation::admit(
                 service.metadata.store.clone(),
@@ -954,9 +1126,16 @@ mod handoff_tests {
                     authorization, artifact_release_id: "latesthotrelease".into(), source_journal_sha256: "b".repeat(64), desired_revision: 4,
                 }}).to_string(), if fault == "disconnect" { 7 } else { 0 }));
             }
+            runtime.patch_preparation_fails.store(
+                matches!(fault, "preparation-failed" | "recovery-old"),
+                Ordering::SeqCst,
+            );
             runtime
-                .patch_preparation_fails
-                .store(fault == "preparation-failed", Ordering::SeqCst);
+                .offline_source_run_fails
+                .store(fault == "offline-run-unknown", Ordering::SeqCst);
+            runtime
+                .offline_source_cleanup_fails
+                .store(fault == "offline-cleanup-unknown", Ordering::SeqCst);
             let params = container_runtime_api::ContainerCreateParams::builder()
                 .project_id(app_id)
                 .service_type(shared_types::ServiceType::Userapp)
@@ -979,9 +1158,75 @@ mod handoff_tests {
                 )
                 .build();
             let result = service
-                .execute_update(app_id, params, current, &mut operation, &guard)
+                .execute_update(
+                    app_id,
+                    params.clone(),
+                    current.clone(),
+                    &mut operation,
+                    &guard,
+                )
                 .await;
             let commands = runtime.configuration_commands.lock().unwrap().clone();
+            if fault.starts_with("offline") {
+                assert!(
+                    commands.is_empty(),
+                    "stopped source must not use active-owner exec"
+                );
+                assert_eq!(runtime.management_start_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+                let before = service
+                    .metadata
+                    .store
+                    .get_operation(app_id, &context.operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    before.checkpoint["offline_source_helper"]["helper_uid"],
+                    "originalhelperuid"
+                );
+                if fault == "offline" {
+                    result.unwrap();
+                } else {
+                    assert!(result.is_err());
+                    assert!(guard.has_unfinished_mutation());
+                    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+                    runtime
+                        .offline_source_run_fails
+                        .store(false, Ordering::SeqCst);
+                    runtime
+                        .offline_source_cleanup_fails
+                        .store(false, Ordering::SeqCst);
+                    service
+                        .execute_update(app_id, params, current, &mut operation, &guard)
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+                let calls = runtime.offline_source_calls.lock().unwrap().clone();
+                let expected = match fault {
+                    "offline-run-unknown" => vec!["prepare", "run", "run", "cleanup"],
+                    "offline-cleanup-unknown" => vec!["prepare", "run", "cleanup", "cleanup"],
+                    _ => vec!["prepare", "run", "cleanup"],
+                };
+                assert_eq!(calls, expected, "{fault}");
+                let after = service
+                    .metadata
+                    .store
+                    .get_operation(app_id, &context.operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    after.checkpoint["generation_handoff"],
+                    before.checkpoint["generation_handoff"]
+                );
+                assert_eq!(
+                    after.checkpoint["offline_source_helper"],
+                    before.checkpoint["offline_source_helper"]
+                );
+                continue;
+            }
             assert!(!commands.is_empty(), "must reach source owner: {fault}");
             assert!(commands.iter().all(|command| {
                 command
@@ -1000,18 +1245,86 @@ mod handoff_tests {
                 record.checkpoint["source_management_target"]["physical_uid"],
                 format!("test-{}", context.lifecycle_id)
             );
-            if fault == "busy-then-sealed" {
-                result.unwrap();
-                assert_eq!(commands.len(), 2);
+            if fault == "busy-then-sealed" || fault.starts_with("recovery") {
+                if fault == "recovery-old" {
+                    assert!(result.is_err());
+                } else {
+                    result.unwrap();
+                }
+                if fault == "busy-then-sealed" {
+                    assert_eq!(commands.len(), 2);
+                    assert_eq!(
+                        commands[0], commands[1],
+                        "retry must preserve original request"
+                    );
+                }
                 assert_eq!(
-                    commands[0], commands[1],
-                    "retry must preserve original request"
+                    runtime.create_calls.load(Ordering::SeqCst),
+                    usize::from(fault != "recovery-old")
                 );
-                assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
                 assert_eq!(
                     record.checkpoint["source_seal"]["artifact_release_id"],
                     "latesthotrelease"
                 );
+                if fault.starts_with("recovery") {
+                    runtime
+                        .patch_preparation_fails
+                        .store(false, Ordering::SeqCst);
+                    if fault != "recovery-old" {
+                        let installed =
+                            runtime.create_params_history.get(app_id).unwrap()[0].clone();
+                        let mut installed_env = installed.env.clone().unwrap();
+                        if fault == "recovery-third" {
+                            installed_env.insert(
+                                shared_types::APP_DEPLOY_GENERATION_ID.into(),
+                                "thirdgeneration".into(),
+                            );
+                        }
+                        runtime.specs.insert(
+                            app_id.into(),
+                            container_runtime_api::ContainerSpecSnapshot {
+                                env: Some(installed_env),
+                                ..Default::default()
+                            },
+                        );
+                    } else {
+                        runtime.configuration_replies.lock().unwrap().push_back(reply(
+                            serde_json::json!({"success":true,"data":record.checkpoint["source_seal"]}).to_string(), 0));
+                    }
+                    let resumed = service
+                        .execute_update(app_id, params, current, &mut operation, &guard)
+                        .await;
+                    assert_eq!(
+                        resumed.is_ok(),
+                        fault != "recovery-third",
+                        "{fault}: {resumed:?}"
+                    );
+                    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1, "{fault}");
+                    let resumed_commands = runtime.configuration_commands.lock().unwrap().clone();
+                    assert_eq!(
+                        resumed_commands.len(),
+                        if fault == "recovery-old" { 2 } else { 1 }
+                    );
+                    if fault == "recovery-old" {
+                        assert_eq!(resumed_commands[0], resumed_commands[1]);
+                    }
+                    let resumed_record = service
+                        .metadata
+                        .store
+                        .get_operation(app_id, &context.operation_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        resumed_record.checkpoint["generation_handoff"],
+                        record.checkpoint["generation_handoff"]
+                    );
+                    assert_eq!(
+                        resumed_record.checkpoint["source_management_target"],
+                        record.checkpoint["source_management_target"]
+                    );
+                    assert!(guard.has_unfinished_mutation());
+                }
             } else {
                 assert!(result.is_err(), "{fault}");
                 assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0, "{fault}");
@@ -1030,6 +1343,9 @@ mod handoff_tests {
         for fault in [
             "wrong-operation",
             "wrong-physical-source",
+            "wrong-journal-digest",
+            "wrong-artifact",
+            "wrong-desired-revision",
             "rejected",
             "disconnect",
             "consumed",
@@ -1100,7 +1416,10 @@ mod handoff_tests {
             operation
                 .checkpoint(
                     "runtime_updated",
-                    serde_json::json!({"generation_handoff":authorization}),
+                    serde_json::json!({"generation_handoff":authorization, "source_seal": shared_types::RuntimeGenerationSourceSeal {
+                        authorization: authorization.clone(), artifact_release_id: "hot-b".into(),
+                        source_journal_sha256: "b".repeat(64), desired_revision: 2,
+                    }}),
                 )
                 .await
                 .unwrap();
@@ -1202,6 +1521,9 @@ mod handoff_tests {
                 "wrong-physical-source" => {
                     prepared.authorization.previous_resource_uid = "replacement-impostor".into()
                 }
+                "wrong-journal-digest" => prepared.previous_journal_sha256 = "c".repeat(64),
+                "wrong-artifact" => prepared.artifact_release_id = "staleartifact".into(),
+                "wrong-desired-revision" => prepared.desired_revision += 1,
                 _ => {}
             }
             runtime.configuration_replies.lock().unwrap().push_back(

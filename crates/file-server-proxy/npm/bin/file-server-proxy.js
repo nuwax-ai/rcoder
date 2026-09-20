@@ -8,7 +8,7 @@ const { compatibilityArgs } = require("../lib/orchestrate");
 
 async function main(argv) {
   if (argv.includes("--help") || argv.includes("-h")) {
-    console.log("file-server-proxy start|stop|status|restart|recover [--port N] [--policy all_rust|ts_first|all_ts] [--ts-port N] [--detached]\nRust owns each listener scope; unknown owners require reconciliation, never PID cleanup.");
+    console.log("file-server-proxy start|stop|status|restart|recover|retire [--port N] [--policy all_rust|ts_first|all_ts] [--ts-port N] [--detached]\nRust owns each listener scope; unknown owners require reconciliation, never PID cleanup.");
     return;
   }
   const binary = await ensureBinary();
@@ -19,7 +19,7 @@ async function main(argv) {
     return;
   }
   const action = argv.shift();
-  if (!["start", "stop", "status", "restart", "recover"].includes(action)) throw new Error("expected start, stop, status, restart or recover");
+  if (!["start", "stop", "status", "restart", "recover", "retire"].includes(action)) throw new Error("expected start, stop, status, restart, recover or retire");
   let policy = process.env.FILE_SERVER_PROXY_POLICY || "all_rust";
   let detached = false, tsPort;
   const scope = [], forwarded = [];
@@ -43,7 +43,7 @@ async function main(argv) {
   }
   if (!["all_rust", "ts_first", "all_ts"].includes(policy)) throw new Error("unsupported policy");
   const env = { ...process.env };
-  if (action === "status" || action === "stop" || action === "recover") {
+  if (action === "status" || action === "stop" || action === "recover" || action === "retire") {
     console.log(JSON.stringify(await control(binary, action, scope, env)));
     return;
   }

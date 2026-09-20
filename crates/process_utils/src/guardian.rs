@@ -2,6 +2,7 @@
 use crate::managed_tree::{ManagedChild, StopOutcome, spawn_managed};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     ffi::OsString,
     fs::File,
@@ -28,6 +29,7 @@ struct Receipt {
     instance_id: String,
     phase: String,
     command_record: Option<PathBuf>,
+    command_digest: String,
 }
 fn save(root: &Path, receipt: &Receipt) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(root)?;
@@ -96,7 +98,7 @@ impl OwnedChild {
     }
     pub async fn wait_root(&mut self) -> std::io::Result<ExitStatus> {
         match self {
-            Self::Direct(c) => c.wait_root().await,
+            Self::Direct(c) => c.wait_root().await.map_err(std::io::Error::other),
             Self::Guarded { child, .. } => child.wait().await,
         }
     }
@@ -156,8 +158,18 @@ fn confirm_command(root: &Path, receipt: &Receipt) -> Result<()> {
 }
 fn confirmed(root: &Path) -> Result<()> {
     let _lock = lock(root)?;
+    let receipt = read(root)?;
+    let instance = root
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|s| s.to_str());
     ensure!(
-        read(root)?.phase == "Quiescent",
+        instance == Some(receipt.instance_id.as_str()),
+        "guardian instance mismatch"
+    );
+    ensure!(
+        matches!(receipt.phase.as_str(), "Quiescent" | "Revoked"),
         "guardian cleanup unconfirmed"
     );
     Ok(())
@@ -214,6 +226,7 @@ pub async fn spawn_guarded(
         instance_id,
         phase: "Pending".into(),
         command_record: command_record.map(Path::to_path_buf),
+        command_digest: format!("{:x}", Sha256::digest(serde_json::to_vec(&spec)?)),
     };
     save(&root, &receipt)?;
     let mut guardian = tokio::process::Command::new(std::env::current_exe()?);
@@ -261,6 +274,18 @@ pub async fn run(root: &Path) -> Result<i32> {
         receipt.phase == "Pending",
         "guardian authorization already consumed/revoked"
     );
+    let result = execute_unconsumed(root, &mut receipt).await;
+    if result.is_err() && receipt.phase == "Pending" {
+        // Holding the original authorization lock and not having entered the
+        // pre-spawn Running boundary proves no business child was started.
+        receipt.phase = "Revoked".into();
+        save(root, &receipt)?;
+        confirm_command(root, &receipt)?;
+    }
+    result
+}
+
+async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
     if let Some(path) = &receipt.command_record {
         let work = root
             .parent()
@@ -297,10 +322,14 @@ pub async fn run(root: &Path) -> Result<i32> {
     let mut bytes = Vec::new();
     input.read_until(b'\n', &mut bytes).await?;
     ensure!(
-        !bytes.is_empty() && bytes.len() <= 1024 * 1024,
+        !bytes.is_empty() && bytes.len() <= 1024 * 1024 && bytes.last() == Some(&b'\n'),
         "invalid guardian command frame"
     );
     let spec: Spec = serde_json::from_slice(&bytes)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(serde_json::to_vec(&spec)?)) == receipt.command_digest,
+        "guardian command differs from original authorized specification"
+    );
     let mut command = tokio::process::Command::new(spec.program);
     command
         .args(spec.args)
@@ -323,12 +352,12 @@ pub async fn run(root: &Path) -> Result<i32> {
     // Mark the spawn window before the side effect. A guardian crash during
     // spawn must not be misread as unconsumed Pending during recovery.
     receipt.phase = "Running".into();
-    save(root, &receipt)?;
+    save(root, receipt)?;
     let mut child = match spawn_managed(command) {
         Ok(child) => child,
         Err(error) => {
             receipt.phase = "Quiescent".into();
-            save(root, &receipt)?;
+            save(root, receipt)?;
             return Err(error);
         }
     };
@@ -345,13 +374,13 @@ pub async fn run(root: &Path) -> Result<i32> {
     }
     receipt.phase = "Quiescent".into();
     loop {
-        if save(root, &receipt).is_ok() {
+        if save(root, receipt).is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     loop {
-        if confirm_command(root, &receipt).is_ok() {
+        if confirm_command(root, receipt).is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -387,4 +416,72 @@ pub fn recover(work_root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn stopping_owner_revokes_unconsumed_guardian_without_spawning() {
+        let scope = tempfile::tempdir().unwrap();
+        let instance = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = scope
+            .path()
+            .join("work")
+            .join(&instance)
+            .join("guardians")
+            .join(&id);
+        crate::command_context::create_durable_directory(&root).unwrap();
+        std::fs::write(
+            scope.path().join("owner.json"),
+            serde_json::to_vec(&serde_json::json!({"instance_id":instance,"phase":"Stopping"}))
+                .unwrap(),
+        )
+        .unwrap();
+        let receipt = Receipt {
+            version: 1,
+            id,
+            instance_id: instance,
+            phase: "Pending".into(),
+            command_record: None,
+            command_digest: "0".repeat(64),
+        };
+        save(&root, &receipt).unwrap();
+        // Rejection occurs before reading a spec or spawning a child.
+        assert!(run(&root).await.is_err());
+        assert_eq!(read(&root).unwrap().phase, "Revoked");
+        confirmed(&root).unwrap();
+        assert!(run(&root).await.is_err());
+        assert_eq!(read(&root).unwrap().phase, "Revoked");
+    }
+    #[tokio::test]
+    async fn consumed_unknown_guardian_is_never_revoked_by_rejection() {
+        let scope = tempfile::tempdir().unwrap();
+        let instance = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = scope
+            .path()
+            .join("work")
+            .join(&instance)
+            .join("guardians")
+            .join(&id);
+        crate::command_context::create_durable_directory(&root).unwrap();
+        save(
+            &root,
+            &Receipt {
+                version: 1,
+                id,
+                instance_id: instance,
+                phase: "Running".into(),
+                command_record: None,
+                command_digest: "0".repeat(64),
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(root.join("receipt.json")).unwrap();
+        assert!(run(&root).await.is_err());
+        assert!(confirmed(&root).is_err());
+        assert_eq!(std::fs::read(root.join("receipt.json")).unwrap(), before);
+    }
 }

@@ -556,6 +556,32 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    async fn prepare_stopped_source_seal(
+        &self,
+        _source: &shared_types::UserAppMutationTarget,
+        _authorization: &shared_types::RuntimeGenerationHandoff,
+    ) -> ContainerRuntimeResult<crate::OfflineSourceSealTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Offline source sealing is unsupported".into(),
+        ))
+    }
+    async fn run_stopped_source_seal(
+        &self,
+        _target: &crate::OfflineSourceSealTarget,
+    ) -> ContainerRuntimeResult<shared_types::RuntimeGenerationSourceSeal> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Offline source sealing is unsupported".into(),
+        ))
+    }
+    async fn cleanup_stopped_source_seal(
+        &self,
+        _target: &crate::OfflineSourceSealTarget,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Offline source sealing is unsupported".into(),
+        ))
+    }
+
     /// Start the captured compute solely for management; preserve wake policy.
     /// Never substitute ordinary start, which may enable automatic traffic wake.
     async fn start_app_management_target(

@@ -16,6 +16,8 @@ pub(crate) enum Boundary {
     Switching,
     Activated,
     Active,
+    /// The previous artifact is serving again; the failed attempt stays failed.
+    RestoredActive,
     /// Artifact and shutdown confirmed; migrations confirmed, only startup failed.
     StartupFailed,
     Failed,
@@ -110,7 +112,8 @@ impl Journal {
                 continue;
             }
             let has_records = legacy.join(".deploy-operation.json").try_exists()?
-                || legacy.join(".deploy-coordinator.json").try_exists()?;
+                || legacy.join(".deploy-coordinator.json").try_exists()?
+                || legacy.join(".generation-source-seal.json").try_exists()?;
             if !has_records {
                 continue;
             }
@@ -137,7 +140,11 @@ impl Journal {
         let Some(legacy) = self.legacy_root.as_ref() else {
             return Ok(());
         };
-        for name in [".deploy-operation.json", ".deploy-coordinator.json"] {
+        for name in [
+            ".deploy-operation.json",
+            ".deploy-coordinator.json",
+            ".generation-source-seal.json",
+        ] {
             let source = legacy.join(name);
             if source.try_exists()? {
                 anyhow::ensure!(

@@ -343,6 +343,14 @@ impl RuntimeStore {
             .filter(|token| !token.is_empty())
     }
 
+    /// Read the original identity without claiming a new running instance.
+    pub(crate) fn existing_identity(&self) -> Result<RuntimeIdentityView> {
+        serde_json::from_value(
+            read_json(&self.identity_path())?.context("source runtime identity missing")?,
+        )
+        .context("decode source runtime identity")
+    }
+
     /// 读取/落盘身份（runtime_instance_id 每次进程启动新生成；
     /// deployment_generation_id 延续既有代次）。
     pub(crate) fn load_or_init_identity(
@@ -699,7 +707,7 @@ impl RuntimeKernel {
     /// caller also holds the legacy deployment admission lock.
     pub(crate) fn try_seal_source<T>(
         &self,
-        persist: impl FnOnce() -> Result<T>,
+        persist: impl FnOnce(&mut bool) -> Result<T>,
     ) -> Result<Option<T>> {
         let Ok(mut guard) = self.admission.try_lock() else {
             return Ok(None);
@@ -714,9 +722,14 @@ impl RuntimeKernel {
         {
             return Ok(None);
         }
-        let result = persist()?;
-        guard.source_sealed = true;
-        Ok(Some(result))
+        // Set by the caller immediately before the first durable write. An
+        // error after that point cannot prove that the reservation is absent.
+        let mut write_started = false;
+        let result = persist(&mut write_started);
+        if write_started || result.is_ok() {
+            guard.source_sealed = true;
+        }
+        result.map(Some)
     }
 
     pub(crate) fn identity(&self) -> &RuntimeIdentityView {
@@ -1598,6 +1611,27 @@ mod tests {
         let store = open_store(&workspace);
         let identity = identity();
         RuntimeKernel::new(store, identity, Box::new(|_| {}))
+    }
+
+    #[tokio::test]
+    async fn source_seal_unknown_write_blocks_admission_but_validation_error_does_not() {
+        for write_started in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let kernel = kernel(dir.path());
+            let result: Result<Option<()>> = kernel.try_seal_source(|started| {
+                *started = write_started;
+                anyhow::bail!("injected source seal failure")
+            });
+            assert!(result.is_err());
+            let admitted = kernel
+                .admit(request(RuntimeOperationKind::Start, "afterseal"))
+                .await;
+            if write_started {
+                assert_eq!(admitted.err().unwrap().code, "HANDOFF_SOURCE_SEALED");
+            } else {
+                assert!(admitted.is_ok());
+            }
+        }
     }
 
     #[tokio::test]

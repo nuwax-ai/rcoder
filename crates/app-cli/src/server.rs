@@ -559,7 +559,7 @@ impl ServerState {
         let kernel = self
             .runtime_kernel()
             .context("source runtime kernel unavailable")?;
-        kernel.try_seal_source(|| {
+        kernel.try_seal_source(|write_started| {
             let guard = self
                 .journal
                 .lock()
@@ -570,7 +570,10 @@ impl ServerState {
                 .as_ref()
                 .context("source artifact is unconfirmed")?;
             anyhow::ensure!(
-                matches!(receipt.boundary, Boundary::Active | Boundary::StartupFailed),
+                matches!(
+                    receipt.boundary,
+                    Boundary::Active | Boundary::RestoredActive | Boundary::StartupFailed
+                ),
                 "source journal has an unconfirmed mutation boundary"
             );
             anyhow::ensure!(
@@ -603,16 +606,21 @@ impl ServerState {
                 ),
                 desired_revision,
             };
-            if let Some(previous) = journal.source_seal()? {
-                if previous.authorization.previous_generation == self.generation {
-                    anyhow::ensure!(
-                        previous == seal,
-                        "source is reserved for a different handoff or changed state"
-                    );
-                    return Ok(previous);
-                }
+            if let Some(previous) = journal.source_seal()?
+                && previous.authorization.previous_generation == self.generation
+            {
+                anyhow::ensure!(
+                    previous == seal,
+                    "source is reserved for a different handoff or changed state"
+                );
+                return Ok(previous);
             }
-            journal.write_source_seal(&seal)?;
+            *write_started = true;
+            if let Err(error) = journal.write_source_seal(&seal) {
+                self.runtime_recovery_hold
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(error);
+            }
             Ok(seal)
         })
     }
@@ -1123,6 +1131,22 @@ impl ServerState {
                 && receipt.operation.operation_id == operation.operation_id,
             "deployment receipt does not belong to the current operation"
         );
+        if boundary == Boundary::RestoredActive {
+            let active = receipt
+                .active
+                .as_ref()
+                .context("restored artifact missing")?;
+            anyhow::ensure!(
+                matches!(
+                    receipt.boundary,
+                    Boundary::Preparing | Boundary::Switching | Boundary::RestoredActive
+                ) && operation.phase == AppCliDeployPhase::Failed
+                    && self
+                        .release()
+                        .is_some_and(|release| release.release_id == active.artifact_release_id),
+                "restoration requires the confirmed previous artifact and failed preparation"
+            );
+        }
         receipt.boundary = boundary.clone();
         receipt.operation = operation;
         if matches!(boundary, Boundary::Activated | Boundary::Active) {
@@ -1239,7 +1263,7 @@ impl ServerState {
         if !failed {
             self.persist_boundary(Boundary::Active)?;
         } else {
-            self.persist_boundary(Boundary::Preparing)?;
+            self.persist_boundary(Boundary::RestoredActive)?;
         }
         self.set_phase(ServerPhase::Running);
         Ok(())
@@ -2104,6 +2128,89 @@ async fn establish_startup_quiescence(
     Ok(())
 }
 
+/// Legacy `run` must honor the same durable source reservation as `serve`.
+/// The caller holds OwnerGuard; read the journal generation rather than trusting
+/// a caller-provided environment override to bypass a reservation.
+pub fn require_unsealed_legacy_source(state_root: &std::path::Path) -> Result<()> {
+    let bytes = match std::fs::read(state_root.join(".generation-source-seal.json")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("read source reservation before legacy startup"),
+    };
+    let seal: shared_types::RuntimeGenerationSourceSeal = serde_json::from_slice(&bytes)
+        .context("decode source reservation before legacy startup")?;
+    seal.authorization.validate().map_err(anyhow::Error::msg)?;
+    let receipt: Receipt = serde_json::from_slice(
+        &std::fs::read(state_root.join(".deploy-operation.json"))
+            .context("read reserved source journal")?,
+    )
+    .context("decode reserved source journal")?;
+    anyhow::ensure!(
+        receipt.generation == seal.authorization.activation.deployment_generation
+            && receipt.generation != seal.authorization.previous_generation,
+        "runtime generation is reserved for replacement; legacy startup is not permitted"
+    );
+    Ok(())
+}
+
+/// Offline counterpart of the source-owner API. The runtime caller must prove
+/// the captured container is stopped and mount exactly its original volume.
+/// This function independently holds the ordinary owner/journal locks and never
+/// calls startup recovery, a service supervisor, or a network listener.
+pub async fn seal_stopped_source(
+    workspace: &std::path::Path,
+    authorization: &shared_types::RuntimeGenerationHandoff,
+) -> Result<shared_types::RuntimeGenerationSourceSeal> {
+    use crate::runtime_kernel::RuntimeStore;
+    authorization.validate().map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        std::env::var("PROJECT_ID").ok().as_deref() == Some(authorization.app_id.as_str())
+            && std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
+                .ok()
+                .as_deref()
+                == Some(authorization.previous_generation.as_str()),
+        "offline source environment does not match authorization"
+    );
+    let root = RuntimeStore::resolve_root(workspace, &authorization.app_id)?;
+    seal_stopped_source_at_root(workspace, authorization, root).await
+}
+
+async fn seal_stopped_source_at_root(
+    workspace: &std::path::Path,
+    authorization: &shared_types::RuntimeGenerationHandoff,
+    root: std::path::PathBuf,
+) -> Result<shared_types::RuntimeGenerationSourceSeal> {
+    use crate::runtime_kernel::{RuntimeKernel, RuntimeStore};
+    let _owner = crate::platform::owner_guard::OwnerGuard::try_acquire(&root)?
+        .context("source runtime still owns workspace")?;
+    let mut journal = Journal::open_with_root(workspace, root.clone())?;
+    journal.require_fresh_process_scope()?;
+    let store = RuntimeStore::open_with_root(root, workspace)?;
+    let identity = store.existing_identity()?;
+    anyhow::ensure!(
+        identity.application_id == authorization.app_id
+            && identity.deployment_generation_id == authorization.previous_generation
+            && identity.source_root
+                == runtime_state_layout::canonical_project_root(workspace).to_string_lossy(),
+        "offline source identity does not match authorization or workspace"
+    );
+    // Unlike serve, this command has no listener. Exclusive owner admission and
+    // the stopped-process/identity checks above precede any journal migration.
+    journal.migrate_after_bind()?;
+    let kernel = Arc::new(RuntimeKernel::new(store, identity, Box::new(|_| {})));
+    kernel.recover().await?;
+    let mut state = ServerState::new(RuntimeStatusService::default());
+    state.generation = authorization.previous_generation.clone();
+    *state
+        .journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("source journal lock poisoned"))? = Some(journal);
+    state.set_runtime_kernel(kernel);
+    state
+        .seal_generation_source(workspace, authorization)?
+        .context("offline source has an active runtime operation")
+}
+
 /// Resolve only owner-relative targets; persisted records cannot redirect writes
 /// to an arbitrary path. The owner identity remains the original project root.
 fn execution_workspace(
@@ -2194,7 +2301,10 @@ fn prepare_generation_handoff(args: &RuntimeArgs, state: &ServerState) -> Result
         );
     }
     anyhow::ensure!(
-        matches!(receipt.boundary, Boundary::Active | Boundary::StartupFailed),
+        matches!(
+            receipt.boundary,
+            Boundary::Active | Boundary::RestoredActive | Boundary::StartupFailed
+        ),
         "handoff requires confirmed active or startup-failed boundary"
     );
     let active = receipt
@@ -2245,6 +2355,12 @@ fn prepare_generation_handoff(args: &RuntimeArgs, state: &ServerState) -> Result
             desired_revision: revision,
         }
     };
+    anyhow::ensure!(
+        prepared.previous_journal_sha256 == source_seal.source_journal_sha256
+            && prepared.artifact_release_id == source_seal.artifact_release_id
+            && prepared.desired_revision == source_seal.desired_revision,
+        "prepared handoff differs from source reservation"
+    );
     let authorized_revision = prepared
         .desired_revision
         .checked_add(1)
@@ -3971,6 +4087,100 @@ format = "jsonl"
     }
 
     #[test]
+    fn legacy_start_cannot_bypass_source_seal_before_destination_is_prepared() {
+        let dir = tempfile::tempdir().unwrap();
+        let (args, state) = handoff_fixture(dir.path(), false);
+        // This fixture uses the historical volume journal root.
+        assert!(require_unsealed_legacy_source(dir.path()).is_err());
+        prepare_generation_handoff(&args, &state).unwrap();
+        assert!(require_unsealed_legacy_source(dir.path()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn offline_source_seal_replays_without_changing_owner_identity_or_desired() {
+        for presealed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (args, state) = handoff_fixture(dir.path(), true);
+            let authorization = state
+                .configuration_gate()
+                .unwrap()
+                .handoff()
+                .unwrap()
+                .clone();
+            let root = dir.path().join("state-root");
+            let mut identity = state.runtime_kernel().unwrap().identity().clone();
+            identity.application_id = authorization.app_id.clone();
+            identity.deployment_generation_id = authorization.previous_generation.clone();
+            identity.source_root = runtime_state_layout::canonical_project_root(&args.workspace)
+                .to_string_lossy()
+                .into_owned();
+            let identity_bytes = serde_json::to_vec(&identity).unwrap();
+            std::fs::write(root.join("identity.json"), &identity_bytes).unwrap();
+            let desired = state
+                .runtime_kernel()
+                .unwrap()
+                .store()
+                .load_desired()
+                .unwrap();
+            {
+                let mut guard = state.journal.lock().unwrap();
+                let journal = guard.as_mut().unwrap();
+                journal.commit_coordinator().unwrap();
+                journal.commit_quiescent().unwrap();
+            }
+            drop(state);
+            if !presealed {
+                std::fs::remove_file(dir.path().join(".generation-source-seal.json")).unwrap();
+            }
+            let first = seal_stopped_source_at_root(&args.workspace, &authorization, root.clone())
+                .await
+                .unwrap();
+            let second = seal_stopped_source_at_root(&args.workspace, &authorization, root.clone())
+                .await
+                .unwrap();
+            assert_eq!(first, second);
+            assert!(!dir.path().join(".generation-source-seal.json").exists());
+            assert!(!dir.path().join(".deploy-operation.json").exists());
+            assert!(root.join(".deploy-operation.json").is_file());
+            assert_eq!(
+                std::fs::read(root.join("identity.json")).unwrap(),
+                identity_bytes
+            );
+            let store =
+                crate::runtime_kernel::RuntimeStore::open_with_root(root, &args.workspace).unwrap();
+            assert_eq!(store.load_desired().unwrap(), desired);
+        }
+    }
+
+    #[test]
+    fn handoff_replay_rejects_changed_source_evidence_before_desired_write() {
+        for field in ["journal", "artifact", "revision"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (args, state) = handoff_fixture(dir.path(), false);
+            prepare_generation_handoff(&args, &state).unwrap();
+            let kernel = state.runtime_kernel().unwrap();
+            let desired_before = kernel.store().load_desired().unwrap();
+            {
+                let mut guard = state.journal.lock().unwrap();
+                let journal = guard.as_mut().unwrap();
+                let mut receipt = journal.receipt.clone().unwrap();
+                let prepared = receipt.generation_handoff.as_mut().unwrap();
+                match field {
+                    "journal" => prepared.previous_journal_sha256 = "f".repeat(64),
+                    "artifact" => prepared.artifact_release_id = "different-artifact".into(),
+                    _ => prepared.desired_revision += 1,
+                }
+                journal.write(receipt).unwrap();
+            }
+            assert!(
+                prepare_generation_handoff(&args, &state).is_err(),
+                "{field}"
+            );
+            assert_eq!(kernel.store().load_desired().unwrap(), desired_before);
+        }
+    }
+
+    #[test]
     fn configuration_handoff_preserves_hot_artifact_and_explicitly_starts_stopped_owner() {
         for stopped in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -4465,7 +4675,7 @@ format = "jsonl"
             .receipt
             .clone()
             .unwrap();
-        assert_eq!(receipt.boundary, Boundary::Preparing);
+        assert_eq!(receipt.boundary, Boundary::RestoredActive);
         assert_eq!(receipt.active.unwrap().artifact_release_id, "existing-a");
         assert_eq!(receipt.operation.phase, AppCliDeployPhase::Failed);
         drop(restarted);

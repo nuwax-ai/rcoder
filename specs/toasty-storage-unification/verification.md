@@ -979,3 +979,30 @@ Compose完整轮中AI场景因冻结源码没有.env.local且临时启动脚本�
 - 第一轮真实 PG 30/31；新旧租约反例留下新Running操作污染后续全局分页测试。修复仅在所有隔离断言之后，用新操作本身的身份收束并清理其租约，不改变生产逻辑或断言。
 - 第二轮真实 PG **31/31，退出 0**；报告目录由 `/tmp/rcoder-storage-new-pg-recheck-report.txt` 指向，日志 `/tmp/rcoder-storage-new-pg-recheck.log`。正式目录已包含 Preview 双独立owner竞争及跨身份约束矩阵。
 - app-cli source-seal首轮独立nextest **269/269通过，1环境项未执行**，日志 `/tmp/rcoder-appcli-source-seal-nextest.log`。后续配置写入屏障修改尚待新一轮验证，本记录不覆盖未测增量。
+
+## 2026-09-20 source-seal 与 native guardian 后续验证
+
+- 阶段提交 `bf2825ec` 后，native 四组件 `cargo check --all-targets` 通过。首轮 guardian 错误类型不匹配已修。
+- native nextest **484/484，0 skip**；日志 `/tmp/rcoder-native-guardian-nextest.log`。
+- macOS 实际 proxy 二进制故障脚本 6 项通过：`/tmp/rcoder-native-guardian-contract2.json` 含二进制 SHA，脚本为 `crates/file-server-proxy/tools/test_native_guardian.py`。覆盖 owner SIGKILL、TS/命令树清理、原实例 recover、新实例隔离、guardian 自身死亡时拒绝未知恢复；不代表 Windows/Linux 通过。
+- app-cli 首次追加轮 **269/271，1 skip**。两失败分别为恢复边界漏掉真实 Switching 路径、监听先开放时测试错误要求首个响应即 orchestrating。修复后两项及 source-seal 写入未知反例共 **3/3**，日志 `/tmp/rcoder-appcli-seal-focused.log`；完整追加轮仍在执行。
+- 平台 source-seal 两项测试首轮一过一失败。失败在真实运行夹具的 lease_held 断言，正在查因，不计通过；日志 `/tmp/rcoder-platform-source-seal-nextest.log`。
+- Stopped 物理容器的离线 source-seal helper 尚未实现，普通 start 管理接口不满足“不复活旧业务”的要求。
+
+- app-cli 完整追加轮已结束：`cargo nextest run --manifest-path crates/app-cli/Cargo.toml --no-fail-fast --all-features` 退出 0，**272/272，1 skip**。日志 `/tmp/rcoder-appcli-handoff-final-nextest.log`。覆盖 source-seal 未知写、辅助写屏障、RestoredActive 和 prepared/source-seal 三字段关联反例；不替代真实部署与三平台验收。
+
+- 平台 source-seal 夹具修复后聚焦 **1/1**（含 8 个内部恢复分支），退出 0，日志 `/tmp/rcoder-platform-source-seal-fixed.log`。Docker 文件锁之外显式获取 MockRuntime 要求的管理租约；原租约保护断言保留。prepared 三字段篡改用例在前轮已通过。
+- 新增 `app-cli seal-source --workspace ...` 离线入口正在开发验证：stdin 为授权 JSON，stdout 为原 source-seal，沿用原身份和期望状态；不启动业务/数据库/API。平台 helper 接入尚未验收，不能据命令存在宣布 Stopped 凭据切换完成。
+
+- 离线 source-seal 聚焦 nextest 退出 0，1/1，验证同授权重放以及 identity/desired 字节或语义不变；日志 `/tmp/rcoder-appcli-offline-seal-nextest.log`。随后增加 legacy run 读取原 journal 的封存检查，待下一次聚焦验证；平台 helper 与真实容器场景仍未完成。
+
+- 离线封存与 journal 迁移追加聚焦 **15/15**，退出 0，日志 `/tmp/rcoder-appcli-offline-journal-nextest.log`。含首次 seal、已有 seal 迁移重放、源/run 同锁域及旧锁保留。平台 app_manager/docker_manager 全 features/all-targets check 退出 0，日志 `/tmp/rcoder-offline-source-helper-check2.log`；平台真实运行仍待验证。
+
+- app-cli 离线入口及交接屏障 Clippy `--all-targets -- -D warnings` 退出 0，日志 `/tmp/rcoder-appcli-offline-clippy2.log`。
+- T0 新增共享 codec 三项边界反例：最大合法整数/u64超范围、微秒与非法时间、损坏JSON及u64大整数往返；已与平台 offline 反例合并到集中 nextest，尚待结果。这只是编解码层覆盖，不能替代两个数据库真实行读写的边界验收。
+
+## Qoder交接冻结
+
+最后集中nextest 10/10退出0：`/tmp/rcoder-offline-storage-focused2.log`。包含三个codec边界、helper输入/回执、Docker/K8s spec验证以及平台恢复链。首轮只因测试中的冗余限定路径被lint拒绝，已修复。根workspace与app-cli fmt检查通过；app-cli离线metadata解析退出0，已刷新新增path依赖sha2的独立lock清单，不代表retire新实现已编译。
+
+完整接续清单见 `specs/handoffs/2026-09-20-qoder-development-and-validation.md`。retire/spec摘要仍未编译实测，历史486/7项不扩大为当前结果。
