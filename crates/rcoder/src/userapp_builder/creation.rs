@@ -636,6 +636,11 @@ pub(super) async fn reconcile_fenced_ensure(
         return Ok(());
     }
     let Some(_local) = super::lifecycle::try_acquire(&snapshot.app_id).await else {
+        tracing::debug!(
+            operation_id = %snapshot.operation_id,
+            app_id = %snapshot.app_id,
+            "Fence settle skipped: app lifecycle lock is contended this tick"
+        );
         return Ok(());
     };
     // Re-read under the lock: another executor may have settled or advanced
@@ -647,15 +652,37 @@ pub(super) async fn reconcile_fenced_ensure(
     let Some(record) = current.filter(|record| {
         record.state == UserAppOperationState::RecoveryRequired && record.kind == snapshot.kind
     }) else {
+        tracing::debug!(
+            operation_id = %snapshot.operation_id,
+            app_id = %snapshot.app_id,
+            "Fence settle skipped: record advanced or settled concurrently"
+        );
         return Ok(());
     };
     // 无执行者声明的记录不可被扫描器收束（store 侧同样拒绝）。
     if record.executor_id.is_none() {
+        tracing::warn!(
+            operation_id = %record.operation_id,
+            app_id = %record.app_id,
+            "Fence kept: record has no executor claim"
+        );
         return Ok(());
     }
     let evidence = match observe_fence_evidence(state, &record).await {
         FenceEvidence::Observed(evidence) => evidence,
-        FenceEvidence::Insufficient => return Ok(()),
+        FenceEvidence::Insufficient => {
+            // 线上定位锚点：此日志出现说明分发与执行都正常、卡在证据谓词
+            // （观察失败或身份不符）。每 app 每扫描周期一条，节流由扫描
+            // 器节奏（5s）天然限定。
+            tracing::warn!(
+                operation_id = %record.operation_id,
+                app_id = %record.app_id,
+                kind = ?record.kind,
+                step = %record.step,
+                "Fence kept: evidence predicate returned insufficient"
+            );
+            return Ok(());
+        }
     };
     // 经 store 的 sanctioned 终态化路径（内部 Running 跳转满足状态机独占
     // 门，纯记账不授权运行时工作）——直接 advance(Failed) 会被
@@ -1406,7 +1433,7 @@ mod tests {
 // ============================================================================
 
 #[cfg(test)]
-mod fence_settler_tests {
+pub(crate) mod fence_settler_tests {
     use super::*;
     use crate::app_state::AppState;
     use arc_swap::ArcSwap;
@@ -1423,14 +1450,17 @@ mod fence_settler_tests {
 
     /// 可控运行态：deployment 相位/副本 + 活代 generation + builder 观察。
     #[derive(Default)]
-    struct FenceRuntime {
+    pub(crate) struct FenceRuntime {
         status: Mutex<Option<Option<DeploymentStatus>>>,
         generation: Mutex<Option<String>>,
-        builder_workload: Mutex<Option<String>>,
+        pub(crate) builder_workload: Mutex<Option<String>>,
     }
 
     impl FenceRuntime {
-        fn scenario(status: Option<DeploymentStatus>, generation: Option<&str>) -> Arc<Self> {
+        pub(crate) fn scenario(
+            status: Option<DeploymentStatus>,
+            generation: Option<&str>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 status: Mutex::new(Some(status)),
                 generation: Mutex::new(generation.map(str::to_string)),
@@ -1565,7 +1595,7 @@ mod fence_settler_tests {
         }
     }
 
-    async fn fence_state(
+    pub(crate) async fn fence_state(
         runtime: Arc<FenceRuntime>,
         kind: UserAppOperationKind,
         operation_id: &str,
@@ -1585,6 +1615,61 @@ mod fence_settler_tests {
         operation_id: &str,
         terminal: UserAppOperationState,
     ) -> (Arc<AppState>, tempfile::TempDir) {
+        let metadata_dir = tempfile::tempdir().expect("metadata directory");
+        let store = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &metadata_dir.path().join("userapp.turso.db"),
+            )
+            .await
+            .expect("store"),
+        );
+        let (state, _keep) =
+            fence_state_on_store(runtime, kind, operation_id, terminal, store).await;
+        // TempDir 必须活过测试：把 _keep 换成泄露（测试进程级可接受）。
+        std::mem::forget(metadata_dir);
+        (state, tempfile::tempdir().expect("placeholder dir"))
+    }
+
+    /// PG 后端变体：store 走 Postgres（集群形态），RCODER_PG_TEST_DSN 门控。
+    #[cfg(feature = "rcoder-pg")]
+    pub(crate) async fn fence_state_pg(
+        runtime: Arc<FenceRuntime>,
+        kind: UserAppOperationKind,
+        operation_id: &str,
+        dsn: &str,
+    ) -> Arc<AppState> {
+        let store = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::connect(
+                &rcoder_storage::config::PostgresConfig {
+                    url: Some(dsn.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("PG store"),
+        );
+        let (state, _keep) = fence_state_on_store(
+            runtime,
+            kind,
+            operation_id,
+            UserAppOperationState::RecoveryRequired,
+            store,
+        )
+        .await;
+        std::mem::forget(_keep);
+        state
+    }
+
+    async fn fence_state_on_store(
+        runtime: Arc<FenceRuntime>,
+        kind: UserAppOperationKind,
+        operation_id: &str,
+        terminal: UserAppOperationState,
+        store: Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
+    ) -> (
+        Arc<AppState>,
+        Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
+    ) {
         let (adapter, _cleanup_rx) =
             crate::storage::ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
         let activity = Arc::new(app_manager::AppActivityRegistry::new(Duration::from_secs(
@@ -1594,14 +1679,6 @@ mod fence_settler_tests {
             access_mode: app_manager::config::AppAccessMode::Docker,
             ..app_manager::config::AppManagerConfig::default()
         };
-        let metadata_dir = tempfile::tempdir().expect("metadata directory");
-        let store = Arc::new(
-            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
-                &metadata_dir.path().join("userapp.turso.db"),
-            )
-            .await
-            .expect("store"),
-        );
         let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(
             app_manager::service::AppService::new(
                 manager_config,
@@ -1737,10 +1814,13 @@ mod fence_settler_tests {
             })
             .await
             .expect("fence");
-        (state, metadata_dir)
+        (state, store)
     }
 
-    async fn settled(state: &Arc<AppState>, operation_id: &str) -> UserAppOperationRecord {
+    pub(crate) async fn settled(
+        state: &Arc<AppState>,
+        operation_id: &str,
+    ) -> UserAppOperationRecord {
         state
             .userapp_store
             .get_operation("fenced", operation_id)

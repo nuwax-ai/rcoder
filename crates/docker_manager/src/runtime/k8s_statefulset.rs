@@ -713,10 +713,37 @@ fn validate_builder_statefulset(
         }
         // env 是指纹原本覆盖而 launch 字段比对未覆盖的部分——等价判定必须
         // 收口在这里，否则内容校验会放过 env 漂移（旧实现由指纹门兜底）。
-        if canonical_env(actual.env.as_deref().unwrap_or(&[]))
-            != canonical_env(desired_container.env.as_deref().unwrap_or(&[]))
-        {
-            return Err(conflict("Builder container environment changed"));
+        // 差异 key 清单进文案：发版窗口（runtime image digest 随版本变）的
+        // 漂移源一眼可辨，不再需要二进制对比。
+        let actual_env = canonical_env(actual.env.as_deref().unwrap_or(&[]));
+        let desired_env = canonical_env(desired_container.env.as_deref().unwrap_or(&[]));
+        if actual_env != desired_env {
+            let actual_keys: std::collections::BTreeSet<&str> =
+                actual_env.iter().map(|entry| entry.name.as_str()).collect();
+            let desired_keys: std::collections::BTreeSet<&str> = desired_env
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect();
+            let mut drift: Vec<String> = desired_keys
+                .difference(&actual_keys)
+                .map(|key| format!("+{key}"))
+                .chain(
+                    actual_keys
+                        .difference(&desired_keys)
+                        .map(|key| format!("-{key}")),
+                )
+                .collect();
+            for entry in &desired_env {
+                if let Some(current) = actual_env.iter().find(|e| e.name == entry.name)
+                    && current.value != entry.value
+                {
+                    drift.push(format!("~{}", entry.name));
+                }
+            }
+            return Err(conflict(&format!(
+                "Builder container environment changed (drifted keys: {})",
+                drift.join(",")
+            )));
         }
     }
     let desired_hash = desired

@@ -271,7 +271,14 @@ async fn discover(
             if shared_types::userapp_builder_creation_needs_runtime_receipt(&operation) {
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
-                    super::creation::reconcile_runtime_receipt(&state, &operation).await?;
+                    // receipt 恢复不可行（Ok(false)：runtime 无恢复证据）时
+                    // 穿落到证据化兜底，而不是每扫描周期空转重试——否则
+                    // checkpoint 为空的 EnsureBuilder 围栏被本分支永久截走，
+                    // 兜底 settler 永远轮不到（测试环境 20 个站立围栏的
+                    // 直接成因之一）。
+                    if !super::creation::reconcile_runtime_receipt(&state, &operation).await? {
+                        super::creation::reconcile_fenced_ensure(&state, &operation).await?;
+                    }
                     Ok(())
                 });
                 continue;
@@ -451,3 +458,83 @@ mod tests {
 
 #[cfg(all(test, unix))]
 mod terminal_tests;
+
+/// discover 全链复现：EnsureBuilder 围栏经扫描器分发→settler 收束。
+/// 线上 20 个围栏零收束（零日志）而静态路径全通——此测试直接跑分发层，
+/// 暴露分发顺序/任务池/谓词任何一环的问题。
+#[cfg(test)]
+mod discover_settle_tests {
+    use super::*;
+    use crate::userapp_builder::creation::fence_settler_tests::{
+        FenceRuntime, fence_state, fence_state_pg, settled,
+    };
+
+    /// PG 后端复现（集群形态）：线上 20 个围栏零收束而 Turso 全通——
+    /// 此测试直接验证 Postgres 后端下 discover→settler 链路。
+    #[cfg(feature = "rcoder-pg")]
+    #[tokio::test]
+    async fn discover_settles_fence_on_postgres_backend() {
+        let Some(dsn) = std::env::var("RCODER_PG_TEST_DSN")
+            .ok()
+            .filter(|value| !value.is_empty())
+        else {
+            eprintln!("[skip] RCODER_PG_TEST_DSN not set");
+            return;
+        };
+        let operation_id = format!("op-pg-{}", uuid::Uuid::new_v4().simple());
+        let runtime = FenceRuntime::scenario(None, None);
+        *runtime.builder_workload.lock().expect("lock") = Some("rcoder-app-builder-fenced".into());
+        let state = fence_state_pg(
+            runtime,
+            UserAppOperationKind::EnsureBuilder,
+            &operation_id,
+            &dsn,
+        )
+        .await;
+        let mut tasks = RecoveryTasks::default();
+        let mut cursor = None;
+        discover(&state, &mut tasks, &mut cursor)
+            .await
+            .expect("discover");
+        while let Some((id, result)) = tasks.next().await {
+            result.unwrap_or_else(|error| panic!("recovery task {id} failed: {error}"));
+        }
+        let record = settled(&state, &operation_id).await;
+        assert_eq!(
+            record.state,
+            UserAppOperationState::Failed,
+            "PG backend must settle the fence; state={:?} step={} err={:?}",
+            record.state,
+            record.step,
+            record.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_dispatches_ensure_builder_fence_to_settler() {
+        let operation_id = "op-discover-settle";
+        let runtime = FenceRuntime::scenario(None, None);
+        *runtime.builder_workload.lock().expect("lock") = Some("rcoder-app-builder-fenced".into());
+        let (state, _dir) =
+            fence_state(runtime, UserAppOperationKind::EnsureBuilder, operation_id).await;
+        let mut tasks = RecoveryTasks::default();
+        let mut cursor = None;
+        // discover 是本模块私有 fn：直接调用，跑完整分发。
+        discover(&state, &mut tasks, &mut cursor)
+            .await
+            .expect("discover");
+        // 收集全部任务结果（不应有失败）。
+        while let Some((id, result)) = tasks.next().await {
+            result.unwrap_or_else(|error| panic!("recovery task {id} failed: {error}"));
+        }
+        let record = settled(&state, operation_id).await;
+        assert_eq!(
+            record.state,
+            UserAppOperationState::Failed,
+            "discover must settle the fence; state={:?} step={} err={:?}",
+            record.state,
+            record.step,
+            record.error_message
+        );
+    }
+}
