@@ -546,13 +546,16 @@ async fn observe_fence_evidence(
                 request_fingerprint: record.request_fingerprint.clone(),
             };
             match super::adoption::capture_bound_target(state, &context).await {
-                Ok(target) => FenceEvidence::Observed(serde_json::json!({
-                    "kind": "live_builder",
-                    "workload": target.workload,
-                    "observed_at_us": chrono::Utc::now().timestamp_micros(),
-                })),
-                // 身份不符或 builder 缺失：受保护目标未证实，保持围栏。
-                Err(_) => FenceEvidence::Insufficient,
+                // 活体工作负载是唯一可接受证据：identity 不符（Err）或
+                // workload 缺失（Ok(None)）都保持围栏。
+                Ok(target) if target.workload.is_some() => {
+                    FenceEvidence::Observed(serde_json::json!({
+                        "kind": "live_builder",
+                        "workload": target.workload,
+                        "observed_at_us": chrono::Utc::now().timestamp_micros(),
+                    }))
+                }
+                _ => FenceEvidence::Insufficient,
             }
         }
         // prod 发布族：活代 generation + 运行相位。generation == 本操作 =
@@ -646,35 +649,21 @@ pub(super) async fn reconcile_fenced_ensure(
     }) else {
         return Ok(());
     };
-    let Some(executor_id) = record.executor_id.clone() else {
+    // 无执行者声明的记录不可被扫描器收束（store 侧同样拒绝）。
+    if record.executor_id.is_none() {
         return Ok(());
-    };
+    }
     let evidence = match observe_fence_evidence(state, &record).await {
         FenceEvidence::Observed(evidence) => evidence,
         FenceEvidence::Insufficient => return Ok(()),
     };
-    let mut checkpoint = record.checkpoint.clone();
-    checkpoint["superseded_by_live_builder"] = evidence;
+    // 经 store 的 sanctioned 终态化路径（内部 Running 跳转满足状态机独占
+    // 门，纯记账不授权运行时工作）——直接 advance(Failed) 会被
+    // domain::advance 的 RecoveryRequired 转移门拒绝（f49b594d 潜伏 bug：
+    // settler 从未真正收束过任何围栏）。
     state
         .userapp_store
-        .advance(&UserAppOperationProgress {
-            app_id: record.app_id.clone(),
-            lifecycle_id: record.lifecycle_id.clone(),
-            operation_id: record.operation_id.clone(),
-            expected_revision: record.revision,
-            executor_id,
-            state: UserAppOperationState::Failed,
-            step: record.step.clone(),
-            checkpoint,
-            error_code: record
-                .error_code
-                .clone()
-                .or_else(|| Some("ERR_CONFLICT".into())),
-            error_message: Some(format!(
-                "{}; fence released: physical state verified definite by recovery scanner",
-                record.error_message.as_deref().unwrap_or("ensure fenced")
-            )),
-        })
+        .settle_fenced_operation(&record, &evidence)
         .await?;
     tracing::warn!(
         operation_id = %record.operation_id,
@@ -1480,6 +1469,18 @@ mod fence_settler_tests {
         async fn health_check(&self) -> ContainerRuntimeResult<()> {
             Ok(())
         }
+        async fn inspect_builder_candidate(
+            &self,
+            _context: &shared_types::UserAppExecutionContext,
+        ) -> ContainerRuntimeResult<BuilderControlTarget> {
+            // workload=None → capture_bound_target 回落到 capture_builder_control。
+            Ok(BuilderControlTarget {
+                resource_binding: None,
+                context: _context.clone(),
+                workload: None,
+                pod: None,
+            })
+        }
         async fn capture_builder_control(
             &self,
             context: &shared_types::UserAppExecutionContext,
@@ -1604,9 +1605,35 @@ mod fence_settler_tests {
         // 构造围栏记录：admit(Pending) → advance(Running, executor) →
         // advance(RecoveryRequired, step=runtime_updated)。
         let lifecycle = store.ensure_identity("fenced").await.expect("identity");
-        // Deploy/Update 族命令携带私有执行输入摘要，必须经 admit_with_input
-        // 受理（digest 与 input 绑定）；其余 kind 用无输入命令。
+        // EnsureBuilder/AdoptBuilder 无对应命令变体（命令↔kind 严格对应），
+        // 传 None；其余 kind 按命令表构造，Deploy/Update 族携带执行输入摘要。
+        let builder_family = matches!(
+            kind,
+            UserAppOperationKind::EnsureBuilder | UserAppOperationKind::AdoptBuilder
+        );
         let input = shared_types::UserAppExecutionInput::new("{}".into());
+        let command = if builder_family {
+            None
+        } else {
+            Some(match kind {
+                UserAppOperationKind::StartDeployment => UserAppControlCommand::Deploy {
+                    restart: false,
+                    input_digest: input.digest(),
+                },
+                UserAppOperationKind::RestartDeployment => UserAppControlCommand::Deploy {
+                    restart: true,
+                    input_digest: input.digest(),
+                },
+                UserAppOperationKind::Update => UserAppControlCommand::Update {
+                    input_digest: input.digest(),
+                },
+                UserAppOperationKind::Restart => UserAppControlCommand::Restart,
+                UserAppOperationKind::Stop => UserAppControlCommand::Stop {
+                    wake_on_traffic: true,
+                },
+                _ => UserAppControlCommand::Start { traffic: false },
+            })
+        };
         let admitted = store
             .admit_with_input(
                 &UserAppAdmission {
@@ -1616,28 +1643,11 @@ mod fence_settler_tests {
                     request_id: Some(format!("req-{operation_id}")),
                     request_fingerprint: "cd".repeat(32),
                     kind,
-                    command: Some(match kind {
-                        UserAppOperationKind::StartDeployment => UserAppControlCommand::Deploy {
-                            restart: false,
-                            input_digest: input.digest(),
-                        },
-                        UserAppOperationKind::RestartDeployment => UserAppControlCommand::Deploy {
-                            restart: true,
-                            input_digest: input.digest(),
-                        },
-                        UserAppOperationKind::Update => UserAppControlCommand::Update {
-                            input_digest: input.digest(),
-                        },
-                        UserAppOperationKind::Restart => UserAppControlCommand::Restart,
-                        UserAppOperationKind::Stop => UserAppControlCommand::Stop {
-                            wake_on_traffic: true,
-                        },
-                        _ => UserAppControlCommand::Start { traffic: false },
-                    }),
+                    command,
                     metadata: None,
                     runtime_policy_on_success: None,
                 },
-                Some(&input),
+                (!builder_family).then_some(&input),
             )
             .await
             .expect("admit");
@@ -1710,7 +1720,7 @@ mod fence_settler_tests {
         let record = settled(&state, operation_id).await;
         assert_eq!(record.state, UserAppOperationState::Failed);
         assert_eq!(
-            record.checkpoint["superseded_by_live_builder"]["kind"],
+            record.checkpoint["fence_released_evidence"]["kind"],
             "rollout_completed"
         );
         assert!(
@@ -1738,7 +1748,7 @@ mod fence_settler_tests {
         let record = settled(&state, operation_id).await;
         assert_eq!(record.state, UserAppOperationState::Failed);
         assert_eq!(
-            record.checkpoint["superseded_by_live_builder"]["kind"],
+            record.checkpoint["fence_released_evidence"]["kind"],
             "superseded_by_newer_generation"
         );
     }
@@ -1794,7 +1804,7 @@ mod fence_settler_tests {
         let record = settled(&state, operation_id).await;
         assert_eq!(record.state, UserAppOperationState::Failed);
         assert_eq!(
-            record.checkpoint["superseded_by_live_builder"]["kind"],
+            record.checkpoint["fence_released_evidence"]["kind"],
             "live_builder"
         );
     }

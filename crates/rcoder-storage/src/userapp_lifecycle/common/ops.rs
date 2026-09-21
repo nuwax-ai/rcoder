@@ -1329,6 +1329,75 @@ pub(super) async fn finalize_observed_wake(
     Ok(op)
 }
 
+/// Settle a fenced (RecoveryRequired) operation as Failed with observation
+/// evidence. The recovery scanner has verified through a read-only path that
+/// the physical state is definite (no in-flight write from the dead executor),
+/// so the admission slot can be freed. This is a pure bookkeeping transition:
+/// the internal Running hop only satisfies the state machine's exclusive-claim
+/// gate — it never grants runtime work, and the terminal record is honest
+/// Failed with the original error preserved plus the observation evidence.
+/// Callers must have validated the evidence predicate for the kind; this
+/// method validates identity, revision and state only.
+pub(super) async fn settle_fenced_operation(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &UserAppOperationRecord,
+    evidence: &serde_json::Value,
+) -> Result<UserAppOperationRecord, Error> {
+    let (mut app, mut op) = current(
+        tx,
+        backend,
+        &snapshot.app_id,
+        &snapshot.operation_id,
+        &snapshot.lifecycle_id,
+    )
+    .await?;
+    if op != *snapshot
+        || op.state != UserAppOperationState::RecoveryRequired
+        || op.executor_id.is_none()
+    {
+        return Err(Error::VersionConflict);
+    }
+    let before_app = app.clone();
+    let mut checkpoint = op.checkpoint.clone();
+    checkpoint["fence_released_evidence"] = evidence.clone();
+    // Internal transition only, under this transaction.
+    op.state = UserAppOperationState::Running;
+    let progress = UserAppOperationProgress {
+        app_id: op.app_id.clone(),
+        lifecycle_id: op.lifecycle_id.clone(),
+        operation_id: op.operation_id.clone(),
+        expected_revision: op.revision,
+        executor_id: op.executor_id.clone().ok_or(Error::VersionConflict)?,
+        state: UserAppOperationState::Failed,
+        step: op.step.clone(),
+        checkpoint,
+        error_code: op
+            .error_code
+            .clone()
+            .or_else(|| Some("ERR_CONFLICT".into())),
+        error_message: Some(format!(
+            "{}; fence released: physical state verified definite by recovery scanner",
+            op.error_message.as_deref().unwrap_or("operation fenced")
+        )),
+    };
+    domain::advance(&mut app, &mut op, &progress)?;
+    repo::save_operation(tx, backend, &op, snapshot).await?;
+    repo::save_app(
+        tx,
+        backend,
+        &app,
+        &before_app.lifecycle_id,
+        before_app.metadata_revision,
+    )
+    .await?;
+    repo::save_slots(tx, backend, &app, &before_app).await?;
+    models::OperationInput::delete_by_operation_id(tx, &op.operation_id)
+        .await
+        .map_err(storage)?;
+    Ok(op)
+}
+
 /// Close an observed hot-deployment SUCCESS by full snapshot CAS: the owner
 /// reported a terminal Running outcome for exactly this operation (or the
 /// converged environment matches the persisted target). Evidence validation

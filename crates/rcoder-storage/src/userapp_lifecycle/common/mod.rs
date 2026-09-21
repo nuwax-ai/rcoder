@@ -718,6 +718,21 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         })
         .await
     }
+    async fn settle_fenced_operation(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &serde_json::Value,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let evidence = evidence.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                ops::settle_fenced_operation(tx, backend, &snapshot, &evidence).await
+            })
+        })
+        .await
+    }
+
     async fn finalize_observed_hot_success(
         &self,
         snapshot: &UserAppOperationRecord,

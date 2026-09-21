@@ -1115,6 +1115,16 @@ pub trait UserAppLifecycleStore: Send + Sync {
     /// the original timed-out creation and its own slot via full snapshot CAS.
     /// Close only an acknowledged wake's read-only recovery phase using a full
     /// record CAS. Never authorizes another runtime write or releases a lease.
+    /// Settle a fenced (RecoveryRequired) operation as Failed with the
+    /// scanner's observation evidence. Pure bookkeeping: frees the admission
+    /// slot, never grants runtime work. Full-snapshot CAS; identity, revision
+    /// and state validated inside.
+    async fn settle_fenced_operation(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &serde_json::Value,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError>;
+
     async fn finalize_observed_wake(
         &self,
         _snapshot: &UserAppOperationRecord,
