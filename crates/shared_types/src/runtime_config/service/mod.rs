@@ -7,7 +7,10 @@ mod resource;
 
 pub use defaults::{default_agent_runner_service_config, default_rcoder_service_config};
 pub use image::{ConfigValidationResult, ServiceImageConfig, ServiceMountConfig};
-pub use resource::{ServiceResourceLimits, ServiceSecurityConfig};
+pub use resource::{
+    DEFAULT_AGENT_CPU_LIMIT_CORES, DEFAULT_AGENT_MEMORY_LIMIT_BYTES, ServiceResourceLimits,
+    ServiceSecurityConfig,
+};
 
 #[cfg(test)]
 mod tests {

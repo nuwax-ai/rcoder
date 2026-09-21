@@ -250,7 +250,8 @@ pub use runtime_config::quantity::{
     parse_cpu_quantity, parse_memory_quantity, validate_k8s_storage_size,
 };
 pub use runtime_config::service::{
-    ServiceImageConfig, ServiceMountConfig, ServiceResourceLimits, ServiceSecurityConfig,
+    DEFAULT_AGENT_CPU_LIMIT_CORES, DEFAULT_AGENT_MEMORY_LIMIT_BYTES, ServiceImageConfig,
+    ServiceMountConfig, ServiceResourceLimits, ServiceSecurityConfig,
     default_agent_runner_service_config, default_rcoder_service_config,
 };
 

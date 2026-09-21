@@ -2,6 +2,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// agent 族容器（Web/Computer/builder；ensure、chat 等全部创建入口）
+/// 未显式传入资源限制时的默认内存上限（字节）：6 GiB。
+///
+/// 为什么默认必须给限制：环境可能给"无声明"容器套入远小于实际需求的
+/// 隐式上限（131 实证 547Mi：import 解压内存尖峰触发 cgroup reclaim
+/// 风暴，容器整体冻结——探针/转发/exec 全无响应）。
+/// 为什么给 6 GiB：builder 容器承载桌面全家桶（Xvnc/XFCE/fcitx/
+/// TS+Rust file-server/PG），6G 保证构建/解压尖峰余量。
+pub const DEFAULT_AGENT_MEMORY_LIMIT_BYTES: f64 = 6442450944.0;
+
+/// agent 族容器未显式传入资源限制时的默认 CPU 上限（核心数）：2 核。
+/// 低于 2 核实证会令全家桶 throttle 到响应停摆（症状与内存冻结一致）。
+pub const DEFAULT_AGENT_CPU_LIMIT_CORES: f64 = 2.0;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceResourceLimits {
     /// 内存限制（字节，支持浮点数输入）
