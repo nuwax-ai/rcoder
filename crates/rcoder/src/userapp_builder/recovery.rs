@@ -101,7 +101,7 @@ pub(crate) fn start_recovery(
                     // Receipt listing touches cluster objects or the receipt
                     // directory; run it on a slow cadence instead of per tick.
                     sweep_ticks = sweep_ticks.wrapping_add(1);
-                    if sweep_ticks % 72 == 0
+                    if sweep_ticks.is_multiple_of(72)
                         && let Err(error) = compute::sweep_builder_creation_receipts(state.userapp_store.clone(), state.runtime.clone(), &mut tasks).await {
                         tracing::warn!(%error, "Builder creation receipt sweep failed");
                     }

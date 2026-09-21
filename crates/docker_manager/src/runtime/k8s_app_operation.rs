@@ -276,7 +276,15 @@ impl KubernetesRuntime {
                 })?;
                 let operation_id = current
                     .and_then(|current| current.metadata.annotations)
-                    .and_then(|annotations| annotations.get("rcoder.io/operation-id").cloned())
+                    .and_then(|annotations| {
+                        // Prefer the durable operation identity; a legacy-path
+                        // lease still carries its holding token — reporting
+                        // None here reads as "nobody holds it" to operators.
+                        annotations
+                            .get("rcoder.io/operation-id")
+                            .or_else(|| annotations.get("rcoder.io/legacy-operation-id"))
+                            .cloned()
+                    })
                     .filter(|id| !id.is_empty());
                 return Err(ContainerRuntimeError::OperationInProgress(Box::new(
                     shared_types::UserAppOperationInProgress {

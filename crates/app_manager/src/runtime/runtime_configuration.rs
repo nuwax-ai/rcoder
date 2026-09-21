@@ -131,13 +131,42 @@ impl AppService {
                 .ok_or_else(|| {
                     AppOperationError::InvalidState("Database target generation is missing".into())
                 })?;
-            let target = self
-                .runtime
-                .capture_app_configuration_target(&context, generation)
-                .await
-                .map_err(|error| {
-                    crate::utils::map_runtime_error("Capture explicit database target", error)
-                })?;
+            // A just-patched Deployment rolls out (Recreate: old pod must die
+            // before the new one is created). Capturing the management pod in
+            // that zero-pod window is expected, not a failure — retry until
+            // the new-generation pod is running or the operation budget ends.
+            // Identity conflicts still fail immediately.
+            let mut captured = None;
+            loop {
+                match self
+                    .runtime
+                    .capture_app_configuration_target(&context, generation)
+                    .await
+                {
+                    Ok(target) => {
+                        captured = Some(target);
+                        break;
+                    }
+                    Err(
+                        error @ container_runtime_api::ContainerRuntimeError::ManagementNotRunning,
+                    ) if tokio::time::Instant::now() < deadline => {
+                        drop(error);
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    Err(error) => {
+                        return Err(crate::utils::map_runtime_error(
+                            "Capture explicit database target",
+                            error,
+                        ));
+                    }
+                }
+            }
+            let Some(target) = captured else {
+                return Err(AppOperationError::CredentialApplication {
+                    message: "Management container did not run within the operation budget".into(),
+                    mutation: CredentialMutationEvidence::NotAttempted,
+                });
+            };
             let admin = self
                 .wait_for_configuration_postgres(&context, &target, deadline)
                 .await?;

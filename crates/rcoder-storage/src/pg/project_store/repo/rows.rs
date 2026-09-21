@@ -8,6 +8,9 @@ pub(in crate::pg) struct ContainerRow {
     pub container_generation: String,
     pub row_revision: i64,
     pub container_id: Option<String>,
+    /// §1.1 持久 workload 身份——schema 已冻结；读取方随契约四解析器
+    /// 分层批次接入（对账判"同 workload"），届时移除本豁免。
+    #[allow(dead_code)]
     pub workload_uid: Option<String>,
     pub logical_id: String,
     pub container_ip: String,

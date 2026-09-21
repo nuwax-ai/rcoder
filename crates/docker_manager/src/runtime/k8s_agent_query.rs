@@ -62,7 +62,6 @@ impl KubernetesRuntime {
                 let status = Self::extract_pod_status(&pod);
                 let metadata = &pod.metadata;
                 let uid = metadata.uid.clone().unwrap_or_default();
-                let name = metadata.name.clone().unwrap_or_default();
                 let pod_ip = pod
                     .status
                     .as_ref()
@@ -321,7 +320,7 @@ impl KubernetesRuntime {
             let pod_info = RuntimeContainerInfo {
                 container_id: metadata.uid.clone().unwrap_or_default(),
                 // 同 get 路径：ownerReference 权威派生 workload 名（契约一）。
-                container_name: Self::workload_name_from_pod(&metadata),
+                container_name: Self::workload_name_from_pod(metadata),
                 container_ip: pod
                     .status
                     .as_ref()

@@ -401,23 +401,23 @@ impl AgentContainerRuntime for DockerRuntime {
                     let result = crate::agent_container_starter::AgentContainerStarter::new(&inner)
                         .start_prepared(params, prepared)
                         .await;
-                    if let (Err(error), Some(context)) = (&result, context.as_ref()) {
-                        if let Some(physical_id) = acknowledged_partial_creation(error) {
-                            // Save known-complete writes before returning the original
-                            // failure. Recovery can drain this exact created resource;
-                            // it must still separately observe management readiness.
-                            if let Err(record_error) = Self::new(inner.clone())
-                                .record_partial_creation(context, physical_id, lease.receipt())
-                                .await
-                            {
-                                return super::builder_completion::finish(
-                                    lease,
-                                    Err(ContainerRuntimeError::ContainerCreationError(format!(
-                                        "{error}; persist partial creation evidence: {record_error}"
-                                    ))),
-                                )
-                                .await;
-                            }
+                    if let (Err(error), Some(context)) = (&result, context.as_ref())
+                        && let Some(physical_id) = acknowledged_partial_creation(error)
+                    {
+                        // Save known-complete writes before returning the original
+                        // failure. Recovery can drain this exact created resource;
+                        // it must still separately observe management readiness.
+                        if let Err(record_error) = Self::new(inner.clone())
+                            .record_partial_creation(context, physical_id, lease.receipt())
+                            .await
+                        {
+                            return super::builder_completion::finish(
+                                lease,
+                                Err(ContainerRuntimeError::ContainerCreationError(format!(
+                                    "{error}; persist partial creation evidence: {record_error}"
+                                ))),
+                            )
+                            .await;
                         }
                     }
                     result.map_err(super::builder_completion::docker_error)

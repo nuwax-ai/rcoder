@@ -159,10 +159,10 @@ async fn persist_exclusive(path: PathBuf, payload: Vec<u8>) -> Result<()> {
             std::fs::File::open(parent)?.sync_all()?;
             Ok(())
         })();
-        if let Err(error) = std::fs::remove_file(&temporary) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(%error, "Could not remove restart archive temporary file");
-            }
+        if let Err(error) = std::fs::remove_file(&temporary)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "Could not remove restart archive temporary file");
         }
         result
     })
@@ -294,7 +294,6 @@ impl DockerRuntime {
             return Err(conflict("Builder changed before template capture"));
         }
         let config = config_of(&inspect)?;
-        let host = inspect.host_config.as_ref();
         let host = inspect.host_config.as_ref();
         // Bind specifications live either in the legacy `Binds` strings or as
         // structured `Mounts` entries (the ContainerConfigBuilder path). Replay

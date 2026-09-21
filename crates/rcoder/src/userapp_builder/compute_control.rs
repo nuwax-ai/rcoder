@@ -441,41 +441,40 @@ pub(crate) async fn execute_pending(state: &AppState, pending: ComputeControlRec
                 .await
                 .context("Persist compute execution recovery state")?;
         }
-        if settled {
-            if let Some(current) = state
+        if settled
+            && let Some(current) = state
                 .userapp_store
                 .get_compute_control(&identity.app_id, &identity.operation_id)
                 .await?
-                && current.state == ComputeControlState::Superseded
-            {
-                let evidence = if current.stage == "draining_previous" {
-                    ComputeControlDrainEvidence::NoMutationSubmitted
-                } else {
-                    ComputeControlDrainEvidence::MutationCompleted {
-                        checkpoint: current.checkpoint.clone(),
-                    }
-                };
-                let drained = state
-                    .userapp_store
-                    .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
-                        identity: identity.clone(),
-                        expected_revision: current.revision,
-                        evidence,
-                    })
-                    .await?;
-                if let Some(ref receipt) = drained.lease {
-                    state
-                        .runtime()
-                        .release_app_operation_receipt(
-                            &drained.execution_context().map_err(anyhow::Error::msg)?,
-                            &receipt,
-                        )
-                        .await?;
-                    state
-                        .userapp_store
-                        .forget_compute_lease(&identity, &receipt)
-                        .await?;
+            && current.state == ComputeControlState::Superseded
+        {
+            let evidence = if current.stage == "draining_previous" {
+                ComputeControlDrainEvidence::NoMutationSubmitted
+            } else {
+                ComputeControlDrainEvidence::MutationCompleted {
+                    checkpoint: current.checkpoint.clone(),
                 }
+            };
+            let drained = state
+                .userapp_store
+                .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
+                    identity: identity.clone(),
+                    expected_revision: current.revision,
+                    evidence,
+                })
+                .await?;
+            if let Some(ref receipt) = drained.lease {
+                state
+                    .runtime()
+                    .release_app_operation_receipt(
+                        &drained.execution_context().map_err(anyhow::Error::msg)?,
+                        receipt,
+                    )
+                    .await?;
+                state
+                    .userapp_store
+                    .forget_compute_lease(&identity, receipt)
+                    .await?;
             }
         }
         return Err(error);
@@ -1186,24 +1185,23 @@ async fn run_restart_continuation(
                     error_message: Some(format!("{error:#}")),
                 })
                 .await?;
-        } else if !unknown_write {
-            if let Some(current) = state
+        } else if !unknown_write
+            && let Some(current) = state
                 .userapp_store
                 .get_compute_control(&identity.app_id, &identity.operation_id)
                 .await?
-                && current.state == ComputeControlState::Superseded
-            {
-                state
-                    .userapp_store
-                    .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
-                        identity,
-                        expected_revision: current.revision,
-                        evidence: ComputeControlDrainEvidence::MutationCompleted {
-                            checkpoint: current.checkpoint,
-                        },
-                    })
-                    .await?;
-            }
+            && current.state == ComputeControlState::Superseded
+        {
+            state
+                .userapp_store
+                .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
+                    identity,
+                    expected_revision: current.revision,
+                    evidence: ComputeControlDrainEvidence::MutationCompleted {
+                        checkpoint: current.checkpoint,
+                    },
+                })
+                .await?;
         }
     }
     result

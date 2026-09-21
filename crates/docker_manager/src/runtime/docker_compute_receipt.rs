@@ -77,10 +77,10 @@ async fn save(path: PathBuf, target: &impl serde::Serialize) -> Result<()> {
             std::fs::File::open(parent)?.sync_all()?;
             Ok(())
         })();
-        if let Err(error) = std::fs::remove_file(&temporary) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(%error, "Could not remove Docker receipt temporary file");
-            }
+        if let Err(error) = std::fs::remove_file(&temporary)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "Could not remove Docker receipt temporary file");
         }
         result
     })

@@ -415,7 +415,7 @@ fn running_builder_info(
         .host_config
         .as_ref()
         .and_then(|config| config.network_mode.as_deref());
-    let address = super::docker_runtime::extract_container_ip(&after, preferred)
+    let address = super::docker_runtime::extract_container_ip(after, preferred)
         .parse::<std::net::IpAddr>()
         .map_err(|error| Error::ConfigurationError(format!("Builder IP is invalid: {error}")))?;
     if address.is_unspecified() {
