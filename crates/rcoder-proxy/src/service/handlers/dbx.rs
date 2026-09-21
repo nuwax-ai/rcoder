@@ -52,7 +52,7 @@ async fn dbx_rewrite_request(
 /// 构造 dbx 上游 peer（长会话同款参数：conn 10s / 无读写超时 / idle 3600s）。
 fn dbx_peer(container_addr: &str) -> Box<HttpPeer> {
     let mut peer = HttpPeer::new(
-        (container_addr, shared_types::DBX_PORT),
+        super::super::upstream::dial_peer(container_addr, shared_types::DBX_PORT),
         false,
         "".to_string(),
     );

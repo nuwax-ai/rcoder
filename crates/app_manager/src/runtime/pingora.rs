@@ -29,29 +29,20 @@ impl AppService {
         let Some(pingora) = &self.pingora else {
             return vec![];
         };
-        // backend host：Docker 用 container_ip；K8s 用 ClusterIP Service FQDN（container_ip 为空）
-        let backend_host = match self.config.access_mode {
-            AppAccessMode::Docker => {
-                if container_ip.is_empty() {
-                    warn!(
-                        "[APP] Docker mode container_ip empty, skip pingora backend registration: {}",
-                        app_id
-                    );
-                    return vec![];
-                }
-                container_ip.to_string()
-            }
-            AppAccessMode::Kubernetes => {
-                let cluster_domain = shared_types::get_k8s_cluster_domain();
-                format!(
-                    "{}-{}-svc.{}.svc.{}",
-                    ServiceType::Userapp.container_prefix(),
-                    app_id,
-                    self.config.namespace,
-                    cluster_domain
-                )
-            }
+        // backend host：Docker 用 container_ip；K8s 用 ClusterIP Service FQDN（container_ip 为空）。
+        // deploy-host：统一注册表键 = 确定性容器名（与 lookup/published 注册同源）
+        #[cfg(feature = "deploy-host")]
+        let backend_host = if shared_types::is_deploy_host() {
+            format!("{}-{app_id}", ServiceType::Userapp.container_prefix())
+        } else {
+            self.access_backend_host(container_ip, app_id)
         };
+        #[cfg(not(feature = "deploy-host"))]
+        let backend_host = self.access_backend_host(container_ip, app_id);
+        // Docker 形态 container_ip 为空时整体跳过注册（原语义：空 host 不入表）
+        if backend_host.is_empty() {
+            return vec![];
+        }
         for port in http_ports {
             pingora.add_app_backend(app_id, *port, backend_host.clone());
         }
@@ -100,6 +91,33 @@ impl AppService {
 
     /// 启动时重建 Pingora backends（K8s Pingora 模式，修复重启后 pingora_ports 内存态丢失）。
     /// 从集群列出所有托管 app，按 expose_type（Deployment annotation 还原）重新注册 HTTP 端口的 backend。
+    /// 按 access_mode 构造 backend host（deploy-host 的注册表键在外层分支处理）：
+    /// Docker=container_ip；K8s=ClusterIP Service FQDN（Pod 内 kube-dns 解析）。
+    fn access_backend_host(&self, container_ip: &str, app_id: &str) -> String {
+        match self.config.access_mode {
+            AppAccessMode::Docker => {
+                if container_ip.is_empty() {
+                    warn!(
+                        "[APP] Docker mode container_ip empty, skip pingora backend registration: {}",
+                        app_id
+                    );
+                    return String::new();
+                }
+                container_ip.to_string()
+            }
+            AppAccessMode::Kubernetes => {
+                let cluster_domain = shared_types::get_k8s_cluster_domain();
+                format!(
+                    "{}-{}-svc.{}.svc.{}",
+                    ServiceType::Userapp.container_prefix(),
+                    app_id,
+                    self.config.namespace,
+                    cluster_domain
+                )
+            }
+        }
+    }
+
     pub(crate) async fn rebuild_pingora_backends(&self) -> AppResult<()> {
         // pingora 未配置（proxy_config 未配）→ 无 backend 可注册；显式说明，避免"0 个 app"被误读为"集群无应用"
         if self.pingora.is_none() {

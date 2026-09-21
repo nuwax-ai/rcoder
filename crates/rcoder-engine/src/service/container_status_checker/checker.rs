@@ -154,7 +154,22 @@ impl ContainerStatusChecker {
         let last_activity_str = format_datetime(last_activity);
         let relative_time_str = format_relative_time(last_activity);
 
-        // 构建 gRPC 地址
+        // 构建 gRPC 地址（deploy-host 经注册表键解析；否则容器 IP 直连）
+        #[cfg(feature = "deploy-host")]
+        let grpc_addr = if shared_types::is_deploy_host() {
+            shared_types::published::resolve_published_addr(
+                &container.container_name,
+                shared_types::GRPC_DEFAULT_PORT,
+            )
+            .to_string()
+        } else {
+            format!(
+                "{}:{}",
+                container.container_ip,
+                shared_types::GRPC_DEFAULT_PORT
+            )
+        };
+        #[cfg(not(feature = "deploy-host"))]
         let grpc_addr = format!(
             "{}:{}",
             container.container_ip,

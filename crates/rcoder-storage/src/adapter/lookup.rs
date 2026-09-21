@@ -18,6 +18,11 @@ impl ProjectAdapter {
     ///   恢复,无需 rcoder 重注册/重查(与 `register_vnc_backend` 的 vnc_backends 对齐)。
     /// - Docker:容器 IP(直连)。
     pub(crate) fn resolve_backend_addr(&self, info: &ContainerBasicInfo) -> String {
+        // deploy-host：返回注册表键（container_name）；宿主机无法路由容器 IP
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            return info.container_name.clone();
+        }
         if shared_types::is_kubernetes_runtime() {
             shared_types::build_k8s_service_fqdn(
                 &info.container_name,
@@ -77,6 +82,11 @@ impl shared_types::ContainerLookup for ProjectAdapter {
         }
         // 确定性命名构造（trait 文档：运行容器不进 projects 注册表，键被 builder 占用）
         let container_name = format!("{}-{app_id}", ServiceType::Userapp.container_prefix());
+        // deploy-host：注册表键 = 容器名（与 Docker 拨号/注册路径同源）
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            return Some(container_name);
+        }
         if shared_types::is_kubernetes_runtime() {
             Some(shared_types::build_k8s_service_fqdn(
                 &container_name,

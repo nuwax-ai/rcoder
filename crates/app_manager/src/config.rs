@@ -114,7 +114,25 @@ impl Default for AppManagerConfig {
         Self {
             enabled: true,
             workspace_root: std::env::var("RCODER_WORKSPACE_ROOT").ok(),
-            operation_lock_root: shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT.to_owned(),
+            operation_lock_root: {
+                #[cfg(feature = "deploy-host")]
+                {
+                    // deploy-host：容器常量 /app/userapp-workspace 在宿主机不存在，
+                    // 锚定 ~/.rcoder/workspace/userapp（与 docker_manager host_map 默认
+                    // 同源约定）；env 显式设置优先
+                    std::env::var("RCODER_OPERATION_LOCK_ROOT").unwrap_or_else(|_| {
+                        std::env::var("HOME")
+                            .map(|home| format!("{home}/.rcoder/workspace/userapp"))
+                            .unwrap_or_else(|_| {
+                                shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT.to_owned()
+                            })
+                    })
+                }
+                #[cfg(not(feature = "deploy-host"))]
+                {
+                    shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT.to_owned()
+                }
+            },
             namespace: std::env::var("RCODER_K8S_NAMESPACE")
                 .unwrap_or_else(|_| "default".to_string()),
             gateway_name: std::env::var("RCODER_K8S_GATEWAY_NAME").ok(),

@@ -148,7 +148,11 @@ pub async fn handle_port_proxy_upstream(
         ctx.preview_internal_token = Some(deps.internal_token.clone());
         ctx.preview_origin_port = Some(target_port);
         ctx.target_port = Some(peer_port);
-        let mut peer = HttpPeer::new((host_ip.as_str(), peer_port), false, "".to_string());
+        let mut peer = HttpPeer::new(
+            super::super::upstream::dial_peer(&host_ip, peer_port),
+            false,
+            "".to_string(),
+        );
         peer.options.connection_timeout = Some(Duration::from_secs(10));
         peer.options.read_timeout = None;
         peer.options.write_timeout = None;
@@ -180,7 +184,7 @@ pub async fn handle_port_proxy_upstream(
 
     // 创建 HTTP Peer
     let mut peer = HttpPeer::new(
-        (resolved_host.as_str(), target_port),
+        super::super::upstream::dial_peer(&resolved_host, target_port),
         false,          // 不使用 TLS
         "".to_string(), // SNI
     );

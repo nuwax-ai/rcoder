@@ -90,7 +90,8 @@ pub async fn handle_prod_app_upstream(
         // 回退分支用的注册值历史上是 IP 字面量（IPv4），按字面量同步解析即可
         let try_parse = |host: &str, port: u16| -> Option<std::net::SocketAddr> {
             use std::net::ToSocketAddrs;
-            (host, port).to_socket_addrs().ok()?.next()
+            let (host, port) = super::super::upstream::dial_peer(host, port);
+            (host.as_str(), port).to_socket_addrs().ok()?.next()
         };
         if let Some(host) = container_lookup
             .as_ref()

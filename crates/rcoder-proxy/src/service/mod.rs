@@ -18,6 +18,7 @@ mod proxy_http;
 
 pub mod handlers;
 pub mod types;
+pub mod upstream;
 pub mod utils;
 
 use anyhow::Result;

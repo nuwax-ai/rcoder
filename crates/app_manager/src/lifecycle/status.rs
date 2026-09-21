@@ -270,7 +270,37 @@ impl AppService {
         };
 
         // internal domain：K8s = ClusterIP Service FQDN；Docker = 容器名（= 资源名）
-        let (domain, short_domain) = match self.config.access_mode {
+        #[cfg(feature = "deploy-host")]
+        let (domain, short_domain) = if shared_types::is_deploy_host() {
+            let name = format!("{}-{app_id}", ServiceType::Userapp.container_prefix());
+            (name.clone(), name)
+        } else {
+            self.access_domains(app_id)
+        };
+        #[cfg(not(feature = "deploy-host"))]
+        let (domain, short_domain) = self.access_domains(app_id);
+
+        AccessInfo {
+            external: ExternalAccess {
+                http: http_url,
+                tcp: vec![], // TCP 初期不对外
+            },
+            internal: InternalAccess {
+                domain,
+                short_domain,
+                ports: ports
+                    .iter()
+                    .map(|p| InternalPort {
+                        name: p.name.clone(),
+                        port: p.port,
+                    })
+                    .collect(),
+            },
+        }
+    }
+    /// 按 access_mode 构造 (domain, short_domain)（deploy-host 键在外层分支处理）。
+    fn access_domains(&self, app_id: &str) -> (String, String) {
+        match self.config.access_mode {
             AppAccessMode::Docker => {
                 // 容器名统一走 DockerUtils::generate_container_name（与创建路径一致）；
                 // app_id 已在 API 层校验，理论上不会走到降级分支
@@ -292,24 +322,6 @@ impl AppService {
                     format!("{}.{}", svc, self.config.namespace),
                 )
             }
-        };
-
-        AccessInfo {
-            external: ExternalAccess {
-                http: http_url,
-                tcp: vec![], // TCP 初期不对外
-            },
-            internal: InternalAccess {
-                domain,
-                short_domain,
-                ports: ports
-                    .iter()
-                    .map(|p| InternalPort {
-                        name: p.name.clone(),
-                        port: p.port,
-                    })
-                    .collect(),
-            },
         }
     }
 }

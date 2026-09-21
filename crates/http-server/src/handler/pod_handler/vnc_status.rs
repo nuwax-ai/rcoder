@@ -172,7 +172,16 @@ pub async fn pod_vnc_status(
     if let Some(ref pingora_service) = state.pingora_service
         && let Some(uid) = user_id
     {
-        pingora_service.add_vnc_backend(uid, &result.container_ip);
+        // deploy-host：注册表键 = container_name（宿主机无容器 IP 路由）
+        #[cfg(feature = "deploy-host")]
+        let backend_key = if shared_types::is_deploy_host() {
+            result.container_name.clone()
+        } else {
+            result.container_ip.clone()
+        };
+        #[cfg(not(feature = "deploy-host"))]
+        let backend_key = result.container_ip.clone();
+        pingora_service.add_vnc_backend(uid, &backend_key);
         debug!(
             "🔗 [POD_VNC_STATUS] Ensured VNC backend registered: user_id={} -> {}",
             uid, result.container_ip

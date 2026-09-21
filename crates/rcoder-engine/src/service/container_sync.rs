@@ -74,6 +74,21 @@ pub fn start_container_sync_task(
                                 for container in removed {
                                     // 清理 gRPC 连接池
                                     if !container.container_ip.is_empty() {
+                                        #[cfg(feature = "deploy-host")]
+                                        let grpc_addr = if shared_types::is_deploy_host() {
+                                            shared_types::published::resolve_published_addr(
+                                                &container.container_name,
+                                                shared_types::GRPC_DEFAULT_PORT,
+                                            )
+                                            .to_string()
+                                        } else {
+                                            format!(
+                                                "{}:{}",
+                                                container.container_ip,
+                                                shared_types::GRPC_DEFAULT_PORT
+                                            )
+                                        };
+                                        #[cfg(not(feature = "deploy-host"))]
                                         let grpc_addr = format!(
                                             "{}:{}",
                                             container.container_ip,

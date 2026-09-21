@@ -211,7 +211,7 @@ pub async fn handle_dev_ttyd_upstream(
 
     // 与 computer 族同款 peer（WebSocket 长连接优化）
     let mut peer = HttpPeer::new(
-        (container_ip.as_str(), shared_types::WS_TERMINAL_PORT),
+        super::super::upstream::dial_peer(&container_ip, shared_types::WS_TERMINAL_PORT),
         false,
         "".to_string(),
     );
@@ -273,7 +273,7 @@ pub async fn handle_dev_vnc_upstream(
     );
 
     let mut peer = HttpPeer::new(
-        (container_ip.as_str(), shared_types::NOVNC_PORT),
+        super::super::upstream::dial_peer(&container_ip, shared_types::NOVNC_PORT),
         false,
         "".to_string(),
     );
@@ -318,7 +318,10 @@ pub async fn handle_dev_audio_request(
     deps.metrics.record_request();
     deps.metrics.record_request_port(target_port);
     ctx.target_port = Some(target_port);
-    ctx.upstream_host = Some(format!("{}:{}", container_ip, target_port));
+    ctx.upstream_host = Some(super::super::upstream::dial_addr(
+        &container_ip,
+        target_port,
+    ));
     info!(
         "[DEV_AUDIO] app_id={}, path={}, target={}:{}",
         app_id, remaining, container_ip, target_port
@@ -381,7 +384,10 @@ pub async fn handle_dev_ime_request(
     deps.metrics.record_request();
     deps.metrics.record_request_port(shared_types::IME_PORT);
     ctx.target_port = Some(shared_types::IME_PORT);
-    ctx.upstream_host = Some(format!("{}:{}", container_ip, shared_types::IME_PORT));
+    ctx.upstream_host = Some(super::super::upstream::dial_addr(
+        &container_ip,
+        shared_types::IME_PORT,
+    ));
     debug!(
         "[DEV_IME] app_id={} -> {}:{}",
         app_id,
@@ -520,7 +526,7 @@ pub async fn handle_runtime_ttyd_upstream(
     );
 
     let mut peer = HttpPeer::new(
-        (container_addr.as_str(), shared_types::TTYD_PORT),
+        super::super::upstream::dial_peer(&container_addr, shared_types::TTYD_PORT),
         false,
         "".to_string(),
     );
