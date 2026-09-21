@@ -1,0 +1,35 @@
+[package]
+name = "desktop"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "rcoder 桌面客户端（gpui-kit；进程内运行完整 rcoder 服务）"
+
+[package.metadata.dist]
+dist = false
+
+[lib]
+name = "desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "desktop"
+path = "src/main.rs"
+
+[features]
+default = []
+deploy-host = ["rcoder/deploy-host"]
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui-kit = "0.6"
+rcoder = { workspace = true }
+rcoder-engine = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
