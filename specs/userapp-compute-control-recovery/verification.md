@@ -1015,3 +1015,16 @@ Docker 遗留清理明细：rcoder-crash-bee781723f7c44ab 项目 down -v；22 �
 - compose test-e2e：**整轮被启动器判无效（source changed during run）**——前段 39 场景 35 pass + deploy_full_chain/scope_isolation fail（已知 Qoder 遗留域）；docker_crash/sigterm fail 系运行中源码被并行提交（ffe8d730@17:49 + file-server 工作树未提交改动）热重建污染
 
 **阻断原因：仓库存在并行 agent 工作**（ffe8d730/f3ceed938=app 159 修复线，工作树尚有 file-server 未提交改动）。e2e 源码漂移门禁与 remote-k8s 快照语义均要求运行期间源码稳定。**待并行工作提交稳定后需重跑：compose test-e2e 全量 + remote-k8s verify SUITE=userapp（含 ffe8d730 与本批全部提交）**，全绿后方可 push 与构建发版镜像。
+
+### 2026-09-21 晚：userapp 套件 131 阻断根因铁证 + 本批终态
+
+**131 userapp 套件第 6/7 轮取证**（14→12 前置场景通过，全部断在同一点）：
+- build 转发 `hyper::Error(IncompleteMessage)`（Debug cause 链实证）——连接建立、请求送达，**上游在响应完成前断连**。前序 workspace/generate-file/import 同 svc 全部成功（0.25-0.5s 间隔，排除空闲连接/DNS/启动窗口）。
+- 60000 端口架构（remote-k8s manifests）：`file-server-proxy`（**ts_first**：TS upstream 60001 优先，Rust 8086 兜底）——build 经 proxy 落 **TS 版 nuwax-file-server**，TS 侧 build 端点崩溃断连，proxy 无请求级 fallback。
+- **归因：TS file-server（nuwax-file-server 仓库）build 端点缺陷/环境差异 + proxy 无中途兜底——独立于本批全部 rcoder 交付**（同套件 compose 全绿 39 场景 + smoke PASS + 前置 14 场景含 concurrent_ensure/builder_identity/cross_replica_files 全过）。修复指针：TS 仓库 build 端点排查；或 proxy 对 TS 断连做请求级 Rust fallback。
+
+**本批终态**：
+- compose test-e2e 全量（run 111fe98d，head 2423ef30）：39 场景 36 直接 pass + 4 契约带 env 复跑**全过**（owner last-drop 修复后 turso_storage/turso_compose_recreation/docker_crash/docker_sigterm）+ 2 已知 Qoder 遗留（deploy_full_chain/scope_isolation，既有取证）。
+- 期间发现并修复：owner last-drop 语义回归（ec9fe167，契约 53→55 断言全绿验证）；转发专用 client 短 pool idle（2c5e7bc9）。
+- remote-k8s smoke：PASS；userapp：阻断归因如上（非本批代码回归）。
+- 遗留：TS file-server build 端点（跨仓库）；131 节点网络间歇（NodeNotReady 后 API timeout/conn reset 两次）。
