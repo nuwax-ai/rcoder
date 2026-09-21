@@ -6,10 +6,31 @@ use shared_types::ServiceType;
 
 use super::docker_runtime::DockerRuntime;
 
+/// userapp-workspace 根：容器形态直接用容器内常量（rcoder 容器挂载锚点）；
+/// deploy-host 宿主机形态经路径映射表解析为宿主机真实路径
+/// （~/.rcoder/workspace/userapp）。
+async fn userapp_workspace_root() -> ContainerRuntimeResult<std::path::PathBuf> {
+    #[cfg(feature = "deploy-host")]
+    if shared_types::is_deploy_host() {
+        return crate::path::resolve_container_path_to_host(std::path::Path::new(
+            shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
+        ))
+        .await
+        .map_err(|e| {
+            ContainerRuntimeError::DockerError(format!(
+                "deploy-host userapp workspace root resolve failed: {e}"
+            ))
+        });
+    }
+    let root = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
+    Ok(root.to_path_buf())
+}
+
 /// `list_workspace_identifiers` 仅实现 dev（UserappBuilder）形态（目录树扫描），
 /// prod 维持 trait 默认空（孤儿检测依赖 list_deployments 兜底——存量缺口）。
 /// **`destroy_app_pvc` 重写** (Docker 模式 destroy = 删 app workspace 目录, 对应 K8s 删 PVC+subvolume).
 #[async_trait]
+
 impl WorkspaceRuntime for DockerRuntime {
     async fn capture_app_storage_resize(
         &self,
@@ -58,8 +79,7 @@ impl WorkspaceRuntime for DockerRuntime {
         if *service_type != ServiceType::UserappBuilder {
             return Ok(vec![]);
         }
-        let dev_root =
-            std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join("dev");
+        let dev_root = userapp_workspace_root().await?.join("dev");
         scan_dev_workspace_identifiers(&dev_root).await
     }
 
@@ -77,8 +97,8 @@ impl WorkspaceRuntime for DockerRuntime {
                 "destroy_app_pvc: invalid app_id {app_id:?}"
             )));
         }
-        let prod_root =
-            std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join("prod");
+        let userapp_root = userapp_workspace_root().await?;
+        let prod_root = userapp_root.join("prod");
         // 全段走 tokio::fs：本函数是 async fn 且下方删除已是 remove_dir_all().await，
         // 混用阻塞 std::fs 会占住 tokio worker 线程。错误处理对齐同文件
         // scan_dev_workspace_identifiers —— 上抛而非静默跳过：漏扫某个 uid 目录会让
@@ -122,9 +142,7 @@ impl WorkspaceRuntime for DockerRuntime {
             }
             for _uid in uid_entries {
                 for sub in shared_types::paths::userapp_prod_subpaths(app_id) {
-                    let dir =
-                        std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
-                            .join(&sub);
+                    let dir = userapp_root.join(&sub);
                     if tokio::fs::try_exists(&dir).await.map_err(|e| {
                         ContainerRuntimeError::DockerError(format!(
                             "destroy_app_pvc: stat {}: {e}",

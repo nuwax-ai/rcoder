@@ -68,6 +68,8 @@ default = []
 # Kubernetes runtime support
 # 阶段2: xattr 目录配额已退役 (改 per-agent subvolume PVC + CSI 服务端配额), xattr crate 已移除
 kubernetes = ["kube", "k8s-openapi", "tokio-util"]
+# deploy-host 宿主机运行形态：路径恒等映射/独立网络/端口发布
+deploy-host = ["shared_types/deploy-host"]
 
 [dev-dependencies]
 rustls = { workspace = true }

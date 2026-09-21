@@ -46,3 +46,8 @@ arc-swap = { workspace = true }
 serde_json = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true }
+
+[features]
+default = []
+# deploy-host 宿主机运行形态（dial_addr 统一出口）
+deploy-host = ["shared_types/deploy-host"]

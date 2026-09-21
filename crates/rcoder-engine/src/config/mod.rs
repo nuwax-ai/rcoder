@@ -127,6 +127,23 @@ pub(crate) fn generate_random_api_key() -> String {
 
 pub const CONFIG_FILE: &str = "config.yml";
 
+/// config 文件定位：默认 CWD 相对 `config.yml`（容器形态，既有行为）；
+/// deploy-host 宿主机形态解析 `~/.rcoder/config.yml`（env `RCODER_CONFIG_FILE`
+/// 可覆盖）——宿主机形态自包含、不依赖仓库 cwd。
+pub fn config_file_path() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("RCODER_CONFIG_FILE").filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(explicit);
+    }
+    #[cfg(feature = "deploy-host")]
+    if shared_types::is_deploy_host() {
+        if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+            return PathBuf::from(home).join(".rcoder").join(CONFIG_FILE);
+        }
+    }
+    PathBuf::from(CONFIG_FILE)
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {

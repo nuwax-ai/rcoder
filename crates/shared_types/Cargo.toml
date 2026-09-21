@@ -8,6 +8,8 @@ license.workspace = true
 [features]
 default = []
 kubernetes = []
+# deploy-host 宿主机运行形态（Phase 2 引入；编译期隔离，生产二进制不含）
+deploy-host = []
 
 [lints]
 workspace = true

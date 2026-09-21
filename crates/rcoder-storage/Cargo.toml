@@ -8,6 +8,8 @@ repository.workspace = true
 
 [features]
 default = []
+# deploy-host 宿主机运行形态（lookup 分支）
+deploy-host = ["shared_types/deploy-host"]
 
 # PostgreSQL 持久化后端（write-behind + 启动全量加载）。
 # 未选择 pg 后端时不编译 PostgreSQL 驱动。

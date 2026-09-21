@@ -170,10 +170,16 @@ pub(super) async fn apply_auto_mounts(
 
             let host_mount = workspace_host_path.join(&host_sub);
 
-            // 创建宿主机挂载目录（通过容器内路径创建，volume 会传播到宿主机）
-            // workspace_resolution 是容器内路径（如 /app/computer-project-workspace）
-            // host_sub 是子目录（如 tenant_abc）
-            // 拼接后在容器内创建目录，通过 docker-compose volume 自动同步到宿主机
+            // 创建宿主机挂载目录。容器形态：经容器内路径创建（compose bind 双向
+            // 同步宿主机）。deploy-host 宿主机形态：rcoder 进程即宿主机进程，
+            // 直接在 bind 源（host_mount）上创建。
+            #[cfg(feature = "deploy-host")]
+            let host_dir_to_create = if shared_types::is_deploy_host() {
+                host_mount.clone()
+            } else {
+                std::path::PathBuf::from(&workspace_resolution).join(&host_sub)
+            };
+            #[cfg(not(feature = "deploy-host"))]
             let host_dir_to_create =
                 std::path::PathBuf::from(&workspace_resolution).join(&host_sub);
             if let Err(e) = tokio::fs::create_dir_all(&host_dir_to_create).await {

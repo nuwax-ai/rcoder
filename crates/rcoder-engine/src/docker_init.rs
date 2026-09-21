@@ -8,6 +8,25 @@ use crate::config::AppConfig;
 use crate::utils;
 
 pub async fn init_path_resolver(runtime_type: RuntimeType) -> anyhow::Result<()> {
+    // deploy-host 宿主机形态：不做容器自检（宿主机无 /proc/self/cgroup），
+    // 路径解析改"容器根→宿主机根"映射（默认 ~/.rcoder 约定，env 覆盖）。
+    #[cfg(feature = "deploy-host")]
+    if shared_types::is_deploy_host() {
+        let resolver = docker_manager::path::HostPathResolver::new_host_mode()?;
+        info!(
+            "[deploy-host] host path map ({} entries):",
+            resolver.snapshot_map().len()
+        );
+        for (container_root, host_root) in resolver.snapshot_map() {
+            info!(
+                "[deploy-host]   {} -> {}",
+                container_root.display(),
+                host_root.display()
+            );
+        }
+        return Ok(());
+    }
+
     if runtime_type == RuntimeType::Kubernetes {
         info!("[K8S] Kubernetes runtime mode, skipping Docker socket path resolver");
         return Ok(());
@@ -144,6 +163,15 @@ pub async fn init_docker_manager(config: &AppConfig) -> anyhow::Result<()> {
         docker_manager::global::init_global_docker_manager_with_config(docker_manager_config).await
     {
         error!("Docker Manager initialization failed: {}", e);
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            error!("[deploy-host] 宿主机形态连接 Docker 失败，请检查：");
+            error!("  1. Docker/OrbStack 是否已启动");
+            error!(
+                "  2. DOCKER_SOCKET_PATH 是否指向有效 socket（OrbStack 备选：$HOME/.orbstack/run/docker.sock）"
+            );
+            error!("  3. 当前用户是否有 socket 访问权限");
+        }
         return Err(anyhow::anyhow!(
             "Docker Manager initialization failed: {}",
             e

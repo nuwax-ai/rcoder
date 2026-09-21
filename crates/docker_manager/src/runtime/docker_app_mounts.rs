@@ -33,6 +33,15 @@ pub(super) async fn build_prod_flat_mounts(
     let subs = shared_types::paths::userapp_prod_subpaths(app_id);
     let mut mounts = Vec::with_capacity(4);
     for (rel, target) in subs.iter().zip(prod_flat_container_paths(app_id)) {
+        // 容器形态：经容器内锚点路径创建（compose bind 同步宿主机）；
+        // deploy-host：直接在 bind 源（host_root 子路径）创建。
+        #[cfg(feature = "deploy-host")]
+        let precreate = if shared_types::is_deploy_host() {
+            host_root.join(rel)
+        } else {
+            std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(rel)
+        };
+        #[cfg(not(feature = "deploy-host"))]
         let precreate =
             std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(rel);
         if let Err(e) = tokio::fs::create_dir_all(&precreate).await {

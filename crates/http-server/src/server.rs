@@ -9,7 +9,22 @@ pub async fn start_http_server(
     port: u16,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+    // bind 地址：默认 0.0.0.0（容器形态）；deploy-host 宿主机形态默认收紧为
+    // 127.0.0.1（docker.sock 等价 root 的安全边界），env RCODER_BIND_HOST 可覆盖。
+    #[cfg(feature = "deploy-host")]
+    let default_bind_host = if shared_types::is_deploy_host() {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0"
+    };
+    #[cfg(not(feature = "deploy-host"))]
+    let default_bind_host = "0.0.0.0";
+    let bind_host = std::env::var("RCODER_BIND_HOST")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_bind_host.to_owned());
+    let listener = tokio::net::TcpListener::bind(format!("{}:{}", bind_host, port))
         .await
         .map_err(|e| anyhow::anyhow!("HTTP server failed to bind port {}: {}", port, e))?;
 

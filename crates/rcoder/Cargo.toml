@@ -43,6 +43,9 @@ kubernetes = ["rcoder-engine/kubernetes"]
 # userApp 后端独立配置，不因 Agent 仍使用 memory 而回退到内存。
 rcoder-pg = ["rcoder-engine/rcoder-pg"]
 
+# deploy-host 宿主机运行形态：组合根转发（构建入口 feature 兼容面）
+deploy-host = ["rcoder-engine/deploy-host", "http-server/deploy-host"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 filetime = { workspace = true }

@@ -30,6 +30,9 @@ kubernetes = ["rcoder-engine/kubernetes"]
 
 rcoder-pg = ["rcoder-engine/rcoder-pg"]
 
+# deploy-host 宿主机运行形态（handler dial 点经 funnel 查表）
+deploy-host = ["rcoder-engine/deploy-host"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 filetime = { workspace = true }

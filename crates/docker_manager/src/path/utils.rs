@@ -2,8 +2,8 @@
 //!
 //! 提供便捷的路径解析接口
 
-use crate::DockerResult;
 use crate::path::HostPathResolver;
+use crate::{DockerError, DockerResult};
 use std::path::{Path, PathBuf};
 
 /// 便捷函数：将容器路径解析为宿主机路径
@@ -30,8 +30,25 @@ use std::path::{Path, PathBuf};
 /// # }
 /// ```
 pub async fn resolve_container_path_to_host(container_path: &Path) -> DockerResult<PathBuf> {
+    #[cfg(feature = "deploy-host")]
+    if shared_types::is_deploy_host() {
+        return host_mode_resolver()?.resolve_to_host_path(container_path);
+    }
     let resolver = HostPathResolver::new().await?;
     resolver.resolve_to_host_path(container_path)
+}
+
+/// deploy-host 模式共享解析器（无 Docker inspect 依赖，进程内缓存一次构建；
+/// 构建失败每次调用重放同一错误，保持 fail-fast 语义）。
+#[cfg(feature = "deploy-host")]
+fn host_mode_resolver() -> DockerResult<&'static HostPathResolver> {
+    static HOST_RESOLVER: std::sync::OnceLock<Result<HostPathResolver, String>> =
+        std::sync::OnceLock::new();
+    let cached = HOST_RESOLVER
+        .get_or_init(|| HostPathResolver::new_host_mode().map_err(|error| error.to_string()));
+    cached.as_ref().map_err(|message| {
+        DockerError::ConfigurationError(format!("deploy-host resolver unavailable: {message}"))
+    })
 }
 
 /// 便捷函数：获取 HostPathResolver 实例

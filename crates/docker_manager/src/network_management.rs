@@ -1,5 +1,7 @@
 //! 网络管理：主网络检测、网络存在性检查（从 DockerManager 拆出）
 
+use std::collections::HashMap;
+
 use bollard::Docker;
 use tracing::{debug, info, warn};
 
@@ -62,6 +64,14 @@ impl DockerManager {
         docker: &Docker,
         network_base_name: &str,
     ) -> DockerResult<String> {
+        // deploy-host 宿主机形态：HOSTNAME 自检不可用（宿主机非容器），改用
+        // 独立默认网络（不与 compose {project}_agent-network 混淆），不存在则创建
+        // user-defined bridge（保留容器别名能力，agent 容器照常经 build_networking 接入）。
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            return Self::ensure_deploy_host_network(docker).await;
+        }
+
         use bollard::query_parameters::InspectContainerOptions;
 
         // 🎯 优化：直接通过 HOSTNAME 环境变量 inspect 当前容器，无需列出所有容器
@@ -124,5 +134,43 @@ impl DockerManager {
     /// 这样可以适应不同的 Docker Compose project name
     pub async fn detect_main_network_name(&self) -> DockerResult<String> {
         Self::detect_main_network_name_static(&self.docker, &self.config.network_base_name).await
+    }
+
+    /// deploy-host 独立 agent 网络：env `RCODER_DEPLOY_HOST_NETWORK` 覆盖名，
+    /// 默认 `rcoder-agent-network`；不存在则创建 user-defined bridge。
+    #[cfg(feature = "deploy-host")]
+    async fn ensure_deploy_host_network(docker: &Docker) -> DockerResult<String> {
+        use bollard::query_parameters::ListNetworksOptions;
+
+        let name = std::env::var("RCODER_DEPLOY_HOST_NETWORK")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "rcoder-agent-network".to_owned());
+
+        let networks = docker
+            .list_networks(None::<ListNetworksOptions>)
+            .await
+            .map_err(|e| DockerError::ConnectionError(format!("failed to list networks: {}", e)))?;
+        if networks.iter().any(|n| n.name.as_ref() == Some(&name)) {
+            info!("[deploy-host] detected network: {}", name);
+            return Ok(name);
+        }
+
+        let labels = HashMap::from([
+            ("dev.rcoder.managed".to_owned(), "deploy-host".to_owned()),
+            ("dev.rcoder.form".to_owned(), "deploy-host".to_owned()),
+        ]);
+        let request = bollard::models::NetworkCreateRequest {
+            name: name.clone(),
+            labels: Some(labels),
+            driver: Some("bridge".to_owned()),
+            ..Default::default()
+        };
+        docker.create_network(request).await.map_err(|e| {
+            DockerError::ConnectionError(format!("failed to create network {name}: {}", e))
+        })?;
+        info!("[deploy-host] created network: {}", name);
+        Ok(name)
     }
 }

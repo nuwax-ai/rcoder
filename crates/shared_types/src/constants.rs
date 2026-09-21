@@ -164,6 +164,14 @@ pub fn is_kubernetes_runtime() -> bool {
     cfg!(feature = "kubernetes")
 }
 
+/// 判断是否是 deploy-host 宿主机运行形态（通过 feature flag）
+///
+/// 与 [`is_kubernetes_runtime`] 对偶的编译期判定：宿主机原生运行的控制平面，
+/// agent 寻址一律经 published-port 注册表（[`crate::published`]) 拨 loopback。
+pub fn is_deploy_host() -> bool {
+    cfg!(feature = "deploy-host")
+}
+
 /// 构建 K8s Service FQDN
 ///
 /// # 参数
@@ -204,7 +212,12 @@ pub fn build_backend_addr(
     namespace: &str,
     cluster_domain: &str,
 ) -> String {
-    if is_kubernetes_runtime() {
+    if is_deploy_host() {
+        // 宿主机形态：返回注册表查表键（地址经 build_grpc_addr/build_http_addr
+        // 查 published-port 组装 127.0.0.1:host_port）。macOS 宿主机无法路由
+        // 容器网段 IP，也无法解析集群内 FQDN，发布端口是唯一可达路径。
+        container_name.to_string()
+    } else if is_kubernetes_runtime() {
         // K8s 环境：使用 K8s Service FQDN
         build_k8s_service_fqdn(container_name, namespace, cluster_domain)
     } else {
@@ -234,6 +247,11 @@ pub fn build_grpc_addr(
     cluster_domain: &str,
 ) -> String {
     let backend_addr = build_backend_addr(container_name, container_ip, namespace, cluster_domain);
+    #[cfg(feature = "deploy-host")]
+    if is_deploy_host() {
+        return crate::published::resolve_published_addr(&backend_addr, GRPC_DEFAULT_PORT)
+            .to_string();
+    }
     format!("{}:{}", backend_addr, GRPC_DEFAULT_PORT)
 }
 
@@ -258,7 +276,31 @@ pub fn build_http_addr(
     cluster_domain: &str,
 ) -> String {
     let backend_addr = build_backend_addr(container_name, container_ip, namespace, cluster_domain);
+    #[cfg(feature = "deploy-host")]
+    if is_deploy_host() {
+        return crate::published::resolve_published_addr(&backend_addr, HTTP_DEFAULT_PORT)
+            .to_string();
+    }
     format!("{}:{}", backend_addr, HTTP_DEFAULT_PORT)
+}
+
+/// 构建指定容器端口的后端地址：deploy-host 经 published-port 注册表解析
+/// `127.0.0.1:{host_port}`，K8s 形态拼 FQDN，Docker 容器形态用容器 IP。
+/// 与 [`build_grpc_addr`]/[`build_http_addr`] 同一收敛语义，供非标准端口
+/// （file-server 60000 等）的直连点统一走查表。
+pub fn build_container_port_addr(
+    container_name: &str,
+    container_ip: &str,
+    namespace: &str,
+    cluster_domain: &str,
+    port: u16,
+) -> String {
+    let backend_addr = build_backend_addr(container_name, container_ip, namespace, cluster_domain);
+    #[cfg(feature = "deploy-host")]
+    if is_deploy_host() {
+        return crate::published::resolve_published_addr(&backend_addr, port).to_string();
+    }
+    format!("{}:{}", backend_addr, port)
 }
 
 // === gRPC 超时配置 ===

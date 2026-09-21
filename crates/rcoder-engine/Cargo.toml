@@ -40,6 +40,9 @@ kubernetes = ["rcoder-storage/pg", "docker_manager/kubernetes", "shared_types/ku
 # userApp 后端独立配置，不因 Agent 仍使用 memory 而回退到内存。
 rcoder-pg = ["kubernetes", "rcoder-storage/pg"]
 
+# deploy-host 宿主机运行形态：引擎层主开关（启动门/路径映射/端口发布）
+deploy-host = ["shared_types/deploy-host", "docker_manager/deploy-host", "rcoder-storage/deploy-host", "rcoder-proxy/deploy-host", "app_manager/deploy-host"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 filetime = { workspace = true }

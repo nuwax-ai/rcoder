@@ -114,10 +114,14 @@ async fn resolve_existing_dev(
             "dev container address unavailable",
         ));
     }
-    Ok(Some(format!(
-        "http://{host}:{}",
-        shared_types::AGENT_FILE_SERVER_PORT
-    )))
+    let addr = shared_types::build_container_port_addr(
+        &info.container_name,
+        &info.container_ip,
+        namespace,
+        cluster_domain,
+        shared_types::AGENT_FILE_SERVER_PORT,
+    );
+    Ok(Some(format!("http://{addr}")))
 }
 
 pub(super) async fn dev_container_absent(
@@ -487,7 +491,10 @@ mod authoritative_lookup_tests {
         .expect("runtime found");
         // Use the shared crate's effective feature selection, including Cargo
         // feature unification, while asserting the complete address contract.
-        let expected = if shared_types::is_kubernetes_runtime() {
+        let expected = if shared_types::is_deploy_host() {
+            // 容器未登记发布端口：回退 loopback:容器端口（运行期 warn 可归因）
+            "http://127.0.0.1:60000"
+        } else if shared_types::is_kubernetes_runtime() {
             "http://rcoder-app-builder-app-a-svc.test.svc.cluster.local:60000"
         } else {
             "http://127.0.0.2:60000"

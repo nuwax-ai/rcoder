@@ -428,13 +428,14 @@ async fn probe_file_server(addr: &str) -> bool {
 
 /// 开发容器 file-server 地址（`http://{host}:60000`）。
 pub fn dev_file_server_addr(state: &AppState, info: &ContainerBasicInfo) -> String {
-    let host = build_backend_addr(
+    let addr = shared_types::build_container_port_addr(
         &info.container_name,
         &info.container_ip,
         &state.config.app_manager.namespace,
         &state.cluster_domain,
+        AGENT_FILE_SERVER_PORT,
     );
-    format!("http://{host}:{AGENT_FILE_SERVER_PORT}")
+    format!("http://{addr}")
 }
 
 /// 纯解析:只查 state.projects,无副作用（短路语义 peek 复用——只读判定

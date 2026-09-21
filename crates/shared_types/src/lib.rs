@@ -109,6 +109,10 @@ pub use permission_types::{
 pub mod constants;
 // 工作区路径常量 (单一事实源, 所有 crate 共用: rcoder/docker_manager/agent_runner)
 pub mod paths;
+
+/// deploy-host published-port 注册表（宿主机形态寻址单一事实源；feature 门控）
+#[cfg(feature = "deploy-host")]
+pub mod published;
 pub mod storage_contents;
 pub use app_resource_deletion::{UserAppStorageClear, UserAppStorageClearTarget};
 pub use constants::*;

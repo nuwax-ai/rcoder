@@ -60,6 +60,12 @@ impl Sandbox {
         }
         let origin_cwd = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&dir).expect("chdir");
+        // 显式指向沙箱 config.yml：两种编译形态（容器 cwd 相对 / deploy-host
+        // ~/.rcoder 默认）下 load 都读沙箱文件，行为一致
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("RCODER_CONFIG_FILE", dir.join(CONFIG_FILE));
+        }
         Self {
             origin_cwd,
             dir,
@@ -89,6 +95,10 @@ impl Sandbox {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         // 恢复顺序：env → cwd → 清理目录（断言失败也不留脏全局态）
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("RCODER_CONFIG_FILE");
+        }
         for k in &self.env_keys {
             #[allow(unsafe_code)]
             unsafe {

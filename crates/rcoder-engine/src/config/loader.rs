@@ -11,10 +11,11 @@ use tracing::{info, warn};
 use super::sections::*;
 use super::sections::{env_override_bool, env_override_u64};
 use super::storage;
-use super::{ApiKeyAuthConfig, AppConfig, CONFIG_FILE, CliArgs, generate_random_api_key};
+use super::{ApiKeyAuthConfig, AppConfig, CliArgs, config_file_path, generate_random_api_key};
 
 pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
-    let mut config = if std::path::Path::new(CONFIG_FILE).exists() {
+    let config_path = config_file_path();
+    let mut config = if config_path.exists() {
         // fail fast: 配置文件存在但解析失败 → 直接退出（不降级默认配置带病运行）。
         // 历史教训（0.1.233 部署事故）：降级默认值后 docker_config 无镜像，
         // 报错与真因（configmap 模板缩进坏）隔三层，CrashLoop 排障一小时；
@@ -23,7 +24,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     } else {
         info!(
             "config file not found, created default config file: {}",
-            CONFIG_FILE
+            config_path.display().to_string()
         );
         let default_config = AppConfig::default();
         create_default_config_file()?;
@@ -146,10 +147,13 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
 /// （`rcoder file-server status` 这类只读短命令不应有写文件副作用），
 /// 仅用内存默认值补齐端口/API key 后返回。
 pub fn load_config_for_cli(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
-    if std::path::Path::new(CONFIG_FILE).exists() {
+    if config_file_path().exists() {
         return load_config_with_args(cli_args);
     }
-    info!("{CONFIG_FILE} 不存在, CLI 子命令使用内存默认配置（不写盘）");
+    info!(
+        "{} 不存在, CLI 子命令使用内存默认配置（不写盘）",
+        config_file_path().display()
+    );
     let mut config = AppConfig::default();
     if let Some(port) = cli_args.port {
         config.port = port;
@@ -159,7 +163,7 @@ pub fn load_config_for_cli(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
 
 /// 从文件加载配置
 fn load_config_from_file() -> anyhow::Result<AppConfig> {
-    let config_content = fs::read_to_string(CONFIG_FILE)
+    let config_content = fs::read_to_string(config_file_path())
         .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
     // 安全修复：移除完整配置内容的 debug 日志，避免泄露 API Key 等敏感信息
@@ -237,12 +241,13 @@ pub fn load_api_key_config_from_file(
 /// 创建默认配置文件
 fn create_default_config_file() -> anyhow::Result<()> {
     // 检查配置文件是否已存在
-    if std::path::Path::new(CONFIG_FILE).exists() {
+    if config_file_path().exists() {
         return Ok(());
     }
 
     // 创建配置文件目录（如果不存在）
-    if let Some(parent) = std::path::Path::new(CONFIG_FILE).parent() {
+    let config_path = config_file_path();
+    if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
     }
@@ -254,13 +259,13 @@ fn create_default_config_file() -> anyhow::Result<()> {
     let generated_api_key = generate_random_api_key();
     let config_content = default_config.replace("{{GENERATED_API_KEY}}", &generated_api_key);
 
-    fs::write(CONFIG_FILE, config_content)
+    fs::write(&config_path, config_content)
         .map_err(|e| anyhow::anyhow!("Failed to write default config file: {}", e))?;
 
-    info!("Created default config file: {}", CONFIG_FILE);
+    info!("Created default config file: {}", config_path.display());
     info!(
         "Generated a random API key into {} (not echoed to logs)",
-        CONFIG_FILE
+        config_path.display().to_string()
     );
     Ok(())
 }
@@ -272,6 +277,8 @@ mod tests {
     use std::env;
     use std::fs;
     use std::process;
+
+    use crate::config::CONFIG_FILE;
 
     /// fail fast 防回归：配置文件存在但解析失败必须返回 Err（不降级默认配置）。
     /// 历史教训（0.1.233 部署事故）：降级默认值后报错与真因隔三层
@@ -290,7 +297,17 @@ mod tests {
 
         let origin = env::current_dir().expect("cwd");
         env::set_current_dir(&dir).expect("chdir");
+        // RCODER_CONFIG_FILE 显式指向临时配置：两种编译形态（容器 cwd 相对 /
+        // deploy-host ~/.rcoder）都读到本测试写入的坏配置
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var("RCODER_CONFIG_FILE", dir.join(CONFIG_FILE));
+        }
         let result = load_config_with_args(CliArgs::try_parse_from(["rcoder"]).expect("cli args"));
+        #[allow(unsafe_code)]
+        unsafe {
+            env::remove_var("RCODER_CONFIG_FILE");
+        }
         // 恢复 cwd 尽早执行（断言失败也不留脏 cwd）
         if let Err(e) = env::set_current_dir(origin) {
             eprintln!("restore cwd failed: {e}");
