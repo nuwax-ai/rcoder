@@ -258,7 +258,7 @@ pub(crate) fn invalidate_probe_cache(key: &str) {
 
 /// 开发容器 file-server 轻量探活（连接失败/非 2xx 均视为不可用）。
 async fn probe_dev_container(addr: &str) -> bool {
-    crate::http_client::shared_client()
+    crate::http_client::forward_client()
         .get(format!("{addr}/api/version"))
         .timeout(std::time::Duration::from_secs(3))
         .send()
@@ -278,7 +278,7 @@ async fn forward_to_addr(target_label: &str, app_id: &str, addr: &str, req: Requ
     let listed = connection_listed_tokens(&parts.headers);
     // 循环外一次构造引用视图（原先每个 header 重建一次 Vec）
     let listed_refs: Vec<&str> = listed.iter().map(String::as_str).collect();
-    let mut outbound = crate::http_client::shared_client().request(parts.method, &target);
+    let mut outbound = crate::http_client::forward_client().request(parts.method, &target);
     for (name, value) in &parts.headers {
         if is_hop_by_hop(name.as_str(), &listed_refs) {
             continue;
