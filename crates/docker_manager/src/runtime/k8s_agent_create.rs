@@ -219,10 +219,26 @@ impl KubernetesRuntime {
         let image = self.select_image(service_type);
 
         // Build resource requirements if limits are provided
-        let resources = params
-            .resource_limits
-            .as_ref()
-            .and_then(Self::build_resource_requirements);
+        let resources = match params.resource_limits.as_ref() {
+            Some(limits) => Self::build_resource_requirements(limits),
+            None if *service_type == ServiceType::UserappBuilder => {
+                // builder 容器承载桌面全家桶（Xvnc/XFCE/fcitx/TS file-server/
+                // Rust file-server/PG）。无显式 limits 时环境可能套入远小于
+                // 实际需求的隐式上限（131 实证 547Mi：import 解压内存尖峰触发
+                // cgroup reclaim 风暴，容器整体冻结——探针/转发/exec 全无响应，
+                // liveness 60s 兜底重启后本轮请求已失败）。显式默认 2Gi/2 核
+                // 覆盖任何隐式层；CPU 必须给足——桌面+file-server+PG 在 1 核
+                // limit 下 throttle 到响应停摆（第 12 轮实证同症状复发）。
+                Self::build_resource_requirements(&shared_types::ServiceResourceLimits {
+                    memory: Some(2147483648.0),
+                    cpu: Some(2.0),
+                    swap: None,
+                    ephemeral_storage_limit: None,
+                    storage_size: None,
+                })
+            }
+            None => None,
+        };
 
         // workspace PVC:
         // - per-agent (pod_id=None + per_agent_pvc_enabled=true): per-agent PVC (subPath=None)
