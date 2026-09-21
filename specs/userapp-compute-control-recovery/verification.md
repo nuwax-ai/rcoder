@@ -998,3 +998,20 @@ Docker 遗留清理明细：rcoder-crash-bee781723f7c44ab 项目 down -v；22 �
 5. 顺带记录：131 soddy 节点 CephFS CSI staging handle 损坏（permission denied→file does not exist），已做 umount -l + handle 清理 + CSI nodeplugin 重启 + VolumeAttachment 重建，rcoder surge pod 仍偶发 Init 卡住（节点级残留问题，rcoder 双副本不受影响）。
 
 已恢复：closed-storage pod 已删除重建；debug 资源已清理。
+
+### 2026-09-21 傍晚：注册表零包袱四契约批次——验证轮被并行工作冲突阻断
+
+**本轮交付**（提交 736e3c9e/1d845d5d/bd7138d6/4be996aa/182b14b0，均未 push）：
+- 契约四（workload_uid 捕获传输 + k8s_resolution 分层解析器 + 围栏证据化收束泛化）
+- 契约二（teardown 代次守卫，判定矩阵单测 1/1）
+- 契约三（对账处置表 9 行纯函数 + 逐行测试 8/8 + prepare_info §1.2 换代门 + 周期补偿观察任务）
+- 代码审查修复 3 处 workload_uid 捕获漏点（builder 主路径/trait 默认实现/deployment uid）
+- 换代门 PG 集成测试 1/1 + pg::project_store 全量 25/25（本地 PG）
+- workspace 全 feature + 默认 feature 编译/clippy 零警
+
+**验证轮结果**：
+- remote-k8s smoke：**PASS**（build b0fdbf64=4be996aa 源码，双副本就绪；首次失败系 131 API server i/o timeout 抖动，重试过）
+- remote-k8s userapp：**2 次 fail，均非本批代码回归**——①builder build 转发连接失败（pod Ready 后 1 秒同 svc 从通到不通 + 12min 前节点 NodeNotReady 刚恢复=网络抖动）；②RecoveryRequired@builder_created_observed 卡死 + state version conflict（app 159 首开竞态形态；**并行 agent 已提交 ffe8d730 修复，但部署快照不含它**）
+- compose test-e2e：**整轮被启动器判无效（source changed during run）**——前段 39 场景 35 pass + deploy_full_chain/scope_isolation fail（已知 Qoder 遗留域）；docker_crash/sigterm fail 系运行中源码被并行提交（ffe8d730@17:49 + file-server 工作树未提交改动）热重建污染
+
+**阻断原因：仓库存在并行 agent 工作**（ffe8d730/f3ceed938=app 159 修复线，工作树尚有 file-server 未提交改动）。e2e 源码漂移门禁与 remote-k8s 快照语义均要求运行期间源码稳定。**待并行工作提交稳定后需重跑：compose test-e2e 全量 + remote-k8s verify SUITE=userapp（含 ffe8d730 与本批全部提交）**，全绿后方可 push 与构建发版镜像。
