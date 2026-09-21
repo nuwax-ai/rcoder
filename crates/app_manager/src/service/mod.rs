@@ -94,7 +94,7 @@ impl AppService {
         store: Arc<dyn shared_types::UserAppLifecycleStore>,
     ) -> AppResult<Self> {
         if config.access_mode == AppAccessMode::Docker
-            && config.operation_lock_root != shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT
+            && config.operation_lock_root != crate::config::default_operation_lock_root()
         {
             return Err(AppOperationError::Validation(
                 "Docker application operation lock root must match the shared runtime data root"

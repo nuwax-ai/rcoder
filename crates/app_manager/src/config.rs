@@ -114,25 +114,7 @@ impl Default for AppManagerConfig {
         Self {
             enabled: true,
             workspace_root: std::env::var("RCODER_WORKSPACE_ROOT").ok(),
-            operation_lock_root: {
-                #[cfg(feature = "deploy-host")]
-                {
-                    // deploy-host：容器常量 /app/userapp-workspace 在宿主机不存在，
-                    // 锚定 ~/.rcoder/workspace/userapp（与 docker_manager host_map 默认
-                    // 同源约定）；env 显式设置优先
-                    std::env::var("RCODER_OPERATION_LOCK_ROOT").unwrap_or_else(|_| {
-                        std::env::var("HOME")
-                            .map(|home| format!("{home}/.rcoder/workspace/userapp"))
-                            .unwrap_or_else(|_| {
-                                shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT.to_owned()
-                            })
-                    })
-                }
-                #[cfg(not(feature = "deploy-host"))]
-                {
-                    shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT.to_owned()
-                }
-            },
+            operation_lock_root: default_operation_lock_root(),
             namespace: std::env::var("RCODER_K8S_NAMESPACE")
                 .unwrap_or_else(|_| "default".to_string()),
             gateway_name: std::env::var("RCODER_K8S_GATEWAY_NAME").ok(),
@@ -265,5 +247,28 @@ pub fn deploy_budget_from_env() -> DeployBudgetConfig {
             "RCODER_USERAPP_DEPLOY_FENCED_ALERT_AFTER_SECS",
             d.fenced_alert_after_secs,
         ),
+    }
+}
+
+/// 运行时数据根（Docker 形态锁根与数据根同树约定的单一事实源）。
+///
+/// 容器形态：常量 `/app/userapp-workspace`。deploy-host 宿主机形态：容器常量
+/// 路径不存在，锚定 `~/.rcoder/workspace/userapp`（与 docker_manager host_map
+/// 默认同源约定）；env `RCODER_OPERATION_LOCK_ROOT` 显式设置永远优先。
+/// [`crate::service::AppService::new`] 的锁根一致性校验与
+/// [`AppManagerConfig`] 默认值**必须**共用本函数——两处分头推导会造成
+/// 宿主机形态启动即 Validation 拒启（2026-09-22 自检实测回归）。
+pub fn default_operation_lock_root() -> String {
+    #[cfg(feature = "deploy-host")]
+    {
+        std::env::var("RCODER_OPERATION_LOCK_ROOT").unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|home| format!("{home}/.rcoder/workspace/userapp"))
+                .unwrap_or_else(|_| shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT.to_owned())
+        })
+    }
+    #[cfg(not(feature = "deploy-host"))]
+    {
+        shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT.to_owned()
     }
 }
