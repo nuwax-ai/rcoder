@@ -54,7 +54,7 @@ pub fn validate_store_segment(kind: &str, value: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// V05：受管 ACP 根身份核验——`.agents/.claude/.opencode/.codex/.grok/.pi`
+/// V05：受管 ACP 根身份核验——`.agents` + `SYNC_TARGET_DIRS` 各根
 /// 全部根在任何 manifest 写入/create/prune **之前**校验：任何根（或将创建
 /// 其子目录的祖先）是指向受管树之外的符号链接时，后续 create_dir_all/
 /// read_dir/递归删除会沿链接作用于目标目录。查询错误不得当不存在
@@ -1799,10 +1799,10 @@ mod tests {
 
     #[tokio::test]
     async fn replaced_non_agents_acp_roots_are_refused_across_all_variants() {
-        // V05：.agents 之外的 ACP 根（.claude/.opencode/.codex/.grok/.pi 任一）
-        // 被替换为指向 victim 的链接——sync 与 link 两条路径都必须拒绝，
+        // V05：.agents 之外的 ACP 根（SYNC_TARGET_DIRS 任一）被替换为指向
+        // victim 的链接——sync 与 link 两条路径都必须拒绝，
         // 且 victim、manifest、其余视图零变更
-        for replaced in [".claude", ".opencode", ".codex", ".grok", ".pi"] {
+        for replaced in crate::service::skills::SYNC_TARGET_DIRS {
             let tmp = tempfile::tempdir().unwrap();
             let user_root = tmp.path().join("u1");
             let workspace = tmp.path().join("ws");

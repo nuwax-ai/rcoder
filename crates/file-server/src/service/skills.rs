@@ -253,11 +253,26 @@ async fn find_skills_dir(root: &Path) -> AppResult<Option<PathBuf>> {
 /// sync_agents fan-out 目标目录: 权威源 .agents/{skills,agents} → 各家 ACP agent 约定目录。
 /// 加新 agent 在此追加目录名即可 (注意: .agents 是权威源本身, 不在此列)。
 /// 源码实证: claude(.claude) / opencode(.opencode) / codex(.codex) / grok(.grok) / pi(.pi)。
-pub const SYNC_TARGET_DIRS: &[&str] = &[".claude", ".opencode", ".codex", ".grok", ".pi"];
+// 临时屏蔽: 暂不接入 grok/pi agent, skills/agents 不再 fan-out 到这两家; 接入时取消注释即恢复。
+pub const SYNC_TARGET_DIRS: &[&str] = &[
+    ".claude",
+    ".opencode",
+    ".codex",
+    // ".grok",
+    // ".pi",
+];
 
 /// 所有 agent 目录 (含权威源 .agents + 各家 ACP 目录)。
 /// `link_workspace_to_agent_store` 用此列表把每个目录的 {skills,agents} 软链到 agent-store。
-pub const ALL_AGENT_DIRS: &[&str] = &[".agents", ".claude", ".opencode", ".codex", ".grok", ".pi"];
+// 临时屏蔽: 同 SYNC_TARGET_DIRS, 暂不接入 grok/pi agent, 不为其建目录/软链。
+pub const ALL_AGENT_DIRS: &[&str] = &[
+    ".agents",
+    ".claude",
+    ".opencode",
+    ".codex",
+    // ".grok",
+    // ".pi",
+];
 
 /// fan-out 版本标识 (SYNC_TARGET_DIRS 派生): sync_agents 写入 `.agents/.sync_version`,
 /// 启动 reconciler 据此 O(1) 判断是否需补 sync。加新 agent 改 SYNC_TARGET_DIRS 即自动变版本。
@@ -265,11 +280,11 @@ pub fn sync_target_version() -> String {
     SYNC_TARGET_DIRS.join(",")
 }
 
-/// 以 `.agents` 为权威源, 全量 fan-out skills/agents 到五家 ACP agent 约定目录
+/// 以 `.agents` 为权威源, 全量 fan-out skills/agents 到各家 ACP agent 约定目录
 /// (对齐 nuwax AgentWorkspaceUtils syncAgents; PRIMARY_AGENT_TYPE="agents")。
 ///
-/// 10 个目录 (5 agent × {skills, agents}) 并发同步 (`try_join_all`);
-/// 优先软链 (零拷贝), 失败 fallback 实体复制。
+/// 2 × SYNC_TARGET_DIRS 个目录 (每个 agent × {skills, agents}) 并发同步
+/// (`try_join_all`); 优先软链 (零拷贝), 失败 fallback 实体复制。
 /// 各 agent 的 hook 配置 (`settings.json` / `hooks.json` / `plugins/` 等) 不受影响。
 pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
     let start = std::time::Instant::now();

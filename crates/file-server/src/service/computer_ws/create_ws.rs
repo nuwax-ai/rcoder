@@ -181,7 +181,7 @@ pub async fn create_workspace(
         }
     }
 
-    // syncAgents: .agents → .claude/.opencode/.codex/.grok/.pi
+    // syncAgents: .agents → SYNC_TARGET_DIRS 各家 ACP 目录 (grok/pi 临时屏蔽)
     crate::service::skills::sync_agents(workspace).await?;
 
     let mut message = if updated_dirs.is_empty() {
@@ -373,12 +373,12 @@ mod tests {
         assert!(tmp.join(".agents").join("agents").is_dir());
         // 无 file → 早退 message
         assert!(res.message.contains("no uploaded file"));
-        // syncAgents 镜像目录
+        // syncAgents 镜像目录 (grok/pi 临时屏蔽, 不再创建)
         assert!(tmp.join(".claude").join("skills").is_dir());
         assert!(tmp.join(".opencode").join("skills").is_dir());
         assert!(tmp.join(".codex").join("skills").is_dir());
-        assert!(tmp.join(".grok").join("skills").is_dir());
-        assert!(tmp.join(".pi").join("skills").is_dir());
+        assert!(!tmp.join(".grok").join("skills").exists());
+        assert!(!tmp.join(".pi").join("skills").exists());
         // sync_agents 写版本 marker (启动 reconciler 据此 O(1) 判断是否需补 sync)
         assert!(tmp.join(".agents").join(".sync_version").is_file());
         drop(fs::remove_dir_all(&tmp).await);
