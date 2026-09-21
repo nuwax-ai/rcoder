@@ -8,11 +8,13 @@
 //!
 //! 历史职责（纯 DashMap 内存存储 + RAII）见 rcoder-storage crate 文档。
 
+mod registry_reconcile;
 mod resource_reaper;
 
 pub use rcoder_storage::{
     CLEANUP_CHANNEL_CAPACITY, CleanupRequest, ContainerEntry, IdleContainerInfo, ProjectAdapter,
     ProjectStoreBackend, StorageStats,
 };
+pub(crate) use registry_reconcile::start_registry_reconcile;
 pub use resource_reaper::ResourceReaper;
 pub use shared_types::ProjectStore;

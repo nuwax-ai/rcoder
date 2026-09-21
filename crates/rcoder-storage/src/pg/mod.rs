@@ -221,8 +221,13 @@ impl PgStore {
         retired: &std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Arc<ProjectAndContainerInfo>> {
         let supplied = info.persistence_identity().clone();
+        // 契约三行3/§1.2 换代门输入：当前注册的 workload UID（同名替换判定）。
+        let mut registered_workload_uid: Option<String> = None;
         let mut identity = if let Some(existing) = self.inner.get(info.project_id()) {
             let current = existing.persistence_identity();
+            registered_workload_uid = existing
+                .container_info()
+                .and_then(|basic| basic.workload_uid);
             anyhow::ensure!(
                 supplied.revision == 0
                     || (supplied.generation == current.generation
@@ -277,6 +282,21 @@ impl PgStore {
                         physical_uid.is_some(),
                         "A placeholder cannot clear a bound container identity"
                     );
+                    // 契约三行3/§1.2：同名 workload 对象已被替换（注册与观察的
+                    // workload UID 均在且不同）→ 禁止自动换代重绑——自动接管
+                    // 会把 projects/sessions 绑到别人的 workload 上；需显式
+                    // 恢复路径处置旧绑定。任一方缺 workload UID（Docker/
+                    // bare-pod/Deployment 族）不在此门内，按既有换代事务走。
+                    if let (Some(registered), Some(observed)) = (
+                        registered_workload_uid.as_deref(),
+                        basic.workload_uid.as_deref(),
+                    ) {
+                        anyhow::ensure!(
+                            registered == observed,
+                            "Container workload was replaced ({registered} -> {observed}); \
+                             rebinding requires explicit recovery"
+                        );
+                    }
                     shared_types::persistence::ContainerPersistenceIdentity {
                         generation: uuid_generation(),
                         revision: 1,

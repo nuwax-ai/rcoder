@@ -204,6 +204,8 @@ impl AppState {
             .userapp_recovery_handle
             .lock()
             .map_err(|_| anyhow::anyhow!("recovery handle lock poisoned"))? = Some(recovery_handle);
+        // 契约三周期补偿观察（Weak 持有，关机广播后自行退出，不占 R02 门）
+        crate::storage::start_registry_reconcile(Arc::downgrade(&state), shutdown_tx.subscribe());
         Ok(state)
     }
 
