@@ -2811,7 +2811,6 @@ dependencies = [
  "gpui-kit",
  "rcoder",
  "rcoder-engine",
- "reqwest",
  "tokio",
 ]
 

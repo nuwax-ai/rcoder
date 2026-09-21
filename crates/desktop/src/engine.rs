@@ -12,8 +12,8 @@ pub fn tcp_health_probe(port: u16) -> Result<(), String> {
     use std::net::{SocketAddr, TcpStream};
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))
-        .map_err(|e| e.to_string())?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, Duration::from_secs(1)).map_err(|e| e.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|e| e.to_string())?;
@@ -26,7 +26,10 @@ pub fn tcp_health_probe(port: u16) -> Result<(), String> {
     if head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200") {
         Ok(())
     } else {
-        Err(format!("non-200 status line: {}", head.lines().next().unwrap_or_default()))
+        Err(format!(
+            "non-200 status line: {}",
+            head.lines().next().unwrap_or_default()
+        ))
     }
 }
 

@@ -34,7 +34,12 @@ async fn post_json(
 
 fn docker_inspect_ports(container: &str) -> Result<String, String> {
     let output = std::process::Command::new("docker")
-        .args(["inspect", "--format", "{{json .NetworkSettings.Ports}}", container])
+        .args([
+            "inspect",
+            "--format",
+            "{{json .NetworkSettings.Ports}}",
+            container,
+        ])
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
@@ -51,9 +56,7 @@ fn docker_container_absent(container: &str) -> bool {
         .args(["ps", "-aq", "--filter", &format!("name=^/{container}$")])
         .output();
     match output {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().is_empty()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().is_empty(),
         _ => false,
     }
 }
@@ -135,7 +138,10 @@ async fn host_agent_lifecycle_no_llm() {
     report.assert_hard(
         "host_container_ports_published",
         published,
-        format!("ports={}", ports_json.as_deref().unwrap_or("<inspect failed>")),
+        format!(
+            "ports={}",
+            ports_json.as_deref().unwrap_or("<inspect failed>")
+        ),
     );
 
     // 3) ensure 幂等：同身份复用（created=false），不再新建
