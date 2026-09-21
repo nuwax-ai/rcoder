@@ -39,6 +39,7 @@ REQUIRED = {'cluster_ready', 'concurrent_ensure', 'ensure_retry', 'builder_ident
             'lock_holder_completes', 'lock_rejected_no_auto_execution', 'lock_no_side_effects',
             'lock_busy_start_conflict',
             'lock_delete_stale_version_conflict', 'lock_delete_version_keeps_resources',
+            'lease_dead_holder_takeover', 'lease_released_after_operation',
             'lifecycle_active', 'stop_request_operation', 'stop_operation_by_request',
             'lifecycle_stable_stop_wake', 'request_id_replay_no_redeploy', 'request_id_by_request',
             'stop_idempotent', 'stop_zero_pods', 'wake_new_pod', 'wake', 'wake_content_B', 'cleanup',
@@ -478,6 +479,68 @@ strip_prefix = false
                    and envelope.get('success') is False,
                    {'status': status, 'envelope': envelope, 'elapsed_ms': elapsed_ms})
 
+    def lease_dead_holder_takeover(self):
+        """死持有者租约接管（coordination.Lease TTL 语义，替代原 ConfigMap
+        永久残留）：预置 renewTime 一小时前的 rcoder-operation-prod-{app}
+        Lease（模拟持有者副本崩溃/被 kill 后的残留锁），随后的控制操作必须
+        在 acquire 的 409 分支判定过期并 CAS 接管成功——不报 occupied、无需
+        人工 kubectl delete；操作完成按正常路径释放 Lease（对象消失）。
+        修复前语义：409 一律 OperationInProgress，残留锁永久挡住该 app 的
+        一切操作（09-21 app 141/154 事故形态，需人工 SQL + kubectl 解救）。"""
+        lease_name = 'rcoder-operation-prod-' + self.app
+        remote_path = '/tmp/rcoder-e2e-dead-lease.json'
+        stale = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 3600))
+        manifest = {
+            'apiVersion': 'coordination.k8s.io/v1', 'kind': 'Lease',
+            'metadata': {'name': lease_name, 'namespace': self.args.namespace},
+            'spec': {
+                'holderIdentity': 'dead-holder:dead-operation',
+                'leaseDurationSeconds': 60,
+                'acquireTime': stale, 'renewTime': stale,
+            },
+        }
+        subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                        self.args.ssh, 'cat > ' + remote_path],
+                       input=json.dumps(manifest), text=True, check=True, timeout=30)
+        self.kube('apply', '-f', remote_path)
+        placed = json.loads(self.kube('get', 'lease', lease_name, '-o', 'json'))
+        placed_holder = (placed.get('spec') or {}).get('holderIdentity')
+        restart_request = 'lease-takeover-' + uuid.uuid4().hex[:16]
+        started = time.monotonic()
+        status, envelope = self.request('/api/v1/userapp/' + self.app + '/restart',
+                                        {'user_id': self.user, 'request_id': restart_request},
+                                        timeout=300)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        occupied = 'occupied' in envelope.get('message', '') or envelope.get('code') == 'ERR_CONFLICT'
+        self.check('lease_dead_holder_takeover',
+                   placed_holder == 'dead-holder:dead-operation'
+                   and status == 200 and envelope.get('code') == '0000'
+                   and not occupied and bool(envelope.get('operation_id')),
+                   {'placed_holder': placed_holder, 'status': status,
+                    'envelope': envelope, 'elapsed_ms': elapsed_ms})
+        # 接管后的正常收尾：操作成功即显式释放（uid + 实时 RV precondition），
+        # Lease 对象消失——证明接管走完了与正常 acquire 完全相同的生命周期。
+        # poll 超时抛 TimeoutError：收敛为失败断言（带残留证据），不崩套件。
+        try:
+            self.poll(lambda: self.lease_rows(lease_name), lambda rows: not rows, 60)
+            released = True
+            residue = []
+        except TimeoutError as error:
+            released = False
+            residue = self.lease_rows(lease_name)
+            print('lease residue after operation: ' + str(residue)[:400], flush=True)
+        self.check('lease_released_after_operation', released,
+                   {'lease': lease_name, 'still_present': residue,
+                    'poll_error': None if released else str(error)[:400]})
+        self.kube('delete', '-f', remote_path, '--ignore-not-found')
+
+    def lease_rows(self, name):
+        try:
+            data = json.loads(self.kube('get', 'lease', name, '-o', 'json'))
+        except subprocess.CalledProcessError:
+            return []
+        return [data] if data.get('metadata', {}).get('name') == name else []
+
     def delete_version_guard(self):
         """delete 乐观锁：跨 stop/wake 换代后的过期 resource_version 必须被拒，
         计算资源与数据卷不受影响。"""
@@ -552,6 +615,7 @@ strip_prefix = false
         # 锁快失败/等待语义真实场景（持有者 = 热部署在途）
         self.lock_fail_fast(artifact_b)
         self.lock_start_waits(artifact_b)
+        self.lease_dead_holder_takeover()
         stop_request_id = 'stop-' + uuid.uuid4().hex
         for _ in range(2):
             status, envelope = self.request('/api/v1/userapp/' + self.app + '/stop?' + urllib.parse.urlencode({'user_id': self.user, 'request_id': stop_request_id}), {})

@@ -1,19 +1,31 @@
 //! Private database execution owner. Neither Db nor a connection escapes this runtime.
 //!
 //! A queued job is a complete business transaction, not an individual SQL statement.
-//! Cancelling its caller drops only the reply receiver. Closing rejects admission,
-//! drains every accepted job, drops the database and its runtime, then joins the
-//! owning thread before publishing a shared shutdown result.
+//! Cancelling its caller drops only the reply receiver. User shutdown rejects
+//! admission, drains every accepted job, drops the database and its runtime, then
+//! joins the owning thread before publishing a shared shutdown result.
+//!
+//! A panicking task (for example toasty 0.10.0's connection-channel
+//! `unwrap` on a transient backend blip) reports `OutcomeUnknown` to its own
+//! caller and freezes admission, but is not terminal for the owner: after the
+//! in-flight set drains, the owner probes the pool for a fresh connection
+//! (`Db::connection` — the pool evicts dead workers on recycle) and resumes
+//! admission when the probe succeeds. Only user shutdown (or a probe that
+//! never succeeds until then) ends the owner.
 use futures::FutureExt as _;
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::Arc,
+    time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
 type Job =
     Box<dyn FnOnce(toasty::Db) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send>;
 type Completion = Option<Result<(), String>>;
+
+/// Backoff between failed reopen probes while the database stays unreachable.
+const REOPEN_PROBE_BACKOFF: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) struct DatabaseOwner {
@@ -29,7 +41,7 @@ struct Shared {
 #[derive(Debug)]
 pub(crate) struct OutcomeUnknown;
 impl std::fmt::Display for OutcomeUnknown {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("database execution outcome is unknown; query the original operation identity")
     }
 }
@@ -62,7 +74,7 @@ impl DatabaseOwner {
     ) -> anyhow::Result<Self>
     where
         I: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = anyhow::Result<toasty::Db>> + 'static,
+        Fut: Future<Output = anyhow::Result<toasty::Db>> + Send + 'static,
         Resource: Send + 'static,
     {
         anyhow::ensure!(
@@ -73,6 +85,12 @@ impl DatabaseOwner {
         let (stop, closing) = watch::channel(false);
         let (finished, completion) = watch::channel(None);
         let (ready, initialized) = oneshot::channel();
+        let shared = Arc::new(Shared {
+            queue: queue.clone(),
+            stop: stop.clone(),
+            completion: completion.clone(),
+        });
+        let worker_shared = shared.clone();
         let worker = std::thread::Builder::new()
             .name("rcoder-db-owner".into())
             .spawn(move || {
@@ -96,7 +114,7 @@ impl DatabaseOwner {
                             drop(db);
                             return Ok(());
                         }
-                        run(db, receiver, closing, max_inflight).await
+                        supervise(db, receiver, closing, worker_shared, max_inflight).await
                     });
                     drop(runtime);
                     result
@@ -104,8 +122,8 @@ impl DatabaseOwner {
                 drop(resource);
                 result
             })?;
-        // The observer does not depend on a request's or host's Tokio runtime.
-        // Completion means join returned, not merely that a Drop callback ran.
+        // The observer does not depend on a request's runtime.
+        // Completion means join returned, not merely a Drop callback ran.
         std::thread::Builder::new()
             .name("rcoder-db-join".into())
             .spawn(move || {
@@ -132,14 +150,7 @@ impl DatabaseOwner {
             drop(wait_for_completion(completion).await);
             return Err(error);
         }
-        Ok(Self {
-            inner: Arc::new(Shared {
-                queue,
-                closing: Mutex::new(false),
-                stop,
-                completion,
-            }),
-        })
+        Ok(Self { inner: shared })
     }
 
     pub(crate) async fn execute<T, F, Fut>(&self, transaction: F) -> anyhow::Result<T>
@@ -157,13 +168,15 @@ impl DatabaseOwner {
                     .await;
                 let panicked = outcome.is_err();
                 if panicked && let Some(shared) = admission.upgrade() {
-                    // Publish closed admission before waking the failed caller;
-                    // otherwise it could enqueue another mutation in the gap
-                    // before the owner observes this task's completion.
+                    // Freeze admission before waking the failed caller so it
+                    // cannot enqueue another mutation in the gap before the
+                    // owner observes this task's completion. Freezing is not
+                    // terminal: the owner drains, probes the pool, and
+                    // reopens if a fresh connection is available. User
+                    // shutdown remains the only permanent stop.
                     if let Ok(mut closing) = shared.closing.lock() {
                         *closing = true;
                     }
-                    shared.stop.send_replace(true);
                 }
                 drop(reply.send(outcome.unwrap_or_else(|_| Err(OutcomeUnknown.into()))));
                 anyhow::ensure!(
@@ -179,7 +192,7 @@ impl DatabaseOwner {
                 .closing
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database admission lock poisoned"))?;
-            anyhow::ensure!(!*closing, "database is closing; job was not admitted");
+            anyhow::ensure!(matches!(*closing, false), "database is closing; job was not admitted");
             self.inner
                 .queue
                 .try_send(job)
@@ -223,44 +236,105 @@ async fn wait_for_completion(mut completion: watch::Receiver<Completion>) -> any
     }
 }
 
-async fn run(
+/// Serve until user shutdown. A task failure (by construction, a panic: jobs
+/// return `Err` only from the panic guard) freezes intake, drains the
+/// in-flight set, then probes the pool for a healthy connection. A
+/// successful probe reopens admission on the same channel; the caller of the
+/// panicked job has already received `OutcomeUnknown` and must verify it
+/// independently — reopening never fabricates that outcome.
+async fn supervise(
     db: toasty::Db,
     mut queue: mpsc::Receiver<Job>,
-    mut closing: watch::Receiver<bool>,
+    mut stop: watch::Receiver<bool>,
+    shared: Arc<Shared>,
     max_inflight: usize,
 ) -> anyhow::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
-    let mut close_seen = false;
+    let mut stop_seen = false;
     let mut queue_drained = false;
-    let mut task_failed = false;
-    while !queue_drained || !tasks.is_empty() {
+    let mut intake_paused = false;
+    // Set when a task failed and the failure was later recovered from; only an
+    // unrecovered failure at exit makes the owner report an error.
+    let mut pending_failure: Option<String> = None;
+    loop {
+        if stop_seen && tasks.is_empty() && queue_drained {
+            break;
+        }
         tokio::select! {
             biased;
-            _ = closing.changed(), if !close_seen => {
-                close_seen = true;
+            _ = stop.changed(), if !stop_seen => {
+                stop_seen = true;
                 queue.close();
             }
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                if !matches!(result, Ok(Ok(()))) {
-                    task_failed = true;
-                    // Drain already accepted jobs, but stop admitting new work
-                    // after a task panic. Shutdown must retain the failure.
-                    close_seen = true;
-                    queue.close();
+                if let Err(error) = result.unwrap_or_else(|error| Err(anyhow::anyhow!(
+                    "database task join failed: {error}"
+                ))) {
+                    // Freeze intake (do NOT close the channel: recovery may
+                    // resume serving the already-admitted backlog).
+                    intake_paused = true;
+                    pending_failure = Some(format!("{error:#}"));
                 }
             }
-            job = queue.recv(), if !queue_drained && tasks.len() < max_inflight => {
+            job = queue.recv(), if !queue_drained && !intake_paused && tasks.len() < max_inflight => {
                 match job {
                     Some(job) => { tasks.spawn(job(db.clone())); }
                     None => { queue_drained = true; }
                 }
             }
         }
+        // Drain complete after a failure: probe the pool for recovery.
+        if intake_paused && tasks.is_empty() {
+            match reopen_probe(&db, &mut stop).await {
+                Reopen::Reopened => {
+                    if let Ok(mut closing) = shared.closing.lock() {
+                        *closing = false;
+                    }
+                    intake_paused = false;
+                    pending_failure = None;
+                }
+                Reopen::UserStopped => {
+                    // Leave intake paused; the outer loop now only drains stop.
+                    intake_paused = true;
+                }
+            }
+        }
     }
     drop(db);
-    anyhow::ensure!(
-        !task_failed,
-        "a database execution task failed during drain"
-    );
+    if let Some(failure) = pending_failure {
+        anyhow::bail!("database execution failed and did not recover: {failure}");
+    }
     Ok(())
+}
+
+enum Reopen {
+    Reopened,
+    UserStopped,
+}
+
+/// Probe with backoff until the pool yields a fresh connection or the user
+/// stops the owner. `Db::connection` acquires from the pool — the same
+/// recycle path production uses after a blip — so success means the
+/// transport (and a live worker) is back.
+async fn reopen_probe(db: &toasty::Db, stop: &mut watch::Receiver<bool>) -> Reopen {
+    loop {
+        if *stop.borrow() {
+            return Reopen::UserStopped;
+        }
+        match db.connection().await {
+            Ok(_connection) => return Reopen::Reopened,
+            Err(error) => {
+                tracing::warn!(%error, "database reopen probe failed; retrying");
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => {
+                if *stop.borrow() {
+                    return Reopen::UserStopped;
+                }
+            }
+            _ = tokio::time::sleep(REOPEN_PROBE_BACKOFF) => {}
+        }
+    }
 }
