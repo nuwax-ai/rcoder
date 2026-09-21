@@ -136,17 +136,13 @@ impl AppService {
             // that zero-pod window is expected, not a failure — retry until
             // the new-generation pod is running or the operation budget ends.
             // Identity conflicts still fail immediately.
-            let mut captured = None;
-            loop {
+            let target = loop {
                 match self
                     .runtime
                     .capture_app_configuration_target(&context, generation)
                     .await
                 {
-                    Ok(target) => {
-                        captured = Some(target);
-                        break;
-                    }
+                    Ok(target) => break target,
                     Err(
                         error @ container_runtime_api::ContainerRuntimeError::ManagementNotRunning,
                     ) if tokio::time::Instant::now() < deadline => {
@@ -160,12 +156,6 @@ impl AppService {
                         ));
                     }
                 }
-            }
-            let Some(target) = captured else {
-                return Err(AppOperationError::CredentialApplication {
-                    message: "Management container did not run within the operation budget".into(),
-                    mutation: CredentialMutationEvidence::NotAttempted,
-                });
             };
             let admin = self
                 .wait_for_configuration_postgres(&context, &target, deadline)

@@ -399,6 +399,17 @@ pub(crate) async fn adopt_builder(
     Ok(shared_types::HttpResult::success(data).with_operation_id(operation_id))
 }
 
+/// Recover the original annotated lifecycle before an ensure can allocate a new
+/// identity. Discovery contains no runtime writes; ordinary capture remains the
+/// authority for every subsequent resource operation.
+pub(crate) async fn discover_missing_identity(
+    state: &AppState,
+    app_id: &str,
+) -> Result<Option<shared_types::UserAppLifecycleRecord>> {
+    Ok(state.app_service.discover_missing_identity(app_id).await?)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,12 +433,3 @@ mod tests {
     }
 }
 
-/// Recover the original annotated lifecycle before an ensure can allocate a new
-/// identity. Discovery contains no runtime writes; ordinary capture remains the
-/// authority for every subsequent resource operation.
-pub(crate) async fn discover_missing_identity(
-    state: &AppState,
-    app_id: &str,
-) -> Result<Option<shared_types::UserAppLifecycleRecord>> {
-    Ok(state.app_service.discover_missing_identity(app_id).await?)
-}
