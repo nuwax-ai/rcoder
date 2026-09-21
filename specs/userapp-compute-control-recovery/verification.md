@@ -980,3 +980,21 @@ Docker 遗留清理明细：rcoder-crash-bee781723f7c44ab 项目 down -v；22 �
 - docker_runtime_sigterm：**pass**（需 E2E_TURSO_RUNTIME_IMAGE + SHA256 两 env，run 67a4de57）。
 - Compose 终态：45 场景中 44 逻辑通过（pg_reset 清单已同步待复跑确认）；deploy_full_chain 剩 3 断言 = Qoder 遗留"编排中 Stop 后恢复"app-cli 编排循环（取证见 2026-09-21 深夜批：ABNORMAL_TERMINATION: app-pingap 12s 循环，StartupFailed 修复已让恢复编排启动 pingap 成功，但多实例互踩未闭环），独立于本会话全部修复，已列为下一批最高优先。
 - 新 dev-master-rcoder:latest 二进制 SHA256：e0322e67491d19a9c2bdf99bdada5e7bf49b6df8e22fdeec8ba712f79aa41353。
+
+### 2026-09-21 午后：remote-k8s smoke 全绿 + userapp 套件环境阻断（含新发现 toasty panic 根因）
+
+**verify smoke：PASS**（run b20accf0：build fcffb5de、源码匹配 HEAD 6885fabd、双副本就绪、sources_match=true、live_source_changed=false）。
+
+**userapp 套件：4 次尝试均 fail，环境阻断归因（非本轮代码回归）**：
+
+1. 前三次：builder pod 起来但 readiness 8086 connection reset → 60000 file-server 不可达 → 首场景 build 失败。手动同 API 创建的 builder 完全健康（8086/60000 均 200）——差异为负载时序（131 负载均值 23+）。
+2. 第四次：新错误 "database is closing; job was not admitted"。深挖根因（现 pod 日志实证）：
+   - 12:39:08 toasty WARN "query failed: connection lost"（userapp_compute_controls 查询，PG 连接抖动）
+   - 同刻 **panic: unwrap() on Err(SendError) at toasty-0.10.0/src/db/connection.rs:78**（toasty 内部连接任务对 send 的 unwrap）
+   - panic 落在 userapp 存储执行任务 → db/owner.rs run() 判 task_failed → 队列永久关闭（设计语义"结果未知不受理"）
+   - 之后 16+ 分钟所有 userapp 存储 API 持续 "database is closing" 直到 pod 删除重启
+3. 结论：**一次 PG 连接抖动 = userapp 存储瘫痪到进程重启**。这是独立于本轮全部修复的依赖层缺陷，触发条件=共享测试机高负载下的连接抖动。
+4. **下一批高优先项**：(a) toasty 升级/补丁消除 connection.rs:78 unwrap panic；(b) owner 层对"连接丢失形态 panic"的受限重开设计（不破坏 outcome-unknown 语义——重开仅限确认无在途写后重建连接，已有租约/回执状态不变）。在修好前，userapp 套件在 131 的结果不可信。
+5. 顺带记录：131 soddy 节点 CephFS CSI staging handle 损坏（permission denied→file does not exist），已做 umount -l + handle 清理 + CSI nodeplugin 重启 + VolumeAttachment 重建，rcoder surge pod 仍偶发 Init 卡住（节点级残留问题，rcoder 双副本不受影响）。
+
+已恢复：closed-storage pod 已删除重建；debug 资源已清理。
