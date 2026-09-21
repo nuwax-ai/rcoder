@@ -511,3 +511,106 @@ async fn shutdown_failure_is_not_success_on_first_or_repeated_call() {
         "repeated shutdown must preserve failure"
     );
 }
+
+/// 契约三行3/§1.2 换代门（workload 身份语义）：同名 workload 下物理 UID
+/// 变化=换代事务（新 generation+predecessor）；同名 workload 被替换（UID
+/// 变化）= 拒绝自动重绑。容器名恒定（同一 workload 的注册键）。
+#[tokio::test]
+async fn workload_generation_gate_allows_rebind_only_for_same_workload() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let pool = crate::pg::test_support::database(&dsn).await;
+    let project_id = format!("wrep-{}", uuid_suffix());
+    let (store, _rx) = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect");
+
+    let container_with = |physical_uid: &str, workload_uid: &str| ContainerBasicInfo {
+        container_id: physical_uid.into(),
+        // 同一 workload 的注册键恒定（契约一：workload 名）
+        container_name: "rcoder-web-wrep".into(),
+        container_ip: "10.42.0.9".into(),
+        internal_port: 50051,
+        external_port: 0,
+        project_id: project_id.clone(),
+        status: "running".into(),
+        created_at: chrono::Utc::now(),
+        service_url: "http://rcoder-web-wrep".into(),
+        workload_uid: Some(workload_uid.into()),
+    };
+
+    // 首次注册：pod-a 属 sts-uid-1。
+    store
+        .insert_with_session(
+            project_id.clone(),
+            info_for(&project_id, Some(container_with("pod-a", "sts-uid-1"))),
+            Some(&format!("sess-a-{project_id}")),
+        )
+        .expect("first registration");
+    assert!(
+        store.wait_drained(Duration::from_secs(5)).await,
+        "first registration drain"
+    );
+    let first = store.get(&project_id).expect("registered");
+    let first_generation = first
+        .persistence_identity()
+        .container
+        .as_ref()
+        .expect("container identity")
+        .generation
+        .clone();
+
+    // 同 workload（sts-uid-1）重建新 pod（pod-b）：换代事务放行——
+    // 新 generation 落盘，注册绑定到新物理 UID。
+    store
+        .insert_with_session(
+            project_id.clone(),
+            info_for(&project_id, Some(container_with("pod-b", "sts-uid-1"))),
+            Some(&format!("sess-b-{project_id}")),
+        )
+        .expect("same-workload pod replacement rebinds");
+    assert!(
+        store.wait_drained(Duration::from_secs(5)).await,
+        "rebind drain"
+    );
+    let rebound = store.get(&project_id).expect("rebound");
+    let rebound_identity = rebound
+        .persistence_identity()
+        .container
+        .as_ref()
+        .expect("rebound container identity");
+    assert_eq!(
+        rebound.container_info().expect("info").container_id,
+        "pod-b"
+    );
+    assert_eq!(
+        rebound_identity.physical_uid.as_deref(),
+        Some("pod-b"),
+        "identity carries the new physical UID"
+    );
+    assert_ne!(
+        rebound_identity.generation, first_generation,
+        "pod replacement must go through a new container generation, not an in-place revision"
+    );
+    assert_eq!(
+        rebound_identity.predecessor.as_deref(),
+        Some(first_generation.as_str()),
+        "predecessor generation is captured atomically"
+    );
+
+    // 同名 workload 被替换（sts-uid-2）：拒绝自动重绑——行3 语义。
+    let rejected = store.insert_with_session(
+        project_id.clone(),
+        info_for(&project_id, Some(container_with("pod-x", "sts-uid-2"))),
+        Some(&format!("sess-c-{project_id}")),
+    );
+    assert!(
+        rejected.is_err(),
+        "a replaced workload (same name, different UID) must never be auto-rebound"
+    );
+
+    let _ = store.writer().flush_and_stop(Duration::from_secs(5)).await;
+    let _ = pool;
+}
