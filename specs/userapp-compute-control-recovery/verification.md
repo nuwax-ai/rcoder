@@ -961,3 +961,14 @@ R1 Docker 归档路径在真实链上暴露四层竞态，逐轮修复逐轮验�
 第 7 轮结果：四个并发断言全部通过，唯一失败为 backend-python 构建 600s 超时（7 服务全量构建 + 本机连续 7 轮负载，环境性能前置，非逻辑回归——此前 6 轮同一构建通过）。
 
 **"current 数组双 scope 同现"失败归因**：观察窗口 20s 内未同帧捕获两 scope 活动操作——受理隔离修复后 dev/prod 操作收束都快于轮询间隔，时序型断言；第 7 轮该断言已通过（构建超时前）。
+
+### 2026-09-21：终轮全量 e2e（run e278f1c3）：39/45 通过，6 失败逐项归因
+
+| 失败 | 归因 | 处置 |
+|---|---|---|
+| userapp_dev_pg_reset_password | 场景断言全过（jsonl verdict=pass），严格验收门禁因清单引用旧断言名"受管理运行账号拒绝直接改密"报缺步 | 清单已同步新断言名（已提交） |
+| userapp_deploy_full_chain / scope_isolation | backend-python 构建 600s 超时——PyPI 下载 3.4MB 用 2:34（22.6kB/s），网络带宽前置；并发/隔离断言全部通过 | 环境前置，非逻辑回归 |
+| turso_compose_recreation | 两层：①Docker 预定义地址池耗尽（27 个遗留测试网络）→ compose 建网失败；清理后暴露 ②"Offline observer requires all component migrations"——契约用的 dev-master-rcoder:latest 镜像 14h 旧（predates 最新 schema 迁移），HEAD 观察器拒绝半迁移库 | 正在重建 dev-master-rcoder 镜像后复跑 |
+| docker_runtime_crash / sigterm | 同①地址池耗尽（CalledProcessError=compose up 建网失败）；遗留 rcoder-crash-bee781723f7c44ab 项目（2 天前）与 22 个 sqlite/turso 测试网络已清理 | 地址池已释放（网络 31→9），复跑待镜像 |
+
+Docker 遗留清理明细：rcoder-crash-bee781723f7c44ab 项目 down -v；22 个 rcoder-sqlite/turso-* 遗留网络删除。
