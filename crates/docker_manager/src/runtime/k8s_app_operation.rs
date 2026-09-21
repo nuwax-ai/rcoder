@@ -80,17 +80,31 @@ fn lease_expired_at(now: k8s_openapi::jiff::Timestamp, object: &Lease) -> bool {
 }
 
 /// Renewal body: only the observed resourceVersion (CAS anchor) and a fresh
-/// renewTime are written.
-fn renewal_patch(resource_version: &str) -> serde_json::Value {
-    serde_json::json!({
-        "metadata": {"resourceVersion": resource_version},
-        "spec": {"renewTime": lease_now().0.to_string()},
+/// renewTime are written. Built as a partial typed `Lease` so the timestamp
+/// goes through `MicroTime`'s serializer, which is fixed to microsecond
+/// precision (`%.6f`) — hand-stringified jiff stamps carry nanoseconds and the
+/// apiserver rejects them (2026-09-22 app-154 lockup).
+fn renewal_patch(resource_version: &str) -> ContainerRuntimeResult<serde_json::Value> {
+    let patch = Lease {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            resource_version: Some(resource_version.to_owned()),
+            ..Default::default()
+        },
+        spec: Some(LeaseSpec {
+            renew_time: Some(lease_now()),
+            ..Default::default()
+        }),
+    };
+    serde_json::to_value(patch).map_err(|error| {
+        ContainerRuntimeError::K8sError(format!("serialize lease renewal patch: {error}"))
     })
 }
 
 /// Takeover body for an expired lease: rewrites holder identity, annotations
 /// and labels to the taker's, bumps transitions, and is anchored on the
-/// observed resourceVersion so exactly one competing taker can win.
+/// observed resourceVersion so exactly one competing taker can win. Typed
+/// serialization for the same timestamp-precision reason as [`renewal_patch`];
+/// serde skips `None` fields so the merge patch stays minimal.
 fn takeover_patch(
     desired: &Lease,
     resource_version: &str,
@@ -104,20 +118,25 @@ fn takeover_patch(
         .ok_or_else(|| {
             ContainerRuntimeError::ConfigurationError("Lease holder identity is missing".into())
         })?;
-    Ok(serde_json::json!({
-        "metadata": {
-            "resourceVersion": resource_version,
-            "labels": desired.metadata.labels,
-            "annotations": desired.metadata.annotations,
+    let patch = Lease {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            resource_version: Some(resource_version.to_owned()),
+            labels: desired.metadata.labels.clone(),
+            annotations: desired.metadata.annotations.clone(),
+            ..Default::default()
         },
-        "spec": {
-            "holderIdentity": holder_identity,
-            "leaseDurationSeconds": LEASE_TTL_SECONDS,
-            "acquireTime": lease_now().0.to_string(),
-            "renewTime": lease_now().0.to_string(),
-            "leaseTransitions": transitions.saturating_add(1),
-        },
-    }))
+        spec: Some(LeaseSpec {
+            holder_identity: Some(holder_identity),
+            lease_duration_seconds: Some(LEASE_TTL_SECONDS),
+            acquire_time: Some(lease_now()),
+            renew_time: Some(lease_now()),
+            lease_transitions: Some(transitions.saturating_add(1)),
+            ..Default::default()
+        }),
+    };
+    serde_json::to_value(patch).map_err(|error| {
+        ContainerRuntimeError::K8sError(format!("serialize lease takeover patch: {error}"))
+    })
 }
 
 enum RenewOutcome {
@@ -151,14 +170,13 @@ async fn renew_once(api: &Api<Lease>, name: &str, uid: &str, token: &str) -> Ren
     else {
         return RenewOutcome::Lost(format!("operation lease {name} has no resourceVersion"));
     };
-    match api
-        .patch(
-            name,
-            &PatchParams::default(),
-            &Patch::Merge(renewal_patch(&version)),
-        )
-        .await
-    {
+    let patch = match renewal_patch(&version) {
+        Ok(patch) => Patch::Merge(patch),
+        Err(error) => {
+            return RenewOutcome::Transient(format!("build renewal patch {name}: {error}"));
+        }
+    };
+    match api.patch(name, &PatchParams::default(), &patch).await {
         Ok(_) => RenewOutcome::Renewed,
         Err(kube::Error::Api(status)) if status.code == 409 => RenewOutcome::Lost(format!(
             "operation lease {name} renewal lost a concurrent update"
@@ -935,7 +953,7 @@ mod tests {
     /// 续租体只带 CAS 锚（观察到的 resourceVersion）与新鲜 renewTime。
     #[test]
     fn renewal_patch_carries_cas_anchor_and_fresh_renew() {
-        let body = renewal_patch("42");
+        let body = renewal_patch("42").expect("patch");
         assert_eq!(body["metadata"]["resourceVersion"], "42");
         assert!(
             body["spec"]["renewTime"]
@@ -953,6 +971,46 @@ mod tests {
         assert_eq!(body["spec"]["holderIdentity"], "executor-one:operation-one");
         assert_eq!(body["spec"]["leaseTransitions"], 4);
         assert_eq!(body["spec"]["leaseDurationSeconds"], LEASE_TTL_SECONDS);
+    }
+
+    /// 事故回归闸（2026-09-22 app-154 死锁）：patch 体时间戳必须恰好 6 位
+    /// 微秒小数。手拼 `Timestamp::to_string()` 是纳秒（9 位），apiserver 的
+    /// MicroTime 解析直接拒收（"cannot parse 488Z as Z07:00"）→ 续租/接管
+    /// 永不成功 → 操作围栏死锁。类型化序列化（MicroTime serde 写死 %.6f）
+    /// 是正确性的来源；本测试把该不变量锁死，防止退化回手拼。
+    #[test]
+    fn patch_timestamps_are_microsecond_precision() {
+        /// RFC3339 时间戳小数位须恰好 6 位（`…T12:34:56.123456Z`）。
+        fn assert_micros(field: &str, stamp: &str) {
+            let fraction = stamp
+                .rsplit_once('.')
+                .map(|(_, tail)| tail.strip_suffix('Z').unwrap_or(tail))
+                .unwrap_or_default();
+            assert_eq!(
+                fraction.chars().count(),
+                6,
+                "{field} must be exactly microsecond precision, got: {stamp}"
+            );
+            assert!(
+                fraction.chars().all(|c| c.is_ascii_digit()),
+                "{field} fraction must be digits, got: {stamp}"
+            );
+        }
+
+        let renewal = renewal_patch("9").expect("renewal patch");
+        assert_micros(
+            "renewTime",
+            renewal["spec"]["renewTime"].as_str().expect("renewTime"),
+        );
+
+        let desired = sample_lease(Some(0));
+        let takeover = takeover_patch(&desired, "7", 0).expect("takeover patch");
+        for field in ["acquireTime", "renewTime"] {
+            let stamp = takeover["spec"][field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} missing in takeover patch: {takeover}"));
+            assert_micros(field, stamp);
+        }
     }
 }
 

@@ -747,7 +747,9 @@ impl KubernetesRuntime {
         let identity = self.capture_app_mutation_identity(app_id).await?;
         self.claim_app_storage(app_id).await?;
         let name = &identity.name;
-        let now = chrono::Utc::now().to_rfc3339();
+        // kubectl 风格固定秒精度:注解值仅要求"变化即触发",但可变小数位
+        // 是纳秒时间戳事故的同款模式(手拼时间戳一律定精度)。
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let patch = serde_json::json!({
             "spec": { "template": { "metadata": { "annotations": {
                 "kubectl.kubernetes.io/restartedAt": now
