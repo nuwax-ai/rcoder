@@ -190,11 +190,13 @@ async fn legacy_pod_stop(
         container_info.container_id, container_deleted, deleted_projects
     );
 
-    // 5. 关闭旧容器的 SSE 共享流 + 清理 gRPC 连接
+    // 5. 关闭旧容器的 SSE 共享流 + 清理 gRPC 连接（契约二代次守卫：携带被
+    //    销毁实例的物理 UID，注册表已绑定新实例时作废本动作）
     state
-        .teardown_container_connections(
+        .teardown_container_connections_guarded(
             &container_info.container_name,
             &container_info.container_ip,
+            Some(&container_info.container_id),
         )
         .await;
 

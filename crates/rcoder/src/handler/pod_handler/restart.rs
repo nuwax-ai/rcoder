@@ -444,11 +444,13 @@ async fn destroy_for_recreate(
     }
 
     // 物理销毁后，关闭旧容器的 SSE 共享流 + 清理 gRPC 连接（post-destroy；
-    // delete_container_with_projects 之后的既有顺序）
+    // delete_container_with_projects 之后的既有顺序）。契约二代次守卫：
+    // 携带被销毁实例的物理 UID——重建若已完成并注册，本动作作废。
     state
-        .teardown_container_connections(
+        .teardown_container_connections_guarded(
             &container_info.container_name,
             &container_info.container_ip,
+            Some(&container_info.container_id),
         )
         .await;
 

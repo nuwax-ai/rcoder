@@ -356,6 +356,33 @@ impl AppState {
     /// （K8s Service FQDN / Docker 容器 IP，与连接建立同源）。K8s 恒清；
     /// Docker 仅在有 IP 时清。
     pub async fn teardown_container_connections(&self, container_name: &str, container_ip: &str) {
+        self.teardown_container_connections_guarded(container_name, container_ip, None)
+            .await;
+    }
+
+    /// 契约二（地址代次失效）：失效动作携带发起时观察到的旧实例物理身份
+    /// （Pod/容器 UID）。执行前与注册表当前绑定比对——同一 workload 已绑定
+    /// **新实例**说明换代已发生，本动作是延迟任务，作废（新实例的流不能杀；
+    /// FQDN 跨实例不变，按 addr 盲清实证危险）。`None` 保持无守卫语义（仅限
+    /// 尚未升级的调用方；重建/stop/restart 必须传身份）。
+    pub async fn teardown_container_connections_guarded(
+        &self,
+        container_name: &str,
+        container_ip: &str,
+        retired_physical_uid: Option<&str>,
+    ) {
+        if !teardown_guard_allows(
+            retired_physical_uid,
+            self.registered_container_id_by_workload(container_name)
+                .as_deref(),
+        ) {
+            tracing::warn!(
+                container_name,
+                retired_physical_uid = retired_physical_uid.unwrap_or(""),
+                "skip connection teardown: workload already rebound to a new instance"
+            );
+            return;
+        }
         if shared_types::is_kubernetes_runtime() || !container_ip.is_empty() {
             let addr = shared_types::build_grpc_addr(
                 container_name,
@@ -366,6 +393,20 @@ impl AppState {
             self.shutdown_sse_streams_by_addr(&addr);
             self.grpc_pool.remove(&addr).await;
         }
+    }
+
+    /// 按 workload 名（container_name，契约一语义）反查注册表当前绑定的
+    /// 物理 UID。注册表可能已无该 workload（正常销毁路径）——返回 None
+    /// 不构成守卫阻断。
+    fn registered_container_id_by_workload(&self, workload_name: &str) -> Option<String> {
+        self.projects
+            .iter()
+            .into_iter()
+            .find_map(|(_project_id, info)| {
+                let container = info.container_info()?;
+                (container.container_name == workload_name).then(|| container.container_id.clone())
+            })
+            .filter(|uid| !uid.is_empty())
     }
 
     /// 按 grpc_addr 关闭关联的所有 SSE 共享流。
@@ -512,5 +553,39 @@ impl AppState {
     #[inline]
     pub fn update_session_activity(&self, session_id: &str) {
         self.projects.update_session_activity(session_id);
+    }
+}
+
+/// 契约二（地址代次失效）守卫判定：失效动作只在"发起时观察到的旧实例
+/// 身份与注册表当前绑定一致，或注册表已无该 workload 绑定"时放行。
+/// 注册表已绑定**新实例** = 换代已发生，本动作是延迟任务 → 阻断
+///（FQDN 跨实例不变，按 addr 盲清会杀新实例的流）。
+fn teardown_guard_allows(retired: Option<&str>, current: Option<&str>) -> bool {
+    match (retired, current) {
+        // 调用方未升级（无退休身份）：保持既有语义，放行。
+        (None, _) => true,
+        // 注册表已无绑定（正常销毁路径，记录先于 teardown 被清）：放行。
+        (Some(_), None) => true,
+        // 身份一致：这正是被销毁的实例，失效有效。
+        (Some(retired), Some(current)) => retired == current,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::teardown_guard_allows;
+
+    /// 契约二反例矩阵：延迟失效任务不得清新实例的流。
+    #[test]
+    fn teardown_guard_blocks_only_when_workload_rebound() {
+        // 注册表已绑定新实例（换代发生）：延迟 teardown 必须被阻断。
+        assert!(!teardown_guard_allows(Some("pod-old"), Some("pod-new")));
+        // 身份一致：失效有效。
+        assert!(teardown_guard_allows(Some("pod-old"), Some("pod-old")));
+        // 注册表已无绑定（记录已清）：放行——销毁路径常态。
+        assert!(teardown_guard_allows(Some("pod-old"), None));
+        // 调用方未升级：保持既有语义。
+        assert!(teardown_guard_allows(None, Some("pod-new")));
+        assert!(teardown_guard_allows(None, None));
     }
 }

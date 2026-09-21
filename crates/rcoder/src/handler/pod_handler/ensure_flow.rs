@@ -170,9 +170,15 @@ pub(super) async fn resolve_need_create(
             );
 
             // 物理销毁成功后，关闭旧容器的 SSE 共享流 + 清理 gRPC 连接（post-destroy：
-            // stop 用 ? 返回，失败时此处不执行，避免误断可能仍存活的容器连接）
+            // stop 用 ? 返回，失败时此处不执行，避免误断可能仍存活的容器连接）。
+            // 契约二代次守卫：携带被销毁实例的物理 UID——若注册表已绑定新实例
+            //（同名重建完成），本动作作废，不杀新实例的流。
             state
-                .teardown_container_connections(&result.container_name, &result.container_ip)
+                .teardown_container_connections_guarded(
+                    &result.container_name,
+                    &result.container_ip,
+                    Some(&result.container_id),
+                )
                 .await;
 
             // ⏱️ 等待 Docker 完全释放容器资源（避免竞态条件）
