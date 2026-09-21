@@ -345,10 +345,27 @@ async fn reopen_probe(db: &toasty::Db, stop: &mut watch::Receiver<bool>) -> Reop
         if *stop.borrow() {
             return Reopen::UserStopped;
         }
-        match db.connection().await {
-            Ok(_connection) => return Reopen::Reopened,
-            Err(error) => {
-                tracing::warn!(%error, "database reopen probe failed; retrying");
+        // 真实语句探活，而非池 checkout：toasty 0.10.0 的 worker-gone 缺陷
+        // 里连接对象完好、只有内部 worker 已退出——checkout 恒"成功"，
+        // 假解冻后首个真实请求再次 panic，冻结-解冻循环瘫痪。BEGIN+COMMIT
+        // 走 Connection 提交路径，僵尸连接在此暴露。探活必须 spawn 隔离：
+        // 官方 0.10.0 的 unwrap panic 若直接 await 会沿栈杀死 supervise
+        // （owner 永久终局），JoinHandle 只暴露 JoinError。
+        let mut probe_db = db.clone();
+        let probe = tokio::spawn(async move {
+            let mut tx = probe_db.transaction().await?;
+            tx.commit().await
+        });
+        match probe.await {
+            Ok(Ok(())) => return Reopen::Reopened,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "database reopen probe statement failed; retrying");
+            }
+            Err(join_error) => {
+                tracing::warn!(
+                    %join_error,
+                    "database reopen probe panicked (zombie connection signature); retrying"
+                );
             }
         }
         tokio::select! {
