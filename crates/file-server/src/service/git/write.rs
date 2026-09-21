@@ -383,6 +383,36 @@ pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBu
     Ok(buckets)
 }
 
+/// [`init_repo`] / [`init_and_commit`] 的 async 安全包装：git2 全同步 IO
+/// （index 写、对象写、commit——在 Ceph RBD/CephFS 卷上含多次 fsync，高负载
+/// 下可达秒级）。此前在 async 上下文直接调用会阻塞 runtime worker：accept
+/// 停滞 → readiness/liveness 探针与业务转发的连接被 reset（131 userapp 套件
+/// build 转发 IncompleteMessage 的根因链；同因诱发 liveness 30s 窗口误杀）。
+/// 挪 blocking 池执行；git 失败语义不变（调用方 best-effort warn）。
+pub async fn init_repo_offloaded(
+    path: std::path::PathBuf,
+    author_name: String,
+    author_email: String,
+) -> AppResult<bool> {
+    tokio::task::spawn_blocking(move || init_repo(&path, &author_name, &author_email))
+        .await
+        .map_err(|e| map_git_err(e, "git init_repo join"))?
+}
+
+/// [`init_and_commit`] 的 async 安全包装（同 [`init_repo_offloaded`] 动因）。
+pub async fn init_and_commit_offloaded(
+    path: std::path::PathBuf,
+    message: String,
+    author_name: String,
+    author_email: String,
+) -> AppResult<()> {
+    tokio::task::spawn_blocking(move || {
+        init_and_commit(&path, &message, &author_name, &author_email)
+    })
+    .await
+    .map_err(|e| map_git_err(e, "git init_and_commit join"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

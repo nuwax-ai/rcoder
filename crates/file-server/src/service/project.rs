@@ -131,12 +131,13 @@ pub async fn create_project(
     }
     // GIT_ENABLED → git init + commit("init project: {id}") (对齐 nuwax createProject)
     if config.git_enabled
-        && let Err(e) = crate::service::git::init_and_commit(
-            &project_path,
-            &format!("init project: {project_id}"),
-            &config.git_default_author_name,
-            &config.git_default_author_email,
+        && let Err(e) = crate::service::git::write::init_and_commit_offloaded(
+            project_path.clone(),
+            format!("init project: {project_id}"),
+            config.git_default_author_name.clone(),
+            config.git_default_author_email.clone(),
         )
+        .await
     {
         tracing::warn!(error = %e, "git init/commit after create failed (skipping)");
     }
@@ -200,12 +201,13 @@ pub async fn copy_project(
     }
     // GIT_ENABLED → git init + commit("copy project: {src} -> {tgt}") (对齐 nuwax copyProject)
     if config.git_enabled
-        && let Err(e) = crate::service::git::init_and_commit(
-            &target_path,
-            &format!("copy project: {source_id} -> {target_id}"),
-            &config.git_default_author_name,
-            &config.git_default_author_email,
+        && let Err(e) = crate::service::git::write::init_and_commit_offloaded(
+            target_path.to_path_buf(),
+            format!("copy project: {source_id} -> {target_id}"),
+            config.git_default_author_name.clone(),
+            config.git_default_author_email.clone(),
         )
+        .await
     {
         tracing::warn!(error = %e, "git init/commit after copy failed (skipping)");
     }
@@ -350,12 +352,13 @@ pub async fn upload_project(
 
     // 4. GIT_ENABLED → init + commit
     if config.git_enabled
-        && let Err(e) = crate::service::git::init_and_commit(
-            &project_path,
-            &format!("upload project v{version}"),
-            &config.git_default_author_name,
-            &config.git_default_author_email,
+        && let Err(e) = crate::service::git::write::init_and_commit_offloaded(
+            project_path.clone(),
+            format!("upload project v{version}"),
+            config.git_default_author_name.clone(),
+            config.git_default_author_email.clone(),
         )
+        .await
     {
         tracing::warn!(error = %e, "git init/commit after upload failed (skipping)");
     }

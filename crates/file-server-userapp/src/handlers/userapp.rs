@@ -436,11 +436,12 @@ pub(crate) async fn confirm_project(
         // workspace 级 git init（幂等）：本地版本管理 + publish snapshot commit 的前提。
         // 放 handler 层（持有 config.git_enabled / author）；失败仅告警，不阻断 manifest 确认。
         if state.fs.config.git_enabled
-            && let Err(e) = file_server::service::git::write::init_repo(
-                &workspace,
-                &state.fs.config.git_default_author_name,
-                &state.fs.config.git_default_author_email,
+            && let Err(e) = file_server::service::git::write::init_repo_offloaded(
+                workspace.clone(),
+                state.fs.config.git_default_author_name.clone(),
+                state.fs.config.git_default_author_email.clone(),
             )
+            .await
         {
             tracing::warn!(%app_id, error = %e, "workspace git init failed (non-blocking)");
         }
