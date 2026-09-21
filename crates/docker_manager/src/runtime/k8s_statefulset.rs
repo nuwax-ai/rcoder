@@ -8,7 +8,9 @@
 //! 仅 ComputerAgentRunner / WebAgentRunner 走此路径；Userapp 仍用 Deployment（create_deployment）。
 
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
-use k8s_openapi::api::core::v1::{PodSpec, PodTemplateSpec, Service, ServicePort, ServiceSpec};
+use k8s_openapi::api::core::v1::{
+    EnvVar, PodSpec, PodTemplateSpec, Service, ServicePort, ServiceSpec,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
@@ -85,8 +87,73 @@ impl KubernetesRuntime {
                 ));
             }
         };
-        validate_builder_statefulset(&existing, &desired, context)?;
+        match validate_builder_statefulset(&existing, &desired, context)? {
+            BuilderTemplateCheck::Current => {}
+            BuilderTemplateCheck::StaleHash => {
+                // 内容等价但注解是旧算法值：纯 metadata patch 重写后复用。
+                let desired_hash = desired
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|values| values.get(TEMPLATE_HASH_ANNOTATION))
+                    .ok_or_else(|| {
+                        ContainerRuntimeError::ConfigurationError(
+                            "Desired builder template hash is missing".into(),
+                        )
+                    })?;
+                self.heal_builder_template_hash(&existing, desired_hash)
+                    .await?;
+            }
+        }
         self.scale_captured_statefulset(&existing, &family, 1).await
+    }
+
+    /// template-hash 注解自愈（纯 metadata，不触碰模板）：validate 已证明
+    /// launch 内容（镜像/command/args/归一化 env/容器集合/workspace claim）
+    /// 与期望等价，仅注解为哈希算法演进前的存量值——跨算法不可比，比对
+    /// 必然 mismatch，会把内容一致的存量 STS 永久判成漂移（围栏/收束循环）。
+    /// 重写后旧 STS 首次全量 ensure 即愈合；后续校验回到正常指纹门。
+    async fn heal_builder_template_hash(
+        &self,
+        existing: &StatefulSet,
+        desired_hash: &str,
+    ) -> ContainerRuntimeResult<()> {
+        let Some(name) = existing.metadata.name.as_deref() else {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Existing builder StatefulSet has no name".into(),
+            ));
+        };
+        // Merge patch 只写单个注解键，其余注解由 merge 语义保留。并发模板
+        // 变更与本次 heal 竞态是无害的：注解只是"当前算法记账"，内容校验
+        // （镜像/command/args/env/容器集合）才是复用门——即使注解被短暂
+        // 盖到已漂移的模板上，下一次 validate 的内容比对仍会精确拒绝。
+        if let Err(error) = self
+            .statefulsets()
+            .patch(
+                name,
+                &PatchParams::default(),
+                &Patch::Merge(serde_json::json!({
+                    "metadata": {"annotations": {TEMPLATE_HASH_ANNOTATION: desired_hash}}
+                })),
+            )
+            .await
+        {
+            return Err(match &error {
+                kube::Error::Api(status) if status.code == 409 || status.code == 422 => {
+                    ContainerRuntimeError::Conflict(
+                        "Builder StatefulSet changed during template-hash heal".into(),
+                    )
+                }
+                _ => ContainerRuntimeError::K8sError(format!(
+                    "Heal builder template hash {name}: {error}"
+                )),
+            });
+        }
+        warn!(
+            "[K8S-STS] {} template-hash healed to current algorithm (legacy annotation superseded)",
+            name
+        );
+        Ok(())
     }
 
     /// StatefulSet API 访问器（与 pods()/pvcs() 对齐）。
@@ -535,11 +602,48 @@ fn workspace_claim_name(spec: &PodSpec) -> Option<String> {
 /// SPACE_ID/ISOLATION_TYPE（请求携带时才注入）随请求抖动，混入指纹会让
 /// 同版本的 ensure 对比误报 drift（参数噪声淹没版本信号）；这些字段的
 /// 期望变更本来也不在滚动/重建语义内（ensure 恒不更新模板）。
+/// Builder 模板复用校验结论。
+#[derive(Debug, PartialEq, Eq)]
+enum BuilderTemplateCheck {
+    /// 记录指纹与期望一致（或内容已由下方内容校验独立证明等价），可直接复用。
+    Current,
+    /// launch 内容与期望等价，但记录指纹是旧算法写入的存量值（跨算法不可比）。
+    /// 调用方以纯 metadata patch 重写注解（heal_builder_template_hash）后按
+    /// Current 对待——不愈合则存量 STS 的每次全量校验必然 mismatch，落成
+    /// 围栏/收束循环（哈希算法演进的一次性迁移语义）。
+    StaleHash,
+}
+
+/// 哈希指纹与内容等价判定的共同 env 口径：剔除随请求/创建抖动的键
+/// （per-request 槽位 + 每创建随机的部署凭据）后按 name 排序。两侧口径
+/// 必须同源——任一侧独立漂移会造成"指纹相等但内容不等"或反向的假信号。
+fn canonical_env(env: &[EnvVar]) -> Vec<EnvVar> {
+    const VOLATILE_ENV_KEYS: [&str; 4] = [
+        "TENANT_ID",
+        "SPACE_ID",
+        "ISOLATION_TYPE",
+        "APP_CLI_DEPLOY_TOKEN",
+    ];
+    let mut entries: Vec<EnvVar> = env
+        .iter()
+        .filter(|entry| !VOLATILE_ENV_KEYS.contains(&entry.name.as_str()))
+        .cloned()
+        .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
+/// 内容优先的复用校验：launch 投影（镜像/command/args/归一化 env/容器集合/
+/// workspace claim）逐一比对，真实漂移在此以精确文案拒绝；指纹注解最后判
+/// 定——mismatch 且内容等价 = 旧算法存量注解，返回 StaleHash 交由调用方
+/// 自愈。注意：指纹原本覆盖的投影外字段（probe/port 等 API 默认化字段，
+/// 既有内容校验明确忽略）不再触发拒绝，与 computer-agent 路径的 advisory
+/// 哲学一致——此类残余漂移由 cleaner 的空闲换代路径滚动，不再围栏。
 fn validate_builder_statefulset(
     existing: &StatefulSet,
     desired: &StatefulSet,
     context: &shared_types::UserAppExecutionContext,
-) -> ContainerRuntimeResult<()> {
+) -> ContainerRuntimeResult<BuilderTemplateCheck> {
     let conflict = |message: &str| ContainerRuntimeError::Conflict(message.into());
     let annotations = existing
         .metadata
@@ -549,14 +653,6 @@ fn validate_builder_statefulset(
     context
         .validate_resource_metadata(annotations)
         .map_err(ContainerRuntimeError::Conflict)?;
-    let desired_hash = desired
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|values| values.get(TEMPLATE_HASH_ANNOTATION));
-    if desired_hash.is_none() || annotations.get(TEMPLATE_HASH_ANNOTATION) != desired_hash {
-        return Err(conflict("Builder StatefulSet configuration changed"));
-    }
     let template = existing
         .spec
         .as_ref()
@@ -584,6 +680,9 @@ fn validate_builder_statefulset(
     }
     // Inspect the actual launch fields too: an external patch can leave the
     // recorded template hash unchanged. Ignore API-defaulted probe/port fields.
+    if existing_pod.containers.len() != desired_pod.containers.len() {
+        return Err(conflict("Builder container set changed"));
+    }
     for desired_container in &desired_pod.containers {
         let actual = existing_pod
             .containers
@@ -596,8 +695,27 @@ fn validate_builder_statefulset(
         {
             return Err(conflict("Builder container launch configuration changed"));
         }
+        // env 是指纹原本覆盖而 launch 字段比对未覆盖的部分——等价判定必须
+        // 收口在这里，否则内容校验会放过 env 漂移（旧实现由指纹门兜底）。
+        if canonical_env(actual.env.as_deref().unwrap_or(&[]))
+            != canonical_env(desired_container.env.as_deref().unwrap_or(&[]))
+        {
+            return Err(conflict("Builder container environment changed"));
+        }
     }
-    Ok(())
+    let desired_hash = desired
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|values| values.get(TEMPLATE_HASH_ANNOTATION));
+    let desired_hash =
+        desired_hash.ok_or_else(|| conflict("Builder desired template hash is missing"))?;
+    if annotations.get(TEMPLATE_HASH_ANNOTATION) == Some(desired_hash) {
+        return Ok(BuilderTemplateCheck::Current);
+    }
+    // 走到这里意味着 launch 投影全部等价，注解 mismatch 只能是算法演进的
+    // 存量值——授权自愈而非围栏。
+    Ok(BuilderTemplateCheck::StaleHash)
 }
 
 fn conditional_scale_patch(
@@ -647,18 +765,13 @@ fn agent_template_hash(pod_spec: &PodSpec) -> String {
             // per-creation deploy credential (a fresh random token on every
             // build — hashing it made every re-computation differ and turned
             // the drift check into a coin flip; test-env app 151/155 incident).
-            env.retain(|e| {
-                !matches!(
-                    e.name.as_str(),
-                    "TENANT_ID" | "SPACE_ID" | "ISOLATION_TYPE" | "APP_CLI_DEPLOY_TOKEN"
-                )
-            });
             // Canonical ordering: env lists are assembled from HashMaps whose
             // iteration order is per-process random. Without sorting, two
             // replicas computing the hash for the identical desired spec
             // produce different values and the reuse check rejects a perfectly
             // matching controller ("configuration changed" false positive).
-            env.sort_by(|a, b| a.name.cmp(&b.name));
+            // 口径与 validate_builder_statefulset 的内容等价判定同源（canonical_env）。
+            *env = canonical_env(env);
         }
     }
     let canonical = serde_json::to_value(&spec)
@@ -722,7 +835,120 @@ mod tests {
             .as_mut()
             .unwrap()
             .insert(TEMPLATE_HASH_ANNOTATION.into(), "other-template".into());
-        assert!(validate_builder_statefulset(&foreign, &desired, &context).is_err());
+        // 注解与期望指纹不等但 launch 内容完全一致 = 旧算法存量注解：
+        // 授权自愈（StaleHash），不再当作漂移围栏（方案 c 迁移语义）。
+        assert!(matches!(
+            validate_builder_statefulset(&foreign, &desired, &context),
+            Ok(BuilderTemplateCheck::StaleHash)
+        ));
+    }
+
+    fn builder_sts_with_env(
+        hash: &str,
+        env: Vec<EnvVar>,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> StatefulSet {
+        use k8s_openapi::api::core::v1::Container;
+        let mut annotations = context.resource_metadata();
+        annotations.insert(TEMPLATE_HASH_ANNOTATION.into(), hash.into());
+        let pod_spec = PodSpec {
+            containers: vec![Container {
+                name: "agent".to_string(),
+                image: Some("builder:one".to_string()),
+                env: Some(env),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        StatefulSet {
+            metadata: ObjectMeta {
+                annotations: Some(annotations.clone()),
+                ..Default::default()
+            },
+            spec: Some(StatefulSetSpec {
+                template: PodTemplateSpec {
+                    metadata: Some(ObjectMeta {
+                        annotations: Some(annotations),
+                        ..Default::default()
+                    }),
+                    spec: Some(pod_spec),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// 方案 c 自愈（迁移语义）：存量 STS 的 template-hash 是旧算法写入的值，
+    /// 与新算法期望指纹必然不等——但 launch 内容（含构造顺序不同的 env，
+    /// 归一化后等价）完全一致时必须授权自愈而非误报漂移。修复前必红：
+    /// 跨算法注解 mismatch 一律 Conflict，存量 STS 首次全量 ensure 即落
+    /// 围栏/收束循环（app 151/155 事故修复的迁移缺口）。
+    #[test]
+    fn stale_hash_annotation_heals_when_launch_content_equivalent() {
+        let context = shared_types::UserAppExecutionContext {
+            app_id: "app-one".into(),
+            lifecycle_id: "life-one".into(),
+            operation_id: "operation-one".into(),
+            executor_id: "executor-one".into(),
+            request_fingerprint: "ab".repeat(32),
+        };
+        let order_a = vec![
+            EnvVar {
+                name: "ALPHA".into(),
+                value: Some("1".into()),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "BETA".into(),
+                value: Some("2".into()),
+                ..Default::default()
+            },
+        ];
+        let order_b: Vec<EnvVar> = order_a.iter().rev().cloned().collect();
+        let desired = builder_sts_with_env("hash-current", order_a, &context);
+        let mut existing = builder_sts_with_env("hash-legacy", order_b, &context);
+        assert!(matches!(
+            validate_builder_statefulset(&existing, &desired, &context),
+            Ok(BuilderTemplateCheck::StaleHash)
+        ));
+        // 迁移完成后（注解已被 heal 为当前算法值）→ Current。
+        existing
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(TEMPLATE_HASH_ANNOTATION.into(), "hash-current".into());
+        assert!(matches!(
+            validate_builder_statefulset(&existing, &desired, &context),
+            Ok(BuilderTemplateCheck::Current)
+        ));
+    }
+
+    /// 自愈不放松真实漂移：非挥发性 env 值变化（注解也同时 mismatch）必须
+    /// 仍然拒绝——内容等价是自愈的唯一授权，注解门自身不构成漂移证据。
+    #[test]
+    fn stale_hash_heal_never_masks_environment_drift() {
+        let context = shared_types::UserAppExecutionContext {
+            app_id: "app-one".into(),
+            lifecycle_id: "life-one".into(),
+            operation_id: "operation-one".into(),
+            executor_id: "executor-one".into(),
+            request_fingerprint: "ab".repeat(32),
+        };
+        let env = vec![EnvVar {
+            name: "ALPHA".into(),
+            value: Some("1".into()),
+            ..Default::default()
+        }];
+        let drifted_env = vec![EnvVar {
+            name: "ALPHA".into(),
+            value: Some("2".into()),
+            ..Default::default()
+        }];
+        let desired = builder_sts_with_env("hash-current", env, &context);
+        let existing = builder_sts_with_env("hash-legacy", drifted_env, &context);
+        assert!(validate_builder_statefulset(&existing, &desired, &context).is_err());
     }
 
     #[test]
@@ -879,7 +1105,7 @@ mod tests {
         // 注入隔离 env
         let mut with_isolation = base.clone();
         if let Some(env) = with_isolation.containers[0].env.as_mut() {
-            env.push(k8s_openapi::api::core::v1::EnvVar {
+            env.push(EnvVar {
                 name: "TENANT_ID".to_string(),
                 value: Some("t1".to_string()),
                 ..Default::default()
