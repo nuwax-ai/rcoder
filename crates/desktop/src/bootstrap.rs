@@ -58,7 +58,11 @@ impl StatusView {
         let port = service_port();
         let poll_task = cx.spawn_in(window, async move |this, cx| {
             loop {
-                let health = engine::health_probe(port).await;
+                // 同步 TCP 探活放 background executor（避免阻塞 UI 线程）
+                let health = cx
+                    .background_executor()
+                    .spawn(async move { engine::tcp_health_probe(port) })
+                    .await;
                 let text = match health {
                     Ok(()) => format!("rcoder 服务健康（127.0.0.1:{port}/health）"),
                     Err(reason) => format!("服务未就绪：{reason}"),

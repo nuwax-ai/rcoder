@@ -5,22 +5,28 @@
 
 use std::time::Duration;
 
-/// 主端口的健康探查（引擎状态卡用；deploy-host 默认 bind 127.0.0.1）。
-pub async fn health_probe(port: u16) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:{port}/health");
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .build()
+/// 主端口的健康探查（纯 std TCP + 原始 HTTP 请求——gpui executor 非 tokio，
+/// 不能用 reqwest；同步实现经 background executor 调用）。
+pub fn tcp_health_probe(port: u16) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))
         .map_err(|e| e.to_string())?;
-    let resp = client
-        .get(&url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await;
-    match resp {
-        Ok(r) if r.status().is_success() => Ok(()),
-        Ok(r) => Err(format!("HTTP {}", r.status())),
-        Err(e) => Err(e.to_string()),
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .write_all(format!("GET /health HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 128];
+    let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    if head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200") {
+        Ok(())
+    } else {
+        Err(format!("non-200 status line: {}", head.lines().next().unwrap_or_default()))
     }
 }
 

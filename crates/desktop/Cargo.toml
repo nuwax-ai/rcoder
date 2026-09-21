@@ -32,4 +32,3 @@ rcoder = { workspace = true }
 rcoder-engine = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 anyhow = { workspace = true }
-reqwest = { workspace = true }
