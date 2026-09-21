@@ -15,12 +15,8 @@ pub use rcoder_engine::{
     userapp_forward, userapp_recycle, utils, vnc, workspace_migrate,
 };
 
-// HTTP 面（Phase 1 迁 http-server）
-pub mod handler;
-pub mod middleware;
-pub mod router;
-pub mod router_docs;
-pub mod server;
+// HTTP 面（Phase 1 迁 http-server crate 后 re-export）
+pub use http_server::{handler, middleware, router, router_docs, server};
 
 // 重新导出主要的类型和函数
 pub use storage::{ProjectAdapter, ProjectStore, ProjectStoreBackend};

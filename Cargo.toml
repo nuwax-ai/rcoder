@@ -6,6 +6,7 @@ resolver = "2"
 default-members = [
     "crates/rcoder",
     "crates/rcoder-engine",
+    "crates/http-server",
     "crates/rcoder-storage",
     "crates/agent_runner",
     "crates/shared_types",
@@ -327,6 +328,7 @@ shared_types_i18n = { path = "crates/shared_types_i18n" }
 preview-coordinator = { path = "crates/preview-coordinator" }
 rcoder-storage = { path = "crates/rcoder-storage" }
 rcoder-engine = { path = "crates/rcoder-engine" }
+http-server = { path = "crates/http-server" }
 agent_config = { path = "crates/agent_config" }
 agent_abstraction = { path = "crates/agent_abstraction" }
 agent_provisioning = { path = "crates/agent_provisioning" }
