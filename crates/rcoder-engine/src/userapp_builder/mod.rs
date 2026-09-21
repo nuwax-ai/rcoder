@@ -30,7 +30,6 @@ use container_runtime_api::ContainerCreateParams;
 use shared_types::ProjectStore as _;
 use shared_types::{
     AGENT_FILE_SERVER_PORT, ContainerBasicInfo, ProjectAndContainerInfo, ServiceType,
-    build_backend_addr,
 };
 use tracing::info;
 

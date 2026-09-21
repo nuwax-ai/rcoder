@@ -136,10 +136,10 @@ pub fn config_file_path() -> PathBuf {
         return PathBuf::from(explicit);
     }
     #[cfg(feature = "deploy-host")]
-    if shared_types::is_deploy_host() {
-        if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-            return PathBuf::from(home).join(".rcoder").join(CONFIG_FILE);
-        }
+    if shared_types::is_deploy_host()
+        && let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(home).join(".rcoder").join(CONFIG_FILE);
     }
     PathBuf::from(CONFIG_FILE)
 }

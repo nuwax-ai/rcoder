@@ -1,5 +1,6 @@
 //! 网络管理：主网络检测、网络存在性检查（从 DockerManager 拆出）
 
+#[cfg(feature = "deploy-host")]
 use std::collections::HashMap;
 
 use bollard::Docker;

@@ -2,8 +2,10 @@
 //!
 //! 提供便捷的路径解析接口
 
+#[cfg(feature = "deploy-host")]
+use crate::DockerError;
+use crate::DockerResult;
 use crate::path::HostPathResolver;
-use crate::{DockerError, DockerResult};
 use std::path::{Path, PathBuf};
 
 /// 便捷函数：将容器路径解析为宿主机路径
