@@ -148,7 +148,7 @@ mod tests {
 
         assert_eq!(stats.synced, 1);
         assert_eq!(stats.skipped, 0);
-        // sync_agents 写了 marker + fan-out 到 6 家 (验证 grok/pi 补齐)
+        // sync_agents 写了 marker + fan-out 到活跃目标 (grok/pi 临时屏蔽不再创建)
         assert_eq!(
             tokio::fs::read_to_string(ws.join(".agents/.sync_version"))
                 .await
@@ -156,8 +156,8 @@ mod tests {
             current
         );
         assert!(ws.join(".claude/skills/sk1/SKILL.md").exists());
-        assert!(ws.join(".grok/skills/sk1/SKILL.md").exists());
-        assert!(ws.join(".pi/skills/sk1/SKILL.md").exists());
+        assert!(!ws.join(".grok/skills").exists());
+        assert!(!ws.join(".pi/skills").exists());
     }
 
     #[tokio::test]

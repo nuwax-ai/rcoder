@@ -519,8 +519,13 @@ mod terminal_tests;
 #[cfg(test)]
 mod discover_settle_tests {
     use super::*;
+    #[cfg(feature = "rcoder-pg")]
     use crate::userapp_builder::creation::fence_settler_tests::{
         FenceRuntime, fence_state, fence_state_pg, settled,
+    };
+    #[cfg(not(feature = "rcoder-pg"))]
+    use crate::userapp_builder::creation::fence_settler_tests::{
+        FenceRuntime, fence_state, settled,
     };
 
     /// PG 后端复现（集群形态）：线上 20 个围栏零收束而 Turso 全通——
