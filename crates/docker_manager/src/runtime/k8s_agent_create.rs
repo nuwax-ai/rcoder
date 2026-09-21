@@ -527,8 +527,14 @@ impl KubernetesRuntime {
                         }),
                         initial_delay_seconds: Some(30),
                         period_seconds: Some(10),
-                        timeout_seconds: Some(3),
-                        failure_threshold: Some(3),
+                        // 131 实证（userapp 套件多轮）：control-plane 混部节点高负载下
+                        // 8086 响应间歇 >3s（readiness 同端口 deadline exceeded 多次记录，
+                        // 空闲 pod 亦出现），原 timeout=3×failure=3 在 30s 窗口内连败即
+                        // SIGTERM 误杀活容器——在途连接 RST（rcoder 转发表现为
+                        // IncompleteMessage），builder 链路整轮瘫痪。放宽为 10s×6（60s
+                        // 宽限）：真死锁进程晚 30s 被杀无碍，误杀活容器代价高得多。
+                        timeout_seconds: Some(10),
+                        failure_threshold: Some(6),
                         success_threshold: Some(1),
                         ..Default::default()
                     }),
