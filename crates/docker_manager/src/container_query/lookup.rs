@@ -204,6 +204,7 @@ impl DockerManager {
             status: container_info.status.to_string(),
             created_at: container_info.created_at,
             service_url: server_url,
+            workload_uid: None,
         }))
     }
 

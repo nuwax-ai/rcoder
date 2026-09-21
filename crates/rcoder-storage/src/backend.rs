@@ -490,6 +490,7 @@ mod tests {
             status: "running".into(),
             created_at: chrono::Utc::now(),
             service_url: "http://container-1".into(),
+            workload_uid: None,
         }));
         backend
             .insert_with_session("proj-1".into(), Arc::new(info), Some("sess-1"))

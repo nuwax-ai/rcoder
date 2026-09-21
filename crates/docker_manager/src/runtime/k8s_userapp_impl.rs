@@ -139,6 +139,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
                     &self.config.cluster_domain,
                 ),
             ),
+            workload_uid: None,
         }))
     }
 
@@ -553,6 +554,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
                     &self.config.cluster_domain,
                 ),
             ),
+            workload_uid: None,
         })
     }
 
@@ -632,6 +634,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
                     &self.config.cluster_domain,
                 ),
             ),
+            workload_uid: None,
         })
     }
 

@@ -1,7 +1,8 @@
-//! agent-runner 查询/读取（从 k8s_agent_pod.rs 拆出）：cache + K8s API 按 label 查 + 列举。
+//! agent-runner 查询/读取（从 k8s_agent_pod.rs 拆出）：cache + 分层解析器查询。
 //!
-//! - `get_container_info_inner` / `get_container_info_by_identifier_inner`：按 identifier 查（仅普通 agent 保留 svc self-heal）。
-//! - `find_container_inner`：cache → pod 名 → 标准 label → 旧 label 三级查。
+//! - `get_container_info_inner` / `get_container_info_by_identifier_inner`：按 identifier 查
+//!   （契约四：经 `k8s_resolution` 分层解析，冲突/未知如实上报；仅普通 agent 保留 svc self-heal）。
+//! - `find_container_inner`：cache → 分层解析 → 旧标签兼容三级。
 //! - `list_containers_inner`：列举 rcoder-runtime managed pods。
 //!
 //! 与 k8s_agent_create.rs（创建）、k8s_agent_pod.rs（变更）正交。
@@ -50,69 +51,26 @@ impl KubernetesRuntime {
             ));
         }
 
-        // Query K8s API — 按类型分流的 selector（单一事实源，与 find_container_inner 共用）
-        for query in pod_label_selectors(identifier, service_type) {
-            let lp = ListParams::default().labels(&query);
-            let pods = self.pods().list(&lp).await.map_err(|error| {
-                ContainerRuntimeError::K8sError(format!(
-                    "query container pods with selector {query}: {error}"
-                ))
-            })?;
-            if let Some(pod) = pods.items.into_iter().next() {
-                let status = Self::extract_pod_status(&pod);
-                let metadata = &pod.metadata;
-                let uid = metadata.uid.clone().unwrap_or_default();
-                let pod_ip = pod
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.pod_ip.clone())
-                    .unwrap_or_default();
-                let created_at = metadata
-                    .creation_timestamp
-                    .as_ref()
-                    .map(|ts| {
-                        chrono::DateTime::from_timestamp(
-                            ts.0.as_second(),
-                            ts.0.subsec_nanosecond() as u32,
-                        )
-                        .unwrap_or_else(Utc::now)
-                    })
-                    .unwrap_or_else(Utc::now);
-
-                // 标签直读身份（与查询的 service_type 一致；标签缺失时回退查询
-                // 类型，防御 bare-pod 等历史形态）
-                let (label_type, label_slots) = match pod.metadata.labels.as_ref() {
-                    Some(labels) => super::k8s_service::container_identity_from_labels(labels),
-                    None => (
-                        None,
-                        container_runtime_api::ContainerIdentitySlots::default(),
-                    ),
-                };
+        // Query K8s API —— 契约四分层解析：label 发现 + 身份核验（selector
+        // 单一事实源在 k8s_resolution）；冲突/未知如实上报，不盲取首条。
+        match self.resolve_pod(identifier, service_type).await {
+            super::k8s_resolution::PodResolution::Present { info: boxed, .. } => {
+                let mut info = *boxed;
+                // 标签直读身份缺槽（bare-pod 等历史形态）按查询类型回填
                 let fallback_slots =
                     container_runtime_api::slots_from_identifier(service_type, identifier);
-                let pod_info = RuntimeContainerInfo {
-                    container_id: uid,
-                    // container_name ≡ 稳定 workload 名（契约一）：ownerReference 权威派生
-                    // 的 STS 名即寻址基名（FQDN/grpc_addr 从它派生 `{name}-svc`）；bare
-                    // pod 以 pod 名为 workload 身份。实际 pod 名由 agent_pod_name() 按需取。
-                    container_name: Self::workload_name_from_pod(metadata),
-                    container_ip: pod_ip,
-                    status,
-                    created_at,
-                    env_vars: None,
-                    service_type: label_type.or(Some(*service_type)),
-                    project_id: label_slots.project_id.or(fallback_slots.project_id),
-                    user_id: label_slots.user_id.or(fallback_slots.user_id),
-                    pod_id: label_slots.pod_id.or(fallback_slots.pod_id),
-                    app_id: label_slots.app_id.or(fallback_slots.app_id),
-                };
+                info.project_id = info.project_id.or(fallback_slots.project_id);
+                info.user_id = info.user_id.or(fallback_slots.user_id);
+                info.pod_id = info.pod_id.or(fallback_slots.pod_id);
+                info.app_id = info.app_id.or(fallback_slots.app_id);
+                info.service_type = info.service_type.or(Some(*service_type));
 
                 // Update cache if running
-                if pod_info.status == ContainerRuntimeStatus::Running {
+                if info.status == ContainerRuntimeStatus::Running {
                     self.pod_cache.write().await.insert(
                         identifier.to_string(),
                         CachedPod {
-                            info: pod_info.clone(),
+                            info: info.clone(),
                             service_type: service_type.family_representative(),
                             cached_at: std::time::Instant::now(),
                         },
@@ -120,10 +78,19 @@ impl KubernetesRuntime {
                 }
 
                 return Ok(Some(
-                    self.build_container_basic_info(identifier, &pod_info)
-                        .await?,
+                    self.build_container_basic_info(identifier, &info).await?,
                 ));
             }
+            super::k8s_resolution::PodResolution::Conflict { reason } => {
+                return Err(ContainerRuntimeError::Conflict(reason));
+            }
+            super::k8s_resolution::PodResolution::Unknown { reason } => {
+                return Err(ContainerRuntimeError::K8sError(reason));
+            }
+            // Absent / WorkloadWithoutPod：无容器可报（workload 在而 pod 暂缺
+            // 对 info 查询同样返回 None——不判停，业务策略由调用方应用）。
+            super::k8s_resolution::PodResolution::Absent { .. }
+            | super::k8s_resolution::PodResolution::WorkloadWithoutPod { .. } => {}
         }
 
         Ok(None)
@@ -198,50 +165,29 @@ impl KubernetesRuntime {
             return Ok(Some(info));
         }
 
-        // 1) Query by concrete pod name —— STS 实际 pod 名（`{sts_name}-0`）。
-        // pod_name() 产出的是 STS 名（建 STS/拼 svc FQDN 的寻址基名，不带序号），
-        // 直接 get 恒 404；Userapp 是 Deployment（hash 名），`-0` 后缀同样 404 落兜底。
-        let pod_name = self.agent_pod_name(identifier, service_type)?;
-        match self.pods().get(&pod_name).await {
-            Ok(pod) => {
-                let info = Self::runtime_info_from_pod(&pod);
+        // 契约四分层解析：label 发现 + 身份核验 + STS 规范名兜底 + 缺席证据
+        //（细节见 k8s_resolution）。冲突/未知如实上报；仍无候选时保留旧标签
+        // 兼容查询（平滑迁移，生产 UserApp Deployment 无这些标签，无撞车面）。
+        match self.resolve_pod(identifier, service_type).await {
+            super::k8s_resolution::PodResolution::Present { info, .. } => {
+                let info = *info;
                 self.maybe_cache_running_pod(identifier, service_type, &info)
                     .await;
                 return Ok(Some(info));
             }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-            Err(e) => {
-                return Err(ContainerRuntimeError::K8sError(format!(
-                    "Failed to get pod by name '{}': {}",
-                    pod_name, e
-                )));
+            super::k8s_resolution::PodResolution::Conflict { reason } => {
+                return Err(ContainerRuntimeError::Conflict(reason));
             }
+            super::k8s_resolution::PodResolution::Unknown { reason } => {
+                return Err(ContainerRuntimeError::K8sError(reason));
+            }
+            // 无候选：走旧标签兼容查询。Absent 的证据随日志留痕（对账/排障）。
+            super::k8s_resolution::PodResolution::Absent { evidence } => {
+                tracing::debug!(%evidence, %identifier, "pod resolution: absent");
+            }
+            super::k8s_resolution::PodResolution::WorkloadWithoutPod { .. } => {}
         }
 
-        // 2) Query by labels —— 按类型分流的 selector（单一事实源）。
-        // 仅 `instance={id}` 单键时，生产 UserApp Deployment（instance 同值、字典序
-        // 排前）会被 limit(1) 稳定捞走，污染 builder 注册表——app 23 事故形态。
-        for selector in pod_label_selectors(identifier, service_type) {
-            let pods = self
-                .pods()
-                .list(&ListParams::default().labels(&selector).limit(1))
-                .await
-                .map_err(|e| {
-                    ContainerRuntimeError::K8sError(format!(
-                        "Failed to list pods with selector '{}': {}",
-                        selector, e
-                    ))
-                })?;
-
-            if let Some(pod) = pods.items.into_iter().next() {
-                let info = Self::runtime_info_from_pod(&pod);
-                self.maybe_cache_running_pod(identifier, service_type, &info)
-                    .await;
-                return Ok(Some(info));
-            }
-        }
-
-        // 3) 兼容旧标签查询（平滑迁移；生产 UserApp Deployment 无这些标签，无撞车面）
         for old_selector in [
             format!("pod_id={}", identifier),
             format!("user_id={}", identifier),
@@ -344,6 +290,7 @@ impl KubernetesRuntime {
                 user_id: slots.user_id,
                 pod_id: slots.pod_id,
                 app_id: slots.app_id,
+                workload_uid: Self::workload_uid_from_pod_owner(metadata),
             };
             result.push(pod_info);
         }
@@ -353,29 +300,41 @@ impl KubernetesRuntime {
 
     /// 诊断 agent pod 容器状态(gRPC 连接失败时定位真实根因)。
     ///
-    /// 取 STS pod `{prefix}-{identifier}-0` 的 "agent" 容器 ContainerStatus,解析:
-    /// restart_count / ready / last_terminate_reason(OOMKilled)/ last_exit_code / waiting_reason
+    /// 契约四：诊断类消费者必须能返回 Pending/CrashLoopBackOff/未 Ready——
+    /// 经分层解析器发现候选（label 优先 + STS 规范名兜底），不只按派生名
+    /// GET，标签漂移/换代窗口内同样可诊断。
+    /// 取 "agent" 容器 ContainerStatus,解析: restart_count / ready /
+    /// last_terminate_reason(OOMKilled)/ last_exit_code / waiting_reason
     /// (CrashLoopBackOff)/ 可读 detail(复用 [`super::k8s_app_query::container_error_message`])。
-    /// pod 不存在(404)→ exists=false;其他 K8s API 错误 → 向上传播 Err(调用方兜底为"未知")。
+    /// pod 不存在 → exists=false（workload 在而 pod 暂缺同样 exists=false，
+    /// detail 注明，不判停）；冲突/观察不完整 → 向上传播 Err。
     pub(crate) async fn diagnose_agent_pod_inner(
         &self,
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<AgentPodDiagnostic> {
-        let pod_name = self.agent_pod_name(identifier, service_type)?;
-        let pod = match self.pods().get(&pod_name).await {
-            Ok(pod) => pod,
-            Err(kube::Error::Api(err)) if err.code == 404 => {
-                // pod 不存在:本身就是根因(默认诊断 exists=true,这里显式置 false)
+        let pod = match self.resolve_pod(identifier, service_type).await {
+            super::k8s_resolution::PodResolution::Present { pod, .. } => pod,
+            super::k8s_resolution::PodResolution::Absent { .. } => {
                 return Ok(AgentPodDiagnostic {
                     exists: false,
                     ..Default::default()
                 });
             }
-            Err(e) => {
-                return Err(ContainerRuntimeError::K8sError(format!(
-                    "diagnose_agent_pod: get pod {pod_name} failed: {e}"
-                )));
+            super::k8s_resolution::PodResolution::WorkloadWithoutPod { workload_name } => {
+                return Ok(AgentPodDiagnostic {
+                    exists: false,
+                    detail: Some(format!(
+                        "workload {workload_name} exists but no pod is scheduled (recreating?)"
+                    )),
+                    ..Default::default()
+                });
+            }
+            super::k8s_resolution::PodResolution::Conflict { reason } => {
+                return Err(ContainerRuntimeError::Conflict(reason));
+            }
+            super::k8s_resolution::PodResolution::Unknown { reason } => {
+                return Err(ContainerRuntimeError::K8sError(reason));
             }
         };
 
@@ -412,115 +371,5 @@ impl KubernetesRuntime {
             waiting_reason,
             detail: super::k8s_app_query::container_error_message(cs),
         })
-    }
-}
-
-/// pod 定位 label selector 候选（单一事实源：find_container_inner step2 与
-/// get_container_info_inner 的 label 查询共用）。
-///
-/// 生产 UserApp Deployment 与 agent/builder STS 族的标签体系不同——两族共享
-/// `app.kubernetes.io/instance={id}` 键（builder 与生产同 app_id 时同值），仅凭
-/// 它无法分流；单键 + limit(1) 时生产 pod（字典序排前）会被稳定捞走，以 inspect
-/// 真实值污染 builder 注册表（app 23 事故）。故按 service_type 拼双键：
-/// - Userapp（生产 Deployment，标签由 app_manager `build_app_labels` 写入）：
-///   instance + managed-by=rcoder-app-manager
-/// - 其余（STS 族，标签由 `build_standard_labels` 写入，恒带
-///   rcoder.io/service-type）：instance + rcoder.io/service-type
-///
-/// 第二候选取各族的 rcoder.io 专属键（identifier vs app-id），同样带类型维度。
-fn pod_label_selectors(identifier: &str, service_type: &ServiceType) -> Vec<String> {
-    // 穷尽列举（09-19 教训：_ 通配臂关闭编译器穷尽检查，新增变体静默漏接）；
-    // STS 族四变体同臂（家族归一在臂内执行），Userapp 专属标签集单臂
-    match service_type {
-        ServiceType::Userapp => vec![
-            format!(
-                "app.kubernetes.io/instance={identifier},app.kubernetes.io/managed-by={}",
-                super::k8s_deployment::APP_MANAGED_BY
-            ),
-            format!(
-                "rcoder.io/app-id={identifier},app.kubernetes.io/managed-by={}",
-                super::k8s_deployment::APP_MANAGED_BY
-            ),
-        ],
-        ServiceType::WebAgentRunner
-        | ServiceType::ComputerAgentRunner
-        | ServiceType::ComputerNormalProject
-        | ServiceType::UserappBuilder => {
-            // 家族归一：label 由创建侧写家族值（常规项目与 Computer 同容器同 label），
-            // selector 必须用家族值才能命中既有 STS/Pod，否则会误判不存在而重建
-            let family = service_type.container_family_key();
-            vec![
-                format!("app.kubernetes.io/instance={identifier},rcoder.io/service-type={family}"),
-                format!("rcoder.io/identifier={identifier},rcoder.io/service-type={family}"),
-            ]
-        }
-    }
-}
-
-#[cfg(test)]
-mod label_selector_tests {
-    use super::pod_label_selectors;
-    use shared_types::ServiceType;
-
-    /// Userapp 走 managed-by 维度（生产 Deployment 无 rcoder.io/service-type 标签），
-    /// 且两个候选都必须含 managed-by=rcoder-app-manager——这是把生产 pod 从
-    /// builder 查询里分流出去的决定性维度。
-    #[test]
-    fn userapp_selectors_use_app_manager_dimension() {
-        let selectors = pod_label_selectors("23", &ServiceType::Userapp);
-        assert_eq!(selectors.len(), 2);
-        assert!(
-            selectors
-                .iter()
-                .all(|s| !s.contains("rcoder.io/service-type"))
-        );
-        assert!(
-            selectors
-                .iter()
-                .all(|s| s.contains("managed-by=rcoder-app-manager"))
-        );
-        assert!(selectors[0].contains("app.kubernetes.io/instance=23"));
-        assert!(selectors[1].contains("rcoder.io/app-id=23"));
-    }
-
-    /// STS 族（含 UserappBuilder）带 rcoder.io/service-type 维度——builder 与生产
-    /// Deployment 同 app_id 共享 instance 键，service-type 是唯一分键。
-    #[test]
-    fn sts_family_selectors_carry_service_type_dimension() {
-        for st in [
-            ServiceType::UserappBuilder,
-            ServiceType::WebAgentRunner,
-            ServiceType::ComputerAgentRunner,
-        ] {
-            let selectors = pod_label_selectors("42", &st);
-            assert_eq!(selectors.len(), 2, "{st}");
-            assert!(
-                selectors
-                    .iter()
-                    .all(|s| s.contains(&format!("rcoder.io/service-type={st}"))),
-                "{st}"
-            );
-            assert!(selectors[0].contains("app.kubernetes.io/instance=42"));
-            assert!(selectors[1].contains("rcoder.io/identifier=42"));
-        }
-    }
-
-    /// 常规项目（ComputerNormalProject）查询的 selector 恒用族代表词——
-    /// label 写入侧（build_standard_labels）就是族值，本义查询必须归一命中，
-    /// 否则 NormalProject 会话会误判容器不存在而重建。
-    #[test]
-    fn normal_project_selectors_use_family_key() {
-        for st in [
-            ServiceType::ComputerNormalProject,
-            ServiceType::ComputerAgentRunner,
-        ] {
-            let selectors = pod_label_selectors("42", &st);
-            assert!(
-                selectors
-                    .iter()
-                    .all(|s| s.contains("rcoder.io/service-type=computer-agent-runner")),
-                "{st} selector 必须用族代表词"
-            );
-        }
     }
 }

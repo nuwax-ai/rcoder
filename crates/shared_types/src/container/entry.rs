@@ -163,6 +163,7 @@ mod tests {
                 status: "running".to_string(),
                 created_at: Utc::now(),
                 service_url: "http://test".to_string(),
+                workload_uid: None,
             },
             ServiceType::WebAgentRunner,
             "proj-1".to_string(),
@@ -214,6 +215,7 @@ mod tests {
                 status: "running".to_string(),
                 created_at: Utc::now(),
                 service_url: "http://test".to_string(),
+                workload_uid: None,
             },
             ServiceType::WebAgentRunner,
             "proj-1".to_string(),
@@ -238,6 +240,7 @@ mod tests {
             status: "stopped".to_string(),
             created_at: Utc::now(),
             service_url: "http://new".to_string(),
+            workload_uid: None,
         };
         entry.update(new_info, ServiceType::ComputerAgentRunner);
         assert_eq!(entry.info().container_name, "new-name");

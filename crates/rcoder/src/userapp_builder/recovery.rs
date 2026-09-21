@@ -308,12 +308,17 @@ async fn discover(
                 });
                 continue;
             }
-            if operation.kind == UserAppOperationKind::EnsureBuilder
-                && operation.state == UserAppOperationState::RecoveryRequired
+            if operation.state == UserAppOperationState::RecoveryRequired
+                // app_manager 侧已认领的 step 级 resume（hot_execution /
+                // hot_converging / traffic_wake_observing）在前面的分支优
+                // 先处理；此处兜底其余全部 kind 的证据化收束。
+                && !matches!(operation.step.as_str(),
+                    "hot_execution" | "hot_converging" | "traffic_wake_observing")
             {
-                // Fenced ensure without final evidence: settle automatically
-                // when the protected goal (a live, identity-bound builder) is
-                // verifiably satisfied — frees the slot without operator action.
+                // Fenced operation without a step-specific resume: settle
+                // automatically when the physical state is verifiably definite
+                // (per-kind evidence predicates in creation::observe_fence_
+                // evidence) — frees the slot without operator action.
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
                     super::creation::reconcile_fenced_ensure(&state, &operation).await?;

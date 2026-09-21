@@ -148,6 +148,7 @@ impl K8sPodOps for KubernetesRuntime {
             user_id: slots.user_id,
             pod_id: slots.pod_id,
             app_id: slots.app_id,
+            workload_uid: Self::workload_uid_from_pod_owner(metadata),
         }
     }
 

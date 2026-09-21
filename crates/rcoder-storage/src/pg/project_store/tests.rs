@@ -37,6 +37,7 @@ fn container_for(project_id: &str) -> ContainerBasicInfo {
         status: "running".into(),
         created_at: chrono::Utc::now(),
         service_url: format!("http://container-{project_id}"),
+        workload_uid: None,
     }
 }
 

@@ -64,6 +64,8 @@ pub(crate) mod k8s_pod;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_pvc;
 #[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_resolution;
+#[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_service;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_statefulset;

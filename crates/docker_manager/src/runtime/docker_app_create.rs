@@ -305,6 +305,7 @@ impl DockerRuntime {
             status: "Running".to_string(),
             created_at: chrono::Utc::now(),
             service_url: String::new(),
+            workload_uid: None,
         })
     }
 

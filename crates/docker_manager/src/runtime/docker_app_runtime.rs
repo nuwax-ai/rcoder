@@ -248,6 +248,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             status: "Starting".to_string(),
             created_at: chrono::Utc::now(),
             service_url: String::new(),
+            workload_uid: None,
         }))
     }
 

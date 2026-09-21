@@ -294,6 +294,7 @@ impl KubernetesRuntime {
                 access_address,
                 shared_types::HTTP_DEFAULT_PORT
             ),
+            workload_uid: None,
         })
     }
 }

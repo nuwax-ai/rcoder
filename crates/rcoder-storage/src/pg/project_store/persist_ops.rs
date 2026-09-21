@@ -324,7 +324,7 @@ pub(in crate::pg) fn registration_for_info(
                 .container
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Container registration identity missing"))?,
-            None,
+            basic.workload_uid.as_deref(),
         )?))
     } else {
         None
@@ -355,6 +355,7 @@ mod tests {
             status: "running".into(),
             created_at: Utc::now(),
             service_url: "http://container-1".into(),
+            workload_uid: None,
         }));
         let mut identity = info.persistence_identity().clone();
         identity.revision = 1;

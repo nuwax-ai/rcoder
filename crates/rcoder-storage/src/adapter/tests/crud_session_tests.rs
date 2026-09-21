@@ -372,6 +372,7 @@ fn test_raii_cleanup_on_last_project_remove() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: "http://shared".to_string(),
+        workload_uid: None,
     };
 
     let mut info1 = ProjectAndContainerInfo::from_parts(
@@ -470,6 +471,7 @@ fn test_save_container_update() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: "http://test".to_string(),
+        workload_uid: None,
     };
 
     // 第一次 save：创建新条目（ref_count=0）

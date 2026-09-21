@@ -199,6 +199,22 @@ impl KubernetesRuntime {
             .unwrap_or_else(|| pod_meta.name.clone().unwrap_or_default())
     }
 
+    /// Workload UID 的权威派生（注册表零包袱 §1.1）：controller
+    /// ownerReference 一跳。STS 族 owner 即 STS，其 UID 即 workload UID；
+    /// Deployment 族 pod 的 controller 是 ReplicaSet（非 workload 对象），
+    /// 返回 None——其绑定身份由部署捕获侧写入 userapp 生命周期表
+    /// （physical_uid + deployment_generation），热路径不做两跳 API 解析。
+    /// bare pod 无 workload 对象，亦 None（workload 身份=pod 名，契约一）。
+    pub(crate) fn workload_uid_from_pod_owner(pod_meta: &ObjectMeta) -> Option<String> {
+        pod_meta
+            .owner_references
+            .as_ref()?
+            .iter()
+            .find(|owner| owner.controller == Some(true) && owner.kind == "StatefulSet")
+            .map(|owner| owner.uid.clone())
+            .filter(|uid| !uid.is_empty())
+    }
+
     /// 确保 headless Service 存在（STS 必需，clusterIP=None）。selector 与 pod labels 一致。
     pub(crate) async fn ensure_agent_headless_service(
         &self,

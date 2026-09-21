@@ -513,22 +513,123 @@ pub(super) async fn reconcile_created(
     Ok(true)
 }
 
-/// Auto-settle a fenced EnsureBuilder whose protected goal is verifiably
-/// satisfied: a builder controller exists under the same app+lifecycle
-/// (captured through the registry/binding path, which is fingerprint-free).
-/// The interrupted operation is settled as Failed with observation evidence —
+/// 围栏证据：物理状态只读观察结论。
+enum FenceEvidence {
+    /// 状态确定且可观察（附留痕）——该生命周期已有一次完成的变更落地，
+    /// 后继操作可安全重走完整 admission + capture + precondition 流程。
+    Observed(serde_json::Value),
+    /// 观察失败/身份不符/kind 无谓词：保持围栏（保守面不变）。
+    Insufficient,
+}
+
+/// per-kind 证据谓词。判定规则统一为：**物理状态确定（无死执行者在途写）**，
+/// 而非"操作目标已达成"——围栏的职责是防半应用状态上的并发变更，而围栏
+/// 落盘时执行者已携带已知错误返回（`OwnedOperation::fail`），不存在在途
+/// 写；后继操作自带 admission/capture/precondition 防线。
+async fn observe_fence_evidence(
+    state: &AppState,
+    record: &UserAppOperationRecord,
+) -> FenceEvidence {
+    match record.kind {
+        // dev 族：同 app+lifecycle 的存活 builder（指纹无关观察路径——
+        // 被本生命周期另一次操作 ensure 出来的 builder 同样算数，正是
+        // "被取代"情形）。
+        UserAppOperationKind::EnsureBuilder | UserAppOperationKind::AdoptBuilder => {
+            let context = shared_types::UserAppExecutionContext {
+                app_id: record.app_id.clone(),
+                lifecycle_id: record.lifecycle_id.clone(),
+                operation_id: record.operation_id.clone(),
+                executor_id: record
+                    .executor_id
+                    .clone()
+                    .unwrap_or_else(|| "fenced-settler".into()),
+                request_fingerprint: record.request_fingerprint.clone(),
+            };
+            match super::adoption::capture_bound_target(state, &context).await {
+                Ok(target) => FenceEvidence::Observed(serde_json::json!({
+                    "kind": "live_builder",
+                    "workload": target.workload,
+                    "observed_at_us": chrono::Utc::now().timestamp_micros(),
+                })),
+                // 身份不符或 builder 缺失：受保护目标未证实，保持围栏。
+                Err(_) => FenceEvidence::Insufficient,
+            }
+        }
+        // prod 发布族：活代 generation + 运行相位。generation == 本操作 =
+        // 本次 rollout 已落地（app 154 事故形态：patch 后零 pod 窗口捕获
+        // 失败，rollout 事后照常完成）；generation 属后来操作 = 被取代
+        // （与 builder 族"被另一次操作 ensure"同义）。
+        UserAppOperationKind::StartDeployment | UserAppOperationKind::RestartDeployment => {
+            let Ok(spec) = state.runtime().get_app_container_spec(&record.app_id).await else {
+                return FenceEvidence::Insufficient;
+            };
+            let generation = spec
+                .env
+                .as_ref()
+                .and_then(|env| env.get(shared_types::APP_DEPLOY_GENERATION_ID).cloned());
+            let Some(generation) = generation else {
+                return FenceEvidence::Insufficient;
+            };
+            let superseded = generation != record.operation_id;
+            match state.app_service.get_app(&record.app_id).await {
+                Ok(info) if info.phase == "Running" => FenceEvidence::Observed(serde_json::json!({
+                    "kind": if superseded { "superseded_by_newer_generation" }
+                              else { "rollout_completed" },
+                    "live_generation": generation,
+                    "phase": info.phase,
+                    "ready_replicas": info.ready_replicas,
+                    "observed_at_us": chrono::Utc::now().timestamp_micros(),
+                })),
+                // 查询失败或相位未定：保持围栏。
+                _ => FenceEvidence::Insufficient,
+            }
+        }
+        // prod 启停族：相位确定即收束（记录实际相位留痕——目标未达成时
+        // 后继显式操作会重新观测并执行，好于永久挡死）。
+        UserAppOperationKind::Start | UserAppOperationKind::Restart => {
+            match state.app_service.get_app(&record.app_id).await {
+                Ok(info) => FenceEvidence::Observed(serde_json::json!({
+                    "kind": "prod_phase_definite",
+                    "phase": info.phase,
+                    "replicas": info.replicas,
+                    "ready_replicas": info.ready_replicas,
+                    "observed_at_us": chrono::Utc::now().timestamp_micros(),
+                })),
+                Err(_) => FenceEvidence::Insufficient,
+            }
+        }
+        UserAppOperationKind::Stop => match state.app_service.get_app(&record.app_id).await {
+            Ok(info) if info.replicas == 0 => FenceEvidence::Observed(serde_json::json!({
+                "kind": "prod_stopped",
+                "phase": info.phase,
+                "observed_at_us": chrono::Utc::now().timestamp_micros(),
+            })),
+            Ok(info) => FenceEvidence::Observed(serde_json::json!({
+                "kind": "prod_still_running",
+                "phase": info.phase,
+                "replicas": info.replicas,
+                "observed_at_us": chrono::Utc::now().timestamp_micros(),
+            })),
+            Err(_) => FenceEvidence::Insufficient,
+        },
+        _ => FenceEvidence::Insufficient,
+    }
+}
+
+/// Auto-settle a fenced operation whose physical state is verifiably definite:
+/// the interrupted operation is settled as Failed with observation evidence —
 /// never Succeeded, because this operation itself did not complete — which
-/// frees the dev admission slot so the next explicit ensure/start proceeds
-/// normally (test-env app 151/155 incident: a concurrent replica's ensure
-/// was rejected by fingerprint drift and stayed fenced forever, blocking
-/// every chat with "Container operation failed").
+/// frees the admission slot so the next explicit operation proceeds normally.
+/// Covers every kind with an evidence predicate (test-env app 151/155: fenced
+/// EnsureBuilder blocked every chat with "Container operation failed"; app
+/// 154: fenced start_deployment blocked redeploy with ERR_CONFLICT until an
+/// operator ran manual SQL). Identity mismatch or absent resources keep the
+/// fence protected.
 pub(super) async fn reconcile_fenced_ensure(
     state: &AppState,
     snapshot: &UserAppOperationRecord,
 ) -> Result<()> {
-    if snapshot.kind != UserAppOperationKind::EnsureBuilder
-        || snapshot.state != UserAppOperationState::RecoveryRequired
-    {
+    if snapshot.state != UserAppOperationState::RecoveryRequired {
         return Ok(());
     }
     let Some(_local) = super::lifecycle::try_acquire(&snapshot.app_id).await else {
@@ -541,39 +642,19 @@ pub(super) async fn reconcile_fenced_ensure(
         .get_operation(&snapshot.app_id, &snapshot.operation_id)
         .await?;
     let Some(record) = current.filter(|record| {
-        record.state == UserAppOperationState::RecoveryRequired
-            && record.kind == UserAppOperationKind::EnsureBuilder
+        record.state == UserAppOperationState::RecoveryRequired && record.kind == snapshot.kind
     }) else {
         return Ok(());
     };
     let Some(executor_id) = record.executor_id.clone() else {
         return Ok(());
     };
-    let context = shared_types::UserAppExecutionContext {
-        app_id: record.app_id.clone(),
-        lifecycle_id: record.lifecycle_id.clone(),
-        operation_id: record.operation_id.clone(),
-        executor_id,
-        request_fingerprint: record.request_fingerprint.clone(),
-    };
-    // Observation: does a builder bound to THIS app+lifecycle exist? The
-    // capture path validates identity (labels + binding) without involving
-    // the request fingerprint, so a builder ensured by a different operation
-    // of the same lifecycle is accepted — exactly the superseded case.
-    let captured = match super::adoption::capture_bound_target(state, &context).await {
-        Ok(target) => target,
-        // Identity mismatch or absent builder: the fenced outcome stays
-        // protected — nothing here authorizes releasing it.
-        Err(_) => return Ok(()),
-    };
-    let Some(workload) = captured.workload else {
-        return Ok(());
+    let evidence = match observe_fence_evidence(state, &record).await {
+        FenceEvidence::Observed(evidence) => evidence,
+        FenceEvidence::Insufficient => return Ok(()),
     };
     let mut checkpoint = record.checkpoint.clone();
-    checkpoint["superseded_by_live_builder"] = serde_json::json!({
-        "workload": workload,
-        "observed_at_us": chrono::Utc::now().timestamp_micros(),
-    });
+    checkpoint["superseded_by_live_builder"] = evidence;
     state
         .userapp_store
         .advance(&UserAppOperationProgress {
@@ -581,7 +662,7 @@ pub(super) async fn reconcile_fenced_ensure(
             lifecycle_id: record.lifecycle_id.clone(),
             operation_id: record.operation_id.clone(),
             expected_revision: record.revision,
-            executor_id: context.executor_id,
+            executor_id,
             state: UserAppOperationState::Failed,
             step: record.step.clone(),
             checkpoint,
@@ -590,7 +671,7 @@ pub(super) async fn reconcile_fenced_ensure(
                 .clone()
                 .or_else(|| Some("ERR_CONFLICT".into())),
             error_message: Some(format!(
-                "{}; superseded: live builder verified under the same lifecycle",
+                "{}; fence released: physical state verified definite by recovery scanner",
                 record.error_message.as_deref().unwrap_or("ensure fenced")
             )),
         })
@@ -598,7 +679,8 @@ pub(super) async fn reconcile_fenced_ensure(
     tracing::warn!(
         operation_id = %record.operation_id,
         app_id = %record.app_id,
-        "Fenced ensure settled as Failed: live builder verified under the same lifecycle"
+        kind = ?record.kind,
+        "Fenced operation settled as Failed: physical state verified definite"
     );
     Ok(())
 }
@@ -1089,6 +1171,7 @@ mod tests {
             status: "running".into(),
             created_at: chrono::Utc::now(),
             service_url: "http://127.0.0.1:60000".into(),
+            workload_uid: None,
         };
         let evidence = shared_types::BuilderCreationEvidence {
             creation_lease_released: true,
@@ -1297,5 +1380,437 @@ mod tests {
         wait_record(&store, &accepted, Instant::now() + Duration::from_secs(1))
             .await
             .expect("subsequent waiter sees result");
+    }
+}
+
+// ============================================================================
+// P1 围栏证据化收束测试（泛化 per-kind 谓词）
+// ============================================================================
+
+#[cfg(test)]
+mod fence_settler_tests {
+    use super::*;
+    use crate::app_state::AppState;
+    use arc_swap::ArcSwap;
+    use container_runtime_api::{
+        AgentContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult, DeploymentStatus,
+        UserAppDeploymentRuntime, WorkspaceRuntime,
+    };
+    use dashmap::DashMap;
+    use shared_types::{
+        AppResourceIdentity, AppResourceKind, BuilderControlTarget, ServiceType, UserAppAdmission,
+        UserAppAdmissionOutcome, UserAppControlCommand, UserAppOperationKind,
+    };
+    use std::collections::HashMap;
+
+    /// 可控运行态：deployment 相位/副本 + 活代 generation + builder 观察。
+    #[derive(Default)]
+    struct FenceRuntime {
+        status: Mutex<Option<Option<DeploymentStatus>>>,
+        generation: Mutex<Option<String>>,
+        builder_workload: Mutex<Option<String>>,
+    }
+
+    impl FenceRuntime {
+        fn scenario(status: Option<DeploymentStatus>, generation: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                status: Mutex::new(Some(status)),
+                generation: Mutex::new(generation.map(str::to_string)),
+                builder_workload: Mutex::new(None),
+            })
+        }
+    }
+
+    fn status_of(phase: &str, replicas: i32) -> DeploymentStatus {
+        DeploymentStatus {
+            app_id: "fenced".into(),
+            replicas,
+            ready_replicas: replicas,
+            phase: phase.into(),
+            message: None,
+            pod_ip: None,
+            node: None,
+            restart_count: 0,
+            started_at: None,
+            ports: vec![],
+            resource_version: Some("9".into()),
+            recycle_enabled: None,
+            idle_timeout_seconds: None,
+            wake_on_traffic: None,
+            created_at: None,
+            deployment_uid: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentContainerRuntime for FenceRuntime {
+        async fn create_container(
+            &self,
+            _params: container_runtime_api::ContainerCreateParams,
+        ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+            Err(ContainerRuntimeError::ContainerNotFound("fence".into()))
+        }
+        async fn get_container_info(
+            &self,
+            _project_id: &str,
+        ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+            Ok(None)
+        }
+        async fn find_container(
+            &self,
+            _identifier: &str,
+            _service_type: &ServiceType,
+        ) -> ContainerRuntimeResult<Option<container_runtime_api::RuntimeContainerInfo>> {
+            Ok(None)
+        }
+        async fn stop_container(&self, _project_id: &str) -> ContainerRuntimeResult<()> {
+            Ok(())
+        }
+        async fn is_container_running(&self, _project_id: &str) -> ContainerRuntimeResult<bool> {
+            Ok(false)
+        }
+        async fn list_containers(
+            &self,
+        ) -> ContainerRuntimeResult<Vec<container_runtime_api::RuntimeContainerInfo>> {
+            Ok(vec![])
+        }
+        async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> ContainerRuntimeResult<()> {
+            Ok(())
+        }
+        async fn capture_builder_control(
+            &self,
+            context: &shared_types::UserAppExecutionContext,
+        ) -> ContainerRuntimeResult<BuilderControlTarget> {
+            let workload = self.builder_workload.lock().expect("lock").clone();
+            Ok(BuilderControlTarget {
+                resource_binding: None,
+                context: context.clone(),
+                workload: workload.map(|name| AppResourceIdentity {
+                    kind: AppResourceKind::StatefulSet,
+                    name,
+                    uid: "builder-uid".into(),
+                    resource_version: Some("3".into()),
+                }),
+                pod: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceRuntime for FenceRuntime {}
+
+    #[async_trait::async_trait]
+    impl UserAppDeploymentRuntime for FenceRuntime {
+        async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
+            Ok(vec![])
+        }
+        async fn get_deployment_status(
+            &self,
+            _app_id: &str,
+        ) -> ContainerRuntimeResult<Option<DeploymentStatus>> {
+            Ok(self.status.lock().expect("lock").clone().flatten())
+        }
+        async fn get_app_container_spec(
+            &self,
+            _app_id: &str,
+        ) -> ContainerRuntimeResult<container_runtime_api::ContainerSpecSnapshot> {
+            Ok(container_runtime_api::ContainerSpecSnapshot {
+                command: None,
+                env: Some(HashMap::from([(
+                    shared_types::APP_DEPLOY_GENERATION_ID.to_string(),
+                    self.generation
+                        .lock()
+                        .expect("lock")
+                        .clone()
+                        .unwrap_or_else(|| "absent".into()),
+                )])),
+                secrets: None,
+                resources: None,
+                health_check: None,
+                ports: None,
+            })
+        }
+    }
+
+    async fn fence_state(
+        runtime: Arc<FenceRuntime>,
+        kind: UserAppOperationKind,
+        operation_id: &str,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
+        let (adapter, _cleanup_rx) =
+            crate::storage::ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
+        let activity = Arc::new(app_manager::AppActivityRegistry::new(Duration::from_secs(
+            300,
+        )));
+        let manager_config = app_manager::config::AppManagerConfig {
+            access_mode: app_manager::config::AppAccessMode::Docker,
+            ..app_manager::config::AppManagerConfig::default()
+        };
+        let metadata_dir = tempfile::tempdir().expect("metadata directory");
+        let store = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &metadata_dir.path().join("userapp.turso.db"),
+            )
+            .await
+            .expect("store"),
+        );
+        let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(
+            app_manager::service::AppService::new(
+                manager_config,
+                runtime.clone(),
+                activity.clone(),
+                None,
+                store.clone(),
+            )
+            .await
+            .expect("AppService"),
+        );
+        let download_dir = tempfile::tempdir().expect("download directory");
+        let (pod_created_tx, _) = tokio::sync::broadcast::channel(8);
+        let state = Arc::new(AppState {
+            userapp_store: store.clone(),
+            userapp_store_control: store.clone(),
+            userapp_op_flight: Arc::new(
+                crate::userapp_builder::shutdown_gate::OperationFlightGate::default(),
+            ),
+            userapp_recovery_handle: Arc::new(Mutex::new(None)),
+            config: crate::config::AppConfig::default(),
+            projects: Arc::new(crate::storage::ProjectStoreBackend::Memory(Arc::new(
+                adapter,
+            ))),
+            pingora_service: None,
+            grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
+            session_stream_registry: Arc::new(crate::grpc::SessionStreamRegistry::new()),
+            api_key_config: Arc::new(ArcSwap::from_pointee(
+                crate::config::ApiKeyAuthConfig::default(),
+            )),
+            pod_creating: Arc::new(DashMap::new()),
+            pod_created_tx: Arc::new(pod_created_tx),
+            container_prefix_rcoder: "dev-rcoder".to_string(),
+            container_prefix_computer: "computer-agent-runner".to_string(),
+            runtime,
+            cleanup_rx: Arc::new(Mutex::new(None)),
+            agent_download_manager: Arc::new(
+                agent_provisioning::AgentDownloadManager::new(download_dir.path())
+                    .expect("download manager"),
+            ),
+            app_service,
+            activity,
+            cluster_domain: "cluster.local".to_string(),
+        });
+        // 构造围栏记录：admit(Pending) → advance(Running, executor) →
+        // advance(RecoveryRequired, step=runtime_updated)。
+        let lifecycle = store.ensure_identity("fenced").await.expect("identity");
+        // Deploy/Update 族命令携带私有执行输入摘要，必须经 admit_with_input
+        // 受理（digest 与 input 绑定）；其余 kind 用无输入命令。
+        let input = shared_types::UserAppExecutionInput::new("{}".into());
+        let admitted = store
+            .admit_with_input(
+                &UserAppAdmission {
+                    app_id: "fenced".into(),
+                    lifecycle_id: Some(lifecycle.lifecycle_id.clone()),
+                    operation_id: operation_id.into(),
+                    request_id: Some(format!("req-{operation_id}")),
+                    request_fingerprint: "cd".repeat(32),
+                    kind,
+                    command: Some(match kind {
+                        UserAppOperationKind::StartDeployment => UserAppControlCommand::Deploy {
+                            restart: false,
+                            input_digest: input.digest(),
+                        },
+                        UserAppOperationKind::RestartDeployment => UserAppControlCommand::Deploy {
+                            restart: true,
+                            input_digest: input.digest(),
+                        },
+                        UserAppOperationKind::Update => UserAppControlCommand::Update {
+                            input_digest: input.digest(),
+                        },
+                        UserAppOperationKind::Restart => UserAppControlCommand::Restart,
+                        UserAppOperationKind::Stop => UserAppControlCommand::Stop {
+                            wake_on_traffic: true,
+                        },
+                        _ => UserAppControlCommand::Start { traffic: false },
+                    }),
+                    metadata: None,
+                    runtime_policy_on_success: None,
+                },
+                Some(&input),
+            )
+            .await
+            .expect("admit");
+        let record = match admitted {
+            UserAppAdmissionOutcome::Accepted(record) => record,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        store
+            .advance(&UserAppOperationProgress {
+                app_id: record.app_id.clone(),
+                lifecycle_id: record.lifecycle_id.clone(),
+                operation_id: record.operation_id.clone(),
+                expected_revision: record.revision,
+                executor_id: "executor-fenced".into(),
+                state: UserAppOperationState::Running,
+                step: "claimed".into(),
+                checkpoint: serde_json::Value::Null,
+                error_code: None,
+                error_message: None,
+            })
+            .await
+            .expect("claim");
+        let running = store
+            .get_operation("fenced", operation_id)
+            .await
+            .expect("read")
+            .expect("running record");
+        store
+            .advance(&UserAppOperationProgress {
+                app_id: running.app_id.clone(),
+                lifecycle_id: running.lifecycle_id.clone(),
+                operation_id: running.operation_id.clone(),
+                expected_revision: running.revision,
+                executor_id: "executor-fenced".into(),
+                state: UserAppOperationState::RecoveryRequired,
+                step: "runtime_updated".into(),
+                checkpoint: serde_json::json!({"resource": {"container_id": "c1"}}),
+                error_code: Some("ERR_BACKEND_ERROR".into()),
+                error_message: Some(
+                    "Capture explicit database target: Owned management container is not running"
+                        .into(),
+                ),
+            })
+            .await
+            .expect("fence");
+        (state, metadata_dir)
+    }
+
+    async fn settled(state: &Arc<AppState>, operation_id: &str) -> UserAppOperationRecord {
+        state
+            .userapp_store
+            .get_operation("fenced", operation_id)
+            .await
+            .expect("read")
+            .expect("record")
+    }
+
+    /// app 154 事故类：发布 rollout 已完成（活代=本操作、相位 Running）→
+    /// 围栏必须被证据化收束为 Failed（修复前永久卡死，需人工 SQL）。
+    #[tokio::test]
+    async fn start_deployment_fence_settles_when_rollout_completed() {
+        let operation_id = "op-rollout-done";
+        let runtime = FenceRuntime::scenario(Some(status_of("Running", 1)), Some(operation_id));
+        let (state, _dir) =
+            fence_state(runtime, UserAppOperationKind::StartDeployment, operation_id).await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("settle");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(record.state, UserAppOperationState::Failed);
+        assert_eq!(
+            record.checkpoint["superseded_by_live_builder"]["kind"],
+            "rollout_completed"
+        );
+        assert!(
+            record
+                .error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("fence released")),
+            "{:?}",
+            record.error_message
+        );
+    }
+
+    /// 被后续发布取代（活代属别的操作）同样是确定性状态——与 builder 族
+    /// "被另一次操作 ensure" 同义，收束并留痕。
+    #[tokio::test]
+    async fn start_deployment_fence_settles_when_superseded_by_newer_generation() {
+        let operation_id = "op-superseded";
+        let runtime = FenceRuntime::scenario(Some(status_of("Running", 1)), Some("op-newer"));
+        let (state, _dir) =
+            fence_state(runtime, UserAppOperationKind::StartDeployment, operation_id).await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("settle");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(record.state, UserAppOperationState::Failed);
+        assert_eq!(
+            record.checkpoint["superseded_by_live_builder"]["kind"],
+            "superseded_by_newer_generation"
+        );
+    }
+
+    /// 运行态查不到（部署不存在）：证据不足，围栏保持。
+    #[tokio::test]
+    async fn start_deployment_fence_kept_when_deployment_absent() {
+        let operation_id = "op-absent";
+        let runtime = FenceRuntime::scenario(None, Some(operation_id));
+        let (state, _dir) =
+            fence_state(runtime, UserAppOperationKind::StartDeployment, operation_id).await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("scan");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(record.state, UserAppOperationState::RecoveryRequired);
+        assert!(
+            record
+                .checkpoint
+                .get("superseded_by_live_builder")
+                .is_none()
+        );
+    }
+
+    /// 无证据谓词的 kind（Update）：即使运行态可见也保持围栏——保守面
+    /// 不因泛化而扩大。
+    #[tokio::test]
+    async fn unsupported_kind_fence_kept_even_when_running() {
+        let operation_id = "op-update";
+        let runtime = FenceRuntime::scenario(Some(status_of("Running", 1)), Some(operation_id));
+        let (state, _dir) = fence_state(runtime, UserAppOperationKind::Update, operation_id).await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("scan");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(record.state, UserAppOperationState::RecoveryRequired);
+    }
+
+    /// builder 族原语义不回退：存活 builder（指纹无关观察）→ 收束。
+    #[tokio::test]
+    async fn ensure_builder_fence_settles_with_live_builder() {
+        let operation_id = "op-builder-live";
+        let runtime = FenceRuntime::scenario(None, None);
+        *runtime.builder_workload.lock().expect("lock") = Some("rcoder-app-builder-fenced".into());
+        let (state, _dir) =
+            fence_state(runtime, UserAppOperationKind::EnsureBuilder, operation_id).await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("settle");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(record.state, UserAppOperationState::Failed);
+        assert_eq!(
+            record.checkpoint["superseded_by_live_builder"]["kind"],
+            "live_builder"
+        );
+    }
+
+    /// builder 缺失：保持围栏（受保护目标未证实）。
+    #[tokio::test]
+    async fn ensure_builder_fence_kept_when_builder_absent() {
+        let operation_id = "op-builder-absent";
+        let runtime = FenceRuntime::scenario(None, None);
+        let (state, _dir) =
+            fence_state(runtime, UserAppOperationKind::EnsureBuilder, operation_id).await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("scan");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(record.state, UserAppOperationState::RecoveryRequired);
     }
 }

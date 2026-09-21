@@ -307,6 +307,7 @@ async fn lifecycle_contract_container_delete_preserves_changed_association() {
         status: "running".into(),
         created_at: chrono::Utc::now(),
         service_url: "http://old".into(),
+        workload_uid: None,
     };
     let mut identity = p.persistence_identity().clone();
     identity.container = Some(shared_types::persistence::ContainerPersistenceIdentity {

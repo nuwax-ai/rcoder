@@ -56,6 +56,7 @@ pub(super) fn container_row_to_basic(row: &ContainerRow) -> ContainerBasicInfo {
         status: row.status.clone(),
         created_at: row.created_at,
         service_url: row.service_url.clone(),
+        workload_uid: row.workload_uid.clone(),
     }
 }
 

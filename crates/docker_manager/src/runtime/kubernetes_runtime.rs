@@ -1198,6 +1198,7 @@ mod create_lease_tests {
                             user_id: None,
                             pod_id: None,
                             app_id: Some("errclaim".into()),
+                            workload_uid: None,
                         },
                         service_type: ServiceType::UserappBuilder,
                         cached_at: std::time::Instant::now(),

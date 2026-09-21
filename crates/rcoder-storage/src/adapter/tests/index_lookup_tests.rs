@@ -19,6 +19,7 @@ fn test_index_user_id_lookup() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: "http://test".to_string(),
+        workload_uid: None,
     };
 
     let mut info = ProjectAndContainerInfo::from_parts(
@@ -74,6 +75,7 @@ fn test_user_id_index_not_polluted_by_web_project() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: format!("http://{}", cid),
+        workload_uid: None,
     };
 
     // Computer 项目（user_id 索引消费者）
@@ -193,6 +195,7 @@ fn test_find_by_user_id_after_indexed_project_removed() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: "http://shared".to_string(),
+        workload_uid: None,
     };
 
     let mk_proj = |pid: &str| {
@@ -270,6 +273,7 @@ fn test_computer_pod_id_shared_container() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: "http://shared".to_string(),
+        workload_uid: None,
     };
 
     // user-A、user-B 各自一个 Computer 项目，通过 pod_id="pod-shared" 共享容器
@@ -364,6 +368,7 @@ fn test_cross_service_type_no_key_collision() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: format!("http://{name}"),
+        workload_uid: None,
     };
 
     // Computer 项目：user_id="6"，container_name 含 computer 前缀
@@ -453,6 +458,7 @@ fn test_container_recreation_stability() {
             status: "running".to_string(),
             created_at: Utc::now(),
             service_url: "http://c".to_string(),
+            workload_uid: None,
         };
         let mut p = ProjectAndContainerInfo::from_parts(
             "proj-A".to_string(),
@@ -537,6 +543,7 @@ fn test_lookup_source_consistency() {
             status: "running".to_string(),
             created_at: Utc::now(),
             service_url: format!("http://{cid}"),
+            workload_uid: None,
         };
         let mut p = ProjectAndContainerInfo::from_parts(
             "proj-A".to_string(),
@@ -618,6 +625,7 @@ fn test_index_pod_id_lookup() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: "http://test".to_string(),
+        workload_uid: None,
     };
 
     let mut info = ProjectAndContainerInfo::from_parts(
@@ -708,6 +716,7 @@ fn test_find_projects_by_pod_id_multiple_projects() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: "http://shared".to_string(),
+        workload_uid: None,
     };
 
     // 两个 project 共享 pod_id="pod-shared"（RCoder 共享容器模式）
@@ -763,6 +772,7 @@ fn test_index_cleanup_on_remove() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: "http://test".to_string(),
+        workload_uid: None,
     };
 
     let mut info = ProjectAndContainerInfo::from_parts(
@@ -819,6 +829,7 @@ fn test_index_cleanup_on_delete_container_with_projects() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: "http://test".to_string(),
+        workload_uid: None,
     };
 
     let mut info = ProjectAndContainerInfo::from_parts(
@@ -878,6 +889,7 @@ fn test_index_consistency_under_raii() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: "http://shared".to_string(),
+        workload_uid: None,
     };
 
     // 两个 project 共享同一容器（同一 user_id → container_key = user_id）
@@ -1115,6 +1127,7 @@ fn test_computer_family_lookup_shared_container() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: format!("http://{}", cid),
+        workload_uid: None,
     };
 
     // Computer 容器记录（keepalive/ensure 补建时可能存家族值）

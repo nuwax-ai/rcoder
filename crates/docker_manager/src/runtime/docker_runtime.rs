@@ -132,6 +132,7 @@ impl DockerRuntime {
             } else {
                 format!("http://{address}:{}", shared_types::GRPC_DEFAULT_PORT)
             },
+            workload_uid: None,
         };
         let after = self
             .capture_builder_compute_with_binding(context, None, false)
@@ -527,6 +528,7 @@ impl AgentContainerRuntime for DockerRuntime {
                         pod.container_ip,
                         shared_types::GRPC_DEFAULT_PORT
                     ),
+                    workload_uid: None,
                 }))
             }
             // Userapp 兜底：Userapp 通常走 create_deployment/get_deployment_status，
@@ -545,6 +547,7 @@ impl AgentContainerRuntime for DockerRuntime {
                     // 唯一消费方（DockerRuntimeIpResolver）只读 container_ip；
                     // service_url 是 v1 agent 容器遗留字段，此处填空避免每请求死分配
                     service_url: String::new(),
+                    workload_uid: None,
                 }))
             }
         }
@@ -578,6 +581,7 @@ impl AgentContainerRuntime for DockerRuntime {
                 user_id: slots.user_id,
                 pod_id: slots.pod_id,
                 app_id: slots.app_id,
+                workload_uid: None,
             }
         }))
     }
@@ -783,6 +787,7 @@ impl DockerRuntime {
                 user_id: slots.user_id,
                 pod_id: slots.pod_id,
                 app_id: slots.app_id,
+                workload_uid: None,
             });
         }
         Ok(result)

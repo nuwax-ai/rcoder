@@ -436,6 +436,7 @@ mod builder_retry_tests {
                             status: "running".into(),
                             created_at: chrono::Utc::now(),
                             service_url: "http://127.0.0.1:60000".into(),
+                            workload_uid: None,
                         },
                     })
                     .unwrap(),

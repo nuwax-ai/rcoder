@@ -35,6 +35,7 @@ mod tests {
             status: "running".to_string(),
             created_at,
             service_url: format!("http://{}", project_id),
+            workload_uid: None,
         };
 
         Arc::new(ProjectAndContainerInfo::from_parts(
@@ -72,6 +73,7 @@ mod tests {
             status: "running".to_string(),
             created_at,
             service_url: format!("http://{}", pod_id),
+            workload_uid: None,
         };
 
         Arc::new(ProjectAndContainerInfo::from_parts(

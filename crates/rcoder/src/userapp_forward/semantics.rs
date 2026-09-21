@@ -471,6 +471,7 @@ mod authoritative_lookup_tests {
             project_id: None,
             user_id: None,
             pod_id: None,
+            workload_uid: None,
         }
     }
 

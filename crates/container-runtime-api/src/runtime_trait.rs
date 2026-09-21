@@ -326,6 +326,7 @@ pub trait AgentContainerRuntime: Send + Sync {
                 pod.container_ip,
                 shared_types::GRPC_DEFAULT_PORT
             ),
+            workload_uid: None,
         }))
     }
 

@@ -1204,6 +1204,7 @@ fn ready_builder_info(
                 endpoint.address,
                 shared_types::GRPC_DEFAULT_PORT
             ),
+            workload_uid: None,
         },
         identity,
     ))))

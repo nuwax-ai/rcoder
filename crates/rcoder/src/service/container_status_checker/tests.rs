@@ -99,6 +99,7 @@ impl AgentContainerRuntime for ProbeRuntime {
                 user_id: None,
                 pod_id: None,
                 app_id: None,
+                workload_uid: None,
             })),
             FindBehavior::Missing => Ok(None),
             FindBehavior::Fail => Err(ContainerRuntimeError::ConnectionError(
@@ -219,6 +220,7 @@ fn container_info(
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: format!("http://{project_id}"),
+        workload_uid: None,
     };
     Arc::new(ProjectAndContainerInfo::from_parts(
         project_id.to_string(),

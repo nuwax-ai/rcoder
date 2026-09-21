@@ -116,6 +116,7 @@ fn test_concurrent_shared_container_remove() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: "http://shared".to_string(),
+        workload_uid: None,
     };
 
     let info1 = create_shared_project("proj-1", "user-1", &container);
@@ -369,6 +370,7 @@ fn test_shared_container_ref_count_no_leak_under_reinsert() {
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: "http://leak".to_string(),
+        workload_uid: None,
     };
 
     for round in 0..5 {

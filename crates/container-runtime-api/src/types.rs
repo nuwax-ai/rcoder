@@ -482,6 +482,11 @@ pub struct RuntimeContainerInfo {
     pub pod_id: Option<String>,
     /// userapp / userapp-builder 的 app 标识
     pub app_id: Option<String>,
+    /// K8s workload 身份（STS `metadata.uid`，ownerReference 一跳权威派生；
+    /// 注册表零包袱方案 §1.1）：与 Pod UID（container_id）一同捕获。
+    /// Docker 恒 None；Deployment 族（owner 是 ReplicaSet）不在热路径两跳
+    /// 解析——其绑定身份由部署捕获侧写入 userapp 生命周期表。
+    pub workload_uid: Option<String>,
 }
 
 /// 身份槽位组（填充侧的中间结构；单值标识按 [`slots_from_identifier`] 还原）。
@@ -883,6 +888,7 @@ mod identity_tests {
             project_id: None,
             user_id: None,
             pod_id: None,
+            workload_uid: None,
             app_id: Some("app-23".into()),
         };
         assert_eq!(info.identity_key(), Some("app-23"));

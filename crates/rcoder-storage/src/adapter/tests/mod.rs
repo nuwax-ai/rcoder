@@ -43,6 +43,7 @@ fn create_test_info_with_container(
         status: "running".to_string(),
         created_at: Utc::now(),
         service_url: format!("http://{}", container_name),
+        workload_uid: None,
     }));
     info
 }

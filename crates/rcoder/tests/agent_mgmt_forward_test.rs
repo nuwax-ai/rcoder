@@ -319,6 +319,7 @@ fn make_project(addr: SocketAddr) -> ProjectAndContainerInfo {
             status: "running".into(),
             created_at: chrono::Utc::now(),
             service_url: format!("http://{}", addr),
+            workload_uid: None,
         }),
         None,
         None,

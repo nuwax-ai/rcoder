@@ -442,6 +442,7 @@ fn running_builder_info(
         status: "Running".into(),
         created_at,
         service_url: format!("http://{address}:{}", shared_types::GRPC_DEFAULT_PORT),
+        workload_uid: None,
     }))
 }
 

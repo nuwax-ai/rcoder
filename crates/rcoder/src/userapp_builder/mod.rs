@@ -85,6 +85,7 @@ fn refreshed_registration(
         status: String::from(rc.status.clone()),
         created_at: rc.created_at,
         service_url: format!("http://{}:{}", rc.container_ip, existing.internal_port),
+        workload_uid: rc.workload_uid.clone(),
         ..existing.clone()
     };
     (&updated != existing).then_some(updated)
@@ -479,6 +480,7 @@ async fn registered_or_discovered_builder(
         status: String::from(actual.status),
         created_at: actual.created_at,
         service_url: format!("http://{}:{}", actual.container_ip, AGENT_FILE_SERVER_PORT),
+        workload_uid: None,
     };
     adoption::verify_live_builder(state, instance, instance, &info.container_id).await?;
     register_builder(state, instance, &info)?;
@@ -631,6 +633,7 @@ mod remediation_tests {
             status: "Running".to_string(),
             created_at: Utc::now(),
             service_url: format!("http://{ip}:60000"),
+            workload_uid: None,
         }
     }
 
@@ -647,6 +650,7 @@ mod remediation_tests {
             user_id: None,
             pod_id: None,
             app_id: Some("app1".to_string()),
+            workload_uid: None,
         }
     }
 
@@ -672,6 +676,7 @@ mod remediation_tests {
         let existing = ContainerBasicInfo {
             created_at: rc.created_at,
             status: String::from(rc.status.clone()),
+            workload_uid: None,
             ..existing
         };
         assert!(
