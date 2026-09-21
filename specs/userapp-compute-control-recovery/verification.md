@@ -972,3 +972,11 @@ R1 Docker 归档路径在真实链上暴露四层竞态，逐轮修复逐轮验�
 | docker_runtime_crash / sigterm | 同①地址池耗尽（CalledProcessError=compose up 建网失败）；遗留 rcoder-crash-bee781723f7c44ab 项目（2 天前）与 22 个 sqlite/turso 测试网络已清理 | 地址池已释放（网络 31→9），复跑待镜像 |
 
 Docker 遗留清理明细：rcoder-crash-bee781723f7c44ab 项目 down -v；22 个 rcoder-sqlite/turso-* 遗留网络删除。
+
+### 2026-09-21：契约复跑全绿 + deploy_full_chain 终态确认
+
+- turso_compose_recreation：**pass**（网络池清理 + dev-master-rcoder 重建后，run 7a0cda09）。
+- docker_runtime_crash：**pass**（同清理，run dca2c598）。
+- docker_runtime_sigterm：**pass**（需 E2E_TURSO_RUNTIME_IMAGE + SHA256 两 env，run 67a4de57）。
+- Compose 终态：45 场景中 44 逻辑通过（pg_reset 清单已同步待复跑确认）；deploy_full_chain 剩 3 断言 = Qoder 遗留"编排中 Stop 后恢复"app-cli 编排循环（取证见 2026-09-21 深夜批：ABNORMAL_TERMINATION: app-pingap 12s 循环，StartupFailed 修复已让恢复编排启动 pingap 成功，但多实例互踩未闭环），独立于本会话全部修复，已列为下一批最高优先。
+- 新 dev-master-rcoder:latest 二进制 SHA256：e0322e67491d19a9c2bdf99bdada5e7bf49b6df8e22fdeec8ba712f79aa41353。
