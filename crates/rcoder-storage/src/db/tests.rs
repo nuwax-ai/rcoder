@@ -696,3 +696,48 @@ async fn user_shutdown_during_frozen_recovery_completes_and_reports_unrecovered_
     );
     assert!(dropped.load(Ordering::SeqCst));
 }
+
+/// last-drop 语义（契约 last_owner_drop_drains_accepted_job_and_releases_resource
+/// 的 crate 内最小形态）：所有调用方 clone drop（无人调用 shutdown）后，
+/// owner 必须排空已受理事务并释放资源——worker 持有队列 sender 克隆的
+/// 循环引用会让它永不退出。
+#[tokio::test]
+async fn last_owner_drop_drains_admitted_job_and_releases() {
+    let (owner, dropped) = owner().await;
+    let (entered, started) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel::<()>();
+    let handle = tokio::spawn({
+        let owner = owner.clone();
+        async move {
+            owner
+                .execute(move |mut db| async move {
+                    entered.send(()).unwrap();
+                    resumed.await.unwrap();
+                    Probe::create()
+                        .id(9)
+                        .revision(0)
+                        .value("drained")
+                        .exec(&mut db)
+                        .await?;
+                    Ok(())
+                })
+                .await
+        }
+    });
+    started.await.unwrap();
+
+    // Drop every caller-side clone without shutdown: the queue closes and the
+    // owner must drain the admitted job, then release its resource.
+    drop(owner);
+    resume.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !dropped.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "owner must release after last drop"
+    );
+}

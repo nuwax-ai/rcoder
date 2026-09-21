@@ -31,10 +31,15 @@ const REOPEN_PROBE_BACKOFF: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) struct DatabaseOwner {
+    /// 每个调用方克隆各持一份 sender；**绝不与 worker 共享**——最后一份
+    /// clone drop 后队列关闭即触发 owner 排空退出（last-drop 语义）。
+    queue: mpsc::Sender<Job>,
     inner: Arc<Shared>,
 }
+/// Worker 与调用方共享的**无队列引用**状态：worker 若持有 sender 克隆，
+/// 所有调用方 drop 后队列永不关闭，owner 永不退出（资源泄漏——契约
+/// `last_owner_drop_drains_accepted_job_and_releases_resource` 锁定的语义）。
 struct Shared {
-    queue: mpsc::Sender<Job>,
     closing: Mutex<bool>,
     stop: watch::Sender<bool>,
     completion: watch::Receiver<Completion>,
@@ -59,8 +64,8 @@ impl DatabaseOwner {
         let (stop, _) = watch::channel(true);
         let (_, completion) = watch::channel(Some(Ok(())));
         Self {
+            queue,
             inner: Arc::new(Shared {
-                queue,
                 closing: Mutex::new(true),
                 stop,
                 completion,
@@ -88,7 +93,6 @@ impl DatabaseOwner {
         let (finished, completion) = watch::channel(None);
         let (ready, initialized) = oneshot::channel();
         let shared = Arc::new(Shared {
-            queue: queue.clone(),
             closing: Mutex::new(false),
             stop: stop.clone(),
             completion: completion.clone(),
@@ -153,7 +157,10 @@ impl DatabaseOwner {
             drop(wait_for_completion(completion).await);
             return Err(error);
         }
-        Ok(Self { inner: shared })
+        Ok(Self {
+            queue,
+            inner: shared,
+        })
     }
 
     pub(crate) async fn execute<T, F, Fut>(&self, transaction: F) -> anyhow::Result<T>
@@ -196,17 +203,14 @@ impl DatabaseOwner {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database admission lock poisoned"))?;
             anyhow::ensure!(!*closing, "database is closing; job was not admitted");
-            self.inner
-                .queue
-                .try_send(job)
-                .map_err(|error| match error {
-                    mpsc::error::TrySendError::Full(_) => {
-                        anyhow::anyhow!("database queue is full; job was not admitted")
-                    }
-                    mpsc::error::TrySendError::Closed(_) => {
-                        anyhow::anyhow!("database worker is unavailable; job was not admitted")
-                    }
-                })?;
+            self.queue.try_send(job).map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    anyhow::anyhow!("database queue is full; job was not admitted")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    anyhow::anyhow!("database worker is unavailable; job was not admitted")
+                }
+            })?;
         }
         result
             .await
@@ -260,7 +264,10 @@ async fn supervise(
     // unrecovered failure at exit makes the owner report an error.
     let mut pending_failure: Option<String> = None;
     loop {
-        if stop_seen && tasks.is_empty() && queue_drained {
+        // last-drop 语义：队列关闭（所有调用方 clone drop 或显式 stop 关闭）
+        // 且在途排空即退出——不要求 stop 信号（契约
+        // last_owner_drop_drains_accepted_job_and_releases_resource）。
+        if queue_drained && tasks.is_empty() {
             break;
         }
         tokio::select! {
@@ -288,6 +295,15 @@ async fn supervise(
         }
         // Drain complete after a failure: probe the pool for recovery.
         if intake_paused && tasks.is_empty() {
+            // 冻结中所有调用方已放弃（sender 全 drop）：恢复无人等待，
+            // 排空退出（未恢复的失败经 pending_failure 如实上报）。
+            if matches!(
+                queue.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ) {
+                queue_drained = true;
+                continue;
+            }
             match reopen_probe(&db, &mut stop).await {
                 Reopen::Reopened => {
                     if let Ok(mut closing) = shared.closing.lock() {
