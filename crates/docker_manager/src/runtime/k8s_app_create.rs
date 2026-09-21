@@ -1605,7 +1605,7 @@ mod conditional_tests {
             let address = listener.local_addr().expect("address");
             let server = tokio::spawn(async move {
                 let mut winner = serde_json::Value::Null;
-                for request_index in 0..if cancelled { 3 } else { 4 } {
+                for request_index in 0..if cancelled { 3 } else { 5 } {
                     let (mut stream, _) = listener.accept().await.expect("accept");
                     let mut bytes = Vec::new();
                     let mut buffer = [0u8; 2048];
@@ -1634,8 +1634,8 @@ mod conditional_tests {
                     let mut body: serde_json::Value = if length == 0 { serde_json::Value::Null } else {
                         serde_json::from_slice(&bytes[offset..offset + length]).expect("json")
                     };
-                    assert!(head.contains("/configmaps"), "{head}");
-                    let conflict = request_index == 1 || (request_index == 3 && replaced);
+                    assert!(head.contains("/leases"), "{head}");
+                    let conflict = request_index == 1 || (request_index == 4 && replaced);
                     if request_index < 2 {
                         assert!(head.starts_with("POST "));
                         assert!(
@@ -1647,12 +1647,16 @@ mod conditional_tests {
                         assert!(body["metadata"]["annotations"]["rcoder.io/operation-id"].is_null(), "legacy token must not advertise a joinable durable operation");
                         assert_eq!(body["metadata"]["labels"]["rcoder.io/operation-app"], "writer-paused");
                         assert_eq!(body["metadata"]["labels"]["rcoder.io/operation-family"], ServiceType::Userapp.to_string());
+                        assert!(!body["spec"]["holderIdentity"].as_str().expect("holder").is_empty());
                         body["metadata"]["uid"] = "lease-owner".into();
                         body["metadata"]["resourceVersion"] = "42".into();
                         if request_index == 0 { winner = body.clone(); }
-                    } else if request_index == 2 {
+                    } else if request_index == 2 || request_index == 3 {
+                        // 2 = 第二次 acquire 的接管资格探测；3 = release 的
+                        // 身份/实时 RV 重读。两者都回显持有者（renewTime 新鲜
+                        // → 未过期 → 报 InProgress 而非抢占）。
                         assert!(head.starts_with("GET "));
-                        assert!(head.contains("/configmaps/rcoder-operation-prod-writer-paused"));
+                        assert!(head.contains("/leases/rcoder-operation-prod-writer-paused"));
                         assert_eq!(length, 0);
                         body = winner.clone();
                     } else {
@@ -1683,6 +1687,8 @@ mod conditional_tests {
                 Some(writer)
             };
             // The writer is paused after acquiring ownership and before its Deployment POST.
+            // 6885fabd 起冲突读回回退 legacy-operation-id：legacy 持有者的令牌
+            // 必须上报（Some），报 None 会让运维读成"没人持有却锁着"。
             assert!(matches!(
                 runtime
                     .acquire_application_operation("writer-paused", &ServiceType::Userapp)
@@ -1691,7 +1697,7 @@ mod conditional_tests {
                     if operation.app_id == "writer-paused"
                         && operation.service_type == ServiceType::Userapp
                         && operation.resource_name == "rcoder-operation-prod-writer-paused"
-                        && operation.operation_id.is_none()
+                        && operation.operation_id.is_some()
             ));
             if let Some(writer) = writer {
                 let released = writer.release().await;

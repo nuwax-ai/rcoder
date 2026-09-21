@@ -35,3 +35,7 @@ rules:
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # 操作互斥租约（docker_manager k8s_app_operation：acquire/renew/接管/release）
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]

@@ -1091,6 +1091,17 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// Sweep migration-stock operation locks: delete those older than
+    /// `older_than` under uid preconditions and return their names for
+    /// logging. Deletion only releases a stale mutex — it never authorizes
+    /// any mutation. Runtimes without a legacy lock mechanism no-op.
+    async fn sweep_legacy_operation_locks(
+        &self,
+        _older_than: std::time::Duration,
+    ) -> ContainerRuntimeResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Delete only the captured compute identities, never newly discovered resources.
     async fn delete_app_snapshot(
         &self,

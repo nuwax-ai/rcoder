@@ -683,8 +683,11 @@ async fn kubernetes_lease_conflict_fails_fast_without_queueing() {
     .await
     .expect("K8s lease conflict must fail fast without queueing")
     .expect_err("held lease must reject stop");
+    // f49b594d/6885fabd 起租约冲突走 ConflictBlocked（保留 blocker 细节与
+    // legacy 持有者身份的消息）——仍须是快失败的 ERR_CONFLICT 形态。
     assert!(
-        matches!(&error, AppOperationError::Conflict(_)),
+        matches!(&error, AppOperationError::ConflictBlocked { message, .. }
+            if message.contains("occupied") && message.contains("rcoder-operation-prod-k8sbusy")),
         "got: {error}"
     );
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);

@@ -1059,16 +1059,18 @@ mod create_lease_tests {
                 .expect("bind");
             let address = listener.local_addr().expect("address");
             let server = tokio::spawn(async move {
-                // 前 4 个请求：acquire POST ConfigMap → ensure 探测 GET PVC →
+                let mut lease_object = serde_json::Value::Null;
+                // 前 4 个请求：acquire POST Lease → ensure 探测 GET PVC →
                 // claim 读 GET PVC → claim PATCH PVC；缓存场景继续 GET/PATCH Service。
                 for _ in 0..if cached { 6 } else { 4 } {
                     let (mut stream, _) = listener.accept().await.expect("accept");
                     let (head, body) = read_request(&mut stream).await;
-                    if head.starts_with("POST ") && head.contains("/configmaps") {
+                    if head.starts_with("POST ") && head.contains("/leases") {
                         let mut object: serde_json::Value =
                             serde_json::from_slice(&body).expect("acquire body");
                         object["metadata"]["uid"] = "lease-owner".into();
                         object["metadata"]["resourceVersion"] = "42".into();
+                        lease_object = object.clone();
                         write_reply(&mut stream, 200, &object).await;
                     } else if head.starts_with("GET ") && head.contains("persistentvolumeclaims") {
                         write_reply(
@@ -1134,30 +1136,43 @@ mod create_lease_tests {
                         panic!("unexpected request: {head}");
                     }
                 }
-                // 后续请求：失败路径的锁释放 DELETE（本测试的修复断言核心；
-                // 回归时（Err 不释放）此处 accept 超时，saw_release 保持 false）。
+                // 后续请求：失败路径的锁释放 = GET Lease（重读身份/实时 RV）
+                // → DELETE Lease（本测试的修复断言核心；回归时（Err 不释放）
+                // 此处 accept 超时，saw_release 保持 false）。
                 let mut saw_release = false;
                 if let Ok(Ok((mut stream, _))) =
                     tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
                 {
-                    let (head, body) = read_request(&mut stream).await;
+                    let (head, _) = read_request(&mut stream).await;
                     assert!(
-                        head.starts_with("DELETE ")
-                            && head.contains("/configmaps/rcoder-operation-builder-errclaim"),
+                        head.starts_with("GET ")
+                            && head.contains("/leases/rcoder-operation-builder-errclaim"),
                         "{head}"
                     );
-                    let preconditions: serde_json::Value =
-                        serde_json::from_slice(&body).expect("release body");
-                    assert_eq!(preconditions["preconditions"]["uid"], "lease-owner");
-                    assert_eq!(preconditions["preconditions"]["resourceVersion"], "42");
-                    write_reply(
-                        &mut stream,
-                        200,
-                        &serde_json::json!({"apiVersion":"v1","kind":"Status",
-                        "status":"Success","code":200}),
-                    )
-                    .await;
-                    saw_release = true;
+                    write_reply(&mut stream, 200, &lease_object).await;
+                    if let Ok(Ok((mut stream, _))) =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                            .await
+                    {
+                        let (head, body) = read_request(&mut stream).await;
+                        assert!(
+                            head.starts_with("DELETE ")
+                                && head.contains("/leases/rcoder-operation-builder-errclaim"),
+                            "{head}"
+                        );
+                        let preconditions: serde_json::Value =
+                            serde_json::from_slice(&body).expect("release body");
+                        assert_eq!(preconditions["preconditions"]["uid"], "lease-owner");
+                        assert_eq!(preconditions["preconditions"]["resourceVersion"], "42");
+                        write_reply(
+                            &mut stream,
+                            200,
+                            &serde_json::json!({"apiVersion":"v1","kind":"Status",
+                            "status":"Success","code":200}),
+                        )
+                        .await;
+                        saw_release = true;
+                    }
                 }
                 assert_eq!(
                     saw_release, should_release,

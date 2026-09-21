@@ -361,6 +361,13 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .map(Some)
     }
 
+    async fn sweep_legacy_operation_locks(
+        &self,
+        older_than: std::time::Duration,
+    ) -> ContainerRuntimeResult<Vec<String>> {
+        self.sweep_legacy_operation_configmaps(older_than).await
+    }
+
     async fn acquire_builder_family_operation(
         &self,
         app_id: &str,

@@ -30,6 +30,7 @@ def render(c, images, password, registry_auth=None):
         {'apiGroups': ['apps'], 'resources': ['deployments', 'replicasets', 'statefulsets'], 'verbs': ['get', 'list', 'watch', 'create', 'update', 'patch', 'delete']},
         {'apiGroups': ['gateway.networking.k8s.io'], 'resources': ['httproutes'], 'verbs': ['get', 'list', 'watch', 'create', 'update', 'patch', 'delete', 'deletecollection']},
         {'apiGroups': ['events.k8s.io'], 'resources': ['events'], 'verbs': ['create', 'patch']},
+        {'apiGroups': ['coordination.k8s.io'], 'resources': ['leases'], 'verbs': ['create', 'delete', 'get', 'list', 'watch', 'patch', 'update']},
     ]
     obj('Role', 'rcoder', api='rbac.authorization.k8s.io/v1', rules=rules)
     obj('RoleBinding', 'rcoder', api='rbac.authorization.k8s.io/v1',

@@ -105,6 +105,26 @@ pub(crate) fn start_recovery(
                         && let Err(error) = compute::sweep_builder_creation_receipts(state.userapp_store.clone(), state.runtime.clone(), &mut tasks).await {
                         tracing::warn!(%error, "Builder creation receipt sweep failed");
                     }
+                    // 迁移清扫：Lease 化之后 acquire 不再产生 ConfigMap 锁，
+                    // 残存的 rcoder-operation-* ConfigMap 是迁移前存量/孤儿——
+                    // 24h 龄期（覆盖滚动升级窗口）+ uid precondition 删除。
+                    // 只释放陈旧互斥，不授权任何变更。
+                    if sweep_ticks.is_multiple_of(720) {
+                        match state
+                            .runtime
+                            .sweep_legacy_operation_locks(Duration::from_secs(24 * 3600))
+                            .await
+                        {
+                            Ok(names) if !names.is_empty() => {
+                                tracing::info!(count = names.len(), ?names,
+                                    "Legacy ConfigMap operation locks swept");
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, "Legacy operation lock sweep failed");
+                            }
+                        }
+                    }
                     if terminal_first
                         && let Err(error) = discover_terminal_leases(state.userapp_store.clone(), state.runtime.clone(), &mut tasks, &mut terminal_cursor).await {
                         tracing::error!(%error, "UserApp terminal lease scan failed");
