@@ -1,0 +1,364 @@
+//! `POST /api/v1/userapp/db/{dev|prod}/reset-password|create-database`：
+//! Userapp PG 账号/库管理。
+//!
+//! 统一前缀 `/api/v1/userapp/db/*`（路径段区分环境，可滤镜、可扩展）：
+//! - `dev` → 该 app 的 UserappBuilder 开发容器（exec 直达 builder 容器，
+//!   含 PG 就绪等待）
+//! - `prod` → Userapp 运行容器（app_manager runtime exec 通道）；改密不自动唤醒。
+//!
+//! 流程单头 [`shared_types::upsert_pg_user`]/[`create_pg_database`]；密码不落日志。
+//! （PG 凭据对齐不在此面——start 部署链内嵌（请求 `pg.username`/`pg.password`
+//! → 响应 `pg_aligned`），流程单头 `shared_types::align_pg_credentials`
+//! 供 app_manager 函数级消费，独立 HTTP 入口已下线。）
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use axum::Json;
+use axum::extract::{Path, State};
+use tracing::info;
+
+// ExecRunner 方法语法调用所需（trait 本体经 shared_types 全路径引用）
+use shared_types::PgCommandRunner as _;
+use shared_types::UserappStage;
+
+use crate::app_state::AppState;
+use crate::userapp_builder::ensure_userapp_builder_probed;
+use crate::{AppError, HttpResult};
+
+/// rcoder 侧 PG 命令执行通道：`ContainerRuntime::exec`（容器内 `sh -c`）。
+/// rcoder 侧 PG 命令执行通道（对齐 shared_types::db_align 模块契约注释）：
+/// - dev：开发容器内 file-server `execute-command`（HTTP，容器内 `sh -c`
+///   同语义）——`ContainerRuntime::exec` 是 **Userapp 运行容器**的 app_id
+///   语义（目标拼 `rcoder-app-{id}`），传 builder 完整容器名会被再拼一层
+///   前缀致 404，不能用于 dev
+/// - prod：`ContainerRuntime::exec`（app_id → Userapp 运行容器，与
+///   app_manager 的 RuntimeExecRunner 同款）
+pub(super) enum ExecChannel<'a> {
+    DevHttp {
+        /// dev 容器 file-server 基址（`dev_file_server_addr` 产出）
+        base: String,
+        app_id: String,
+    },
+    ProdRuntime {
+        runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
+        app_id: String,
+    },
+}
+
+#[async_trait]
+impl shared_types::PgCommandRunner for ExecChannel<'_> {
+    async fn run(&self, command: &str) -> Result<shared_types::CommandOutcome, String> {
+        match self {
+            Self::DevHttp { base, app_id } => {
+                let resp = crate::http_client::shared_client()
+                    .post(format!("{base}/api/v1/userapp/execute-command"))
+                    .json(&serde_json::json!({
+                        "app_id": app_id,
+                        "command": command,
+                    }))
+                    .timeout(std::time::Duration::from_secs(90))
+                    .send()
+                    .await
+                    .map_err(|e| format!("exec http failed: {e}"))?;
+                let status = resp.status();
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("exec http body: {e}"))?;
+                // execute-command 契约：外层恒 success=true（命令结果由
+                // exit_code 表示）；非 2xx / success=false 是通道层问题
+                if !status.is_success() || body["success"].as_bool() != Some(true) {
+                    return Err(format!(
+                        "execute-command rejected: HTTP {status}: {}",
+                        serde_json::to_string(&body).unwrap_or_else(|_| "<unserializable>".into())
+                    ));
+                }
+                // userapp 域 execute-command 响应键为 snake（exit_code——契约
+                // 测试 userapp_dev.rs:357 锁定）；-1 兜底 = 响应缺字段视为执行失败
+                Ok(shared_types::CommandOutcome {
+                    exit_code: body["exit_code"].as_i64().unwrap_or(-1),
+                    stdout: body["stdout"].as_str().unwrap_or_default().to_string(),
+                    stderr: body["stderr"].as_str().unwrap_or_default().to_string(),
+                })
+            }
+            Self::ProdRuntime { runtime, app_id } => {
+                let r = runtime
+                    .exec(
+                        app_id,
+                        vec!["sh".to_string(), "-c".to_string(), command.to_string()],
+                    )
+                    .await
+                    .map_err(|e| format!("exec failed: {e}"))?;
+                Ok(shared_types::CommandOutcome {
+                    exit_code: r.exit_code,
+                    stdout: r.stdout,
+                    stderr: r.stderr,
+                })
+            }
+        }
+    }
+}
+
+/// 解析 exec 目标并做存在性/就绪校验（"有请求即唤醒"平台语义）：
+/// - dev：`ensure_userapp_builder_probed`（幂等 + 探活自愈——注册缓存指向
+///   stopped/exited 的 Docker builder 时自动重建；pod ensure dev 同款）
+/// - prod：`get_app` 前置（防 ensure_running 对不存在 app 的 AlreadyRunning
+///   幻报）→ `activity.ensure_running` 自动唤醒（single-flight scale-up，
+///   hold-and-wait ≤ wake_timeout 默认 60s；与文件透传/pod ensure prod 同款）
+pub(super) async fn resolve_exec_target<'a>(
+    state: &'a AppState,
+    app_stage: UserappStage,
+    app_id: &str,
+) -> Result<ExecChannel<'a>, AppError> {
+    match app_stage {
+        UserappStage::Dev => {
+            let (info, _recreated) = ensure_userapp_builder_probed(state, app_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "[USERAPP_DB_ADMIN] ensure dev container failed: app_stage=dev, app_id={app_id}: {e:#}"
+                    );
+                    AppError::with_message(
+                        shared_types::error_codes::ERR_CONTAINER_ERROR,
+                        format!("ensure dev container failed: {e:#}"),
+                    )
+                })?;
+            // dev 通道：dev 容器 file-server execute-command（契约见 ExecChannel）
+            let channel = ExecChannel::DevHttp {
+                base: crate::userapp_builder::dev_file_server_addr(state, &info),
+                app_id: app_id.to_string(),
+            };
+            // builder 内 PG 可能刚 initdb（新容器/重建后），等就绪再执行改密命令
+            let wait = channel
+                .run(&shared_types::pg_utils::pg_wait_ready_cmd(60))
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "[USERAPP_DB_ADMIN] wait dev PG ready failed: app_id={app_id}: {e}"
+                    );
+                    AppError::with_message(
+                        shared_types::error_codes::ERR_CONTAINER_ERROR,
+                        format!("wait dev PG ready failed: {e}"),
+                    )
+                })?;
+            if wait.exit_code != 0 {
+                return Err(AppError::with_message(
+                    shared_types::error_codes::ERR_CONTAINER_ERROR,
+                    "dev builder postgres not ready after ensure",
+                ));
+            }
+            Ok(channel)
+        }
+        UserappStage::Prod => {
+            if let Err(e) = state.app_service.get_app(app_id).await {
+                tracing::error!("[USERAPP_DB_ADMIN] prod app not found: app_id={app_id}: {e:#}");
+                // 与 align prod 侧同码（ERR_APP_NOT_FOUND）——同一"应用不存在"语义
+                // 双码（ERR_NOT_FOUND）曾是历史不一致，未上线期统一
+                return Err(AppError::with_message(
+                    shared_types::error_codes::ERR_APP_NOT_FOUND,
+                    format!("userapp prod app not found: {e:#}"),
+                ));
+            }
+            use shared_types::AppWakeControl;
+            match state.activity.ensure_running(app_id).await {
+                shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
+                shared_types::WakeOutcome::Blocked { message, blocker } => {
+                    let mut error =
+                        AppError::with_message(shared_types::error_codes::ERR_CONFLICT, message);
+                    if !blocker.operation_id.is_empty() {
+                        error = error.with_operation_id(blocker.operation_id.clone());
+                    }
+                    return Err(error.with_blocker(blocker));
+                }
+                shared_types::WakeOutcome::Timeout | shared_types::WakeOutcome::Failed(_) => {
+                    tracing::error!("[USERAPP_DB_ADMIN] prod app wake failed: app_id={app_id}");
+                    return Err(AppError::with_message(
+                        shared_types::error_codes::ERR_CONTAINER_ERROR,
+                        "userapp prod app wake failed or timeout (still starting), retry later",
+                    ));
+                }
+            }
+            // 唤醒后容器内 PG 启动窗口：等就绪再交还 exec 通道
+            let channel = ExecChannel::ProdRuntime {
+                runtime: state.runtime(),
+                app_id: app_id.to_string(),
+            };
+            let wait = channel
+                .run(&shared_types::pg_utils::pg_wait_ready_cmd(60))
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "[USERAPP_DB_ADMIN] wait prod PG ready failed: app_id={app_id}: {e}"
+                    );
+                    AppError::with_message(
+                        shared_types::error_codes::ERR_CONTAINER_ERROR,
+                        format!("wait prod PG ready failed: {e}"),
+                    )
+                })?;
+            if wait.exit_code != 0 {
+                return Err(AppError::with_message(
+                    shared_types::error_codes::ERR_CONTAINER_ERROR,
+                    "userapp prod postgres not ready after wake",
+                ));
+            }
+            Ok(ExecChannel::ProdRuntime {
+                runtime: state.runtime(),
+                app_id: app_id.to_string(),
+            })
+        }
+    }
+}
+
+/// 账号/库管理流程错误的错误码映射（类型化 variant 匹配，与 db_align 的
+/// 对齐错误映射同构）。
+fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
+    use shared_types::DbAdminError as E;
+    match err {
+        E::InvalidInput(_) => shared_types::error_codes::ERR_VALIDATION,
+        E::AlreadyExists(_) => shared_types::error_codes::ERR_CONFLICT,
+        E::Command { .. } => shared_types::error_codes::ERR_CONTAINER_ERROR,
+    }
+}
+
+/// `POST /api/v1/userapp/db/{app_stage}/reset-password`
+#[utoipa::path(
+    post,
+    path = "/api/v1/userapp/db/{app_stage}/reset-password",
+    request_body = shared_types::UserappDbResetPasswordRequest,
+    params(
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）内的 PG；`prod`=运行容器（Userapp）内的 PG")
+    ),
+    responses(
+        (status = 200, description = "HttpResult：成功表示密码已设置且 TCP 验证成功；失败检查 code/message/operation_id，非法输入 ERR_VALIDATION、身份或操作冲突 ERR_CONFLICT、后端失败 ERR_BACKEND_ERROR。未知结果保持保护", body = HttpResult<String>)
+    ),
+    tag = "Userapp · 双态 · 数据库",
+    operation_id = "userapp_db_reset_password",
+    summary = "重置/创建 PG 账号密码",
+    description = r#"
+设置目标容器内 PG 的账号密码，两种语义：
+
+- **不带 username**：目标为 PGDATA 中持久化的初始化管理员；
+- **带 username**：账号 upsert——角色存在则 ALTER USER 改密，不存在则 CREATE ROLE
+  建号后再设密。
+
+dbx 预置连接为容器内 local-pg socket 免密（与改密链解耦——改密不影响 dbx 访问）。
+prod 环境需要目标容器已运行；未运行时明确返回错误，由用户先启动容器。
+
+运行账号也可直接改密。此接口不重启应用或容器，不主动断开现有数据库会话。
+已认证会话继续使用；后续采用密码认证的新连接必须使用新密码。应用连接配置更新及重启由用户决定。
+request_id 用于原请求重放，lifecycle_id 用于拒绝已换代应用；建议调用方始终传入两者。
+受理后的协调任务不会因 HTTP 断连而取消。写结果未知时保留操作与租约，不能换 request_id 重试绕过。
+成功表示数据库已确认写入且 TCP 凭据验证通过；密码不进入操作记录或错误响应。
+"#,
+)]
+pub(crate) async fn reset_password(
+    State(state): State<Arc<AppState>>,
+    Path(app_stage): Path<String>,
+    Json(body): Json<shared_types::UserappDbResetPasswordRequest>,
+) -> Result<HttpResult<String>, AppError> {
+    let app_stage = UserappStage::parse(&app_stage)
+        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    body.validate().map_err(|e| AppError::bad_request(&e))?;
+
+    super::db_password::execute(state, app_stage, body)
+        .await
+        .map(HttpResult::success)
+}
+
+/// Reconcile or cancel the original uncertain password write on its captured target.
+#[utoipa::path(
+    post,
+    path = "/api/v1/userapp/db/{app_stage}/reset-password/recover",
+    request_body = shared_types::UserappDbPasswordRecoveryRequest,
+    params(("app_stage" = String, Path, description = "Original environment: dev or prod")),
+    responses(
+        (status = 200, description = "HttpResult：成功时检查 data.state 和 lease_cleanup_pending；失败时检查 ERR_VALIDATION、ERR_CONFLICT 或 ERR_BACKEND_ERROR。身份、回执或 TCP 验证未确认时保持保护", body = HttpResult<shared_types::UserappDbPasswordRecoveryResponse>)
+    ),
+    tag = "Userapp · 双态 · 数据库",
+    operation_id = "userapp_db_recover_password",
+    summary = "确认或取消原改密操作",
+    description = "显式恢复：携带原请求（包括原 request_id 和密码）、lifecycle_id、operation_id、expected_revision。已提交的 PG 事务经 TCP 验证后记 Succeeded；未提交的请求通过事务墓碑阻止迟到写入，记 Failed。不会重新改密、启动或替换容器。旧版本无事务回执协议的操作拒绝自动恢复。终态重放返回同一结果；lease_cleanup_pending 表示仅原租约清理待完成。"
+)]
+pub(crate) async fn recover_password(
+    State(state): State<Arc<AppState>>,
+    Path(app_stage): Path<String>,
+    Json(body): Json<shared_types::UserappDbPasswordRecoveryRequest>,
+) -> Result<HttpResult<shared_types::UserappDbPasswordRecoveryResponse>, AppError> {
+    let stage = UserappStage::parse(&app_stage)
+        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    super::db_password::recover(state, stage, body)
+        .await
+        .map(HttpResult::success)
+}
+
+/// Reconcile an uncertain explicit deployment password write under its original operation.
+#[utoipa::path(
+    post,
+    path = "/api/v1/userapp/deploy-pg/recover",
+    request_body = shared_types::UserappDeployPgRecoveryRequest,
+    responses(
+        (status = 200, description = "HttpResult：成功时检查 data.state/data.stage；失败时检查 ERR_VALIDATION、ERR_CONFLICT 或 ERR_BACKEND_ERROR。回执未确认、物理目标被替换或 TCP 验证失败时保持保护", body = HttpResult<shared_types::UserappDeployPgRecoveryResponse>)
+    ),
+    tag = "Userapp · 双态 · 数据库",
+    operation_id = "userapp_deploy_pg_recover",
+    summary = "确认或取消原显式部署改密写入",
+    description = "仅当原操作已进入 RecoveryRequired，沿原部署操作身份恢复；Running 操作仍可能执行后续步骤，拒绝取消回执和释放租约。显式部署携带 `pg` 输入的改密写结果未知（断连/协调器中断/checkpoint 提交失败）时：携带 app_id/lifecycle_id/operation_id/expected_revision 与原 pg 的 username/password。已提交的事务经回执+TCP 验证确认；未提交的通过取消墓碑阻止迟到写入。两种结果都终局为 Failed——部署本身未记录完成证据，需重发部署（已确认的密码不会再次改写）。不会重新执行密码写、重新部署、启动或替换容器；旧版本无事务回执协议的操作拒绝自动恢复。终态重放返回同一结果；lease_cleanup_pending 表示仅原租约清理待完成。"
+)]
+pub(crate) async fn recover_deploy_pg(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<shared_types::UserappDeployPgRecoveryRequest>,
+) -> Result<HttpResult<shared_types::UserappDeployPgRecoveryResponse>, AppError> {
+    super::db_password::recover_deploy_pg(state, body)
+        .await
+        .map(HttpResult::success)
+}
+
+/// `POST /api/v1/userapp/db/{app_stage}/create-database`
+#[utoipa::path(
+    post,
+    path = "/api/v1/userapp/db/{app_stage}/create-database",
+    request_body = shared_types::UserappDbCreateDatabaseRequest,
+    params(
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）内的 PG；`prod`=运行容器（Userapp）内的 PG")
+    ),
+    responses(
+        (status = 200, description = "HttpResult：成功表示数据库已创建；非法输入 ERR_VALIDATION、已有数据库 ERR_CONFLICT、执行失败 ERR_CONTAINER_ERROR。错误通过 code/message 返回", body = HttpResult<String>)
+    ),
+    tag = "Userapp · 双态 · 数据库",
+    operation_id = "userapp_db_create_database",
+    summary = "新建 PG 数据库",
+    description = r#"
+在目标容器的 PG 里建库（API 化建库，Java/CI 自动化场景免手工 psql）：
+
+- 先查 `pg_database` 再 CREATE（check-then-act；409 已存在含并发竞态复检，
+  不靠 stderr 文本判定）；
+- `owner` 可选：库属主账号（须已存在）；缺省 = 执行者 superuser；
+- 标识符白名单校验 `[A-Za-z0-9_]`（app_id/database/owner 全过，防注入）；
+- prod 环境 stopped 自动唤醒并等待 PG 就绪。
+
+普通数据操作建议走 dbx 控制台 / 业务迁移脚本，本接口面向"建库"这一步编排。
+"#,
+)]
+pub(crate) async fn create_database(
+    State(state): State<Arc<AppState>>,
+    Path(app_stage): Path<String>,
+    Json(body): Json<shared_types::UserappDbCreateDatabaseRequest>,
+) -> Result<HttpResult<String>, AppError> {
+    let app_stage = UserappStage::parse(&app_stage)
+        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    body.validate().map_err(|e| AppError::bad_request(&e))?;
+
+    let runner = resolve_exec_target(&state, app_stage, &body.app_id).await?;
+    shared_types::create_pg_database(&runner, &body.database, body.owner.as_deref())
+        .await
+        .map_err(|e| AppError::with_message(db_admin_error_code(&e), e.to_string()))?;
+    info!(
+        "[USERAPP_DB_ADMIN] database created: app_stage={}, app_id={}, database={}, owner={:?}",
+        app_stage.as_str(),
+        body.app_id,
+        body.database,
+        body.owner
+    );
+    Ok(HttpResult::success("数据库已创建".to_string()))
+}

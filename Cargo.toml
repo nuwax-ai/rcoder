@@ -5,6 +5,7 @@ resolver = "2"
 
 default-members = [
     "crates/rcoder",
+    "crates/rcoder-engine",
     "crates/rcoder-storage",
     "crates/agent_runner",
     "crates/shared_types",
@@ -325,6 +326,7 @@ shared_types_i18n = { path = "crates/shared_types_i18n" }
 # Custom Page 预览协调器（进程内权威存储 + 契约测试套件；协调服务对象批次 2 接入）
 preview-coordinator = { path = "crates/preview-coordinator" }
 rcoder-storage = { path = "crates/rcoder-storage" }
+rcoder-engine = { path = "crates/rcoder-engine" }
 agent_config = { path = "crates/agent_config" }
 agent_abstraction = { path = "crates/agent_abstraction" }
 agent_provisioning = { path = "crates/agent_provisioning" }

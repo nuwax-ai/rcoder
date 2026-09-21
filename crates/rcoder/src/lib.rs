@@ -1,43 +1,26 @@
 //! rcoder 库
 //!
-//! 提供 ACP 协议集成和 AI 代理管理功能
-
-// 单树化：全部模块在 lib 树声明唯一一份（bin 的 main.rs 只做编排入口经 `rcoder::`
-// 引用）——消灭 lib/bin 双树对同一源文件的双份编译与类型分裂；config 的
-// load_config* 消费者（bootstrap/config_watcher）进 lib 树后 dead_code 自然消失。
-pub mod app_state;
-pub mod background_tasks;
-pub mod batch_migrate;
-pub mod bootstrap;
-pub mod cleanup_task;
-pub mod config;
-pub mod config_watcher;
+//! Phase 0 后 rcoder = HTTP 面（handler/router/middleware/server，Phase 1 迁
+//! http-server）+ 组合根（main.rs 经 `rcoder::` 引用）。引擎模块已整体迁
+//! `rcoder-engine` crate，此处 re-export 保持 `crate::X` 路径兼容——HTTP 层
+//! 与 bin 的既有引用零改动，行为零变化。
 /// dial9 事件级 Tokio tracing 装配（`dial9` feature 专用；bin 的 main 手动
 /// 构建 runtime 时经 `rcoder::dial9_obs` 调用，须 pub）
 #[cfg(feature = "dial9")]
-pub mod dial9_obs;
-pub mod docker_init;
-pub mod file_server_admin;
-pub mod file_server_embed;
-pub mod grpc;
+pub use rcoder_engine::dial9_obs;
+pub use rcoder_engine::{
+    app_state, background_tasks, batch_migrate, bootstrap, cleanup_task, config, config_watcher,
+    docker_init, file_server_admin, file_server_embed, grpc, http_client, preview_assembly,
+    proxy_init, service, shutdown, skill_sync_reconciler, storage, userapp_builder,
+    userapp_forward, userapp_recycle, utils, vnc, workspace_migrate,
+};
+
+// HTTP 面（Phase 1 迁 http-server）
 pub mod handler;
-pub mod http_client;
 pub mod middleware;
-pub mod preview_assembly;
-pub mod proxy_init;
 pub mod router;
 pub mod router_docs;
 pub mod server;
-pub(crate) mod service;
-pub mod shutdown;
-pub mod skill_sync_reconciler;
-pub mod storage;
-pub mod userapp_builder;
-pub mod userapp_forward;
-pub(crate) mod userapp_recycle;
-pub(crate) mod utils;
-pub mod vnc;
-pub(crate) mod workspace_migrate;
 
 // 重新导出主要的类型和函数
 pub use storage::{ProjectAdapter, ProjectStore, ProjectStoreBackend};

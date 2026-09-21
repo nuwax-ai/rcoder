@@ -1,47 +1,44 @@
 [package]
-name = "rcoder"
+name = "rcoder-engine"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [package.metadata.dist]
 dist = false
 
 [lib]
-name = "rcoder"
+name = "rcoder_engine"
 path = "src/lib.rs"
 
 [features]
 default = ["userapp-turso"]
 
-# 调试功能：启用 /debug/* 路由，用于开发和问题排查
-# 生产环境默认不启用，需要显式添加 --features debug
-debug = []
-
 # Hotpath 本地性能剖析（hotpath-rs；仅本地开发，不进 default）。
 # feature 关闭时 hotpath 宏全部 no-op、零依赖编译，代码里宏裸用不配 cfg。
-# axum-0-8 供 router 装配处 hotpath::axum!（关闭时原样返回 router）；
+# axum-0-8 供 userapp_forward 路由装配处 hotpath::axum!（关闭时原样返回 router）；
 # tokio 供 hotpath::tokio_runtime!() runtime 指标线程。
 hotpath = ["hotpath/hotpath", "hotpath/threads", "hotpath/tokio", "hotpath/axum-0-8"]
-# 不启用 hotpath-alloc：Turso 使用自己的全局分配器；保留耗时分析与 MCP。
 # 叠加 MCP server（127.0.0.1:6771，AI 实时查询性能数据；见 AGENTS.md）
 hotpath-mcp = ["hotpath", "hotpath/hotpath-mcp"]
 
-# dial9 事件级 Tokio tracing（引擎侧装配已迁 rcoder-engine，此处转发 feature；
-# dial9_obs 经引擎 re-export 供 bin 调用）。
-dial9 = ["rcoder-engine/dial9"]
+# dial9 事件级 Tokio tracing（本地开发专用；编译须配 RUSTFLAGS="--cfg tokio_unstable"
+# 才有全量 task 覆盖——见 make/dev.mk dial9-on 与 docker/dev-hot-build.sh）。
+# 运行期 DIAL9_ENABLED 开关（默认关=纯 passthrough runtime，零开销）。
+dial9 = ["dep:dial9"]
 
 # Kubernetes 支持：启用 Kubernetes 运行时模式
 # 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
-userapp-turso = ["rcoder-engine/userapp-turso"]
+userapp-turso = ["rcoder-storage/userapp-turso"]
 
-kubernetes = ["rcoder-engine/kubernetes"]
+kubernetes = ["rcoder-storage/pg", "docker_manager/kubernetes", "shared_types/kubernetes", "app_manager/kubernetes", "file-server/kubernetes", "kube", "k8s-openapi"]
 
 # Agent 项目/会话 PostgreSQL 后端；运行期由 [storage].backend 选择。
 # userApp 后端独立配置，不因 Agent 仍使用 memory 而回退到内存。
-rcoder-pg = ["rcoder-engine/rcoder-pg"]
+rcoder-pg = ["kubernetes", "rcoder-storage/pg"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -69,8 +66,8 @@ app_manager = { path = "../app_manager" }
 # 🚀 无锁配置热更新
 arc-swap = { workspace = true }
 docker_manager = { workspace = true }
-rcoder-engine = { workspace = true }
 rcoder-telemetry = { workspace = true }
+dial9 = { workspace = true, optional = true }
 
 clap = { workspace = true }
 async-trait = { workspace = true }
