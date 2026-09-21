@@ -172,11 +172,11 @@ mod tests {
     #[test]
     fn document_contains_every_registered_operation() {
         let document = generated_document();
-        // 73 = TS 对齐域全量（镜像族+build+dev）+ /fs/roots + /fs/children
-        // （对齐 TS 1.4.5 目录浏览）。userApp 域 33 条已拆至
-        // file-server-userapp crate（其 routes.rs 测试守卫）。路由增删须同步本计数
-        // （防"注册了但没进文档"回归）。
-        assert_eq!(document.paths.paths.len(), 73);
+        // 74 = TS 对齐域全量（镜像族+build+dev）+ /fs/roots + /fs/children
+        // （对齐 TS 1.4.5 目录浏览）+ /get-file-meta（TS 1.5.0）。userApp 域
+        // 33 条已拆至 file-server-userapp crate（其 routes.rs 测试守卫）。路由
+        // 增删须同步本计数（防"注册了但没进文档"回归）。
+        assert_eq!(document.paths.paths.len(), 74);
         assert!(document.paths.paths.contains_key("/"));
         assert!(document.paths.paths.contains_key("/api/build/start-dev"));
         assert!(document.paths.paths.contains_key("/api/git/commit"));
@@ -191,6 +191,12 @@ mod tests {
                 .paths
                 .paths
                 .contains_key("/api/computer/generate-file")
+        );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/computer/get-file-meta")
         );
         assert!(
             document

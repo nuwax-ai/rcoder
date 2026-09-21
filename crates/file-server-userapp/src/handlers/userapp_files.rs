@@ -12,9 +12,9 @@ use serde_json::{Value, json};
 
 use crate::UserAppState;
 use crate::models::{
-    UserappFileEntry, UserappFileListQuery, UserappFilesUpdateBody, UserappGenerateFileBody,
-    UserappImportProjectForm, UserappResolveFileQuery, UserappSearchFilesQuery,
-    UserappUploadFileForm, UserappUploadFilesForm,
+    UserappFileEntry, UserappFileListQuery, UserappFileMetaBody, UserappFilesUpdateBody,
+    UserappGenerateFileBody, UserappImportProjectForm, UserappResolveFileQuery,
+    UserappSearchFilesQuery, UserappUploadFileForm, UserappUploadFilesForm,
 };
 use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
@@ -22,7 +22,10 @@ use file_server::ops::files::files_update_core;
 use file_server::ops::files::{
     BatchUploadItem, generate_file_core, import_project_core, upload_file_core, upload_files_core,
 };
-use file_server::ops::files_read::{get_file_list_core, resolve_file_core, search_files_core};
+use file_server::ops::files_read::{
+    effective_file_meta_max_batch, get_file_list_core, get_file_meta_core, resolve_file_core,
+    search_files_core,
+};
 use file_server::ops::multipart::{file_field, text_field, validate_zip_ext};
 use file_server::service::code as code_service;
 use file_server::service::temp_file::TemporaryFile;
@@ -151,6 +154,70 @@ pub(crate) async fn search_files(
         "truncated": r.truncated,
         "visited": r.visited,
     })))
+}
+
+// ── get-file-meta ───────────────────────────────────────────────────────────────
+
+/// 批量查询文件元数据（大小/mtime/MIME 等）
+///
+/// 对齐 computer 域 get-file-meta（TS 1.5.0 getFileMeta）：与 get-file-list
+/// 解耦按需查询，`file_paths` 为相对 workspace 根的路径数组（通常为
+/// get-file-list 返回的 name）。响应 `{ success, metas[] }`——条目含
+/// `path/is_dir/is_link/size/mtime_ms/extension/mime_type/link_target/
+/// child_count`；单条失败仅该条带 `error`、其余字段 null，不影响整批；
+/// 目录 `size/extension/mime_type` 恒 null，`child_count` 可见性与
+/// get-file-list 同口径（1000 截断）。`file_meta_max_batch` 缺省 100、
+/// 服务端硬顶 1000，超限 400。
+#[utoipa::path(
+    post,
+    path = "/get-file-meta",
+    request_body = UserappFileMetaBody,
+    responses(file_server::openapi::JsonApiResponses),
+    tag = "Userapp · 双态 · 文件镜像"
+)]
+pub(crate) async fn get_file_meta(
+    State(state): State<UserAppState>,
+    Json(body): Json<UserappFileMetaBody>,
+) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(file_server::error::from_garde)?;
+    // 非空与上限联合校验 (对齐 computer 域同款位置与消息)
+    if body.file_paths.is_empty() {
+        return Err(AppError::validation("filePaths must be a non-empty array"));
+    }
+    let max_batch = effective_file_meta_max_batch(body.file_meta_max_batch);
+    if body.file_paths.len() > max_batch {
+        return Err(AppError::validation(format!(
+            "filePaths batch size {} exceeds limit {max_batch}",
+            body.file_paths.len()
+        )));
+    }
+    let path = resolve_userapp_dev(
+        &body.app_id,
+        body.custom_target_dir.as_deref(),
+        &state.fs.config,
+    )?;
+    let metas = get_file_meta_core(&state.fs, &path, &body.file_paths).await?;
+    let metas: Vec<Value> = metas
+        .iter()
+        .map(|m| {
+            let mut obj = json!({
+                "path": m.path,
+                "is_dir": m.is_dir,
+                "is_link": m.is_link,
+                "size": m.size,
+                "mtime_ms": m.mtime_ms,
+                "extension": m.extension,
+                "mime_type": m.mime_type,
+                "link_target": m.link_target,
+                "child_count": m.child_count,
+            });
+            if let Some(error) = &m.error {
+                obj["error"] = json!(error);
+            }
+            obj
+        })
+        .collect();
+    Ok(Json(json!({ "success": true, "metas": metas })))
 }
 
 // ── files-update ────────────────────────────────────────────────────────────────
@@ -731,5 +798,115 @@ mod tests {
         );
         // 路径穿越拒绝
         assert!(resolve_userapp_dev("../escape", None, &config).is_err());
+    }
+
+    // ── get_file_meta 镜像测试 (对齐 computer 域, snake 键) ──────────────────────
+
+    /// 元数据种子: 开发卷 {root}/{app_id}/ 下 a.txt + sub/(c.txt + .hidden +
+    /// node_modules/) + unix 软链 link→a.txt。
+    async fn seed_meta_volume(userapp_root: &std::path::Path) {
+        let ws = userapp_root.join("app-meta");
+        tokio::fs::create_dir_all(ws.join("sub").join("node_modules"))
+            .await
+            .unwrap();
+        tokio::fs::write(ws.join("a.txt"), "abc").await.unwrap();
+        tokio::fs::write(ws.join("sub").join("c.txt"), "c")
+            .await
+            .unwrap();
+        tokio::fs::write(ws.join("sub").join(".hidden"), "h")
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", ws.join("link")).unwrap();
+    }
+
+    fn snake_meta_of<'a>(val: &'a Value, path: &str) -> &'a Value {
+        val["metas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["path"].as_str() == Some(path))
+            .unwrap_or_else(|| panic!("meta {path} missing"))
+    }
+
+    /// snake 键镜像 + app_id 定位开发卷 + childCount 口径 (隐藏/排除不计)。
+    #[tokio::test]
+    async fn get_file_meta_mirror_snake_keys_and_visibility() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        seed_meta_volume(tmp.path()).await;
+        let res = get_file_meta(
+            State(state),
+            Json(UserappFileMetaBody {
+                app_id: "app-meta".into(),
+                file_paths: vec!["a.txt".into(), "sub".into(), "nope.txt".into()],
+                file_meta_max_batch: None,
+                custom_target_dir: None,
+            }),
+        )
+        .await
+        .expect("meta ok");
+        let val = res.0;
+        assert_eq!(val["success"], json!(true));
+        // 常规文件: snake 键 is_dir/size/extension/mime_type, 无 error 键
+        let f = snake_meta_of(&val, "a.txt");
+        assert_eq!(f["is_dir"], json!(false));
+        assert_eq!(f["size"], json!(3));
+        assert_eq!(f["extension"], json!("txt"));
+        assert_eq!(f["mime_type"], json!("text/plain"));
+        assert!(f["mtime_ms"].as_f64().unwrap() > 0.0);
+        assert!(f.get("error").is_none());
+        // 目录: size/extension/mime_type null; childCount 只计可见 (c.txt,
+        // .hidden 隐藏、node_modules 排除)
+        let d = snake_meta_of(&val, "sub");
+        assert_eq!(d["child_count"], json!(1));
+        assert_eq!(d["size"], json!(null));
+        // 不存在: 该条 error、其余 null, 不影响整批
+        let missing = snake_meta_of(&val, "nope.txt");
+        assert!(missing["error"].as_str().is_some_and(|e| !e.is_empty()));
+        assert_eq!(missing["size"], json!(null));
+    }
+
+    /// 软链: is_link 如实 + link_target 回显 (lstat 不跟随)。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_file_meta_mirror_symlink_link_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        seed_meta_volume(tmp.path()).await;
+        let res = get_file_meta(
+            State(state),
+            Json(UserappFileMetaBody {
+                app_id: "app-meta".into(),
+                file_paths: vec!["link".into()],
+                file_meta_max_batch: None,
+                custom_target_dir: None,
+            }),
+        )
+        .await
+        .expect("meta ok");
+        let l = snake_meta_of(&res.0, "link");
+        assert_eq!(l["is_link"], json!(true));
+        assert_eq!(l["link_target"], json!("a.txt"));
+    }
+
+    /// 超批量 → 400 (与 computer 域同款校验)。
+    #[tokio::test]
+    async fn get_file_meta_mirror_rejects_over_limit_batch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        let err = get_file_meta(
+            State(state),
+            Json(UserappFileMetaBody {
+                app_id: "app-meta".into(),
+                file_paths: vec!["a".into(), "b".into(), "c".into()],
+                file_meta_max_batch: Some(2),
+                custom_target_dir: None,
+            }),
+        )
+        .await
+        .err()
+        .expect("should reject");
+        assert!(err.to_string().contains("exceeds limit"));
     }
 }

@@ -19,11 +19,12 @@ use utoipa_swagger_ui::SwaggerUi;
 /// 内部路由 path（file-server-proxy 分流代理的上游镜像接口）：路由保留、对外
 /// 文档不暴露——Java 同事调 computer 域同名接口，带 `x-service-type: userapp`
 /// header 经 60000 分流代理内部路由到这些；直接暴露会让调用方绕过分流契约。
-const INTERNAL_USERAPP_PATHS: [&str; 22] = [
+const INTERNAL_USERAPP_PATHS: [&str; 23] = [
     "/api/v1/userapp/download-all-files",
     "/api/v1/userapp/files-update",
     "/api/v1/userapp/generate-file",
     "/api/v1/userapp/get-file-list",
+    "/api/v1/userapp/get-file-meta",
     "/api/v1/userapp/import-project",
     "/api/v1/userapp/execute-command",
     "/api/v1/userapp/push-skills-to-workspace",

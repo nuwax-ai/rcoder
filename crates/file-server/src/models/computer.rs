@@ -206,6 +206,54 @@ pub struct SearchFilesQuery {
     pub timeout_ms: String,
 }
 
+/// `get-file-meta` 请求体（对齐 TS 1.5.0 getFileMeta）。`filePaths` 非空与
+/// 批量上限（≤fileMetaMaxBatch，缺省 100/硬顶 1000）的联合校验在 handler。
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[garde(allow_unvalidated)]
+#[serde(rename_all = "camelCase")]
+pub struct GetFileMetaBody {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub c_id: String,
+    /// 相对目标根的路径数组（通常为 get-file-list 返回的 name）
+    pub file_paths: Vec<String>,
+    /// 单次批量上限（可选，JSON number；缺省 100，服务端硬顶 1000。仅收
+    /// number——TS 对非数值静默回落缺省，我方 fail-fast 400，刻意分歧）
+    #[serde(default)]
+    #[garde(skip)]
+    pub file_meta_max_batch: Option<u64>,
+    /// 自定义目标目录 (可选；非空时直接以该目录为根)
+    #[serde(default)]
+    #[garde(skip)]
+    pub custom_target_dir: Option<String>,
+    /// 用户维度工作目录（可选；跨平台绝对路径，非空时优先于默认定位，对齐 TS 1.4.5）
+    #[serde(default)]
+    #[garde(skip)]
+    pub workspace_path: Option<String>,
+    /// serviceContext 通道：工作空间定位类型（userApp/pageApp/normalProject/
+    /// taskAgent，大小写不敏感；header `x-workspace-type` 优先（回退
+    /// `x-service-type`）——收口层合并，对齐 TS 88a1827；wire 双名兼容：
+    /// `workspaceType`（新）/`serviceType`（旧））
+    #[serde(default)]
+    #[garde(skip)]
+    pub service_type: Option<String>,
+    /// 工作空间定位类型（R06：独立语义，不与 serviceType 合并——header
+    /// `x-workspace-type` 优先，收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub workspace_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(default)]
+    #[garde(skip)]
+    pub app_id: Option<String>,
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallBody {

@@ -273,6 +273,27 @@ pub struct UserappSearchFilesQuery {
     pub timeout_ms: String,
 }
 
+/// userapp 版 get-file-meta 请求体（computer GetFileMetaBody 镜像, cId→appId）。
+/// `file_paths` 非空与批量上限的联合校验在 handler（对齐 computer 域）。
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+pub struct UserappFileMetaBody {
+    #[garde(custom(file_server::validation_rules::not_blank))]
+    /// Userapp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
+    pub app_id: String,
+    /// 相对 workspace 根的路径数组（通常为 get-file-list 返回的 name）
+    #[garde(skip)]
+    pub file_paths: Vec<String>,
+    #[serde(default)]
+    #[garde(skip)]
+    /// 单次批量上限（可选，JSON number；缺省 100，服务端硬顶 1000——仅收
+    /// number，非数值 fail-fast 400，与 computer 域同款刻意分歧）
+    pub file_meta_max_batch: Option<u64>,
+    #[serde(default)]
+    #[garde(skip)]
+    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
+    pub custom_target_dir: Option<String>,
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct UserappFilesUpdateBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]

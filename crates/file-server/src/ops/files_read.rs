@@ -1,4 +1,4 @@
-//! 文件读类共享实现：get-file-list / resolve-file / search-files。
+//! 文件读类共享实现：get-file-list / resolve-file / search-files / get-file-meta。
 //!
 //! 壳与 handler 层测试在 handlers/computer/files_read.rs；参数经
 //! `FileListParams` / `SearchFilesParams` 借用结构传入，定位（computer 树或
@@ -6,11 +6,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::extract::AppJson as Json;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::config::Config;
 use crate::error::AppError;
+use crate::extract::AppJson as Json;
 use crate::service::{code as code_service, tree};
 
 pub struct FileListParams<'a> {
@@ -218,4 +220,244 @@ fn parse_positive_int(value: &str, field: &str) -> Result<usize, AppError> {
         .trim()
         .parse::<usize>()
         .map_err(|_| AppError::system(format!("{field}: parse failed after garde validation")))
+}
+
+// ── get-file-meta (对齐 TS 1.5.0 getFileMeta) ──────────────────────────────────
+
+/// get-file-meta 单次批量缺省上限 (调用方未显式下发 fileMetaMaxBatch 时生效)。
+pub const FILE_META_DEFAULT_MAX_BATCH: usize = 100;
+/// get-file-meta 单次批量硬顶: 调用方下发的上限也压在该值内 (防畸形配置放大
+/// lstat/响应开销)。
+pub const FILE_META_HARD_MAX_BATCH: usize = 1000;
+/// 单条内 lstat/readlink/read_dir 的条目并发上限 (IO 饱和保护, 对齐 TS
+/// FILE_META_CONCURRENCY 的 libuv 线程池保护意图)。
+const FILE_META_CONCURRENCY: usize = 8;
+/// 目录子项计数截断上限: 防超大目录拖垮单请求; 达到即停, 值语义为 ≥LIMIT。
+pub const FILE_META_CHILD_COUNT_LIMIT: u64 = 1000;
+
+/// 生效批量上限: 缺省 100; 显式 0/缺省回落缺省值, 正数压入硬顶 1000 内
+/// (对齐 TS parseInt 语义中 0/非正数回落的分支; 非数值输入已在 serde 层
+/// fail-fast, 不做 TS 的静默回落)。
+pub fn effective_file_meta_max_batch(requested: Option<u64>) -> usize {
+    requested
+        .filter(|v| *v > 0)
+        .map(|v| (v as usize).min(FILE_META_HARD_MAX_BATCH))
+        .unwrap_or(FILE_META_DEFAULT_MAX_BATCH)
+}
+
+/// get-file-meta 单条结果 (typed; 失败条目 error 非空、其余字段全 None——
+/// 形状与成功条目一致, 前端可无分支消费)。path 回显请求输入 (trimmed),
+/// 保证响应与请求条目可按键/按序关联; 规范路径以 get-file-list 的 name 为准。
+pub struct FileMetaEntry {
+    pub path: String,
+    pub is_dir: Option<bool>,
+    pub is_link: Option<bool>,
+    pub size: Option<u64>,
+    pub mtime_ms: Option<f64>,
+    pub extension: Option<String>,
+    pub mime_type: Option<String>,
+    pub link_target: Option<String>,
+    pub child_count: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl FileMetaEntry {
+    fn errored(path: String, error: String) -> Self {
+        Self {
+            path,
+            is_dir: None,
+            is_link: None,
+            size: None,
+            mtime_ms: None,
+            extension: None,
+            mime_type: None,
+            link_target: None,
+            child_count: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// get-file-meta 的 workspace 无关核心 (computer / userapp 域共用; 定位由各域
+/// 壳层完成)。readdir 的目录项不含 size (POSIX 本就无), 列表不带 size、由本
+/// 接口 lstat 补查, 只为用户实际查看的文件付费。根目录缺失 → 空 metas (与
+/// get-file-list 空列表语义对齐); 条目并发 FILE_META_CONCURRENCY 且结果与
+/// 请求同序 (`buffered` 保序)。
+pub async fn get_file_meta_core(
+    state: &AppState,
+    target_dir: &Path,
+    file_paths: &[String],
+) -> Result<Vec<FileMetaEntry>, AppError> {
+    if !crate::service::fs_util::path_exists(target_dir).await? {
+        return Ok(Vec::new());
+    }
+    let dir = target_dir.to_path_buf();
+    let config = state.config.clone();
+    let metas: Vec<FileMetaEntry> = futures_util::stream::iter(file_paths.iter().cloned())
+        .map(|file_path| {
+            let dir = dir.clone();
+            let config = config.clone();
+            async move { query_file_meta_entry(&dir, &file_path, &config).await }
+        })
+        .buffered(FILE_META_CONCURRENCY)
+        .collect()
+        .await;
+    Ok(metas)
+}
+
+/// get-file-meta 的 workspace 无关实现 (computer 域 TS 响应拼装, camelCase 键;
+/// error 仅失败条目携带, 成功条目无该键——对齐 TS 展开写法)。
+pub async fn get_file_meta_impl(
+    state: &AppState,
+    path: &Path,
+    file_paths: &[String],
+) -> Result<Json<Value>, AppError> {
+    let metas = get_file_meta_core(state, path, file_paths).await?;
+    let metas: Vec<Value> = metas
+        .iter()
+        .map(|m| {
+            let mut obj = json!({
+                "path": m.path,
+                "isDir": m.is_dir,
+                "isLink": m.is_link,
+                "size": m.size,
+                "mtimeMs": m.mtime_ms,
+                "extension": m.extension,
+                "mimeType": m.mime_type,
+                "linkTarget": m.link_target,
+                "childCount": m.child_count,
+            });
+            if let Some(error) = &m.error {
+                obj["error"] = json!(error);
+            }
+            obj
+        })
+        .collect();
+    Ok(Json(json!({ "success": true, "metas": metas })))
+}
+
+/// 单条元数据查询: 非法路径/不存在仅该条带 error。lstat 不跟随符号链接
+/// (isLink 如实返回, size 为链接条目自身); 目录 size 恒 null (递归总大小需
+/// 整棵子树遍历, 前端可基于扁平列表自行聚合)。
+async fn query_file_meta_entry(
+    target_dir: &Path,
+    file_path: &str,
+    config: &Config,
+) -> FileMetaEntry {
+    let input = file_path.trim();
+    if input.is_empty() {
+        return FileMetaEntry::errored(String::new(), "illegal path".into());
+    }
+    // resolve_subdir 内含前导斜杠剥除 + `..` 拒绝 + ensure_within 兜底, 与 TS
+    // resolveFilePathWithinWorkspace + `/` 前缀重试同语义; 越界 → illegal path。
+    let resolved = match tree::resolve_subdir(target_dir, Some(input)) {
+        Ok(resolved) => resolved,
+        Err(_) => return FileMetaEntry::errored(input.to_string(), "illegal path".into()),
+    };
+    let meta = match tokio::fs::symlink_metadata(&resolved).await {
+        Ok(meta) => meta,
+        Err(e) => return FileMetaEntry::errored(input.to_string(), e.to_string()),
+    };
+    let is_dir = meta.is_dir();
+    let is_link = meta.is_symlink();
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64() * 1000.0);
+    let mut entry = FileMetaEntry {
+        path: input.to_string(),
+        is_dir: Some(is_dir),
+        is_link: Some(is_link),
+        size: if is_dir { None } else { Some(meta.len()) },
+        mtime_ms,
+        extension: if is_dir {
+            None
+        } else {
+            Some(extension_of(input))
+        },
+        mime_type: if is_dir {
+            None
+        } else {
+            Some(mime_type_of(input))
+        },
+        link_target: None,
+        child_count: None,
+        error: None,
+    };
+    if is_link {
+        match tokio::fs::read_link(&resolved).await {
+            Ok(target) => entry.link_target = Some(target.to_string_lossy().into_owned()),
+            Err(e) => tracing::warn!(
+                path = %input,
+                error = %e,
+                "readlink failed, linkTarget set to null"
+            ),
+        }
+    }
+    if is_dir {
+        match count_visible_dir_entries(&resolved, config).await {
+            Ok(count) => entry.child_count = Some(count),
+            Err(e) => tracing::warn!(
+                path = %input,
+                error = %e,
+                "count directory entries failed, childCount set to null"
+            ),
+        }
+    }
+    entry
+}
+
+/// 提取小写扩展名 (不含点; 无扩展名返回空串——对齐 TS extensionOf)。
+fn extension_of(input: &str) -> String {
+    Path::new(input)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+/// 按文件名查表 MIME (零 syscall); 未知类型回落 application/octet-stream。
+fn mime_type_of(input: &str) -> String {
+    mime_guess::from_path(input)
+        .first_raw()
+        .unwrap_or("application/octet-stream")
+        .to_string()
+}
+
+/// 目录子项流式计数 (不物化整个目录), 达到截断上限提前返回。可见性与文件
+/// 列表同口径 (隐藏项保留 .gitignore、排除名单整体生效), 但**只按名字过滤
+/// 不 stat 类型**——与排除目录同名的文件被误排属可接受的极端情况 (对齐 TS
+/// countDirEntries; 刻意不复用 `read_filtered_entries`, 其 stat 类型+物化+排序)。
+async fn count_visible_dir_entries(dir: &Path, config: &Config) -> Result<u64, AppError> {
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    let mut count: u64 = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        if !is_counted_dir_entry(&name.to_string_lossy(), config) {
+            continue;
+        }
+        count += 1;
+        if count >= FILE_META_CHILD_COUNT_LIMIT {
+            return Ok(FILE_META_CHILD_COUNT_LIMIT);
+        }
+    }
+    Ok(count)
+}
+
+fn is_counted_dir_entry(name: &str, config: &Config) -> bool {
+    if name.starts_with('.') && name != tree::KEEP_HIDDEN_FILE {
+        return false;
+    }
+    if config
+        .content_traverse_exclude_files
+        .iter()
+        .any(|f| f == name)
+    {
+        return false;
+    }
+    if config.traverse_exclude_dirs.iter().any(|d| d == name) {
+        return false;
+    }
+    true
 }

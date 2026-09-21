@@ -22,6 +22,7 @@ fn userapp_router() -> OpenApiRouter<UserAppState> {
         .routes(routes!(userapp_files::get_file_list))
         .routes(routes!(userapp_files::resolve_file))
         .routes(routes!(userapp_files::search_files))
+        .routes(routes!(userapp_files::get_file_meta))
         .routes(routes!(userapp_files::files_update))
         .routes(routes!(userapp_files::upload_file))
         .routes(routes!(userapp_files::upload_files))
@@ -102,6 +103,7 @@ mod tests {
             "/api/v1/userapp/{app_id}/{app_stage}/projects/detect",
             "/api/v1/userapp/{app_id}/{app_stage}/projects/confirm",
             "/api/v1/userapp/get-file-list",
+            "/api/v1/userapp/get-file-meta",
             "/api/v1/userapp/resolve-file",
             "/api/v1/userapp/search-files",
             "/api/v1/userapp/files-update",
@@ -136,7 +138,7 @@ mod tests {
                 "userapp path missing: {path}"
             );
         }
-        assert_eq!(document.paths.paths.len(), 35);
+        assert_eq!(document.paths.paths.len(), 36);
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 

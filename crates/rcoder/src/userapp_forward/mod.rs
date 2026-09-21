@@ -57,6 +57,7 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
     // （见 routes_for_env_flattened：dev-only，app_stage 折叠后仍以容器平铺契约转发）
     // 文件镜像（TS nuwax-file-server 同名老接口族）
     "/api/v1/userapp/get-file-list",
+    "/api/v1/userapp/get-file-meta",
     "/api/v1/userapp/resolve-file",
     "/api/v1/userapp/search-files",
     "/api/v1/userapp/files-update",

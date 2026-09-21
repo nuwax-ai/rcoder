@@ -26,7 +26,7 @@ use tokio::fs;
 use crate::config::Config;
 
 /// 遍历时保留的唯一隐藏文件 (其余 `.` 开头的文件跳过)。
-const KEEP_HIDDEN_FILE: &str = ".gitignore";
+pub(crate) const KEEP_HIDDEN_FILE: &str = ".gitignore";
 use crate::error::{AppError, AppResult};
 use crate::path_safety;
 
@@ -151,7 +151,7 @@ pub async fn list_files_meta(
 /// - `ensure_within_path` (clean + starts_with) 做最终兜底, 双重保险。
 ///
 /// 最终经 [`path_safety::ensure_within_path`] (clean + starts_with) 兜底, 双重保险。
-pub(super) fn resolve_subdir(root: &Path, relative_path: Option<&str>) -> AppResult<PathBuf> {
+pub(crate) fn resolve_subdir(root: &Path, relative_path: Option<&str>) -> AppResult<PathBuf> {
     let Some(rel) = relative_path.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(root.clean());
     };

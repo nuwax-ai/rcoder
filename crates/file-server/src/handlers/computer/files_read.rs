@@ -10,10 +10,11 @@ use serde_json::Value;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
-use crate::models::{FileListQuery, ResolveFileQuery, SearchFilesQuery};
+use crate::models::{FileListQuery, GetFileMetaBody, ResolveFileQuery, SearchFilesQuery};
 
 use crate::ops::files_read::{
-    FileListParams, SearchFilesParams, get_file_list_impl, resolve_file_impl, search_files_impl,
+    FileListParams, SearchFilesParams, effective_file_meta_max_batch, get_file_list_impl,
+    get_file_meta_impl, resolve_file_impl, search_files_impl,
 };
 
 use super::ServiceScope;
@@ -149,6 +150,51 @@ pub(crate) async fn search_files(
         },
     )
     .await
+}
+
+// ── get-file-meta ───────────────────────────────────────────────────────────────
+
+/// 批量查询文件元数据
+///
+/// 对齐 nuwax 1.5.0 getFileMeta：大小/mtime/MIME/扩展名/软链目标/目录子项数；
+/// 与 get-file-list 解耦按需查询；单条失败仅该条带 error，不影响整批。
+#[utoipa::path(
+    post,
+    path = "/get-file-meta",
+    request_body = GetFileMetaBody,
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Computer"
+)]
+pub(crate) async fn get_file_meta(
+    State(state): State<AppState>,
+    Json(body): Json<GetFileMetaBody>,
+) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
+    // 非空与上限联合校验 (对齐 TS ValidationError 位置; 上限缺省 100/硬顶 1000)
+    if body.file_paths.is_empty() {
+        return Err(AppError::validation("filePaths must be a non-empty array"));
+    }
+    let max_batch = effective_file_meta_max_batch(body.file_meta_max_batch);
+    if body.file_paths.len() > max_batch {
+        return Err(AppError::validation(format!(
+            "filePaths batch size {} exceeds limit {max_batch}",
+            body.file_paths.len()
+        )));
+    }
+    let path = resolve_computer_target(
+        &state,
+        &body.user_id,
+        &body.c_id,
+        body.custom_target_dir.as_deref(),
+        ServiceScope {
+            workspace_type: body.workspace_type.as_deref(),
+            service_type: body.service_type.as_deref(),
+            app_id: body.app_id.as_deref(),
+            workspace_path: body.workspace_path.as_deref(),
+        },
+    )
+    .await?;
+    get_file_meta_impl(&state, &path, &body.file_paths).await
 }
 
 #[cfg(test)]
@@ -605,5 +651,178 @@ mod tests {
             err.into_response().status(),
             axum::http::StatusCode::BAD_REQUEST
         );
+    }
+
+    // ── get_file_meta handler 层测试 (对齐 TS 1.5.0 getFileMeta) ─────────────────
+
+    fn meta_body(file_paths: Vec<&str>) -> Json<GetFileMetaBody> {
+        Json(GetFileMetaBody {
+            user_id: "u".into(),
+            c_id: "c".into(),
+            file_paths: file_paths.into_iter().map(Into::into).collect(),
+            file_meta_max_batch: None,
+            custom_target_dir: None,
+            workspace_path: None,
+            service_type: None,
+            workspace_type: None,
+            app_id: None,
+        })
+    }
+
+    /// 元数据种子: a.txt / IMG.PNG / sub/(c.txt + .gitignore + .hidden +
+    /// node_modules/) + unix 软链 link→a.txt。
+    async fn seed_meta_workspace(computer_root: &Path) {
+        let ws = computer_root.join("u").join("c");
+        tokio::fs::create_dir_all(ws.join("sub").join("node_modules"))
+            .await
+            .unwrap();
+        tokio::fs::write(ws.join("a.txt"), "abc").await.unwrap();
+        tokio::fs::write(ws.join("IMG.PNG"), "x").await.unwrap();
+        tokio::fs::write(ws.join("sub").join("c.txt"), "c")
+            .await
+            .unwrap();
+        tokio::fs::write(ws.join("sub").join(".gitignore"), "g")
+            .await
+            .unwrap();
+        tokio::fs::write(ws.join("sub").join(".hidden"), "h")
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", ws.join("link")).unwrap();
+    }
+
+    fn meta_of<'a>(val: &'a Value, path: &str) -> &'a Value {
+        val["metas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["path"].as_str() == Some(path))
+            .unwrap_or_else(|| panic!("meta {path} missing"))
+    }
+
+    #[tokio::test]
+    async fn get_file_meta_file_dir_symlink_shapes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let computer_root = tmp.path().join("c");
+        let state = make_state(computer_root.clone());
+        seed_meta_workspace(&computer_root).await;
+        let res = get_file_meta(
+            State(state),
+            meta_body(vec!["a.txt", "IMG.PNG", "sub", "link"]),
+        )
+        .await
+        .expect("meta ok");
+        let val = res.0;
+        assert_eq!(val["success"], json!(true));
+
+        // 常规文件: size/mtimeMs/extension 小写/mime 查表, 无 error 键
+        let f = meta_of(&val, "a.txt");
+        assert_eq!(f["isDir"], json!(false));
+        assert_eq!(f["size"], json!(3));
+        assert!(f["mtimeMs"].as_f64().unwrap() > 0.0);
+        assert_eq!(f["extension"], json!("txt"));
+        assert_eq!(f["mimeType"], json!("text/plain"));
+        assert!(f.get("error").is_none());
+
+        // 大写扩展名归一小写
+        let img = meta_of(&val, "IMG.PNG");
+        assert_eq!(img["extension"], json!("png"));
+        assert_eq!(img["mimeType"], json!("image/png"));
+
+        // 目录: size/extension/mimeType 恒 null; childCount 可见性口径
+        // (c.txt + .gitignore 计入; .hidden 隐藏、node_modules 排除)
+        let d = meta_of(&val, "sub");
+        assert_eq!(d["isDir"], json!(true));
+        assert_eq!(d["size"], json!(null));
+        assert_eq!(d["extension"], json!(null));
+        assert_eq!(d["mimeType"], json!(null));
+        assert_eq!(d["childCount"], json!(2));
+
+        // 软链: isLink 如实 + linkTarget 回显; size 为链接条目自身 (lstat)
+        #[cfg(unix)]
+        {
+            let l = meta_of(&val, "link");
+            assert_eq!(l["isLink"], json!(true));
+            assert_eq!(l["linkTarget"], json!("a.txt"));
+            assert!(l["size"].as_u64().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn get_file_meta_missing_entry_error_isolated_and_order_preserved() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let computer_root = tmp.path().join("c");
+        let state = make_state(computer_root.clone());
+        seed_meta_workspace(&computer_root).await;
+        let res = get_file_meta(State(state), meta_body(vec!["a.txt", "nope.txt", "sub"]))
+            .await
+            .expect("meta ok");
+        let val = res.0;
+        // 响应与请求同序 (按键关联的兜底契约)
+        let paths: Vec<&str> = val["metas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["a.txt", "nope.txt", "sub"]);
+        // 单条失败仅该条带 error, 其余字段 null, 不影响整批
+        let missing = meta_of(&val, "nope.txt");
+        assert!(missing["error"].as_str().is_some_and(|e| !e.is_empty()));
+        assert_eq!(missing["size"], json!(null));
+        assert_eq!(meta_of(&val, "a.txt")["size"], json!(3));
+    }
+
+    #[tokio::test]
+    async fn get_file_meta_traversal_and_blank_are_illegal_per_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let computer_root = tmp.path().join("c");
+        let state = make_state(computer_root.clone());
+        seed_meta_workspace(&computer_root).await;
+        let res = get_file_meta(State(state), meta_body(vec!["../x", "  ", "/a.txt"]))
+            .await
+            .expect("meta ok");
+        let val = res.0;
+        // 穿越 → illegal path
+        assert_eq!(meta_of(&val, "../x")["error"], json!("illegal path"));
+        // 空白串 trim 后为空 → illegal path (path 回显 trimmed 空串)
+        assert_eq!(meta_of(&val, "")["error"], json!("illegal path"));
+        // / 开头实为相对目标根的写法兼容 (resolve_subdir 剥前导斜杠);
+        // path 回显原始输入 (对齐 TS: 规范路径以 get-file-list 的 name 为准)
+        let abs = meta_of(&val, "/a.txt");
+        assert_eq!(abs["size"], json!(3));
+        assert!(abs.get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_file_meta_rejects_empty_and_over_limit_batch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().join("c"));
+        // 空数组 → 400
+        let err = get_file_meta(State(state.clone()), meta_body(vec![]))
+            .await
+            .err()
+            .expect("should reject");
+        assert!(err.to_string().contains("filePaths"));
+        // 超批量上限 (显式 fileMetaMaxBatch=2) → 400
+        let mut body = meta_body(vec!["a", "b", "c"]);
+        body.0.file_meta_max_batch = Some(2);
+        let err = get_file_meta(State(state), body)
+            .await
+            .err()
+            .expect("should reject");
+        assert!(err.to_string().contains("exceeds limit"));
+    }
+
+    #[tokio::test]
+    async fn get_file_meta_missing_root_returns_empty_metas() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().join("c"));
+        // 不 seed → 工作区不存在 → 空 metas (对齐 getFileList 空列表语义)
+        let res = get_file_meta(State(state), meta_body(vec!["a.txt"]))
+            .await
+            .expect("meta ok");
+        assert_eq!(res.0["success"], json!(true));
+        assert_eq!(res.0["metas"], json!([]));
     }
 }

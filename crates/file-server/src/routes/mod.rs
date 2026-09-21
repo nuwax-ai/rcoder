@@ -131,6 +131,7 @@ fn computer_router() -> OpenApiRouter<AppState> {
         .routes(routes!(computer::files_read::get_file_list))
         .routes(routes!(computer::files_read::resolve_file))
         .routes(routes!(computer::files_read::search_files))
+        .routes(routes!(computer::files_read::get_file_meta))
         .routes(routes!(computer::files::delete_workspace))
         .routes(routes!(computer::exec::get_logs))
         .routes(routes!(computer::exec::execute_command))
