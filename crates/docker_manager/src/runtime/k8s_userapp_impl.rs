@@ -139,7 +139,9 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
                     &self.config.cluster_domain,
                 ),
             ),
-            workload_uid: None,
+            // Deployment uid 已在上方校验非空——此处对账可用性优先带上
+            //（UserApp 权威绑定仍在 lifecycle 表 physical_uid+generation）。
+            workload_uid: deployment.metadata.uid.clone(),
         }))
     }
 

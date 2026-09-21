@@ -326,7 +326,8 @@ pub trait AgentContainerRuntime: Send + Sync {
                 pod.container_ip,
                 shared_types::GRPC_DEFAULT_PORT
             ),
-            workload_uid: None,
+            // workload 身份随 RuntimeContainerInfo 透传（§1.1 捕获链）。
+            workload_uid: pod.workload_uid.clone(),
         }))
     }
 

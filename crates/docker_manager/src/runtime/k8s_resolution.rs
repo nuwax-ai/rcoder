@@ -165,8 +165,8 @@ impl KubernetesRuntime {
     }
 }
 
-/// 候选择优：Running 优先，其次最新创建（确定性：时间戳并列时 max_by 保序
-/// 取较先入列者——候选来自同一 selector list，顺序由 API server 决定）。
+/// 候选择优：Running 优先，其次最新创建（平局时 `max_by` 取列表末位——
+/// 同 workload 同 rank 的候选任选其一语义等价）。
 fn pick_candidate(candidates: Vec<Pod>) -> Option<Pod> {
     candidates
         .into_iter()

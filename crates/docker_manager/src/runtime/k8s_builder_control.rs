@@ -1204,7 +1204,9 @@ fn ready_builder_info(
                 endpoint.address,
                 shared_types::GRPC_DEFAULT_PORT
             ),
-            workload_uid: None,
+            // §1.1：workload UID（STS metadata.uid）与 Pod UID（container_id）
+            // 一同捕获——契约二代次守卫与契约三对账按此判"同 workload"。
+            workload_uid: Some(workload.uid.clone()),
         },
         identity,
     ))))

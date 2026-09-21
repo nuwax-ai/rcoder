@@ -294,7 +294,7 @@ impl PgStore {
                         anyhow::ensure!(
                             registered == observed,
                             "Container workload was replaced ({registered} -> {observed}); \
-                             rebinding requires explicit recovery"
+                             stop the project to retire the stale binding before re-ensuring"
                         );
                     }
                     shared_types::persistence::ContainerPersistenceIdentity {
