@@ -111,8 +111,20 @@ impl AppState {
         let (pod_created_tx, _) = broadcast::channel(32);
 
         // 初始化 Agent 下载管理器
-        let cache_dir = std::env::var("AGENT_CACHE_DIR")
-            .unwrap_or_else(|_| shared_types::AGENT_CACHE_DIR.to_string());
+        let cache_dir = std::env::var("AGENT_CACHE_DIR").unwrap_or_else(|_| {
+            // deploy-host：/app/agent-cache 宿主机不可写（非 root），锚定
+            // ~/.rcoder/agent-cache（与 host_map 默认同源）
+            #[cfg(feature = "deploy-host")]
+            if shared_types::is_deploy_host()
+                && let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty())
+            {
+                return std::path::Path::new(&home)
+                    .join(".rcoder/agent-cache")
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            shared_types::AGENT_CACHE_DIR.to_string()
+        });
         let agent_download_manager =
             Arc::new(AgentDownloadManager::new(cache_dir).map_err(|e| {
                 anyhow::anyhow!("failed to initialize agent download manager: {}", e)

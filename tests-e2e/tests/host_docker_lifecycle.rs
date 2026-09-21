@@ -67,7 +67,10 @@ pub async fn host_or_skip(scenario: &str) -> Option<(Env, JsonlReporter)> {
     if !rcoder_e2e::common::require_context_or_skip() {
         return None;
     }
-    let env = Env::load();
+    let mut env = Env::load();
+    // host 场景绝不能继承远端清理目标（对齐 compose_or_skip：.env.local 带
+    // TEST_K8S_SSH 时 TestUserGuard 必须走本地 docker rm 而非 ssh kubectl）
+    env.k8s_ssh.clear();
     let report = JsonlReporter::begin(
         scenario,
         "host",
