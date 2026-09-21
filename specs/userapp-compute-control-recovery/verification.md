@@ -1043,3 +1043,13 @@ Docker 遗留清理明细：rcoder-crash-bee781723f7c44ab 项目 down -v；22 �
 **剩余未解面（精确收窄）**：import_A→build_A 断连仍复现，本轮表现为 8086 **connection refused**（进程短暂消失，非阻塞非 RST）——**容器内编排层重启 8086 持有进程**（agent_runner dev-server 子进程，pid 1/134 双实例结构）的机制未定位：k8s 层无重启（liveness 已放宽、无 OOM、Killing 仅清理）；app-cli 无 60000/8086 管理；supervisord 只管 postgresql/dbx/ttyd；节点日志已被轮转不可考古。**下一步需 pod 内实时观测**（strace/进程监控脚本抓 8086 持有者被重启瞬间的父进程信号链）。
 
 **归因修正**：此前"TS file-server build 端点崩溃"结论**错误**——TsFirst 下 /api/v1/userapp/* 明确路由 Rust 上游；TS 无该路由族（零命中）。前报告相关表述以本节为准。
+
+### 2026-09-21 深夜终态：第 9-13 轮——builder 资源修复与残留问题交接
+
+**新增修复**：
+- builder 默认资源（5e4d5b3d）：无显式 limits 时 2Gi/2 核。主动复现（probe app+节点日志）实证：容器 cgroup memory.max=547Mi（STS resources 空+无 LimitRange=隐式层套入）→ import 内存尖峰 cgroup reclaim 风暴 → 容器整体冻结（stdout 沉默/runc exec 失败/探针无响应，liveness 60s 兜底重启）。cpu limit 1 核同样令全家桶 throttle 停摆（第 12 轮），故 2 核。
+- 第 12 轮另暴露 PG 语句超时（statement timeout）——swufe 节点 k3s+ceph-osd+RocketMQ 混部、load 16-20 常态的环境 CPU 争抢背景。
+
+**残留问题（明确交接）**：userapp 套件 build 转发断连（IncompleteMessage）在第 13 轮（2Gi/2 核生效后）仍复现于 14-18 前置场景之后。已排除：rcoder 代码回归（compose 全绿）、DNS（pod 内 0/30 失败）、空闲连接、TS（路径明确走 Rust）、git 阻塞（已修）、liveness 误杀（已修）、内存 547Mi（已修）、CPU 1 核（已修）。**下一步方案**：受控复现+分层抓取——节点侧对 builder veth tcpdump port 60000 定位 RST 源头（pod 内进程/conntrack/kube-proxy），辅以容器内 pid+8086 探活监控（写 PVC 子路径 /home/user/{app_id}/ 免疫重启，注意 /home/user 根是容器层）。
+
+**本批 131 交付分项**：remote-k8s smoke PASS ✓；userapp 套件前置场景 18/52（历史最佳，修复前 14）；build 断连残留 ✗（环境+容器内编排层，方案如上）。
