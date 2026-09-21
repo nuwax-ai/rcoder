@@ -546,8 +546,14 @@ fn validate_builder_statefulset(
         .annotations
         .as_ref()
         .ok_or_else(|| conflict("Builder StatefulSet requires identity adoption"))?;
+    // Identity reuse is application-scoped (app + lifecycle): a different
+    // creation operation in the SAME lifecycle must be accepted — otherwise
+    // concurrent/replica-racing ensures reject each other's fingerprint and
+    // land in an unrecoverable conflict (test-env app 151 incident).
+    // Configuration drift is separately pinned by the template hash below,
+    // which is the authoritative "desired configuration" signal.
     context
-        .validate_resource_metadata(annotations)
+        .validate_application_metadata(annotations)
         .map_err(ContainerRuntimeError::Conflict)?;
     let desired_hash = desired
         .metadata
@@ -568,7 +574,7 @@ fn validate_builder_statefulset(
         .and_then(|metadata| metadata.annotations.as_ref())
         .ok_or_else(|| conflict("Builder pod template identity missing"))?;
     context
-        .validate_resource_metadata(identity)
+        .validate_application_metadata(identity)
         .map_err(ContainerRuntimeError::Conflict)?;
     let existing_pod = template
         .spec

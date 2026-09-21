@@ -288,6 +288,19 @@ async fn discover(
                 });
                 continue;
             }
+            if operation.kind == UserAppOperationKind::EnsureBuilder
+                && operation.state == UserAppOperationState::RecoveryRequired
+            {
+                // Fenced ensure without final evidence: settle automatically
+                // when the protected goal (a live, identity-bound builder) is
+                // verifiably satisfied — frees the slot without operator action.
+                let state = state.clone();
+                tasks.push(operation.operation_id.clone(), async move {
+                    super::creation::reconcile_fenced_ensure(&state, &operation).await?;
+                    Ok(())
+                });
+                continue;
+            }
             if operation.state != UserAppOperationState::Pending
                 || (operation.command.is_none()
                     && !matches!(

@@ -513,6 +513,97 @@ pub(super) async fn reconcile_created(
     Ok(true)
 }
 
+/// Auto-settle a fenced EnsureBuilder whose protected goal is verifiably
+/// satisfied: a builder controller exists under the same app+lifecycle
+/// (captured through the registry/binding path, which is fingerprint-free).
+/// The interrupted operation is settled as Failed with observation evidence —
+/// never Succeeded, because this operation itself did not complete — which
+/// frees the dev admission slot so the next explicit ensure/start proceeds
+/// normally (test-env app 151/155 incident: a concurrent replica's ensure
+/// was rejected by fingerprint drift and stayed fenced forever, blocking
+/// every chat with "Container operation failed").
+pub(super) async fn reconcile_fenced_ensure(
+    state: &AppState,
+    snapshot: &UserAppOperationRecord,
+) -> Result<()> {
+    if snapshot.kind != UserAppOperationKind::EnsureBuilder
+        || snapshot.state != UserAppOperationState::RecoveryRequired
+    {
+        return Ok(());
+    }
+    let Some(_local) = super::lifecycle::try_acquire(&snapshot.app_id).await else {
+        return Ok(());
+    };
+    // Re-read under the lock: another executor may have settled or advanced
+    // the operation since the scan snapshot was taken.
+    let current = state
+        .userapp_store
+        .get_operation(&snapshot.app_id, &snapshot.operation_id)
+        .await?;
+    let Some(record) = current.filter(|record| {
+        record.state == UserAppOperationState::RecoveryRequired
+            && record.kind == UserAppOperationKind::EnsureBuilder
+            && record.executor_id.is_some()
+    }) else {
+        return Ok(());
+    };
+    let context = shared_types::UserAppExecutionContext {
+        app_id: record.app_id.clone(),
+        lifecycle_id: record.lifecycle_id.clone(),
+        operation_id: record.operation_id.clone(),
+        executor_id: record
+            .executor_id
+            .clone()
+            .expect("executor presence checked above"),
+        request_fingerprint: record.request_fingerprint.clone(),
+    };
+    // Observation: does a builder bound to THIS app+lifecycle exist? The
+    // capture path validates identity (labels + binding) without involving
+    // the request fingerprint, so a builder ensured by a different operation
+    // of the same lifecycle is accepted — exactly the superseded case.
+    let captured = match super::adoption::capture_bound_target(state, &context).await {
+        Ok(target) => target,
+        // Identity mismatch or absent builder: the fenced outcome stays
+        // protected — nothing here authorizes releasing it.
+        Err(_) => return Ok(()),
+    };
+    let Some(workload) = captured.workload else {
+        return Ok(());
+    };
+    let mut checkpoint = record.checkpoint.clone();
+    checkpoint["superseded_by_live_builder"] = serde_json::json!({
+        "workload": workload,
+        "observed_at_us": chrono::Utc::now().timestamp_micros(),
+    });
+    state
+        .userapp_store
+        .advance(&UserAppOperationProgress {
+            app_id: record.app_id.clone(),
+            lifecycle_id: record.lifecycle_id.clone(),
+            operation_id: record.operation_id.clone(),
+            expected_revision: record.revision,
+            executor_id: context.executor_id,
+            state: UserAppOperationState::Failed,
+            step: record.step.clone(),
+            checkpoint,
+            error_code: record
+                .error_code
+                .clone()
+                .or_else(|| Some("ERR_CONFLICT".into())),
+            error_message: Some(format!(
+                "{}; superseded: live builder verified under the same lifecycle",
+                record.error_message.as_deref().unwrap_or("ensure fenced")
+            )),
+        })
+        .await?;
+    tracing::warn!(
+        operation_id = %record.operation_id,
+        app_id = %record.app_id,
+        "Fenced ensure settled as Failed: live builder verified under the same lifecycle"
+    );
+    Ok(())
+}
+
 async fn observe_created_ready(
     state: &AppState,
     evidence: &shared_types::BuilderCreationEvidence,
