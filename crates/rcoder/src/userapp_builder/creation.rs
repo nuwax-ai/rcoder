@@ -853,6 +853,16 @@ async fn wait(
     Ok(verified)
 }
 
+/// RecoveryRequired 骑代宽限。该状态是"需要检查"的**中间态**而非终态：
+/// 预算观察器（creation_confirmation_timed_out）与 worker 中断观察都会
+/// 写入它并明确注释"remote execution is still being observed"，恢复扫描器
+/// 5s 一轮核验改判——证据满足→Succeeded，真实围栏→settler 收 Failed。
+/// 等待方在此态上立即宣判过会把"再等几秒就好"变成用户可见错误（测试
+/// 环境 app 159 首开竞态：创建中的瞬时检查态被两个并发 ensure 判死→
+/// Java 5000，5 秒后创建实际成功）。持续超过宽限仍不改判才按终态处理：
+/// 真实围栏的最坏暴露从 0s 变为 ≤宽限+一个轮询周期。
+const RECOVERY_REQUIRED_GRACE: Duration = Duration::from_secs(15);
+
 async fn wait_record(
     store: &Arc<dyn UserAppLifecycleStore>,
     accepted: &UserAppOperationRecord,
@@ -866,6 +876,9 @@ async fn wait_record(
     let mut delay = Duration::from_millis(200);
     // Per-waiter jitter avoids a synchronized poll storm across replicas.
     let jitter = Duration::from_millis(u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 101);
+    // 当前骑代窗口的起点：状态离开 RecoveryRequired 即重置，每个检查窗口
+    // 都获得完整宽限。
+    let mut fenced_since: Option<Instant> = None;
     let result = tokio::time::timeout_at(deadline, async {
         loop {
             let operation = store
@@ -877,7 +890,7 @@ async fn wait_record(
             }
             match operation.state {
                 UserAppOperationState::Succeeded => return Ok(operation),
-                UserAppOperationState::Failed | UserAppOperationState::RecoveryRequired => {
+                UserAppOperationState::Failed => {
                     return Err(anyhow!(
                         "Builder operation {} ended as {:?}: {}",
                         operation.operation_id,
@@ -888,7 +901,23 @@ async fn wait_record(
                             .unwrap_or("Operation result requires inspection")
                     ));
                 }
-                _ => {}
+                UserAppOperationState::RecoveryRequired => {
+                    let since = *fenced_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= RECOVERY_REQUIRED_GRACE {
+                        return Err(anyhow!(
+                            "Builder operation {} ended as {:?}: {}",
+                            operation.operation_id,
+                            operation.state,
+                            operation
+                                .error_message
+                                .as_deref()
+                                .unwrap_or("Operation result requires inspection")
+                        ));
+                    }
+                }
+                _ => {
+                    fenced_since = None;
+                }
             }
             if let Some(receiver) = signal.as_mut() {
                 tokio::select! {
@@ -1541,6 +1570,21 @@ mod fence_settler_tests {
         kind: UserAppOperationKind,
         operation_id: &str,
     ) -> (Arc<AppState>, tempfile::TempDir) {
+        fence_state_with_terminal(
+            runtime,
+            kind,
+            operation_id,
+            UserAppOperationState::RecoveryRequired,
+        )
+        .await
+    }
+
+    async fn fence_state_with_terminal(
+        runtime: Arc<FenceRuntime>,
+        kind: UserAppOperationKind,
+        operation_id: &str,
+        terminal: UserAppOperationState,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
         let (adapter, _cleanup_rx) =
             crate::storage::ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
         let activity = Arc::new(app_manager::AppActivityRegistry::new(Duration::from_secs(
@@ -1682,7 +1726,7 @@ mod fence_settler_tests {
                 operation_id: running.operation_id.clone(),
                 expected_revision: running.revision,
                 executor_id: "executor-fenced".into(),
-                state: UserAppOperationState::RecoveryRequired,
+                state: terminal,
                 step: "runtime_updated".into(),
                 checkpoint: serde_json::json!({"resource": {"container_id": "c1"}}),
                 error_code: Some("ERR_BACKEND_ERROR".into()),
@@ -1822,5 +1866,95 @@ mod fence_settler_tests {
             .expect("scan");
         let record = settled(&state, operation_id).await;
         assert_eq!(record.state, UserAppOperationState::RecoveryRequired);
+    }
+
+    /// app 159 事故回归：创建中的瞬时 RecoveryRequired 必须被骑代——3s 后
+    /// 恢复核验把操作收束为真终态 Failed，等待方观察到的是真终态而非在
+    /// 中间态上提前宣判。修复前必红：立即返回 "ended as RecoveryRequired"。
+    #[tokio::test]
+    async fn transient_fence_is_ridden_through_to_real_terminal() {
+        let operation_id = "op-ride-through";
+        let runtime = FenceRuntime::scenario(None, None);
+        let (state, _dir) =
+            fence_state(runtime, UserAppOperationKind::StartDeployment, operation_id).await;
+        let fenced = settled(&state, operation_id).await;
+        // 3s 后恢复扫描器的核验收束路径把围栏落为真终态（Failed+证据）。
+        let store = state.userapp_store.clone();
+        let snapshot = fenced.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            store
+                .settle_fenced_operation(&snapshot, &serde_json::json!({"kind": "test"}))
+                .await
+                .expect("settle");
+        });
+        let result = wait_record(
+            &state.userapp_store,
+            &fenced,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .await;
+        let error = result.expect_err("terminal failure").to_string();
+        assert!(
+            error.contains("ended as Failed"),
+            "waiter must observe the real terminal, not the transient fence: {error}"
+        );
+        assert!(
+            !error.contains("RecoveryRequired"),
+            "waiter must not report the intermediate state as terminal: {error}"
+        );
+    }
+
+    /// 真围栏（持续不改判）在宽限后仍按终态失败——骑代不变成永久等待。
+    #[tokio::test]
+    async fn persistent_fence_fails_only_after_grace() {
+        let operation_id = "op-persistent-fence";
+        let runtime = FenceRuntime::scenario(None, None);
+        let (state, _dir) =
+            fence_state(runtime, UserAppOperationKind::StartDeployment, operation_id).await;
+        let fenced = settled(&state, operation_id).await;
+        let started = Instant::now();
+        let result = wait_record(
+            &state.userapp_store,
+            &fenced,
+            Instant::now() + Duration::from_secs(45),
+        )
+        .await;
+        let error = result.expect_err("persistent fence must fail").to_string();
+        assert!(error.contains("ended as RecoveryRequired"), "{error}");
+        assert!(
+            started.elapsed() >= RECOVERY_REQUIRED_GRACE,
+            "must not fail before the grace window: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 已是真终态（Failed）的操作保持立即失败——骑代只对中间态生效。
+    #[tokio::test]
+    async fn real_terminal_failure_still_fails_fast() {
+        let operation_id = "op-already-failed";
+        let runtime = FenceRuntime::scenario(None, None);
+        let (state, _dir) = fence_state_with_terminal(
+            runtime,
+            UserAppOperationKind::StartDeployment,
+            operation_id,
+            UserAppOperationState::Failed,
+        )
+        .await;
+        let failed = settled(&state, operation_id).await;
+        let started = Instant::now();
+        let result = wait_record(
+            &state.userapp_store,
+            &failed,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        let error = result.expect_err("failed operation must error").to_string();
+        assert!(error.contains("ended as Failed"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "real terminal must fail fast: {:?}",
+            started.elapsed()
+        );
     }
 }
