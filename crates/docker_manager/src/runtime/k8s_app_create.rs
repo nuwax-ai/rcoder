@@ -454,7 +454,92 @@ impl KubernetesRuntime {
                 }
             }
         }
+        if result.is_ok() {
+            // 换代提交成功：回收本 app 被取代的历史配置代（含历史失败 staging 残留）。
+            // 同 app 发布在操作锁内串行，不存在并发 staging 交错。
+            self.reclaim_superseded_app_config(app_id, &cm_name, &secret_name)
+                .await;
+        }
         result
+    }
+
+    /// 换代提交成功后回收被取代的配置代：按 app label（与 capture_deletion 同源
+    /// 选择器）list env ConfigMap / secret，保留本次提交的活跃引用名，其余
+    /// [`is_superseded_generation`] 命中的换代 staging 对象按 UID 前置条件删除。
+    /// 回收失败不影响发布正确性（活跃配置已生效）——warn 记录，残留由下次发布
+    /// （幂等）或销毁路径（capture_deletion 全量捕获）回收，非吞业务错。
+    async fn reclaim_superseded_app_config(
+        &self,
+        app_id: &str,
+        active_cm: &str,
+        active_secret: &str,
+    ) {
+        use kube::api::{DeleteParams, ListParams, Preconditions};
+
+        let selector = format!(
+            "app.kubernetes.io/instance={app_id},app.kubernetes.io/managed-by=rcoder-app-manager"
+        );
+        let params = ListParams::default().labels(&selector);
+        match self.configmaps_api().list(&params).await {
+            Ok(list) => {
+                for cm in list.items {
+                    let Some(name) = cm.metadata.name.clone() else {
+                        continue;
+                    };
+                    if !is_superseded_generation(app_id, active_cm, &name) {
+                        continue;
+                    }
+                    let Some(uid) = cm.metadata.uid.clone() else {
+                        tracing::warn!("skip superseded generation env {name}: missing UID");
+                        continue;
+                    };
+                    let dp = DeleteParams {
+                        preconditions: Some(Preconditions {
+                            uid: Some(uid),
+                            resource_version: None,
+                        }),
+                        ..Default::default()
+                    };
+                    if let Err(error) = self.configmaps_api().delete(&name, &dp).await {
+                        tracing::warn!("reclaim superseded generation env {name} failed: {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!("list superseded generation env configmaps failed: {error}");
+            }
+        }
+        match self.secrets_api().list(&params).await {
+            Ok(list) => {
+                for secret in list.items {
+                    let Some(name) = secret.metadata.name.clone() else {
+                        continue;
+                    };
+                    if !is_superseded_generation(app_id, active_secret, &name) {
+                        continue;
+                    }
+                    let Some(uid) = secret.metadata.uid.clone() else {
+                        tracing::warn!("skip superseded generation secret {name}: missing UID");
+                        continue;
+                    };
+                    let dp = DeleteParams {
+                        preconditions: Some(Preconditions {
+                            uid: Some(uid),
+                            resource_version: None,
+                        }),
+                        ..Default::default()
+                    };
+                    if let Err(error) = self.secrets_api().delete(&name, &dp).await {
+                        tracing::warn!(
+                            "reclaim superseded generation secret {name} failed: {error}"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!("list superseded generation secrets failed: {error}");
+            }
+        }
     }
 
     /// Create UserApp resources using an exclusive Deployment create:
@@ -678,6 +763,13 @@ pub(crate) fn app_flat_volume_mounts(app_id: &str) -> [(String, String); 4] {
     ]
 }
 
+/// 判定配置对象名是否为本 app 已被取代的换代 staging 代：`ua-{app_id}-` 前缀
+/// 且非当前活跃引用。仅匹配换代 staging 命名（前缀含结尾 `-`，app id 10 与
+/// 104 无前缀碰撞），不触碰其它来源的配置对象（如 apply 路径的固定名）。
+fn is_superseded_generation(app_id: &str, active: &str, name: &str) -> bool {
+    name != active && name.starts_with(&format!("ua-{app_id}-"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,6 +804,46 @@ mod tests {
                 "卷内平级目录 {m:?} 应是宿主段 {sub_suffix} 的前缀"
             );
         }
+    }
+
+    /// 换代配置回收过滤：活跃引用与其它来源命名不回收，同 app 旧代/失败 staging
+    /// 残留回收，前缀含结尾 `-` 隔离相近 app id（10 vs 104）。
+    #[test]
+    fn superseded_generation_filter_keeps_active_and_ignores_foreign_names() {
+        // 活跃引用自身不回收（cm 与 sec 各自的活跃名）
+        assert!(!is_superseded_generation(
+            "104",
+            "ua-104-active0123abcd-env",
+            "ua-104-active0123abcd-env"
+        ));
+        assert!(!is_superseded_generation(
+            "104",
+            "ua-104-active0123abcd-sec",
+            "ua-104-active0123abcd-sec"
+        ));
+        // 同 app 被取代的旧代与失败 staging 残留回收
+        assert!(is_superseded_generation(
+            "104",
+            "ua-104-active0123abcd-env",
+            "ua-104-old0456ffff-env"
+        ));
+        assert!(is_superseded_generation(
+            "104",
+            "ua-104-active0123abcd-sec",
+            "ua-104-stale0789eeee-sec"
+        ));
+        // 非 ua- 前缀的其它来源配置（apply 路径固定名）不回收
+        assert!(!is_superseded_generation(
+            "104",
+            "ua-104-active0123abcd-env",
+            "rcoder-app-104-config"
+        ));
+        // 前缀隔离：app 104 的对象不被 app 10 的回收误删（含结尾 `-`）
+        assert!(!is_superseded_generation(
+            "10",
+            "ua-10-active0123abcd-env",
+            "ua-104-old0456ffff-env"
+        ));
     }
 }
 
@@ -1634,6 +1766,26 @@ mod conditional_tests {
                     let line = head.lines().next().expect("request line");
                     let method = line.split_whitespace().next().expect("method");
                     let path = line.split_whitespace().nth(1).expect("path");
+                    if method == "GET" {
+                        // 换代回收的 list 探测（label 选择器查询）：并发用例无历史代，
+                        // 返回空列表保持 mock 确定性（真实回收行为见专项用例）
+                        let kind = if path.contains("/configmaps") {
+                            "ConfigMapList"
+                        } else {
+                            "SecretList"
+                        };
+                        let payload = serde_json::to_vec(
+                            &serde_json::json!({"apiVersion":"v1","kind":kind,"items":[]}),
+                        )
+                        .expect("serialize");
+                        let headers = format!(
+                            "HTTP/1.1 200 Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        stream.write_all(headers.as_bytes()).await.expect("headers");
+                        stream.write_all(&payload).await.expect("response");
+                        return;
+                    }
                     let body: serde_json::Value =
                         serde_json::from_slice(&bytes[offset..offset + length]).expect("JSON");
                     captured.lock().expect("capture").push((
@@ -1746,6 +1898,206 @@ mod conditional_tests {
         );
         server.abort();
     }
+    /// 换代提交成功后回收被取代的历史配置代（真实调用链）：按 app 选择器 list
+    /// 探测、活跃引用保留、仅 `ua-{app_id}-` 历史代按 UID 前置条件删除。
+    #[tokio::test]
+    async fn generation_commit_reclaims_superseded_config_generations() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let active: Arc<Mutex<(String, String)>> =
+            Arc::new(Mutex::new((String::new(), String::new())));
+        let seen: Arc<Mutex<Vec<(String, String, serde_json::Value)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let (captured_seen, captured_active) = (seen.clone(), active.clone());
+        let server = tokio::spawn(async move {
+            for step in 0..7usize {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let (seen, active) = (captured_seen.clone(), captured_active.clone());
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 4096];
+                let (head, offset, length) = loop {
+                    let n = stream.read(&mut buf).await.expect("read request");
+                    if n == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(offset) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&bytes[..offset]).to_string();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().expect("length"))
+                            })
+                            .unwrap_or(0);
+                        break (head, offset + 4, length);
+                    }
+                };
+                while bytes.len() < offset + length {
+                    let n = stream.read(&mut buf).await.expect("body");
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let line = head.lines().next().expect("request line");
+                let method = line.split_whitespace().next().expect("method").to_owned();
+                let path = line.split_whitespace().nth(1).expect("path").to_owned();
+                let body: serde_json::Value = if length == 0 {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_slice(&bytes[offset..offset + length]).expect("JSON")
+                };
+                seen.lock()
+                    .expect("seen")
+                    .push((method.clone(), path.clone(), body.clone()));
+                let stale_cm = "ua-app-review-stale0000-env";
+                let stale_sec = "ua-app-review-stale0000-sec";
+                let (status, reply) = match step {
+                    0 => {
+                        assert!(
+                            method == "POST" && path.contains("/configmaps"),
+                            "{method} {path}"
+                        );
+                        let name = body["metadata"]["name"]
+                            .as_str()
+                            .expect("cm name")
+                            .to_owned();
+                        active.lock().expect("active").0 = name.clone();
+                        (
+                            201,
+                            serde_json::json!({"metadata":{"name":name,"uid":"owned-active-cm","resourceVersion":"1"}}),
+                        )
+                    }
+                    1 => {
+                        assert!(
+                            method == "POST" && path.contains("/secrets"),
+                            "{method} {path}"
+                        );
+                        let name = body["metadata"]["name"]
+                            .as_str()
+                            .expect("sec name")
+                            .to_owned();
+                        active.lock().expect("active").1 = name.clone();
+                        (
+                            201,
+                            serde_json::json!({"metadata":{"name":name,"uid":"owned-active-sec","resourceVersion":"1"}}),
+                        )
+                    }
+                    2 => {
+                        assert!(
+                            method == "POST" && path.contains("/deployments"),
+                            "{method} {path}"
+                        );
+                        (
+                            201,
+                            serde_json::json!({"metadata":{"uid":"deployment-owned","resourceVersion":"43"}}),
+                        )
+                    }
+                    3 => {
+                        assert!(
+                            method == "GET" && path.contains("/configmaps"),
+                            "{method} {path}"
+                        );
+                        assert!(
+                            path.contains("app-review") && path.contains("rcoder-app-manager"),
+                            "reclaim must list by app selector: {path}"
+                        );
+                        (
+                            200,
+                            serde_json::json!({"apiVersion":"v1","kind":"ConfigMapList","items":[
+                                {"metadata":{"name": active.lock().expect("active").0.clone(), "uid":"owned-active-cm"}},
+                                {"metadata":{"name": stale_cm, "uid":"stale-cm-uid"}}]}),
+                        )
+                    }
+                    4 => {
+                        assert!(
+                            method == "DELETE"
+                                && path
+                                    .split('?')
+                                    .next()
+                                    .is_some_and(|p| p.ends_with(stale_cm)),
+                            "must delete only superseded env: {method} {path}"
+                        );
+                        assert_eq!(body["preconditions"]["uid"], "stale-cm-uid");
+                        (
+                            200,
+                            serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success","code":200}),
+                        )
+                    }
+                    5 => {
+                        assert!(
+                            method == "GET" && path.contains("/secrets"),
+                            "{method} {path}"
+                        );
+                        (
+                            200,
+                            serde_json::json!({"apiVersion":"v1","kind":"SecretList","items":[
+                                {"metadata":{"name": active.lock().expect("active").1.clone(), "uid":"owned-active-sec"}},
+                                {"metadata":{"name": stale_sec, "uid":"stale-sec-uid"}}]}),
+                        )
+                    }
+                    6 => {
+                        assert!(
+                            method == "DELETE"
+                                && path
+                                    .split('?')
+                                    .next()
+                                    .is_some_and(|p| p.ends_with(stale_sec)),
+                            "must delete only superseded secret: {method} {path}"
+                        );
+                        assert_eq!(body["preconditions"]["uid"], "stale-sec-uid");
+                        (
+                            200,
+                            serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success","code":200}),
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                let payload = serde_json::to_vec(&reply).expect("serialize");
+                let headers = format!(
+                    "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                stream.write_all(headers.as_bytes()).await.expect("headers");
+                stream.write_all(&payload).await.expect("response");
+            }
+        });
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let config = kube::Config::new(format!("http://{addr}").parse().expect("URI"));
+        let rt = runtime(kube::Client::try_from(config).expect("local client"));
+        let params = ContainerCreateParams::builder()
+            .project_id("app-review")
+            .service_type(ServiceType::Userapp)
+            .image_override("runtime:test")
+            .build();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            rt.write_app_generation("app-review", &params, None, None)
+                .await
+                .expect("generation commit");
+        })
+        .await
+        .expect("bounded reclaim flow");
+        server.await.expect("wire assertions");
+        let (active_cm, active_sec) = active.lock().expect("active").clone();
+        let seen = seen.lock().expect("seen");
+        assert!(
+            !active_cm.is_empty() && !active_sec.is_empty(),
+            "staged generation names captured"
+        );
+        // 活跃引用从未被删除；DELETE 仅命中两个历史代
+        assert!(seen.iter().all(|(method, path, _)| {
+            !(method == "DELETE" && (path.contains(&active_cm) || path.contains(&active_sec)))
+        }));
+        assert_eq!(
+            seen.iter()
+                .filter(|(method, _, _)| method == "DELETE")
+                .count(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn deletion_waits_for_disappearance_and_stops_on_untrusted_observation() {
         use shared_types::{AppDeletionSnapshot, AppResourceIdentity, AppResourceKind};
