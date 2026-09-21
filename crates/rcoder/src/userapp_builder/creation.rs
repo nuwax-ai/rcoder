@@ -668,9 +668,26 @@ pub(super) async fn reconcile_fenced_ensure(
         );
         return Ok(());
     }
-    let evidence = match observe_fence_evidence(state, &record).await {
-        FenceEvidence::Observed(evidence) => evidence,
-        FenceEvidence::Insufficient => {
+    // 只读观察整体限时：kube 请求无总超时（kube-rs 默认 read_timeout=None），
+    // 一个 stall 连接会把恢复任务永久挂死，占满扫描器 8 槽后瘫痪整个
+    // 恢复管线（0.1.288 线上 20 围栏零收束的根因形态）。超时=证据不足，
+    // 保守保持围栏，下一扫描周期重试。
+    let observation = tokio::time::timeout(
+        Duration::from_secs(10),
+        observe_fence_evidence(state, &record),
+    )
+    .await;
+    let evidence = match observation {
+        Ok(FenceEvidence::Observed(evidence)) => evidence,
+        Err(_) => {
+            tracing::warn!(
+                operation_id = %record.operation_id,
+                app_id = %record.app_id,
+                "Fence kept: evidence observation timed out (stalled runtime call)"
+            );
+            return Ok(());
+        }
+        Ok(FenceEvidence::Insufficient) => {
             // 线上定位锚点：此日志出现说明分发与执行都正常、卡在证据谓词
             // （观察失败或身份不符）。每 app 每扫描周期一条，节流由扫描
             // 器节奏（5s）天然限定。

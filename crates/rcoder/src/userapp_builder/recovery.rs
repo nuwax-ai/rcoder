@@ -28,6 +28,21 @@ impl RecoveryTasks {
         self.active.len() >= MAX_RECOVERIES
     }
 
+    /// 槽满 = 扫描器瘫痪面（本次事故 9 小时不可见的直接成因：挂死任务
+    /// 占满后所有 discover 静默 return，零日志零收束）。返回 true 时打
+    /// warn 并带上挂死任务清单——瘫痪必须可见。
+    fn reject_if_full(&self, gate: &str) -> bool {
+        if !self.is_full() {
+            return false;
+        }
+        tracing::warn!(
+            gate,
+            active = ?self.active.iter().cloned().collect::<Vec<_>>(),
+            "Recovery scanner saturated: tasks are not completing (likely a stalled runtime call without timeout); discovery is paused"
+        );
+        true
+    }
+
     fn push(
         &mut self,
         operation_id: String,
@@ -161,7 +176,7 @@ async fn discover_terminal_leases(
     tasks: &mut RecoveryTasks,
     cursor: &mut Option<String>,
 ) -> anyhow::Result<()> {
-    if tasks.is_full() {
+    if tasks.reject_if_full("terminal_lease_scan") {
         return Ok(());
     }
     let query_cursor = cursor.clone();
@@ -185,7 +200,7 @@ async fn discover_terminal_leases(
         return Ok(());
     }
     for binding in page {
-        if tasks.is_full() {
+        if tasks.reject_if_full("terminal_lease_push") {
             break;
         }
         *cursor = Some(binding.context.operation_id.clone());
@@ -210,7 +225,7 @@ async fn discover(
     // Keep a cursor across ticks so blocked or large early pages cannot starve
     // later applications. Wrapping reconsiders earlier Pending operations.
     for _ in 0..MAX_PAGES_PER_TICK {
-        if tasks.is_full() {
+        if tasks.reject_if_full("discover_page") {
             return Ok(());
         }
         let query_cursor = cursor.clone();
@@ -236,7 +251,7 @@ async fn discover(
             return Ok(());
         }
         for operation in page {
-            if tasks.is_full() {
+            if tasks.reject_if_full("dispatch") {
                 return Ok(());
             }
             *cursor = Some(operation.operation_id.clone());
@@ -277,7 +292,16 @@ async fn discover(
                     // 兜底 settler 永远轮不到（测试环境 20 个站立围栏的
                     // 直接成因之一）。
                     if !super::creation::reconcile_runtime_receipt(&state, &operation).await? {
-                        super::creation::reconcile_fenced_ensure(&state, &operation).await?;
+                        tokio::time::timeout(
+                            Duration::from_secs(60),
+                            super::creation::reconcile_fenced_ensure(&state, &operation),
+                        )
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "reconcile_fenced_ensure timed out (stalled runtime call)"
+                            )
+                        })??;
                     }
                     Ok(())
                 });
@@ -289,7 +313,14 @@ async fn discover(
             {
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
-                    super::creation::reconcile_created(&state, &operation).await?;
+                    tokio::time::timeout(
+                        Duration::from_secs(60),
+                        super::creation::reconcile_created(&state, &operation),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("reconcile_created timed out (stalled runtime call)")
+                    })??;
                     Ok(())
                 });
                 continue;
@@ -302,12 +333,28 @@ async fn discover(
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
                     if operation.kind == UserAppOperationKind::EnsureBuilder {
-                        super::creation::reconcile_completed(&state, &operation).await?;
+                        tokio::time::timeout(
+                            Duration::from_secs(60),
+                            super::creation::reconcile_completed(&state, &operation),
+                        )
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!("reconcile_completed timed out (stalled runtime call)")
+                        })??;
                     } else if matches!(
                         operation.kind,
                         UserAppOperationKind::StopBuilder | UserAppOperationKind::RestartBuilder
                     ) {
-                        super::control::reconcile_completed(&state, &operation).await?;
+                        tokio::time::timeout(
+                            Duration::from_secs(60),
+                            super::control::reconcile_completed(&state, &operation),
+                        )
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "control reconcile_completed timed out (stalled runtime call)"
+                            )
+                        })??;
                     } else {
                         state.app_service.resume_pending_control(&operation).await?;
                     }
@@ -328,7 +375,14 @@ async fn discover(
                 // evidence) — frees the slot without operator action.
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
-                    super::creation::reconcile_fenced_ensure(&state, &operation).await?;
+                    tokio::time::timeout(
+                        Duration::from_secs(60),
+                        super::creation::reconcile_fenced_ensure(&state, &operation),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("reconcile_fenced_ensure timed out (stalled runtime call)")
+                    })??;
                     Ok(())
                 });
                 continue;
