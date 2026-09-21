@@ -546,14 +546,8 @@ fn validate_builder_statefulset(
         .annotations
         .as_ref()
         .ok_or_else(|| conflict("Builder StatefulSet requires identity adoption"))?;
-    // Identity reuse is application-scoped (app + lifecycle): a different
-    // creation operation in the SAME lifecycle must be accepted — otherwise
-    // concurrent/replica-racing ensures reject each other's fingerprint and
-    // land in an unrecoverable conflict (test-env app 151 incident).
-    // Configuration drift is separately pinned by the template hash below,
-    // which is the authoritative "desired configuration" signal.
     context
-        .validate_application_metadata(annotations)
+        .validate_resource_metadata(annotations)
         .map_err(ContainerRuntimeError::Conflict)?;
     let desired_hash = desired
         .metadata
@@ -574,7 +568,7 @@ fn validate_builder_statefulset(
         .and_then(|metadata| metadata.annotations.as_ref())
         .ok_or_else(|| conflict("Builder pod template identity missing"))?;
     context
-        .validate_application_metadata(identity)
+        .validate_resource_metadata(identity)
         .map_err(ContainerRuntimeError::Conflict)?;
     let existing_pod = template
         .spec
@@ -649,7 +643,22 @@ fn agent_template_hash(pod_spec: &PodSpec) -> String {
     for container in &mut spec.containers {
         container.resources = None;
         if let Some(env) = &mut container.env {
-            env.retain(|e| !matches!(e.name.as_str(), "TENANT_ID" | "SPACE_ID" | "ISOLATION_TYPE"));
+            // Excluded from the fingerprint: per-request slot values, and the
+            // per-creation deploy credential (a fresh random token on every
+            // build — hashing it made every re-computation differ and turned
+            // the drift check into a coin flip; test-env app 151/155 incident).
+            env.retain(|e| {
+                !matches!(
+                    e.name.as_str(),
+                    "TENANT_ID" | "SPACE_ID" | "ISOLATION_TYPE" | "APP_CLI_DEPLOY_TOKEN"
+                )
+            });
+            // Canonical ordering: env lists are assembled from HashMaps whose
+            // iteration order is per-process random. Without sorting, two
+            // replicas computing the hash for the identical desired spec
+            // produce different values and the reuse check rejects a perfectly
+            // matching controller ("configuration changed" false positive).
+            env.sort_by(|a, b| a.name.cmp(&b.name));
         }
     }
     let canonical = serde_json::to_value(&spec)
@@ -788,6 +797,65 @@ mod tests {
         }
         let after = agent_template_hash(&spec);
         assert_ne!(before, after);
+    }
+
+    /// 确定性（跨构造顺序）：env 列表由 HashMap 迭代组装，两个副本对同一
+    /// 期望配置可能以不同顺序构造 spec——指纹必须与 env 顺序无关。
+    /// 修复前必红：HashMap 每进程随机迭代序使复用校验对完全匹配的
+    /// 控制器误报 "configuration changed"（测试环境 app 151/155 事故根因）。
+    #[test]
+    fn template_hash_is_independent_of_env_ordering() {
+        use k8s_openapi::api::core::v1::EnvVar;
+        let entries = [
+            ("ALPHA", "1"),
+            ("BETA", "2"),
+            ("GAMMA", "3"),
+            ("DELTA", "4"),
+            ("EPSILON", "5"),
+        ];
+        let build = |order: usize| {
+            let mut spec = sample_pod_spec("repo/rcoder:0.1.230");
+            let rotated: Vec<EnvVar> = (0..entries.len())
+                .map(|index| {
+                    let (name, value) = entries[(index + order) % entries.len()];
+                    EnvVar {
+                        name: name.to_string(),
+                        value: Some(value.to_string()),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            spec.containers[0].env = Some(rotated);
+            agent_template_hash(&spec)
+        };
+        let reference = build(0);
+        for order in 1..entries.len() {
+            assert_eq!(
+                reference,
+                build(order),
+                "env ordering must not affect the template hash"
+            );
+        }
+    }
+
+    /// 确定性（凭据排除）：APP_CLI_DEPLOY_TOKEN 每次生成都换新随机值，
+    /// 不得影响指纹——修复前两次 ensure 的指纹必然不同，复用校验形同虚设。
+    #[test]
+    fn template_hash_ignores_per_creation_deploy_token() {
+        use k8s_openapi::api::core::v1::EnvVar;
+        let build = |token: &str| {
+            let mut spec = sample_pod_spec("repo/rcoder:0.1.230");
+            spec.containers[0]
+                .env
+                .get_or_insert_with(Vec::new)
+                .push(EnvVar {
+                    name: "APP_CLI_DEPLOY_TOKEN".to_string(),
+                    value: Some(token.to_string()),
+                    ..Default::default()
+                });
+            agent_template_hash(&spec)
+        };
+        assert_eq!(build("token-aaa"), build("token-bbb"));
     }
 
     /// per-request 字段豁免：resources 与 TENANT_ID/SPACE_ID/ISOLATION_TYPE 随

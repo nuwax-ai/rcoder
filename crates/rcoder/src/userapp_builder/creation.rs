@@ -543,18 +543,17 @@ pub(super) async fn reconcile_fenced_ensure(
     let Some(record) = current.filter(|record| {
         record.state == UserAppOperationState::RecoveryRequired
             && record.kind == UserAppOperationKind::EnsureBuilder
-            && record.executor_id.is_some()
     }) else {
+        return Ok(());
+    };
+    let Some(executor_id) = record.executor_id.clone() else {
         return Ok(());
     };
     let context = shared_types::UserAppExecutionContext {
         app_id: record.app_id.clone(),
         lifecycle_id: record.lifecycle_id.clone(),
         operation_id: record.operation_id.clone(),
-        executor_id: record
-            .executor_id
-            .clone()
-            .expect("executor presence checked above"),
+        executor_id,
         request_fingerprint: record.request_fingerprint.clone(),
     };
     // Observation: does a builder bound to THIS app+lifecycle exist? The
