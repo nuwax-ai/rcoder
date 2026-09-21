@@ -612,5 +612,7 @@ async fn workload_generation_gate_allows_rebind_only_for_same_workload() {
     );
 
     let _ = store.writer().flush_and_stop(Duration::from_secs(5)).await;
-    let _ = pool;
+    // 函数末行显式释放连接池（`let _ = pool` 立即 drop 但触发
+    // -W let-underscore-drop 告警，语义相同、意图更明确）。
+    drop(pool);
 }
