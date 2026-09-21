@@ -292,7 +292,7 @@ async fn forward_to_addr(target_label: &str, app_id: &str, addr: &str, req: Requ
         Ok(resp) => resp,
         Err(e) => {
             warn!(
-                "[USERAPP_FORWARD] upstream request failed: app_id={app_id}, target={target}: {e}"
+                "[USERAPP_FORWARD] upstream request failed: app_id={app_id}, target={target}: {e:?}"
             );
             return HttpResultError::bad_gateway(format!(
                 "{target_label} container request failed: {e}"
