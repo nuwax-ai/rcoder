@@ -460,5 +460,11 @@
       "scenario": "userapp_manual_owner_multi_process_control",
       "backend": "compose"
     }
+  ],
+  "host_agent_lifecycle_no_llm": [
+    {
+      "scenario": "host_agent_lifecycle_no_llm",
+      "backend": "host"
+    }
   ]
 }

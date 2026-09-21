@@ -69,3 +69,8 @@ test-e2e-k8s:
 .PHONY: test-e2e-k8s-userapp
 test-e2e-k8s-userapp:
 	python3 tests-e2e/tools/k8s_userapp.py --ssh "$(TEST_K8S_SSH)" --url "$(RCODER_URL)" --proxy-url "$(E2E_PINGORA_URL)"
+
+# deploy-host 宿主机形态严格 E2E（前置：make dev-host 已运行）
+.PHONY: test-e2e-host
+test-e2e-host:
+	python3 tests-e2e/tools/run.py --group host

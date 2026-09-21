@@ -109,5 +109,8 @@
     "cpp_lifecycle_envelopes",
     "cpp_preview_http",
     "cpp_hmr_websocket"
+  ],
+  "host_docker_lifecycle": [
+    "host_agent_lifecycle_no_llm"
   ]
 }

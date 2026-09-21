@@ -29,6 +29,7 @@ GROUPS = {
     'compose': ['compose_sse', 'compose_session', 'compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_webchat', 'custom_page_preview'],
     'deploy': ['compose_userapp_deploy'],
     'k8s': ['k8s_lb'],
+    'host': ['host_docker_lifecycle'],
 }
 
 

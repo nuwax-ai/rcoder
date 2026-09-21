@@ -212,3 +212,11 @@ REQUIRED['docker_runtime_sigterm_drain_contract'] = {
     'No physical create or replay after signal',
     'Owned SIGTERM fixture cleanup',
 }
+
+
+REQUIRED['host_agent_lifecycle_no_llm'] = {
+    'host_pod_ensure_created',
+    'host_container_ports_published',
+    'host_ensure_idempotent_reuse',
+    'host_owned_cleanup_reclaims_container',
+}
