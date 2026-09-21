@@ -64,3 +64,4 @@ target-tssync/
 /.remote-k8s/
 target-check/
 /target-appcli/
+target_DIR_PLACEHOLDER/
