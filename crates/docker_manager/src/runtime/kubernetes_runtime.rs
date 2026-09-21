@@ -128,10 +128,20 @@ impl KubernetesRuntime {
             .unwrap_or_else(|_| "nfs-server.nfs-storage.svc.cluster.local".to_string());
         let nfs_path =
             std::env::var("RCODER_K8S_NFS_PATH").unwrap_or_else(|_| "/exports".to_string());
-        let storage_class =
-            std::env::var("RCODER_K8S_STORAGE_CLASS").unwrap_or_else(|_| "rcoder-nfs".to_string());
+        // deploy-host 宿主机形态 feature 门控默认（仅 env 未设时生效）：本地集群
+        // （OrbStack/k3d/k3s）通常为 local-path/RWO，无 NFS；env 显式设置永远优先
+        #[cfg(feature = "deploy-host")]
+        let (default_storage_class, default_access_mode) = if shared_types::is_deploy_host() {
+            ("local-path", "ReadWriteOnce")
+        } else {
+            ("rcoder-nfs", "ReadWriteMany")
+        };
+        #[cfg(not(feature = "deploy-host"))]
+        let (default_storage_class, default_access_mode) = ("rcoder-nfs", "ReadWriteMany");
+        let storage_class = std::env::var("RCODER_K8S_STORAGE_CLASS")
+            .unwrap_or_else(|_| default_storage_class.to_string());
         let access_mode = std::env::var("RCODER_K8S_PVC_ACCESS_MODE")
-            .unwrap_or_else(|_| "ReadWriteMany".to_string());
+            .unwrap_or_else(|_| default_access_mode.to_string());
 
         info!(
             "[K8S] Kubernetes runtime initialized, namespace: {}, cluster_domain: {}",

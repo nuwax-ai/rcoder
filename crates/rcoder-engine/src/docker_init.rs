@@ -157,6 +157,14 @@ pub fn build_docker_manager_config(config: &AppConfig) -> docker_manager::Docker
 pub async fn init_docker_manager(config: &AppConfig) -> anyhow::Result<()> {
     info!("initialize Docker Manager (with config)...");
 
+    // deploy-host + K8s：启动 rehydrate——list 存量 agent Services 读回
+    // nodePort 回填 published 注册表（进程重启后注册表为空，此前的拨号会
+    // 全部回退 loopback:容器端口而失败）
+    #[cfg(all(feature = "kubernetes", feature = "deploy-host"))]
+    if shared_types::is_deploy_host() && RuntimeType::from_env() == RuntimeType::Kubernetes {
+        rehydrate_deploy_host_node_ports().await?;
+    }
+
     let docker_manager_config = build_docker_manager_config(config);
 
     if let Err(e) =
@@ -332,4 +340,56 @@ fn show_docker_configuration_help(socket_path: &str) {
     );
     error!("");
     error!("socket exists, rcoder container may not have access");
+}
+
+/// deploy-host K8s 启动回填：list 本 namespace 的 rcoder-runtime agent
+/// Services（selector: managed-by=rcoder-runtime + component=agent），按
+/// `rcoder.io/instance` label 取 identifier，读回 nodePort 整表登记注册表。
+#[cfg(all(feature = "kubernetes", feature = "deploy-host"))]
+async fn rehydrate_deploy_host_node_ports() -> anyhow::Result<()> {
+    use k8s_openapi::api::core::v1::Service;
+    use kube::api::{Api, ListParams};
+
+    let client = kube::Client::try_default()
+        .await
+        .map_err(|e| anyhow::anyhow!("deploy-host rehydrate kube client: {e}"))?;
+    let namespace = std::env::var("RCODER_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+    let services: Api<Service> = Api::namespaced(client, &namespace);
+    let list = services
+        .list(&ListParams::default().labels(
+            "app.kubernetes.io/managed-by=rcoder-runtime,app.kubernetes.io/component=agent",
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("deploy-host rehydrate list services: {e}"))?;
+    let mut registered = 0usize;
+    for svc in list.items {
+        let Some(identifier) = svc
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("rcoder.io/instance"))
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(ports) = svc.spec.as_ref().and_then(|spec| spec.ports.as_ref()) else {
+            continue;
+        };
+        let map: std::collections::HashMap<u16, u16> = ports
+            .iter()
+            .filter_map(|p| {
+                let node_port = p.node_port? as u16;
+                Some((p.port as u16, node_port))
+            })
+            .collect();
+        if map.is_empty() {
+            continue;
+        }
+        shared_types::published::register(&identifier, map);
+        registered += 1;
+    }
+    tracing::info!(
+        "[deploy-host] K8s NodePort rehydrate: {registered} agent service(s) registered"
+    );
+    Ok(())
 }

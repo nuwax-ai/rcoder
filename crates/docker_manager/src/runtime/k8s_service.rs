@@ -102,6 +102,18 @@ pub(super) fn agent_service_object(
             ..Default::default()
         },
         spec: Some(ServiceSpec {
+            // deploy-host：NodePort（server 分配 nodePort，apply 后读回登记注册表，
+            // rcoder 进程在集群外经 127.0.0.1:{nodePort} 触达 agent）
+            #[cfg(feature = "deploy-host")]
+            type_: Some(
+                if shared_types::is_deploy_host() {
+                    "NodePort"
+                } else {
+                    "ClusterIP"
+                }
+                .to_string(),
+            ),
+            #[cfg(not(feature = "deploy-host"))]
             type_: Some("ClusterIP".to_string()),
             selector: Some(build_selector_labels(identifier, service_type)),
             ports: Some(agent_service_ports(service_type)),
@@ -109,6 +121,34 @@ pub(super) fn agent_service_object(
         }),
         status: None,
     }
+}
+
+/// deploy-host：从 Service 读回 nodePort 并登记注册表（键 = identifier，
+/// 与 funnel 的 container_name 同源）。非 NodePort/未分配的端口跳过。
+#[cfg(feature = "deploy-host")]
+pub(super) fn register_service_node_ports(identifier: &str, svc: &Service) {
+    if !shared_types::is_deploy_host() {
+        return;
+    }
+    let Some(ports) = svc.spec.as_ref().and_then(|spec| spec.ports.as_ref()) else {
+        return;
+    };
+    let mut map = std::collections::HashMap::new();
+    for port in ports {
+        if let Some(node_port) = port.node_port {
+            let container_port = port.port as u16;
+            map.insert(container_port, node_port as u16);
+        }
+    }
+    if map.is_empty() {
+        return;
+    }
+    let entries = map.len();
+    shared_types::published::register(identifier, map);
+    info!(
+        "[deploy-host] NodePorts registered: identifier={}, entries={}",
+        identifier, entries
+    );
 }
 
 /// Service 是否已声明某端口（端口值口径；ClusterIP 只路由已声明的端口）
@@ -409,9 +449,13 @@ impl K8sServiceOps for KubernetesRuntime {
                         "[K8S] Service {} patched to converge expected ports (was missing some)",
                         svc_name
                     );
+                    #[cfg(feature = "deploy-host")]
+                    register_service_node_ports(identifier, &existing);
                     return Ok(());
                 }
                 debug!("[K8S] Service {} already exists", svc_name);
+                #[cfg(feature = "deploy-host")]
+                register_service_node_ports(identifier, &existing);
                 return Ok(());
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {}
@@ -425,7 +469,7 @@ impl K8sServiceOps for KubernetesRuntime {
 
         let service = agent_service_object(&self.namespace, &svc_name, identifier, service_type);
 
-        services
+        let created_svc = services
             .create(&PostParams::default(), &service)
             .await
             .map_err(|e| {
@@ -434,6 +478,8 @@ impl K8sServiceOps for KubernetesRuntime {
                     e,
                 )
             })?;
+        #[cfg(feature = "deploy-host")]
+        register_service_node_ports(identifier, &created_svc);
 
         info!(
             "[K8S] Service {} created for {} ({})",
@@ -450,6 +496,11 @@ impl K8sServiceOps for KubernetesRuntime {
         let svc_name = self.agent_service_name(identifier, service_type)?;
         let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
 
+        // deploy-host：Service 删除同步注销发布端口注册表（键 = identifier）
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            shared_types::published::unregister(identifier);
+        }
         match services.delete(&svc_name, &DeleteParams::default()).await {
             Ok(_) => {
                 info!("[K8S] Service {} deleted", svc_name);

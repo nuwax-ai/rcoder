@@ -258,6 +258,16 @@ impl KubernetesRuntime {
         // 实际 K8s Service 名对齐)。不要过 agent_service_name/pod_name —— 那会再叠一层
         // service_container_prefix,产生 {prefix}-{prefix}-{id}-svc 双前缀(生产 bug 根因:
         // service_url 多出 rcoder-k8s- 前缀 → permission/cancel/stop transport error)。
+        // deploy-host：返回注册表查表键（identifier = container_name 同源；
+        // 端口级地址由消费方经 published 注册表解析 127.0.0.1:{nodePort}）
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            debug!(
+                "[deploy-host] agent access address key: identifier={}",
+                identifier
+            );
+            return identifier.to_string();
+        }
         let fqdn = shared_types::build_k8s_service_fqdn(
             identifier,
             &self.namespace,
@@ -289,11 +299,31 @@ impl KubernetesRuntime {
             project_id: project_id.to_string(),
             status: String::from(pod_info.status.clone()),
             created_at: pod_info.created_at,
-            service_url: format!(
-                "http://{}:{}",
-                access_address,
-                shared_types::HTTP_DEFAULT_PORT
-            ),
+            service_url: {
+                #[cfg(feature = "deploy-host")]
+                let url = if shared_types::is_deploy_host() {
+                    format!(
+                        "http://{}",
+                        shared_types::published::resolve_published_addr(
+                            &access_address,
+                            shared_types::HTTP_DEFAULT_PORT
+                        )
+                    )
+                } else {
+                    format!(
+                        "http://{}:{}",
+                        access_address,
+                        shared_types::HTTP_DEFAULT_PORT
+                    )
+                };
+                #[cfg(not(feature = "deploy-host"))]
+                let url = format!(
+                    "http://{}:{}",
+                    access_address,
+                    shared_types::HTTP_DEFAULT_PORT
+                );
+                url
+            },
             workload_uid: None,
         })
     }
