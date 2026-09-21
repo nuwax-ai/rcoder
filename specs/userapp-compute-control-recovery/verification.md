@@ -1028,3 +1028,18 @@ Docker 遗留清理明细：rcoder-crash-bee781723f7c44ab 项目 down -v；22 �
 - 期间发现并修复：owner last-drop 语义回归（ec9fe167，契约 53→55 断言全绿验证）；转发专用 client 短 pool idle（2c5e7bc9）。
 - remote-k8s smoke：PASS；userapp：阻断归因如上（非本批代码回归）。
 - 遗留：TS file-server build 端点（跨仓库）；131 节点网络间歇（NodeNotReady 后 API timeout/conn reset 两次）。
+
+### 2026-09-21 深夜：userapp 131 根因深挖——四层真凶连环修复，18 前置场景历史最佳
+
+**深挖轮次**（每轮 verify 全链路 ~12min，共 9 轮）逐层剥离出四个独立真 bug：
+
+1. **owner last-drop 泄漏**（ec9fe167）：supervie 重写的 Shared 含队列 sender 被 worker 持有→循环引用→owner 永不退出。turso 契约暴露（53/55 断言），修复后契约全绿。
+2. **转发空闲死连接复用**（2c5e7bc9）：shared client pool_idle 90s 复用 server 已关连接→POST 不重试。修：dev 转发专用 client（3s idle）。
+3. **liveness 30s 窗口误杀**（ef4d1ca5）：control-plane 混部节点高负载下 8086 间歇卡顿>3s×3 连败→kubelet SIGTERM 活容器（restartCount=2 与断连时刻吻合实证）→在途连接 RST。修：10s×6（60s 宽限）。
+4. **git 同步 IO 阻塞 runtime**（ba328211）：init_repo/init_and_commit（git2 同步+RBD fsync 秒级）在 async 上下文直调→accept 停滞→readiness reset/超时+转发 RST。修：offloaded 包装（spawn_blocking）迁移全部 5 个生产调用点。
+
+**修复效果**：前置场景 14（修复前 6 轮恒定）→ **18**（recreate/cleanup/baseline 等 git 路径场景全过，历史最佳）。
+
+**剩余未解面（精确收窄）**：import_A→build_A 断连仍复现，本轮表现为 8086 **connection refused**（进程短暂消失，非阻塞非 RST）——**容器内编排层重启 8086 持有进程**（agent_runner dev-server 子进程，pid 1/134 双实例结构）的机制未定位：k8s 层无重启（liveness 已放宽、无 OOM、Killing 仅清理）；app-cli 无 60000/8086 管理；supervisord 只管 postgresql/dbx/ttyd；节点日志已被轮转不可考古。**下一步需 pod 内实时观测**（strace/进程监控脚本抓 8086 持有者被重启瞬间的父进程信号链）。
+
+**归因修正**：此前"TS file-server build 端点崩溃"结论**错误**——TsFirst 下 /api/v1/userapp/* 明确路由 Rust 上游；TS 无该路由族（零命中）。前报告相关表述以本节为准。
