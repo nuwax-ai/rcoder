@@ -1,0 +1,334 @@
+//! 引擎装配序（自 rcoder bin 的 main.rs:86-315 收敛为单一入口，零行为搬迁）。
+//!
+//! ## 为何必须晚绑定（构造环 + 数据平面先行 + 失败隔离）
+//!
+//! 本函数内三处 Pingora 槽回填（`set_app_runtime_ip_resolver` /
+//! `set_preview_routing` / `set_dev_ensure`）与 `activity_registry.set_runtime`
+//! 的 OnceLock 填充是**构造环的正当解**，不是待清除的坏味道：
+//!
+//! 1. **构造环**：`AppState::new` 的入参持有 `pingora_service` 的 Arc，而
+//!    Pingora 的 `dev_ensure_slot` 需要 `Weak<AppState>`——互相持有必有一方
+//!    晚绑定（ArcSwapOption 槽 + Weak 引用，不延长生命周期）。
+//! 2. **数据平面先行**：Pingora 在引擎装配早期即 spawn 监听，axum 主服务在
+//!    全部装配完成后才 serve。proxy 承载 VNC/ttyd/dbx/预览/端口代理，且
+//!    "开终端自动 ensure"是使用语义——端口必须尽早 listen，不能等存储开库、
+//!    AppService 装配、恢复扫描跑完。
+//! 3. **失败隔离**：preview_assembly / file-server 装配失败不拖垮已 listen
+//!    的数据平面；反向亦然。
+//!
+//! 三个 set_* 的调用顺序在本函数内固定为编译期协议；http-server（Phase 1）
+//! 与 desktop（Phase 6）共享本入口，两条前端时序不分叉。
+
+use std::sync::Arc;
+
+use tracing::{error, info, warn};
+
+use crate::app_state::AppState;
+use crate::bootstrap;
+use crate::*;
+use docker_manager::runtime_selection::RuntimeType;
+
+/// 引擎装配产物：服务组合（http-server bin / desktop）继续装配 HTTP 面与
+/// 关停编排所需的全部句柄。`_config_watcher` 下划线字段名保持 watcher 存活。
+pub struct AssembledEngine {
+    pub state: Arc<AppState>,
+    pub merged_fs: file_server_embed::MergedFileServer,
+    pub proxy_result: proxy_init::ProxyInitResult,
+    pub bg_handles: background_tasks::BackgroundTaskHandles,
+    /// 关停广播源（serve/后台任务/Pingora 共用）；clone 给各消费方。
+    pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    /// 在装配早期（信号 handler 安装后立即）订阅并保持到关停等待——
+    /// 装配期间到达的信号不丢失（与原 main.rs:165 同点同语义）。
+    pub shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    pub config: config::AppConfig,
+    pub telemetry: Arc<rcoder_telemetry::TelemetryGuard>,
+    pub runtime_for_shutdown: Arc<dyn container_runtime_api::ContainerRuntime>,
+    pub projects_for_shutdown: Arc<ProjectStoreBackend>,
+    pub userapp_store_control: Arc<dyn rcoder_storage::userapp_lifecycle::UserAppStoreControl>,
+    pub activity_for_shutdown: Arc<app_manager::AppActivityRegistry>,
+    pub userapp_op_flight: Arc<userapp_builder::shutdown_gate::OperationFlightGate>,
+    pub userapp_recovery: Option<tokio::task::JoinHandle<()>>,
+    pub _config_watcher: Option<config_watcher::ConfigWatcher>,
+}
+
+/// 引擎装配序（详见模块文档）。bootstrap 之后、HTTP 面之前的全部启动逻辑。
+pub async fn assemble(
+    bootstrap_result: bootstrap::BootstrapResult,
+) -> anyhow::Result<AssembledEngine> {
+    let runtime_type = RuntimeType::from_env();
+    let is_kubernetes = shared_types::is_kubernetes_runtime();
+    info!(
+        "Runtime type: {:?}, is_kubernetes_runtime: {}",
+        runtime_type, is_kubernetes
+    );
+    info!(
+        "🔧 [STARTUP] Container runtime: {}",
+        if is_kubernetes {
+            "Kubernetes"
+        } else {
+            "Docker"
+        }
+    );
+
+    docker_init::init_path_resolver(runtime_type).await?;
+    docker_init::init_docker_manager(&bootstrap_result.config).await?;
+    docker_init::startup_cleanup(&bootstrap_result.config).await;
+
+    // 提前创建存储后端（M4：按 config.storage 分叉 Memory/Postgres 枚举），
+    // 以便同一 Arc 实例同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层
+    // （统一容器 IP 数据源）和作为 AppState.projects 共享给业务逻辑。
+    let cluster_domain = shared_types::get_k8s_cluster_domain();
+    let (projects_backend, cleanup_rx) = match bootstrap_result.config.storage.backend {
+        config::StorageBackend::Memory => {
+            let (adapter, cleanup_rx) = ProjectAdapter::new(
+                bootstrap_result.config.app_manager.namespace.clone(),
+                cluster_domain.clone(),
+            );
+            (ProjectStoreBackend::Memory(Arc::new(adapter)), cleanup_rx)
+        }
+        // PG 模式 fail fast：未编译 feature / 连接失败 / 迁移失败均直接退出，
+        // 绝不静默降级内存（会造成 PG 与镜像分叉）
+        #[cfg(feature = "rcoder-pg")]
+        config::StorageBackend::Postgres => {
+            let pg_config = &bootstrap_result.config.storage.postgres;
+            let (store, cleanup_rx) = rcoder_storage::pg::PgStore::connect(
+                pg_config,
+                bootstrap_result.config.app_manager.namespace.clone(),
+                cluster_domain.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("[STORAGE_PG] postgres backend init failed: {e:#}");
+                std::process::exit(1);
+            });
+            (ProjectStoreBackend::Postgres(Arc::new(store)), cleanup_rx)
+        }
+        #[cfg(not(feature = "rcoder-pg"))]
+        config::StorageBackend::Postgres => {
+            eprintln!(
+                "storage.backend=postgres 但二进制未编译 rcoder-pg feature；\
+                 请用 --features rcoder-pg 构建，或将 RCODER_STORAGE_BACKEND 设为 memory"
+            );
+            std::process::exit(1);
+        }
+    };
+    let projects = Arc::new(projects_backend);
+    // 关停 flush 用的克隆（AppState::new 会 move 主 Arc）
+    let projects_for_shutdown = Arc::clone(&projects);
+
+    // 克隆同一 Arc 实例供 Pingora 代理层使用（共享底层数据）。
+    // 必须先得到具体类型 Arc<ProjectStoreBackend>，再在其上做 unsized coercion
+    // 到 trait object，避免类型推断把 clone 的类型参数反向绑定为 dyn。
+    let projects_for_lookup = Arc::clone(&projects);
+    let container_lookup: Arc<dyn shared_types::ContainerLookup> = projects_for_lookup;
+
+    // Userapp 活动状态注册表（闲置回收 + 流量唤醒的共享状态）。
+    // 独立 Arc 在 Pingora 之前构造（注入代理层）；runtime 延迟到下方 RuntimeManager::get 后
+    // 经 set_runtime 填充（OnceLock）——wake 只在 is_stopped 真时触发，而 stopped 表要到
+    // AppService::new 才填充，此时 OnceLock 早已 set。
+    let wake_timeout = std::time::Duration::from_secs(
+        bootstrap_result.config.userapp_recycle.wake_timeout_seconds,
+    );
+    let activity_registry: Arc<app_manager::AppActivityRegistry> =
+        Arc::new(app_manager::AppActivityRegistry::new(wake_timeout));
+    let access_tracker: Arc<dyn shared_types::AppAccessTracker> = activity_registry.clone();
+    let wake_control: Arc<dyn shared_types::AppWakeControl> = activity_registry.clone();
+
+    let proxy_result = proxy_init::init_proxy(
+        &bootstrap_result.config,
+        Arc::clone(&bootstrap_result.api_key_config),
+        container_lookup,
+        access_tracker,
+        wake_control,
+    )
+    .await;
+    proxy_init::log_proxy_info(&bootstrap_result.config);
+
+    // panic 位置+消息进 tracing 文件日志（catch_unwind 兜底只拿得到消息文本，
+    // 位置原本只在默认 hook 的 stderr——两路日志，排障对不上代码行）
+    shutdown::set_panic_hook();
+    let shutdown_tx = shutdown::setup_signal_handlers();
+    // Retain signals during asynchronous AppState/background initialization.
+    let shutdown_rx = shutdown_tx.subscribe();
+
+    let _config_watcher = if bootstrap_result.config_watcher_enabled {
+        match config_watcher::ConfigWatcher::new(
+            bootstrap_result.config_file_path.clone(),
+            Arc::clone(&bootstrap_result.api_key_config),
+        ) {
+            Ok(watcher) => {
+                info!(
+                    "📁 Config file watcher started: {:?}",
+                    bootstrap_result.config_file_path
+                );
+                Some(watcher)
+            }
+            Err(e) => {
+                warn!("config file watcher start failed: {}, API Key updated", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (container_prefix_rcoder, container_prefix_computer) =
+        docker_init::get_container_prefixes(&bootstrap_result.config).await?;
+
+    // 获取容器运行时（在 init_docker_manager 之后可用）
+    let runtime = docker_manager::runtime::RuntimeManager::get()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get container runtime: {}", e))?;
+
+    // 注入 runtime 到活动注册表（wake 需要 scale + 查 status；启动早期 OnceLock 为空，此处填充）。
+    // trait upcasting: Arc<dyn ContainerRuntime> → Arc<dyn UserAppRuntime>（supertrait，Rust 1.86+）
+    activity_registry.set_runtime(runtime.clone());
+
+    // userApp 运行容器终端/数据库代理的 IPv4 解析回填（Docker 模式 ttyd 只 bind
+    // IPv4，见 shared_types::AppRuntimeIpResolver；Pingora 已启动——ArcSwap 槽生效）。
+    if let Some(pingora_service) = proxy_result.pingora_service.as_ref() {
+        pingora_service.set_app_runtime_ip_resolver(Arc::new(
+            proxy_init::DockerRuntimeIpResolver::new(runtime.clone()),
+        ));
+    }
+
+    // 阶段2 批量迁移: 启动后台 task 将共享 PVC 老数据一次性迁到 per-agent PVC (env 开关, 默认 false)
+    batch_migrate::spawn_if_enabled(runtime.clone());
+
+    // 启动 skill sync reconciler: 后台补齐旧 workspace 缺的 fan-out 目录 (grok/pi/...),
+    // 版本 marker 驱动, 已同步的 O(1) 跳过。env RCODER_SKILL_SYNC_RECONCILE_ON_STARTUP 默认 true。
+    skill_sync_reconciler::spawn_skill_sync_reconciler();
+
+    // file-server 路由合并进主服务（无独立 listener/端口；60000 让位反向代理）。
+    // runtime 无条件注册, create_router 经 merged_router() 构造基础路由挂进主 Router
+    // （project/computer/git/build 老路径 + SubvolumeWorkspaceResolver per-agent PVC 解析）。
+    let ws_runtime: Arc<dyn container_runtime_api::WorkspaceRuntime> = runtime.clone();
+    file_server_embed::register_runtime(ws_runtime);
+
+    // Custom Page 预览协调器装配（config 段 preview_coordinator）：
+    // 存储构建（K8s=PG / 其他=进程内）+ 令牌 fail-fast + kube 宿主证据；
+    // 未配置/enabled=false → 全部现状行为（协调器 None）。
+    let mut preview_asm = preview_assembly::bootstrap(&bootstrap_result.config).await?;
+    if let Some(section) = preview_asm.config.as_mut() {
+        // 对等副本派发端口 = 本进程对外主 API 端口（同 Service 8086 面）。
+        section.peer_api_port = bootstrap_result.config.port;
+    }
+    let merged_fs = match file_server_embed::merged_router(preview_asm) {
+        Ok(merged) => merged,
+        Err(e) => {
+            warn!("file-server 路由装配失败（主服务照常启动）: {e}");
+            file_server_embed::MergedFileServer {
+                router: axum::Router::new(),
+                coordinator: None,
+            }
+        }
+    };
+    if let Some(coordinator) = merged_fs.coordinator.as_ref() {
+        // 启动对账（同 Pod 旧 boot 代次实例判停）+ 后台任务（心跳/刷盘/回收）。
+        coordinator.run_startup_reconcile().await;
+        coordinator.spawn_background_tasks(shutdown_tx.clone());
+        // Pingora 预览路由槽回填（协调器晚于 Pingora 启动，与 dev_ensure 同款模式）：
+        // `/proxy/{port}` 预览解析 + `/internal/preview-forward` 宿主校验入口。
+        if let Some(pingora_service) = proxy_result.pingora_service.as_ref() {
+            let proxy_listen_port = bootstrap_result
+                .config
+                .proxy_config
+                .as_ref()
+                .map(|proxy| proxy.listen_port)
+                .unwrap_or(8088);
+            pingora_service.set_preview_routing(rcoder_proxy::service::PreviewRouteDeps {
+                coordination: coordinator.clone(),
+                peer_api_port: bootstrap_result.config.port,
+                peer_proxy_port: proxy_listen_port,
+                internal_token: coordinator.internal_token().to_string(),
+            });
+        }
+    }
+    let preview_enabled = merged_fs.coordinator.is_some();
+
+    // 60000 file-server 分流反代（Java/外部入口，独立 crate file-server-proxy）：
+    // x-service-type: userapp → 本主服务（8086），其余 → TS nuwax-file-server（60001）。
+    // 配置无条件注册（段缺失时兜底默认端口但 rust 上游对准本服务实际端口，
+    // 供运行时 `rcoder file-server start` 拉起）；段存在时自动启动（本地 dev 无段
+    // 则不监听 60000）。运行时启停经
+    // /api/system/file-server/*（`rcoder file-server {start,stop,restart,status}`）。
+    // 预览协调启用时：dev 生命周期 7 端点在所有策略下改路 Rust 上游（coordinated_dev_lifecycle）。
+    // N07 内嵌形态 env 通道（2026-09-19 线上事故治本）：config.yml 两条
+    // 构造路径此前都不读 FILE_SERVER_PROXY_PUBLIC_BIND——env 只对独立进程
+    // 形态生效，内嵌形态"env 设了却没用"。此处收口统一叠加（OR 语义，
+    // 与独立进程形态同词表"1"/"true"）。
+    file_server_proxy::init(file_server_embed::embedded_proxy_config(
+        bootstrap_result.config.file_server_proxy.clone(),
+        preview_enabled,
+        bootstrap_result.config.port,
+    ));
+    if bootstrap_result.config.file_server_proxy.is_some() {
+        // 同步 bind 语义：启动失败（如端口被占）此刻即报，不留到首个请求
+        if let Err(e) = file_server_proxy::try_start().await {
+            error!("file-server 分流代理启动失败: {e}");
+        }
+    }
+
+    // AppState::new 返回 Arc<Self>（内部完成 dev_locator 等需回指 state 的装配）
+    let state = AppState::new(
+        bootstrap_result.config.clone(),
+        proxy_result.pingora_service.clone(),
+        bootstrap_result.api_key_config,
+        container_prefix_rcoder,
+        container_prefix_computer,
+        runtime,
+        projects,
+        cleanup_rx,
+        activity_registry.clone(),
+        shutdown_tx.clone(),
+    )
+    .await?;
+
+    // dev 终端代理（ttyd/vnc/audio/ime/dbx）的懒启动回调回填：开终端是使用
+    // 语义，开发容器不在时自动 ensure 创建而非 404（owner 走 metadata 链——
+    // 浏览器终端 URL 无入参携带能力）。AppState 就绪晚于 Pingora 启动，
+    // ArcSwap 槽回填生效（与 set_app_runtime_ip_resolver 同款时序）。
+    if let Some(pingora_service) = proxy_result.pingora_service.as_ref() {
+        pingora_service.set_dev_ensure(userapp_builder::dev_ensure_for_proxy(Arc::downgrade(
+            &state,
+        )));
+    }
+
+    let bg_handles = background_tasks::start_all_background_tasks(
+        &bootstrap_result.config,
+        state.clone(),
+        shutdown_tx.clone(),
+    )
+    .await?;
+
+    let runtime_for_shutdown = state.runtime().clone();
+    // 存储关机控制（trait-design §6）：state 即将 move 进 router，先留出句柄
+    let userapp_store_control = state.userapp_store_control.clone();
+    let activity_for_shutdown = state.activity.clone();
+    // R02：在途协调门闸 + 恢复扫描器句柄（take——扫描器随关机退出）
+    let userapp_op_flight = state.userapp_op_flight.clone();
+    let userapp_recovery = state
+        .userapp_recovery_handle
+        .lock()
+        .map(|mut guard| guard.take())
+        .ok()
+        .flatten();
+
+    Ok(AssembledEngine {
+        state,
+        merged_fs,
+        proxy_result,
+        bg_handles,
+        shutdown_tx,
+        shutdown_rx,
+        config: bootstrap_result.config,
+        telemetry: bootstrap_result.telemetry,
+        runtime_for_shutdown,
+        projects_for_shutdown,
+        userapp_store_control,
+        activity_for_shutdown,
+        userapp_op_flight,
+        userapp_recovery,
+        _config_watcher,
+    })
+}

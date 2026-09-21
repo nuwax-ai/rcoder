@@ -7,6 +7,7 @@
 //! 依赖方向 rcoder → rcoder_engine 单向无环。
 
 pub mod app_state;
+pub mod assemble;
 pub mod background_tasks;
 pub mod batch_migrate;
 pub mod bootstrap;
