@@ -409,7 +409,6 @@ pub(crate) async fn discover_missing_identity(
     Ok(state.app_service.discover_missing_identity(app_id).await?)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,4 +431,3 @@ mod tests {
         assert!(validate_request("app", &invalid).is_err());
     }
 }
-
