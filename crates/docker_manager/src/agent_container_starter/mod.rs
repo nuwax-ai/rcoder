@@ -246,6 +246,14 @@ impl<'a> AgentContainerStarter<'a> {
         // 透传服务级安全配置（仅 Docker 模式生效；None 时 build_host_config 走代码默认）
         builder = builder.security(service_config.security.clone());
 
+        // deploy-host：按服务类型发布端口（宿主端口 Docker 分配，创建后读回注册）
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            for port in crate::deploy_host_ports::published_ports_for(&service_type) {
+                builder = builder.auto_port_binding(port);
+            }
+        }
+
         // 添加环境变量
         // 处理其他环境变量中的模板（先处理，因为后续需要使用 project_id/user_id 的值）
         for (key, value) in &service_config.environment {
@@ -400,6 +408,29 @@ impl<'a> AgentContainerStarter<'a> {
                     pid
                 );
             }
+        }
+
+        // deploy-host：从容器 inspect 读回实际发布端口并登记注册表（必须在
+        // 就绪等待前——健康检查经注册表解析 127.0.0.1:host_port）
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            let inspect = self
+                .manager
+                .docker
+                .inspect_container(
+                    &created.container_id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .map_err(|e| {
+                    DockerError::ContainerCreationError(format!(
+                        "deploy-host port read-back inspect failed: {e}"
+                    ))
+                })?;
+            crate::deploy_host_ports::register_from_inspect(
+                &container_id,
+                &inspect.network_settings.and_then(|ns| ns.ports),
+            )?;
         }
 
         // 5. 等待就绪并返回信息

@@ -15,6 +15,8 @@ pub mod api_cache;
 pub mod container_builder;
 pub mod container_creator;
 pub mod container_query;
+#[cfg(feature = "deploy-host")]
+pub mod deploy_host_ports;
 pub mod health;
 pub mod image_management;
 pub mod manager_cleanup;

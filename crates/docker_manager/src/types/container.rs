@@ -26,6 +26,11 @@ pub struct DockerContainerConfig {
     pub env_vars: HashMap<String, String>,
     /// 端口映射
     pub port_bindings: HashMap<String, String>,
+    /// deploy-host 自动发布端口（容器端口号；宿主端口 Docker 分配）。
+    /// serde default 空 = 非 deploy-host 构建零行为变化。
+    #[serde(default)]
+    #[cfg(feature = "deploy-host")]
+    pub auto_port_bindings: Vec<u16>,
     /// 网络模式
     pub network_mode: String,
     /// 自动删除
@@ -112,6 +117,8 @@ impl DockerContainerConfig {
             work_dir: crate::DEFAULT_WORK_DIR.to_string(),
             env_vars: HashMap::new(),
             port_bindings: HashMap::new(),
+            #[cfg(feature = "deploy-host")]
+            auto_port_bindings: Vec::new(),
             network_mode: crate::DEFAULT_NETWORK_MODE.to_string(),
             auto_remove: false,
             resource_limits: None,

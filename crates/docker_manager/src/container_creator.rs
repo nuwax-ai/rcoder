@@ -114,8 +114,12 @@ impl<'a> ContainerCreator<'a> {
         // 6. 构建环境变量（消耗 config.env_vars）
         let env_vars = build_env_vars(config.env_vars);
 
-        // 7. 构建端口映射
-        let port_bindings_map = build_port_bindings(&port_bindings);
+        // 7. 构建端口映射（deploy-host 的自动发布端口并入：宿主端口留空由
+        // Docker 分配，创建后经 inspect 读回登记注册表）
+        #[cfg(feature = "deploy-host")]
+        let port_bindings_map = build_port_bindings(&port_bindings, &config.auto_port_bindings);
+        #[cfg(not(feature = "deploy-host"))]
+        let port_bindings_map = build_port_bindings(&port_bindings, &[]);
 
         // 8. 构建主机配置
         let host_config = build_host_config(
@@ -566,8 +570,14 @@ fn build_env_vars(env_vars: HashMap<String, String>) -> Vec<String> {
 }
 
 /// 构建端口映射
+///
+/// 显式映射保持既有语义（host_port 由调用方指定）；
+/// `auto_container_ports`（deploy-host 自动发布清单）以 `host_port: None`
+/// 发给 Docker——daemon 分配宿主端口，创建后 inspect 读回（同
+/// docker_app_create 的 Tcp 端口先例）。
 fn build_port_bindings(
     port_bindings: &HashMap<String, String>,
+    auto_container_ports: &[u16],
 ) -> HashMap<String, Option<Vec<PortBinding>>> {
     let mut map = HashMap::new();
     for (container_port, host_port) in port_bindings {
@@ -578,6 +588,15 @@ fn build_port_bindings(
                 host_port: Some(host_port.clone()),
             }]),
         );
+    }
+    for container_port in auto_container_ports {
+        let key = format!("{}/tcp", container_port);
+        map.entry(key).or_insert_with(|| {
+            Some(vec![PortBinding {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: None,
+            }])
+        });
     }
     map
 }

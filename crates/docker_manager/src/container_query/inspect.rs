@@ -37,6 +37,12 @@ impl DockerManager {
     /// 从 DockerManager 的内存缓存中移除容器信息。
     /// 通常在容器被销毁后调用，以保持缓存与实际状态同步。
     pub async fn remove_container_cache(&self, project_id: &str) -> Option<DockerContainerInfo> {
+        // deploy-host：容器缓存移除时同步注销发布端口（注册键 = 容器名 =
+        // project_id 逻辑名；同名重建由整表替换自愈）
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            shared_types::published::unregister(project_id);
+        }
         self.containers.remove(project_id).await
     }
 

@@ -186,7 +186,26 @@ impl DockerManager {
                 DockerError::ConnectionError("Container not connected to any network".to_string())
             })?;
 
-        // 3. 构建服务 URL (Agent 内部默认监听 HTTP_DEFAULT_PORT=8086)
+        // 3. 构建服务 URL (Agent 内部默认监听 HTTP_DEFAULT_PORT=8086)。
+        // deploy-host：经 published-port 注册表解析 127.0.0.1:host_port（宿主机
+        // 无法路由容器网段 IP；注册键 = container_name）。
+        #[cfg(feature = "deploy-host")]
+        let server_url = if shared_types::is_deploy_host() {
+            format!(
+                "http://{}",
+                shared_types::published::resolve_published_addr(
+                    &container_info.container_name,
+                    shared_types::HTTP_DEFAULT_PORT
+                )
+            )
+        } else {
+            format!(
+                "http://{}:{}",
+                container_ip,
+                shared_types::HTTP_DEFAULT_PORT
+            )
+        };
+        #[cfg(not(feature = "deploy-host"))]
         let server_url = format!(
             "http://{}:{}",
             container_ip,

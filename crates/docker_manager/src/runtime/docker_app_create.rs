@@ -148,6 +148,24 @@ impl DockerRuntime {
                 );
             }
         }
+        // deploy-host：Http 端口（app-entry 9080 等）一并发布——容器形态 Http
+        // 走 Pingora 经容器 IP，宿主机形态 Pingora 数据面同样经注册表拨号，
+        // 全部暴露端口需发布到宿主机
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host()
+            && let Some(ports) = &params.ports
+        {
+            for p in ports.iter().filter(|p| p.expose_type == ExposeType::Http) {
+                port_bindings
+                    .entry(format!("{}/tcp", p.port))
+                    .or_insert_with(|| {
+                        Some(vec![PortBinding {
+                            host_ip: Some("0.0.0.0".to_string()),
+                            host_port: None,
+                        }])
+                    });
+            }
+        }
 
         // 挂载组装（prod 四目录压平，与 dev builder 同构）在 docker_app_mounts.rs——
         // 锚点反解 fail fast + 预创建 + 四 bind（恒四个，非空）。
@@ -262,12 +280,30 @@ impl DockerRuntime {
 
         // 短轮询等待 container_ip 就绪（容器刚 start，IP 可能尚未分配）。
         // 优先取主网络网卡的 IP，回退任意网卡；最多重试 6 次 × 200ms。
+        // deploy-host：同一 inspect 读回发布端口登记注册表（键 = container_name，
+        // 与 funnel/清理路径同源）。
         let preferred = Some(main_network.as_str());
         let ip = {
             let mut ip = String::new();
             for attempt in 0..6u32 {
                 match client.inspect_container(&created.id, None).await {
                     Ok(inspect) => {
+                        #[cfg(feature = "deploy-host")]
+                        if shared_types::is_deploy_host() {
+                            let ports_ref = inspect
+                                .network_settings
+                                .as_ref()
+                                .and_then(|ns| ns.ports.clone());
+                            crate::deploy_host_ports::register_from_inspect(
+                                &container_name,
+                                &ports_ref,
+                            )
+                            .map_err(|e| {
+                                ContainerRuntimeError::DockerError(format!(
+                                    "deploy-host app port registration failed: {e}"
+                                ))
+                            })?;
+                        }
                         ip = extract_container_ip(&inspect, preferred);
                         if !ip.is_empty() {
                             break;

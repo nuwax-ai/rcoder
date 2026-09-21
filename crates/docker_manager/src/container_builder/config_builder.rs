@@ -35,6 +35,10 @@ pub struct ContainerConfigBuilder {
     work_dir: Option<String>,
     env_vars: HashMap<String, String>,
     port_bindings: HashMap<String, String>,
+    /// deploy-host 自动发布端口（容器端口号；宿主端口由 Docker 分配）。
+    /// serde default 空 = 非 deploy-host 构建零行为变化。
+    #[cfg(feature = "deploy-host")]
+    auto_port_bindings: Vec<u16>,
     network_mode: Option<String>,
     auto_remove: bool,
     resource_limits: Option<ServiceResourceLimits>,
@@ -68,6 +72,8 @@ impl ContainerConfigBuilder {
             work_dir: None,
             env_vars: HashMap::new(),
             port_bindings: HashMap::new(),
+            #[cfg(feature = "deploy-host")]
+            auto_port_bindings: Vec::new(),
             network_mode: None,
             auto_remove: false,
             resource_limits: None,
@@ -141,6 +147,13 @@ impl ContainerConfigBuilder {
     /// 批量添加端口映射
     pub fn port_bindings(mut self, bindings: HashMap<String, String>) -> Self {
         self.port_bindings.extend(bindings);
+        self
+    }
+
+    /// deploy-host：追加自动发布端口（容器端口号，宿主端口由 Docker 分配）。
+    #[cfg(feature = "deploy-host")]
+    pub fn auto_port_binding(mut self, container_port: u16) -> Self {
+        self.auto_port_bindings.push(container_port);
         self
     }
 
@@ -262,6 +275,8 @@ impl ContainerConfigBuilder {
             work_dir,
             env_vars: self.env_vars,
             port_bindings: self.port_bindings,
+            #[cfg(feature = "deploy-host")]
+            auto_port_bindings: self.auto_port_bindings,
             network_mode,
             auto_remove: self.auto_remove,
             resource_limits: self.resource_limits,

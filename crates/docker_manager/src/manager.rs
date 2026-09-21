@@ -341,6 +341,10 @@ impl DockerManager {
                 status_code: 404, ..
             }) => {
                 // 容器不存在（HTTP 404），从映射中移除
+                #[cfg(feature = "deploy-host")]
+                if shared_types::is_deploy_host() {
+                    shared_types::published::unregister(project_id);
+                }
                 self.containers.remove(project_id).await;
                 Ok(None)
             }
