@@ -105,7 +105,9 @@ impl DevServerManager {
     ///   幂等按原 operation_id 恢复）；
     /// - 无登记但有 owner 应答 → 核验项目归属、读取控制凭据，持久化停止
     ///   意图后通过 owner API 停止；身份不符则拒绝；
-    /// - 连接被拒绝 → 无 owner；超时或协议错误不能当作已停止。
+    /// - 连接被拒绝或 identity 503（run 模式 app-cli 的
+    ///   ERR_PROTOCOL_UNSUPPORTED——无 runtime kernel，非 runtime owner）→
+    ///   无 owner，无登记时幂等成功；超时或其他协议错误不能当作已停止。
     pub async fn stop_userapp_dev(
         &self,
         project_id: &str,
@@ -964,12 +966,48 @@ mod external_stop_tests {
         server.abort();
     }
 
+    /// 503 = run 模式 app-cli（无 runtime kernel）在 identity 端点的
+    /// ERR_PROTOCOL_UNSUPPORTED 应答——归类为"无 runtime owner"（4a2610917
+    /// 拍板：dev 标准链 owner 恒此形态，按错误判会阻塞全部停止）。无登记时
+    /// stop 幂等成功且不杀任何进程（不 ps 扫杀、不误杀编排进程）。
     #[tokio::test]
-    async fn owner_http_error_does_not_report_stop_success() {
+    async fn run_mode_owner_503_means_no_runtime_owner_and_stop_is_idempotent() {
         let root = tempfile::tempdir().unwrap();
         let app = axum::Router::new().route(
             "/v1/runtime/identity",
             axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = crate::Config::from_env().unwrap();
+        config.log_base_dir = root.path().join("logs");
+        config.app_cli_admin_probe_addr = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let manager = DevServerManager::new(Arc::new(config));
+        let stopped = manager
+            .stop_userapp_dev("userapp:absent", root.path())
+            .await
+            .unwrap();
+        assert!(
+            !stopped.owner_stopped,
+            "no runtime owner acknowledged a stop"
+        );
+        assert!(
+            stopped.killed_pids.is_empty(),
+            "must not kill unregistered pids"
+        );
+        task.abort();
+    }
+
+    /// 非 503 的 5xx（如 500）仍按观察失败报错——不确认停止，保留原
+    /// "owner 应答异常不得谎报成功"的保护意图（仅 503 例外，见上）。
+    #[tokio::test]
+    async fn owner_http_500_does_not_report_stop_success() {
+        let root = tempfile::tempdir().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/runtime/identity",
+            axum::routing::get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = crate::Config::from_env().unwrap();
