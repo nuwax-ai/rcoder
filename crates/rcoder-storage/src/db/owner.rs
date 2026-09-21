@@ -3,7 +3,9 @@
 //! A queued job is a complete business transaction, not an individual SQL statement.
 //! Cancelling its caller drops only the reply receiver. User shutdown rejects
 //! admission, drains every accepted job, drops the database and its runtime, then
-//! joins the owning thread before publishing a shared shutdown result.
+//! joins the owning thread before publishing a shared shutdown result. (When a
+//! panic has already frozen intake, the still-queued backlog cannot be served;
+//! it is dropped and those callers see OutcomeUnknown instead.)
 //!
 //! A panicking task (for example toasty 0.10.0's connection-channel
 //! `unwrap` on a transient backend blip) reports `OutcomeUnknown` to its own
@@ -15,7 +17,7 @@
 use futures::FutureExt as _;
 use std::{
     future::Future,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, watch};
@@ -41,7 +43,7 @@ struct Shared {
 #[derive(Debug)]
 pub(crate) struct OutcomeUnknown;
 impl std::fmt::Display for OutcomeUnknown {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("database execution outcome is unknown; query the original operation identity")
     }
 }
@@ -87,6 +89,7 @@ impl DatabaseOwner {
         let (ready, initialized) = oneshot::channel();
         let shared = Arc::new(Shared {
             queue: queue.clone(),
+            closing: Mutex::new(false),
             stop: stop.clone(),
             completion: completion.clone(),
         });
@@ -192,7 +195,7 @@ impl DatabaseOwner {
                 .closing
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database admission lock poisoned"))?;
-            anyhow::ensure!(matches!(*closing, false), "database is closing; job was not admitted");
+            anyhow::ensure!(!*closing, "database is closing; job was not admitted");
             self.inner
                 .queue
                 .try_send(job)
@@ -294,8 +297,13 @@ async fn supervise(
                     pending_failure = None;
                 }
                 Reopen::UserStopped => {
-                    // Leave intake paused; the outer loop now only drains stop.
-                    intake_paused = true;
+                    // User stop wins over recovery: the frozen owner must not
+                    // execute the queued backlog either. Drop it — those
+                    // callers already receive OutcomeUnknown from the dropped
+                    // reply channels — and let the loop finish draining stop.
+                    queue.close();
+                    while queue.try_recv().is_ok() {}
+                    queue_drained = true;
                 }
             }
         }

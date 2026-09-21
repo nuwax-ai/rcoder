@@ -21,9 +21,9 @@ impl Drop for Resource {
         self.0.store(true, Ordering::SeqCst);
     }
 }
-async fn owner() -> (DatabaseOwner, Arc<AtomicBool>) {
+async fn owner_with_inflight(max_inflight: usize) -> (DatabaseOwner, Arc<AtomicBool>) {
     let dropped = Arc::new(AtomicBool::new(false));
-    let db = DatabaseOwner::open(8, 1, Resource(dropped.clone()), || async {
+    let db = DatabaseOwner::open(8, max_inflight, Resource(dropped.clone()), || async {
         let db = toasty::Db::builder()
             .models(toasty::models!(Probe))
             .max_pool_size(1)
@@ -35,6 +35,10 @@ async fn owner() -> (DatabaseOwner, Arc<AtomicBool>) {
     .await
     .unwrap();
     (db, dropped)
+}
+
+async fn owner() -> (DatabaseOwner, Arc<AtomicBool>) {
+    owner_with_inflight(1).await
 }
 
 #[tokio::test]
@@ -575,4 +579,120 @@ async fn compute_control_upgrade_preserves_v1_data_and_baseline_checksum() {
         Ok(())
     }).await.unwrap();
     owner.shutdown().await.unwrap();
+}
+
+/// 2026-09-21 生产事故回归（131 环境）：toasty 0.10.0 连接 worker 在 PG
+/// 抖动后退出，后续操作撞 connection.rs 的 send/rx unwrap → panic 落在
+/// owner 任务里。修复前：owner 永久 closing，"database is closing" 直到
+/// 进程重启。修复后：panic 的调用方仍收 OutcomeUnknown（结果未知需核验，
+/// 不伪造），owner 排空后探活恢复受理，后续事务正常执行。
+#[tokio::test]
+async fn panicking_task_reports_unknown_and_owner_recovers() {
+    let (owner, dropped) = owner().await;
+
+    let panicked = owner
+        .execute::<(), _, _>(|_db| async move {
+            panic!("simulated toasty worker-gone unwrap");
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        panicked.to_string().contains("outcome is unknown"),
+        "panicking caller must receive OutcomeUnknown, got: {panicked:#}"
+    );
+
+    // Recovery is drain + one pool probe; poll until admission reopens so
+    // the test never depends on the exact drain instant.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let value = loop {
+        match owner
+            .execute(|mut db| async move {
+                Probe::create()
+                    .id(7)
+                    .revision(0)
+                    .value("recovered")
+                    .exec(&mut db)
+                    .await?;
+                Ok(Probe::get_by_id(&mut db, 7).await?.value)
+            })
+            .await
+        {
+            Ok(value) => break value,
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                assert!(
+                    error.to_string().contains("database is closing"),
+                    "during recovery only the closing rejection is expected, got: {error:#}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("owner did not recover in time: {error:#}"),
+        }
+    };
+    assert_eq!(value, "recovered");
+
+    owner.shutdown().await.unwrap();
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+/// Panic 冻结期间用户关机：停机信号必须压过恢复探活——owner 收束退出、
+/// 不执行积压任务也不悬挂，且未恢复的失败如实上报（fail-fast，不吞错）。
+#[tokio::test]
+async fn user_shutdown_during_frozen_recovery_completes_and_reports_unrecovered_failure() {
+    let (owner, dropped) = owner_with_inflight(2).await;
+
+    // A blocked in-flight task pins the owner in the frozen window: recovery
+    // (drain + probe) cannot proceed while it runs, so every assertion below
+    // is deterministic instead of racing the reopen probe.
+    let (entered, started) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel::<()>();
+    let blocked = tokio::spawn({
+        let owner = owner.clone();
+        async move {
+            owner
+                .execute(move |_db| async move {
+                    entered.send(()).unwrap();
+                    resumed.await.unwrap();
+                    Ok(())
+                })
+                .await
+        }
+    });
+    started.await.unwrap();
+
+    let panicked = owner
+        .execute::<(), _, _>(|_db| async move { panic!("boom") })
+        .await
+        .unwrap_err();
+    assert!(
+        panicked.to_string().contains("outcome is unknown"),
+        "panicking caller must receive OutcomeUnknown, got: {panicked:#}"
+    );
+
+    let rejected = owner
+        .execute::<(), _, _>(|_db| async move { Ok(()) })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        rejected.to_string(),
+        "database is closing; job was not admitted"
+    );
+
+    // Stop lands while the owner is frozen; only then release the in-flight
+    // task, forcing the probe path to observe UserStopped, not a reopen.
+    let shutdown_owner = owner.clone();
+    let shutdown = tokio::spawn(async move { shutdown_owner.shutdown().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    resume.send(()).unwrap();
+    blocked.await.unwrap().unwrap();
+
+    let failure = tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown must complete within budget")
+        .expect("shutdown task must not panic")
+        .unwrap_err();
+    assert!(
+        failure.to_string().contains("did not recover"),
+        "the unrecovered task failure must be reported, got: {failure:#}"
+    );
+    assert!(dropped.load(Ordering::SeqCst));
 }
