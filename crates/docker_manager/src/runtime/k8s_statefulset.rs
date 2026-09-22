@@ -643,7 +643,18 @@ fn canonical_env(env: &[EnvVar]) -> Vec<EnvVar> {
     let mut entries: Vec<EnvVar> = env
         .iter()
         .filter(|entry| !VOLATILE_ENV_KEYS.contains(&entry.name.as_str()))
-        .cloned()
+        .map(|entry| {
+            let mut entry = entry.clone();
+            // 空值归一：apiserver 对 env value="" 的存储不可往返——发送
+            // Some("") 的条目存回读出即无 value 字段（builder 的 USER_ID 恒空
+            // 即 2026-09-22 app-155 全量 ensure/restart 恒 Conflict 的根源，
+            // "drifted keys: ~USER_ID"）。Some("") 与 None 的区别在 API 层
+            // 不可表达，归一后比较才与真实漂移对齐，非放宽校验。
+            if entry.value.as_deref() == Some("") {
+                entry.value = None;
+            }
+            entry
+        })
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
@@ -992,6 +1003,62 @@ mod tests {
         let desired = builder_sts_with_env("hash-current", env, &context);
         let existing = builder_sts_with_env("hash-legacy", drifted_env, &context);
         assert!(validate_builder_statefulset(&existing, &desired, &context).is_err());
+    }
+
+    /// 事故回归闸（2026-09-22 app-155 重启恒失败，"drifted keys: ~USER_ID"）：
+    /// apiserver 对 env value="" 存储不可往返——desired 发 `Some("")` 的条目
+    /// （builder 的 USER_ID 恒空），API 读回是无 value 字段（`None`）。二者
+    /// 必须判等，否则全部存量 builder STS 的 ensure/restart 恒 Conflict。
+    #[test]
+    fn empty_string_env_roundtrip_is_equivalent() {
+        let context = shared_types::UserAppExecutionContext {
+            app_id: "app-one".into(),
+            lifecycle_id: "life-one".into(),
+            operation_id: "operation-one".into(),
+            executor_id: "executor-one".into(),
+            request_fingerprint: "ab".repeat(32),
+        };
+        // desired：创建链构造形态（USER_ID = Some("")，agent/builder 共用模板）
+        let desired_env = vec![
+            EnvVar {
+                name: "USER_ID".into(),
+                value: Some(String::new()),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "PROJECT_ID".into(),
+                value: Some("155".into()),
+                ..Default::default()
+            },
+        ];
+        // existing：apiserver 存回形态（USER_ID 无 value 字段）
+        let stored_env = vec![
+            EnvVar {
+                name: "USER_ID".into(),
+                value: None,
+                ..Default::default()
+            },
+            EnvVar {
+                name: "PROJECT_ID".into(),
+                value: Some("155".into()),
+                ..Default::default()
+            },
+        ];
+        let desired = builder_sts_with_env("hash-current", desired_env, &context);
+        let existing = builder_sts_with_env("hash-current", stored_env.clone(), &context);
+        assert!(matches!(
+            validate_builder_statefulset(&existing, &desired, &context),
+            Ok(BuilderTemplateCheck::Current)
+        ));
+        // 反向同样成立（两侧归一对称）；真实值漂移仍被拒（防归一变放宽）。
+        assert!(matches!(
+            validate_builder_statefulset(&desired, &existing, &context),
+            Ok(BuilderTemplateCheck::Current)
+        ));
+        let mut drifted = stored_env.clone();
+        drifted[0].value = Some("real-user".into());
+        let drifted_sts = builder_sts_with_env("hash-current", drifted, &context);
+        assert!(validate_builder_statefulset(&drifted_sts, &desired, &context).is_err());
     }
 
     #[test]
