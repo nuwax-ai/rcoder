@@ -111,6 +111,11 @@ pub struct AppConfig {
     /// 应用管理配置
     #[serde(default)]
     pub app_manager: app_manager::AppManagerConfig,
+    /// 围栏 holder 死亡兜底收束的超龄门槛（秒）；None/缺省 = 默认 900s
+    /// （≫ 操作 deadline + 租约 TTL 60s）。RecoveryRequired 围栏超龄且持有者
+    /// 已死（无租约绑定 / 物理租约过期）→ 自动收束 Failed，不再永久占受理 slot。
+    #[serde(default)]
+    pub fence_settle_grace_secs: Option<u64>,
 }
 
 pub(crate) fn default_agent_id() -> String {
@@ -164,6 +169,7 @@ impl Default for AppConfig {
                 api_key: generate_random_api_key(),
             },
             app_manager: app_manager::AppManagerConfig::default(),
+            fence_settle_grace_secs: None,
         }
     }
 }

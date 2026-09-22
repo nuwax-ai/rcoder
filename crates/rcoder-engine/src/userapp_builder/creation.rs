@@ -522,10 +522,47 @@ enum FenceEvidence {
     Insufficient,
 }
 
+/// 发布族共用证据：活代 generation + 运行相位。generation == 本操作 =
+/// 本次 rollout 已落地（app 154 事故形态：patch 后零 pod 窗口捕获失败，
+/// rollout 事后照常完成）；generation 属后来操作 = 被取代（与 builder 族
+/// "被另一次操作 ensure"同义）。维持 env 代次 token 口径，勿改
+/// `.metadata.generation`（restart 单写会 bump generation 造成误判）。
+async fn observe_generation_fence(
+    state: &AppState,
+    record: &UserAppOperationRecord,
+) -> FenceEvidence {
+    let Ok(spec) = state.runtime().get_app_container_spec(&record.app_id).await else {
+        return FenceEvidence::Insufficient;
+    };
+    let generation = spec
+        .env
+        .as_ref()
+        .and_then(|env| env.get(shared_types::APP_DEPLOY_GENERATION_ID).cloned());
+    let Some(generation) = generation else {
+        return FenceEvidence::Insufficient;
+    };
+    let superseded = generation != record.operation_id;
+    match state.app_service.get_app(&record.app_id).await {
+        Ok(info) if info.phase == "Running" => FenceEvidence::Observed(serde_json::json!({
+            "kind": if superseded { "superseded_by_newer_generation" }
+                      else { "rollout_completed" },
+            "live_generation": generation,
+            "phase": info.phase,
+            "ready_replicas": info.ready_replicas,
+            "observed_at_us": chrono::Utc::now().timestamp_micros(),
+        })),
+        // 查询失败或相位未定：保持围栏。
+        _ => FenceEvidence::Insufficient,
+    }
+}
+
 /// per-kind 证据谓词。判定规则统一为：**物理状态确定（无死执行者在途写）**，
 /// 而非"操作目标已达成"——围栏的职责是防半应用状态上的并发变更，而围栏
 /// 落盘时执行者已携带已知错误返回（`OwnedOperation::fail`），不存在在途
 /// 写；后继操作自带 admission/capture/precondition 防线。
+///
+/// **穷尽 match（禁通配臂）**：24 个 kind 全部显式列出——新增 kind 时编译
+/// 器强制在此决定证据语义，避免静默落入"无谓词永久围栏"（09-22 用户纪律）。
 async fn observe_fence_evidence(
     state: &AppState,
     record: &UserAppOperationRecord,
@@ -558,33 +595,20 @@ async fn observe_fence_evidence(
                 _ => FenceEvidence::Insufficient,
             }
         }
-        // prod 发布族：活代 generation + 运行相位。generation == 本操作 =
-        // 本次 rollout 已落地（app 154 事故形态：patch 后零 pod 窗口捕获
-        // 失败，rollout 事后照常完成）；generation 属后来操作 = 被取代
-        // （与 builder 族"被另一次操作 ensure"同义）。
         UserAppOperationKind::StartDeployment | UserAppOperationKind::RestartDeployment => {
-            let Ok(spec) = state.runtime().get_app_container_spec(&record.app_id).await else {
-                return FenceEvidence::Insufficient;
-            };
-            let generation = spec
-                .env
-                .as_ref()
-                .and_then(|env| env.get(shared_types::APP_DEPLOY_GENERATION_ID).cloned());
-            let Some(generation) = generation else {
-                return FenceEvidence::Insufficient;
-            };
-            let superseded = generation != record.operation_id;
-            match state.app_service.get_app(&record.app_id).await {
-                Ok(info) if info.phase == "Running" => FenceEvidence::Observed(serde_json::json!({
-                    "kind": if superseded { "superseded_by_newer_generation" }
-                              else { "rollout_completed" },
-                    "live_generation": generation,
-                    "phase": info.phase,
-                    "ready_replicas": info.ready_replicas,
+            observe_generation_fence(state, record).await
+        }
+        // Create/Update：什么都没建出来（无部署痕迹）= no_trace（操作留下的
+        // 痕迹全无，可安全关闭，app-166 的 prod 面同族）；有部署痕迹 →
+        // 与发布族同一 env 代次口径判定。
+        UserAppOperationKind::Create | UserAppOperationKind::Update => {
+            match state.runtime().get_deployment_status(&record.app_id).await {
+                Ok(None) => FenceEvidence::Observed(serde_json::json!({
+                    "kind": "no_trace",
                     "observed_at_us": chrono::Utc::now().timestamp_micros(),
                 })),
-                // 查询失败或相位未定：保持围栏。
-                _ => FenceEvidence::Insufficient,
+                Ok(Some(_)) => observe_generation_fence(state, record).await,
+                Err(_) => FenceEvidence::Insufficient,
             }
         }
         // prod 启停族：相位确定即收束（记录实际相位留痕——目标未达成时
@@ -615,7 +639,126 @@ async fn observe_fence_evidence(
             })),
             Err(_) => FenceEvidence::Insufficient,
         },
-        _ => FenceEvidence::Insufficient,
+        // SetRecyclePolicy：回收注解可读即确定状态（同 Stop 哲学）——
+        // desired/observed 双留痕，目标未达成时后继显式操作重放。
+        UserAppOperationKind::SetRecyclePolicy => {
+            let Some(shared_types::UserAppControlCommand::SetRecyclePolicy { policy }) =
+                &record.command
+            else {
+                return FenceEvidence::Insufficient;
+            };
+            match state.runtime().get_deployment_status(&record.app_id).await {
+                Ok(Some(info)) => {
+                    let desired_hit = policy
+                        .recycle_enabled
+                        .is_none_or(|v| Some(v) == info.recycle_enabled)
+                        && policy
+                            .idle_timeout_seconds
+                            .is_none_or(|v| Some(v) == info.idle_timeout_seconds)
+                        && policy
+                            .wake_on_traffic
+                            .is_none_or(|v| Some(v) == info.wake_on_traffic);
+                    FenceEvidence::Observed(serde_json::json!({
+                        "kind": if desired_hit { "already_at_desired" } else { "policy_differs" },
+                        "desired": policy,
+                        "observed": {
+                            "recycle_enabled": info.recycle_enabled,
+                            "idle_timeout_seconds": info.idle_timeout_seconds,
+                            "wake_on_traffic": info.wake_on_traffic,
+                        },
+                        "observed_at_us": chrono::Utc::now().timestamp_micros(),
+                    }))
+                }
+                Ok(None) | Err(_) => FenceEvidence::Insufficient,
+            }
+        }
+        // 删除族：资源缺席即达成证据（删除中断后残留已不在 = 目标态）；
+        // 仍在也属确定状态（留痕 still_present，后继显式删除重试）。
+        UserAppOperationKind::DeleteCompute
+        | UserAppOperationKind::PurgeResources
+        | UserAppOperationKind::DeleteApplication => {
+            match state.runtime().get_deployment_status(&record.app_id).await {
+                Ok(None) => FenceEvidence::Observed(serde_json::json!({
+                    "kind": "absent_confirmed",
+                    "observed_at_us": chrono::Utc::now().timestamp_micros(),
+                })),
+                Ok(Some(info)) => FenceEvidence::Observed(serde_json::json!({
+                    "kind": "still_present",
+                    "phase": info.phase,
+                    "replicas": info.replicas,
+                    "observed_at_us": chrono::Utc::now().timestamp_micros(),
+                })),
+                Err(_) => FenceEvidence::Insufficient,
+            }
+        }
+        // 以下 kind 无只读可判定证据（存储深度/密码远端回执/热部署收敛/
+        // 杂项控制）——保守保持围栏，超龄 + holder 死亡由 holder_expired
+        // 兜底有界收束。**显式列出（禁通配臂）**：新增 kind 必须在此决定
+        // 证据语义。
+        UserAppOperationKind::AdoptApplication
+        | UserAppOperationKind::HotDeploy
+        | UserAppOperationKind::StopBuilder
+        | UserAppOperationKind::RestartBuilder
+        | UserAppOperationKind::DestroyDevStorage
+        | UserAppOperationKind::DestroyProdStorage
+        | UserAppOperationKind::ClearDevStorage
+        | UserAppOperationKind::ClearProdStorage
+        | UserAppOperationKind::ResetDevDatabasePassword
+        | UserAppOperationKind::ResetProdDatabasePassword
+        | UserAppOperationKind::PrepareProdDatabase => FenceEvidence::Insufficient,
+    }
+}
+
+/// holder 死亡兜底的收束留痕说明。
+const HOLDER_EXPIRED_RELEASE_NOTE: &str = "holder expired, outcome unverifiable; retry the operation";
+/// 物理状态确定性观察收束的留痕说明。
+const DEFINITE_RELEASE_NOTE: &str = "physical state verified definite by recovery scanner";
+/// 围栏 holder 死亡兜底的默认超龄门槛（秒）：≫ 操作 deadline + 租约 TTL 60s。
+const DEFAULT_FENCE_SETTLE_GRACE_SECS: u64 = 900;
+
+/// holder 死亡兜底判定（围栏有界保证）：**围栏超龄 ∧ 持有者已死**。
+///
+/// 持有者死亡证明：无租约绑定行（执行者从未取得锁/绑定已被终态清扫），
+/// 或绑定的物理租约校验为非持有（TTL 过期=停止续租，或已被接管）。
+/// 围栏落盘时执行者已携带已知错误返回（`OwnedOperation::fail`），不存在
+/// 正在途写的持有者；查询失败/租约仍持有/未超龄 → 保守保持围栏。
+/// 收束一律 Failed（`settle_fenced_operation`），绝不伪造 Succeeded。
+async fn holder_expired(state: &AppState, record: &UserAppOperationRecord) -> bool {
+    let grace_secs = state
+        .config
+        .fence_settle_grace_secs
+        .unwrap_or(DEFAULT_FENCE_SETTLE_GRACE_SECS);
+    let grace_us = i64::try_from(grace_secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+    let now_us = chrono::Utc::now().timestamp_micros();
+    // 计龄从 created_at 起算（记录仅暴露 created_at；created ≤ updated，
+    // 保守取更长的等待）。
+    if now_us.saturating_sub(record.created_at.timestamp_micros()) < grace_us {
+        return false;
+    }
+    match state
+        .userapp_store
+        .get_operation_lease(&record.app_id, &record.operation_id)
+        .await
+    {
+        Ok(None) => true,
+        Ok(Some(binding)) => {
+            matches!(
+                state
+                    .runtime()
+                    .validate_app_operation_receipt(&binding.context, &binding.receipt)
+                    .await,
+                Ok(false)
+            )
+        }
+        Err(error) => {
+            tracing::warn!(
+                operation_id = %record.operation_id,
+                app_id = %record.app_id,
+                %error,
+                "Fence kept: holder death check failed to read lease binding"
+            );
+            false
+        }
     }
 }
 
@@ -698,6 +841,25 @@ pub(super) async fn reconcile_fenced_ensure(
                 step = %record.step,
                 "Fence kept: evidence predicate returned insufficient"
             );
+            // holder 死亡兜底：无据可查但持有者已死（无绑定/租约过期）且
+            // 围栏超龄 → 有界收束，不再永久占受理 slot（app-166 事故类：
+            // 创建报错落围栏后什么都没建出来，live 证据谓词永不满足）。
+            if holder_expired(state, &record).await {
+                let evidence = serde_json::json!({
+                    "kind": "holder_expired",
+                    "checked_at_us": chrono::Utc::now().timestamp_micros(),
+                });
+                state
+                    .userapp_store
+                    .settle_fenced_operation(&record, &evidence, HOLDER_EXPIRED_RELEASE_NOTE)
+                    .await?;
+                tracing::warn!(
+                    operation_id = %record.operation_id,
+                    app_id = %record.app_id,
+                    kind = ?record.kind,
+                    "Fenced operation settled as Failed: holder expired, outcome unverifiable"
+                );
+            }
             return Ok(());
         }
     };
@@ -707,7 +869,7 @@ pub(super) async fn reconcile_fenced_ensure(
     // settler 从未真正收束过任何围栏）。
     state
         .userapp_store
-        .settle_fenced_operation(&record, &evidence)
+        .settle_fenced_operation(&record, &evidence, DEFINITE_RELEASE_NOTE)
         .await?;
     tracing::warn!(
         operation_id = %record.operation_id,
@@ -1465,12 +1627,14 @@ pub(crate) mod fence_settler_tests {
     };
     use std::collections::HashMap;
 
-    /// 可控运行态：deployment 相位/副本 + 活代 generation + builder 观察。
+    /// 可控运行态：deployment 相位/副本 + 活代 generation + builder 观察 +
+    /// 物理租约持有状态（validate_app_operation_receipt）。
     #[derive(Default)]
     pub(crate) struct FenceRuntime {
         status: Mutex<Option<Option<DeploymentStatus>>>,
         generation: Mutex<Option<String>>,
         pub(crate) builder_workload: Mutex<Option<String>>,
+        pub(crate) receipt_alive: Mutex<bool>,
     }
 
     impl FenceRuntime {
@@ -1482,6 +1646,7 @@ pub(crate) mod fence_settler_tests {
                 status: Mutex::new(Some(status)),
                 generation: Mutex::new(generation.map(str::to_string)),
                 builder_workload: Mutex::new(None),
+                receipt_alive: Mutex::new(false),
             })
         }
     }
@@ -1611,6 +1776,14 @@ pub(crate) mod fence_settler_tests {
                 ports: None,
             })
         }
+
+        async fn validate_app_operation_receipt(
+            &self,
+            _context: &shared_types::UserAppExecutionContext,
+            _receipt: &shared_types::UserAppOperationLeaseReceipt,
+        ) -> ContainerRuntimeResult<bool> {
+            Ok(*self.receipt_alive.lock().expect("lock"))
+        }
     }
 
     pub(crate) async fn fence_state(
@@ -1618,11 +1791,24 @@ pub(crate) mod fence_settler_tests {
         kind: UserAppOperationKind,
         operation_id: &str,
     ) -> (Arc<AppState>, tempfile::TempDir) {
+        fence_state_custom(runtime, kind, operation_id, None, None).await
+    }
+
+    /// 带围栏收束 grace 覆盖与可选租约绑定的围栏夹具（holder 死亡兜底反例用）。
+    pub(crate) async fn fence_state_custom(
+        runtime: Arc<FenceRuntime>,
+        kind: UserAppOperationKind,
+        operation_id: &str,
+        fence_settle_grace_secs: Option<u64>,
+        bind_receipt: Option<shared_types::UserAppOperationLeaseReceipt>,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
         fence_state_with_terminal(
             runtime,
             kind,
             operation_id,
             UserAppOperationState::RecoveryRequired,
+            fence_settle_grace_secs,
+            bind_receipt,
         )
         .await
     }
@@ -1632,6 +1818,8 @@ pub(crate) mod fence_settler_tests {
         kind: UserAppOperationKind,
         operation_id: &str,
         terminal: UserAppOperationState,
+        fence_settle_grace_secs: Option<u64>,
+        bind_receipt: Option<shared_types::UserAppOperationLeaseReceipt>,
     ) -> (Arc<AppState>, tempfile::TempDir) {
         let metadata_dir = tempfile::tempdir().expect("metadata directory");
         let store = Arc::new(
@@ -1641,8 +1829,16 @@ pub(crate) mod fence_settler_tests {
             .await
             .expect("store"),
         );
-        let (state, _keep) =
-            fence_state_on_store(runtime, kind, operation_id, terminal, store).await;
+        let (state, _keep) = fence_state_on_store(
+            runtime,
+            kind,
+            operation_id,
+            terminal,
+            store,
+            fence_settle_grace_secs,
+            bind_receipt,
+        )
+        .await;
         // TempDir 必须活过测试：把 _keep 换成泄露（测试进程级可接受）。
         std::mem::forget(metadata_dir);
         (state, tempfile::tempdir().expect("placeholder dir"))
@@ -1672,6 +1868,8 @@ pub(crate) mod fence_settler_tests {
             operation_id,
             UserAppOperationState::RecoveryRequired,
             store,
+            None,
+            None,
         )
         .await;
         std::mem::forget(_keep);
@@ -1684,6 +1882,8 @@ pub(crate) mod fence_settler_tests {
         operation_id: &str,
         terminal: UserAppOperationState,
         store: Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
+        fence_settle_grace_secs: Option<u64>,
+        bind_receipt: Option<shared_types::UserAppOperationLeaseReceipt>,
     ) -> (
         Arc<AppState>,
         Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
@@ -1717,7 +1917,10 @@ pub(crate) mod fence_settler_tests {
                 crate::userapp_builder::shutdown_gate::OperationFlightGate::default(),
             ),
             userapp_recovery_handle: Arc::new(Mutex::new(None)),
-            config: crate::config::AppConfig::default(),
+            config: crate::config::AppConfig {
+                fence_settle_grace_secs,
+                ..Default::default()
+            },
             projects: Arc::new(crate::storage::ProjectStoreBackend::Memory(Arc::new(
                 adapter,
             ))),
@@ -1744,34 +1947,119 @@ pub(crate) mod fence_settler_tests {
         // 构造围栏记录：admit(Pending) → advance(Running, executor) →
         // advance(RecoveryRequired, step=runtime_updated)。
         let lifecycle = store.ensure_identity("fenced").await.expect("identity");
-        // EnsureBuilder/AdoptBuilder 无对应命令变体（命令↔kind 严格对应），
-        // 传 None；其余 kind 按命令表构造，Deploy/Update 族携带执行输入摘要。
-        let builder_family = matches!(
-            kind,
-            UserAppOperationKind::EnsureBuilder | UserAppOperationKind::AdoptBuilder
-        );
+        // 命令↔kind 严格对应（权威映射 = UserAppControlCommand::kind() 的
+        // 穷尽 match）；EnsureBuilder/AdoptBuilder/AdoptApplication/HotDeploy
+        // 无对应命令变体传 None。**禁止通配臂**：新增 kind 必须在此显式补
+        // 映射，否则 admit 的命令↔摘要校验会拒绝（09-22 用户纪律：穷尽
+        // match，`_` 会静默吞掉新增变体）。仅携带 input_digest 的命令附带
+        // 执行输入。
         let input = shared_types::UserAppExecutionInput::new("{}".into());
-        let command = if builder_family {
-            None
-        } else {
-            Some(match kind {
-                UserAppOperationKind::StartDeployment => UserAppControlCommand::Deploy {
+        let digest = input.digest();
+        let (command, with_input) = match kind {
+            UserAppOperationKind::EnsureBuilder
+            | UserAppOperationKind::AdoptBuilder
+            | UserAppOperationKind::AdoptApplication
+            | UserAppOperationKind::HotDeploy => (None, false),
+            UserAppOperationKind::StartDeployment => (
+                Some(UserAppControlCommand::Deploy {
                     restart: false,
-                    input_digest: input.digest(),
-                },
-                UserAppOperationKind::RestartDeployment => UserAppControlCommand::Deploy {
+                    input_digest: digest,
+                }),
+                true,
+            ),
+            UserAppOperationKind::RestartDeployment => (
+                Some(UserAppControlCommand::Deploy {
                     restart: true,
-                    input_digest: input.digest(),
-                },
-                UserAppOperationKind::Update => UserAppControlCommand::Update {
-                    input_digest: input.digest(),
-                },
-                UserAppOperationKind::Restart => UserAppControlCommand::Restart,
-                UserAppOperationKind::Stop => UserAppControlCommand::Stop {
+                    input_digest: digest,
+                }),
+                true,
+            ),
+            UserAppOperationKind::Create => (
+                Some(UserAppControlCommand::Create {
+                    input_digest: digest,
+                }),
+                true,
+            ),
+            UserAppOperationKind::Update => (
+                Some(UserAppControlCommand::Update {
+                    input_digest: digest,
+                }),
+                true,
+            ),
+            UserAppOperationKind::Start => {
+                (Some(UserAppControlCommand::Start { traffic: false }), false)
+            }
+            UserAppOperationKind::Restart => (Some(UserAppControlCommand::Restart), false),
+            UserAppOperationKind::Stop => (
+                Some(UserAppControlCommand::Stop {
                     wake_on_traffic: true,
-                },
-                _ => UserAppControlCommand::Start { traffic: false },
-            })
+                }),
+                false,
+            ),
+            UserAppOperationKind::SetRecyclePolicy => (
+                Some(UserAppControlCommand::SetRecyclePolicy {
+                    policy: shared_types::UserAppRuntimePolicy {
+                        recycle_enabled: Some(true),
+                        idle_timeout_seconds: Some(7200),
+                        wake_on_traffic: Some(true),
+                    },
+                }),
+                false,
+            ),
+            UserAppOperationKind::DeleteCompute => (
+                Some(UserAppControlCommand::DeleteResources {
+                    purge: false,
+                    expected_resource_version: None,
+                }),
+                false,
+            ),
+            UserAppOperationKind::PurgeResources => (
+                Some(UserAppControlCommand::DeleteResources {
+                    purge: true,
+                    expected_resource_version: None,
+                }),
+                false,
+            ),
+            UserAppOperationKind::DeleteApplication => {
+                (Some(UserAppControlCommand::DeleteApplication), false)
+            }
+            UserAppOperationKind::DestroyDevStorage => (
+                Some(UserAppControlCommand::DestroyStorage { production: false }),
+                false,
+            ),
+            UserAppOperationKind::DestroyProdStorage => (
+                Some(UserAppControlCommand::DestroyStorage { production: true }),
+                false,
+            ),
+            UserAppOperationKind::ClearDevStorage => (
+                Some(UserAppControlCommand::ClearStorage { production: false }),
+                false,
+            ),
+            UserAppOperationKind::ClearProdStorage => (
+                Some(UserAppControlCommand::ClearStorage { production: true }),
+                false,
+            ),
+            UserAppOperationKind::ResetDevDatabasePassword => (
+                Some(UserAppControlCommand::ResetDatabasePassword {
+                    production: false,
+                    username: "app".into(),
+                }),
+                false,
+            ),
+            UserAppOperationKind::ResetProdDatabasePassword => (
+                Some(UserAppControlCommand::ResetDatabasePassword {
+                    production: true,
+                    username: "app".into(),
+                }),
+                false,
+            ),
+            UserAppOperationKind::PrepareProdDatabase => {
+                (Some(UserAppControlCommand::PrepareProdDatabase), false)
+            }
+            UserAppOperationKind::StopBuilder => (Some(UserAppControlCommand::StopBuilder), false),
+            UserAppOperationKind::RestartBuilder => {
+                (Some(UserAppControlCommand::RestartBuilder), false)
+            }
         };
         let admitted = store
             .admit_with_input(
@@ -1786,7 +2074,7 @@ pub(crate) mod fence_settler_tests {
                     metadata: None,
                     runtime_policy_on_success: None,
                 },
-                (!builder_family).then_some(&input),
+                with_input.then_some(&input),
             )
             .await
             .expect("admit");
@@ -1809,6 +2097,21 @@ pub(crate) mod fence_settler_tests {
             })
             .await
             .expect("claim");
+        if let Some(receipt) = &bind_receipt {
+            store
+                .bind_operation_lease(
+                    &shared_types::UserAppExecutionContext {
+                        app_id: "fenced".into(),
+                        lifecycle_id: lifecycle.lifecycle_id.clone(),
+                        operation_id: operation_id.into(),
+                        executor_id: "executor-fenced".into(),
+                        request_fingerprint: "cd".repeat(32),
+                    },
+                    receipt,
+                )
+                .await
+                .expect("bind lease");
+        }
         let running = store
             .get_operation("fenced", operation_id)
             .await
@@ -1823,7 +2126,9 @@ pub(crate) mod fence_settler_tests {
                 executor_id: "executor-fenced".into(),
                 state: terminal,
                 step: "runtime_updated".into(),
-                checkpoint: serde_json::json!({"resource": {"container_id": "c1"}}),
+                // 失败/围栏转移保持已记录 checkpoint（domain 对删除/存储族
+                // 有"必须保持证据"校验，真实执行器 fail 亦保点）。
+                checkpoint: running.checkpoint.clone(),
                 error_code: Some("ERR_BACKEND_ERROR".into()),
                 error_message: Some(
                     "Capture explicit database target: Owned management container is not running"
@@ -1916,19 +2221,89 @@ pub(crate) mod fence_settler_tests {
         );
     }
 
-    /// 无证据谓词的 kind（Update）：即使运行态可见也保持围栏——保守面
-    /// 不因泛化而扩大。
+    /// 无证据谓词的 kind：即使运行态可见也保持围栏——保守面不因泛化而
+    /// 扩大（超龄+holder 死亡由兜底收束，见 holder_expired 系列）。
+    /// 注：本测试原以 Update 为靶，Step B 给 Create/Update 补谓词后按批准
+    /// 需求换到仍无谓词的存储族 kind（测试预期随需求偏移，语义保持）。
     #[tokio::test]
     async fn unsupported_kind_fence_kept_even_when_running() {
-        let operation_id = "op-update";
+        let operation_id = "op-destroy-storage";
         let runtime = FenceRuntime::scenario(Some(status_of("Running", 1)), Some(operation_id));
-        let (state, _dir) = fence_state(runtime, UserAppOperationKind::Update, operation_id).await;
+        let (state, _dir) =
+            fence_state(runtime, UserAppOperationKind::DestroyDevStorage, operation_id).await;
         let snapshot = settled(&state, operation_id).await;
         reconcile_fenced_ensure(&state, &snapshot)
             .await
             .expect("scan");
         let record = settled(&state, operation_id).await;
         assert_eq!(record.state, UserAppOperationState::RecoveryRequired);
+    }
+
+    /// Step B 反例（修复前必挂）：删除中断后部署已缺席 = 达成证据
+    /// （同 Stop 哲学），必须收束留痕而不是永久围栏。
+    #[tokio::test]
+    async fn delete_compute_fence_settles_when_deployment_absent() {
+        let operation_id = "op-delete-absent";
+        let runtime = FenceRuntime::scenario(None, None);
+        let (state, _dir) =
+            fence_state(runtime, UserAppOperationKind::DeleteCompute, operation_id).await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("settle");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(record.state, UserAppOperationState::Failed);
+        assert_eq!(
+            record.checkpoint["fence_released_evidence"]["kind"], "absent_confirmed",
+            "{:?}",
+            record.checkpoint["fence_released_evidence"]
+        );
+    }
+
+    /// Step B 反例（修复前必挂）：Create 报错且什么都没建出来 → no_trace
+    /// 收束（app-166 同族的 prod 面）。
+    #[tokio::test]
+    async fn create_fence_settles_no_trace_when_nothing_created() {
+        let operation_id = "op-create-no-trace";
+        let runtime = FenceRuntime::scenario(None, None);
+        let (state, _dir) =
+            fence_state(runtime, UserAppOperationKind::Create, operation_id).await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("settle");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(record.state, UserAppOperationState::Failed);
+        assert_eq!(
+            record.checkpoint["fence_released_evidence"]["kind"], "no_trace",
+            "{:?}",
+            record.checkpoint["fence_released_evidence"]
+        );
+    }
+
+    /// Step B 反例（修复前必挂）：SetRecyclePolicy 的注解可读即确定状态
+    /// ——已达 desired 收束留痕（policy 观察值入证据）。
+    #[tokio::test]
+    async fn set_recycle_policy_fence_settles_with_observed_policy() {
+        let operation_id = "op-recycle-policy";
+        let mut status = status_of("Running", 1);
+        status.recycle_enabled = Some(true);
+        status.idle_timeout_seconds = Some(7200);
+        status.wake_on_traffic = Some(true);
+        let runtime = FenceRuntime::scenario(Some(status), None);
+        let (state, _dir) =
+            fence_state(runtime, UserAppOperationKind::SetRecyclePolicy, operation_id).await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("settle");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(record.state, UserAppOperationState::Failed);
+        assert_eq!(
+            record.checkpoint["fence_released_evidence"]["kind"], "already_at_desired",
+            "{:?}",
+            record.checkpoint["fence_released_evidence"]
+        );
     }
 
     /// builder 族原语义不回退：存活 builder（指纹无关观察）→ 收束。
@@ -1966,6 +2341,122 @@ pub(crate) mod fence_settler_tests {
         assert_eq!(record.state, UserAppOperationState::RecoveryRequired);
     }
 
+    /// Step A 反例（修复前必挂，app-166 事故类）：创建报错落围栏后什么都没
+    /// 建出来（无 workload、无租约绑定）——持有者已死（0 绑定）且超龄
+    /// （grace=0）时必须兜底收束为 Failed，不再永久占受理 slot。
+    #[tokio::test]
+    async fn holder_expired_fence_without_binding_settles() {
+        let operation_id = "op-holder-expired";
+        let runtime = FenceRuntime::scenario(None, None); // 无 workload → 谓词 Insufficient
+        let (state, _dir) = fence_state_custom(
+            runtime,
+            UserAppOperationKind::EnsureBuilder,
+            operation_id,
+            Some(0),
+            None,
+        )
+        .await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("settle");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(record.state, UserAppOperationState::Failed);
+        assert_eq!(
+            record.checkpoint["fence_released_evidence"]["kind"], "holder_expired",
+            "evidence 必须留痕 holder 死亡判定: {:?}",
+            record.checkpoint["fence_released_evidence"]
+        );
+        assert!(
+            record
+                .error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("holder expired")),
+            "{:?}",
+            record.error_message
+        );
+        // 端到端：slot 已释放——同 app 同 scope 新受理必须 Accepted。
+        let admitted = state
+            .userapp_store
+            .admit_with_input(
+                &UserAppAdmission {
+                    app_id: "fenced".into(),
+                    lifecycle_id: Some(record.lifecycle_id.clone()),
+                    operation_id: format!("{operation_id}-retry"),
+                    request_id: Some(format!("req-{operation_id}-retry")),
+                    request_fingerprint: "ef".repeat(32),
+                    kind: UserAppOperationKind::EnsureBuilder,
+                    command: None,
+                    metadata: None,
+                    runtime_policy_on_success: None,
+                },
+                None,
+            )
+            .await
+            .expect("admit after settle");
+        assert!(
+            matches!(admitted, UserAppAdmissionOutcome::Accepted(_)),
+            "收束后同 scope 必须可受理: {admitted:?}"
+        );
+    }
+
+    /// 锁：围栏未超龄（默认 grace）→ 即使无绑定也保持围栏——兜底只对
+    /// 超龄围栏生效，给在途收尾留出宽限。
+    #[tokio::test]
+    async fn fresh_fence_without_binding_keeps() {
+        let operation_id = "op-fresh-fence";
+        let runtime = FenceRuntime::scenario(None, None);
+        let (state, _dir) = fence_state_custom(
+            runtime,
+            UserAppOperationKind::EnsureBuilder,
+            operation_id,
+            None,
+            None,
+        )
+        .await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("scan");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(record.state, UserAppOperationState::RecoveryRequired);
+    }
+
+    /// 锁：绑定行存在且物理租约仍持有（validate=true）→ holder 未死，
+    /// 即使超龄也保持围栏——兜底不得从活持有者手里收束。
+    #[tokio::test]
+    async fn live_lease_binding_keeps_fence() {
+        let operation_id = "op-live-lease";
+        let runtime = FenceRuntime::scenario(None, None);
+        *runtime.receipt_alive.lock().expect("lock") = true;
+        let receipt = shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+            service_type: ServiceType::UserappBuilder,
+            namespace: "test-ns".into(),
+            name: format!("rcoder-operation-builder-{operation_id}"),
+            uid: "lease-uid".into(),
+            resource_version: "1".into(),
+            token: "lease-token".into(),
+        };
+        let (state, _dir) = fence_state_custom(
+            runtime,
+            UserAppOperationKind::EnsureBuilder,
+            operation_id,
+            Some(0),
+            Some(receipt),
+        )
+        .await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("scan");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(
+            record.state,
+            UserAppOperationState::RecoveryRequired,
+            "活租约必须保持围栏"
+        );
+    }
+
     /// app 159 事故回归：创建中的瞬时 RecoveryRequired 必须被骑代——3s 后
     /// 恢复核验把操作收束为真终态 Failed，等待方观察到的是真终态而非在
     /// 中间态上提前宣判。修复前必红：立即返回 "ended as RecoveryRequired"。
@@ -1982,7 +2473,11 @@ pub(crate) mod fence_settler_tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3)).await;
             store
-                .settle_fenced_operation(&snapshot, &serde_json::json!({"kind": "test"}))
+                .settle_fenced_operation(
+                    &snapshot,
+                    &serde_json::json!({"kind": "test"}),
+                    "test fixture settle",
+                )
                 .await
                 .expect("settle");
         });
@@ -2037,6 +2532,8 @@ pub(crate) mod fence_settler_tests {
             UserAppOperationKind::StartDeployment,
             operation_id,
             UserAppOperationState::Failed,
+            None,
+            None,
         )
         .await;
         let failed = settled(&state, operation_id).await;

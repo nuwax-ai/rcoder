@@ -1343,6 +1343,7 @@ pub(super) async fn settle_fenced_operation(
     backend: Backend,
     snapshot: &UserAppOperationRecord,
     evidence: &serde_json::Value,
+    release_note: &str,
 ) -> Result<UserAppOperationRecord, Error> {
     let (mut app, mut op) = current(
         tx,
@@ -1377,8 +1378,9 @@ pub(super) async fn settle_fenced_operation(
             .clone()
             .or_else(|| Some("ERR_CONFLICT".into())),
         error_message: Some(format!(
-            "{}; fence released: physical state verified definite by recovery scanner",
-            op.error_message.as_deref().unwrap_or("operation fenced")
+            "{}; fence released: {}",
+            op.error_message.as_deref().unwrap_or("operation fenced"),
+            release_note
         )),
     };
     domain::advance(&mut app, &mut op, &progress)?;

@@ -1118,11 +1118,13 @@ pub trait UserAppLifecycleStore: Send + Sync {
     /// Settle a fenced (RecoveryRequired) operation as Failed with the
     /// scanner's observation evidence. Pure bookkeeping: frees the admission
     /// slot, never grants runtime work. Full-snapshot CAS; identity, revision
-    /// and state validated inside.
+    /// and state validated inside. `release_note` 归类收束依据（如
+    /// "holder expired, outcome unverifiable"），拼入 error_message 留痕。
     async fn settle_fenced_operation(
         &self,
         snapshot: &UserAppOperationRecord,
         evidence: &serde_json::Value,
+        release_note: &str,
     ) -> Result<UserAppOperationRecord, UserAppStoreError>;
 
     async fn finalize_observed_wake(

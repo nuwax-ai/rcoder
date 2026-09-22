@@ -376,6 +376,27 @@ pub(super) fn patch_metadata(
     Ok(())
 }
 
+/// 扫描器收束留痕的 checkpoint 键（`settle_fenced_operation` 记账性审计）。
+pub(crate) const FENCE_RELEASED_EVIDENCE_KEY: &str = "fence_released_evidence";
+
+/// 失败/围栏转移的 checkpoint 保持判定：捕获证据逐字段不变，仅允许附加
+/// [`FENCE_RELEASED_EVIDENCE_KEY`] 收束留痕（不覆盖任何捕获字段）。settle
+/// 以 Failed 收束任意 kind，各 kind 的"必须保持证据"校验统一以本判定放行
+/// 该附加键——否则删除/存储/密码族的围栏在 settle 路径上永不可收束。
+fn failure_checkpoint_preserved(previous: &serde_json::Value, next: &serde_json::Value) -> bool {
+    if previous == next {
+        return true;
+    }
+    let Some(mut map) = next.as_object().cloned() else {
+        return false;
+    };
+    map.remove(FENCE_RELEASED_EVIDENCE_KEY);
+    if previous.is_null() && map.is_empty() {
+        return true;
+    }
+    previous == &serde_json::Value::Object(map)
+}
+
 /// SQL callers cannot bypass the coordinator's deletion evidence ordering.
 fn validate_deletion_progress(
     _app: &UserAppLifecycleRecord,
@@ -392,7 +413,7 @@ fn validate_deletion_progress(
         return Ok(());
     }
     if matches!(progress.state, OpState::Failed | OpState::RecoveryRequired) {
-        return if progress.checkpoint == operation.checkpoint {
+        return if failure_checkpoint_preserved(&operation.checkpoint, &progress.checkpoint) {
             Ok(())
         } else {
             Err(Error::InvalidOperation(
@@ -469,7 +490,7 @@ fn validate_storage_destruction_progress(
         _ => return Ok(()),
     };
     if matches!(progress.state, OpState::Failed | OpState::RecoveryRequired) {
-        return if progress.checkpoint == operation.checkpoint {
+        return if failure_checkpoint_preserved(&operation.checkpoint, &progress.checkpoint) {
             Ok(())
         } else {
             Err(Error::InvalidOperation(
@@ -542,7 +563,7 @@ fn validate_storage_clear_progress(
         _ => return Ok(()),
     };
     if matches!(progress.state, OpState::Failed | OpState::RecoveryRequired) {
-        return if progress.checkpoint == operation.checkpoint {
+        return if failure_checkpoint_preserved(&operation.checkpoint, &progress.checkpoint) {
             Ok(())
         } else {
             Err(Error::InvalidOperation(
@@ -637,7 +658,7 @@ fn validate_database_password_progress(
         Error::InvalidOperation("Database password writes require ordered physical evidence; uncertain writes remain protected".into())
     };
     if operation.checkpoint.is_null() {
-        if progress.checkpoint.is_null() {
+        if failure_checkpoint_preserved(&operation.checkpoint, &progress.checkpoint) {
             return if matches!(progress.state, OpState::Failed | OpState::RecoveryRequired)
                 || (progress.state == OpState::Running && progress.step == "claimed")
             {
@@ -714,7 +735,9 @@ fn validate_database_preparation_progress(
             "Database management preparation requires ordered identity-bound evidence".into(),
         )
     };
-    if operation.checkpoint.is_null() && progress.checkpoint.is_null() {
+    if operation.checkpoint.is_null()
+        && failure_checkpoint_preserved(&operation.checkpoint, &progress.checkpoint)
+    {
         return if matches!(progress.state, OpState::Failed | OpState::RecoveryRequired)
             || (progress.state == OpState::Running && progress.step == "claimed")
         {
