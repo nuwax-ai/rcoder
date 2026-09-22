@@ -53,9 +53,22 @@ fn kubectl(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// K8s 资源 guard：Drop 时删该 identifier 的 STS 与 Service（panic/断言失败
+/// 路径同样回收——对齐 Docker 场景 TestUserGuard 的 Drop 语义，避免失败轮
+/// 遗留 sts/svc 阻塞下一轮同名创建）。共享 PVC 永不删除。
+struct K8sResourceGuard {
+    identifier: String,
+}
+
+impl Drop for K8sResourceGuard {
+    fn drop(&mut self) {
+        k8s_cleanup(&self.identifier);
+    }
+}
+
 /// 场景兜底清理：删该 identifier 的 STS 与两个 Service（label 选择器对齐
 /// rcoder.io/identifier）。幂等；agent PVC 属共享 PVC，永不删除。
-fn k8s_cleanup(identifier: &str, report: &JsonlReporter) {
+fn k8s_cleanup(identifier: &str) {
     let target = format!("rcoder.io/identifier={identifier}");
     for kind in ["sts", "svc"] {
         match kubectl(&["delete", kind, "-l", &target, "--ignore-not-found=true"]) {
@@ -109,6 +122,9 @@ async fn host_k8s_agent_lifecycle_no_llm() {
     let identifier = user.clone();
     let sts_name = format!("{AGENT_PREFIX}-{identifier}");
     let svc_name = format!("{sts_name}-svc");
+    let _guard = K8sResourceGuard {
+        identifier: identifier.clone(),
+    };
 
     // 1) ensure 创建 computer agent STS（K8s 形态）
     let (status, body) = post_json(
@@ -206,8 +222,8 @@ async fn host_k8s_agent_lifecycle_no_llm() {
         }),
     );
 
-    // 5) owned 清理：sts+svc 回收（共享 PVC 永不删）
-    k8s_cleanup(&identifier, &report);
+    // 5) owned 清理：guard Drop 回收 sts+svc（共享 PVC 永不删），此处轮询确认
+    drop(_guard);
     let mut gone = false;
     for _ in 0..30 {
         let sts = kubectl(&[

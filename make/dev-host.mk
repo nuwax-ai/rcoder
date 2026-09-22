@@ -19,6 +19,11 @@ dev-host:
 # K8s 宿主机形态：本地 kubeconfig（OrbStack k8s 等）直连集群
 # - storage class 默认 local-path / RWO（env 可覆盖）
 # - agent Service 自动 NodePort 化 + nodePort 读回注册表
+# - 三前置（缺一 fail-fast，详见 docs/deploy-host.md「K8s 形态三前置」）：
+#   ① userApp 控制面 PG（docker run postgres + RCODER_USERAPP_STORAGE_BACKEND=
+#      postgres RCODER_USERAPP_PG_URL=postgres://...@127.0.0.1:55432/userapp）
+#   ② ~/.rcoder/config.yml 的 kubernetes_config.services 配 resource_limits
+#   ③ 共享 computer workspace PVC 预建（kubectl apply local-path/RWO 10Gi）
 dev-host-k8s:
 	@echo "🚀 deploy-host 宿主机形态（K8s 运行时）..."
 	CONTAINER_RUNTIME=kubernetes cargo run -p rcoder --bin rcoder --features kubernetes,deploy-host

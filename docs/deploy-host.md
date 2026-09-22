@@ -78,6 +78,20 @@ CONTAINER_RUNTIME=kubernetes cargo run -p rcoder --bin rcoder --features kuberne
 - 单租户单实例定位：多实例共写 `~/.rcoder` 属误用；desktop 与同机 rcoder
   server 占同一组端口，二选一。
 
+## K8s 形态三前置（`make dev-host-k8s`）
+
+K8s 形态（本地 kubeconfig 直连 OrbStack k3s 等）比 Docker 形态多三个前置，
+缺一会在启动或首个 agent 创建时 fail-fast：
+
+| 前置 | 原因（既有约束） | 满足方式 |
+| --- | --- | --- |
+| userApp 控制面 PostgreSQL | K8s access mode 强制 PG（`resolved_backend`，多副本共享控制面设计） | 本地容器 `docker run -d --name rcoder-host-pg -e POSTGRES_PASSWORD=... -p 127.0.0.1:55432:5432 postgres:17` + env `RCODER_USERAPP_STORAGE_BACKEND=postgres` `RCODER_USERAPP_PG_URL=postgres://...@127.0.0.1:55432/userapp` |
+| `kubernetes_config.services` 配 `resource_limits` | K8s 模式下 fail-fast 拒绝降级 docker_config（helpers.rs `resolve_resource_limits_from_config`） | `~/.rcoder/config.yml` 的 `kubernetes_config.services.{service}` 段补 `resource_limits` 与本地镜像 |
+| 共享 workspace PVC 预建 | 运行时假定部署链已建（devspace/remote-k8s 均有对应清单） | `kubectl apply` `{ns}-rcoder-computer-workspace`（10Gi）——**单节点 local-path/RWO 即可**（OrbStack 单节点下 RWO 与 RWX 行为等价；多节点才需 CephFS/NFS 的 RWX） |
+
+agent 镜像：OrbStack 的 Docker 与 K8s **共享镜像仓库**——本地
+`docker build -t dev-rcoder-agent-runner:latest` 后 Pod `IfNotPresent` 直接命中。
+
 ## 已知限制
 
 - agent 容器 egress 在独立 bridge（`rcoder-agent-network`），无法解析 compose
