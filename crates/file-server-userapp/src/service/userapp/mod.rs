@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use file_server::error::{AppError, AppResult};
 use file_server::service::build_generic::{GenericBuildRequest, build_generic};
-use file_server::service::build_manager::BuildManager;
+use file_server::service::build_manager::{BuildGuard, BuildManager};
 use shared_types::ProjectType;
 
 use assemble::assemble_workspace_package;
@@ -54,6 +54,85 @@ pub const WORKSPACE_BUILDS_DIR: &str = "builds";
 
 /// SSE `log` 事件单行字节上限（事件流展示副本的截断线，文件落盘不受影响）。
 const MAX_LOG_EVENT_LINE_BYTES: usize = 16 * 1024;
+
+/// pnpm "缺 lockfile" 机器码——构建自愈的精确触发信号。
+const PNPM_NO_LOCKFILE_TOKEN: &str = "ERR_PNPM_NO_LOCKFILE";
+/// `run_command_to_log` 错误 Display 的输出尾部标记：token 只在此后匹配，
+/// 防止用户源码文本提前出现同词误报（对齐 classify.rs"机器码整 token 才参与
+/// 分类"的哲学）。
+const BUILD_OUTPUT_TAIL_MARKER: &str = "--- output tail (";
+
+/// 构建失败是否为 pnpm 缺 lockfile：错误 Display 按尾部标记切分，只在
+/// 输出尾段做整 token 等值匹配。
+pub(super) fn is_pnpm_no_lockfile_failure(error: &AppError) -> bool {
+    let text = error.to_string();
+    let Some((_, tail)) = text.split_once(BUILD_OUTPUT_TAIL_MARKER) else {
+        return false;
+    };
+    tail.split_whitespace().any(|token| {
+        token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            == PNPM_NO_LOCKFILE_TOKEN
+    })
+}
+
+/// 单服务构建 + 缺 lockfile 自愈（app-171 事故）：平台导出链过滤
+/// pnpm-lock.yaml（既定设计），构建脚本若假设 lockfile 存在（`--frozen-
+/// lockfile`）必失败。失败码为 `ERR_PNPM_NO_LOCKFILE` 时先 `pnpm install`
+/// 生成 lockfile 再重试一次构建；安装失败不放弃重试（pnpm 先写 lockfile
+/// 再跑 postinstall，部分安装后 lockfile 已可用）；重试仍失败才上抛并附
+/// 自愈上下文。非该码失败路径不变。
+async fn build_service_with_no_lockfile_heal(
+    request: &GenericBuildRequest<'_>,
+    guard: &BuildGuard<'_>,
+    progress: &Option<Arc<BuildTask>>,
+    service_id: &str,
+) -> AppResult<PathBuf> {
+    let first = match build_generic(request, guard).await {
+        Ok(artifact) => return Ok(artifact),
+        Err(error) if is_pnpm_no_lockfile_failure(&error) => error,
+        Err(error) => return Err(error),
+    };
+    if let Some(task) = progress {
+        task.emit(BuildProgressEvent::Log {
+            service: service_id.to_string(),
+            line: format!(
+                "[self-heal] {PNPM_NO_LOCKFILE_TOKEN}: generating pnpm-lock.yaml via pnpm install, retrying build once (first failure: {first})"
+            ),
+        })
+        .await;
+    }
+    // 安装日志与构建日志同轴（logs/<service_id>：main + 新 dev-temp）。
+    let install_logs = file_server::service::pnpm::LogFiles::new(
+        request
+            .log_dir
+            .join(file_server::service::dev_server::log::main_log_name()),
+        request
+            .log_dir
+            .join(file_server::service::dev_server::log::temp_log_name(
+                file_server::service::dev_server::now_ms(),
+            )),
+    );
+    let install_error = match file_server::service::pnpm::install(
+        request.cwd,
+        &file_server::service::pnpm::InstallOptions::prefer_offline(),
+        Some(&install_logs),
+        request.timeout_secs,
+    )
+    .await
+    {
+        Ok(_) => None,
+        Err(error) => Some(error.to_string()),
+    };
+    match build_generic(request, guard).await {
+        Ok(artifact) => Ok(artifact),
+        Err(retry) => Err(AppError::system(format!(
+            "{retry}\n(self-heal attempted: pnpm install + one build retry{})",
+            install_error
+                .map(|error| format!("; install failed: {error}"))
+                .unwrap_or_default()
+        ))),
+    }
+}
 
 /// 按 UTF-8 字符边界截断（超限截到 `max` 内最大合法前缀，带省略号标记）。
 fn truncate_at_char(s: &str, max: usize) -> String {
@@ -193,7 +272,7 @@ pub async fn build_workspace_package(
         let pid_cb = progress.as_ref().map(|p| move |pid: u32| p.set_pid(pid));
         let pid_ref: Option<&(dyn Fn(u32) + Send + Sync)> =
             pid_cb.as_ref().map(|c| c as &(dyn Fn(u32) + Send + Sync));
-        let build_result = build_generic(
+        let build_result = build_service_with_no_lockfile_heal(
             &GenericBuildRequest {
                 argv: &proj.manifest.build.command,
                 cwd: &proj_dir,
@@ -204,6 +283,8 @@ pub async fn build_workspace_package(
                 on_line: Some(line_cb.clone()),
             },
             &_ws_guard,
+            &progress,
+            proj.service_id(),
         )
         .await;
         // 子进程已退出(或超时被 kill),pid 即将失效,清零缩短 stale-pid 窗口(#2)。
@@ -754,5 +835,179 @@ mod precheck_tests {
             precheck_dev_workspace("../evil", &cfg).await,
             Err(DevPrecheckError::Resolve(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod no_lockfile_heal_tests {
+    use super::*;
+
+    fn app_error(message: impl Into<String>) -> AppError {
+        AppError::system(message.into())
+    }
+
+    /// 检测矩阵:token 只在输出尾段计;用户源码文本提前出现同词不算;
+    /// 其他码/无尾段不算。
+    #[test]
+    fn no_lockfile_detection_is_tail_scoped_and_token_exact() {
+        let tail = |body: &str| {
+            app_error(format!(
+                "command exited non-zero: exit status: 1\n--- output tail (dev-temp-1.log, last 3 lines) ---\n{body}"
+            ))
+        };
+        assert!(is_pnpm_no_lockfile_failure(&tail(
+            "ERR_PNPM_NO_LOCKFILE Cannot install with frozen-lockfile"
+        )));
+        assert!(is_pnpm_no_lockfile_failure(&tail(
+            "Note: `ERR_PNPM_NO_LOCKFILE` is the code."
+        )));
+        assert!(
+            !is_pnpm_no_lockfile_failure(&tail("ERR_PNPM_OUTDATED_LOCKFILE")),
+            "相邻码不得命中"
+        );
+        assert!(
+            !is_pnpm_no_lockfile_failure(&tail("ERR_PNPM_NO_LOCKFILE_X")),
+            "仅前缀相同的长 token 不得命中"
+        );
+        assert!(
+            !is_pnpm_no_lockfile_failure(&app_error(
+                "echo ERR_PNPM_NO_LOCKFILE && exit 1\n--- output tail (x.log, last 1 lines) ---\nplain failure"
+            )),
+            "token 只出现在尾段标记之前(用户输出正文)不得命中"
+        );
+        assert!(!is_pnpm_no_lockfile_failure(&app_error(
+            "command timed out after 30s"
+        )));
+    }
+
+    fn pnpm_on_path() -> bool {
+        std::process::Command::new("pnpm")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    fn write_local_dep_project(dir: &Path) {
+        std::fs::create_dir_all(dir.join("vendor").join("vend")).expect("vendor dir");
+        std::fs::write(
+            dir.join("vendor").join("vend").join("package.json"),
+            r#"{ "name": "vend", "version": "1.0.0" }"#,
+        )
+        .expect("vendor pkg");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{ "name": "heal-fixture", "version": "1.0.0", "dependencies": { "vend": "file:./vendor/vend" } }"#,
+        )
+        .expect("package.json");
+    }
+
+    async fn run_heal(dir: &Path, argv: &[&str], artifact_rel: &str) -> AppResult<PathBuf> {
+        let manager = BuildManager::new(1);
+        let guard = manager.try_start("heal-test").expect("guard");
+        let command: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let log_dir = dir.join("logs");
+        let request = GenericBuildRequest {
+            argv: &command,
+            cwd: dir,
+            artifact_rel,
+            log_dir: &log_dir,
+            timeout_secs: 180,
+            on_pid: None,
+            on_line: None,
+        };
+        build_service_with_no_lockfile_heal(&request, &guard, &None, "fixture").await
+    }
+
+    /// app-171 事故形态:构建脚本 --frozen-lockfile + 无 lockfile → 自愈生成
+    /// lockfile 后重试成功。
+    #[tokio::test]
+    async fn frozen_build_without_lockfile_heals_and_retries() {
+        if !pnpm_on_path() {
+            eprintln!("skip: pnpm not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        write_local_dep_project(dir.path());
+        let result = run_heal(
+            dir.path(),
+            &[
+                "sh",
+                "-c",
+                "pnpm install --frozen-lockfile && mkdir -p dist && echo ok > dist/index.html",
+            ],
+            "dist",
+        )
+        .await;
+        let artifact = result.expect("healed build succeeds");
+        assert!(artifact.ends_with("dist"));
+        assert!(
+            dir.path().join("pnpm-lock.yaml").is_file(),
+            "self-heal must generate the lockfile"
+        );
+    }
+
+    /// 反例:非该码失败不自愈不重试(恰一次执行)。
+    #[tokio::test]
+    async fn non_token_failure_does_not_heal_or_retry() {
+        let dir = tempfile::tempdir().expect("dir");
+        let runs = dir.path().join("runs.txt");
+        let error = run_heal(
+            dir.path(),
+            &["sh", "-c", "echo run >> runs.txt; exit 7"],
+            "dist",
+        )
+        .await
+        .expect_err("plain failure stays failed");
+        assert_eq!(
+            std::fs::read_to_string(&runs)
+                .expect("runs")
+                .lines()
+                .count(),
+            1,
+            "non-token failure must not retry"
+        );
+        assert!(
+            !error.to_string().contains("self-heal attempted"),
+            "no heal context on plain failures"
+        );
+    }
+
+    /// 恒定该码失败:恰重试一次(两次执行),终错携带自愈上下文。
+    #[tokio::test]
+    async fn token_failure_heals_exactly_once() {
+        if !pnpm_on_path() {
+            eprintln!("skip: pnpm not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{ "name": "always-fail", "version": "1.0.0" }"#,
+        )
+        .expect("package.json");
+        let error = run_heal(
+            dir.path(),
+            &[
+                "sh",
+                "-c",
+                "echo run >> runs.txt; echo 'ERR_PNPM_NO_LOCKFILE' >&2; exit 1",
+            ],
+            "dist",
+        )
+        .await
+        .expect_err("retry failure surfaces");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("runs.txt"))
+                .expect("runs")
+                .lines()
+                .count(),
+            2,
+            "exactly one heal retry"
+        );
+        assert!(
+            error.to_string().contains("self-heal attempted"),
+            "final error must carry the heal context"
+        );
     }
 }
