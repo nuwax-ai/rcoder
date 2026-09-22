@@ -110,6 +110,9 @@ pub mod constants;
 // 工作区路径常量 (单一事实源, 所有 crate 共用: rcoder/docker_manager/agent_runner)
 pub mod paths;
 
+/// deploy-host Reach 寻址模式解析（env > config > auto 检测；
+/// ReachSetting 不门控——config 面无 feature 也要可反序列化）
+pub mod deploy_host_reach;
 /// deploy-host published-port 注册表（宿主机形态寻址单一事实源；feature 门控）
 #[cfg(feature = "deploy-host")]
 pub mod published;
