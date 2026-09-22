@@ -237,6 +237,16 @@ docker_config:
   #   - 大型环境: 10000-50000
   cache_max_capacity: 10000
 
+# deploy-host 宿主机形态 Reach 寻址（可选；容器/K8s 形态忽略此段）
+# reach 决定宿主机如何拨号容器端口：
+#   - auto（默认）: 按生效 Docker socket 检测——OrbStack/原生 Linux 用
+#     direct（容器 IPv4 直拨、零端口发布），Docker Desktop 用 published
+#   - direct: 容器 IPv4 直拨，不发布任何端口到宿主机
+#   - published: 端口发布到宿主机（既有行为）
+# 可用环境变量 RCODER_DEPLOY_HOST_REACH 覆盖（优先于本段）
+# deploy_host:
+#   reach: auto
+
 # API Key 鉴权配置（可选）
 api_key_auth:
   # 是否启用 API Key 鉴权（默认关闭）

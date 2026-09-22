@@ -269,6 +269,30 @@ impl Default for UserAppRecycleConfig {
     }
 }
 
+/// deploy-host 宿主机形态 Reach 寻址配置（Docker 容器如何被宿主机拨号）。
+///
+/// 仅 deploy-host 形态消费：`reach` 决定容器端口寻址策略——
+/// `direct` = 容器 IPv4 直拨、零端口发布；`published` = 端口发布到宿主机
+/// 经映射表拨 loopback；`auto` = 按生效 Docker socket 特征检测
+/// （OrbStack/原生 Linux→direct、Docker Desktop→published、未知→published
+/// 安全默认）；`tunnel` 为 R2/R3 契约占位（配置可写，启动显式拒绝）。
+/// 模式进程级一次：容器创建前决定（Docker 创建后不能补绑端口）。
+/// Docker/K8s 容器形态忽略此段；env `RCODER_DEPLOY_HOST_REACH` 优先于本段。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeployHostConfig {
+    /// Reach 寻址模式（auto|direct|published|tunnel 占位），默认 auto
+    pub reach: shared_types::deploy_host_reach::ReachSetting,
+}
+
+impl Default for DeployHostConfig {
+    fn default() -> Self {
+        Self {
+            reach: shared_types::deploy_host_reach::ReachSetting::Auto,
+        }
+    }
+}
+
 /// Docker 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

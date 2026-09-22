@@ -87,6 +87,11 @@ pub struct AppConfig {
     pub preview_coordinator: Option<preview_coordinator::CoordinatorConfig>,
     /// Docker 配置(docker 运行时读,K8s 不读)
     pub docker_config: Option<DockerConfig>,
+    /// deploy-host 宿主机形态 Reach 寻址配置（容器端口如何被宿主机拨号；
+    /// docker/K8s 容器形态忽略。模式进程级一次——容器创建前决定，
+    /// Docker 创建后不能补绑端口）
+    #[serde(default)]
+    pub deploy_host: DeployHostConfig,
     /// K8s 运行时配置(K8s 运行时读,docker 不读;与 docker_config 完全分家)
     ///
     /// docker 部署下此键缺失 → None;AppConfig 无 deny_unknown_fields,
@@ -159,6 +164,7 @@ impl Default for AppConfig {
             file_server_proxy: None,
             preview_coordinator: None,
             docker_config: Some(DockerConfig::default()),
+            deploy_host: DeployHostConfig::default(),
             kubernetes_config: None,
             cleanup_config: CleanupConfigSettings::default(),
             userapp_recycle: UserAppRecycleConfig::default(),
@@ -178,4 +184,6 @@ mod loader;
 mod sections;
 
 pub use loader::{load_api_key_config_from_file, load_config_for_cli, load_config_with_args};
-pub use sections::{CleanupConfigSettings, DockerConfig, ProxyConfig, UserAppRecycleConfig};
+pub use sections::{
+    CleanupConfigSettings, DeployHostConfig, DockerConfig, ProxyConfig, UserAppRecycleConfig,
+};

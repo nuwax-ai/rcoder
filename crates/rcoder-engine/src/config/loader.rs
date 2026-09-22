@@ -115,6 +115,25 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         .userapp_storage
         .apply_overrides(|key| std::env::var(key).ok())?;
 
+    // deploy-host Reach 模式：env 覆盖 config（非法 token fail-fast，对齐
+    // userapp_storage 覆盖链语义），随后进程级定模式——必须发生在任何容器
+    // 创建之前（Docker 创建后不能补绑端口）；tunnel 占位显式拒绝不虚报
+    use shared_types::deploy_host_reach::{REACH_ENV, ReachSetting};
+    if let Ok(val) = std::env::var(REACH_ENV) {
+        let token = val.trim();
+        if !token.is_empty() {
+            let setting = ReachSetting::from_token(token).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid {REACH_ENV}: {token} (expected auto|direct|published|tunnel)"
+                )
+            })?;
+            config.deploy_host.reach = setting;
+            info!(" {REACH_ENV} (env override): {}", setting.as_token());
+        }
+    }
+    #[cfg(feature = "deploy-host")]
+    shared_types::deploy_host_reach::init(config.deploy_host.reach)?;
+
     // 验证 API Key 配置
     if config.api_key_auth.enabled && config.api_key_auth.api_key.trim().is_empty() {
         return Err(anyhow::anyhow!(
@@ -276,6 +295,7 @@ mod tests {
     use clap::Parser as _;
     use std::env;
     use std::fs;
+    use std::path::Path;
     use std::process;
 
     use crate::config::CONFIG_FILE;
@@ -320,5 +340,110 @@ mod tests {
             msg.contains("Failed to parse config file"),
             "错误信息应指向配置解析: {msg}"
         );
+    }
+
+    /// 临时最小合法配置 + RCODER_CONFIG_FILE 指向；返回其路径。
+    /// 两侧测试约束与 malformed 用例同款（绝对路径双形态生效）。
+    fn write_min_config(extra: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "rcoder-reach-{}-{}",
+            process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            format!("projects_dir: /tmp/rcoder-reach-test\nport: 8087\n{extra}"),
+        )
+        .expect("write");
+        path
+    }
+
+    fn load_with_config(path: &Path) -> anyhow::Result<AppConfig> {
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var("RCODER_CONFIG_FILE", path);
+        }
+        let result = load_config_with_args(CliArgs::try_parse_from(["rcoder"]).expect("cli args"));
+        #[allow(unsafe_code)]
+        unsafe {
+            env::remove_var("RCODER_CONFIG_FILE");
+        }
+        result
+    }
+
+    #[test]
+    fn missing_deploy_host_section_defaults_to_auto() {
+        let path = write_min_config("");
+        let config = load_with_config(&path).expect("config loads without deploy_host");
+        assert_eq!(
+            config.deploy_host.reach,
+            shared_types::deploy_host_reach::ReachSetting::Auto,
+            "缺段必须回落 auto 而非报错"
+        );
+        fs::remove_dir_all(path.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn reach_env_overrides_config_value() {
+        let path = write_min_config("deploy_host:\n  reach: published\n");
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var("RCODER_DEPLOY_HOST_REACH", "Direct ");
+        }
+        let config = load_with_config(&path).expect("env override applies");
+        #[allow(unsafe_code)]
+        unsafe {
+            env::remove_var("RCODER_DEPLOY_HOST_REACH");
+        }
+        assert_eq!(
+            config.deploy_host.reach.as_token(),
+            "direct",
+            "env 必须优先于 config 段且容忍大小写空白"
+        );
+        fs::remove_dir_all(path.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn invalid_reach_env_token_bails() {
+        let path = write_min_config("");
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var("RCODER_DEPLOY_HOST_REACH", "orb");
+        }
+        let result = load_with_config(&path);
+        #[allow(unsafe_code)]
+        unsafe {
+            env::remove_var("RCODER_DEPLOY_HOST_REACH");
+        }
+        let err = result.expect_err("非法 token 必须 fail fast");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RCODER_DEPLOY_HOST_REACH") && msg.contains("orb"),
+            "错误应点名 env 键与原值: {msg}"
+        );
+        fs::remove_dir_all(path.parent().expect("parent")).ok();
+    }
+
+    /// tunnel 契约占位：token 可解析（config 合法），deploy-host 编译下
+    /// init 显式 bail 拒绝——不虚报支持。
+    #[test]
+    #[cfg(feature = "deploy-host")]
+    fn tunnel_reach_rejected_at_init() {
+        let path = write_min_config("");
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var("RCODER_DEPLOY_HOST_REACH", "tunnel");
+        }
+        let result = load_with_config(&path);
+        #[allow(unsafe_code)]
+        unsafe {
+            env::remove_var("RCODER_DEPLOY_HOST_REACH");
+        }
+        let err = result.expect_err("tunnel 未实现必须拒绝启动");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("tunnel"), "错误应点名 tunnel: {msg}");
+        fs::remove_dir_all(path.parent().expect("parent")).ok();
     }
 }
