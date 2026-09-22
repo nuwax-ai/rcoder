@@ -112,7 +112,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn release_failure_preserves_original_error_and_rejects_success() {
+    async fn release_failure_reports_unconfirmed_connection_error_with_context() {
         for result in [Ok(()), Err(rejected())] {
             let was_ok = result.is_ok();
             let error = finish(
@@ -124,10 +124,16 @@ mod tests {
             )
             .await
             .unwrap_err();
-            if was_ok {
-                assert!(matches!(error, Error::ConnectionError(_)));
-            } else {
-                assert!(matches!(error, Error::RequestRejected(_)));
+            // release 失败=清理未确认：无论原结果是成功还是显式拒绝，都不允许
+            // 调用方按终态收束（租约仍持有，恢复围栏必须保留）——一律
+            // ConnectionError；消息保留 release 失败原因，拒绝场景额外保留
+            // 原拒绝文本以便归因。
+            let Error::ConnectionError(message) = &error else {
+                panic!("release failure must stay unconfirmed, got: {error:?}");
+            };
+            assert!(message.contains("release denied"), "message: {message}");
+            if !was_ok {
+                assert!(message.contains("claim denied"), "message: {message}");
             }
         }
     }

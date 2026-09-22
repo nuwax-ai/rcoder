@@ -532,17 +532,17 @@ impl DockerRuntime {
         // deploy-host：replacement 容器是新物理实例，刷新寻址登记（与
         // compute_mode 钩子可能双触发——整条目幂等替换，无害）
         #[cfg(feature = "deploy-host")]
-        if shared_types::is_deploy_host() {
-            if let Err(error) = crate::deploy_host_ports::register_reach_from_inspect(
+        if shared_types::is_deploy_host()
+            && let Err(error) = crate::deploy_host_ports::register_reach_from_inspect(
                 &resource.name,
                 None,
                 &inspect,
-            ) {
-                tracing::warn!(
-                    "[deploy-host] builder restart reach refresh {} failed: {error}",
-                    resource.name
-                );
-            }
+            )
+        {
+            tracing::warn!(
+                "[deploy-host] builder restart reach refresh {} failed: {error}",
+                resource.name
+            );
         }
         Ok(restored)
     }

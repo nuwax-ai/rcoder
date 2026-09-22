@@ -403,15 +403,14 @@ impl DockerRuntime {
         // Published 用重建容器实际映射整表替换（restore_body 无 port_bindings
         // 的既有缺口：旧死端口被清出注册表）。失败仅 warn，不阻断控制成功路径
         #[cfg(feature = "deploy-host")]
-        if shared_types::is_deploy_host() {
-            if let Err(error) =
+        if shared_types::is_deploy_host()
+            && let Err(error) =
                 crate::deploy_host_ports::register_reach_from_inspect(&resource.name, None, &after)
-            {
-                tracing::warn!(
-                    "[deploy-host] builder control reach refresh {} failed: {error}",
-                    resource.name
-                );
-            }
+        {
+            tracing::warn!(
+                "[deploy-host] builder control reach refresh {} failed: {error}",
+                resource.name
+            );
         }
         running_builder_info(&after, target)
     }
@@ -511,8 +510,23 @@ pub(super) fn control_identity_with_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试内 env 变异（nextest 进程隔离；对齐 loader.rs / app-cli 测试先例）。
+    mod receipt_env {
+        #![allow(unsafe_code)]
+
+        pub fn set_root(path: &std::path::Path) {
+            unsafe { std::env::set_var("RCODER_OPERATION_RECEIPT_ROOT", path) };
+        }
+    }
+
     #[tokio::test]
     async fn bound_wake_starts_only_the_captured_id_and_accepts_already_running() {
+        // 回执落盘需可写根：容器常量 /app/... 在宿主机（macOS 只读根 /）会
+        // EROFS——显式 env 注入 tempfile 根（生产同链路：env > host_map >
+        // 容器常量，见 docker_compute_receipt::receipts_base）。
+        let receipt_root = tempfile::tempdir().expect("receipt root tempdir");
+        receipt_env::set_root(receipt_root.path());
         for start_status in [204, 304, 403] {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let context = UserAppExecutionContext {

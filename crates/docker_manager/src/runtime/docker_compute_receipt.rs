@@ -9,11 +9,40 @@ use std::{
     path::PathBuf,
 };
 
-fn path(context: &UserAppExecutionContext, family: &str, action: &str) -> Result<PathBuf> {
+/// 回执根显式覆盖（单测/部署注入可写根）。
+const RECEIPT_ROOT_ENV: &str = "RCODER_OPERATION_RECEIPT_ROOT";
+
+/// 回执根解析，优先序对齐 `app_manager::config::default_operation_lock_root`
+/// 推导链：env 显式覆盖 > deploy-host 宿主机形态经 host_map 解析的宿主真实
+/// 根 > 容器形态常量。容器常量 `/app/...` 只在容器内可写；宿主机进程
+/// （macOS 只读根 `/`）直接落盘会 EROFS——宿主机形态与单测必须解析可写根。
+async fn receipts_base() -> Result<PathBuf> {
+    if let Ok(explicit) = std::env::var(RECEIPT_ROOT_ENV)
+        && !explicit.trim().is_empty()
+    {
+        return Ok(PathBuf::from(explicit));
+    }
+    #[cfg(feature = "deploy-host")]
+    if shared_types::is_deploy_host() {
+        return crate::path::resolve_container_path_to_host(std::path::Path::new(
+            shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
+        ))
+        .await
+        .map_err(|error| {
+            Error::DockerError(format!("deploy-host receipt root resolve failed: {error}"))
+        });
+    }
+    Ok(PathBuf::from(
+        shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
+    ))
+}
+
+async fn path(context: &UserAppExecutionContext, family: &str, action: &str) -> Result<PathBuf> {
     context
         .validate_identity(&context.app_id)
         .map_err(Error::ConfigurationError)?;
-    let root = PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+    let root = receipts_base()
+        .await?
         .join(".app-operation-receipts")
         .join(&context.app_id);
     Ok(root.join(format!("{family}-{action}-{}.json", context.operation_id)))
@@ -21,26 +50,34 @@ fn path(context: &UserAppExecutionContext, family: &str, action: &str) -> Result
 
 pub(super) async fn save_stop(target: &BuilderControlTarget) -> Result<()> {
     target.validate().map_err(Error::ConfigurationError)?;
-    save(path(&target.context, "builder", "stop")?, target).await
+    save(path(&target.context, "builder", "stop").await?, target).await
 }
 
 pub(super) async fn save_app_stop(target: &UserAppMutationTarget) -> Result<()> {
-    save(path(&target.context, "prod", "stop")?, target).await
+    save(path(&target.context, "prod", "stop").await?, target).await
 }
 
 pub(super) async fn save_start(target: &BuilderControlTarget) -> Result<()> {
     target.validate().map_err(Error::ConfigurationError)?;
-    save(path(&target.context, "builder", "start")?, target).await
+    save(path(&target.context, "builder", "start").await?, target).await
 }
 pub(super) async fn matches_start(target: &BuilderControlTarget) -> Result<bool> {
     target.validate().map_err(Error::ConfigurationError)?;
-    matches(path(&target.context, "builder", "start")?, target.clone()).await
+    matches(
+        path(&target.context, "builder", "start").await?,
+        target.clone(),
+    )
+    .await
 }
 pub(super) async fn save_app_start(target: &UserAppMutationTarget) -> Result<()> {
-    save(path(&target.context, "prod", "start")?, target).await
+    save(path(&target.context, "prod", "start").await?, target).await
 }
 pub(super) async fn matches_app_start(target: &UserAppMutationTarget) -> Result<bool> {
-    matches(path(&target.context, "prod", "start")?, target.clone()).await
+    matches(
+        path(&target.context, "prod", "start").await?,
+        target.clone(),
+    )
+    .await
 }
 
 async fn save(path: PathBuf, target: &impl serde::Serialize) -> Result<()> {
@@ -91,11 +128,15 @@ async fn save(path: PathBuf, target: &impl serde::Serialize) -> Result<()> {
 
 pub(super) async fn matches_stop(target: &BuilderControlTarget) -> Result<bool> {
     target.validate().map_err(Error::ConfigurationError)?;
-    matches(path(&target.context, "builder", "stop")?, target.clone()).await
+    matches(
+        path(&target.context, "builder", "stop").await?,
+        target.clone(),
+    )
+    .await
 }
 
 pub(super) async fn matches_app_stop(target: &UserAppMutationTarget) -> Result<bool> {
-    matches(path(&target.context, "prod", "stop")?, target.clone()).await
+    matches(path(&target.context, "prod", "stop").await?, target.clone()).await
 }
 
 async fn matches<T>(path: PathBuf, expected: T) -> Result<bool>
@@ -155,16 +196,21 @@ where
 
 pub(super) async fn save_creation(receipt: &BuilderCreationReceipt) -> Result<()> {
     receipt.validate()?;
-    save(path(&receipt.target.context, "builder", "create")?, receipt).await
+    save(
+        path(&receipt.target.context, "builder", "create").await?,
+        receipt,
+    )
+    .await
 }
 pub(super) async fn save_cancellation(receipt: &BuilderCancellationReceipt) -> Result<()> {
     receipt.validate()?;
-    save(path(&receipt.context, "builder", "cancel")?, receipt).await
+    save(path(&receipt.context, "builder", "cancel").await?, receipt).await
 }
 pub(super) async fn read_cancellation(
     context: &UserAppExecutionContext,
 ) -> Result<Option<BuilderCancellationReceipt>> {
-    let receipt = read::<BuilderCancellationReceipt>(path(context, "builder", "cancel")?).await?;
+    let receipt =
+        read::<BuilderCancellationReceipt>(path(context, "builder", "cancel").await?).await?;
     if let Some(receipt) = &receipt {
         receipt.validate()?;
         if receipt.context != *context {
@@ -178,7 +224,7 @@ pub(super) async fn read_cancellation(
 pub(super) async fn read_creation(
     context: &UserAppExecutionContext,
 ) -> Result<Option<BuilderCreationReceipt>> {
-    let receipt = read::<BuilderCreationReceipt>(path(context, "builder", "create")?).await?;
+    let receipt = read::<BuilderCreationReceipt>(path(context, "builder", "create").await?).await?;
     if let Some(receipt) = &receipt {
         receipt.validate()?;
         if receipt.target.context != *context {
@@ -198,10 +244,10 @@ pub(super) async fn cleanup_compute_receipt_files(context: &UserAppExecutionCont
         .validate_identity(&context.app_id)
         .map_err(Error::ConfigurationError)?;
     let paths = [
-        path(context, "builder", "stop")?,
-        path(context, "builder", "start")?,
-        path(context, "prod", "stop")?,
-        path(context, "prod", "start")?,
+        path(context, "builder", "stop").await?,
+        path(context, "builder", "start").await?,
+        path(context, "prod", "stop").await?,
+        path(context, "prod", "start").await?,
     ];
     let context = context.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -240,9 +286,8 @@ pub(super) async fn cleanup_compute_receipt_files(context: &UserAppExecutionCont
     .map_err(|error| Error::DockerError(format!("Compute receipt cleanup worker: {error}")))?
 }
 
-fn receipts_root() -> PathBuf {
-    PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
-        .join(".app-operation-receipts")
+async fn receipts_root() -> Result<PathBuf> {
+    Ok(receipts_base().await?.join(".app-operation-receipts"))
 }
 
 /// List operation contexts that still have builder creation or cancellation
@@ -250,9 +295,10 @@ fn receipts_root() -> PathBuf {
 /// silently and never deleted by the sweep.
 pub(super) async fn list_builder_creation_receipt_contexts() -> Result<Vec<UserAppExecutionContext>>
 {
+    let root = receipts_root().await?;
     tokio::task::spawn_blocking(move || -> Result<Vec<UserAppExecutionContext>> {
         let mut contexts = Vec::new();
-        let entries = match std::fs::read_dir(receipts_root()) {
+        let entries = match std::fs::read_dir(root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(contexts),
             Err(error) => return Err(Error::DockerError(format!("Open receipts root: {error}"))),
@@ -327,8 +373,8 @@ pub(super) async fn cleanup_builder_creation_receipt_files(
     context
         .validate_identity(&context.app_id)
         .map_err(Error::ConfigurationError)?;
-    let create_path = path(context, "builder", "create")?;
-    let cancel_path = path(context, "builder", "cancel")?;
+    let create_path = path(context, "builder", "create").await?;
+    let cancel_path = path(context, "builder", "cancel").await?;
     let context = context.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         for (path, expected_create) in [(create_path, true), (cancel_path, false)] {
