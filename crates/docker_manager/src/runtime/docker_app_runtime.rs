@@ -352,6 +352,17 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         self.validate_captured_file_lease(context, receipt).await
     }
 
+    async fn app_operation_receipt_holder_dead(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<bool> {
+        // Docker flock 极性与 K8s Lease 相反：validate 的 Ok(true) 是孤儿
+        // marker 的 authority 残留而非活跃持有，默认推导会把活锁判成已死、
+        // 把孤儿判成存活，必须以 flock 活性覆写。
+        self.captured_file_lease_holder_dead(context, receipt).await
+    }
+
     async fn release_app_operation_receipt(
         &self,
         context: &shared_types::UserAppExecutionContext,

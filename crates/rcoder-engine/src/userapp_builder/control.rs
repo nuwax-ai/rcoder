@@ -388,27 +388,34 @@ pub(super) async fn reconcile_completed(
         .runtime()
         .release_app_operation_receipt(&binding.context, &binding.receipt)
         .await;
+    // The completed checkpoint is already reserved durably: a failed release
+    // is pending cleanup, never an unknown outcome. The Lease self-expires
+    // within its TTL (a legacy marker is retired by the 24h sweep), and
+    // terminal-lease discovery retries release+forget — re-fencing a
+    // completed operation here recreates the permanent-block class.
+    if let Err(error) = &result {
+        tracing::warn!(
+            operation_id = %snapshot.operation_id,
+            app_id = %snapshot.app_id,
+            %error,
+            "Completed builder lease release failed; terminal-lease discovery will retry"
+        );
+    }
     let checkpoint = reserved.checkpoint.clone();
     let step = reserved.step.clone();
-    let (status, message) = match &result {
-        Ok(()) => (UserAppOperationState::Succeeded, None),
-        Err(error) => (
-            UserAppOperationState::RecoveryRequired,
-            Some(error.to_string()),
-        ),
-    };
     advance(
         state,
         &mut reserved,
         &binding.context.executor_id,
-        status,
+        UserAppOperationState::Succeeded,
         &step,
         checkpoint,
-        message,
+        None,
     )
     .await?;
-    result?;
-    forget_released_lease(state, &binding).await;
+    if result.is_ok() {
+        forget_released_lease(state, &binding).await;
+    }
     crate::userapp_forward::invalidate_probe_cache(&instance);
     Ok(true)
 }

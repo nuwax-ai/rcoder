@@ -217,27 +217,44 @@ fn spawn_renewal(
     });
 }
 
+/// Outcome of removing the Lease this receipt used to own.
+enum LeaseRemoval {
+    /// Deleted by us with uid + freshly observed resourceVersion preconditions.
+    Deleted,
+    /// No Lease object exists (legacy ConfigMap fallback applies).
+    Absent,
+    /// uid/holder-token mismatch: a successor already took the object over.
+    /// The old receipt holds no authority left — the successor's lock is not
+    /// ours to delete, and nothing of ours still fences the old operation.
+    TakenOver,
+}
+
+/// Pure polarity lock: an identity mismatch on a live Lease means takeover —
+/// a released state for the old receipt — not a release error. Feeding it
+/// into cleanup chains as an error caused permanent release/forget retries
+/// and re-fenced completed operations (D2).
+fn lease_taken_over(current: &Lease, uid: &str, token: &str) -> bool {
+    current.metadata.uid.as_deref() != Some(uid) || holder_token(current).as_deref() != Some(token)
+}
+
 /// Delete the Lease we own; identity is uid + holder token, and the delete
 /// precondition uses the freshly observed resourceVersion (renewals move it,
 /// so the acquisition-time receipt version is stale by design).
-/// `Ok(false)` = no Lease object exists (legacy ConfigMap fallback applies).
+/// `Ok(Absent)` = no Lease object exists (legacy ConfigMap fallback applies);
+/// `Ok(TakenOver)` = a successor owns the object now — also a released state.
 async fn remove_owned_lease(
     api: &Api<Lease>,
     name: &str,
     uid: &str,
     token: &str,
-) -> Result<bool, String> {
+) -> Result<LeaseRemoval, String> {
     let current = match api.get_opt(name).await {
         Ok(Some(current)) => current,
-        Ok(None) => return Ok(false),
+        Ok(None) => return Ok(LeaseRemoval::Absent),
         Err(error) => return Err(format!("read application operation {name}: {error}")),
     };
-    if current.metadata.uid.as_deref() != Some(uid)
-        || holder_token(&current).as_deref() != Some(token)
-    {
-        return Err(format!(
-            "release application operation {name}: lease was taken over"
-        ));
+    if lease_taken_over(&current, uid, token) {
+        return Ok(LeaseRemoval::TakenOver);
     }
     let Some(version) = current
         .metadata
@@ -257,8 +274,8 @@ async fn remove_owned_lease(
         ..Default::default()
     };
     match api.delete(name, &params).await {
-        Ok(_) => Ok(true),
-        Err(kube::Error::Api(error)) if error.code == 404 => Ok(true),
+        Ok(_) => Ok(LeaseRemoval::Deleted),
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(LeaseRemoval::Deleted),
         Err(error) => Err(format!("release application operation {name}: {error}")),
     }
 }
@@ -289,13 +306,17 @@ impl AppOperationLease for OperationLease {
         Some(self.receipt.clone())
     }
     async fn release(mut self: Box<Self>) -> Result<(), String> {
-        // Absent (Ok(false)) is still a released state: idempotent release.
-        let result = remove_owned_lease(&self.api, &self.name, &self.uid, &self.token)
-            .await
-            .map(|_| ());
+        // Absent and TakenOver are both released states: idempotent release.
+        // A taken-over lease belongs to the successor; this receipt has
+        // nothing left to unlock.
+        let outcome = remove_owned_lease(&self.api, &self.name, &self.uid, &self.token).await;
+        if matches!(outcome, Ok(LeaseRemoval::TakenOver)) {
+            tracing::warn!(name = %self.name, uid = %self.uid,
+                "operation lease was taken over before release; the successor now owns it");
+        }
         self.released = true;
         self.cancel.cancel();
-        result
+        outcome.map(|_| ())
     }
 }
 
@@ -525,8 +546,17 @@ impl KubernetesRuntime {
         // resolves existence, identity and the live resourceVersion.
         let lease_api: Api<Lease> = Api::namespaced(self.client.clone(), namespace);
         match remove_owned_lease(&lease_api, name, uid, token).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
+            Ok(LeaseRemoval::Deleted) => return Ok(()),
+            Ok(LeaseRemoval::TakenOver) => {
+                // The successor's Lease now owns the object — this receipt's
+                // authority is gone, which is a released state for it. Never
+                // delete the successor's lock and never fall through to the
+                // legacy ConfigMap: the name hosts a live Lease, not
+                // migration stock.
+                tracing::debug!(%name, "captured operation lease was taken over before release");
+                return Ok(());
+            }
+            Ok(LeaseRemoval::Absent) => {}
             Err(error) => return Err(ContainerRuntimeError::K8sError(error)),
         }
         self.release_captured_configmap(context, service_type, name, receipt)
@@ -864,6 +894,32 @@ mod tests {
         assert_eq!(
             operation_name("builder-foo", &ServiceType::Userapp).expect("prod"),
             "rcoder-operation-prod-builder-foo"
+        );
+    }
+
+    /// D2 判定锁：身份不符的活 Lease 是被接管（对旧回执是已释放态），
+    /// 不是 release 错误——修复前它是字符串错误，喂进清理链的 `?` 造成
+    /// release/forget 永久重试与 completed→fence 翻转。
+    #[test]
+    fn identity_mismatch_means_taken_over_not_release_error() {
+        let mut object = sample_lease(Some(0));
+        object.metadata.uid = Some("uid-a".into());
+        object.metadata.annotations =
+            Some([("rcoder.io/operation-id".to_string(), "token-a".to_string())].into());
+        assert!(!lease_taken_over(&object, "uid-a", "token-a"));
+        assert!(
+            lease_taken_over(&object, "uid-b", "token-a"),
+            "uid 换=被接管"
+        );
+        assert!(
+            lease_taken_over(&object, "uid-a", "token-b"),
+            "token 换=被接管"
+        );
+        assert!(lease_taken_over(&object, "uid-a", ""), "空 token 不匹配");
+        object.metadata.uid = None;
+        assert!(
+            lease_taken_over(&object, "uid-a", "token-a"),
+            "缺 uid=被接管"
         );
     }
 
@@ -1388,10 +1444,12 @@ mod wire_tests {
         .expect("legacy fallback within budget");
     }
 
-    /// 释放时的身份防线：Lease 已被别的持有者接管（uid 不符）→ 报错而非
-    /// 删除别人的锁。
+    /// 释放时的身份防线（D2 语义更新）：Lease 已被别的持有者接管（uid 不符）
+    /// → 对旧回执是**已释放态**（Ok，清理链可继续 forget），但后继者的锁
+    /// 绝不被删——服务端必须只观察到一次 GET，任何 DELETE 都会让 release
+    /// 失败。修复前这里是 Err，喂进清理链造成永久重试与 completed→fence。
     #[tokio::test]
-    async fn captured_release_rejects_taken_over_lease() {
+    async fn captured_release_treats_taken_over_lease_as_released_without_deleting() {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -1399,7 +1457,11 @@ mod wire_tests {
             let address = listener.local_addr().expect("address");
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("lease probe");
-                read_request(&mut stream).await;
+                let (head, _) = read_request(&mut stream).await;
+                assert!(
+                    head.starts_with("GET "),
+                    "taken-over lease must only be observed, never deleted: {head}"
+                );
                 write_reply(
                     &mut stream,
                     200,
@@ -1416,13 +1478,13 @@ mod wire_tests {
                 resource_version: "10".into(),
                 token: "live-operation".into(),
             };
-            let result = runtime_for(client_for(address).await)
+            runtime_for(client_for(address).await)
                 .release_captured_application_operation(&context, &receipt)
-                .await;
-            assert!(result.is_err(), "taken-over lease must not be deleted");
+                .await
+                .expect("taken-over lease is a released state for the old receipt");
             server.await.expect("adapter assertions");
         })
         .await
-        .expect("taken-over rejection within budget");
+        .expect("taken-over release within budget");
     }
 }

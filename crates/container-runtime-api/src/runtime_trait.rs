@@ -1063,6 +1063,28 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         Ok(false)
     }
 
+    /// Holder-death proof for fenced-operation settlement: `Ok(true)` only
+    /// when the receipt's holder is provably gone (released, expired, or
+    /// superseded by takeover); `Ok(false)` while a holder may still be
+    /// active; transport errors propagate and keep the fence (fail-safe).
+    ///
+    /// 默认实现从 [`Self::validate_app_operation_receipt`] 推导：authority
+    /// 已释放/过期（`Ok(false)`）或身份被取代（`Err(Conflict)`）都证明旧
+    /// 持有者已去。但 `Ok(true)` 的语义各后端不同——Docker 文件租约的
+    /// `Ok(true)` 是「孤儿 marker 的 authority 残留」而非「活跃持有」，
+    /// 极性相反的后端必须覆写本探针，不得由 validate 极性推导。
+    async fn app_operation_receipt_holder_dead(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<bool> {
+        match self.validate_app_operation_receipt(context, receipt).await {
+            Ok(held) => Ok(!held),
+            Err(ContainerRuntimeError::Conflict(_)) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Release only the captured mutex after the coordinator has reserved a
     /// confirmed final checkpoint with a database revision claim.
     async fn release_app_operation_receipt(

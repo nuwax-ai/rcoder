@@ -717,24 +717,15 @@ const DEFINITE_RELEASE_NOTE: &str = "physical state verified definite by recover
 /// 围栏 holder 死亡兜底的默认超龄门槛（秒）：≫ 操作 deadline + 租约 TTL 60s。
 const DEFAULT_FENCE_SETTLE_GRACE_SECS: u64 = 900;
 
-/// validate 判定 → holder 是否已死：`Ok(false)` = 非持有（缺失/TTL 过期/
-/// 后端不支持）；`Err(Conflict)` = 身份已变（租约被接管——旧持有者确定性
-/// 死亡，不能保守当活）；其余 `Err`（查询/传输失败）保守视作存活。
-fn validate_verdict_means_dead(
-    outcome: container_runtime_api::ContainerRuntimeResult<bool>,
-) -> bool {
-    matches!(
-        outcome,
-        Ok(false) | Err(container_runtime_api::ContainerRuntimeError::Conflict(_))
-    )
-}
-
 /// holder 死亡兜底判定（围栏有界保证）：**围栏超龄 ∧ 持有者已死**。
 ///
 /// 持有者死亡证明：无租约绑定行（执行者从未取得锁/绑定已被终态清扫），
-/// 或绑定的物理租约校验为非持有（TTL 过期=停止续租，或已被接管）。
+/// 或运行时死亡探针判定已死（[`container_runtime_api::UserAppDeploymentRuntime::app_operation_receipt_holder_dead`]：
+/// K8s=TTL 过期/对象缺失/被接管；Docker=flock 已被内核释放/身份被替换）。
+/// 探针极性各后端不同，不得由 validate 推导（Docker flock 的 Ok(true) 是
+/// 孤儿 marker 的 authority 残留，推导会把活锁判死、把孤儿判活）。
 /// 围栏落盘时执行者已携带已知错误返回（`OwnedOperation::fail`），不存在
-/// 正在途写的持有者；查询失败/租约仍持有/未超龄 → 保守保持围栏。
+/// 正在途写的持有者；探针失败/租约仍持有/未超龄 → 保守保持围栏。
 /// 收束一律 Failed（`settle_fenced_operation`），绝不伪造 Succeeded。
 async fn holder_expired(state: &AppState, record: &UserAppOperationRecord) -> bool {
     let grace_secs = state
@@ -755,11 +746,22 @@ async fn holder_expired(state: &AppState, record: &UserAppOperationRecord) -> bo
     {
         Ok(None) => true,
         Ok(Some(binding)) => {
-            let outcome = state
+            match state
                 .runtime()
-                .validate_app_operation_receipt(&binding.context, &binding.receipt)
-                .await;
-            validate_verdict_means_dead(outcome)
+                .app_operation_receipt_holder_dead(&binding.context, &binding.receipt)
+                .await
+            {
+                Ok(dead) => dead,
+                Err(error) => {
+                    tracing::warn!(
+                        operation_id = %record.operation_id,
+                        app_id = %record.app_id,
+                        %error,
+                        "Fence kept: holder death probe failed"
+                    );
+                    false
+                }
+            }
         }
         Err(error) => {
             tracing::warn!(
@@ -1638,14 +1640,56 @@ pub(crate) mod fence_settler_tests {
     };
     use std::collections::HashMap;
 
+    /// validate_app_operation_receipt 的可控判定，模型各后端极性：
+    /// `Held` = Ok(true)（K8s 仍持有 / **Docker 孤儿 marker 的 authority 残留**）；
+    /// `NotHeld` = Ok(false)（K8s TTL 过期/对象缺失 / marker 已清）；
+    /// `TakenOver` = Err(Conflict)（K8s 被接管 / **Docker 活 flock "remains active"**）；
+    /// `Transport` = Err(K8sError)（查询/传输失败）。
+    #[derive(Clone, Copy, Default, Debug, PartialEq)]
+    pub(crate) enum ReceiptVerdict {
+        #[default]
+        NotHeld,
+        Held,
+        TakenOver,
+        Transport,
+    }
+
+    /// 终态落库种子：默认围栏形态（runtime_updated + 保持已有 checkpoint），
+    /// 或 D2 反例的完成证据形态（compute_confirmed + 显式 checkpoint）。
+    struct TerminalSeed {
+        state: UserAppOperationState,
+        step: &'static str,
+        checkpoint: Option<serde_json::Value>,
+    }
+
+    impl TerminalSeed {
+        fn fence(state: UserAppOperationState) -> Self {
+            Self {
+                state,
+                step: "runtime_updated",
+                checkpoint: None,
+            }
+        }
+        fn completed_evidence(checkpoint: serde_json::Value) -> Self {
+            Self {
+                state: UserAppOperationState::RecoveryRequired,
+                step: "compute_confirmed",
+                checkpoint: Some(checkpoint),
+            }
+        }
+    }
+
     /// 可控运行态：deployment 相位/副本 + 活代 generation + builder 观察 +
-    /// 物理租约持有状态（validate_app_operation_receipt）。
+    /// 物理租约 validate 判定 + 可选死亡探针覆写。
     #[derive(Default)]
     pub(crate) struct FenceRuntime {
         status: Mutex<Option<Option<DeploymentStatus>>>,
         generation: Mutex<Option<String>>,
         pub(crate) builder_workload: Mutex<Option<String>>,
-        pub(crate) receipt_alive: Mutex<bool>,
+        pub(crate) receipt_verdict: Mutex<ReceiptVerdict>,
+        /// 显式 holder 死亡探针判定（模型 Docker flock 覆写）；
+        /// None = 默认推导（K8s 极性）。
+        pub(crate) receipt_holder_dead: Mutex<Option<bool>>,
     }
 
     impl FenceRuntime {
@@ -1657,7 +1701,8 @@ pub(crate) mod fence_settler_tests {
                 status: Mutex::new(Some(status)),
                 generation: Mutex::new(generation.map(str::to_string)),
                 builder_workload: Mutex::new(None),
-                receipt_alive: Mutex::new(false),
+                receipt_verdict: Mutex::new(ReceiptVerdict::NotHeld),
+                receipt_holder_dead: Mutex::new(None),
             })
         }
     }
@@ -1793,7 +1838,30 @@ pub(crate) mod fence_settler_tests {
             _context: &shared_types::UserAppExecutionContext,
             _receipt: &shared_types::UserAppOperationLeaseReceipt,
         ) -> ContainerRuntimeResult<bool> {
-            Ok(*self.receipt_alive.lock().expect("lock"))
+            match *self.receipt_verdict.lock().expect("lock") {
+                ReceiptVerdict::Held => Ok(true),
+                ReceiptVerdict::NotHeld => Ok(false),
+                ReceiptVerdict::TakenOver => {
+                    Err(ContainerRuntimeError::Conflict("mock taken over".into()))
+                }
+                ReceiptVerdict::Transport => Err(ContainerRuntimeError::K8sError("io".into())),
+            }
+        }
+
+        async fn app_operation_receipt_holder_dead(
+            &self,
+            context: &shared_types::UserAppExecutionContext,
+            receipt: &shared_types::UserAppOperationLeaseReceipt,
+        ) -> ContainerRuntimeResult<bool> {
+            if let Some(dead) = *self.receipt_holder_dead.lock().expect("lock") {
+                return Ok(dead);
+            }
+            // None：复刻 trait 默认推导（模型 K8s 极性）。
+            match self.validate_app_operation_receipt(context, receipt).await {
+                Ok(held) => Ok(!held),
+                Err(ContainerRuntimeError::Conflict(_)) => Ok(true),
+                Err(error) => Err(error),
+            }
         }
     }
 
@@ -1824,6 +1892,28 @@ pub(crate) mod fence_settler_tests {
         .await
     }
 
+    /// D2 反例夹具：StopBuilder 携带完成证据（compute_confirmed + 完成态
+    /// checkpoint）落 RecoveryRequired 围栏 + 可选租约绑定。
+    pub(crate) async fn fence_state_completed_builder(
+        runtime: Arc<FenceRuntime>,
+        operation_id: &str,
+        bind_receipt: Option<shared_types::UserAppOperationLeaseReceipt>,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
+        let checkpoint = serde_json::json!({
+            "target": {"context": {"operation_id": operation_id}},
+            "result": {"operation_id": operation_id},
+        });
+        fence_state_on_store_wrapped(
+            runtime,
+            UserAppOperationKind::StopBuilder,
+            operation_id,
+            None,
+            bind_receipt,
+            TerminalSeed::completed_evidence(checkpoint),
+        )
+        .await
+    }
+
     async fn fence_state_with_terminal(
         runtime: Arc<FenceRuntime>,
         kind: UserAppOperationKind,
@@ -1831,6 +1921,25 @@ pub(crate) mod fence_settler_tests {
         terminal: UserAppOperationState,
         fence_settle_grace_secs: Option<u64>,
         bind_receipt: Option<shared_types::UserAppOperationLeaseReceipt>,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
+        fence_state_on_store_wrapped(
+            runtime,
+            kind,
+            operation_id,
+            fence_settle_grace_secs,
+            bind_receipt,
+            TerminalSeed::fence(terminal),
+        )
+        .await
+    }
+
+    async fn fence_state_on_store_wrapped(
+        runtime: Arc<FenceRuntime>,
+        kind: UserAppOperationKind,
+        operation_id: &str,
+        fence_settle_grace_secs: Option<u64>,
+        bind_receipt: Option<shared_types::UserAppOperationLeaseReceipt>,
+        seed: TerminalSeed,
     ) -> (Arc<AppState>, tempfile::TempDir) {
         let metadata_dir = tempfile::tempdir().expect("metadata directory");
         let store = Arc::new(
@@ -1844,10 +1953,10 @@ pub(crate) mod fence_settler_tests {
             runtime,
             kind,
             operation_id,
-            terminal,
             store,
             fence_settle_grace_secs,
             bind_receipt,
+            seed,
         )
         .await;
         // TempDir 必须活过测试：把 _keep 换成泄露（测试进程级可接受）。
@@ -1877,10 +1986,10 @@ pub(crate) mod fence_settler_tests {
             runtime,
             kind,
             operation_id,
-            UserAppOperationState::RecoveryRequired,
             store,
             None,
             None,
+            TerminalSeed::fence(UserAppOperationState::RecoveryRequired),
         )
         .await;
         std::mem::forget(_keep);
@@ -1891,10 +2000,10 @@ pub(crate) mod fence_settler_tests {
         runtime: Arc<FenceRuntime>,
         kind: UserAppOperationKind,
         operation_id: &str,
-        terminal: UserAppOperationState,
         store: Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
         fence_settle_grace_secs: Option<u64>,
         bind_receipt: Option<shared_types::UserAppOperationLeaseReceipt>,
+        seed: TerminalSeed,
     ) -> (
         Arc<AppState>,
         Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
@@ -2128,6 +2237,23 @@ pub(crate) mod fence_settler_tests {
             .await
             .expect("read")
             .expect("running record");
+        let checkpoint = seed
+            .checkpoint
+            .unwrap_or_else(|| running.checkpoint.clone());
+        seed_terminal_fence(&store, &running, seed.state, seed.step, checkpoint).await;
+        (state, store)
+    }
+
+    /// 终态/围栏转移：失败与围栏保持已记录 checkpoint（domain 对删除/存储族
+    /// 有「必须保持证据」校验，真实执行器 fail 亦保点）；D2 反例用
+    /// compute_confirmed + 完成证据 checkpoint 复用同一落库路径。
+    async fn seed_terminal_fence(
+        store: &Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
+        running: &UserAppOperationRecord,
+        terminal: UserAppOperationState,
+        step: &str,
+        checkpoint: serde_json::Value,
+    ) {
         store
             .advance(&UserAppOperationProgress {
                 app_id: running.app_id.clone(),
@@ -2136,10 +2262,8 @@ pub(crate) mod fence_settler_tests {
                 expected_revision: running.revision,
                 executor_id: "executor-fenced".into(),
                 state: terminal,
-                step: "runtime_updated".into(),
-                // 失败/围栏转移保持已记录 checkpoint（domain 对删除/存储族
-                // 有"必须保持证据"校验，真实执行器 fail 亦保点）。
-                checkpoint: running.checkpoint.clone(),
+                step: step.into(),
+                checkpoint,
                 error_code: Some("ERR_BACKEND_ERROR".into()),
                 error_message: Some(
                     "Capture explicit database target: Owned management container is not running"
@@ -2148,7 +2272,6 @@ pub(crate) mod fence_settler_tests {
             })
             .await
             .expect("fence");
-        (state, store)
     }
 
     pub(crate) async fn settled(
@@ -2359,23 +2482,158 @@ pub(crate) mod fence_settler_tests {
         assert_eq!(record.state, UserAppOperationState::RecoveryRequired);
     }
 
+    /// 判定表锁（探针化后，模型 K8s 极性的默认推导）：非持有（Ok(false)）
+    /// 与被接管（Err(Conflict)）都是 holder 死亡证明；传输失败保守保持围栏。
+    #[tokio::test]
+    async fn not_held_and_taken_over_settle_via_default_derivation() {
+        for (verdict, operation_id) in [
+            (ReceiptVerdict::NotHeld, "op-expired-lease"),
+            (ReceiptVerdict::TakenOver, "op-taken-over-lease"),
+        ] {
+            let runtime = FenceRuntime::scenario(None, None);
+            *runtime.receipt_verdict.lock().expect("lock") = verdict;
+            let receipt = shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+                service_type: ServiceType::UserappBuilder,
+                namespace: "test-ns".into(),
+                name: format!("rcoder-operation-builder-{operation_id}"),
+                uid: "lease-uid".into(),
+                resource_version: "1".into(),
+                token: "lease-token".into(),
+            };
+            let (state, _dir) = fence_state_custom(
+                runtime,
+                UserAppOperationKind::EnsureBuilder,
+                operation_id,
+                Some(0),
+                Some(receipt),
+            )
+            .await;
+            let snapshot = settled(&state, operation_id).await;
+            reconcile_fenced_ensure(&state, &snapshot)
+                .await
+                .expect("settle");
+            let record = settled(&state, operation_id).await;
+            assert_eq!(
+                record.state,
+                UserAppOperationState::Failed,
+                "默认推导必须把 {verdict:?} 判为 holder 已死"
+            );
+            assert_eq!(
+                record.checkpoint["fence_released_evidence"]["kind"],
+                "holder_expired"
+            );
+        }
+    }
+
+    /// 探针传输失败（fail-safe）：保守保持围栏，绝不凭查询失败判死。
+    #[tokio::test]
+    async fn holder_death_probe_failure_keeps_fence() {
+        let operation_id = "op-probe-transport";
+        let runtime = FenceRuntime::scenario(None, None);
+        *runtime.receipt_verdict.lock().expect("lock") = ReceiptVerdict::Transport;
+        let receipt = shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+            service_type: ServiceType::UserappBuilder,
+            namespace: "test-ns".into(),
+            name: format!("rcoder-operation-builder-{operation_id}"),
+            uid: "lease-uid".into(),
+            resource_version: "1".into(),
+            token: "lease-token".into(),
+        };
+        let (state, _dir) = fence_state_custom(
+            runtime,
+            UserAppOperationKind::EnsureBuilder,
+            operation_id,
+            Some(0),
+            Some(receipt),
+        )
+        .await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("scan");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(record.state, UserAppOperationState::RecoveryRequired);
+    }
+
+    /// D1 反例之一（修复前必挂）：Docker flock 极性——validate 对孤儿
+    /// marker 返回 Ok(true)（authority 残留），旧推导把它判成「仍持有」
+    /// → 兜底死代码、Compose 上围栏永久保持。修复后走死亡探针
+    /// （flock 已被内核释放=已死），超龄围栏必须收束。
+    #[tokio::test]
+    async fn docker_orphan_marker_binding_settles_via_death_probe() {
+        let operation_id = "op-docker-orphan";
+        let runtime = FenceRuntime::scenario(None, None);
+        *runtime.receipt_verdict.lock().expect("lock") = ReceiptVerdict::Held;
+        *runtime.receipt_holder_dead.lock().expect("lock") = Some(true);
+        let receipt = shared_types::UserAppOperationLeaseReceipt::Docker {
+            service_type: ServiceType::UserappBuilder,
+            device: 1,
+            inode: 2,
+            token: "orphan-token".into(),
+        };
+        let (state, _dir) = fence_state_custom(
+            runtime,
+            UserAppOperationKind::EnsureBuilder,
+            operation_id,
+            Some(0),
+            Some(receipt),
+        )
+        .await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("settle");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(
+            record.state,
+            UserAppOperationState::Failed,
+            "孤儿 marker 不是活性证明，探针判死必须收束"
+        );
+        assert_eq!(
+            record.checkpoint["fence_released_evidence"]["kind"],
+            "holder_expired"
+        );
+    }
+
+    /// D1 反例之二（修复前必挂，危险面）：Docker 活 flock——validate 返回
+    /// Err(Conflict)（"remains active"），旧推导把 Conflict 一律当死亡证明
+    /// → 会从**活持有者**手里收束围栏。修复后探针（flock 被持有=未死）
+    /// 必须保持围栏。
+    #[tokio::test]
+    async fn docker_live_flock_binding_keeps_fence_under_probe() {
+        let operation_id = "op-docker-live-flock";
+        let runtime = FenceRuntime::scenario(None, None);
+        *runtime.receipt_verdict.lock().expect("lock") = ReceiptVerdict::TakenOver;
+        *runtime.receipt_holder_dead.lock().expect("lock") = Some(false);
+        let receipt = shared_types::UserAppOperationLeaseReceipt::Docker {
+            service_type: ServiceType::UserappBuilder,
+            device: 1,
+            inode: 2,
+            token: "live-token".into(),
+        };
+        let (state, _dir) = fence_state_custom(
+            runtime,
+            UserAppOperationKind::EnsureBuilder,
+            operation_id,
+            Some(0),
+            Some(receipt),
+        )
+        .await;
+        let snapshot = settled(&state, operation_id).await;
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("scan");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(
+            record.state,
+            UserAppOperationState::RecoveryRequired,
+            "活 flock 持有者未死，围栏必须保持"
+        );
+    }
+
     /// Step A 反例（修复前必挂，app-166 事故类）：创建报错落围栏后什么都没
     /// 建出来（无 workload、无租约绑定）——持有者已死（0 绑定）且超龄
     /// （grace=0）时必须兜底收束为 Failed，不再永久占受理 slot。
-    /// 判定表锁：被接管（Err(Conflict)）与非持有（Ok(false)）都是 holder
-    /// 死亡证明；查询/传输失败保守视作存活。
-    #[test]
-    fn validate_verdict_dead_mapping() {
-        assert!(validate_verdict_means_dead(Ok(false)));
-        assert!(validate_verdict_means_dead(Err(
-            ContainerRuntimeError::Conflict("taken over".into())
-        )));
-        assert!(!validate_verdict_means_dead(Ok(true)));
-        assert!(!validate_verdict_means_dead(Err(
-            ContainerRuntimeError::K8sError("io".into())
-        )));
-    }
-
     #[tokio::test]
     async fn holder_expired_fence_without_binding_settles() {
         let operation_id = "op-holder-expired";
@@ -2432,6 +2690,52 @@ pub(crate) mod fence_settler_tests {
         );
     }
 
+    /// D2 反例（修复前必挂）：StopBuilder 已携带完成证据，收尾清理的
+    /// release 失败（本 mock 的 release 走 trait 默认=Err；现实中对应租约
+    /// 被接管被包成 K8sError / 瞬态传输错误）。修复前 release 错误把已
+    /// 完成的操作翻回围栏（advance RecoveryRequired + 错误传播）——
+    /// completed→fence 翻转正是 154 类永久阻塞的成因；修复后清理失败只留
+    /// warn、绑定行交终态租约清扫重试，操作必须落 Succeeded。
+    #[tokio::test]
+    async fn completed_builder_survives_release_failure() {
+        let operation_id = "op-release-fails";
+        let runtime = FenceRuntime::scenario(None, None);
+        let receipt = shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+            service_type: ServiceType::UserappBuilder,
+            namespace: "test-ns".into(),
+            name: format!("rcoder-operation-builder-{operation_id}"),
+            uid: "lease-uid".into(),
+            resource_version: "1".into(),
+            token: "lease-token".into(),
+        };
+        let (state, _dir) =
+            fence_state_completed_builder(runtime, operation_id, Some(receipt)).await;
+        let snapshot = settled(&state, operation_id).await;
+        assert!(
+            shared_types::userapp_operation_has_final_evidence(&snapshot),
+            "fixture must carry final evidence"
+        );
+        super::super::control::reconcile_completed(&state, &snapshot)
+            .await
+            .expect("finalize");
+        let record = settled(&state, operation_id).await;
+        assert_eq!(
+            record.state,
+            UserAppOperationState::Succeeded,
+            "release 清理失败不得把已完成操作翻回围栏"
+        );
+        // 清理记录（租约绑定行）保留，交终态租约清扫重试成功后 forget。
+        assert!(
+            state
+                .userapp_store
+                .get_operation_lease("fenced", operation_id)
+                .await
+                .expect("read binding")
+                .is_some(),
+            "release 失败时保留绑定行供终态清扫重试"
+        );
+    }
+
     /// 锁：围栏未超龄（默认 grace）→ 即使无绑定也保持围栏——兜底只对
     /// 超龄围栏生效，给在途收尾留出宽限。
     #[tokio::test]
@@ -2460,7 +2764,7 @@ pub(crate) mod fence_settler_tests {
     async fn live_lease_binding_keeps_fence() {
         let operation_id = "op-live-lease";
         let runtime = FenceRuntime::scenario(None, None);
-        *runtime.receipt_alive.lock().expect("lock") = true;
+        *runtime.receipt_verdict.lock().expect("lock") = ReceiptVerdict::Held;
         let receipt = shared_types::UserAppOperationLeaseReceipt::Kubernetes {
             service_type: ServiceType::UserappBuilder,
             namespace: "test-ns".into(),

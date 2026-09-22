@@ -34,6 +34,36 @@ impl DockerRuntime {
                 ))
             })?
     }
+    pub(super) async fn captured_file_lease_holder_dead(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> Result<bool> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(Error::ConfigurationError)?;
+        receipt.validate().map_err(Error::ConfigurationError)?;
+        let prefix = match receipt.service_type() {
+            ServiceType::Userapp => "prod",
+            ServiceType::UserappBuilder => "builder",
+            _ => {
+                return Err(Error::ConfigurationError(
+                    "Invalid application lease family".into(),
+                ));
+            }
+        };
+        let path = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+            .join(".app-operation-locks")
+            .join(format!("{prefix}-{}.lock", context.app_id));
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || file_receipt_holder_dead(&path, &receipt))
+            .await
+            .map_err(|error| {
+                Error::DockerError(format!(
+                    "Operation lease liveness probe worker failed: {error}"
+                ))
+            })?
+    }
     pub(super) async fn captured_builder_workspace(
         &self,
         snapshot: &BuilderDeletionSnapshot,
@@ -430,12 +460,44 @@ fn open_inactive_file_receipt(
     Ok(file)
 }
 
+/// Lock-file presence shared by validate/release: `Absent` is a released
+/// state (nothing to observe, complete, or unlock — cleanup chains must not
+/// retry forever on it); `Foreign` means the path hosts a non-regular file
+/// (identity changed); `Present` proceeds to the inactive-open path. A stat
+/// transport error defers to `open_inactive_file_receipt`'s error mapping.
+#[cfg(unix)]
+enum LockFilePresence {
+    Present,
+    Absent,
+    Foreign,
+}
+
+#[cfg(unix)]
+fn lock_file_presence(path: &std::path::Path) -> LockFilePresence {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => LockFilePresence::Present,
+        Ok(_) => LockFilePresence::Foreign,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => LockFilePresence::Absent,
+        Err(_) => LockFilePresence::Present,
+    }
+}
+
 #[cfg(unix)]
 fn validate_file_receipt(
     path: &std::path::Path,
     receipt: &shared_types::UserAppOperationLeaseReceipt,
 ) -> Result<bool> {
     use std::io::Read as _;
+    // A deleted lock file holds no marker: no continuation authority.
+    match lock_file_presence(path) {
+        LockFilePresence::Absent => return Ok(false),
+        LockFilePresence::Foreign => {
+            return Err(Error::Conflict(
+                "Operation lease file identity changed".into(),
+            ));
+        }
+        LockFilePresence::Present => {}
+    }
     let file = open_inactive_file_receipt(path, receipt)?;
     let shared_types::UserAppOperationLeaseReceipt::Docker { token, .. } = receipt else {
         return Err(Error::Conflict("Operation lease runtime mismatch".into()));
@@ -458,11 +520,88 @@ fn validate_file_receipt(
     Ok(false)
 }
 
+/// Docker 侧持有者死亡证明：flock 是活性真源，marker 只是 authority 残留。
+///
+/// `Ok(true)` = 旧持有者确定已死或已被取代：锁文件缺席（同 K8s Lease 对象
+/// 不存在的极性）、身份被替换（superseded，同被接管租约的极性）、或 flock
+/// 可被获取——内核在进程死亡时释放 flock，孤儿 marker 不能证明持有者存活。
+/// `Ok(false)` = flock 被持有（holder 可能仍在变更中）。探测自身 I/O 失败
+/// 返回 Err，保持围栏（fail-safe）。极性与 [`validate_file_receipt`] 不同，
+/// 不得由 validate 推导。
+#[cfg(unix)]
+fn file_receipt_holder_dead(
+    path: &std::path::Path,
+    receipt: &shared_types::UserAppOperationLeaseReceipt,
+) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let shared_types::UserAppOperationLeaseReceipt::Docker { device, inode, .. } = receipt else {
+        return Err(Error::Conflict("Operation lease runtime mismatch".into()));
+    };
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(before) => before,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(Error::DockerError(format!(
+                "Probe operation lease file: {error}"
+            )));
+        }
+    };
+    if !before.is_file() || before.dev() != *device || before.ino() != *inode {
+        return Ok(true);
+    }
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            Error::DockerError(format!("Open operation lease for liveness: {error}"))
+        })?;
+    let opened = file
+        .metadata()
+        .map_err(|error| Error::DockerError(format!("Read operation lease identity: {error}")))?;
+    if opened.dev() != *device || opened.ino() != *inode {
+        return Ok(true);
+    }
+    match file.try_lock() {
+        // Acquiring the flock proves the kernel released it; dropping the fd
+        // releases it again without touching the marker.
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(error)) => Err(Error::DockerError(format!(
+            "Probe operation lease liveness: {error}"
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_receipt_holder_dead(
+    _: &std::path::Path,
+    _: &shared_types::UserAppOperationLeaseReceipt,
+) -> Result<bool> {
+    Err(Error::ConfigurationError(
+        "Physical operation lease liveness probing requires Unix".into(),
+    ))
+}
+
 #[cfg(unix)]
 fn release_file_receipt(
     path: &std::path::Path,
     receipt: &shared_types::UserAppOperationLeaseReceipt,
 ) -> Result<()> {
+    match lock_file_presence(path) {
+        // A deleted lock file is already released: nothing to complete or
+        // unlock. Reporting it as an error made terminal-lease discovery
+        // retry the same binding forever.
+        LockFilePresence::Absent => return Ok(()),
+        LockFilePresence::Foreign => {
+            return Err(Error::Conflict(
+                "Operation lease file identity changed".into(),
+            ));
+        }
+        LockFilePresence::Present => {}
+    }
     let file = open_inactive_file_receipt(path, receipt)?;
     let shared_types::UserAppOperationLeaseReceipt::Docker { token, .. } = receipt else {
         return Err(Error::Conflict("Operation lease runtime mismatch".into()));
@@ -621,6 +760,89 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&retained).expect("original marker"),
             "original"
+        );
+    }
+
+    /// D1 反例：默认推导（`!validate`）在 Docker flock 极性下两行判反——
+    /// 活锁时 validate 返回 Err(Conflict "remains active")，推导成「已死」；
+    /// 孤儿 marker 时 validate 返回 Ok(true)（authority 残留），推导成「存活」。
+    /// 本测试以 flock 为活性真源锁死极性。
+    #[cfg(unix)]
+    #[test]
+    fn file_receipt_holder_dead_reads_flock_liveness_not_marker_authority() {
+        let root = tempfile::tempdir().expect("fixture");
+        let path = root.path().join("builder-app.lock");
+        let lease = lock_builder_file_with_marker(
+            root.path(),
+            "builder-app.lock",
+            shared_types::AppFileMutationMarker::for_operation("original").expect("marker"),
+        )
+        .expect("lease");
+        let receipt = lease.receipt().expect("receipt");
+        // 活 flock：持有者可能仍在变更，绝不判定已死。
+        assert!(!file_receipt_holder_dead(&path, &receipt).expect("live holder probe"));
+        // 孤儿 marker + 空闲 flock：内核在进程死亡时释放 flock，marker 只是
+        // authority 残留——持有者确定已死。
+        drop(lease);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("orphan marker"),
+            "original"
+        );
+        assert!(file_receipt_holder_dead(&path, &receipt).expect("orphan holder probe"));
+        // 身份被替换：superseded，同 K8s 租约被接管的极性。
+        std::fs::rename(&path, root.path().join("retained")).expect("rename");
+        std::fs::write(&path, "new-physical-file").expect("replacement");
+        assert!(file_receipt_holder_dead(&path, &receipt).expect("superseded inode probe"));
+        // 锁文件缺席：同 K8s Lease 对象不存在的极性。
+        std::fs::remove_file(&path).expect("remove");
+        assert!(file_receipt_holder_dead(&path, &receipt).expect("absent lock probe"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_receipt_holder_dead_treats_replaced_path_as_superseded() {
+        let root = tempfile::tempdir().expect("fixture");
+        let path = root.path().join("builder-app.lock");
+        let retained = root.path().join("retained");
+        let lease = lock_builder_file_with_marker(
+            root.path(),
+            "builder-app.lock",
+            shared_types::AppFileMutationMarker::for_operation("original").expect("marker"),
+        )
+        .expect("lease");
+        let receipt = lease.receipt().expect("receipt");
+        drop(lease);
+        std::fs::rename(&path, &retained).expect("rename");
+        std::os::unix::fs::symlink(&retained, &path).expect("alias");
+        assert!(file_receipt_holder_dead(&path, &receipt).expect("replaced path is superseded"));
+    }
+
+    /// D2 同族（Docker 面）：锁文件已缺失 = 确定的已释放态——release 必须
+    /// Ok（无可完成/解锁的对象）、validate 必须 Ok(false)（无 authority），
+    /// 否则终态租约清扫对缺失文件的绑定永久重试。
+    #[cfg(unix)]
+    #[test]
+    fn absent_lock_file_is_a_released_state() {
+        let root = tempfile::tempdir().expect("fixture");
+        let path = root.path().join("builder-app.lock");
+        let lease = lock_builder_file_with_marker(
+            root.path(),
+            "builder-app.lock",
+            shared_types::AppFileMutationMarker::for_operation("gone").expect("marker"),
+        )
+        .expect("lease");
+        let receipt = lease.receipt().expect("receipt");
+        drop(lease);
+        std::fs::remove_file(&path).expect("remove lock file");
+        assert_eq!(
+            release_file_receipt(&path, &receipt).ok(),
+            Some(()),
+            "缺失锁文件 = 已释放，不得当成清理错误"
+        );
+        assert_eq!(
+            validate_file_receipt(&path, &receipt).ok(),
+            Some(false),
+            "缺失锁文件无 authority"
         );
     }
 
