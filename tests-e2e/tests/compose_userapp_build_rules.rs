@@ -965,8 +965,10 @@ async fn userapp_build_no_lockfile_pnpm_install() {
 
     // 单服务 node 工程：无 pnpm-lock.yaml + 本地 file: 依赖（离线安装）。
     // [build] 刻意用旧模板形态 --frozen-lockfile（app-171 事故现场形状）。
+    // [run] 仅为满足非 static 服务的 manifest 契约（discover 强校验
+    // run.command 非空）；本场景只触发 build，不启动服务，命令不会被执行。
     let ws_manifest = "schema_version = 1\n\n[workspace]\nname = \"e2e-br-build-heal\"\n";
-    let frozen_manifest = "schema_version = 1\n\n[project]\nservice_id = \"build-heal-svc\"\nname = \"Build Heal\"\ntype = \"node\"\n\n[build]\ncommand = [\"sh\", \"-c\", \"pnpm install --frozen-lockfile && mkdir -p dist && echo ok > dist/index.html\"]\nartifact = \"dist\"\n\n[proxy]\npath = \"/api/heal/\"\nstrip_prefix = true\n";
+    let frozen_manifest = "schema_version = 1\n\n[project]\nservice_id = \"build-heal-svc\"\nname = \"Build Heal\"\ntype = \"node\"\n\n[build]\ncommand = [\"sh\", \"-c\", \"pnpm install --frozen-lockfile && mkdir -p dist && echo ok > dist/index.html\"]\nartifact = \"dist\"\n\n[run]\ncommand = [\"sh\", \"-c\", \"exec python3 -m http.server $PORT --bind 0.0.0.0\"]\n\n[proxy]\npath = \"/api/heal/\"\nstrip_prefix = true\n";
     let pkg_json = "{\n  \"name\": \"build-heal-fixture\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": { \"dep-a\": \"file:./vendor/dep-a\" }\n}\n";
     let dep_pkg = "{ \"name\": \"dep-a\", \"version\": \"1.0.0\" }\n";
     if !init_zip_workspace(
