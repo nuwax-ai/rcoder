@@ -17,7 +17,7 @@ use k8s_openapi::api::apps::v1::Deployment;
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
 #[cfg(feature = "kubernetes")]
-use kube::api::{Api, PatchParams};
+use kube::api::Api;
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
 
@@ -118,17 +118,6 @@ impl KubernetesRuntime {
             labels.insert(format!("{}/space", RCODER_LABEL_PREFIX), s.to_string());
         }
         labels
-    }
-
-    /// Server-Side Apply 参数：`field_manager=rcoder-app-manager` 标识字段 owner，
-    /// `force=true` 允许从其他 manager 接管字段（controller 应总是 force，见 operator-rs）。
-    /// 让 create-or-update 自然合一：不存在则创建，存在则按字段级三方合并收敛。
-    pub(crate) fn ssa_patch_params() -> PatchParams {
-        PatchParams {
-            field_manager: Some(APP_MANAGED_BY.to_string()),
-            force: true,
-            ..Default::default()
-        }
     }
 
     pub(crate) fn pods_api(&self) -> Api<k8s_openapi::api::core::v1::Pod> {

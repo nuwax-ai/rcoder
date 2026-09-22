@@ -127,15 +127,14 @@ impl KubernetesRuntime {
         // 变更与本次 heal 竞态是无害的：注解只是"当前算法记账"，内容校验
         // （镜像/command/args/env/容器集合）才是复用门——即使注解被短暂
         // 盖到已漂移的模板上，下一次 validate 的内容比对仍会精确拒绝。
+        let mut heal_patch = serde_json::json!({
+            "metadata": {"annotations": {TEMPLATE_HASH_ANNOTATION: desired_hash}}
+        });
+        // step-D 写面 fencing：heal 同样带 uid+RV 前置——接管后的迟到写 409。
+        super::k8s_runtime_helpers::inject_object_identity(&mut heal_patch, &existing.metadata)?;
         if let Err(error) = self
             .statefulsets()
-            .patch(
-                name,
-                &PatchParams::default(),
-                &Patch::Merge(serde_json::json!({
-                    "metadata": {"annotations": {TEMPLATE_HASH_ANNOTATION: desired_hash}}
-                })),
-            )
+            .patch(name, &PatchParams::default(), &Patch::Merge(heal_patch))
             .await
         {
             return Err(match &error {
@@ -412,16 +411,35 @@ impl KubernetesRuntime {
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 let sts =
                     self.build_agent_statefulset(identifier, service_type, pod_spec, replicas)?;
-                sts_api
-                    .create(&PostParams::default(), &sts)
-                    .await
-                    .map_err(|e| {
-                        crate::runtime::builder_completion::k8s_error(format!("create sts: {e}"), e)
-                    })?;
-                info!(
-                    "[K8S-STS] StatefulSet created: {} (replicas={}, type={:?})",
-                    sts_name, replicas, service_type
-                );
+                match sts_api.create(&PostParams::default(), &sts).await {
+                    Ok(_) => info!(
+                        "[K8S-STS] StatefulSet created: {} (replicas={}, type={:?})",
+                        sts_name, replicas, service_type
+                    ),
+                    Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                        // step-D winner 校验（对齐 builder STS）：接管窗口下并发
+                        // 创建者胜出时校验等价后幂等收敛，漂移显式 Conflict。
+                        let winner = sts_api.get(&sts_name).await.map_err(|e| {
+                            crate::runtime::builder_completion::k8s_error(
+                                format!("get sts winner {}: {}", sts_name, e),
+                                e,
+                            )
+                        })?;
+                        validate_agent_statefulset(&winner, &sts)?;
+                        self.scale_captured_statefulset(&winner, service_type, replicas)
+                            .await?;
+                        info!(
+                            "[K8S-STS] StatefulSet adopted from concurrent create (winner validated): {}",
+                            sts_name
+                        );
+                    }
+                    Err(e) => {
+                        return Err(crate::runtime::builder_completion::k8s_error(
+                            format!("create sts: {e}"),
+                            e,
+                        ));
+                    }
+                }
             }
             Err(e) => {
                 return Err(crate::runtime::builder_completion::k8s_error(
@@ -569,16 +587,26 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         let sts_name = self.pod_name(identifier, service_type)?;
         let sts_api = self.statefulsets();
-        match sts_api
-            .delete(
-                &sts_name,
-                &DeleteParams {
-                    propagation_policy: Some(kube::api::PropagationPolicy::Foreground),
-                    ..Default::default()
-                },
-            )
-            .await
-        {
+        // step-D 写面 fencing：删除带 uid+RV 前置——接管后的迟到删除不会误删
+        // 同名新代资源（与 delete_captured 同款）。
+        let live = match sts_api.get(&sts_name).await {
+            Ok(live) => live,
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                debug!("[K8S-STS] StatefulSet {} not found, skip delete", sts_name);
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(crate::runtime::builder_completion::k8s_error(
+                    format!("get sts {} before delete: {}", sts_name, e),
+                    e,
+                ));
+            }
+        };
+        let params = super::k8s_runtime_helpers::conditioned_delete_params(
+            &live.metadata,
+            Some(kube::api::PropagationPolicy::Foreground),
+        )?;
+        match sts_api.delete(&sts_name, &params).await {
             Ok(_) => {
                 info!("[K8S-STS] StatefulSet deleted: {}", sts_name);
                 Ok(())
@@ -1230,5 +1258,129 @@ mod tests {
 
     fn quantity(v: &str) -> k8s_openapi::apimachinery::pkg::api::resource::Quantity {
         k8s_openapi::apimachinery::pkg::api::resource::Quantity(v.to_string())
+    }
+}
+
+/// agent STS create-409 winner 校验（step-D 写面 fencing，对齐 builder STS
+/// winner-validate）：身份标签/注解 + 启动内容（image/command/args/容器集合）
+/// 等价才可复用；漂移 → Conflict。template-hash 注解按既有口径只作记账
+/// （内容校验才是复用门），不参与比对。
+fn validate_agent_statefulset(
+    existing: &StatefulSet,
+    desired: &StatefulSet,
+) -> ContainerRuntimeResult<()> {
+    let existing_meta = &existing.metadata;
+    let desired_meta = &desired.metadata;
+    for (key, value) in desired_meta.labels.iter().flatten() {
+        if existing_meta.labels.as_ref().and_then(|l| l.get(key)) != Some(value) {
+            return Err(ContainerRuntimeError::Conflict(format!(
+                "Agent StatefulSet identity label '{key}' differs from desired"
+            )));
+        }
+    }
+    for (key, value) in desired_meta.annotations.iter().flatten() {
+        if key == TEMPLATE_HASH_ANNOTATION {
+            continue;
+        }
+        if existing_meta.annotations.as_ref().and_then(|a| a.get(key)) != Some(value) {
+            return Err(ContainerRuntimeError::Conflict(format!(
+                "Agent StatefulSet identity annotation '{key}' differs from desired"
+            )));
+        }
+    }
+    let existing_pod = existing
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref());
+    let desired_pod = desired.spec.as_ref().and_then(|s| s.template.spec.as_ref());
+    let (Some(existing_pod), Some(desired_pod)) = (existing_pod, desired_pod) else {
+        return Err(ContainerRuntimeError::Conflict(
+            "Agent StatefulSet pod template is missing".into(),
+        ));
+    };
+    if existing_pod.containers.len() != desired_pod.containers.len() {
+        return Err(ContainerRuntimeError::Conflict(
+            "Agent StatefulSet container set differs from desired".into(),
+        ));
+    }
+    for desired_container in &desired_pod.containers {
+        let Some(existing_container) = existing_pod
+            .containers
+            .iter()
+            .find(|c| c.name == desired_container.name)
+        else {
+            return Err(ContainerRuntimeError::Conflict(format!(
+                "Agent StatefulSet container '{}' missing in existing",
+                desired_container.name
+            )));
+        };
+        if existing_container.image != desired_container.image
+            || existing_container.command != desired_container.command
+            || existing_container.args != desired_container.args
+        {
+            return Err(ContainerRuntimeError::Conflict(format!(
+                "Agent StatefulSet container '{}' launch content differs from desired",
+                desired_container.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod agent_statefulset_winner_tests {
+    use super::*;
+    use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
+    use k8s_openapi::api::core::v1::{Container, PodSpec, PodTemplateSpec};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    fn sts(image: &str) -> StatefulSet {
+        StatefulSet {
+            metadata: ObjectMeta {
+                name: Some("agent-x".into()),
+                uid: Some("uid-1".into()),
+                resource_version: Some("7".into()),
+                labels: Some([("rcoder.io/app".to_string(), "x".to_string())].into()),
+                annotations: Some(
+                    [(TEMPLATE_HASH_ANNOTATION.to_string(), "h1".to_string())].into(),
+                ),
+                ..Default::default()
+            },
+            spec: Some(StatefulSetSpec {
+                template: PodTemplateSpec {
+                    spec: Some(PodSpec {
+                        containers: vec![Container {
+                            name: "agent".into(),
+                            image: Some(image.into()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn identical_winner_is_adoptable_even_with_stale_hash_annotation() {
+        let mut winner = sts("img:1");
+        winner.metadata.annotations =
+            Some([(TEMPLATE_HASH_ANNOTATION.to_string(), "legacy-h".to_string())].into());
+        validate_agent_statefulset(&winner, &sts("img:1")).expect("hash 注解只作记账不参与比对");
+    }
+
+    #[test]
+    fn launch_content_drift_rejects_winner() {
+        assert!(validate_agent_statefulset(&sts("img:OLD"), &sts("img:1")).is_err());
+    }
+
+    #[test]
+    fn identity_label_drift_rejects_winner() {
+        let mut winner = sts("img:1");
+        winner.metadata.labels = Some([("rcoder.io/app".to_string(), "OTHER".to_string())].into());
+        assert!(validate_agent_statefulset(&winner, &sts("img:1")).is_err());
     }
 }

@@ -8,7 +8,7 @@ use container_runtime_api::{
     ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, ExposeType,
 };
 #[cfg(feature = "kubernetes")]
-use kube::api::{DeleteParams, Patch, PatchParams};
+use kube::api::{Patch, PatchParams};
 #[cfg(feature = "kubernetes")]
 use tracing::info;
 
@@ -869,35 +869,51 @@ impl KubernetesRuntime {
             .is_some_and(|ps| ps.iter().any(|p| p.expose_type == ExposeType::Tcp));
         let has_env = params.env.as_ref().is_some_and(|e| !e.is_empty());
         let has_secrets = params.secrets.as_ref().is_some_and(|s| !s.is_empty());
-        let dp = DeleteParams::default();
+        // step-D 写面 fencing：清理删除一律 uid+RV 前置（对齐 delete_captured）
+        // ——接管后的迟到删除被前置拒绝，不会误删同名新代资源。
         if !has_http {
-            let routes = self.httproute_api();
-            self.ignore_404(routes.delete(&self.app_http_route_name(app_id), &dp).await)
-                .await?;
+            let name = self.app_http_route_name(app_id);
+            let api = self.httproute_api();
+            if let Some(live) = api.get_opt(&name).await.map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("get httproute {name} before cleanup: {e}"))
+            })? {
+                let dp =
+                    super::k8s_runtime_helpers::conditioned_delete_params(&live.metadata, None)?;
+                self.ignore_404(api.delete(&name, &dp).await).await?;
+            }
         }
         if !has_tcp {
-            self.ignore_404(
-                self.services_api()
-                    .delete(&self.app_nodeport_name(app_id), &dp)
-                    .await,
-            )
-            .await?;
+            let name = self.app_nodeport_name(app_id);
+            let api = self.services_api();
+            if let Some(live) = api.get_opt(&name).await.map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("get nodeport {name} before cleanup: {e}"))
+            })? {
+                let dp =
+                    super::k8s_runtime_helpers::conditioned_delete_params(&live.metadata, None)?;
+                self.ignore_404(api.delete(&name, &dp).await).await?;
+            }
         }
         if !has_env {
-            self.ignore_404(
-                self.configmaps_api()
-                    .delete(&self.app_config_name(app_id), &dp)
-                    .await,
-            )
-            .await?;
+            let name = self.app_config_name(app_id);
+            let api = self.configmaps_api();
+            if let Some(live) = api.get_opt(&name).await.map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("get configmap {name} before cleanup: {e}"))
+            })? {
+                let dp =
+                    super::k8s_runtime_helpers::conditioned_delete_params(&live.metadata, None)?;
+                self.ignore_404(api.delete(&name, &dp).await).await?;
+            }
         }
         if !has_secrets {
-            self.ignore_404(
-                self.secrets_api()
-                    .delete(&self.app_secret_name(app_id), &dp)
-                    .await,
-            )
-            .await?;
+            let name = self.app_secret_name(app_id);
+            let api = self.secrets_api();
+            if let Some(live) = api.get_opt(&name).await.map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("get secret {name} before cleanup: {e}"))
+            })? {
+                let dp =
+                    super::k8s_runtime_helpers::conditioned_delete_params(&live.metadata, None)?;
+                self.ignore_404(api.delete(&name, &dp).await).await?;
+            }
         }
         Ok(())
     }

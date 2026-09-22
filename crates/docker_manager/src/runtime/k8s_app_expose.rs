@@ -9,7 +9,7 @@ use container_runtime_api::{
 use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::Patch;
+use kube::api::{DynamicObject, Patch, PatchParams, PostParams};
 use tracing::warn;
 
 use super::kubernetes_runtime::KubernetesRuntime;
@@ -92,14 +92,9 @@ impl KubernetesRuntime {
         };
         let body = serde_json::to_value(&svc)
             .map_err(|e| ContainerRuntimeError::K8sError(format!("serialize service: {e}")))?;
-        self.services_api()
-            .patch(
-                &self.app_service_name(app_id),
-                &Self::ssa_patch_params(),
-                &Patch::Apply(body),
-            )
-            .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("apply app service: {e}")))?;
+        // 条件化 upsert（uid+RV 前置）：接管后的迟到写 409 而非静默收敛。
+        conditioned_upsert_service(&self.services_api(), &self.app_service_name(app_id), body)
+            .await?;
         Ok(())
     }
 
@@ -167,14 +162,8 @@ impl KubernetesRuntime {
             }
         });
 
-        routes
-            .patch(
-                &self.app_http_route_name(app_id),
-                &Self::ssa_patch_params(),
-                &Patch::Apply(route),
-            )
-            .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("apply httproute: {e}")))?;
+        // 条件化 upsert（uid+RV 前置）：接管后的迟到写 409 而非静默收敛。
+        conditioned_upsert_route(&routes, &self.app_http_route_name(app_id), route).await?;
         Ok(())
     }
 
@@ -220,15 +209,10 @@ impl KubernetesRuntime {
         };
         let body = serde_json::to_value(&svc)
             .map_err(|e| ContainerRuntimeError::K8sError(format!("serialize nodeport: {e}")))?;
-        let created = self
-            .services_api()
-            .patch(
-                &self.app_nodeport_name(app_id),
-                &Self::ssa_patch_params(),
-                &Patch::Apply(body),
-            )
-            .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("apply nodeport: {e}")))?;
+        // 条件化 upsert（uid+RV 前置）：接管后的迟到写 409 而非静默收敛。
+        let created =
+            conditioned_upsert_service(&self.services_api(), &self.app_nodeport_name(app_id), body)
+                .await?;
 
         // 提取实际分配的 node_port：按 name（回退 port 号）关联，避免 server 返回顺序与
         // 请求顺序不一致时 name 与 external_port 配错。
@@ -257,5 +241,109 @@ impl KubernetesRuntime {
             }
         }
         Ok(result)
+    }
+}
+
+/// 条件化 upsert（Service）：活对象 → uid+RV 前置 merge patch；缺席 →
+/// create，并发 409 → 读 winner 身份后条件 merge（同写面收敛）。step-D 写面
+/// fencing 收口——接管后的迟到写在 409 上失败而非静默收敛。
+async fn conditioned_upsert_service(
+    api: &kube::Api<Service>,
+    name: &str,
+    body: serde_json::Value,
+) -> ContainerRuntimeResult<Service> {
+    use super::k8s_runtime_helpers::inject_object_identity;
+    match api
+        .get_opt(name)
+        .await
+        .map_err(|e| ContainerRuntimeError::K8sError(format!("get service {name}: {e}")))?
+    {
+        Some(live) => {
+            let mut body = body;
+            inject_object_identity(&mut body, &live.metadata)?;
+            api.patch(name, &PatchParams::default(), &Patch::Merge(body))
+                .await
+                .map_err(|e| {
+                    ContainerRuntimeError::K8sError(format!(
+                        "conditioned update service {name}: {e}"
+                    ))
+                })
+        }
+        None => {
+            let create_body: Service = serde_json::from_value(body.clone())
+                .map_err(|e| ContainerRuntimeError::K8sError(format!("decode service: {e}")))?;
+            match api.create(&PostParams::default(), &create_body).await {
+                Ok(created) => Ok(created),
+                Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                    let live = api.get(name).await.map_err(|e| {
+                        ContainerRuntimeError::K8sError(format!("get service winner {name}: {e}"))
+                    })?;
+                    let mut body = body;
+                    inject_object_identity(&mut body, &live.metadata)?;
+                    api.patch(name, &PatchParams::default(), &Patch::Merge(body))
+                        .await
+                        .map_err(|e| {
+                            ContainerRuntimeError::K8sError(format!(
+                                "conditioned adopt service {name}: {e}"
+                            ))
+                        })
+                }
+                Err(e) => Err(ContainerRuntimeError::K8sError(format!(
+                    "create service {name}: {e}"
+                ))),
+            }
+        }
+    }
+}
+
+/// 条件化 upsert（HTTPRoute 动态资源）：机理同 [`conditioned_upsert_service`]。
+async fn conditioned_upsert_route(
+    api: &kube::Api<DynamicObject>,
+    name: &str,
+    body: serde_json::Value,
+) -> ContainerRuntimeResult<()> {
+    use super::k8s_runtime_helpers::inject_object_identity;
+    match api
+        .get_opt(name)
+        .await
+        .map_err(|e| ContainerRuntimeError::K8sError(format!("get httproute {name}: {e}")))?
+    {
+        Some(live) => {
+            let mut body = body;
+            inject_object_identity(&mut body, &live.metadata)?;
+            api.patch(name, &PatchParams::default(), &Patch::Merge(body))
+                .await
+                .map_err(|e| {
+                    ContainerRuntimeError::K8sError(format!(
+                        "conditioned update httproute {name}: {e}"
+                    ))
+                })?;
+            Ok(())
+        }
+        None => {
+            let create_body: DynamicObject = serde_json::from_value(body.clone())
+                .map_err(|e| ContainerRuntimeError::K8sError(format!("decode httproute: {e}")))?;
+            match api.create(&PostParams::default(), &create_body).await {
+                Ok(_) => Ok(()),
+                Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                    let live = api.get(name).await.map_err(|e| {
+                        ContainerRuntimeError::K8sError(format!("get httproute winner {name}: {e}"))
+                    })?;
+                    let mut body = body;
+                    inject_object_identity(&mut body, &live.metadata)?;
+                    api.patch(name, &PatchParams::default(), &Patch::Merge(body))
+                        .await
+                        .map_err(|e| {
+                            ContainerRuntimeError::K8sError(format!(
+                                "conditioned adopt httproute {name}: {e}"
+                            ))
+                        })?;
+                    Ok(())
+                }
+                Err(e) => Err(ContainerRuntimeError::K8sError(format!(
+                    "create httproute {name}: {e}"
+                ))),
+            }
+        }
     }
 }

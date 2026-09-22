@@ -313,6 +313,16 @@ pub fn control_error(error: &anyhow::Error) -> shared_types::AppError {
     if let Some(shared_types::UserAppStoreError::OperationInProgress(blocker)) =
         error.downcast_ref::<shared_types::UserAppStoreError>()
     {
+        // step-E 观测：Java 信封会丢弃 blocker 字段（blocker-envelope-java-handoff），
+        // 这里保证阻塞者身份在 rcoder 日志可查（排障不再依赖响应体）。
+        tracing::warn!(
+            blocker_operation_id = %blocker.operation_id,
+            blocker_kind = ?blocker.kind,
+            blocker_state = ?blocker.state,
+            blocker_step = %blocker.step,
+            blocker_scope = ?blocker.scope,
+            "Application operation conflict: admission blocked by an in-flight operation"
+        );
         return shared_types::AppError::with_message(
             shared_types::error_codes::ERR_CONFLICT,
             "A conflicting application operation is in progress",

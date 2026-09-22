@@ -129,10 +129,22 @@ impl KubernetesRuntime {
                                     pvc_name,
                                     wait_start.elapsed().as_secs_f64()
                                 );
-                                let dp = kube::api::DeleteParams {
-                                    grace_period_seconds: Some(0),
-                                    ..Default::default()
-                                };
+                                // step-D 写面 fencing：强删同样带 uid+RV 前置（身份
+                                // 现读现用，防误删同名新代资源）。
+                                let mut dp =
+                                    match self.pvcs().get(pvc_name).await {
+                                        Ok(live) => super::super::k8s_runtime_helpers::conditioned_delete_params(
+                                            &live.metadata,
+                                            None,
+                                        )?,
+                                        Err(e) => {
+                                            return Err(crate::runtime::builder_completion::k8s_error(
+                                                format!("get PVC {pvc_name} before force delete: {e}"),
+                                                e,
+                                            ));
+                                        }
+                                    };
+                                dp.grace_period_seconds = Some(0);
                                 if let Err(e) = self.pvcs().delete(pvc_name, &dp).await {
                                     return Err(crate::runtime::builder_completion::k8s_error(
                                         format!("force delete PVC {pvc_name}: {e}"),
@@ -295,7 +307,7 @@ impl KubernetesRuntime {
     /// 60s Terminating 等待 → 强删 grace=0。
     pub(super) async fn destroy_pvc_core(&self, pvc_name: &str) -> ContainerRuntimeResult<()> {
         // 幂等: PVC 不存在直接返回成功 (Java 重试 / 对账安全)
-        match self.pvcs().get(pvc_name).await {
+        let live = match self.pvcs().get(pvc_name).await {
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 info!(
                     "[K8S] PVC {} not found, destroy is no-op (idempotent)",
@@ -310,16 +322,16 @@ impl KubernetesRuntime {
                     pvc_name, e
                 )));
             }
-            Ok(_) => {}
-        }
+            Ok(live) => live,
+        };
 
         // 发删除请求 (默认 grace period; 调用方保证 app 已 delete → 无 Pod 引用 →
         // pvc-protection finalizer 正常移除)
-        match self
-            .pvcs()
-            .delete(pvc_name, &kube::api::DeleteParams::default())
-            .await
-        {
+        // step-D 写面 fencing：删除带 uid+RV 前置——接管后的迟到删除不会误删
+        // 同名新代资源（与 delete_captured 同款）。
+        let delete_params =
+            super::super::k8s_runtime_helpers::conditioned_delete_params(&live.metadata, None)?;
+        match self.pvcs().delete(pvc_name, &delete_params).await {
             Ok(_) => info!("[K8S] PVC {} delete requested", pvc_name),
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 // 并发已删, 幂等
@@ -349,10 +361,20 @@ impl KubernetesRuntime {
                     pvc_name,
                     wait_start.elapsed().as_secs_f64()
                 );
-                let dp = kube::api::DeleteParams {
-                    grace_period_seconds: Some(0),
-                    ..Default::default()
+                // step-D 写面 fencing：强删带 uid+RV 前置（身份现读现用）。
+                let mut dp = match self.pvcs().get(pvc_name).await {
+                    Ok(live) => super::super::k8s_runtime_helpers::conditioned_delete_params(
+                        &live.metadata,
+                        None,
+                    )?,
+                    Err(e) => {
+                        self.subvolume_path_cache.write().await.remove(pvc_name);
+                        return Err(ContainerRuntimeError::K8sError(format!(
+                            "get PVC '{pvc_name}' before force delete: {e}"
+                        )));
+                    }
                 };
+                dp.grace_period_seconds = Some(0);
                 if let Err(e) = self.pvcs().delete(pvc_name, &dp).await {
                     warn!("[K8S] PVC {pvc_name} force-delete(grace=0) 请求失败: {e}");
                 }

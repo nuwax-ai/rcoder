@@ -328,3 +328,119 @@ impl KubernetesRuntime {
         })
     }
 }
+
+/// 条件写前置元数据：把捕获身份（uid+resourceVersion）注入 patch body 的
+/// metadata——K8s 对携带 resourceVersion 的 patch/replace 做乐观并发校验，
+/// 接管后的迟到写在 409 上失败而非静默收敛（`condition_app_patch` 同款机理，
+/// step-D 写面 fencing 收口）。
+pub(super) fn inject_object_identity(
+    body: &mut serde_json::Value,
+    meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+) -> ContainerRuntimeResult<()> {
+    let (Some(uid), Some(version)) = (meta.uid.as_deref(), meta.resource_version.as_deref()) else {
+        return Err(
+            container_runtime_api::ContainerRuntimeError::ConfigurationError(
+                "Captured resource identity is incomplete (uid/resourceVersion)".into(),
+            ),
+        );
+    };
+    if uid.is_empty() || version.is_empty() {
+        return Err(
+            container_runtime_api::ContainerRuntimeError::ConfigurationError(
+                "Captured resource identity is empty (uid/resourceVersion)".into(),
+            ),
+        );
+    }
+    let metadata = body
+        .as_object_mut()
+        .and_then(|object| {
+            object
+                .entry("metadata")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+        })
+        .ok_or_else(|| {
+            container_runtime_api::ContainerRuntimeError::ConfigurationError(
+                "Conditioned patch body must be an object".into(),
+            )
+        })?;
+    metadata.insert("uid".into(), uid.into());
+    metadata.insert("resourceVersion".into(), version.into());
+    Ok(())
+}
+
+/// 条件删除参数（uid+resourceVersion 前置，与 `delete_captured` 同款）——
+/// 接管后的迟到删除被前置拒绝，不会误删同名新代资源。
+pub(super) fn conditioned_delete_params(
+    meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    propagation: Option<kube::api::PropagationPolicy>,
+) -> ContainerRuntimeResult<kube::api::DeleteParams> {
+    let (Some(uid), Some(version)) = (meta.uid.clone(), meta.resource_version.clone()) else {
+        return Err(
+            container_runtime_api::ContainerRuntimeError::ConfigurationError(
+                "Captured resource identity is incomplete (uid/resourceVersion)".into(),
+            ),
+        );
+    };
+    if uid.is_empty() || version.is_empty() {
+        return Err(
+            container_runtime_api::ContainerRuntimeError::ConfigurationError(
+                "Captured resource identity is empty (uid/resourceVersion)".into(),
+            ),
+        );
+    }
+    Ok(kube::api::DeleteParams {
+        propagation_policy: propagation,
+        preconditions: Some(kube::api::Preconditions {
+            uid: Some(uid),
+            resource_version: Some(version),
+        }),
+        ..Default::default()
+    })
+}
+
+#[cfg(test)]
+mod conditioned_write_tests {
+    use super::*;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    fn meta(uid: &str, rv: &str) -> ObjectMeta {
+        ObjectMeta {
+            uid: Some(uid.into()),
+            resource_version: Some(rv.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inject_object_identity_stamps_preconditions() {
+        let mut body = serde_json::json!({"metadata": {"labels": {"a": "b"}}, "spec": {}});
+        inject_object_identity(&mut body, &meta("uid-1", "9")).expect("inject");
+        assert_eq!(body["metadata"]["uid"], "uid-1");
+        assert_eq!(body["metadata"]["resourceVersion"], "9");
+        assert_eq!(
+            body["metadata"]["labels"]["a"], "b",
+            "既有 metadata 键必须保留"
+        );
+    }
+
+    #[test]
+    fn incomplete_identity_is_rejected_for_writes_and_deletes() {
+        let mut body = serde_json::json!({});
+        assert!(inject_object_identity(&mut body, &ObjectMeta::default()).is_err());
+        assert!(conditioned_delete_params(&meta("", "9"), None).is_err());
+        assert!(conditioned_delete_params(&meta("uid", ""), None).is_err());
+    }
+
+    #[test]
+    fn conditioned_delete_params_carries_uid_and_version_preconditions() {
+        let dp = conditioned_delete_params(
+            &meta("uid-1", "3"),
+            Some(kube::api::PropagationPolicy::Foreground),
+        )
+        .expect("params");
+        let pre = dp.preconditions.expect("preconditions");
+        assert_eq!(pre.uid.as_deref(), Some("uid-1"));
+        assert_eq!(pre.resource_version.as_deref(), Some("3"));
+    }
+}
