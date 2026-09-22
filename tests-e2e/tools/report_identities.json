@@ -472,5 +472,11 @@
       "scenario": "host_k8s_agent_lifecycle_no_llm",
       "backend": "host"
     }
+  ],
+  "userapp_build_no_lockfile_pnpm_install": [
+    {
+      "scenario": "userapp_build_no_lockfile",
+      "backend": "compose"
+    }
   ]
 }

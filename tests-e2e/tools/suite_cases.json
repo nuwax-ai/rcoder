@@ -32,6 +32,7 @@
     "userapp_compose_regression"
   ],
   "compose_userapp_build_rules": [
+    "userapp_build_no_lockfile_pnpm_install",
     "userapp_devbuild_no_lockfile_pnpm_install",
     "userapp_devbuild_skip_and_fallback_source_mode",
     "userapp_static_proxy_aligned_build_passes",

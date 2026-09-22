@@ -125,6 +125,15 @@ REQUIRED['userapp_devbuild_skip_and_fallback_source_mode'].update({
     'Q10 previous content remains healthy after build failure',
 })
 
+REQUIRED['userapp_build_no_lockfile_pnpm_install'] = {
+    'create-workspace（ensure 开发容器）',
+    'init 模板 zip（manifests + dist fixture 直投源码目录）',
+    'build 受理（200 + task_id）',
+    '无 lockfile build completed（frozen 失败→pnpm install→重试成功）',
+    'build 自愈生成 pnpm-lock.yaml（修复前此处 ERR_PNPM_NO_LOCKFILE 失败）',
+    '非 ERR_PNPM_NO_LOCKFILE 失败不自愈（错误如实传播）',
+}
+
 REQUIRED['userapp_devbuild_no_lockfile_pnpm_install'] = {
     'create-workspace（ensure 开发容器）',
     'init 模板 zip（manifests + dist fixture 直投源码目录）',

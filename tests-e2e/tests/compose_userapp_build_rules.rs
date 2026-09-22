@@ -939,3 +939,109 @@ async fn userapp_devbuild_no_lockfile_pnpm_install() {
     assert_hard_all(report).await;
     cleanup_builder(&app);
 }
+
+// ============================================================
+// 场景：prod build 缺 lockfile 自愈（app-171 事故回归）
+// 平台导出链过滤 pnpm-lock.yaml（既定设计）+ 存量模板 build 脚本
+// --frozen-lockfile → ERR_PNPM_NO_LOCKFILE。自愈：失败码触发 pnpm
+// install 生成 lockfile 后重试一次构建。
+// ============================================================
+#[tokio::test]
+async fn userapp_build_no_lockfile_pnpm_install() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_build_no_lockfile";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "bn");
+    let user = "e2e-br-user";
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 单服务 node 工程：无 pnpm-lock.yaml + 本地 file: 依赖（离线安装）。
+    // [build] 刻意用旧模板形态 --frozen-lockfile（app-171 事故现场形状）。
+    let ws_manifest = "schema_version = 1\n\n[workspace]\nname = \"e2e-br-build-heal\"\n";
+    let frozen_manifest = "schema_version = 1\n\n[project]\nservice_id = \"build-heal-svc\"\nname = \"Build Heal\"\ntype = \"node\"\n\n[build]\ncommand = [\"sh\", \"-c\", \"pnpm install --frozen-lockfile && mkdir -p dist && echo ok > dist/index.html\"]\nartifact = \"dist\"\n\n[proxy]\npath = \"/api/heal/\"\nstrip_prefix = true\n";
+    let pkg_json = "{\n  \"name\": \"build-heal-fixture\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": { \"dep-a\": \"file:./vendor/dep-a\" }\n}\n";
+    let dep_pkg = "{ \"name\": \"dep-a\", \"version\": \"1.0.0\" }\n";
+    if !init_zip_workspace(
+        &env,
+        &report,
+        &app,
+        user,
+        &[
+            ("workspace.manifest.toml", ws_manifest),
+            ("build-heal-svc/project.manifest.toml", frozen_manifest),
+            ("build-heal-svc/package.json", pkg_json),
+            ("build-heal-svc/vendor/dep-a/package.json", dep_pkg),
+        ],
+    )
+    .await
+    {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 正例：frozen + 无 lockfile → 自愈（install 生成 lockfile + 重试一次）→ completed
+    let terminal = build_to_terminal(&env, &report, &app, user, Duration::from_secs(300)).await;
+    let completed = terminal
+        .as_ref()
+        .is_some_and(|d| d["status"] == "completed");
+    report.assert_hard(
+        "无 lockfile build completed（frozen 失败→pnpm install→重试成功）",
+        completed,
+        format!("terminal={}", trunc(&terminal.unwrap_or(Value::Null), 240)),
+    );
+    let lockfile = file_exists(&env, &app, user, "build-heal-svc/pnpm-lock.yaml").await;
+    report.assert_hard(
+        "build 自愈生成 pnpm-lock.yaml（修复前此处 ERR_PNPM_NO_LOCKFILE 失败）",
+        lockfile == Some(true),
+        format!("resolve-file build-heal-svc/pnpm-lock.yaml → {lockfile:?}"),
+    );
+
+    // 反例：非该码失败不得触发自愈（错误如实传播，无 self-heal 上下文）。
+    let plain_fail_manifest = frozen_manifest.replace(
+        "pnpm install --frozen-lockfile && mkdir -p dist && echo ok > dist/index.html",
+        "exit 7",
+    );
+    assert_ne!(
+        plain_fail_manifest, frozen_manifest,
+        "反例 manifest 必须生效"
+    );
+    overwrite_file(
+        &env,
+        &app,
+        user,
+        "build-heal-svc/project.manifest.toml",
+        &plain_fail_manifest,
+    )
+    .await;
+    let terminal = build_to_terminal(&env, &report, &app, user, Duration::from_secs(120)).await;
+    let failed_honestly = terminal.as_ref().is_some_and(|d| {
+        d["status"] == "failed"
+            && d["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("exited non-zero"))
+            && !e_no_self_heal(d)
+    });
+    report.assert_hard(
+        "非 ERR_PNPM_NO_LOCKFILE 失败不自愈（错误如实传播）",
+        failed_honestly,
+        format!("terminal={}", trunc(&terminal.unwrap_or(Value::Null), 240)),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}
+
+fn e_no_self_heal(data: &Value) -> bool {
+    data["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("self-heal"))
+}
