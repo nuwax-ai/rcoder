@@ -561,10 +561,14 @@ async fn compute_control_upgrade_preserves_v1_data_and_baseline_checksum() {
     let owner = schema_owner().await;
     owner.execute(|mut db| async move {
         schema::initialize(&mut db, Backend::Turso, &[Component::Userapp]).await?;
-        // Reconstruct the exact released v1 catalog, retaining its original ledger.
+        // Reconstruct the exact released v1 catalog, retaining its original
+        // ledger: drop every post-baseline table (v2 compute-control 族、v3
+        // recovery-witness) and ledger row (version>=2)——少删一号账本即触发
+        // 迁移历史 gap 守卫（本测试模拟的是干净 v1 现场，不是跳版现场）。
         toasty::sql::statement("DROP TABLE userapp_compute_controls").exec(&mut db).await?;
         toasty::sql::statement("DROP TABLE userapp_compute_intents").exec(&mut db).await?;
-        toasty::sql::statement("DELETE FROM rcoder_schema_migrations WHERE component='userapp' AND version=2").exec(&mut db).await?;
+        toasty::sql::statement("DROP TABLE userapp_recovery_witnesses").exec(&mut db).await?;
+        toasty::sql::statement("DELETE FROM rcoder_schema_migrations WHERE component='userapp' AND version>=2").exec(&mut db).await?;
         toasty::sql::statement("INSERT INTO userapps(app_id,lifecycle_id,lifecycle_epoch,lifecycle_state,metadata_revision,created_at_us,updated_at_us) VALUES('keptapp','keptlife',1,'active',1,1,1)").exec(&mut db).await?;
         let before = toasty::sql::query("SELECT checksum,schema_fingerprint FROM rcoder_schema_migrations WHERE component='userapp' AND version=1").exec(&mut db).await?;
         schema::initialize(&mut db, Backend::Turso, &[Component::Userapp]).await?;
@@ -574,7 +578,7 @@ async fn compute_control_upgrade_preserves_v1_data_and_baseline_checksum() {
         let kept = super::models::Application::filter_by_app_id("keptapp").first().exec(&mut db).await?.expect("application survives upgrade");
         assert_eq!(kept.lifecycle_id, "keptlife");
         let migrations = toasty::sql::query("SELECT version FROM rcoder_schema_migrations WHERE component='userapp' ORDER BY version").exec(&mut db).await?;
-        assert_eq!(migrations.len(), 2);
+        assert_eq!(migrations.len(), 3);
         assert!(toasty::sql::statement("INSERT INTO userapp_compute_intents VALUES('keptapp','keptlife','dev',0,1,'stopped',NULL,1)").exec(&mut db).await.is_err());
         Ok(())
     }).await.unwrap();

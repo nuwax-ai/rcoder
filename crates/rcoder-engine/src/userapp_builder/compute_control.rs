@@ -13,8 +13,12 @@ pub struct ComputeOperationView {
     pub operation_id: String,
     pub app_id: String,
     pub lifecycle_id: String,
+    /// Operation slot scope: Dev / Prod / Application.
     pub scope: UserAppOperationScope,
+    /// Compute intent kind: one of stop / restart.
     pub action: ComputeControlAction,
+    /// Intent state: pending / running / recovery_required / succeeded /
+    /// failed / superseded.
     pub state: ComputeControlState,
     pub stage: String,
     pub revision: i64,

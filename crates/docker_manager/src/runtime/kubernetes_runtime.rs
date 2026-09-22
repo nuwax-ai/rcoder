@@ -1128,10 +1128,30 @@ mod create_lease_tests {
                         write_reply(
                             &mut stream,
                             200,
+                            // 归属校验（validate_builder_service）四要素齐全：
+                            // identifier/service-type 家族标签 + 全量 selector +
+                            // 非 headless（无 clusterIP）；uid/RV 供端口收敛
+                            // patch 的 precondition——夹具残缺会在到达注入失败
+                            // 前先撞归属 Conflict，遮蔽被测传播语义。
                             &serde_json::json!({
                                 "apiVersion":"v1", "kind":"Service",
-                                "metadata":{"name":"rcoder-app-builder-errclaim-svc"},
-                                "spec":{"ports":[]}
+                                "metadata":{
+                                    "name":"rcoder-app-builder-errclaim-svc",
+                                    "uid":"svc-owned","resourceVersion":"42",
+                                    "labels":{
+                                        "rcoder.io/identifier":"errclaim",
+                                        "rcoder.io/service-type":"user-app-builder"
+                                    }
+                                },
+                                "spec":{
+                                    "selector":{
+                                        "app.kubernetes.io/name":"user-app-builder",
+                                        "app.kubernetes.io/instance":"errclaim",
+                                        "app.kubernetes.io/managed-by":"rcoder-runtime",
+                                        "rcoder.io/identifier":"errclaim"
+                                    },
+                                    "ports":[]
+                                }
                             }),
                         )
                         .await;

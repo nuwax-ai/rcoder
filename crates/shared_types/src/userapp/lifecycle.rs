@@ -409,11 +409,12 @@ pub struct UserAppOperationRecord {
     pub lifecycle_id: String,
     pub request_id: Option<String>,
     pub request_fingerprint: String,
-    /// Operation kind: EnsureBuilder, AdoptBuilder, StopBuilder, RestartBuilder,
-    /// Create, StartDeployment, RestartDeployment, Update, Start, Restart, Stop,
-    /// SetRecyclePolicy, HotDeploy, DeleteCompute, PurgeResources, DestroyDevStorage,
-    /// DestroyProdStorage, ClearDevStorage, ClearProdStorage, ResetDevDatabasePassword,
-    /// ResetProdDatabasePassword, PrepareProdDatabase, or DeleteApplication.
+    /// Operation kind: EnsureBuilder, AdoptBuilder, AdoptApplication,
+    /// StopBuilder, RestartBuilder, Create, StartDeployment, RestartDeployment,
+    /// Update, Start, Restart, Stop, SetRecyclePolicy, HotDeploy, DeleteCompute,
+    /// PurgeResources, DestroyDevStorage, DestroyProdStorage, ClearDevStorage,
+    /// ClearProdStorage, ResetDevDatabasePassword, ResetProdDatabasePassword,
+    /// PrepareProdDatabase, or DeleteApplication.
     pub kind: UserAppOperationKind,
     /// Resource scope this operation occupies. Server-derived from the kind at
     /// admission; never client-supplied, and never defaulted when decoding
@@ -508,11 +509,12 @@ pub struct UserAppAdmission {
     pub operation_id: String,
     pub request_id: Option<String>,
     pub request_fingerprint: String,
-    /// Operation kind: EnsureBuilder, AdoptBuilder, StopBuilder, RestartBuilder,
-    /// Create, StartDeployment, RestartDeployment, Update, Start, Restart, Stop,
-    /// SetRecyclePolicy, HotDeploy, DeleteCompute, PurgeResources, DestroyDevStorage,
-    /// DestroyProdStorage, ClearDevStorage, ClearProdStorage, ResetDevDatabasePassword,
-    /// ResetProdDatabasePassword, PrepareProdDatabase, or DeleteApplication.
+    /// Operation kind: EnsureBuilder, AdoptBuilder, AdoptApplication,
+    /// StopBuilder, RestartBuilder, Create, StartDeployment, RestartDeployment,
+    /// Update, Start, Restart, Stop, SetRecyclePolicy, HotDeploy, DeleteCompute,
+    /// PurgeResources, DestroyDevStorage, DestroyProdStorage, ClearDevStorage,
+    /// ClearProdStorage, ResetDevDatabasePassword, ResetProdDatabasePassword,
+    /// PrepareProdDatabase, or DeleteApplication.
     pub kind: UserAppOperationKind,
 }
 
@@ -694,11 +696,12 @@ pub struct UserAppOperationBlocker {
     /// Blocking scope: Dev, Prod, or Application.
     pub scope: UserAppOperationScope,
     pub operation_id: String,
-    /// Blocking operation kind: EnsureBuilder, AdoptBuilder, StopBuilder,
-    /// RestartBuilder, Create, StartDeployment, RestartDeployment, Update, Start,
-    /// Restart, Stop, SetRecyclePolicy, HotDeploy, DeleteCompute, PurgeResources,
-    /// DestroyDevStorage, DestroyProdStorage, ClearDevStorage, ClearProdStorage,
-    /// ResetDevDatabasePassword, ResetProdDatabasePassword, PrepareProdDatabase, or DeleteApplication.
+    /// Blocking operation kind: EnsureBuilder, AdoptBuilder, AdoptApplication,
+    /// StopBuilder, RestartBuilder, Create, StartDeployment, RestartDeployment,
+    /// Update, Start, Restart, Stop, SetRecyclePolicy, HotDeploy, DeleteCompute,
+    /// PurgeResources, DestroyDevStorage, DestroyProdStorage, ClearDevStorage,
+    /// ClearProdStorage, ResetDevDatabasePassword, ResetProdDatabasePassword,
+    /// PrepareProdDatabase, or DeleteApplication.
     pub kind: UserAppOperationKind,
     /// Blocking operation state: Pending, Running, WaitingRetry,
     /// RecoveryRequired, Succeeded, or Failed.
@@ -1259,11 +1262,12 @@ pub struct UserAppOperationView {
     pub app_id: String,
     pub lifecycle_id: String,
     pub request_id: Option<String>,
-    /// Operation kind: EnsureBuilder, AdoptBuilder, StopBuilder, RestartBuilder,
-    /// Create, StartDeployment, RestartDeployment, Update, Start, Restart, Stop,
-    /// SetRecyclePolicy, HotDeploy, DeleteCompute, PurgeResources, DestroyDevStorage,
-    /// DestroyProdStorage, ClearDevStorage, ClearProdStorage, ResetDevDatabasePassword,
-    /// ResetProdDatabasePassword, PrepareProdDatabase, or DeleteApplication.
+    /// Operation kind: EnsureBuilder, AdoptBuilder, AdoptApplication,
+    /// StopBuilder, RestartBuilder, Create, StartDeployment, RestartDeployment,
+    /// Update, Start, Restart, Stop, SetRecyclePolicy, HotDeploy, DeleteCompute,
+    /// PurgeResources, DestroyDevStorage, DestroyProdStorage, ClearDevStorage,
+    /// ClearProdStorage, ResetDevDatabasePassword, ResetProdDatabasePassword,
+    /// PrepareProdDatabase, or DeleteApplication.
     pub kind: UserAppOperationKind,
     /// Resource scope this operation occupies: Dev (builder), Prod (production
     /// runtime) or Application (both environments plus shared authority).

@@ -1,6 +1,7 @@
 use super::*;
 use axum::{extract::Path, response::IntoResponse};
 
+/// 查询计算控制操作状态与恢复阶段
 #[utoipa::path(get, path = "/computer/pod/operations/{app_id}/{operation_id}",
     params(("app_id" = String, Path, description = "Application ID"),
            ("operation_id" = String, Path, description = "Compute operation ID")),
@@ -39,6 +40,7 @@ pub struct ComputeRecoveryRequest {
     pub expected_revision: i64,
 }
 
+/// 恢复计算控制操作（续排空或终局确认，不重放）
 #[utoipa::path(post, path = "/computer/pod/operations/{app_id}/{operation_id}/recover",
     params(("app_id" = String, Path, description = "Application ID"),
            ("operation_id" = String, Path, description = "Original compute operation ID")),

@@ -91,8 +91,9 @@ pub const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
 pub mod guard_tables {
     /// rcoder 本地实现的 userapp 路径快照（`routes()` 显式入口部分；
     /// 守卫闭包比对用——改动路由须同步）。
-    pub const LOCAL_USERAPP_PATHS: [&str; 18] = [
+    pub const LOCAL_USERAPP_PATHS: [&str; 19] = [
         "/api/v1/userapp/{app_id}/builder/adopt",
+        "/api/v1/userapp/{app_id}/prod/adopt",
         "/api/v1/userapp/workspace",
         "/api/v1/userapp/db/{app_stage}/reset-password",
         "/api/v1/userapp/db/{app_stage}/reset-password/recover",

@@ -403,6 +403,18 @@ impl UserAppDeploymentRuntime for MockRuntime {
             .unwrap_or_default())
     }
 
+    /// 单测不模拟"PG 记录缺失但物理资源残留"的孤儿场景：discovery 恒无发现，
+    /// 对齐真实运行时（K8s/Docker）无匹配资源时的 Ok(None)；需要正向发现的
+    /// 测试（如孤儿接管）再扩展本桩。
+    async fn discover_application_identity(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppDiscoveredIdentity>> {
+        shared_types::validate_identifier(app_id, "app_id")
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        Ok(None)
+    }
+
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
         self.list_calls.fetch_add(1, Ordering::Relaxed);
         Ok(self
