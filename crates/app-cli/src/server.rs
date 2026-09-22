@@ -21,7 +21,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 #[path = "server_journal.rs"]
-pub(crate) mod journal;
+pub mod journal;
 #[path = "server_preparation.rs"]
 mod preparation;
 use journal::{ActiveVersion, Boundary, Journal, Receipt};

@@ -29,6 +29,16 @@ async fn main() -> anyhow::Result<()> {
             let _guard = init_tracing(&args.log_dir);
             return app_cli::run_service::run(&args.release_id, &args.service_id, &args.log_dir);
         }
+        app_cli::config::Command::Journal {
+            command: app_cli::config::JournalCommand::Adopt(args),
+        } => {
+            let report = app_cli::server::journal::adopt_superseded_legacy(
+                &args.workspace.workspace,
+                args.force,
+            )?;
+            println!("{report}");
+            return Ok(());
+        }
         app_cli::config::Command::Run(args) => app_cli::RuntimeArgs::from(args),
     };
     let _guard = init_tracing(&args.log_dir);

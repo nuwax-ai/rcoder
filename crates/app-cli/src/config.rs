@@ -22,6 +22,28 @@ pub enum Command {
     GenLock(WorkspaceArgs),
     /// 执行 supervisord 管理的服务 spec。
     RunService(RunServiceArgs),
+    /// 部署 journal 运维（双权威域裁决等）。
+    Journal {
+        #[command(subcommand)]
+        command: JournalCommand,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum JournalCommand {
+    /// 裁决双权威域冲突：归档被取代的陈旧 legacy 记录（可审计、可回滚）。
+    Adopt(JournalAdoptArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct JournalAdoptArgs {
+    #[command(flatten)]
+    pub workspace: WorkspaceArgs,
+    /// 跳过 settled/新旧判定归档陈旧 legacy 记录——操作者断言权威状态根为
+    /// 唯一真相。归档只改名（.superseded-<ts>）可回滚，不删除；任一侧锁被
+    /// 活持有者持有时仍拒绝。
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug, Clone)]

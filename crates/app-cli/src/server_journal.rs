@@ -501,6 +501,103 @@ fn archive_superseded_records(legacy: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `app-cli journal adopt`：双权威域冲突的可审计显式裁决。
+///
+/// - 无 legacy 记录 → no-op 成功（可作升级前批量预检）；
+/// - 权威根为空 → 拒绝归档（legacy 是下次 serve 自动迁移的来源，归档即
+///   掐断迁移），报告引导直接启动；
+/// - 有冲突（默认）：执行与 serve 启动同款的判定——双侧 settled 且权威
+///   记录不旧于 legacy → 归档陈旧侧；不满足则非零退出并给出具体原因；
+/// - `--force`：跳过 settled/新旧判定（操作者断言权威根为真相），仅保留
+///   两侧活锁拒绝这一道防线。归档改名可回滚，永不删除。
+pub fn adopt_superseded_legacy(workspace: &Path, force: bool) -> Result<String> {
+    let root = match std::env::var_os("APP_CLI_STATE_ROOT").filter(|value| !value.is_empty()) {
+        Some(explicit) => PathBuf::from(explicit),
+        None => workspace
+            .parent()
+            .context("workspace has no volume root")?
+            .to_path_buf(),
+    };
+    adopt_superseded_legacy_with_root(workspace, root, force)
+}
+
+/// [`adopt_superseded_legacy`] 的显式 root 形态（serve 的 open_with_root 同款
+/// 布局：authority root 独立于 legacy 候选路径）。
+pub fn adopt_superseded_legacy_with_root(
+    workspace: &Path,
+    root: PathBuf,
+    force: bool,
+) -> Result<String> {
+    // 活 owner 在跑 → open_root 的 try_lock 直接拒绝（与 serve 同因同文案）。
+    let authority = Journal::open_root(root.clone())?;
+    let project = runtime_state_layout::canonical_project_root(workspace);
+    let mut candidates = vec![project.clone()];
+    if let Some(parent) = project.parent() {
+        candidates.push(parent.to_path_buf());
+    }
+    let root_identity = std::fs::canonicalize(&root)?;
+    let conflicts: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|legacy| {
+            std::fs::canonicalize(legacy).is_ok_and(|path| path != root_identity)
+                && (legacy
+                    .join(".deploy-operation.json")
+                    .try_exists()
+                    .unwrap_or(false)
+                    || legacy
+                        .join(".deploy-coordinator.json")
+                        .try_exists()
+                        .unwrap_or(false))
+        })
+        .collect();
+    if conflicts.is_empty() {
+        return Ok(format!(
+            "authority root: {}\nno conflicting legacy deployment records found",
+            root.display()
+        ));
+    }
+    anyhow::ensure!(
+        authority.receipt.is_some() || authority.previous_owner.is_some(),
+        "authority root {} has no deployment records; legacy records \
+         migrate automatically on the next serve — nothing to adopt",
+        root.display()
+    );
+    let mut report = format!("authority root: {}\n", root.display());
+    for legacy in conflicts {
+        let old = Journal::open_root(legacy.clone())?;
+        if !force {
+            let legacy_settled = domain_settled(
+                old.receipt.as_ref().map(|receipt| &receipt.boundary),
+                old.previous_owner.as_ref(),
+            );
+            let authority_settled = domain_settled(
+                authority.receipt.as_ref().map(|receipt| &receipt.boundary),
+                authority.previous_owner.as_ref(),
+            );
+            anyhow::ensure!(
+                authority_settled && legacy_settled,
+                "legacy {} or authority {} has an in-flight deployment handoff; \
+                 settle it or rerun with --force after verifying the authority root",
+                legacy.display(),
+                root.display()
+            );
+            anyhow::ensure!(
+                authority_covers_legacy(&root, &legacy),
+                "legacy records at {} are newer than authority {}; verify for \
+                 downgrade mixing, then rerun with --force",
+                legacy.display(),
+                root.display()
+            );
+        }
+        archive_superseded_records(&legacy)?;
+        report.push_str(&format!(
+            "archived superseded legacy records at {}\n",
+            legacy.display()
+        ));
+    }
+    Ok(report)
+}
+
 /// A new Linux PID namespace proves that processes from the previous container
 /// cannot still own this workspace. A process restart in the same namespace does not.
 fn process_scope() -> Option<String> {
@@ -701,6 +798,91 @@ mod tests {
         assert!(root.join(".deploy-operation.json").exists());
     }
 
+    // ── `app-cli journal adopt` 子命令（可审计显式裁决）────────────────────
+
+    /// 无冲突 → no-op 成功（升级前批量预检语义）。
+    #[test]
+    fn adopt_without_conflict_is_noop_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&workspace, None, None).unwrap();
+        let report = adopt_superseded_legacy_with_root(&workspace, root, false).unwrap();
+        assert!(report.contains("no conflicting legacy deployment records found"));
+    }
+
+    /// 权威根为空 → 拒绝归档：legacy 是下次 serve 自动迁移的来源，
+    /// 归档即掐断迁移（journal 历史丢失）。
+    #[test]
+    fn adopt_never_archives_when_authority_root_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&workspace, None, None).unwrap();
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        legacy.commit_quiescent().unwrap();
+        drop(legacy);
+
+        let error = adopt_superseded_legacy_with_root(&workspace, root, false).unwrap_err();
+        assert!(error.to_string().contains("nothing to adopt"));
+        assert!(dir.path().join(".deploy-operation.json").exists());
+    }
+
+    /// 默认判定与 serve 自动收束同款：settled+权威新 → 归档；
+    /// legacy 在途 → 拒绝且记录原样；--force → 归档放行。
+    #[test]
+    fn adopt_follows_settled_checks_and_force_overrides() {
+        // 形态一：settled + 权威新（可自动收束的冲突）→ adopt 默认即归档
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&workspace, None, None).unwrap();
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        legacy.commit_quiescent().unwrap();
+        drop(legacy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut authority = Journal::open_root(root.clone()).unwrap();
+        authority.commit_coordinator().unwrap();
+        authority.write(receipt(Boundary::Failed)).unwrap();
+        authority.commit_quiescent().unwrap();
+        drop(authority);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let report = adopt_superseded_legacy_with_root(&workspace, root.clone(), false).unwrap();
+        assert!(report.contains("archived superseded legacy records"));
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+        assert!(root.join(".deploy-operation.json").exists());
+
+        // 形态二：legacy 在途（coordinator 未 quiescent）→ 默认拒绝带原因，
+        // --force 归档放行
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&workspace, None, None).unwrap();
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        // 不 quiescent：在途
+        drop(legacy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut authority = Journal::open_root(root.clone()).unwrap();
+        authority.commit_coordinator().unwrap();
+        authority.write(receipt(Boundary::Failed)).unwrap();
+        authority.commit_quiescent().unwrap();
+        drop(authority);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let error = adopt_superseded_legacy_with_root(&workspace, root.clone(), false).unwrap_err();
+        assert!(error.to_string().contains("in-flight"));
+        assert!(dir.path().join(".deploy-operation.json").exists());
+        let report = adopt_superseded_legacy_with_root(&workspace, root, true).unwrap();
+        assert!(report.contains("archived superseded legacy records"));
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+    }
     fn receipt(boundary: Boundary) -> Receipt {
         let request = DeployRequest {
             runtime_operation_id: None,
