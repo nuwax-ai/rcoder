@@ -223,7 +223,7 @@ impl KubernetesRuntime {
             .unwrap_or(0);
 
         // 关联 Pod 信息先取：phase 判定需要容器状态（CrashLoop/ImagePull/异常退出 → Error）。
-        let (pod_ip, node, restart_count, started_at, error_message) =
+        let (pod_ip, node, restart_count, started_at, error_message, error_reason) =
             self.fetch_app_pod_info(app_id).await;
         let phase = derive_phase(replicas, ready_replicas, &error_message);
         let tcp_nodeports = self.collect_tcp_nodeports(app_id).await;
@@ -253,6 +253,7 @@ impl KubernetesRuntime {
             ready_replicas,
             phase,
             message: error_message,
+            reason: error_reason,
             pod_ip: if pod_ip.is_empty() {
                 None
             } else {
@@ -272,11 +273,20 @@ impl KubernetesRuntime {
     }
 
     /// 拉取 app 关联 Pod 的实时信息（取一个；app 当前为单副本）。
-    /// 返回 (pod_ip, node, restart_count, started_at, error_message)；无 Pod 或 list 失败返默认空值。
+    /// 返回 (pod_ip, node, restart_count, started_at, error_message, error_reason)；
+    /// 无 Pod 或 list 失败返默认空值。error_reason 是 typed 容器状态字段的结构化
+    /// 失败原因（见 `container_error_reason`），error_message 仅作人类可读详情。
     async fn fetch_app_pod_info(
         &self,
         app_id: &str,
-    ) -> (String, String, u32, Option<String>, Option<String>) {
+    ) -> (
+        String,
+        String,
+        u32,
+        Option<String>,
+        Option<String>,
+        Option<container_runtime_api::ContainerFailureReason>,
+    ) {
         let lp = ListParams {
             label_selector: Some(format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX)),
             // 查询面同样走 watch cache（与 list_app_status 一致）
@@ -308,6 +318,7 @@ impl KubernetesRuntime {
                                 0,
                                 None,
                                 scheduling,
+                                None,
                             ));
                         }
                     };
@@ -321,16 +332,18 @@ impl KubernetesRuntime {
                     // 启动失败原因（CrashLoop / 镜像拉取失败 / 异常退出）；正常拉起的中间态
                     // （ContainerCreating）不在此列，不会被误判为 Error。
                     let error_message = container_error_message(&cs);
+                    let error_reason = container_error_reason(&cs);
                     Some((
                         st.pod_ip.clone().unwrap_or_default(),
                         p.spec.and_then(|s| s.node_name).unwrap_or_default(),
                         cs.restart_count as u32,
                         started_at,
                         error_message,
+                        error_reason,
                     ))
                 })
                 .unwrap_or_default(),
-            Err(_) => (String::new(), String::new(), 0, None, None),
+            Err(_) => (String::new(), String::new(), 0, None, None, None),
         }
     }
 
@@ -543,6 +556,7 @@ impl KubernetesRuntime {
 // probe_to_health_check）与测试已拆至 k8s_app_status_derive.rs；
 // re-export 保持 k8s_agent_query 的既有引用路径不变
 pub(crate) use super::k8s_app_status_derive::container_error_message;
+use super::k8s_app_status_derive::container_error_reason;
 use super::k8s_app_status_derive::unschedulable_message;
 use super::k8s_app_status_derive::{derive_phase, derive_port_statuses, probe_to_health_check};
 

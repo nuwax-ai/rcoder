@@ -1,7 +1,7 @@
 //! service 层工具函数（错误映射 / 校验 / 状态派生 / 类型映射）
 
 use container_runtime_api::{
-    ContainerRuntimeError, DeploymentStatus, ExposeType as RtExposeType,
+    ContainerFailureReason, ContainerRuntimeError, DeploymentStatus, ExposeType as RtExposeType,
     HealthCheckType as RtHealthCheckType,
 };
 use shared_types::ServiceType;
@@ -145,20 +145,29 @@ pub(super) fn phase_to_status(phase: &str) -> AppStatus {
     }
 }
 
-/// 从 message 中提取简短机器码原因（CrashLoopBackOff / ImagePullBackOff 等）
-pub(super) fn extract_reason(msg: &str) -> Option<&str> {
-    const KNOWN: &[&str] = &[
-        "CrashLoopBackOff",
-        "ImagePullBackOff",
-        "ErrImagePull",
-        "CreateContainerConfigError",
-        "CreateContainerError",
-        "InvalidImageName",
-        "RunContainerError",
-        "StartError",
-        "OOMKilled",
-    ];
-    KNOWN.iter().find(|k| msg.contains(*k)).copied()
+/// 容器失败原因分类（契约 C4）：**结构化 reason 字段优先**（[`ContainerFailureReason`]
+/// 类型化、边界已 parse），message 白名单仅作单点收窄兜底（[`extract_reason`]，
+/// 整 token 不子串）。都未命中 → None，调用方按 "Error" 兜底
+/// （输出与 message 回扫时代一致）。
+pub(super) fn classify_k8s_reason(
+    reason: Option<ContainerFailureReason>,
+    message: Option<&str>,
+) -> Option<ContainerFailureReason> {
+    reason.or_else(|| message.and_then(extract_reason))
+}
+
+/// message 兜底白名单（单点文档化，非主判据——主判据是结构化 reason 字段）。
+/// 整 token 等值匹配（不子串），命中顺序按 [`ContainerFailureReason::ALL`] 优先序。
+fn extract_reason(msg: &str) -> Option<ContainerFailureReason> {
+    ContainerFailureReason::ALL
+        .into_iter()
+        .find(|r| message_has_token(msg, r.as_str()))
+}
+
+fn message_has_token(msg: &str, token: &str) -> bool {
+    msg.split_whitespace()
+        .map(|raw| raw.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_')))
+        .any(|t| t == token)
 }
 
 /// 由 DeploymentStatus 派生 conditions（见设计文档 §6.3 派生表）
@@ -177,11 +186,8 @@ pub(super) fn derive_conditions(status: &DeploymentStatus) -> Vec<Condition> {
     };
     match app_status {
         AppStatus::Error => {
-            let reason = status
-                .message
-                .as_deref()
-                .and_then(extract_reason)
-                .unwrap_or("Error");
+            let reason = classify_k8s_reason(status.reason, status.message.as_deref())
+                .map_or("Error", |r| r.as_str());
             vec![
                 mk("Error", "True", Some(reason), status.message.clone()),
                 mk("Ready", "False", Some("Error"), None),
@@ -376,19 +382,58 @@ mod tests {
     fn extract_reason_finds_known_code() {
         assert_eq!(
             extract_reason("Back-off restarting... CrashLoopBackOff"),
-            Some("CrashLoopBackOff")
+            Some(ContainerFailureReason::CrashLoopBackOff)
         );
         assert_eq!(
             extract_reason("ImagePullBackOff: pull failed"),
-            Some("ImagePullBackOff")
+            Some(ContainerFailureReason::ImagePullBackOff)
         );
-        assert_eq!(extract_reason("ErrImagePull"), Some("ErrImagePull"));
-        assert_eq!(extract_reason("OOMKilled"), Some("OOMKilled"));
+        assert_eq!(
+            extract_reason("ErrImagePull"),
+            Some(ContainerFailureReason::ErrImagePull)
+        );
+        assert_eq!(
+            extract_reason("OOMKilled"),
+            Some(ContainerFailureReason::OOMKilled)
+        );
     }
 
     #[test]
     fn extract_reason_returns_none_for_normal_log() {
         assert_eq!(extract_reason("normal log message"), None);
+    }
+
+    // ---------------- classify_k8s_reason（契约 C4） ----------------
+
+    #[test]
+    fn structured_reason_wins_without_message_match() {
+        // T003 反例（修复前必挂）: reason 字段结构化命中, message 无该词也必须分类。
+        assert_eq!(
+            classify_k8s_reason(
+                Some(ContainerFailureReason::CrashLoopBackOff),
+                Some("back-off 5m0s")
+            ),
+            Some(ContainerFailureReason::CrashLoopBackOff)
+        );
+        assert_eq!(
+            classify_k8s_reason(Some(ContainerFailureReason::OOMKilled), None),
+            Some(ContainerFailureReason::OOMKilled)
+        );
+    }
+
+    #[test]
+    fn message_fallback_is_whitelist_only_and_token_scoped() {
+        // 结构化字段缺失/未知 → 单点 message 白名单兜底; 过宽子串不得吞错。
+        assert_eq!(
+            classify_k8s_reason(None, Some("ImagePullBackOff: pull failed")),
+            Some(ContainerFailureReason::ImagePullBackOff)
+        );
+        assert_eq!(
+            classify_k8s_reason(None, Some("xCrashLoopBackOffx foo")),
+            None,
+            "子串含关键词但非整 token 不得吞错"
+        );
+        assert_eq!(classify_k8s_reason(None, Some("normal log message")), None);
     }
 
     // ---------------- map_expose_type / map_health_check_type ----------------

@@ -42,18 +42,12 @@ impl RpcFault {
 
     /// 目标组/进程不存在（R11 结构化分类）。
     ///
-    /// 判据：`faultCode == 10`（supervisord `xmlrpc.Faults.BAD_NAME`——官方
-    /// 客户端同款分类）优先；`faultString` 包含 "no process group"/"BAD_NAME"
-    /// 兜底（版本措辞差异）。**只在 RpcFault 已解析的前提下判定**——普通
-    /// 网络错误的文案恰含这些词不再被误判为"不存在"。
+    /// 判据**仅** `faultCode == 10`（supervisord `xmlrpc.Faults.BAD_NAME`——官方
+    /// 稳定错误码，官方客户端同款分类）。faultString 文案不参与判定：
+    /// 措辞随版本漂移，且 `SPAWN_ERROR` 等 fault 的文案可能恰含 "BAD_NAME"。
+    /// **只在 RpcFault 已解析的前提下判定**——普通网络错误无从误判。
     fn is_no_such_process(&self) -> bool {
-        let code = self.0.get("faultCode").and_then(serde_json::Value::as_i64);
-        let message = self
-            .0
-            .get("faultString")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        code == Some(10) || message.contains("no process group") || message.contains("BAD_NAME")
+        self.0.get("faultCode").and_then(serde_json::Value::as_i64) == Some(10)
     }
 }
 
@@ -424,7 +418,29 @@ mod tests {
             r#"<?xml version="1.0"?><methodResponse><fault><value><struct><member><name>faultString</name><value><string>no process group named 'x'</string></value></member></struct></value></fault></methodResponse>"#,
         )
         .unwrap_err();
-        assert!(is_no_such_process(&fault));
+        // 契约 C5: 判据仅 faultCode==10——无结构化码的 fault 不算 NoSuchProcess
+        //（旧 faultString 兜底已按批准需求删除）。
+        assert!(!is_no_such_process(&fault));
+    }
+
+    #[test]
+    fn no_such_process_classifies_only_by_fault_code() {
+        // T004 反例（修复前必挂）: faultString 含 BAD_NAME/no process group
+        // 不得再驱动分类; 官方码 faultCode==10 才是 NoSuchProcess。
+        let fault_code_10 = parse_response(
+            r#"<?xml version="1.0"?><methodResponse><fault><value><struct><member><name>faultCode</name><value><int>10</int></value></member><member><name>faultString</name><value><string>no such process</string></value></member></struct></value></fault></methodResponse>"#,
+        )
+        .unwrap_err();
+        assert!(is_no_such_process(&fault_code_10));
+
+        let fault_code_50_with_bad_name = parse_response(
+            r#"<?xml version="1.0"?><methodResponse><fault><value><struct><member><name>faultCode</name><value><int>50</int></value></member><member><name>faultString</name><value><string>BAD_NAME: app-svc-web</string></value></member></struct></value></fault></methodResponse>"#,
+        )
+        .unwrap_err();
+        assert!(
+            !is_no_such_process(&fault_code_50_with_bad_name),
+            "faultCode=50 按官方码不是 NoSuchProcess, 文案含 BAD_NAME 不得误判"
+        );
     }
 
     #[test]
@@ -515,8 +531,9 @@ mod r11_tests {
         RpcFault(serde_json::json!({"faultCode": code, "faultString": message})).into()
     }
 
-    /// R11 反例：typed 分类——网络错误文案恰含 "no process group" 不再被
-    /// 误判为"不存在"；faultCode=10（BAD_NAME）与措辞兜底各自命中；
+    /// R11 反例：typed 分类——判据仅 `faultCode == 10`（契约 C5）。
+    /// 网络错误文案恰含 "no process group" 不再被误判为"不存在"；
+    /// 非 10 码即使 faultString 含 BAD_NAME 也按官方码分类（措辞兜底已删除）；
     /// malformed fault（缺字段）不判为不存在。
     #[test]
     fn no_such_process_classification_is_typed() {
@@ -524,15 +541,14 @@ mod r11_tests {
         assert!(is_no_such_process(&fault(10, "no process group named 'x'")));
         // faultCode 10 + 其他措辞 → 仍按官方码分类
         assert!(is_no_such_process(&fault(10, "whatever")));
-        // 非 10 码但措辞明确 → 兜底命中
-        assert!(is_no_such_process(&fault(1, "BAD_NAME: foo")));
+        // 非 10 码但措辞含 BAD_NAME → 按官方码不是"不存在"（旧措辞兜底已删）
+        assert!(!is_no_such_process(&fault(1, "BAD_NAME: foo")));
         // 非 10 码 + 无相关措辞 → 不是"不存在"
         assert!(!is_no_such_process(&fault(6, "SHUTDOWN_STATE")));
         // 反例：普通网络错误文案恰含关键词 → 不误判（typed 边界）
         let network = anyhow::Error::msg("connect failed: no process group left in pool");
         assert!(!is_no_such_process(&network));
-        // malformed fault（缺 faultCode 且措辞不相关）→ 不判为不存在
-        //（仅 faultString 命中关键词时按措辞兜底——版本差异兼容是有意的）
+        // malformed fault（缺 faultCode）→ 无官方码不判为不存在
         assert!(!is_no_such_process(
             &RpcFault(serde_json::json!({"faultString": "unknown"})).into()
         ));

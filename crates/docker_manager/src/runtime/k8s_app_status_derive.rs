@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use container_runtime_api::{AppPortStatus, ExposeType};
+use container_runtime_api::{AppPortStatus, ContainerFailureReason, ExposeType};
 use k8s_openapi::api::apps::v1::Deployment;
 
 use super::k8s_app_helpers::{PORT_EXPOSE_ANNOTATION, parse_port_expose};
@@ -164,6 +164,27 @@ pub(crate) fn container_error_message(
         ));
     }
     None
+}
+
+/// [`container_error_message`] 的结构化伴生（typed 字段直读，不从 message 回扫）。
+/// 按 waiting → terminated → last_state.terminated 的顺序取第一个命中
+/// [`ContainerFailureReason::parse`] 词表的 reason；未命中 → None
+/// （上层按 "Error" 兜底，输出与 message 回扫时代一致）。
+pub(crate) fn container_error_reason(
+    cs: &k8s_openapi::api::core::v1::ContainerStatus,
+) -> Option<ContainerFailureReason> {
+    let state = cs.state.as_ref();
+    let candidates = [
+        state.and_then(|s| s.waiting.as_ref().and_then(|w| w.reason.as_deref())),
+        state.and_then(|s| s.terminated.as_ref().and_then(|t| t.reason.as_deref())),
+        cs.last_state
+            .as_ref()
+            .and_then(|ls| ls.terminated.as_ref().and_then(|t| t.reason.as_deref())),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find_map(ContainerFailureReason::parse)
 }
 
 /// probes → [`container_runtime_api::AppHealthCheck`] 反推（`build_probe` 的逆映射）。

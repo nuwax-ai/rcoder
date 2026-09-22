@@ -675,6 +675,67 @@ pub struct AppPortStatus {
     pub external_port: Option<u16>,
 }
 
+/// 容器失败原因（诊断分类封闭集）。来源是运行时结构化字段——K8s container status
+/// 的 `waiting.reason`/`terminated.reason`；K8s API 把 reason 定义为开放字符串
+/// （k8s-openapi 仅 `Option<String>`，生态无现成枚举），本枚举是边界收口：
+/// [`parse`][Self::parse] 一次，下游只消费类型，不再对 message 做子串回扫。
+///
+/// 变体顺序 = 诊断优先序（[`Self::ALL`]）；字符串值 = K8s 原始 token。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+pub enum ContainerFailureReason {
+    CrashLoopBackOff,
+    ImagePullBackOff,
+    ErrImagePull,
+    CreateContainerConfigError,
+    CreateContainerError,
+    InvalidImageName,
+    RunContainerError,
+    StartError,
+    OOMKilled,
+}
+
+impl ContainerFailureReason {
+    /// 全部变体（按诊断优先序）。新增变体须同步本数组——[`Self::as_str`] 的
+    /// 穷尽 match 会先强制更新字符串映射。
+    pub const ALL: [Self; 9] = [
+        Self::CrashLoopBackOff,
+        Self::ImagePullBackOff,
+        Self::ErrImagePull,
+        Self::CreateContainerConfigError,
+        Self::CreateContainerError,
+        Self::InvalidImageName,
+        Self::RunContainerError,
+        Self::StartError,
+        Self::OOMKilled,
+    ];
+
+    /// K8s 原始 token（穷尽 match：新增变体时编译器强制同步）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CrashLoopBackOff => "CrashLoopBackOff",
+            Self::ImagePullBackOff => "ImagePullBackOff",
+            Self::ErrImagePull => "ErrImagePull",
+            Self::CreateContainerConfigError => "CreateContainerConfigError",
+            Self::CreateContainerError => "CreateContainerError",
+            Self::InvalidImageName => "InvalidImageName",
+            Self::RunContainerError => "RunContainerError",
+            Self::StartError => "StartError",
+            Self::OOMKilled => "OOMKilled",
+        }
+    }
+
+    /// 边界解析：K8s reason 字符串 → 枚举（整值等值匹配；未知 reason → None）。
+    pub fn parse(reason: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == reason)
+    }
+}
+
+impl std::fmt::Display for ContainerFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Deployment 运行时状态（供 app_manager 实时查询，rcoder 无状态化读路径的数据载体）
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct DeploymentStatus {
@@ -689,6 +750,11 @@ pub struct DeploymentStatus {
     /// 阶段附加信息（如失败原因：CrashLoopBackOff / ImagePullBackOff / 容器退出码等）。
     /// phase=Error 时必填，便于调用方定位"服务为啥没起来"。
     pub message: Option<String>,
+    /// 机器可读失败原因（[`ContainerFailureReason`]），来自运行时结构化字段
+    /// （K8s container status 的 waiting.reason / terminated.reason）。
+    /// 诊断分类优先消费本字段，[`Self::message`] 仅作兜底——不得对 message
+    /// 做子串回扫当主判据。
+    pub reason: Option<ContainerFailureReason>,
     /// Pod IP（K8s）/ 容器 IP（Docker）
     pub pod_ip: Option<String>,
     /// 所在节点（K8s）
