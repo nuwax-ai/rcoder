@@ -75,6 +75,12 @@ test-e2e-k8s-userapp:
 test-e2e-host:
 	python3 tests-e2e/tools/run.py --group host
 
+# deploy-host Direct 直拨形态严格 E2E（前置：make dev-host-direct 已运行——
+# RCODER_DEPLOY_HOST_REACH=direct 的宿主机 rcoder；反向断言 fail-loud 模式门）
+.PHONY: test-e2e-host-direct
+test-e2e-host-direct:
+	python3 tests-e2e/tools/run.py --group host_direct
+
 # deploy-host 宿主机 K8s 形态严格 E2E（前置：CONTAINER_RUNTIME=kubernetes 的宿主机 rcoder）
 .PHONY: test-e2e-host-k8s
 test-e2e-host-k8s:

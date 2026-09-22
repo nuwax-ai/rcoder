@@ -30,6 +30,7 @@ GROUPS = {
     'deploy': ['compose_userapp_deploy'],
     'k8s': ['k8s_lb'],
     'host': ['host_docker_lifecycle'],
+    'host_direct': ['host_docker_direct_lifecycle'],
     'host_k8s': ['host_k8s_lifecycle'],
 }
 

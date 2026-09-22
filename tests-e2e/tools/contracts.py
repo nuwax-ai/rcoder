@@ -231,6 +231,15 @@ REQUIRED['host_agent_lifecycle_no_llm'] = {
 }
 
 
+REQUIRED['host_agent_direct_lifecycle_no_llm'] = {
+    'host_direct_pod_ensure_created',
+    'host_direct_no_published_ports',
+    'host_direct_container_ip_dial',
+    'host_direct_ensure_idempotent_reuse',
+    'host_direct_owned_cleanup_reclaims_container',
+}
+
+
 REQUIRED['host_k8s_agent_lifecycle_no_llm'] = {
     'host_k8s_pod_ensure_created',
     'host_k8s_service_nodeport_assigned',
