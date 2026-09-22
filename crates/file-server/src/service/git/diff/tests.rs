@@ -249,3 +249,70 @@ fn diff_source_has_canonical_string_roundtrip() {
         assert_eq!(parsed.to_string(), expected.to_string());
     }
 }
+
+// ── G-B1: from/to 统一走 resolve_rev（修订表达式/短 hash 能力 + 显式错误契约） ──
+
+fn commit_diff_params(from: Option<&str>, to: Option<&str>) -> DiffParams {
+    DiffParams {
+        source: DiffSource::Commit,
+        from: from.map(str::to_string),
+        to: to.map(str::to_string),
+        paths: Vec::new(),
+        max_file_size_bytes: 16 * 1024 * 1024,
+        max_total_bytes: 64 * 1024 * 1024,
+        max_output_bytes: 64 * 1024 * 1024,
+    }
+}
+
+#[test]
+fn commit_diff_resolves_revision_expressions_and_short_oid() {
+    let directory = tempfile::tempdir().expect("create test directory");
+    init_repo(directory.path(), "Test", "test@example.com").expect("init repo");
+    let repo = open(directory.path()).expect("open repo");
+    std::fs::write(directory.path().join("a.txt"), "old\n").expect("write old");
+    stage_path(&repo, "a.txt").expect("stage old");
+    let old = commit_indexed(&repo, "old", "Test", "test@example.com").expect("commit old");
+    std::fs::write(directory.path().join("a.txt"), "new\n").expect("write new");
+    stage_path(&repo, "a.txt").expect("stage new");
+    let new = commit_indexed(&repo, "new", "Test", "test@example.com").expect("commit new");
+
+    let expected =
+        compute_diff(&repo, &commit_diff_params(Some(&old), Some(&new))).expect("显式 hash diff");
+    let by_expr = compute_diff(&repo, &commit_diff_params(Some("HEAD~1"), Some("HEAD")))
+        .expect("HEAD~1/HEAD 必须可解析");
+    assert_eq!(
+        by_expr.diff, expected.diff,
+        "修订表达式 diff 必须与显式 hash 一致"
+    );
+    let by_short = compute_diff(&repo, &commit_diff_params(Some(&old[..7]), Some(&new[..7])))
+        .expect("短 hash 必须可解析");
+    assert_eq!(
+        by_short.diff, expected.diff,
+        "短 hash diff 必须与显式 hash 一致"
+    );
+}
+
+#[test]
+fn commit_diff_missing_from_is_explicit_and_bad_expression_is_validation() {
+    // T-d6: 缺 from 显式报错（system 类, 保持既有 HTTP 类别）, 不得静默空 diff;
+    // 坏修订表达式 = 显式 Validation（新显式错误面; 修复前是 System + 擦除文案）。
+    let directory = tempfile::tempdir().expect("create test directory");
+    init_repo(directory.path(), "Test", "test@example.com").expect("init repo");
+    let repo = open(directory.path()).expect("open repo");
+    std::fs::write(directory.path().join("a.txt"), "x\n").expect("write");
+    stage_path(&repo, "a.txt").expect("stage");
+    commit_indexed(&repo, "c", "Test", "test@example.com").expect("commit");
+
+    let missing = compute_diff(&repo, &commit_diff_params(Some("no-such-ref"), None))
+        .expect_err("缺 from 必须显式报错");
+    assert!(
+        matches!(missing, AppError::System(..)),
+        "缺 from 保持 system 类别（零 HTTP 变化）: {missing:?}"
+    );
+    let malformed = compute_diff(&repo, &commit_diff_params(Some("HEAD~x"), None))
+        .expect_err("坏修订表达式必须显式报错");
+    assert!(
+        matches!(malformed, AppError::Validation(..)),
+        "坏修订表达式应 Validation: {malformed:?}"
+    );
+}

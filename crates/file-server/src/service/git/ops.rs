@@ -17,6 +17,7 @@ use gix::refs::{FullName, Target};
 use crate::error::{AppError, AppResult};
 use crate::path_safety::ensure_within_path;
 
+use super::read::{head_id_required, resolve_rev_required};
 use super::{commit_indexed, ensure_gitignore, get_status, map_git_err, stage_path};
 
 // ── reset ──────────────────────────────────────────────────────────────────────
@@ -77,6 +78,7 @@ impl std::str::FromStr for ResetMode {
     }
 }
 
+#[derive(Debug)]
 pub struct ResetOutcome {
     pub previous_head: Option<String>,
 }
@@ -86,10 +88,7 @@ pub struct ResetOutcome {
 /// - mixed/hard: 重建 index 为 target tree
 /// - hard: 额外重写 worktree (写 target 文件 + 删除 target 之外文件) + 补 .gitignore
 pub fn reset(repo: &Repository, target: &str, mode: ResetMode) -> AppResult<ResetOutcome> {
-    let target_id = repo
-        .rev_parse_single(target)
-        .map_err(|e| map_git_err(e, "git rev_parse target"))?
-        .detach();
+    let target_id = resolve_rev_required(repo, target, "git reset target")?;
     // index_from_tree 需 tree id (非 commit id)
     let target_tree_id = repo
         .find_commit(target_id)
@@ -98,7 +97,7 @@ pub fn reset(repo: &Repository, target: &str, mode: ResetMode) -> AppResult<Rese
         .map_err(|e| map_git_err(e, "git target tree"))?
         .id()
         .detach();
-    let previous_head = repo.head_id().ok().map(|id| id.to_string());
+    let previous_head = super::read::resolve_rev(repo, "HEAD")?.map(|id| id.to_string());
     let old_head_tree = repo
         .head_tree_id_or_empty()
         .map_err(|e| map_git_err(e, "git head_tree_id_or_empty"))?
@@ -142,10 +141,7 @@ fn reset_index_to_tree(repo: &Repository, tree_id: &oid) -> AppResult<()> {
 /// **不删除** target 之外的文件, **不动** HEAD, 变更留 staged。
 /// (对齐 nuwax: 不是切分支, 不是恢复单文件; 类似 `git checkout <commit> -- .` 的覆盖语义)
 pub fn checkout_tree(repo: &Repository, target: &str) -> AppResult<()> {
-    let target_id = repo
-        .rev_parse_single(target)
-        .map_err(|e| map_git_err(e, "git rev_parse target"))?
-        .detach();
+    let target_id = resolve_rev_required(repo, target, "git checkout target")?;
     let target_tree_id = repo
         .find_commit(target_id)
         .map_err(|e| map_git_err(e, "git find_commit target"))?
@@ -204,6 +200,7 @@ fn overlay_tree_on_worktree_and_index(
 
 // ── revert ─────────────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct RevertOutcome {
     /// 新提交 hash (None = no-op, HEAD 已等于 target)。
     pub commit: Option<String>,
@@ -221,10 +218,7 @@ pub fn revert_to_commit(
     author_email: &str,
 ) -> AppResult<RevertOutcome> {
     clean_tree_check(repo)?;
-    let target_id = repo
-        .rev_parse_single(target)
-        .map_err(|e| map_git_err(e, "git rev_parse target"))?
-        .detach();
+    let target_id = resolve_rev_required(repo, target, "git revert target")?;
     let target_tree_id = repo
         .find_commit(target_id)
         .map_err(|e| map_git_err(e, "git find_commit target"))?
@@ -232,11 +226,7 @@ pub fn revert_to_commit(
         .map_err(|e| map_git_err(e, "git target tree"))?
         .id()
         .detach();
-    let previous_head = repo
-        .head_id()
-        .map_err(|e| map_git_err(e, "git head_id"))?
-        .detach()
-        .to_string();
+    let previous_head = head_id_required(repo, "git revert")?.to_string();
     let old_head_tree = repo
         .head_tree_id_or_empty()
         .map_err(|e| map_git_err(e, "git head_tree_id_or_empty"))?
@@ -413,4 +403,64 @@ pub(crate) fn clean_tree_check(repo: &Repository) -> AppResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! ops 写操作 target 解析契约（G-B2/T-d7）：
+    //! - target 缺席 = 显式 system 错误（类别保持, 不静默成功）
+    //! - 坏修订表达式 = 显式 Validation
+    //! - `HEAD~1`/短 hash target 能力保留
+
+    use super::*;
+    use crate::error::AppError;
+    use crate::service::git::{commit_indexed, init_repo, stage_path};
+    use gix::open;
+
+    fn fixture() -> (tempfile::TempDir, Repository, String, String) {
+        let dir = tempfile::tempdir().expect("create test directory");
+        init_repo(dir.path(), "Test", "test@example.com").expect("init repo");
+        let repo = open(dir.path()).expect("open repo");
+        std::fs::write(dir.path().join("a.txt"), "v1\n").expect("write v1");
+        stage_path(&repo, "a.txt").expect("stage v1");
+        let c1 = commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit c1");
+        std::fs::write(dir.path().join("a.txt"), "v2\n").expect("write v2");
+        stage_path(&repo, "a.txt").expect("stage v2");
+        let c2 = commit_indexed(&repo, "c2", "Test", "test@example.com").expect("commit c2");
+        (dir, repo, c1, c2)
+    }
+
+    #[test]
+    fn reset_target_missing_is_explicit_and_bad_expression_is_validation() {
+        let (_dir, repo, _c1, _c2) = fixture();
+        let err =
+            reset(&repo, "no-such-ref", ResetMode::Mixed).expect_err("缺 target 必须显式报错");
+        assert!(matches!(err, AppError::System(..)), "{err:?}");
+        let err = reset(&repo, "HEAD~x", ResetMode::Mixed).expect_err("坏表达式必须显式报错");
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
+    }
+
+    #[test]
+    fn reset_and_checkout_accept_revision_expression_targets() {
+        let (dir, repo, c1, _c2) = fixture();
+        let out = reset(&repo, "HEAD~1", ResetMode::Soft).expect("HEAD~1 target 必须可解析");
+        assert_eq!(out.previous_head.as_deref(), Some(_c2.as_str()));
+        let head = repo.head_id().expect("head").detach().to_string();
+        assert_eq!(head, c1, "soft reset 后 HEAD 应停在父提交");
+
+        checkout_tree(&repo, &c1[..7]).expect("短 hash checkout 必须可解析");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).expect("read a.txt"),
+            "v1\n",
+            "checkout 短 hash 后工作区应回到 v1"
+        );
+    }
+
+    #[test]
+    fn revert_missing_target_is_explicit_error() {
+        let (_dir, repo, _c1, _c2) = fixture();
+        let err = revert_to_commit(&repo, "no-such-ref", None, "Test", "test@example.com")
+            .expect_err("缺 target 必须显式报错");
+        assert!(matches!(err, AppError::System(..)), "{err:?}");
+    }
 }

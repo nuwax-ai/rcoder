@@ -153,17 +153,7 @@ pub(crate) async fn file_content(
             return Err(AppError::resource("workspace does not exist"));
         }
         if read_worktree {
-            let full = crate::path_safety::ensure_within(&path, &fp_c)?;
-            let metadata = std::fs::metadata(&full).map_err(|error| {
-                AppError::system(format!("read metadata {}: {error}", full.display()))
-            })?;
-            if metadata.len() > max_bytes {
-                return Err(AppError::validation(format!(
-                    "git file content exceeds limit (max {max_bytes} bytes)"
-                )));
-            }
-            return std::fs::read_to_string(&full)
-                .map_err(|error| AppError::system(format!("read {}: {error}", full.display())));
+            return git::worktree_content(&path, &fp_c, max_bytes);
         }
         let repo = git::ensure_repo(&path)?;
         git::ensure_gitignore(&path)?;

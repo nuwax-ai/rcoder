@@ -3,6 +3,7 @@
 use crate::error::AppResult;
 
 use super::map_git_err;
+use super::read::{head_id_required, resolve_rev_required};
 
 use gix::Repository;
 use gix::actor::Signature;
@@ -24,19 +25,13 @@ pub fn create_branch(
         super::ops::clean_tree_check(repo)?;
     }
     let target = match start_point {
-        Some(sp) => repo
-            .rev_parse_single(sp)
-            .map_err(|e| map_git_err(e, "git rev_parse startPoint"))?,
-        None => repo.head_id().map_err(|e| map_git_err(e, "git head_id"))?,
+        Some(sp) => resolve_rev_required(repo, sp, "git branch start_point")?,
+        // G-B4: unborn 仓库无起点可依——结构化判定, 不让 gix 原文直打调用方
+        None => head_id_required(repo, "create branch without start_point")?,
     };
     let full = format!("refs/heads/{name}");
-    repo.reference(
-        full,
-        target.detach(),
-        PreviousValue::MustNotExist,
-        "create branch",
-    )
-    .map_err(|e| map_git_err(e, "git reference (branch may already exist)"))?;
+    repo.reference(full, target, PreviousValue::MustNotExist, "create branch")
+        .map_err(|e| map_git_err(e, "git reference (branch may already exist)"))?;
     if switch {
         super::ops::switch_branch(repo, name)?;
     }
@@ -63,10 +58,7 @@ pub fn create_tag(
     author_name: &str,
     author_email: &str,
 ) -> AppResult<()> {
-    let head_id = repo
-        .head_id()
-        .map_err(|e| map_git_err(e, "git head_id"))?
-        .detach();
+    let head_id = head_id_required(repo, "create tag")?;
     if let Some(msg) = message {
         let tagger = Signature {
             name: BString::from(author_name),
@@ -108,4 +100,92 @@ pub fn is_current_branch(repo: &Repository, name: &str) -> AppResult<bool> {
         .flatten()
         .and_then(|n| super::shorten_ref(&n.to_string()));
     Ok(current.as_deref() == Some(name))
+}
+
+#[cfg(test)]
+mod tests {
+    //! refs 写操作契约（G-B3/G-B4/N4）：
+    //! - unborn 建分支/标签 = 显式 system 错误且不泄漏 gix 原文（app-169 同类）
+    //! - start_point 缺席/坏表达式 = 显式错误
+    //! - 缺分支/缺标签 = 显式 system 错误（类别保持, 不静默）
+
+    use super::*;
+    use crate::error::AppError;
+    use crate::service::git::{commit_indexed, init_repo, stage_path};
+    use gix::open;
+
+    fn system_message(err: &AppError) -> String {
+        match err {
+            AppError::System(m) => m.clone(),
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_branch_and_tag_on_unborn_fail_with_clean_message() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        crate::service::git::ensure_repo(dir.path()).expect("init unborn repo");
+        let repo = open(dir.path()).expect("open repo");
+
+        let err = create_branch(&repo, "feature", None, false).expect_err("unborn 建分支必须报错");
+        let msg = system_message(&err);
+        assert!(
+            !msg.contains("does not have any commits"),
+            "不得泄漏 gix 原文: {msg}"
+        );
+        assert!(msg.contains("no commits yet"), "应说明缺提交: {msg}");
+
+        let err = create_tag(&repo, "v1", None, "Test", "test@example.com")
+            .expect_err("unborn 打标签必须报错");
+        let msg = system_message(&err);
+        assert!(
+            !msg.contains("does not have any commits"),
+            "不得泄漏 gix 原文: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_branch_accepts_revision_expression_start_point() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        init_repo(dir.path(), "Test", "test@example.com").expect("init repo");
+        let repo = open(dir.path()).expect("open repo");
+        std::fs::write(dir.path().join("a.txt"), "v1\n").expect("write v1");
+        stage_path(&repo, "a.txt").expect("stage v1");
+        let c1 = commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit c1");
+        std::fs::write(dir.path().join("a.txt"), "v2\n").expect("write v2");
+        stage_path(&repo, "a.txt").expect("stage v2");
+        commit_indexed(&repo, "c2", "Test", "test@example.com").expect("commit c2");
+
+        create_branch(&repo, "feature", Some("HEAD~1"), false)
+            .expect("HEAD~1 start_point 必须可解析");
+        let id = repo
+            .find_reference("refs/heads/feature")
+            .expect("branch exists")
+            .id()
+            .detach()
+            .to_string();
+        assert_eq!(id, c1, "feature 应指向 HEAD~1 即 c1");
+
+        let err = create_branch(&repo, "broken", Some("no-such-ref"), false)
+            .expect_err("缺 start_point 必须报错");
+        assert!(matches!(err, AppError::System(..)), "{err:?}");
+        let err =
+            create_branch(&repo, "broken2", Some("HEAD~x"), false).expect_err("坏表达式必须报错");
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
+    }
+
+    #[test]
+    fn missing_branch_and_tag_deletion_is_explicit_error() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        init_repo(dir.path(), "Test", "test@example.com").expect("init repo");
+        let repo = open(dir.path()).expect("open repo");
+
+        let err = delete_branch(&repo, "nope", false).expect_err("缺分支必须显式报错");
+        assert!(matches!(err, AppError::System(..)), "{err:?}");
+        let err = delete_tag(&repo, "nope").expect_err("缺标签必须显式报错");
+        assert!(matches!(err, AppError::System(..)), "{err:?}");
+        let err =
+            crate::service::git::switch_branch(&repo, "nope").expect_err("切缺分支必须显式报错");
+        assert!(matches!(err, AppError::System(..)), "{err:?}");
+    }
 }

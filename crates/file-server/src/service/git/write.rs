@@ -184,9 +184,16 @@ pub fn commit_indexed(
     let tree_id = editor
         .write()
         .map_err(|e| map_git_err(e, "git editor write"))?;
-    let parents: Vec<ObjectId> = match repo.head_id() {
-        Ok(id) => vec![id.detach()],
-        Err(_) => vec![],
+    // unborn → root commit（合法首提交）；head() 真错误传播，不吞成"无 parent"
+    let head = repo.head().map_err(|e| map_git_err(e, "git head"))?;
+    let parents: Vec<ObjectId> = if head.is_unborn() {
+        vec![]
+    } else {
+        vec![
+            head.into_peeled_id()
+                .map_err(|e| map_git_err(e, "git head_id"))?
+                .detach(),
+        ]
     };
     let sig = Signature {
         name: BString::from(author_name),
@@ -218,16 +225,19 @@ pub fn init_repo(path: &Path, author_name: &str, author_email: &str) -> AppResul
     let existed = super::is_git_repo(path);
     let repo = super::ensure_repo(path)?;
     super::ensure_gitignore(path)?;
-    if !has_any_commit(&repo) {
+    if !has_any_commit(&repo)? {
         stage_path(&repo, ".gitignore")?;
         commit_indexed(&repo, "Initial commit", author_name, author_email)?;
     }
     Ok(existed)
 }
 
-/// 仓库是否已有至少一个提交 (unborn → false)。
-fn has_any_commit(repo: &Repository) -> bool {
-    repo.head_id().is_ok()
+/// 仓库是否已有至少一个提交（unborn → false）。
+/// "缺席"只来自类型化状态（`is_unborn`），不来自错误发生——`head()` 的
+/// IO/损坏错误必须传播，否则会被误判"无提交"而触发 initial commit 误写。
+fn has_any_commit(repo: &Repository) -> AppResult<bool> {
+    let head = repo.head().map_err(|e| map_git_err(e, "git head"))?;
+    Ok(!head.is_unborn())
 }
 
 /// 公开 `/api/git/init` 使用：只初始化仓库并维护 .gitignore，不创建提交。
@@ -422,6 +432,27 @@ pub async fn init_and_commit_offloaded(
 mod tests {
     use super::*;
     use gix::open;
+
+    #[test]
+    fn init_repo_propagates_corrupt_head_without_touching_index() {
+        // G-C1 反例: "缺席"判定只认 is_unborn 状态。HEAD 损坏 = 真错误, 必须
+        // 响亮失败, 不得误判"无提交"后 stage .gitignore 甚至写出孤立 root commit。
+        let dir = tempfile::tempdir().expect("create test directory");
+        let path = dir.path();
+        super::super::ensure_repo(path).expect("init unborn repo");
+        std::fs::write(path.join(".git/HEAD"), "garbage-not-a-ref\n").expect("corrupt HEAD");
+
+        let err = init_repo(path, "Test", "test@example.com").expect_err("损坏 HEAD 必须响亮失败");
+        assert!(matches!(err, AppError::System(..)), "{err:?}");
+
+        let repo = open(path).expect("open repo");
+        let index = repo.open_index().expect("open index");
+        assert!(
+            index.entries().is_empty(),
+            "失败的 init_repo 不得改动 index: {} entries",
+            index.entries().len()
+        );
+    }
 
     struct TestRepo(std::path::PathBuf);
 

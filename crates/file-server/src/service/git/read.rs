@@ -10,14 +10,115 @@ use gix::status::index_worktree::Item as WorktreeItem;
 use gix::status::{Item as StatusItem, UntrackedFiles};
 use gix::{Commit, ObjectId, Repository};
 
-/// refspec → ObjectId。spec 为分支/tag 名（gix 部分名展开，与 revparse delegate
-/// 内部解析 ref 名同路径）或完整 OID；"HEAD" 走 gix 的 unborn 状态判定。
+/// 修订链上的一步：`~n` = 首个 parent 走 n 次（裸 `~` = `~1`）；
+/// `^n` = 第 n 个 parent（裸 `^` = `^1`，`^0` = 恒等）。
+enum ParentStep {
+    Tilde(usize),
+    Caret(usize),
+}
+
+/// refspec → ObjectId。spec 为：
+/// - "HEAD"（gix 的 unborn 状态判定）
+/// - 分支/tag 名（gix 部分名展开，与 revparse delegate 内部解析 ref 名同路径）
+/// - 完整 40 位 OID 或 ≥4 位 hex 前缀（类型化 lookup；歧义前缀显式报错）
+/// - 以上任意项 + `~n`/`^n` 修订链（`HEAD~1`、`main~2^2` 等，对齐 git 语法）
 ///
-/// `Ok(None)` = 空仓库（unborn HEAD）或 ref/OID 不存在——两类"缺席"由调用方
-/// 按"无数据"契约映射（log → 空列表，file-content → None/空串）；其余错误传播。
+/// `Ok(None)` = 空仓库（unborn HEAD）、ref/OID 不存在或修订链越界（如 `HEAD~99`）——
+/// "缺席"由调用方按"无数据"契约映射（log → 空列表，file-content → None/空串）。
+/// 坏修订表达式（`HEAD~x`）与歧义前缀 → `AppError::validation`；其余错误传播。
+///
 /// 不经 rev_parse_single：其错误经 gix-error 类型擦除无法结构化分类。
+/// 明确不支持 revspec 的 `@{}`、`:/`、`rev:path` 等表达式（Java/TS 契约均未承诺，
+/// 会按 ref 名走缺席/非法名路径）。
 pub(crate) fn resolve_rev(repo: &Repository, spec: &str) -> AppResult<Option<ObjectId>> {
-    if spec == "HEAD" {
+    let (base, steps) = split_revision_chain(spec)?;
+    let Some(mut oid) = resolve_base_rev(repo, base)? else {
+        return Ok(None);
+    };
+    for step in steps {
+        let Some(next) = apply_parent_step(repo, oid, step)? else {
+            return Ok(None);
+        };
+        oid = next;
+    }
+    Ok(Some(oid))
+}
+
+/// 写/对比路径的解析入口：语义同 [`resolve_rev`]，但"缺席"显式失败
+/// （system 类，保持既有 HTTP 错误类别）——写与对比操作没有"无数据"契约，
+/// 静默成功/空结果会误导调用方。
+pub(crate) fn resolve_rev_required(
+    repo: &Repository,
+    spec: &str,
+    ctx: &str,
+) -> AppResult<ObjectId> {
+    resolve_rev(repo, spec)?
+        .ok_or_else(|| AppError::system(format!("{ctx}: revision '{spec}' not found")))
+}
+
+/// HEAD 必须已出生（创建分支/标签、revert 等需要现有提交做基准）。
+/// unborn → system 错误（保持既有 HTTP 类别），文案不泄漏 gix 内部信息
+/// （app-169 事故同源："Branch ... does not have any commits" 原文直达调用方）。
+pub(crate) fn head_id_required(repo: &Repository, ctx: &str) -> AppResult<ObjectId> {
+    let head = repo.head().map_err(|e| map_git_err(e, "git head"))?;
+    if head.is_unborn() {
+        return Err(AppError::system(format!(
+            "{ctx}: repository has no commits yet"
+        )));
+    }
+    Ok(head
+        .into_peeled_id()
+        .map_err(|e| map_git_err(e, "git head_id"))?
+        .detach())
+}
+
+/// 在首个 `~`/`^` 处拆出 base 与修订链（git refname 规则禁止这两个字符，
+/// 拆分无歧义）。链语法非法（缺 base、非数字后缀）→ Validation。
+fn split_revision_chain(spec: &str) -> AppResult<(&str, Vec<ParentStep>)> {
+    let Some(pos) = spec.find(['~', '^']) else {
+        return Ok((spec, Vec::new()));
+    };
+    let (base, rest) = spec.split_at(pos);
+    if base.is_empty() {
+        return Err(AppError::validation(format!(
+            "invalid revision '{spec}': missing base before '~'/'^'"
+        )));
+    }
+    let mut steps = Vec::new();
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let tilde = match bytes[i] {
+            b'~' => true,
+            b'^' => false,
+            _ => {
+                return Err(AppError::validation(format!("invalid revision '{spec}'")));
+            }
+        };
+        i += 1;
+        let digits_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let n: usize = if i == digits_start {
+            1 // 裸 `~`/`^` 等价 `~1`/`^1`
+        } else {
+            rest[digits_start..i].parse().map_err(|_| {
+                AppError::validation(format!("invalid revision '{spec}': parent index too large"))
+            })?
+        };
+        steps.push(if tilde {
+            ParentStep::Tilde(n)
+        } else {
+            ParentStep::Caret(n)
+        });
+    }
+    Ok((base, steps))
+}
+
+/// base 段（不含修订链）的类型化解析。
+fn resolve_base_rev(repo: &Repository, base: &str) -> AppResult<Option<ObjectId>> {
+    if base == "HEAD" {
         let head = repo.head().map_err(|e| map_git_err(e, "git head"))?;
         return if head.is_unborn() {
             Ok(None)
@@ -29,19 +130,80 @@ pub(crate) fn resolve_rev(repo: &Repository, spec: &str) -> AppResult<Option<Obj
             ))
         };
     }
-    match repo.find_reference(spec) {
+    match repo.find_reference(base) {
         Ok(mut r) => Ok(Some(
             r.peel_to_id()
                 .map_err(|e| map_git_err(e, "git peel ref"))?
                 .detach(),
         )),
-        Err(gix::reference::find::existing::Error::NotFound { .. }) => {
-            Ok(ObjectId::from_hex(spec.as_bytes())
-                .ok()
-                .filter(|oid| repo.find_object(*oid).is_ok()))
-        }
+        Err(gix::reference::find::existing::Error::NotFound { .. }) => resolve_oid(repo, base),
         Err(e) => Err(map_git_err(e, "git find_reference")),
     }
+}
+
+/// OID 解析：完整 hash 逐对象确证存在；其余 hex 前缀走类型化 lookup。
+/// NotFound/无前缀命中 = 缺席；歧义前缀 = 显式 Validation（不静默取第一个）；
+/// ODB 真错误传播（不吞成缺席）。
+fn resolve_oid(repo: &Repository, spec: &str) -> AppResult<Option<ObjectId>> {
+    if let Ok(oid) = ObjectId::from_hex(spec.as_bytes()) {
+        return match repo.find_object(oid) {
+            Ok(_) => Ok(Some(oid)),
+            Err(gix::object::find::existing::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(map_git_err(e, "git find_object")),
+        };
+    }
+    match gix::hash::Prefix::from_hex(spec) {
+        Ok(prefix) => match repo.objects.lookup_prefix(prefix, None) {
+            Ok(Some(Ok(id))) => Ok(Some(id)),
+            Ok(Some(Err(()))) => Err(AppError::validation(format!(
+                "ambiguous object prefix '{spec}'"
+            ))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(map_git_err(e, "git lookup_prefix")),
+        },
+        // 非 hex / 过短(<4) / 过长：按"非 OID 缺席"处理（保持既有空数据契约）
+        Err(_) => Ok(None),
+    }
+}
+
+/// 应用一步修订：越界 parent = 缺席（Ok(None)）；作用在非 commit 上 = Validation。
+fn apply_parent_step(
+    repo: &Repository,
+    oid: ObjectId,
+    step: ParentStep,
+) -> AppResult<Option<ObjectId>> {
+    match step {
+        ParentStep::Tilde(0) | ParentStep::Caret(0) => Ok(Some(oid)),
+        ParentStep::Tilde(n) => {
+            let mut current = oid;
+            for _ in 0..n {
+                match parent_at(repo, current, 0)? {
+                    Some(parent) => current = parent,
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(current))
+        }
+        ParentStep::Caret(n) => parent_at(repo, oid, n - 1),
+    }
+}
+
+/// commit 的第 index 个 parent（0 基）。缺席/越界 → Ok(None)。
+fn parent_at(repo: &Repository, oid: ObjectId, index: usize) -> AppResult<Option<ObjectId>> {
+    let obj = match repo.find_object(oid) {
+        Ok(obj) => obj,
+        Err(gix::object::find::existing::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(map_git_err(e, "git find_object")),
+    };
+    if obj.kind != gix::object::Kind::Commit {
+        return Err(AppError::validation(format!(
+            "revision step '~'/'^' requires a commit at {oid}"
+        )));
+    }
+    let commit = obj
+        .try_into_commit()
+        .map_err(|e| map_git_err(e, "git to commit"))?;
+    Ok(commit.parent_ids().nth(index).map(|id| id.detach()))
 }
 
 /// 列本地分支 + 当前分支名 (对齐 nuwax listBranches + currentBranch)。
@@ -190,6 +352,44 @@ fn iso_from_secs(secs: i64) -> String {
     chrono::DateTime::from_timestamp(secs, 0)
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_default()
+}
+
+/// 读工作区文件内容（ref=worktree/staged 短路路径, 对齐 TS fileContent）。
+/// 缺文件 = 空串（TS `existsSync ? read : ""` 的空数据契约——Diff 右侧取
+/// 未存盘/已删文件时不得 500）；超限 = Validation；非 UTF-8 = lossy
+/// （与 ref 路径 [`file_content_at_ref`] 的 from_utf8_lossy 一致）。
+pub fn worktree_content(
+    path: &std::path::Path,
+    file_path: &str,
+    max_bytes: u64,
+) -> AppResult<String> {
+    let full = crate::path_safety::ensure_within(path, file_path)?;
+    let metadata = match std::fs::metadata(&full) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => {
+            return Err(AppError::system(format!(
+                "read metadata {}: {error}",
+                full.display()
+            )));
+        }
+    };
+    if metadata.len() > max_bytes {
+        return Err(AppError::validation(format!(
+            "git file content exceeds limit (max {max_bytes} bytes)"
+        )));
+    }
+    let bytes = match std::fs::read(&full) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => {
+            return Err(AppError::system(format!(
+                "read {}: {error}",
+                full.display()
+            )));
+        }
+    };
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// 读 ref 处的文件内容 (对齐 nuwax fileContent)。
@@ -480,6 +680,12 @@ mod tests {
         let t = TestRepo::new();
         commit_file(&t, "a.txt", "1", "c1");
         let repo = t.open();
+        // T-d4 锁: 有提交后分支短名（PartialNameRef 展开）必须命中
+        let main_walk = log_history(&repo, 50, 0, Some("main"), None).expect("短名 main 应可 walk");
+        assert!(
+            !main_walk.is_empty(),
+            "main 短名 walk 必须非空: {main_walk:?}"
+        );
         let r = log_history(&repo, 50, 0, Some("no-such-branch"), None)
             .expect("缺分支必须空列表而非报错");
         assert!(r.is_empty(), "缺失分支: {r:?}");
@@ -617,5 +823,26 @@ mod tests {
                 "{spec} 应是 Validation: {err:?}"
             );
         }
+    }
+
+    // ── N1: worktree file-content 空数据契约（修复前必挂） ─────────────────────
+
+    #[test]
+    fn worktree_content_missing_file_is_empty_and_non_utf8_is_lossy() {
+        // TS 契约: fileContent 的 worktree 路径 `existsSync ? read : ""` ——
+        // 缺文件不得 500（Diff 右侧取未存盘/已删文件时的空数据契约）;
+        // 非 UTF-8 统一 lossy（与 ref 路径 from_utf8_lossy 一致）。
+        let t = TestRepo::new();
+        assert_eq!(
+            worktree_content(&t.0, "no/such/file.txt", 1024).expect("缺文件必须空串"),
+            "",
+            "缺文件必须走空串契约"
+        );
+        std::fs::write(t.0.join("bin.dat"), [0xff_u8, 0xfe, b'a']).expect("write non-utf8");
+        let s = worktree_content(&t.0, "bin.dat", 1024).expect("非 UTF-8 不得 500");
+        assert!(s.contains('a'), "lossy 内容应保留可解码部分: {s:?}");
+        std::fs::write(t.0.join("big.txt"), "0123456789").expect("write big");
+        let err = worktree_content(&t.0, "big.txt", 5).expect_err("超限必须拒绝");
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
     }
 }

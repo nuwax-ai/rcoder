@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 
 use crate::error::{AppError, AppResult};
 
+use super::read::resolve_rev_required;
 use super::{get_status, map_git_err};
 
 use gix::Repository;
@@ -63,9 +64,7 @@ fn collect_commit_changes(repo: &Repository, params: &DiffParams) -> AppResult<V
         .from
         .as_deref()
         .ok_or_else(|| AppError::validation("commit diff requires `from`"))?;
-    let from_id = repo
-        .rev_parse_single(from)
-        .map_err(|e| map_git_err(e, "git rev_parse from"))?;
+    let from_id = resolve_rev_required(repo, from, "git diff from")?;
     let requested_tree = repo
         .find_commit(from_id)
         .map_err(|e| map_git_err(e, "git find_commit from"))?
@@ -77,9 +76,7 @@ fn collect_commit_changes(repo: &Repository, params: &DiffParams) -> AppResult<V
     // 只给 from: old=from 的首个 parent (无 parent 则空树), new=from。
     let (old_tree_id, new_tree_id) = match &params.to {
         Some(to) => {
-            let to_id = repo
-                .rev_parse_single(to.as_str())
-                .map_err(|e| map_git_err(e, "git rev_parse to"))?;
+            let to_id = resolve_rev_required(repo, to.as_str(), "git diff to")?;
             let to_tree = repo
                 .find_commit(to_id)
                 .map_err(|e| map_git_err(e, "git find_commit to"))?
