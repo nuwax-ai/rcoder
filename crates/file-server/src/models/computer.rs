@@ -580,3 +580,28 @@ pub struct FsChildrenQuery {
     #[garde(custom(crate::validation_rules::not_blank))]
     pub path: String,
 }
+
+/// `fs/mkdir` 请求体（目录选择弹窗"新建文件夹"；参数走 JSON body，
+/// 天然规避 query 编码问题——对齐 TS 1.5.1）。
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsMkdirRequest {
+    /// 父目录绝对路径（宿主语义；父目录须已存在，非递归创建）
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub parent_path: String,
+    /// 新目录名（仅名字，禁止路径分隔符/`.`/`..`；中文名等任意合法文件名）
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub dir_name: String,
+}
+
+/// `fs/rename` 请求体（目录选择弹窗同目录重命名；对齐 TS 1.5.1）。
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsRenameRequest {
+    /// 现目录绝对路径（宿主语义）
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub path: String,
+    /// 新名字（仅名字，禁止路径分隔符；不支持跨目录移动）
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub new_name: String,
+}

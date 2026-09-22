@@ -142,28 +142,44 @@ pub async fn list_files_meta(
 
 // ── 共享工具 (供子模块 resolve/search 复用) ────────────────────────────────────
 
+/// 剥前导根/盘符前缀组件，转为相对形态（意图对齐 TS `replace(/^[\/\\]+/,"")`，
+/// 实现用 [`Path::components()`] 而非手写字符集匹配）：POSIX `/`、`//`，
+/// win32 `\`、`C:/` 等前导形态由 std 组件层统一归一。
+///
+/// 宿主语义差异（有意）：POSIX 上 `\` 是普通文件名字符（不是分隔符），
+/// 组件层不剥——比 TS 的字符串剥更忠实于宿主文件系统；Windows 上 `\`
+/// 是分隔符，照剥。返回相对形态字符串（可能为空，调用方自行判空）。
+pub(crate) fn strip_leading_root_components(p: &str) -> String {
+    Path::new(p)
+        .components()
+        .skip_while(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// 解析 `relative_path` 到 `root` 内的子目录绝对路径 (对齐 TS `resolvePathWithinWorkspace`)。
 ///
 /// 用 [`path_clean::PathClean`] 标准化路径 (等价 TS `path.normalize`), 消除 `.`/`..`:
-/// - `None` / `""` / `"."` / `"/"` → `root` 本身;
-/// - 前导 `/` 剥离 → 兼容 `"/sub"` 这类写法 (对齐 TS `replace(/^[\/\\]+/,"")`);
+/// - `None` / 纯空白 / 仅分隔符 (`"/"`) / `"."` → `root` 本身;
+/// - 前导根组件剥离 → 兼容 `"/sub"` 这类写法 (见 [`strip_leading_root_components`]);
 /// - 标准化后仍含 `..` (即 `..` 未被抵消, 越出根) → `Err`;
 /// - `ensure_within_path` (clean + starts_with) 做最终兜底, 双重保险。
 ///
-/// 最终经 [`path_safety::ensure_within_path`] (clean + starts_with) 兜底, 双重保险。
+/// 有意偏离 TS：不做整体 trim——会静默变形以空白开头/结尾的合法路径段；
+/// 判空保持 TS 口径（纯空白视同未指定），非纯空白原样解析。
 pub(crate) fn resolve_subdir(root: &Path, relative_path: Option<&str>) -> AppResult<PathBuf> {
-    let Some(rel) = relative_path.map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(rel) = relative_path.filter(|s| !s.trim().is_empty()) else {
         return Ok(root.clean());
     };
 
-    // 剥前导斜杠 (对齐 TS replace(/^[\/\\]+/,"")), 兼容 "/sub" 写法。
-    let stripped = rel.trim_start_matches(['/', '\\']);
+    let stripped = strip_leading_root_components(rel);
     if stripped.is_empty() {
         return Ok(root.clean());
     }
 
     // 标准化: 消除 . 和能抵消的 .. (如 "a/../b" → "b")。未抵消的 .. 会保留。
-    let normalized = Path::new(stripped).clean();
+    let normalized = Path::new(&stripped).clean();
 
     // 标准化后仍含 .. → 越界 (如 "../x" 不会被抵消)。用 components 检测最可靠。
     if normalized
@@ -644,5 +660,34 @@ mod tests {
         assert!(resolve_subdir(root, Some("a/../../escape")).is_err());
         // a/../b/../../x: 抵消后 b 还剩, 再 .. 栈空 → 越界
         assert!(resolve_subdir(root, Some("a/../b/../../x")).is_err());
+    }
+
+    #[test]
+    fn strip_leading_root_components_uses_host_component_semantics() {
+        assert_eq!(strip_leading_root_components("src/a.md"), "src/a.md");
+        assert_eq!(strip_leading_root_components("/src/a.md"), "src/a.md");
+        assert_eq!(strip_leading_root_components("//src"), "src");
+        assert_eq!(strip_leading_root_components("/"), "");
+        // 宿主语义（有意偏离 TS 的字符集剥法）：POSIX 上 `\` 是普通文件名字符，
+        // 组件层不剥；Windows 上是分隔符，照剥
+        #[cfg(not(windows))]
+        assert_eq!(strip_leading_root_components("\\src"), "\\src");
+        #[cfg(windows)]
+        assert_eq!(strip_leading_root_components("\\src"), "src");
+    }
+
+    #[test]
+    fn resolve_subdir_keeps_edge_whitespace_in_segments() {
+        // 有意偏离 TS：不做整体 trim——首尾空格是合法路径段的一部分
+        let root = Path::new("/app/ws");
+        assert_eq!(
+            resolve_subdir(root, Some(" dir ")).unwrap(),
+            PathBuf::from("/app/ws/ dir ")
+        );
+        // 中段空格不受影响（原本就原样）
+        assert_eq!(
+            resolve_subdir(root, Some("/ lead/file.txt")).unwrap(),
+            PathBuf::from("/app/ws/ lead/file.txt")
+        );
     }
 }

@@ -344,8 +344,10 @@ async fn query_file_meta_entry(
     file_path: &str,
     config: &Config,
 ) -> FileMetaEntry {
-    let input = file_path.trim();
-    if input.is_empty() {
+    // 有意偏离 TS：不做整体 trim——会静默变形以空白开头/结尾的合法路径段。
+    // 判空保持 TS 口径（纯空白 → illegal），非纯空白原样解析
+    let input = file_path;
+    if input.trim().is_empty() {
         return FileMetaEntry::errored(String::new(), "illegal path".into());
     }
     // resolve_subdir 内含前导斜杠剥除 + `..` 拒绝 + ensure_within 兜底, 与 TS

@@ -37,11 +37,11 @@ pub async fn resolve_existing_file(
     let resolved = match resolved {
         Some(r) => Some(r),
         None => {
-            let as_relative = file_path.trim_start_matches(['/', '\\']);
-            if as_relative.is_empty() || as_relative == file_path.trim() {
+            let as_relative = super::strip_leading_root_components(file_path);
+            if as_relative.is_empty() || as_relative == file_path {
                 None
             } else {
-                resolve_file_path_within_workspace(root, as_relative)
+                resolve_file_path_within_workspace(root, &as_relative)
             }
         }
     };
@@ -82,23 +82,26 @@ struct ResolvedPath {
 /// 与 [`super::resolve_subdir`] 用统一的标准化策略 ([`.clean()`] + 残留 `..` 检测),
 /// 差异仅在于: 本函数接受落在 `root` 内的**绝对路径** (供 IM 直出场景), 且 root 本身不算
 /// (要解析到具体文件)。越界 / 空 → `None`。
+///
+/// 有意偏离 TS：不做整体 trim——TS 对 filePath 整体 `.trim()` 会静默变形以空白
+/// 开头/结尾的合法路径段（如 `dir /file.txt`）。判空保持 TS 口径（纯空白 →
+/// `None`），非纯空白原样解析。
 fn resolve_file_path_within_workspace(root: &Path, file_path: &str) -> Option<ResolvedPath> {
-    let trimmed = file_path.trim();
-    if trimmed.is_empty() {
+    if file_path.trim().is_empty() {
         return None;
     }
 
     let normalized_root = root.clean();
-    let abs_path = if Path::new(trimmed).is_absolute() {
+    let abs_path = if Path::new(file_path).is_absolute() {
         // 绝对路径: clean 后须落在 root 下 (TS resolveFilePathWithinWorkspace 允许)
-        PathBuf::from(trimmed).clean()
+        PathBuf::from(file_path).clean()
     } else {
-        // 相对路径: 剥前导斜杠 + clean 标准化 (与 resolve_subdir 一致)
-        let stripped = trimmed.trim_start_matches(['/', '\\']);
+        // 相对路径: 剥前导根组件 + clean 标准化 (与 resolve_subdir 一致)
+        let stripped = super::strip_leading_root_components(file_path);
         if stripped.is_empty() {
             return None;
         }
-        let normalized = Path::new(stripped).clean();
+        let normalized = Path::new(&stripped).clean();
         // 标准化后仍含 .. → 越界
         if normalized
             .components()
@@ -140,6 +143,19 @@ mod tests {
         assert!(resolve_file_path_within_workspace(root, "").is_none());
         // 绝对路径在 root 外 → None
         assert!(resolve_file_path_within_workspace(root, "/etc/passwd").is_none());
+        // 注: "/src/a.txt" 形态的前导斜杠兼容由外层 resolve_existing_file 重试
+        // （见 resolve_existing_file_hits_leading_slash_compat），本函数内先按
+        // 绝对路径处理（不在 root 下 → None）
+    }
+
+    #[test]
+    fn resolve_file_path_keeps_edge_whitespace_in_segments() {
+        // 有意偏离 TS：不做整体 trim——首尾空格是合法路径段的一部分
+        let root = Path::new("/app/ws");
+        let r = resolve_file_path_within_workspace(root, " dir /a.txt").unwrap();
+        assert_eq!(r.abs_path, PathBuf::from("/app/ws/ dir /a.txt"));
+        // 纯空白视同未指定 → None（判空保持 TS 口径）
+        assert!(resolve_file_path_within_workspace(root, "   ").is_none());
     }
 
     /// 构造测试目录结构 (与 tree/mod.rs tests 同构):

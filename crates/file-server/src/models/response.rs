@@ -325,7 +325,7 @@ pub struct PortAllocation {
     pub port: u16,
 }
 
-// ── 文件系统目录浏览 (/fs/roots, /fs/children, 对齐 TS 1.4.5) ───────────────────
+// ── 文件系统目录浏览 (/fs/roots, /fs/children, /fs/mkdir, /fs/rename, 对齐 TS 1.5.1) ──
 
 /// 目录浏览条目（目录与文件；是否可选由前端按 `isDir` 判断）。
 #[derive(Debug, Clone, serde::Serialize, ToSchema)]
@@ -375,4 +375,23 @@ pub struct FsChildrenResponse {
     pub path: String,
     /// 一层子项（目录在前、名称自然排序）
     pub entries: Vec<FsEntry>,
+}
+
+/// `POST /fs/mkdir` / `POST /fs/rename` 响应：新建/重命名后的目录条目
+/// （对齐 TS 1.5.1 目录选择弹窗写操作）。
+#[derive(Debug, serde::Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsMutationResponse {
+    /// 恒 true
+    pub success: bool,
+    /// 条目名（`dirName`/`newName` trim 后的值）
+    pub name: String,
+    /// 归一化后的完整路径（分隔符统一 `/`）
+    pub path: String,
+    /// 归一化后的父目录路径
+    pub parent_path: String,
+    /// 恒 true（目录选择弹窗当前仅目录操作）
+    pub is_dir: bool,
+    /// 恒 false
+    pub is_symlink: bool,
 }
