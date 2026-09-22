@@ -185,3 +185,6 @@ grpc.status.vnc_backend_not_ready: "noVNC proxy ready, but Xvnc backend (5900) i
 error.hot_deploy_env_change: "Hot deployment cannot change business env; use pod mode"
 
 error.userapp_wait_timeout: "Builder ensure deadline exceeded; the accepted operation may still be running"
+
+# Backend fallback (2026-09-22 app-105: code previously leaked as "en-US.error.backend_error")
+error.backend_error: "Backend service failed; see the operation message or service logs for the underlying cause"

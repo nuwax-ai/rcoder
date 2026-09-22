@@ -181,3 +181,6 @@ error.dev_not_running: "開發服務未運行：dev 日誌僅在開發服務運�
 error.hot_deploy_env_change: "熱部署不能變更業務環境變數，請使用 pod 模式"
 
 error.userapp_wait_timeout: "等待開發容器逾時；已受理的操作可能仍在執行"
+
+# 後端兜底（2026-09-22 app-105：此前該 code 缺條目洩漏為 "en-US.error.backend_error"）
+error.backend_error: "後端服務執行失敗；請查看操作訊息或服務日誌定位根因"

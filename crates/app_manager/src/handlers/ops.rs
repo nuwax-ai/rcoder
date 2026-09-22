@@ -370,6 +370,63 @@ mod deployment_response_tests {
         );
     }
 
+    /// 消息透传回归闸（2026-09-22 app-105 事故）：deploy_wait 的确定性失败
+    /// 消息（含 CrashLoopBackOff 根因）必须原样到达 HTTP 响应——不允许任何
+    /// 一环降级为 i18n key（前端拿到 "en-US.error.backend_error" 不可行动）。
+    #[tokio::test]
+    async fn backend_failure_message_reaches_http_response() {
+        use axum::response::IntoResponse as _;
+        use shared_types::AppError;
+
+        // 路径 1: service 错误 → From 转换 → correlate 补 operation_id → 响应
+        let op_err = crate::error::AppOperationError::Backend(
+            "deterministic deployment failure on app 105 (operation op-x): \
+             CrashLoopBackOff (never ready, restart_count=4)"
+                .into(),
+        );
+        let app_err: AppError = op_err.into();
+        let app_err = app_err.with_operation_id("op-x".into());
+        let response = app_err.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body bytes");
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope JSON");
+        assert_eq!(
+            envelope["code"],
+            shared_types::error_codes::ERR_BACKEND_ERROR
+        );
+        let message = envelope["message"].as_str().expect("message");
+        assert!(
+            message.contains("CrashLoopBackOff"),
+            "root-cause message must reach the response, got: {message}"
+        );
+        assert!(
+            !message.contains("error.backend_error"),
+            "i18n key must not leak into the response, got: {message}"
+        );
+        assert_eq!(envelope["operation_id"], "op-x");
+
+        // 路径 2: 经 await_deployment_response 的完整链（JoinHandle 输出 Err）
+        // ——根因文本必须在该链中幸存（无论包装成什么 code/前缀）。
+        let task = tokio::spawn(async move {
+            Err::<(), crate::error::AppOperationError>(crate::error::AppOperationError::Backend(
+                "deterministic deployment failure on app 105: CrashLoopBackOff".into(),
+            ))
+        });
+        let outcome = await_deployment_response(task, std::time::Duration::from_secs(5)).await;
+        let err = outcome.expect_err("failure expected");
+        let response = err.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body bytes");
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope JSON");
+        let message = envelope["message"].as_str().expect("message");
+        assert!(
+            message.contains("CrashLoopBackOff"),
+            "root-cause must survive await_deployment_response, got: {message}"
+        );
+    }
+
     #[tokio::test]
     async fn response_timeout_does_not_cancel_owned_coordinator() {
         let (release, proceed) = tokio::sync::oneshot::channel();
