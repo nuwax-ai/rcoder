@@ -191,13 +191,14 @@ impl IntoResponse for AppError {
         let status = self.status_code();
         let typ = self.type_name();
         // 对 ValidationI18n: 优先按请求 locale 翻译, 未命中则用 fallback。
-        // rust-i18n 未命中时返回 "{locale}.{key}" (如 "en-US.error.xxx"), 以此判断未命中。
+        // shared_types::t 未命中归一为裸 key (旧形状 "{locale}.{key}" 一并兜底):
+        // 以 key 结尾 (裸 key 即相等) 判定未命中。
         let message = match &self {
             AppError::ValidationI18n(fallback, key) => {
                 let locale = shared_types::current_request_locale();
                 let translated = shared_types::t(key, locale);
-                // 未命中格式: "{locale}.{key}" → 以 key 结尾且比 key 长
-                if translated.len() > key.len() && translated.ends_with(key) {
+                if translated == *key || (translated.len() > key.len() && translated.ends_with(key))
+                {
                     fallback.clone()
                 } else {
                     translated
