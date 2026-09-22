@@ -135,9 +135,16 @@ impl DockerRuntime {
             labels.insert(APP_COMMAND_LABEL.to_string(), encoded);
         }
 
-        // TCP port_bindings（host_port=None 让 Docker 自动分配）
+        // TCP port_bindings（host_port=None 让 Docker 自动分配）；
+        // deploy-host Direct 形态抑制全部发布（零 -p，容器 IP 直拨）
+        #[cfg(feature = "deploy-host")]
+        let suppress_publish = crate::deploy_host_ports::suppress_port_publishing();
+        #[cfg(not(feature = "deploy-host"))]
+        let suppress_publish = false;
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
-        if let Some(ports) = &params.ports {
+        if let Some(ports) = &params.ports
+            && !suppress_publish
+        {
             for p in ports.iter().filter(|p| p.expose_type == ExposeType::Tcp) {
                 port_bindings.insert(
                     format!("{}/tcp", p.port),
@@ -150,9 +157,10 @@ impl DockerRuntime {
         }
         // deploy-host：Http 端口（app-entry 9080 等）一并发布——容器形态 Http
         // 走 Pingora 经容器 IP，宿主机形态 Pingora 数据面同样经注册表拨号，
-        // 全部暴露端口需发布到宿主机
+        // 全部暴露端口需发布到宿主机（Direct 形态零发布）
         #[cfg(feature = "deploy-host")]
         if shared_types::is_deploy_host()
+            && !crate::deploy_host_ports::suppress_port_publishing()
             && let Some(ports) = &params.ports
         {
             for p in ports.iter().filter(|p| p.expose_type == ExposeType::Http) {
@@ -290,18 +298,16 @@ impl DockerRuntime {
                     Ok(inspect) => {
                         #[cfg(feature = "deploy-host")]
                         if shared_types::is_deploy_host() {
-                            let ports_ref = inspect
-                                .network_settings
-                                .as_ref()
-                                .and_then(|ns| ns.ports.clone());
-                            crate::deploy_host_ports::register_from_inspect(
+                            // 同一次 inspect：Published 读回发布端口；Direct 提取
+                            // 容器 IPv4（零额外 inspect）
+                            crate::deploy_host_ports::register_reach_from_inspect(
                                 &container_name,
-                                inspect.name.as_deref(),
-                                &ports_ref,
+                                preferred,
+                                &inspect,
                             )
                             .map_err(|e| {
                                 ContainerRuntimeError::DockerError(format!(
-                                    "deploy-host app port registration failed: {e}"
+                                    "deploy-host app reach registration failed: {e}"
                                 ))
                             })?;
                         }
@@ -442,6 +448,9 @@ impl DockerRuntime {
                 .start_container(&name, None::<StartContainerOptions>)
                 .await
                 .map_err(|e| ContainerRuntimeError::ContainerStartError(e.to_string()))?;
+            // deploy-host：stop 后再 start，容器 IP 重分配——刷新寻址登记
+            self.refresh_deploy_host_registration(&app_deployment_name(app_id))
+                .await;
         }
         Ok(())
     }
@@ -620,14 +629,20 @@ impl DockerRuntime {
             .start_container(&target.resource.uid, None::<StartContainerOptions>)
             .await
         {
-            Ok(()) => Ok(()),
-            Err(bollard::errors::Error::DockerResponseServerError {
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 304, ..
-            }) => Ok(()),
-            Err(error) => Err(ContainerRuntimeError::ContainerStartError(format!(
-                "Start captured application: {error}"
-            ))),
+            }) => {}
+            Err(error) => {
+                return Err(ContainerRuntimeError::ContainerStartError(format!(
+                    "Start captured application: {error}"
+                )));
+            }
         }
+        // deploy-host：start 后刷新寻址登记（IP 随 start 就绪/漂移）
+        self.refresh_deploy_host_registration(&target.resource.name)
+            .await;
+        Ok(())
     }
 
     pub(super) async fn captured_start_is_running(
@@ -766,7 +781,44 @@ impl DockerRuntime {
             .start_container(&name, None::<StartContainerOptions>)
             .await
             .map_err(|e| ContainerRuntimeError::ContainerStartError(e.to_string()))?;
+        // deploy-host：stop/start 后容器 IP 重分配，刷新寻址登记（键与创建链
+        // container_name 同源——部署名本身唯一）
+        self.refresh_deploy_host_registration(&app_deployment_name(app_id))
+            .await;
         Ok(())
+    }
+
+    /// deploy-host：重建/重启/扩缩后刷新容器寻址登记（Published 端口映射与
+    /// Direct 容器 IP 均随重建漂移）。登记失败仅 warn 不 fail——容器已在跑，
+    /// 强失败恶化状态；拨号回退 loopback+warn 可归因，进程重启 rehydrate 恢复。
+    async fn refresh_deploy_host_registration(&self, key: &str) {
+        #[cfg(not(feature = "deploy-host"))]
+        {
+            let _ = (self, key);
+        }
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            let inspect = match self
+                .inner
+                .get_docker_client()
+                .inspect_container(key, None)
+                .await
+            {
+                Ok(inspect) => inspect,
+                Err(error) => {
+                    tracing::warn!("[deploy-host] reach refresh inspect {key} failed: {error}");
+                    return;
+                }
+            };
+            let preferred = self.inner.detect_main_network_name().await.ok();
+            if let Err(error) = crate::deploy_host_ports::register_reach_from_inspect(
+                key,
+                preferred.as_deref(),
+                &inspect,
+            ) {
+                tracing::warn!("[deploy-host] reach refresh register {key} failed: {error}");
+            }
+        }
     }
 }
 

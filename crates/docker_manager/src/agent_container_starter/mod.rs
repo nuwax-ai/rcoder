@@ -246,9 +246,10 @@ impl<'a> AgentContainerStarter<'a> {
         // 透传服务级安全配置（仅 Docker 模式生效；None 时 build_host_config 走代码默认）
         builder = builder.security(service_config.security.clone());
 
-        // deploy-host：按服务类型发布端口（宿主端口 Docker 分配，创建后读回注册）
+        // deploy-host：按服务类型发布端口（宿主端口 Docker 分配，创建后读回注册）；
+        // Direct 模式零发布（容器 IP 直拨），发布在创建后不可补——创建前抑制
         #[cfg(feature = "deploy-host")]
-        if shared_types::is_deploy_host() {
+        if shared_types::is_deploy_host() && !crate::deploy_host_ports::suppress_port_publishing() {
             for port in crate::deploy_host_ports::published_ports_for(&service_type) {
                 builder = builder.auto_port_binding(port);
             }
@@ -410,8 +411,10 @@ impl<'a> AgentContainerStarter<'a> {
             }
         }
 
-        // deploy-host：从容器 inspect 读回实际发布端口并登记注册表（必须在
-        // 就绪等待前——健康检查经注册表解析 127.0.0.1:host_port）
+        // deploy-host：登记注册表（Published=读回发布端口；Direct=容器 IPv4）。
+        // 必须在就绪等待前——健康检查经注册表解析拨号地址。
+        // network_name 已 move 进 builder(:338)，preferred 网卡重取（container_creator
+        // 同款；Direct 模式多网卡容器需要它保证取主网卡 IP）
         #[cfg(feature = "deploy-host")]
         if shared_types::is_deploy_host() {
             let inspect = self
@@ -424,14 +427,20 @@ impl<'a> AgentContainerStarter<'a> {
                 .await
                 .map_err(|e| {
                     DockerError::ContainerCreationError(format!(
-                        "deploy-host port read-back inspect failed: {e}"
+                        "deploy-host reach registration inspect failed: {e}"
                     ))
                 })?;
-            crate::deploy_host_ports::register_from_inspect(
+            let preferred_network = self.manager.get_main_network_name().await;
+            crate::deploy_host_ports::register_reach_from_inspect(
                 &container_id,
-                inspect.name.as_deref(),
-                &inspect.network_settings.and_then(|ns| ns.ports),
-            )?;
+                Some(preferred_network.as_str()),
+                &inspect,
+            )
+            .map_err(|e| {
+                DockerError::ContainerCreationError(format!(
+                    "deploy-host reach registration failed: {e}"
+                ))
+            })?;
         }
 
         // 5. 等待就绪并返回信息

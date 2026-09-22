@@ -403,9 +403,13 @@ async fn rehydrate_deploy_host_node_ports() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// deploy-host Docker 重启回填：list 全部容器，有发布端口的经
-/// register_from_inspect 双键登记（K8s 侧 rehydrate 的 Docker 对应——
-/// 重启后注册表为空则存量 agent 容器拨号全部回退 loopback:容器端口）。
+/// deploy-host Docker 重启回填：list 存量 rcoder 容器按 Reach 模式重新登记
+/// （K8s 侧 rehydrate 的 Docker 对应——重启后注册表为空则存量 agent 容器
+/// 拨号全部回退 loopback:容器端口）。
+///
+/// 过滤：仅 **running**（stopped 容器 IP 已失效，登记死 IP 比缺项更糟）且带
+/// `service-type` label（非 rcoder 管理容器不占注册表）。键集与创建链同源：
+/// `.Name` 去斜杠 ∪ `identifier`（starter）∪ `app-id`（app_create）。
 #[cfg(feature = "deploy-host")]
 async fn rehydrate_deploy_host_docker_ports() {
     use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions};
@@ -418,35 +422,68 @@ async fn rehydrate_deploy_host_docker_ports() {
         tracing::warn!("[deploy-host] Docker rehydrate: list failed");
         return;
     };
+    // Direct 模式 preferred 网卡与创建链 get_main_network_name 同源
+    // （network_management ensure_deploy_host_network 的 env 解析）
+    let preferred = std::env::var("RCODER_DEPLOY_HOST_NETWORK")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "rcoder-agent-network".to_owned());
     let mut registered = 0usize;
+    let mut skipped_stopped = 0usize;
+    let mut skipped_unmanaged = 0usize;
+    let mut failed = 0usize;
     for container in &containers {
         let Some(inspect_id) = container.id.as_deref() else {
             continue;
         };
+        // 无 service-type label = 非 rcoder 管理容器，跳过且不 inspect
+        let labels = container.labels.as_ref();
+        if !labels.is_some_and(|l| l.contains_key("service-type")) {
+            skipped_unmanaged += 1;
+            continue;
+        }
         let Ok(inspect) = docker
             .inspect_container(inspect_id, None::<InspectContainerOptions>)
             .await
         else {
+            failed += 1;
             continue;
         };
-        let key = inspect
+        let running = inspect
+            .state
+            .as_ref()
+            .and_then(|state| state.status)
+            .is_some_and(|status| status == bollard::models::ContainerStateStatusEnum::RUNNING);
+        if !running {
+            skipped_stopped += 1;
+            continue;
+        }
+        let name_key = inspect
             .name
             .as_deref()
             .map(|name| name.trim_start_matches('/').to_owned())
             .unwrap_or_else(|| inspect_id.to_owned());
-        let ports = inspect
-            .network_settings
-            .as_ref()
-            .and_then(|ns| ns.ports.clone());
-        if docker_manager::deploy_host_ports::register_from_inspect(
-            &key,
-            inspect.name.as_deref(),
-            &ports,
-        )
-        .is_ok()
+        let identifier_key = labels.and_then(|l| l.get("identifier")).cloned();
+        let app_id_key = labels
+            .and_then(|l| l.get(shared_types::USERAPP_DOCKER_APP_ID_LABEL))
+            .cloned();
+        for key in [Some(name_key), identifier_key, app_id_key]
+            .into_iter()
+            .flatten()
         {
-            registered += 1;
+            match docker_manager::deploy_host_ports::register_reach_from_inspect(
+                &key,
+                Some(preferred.as_str()),
+                &inspect,
+            ) {
+                Ok(()) => registered += 1,
+                Err(_) => failed += 1,
+            }
         }
     }
-    tracing::info!("[deploy-host] Docker rehydrate: {registered} container(s) registered");
+    tracing::info!(
+        "[deploy-host] Docker rehydrate: {registered} registration(s) \
+         (skipped: {skipped_stopped} stopped, {skipped_unmanaged} unmanaged, {failed} failed)"
+    );
 }

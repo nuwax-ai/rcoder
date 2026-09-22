@@ -898,7 +898,7 @@ fn map_container_status(status: &crate::types::ContainerStatus) -> ContainerRunt
 ///
 /// Docker 容器可能同时连接多个网络（主网络 + 自定义），`networks.values().next()`
 /// 会非确定性地取一个。优先按主网络名定位，确保拿到 Pingora backend 应指向的 IP。
-pub(super) fn extract_container_ip(
+pub(crate) fn extract_container_ip(
     inspect: &bollard::models::ContainerInspectResponse,
     preferred_network: Option<&str>,
 ) -> String {

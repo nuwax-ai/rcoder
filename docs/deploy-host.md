@@ -49,6 +49,7 @@ CONTAINER_RUNTIME=kubernetes cargo run -p rcoder --bin rcoder --features kuberne
 | `RCODER_CONFIG_FILE` | `~/.rcoder/config.yml` | config 文件位置（双形态都优先生效） |
 | `RCODER_DEPLOY_HOST_PATH_MAP` | 空 | 容器根→宿主根增量覆盖，`/app/x=/abs/path,...` |
 | `RCODER_DEPLOY_HOST_NETWORK` | `rcoder-agent-network` | agent 容器网络（不存在自动创建） |
+| `RCODER_DEPLOY_HOST_REACH` | `auto` | 容器寻址模式：`direct`（容器 IP 直拨零发布）/ `published`（发布到宿主机）/ `auto`（按 socket 检测）；优先于 config `deploy_host.reach` |
 | `RCODER_BIND_HOST` | `127.0.0.1`（容器形态 `0.0.0.0`） | 主 HTTP 端口 bind 地址 |
 | `DOCKER_SOCKET_PATH` | `/var/run/docker.sock` | OrbStack 备选 `$HOME/.orbstack/run/docker.sock` |
 | `RCODER_K8S_NAMESPACE` | `default` | K8s 形态 namespace |
@@ -65,10 +66,22 @@ CONTAINER_RUNTIME=kubernetes cargo run -p rcoder --bin rcoder --features kuberne
   （all_rust 策略）——主端口与 60000 双入口并存、路由行为一致。
 - **Pingora 8088**：数据面（VNC/ttyd/dbx/预览）照常。
 - **agent 容器端口**（8086/50051/6080/17681/60000/4224，builder 加
-  3010/9080/6091）：Docker 形态发布到宿主机（Docker 自动分配）；K8s 形态
-  agent Service 自动 NodePort 化。rcoder 拨号一律经 published-port 注册表
-  解析 `127.0.0.1:{host_port}`——macOS 宿主机无法路由容器网段 IP，也无法
-  解析集群内 FQDN，发布端口是唯一可达路径。
+  3010/9080/6091）：按 **Reach 模式**（env `RCODER_DEPLOY_HOST_REACH` >
+  config `deploy_host.reach` > `auto` 检测）二选一：
+
+| Reach | 行为 | 适用环境 |
+| --- | --- | --- |
+| `direct` | **零端口发布**，注册表登记容器真实 IPv4，拨 `{ip}:{容器端口原值}` | OrbStack、原生 Linux dockerd（容器网段从宿主机可路由） |
+| `published` | 端口发布到宿主机全部网卡（Docker 自动分配 host port），拨 `127.0.0.1:{host_port}` | Docker Desktop（容器网段对宿主机不可路由，发布端口是唯一可达路径） |
+| `auto`（默认） | 按生效 Docker socket 特征检测：`.orbstack`→direct；`com.docker.docker`/`docker.raw`→published；Linux 原生→direct；未知→published（安全默认） | — |
+
+  **OrbStack 用户注意**：`auto` 在 OrbStack 下默认即 direct（行为相对
+  Published 时代翻转）——需要发布端口给内网其他机器访问时，显式设
+  `RCODER_DEPLOY_HOST_REACH=published` 一行回退。K8s 形态不受 Reach 影响
+  （Service NodePort 路径不咨询模式）。Direct 模式绝不使用
+  `容器名.orb.local`（fake-IP 恒超时）。模式进程级一次，容器创建前决定
+  （Docker 创建后不能补绑端口）；`tunnel`（R2 yamux/R3 iroh）为契约占位，
+  配置可写但启动显式拒绝。
 
 ## 安全明示
 
@@ -98,5 +111,10 @@ agent 镜像：OrbStack 的 Docker 与 K8s **共享镜像仓库**——本地
   环境服务名（如内网 LLM 网关）——LLM `base_url` 请配 IP/localhost。
 - K8s NodePort 段 30000-32767（共 2768 个），每 agent 6-9 个端口——本地
   开发可接受，长期多 agent 需固定段分配（roadmap）。
+- Direct 模式依赖容器网段从宿主机可路由——Docker Desktop（macOS）虚拟网络
+  不可达，`auto` 检测会选 published；手动强制 direct 而 socket 特征未知时
+  运行期连接失败可归因（注册表未登记→拨号回退 warn 日志）。
+- Published 模式下 builder 重启重建的替换容器无 port_bindings（既有缺口，
+  发布丢失）——Direct 模式经重启刷新点登记新 IP，无此问题。
 - app-cli 保持独立命令（npm `@nuwax-ai/app-cli` 自装）；宿主机形态 UserApp
   编排仍在容器内，宿主机进程不需要 app-cli。

@@ -399,6 +399,20 @@ impl DockerRuntime {
         if only_start {
             super::docker_compute_receipt::save_start(target).await?;
         }
+        // deploy-host：builder 重启重建后刷新寻址登记——Direct 登记新 IP；
+        // Published 用重建容器实际映射整表替换（restore_body 无 port_bindings
+        // 的既有缺口：旧死端口被清出注册表）。失败仅 warn，不阻断控制成功路径
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            if let Err(error) =
+                crate::deploy_host_ports::register_reach_from_inspect(&resource.name, None, &after)
+            {
+                tracing::warn!(
+                    "[deploy-host] builder control reach refresh {} failed: {error}",
+                    resource.name
+                );
+            }
+        }
         running_builder_info(&after, target)
     }
 }
