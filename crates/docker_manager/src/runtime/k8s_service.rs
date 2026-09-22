@@ -144,11 +144,38 @@ pub(super) fn register_service_node_ports(identifier: &str, svc: &Service) {
         return;
     }
     let entries = map.len();
+    // 双键注册：identifier（create_agent_service 的短名键）+ 完整 STS 名
+    // （svc.metadata.name 去 "-svc" 后缀——get_container_info 查询键 =
+    // pod_info.container_name 完整名。单键不匹配时拨号回退容器端口，
+    // 与 Docker 端同类键分裂，2026-09-22 宿主机 OrbStack 实测）。
+    let pod_key = svc
+        .metadata
+        .name
+        .as_deref()
+        .and_then(|name| name.strip_suffix("-svc"))
+        .filter(|pod_name| *pod_name != identifier)
+        .map(str::to_owned);
+    if let Some(pod_name) = &pod_key {
+        shared_types::published::register(pod_name, map.clone());
+        info!(
+            "[deploy-host] NodePorts registered: identifier={}, entries={}",
+            pod_name, entries
+        );
+    }
     shared_types::published::register(identifier, map);
     info!(
         "[deploy-host] NodePorts registered: identifier={}, entries={}",
         identifier, entries
     );
+}
+
+/// deploy-host：Service 的任一端口已分配 nodePort（创建瞬间常为 None）。
+#[cfg(feature = "deploy-host")]
+fn node_ports_assigned(svc: &Service) -> bool {
+    svc.spec
+        .as_ref()
+        .and_then(|spec| spec.ports.as_ref())
+        .is_some_and(|ports| ports.iter().any(|p| p.node_port.is_some()))
 }
 
 /// Service 是否已声明某端口（端口值口径；ClusterIP 只路由已声明的端口）
@@ -478,8 +505,32 @@ impl K8sServiceOps for KubernetesRuntime {
                     e,
                 )
             })?;
+        // deploy-host：nodePort 由 apiserver 异步分配——create 响应里常为 None，
+        // 直接注册会得到空表（宿主机实测回退 127.0.0.1:容器端口的根因）。
+        // re-get 轮询直至分配（有界 10×500ms），再登记注册表。
         #[cfg(feature = "deploy-host")]
-        register_service_node_ports(identifier, &created_svc);
+        if shared_types::is_deploy_host() {
+            let mut svc = created_svc;
+            if !node_ports_assigned(&svc) {
+                for attempt in 0..10u32 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    match services.get(&svc_name).await {
+                        Ok(refetched) => {
+                            svc = refetched;
+                            if node_ports_assigned(&svc) {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[deploy-host] re-get Service '{svc_name}' for nodePort attempt {attempt}: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+            register_service_node_ports(identifier, &svc);
+        }
 
         info!(
             "[K8S] Service {} created for {} ({})",
