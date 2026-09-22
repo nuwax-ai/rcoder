@@ -13,6 +13,25 @@ pub enum UserAppStorageBackend {
     Postgres,
 }
 
+impl std::str::FromStr for UserAppStorageBackend {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value.trim() {
+            "auto" => Ok(Self::Auto),
+            // 旧值 fail-fast：控制面 SQLite 已按 spec 一次性切换为 Turso，不静默
+            // 映射（specs/userapp-turso-local-storage T3；docker/TURSO.md 记录
+            // 该契约）。
+            "sqlite" => {
+                bail!("backend sqlite was replaced by turso; update the deployment configuration")
+            }
+            "turso" => Ok(Self::Turso),
+            "postgres" => Ok(Self::Postgres),
+            _ => bail!("backend must be auto, turso or postgres"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UserAppStorageConfig {
@@ -59,18 +78,9 @@ impl UserAppStorageConfig {
         lookup: impl Fn(&str) -> Option<String>,
     ) -> anyhow::Result<()> {
         if let Some(value) = lookup("RCODER_USERAPP_STORAGE_BACKEND") {
-            self.backend = match value.trim() {
-                "auto" => UserAppStorageBackend::Auto,
-                // 旧值 fail-fast：Docker Compose 的 SQLite 已按 spec 一次性切换
-                // 为 Turso，不静默映射（specs/userapp-turso-local-storage T3）。
-                "sqlite" => bail!(
-                    "RCODER_USERAPP_STORAGE_BACKEND=sqlite was replaced by turso; \
-                     update the deployment configuration"
-                ),
-                "turso" => UserAppStorageBackend::Turso,
-                "postgres" => UserAppStorageBackend::Postgres,
-                _ => bail!("RCODER_USERAPP_STORAGE_BACKEND must be auto, turso or postgres"),
-            };
+            self.backend = value
+                .parse()
+                .with_context(|| format!("invalid RCODER_USERAPP_STORAGE_BACKEND={value:?}"))?;
         }
         if lookup("RCODER_USERAPP_SQLITE_PATH").is_some() {
             bail!(
@@ -247,6 +257,28 @@ mod tests {
                 .resolved_backend(app_manager::AppAccessMode::Kubernetes)
                 .is_err()
         );
+    }
+    #[test]
+    fn backend_from_str_parses_known_values_and_fails_fast_on_legacy() {
+        assert_eq!(
+            "auto".parse::<UserAppStorageBackend>().unwrap(),
+            UserAppStorageBackend::Auto
+        );
+        assert_eq!(
+            " turso ".parse::<UserAppStorageBackend>().unwrap(),
+            UserAppStorageBackend::Turso,
+            "env override trims surrounding whitespace"
+        );
+        assert_eq!(
+            "postgres".parse::<UserAppStorageBackend>().unwrap(),
+            UserAppStorageBackend::Postgres
+        );
+        for invalid in ["sqlite", "memory", ""] {
+            assert!(
+                invalid.parse::<UserAppStorageBackend>().is_err(),
+                "{invalid:?} must be rejected without silent fallback"
+            );
+        }
     }
     #[test]
     fn explicit_invalid_settings_never_fall_back_to_memory() {
