@@ -353,7 +353,7 @@ async fn reopen_probe(db: &toasty::Db, stop: &mut watch::Receiver<bool>) -> Reop
         // （owner 永久终局），JoinHandle 只暴露 JoinError。
         let mut probe_db = db.clone();
         let probe = tokio::spawn(async move {
-            let mut tx = probe_db.transaction().await?;
+            let tx = probe_db.transaction().await?;
             tx.commit().await
         });
         match probe.await {

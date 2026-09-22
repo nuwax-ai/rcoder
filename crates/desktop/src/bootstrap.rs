@@ -67,10 +67,10 @@ impl StatusView {
                     Ok(()) => format!("rcoder 服务健康（127.0.0.1:{port}/health）"),
                     Err(reason) => format!("服务未就绪：{reason}"),
                 };
-                let _ = this.update(cx, |view, cx| {
+                drop(this.update(cx, |view, cx| {
                     view.health = text.into();
                     cx.notify();
-                });
+                }));
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(2))
                     .await;

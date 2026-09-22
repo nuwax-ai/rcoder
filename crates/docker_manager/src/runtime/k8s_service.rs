@@ -479,10 +479,10 @@ impl K8sServiceOps for KubernetesRuntime {
                     // deploy-host：patch 新增端口的 nodePort 由 apiserver 异步分配，
                     // patch 前的 existing 拿不到——re-get 后注册（复用下方轮询）
                     #[cfg(feature = "deploy-host")]
-                    if shared_types::is_deploy_host() {
-                        if let Ok(refetched) = services.get(&svc_name).await {
-                            register_service_node_ports(identifier, &refetched);
-                        }
+                    if shared_types::is_deploy_host()
+                        && let Ok(refetched) = services.get(&svc_name).await
+                    {
+                        register_service_node_ports(identifier, &refetched);
                     }
                     return Ok(());
                 }

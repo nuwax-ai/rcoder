@@ -157,11 +157,10 @@ async fn host_k8s_agent_lifecycle_no_llm() {
             &svc_name,
             "-o",
             "jsonpath={.spec.ports[?(@.port==8086)].nodePort}",
-        ]) {
-            if !np.is_empty() {
-                node_port = np;
-                break;
-            }
+        ]) && !np.is_empty()
+        {
+            node_port = np;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

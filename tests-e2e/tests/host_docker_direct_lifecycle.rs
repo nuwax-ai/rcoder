@@ -70,7 +70,7 @@ fn docker_container_ipv4(container: &str) -> Result<String, String> {
         .get("rcoder-agent-network")
         .and_then(|value| ipv4_of(value).filter(|ip| !ip.is_empty()));
     Ok(primary
-        .or_else(|| entries.values().find_map(|value| ipv4_of(value)))
+        .or_else(|| entries.values().find_map(ipv4_of))
         .unwrap_or_default())
 }
 
