@@ -29,19 +29,32 @@ type ManagedChildren = Vec<(String, ManagedChild)>;
 /// failed 清单按条目映射进任务失败汇总，编排阶段错误不再依赖超时兜底）。
 pub(crate) const ORCHESTRATOR_FAILURE_SERVICE: &str = "orchestrator";
 
+/// 一次编排/运行的执行档位：由调用形态决定（server 操作上下文显式传递 /
+/// legacy 直跑兜底），沿 migrate→启动链原样传递。收拢三元组避免参数表
+/// 膨胀（clippy too_many_arguments）。
+#[derive(Clone, Debug, Default)]
+pub struct RunProfile {
+    /// 是否执行 [run].migrate 命令（server 形态按操作语义决定）。
+    pub run_migrations: bool,
+    /// dev 源码态信号（[devrun] 优先；见 [`dev_run_profile`]）。
+    pub dev_profile: bool,
+    /// R08 每操作 PG 凭据（owner 复用时平台传入；注入服务进程 env）。
+    pub pg: Option<shared_types::StartPgCredential>,
+}
+
+/// legacy 直跑形态的档位：migrate 恒执行、dev 由 env 信号、无操作级凭据。
+pub fn legacy_run_profile() -> RunProfile {
+    RunProfile {
+        run_migrations: true,
+        dev_profile: dev_run_profile(),
+        pg: None,
+    }
+}
+
 /// 编排主入口（legacy 直跑形态：一次性编排，无外部取消源）。
 pub async fn run(args: &RuntimeArgs, runtime_status: RuntimeStatusService) -> Result<()> {
     // 直跑形态（无操作上下文）：env 兜底（R08 显式 profile/凭据仅经 server 形态）
-    run_inner(
-        args,
-        runtime_status,
-        None,
-        None,
-        true,
-        dev_run_profile(),
-        None,
-    )
-    .await
+    run_inner(args, runtime_status, None, None, legacy_run_profile()).await
 }
 
 /// 编排主入口（server 形态：`cancel` 触发 = 优雅停全部子服务后 Ok 返回，
@@ -56,20 +69,9 @@ pub async fn run_with_cancel(
     runtime_status: RuntimeStatusService,
     cancel: tokio_util::sync::CancellationToken,
     on_running: Option<tokio::sync::oneshot::Sender<()>>,
-    run_migrations: bool,
-    dev_profile: bool,
-    pg: Option<shared_types::StartPgCredential>,
+    profile: RunProfile,
 ) -> Result<()> {
-    run_inner(
-        &args,
-        runtime_status,
-        Some(cancel),
-        on_running,
-        run_migrations,
-        dev_profile,
-        pg,
-    )
-    .await
+    run_inner(&args, runtime_status, Some(cancel), on_running, profile).await
 }
 
 /// 等 SIGTERM 的可复用 future（server 主循环 select 消费；Unix handler 安装
@@ -83,11 +85,14 @@ async fn run_inner(
     runtime_status: RuntimeStatusService,
     cancel: Option<tokio_util::sync::CancellationToken>,
     on_running: Option<tokio::sync::oneshot::Sender<()>>,
-    run_migrations: bool,
-    dev_profile: bool,
-    pg: Option<shared_types::StartPgCredential>,
+    profile: RunProfile,
 ) -> Result<()> {
     runtime_status.set_ready(false);
+    let RunProfile {
+        run_migrations,
+        dev_profile,
+        pg,
+    } = profile;
     let pg = resolve_run_pg(pg)?;
     // 1. 自动发现子项目 + 组装服务清单
     let release = manifest::read_release_lock(&args.workspace).context("load release lock")?;
@@ -558,7 +563,15 @@ fn database_url_with_credentials(
 /// PostgreSQL preflight is an execution-environment policy supplied by RCoder.
 /// Standalone app-cli does not infer a local database from migrations or templates.
 pub(crate) fn workspace_needs_pg(_specs: &[ServiceSpec]) -> bool {
-    std::env::var_os("APP_CLI_REQUIRE_PG").is_some_and(|value| value == "1")
+    pg_required_by_policy(std::env::var_os("APP_CLI_REQUIRE_PG").as_deref())
+}
+
+/// [`workspace_needs_pg`] 的纯谓词（供测试直测，不动进程 env）：
+/// 平台声明（builder 形态注入 APP_CLI_REQUIRE_PG=1）才探测；其余值/缺失
+/// 均不探测——含声明了 migrate 的服务（e39591126 起 PG 预检为环境策略，
+/// 不再由服务清单推断）。
+pub(crate) fn pg_required_by_policy(declared: Option<&std::ffi::OsStr>) -> bool {
+    declared == Some(std::ffi::OsStr::new("1"))
 }
 
 /// Probe the same database and credentials that migration commands consume.
@@ -1535,15 +1548,17 @@ mod tests {
         );
     }
 
-    /// N01：数据库需求声明式判定——migrate 命令或显式 env 才探测 PG。
+    /// PG 预检门控（e39591126 起为环境策略）：平台声明 APP_CLI_REQUIRE_PG=1
+    /// 才探测；缺省不探测——即使服务声明了 migrate（独立 app-cli 不从服务
+    /// 清单推断本地数据库，60s 轮询不得阻塞无数据库工作区启动）。
     #[test]
     fn pg_wait_is_gated_on_declared_need() {
-        let mut with_migrate = spec_with(None);
-        with_migrate.run.migrate = vec!["pnpm".into(), "db:migrate".into()];
-        // 服务声明 migrate → 需要
-        assert!(workspace_needs_pg(&[with_migrate]));
-        // 纯静态/前端服务（无 migrate）→ 不探测（60s 轮询不得阻塞启动）
-        assert!(!workspace_needs_pg(&[spec_with(None)]));
+        // 平台未声明 → 不探测（含声明 migrate 的服务）
+        assert!(!pg_required_by_policy(None));
+        assert!(!pg_required_by_policy(Some(std::ffi::OsStr::new(""))));
+        assert!(!pg_required_by_policy(Some(std::ffi::OsStr::new("0"))));
+        // 平台声明（builder 形态注入）→ 探测
+        assert!(pg_required_by_policy(Some(std::ffi::OsStr::new("1"))));
     }
 
     /// dev 形态 + 有 [devrun] → devrun.command（热加载命令生效）。

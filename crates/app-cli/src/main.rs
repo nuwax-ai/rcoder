@@ -157,16 +157,13 @@ async fn main() -> anyhow::Result<()> {
 
     // supervisor（前台阻塞，退出 → main 退出 → supervisor [program:app] 重启）。
     // P1-02：保留原始错误——supervisor Err 决定进程退出码。
+    // R08：直跑形态无操作上下文——dev 信号 env 兜底、无每操作凭据。
     let supervisor_result = app_cli::supervisor::run_with_cancel(
         args.clone(),
         runtime_status,
         supervisor_cancel,
         None,
-        true,
-        // R08：直跑形态无操作上下文——env 兜底（server 形态经操作显式传递）
-        app_cli::supervisor::dev_run_profile(),
-        // 直跑形态无每操作凭据（进程 env 透传）
-        None,
+        app_cli::supervisor::legacy_run_profile(),
     )
     .await;
     match &supervisor_result {

@@ -101,13 +101,16 @@ impl SupervisordHost {
         args: &RuntimeArgs,
         release: &ReleaseLock,
         runtime_status: &RuntimeStatusService,
-        run_migrations: bool,
-        dev_profile: bool,
-        pg: Option<shared_types::StartPgCredential>,
+        profile: supervisor::RunProfile,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         runtime_status.set_ready(false);
+        let supervisor::RunProfile {
+            run_migrations,
+            dev_profile,
+            pg,
+        } = profile;
         let pg = supervisor::resolve_run_pg(pg)?;
         supervisor::validate_runtime_compatibility(release)?;
         let specs: Vec<ServiceSpec> = release
@@ -441,6 +444,20 @@ fn safe_program_token(raw: &str) -> &str {
     }
 }
 
+// A lost reply to a mutation is not proof that supervisord stopped executing it.
+fn mutation_result<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if crate::xmlrpc::is_confirmed_fault(&error) {
+            error
+        } else {
+            supervisor::ShutdownUnconfirmed(format!(
+                "Supervisord mutation response is unconfirmed: {error:#}"
+            ))
+            .into()
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,18 +628,4 @@ NODE_ENV = "production"
         );
         server.await.unwrap();
     }
-}
-
-// A lost reply to a mutation is not proof that supervisord stopped executing it.
-fn mutation_result<T>(result: Result<T>) -> Result<T> {
-    result.map_err(|error| {
-        if crate::xmlrpc::is_confirmed_fault(&error) {
-            error
-        } else {
-            supervisor::ShutdownUnconfirmed(format!(
-                "Supervisord mutation response is unconfirmed: {error:#}"
-            ))
-            .into()
-        }
-    })
 }

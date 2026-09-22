@@ -3600,9 +3600,11 @@ async fn server_loop(
                 args,
                 &release,
                 &runtime_status,
-                run_migrations,
-                run_dev_profile,
-                run_pg,
+                crate::supervisor::RunProfile {
+                    run_migrations,
+                    dev_profile: run_dev_profile,
+                    pg: run_pg,
+                },
                 &orchestration_cancel,
             );
             tokio::pin!(orchestration);
@@ -3798,9 +3800,11 @@ async fn server_loop(
             runtime_status,
             cancel.clone(),
             Some(running_tx),
-            run_migrations,
-            run_dev_profile,
-            run_pg,
+            supervisor::RunProfile {
+                run_migrations,
+                dev_profile: run_dev_profile,
+                pg: run_pg,
+            },
         ));
         let mut sup_joined = false;
         // Startup must consume Stop too; waiting only for readiness can leave
