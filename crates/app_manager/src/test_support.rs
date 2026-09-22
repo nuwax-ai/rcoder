@@ -36,6 +36,9 @@ pub(crate) struct MockRuntime {
     pub mutation_uid_override: std::sync::Mutex<Option<String>>,
     pub scale_calls: AtomicUsize,
     pub management_start_calls: AtomicUsize,
+    /// restart_app_target 调用计数与每次收到的镜像（image-roll 断言用）。
+    pub restart_calls: AtomicUsize,
+    pub restart_images: std::sync::Mutex<Vec<Option<String>>>,
     pub lease_held: Arc<AtomicBool>,
     pub env_commit_failure: AtomicUsize,
     pub patch_preparation_fails: AtomicBool,
@@ -486,7 +489,13 @@ impl UserAppDeploymentRuntime for MockRuntime {
     async fn restart_app_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
+        image: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
+        self.restart_calls.fetch_add(1, Ordering::SeqCst);
+        self.restart_images
+            .lock()
+            .unwrap()
+            .push(image.map(str::to_string));
         self.start_app_target(target).await
     }
 

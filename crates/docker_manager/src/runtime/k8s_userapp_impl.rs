@@ -652,8 +652,9 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
     async fn restart_app_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
+        image: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
-        self.restart_captured_target(target).await
+        self.restart_captured_target(target, image).await
     }
 
     async fn start_app_management_target(

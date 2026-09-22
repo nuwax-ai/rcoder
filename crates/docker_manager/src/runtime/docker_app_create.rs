@@ -495,11 +495,106 @@ impl DockerRuntime {
     pub(super) async fn restart_captured_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
+        image: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
-        // Both calls retain the original physical ID. A failed stop does not
-        // authorize starting another resource selected by the logical name.
-        self.stop_captured_target(target).await?;
-        self.start_captured_target(target).await
+        match image {
+            // Both calls retain the original physical ID. A failed stop does not
+            // authorize starting another resource selected by the logical name.
+            None => {
+                self.stop_captured_target(target).await?;
+                self.start_captured_target(target).await
+            }
+            // Image roll: Docker cannot swap an image in place. Prepare the
+            // replacement from the verified live container, then delete and
+            // recreate under the captured name (the prepare-then-delete
+            // ordering of patch_deployment_impl).
+            Some(image) => {
+                self.recreate_captured_target_with_image(target, image)
+                    .await
+            }
+        }
+    }
+
+    /// Recreate the captured container onto `image`. The create body is derived
+    /// from the live container inspect so env/labels/cmd/mounts/network stay
+    /// byte-identical (the PG-password retention guarantee); only the image
+    /// differs. Any failure before the delete leaves the original running.
+    pub(super) async fn recreate_captured_target_with_image(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        image: &str,
+    ) -> ContainerRuntimeResult<()> {
+        target
+            .context
+            .validate_identity(&target.context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if target.resource.kind != shared_types::AppResourceKind::Container
+            || target.resource.name != app_deployment_name(&target.context.app_id)
+            || target.resource.uid.is_empty()
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Invalid captured application restart target".into(),
+            ));
+        }
+        let inspect = self
+            .inner
+            .get_docker_client()
+            .inspect_container(&target.resource.uid, None)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::DockerError(format!(
+                    "Inspect application restart target: {error}"
+                ))
+            })?;
+        let uid = validate_app_container_target(&target.context.app_id, &inspect)?;
+        if uid != target.resource.uid {
+            return Err(ContainerRuntimeError::Conflict(
+                "Captured application restart target changed".into(),
+            ));
+        }
+        self.inner
+            .ensure_image_exists(image)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::PreparationFailed(shared_types::AppPreparationFailure {
+                    message: format!("prepare restart image {image}: {error}"),
+                })
+            })?;
+        let live_config = inspect.config.clone().ok_or_else(|| {
+            ContainerRuntimeError::DockerError("Restart target has no container config".into())
+        })?;
+        let host_config = inspect.host_config.clone();
+        let inspected_network = host_config
+            .as_ref()
+            .and_then(|config| config.network_mode.clone())
+            .filter(|mode| !mode.is_empty());
+        let main_network = match inspected_network {
+            Some(mode) => mode,
+            None => self
+                .inner
+                .detect_main_network_name()
+                .await
+                .map_err(|error| {
+                    ContainerRuntimeError::DockerError(format!(
+                        "prepare application network: {error}"
+                    ))
+                })?,
+        };
+        let prepared = PreparedAppContainer {
+            app_id: target.context.app_id.clone(),
+            image: image.to_string(),
+            container_name: target.resource.name.clone(),
+            main_network,
+            config: recreate_body_from_inspect(&live_config, host_config, image),
+        };
+        let snapshot = shared_types::AppDeletionSnapshot {
+            app_id: target.context.app_id.clone(),
+            operation_id: target.context.operation_id.clone(),
+            resources: vec![target.resource.clone()],
+        };
+        self.delete_app_snapshot(&snapshot).await?;
+        self.create_prepared_app_container(prepared).await?;
+        Ok(())
     }
 
     pub(super) async fn start_captured_target(
@@ -711,6 +806,25 @@ fn validate_app_container_target(
         })
 }
 
+/// Derive the recreate body from the live container inspect: env/labels/cmd and
+/// the host config (mounts/network/port bindings) stay byte-identical — this is
+/// the PG-password and workspace retention guarantee — and only the image is
+/// replaced.
+fn recreate_body_from_inspect(
+    config: &bollard::models::ContainerConfig,
+    host_config: Option<bollard::models::HostConfig>,
+    image: &str,
+) -> bollard::models::ContainerCreateBody {
+    bollard::models::ContainerCreateBody {
+        image: Some(image.to_string()),
+        cmd: config.cmd.clone(),
+        env: config.env.clone(),
+        labels: config.labels.clone(),
+        host_config,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod mutation_target_tests {
     use super::*;
@@ -742,5 +856,69 @@ mod mutation_target_tests {
         let mut missing = target;
         missing.id = None;
         assert!(validate_app_container_target("app-one", &missing).is_err());
+    }
+
+    /// 反例锚定：重建体只换镜像——env/labels/cmd 与 HostConfig 必须逐字保留
+    /// （PG 密码经 env 注入、工作区经 mounts 绑定，丢失即 CR10 破坏）。
+    #[test]
+    fn recreate_config_from_inspect_replaces_only_image() {
+        let inspect: bollard::models::ContainerInspectResponse =
+            serde_json::from_value(serde_json::json!({
+                "Id": "physical-original",
+                "Config": {
+                    "Labels": {
+                        (shared_types::USERAPP_DOCKER_APP_ID_LABEL): "app-one",
+                        "service-type": ServiceType::Userapp.to_string(),
+                        "managed-by": "rcoder-app-manager"
+                    },
+                    "Env": ["APP_ID=app-one", "PGPASSWORD=secret-value"],
+                    "Cmd": ["/app/start-app.sh"]
+                },
+                "HostConfig": {
+                    "NetworkMode": "rcoder-testnet",
+                    "Binds": ["/tmp/ws-app-one:/home/user/app-one"]
+                }
+            }))
+            .expect("inspect");
+        let config = inspect.config.clone().expect("config");
+        let host_config = inspect.host_config.clone();
+        let body = recreate_body_from_inspect(
+            &config,
+            host_config.clone(),
+            "registry.test/app-runtime:0.2.0",
+        );
+        assert_eq!(
+            body.image.as_deref(),
+            Some("registry.test/app-runtime:0.2.0")
+        );
+        assert_eq!(
+            body.env.as_deref(),
+            Some(
+                [
+                    "APP_ID=app-one".to_string(),
+                    "PGPASSWORD=secret-value".to_string()
+                ]
+                .as_slice()
+            ),
+            "env must survive the image swap byte-identically"
+        );
+        assert_eq!(
+            body.cmd.as_deref(),
+            Some(["/app/start-app.sh".to_string()].as_slice())
+        );
+        let labels = body.labels.as_ref().expect("labels");
+        assert_eq!(
+            labels
+                .get(shared_types::USERAPP_DOCKER_APP_ID_LABEL)
+                .map(String::as_str),
+            Some("app-one")
+        );
+        let host = body.host_config.as_ref().expect("host config");
+        assert_eq!(host.network_mode.as_deref(), Some("rcoder-testnet"));
+        assert_eq!(
+            host.binds.as_deref(),
+            Some(["/tmp/ws-app-one:/home/user/app-one".to_string()].as_slice()),
+            "workspace binds must survive the image swap"
+        );
     }
 }

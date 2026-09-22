@@ -854,6 +854,7 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     async fn restart_app_target(
         &self,
         _target: &shared_types::UserAppMutationTarget,
+        _image: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         Err(ContainerRuntimeError::ConfigurationError(
             "Identity-bound application restart is unsupported".into(),
@@ -901,6 +902,7 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
             target: target.clone(),
             compute_start_single_write: false,
             volumes: Vec::new(),
+            restart_image: None,
         })
     }
 

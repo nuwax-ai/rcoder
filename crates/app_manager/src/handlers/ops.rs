@@ -128,13 +128,15 @@ pub async fn stop_app(
 /// 重启应用
 ///
 /// rollout restart；可选参数与 start 同款——带 url 即部署新版本并重启。
+/// 无 url/env 的裸重启同时把容器滚动到平台默认运行时镜像
+/// （env `RCODER_RUNTIME_IMAGE_DIGEST`；env 缺失时保持原镜像并 warn）。
 #[utoipa::path(
     post,
     path = "/api/v1/userapp/{app_id}/restart",
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body(
         content = StartAppRequest,
-        description = "按 app_id 定位，不使用 user_id；其余可选——空对象 = 传统 rollout restart。带 url = 部署新版本（等待边界同 start：部署段完成 + SQL 执行，服务启动异步可见，成功 ≠ 立即接流量）；其余字段语义同 start"
+        description = "按 app_id 定位，不使用 user_id；其余可选——空对象 = 传统 rollout restart（同时滚动到平台默认运行时镜像）。带 url = 部署新版本（等待边界同 start：部署段完成 + SQL 执行，服务启动异步可见，成功 ≠ 立即接流量）；其余字段语义同 start"
     ),
     description = r#"
 - If another operation holds the lock, this request is rejected without waiting

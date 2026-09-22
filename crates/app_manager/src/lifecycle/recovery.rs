@@ -1058,12 +1058,16 @@ impl AppService {
                 }
                 Command::Restart => {
                     guard.mark_mutating()?;
+                    let restart_image = crate::runtime::params::platform_restart_image(
+                        &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
+                    );
                     self.runtime
-                        .restart_app_target(&target)
+                        .restart_app_target(&target, restart_image.as_deref())
                         .await
                         .map_err(|error| {
                             map_runtime_error("Restart captured recovery target", error)
                         })?;
+                    self.refresh_pingora_after_restart(&snapshot.app_id).await;
                 }
                 Command::Start { traffic } => {
                     if !*traffic || previous.phase != "Running" {

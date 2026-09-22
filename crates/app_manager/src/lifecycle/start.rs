@@ -5,6 +5,9 @@
 //! 部署段完成（[`Self::wait_deploy_stage`]；服务启动结果异步可见）。失败 =
 //! 部署段失败/等待超时，code/ 现场不破坏（旧制品 URL 重发即回滚）。
 //! 可选 env/idle/pg 顺带生效。
+//! 无 url/env 的 restart 额外把容器滚动到平台默认运行时镜像
+//! （env `RCODER_RUNTIME_IMAGE_DIGEST`，受理时冻结进 DeployInput；env 缺失
+//! 降级为普通重启并 warn——重启可用性优先）。
 
 use garde::Validate as _;
 

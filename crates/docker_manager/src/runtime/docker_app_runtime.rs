@@ -500,8 +500,9 @@ impl UserAppDeploymentRuntime for DockerRuntime {
     async fn restart_app_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
+        image: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
-        self.restart_captured_target(target).await
+        self.restart_captured_target(target, image).await
     }
 
     async fn start_app_management_target(
@@ -522,6 +523,18 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         &self,
         target: &shared_types::UserAppComputeStartTarget,
     ) -> ContainerRuntimeResult<()> {
+        if let Some(image) = target.restart_image.as_deref() {
+            // Scoped divergence: the compute-restart verification and recovery
+            // fences bind to the captured physical UID, and a Docker image
+            // roll recreates the container. Image rolls on Docker go through
+            // restart_app_target / update / redeploy, which carry no UID
+            // fence; the compute path restarts the captured container.
+            tracing::warn!(
+                app_id = %target.target.context.app_id,
+                image,
+                "Docker compute restart keeps the captured container; image not rolled"
+            );
+        }
         self.start_captured_target(&target.target).await?;
         if !self.captured_start_is_running(&target.target).await? {
             return Err(ContainerRuntimeError::Conflict(

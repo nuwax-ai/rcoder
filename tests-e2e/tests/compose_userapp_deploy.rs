@@ -148,6 +148,19 @@ fn docker_inspect_id(container: &str) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
+/// docker inspect 读容器镜像（重启滚镜像断言依据）。
+fn docker_inspect_image(container: &str) -> Option<String> {
+    let out = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{.Config.Image}}", container])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let image = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!image.is_empty()).then_some(image)
+}
+
 fn trunc(v: &Value, n: usize) -> String {
     let s = v.to_string();
     s.chars().take(n).collect()
@@ -675,6 +688,56 @@ async fn deploy_and_verify_traffic(
             && qb["data"]["kind"].as_str() == Some("StartDeployment")
             && qb["data"]["state"].as_str() == Some("Succeeded"),
         format!("HTTP {qs}, body 截断: {}", trunc(&qb, 160)),
+    );
+
+    // D″：裸 restart（无 url/env）= 平台镜像升级通道。Docker 形态经容器重建
+    // 落地：Id 更换 + Config.Image == 平台默认；随后流量七路在重建后的容器上
+    // 复验（证明业务经 env/挂载保真重建后仍可用）。
+    let (rs2, rb2) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/restart?user_id={user}"),
+        json!({}),
+    )
+    .await;
+    report.assert_hard(
+        "bare restart 受理（镜像滚动通道）",
+        rs2.is_success() && http_ok(&rb2),
+        format!("HTTP {rs2}, body 截断: {}", trunc(&rb2, 160)),
+    );
+    let platform_image = env_or("RCODER_RUNTIME_IMAGE_DIGEST", "dev-app-runtime:latest");
+    let prod_container = format!("rcoder-app-{app}");
+    let mut rolled = false;
+    let mut rolled_detail = String::new();
+    let t0 = Instant::now();
+    while t0.elapsed() < ready_budget() {
+        if docker_container_running(&prod_container) {
+            match (
+                docker_inspect_image(&prod_container),
+                docker_inspect_id(&prod_container),
+            ) {
+                (Some(image), Some(id)) if image == platform_image => {
+                    rolled = container_id_after.as_deref() != Some(id.as_str());
+                    rolled_detail = format!(
+                        "image={image}, id_changed={}",
+                        container_id_after.as_deref() != Some(id.as_str())
+                    );
+                    break;
+                }
+                (image, id) => {
+                    rolled_detail = format!(
+                        "image={image:?}（期望 {platform_image}）, id={:?}",
+                        id.as_deref().map(|value| &value[..12.min(value.len())])
+                    );
+                }
+                _ => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    report.assert_hard(
+        "bare restart 滚动到平台默认镜像（容器重建，Id 更换）",
+        rolled,
+        rolled_detail,
     );
 
     // 七路流量：next=/、react=/react、vue=/vue、四后端 readiness（strip_prefix 后路径）
@@ -1929,6 +1992,47 @@ async fn verify_stop_and_explicit_start(env: &Env, report: &JsonlReporter, app: 
         ready && docker_container_running(&format!("rcoder-app-{app}")),
         format!("start: {}", trunc(&start, 180)),
     );
+
+    // prod `/computer/pod/restart`（compute 控制通道，此前零 prod 覆盖）：
+    // 202 受理 → 容器恢复运行 + 代理就绪。Docker 形态该通道不滚镜像（物理
+    // UID 身份围栏保持；镜像滚动走上面的 restart 通道）——差异固化为断言，
+    // 语义变化时强制更新。
+    let prod_container = format!("rcoder-app-{app}");
+    let image_before = docker_inspect_image(&prod_container);
+    let (cs, cb) = post_json(
+        env,
+        "/computer/pod/restart",
+        json!({"user_id": user, "app_id": app, "app_stage": "prod", "service_type": "userapp"}),
+    )
+    .await;
+    let accepted = cs.as_u16() == 202 && cb["data"]["operation_id"].as_str().is_some();
+    report.assert_hard(
+        "prod /computer/pod/restart 受理 202",
+        accepted,
+        format!("HTTP {cs}, body 截断: {}", trunc(&cb, 160)),
+    );
+    if accepted {
+        let mut restored = false;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(180) {
+            if docker_container_running(&prod_container) && cr10_proxy_ready(env, app, user).await {
+                restored = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        report.assert_hard(
+            "prod compute restart 容器恢复运行且代理就绪",
+            restored,
+            format!("{:.0}s 内恢复", t0.elapsed().as_secs_f64()),
+        );
+        let image_after = docker_inspect_image(&prod_container);
+        report.assert_hard(
+            "Docker compute 通道保持镜像不变（物理 UID 围栏；滚镜像走 restart 通道）",
+            image_after == image_before,
+            format!("before={image_before:?}, after={image_after:?}"),
+        );
+    }
 }
 
 /// 回收：prod delete purge → 流量转 502。

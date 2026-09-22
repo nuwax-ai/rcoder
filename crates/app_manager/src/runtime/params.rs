@@ -350,6 +350,22 @@ pub(crate) fn default_runtime_image(env_value: &Option<String>) -> AppResult<Str
         })
 }
 
+/// Restart-path image resolution. Unlike [`default_runtime_image`], a missing
+/// or blank env degrades to `None` (plain restart on the current image) with a
+/// warning: restart's primary contract is availability and must not brick on
+/// deployment config gaps.
+pub(crate) fn platform_restart_image(env_value: &Option<String>) -> Option<String> {
+    let resolved = env_value
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if resolved.is_none() {
+        warn!("[APP] RCODER_RUNTIME_IMAGE_DIGEST missing/blank: restart keeps the current image");
+    }
+    resolved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,7 +678,7 @@ mod tests {
 
     #[cfg(test)]
     mod default_image {
-        use super::default_runtime_image;
+        use super::{default_runtime_image, platform_restart_image};
 
         #[test]
         fn env_present_resolves() {
@@ -675,6 +691,18 @@ mod tests {
         fn env_blank_is_missing() {
             assert!(default_runtime_image(&Some("   ".into())).is_err());
             assert!(default_runtime_image(&None).is_err());
+        }
+
+        /// 反例矩阵：restart 通道的镜像解析在 env 缺失/空白时降级为 None
+        /// （普通重启），而非报错——重启可用性优先于配置完备性。
+        #[test]
+        fn restart_resolution_degrades_instead_of_failing() {
+            assert_eq!(platform_restart_image(&None), None);
+            assert_eq!(platform_restart_image(&Some("   ".into())), None);
+            assert_eq!(
+                platform_restart_image(&Some(" registry.example/app-runtime:0.2.0 ".into())),
+                Some("registry.example/app-runtime:0.2.0".to_string())
+            );
         }
     }
 }

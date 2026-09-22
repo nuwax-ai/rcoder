@@ -3104,6 +3104,127 @@ async fn controlled_restart_deduplicates_and_is_distinct_from_start() {
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), before + 1);
 }
 
+// 豁免仅限测试 helper：edition-2024 env 变异是 unsafe；同值重复 set 对并行测试无害
+// （与 lifecycle/start.rs 的 with_runtime_image_env 同款约定）。
+#[allow(unsafe_code)]
+fn restart_image_env() {
+    unsafe {
+        std::env::set_var(
+            "RCODER_RUNTIME_IMAGE_DIGEST",
+            "registry.test/app-runtime:ut",
+        );
+    }
+}
+
+/// 裸 restart（无 url/env）把平台默认镜像传给运行时，且保持单次定向写：
+/// 不走 create/patch 全量重建（突变证明——重启通道不得回退成 update 通道）。
+#[tokio::test]
+async fn bare_restart_rolls_captured_target_to_platform_default_image() {
+    restart_image_env();
+    let root = tempfile::tempdir().expect("directory");
+    let (service, runtime) = created_app_service(root.path(), "imagerestart").await;
+    let create_calls = runtime.create_calls.load(Ordering::SeqCst);
+    let params_before = runtime
+        .create_params_history
+        .get("imagerestart")
+        .map(|entry| entry.value().len())
+        .unwrap_or(0);
+    let result = service
+        .restart_app_enhanced("imagerestart", StartAppRequest::default())
+        .await
+        .expect("bare restart");
+    assert_eq!(result.runtime.phase, "Running");
+    assert_eq!(runtime.restart_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        runtime.restart_images.lock().expect("images").as_slice(),
+        &[Some("registry.test/app-runtime:ut".to_string())]
+    );
+    assert_eq!(
+        runtime.create_calls.load(Ordering::SeqCst),
+        create_calls,
+        "restart must stay a single targeted write, not a full re-apply"
+    );
+    let params_after = runtime
+        .create_params_history
+        .get("imagerestart")
+        .map(|entry| entry.value().len())
+        .unwrap_or(0);
+    assert_eq!(
+        params_before, params_after,
+        "restart must not rebuild container params"
+    );
+    let operation = service
+        .metadata
+        .store
+        .get_operation("imagerestart", &result.operation_id.expect("operation id"))
+        .await
+        .expect("read")
+        .expect("operation");
+    assert_eq!(
+        operation.state,
+        shared_types::UserAppOperationState::Succeeded
+    );
+}
+
+/// 带 env 的 restart 走既有 update 通道滚镜像（image 缺省=平台默认），
+/// 不再叠加 restart_app_target（防未来双重突变回归）。
+#[tokio::test]
+async fn restart_with_env_rolls_image_via_single_update_not_restart_target() {
+    restart_image_env();
+    let root = tempfile::tempdir().expect("directory");
+    let (service, runtime) = created_app_service(root.path(), "envrestart").await;
+    service
+        .restart_app_enhanced(
+            "envrestart",
+            StartAppRequest {
+                env: Some([("APP_BAR".to_string(), "2".to_string())].into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("restart with env");
+    assert_eq!(
+        runtime.restart_calls.load(Ordering::SeqCst),
+        0,
+        "env-carrying restart rolls the image through the update channel only"
+    );
+    let history = runtime
+        .create_params_history
+        .get("envrestart")
+        .expect("update recorded")
+        .value()
+        .clone();
+    let last = history.last().expect("update params");
+    assert_eq!(
+        last.image_override.as_deref(),
+        Some("registry.test/app-runtime:ut"),
+        "update must resolve the image to the platform default"
+    );
+}
+
+/// ops.rs 控制通道的 restart 同样携带平台镜像（与前两个入口行为一致）。
+#[tokio::test]
+async fn controlled_restart_passes_platform_image() {
+    restart_image_env();
+    let root = tempfile::tempdir().expect("directory");
+    let (service, runtime) = created_app_service(root.path(), "controlledimage").await;
+    service
+        .restart_app_controlled(
+            "controlledimage",
+            shared_types::UserAppControlRequest {
+                lifecycle_id: None,
+                request_id: Some("controlled-image".into()),
+            },
+        )
+        .await
+        .expect("controlled restart");
+    assert_eq!(runtime.restart_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        runtime.restart_images.lock().expect("images").as_slice(),
+        &[Some("registry.test/app-runtime:ut".to_string())]
+    );
+}
+
 #[tokio::test]
 async fn explicit_retry_checks_owner_lifecycle_and_revision_before_execution() {
     let directory = tempfile::tempdir().expect("directory");

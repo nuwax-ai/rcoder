@@ -16,6 +16,8 @@ use tracing::info;
 use super::k8s_app_helpers::{
     IDLE_TIMEOUT_ANNOTATION, RECYCLE_ENABLED_ANNOTATION, WAKE_ON_TRAFFIC_ANNOTATION,
 };
+#[cfg(feature = "kubernetes")]
+use super::k8s_deployment::APP_CONTAINER_NAME;
 
 use super::kubernetes_runtime::KubernetesRuntime;
 
@@ -117,6 +119,7 @@ impl KubernetesRuntime {
     pub(super) async fn restart_captured_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
+        image: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         target
             .context
@@ -137,10 +140,15 @@ impl KubernetesRuntime {
         }
         self.claim_app_storage_with_context(&target.context.app_id, Some(&target.context))
             .await?;
-        self.patch_captured_app(&target.resource, serde_json::json!({
-            "metadata":{"annotations":{(WAKE_ON_TRAFFIC_ANNOTATION):"true"}},
-            "spec":{"replicas":1,"template":{"metadata":{"annotations":{"rcoder.io/restart-operation":target.context.operation_id}}}}
-        })).await
+        let patch = app_restart_patch(&target.context.operation_id, image);
+        if image.is_some() {
+            // containers merge-by-name requires the strategic patch type; an
+            // RFC 7386 merge patch would replace the array atomically.
+            self.patch_captured_app_strategic(&target.resource, patch)
+                .await
+        } else {
+            self.patch_captured_app(&target.resource, patch).await
+        }
     }
 
     pub(super) async fn start_captured_target(
@@ -298,6 +306,7 @@ impl KubernetesRuntime {
             target: target.clone(),
             compute_start_single_write: true,
             volumes,
+            restart_image: None,
         })
     }
 
@@ -355,7 +364,8 @@ impl KubernetesRuntime {
                 "Restart workload version missing".into(),
             ));
         }
-        let prepared = self.prepare_captured_compute_start(&refreshed).await?;
+        let mut prepared = self.prepare_captured_compute_start(&refreshed).await?;
+        prepared.restart_image = captured.restart_image.clone();
         captured
             .verify_same_volumes(&prepared)
             .map_err(ContainerRuntimeError::Conflict)?;
@@ -480,10 +490,14 @@ impl KubernetesRuntime {
         })?;
         // The caller already drained prior writers and owns the operation lease.
         // No PVC mutation, create, or second runtime write follows this patch.
-        self.patch_captured_app(&captured.target.resource, serde_json::json!({
-            "metadata":{"annotations":{(WAKE_ON_TRAFFIC_ANNOTATION):"true", "rcoder.io/compute-start-receipt":receipt}},
-            "spec":{"replicas":1}
-        })).await
+        let patch = app_compute_start_patch(&receipt, captured.restart_image.as_deref());
+        if captured.restart_image.is_some() {
+            self.patch_captured_app_strategic(&captured.target.resource, patch)
+                .await
+        } else {
+            self.patch_captured_app(&captured.target.resource, patch)
+                .await
+        }
     }
 
     pub(super) async fn reconcile_captured_compute_start(
@@ -809,6 +823,36 @@ impl KubernetesRuntime {
         Ok(())
     }
 
+    /// Same identity-fenced patch as [`Self::patch_captured_app`] but with the
+    /// strategic merge type: `containers` entries merge by container name
+    /// instead of the array being replaced atomically.
+    pub(super) async fn patch_captured_app_strategic(
+        &self,
+        identity: &shared_types::AppResourceIdentity,
+        patch: serde_json::Value,
+    ) -> ContainerRuntimeResult<()> {
+        let patch = condition_app_patch(identity, patch)?;
+        self.deployments_api()
+            .patch(
+                &identity.name,
+                &PatchParams::default(),
+                &Patch::Strategic(patch),
+            )
+            .await
+            .map_err(|error| match &error {
+                kube::Error::Api(response) if response.code == 409 => {
+                    ContainerRuntimeError::Conflict(format!(
+                        "Application mutation precondition failed: {error}"
+                    ))
+                }
+                _ => super::builder_completion::k8s_error(
+                    format!("Patch captured application: {error}"),
+                    error,
+                ),
+            })?;
+        Ok(())
+    }
+
     /// Remove obsolete port resources after a successful update.
     pub async fn cleanup_orphan_port_resources(
         &self,
@@ -906,6 +950,51 @@ fn app_mutation_identity(
     })
 }
 
+/// Restart patch body: wake annotation + replicas=1 + per-operation template
+/// annotation (guarantees a rollout even when the image is unchanged). With an
+/// image the pod-template container image joins the same write — the caller
+/// must dispatch via strategic merge (containers merge by name; an RFC 7386
+/// merge patch would replace the array atomically).
+fn app_restart_patch(operation_id: &str, image: Option<&str>) -> serde_json::Value {
+    let template = match image {
+        Some(image) => serde_json::json!({
+            "metadata":{"annotations":{"rcoder.io/restart-operation":operation_id}},
+            "spec":{"containers":[{"name":APP_CONTAINER_NAME,"image":image}]}
+        }),
+        None => serde_json::json!({
+            "metadata":{"annotations":{"rcoder.io/restart-operation":operation_id}}
+        }),
+    };
+    serde_json::json!({
+        "metadata":{"annotations":{(WAKE_ON_TRAFFIC_ANNOTATION):"true"}},
+        "spec":{"replicas":1,"template":template}
+    })
+}
+
+/// Compute-start patch body: wake + start receipt annotations + replicas=1,
+/// optionally rolling the pod-template container image in the same single
+/// write (strategic merge required, same as [`app_restart_patch`]).
+fn app_compute_start_patch(receipt: &str, image: Option<&str>) -> serde_json::Value {
+    match image {
+        Some(image) => serde_json::json!({
+            "metadata":{"annotations":{
+                (WAKE_ON_TRAFFIC_ANNOTATION):"true",
+                "rcoder.io/compute-start-receipt":receipt
+            }},
+            "spec":{"replicas":1,"template":{"spec":{"containers":[
+                {"name":APP_CONTAINER_NAME,"image":image}
+            ]}}}
+        }),
+        None => serde_json::json!({
+            "metadata":{"annotations":{
+                (WAKE_ON_TRAFFIC_ANNOTATION):"true",
+                "rcoder.io/compute-start-receipt":receipt
+            }},
+            "spec":{"replicas":1}
+        }),
+    }
+}
+
 fn condition_app_patch(
     identity: &shared_types::AppResourceIdentity,
     mut patch: serde_json::Value,
@@ -943,6 +1032,73 @@ fn condition_app_patch(
 #[cfg(test)]
 mod mutation_identity_tests {
     use super::*;
+
+    /// 镜像滚动版 restart patch：同一写携带镜像+重启注解+replicas；
+    /// containers 只含 name/image 两个键（Strategic merge-by-name 语义，
+    /// 误用 Merge patch 会整组替换 containers——此处固化形状防回退）。
+    #[test]
+    fn restart_patch_carries_image_annotation_and_replicas_in_one_write() {
+        let patch = app_restart_patch("op-restart", Some("registry.test/app-runtime:0.2.0"));
+        assert_eq!(
+            patch["metadata"]["annotations"][WAKE_ON_TRAFFIC_ANNOTATION],
+            "true"
+        );
+        assert_eq!(patch["spec"]["replicas"], 1);
+        assert_eq!(
+            patch["spec"]["template"]["metadata"]["annotations"]["rcoder.io/restart-operation"],
+            "op-restart"
+        );
+        let containers = patch["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .expect("containers array");
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0]["name"], APP_CONTAINER_NAME);
+        assert_eq!(containers[0]["image"], "registry.test/app-runtime:0.2.0");
+        assert_eq!(
+            containers[0].as_object().expect("container object").len(),
+            2,
+            "container entry must carry only name+image"
+        );
+    }
+
+    /// 无镜像版保持既有形状：template 只含 metadata 注解，不出现 containers
+    /// 键（走 Merge patch 的判定依据）。
+    #[test]
+    fn restart_patch_without_image_keeps_plain_shape() {
+        let patch = app_restart_patch("op-restart", None);
+        assert_eq!(patch["spec"]["replicas"], 1);
+        assert_eq!(
+            patch["spec"]["template"]["metadata"]["annotations"]["rcoder.io/restart-operation"],
+            "op-restart"
+        );
+        assert!(
+            patch["spec"]["template"].get("spec").is_none(),
+            "no container template spec without an image roll"
+        );
+    }
+
+    #[test]
+    fn compute_start_patch_carries_image_only_when_present() {
+        let plain = app_compute_start_patch("{\"op\":\"a\"}", None);
+        assert_eq!(plain["spec"]["replicas"], 1);
+        assert_eq!(
+            plain["metadata"]["annotations"]["rcoder.io/compute-start-receipt"],
+            "{\"op\":\"a\"}"
+        );
+        assert!(plain["spec"].get("template").is_none());
+
+        let rolled = app_compute_start_patch("{\"op\":\"b\"}", Some("registry.test/app-runtime:9"));
+        let containers = rolled["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .expect("containers array");
+        assert_eq!(containers[0]["name"], APP_CONTAINER_NAME);
+        assert_eq!(containers[0]["image"], "registry.test/app-runtime:9");
+        assert_eq!(
+            rolled["metadata"]["annotations"][WAKE_ON_TRAFFIC_ANNOTATION],
+            "true"
+        );
+    }
+
     #[test]
     fn conditional_workload_patch_retains_requested_changes_and_captured_identity() {
         let metadata = k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {

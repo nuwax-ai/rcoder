@@ -72,6 +72,11 @@ pub struct UserAppComputeStartTarget {
     pub compute_start_single_write: bool,
     #[serde(default)]
     pub volumes: Vec<AppResourceIdentity>,
+    /// Platform-default image the restart operation froze at admission. The
+    /// compute-start patch rolls the workload onto it; `None` keeps the image
+    /// (plain restart / wake — wake never waits on image pulls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_image: Option<String>,
 }
 
 impl UserAppComputeStartTarget {
@@ -416,4 +421,60 @@ pub const USERAPP_DOCKER_APP_ID_LABEL: &str = "app-id";
 #[error("{message}")]
 pub struct AppPreparationFailure {
     pub message: String,
+}
+
+#[cfg(test)]
+mod compute_start_target_tests {
+    use super::*;
+
+    fn sample_target() -> UserAppComputeStartTarget {
+        UserAppComputeStartTarget {
+            target: UserAppMutationTarget {
+                context: crate::UserAppExecutionContext {
+                    app_id: "app".into(),
+                    lifecycle_id: "life".into(),
+                    operation_id: "op".into(),
+                    executor_id: "worker".into(),
+                    request_fingerprint: "f".repeat(64),
+                },
+                resource: AppResourceIdentity {
+                    kind: AppResourceKind::Deployment,
+                    name: "rcoder-app-app".into(),
+                    uid: "uid".into(),
+                    resource_version: Some("7".into()),
+                },
+            },
+            compute_start_single_write: true,
+            volumes: Vec::new(),
+            restart_image: Some("registry.test/app-runtime:0.2.0".into()),
+        }
+    }
+
+    /// restart_image 经 compute checkpoint 序列化往返保留（恢复/续跑确定性），
+    /// 且 skip 序列化不破坏旧读端解析。
+    #[test]
+    fn restart_image_round_trips_and_legacy_payload_stays_compatible() {
+        let target = sample_target();
+        let encoded = serde_json::to_value(&target).expect("encode");
+        assert_eq!(
+            encoded["restart_image"], "registry.test/app-runtime:0.2.0",
+            "frozen image must persist in the checkpoint payload"
+        );
+        let decoded: UserAppComputeStartTarget =
+            serde_json::from_value(encoded.clone()).expect("decode");
+        assert_eq!(decoded.restart_image, target.restart_image);
+        let legacy = serde_json::json!({
+            "context": encoded["context"],
+            "resource": encoded["resource"],
+            "compute_start_single_write": true,
+            "volumes": [],
+        });
+        let legacy_decoded: UserAppComputeStartTarget =
+            serde_json::from_value(legacy).expect("legacy payload parses");
+        assert_eq!(legacy_decoded.restart_image, None);
+        assert!(
+            target.verify_same_volumes(&legacy_decoded).is_ok(),
+            "volume witness comparison ignores the image field"
+        );
+    }
 }

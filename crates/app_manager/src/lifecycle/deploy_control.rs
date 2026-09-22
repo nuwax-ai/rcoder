@@ -15,6 +15,12 @@ pub(super) struct DeployInput {
     params: Option<container_runtime_api::ContainerCreateParams>,
     previous: Option<container_runtime_api::DeploymentStatus>,
     restart: bool,
+    /// Frozen at admission for the params-less restart branch: the platform
+    /// default image the restart rolls the workload onto. `None` = plain
+    /// restart (env missing/blank, or restart carrying url/env which goes
+    /// through the params update path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restart_image: Option<String>,
 }
 impl DeployInput {
     fn encode(&self) -> AppResult<UserAppExecutionInput> {
@@ -307,12 +313,20 @@ impl AppService {
         } else {
             None
         };
+        let restart_image = if restart && previous.is_some() && params.is_none() {
+            crate::runtime::params::platform_restart_image(
+                &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
+            )
+        } else {
+            None
+        };
         Ok(DeployInput {
             version: 1,
             request,
             params,
             previous,
             restart,
+            restart_image,
         })
     }
 
@@ -324,11 +338,12 @@ impl AppService {
         guard: Arc<AppOperationGuard>,
     ) -> AppResult<StartAppResult> {
         let DeployInput {
+            version: _,
             request,
             params,
             previous,
             restart,
-            ..
+            restart_image,
         } = input;
         operation.bind_lease(&guard).await?;
         let context = operation.execution_context();
@@ -458,11 +473,16 @@ impl AppService {
                 operation.authorize_mutation().await?;
                 guard.mark_mutating()?;
                 if restart {
-                    self.runtime.restart_app_target(&target).await
+                    self.runtime
+                        .restart_app_target(&target, restart_image.as_deref())
+                        .await
                 } else {
                     self.runtime.start_app_target(&target).await
                 }
                 .map_err(|error| map_runtime_error("Start captured deployment", error))?;
+                if restart {
+                    self.refresh_pingora_after_restart(app_id).await;
+                }
             }
         }
         // Explicit pg input aligns before the business wait: the management
@@ -543,5 +563,39 @@ impl AppService {
             )
             .await?;
         Ok(result)
+    }
+
+    /// Restart may replace the physical container (Docker recreate on image
+    /// roll) and change its IP; K8s re-registration recomputes the Service
+    /// FQDN (no-op shape). Registration is advisory: a failed status read
+    /// warns instead of failing the already-committed restart.
+    pub(super) async fn refresh_pingora_after_restart(&self, app_id: &str) {
+        let http_ports = self.registered_http_ports(app_id);
+        if http_ports.is_empty() {
+            return;
+        }
+        match self.runtime.get_deployment_status(app_id).await {
+            Ok(Some(status)) => {
+                self.register_pingora_backends(
+                    app_id,
+                    &http_ports,
+                    status.pod_ip.as_deref().unwrap_or_default(),
+                )
+                .await;
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    app_id,
+                    "Post-restart status read found no deployment; pingora backend left unchanged"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    app_id,
+                    %error,
+                    "Post-restart status read failed; pingora backend left unchanged"
+                );
+            }
+        }
     }
 }

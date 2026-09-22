@@ -742,8 +742,12 @@ async fn execute_claimed(
     } else {
         let target = super::app_adoption::capture_bound_app_target(state, &context).await?;
         if record.action == ComputeControlAction::Restart {
-            let mut prepared =
-                serde_json::to_value(state.runtime().prepare_app_compute_start(&target).await?)?;
+            let mut prepared_target = state.runtime().prepare_app_compute_start(&target).await?;
+            // Freeze the platform-default image into the very first checkpoint:
+            // every later stage (including crash resume) replays this frozen
+            // value instead of re-reading the env.
+            prepared_target.restart_image = prod_restart_image();
+            let mut prepared = serde_json::to_value(prepared_target)?;
             if let Some(template) = state.runtime().archive_app_restart(&target).await? {
                 prepared["app_restart_template"] = serde_json::to_value(template)?;
             }
@@ -847,11 +851,12 @@ async fn execute_claimed(
                 fresh = state.runtime().restore_app_restart(&template).await?;
                 *settled = true;
             }
-            let prepared = state.runtime().prepare_app_compute_start(&fresh).await?;
+            let mut prepared = state.runtime().prepare_app_compute_start(&fresh).await?;
             let prior: UserAppComputeStartTarget = serde_json::from_value(target.clone())?;
             prior
                 .verify_same_volumes(&prepared)
                 .map_err(anyhow::Error::msg)?;
+            prepared.restart_image = prior.restart_image.clone();
             let mut fresh = serde_json::to_value(prepared)?;
             // Keep the restart archive reachable from every later stage: an
             // interrupted Starting resume still needs its recovery source.
@@ -959,6 +964,24 @@ async fn execute_claimed(
     Ok(())
 }
 
+/// Restart-path platform image resolution: a missing or blank env degrades to
+/// `None` (plain restart) with a warning — restart availability must not brick
+/// on deployment config gaps (create/update keep their fail-fast contract).
+fn prod_restart_image() -> Option<String> {
+    let resolved = std::env::var("RCODER_RUNTIME_IMAGE_DIGEST")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if resolved.is_none() {
+        tracing::warn!(
+            "RCODER_RUNTIME_IMAGE_DIGEST missing/blank: compute restart keeps the current image"
+        );
+    }
+    resolved
+}
+
 /// Continue a proven stopped restart under the same durable lease. A CAS
 /// selects one starter; losing observers never submit the runtime request.
 pub(crate) async fn resume_restart_start(
@@ -1026,10 +1049,11 @@ pub(crate) async fn resume_restart_start(
             // succeed before any new business instance can start.
             target = state.runtime().restore_app_restart(&template).await?;
         }
-        let prepared = state.runtime().prepare_app_compute_start(&target).await?;
+        let mut prepared = state.runtime().prepare_app_compute_start(&target).await?;
         prior
             .verify_same_volumes(&prepared)
             .map_err(anyhow::Error::msg)?;
+        prepared.restart_image = prior.restart_image.clone();
         prepared
     };
     ensure!(
