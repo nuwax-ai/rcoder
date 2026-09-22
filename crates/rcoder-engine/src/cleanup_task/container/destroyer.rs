@@ -113,8 +113,15 @@ impl ContainerDestroyer {
 
         // 2. 清理关联资源 (gRPC 连接池旧连接 + Pingora 后端)
         // 清理 gRPC 连接池中的旧连接（避免复用已失效的 TCP 连接）。
-        // Docker 环境 container_ip 为空时跳过(K8s 用 FQDN 不依赖 ip)。
-        if !self.is_kubernetes && container_ip.is_empty() {
+        // 容器形态：Docker 的 container_ip 为空则无法构造 grpc_addr，跳过。
+        // deploy-host：build_grpc_addr 经注册表按 container_name 查表，不依赖
+        // IP——空 IP 也要继续清理（守卫豁免），否则 grpc pool/SSE 残留。
+        #[cfg(feature = "deploy-host")]
+        let empty_ip_unusable =
+            !self.is_kubernetes && container_ip.is_empty() && !shared_types::is_deploy_host();
+        #[cfg(not(feature = "deploy-host"))]
+        let empty_ip_unusable = !self.is_kubernetes && container_ip.is_empty();
+        if empty_ip_unusable {
             debug!("[destroyer] Container IP is empty, skipping gRPC cleanup");
             return Ok(());
         }

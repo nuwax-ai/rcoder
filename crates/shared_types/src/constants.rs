@@ -303,6 +303,36 @@ pub fn build_container_port_addr(
     format!("{}:{}", backend_addr, port)
 }
 
+/// 服务 bind 地址单一事实源：env `RCODER_BIND_HOST` 永远优先；deploy-host
+/// 默认 127.0.0.1（宿主机安全边界），其余形态 0.0.0.0。listener（http-server
+/// server.rs）与本机自拨（rcoder-proxy dispatch HealthCheck）共用，保证
+/// 自拨永远打到实际监听地址。
+pub fn service_bind_host() -> String {
+    if let Some(explicit) = std::env::var("RCODER_BIND_HOST")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        return explicit;
+    }
+    #[cfg(feature = "deploy-host")]
+    if is_deploy_host() {
+        return "127.0.0.1".to_owned();
+    }
+    "0.0.0.0".to_owned()
+}
+
+/// 本机自拨目标：bind 地址为通配（0.0.0.0/::）时回落 loopback——通配地址
+/// 不能作为 connect 目标；其余（含 deploy-host 默认 127.0.0.1）原样返回。
+pub fn local_probe_host() -> String {
+    let bind = service_bind_host();
+    if bind == "0.0.0.0" || bind == "::" || bind.is_empty() {
+        "127.0.0.1".to_owned()
+    } else {
+        bind
+    }
+}
+
 // === gRPC 超时配置 ===
 
 /// gRPC 连接超时（秒）

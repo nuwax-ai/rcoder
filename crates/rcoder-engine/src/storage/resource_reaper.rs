@@ -175,7 +175,14 @@ impl ResourceReaper {
         // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）；
         // Docker 模式下 container_ip 为空时无法构造 grpc_addr，跳过 gRPC/SSE 清理
         // （K8s 用 FQDN，不受影响；无法反查容器→addr 映射，只能告警提示可能残留）
-        if !self.is_kubernetes && req.container_ip.is_empty() {
+        // deploy-host：grpc_addr 经注册表按 container_name 查表不依赖 IP，
+        // 空 IP 继续清理（守卫豁免）；容器形态维持原跳过语义
+        #[cfg(feature = "deploy-host")]
+        let empty_ip_unusable =
+            !self.is_kubernetes && req.container_ip.is_empty() && !shared_types::is_deploy_host();
+        #[cfg(not(feature = "deploy-host"))]
+        let empty_ip_unusable = !self.is_kubernetes && req.container_ip.is_empty();
+        if empty_ip_unusable {
             warn!(
                 "[REAPER] Container IP is empty, skipping gRPC/SSE cleanup (no grpc_addr available, SSE streams for {} may linger)",
                 req.container_name

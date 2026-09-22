@@ -10,7 +10,7 @@ default = []
 # 由 rcoder 的 kubernetes feature 转发开启，保持双后端编译期同源。
 kubernetes = []
 # deploy-host 宿主机运行形态（锁根/内网域分支）
-deploy-host = ["shared_types/deploy-host"]
+deploy-host = ["shared_types/deploy-host", "docker_manager/deploy-host"]
 
 [lints]
 workspace = true

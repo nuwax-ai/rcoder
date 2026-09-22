@@ -514,4 +514,108 @@ mod tests {
             None
         );
     }
+
+    // ── 修订表达式 / 短 OID（G-A1/G-A2/G-C2 反例；修复前必挂） ──────────────────
+
+    #[test]
+    fn revision_expressions_resolve_relative_to_parents() {
+        // G-A1: Java 契约 (GitController.fileContent) 明文 ref 可取 HEAD~1。
+        let t = TestRepo::new();
+        let c1 = commit_file(&t, "a.txt", "one", "c1");
+        commit_file(&t, "a.txt", "two", "c2");
+        let repo = t.open();
+
+        let content = file_content_at_ref(&repo, "HEAD~1", "a.txt", 1024)
+            .expect("HEAD~1 必须解析到父提交而非静默空");
+        assert_eq!(content.as_deref(), Some("one"), "HEAD~1 应取父提交内容");
+
+        // git 语法: 裸 `~`/`^` 等价于 `~1`/`^1`
+        let bare =
+            file_content_at_ref(&repo, "HEAD~", "a.txt", 1024).expect("HEAD~ 必须等价 HEAD~1");
+        assert_eq!(bare.as_deref(), Some("one"));
+        let caret =
+            file_content_at_ref(&repo, "HEAD^", "a.txt", 1024).expect("HEAD^ 必须等价 HEAD~1");
+        assert_eq!(caret.as_deref(), Some("one"));
+
+        let log = log_history(&repo, 50, 0, Some("HEAD~1"), None).expect("log HEAD~1 应可解析");
+        assert_eq!(
+            log.first().map(|c| c.hash.as_str()),
+            Some(c1.as_str()),
+            "log 应自父提交开始 walk: {log:?}"
+        );
+
+        // 越界 parent = 缺席 → 空数据契约（不报错）
+        let oob = log_history(&repo, 50, 0, Some("HEAD~99"), None)
+            .expect("HEAD~99 越界必须按缺席返回空列表");
+        assert!(oob.is_empty(), "越界 parent: {oob:?}");
+        // 单亲链上 ^2 越界同为缺席
+        let oob_caret = log_history(&repo, 50, 0, Some("HEAD^2"), None)
+            .expect("HEAD^2 于单亲链必须按缺席返回空列表");
+        assert!(oob_caret.is_empty(), "越界 nth-parent: {oob_caret:?}");
+    }
+
+    #[test]
+    fn short_oid_resolves_and_missing_is_absent() {
+        // G-A2: 短 hash 前缀解析（旧 rev_parse_single 能力）。
+        let t = TestRepo::new();
+        let oid = commit_file(&t, "a.txt", "1", "c1");
+        let repo = t.open();
+        let short = &oid[..7];
+        let r = log_history(&repo, 50, 0, Some(short), None).expect("短 hash 应命中");
+        assert!(!r.is_empty(), "短 hash walk 必须非空: {r:?}");
+        assert_eq!(r.first().map(|c| c.hash.as_str()), Some(oid.as_str()));
+
+        let missing = "0000000";
+        let r = log_history(&repo, 50, 0, Some(missing), None)
+            .expect("不存在的短前缀必须按缺席返回空列表");
+        assert!(r.is_empty(), "不存在前缀: {r:?}");
+    }
+
+    #[test]
+    fn ambiguous_object_prefix_is_explicit_error() {
+        // G-A2: 歧义前缀必须显式报错，不得静默取第一个。
+        let t = TestRepo::new();
+        let repo = t.open();
+        // 暴力构造两个共享 4-hex 前缀的 blob（16-bit 生日碰撞期望 ~300 次）
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut found: Option<(String, String, String)> = None;
+        for i in 0..200_000_u32 {
+            let content = format!("ambiguous-{i}");
+            let id = gix::objs::compute_hash(
+                repo.object_hash(),
+                gix::objs::Kind::Blob,
+                content.as_bytes(),
+            )
+            .expect("hash blob");
+            let p4 = id.to_hex().to_string()[..4].to_string();
+            if let Some(prev) = seen.get(&p4) {
+                found = Some((p4, prev.clone(), content));
+                break;
+            }
+            seen.insert(p4, content);
+        }
+        let (prefix, a, b) = found.expect("暴力构造 4-hex 碰撞对");
+        repo.write_blob(a.as_bytes()).expect("write blob a");
+        repo.write_blob(b.as_bytes()).expect("write blob b");
+
+        let err = resolve_rev(&repo, &prefix).expect_err("歧义前缀必须显式报错");
+        assert!(
+            matches!(err, AppError::Validation(..)),
+            "歧义前缀应是 Validation: {err:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_revision_expression_is_explicit_error() {
+        // G-C2: 坏修订表达式显式报错（当前静默空的坏输入, 拍板允许的新增显式错误面）。
+        let t = TestRepo::new();
+        let repo = t.open();
+        for spec in ["HEAD~x", "HEAD^2x", "~1", "HEAD~2~y"] {
+            let err = resolve_rev(&repo, spec).expect_err("坏表达式必须显式报错");
+            assert!(
+                matches!(err, AppError::Validation(..)),
+                "{spec} 应是 Validation: {err:?}"
+            );
+        }
+    }
 }

@@ -256,7 +256,7 @@ async fn cache_clean_userapp_dev(
         shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
     );
     #[cfg(not(feature = "deploy-host"))]
-    let root = PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
+    let root = std::path::PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
     let cache_dir = root
         .join("dev")
         .join(shared_types::paths::USERAPP_STORAGE_NAMESPACE)

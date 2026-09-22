@@ -72,8 +72,14 @@ pub fn start_container_sync_task(
 
                                 // 清理关联资源
                                 for container in removed {
-                                    // 清理 gRPC 连接池
-                                    if !container.container_ip.is_empty() {
+                                    // 清理 gRPC 连接池。deploy-host 下地址经
+                                    // 注册表按 name 查表，空 IP 也清理（豁免外层守卫）
+                                    #[cfg(feature = "deploy-host")]
+                                    let cleanable =
+                                        !container.container_ip.is_empty() || shared_types::is_deploy_host();
+                                    #[cfg(not(feature = "deploy-host"))]
+                                    let cleanable = !container.container_ip.is_empty();
+                                    if cleanable {
                                         #[cfg(feature = "deploy-host")]
                                         let grpc_addr = if shared_types::is_deploy_host() {
                                             shared_types::published::resolve_published_addr(

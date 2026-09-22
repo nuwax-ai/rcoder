@@ -269,7 +269,7 @@ impl PortProxy {
 
                 // 返回 Axum 服务的 peer
                 let peer = Box::new(HttpPeer::new(
-                    ("127.0.0.1", target_port),
+                    (shared_types::local_probe_host(), target_port),
                     false,
                     "".to_string(),
                 ));

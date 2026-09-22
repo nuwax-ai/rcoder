@@ -261,11 +261,22 @@ pub fn deploy_budget_from_env() -> DeployBudgetConfig {
 pub fn default_operation_lock_root() -> String {
     #[cfg(feature = "deploy-host")]
     {
-        std::env::var("RCODER_OPERATION_LOCK_ROOT").unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(|home| format!("{home}/.rcoder/workspace/userapp"))
-                .unwrap_or_else(|_| shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT.to_owned())
-        })
+        // 推导链：显式 env > PATH_MAP 映射（保持"锁根与数据根同树"——
+        // map 覆盖 /app/userapp-workspace 后两者同变）> ~/.rcoder 默认
+        if let Ok(explicit) = std::env::var("RCODER_OPERATION_LOCK_ROOT") {
+            return explicit;
+        }
+        if let Ok(map) = docker_manager::path::host_map::resolve_map()
+            && let Some(host_root) = docker_manager::path::host_map::resolve_host_path(
+                &map,
+                std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT),
+            )
+        {
+            return host_root.to_string_lossy().into_owned();
+        }
+        std::env::var("HOME")
+            .map(|home| format!("{home}/.rcoder/workspace/userapp"))
+            .unwrap_or_else(|_| shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT.to_owned())
     }
     #[cfg(not(feature = "deploy-host"))]
     {
