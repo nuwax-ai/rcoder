@@ -153,6 +153,10 @@ impl UserAppDeploymentRuntime for MockRuntime {
         if panic_nth > 0 && n == panic_nth {
             panic!("mock scale panic #{}", n);
         }
+        // 对齐真实运行时的注解回写（k8s_app_lifecycle start/stop_captured_target）：
+        // start（scale-up）把 wake-on-traffic 写回 true（手动停档随之解除），
+        // stop（scale 0）写 false——观察循环按注解识别"启动中途被 stop"。
+        *self.wake_on_traffic.lock().unwrap() = Some(_replicas > 0);
         if self.running_after_scale {
             *self.phase.lock().unwrap() = "Running".to_string();
         }
@@ -477,6 +481,40 @@ async fn cached_running_state_cannot_bypass_a_remote_manual_stop() {
     assert!(registry.waking.is_empty());
 }
 
+/// 拍板 2026-09-22（app 177 事故类）：pod/ensure 是用户显式动作，**可以**
+/// 拉起显式停止的应用——平台不做业务限制；被动流量唤醒仍不得复活
+/// （`cached_running_state_cannot_bypass_a_remote_manual_stop` 钉住）。
+/// 修复前必红：显式入口与流量入口同语义 → Failed("intentionally stopped")。
+#[tokio::test]
+async fn explicit_ensure_starts_intentionally_stopped_app() {
+    let runtime = Arc::new(MockRuntime::new(true));
+    *runtime.phase.lock().expect("phase") = "Stopped".into();
+    *runtime.wake_on_traffic.lock().expect("policy") = Some(false);
+    let registry = Arc::new(AppActivityRegistry::new(Duration::from_secs(2)));
+    registry.set_runtime(runtime.clone());
+    let _fixture = attach_coordinator(&registry, runtime.clone(), "manualstart").await;
+
+    // 流量语义回归锚：同一状态下被动唤醒仍被拒、零 scale。
+    assert!(matches!(
+        registry.ensure_running("manualstart").await,
+        WakeOutcome::Failed(message) if message.contains("intentionally stopped")
+    ));
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+
+    // 显式语义：拉起并就绪。
+    let outcome = registry.ensure_running_explicit("manualstart").await;
+    assert!(
+        matches!(outcome, WakeOutcome::Ready | WakeOutcome::AlreadyRunning),
+        "显式 ensure 必须拉起显式停止的应用: {outcome:?}"
+    );
+    assert!(
+        runtime.scale_calls.load(Ordering::SeqCst) >= 1,
+        "显式 ensure 必须发生 scale up"
+    );
+    assert!(registry.waking.is_empty());
+    assert!(!registry.is_wake_blocked("manualstart"), "手动停档必须解除");
+}
+
 #[tokio::test]
 async fn cached_running_state_requires_a_durable_application_identity() {
     let runtime = Arc::new(MockRuntime::new(true));
@@ -612,7 +650,10 @@ fn loaded_activity_never_restores_wake_policy_or_regresses_epoch() {
 async fn guard_broadcasts_failed_on_drop_when_leader_did_not_finish() {
     let map: Arc<DashMap<String, Arc<WakeHandle>>> = Arc::new(DashMap::new());
     let (tx, _) = watch::channel(None::<WakeOutcome>);
-    let handle = Arc::new(WakeHandle { tx });
+    let handle = Arc::new(WakeHandle {
+        tx,
+        explicit: AtomicBool::new(false),
+    });
     map.insert("appg".to_string(), handle.clone());
 
     // follower 先 subscribe(模拟并发请求 join 到 leader)
@@ -671,7 +712,10 @@ fn completed_wake_is_retained_for_follower_that_has_not_subscribed_yet() {
         let map = Arc::new(DashMap::new());
         let (tx, initial_rx) = watch::channel(None::<WakeOutcome>);
         drop(initial_rx);
-        let handle = Arc::new(WakeHandle { tx });
+        let handle = Arc::new(WakeHandle {
+            tx,
+            explicit: AtomicBool::new(false),
+        });
         map.insert("latefollower".into(), handle.clone());
         // The follower selected its role but has not subscribed yet.
         let follower_handle = handle.clone();
@@ -694,7 +738,10 @@ fn deletion_outcome_is_retained_for_a_late_wake_subscriber() {
     let registry = AppActivityRegistry::new(Duration::from_secs(2));
     let (tx, receiver) = watch::channel(None);
     drop(receiver);
-    let handle = Arc::new(WakeHandle { tx });
+    let handle = Arc::new(WakeHandle {
+        tx,
+        explicit: AtomicBool::new(false),
+    });
     registry
         .waking
         .insert("deletedlatesubscriber".into(), handle.clone());

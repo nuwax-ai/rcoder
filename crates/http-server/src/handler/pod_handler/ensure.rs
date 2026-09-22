@@ -197,7 +197,10 @@ async fn ensure_userapp_prod(
         }
     }
     use shared_types::AppWakeControl;
-    let outcome = state.activity.ensure_running(&app_id).await;
+    // 显式入口（拍板 2026-09-22）：pod/ensure 是用户打开应用页的显式动作，
+    // 可拉起显式停止的应用（平台不做业务限制）；rcoder-proxy 的被动流量
+    // 唤醒仍走 ensure_running，不得复活手动停档。
+    let outcome = state.activity.ensure_running_explicit(&app_id).await;
     match outcome {
         shared_types::WakeOutcome::Ready => Ok(HttpResult::success(EnsurePodResponse {
             created: true,

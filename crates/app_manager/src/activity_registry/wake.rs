@@ -54,6 +54,10 @@ impl RemoteState {
 /// 进行中的唤醒句柄(leader 持有 `tx`,follower `subscribe` 后等结果)
 pub(super) struct WakeHandle {
     pub(super) tx: watch::Sender<Option<WakeOutcome>>,
+    /// 显式升级位：显式调用方（pod/ensure）加入在途流量 flight 时置位；
+    /// leader 在策略判定点读取。晚于判定点到达时本次仍按流量语义结束，
+    /// 下一次 ensure 以 leader 身份带显式语义重试（UI 本就重试）。
+    pub(super) explicit: std::sync::atomic::AtomicBool,
 }
 
 /// RAII 守卫:leader 路径持有。drop 时(含 panic unwind)做两件事:
@@ -157,11 +161,14 @@ impl AppActivityRegistry {
 
     /// The registry only merges callers. Durable admission, runtime identity and
     /// wake policy are checked by the lifecycle coordinator under its operation lock.
-    async fn wake_leader(&self, app_id: &str) -> WakeOutcome {
+    async fn wake_leader(&self, app_id: &str, explicit: bool) -> WakeOutcome {
         let Some(service) = self.coordinator.get().and_then(std::sync::Weak::upgrade) else {
             return WakeOutcome::Failed("Activity lifecycle coordinator is unavailable".into());
         };
-        match service.wake_app_on_traffic(app_id, self.wake_timeout).await {
+        match service
+            .wake_app_on_traffic(app_id, self.wake_timeout, explicit)
+            .await
+        {
             Ok(outcome) => outcome,
             Err(crate::models::AppOperationError::ConflictBlocked { message, blocker }) => {
                 WakeOutcome::Blocked { message, blocker }
@@ -178,7 +185,8 @@ impl AppActivityRegistry {
             handle: handle.clone(),
             outcome: None,
         };
-        let r = self.wake_leader(app_id).await;
+        let explicit = handle.explicit.load(std::sync::atomic::Ordering::Acquire);
+        let r = self.wake_leader(app_id, explicit).await;
         // 写入 outcome；guard 在函数返回/panic unwind 时 drop → 广播给 follower + 移除 waking 条目。
         guard.outcome = Some(r.clone());
         r
@@ -224,7 +232,20 @@ impl AppWakeControl for AppActivityRegistry {
     }
 
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome {
-        // 回收过渡期的请求必须等 scale0 完成，再由唤醒 single-flight scale1。
+        self.ensure_running_with_policy(app_id, false).await
+    }
+
+    /// 显式入口（pod/ensure）：可拉起显式停止的应用（拍板 2026-09-22）。
+    async fn ensure_running_explicit(&self, app_id: &str) -> WakeOutcome {
+        self.ensure_running_with_policy(app_id, true).await
+    }
+}
+
+impl AppActivityRegistry {
+    /// 单一入口：`explicit=false` 被动流量语义（不得复活手动停档）；
+    /// `explicit=true` 用户显式动作语义。
+    async fn ensure_running_with_policy(&self, app_id: &str, explicit: bool) -> WakeOutcome {
+        // 回收过渡期的请求必须等 scale0 完成,再由唤醒 single-flight scale1。
         self.wait_for_recycle_transition(app_id).await;
         // Local stop flags may outlive an operation completed by another replica.
         // The coordinator validates durable state and live policy before mutation.
@@ -247,13 +268,25 @@ impl AppWakeControl for AppActivityRegistry {
             dashmap::mapref::entry::Entry::Occupied(e) => WakeRole::Follower(e.get().clone()),
             dashmap::mapref::entry::Entry::Vacant(e) => {
                 let (tx, _rx) = watch::channel(None::<WakeOutcome>);
-                let handle = Arc::new(WakeHandle { tx });
+                let handle = Arc::new(WakeHandle {
+                    tx,
+                    explicit: std::sync::atomic::AtomicBool::new(explicit),
+                });
                 e.insert(handle.clone());
                 WakeRole::Leader(handle)
             }
         };
         match role {
-            WakeRole::Follower(handle) => self.join_as_follower(handle).await,
+            WakeRole::Follower(handle) => {
+                if explicit {
+                    // 尽力升级在途 flight 的语义；leader 已过判定点则本次按
+                    // 流量语义结束，下一次 ensure 以 leader 身份带显式语义。
+                    handle
+                        .explicit
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                self.join_as_follower(handle).await
+            }
             WakeRole::Leader(handle) => self.become_leader(app_id, handle).await,
         }
     }

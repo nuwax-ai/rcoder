@@ -55,6 +55,16 @@ pub trait AppWakeControl: Send + Sync {
     /// share the same bounded wake result.
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome;
 
+    /// Explicit variant of [`Self::ensure_running`]: the caller acts on a
+    /// user-driven control action (pod/ensure opening an app page) and MAY
+    /// start an intentionally stopped application — the platform imposes no
+    /// business-level block there. Passive traffic callers keep
+    /// `ensure_running` and never override a manual stop. The default falls
+    /// back to traffic semantics for implementors that do not distinguish.
+    async fn ensure_running_explicit(&self, app_id: &str) -> WakeOutcome {
+        self.ensure_running(app_id).await
+    }
+
     /// 内存无 stopped 记录时的兜底判定（多副本：其他副本 stop 后本副本内存
     /// 不知情；或本副本重启后未覆盖的场景）。查集群真实 replicas（实现方以
     /// TTL 缓存节流）。默认 `false` = 无兜底（行为同旧，仅内存表判定）。

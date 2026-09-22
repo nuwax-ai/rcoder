@@ -11,10 +11,15 @@ use crate::service::{AppService, OwnedOperation};
 use crate::utils::{map_runtime_error, validate_app_id};
 
 impl AppService {
+    /// `explicit=true`：调用方是用户显式动作（pod/ensure 打开应用页），
+    /// 拍板 2026-09-22 —— 可以拉起显式停止的应用（start 会把
+    /// wake-on-traffic 注解写回 true，手动停档随之解除）；被动流量唤醒
+    /// （`explicit=false`，rcoder-proxy/文件转发）仍不得复活手动停档。
     pub(crate) async fn wake_app_on_traffic(
         &self,
         app_id: &str,
         budget: Duration,
+        explicit: bool,
     ) -> AppResult<WakeOutcome> {
         validate_app_id(app_id)?;
         let deadline = Instant::now() + budget;
@@ -40,9 +45,15 @@ impl AppService {
                 .await?;
             let status = self.fetch_runtime_status_or_err(app_id).await?;
             if status.wake_on_traffic == Some(false) {
-                return Err(AppOperationError::InvalidState(
-                    "Application is intentionally stopped".into(),
-                ));
+                if !explicit {
+                    return Err(AppOperationError::InvalidState(
+                        "Application is intentionally stopped".into(),
+                    ));
+                }
+                tracing::info!(
+                    app_id,
+                    "Explicit ensure starts an intentionally stopped application"
+                );
             }
             Ok::<_, AppOperationError>((guard, identity, status))
         };
