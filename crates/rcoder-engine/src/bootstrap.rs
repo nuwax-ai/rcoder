@@ -122,7 +122,7 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
         .map_err(|e| anyhow::anyhow!("Failed to create projects directory: {}", e))?;
     info!("Projects directory: {:?}", config.projects_dir);
 
-    let config_file_path = std::path::PathBuf::from(crate::config::CONFIG_FILE);
+    let config_file_path = crate::config::config_file_path();
     let config_watcher_enabled = tokio::fs::try_exists(&config_file_path)
         .await
         .unwrap_or(false);

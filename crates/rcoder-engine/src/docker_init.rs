@@ -24,6 +24,7 @@ pub async fn init_path_resolver(runtime_type: RuntimeType) -> anyhow::Result<()>
                 host_root.display()
             );
         }
+        rehydrate_deploy_host_docker_ports().await;
         return Ok(());
     }
 
@@ -385,6 +386,14 @@ async fn rehydrate_deploy_host_node_ports() -> anyhow::Result<()> {
         if map.is_empty() {
             continue;
         }
+        // 双键对齐运行期注册（k8s_service.rs：identifier + 完整 STS 名）——
+        // 重启后 get_container_info 的查询键是 pod_info.container_name
+        // （STS 完整名），单键会让首次拨号回退容器端口
+        if let Some(svc_name) = svc.metadata.name.as_deref()
+            && let Some(sts_name) = svc_name.strip_suffix("-svc")
+        {
+            shared_types::published::register(sts_name, map.clone());
+        }
         shared_types::published::register(&identifier, map);
         registered += 1;
     }
@@ -392,4 +401,52 @@ async fn rehydrate_deploy_host_node_ports() -> anyhow::Result<()> {
         "[deploy-host] K8s NodePort rehydrate: {registered} agent service(s) registered"
     );
     Ok(())
+}
+
+/// deploy-host Docker 重启回填：list 全部容器，有发布端口的经
+/// register_from_inspect 双键登记（K8s 侧 rehydrate 的 Docker 对应——
+/// 重启后注册表为空则存量 agent 容器拨号全部回退 loopback:容器端口）。
+#[cfg(feature = "deploy-host")]
+async fn rehydrate_deploy_host_docker_ports() {
+    use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions};
+
+    let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+        tracing::warn!("[deploy-host] Docker rehydrate: connect failed");
+        return;
+    };
+    let Ok(containers) = docker.list_containers(None::<ListContainersOptions>).await else {
+        tracing::warn!("[deploy-host] Docker rehydrate: list failed");
+        return;
+    };
+    let mut registered = 0usize;
+    for container in &containers {
+        let Some(inspect_id) = container.id.as_deref() else {
+            continue;
+        };
+        let Ok(inspect) = docker
+            .inspect_container(inspect_id, None::<InspectContainerOptions>)
+            .await
+        else {
+            continue;
+        };
+        let key = inspect
+            .name
+            .as_deref()
+            .map(|name| name.trim_start_matches('/').to_owned())
+            .unwrap_or_else(|| inspect_id.to_owned());
+        let ports = inspect
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.ports.clone());
+        if docker_manager::deploy_host_ports::register_from_inspect(
+            &key,
+            inspect.name.as_deref(),
+            &ports,
+        )
+        .is_ok()
+        {
+            registered += 1;
+        }
+    }
+    tracing::info!("[deploy-host] Docker rehydrate: {registered} container(s) registered");
 }

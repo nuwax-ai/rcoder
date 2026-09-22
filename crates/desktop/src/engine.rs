@@ -20,8 +20,19 @@ pub fn tcp_health_probe(port: u16) -> Result<(), String> {
     stream
         .write_all(format!("GET /health HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes())
         .map_err(|e| e.to_string())?;
+    // 循环读至 \r\n 或缓冲满（TCP 分段下单次 read 可能截断状态行）
     let mut buf = [0u8; 128];
-    let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
+    let mut n = 0usize;
+    while n < buf.len() {
+        let read = stream.read(&mut buf[n..]).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        n += read;
+        if buf[..n].windows(2).any(|w| w == b"\r\n") {
+            break;
+        }
+    }
     let head = String::from_utf8_lossy(&buf[..n]);
     if head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200") {
         Ok(())

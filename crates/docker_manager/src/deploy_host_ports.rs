@@ -26,6 +26,12 @@ pub const WS_TERMINAL_PORT: u16 = 17681;
 pub const FILE_SERVER_PORT: u16 = shared_types::AGENT_FILE_SERVER_PORT;
 /// dbx Web GUI
 pub const DBX_PORT: u16 = 4224;
+/// audio WebSocket（computer 数据面）
+pub const AUDIO_WS_PORT: u16 = 6089;
+/// audio HTTP（computer 数据面）
+pub const AUDIO_HTTP_PORT: u16 = 6090;
+/// runtime ttyd 本体端口（dev_terminal runtime 会话直拨）
+pub const TTYD_PORT: u16 = 7681;
 /// app-cli 管理面（UserappBuilder 族）
 pub const APP_CLI_ADMIN_PORT: u16 = shared_types::APP_CLI_ADMIN_PORT;
 /// UserApp 应用入口（UserappBuilder 族）
@@ -42,9 +48,19 @@ pub fn published_ports_for(service_type: &ServiceType) -> Vec<u16> {
         WS_TERMINAL_PORT,
         FILE_SERVER_PORT,
         DBX_PORT,
+        AUDIO_WS_PORT,
+        AUDIO_HTTP_PORT,
     ];
-    if matches!(service_type, ServiceType::UserappBuilder) {
-        ports.extend_from_slice(&[APP_CLI_ADMIN_PORT, APP_ENTRY_PORT, IME_PORT]);
+    match service_type {
+        ServiceType::UserappBuilder => {
+            ports.extend_from_slice(&[APP_CLI_ADMIN_PORT, APP_ENTRY_PORT, IME_PORT]);
+        }
+        // computer 族也拨 IME（ime.rs 经 vnc_backends 键 + IME_PORT）与
+        // runtime ttyd（7681，dev_terminal runtime 会话）
+        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+            ports.extend_from_slice(&[IME_PORT, TTYD_PORT]);
+        }
+        _ => {}
     }
     ports
 }

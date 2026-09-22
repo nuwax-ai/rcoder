@@ -251,7 +251,13 @@ async fn cache_clean_userapp_dev(
     app_id: &str,
     request: &CacheCleanRequest,
 ) -> Result<HttpResult<CacheCleanResponse>, AppError> {
-    let cache_dir = Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+    #[cfg(feature = "deploy-host")]
+    let root = rcoder_engine::utils::workspace_root_path(
+        shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
+    );
+    #[cfg(not(feature = "deploy-host"))]
+    let root = PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
+    let cache_dir = root
         .join("dev")
         .join(shared_types::paths::USERAPP_STORAGE_NAMESPACE)
         .join(app_id)

@@ -148,11 +148,10 @@ pub async fn handle_port_proxy_upstream(
         ctx.preview_internal_token = Some(deps.internal_token.clone());
         ctx.preview_origin_port = Some(target_port);
         ctx.target_port = Some(peer_port);
-        let mut peer = HttpPeer::new(
-            super::super::upstream::dial_peer(&host_ip, peer_port),
-            false,
-            "".to_string(),
-        );
+        // host_ip 是协调器解析出的对等副本 Pod IP（IP 字面量，非 agent 注册
+        // 表键）——直连不经 dial_peer（误接会把 Pod IP 当键查表回退
+        // 127.0.0.1，preview_forward_tests 实测暴露）
+        let mut peer = HttpPeer::new((host_ip.as_str(), peer_port), false, "".to_string());
         peer.options.connection_timeout = Some(Duration::from_secs(10));
         peer.options.read_timeout = None;
         peer.options.write_timeout = None;

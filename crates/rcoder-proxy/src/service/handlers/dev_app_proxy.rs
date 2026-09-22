@@ -111,7 +111,7 @@ pub async fn handle_dev_app_upstream(
 
     // 与 prod app 代理同款 peer（长连接，支持 WebSocket / HMR）
     let mut peer = HttpPeer::new(
-        (dev_container_ip.as_str(), shared_types::APP_ENTRY_PORT),
+        super::super::upstream::dial_peer(&dev_container_ip, shared_types::APP_ENTRY_PORT),
         false,
         "".to_string(),
     );

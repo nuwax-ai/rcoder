@@ -155,6 +155,8 @@ help:
 	@echo "  make test-doc       - workspace + app-cli 文档测试"
 	@echo "  make test-all       - 串行运行 test + test-app-cli + test-doc（不含 E2E）"
 	@echo "  make test-e2e       - 本地 Compose 核心业务回归，防止逻辑偏移"
+	@echo "  make test-e2e-host     - deploy-host 宿主机 Docker 形态 e2e（需 make dev-host）"
+	@echo "  make test-e2e-host-k8s - deploy-host 宿主机 K8s 形态 e2e（需 make dev-host-k8s）"
 	@echo "  参数: TEST_FEATURES= 验证默认 features；NEXTEST_ARGS='-p rcoder' 聚焦 Rust 测试"
 	@echo ""
 	@echo "🔍 质量检查："

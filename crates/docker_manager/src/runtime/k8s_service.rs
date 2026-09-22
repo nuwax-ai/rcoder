@@ -476,8 +476,14 @@ impl K8sServiceOps for KubernetesRuntime {
                         "[K8S] Service {} patched to converge expected ports (was missing some)",
                         svc_name
                     );
+                    // deploy-host：patch 新增端口的 nodePort 由 apiserver 异步分配，
+                    // patch 前的 existing 拿不到——re-get 后注册（复用下方轮询）
                     #[cfg(feature = "deploy-host")]
-                    register_service_node_ports(identifier, &existing);
+                    if shared_types::is_deploy_host() {
+                        if let Ok(refetched) = services.get(&svc_name).await {
+                            register_service_node_ports(identifier, &refetched);
+                        }
+                    }
                     return Ok(());
                 }
                 debug!("[K8S] Service {} already exists", svc_name);
@@ -547,9 +553,12 @@ impl K8sServiceOps for KubernetesRuntime {
         let svc_name = self.agent_service_name(identifier, service_type)?;
         let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
 
-        // deploy-host：Service 删除同步注销发布端口注册表（键 = identifier）
+        // deploy-host：Service 删除同步注销发布端口注册表（双键对齐注册侧）
         #[cfg(feature = "deploy-host")]
         if shared_types::is_deploy_host() {
+            if let Some(sts_name) = svc_name.strip_suffix("-svc") {
+                shared_types::published::unregister(sts_name);
+            }
             shared_types::published::unregister(identifier);
         }
         match services.delete(&svc_name, &DeleteParams::default()).await {

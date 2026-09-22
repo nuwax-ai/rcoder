@@ -360,7 +360,13 @@ async fn remove_if_present(path: &std::path::Path) -> Result<(), String> {
     }
 }
 async fn remove_bind_directories(app_id: &str) -> Result<(), String> {
-    let anchor = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
+    // deploy-host：容器常量锚点在宿主机不存在（bind 源经 host_map 映射创建），
+    // 清理须走同一映射出口，否则 read_dir NotFound 被吞 → dev bind 目录泄漏
+    #[cfg(feature = "deploy-host")]
+    let anchor =
+        crate::utils::workspace_root_path(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
+    #[cfg(not(feature = "deploy-host"))]
+    let anchor = std::path::PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
     match tokio::fs::read_dir(anchor.join("dev")).await {
         Ok(mut entries) => {
             while let Some(user) = entries

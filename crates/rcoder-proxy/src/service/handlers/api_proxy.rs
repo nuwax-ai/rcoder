@@ -255,7 +255,9 @@ pub async fn handle_api_proxy_upstream(
     metrics.inc_active();
 
     // 4.1 记录上游信息到 ctx（用于 response_filter 打印协议）
-    ctx.upstream_host = Some(super::super::upstream::dial_addr(host, port));
+    // ctx 仅日志/追踪记录：外部 API 域名不经注册表解析（dial_addr 只用于
+    // 注册表键），实际 peer 构造在下方直拼——原样记录避免误解析+噪声 warn
+    ctx.upstream_host = Some(format!("{host}:{port}"));
     ctx.use_tls = use_tls;
 
     // 5. 创建真实 API 端点的 HttpPeer

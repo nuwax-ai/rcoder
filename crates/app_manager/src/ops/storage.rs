@@ -9,6 +9,17 @@
 //!   开发容器常驻，"重置开发工作区"语义）；`destroy` = UserappDevCleanup 四步
 //!   回收整个开发环境（容器+PVC+目录+注册），不动 metadata。
 
+/// deploy-host：userapp 根经容器名键映射出口（与引擎 workspace_root_path 同语义，
+/// app_manager 不依赖 rcoder-engine，就地实现）。
+#[cfg(feature = "deploy-host")]
+fn app_manager_utils_host_root() -> std::path::PathBuf {
+    // 直接读 host_map 同源 env/默认表（避免跨 crate 依赖）：默认 ~/.rcoder
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::env::var("RCODER_OPERATION_LOCK_ROOT")
+        .unwrap_or_else(|_| format!("{home}/.rcoder/workspace/userapp"))
+        .into()
+}
+
 use tracing::{info, warn};
 
 use shared_types::ServiceType;
@@ -144,7 +155,12 @@ impl crate::service::AppService {
     async fn app_prod_dirs(&self, app_id: &str) -> AppResult<[std::path::PathBuf; 4]> {
         Ok(
             shared_types::paths::userapp_prod_subpaths(app_id).map(|sub| {
-                std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(sub)
+                #[cfg(feature = "deploy-host")]
+                let root = app_manager_utils_host_root();
+                #[cfg(not(feature = "deploy-host"))]
+                let root =
+                    std::path::PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
+                root.join(sub)
             }),
         )
     }
@@ -154,7 +170,12 @@ impl crate::service::AppService {
     async fn app_dev_dirs(&self, app_id: &str) -> AppResult<[std::path::PathBuf; 4]> {
         Ok(
             shared_types::paths::userapp_dev_subpaths(app_id).map(|sub| {
-                std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(sub)
+                #[cfg(feature = "deploy-host")]
+                let root = app_manager_utils_host_root();
+                #[cfg(not(feature = "deploy-host"))]
+                let root =
+                    std::path::PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
+                root.join(sub)
             }),
         )
     }
