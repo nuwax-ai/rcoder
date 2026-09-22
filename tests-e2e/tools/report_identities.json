@@ -466,5 +466,11 @@
       "scenario": "host_agent_lifecycle_no_llm",
       "backend": "host"
     }
+  ],
+  "host_k8s_agent_lifecycle_no_llm": [
+    {
+      "scenario": "host_k8s_agent_lifecycle_no_llm",
+      "backend": "host"
+    }
   ]
 }

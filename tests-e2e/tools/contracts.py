@@ -220,3 +220,12 @@ REQUIRED['host_agent_lifecycle_no_llm'] = {
     'host_ensure_idempotent_reuse',
     'host_owned_cleanup_reclaims_container',
 }
+
+
+REQUIRED['host_k8s_agent_lifecycle_no_llm'] = {
+    'host_k8s_pod_ensure_created',
+    'host_k8s_service_nodeport_assigned',
+    'host_k8s_nodeport_reachable',
+    'host_k8s_ensure_idempotent_reuse',
+    'host_k8s_owned_cleanup_reclaims',
+}

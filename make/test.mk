@@ -74,3 +74,8 @@ test-e2e-k8s-userapp:
 .PHONY: test-e2e-host
 test-e2e-host:
 	python3 tests-e2e/tools/run.py --group host
+
+# deploy-host 宿主机 K8s 形态严格 E2E（前置：CONTAINER_RUNTIME=kubernetes 的宿主机 rcoder）
+.PHONY: test-e2e-host-k8s
+test-e2e-host-k8s:
+	python3 tests-e2e/tools/run.py --group host_k8s

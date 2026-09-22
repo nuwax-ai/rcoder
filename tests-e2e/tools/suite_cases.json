@@ -112,5 +112,8 @@
   ],
   "host_docker_lifecycle": [
     "host_agent_lifecycle_no_llm"
+  ],
+  "host_k8s_lifecycle": [
+    "host_k8s_agent_lifecycle_no_llm"
   ]
 }
