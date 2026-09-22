@@ -231,7 +231,7 @@ impl Default for Config {
             userapp_single_app_id: None,
             service_log_dir: PathBuf::from("/app/logs/file-server"),
             service_log_retention_days: 7,
-            build_artifact_retain_count: 10,
+            build_artifact_retain_count: 3,
             build_log_retention_days: 7,
             init_project_dir: PathBuf::from("/app/project_init"),
             upload_project_dir: PathBuf::from("/app/project_zips"),
