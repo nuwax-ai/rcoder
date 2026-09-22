@@ -1047,3 +1047,122 @@ fn e_no_self_heal(data: &Value) -> bool {
         .as_str()
         .is_some_and(|message| message.contains("self-heal"))
 }
+
+// ============================================================
+// 场景：devbuild 缺 lockfile 自愈（app-171 事故 dev 链回归）
+// 存量 [devbuild] 命令 --frozen-lockfile + 导出链过滤 pnpm-lock.yaml →
+// ERR_PNPM_NO_LOCKFILE。自愈：失败码触发 pnpm install 生成 lockfile 后
+// 重试一次 dev 构建 → dev/start completed。反例：非该码失败不自愈。
+// ============================================================
+#[tokio::test]
+async fn userapp_devbuild_no_lockfile_heal_pnpm_install() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let scenario = "userapp_devbuild_no_lockfile_heal";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let app = scoped_app(&env, "dh");
+    let user = "e2e-br-user";
+
+    if !create_workspace(&env, &report, &app, user).await {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 单服务 node 工程：无 pnpm-lock.yaml + 本地 file: 依赖（离线安装）。
+    // [devbuild] 刻意用旧模板形态 --frozen-lockfile（app-171 dev 链事故现场
+    // 形状）；[devrun] 使 dev 形态进入源码态（dev 编译链才会执行 [devbuild]）。
+    let ws_manifest = "schema_version = 1\n\n[workspace]\nname = \"e2e-br-devbuild-heal\"\n";
+    let frozen_manifest = "schema_version = 1\n\n[project]\nservice_id = \"devbuild-heal-svc\"\nname = \"Devbuild Heal\"\ntype = \"node\"\n\n[build]\ncommand = [\"sh\", \"-c\", \"touch built.marker\"]\nartifact = \"artifact.zip\"\n\n[run]\ncommand = [\"sh\", \"-c\", \"exec python3 -m http.server $PORT --bind 0.0.0.0\"]\n\n[health]\nreadiness_path = \"/ready-heal\"\n\n[devbuild]\ncommand = [\"sh\", \"-c\", \"pnpm install --frozen-lockfile\"]\n\n[devrun]\ncommand = [\"sh\", \"-c\", \"exec node server.js\"]\n\n[proxy]\npath = \"/api/heal/\"\nstrip_prefix = true\n";
+    let server_js = "const http = require('http');\nhttp.createServer(function (req, res) { res.writeHead(200, {'Content-Type': 'text/plain'}); res.end('DEVBUILD_HEAL_OK'); }).listen(process.env.PORT || 3000, '0.0.0.0');\n";
+    let pkg_json = "{\n  \"name\": \"devbuild-heal-fixture\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": { \"dep-a\": \"file:./vendor/dep-a\" }\n}\n";
+    let dep_pkg = "{ \"name\": \"dep-a\", \"version\": \"1.0.0\" }\n";
+    if !init_zip_workspace(
+        &env,
+        &report,
+        &app,
+        user,
+        &[
+            ("workspace.manifest.toml", ws_manifest),
+            ("devbuild-heal-svc/project.manifest.toml", frozen_manifest),
+            ("devbuild-heal-svc/server.js", server_js),
+            ("devbuild-heal-svc/package.json", pkg_json),
+            ("devbuild-heal-svc/vendor/dep-a/package.json", dep_pkg),
+        ],
+    )
+    .await
+    {
+        assert_hard_all(report).await;
+        cleanup_builder(&app);
+        return;
+    }
+
+    // 正例：frozen + 无 lockfile → 自愈（install 生成 lockfile + 重试一次）→ completed
+    let terminal = dev_start_to_terminal(&env, &report, &app, user, Duration::from_secs(300)).await;
+    let completed = terminal
+        .as_ref()
+        .is_some_and(|d| d["status"] == "completed");
+    report.assert_hard(
+        "无 lockfile dev/start completed（frozen 失败→pnpm install→重试成功）",
+        completed,
+        format!("terminal={}", trunc(&terminal.unwrap_or(Value::Null), 240)),
+    );
+    let lockfile = file_exists(&env, &app, user, "devbuild-heal-svc/pnpm-lock.yaml").await;
+    report.assert_hard(
+        "devbuild 自愈生成 pnpm-lock.yaml（修复前此处 ERR_PNPM_NO_LOCKFILE 失败）",
+        lockfile == Some(true),
+        format!("resolve-file devbuild-heal-svc/pnpm-lock.yaml → {lockfile:?}"),
+    );
+
+    // 反例：非该码失败不得触发自愈（错误如实传播，无 self-heal 上下文）。
+    let plain_fail_manifest = frozen_manifest.replace("pnpm install --frozen-lockfile", "exit 7");
+    assert_ne!(
+        plain_fail_manifest, frozen_manifest,
+        "反例 manifest 必须生效"
+    );
+    overwrite_file(
+        &env,
+        &app,
+        user,
+        "devbuild-heal-svc/project.manifest.toml",
+        &plain_fail_manifest,
+    )
+    .await;
+    let terminal = dev_start_to_terminal(&env, &report, &app, user, Duration::from_secs(180)).await;
+    let failed_honestly = terminal.as_ref().is_some_and(|d| {
+        d["status"] == "failed"
+            && d["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("dev build failed"))
+            && !e_no_self_heal(d)
+    });
+    report.assert_hard(
+        "非 ERR_PNPM_NO_LOCKFILE 失败不自愈（dev build failed 如实传播）",
+        failed_honestly,
+        format!("terminal={}", trunc(&terminal.unwrap_or(Value::Null), 240)),
+    );
+
+    // dev/stop → Stopped（收尾，防 builder 残留进程族）
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/dev/stop", env.rcoder))
+        .timeout(Duration::from_secs(30))
+        .header("X-App-Id", &app)
+        .json(&json!({"app_id": app, "user_id": user}))
+        .send()
+        .await
+        .expect("dev stop");
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "dev/stop → Stopped",
+        body["data"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Stopped")),
+        format!("body 截断: {}", trunc(&body, 120)),
+    );
+
+    assert_hard_all(report).await;
+    cleanup_builder(&app);
+}

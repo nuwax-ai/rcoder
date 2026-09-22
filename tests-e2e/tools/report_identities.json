@@ -484,5 +484,11 @@
       "scenario": "userapp_build_no_lockfile",
       "backend": "compose"
     }
+  ],
+  "userapp_devbuild_no_lockfile_heal_pnpm_install": [
+    {
+      "scenario": "userapp_devbuild_no_lockfile_heal",
+      "backend": "compose"
+    }
   ]
 }

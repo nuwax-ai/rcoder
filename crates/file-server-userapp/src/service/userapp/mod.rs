@@ -80,7 +80,8 @@ pub(super) fn is_pnpm_no_lockfile_failure(error: &AppError) -> bool {
 /// lockfile`）必失败。失败码为 `ERR_PNPM_NO_LOCKFILE` 时先 `pnpm install`
 /// 生成 lockfile 再重试一次构建；安装失败不放弃重试（pnpm 先写 lockfile
 /// 再跑 postinstall，部分安装后 lockfile 已可用）；重试仍失败才上抛并附
-/// 自愈上下文。非该码失败路径不变。
+/// 自愈上下文。非该码失败路径不变。dev 编译链同款自愈见
+/// `dev_mode::devbuild_with_no_lockfile_heal`（公告/安装/终错三段共用）。
 async fn build_service_with_no_lockfile_heal(
     request: &GenericBuildRequest<'_>,
     guard: &BuildGuard<'_>,
@@ -92,6 +93,21 @@ async fn build_service_with_no_lockfile_heal(
         Err(error) if is_pnpm_no_lockfile_failure(&error) => error,
         Err(error) => return Err(error),
     };
+    emit_no_lockfile_heal_log(progress, service_id, &first).await;
+    let install_error = heal_pnpm_install(request.cwd, request.log_dir, request.timeout_secs).await;
+    match build_generic(request, guard).await {
+        Ok(artifact) => Ok(artifact),
+        Err(retry) => Err(self_heal_retry_error(retry, install_error)),
+    }
+}
+
+/// 缺 lockfile 自愈的 SSE 公告（发布与 dev 两条构建链共用）：命中机器码后
+/// 先告知自愈动作与首败全文，日志流里可辨"自愈重试"段。
+async fn emit_no_lockfile_heal_log(
+    progress: &Option<Arc<BuildTask>>,
+    service_id: &str,
+    first: &AppError,
+) {
     if let Some(task) = progress {
         task.emit(BuildProgressEvent::Log {
             service: service_id.to_string(),
@@ -101,37 +117,42 @@ async fn build_service_with_no_lockfile_heal(
         })
         .await;
     }
-    // 安装日志与构建日志同轴（logs/<service_id>：main + 新 dev-temp）。
+}
+
+/// 缺 lockfile 自愈的安装段（两条构建链共用）：在 cwd 执行 `pnpm install`
+/// 生成 lockfile（默认 --no-frozen-lockfile + 无 CI env；安装日志与构建日志
+/// 同轴 logs/<service_id>：main + 新 dev-temp）；安装失败不放弃重试（pnpm
+/// 先写 lockfile 再跑 postinstall，部分安装后 lockfile 已可用）。返回安装
+/// 错误文本（None=安装成功）。
+async fn heal_pnpm_install(cwd: &Path, log_dir: &Path, timeout_secs: u64) -> Option<String> {
     let install_logs = file_server::service::pnpm::LogFiles::new(
-        request
-            .log_dir
-            .join(file_server::service::dev_server::log::main_log_name()),
-        request
-            .log_dir
-            .join(file_server::service::dev_server::log::temp_log_name(
-                file_server::service::dev_server::now_ms(),
-            )),
+        log_dir.join(file_server::service::dev_server::log::main_log_name()),
+        log_dir.join(file_server::service::dev_server::log::temp_log_name(
+            file_server::service::dev_server::now_ms(),
+        )),
     );
-    let install_error = match file_server::service::pnpm::install(
-        request.cwd,
+    match file_server::service::pnpm::install(
+        cwd,
         &file_server::service::pnpm::InstallOptions::prefer_offline(),
         Some(&install_logs),
-        request.timeout_secs,
+        timeout_secs,
     )
     .await
     {
         Ok(_) => None,
         Err(error) => Some(error.to_string()),
-    };
-    match build_generic(request, guard).await {
-        Ok(artifact) => Ok(artifact),
-        Err(retry) => Err(AppError::system(format!(
-            "{retry}\n(self-heal attempted: pnpm install + one build retry{})",
-            install_error
-                .map(|error| format!("; install failed: {error}"))
-                .unwrap_or_default()
-        ))),
     }
+}
+
+/// 缺 lockfile 自愈的重试终错（两条构建链共用）：附自愈上下文（含安装失败
+/// 原因，若有）。
+fn self_heal_retry_error(retry: AppError, install_error: Option<String>) -> AppError {
+    AppError::system(format!(
+        "{retry}\n(self-heal attempted: pnpm install + one build retry{})",
+        install_error
+            .map(|error| format!("; install failed: {error}"))
+            .unwrap_or_default()
+    ))
 }
 
 /// 按 UTF-8 字符边界截断（超限截到 `max` 内最大合法前缀，带省略号标记）。

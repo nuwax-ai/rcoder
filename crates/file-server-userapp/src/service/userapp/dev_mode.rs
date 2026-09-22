@@ -94,7 +94,6 @@ pub async fn run_dev_builds(
             .await;
         }
 
-        let (line_cb, line_task) = spawn_build_log_pipe(&progress, proj.service_id());
         let log_dir = ws.join("logs").join(proj.service_id());
         let proj_dir = file_server::path_safety::ensure_within(ws, &proj.dir).map_err(|_| {
             AppError::validation(format!(
@@ -114,46 +113,20 @@ pub async fn run_dev_builds(
                 proj.service_id()
             )));
         }
-        // on_pid 回调: spawn 子进程后回写 pid 到 task, 供 cancel kill 进程组。
-        let pid_cb = progress.as_ref().map(|p| move |pid: u32| p.set_pid(pid));
-        let pid_ref: Option<&(dyn Fn(u32) + Send + Sync)> =
-            pid_cb.as_ref().map(|c| c as &(dyn Fn(u32) + Send + Sync));
-
-        let (program, args) = argv.split_first().ok_or_else(|| {
-            AppError::validation("dev build command must have at least one argv item")
-        })?;
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         tokio::fs::create_dir_all(&log_dir)
             .await
             .map_err(|e| AppError::system(format!("create dev build log dir: {e}")))?;
-        let now = now_ms();
-        let build_result = run_command_to_log(
-            program,
-            &args,
+
+        // 服务名前缀错误在自愈层内包装（多服务串行时快照 error 自明是哪个服务挂的）
+        let outcome = devbuild_with_no_lockfile_heal(
+            &argv,
             &proj_dir,
-            &log_dir.join(main_log_name()),
-            &log_dir.join(temp_log_name(now)),
+            &log_dir,
             timeout_secs,
-            CommandObservers {
-                on_pid: pid_ref,
-                on_line: Some(line_cb.clone()),
-            },
+            &progress,
+            proj.service_id(),
         )
         .await;
-
-        if let Some(p) = &progress {
-            p.clear_pid();
-        }
-        // 关通道（管道已 drain）→ 排空 join → 才 emit 终态（保序约定见管道 fn 文档）
-        drop(line_cb);
-        if let Err(e) = line_task.await {
-            tracing::warn!(error = %e, "log line consumer task join failed");
-        }
-
-        // 服务名前缀错误（与发布编译同款：多服务串行时快照 error 自明是哪个服务挂的）
-        let outcome = build_result
-            .map(|_| ())
-            .map_err(|e| AppError::system(format!("{} dev build failed: {e}", proj.service_id())));
         match outcome {
             Ok(()) => {
                 if let Some(p) = &progress {
@@ -180,6 +153,80 @@ pub async fn run_dev_builds(
     Ok(())
 }
 
+/// 单次 devbuild 执行：pid 回写（供 cancel kill 进程组）、逐行日志管道、
+/// temp_log 落 `log_dir`；失败带 `<service_id> dev build failed` 前缀——
+/// 缺 lockfile 自愈检测依赖错误尾段里的机器码。
+async fn run_devbuild_once(
+    argv: &[String],
+    proj_dir: &Path,
+    log_dir: &Path,
+    timeout_secs: u64,
+    progress: &Option<Arc<BuildTask>>,
+    service_id: &str,
+) -> AppResult<()> {
+    let (program, args) = argv.split_first().ok_or_else(|| {
+        AppError::validation("dev build command must have at least one argv item")
+    })?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (line_cb, line_task) = spawn_build_log_pipe(progress, service_id);
+    // on_pid 回调: spawn 子进程后回写 pid 到 task, 供 cancel kill 进程组。
+    let pid_cb = progress.as_ref().map(|p| move |pid: u32| p.set_pid(pid));
+    let pid_ref: Option<&(dyn Fn(u32) + Send + Sync)> =
+        pid_cb.as_ref().map(|c| c as &(dyn Fn(u32) + Send + Sync));
+    let result = run_command_to_log(
+        program,
+        &args,
+        proj_dir,
+        &log_dir.join(main_log_name()),
+        &log_dir.join(temp_log_name(now_ms())),
+        timeout_secs,
+        CommandObservers {
+            on_pid: pid_ref,
+            on_line: Some(line_cb.clone()),
+        },
+    )
+    .await;
+    if let Some(p) = progress {
+        p.clear_pid();
+    }
+    // 关通道（管道已 drain）→ 排空 join → 才 emit 终态（保序约定见管道 fn 文档）
+    drop(line_cb);
+    if let Err(e) = line_task.await {
+        tracing::warn!(error = %e, "log line consumer task join failed");
+    }
+    result
+        .map(|_| ())
+        .map_err(|e| AppError::system(format!("{service_id} dev build failed: {e}")))
+}
+
+/// dev 构建 + 缺 lockfile 自愈（app-171 事故，与发布编译链
+/// `super::build_service_with_no_lockfile_heal` 对称）：平台导出链过滤
+/// pnpm-lock.yaml（既定设计），存量 `[devbuild]` 命令若 `--frozen-lockfile`
+/// 假设 lockfile 存在必失败。失败码为 `ERR_PNPM_NO_LOCKFILE` 时先 `pnpm
+/// install` 生成 lockfile 再重试一次；非该码失败路径不变；重试仍失败才
+/// 上抛并附自愈上下文。
+async fn devbuild_with_no_lockfile_heal(
+    argv: &[String],
+    proj_dir: &Path,
+    log_dir: &Path,
+    timeout_secs: u64,
+    progress: &Option<Arc<BuildTask>>,
+    service_id: &str,
+) -> AppResult<()> {
+    let first = match run_devbuild_once(argv, proj_dir, log_dir, timeout_secs, progress, service_id)
+        .await
+    {
+        Ok(()) => return Ok(()),
+        Err(error) if super::is_pnpm_no_lockfile_failure(&error) => error,
+        Err(error) => return Err(error),
+    };
+    super::emit_no_lockfile_heal_log(progress, service_id, &first).await;
+    let install_error = super::heal_pnpm_install(proj_dir, log_dir, timeout_secs).await;
+    match run_devbuild_once(argv, proj_dir, log_dir, timeout_secs, progress, service_id).await {
+        Ok(()) => Ok(()),
+        Err(retry) => Err(super::self_heal_retry_error(retry, install_error)),
+    }
+}
 /// ensure 源码目录 `release.lock.toml`：无 lock、或任一 manifest 比 lock 新
 /// （mtime）→ 重新生成；新鲜则 no-op。返回编排 workspace 根（= 源码 ws 本身，
 /// app-cli `--workspace` 指向这里）。
@@ -444,27 +491,57 @@ mod tests {
         "[devbuild]\ncommand = ['sh', '-c', 'pnpm install --frozen-lockfile && touch check-ran']";
     const NO_FROZEN_DEVBUILD: &str = "[devbuild]\ncommand = ['sh', '-c', 'pnpm install --no-frozen-lockfile && touch check-ran']";
 
-    /// 反例（app 110 事故形态）：旧模板命令 --frozen-lockfile + 无 lockfile →
-    /// dev build 失败，且 && 后的检查未执行。
+    /// app-171 事故形态：旧模板命令 --frozen-lockfile + 无 lockfile（平台导出
+    /// 链过滤 lockfile 为既定设计）→ 自愈先 pnpm install 生成 lockfile 再重试
+    /// 一次，dev build 成功且 && 后的检查确实执行。
     #[tokio::test]
-    async fn devbuild_frozen_without_lockfile_fails_and_skips_check() {
+    async fn devbuild_frozen_without_lockfile_heals_and_retries() {
         let Some(version) = pnpm_version_on_path() else {
             eprintln!("SKIP: pnpm not on PATH (real-pnpm devbuild regression)");
             return;
         };
         eprintln!("using pnpm {version}");
         let (ws, sentinel) = pnpm_devbuild_ws(FROZEN_DEVBUILD);
-        let error = run_dev_builds_on(&ws, "frozen-110")
+        run_dev_builds_on(&ws, "frozen-171")
             .await
-            .expect_err("frozen install without lockfile must fail");
-        assert!(error.to_string().contains("dev build failed"), "{error}");
+            .expect("frozen install without lockfile must self-heal and succeed");
+        assert!(sentinel.exists(), "check must run on the healed retry");
         assert!(
-            !sentinel.exists(),
-            "check must not run after failed install"
+            ws.join("frontend").join("pnpm-lock.yaml").exists(),
+            "self-heal must generate the lockfile"
         );
         assert!(
             devbuild_log_text(&ws).contains("ERR_PNPM_NO_LOCKFILE"),
-            "failure must be ERR_PNPM_NO_LOCKFILE (incident signature)"
+            "first failure must be ERR_PNPM_NO_LOCKFILE (incident signature)"
+        );
+    }
+
+    /// 恒定该码失败：恰重试一次（两次执行），终错携带自愈上下文且保留
+    /// `<service> dev build failed` 前缀。
+    #[tokio::test]
+    async fn devbuild_token_failure_heals_exactly_once() {
+        let Some(version) = pnpm_version_on_path() else {
+            eprintln!("SKIP: pnpm not on PATH (real-pnpm devbuild regression)");
+            return;
+        };
+        eprintln!("using pnpm {version}");
+        let extra = "[devbuild]\ncommand = ['sh', '-c', 'echo run >> runs.txt; echo ERR_PNPM_NO_LOCKFILE >&2; exit 1']";
+        let (ws, _sentinel) = pnpm_devbuild_ws(extra);
+        let error = run_dev_builds_on(&ws, "token-fail")
+            .await
+            .expect_err("constant token failure stays failed");
+        assert!(error.to_string().contains("dev build failed"), "{error}");
+        assert!(
+            error.to_string().contains("self-heal attempted"),
+            "final error must carry the heal context"
+        );
+        assert_eq!(
+            fs::read_to_string(ws.join("frontend").join("runs.txt"))
+                .expect("runs")
+                .lines()
+                .count(),
+            2,
+            "exactly one heal retry"
         );
     }
 
@@ -573,5 +650,9 @@ mod tests {
             .await
             .expect_err("check failure must fail devbuild");
         assert!(error.to_string().contains("dev build failed"), "{error}");
+        assert!(
+            !error.to_string().contains("self-heal attempted"),
+            "non-token failure must not heal"
+        );
     }
 }
